@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "gate-app",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/gate-app.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build-gate-app",
+      "env": {
+        "RUST_LOG": "info",
+        "WGPU_BACKEND": "vulkan",
+      }
+    }
+  ]
+}

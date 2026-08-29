@@ -1,0 +1,10 @@
+[package]
+name = "gate-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+gate-voxel = { workspace = true }
+gate-render = { workspace = true }

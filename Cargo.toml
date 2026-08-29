@@ -1,0 +1,48 @@
+[workspace]
+members = ["gate-app", "gate-voxel", "gate-render"]
+# third_party/wgpu 是独立 workspace（wgpu PR#9361 补丁），必须显式排除：
+# 否则 cargo 把它的成员吸收进本 workspace，继承 [workspace.package] 时报错（cargo#12154）
+exclude = ["third_party"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+# P0.2: Bevy 版本精确锁定（render graph API 随版本破坏性变更频繁）
+[workspace.dependencies]
+bevy = { version = "=0.19.1", default-features = false, features = [
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_post_process",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_state",
+    "multi_threaded",
+    "std",
+    "default_font",
+    "reflect_auto_register",
+    "async_executor",
+] }
+gate-voxel = { path = "gate-voxel" }
+gate-render = { path = "gate-render" }
+
+# Bevy 官方推荐：依赖全优化，本项目代码保持可调试
+# 没有它 debug build 慢 10-50 倍（窗口卡死/无响应的根因之一）
+# incremental = false：沙箱拦截 target/debug/incremental 写入（os error 5）导致
+# rustc 假 ICE（pre-lto-bitcode 写入失败 panic），项目小关闭增量无感
+[profile.dev]
+opt-level = 1
+incremental = false
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# 注：曾实验将 wgpu patch 到上游修复 PR#9361（third_party/wgpu），因 API breaking
+# （SurfaceTexture::present 移至 Queue、NoopBackendOptions/RequestAdapterOptions 加字段）
+# bevy_render 0.19.1 无法编译，已撤销。详见 docs/decisions.md ADR-0002。
+# third_party/ 目录残留可删，.gitignore 已排除。

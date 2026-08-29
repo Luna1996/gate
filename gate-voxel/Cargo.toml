@@ -1,0 +1,8 @@
+[package]
+name = "gate-voxel"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# 纯逻辑，零渲染依赖
