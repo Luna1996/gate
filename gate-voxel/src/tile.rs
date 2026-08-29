@@ -60,9 +60,18 @@ impl Brick {
   fn is_empty(&self) -> bool {
     self.occupancy == [0; 64]
   }
+
+  /// 堆上深尺寸（palette 槽表；occupancy 512B 为 Brick 内联部分，随 size_of 计）
+  pub fn heap_bytes(&self) -> usize {
+    std::mem::size_of_val(&*self.palette)
+  }
 }
 
 /// 基元胞：可变叶八叉树（层级线性表实现）
+///
+/// l4 用 `Option<Box<Brick>>`：Brick 520B 内联会把 uniform 粗叶胞撑到 ~560B
+/// （Option<Brick> 无 niche 优化），装箱后空胞 ~40B——均匀粗叶场景（背景体素）
+/// 内存 14×，P1.7 工作间预算断言依赖此布局
 #[derive(Debug, Clone, Default)]
 pub struct Cell {
   /// L0 整胞同色；Some 时全部层级表必须为 None
@@ -70,12 +79,30 @@ pub struct Cell {
   pub l1: Option<Box<[Slot; 8]>>,
   pub l2: Option<Box<[Slot; 64]>>,
   pub l3: Option<Box<[Slot; 512]>>,
-  pub l4: Option<Brick>,
+  pub l4: Option<Box<Brick>>,
 }
 
 impl Cell {
   fn new() -> Self {
     Self::default()
+  }
+
+  /// 堆上深尺寸（层级表 + brick 含内联部分；自身 size_of 由容器层计）
+  pub fn heap_bytes(&self) -> usize {
+    let mut n = 0;
+    if let Some(t) = &self.l1 {
+      n += std::mem::size_of_val(&**t);
+    }
+    if let Some(t) = &self.l2 {
+      n += std::mem::size_of_val(&**t);
+    }
+    if let Some(t) = &self.l3 {
+      n += std::mem::size_of_val(&**t);
+    }
+    if let Some(b) = &self.l4 {
+      n += std::mem::size_of::<Brick>() + b.heap_bytes();
+    }
+    n
   }
 
   /// 槽状态查询；表不存在 = 整级无数据（Empty）
@@ -116,7 +143,7 @@ impl Cell {
         3 => {
           self.l3.as_mut().unwrap()[parent_slot] = Slot::Branch;
           if self.l4.is_none() {
-            self.l4 = Some(Brick::new());
+            self.l4 = Some(Box::new(Brick::new()));
           }
         }
         _ => unreachable!(),
@@ -357,6 +384,26 @@ impl Default for Tile {
 }
 
 impl Tile {
+  /// 堆上深尺寸（cells 哈希表 + 各基元胞层级表；occupancy 4KB 内联部分由 size_of::<Tile> 计）
+  ///
+  /// hashbrown 桶开销 ≈ capacity × (entry + 1 控制字节) × 8/7（capacity=7/8 负载因子的倒数），
+  /// 估值只高不低，用于内存预算断言是保守方向
+  pub fn heap_bytes(&self) -> usize {
+    let map = self.cells.capacity() * (std::mem::size_of::<(u16, Cell)>() + 1) / 7 * 8;
+    let cells: usize = self.cells.values().map(Cell::heap_bytes).sum();
+    let comp = self
+      .comp_layer
+      .as_ref()
+      .map(|l| std::mem::size_of_val(&**l))
+      .unwrap_or(0);
+    map + cells + comp
+  }
+
+  /// 占用基元胞数（统计用）
+  pub fn cell_count(&self) -> usize {
+    self.cells.len()
+  }
+
   pub fn cell(&self, idx: u16) -> Option<&Cell> {
     if self.occupancy[idx as usize / 64] >> (idx as usize % 64) & 1 == 1 {
       self.cells.get(&idx)

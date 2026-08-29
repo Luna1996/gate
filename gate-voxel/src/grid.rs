@@ -22,9 +22,33 @@ pub struct DirtyEdit {
 
 #[derive(Debug, Default)]
 pub struct TileGrid {
-  tiles: HashMap<TileCoord, Tile>,
+  /// Box 载荷：Tile 含 4KB occupancy，若内联进桶，百万 tile 时桶数组膨胀至 GB 级
+  /// 且 rehash 反复搬运（P1.7 实测 12.3GB → 装箱后 ~24B/entry）
+  tiles: HashMap<TileCoord, Box<Tile>>,
   palette: Palette,
   pub dirty: DirtyTracker,
+}
+
+/// 内存用量核算（P1.7 极限测试的预算断言依据）
+///
+/// 全部为**深尺寸**：Tile 内联（occupancy 4KB）+ 堆上哈希表/层级表/brick。
+/// 估算策略偏保守（只高不低）；不含分配器元数据与 false sharing。
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryUsage {
+  pub tile_count: usize,
+  pub cell_count: usize,
+  /// Tile 内联部分合计（含 occupancy 4KB/Tile）
+  pub tile_inline_bytes: usize,
+  /// Tile 堆上部分合计
+  pub tile_heap_bytes: usize,
+  /// 脏标记结构合计
+  pub dirty_bytes: usize,
+}
+
+impl MemoryUsage {
+  pub fn total_bytes(&self) -> usize {
+    self.tile_inline_bytes + self.tile_heap_bytes + self.dirty_bytes
+  }
 }
 
 impl TileGrid {
@@ -41,11 +65,28 @@ impl TileGrid {
   }
 
   pub fn tile(&self, coord: TileCoord) -> Option<&Tile> {
-    self.tiles.get(&coord)
+    self.tiles.get(&coord).map(|t| &**t)
   }
 
   pub fn tile_count(&self) -> usize {
     self.tiles.len()
+  }
+
+  /// 内存用量（深尺寸，估算偏保守；预算断言用）
+  pub fn memory_usage(&self) -> MemoryUsage {
+    let tile_inline = std::mem::size_of::<Tile>();
+    let tile_count = self.tiles.len();
+    let cell_count: usize = self.tiles.values().map(|t| t.cell_count()).sum();
+    let tile_heap: usize = self.tiles.values().map(|t| t.heap_bytes()).sum();
+    // 外层桶（现仅 TileCoord + Box 指针）+ Tile 载荷（Box 目标，连续堆块）
+    let outer = self.tiles.capacity() * (std::mem::size_of::<(TileCoord, Box<Tile>)>() + 1) / 7 * 8;
+    MemoryUsage {
+      tile_count,
+      cell_count,
+      tile_inline_bytes: tile_inline * tile_count + outer,
+      tile_heap_bytes: tile_heap,
+      dirty_bytes: self.dirty.heap_bytes(),
+    }
   }
 
   /// 包含点的最深叶颜色；空 = None（AIR）

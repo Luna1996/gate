@@ -35,4 +35,5 @@ jobs:
         run: cargo build --workspace
 
       - name: Test
-        run: cargo test --workspace
+        # --nocapture：极限测试实测数字（内存/耗时）进 CI 日志
+        run: cargo test --workspace -- --nocapture

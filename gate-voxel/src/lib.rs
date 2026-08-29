@@ -7,6 +7,9 @@ pub mod palette;
 pub mod scene;
 pub mod tile;
 
+#[cfg(test)]
+mod stress;
+
 pub use coords::{Level, MAX_LEVEL, TILE_CELLS, TILE_SUB, TileCoord, VoxelPos};
 pub use dirty::DirtyTracker;
 pub use grid::{DirtyEdit, TileGrid};

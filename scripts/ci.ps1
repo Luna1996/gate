@@ -17,7 +17,8 @@ cargo build --workspace
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: build' -ForegroundColor Red; exit 1 }
 
 Write-Host '== cargo test ==' -ForegroundColor Cyan
-cargo test --workspace
+# --nocapture：P1.7 极限测试的实测数字（内存/耗时）进日志，防回归有据可查
+cargo test --workspace -- --nocapture
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: test' -ForegroundColor Red; exit 1 }
 
 Write-Host 'CI PASSED' -ForegroundColor Green

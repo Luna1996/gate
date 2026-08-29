@@ -72,6 +72,17 @@ impl DirtyTracker {
     }
     out
   }
+
+  /// 堆上深尺寸（两套 HashSet + 两个 FIFO 队列；估算偏保守）
+  pub fn heap_bytes(&self) -> usize {
+    let entry = std::mem::size_of::<TileCoord>() + 1;
+    let set = |cap: usize| cap * entry / 7 * 8;
+    let q = |cap: usize| cap * std::mem::size_of::<TileCoord>();
+    set(self.data_dirty.capacity())
+      + set(self.comp_dirty.capacity())
+      + q(self.data_queue.capacity())
+      + q(self.comp_queue.capacity())
+  }
 }
 
 #[cfg(test)]
