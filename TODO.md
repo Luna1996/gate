@@ -113,19 +113,19 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
   - [ ] Bevy 相机视图矩阵 → system 可见的 uniform
   - 踩坑记录：ViewTarget 是 `Rgba8UnormSrgb`（blit 管线格式必须匹配，输出前 sRGB→linear 抵消硬件编码）；**Msaa 0.19 是 per-view Component**（非资源，默认 4x 与自定义管线 sample count 冲突即崩）；沙箱拦截 `target/debug/incremental` 写入伪装成 rustc ICE（`incremental = false` 规避，ADR-0003）
 - [x] 0.4 CI：Windows build + test + clippy（git 仓库已初始化；`scripts/ci.ps1` 本地一键 = fmt --check + clippy -D warnings + build + test，已验证 PASSED；`.github/workflows/ci.yml` 备用——windows-latest + rust-cache，推 GitHub 后即生效）
-- [ ] 0.5 tracing 日志 + 帧时间统计基座
-- [ ] 0.6 `docs/decisions.md`：决策表落成 ADR
+- [x] 0.5 tracing 日志 + 帧时间统计基座（LogPlugin filter 显式覆盖为 `"info"` 全开——默认值会静音 wgpu，违背"不隐藏日志"原则；FrameTimeDiagnosticsPlugin + LogDiagnosticsPlugin 每秒输出 fps/frame_time，实测 60fps@16.7ms；P2.7 接 GPU timestamp，P7 接 UI）
+- [x] 0.6 `docs/decisions.md`：决策表落成 ADR（索引表 + ADR-0001~0004；ADR-0004 定存放原则：TODO 决策表 = 唯一真源，ADR 只存工程细节与坑，防双源漂移）
 
 ## P1 体素数据层（最小版，先服务渲染）
 
-- [ ] 1.1 基础类型：`VoxelPos`（含叶子层级）/ `TileCoord`（i32³）；TILE = 32 基元胞（4cm）；分层寻址无边界常量
-- [ ] 1.2 Tile：32³ 基元胞占用位掩码 + 每基元胞可变叶八叉树（最多 4 级细分至 0.25cm；长期不用的细分可合并回收）
-  - [ ] 叶子存 `palette_idx`；整块同色粗叶压缩存储
-  - [ ] `comp_layer: Option<Box<[u16]>>` 字段占位（洪泛后置到 P5）
-- [ ] 1.3 Palette：256 × `PaletteEntry { color, roughness, emissive, transmission, flags }`（u8 索引 + flags 视觉变体）
-- [ ] 1.4 TileGrid：HashMap + `get/set_voxel`（跨级放置 → brick 分配 + 祖先掩码更新）+ `batch_edit`，编辑返回受影响区域集合
-- [ ] 1.5 脏标记：`data_dirty` / `comp_dirty` 分离 + 每帧上传预算队列
-- [ ] 1.6 测试场景构造器：手工生成测试体素（方块/球/文字），含多分辨率混合场景（粗背景 + 细热点），P2 的输入源
+- [x] 1.1 基础类型：`VoxelPos`（含叶子层级）/ `TileCoord`（i32³）；TILE = 32 基元胞（4cm）；分层寻址无边界常量（fine 坐标 = 0.25cm 单位 i32³，欧氏除法保证负坐标落邻接 Tile）
+- [x] 1.2 Tile：32³ 基元胞占用位掩码 + 每基元胞可变叶八叉树（最多 4 级细分至 0.25cm；长期不用的细分可合并回收）
+  - [x] 叶子存 `palette_idx`；整块同色粗叶压缩存储（cell.uniform 快路径 + 同色向上折叠至 L1/L0，破坏性粗写清深层，清除时逐级收缩）
+  - [x] `comp_layer: Option<Box<[u16]>>` 字段占位（洪泛后置到 P5）
+- [x] 1.3 Palette：256 × `PaletteEntry { color, roughness, emissive, transmission, flags }`（u8 索引 + flags 视觉变体；槽 0 = AIR 保留，set_voxel debug_assert 禁写）
+- [x] 1.4 TileGrid：HashMap + `get/set_voxel`（跨级放置 → brick 分配 + 祖先掩码更新）+ `batch_edit`，编辑返回受影响区域集合（`DirtyEdit { tile, level }`，P2.3 按此增量上传）
+- [x] 1.5 脏标记：`data_dirty` / `comp_dirty` 分离 + 每帧上传预算队列（`drain_data_budget(n)` FIFO 去重）
+- [x] 1.6 测试场景构造器：手工生成测试体素（方块/球/文字），含多分辨率混合场景（粗背景 + 细热点），P2 的输入源（scene.rs：fill_box/fill_sphere/draw_text 5×7 字体，任意层级可叠加，计数确定性可断言）
 
 ## P2 基础渲染 M1：体素上屏
 

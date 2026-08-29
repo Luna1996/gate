@@ -1,4 +1,11 @@
-use bevy::{asset::AssetPlugin, image::Image, prelude::*, window::Window};
+use bevy::{
+  asset::AssetPlugin,
+  diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+  image::Image,
+  log::LogPlugin,
+  prelude::*,
+  window::Window,
+};
 
 use gate_render::{GradientImages, GradientUniforms, VIEW_SIZE, create_gradient_image};
 
@@ -19,8 +26,21 @@ fn main() {
         .set(AssetPlugin {
           file_path: ASSETS_PATH.into(),
           ..default()
+        })
+        // 日志基线：默认 INFO 全开，不静音任何 crate（含 wgpu——
+        // LogPlugin::default 的 filter 是 "wgpu=error,naga=warn"，必须覆盖）。
+        // 临时降噪用 RUST_LOG 覆盖（launch.json / 终端 env），代码里不做隐藏
+        .set(LogPlugin {
+          filter: "info".into(),
+          ..default()
         }),
     )
+    // 帧时间统计基座（P0.5）：采集 fps/frame_time，每秒输出到 INFO 日志。
+    // P2.7 接 GPU timestamp，P7 接 UI 面板
+    .add_plugins((
+      FrameTimeDiagnosticsPlugin::default(),
+      LogDiagnosticsPlugin::default(),
+    ))
     .add_plugins(gate_render::GateRenderPlugin)
     .add_systems(Startup, setup)
     .run();

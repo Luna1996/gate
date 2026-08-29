@@ -3,4 +3,4 @@
 # wgpu PR#9361 本地补丁残留（ADR-0002，可随时删除）
 /third_party
 # 本地运行日志（Out-File 重定向产物）
-run.log
+*.log

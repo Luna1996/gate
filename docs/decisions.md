@@ -3,6 +3,15 @@
 > 每条 ADR：背景 → 决策 → 后果。状态只有两种：**已接受** / **已否决**（否决项保留理由，防止反复）。
 > 与 TODO.md「已定关键决策」表对应，此处存放工程细节与版本对齐记录。
 
+## 索引
+
+| ADR | 标题 | 状态 | 日期 |
+|---|---|---|---|
+| [ADR-0001](#adr-0001bevy-版本锁定p02) | Bevy 版本锁定 | 已接受 | 2026-08-29 |
+| [ADR-0002](#adr-0002bevy-019-渲染挂载模式与开发环境基线p03-spike-结论) | Bevy 0.19 渲染挂载模式与开发环境基线 | 已接受 | 2026-08-29 |
+| [ADR-0003](#adr-0003viewtarget-直写的挂载点与格式msaa-契约p03-阶段-b) | ViewTarget 直写的挂载点与格式/MSAA 契约 | 已接受 | 2026-08-29 |
+| [ADR-0004](#adr-0004决策存放原则与工程基线p05p06) | 决策存放原则与工程基线（日志/CI） | 已接受 | 2026-08-29 |
+
 ---
 
 ## ADR-0001：Bevy 版本锁定（P0.2）
@@ -149,3 +158,35 @@ opt-level = 3
 - ✅ 架构定型：compute（RenderGraph schedule，camera_driver 前）→ blit（Core2d PostProcess）→ 上屏，P2 的 DDA pass 直接套用此骨架
 - ✅ 阶段 A 的 Sprite 路径代码删除，无中转
 - ⚠️ 多相机时 `Query<&ViewTarget>.single()` 需重审（当前单相机）；PostProcess set 内与其他 post system 的顺序依赖将来 tonemapping 接入时再梳理（P3.5）
+
+---
+
+## ADR-0004：决策存放原则与工程基线（P0.5/P0.6）
+
+**状态**：已接受
+**日期**：2026-08-29
+
+### 决策一：决策存放原则（防止双源漂移）
+
+- **TODO.md「已定关键决策」表是产品/架构决策的唯一真源**（live 文档，随 grill-me 裁决更新）
+- **decisions.md 只存工程细节与版本对齐记录**（怎么实现、踩了什么坑、API 长什么样），不复述 TODO 表内容
+- 大决策若被推翻：改 TODO 表 + 对应 ADR 标注修订（参考 ADR-0002 踩坑 4 被 ADR-0003 修正的先例）
+- 架构级大决策（数据结构/电路语义/模拟位置/画质基线等）的完整论证见 TODO.md v3 及 grill-me 会话记录，此处不复制
+
+### 决策二：日志基线（P0.5）
+
+- **代码默认 INFO 全开，不静音任何 crate**（用户明确要求：不掩盖问题）。注意 `LogPlugin::default()` 的 filter 是 `"wgpu=error,naga=warn"`——静音 wgpu 是默认行为，必须显式覆盖为 `"info"`
+- 临时降噪走环境变量 `RUST_LOG`（launch.json / 终端 env），不在代码里做
+- 帧时间统计：`FrameTimeDiagnosticsPlugin` + `LogDiagnosticsPlugin`（每秒输出 fps/frame_time 到 INFO）。后续扩展：P2.7 GPU timestamp 接 diagnostics 通道，P7 接 UI 面板
+
+### 决策三：CI 基线（P0.4）
+
+- 本地一键：`scripts/ci.ps1`（fmt --check → clippy `-D warnings` → build → test），提交前必跑
+- GitHub Actions：`.github/workflows/ci.yml`（windows-latest，rust-cache），推 GitHub 即生效；同分支并发取消
+- clippy 例外：Bevy render system 参数即依赖注入，参数多属常态——`#[allow(clippy::too_many_arguments)]`（Bevy 源码同款），不用配置 lint 阈值
+
+### 后果
+
+- ✅ P0 全部完成（0.1~0.6），进入 P1 体素数据层
+- ✅ 决策双源风险消除：TODO 表 = what/why，ADR = how/坑
+- ⚠️ ADR 索引表需随新增 ADR 手动维护（低成本，可接受）

@@ -5,4 +5,5 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-# 纯逻辑，零渲染依赖
+# 纯逻辑，零渲染依赖；glam 是 workspace 依赖链既有成员
+glam = { workspace = true }

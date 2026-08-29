@@ -1984,6 +1984,9 @@ dependencies = [
 [[package]]
 name = "gate-voxel"
 version = "0.1.0"
+dependencies = [
+ "glam",
+]
 
 [[package]]
 name = "getrandom"

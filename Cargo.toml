@@ -30,6 +30,8 @@ bevy = { version = "=0.19.1", default-features = false, features = [
 ] }
 gate-voxel = { path = "gate-voxel" }
 gate-render = { path = "gate-render" }
+# ADR-0001 对齐表版本；gate-voxel 唯一外部依赖（bevy/wgpu 已传递引入，非新增）
+glam = "=0.32.1"
 
 # Bevy 官方推荐：依赖全优化，本项目代码保持可调试
 # 没有它 debug build 慢 10-50 倍（窗口卡死/无响应的根因之一）
