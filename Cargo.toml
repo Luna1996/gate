@@ -1,8 +1,9 @@
 [workspace]
-members = ["gate-app", "gate-voxel", "gate-render"]
+members = ["gate-app", "gate-voxel", "gate-render", "gate-ui"]
 # third_party/wgpu 是独立 workspace（wgpu PR#9361 补丁），必须显式排除：
 # 否则 cargo 把它的成员吸收进本 workspace，继承 [workspace.package] 时报错（cargo#12154）
-exclude = ["third_party"]
+# vendor/parley 同理：本地补丁包（见 [patch.crates-io]）
+exclude = ["third_party", "vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -19,9 +20,13 @@ bevy = { version = "=0.19.1", default-features = false, features = [
     "bevy_post_process",
     "bevy_sprite",
     "bevy_sprite_render",
+    "bevy_ui",
+    "bevy_ui_render",
     "bevy_asset",
     "bevy_log",
     "bevy_state",
+    # 2.7a：FontSource::SystemUi 需要（未启用时 bevy_text 报错且文本不渲染）
+    "system_font_discovery",
     "multi_threaded",
     "std",
     "default_font",
@@ -30,8 +35,14 @@ bevy = { version = "=0.19.1", default-features = false, features = [
 ] }
 gate-voxel = { path = "gate-voxel" }
 gate-render = { path = "gate-render" }
+gate-ui = { path = "gate-ui" }
+# 2.7a 主题令牌 RON 反序列化（ron 版本随 bevy 0.19 内部用法，避免双份编译）
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
 # ADR-0001 对齐表版本；gate-voxel 唯一外部依赖（bevy/wgpu 已传递引入，非新增）
 glam = "=0.32.1"
+# P2.2 全量构建并行分块（docs/brickmap.md §5）
+rayon = "1"
 
 # Bevy 官方推荐：依赖全优化，本项目代码保持可调试
 # 没有它 debug build 慢 10-50 倍（窗口卡死/无响应的根因之一）
@@ -48,3 +59,14 @@ opt-level = 3
 # （SurfaceTexture::present 移至 Queue、NoopBackendOptions/RequestAdapterOptions 加字段）
 # bevy_render 0.19.1 无法编译，已撤销。详见 docs/decisions.md ADR-0002。
 # third_party/ 目录残留可删，.gitignore 已排除。
+
+# ADR-0005：parley 0.9.0 本地补丁（vendor/parley）——修复 CJK 文本分段
+# 现象：gate-ui 中文文本每次排版触发 "ICU4X data error: No segmentation model
+# for complex script: Chinese/Japanese"，且整段中文被视为单一不可断行单元。
+# 根因：上游用 new_for_non_complex_scripts 构造分段器（无任何复杂文字载荷），
+# bevy_text 0.19.1 锁定 parley 0.9，上游无 feature 可开。
+# 补丁：word/line 分段器改用 new_dictionary（加载 baked 词典，含 cjdict）。
+# 公开 API 未变，bevy_text 无感。不可放入 third_party/（已被 gitignore）。
+[patch.crates-io]
+parley = { path = "vendor/parley" }
+

@@ -2,5 +2,20 @@
 *.rs.bk
 # wgpu PR#9361 本地补丁残留（ADR-0002，可随时删除）
 /third_party
-# 本地运行日志（Out-File 重定向产物）
+# 本地运行日志（PowerShell tee / Out-File 重定向产物；`cargo run 2>&1 | tee run.log` 等）
 *.log
+*.out
+*.err
+# Visual Studio / VSCode 本地用户配置（launch.json/tasks.json 共享，忽略 *.code-workspace/缓存）
+*.code-workspace
+.vscode/.history/
+.vscode/ipch/
+# Rust Analyzer proc-macro 缓存（跨机器不要）
+/.cache
+# Trae 本地会话记忆：项目级正式决策放 docs/decisions.md；用户级持久记忆存 $HOME/.trae-cn/memory/projects/<repo>/
+# 这里是 workspace 内可能意外生成的副本（不提交，避免双处冲突）
+.trae/documents/
+.trae/memory/
+.trae/**/*.log
+.trae/**/*.err
+.trae/**/*.out

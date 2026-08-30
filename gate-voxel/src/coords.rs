@@ -34,9 +34,21 @@ pub const LEVEL_SLOT_COUNT: [usize; 5] = [1, 8, 64, 512, 4096];
 /// 层级对应的槽表边长：L1=2, L2=4, L3=8, L4=16（usize：直接参与槽索引线性运算）
 pub const LEVEL_TABLE_AXIS: [usize; 5] = [1, 2, 4, 8, 16];
 
-/// Tile 网格坐标（i32³，无界）
+/// Tile 网格坐标（i32³，无界）；全序 = 分量字典序（构建器/测试确定性排序用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileCoord(pub IVec3);
+
+impl Ord for TileCoord {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    (self.0.x, self.0.y, self.0.z).cmp(&(other.0.x, other.0.y, other.0.z))
+  }
+}
+
+impl PartialOrd for TileCoord {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
 
 impl TileCoord {
   pub fn new(x: i32, y: i32, z: i32) -> Self {

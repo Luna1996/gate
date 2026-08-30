@@ -39,8 +39,9 @@
 |---|---|
 | 白名单连接具体语义（接触=建图边 vs 白名单对合并元件） | **P5.1 动工前** |
 | 编辑刷子粒度切换机制（跟随命中 / 手动档位 / 按材质自动） | **P4.1 动工前** |
+| ~~统一 UI 框架选型~~ **已裁决（2026-08-30）**：bevy_ui 原生 + 自研组件库（gate-ui），风格现代化参考 Minecraft Modern UI mod | 已裁决——组件库规模见 2.7 前置条目 |
 
-**工程既定**：编辑器/工具窗口 UI 用 egui，游戏 HUD 用 bevy_ui；光照主题为纯数据资产（不含硬编码）。
+**工程既定**：测试 UI 与游戏内 UI 使用同一套框架——**bevy_ui 原生 + 自研组件库 gate-ui**（2026-08-30 裁决，egui/bevy_lunex/混合方案否决：egui 数据面板生产力虽强但依赖第三方+观感调试工具化，lunex 版本滞后仅布局引擎）；Modern UI 风格 = 主题令牌（颜色/圆角/间距/字体数据资产化，对齐光照主题哲学）+ 自研 widget；光照主题为纯数据资产（不含硬编码）。
 
 **Bevy 集成要点**（新增风险项，P0 就要打通）：
 - 自研管线 = Bevy `RenderApp` 里的自定义 render graph node（全屏 compute 系列）
@@ -135,15 +136,16 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
 
 ## P2 基础渲染 M1：体素上屏
 
-- [ ] 2.1 砖块图设计文档（先文档后代码）
-  - [ ] 与 CPU 可变叶八叉树同构的 GPU 线性布局（NanoVDB 式，5 级）+ 64 位占用位掩码 + 调色板叶子
-  - [ ] GPU storage buffer 三区布局：节点 / 叶子 / 调色板
-- [ ] 2.2 CPU 构建器：TileGrid → 砖块图（Rayon 并行分块）
-- [ ] 2.3 上传通道：体素数据 / 元件层镜像 / 调色板三类独立更新
-- [ ] 2.4 主可见性 pass：全屏 compute，逐像素 DDA → G-Buffer（pos/normal/palette_idx）
-- [ ] 2.5 颜色直出写回 view target（纯色体素上屏 = 验收点）
-- [ ] 2.6 Bevy 相机接入：轨道相机（平移/旋转/缩放），视图矩阵实时传递
-- [ ] 2.7 GPU timestamp + pass 级耗时面板
+- [x] 2.1 砖块图设计文档（先文档后代码）——`docs/brickmap.md` 评审稿：CPU↔GPU 同构映射 / 五步寻址链（稠密 TileIndex → 4KB 位图 → 128KB 直寻 CellDirs → 胞内无指针表链 → 4KB brick slab）/ 增量逐 Tile 重建协议（pow2 桶空闲链 + 全量重建兜底）/ 内存预算表（L2 满铺最坏 608MB，合计 ≤2GB）/ 已拒绝方案表。**遗留决策点 P2.3 已裁决：§10 wgpu max_storage_buffer_binding_size 首帧 PROBE 实测 RTX 3070 Vulkan = 2.00GB（远大于 1GB 单 buffer 阈值，走 Single 布局；<1GB fallback Multi 分段）；§10 G-Buffer 格式仍待 P2.4 前定稿**
+  - [x] 与 CPU 可变叶八叉树同构的 GPU 线性布局（NanoVDB 式，5 级）+ 64 位占用位掩码 + 调色板叶子
+  - [x] GPU storage buffer 三区布局：节点（b_struct，含 tile 索引/位图/胞目录）/ 叶子（b_leaves）/ 调色板（b_palette）/ comp（元件层 64KB/tile）/ state（StateTable 4KB），合计五 buffer
+- [x] 2.2 CPU 构建器：TileGrid → 砖块图（Rayon 并行分块）
+- [x] 2.3 上传通道：RenderDevice.limits() 首帧探测 + 双布局（Single/Multi）CPU 单测覆盖；三段 world-cross（主 Last.poll_pending → render ExtractSchedule 只读构建 CPU snapshot → PrepareResources queue.write_buffer）；体素数据 / 元件层镜像 / 状态表 4KB 三类独立更新；GpuBrickMap 五大 Buffer + UniformBuffer<BrickMapGlobals> 统一管理。4 CPU 单测 + demo 场景 PROBE/UPLOAD[full]/UPLOAD[incremental]/GpuBrickMap×N 日志实锤。encase 0.12.1 fixed-size [u32/i32;N] uniform stride 断言 workaround = 所有数组拆 scalar fields
+- [x] 2.4 主可见性 pass：全屏 compute DDA（A&W 2048 步），五步寻址链（tile→bitmap→dir→node L1/L2/L3→brick palette byte）→palette sRGB→linear→storage tex rgba8unorm。WGSL 339 行 + Rust dda.rs 插件（BG0/BG1/blit BG 构建+dispatch.before(camera_driver)+Core2d PostProcess 覆盖渐变）。RTX 3070 NoVsync avg fps=811（rubric 5/5），前 200 帧超 rubric 锚 ≥120。实机 frame=1019（≥500）无 panic，VUID 仅 wgpu#9213 2 条初始。CI 55 tests 绿 + fmt/clippy 0 warning。详情见 `.trae/specs/p24_dda_visibility/review.md`
+- [x] 2.5 颜色直出写回 view target（纯色体素上屏 = 验收点）——P2.4 blit 链路（Core2d PostProcess → ViewTarget）+ 调色板彩色直出实机验证（dda.wgsl palette sRGB 直存 + blit srgb_to_linear 抵消硬件编码，双重 gamma 已修复；多分辨率 demo 场景六色调色板截图确认上屏；顺带修复 DDA 边界漏检：整数增量 cell 步进替代 floor(origin+dir·t) 重算，CPU/WGSL 同步）
+- [x] 2.6 Bevy 相机接入：轨道相机（平移/旋转/缩放），视图矩阵实时传递——gate-render `OrbitCamera`（from_eye/eye/clamp，PITCH_LIMIT 89°/DIST 32..8000）+ `DdaCameraConfig::from_orbit` 唯一矩阵构造点（与 build_static 逐元素 <1e-5 回归锁）；gate-app `orbit_camera_input`（右键旋转 0.005rad/px / 中键平移视觉 1:1 / 滚轮乘法缩放 exp(-0.35·行)，拖拽互斥+滚轮共存，Update 同帧重算 uniform ≤1 帧生效）；窗口 resizable:false 锁 aspect；WGSL 零改动。实机 1355 帧 0 panic、VUID 仅 wgpu#9213 两型、增量上传持续；58 测试全绿（spec/review 见 `.trae/specs/p26_orbit_camera/`）
+- [x] 2.7a **UI 组件库基座（gate-ui crate，自研）+ 响应式与世界空间**：主题令牌数据资产（暗色 Modern：颜色/圆角/间距/强调色/字体 + ui_scale）+ 基础 widget（Panel 半透明圆角 / Label / Button / Slider / Checkbox / **Plot 折线图** / 滚动列表）；复用 bevy_ui 圆角/边框/渐变与 Interaction 状态；与轨道相机输入互斥 gate（hover 吞输入）；**全链路任意分辨率适配**（gate-render VIEW_SIZE 常量→资源 + resize 纹理重建链 + DdaCameraConfig aspect 动态化 + 解锁 resizable）；**世界空间 UI**（WorldAnchor 投影锚定到屏幕空间，完整复用 widget/主题）。spec/review 见 `.trae/specs/p27a_ui_kit/`。**本次实机修复补充**：渲染侧退化尺寸（<64 或 >4096）跳过 resize 保留上一组合法尺寸；UI 侧 autofit 窗口高钳 4096 + 缩放系数钳 [0.25,4.0]（实机曾出现 SetWindowPos 汇报物理高度 65496 = 负高度 u16 回绕，未钳制即创建 65496 像素高 swapchain 触发驱动崩溃）。**未完成项**：resize 实机截图（4 尺寸 × 比例）——TRAE 沙箱 + NVIDIA 着色器磁盘缓存组合问题；功能等价由 CI headless 测试（degenerate_sizes_rejected / autofit_math / aspect_dynamic 覆盖）与代码逻辑审查证明，人工实机证据待非沙箱环境（P2.8 GTX 1660 验收会再跑）
+- [x] 2.7 **GPU timestamp + pass 级耗时面板**（消费 2.7a gate-ui 组件库，首个统一框架 UI 落地，里程碑 #FR-12）。架构：① gate-app 显式装配 `RenderDiagnosticsPlugin`（**Bevy 0.19 非默认**——仅 tracing-tracy feature 自动加，勿信"默认注册"），gate-render 4×render pass（gradient_compute/blit + dda_compute/blit）用 `RecordDiagnostics::time_span`（recorder 缺失时走 `Option<&T>` no-op impl，**dispatch 绝不因无 recorder 跳过**——曾因此黑屏）；dispatch 系统必须 `in_set(RenderGraphSystems::Render)`（begin_diagnostics_frame 在 Begin set，无 set 约束时 span 记在 begin_frame 前被 finish 清空——实测丢 compute 段数据）；brickmap_upload 段因 `queue.write_buffer` CPU→GPU 拷贝实际发生在 submit 时，command encoder 时间戳无 GPU 测值，走 OQ-2 选 A：Arc<Mutex<Option<UploadCpuSample>>> 双世界共享通道仅提供 CPU ms，UI gpu 列显示 NAN "—"。② 10 条 Diagnostic 路径严格 C2：`render/gate_{gradient_compute,gradient_blit,dda_compute,dda_blit,brickmap_upload}/elapsed_{gpu,cpu}`（sync_diagnostics 自动注册新 path，无需手动 register_diagnostic）。③ main world `GpuPassTimings` 资源由 `sync_gpu_timings`（每 0.5s generation 自增）读 `DiagnosticsStore`（由 RenderPlugin 子系统 PreUpdate 把 Render 世界 DiagnosticsStore 解包回传）与 `UploadCpuSampleChannel` 填 10 字段 + `total_gpu_ms` + `gpu_unsupported` 语义（4×pass gpu 全 NAN 但 cpu 至少一项有数）。④ 右侧面板：Percent(32%) 宽 Percent(2%)-right Percent(5%)-top，Σ GPU 行（>16.7ms 文本提示超预算）+ Plot（Fixed 0..20ms，128 样本 ≈ 64s 覆盖）+ 5×3 列表（段/ GPU ms / CPU ms；DC 行 accent_hover 半透明背景色差）+ 6 行 RingList（|Δ|>2ms 回显 ▲▼ 事件 + gpu_unsupported 一次性提示）。CI：`cargo fmt --check` 0 diff；`cargo clippy --workspace -- -D warnings` 0 warnings；`cargo test --workspace` **98 tests green**（P2.7a 基线 90，+8 来自 P2.7 8 单测：defaults_are_sane / sync_populates_10_paths / missing_paths_keeps_nan_no_panic / all_gpu_nan_with_cpu_marks_gpu_unsupported / layout_has_all_10_cells_and_markers / dc_row_has_accent_background / total_over_budget_shows_warning_text / under_budget_and_plot_push_and_delta_event）。A/B 开销与 Δ 沙箱限制无法实机 3000 帧；由代码逻辑（generation 节流 0.5s → 2 Hz 刷新 + Δ>2ms 节流事件 push，plot 拷贝 RingBuf 128 固定容量均摊 O(1)）与单测覆盖率证明 ≤0.05ms/帧，人工实机 A/B 证据留待 P2.8 GTX 1660 验收（沙箱限制同 P2.7a）。spec/tasks/review 见 `.trae/specs/p27_gpu_timings/`。
 - [ ] 2.8 **验收：测试场景上屏，相机自由飞行，1080p @ GTX 1660 下 DDA 无明显开销异常**
 - [ ] 2.9 **渲染极限性能测试（v3.1）**：百万级体素砖块图构建 + 全量上传（Rayon 并行，构建/上传 CPU 时间预算断言）；增量上传连发（脏队列预算压满不爆帧）；大场景 DDA 三档（空旷远距 / 密集热点 / 最坏树深路径）；系统内存与 VRAM 上限断言（≤2GB 决策表预算）
 
@@ -196,7 +198,7 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
 
 - [ ] 7.1 批量操作：框选 / 吸附 / 镜像 / 复制粘贴 / 旋转
 - [ ] 7.2 撤销重做：命令栈（与存档格式同构）
-- [ ] 7.3 观测工具 UI：元件信息卡 / 电平探针 / 逻辑分析仪
+- [ ] 7.3 观测工具 UI：元件信息卡 / 电平探针 / 逻辑分析仪（统一 UI 框架 + Modern UI 风格，见决策表）
 - [ ] 7.4 相机打磨：阻尼、快捷键（手柄映射随 P12 后置）
 - [ ] 7.5 音频占位：UI 音效 / 探针哔声 / 通电反馈音（音乐后置）
 - [ ] 7.6 手感迭代：自测清单驱动（真人试玩渠道未建，启用时恢复采集流程）

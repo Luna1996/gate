@@ -8,6 +8,7 @@ use bevy::{
   prelude::*,
   render::{
     Render, RenderApp, RenderStartup, RenderSystems,
+    diagnostic::RecordDiagnostics,
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
     render_resource::{
@@ -24,8 +25,27 @@ use std::borrow::Cow;
 
 pub const SHADER_ASSET_PATH: &str = "shaders/gradient.wgsl";
 pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
+/// 初始渲染分辨率（窗口创建尺寸；resize 后由 RenderScale 资源接管，FR-5）
 pub const VIEW_SIZE: UVec2 = UVec2::new(1280, 720);
-const WORKGROUP_SIZE: u32 = 8;
+pub const WORKGROUP_SIZE: u32 = 8;
+
+/// 当前渲染分辨率（main world `resize_render_targets` 更新，提取进 render world；
+/// dispatch workgroup 数随它重算，shader 侧自行越界剔除）
+#[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
+pub struct RenderScale {
+  pub size: UVec2,
+}
+
+impl Default for RenderScale {
+  fn default() -> Self {
+    Self { size: VIEW_SIZE }
+  }
+}
+
+/// gradient blit 的排序锚点 set：dda blit 通过 .after(GradientBlitSet) 保证
+/// 在渐变 blit 之后执行（Core2d 同 set 系统默认无序）
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GradientBlitSet;
 
 pub struct GradientPlugin;
 
@@ -34,6 +54,8 @@ impl Plugin for GradientPlugin {
     app.add_plugins((
       ExtractResourcePlugin::<GradientImages>::default(),
       ExtractResourcePlugin::<GradientUniforms>::default(),
+      ExtractResourcePlugin::<RenderScale>::default(),
+      crate::responsive::ResponsivePlugin,
     ));
 
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -45,12 +67,24 @@ impl Plugin for GradientPlugin {
         Render,
         prepare_bind_group.in_set(RenderSystems::PrepareBindGroups),
       )
-      // compute 在 camera_driver 前写 storage texture（阶段 A 验证过的时序）
-      .add_systems(RenderGraph, dispatch_gradient.before(camera_driver))
+      // compute 在 camera_driver 前写 storage texture（阶段 A 验证过的时序）。
+      // 必须 in_set(RenderGraphSystems::Render)：begin_diagnostics_frame 在 Begin set，
+      // 无 set 约束时与 Begin 顺序未定——span 若记在 begin_frame 前会被 finish 清空（实测丢数据）
+      .add_systems(
+        RenderGraph,
+        dispatch_gradient
+          .in_set(bevy::render::renderer::RenderGraphSystems::Render)
+          .before(camera_driver),
+      )
       // blit 挂在 Core2d 的 PostProcess set：MainPass（含 clear）之后、
       // upscaling（上屏 copy）之前。camera_driver 之后挂载无效——
       // surface copy 在 camera_driver 内部的相机图末尾就完成了
-      .add_systems(Core2d, blit_view.in_set(Core2dSystems::PostProcess));
+      .add_systems(
+        Core2d,
+        blit_view
+          .in_set(GradientBlitSet)
+          .in_set(Core2dSystems::PostProcess),
+      );
   }
 }
 
@@ -184,6 +218,7 @@ fn dispatch_gradient(
   bind_group: Option<Res<GradientImageBindGroup>>,
   pipeline_cache: Res<PipelineCache>,
   pipeline: Res<GradientPipeline>,
+  scale: Res<RenderScale>,
 ) {
   let Some(bind_group) = bind_group.as_ref() else {
     return;
@@ -193,20 +228,28 @@ fn dispatch_gradient(
     return;
   };
 
+  // P2.7：诊断 span（recorder 缺失时 Option<&T> impl no-op，**dispatch 绝不跳过**——
+  // RenderDiagnosticsPlugin 非默认装配（需 tracing-tracy feature），不能因无 recorder 丢渲染）
+  let recorder = render_context.diagnostic_recorder();
+  let recorder = recorder.as_deref();
+  let span = recorder.time_span(render_context.command_encoder(), "gate_gradient_compute");
   let mut pass = render_context
     .command_encoder()
     .begin_compute_pass(&ComputePassDescriptor::default());
   pass.set_bind_group(0, &bind_group.0, &[]);
   pass.set_pipeline(pipeline);
   pass.dispatch_workgroups(
-    VIEW_SIZE.x / WORKGROUP_SIZE,
-    VIEW_SIZE.y / WORKGROUP_SIZE,
+    scale.size.x.div_ceil(WORKGROUP_SIZE),
+    scale.size.y.div_ceil(WORKGROUP_SIZE),
     1,
   );
+  drop(pass);
+  span.end(render_context.command_encoder());
 }
 
 /// 全屏 blit：storage texture → view target（相机 surface）
 /// 挂载在 Core2d 的 PostProcess set：MainPass（含 clear）后、upscaling 上屏前
+/// 排序锚点 GradientBlitSet 供 dda blit .after() 使用
 fn blit_view(
   mut render_context: RenderContext,
   views: Query<&ViewTarget>,
@@ -221,6 +264,14 @@ fn blit_view(
     return;
   };
 
+  // NOTE：P2.7 本应使用 `pass_span(pass, ...)`（含 pipeline statistics），但此处
+  // `forget_lifetime()` 把 `RenderPass<'a>` 变成无生命周期封装 `RenderPass`，
+  // 后续再无法把 &mut 归还给 guard.end()。折中：`time_span(encoder)` 覆盖整段
+  // begin_render_pass + draw，**不记录 pipeline statistics**（本 spec 非目标项）。
+  // recorder 缺失（插件未装配）→ Option<&T> impl no-op，draw 绝不跳过。
+  let recorder = render_context.diagnostic_recorder();
+  let recorder = recorder.as_deref();
+  let span = recorder.time_span(render_context.command_encoder(), "gate_gradient_blit");
   let pass = render_context
     .command_encoder()
     .begin_render_pass(&RenderPassDescriptor {
@@ -235,6 +286,8 @@ fn blit_view(
   pass.set_pipeline(pipeline);
   pass.set_bind_group(0, &bind_group.0, &[]);
   pass.draw(0..3, 0..1);
+  drop(pass);
+  span.end(render_context.command_encoder());
 }
 
 /// 创建渐变目标纹理（RENDER_WORLD 专用，storage + 采样双用途）

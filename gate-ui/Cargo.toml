@@ -1,0 +1,10 @@
+[package]
+name = "gate-ui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }

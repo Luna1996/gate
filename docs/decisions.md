@@ -11,6 +11,7 @@
 | [ADR-0002](#adr-0002bevy-019-渲染挂载模式与开发环境基线p03-spike-结论) | Bevy 0.19 渲染挂载模式与开发环境基线 | 已接受 | 2026-08-29 |
 | [ADR-0003](#adr-0003viewtarget-直写的挂载点与格式msaa-契约p03-阶段-b) | ViewTarget 直写的挂载点与格式/MSAA 契约 | 已接受 | 2026-08-29 |
 | [ADR-0004](#adr-0004决策存放原则与工程基线p05p06) | 决策存放原则与工程基线（日志/CI） | 已接受 | 2026-08-29 |
+| [ADR-0005](#adr-0005parley-090-本地补丁cjk-文本分段vendorparley) | parley 0.9.0 本地补丁——CJK 文本分段 | 已接受 | 2026-08-30 |
 
 ---
 
@@ -190,3 +191,66 @@ opt-level = 3
 - ✅ P0 全部完成（0.1~0.6），进入 P1 体素数据层
 - ✅ 决策双源风险消除：TODO 表 = what/why，ADR = how/坑
 - ⚠️ ADR 索引表需随新增 ADR 手动维护（低成本，可接受）
+
+---
+
+## ADR-0005：parley 0.9.0 本地补丁——CJK 文本分段（vendor/parley）
+
+**状态**：已接受
+**日期**：2026-08-30
+
+### 背景
+
+gate-ui（2.7a）引入中文 UI 文本后，每次排版向 stderr 刷：
+
+```text
+ICU4X data error: No segmentation model for complex script: Chinese/Japanese
+```
+
+且整段中文被视为单一不可断行单元（word 边界回退到整段末尾）。
+
+根因链（Bevy 0.19.1 → bevy_text 0.19.1 → parley 0.9.0 → icu_segmenter 2.3.0）：
+
+1. parley 0.9.0 用 `LineSegmenter/WordSegmenter::new_for_non_complex_scripts` 构造分段器，
+   复杂文字载荷（my/km/lo/th/ja）全 None；
+2. CJK 文本进入 word 分段器 complex 路径 → `select(ChineseOrJapanese)` 返回 None →
+   icu_provider `with_display_context`（`logging` feature 开启）打出 `log::warn!`——**不是 panic**，
+   是警告刷屏 + 断行降级；
+3. baked `compiled_data` 里**本来就带有 cjdict**（中文/日文词典约 2MB，`segmenter_dictionary_auto_v1`
+   "und/cjdict"），只是从未被加载；
+4. parley 0.9 无任何 feature 可启用复杂文字支持；bevy_text 0.19.1 锁定 parley 0.9，
+   无法升级到带修复的版本。
+
+注意区分：行分段器侧上游**刻意**不加载 cjdict（line.rs `load_dictionary` 注释：UAX #14 的
+ID 类断行属性允许汉字间断行），行侧 CJK 行为本来就正确；出问题的只有 word 分段器侧
+（CJK 分词必须依赖词典）。
+
+### 决策
+
+- vendor parley 0.9.0（registry 提取物原样复制）到 `vendor/parley`，
+  根 Cargo.toml `[patch.crates-io] parley = { path = "vendor/parley" }` 接管；
+- 唯一改动点 `src/analysis/mod.rs`：`word_segmenter` 改用
+  `WordSegmenter::new_dictionary`（加载 SEA 词典 + cjdict），`line_segmenter` 三个
+  WordBreak 分支改用 `LineSegmenter::new_dictionary`（顺带修复泰/缅/高棉/老挝断行，
+  CJK 行侧行为不变）；
+- const 构造改为运行时构造（`new_dictionary` 非 const；每次调用 5 次静态 zerotrie 查找，
+  开销可忽略，返回值仍借用 `'static` 数据）；
+- 放 `vendor/` 而非 `third_party/`（后者被 .gitignore 排除，补丁必须可提交）；
+  workspace `exclude` 增加 `"vendor"` 防止被吸收为成员（同 ADR-0002 的 cargo#12154 坑）。
+
+### 踩坑记录
+
+- 报错无 panic 包装、应用照常 60fps 运行，容易被当成无害噪音——实际断行行为已降级；
+- `DataError::with_display_context` 在 `logging` feature 下即 `log::warn!`，这就是打印源
+  （错误本身在 select() 里被丢弃、优雅回退）；
+- registry 原地改源码的方式在 `cargo update`/registry 重提取后会静默丢失，必须走
+  `[patch]` + vendor；
+- **中文方框是字体缺失**，与 parley/ICU4X 无关——警告刷屏和方框是两个独立问题，
+  曾短暂误判为同一根因而误撤 vendor 补丁，已恢复。
+
+### 后果
+
+- ✅ 实机验证：运行 12s ICU4X 警告 0 次（修复前主题加载后立即刷屏），CJK 断行正确
+- ✅ workspace 98 测试全绿，parley 公开 API 未变，bevy_text 无感
+- ⚠️ 二进制增大：cjdict ≈2MB + SEA 词典被链接器保留
+- ⚠️ parley 升级或 bevy_text 改绑更高版本时，vendor 补丁需人工重放

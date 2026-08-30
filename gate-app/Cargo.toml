@@ -6,5 +6,7 @@ license.workspace = true
 
 [dependencies]
 bevy = { workspace = true }
+glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }
+gate-ui = { workspace = true }

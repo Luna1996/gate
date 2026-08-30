@@ -27,11 +27,18 @@ pub struct TileGrid {
   tiles: HashMap<TileCoord, Box<Tile>>,
   palette: Palette,
   pub dirty: DirtyTracker,
+  /// 元件层（P2.3 通道，P6 真数据）：每 tile u16[32768] = 组件 ID，空 tile 不占内存
+  comp_layer: HashMap<TileCoord, Box<[u16; 32768]>>,
+  /// 状态表（P2.3 通道，P3.3 占位呼吸，P6 模拟真数据）：
+  /// Vec<[u32; 4]> 按元件 ID 下标；[类型, 状态值, 相位/时间戳, 预留]
+  state_table: Vec<[u32; 4]>,
+  /// state_table 全表脏（P3.3 每帧呼吸）—— 全 4KB 上传，不做增量
+  pub state_dirty: bool,
 }
 
 /// 内存用量核算（P1.7 极限测试的预算断言依据）
 ///
-/// 全部为**深尺寸**：Tile 内联（occupancy 4KB）+ 堆上哈希表/层级表/brick。
+/// 全部为**深尺寸**：Tile 内联（occupancy 4KB）+ 堆上哈希表/层级表/brick + comp/state。
 /// 估算策略偏保守（只高不低）；不含分配器元数据与 false sharing。
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryUsage {
@@ -43,17 +50,32 @@ pub struct MemoryUsage {
   pub tile_heap_bytes: usize,
   /// 脏标记结构合计
   pub dirty_bytes: usize,
+  /// 元件层合计（64KB × 已写 tile 数）
+  pub comp_bytes: usize,
+  /// 状态表合计（16B × 条目数）
+  pub state_bytes: usize,
 }
 
 impl MemoryUsage {
   pub fn total_bytes(&self) -> usize {
-    self.tile_inline_bytes + self.tile_heap_bytes + self.dirty_bytes
+    self.tile_inline_bytes
+      + self.tile_heap_bytes
+      + self.dirty_bytes
+      + self.comp_bytes
+      + self.state_bytes
   }
 }
 
 impl TileGrid {
   pub fn new() -> Self {
-    Self::default()
+    Self {
+      tiles: HashMap::new(),
+      palette: Palette::default(),
+      dirty: DirtyTracker::new(),
+      comp_layer: HashMap::new(),
+      state_table: vec![[0u32; 4]; 256], // 预留 256 条目 = u16 组件 ID 低 8bit（MVP）
+      state_dirty: true,
+    }
   }
 
   pub fn palette(&self) -> &Palette {
@@ -68,6 +90,58 @@ impl TileGrid {
     self.tiles.get(&coord).map(|t| &**t)
   }
 
+  /// 元件层数据引用（P2.3 上传用）
+  pub fn comp_layer(&self) -> &HashMap<TileCoord, Box<[u16; 32768]>> {
+    &self.comp_layer
+  }
+  /// StateTable 字节视图（P2.3 上传用）：4×u32 平铺，256 条目 × 16B = 4096B
+  pub fn state_table_bytes(&self) -> &[u8] {
+    let slice = &self.state_table[..];
+    let byte_len = slice.len() * 16;
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, byte_len) }
+  }
+  /// StateTable 条目读写（P3.3 演示用，P6 真数据）
+  pub fn set_state(&mut self, id: u8, word: usize, value: u32) {
+    debug_assert!(word < 4);
+    if id as usize >= self.state_table.len() {
+      self.state_table.resize(id as usize + 1, [0u32; 4]);
+    }
+    self.state_table[id as usize][word] = value;
+    self.state_dirty = true;
+  }
+  pub fn get_state(&self, id: u8, word: usize) -> u32 {
+    debug_assert!(word < 4);
+    self
+      .state_table
+      .get(id as usize)
+      .map(|a| a[word])
+      .unwrap_or(0)
+  }
+  /// 写单个基元胞的组件 ID（P6 洪泛接）
+  pub fn set_comp(&mut self, tile: TileCoord, cell_idx: u16, comp_id: u16) {
+    let arr = self
+      .comp_layer
+      .entry(tile)
+      .or_insert_with(|| Box::new([0u16; 32768]));
+    if arr[cell_idx as usize] != comp_id {
+      arr[cell_idx as usize] = comp_id;
+      self.dirty.mark_comp(tile);
+    }
+  }
+  /// 读单个基元胞的组件 ID；未写的 tile/cell = 0（AIR/无元件）
+  pub fn get_comp(&self, tile: TileCoord, cell_idx: u16) -> u16 {
+    self
+      .comp_layer
+      .get(&tile)
+      .map(|a| a[cell_idx as usize])
+      .unwrap_or(0)
+  }
+
+  /// 全部 tile 坐标枚举（P2.2 构建器 / P2.3 上传遍历用）
+  pub fn tile_coords(&self) -> impl Iterator<Item = TileCoord> + '_ {
+    self.tiles.keys().copied()
+  }
+
   pub fn tile_count(&self) -> usize {
     self.tiles.len()
   }
@@ -80,12 +154,18 @@ impl TileGrid {
     let tile_heap: usize = self.tiles.values().map(|t| t.heap_bytes()).sum();
     // 外层桶（现仅 TileCoord + Box 指针）+ Tile 载荷（Box 目标，连续堆块）
     let outer = self.tiles.capacity() * (std::mem::size_of::<(TileCoord, Box<Tile>)>() + 1) / 7 * 8;
+    // comp_layer：每个已写 tile 64KB
+    let comp_bytes = self.comp_layer.len() * std::mem::size_of::<[u16; 32768]>();
+    // state_table：Vec<[u32; 4]> 连续堆块
+    let state_bytes = self.state_table.capacity() * std::mem::size_of::<[u32; 4]>();
     MemoryUsage {
       tile_count,
       cell_count,
       tile_inline_bytes: tile_inline * tile_count + outer,
       tile_heap_bytes: tile_heap,
       dirty_bytes: self.dirty.heap_bytes(),
+      comp_bytes,
+      state_bytes,
     }
   }
 
@@ -199,6 +279,20 @@ mod tests {
     // 同位置重写同色 → 无脏
     grid.batch_edit((0..100).map(|i| (IVec3::new(i, 0, 0), 4u8, 1u8)));
     assert_eq!(grid.dirty.data_dirty_count(), 0);
+  }
+
+  #[test]
+  fn tile_coords_enumeration() {
+    let mut grid = TileGrid::new();
+    grid.set_voxel(IVec3::new(5, 5, 5), 4, 1);
+    grid.set_voxel(IVec3::new(-5, 0, 0), 4, 1);
+    let mut coords: Vec<_> = grid.tile_coords().collect();
+    coords.sort();
+    assert_eq!(coords.len(), grid.tile_count());
+    assert_eq!(
+      coords,
+      vec![TileCoord::new(-1, 0, 0), TileCoord::new(0, 0, 0)]
+    );
   }
 
   #[test]
