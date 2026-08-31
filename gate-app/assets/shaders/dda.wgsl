@@ -797,7 +797,7 @@ const SHADOW_SAMPLES: u32 = 2u;
 const SHADOW_BIAS: f32 = 0.5;
 const FINES_PER_M: f32 = 400.0;
 // 诊断开关：0 = 完整阴影；1 = 跳过阴影射线（vis 恒 1.0）
-const DIAG_SKIP_SHADOWS: u32 = 1u;
+const DIAG_SKIP_SHADOWS: u32 = 0u;
 
 // 锥内固定采样方向：轴 l、半角 theta，k ∈ [0,2) 取 φ 对称两方向
 fn cone_sample_dir(l: vec3<f32>, theta: f32, k: u32) -> vec3<f32> {
@@ -929,26 +929,19 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   for (var i: u32 = 0u; i < mov_g.count; i = i + 1u) {
-    // 临时诊断：跳过 MOV 物体循环，看 fps 是否恢复
-    // let cap = min(best_t, frustum_length);
-    // let h = trace_object(i, origin_fine, dir_fine, cap);
-    // if (h.hit && h.t < best_t) {
-    //   best_t = h.t;
-    //   best_pal = h.pal;
-    //   best_obj = i32(i);
-    //   best_n = h.n;
-    // }
+    let cap = min(best_t, frustum_length);
+    let h = trace_object(i, origin_fine, dir_fine, cap);
+    if (h.hit && h.t < best_t) {
+      best_t = h.t;
+      best_pal = h.pal;
+      best_obj = i32(i);
+      best_n = h.n;
+    }
   }
 
-  // ---- 颜色输出：命中 → 光照合成；空 → 背景色 ----
+  // ---- 颜色输出：命中 → 光照合成（NEE 直射 + 软阴影）；空 → 背景色 ----
   if (best_t < 1e+29) {
-    // 诊断模式 C：inline palette 直出（P2.10 基线）
-    let w0 = b_palette[best_pal * 2u];
-    col = vec3<f32>(
-      f32(w0 & 0xFFu),
-      f32((w0 >> 8u) & 0xFFu),
-      f32((w0 >> 16u) & 0xFFu),
-    ) / 255.0;
+    col = shade_hit(origin_fine, dir_fine, best_t, best_pal, best_obj, best_n, frustum_length);
   }
   textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
 }

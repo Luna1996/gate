@@ -79,9 +79,17 @@ fn main() {
             // WorkerGuard 须活到进程退出；App 构建处无处安放，直接泄漏——
             // worker 线程满缓冲 / 每 10ms 即落盘，进程退出由 OS 收尾，尾部丢失可忽略
             std::mem::forget(guard);
+            // 本地时区时间戳（默认 SystemTime timer 是 UTC，+8 区看日志像"慢 8 小时"；
+            // Windows 下 current_local_offset 安全，此处仍在 main 早期单线程阶段，失败回退 UTC）
+            let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+            let timer = tracing_subscriber::fmt::time::OffsetTime::new(
+              offset,
+              time::format_description::well_known::Rfc3339,
+            );
             Some(Box::new(
               tracing_subscriber::fmt::layer()
                 .with_ansi(false)
+                .with_timer(timer)
                 .with_writer(writer),
             ) as BoxedLayer)
           },

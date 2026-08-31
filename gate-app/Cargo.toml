@@ -11,5 +11,8 @@ gate-voxel = { workspace = true }
 gate-render = { workspace = true }
 gate-ui = { workspace = true }
 # 方案 3 日志落盘：版本对齐 bevy_log 0.19.1 内部用法（subcriber 需含默认 fmt/ansi features）
-tracing-subscriber = "0.3.20"
+# "time" feature：OffsetTime 本地时区时间戳（latest.log 此前是 UTC，跨机器核对日志误导）
+tracing-subscriber = { version = "0.3.20", features = ["time"] }
 tracing-appender = "0.2"
+# formatting = Rfc3339 格式化；local-offset = current_local_offset()（Windows 安全，main 早期单线程）
+time = { version = "0.3", features = ["formatting", "local-offset"] }
