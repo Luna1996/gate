@@ -1,0 +1,23 @@
+// 「暗色实验室」光照主题（P3.1 首发）
+// 方向光 dir = 光传播方向（指向场景，打包时翻转为 L 指向光）；
+// angular_radius_deg = 太阳盘角半径（软阴影锥采样角）；
+// 点光 pos/radius 单位 fine（0.25cm），intensity = 米制衰减系数；
+// ambient/exposure 为线性空间常数项（P3.4 体素 AO 前的占位环境光）。
+(
+    sun: Some((
+        dir: (0.45, -0.72, 0.35),
+        angular_radius_deg: 2.0,
+        color: (1.0, 0.95, 0.85),
+        intensity: 3.0,
+    )),
+    points: [
+        (
+            pos: (260.0, 340.0, 260.0),
+            radius: 12.0,
+            color: (1.0, 0.85, 0.65),
+            intensity: 12.0,
+        ),
+    ],
+    ambient: (0.045, 0.05, 0.07),
+    exposure: 1.0,
+)

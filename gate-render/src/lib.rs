@@ -1,5 +1,6 @@
 pub mod brickmap;
 mod gradient;
+pub mod lighting;
 mod responsive;
 
 use bevy::prelude::*;
@@ -18,6 +19,11 @@ pub use gradient::{
     GradientImages, GradientUniforms, RenderScale, VIEW_SIZE, create_gradient_image,
 };
 pub use responsive::{ResponsivePlugin, resize_render_targets};
+pub use lighting::{
+    FINES_PER_M, LightDesc, LightGlobals, LightPoolUniform, LightingTheme, MAX_LIGHTS,
+    SHADOW_BIAS, SHADOW_SAMPLES, build_light_pool, cone_sample_dir, parse_lighting_ron,
+    sphere_sample_offset,
+};
 
 pub struct GateRenderPlugin;
 

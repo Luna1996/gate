@@ -167,6 +167,7 @@ fn incremental_burst_frame_budget() {
 
   let mut frames_ms: Vec<f64> = Vec::new();
   let mut frame_bytes: Vec<usize> = Vec::new();
+  let mut frame_tiles: Vec<usize> = Vec::new();
   let mut drained = 0usize;
   while grid.dirty.data_dirty_count() > 0 {
     let coords = grid
@@ -189,6 +190,7 @@ fn incremental_burst_frame_budget() {
       .sum();
     frames_ms.push(el.as_secs_f64() * 1000.0);
     frame_bytes.push(bytes);
+    frame_tiles.push(coords.len());
     drained += coords.len();
   }
   assert_eq!(drained, 64, "脏队列必须被预算机制完全消化");
@@ -198,7 +200,7 @@ fn incremental_burst_frame_budget() {
     assert!(
       *ms < 2.0 * FRAME_MS,
       "第 {f} 帧增量重建 {} tiles 耗时 {ms:.2}ms > 2×16.7ms（压满帧预算）",
-      if f == 0 { budget_n } else { budget_n }
+      frame_tiles[f]
     );
   }
   println!(

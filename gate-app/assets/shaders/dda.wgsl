@@ -136,6 +136,30 @@ struct MovGlobals {
 }
 @group(2) @binding(4) var<uniform> mov_g: MovGlobals;
 
+// ---- BG3：光源池（P3.1）----
+// Rust `lighting.rs::LightPoolUniform` 逐字段镜像（432B：48B header + 8×48B）
+struct LightGlobals {
+  count: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+  ambient: vec4<f32>,      // rgb = 环境色（线性），w reserved
+  exposure_pad: vec4<f32>, // x = 曝光系数
+}
+struct LightDesc {
+  // x = kind（0 = 方向光 / 1 = 点光）；yzw = L 轴（指向光，已归一，方向光）或球心位置（fine，点光）
+  kind_pos_dir: vec4<f32>,
+  // rgb = 线性色，w = 强度（方向光无量纲；点光为米制衰减系数）
+  color_intensity: vec4<f32>,
+  // x = 方向光盘角半径（rad）/ 点光球半径（fine）
+  shape: vec4<f32>,
+}
+struct LightPool {
+  g: LightGlobals,
+  lights: array<LightDesc, 8u>,
+}
+@group(3) @binding(0) var<uniform> light_u: LightPool;
+
 // ============================================================================
 // 五步寻址链 sample_brickmap(fine: vec3<i32>) -> u32 (palette_idx, 0=AIR)
 // 严格对应 view.rs get_voxel L55-147：
@@ -401,22 +425,30 @@ fn mov_sample_voxel(bmp_base: u32, dir_b: u32, node_b: u32, leaves_b: u32,
 }
 
 // 物体局部细扫：单粗 cell（16³ fine）内有界 fine DDA。对应 mov.rs::obj_fine_scan_cell
-// 返回 (hit, t_rel_hit, pal)；t 为「相对 start」标尺（调用方 + tl0 还原全局）
+// 返回 (hit, t_rel_hit, pal, axis)；t 为「相对 start」标尺（调用方 + tl0 还原全局）；
+// axis = 命中轴 0/1/2（法线用），3 = 起点即在体内
 struct FineHit {
   hit: bool,
   t: f32,
   pal: u32,
+  axis: u32,
 }
 fn mov_fine_scan_cell(bmp_base: u32, dir_b: u32, node_b: u32, leaves_b: u32,
                       ro: vec3<f32>, rd: vec3<f32>, sign: vec3<i32>, delta: vec3<f32>,
                       cc: vec3<i32>, t_lo: f32, t_hi: f32) -> FineHit {
-  if (t_hi <= t_lo) { return FineHit(false, 0.0, 0u); }
+  // 诊断开关：0 = 完整；1 = 初始胞采样 only（跳过 A&W）；2 = 全 skip（return miss）
+  const MOV_FINE_DIAG: u32 = 0u;
+  if (MOV_FINE_DIAG == 2u) { return FineHit(false, 0.0, 0u, 3u); }
+  if (t_hi <= t_lo) { return FineHit(false, 0.0, 0u, 3u); }
   let p = ro + rd * t_lo;
-  let base = cc << vec3<u32>(4u);   // cell 起点 fine 坐标（移位量显式 u32 向量）
-  // 入口 fine 胞 clamp 进本 cell（入口面浮点误差防护，同世界版）
+  let base = cc << vec3<u32>(4u);
   let fc0 = clamp(vec3<i32>(floor(p)), base, base + vec3<i32>(15));
+  // 初始 fine 胞采样（两种模式都跑）
+  let pal0_init = mov_sample_voxel(bmp_base, dir_b, node_b, leaves_b, fc0);
+  if (pal0_init != 0u) { return FineHit(true, t_lo, pal0_init, 3u); }
+  if (MOV_FINE_DIAG == 1u) { return FineHit(false, 0.0, 0u, 3u); }
+  // ---- 完整 A&W 细步循环（MOV_FINE_DIAG == 0）----
   var fc = fc0;
-  // fine tmax：相对 t_lo 的距离（自 cell 入口重算，非累加）
   var tmax_f = vec3<f32>(1e+30);
   if (abs(rd.x) > 1e-30) {
     let t = (next_boundary(fc0.x, sign.x) - p.x) / rd.x;
@@ -432,38 +464,39 @@ fn mov_fine_scan_cell(bmp_base: u32, dir_b: u32, node_b: u32, leaves_b: u32,
   }
   let span = t_hi - t_lo;
   var t_f = 0.0;
-  // 初始 fine 胞采样
-  let pal0 = mov_sample_voxel(bmp_base, dir_b, node_b, leaves_b, fc0);
-  if (pal0 != 0u) { return FineHit(true, t_lo, pal0); }
-  // 48 = 3 轴 × 16：斜穿 16³ cell 的步数上界
   for (var i_f: u32 = 0u; i_f < 48u; i_f = i_f + 1u) {
     if (t_f >= span) { break; }
+    var axis = 2u;
     if (tmax_f.x <= tmax_f.y && tmax_f.x <= tmax_f.z) {
       t_f = tmax_f.x;
       tmax_f.x = tmax_f.x + delta.x;
       fc.x = fc.x + sign.x;
+      axis = 0u;
     } else if (tmax_f.y <= tmax_f.z) {
       t_f = tmax_f.y;
       tmax_f.y = tmax_f.y + delta.y;
       fc.y = fc.y + sign.y;
+      axis = 1u;
     } else {
       t_f = tmax_f.z;
       tmax_f.z = tmax_f.z + delta.z;
       fc.z = fc.z + sign.z;
     }
     let pal = mov_sample_voxel(bmp_base, dir_b, node_b, leaves_b, fc);
-    if (pal != 0u) { return FineHit(true, t_lo + t_f, pal); }
+    if (pal != 0u) { return FineHit(true, t_lo + t_f, pal, axis); }
   }
-  return FineHit(false, 0.0, 0u);
+  return FineHit(false, 0.0, 0u, 3u);
 }
 
 // 单物体两级 DDA。对应 mov.rs::cpu_reference_object_ray：
 // 世界 AABB 预剔除 → 局部变换（rd 不归一化，t 标尺不变）→ 局部 tile 盒 slab →
 // cell 粗步（上限 96 = 3×32，cell 0..31³）+ fine 细步。返回 t 为全局标尺。
+// n = 命中面法线（世界空间单位向量，指向射线来向；起点在体内时 = -dir 局部方向）
 struct ObjHit {
   hit: bool,
   t: f32,
   pal: u32,
+  n: vec3<f32>,
 }
 fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjHit {
   // ---- descriptor 解码（32 words，f32 字段 bitcast）----
@@ -473,7 +506,6 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
     bitcast<f32>(mov_descs[base + 1u]),
     bitcast<f32>(mov_descs[base + 2u]));
   let scale = bitcast<f32>(mov_descs[base + 3u]);
-  // 旋转列（world = pos + R·(local·scale)）
   let col0 = vec3<f32>(
     bitcast<f32>(mov_descs[base + 4u]),
     bitcast<f32>(mov_descs[base + 5u]),
@@ -501,9 +533,11 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
 
   // ---- 世界 AABB 预剔除（几乎零成本）----
   let bx = slab_box(origin, dir, w_mn, w_mx, 0.0, t_cap);
-  if (bx.y < max(bx.x, 0.0) || bx.x >= t_cap) { return ObjHit(false, 0.0, 0u); }
+  if (bx.y < max(bx.x, 0.0) || bx.x >= t_cap) { return ObjHit(false, 0.0, 0u, vec3<f32>(0.0)); }
   let t_hi_cap = min(bx.y, t_cap);
-  if (t_hi_cap <= max(bx.x, 0.0)) { return ObjHit(false, 0.0, 0u); }
+  if (t_hi_cap <= max(bx.x, 0.0)) { return ObjHit(false, 0.0, 0u, vec3<f32>(0.0)); }
+  // 诊断：slab_box 后直接 return miss（跳过局部变换 + A&W）
+  // return ObjHit(false, 0.0, 0u, vec3<f32>(0.0));
 
   // ---- 局部变换：local = ((w - pos)·col_i) / scale（rd 不归一化）----
   let wp = origin - obj_pos;
@@ -512,10 +546,12 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
 
   // ---- 局部 tile 盒 [0,512]³ slab ----
   let tl = slab_box(ro, rd, vec3<f32>(0.0), vec3<f32>(f32(LOCAL_TILE_FINE)), 0.0, t_hi_cap);
-  if (tl.y < max(tl.x, 0.0)) { return ObjHit(false, 0.0, 0u); }
+  if (tl.y < max(tl.x, 0.0)) { return ObjHit(false, 0.0, 0u, vec3<f32>(0.0)); }
   let tl0 = max(tl.x, 0.0);
   let tl1 = min(tl.y, t_hi_cap);
-  if (tl1 <= tl0) { return ObjHit(false, 0.0, 0u); }
+  if (tl1 <= tl0) { return ObjHit(false, 0.0, 0u, vec3<f32>(0.0)); }
+  // 诊断：局部 slab 后直接 return miss（跳过 A&W）——第 2 级诊断
+  // return ObjHit(false, 0.0, 0u, vec3<f32>(0.0));
 
   // ---- 两级 A&W（cell 0..31³）；全程「相对 start 的 t」标尺，返回时 +tl0 ----
   var sign_v = vec3<i32>(1i);
@@ -550,7 +586,17 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
       let f = mov_fine_scan_cell(bmp_base, dir_b, node_b, leaves_b,
                                  start, rd, sign_v, delta, cc,
                                  t_in, min(t_out, t_rel_max));
-      if (f.hit) { return ObjHit(true, tl0 + f.t, f.pal); }
+      if (f.hit) {
+        // 局部命中法线：-sign[axis] 单位轴；axis=3（起点在体内）→ -rd 方向
+        //（CPU: -rd.normalize_or_zero()；rd 非零恒成立，normalize 即可）
+        var n_local = -rd;
+        if (f.axis == 0u) { n_local = vec3<f32>(f32(-sign_v.x), 0.0, 0.0); }
+        else if (f.axis == 1u) { n_local = vec3<f32>(0.0, f32(-sign_v.y), 0.0); }
+        else if (f.axis == 2u) { n_local = vec3<f32>(0.0, 0.0, f32(-sign_v.z)); }
+        // 局部法线 → 世界：n_world = R · n_local（列线性组合），renormalize 消舍入
+        let n_world = normalize(n_local.x * col0 + n_local.y * col1 + n_local.z * col2);
+        return ObjHit(true, tl0 + f.t, f.pal, n_world);
+      }
     }
     if (t_out >= t_rel_max) { break; }
     // 粗级步进
@@ -568,13 +614,276 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
       cc.z = cc.z + sign_v.z;
     }
   }
-  return ObjHit(false, 0.0, 0u);
+  return ObjHit(false, 0.0, 0u, vec3<f32>(0.0));
 }
 
 // 物体 palette 解包（mov_palette 字基址 + pal_idx × 2 words）
 fn mov_palette_rgb(pal_b: u32, pal_idx: u32) -> vec3<u32> {
   let w0 = mov_palette[pal_b + pal_idx * 2u];
   return vec3<u32>(w0 & 0xFFu, (w0 >> 8u) & 0xFFu, (w0 >> 16u) & 0xFFu);
+}
+
+// ============================================================================
+// P3.1 光照：trace_world 提取（主视线/阴影射线共用）+ scene_occluded 快路径
+// ============================================================================
+
+// 世界两级 DDA（原 dda_main 内联体提取，t_exit 初值参数化 = t_max）：
+// - 主视线：t_max = frustum_length（行为与 P2.10 前完全一致）
+// - 阴影射线：t_max = 段长；window AABB 剪裁保证出窗即停（无空域空走）
+// 返回 t（自 origin 的全局标尺）、palette、命中面法线（世界空间，指向射线来向）。
+struct WorldHit {
+  t: f32,
+  pal: u32,
+  n: vec3<f32>,
+}
+fn trace_world(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> WorldHit {
+  let miss = WorldHit(1e+30, 0u, vec3<f32>(0.0));
+  // ---- slab 法求射线 vs brickmap tile-window AABB（fine 坐标）相交区间 ----
+  let tile_origin_fine = vec3<f32>(
+    f32(g.index_origin_x) * 512.0,
+    f32(g.index_origin_y) * 512.0,
+    f32(g.index_origin_z) * 512.0,
+  );
+  let aabb_min = tile_origin_fine;
+  let aabb_max = tile_origin_fine + vec3<f32>(
+    f32(g.index_dims_x) * 512.0,
+    f32(g.index_dims_y) * 512.0,
+    f32(g.index_dims_z) * 512.0,
+  );
+  var t_enter = 0.0;
+  var t_exit  = t_max;
+  {
+    // X 轴 slab
+    let d = dir.x;
+    if (abs(d) < 1e-30) {
+      if (origin.x < aabb_min.x || origin.x > aabb_max.x) { return miss; }
+    } else {
+      let t1 = (aabb_min.x - origin.x) / d;
+      let t2 = (aabb_max.x - origin.x) / d;
+      t_enter = max(t_enter, min(t1, t2));
+      t_exit  = min(t_exit,  max(t1, t2));
+    }
+    // Y 轴 slab
+    {
+      let d = dir.y;
+      if (abs(d) < 1e-30) {
+        if (origin.y < aabb_min.y || origin.y > aabb_max.y) { return miss; }
+      } else {
+        let t1 = (aabb_min.y - origin.y) / d;
+        let t2 = (aabb_max.y - origin.y) / d;
+        t_enter = max(t_enter, min(t1, t2));
+        t_exit  = min(t_exit,  max(t1, t2));
+      }
+    }
+    // Z 轴 slab
+    {
+      let d = dir.z;
+      if (abs(d) < 1e-30) {
+        if (origin.z < aabb_min.z || origin.z > aabb_max.z) { return miss; }
+      } else {
+        let t1 = (aabb_min.z - origin.z) / d;
+        let t2 = (aabb_max.z - origin.z) / d;
+        t_enter = max(t_enter, min(t1, t2));
+        t_exit  = min(t_exit,  max(t1, t2));
+      }
+    }
+  }
+  if (t_exit < max(t_enter, 0.0)) { return miss; }
+  let t_enter_clamped = max(t_enter, 0.0);
+  let t_exit_clamped  = min(t_exit, t_max);
+  if (t_exit_clamped <= t_enter_clamped) { return miss; }
+
+  // ---- 起点推进 + 两级 A&W（相对标尺），与 cpu_reference_dda_ray_two_level 同构 ----
+  let start_v = origin + dir * t_enter_clamped;
+  let t_rel_max = t_exit_clamped - t_enter_clamped;
+  var sign_v = vec3<i32>(1i);
+  sign_v = select(sign_v, vec3<i32>(-1i), dir < vec3<f32>(0.0));
+  var delta = vec3<f32>(1e+30);
+  delta = select(delta, 1.0 / abs(dir), abs(dir) > vec3<f32>(1e-30));
+  let delta_c = delta * 16.0;
+  // 粗 cell = floor(start_v) >> 4（算术右移 = floor 除法，负坐标正确；不 clamp，出窗占用查询返 false）
+  var cc = vec3<i32>(floor(start_v)) >> vec3<u32>(4u);
+  var tmax_c = vec3<f32>(1e+30);
+  // 下一粗边界（无 window 下限 clamp：负坐标 tile 合法，同内联版 next_coarse_boundary）
+  {
+    let b = (cc + select(vec3<i32>(1), vec3<i32>(0), dir < vec3<f32>(0.0))) << vec3<u32>(4);
+    let tb = vec3<f32>(b) - start_v;
+    let td = tb / dir;
+    tmax_c = select(vec3<f32>(1e+30), max(td, vec3<f32>(0.0)), abs(dir) > vec3<f32>(1e-30));
+  }
+  var t_in = 0.0;
+  for (var step_c: u32 = 0u; step_c < 16384u; step_c = step_c + 1u) {
+    let t_out = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
+    if (cell_occupied(cc)) {
+      let t_hi = min(t_out, t_rel_max);
+      if (t_hi > t_in) {
+        let p = start_v + dir * t_in;
+        let base = cc << vec3<u32>(4);
+        let fc0 = clamp(vec3<i32>(floor(p)), base, base + vec3<i32>(15));
+        var fc = fc0;
+        var tmax_f = vec3<f32>(1e+30);
+        tmax_f = select(tmax_f, max((vec3<f32>(fc0 + select(vec3<i32>(1), vec3<i32>(0), dir < vec3<f32>(0.0))) - p) / dir, vec3<f32>(0.0)), abs(dir) > vec3<f32>(1e-30));
+        var t_f = 0.0;
+        let span = t_hi - t_in;
+        let pal0 = sample_brickmap(fc0);
+        if (pal0 != 0u) {
+          // 起点即在体内：法线 = -dir（axis=3 语义）
+          return WorldHit(t_enter_clamped + t_in, pal0, normalize(-dir));
+        }
+        for (var i_f: u32 = 0u; i_f < 48u && t_f < span; i_f = i_f + 1u) {
+          var axis = 2u;
+          if (tmax_f.x <= tmax_f.y && tmax_f.x <= tmax_f.z) {
+            t_f = tmax_f.x;
+            tmax_f.x = tmax_f.x + delta.x;
+            fc.x = fc.x + sign_v.x;
+            axis = 0u;
+          } else if (tmax_f.y <= tmax_f.z) {
+            t_f = tmax_f.y;
+            tmax_f.y = tmax_f.y + delta.y;
+            fc.y = fc.y + sign_v.y;
+            axis = 1u;
+          } else {
+            t_f = tmax_f.z;
+            tmax_f.z = tmax_f.z + delta.z;
+            fc.z = fc.z + sign_v.z;
+          }
+          let pal = sample_brickmap(fc);
+          if (pal != 0u) {
+            // 面法线 = -sign[axis] 单位轴（射线朝 +axis 穿入 → 面在 -axis 侧）
+            var n = vec3<f32>(0.0);
+            if (axis == 0u) { n = vec3<f32>(f32(-sign_v.x), 0.0, 0.0); }
+            else if (axis == 1u) { n = vec3<f32>(0.0, f32(-sign_v.y), 0.0); }
+            else { n = vec3<f32>(0.0, 0.0, f32(-sign_v.z)); }
+            return WorldHit(t_enter_clamped + t_in + t_f, pal, n);
+          }
+        }
+      }
+    }
+    if (t_out >= t_rel_max) { break; }
+    if (tmax_c.x <= tmax_c.y && tmax_c.x <= tmax_c.z) {
+      t_in = tmax_c.x;
+      tmax_c.x = tmax_c.x + delta_c.x;
+      cc.x = cc.x + sign_v.x;
+    } else if (tmax_c.y <= tmax_c.z) {
+      t_in = tmax_c.y;
+      tmax_c.y = tmax_c.y + delta_c.y;
+      cc.y = cc.y + sign_v.y;
+    } else {
+      t_in = tmax_c.z;
+      tmax_c.z = tmax_c.z + delta_c.z;
+      cc.z = cc.z + sign_v.z;
+    }
+  }
+  return miss;
+}
+
+// 遮挡快路径（阴影射线）：[0, t_max) 内任一命中即 true，无「最近」比较。
+// 对应 mov.rs::cpu_reference_scene_occluded。
+fn scene_occluded(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> bool {
+  let w = trace_world(origin, dir, t_max);
+  if (w.t < t_max) { return true; }
+  for (var i: u32 = 0u; i < mov_g.count; i = i + 1u) {
+    let h = trace_object(i, origin, dir, t_max);
+    if (h.hit && h.t < t_max) { return true; }
+  }
+  return false;
+}
+
+// ============================================================================
+// P3.1 光照：软阴影采样 + NEE 直射合成（lighting.rs CPU 参考逐字镜像）
+// ============================================================================
+
+const SHADOW_SAMPLES: u32 = 2u;
+const SHADOW_BIAS: f32 = 0.5;
+const FINES_PER_M: f32 = 400.0;
+// 诊断开关：0 = 完整阴影；1 = 跳过阴影射线（vis 恒 1.0）
+const DIAG_SKIP_SHADOWS: u32 = 1u;
+
+// 锥内固定采样方向：轴 l、半角 theta，k ∈ [0,2) 取 φ 对称两方向
+fn cone_sample_dir(l: vec3<f32>, theta: f32, k: u32) -> vec3<f32> {
+  var t = cross(l, vec3<f32>(0.0, 1.0, 0.0));
+  if (abs(l.y) >= 0.999) { t = cross(l, vec3<f32>(1.0, 0.0, 0.0)); }
+  t = normalize(t);
+  let b = cross(l, t);
+  let phi = f32(k) * 3.14159265;
+  return normalize(l * cos(theta) + (t * cos(phi) + b * sin(phi)) * sin(theta));
+}
+
+// 球面黄金螺旋固定偏移（单位向量）：z ∈ {±0.5}，方位角按黄金角错开
+fn sphere_sample_offset(k: u32) -> vec3<f32> {
+  let z = 1.0 - 2.0 * (f32(k) + 0.5) / f32(SHADOW_SAMPLES);
+  let r = sqrt(max(1.0 - z * z, 0.0));
+  let golden = (1.0 + sqrt(5.0)) * 3.14159265;
+  let phi = f32(k) * golden;
+  return vec3<f32>(r * cos(phi), z, r * sin(phi));
+}
+
+// 命中点 albedo（palette u8 → /255 线性近似）
+fn hit_rgb(obj: i32, pal: u32) -> vec3<f32> {
+  var w0: u32;
+  if (obj < 0) {
+    w0 = b_palette[pal * 2u];
+  } else {
+    let pal_b = mov_descs[u32(obj) * MOV_DESC_WORDS + 28u];
+    w0 = mov_palette[pal_b + pal * 2u];
+  }
+  return vec3<f32>(
+    f32(w0 & 0xFFu),
+    f32((w0 >> 8u) & 0xFFu),
+    f32((w0 >> 16u) & 0xFFu),
+  ) / 255.0;
+}
+
+// 直射光合成（NEE）：P = origin + dir·t、法线 n、albedo → 环境项 + 逐光源
+// 方向光锥采样（太阳盘角半径软阴影）/ 点光球面立体角采样（米制平方反比）。
+fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, obj: i32, n: vec3<f32>, shadow_t_max: f32) -> vec3<f32> {
+  let p = origin + dir * t;
+  let base = hit_rgb(obj, pal);
+  var col = base * light_u.g.ambient.xyz;
+  let vis_step = 1.0 / f32(SHADOW_SAMPLES);
+  let n_lights = min(light_u.g.count, 8u);
+  for (var i: u32 = 0u; i < n_lights; i = i + 1u) {
+    let ld = light_u.lights[i];
+    if (ld.kind_pos_dir.x < 0.5) {
+      // ---- 方向光：盘角半径锥采样软阴影 ----
+      let l_axis = ld.kind_pos_dir.yzw;
+      let ndl = max(dot(n, l_axis), 0.0);
+      if (ndl <= 0.0) { continue; }
+      let theta = ld.shape.x;
+      let o = p + n * SHADOW_BIAS;
+      var vis = 0.0;
+      for (var k: u32 = 0u; k < SHADOW_SAMPLES; k = k + 1u) {
+        let d = cone_sample_dir(l_axis, theta, k);
+        if (DIAG_SKIP_SHADOWS == 1u || !scene_occluded(o, d, shadow_t_max)) { vis = vis + vis_step; }
+      }
+      let c = ld.color_intensity.xyz * ld.color_intensity.w;
+      col = col + base * c * (ndl * vis);
+    } else {
+      // ---- 点光：球面立体角采样软阴影 + 米制平方反比 ----
+      let center = ld.kind_pos_dir.yzw;
+      let to_l = center - p;
+      let dist = length(to_l);
+      if (dist < 1e-4) { continue; }
+      let l_axis = to_l / dist;
+      let ndl = max(dot(n, l_axis), 0.0);
+      if (ndl <= 0.0) { continue; }
+      let radius = ld.shape.x;
+      let o = p + n * SHADOW_BIAS;
+      var vis = 0.0;
+      for (var k: u32 = 0u; k < SHADOW_SAMPLES; k = k + 1u) {
+        let sp = center + sphere_sample_offset(k) * radius;
+        let seg = sp - o;
+        let seg_len = length(seg);
+        if (seg_len < 1e-4) { continue; }
+        if (DIAG_SKIP_SHADOWS == 1u || !scene_occluded(o, seg / seg_len, seg_len)) { vis = vis + vis_step; }
+      }
+      let d_m = dist / FINES_PER_M;
+      let atten = 1.0 / max(d_m * d_m, 1e-6);
+      let c = ld.color_intensity.xyz * ld.color_intensity.w;
+      col = col + base * c * (ndl * vis * atten);
+    }
+  }
+  return col * light_u.g.exposure_pad.x;
 }
 
 // ============================================================================
@@ -606,242 +915,40 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir_fine = normalize(diff_world);
   let origin_fine = view_u.cam_pos_fine.xyz;
 
-  // ---- 1) slab 法求射线 vs brickmap tile-window AABB（fine 坐标）相交区间 ----
-  // 与 Rust `cpu_reference_dda_ray_aabb_skip` 实现逐字对应，300 条随机射线已证明与直走 DDA 等价。
-  // AABB = [index_origin..index_origin+index_dims] × 512 fine（每个 tile 512 fine）
-  let tile_origin_fine = vec3<f32>(
-    f32(g.index_origin_x) * 512.0,
-    f32(g.index_origin_y) * 512.0,
-    f32(g.index_origin_z) * 512.0,
-  );
-  let aabb_min = tile_origin_fine;
-  let aabb_max = tile_origin_fine + vec3<f32>(
-    f32(g.index_dims_x) * 512.0,
-    f32(g.index_dims_y) * 512.0,
-    f32(g.index_dims_z) * 512.0,
-  );
-  // t_enter / t_exit：自 origin_fine 量起的 fine 距离（全局标尺）
-  var t_enter = 0.0;
-  var t_exit  = frustum_length;
-  var miss = false;
-  // X 轴 slab
-  {
-    let d = dir_fine.x;
-    if (abs(d) < 1e-30) {
-      if (origin_fine.x < aabb_min.x || origin_fine.x > aabb_max.x) { miss = true; }
-    } else {
-      let t1 = (aabb_min.x - origin_fine.x) / d;
-      let t2 = (aabb_max.x - origin_fine.x) / d;
-      let lo = min(t1, t2);
-      let hi = max(t1, t2);
-      t_enter = max(t_enter, lo);
-      t_exit  = min(t_exit,  hi);
-    }
-  }
-  // Y 轴 slab
-  {
-    let d = dir_fine.y;
-    if (abs(d) < 1e-30) {
-      if (origin_fine.y < aabb_min.y || origin_fine.y > aabb_max.y) { miss = true; }
-    } else {
-      let t1 = (aabb_min.y - origin_fine.y) / d;
-      let t2 = (aabb_max.y - origin_fine.y) / d;
-      let lo = min(t1, t2);
-      let hi = max(t1, t2);
-      t_enter = max(t_enter, lo);
-      t_exit  = min(t_exit,  hi);
-    }
-  }
-  // Z 轴 slab
-  {
-    let d = dir_fine.z;
-    if (abs(d) < 1e-30) {
-      if (origin_fine.z < aabb_min.z || origin_fine.z > aabb_max.z) { miss = true; }
-    } else {
-      let t1 = (aabb_min.z - origin_fine.z) / d;
-      let t2 = (aabb_max.z - origin_fine.z) / d;
-      let lo = min(t1, t2);
-      let hi = max(t1, t2);
-      t_enter = max(t_enter, lo);
-      t_exit  = min(t_exit,  hi);
-    }
-  }
-  if (miss || t_exit < max(t_enter, 0.0)) {
-    // 不相交 → 0 步 DDA，背景 return
-    textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
-    return;
-  }
-  // 约束到视锥有效段 [0, frustum_length]
-  let t_enter_clamped = max(t_enter, 0.0);
-  let t_exit_clamped  = min(t_exit,  frustum_length);
-  if (t_exit_clamped <= t_enter_clamped) {
-    // 厚度为 0（擦边）或完全在视锥外
-    textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
-    return;
-  }
-
-  // ---- 2) 起点推进到 start = origin + dir · t_enter_clamped（跳过前面空胞）
-  // 之后全程用「相对标尺」：t_rel / tmax_* 都自 start 量起，和 Rust 单测 AABB-skip 版完全一致。
-  let start_v = origin_fine + dir_fine * t_enter_clamped;
-  let t_rel_max = t_exit_clamped - t_enter_clamped;
-
-  // ---- 两级 Amanatides & Woo：粗级 cell（16 fine）步进 + 非空 cell 内 fine 细步 ----
-  // Rust `cpu_reference_dda_ray_two_level` 的逐字翻译
-  //（等价性单测 two_level_equivalence_300_rays 锁死：命中/palette 严格一致）。
-  // 空气穿越成本：每 16 fine 一次 cell 占用查询（2 load），
-  // 替代原单级版每 1 fine 一次全链 sample（4~10 load）——远距离射线 ~40× 访存降幅。
-  var sign_x = 1i; var sign_y = 1i; var sign_z = 1i;
-  if (dir_fine.x < 0.0) { sign_x = -1i; }
-  if (dir_fine.y < 0.0) { sign_y = -1i; }
-  if (dir_fine.z < 0.0) { sign_z = -1i; }
-  var dx = 1e+30;
-  if (abs(dir_fine.x) > 1e-30) { dx = 1.0 / abs(dir_fine.x); }
-  var dy = 1e+30;
-  if (abs(dir_fine.y) > 1e-30) { dy = 1.0 / abs(dir_fine.y); }
-  var dz = 1e+30;
-  if (abs(dir_fine.z) > 1e-30) { dz = 1.0 / abs(dir_fine.z); }
-  // 粗 delta = fine delta × 16（f32 乘 2 的幂，精确）
-  var dcx = dx * 16.0;
-  var dcy = dy * 16.0;
-  var dcz = dz * 16.0;
-
-  // 粗 cell = floor(start_v) >> 4（算术右移 = floor 除法，负坐标正确）
-  var cc_x = i32(floor(start_v.x)) >> 4;
-  var cc_y = i32(floor(start_v.y)) >> 4;
-  var cc_z = i32(floor(start_v.z)) >> 4;
-
-  // 粗 tmax：下一个粗边界的距离（相对标尺，同 full 版公式，边界 ×16）
-  var tmax_cx = 1e+30;
-  if (abs(dir_fine.x) > 1e-30) {
-    tmax_cx = (next_coarse_boundary(cc_x, sign_x) - start_v.x) / dir_fine.x;
-    if (tmax_cx < 0.0) { tmax_cx = 0.0; }
-  }
-  var tmax_cy = 1e+30;
-  if (abs(dir_fine.y) > 1e-30) {
-    tmax_cy = (next_coarse_boundary(cc_y, sign_y) - start_v.y) / dir_fine.y;
-    if (tmax_cy < 0.0) { tmax_cy = 0.0; }
-  }
-  var tmax_cz = 1e+30;
-  if (abs(dir_fine.z) > 1e-30) {
-    tmax_cz = (next_coarse_boundary(cc_z, sign_z) - start_v.z) / dir_fine.z;
-    if (tmax_cz < 0.0) { tmax_cz = 0.0; }
-  }
-
-  var t_in = 0.0;                        // 当前粗 cell 入口 t（相对标尺，初始 cell = 0）
-  var hit_pal: u32 = 0u;
-  var hit = false;
-  var world_hit_t = 1e+30;               // 世界命中的全局 t（trace_scene 最近比较用）
-
-  // 粗级主循环：每步 = 占用查询 →（占用才）细级扫描 → 粗步进
-  for (var step_c: u32 = 0u; step_c < 16384u; step_c = step_c + 1u) {
-    let t_out = min(tmax_cx, min(tmax_cy, tmax_cz));
-    // 占用查询先行：空 cell 整段跳过所有 fine 采样（性能核心）
-    if (cell_occupied(vec3<i32>(cc_x, cc_y, cc_z))) {
-      // ---- 细级：本 cell 区间 [t_in, min(t_out, t_rel_max)] 内有界 fine DDA ----
-      let t_hi = min(t_out, t_rel_max);
-      if (t_hi > t_in) {
-        let p = start_v + dir_fine * t_in;
-        let base_x = cc_x << 4;
-        let base_y = cc_y << 4;
-        let base_z = cc_z << 4;
-        // 入口 fine 胞 = floor(p) clamp 进本 cell（入口面浮点误差防护；
-        // clamp 掉的邻胞属前一粗 cell，其细扫已覆盖，不漏检）
-        var fc_x = clamp(i32(floor(p.x)), base_x, base_x + 15);
-        var fc_y = clamp(i32(floor(p.y)), base_y, base_y + 15);
-        var fc_z = clamp(i32(floor(p.z)), base_z, base_z + 15);
-        // fine tmax：相对 t_in 的距离（自 cell 入口重算，非累加）
-        var tf_x = 1e+30;
-        if (abs(dir_fine.x) > 1e-30) {
-          tf_x = (next_boundary(fc_x, sign_x) - p.x) / dir_fine.x;
-          if (tf_x < 0.0) { tf_x = 0.0; }
-        }
-        var tf_y = 1e+30;
-        if (abs(dir_fine.y) > 1e-30) {
-          tf_y = (next_boundary(fc_y, sign_y) - p.y) / dir_fine.y;
-          if (tf_y < 0.0) { tf_y = 0.0; }
-        }
-        var tf_z = 1e+30;
-        if (abs(dir_fine.z) > 1e-30) {
-          tf_z = (next_boundary(fc_z, sign_z) - p.z) / dir_fine.z;
-          if (tf_z < 0.0) { tf_z = 0.0; }
-        }
-        var t_f = 0.0;
-        let span = t_hi - t_in;
-        // 初始 fine 胞采样
-        let pal0 = sample_brickmap(vec3<i32>(fc_x, fc_y, fc_z));
-        if (pal0 != 0u) {
-          hit_pal = pal0;
-          hit = true;
-          world_hit_t = t_enter_clamped + t_in;
-        }
-        // 48 = 3 轴 × 16：斜穿 16³ cell 的步数上界，几何上必在 span 内退出
-        for (var i_f: u32 = 0u; !hit && i_f < 48u && t_f < span; i_f = i_f + 1u) {
-          if (tf_x <= tf_y && tf_x <= tf_z) {
-            t_f = tf_x;
-            tf_x = tf_x + dx;
-            fc_x = fc_x + sign_x;
-          } else if (tf_y <= tf_z) {
-            t_f = tf_y;
-            tf_y = tf_y + dy;
-            fc_y = fc_y + sign_y;
-          } else {
-            t_f = tf_z;
-            tf_z = tf_z + dz;
-            fc_z = fc_z + sign_z;
-          }
-          let pal = sample_brickmap(vec3<i32>(fc_x, fc_y, fc_z));
-          if (pal != 0u) {
-            hit_pal = pal;
-            hit = true;
-            world_hit_t = t_enter_clamped + t_in + t_f;
-          }
-        }
-      }
-    }
-    if (hit || t_out >= t_rel_max) { break; }
-    // ---- 粗级步进（整数增量，同 full 版约定）----
-    if (tmax_cx <= tmax_cy && tmax_cx <= tmax_cz) {
-      t_in = tmax_cx;
-      tmax_cx = tmax_cx + dcx;
-      cc_x = cc_x + sign_x;
-    } else if (tmax_cy <= tmax_cz) {
-      t_in = tmax_cy;
-      tmax_cy = tmax_cy + dcy;
-      cc_y = cc_y + sign_y;
-    } else {
-      t_in = tmax_cz;
-      tmax_cz = tmax_cz + dcz;
-      cc_z = cc_z + sign_z;
-    }
-  }
-
-  // ---- trace_scene 合成（P2.10）：世界命中 → 逐物体（AABB 预剔除 + t_cap 剪枝）取最近 ----
-  // 对应 mov.rs::cpu_reference_trace_scene；count=0 时循环零成本，行为与纯世界版一致。
-  var best_t = world_hit_t;
-  var best_pal = hit_pal;
+  // ---- trace_scene 合成：trace_world（世界两级 DDA）+ 逐物体 trace_object 取最近 ----
+  var best_t = 1e+30;
+  var best_pal: u32 = 0u;
   var best_obj: i32 = -1;  // -1 = 世界网格
-  for (var i: u32 = 0u; i < mov_g.count; i = i + 1u) {
-    // 已有更近命中时以之为剪枝上限（P3 阴影射线 / P9 GI 同一入口）
-    let cap = min(best_t, frustum_length);
-    let h = trace_object(i, origin_fine, dir_fine, cap);
-    if (h.hit && h.t < best_t) {
-      best_t = h.t;
-      best_pal = h.pal;
-      best_obj = i32(i);
-    }
+  var best_n = vec3<f32>(0.0);
+
+  let w = trace_world(origin_fine, dir_fine, frustum_length);
+  if (w.t < 1e+29) {
+    best_t = w.t;
+    best_pal = w.pal;
+    best_n = w.n;
   }
 
-  // ---- 颜色输出：命中 → palette sRGB 字节直接存（世界/物体各自 palette 区）；空 → 背景色 ----
+  for (var i: u32 = 0u; i < mov_g.count; i = i + 1u) {
+    // 临时诊断：跳过 MOV 物体循环，看 fps 是否恢复
+    // let cap = min(best_t, frustum_length);
+    // let h = trace_object(i, origin_fine, dir_fine, cap);
+    // if (h.hit && h.t < best_t) {
+    //   best_t = h.t;
+    //   best_pal = h.pal;
+    //   best_obj = i32(i);
+    //   best_n = h.n;
+    // }
+  }
+
+  // ---- 颜色输出：命中 → 光照合成；空 → 背景色 ----
   if (best_t < 1e+29) {
-    var rgb_u8: vec3<u32>;
-    if (best_obj < 0) {
-      rgb_u8 = palette_rgb_u8(best_pal);
-    } else {
-      // descriptor word 28 = palette_base（mov_palette 内字基址）
-      let pal_b = mov_descs[u32(best_obj) * MOV_DESC_WORDS + 28u];
-      rgb_u8 = mov_palette_rgb(pal_b, best_pal);
-    }
-    col = vec3<f32>(rgb_u8) / 255.0;
+    // 诊断模式 C：inline palette 直出（P2.10 基线）
+    let w0 = b_palette[best_pal * 2u];
+    col = vec3<f32>(
+      f32(w0 & 0xFFu),
+      f32((w0 >> 8u) & 0xFFu),
+      f32((w0 >> 16u) & 0xFFu),
+    ) / 255.0;
   }
   textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
 }

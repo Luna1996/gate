@@ -9,8 +9,13 @@ bevy = { workspace = true }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 rayon = { workspace = true }
+# P3.1 光照主题 RON 解析（版本随 workspace，避免双份编译）
+serde = { workspace = true }
+ron = { workspace = true }
 
 [dev-dependencies]
 # 集成测试（tests/p29_limits.rs）需要直接构造 TileGrid / 调用 fill_box
 glam = { workspace = true }
 gate-voxel = { workspace = true }
+# P3.1 WGSL 编译期校验（tests/wgsl_compile.rs）：shader 语法错误提前到 CI 抓
+naga = { workspace = true }

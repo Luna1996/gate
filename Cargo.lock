@@ -2091,7 +2091,10 @@ dependencies = [
  "bevy",
  "gate-voxel",
  "glam",
+ "naga",
  "rayon",
+ "ron",
+ "serde",
 ]
 
 [[package]]

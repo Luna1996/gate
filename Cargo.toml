@@ -43,6 +43,8 @@ ron = "0.12"
 glam = "=0.32.1"
 # P2.2 全量构建并行分块（docs/brickmap.md §5）
 rayon = "1"
+# P3.1 WGSL 编译期校验测试（版本锁 bevy_render 传递的 naga，避免双份编译）
+naga = { version = "=29.0.4", features = ["wgsl-in"] }
 
 # Bevy 官方推荐：依赖全优化，本项目代码保持可调试
 # 没有它 debug build 慢 10-50 倍（窗口卡死/无响应的根因之一）

@@ -112,6 +112,16 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let grad_handle = create_gradient_image(&mut images);
   let dda_handle = create_dda_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off));
+  // ---- P3.1 光照主题：「暗色实验室」RON 加载（一次性静态配置，同步读足够；
+  // 缺失/解析失败回退内置默认主题）----
+  let theme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/lighting/dark_lab.ron"))
+    .map_err(|e| format!("read: {e}"))
+    .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))
+    .unwrap_or_else(|e| {
+      bevy::log::warn!("lighting/dark_lab.ron 加载失败（{e}），回退内置默认主题");
+      Default::default()
+    });
+  commands.insert_resource(theme);
   commands.insert_resource(GradientImages {
     target: grad_handle,
   });

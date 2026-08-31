@@ -657,7 +657,7 @@ fn dda_fine_scan_cell(
     cc: [i32; 3],    // 粗 cell 坐标（1 单位 = 16 fine）
     t_lo: f32,
     t_hi: f32,
-) -> Option<(f32, u8)> {
+) -> Option<(f32, u8, u8)> {
     if t_hi <= t_lo {
         return None;
     }
@@ -679,39 +679,51 @@ fn dda_fine_scan_cell(
     }
     let span = t_hi - t_lo;
     let mut t_f = 0.0f32;
-    // 初始 fine 胞采样
+    // 初始 fine 胞采样（起点在体内 → 无跨越面，axis=3 哨兵：调用方以 -dir 作法线）
     if let Some(pal) = view.get_voxel(IVec3::from_array(fc)) {
-        return Some((t_lo, pal));
+        return Some((t_lo, pal, 3));
     }
     // 48 = 3 轴 × 16：斜穿 16³ cell 的步数上界，几何上必在 span 内退出
     for _ in 0..48 {
         if t_f >= span {
             return None;
         }
-        if tmax_f[0] <= tmax_f[1] && tmax_f[0] <= tmax_f[2] {
+        let axis = if tmax_f[0] <= tmax_f[1] && tmax_f[0] <= tmax_f[2] {
             t_f = tmax_f[0];
             tmax_f[0] += delta[0];
             fc[0] += sign[0];
+            0u8
         } else if tmax_f[1] <= tmax_f[2] {
             t_f = tmax_f[1];
             tmax_f[1] += delta[1];
             fc[1] += sign[1];
+            1u8
         } else {
             t_f = tmax_f[2];
             tmax_f[2] += delta[2];
             fc[2] += sign[2];
-        }
+            2u8
+        };
         if let Some(pal) = view.get_voxel(IVec3::from_array(fc)) {
-            return Some((t_lo + t_f, pal));
+            return Some((t_lo + t_f, pal, axis));
         }
     }
     None
 }
 
+/// 两级 DDA 命中记录：axis = 最后跨越的细格轴（0/1/2；3 = 起点即在体内，无跨越面）。
+/// 面法线 = -sign[axis] 方向的单位轴向量（体素命中面恒与轴对齐）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DdaHit {
+    pub t: f32,
+    pub pal: u8,
+    pub axis: u8,
+}
+
 /// 两级 DDA 参考实现（cell 粗步 + cell 内细步）。
 ///
 /// 语义与 `cpu_reference_dda_ray` 完全一致：射线 (origin, dir, t∈[0,t_max]) 上
-/// 首个非空 fine 体素，返回 (全局 t, palette) 或 None。
+/// 首个非空 fine 体素，返回命中记录或 None。
 ///
 /// 结构（WGSL dda_main 逐字对应的源）：
 ///   1. 粗级 A&W：cell 粒度（16 fine）步进，delta_c = delta × 16（f32 乘 2 的幂，精确）；
@@ -729,7 +741,7 @@ pub fn cpu_reference_dda_ray_two_level(
     dir_fine: Vec3, // fine units（归一化），magnitude 任意（delta 按 |dir| 缩放）
     t_max: f32,
     max_steps: u32,
-) -> Option<(f32, u8)> {
+) -> Option<DdaHit> {
     let view = BrickMapView::new(buffers);
     let o = [origin_fine.x, origin_fine.y, origin_fine.z];
     let d = [dir_fine.x, dir_fine.y, dir_fine.z];
@@ -777,7 +789,7 @@ pub fn cpu_reference_dda_ray_two_level(
         let t_out = tmax_c[0].min(tmax_c[1]).min(tmax_c[2]);
         // 占用查询先行：空 cell 不做任何 fine 采样（性能核心）
         if view.cell_occupied(IVec3::from_array(cc))
-            && let Some(r) = dda_fine_scan_cell(
+            && let Some((t, pal, axis)) = dda_fine_scan_cell(
                 &view,
                 origin_fine,
                 dir_fine,
@@ -788,7 +800,7 @@ pub fn cpu_reference_dda_ray_two_level(
                 t_out.min(t_max),
             )
         {
-            return Some(r);
+            return Some(DdaHit { t, pal, axis });
         }
         if t_out >= t_max {
             return None;
@@ -1120,7 +1132,8 @@ mod dda_ref_tests {
             let full = cpu_reference_dda_ray(&bufs, *o, *d, 4096.0, 2_000_000);
             let two = cpu_reference_dda_ray_two_level(&bufs, *o, *d, 4096.0, 16384);
             match (full, two) {
-                (Some((tf, pf)), Some((tt, pt))) => {
+                (Some((tf, pf)), Some(h)) => {
+                    let (tt, pt) = (h.t, h.pal);
                     assert_eq!(pf, pt, "axis[{i}] palette diff full_t={tf} two_t={tt}");
                     assert!((tf - tt).abs() <= 1.0, "axis[{i}] t diff {tf} vs {tt}");
                 }
@@ -1154,7 +1167,8 @@ mod dda_ref_tests {
             let full = cpu_reference_dda_ray(&bufs, origin, dir, 2048.0, 2_000_000);
             let two = cpu_reference_dda_ray_two_level(&bufs, origin, dir, 2048.0, 16384);
             match (full, two) {
-                (Some((tf, pf)), Some((tt, pt))) => {
+                (Some((tf, pf)), Some(h)) => {
+                    let (tt, pt) = (h.t, h.pal);
                     assert_eq!(
                         pf, pt,
                         "ray[{ray}] palette diff o={origin:?} d={dir:?} full_t={tf} two_t={tt}"
@@ -1207,6 +1221,7 @@ use std::borrow::Cow;
 use super::upload::GpuBrickMap;
 use super::mov::GpuMovPool;
 use crate::gradient::{BLIT_SHADER_ASSET_PATH, WORKGROUP_SIZE};
+use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
 
 pub const DDA_SHADER_ASSET_PATH: &str = "shaders/dda.wgsl";
 
@@ -1220,6 +1235,8 @@ struct DdaBg1BindGroup(BindGroup);
 #[derive(Resource)]
 struct DdaBg2BindGroup(BindGroup);
 #[derive(Resource)]
+struct DdaBg3BindGroup(BindGroup);
+#[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
 #[derive(Resource)]
@@ -1227,6 +1244,7 @@ struct DdaPipelines {
     bg0_layout: BindGroupLayoutDescriptor,
     bg1_layout: BindGroupLayoutDescriptor,
     bg2_layout: BindGroupLayoutDescriptor,
+    bg3_layout: BindGroupLayoutDescriptor,
     blit_layout: BindGroupLayoutDescriptor,
     compute_pipeline: CachedComputePipelineId,
     blit_pipeline: CachedRenderPipelineId,
@@ -1248,6 +1266,7 @@ impl Plugin for BrickMapDdaPlugin {
         };
         render_app
             .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
+            .add_systems(bevy::render::ExtractSchedule, extract_light_pool)
             .add_systems(RenderStartup, init_dda_pipelines)
             .add_systems(
                 Render,
@@ -1285,6 +1304,19 @@ fn extract_camera_config(
     let Some(cfg) = cfg else { return };
     let uniform = DdaViewUniform::from_cfg(&cfg);
     commands.insert_resource(uniform);
+}
+
+/// main world `LightingTheme` → render world `LightPoolUniform`（P3.1 BG3）。
+/// main world 无主题（test 场景）时回退内置默认「暗色实验室」。
+fn extract_light_pool(
+    mut commands: bevy::ecs::system::Commands,
+    theme: Option<bevy::render::Extract<bevy::ecs::system::Res<LightingTheme>>>,
+) {
+    let pool = match theme {
+        Some(t) => build_light_pool(&t),
+        None => build_light_pool(&LightingTheme::default()),
+    };
+    commands.insert_resource(pool);
 }
 
 fn init_dda_pipelines(
@@ -1335,6 +1367,15 @@ fn init_dda_pipelines(
         ),
     );
 
+    // ---- BG3：光源池 uniform（P3.1，LightPoolUniform 432B）----
+    let bg3 = BindGroupLayoutDescriptor::new(
+        "DdaBg3",
+        &BindGroupLayoutEntries::single(
+            ShaderStages::COMPUTE,
+            uniform_buffer::<LightPoolUniform>(false),
+        ),
+    );
+
     // ---- blit BG layout：与 Gradient 完全一致（texture_2d f32）----
     let blit = BindGroupLayoutDescriptor::new(
         "DdaBlit",
@@ -1348,7 +1389,7 @@ fn init_dda_pipelines(
     let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
     let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some(Cow::from("gate_dda_compute")),
-        layout: vec![bg0.clone(), bg1.clone(), bg2.clone()],
+        layout: vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone()],
         shader: dda_shader,
         entry_point: Some(Cow::from("dda_main")),
         ..default()
@@ -1381,6 +1422,7 @@ fn init_dda_pipelines(
         bg0_layout: bg0,
         bg1_layout: bg1,
         bg2_layout: bg2,
+        bg3_layout: bg3,
         blit_layout: blit,
         compute_pipeline: compute,
         blit_pipeline,
@@ -1396,6 +1438,7 @@ fn prepare_dda_bind_groups(
     view_uniform: Option<Res<DdaViewUniform>>,
     gpu_brickmap: Option<Res<GpuBrickMap>>,
     gpu_mov: Option<Res<GpuMovPool>>,
+    light_pool: Option<Res<LightPoolUniform>>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     queue: Res<RenderQueue>,
@@ -1403,34 +1446,44 @@ fn prepare_dda_bind_groups(
     // Prepare 与 Extract 的跨 world 同步在首帧可能还没完成，这些缺失是正常的，
     // 下一帧自动补齐；不应当 warn 级别噪音。
     let Some(images) = images else {
-        bevy::log::debug_once!("DDA prepare: no DdaImages");
+        bevy::log::info_once!("DDA prepare: no DdaImages");
         return;
     };
     let Some(view_uniform) = view_uniform else {
-        bevy::log::debug_once!("DDA prepare: no DdaViewUniform (extract_camera_config 未产出)");
+        bevy::log::info_once!("DDA prepare: no DdaViewUniform (extract_camera_config 未产出)");
         return;
     };
     let Some(gpu) = gpu_brickmap else {
-        bevy::log::debug_once!("DDA prepare: no GpuBrickMap");
+        bevy::log::info_once!("DDA prepare: no GpuBrickMap");
         return;
     };
     let Some(mov) = gpu_mov else {
-        bevy::log::debug_once!("DDA prepare: no GpuMovPool");
+        bevy::log::info_once!("DDA prepare: no GpuMovPool");
+        return;
+    };
+    let Some(light_pool) = light_pool else {
+        bevy::log::info_once!("DDA prepare: no LightPoolUniform (extract_light_pool 未产出)");
         return;
     };
     let Some(tex_view) = gpu_images.get(&images.target) else {
-        bevy::log::debug_once!("DDA prepare: GpuImage not ready");
+        bevy::log::info_once!("DDA prepare: GpuImage not ready");
         return;
     };
+    bevy::log::info_once!("DDA prepare: ALL RESOURCES OK, proceeding");
 
     // ---- 写 DdaViewUniform 到 UniformBuffer ----
     let mut u = UniformBuffer::from(view_uniform.into_inner());
     u.write_buffer(&render_device, &queue);
 
+    // ---- 写光源池 uniform（P3.1，432B/帧）----
+    let mut lp = UniformBuffer::from(*light_pool);
+    lp.write_buffer(&render_device, &queue);
+
     // ---- 通过 PipelineCache 把 Descriptor 转成 BindGroupLayout handle ----
     let bg0_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_layout);
     let bg1_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg1_layout);
     let bg2_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg2_layout);
+    let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
     let blit_layout = pipeline_cache.get_bind_group_layout(&pipelines.blit_layout);
 
     // ---- BG0：out tex + view uniform ----
@@ -1472,6 +1525,13 @@ fn prepare_dda_bind_groups(
         )),
     );
 
+    // ---- BG3：光源池 uniform ----
+    let bg3 = render_device.create_bind_group(
+        None,
+        &bg3_layout,
+        &BindGroupEntries::single(&lp),
+    );
+
     // ---- Blit BG：dda tex（和 gradient 相同的 texture_2d blit layout）----
     let blit_bg = render_device.create_bind_group(
         None,
@@ -1482,30 +1542,31 @@ fn prepare_dda_bind_groups(
     commands.insert_resource(DdaBg0BindGroup(bg0));
     commands.insert_resource(DdaBg1BindGroup(bg1));
     commands.insert_resource(DdaBg2BindGroup(bg2));
+    commands.insert_resource(DdaBg3BindGroup(bg3));
     commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_dda(
     mut ctx: RenderContext,
     bg0: Option<Res<DdaBg0BindGroup>>,
     bg1: Option<Res<DdaBg1BindGroup>>,
     bg2: Option<Res<DdaBg2BindGroup>>,
+    bg3: Option<Res<DdaBg3BindGroup>>,
     pipeline_cache: Res<PipelineCache>,
     pipelines: Res<DdaPipelines>,
     scale: Res<crate::gradient::RenderScale>,
 ) {
-    let (Some(bg0), Some(bg1), Some(bg2)) = (bg0.as_ref(), bg1.as_ref(), bg2.as_ref()) else {
+    let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) =
+        (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref())
+    else {
         bevy::log::debug_once!("DDA dispatch: bind groups missing");
         return;
     };
-    // 首帧 PipelineCache 尚未完成着色器编译是正常时序（Render schedule 与 pipeline 编译异步），
-    // 不应当 warn 刷屏：降级 debug 级别，仅在 DEBUG 级 filter 时可见。
     let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.compute_pipeline) else {
         bevy::log::debug_once!("DDA dispatch: compute pipeline not ready");
         return;
     };
-    // P2.7：诊断 span（recorder 缺失时 Option<&T> impl no-op，dispatch 绝不跳过——
-    // RenderDiagnosticsPlugin 非默认装配，不能因无 recorder 丢渲染）
     let recorder = ctx.diagnostic_recorder();
     let recorder = recorder.as_deref();
     let span = recorder.time_span(ctx.command_encoder(), "gate_dda_compute");
@@ -1516,6 +1577,7 @@ fn dispatch_dda(
     pass.set_bind_group(0, &bg0.0, &[]);
     pass.set_bind_group(1, &bg1.0, &[]);
     pass.set_bind_group(2, &bg2.0, &[]);
+    pass.set_bind_group(3, &bg3.0, &[]);
     let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
     let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
     pass.dispatch_workgroups(gx, gy, 1);

@@ -305,11 +305,13 @@ pub(crate) fn prepare_mov_pool(
 // ============================================================================
 
 /// 命中记录：obj = OBJ_WORLD 表示世界网格命中
+/// normal = 命中面法线（世界空间单位向量，指向射线来向；起点在体内时 = -dir）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovHit {
     pub t: f32,
     pub pal: u8,
     pub obj: u32,
+    pub normal: Vec3,
 }
 
 pub const OBJ_WORLD: u32 = u32::MAX;
@@ -431,6 +433,7 @@ fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
 }
 
 /// 物体局部细扫：单粗 cell（16³ fine）内有界 fine DDA（镜像 dda_fine_scan_cell，t 全局标尺）
+/// 返回 (t_rel, pal, axis)；axis = 局部命中轴（0/1/2），3 = 起点即在体内。
 #[allow(clippy::too_many_arguments)]
 fn obj_fine_scan_cell(
     pool: &MovPoolPacked,
@@ -442,7 +445,7 @@ fn obj_fine_scan_cell(
     cc: [u32; 3],
     t_lo: f32,
     t_hi: f32,
-) -> Option<(f32, u8)> {
+) -> Option<(f32, u8, u8)> {
     if t_hi <= t_lo {
         return None;
     }
@@ -466,28 +469,31 @@ fn obj_fine_scan_cell(
     let fine = IVec3::from_array(fc);
     let pal0 = obj_sample_voxel(pool, dsc, fine);
     if pal0 != 0 {
-        return Some((t_lo, pal0));
+        return Some((t_lo, pal0, 3));
     }
     for _ in 0..48 {
         if t_f >= span {
             return None;
         }
-        if tmax_f[0] <= tmax_f[1] && tmax_f[0] <= tmax_f[2] {
+        let axis = if tmax_f[0] <= tmax_f[1] && tmax_f[0] <= tmax_f[2] {
             t_f = tmax_f[0];
             tmax_f[0] += delta[0];
             fc[0] += sign[0];
+            0u8
         } else if tmax_f[1] <= tmax_f[2] {
             t_f = tmax_f[1];
             tmax_f[1] += delta[1];
             fc[1] += sign[1];
+            1u8
         } else {
             t_f = tmax_f[2];
             tmax_f[2] += delta[2];
             fc[2] += sign[2];
-        }
+            2u8
+        };
         let pal = obj_sample_voxel(pool, dsc, IVec3::from_array(fc));
         if pal != 0 {
-            return Some((t_lo + t_f, pal));
+            return Some((t_lo + t_f, pal, axis));
         }
     }
     None
@@ -496,14 +502,15 @@ fn obj_fine_scan_cell(
 /// 单物体两级 DDA（镜像 WGSL `trace_object`）：世界 AABB 预剔除 → 局部变换 →
 /// 局部 tile 盒 slab → cell 粗步 + fine 细步。t 为全局标尺（rd 不归一化）。
 ///
-/// 返回 (t, palette) 或 None（t_cap 内无命中）。
+/// 返回 (全局 t, palette, **局部**面法线) 或 None（t_cap 内无命中）。
+/// n_local 为物体局部空间单位向量、指向射线来向（世界法线 = rot · n_local）。
 pub fn cpu_reference_object_ray(
     pool: &MovPoolPacked,
     idx: usize,
     origin: Vec3,
     dir: Vec3,
     t_cap: f32,
-) -> Option<(f32, u8)> {
+) -> Option<(f32, u8, Vec3)> {
     let dsc = &pool.descs[idx];
     // ---- 世界 AABB 预剔除 ----
     let (pos, rot, scale) = desc_transform(dsc);
@@ -567,11 +574,20 @@ pub fn cpu_reference_object_ray(
         }
         let t_out = tmax_c[0].min(tmax_c[1]).min(tmax_c[2]);
         if obj_cell_occupied(pool, dsc, cc)
-            && let Some((t_rel_hit, pal)) = obj_fine_scan_cell(
+            && let Some((t_rel_hit, pal, axis)) = obj_fine_scan_cell(
                 pool, dsc, start, rd, sign, delta, cc, t_in, t_out.min(t_rel_max),
             )
         {
-            return Some((tl0 + t_rel_hit, pal));
+            // 局部命中法线：-sign[axis] 单位轴；axis=3（起点在体内）→ -rd
+            let n_local = if axis < 3 {
+                let a = axis as usize;
+                let mut n = Vec3::ZERO;
+                n[a] = -sign[a] as f32;
+                n
+            } else {
+                -rd.normalize_or_zero()
+            };
+            return Some((tl0 + t_rel_hit, pal, n_local));
         }
         if t_out >= t_rel_max {
             return None;
@@ -601,17 +617,57 @@ pub fn cpu_reference_trace_scene(
     dir: Vec3,
     t_max: f32,
 ) -> Option<MovHit> {
-    let mut best = cpu_reference_dda_ray_two_level(world, origin, dir, t_max, 16384)
-        .map(|(t, pal)| MovHit { t, pal, obj: OBJ_WORLD });
+    let mut best =
+        cpu_reference_dda_ray_two_level(world, origin, dir, t_max, 16384).map(|h| {
+            // 世界命中法线：-sign[axis] 单位轴（射线朝 +axis 穿入 → 面在 -axis 侧）；
+            // axis=3（起点在体内）→ -dir
+            let normal = if h.axis < 3 {
+                let a = h.axis as usize;
+                let mut n = Vec3::ZERO;
+                n[a] = if dir[a] >= 0.0 { -1.0 } else { 1.0 };
+                n
+            } else {
+                -dir
+            };
+            MovHit { t: h.t, pal: h.pal, obj: OBJ_WORLD, normal }
+        });
     for i in 0..pool.descs.len() {
         let cap = best.as_ref().map_or(t_max, |b| b.t.min(t_max));
-        if let Some((t, pal)) = cpu_reference_object_ray(pool, i, origin, dir, cap)
+        if let Some((t, pal, n_local)) = cpu_reference_object_ray(pool, i, origin, dir, cap)
             && best.as_ref().is_none_or(|b| t < b.t)
         {
-            best = Some(MovHit { t, pal, obj: i as u32 });
+            // 局部法线 → 世界（uniform scale 不改方向，renormalize 消旋转舍入）
+            let dsc = &pool.descs[i];
+            let rot = Mat3::from_cols(
+                dsc.rot0.truncate(),
+                dsc.rot1.truncate(),
+                dsc.rot2.truncate(),
+            );
+            best = Some(MovHit {
+                t,
+                pal,
+                obj: i as u32,
+                normal: (rot * n_local).normalize_or_zero(),
+            });
         }
     }
     best
+}
+
+/// `trace_scene()` 遮挡快路径（P3.1 阴影射线）：t_max 内**任一**命中即 true。
+/// 世界/物体各自的两级 DDA 找到首个命中即返回，无「最近」比较；
+/// 阴影射线占比大时（每像素 × 光源 × 采样），此路径省掉逐物体 t 排序。
+pub fn cpu_reference_scene_occluded(
+    world: &BrickMapBuffers,
+    pool: &MovPoolPacked,
+    origin: Vec3,
+    dir: Vec3,
+    t_max: f32,
+) -> bool {
+    if cpu_reference_dda_ray_two_level(world, origin, dir, t_max, 16384).is_some() {
+        return true;
+    }
+    (0..pool.descs.len()).any(|i| cpu_reference_object_ray(pool, i, origin, dir, t_max).is_some())
 }
 
 use crate::brickmap::dda::cpu_reference_dda_ray_two_level;
@@ -712,8 +768,14 @@ mod tests {
             )
             .normalize();
             let a = cpu_reference_trace_scene(&world, &pool, origin, dir, 4096.0);
-            let b = cpu_reference_dda_ray_two_level(&world, origin, dir, 4096.0, 16384)
-                .map(|(t, pal)| MovHit { t, pal, obj: OBJ_WORLD });
+            let b = cpu_reference_dda_ray_two_level(&world, origin, dir, 4096.0, 16384).map(
+                |h| MovHit {
+                    t: h.t,
+                    pal: h.pal,
+                    obj: OBJ_WORLD,
+                    normal: Vec3::ZERO, // 等价性断言不比对法线
+                },
+            );
             match (a, b) {
                 (Some(ha), Some(hb)) => {
                     assert_eq!(ha.pal, hb.pal);
