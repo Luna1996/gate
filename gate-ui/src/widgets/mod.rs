@@ -48,9 +48,9 @@ impl<'a> UiCtx<'a> {
   /// - 否则 → `FontSource::default()`（= AssetId::<Font>::default() slot，由
   ///   GateUiPlugin 在主题字体加载后覆盖；即使 theme.font_path 是 None，
   ///   这条也将命中 Bevy 内置 FiraMono，结果与 FontSource::Handle(Handle::default()) 一致）。
-  /// 之前用 `FontSource::SystemUi`——它会退到操作系统 UI 字体，字形与项目字体不一致，
-  /// 且在英文系统上可能没有 CJK 字形。除非显式指定其他字体，所有 gate-ui 文本统一走
-  /// 主题字体，满足"除非额外指定，全部用同一字体"的需求。
+  ///   之前用 `FontSource::SystemUi`——它会退到操作系统 UI 字体，字形与项目字体不一致，
+  ///   且在英文系统上可能没有 CJK 字形。除非显式指定其他字体，所有 gate-ui 文本统一走
+  ///   主题字体，满足"除非额外指定，全部用同一字体"的需求。
   pub fn font_source(&self) -> FontSource {
     match self.font {
       Some(h) => FontSource::from(h),

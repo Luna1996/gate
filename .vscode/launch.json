@@ -9,8 +9,7 @@
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "build-gate-app",
       "env": {
-        "RUST_LOG": "info",
-        "WGPU_BACKEND": "vulkan",
+        "WGPU_BACKEND": "vulkan"
       }
     }
   ]

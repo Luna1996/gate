@@ -10,3 +10,6 @@ glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }
 gate-ui = { workspace = true }
+# 方案 3 日志落盘：版本对齐 bevy_log 0.19.1 内部用法（subcriber 需含默认 fmt/ansi features）
+tracing-subscriber = "0.3.20"
+tracing-appender = "0.2"

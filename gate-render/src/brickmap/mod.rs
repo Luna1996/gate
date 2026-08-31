@@ -7,18 +7,23 @@
 
 mod builder;
 pub mod dda;
+pub mod mov;
 pub mod upload;
 mod view;
 pub mod wire;
 
-pub use builder::{BrickMapBuilder, TileUpdate};
+pub use builder::{BrickMapBuilder, DirtyRanges, TileUpdate};
 pub use dda::{
-  DdaCameraConfig, DdaImages, DdaViewUniform, OrbitCamera, cpu_dda_ascii_grid_32x32,
-  cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip, create_dda_image,
+    DdaCameraConfig, DdaImages, DdaViewUniform, OrbitCamera, cpu_dda_ascii_grid_32x32,
+    cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip, create_dda_image,
+};
+pub use mov::{
+    GpuMovPool, MovDesc, MovGlobals, MovHit, MovObject, MovPlugin, MovPoolPacked, MovScene,
+    OBJ_WORLD, cpu_reference_object_ray, cpu_reference_trace_scene, pack_mov_pool, world_aabb,
 };
 pub use upload::{
-  BindingLimits, BrickMapUploadPlugin, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,
-  UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VoxelScene,
+    BindingLimits, BrickMapUploadPlugin, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,
+    UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VoxelScene,
 };
 pub use view::BrickMapView;
 pub use wire::{BrickMapBuffers, BrickMapGlobals};

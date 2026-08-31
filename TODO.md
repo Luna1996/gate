@@ -4,7 +4,9 @@
 > v2 变更：引擎定 Bevy；顺序改为**渲染先行，游戏逻辑后置**
 > v3 变更：grill-me 拷问裁决落地——数据结构定**单一可变叶八叉树**；画质验收写死硬件基线；光照主题数据驱动（首发暗色实验室）；P12 整体后置；编辑成本表述修正
 > v3.1 变更：**全链路极限性能测试 + 资源预算上断言**——数据层/渲染/模拟的压测必须断言内存与 CPU 用量上限，CI 跑宽松预算防回归，基准机出正式数字
-> 最后更新：2026-08-29
+> v3.2 变更（2026-08-31）：**新增 MOV 动态体素对象规划**（P2.10/P4.7/P10.5/P11.6 四阶段穿插，NPC 寄件修复玩法底座）；**M2 光源表示升级**（软阴影 + 发光元件进光源列表，对标 Douglas octo 观感）；P2.4 补录两级 DDA 性能改造（DC 43ms→2.75ms，15.6×）
+> v3.3 变更（2026-08-31）：**场景决策修订**——「不做流式」降级为游戏内容范围妥协（用户澄清：真实意图 = 引擎能力推至极限，流式凡技术上可能即做）；**新增 P14 流式大世界引擎能力线**（tile 驻留 / 程序化分页 / LOD / 重定基剔除），P11.4/P11.5 升格并入；游戏内容决策全部维持推迟
+> 最后更新：2026-08-31
 
 ---
 
@@ -22,11 +24,13 @@
 | 模拟位置 | CPU 事件驱动，**不上 GPU** | 依赖链结构 + 步进/回放刚需；成本∝翻转数而非总数 |
 | 状态可视化 | 每体素存元件 ID；状态表每元件 1 字节每 tick 上传 | 状态变化零体素写入；通道在 P3 就用占位数据搭好 |
 | 特殊体素 | 调色板视觉变体 / CPU 校验标志 / 侧表数据 三级分流 | 不摊平进体素词 |
-| 场景 | 有界工作间（静态锁定体素），不做流式大世界 | 护栏已埋，将来可扩展 |
+| 场景（v3.3 修订） | **游戏内容范围** = 有界工作间；**引擎能力目标** = 流式大世界（P14 能力线） | CPU 世界本就无界稀疏；tile 粒度上传/重建/脏跟踪天然是流式单位；2GB GPU 绑定上限下大世界**必须**流式（P1.7：百万 tile≈4GB）——「不做流式」是内容范围妥协，非引擎上限 |
 | **画质基线（v3）** | **M2 @ GTX 1660 1080p60；M3 @ RTX 3070 1080p60** | 验收写死硬件+分辨率+帧率，杜绝玄学；1660 上 M3 提供降档（关 GI） |
 | **资源预算（v3.1）** | 所有极限性能测试必须**断言资源上限**：系统内存 ≤2GB（体素数据+镜像）、VRAM ≤2GB（砖块图+G-Buffer）——**限工作间/关卡场景**；沙盒极值仅要求不崩溃 + 实测数字上报（P1.7 裁决：100 万非空 tile 受 occupancy 4KB/Tile 下限约束 ≈4GB）。关键操作（编辑/洪泛/模拟 tick/砖块构建与上传/DDA）带 CPU 时间预算断言。CI 跑宽松上界（防机器抖动误报），基准机跑正式数字 | 防止功能正确但资源失控；预算不写死则性能目标不可验收、不可回归 |
 | **内部观察（v3）** | **仅剖面切割**（DDA 裁剪平面，近零成本），不做 X-ray 半透明 | 编辑/调试封闭电路刚需；管线早期预留 |
 | **光照主题（v3）** | 数据驱动配置（光源/环境/曝光资产化），首发仅深调**暗色实验室** | M3 调优矩阵不随主题数翻倍；其余主题后置扩展 |
+| **动态体素对象 MOV（v3.2）** | 独立小 brickmap + 变换（位置/旋转/缩放），**不进世界网格**；渲染 = 世界 DDA + 逐物体局部 DDA（射线变换 + OBB 剔除取最近命中），统一 `trace_scene()` 抽象 | NPC 寄件修复玩法的底座；Teardown/octo 同法先例；两级 DDA（P2.4 改造）原样复用，物体=小号 TileGrid 全链复用；与「有界工作间」决策不冲突（实体≠流式世界） |
+| **光源表示（v3.2）** | 方向光 = 带角半径太阳盘（**软阴影**锥采样）；点光 = 球形光（立体角采样）；**发光元件进 NEE 光源列表**（ComponentTable 聚合驱动，数量有界） | Douglas octo 观感对标（PT 光照/软阴影/自发光照明是其标志性画面）；「通电电路照亮暗室」= 电路游戏核心视觉语言，M2 即具备而非等 P9 |
 | 渲染里程碑 | M2 = 可发布保底线；M3 = 视觉飞跃线；M4 = 冲刺线 | 每级独立成立 |
 | **操作设备（v3）** | 键鼠首发，手柄后置 | 三维体素编辑手柄适配成本极高，P12.4 移出关键路径 |
 | **节奏（v3）** | 无硬期限，质量优先；Steam 页面暂不开架，**P12 整体后置** | 里程碑表是唯一范围纪律；Platform trait 抽象保留在 P0 防后补成本 |
@@ -39,6 +43,7 @@
 |---|---|
 | 白名单连接具体语义（接触=建图边 vs 白名单对合并元件） | **P5.1 动工前** |
 | 编辑刷子粒度切换机制（跟随命中 / 手动档位 / 按材质自动） | **P4.1 动工前** |
+| **物体（MOV）网格是否进洪泛/模拟**——修复判定 = 图案比对（便宜）vs 物体真实通电（需 DSU/模拟器作用域扩展到物体网格，贵一个量级） | **P10.5 动工前** |
 | ~~统一 UI 框架选型~~ **已裁决（2026-08-30）**：bevy_ui 原生 + 自研组件库（gate-ui），风格现代化参考 Minecraft Modern UI mod | 已裁决——组件库规模见 2.7 前置条目 |
 
 **工程既定**：测试 UI 与游戏内 UI 使用同一套框架——**bevy_ui 原生 + 自研组件库 gate-ui**（2026-08-30 裁决，egui/bevy_lunex/混合方案否决：egui 数据面板生产力虽强但依赖第三方+观感调试工具化，lunex 版本滞后仅布局引擎）；Modern UI 风格 = 主题令牌（颜色/圆角/间距/字体数据资产化，对齐光照主题哲学）+ 自研 widget；光照主题为纯数据资产（不含硬编码）。
@@ -95,6 +100,10 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
 → P10 场景资产 → P11 冲刺随时插空（P12 平台发布整体后置）
 ```
 
+MOV 动态体素对象线（v3.2，随主线穿插推进）：**P2.10 多网格渲染 → P4.7 平滑移动/交互 → P10.5 物体编辑=修复 → P11.6 烘焙优化（可推迟）**
+
+流式大世界引擎线（v3.3，与内容线解耦的引擎能力线）：**P14 全部为引擎能力、零游戏内容耦合**——14.1 tile 驻留管理可在 P3 后任意点插入（机制全是 P2.3/P2.9/P2.10 雏形扩用），14.2 程序化分页 → 14.3 LOD → 14.4 重定基+剔除（依赖 M4 冲刺位），与 MOV 线并行推进
+
 两个生死里程碑：
 1. **P2.7 首个画面上屏**——砖块图 + DDA 是否真的能在 Bevy 里跑起来
 2. **P4.2 编辑闭环**——点击到画面同帧更新，此后一切迭代都有载体
@@ -141,18 +150,21 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
   - [x] GPU storage buffer 三区布局：节点（b_struct，含 tile 索引/位图/胞目录）/ 叶子（b_leaves）/ 调色板（b_palette）/ comp（元件层 64KB/tile）/ state（StateTable 4KB），合计五 buffer
 - [x] 2.2 CPU 构建器：TileGrid → 砖块图（Rayon 并行分块）
 - [x] 2.3 上传通道：RenderDevice.limits() 首帧探测 + 双布局（Single/Multi）CPU 单测覆盖；三段 world-cross（主 Last.poll_pending → render ExtractSchedule 只读构建 CPU snapshot → PrepareResources queue.write_buffer）；体素数据 / 元件层镜像 / 状态表 4KB 三类独立更新；GpuBrickMap 五大 Buffer + UniformBuffer<BrickMapGlobals> 统一管理。4 CPU 单测 + demo 场景 PROBE/UPLOAD[full]/UPLOAD[incremental]/GpuBrickMap×N 日志实锤。encase 0.12.1 fixed-size [u32/i32;N] uniform stride 断言 workaround = 所有数组拆 scalar fields
+  - [x] **卡顿修复（2026-08-31，v3.4）**：首编辑 44.42MB/51.5ms 假增量 → 0.26MB/~250µs（171×/200×）。根因① `build_full` 期间 place_tile 累积的全场景 mark（node bump+211×dir 128KB+bitmap≈44.9MB）未被 full 分支消费，第一次增量 `take_dirty_ranges` 连带带出——修复：build_full 末尾丢弃（回归测试 `full_build_leaves_no_stale_dirty_marks`）；根因② ensure 扩容 2× 翻倍整写 163MB PCIe——修复：32MiB 水位对齐（163.8MB→160MiB，非 312MiB）+ 增量路径 GPU-GPU 前缀拷贝（CommandEncoder copy_buffer_to_buffer，只 DMA 增长尾部；buffer usage 补 COPY_SRC）。`grow_size_watermark_policy` 单测锁策略
 - [x] 2.4 主可见性 pass：全屏 compute DDA（A&W 2048 步），五步寻址链（tile→bitmap→dir→node L1/L2/L3→brick palette byte）→palette sRGB→linear→storage tex rgba8unorm。WGSL 339 行 + Rust dda.rs 插件（BG0/BG1/blit BG 构建+dispatch.before(camera_driver)+Core2d PostProcess 覆盖渐变）。RTX 3070 NoVsync avg fps=811（rubric 5/5），前 200 帧超 rubric 锚 ≥120。实机 frame=1019（≥500）无 panic，VUID 仅 wgpu#9213 2 条初始。CI 55 tests 绿 + fmt/clippy 0 warning。详情见 `.trae/specs/p24_dda_visibility/review.md`
+  - [x] **性能改造（2026-08-31）**：单级 fine A&W（CAM_FAR=65536 下天空射线空走 16384 步/像素，DC=43ms 瓶颈）→ **两级 DDA**（cell 16-fine 粗步：占用查询走寻址链 ①+② 仅 2 load，空 cell 一次跨 16 fine；占用 cell 内有界细步 ≤48 步全链采样）。CPU 参考 `cpu_reference_dda_ray_two_level` + 300 随机射线等价单测锁死（命中/palette 严格一致）→ WGSL 逐字翻译。**DC 43ms→2.75ms（15.6×），默认机位 23→333fps（4060 dev 构建）**
 - [x] 2.5 颜色直出写回 view target（纯色体素上屏 = 验收点）——P2.4 blit 链路（Core2d PostProcess → ViewTarget）+ 调色板彩色直出实机验证（dda.wgsl palette sRGB 直存 + blit srgb_to_linear 抵消硬件编码，双重 gamma 已修复；多分辨率 demo 场景六色调色板截图确认上屏；顺带修复 DDA 边界漏检：整数增量 cell 步进替代 floor(origin+dir·t) 重算，CPU/WGSL 同步）
 - [x] 2.6 Bevy 相机接入：轨道相机（平移/旋转/缩放），视图矩阵实时传递——gate-render `OrbitCamera`（from_eye/eye/clamp，PITCH_LIMIT 89°/DIST 32..8000）+ `DdaCameraConfig::from_orbit` 唯一矩阵构造点（与 build_static 逐元素 <1e-5 回归锁）；gate-app `orbit_camera_input`（右键旋转 0.005rad/px / 中键平移视觉 1:1 / 滚轮乘法缩放 exp(-0.35·行)，拖拽互斥+滚轮共存，Update 同帧重算 uniform ≤1 帧生效）；窗口 resizable:false 锁 aspect；WGSL 零改动。实机 1355 帧 0 panic、VUID 仅 wgpu#9213 两型、增量上传持续；58 测试全绿（spec/review 见 `.trae/specs/p26_orbit_camera/`）
 - [x] 2.7a **UI 组件库基座（gate-ui crate，自研）+ 响应式与世界空间**：主题令牌数据资产（暗色 Modern：颜色/圆角/间距/强调色/字体 + ui_scale）+ 基础 widget（Panel 半透明圆角 / Label / Button / Slider / Checkbox / **Plot 折线图** / 滚动列表）；复用 bevy_ui 圆角/边框/渐变与 Interaction 状态；与轨道相机输入互斥 gate（hover 吞输入）；**全链路任意分辨率适配**（gate-render VIEW_SIZE 常量→资源 + resize 纹理重建链 + DdaCameraConfig aspect 动态化 + 解锁 resizable）；**世界空间 UI**（WorldAnchor 投影锚定到屏幕空间，完整复用 widget/主题）。spec/review 见 `.trae/specs/p27a_ui_kit/`。**本次实机修复补充**：渲染侧退化尺寸（<64 或 >4096）跳过 resize 保留上一组合法尺寸；UI 侧 autofit 窗口高钳 4096 + 缩放系数钳 [0.25,4.0]（实机曾出现 SetWindowPos 汇报物理高度 65496 = 负高度 u16 回绕，未钳制即创建 65496 像素高 swapchain 触发驱动崩溃）。**未完成项**：resize 实机截图（4 尺寸 × 比例）——TRAE 沙箱 + NVIDIA 着色器磁盘缓存组合问题；功能等价由 CI headless 测试（degenerate_sizes_rejected / autofit_math / aspect_dynamic 覆盖）与代码逻辑审查证明，人工实机证据待非沙箱环境（P2.8 GTX 1660 验收会再跑）
 - [x] 2.7 **GPU timestamp + pass 级耗时面板**（消费 2.7a gate-ui 组件库，首个统一框架 UI 落地，里程碑 #FR-12）。架构：① gate-app 显式装配 `RenderDiagnosticsPlugin`（**Bevy 0.19 非默认**——仅 tracing-tracy feature 自动加，勿信"默认注册"），gate-render 4×render pass（gradient_compute/blit + dda_compute/blit）用 `RecordDiagnostics::time_span`（recorder 缺失时走 `Option<&T>` no-op impl，**dispatch 绝不因无 recorder 跳过**——曾因此黑屏）；dispatch 系统必须 `in_set(RenderGraphSystems::Render)`（begin_diagnostics_frame 在 Begin set，无 set 约束时 span 记在 begin_frame 前被 finish 清空——实测丢 compute 段数据）；brickmap_upload 段因 `queue.write_buffer` CPU→GPU 拷贝实际发生在 submit 时，command encoder 时间戳无 GPU 测值，走 OQ-2 选 A：Arc<Mutex<Option<UploadCpuSample>>> 双世界共享通道仅提供 CPU ms，UI gpu 列显示 NAN "—"。② 10 条 Diagnostic 路径严格 C2：`render/gate_{gradient_compute,gradient_blit,dda_compute,dda_blit,brickmap_upload}/elapsed_{gpu,cpu}`（sync_diagnostics 自动注册新 path，无需手动 register_diagnostic）。③ main world `GpuPassTimings` 资源由 `sync_gpu_timings`（每 0.5s generation 自增）读 `DiagnosticsStore`（由 RenderPlugin 子系统 PreUpdate 把 Render 世界 DiagnosticsStore 解包回传）与 `UploadCpuSampleChannel` 填 10 字段 + `total_gpu_ms` + `gpu_unsupported` 语义（4×pass gpu 全 NAN 但 cpu 至少一项有数）。④ 右侧面板：Percent(32%) 宽 Percent(2%)-right Percent(5%)-top，Σ GPU 行（>16.7ms 文本提示超预算）+ Plot（Fixed 0..20ms，128 样本 ≈ 64s 覆盖）+ 5×3 列表（段/ GPU ms / CPU ms；DC 行 accent_hover 半透明背景色差）+ 6 行 RingList（|Δ|>2ms 回显 ▲▼ 事件 + gpu_unsupported 一次性提示）。CI：`cargo fmt --check` 0 diff；`cargo clippy --workspace -- -D warnings` 0 warnings；`cargo test --workspace` **98 tests green**（P2.7a 基线 90，+8 来自 P2.7 8 单测：defaults_are_sane / sync_populates_10_paths / missing_paths_keeps_nan_no_panic / all_gpu_nan_with_cpu_marks_gpu_unsupported / layout_has_all_10_cells_and_markers / dc_row_has_accent_background / total_over_budget_shows_warning_text / under_budget_and_plot_push_and_delta_event）。A/B 开销与 Δ 沙箱限制无法实机 3000 帧；由代码逻辑（generation 节流 0.5s → 2 Hz 刷新 + Δ>2ms 节流事件 push，plot 拷贝 RingBuf 128 固定容量均摊 O(1)）与单测覆盖率证明 ≤0.05ms/帧，人工实机 A/B 证据留待 P2.8 GTX 1660 验收（沙箱限制同 P2.7a）。spec/tasks/review 见 `.trae/specs/p27_gpu_timings/`。
-- [ ] 2.8 **验收：测试场景上屏，相机自由飞行，1080p @ GTX 1660 下 DDA 无明显开销异常**
-- [ ] 2.9 **渲染极限性能测试（v3.1）**：百万级体素砖块图构建 + 全量上传（Rayon 并行，构建/上传 CPU 时间预算断言）；增量上传连发（脏队列预算压满不爆帧）；大场景 DDA 三档（空旷远距 / 密集热点 / 最坏树深路径）；系统内存与 VRAM 上限断言（≤2GB 决策表预算）
+- [ ] 2.8 **验收：测试场景上屏，相机自由飞行，1080p @ GTX 1660 下 DDA 无明显开销异常**——**本机（RTX 4060 Laptop）已验（2026-08-31）**：极限场景 10×10 大陆（211 tile / 157MB 全量 blob 上屏 170ms）+ 3 枚 MOV 芯片，上屏/轨道相机（旋转/平移/缩放）/增量上传（0.26MB/~300µs 持续）全链无 panic 无 wgpu 校验错误；**GTX 1660 实机（目标机）验收待验**
+- [x] 2.9 **渲染极限性能测试（v3.1）**（`gate-render/tests/p29_limits.rs`，CI 宽松上界 + println 留档）：①2.1M 体素（64 满铺 tile）`build_full` **134ms**（2.1ms/tile，预算 2s）；②增量连发 64 tiles/3 帧 **9.15/7.96/0.37ms**（≤2×16.7ms 帧预算，脏字节 4.4+4.4+0.28MB）；③DDA 三档 CPU 代理（两级参考实现）：空旷远距 **8.3µs/ray**（单级退化哨兵）/ 密集 L2 **1.8µs/ray** / L4 满深度热点 **1.7µs/ray**；④VRAM 预算：L2 满铺 4.62MB/tile × 122 tiles = **564MB ≤ 608MB 预算线**，典型工作间 167.8MB（含 140MB 定长前缀）× 2（GPU+CPU 镜像）= **336MB ≤ 2GB**；⑤P2.9e MOV 复测见 2.10
+- [x] 2.10 **MOV-1 多网格渲染 + `trace_scene()` 抽象（v3.2，动态体素对象地基）**：①CPU 侧 `brickmap/mov.rs`：`MovDesc`（128B/物体：pos/scale + mat3 列 + 世界 AABB + bitmap/dir/node/leaves/palette 五基址）+ `pack_mov_pool`（逐物体 [bitmap|dirs|node] 拼接，dirs/node 保留绝对偏移 shader 端 `node_base + (abs - NODE_STREAM_BASE)` 校正；leaves/palette 基址直加）+ `GpuMovPool`/`MovPlugin`（Extract/RenderStartup 空池/版本变化重建）+ **CPU 参考实现** `cpu_reference_object_ray`（世界 AABB 预剔除→局部变换 rd 不归一化 t 标尺不变→局部 tile 盒 slab→cell 粗步 96 上限+fine 细步 48）/`cpu_reference_trace_scene`（世界两级 DDA + 逐物体 t_cap 剪枝取最近）；②GPU 侧 `dda.wgsl`：BG2（4 storage + count uniform）+ `slab_box`/`mov_cell_occupied`/`mov_sample_voxel`/`mov_fine_scan_cell`/`trace_object` 逐字镜像 CPU 参考实现 + `dda_main` trace_scene 合成（count=0 零成本回退纯世界版）；③dda.rs BG2 绑定组接线；④单测 8 项全绿：descriptor 128B 布局 / pool 基址顺序拼接 / 世界路径回归（100 射线）/ 遮挡双向 / yaw90° 旋转 / scale2 / 世界交叠最近面获胜 / L4 brick slab 偏移（双物体 leaves_base 各自命中）；⑤**P2.9e 多网格开销复测**：16 物体 pool **141.4KB/物体**（struct 141KB + leaves 32KB + palette 2KB + desc 128B），trace_scene 1000 射线 × 16 物体 **8.8µs/ray**（世界独占 1.2µs 基线 + 物体剔除/局部 DDA 增量，1s CI 预算余量 ~100×）；⑥gate-app 硬编码验收场景：3 枚芯片预制件（128×32×128 fine，PCB/die/引脚 L0 + 8×L4 走线）——贴地（城堡平台）/ 嵌入北城墙（突出部遮挡+嵌入部被遮挡）/ yaw30°+scale2 压大道，实机运行无错误（遮挡/贴地/交叠语义已由单测锁定，目验待用户 F5）
 
 ## P3 光影渲染 M2：保底可发布线
 
-- [ ] 3.1 光源系统：方向光 + 点光源列表（**数据驱动主题配置**：光源/环境/曝光资产化，首发「暗色实验室」）；NEE 采样 + 阴影射线（DDA 复用）
-- [ ] 3.2 Palette 材质参数消费：emissive / roughness 简化高光
+- [ ] 3.1 光源系统：方向光（**太阳盘角半径 → 软阴影锥采样**，v3.2）+ 点光源（**球形光立体角采样**）列表（**数据驱动主题配置**：光源/环境/曝光资产化，首发「暗色实验室」）；NEE 采样 + 阴影射线（DDA 复用，**经 P2.10 `trace_scene()`——动态物体天然投影**）
+- [ ] 3.2 Palette 材质参数消费：emissive / roughness 简化高光；**发光元件进 NEE 光源列表**（v3.2 升级：CPU 每帧从 ComponentTable 聚合位置提取有界光源清单——「通电的电路照亮暗室」= M2 核心画面与电路游戏视觉语言，不等 P9）
 - [ ] 3.3 **状态调制通道**：StateTable buffer + shader 查表（先用占位数据做呼吸/闪烁验证，P6 接真数据）
 - [ ] 3.4 环境光近似：常数环境项 + 简单体素 AO
 - [ ] 3.5 后处理：ACES tonemap + sRGB（评估复用 Bevy 后处理链）
@@ -168,6 +180,7 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
 - [ ] 4.4 基础工具：放置 / 删除 / 涂材质 / 直线刷
 - [ ] 4.5 **剖面切割**：DDA 起点沿裁剪平面推进（任意角度），编辑与观察封闭电路内部（M2 管线预留位在此兑现）
 - [ ] 4.6 验收：连续高速编辑无卡顿、无渲染不同步；跨级编辑（粗→细）无明显卡顿尖峰（**资源断言 v3.1**：单次编辑 CPU 耗时上界 + 编辑会话内存增量上限，脏上传连发不积压）
+- [ ] 4.7 **MOV-2 平滑移动与交互（v3.2）**：物体 = Bevy Entity（`Transform` 驱动渲染 descriptor，每帧上传，体素网格本身不动 → 平滑无对齐伪影）；抓取 / 拖放 / 放置输入桥（复用 4.x 输入体系与 4.1 拾取——拾取射线同样走 `trace_scene()`）；物体间 / 物体-世界遮挡拾取排序正确
 
 ## P5 游戏逻辑 I：洪泛元件系统（gate-voxel）
 
@@ -221,22 +234,24 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
 - [ ] 9.4 上采样 + 与 M2 直光合成
 - [ ] 9.5 蓝噪声序列管理
 - [ ] 9.6 实机调优迭代回路（用户在环，仅「暗色实验室」主题）
-- [ ] 9.7 验收：与 bevy_vox_scene 参考图并排对比超越（暗色实验室场景，RTX 3070 1080p60）
+- [ ] 9.7 验收：与 bevy_vox_scene 参考图并排对比超越（暗色实验室场景，RTX 3070 1080p60）；**观感对标锚点补 Douglas octo demo（PT AO / 软阴影 / 自发光照明同级，v3.2）**
 
 ## P10 工作间场景与资产管线
 
-- [ ] 10.1 .vox 导入器：MagicaVoxel → palette 映射 → 锁定体素注入（跳过洪泛）
+- [ ] 10.1 .vox 导入器：MagicaVoxel → palette 映射 → 锁定体素注入（跳过洪泛）；**双目标输出：世界网格注入 + MOV 物体网格装载（v3.2）**
 - [ ] 10.2 工作间雕刻 + 打光（光源为点光源列表，落进「暗色实验室」主题配置）
 - [ ] 10.3 元件预制件库：芯片 / 端口 / 显示元件
 - [ ] 10.4 背景与工作区隔离：背景 tile 不进洪泛/编辑，一次上传永驻
+- [ ] 10.5 **MOV-3 物体编辑 = 修复玩法（v3.2）**：NPC 寄来的电子产品 = 预制件装载为 MOV 物体（10.1 双目标 + 10.3 预制件合流）；修复 = 对**物体局部网格**的逐体素编辑（复用 4.2 编辑闭环与脏上传管线，编辑目标切物体槽位）；**动工前先裁决：修复判定语义（图案比对 vs 物体网格进洪泛/模拟），见 UNRESOLVED 表**
 
 ## P11 渲染 M4：冲刺线（可无限期推迟）
 
 - [ ] 11.1 ReSTIR 精修直光（M3 降噪稳定后再动）
 - [ ] 11.2 玻璃透射（折射射线）
 - [ ] 11.3 逐体素动画：电流流动（comp_id → 动画参数查表）
-- [ ] 11.4 相机相对渲染 / tile 重定基（沙盒 >4km 精度）
-- [ ] 11.5 视锥剔除 + 距离剔除（megabase 保护）
+- [ ] ~~11.4 相机相对渲染 / tile 重定基~~ **升格至 P14.4**（v3.3：与视锥/距离剔除同属流式线前置件，不再是冲刺选项）
+- [ ] ~~11.5 视锥剔除 + 距离剔除~~ **升格至 P14.4**（v3.3）
+- [ ] 11.6 **MOV-4 烘焙/解烘焙优化（v3.2，可无限期推迟）**：静止物体烘焙进世界网格（省逐帧多网格遍历 + 纳入 GI/洪泛），拿起时反向解烘焙
 
 ## P12 平台与发布（**整体后置**：Steam 页面暂不开架；仅 P0 的 Platform trait 抽象保留。P10 完成且质量达标后再评估本阶段）
 
@@ -260,14 +275,28 @@ P0 Bevy基建 → P1 最小数据层 → P2 渲染M1（体素上屏）
 
 ---
 
+## P14 流式大世界：引擎能力线（v3.3 新增，**零游戏内容耦合**）
+
+> 定位：把「有界工作间」从引擎上限降级为游戏内容范围。技术判断：CPU 世界本就无界稀疏（`HashMap<TileCoord, Tile>`），GPU 侧一切机制——pow2 桶空闲链（slot 分配/回收）、`TILE_INDEX` 窗口（origin+dims）、tile 粒度增量重建 + 脏上传预算队列——即驻留管理雏形，**流式 = 驻留集有界化，非新架构**。2GB GPU 绑定上限下 >50 万 tile 的大世界只有流式一条路（P1.7 实测百万 tile≈4GB）。参考底子：GigaVoxels（P2 理论总纲即 SVO 流式）· bonsai（八叉树流式世界）· Teardown Sparse Shapes · octo 0.x（octree 加速 Perlin 地形生成）。
+
+- [ ] 14.1 **S1 tile 驻留管理器**：视锥 + 距离优先级 LRU 决定 GPU 驻留集；slot 分配/回收（复用 pow2 桶空闲链）+ index 窗口重扫（复用增量重建协议）；上传走既有预算队列（脏队列机制原样扩用）；**资源断言升级：VRAM ≤ 驻留预算（替代「全场景 ≤2GB」断言——这正是流式的意义）**
+- [ ] 14.2 **S2 程序化世界生成分页源**：确定性 seed、按 tile 请求、Rayon 并行预算内生成；**生成层 / 编辑覆盖层分离**（差量存档 v3.1 的「非空 tile」语义直接复用：生成层只落编辑过的 tile）；octree 加速 Perlin（octo 0.x 验证过的组合）
+- [ ] 14.3 **S3 LOD**：可变叶八叉树折叠 = 天然降采样变体（4cm→16cm→64cm）；远处粗叶直出；切换闪烁抑制（抖动溶解 + 距离滞后带）；LOD 变体生成纳入 14.2 分页预算
+- [ ] 14.4 **S4 精度与剔除**（自 P11.4/P11.5 升格）：相机相对渲染 + tile 重定基（>4km f32 精度）+ 视锥/距离剔除（megabase 保护）
+- [ ] 14.5 **验收**：相机连续飞行穿越 ≥10 万 tile 程序化世界；GPU 驻留 ≤ 预算、无 >1 帧（16.7ms）卡顿尖峰；加载距离外零驻留；编辑/存档/洪泛在流式边界处语义正确（游戏内容侧只要求机制可用，不设计具体关卡）
+
+---
+
 ## 里程碑验收标准汇总
 
 | 里程碑 | 验收标准 | 状态 |
 |---|---|---|
 | **M1（P2）** | 测试体素场景经砖块图+DDA 在 Bevy 内上屏，相机自由飞行，1080p @ GTX 1660 无异常 | ☐ |
-| **M2（P3）** | 暗色实验室主题光影实时渲染；1080p60 @ GTX 1660；万体素编辑不掉帧；理论可上架 | ☐ |
+| **M2（P3）** | 暗色实验室主题光影实时渲染（**软阴影 + 发光元件直接照明**，v3.2）；1080p60 @ GTX 1660；万体素编辑不掉帧；理论可上架 | ☐ |
 | **可编辑（P4）** | 点击放/删体素画面同帧更新，连续操作流畅，剖面切割可用 | ☐ |
+| **MOV 底座（P2.10+P4.7+P10.5）** | 静态/平滑移动的多网格体素对象渲染正确；NPC 寄件电子产品可被逐体素修复 | ☐ |
 | **内核（P5+P6）** | 洪泛成元件 → 事件驱动模拟 → 通电变色全链路真数据跑通 | ☐ |
 | **可玩（P7+P8）** | 教学关自测通过：无说明能完成并想优化解法 | ☐ |
 | **M3（P9）** | PT GI + 降噪稳定 @ RTX 3070 1080p60，观感超越 bevy_vox_scene 参考图 | ☐ |
 | **M4（P11）** | VoxTrace demo 同级表现 | ☐ |
+| **引擎能力·流式（P14）** | ≥10 万 tile 程序化世界连续飞行：GPU 驻留有界、无卡顿尖峰、LOD 无闪烁、>4km 精度正确 | ☐ |

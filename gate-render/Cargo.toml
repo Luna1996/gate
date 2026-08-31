@@ -9,3 +9,8 @@ bevy = { workspace = true }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 rayon = { workspace = true }
+
+[dev-dependencies]
+# 集成测试（tests/p29_limits.rs）需要直接构造 TileGrid / 调用 fill_box
+glam = { workspace = true }
+gate-voxel = { workspace = true }
