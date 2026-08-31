@@ -1,0 +1,1 @@
+this is douglas and welcome to a weekly progress update on my massive voxel game engine this week i've been working on adding a chunk loading system to the game the world is now virtually infinite and you can edit any part of it even borders between chunks chunks are loaded in and out of memory depending upon your proximity to them

@@ -19,3 +19,5 @@
 .trae/**/*.log
 .trae/**/*.err
 .trae/**/*.out
+# YouTube 登录 cookie（yt-dlp 下载字幕用，敏感凭据严禁提交）
+/cookies.txt
