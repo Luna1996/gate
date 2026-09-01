@@ -136,8 +136,7 @@ struct MovGlobals {
 }
 @group(2) @binding(4) var<uniform> mov_g: MovGlobals;
 
-// ---- BG3：光源池（P3.1）----
-// Rust `lighting.rs::LightPoolUniform` 逐字段镜像（432B：48B header + 8×48B）
+// ---- BG3：光源池（P3.1；P3.2 发光元件并入，816B：48B header + 16×48B）----
 struct LightGlobals {
   count: u32,
   _pad0: u32,
@@ -156,7 +155,9 @@ struct LightDesc {
 }
 struct LightPool {
   g: LightGlobals,
-  lights: array<LightDesc, 8u>,
+  lights: array<LightDesc, 16u>,
+  sky_top: vec4<f32>,
+  sky_horizon: vec4<f32>,
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
 
@@ -818,34 +819,128 @@ fn sphere_sample_offset(k: u32) -> vec3<f32> {
   return vec3<f32>(r * cos(phi), z, r * sin(phi));
 }
 
-// 命中点 albedo（palette u8 → /255 线性近似）
-fn hit_rgb(obj: i32, pal: u32) -> vec3<f32> {
+// 命中点材质（P3.2：palette 两 words 解包 albedo + roughness + emissive）
+// w0 = color.r | color.g<<8 | color.b<<16 | roughness<<24
+// w1 = emissive | transmission<<8 | flags<<16
+struct HitMat {
+  albedo: vec3<f32>,
+  rough: f32,    // 0（镜面）..1（全粗糙）
+  emissive: f32, // 0..1（发光强度归一）
+}
+fn hit_mat(obj: i32, pal: u32) -> HitMat {
   var w0: u32;
+  var w1: u32;
   if (obj < 0) {
     w0 = b_palette[pal * 2u];
+    w1 = b_palette[pal * 2u + 1u];
   } else {
     let pal_b = mov_descs[u32(obj) * MOV_DESC_WORDS + 28u];
     w0 = mov_palette[pal_b + pal * 2u];
+    w1 = mov_palette[pal_b + pal * 2u + 1u];
   }
-  return vec3<f32>(
-    f32(w0 & 0xFFu),
-    f32((w0 >> 8u) & 0xFFu),
-    f32((w0 >> 16u) & 0xFFu),
-  ) / 255.0;
+  return HitMat(
+    vec3<f32>(
+      f32(w0 & 0xFFu),
+      f32((w0 >> 8u) & 0xFFu),
+      f32((w0 >> 16u) & 0xFFu),
+    ) / 255.0,
+    f32((w0 >> 24u) & 0xFFu) / 255.0,
+    f32(w1 & 0xFFu) / 255.0,
+  );
 }
 
-// 直射光合成（NEE）：P = origin + dir·t、法线 n、albedo → 环境项 + 逐光源
-// 方向光锥采样（太阳盘角半径软阴影）/ 点光球面立体角采样（米制平方反比）。
+// Phong 简化高光系数（P3.2 视图相关项；3.5d 逐体素量化时随直光进体素均值）。
+// 用真反射向量（Blinn 半程向量在 l≈v 场景严重高估：太阳正照平面时
+// dot(h,n)≈1，而物理上反射光背向观察者）。roughness 0（镜面）→ 指数 128 /
+// 强度 0.35，1（全粗糙）→ 指数 4 / 强度 0。
+// 与 lighting.rs::phong_spec 逐字一致。
+const SPEC_MAX: f32 = 0.35;
+fn phong_spec(n: vec3<f32>, l: vec3<f32>, v: vec3<f32>, rough: f32) -> f32 {
+  let r = 2.0 * dot(n, l) * n - l; // = reflect(-l, n)
+  let spec_exp = (1.0 - rough) * 124.0 + 4.0;
+  let strength = (1.0 - rough) * SPEC_MAX;
+  return pow(max(dot(r, v), 0.0), spec_exp) * strength;
+}
+
+// 发光直出增益（albedo × emissive × GAIN；与 lighting.rs::EMISSIVE_EMIT_GAIN 一致）
+const EMISSIVE_EMIT_GAIN: f32 = 4.0;
+// 方向光阴影射线 t_max：CAM_FAR 量级（65536 fine），足够覆盖整个可见场景
+// 不能用 frustum_length——那是主视线的 far 距离，太阳方向的阴影射线需要独立长度
+const SHADOW_DIR_T_MAX: f32 = 65536.0;
+
+// ============================================================================
+// P3.5 色调映射 + 颜色空间转换
+// ============================================================================
+
+// ACES Filmic 色调映射（简化版，Narkowicz 近似）
+// 把 HDR 线性值压缩进 [0,1]，高光不截断、暗部不发黑
+fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// 线性 → sRGB 转换
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+  let l = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  return vec3<f32>(
+    select(12.92 * l.r, pow(l.r, 1.0 / 2.4) * 1.055 - 0.055, l.r > 0.0031308),
+    select(12.92 * l.g, pow(l.g, 1.0 / 2.4) * 1.055 - 0.055, l.g > 0.0031308),
+    select(12.92 * l.b, pow(l.b, 1.0 / 2.4) * 1.055 - 0.055, l.b > 0.0031308)
+  );
+}
+
+// 直射光合成（NEE）：P = origin + dir·t、法线 n、材质 → 环境项 + 逐光源
+// 方向光锥采样（太阳盘角半径软阴影）/ 点光球面立体角采样（米制平方反比）
+// ============================================================================
+// P3.5a 程序化天空：sky(dir) → 线性色（渐变 + 太阳盘）
+// 一处实现三处复用：miss 射线背景 / 3.5b 雾色 / 3.4 环境光半球采样
+// ============================================================================
+fn sky(dir: vec3<f32>) -> vec3<f32> {
+  // 归一化方向
+  let d = normalize(dir);
+  // 垂直高度：y > 0 → 仰角；y <= 0 → 地平线以下（地面）
+  let h = clamp(d.y, 0.0, 1.0);
+  // 渐变：地平线(0) → 天顶(1)，用 smoothstep 让过渡自然
+  let t = smoothstep(0.0, 0.35, h);
+  var col: vec3<f32> = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, t);
+  // 太阳盘：只有主题有太阳时（lights[0] kind=0 方向光）才叠加
+  if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
+    let sdir = light_u.lights[0].kind_pos_dir.yzw;
+    let cos_a = max(dot(d, sdir), 0.0);
+    // 盘角半径 = angular_radius rad；太阳颜色 + 强度
+    let radius = light_u.lights[0].shape.x;
+    let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+    // smoothstep 边缘过渡，避免硬边
+    let disc = smoothstep(cos(radius), cos(radius * 0.8), cos_a);
+    // 辉光晕：太阳方向附近亮度过渡；仅天空方向可见
+    let glow = pow(max(cos_a, 0.0), 64.0) * 0.05 * select(1.0, 0.0, h > 0.0);
+    let on_disk = select(disc, 0.0, h > 0.0);
+    col = col + sun_c * (on_disk * 0.3 + glow);
+  }
+  return col;
+}
+
+// 直射光合成（NEE）：方向光软阴影 + 点光 + 天空环境光 + 发光直出
 fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, obj: i32, n: vec3<f32>, shadow_t_max: f32) -> vec3<f32> {
   let p = origin + dir * t;
-  let base = hit_rgb(obj, pal);
-  var col = base * light_u.g.ambient.xyz;
+  let v = normalize(-dir);
+  let mat = hit_mat(obj, pal);
+  let base = mat.albedo;
+  // 3.4 环境光 sky 渐变采样
+  let h = clamp(n.y, 0.0, 1.0);
+  let sky_grad = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, smoothstep(0.0, 0.35, h));
+  var col: vec3<f32> = base * (light_u.g.ambient.xyz * 0.6 + sky_grad * 0.4);
+
   let vis_step = 1.0 / f32(SHADOW_SAMPLES);
-  let n_lights = min(light_u.g.count, 8u);
+  let n_lights = min(light_u.g.count, 16u);
   for (var i: u32 = 0u; i < n_lights; i = i + 1u) {
     let ld = light_u.lights[i];
     if (ld.kind_pos_dir.x < 0.5) {
-      // ---- 方向光：盘角半径锥采样软阴影 ----
+      // 方向光：太阳软阴影
       let l_axis = ld.kind_pos_dir.yzw;
       let ndl = max(dot(n, l_axis), 0.0);
       if (ndl <= 0.0) { continue; }
@@ -854,12 +949,13 @@ fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, obj: i32, n: v
       var vis = 0.0;
       for (var k: u32 = 0u; k < SHADOW_SAMPLES; k = k + 1u) {
         let d = cone_sample_dir(l_axis, theta, k);
-        if (DIAG_SKIP_SHADOWS == 1u || !scene_occluded(o, d, shadow_t_max)) { vis = vis + vis_step; }
+        if (!scene_occluded(o, d, SHADOW_DIR_T_MAX)) { vis = vis + vis_step; }
       }
       let c = ld.color_intensity.xyz * ld.color_intensity.w;
       col = col + base * c * (ndl * vis);
+      col = col + c * (phong_spec(n, l_axis, v, mat.rough) * vis);
     } else {
-      // ---- 点光：球面立体角采样软阴影 + 米制平方反比 ----
+      // 点光：平方反比衰减（不采阴影——Douglas 方案）
       let center = ld.kind_pos_dir.yzw;
       let to_l = center - p;
       let dist = length(to_l);
@@ -867,22 +963,15 @@ fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, obj: i32, n: v
       let l_axis = to_l / dist;
       let ndl = max(dot(n, l_axis), 0.0);
       if (ndl <= 0.0) { continue; }
-      let radius = ld.shape.x;
-      let o = p + n * SHADOW_BIAS;
-      var vis = 0.0;
-      for (var k: u32 = 0u; k < SHADOW_SAMPLES; k = k + 1u) {
-        let sp = center + sphere_sample_offset(k) * radius;
-        let seg = sp - o;
-        let seg_len = length(seg);
-        if (seg_len < 1e-4) { continue; }
-        if (DIAG_SKIP_SHADOWS == 1u || !scene_occluded(o, seg / seg_len, seg_len)) { vis = vis + vis_step; }
-      }
       let d_m = dist / FINES_PER_M;
       let atten = 1.0 / max(d_m * d_m, 1e-6);
       let c = ld.color_intensity.xyz * ld.color_intensity.w;
-      col = col + base * c * (ndl * vis * atten);
+      col = col + base * c * (ndl * atten);
+      col = col + c * (phong_spec(n, l_axis, v, mat.rough) * atten);
     }
   }
+  // 发光直出
+  col = col + base * (mat.emissive * EMISSIVE_EMIT_GAIN);
   return col * light_u.g.exposure_pad.x;
 }
 
@@ -896,8 +985,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(out_tex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
-  // 背景色深蓝黑（命中时再覆盖）
-  var col: vec3<f32> = vec3<f32>(0.05, 0.08, 0.12);
+  // 背景色占位（反投影后用 sky(dir_fine) 覆盖）
+  var col: vec3<f32> = vec3<f32>(0.0);
 
   // ---- 反投影：像素中心 (gid + 0.5) → NDC (u, v) ∈ [-1, 1] ----
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
@@ -914,6 +1003,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let frustum_length = length(diff_world);
   let dir_fine = normalize(diff_world);
   let origin_fine = view_u.cam_pos_fine.xyz;
+  // 3.5a 程序化天空背景
+  col = sky(dir_fine);
 
   // ---- trace_scene 合成：trace_world（世界两级 DDA）+ 逐物体 trace_object 取最近 ----
   var best_t = 1e+30;
@@ -943,6 +1034,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (best_t < 1e+29) {
     col = shade_hit(origin_fine, dir_fine, best_t, best_pal, best_obj, best_n, frustum_length);
   }
+  col = aces_tonemap(col);
   textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
 }
 

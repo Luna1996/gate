@@ -14,24 +14,24 @@ license = "MIT OR Apache-2.0"
 # P0.2: Bevy 版本精确锁定（render graph API 随版本破坏性变更频繁）
 [workspace.dependencies]
 bevy = { version = "=0.19.1", default-features = false, features = [
-    "bevy_winit",
-    "bevy_render",
-    "bevy_core_pipeline",
-    "bevy_post_process",
-    "bevy_sprite",
-    "bevy_sprite_render",
-    "bevy_ui",
-    "bevy_ui_render",
-    "bevy_asset",
-    "bevy_log",
-    "bevy_state",
-    # 2.7a：FontSource::SystemUi 需要（未启用时 bevy_text 报错且文本不渲染）
-    "system_font_discovery",
-    "multi_threaded",
-    "std",
-    "default_font",
-    "reflect_auto_register",
-    "async_executor",
+  "bevy_winit",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_post_process",
+  "bevy_sprite",
+  "bevy_sprite_render",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_asset",
+  "bevy_log",
+  "bevy_state",
+  # 2.7a：FontSource::SystemUi 需要（未启用时 bevy_text 报错且文本不渲染）
+  "system_font_discovery",
+  "multi_threaded",
+  "std",
+  "default_font",
+  "reflect_auto_register",
+  "async_executor",
 ] }
 gate-voxel = { path = "gate-voxel" }
 gate-render = { path = "gate-render" }

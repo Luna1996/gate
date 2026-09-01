@@ -453,8 +453,7 @@ impl Plugin for GateUiPlugin {
           crate::widgets::ring_list_sync_system,
           crate::widgets::plot_redraw_system,
           crate::capture::ui_pointer_capture_system,
-          crate::world_anchor::world_anchor_apply_text
-            .after(ui_theme_font_install_default),
+          crate::world_anchor::world_anchor_apply_text.after(ui_theme_font_install_default),
           crate::world_anchor::world_anchor_system,
         ),
       );

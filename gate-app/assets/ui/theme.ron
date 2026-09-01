@@ -1,25 +1,25 @@
 // gate-ui 主题令牌 —— Modern UI 暗色（与内置默认主题一致的数据化镜像，可改此文件换肤）
 // 颜色格式："RRGGBB"（alpha=FF）或 "RRGGBBAA"；字段缺失回退内置默认
 (
-    colors: (
-        panel_bg: "1E1E2ECC",
-        panel_border: "45475ACC",
-        text: "CDD6F4",
-        text_muted: "9399B2",
-        accent: "89B4FA",
-        accent_hover: "74C7EC",
-        accent_pressed: "7287FD",
-        success: "A6E3A1",
-        warning: "F9E2AF",
-        danger: "F38BA8",
-    ),
-    metrics: (
-        corner_radius: 8.0,
-        border_width: 1.0,
-        spacing: (xs: 4.0, sm: 8.0, md: 12.0, lg: 16.0),
-        font_size: (sm: 12.0, md: 14.0, lg: 18.0),
-    ),
-    ui_scale: 1.0,
-    auto_fit_ui_scale: true,
-    font_path: Some("fonts/MapleMono-NF-CN-Regular.ttf"),
+  colors: (
+    panel_bg: "1E1E2ECC",
+    panel_border: "45475ACC",
+    text: "CDD6F4",
+    text_muted: "9399B2",
+    accent: "89B4FA",
+    accent_hover: "74C7EC",
+    accent_pressed: "7287FD",
+    success: "A6E3A1",
+    warning: "F9E2AF",
+    danger: "F38BA8",
+  ),
+  metrics: (
+    corner_radius: 8.0,
+    border_width: 1.0,
+    spacing: (xs: 4.0, sm: 8.0, md: 12.0, lg: 16.0),
+    font_size: (sm: 12.0, md: 14.0, lg: 18.0),
+  ),
+  ui_scale: 1.0,
+  auto_fit_ui_scale: true,
+  font_path: Some("fonts/MapleMono-NF-CN-Regular.ttf"),
 )

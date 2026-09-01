@@ -19,19 +19,19 @@
 //! - info 打印 PROBE 结论 + UPLOAD[full|incremental]
 
 use bevy::{
-    log::{info, warn},
-    prelude::*,
-    render::{
-        Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
-        render_resource::*,
-        renderer::{RenderDevice, RenderQueue},
-    },
+  log::{info, warn},
+  prelude::*,
+  render::{
+    Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+    render_resource::*,
+    renderer::{RenderDevice, RenderQueue},
+  },
 };
 
 use super::builder::{BrickMapBuilder, DirtyRanges, TileUpdate};
 use super::wire::{
-    BrickMapBuffers, BrickMapGlobals, CELL_DIR_WORDS, NODE_STREAM_BASE, TILE_BITMAP_WORDS,
-    TILE_COMP_WORDS,
+  BrickMapBuffers, BrickMapGlobals, CELL_DIR_WORDS, NODE_STREAM_BASE, TILE_BITMAP_WORDS,
+  TILE_COMP_WORDS,
 };
 
 // ----------------------------------------------------------------------------
@@ -42,37 +42,37 @@ pub const SINGLE_THRESHOLD_BYTES: u64 = (1 << 30) - 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BindingLimits {
-    pub max_storage_buffer_binding_size: u64,
+  pub max_storage_buffer_binding_size: u64,
 }
 impl BindingLimits {
-    pub fn probe(device: &RenderDevice) -> Self {
-        Self {
-            max_storage_buffer_binding_size: device.limits().max_storage_buffer_binding_size,
-        }
+  pub fn probe(device: &RenderDevice) -> Self {
+    Self {
+      max_storage_buffer_binding_size: device.limits().max_storage_buffer_binding_size,
     }
-    pub fn force_multi(&self) -> bool {
-        self.max_storage_buffer_binding_size < SINGLE_THRESHOLD_BYTES
-    }
+  }
+  pub fn force_multi(&self) -> bool {
+    self.max_storage_buffer_binding_size < SINGLE_THRESHOLD_BYTES
+  }
 }
 
 #[derive(Debug, Clone)]
 pub enum BufferLayout {
-    Single,
-    Multi { node_slices: usize },
+  Single,
+  Multi { node_slices: usize },
 }
 impl BufferLayout {
-    pub fn from_limits(limits: &BindingLimits) -> Self {
-        if limits.force_multi() {
-            let per = 64u64 << 20;
-            let left = limits.max_storage_buffer_binding_size.min(per).max(4 << 20);
-            let node_slices = ((NODE_STREAM_BASE as u64).saturating_add(per) / left) as usize;
-            Self::Multi {
-                node_slices: node_slices.max(1),
-            }
-        } else {
-            Self::Single
-        }
+  pub fn from_limits(limits: &BindingLimits) -> Self {
+    if limits.force_multi() {
+      let per = 64u64 << 20;
+      let left = limits.max_storage_buffer_binding_size.min(per).max(4 << 20);
+      let node_slices = ((NODE_STREAM_BASE as u64).saturating_add(per) / left) as usize;
+      Self::Multi {
+        node_slices: node_slices.max(1),
+      }
+    } else {
+      Self::Single
     }
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -81,30 +81,30 @@ impl BufferLayout {
 
 #[derive(Resource)]
 pub struct VoxelScene {
-    pub grid: gate_voxel::TileGrid,
-    pub demo_force_full_rebuild: bool,
+  pub grid: gate_voxel::TileGrid,
+  pub demo_force_full_rebuild: bool,
 }
 
 #[derive(Resource, Clone, Debug)]
 pub struct UploadBudget {
-    pub max_bytes_per_frame: usize,
-    pub incremental: bool,
+  pub max_bytes_per_frame: usize,
+  pub incremental: bool,
 }
 impl Default for UploadBudget {
-    fn default() -> Self {
-        Self {
-            max_bytes_per_frame: 4 * 1024 * 1024,
-            incremental: true,
-        }
+  fn default() -> Self {
+    Self {
+      max_bytes_per_frame: 4 * 1024 * 1024,
+      incremental: true,
     }
+  }
 }
 
 /// 主世界 Pending 资源：在主 world `Last` schedule 按预算 drain dirty，供只读提取
 #[derive(Resource, Default)]
 pub struct MainPending {
-    pub force_full: bool,
-    pub data_tiles: Vec<gate_voxel::TileCoord>,
-    pub comp_tiles: Vec<gate_voxel::TileCoord>,
+  pub force_full: bool,
+  pub data_tiles: Vec<gate_voxel::TileCoord>,
+  pub comp_tiles: Vec<gate_voxel::TileCoord>,
 }
 
 /// 在主 world `Last` 阶段（晚于用户 Update 编辑）：按预算 drain dirty → MainPending
@@ -113,40 +113,40 @@ pub struct MainPending {
 /// 被 mirror 消费）；否则坐标会逐帧累积并重复 update_tile，带来 O(140MB/帧) 的假
 /// 增量上传。force_full 同样在处理完一帧后复位。
 pub fn poll_pending(
-    scene: Option<ResMut<VoxelScene>>,
-    budget: Option<Res<UploadBudget>>,
-    mut pending: ResMut<MainPending>,
+  scene: Option<ResMut<VoxelScene>>,
+  budget: Option<Res<UploadBudget>>,
+  mut pending: ResMut<MainPending>,
 ) {
-    let (Some(mut scene), Some(budget)) = (scene, budget) else {
-        return;
-    };
-    pending.data_tiles.clear();
-    pending.comp_tiles.clear();
-    pending.force_full = false;
-    if scene.demo_force_full_rebuild {
-        pending.force_full = true;
-        scene.demo_force_full_rebuild = false;
-    }
-    let per_tile_floor = (TILE_BITMAP_WORDS + CELL_DIR_WORDS) * 4;
-    let budget_n = (budget.max_bytes_per_frame / per_tile_floor.max(1)).clamp(1, 64);
-    let data_backlog = scene.grid.dirty.data_dirty_count();
-    let comp_backlog = scene.grid.dirty.comp_dirty_count();
-    // 反推 backlog：Startup 首次构建有上百 tile dirty（极限场景 ~211），
-    // 若按 budget_n (≈31) 逐帧 drain，每帧 builder.update_tile(31 tiles) 会 CPU 阻塞 2~3s
-    // 冻结 Prepare 全局调度 → BG1 绑定 / DDA dispatch 推迟十几秒 → 画面"只有 UI+渐变全黑"。
-    // 当 backlog > 3× 预算（即明显处于 Startup 批量构建积压，而不是 120 帧 1 tile 增量编辑），
-    // 一次性把 dirty 队列清空。这个判定不依赖任何外部 flag 时序，鲁棒。
-    let (data_n, comp_n) = if data_backlog > budget_n * 3 {
-        (data_backlog, comp_backlog.max(budget_n))
-    } else {
-        (budget_n, budget_n.min(comp_backlog.max(1)))
-    };
-    pending
-        .data_tiles
-        .extend(scene.grid.dirty.drain_data_budget(data_n));
-    pending
-        .comp_tiles
-        .extend(scene.grid.dirty.drain_comp_budget(comp_n));
+  let (Some(mut scene), Some(budget)) = (scene, budget) else {
+    return;
+  };
+  pending.data_tiles.clear();
+  pending.comp_tiles.clear();
+  pending.force_full = false;
+  if scene.demo_force_full_rebuild {
+    pending.force_full = true;
+    scene.demo_force_full_rebuild = false;
+  }
+  let per_tile_floor = (TILE_BITMAP_WORDS + CELL_DIR_WORDS) * 4;
+  let budget_n = (budget.max_bytes_per_frame / per_tile_floor.max(1)).clamp(1, 64);
+  let data_backlog = scene.grid.dirty.data_dirty_count();
+  let comp_backlog = scene.grid.dirty.comp_dirty_count();
+  // 反推 backlog：Startup 首次构建有上百 tile dirty（极限场景 ~211），
+  // 若按 budget_n (≈31) 逐帧 drain，每帧 builder.update_tile(31 tiles) 会 CPU 阻塞 2~3s
+  // 冻结 Prepare 全局调度 → BG1 绑定 / DDA dispatch 推迟十几秒 → 画面"只有 UI+渐变全黑"。
+  // 当 backlog > 3× 预算（即明显处于 Startup 批量构建积压，而不是 120 帧 1 tile 增量编辑），
+  // 一次性把 dirty 队列清空。这个判定不依赖任何外部 flag 时序，鲁棒。
+  let (data_n, comp_n) = if data_backlog > budget_n * 3 {
+    (data_backlog, comp_backlog.max(budget_n))
+  } else {
+    (budget_n, budget_n.min(comp_backlog.max(1)))
+  };
+  pending
+    .data_tiles
+    .extend(scene.grid.dirty.drain_data_budget(data_n));
+  pending
+    .comp_tiles
+    .extend(scene.grid.dirty.drain_comp_budget(comp_n));
 }
 
 // ----------------------------------------------------------------------------
@@ -156,23 +156,23 @@ pub fn poll_pending(
 /// ExtractSchedule 用的 CPU builder / pending 状态（render world resource）
 #[derive(Resource, Default)]
 pub struct BuilderMirror {
-    pub builder: Option<BrickMapBuilder>,
-    pub pending_full: bool,
-    pub pending_data_tiles: Vec<gate_voxel::TileCoord>,
-    pub pending_comp_tiles: Vec<gate_voxel::TileCoord>,
+  pub builder: Option<BrickMapBuilder>,
+  pub pending_full: bool,
+  pub pending_data_tiles: Vec<gate_voxel::TileCoord>,
+  pub pending_comp_tiles: Vec<gate_voxel::TileCoord>,
 }
 
 /// ExtractSchedule 产出 → PrepareResources 消费（render world resource）
 #[derive(Resource, Clone)]
 pub struct UploadSnapshot {
-    pub buffers: BrickMapBuffers,
-    pub mode_tag: &'static str,
-    pub state_bytes: Vec<u8>,
-    pub comp_tiles: usize,
-    /// 更新的 dirty tile 数（用于日志：不再误导写"总 tile_count=3"）
-    pub dirty_tiles: usize,
-    /// 增量脏字节区间；`mode_tag="full"` 时会被忽略（整块写）。
-    pub dirty: DirtyRanges,
+  pub buffers: BrickMapBuffers,
+  pub mode_tag: &'static str,
+  pub state_bytes: Vec<u8>,
+  pub comp_tiles: usize,
+  /// 更新的 dirty tile 数（用于日志：不再误导写"总 tile_count=3"）
+  pub dirty_tiles: usize,
+  /// 增量脏字节区间；`mode_tag="full"` 时会被忽略（整块写）。
+  pub dirty: DirtyRanges,
 }
 
 /// P2.7 上传 CPU 耗时样本（render world 资源，由 prepare 每帧 insert_resource 覆盖。
@@ -180,8 +180,8 @@ pub struct UploadSnapshot {
 /// 详见下方 [`UploadCpuSampleChannel`]。上传段的 GPU 拷贝在 submit 时发生，测不到——OQ-2 选 A。
 #[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct UploadCpuSample {
-    pub cpu_ms: f32,
-    pub generation: u64,
+  pub cpu_ms: f32,
+  pub generation: u64,
 }
 
 /// render↔main 共享通道（Arc<Mutex>），与 bevy RenderDiagnosticsMutex 同款模式。
@@ -191,12 +191,12 @@ pub struct UploadCpuSampleChannel(pub std::sync::Arc<std::sync::Mutex<Option<Upl
 
 #[derive(Resource)]
 pub struct GpuBrickMap {
-    pub struct_buf: Buffer,
-    pub leaves: Buffer,
-    pub palette: Buffer,
-    pub comp: Buffer,
-    pub state: Buffer,
-    pub globals: UniformBuffer<BrickMapGlobals>,
+  pub struct_buf: Buffer,
+  pub leaves: Buffer,
+  pub palette: Buffer,
+  pub comp: Buffer,
+  pub state: Buffer,
+  pub globals: UniformBuffer<BrickMapGlobals>,
 }
 
 // ----------------------------------------------------------------------------
@@ -204,24 +204,24 @@ pub struct GpuBrickMap {
 // ----------------------------------------------------------------------------
 
 fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
-    // COPY_SRC：扩容前缀拷贝（copy_buffer_to_buffer 旧→新）必需
-    let make = |label: &str| -> Buffer {
-        device.create_buffer(&BufferDescriptor {
-            label: Some(label),
-            size: 4,
-            usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        })
-    };
-    let globals = UniformBuffer::<BrickMapGlobals>::default();
-    commands.insert_resource(GpuBrickMap {
-        struct_buf: make("gate_struct"),
-        leaves: make("gate_leaves"),
-        palette: make("gate_palette"),
-        comp: make("gate_comp"),
-        state: make("gate_state"),
-        globals,
-    });
+  // COPY_SRC：扩容前缀拷贝（copy_buffer_to_buffer 旧→新）必需
+  let make = |label: &str| -> Buffer {
+    device.create_buffer(&BufferDescriptor {
+      label: Some(label),
+      size: 4,
+      usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    })
+  };
+  let globals = UniformBuffer::<BrickMapGlobals>::default();
+  commands.insert_resource(GpuBrickMap {
+    struct_buf: make("gate_struct"),
+    leaves: make("gate_leaves"),
+    palette: make("gate_palette"),
+    comp: make("gate_comp"),
+    state: make("gate_state"),
+    globals,
+  });
 }
 
 // ----------------------------------------------------------------------------
@@ -231,80 +231,79 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 // ----------------------------------------------------------------------------
 
 fn extract(
-    mut commands: Commands,
-    scene: Option<Extract<Res<VoxelScene>>>,
-    budget: Option<Extract<Res<UploadBudget>>>,
-    main_pending: Option<Extract<Res<MainPending>>>,
-    mut mirror: ResMut<BuilderMirror>,
+  mut commands: Commands,
+  scene: Option<Extract<Res<VoxelScene>>>,
+  budget: Option<Extract<Res<UploadBudget>>>,
+  main_pending: Option<Extract<Res<MainPending>>>,
+  mut mirror: ResMut<BuilderMirror>,
 ) {
-    let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
-        return;
-    };
-    if main_pending.force_full {
-        mirror.pending_full = true;
-    }
-    mirror
-        .pending_data_tiles
-        .extend(main_pending.data_tiles.clone());
-    mirror
-        .pending_comp_tiles
-        .extend(main_pending.comp_tiles.clone());
+  let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
+    return;
+  };
+  if main_pending.force_full {
+    mirror.pending_full = true;
+  }
+  mirror
+    .pending_data_tiles
+    .extend(main_pending.data_tiles.clone());
+  mirror
+    .pending_comp_tiles
+    .extend(main_pending.comp_tiles.clone());
 
-    let first = mirror.builder.is_none();
-    let pending_full = std::mem::take(&mut mirror.pending_full);
-    let mut pending_data: Vec<gate_voxel::TileCoord> =
-        std::mem::take(&mut mirror.pending_data_tiles);
-    let pending_comp: Vec<_> = std::mem::take(&mut mirror.pending_comp_tiles);
-    let need_full = first || pending_full || !budget.incremental;
-    let dirty_any = need_full || !pending_data.is_empty() || !pending_comp.is_empty();
-    // 如果非首帧 + 非强制全量 + 无脏 tile → 跳过构建/上传（节省 140MB CPU 构建 + PCIe）
-    if !dirty_any {
-        return;
+  let first = mirror.builder.is_none();
+  let pending_full = std::mem::take(&mut mirror.pending_full);
+  let mut pending_data: Vec<gate_voxel::TileCoord> = std::mem::take(&mut mirror.pending_data_tiles);
+  let pending_comp: Vec<_> = std::mem::take(&mut mirror.pending_comp_tiles);
+  let need_full = first || pending_full || !budget.incremental;
+  let dirty_any = need_full || !pending_data.is_empty() || !pending_comp.is_empty();
+  // 如果非首帧 + 非强制全量 + 无脏 tile → 跳过构建/上传（节省 140MB CPU 构建 + PCIe）
+  if !dirty_any {
+    return;
+  }
+  let dirty_tiles = pending_data.len();
+  let grid_ref = &scene.grid;
+  let builder = mirror
+    .builder
+    .get_or_insert_with(|| BrickMapBuilder::new_unbuilt(grid_ref));
+  if need_full {
+    *builder = BrickMapBuilder::build_full(grid_ref);
+    pending_data.clear();
+  } else {
+    for c in pending_data.drain(..) {
+      builder.update_tile(grid_ref, c);
     }
-    let dirty_tiles = pending_data.len();
-    let grid_ref = &scene.grid;
-    let builder = mirror
-        .builder
-        .get_or_insert_with(|| BrickMapBuilder::new_unbuilt(grid_ref));
-    if need_full {
-        *builder = BrickMapBuilder::build_full(grid_ref);
-        pending_data.clear();
-    } else {
-        for c in pending_data.drain(..) {
-            builder.update_tile(grid_ref, c);
-        }
+  }
+  let mode_tag = if first || need_full {
+    "full"
+  } else if budget.incremental {
+    "incremental"
+  } else {
+    "fallback_full"
+  };
+  let buffers = builder.buffers().clone();
+  // full 时 dirty ranges 无意义（prepare 走整块写）；incremental 取出累积的脏区间。
+  let dirty = if need_full {
+    DirtyRanges {
+      struct_ranges: Vec::new(),
+      leaves_ranges: Vec::new(),
+      palette_changed: false,
     }
-    let mode_tag = if first || need_full {
-        "full"
-    } else if budget.incremental {
-        "incremental"
-    } else {
-        "fallback_full"
-    };
-    let buffers = builder.buffers().clone();
-    // full 时 dirty ranges 无意义（prepare 走整块写）；incremental 取出累积的脏区间。
-    let dirty = if need_full {
-        DirtyRanges {
-            struct_ranges: Vec::new(),
-            leaves_ranges: Vec::new(),
-            palette_changed: false,
-        }
-    } else {
-        builder.take_dirty_ranges()
-    };
-    let state_bytes = grid_ref.state_table_bytes().to_vec();
-    let comp_tiles = grid_ref.comp_layer().len();
-    drop(pending_comp);
-    let _ = TileUpdate::Rebuilt;
+  } else {
+    builder.take_dirty_ranges()
+  };
+  let state_bytes = grid_ref.state_table_bytes().to_vec();
+  let comp_tiles = grid_ref.comp_layer().len();
+  drop(pending_comp);
+  let _ = TileUpdate::Rebuilt;
 
-    commands.insert_resource(UploadSnapshot {
-        buffers,
-        mode_tag,
-        state_bytes,
-        comp_tiles,
-        dirty_tiles,
-        dirty,
-    });
+  commands.insert_resource(UploadSnapshot {
+    buffers,
+    mode_tag,
+    state_bytes,
+    comp_tiles,
+    dirty_tiles,
+    dirty,
+  });
 }
 
 // ----------------------------------------------------------------------------
@@ -312,7 +311,7 @@ fn extract(
 // ----------------------------------------------------------------------------
 
 fn u8_of_u32(w: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) }
+  unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) }
 }
 
 /// GPU buffer 扩容尺寸策略（纯函数，单测覆盖）。
@@ -322,13 +321,13 @@ fn u8_of_u32(w: &[u32]) -> &[u8] {
 /// 新策略：大 buffer（≥8MB，当前即 b_struct/b_leaves 大场景形态）按 32MB 水位
 /// 对齐——扩容 DMA 量小、重建间隔 ≥32MB 增长；小 buffer 维持 2×（palette 等翻倍成本可忽略）。
 fn grow_size(cap: u64, need: u64) -> u64 {
-    const BIG: u64 = 8 << 20;
-    const RESERVE: u64 = 32 << 20;
-    if need >= BIG {
-        need.div_ceil(RESERVE) * RESERVE
-    } else {
-        need.max(cap * 2).max(65536) // ≥64KB，2× amortize（原策略）
-    }
+  const BIG: u64 = 8 << 20;
+  const RESERVE: u64 = 32 << 20;
+  if need >= BIG {
+    need.div_ceil(RESERVE) * RESERVE
+  } else {
+    need.max(cap * 2).max(65536) // ≥64KB，2× amortize（原策略）
+  }
 }
 
 /// 保证 buffer 能容纳 `bytes`，扩容时保留/写入新的整份内容（不丢旧字节）。
@@ -347,62 +346,62 @@ fn grow_size(cap: u64, need: u64) -> u64 {
 /// 尾部 [cap..need)——单次扩容 PCIe 从整份 163MB 降到增长量（10KB 级）。
 /// full 重建等 GPU 旧内容不可信的场景传 false：整份 bytes 一次 DMA（原行为）。
 fn ensure_with_copy(
-    device: &RenderDevice,
-    queue: &RenderQueue,
-    cur: &mut Buffer,
-    label: &str,
-    bytes: &[u8],
-    prefix_valid: bool,
+  device: &RenderDevice,
+  queue: &RenderQueue,
+  cur: &mut Buffer,
+  label: &str,
+  bytes: &[u8],
+  prefix_valid: bool,
 ) {
-    let cap = cur.size();
-    let need = bytes.len() as u64;
-    if cap >= need {
-        return;
-    }
-    let new_size = grow_size(cap, need);
-    let new_buf = device.create_buffer(&BufferDescriptor {
-        label: Some(label),
-        size: new_size,
-        usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
-        mapped_at_creation: false,
+  let cap = cur.size();
+  let need = bytes.len() as u64;
+  if cap >= need {
+    return;
+  }
+  let new_size = grow_size(cap, need);
+  let new_buf = device.create_buffer(&BufferDescriptor {
+    label: Some(label),
+    size: new_size,
+    usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+    mapped_at_creation: false,
+  });
+  if prefix_valid && cap > 0 {
+    // 前缀经 GPU-GPU 拷贝（独立 encoder submit，不占 PCIe）；随后 write_buffer 的
+    // 内部 submit 与之保持提交顺序，先拷贝后写尾部。
+    // COPY_BUFFER_ALIGNMENT=4；cap 恒为 words×4 或初始 4B，天然对齐。
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+      label: Some("gate_grow_prefix_copy"),
     });
-    if prefix_valid && cap > 0 {
-        // 前缀经 GPU-GPU 拷贝（独立 encoder submit，不占 PCIe）；随后 write_buffer 的
-        // 内部 submit 与之保持提交顺序，先拷贝后写尾部。
-        // COPY_BUFFER_ALIGNMENT=4；cap 恒为 words×4 或初始 4B，天然对齐。
-        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("gate_grow_prefix_copy"),
-        });
-        enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
-        queue.submit([enc.finish()]);
-        queue.write_buffer(&new_buf, cap, &bytes[cap as usize..need as usize]);
-    } else if !bytes.is_empty() {
-        queue.write_buffer(&new_buf, 0, bytes);
-    }
-    *cur = new_buf;
+    enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
+    queue.submit([enc.finish()]);
+    queue.write_buffer(&new_buf, cap, &bytes[cap as usize..need as usize]);
+  } else if !bytes.is_empty() {
+    queue.write_buffer(&new_buf, 0, bytes);
+  }
+  *cur = new_buf;
 }
 
 /// 整块写（full 模式 / state 等小 buffer）：GPU 旧内容不可信 → prefix_valid=false
 fn write(device: &RenderDevice, queue: &RenderQueue, cur: &mut Buffer, label: &str, bytes: &[u8]) {
-    ensure_with_copy(device, queue, cur, label, bytes, false);
-    if !bytes.is_empty() {
-        queue.write_buffer(cur, 0, bytes);
-    }
+  ensure_with_copy(device, queue, cur, label, bytes, false);
+  if !bytes.is_empty() {
+    queue.write_buffer(cur, 0, bytes);
+  }
 }
 
 /// 部分写：只写 [lo, hi)。GPU buffer 必须已经 ≥ hi（full 模式已 ensure 过一次）。
 fn write_partial(queue: &RenderQueue, cur: &Buffer, bytes: &[u8], lo: usize, hi: usize) {
-    let hi = hi.min(bytes.len());
-    if lo >= hi {
-        return;
-    }
-    debug_assert!(
-        cur.size() >= hi as u64,
-        "write_partial: buffer size {}B < hi {}B",
-        cur.size(),
-        hi
-    );
-    queue.write_buffer(cur, lo as u64, &bytes[lo..hi]);
+  let hi = hi.min(bytes.len());
+  if lo >= hi {
+    return;
+  }
+  debug_assert!(
+    cur.size() >= hi as u64,
+    "write_partial: buffer size {}B < hi {}B",
+    cur.size(),
+    hi
+  );
+  queue.write_buffer(cur, lo as u64, &bytes[lo..hi]);
 }
 
 // ----------------------------------------------------------------------------
@@ -410,203 +409,203 @@ fn write_partial(queue: &RenderQueue, cur: &Buffer, bytes: &[u8], lo: usize, hi:
 // ----------------------------------------------------------------------------
 
 fn prepare(
-    mut commands: Commands,
-    snapshot: Option<Res<UploadSnapshot>>,
-    mut gpu: ResMut<GpuBrickMap>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    sample_channel: Option<Res<UploadCpuSampleChannel>>,
+  mut commands: Commands,
+  snapshot: Option<Res<UploadSnapshot>>,
+  mut gpu: ResMut<GpuBrickMap>,
+  device: Res<RenderDevice>,
+  queue: Res<RenderQueue>,
+  sample_channel: Option<Res<UploadCpuSampleChannel>>,
 ) {
-    let Some(snap) = snapshot else { return };
-    let t0 = std::time::Instant::now();
+  let Some(snap) = snapshot else { return };
+  let t0 = std::time::Instant::now();
 
-    // ---- 首帧探测（只打一次日志）----
-    static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let limits = BindingLimits::probe(&device);
-    let layout = BufferLayout::from_limits(&limits);
-    if !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let gb = limits.max_storage_buffer_binding_size as f64 / (1 << 30) as f64;
-        info!(target: "gate",
-          "PROBE: max_storage_buffer_binding_size = {gb:.2}GB → {}",
-          match layout { BufferLayout::Single => "单 buffer 路径", BufferLayout::Multi{..} => "多 buffer fallback 路径" },
-        );
-        if limits.force_multi() {
-            warn!(target: "gate",
-              "GPU storage binding < 1GB，退化到全量上传（单 tile 170MB 会跨帧）——P2.3 多 buffer 切片代码保留，需要时接入"
-            );
-        }
+  // ---- 首帧探测（只打一次日志）----
+  static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  let limits = BindingLimits::probe(&device);
+  let layout = BufferLayout::from_limits(&limits);
+  if !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    let gb = limits.max_storage_buffer_binding_size as f64 / (1 << 30) as f64;
+    info!(target: "gate",
+      "PROBE: max_storage_buffer_binding_size = {gb:.2}GB → {}",
+      match layout { BufferLayout::Single => "单 buffer 路径", BufferLayout::Multi{..} => "多 buffer fallback 路径" },
+    );
+    if limits.force_multi() {
+      warn!(target: "gate",
+        "GPU storage binding < 1GB，退化到全量上传（单 tile 170MB 会跨帧）——P2.3 多 buffer 切片代码保留，需要时接入"
+      );
     }
+  }
 
-    let struct_bytes = u8_of_u32(&snap.buffers.b_struct);
-    let leaves_bytes = u8_of_u32(&snap.buffers.b_leaves);
-    let palette_bytes = u8_of_u32(&snap.buffers.b_palette);
-    let comp_bytes = snap.comp_tiles * TILE_COMP_WORDS * 4;
+  let struct_bytes = u8_of_u32(&snap.buffers.b_struct);
+  let leaves_bytes = u8_of_u32(&snap.buffers.b_leaves);
+  let palette_bytes = u8_of_u32(&snap.buffers.b_palette);
+  let comp_bytes = snap.comp_tiles * TILE_COMP_WORDS * 4;
 
-    // bytes 统计（日志用）：full = 整块；incremental = dirty ranges 求和
-    let is_full = matches!(snap.mode_tag, "full" | "fallback_full");
-    let (struct_tx_bytes, leaves_tx_bytes, palette_tx_bytes) = if is_full {
-        (struct_bytes.len(), leaves_bytes.len(), palette_bytes.len())
+  // bytes 统计（日志用）：full = 整块；incremental = dirty ranges 求和
+  let is_full = matches!(snap.mode_tag, "full" | "fallback_full");
+  let (struct_tx_bytes, leaves_tx_bytes, palette_tx_bytes) = if is_full {
+    (struct_bytes.len(), leaves_bytes.len(), palette_bytes.len())
+  } else {
+    let s = snap
+      .dirty
+      .struct_ranges
+      .iter()
+      .map(|&(a, b)| (b.min(struct_bytes.len())).saturating_sub(a))
+      .sum::<usize>();
+    let l = snap
+      .dirty
+      .leaves_ranges
+      .iter()
+      .map(|&(a, b)| (b.min(leaves_bytes.len())).saturating_sub(a))
+      .sum::<usize>();
+    let p = if snap.dirty.palette_changed {
+      palette_bytes.len()
     } else {
-        let s = snap
-            .dirty
-            .struct_ranges
-            .iter()
-            .map(|&(a, b)| (b.min(struct_bytes.len())).saturating_sub(a))
-            .sum::<usize>();
-        let l = snap
-            .dirty
-            .leaves_ranges
-            .iter()
-            .map(|&(a, b)| (b.min(leaves_bytes.len())).saturating_sub(a))
-            .sum::<usize>();
-        let p = if snap.dirty.palette_changed {
-            palette_bytes.len()
-        } else {
-            0
-        };
-        (s, l, p)
+      0
     };
+    (s, l, p)
+  };
 
-    if is_full {
-        // 全量：整块 + ensure 保证 GPU 容量够
-        write(
-            &device,
-            &queue,
-            &mut gpu.struct_buf,
-            "gate_struct",
-            struct_bytes,
-        );
-        write(
-            &device,
-            &queue,
-            &mut gpu.leaves,
-            "gate_leaves",
-            leaves_bytes,
-        );
-        write(
-            &device,
-            &queue,
-            &mut gpu.palette,
-            "gate_palette",
-            palette_bytes,
-        );
-    } else {
-        // 增量镜像路径（prefix_valid=true）：CPU 镜像 [0..cap) 与 GPU 一致，扩容走
-        // GPU-GPU 前缀拷贝 + 只 DMA 增长尾部；随后 write_partial 覆写脏区（冗余但正确）。
-        // 不再出现旧 2× 翻倍策略"首次编辑整写 163MB"的 PCIe 尖峰。
-        ensure_with_copy(
-            &device,
-            &queue,
-            &mut gpu.struct_buf,
-            "gate_struct",
-            struct_bytes,
-            true,
-        );
-        ensure_with_copy(
-            &device,
-            &queue,
-            &mut gpu.leaves,
-            "gate_leaves",
-            leaves_bytes,
-            true,
-        );
-        ensure_with_copy(
-            &device,
-            &queue,
-            &mut gpu.palette,
-            "gate_palette",
-            palette_bytes,
-            true,
-        );
-
-        for (lo, hi) in snap.dirty.struct_ranges.iter().copied() {
-            write_partial(&queue, &gpu.struct_buf, struct_bytes, lo, hi);
-        }
-        for (lo, hi) in snap.dirty.leaves_ranges.iter().copied() {
-            write_partial(&queue, &gpu.leaves, leaves_bytes, lo, hi);
-        }
-        if snap.dirty.palette_changed {
-            // palette 2048B 太小，整块写
-            queue.write_buffer(&gpu.palette, 0, palette_bytes);
-        }
-    }
-    // state / comp 每次都整块写（state 4KB、comp 在 MVP 3 tiles 下是 64KB，都很小）
+  if is_full {
+    // 全量：整块 + ensure 保证 GPU 容量够
     write(
-        &device,
-        &queue,
-        &mut gpu.state,
-        "gate_state",
-        &snap.state_bytes,
+      &device,
+      &queue,
+      &mut gpu.struct_buf,
+      "gate_struct",
+      struct_bytes,
     );
-    // comp: 每个 tile 1 字；build 后可能为 0 字节，ensure 至少 4B。
-    // comp_bytes 只是预估上限；实际内容读 grid 时已经按真实 size 存。
-    // MVP 下 comp 数据直接从 CPU 侧构建：UploadSnapshot 当前没带 comp 字节，
-    // 这里用 gpu.comp size ≥ 预估的占位（历史行为：仅 buffer 大小对齐）。
-    {
-        let placeholder = vec![0u8; comp_bytes.max(4)];
-        // comp 为占位通道（内容无意义，历史行为仅对齐 buffer 大小）；保留旧前缀即可
-        ensure_with_copy(
-            &device,
-            &queue,
-            &mut gpu.comp,
-            "gate_comp",
-            &placeholder,
-            true,
-        );
-    }
+    write(
+      &device,
+      &queue,
+      &mut gpu.leaves,
+      "gate_leaves",
+      leaves_bytes,
+    );
+    write(
+      &device,
+      &queue,
+      &mut gpu.palette,
+      "gate_palette",
+      palette_bytes,
+    );
+  } else {
+    // 增量镜像路径（prefix_valid=true）：CPU 镜像 [0..cap) 与 GPU 一致，扩容走
+    // GPU-GPU 前缀拷贝 + 只 DMA 增长尾部；随后 write_partial 覆写脏区（冗余但正确）。
+    // 不再出现旧 2× 翻倍策略"首次编辑整写 163MB"的 PCIe 尖峰。
+    ensure_with_copy(
+      &device,
+      &queue,
+      &mut gpu.struct_buf,
+      "gate_struct",
+      struct_bytes,
+      true,
+    );
+    ensure_with_copy(
+      &device,
+      &queue,
+      &mut gpu.leaves,
+      "gate_leaves",
+      leaves_bytes,
+      true,
+    );
+    ensure_with_copy(
+      &device,
+      &queue,
+      &mut gpu.palette,
+      "gate_palette",
+      palette_bytes,
+      true,
+    );
 
-    gpu.globals.set(snap.buffers.globals);
-    gpu.globals.write_buffer(&device, &queue);
+    for (lo, hi) in snap.dirty.struct_ranges.iter().copied() {
+      write_partial(&queue, &gpu.struct_buf, struct_bytes, lo, hi);
+    }
+    for (lo, hi) in snap.dirty.leaves_ranges.iter().copied() {
+      write_partial(&queue, &gpu.leaves, leaves_bytes, lo, hi);
+    }
+    if snap.dirty.palette_changed {
+      // palette 2048B 太小，整块写
+      queue.write_buffer(&gpu.palette, 0, palette_bytes);
+    }
+  }
+  // state / comp 每次都整块写（state 4KB、comp 在 MVP 3 tiles 下是 64KB，都很小）
+  write(
+    &device,
+    &queue,
+    &mut gpu.state,
+    "gate_state",
+    &snap.state_bytes,
+  );
+  // comp: 每个 tile 1 字；build 后可能为 0 字节，ensure 至少 4B。
+  // comp_bytes 只是预估上限；实际内容读 grid 时已经按真实 size 存。
+  // MVP 下 comp 数据直接从 CPU 侧构建：UploadSnapshot 当前没带 comp 字节，
+  // 这里用 gpu.comp size ≥ 预估的占位（历史行为：仅 buffer 大小对齐）。
+  {
+    let placeholder = vec![0u8; comp_bytes.max(4)];
+    // comp 为占位通道（内容无意义，历史行为仅对齐 buffer 大小）；保留旧前缀即可
+    ensure_with_copy(
+      &device,
+      &queue,
+      &mut gpu.comp,
+      "gate_comp",
+      &placeholder,
+      true,
+    );
+  }
 
-    let elapsed = t0.elapsed();
-    let cpu_ms = elapsed.as_secs_f32() * 1000.0;
-    let tx_bytes_total =
-        (struct_tx_bytes + leaves_tx_bytes + palette_tx_bytes + snap.state_bytes.len()) as f64;
-    let mb = tx_bytes_total / (1 << 20) as f64;
-    // full: tiles = 总 tile_count；incremental: tiles = 本轮 dirty tile 数（不再误导）
-    let tiles_show = if is_full {
-        snap.buffers.globals.tile_count as usize
-    } else {
-        snap.dirty_tiles
-    };
-    debug!(target: "gate",
-      "UPLOAD[{}]: bytes={:.2}MB (s {}KB,l {}KB,pal {}KB,state 4KB), tiles={}, comp={}KB, elapsed={:?}",
-      snap.mode_tag, mb,
-      struct_tx_bytes / 1024, leaves_tx_bytes / 1024, palette_tx_bytes / 1024,
-      tiles_show, comp_bytes / 1024, elapsed,
+  gpu.globals.set(snap.buffers.globals);
+  gpu.globals.write_buffer(&device, &queue);
+
+  let elapsed = t0.elapsed();
+  let cpu_ms = elapsed.as_secs_f32() * 1000.0;
+  let tx_bytes_total =
+    (struct_tx_bytes + leaves_tx_bytes + palette_tx_bytes + snap.state_bytes.len()) as f64;
+  let mb = tx_bytes_total / (1 << 20) as f64;
+  // full: tiles = 总 tile_count；incremental: tiles = 本轮 dirty tile 数（不再误导）
+  let tiles_show = if is_full {
+    snap.buffers.globals.tile_count as usize
+  } else {
+    snap.dirty_tiles
+  };
+  debug!(target: "gate",
+    "UPLOAD[{}]: bytes={:.2}MB (s {}KB,l {}KB,pal {}KB,state 4KB), tiles={}, comp={}KB, elapsed={:?}",
+    snap.mode_tag, mb,
+    struct_tx_bytes / 1024, leaves_tx_bytes / 1024, palette_tx_bytes / 1024,
+    tiles_show, comp_bytes / 1024, elapsed,
+  );
+  // P2.7：写入共享通道（render↔main Arc<Mutex>，OQ-2 选 A 不提供 GPU 值）
+  static SAMPLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let generation = SAMPLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+  let sample = UploadCpuSample { cpu_ms, generation };
+  commands.insert_resource(sample);
+  if let Some(ch) = sample_channel
+    && let Ok(mut g) = ch.0.lock()
+  {
+    *g = Some(sample);
+  }
+  // VRAM 预算断言（V3.1 ≤2GB）
+  let vram = gpu.struct_buf.size()
+    + gpu.leaves.size()
+    + gpu.palette.size()
+    + gpu.comp.size()
+    + gpu.state.size();
+  debug_assert!(vram <= 2u64 << 30, "GPU VRAM 超预算: {vram} bytes");
+  if !limits.force_multi() {
+    debug_assert!(
+      struct_bytes.len() as u64 <= limits.max_storage_buffer_binding_size,
+      "b_struct {} bytes > binding limit {}",
+      struct_bytes.len(),
+      limits.max_storage_buffer_binding_size,
     );
-    // P2.7：写入共享通道（render↔main Arc<Mutex>，OQ-2 选 A 不提供 GPU 值）
-    static SAMPLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let generation = SAMPLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let sample = UploadCpuSample { cpu_ms, generation };
-    commands.insert_resource(sample);
-    if let Some(ch) = sample_channel
-        && let Ok(mut g) = ch.0.lock()
-    {
-        *g = Some(sample);
-    }
-    // VRAM 预算断言（V3.1 ≤2GB）
-    let vram = gpu.struct_buf.size()
-        + gpu.leaves.size()
-        + gpu.palette.size()
-        + gpu.comp.size()
-        + gpu.state.size();
-    debug_assert!(vram <= 2u64 << 30, "GPU VRAM 超预算: {vram} bytes");
-    if !limits.force_multi() {
-        debug_assert!(
-            struct_bytes.len() as u64 <= limits.max_storage_buffer_binding_size,
-            "b_struct {} bytes > binding limit {}",
-            struct_bytes.len(),
-            limits.max_storage_buffer_binding_size,
-        );
-    }
-    debug!(target: "gate",
-      "GpuBrickMap: struct_buf={}B leaves={}B palette={}B comp={}B state={}B bind_group_ready=pending(P2.4)",
-      gpu.struct_buf.size(), gpu.leaves.size(), gpu.palette.size(),
-      gpu.comp.size(), gpu.state.size(),
-    );
-    // 消费完本帧 snapshot 必须移除；否则 prepare 每帧都读旧 snapshot → 140MB/帧假上传
-    commands.remove_resource::<UploadSnapshot>();
+  }
+  debug!(target: "gate",
+    "GpuBrickMap: struct_buf={}B leaves={}B palette={}B comp={}B state={}B bind_group_ready=pending(P2.4)",
+    gpu.struct_buf.size(), gpu.leaves.size(), gpu.palette.size(),
+    gpu.comp.size(), gpu.state.size(),
+  );
+  // 消费完本帧 snapshot 必须移除；否则 prepare 每帧都读旧 snapshot → 140MB/帧假上传
+  commands.remove_resource::<UploadSnapshot>();
 }
 
 // ----------------------------------------------------------------------------
@@ -615,25 +614,26 @@ fn prepare(
 
 pub struct BrickMapUploadPlugin;
 impl Plugin for BrickMapUploadPlugin {
-    fn build(&self, app: &mut App) {
-        // Render↔main 共享通道（UploadCpuSample）：插入同一个 Arc<Mutex> Resource 到两个世界
-        let ch = UploadCpuSampleChannel::default();
-        app.insert_resource(ch.clone())
-            .init_resource::<MainPending>()
-            .add_systems(Last, poll_pending);
-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
-            return;
-        };
-        render_app
-            .insert_resource(ch)
-            .insert_resource(BuilderMirror {
-                pending_full: true,
-                ..Default::default()
-            })
-            .add_systems(RenderStartup, init_empty_gpu)
-            .add_systems(ExtractSchedule, extract)
-            .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources));
-    }
+  fn build(&self, app: &mut App) {
+    // Render↔main 共享通道（UploadCpuSample）：插入同一个 Arc<Mutex> Resource 到两个世界
+    let ch = UploadCpuSampleChannel::default();
+    app
+      .insert_resource(ch.clone())
+      .init_resource::<MainPending>()
+      .add_systems(Last, poll_pending);
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+      return;
+    };
+    render_app
+      .insert_resource(ch)
+      .insert_resource(BuilderMirror {
+        pending_full: true,
+        ..Default::default()
+      })
+      .add_systems(RenderStartup, init_empty_gpu)
+      .add_systems(ExtractSchedule, extract)
+      .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources));
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -642,77 +642,77 @@ impl Plugin for BrickMapUploadPlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::super::wire::{BrickMapBuffers, INDEX_WORDS, STATE_TOTAL_WORDS};
-    use super::*;
-    use gate_voxel::fill_box;
+  use super::super::wire::{BrickMapBuffers, INDEX_WORDS, STATE_TOTAL_WORDS};
+  use super::*;
+  use gate_voxel::fill_box;
 
-    #[test]
-    fn limits_select_layout() {
-        let multi = BindingLimits {
-            max_storage_buffer_binding_size: 128 * (1 << 20),
-        };
-        assert!(multi.force_multi());
-        let single = BindingLimits {
-            max_storage_buffer_binding_size: 2 * (1 << 30),
-        };
-        assert!(!single.force_multi());
-        let _ml = BufferLayout::from_limits(&multi);
-        let _sl = BufferLayout::from_limits(&single);
-    }
+  #[test]
+  fn limits_select_layout() {
+    let multi = BindingLimits {
+      max_storage_buffer_binding_size: 128 * (1 << 20),
+    };
+    assert!(multi.force_multi());
+    let single = BindingLimits {
+      max_storage_buffer_binding_size: 2 * (1 << 30),
+    };
+    assert!(!single.force_multi());
+    let _ml = BufferLayout::from_limits(&multi);
+    let _sl = BufferLayout::from_limits(&single);
+  }
 
-    #[test]
-    fn comp_state_api_on_grid() {
-        let mut g = gate_voxel::TileGrid::new();
-        let t = gate_voxel::TileCoord::new(0, 0, 0);
-        assert_eq!(g.get_comp(t, 17), 0);
-        g.set_comp(t, 17, 0xABCD);
-        assert_eq!(g.get_comp(t, 17), 0xABCD);
-        g.set_state(7, 2, 0x42);
-        assert_eq!(g.get_state(7, 2), 0x42);
-        assert_eq!(g.get_state(99, 0), 0);
-        assert_eq!(g.state_table_bytes().len(), 256 * 16);
-    }
+  #[test]
+  fn comp_state_api_on_grid() {
+    let mut g = gate_voxel::TileGrid::new();
+    let t = gate_voxel::TileCoord::new(0, 0, 0);
+    assert_eq!(g.get_comp(t, 17), 0);
+    g.set_comp(t, 17, 0xABCD);
+    assert_eq!(g.get_comp(t, 17), 0xABCD);
+    g.set_state(7, 2, 0x42);
+    assert_eq!(g.get_state(7, 2), 0x42);
+    assert_eq!(g.get_state(99, 0), 0);
+    assert_eq!(g.state_table_bytes().len(), 256 * 16);
+  }
 
-    #[test]
-    fn wire_constants() {
-        assert_eq!(TILE_COMP_WORDS * 4, 32768 * 2); // u16[32768] → 64KB
-        assert_eq!(STATE_TOTAL_WORDS * 4, 4096); // 256×4×4B
-    }
+  #[test]
+  fn wire_constants() {
+    assert_eq!(TILE_COMP_WORDS * 4, 32768 * 2); // u16[32768] → 64KB
+    assert_eq!(STATE_TOTAL_WORDS * 4, 4096); // 256×4×4B
+  }
 
-    #[test]
-    fn grow_size_watermark_policy() {
-        // 小 buffer：2×（原策略），下限 64KB
-        assert_eq!(grow_size(4, 2048), 65536); // palette 首扩
-        assert_eq!(grow_size(32768, 40000), 65536);
-        assert_eq!(grow_size(40000, 50000), 80000); // 恰好 2×
-        // 大 buffer：32MiB 水位对齐——首增 ~10KB 不再翻倍到 2×cap
-        let cap160m: u64 = 163_798_052; // 156.2MiB（实机 full 后 b_struct）
-        let need = cap160m + 10 * 1024; // 首次编辑真实增长 ~10KB
-        let grown = grow_size(cap160m, need);
-        assert_eq!(grown, 160 * 1024 * 1024); // → 160MiB（下一 32MiB 边界），非 2×=312MiB
-        assert!(grown >= need);
-        // 水位内的增长由 ensure_with_copy 的 cap>=need 早退拦截，不会进 grow_size；
-        // 刚跨过边界 → 立即扩到下一档（amortized）
-        assert_eq!(grow_size(grown, grown + 1024), 192 * 1024 * 1024);
-        // 连续跨档（160MiB+33MiB=193MiB → 224MiB）
-        assert_eq!(
-            grow_size(grown, grown + 33 * 1024 * 1024),
-            224 * 1024 * 1024
-        );
-    }
+  #[test]
+  fn grow_size_watermark_policy() {
+    // 小 buffer：2×（原策略），下限 64KB
+    assert_eq!(grow_size(4, 2048), 65536); // palette 首扩
+    assert_eq!(grow_size(32768, 40000), 65536);
+    assert_eq!(grow_size(40000, 50000), 80000); // 恰好 2×
+    // 大 buffer：32MiB 水位对齐——首增 ~10KB 不再翻倍到 2×cap
+    let cap160m: u64 = 163_798_052; // 156.2MiB（实机 full 后 b_struct）
+    let need = cap160m + 10 * 1024; // 首次编辑真实增长 ~10KB
+    let grown = grow_size(cap160m, need);
+    assert_eq!(grown, 160 * 1024 * 1024); // → 160MiB（下一 32MiB 边界），非 2×=312MiB
+    assert!(grown >= need);
+    // 水位内的增长由 ensure_with_copy 的 cap>=need 早退拦截，不会进 grow_size；
+    // 刚跨过边界 → 立即扩到下一档（amortized）
+    assert_eq!(grow_size(grown, grown + 1024), 192 * 1024 * 1024);
+    // 连续跨档（160MiB+33MiB=193MiB → 224MiB）
+    assert_eq!(
+      grow_size(grown, grown + 33 * 1024 * 1024),
+      224 * 1024 * 1024
+    );
+  }
 
-    #[test]
-    fn buffer_data_roundtrip() {
-        let mut g = gate_voxel::TileGrid::new();
-        fill_box(&mut g, glam::IVec3::ZERO, glam::IVec3::splat(8), 4, 1);
-        g.set_state(5, 3, 0xCAFEBABE);
-        let state = g.state_table_bytes();
-        let off = 5 * 16 + 3 * 4; // entry 5 + field 3
-        assert_eq!(state[off..off + 4], 0xCAFEBABEu32.to_le_bytes());
-        let buffers: BrickMapBuffers = BrickMapBuilder::build_full(&g).buffers().clone();
-        let bytes = u8_of_u32(&buffers.b_struct);
-        assert_eq!(bytes.len(), buffers.b_struct.len() * 4);
-        assert!(buffers.globals.tile_count >= 1);
-        assert!(!buffers.b_struct[0..INDEX_WORDS].iter().all(|&w| w == 0));
-    }
+  #[test]
+  fn buffer_data_roundtrip() {
+    let mut g = gate_voxel::TileGrid::new();
+    fill_box(&mut g, glam::IVec3::ZERO, glam::IVec3::splat(8), 4, 1);
+    g.set_state(5, 3, 0xCAFEBABE);
+    let state = g.state_table_bytes();
+    let off = 5 * 16 + 3 * 4; // entry 5 + field 3
+    assert_eq!(state[off..off + 4], 0xCAFEBABEu32.to_le_bytes());
+    let buffers: BrickMapBuffers = BrickMapBuilder::build_full(&g).buffers().clone();
+    let bytes = u8_of_u32(&buffers.b_struct);
+    assert_eq!(bytes.len(), buffers.b_struct.len() * 4);
+    assert!(buffers.globals.tile_count >= 1);
+    assert!(!buffers.b_struct[0..INDEX_WORDS].iter().all(|&w| w == 0));
+  }
 }

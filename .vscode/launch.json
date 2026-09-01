@@ -5,7 +5,7 @@
       "name": "gate-app",
       "type": "f5anything",
       "request": "launch",
-      "command": "clear; cargo run -p gate-app",
+      "command": "clear; ./target/release/gate-app.exe",
       "terminalName": "gate-app",
       "showTerminal": true,
       "preLaunchTask": "build-gate-app",

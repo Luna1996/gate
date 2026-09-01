@@ -63,38 +63,38 @@ pub const SLOT_TAG_BRANCH: u16 = 2;
 
 /// 编码一个槽：tag 进高位，palette 进低位
 pub const fn encode_slot(tag: u16, palette: u8) -> u16 {
-    (tag << 8) | palette as u16
+  (tag << 8) | palette as u16
 }
 
 /// 两个 u16 槽打包进一个 u32（低 16 位 = 偶数槽）
 pub const fn pack_slot_pair(lo: u16, hi: u16) -> u32 {
-    lo as u32 | (hi as u32) << 16
+  lo as u32 | (hi as u32) << 16
 }
 
 /// 取槽字中的第 lane（0/1）个槽
 pub const fn unpack_slot_word(word: u32, lane: usize) -> u16 {
-    (word >> (16 * lane)) as u16
+  (word >> (16 * lane)) as u16
 }
 
 /// 槽 tag 提取
 pub const fn slot_tag(slot: u16) -> u16 {
-    slot >> 8
+  slot >> 8
 }
 
 /// 槽 palette 提取
 pub const fn slot_palette(slot: u16) -> u8 {
-    slot as u8
+  slot as u8
 }
 
 /// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）
 pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
-    [
-        e.color[0] as u32
-            | (e.color[1] as u32) << 8
-            | (e.color[2] as u32) << 16
-            | (e.roughness as u32) << 24,
-        e.emissive as u32 | (e.transmission as u32) << 8 | (e.flags.0 as u32) << 16,
-    ]
+  [
+    e.color[0] as u32
+      | (e.color[1] as u32) << 8
+      | (e.color[2] as u32) << 16
+      | (e.roughness as u32) << 24,
+    e.emissive as u32 | (e.transmission as u32) << 8 | (e.flags.0 as u32) << 16,
+  ]
 }
 
 /// GPU 全局参数（P2.3 进 uniform buffer）。
@@ -108,25 +108,25 @@ pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]
 pub struct BrickMapGlobals {
-    pub index_origin_x: i32,
-    pub index_origin_y: i32,
-    pub index_origin_z: i32,
-    pub index_origin_w: i32,
-    pub index_dims_x: u32,
-    pub index_dims_y: u32,
-    pub index_dims_z: u32,
-    pub index_dims_w: u32,
-    pub tile_count: u32,
-    pub node_words: u32,
-    pub node_free_words: u32,
-    pub brick_slabs: u32,
-    pub brick_free: u32,
-    pub rejected_tiles: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
-    pub _pad3: u32,
-    pub _pad4: u32,
+  pub index_origin_x: i32,
+  pub index_origin_y: i32,
+  pub index_origin_z: i32,
+  pub index_origin_w: i32,
+  pub index_dims_x: u32,
+  pub index_dims_y: u32,
+  pub index_dims_z: u32,
+  pub index_dims_w: u32,
+  pub tile_count: u32,
+  pub node_words: u32,
+  pub node_free_words: u32,
+  pub brick_slabs: u32,
+  pub brick_free: u32,
+  pub rejected_tiles: u32,
+  pub _pad0: u32,
+  pub _pad1: u32,
+  pub _pad2: u32,
+  pub _pad3: u32,
+  pub _pad4: u32,
 }
 
 /// 构建产物：与 GPU buffer 字节一一对应的内容（P2.3 原样上传）
@@ -135,62 +135,62 @@ pub struct BrickMapGlobals {
 /// b_leaves 的 slab i = `[i*1024, (i+1)*1024)`（P2.3 上传到预分配池的同号 slab）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrickMapBuffers {
-    pub b_struct: Vec<u32>,
-    pub b_leaves: Vec<u32>,
-    pub b_palette: Vec<u32>,
-    pub globals: BrickMapGlobals,
+  pub b_struct: Vec<u32>,
+  pub b_leaves: Vec<u32>,
+  pub b_palette: Vec<u32>,
+  pub globals: BrickMapGlobals,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use gate_voxel::PaletteFlags;
+  use super::*;
+  use gate_voxel::PaletteFlags;
 
-    #[test]
-    fn region_layout_matches_design() {
-        assert_eq!(CELLS_PER_TILE, 32768);
-        assert_eq!(TILE_BITMAP_WORDS, 1024);
-        assert_eq!(CELL_DIR_WORDS, 32768);
-        assert_eq!(BRICK_SLAB_WORDS, 1024);
-        assert_eq!(PALETTE_WORDS, 512);
-        assert_eq!(INDEX_WORDS, 128 * 128 * 128);
-        assert_eq!(BITMAP_REGION_WORDS, TILE_CAP * TILE_BITMAP_WORDS);
-        assert_eq!(DIR_REGION_WORDS, TILE_CAP * CELL_DIR_WORDS);
-        // 定长前缀 ≈ 140MB（预算表 §7 恒定项）：index 8MB + bitmaps 4MB + dirs 128MB
-        assert_eq!(NODE_STREAM_BASE, 36_700_160);
-        assert_eq!(BITMAP_BASE, INDEX_WORDS);
-        assert_eq!(DIR_BASE, INDEX_WORDS + BITMAP_REGION_WORDS);
-        assert_eq!(SLOT_TABLE_WORDS, [0, 4, 32, 256, 0]);
-    }
+  #[test]
+  fn region_layout_matches_design() {
+    assert_eq!(CELLS_PER_TILE, 32768);
+    assert_eq!(TILE_BITMAP_WORDS, 1024);
+    assert_eq!(CELL_DIR_WORDS, 32768);
+    assert_eq!(BRICK_SLAB_WORDS, 1024);
+    assert_eq!(PALETTE_WORDS, 512);
+    assert_eq!(INDEX_WORDS, 128 * 128 * 128);
+    assert_eq!(BITMAP_REGION_WORDS, TILE_CAP * TILE_BITMAP_WORDS);
+    assert_eq!(DIR_REGION_WORDS, TILE_CAP * CELL_DIR_WORDS);
+    // 定长前缀 ≈ 140MB（预算表 §7 恒定项）：index 8MB + bitmaps 4MB + dirs 128MB
+    assert_eq!(NODE_STREAM_BASE, 36_700_160);
+    assert_eq!(BITMAP_BASE, INDEX_WORDS);
+    assert_eq!(DIR_BASE, INDEX_WORDS + BITMAP_REGION_WORDS);
+    assert_eq!(SLOT_TABLE_WORDS, [0, 4, 32, 256, 0]);
+  }
 
-    #[test]
-    fn slot_encoding_roundtrip() {
-        let w = pack_slot_pair(
-            encode_slot(SLOT_TAG_LEAF, 0xab),
-            encode_slot(SLOT_TAG_BRANCH, 0),
-        );
-        assert_eq!(unpack_slot_word(w, 0), encode_slot(SLOT_TAG_LEAF, 0xab));
-        assert_eq!(unpack_slot_word(w, 1), encode_slot(SLOT_TAG_BRANCH, 0));
-        assert_eq!(slot_tag(encode_slot(SLOT_TAG_LEAF, 7)), SLOT_TAG_LEAF);
-        assert_eq!(slot_palette(encode_slot(SLOT_TAG_LEAF, 7)), 7);
-        assert_eq!(slot_tag(encode_slot(SLOT_TAG_EMPTY, 0)), SLOT_TAG_EMPTY);
-    }
+  #[test]
+  fn slot_encoding_roundtrip() {
+    let w = pack_slot_pair(
+      encode_slot(SLOT_TAG_LEAF, 0xab),
+      encode_slot(SLOT_TAG_BRANCH, 0),
+    );
+    assert_eq!(unpack_slot_word(w, 0), encode_slot(SLOT_TAG_LEAF, 0xab));
+    assert_eq!(unpack_slot_word(w, 1), encode_slot(SLOT_TAG_BRANCH, 0));
+    assert_eq!(slot_tag(encode_slot(SLOT_TAG_LEAF, 7)), SLOT_TAG_LEAF);
+    assert_eq!(slot_palette(encode_slot(SLOT_TAG_LEAF, 7)), 7);
+    assert_eq!(slot_tag(encode_slot(SLOT_TAG_EMPTY, 0)), SLOT_TAG_EMPTY);
+  }
 
-    #[test]
-    fn palette_entry_pack_layout() {
-        // _pad 私有，跨 crate 用 default + 逐字段赋值
-        let mut e = PaletteEntry::default();
-        e.color = [1, 2, 3];
-        e.roughness = 4;
-        e.emissive = 5;
-        e.transmission = 6;
-        e.flags = PaletteFlags(7);
-        assert_eq!(
-            pack_palette_entry(&e),
-            [
-                1 | (2 << 8) | (3 << 16) | (4 << 24),
-                5 | (6 << 8) | (7 << 16)
-            ]
-        );
-    }
+  #[test]
+  fn palette_entry_pack_layout() {
+    // _pad 私有，跨 crate 用 default + 逐字段赋值
+    let mut e = PaletteEntry::default();
+    e.color = [1, 2, 3];
+    e.roughness = 4;
+    e.emissive = 5;
+    e.transmission = 6;
+    e.flags = PaletteFlags(7);
+    assert_eq!(
+      pack_palette_entry(&e),
+      [
+        1 | (2 << 8) | (3 << 16) | (4 << 24),
+        5 | (6 << 8) | (7 << 16)
+      ]
+    );
+  }
 }

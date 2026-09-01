@@ -7,12 +7,12 @@
 //! 由 app 侧同步（gate-app 从 DdaCameraConfig 拷贝），投影数学只依赖 Mat4。
 //! 遮挡检测（OQ-2，CPU DDA）v0 不做，后置 P7.3（需体素网格跨 crate 访问）。
 
-use bevy::asset::{ AssetServer, LoadState};
-use bevy::log::{info};
-use bevy::prelude::*;
-use bevy::text::{ FontSize, FontSource, TextColor};
-use bevy::ui::widget::Label;
 use crate::theme::ThemeFont;
+use bevy::asset::{AssetServer, LoadState};
+use bevy::log::info;
+use bevy::prelude::*;
+use bevy::text::{FontSize, FontSource, TextColor};
+use bevy::ui::widget::Label;
 
 /// 投影相机镜像（app 侧每帧同步；Identity = 未同步，锚点将投影到无效位置）
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
@@ -225,7 +225,9 @@ pub fn world_anchor_apply_text(
     (_, None) => Some(FontSource::default()),
     _ => None,
   };
-  let Some(font_source) = ready_handle else { return };
+  let Some(font_source) = ready_handle else {
+    return;
+  };
   // 2) 对所有尚未应用文本（Without<Text>）的 Pending 实体插入组件
   let mut count = 0usize;
   for (e, p) in &mut pending {

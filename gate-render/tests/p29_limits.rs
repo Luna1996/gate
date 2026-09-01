@@ -35,7 +35,13 @@ fn fill_full_tiles(grid: &mut TileGrid, tile_x0: i32, n: usize) {
     let base = IVec3::new((tile_x0 + i as i32) * TILE_FINE, 0, 0);
     let pal = (i % 6 + 1) as u8;
     // 半 tile 条带两色：整体非 uniform，胞间有差异
-    fill_box(grid, base, IVec3::new(TILE_FINE / 2, TILE_FINE, TILE_FINE), 0, pal);
+    fill_box(
+      grid,
+      base,
+      IVec3::new(TILE_FINE / 2, TILE_FINE, TILE_FINE),
+      0,
+      pal,
+    );
     fill_box(
       grid,
       base + IVec3::new(TILE_FINE / 2, 0, 0),
@@ -143,7 +149,13 @@ fn incremental_burst_frame_budget() {
   let mut grid = TileGrid::new();
   for i in 0..64isize {
     let base = IVec3::new(i as i32 * TILE_FINE, 0, 0);
-    fill_box(&mut grid, base, IVec3::new(TILE_FINE, 64, 256), 0, (i % 6 + 1) as u8);
+    fill_box(
+      &mut grid,
+      base,
+      IVec3::new(TILE_FINE, 64, 256),
+      0,
+      (i % 6 + 1) as u8,
+    );
   }
   let mut builder = BrickMapBuilder::build_full(&grid);
   // build_full 末尾已丢弃脏区间（full_build_leaves_no_stale_dirty_marks）；防御性再取一次
@@ -361,13 +373,21 @@ fn vram_layout_budget_2gb() {
     bufs.globals.brick_slabs
   );
   // 20 万胞热点外推到预算口径（~1GB 上限）远有余；断言锁数量级防意外分配
-  assert!(node_mb + leaves_mb < 256.0, "20 万胞热点 node+brick {node_mb:.1}+{leaves_mb:.1}MB 超 256MB 数量级锚");
+  assert!(
+    node_mb + leaves_mb < 256.0,
+    "20 万胞热点 node+brick {node_mb:.1}+{leaves_mb:.1}MB 超 256MB 数量级锚"
+  );
 
   // ④ 典型工作间合计：64 典型 tile + 1 L2 满 tile + 1 L4 热点 + 定长前缀，
   //    外推 ×2（CPU 镜像+GPU 同规格）远低于 2GB（v3.1 系统内存/VRAM 决策）
   let mut grid = TileGrid::new();
   fill_full_tiles(&mut grid, 0, 62);
-  fill_checkerboard(&mut grid, IVec3::new(62 * TILE_FINE, 0, 0), IVec3::splat(TILE_FINE), 2);
+  fill_checkerboard(
+    &mut grid,
+    IVec3::new(62 * TILE_FINE, 0, 0),
+    IVec3::splat(TILE_FINE),
+    2,
+  );
   fill_checkerboard(
     &mut grid,
     IVec3::new(63 * TILE_FINE, 0, 0),
@@ -375,8 +395,8 @@ fn vram_layout_budget_2gb() {
     4,
   );
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
-  let total_mb = (bufs.b_struct.len() + bufs.b_leaves.len() + bufs.b_palette.len()) as f64 * 4.0
-    / 1048576.0;
+  let total_mb =
+    (bufs.b_struct.len() + bufs.b_leaves.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
   println!(
     "[P2.9d] 典型工作间 buffers 合计={total_mb:.1}MB（含 140MB 定长前缀）→ GPU 同规格 + CPU 镜像 ×2 = {:.0}MB ≤ 2GB ✓",
     total_mb * 2.0
@@ -450,7 +470,10 @@ fn mov_16_objects_trace_scene_budget() {
     }
   }
   let el = t0.elapsed();
-  assert!(obj_hits > 0 && world_hits > 0, "两类命中都必须出现（obj={obj_hits} world={world_hits}）");
+  assert!(
+    obj_hits > 0 && world_hits > 0,
+    "两类命中都必须出现（obj={obj_hits} world={world_hits}）"
+  );
   // CI 宽松：每射线 = 世界 DDA + 16×(AABB 剔除 ~0 / 少量物体 DDA)；1s ≈ 30× 余量
   assert!(
     el.as_secs_f64() < 1.0,
