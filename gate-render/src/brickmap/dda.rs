@@ -7,13 +7,36 @@
 //! - DDA 着色器：`shaders/dda.wgsl`
 
 use bevy::{
+    asset::RenderAssetUsages,
     image::Image,
     prelude::*,
     render::{extract_resource::ExtractResource, render_resource::*},
 };
 use std::ops::Mul;
 
-use crate::gradient::{VIEW_SIZE, create_gradient_image};
+// ============================================================================
+// 渲染目标共享基础设施（原 gradient.rs；P0.3 spike 渐变 pass 已删，幸存部分迁此）
+// ============================================================================
+
+/// blit.wgsl 资产路径（DDA 上屏复用同一份全屏三角 blit shader）
+pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
+/// 初始渲染分辨率（窗口创建尺寸；resize 后由 RenderScale 资源接管，FR-5）
+pub const VIEW_SIZE: UVec2 = UVec2::new(1280, 720);
+/// compute dispatch 工作组边长（DDA 8×8，与原 gradient 一致）
+pub const WORKGROUP_SIZE: u32 = 8;
+
+/// 当前渲染分辨率（main world `resize_render_targets` 更新，提取进 render world；
+/// dispatch workgroup 数随它重算，shader 侧自行越界剔除）
+#[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
+pub struct RenderScale {
+    pub size: UVec2,
+}
+
+impl Default for RenderScale {
+    fn default() -> Self {
+        Self { size: VIEW_SIZE }
+    }
+}
 
 // ============================================================================
 // Task 1: 视图资源 + 图像资源
@@ -150,13 +173,14 @@ pub struct DdaImages {
     pub target: Handle<Image>,
 }
 
-/// 工厂：与 GradientImage 同配置（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）
-///
-/// 复用 gradient.rs 的 create_gradient_image 逻辑（完全一致）
+/// 工厂：DDA 目标纹理（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）
 pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
-    // 完全相同：Rgba8Unorm VIEW_SIZE + usage=STORAGE_BINDING | TEXTURE_BINDING
-    // 直接复用 create_gradient_image 保证配置一致（避免重复参数后续 drift）
-    create_gradient_image(images)
+    let mut image =
+        Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba8Unorm, None);
+    image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    image.texture_descriptor.usage =
+        TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    images.add(image)
 }
 
 #[cfg(test)]
@@ -1218,9 +1242,8 @@ use bevy::{
 
 use std::borrow::Cow;
 
-use super::upload::GpuBrickMap;
 use super::mov::GpuMovPool;
-use crate::gradient::{BLIT_SHADER_ASSET_PATH, WORKGROUP_SIZE};
+use super::upload::GpuBrickMap;
 use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
 
 pub const DDA_SHADER_ASSET_PATH: &str = "shaders/dda.wgsl";
@@ -1254,9 +1277,12 @@ pub struct BrickMapDdaPlugin;
 
 impl Plugin for BrickMapDdaPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((bevy::render::extract_resource::ExtractResourcePlugin::<
-            DdaImages,
-        >::default(),));
+        app.add_plugins((
+            bevy::render::extract_resource::ExtractResourcePlugin::<DdaImages>::default(),
+            // RenderScale 提取进 render world（dispatch workgroup 数随 resize 重算）
+            bevy::render::extract_resource::ExtractResourcePlugin::<RenderScale>::default(),
+            crate::responsive::ResponsivePlugin,
+        ));
 
         // main → render 的 ExtractSchedule：把 DdaCameraConfig 从 main world 读
         // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
@@ -1283,14 +1309,7 @@ impl Plugin for BrickMapDdaPlugin {
                     .in_set(bevy::render::renderer::RenderGraphSystems::Render)
                     .before(camera_driver),
             )
-            .add_systems(
-                Core2d,
-                // 显式 after gradient blit：同一 set 内系统默认无序（并行），
-                // 不加 ordering 时 gradient 可能后执行覆盖 DDA 画面（实机截图已复现）
-                blit_dda_view
-                    .in_set(Core2dSystems::PostProcess)
-                    .after(crate::gradient::GradientBlitSet),
-            );
+            .add_systems(Core2d, blit_dda_view.in_set(Core2dSystems::PostProcess));
     }
 }
 
@@ -1526,11 +1545,7 @@ fn prepare_dda_bind_groups(
     );
 
     // ---- BG3：光源池 uniform ----
-    let bg3 = render_device.create_bind_group(
-        None,
-        &bg3_layout,
-        &BindGroupEntries::single(&lp),
-    );
+    let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp));
 
     // ---- Blit BG：dda tex（和 gradient 相同的 texture_2d blit layout）----
     let blit_bg = render_device.create_bind_group(
@@ -1555,7 +1570,7 @@ fn dispatch_dda(
     bg3: Option<Res<DdaBg3BindGroup>>,
     pipeline_cache: Res<PipelineCache>,
     pipelines: Res<DdaPipelines>,
-    scale: Res<crate::gradient::RenderScale>,
+    scale: Res<RenderScale>,
 ) {
     let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) =
         (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref())

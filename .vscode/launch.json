@@ -3,14 +3,12 @@
   "configurations": [
     {
       "name": "gate-app",
-      "type": "lldb",
+      "type": "f5anything",
       "request": "launch",
-      "program": "${workspaceFolder}/target/debug/gate-app.exe",
-      "cwd": "${workspaceFolder}",
+      "command": "clear; cargo run -p gate-app",
+      "terminalName": "gate-app",
+      "showTerminal": true,
       "preLaunchTask": "build-gate-app",
-      "env": {
-        "WGPU_BACKEND": "vulkan"
-      }
     }
   ]
 }

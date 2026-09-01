@@ -12,8 +12,7 @@ fn manifest_dir() -> PathBuf {
 
 fn compile_wgsl(rel_path: &str) {
     let path = manifest_dir().join("../gate-app/assets").join(rel_path);
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{rel_path} 读取失败: {e}"));
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel_path} 读取失败: {e}"));
     let module = naga::front::wgsl::parse_str(&src)
         .unwrap_or_else(|e| panic!("{rel_path} naga parse 失败: {e:?}"));
     // validate 需要常量评估等能力：默认 Options 即可
@@ -31,6 +30,5 @@ fn compile_wgsl(rel_path: &str) {
 #[test]
 fn wgsl_shaders_parse_and_validate() {
     compile_wgsl("shaders/dda.wgsl");
-    compile_wgsl("shaders/gradient.wgsl");
     compile_wgsl("shaders/blit.wgsl");
 }

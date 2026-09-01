@@ -3,13 +3,12 @@
 //! 策略（spec FR-5 v0）：渲染内部分辨率跟随窗口物理像素。
 //! 纹理用 `Assets<Image>::get_mut + resize`（Handle 不变，引用方零改动），
 //! GpuImage 由资产管线在下一次 Prepare 自动按新描述符重建；
-//! gradient/DDA shader 均有越界剔除（uniform 尺寸 / textureDimensions），div_ceil 派发安全。
+//! DDA shader 有越界剔除（textureDimensions），div_ceil 派发安全。
 
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 
-use crate::brickmap::dda::DdaImages;
-use crate::gradient::{GradientImages, GradientUniforms, RenderScale};
+use crate::brickmap::dda::{DdaImages, RenderScale};
 
 /// 合法窗口尺寸范围：下限防最小化/折叠矩形，上限防超 GPU 纹理上限
 /// （实测 SetWindowPos 异常矩形曾上报 65496 物理高度——负值 u16 回绕）。
@@ -20,16 +19,14 @@ fn size_is_sane(s: UVec2) -> bool {
     (MIN_DIM..=MAX_DIM).contains(&s.x) && (MIN_DIM..=MAX_DIM).contains(&s.y)
 }
 
-/// 每帧对照主窗口物理尺寸；变化 → 重建 gradient + DDA 目标纹理并更新
-/// RenderScale / GradientUniforms（aspect 侧由 gate-app orbit_camera_input 同帧跟随）。
+/// 每帧对照主窗口物理尺寸；变化 → 原地重建 DDA 目标纹理并更新 RenderScale
+/// （aspect 侧由 gate-app orbit_camera_input 同帧跟随）。
 /// 退化尺寸（<64 或 >4096）：跳过本次 resize 保留上一组合法尺寸，warn 仅一次。
 pub fn resize_render_targets(
     windows: Query<&Window>,
-    grad: Option<Res<GradientImages>>,
     dda: Option<Res<DdaImages>>,
     mut images: ResMut<Assets<Image>>,
     mut scale: ResMut<RenderScale>,
-    mut uniforms: ResMut<GradientUniforms>,
     mut warned: Local<bool>,
 ) {
     let Ok(window) = windows.single() else { return };
@@ -57,18 +54,12 @@ pub fn resize_render_targets(
         height: new_size.y,
         depth_or_array_layers: 1,
     };
-    for handle in grad.iter().map(|g| &g.target) {
-        if let Some(mut img) = images.get_mut(handle) {
-            img.resize(extent);
-        }
-    }
     for handle in dda.iter().map(|d| &d.target) {
         if let Some(mut img) = images.get_mut(handle) {
             img.resize(extent);
         }
     }
     scale.size = new_size;
-    uniforms.size = new_size.as_vec2().extend(0.0).extend(0.0);
 }
 
 pub struct ResponsivePlugin;
@@ -88,15 +79,15 @@ mod tests {
     #[test]
     fn render_scale_defaults_to_view_size() {
         let s = RenderScale::default();
-        assert_eq!(s.size, crate::gradient::VIEW_SIZE);
+        assert_eq!(s.size, crate::brickmap::dda::VIEW_SIZE);
     }
 
     /// dispatch 数 = size.div_ceil(WORKGROUP)：非整除尺寸也要全屏覆盖
     #[test]
     fn dispatch_count_covers_non_multiple_sizes() {
         for size in [1280u32, 720, 1024, 769, 1] {
-            let gx = size.div_ceil(crate::gradient::WORKGROUP_SIZE);
-            assert!(gx * crate::gradient::WORKGROUP_SIZE >= size);
+            let gx = size.div_ceil(crate::brickmap::dda::WORKGROUP_SIZE);
+            assert!(gx * crate::brickmap::dda::WORKGROUP_SIZE >= size);
         }
     }
 

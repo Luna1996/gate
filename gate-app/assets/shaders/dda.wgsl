@@ -306,7 +306,7 @@ fn next_coarse_boundary(c: i32, s: i32) -> f32 {
 // Rust BrickMapView::cell_occupied 的逐字翻译。cc 为 cell 坐标（1 单位 = 16 fine）。
 // 语义：false ⇒ 该 cell 内全部 16³ fine 位置 sample 均为空。成本 2 次 load（全链 4~10 次）。
 fn cell_occupied(cc: vec3<i32>) -> bool {
-  let tile_i = cc >> vec3<u32>(5u);       // 32 cell / tile（i32 算术右移，负坐标正确；移位量须 u32）
+  let tile_i = vec3<i32>(cc >> vec3<u32>(5u));       // 32 cell / tile（i32 算术右移，负坐标正确；移位量须 u32）
   let it = vec3<u32>(cc & vec3<i32>(31)); // in-tile cell（欧氏余数；转 u32 供位运算）
   let origin = vec3<i32>(g.index_origin_x, g.index_origin_y, g.index_origin_z);
   let dims = vec3<u32>(g.index_dims_x, g.index_dims_y, g.index_dims_z);
@@ -441,7 +441,7 @@ fn mov_fine_scan_cell(bmp_base: u32, dir_b: u32, node_b: u32, leaves_b: u32,
   if (MOV_FINE_DIAG == 2u) { return FineHit(false, 0.0, 0u, 3u); }
   if (t_hi <= t_lo) { return FineHit(false, 0.0, 0u, 3u); }
   let p = ro + rd * t_lo;
-  let base = cc << vec3<u32>(4u);
+  let base = vec3<i32>(cc << vec3<u32>(4u));
   let fc0 = clamp(vec3<i32>(floor(p)), base, base + vec3<i32>(15));
   // 初始 fine 胞采样（两种模式都跑）
   let pal0_init = mov_sample_voxel(bmp_base, dir_b, node_b, leaves_b, fc0);
@@ -502,30 +502,30 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
   // ---- descriptor 解码（32 words，f32 字段 bitcast）----
   let base = idx * MOV_DESC_WORDS;
   let obj_pos = vec3<f32>(
-    bitcast<f32>(mov_descs[base]),
-    bitcast<f32>(mov_descs[base + 1u]),
-    bitcast<f32>(mov_descs[base + 2u]));
-  let scale = bitcast<f32>(mov_descs[base + 3u]);
+    f32(mov_descs[base]),
+    f32(mov_descs[base + 1u]),
+    f32(mov_descs[base + 2u]));
+  let scale = f32(mov_descs[base + 3u]);
   let col0 = vec3<f32>(
-    bitcast<f32>(mov_descs[base + 4u]),
-    bitcast<f32>(mov_descs[base + 5u]),
-    bitcast<f32>(mov_descs[base + 6u]));
+    f32(mov_descs[base + 4u]),
+    f32(mov_descs[base + 5u]),
+    f32(mov_descs[base + 6u]));
   let col1 = vec3<f32>(
-    bitcast<f32>(mov_descs[base + 8u]),
-    bitcast<f32>(mov_descs[base + 9u]),
-    bitcast<f32>(mov_descs[base + 10u]));
+    f32(mov_descs[base + 8u]),
+    f32(mov_descs[base + 9u]),
+    f32(mov_descs[base + 10u]));
   let col2 = vec3<f32>(
-    bitcast<f32>(mov_descs[base + 12u]),
-    bitcast<f32>(mov_descs[base + 13u]),
-    bitcast<f32>(mov_descs[base + 14u]));
+    f32(mov_descs[base + 12u]),
+    f32(mov_descs[base + 13u]),
+    f32(mov_descs[base + 14u]));
   let w_mn = vec3<f32>(
-    bitcast<f32>(mov_descs[base + 16u]),
-    bitcast<f32>(mov_descs[base + 17u]),
-    bitcast<f32>(mov_descs[base + 18u]));
+    f32(mov_descs[base + 16u]),
+    f32(mov_descs[base + 17u]),
+    f32(mov_descs[base + 18u]));
   let w_mx = vec3<f32>(
-    bitcast<f32>(mov_descs[base + 20u]),
-    bitcast<f32>(mov_descs[base + 21u]),
-    bitcast<f32>(mov_descs[base + 22u]));
+    f32(mov_descs[base + 20u]),
+    f32(mov_descs[base + 21u]),
+    f32(mov_descs[base + 22u]));
   let bmp_base = mov_descs[base + 24u];
   let dir_b = mov_descs[base + 25u];
   let node_b = mov_descs[base + 26u];
@@ -561,7 +561,7 @@ fn trace_object(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> ObjH
   let delta_c = delta * 16.0;
   let start = ro + rd * tl0;
   // cc = clamp(floor(start) >> 4, 0, 31)
-  var cc = clamp(vec3<i32>(floor(start)) >> vec3<u32>(4u), vec3<i32>(0), vec3<i32>(31));
+  var cc = clamp(vec3<i32>(vec3<i32>(floor(start)) >> vec3<u32>(4u)), vec3<i32>(0), vec3<i32>(31));
   // 粗 tmax：下一粗边界距离（相对 start）
   var tmax_c = vec3<f32>(1e+30);
   if (abs(rd.x) > 1e-30) {
@@ -702,7 +702,7 @@ fn trace_world(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> WorldHit {
   delta = select(delta, 1.0 / abs(dir), abs(dir) > vec3<f32>(1e-30));
   let delta_c = delta * 16.0;
   // 粗 cell = floor(start_v) >> 4（算术右移 = floor 除法，负坐标正确；不 clamp，出窗占用查询返 false）
-  var cc = vec3<i32>(floor(start_v)) >> vec3<u32>(4u);
+  var cc = vec3<i32>(vec3<i32>(floor(start_v)) >> vec3<u32>(4u));
   var tmax_c = vec3<f32>(1e+30);
   // 下一粗边界（无 window 下限 clamp：负坐标 tile 合法，同内联版 next_coarse_boundary）
   {
@@ -718,7 +718,7 @@ fn trace_world(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> WorldHit {
       let t_hi = min(t_out, t_rel_max);
       if (t_hi > t_in) {
         let p = start_v + dir * t_in;
-        let base = cc << vec3<u32>(4);
+        let base = vec3<i32>(cc << vec3<u32>(4));
         let fc0 = clamp(vec3<i32>(floor(p)), base, base + vec3<i32>(15));
         var fc = fc0;
         var tmax_f = vec3<f32>(1e+30);

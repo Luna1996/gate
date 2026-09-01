@@ -14,9 +14,9 @@ pub mod wire;
 
 pub use builder::{BrickMapBuilder, DirtyRanges, TileUpdate};
 pub use dda::{
-    DdaCameraConfig, DdaHit, DdaImages, DdaViewUniform, OrbitCamera, cpu_dda_ascii_grid_32x32,
-    cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip, cpu_reference_dda_ray_two_level,
-    create_dda_image,
+    DdaCameraConfig, DdaHit, DdaImages, DdaViewUniform, OrbitCamera, RenderScale, VIEW_SIZE,
+    cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip,
+    cpu_reference_dda_ray_two_level, create_dda_image,
 };
 pub use mov::{
     GpuMovPool, MovDesc, MovGlobals, MovHit, MovObject, MovPlugin, MovPoolPacked, MovScene,
