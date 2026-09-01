@@ -11,8 +11,8 @@ use bevy::{
 use glam::{Mat3, Vec3};
 
 use gate_render::{
-  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, EmissiveLights, MovObject,
-  MovScene, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image, pack_mov_pool,
+  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, MovObject, MovScene,
+  OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image, pack_mov_pool,
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
@@ -110,6 +110,7 @@ fn main() {
         edit_tile_every_120_frames,
         demo_ui_setup,
         fps_line_feed,
+        debug_normals_toggle,
       ),
     )
     .run();
@@ -146,31 +147,12 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     CAM_NEAR,
     CAM_FAR,
   ));
+  commands.insert_resource(DebugNormals::default());
 
   // ---- demo scene：调色板 + 多分辨率混合极限场景 ----
   let mut grid = gate_voxel::TileGrid::new();
   paint_demo_palette(&mut grid);
   build_demo_scene(&mut grid);
-
-  // ---- P3.2 发光元件验证：中央大道两侧 LED 灯柱（palette 14，emissive 255）----
-  // 2×2×96 fine 细柱：半对角 22.6 < EMISSIVE_RADIUS 24，NEE 球面采样点
-  // 落在柱外 → 阴影射线不自遮挡（大面积发光体的透光调优归 3.5d/P9）
-  let mut emissive_lights = EmissiveLights::default();
-  for sx in [-96.0f32, 96.0] {
-    let cx = 2560 + sx as i32;
-    let cz = 3200;
-    let base_y = terrain_h(cx, cz) + 2;
-    let origin = IVec3::new(cx - 1, base_y, cz - 1);
-    fill_box(&mut grid, origin, IVec3::new(2, 96, 2), 4, 14);
-    for dx in 0..2 {
-      for dy in 0..96 {
-        for dz in 0..2 {
-          emissive_lights.observe_edit(grid.palette(), origin + IVec3::new(dx, dy, dz), 14);
-        }
-      }
-    }
-  }
-  commands.insert_resource(emissive_lights);
 
   commands.insert_resource(VoxelScene {
     grid,
@@ -814,15 +796,24 @@ fn window_height(windows: &Query<&Window>) -> f32 {
     .unwrap_or(VIEW_SIZE.y as f32)
 }
 
+/// 按 N 切换法向向量可视化调试
+fn debug_normals_toggle(keys: Res<ButtonInput<KeyCode>>, mut dbg_res: ResMut<DebugNormals>) {
+  if keys.just_pressed(KeyCode::KeyN) {
+    dbg_res.0 = !dbg_res.0;
+    bevy::log::info!(
+      "DebugNormals: {}",
+      if dbg_res.0 {
+        "ON (法向向量)"
+      } else {
+        "OFF (正常)"
+      }
+    );
+  }
+}
+
 /// 每 120 帧改一次 tile (1,0,0) 触发增量上传（验证 UPLOAD[incremental] 日志）
 /// 用 set_voxel 填 palette 交替 → 确保一定产生 DirtyEdit（而不是 clear 空胞 no-op）
-/// 极限场景 palette：11 金 / 8 青（高对比肉眼可见、且不与森林树叶 5/树干 6 语义冲突）
-/// P3.2：编辑路径同步观察 EmissiveLights（金/青非发光 → O(1) miss；钩子语义完整性验证）
-fn edit_tile_every_120_frames(
-  mut frame: Local<u64>,
-  scene: Option<ResMut<VoxelScene>>,
-  mut emissive: Option<ResMut<EmissiveLights>>,
-) {
+fn edit_tile_every_120_frames(mut frame: Local<u64>, scene: Option<ResMut<VoxelScene>>) {
   *frame += 1;
   let Some(mut scene) = scene else { return };
   if *frame == 1 {
@@ -841,9 +832,6 @@ fn edit_tile_every_120_frames(
         while x < 32 {
           let pos = origin + IVec3::new(x, y, z);
           scene.grid.set_voxel(pos, 4, pal);
-          if let Some(em) = emissive.as_deref_mut() {
-            em.observe_edit(scene.grid.palette(), pos, pal);
-          }
           x += 1;
         }
         y += 1;

@@ -7,19 +7,17 @@ use bevy::prelude::*;
 pub use brickmap::{
   BindingLimits, BrickMapBuffers, BrickMapBuilder, BrickMapGlobals, BrickMapUploadPlugin,
   BrickMapView, BufferLayout, BuilderMirror, DdaCameraConfig, DdaImages, DdaViewUniform,
-  DirtyRanges, GpuBrickMap, GpuMovPool, MovDesc, MovGlobals, MovHit, MovObject, MovPlugin,
-  MovPoolPacked, MovScene, OBJ_WORLD, OrbitCamera, TileUpdate, UploadBudget, UploadCpuSample,
-  UploadCpuSampleChannel, UploadSnapshot, VoxelScene, cpu_dda_ascii_grid_32x32,
+  DebugNormals, DirtyRanges, GpuBrickMap, GpuMovPool, MovDesc, MovGlobals, MovHit, MovObject,
+  MovPlugin, MovPoolPacked, MovScene, OBJ_WORLD, OrbitCamera, TileUpdate, UploadBudget,
+  UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VoxelScene, cpu_dda_ascii_grid_32x32,
   cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip, cpu_reference_object_ray,
   cpu_reference_trace_scene, create_dda_image, pack_mov_pool,
 };
 pub use brickmap::{RenderScale, VIEW_SIZE};
 pub use lighting::{
-  EMISSIVE_CLUSTER_SIZE, EMISSIVE_EMIT_GAIN, EMISSIVE_GAIN, EMISSIVE_MAX_DIST_FINES,
-  EMISSIVE_RADIUS, EmissiveLights, FINES_PER_M, LightDesc, LightGlobals, LightPoolUniform,
-  LightingTheme, MAX_LIGHTS, SHADOW_BIAS, SHADOW_SAMPLES, SkyCfg, build_light_pool,
-  cluster_emissive_lights, cone_sample_dir, cpu_reference_sky, parse_lighting_ron, phong_spec,
-  sphere_sample_offset,
+  DirLightCfg, EMISSIVE_EMIT_GAIN, LightDesc, LightGlobals, LightPoolUniform, LightingTheme,
+  MAX_LIGHTS, SHADOW_BIAS, SHADOW_DIR_T_MAX, SkyCfg, build_light_pool, cpu_reference_sky,
+  parse_lighting_ron,
 };
 pub use responsive::{ResponsivePlugin, resize_render_targets};
 

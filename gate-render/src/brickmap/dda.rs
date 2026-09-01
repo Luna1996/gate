@@ -80,6 +80,10 @@ impl DdaCameraConfig {
   }
 }
 
+/// 调试切换：法向向量可视化（main world Resource，按 N 键切换）
+#[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
+pub struct DebugNormals(pub bool);
+
 /// 相机约束常量（spec FR-3 clamp；pub 供 gate-app 输入 system 与测试断言）
 pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians(); // ±89° 防万向节锁（up 与 view 共线）
 pub const DIST_MIN: f32 = 32.0; // 最近 32 fine（8cm，不穿进体素内部失稳）
@@ -153,16 +157,17 @@ impl DdaCameraConfig {
 pub struct DdaViewUniform {
   pub inv_view_proj: Mat4,
   pub cam_pos_fine: Vec4, // w=1
-  pub _pad: Vec4,
+  /// x = debug_mode（0 = 正常，1 = 法向向量可视化）；yzw reserved
+  pub debug_mode: Vec4,
 }
 
 impl DdaViewUniform {
-  pub fn from_cfg(cfg: &DdaCameraConfig) -> Self {
+  pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32) -> Self {
     Self {
       inv_view_proj: cfg.inv_view_proj,
       // 世界单位 = fine 单位（0.25cm）；DDA 着色器 dir 同样不缩放
       cam_pos_fine: cfg.position_world.extend(1.0),
-      _pad: Vec4::ZERO,
+      debug_mode: Vec4::new(debug_mode as f32, 0.0, 0.0, 0.0),
     }
   }
 }
@@ -1307,29 +1312,23 @@ impl Plugin for BrickMapDdaPlugin {
 
 fn extract_camera_config(
   mut commands: bevy::ecs::system::Commands,
-  // ExtractSchedule 运行在 render world：Res 读不到 main world 资源，
-  // 必须用 Extract<Res<T>> 系统参数跨 world 读取（与 ExtractResourcePlugin 同机制）
   cfg: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DdaCameraConfig>>>,
+  debug: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DebugNormals>>>,
 ) {
-  // 无配置（某些 test 场景）不 panic
   let Some(cfg) = cfg else { return };
-  let uniform = DdaViewUniform::from_cfg(&cfg);
+  let debug_mode = debug.map(|d| d.0 as u32).unwrap_or(0);
+  let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode);
   commands.insert_resource(uniform);
 }
 
-/// main world `LightingTheme` + `EmissiveLights` → render world `LightPoolUniform`
-/// （P3.1 BG3；P3.2 发光元件点光按眼睛距离并入）。main world 无主题（test 场景）
-/// 时回退内置默认「暗色实验室」。
+/// main world `LightingTheme` → render world `LightPoolUniform`
+/// 方向光 + 天空 + 环境 + 曝光；Douglas 方案：无点光源/发光体素 NEE。
 fn extract_light_pool(
   mut commands: bevy::ecs::system::Commands,
   theme: Option<bevy::render::Extract<bevy::ecs::system::Res<LightingTheme>>>,
-  emissive: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::lighting::EmissiveLights>>>,
-  orbit: Option<bevy::render::Extract<bevy::ecs::system::Res<OrbitCamera>>>,
 ) {
   let t = theme.map(|t| t.clone()).unwrap_or_default();
-  let em: Vec<crate::lighting::LightDesc> = emissive.map(|e| e.descs()).unwrap_or_default();
-  let eye = orbit.map(|o| o.eye()).unwrap_or(Vec3::ZERO);
-  commands.insert_resource(build_light_pool(&t, &em, eye));
+  commands.insert_resource(build_light_pool(&t));
 }
 
 fn init_dda_pipelines(
