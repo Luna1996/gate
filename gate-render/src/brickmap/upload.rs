@@ -584,13 +584,15 @@ fn prepare(
   {
     *g = Some(sample);
   }
-  // VRAM 预算断言（V3.1 ≤2GB）
+  // VRAM 规模留档（v3.9.1 用户指令：2GB 内存预算断言取消，仅打印不拦截）
   let vram = gpu.struct_buf.size()
     + gpu.leaves.size()
     + gpu.palette.size()
     + gpu.comp.size()
     + gpu.state.size();
-  debug_assert!(vram <= 2u64 << 30, "GPU VRAM 超预算: {vram} bytes");
+  if vram > 2u64 << 30 {
+    bevy::log::warn!("GPU VRAM 超过旧预算线（仅提示）: {vram} bytes");
+  }
   if !limits.force_multi() {
     debug_assert!(
       struct_bytes.len() as u64 <= limits.max_storage_buffer_binding_size,

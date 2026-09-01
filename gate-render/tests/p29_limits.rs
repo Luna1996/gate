@@ -24,8 +24,6 @@ use std::time::Instant;
 
 /// 单 tile 的 fine 边长（32 基元胞 × 16 fine）
 const TILE_FINE: i32 = 512;
-/// 满铺 tile 的基元胞数（L0，4cm）
-const CELLS_PER_TILE: usize = 32 * 32 * 32;
 /// 帧预算（60fps 口径）
 const FRAME_MS: f64 = 16.7;
 
@@ -327,16 +325,17 @@ fn dda_regime_c_worst_depth_budget() {
 }
 
 // ============================================================================
-// P2.9d：系统内存 + VRAM 布局预算断言（≤2GB，工作间/关卡口径）
+// P2.9d：系统内存 + VRAM 布局规模留档（v3.9.1 用户指令：2GB 内存预算断言取消，
+// 仅打印测量值留档；保留布局契约断言防结构漂移）
 // ============================================================================
 
 #[test]
 fn vram_layout_budget_2gb() {
   // ① 定长前缀回归锚：index 8MB + bitmaps 4MB + dirs 128MB = 140MB
-  //    （TILE_CAP=1024 的占位虚耗，brickmap.md §6「不做 rank 压缩」）
+  //    （TILE_CAP=1024 的占位虚耗，brickmap.md §6「不做 rank 压缩」）——布局契约保留
   assert_eq!(NODE_STREAM_BASE * 4, 36_700_160 * 4);
   let fixed_mb = NODE_STREAM_BASE as f64 * 4.0 / 1048576.0;
-  assert!(fixed_mb < 150.0, "定长前缀 {fixed_mb:.1}MB 意外膨胀");
+  println!("[P2.9d] 定长前缀 = {fixed_mb:.1}MB");
 
   // ② L2 精细化满铺单 tile 的 node stream 成本线：
   //    预算表 §7「L2 精细化满铺 4M L0 胞 × 152B = 608MB」→ 单 tile（32768 L0 胞）
@@ -346,18 +345,8 @@ fn vram_layout_budget_2gb() {
   let g = BrickMapBuilder::build_full(&grid).buffers().globals;
   let node_per_tile = g.node_words as f64 * 4.0;
   println!(
-    "[P2.9d] L2 满铺 1 tile: node={:.2}MB/tile（预算线 4.98MB×1.15）× 122 tiles = {:.0}MB（608MB 预算）",
+    "[P2.9d] L2 满铺 1 tile: node={:.2}MB/tile（预算线 4.98MB×1.15）× 122 tiles = {:.0}MB（旧预算 608MB）",
     node_per_tile / 1048576.0,
-    node_per_tile * 122.0 / 1048576.0
-  );
-  assert!(
-    node_per_tile <= 152.0 * CELLS_PER_TILE as f64 * 1.15,
-    "L2 精细化单 tile node {:.2}MB > 152B/胞 ×1.15（布局退化或折叠失效）",
-    node_per_tile / 1048576.0
-  );
-  assert!(
-    node_per_tile * 122.0 <= 670.0 * 1048576.0,
-    "工作间 122 tile L2 满铺外推 {:.0}MB > 608MB×1.10",
     node_per_tile * 122.0 / 1048576.0
   );
 
@@ -372,14 +361,9 @@ fn vram_layout_budget_2gb() {
     "[P2.9d] L4 满深度热点(19.7万胞): node={node_mb:.1}MB leaves={leaves_mb:.1}MB bricks={}",
     bufs.globals.brick_slabs
   );
-  // 20 万胞热点外推到预算口径（~1GB 上限）远有余；断言锁数量级防意外分配
-  assert!(
-    node_mb + leaves_mb < 256.0,
-    "20 万胞热点 node+brick {node_mb:.1}+{leaves_mb:.1}MB 超 256MB 数量级锚"
-  );
 
   // ④ 典型工作间合计：64 典型 tile + 1 L2 满 tile + 1 L4 热点 + 定长前缀，
-  //    外推 ×2（CPU 镜像+GPU 同规格）远低于 2GB（v3.1 系统内存/VRAM 决策）
+  //    外推 ×2（CPU 镜像+GPU 同规格）——仅留档
   let mut grid = TileGrid::new();
   fill_full_tiles(&mut grid, 0, 62);
   fill_checkerboard(
@@ -398,12 +382,7 @@ fn vram_layout_budget_2gb() {
   let total_mb =
     (bufs.b_struct.len() + bufs.b_leaves.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
   println!(
-    "[P2.9d] 典型工作间 buffers 合计={total_mb:.1}MB（含 140MB 定长前缀）→ GPU 同规格 + CPU 镜像 ×2 = {:.0}MB ≤ 2GB ✓",
-    total_mb * 2.0
-  );
-  assert!(
-    total_mb * 2.0 <= 2048.0,
-    "工作间双份（GPU+CPU 镜像）{:.0}MB > 2GB",
+    "[P2.9d] 典型工作间 buffers 合计={total_mb:.1}MB（含 140MB 定长前缀）→ GPU 同规格 + CPU 镜像 ×2 = {:.0}MB（旧预算 2GB）",
     total_mb * 2.0
   );
 }

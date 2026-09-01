@@ -1119,7 +1119,7 @@ mod tests {
       build < Duration::from_secs(30),
       "全深度构建超预算: {build:?}"
     );
-    assert!(vram <= 2 << 30, "单 tile VRAM 超预算: {vram} B");
+    // v3.9.1 用户指令：2GB VRAM 预算断言取消（vram 已在上方 println 留档）
     // 读回抽查（对角胞 + 中心胞；每胞 1 个 L4 体素 = 其 0.25cm 格）
     let v = BrickMapView::new(b.buffers());
     for cz in [0usize, 31] {

@@ -54,6 +54,18 @@ const NODE_STREAM_BASE: u32 = 36700160u;  // 128³ + 1024×1024 + 1024×32768（
 const MOV_DESC_WORDS: u32 = 32u;          // 128B / 4 = 32 words/物体 descriptor
 const LOCAL_TILE_FINE: u32 = 512u;        // 物体局部 tile 边长（v1 每物体恰 1 tile）
 
+// 逐面光照注册表（P3.5d；Rust 镜像 gate-render/src/brickmap/face_light.rs，单测防漂移）
+const FL_REG_SLOTS: u32 = 2097152u;       // 1<<21 槽（近景可见独立体素可逼近屏幕像素数 ~2M，余量防 probe 耗尽丢注册）
+const FL_WORDS_PER_SLOT: u32 = 28u;
+const FL_PROBE_MAX: u32 = 64u;
+const FL_EPOCH_INVALID: u32 = 0xFFFFFFFFu; // 新占位槽的 epoch 值（作废残留，强制 fl_light 重算）
+// slot 布局偏移：[0]status [1..3]xyz [4]obj_key [5]face_mask [6]epoch [7..24]light×6面 [25..27]MOV中心
+const FL_OFF_OBJ: u32 = 4u;
+const FL_OFF_MASK: u32 = 5u;
+const FL_OFF_EPOCH: u32 = 6u;
+const FL_OFF_LIGHT: u32 = 7u;
+const FL_OFF_CENTER: u32 = 25u;
+
 // Slot 编码（wire.rs encode_slot / unpack_slot_word）
 // tag: 最高 8bit (u16)，palette: 低 8bit
 fn slot_pack(tag: u32, pal: u32) -> u32 {
@@ -84,15 +96,29 @@ const TAG_EMPTY: u32 = 0u;
 const TAG_LEAF: u32 = 1u;
 const TAG_BRANCH: u32 = 2u;
 
-// --- BG0：输出 + 视图 uniform ---
-@group(0) @binding(0) var out_tex: texture_storage_2d<rgba8unorm, write>;
+// --- BG0：G-buffer + 输出 + 视图 uniform（P3.5d 三段式管线共用）---
+// @binding(0) = gbuffer storage read_write（rgba32uint: xyz 体素 + meta word）
+//   dda_main 写入（textureStore），fl_composite_main 读取（textureLoad）
+// @binding(1) = out storage write（rgba8unorm，合成 pass 最终输出；debug 模式主 pass 直写）
+// @binding(2) = uniform DdaViewUniform
+@group(0) @binding(0) var gbuf_tex: texture_storage_2d<rgba32uint, read_write>;
+@group(0) @binding(1) var out_tex: texture_storage_2d<rgba8unorm, write>;
 
 struct DdaViewUniform {
   inv_view_proj: mat4x4<f32>,  // 64B
   cam_pos_fine: vec4<f32>,     // 16B，w=1
   debug_mode: vec4<f32>,       // 16B：x = 1.0 → 法向向量可视化
+  fl_epoch: vec4<f32>,         // 16B：x = 逐面光照 epoch（u32 as f32，2^24 内精确）
 }
-@group(0) @binding(1) var<uniform> view_u: DdaViewUniform;
+@group(0) @binding(2) var<uniform> view_u: DdaViewUniform;
+
+// G-buffer meta word 打包
+//   bits 0-7   pal
+//   bits 8-15  objm（0xFF = 世界；否则 MOV 物体下标）
+//   bits 16-18 face（0=-X 1=+X 2=-Y 3=+Y 4=-Z 5=+Z；MOV 为局部 face）
+//   bit  19    is_sky
+const GB_SKY_BIT: u32 = 1u << 19u;
+const GB_OBJM_WORLD: u32 = 0xFFu;
 
 // --- BG1：brick map 全部数据 + globals ---
 @group(1) @binding(0) var<storage, read> b_struct: array<u32>;
@@ -160,6 +186,151 @@ struct LightPool {
   sky_horizon: vec4<f32>,
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
+
+// ---- BG4：逐面光照注册表（P3.5d；read_write，f32 字段 bitcast 存取）----
+@group(4) @binding(0) var<storage, read_write> fl_table: array<atomic<u32>>;
+
+// ============================================================================
+// P3.5d 逐面光照：hash 注册表操作 + 面工具 + 面光照数学
+// ============================================================================
+
+// 整数混合（Rust face_light.rs fl_hash_u32 镜像）
+fn fl_hash_u32(v: u32) -> u32 {
+  var x = v;
+  x = x ^ (x >> 16u);
+  x = x * 0x7FEB352Du;
+  x = x ^ (x >> 15u);
+  x = x * 0x846CA68Bu;
+  x = x ^ (x >> 16u);
+  return x;
+}
+// key = (x, y, z, obj_key)（obj_key：0=世界，N+1=MOV N）
+fn fl_hash(x: i32, y: i32, z: i32, obj_key: u32) -> u32 {
+  var h = 0x811C9DC5u;
+  h = fl_hash_u32(h ^ bitcast<u32>(x));
+  h = fl_hash_u32(h ^ bitcast<u32>(y));
+  h = fl_hash_u32(h ^ bitcast<u32>(z));
+  h = fl_hash_u32(h ^ obj_key);
+  return h;
+}
+
+// face f 法线（世界物体 = 世界轴向；MOV 光照时经旋转矩阵变换）
+fn fl_face_normal(f: u32) -> vec3<f32> {
+  if (f == 0u) { return vec3<f32>(-1.0, 0.0, 0.0); }
+  if (f == 1u) { return vec3<f32>(1.0, 0.0, 0.0); }
+  if (f == 2u) { return vec3<f32>(0.0, -1.0, 0.0); }
+  if (f == 3u) { return vec3<f32>(0.0, 1.0, 0.0); }
+  if (f == 4u) { return vec3<f32>(0.0, 0.0, -1.0); }
+  return vec3<f32>(0.0, 0.0, 1.0);
+}
+
+// 命中面法线（±轴单位向量）→ face index
+fn fl_face_index(n: vec3<f32>) -> u32 {
+  if (n.x < -0.5) { return 0u; }
+  if (n.x > 0.5) { return 1u; }
+  if (n.y < -0.5) { return 2u; }
+  if (n.y > 0.5) { return 3u; }
+  if (n.z < -0.5) { return 4u; }
+  return 5u;
+}
+
+// 可见面注册（dda_main 命中后调用）：开放寻址 + CAS 占位。
+// 并发协议：CAS(0→1) 成功者独占槽位并写 key；后来者读 key 比对——
+// 同 key → atomicOr face_mask；异 key → 下一槽。占位中（key 未写）被读到
+// 旧尸体 key 时误判走下一槽，最坏产生重复同 key 槽（lookup 侧按 mask 位
+// 过滤继续 probe，见 fl_lookup 注）。
+//
+// epoch 置 INVALID（v3.9.1 修复）：clear 保留 epoch/light 残留，但开放寻址的
+// 槽位随注册竞争顺序漂移（同 key 每帧可能落不同槽）→ 槽内 epoch/light 可能是
+// 其他体素的残留 → 「epoch 匹配跳过」会读到脏数据（随机亮暗噪点+闪烁）或漏算
+// 新见面（黑块）。置 INVALID 强制 fl_light 恒重算，时间复用待槽位稳定化后恢复。
+fn fl_register(voxel: vec3<i32>, obj_key: u32, face: u32, world_center: vec3<f32>) {
+  let h = fl_hash(voxel.x, voxel.y, voxel.z, obj_key) % FL_REG_SLOTS;
+  for (var probe: u32 = 0u; probe < FL_PROBE_MAX; probe = probe + 1u) {
+    let idx = (h + probe) % FL_REG_SLOTS;
+    let base = idx * FL_WORDS_PER_SLOT;
+    let cas = atomicCompareExchangeWeak(&fl_table[base], 0u, 1u);
+    if (cas.exchanged) {
+      // 独占槽位：作废残留 epoch → 写 key + face
+      atomicStore(&fl_table[base + FL_OFF_EPOCH], FL_EPOCH_INVALID);
+      atomicStore(&fl_table[base + 1u], bitcast<u32>(voxel.x));
+      atomicStore(&fl_table[base + 2u], bitcast<u32>(voxel.y));
+      atomicStore(&fl_table[base + 3u], bitcast<u32>(voxel.z));
+      atomicStore(&fl_table[base + FL_OFF_OBJ], obj_key);
+      atomicOr(&fl_table[base + FL_OFF_MASK], 1u << face);
+      if (obj_key != 0u) {
+        // MOV：存世界体素中心（旋转/缩放后面中心 ≠ voxel+0.5）
+        atomicStore(&fl_table[base + FL_OFF_CENTER], bitcast<u32>(world_center.x));
+        atomicStore(&fl_table[base + FL_OFF_CENTER + 1u], bitcast<u32>(world_center.y));
+        atomicStore(&fl_table[base + FL_OFF_CENTER + 2u], bitcast<u32>(world_center.z));
+      }
+      return;
+    }
+    // 已占用：比对 key（同 key 聚合 face）
+    let kx = bitcast<i32>(atomicLoad(&fl_table[base + 1u]));
+    let ky = bitcast<i32>(atomicLoad(&fl_table[base + 2u]));
+    let kz = bitcast<i32>(atomicLoad(&fl_table[base + 3u]));
+    if (kx == voxel.x && ky == voxel.y && kz == voxel.z
+        && atomicLoad(&fl_table[base + FL_OFF_OBJ]) == obj_key) {
+      atomicOr(&fl_table[base + FL_OFF_MASK], 1u << face);
+      return;
+    }
+  }
+  // probe 耗尽：丢弃（合成 pass 查不到 → 默认光照兜底）
+}
+
+// 查表取面光照（fl_composite_main 专用；未注册 = 中性灰兜底）。
+// mask 位过滤（v3.9.1 修复）：注册并发写 key 的撕裂窗口可产生同 key 重复槽
+// （face 分裂在两个槽）——命中匹配 key 但该槽 mask 不含 face 时继续 probe，
+// 找含 face 的槽（各槽光照数学确定性一致，任一含 face 槽的值皆正确）。
+fn fl_lookup(voxel: vec3<i32>, obj_key: u32, face: u32) -> vec3<f32> {
+  let h = fl_hash(voxel.x, voxel.y, voxel.z, obj_key) % FL_REG_SLOTS;
+  for (var probe: u32 = 0u; probe < FL_PROBE_MAX; probe = probe + 1u) {
+    let idx = (h + probe) % FL_REG_SLOTS;
+    let base = idx * FL_WORDS_PER_SLOT;
+    if (atomicLoad(&fl_table[base]) == 0u) { break; }
+    let kx = bitcast<i32>(atomicLoad(&fl_table[base + 1u]));
+    let ky = bitcast<i32>(atomicLoad(&fl_table[base + 2u]));
+    let kz = bitcast<i32>(atomicLoad(&fl_table[base + 3u]));
+    if (kx == voxel.x && ky == voxel.y && kz == voxel.z
+        && atomicLoad(&fl_table[base + FL_OFF_OBJ]) == obj_key) {
+      let mask = atomicLoad(&fl_table[base + FL_OFF_MASK]);
+      if ((mask & (1u << face)) != 0u) {
+        let w = FL_OFF_LIGHT + face * 3u;
+        return vec3<f32>(
+          bitcast<f32>(atomicLoad(&fl_table[base + w])),
+          bitcast<f32>(atomicLoad(&fl_table[base + w + 1u])),
+          bitcast<f32>(atomicLoad(&fl_table[base + w + 2u])));
+      }
+      // 槽 mask 不含 face：撕裂重复槽，继续 probe
+    }
+  }
+  return vec3<f32>(0.3);
+}
+
+// 面光照数学（原 shade_hit 环境部分逐面化；pre-exposure HDR；无高光/软阴影）
+// n = 面法线（世界空间），v = 面中心（阴影射线起点基准）
+fn face_light_math(n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+  // sky 渐变环境光（按面法线 y）
+  let h = clamp(n.y, 0.0, 1.0);
+  let sky_grad = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, smoothstep(0.0, 0.35, h));
+  var light = light_u.g.ambient.xyz * 0.4 + sky_grad * 0.6;
+
+  // 方向光硬阴影（每面 1 条阴影射线；3.5d 软阴影半影后续换多样本平均）
+  if (light_u.g.count > 0u) {
+    let ld = light_u.lights[0];
+    if (ld.kind_pos_dir.x < 0.5) {
+      let l_axis = ld.kind_pos_dir.yzw;
+      let ndl = max(dot(n, l_axis), 0.0);
+      if (ndl > 0.0) {
+        let o = v + n * SHADOW_BIAS;
+        let vis = select(0.0, 1.0, !scene_occluded(o, l_axis, SHADOW_DIR_T_MAX));
+        light = light + ld.color_intensity.xyz * ld.color_intensity.w * (ndl * vis);
+      }
+    }
+  }
+  return light;
+}
 
 // ============================================================================
 // 五步寻址链 sample_brickmap(fine: vec3<i32>) -> u32 (palette_idx, 0=AIR)
@@ -942,17 +1113,13 @@ fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, obj: i32, dda_
 // ============================================================================
 @compute @workgroup_size(8, 8, 1)
 fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  // 画面尺寸：VIEW_SIZE (1280x720) 由 Rust Gradient 定义相同，这里不 hardcode，
-  // 用 textureDimensions(out_tex) 拿精确尺寸。
-  let size = textureDimensions(out_tex);
+  let size = textureDimensions(gbuf_tex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
-  // 背景色占位（反投影后用 sky(dir_fine) 覆盖）
-  var col: vec3<f32> = vec3<f32>(0.0);
 
   // ---- 反投影：像素中心 (gid + 0.5) → NDC (u, v) ∈ [-1, 1] ----
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
-  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);  // v Y 翻转与 Rust cpu_dda 一致
+  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
   let near_ndc = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
   let far_ndc  = vec4<f32>(uv.x, uv.y, 1.0, 1.0);
   let near_world_h = view_u.inv_view_proj * near_ndc;
@@ -960,15 +1127,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let near_world = near_world_h.xyz / near_world_h.w;
   let far_world  = far_world_h.xyz  / far_world_h.w;
   let diff_world = far_world - near_world;
-  // frustum_length = 视锥内这条射线 near→far 的 fine 距离（视锥外不可见，DDA 到这里就停）。
-  // 随 CAM_FAR 变化（当前 65536 fine = 163.84m），用户取消"最远距离"后仍能看到整个场景。
   let frustum_length = length(diff_world);
   let dir_fine = normalize(diff_world);
   let origin_fine = view_u.cam_pos_fine.xyz;
-  // 3.5a 程序化天空背景
-  col = sky(dir_fine);
 
-  // ---- trace_scene 合成：trace_world（世界两级 DDA）+ 逐物体 trace_object 取最近 ----
+  // ---- trace_scene：世界两级 DDA + 逐物体 trace_object 取最近 ----
   var best_t = 1e+30;
   var best_pal: u32 = 0u;
   var best_obj: i32 = -1;  // -1 = 世界网格
@@ -992,20 +1155,166 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  // ---- 颜色输出：命中 → 光照合成；空 → 背景色 ----
+  // ---- G-buffer 写入 + 可见面注册（P3.5d：移除 per-pixel shade_hit）----
   if (best_t < 1e+29) {
+    // debug 模式：法向向量可视化，直接写 out_tex 绕过逐面管线
     if (view_u.debug_mode.x > 0.5) {
-      // 调试模式：法向向量可视化（Douglas implicit normals）
       let n_implicit = compute_implicit_normal(origin_fine, dir_fine, best_t, best_n, best_obj < 0);
-      col = n_implicit * 0.5 + 0.5;
-      textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
+      textureStore(out_tex, coord0, vec4<f32>(n_implicit * 0.5 + 0.5, 1.0));
       return;
     }
-    col = shade_hit(origin_fine, dir_fine, best_t, best_pal, best_obj, best_n, frustum_length);
+    // 命中：写 G-buffer + 注册可见面
+    let hit_pos = origin_fine + dir_fine * best_t;
+    let voxel = vec3<i32>(floor(hit_pos - best_n * 0.001));
+    let obj_key = select(0u, u32(best_obj) + 1u, best_obj >= 0);
+    let face = fl_face_index(best_n);
+    let objm = select(GB_OBJM_WORLD, u32(best_obj), best_obj >= 0);
+    let meta_w = u32(best_pal) | (objm << 8u) | (face << 16u);
+    let world_center = vec3<f32>(voxel) + vec3<f32>(0.5);
+    textureStore(gbuf_tex, coord0, vec4<u32>(
+      bitcast<u32>(voxel.x),
+      bitcast<u32>(voxel.y),
+      bitcast<u32>(voxel.z),
+      meta_w));
+    fl_register(voxel, obj_key, face, world_center);
+  } else {
+    // 未命中：sky 标记（composite pass 重建方向算 sky()）
+    textureStore(gbuf_tex, coord0, vec4<u32>(0u, 0u, 0u, GB_SKY_BIT));
   }
-  col = aces_tonemap(col);
-  textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
+  // out_tex 不写——fl_composite_main 负责最终输出
 }
 
-// ---- entry point 命名与 Rust PipelineCache queue_compute 对应 ----
-// Pipeline init（Task 5）会以 `entry_point="dda_main"` 创建 compute pipeline
+// ============================================================================
+// P3.5d 逐面光照管线：四个 compute entry point
+//   dispatch 序：fl_clear_main → dda_main → fl_light_main → fl_composite_main
+// ============================================================================
+
+// ---- Pass 1：fl_clear_main — 清注册表 status + face_mask（epoch + light 保留）----
+// 每线程 1 slot；workgroup 64 → dispatch ceil(FL_REG_SLOTS/64) workgroups。
+// 时间复用（后置）：epoch/light 保留本可跨帧复用，但开放寻址槽位随注册竞争
+// 顺序漂移 → fl_register 占位时置 FL_EPOCH_INVALID 作废残留，fl_light 恒重算。
+// 恢复复用需槽位稳定化（同 key 恒同槽），见 TODO 3.5d 注。
+@compute @workgroup_size(64, 1, 1)
+fn fl_clear_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= FL_REG_SLOTS) { return; }
+  let base = gid.x * FL_WORDS_PER_SLOT;
+  atomicStore(&fl_table[base], 0u);                   // status = 0（空，供 fl_register CAS）
+  atomicStore(&fl_table[base + 1u], 0u);              // key xyz+obj 清零（v3.9.3：残留 key 会让
+  atomicStore(&fl_table[base + 2u], 0u);              // fl_register 聚合分支在「占位中」槽上误匹配
+  atomicStore(&fl_table[base + 3u], 0u);              // → mask 写错槽 → 本体素 face 丢注册 → lookup
+  atomicStore(&fl_table[base + FL_OFF_OBJ], 0u);      // 兜底 0.3 灰 → 单体素闪烁）
+  atomicStore(&fl_table[base + FL_OFF_MASK], 0u);     // face_mask = 0（新帧重新收集）
+  // epoch (word 6) + light (words 7-24) + center (words 25-27) 保留
+}
+
+// ---- Pass 3：fl_light_main — 逐注册体素逐面算光照 ----
+// 每线程 1 slot；workgroup 64 → dispatch ceil(FL_REG_SLOTS/64) workgroups。
+// 本帧注册槽 epoch = FL_EPOCH_INVALID → 复用分支恒不命中 = 恒重算（v3.9.1
+// 正确性修复；时间复用待槽位稳定化后恢复）。MOV（obj_key != 0）本就恒重算。
+// 光照结果 bitcast 存入 slot light 区（FL_OFF_LIGHT + face*3），算完写 cur_epoch。
+@compute @workgroup_size(64, 1, 1)
+fn fl_light_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= FL_REG_SLOTS) { return; }
+  let base = gid.x * FL_WORDS_PER_SLOT;
+  if (atomicLoad(&fl_table[base]) == 0u) { return; }  // 空槽跳过
+
+  // 读 key
+  let voxel = vec3<i32>(
+    bitcast<i32>(atomicLoad(&fl_table[base + 1u])),
+    bitcast<i32>(atomicLoad(&fl_table[base + 2u])),
+    bitcast<i32>(atomicLoad(&fl_table[base + 3u])));
+  let obj_key = atomicLoad(&fl_table[base + FL_OFF_OBJ]);
+  let mask = atomicLoad(&fl_table[base + FL_OFF_MASK]);
+  let cur_epoch = u32(view_u.fl_epoch.x);
+
+  // 时间复用：世界体素 + epoch 匹配 → 跳过
+  let stored_epoch = atomicLoad(&fl_table[base + FL_OFF_EPOCH]);
+  if (obj_key == 0u && stored_epoch == cur_epoch) { return; }
+
+  // 面中心（世界体素 = voxel+0.5；MOV = slot 内存储的世界中心）
+  var center = vec3<f32>(f32(voxel.x) + 0.5, f32(voxel.y) + 0.5, f32(voxel.z) + 0.5);
+  if (obj_key != 0u) {
+    center = vec3<f32>(
+      bitcast<f32>(atomicLoad(&fl_table[base + FL_OFF_CENTER])),
+      bitcast<f32>(atomicLoad(&fl_table[base + FL_OFF_CENTER + 1u])),
+      bitcast<f32>(atomicLoad(&fl_table[base + FL_OFF_CENTER + 2u])));
+  }
+
+  // 逐面算光照
+  for (var f: u32 = 0u; f < 6u; f = f + 1u) {
+    if ((mask & (1u << f)) == 0u) { continue; }
+    let n = fl_face_normal(f);
+    let v = center + n * 0.5;
+    let light = face_light_math(n, v);
+    let w = FL_OFF_LIGHT + f * 3u;
+    atomicStore(&fl_table[base + w], bitcast<u32>(light.x));
+    atomicStore(&fl_table[base + w + 1u], bitcast<u32>(light.y));
+    atomicStore(&fl_table[base + w + 2u], bitcast<u32>(light.z));
+  }
+
+  // 更新 epoch
+  atomicStore(&fl_table[base + FL_OFF_EPOCH], cur_epoch);
+}
+
+// ---- Pass 4：fl_composite_main — G-buffer + 面光照 → ACES → sRGB → out_tex ----
+// 每像素 = workgroup 8×8×1 内一个 invocation（与 dda_main 对齐）。
+// sky 像素：重建射线方向 → sky()；命中像素：albedo × fl_lookup(light) + emissive 直出。
+@compute @workgroup_size(8, 8, 1)
+fn fl_composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let size = textureDimensions(out_tex);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  // 读 G-buffer
+  let g = textureLoad(gbuf_tex, coord0);
+  let meta_w = g.a;
+  var col: vec3<f32>;
+
+  // debug_mode.y = G-buffer 状态图（v3.9.3 分割线定位）：sky=品红、命中=face 6 色。
+  // 分割线两侧颜色分布直接区分「miss(sky 化)」vs「命中但光照异常」。
+  if (view_u.debug_mode.y > 0.5) {
+    if ((meta_w & GB_SKY_BIT) != 0u) {
+      col = vec3<f32>(1.0, 0.0, 1.0);   // sky/miss = 品红
+    } else {
+      let face = (meta_w >> 16u) & 7u;
+      // face: 0=-X 红 1=+X 绿 2=-Y 蓝 3=+Y 黄 4=-Z 青 5=+Z 紫（6/7 = 异常白）
+      if (face == 0u) { col = vec3<f32>(1.0, 0.2, 0.2); }
+      else if (face == 1u) { col = vec3<f32>(0.2, 1.0, 0.2); }
+      else if (face == 2u) { col = vec3<f32>(0.2, 0.2, 1.0); }
+      else if (face == 3u) { col = vec3<f32>(1.0, 1.0, 0.2); }
+      else if (face == 4u) { col = vec3<f32>(0.2, 1.0, 1.0); }
+      else if (face == 5u) { col = vec3<f32>(1.0, 0.2, 1.0); }
+      else { col = vec3<f32>(1.0); }
+    }
+    textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
+    return;
+  }
+
+  if ((meta_w & GB_SKY_BIT) != 0u) {
+    // sky：重建射线方向
+    let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
+    let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
+    let near_h = view_u.inv_view_proj * vec4<f32>(uv.x, uv.y, 0.0, 1.0);
+    let far_h  = view_u.inv_view_proj * vec4<f32>(uv.x, uv.y, 1.0, 1.0);
+    let diff = (far_h.xyz / far_h.w) - (near_h.xyz / near_h.w);
+    col = sky(normalize(diff));
+  } else {
+    // 命中：解包 meta
+    let pal = meta_w & 0xFFu;
+    let objm = (meta_w >> 8u) & 0xFFu;
+    let face = (meta_w >> 16u) & 7u;
+    let voxel = vec3<i32>(bitcast<i32>(g.x), bitcast<i32>(g.y), bitcast<i32>(g.z));
+    let obj_key = select(0u, objm + 1u, objm != GB_OBJM_WORLD);
+    let obj_i32 = select(-1, i32(objm), objm != GB_OBJM_WORLD);
+
+    // albedo + emissive（hit_mat 内联）
+    let mat = hit_mat(obj_i32, pal);
+    let light = fl_lookup(voxel, obj_key, face);
+    col = mat.albedo * light + mat.albedo * (mat.emissive * EMISSIVE_EMIT_GAIN);
+    col = col * light_u.g.exposure_pad.x;
+  }
+
+  col = aces_tonemap(col);
+  col = linear_to_srgb(col);
+  textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
+}

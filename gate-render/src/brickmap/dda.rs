@@ -80,9 +80,11 @@ impl DdaCameraConfig {
   }
 }
 
-/// 调试切换：法向向量可视化（main world Resource，按 N 键切换）
+/// 调试视图模式（main world Resource，按 N 键循环 0→1→2→0）：
+/// 0 = 正常画面；1 = 法向向量可视化；2 = G-buffer 状态图（sky=品红、face 6 色，
+/// v3.9.3 分割线定位用）
 #[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
-pub struct DebugNormals(pub bool);
+pub struct DebugNormals(pub u32);
 
 /// 相机约束常量（spec FR-3 clamp；pub 供 gate-app 输入 system 与测试断言）
 pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians(); // ±89° 防万向节锁（up 与 view 共线）
@@ -152,30 +154,41 @@ impl DdaCameraConfig {
   }
 }
 
-/// Render-world 着色器绑定的 camera uniform（ShaderType derive = 144B）
+/// Render-world 着色器绑定的 camera uniform（ShaderType derive = 192B）
+/// WGSL `DdaViewUniform` 逐字对齐（4 × mat4x4/vec4 = 4×16 = 64B）
 #[derive(Resource, Clone, Copy, ShaderType)]
 pub struct DdaViewUniform {
   pub inv_view_proj: Mat4,
   pub cam_pos_fine: Vec4, // w=1
   /// x = debug_mode（0 = 正常，1 = 法向向量可视化）；yzw reserved
   pub debug_mode: Vec4,
+  /// x = 逐面光照 epoch（u32 as f32，2^24 内精确）；yzw reserved
+  pub fl_epoch: Vec4,
 }
 
 impl DdaViewUniform {
-  pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32) -> Self {
+  pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, fl_epoch: u32) -> Self {
     Self {
       inv_view_proj: cfg.inv_view_proj,
       // 世界单位 = fine 单位（0.25cm）；DDA 着色器 dir 同样不缩放
       cam_pos_fine: cfg.position_world.extend(1.0),
-      debug_mode: Vec4::new(debug_mode as f32, 0.0, 0.0, 0.0),
+      debug_mode: Vec4::new(
+        (debug_mode == 1) as u32 as f32, // x = 法向可视化（WGSL debug_mode.x）
+        (debug_mode == 2) as u32 as f32, // y = G-buffer 状态图（WGSL debug_mode.y）
+        0.0,
+        0.0,
+      ),
+      fl_epoch: Vec4::new(fl_epoch as f32, 0.0, 0.0, 0.0),
     }
   }
 }
 
-/// DDA 着色器的输出纹理（main world 创建，提取进 render world）
+/// DDA 着色器的纹理（main world 创建，提取进 render world）
 #[derive(Resource, Clone, ExtractResource)]
 pub struct DdaImages {
   pub target: Handle<Image>,
+  /// G-buffer（rgba32uint：xyz 体素 + meta word；P3.5d）
+  pub gbuffer: Handle<Image>,
 }
 
 /// 工厂：DDA 目标纹理（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）
@@ -184,6 +197,15 @@ pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
     Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba8Unorm, None);
   image.asset_usage = RenderAssetUsages::RENDER_WORLD;
   image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+  images.add(image)
+}
+
+/// 工厂：G-buffer 纹理（rgba32uint VIEW_SIZE，STORAGE read_write；P3.5d）
+pub fn create_gbuffer_image(images: &mut Assets<Image>) -> Handle<Image> {
+  let mut image =
+    Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba32Uint, None);
+  image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+  image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING;
   images.add(image)
 }
 
@@ -1228,7 +1250,8 @@ use bevy::{
       RenderPassDescriptor, ShaderStages, StorageTextureAccess, TextureFormat, TextureSampleType,
       UniformBuffer, VertexState,
       binding_types::{
-        storage_buffer_read_only_sized, texture_2d, texture_storage_2d, uniform_buffer,
+        storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, texture_storage_2d,
+        uniform_buffer,
       },
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -1257,6 +1280,8 @@ struct DdaBg2BindGroup(BindGroup);
 #[derive(Resource)]
 struct DdaBg3BindGroup(BindGroup);
 #[derive(Resource)]
+struct DdaBg4BindGroup(BindGroup);
+#[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
 #[derive(Resource)]
@@ -1265,8 +1290,12 @@ struct DdaPipelines {
   bg1_layout: BindGroupLayoutDescriptor,
   bg2_layout: BindGroupLayoutDescriptor,
   bg3_layout: BindGroupLayoutDescriptor,
+  bg4_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
   compute_pipeline: CachedComputePipelineId,
+  fl_clear_pipeline: CachedComputePipelineId,
+  fl_light_pipeline: CachedComputePipelineId,
+  fl_composite_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
 }
 
@@ -1314,10 +1343,14 @@ fn extract_camera_config(
   mut commands: bevy::ecs::system::Commands,
   cfg: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DdaCameraConfig>>>,
   debug: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DebugNormals>>>,
+  fl_state: Option<
+    bevy::render::Extract<bevy::ecs::system::Res<super::face_light::FaceLightState>>,
+  >,
 ) {
   let Some(cfg) = cfg else { return };
-  let debug_mode = debug.map(|d| d.0 as u32).unwrap_or(0);
-  let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode);
+  let debug_mode = debug.map(|d| d.0).unwrap_or(0);
+  let epoch = fl_state.map(|s| s.epoch).unwrap_or(1);
+  let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, epoch);
   commands.insert_resource(uniform);
 }
 
@@ -1335,14 +1368,15 @@ fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
   pipeline_cache: Res<PipelineCache>,
-  _render_device: Res<RenderDevice>,
+  render_device: Res<RenderDevice>,
 ) {
-  // ---- BG0：out tex storage + DdaViewUniform uniform（Compute）----
+  // ---- BG0：gbuffer read_write + out tex write + DdaViewUniform uniform（P3.5d）----
   let bg0 = BindGroupLayoutDescriptor::new(
     "DdaBg0",
     &BindGroupLayoutEntries::sequential(
       ShaderStages::COMPUTE,
       (
+        texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
         texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
         uniform_buffer::<DdaViewUniform>(false),
       ),
@@ -1397,13 +1431,47 @@ fn init_dda_pipelines(
     ),
   );
 
-  // ---- Compute pipeline：dda.wgsl entry dda_main ----
+  // ---- BG4：逐面光照注册表（P3.5d；storage read_write）----
+  let bg4 = BindGroupLayoutDescriptor::new(
+    "DdaBg4",
+    &BindGroupLayoutEntries::single(ShaderStages::COMPUTE, storage_buffer_sized(false, None)),
+  );
+
+  // ---- Compute pipelines：dda.wgsl 四个 entry point（P3.5d 四段式管线）----
   let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
+  let layouts = vec![
+    bg0.clone(),
+    bg1.clone(),
+    bg2.clone(),
+    bg3.clone(),
+    bg4.clone(),
+  ];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
-    layout: vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone()],
-    shader: dda_shader,
+    layout: layouts.clone(),
+    shader: dda_shader.clone(),
     entry_point: Some(Cow::from("dda_main")),
+    ..default()
+  });
+  let fl_clear = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_fl_clear")),
+    layout: layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("fl_clear_main")),
+    ..default()
+  });
+  let fl_light = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_fl_light")),
+    layout: layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("fl_light_main")),
+    ..default()
+  });
+  let fl_composite = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_fl_composite")),
+    layout: layouts,
+    shader: dda_shader,
+    entry_point: Some(Cow::from("fl_composite_main")),
     ..default()
   });
 
@@ -1430,13 +1498,32 @@ fn init_dda_pipelines(
     ..default()
   });
 
+  // ---- BG4：逐面光照注册表（P3.5d；storage read_write）----
+  let bg4 = BindGroupLayoutDescriptor::new(
+    "DdaBg4",
+    &BindGroupLayoutEntries::single(ShaderStages::COMPUTE, storage_buffer_sized(false, None)),
+  );
+
+  // ---- GpuFaceLightTable：零初始化 buffer（status=0 → 首帧全部空槽）----
+  let fl_buf = render_device.create_buffer(&BufferDescriptor {
+    label: Some("gate_face_light_table"),
+    size: super::face_light::FL_BUF_SIZE,
+    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    mapped_at_creation: false,
+  });
+  commands.insert_resource(super::face_light::GpuFaceLightTable { buf: fl_buf });
+
   commands.insert_resource(DdaPipelines {
     bg0_layout: bg0,
     bg1_layout: bg1,
     bg2_layout: bg2,
     bg3_layout: bg3,
+    bg4_layout: bg4,
     blit_layout: blit,
     compute_pipeline: compute,
+    fl_clear_pipeline: fl_clear,
+    fl_light_pipeline: fl_light,
+    fl_composite_pipeline: fl_composite,
     blit_pipeline,
   });
 }
@@ -1451,6 +1538,7 @@ fn prepare_dda_bind_groups(
   gpu_brickmap: Option<Res<GpuBrickMap>>,
   gpu_mov: Option<Res<GpuMovPool>>,
   light_pool: Option<Res<LightPoolUniform>>,
+  fl_table: Option<Res<super::face_light::GpuFaceLightTable>>,
   render_device: Res<RenderDevice>,
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
@@ -1481,6 +1569,14 @@ fn prepare_dda_bind_groups(
     bevy::log::info_once!("DDA prepare: GpuImage not ready");
     return;
   };
+  let Some(gbuf_view) = gpu_images.get(&images.gbuffer) else {
+    bevy::log::info_once!("DDA prepare: G-buffer GpuImage not ready");
+    return;
+  };
+  let Some(fl) = fl_table else {
+    bevy::log::info_once!("DDA prepare: no GpuFaceLightTable");
+    return;
+  };
   bevy::log::info_once!("DDA prepare: ALL RESOURCES OK, proceeding");
 
   // ---- 写 DdaViewUniform 到 UniformBuffer ----
@@ -1496,13 +1592,14 @@ fn prepare_dda_bind_groups(
   let bg1_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg1_layout);
   let bg2_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg2_layout);
   let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
+  let bg4_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg4_layout);
   let blit_layout = pipeline_cache.get_bind_group_layout(&pipelines.blit_layout);
 
-  // ---- BG0：out tex + view uniform ----
+  // ---- BG0：gbuffer read_write + out tex write + view uniform（P3.5d）----
   let bg0 = render_device.create_bind_group(
     None,
     &bg0_layout,
-    &BindGroupEntries::sequential((&tex_view.texture_view, &u)),
+    &BindGroupEntries::sequential((&gbuf_view.texture_view, &tex_view.texture_view, &u)),
   );
 
   // ---- BG1：struct + leaves + palette + globals ----
@@ -1540,6 +1637,13 @@ fn prepare_dda_bind_groups(
   // ---- BG3：光源池 uniform ----
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp));
 
+  // ---- BG4：逐面光照注册表（P3.5d；storage read_write）----
+  let bg4 = render_device.create_bind_group(
+    None,
+    &bg4_layout,
+    &BindGroupEntries::single(fl.buf.as_entire_binding()),
+  );
+
   // ---- Blit BG：dda tex（和 gradient 相同的 texture_2d blit layout）----
   let blit_bg = render_device.create_bind_group(
     None,
@@ -1551,6 +1655,7 @@ fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBg1BindGroup(bg1));
   commands.insert_resource(DdaBg2BindGroup(bg2));
   commands.insert_resource(DdaBg3BindGroup(bg3));
+  commands.insert_resource(DdaBg4BindGroup(bg4));
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
@@ -1561,36 +1666,126 @@ fn dispatch_dda(
   bg1: Option<Res<DdaBg1BindGroup>>,
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
+  bg4: Option<Res<DdaBg4BindGroup>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
 ) {
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) =
-    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref())
-  else {
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
+    bg0.as_ref(),
+    bg1.as_ref(),
+    bg2.as_ref(),
+    bg3.as_ref(),
+    bg4.as_ref(),
+  ) else {
     bevy::log::debug_once!("DDA dispatch: bind groups missing");
     return;
   };
-  let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.compute_pipeline) else {
-    bevy::log::debug_once!("DDA dispatch: compute pipeline not ready");
-    return;
-  };
+
+  // 四段式管线 dispatch（P3.5d）：clear → dda → light → composite
   let recorder = ctx.diagnostic_recorder();
   let recorder = recorder.as_deref();
-  let span = recorder.time_span(ctx.command_encoder(), "gate_dda_compute");
-  let mut pass = ctx
-    .command_encoder()
-    .begin_compute_pass(&ComputePassDescriptor::default());
-  pass.set_pipeline(pipe);
-  pass.set_bind_group(0, &bg0.0, &[]);
-  pass.set_bind_group(1, &bg1.0, &[]);
-  pass.set_bind_group(2, &bg2.0, &[]);
-  pass.set_bind_group(3, &bg3.0, &[]);
-  let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
-  let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
-  pass.dispatch_workgroups(gx, gy, 1);
-  drop(pass);
-  span.end(ctx.command_encoder());
+
+  // ---- Pass 1: fl_clear_main（清注册表）----
+  let Some(clear_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_clear_pipeline) else {
+    bevy::log::debug_once!("DDA dispatch: fl_clear pipeline not ready");
+    return;
+  };
+  let span_clear = recorder.time_span(ctx.command_encoder(), "gate_fl_clear");
+  {
+    let mut pass = ctx
+      .command_encoder()
+      .begin_compute_pass(&ComputePassDescriptor {
+        label: Some("gate_fl_clear"),
+        ..default()
+      });
+    pass.set_pipeline(clear_pipe);
+    pass.set_bind_group(0, &bg0.0, &[]);
+    pass.set_bind_group(1, &bg1.0, &[]);
+    pass.set_bind_group(2, &bg2.0, &[]);
+    pass.set_bind_group(3, &bg3.0, &[]);
+    pass.set_bind_group(4, &bg4.0, &[]);
+    let slots = super::face_light::FL_REG_SLOTS;
+    let wg = slots.div_ceil(super::face_light::FL_WORKGROUP);
+    pass.dispatch_workgroups(wg, 1, 1);
+  }
+  span_clear.end(ctx.command_encoder());
+
+  // ---- Pass 2: dda_main（DDA trace + G-buffer + 面注册）----
+  let Some(dda_pipe) = pipeline_cache.get_compute_pipeline(pipelines.compute_pipeline) else {
+    bevy::log::debug_once!("DDA dispatch: dda pipeline not ready");
+    return;
+  };
+  let span_dda = recorder.time_span(ctx.command_encoder(), "gate_dda_compute");
+  {
+    let mut pass = ctx
+      .command_encoder()
+      .begin_compute_pass(&ComputePassDescriptor {
+        label: Some("gate_dda_trace"),
+        ..default()
+      });
+    pass.set_pipeline(dda_pipe);
+    pass.set_bind_group(0, &bg0.0, &[]);
+    pass.set_bind_group(1, &bg1.0, &[]);
+    pass.set_bind_group(2, &bg2.0, &[]);
+    pass.set_bind_group(3, &bg3.0, &[]);
+    pass.set_bind_group(4, &bg4.0, &[]);
+    let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
+    let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
+    pass.dispatch_workgroups(gx, gy, 1);
+  }
+  span_dda.end(ctx.command_encoder());
+
+  // ---- Pass 3: fl_light_main（逐面光照）----
+  let Some(light_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_light_pipeline) else {
+    bevy::log::debug_once!("DDA dispatch: fl_light pipeline not ready");
+    return;
+  };
+  let span_light = recorder.time_span(ctx.command_encoder(), "gate_fl_light");
+  {
+    let mut pass = ctx
+      .command_encoder()
+      .begin_compute_pass(&ComputePassDescriptor {
+        label: Some("gate_fl_light"),
+        ..default()
+      });
+    pass.set_pipeline(light_pipe);
+    pass.set_bind_group(0, &bg0.0, &[]);
+    pass.set_bind_group(1, &bg1.0, &[]);
+    pass.set_bind_group(2, &bg2.0, &[]);
+    pass.set_bind_group(3, &bg3.0, &[]);
+    pass.set_bind_group(4, &bg4.0, &[]);
+    let slots = super::face_light::FL_REG_SLOTS;
+    let wg = slots.div_ceil(super::face_light::FL_WORKGROUP);
+    pass.dispatch_workgroups(wg, 1, 1);
+  }
+  span_light.end(ctx.command_encoder());
+
+  // ---- Pass 4: fl_composite_main（合成）----
+  let Some(composite_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_composite_pipeline)
+  else {
+    bevy::log::debug_once!("DDA dispatch: fl_composite pipeline not ready");
+    return;
+  };
+  let span_comp = recorder.time_span(ctx.command_encoder(), "gate_fl_composite");
+  {
+    let mut pass = ctx
+      .command_encoder()
+      .begin_compute_pass(&ComputePassDescriptor {
+        label: Some("gate_fl_composite"),
+        ..default()
+      });
+    pass.set_pipeline(composite_pipe);
+    pass.set_bind_group(0, &bg0.0, &[]);
+    pass.set_bind_group(1, &bg1.0, &[]);
+    pass.set_bind_group(2, &bg2.0, &[]);
+    pass.set_bind_group(3, &bg3.0, &[]);
+    pass.set_bind_group(4, &bg4.0, &[]);
+    let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
+    let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
+    pass.dispatch_workgroups(gx, gy, 1);
+  }
+  span_comp.end(ctx.command_encoder());
 }
 
 // DDA blit 挂 Core2d PostProcess，Gradient blit 也挂在同一 set，

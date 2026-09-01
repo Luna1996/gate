@@ -22,12 +22,12 @@ use crate::brickmap::{MovHit, MovPoolPacked};
 
 /// Vec4 的 yzw 分量
 #[inline]
-fn yzw(v: Vec4) -> Vec3 {
+pub(crate) fn yzw(v: Vec4) -> Vec3 {
   Vec3::new(v.y, v.z, v.w)
 }
 /// Vec4 的 xyz 分量
 #[inline]
-fn xyz(v: Vec4) -> Vec3 {
+pub(crate) fn xyz(v: Vec4) -> Vec3 {
   Vec3::new(v.x, v.y, v.z)
 }
 
@@ -83,7 +83,7 @@ pub struct LightPoolUniform {
 // ============================================================================
 
 /// 方向光配置（主题资产）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DirLightCfg {
   /// 光传播方向（指向场景）；打包时翻转为 L（指向光）
   pub dir: [f32; 3],
@@ -98,14 +98,14 @@ fn default_angular_radius() -> f32 {
 }
 
 /// 天空颜色配置
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SkyCfg {
   pub top: [f32; 3],
   pub horizon: [f32; 3],
 }
 
 /// 光照主题（`assets/lighting/*.ron`）：方向光 + 环境 + 天空 + 曝光
-#[derive(Debug, Clone, Resource, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Resource, Deserialize)]
 pub struct LightingTheme {
   pub sun: Option<DirLightCfg>,
   pub ambient: [f32; 3],

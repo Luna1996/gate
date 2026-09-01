@@ -11,8 +11,9 @@ use bevy::{
 use glam::{Mat3, Vec3};
 
 use gate_render::{
-  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, MovObject, MovScene,
-  OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image, pack_mov_pool,
+  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, FaceLightState,
+  MovObject, MovScene, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
+  create_gbuffer_image, face_light_epoch_tick, pack_mov_pool,
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
@@ -106,11 +107,12 @@ fn main() {
       Update,
       (
         orbit_camera_input,
-        sync_anchor_camera.after(orbit_camera_input),
+        left_click_pick_recenter.after(orbit_camera_input),
         edit_tile_every_120_frames,
         demo_ui_setup,
         fps_line_feed,
         debug_normals_toggle,
+        face_light_epoch_tick,
       ),
     )
     .run();
@@ -118,6 +120,7 @@ fn main() {
 
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let dda_handle = create_dda_image(&mut images);
+  let gbuf_handle = create_gbuffer_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off));
   // ---- P3.1 光照主题：「暗色实验室」RON 加载（一次性静态配置，同步读足够；
   // 缺失/解析失败回退内置默认主题）----
@@ -132,7 +135,12 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     Default::default()
   });
   commands.insert_resource(theme);
-  commands.insert_resource(DdaImages { target: dda_handle });
+  commands.insert_resource(DdaImages {
+    target: dda_handle,
+    gbuffer: gbuf_handle,
+  });
+  // P3.5d：逐面光照 epoch 失效源
+  commands.insert_resource(FaceLightState::default());
   // P2.6：轨道相机为唯一相机状态源；DdaCameraConfig 由 from_orbit 生成
   // （极限场景：世界中心 2560,160,2560；eye 从 +X/+Z 45° 俯视距离 5200 fine 一览 10×10 大陆全境）
   let orbit = OrbitCamera::from_eye(
@@ -192,42 +200,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     packed: std::sync::Arc::new(pack_mov_pool(&chips)),
     version: 1,
   });
-  gate_ui::world_anchor_label(
-    &mut commands,
-    "P2.10 芯片·MOV",
-    Vec3::new(2416.0, 380.0, 2416.0),
-    Color::srgb_u8(68, 230, 220),
-  );
-
-  // ---- 世界空间 UI 标注（极限场景 4 个兴趣点） ----
-  // 天空堡金顶（正中央）
-  gate_ui::world_anchor_label(
-    &mut commands,
-    "天空堡·金顶",
-    Vec3::new(2560.0, 880.0, 2560.0),
-    Color::srgb_u8(248, 210, 72),
-  );
-  // 入口大标语
-  gate_ui::world_anchor_label(
-    &mut commands,
-    "入口大道 GATE ENGINE",
-    Vec3::new(512.0, 96.0, 256.0),
-    Color::srgb_u8(68, 230, 220),
-  );
-  // 西北角雪峰
-  gate_ui::world_anchor_label(
-    &mut commands,
-    "西北雪峰",
-    Vec3::new(480.0, 900.0, 480.0),
-    Color::srgb_u8(240, 244, 248),
-  );
-  // 水晶矿区
-  gate_ui::world_anchor_label(
-    &mut commands,
-    "青紫水晶矿区（L4 精细体素）",
-    Vec3::new(480.0, 80.0, 480.0),
-    Color::srgb_u8(200, 120, 240),
-  );
 }
 
 /// demo 调色板（PaletteEntry._pad 私有 → 跨 crate 用 default + 逐字段赋值）
@@ -719,11 +691,12 @@ fn build_chip_prefab() -> BrickMapBuffers {
 /// 轨道相机输入（P2.6 spec FR-3/FR-4）：
 /// - 右键拖拽 = 旋转（yaw -= dx·ROT_SPEED, pitch += dy·ROT_SPEED）
 /// - 中键拖拽 = 平移（right/up 正交基，PAN_PER_PX = distance·2tan(fov/2)/窗口物理高度，视觉 1:1）
-/// - 滚轮 = 乘法缩放（distance *= exp(-line·0.35)）
+/// - 滚轮 = 乘法缩放（distance *= exp(-line·0.35)）；按住 Shift 步进缩为 1/10（精细微调）
 /// - 拖拽类互斥（旋转 > 平移），滚轮可与拖拽共存
 /// - 末尾同帧重建 DdaCameraConfig（from_orbit 唯一矩阵构造点）→ ≤1 帧生效
 fn orbit_camera_input(
   mouse: Res<ButtonInput<MouseButton>>,
+  keys: Res<ButtonInput<KeyCode>>,
   motion: Res<AccumulatedMouseMotion>,
   scroll: Res<AccumulatedMouseScroll>,
   captured: Res<gate_ui::UiPointerCaptured>,
@@ -760,7 +733,13 @@ fn orbit_camera_input(
       MouseScrollUnit::Pixel => scroll.delta.y / 16.0,
     };
     if lines != 0.0 {
-      orbit.distance *= (-lines * ZOOM_LOG_SPEED).exp();
+      // Shift 细调：步进缩为 1/10（同距离变化所需滚轮行 ×10）
+      let zoom_speed = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        ZOOM_LOG_SPEED * 0.1
+      } else {
+        ZOOM_LOG_SPEED
+      };
+      orbit.distance *= (-lines * zoom_speed).exp();
       orbit.clamp();
     }
   }
@@ -781,13 +760,6 @@ fn orbit_camera_input(
   );
 }
 
-/// 世界空间 UI 相机镜像（gate-ui 不依赖 gate-render：通用资源传递投影矩阵）；
-/// after(orbit_camera_input) 保证同帧拿到刚重建的 cfg
-fn sync_anchor_camera(cfg: Res<DdaCameraConfig>, mut anchor_cam: ResMut<gate_ui::AnchorCamera>) {
-  anchor_cam.view_proj = cfg.view_proj;
-  anchor_cam.position_world = cfg.position_world;
-}
-
 /// 主窗口物理高度（pan_per_px 1:1 基准；无窗口时回退 VIEW_SIZE.y）
 fn window_height(windows: &Query<&Window>) -> f32 {
   windows
@@ -796,18 +768,94 @@ fn window_height(windows: &Query<&Window>) -> f32 {
     .unwrap_or(VIEW_SIZE.y as f32)
 }
 
+/// 左键点击：把旋转中心（OrbitCamera.target）搬到点击像素命中的体素位置。
+/// - 未命中任何体素 / MOV 物体 → 不做操作。
+/// - 命中点用射线入点 fine 坐标（命中面外侧向内偏半个 fine，避免 target 贴着面导致
+///   距离过近时 pitch clamp 抖动）。
+/// - UI 捕获指针（UI 控件上点击）时跳过，避免误触发。
+/// - CPU picking：用 `cpu_reference_trace_scene` 同步跑世界+MOV 两级 DDA，
+///   复用 DdaCameraConfig.inv_view_proj 反投影构造射线（origin=相机、dir=命中像素 far）。
+#[allow(clippy::too_many_arguments)] // 多资源 = 点击成本可接受
+fn left_click_pick_recenter(
+  mouse: Res<ButtonInput<MouseButton>>,
+  captured: Res<gate_ui::UiPointerCaptured>,
+  windows: Query<&Window>,
+  cfg: Res<DdaCameraConfig>,
+  scene: Option<Res<VoxelScene>>,
+  mov: Option<Res<MovScene>>,
+  mut orbit: ResMut<OrbitCamera>,
+) {
+  if !mouse.just_pressed(MouseButton::Left) {
+    return;
+  }
+  if captured.0 {
+    return; // UI 控件点击 → 吞掉
+  }
+  let (Some(scene), Some(mov)) = (scene, mov) else {
+    return;
+  };
+  let Ok(window) = windows.single() else {
+    return;
+  };
+  // ---- 1) 构造射线：cursor 逻辑像素 → 物理像素 → NDC → 反投影 ----
+  let Some(cursor) = window.cursor_position() else {
+    return; // 指针不在窗口
+  };
+  let sf = window.scale_factor() as f32;
+  let phys = cursor * sf; // 物理像素（左上原点，y 向下）
+  let pw = window.physical_width().max(1) as f32;
+  let ph = window.physical_height().max(1) as f32;
+  let u = (phys.x / pw) * 2.0 - 1.0; // [-1, 1]
+  let v = 1.0 - (phys.y / ph) * 2.0; // [-1, 1]，翻转 y（NDC +y 朝上）
+  let near = cfg.inv_view_proj * Vec4::new(u, v, 0.0, 1.0);
+  let far = cfg.inv_view_proj * Vec4::new(u, v, 1.0, 1.0);
+  let near = near.truncate() / near.w;
+  let far = far.truncate() / far.w;
+  let delta = far - near;
+  let dir = delta.normalize_or_zero();
+  if dir.length_squared() < 1e-20 {
+    return;
+  }
+  let t_max = (CAM_FAR - CAM_NEAR).max(delta.length());
+  // ---- 2) CPU picking：从 VoxelScene.grid 同步构建 brickmap + trace
+  // 点击低频（用户输入），且极限场景 ~300 tile 单次 build_full <150ms；
+  // 故意不做跨帧缓存——编辑（每 120 帧 tile 改写）会让缓存与实际渲染画面
+  // 不匹配，造成"点到空气也 recenter"的错觉。宁可点击时重建也不提供假命中。
+  let world_bufs = BrickMapBuilder::build_full(&scene.grid).buffers().clone();
+  // ---- 3) trace_scene：世界 + MOV 统一求最近 ----
+  if let Some(hit) =
+    gate_render::cpu_reference_trace_scene(&world_bufs, &mov.packed, cfg.position_world, dir, t_max)
+  {
+    // 命中点 = origin + t·dir；再朝命中法线方向推半个 fine（让 target 落在体素内部）。
+    let mut p = cfg.position_world + dir * hit.t;
+    let half = 0.5;
+    p += hit.normal * half; // 法线朝射线来向 → *+half 把点推进命中体素内 0.5 fine
+    orbit.target = p;
+    bevy::log::info!(
+      "PICK → target=({:.1},{:.1},{:.1})  t={:.1}  pal={}  obj={}",
+      p.x,
+      p.y,
+      p.z,
+      hit.t,
+      hit.pal,
+      hit.obj,
+    );
+    // 注：DdaCameraConfig 由 orbit_camera_input 同帧末尾重建（本系统在其之后），
+    // 因此新 target 下帧生效，避免 Update 中段重复 cfg 构造。
+  }
+}
+
 /// 按 N 切换法向向量可视化调试
 fn debug_normals_toggle(keys: Res<ButtonInput<KeyCode>>, mut dbg_res: ResMut<DebugNormals>) {
   if keys.just_pressed(KeyCode::KeyN) {
-    dbg_res.0 = !dbg_res.0;
-    bevy::log::info!(
-      "DebugNormals: {}",
-      if dbg_res.0 {
-        "ON (法向向量)"
-      } else {
-        "OFF (正常)"
-      }
-    );
+    // 三态循环：0 = 正常 → 1 = 法向向量 → 2 = G-buffer 状态图（sky=品红、face 6 色）
+    dbg_res.0 = (dbg_res.0 + 1) % 3;
+    let label = match dbg_res.0 {
+      1 => "ON (法向向量)",
+      2 => "ON (G-buffer 状态图：sky=品红 / face 6 色)",
+      _ => "OFF (正常)",
+    };
+    bevy::log::info!("DebugNormals: mode {} — {label}", dbg_res.0);
   }
 }
 
