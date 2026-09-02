@@ -8,11 +8,11 @@ pub use brickmap::{
   BindingLimits, BrickMapBuffers, BrickMapBuilder, BrickMapGlobals, BrickMapUploadPlugin,
   BrickMapView, BufferLayout, BuilderMirror, DdaCameraConfig, DdaImages, DdaViewUniform,
   DebugNormals, DirtyRanges, FL_BUF_SIZE, FaceLightState, GpuBrickMap, GpuFaceLightTable,
-  GpuMovPool, MovDesc, MovGlobals, MovHit, MovObject, MovPlugin, MovPoolPacked, MovScene,
-  OBJ_WORLD, OrbitCamera, TileUpdate, UploadBudget, UploadCpuSample, UploadCpuSampleChannel,
+  GpuObjPool, OBJ_WORLD, ObjDesc, ObjGlobals, ObjHit, ObjObject, ObjPlugin, ObjPoolPacked,
+  ObjScene, OrbitCamera, TileUpdate, UploadBudget, UploadCpuSample, UploadCpuSampleChannel,
   UploadSnapshot, VoxelScene, cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray,
   cpu_reference_dda_ray_aabb_skip, cpu_reference_object_ray, cpu_reference_trace_scene,
-  create_dda_image, create_gbuffer_image, face_light_epoch_tick, pack_mov_pool,
+  create_dda_image, create_gbuffer_image, face_light_epoch_tick, pack_obj_pool,
 };
 pub use brickmap::{RenderScale, VIEW_SIZE};
 pub use lighting::{
@@ -29,7 +29,7 @@ impl Plugin for GateRenderPlugin {
     app.add_plugins((
       BrickMapUploadPlugin,
       brickmap::dda::BrickMapDdaPlugin,
-      brickmap::mov::MovPlugin,
+      brickmap::obj::ObjPlugin,
     ));
   }
 }

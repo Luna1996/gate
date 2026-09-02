@@ -173,9 +173,9 @@ impl DdaViewUniform {
       // 世界单位 = fine 单位（0.25cm）；DDA 着色器 dir 同样不缩放
       cam_pos_fine: cfg.position_world.extend(1.0),
       debug_mode: Vec4::new(
-        (debug_mode == 1) as u32 as f32, // x = 法向可视化（WGSL debug_mode.x）
-        (debug_mode == 2) as u32 as f32, // y = G-buffer 状态图（WGSL debug_mode.y）
-        0.0,
+        (debug_mode == 1) as u32 as f32, // x = 法向可视化
+        (debug_mode == 2) as u32 as f32, // y = axis 诊断（fine_scan 原始 axis）
+        (debug_mode == 3) as u32 as f32, // z = fc 坐标诊断（命中的 fine cell 坐标 RGB）
         0.0,
       ),
       fl_epoch: Vec4::new(fl_epoch as f32, 0.0, 0.0, 0.0),
@@ -1262,7 +1262,8 @@ use bevy::{
 
 use std::borrow::Cow;
 
-use super::mov::GpuMovPool;
+use super::face_light::FL_REG_SLOTS;
+use super::obj::GpuObjPool;
 use super::upload::GpuBrickMap;
 use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
 
@@ -1285,6 +1286,7 @@ struct DdaBg4BindGroup(BindGroup);
 struct DdaBlitBindGroup(BindGroup);
 
 #[derive(Resource)]
+#[allow(dead_code)]
 struct DdaPipelines {
   bg0_layout: BindGroupLayoutDescriptor,
   bg1_layout: BindGroupLayoutDescriptor,
@@ -1293,6 +1295,10 @@ struct DdaPipelines {
   bg4_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
   compute_pipeline: CachedComputePipelineId,
+  // P3.5d 逐面光照管线：因 WGSL relaxed memory ordering 跨 workgroup CAS race
+  // 暂时绕过，dda_main 直接 per-pixel shade_hit + best_n 面法向（面内零渐变）。
+  // 后续恢复需改为 sort-based 注册（dda_main 写 flat array → sort → compact
+  // 去重 → 逐体素算光照），每个 pass boundary 提供 WGSL 缺失的跨 workgroup barrier。
   fl_clear_pipeline: CachedComputePipelineId,
   fl_light_pipeline: CachedComputePipelineId,
   fl_composite_pipeline: CachedComputePipelineId,
@@ -1325,7 +1331,7 @@ impl Plugin for BrickMapDdaPlugin {
         prepare_dda_bind_groups
           .in_set(RenderSystems::PrepareBindGroups)
           // 同帧先用新 pool 重建 BG2 再绑 DDA（版本不匹配时差一帧也可接受，但同帧更稳）
-          .after(super::mov::prepare_mov_pool),
+          .after(super::obj::prepare_obj_pool),
       )
       // 必须挂 RenderGraph::Render set（而非 Render schedule）：Render schedule 整体在
       // RenderGraph 之前 → begin_diagnostics_frame（Begin set）前执行，诊断 span 会被清空
@@ -1398,17 +1404,17 @@ fn init_dda_pipelines(
     ),
   );
 
-  // ---- BG2：MOV object pool（mov_struct/mov_leaves/mov_palette/descs 四 storage + count uniform）----
+  // ---- BG2：OBJ object pool（obj_struct/obj_leaves/obj_palette/descs 四 storage + count uniform）----
   let bg2 = BindGroupLayoutDescriptor::new(
     "DdaBg2",
     &BindGroupLayoutEntries::sequential(
       ShaderStages::COMPUTE,
       (
-        storage_buffer_read_only_sized(false, None), // @binding(0) mov_struct
-        storage_buffer_read_only_sized(false, None), // @binding(1) mov_leaves
-        storage_buffer_read_only_sized(false, None), // @binding(2) mov_palette
-        storage_buffer_read_only_sized(false, None), // @binding(3) mov_descs
-        uniform_buffer::<super::mov::MovGlobals>(false), // @binding(4) count
+        storage_buffer_read_only_sized(false, None), // @binding(0) obj_struct
+        storage_buffer_read_only_sized(false, None), // @binding(1) obj_leaves
+        storage_buffer_read_only_sized(false, None), // @binding(2) obj_palette
+        storage_buffer_read_only_sized(false, None), // @binding(3) obj_descs
+        uniform_buffer::<super::obj::ObjGlobals>(false), // @binding(4) count
       ),
     ),
   );
@@ -1536,7 +1542,7 @@ fn prepare_dda_bind_groups(
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
-  gpu_mov: Option<Res<GpuMovPool>>,
+  gpu_obj: Option<Res<GpuObjPool>>,
   light_pool: Option<Res<LightPoolUniform>>,
   fl_table: Option<Res<super::face_light::GpuFaceLightTable>>,
   render_device: Res<RenderDevice>,
@@ -1557,8 +1563,8 @@ fn prepare_dda_bind_groups(
     bevy::log::info_once!("DDA prepare: no GpuBrickMap");
     return;
   };
-  let Some(mov) = gpu_mov else {
-    bevy::log::info_once!("DDA prepare: no GpuMovPool");
+  let Some(obj) = gpu_obj else {
+    bevy::log::info_once!("DDA prepare: no GpuObjPool");
     return;
   };
   let Some(light_pool) = light_pool else {
@@ -1618,19 +1624,19 @@ fn prepare_dda_bind_groups(
     )),
   );
 
-  // ---- BG2：MOV pool（四 storage + count uniform）----
-  let mov_globals_bind = mov.globals.binding().expect(
-    "GpuMovPool.globals uniform buffer 未初始化（RenderStartup init_empty_mov_pool 应默认构造）",
+  // ---- BG2：OBJ pool（四 storage + count uniform）----
+  let obj_globals_bind = obj.globals.binding().expect(
+    "GpuObjPool.globals uniform buffer 未初始化（RenderStartup init_empty_obj_pool 应默认构造）",
   );
   let bg2 = render_device.create_bind_group(
     None,
     &bg2_layout,
     &BindGroupEntries::sequential((
-      mov.struct_buf.as_entire_binding(),
-      mov.leaves.as_entire_binding(),
-      mov.palette.as_entire_binding(),
-      mov.descs.as_entire_binding(),
-      mov_globals_bind,
+      obj.struct_buf.as_entire_binding(),
+      obj.leaves.as_entire_binding(),
+      obj.palette.as_entire_binding(),
+      obj.descs.as_entire_binding(),
+      obj_globals_bind,
     )),
   );
 
@@ -1682,11 +1688,19 @@ fn dispatch_dda(
     return;
   };
 
-  // 四段式管线 dispatch（P3.5d）：clear → dda → light → composite
+  // P3.5d 4-pass hashmap 管线（2026-09-02 race 修复后启用）：
+  //   fl_clear → dda_main（写 G-buffer + fl_register）→ fl_light（逐面算）→ fl_composite
+  // race 已修复：fl_register 用 packed status+hash 单原子 CAS，同 voxel 同面像素聚合到
+  // 同 slot，消除跨 workgroup 多 atomicStore 撕裂窗口。
+
   let recorder = ctx.diagnostic_recorder();
   let recorder = recorder.as_deref();
 
-  // ---- Pass 1: fl_clear_main（清注册表）----
+  let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
+  let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
+  let fl_wg = FL_REG_SLOTS.div_ceil(64);
+
+  // ---- Pass 1: fl_clear_main（清 hashmap status + key + mask；epoch/light 保留）----
   let Some(clear_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_clear_pipeline) else {
     bevy::log::debug_once!("DDA dispatch: fl_clear pipeline not ready");
     return;
@@ -1705,13 +1719,11 @@ fn dispatch_dda(
     pass.set_bind_group(2, &bg2.0, &[]);
     pass.set_bind_group(3, &bg3.0, &[]);
     pass.set_bind_group(4, &bg4.0, &[]);
-    let slots = super::face_light::FL_REG_SLOTS;
-    let wg = slots.div_ceil(super::face_light::FL_WORKGROUP);
-    pass.dispatch_workgroups(wg, 1, 1);
+    pass.dispatch_workgroups(fl_wg, 1, 1);
   }
   span_clear.end(ctx.command_encoder());
 
-  // ---- Pass 2: dda_main（DDA trace + G-buffer + 面注册）----
+  // ---- Pass 2: dda_main（DDA trace + G-buffer 写 + fl_register 可见面注册）----
   let Some(dda_pipe) = pipeline_cache.get_compute_pipeline(pipelines.compute_pipeline) else {
     bevy::log::debug_once!("DDA dispatch: dda pipeline not ready");
     return;
@@ -1730,13 +1742,11 @@ fn dispatch_dda(
     pass.set_bind_group(2, &bg2.0, &[]);
     pass.set_bind_group(3, &bg3.0, &[]);
     pass.set_bind_group(4, &bg4.0, &[]);
-    let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
-    let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
     pass.dispatch_workgroups(gx, gy, 1);
   }
   span_dda.end(ctx.command_encoder());
 
-  // ---- Pass 3: fl_light_main（逐面光照）----
+  // ---- Pass 3: fl_light_main（逐注册体素逐面算光照；本帧注册 epoch=INVALID 恒重算）----
   let Some(light_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_light_pipeline) else {
     bevy::log::debug_once!("DDA dispatch: fl_light pipeline not ready");
     return;
@@ -1755,19 +1765,17 @@ fn dispatch_dda(
     pass.set_bind_group(2, &bg2.0, &[]);
     pass.set_bind_group(3, &bg3.0, &[]);
     pass.set_bind_group(4, &bg4.0, &[]);
-    let slots = super::face_light::FL_REG_SLOTS;
-    let wg = slots.div_ceil(super::face_light::FL_WORKGROUP);
-    pass.dispatch_workgroups(wg, 1, 1);
+    pass.dispatch_workgroups(fl_wg, 1, 1);
   }
   span_light.end(ctx.command_encoder());
 
-  // ---- Pass 4: fl_composite_main（合成）----
+  // ---- Pass 4: fl_composite_main（G-buffer + 面光照 → ACES → sRGB → out_tex）----
   let Some(composite_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_composite_pipeline)
   else {
     bevy::log::debug_once!("DDA dispatch: fl_composite pipeline not ready");
     return;
   };
-  let span_comp = recorder.time_span(ctx.command_encoder(), "gate_fl_composite");
+  let span_composite = recorder.time_span(ctx.command_encoder(), "gate_fl_composite");
   {
     let mut pass = ctx
       .command_encoder()
@@ -1781,11 +1789,9 @@ fn dispatch_dda(
     pass.set_bind_group(2, &bg2.0, &[]);
     pass.set_bind_group(3, &bg3.0, &[]);
     pass.set_bind_group(4, &bg4.0, &[]);
-    let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
-    let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
     pass.dispatch_workgroups(gx, gy, 1);
   }
-  span_comp.end(ctx.command_encoder());
+  span_composite.end(ctx.command_encoder());
 }
 
 // DDA blit 挂 Core2d PostProcess，Gradient blit 也挂在同一 set，

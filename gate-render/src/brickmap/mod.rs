@@ -8,7 +8,7 @@
 mod builder;
 pub mod dda;
 pub mod face_light;
-pub mod mov;
+pub mod obj;
 pub mod upload;
 mod view;
 pub mod wire;
@@ -20,10 +20,10 @@ pub use dda::{
   cpu_reference_dda_ray_two_level, create_dda_image, create_gbuffer_image,
 };
 pub use face_light::{FL_BUF_SIZE, FaceLightState, GpuFaceLightTable, face_light_epoch_tick};
-pub use mov::{
-  GpuMovPool, MovDesc, MovGlobals, MovHit, MovObject, MovPlugin, MovPoolPacked, MovScene,
-  OBJ_WORLD, cpu_reference_object_ray, cpu_reference_scene_occluded, cpu_reference_trace_scene,
-  pack_mov_pool, world_aabb,
+pub use obj::{
+  GpuObjPool, OBJ_WORLD, ObjDesc, ObjGlobals, ObjHit, ObjObject, ObjPlugin, ObjPoolPacked,
+  ObjScene, cpu_reference_object_ray, cpu_reference_scene_occluded, cpu_reference_trace_scene,
+  pack_obj_pool, world_aabb,
 };
 pub use upload::{
   BindingLimits, BrickMapUploadPlugin, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,

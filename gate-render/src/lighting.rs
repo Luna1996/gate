@@ -16,9 +16,9 @@ use glam::{Vec3, Vec4};
 use serde::Deserialize;
 
 use crate::brickmap::cpu_reference_scene_occluded;
-use crate::brickmap::mov::OBJ_WORLD;
+use crate::brickmap::obj::OBJ_WORLD;
 use crate::brickmap::wire::BrickMapBuffers;
-use crate::brickmap::{MovHit, MovPoolPacked};
+use crate::brickmap::{ObjHit, ObjPoolPacked};
 
 /// Vec4 的 yzw 分量
 #[inline]
@@ -181,7 +181,7 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
 
 /// 命中点材质（palette 两 words 解包）：
 /// albedo（u8 → /255）+ roughness（w0>>24）+ emissive（w1 低 8bit）
-fn hit_mat(world: &BrickMapBuffers, pool: &MovPoolPacked, hit: &MovHit) -> (Vec3, f32, f32) {
+fn hit_mat(world: &BrickMapBuffers, pool: &ObjPoolPacked, hit: &ObjHit) -> (Vec3, f32, f32) {
   let (w0, w1) = if hit.obj == OBJ_WORLD {
     (
       world.b_palette[hit.pal as usize * 2],
@@ -190,8 +190,8 @@ fn hit_mat(world: &BrickMapBuffers, pool: &MovPoolPacked, hit: &MovHit) -> (Vec3
   } else {
     let base = pool.descs[hit.obj as usize].palette_base as usize;
     (
-      pool.mov_palette[base + hit.pal as usize * 2],
-      pool.mov_palette[base + hit.pal as usize * 2 + 1],
+      pool.obj_palette[base + hit.pal as usize * 2],
+      pool.obj_palette[base + hit.pal as usize * 2 + 1],
     )
   };
   let albedo = Vec3::new(
@@ -236,11 +236,11 @@ pub fn cpu_reference_sky(dir: Vec3, pool: &LightPoolUniform) -> Vec3 {
 /// 无点光源、无 Phong 高光、无软阴影锥采样。
 pub fn cpu_reference_shade_hit(
   world: &BrickMapBuffers,
-  pool: &MovPoolPacked,
+  pool: &ObjPoolPacked,
   light_pool: &LightPoolUniform,
   origin: Vec3,
   dir: Vec3,
-  hit: MovHit,
+  hit: ObjHit,
   _shadow_t_max: f32,
 ) -> Vec3 {
   let p = origin + dir * hit.t;
@@ -287,7 +287,7 @@ pub fn cpu_reference_shade_hit(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::brickmap::{BrickMapBuilder, MovObject, cpu_reference_trace_scene, pack_mov_pool};
+  use crate::brickmap::{BrickMapBuilder, ObjObject, cpu_reference_trace_scene, pack_obj_pool};
   use gate_voxel::{TileGrid, fill_box};
   use glam::{IVec3, Mat3};
 
@@ -348,7 +348,7 @@ mod tests {
       sky: None,
     };
     let lp = build_light_pool(&theme);
-    let pool = MovPoolPacked::default();
+    let pool = ObjPoolPacked::default();
 
     // 顶面命中：N·L = 1，vis = 1（无遮挡）
     let hit = cpu_reference_trace_scene(
@@ -397,9 +397,9 @@ mod tests {
     assert!((rgb.x - ALBEDO * 0.1).abs() < 1e-4, "底面 rgb={rgb:?}");
   }
 
-  /// MOV 物体遮挡太阳：地面命中点在物体正下方 → vis=0 → 仅环境项
+  /// OBJ 物体遮挡太阳：地面命中点在物体正下方 → vis=0 → 仅环境项
   #[test]
-  fn mov_object_casts_shadow_on_ground() {
+  fn obj_object_casts_shadow_on_ground() {
     let world = world_box(512, 3);
     let theme = LightingTheme {
       sun: Some(DirLightCfg {
@@ -415,15 +415,15 @@ mod tests {
     let lp = build_light_pool(&theme);
 
     let obj_bufs = world_box(512, 5);
-    let pool_with = pack_mov_pool(&[MovObject {
+    let pool_with = pack_obj_pool(&[ObjObject {
       buffers: &obj_bufs,
       pos: Vec3::new(240.0, 592.0, 240.0),
       rot: Mat3::IDENTITY,
       scale: 1.0,
     }]);
-    let pool_empty = MovPoolPacked::default();
+    let pool_empty = ObjPoolPacked::default();
 
-    let hit = MovHit {
+    let hit = ObjHit {
       t: 384.0,
       pal: 3,
       obj: OBJ_WORLD,
@@ -459,7 +459,7 @@ mod tests {
       sky: None,
     };
     let lp = build_light_pool(&theme);
-    let pool = MovPoolPacked::default();
+    let pool = ObjPoolPacked::default();
 
     let hit = cpu_reference_trace_scene(
       &world,

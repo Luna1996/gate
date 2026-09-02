@@ -17,7 +17,7 @@
 
 use gate_render::brickmap::dda::cpu_reference_dda_ray_two_level;
 use gate_render::brickmap::wire::NODE_STREAM_BASE;
-use gate_render::{BrickMapBuilder, DirtyRanges, MovObject, TileUpdate, cpu_reference_trace_scene};
+use gate_render::{BrickMapBuilder, DirtyRanges, ObjObject, TileUpdate, cpu_reference_trace_scene};
 use gate_voxel::{TileGrid, fill_box};
 use glam::{IVec3, Mat3, Vec3};
 use std::time::Instant;
@@ -388,11 +388,11 @@ fn vram_layout_budget_2gb() {
 }
 
 // ============================================================================
-// P2.9e：MOV 多网格（P2.10 trace_scene）CPU 代理预算——同屏 16 物体
+// P2.9e：OBJ 多网格（P2.10 trace_scene）CPU 代理预算——同屏 16 物体
 // ============================================================================
 
 #[test]
-fn mov_16_objects_trace_scene_budget() {
+fn obj_16_objects_trace_scene_budget() {
   use gate_render::OBJ_WORLD;
 
   // 世界：8 满铺 tile 地面（顶面 y=512）
@@ -410,23 +410,23 @@ fn mov_16_objects_trace_scene_budget() {
       .expect("L0 板占用祖先存在，写入应生效");
   }
   let chip_bufs = BrickMapBuilder::build_full(&chip).buffers().clone();
-  let objs: Vec<MovObject> = (0..16)
-    .map(|i| MovObject {
+  let objs: Vec<ObjObject> = (0..16)
+    .map(|i| ObjObject {
       buffers: &chip_bufs,
       pos: Vec3::new(i as f32 * 512.0, 512.0, 512.0),
       rot: Mat3::from_rotation_y((i as f32 * 0.4).sin() * 0.6),
       scale: 1.0 + (i % 4) as f32,
     })
     .collect();
-  let pool = gate_render::pack_mov_pool(&objs);
+  let pool = gate_render::pack_obj_pool(&objs);
 
   // pool 体量留档：v1 每物体 = bitmap 1024w + dirs 32768w + node stream
-  let per_obj_kb = pool.mov_struct.len() as f64 * 4.0 / 1024.0 / objs.len() as f64;
+  let per_obj_kb = pool.obj_struct.len() as f64 * 4.0 / 1024.0 / objs.len() as f64;
   println!(
     "[P2.9e] 16 物体 pool: struct={:.1}KB/obj leaves={}w palette={}w descs={}×128B",
     per_obj_kb,
-    pool.mov_leaves.len(),
-    pool.mov_palette.len(),
+    pool.obj_leaves.len(),
+    pool.obj_palette.len(),
     pool.descs.len()
   );
   assert_eq!(pool.descs.len(), 16);

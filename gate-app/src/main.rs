@@ -12,8 +12,8 @@ use glam::{Mat3, Vec3};
 
 use gate_render::{
   BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, FaceLightState,
-  MovObject, MovScene, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
-  create_gbuffer_image, face_light_epoch_tick, pack_mov_pool,
+  ObjObject, ObjScene, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
+  create_gbuffer_image, face_light_epoch_tick, pack_obj_pool,
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
@@ -162,6 +162,29 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   paint_demo_palette(&mut grid);
   build_demo_scene(&mut grid);
 
+  // 诊断：打印 brickmap globals
+  {
+    let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
+    let g = &bufs.globals;
+    let n_tiles = grid.tile_coords().count();
+    bevy::log::info!(
+      "BRICKMAP DIAG: tiles={} origin=({},{},{}) dims=({},{},{})  AABB=[{},{},{}]-[{},{},{}]",
+      n_tiles,
+      g.index_origin_x,
+      g.index_origin_y,
+      g.index_origin_z,
+      g.index_dims_x,
+      g.index_dims_y,
+      g.index_dims_z,
+      g.index_origin_x * 512,
+      g.index_origin_y * 512,
+      g.index_origin_z * 512,
+      (g.index_origin_x + g.index_dims_x as i32) * 512,
+      (g.index_origin_y + g.index_dims_y as i32) * 512,
+      (g.index_origin_z + g.index_dims_z as i32) * 512,
+    );
+  }
+
   commands.insert_resource(VoxelScene {
     grid,
     demo_force_full_rebuild: true,
@@ -171,33 +194,33 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     incremental: true,
   });
 
-  // ---- P2.10 MOV 硬编码验收场景：芯片预制件 ×3（遮挡/贴地/交叠/旋转/缩放）----
+  // ---- P2.10 OBJ 硬编码验收场景：芯片预制件 ×3（遮挡/贴地/交叠/旋转/缩放）----
   let chip = build_chip_prefab();
   let chips = [
     // A 贴地：城堡平台顶面（y=272）上，identity / scale 1
-    MovObject {
+    ObjObject {
       buffers: &chip,
       pos: Vec3::new(2352.0, 272.0, 2352.0),
       rot: Mat3::IDENTITY,
       scale: 1.0,
     },
     // B 交叠：嵌入北城墙（z 2048..2056）——突出部遮挡墙 / 嵌入部被墙遮挡
-    MovObject {
+    ObjObject {
       buffers: &chip,
       pos: Vec3::new(2600.0, 260.0, 1980.0),
       rot: Mat3::IDENTITY,
       scale: 1.0,
     },
     // C 旋转 + 缩放：地面 yaw30° / scale 2，压中央大道
-    MovObject {
+    ObjObject {
       buffers: &chip,
       pos: Vec3::new(1600.0, 16.0, 2600.0),
       rot: Mat3::from_rotation_y(30.0_f32.to_radians()),
       scale: 2.0,
     },
   ];
-  commands.insert_resource(MovScene {
-    packed: std::sync::Arc::new(pack_mov_pool(&chips)),
+  commands.insert_resource(ObjScene {
+    packed: std::sync::Arc::new(pack_obj_pool(&chips)),
     version: 1,
   });
 }
@@ -613,7 +636,7 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
   grid.set_comp(t0, 1, 0x3344);
 }
 
-// ================= P2.10 MOV 硬编码芯片预制件 =================
+// ================= P2.10 OBJ 硬编码芯片预制件 =================
 //
 // 电子学级小网格（128×32×128 fine，独立 1-tile TileGrid，全链复用
 // TileGrid/BrickMapBuilder）。含 L0 PCB / 引脚 / die + L4 走线（1-fine
@@ -769,11 +792,11 @@ fn window_height(windows: &Query<&Window>) -> f32 {
 }
 
 /// 左键点击：把旋转中心（OrbitCamera.target）搬到点击像素命中的体素位置。
-/// - 未命中任何体素 / MOV 物体 → 不做操作。
+/// - 未命中任何体素 / OBJ 物体 → 不做操作。
 /// - 命中点用射线入点 fine 坐标（命中面外侧向内偏半个 fine，避免 target 贴着面导致
 ///   距离过近时 pitch clamp 抖动）。
 /// - UI 捕获指针（UI 控件上点击）时跳过，避免误触发。
-/// - CPU picking：用 `cpu_reference_trace_scene` 同步跑世界+MOV 两级 DDA，
+/// - CPU picking：用 `cpu_reference_trace_scene` 同步跑世界+OBJ 两级 DDA，
 ///   复用 DdaCameraConfig.inv_view_proj 反投影构造射线（origin=相机、dir=命中像素 far）。
 #[allow(clippy::too_many_arguments)] // 多资源 = 点击成本可接受
 fn left_click_pick_recenter(
@@ -782,7 +805,7 @@ fn left_click_pick_recenter(
   windows: Query<&Window>,
   cfg: Res<DdaCameraConfig>,
   scene: Option<Res<VoxelScene>>,
-  mov: Option<Res<MovScene>>,
+  obj: Option<Res<ObjScene>>,
   mut orbit: ResMut<OrbitCamera>,
 ) {
   if !mouse.just_pressed(MouseButton::Left) {
@@ -791,7 +814,7 @@ fn left_click_pick_recenter(
   if captured.0 {
     return; // UI 控件点击 → 吞掉
   }
-  let (Some(scene), Some(mov)) = (scene, mov) else {
+  let (Some(scene), Some(obj)) = (scene, obj) else {
     return;
   };
   let Ok(window) = windows.single() else {
@@ -822,9 +845,9 @@ fn left_click_pick_recenter(
   // 故意不做跨帧缓存——编辑（每 120 帧 tile 改写）会让缓存与实际渲染画面
   // 不匹配，造成"点到空气也 recenter"的错觉。宁可点击时重建也不提供假命中。
   let world_bufs = BrickMapBuilder::build_full(&scene.grid).buffers().clone();
-  // ---- 3) trace_scene：世界 + MOV 统一求最近 ----
+  // ---- 3) trace_scene：世界 + OBJ 统一求最近 ----
   if let Some(hit) =
-    gate_render::cpu_reference_trace_scene(&world_bufs, &mov.packed, cfg.position_world, dir, t_max)
+    gate_render::cpu_reference_trace_scene(&world_bufs, &obj.packed, cfg.position_world, dir, t_max)
   {
     // 命中点 = origin + t·dir；再朝命中法线方向推半个 fine（让 target 落在体素内部）。
     let mut p = cfg.position_world + dir * hit.t;
@@ -848,11 +871,11 @@ fn left_click_pick_recenter(
 /// 按 N 切换法向向量可视化调试
 fn debug_normals_toggle(keys: Res<ButtonInput<KeyCode>>, mut dbg_res: ResMut<DebugNormals>) {
   if keys.just_pressed(KeyCode::KeyN) {
-    // 三态循环：0 = 正常 → 1 = 法向向量 → 2 = G-buffer 状态图（sky=品红、face 6 色）
+    // 三态循环：0 = 正常 → 1 = 法向向量 → 2 = face 6 色
     dbg_res.0 = (dbg_res.0 + 1) % 3;
     let label = match dbg_res.0 {
       1 => "ON (法向向量)",
-      2 => "ON (G-buffer 状态图：sky=品红 / face 6 色)",
+      2 => "ON (face 6 色)",
       _ => "OFF (正常)",
     };
     bevy::log::info!("DebugNormals: mode {} — {label}", dbg_res.0);

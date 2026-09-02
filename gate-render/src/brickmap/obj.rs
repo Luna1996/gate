@@ -1,4 +1,4 @@
-//! P2.10 MOV-1：动态体素对象（多网格渲染 + `trace_scene()` 抽象）
+//! P2.10 OBJ-1：动态体素对象（多网格渲染 + `trace_scene()` 抽象）
 //!
 //! 物体 = 独立小 brickmap（`TileGrid`/`BrickMapBuilder` 全链复用，v1 限 1 tile）+
 //! object-pool storage buffer + descriptor 表（位置 / mat3 旋转 / 缩放 / 网格基址 /
@@ -6,12 +6,12 @@
 //! 取最近命中，统一 `trace_scene()` 入口（P3 阴影射线 / P9 GI 天生感知物体网格）。
 //!
 //! pool 布局（CPU 打包，shader 零重映射）：
-//! - `mov_struct`：逐对象 `[bitmap 1024w | dirs 32768w | node stream n w]` 顺序拼接；
+//! - `obj_struct`：逐对象 `[bitmap 1024w | dirs 32768w | node stream n w]` 顺序拼接；
 //!   dirs/node 内部保留 builder 绝对字偏移（≥ NODE_STREAM_BASE），shader 端
 //!   `node_base + (abs - NODE_STREAM_BASE)` 校正；bitmap/dir/node 基址进 descriptor。
-//! - `mov_leaves`：brick slab 顺序拼接，descriptor 存 slab 基址（node 内 1-based
+//! - `obj_leaves`：brick slab 顺序拼接，descriptor 存 slab 基址（node 内 1-based
 //!   slab 号直接加基址）。
-//! - `mov_palette`：逐对象 256 条 ×2w 拼接，descriptor 存字基址。
+//! - `obj_palette`：逐对象 256 条 ×2w 拼接，descriptor 存字基址。
 //!
 //! CPU 参考实现 [`cpu_reference_trace_scene`] 与 WGSL `trace_scene` 同构
 //! （世界路径直接复用 `cpu_reference_dda_ray_two_level`，等价性由单测锁定）。
@@ -39,7 +39,7 @@ use super::wire::{
 /// `rd_local` 不归一化，t 标尺与世界一致（DDA 局部/全局 t 无需换算）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, ShaderType)]
-pub struct MovDesc {
+pub struct ObjDesc {
   /// xyz = 物体 tile 原点的世界坐标（fine 单位），w = scale
   pub pos_scale: Vec4,
   pub rot0: Vec4,
@@ -48,25 +48,25 @@ pub struct MovDesc {
   /// 世界 AABB（局部 tile [0,512]³ 经变换的外包盒，CPU 预计算）
   pub aabb_min: Vec4,
   pub aabb_max: Vec4,
-  /// mov_struct 内 bitmap 区字基址
+  /// obj_struct 内 bitmap 区字基址
   pub bitmap_base: u32,
-  /// mov_struct 内 dirs 区字基址
+  /// obj_struct 内 dirs 区字基址
   pub dir_base: u32,
-  /// mov_struct 内 node stream 字基址（对应物体自身 NODE_STREAM_BASE）
+  /// obj_struct 内 node stream 字基址（对应物体自身 NODE_STREAM_BASE）
   pub node_base: u32,
-  /// mov_leaves 内 slab 基址（物体 node 内 slab 号 + 基址 = pool slab 号）
+  /// obj_leaves 内 slab 基址（物体 node 内 slab 号 + 基址 = pool slab 号）
   pub leaves_base: u32,
-  /// mov_palette 内字基址
+  /// obj_palette 内字基址
   pub palette_base: u32,
   pub _pad0: u32,
   pub _pad1: u32,
   pub _pad2: u32,
 }
 
-/// BG2 uniform：物体数（WGSL `MovGlobals` 镜像，16B）
+/// BG2 uniform：物体数（WGSL `ObjGlobals` 镜像，16B）
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, ShaderType)]
-pub struct MovGlobals {
+pub struct ObjGlobals {
   pub count: u32,
   pub _pad0: u32,
   pub _pad1: u32,
@@ -75,16 +75,16 @@ pub struct MovGlobals {
 
 /// 打包后的 CPU 侧 pool（与 GPU buffer 字节一一对应）
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct MovPoolPacked {
-  pub mov_struct: Vec<u32>,
-  pub mov_leaves: Vec<u32>,
-  pub mov_palette: Vec<u32>,
-  pub descs: Vec<MovDesc>,
+pub struct ObjPoolPacked {
+  pub obj_struct: Vec<u32>,
+  pub obj_leaves: Vec<u32>,
+  pub obj_palette: Vec<u32>,
+  pub descs: Vec<ObjDesc>,
 }
 
 /// 单个物体的打包输入（buffers = 该物体独立 TileGrid 的 build_full 产物）
 #[derive(Debug, Clone, Copy)]
-pub struct MovObject<'a> {
+pub struct ObjObject<'a> {
   pub buffers: &'a BrickMapBuffers,
   /// 物体 tile 原点（局部 [0,512]³ fine 的 [0,0,0] 角）的世界坐标
   pub pos: Vec3,
@@ -97,13 +97,13 @@ pub struct MovObject<'a> {
 ///
 /// # Panics
 /// 物体 `tile_count != 1`（0 = 空网格，>1 = 越出 v1 单 tile 限制）时 panic。
-pub fn pack_mov_pool(objs: &[MovObject]) -> MovPoolPacked {
-  let mut out = MovPoolPacked::default();
+pub fn pack_obj_pool(objs: &[ObjObject]) -> ObjPoolPacked {
+  let mut out = ObjPoolPacked::default();
   for obj in objs {
     let g = &obj.buffers.globals;
     assert_eq!(
       g.tile_count, 1,
-      "MOV v1 契约：每物体恰 1 tile（got {}）",
+      "OBJ v1 契约：每物体恰 1 tile（got {}）",
       g.tile_count
     );
     let struct_len = obj.buffers.b_struct.len();
@@ -114,15 +114,15 @@ pub fn pack_mov_pool(objs: &[MovObject]) -> MovPoolPacked {
     let leaves_end = (g.brick_slabs as usize * BRICK_SLAB_WORDS).min(obj.buffers.b_leaves.len());
     let palette_end = PALETTE_WORDS.min(obj.buffers.b_palette.len());
 
-    let mut dsc = MovDesc {
+    let mut dsc = ObjDesc {
       pos_scale: obj.pos.extend(obj.scale),
       aabb_min: Vec4::ZERO,
       aabb_max: Vec4::ZERO,
-      bitmap_base: out.mov_struct.len() as u32,
+      bitmap_base: out.obj_struct.len() as u32,
       dir_base: 0,
       node_base: 0,
-      leaves_base: (out.mov_leaves.len() / BRICK_SLAB_WORDS) as u32,
-      palette_base: out.mov_palette.len() as u32,
+      leaves_base: (out.obj_leaves.len() / BRICK_SLAB_WORDS) as u32,
+      palette_base: out.obj_palette.len() as u32,
       rot0: Vec4::ZERO,
       rot1: Vec4::ZERO,
       rot2: Vec4::ZERO,
@@ -131,21 +131,21 @@ pub fn pack_mov_pool(objs: &[MovObject]) -> MovPoolPacked {
       _pad2: 0,
     };
     out
-      .mov_struct
+      .obj_struct
       .extend_from_slice(&obj.buffers.b_struct[bitmap]);
-    dsc.dir_base = out.mov_struct.len() as u32;
+    dsc.dir_base = out.obj_struct.len() as u32;
     out
-      .mov_struct
+      .obj_struct
       .extend_from_slice(&obj.buffers.b_struct[dirs]);
-    dsc.node_base = out.mov_struct.len() as u32;
+    dsc.node_base = out.obj_struct.len() as u32;
     out
-      .mov_struct
+      .obj_struct
       .extend_from_slice(&obj.buffers.b_struct[nodes]);
     out
-      .mov_leaves
+      .obj_leaves
       .extend_from_slice(&obj.buffers.b_leaves[..leaves_end]);
     out
-      .mov_palette
+      .obj_palette
       .extend_from_slice(&obj.buffers.b_palette[..palette_end]);
 
     // 旋转列（glam Mat3 三轴 = 列）+ 世界 AABB（局部 tile 盒 8 角变换外包）
@@ -178,60 +178,60 @@ pub fn world_aabb(pos: Vec3, rot: Mat3, scale: f32) -> (Vec3, Vec3) {
 }
 
 // ============================================================================
-// 渲染侧资源：MovScene（main world）→ RenderMov（render world）→ GpuMovPool
+// 渲染侧资源：ObjScene（main world）→ RenderObj（render world）→ GpuObjPool
 // ============================================================================
 
 /// main world 资源：app 构建后一次性插入（v1 静态；P4.7 平滑移动改每帧版本号）
 #[derive(Resource, Clone)]
-pub struct MovScene {
-  pub packed: Arc<MovPoolPacked>,
+pub struct ObjScene {
+  pub packed: Arc<ObjPoolPacked>,
   pub version: u64,
 }
 
 /// render world 提取产物
 #[derive(Resource, Clone)]
-pub(crate) struct RenderMov {
-  packed: Arc<MovPoolPacked>,
+pub(crate) struct RenderObj {
+  packed: Arc<ObjPoolPacked>,
   version: u64,
 }
 
 /// BG2 绑定的 GPU pool（render world）
 #[derive(Resource)]
-pub struct GpuMovPool {
+pub struct GpuObjPool {
   pub struct_buf: Buffer,
   pub leaves: Buffer,
   pub palette: Buffer,
   pub descs: Buffer,
-  pub globals: UniformBuffer<MovGlobals>,
+  pub globals: UniformBuffer<ObjGlobals>,
   pub version: u64,
 }
 
-pub struct MovPlugin;
+pub struct ObjPlugin;
 
-impl Plugin for MovPlugin {
+impl Plugin for ObjPlugin {
   fn build(&self, app: &mut App) {
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app
-      .add_systems(bevy::render::ExtractSchedule, extract_mov_scene)
-      .add_systems(RenderStartup, init_empty_mov_pool)
+      .add_systems(bevy::render::ExtractSchedule, extract_obj_scene)
+      .add_systems(RenderStartup, init_empty_obj_pool)
       .add_systems(
         Render,
-        prepare_mov_pool.in_set(RenderSystems::PrepareBindGroups),
+        prepare_obj_pool.in_set(RenderSystems::PrepareBindGroups),
       );
   }
 }
 
-fn extract_mov_scene(mut commands: Commands, scene: Option<Extract<Res<MovScene>>>) {
+fn extract_obj_scene(mut commands: Commands, scene: Option<Extract<Res<ObjScene>>>) {
   let Some(s) = scene else { return };
-  commands.insert_resource(RenderMov {
+  commands.insert_resource(RenderObj {
     packed: s.packed.clone(),
     version: s.version,
   });
 }
 
-fn init_empty_mov_pool(device: Res<RenderDevice>, mut commands: Commands) {
+fn init_empty_obj_pool(device: Res<RenderDevice>, mut commands: Commands) {
   let make = |label: &str| -> Buffer {
     device.create_buffer(&BufferDescriptor {
       label: Some(label),
@@ -240,12 +240,12 @@ fn init_empty_mov_pool(device: Res<RenderDevice>, mut commands: Commands) {
       mapped_at_creation: false,
     })
   };
-  let globals = UniformBuffer::<MovGlobals>::default();
-  commands.insert_resource(GpuMovPool {
-    struct_buf: make("gate_mov_struct"),
-    leaves: make("gate_mov_leaves"),
-    palette: make("gate_mov_palette"),
-    descs: make("gate_mov_descs"),
+  let globals = UniformBuffer::<ObjGlobals>::default();
+  commands.insert_resource(GpuObjPool {
+    struct_buf: make("gate_obj_struct"),
+    leaves: make("gate_obj_leaves"),
+    palette: make("gate_obj_palette"),
+    descs: make("gate_obj_descs"),
     globals,
     version: 0,
   });
@@ -255,16 +255,16 @@ fn u32_bytes(slice: &[u32]) -> &[u8] {
   unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) }
 }
 
-fn desc_bytes(slice: &[MovDesc]) -> &[u8] {
-  const _: () = assert!(std::mem::size_of::<MovDesc>() == 128);
+fn desc_bytes(slice: &[ObjDesc]) -> &[u8] {
+  const _: () = assert!(std::mem::size_of::<ObjDesc>() == 128);
   unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 128) }
 }
 
 /// 版本变化时重建 pool buffers（v1 静态：仅 version 0→1 一次）
-pub(crate) fn prepare_mov_pool(
+pub(crate) fn prepare_obj_pool(
   mut commands: Commands,
-  scene: Option<Res<RenderMov>>,
-  existing: Option<Res<GpuMovPool>>,
+  scene: Option<Res<RenderObj>>,
+  existing: Option<Res<GpuObjPool>>,
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
 ) {
@@ -285,16 +285,16 @@ pub(crate) fn prepare_mov_pool(
     }
     b
   };
-  let struct_buf = make("gate_mov_struct", u32_bytes(&p.mov_struct));
-  let leaves = make("gate_mov_leaves", u32_bytes(&p.mov_leaves));
-  let palette = make("gate_mov_palette", u32_bytes(&p.mov_palette));
-  let descs = make("gate_mov_descs", desc_bytes(&p.descs));
-  let mut globals = UniformBuffer::from(MovGlobals {
+  let struct_buf = make("gate_obj_struct", u32_bytes(&p.obj_struct));
+  let leaves = make("gate_obj_leaves", u32_bytes(&p.obj_leaves));
+  let palette = make("gate_obj_palette", u32_bytes(&p.obj_palette));
+  let descs = make("gate_obj_descs", desc_bytes(&p.descs));
+  let mut globals = UniformBuffer::from(ObjGlobals {
     count: p.descs.len() as u32,
     ..Default::default()
   });
   globals.write_buffer(&device, &queue);
-  commands.insert_resource(GpuMovPool {
+  commands.insert_resource(GpuObjPool {
     struct_buf,
     leaves,
     palette,
@@ -311,7 +311,7 @@ pub(crate) fn prepare_mov_pool(
 /// 命中记录：obj = OBJ_WORLD 表示世界网格命中
 /// normal = 命中面法线（世界空间单位向量，指向射线来向；起点在体内时 = -dir）
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MovHit {
+pub struct ObjHit {
   pub t: f32,
   pub pal: u8,
   pub obj: u32,
@@ -345,7 +345,7 @@ fn slab_box(ro: Vec3, rd: Vec3, mn: Vec3, mx: Vec3, t0: f32, t1: f32) -> (f32, f
 }
 
 /// descriptor 的（列向量，scale）分解
-fn desc_transform(dsc: &MovDesc) -> (Vec3, Mat3, f32) {
+fn desc_transform(dsc: &ObjDesc) -> (Vec3, Mat3, f32) {
   (
     dsc.pos_scale.truncate(),
     Mat3::from_cols(
@@ -358,28 +358,28 @@ fn desc_transform(dsc: &MovDesc) -> (Vec3, Mat3, f32) {
 }
 
 /// 物体 cell（0..31³）占用查询：bitmap 1 load
-fn obj_cell_occupied(pool: &MovPoolPacked, dsc: &MovDesc, cc: [u32; 3]) -> bool {
+fn obj_cell_occupied(pool: &ObjPoolPacked, dsc: &ObjDesc, cc: [u32; 3]) -> bool {
   let ci = (cc[2] * 1024 + cc[1] * 32 + cc[0]) as usize;
-  let w = pool.mov_struct[dsc.bitmap_base as usize + ci / 32];
+  let w = pool.obj_struct[dsc.bitmap_base as usize + ci / 32];
   (w >> (ci % 32)) & 1 != 0
 }
 
 /// 物体局部最细格采样（局部 fine 0..511³，逐字镜像 view.rs get_voxel ④ 链，
 /// 基址换成 descriptor：node_base + (abs - NODE_STREAM_BASE)、slab + leaves_base）
-fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
+fn obj_sample_voxel(pool: &ObjPoolPacked, dsc: &ObjDesc, fine: IVec3) -> u8 {
   let m = fine.clamp(IVec3::ZERO, IVec3::splat(511));
   let it = m.as_uvec3();
   let ci = ((it.z >> 4) * 1024 + (it.y >> 4) * 32 + (it.x >> 4)) as usize;
-  let bmp = pool.mov_struct[dsc.bitmap_base as usize + ci / 32];
+  let bmp = pool.obj_struct[dsc.bitmap_base as usize + ci / 32];
   if (bmp >> (ci % 32)) & 1 == 0 {
     return 0;
   }
-  let abs = pool.mov_struct[dsc.dir_base as usize + ci];
+  let abs = pool.obj_struct[dsc.dir_base as usize + ci];
   if abs == 0 {
     return 0;
   }
   let mut p = (dsc.node_base + (abs - NODE_STREAM_BASE as u32)) as usize;
-  let hdr = pool.mov_struct[p];
+  let hdr = pool.obj_struct[p];
   if hdr & HDR_UNIFORM_MASK != 0 {
     return (hdr & HDR_UNIFORM_MASK) as u8;
   }
@@ -391,7 +391,7 @@ fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
     return 0;
   }
   let slot = unpack_slot_word(
-    pool.mov_struct[p + (slot_at(sub >> 3, 2) >> 1)],
+    pool.obj_struct[p + (slot_at(sub >> 3, 2) >> 1)],
     slot_at(sub >> 3, 2) & 1,
   );
   match slot_tag(slot) {
@@ -404,7 +404,7 @@ fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
     return 0;
   }
   let slot = unpack_slot_word(
-    pool.mov_struct[p + (slot_at(sub >> 2, 4) >> 1)],
+    pool.obj_struct[p + (slot_at(sub >> 2, 4) >> 1)],
     slot_at(sub >> 2, 4) & 1,
   );
   match slot_tag(slot) {
@@ -417,7 +417,7 @@ fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
     return 0;
   }
   let slot = unpack_slot_word(
-    pool.mov_struct[p + (slot_at(sub >> 1, 8) >> 1)],
+    pool.obj_struct[p + (slot_at(sub >> 1, 8) >> 1)],
     slot_at(sub >> 1, 8) & 1,
   );
   match slot_tag(slot) {
@@ -429,13 +429,13 @@ fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
   if hdr & HDR_HAS_BRICK == 0 {
     return 0;
   }
-  let slab_m1 = pool.mov_struct[p];
+  let slab_m1 = pool.obj_struct[p];
   if slab_m1 == 0 {
     return 0;
   }
   let slab = (slab_m1 - 1 + dsc.leaves_base) as usize;
   let idx = (sub.x + sub.y * 16 + sub.z * 256) as usize;
-  let word = pool.mov_leaves[slab * BRICK_SLAB_WORDS + (idx >> 2)];
+  let word = pool.obj_leaves[slab * BRICK_SLAB_WORDS + (idx >> 2)];
   let pal = (word >> ((idx & 3) * 8)) as u8;
   if pal != 0 { pal } else { 0 }
 }
@@ -444,8 +444,8 @@ fn obj_sample_voxel(pool: &MovPoolPacked, dsc: &MovDesc, fine: IVec3) -> u8 {
 /// 返回 (t_rel, pal, axis)；axis = 局部命中轴（0/1/2），3 = 起点即在体内。
 #[allow(clippy::too_many_arguments)]
 fn obj_fine_scan_cell(
-  pool: &MovPoolPacked,
-  dsc: &MovDesc,
+  pool: &ObjPoolPacked,
+  dsc: &ObjDesc,
   ro: Vec3,
   rd: Vec3,
   sign: [i32; 3],
@@ -517,7 +517,7 @@ fn obj_fine_scan_cell(
 /// 返回 (全局 t, palette, **局部**面法线) 或 None（t_cap 内无命中）。
 /// n_local 为物体局部空间单位向量、指向射线来向（世界法线 = rot · n_local）。
 pub fn cpu_reference_object_ray(
-  pool: &MovPoolPacked,
+  pool: &ObjPoolPacked,
   idx: usize,
   origin: Vec3,
   dir: Vec3,
@@ -648,11 +648,11 @@ pub fn cpu_reference_object_ray(
 /// `trace_scene()` CPU 参考：世界两级 DDA + 逐物体（世界 AABB 预剔除、t_cap 剪枝）取最近。
 pub fn cpu_reference_trace_scene(
   world: &BrickMapBuffers,
-  pool: &MovPoolPacked,
+  pool: &ObjPoolPacked,
   origin: Vec3,
   dir: Vec3,
   t_max: f32,
-) -> Option<MovHit> {
+) -> Option<ObjHit> {
   let mut best = cpu_reference_dda_ray_two_level(world, origin, dir, t_max, 16384).map(|h| {
     // 世界命中法线：-sign[axis] 单位轴（射线朝 +axis 穿入 → 面在 -axis 侧）；
     // axis=3（起点在体内）→ -dir
@@ -664,7 +664,7 @@ pub fn cpu_reference_trace_scene(
     } else {
       -dir
     };
-    MovHit {
+    ObjHit {
       t: h.t,
       pal: h.pal,
       obj: OBJ_WORLD,
@@ -683,7 +683,7 @@ pub fn cpu_reference_trace_scene(
         dsc.rot1.truncate(),
         dsc.rot2.truncate(),
       );
-      best = Some(MovHit {
+      best = Some(ObjHit {
         t,
         pal,
         obj: i as u32,
@@ -699,7 +699,7 @@ pub fn cpu_reference_trace_scene(
 /// 阴影射线占比大时（每像素 × 光源 × 采样），此路径省掉逐物体 t 排序。
 pub fn cpu_reference_scene_occluded(
   world: &BrickMapBuffers,
-  pool: &MovPoolPacked,
+  pool: &ObjPoolPacked,
   origin: Vec3,
   dir: Vec3,
   t_max: f32,
@@ -736,8 +736,8 @@ mod tests {
     BrickMapBuilder::build_full(&g).buffers().clone()
   }
 
-  fn pack_one(bufs: &BrickMapBuffers, pos: Vec3, rot: Mat3, scale: f32) -> MovPoolPacked {
-    pack_mov_pool(&[MovObject {
+  fn pack_one(bufs: &BrickMapBuffers, pos: Vec3, rot: Mat3, scale: f32) -> ObjPoolPacked {
+    pack_obj_pool(&[ObjObject {
       buffers: bufs,
       pos,
       rot,
@@ -746,23 +746,23 @@ mod tests {
   }
 
   #[test]
-  fn mov_desc_layout_128b() {
-    assert_eq!(std::mem::size_of::<MovDesc>(), 128);
-    assert_eq!(std::mem::size_of::<MovGlobals>(), 16);
+  fn obj_desc_layout_128b() {
+    assert_eq!(std::mem::size_of::<ObjDesc>(), 128);
+    assert_eq!(std::mem::size_of::<ObjGlobals>(), 16);
   }
 
   #[test]
   fn pack_layout_bases_sequential_and_content() {
     let a = object_box(64, 3);
     let b = object_box(32, 5);
-    let pool = pack_mov_pool(&[
-      MovObject {
+    let pool = pack_obj_pool(&[
+      ObjObject {
         buffers: &a,
         pos: Vec3::ZERO,
         rot: Mat3::IDENTITY,
         scale: 1.0,
       },
-      MovObject {
+      ObjObject {
         buffers: &b,
         pos: Vec3::new(600.0, 0.0, 0.0),
         rot: Mat3::IDENTITY,
@@ -785,12 +785,12 @@ mod tests {
     assert_eq!(d1.leaves_base as usize, 0); // 对象 0 无 brick（L0 盒无 L4 细分）
     // 内容逐字一致：dirs（含绝对 node 偏移）原样拷贝
     assert_eq!(
-      &pool.mov_struct[d1.dir_base as usize..d1.dir_base as usize + CELL_DIR_WORDS],
+      &pool.obj_struct[d1.dir_base as usize..d1.dir_base as usize + CELL_DIR_WORDS],
       &b.b_struct[DIR_BASE..DIR_BASE + CELL_DIR_WORDS]
     );
     // palette 拼接
     assert_eq!(
-      &pool.mov_palette[d1.palette_base as usize..d1.palette_base as usize + PALETTE_WORDS],
+      &pool.obj_palette[d1.palette_base as usize..d1.palette_base as usize + PALETTE_WORDS],
       &b.b_palette[..PALETTE_WORDS]
     );
     // AABB：v1 契约 = 保守 tile 盒 [0,512]³·scale → 世界 1024³ @ (600,0,0)
@@ -802,7 +802,7 @@ mod tests {
   #[test]
   fn trace_scene_world_only_matches_two_level() {
     let world = world_box(1);
-    let pool = MovPoolPacked::default();
+    let pool = ObjPoolPacked::default();
     let mut state: u64 = 0x9E3779B9;
     let mut next = || {
       state ^= state << 13;
@@ -824,7 +824,7 @@ mod tests {
       .normalize();
       let a = cpu_reference_trace_scene(&world, &pool, origin, dir, 4096.0);
       let b = cpu_reference_dda_ray_two_level(&world, origin, dir, 4096.0, 16384).map(|h| {
-        MovHit {
+        ObjHit {
           t: h.t,
           pal: h.pal,
           obj: OBJ_WORLD,
@@ -1006,14 +1006,14 @@ mod tests {
     };
     assert!(a.globals.brick_slabs > 0 && b.globals.brick_slabs > 0);
     // 物体 y 向错开，两条探测射线各只穿一个物体
-    let pool = pack_mov_pool(&[
-      MovObject {
+    let pool = pack_obj_pool(&[
+      ObjObject {
         buffers: &a,
         pos: Vec3::new(500.0, 0.0, 0.0),
         rot: Mat3::IDENTITY,
         scale: 1.0,
       },
-      MovObject {
+      ObjObject {
         buffers: &b,
         pos: Vec3::new(600.0, 100.0, 0.0),
         rot: Mat3::IDENTITY,
