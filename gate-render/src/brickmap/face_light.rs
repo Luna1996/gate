@@ -2,14 +2,15 @@
 //!
 //! 管线拓扑（对标 Douglas devlog #19 的逐体素光照 hashmap，gate 逐面化——
 //! 面法线 = 面轴向天然已知 → 光照结果直接写入对应面槽，无需 CAS 均值混合）：
-//!   1. `fl_clear_main`：清注册表 status/face_mask/**key**（epoch/light/center 保留；
-//!      key 必须清——残留 key 会让注册聚合分支在「占位中」槽上误匹配，mask 写错
-//!      槽 → 本体素 face 丢注册 → lookup 兜底灰 → 单体素闪烁，v3.9.3）
+//!   1. `fl_clear_main`：清注册表 status + face_mask（**保留** epoch + light + key +
+//!      center；Phase 2 时间复用：pinned slot 同 key 跨帧稳定 → key 不必清，下帧
+//!      fl_register 占位时 hash 比对 + key 校验决定聚合/覆盖）
 //!   2. `dda_main`：DDA 输出 unlit G-buffer（体素坐标 + pal + obj + face），
-//!      并把可见面原子注册进 GPU hashmap（开放寻址 + CAS 占位；
-//!      占位即置 epoch=INVALID 作废残留）
+//!      并把可见面原子注册进 GPU hashmap（**pinned slot** + CAS 占位；
+//!      空槽占位**不动 epoch** 保留跨帧复用；异 key 碰撞覆盖 CAS + 置 INVALID
+//!      强制重算）
 //!   3. `fl_light_main`：对每个注册体素逐面算光照（环境 sky 渐变 + 方向光硬阴影，
-//!      每面 1 条阴影射线；epoch 复用分支恒不命中 = 恒重算，见下）
+//!      每面 1 条阴影射线；**epoch 复用分支生效**：世界体素 + epoch 匹配跳过重算）
 //!   4. `fl_composite_main`：albedo × 面光照 + emissive 直出 → 曝光 → ACES → out_tex
 //!
 //! 视图无关性：当前光照数学（P3.1 Douglas 方案）无 Phong 高光、无软阴影，
@@ -24,15 +25,16 @@
 //! slot 布局（`array<atomic<u32>>`，f32 字段 bitcast 存取）：
 //! ```text
 //!   [0]  packed_status_hash  bit31 = status(0空/1占用), bit0-30 = key_hash(30bit)
-//!                       单原子 CAS 验证「空槽 + hash 匹配」消除跨 workgroup 撕裂 race
+//!                       pinned slot：hash 决定唯一 slot，CAS 占位/覆盖/聚合
+//!                       （Phase 2，2026-09-02；Phase 1 race 修复方案 A 改造）
 //!   [1]  x             命中体素 fine 坐标（世界网格，可负；OBJ = 世界 floor）
 //!   [2]  y
 //!   [3]  z
 //!   [4]  obj_key       0 = 世界网格；N+1 = OBJ 物体 N
 //!   [5]  face_mask     bit f = 面 f 本帧被命中（f: 0=-X 1=+X 2=-Y 3=+Y 4=-Z 5=+Z）
-//!   [6]  epoch         INVALID(u32::MAX) = 本帧新占位未算；cur = 本帧已算
-//!                      （跨帧时间复用后置：开放寻址槽位随注册竞争顺序漂移，
-//!                      残留 epoch/light 属其他体素——复用需槽位稳定化，见 TODO 3.5d）
+//!   [6]  epoch         INVALID(u32::MAX) = 异 key 覆盖未算；cur = 本帧已算
+//!                      （Phase 2 时间复用：pinned slot 同 key 跨帧稳定，
+//!                      stored_epoch == cur_epoch 即跳过重算）
 //!   [7..24]  light     6 面 × RGB f32（bitcast），pre-exposure HDR
 //!   [25..27] center    OBJ 世界体素中心 xyz（f32 bitcast；世界体素不用，恒 = xyz+0.5）
 //! ```
@@ -59,9 +61,8 @@ use crate::lighting::{
 // 常量契约（WGSL dda.wgsl 顶部 FL_* 逐字镜像；单测 assert 字面值防漂移）
 // ============================================================================
 
-/// 注册表槽位数（1<<21 = 2097152；近景可见独立体素可逼近屏幕像素数 ~2M，余量
-/// 防 probe 耗尽丢注册 → 合成灰兜底闪烁。VRAM：2M×28×4B ≈ 229MB）
-pub const FL_REG_SLOTS: u32 = 2_097_152;
+/// 注册表槽位数（1<<22 = 4194304；负载因子 ≤25% 时 probe 耗尽可忽略。VRAM：4M×28×4B ≈ 448MB）
+pub const FL_REG_SLOTS: u32 = 4_194_304;
 /// slot 字数
 pub const FL_WORDS_PER_SLOT: u32 = 28;
 /// 插入/查找线性探测上限（耗尽 = 丢弃；合成用默认光照兜底）
@@ -69,7 +70,7 @@ pub const FL_PROBE_MAX: u32 = 64;
 /// 新占位槽的 epoch 值（WGSL `FL_EPOCH_INVALID` 镜像）：作废残留，强制恒重算
 pub const FL_EPOCH_INVALID: u32 = u32::MAX;
 /// clear / face_light pass 的 workgroup x 尺寸（每线程 1 slot）
-pub const FL_WORKGROUP: u32 = 64;
+pub const FL_WORKGROUP: u32 = 128;
 /// packed status+hash word 0：bit31 = 占用标志
 pub const FL_STATUS_OCCUPIED: u32 = 0x8000_0000;
 /// packed status+hash word 0：bit0-30 = 30bit key_hash 掩码
@@ -475,10 +476,10 @@ mod tests {
   #[test]
   fn fl_constants_contract() {
     // WGSL dda.wgsl 顶部 const FL_* 逐字对应；改任一侧必须同步
-    assert_eq!(FL_REG_SLOTS, 2_097_152);
+    assert_eq!(FL_REG_SLOTS, 4_194_304);
     assert_eq!(FL_WORDS_PER_SLOT, 28);
     assert_eq!(FL_PROBE_MAX, 64);
-    assert_eq!(FL_WORKGROUP, 64);
+    assert_eq!(FL_WORKGROUP, 128);
     assert_eq!(FL_EPOCH_INVALID, u32::MAX);
     // packed status+hash（2026-09-02 race 修复）
     assert_eq!(FL_STATUS_OCCUPIED, 0x8000_0000);
@@ -488,7 +489,7 @@ mod tests {
     // 与 dda.rs wgsl_consts 既有常量无冲突（FL 常量独立命名空间）
     assert_ne!(wgsl_consts::TILE_INDEX_CAP, 0);
     // buffer 尺寸 ≈ 229 MiB（2GB 预算断言已取消，仅留档）
-    assert_eq!(FL_BUF_SIZE, 2_097_152 * 28 * 4);
+    assert_eq!(FL_BUF_SIZE, 4_194_304 * 28 * 4);
   }
 
   /// packed hash 一致性 + 单原子 CAS 聚合模拟（race 修复核心保证）

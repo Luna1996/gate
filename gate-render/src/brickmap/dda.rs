@@ -1262,7 +1262,7 @@ use bevy::{
 
 use std::borrow::Cow;
 
-use super::face_light::FL_REG_SLOTS;
+use super::face_light::{self, FL_REG_SLOTS};
 use super::obj::GpuObjPool;
 use super::upload::GpuBrickMap;
 use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
@@ -1698,7 +1698,7 @@ fn dispatch_dda(
 
   let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
   let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
-  let fl_wg = FL_REG_SLOTS.div_ceil(64);
+  let fl_wg = FL_REG_SLOTS.div_ceil(face_light::FL_WORKGROUP);
 
   // ---- Pass 1: fl_clear_main（清 hashmap status + key + mask；epoch/light 保留）----
   let Some(clear_pipe) = pipeline_cache.get_compute_pipeline(pipelines.fl_clear_pipeline) else {

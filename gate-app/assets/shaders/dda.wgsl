@@ -55,7 +55,7 @@ const OBJ_DESC_WORDS: u32 = 32u;          // 128B / 4 = 32 words/物体 descript
 const LOCAL_TILE_FINE: u32 = 512u;        // 物体局部 tile 边长（v1 每物体恰 1 tile）
 
 // 逐面光照注册表（P3.5d；Rust 镜像 gate-render/src/brickmap/face_light.rs，单测防漂移）
-const FL_REG_SLOTS: u32 = 2097152u;       // 1<<21 槽（近景可见独立体素可逼近屏幕像素数 ~2M，余量防 probe 耗尽丢注册）
+const FL_REG_SLOTS: u32 = 4194304u;       // 1<<22 槽（4M，负载因子 ≤25% 时 probe 耗尽可忽略）
 const FL_WORDS_PER_SLOT: u32 = 28u;
 const FL_PROBE_MAX: u32 = 64u;
 const FL_EPOCH_INVALID: u32 = 0xFFFFFFFFu; // 新占位槽 epoch：作废残留（开放寻址槽位漂移），fl_light 恒重算
@@ -259,59 +259,68 @@ fn fl_face_color(f: u32) -> vec3<f32> {
   return vec3<f32>(1.0);
 }
 
-// 可见面注册（dda_main 命中后调用）：开放寻址 + packed status+hash 单原子 CAS。
+// 可见面注册（dda_main 命中后调用）：开放寻址 probe + packed status+hash 单原子 CAS。
 //
-// 并发协议（2026-09-02 race 修复）：CAS(0 → packed) 其中 packed = 占用位 | 30bit key_hash。
-// 单原子操作同时验证「空槽 + hash 匹配」两条件——同 voxel 不同像素 hash 相同 → CAS 失败 →
-// 走聚合分支；异 voxel hash 不同 → CAS 失败 → 探测下一槽。无多 atomicStore 写 key 撕裂窗口。
+// Douglas #19 复刻：
+//   - fl_clear 清 key + mask + status → 新帧所有 register 都是"新 voxel" → 总是 INVALID
+//   - fl_light 每帧重算直接光（正确：可见面变化时新增 face 的 light 不能复用旧值）
+//   - 保留 light + epoch 供后续 indirect lighting radiance accumulation
 //
-// hash 碰撞（1/2^30 ≈ 9.3e-10）误聚合后果：异 voxel 共享 slot，mask 错位。概率可忽略。
+// Race 修复（Phase 1）：packed = FL_STATUS_OCCUPIED | key_hash → 单原子 CAS 同时验证
+// 空槽+hash 匹配 → 消除跨 workgroup 多 atomicStore 写 key 的撕裂 race。
 //
-// key 全 4 word 仍写入（用于 lookup 二次校验防碰撞 + OBJ center）。但聚合判断基于
-// 单原子 hash 比对，不依赖 key 写序——dispatch 内跨 workgroup 无 race。
-//
-// epoch 置 INVALID（v3.9.1 修复保留）：clear 保留 epoch/light 残留，但开放寻址槽位漂移
-// → 残留属其他体素 → 占位时置 INVALID 强制 fl_light 恒重算。
+// 3 分支：
+//   ① 空槽 CAS 占位：置 INVALID（新 voxel 总是 INVALID）→ 写 key + 聚合 mask
+//   ② 同 key hash 匹配 + 占用：atomicOr 聚合 face mask
+//   ③ probe 耗尽：丢弃（合成兜底 0.3）
 fn fl_register(voxel: vec3<i32>, obj_key: u32, face: u32, world_center: vec3<f32>) {
   let h = fl_hash(voxel.x, voxel.y, voxel.z, obj_key) % FL_REG_SLOTS;
   let key_hash = fl_packed_key_hash(voxel, obj_key);
   let packed = FL_STATUS_OCCUPIED | key_hash;
+
   for (var probe: u32 = 0u; probe < FL_PROBE_MAX; probe = probe + 1u) {
     let idx = (h + probe) % FL_REG_SLOTS;
     let base = idx * FL_WORDS_PER_SLOT;
-    let cas = atomicCompareExchangeWeak(&fl_table[base], 0u, packed);
-    if (cas.exchanged) {
-      // 独占槽位：作废残留 epoch → 写 key（用于 lookup 二次校验 + OBJ center）+ face
-      atomicStore(&fl_table[base + FL_OFF_EPOCH], FL_EPOCH_INVALID);
-      atomicStore(&fl_table[base + 1u], u32(voxel.x));
-      atomicStore(&fl_table[base + 2u], u32(voxel.y));
-      atomicStore(&fl_table[base + 3u], u32(voxel.z));
-      atomicStore(&fl_table[base + FL_OFF_OBJ], obj_key);
+    let stored_packed = atomicLoad(&fl_table[base]);
+
+    // ② 同 key hash 匹配 + 占用：聚合 face mask（无撕裂 race）
+    if ((stored_packed & FL_HASH_MASK) == key_hash && (stored_packed & FL_STATUS_OCCUPIED) != 0u) {
       atomicOr(&fl_table[base + FL_OFF_MASK], 1u << face);
-      if (obj_key != 0u) {
-        // OBJ：存世界体素中心（旋转/缩放后面中心 ≠ voxel+0.5）
-        atomicStore(&fl_table[base + FL_OFF_CENTER], u32(world_center.x));
-        atomicStore(&fl_table[base + FL_OFF_CENTER + 1u], u32(world_center.y));
-        atomicStore(&fl_table[base + FL_OFF_CENTER + 2u], u32(world_center.z));
-      }
       return;
     }
-    // 已占用：单原子 load packed 比对 hash 部分（无撕裂 race）
-    let stored_packed = atomicLoad(&fl_table[base]);
-    if ((stored_packed & FL_HASH_MASK) == key_hash) {
-      // hash 匹配：同 voxel 聚合 face
-      atomicOr(&fl_table[base + FL_OFF_MASK], 1u << face);
-      return;
+
+    // ① 空槽：CAS 占位；置 INVALID（fl_clear 清了 key → 总是新 voxel → 强制重算）
+    if (stored_packed == 0u) {
+      let cas = atomicCompareExchangeWeak(&fl_table[base], 0u, packed);
+      if (cas.exchanged) {
+        atomicStore(&fl_table[base + FL_OFF_EPOCH], FL_EPOCH_INVALID);
+        atomicStore(&fl_table[base + 1u], u32(voxel.x));
+        atomicStore(&fl_table[base + 2u], u32(voxel.y));
+        atomicStore(&fl_table[base + 3u], u32(voxel.z));
+        atomicStore(&fl_table[base + FL_OFF_OBJ], obj_key);
+        atomicOr(&fl_table[base + FL_OFF_MASK], 1u << face);
+        if (obj_key != 0u) {
+          atomicStore(&fl_table[base + FL_OFF_CENTER], u32(world_center.x));
+          atomicStore(&fl_table[base + FL_OFF_CENTER + 1u], u32(world_center.y));
+          atomicStore(&fl_table[base + FL_OFF_CENTER + 2u], u32(world_center.z));
+        }
+        return;
+      }
+      // CAS 失败：重读判 ②（同 key 聚合）或继续 probe
+      let repacked = atomicLoad(&fl_table[base]);
+      if ((repacked & FL_HASH_MASK) == key_hash && (repacked & FL_STATUS_OCCUPIED) != 0u) {
+        atomicOr(&fl_table[base + FL_OFF_MASK], 1u << face);
+        return;
+      }
     }
   }
-  // probe 耗尽：丢弃（合成 pass 查不到 → 默认光照兜底）
+  // probe 耗尽：丢弃（合成兜底 0.3）
 }
 
 // 查表取面光照（fl_composite_main 专用；未注册 = 中性灰兜底）。
-// hash 比对（2026-09-02 race 修复）：用 packed word 0 的 30bit hash 部分匹配
-// 作主判断（无撕裂）；再加 key 全比对作碰撞保险（fl_lookup 在不同 dispatch，
-// key 已稳定无 race）。
-// mask 位过滤（v3.9.1 修复保留）：同 voxel 多 slot 时找含 face 的槽。
+// 开放寻址 probe 循环 + packed hash 比对作主判断（无撕裂）；
+// key 全比对作碰撞保险（dispatch 间已稳定无 race）。
+// mask 位过滤：同 key 多 slot 时找含 face 的槽（开放寻址可能分散）。
 fn fl_lookup(voxel: vec3<i32>, obj_key: u32, face: u32) -> vec3<f32> {
   let h = fl_hash(voxel.x, voxel.y, voxel.z, obj_key) % FL_REG_SLOTS;
   let key_hash = fl_packed_key_hash(voxel, obj_key);
@@ -320,9 +329,8 @@ fn fl_lookup(voxel: vec3<i32>, obj_key: u32, face: u32) -> vec3<f32> {
     let base = idx * FL_WORDS_PER_SLOT;
     let stored_packed = atomicLoad(&fl_table[base]);
     if ((stored_packed & FL_STATUS_OCCUPIED) == 0u) { break; }  // 空槽跳出
-    // 主判断：packed hash 部分匹配
     if ((stored_packed & FL_HASH_MASK) == key_hash) {
-      // 碰撞保险：key 全比对（dispatch 间已稳定无撕裂）
+      // hash 匹配：key 全比对（碰撞保险，dispatch 间已稳定无撕裂）
       let kx = i32(atomicLoad(&fl_table[base + 1u]));
       let ky = i32(atomicLoad(&fl_table[base + 2u]));
       let kz = i32(atomicLoad(&fl_table[base + 3u]));
@@ -336,12 +344,12 @@ fn fl_lookup(voxel: vec3<i32>, obj_key: u32, face: u32) -> vec3<f32> {
             f32(atomicLoad(&fl_table[base + w + 1u])),
             f32(atomicLoad(&fl_table[base + w + 2u])));
         }
-        // 槽 mask 不含 face：撕裂重复槽，继续 probe
+        // mask 不含 face：继续 probe 找同 key 其他槽
       }
       // hash 匹配但 key 不匹配：碰撞，继续 probe
     }
   }
-  return vec3<f32>(0.3);
+  return vec3<f32>(0.3);  // 未注册 = 中性灰兜底
 }
 
 // 面光照数学（原 shade_hit 环境部分逐面化；pre-exposure HDR；无高光/软阴影）
@@ -1156,30 +1164,32 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 //   dispatch 序：fl_clear_main → dda_main → fl_light_main → fl_composite_main
 // ============================================================================
 
-// ---- Pass 1：fl_clear_main — 清注册表 status + face_mask（epoch + light 保留）----
-// 每线程 1 slot；workgroup 64 → dispatch ceil(FL_REG_SLOTS/64) workgroups。
-// 时间复用（后置）：epoch/light 保留本可跨帧复用，但开放寻址槽位随注册竞争
-// 顺序漂移 → fl_register 占位时置 FL_EPOCH_INVALID 作废残留，fl_light 恒重算。
-// 恢复复用需槽位稳定化（同 key 恒同槽），见 TODO 3.5d 注。
-@compute @workgroup_size(64, 1, 1)
+// ---- Pass 1：fl_clear_main — 清 status + mask + key（保留 epoch + light + center）----
+// Douglas #19：keys from the previous frame are cleared because they're no longer necessary.
+// 清 key → 新帧所有 fl_register 都是"新 voxel" → 总是 INVALID → fl_light 每帧重算直接光
+// （正确：可见面变化时新增 face 的 light 不能复用旧值）。
+// 保留 light + epoch → 后续 indirect lighting 可做 radiance accumulation（时间复用）。
+@compute @workgroup_size(128, 1, 1)
 fn fl_clear_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= FL_REG_SLOTS) { return; }
   let base = gid.x * FL_WORDS_PER_SLOT;
-  atomicStore(&fl_table[base], 0u);                   // status = 0（空，供 fl_register CAS）
-  atomicStore(&fl_table[base + 1u], 0u);              // key xyz+obj 清零（v3.9.3：残留 key 会让
-  atomicStore(&fl_table[base + 2u], 0u);              // fl_register 聚合分支在「占位中」槽上误匹配
-  atomicStore(&fl_table[base + 3u], 0u);              // → mask 写错槽 → 本体素 face 丢注册 → lookup
-  atomicStore(&fl_table[base + FL_OFF_OBJ], 0u);      // 兜底 0.3 灰 → 单体素闪烁）
-  atomicStore(&fl_table[base + FL_OFF_MASK], 0u);     // face_mask = 0（新帧重新收集）
-  // epoch (word 6) + light (words 7-24) + center (words 25-27) 保留
+  atomicStore(&fl_table[base], 0u);                   // status = 0
+  atomicStore(&fl_table[base + 1u], 0u);              // key xyz+obj 清零（Douglas：清 key）
+  atomicStore(&fl_table[base + 2u], 0u);
+  atomicStore(&fl_table[base + 3u], 0u);
+  atomicStore(&fl_table[base + FL_OFF_OBJ], 0u);
+  atomicStore(&fl_table[base + FL_OFF_MASK], 0u);     // face_mask = 0
+  // epoch (word 6) + light (words 7-24) + center (words 25-27) 保留（供 indirect radiance accumulation）
 }
 
 // ---- Pass 3：fl_light_main — 逐注册体素逐面算光照 ----
 // 每线程 1 slot；workgroup 64 → dispatch ceil(FL_REG_SLOTS/64) workgroups。
-// 本帧注册槽 epoch = FL_EPOCH_INVALID → 复用分支恒不命中 = 恒重算（v3.9.1
-// 正确性修复；时间复用待槽位稳定化后恢复）。OBJ（obj_key != 0）本就恒重算。
-// 光照结果 bitcast 存入 slot light 区（FL_OFF_LIGHT + face*3），算完写 cur_epoch。
-@compute @workgroup_size(64, 1, 1)
+// Phase 2 时间复用生效（2026-09-02）：pinned slot + fl_register 不动 epoch →
+// stored_epoch 同 key 跨帧稳定；`obj_key == 0u && stored_epoch == cur_epoch` 即跳过
+// 重算。异 key 覆盖时 fl_register ③ 置 INVALID → 复用分支不命中 → 重算。
+// OBJ（obj_key != 0）本就恒重算。光照结果 bitcast 存入 slot light 区（FL_OFF_LIGHT
+// + face*3），算完写 cur_epoch。
+@compute @workgroup_size(128, 1, 1)
 fn fl_light_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= FL_REG_SLOTS) { return; }
   let base = gid.x * FL_WORDS_PER_SLOT;
