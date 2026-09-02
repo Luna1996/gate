@@ -7,7 +7,6 @@
 
 mod builder;
 pub mod dda;
-pub mod face_light;
 pub mod obj;
 pub mod upload;
 mod view;
@@ -17,9 +16,8 @@ pub use builder::{BrickMapBuilder, DirtyRanges, TileUpdate};
 pub use dda::{
   DdaCameraConfig, DdaHit, DdaImages, DdaViewUniform, DebugNormals, OrbitCamera, RenderScale,
   VIEW_SIZE, cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip,
-  cpu_reference_dda_ray_two_level, create_dda_image, create_gbuffer_image,
+  cpu_reference_dda_ray_two_level, create_dda_image,
 };
-pub use face_light::{FL_BUF_SIZE, FaceLightState, GpuFaceLightTable, face_light_epoch_tick};
 pub use obj::{
   GpuObjPool, OBJ_WORLD, ObjDesc, ObjGlobals, ObjHit, ObjObject, ObjPlugin, ObjPoolPacked,
   ObjScene, cpu_reference_object_ray, cpu_reference_scene_occluded, cpu_reference_trace_scene,

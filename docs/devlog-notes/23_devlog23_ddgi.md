@@ -22,3 +22,8 @@
 - 活跃探针剔除（6 邻接 cell 无体素即休眠）在 gate 里可由 bitmap 一条 AND 指令判出，几乎免费。
 - 八面体映射 + 纹理数组存 irradiance/depth 是标准存储方案；gate 用 wgpu 实现时同一套布局可用。
 - 时间线注意：他是 #19 路径追踪（噪）→ #23 DDGI（稳）的演进；gate 亦可先上 #19 式廉价间接光、P9 再上 DDGI，两者共享 radiance/存储代码。
+
+# 参考文献（DDGI）
+"Dynamic Diffuse Global Illumination with Ray-Traced Irradiance Fields" by Majercik et. al
+"Scaling Probe-Based Real-Time Dynamic Global Illumination for Production" by Majercik et. al
+"Improving Probes in Dynamic Diffuse Global Illumination" by Rohacek

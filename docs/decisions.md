@@ -1,7 +1,7 @@
 # 决策记录（ADR）
 
 > 每条 ADR：背景 → 决策 → 后果。状态只有两种：**已接受** / **已否决**（否决项保留理由，防止反复）。
-> 与 TODO.md「已定关键决策」表对应，此处存放工程细节与版本对齐记录。
+> 与 docs/todo/README.md「已定关键决策」表对应，此处存放工程细节与版本对齐记录。
 
 ## 索引
 
@@ -12,6 +12,8 @@
 | [ADR-0003](#adr-0003viewtarget-直写的挂载点与格式msaa-契约p03-阶段-b) | ViewTarget 直写的挂载点与格式/MSAA 契约 | 已接受 | 2026-08-29 |
 | [ADR-0004](#adr-0004决策存放原则与工程基线p05p06) | 决策存放原则与工程基线（日志/CI） | 已接受 | 2026-08-29 |
 | [ADR-0005](#adr-0005parley-090-本地补丁cjk-文本分段vendorparley) | parley 0.9.0 本地补丁——CJK 文本分段 | 已接受 | 2026-08-30 |
+| [ADR-0006](#adr-0006统一-grid-架构douglas-172223-volume-方案-11-复刻) | 统一 Grid 架构 v1（保持 gate 数据结构） | **已推翻**（见 ADR-0007） | 2026-09-02 |
+| [ADR-0007](#adr-0007全量-11-复刻-douglas-brick-tree-方案) | 全量 1:1 复刻 Douglas Brick Tree 方案（数据结构换轨） | 已接受 | 2026-09-02 |
 
 ---
 
@@ -169,10 +171,10 @@ opt-level = 3
 
 ### 决策一：决策存放原则（防止双源漂移）
 
-- **TODO.md「已定关键决策」表是产品/架构决策的唯一真源**（live 文档，随 grill-me 裁决更新）
-- **decisions.md 只存工程细节与版本对齐记录**（怎么实现、踩了什么坑、API 长什么样），不复述 TODO 表内容
-- 大决策若被推翻：改 TODO 表 + 对应 ADR 标注修订（参考 ADR-0002 踩坑 4 被 ADR-0003 修正的先例）
-- 架构级大决策（数据结构/电路语义/模拟位置/画质基线等）的完整论证见 TODO.md v3 及 grill-me 会话记录，此处不复制
+- **docs/todo/README.md「已定关键决策」表是产品/架构决策的唯一真源**（live 文档，随 grill-me 裁决更新）
+- **decisions.md 只存工程细节与版本对齐记录**（怎么实现、踩了什么坑、API 长什么样），不复述决策表内容
+- 大决策若被推翻：改 README 决策表 + 对应 ADR 标注修订（参考 ADR-0002 踩坑 4 被 ADR-0003 修正的先例）
+- 架构级大决策（数据结构/电路语义/模拟位置/画质基线等）的完整论证见 docs/todo/README.md v3 及 grill-me 会话记录，此处不复制
 
 ### 决策二：日志基线（P0.5）
 
@@ -254,3 +256,112 @@ ID 类断行属性允许汉字间断行），行侧 CJK 行为本来就正确；
 - ✅ workspace 98 测试全绿，parley 公开 API 未变，bevy_text 无感
 - ⚠️ 二进制增大：cjdict ≈2MB + SEA 词典被链接器保留
 - ⚠️ parley 升级或 bevy_text 改绑更高版本时，vendor 补丁需人工重放
+
+---
+
+## ADR-0006：统一 Grid 架构 v1（Douglas #17/#22/#23 Volume 方案，保持 gate 数据结构）
+
+**状态**：已推翻（被 ADR-0007 取代）
+**日期**：2026-09-02
+**推翻原因**：用户要求"三个不变也要变"——原决策中的"保持 gate 数据结构 / 保持五步伐链 / brickmap.md 不变"被全部推翻。ADR-0007 改为全量 1:1 复刻含数据结构换轨。
+
+### 原决策摘要（历史记录）
+
+- 统一 GPU buffer + shader 路径，**保持** gate 16³ cell / 5-level 可变叶八叉树
+- BrickMapGlobals + ObjDesc → 统一 GridDesc
+- Brick Tree（4³ + u64 mask）**不复刻**，gate R2-3 的 per-cell 64-bit L2 mask 是等价优化
+- Phase 1~3 增量统一，Phase 4 动态拆分推迟
+
+---
+
+## ADR-0007：全量 1:1 复刻 Douglas Brick Tree 方案（数据结构换轨，v4 最终版）
+
+**状态**：已接受
+**日期**：2026-09-03（v4：chunk 256³ + 分裂方向 + 自适应叶子 + BrickCoord{level:2}）
+
+### 背景
+
+ADR-0006（v1 规划）决定只统一 buffer 管理 + shader 路径，**保持 gate 数据结构不变**。用户否决此方案，要求三个"不变"全部变为"变"——从"统一管理架构"升级为"全量换轨，1:1 复刻 Douglas"。
+
+v2/v3 初稿有两个关键错误：错把分裂方向当合并方向；chunk 保持 128³ 导致数学上无法得到 16³ 层。v4 修正后：chunk = 256³（Douglas 早期 chunk 大小 + DDGI probe cell 天然对齐），分裂因子 = 4³ = 64，层级 256→64→16→4→1（4 层），16³ = level 2 天然对齐 DDGI probe cell + gate cell。
+
+Douglas 确认的架构（#17/#18/#22/#23，有原文证据）：
+1. **分裂树**（不是合并树）—— #17: "subdivided by four"；#18: "divided into 4x4x4 regions"
+2. **分支因子 4³ = 64**—— #17: "64 smaller cubes"；#22: "64 tree"
+3. **Occupancy mask = u64**—— #17: "64-bit number where each bit represents whether the child node is subdivided or not"
+4. **mask 进寄存器 + popcount 定位子节点**—— #17: "最多 10+ 步零显存 load"
+5. **chunk 分层**—— #23: "readding the chunk system"
+6. **统一 contree 格式**—— #22: "took my contree implementation from my old engine and I ripped out the per voxel normal data"
+
+### 决策一：chunk 从 128³ → 256³ + 分裂因子 4³
+
+| 维度 | gate v5 当前 | Douglas Brick Tree（v4 最终） |
+|---|---|---|
+| **chunk 大小** | 128³ | **256³**（Douglas 早期 + DDGI 对齐） |
+| **树方向** | 分裂（root=Tile大 → 叶子小） | **分裂（root=Chunk256³ → 叶子小）** 相同 ✅ |
+| **分裂因子** | 2³（八叉树） | **4³（64-tree）** 核心差异 |
+| **层级** | 5 level（2³ 递归） | **4 level（4³ 递归）**：256→64→16→4→1 |
+| **Occupancy** | TileBitmaps + CellDirs | **u64 mask per non-leaf** |
+| **Uniform leaf 存储** | b_leaves（额外 buffer） | **palette 存 BrickTreeNode fixed** |
+| **空体素开销** | CellDirs 128KB 固定 | **mask bit=0 → 零开销** |
+| **DDA 链** | 五步链 Tile→Bitmap→Dirs→Node→Slot→Brick | **mask+palette 单次 load → bitwise AND** |
+| **VRAM** | ≤ 2.2GB | **≤ 350MB** 省 ~1.85GB |
+| **每步 load** | 2~5 | **1** |
+
+### 决策二：uniform leaf 自适应，无固定最小叶子
+
+Douglas 的 Brick Tree 没有固定的最小叶子大小。uniform leaf 停在哪一层是自适应的：
+- 大平面 → 停在 level 1（64³）或 level 2（16³）
+- 小结构 → 分裂到 level 3（4³）或 level 4（1³）
+- 整块 chunk 空 → root mask = 0（一个 u64 搞定）
+
+**这意味着编辑精度 = 1³（分裂到 level 4）**，和 gate 当前精度相同。之前规划里说"放弃向下细分 + 编辑精度降到 16³"是错误的——Douglas 的 Brick Tree **有向下分裂能力**，只是分裂因子是 4³ 不是 2³。
+
+### 决策三：组件 ID 挂 BrickCoord{level:2} = 16³
+
+chunk 256³ → level 2 = 16³（256/4² = 16）。这恰好是：
+- gate 当前 cell 粒度（16³）
+- Douglas #23 DDGI probe cell（16³）
+- Douglas Brick Tree level 2 的体素边长
+
+**对齐链条**：chunk 256³ → level 2 = 16³ → gate cell = 16³ → DDGI probe cell = 16³。
+
+### 决策四：Phase 规划
+
+| Phase | 范围 | 工作量 | 风险 |
+|---|---|---|---|
+| 0 | **gate-voxel Tile 内重写**：chunk 128³→256³；Cell→BrickTree 4³ 分裂 + u64 mask + 编辑 API（体素→分裂 uniform→自底向上 merge） | ~1500 行 Rust | **极高** |
+| 1 | **GPU struct 打包 + GridDesc**：ChunkTree.nodes Vec<u32> 直接上传 + GridDesc 数组 | ~300 行 Rust | 高 |
+| 2 | **Shader Brick Tree DDA + 统一入口**：五步链 → Douglas mask DDA | ~400 行 WGSL + ~300 行 Rust | 高 |
+| 3 | **上传管道泛化**：三段管道 → Volume dirty 依赖 | ~400 行 Rust | 中 |
+
+### 决策五：brickmap.md 标注废弃
+
+`docs/brickmap.md` 保留为 gate v5 数据结构设计的历史文档（标注「已废弃」）。权威设计文档 = `docs/unified-grid-plan.md`（v4）。
+
+### 决策六：R2-3 规划项全部 SUPERSEDED
+
+per-cell 64-bit L2 mask、细步寻址链缓存、tile 级第三级 DDA 被 Douglas Brick Tree 完全取代。
+
+### 决策七：VRAM 预算 ~350MB（省 ~1.85GB）
+
+| gate v5 当前 | Douglas Brick Tree v4 |
+|---|---|
+| TileIndex 8MB + TileBitmaps 4MB + CellDirs 128MB | 删除（mask 取代） |
+| NodeStream ≤ 1GB | ~200MB（紧凑 child offset） |
+| b_leaves ≤ 1GB | 删除（palette 直接存 BrickTreeNode） |
+| **合计 ≤ 2.2GB** | **≤ 350MB** |
+
+腾出预算用于 DDGI probe buffer（~500MB）+ G-Buffer（~300MB）。
+
+### 后果
+
+- ✅ VRAM 从 ~2GB 降到 ~350MB — 给 DDGI/G-Buffer 腾出 ~1.5GB 空间
+- ✅ 每步 storage load 从 2~5 → 1 — 预估帧率提升
+- ✅ shader 代码量大幅减少（五步链 → mask 单步，删掉 obj 路径冗余）
+- ✅ 数据结构更紧凑：只存 mask 非零子块，空块零开销
+- ✅ **编辑精度 = 1³**（和 gate 当前相同，之前规划里说"降到 16³"是错误）
+- ⚠️ gate-voxel crate Tile 内完整重写 — 上层 crate 依赖此 crate
+- ⚠️ 电路组件 key 类型变更 — CellCoord → BrickCoord{level:2}
+- ⚠️ chunk 从 128³ → 256³ — TileGrid HashMap 遍历逻辑需要调整
+- ⚠️ 详细设计见 `docs/unified-grid-plan.md`（v4 最终版）

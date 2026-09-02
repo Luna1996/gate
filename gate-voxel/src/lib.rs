@@ -1,18 +1,33 @@
-//! gate-voxel：权威体素数据层 + 洪泛 + 模拟（纯逻辑，零渲染依赖）
+//! gate-voxel：权威体素数据层 + Brick Tree（Phase 0）
+//!
+//! 纯逻辑 crate，零渲染依赖，唯一外部依赖 `glam`。
+//! Phase 0 用 Douglas Brick Tree（4³ 分裂因子 + u64 mask + 紧凑 child offset + 自适应 uniform leaf）
+//! 替换旧的可变叶八叉树。
 
+pub mod chunk_tree;
 pub mod coords;
 pub mod dirty;
-pub mod grid;
 pub mod palette;
 pub mod scene;
-pub mod tile;
+pub mod volume;
 
-#[cfg(test)]
-mod stress;
+// ============ 核心坐标 ============
+pub use coords::{
+  BrickCoord, ChunkCoord, VoxelCoord, BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT, MAX_LEVEL,
+  child_linear_idx,
+};
 
-pub use coords::{Level, MAX_LEVEL, SUB_PER_CELL, TILE_CELLS, TILE_SUB, TileCoord, VoxelPos};
+// ============ Brick Tree ============
+pub use chunk_tree::ChunkTree;
+
+// ============ 脏追踪 ============
 pub use dirty::DirtyTracker;
-pub use grid::{DirtyEdit, TileGrid};
+
+// ============ Volume 容器 ============
+pub use volume::{DirtyEdit, VolumeGrid};
+
+// ============ 调色板 ============
 pub use palette::{AIR_INDEX, Palette, PaletteEntry, PaletteFlags};
+
+// ============ 场景构造 ============
 pub use scene::{draw_text, fill_box, fill_sphere, text_size};
-pub use tile::{Brick, Cell, Slot, Tile};

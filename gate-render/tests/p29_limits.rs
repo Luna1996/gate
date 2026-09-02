@@ -1,7 +1,7 @@
 //! P2.9 渲染极限性能测试（v3.1 资源预算断言）
 //!
 //! 断言哲学（v3.1 决策）：**CI 跑宽松上界**（防机器抖动误报），正式数字 `println!`
-//! 留档；基准机实测数字记录于 TODO.md P2.9 条目。本文件全部为 **CPU 侧代理断言**：
+//! 留档；基准机实测数字记录于 docs/todo/completed.md P2.9 条目。本文件全部为 **CPU 侧代理断言**：
 //! - 构建 / 增量重建：Rayon `build_full` 与 `update_tile` 的 CPU 时间
 //! - DDA 三档：CPU 两级参考实现 `cpu_reference_dda_ray_two_level`
 //!   （与 WGSL 逐字等价，`two_level_equivalence_300_rays` 单测锁定）的耗时
@@ -12,7 +12,7 @@
 //!
 //! GPU 侧（DC pass / PCIe 上传耗时）不在 headless CI 覆盖范围：由实机日志
 //! 背书（RTX 4060 dev 构建：DC 2.75ms、UPLOAD[full] 157MB/120ms、
-//! UPLOAD[incremental] 0.26MB/~250µs，见 TODO.md P2.4/P2.3 条目）；GPU 全量
+//! UPLOAD[incremental] 0.26MB/~250µs，见 docs/todo/completed.md P2.4/P2.3 条目）；GPU 全量
 //! 池 ≤2GB 的运行时护栏在 prepare 阶段 debug_assert（brickmap.md §10 决议 15）。
 
 use gate_render::brickmap::dda::cpu_reference_dda_ray_two_level;

@@ -10,7 +10,7 @@
 - 与 CPU 可变叶八叉树**同构**的 GPU 线性布局（NanoVDB 式，无指针、纯 u32 索引）
 - 5 级分辨率完整保留：L0 4cm / L1 2cm / L2 1cm / L3 0.5cm / L4 0.25cm
 - 编辑增量上传：以 `DirtyEdit { tile }` 为粒度，逐 Tile 重建，帧预算内分批
-- 工作间/关卡场景 VRAM ≤ 2GB（砖块图 + G-Buffer，v3.1 预算语义）
+- 工作间/关卡场景 VRAM ≤ 2GB（砖块图 + DDGI + triplanar baked attrs，v3.1 预算语义）
 - DDA 友好：空区域跳过以 u32 位掩码字为单位（一次 load 跳过 32 个基元胞）
 
 **非目标（本期不做）**
@@ -18,7 +18,7 @@
 - 元件层 / StateTable：`Tile.comp_layer` 当前为 None；P6 后状态更新走独立 buffer，不触碰砖块图
 - 流式加载 / 大世界分页（P9 范畴）
 - 100 万非空 Tile 的**渲染**：数据层沙盒稳健性已在 P1.7 验证；GPU 渲染按 §7 上限截断并告警
-- GI / 阴影 / 发光（P3+）：本结构只输出 G-Buffer（pos / normal / palette_idx）
+- GI / 阴影 / 发光（P3+）：本结构只输出 BrickMap 数据（trace + shade_hit 直接消费；无中间 G-buffer 缓存）
 
 ## 2. 结构总览：CPU ↔ GPU 同构映射
 
@@ -124,7 +124,7 @@ Amanatides & Woo 步进为骨架，四级网格嵌套（128cm → 4cm → 表级
    - L1（2cm）→ L2（1cm）→ L3（0.5cm）：逐级 A&W 步进查槽；Leaf = 命中；Empty = 该级跳过；Branch = 下钻
    - L3 Branch → brick 内 0.25cm 步进，palette 字节非 0 = 命中
    - 射线离胞 → 回到第 3 步继续（子 DDA 可能 miss：胞占用不代表射线碰到其体素）
-5. 输出 G-Buffer：world pos（f32×3）、normal（进入面）、palette_idx + flags
+5. DDA 输出：命中体素 slot index + palette + 隐式轴向 normal（进入面）→ shade_hit 直接消费，v5 single-pass 无中间缓存
 
 ## 7. 内存预算表（工作间最坏情形，VRAM）
 
@@ -139,7 +139,6 @@ Amanatides & Woo 步进为骨架，四级网格嵌套（128cm → 4cm → 表级
 | NodeStream — L2 精细化满铺（理论最坏） | 4M × 152B（hdr4+l1 16+l2 128+dir 4） | 608MB |
 | NodeStream — L4 热点 | 全深度胞 5.2KB；预算内 ~20 万胞（≈12.8m³ 满深度体量） | ~1GB |
 | BrickPool | 随热点 | ≤1GB |
-| G-Buffer（P2.4） | 1080p × ~3 目标 | ~50MB |
 | **合计** | | **≤2GB ✓（L2 满铺 + 适度热点并存时 1.7GB 留余）** |
 
 超预算的触发与对策（按优先级）：
@@ -176,7 +175,7 @@ Amanatides & Woo 步进为骨架，四级网格嵌套（128cm → 4cm → 表级
 2. **预算断言**（P2.3）：构建典型 + 最坏场景后，各池字节量 ≤ §7 表；超限即 fail 并打印明细
 3. **增量正确性**（P2.3）：随机编辑序列（确定性种子）→ 每步增量重建后软件遍历结果 == 全量重建结果
 4. **上屏验收**（P2.5）：scene.rs 场景纯色直出，颜色与调色板一致（sRGB→linear 换算按 ADR-0002 契约）
-5. **极限探测**（P2.4）：`--nocapture` 打印逐帧 DDA 步数分布与 G-Buffer 生成耗时（CI 宽松上界）
+5. **极限探测**（P2.4）：`--nocapture` 打印逐帧 DDA 步数分布与 shade_hit 帧时间（CI 宽松上界）
 
 ## 9. 已拒绝的替代方案（防重复论证）
 
@@ -196,7 +195,7 @@ Amanatides & Woo 步进为骨架，四级网格嵌套（128cm → 4cm → 表级
   - 双路径 CPU 单测：`limits_select_layout` 覆盖三条分支（≥1GB / 1B~1GB-1 / 0）
   - 日志探针：首帧 INFO `PROBE: max_storage_buffer_binding_size = X.XXGB → 单 buffer 路径`（实测 PROBE 出现 1 次，与最终接受日志一致）
   - 预算护栏：prepare 末尾 `debug_assert!(total_bytes ≤ 2*1024^3)`，VRAM ≤2GB（v3.1 决策）在 dev 构建硬性校验
-- [ ] P2.4 开工前：G-Buffer 目标格式定稿（pos 用 world 还是 bbox 相对；normal 八面体编码 or 直存）——写 ADR
+- [x] P2.4 **v5 single-pass 架构已定**（2026-09-02 重构）：**不搞 G-Buffer 分阶段缓存**——dda_main 命中后 shade_hit 直接出 final color；架构极简且消除了 hashmap 碰撞、多 pass 同步、G-buffer 尺寸差等一系列派生 bug。Triplanar baked attributes（R6）是 BrickMap 1:1 附加缓存而非 G-buffer 中间产物
 
 ## 11. 实现期决策记录（P2.2 + P2.3 落地细化）
 
@@ -253,7 +252,7 @@ P2.2 已完成（builder.rs + wire.rs + view.rs，13 测试全绿）。P2.3 交�
     并打日志告警；Multi 分段绑定是 <1GB 古董后端（≤2020 DX12 WARP/emulated）兜底，
     开发主流 GPU（RTX 3070 / 1660 / Arc A750 等）均 ≥2GB 绑定限额。
 15. **P2.3 #8 · VRAM 2GB debug_assert 护栏**：prepare 计算完 `struct+leaves+palette+
-    comp+state` 字节和后 `debug_assert!(total ≤ 2*1024*1024*1024)`。符合 TODO.md v3.1
+    comp+state` 字节和后 `debug_assert!(total ≤ 2*1024*1024*1024)`。符合 docs/todo/README.md v3.1
     资源预算条款；release 构建降级为 warn 日志（不 panic，允许沙盒边界场景继续）。
 16. **P2.3 #9 · MainPending → BuilderMirror clone 轻量语义**：MainPending 只放
     `TileCoord`（i32×4 = 16B/tile）Vec 和 bool，不是数据拷贝；Mirror 持有 `Option<BrickMapBuilder>`

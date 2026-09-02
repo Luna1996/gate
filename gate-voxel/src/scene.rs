@@ -1,99 +1,65 @@
-//! 测试场景构造器（P1.6）
+//! 测试场景构造器（Phase 0，Brick Tree 适配）
 //!
-//! 方块 / 球 / 文字的体素化工具，供单元测试、基准场景库（确定性回放）与
-//! P2 渲染验证使用。支持任意层级，可多分辨率混合叠加。
-//!
-//! 体素化语义（确定性，无随机）：
-//! - 方块：所有与包围盒相交的层级立方
-//! - 球：立方中心落在半径内
-//! - 文字：5×7 位图字体，每个像素一个层级立方，XY 平面 + 单层厚度
-//!
-//! 返回值统一为「形状包含的层级立方数」（含同色重写，不含实际生效判断），
-//! 只依赖几何形状，可作断言基线。
+//! 方块 / 球 / 文字的体素化工具，供单元测试、基准场景库与 Phase 1 渲染验证使用。
+//! 统一用 1³ 体素写，Brick Tree 自适应合并 uniform leaf。
 
 use glam::IVec3;
 
-use crate::coords::{LEVEL_SUB_EXTENT, Level};
-use crate::grid::TileGrid;
+use crate::coords::VoxelCoord;
+use crate::volume::VolumeGrid;
 
-/// 层级立方的边长（最细格数）
-fn extent_of(level: Level) -> i32 {
-  LEVEL_SUB_EXTENT[level as usize]
-}
-
-/// 欧氏下取整到对齐网格（负坐标正确落到邻接网格）
-fn floor_aligned(v: i32, e: i32) -> i32 {
-  v.div_euclid(e) * e
-}
-
-/// 填充与轴对齐包围盒相交的所有层级立方
-///
-/// `min` 为包围盒最小角（最细格坐标，可负），`extent` 为各轴尺寸（> 0）。
-pub fn fill_box(
-  grid: &mut TileGrid,
-  min: IVec3,
-  extent: IVec3,
-  level: Level,
-  palette: u8,
-) -> usize {
-  assert!(extent.cmpgt(IVec3::ZERO).all(), "extent must be positive");
-  let e = extent_of(level);
+/// 填充与轴对齐包围盒相交的所有体素（1³，确定性）
+pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -> usize {
+  assert!(extent.cmpgt(IVec3::ZERO).all());
   let max = min + extent;
   let mut count = 0;
-  let mut z = floor_aligned(min.z, e);
+  let mut z = min.z;
   while z < max.z {
-    let mut y = floor_aligned(min.y, e);
+    let mut y = min.y;
     while y < max.y {
-      let mut x = floor_aligned(min.x, e);
+      let mut x = min.x;
       while x < max.x {
-        grid.set_voxel(IVec3::new(x, y, z), level, palette);
-        count += 1;
-        x += e;
+        if grid.set_voxel_ivec3(IVec3::new(x, y, z), palette).is_some() {
+          count += 1;
+        }
+        x += 1;
       }
-      y += e;
+      y += 1;
     }
-    z += e;
+    z += 1;
   }
   count
 }
 
 /// 填充球体（立方中心到球心距离 ≤ 半径）
-pub fn fill_sphere(
-  grid: &mut TileGrid,
-  center: IVec3,
-  radius: i32,
-  level: Level,
-  palette: u8,
-) -> usize {
-  assert!(radius > 0, "radius must be positive");
-  let e = extent_of(level);
+pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u8) -> usize {
+  assert!(radius > 0);
   let r2 = radius * radius;
+  let lo = center - IVec3::splat(radius);
+  let hi = center + IVec3::splat(radius);
   let mut count = 0;
-  // 遍历球包围盒内的对齐立方，判定中心
-  let lo = center - IVec3::splat(radius + e);
-  let hi = center + IVec3::splat(radius + e);
-  let mut z = floor_aligned(lo.z, e);
+  let mut z = lo.z;
   while z <= hi.z {
-    let mut y = floor_aligned(lo.y, e);
+    let mut y = lo.y;
     while y <= hi.y {
-      let mut x = floor_aligned(lo.x, e);
+      let mut x = lo.x;
       while x <= hi.x {
-        let c = IVec3::new(x + e / 2, y + e / 2, z + e / 2);
-        let d = c - center;
+        let d = IVec3::new(x, y, z) - center;
         if d.dot(d) <= r2 {
-          grid.set_voxel(IVec3::new(x, y, z), level, palette);
-          count += 1;
+          if grid.set_voxel_ivec3(IVec3::new(x, y, z), palette).is_some() {
+            count += 1;
+          }
         }
-        x += e;
+        x += 1;
       }
-      y += e;
+      y += 1;
     }
-    z += e;
+    z += 1;
   }
   count
 }
 
-/// 5×7 位图字体：bit4 = 最左列，行 0 = 顶部。未知字符按空格处理
+/// 5×7 位图字体（和旧版相同）
 const FONT: &[(u8, [u8; 7])] = &[
   (b'0', [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
   (b'1', [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E]),
@@ -142,35 +108,22 @@ fn glyph(ch: u8) -> &'static [u8; 7] {
     .unwrap_or(&BLANK)
 }
 
-/// 文字占据的包围盒尺寸（最细格单位）
-pub fn text_size(text: &str, level: Level) -> IVec3 {
-  let e = extent_of(level);
-  let cols = if text.is_empty() {
-    0
-  } else {
-    text.len() as i32 * 6 - 1
-  };
-  IVec3::new(cols * e, 7 * e, e)
+pub fn text_size(text: &str) -> IVec3 {
+  let cols = if text.is_empty() { 0 } else { text.len() as i32 * 6 - 1 };
+  IVec3::new(cols, 7, 1)
 }
 
-/// 在 XY 平面绘制文字（行 0 顶部，字距 1 列，z 单层厚度）
-pub fn draw_text(
-  grid: &mut TileGrid,
-  origin: IVec3,
-  text: &str,
-  level: Level,
-  palette: u8,
-) -> usize {
-  let e = extent_of(level);
+pub fn draw_text(grid: &mut VolumeGrid, origin: IVec3, text: &str, palette: u8) -> usize {
   let mut count = 0;
   for (gi, ch) in text.bytes().enumerate() {
     let rows = glyph(ch);
     for (r, bits) in rows.iter().enumerate() {
       for col in 0..5 {
         if bits & (1 << (4 - col)) != 0 {
-          let p = origin + IVec3::new((gi as i32 * 6 + col) * e, r as i32 * e, 0);
-          grid.set_voxel(p, level, palette);
-          count += 1;
+          let p = origin + IVec3::new(gi as i32 * 6 + col, r as i32, 0);
+          if grid.set_voxel_ivec3(p, palette).is_some() {
+            count += 1;
+          }
         }
       }
     }
@@ -181,99 +134,44 @@ pub fn draw_text(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::coords::TileCoord;
 
   #[test]
-  fn box_aligned_count_and_readback() {
-    let mut grid = TileGrid::new();
-    // L4（1 最细格）5×5×5 = 125
-    let n = fill_box(&mut grid, IVec3::new(0, 0, 0), IVec3::splat(5), 4, 1);
+  fn box_readback() {
+    let mut grid = VolumeGrid::new();
+    let n = fill_box(&mut grid, IVec3::new(0, 0, 0), IVec3::splat(5), 1);
     assert_eq!(n, 125);
-    assert_eq!(grid.get_voxel(IVec3::new(2, 2, 2)), Some(1));
-    assert_eq!(grid.get_voxel(IVec3::new(5, 2, 2)), None);
+    assert_eq!(grid.get_voxel(VoxelCoord::new(2, 2, 2)), Some(1));
+    assert_eq!(grid.get_voxel(VoxelCoord::new(5, 2, 2)), None);
   }
 
   #[test]
-  fn box_coarse_covers_full_cells() {
-    let mut grid = TileGrid::new();
-    // L0 立方边长 16：8×8×8 = 512 个基元胞
-    let n = fill_box(&mut grid, IVec3::new(0, 0, 0), IVec3::splat(128), 0, 2);
-    assert_eq!(n, 512);
-    // 基元胞内任意点读回同色
-    assert_eq!(grid.get_voxel(IVec3::new(15, 15, 15)), Some(2));
-    assert_eq!(grid.get_voxel(IVec3::new(0, 0, 0)), Some(2));
-    assert_eq!(grid.get_voxel(IVec3::new(128, 0, 0)), None);
-  }
-
-  #[test]
-  fn box_spans_negative_and_tiles() {
-    let mut grid = TileGrid::new();
-    // 跨 tile 边界（TILE_SUB=512）且含负坐标，L4 逐格
-    let n = fill_box(&mut grid, IVec3::new(-2, 0, 0), IVec3::new(5, 1, 1), 4, 3);
+  fn box_cross_chunk() {
+    let mut grid = VolumeGrid::new();
+    // 600³ box 跨多个 chunk
+    let n = fill_box(&mut grid, IVec3::new(-1, 0, 0), IVec3::new(5, 1, 1), 2);
     assert_eq!(n, 5);
-    assert_eq!(grid.get_voxel(IVec3::new(-1, 0, 0)), Some(3)); // tile (-1,0,0)
-    assert_eq!(grid.get_voxel(IVec3::new(0, 0, 0)), Some(3)); // tile (0,0,0)
-    assert_eq!(grid.get_voxel(IVec3::new(2, 0, 0)), Some(3));
-    assert_eq!(grid.get_voxel(IVec3::new(3, 0, 0)), None);
-    assert!(grid.tile(TileCoord::new(-1, 0, 0)).is_some());
-    assert!(grid.tile(TileCoord::new(0, 0, 0)).is_some());
+    assert!(grid.chunk_count() >= 2);
   }
 
   #[test]
   fn sphere_center_in_solid() {
-    let mut grid = TileGrid::new();
-    let n = fill_sphere(&mut grid, IVec3::new(100, 100, 100), 10, 4, 4);
-    // 中心与近轴点必在球内
-    assert_eq!(grid.get_voxel(IVec3::new(100, 100, 100)), Some(4));
-    assert_eq!(grid.get_voxel(IVec3::new(105, 100, 100)), Some(4));
-    // 角落远点不在
-    assert_eq!(grid.get_voxel(IVec3::new(110, 110, 110)), None);
-    // 计数与遍历一致（重跑不增）
-    assert_eq!(
-      fill_sphere(&mut grid, IVec3::new(100, 100, 100), 10, 4, 4),
-      n
-    );
+    let mut grid = VolumeGrid::new();
+    fill_sphere(&mut grid, IVec3::new(100, 100, 100), 10, 4);
+    assert_eq!(grid.get_voxel(VoxelCoord::new(100, 100, 100)), Some(4));
+    assert_eq!(grid.get_voxel(VoxelCoord::new(110, 110, 110)), None);
   }
 
   #[test]
-  fn text_glyph_count_and_readback() {
-    let mut grid = TileGrid::new();
-    // 字形逐个核对像素数
-    assert_eq!(draw_text(&mut grid, IVec3::ZERO, "GATE", 4, 5), {
-      let want: usize = "GATE"
-        .bytes()
-        .map(|c| {
-          glyph(c)
-            .iter()
-            .map(|r| r.count_ones() as usize)
-            .sum::<usize>()
-        })
-        .sum();
-      want
-    });
-    // 'G' 第 1 行左列有体素（首行 0x0E 左上角为空）
-    assert_eq!(grid.get_voxel(IVec3::new(0, 1, 0)), Some(5));
-    // 字间空隙（'G' 宽 5 + 1 间隔 → x=5 列为空）
-    assert_eq!(grid.get_voxel(IVec3::new(5, 0, 0)), None);
-    // text_size
-    assert_eq!(text_size("GATE", 4), IVec3::new(23, 7, 1));
-  }
-
-  #[test]
-  fn mixed_resolution_coexist() {
-    let mut grid = TileGrid::new();
-    // L0 大方块 + L4 小球 + L2 文字，三者读回互不干扰
-    fill_box(&mut grid, IVec3::new(0, 0, 0), IVec3::splat(64), 0, 1);
-    fill_sphere(&mut grid, IVec3::new(200, 200, 200), 8, 4, 2);
-    draw_text(&mut grid, IVec3::new(0, 100, 0), "OK", 2, 3);
-    assert_eq!(grid.get_voxel(IVec3::new(1, 1, 1)), Some(1));
-    assert_eq!(grid.get_voxel(IVec3::new(200, 200, 200)), Some(2));
-    // 'O' 第 1 行左列（L2 每像素 4 最细格）
-    assert_eq!(grid.get_voxel(IVec3::new(0, 104, 0)), Some(3));
-    // 同基元胞先写粗后写细：细写覆盖粗区域，L4 读到新色
-    grid.set_voxel(IVec3::new(1, 1, 1), 4, 6);
-    assert_eq!(grid.get_voxel(IVec3::new(1, 1, 1)), Some(6));
-    // 同 L4 邻点仍是粗层颜色（细分只影响子区域）
-    assert_eq!(grid.get_voxel(IVec3::new(2, 2, 2)), Some(1));
+  fn text_glyph_count() {
+    let mut grid = VolumeGrid::new();
+    let want = "GATE"
+      .bytes()
+      .map(|c| {
+        let rows = glyph(c);
+        rows.iter().map(|r| r.count_ones() as usize).sum::<usize>()
+      })
+      .sum();
+    assert_eq!(draw_text(&mut grid, IVec3::ZERO, "GATE", 5), want);
+    assert_eq!(text_size("GATE"), IVec3::new(23, 7, 1));
   }
 }

@@ -1,5 +1,12 @@
 # Phase 1: 启用 P3.5d 逐体素光照 hashmap 管线（Douglas Devlog #19 复刻）
 
+> **⚠️ 本文件是历史文档 — 2026-09-02 v5 架构重构后 hashmap 管线已彻底移除**
+> - face_light.rs（~820 行）已删除
+> - dda.wgsl 四段式（fl_clear / fl_light / fl_composite + G-buffer binding）已删除
+> - 替代方案：**1:1 复刻 Douglas #22/#23**（逐体素 flat shading + 无 per-voxel 光照缓存 + DDGI probe 间接光）
+> - 决策依据：hashmap 控制流 bug 反复（2 天内两次）+ 生日悖论碰撞率 39%+ 无根治方案
+> - 本文件保留作架构演进参考 — 实际代码请以 dda.wgsl + dda.rs 为准
+
 ## 关键发现（拆解前提）
 
 P3.5d 4 pass 管线**已完整实现**——WGSL + Rust + CPU 参考 + 单测全在：

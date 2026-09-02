@@ -11,9 +11,9 @@ use bevy::{
 use glam::{Mat3, Vec3};
 
 use gate_render::{
-  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, FaceLightState,
+  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals,
   ObjObject, ObjScene, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
-  create_gbuffer_image, face_light_epoch_tick, pack_obj_pool,
+  pack_obj_pool,
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
@@ -112,7 +112,6 @@ fn main() {
         demo_ui_setup,
         fps_line_feed,
         debug_normals_toggle,
-        face_light_epoch_tick,
       ),
     )
     .run();
@@ -120,7 +119,6 @@ fn main() {
 
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let dda_handle = create_dda_image(&mut images);
-  let gbuf_handle = create_gbuffer_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off));
   // ---- P3.1 光照主题：「暗色实验室」RON 加载（一次性静态配置，同步读足够；
   // 缺失/解析失败回退内置默认主题）----
@@ -137,10 +135,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   commands.insert_resource(theme);
   commands.insert_resource(DdaImages {
     target: dda_handle,
-    gbuffer: gbuf_handle,
   });
-  // P3.5d：逐面光照 epoch 失效源
-  commands.insert_resource(FaceLightState::default());
   // P2.6：轨道相机为唯一相机状态源；DdaCameraConfig 由 from_orbit 生成
   // （极限场景：世界中心 2560,160,2560；eye 从 +X/+Z 45° 俯视距离 5200 fine 一览 10×10 大陆全境）
   let orbit = OrbitCamera::from_eye(

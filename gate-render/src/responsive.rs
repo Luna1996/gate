@@ -54,10 +54,8 @@ pub fn resize_render_targets(
     height: new_size.y,
     depth_or_array_layers: 1,
   };
-  // target（out_tex）与 gbuffer（P3.5d G-buffer）必须同尺寸重建：composite 按
-  // out_tex 尺寸遍历、dda 按 gbuf 尺寸 clip——漏一个就出现尺寸差分割线
-  //（越界 textureLoad 读 0 → 假命中 → 光照查表失败 → 泛白无光影，v3.9.1 修复）
-  for handle in dda.iter().flat_map(|d| [&d.target, &d.gbuffer]) {
+  // target（out_tex）重建尺寸
+  for handle in dda.iter().map(|d| &d.target) {
     if let Some(mut img) = images.get_mut(handle) {
       img.resize(extent);
     }
