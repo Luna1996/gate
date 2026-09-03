@@ -1,38 +1,43 @@
-//! 砖块图软件遍历器（P2.2）：wire 格式缓冲 → 体素读回
+//! Brick Tree 软件遍历器（Phase 1，Douglas mask DDA 的 CPU 参考实现）
 //!
-//! 独立实现 docs/brickmap.md §3 寻址链——刻意不共享 builder 内部代码，
+//! 独立实现 wire.rs §b_struct 寻址链——刻意不共享 builder 内部代码，
 //! 等价性测试的意义就在于两套实现互为对照（共享即自证）。
-//! 语义与 `TileGrid::get_voxel` 严格一致：Some(palette 1..=255) / None（空）。
-//! 同时作为 P2.4 GPU DDA 着色器的 CPU 参考实现（同路径逐级下钻）。
+//! 语义与 `VolumeGrid::get_voxel` 严格一致：Some(palette 1..=255) / None（空）。
+//!
+//! 寻址链（3 步，全部 storage load）：
+//! ① chunk 窗口：fine → chunk（floor div 256）→ entry（0 = 无 chunk）
+//! ② chunk base → 根节点 fixed（mask_lo/mask_hi/palette，8B）
+//! ③ mask bit 测试 → popcount 定位 child offset → 下钻（每层 1 次 load，
+//!    uniform 子块零额外 load——palette 直存父节点 fixed 字）
 
-use gate_voxel::{MAX_LEVEL, VoxelPos};
 use glam::IVec3;
 
-use super::wire::{
-  BITMAP_BASE, BRICK_SLAB_WORDS, BrickMapBuffers, CELL_DIR_WORDS, DIR_BASE, HDR_HAS_BRICK,
-  HDR_HAS_L1, HDR_HAS_L2, HDR_HAS_L3, HDR_UNIFORM_MASK, SLOT_TABLE_WORDS, SLOT_TAG_BRANCH,
-  SLOT_TAG_EMPTY, SLOT_TAG_LEAF, TILE_BITMAP_WORDS, TILE_INDEX_CAP, slot_palette, slot_tag,
-  unpack_slot_word,
-};
+use super::wire::{BrickMapBuffers, CHUNK_INDEX_CAP, CHUNK_SIZE};
 
-/// 层级槽线性索引（axis³ 表：x + y*axis + z*axis²）
-fn slot_at(sub: IVec3, axis: i32) -> usize {
-  (sub.x + sub.y * axis + sub.z * axis * axis) as usize
-}
-
-/// TileIndex 线性位置（独立实现，与 builder 各写各的，测试互为对照）
-fn index_pos(origin: IVec3, dims: IVec3, tile: IVec3) -> Option<usize> {
-  let rel = tile - origin;
+/// 稠密 chunk 窗口线性位置；窗口外返回 None
+fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
+  let rel = chunk - origin;
   if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dims).any() {
     return None;
   }
-  Some((rel.x + rel.y * TILE_INDEX_CAP + rel.z * TILE_INDEX_CAP * TILE_INDEX_CAP) as usize)
+  Some(
+    (rel.x
+      + rel.y * CHUNK_INDEX_CAP as i32
+      + rel.z * CHUNK_INDEX_CAP as i32 * CHUNK_INDEX_CAP as i32) as usize,
+  )
+}
+
+/// 读一个节点的 (mask, palette_u32)。`node` 为 b_struct 内绝对字址。
+#[inline]
+fn read_node(b_struct: &[u32], node: usize) -> (u64, u32) {
+  let lo = b_struct[node] as u64;
+  let hi = b_struct[node + 1] as u64;
+  (hi << 32 | lo, b_struct[node + 2])
 }
 
 /// 砖块图只读视图：持有与 GPU buffer 字节一致的缓冲区引用
 pub struct BrickMapView<'a> {
   b_struct: &'a [u32],
-  b_leaves: &'a [u32],
   origin: IVec3,
   dims: IVec3,
 }
@@ -42,7 +47,6 @@ impl<'a> BrickMapView<'a> {
     let g = &buffers.globals;
     Self {
       b_struct: &buffers.b_struct,
-      b_leaves: &buffers.b_leaves,
       origin: IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z),
       dims: IVec3::new(
         g.index_dims_x as i32,
@@ -52,154 +56,153 @@ impl<'a> BrickMapView<'a> {
     }
   }
 
-  /// 寻址链五步读回单个最细格（0.25cm）体素，O(1)
-  pub fn get_voxel(&self, fine: IVec3) -> Option<u8> {
-    let pos = VoxelPos::from_fine(fine, MAX_LEVEL);
-    // ① TileIndex：0 = 空条目
-    let ip = index_pos(self.origin, self.dims, pos.tile.0)?;
+  /// 从裸字切片构造（obj pool 拼接采样用：切片 = 某物体 b_struct 的连续窗口）
+  pub fn from_parts(b_struct: &'a [u32], origin: IVec3, dims: IVec3) -> Self {
+    Self {
+      b_struct,
+      origin,
+      dims,
+    }
+  }
+
+  /// chunk 窗口查找 → DFS 树绝对字基址（0 = 无 chunk）
+  fn chunk_base(&self, chunk: IVec3) -> Option<usize> {
+    let ip = chunk_index_pos(self.origin, self.dims, chunk)?;
     let entry = self.b_struct[ip];
     if entry == 0 {
       return None;
     }
-    let slot = (entry - 1) as usize;
-    // ② TileBitmaps：基元胞占用位（0 = 整胞无数据）
-    let ci = pos.cell_index() as usize;
-    let bmp = BITMAP_BASE + slot * TILE_BITMAP_WORDS + ci / 32;
-    if self.b_struct[bmp] >> (ci % 32) & 1 == 0 {
-      return None;
-    }
-    // ③ CellDirs：胞节点绝对字偏移（0 = 空）
-    let abs = self.b_struct[DIR_BASE + slot * CELL_DIR_WORDS + ci] as usize;
-    if abs == 0 {
-      return None;
-    }
-    // ④ CellNode 依序下钻（表按 l1 → l2 → l3 → brick 定序，无内部指针）
-    self.walk_node(abs, pos.sub)
+    Some(entry as usize - 1)
   }
 
-  fn walk_node(&self, abs: usize, sub: IVec3) -> Option<u8> {
-    let hdr = self.b_struct[abs];
-    // uniform 胞：bits 0-7 = palette（0 = AIR，恰作空哨兵）
-    if hdr & HDR_UNIFORM_MASK != 0 {
-      return Some((hdr & HDR_UNIFORM_MASK) as u8);
-    }
-    let mut p = abs + 1;
-
-    // L1 表（2³ = 8 槽）；非 uniform 必有 l1（tile.rs 规范型不变式 1）
-    if hdr & HDR_HAS_L1 == 0 {
-      return None;
-    }
-    let idx = slot_at(sub >> 3, 2);
-    match self.slot(p, idx) {
-      (SLOT_TAG_EMPTY, _) => return None,
-      (SLOT_TAG_LEAF, pal) => return Some(pal),
-      (SLOT_TAG_BRANCH, _) => {}
-      _ => {
-        debug_assert!(false, "非法 L1 槽 tag (node {abs:#x})");
-        return None;
+  /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
+  pub fn get_voxel(&self, fine: IVec3) -> Option<u8> {
+    let chunk = fine.div_euclid(IVec3::splat(CHUNK_SIZE));
+    let base = self.chunk_base(chunk)?;
+    let mut local = fine.rem_euclid(IVec3::splat(CHUNK_SIZE));
+    let mut node = base;
+    let mut extent = CHUNK_SIZE;
+    loop {
+      let (mask, pal) = read_node(self.b_struct, node);
+      if mask == 0 {
+        // uniform leaf（含 level 4 Uniform）：palette 0 = AIR
+        return (pal != 0).then_some(pal as u8);
       }
-    }
-    p += SLOT_TABLE_WORDS[1];
-
-    // L2 表（4³ = 64 槽）
-    if hdr & HDR_HAS_L2 == 0 {
-      debug_assert!(false, "L1 Branch 但 L2 表缺失 (node {abs:#x})");
-      return None;
-    }
-    let idx = slot_at(sub >> 2, 4);
-    match self.slot(p, idx) {
-      (SLOT_TAG_EMPTY, _) => return None,
-      (SLOT_TAG_LEAF, pal) => return Some(pal),
-      (SLOT_TAG_BRANCH, _) => {}
-      _ => {
-        debug_assert!(false, "非法 L2 槽 tag (node {abs:#x})");
-        return None;
+      let child_extent = extent >> 2;
+      let ix = local.x / child_extent;
+      let iy = local.y / child_extent;
+      let iz = local.z / child_extent;
+      let ci = (iz * 16 + iy * 4 + ix) as u64;
+      let bit = 1u64 << ci;
+      if mask & bit == 0 {
+        // uniform 子块：颜色 = 本节点 palette_u32（零额外 load）
+        return (pal != 0).then_some(pal as u8);
       }
+      let slot = (mask & (bit - 1)).count_ones() as usize;
+      // child offset = chunk 内相对字址 → 绝对 = base + offset
+      node = base + self.b_struct[node + 3 + slot] as usize;
+      local = IVec3::new(
+        local.x - ix * child_extent,
+        local.y - iy * child_extent,
+        local.z - iz * child_extent,
+      );
+      extent = child_extent;
     }
-    p += SLOT_TABLE_WORDS[2];
-
-    // L3 表（8³ = 512 槽）
-    if hdr & HDR_HAS_L3 == 0 {
-      debug_assert!(false, "L2 Branch 但 L3 表缺失 (node {abs:#x})");
-      return None;
-    }
-    let idx = slot_at(sub >> 1, 8);
-    match self.slot(p, idx) {
-      (SLOT_TAG_EMPTY, _) => return None,
-      (SLOT_TAG_LEAF, pal) => return Some(pal),
-      (SLOT_TAG_BRANCH, _) => {}
-      _ => {
-        debug_assert!(false, "非法 L3 槽 tag (node {abs:#x})");
-        return None;
-      }
-    }
-    p += SLOT_TABLE_WORDS[3];
-
-    // L4 brick：字存 slab 号 + 1；palette 0 = 空（GPU 不存 brick 掩码，§3.4）
-    if hdr & HDR_HAS_BRICK == 0 {
-      debug_assert!(false, "L3 Branch 但 brick 缺失 (node {abs:#x})");
-      return None;
-    }
-    let slab = (self.b_struct[p] - 1) as usize;
-    let idx = slot_at(sub, 16);
-    let word = self.b_leaves[slab * BRICK_SLAB_WORDS + (idx >> 2)];
-    let pal = (word >> ((idx & 3) * 8)) as u8;
-    (pal != 0).then_some(pal)
   }
 
-  /// 槽表第 idx 槽解包为 (tag, palette)
-  fn slot(&self, table: usize, idx: usize) -> (u16, u8) {
-    let s = unpack_slot_word(self.b_struct[table + (idx >> 1)], idx & 1);
-    (slot_tag(s), slot_palette(s))
-  }
-
-  /// cell 级占用查询（两级 DDA 粗步专用）：只走寻址链 ①TileIndex + ②TileBitmaps，
-  /// 不下钻 node。cc 为 cell 坐标（1 单位 = 16 fine，同 VoxelPos::cell 粒度）。
+  /// cell 灭占用查询（两级 DDA 粗步专用）：cc 为 cell 坐标（1 单位 = 16 fine）。
   /// 语义：false ⇒ get_voxel 对该 cell 内全部 16³ fine 位置都返回 None。
-  /// 成本：2 次 b_struct load（vs get_voxel 全链 4~10 次）。
+  ///
+  /// 走树到 level 2（16³）粒度：
+  /// - 中途 mask=0（uniform）→ occupied = palette != 0
+  /// - mask bit=0（uniform 子块）→ occupied = palette != 0
+  /// - 到达 extent=16 的 Split 节点 → occupied = true
+  ///   （ChunkTree merge 不变式：Split ⇒ 64 槽颜色不全同 ⇒ 至少一槽非 AIR）
   pub fn cell_occupied(&self, cc: IVec3) -> bool {
-    // tile = cc >> 5（32 cell/tile，算术右移 = floor 除法，负坐标正确）；
-    // in-tile cell = cc & 31（欧氏余数）
-    let tile = cc >> 5;
-    let it = cc & 31;
-    let Some(ip) = index_pos(self.origin, self.dims, tile) else {
+    // cell 的最小角 fine → chunk + local（cell 恒不跨 chunk：16 | 256）
+    let fine_min = cc * 16;
+    let chunk = fine_min.div_euclid(IVec3::splat(CHUNK_SIZE));
+    let Some(base) = self.chunk_base(chunk) else {
       return false;
     };
-    let entry = self.b_struct[ip];
-    if entry == 0 {
-      return false;
+    let mut local = fine_min.rem_euclid(IVec3::splat(CHUNK_SIZE));
+    let mut node = base;
+    let mut extent = CHUNK_SIZE;
+    loop {
+      let (mask, pal) = read_node(self.b_struct, node);
+      if mask == 0 {
+        return pal != 0;
+      }
+      if extent == 16 {
+        // 已到目标 brick 粒度且是 Split → 内部必有非 AIR 体素
+        return true;
+      }
+      let child_extent = extent >> 2;
+      let ix = local.x / child_extent;
+      let iy = local.y / child_extent;
+      let iz = local.z / child_extent;
+      let ci = (iz * 16 + iy * 4 + ix) as u64;
+      let bit = 1u64 << ci;
+      if mask & bit == 0 {
+        return pal != 0;
+      }
+      let slot = (mask & (bit - 1)).count_ones() as usize;
+      node = base + self.b_struct[node + 3 + slot] as usize;
+      local = IVec3::new(
+        local.x - ix * child_extent,
+        local.y - iy * child_extent,
+        local.z - iz * child_extent,
+      );
+      extent = child_extent;
     }
-    let slot = (entry - 1) as usize;
-    let ci = (it.z * 1024 + it.y * 32 + it.x) as usize;
-    let bmp = BITMAP_BASE + slot * TILE_BITMAP_WORDS + ci / 32;
-    self.b_struct[bmp] >> (ci % 32) & 1 != 0
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use gate_voxel::{VolumeGrid, fill_box};
 
-  /// 各级槽索引线性布局与 coords.rs `VoxelPos::slot_index` 同构（独立实现对照）
+  /// 各级 child 线性索引与 gate-voxel coords.rs `child_linear_idx` 同构
+  /// （独立实现对照：z*16 + y*4 + x）
   #[test]
-  fn slot_index_matches_voxel_pos() {
-    for x in 0..16i32 {
-      for y in 0..16i32 {
-        for z in 0..16i32 {
-          let in_cell = IVec3::new(x, y, z);
-          for level in 1..=4u8 {
-            let shift = (4 - level) as i32;
-            let axis = 1i32 << level; // L1=2, L2=4, L3=8, L4=16
-            let pos = VoxelPos::from_fine(in_cell, level);
-            assert_eq!(pos.sub, in_cell >> shift, "level {level} sub");
-            assert_eq!(
-              slot_at(in_cell >> shift, axis),
-              pos.slot_index(),
-              "level {level} slot"
-            );
-          }
+  fn child_linear_idx_matches_gate_voxel() {
+    use gate_voxel::child_linear_idx;
+    for x in 0..4i64 {
+      for y in 0..4i64 {
+        for z in 0..4i64 {
+          assert_eq!(
+            (z * 16 + y * 4 + x) as u32,
+            child_linear_idx(x as i32, y as i32, z as i32)
+          );
         }
       }
     }
+  }
+
+  /// 负坐标 chunk 定位：fine -1 → chunk -1（div_euclid），local 255（rem_euclid）
+  #[test]
+  fn negative_fine_chunk_lookup() {
+    let f = IVec3::new(-1, -257, 256);
+    assert_eq!(f.div_euclid(IVec3::splat(CHUNK_SIZE)), IVec3::new(-1, -2, 1));
+    assert_eq!(
+      f.rem_euclid(IVec3::splat(CHUNK_SIZE)),
+      IVec3::new(255, 255, 0)
+    );
+  }
+
+  /// view 走 1 chunk 场景的完整读回（builder 等价性测试的主体在 builder.rs）
+  #[test]
+  fn view_reads_single_chunk_scene() {
+    let mut grid = VolumeGrid::new();
+    fill_box(&mut grid, IVec3::new(0, 0, 0), IVec3::splat(16), 3);
+    let b = crate::brickmap::BrickMapBuilder::build_full(&grid);
+    let v = BrickMapView::new(b.buffers());
+    assert_eq!(v.get_voxel(IVec3::new(0, 0, 0)), Some(3));
+    assert_eq!(v.get_voxel(IVec3::new(15, 15, 15)), Some(3));
+    assert_eq!(v.get_voxel(IVec3::new(16, 0, 0)), None);
+    assert_eq!(v.get_voxel(IVec3::new(-1, 0, 0)), None);
+    assert!(v.cell_occupied(IVec3::ZERO));
+    assert!(!v.cell_occupied(IVec3::new(1, 0, 0)));
   }
 }

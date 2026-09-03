@@ -1,7 +1,7 @@
 # Phase 0 工作日志 — gate-voxel crate Brick Tree 重写
 
 **日期**: 2026-09-03
-**状态**: ✅ 完成（gate-voxel 31 tests 全绿，gate-render/app 旧 API 引用待 Phase 1 适配）
+**状态**: ✅ Phase 0 + Phase 1 完成（workspace 114 tests 全绿）
 
 ---
 
@@ -196,11 +196,39 @@ else child_offset = nodes[idx + 3 + popcount(mask & (bit-1))]  // 单 cycle popc
 
 ## 待办 Phase 1+
 
-1. **gate-render/gate-app 适配**：把 TileGrid/Brick/Cell/Slot/VoxelPos 等旧 API 全部替换为 VolumeGrid/ChunkCoord/VoxelCoord/ChunkTree.serialize()
+1. ~~**gate-render/gate-app 适配**：把 TileGrid/Brick/Cell/Slot/VoxelPos 等旧 API 全部替换为 VolumeGrid/ChunkCoord/VoxelCoord/ChunkTree.serialize()~~ ✅ Phase 1 完成
 2. **GPU struct buffer 上传管道**：DirtyTracker.drain_data_budget → serialize 成 Vec<u32> → writeBuffer + indirect draw
 3. **DDGI probe cell pipeline**：level 2 brick（16³）天然对齐 probe cell
 4. **内存 GC/compaction**：Phase 0 split 只增不减，长时间编辑后 nodes Vec 会膨胀
 5. **性能优化**：每次 set_voxel 后全量 DFS serialize 太奢侈，可加脏标记延迟
+
+---
+
+## Phase 1 适配总结（2026-09-03）
+
+### 已迁移文件
+- `gate-render/src/brickmap/wire.rs`：b_struct 布局重写（Region ① chunk 窗口 1MB + Region ② DFS 树 append，b_leaves 删除保留空 Vec）
+- `gate-render/src/brickmap/view.rs`：BrickMapView mask DDA 软件遍历器（独立寻址链，与 builder 互为对照）
+- `gate-render/src/brickmap/builder.rs`：VolumeGrid→serialize append + 增量 update_chunk + DirtyRanges
+- `gate-render/src/brickmap/upload.rs`：VoxelScene/Mirror/poll/extract/prepare 迁移
+- `gate-render/src/brickmap/obj.rs`：pack_obj_pool + rebase_obj_window（物体局部空间 [0,256)³）+ cpu_reference_object_ray 适配
+- `gate-render/src/brickmap/dda.rs`：wgsl_consts 新镜像 + 测试适配
+- `gate-render/src/lighting.rs`：测试 fill_bricks 替换 fill_box（修 160MB 崩溃）
+- `gate-render/tests/p29_limits.rs`：63 chunk 替换 64（compute_window 1 chunk 边距使 64 连续 chunk 必丢 1）
+- `gate-app/src/main.rs`：TileGrid→VolumeGrid、fill_box level 参数删除、大体积改 fill_bricks
+
+### 关键修复
+- **obj.rs 窗口条目 rebase bug**：世界 builder 的窗口带 1 chunk 生长边距（origin=min-1），1-chunk 物体的窗口条目落在 ip=(1,1,1) 而非 0。`rebase_obj_window` 打包时把条目搬到 origin=(0,0,0) 视角（树区绝对字址不变，纯搬家）
+- **fill_box 内存爆炸**：512³ per-voxel 分裂 = 1.34亿体素 × 65 节点 → 160MB+ 崩溃。`fill_bricks(grid, min, extent, e=16, palette)` brick 级树路径写入，零逐体素分裂开销
+- **p29_limits 窗口边距**：compute_window 固定留 1 chunk 生长边距，64 个连续 chunk 必丢 1 → 改 63 chunk（百万级口径仍满足：2.06M）
+
+### 测试统计
+- gate-voxel lib: 31 passed
+- gate-render lib: 46 passed
+- gate-render p29_limits: 7 passed
+- gate-app: 1 passed
+- gate-render 其他测试: 29 passed
+- **合计: 114 passed / 0 failed**
 
 ---
 

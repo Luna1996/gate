@@ -8,7 +8,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::coords::ChunkCoord;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DirtyTracker {
   data_dirty: HashSet<ChunkCoord>,
   comp_dirty: HashSet<ChunkCoord>,

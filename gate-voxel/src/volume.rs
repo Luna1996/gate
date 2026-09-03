@@ -1,27 +1,32 @@
-//! Volume + VolumeGrid：主世界 / 独立物体的统一容器（Phase 0）
+//! Volume + Volumes：主世界 / 独立物体的统一容器（Phase 0 + Phase 3）
 //!
-//! VolumeGrid = 主世界容器（一个 Volume + 无界 chunk HashMap）
-//! Volume = 任意体素 volume（主世界 = identity transform，独立物体 = 任意 transform）
+//! `VolumeGrid` = 单个体素 volume（主世界 = identity transform + 无界 chunk HashMap；
+//! 独立物体 = 任意 transform + 通常 1~少数 chunk）。`Volumes` = `Vec<VolumeGrid>` 容器，
+//! list[0] 永远是主世界（obj_id = -1），list[1..N] 是物体（obj_id = 0..N-1）。
+//! Phase 3 OBJ→Volume 统一：obj.rs 三段独立管道被吸收为 Volumes 中的物体 Volume。
 
 use std::collections::HashMap;
 
-use glam::IVec3;
+use glam::{IVec3, Mat3, Vec3};
 
 use crate::chunk_tree::ChunkTree;
 use crate::coords::{CHUNK_SIZE, ChunkCoord, VoxelCoord};
 use crate::dirty::DirtyTracker;
-use crate::palette::{AIR_INDEX, Palette};
+use crate::palette::Palette;
 
 /// 组件层：level 2 brick = 16³ = 4096 体素 = 一个组件 cell
 /// 每 chunk = (256/16)³ = 16³ = 4096 个 level 2 brick = 4096 个 u16
 pub const COMP_BRICKS_PER_CHUNK: usize = 16 * 16 * 16;
 pub const COMP_BRICK_EXTENT: i32 = 16;
 
-/// 主世界容器 = VolumeGrid = 一个 Volume + VolumeCoord
+/// 主世界 / 独立物体的统一容器。
 ///
-/// Phase 0 只有主世界（VolumeGrid 是唯一 Volume）。Phase 1+ 扩展为 Vec<Volume>
-/// 支持独立物体（任意数量、任意 transform）。
-#[derive(Debug, Default)]
+/// 主世界 = identity transform + 无界 chunk HashMap（obj_id = -1）。
+/// 独立物体 = 任意 transform + 通常 1~少数 chunk（obj_id = 0..N-1）。
+/// Phase 3 OBJ→Volume 统一后，OBJ 不再有独立 ObjScene/RenderObj/GpuObjPool 三段
+/// 管道，而是作为 `Volumes.list[1..N]` 中的普通 `VolumeGrid`，走与主世界完全相同的
+/// `DirtyTracker` → `BrickMapBuilder::update_chunk` → `UploadSnapshot` 增量上传路径。
+#[derive(Debug, Clone)]
 pub struct VolumeGrid {
   chunks: HashMap<ChunkCoord, ChunkTree>,
   palette: Palette,
@@ -29,6 +34,132 @@ pub struct VolumeGrid {
   comp_layer: HashMap<ChunkCoord, Box<[u16; COMP_BRICKS_PER_CHUNK]>>,
   state_table: Vec<[u32; 4]>,
   pub state_dirty: bool,
+  /// 物体变换（主世界 = identity：pos=0/rot=identity/scale=1）。
+  /// 渲染时通过 GridDesc（§2.6）传到 shader，DDA 局部变换 + 世界 AABB 由它推导。
+  pub transform: VolumeTransform,
+  /// 渲染器分配的 obj_id（主世界 = -1；物体 = 0..N-1，对应 `Volumes.list[1..]` 索引）。
+  pub obj_id: i32,
+}
+
+impl Default for VolumeGrid {
+  fn default() -> Self {
+    Self {
+      chunks: HashMap::new(),
+      palette: Palette::default(),
+      dirty: DirtyTracker::new(),
+      comp_layer: HashMap::new(),
+      state_table: vec![[0u32; 4]; 256],
+      state_dirty: true,
+      transform: VolumeTransform::IDENTITY,
+      obj_id: -1,
+    }
+  }
+}
+
+/// 物体变换：`world = pos + rot · (local · scale)`。
+/// 主世界 = identity（pos=0、rot=identity、scale=1），与 GridDesc 对齐。
+/// rot 列向量约定与 glam Mat3 一致（x_axis/y_axis/z_axis 即列）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeTransform {
+  pub pos: Vec3,
+  pub rot: Mat3,
+  pub scale: f32,
+}
+
+impl Default for VolumeTransform {
+  fn default() -> Self {
+    Self::IDENTITY
+  }
+}
+
+impl VolumeTransform {
+  pub const IDENTITY: Self = Self {
+    pos: Vec3::ZERO,
+    rot: Mat3::IDENTITY,
+    scale: 1.0,
+  };
+
+  pub fn new(pos: Vec3, rot: Mat3, scale: f32) -> Self {
+    Self { pos, rot, scale }
+  }
+
+  /// 局部 [0,256]³·scale 经旋转平移后的世界 AABB 外包（剔除用，与 obj.rs 旧 world_aabb 同型）。
+  pub fn world_aabb(&self) -> (Vec3, Vec3) {
+    let mut mn = Vec3::splat(f32::MAX);
+    let mut mx = Vec3::splat(f32::MIN);
+    for &x in &[0.0_f32, 256.0] {
+      for &y in &[0.0, 256.0] {
+        for &z in &[0.0, 256.0] {
+          let local = Vec3::new(x, y, z) * self.scale;
+          let w = self.pos + self.rot * local;
+          mn = mn.min(w);
+          mx = mx.max(w);
+        }
+      }
+    }
+    (mn, mx)
+  }
+}
+
+/// 全场景容器：`Vec<VolumeGrid>`，list[0] = 主世界（obj_id=-1），list[1..N] = 物体。
+///
+/// Phase 3 OBJ→Volume 统一入口：OBJ 不再有独立管道，而是作为 `Volumes.list[1..N]`
+/// 中的普通 `VolumeGrid`，走与主世界完全相同的 dirty → builder → upload 路径。
+/// 渲染器遍历 `list` 生成 GridDesc 数组，shader `trace_scene` 无 kind 分支。
+#[derive(Debug, Default)]
+pub struct Volumes {
+  pub list: Vec<VolumeGrid>,
+}
+
+impl Volumes {
+  /// 构造：插入主世界 volume（obj_id=-1，identity transform）
+  pub fn new(main_world: VolumeGrid) -> Self {
+    let mut list = Vec::with_capacity(8);
+    list.push(main_world);
+    Self { list }
+  }
+
+  /// 主世界只读引用
+  pub fn main(&self) -> &VolumeGrid {
+    &self.list[0]
+  }
+
+  /// 主世界可变引用
+  pub fn main_mut(&mut self) -> &mut VolumeGrid {
+    &mut self.list[0]
+  }
+
+  /// 添加物体 volume，返回分配的 obj_id（= list 索引 - 1，即 0..N-1）
+  pub fn add_object(&mut self, pos: Vec3, rot: Mat3, scale: f32) -> usize {
+    let obj_id = self.list.len() as i32 - 1;
+    let grid = VolumeGrid::new_object(obj_id, pos, rot, scale);
+    self.list.push(grid);
+    obj_id as usize
+  }
+
+  /// 按 obj_id 查物体只读引用（obj_id = 0..N-1 对应 list[1..N]）
+  pub fn object(&self, obj_id: usize) -> Option<&VolumeGrid> {
+    self.list.get(obj_id + 1)
+  }
+
+  /// 按 obj_id 查物体可变引用
+  pub fn object_mut(&mut self, obj_id: usize) -> Option<&mut VolumeGrid> {
+    self.list.get_mut(obj_id + 1)
+  }
+
+  /// volume 总数（含主世界）
+  pub fn len(&self) -> usize {
+    self.list.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.list.is_empty()
+  }
+
+  /// 所有 volume 只读切片
+  pub fn all(&self) -> &[VolumeGrid] {
+    &self.list
+  }
 }
 
 /// 一次编辑产生的脏区域（Phase 1 上传管道用）
@@ -39,14 +170,28 @@ pub struct DirtyEdit {
 
 impl VolumeGrid {
   pub fn new() -> Self {
-    Self {
-      chunks: HashMap::new(),
-      palette: Palette::default(),
-      dirty: DirtyTracker::new(),
-      comp_layer: HashMap::new(),
-      state_table: vec![[0u32; 4]; 256],
-      state_dirty: true,
-    }
+    Self::default()
+  }
+
+  /// 构造独立物体 volume（OBJ→Volume 统一入口）。
+  /// `obj_id` 由渲染器分配（>=0）；`pos/rot/scale` 为世界变换。
+  pub fn new_object(obj_id: i32, pos: Vec3, rot: Mat3, scale: f32) -> Self {
+    let mut g = Self::default();
+    g.obj_id = obj_id;
+    g.transform = VolumeTransform::new(pos, rot, scale);
+    g
+  }
+
+  pub fn transform(&self) -> VolumeTransform {
+    self.transform
+  }
+
+  pub fn set_transform(&mut self, pos: Vec3, rot: Mat3, scale: f32) {
+    self.transform = VolumeTransform::new(pos, rot, scale);
+  }
+
+  pub fn obj_id(&self) -> i32 {
+    self.obj_id
   }
 
   pub fn palette(&self) -> &Palette {
@@ -71,6 +216,13 @@ impl VolumeGrid {
 
   pub fn chunk_count(&self) -> usize {
     self.chunks.len()
+  }
+
+  /// GC 所有 chunk：回收编辑过程中累积的废弃节点（见 [`ChunkTree::compact`]）
+  pub fn compact_all(&mut self) {
+    for tree in self.chunks.values_mut() {
+      tree.compact();
+    }
   }
 
   // =========================================================================
@@ -111,6 +263,32 @@ impl VolumeGrid {
 
   pub fn set_voxel_ivec3(&mut self, pos: IVec3, palette: u8) -> Option<DirtyEdit> {
     self.set_voxel(VoxelCoord::from_ivec3(pos), palette)
+  }
+
+  /// 填充对齐 brick（extent ∈ {256,64,16,4,1}，Douglas wire Uniform 节点同构）。
+  ///
+  /// 大体积均匀填充专用：树路径 O(depth)，不逐体素分裂（见 [`ChunkTree::fill_brick`]）。
+  /// `voxel` 为 brick 最小角的世界 fine 坐标。
+  pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: u8) -> Option<DirtyEdit> {
+    let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
+    let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
+    let cc = ChunkCoord(chunk);
+    let changed = match self.chunks.get_mut(&cc) {
+      Some(tree) => tree.fill_brick([local.x, local.y, local.z], extent, palette),
+      None => {
+        if palette == 0 {
+          return None; // 空 chunk 填空气 = noop，不建 chunk
+        }
+        let tree = self.chunks.entry(cc).or_insert_with(ChunkTree::empty);
+        tree.fill_brick([local.x, local.y, local.z], extent, palette)
+      }
+    };
+    if changed {
+      self.dirty.mark_data(cc);
+      Some(DirtyEdit { chunk: cc })
+    } else {
+      None
+    }
   }
 
   pub fn clear_voxel(&mut self, voxel: VoxelCoord) -> Option<DirtyEdit> {
@@ -254,5 +432,45 @@ mod tests {
       .collect();
     assert_eq!(grid.batch_edit(ops), 100);
     assert_eq!(grid.dirty.data_dirty_count(), 1); // 全在 chunk (0,0,0)
+  }
+
+  #[test]
+  fn volumes_container_main_and_objects() {
+    let main = VolumeGrid::new();
+    assert_eq!(main.obj_id(), -1, "主世界 obj_id=-1");
+    let mut vols = Volumes::new(main);
+    assert_eq!(vols.len(), 1);
+    assert_eq!(vols.main().obj_id(), -1);
+
+    // 添加物体 0：identity + scale 2
+    let id0 = vols.add_object(Vec3::new(100.0, 0.0, 0.0), Mat3::IDENTITY, 2.0);
+    assert_eq!(id0, 0);
+    assert_eq!(vols.len(), 2);
+    let obj0 = vols.object(0).expect("物体 0 存在");
+    assert_eq!(obj0.obj_id(), 0);
+    assert_eq!(obj0.transform.pos, Vec3::new(100.0, 0.0, 0.0));
+    assert_eq!(obj0.transform.scale, 2.0);
+
+    // 添加物体 1
+    let id1 = vols.add_object(Vec3::ZERO, Mat3::IDENTITY, 1.0);
+    assert_eq!(id1, 1);
+    assert_eq!(vols.len(), 3);
+
+    // 可变访问
+    vols.object_mut(0).unwrap().set_voxel_ivec3(IVec3::new(5, 5, 5), 3);
+    assert_eq!(
+      vols.object(0).unwrap().get_voxel(VoxelCoord::new(5, 5, 5)),
+      Some(3)
+    );
+
+    // 主世界可变
+    vols.main_mut().set_voxel_ivec3(IVec3::new(10, 10, 10), 7);
+    assert_eq!(
+      vols.main().get_voxel(VoxelCoord::new(10, 10, 10)),
+      Some(7)
+    );
+
+    // all() 切片
+    assert_eq!(vols.all().len(), 3);
   }
 }

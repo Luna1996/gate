@@ -24,10 +24,10 @@ pub use chunk_tree::ChunkTree;
 pub use dirty::DirtyTracker;
 
 // ============ Volume 容器 ============
-pub use volume::{DirtyEdit, VolumeGrid};
+pub use volume::{COMP_BRICKS_PER_CHUNK, COMP_BRICK_EXTENT, DirtyEdit, VolumeGrid, VolumeTransform, Volumes};
 
 // ============ 调色板 ============
 pub use palette::{AIR_INDEX, Palette, PaletteEntry, PaletteFlags};
 
 // ============ 场景构造 ============
-pub use scene::{draw_text, fill_box, fill_sphere, text_size};
+pub use scene::{draw_text, fill_box, fill_bricks, fill_sphere, text_size};

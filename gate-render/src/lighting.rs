@@ -15,10 +15,9 @@ use bevy::render::render_resource::ShaderType;
 use glam::{Vec3, Vec4};
 use serde::Deserialize;
 
-use crate::brickmap::cpu_reference_scene_occluded;
-use crate::brickmap::obj::OBJ_WORLD;
 use crate::brickmap::wire::BrickMapBuffers;
-use crate::brickmap::{ObjHit, ObjPoolPacked};
+use crate::brickmap::{VolumeHit, cpu_reference_volumes_occluded};
+use gate_voxel::VolumeTransform;
 
 /// Vec4 的 yzw 分量
 #[inline]
@@ -181,19 +180,14 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
 
 /// 命中点材质（palette 两 words 解包）：
 /// albedo（u8 → /255）+ roughness（w0>>24）+ emissive（w1 低 8bit）
-fn hit_mat(world: &BrickMapBuffers, pool: &ObjPoolPacked, hit: &ObjHit) -> (Vec3, f32, f32) {
-  let (w0, w1) = if hit.obj == OBJ_WORLD {
-    (
-      world.b_palette[hit.pal as usize * 2],
-      world.b_palette[hit.pal as usize * 2 + 1],
-    )
-  } else {
-    let base = pool.descs[hit.obj as usize].palette_base as usize;
-    (
-      pool.obj_palette[base + hit.pal as usize * 2],
-      pool.obj_palette[base + hit.pal as usize * 2 + 1],
-    )
-  };
+///
+/// Phase 3 统一：`vols[0]` = 主世界（obj_id=-1），`vols[1..N]` = 物体（obj_id=0..N-1）。
+/// `hit.obj_id` 决定从哪个 volume 的 `b_palette` 取色。
+fn hit_mat(vols: &[(&BrickMapBuffers, VolumeTransform)], hit: &VolumeHit) -> (Vec3, f32, f32) {
+  let idx = if hit.obj_id == -1 { 0 } else { hit.obj_id as usize + 1 };
+  let pal_buf = &vols[idx].0.b_palette;
+  let w0 = pal_buf[hit.pal as usize * 2];
+  let w1 = pal_buf[hit.pal as usize * 2 + 1];
   let albedo = Vec3::new(
     (w0 & 0xFF) as f32,
     ((w0 >> 8) & 0xFF) as f32,
@@ -234,18 +228,20 @@ pub fn cpu_reference_sky(dir: Vec3, pool: &LightPoolUniform) -> Vec3 {
 
 /// Douglas 基础光影：方向光硬阴影 + sky 渐变环境光 + 发光体素 radiance 直出。
 /// 无点光源、无 Phong 高光、无软阴影锥采样。
+///
+/// Phase 3 统一：`vols[0]` = 主世界（identity transform），`vols[1..N]` = 物体。
+/// 阴影射线 `cpu_reference_volumes_occluded` 遍历所有 volume。
 pub fn cpu_reference_shade_hit(
-  world: &BrickMapBuffers,
-  pool: &ObjPoolPacked,
+  vols: &[(&BrickMapBuffers, VolumeTransform)],
   light_pool: &LightPoolUniform,
   origin: Vec3,
   dir: Vec3,
-  hit: ObjHit,
+  hit: VolumeHit,
   _shadow_t_max: f32,
 ) -> Vec3 {
   let p = origin + dir * hit.t;
   let n = hit.normal;
-  let (base, _rough, emissive) = hit_mat(world, pool, &hit);
+  let (base, _rough, emissive) = hit_mat(vols, &hit);
 
   // sky 渐变环境光
   let h = n.y.clamp(0.0, 1.0);
@@ -264,7 +260,7 @@ pub fn cpu_reference_shade_hit(
       let ndl = n.dot(l_axis).max(0.0);
       if ndl > 0.0 {
         let o = p + n * SHADOW_BIAS;
-        let vis = if !cpu_reference_scene_occluded(world, pool, o, l_axis, SHADOW_DIR_T_MAX) {
+        let vis = if !cpu_reference_volumes_occluded(vols, o, l_axis, SHADOW_DIR_T_MAX) {
           1.0
         } else {
           0.0
@@ -287,14 +283,14 @@ pub fn cpu_reference_shade_hit(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::brickmap::{BrickMapBuilder, ObjObject, cpu_reference_trace_scene, pack_obj_pool};
-  use gate_voxel::{TileGrid, fill_box};
+  use crate::brickmap::{BrickMapBuilder, cpu_reference_trace_volumes};
+  use gate_voxel::{VolumeGrid, fill_bricks};
   use glam::{IVec3, Mat3};
 
   fn world_box(ext: i32, pal: u8) -> BrickMapBuffers {
-    let mut g = TileGrid::new();
+    let mut g = VolumeGrid::new();
     g.palette_mut().get_mut(pal).color = [64, 64, 64];
-    fill_box(&mut g, IVec3::ZERO, IVec3::splat(ext), 0, pal);
+    fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(ext), 16, pal);
     BrickMapBuilder::build_full(&g).buffers().clone()
   }
 
@@ -348,21 +344,19 @@ mod tests {
       sky: None,
     };
     let lp = build_light_pool(&theme);
-    let pool = ObjPoolPacked::default();
+    let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
 
     // 顶面命中：N·L = 1，vis = 1（无遮挡）
-    let hit = cpu_reference_trace_scene(
-      &world,
-      &pool,
+    let hit = cpu_reference_trace_volumes(
+      &vols,
       Vec3::new(256.0, 640.0, 256.0),
       -Vec3::Y,
       4096.0,
     )
     .expect("顶面必有命中");
-    assert_eq!(hit.obj, OBJ_WORLD);
+    assert_eq!(hit.obj_id, -1);
     let rgb = cpu_reference_shade_hit(
-      &world,
-      &pool,
+      &vols,
       &lp,
       Vec3::new(256.0, 640.0, 256.0),
       -Vec3::Y,
@@ -377,17 +371,15 @@ mod tests {
     );
 
     // 底面命中：N·L = -1 → 直射 0，仅环境项
-    let hit = cpu_reference_trace_scene(
-      &world,
-      &pool,
+    let hit = cpu_reference_trace_volumes(
+      &vols,
       Vec3::new(256.0, -128.0, 256.0),
       Vec3::Y,
       4096.0,
     )
     .expect("底面必有命中");
     let rgb = cpu_reference_shade_hit(
-      &world,
-      &pool,
+      &vols,
       &lp,
       Vec3::new(256.0, -128.0, 256.0),
       Vec3::Y,
@@ -397,7 +389,7 @@ mod tests {
     assert!((rgb.x - ALBEDO * 0.1).abs() < 1e-4, "底面 rgb={rgb:?}");
   }
 
-  /// OBJ 物体遮挡太阳：地面命中点在物体正下方 → vis=0 → 仅环境项
+  /// 物体遮挡太阳：地面命中点在物体正下方 → vis=0 → 仅环境项
   #[test]
   fn obj_object_casts_shadow_on_ground() {
     let world = world_box(512, 3);
@@ -414,25 +406,27 @@ mod tests {
     };
     let lp = build_light_pool(&theme);
 
-    let obj_bufs = world_box(512, 5);
-    let pool_with = pack_obj_pool(&[ObjObject {
-      buffers: &obj_bufs,
-      pos: Vec3::new(240.0, 592.0, 240.0),
-      rot: Mat3::IDENTITY,
-      scale: 1.0,
-    }]);
-    let pool_empty = ObjPoolPacked::default();
+    let mut og = VolumeGrid::new();
+    og.palette_mut().get_mut(5).color = [64, 64, 64];
+    fill_bricks(&mut og, IVec3::ZERO, IVec3::splat(64), 16, 5);
+    let obj_bufs = BrickMapBuilder::build_full(&og).buffers().clone();
+    let obj_tr = VolumeTransform::new(Vec3::new(240.0, 592.0, 240.0), Mat3::IDENTITY, 1.0);
+    let vols_with: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![
+      (&world, VolumeTransform::IDENTITY),
+      (&obj_bufs, obj_tr),
+    ];
+    let vols_empty: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
 
-    let hit = ObjHit {
+    let hit = VolumeHit {
       t: 384.0,
       pal: 3,
-      obj: OBJ_WORLD,
+      obj_id: -1,
       normal: Vec3::Y,
     };
     let origin = Vec3::new(256.0, 896.0, 256.0);
 
-    let lit = cpu_reference_shade_hit(&world, &pool_empty, &lp, origin, -Vec3::Y, hit, 4096.0);
-    let shadowed = cpu_reference_shade_hit(&world, &pool_with, &lp, origin, -Vec3::Y, hit, 4096.0);
+    let lit = cpu_reference_shade_hit(&vols_empty, &lp, origin, -Vec3::Y, hit, 4096.0);
+    let shadowed = cpu_reference_shade_hit(&vols_with, &lp, origin, -Vec3::Y, hit, 4096.0);
     assert!(
       lit.x > shadowed.x * 10.0,
       "有物体应显著更暗：lit={lit:?} shadowed={shadowed:?}"
@@ -442,7 +436,7 @@ mod tests {
   /// 发光体素 radiance 直出：无光源时 emissive 体素面也亮
   #[test]
   fn shade_emissive_direct_glow() {
-    let mut g = TileGrid::new();
+    let mut g = VolumeGrid::new();
     {
       let pal = g.palette_mut();
       let mut e = gate_voxel::PaletteEntry::default();
@@ -450,7 +444,7 @@ mod tests {
       e.emissive = 200;
       pal.set(3, e);
     }
-    fill_box(&mut g, IVec3::ZERO, IVec3::splat(512), 0, 3);
+    fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(512), 16, 3);
     let world = BrickMapBuilder::build_full(&g).buffers().clone();
     let theme = LightingTheme {
       sun: None,
@@ -459,19 +453,17 @@ mod tests {
       sky: None,
     };
     let lp = build_light_pool(&theme);
-    let pool = ObjPoolPacked::default();
+    let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
 
-    let hit = cpu_reference_trace_scene(
-      &world,
-      &pool,
+    let hit = cpu_reference_trace_volumes(
+      &vols,
       Vec3::new(256.0, 640.0, 256.0),
       -Vec3::Y,
       4096.0,
     )
     .expect("顶面命中");
     let rgb = cpu_reference_shade_hit(
-      &world,
-      &pool,
+      &vols,
       &lp,
       Vec3::new(256.0, 640.0, 256.0),
       -Vec3::Y,
@@ -485,17 +477,15 @@ mod tests {
     );
 
     // 底面直出同值（radiance 无方向性）
-    let hit = cpu_reference_trace_scene(
-      &world,
-      &pool,
+    let hit = cpu_reference_trace_volumes(
+      &vols,
       Vec3::new(256.0, -128.0, 256.0),
       Vec3::Y,
       4096.0,
     )
     .expect("底面命中");
     let rgb = cpu_reference_shade_hit(
-      &world,
-      &pool,
+      &vols,
       &lp,
       Vec3::new(256.0, -128.0, 256.0),
       Vec3::Y,

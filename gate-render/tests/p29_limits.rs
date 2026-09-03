@@ -1,52 +1,55 @@
-//! P2.9 渲染极限性能测试（v3.1 资源预算断言）
+//! P2.9 渲染极限性能测试（Douglas Brick Tree 版，v4 资源预算断言）
 //!
-//! 断言哲学（v3.1 决策）：**CI 跑宽松上界**（防机器抖动误报），正式数字 `println!`
-//! 留档；基准机实测数字记录于 docs/todo/completed.md P2.9 条目。本文件全部为 **CPU 侧代理断言**：
-//! - 构建 / 增量重建：Rayon `build_full` 与 `update_tile` 的 CPU 时间
+//! 断言哲学（v3.1 决策沿用）：**CI 跑宽松上界**（防机器抖动误报），正式数字 `println!`
+//! 留档。本文件全部为 **CPU 侧代理断言**：
+//! - 构建 / 增量重建：`build_full` 与 `update_chunk` 的 CPU 时间
 //! - DDA 三档：CPU 两级参考实现 `cpu_reference_dda_ray_two_level`
 //!   （与 WGSL 逐字等价，`two_level_equivalence_300_rays` 单测锁定）的耗时
-//! - 内存/VRAM：wire 布局公式 + 实测 buffers 字节（docs/brickmap.md §7 预算表）
+//! - 内存/VRAM：wire 布局公式 + 实测 buffers 字节
 //!
-//! 哨兵意义：两级 DDA 被改回单级（15× 退化）、寻址链引入意外分配、精细化
-//! 序列化布局膨胀——任何一项都会立即爆掉本文件的阈值。
+//! 哨兵意义：两级 DDA 被改回单级（15× 退化）、chunk 树序列化布局膨胀、
+//! 增量 append 失控——任何一项都会立即爆掉本文件的阈值。
 //!
-//! GPU 侧（DC pass / PCIe 上传耗时）不在 headless CI 覆盖范围：由实机日志
-//! 背书（RTX 4060 dev 构建：DC 2.75ms、UPLOAD[full] 157MB/120ms、
-//! UPLOAD[incremental] 0.26MB/~250µs，见 docs/todo/completed.md P2.4/P2.3 条目）；GPU 全量
-//! 池 ≤2GB 的运行时护栏在 prepare 阶段 debug_assert（brickmap.md §10 决议 15）。
+//! GPU 侧（DC pass / PCIe 上传耗时）不在 headless CI 覆盖范围：由实机日志背书。
 
 use gate_render::brickmap::dda::cpu_reference_dda_ray_two_level;
-use gate_render::brickmap::wire::NODE_STREAM_BASE;
-use gate_render::{BrickMapBuilder, DirtyRanges, ObjObject, TileUpdate, cpu_reference_trace_scene};
-use gate_voxel::{TileGrid, fill_box};
+use gate_render::brickmap::dda::cpu_reference_trace_volumes;
+use gate_render::brickmap::wire::TREE_BASE;
+use gate_render::{BrickMapBuilder, DirtyRanges};
+use gate_voxel::{VolumeGrid, VolumeTransform, fill_box};
 use glam::{IVec3, Mat3, Vec3};
 use std::time::Instant;
 
-/// 单 tile 的 fine 边长（32 基元胞 × 16 fine）
-const TILE_FINE: i32 = 512;
+/// 单 chunk 的 fine 边长（Douglas Brick Tree：256³）
+const CHUNK_FINE: i32 = 256;
 /// 帧预算（60fps 口径）
 const FRAME_MS: f64 = 16.7;
 
-/// n 个沿 x 排列的满 L0 tile（条带异色防 uniform 折叠，贴近真实场景）
-fn fill_full_tiles(grid: &mut TileGrid, tile_x0: i32, n: usize) {
-  for i in 0..n {
-    let base = IVec3::new((tile_x0 + i as i32) * TILE_FINE, 0, 0);
-    let pal = (i % 6 + 1) as u8;
-    // 半 tile 条带两色：整体非 uniform，胞间有差异
-    fill_box(
-      grid,
-      base,
-      IVec3::new(TILE_FINE / 2, TILE_FINE, TILE_FINE),
-      0,
-      pal,
-    );
-    fill_box(
-      grid,
-      base + IVec3::new(TILE_FINE / 2, 0, 0),
-      IVec3::new(TILE_FINE / 2, TILE_FINE, TILE_FINE),
-      0,
-      pal % 6 + 1,
-    );
+/// 棋盘格填充 [min, min+extent)：cell³ 均色块交替异色（防 uniform 折叠）。
+/// cell=16 → 分裂到 level 2；cell=4 → level 3；cell=1 → level 4 全深度。
+fn fill_checkerboard(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, cell: i32) {
+  assert!(extent.x % cell == 0 && extent.y % cell == 0 && extent.z % cell == 0);
+  let mut z = min.z;
+  while z < min.z + extent.z {
+    let mut y = min.y;
+    while y < min.y + extent.y {
+      let mut x = min.x;
+      while x < min.x + extent.x {
+        let parity = ((x / cell) ^ (y / cell) ^ (z / cell)) & 1;
+        fill_box(grid, IVec3::new(x, y, z), IVec3::splat(cell), parity as u8 + 1);
+        x += cell;
+      }
+      y += cell;
+    }
+    z += cell;
+  }
+}
+
+/// n 个沿 x 排列的 chunk，各在 chunk 原点放 span³ 棋盘（条带异色防折叠）
+fn fill_chunk_checkers(grid: &mut VolumeGrid, chunk_x0: i32, n: usize, span: i32, cell: i32) {
+  for i in 0..n as i32 {
+    let base = IVec3::new((chunk_x0 + i) * CHUNK_FINE, 0, 0);
+    fill_checkerboard(grid, base, IVec3::splat(span), cell);
   }
 }
 
@@ -76,50 +79,27 @@ impl Lcg {
   }
 }
 
-/// 异色棋盘填充 [min, min+extent) 区域（level 精细层），防 uniform 折叠
-fn fill_checkerboard(grid: &mut TileGrid, min: IVec3, extent: IVec3, level: u8) {
-  let e = match level {
-    0 => 16,
-    2 => 4,
-    4 => 1,
-    _ => panic!("测试只覆盖 L0/L2/L4"),
-  };
-  let mut z = min.z;
-  while z < min.z + extent.z {
-    let mut y = min.y;
-    while y < min.y + extent.y {
-      let mut x = min.x;
-      while x < min.x + extent.x {
-        let parity = ((x / e) ^ (y / e) ^ (z / e)) & 1;
-        grid.set_voxel(IVec3::new(x, y, z), level, parity as u8 + 1);
-        x += e;
-      }
-      y += e;
-    }
-    z += e;
-  }
-}
-
 // ============================================================================
-// P2.9a：百万级体素砖块图构建 + 全量上传（CPU 时间预算断言）
+// P2.9a：百万级体素 chunk 树构建 + 全量上传（CPU 时间预算断言）
 // ============================================================================
 
 #[test]
 fn million_voxel_build_full_budget() {
-  let mut grid = TileGrid::new();
-  // 64 tile × 32768 = 2,097,152 体素 ≥ 100 万（v3.1「百万级」口径）
+  let mut grid = VolumeGrid::new();
+  // 63 chunk × 32768 = 2,064,384 fine 体素 ≥ 100 万（「百万级」口径沿用）
+  // cell=4 棋盘 → 分裂到 level 3，树规模贴近真实异色场景
+  // 63 而非 64：compute_window 留 1 chunk 生长边距，64 连续 chunk 必丢 1
   let t0 = Instant::now();
-  fill_full_tiles(&mut grid, 0, 64);
+  fill_chunk_checkers(&mut grid, 0, 63, 32, 4);
   let fill = t0.elapsed();
 
-  // 全量上传的 CPU 侧成本主体 = build_full（序列化+放置，Rayon 并行分批）；
+  // 全量上传的 CPU 侧成本主体 = build_full（逐 chunk DFS 序列化，Rayon 并行）；
   // write_buffer 是 O(1) enqueue，GPU DMA 由实机 UPLOAD[full] 日志背书
   let t0 = Instant::now();
   let builder = BrickMapBuilder::build_full(&grid);
   let build = t0.elapsed();
 
-  // CI 宽松上界：P2.3 基线 211 tile（156MB blob）全量构建 219ms；
-  // 64 满铺 tile 同量级，2s ≈ 10× 余量
+  // CI 宽松上界：2s ≈ 数十倍余量（树序列化为主，63 chunk × 数百节点）
   assert!(
     build.as_secs_f64() < 2.0,
     "build_full 超预算（CI 宽松 2s）：{:?}",
@@ -127,12 +107,11 @@ fn million_voxel_build_full_budget() {
   );
 
   let bufs = builder.buffers();
-  assert_eq!(bufs.globals.tile_count as usize, 64);
+  assert_eq!(bufs.globals.tile_count as usize, 63);
   let struct_mb = bufs.b_struct.len() as f64 * 4.0 / 1048576.0;
-  let leaves_mb = bufs.b_leaves.len() as f64 * 4.0 / 1048576.0;
   println!(
-    "[P2.9a] 2.1M voxels: grid_fill={fill:?} build_full={build:?} ({:.0}µs/tile) b_struct={struct_mb:.1}MB b_leaves={leaves_mb:.1}MB node_words={}",
-    build.as_micros() as f64 / 64.0,
+    "[P2.9a] 2.06M voxels: grid_fill={fill:?} build_full={build:?} ({:.0}µs/chunk) b_struct={struct_mb:.2}MB node_words={}（fill 不计预算）",
+    build.as_micros() as f64 / 63.0,
     bufs.globals.node_words
   );
 }
@@ -143,41 +122,32 @@ fn million_voxel_build_full_budget() {
 
 #[test]
 fn incremental_burst_frame_budget() {
-  // 典型工作间混合：64 个 1/8 体量 tile（均匀为主，编辑成本典型亚毫秒）
-  let mut grid = TileGrid::new();
-  for i in 0..64isize {
-    let base = IVec3::new(i as i32 * TILE_FINE, 0, 0);
-    fill_box(
-      &mut grid,
-      base,
-      IVec3::new(TILE_FINE, 64, 256),
-      0,
-      (i % 6 + 1) as u8,
-    );
-  }
+  // 典型工作间混合：63 个 chunk 各 16³ 棋盘（cell=4，编辑成本典型亚毫秒）
+  // 63 而非 64：compute_window 边距使 64 连续 chunk 必丢 1（详见 P2.9a 注释）
+  let mut grid = VolumeGrid::new();
+  fill_chunk_checkers(&mut grid, 0, 63, 16, 4);
   let mut builder = BrickMapBuilder::build_full(&grid);
-  // build_full 末尾已丢弃脏区间（full_build_leaves_no_stale_dirty_marks）；防御性再取一次
+  // build_full 末尾已丢弃脏区间；防御性再取一次
   let stale: DirtyRanges = builder.take_dirty_ranges();
-  assert!(stale.struct_ranges.is_empty() && stale.leaves_ranges.is_empty());
+  assert!(stale.struct_ranges.is_empty() && !stale.palette_changed);
 
-  // 连发：64 tile 全标脏（真实编辑路径 set_voxel → DirtyTracker 自动 mark）；
-  // 用 L4 微编辑（1 fine 胞）模拟 P4.2 同帧高频编辑的最小粒度。
-  // palette 7：填充只占 1..=6，保证每次编辑都是真实改写（同色写回返回 None）
-  for i in 0..64isize {
-    grid
-      .set_voxel(IVec3::new(i as i32 * TILE_FINE + 8, 8, 8), 4, 7)
-      .expect("区域内必有已占用祖先，编辑应生效");
+  // 连发：63 chunk 全标脏（真实编辑路径 set_voxel → DirtyTracker 自动 mark）；
+  // 用 1 fine 微编辑模拟 P4.2 同帧高频编辑的最小粒度。
+  // palette 7：棋盘只占 1..=2，保证每次编辑都是真实改写（同色写回返回 None）
+  for i in 0..63isize {
+    let edited = grid.set_voxel_ivec3(IVec3::new(i as i32 * CHUNK_FINE + 8, 8, 8), 7);
+    assert!(edited.is_some(), "微编辑应生效（颜色必变）");
   }
-  assert_eq!(grid.dirty.data_dirty_count(), 64);
+  assert_eq!(grid.dirty.data_dirty_count(), 63);
 
-  // 复刻 poll_pending 的预算换算（upload.rs）：4MB/帧 ÷ 每 tile 下限 132KB → 31 tile/帧
-  let per_tile_floor = (1024 + 32768) * 4; // TILE_BITMAP_WORDS + CELL_DIR_WORDS
-  let budget_n = (4 * 1024 * 1024 / per_tile_floor).clamp(1, 64);
-  assert_eq!(budget_n, 31);
+  // 复刻 poll_pending 的预算换算（upload.rs）：4MB/帧 ÷ PER_CHUNK_BYTES 256KB
+  let per_chunk_budget = 256 * 1024;
+  let budget_n = (4 * 1024 * 1024 / per_chunk_budget).clamp(1, 64);
+  assert_eq!(budget_n, 16);
 
   let mut frames_ms: Vec<f64> = Vec::new();
   let mut frame_bytes: Vec<usize> = Vec::new();
-  let mut frame_tiles: Vec<usize> = Vec::new();
+  let mut frame_chunks: Vec<usize> = Vec::new();
   let mut drained = 0usize;
   while grid.dirty.data_dirty_count() > 0 {
     let coords = grid
@@ -186,8 +156,8 @@ fn incremental_burst_frame_budget() {
     let t0 = Instant::now();
     for c in &coords {
       assert!(
-        matches!(builder.update_tile(&grid, *c), TileUpdate::Rebuilt),
-        "已放 slot 的脏 tile 应走 Rebuilt"
+        matches!(builder.update_chunk(&grid, *c), gate_render::ChunkUpdate::Rebuilt),
+        "已渲染脏 chunk 应走 Rebuilt（{c:?}）"
       );
     }
     let el = t0.elapsed();
@@ -196,25 +166,24 @@ fn incremental_burst_frame_budget() {
       .struct_ranges
       .iter()
       .map(|r| r.1 - r.0)
-      .chain(ranges.leaves_ranges.iter().map(|r| r.1 - r.0))
       .sum();
     frames_ms.push(el.as_secs_f64() * 1000.0);
     frame_bytes.push(bytes);
-    frame_tiles.push(coords.len());
+    frame_chunks.push(coords.len());
     drained += coords.len();
   }
-  assert_eq!(drained, 64, "脏队列必须被预算机制完全消化");
+  assert_eq!(drained, 63, "脏队列必须被预算机制完全消化");
 
   // 断言：任何一帧的重建 CPU 时间 ≤ 2× 帧预算（CI 宽松）；正式数字 println
   for (f, ms) in frames_ms.iter().enumerate() {
     assert!(
       *ms < 2.0 * FRAME_MS,
-      "第 {f} 帧增量重建 {} tiles 耗时 {ms:.2}ms > 2×16.7ms（压满帧预算）",
-      frame_tiles[f]
+      "第 {f} 帧增量重建 {} chunks 耗时 {ms:.2}ms > 2×16.7ms（压满帧预算）",
+      frame_chunks[f]
     );
   }
   println!(
-    "[P2.9b] 增量连发 64 tiles / {} 帧: per-frame={frames_ms:?}ms, dirty_bytes={frame_bytes:?} (合计 {}KB)",
+    "[P2.9b] 增量连发 63 chunks / {} 帧: per-frame={frames_ms:?}ms, dirty_bytes={frame_bytes:?} (合计 {}KB)",
     frames_ms.len(),
     frame_bytes.iter().sum::<usize>() / 1024
   );
@@ -224,13 +193,13 @@ fn incremental_burst_frame_budget() {
 // P2.9c：大场景 DDA 三档（CPU 两级参考实现代理）
 // ============================================================================
 
-/// A 空旷远距：1 tile 有内容，射线自 8192 fine 外穿越空旷区。
+/// A 空旷远距：1 chunk 有内容，射线自 8192 fine 外穿越空旷区。
 /// 哨兵：两级 DDA 空旷射线 ≈ t_max/16 粗步；若退化回单级（16384 fine 步），
 /// 耗时 ×15 立即爆阈值（对应实机 DC 43ms→2.75ms 改造的回归锚）。
 #[test]
 fn dda_regime_a_open_far_budget() {
-  let mut grid = TileGrid::new();
-  fill_box(&mut grid, IVec3::ZERO, IVec3::splat(TILE_FINE), 0, 1);
+  let mut grid = VolumeGrid::new();
+  fill_box(&mut grid, IVec3::ZERO, IVec3::splat(64), 1);
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
 
   let origin = Vec3::new(8192.0, 256.0, 8192.0);
@@ -241,7 +210,7 @@ fn dda_regime_a_open_far_budget() {
   for _ in 0..n {
     // 射线朝场景附近散开：大部分路径空旷，少数命中
     let jitter = rng.dir() * 300.0;
-    let dir = (Vec3::new(256.0, 256.0, 256.0) + jitter - origin).normalize();
+    let dir = (Vec3::new(32.0, 32.0, 32.0) + jitter - origin).normalize();
     if cpu_reference_dda_ray_two_level(&bufs, origin, dir, 16384.0, 16384).is_some() {
       hits += 1;
     }
@@ -258,13 +227,12 @@ fn dda_regime_a_open_far_budget() {
   );
 }
 
-/// B 密集热点：tile 内 16³ 基元胞区域 L2（1cm）满铺异色，26.2 万精细胞。
-/// 射线穿越热点内部 → 细步 + 全寻址链采样。
+/// B 密集热点：64³ 区域 cell=4（level 3 粒度）棋盘满铺，4096 异色块。
+/// 射线穿越热点内部 → 树深 3 层下钻 + palette 采样。
 #[test]
 fn dda_regime_b_dense_l2_budget() {
-  let mut grid = TileGrid::new();
-  // 16³ L0 胞 = 256³ fine，L2 胞 4³ fine → (256/4)³ = 262,144 胞
-  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::splat(256), 2);
+  let mut grid = VolumeGrid::new();
+  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::splat(64), 4);
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
 
   let origin = Vec3::new(-256.0, 128.0, 128.0);
@@ -274,30 +242,30 @@ fn dda_regime_b_dense_l2_budget() {
   let mut hits = 0usize;
   for _ in 0..n {
     let jitter = rng.dir() * 220.0;
-    let dir = (Vec3::new(128.0, 128.0, 128.0) + jitter - origin).normalize();
+    let dir = (Vec3::new(32.0, 32.0, 32.0) + jitter - origin).normalize();
     if cpu_reference_dda_ray_two_level(&bufs, origin, dir, 4096.0, 16384).is_some() {
       hits += 1;
     }
   }
   let el = t0.elapsed();
-  // CI 宽松：命中密集区细步多；阈值 2s/千射线
+  // CI 宽松：命中密集区步进多；阈值 2s/千射线
   assert!(
     el.as_secs_f64() < 2.0,
-    "密集 L2 热点 DDA 千射线耗时 {el:?} > 2s（寻址链或细步扫描疑似退化）"
+    "密集热点 DDA 千射线耗时 {el:?} > 2s（树下钻或细步扫描疑似退化）"
   );
   println!(
-    "[P2.9c-B] 密集 L2 满铺 1000 rays: {el:?} ({:.1}µs/ray) hits={hits}/1000",
+    "[P2.9c-B] 密集热点满铺 1000 rays: {el:?} ({:.1}µs/ray) hits={hits}/1000",
     el.as_micros() as f64 / 1000.0
   );
 }
 
-/// C 最坏树深：L4（0.25cm）满深度热点（预算表口径 ~20 万最细胞，异色），
-/// 射线斜穿热点 → 每 L0 胞都触发全深度分支 + 有界细步上限。
+/// C 最坏树深：1³（level 4）满深度热点（预算口径 ~20 万最细胞，异色），
+/// 射线斜穿热点 → 每 4³ 子块都触发全深度分支 + 有界细步上限。
 #[test]
 fn dda_regime_c_worst_depth_budget() {
-  let mut grid = TileGrid::new();
-  // 4×4×3 L0 胞 × 4096 L4 胞 = 196,608 L4 胞（≈20 万预算口径）
-  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::new(256, 256, 192), 4);
+  let mut grid = VolumeGrid::new();
+  // 64×64×48 = 196,608 个 1³ 最细胞（≈20 万预算口径，棋盘异色防折叠）
+  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::new(64, 64, 48), 1);
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
 
   let origin = Vec3::new(-256.0, -128.0, 96.0);
@@ -307,7 +275,7 @@ fn dda_regime_c_worst_depth_budget() {
   let mut hits = 0usize;
   for _ in 0..n {
     let jitter = rng.dir() * 180.0;
-    let dir = (Vec3::new(128.0, 96.0, 96.0) + jitter - origin).normalize();
+    let dir = (Vec3::new(32.0, 32.0, 24.0) + jitter - origin).normalize();
     if cpu_reference_dda_ray_two_level(&bufs, origin, dir, 4096.0, 16384).is_some() {
       hits += 1;
     }
@@ -325,125 +293,131 @@ fn dda_regime_c_worst_depth_budget() {
 }
 
 // ============================================================================
-// P2.9d：系统内存 + VRAM 布局规模留档（v3.9.1 用户指令：2GB 内存预算断言取消，
-// 仅打印测量值留档；保留布局契约断言防结构漂移）
+// P2.9d：系统内存 + VRAM 布局规模留档（v4 Douglas 格式：仅打印测量值留档，
+// 保留布局契约断言防结构漂移）
 // ============================================================================
 
 #[test]
 fn vram_layout_budget_2gb() {
-  // ① 定长前缀回归锚：index 8MB + bitmaps 4MB + dirs 128MB = 140MB
-  //    （TILE_CAP=1024 的占位虚耗，brickmap.md §6「不做 rank 压缩」）——布局契约保留
-  assert_eq!(NODE_STREAM_BASE * 4, 36_700_160 * 4);
-  let fixed_mb = NODE_STREAM_BASE as f64 * 4.0 / 1048576.0;
-  println!("[P2.9d] 定长前缀 = {fixed_mb:.1}MB");
+  // ① 定长前缀回归锚：Region ① 稠密 chunk 窗口 = 64³ 字 = 1MB
+  assert_eq!(TREE_BASE, 64 * 64 * 64);
+  assert_eq!(TREE_BASE * 4, 1_048_576);
+  println!("[P2.9d] 定长前缀（chunk 窗口）= {:.1}MB", TREE_BASE as f64 * 4.0 / 1048576.0);
 
-  // ② L2 精细化满铺单 tile 的 node stream 成本线：
-  //    预算表 §7「L2 精细化满铺 4M L0 胞 × 152B = 608MB」→ 单 tile（32768 L0 胞）
-  //    ≈ 4.98MB。异色棋盘防折叠，实测外推工作间 122 tiles（256m³）≤ 670MB。
-  let mut grid = TileGrid::new();
-  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::splat(TILE_FINE), 2);
+  // ② 中粒度棋盘单 chunk 的树区成本线：64³ cell=16 棋盘（level 2 粒度异色）
+  let mut grid = VolumeGrid::new();
+  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::splat(64), 16);
   let g = BrickMapBuilder::build_full(&grid).buffers().globals;
-  let node_per_tile = g.node_words as f64 * 4.0;
+  let node_per_chunk = g.node_words as f64 * 4.0;
   println!(
-    "[P2.9d] L2 满铺 1 tile: node={:.2}MB/tile（预算线 4.98MB×1.15）× 122 tiles = {:.0}MB（旧预算 608MB）",
-    node_per_tile / 1048576.0,
-    node_per_tile * 122.0 / 1048576.0
+    "[P2.9d] 中粒度棋盘 1 chunk: node={:.2}KB/chunk × 1000 chunks = {:.1}MB",
+    node_per_chunk / 1024.0,
+    node_per_chunk * 1000.0 / 1048576.0
   );
 
-  // ③ L4 满深度热点（19.7 万最细胞）的 node + brick 实测：预算表「L4 热点 ~1GB /
-  //    BrickPool ≤1GB」口径。20 万胞只占总预算一小部分，实测留档 + 宽断言。
-  let mut grid = TileGrid::new();
-  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::new(256, 256, 192), 4);
+  // ③ L4 满深度热点（19.7 万最细胞）的树区实测：最坏场景留档
+  let mut grid = VolumeGrid::new();
+  fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::new(64, 64, 48), 1);
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
   let node_mb = bufs.globals.node_words as f64 * 4.0 / 1048576.0;
-  let leaves_mb = bufs.b_leaves.len() as f64 * 4.0 / 1048576.0;
   println!(
-    "[P2.9d] L4 满深度热点(19.7万胞): node={node_mb:.1}MB leaves={leaves_mb:.1}MB bricks={}",
-    bufs.globals.brick_slabs
+    "[P2.9d] L4 满深度热点(19.7万胞): node={node_mb:.2}MB（v4 格式 palette 直存节点，无 leaves buffer）"
   );
 
-  // ④ 典型工作间合计：64 典型 tile + 1 L2 满 tile + 1 L4 热点 + 定长前缀，
+  // ④ 典型工作间合计：32 典型 chunk + 1 中粒度 + 1 L4 热点 + 定长前缀，
   //    外推 ×2（CPU 镜像+GPU 同规格）——仅留档
-  let mut grid = TileGrid::new();
-  fill_full_tiles(&mut grid, 0, 62);
+  let mut grid = VolumeGrid::new();
+  fill_chunk_checkers(&mut grid, 0, 32, 16, 4);
   fill_checkerboard(
     &mut grid,
-    IVec3::new(62 * TILE_FINE, 0, 0),
-    IVec3::splat(TILE_FINE),
-    2,
+    IVec3::new(32 * CHUNK_FINE, 0, 0),
+    IVec3::splat(64),
+    16,
   );
   fill_checkerboard(
     &mut grid,
-    IVec3::new(63 * TILE_FINE, 0, 0),
-    IVec3::new(256, 256, 192),
-    4,
+    IVec3::new(33 * CHUNK_FINE, 0, 0),
+    IVec3::new(64, 64, 48),
+    1,
   );
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
   let total_mb =
-    (bufs.b_struct.len() + bufs.b_leaves.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
+    (bufs.b_struct.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
   println!(
-    "[P2.9d] 典型工作间 buffers 合计={total_mb:.1}MB（含 140MB 定长前缀）→ GPU 同规格 + CPU 镜像 ×2 = {:.0}MB（旧预算 2GB）",
+    "[P2.9d] 典型工作间 buffers 合计={total_mb:.2}MB（含 1MB chunk 窗口）→ GPU 同规格 + CPU 镜像 ×2 = {:.1}MB（v4 预算 ≤350MB）",
     total_mb * 2.0
   );
 }
 
 // ============================================================================
-// P2.9e：OBJ 多网格（P2.10 trace_scene）CPU 代理预算——同屏 16 物体
+// P2.9e：物体多网格（trace_volumes）CPU 代理预算——同屏 16 物体
 // ============================================================================
 
 #[test]
 fn obj_16_objects_trace_scene_budget() {
-  use gate_render::OBJ_WORLD;
-
-  // 世界：8 满铺 tile 地面（顶面 y=512）
-  let mut grid = TileGrid::new();
-  fill_full_tiles(&mut grid, 0, 8);
+  // 世界：4 chunk 地面块（顶面 y=64），条带异色防 uniform 折叠
+  let mut grid = VolumeGrid::new();
+  for i in 0..4i32 {
+    fill_box(
+      &mut grid,
+      IVec3::new(i * CHUNK_FINE, 0, 0),
+      IVec3::new(128, 64, 64),
+      (i % 6 + 1) as u8,
+    );
+  }
   let world = BrickMapBuilder::build_full(&grid).buffers().clone();
 
-  // 16 物体：每枚 = 1-tile 芯片（L0 板 + 8 个 L4 杂色点，覆盖 brick slab 路径），
+  // 16 物体：每枚 = 1-chunk 芯片（板 + 8 个杂色点，覆盖分裂下钻路径），
   // 各自旋转角/缩放不同（OBB 剔除 + 局部变换路径全覆盖）
-  let mut chip = TileGrid::new();
-  fill_box(&mut chip, IVec3::ZERO, IVec3::new(128, 16, 128), 0, 3);
+  let mut chip = VolumeGrid::new();
+  fill_box(&mut chip, IVec3::ZERO, IVec3::new(128, 16, 128), 3);
   for i in 0..8 {
-    chip
-      .set_voxel(IVec3::new(16 + i * 16, 32, 64), 4, (i % 3 + 1) as u8)
-      .expect("L0 板占用祖先存在，写入应生效");
+    let edited = chip.set_voxel_ivec3(IVec3::new(16 + i * 16, 32, 64), (i % 3 + 1) as u8);
+    assert!(edited.is_some(), "芯片板占用祖先存在，写入应生效");
   }
-  let chip_bufs = BrickMapBuilder::build_full(&chip).buffers().clone();
-  let objs: Vec<ObjObject> = (0..16)
-    .map(|i| ObjObject {
-      buffers: &chip_bufs,
-      pos: Vec3::new(i as f32 * 512.0, 512.0, 512.0),
-      rot: Mat3::from_rotation_y((i as f32 * 0.4).sin() * 0.6),
-      scale: 1.0 + (i % 4) as f32,
+  // 16 个独立 chip 副本（Phase 3 统一：每物体 = 独立 VolumeGrid，不再共享 pool）
+  let chip_bufs: Vec<_> = (0..16)
+    .map(|_| BrickMapBuilder::build_full(&chip).buffers().clone())
+    .collect();
+  let transforms: Vec<VolumeTransform> = (0..16)
+    .map(|i| {
+      VolumeTransform::new(
+        Vec3::new(i as f32 * 160.0, 64.0, 0.0),
+        Mat3::from_rotation_y((i as f32 * 0.4).sin() * 0.6),
+        1.0 + (i % 4) as f32,
+      )
     })
     .collect();
-  let pool = gate_render::pack_obj_pool(&objs);
+  // vols[0] = 主世界，vols[1..17] = 物体
+  let vols: Vec<(&gate_render::BrickMapBuffers, VolumeTransform)> = std::iter::once((
+    &world as &gate_render::BrickMapBuffers,
+    VolumeTransform::IDENTITY,
+  ))
+  .chain(chip_bufs.iter().zip(transforms.iter().copied()).map(|(b, t)| (b as &gate_render::BrickMapBuffers, t)))
+  .collect();
 
-  // pool 体量留档：v1 每物体 = bitmap 1024w + dirs 32768w + node stream
-  let per_obj_kb = pool.obj_struct.len() as f64 * 4.0 / 1024.0 / objs.len() as f64;
+  // 体量留档：v1 每物体 = 1 chunk 树（窗口 1MB + 树）+ palette
+  let per_obj_kb = chip_bufs[0].b_struct.len() as f64 * 4.0 / 1024.0;
   println!(
-    "[P2.9e] 16 物体 pool: struct={:.1}KB/obj leaves={}w palette={}w descs={}×128B",
+    "[P2.9e] 16 物体: struct={:.1}KB/obj palette={}w",
     per_obj_kb,
-    pool.obj_leaves.len(),
-    pool.obj_palette.len(),
-    pool.descs.len()
+    chip_bufs[0].b_palette.len()
   );
-  assert_eq!(pool.descs.len(), 16);
+  assert_eq!(vols.len(), 17);
 
-  // 射线自上方朝地面/物体散开：物体顶面（y≥512+32·scale）近于世界顶面 →
-  // 一部分命中物体（obj!=WORLD），一部分直击地面（WORLD），两路径都覆盖
-  let origin = Vec3::new(4096.0, 2600.0, 4096.0);
+  // 射线自上方朝地面/物体散开：物体顶面（y≥64+16·scale）高于地面顶面 →
+  // 一部分命中物体（obj_id≥0），一部分直击地面（obj_id=-1），两路径都覆盖
+  let origin = Vec3::new(2048.0, 1300.0, 2048.0);
   let mut rng = Lcg(0x00FEDE1E);
   let n = 1000;
   let t0 = Instant::now();
   let (mut obj_hits, mut world_hits) = (0usize, 0usize);
   for _ in 0..n {
-    let tx = (rng.next_u32() % 8192) as f32;
-    let tz = (rng.next_u32() % 4096) as f32;
-    let dir = (Vec3::new(tx, 512.0, tz) - origin).normalize();
-    match cpu_reference_trace_scene(&world, &pool, origin, dir, 16384.0) {
-      Some(h) if h.obj != OBJ_WORLD => obj_hits += 1,
+    let tx = (rng.next_u32() % 2048) as f32;
+    let tz = (rng.next_u32() % 64) as f32;
+    let dir = (Vec3::new(tx, 64.0, tz) - origin).normalize();
+    match cpu_reference_trace_volumes(&vols, origin, dir, 8192.0) {
+      Some(h) if h.obj_id >= 0 => obj_hits += 1,
       Some(_) => world_hits += 1,
       None => {}
     }
@@ -456,10 +430,10 @@ fn obj_16_objects_trace_scene_budget() {
   // CI 宽松：每射线 = 世界 DDA + 16×(AABB 剔除 ~0 / 少量物体 DDA)；1s ≈ 30× 余量
   assert!(
     el.as_secs_f64() < 1.0,
-    "16 物体 trace_scene 千射线耗时 {el:?} > 1s（物体剔除/局部 DDA 疑似退化）"
+    "16 物体 trace_volumes 千射线耗时 {el:?} > 1s（物体剔除/局部 DDA 疑似退化）"
   );
   println!(
-    "[P2.9e] trace_scene 1000 rays ×16 obj: {el:?} ({:.1}µs/ray) obj_hits={obj_hits} world_hits={world_hits}",
+    "[P2.9e] trace_volumes 1000 rays ×16 obj: {el:?} ({:.1}µs/ray) obj_hits={obj_hits} world_hits={world_hits}",
     el.as_micros() as f64 / 1000.0
   );
 }

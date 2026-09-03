@@ -17,42 +17,26 @@
 //   @group(1) @binding(2) = b_palette: array<u32>（palette 256 entries × 2 words = 512 words）
 //   @group(1) @binding(3) = uniform BrickMapGlobals（scalar 字段 20×u32/i32 = 80B）
 //
-// BG2（P2.10 OBJ object pool，与 Rust GpuObjPool 1:1 对应）：
-//   @group(2) @binding(0) = obj_struct: array<u32>（逐对象 [bitmap|dirs|node] 拼接）
-//   @group(2) @binding(1) = obj_leaves: array<u32>（brick slab 池拼接）
-//   @group(2) @binding(2) = obj_palette: array<u32>（逐对象 256×2w 拼接）
-//   @group(2) @binding(3) = obj_descs: array<u32>（32 words/物体，f32 字段 bitcast）
-//   @group(2) @binding(4) = uniform ObjGlobals（count，16B）
+// BG2（Phase 3 OBJ→Volume 统一：GridDesc 数组，与 Rust GpuBrickMap.grid_descs_buf 1:1）：
+//   @group(2) @binding(0) = grid_descs: array<GridDesc>（144B/entry，主世界 + 物体统一描述符）
+//   shader `dda_main` 用 `arrayLength(&grid_descs)` 取 volume 数，遍历 trace_grid 无 kind 分支。
 //
 // 顶部常量与 Rust `brickmap::dda::wgsl_consts` 完全一致（单测 TR-2.1 assert_eq 防漂移）。
 // BrickMap 五步寻址链严格对应 Rust `gate-render/src/brickmap/view.rs::get_voxel`（逐段注释 L 号）。
 // Slot 打包规则对应 Rust `gate-render/src/brickmap/wire.rs::encode_slot/unpack_slot_word/pack_palette_entry`。
-// trace_grid 统一 DDA（主网格 + 逐物体 OBJ），OBJ 等价性单测锁死 CPU 侧。
+// trace_grid 统一 DDA（主网格 + 逐物体 GridDesc），OBJ 等价性单测锁死 CPU 侧。
 // ============================================================================
 
 // --- 常量区（与 Rust wgsl_consts mod 字节对齐）---
-const TILE_INDEX_CAP: u32 = 128u;
-const TILE_CAP: u32 = 1024u;
-const BITMAP_BASE: u32 = 2097152u;     // 128^3
-const TILE_BITMAP_WORDS: u32 = 1024u;  // 32^3 / 32
-const DIR_BASE: u32 = 3145728u;        // BITMAP_BASE + TILE_CAP*TILE_BITMAP_WORDS = 2097152+1048576
-const CELL_DIR_WORDS: u32 = 32768u;    // 32^3
-const HDR_UNIFORM_MASK: u32 = 0xFFu;
-const HDR_HAS_L1: u32 = 256u;          // 1<<8
-const HDR_HAS_L2: u32 = 512u;          // 1<<9
-const HDR_HAS_L3: u32 = 1024u;         // 1<<10
-const HDR_HAS_BRICK: u32 = 2048u;      // 1<<11
-const BRICK_SLAB_WORDS: u32 = 1024u;   // 4096B / 4
-const ST_L1_WORDS: u32 = 4u;
-const ST_L2_WORDS: u32 = 32u;
-const ST_L3_WORDS: u32 = 256u;
-const ST_BRICK_PTR_WORDS: u32 = 2u;    // hdr + slab_ptr = 2 words
-const TILE_SUB: u32 = 512u;            // tile 边长（fine units = 32 cells × 16 sub/cell）
-const SUB_PER_CELL: u32 = 16u;         // 基元胞边长（fine units）
-// OBJ（P2.10）
-const NODE_STREAM_BASE: u32 = 36700160u;  // 128³ + 1024×1024 + 1024×32768（wire.rs）
-const OBJ_DESC_WORDS: u32 = 32u;          // 128B / 4 = 32 words/物体 descriptor
-const LOCAL_TILE_FINE: u32 = 512u;        // 物体局部 tile 边长（v1 每物体恰 1 tile）
+// Douglas Brick Tree：256³ chunk，4³ 分裂因子，4 层（256→64→16→4→1）
+const CHUNK_SIZE: u32 = 256u;
+const BRICK_FACTOR: u32 = 4u;
+const MAX_LEVEL: u32 = 4u;
+const NODE_FIXED_WORDS: u32 = 3u;    // mask_lo + mask_hi + palette
+// b_struct Region ①：稠密 chunk 窗口（64³ = 262144 字 = 1MB）
+const CHUNK_INDEX_CAP: u32 = 64u;
+const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
+const TREE_BASE: u32 = 262144u;          // Region ② 起始
 
 // ---- Pure face math helpers (no hashmap dependency) ----
 fn face_index_from_normal(n: vec3<f32>) -> u32 {
@@ -80,19 +64,6 @@ fn face_color_from_index(f: u32) -> vec3<f32> {
   return vec3<f32>(1.0);
 }
 
-// Slot 编码（wire.rs encode_slot / unpack_slot_word）
-// tag: 最高 8bit (u16)，palette: 低 8bit
-fn slot_pack(tag: u32, pal: u32) -> u32 {
-  return ((tag & 0xFFu) << 8u) | (pal & 0xFFu);
-}
-fn slot_unpack(word: u32, half: u32) -> u32 {
-  // half=0 → lower 16bit; half=1 → upper 16bit
-  let shift = half * 16u;
-  return (word >> shift) & 0xFFFFu;
-}
-fn slot_tag(slot: u32) -> u32 { return (slot >> 8u) & 0xFFu; }
-fn slot_palette(slot: u32) -> u32 { return slot & 0xFFu; }
-
 // palette 解包（wire.rs pack_palette_entry 反函数，palette_idx = 0 => AIR，调用方已提前返回）
 // word_0 = color.r | color.g<<8 | color.b<<16 | roughness<<24
 // 返回 sRGB 颜色分量 [0,255] → 外部再转 f32
@@ -103,12 +74,6 @@ fn palette_rgb_u8(pal_idx: u32) -> vec3<u32> {
   let b = (w0 >> 16u) & 0xFFu;
   return vec3<u32>(r, g, b);
 }
-
-// Tag 常量（与 wire.rs SLOT_TAG_EMPTY/LEAF/BRANCH 一致；定义在 wire.rs：
-// const SLOT_TAG_EMPTY = 0; SLOT_TAG_LEAF = 1; SLOT_TAG_BRANCH = 2）
-const TAG_EMPTY: u32 = 0u;
-const TAG_LEAF: u32 = 1u;
-const TAG_BRANCH: u32 = 2u;
 
 // --- BG0：输出 + 视图 uniform（v5 single-pass per-pixel shade_hit）---
 // @binding(0) = out storage write（rgba8unorm，linear RGB；ACES → sRGB 后输出）
@@ -151,18 +116,31 @@ struct Globals {
 }
 @group(1) @binding(3) var<uniform> g: Globals;
 
-// --- BG2：OBJ object pool（P2.10）---
-@group(2) @binding(0) var<storage, read> obj_struct: array<u32>;
-@group(2) @binding(1) var<storage, read> obj_leaves: array<u32>;
-@group(2) @binding(2) var<storage, read> obj_palette: array<u32>;
-@group(2) @binding(3) var<storage, read> obj_descs: array<u32>;
-struct ObjGlobals {
-  count: u32,
+// --- BG2：GridDesc 数组（Phase 3 OBJ→Volume 统一；144B/entry，与 Rust GridDesc 字节一致）---
+//   主世界 = grid_descs[0]（identity 变换），物体 = grid_descs[1..N]
+//   每个 GridDesc 携带变换、世界 AABB、tree_base（在 b_struct 内绝对字基址）、
+//   palette_base（在 b_palette 内绝对字基址）、chunk 窗口 origin/dims。
+struct GridDesc {
+  pos_scale: vec4<f32>,   // xyz = 位置，w = scale
+  rot0: vec4<f32>,        // xyz = 旋转矩阵列 0，w = 0
+  rot1: vec4<f32>,        // xyz = 旋转矩阵列 1，w = 0
+  rot2: vec4<f32>,        // xyz = 旋转矩阵列 2，w = 0
+  aabb_min: vec4<f32>,    // xyz = 世界 AABB min，w = 0
+  aabb_max: vec4<f32>,    // xyz = 世界 AABB max，w = 0
+  tree_base: u32,         // b_struct 内本 volume 树基址（含 chunk 窗口段）
+  tree_depth: u32,        // 4（Douglas Brick Tree 最大分裂深度）
+  chunk_count: u32,       // 本 volume 的 chunk 数
+  palette_base: u32,      // b_palette 内本 volume palette 基址
+  index_origin_x: i32,    // chunk 窗口 origin（chunk 单位）
+  index_origin_y: i32,
+  index_origin_z: i32,
   _pad0: u32,
+  index_dims_x: u32,      // chunk 窗口 dims（chunk 单位）
+  index_dims_y: u32,
+  index_dims_z: u32,
   _pad1: u32,
-  _pad2: u32,
 }
-@group(2) @binding(4) var<uniform> obj_g: ObjGlobals;
+@group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
 
 // ---- BG3：光源池（P3.1；P3.2 发光元件并入，816B：48B header + 16×48B）----
 struct LightGlobals {
@@ -190,132 +168,66 @@ struct LightPool {
 @group(3) @binding(0) var<uniform> light_u: LightPool;
 
 
-// ============================================================================
-// 五步寻址链 sample_brickmap(fine: vec3<i32>) -> u32 (palette_idx, 0=AIR)
-// 严格对应 view.rs get_voxel L55-147：
-//   ① TileIndex 查找（view.rs L59-66）
-//   ② TileBitmaps 空位检测（view.rs L68-75）
-//   ③ CellDirs node 绝对字偏移（view.rs L77-84）
-//   ④ walk_node 四级槽（L1→L2→L3→BRICK）解包（view.rs L86-147）
-// ============================================================================
-fn sample_brickmap(fine: vec3<i32>) -> u32 {
-  // ---- VoxelPos::from_fine(fine, MAX_LEVEL=4)：tile + cell + in_cell ----
-  // 欧氏余数（负坐标正确落邻接 tile）：m = ((fine % 512) + 512) % 512 ∈ 0..511
-  // tile = (fine - m)/512；cell = m/16（0..31）；in_cell = m - cell*16（0..15）
-  let m = ((fine % vec3<i32>(i32(TILE_SUB))) + vec3<i32>(i32(TILE_SUB))) % vec3<i32>(i32(TILE_SUB));
-  let tile_i = (fine - m) / vec3<i32>(i32(TILE_SUB));
-  let cell_i = m / vec3<i32>(i32(SUB_PER_CELL));             // 0..31
-  let in_cell = m - cell_i * vec3<i32>(i32(SUB_PER_CELL));   // 0..15
-  let it = vec3<u32>(cell_i);                                // cell 0..31
-
-  // ---- ① TileIndex：g.index_origin/dims windowing（view.rs L59-66 index_pos） ----
-  let origin = vec3<i32>(g.index_origin_x, g.index_origin_y, g.index_origin_z);
-  let dims = vec3<u32>(g.index_dims_x, g.index_dims_y, g.index_dims_z);
-  let rel = tile_i - origin;
+// Douglas Brick Tree mask DDA 采样（1:1 复刻 devlog #17/#18）
+// fine → chunk 窗口定位 → DFS 树 4 层 mask 遍历 → palette
+// Phase 3 统一：从 Grid 参数读取 tree_base / index_origin / index_dims，
+// 而非 BG1 globals（主世界 + 物体走同一路径，b_struct[tree_base + ...] 取树）。
+fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
+  // ---- chunk 窗口定位 ----
+  let m = ((fine % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
+  let chunk_i = (fine - m) / vec3<i32>(i32(CHUNK_SIZE));
+  let origin = g.index_origin;
+  let dims = g.index_dims;
+  let rel = chunk_i - origin;
   if (any(rel < vec3<i32>(0))) { return 0u; }
-  // vecN<T>(vecN<U>) 整体转换构造（WGSL 无 i32→u32 隐式转换，分量混型构造非法）；
-  // rel >= 0 已在上方检查，转换安全
   let rel_u = vec3<u32>(rel);
   if (any(rel_u >= dims)) { return 0u; }
-  let index_addr = rel_u.x + rel_u.y * TILE_INDEX_CAP + rel_u.z * (TILE_INDEX_CAP * TILE_INDEX_CAP);
-  let slot_idx = b_struct[index_addr];      // 0 = empty tile
-  if (slot_idx == 0u) { return 0u; }
-  // slot_idx 是 1-based tile 槽（wire.rs slot of tile）
-  let slot = slot_idx - 1u;
+  // Region ① chunk 窗口：entry = 本 volume 内树相对字基址 + 1（0 = 无此 chunk）
+  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+  let entry = b_struct[index_addr];
+  if (entry == 0u) { return 0u; }
+  // 统一 buffer 内绝对字基址 = volume 基址 + entry - 1（entry 编码的是本 volume 内相对地址）
+  let chunk_base = g.tree_base + entry - 1u;
 
-  // ---- ② TileBitmaps：bitmap[slot] 中 in_tile coarse bit（view.rs L68-75） ----
-  // 位索引 = (it.z/8)*16 + (it.y/8)*4 + (it.x/8) = 4x4x4 coarse cell bit
-  let coarse_x = it.x >> 3u;   // /8
-  let coarse_y = it.y >> 3u;
-  let coarse_z = it.z >> 3u;
-  let bit_index = ((coarse_z << 4u) | (coarse_y << 2u) | coarse_x);  // 0..63? 不 4*4*4=64
-  // 等等 4x4x4=64 bits? 但 in_cell_idx 一般 = (z/2)*(16*16)+(y/2)*16+(x/2) 在 tile
-  // 让我们严格按 view.rs L71 bitmap_index_of 的实现：
-  // view.rs L71-72: let i = cell.in_cell_idx(); let bit = 1u32 << (i & 31); b_struct[addr + (i >> 5)] & bit
-  // cell.in_cell_idx() = z*1024 + y*32 + x（32³ cell index, 0-based in tile）
-  let cell_in_tile = it.z * 1024u + it.y * 32u + it.x;  // 0..32767（z-major，与 coords.rs cell_index 一致）
-  let bitmap_addr = BITMAP_BASE + slot * TILE_BITMAP_WORDS + (cell_in_tile >> 5u);
-  let bitmap_word = b_struct[bitmap_addr];
-  let bitmap_bit = 1u << (cell_in_tile & 31u);
-  if ((bitmap_word & bitmap_bit) == 0u) { return 0u; }
+  // ---- DFS 4 层 mask 遍历 ----
+  let local = vec3<u32>(m);  // chunk 内 fine 坐标 0..255
+  var node_addr = chunk_base;
+  for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
+    let mask_lo = b_struct[node_addr];
+    let mask_hi = b_struct[node_addr + 1u];
+    let palette = b_struct[node_addr + 2u];
 
-  // ---- ③ CellDirs：node 绝对字偏移（view.rs L77-84） ----
-  let dir_addr = DIR_BASE + slot * CELL_DIR_WORDS + cell_in_tile;
-  let node_abs = b_struct[dir_addr];  // 绝对 word 偏移（相对于 b_struct[0]）
-  if (node_abs == 0u) { return 0u; }
+    // 该层 4³ 子块索引：shift = 8 - (level+1)*2（level 0:>>6, 1:>>4, 2:>>2, 3:>>0）
+    let shift = 8u - (level + 1u) * 2u;
+    let cx = (local.x >> shift) & 3u;
+    let cy = (local.y >> shift) & 3u;
+    let cz = (local.z >> shift) & 3u;
+    let child_idx = cz * 16u + cy * 4u + cx;  // z*16+y*4+x（与 child_linear_idx 一致）
 
-  // ---- ④ Walk Node：hdr + L1→L2→L3→BRICK（view.rs L86-147 walk_node） ----
-  // Rust 侧 sub 是「cell 内分量坐标」IVec3（0..15，各分量独立），不是线性索引！
-  // slot_at(sub: IVec3, axis) = sub.x + sub.y*axis + sub.z*axis²（x 最低位）
-  //   L1: slot_at(sub >> 3, 2) → 2³=8 槽（ST_L1_WORDS=4 words × 2 slot/word）
-  //   L2: slot_at(sub >> 2, 4) → 4³=64 槽（32 words）
-  //   L3: slot_at(sub >> 1, 8) → 8³=512 槽（256 words）
-  //   L4: slot_at(sub, 16)     → 16³=4096 byte brick（1024 words/slab）
-  var p: u32 = node_abs;
-  let hdr = b_struct[p];
-  p = p + 1u;
-  // L0 uniform: hdr&HDR_UNIFORM_MASK != 0 → palette
-  let uniform = hdr & HDR_UNIFORM_MASK;
-  if (uniform != 0u) {
-    return uniform;
+    // mask 64-bit 拆两个 u32：child_idx < 32 → mask_lo, >= 32 → mask_hi
+    var mask_word: u32 = mask_lo;
+    var bit_in_word: u32 = child_idx;
+    if (child_idx >= 32u) {
+      mask_word = mask_hi;
+      bit_in_word = child_idx - 32u;
+    }
+    let bit = 1u << bit_in_word;
+    if ((mask_word & bit) == 0u) {
+      return palette;  // uniform leaf（palette=0 = AIR）
+    }
+
+    // 分裂 → child offset = popcount(mask 中 child_idx 之前的 set bits)
+    var popcount_below: u32;
+    if (child_idx < 32u) {
+      popcount_below = countOneBits(mask_lo & ((1u << bit_in_word) - 1u));
+    } else {
+      popcount_below = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
+    }
+    let child_offset = b_struct[node_addr + NODE_FIXED_WORDS + popcount_below];
+    node_addr = chunk_base + child_offset;  // chunk 内相对 → 绝对
   }
-  // L1 slot table（view.rs L88-101）
-  if ((hdr & HDR_HAS_L1) == 0u) { return 0u; }
-
-  let sub_u = vec3<u32>(in_cell);  // 0..15
-
-  // L1: slot_at(sub >> 3, 2) = s.x + s.y*2 + s.z*4
-  let s1 = sub_u >> vec3<u32>(3u);  // 各分量 0..1
-  var idx = s1.x + s1.y * 2u + s1.z * 4u;
-  let w_addr0 = p + (idx >> 1u);
-  let w0 = b_struct[w_addr0];
-  var slot_u = slot_unpack(w0, idx & 1u);
-  var tag = slot_tag(slot_u);
-  var pal = slot_palette(slot_u);
-  if (tag == TAG_EMPTY) { return 0u; }
-  if (tag == TAG_LEAF) { return pal; }
-  // BRANCH → 加 L1 words
-  p = p + ST_L1_WORDS;
-
-  // L2: slot_at(sub >> 2, 4) = s.x + s.y*4 + s.z*16
-  let s2 = sub_u >> vec3<u32>(2u);  // 0..3
-  idx = s2.x + s2.y * 4u + s2.z * 16u;
-  if ((hdr & HDR_HAS_L2) == 0u) { return 0u; }
-  let w_addr1 = p + (idx >> 1u);
-  let w1 = b_struct[w_addr1];
-  slot_u = slot_unpack(w1, idx & 1u);
-  tag = slot_tag(slot_u);
-  pal = slot_palette(slot_u);
-  if (tag == TAG_EMPTY) { return 0u; }
-  if (tag == TAG_LEAF) { return pal; }
-  p = p + ST_L2_WORDS;
-
-  // L3: slot_at(sub >> 1, 8) = s.x + s.y*8 + s.z*64
-  let s3 = sub_u >> vec3<u32>(1u);  // 0..7
-  idx = s3.x + s3.y * 8u + s3.z * 64u;
-  if ((hdr & HDR_HAS_L3) == 0u) { return 0u; }
-  let w_addr2 = p + (idx >> 1u);
-  let w2 = b_struct[w_addr2];
-  slot_u = slot_unpack(w2, idx & 1u);
-  tag = slot_tag(slot_u);
-  pal = slot_palette(slot_u);
-  if (tag == TAG_EMPTY) { return 0u; }
-  if (tag == TAG_LEAF) { return pal; }
-  p = p + ST_L3_WORDS;
-
-  // L4 BRICK: view.rs L136-147
-  // slab = b_struct[p] - 1；idx = slot_at(sub, 16) = s.x + s.y*16 + s.z*256
-  // brick 存 bytes：word = b_leaves[slab*BRICK_SLAB_WORDS + (idx/4)]，pal = (word >> (idx%4)*8) & 0xFF
-  if ((hdr & HDR_HAS_BRICK) == 0u) { return 0u; }
-  let slab_minus_1 = b_struct[p];
-  if (slab_minus_1 == 0u) { return 0u; }
-  let slab = slab_minus_1 - 1u;
-  let idx_l4 = sub_u.x + sub_u.y * 16u + sub_u.z * 256u;  // 0..4095
-  let leaf_addr = slab * BRICK_SLAB_WORDS + (idx_l4 >> 2u);
-  if (leaf_addr >= arrayLength(&b_leaves)) { return 0u; }
-  let leaf_word = b_leaves[leaf_addr];
-  let brick_pal = (leaf_word >> ((idx_l4 & 3u) << 3u)) & 0xFFu;
-  return brick_pal;
+  // level 4（1³ leaf）：mask 全 0，直接读 palette
+  return b_struct[node_addr + 2u];
 }
 
 // A&W：给定当前细格坐标分量与步进方向，返回下一格边界的坐标
@@ -332,25 +244,60 @@ fn next_coarse_boundary(c: i32, s: i32) -> f32 {
   return f32(c << 4);
 }
 
-// cell 级占用查询（寻址链 ①TileIndex + ②TileBitmaps；两级 DDA 粗步专用）。
-// Rust BrickMapView::cell_occupied 的逐字翻译。cc 为 cell 坐标（1 单位 = 16 fine）。
-// 语义：false ⇒ 该 cell 内全部 16³ fine 位置 sample 均为空。成本 2 次 load（全链 4~10 次）。
-fn cell_occupied(cc: vec3<i32>) -> bool {
-  let tile_i = vec3<i32>(cc >> vec3<u32>(5u));       // 32 cell / tile（i32 算术右移，负坐标正确；移位量须 u32）
-  let it = vec3<u32>(cc & vec3<i32>(31)); // in-tile cell（欧氏余数；转 u32 供位运算）
-  let origin = vec3<i32>(g.index_origin_x, g.index_origin_y, g.index_origin_z);
-  let dims = vec3<u32>(g.index_dims_x, g.index_dims_y, g.index_dims_z);
-  let rel = tile_i - origin;
+// Brick Tree 占用检查：coarse cell（16³）内是否有非空体素
+// 走 DFS 到 level 2（16³ brick），mask=0 → palette!=0 即占用；mask!=0 → 分裂=有内容
+// Phase 3 统一：从 Grid 参数读取 tree_base / index_origin / index_dims。
+fn cell_occupied(g: Grid, cc: vec3<i32>) -> bool {
+  let fine = cc * 16;
+  // ---- chunk 窗口定位 ----
+  let m = ((fine % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
+  let chunk_i = (fine - m) / vec3<i32>(i32(CHUNK_SIZE));
+  let origin = g.index_origin;
+  let dims = g.index_dims;
+  let rel = chunk_i - origin;
   if (any(rel < vec3<i32>(0))) { return false; }
   let rel_u = vec3<u32>(rel);
   if (any(rel_u >= dims)) { return false; }
-  let index_addr = rel_u.x + rel_u.y * TILE_INDEX_CAP + rel_u.z * (TILE_INDEX_CAP * TILE_INDEX_CAP);
-  let slot_idx = b_struct[index_addr];    // 0 = empty tile
-  if (slot_idx == 0u) { return false; }
-  let slot = slot_idx - 1u;
-  let cell_in_tile = it.z * 1024u + it.y * 32u + it.x;  // z-major，与 sample_brickmap 一致
-  let bitmap_word = b_struct[BITMAP_BASE + slot * TILE_BITMAP_WORDS + (cell_in_tile >> 5u)];
-  return ((bitmap_word >> (cell_in_tile & 31u)) & 1u) != 0u;
+  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+  let entry = b_struct[index_addr];
+  if (entry == 0u) { return false; }
+  let chunk_base = g.tree_base + entry - 1u;
+
+  // ---- DFS 到 level 2（16³ brick）----
+  let local = vec3<u32>(m);
+  var node_addr = chunk_base;
+  for (var level = 0u; level < 2u; level = level + 1u) {
+    let mask_lo = b_struct[node_addr];
+    let mask_hi = b_struct[node_addr + 1u];
+    let palette = b_struct[node_addr + 2u];
+    let shift = 8u - (level + 1u) * 2u;
+    let cx = (local.x >> shift) & 3u;
+    let cy = (local.y >> shift) & 3u;
+    let cz = (local.z >> shift) & 3u;
+    let child_idx = cz * 16u + cy * 4u + cx;
+    var mask_word: u32 = mask_lo;
+    var bit_in_word: u32 = child_idx;
+    if (child_idx >= 32u) {
+      mask_word = mask_hi;
+      bit_in_word = child_idx - 32u;
+    }
+    let bit = 1u << bit_in_word;
+    if ((mask_word & bit) == 0u) {
+      // uniform brick：palette!=0 即占用
+      return palette != 0u;
+    }
+    // 分裂 → 下钻
+    var popcount_below: u32;
+    if (child_idx < 32u) {
+      popcount_below = countOneBits(mask_lo & ((1u << bit_in_word) - 1u));
+    } else {
+      popcount_below = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
+    }
+    let child_offset = b_struct[node_addr + NODE_FIXED_WORDS + popcount_below];
+    node_addr = chunk_base + child_offset;
+  }
+  // level 2 brick 分裂了 → 有内容
+  return true;
 }
 
 // ============================================================================
@@ -394,56 +341,54 @@ fn slab_box(ro: vec3<f32>, rd: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>, t0: f32,
 }
 
 // ============================================================================
-// 统一 DDA 核心（方案二：trace_scene 抽象）
-// world brickmap 和 obj object 本质都是体素网格 DDA——用相同的 slab→coarse→fine
-// 流程，差异通过 Grid 参数化（数据源 kind + 变换矩阵 + cell 范围）。
-// ============================================================================
-// Grid：统一网格追踪上下文——所有网格一视同仁，零 world/object/obj 概念差异
-// 差异只通过 kind + bmp_base 等数据源字段吸收到 sample_voxel/cell_occupied 内部
+// 统一 DDA 核心（Phase 3 OBJ→Volume 统一）
+// 主世界和物体本质都是体素网格 DDA——用相同的 slab→coarse→fine 流程，
+// 差异通过 Grid 参数化（tree_base + 变换矩阵 + chunk 窗口）。
+// 零 kind 分支：所有 grid 从统一 b_struct[tree_base..] 读树、b_palette[palette_base..] 取色。
 // ============================================================================
 
-// 统一命中结构：hit/t/pal/n(世界空间法线)/face_id(0..5)/obj_id(-1=主网格,>=0=obj)
+// 统一命中结构：hit/t/pal/n(世界空间法线)/face_id(0..5)/obj_id(-1=主世界,>=0=物体)
 struct UnifiedHit {
   hit: bool,
   t: f32,
   pal: u32,
   n: vec3<f32>,        // 世界空间法线（光影用）
   face_id: u32,        // 命中面 0..5（与 face_index_from_normal 对齐）
-  obj_id: i32,         // -1 = 主网格, >=0 = obj 物体
+  obj_id: i32,         // -1 = 主世界, >=0 = 物体索引
 }
 
-// 统一网格上下文——一套 DDA 跑所有网格
+// 统一网格上下文——一套 DDA 跑所有网格（主世界 + 物体）
+// 由 `make_grid(idx)` 从 `grid_descs[idx]` 构造；携带 tree_base/palette_base/
+// index_origin/dims 作为数据源基址，trace_grid → fine_scan_cell → grid_sample_voxel
+// 全链统一从 b_struct[tree_base + ...] / b_palette[palette_base + ...] 取数据。
 struct Grid {
-  kind: u32,                    // 0 = brickmap, 1 = obj
   w_mn: vec3<f32>,              // 世界 AABB min
   w_mx: vec3<f32>,              // 世界 AABB max
-  l_min: vec3<f32>,             // 局部 AABB min（fine 坐标）
-  l_max: vec3<f32>,             // 局部 AABB max（fine 坐标）
+  l_min: vec3<f32>,             // 局部 AABB min（fine 坐标）= vec3(0.0)
+  l_max: vec3<f32>,             // 局部 AABB max（fine 坐标）= vec3(256.0)
   cc_min: vec3<i32>,            // coarse cell 范围 min
   cc_max: vec3<i32>,            // coarse cell 范围 max
   max_coarse_steps: u32,
-  col0: vec3<f32>,              // 变换矩阵列
+  col0: vec3<f32>,              // 变换矩阵列（旋转）
   col1: vec3<f32>,
   col2: vec3<f32>,
-  obj_pos: vec3<f32>,
+  pos: vec3<f32>,               // 物体位置
   scale: f32,
-  bmp_base: u32,                // obj 数据源字段（brickmap 时为 0）
-  dir_b: u32,
-  node_b: u32,
-  leaves_b: u32,
-  obj_id: i32,
+  tree_base: u32,               // b_struct 内本 volume 树基址（含 chunk 窗口段）
+  palette_base: u32,            // b_palette 内本 volume palette 基址
+  index_origin: vec3<i32>,      // chunk 窗口 origin（chunk 单位）
+  index_dims: vec3<u32>,        // chunk 窗口 dims（chunk 单位）
+  obj_id: i32,                  // -1 = 主世界，>=0 = 物体索引（debug/implicit normal 用）
 }
 
-// cell 占用查询——唯一允许 kind 分支的地方
+// cell 占用查询——统一入口，零 kind 分支
 fn grid_cell_occupied(g: Grid, cc: vec3<i32>) -> bool {
-  if (g.kind == 0u) { return cell_occupied(cc); }
-  return obj_cell_occupied(g.bmp_base, cc);
+  return cell_occupied(g, cc);
 }
 
-// 体素采样——唯一允许 kind 分支的地方
+// 体素采样——统一入口，零 kind 分支
 fn grid_sample_voxel(g: Grid, fc: vec3<i32>) -> u32 {
-  if (g.kind == 0u) { return sample_brickmap(fc); }
-  return obj_sample_voxel(g.bmp_base, g.dir_b, g.node_b, g.leaves_b, fc);
+  return sample_brickmap(g, fc);
 }
 
 // 统一两级 DDA：slab→coarse→fine_scan_cell（完全通用，零 kind 分支）
@@ -456,7 +401,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Unified
   let t_hi_cap = min(bx.y, t_cap);
   if (t_hi_cap <= max(bx.x, 0.0)) { return miss; }
   // ---- 局部变换 ----
-  let wp = origin - g.obj_pos;
+  let wp = origin - g.pos;
   let ro = vec3<f32>(dot(wp, g.col0), dot(wp, g.col1), dot(wp, g.col2)) / g.scale;
   let rd = vec3<f32>(dot(dir, g.col0), dot(dir, g.col1), dot(dir, g.col2)) / g.scale;
   // ---- 局部 AABB slab ----
@@ -514,151 +459,30 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Unified
   return miss;
 }
 
-// 构造主网格（brickmap）Grid——identity 变换，brickmap tile-window AABB
-fn make_world_grid() -> Grid {
-  let tile_origin_fine = vec3<f32>(
-    f32(g.index_origin_x) * 512.0,
-    f32(g.index_origin_y) * 512.0,
-    f32(g.index_origin_z) * 512.0,
-  );
-  let aabb_min = tile_origin_fine;
-  let aabb_max = tile_origin_fine + vec3<f32>(
-    f32(g.index_dims_x) * 512.0,
-    f32(g.index_dims_y) * 512.0,
-    f32(g.index_dims_z) * 512.0,
-  );
-  let tile_origin = vec3<i32>(g.index_origin_x, g.index_origin_y, g.index_origin_z);
-  let tile_dims = vec3<i32>(i32(g.index_dims_x), i32(g.index_dims_y), i32(g.index_dims_z));
-  let cc_min = tile_origin * 32;
-  let cc_max = (tile_origin + tile_dims) * 32 - vec3<i32>(1i, 1i, 1i);
-  let coarse_budget = (tile_dims.x + tile_dims.y + tile_dims.z) * 32;
+// 构造统一 Grid：从 grid_descs[idx] 解码所有字段（主世界 idx=0，物体 idx≥1）。
+// 主世界 = identity 变换（pos=0/rot=I/scale=1），物体 = 任意变换。
+// chunk 窗口 cc_min/cc_max 由 GridDesc.index_origin/dims 算出；物体 dims=(1,1,1)。
+fn make_grid(idx: u32) -> Grid {
+  let d = grid_descs[idx];
+  let origin = vec3<i32>(d.index_origin_x, d.index_origin_y, d.index_origin_z);
+  let dims = vec3<i32>(i32(d.index_dims_x), i32(d.index_dims_y), i32(d.index_dims_z));
+  let cc_min = origin * 16;
+  let cc_max = (origin + dims) * 16 - vec3<i32>(1i, 1i, 1i);
+  let coarse_budget = (dims.x + dims.y + dims.z) * 16;
   let coarse_limit = u32(coarse_budget) * 3u;
   return Grid(
-    0u,                                        // kind = brickmap
-    aabb_min, aabb_max,
-    aabb_min, aabb_max,
+    d.aabb_min.xyz, d.aabb_max.xyz,       // 世界 AABB
+    vec3<f32>(0.0), vec3<f32>(f32(CHUNK_SIZE)),  // 局部 AABB [0,256]³
     cc_min, cc_max,
     coarse_limit,
-    vec3<f32>(1.0, 0.0, 0.0),                  // col0 identity
-    vec3<f32>(0.0, 1.0, 0.0),
-    vec3<f32>(0.0, 0.0, 1.0),
-    vec3<f32>(0.0, 0.0, 0.0),                  // obj_pos
-    1.0,                                       // scale
-    0u, 0u, 0u, 0u,                            // obj 字段无用
-    -1i,                                       // obj_id = 主网格
+    d.rot0.xyz, d.rot1.xyz, d.rot2.xyz,    // 旋转矩阵列
+    d.pos_scale.xyz, d.pos_scale.w,        // pos + scale
+    d.tree_base, d.palette_base,           // 数据源基址
+    origin, vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z),
+    select(-1i, i32(idx), idx > 0u),       // idx=0 → 主世界(-1)，idx≥1 → 物体
   );
 }
 
-// 构造 obj Grid——从 descriptor 解码
-fn make_obj_grid(idx: u32) -> Grid {
-  let base = idx * OBJ_DESC_WORDS;
-  let obj_pos = vec3<f32>(
-    f32(obj_descs[base]),
-    f32(obj_descs[base + 1u]),
-    f32(obj_descs[base + 2u]));
-  let scale = f32(obj_descs[base + 3u]);
-  let col0 = vec3<f32>(
-    f32(obj_descs[base + 4u]),
-    f32(obj_descs[base + 5u]),
-    f32(obj_descs[base + 6u]));
-  let col1 = vec3<f32>(
-    f32(obj_descs[base + 8u]),
-    f32(obj_descs[base + 9u]),
-    f32(obj_descs[base + 10u]));
-  let col2 = vec3<f32>(
-    f32(obj_descs[base + 12u]),
-    f32(obj_descs[base + 13u]),
-    f32(obj_descs[base + 14u]));
-  let w_mn = vec3<f32>(
-    f32(obj_descs[base + 16u]),
-    f32(obj_descs[base + 17u]),
-    f32(obj_descs[base + 18u]));
-  let w_mx = vec3<f32>(
-    f32(obj_descs[base + 20u]),
-    f32(obj_descs[base + 21u]),
-    f32(obj_descs[base + 22u]));
-  let bmp_base = obj_descs[base + 24u];
-  let dir_b = obj_descs[base + 25u];
-  let node_b = obj_descs[base + 26u];
-  let leaves_b = obj_descs[base + 27u];
-  return Grid(
-    1u,                                  // kind = obj
-    w_mn, w_mx,
-    vec3<f32>(0.0), vec3<f32>(f32(LOCAL_TILE_FINE)),
-    vec3<i32>(0), vec3<i32>(31),
-    96u,
-    col0, col1, col2,
-    obj_pos, scale,
-    bmp_base, dir_b, node_b, leaves_b,
-    i32(idx),
-  );
-}
-
-// ============================================================================
-// P2.10 OBJ：以下是数据源分流函数（trace_grid 通过 ctx_cell_occupied /
-// ctx_sample_voxel 间接调用它们；原始实现保留以兼容未迁移的代码路径）
-// ============================================================================
-
-// 物体 cell（0..31³）占用查询：bitmap 1 load。对应 obj.rs::obj_cell_occupied
-fn obj_cell_occupied(bmp_base: u32, cc: vec3<i32>) -> bool {
-  let it = vec3<u32>(cc);  // cc ∈ 0..31（入口保证非负）
-  let ci = it.z * 1024u + it.y * 32u + it.x;
-  let word = obj_struct[bmp_base + (ci >> 5u)];
-  return ((word >> (ci & 31u)) & 1u) != 0u;
-}
-
-// 物体局部最细格采样（局部 fine 0..511³）。对应 obj.rs::obj_sample_voxel
-// 逐字镜像 view.rs get_voxel ④ 链：基址换 descriptor（node_base + (abs - NODE_STREAM_BASE)、
-// slab - 1 + leaves_base）
-fn obj_sample_voxel(bmp_base: u32, dir_b: u32, node_b: u32, leaves_b: u32,
-                    fine: vec3<i32>) -> u32 {
-  let m = clamp(fine, vec3<i32>(0), vec3<i32>(511));
-  let it = vec3<u32>(m);
-  let ci = (it.z >> 4u) * 1024u + (it.y >> 4u) * 32u + (it.x >> 4u);
-  let bmp = obj_struct[bmp_base + (ci >> 5u)];
-  if (((bmp >> (ci & 31u)) & 1u) == 0u) { return 0u; }
-  let abs_dir = obj_struct[dir_b + ci];
-  if (abs_dir == 0u) { return 0u; }
-  var p = node_b + (abs_dir - NODE_STREAM_BASE);
-  let hdr = obj_struct[p];
-  if ((hdr & HDR_UNIFORM_MASK) != 0u) { return hdr & HDR_UNIFORM_MASK; }
-  p = p + 1u;
-  let sub = it & vec3<u32>(15u);
-  // L1（非 uniform 必有 l1）
-  if ((hdr & HDR_HAS_L1) == 0u) { return 0u; }
-  var si = (sub.x >> 3u) + (sub.y >> 3u) * 2u + (sub.z >> 3u) * 4u;
-  var slot = slot_unpack(obj_struct[p + (si >> 1u)], si & 1u);
-  var tag = slot_tag(slot);
-  if (tag == TAG_EMPTY) { return 0u; }
-  if (tag == TAG_LEAF) { return slot_palette(slot); }
-  p = p + ST_L1_WORDS;
-  // L2
-  if ((hdr & HDR_HAS_L2) == 0u) { return 0u; }
-  si = (sub.x >> 2u) + (sub.y >> 2u) * 4u + (sub.z >> 2u) * 16u;
-  slot = slot_unpack(obj_struct[p + (si >> 1u)], si & 1u);
-  tag = slot_tag(slot);
-  if (tag == TAG_EMPTY) { return 0u; }
-  if (tag == TAG_LEAF) { return slot_palette(slot); }
-  p = p + ST_L2_WORDS;
-  // L3
-  if ((hdr & HDR_HAS_L3) == 0u) { return 0u; }
-  si = (sub.x >> 1u) + (sub.y >> 1u) * 8u + (sub.z >> 1u) * 64u;
-  slot = slot_unpack(obj_struct[p + (si >> 1u)], si & 1u);
-  tag = slot_tag(slot);
-  if (tag == TAG_EMPTY) { return 0u; }
-  if (tag == TAG_LEAF) { return slot_palette(slot); }
-  p = p + ST_L3_WORDS;
-  // BRICK（slab 号 + leaves_base = pool slab 号）
-  if ((hdr & HDR_HAS_BRICK) == 0u) { return 0u; }
-  let slab_m1 = obj_struct[p];
-  if (slab_m1 == 0u) { return 0u; }
-  let slab = slab_m1 - 1u + leaves_b;
-  let li = sub.x + sub.y * 16u + sub.z * 256u;
-  let leaf_addr = slab * BRICK_SLAB_WORDS + (li >> 2u);
-  if (leaf_addr >= arrayLength(&obj_leaves)) { return 0u; }
-  let word = obj_leaves[leaf_addr];
-  return (word >> ((li & 3u) << 3u)) & 0xFFu;
-}
 
 // 统一细扫：任意 grid（brickmap / obj）通用。算法 1:1 原始 Akenine-Möller。
 // 数据源唯一入口：grid_sample_voxel(g, fc)。
@@ -721,13 +545,12 @@ fn fine_scan_cell(g: Grid, ro: vec3<f32>, rd: vec3<f32>, sign: vec3<i32>, delta:
   return FineHit(false, 0.0, 0u, 0u);
 }
 
-// 遮挡快路径（阴影射线）：[0, t_max) 内任一命中即 true。
-// 直接调 trace_grid × N，零 world/obj 分支。
+// 遮挡快路径（阴影射线）：[0, t_max) 内任一 volume 命中即 true。
+// Phase 3 统一：遍历 grid_descs[0..arrayLength]，零 world/obj 分支。
 fn scene_occluded(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> bool {
-  let wh = trace_grid(make_world_grid(), origin, dir, t_max);
-  if (wh.hit) { return true; }
-  for (var i: u32 = 0u; i < obj_g.count; i = i + 1u) {
-    let mh = trace_grid(make_obj_grid(i), origin, dir, t_max);
+  let n = arrayLength(&grid_descs);
+  for (var i: u32 = 0u; i < n; i = i + 1u) {
+    let mh = trace_grid(make_grid(i), origin, dir, t_max);
     if (mh.hit) { return true; }
   }
   return false;
@@ -752,17 +575,11 @@ struct HitMat {
   rough: f32,
   emissive: f32,
 }
-fn hit_mat(obj: i32, pal: u32) -> HitMat {
-  var w0: u32;
-  var w1: u32;
-  if (obj < 0) {
-    w0 = b_palette[pal * 2u];
-    w1 = b_palette[pal * 2u + 1u];
-  } else {
-    let pal_b = obj_descs[u32(obj) * OBJ_DESC_WORDS + 28u];
-    w0 = obj_palette[pal_b + pal * 2u];
-    w1 = obj_palette[pal_b + pal * 2u + 1u];
-  }
+// Phase 3 统一：palette_base 参数替代 obj 分支——主世界 + 物体都从
+// b_palette[palette_base + pal*2..] 取色，零 kind 分支。
+fn hit_mat(palette_base: u32, pal: u32) -> HitMat {
+  let w0 = b_palette[palette_base + pal * 2u];
+  let w1 = b_palette[palette_base + pal * 2u + 1u];
   return HitMat(
     vec3<f32>(
       f32(w0 & 0xFFu),
@@ -822,20 +639,21 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
 // Douglas devlog #22 implicit normals：GPU 运行时按邻域体素 occupancy 有限差分
 // - 命中体素中心 + 6 方向采样 → 密度差 → 连续 per-voxel 法向
 // - 不存储、不烘焙、随 DDA trace 实时算（比 Douglas 的 upload-time bake 更动态）
-// - 世界物体用 sample_brickmap（2~3 级寻址）；OBJ 物体暂用 DDA 面法向
+// - 主世界用 sample_brickmap（2~3 级寻址）；物体暂用 DDA 面法向（obj_id >= 0 跳过）
+// Phase 3 统一：sample_brickmap 走 Grid 参数（g.tree_base + g.index_origin/dims）。
 // ============================================================================
-fn compute_implicit_normal(origin: vec3<f32>, dir: vec3<f32>, t: f32, dda_n: vec3<f32>, is_world: bool) -> vec3<f32> {
-  if (!is_world) { return dda_n; }
+fn compute_implicit_normal(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t: f32, dda_n: vec3<f32>) -> vec3<f32> {
+  if (g.obj_id >= 0) { return dda_n; }  // 物体用 DDA 面法向
   let hit_pos = origin + dir * t;
   // dda_n 指向外部（射线来向）；沿 -dda_n 微偏 → 命中体素中心
   let hit_fc = vec3<i32>(floor(hit_pos - dda_n * 0.001));
   // 6 邻域 occupancy（1 = 实心，0 = 空气）
-  let sx_n = f32(sample_brickmap(hit_fc + vec3<i32>(-1, 0, 0)) != 0u);
-  let sx_p = f32(sample_brickmap(hit_fc + vec3<i32>( 1, 0, 0)) != 0u);
-  let sy_n = f32(sample_brickmap(hit_fc + vec3<i32>( 0,-1, 0)) != 0u);
-  let sy_p = f32(sample_brickmap(hit_fc + vec3<i32>( 0, 1, 0)) != 0u);
-  let sz_n = f32(sample_brickmap(hit_fc + vec3<i32>( 0, 0,-1)) != 0u);
-  let sz_p = f32(sample_brickmap(hit_fc + vec3<i32>( 0, 0, 1)) != 0u);
+  let sx_n = f32(sample_brickmap(g, hit_fc + vec3<i32>(-1, 0, 0)) != 0u);
+  let sx_p = f32(sample_brickmap(g, hit_fc + vec3<i32>( 1, 0, 0)) != 0u);
+  let sy_n = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0,-1, 0)) != 0u);
+  let sy_p = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0, 1, 0)) != 0u);
+  let sz_n = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0, 0,-1)) != 0u);
+  let sz_p = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0, 0, 1)) != 0u);
   let raw = vec3<f32>(sx_n - sx_p, sy_n - sy_p, sz_n - sz_p);
   let len2 = dot(raw, raw);
   return normalize(mix(dda_n, raw, 0.5));
@@ -847,14 +665,12 @@ fn compute_implicit_normal(origin: vec3<f32>, dir: vec3<f32>, t: f32, dda_n: vec
 // 3. 发光体素 radiance 直出（无方向性、不受阴影）
 // 无点光源、无 Phong 高光
 // Per-pixel shading 入口（douglas #02/#22 基础光影）。
-// 法线 = compute_implicit_normal：内部已做 implicit/DDA 加权混合（曲面→implicit
-// 连续法向主导，平坦→DDA 面法向主导，过渡区 smoothstep 平滑插值；MOV 命中
-// obj>=0 时直接返回 dda_n 兜底，不参与混合）
-fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, obj: i32, dda_n: vec3<f32>,
+// Phase 3 统一：Grid 参数携带 palette_base（hit_mat 取色）+ obj_id（implicit normal 分流）。
+fn shade_hit(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, dda_n: vec3<f32>,
              shadow_t_max: f32) -> vec3<f32> {
-  let n = compute_implicit_normal(origin, dir, t, dda_n, obj < 0);
+  let n = compute_implicit_normal(g, origin, dir, t, dda_n);
   let p = origin + dir * t;
-  let mat = hit_mat(obj, pal);
+  let mat = hit_mat(g.palette_base, pal);
   let base = mat.albedo;
 
   // sky 渐变环境光
@@ -905,30 +721,22 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir_fine = normalize(diff_world);
   let origin_fine = view_u.cam_pos_fine.xyz;
 
-  // ---- trace_scene：统一 trace_grid（主网格 + 逐物体 obj）取最近 ----
+  // ---- trace_scene：遍历 grid_descs[0..N] 取最近命中（Phase 3 统一）----
   var best_t = 1e+30;
   var best_pal: u32 = 0u;
-  var best_obj: i32 = -1;
   var best_n = vec3<f32>(0.0);
   var best_face_id: u32 = 0u;
-
-  let wh = trace_grid(make_world_grid(), origin_fine, dir_fine, frustum_length);
-  if (wh.hit) {
-    best_t = wh.t;
-    best_pal = wh.pal;
-    best_n = wh.n;
-    best_face_id = wh.face_id;
-  }
-
-  for (var i: u32 = 0u; i < obj_g.count; i = i + 1u) {
+  var best_grid: Grid = make_grid(0u);  // 命中 volume 的 Grid（shade_hit 取色 + implicit normal 用）
+  let n = arrayLength(&grid_descs);
+  for (var i: u32 = 0u; i < n; i = i + 1u) {
     let cap = min(best_t, frustum_length);
-    let mh = trace_grid(make_obj_grid(i), origin_fine, dir_fine, cap);
+    let mh = trace_grid(make_grid(i), origin_fine, dir_fine, cap);
     if (mh.hit && mh.t < best_t) {
       best_t = mh.t;
       best_pal = mh.pal;
-      best_obj = i32(i);
       best_n = mh.n;
       best_face_id = mh.face_id;
+      best_grid = make_grid(i);
     }
   }
 
@@ -936,7 +744,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (best_t < 1e+29) {
     // debug_mode.x: implicit normal 可视化
     if (view_u.debug_mode.x > 0.5) {
-      let n_implicit = compute_implicit_normal(origin_fine, dir_fine, best_t, best_n, best_obj < 0);
+      let n_implicit = compute_implicit_normal(best_grid, origin_fine, dir_fine, best_t, best_n);
       textureStore(out_tex, coord0, vec4<f32>(n_implicit * 0.5 + 0.5, 1.0));
       return;
     }
@@ -946,7 +754,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       return;
     }
     // 正常着色：shade_hit（per-pixel 硬阴影 + emissive）→ ACES → sRGB
-    var col = shade_hit(origin_fine, dir_fine, best_t, best_pal, best_obj, best_n, SHADOW_DIR_T_MAX);
+    var col = shade_hit(best_grid, origin_fine, dir_fine, best_t, best_pal, best_n, SHADOW_DIR_T_MAX);
     col = aces_tonemap(col);
     col = linear_to_srgb(col);
     textureStore(out_tex, coord0, vec4<f32>(col, 1.0));

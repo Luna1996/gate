@@ -173,7 +173,7 @@ impl ChunkTree {
     if self.nodes.is_empty() {
       return if self.root_palette == 0 { None } else { Some(self.root_palette) };
     }
-    self.get_at(local_x, local_y, local_z, Some(0), self.root_palette, CHUNK_SIZE)
+    self.get_at(local_x, local_y, local_z, Some(0), CHUNK_SIZE)
   }
 
   fn get_at(
@@ -182,7 +182,6 @@ impl ChunkTree {
     y: i32,
     z: i32,
     idx: Option<usize>,
-    default_palette: u8,
     extent: i32,
   ) -> Option<u8> {
     let (mask, palette) = match idx {
@@ -222,7 +221,7 @@ impl ChunkTree {
     let next_z = z - iz * child_extent;
 
     self.get_at(
-      next_x, next_y, next_z, child_idx, palette, child_extent,
+      next_x, next_y, next_z, child_idx, child_extent,
     )
   }
 
@@ -232,7 +231,7 @@ impl ChunkTree {
     if self.nodes.is_empty() {
       return if self.root_palette == 0 { None } else { Some(self.root_palette) };
     }
-    self.get_uniform_at(local_x, local_y, local_z, query_extent, Some(0), self.root_palette, CHUNK_SIZE)
+    self.get_uniform_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
   }
 
   fn get_uniform_at(
@@ -242,7 +241,6 @@ impl ChunkTree {
     z: i32,
     query_extent: i32,
     idx: Option<usize>,
-    default_palette: u8,
     cur_extent: i32,
   ) -> Option<u8> {
     let (mask, palette) = match idx {
@@ -315,7 +313,6 @@ impl ChunkTree {
       z - iz * child_extent,
       query_extent,
       child_idx,
-      palette,
       child_extent,
     )
   }
@@ -341,6 +338,107 @@ impl ChunkTree {
   // =========================================================================
   // 编辑
   // =========================================================================
+
+  /// 填充对齐 brick（extent ∈ LEVEL_EXTENT）：树路径 O(depth) 写入。
+  ///
+  /// 大体积均匀填充专用——逐体素 [`Self::set_voxel`] 每个新 4³ 块要分裂 65 个
+  /// 节点（SPLIT_ALL），百万级填充会内存爆炸；brick 级写与 GPU wire 格式的
+  /// Uniform 节点同构。返回：是否实际修改。
+  pub fn fill_brick(&mut self, local: [i32; 3], extent: i32, palette: u8) -> bool {
+    assert!(
+      LEVEL_EXTENT.contains(&extent),
+      "extent 必须是 brick 粒度 {LEVEL_EXTENT:?} 之一（got {extent}）"
+    );
+    for (i, &v) in local.iter().enumerate() {
+      assert!(
+        v >= 0 && v % extent == 0 && v + extent <= CHUNK_SIZE,
+        "brick 必须对齐且在 chunk 内（local[{i}]={v} extent={extent}）"
+      );
+    }
+    // 只读预检查：非零 palette 且 brick 已 uniform 同色 → noop
+    //（palette=0 时 get_uniform 的 None 语义与「非 uniform」歧义，跳过预检查）
+    if palette != 0 {
+      let level = LEVEL_EXTENT
+        .iter()
+        .position(|&e| e == extent)
+        .expect("LEVEL_EXTENT.contains 已保证") as u8;
+      if self.get_uniform(local[0], local[1], local[2], level) == Some(palette) {
+        return false;
+      }
+    }
+    self.fill_recursive(local, extent, palette, None, CHUNK_SIZE);
+    true
+  }
+
+  fn fill_recursive(
+    &mut self,
+    x: [i32; 3],
+    extent: i32,
+    palette: u8,
+    idx: Option<usize>,
+    cur_extent: i32,
+  ) {
+    if extent == cur_extent {
+      if cur_extent == CHUNK_SIZE {
+        // 整 chunk uniform：规范形 = 空 nodes + root_palette（is_empty 语义一致）
+        self.nodes.clear();
+        self.root_palette = palette;
+      } else {
+        self.nodes[idx.expect("非 root 层 idx 必为 Some")] = Node::Uniform(palette);
+      }
+      return;
+    }
+
+    // 确保 current 是 Split（与 set_recursive 同一套 root/split 逻辑）
+    let mut node_idx = idx;
+    if let Some(i) = node_idx {
+      if let Node::Uniform(p) = &self.nodes[i] {
+        let old = *p;
+        self.split_uniform(i, old);
+      }
+    } else if !self.nodes.is_empty() {
+      // root Split 已存在（之前编辑过），从 nodes[0] 开始
+      node_idx = Some(0);
+    }
+    if node_idx.is_none() {
+      // root uniform（nodes 为空）→ 创建 split root
+      let cur = self.root_palette;
+      let split_idx = self.nodes.len();
+      self.nodes.push(Node::Split { mask: 0, palette: cur, children: vec![None; 64] });
+      let start = self.nodes.len();
+      for _ in 0..64 {
+        self.nodes.push(Node::Uniform(cur));
+      }
+      let split = &mut self.nodes[split_idx];
+      if let Node::Split { mask, children, palette } = split {
+        *mask = 0xFFFFFFFFFFFFFFFF;
+        *palette = cur;
+        for i in 0..64 {
+          children[i] = Some(start + i);
+        }
+      }
+      node_idx = Some(split_idx);
+    }
+
+    let p = node_idx.unwrap();
+    let child_extent = cur_extent / BRICK_FACTOR;
+    let ix = x[0] / child_extent;
+    let iy = x[1] / child_extent;
+    let iz = x[2] / child_extent;
+    let child_i = child_linear_idx(ix, iy, iz) as usize;
+    let child_idx = match &self.nodes[p] {
+      Node::Split { children, .. } => children[child_i],
+      _ => unreachable!(),
+    };
+    let next = [
+      x[0] - ix * child_extent,
+      x[1] - iy * child_extent,
+      x[2] - iz * child_extent,
+    ];
+    self.fill_recursive(next, extent, palette, child_idx, child_extent);
+    // 回溯：try merge
+    self.try_merge(p);
+  }
 
   /// 设置单个 1³ 体素的 palette（palette=0 = 清除）
   /// 返回：是否实际修改
@@ -416,8 +514,8 @@ impl ChunkTree {
     }
 
     let p = node_idx.unwrap();
-    let (mask, cur_pal, children) = match &self.nodes[p] {
-      Node::Split { mask, palette, children } => (*mask, *palette, children.clone()),
+    let children = match &self.nodes[p] {
+      Node::Split { children, .. } => children.clone(),
       _ => unreachable!(),
     };
 
@@ -437,7 +535,6 @@ impl ChunkTree {
 
     // 更新 children 里可能新增的节点引用
     // （如果 uniform leaf 被 split 了，children[child_i] 现在应该指向新节点）
-    let _ = mask; // suppress unused
 
     // 回溯：try merge
     self.try_merge(p);
@@ -516,6 +613,57 @@ impl ChunkTree {
   /// 整个 chunk 是否 uniform AIR（空）
   pub fn is_empty(&self) -> bool {
     self.nodes.is_empty() && self.root_palette == 0
+  }
+
+  /// GC：重建 nodes Vec 只保留 root 可达的有效节点，回收废弃索引
+  ///
+  /// 编辑（set_voxel/fill_brick/clear）过程中 split_uniform 创建 65 节点，
+  /// try_merge 合并同色后子节点变废但仍在 Vec（容量只增不减）。长时间编辑后
+  /// nodes 膨胀到 GB 级——本方法 DFS 标记可达节点，compact 到连续新 Vec，
+  /// 重写 children 索引。O(n) 时间 + O(n) 临时空间，编辑完成后调一次即可。
+  pub fn compact(&mut self) {
+    if self.nodes.len() <= 1 {
+      return; // 空 root 或单节点，无废弃
+    }
+    let mut new_nodes: Vec<Node> = Vec::with_capacity(self.nodes.len());
+    let mut idx_map = vec![usize::MAX; self.nodes.len()];
+    self.collect_reachable(Some(0), &mut new_nodes, &mut idx_map);
+    // 重写 children 索引：old → new
+    for n in new_nodes.iter_mut() {
+      if let Node::Split { children, .. } = n {
+        for c in children.iter_mut() {
+          if let Some(old) = *c {
+            *c = Some(idx_map[old]);
+          }
+        }
+      }
+    }
+    self.nodes = new_nodes;
+  }
+
+  fn collect_reachable(
+    &self,
+    idx: Option<usize>,
+    out: &mut Vec<Node>,
+    map: &mut Vec<usize>,
+  ) {
+    let old = match idx {
+      Some(i) => i,
+      None => return,
+    };
+    if map[old] != usize::MAX {
+      return; // 已访问（防环）
+    }
+    let new_idx = out.len();
+    map[old] = new_idx;
+    out.push(self.nodes[old].clone());
+    if let Node::Split { children, .. } = &self.nodes[old] {
+      for c in children.iter() {
+        if let Some(child_old) = c {
+          self.collect_reachable(Some(*child_old), out, map);
+        }
+      }
+    }
   }
 
   // =========================================================================

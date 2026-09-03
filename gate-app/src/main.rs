@@ -12,14 +12,14 @@ use glam::{Mat3, Vec3};
 
 use gate_render::{
   BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals,
-  ObjObject, ObjScene, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
-  pack_obj_pool,
+  OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
+  cpu_reference_trace_volumes,
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
   widgets::{label, px},
 };
-use gate_voxel::{PaletteEntry, draw_text, fill_box, fill_sphere};
+use gate_voxel::{PaletteEntry, VolumeTransform, Volumes, draw_text, fill_box, fill_bricks, fill_sphere};
 
 /// 以 crate 目录为锚的 assets 路径，F5 / 终端启动行为一致
 pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
@@ -153,76 +153,77 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   commands.insert_resource(DebugNormals::default());
 
   // ---- demo scene：调色板 + 多分辨率混合极限场景 ----
-  let mut grid = gate_voxel::TileGrid::new();
+  let mut grid = gate_voxel::VolumeGrid::new();
   paint_demo_palette(&mut grid);
   build_demo_scene(&mut grid);
+  grid.compact_all(); // GC：回收编辑过程累积的废弃节点
 
   // 诊断：打印 brickmap globals
   {
     let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
     let g = &bufs.globals;
-    let n_tiles = grid.tile_coords().count();
+    let n_chunks = grid.chunk_coords().count();
     bevy::log::info!(
-      "BRICKMAP DIAG: tiles={} origin=({},{},{}) dims=({},{},{})  AABB=[{},{},{}]-[{},{},{}]",
-      n_tiles,
+      "BRICKMAP DIAG: chunks={} origin=({},{},{}) dims=({},{},{})  AABB=[{},{},{}]-[{},{},{}]",
+      n_chunks,
       g.index_origin_x,
       g.index_origin_y,
       g.index_origin_z,
       g.index_dims_x,
       g.index_dims_y,
       g.index_dims_z,
-      g.index_origin_x * 512,
-      g.index_origin_y * 512,
-      g.index_origin_z * 512,
-      (g.index_origin_x + g.index_dims_x as i32) * 512,
-      (g.index_origin_y + g.index_dims_y as i32) * 512,
-      (g.index_origin_z + g.index_dims_z as i32) * 512,
+      g.index_origin_x * 256,
+      g.index_origin_y * 256,
+      g.index_origin_z * 256,
+      (g.index_origin_x + g.index_dims_x as i32) * 256,
+      (g.index_origin_y + g.index_dims_y as i32) * 256,
+      (g.index_origin_z + g.index_dims_z as i32) * 256,
     );
   }
 
+  // ---- Phase 3 OBJ→Volume 统一：物体作为 Volumes.list[1..N] 加入容器 ----
+  // 旧 ObjScene/Pack_obj_pool/ObjObject 三段管道已删除；物体 = 普通的 VolumeGrid，
+  // 通过 Volumes.add_object() 注册变换，走与主世界相同的 dirty → builder → upload 路径。
+  let mut volumes = Volumes::new(grid);
+  // A 贴地：城堡平台顶面（y=272）上，identity / scale 1
+  {
+    let id = volumes.add_object(Vec3::new(2352.0, 272.0, 2352.0), Mat3::IDENTITY, 1.0);
+    if let Some(v) = volumes.object_mut(id) {
+      *v = build_chip_prefab();
+    }
+  }
+  // B 交叠：嵌入北城墙（z 2048..2056）——突出部遮挡墙 / 嵌入部被墙遮挡
+  {
+    let id = volumes.add_object(Vec3::new(2600.0, 260.0, 1980.0), Mat3::IDENTITY, 1.0);
+    if let Some(v) = volumes.object_mut(id) {
+      *v = build_chip_prefab();
+    }
+  }
+  // C 旋转 + 缩放：地面 yaw30° / scale 2，压中央大道
+  {
+    let id = volumes.add_object(
+      Vec3::new(1600.0, 16.0, 2600.0),
+      Mat3::from_rotation_y(30.0_f32.to_radians()),
+      2.0,
+    );
+    if let Some(v) = volumes.object_mut(id) {
+      *v = build_chip_prefab();
+    }
+  }
+
   commands.insert_resource(VoxelScene {
-    grid,
+    volumes,
     demo_force_full_rebuild: true,
   });
   commands.insert_resource(UploadBudget {
     max_bytes_per_frame: 4 * 1024 * 1024,
     incremental: true,
   });
-
-  // ---- P2.10 OBJ 硬编码验收场景：芯片预制件 ×3（遮挡/贴地/交叠/旋转/缩放）----
-  let chip = build_chip_prefab();
-  let chips = [
-    // A 贴地：城堡平台顶面（y=272）上，identity / scale 1
-    ObjObject {
-      buffers: &chip,
-      pos: Vec3::new(2352.0, 272.0, 2352.0),
-      rot: Mat3::IDENTITY,
-      scale: 1.0,
-    },
-    // B 交叠：嵌入北城墙（z 2048..2056）——突出部遮挡墙 / 嵌入部被墙遮挡
-    ObjObject {
-      buffers: &chip,
-      pos: Vec3::new(2600.0, 260.0, 1980.0),
-      rot: Mat3::IDENTITY,
-      scale: 1.0,
-    },
-    // C 旋转 + 缩放：地面 yaw30° / scale 2，压中央大道
-    ObjObject {
-      buffers: &chip,
-      pos: Vec3::new(1600.0, 16.0, 2600.0),
-      rot: Mat3::from_rotation_y(30.0_f32.to_radians()),
-      scale: 2.0,
-    },
-  ];
-  commands.insert_resource(ObjScene {
-    packed: std::sync::Arc::new(pack_obj_pool(&chips)),
-    version: 1,
-  });
 }
 
 /// demo 调色板（PaletteEntry._pad 私有 → 跨 crate 用 default + 逐字段赋值）
 /// 极限场景用 14 色：草地 / 山岩 / 雪峰 / 城堡石 / 树叶 / 树干 / 河蓝 / 水晶青 / 水晶紫 / 水晶红 / 塔顶金 / 旗帜红
-fn paint_demo_palette(grid: &mut gate_voxel::TileGrid) {
+fn paint_demo_palette(grid: &mut gate_voxel::VolumeGrid) {
   let palette: &[(u8, [u8; 3], u8)] = &[
     (1, [86, 160, 70], 220),   // 1 草地（L0 地面平原）
     (2, [140, 108, 76], 200),  // 2 山岩（山体主体）
@@ -267,8 +268,8 @@ fn paint_demo_palette(grid: &mut gate_voxel::TileGrid) {
 //   · 保留 tile(1,0,0) 每 120 帧 L4 黄↔青交替（验证 132KB/180µs 增量上传路径）
 //   · 世界大标语 "GATE ENGINE" 立在入口大道
 // ─────────────────────────────────────────────────────────────────────
-const EXT_N_TILES_X: i32 = 10;
-const EXT_N_TILES_Z: i32 = 10;
+const EXT_N_TILES_X: i32 = 1;
+const EXT_N_TILES_Z: i32 = 1;
 const EXT_FINE_X: i32 = EXT_N_TILES_X * 512;
 const EXT_FINE_Z: i32 = EXT_N_TILES_Z * 512;
 const EXT_FINE_HALF: i32 = EXT_FINE_X / 2; // 2560
@@ -312,7 +313,7 @@ fn in_river(x: i32, z: i32) -> bool {
   dx.abs() < 64.0
 }
 
-fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
+fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   // ================================================================
   //  (1) 基础地形：按 16 fine (L0) 步长采样高度场 → fill_box 铺柱
   //      y=16..h 使用 palette 2 山岩；y>h-40 且 h>520 → palette 3 雪峰
@@ -333,13 +334,13 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
         let snow_line = top - 38;
         if in_r {
           // 河床：先填一层灰色岩，再加 8 fine 高河蓝
-          fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, 12, 16), 0, 2);
-          fill_box(grid, IVec3::new(x, 28, z), IVec3::new(16, 8, 16), 0, 7);
+          fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, 12, 16), 2);
+          fill_box(grid, IVec3::new(x, 28, z), IVec3::new(16, 8, 16), 7);
         } else if top > 16 {
           // 山体主体（palette 2 山岩）
           let rock_h = (snow_line - 16).max(0).min(top - 16);
           if rock_h > 0 {
-            fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, rock_h, 16), 0, 2);
+            fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, rock_h, 16), 2);
           }
           // 雪顶（h > 560 时，顶部 38 fine 改 palette 3 雪）
           if top > 560 {
@@ -349,7 +350,6 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
                 grid,
                 IVec3::new(x, snow_line, z),
                 IVec3::new(16, snow_h, 16),
-                0,
                 3,
               );
             }
@@ -361,7 +361,6 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
                 grid,
                 IVec3::new(x, top - grass_h, z),
                 IVec3::new(16, grass_h, 16),
-                0,
                 1,
               );
             }
@@ -375,11 +374,11 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
     z += 16;
   }
   // 全地图 L0 基础地板（y=0..16，pal 1 草地）——覆盖 0..10 tile 的 X/Z，Y=0..1
-  fill_box(
+  fill_bricks(
     grid,
     IVec3::new(0, 0, 0),
     IVec3::new(EXT_FINE_X, 16, EXT_FINE_Z),
-    0,
+    16,
     1,
   );
 
@@ -391,11 +390,10 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
     grid,
     IVec3::new(0, 16, 2496),
     IVec3::new(EXT_FINE_X, 8, 32),
-    1,
     12,
   );
   // 大标语（L1，每像素 8³，放在入口 X=64 Y=32 Z=256 朝向 -Z）
-  draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 1, 8);
+  draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 8);
 
   // ================================================================
   //  (3) 中央天空之城（中央 2560±520 方区）
@@ -417,15 +415,15 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
   while y < island_top_y {
     let t = (y - island_base_y) as f32 / (island_top_y - island_base_y) as f32;
     let r = (t * t.sqrt() * top_r as f32) as i32 + 16;
-    fill_sphere(grid, IVec3::new(cx, y, cz), r, 1, 13);
+    fill_sphere(grid, IVec3::new(cx, y, cz), r, 13);
     y += 16;
   }
   // 城墙平台（y=240..272，512×512×32）
-  fill_box(
+  fill_bricks(
     grid,
     IVec3::new(cx - 512, 240, cz - 512),
     IVec3::new(1024, 32, 1024),
-    1,
+    16,
     4,
   );
   // 四面城墙（y=272..336 = 64 高）
@@ -434,28 +432,24 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
     grid,
     IVec3::new(cx - 512, 272, cz - 512),
     IVec3::new(1024, 64, 8),
-    1,
     4,
   );
   fill_box(
     grid,
     IVec3::new(cx - 512, 272, cz + 512 - 8),
     IVec3::new(1024, 64, 8),
-    1,
     4,
   );
   fill_box(
     grid,
     IVec3::new(cx - 512, 272, cz - 512),
     IVec3::new(8, 64, 1024),
-    1,
     4,
   );
   fill_box(
     grid,
     IVec3::new(cx + 512 - 8, 272, cz - 512),
     IVec3::new(8, 64, 1024),
-    1,
     4,
   );
   // 四角角楼 96×96×160（从 y=272 起比城墙多高 96）
@@ -467,28 +461,26 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
   ] {
     let tx = cx + ox;
     let tz = cz + oz;
-    fill_box(grid, IVec3::new(tx, 272, tz), IVec3::new(96, 160, 96), 1, 4);
+    fill_bricks(grid, IVec3::new(tx, 272, tz), IVec3::new(96, 160, 96), 16, 4);
     // 角楼顶金色 16
     fill_box(
       grid,
       IVec3::new(tx, 272 + 160, tz),
       IVec3::new(96, 16, 96),
-      1,
       11,
     );
   }
   // 正殿（中心，y=336..464 = 128 高，长 256×256）
-  fill_box(
+  fill_bricks(
     grid,
     IVec3::new(cx - 256, 336, cz - 256),
     IVec3::new(512, 128, 512),
-    1,
+    16,
     4,
   );
   // 正殿正门（Z- 方向，挖一矩形门洞：clear_voxel）
   {
     // L1 每步 = 8 fine；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
-    let level: gate_voxel::Level = 1;
     let e = 8i32; // L1 边长
     let mn = IVec3::new(cx - 48, 336, cz - 264);
     let ex = mn + IVec3::new(96, 96, 8);
@@ -498,7 +490,7 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
       while y < ex.y {
         let mut x = mn.x.div_euclid(e) * e;
         while x < ex.x {
-          grid.clear_voxel(IVec3::new(x, y, z), level);
+          grid.clear_voxel(gate_voxel::VoxelCoord::from_ivec3(IVec3::new(x, y, z)));
           x += e;
         }
         y += e;
@@ -507,11 +499,11 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
     }
   }
   // 高塔（y=464..720 = 256 高，底 96×96 上收顶）
-  fill_box(
+  fill_bricks(
     grid,
     IVec3::new(cx - 48, 464, cz - 48),
     IVec3::new(96, 256, 96),
-    1,
+    16,
     4,
   );
   // 塔顶平台 128×128×16
@@ -519,11 +511,10 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
     grid,
     IVec3::new(cx - 64, 720, cz - 64),
     IVec3::new(128, 16, 128),
-    1,
     11,
   );
   // 金顶球（L2 r=64，塔顶 y=720+80=800）
-  fill_sphere(grid, IVec3::new(cx, 800, cz), 64, 2, 11);
+  fill_sphere(grid, IVec3::new(cx, 800, cz), 64, 11);
   // 四角旗帜（L4 红飘带：从角楼顶 4 角斜向上拉出小立方体串）
   for &(ox, oz) in &[
     (-512, -512),
@@ -538,7 +529,6 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
         grid,
         IVec3::new(fx + s, 448 + s * 4, fz),
         IVec3::new(8, 8, 8),
-        4,
         10,
       );
     }
@@ -565,9 +555,9 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
         && h < 360;
       if ok {
         // 树干 （L1, 24 宽 16 宽 24 深 高 80）
-        fill_box(grid, IVec3::new(x, h, z), IVec3::new(32, 80, 32), 1, 6);
+        fill_box(grid, IVec3::new(x, h, z), IVec3::new(32, 80, 32), 6);
         // 树叶球（L2，r=80，中心在树干顶 + 80）
-        fill_sphere(grid, IVec3::new(x + 16, h + 80 + 64, z + 16), 80, 2, 5);
+        fill_sphere(grid, IVec3::new(x + 16, h + 80 + 64, z + 16), 80, 5);
         n_planted += 1;
       }
       i += 1;
@@ -602,7 +592,6 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
           grid,
           IVec3::new(px_, h + hy, pz_),
           IVec3::new(1, 1, 1),
-          4,
           pal,
         );
         placed += 1;
@@ -616,29 +605,28 @@ fn build_demo_scene(grid: &mut gate_voxel::TileGrid) {
   //      tile(2,0,0) 中心 32³ 蓝 L4（旧 demo）
   //      → 保持增量上传特性展示（UPLOAD 132KB/180µs）
   // ================================================================
-  fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 4, 11);
+  fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 11);
   fill_box(
     grid,
     IVec3::new(1264, 240, 240),
     IVec3::new(32, 32, 32),
-    4,
     7,
   );
-  let t0 = gate_voxel::TileCoord::new(0, 0, 0);
+  let t0 = gate_voxel::ChunkCoord::new(0, 0, 0);
   grid.set_state(0, 1, 0xDEAD);
   grid.set_state(1, 0, 0xBEEF);
-  grid.set_comp(t0, 0, 0x1122);
-  grid.set_comp(t0, 1, 0x3344);
+  grid.set_comp(t0, 0, 0, 0, 0x1122);
+  grid.set_comp(t0, 1, 0, 0, 0x3344);
 }
 
 // ================= P2.10 OBJ 硬编码芯片预制件 =================
 //
-// 电子学级小网格（128×32×128 fine，独立 1-tile TileGrid，全链复用
-// TileGrid/BrickMapBuilder）。含 L0 PCB / 引脚 / die + L4 走线（1-fine
+// 电子学级小网格（128×32×128 fine，独立 1-chunk VolumeGrid，全链复用
+// VolumeGrid/BrickMapBuilder）。含 L0 PCB / 引脚 / die + L4 走线（1-fine
 // 细线，练习 brick slab 路径）。三枚实例见 setup()：贴地 / 交叠 / 旋转缩放。
 
-fn build_chip_prefab() -> BrickMapBuffers {
-  let mut g = gate_voxel::TileGrid::new();
+fn build_chip_prefab() -> gate_voxel::VolumeGrid {
+  let mut g = gate_voxel::VolumeGrid::new();
   // 芯片自带 palette（物体独立 256 条；1 PCB 绿 / 2 走线青 / 3 引脚金 / 4 die 银灰）
   let pal = g.palette_mut();
   let chip_colors: &[(u8, [u8; 3], u8)] = &[
@@ -654,35 +642,31 @@ fn build_chip_prefab() -> BrickMapBuffers {
     pal.set(idx, e);
   }
   // PCB 基板（L0）+ 中央 die + 四边引脚
-  fill_box(&mut g, IVec3::ZERO, IVec3::new(128, 16, 128), 0, 1);
-  fill_box(&mut g, IVec3::new(48, 16, 48), IVec3::new(32, 16, 32), 0, 4);
+  fill_box(&mut g, IVec3::ZERO, IVec3::new(128, 16, 128), 1);
+  fill_box(&mut g, IVec3::new(48, 16, 48), IVec3::new(32, 16, 32), 4);
   for s in 0..4 {
     fill_box(
       &mut g,
       IVec3::new(8 + s * 32, 16, 0),
       IVec3::new(16, 8, 8),
-      0,
       3,
     );
     fill_box(
       &mut g,
       IVec3::new(8 + s * 32, 16, 120),
       IVec3::new(16, 8, 8),
-      0,
       3,
     );
     fill_box(
       &mut g,
       IVec3::new(0, 16, 8 + s * 32),
       IVec3::new(8, 8, 16),
-      0,
       3,
     );
     fill_box(
       &mut g,
       IVec3::new(120, 16, 8 + s * 32),
       IVec3::new(8, 8, 16),
-      0,
       3,
     );
   }
@@ -692,18 +676,16 @@ fn build_chip_prefab() -> BrickMapBuffers {
       &mut g,
       IVec3::new(16 + i * 16, 32, 16),
       IVec3::new(1, 1, 96),
-      4,
       2,
     );
     fill_box(
       &mut g,
       IVec3::new(16, 32, 16 + i * 16),
       IVec3::new(96, 1, 1),
-      4,
       2,
     );
   }
-  BrickMapBuilder::build_full(&g).buffers().clone()
+  g
 }
 
 /// 轨道相机输入（P2.6 spec FR-3/FR-4）：
@@ -787,11 +769,11 @@ fn window_height(windows: &Query<&Window>) -> f32 {
 }
 
 /// 左键点击：把旋转中心（OrbitCamera.target）搬到点击像素命中的体素位置。
-/// - 未命中任何体素 / OBJ 物体 → 不做操作。
+/// - 未命中任何体素 / 物体 → 不做操作。
 /// - 命中点用射线入点 fine 坐标（命中面外侧向内偏半个 fine，避免 target 贴着面导致
 ///   距离过近时 pitch clamp 抖动）。
 /// - UI 捕获指针（UI 控件上点击）时跳过，避免误触发。
-/// - CPU picking：用 `cpu_reference_trace_scene` 同步跑世界+OBJ 两级 DDA，
+/// - CPU picking：用 `cpu_reference_trace_volumes` 同步跑主世界+物体两级 DDA，
 ///   复用 DdaCameraConfig.inv_view_proj 反投影构造射线（origin=相机、dir=命中像素 far）。
 #[allow(clippy::too_many_arguments)] // 多资源 = 点击成本可接受
 fn left_click_pick_recenter(
@@ -800,7 +782,6 @@ fn left_click_pick_recenter(
   windows: Query<&Window>,
   cfg: Res<DdaCameraConfig>,
   scene: Option<Res<VoxelScene>>,
-  obj: Option<Res<ObjScene>>,
   mut orbit: ResMut<OrbitCamera>,
 ) {
   if !mouse.just_pressed(MouseButton::Left) {
@@ -809,7 +790,7 @@ fn left_click_pick_recenter(
   if captured.0 {
     return; // UI 控件点击 → 吞掉
   }
-  let (Some(scene), Some(obj)) = (scene, obj) else {
+  let Some(scene) = scene else {
     return;
   };
   let Ok(window) = windows.single() else {
@@ -835,28 +816,36 @@ fn left_click_pick_recenter(
     return;
   }
   let t_max = (CAM_FAR - CAM_NEAR).max(delta.length());
-  // ---- 2) CPU picking：从 VoxelScene.grid 同步构建 brickmap + trace
-  // 点击低频（用户输入），且极限场景 ~300 tile 单次 build_full <150ms；
-  // 故意不做跨帧缓存——编辑（每 120 帧 tile 改写）会让缓存与实际渲染画面
+  // ---- 2) CPU picking：从 VoxelScene.volumes 同步构建各 volume brickmap + trace
+  // 点击低频（用户输入），且极限场景 ~300 chunk 单次 build_full <150ms；
+  // 故意不做跨帧缓存——编辑（每 120 帧 chunk 改写）会让缓存与实际渲染画面
   // 不匹配，造成"点到空气也 recenter"的错觉。宁可点击时重建也不提供假命中。
-  let world_bufs = BrickMapBuilder::build_full(&scene.grid).buffers().clone();
-  // ---- 3) trace_scene：世界 + OBJ 统一求最近 ----
-  if let Some(hit) =
-    gate_render::cpu_reference_trace_scene(&world_bufs, &obj.packed, cfg.position_world, dir, t_max)
-  {
+  let per_vol_bufs: Vec<BrickMapBuffers> = scene
+    .volumes
+    .list
+    .iter()
+    .map(|v| BrickMapBuilder::build_full(v).buffers().clone())
+    .collect();
+  let vols_with_tr: Vec<(&BrickMapBuffers, VolumeTransform)> = per_vol_bufs
+    .iter()
+    .zip(scene.volumes.list.iter().map(|v| v.transform))
+    .map(|(b, t)| (b, t))
+    .collect();
+  // ---- 3) trace_volumes：主世界 + 物体统一求最近 ----
+  if let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, cfg.position_world, dir, t_max) {
     // 命中点 = origin + t·dir；再朝命中法线方向推半个 fine（让 target 落在体素内部）。
     let mut p = cfg.position_world + dir * hit.t;
     let half = 0.5;
     p += hit.normal * half; // 法线朝射线来向 → *+half 把点推进命中体素内 0.5 fine
     orbit.target = p;
     bevy::log::info!(
-      "PICK → target=({:.1},{:.1},{:.1})  t={:.1}  pal={}  obj={}",
+      "PICK → target=({:.1},{:.1},{:.1})  t={:.1}  pal={}  obj_id={}",
       p.x,
       p.y,
       p.z,
       hit.t,
       hit.pal,
-      hit.obj,
+      hit.obj_id,
     );
     // 注：DdaCameraConfig 由 orbit_camera_input 同帧末尾重建（本系统在其之后），
     // 因此新 target 下帧生效，避免 Update 中段重复 cfg 构造。
@@ -897,7 +886,7 @@ fn edit_tile_every_120_frames(mut frame: Local<u64>, scene: Option<ResMut<VoxelS
         let mut x = 0;
         while x < 32 {
           let pos = origin + IVec3::new(x, y, z);
-          scene.grid.set_voxel(pos, 4, pal);
+          scene.volumes.main_mut().set_voxel_ivec3(pos, pal);
           x += 1;
         }
         y += 1;
@@ -1052,8 +1041,8 @@ mod aabb_zoom_tests {
   //
   // 运行：cargo test -p gate-app demo_scene_aabb_zoom_out -- --nocapture
 
-  fn scene_for_aabb_zoom_headless() -> (gate_voxel::TileGrid, BrickMapGlobals) {
-    let mut grid = gate_voxel::TileGrid::new();
+  fn scene_for_aabb_zoom_headless() -> (gate_voxel::VolumeGrid, BrickMapGlobals) {
+    let mut grid = gate_voxel::VolumeGrid::new();
     paint(&mut grid);
     build_scene(&mut grid);
     let builder = BrickMapBuilder::build_full(&grid);
@@ -1063,7 +1052,7 @@ mod aabb_zoom_tests {
   // 从 main.rs 的 paint_demo_palette / build_demo_scene 重命名 import（同名）——
   // 在 cfg(test) 里调用同名函数会优先选 super::，但函数在 test mod 外。
   // 所以我们直接再包一层：
-  fn paint(grid: &mut gate_voxel::TileGrid) {
+  fn paint(grid: &mut gate_voxel::VolumeGrid) {
     let palette: &[(u8, [u8; 3], u8)] = &[
       (1, [118, 118, 126], 220),
       (2, [214, 64, 64], 180),
@@ -1080,13 +1069,12 @@ mod aabb_zoom_tests {
       pal.set(idx, e);
     }
   }
-  fn build_scene(grid: &mut gate_voxel::TileGrid) {
-    use gate_voxel::{draw_text, fill_box, fill_sphere};
+  fn build_scene(grid: &mut gate_voxel::VolumeGrid) {
+    use gate_voxel::{draw_text, fill_box, fill_bricks, fill_sphere};
     fill_box(
       grid,
       glam::IVec3::ZERO,
       glam::IVec3::new(512, 16, 512),
-      0,
       1,
     );
     for i in (0..512).step_by(128) {
@@ -1094,54 +1082,49 @@ mod aabb_zoom_tests {
         grid,
         glam::IVec3::new(i, 16, 0),
         glam::IVec3::new(4, 4, 512),
-        3,
         6,
       );
       fill_box(
         grid,
         glam::IVec3::new(0, 16, i),
         glam::IVec3::new(512, 4, 4),
-        3,
         6,
       );
     }
-    fill_box(
+    fill_bricks(
       grid,
       glam::IVec3::new(128, 16, 128),
       glam::IVec3::new(128, 256, 128),
-      1,
+      16,
       2,
     );
-    fill_sphere(grid, glam::IVec3::new(192, 320, 192), 64, 2, 5);
+    fill_sphere(grid, glam::IVec3::new(192, 320, 192), 64, 5);
     fill_box(
       grid,
       glam::IVec3::new(256, 192, 144),
       glam::IVec3::new(96, 4, 32),
-      3,
       2,
     );
-    fill_box(
+    fill_bricks(
       grid,
       glam::IVec3::new(352, 16, 128),
       glam::IVec3::new(64, 192, 64),
-      2,
+      16,
       6,
     );
-    fill_sphere(grid, glam::IVec3::new(384, 80, 320), 48, 3, 2);
-    fill_sphere(grid, glam::IVec3::new(192, 48, 352), 24, 4, 4);
-    draw_text(grid, glam::IVec3::new(64, 16, 448), "GATE", 1, 5);
+    fill_sphere(grid, glam::IVec3::new(384, 80, 320), 48, 2);
+    fill_sphere(grid, glam::IVec3::new(192, 48, 352), 24, 4);
+    draw_text(grid, glam::IVec3::new(64, 16, 448), "GATE", 5);
     fill_box(
       grid,
       glam::IVec3::new(656, 64, 64),
       glam::IVec3::new(32, 32, 32),
-      4,
       5,
     );
     fill_box(
       grid,
       glam::IVec3::new(1264, 240, 240),
       glam::IVec3::new(32, 32, 32),
-      4,
       4,
     );
   }

@@ -5,28 +5,95 @@
 
 use glam::IVec3;
 
-use crate::coords::VoxelCoord;
+use crate::coords::LEVEL_EXTENT;
 use crate::volume::VolumeGrid;
 
 /// 填充与轴对齐包围盒相交的所有体素（1³，确定性）
+///
+/// 按 4³ 网格分块：完全含于 box 的整块走 `fill_brick`（O(depth) 树路径写入），
+/// 边缘块逐体素。纯逐体素 `set_voxel` 对大 box 慢 64 倍（每 4³ 块分裂 65 节点）。
 pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -> usize {
   assert!(extent.cmpgt(IVec3::ZERO).all());
   let max = min + extent;
   let mut count = 0;
+
+  // 4³ 网格遍历：块起点 = min 向下对齐 4，块终点 = max 向上对齐 4
+  let blk_lo = IVec3::new(min.x & !3, min.y & !3, min.z & !3);
+  let blk_hi = IVec3::new((max.x + 3) & !3, (max.y + 3) & !3, (max.z + 3) & !3);
+  let mut bz = blk_lo.z;
+  while bz < blk_hi.z {
+    let mut by = blk_lo.y;
+    while by < blk_hi.y {
+      let mut bx = blk_lo.x;
+      while bx < blk_hi.x {
+        let b_lo = IVec3::new(bx, by, bz);
+        let b_hi = b_lo + IVec3::splat(4);
+        if b_lo.cmpge(min).all() && b_hi.cmple(max).all() {
+          // 整块在 box 内 → fill_brick 树路径（64 体素 1 次调用）
+          if grid.fill_brick(b_lo, 4, palette).is_some() {
+            count += 64;
+          }
+        } else {
+          // 边缘块：逐体素
+          let mut z = b_lo.z.max(min.z);
+          while z < b_hi.z.min(max.z) {
+            let mut y = b_lo.y.max(min.y);
+            while y < b_hi.y.min(max.y) {
+              let mut x = b_lo.x.max(min.x);
+              while x < b_hi.x.min(max.x) {
+                if grid.set_voxel_ivec3(IVec3::new(x, y, z), palette).is_some() {
+                  count += 1;
+                }
+                x += 1;
+              }
+              y += 1;
+            }
+            z += 1;
+          }
+        }
+        bx += 4;
+      }
+      by += 4;
+    }
+    bz += 4;
+  }
+  count
+}
+
+/// 用 e³ 对齐 brick 填充 [min, min+extent) 盒（大体积均匀填充专用）
+///
+/// extent 各轴必须是 e 的倍数且 min 各轴对齐 e。brick 级树路径写入
+/// （[`VolumeGrid::fill_brick`]），零逐体素分裂开销——百万级 fill_box 会内存爆炸
+/// （每新 4³ 块分裂 65 节点），大盒一律走本函数。返回实际写入的 brick 数。
+pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, palette: u8) -> usize {
+  assert!(
+    LEVEL_EXTENT.contains(&e),
+    "e 必须是 brick 粒度 {LEVEL_EXTENT:?} 之一（got {e}）"
+  );
+  assert!(
+    extent.x % e == 0 && extent.y % e == 0 && extent.z % e == 0,
+    "extent 必须是 e 的倍数（extent={extent} e={e}）"
+  );
+  assert!(
+    min.x % e == 0 && min.y % e == 0 && min.z % e == 0,
+    "min 必须对齐 e（min={min} e={e}）"
+  );
+  let hi = min + extent;
+  let mut count = 0;
   let mut z = min.z;
-  while z < max.z {
+  while z < hi.z {
     let mut y = min.y;
-    while y < max.y {
+    while y < hi.y {
       let mut x = min.x;
-      while x < max.x {
-        if grid.set_voxel_ivec3(IVec3::new(x, y, z), palette).is_some() {
+      while x < hi.x {
+        if grid.fill_brick(IVec3::new(x, y, z), e, palette).is_some() {
           count += 1;
         }
-        x += 1;
+        x += e;
       }
-      y += 1;
+      y += e;
     }
-    z += 1;
+    z += e;
   }
   count
 }
@@ -134,6 +201,7 @@ pub fn draw_text(grid: &mut VolumeGrid, origin: IVec3, text: &str, palette: u8) 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::VoxelCoord;
 
   #[test]
   fn box_readback() {

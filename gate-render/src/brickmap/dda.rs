@@ -329,112 +329,88 @@ mod tests {
 }
 
 // ============================================================================
-// Task 2: WGSL 常量 Rust 镜像（AC-3 单测 + 槽位打包 roundtrip）
+// Task 2: WGSL 常量 Rust 镜像（单测 assert_eq! 对 wire.rs 常量，防漂移）
 // ============================================================================
 
-/// WGSL 着色器顶部 `const` 的 Rust 镜像副本（单测 assert_eq! 对 wire.rs 常量，防漂移）
+/// WGSL 着色器顶部 `const` 的 Rust 镜像副本（Phase 2 shader 重写时逐字对应；
+/// 单测 assert_eq! 对 wire.rs 常量，防漂移）
 pub mod wgsl_consts {
-  // 与 WGSL 顶部 const 逐字对应；source = Rust wire.rs 对应项
-  pub const TILE_INDEX_CAP: u32 = 128;
-  pub const TILE_CAP: u32 = 1024;
-  pub const BITMAP_BASE: u32 = 2_097_152; // 128³
-  pub const TILE_BITMAP_WORDS: u32 = 1024;
-  pub const DIR_BASE: u32 = 3_145_728; // BITMAP_BASE + TILE_CAP*TILE_BITMAP_WORDS = 2097152+1048576
-  pub const CELL_DIR_WORDS: u32 = 32_768;
-  pub const HDR_UNIFORM_MASK: u32 = 0xFF;
-  pub const HDR_HAS_L1: u32 = 1 << 8;
-  pub const HDR_HAS_L2: u32 = 1 << 9;
-  pub const HDR_HAS_L3: u32 = 1 << 10;
-  pub const HDR_HAS_BRICK: u32 = 1 << 11;
-  pub const BRICK_SLAB_WORDS: u32 = 1024;
-  // WGSL 无法 const array，单 const 分开
-  pub const ST_L1_WORDS: u32 = 4;
-  pub const ST_L2_WORDS: u32 = 32;
-  pub const ST_L3_WORDS: u32 = 256;
-  pub const ST_BRICK_PTR_WORDS: u32 = 2;
-  pub const TILE_SUB: u32 = 512; // tile 边长 fine（32 cells × 16 sub/cell）
-  pub const SUB_PER_CELL: u32 = 16; // 基元胞边长 fine
+  // 分裂树层级（Douglas Brick Tree：256 → 64 → 16 → 4 → 1）
+  pub const CHUNK_SIZE: u32 = 256;
+  pub const BRICK_FACTOR: u32 = 4;
+  pub const MAX_LEVEL: u32 = 4;
+  /// 每节点 fixed 字数（mask_lo + mask_hi + palette_u32）
+  pub const NODE_FIXED_WORDS: u32 = 3;
+  // b_struct Region ①：稠密 chunk 窗口
+  pub const CHUNK_INDEX_CAP: u32 = 64;
+  pub const CHUNK_INDEX_WORDS: u32 = 262_144; // 64³
+  pub const TREE_BASE: u32 = 262_144;
+  // palette / comp / state
+  pub const PALETTE_WORDS: u32 = 512; // 256 条 × 2w
+  pub const CHUNK_COMP_WORDS: u32 = 2048; // u16[4096] → 每 2 字打包 u32
+  pub const STATE_ENTRY_COUNT: u32 = 256;
+  pub const STATE_WORDS_PER_ENTRY: u32 = 4;
+  pub const STATE_TOTAL_WORDS: u32 = 1024; // 256 × 4
 }
 
-/// 与 WGSL `slot_unpack(word, half)` 等价：半 0 = lower 16bit；半 1 = upper 16bit
-pub fn wgsl_slot_unpack(word: u32, half: u32) -> u16 {
-  debug_assert!(half <= 1);
-  ((word >> (16 * half)) & 0xFFFF) as u16
-}
-
-/// 与 WGSL `slot_pack(tag,pal) -> u16` 等价：tag<<8 | pal
-pub fn wgsl_slot_pack(tag: u8, pal: u8) -> u16 {
-  ((tag as u16) << 8) | (pal as u16)
+/// 与 WGSL `popcount(mask & (bit - 1u64))` 等价：mask bit=1 子块在 child offset
+/// 表中的槽位（紧凑 child offset 只存 bit=1 的子块）
+#[inline]
+pub fn wgsl_child_slot_index(mask: u64, child_idx: u32) -> u32 {
+  debug_assert!(child_idx < 64);
+  (mask & ((1u64 << child_idx) - 1)).count_ones()
 }
 
 #[cfg(test)]
 mod const_tests {
+  use super::wgsl_child_slot_index;
   use super::wgsl_consts::*;
-  use super::*;
   use crate::brickmap::wire as w;
 
   /// 确定性 xorshift64（同 dda_ref_tests）
-  fn xorshift64(state: &mut u64) -> u32 {
+  fn xorshift64(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
     *state = x;
-    (x & 0xFFFF_FFFF) as u32
+    x
   }
 
-  /// TR-2.1: WGSL 常量 == wire.rs 对应常量（≥16 项对齐）
+  /// WGSL 常量 == wire.rs 对应常量（Phase 2 shader 源 = wire.rs 契约）
   #[test]
   fn wire_wgsl_constants_aligned() {
-    // 直接按常量名对应
-    // TILE_INDEX_CAP: i32, BITMAP_BASE/DIR_BASE/..._WORDS: usize → as u32 必要；
-    // HDR_*: u32, TILE_CAP/TILE_SUB: u32 → 无需 as
-    assert_eq!(TILE_INDEX_CAP, (w::TILE_INDEX_CAP as u32));
-    assert_eq!(BITMAP_BASE, (w::BITMAP_BASE as u32));
-    assert_eq!(TILE_BITMAP_WORDS, (w::TILE_BITMAP_WORDS as u32));
-    assert_eq!(DIR_BASE, (w::DIR_BASE as u32));
-    assert_eq!(CELL_DIR_WORDS, (w::CELL_DIR_WORDS as u32));
-    assert_eq!(HDR_UNIFORM_MASK, w::HDR_UNIFORM_MASK);
-    assert_eq!(HDR_HAS_L1, w::HDR_HAS_L1);
-    assert_eq!(HDR_HAS_L2, w::HDR_HAS_L2);
-    assert_eq!(HDR_HAS_L3, w::HDR_HAS_L3);
-    assert_eq!(HDR_HAS_BRICK, w::HDR_HAS_BRICK);
-    assert_eq!(BRICK_SLAB_WORDS, (w::BRICK_SLAB_WORDS as u32));
-    assert_eq!(ST_L1_WORDS, (w::SLOT_TABLE_WORDS[1] as u32));
-    assert_eq!(ST_L2_WORDS, (w::SLOT_TABLE_WORDS[2] as u32));
-    assert_eq!(ST_L3_WORDS, (w::SLOT_TABLE_WORDS[3] as u32));
-    // ST_BRICK_PTR_WORDS = 2：L4 BRICK = hdr 字 + brick_index 字（共 2 words）
-    // wire.rs SLOT_TABLE_WORDS[4] = 0（brick 无槽表，存 b_leaves slab），分别对应，不等值
-    assert_eq!(ST_BRICK_PTR_WORDS, 2u32);
-    assert_eq!(TILE_CAP, 1024); // wire.rs TILE_CAP
-    assert_eq!(TILE_SUB, 512); // tile 边长 fine = 32 cells × 16 sub/cell
-    assert_eq!(SUB_PER_CELL, gate_voxel::SUB_PER_CELL as u32);
+    assert_eq!(CHUNK_SIZE, w::CHUNK_SIZE as u32);
+    assert_eq!(BRICK_FACTOR, w::BRICK_FACTOR as u32);
+    assert_eq!(MAX_LEVEL, w::MAX_LEVEL);
+    assert_eq!(NODE_FIXED_WORDS, w::NODE_FIXED_WORDS as u32);
+    assert_eq!(CHUNK_INDEX_CAP, w::CHUNK_INDEX_CAP as u32);
+    assert_eq!(CHUNK_INDEX_WORDS, w::CHUNK_INDEX_WORDS as u32);
+    assert_eq!(TREE_BASE, w::TREE_BASE as u32);
+    assert_eq!(PALETTE_WORDS, w::PALETTE_WORDS as u32);
+    assert_eq!(CHUNK_COMP_WORDS, w::CHUNK_COMP_WORDS as u32);
+    assert_eq!(STATE_ENTRY_COUNT, w::STATE_ENTRY_COUNT as u32);
+    assert_eq!(STATE_WORDS_PER_ENTRY, w::STATE_WORDS_PER_ENTRY as u32);
+    assert_eq!(STATE_TOTAL_WORDS, w::STATE_TOTAL_WORDS as u32);
   }
 
-  /// TR-2.2: 200 随机(tag, pal)，WGS L pack/unpack 与 wire.rs encode_slot/unpack_slot_word 等价
+  /// child_slot_index 与「线性扫描 mask 低位」等价（200 随机 (mask, child_idx)）
   #[test]
-  fn slot_pack_roundtrip_wgsl_vs_rust_200_random() {
+  fn child_slot_index_matches_linear_scan() {
     let mut state: u64 = 0x517CC1B727220A95;
     for _ in 0..200 {
-      let tag: u8 = (xorshift64(&mut state) % 3) as u8; // 0 empty,1 leaf,2 branch
-      let pal: u8 = (xorshift64(&mut state) & 0xFF) as u8;
-      // 先 WGSL 侧 pack → u16
-      let s1 = wgsl_slot_pack(tag, pal);
-      // wire.rs encode_slot = (tag << 8) | pal
-      let s2 = w::encode_slot(tag as u16, pal);
-      assert_eq!(s1, s2, "tag={tag} pal={pal}: {s1} vs {s2}");
-      // 打包进两 slot word（word 里两个 half），half=0 解 s1 和 wire
-      let word_half0 = (s1 as u32) | 0xDEADu32 << 16;
-      assert_eq!(wgsl_slot_unpack(word_half0, 0), s1);
-      assert_eq!(w::unpack_slot_word(word_half0, 0), s1);
-      let word_half1 = 0xBEEFu32 | (s1 as u32) << 16;
-      assert_eq!(wgsl_slot_unpack(word_half1, 1), s1);
-      assert_eq!(w::unpack_slot_word(word_half1, 1), s1);
-      // slot_tag + slot_palette （wgst s1 >>8 和 &0xFF）
-      assert_eq!((s1 >> 8) as u8, tag);
-      assert_eq!((s1 & 0xFF) as u8, pal);
-      assert_eq!(w::slot_tag(s2), tag as u16);
-      assert_eq!(w::slot_palette(s2), pal);
+      let mask = xorshift64(&mut state)
+        | (xorshift64(&mut state) << 32); // 全 64bit 随机
+      let child_idx = (xorshift64(&mut state) % 64) as u32;
+      // 线性扫描：slot = child_idx 位之前 bit=1 的个数
+      let expect = (0..child_idx)
+        .filter(|&i| mask & (1u64 << i) != 0)
+        .count() as u32;
+      assert_eq!(
+        wgsl_child_slot_index(mask, child_idx),
+        expect,
+        "mask={mask:#x} child_idx={child_idx}"
+      );
     }
   }
 }
@@ -894,11 +870,177 @@ pub fn cpu_dda_ascii_grid_32x32(cfg: &DdaCameraConfig, buffers: &BrickMapBuffers
   out
 }
 
+// ============================================================================
+// Phase 3 OBJ→Volume 统一：多 volume CPU 参考 trace
+//
+// 替代已删除的 obj.rs::cpu_reference_trace_scene / cpu_reference_scene_occluded。
+// 入口 = `cpu_reference_trace_volumes` / `cpu_reference_volumes_occluded`，
+// 遍历 `vols: &[(&BrickMapBuffers, VolumeTransform)]`：
+// - idx 0 = 主世界（identity transform、无界 chunk HashMap）→ 直接两级 DDA
+// - idx 1..N = 物体（任意 transform、单 chunk）→ AABB 预剔除 + 局部变换 + 局部
+//   tile 盒 slab + 两级 DDA → 局部法线经 rot → 世界法线
+// ============================================================================
+
+use gate_voxel::VolumeTransform;
+
+/// 统一 volume 命中记录（替代已删除的 `ObjHit`）。
+///
+/// `obj_id` 约定与 `Volumes` 一致：-1 = 主世界，0..N-1 = 物体索引
+/// （对应 `Volumes.list[1..]` 的 0-based 索引）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeHit {
+  pub t: f32,
+  pub pal: u8,
+  pub obj_id: i32,
+  pub normal: Vec3,
+}
+
+/// slab 法射线-AABB 求交（与 WGSL `slab_box` / `cpu_reference_dda_ray_aabb_skip` 同型）。
+/// 返回 (t_enter, t_exit)；t_exit < t_enter 表示不相交。
+fn slab_box(ro: Vec3, rd: Vec3, mn: Vec3, mx: Vec3, t0: f32, t1: f32) -> (f32, f32) {
+  let o = [ro.x, ro.y, ro.z];
+  let d = [rd.x, rd.y, rd.z];
+  let lo = [mn.x, mn.y, mn.z];
+  let hi = [mx.x, mx.y, mx.z];
+  let mut t_enter = t0;
+  let mut t_exit = t1;
+  for i in 0..3 {
+    if d[i].abs() < 1e-30 {
+      if o[i] < lo[i] || o[i] > hi[i] {
+        return (1.0, 0.0); // 平行且在外 → miss 哨兵
+      }
+    } else {
+      let ta = (lo[i] - o[i]) / d[i];
+      let tb = (hi[i] - o[i]) / d[i];
+      t_enter = t_enter.max(ta.min(tb));
+      t_exit = t_exit.min(tb.max(ta));
+    }
+  }
+  (t_enter, t_exit)
+}
+
+/// 由 DDA 命中轴推导面法线：axis<3 → -sign[axis] 单位轴；axis==3（起点在体内）→ -dir。
+/// `dir` 用于决定轴方向（射线朝 +axis 穿入 → 面在 -axis 侧）。
+fn face_normal_from_axis(axis: u8, dir: Vec3) -> Vec3 {
+  if axis < 3 {
+    let a = axis as usize;
+    let mut n = Vec3::ZERO;
+    n[a] = if dir[a] >= 0.0 { -1.0 } else { 1.0 };
+    n
+  } else {
+    -dir.normalize_or_zero()
+  }
+}
+
+/// 单物体 ray：世界 AABB 预剔除 + 局部变换 + 局部 [0,256]³ tile 盒 slab + 两级 DDA。
+/// 返回 (全局 t, palette, **局部**面法线) 或 None。t 标尺全局（rd 不归一化）。
+fn cpu_reference_object_ray_unified(
+  bufs: &BrickMapBuffers,
+  tr: VolumeTransform,
+  origin: Vec3,
+  dir: Vec3,
+  t_cap: f32,
+) -> Option<(f32, u8, Vec3)> {
+  // ---- 世界 AABB 预剔除 ----
+  let (w_mn, w_mx) = tr.world_aabb();
+  let (t_enter, t_exit) = slab_box(origin, dir, w_mn, w_mx, 0.0, t_cap);
+  if t_exit < t_enter.max(0.0) || t_enter >= t_cap {
+    return None;
+  }
+  let t_hi_cap = t_exit.min(t_cap);
+  if t_hi_cap <= t_enter.max(0.0) {
+    return None;
+  }
+  // ---- 局部变换（rd 不归一化 → t 标尺不变）----
+  let wp = origin - tr.pos;
+  let ro = Vec3::new(
+    wp.dot(tr.rot.x_axis),
+    wp.dot(tr.rot.y_axis),
+    wp.dot(tr.rot.z_axis),
+  ) / tr.scale;
+  let rd = Vec3::new(
+    dir.dot(tr.rot.x_axis),
+    dir.dot(tr.rot.y_axis),
+    dir.dot(tr.rot.z_axis),
+  ) / tr.scale;
+  // ---- 局部 tile 盒 [0,256]³ slab（Phase 0 chunk 256³）----
+  let (tl_enter, tl_exit) = slab_box(ro, rd, Vec3::ZERO, Vec3::splat(256.0), 0.0, t_hi_cap);
+  if tl_exit < tl_enter.max(0.0) {
+    return None;
+  }
+  let tl0 = tl_enter.max(0.0);
+  let tl1 = tl_exit.min(t_hi_cap);
+  if tl1 <= tl0 {
+    return None;
+  }
+  // ---- 局部两级 DDA：从 slab 入口起算，t 标尺 = 局部 in-slab 时长 ----
+  // 注意：DDA 起点必须是 slab 入口 `ro + rd*tl0`，否则从远点 ro 出发的粗步
+  // 还没走到 slab 就耗尽 t_max（= tl1 - tl0），导致小 chip 全漏命中。
+  let ro_slab = ro + rd * tl0;
+  let hit = cpu_reference_dda_ray_two_level(bufs, ro_slab, rd, tl1 - tl0, 96)?;
+  let t_global = tl0 + hit.t;
+  let n_local = face_normal_from_axis(hit.axis, rd);
+  Some((t_global, hit.pal, n_local))
+}
+
+/// `trace_volumes()` CPU 参考：遍历所有 volume 取最近命中。
+///
+/// - idx 0 = 主世界：identity transform → 直接 `cpu_reference_dda_ray_two_level`
+///   （主世界无界，不走 AABB 预剔除）
+/// - idx 1..N = 物体：`cpu_reference_object_ray_unified`（AABB + 局部 DDA）
+///
+/// 命中按 t 升序排序取最近；任一前置 volume 命中即压缩后续 volume 的 t_cap。
+pub fn cpu_reference_trace_volumes(
+  vols: &[(&BrickMapBuffers, VolumeTransform)],
+  origin: Vec3,
+  dir: Vec3,
+  t_max: f32,
+) -> Option<VolumeHit> {
+  let mut best: Option<VolumeHit> = None;
+  for (i, (bufs, tr)) in vols.iter().enumerate() {
+    let obj_id = if i == 0 { -1 } else { (i - 1) as i32 };
+    let cap = best.as_ref().map_or(t_max, |b| b.t.min(t_max));
+    let hit = if obj_id == -1 {
+      cpu_reference_dda_ray_two_level(bufs, origin, dir, cap, 16384)
+        .map(|h| (h.t, h.pal, face_normal_from_axis(h.axis, dir)))
+    } else {
+      cpu_reference_object_ray_unified(bufs, *tr, origin, dir, cap)
+        .map(|(t, pal, n_local)| (t, pal, (tr.rot * n_local).normalize_or_zero()))
+    };
+    if let Some((t, pal, normal)) = hit
+      && best.as_ref().is_none_or(|b| t < b.t)
+    {
+      best = Some(VolumeHit { t, pal, obj_id, normal });
+    }
+  }
+  best
+}
+
+/// `trace_volumes()` 遮挡快路径（P3.1 阴影射线）：t_max 内**任一**命中即 true。
+/// 不做最近比较；阴影射线占比大时（每像素 × 光源 × 采样），此路径省去逐 volume t 排序。
+pub fn cpu_reference_volumes_occluded(
+  vols: &[(&BrickMapBuffers, VolumeTransform)],
+  origin: Vec3,
+  dir: Vec3,
+  t_max: f32,
+) -> bool {
+  for (i, (bufs, tr)) in vols.iter().enumerate() {
+    if i == 0 {
+      if cpu_reference_dda_ray_two_level(bufs, origin, dir, t_max, 16384).is_some() {
+        return true;
+      }
+    } else if cpu_reference_object_ray_unified(bufs, *tr, origin, dir, t_max).is_some() {
+      return true;
+    }
+  }
+  false
+}
+
 #[cfg(test)]
 mod dda_ref_tests {
   use super::*;
   use crate::brickmap::BrickMapBuilder;
-  use gate_voxel::{TileGrid, fill_box, fill_sphere};
+  use gate_voxel::{VolumeGrid, fill_box, fill_sphere};
   use glam::IVec3;
 
   /// 确定性 xorshift64（不用引入 rand crate，50 射线 + 200 打包足够）
@@ -932,15 +1074,14 @@ mod dda_ref_tests {
   }
 
   fn build_box_sphere_scene() -> (BrickMapBuffers, DdaCameraConfig) {
-    use gate_voxel::coords::MAX_LEVEL;
-    let mut g = TileGrid::new();
-    // box 16³ fine → 0..16 (最细 level=MAX_LEVEL) → pal=1
-    fill_box(&mut g, IVec3::ZERO, IVec3::splat(16), MAX_LEVEL, 1);
-    // sphere at (8,8,8) fine, r=4 fine (1cm), level=MAX_LEVEL pal=2
-    fill_sphere(&mut g, IVec3::new(8, 8, 8), 4, MAX_LEVEL, 2);
-    // hotspots pal 3+4: 1x1x1 at (12, 2, 12) MAX_LEVEL pal3 and (14,2,14) pal4
-    g.set_voxel(IVec3::new(12, 2, 12), MAX_LEVEL, 3);
-    g.set_voxel(IVec3::new(14, 2, 14), MAX_LEVEL, 4);
+    let mut g = VolumeGrid::new();
+    // box 16³ fine → 0..16，pal=1
+    fill_box(&mut g, IVec3::ZERO, IVec3::splat(16), 1);
+    // sphere at (8,8,8) fine, r=4 fine (1cm), pal=2
+    fill_sphere(&mut g, IVec3::new(8, 8, 8), 4, 2);
+    // hotspots pal 3+4: 1x1x1 at (12, 2, 12) pal3 and (14,2,14) pal4
+    g.set_voxel_ivec3(IVec3::new(12, 2, 12), 3);
+    g.set_voxel_ivec3(IVec3::new(14, 2, 14), 4);
     let b = BrickMapBuilder::build_full(&g);
     (b.buffers().clone(), test_cam())
   }
@@ -1129,21 +1270,19 @@ mod dda_ref_tests {
   /// full 累加 tmax vs 两级粗/细分别重算，长路径 ulp 漂移只影响 t 值不影响命中胞）。
   #[test]
   fn two_level_equivalence_300_rays() {
-    // ---- 多物体场景（一个 tile 内）：外框盒 + 内浮球 + 独立柱，cell 间隙跨越 ----
-    let mut g = TileGrid::new();
-    use gate_voxel::coords::MAX_LEVEL;
-    // 外框壳：32³ box（2×2×2 cells）
-    fill_box(&mut g, IVec3::ZERO, IVec3::splat(32), MAX_LEVEL, 1);
-    // 独立物体：偏移 (96, 32, 96) 的 16³ box（离开外框，中间隔空 cell）
+    // ---- 多物体场景（一个 chunk 内）：外框盒 + 内浮球 + 独立柱，间隙跨越 ----
+    let mut g = VolumeGrid::new();
+    // 外框壳：32³ box
+    fill_box(&mut g, IVec3::ZERO, IVec3::splat(32), 1);
+    // 独立物体：偏移 (96, 32, 96) 的 16³ box（离开外框，中间隔空隙）
     fill_box(
       &mut g,
       IVec3::new(96, 32, 96),
       IVec3::splat(16),
-      MAX_LEVEL,
       2,
     );
-    // 悬浮球：中心 (64, 64, 64)，r=8（跨 cell 边界）
-    fill_sphere(&mut g, IVec3::new(64, 64, 64), 8, MAX_LEVEL, 3);
+    // 悬浮球：中心 (64, 64, 64)，r=8
+    fill_sphere(&mut g, IVec3::new(64, 64, 64), 8, 3);
     let bufs = BrickMapBuilder::build_full(&g).buffers().clone();
 
     // ---- 固定退化方向：±轴平行穿物体中心 / 擦角 / 负坐标远端 ----
@@ -1248,7 +1387,6 @@ use bevy::{
 
 use std::borrow::Cow;
 
-use super::obj::GpuObjPool;
 use super::upload::GpuBrickMap;
 use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
 
@@ -1305,8 +1443,9 @@ impl Plugin for BrickMapDdaPlugin {
         Render,
         prepare_dda_bind_groups
           .in_set(RenderSystems::PrepareBindGroups)
-          // 同帧先用新 pool 重建 BG2 再绑 DDA（版本不匹配时差一帧也可接受，但同帧更稳）
-          .after(super::obj::prepare_obj_pool),
+          // prepare_dda_bind_groups 在 prepare (upload.rs) 之后运行：先 upload 写
+          // grid_descs_buf 再绑 DDA BG2（同帧最稳，避免差一帧的旧 GridDesc 绑定）。
+          .after(super::upload::prepare),
       )
       // 必须挂 RenderGraph::Render set（而非 Render schedule）：Render schedule 整体在
       // RenderGraph 之前 → begin_diagnostics_frame（Begin set）前执行，诊断 span 会被清空
@@ -1374,17 +1513,15 @@ fn init_dda_pipelines(
     ),
   );
 
-  // ---- BG2：OBJ object pool（obj_struct/obj_leaves/obj_palette/descs 四 storage + count uniform）----
+  // ---- BG2：GridDesc 数组（Phase 3 OBJ→Volume 统一；主世界 + 物体同描述符）----
+  // shader `trace_grid` 遍历 grid_descs[0..count]，无 kind 分支。
+  // GridDesc 144B/entry：pos_scale/rot0/rot1/rot2 + aabb_min/max + tree_base/tree_depth/chunk_count/palette_base + index_origin/dims。
   let bg2 = BindGroupLayoutDescriptor::new(
     "DdaBg2",
     &BindGroupLayoutEntries::sequential(
       ShaderStages::COMPUTE,
       (
-        storage_buffer_read_only_sized(false, None), // @binding(0) obj_struct
-        storage_buffer_read_only_sized(false, None), // @binding(1) obj_leaves
-        storage_buffer_read_only_sized(false, None), // @binding(2) obj_palette
-        storage_buffer_read_only_sized(false, None), // @binding(3) obj_descs
-        uniform_buffer::<super::obj::ObjGlobals>(false), // @binding(4) count
+        storage_buffer_read_only_sized(false, None), // @binding(0) grid_descs: array<GridDesc>
       ),
     ),
   );
@@ -1460,7 +1597,6 @@ fn prepare_dda_bind_groups(
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
-  gpu_obj: Option<Res<GpuObjPool>>,
   light_pool: Option<Res<LightPoolUniform>>,
   render_device: Res<RenderDevice>,
   pipeline_cache: Res<PipelineCache>,
@@ -1478,10 +1614,6 @@ fn prepare_dda_bind_groups(
   };
   let Some(gpu) = gpu_brickmap else {
     bevy::log::info_once!("DDA prepare: no GpuBrickMap");
-    return;
-  };
-  let Some(obj) = gpu_obj else {
-    bevy::log::info_once!("DDA prepare: no GpuObjPool");
     return;
   };
   let Some(light_pool) = light_pool else {
@@ -1531,20 +1663,12 @@ fn prepare_dda_bind_groups(
     )),
   );
 
-  // ---- BG2：OBJ pool（四 storage + count uniform）----
-  let obj_globals_bind = obj.globals.binding().expect(
-    "GpuObjPool.globals uniform buffer 未初始化（RenderStartup init_empty_obj_pool 应默认构造）",
-  );
+  // ---- BG2：GridDesc 数组（主世界 + 物体统一描述符；Phase 3 OBJ→Volume 统一）----
+  // shader `dda_main` 遍历 grid_descs[0..arrayLength]，trace_grid 无 kind 分支。
   let bg2 = render_device.create_bind_group(
     None,
     &bg2_layout,
-    &BindGroupEntries::sequential((
-      obj.struct_buf.as_entire_binding(),
-      obj.leaves.as_entire_binding(),
-      obj.palette.as_entire_binding(),
-      obj.descs.as_entire_binding(),
-      obj_globals_bind,
-    )),
+    &BindGroupEntries::sequential((gpu.grid_descs_buf.as_entire_binding(),)),
   );
 
   // ---- BG3：光源池 uniform ----

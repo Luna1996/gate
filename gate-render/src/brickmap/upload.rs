@@ -1,25 +1,25 @@
-//! 砖块图上传通道（P2.3）
+//! 砖块图上传通道（Phase 1，Douglas 1:1）
 //!
 //! 裁决（遗留决策点一）：探测 `RenderDevice.limits().max_storage_buffer_binding_size`
 //! 并在**首帧 info 日志打印路径选择**。默认使用**单 buffer 路径**（NVIDIA 1660/3070
-//! 都 ≥2GB，最坏 750MB b_struct < 1GB 阈值）。多 buffer 代码保留为 fallback
+//! 都 ≥2GB，最坏 b_struct < 1GB 阈值）。多 buffer 代码保留为 fallback
 //! 结构（`BufferLayout::Multi` + 单测覆盖），运行期若 limit<1GB 则 warn 并退化为
-//! 每帧全量 8MB index + 4MB bitmap + 128MB dirs + N×64MB nodes 单独写，不 crash。
+//! 每帧全量上传，不 crash。
 //!
 //! 阶段拆分：
 //! - `RenderStartup`：device/queue 就绪后创建 0 大小的 `GpuBrickMap` buffers（占位）
 //! - `ExtractSchedule`（render sub-app 调度）：用 `Extract<ResMut<T>>` 访问主世界
-//!   `VoxelScene(TileGrid)`，按预算 drain 脏 tile，做全量/增量 CPU 构建，将字节
+//!   `VoxelScene(Volumes)`，按预算 drain 脏 chunk，做全量/增量 CPU 构建，将字节
 //!   snapshot 写入 render world resource `UploadSnapshot`
 //! - `RenderSystems::PrepareResources`：读 `UploadSnapshot` →
-//!   * full：整块 `queue.write_buffer` 写 5 大类 GPU buffer
-//!   * incremental：仅写 Builder 记录的脏字节区间（struct/leaves/palette），
-//!     典型单 tile palette swap → ~132KB struct + 0 leaves + 2KB palette，
-//!     不再整块 147MB DMA，帧率不掉
+//!   * full：整块 `queue.write_buffer` 写 GPU buffer
+//!   * incremental：仅写 Builder 记录的脏字节区间（struct/palette），
+//!     典型单 chunk 编辑 → 窗口条目字 + 新树 append（KB 级），
+//!     不再整块 DMA，帧率不掉
 //! - info 打印 PROBE 结论 + UPLOAD[full|incremental]
 
 use bevy::{
-  log::{info, warn},
+  log::{debug, info, warn},
   prelude::*,
   render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
@@ -28,11 +28,8 @@ use bevy::{
   },
 };
 
-use super::builder::{BrickMapBuilder, DirtyRanges, TileUpdate};
-use super::wire::{
-  BrickMapBuffers, BrickMapGlobals, CELL_DIR_WORDS, NODE_STREAM_BASE, TILE_BITMAP_WORDS,
-  TILE_COMP_WORDS,
-};
+use super::builder::{VolumesBuilder, VolumesSnapshot};
+use super::wire::{BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, TREE_BASE};
 
 // ----------------------------------------------------------------------------
 // Limits + BufferLayout（CPU 单测覆盖单/多两模式）
@@ -65,7 +62,7 @@ impl BufferLayout {
     if limits.force_multi() {
       let per = 64u64 << 20;
       let left = limits.max_storage_buffer_binding_size.min(per).max(4 << 20);
-      let node_slices = ((NODE_STREAM_BASE as u64).saturating_add(per) / left) as usize;
+      let node_slices = ((TREE_BASE as u64).saturating_add(per) / left) as usize;
       Self::Multi {
         node_slices: node_slices.max(1),
       }
@@ -81,7 +78,7 @@ impl BufferLayout {
 
 #[derive(Resource)]
 pub struct VoxelScene {
-  pub grid: gate_voxel::TileGrid,
+  pub volumes: gate_voxel::Volumes,
   pub demo_force_full_rebuild: bool,
 }
 
@@ -100,18 +97,26 @@ impl Default for UploadBudget {
 }
 
 /// 主世界 Pending 资源：在主 world `Last` schedule 按预算 drain dirty，供只读提取
+///
+/// data_chunks / comp_chunks 元素 = `(volume_idx, coord)`：主世界 = 0，物体 = 1..N。
 #[derive(Resource, Default)]
 pub struct MainPending {
   pub force_full: bool,
-  pub data_tiles: Vec<gate_voxel::TileCoord>,
-  pub comp_tiles: Vec<gate_voxel::TileCoord>,
+  pub data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  pub comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
 }
+
+/// 单 chunk 增量重建的预算折中（典型树几十 KB~数 MB；256KB 经验值）
+const PER_CHUNK_BYTES: usize = 256 * 1024;
 
 /// 在主 world `Last` 阶段（晚于用户 Update 编辑）：按预算 drain dirty → MainPending
 ///
-/// **关键**：进入时先清空 data_tiles / comp_tiles（上一帧的坐标已经在 ExtractSchedule
-/// 被 mirror 消费）；否则坐标会逐帧累积并重复 update_tile，带来 O(140MB/帧) 的假
-/// 增量上传。force_full 同样在处理完一帧后复位。
+/// **关键**：进入时先清空 data_chunks / comp_chunks（上一帧的坐标已经在 ExtractSchedule
+/// 被 mirror 消费）；否则坐标会逐帧累积并重复 update_chunk，带来巨量假增量上传。
+/// force_full 同样在处理完一帧后复位。
+///
+/// Phase 3 统一：遍历 `scene.volumes.list` 的所有 volume（主世界 + 物体），
+/// 每个 volume 独立 drain dirty，附带 volume_idx。
 pub fn poll_pending(
   scene: Option<ResMut<VoxelScene>>,
   budget: Option<Res<UploadBudget>>,
@@ -120,33 +125,40 @@ pub fn poll_pending(
   let (Some(mut scene), Some(budget)) = (scene, budget) else {
     return;
   };
-  pending.data_tiles.clear();
-  pending.comp_tiles.clear();
+  pending.data_chunks.clear();
+  pending.comp_chunks.clear();
   pending.force_full = false;
   if scene.demo_force_full_rebuild {
     pending.force_full = true;
     scene.demo_force_full_rebuild = false;
   }
-  let per_tile_floor = (TILE_BITMAP_WORDS + CELL_DIR_WORDS) * 4;
-  let budget_n = (budget.max_bytes_per_frame / per_tile_floor.max(1)).clamp(1, 64);
-  let data_backlog = scene.grid.dirty.data_dirty_count();
-  let comp_backlog = scene.grid.dirty.comp_dirty_count();
-  // 反推 backlog：Startup 首次构建有上百 tile dirty（极限场景 ~211），
-  // 若按 budget_n (≈31) 逐帧 drain，每帧 builder.update_tile(31 tiles) 会 CPU 阻塞 2~3s
-  // 冻结 Prepare 全局调度 → BG1 绑定 / DDA dispatch 推迟十几秒 → 画面"只有 UI+渐变全黑"。
-  // 当 backlog > 3× 预算（即明显处于 Startup 批量构建积压，而不是 120 帧 1 tile 增量编辑），
+  let budget_n = (budget.max_bytes_per_frame / PER_CHUNK_BYTES).clamp(1, 64);
+  // 聚合所有 volume 的 backlog（主世界 + 物体）
+  let mut total_data_backlog = 0usize;
+  let mut total_comp_backlog = 0usize;
+  for grid in scene.volumes.list.iter() {
+    total_data_backlog = total_data_backlog.saturating_add(grid.dirty.data_dirty_count());
+    total_comp_backlog = total_comp_backlog.saturating_add(grid.dirty.comp_dirty_count());
+  }
+  // 反推 backlog：Startup 首次构建有大量 chunk dirty，
+  // 若按 budget_n 逐帧 drain，每帧 builder.update_chunk 会 CPU 阻塞冻结 Prepare
+  // 全局调度 → BG1 绑定 / DDA dispatch 推迟 → 画面"只有 UI 全黑"。
+  // 当 backlog > 3× 预算（即明显处于 Startup 批量构建积压，而不是零星增量编辑），
   // 一次性把 dirty 队列清空。这个判定不依赖任何外部 flag 时序，鲁棒。
-  let (data_n, comp_n) = if data_backlog > budget_n * 3 {
-    (data_backlog, comp_backlog.max(budget_n))
+  let (data_n, comp_n) = if total_data_backlog > budget_n * 3 {
+    (total_data_backlog, total_comp_backlog.max(budget_n))
   } else {
-    (budget_n, budget_n.min(comp_backlog.max(1)))
+    (budget_n, budget_n.min(total_comp_backlog.max(1)))
   };
-  pending
-    .data_tiles
-    .extend(scene.grid.dirty.drain_data_budget(data_n));
-  pending
-    .comp_tiles
-    .extend(scene.grid.dirty.drain_comp_budget(comp_n));
+  // 每个 volume 独立 drain（drain 内部按队列容量自截，data_n 是上限不是强制）
+  for (vol_idx, grid) in scene.volumes.list.iter_mut().enumerate() {
+    for c in grid.dirty.drain_data_budget(data_n) {
+      pending.data_chunks.push((vol_idx, c));
+    }
+    for c in grid.dirty.drain_comp_budget(comp_n) {
+      pending.comp_chunks.push((vol_idx, c));
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -154,25 +166,27 @@ pub fn poll_pending(
 // ----------------------------------------------------------------------------
 
 /// ExtractSchedule 用的 CPU builder / pending 状态（render world resource）
+///
+/// Phase 3 统一：`builder: Option<VolumesBuilder>` 持有 `Vec<BrickMapBuilder>`，
+/// pending chunks 带 volume_idx。
 #[derive(Resource, Default)]
 pub struct BuilderMirror {
-  pub builder: Option<BrickMapBuilder>,
+  pub builder: Option<VolumesBuilder>,
   pub pending_full: bool,
-  pub pending_data_tiles: Vec<gate_voxel::TileCoord>,
-  pub pending_comp_tiles: Vec<gate_voxel::TileCoord>,
+  pub pending_data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  pub pending_comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
 }
 
 /// ExtractSchedule 产出 → PrepareResources 消费（render world resource）
+///
+/// Phase 3 统一：`volumes: VolumesSnapshot` 包含统一 `b_struct`/`b_palette`/
+/// `b_leaves`/`grid_descs` + `mode_tag` + `dirty`（VolumesDirtyRanges）+ `dirty_chunks`。
+/// state/comp 仍是主世界 only（Phase 2 shader 重写后再扩展）。
 #[derive(Resource, Clone)]
 pub struct UploadSnapshot {
-  pub buffers: BrickMapBuffers,
-  pub mode_tag: &'static str,
+  pub volumes: VolumesSnapshot,
   pub state_bytes: Vec<u8>,
-  pub comp_tiles: usize,
-  /// 更新的 dirty tile 数（用于日志：不再误导写"总 tile_count=3"）
-  pub dirty_tiles: usize,
-  /// 增量脏字节区间；`mode_tag="full"` 时会被忽略（整块写）。
-  pub dirty: DirtyRanges,
+  pub comp_chunks: usize,
 }
 
 /// P2.7 上传 CPU 耗时样本（render world 资源，由 prepare 每帧 insert_resource 覆盖。
@@ -189,6 +203,11 @@ pub struct UploadCpuSample {
 #[derive(Resource, Clone, Debug, Default)]
 pub struct UploadCpuSampleChannel(pub std::sync::Arc<std::sync::Mutex<Option<UploadCpuSample>>>);
 
+/// GPU 资源（render world）：统一 struct/leaves/palette/comp/state + grid_descs + globals。
+///
+/// `grid_descs_buf`：Phase 3 新增，GridDesc 数组（144B/entry）——主世界 + 物体统一描述符，
+/// shader `trace_scene` 遍历无 kind 分支。`grid_descs_count` 跟踪有效条目数。
+/// `globals`：保留旧 BrickMapGlobals uniform（Phase 1 shader 字节兼容，重写后移除）。
 #[derive(Resource)]
 pub struct GpuBrickMap {
   pub struct_buf: Buffer,
@@ -196,6 +215,8 @@ pub struct GpuBrickMap {
   pub palette: Buffer,
   pub comp: Buffer,
   pub state: Buffer,
+  pub grid_descs_buf: Buffer,
+  pub grid_descs_count: u32,
   pub globals: UniformBuffer<BrickMapGlobals>,
 }
 
@@ -220,6 +241,8 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     palette: make("gate_palette"),
     comp: make("gate_comp"),
     state: make("gate_state"),
+    grid_descs_buf: make("gate_grid_descs"),
+    grid_descs_count: 0,
     globals,
   });
 }
@@ -227,7 +250,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 // ----------------------------------------------------------------------------
 // ExtractSchedule（render sub-app）：只读访问主 world 资源，CPU 构建 snapshot
 //   Extract<T> 的 T 必须 ReadOnlySystemParam，所以全 Res<T>。
-//   &VoxelScene.grid 读视图 + MainPending.data_tiles(已 drained) → 就地 BrickMapBuilder。
+//   &VoxelScene.volumes 读视图 + MainPending.data_chunks(已 drained) → 就地 VolumesBuilder。
 // ----------------------------------------------------------------------------
 
 fn extract(
@@ -244,65 +267,46 @@ fn extract(
     mirror.pending_full = true;
   }
   mirror
-    .pending_data_tiles
-    .extend(main_pending.data_tiles.clone());
+    .pending_data_chunks
+    .extend(main_pending.data_chunks.iter().copied());
   mirror
-    .pending_comp_tiles
-    .extend(main_pending.comp_tiles.clone());
+    .pending_comp_chunks
+    .extend(main_pending.comp_chunks.iter().copied());
 
   let first = mirror.builder.is_none();
   let pending_full = std::mem::take(&mut mirror.pending_full);
-  let mut pending_data: Vec<gate_voxel::TileCoord> = std::mem::take(&mut mirror.pending_data_tiles);
-  let pending_comp: Vec<_> = std::mem::take(&mut mirror.pending_comp_tiles);
+  let mut pending_data: Vec<(usize, gate_voxel::ChunkCoord)> =
+    std::mem::take(&mut mirror.pending_data_chunks);
+  let _pending_comp: Vec<(usize, gate_voxel::ChunkCoord)> =
+    std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
-  let dirty_any = need_full || !pending_data.is_empty() || !pending_comp.is_empty();
-  // 如果非首帧 + 非强制全量 + 无脏 tile → 跳过构建/上传（节省 140MB CPU 构建 + PCIe）
+  let dirty_any = need_full || !pending_data.is_empty() || !_pending_comp.is_empty();
+  // 如果非首帧 + 非强制全量 + 无脏 chunk → 跳过构建/上传（省 CPU 构建 + PCIe）
   if !dirty_any {
     return;
   }
-  let dirty_tiles = pending_data.len();
-  let grid_ref = &scene.grid;
+  let volumes_ref = &scene.volumes;
   let builder = mirror
     .builder
-    .get_or_insert_with(|| BrickMapBuilder::new_unbuilt(grid_ref));
+    .get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref));
   if need_full {
-    *builder = BrickMapBuilder::build_full(grid_ref);
+    *builder = VolumesBuilder::build_full(volumes_ref);
     pending_data.clear();
   } else {
-    for c in pending_data.drain(..) {
-      builder.update_tile(grid_ref, c);
+    // 同步 volume 数量（新增物体追加 builder）+ 更新变换
+    builder.sync(volumes_ref);
+    for (vol_idx, c) in pending_data.drain(..) {
+      builder.update_chunk(volumes_ref, vol_idx, c);
     }
   }
-  let mode_tag = if first || need_full {
-    "full"
-  } else if budget.incremental {
-    "incremental"
-  } else {
-    "fallback_full"
-  };
-  let buffers = builder.buffers().clone();
-  // full 时 dirty ranges 无意义（prepare 走整块写）；incremental 取出累积的脏区间。
-  let dirty = if need_full {
-    DirtyRanges {
-      struct_ranges: Vec::new(),
-      leaves_ranges: Vec::new(),
-      palette_changed: false,
-    }
-  } else {
-    builder.take_dirty_ranges()
-  };
-  let state_bytes = grid_ref.state_table_bytes().to_vec();
-  let comp_tiles = grid_ref.comp_layer().len();
-  drop(pending_comp);
-  let _ = TileUpdate::Rebuilt;
-
+  let snapshot = builder.snapshot();
+  // state/comp 暂仍主世界 only（Phase 2 shader 重写后再扩展到物体）
+  let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
+  let comp_chunks = volumes_ref.main().comp_layer().len();
   commands.insert_resource(UploadSnapshot {
-    buffers,
-    mode_tag,
+    volumes: snapshot,
     state_bytes,
-    comp_tiles,
-    dirty_tiles,
-    dirty,
+    comp_chunks,
   });
 }
 
@@ -312,6 +316,16 @@ fn extract(
 
 fn u8_of_u32(w: &[u32]) -> &[u8] {
   unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) }
+}
+
+/// GridDesc 数组 → u8 字节视图（`#[repr(C)]` + 144B/entry，可直接 cast）
+fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
+  unsafe {
+    std::slice::from_raw_parts(
+      descs.as_ptr() as *const u8,
+      descs.len() * std::mem::size_of::<GridDesc>(),
+    )
+  }
 }
 
 /// GPU buffer 扩容尺寸策略（纯函数，单测覆盖）。
@@ -408,7 +422,7 @@ fn write_partial(queue: &RenderQueue, cur: &Buffer, bytes: &[u8], lo: usize, hi:
 // PrepareResources：snapshot → GPU 写；首帧探测 limits
 // ----------------------------------------------------------------------------
 
-fn prepare(
+pub(crate) fn prepare(
   mut commands: Commands,
   snapshot: Option<Res<UploadSnapshot>>,
   mut gpu: ResMut<GpuBrickMap>,
@@ -436,35 +450,36 @@ fn prepare(
     }
   }
 
-  let struct_bytes = u8_of_u32(&snap.buffers.b_struct);
-  let leaves_bytes = u8_of_u32(&snap.buffers.b_leaves);
-  let palette_bytes = u8_of_u32(&snap.buffers.b_palette);
-  let comp_bytes = snap.comp_tiles * TILE_COMP_WORDS * 4;
+  let struct_bytes = u8_of_u32(&snap.volumes.b_struct);
+  let palette_bytes = u8_of_u32(&snap.volumes.b_palette);
+  // b_leaves 恒空（Douglas 格式 palette 直存节点）；空 Vec 维持 buffer 结构稳定
+  let leaves_bytes = u8_of_u32(&snap.volumes.b_leaves);
+  let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
+  let comp_bytes = snap.comp_chunks * CHUNK_COMP_WORDS * 4;
 
   // bytes 统计（日志用）：full = 整块；incremental = dirty ranges 求和
-  let is_full = matches!(snap.mode_tag, "full" | "fallback_full");
-  let (struct_tx_bytes, leaves_tx_bytes, palette_tx_bytes) = if is_full {
-    (struct_bytes.len(), leaves_bytes.len(), palette_bytes.len())
+  let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
+  let (struct_tx_bytes, palette_tx_bytes) = if is_full {
+    (struct_bytes.len(), palette_bytes.len())
   } else {
     let s = snap
+      .volumes
       .dirty
       .struct_ranges
       .iter()
       .map(|&(a, b)| (b.min(struct_bytes.len())).saturating_sub(a))
       .sum::<usize>();
-    let l = snap
+    let p = snap
+      .volumes
       .dirty
-      .leaves_ranges
+      .palette_ranges
       .iter()
-      .map(|&(a, b)| (b.min(leaves_bytes.len())).saturating_sub(a))
+      .map(|&(a, b)| (b.min(palette_bytes.len())).saturating_sub(a))
       .sum::<usize>();
-    let p = if snap.dirty.palette_changed {
-      palette_bytes.len()
-    } else {
-      0
-    };
-    (s, l, p)
+    (s, p)
   };
+  let leaves_tx_bytes = if is_full { leaves_bytes.len() } else { 0 };
+  let grid_descs_tx_bytes = if is_full { grid_descs_bytes.len() } else { 0 };
 
   if is_full {
     // 全量：整块 + ensure 保证 GPU 容量够
@@ -489,10 +504,20 @@ fn prepare(
       "gate_palette",
       palette_bytes,
     );
+    write(
+      &device,
+      &queue,
+      &mut gpu.grid_descs_buf,
+      "gate_grid_descs",
+      grid_descs_bytes,
+    );
   } else {
     // 增量镜像路径（prefix_valid=true）：CPU 镜像 [0..cap) 与 GPU 一致，扩容走
     // GPU-GPU 前缀拷贝 + 只 DMA 增长尾部；随后 write_partial 覆写脏区（冗余但正确）。
     // 不再出现旧 2× 翻倍策略"首次编辑整写 163MB"的 PCIe 尖峰。
+    // GridDesc 数组：volume 数变化（新增/删除物体）已由 VolumesBuilder.snapshot 判定
+    // 为 need_full → 走上面的整块写；incremental 路径下 grid_descs 数组不变，
+    // 跳过 grid_descs_buf 的 write（仅 ensure 维持容量）。
     ensure_with_copy(
       &device,
       &queue,
@@ -517,19 +542,24 @@ fn prepare(
       palette_bytes,
       true,
     );
+    ensure_with_copy(
+      &device,
+      &queue,
+      &mut gpu.grid_descs_buf,
+      "gate_grid_descs",
+      grid_descs_bytes,
+      true,
+    );
 
-    for (lo, hi) in snap.dirty.struct_ranges.iter().copied() {
+    for (lo, hi) in snap.volumes.dirty.struct_ranges.iter().copied() {
       write_partial(&queue, &gpu.struct_buf, struct_bytes, lo, hi);
     }
-    for (lo, hi) in snap.dirty.leaves_ranges.iter().copied() {
-      write_partial(&queue, &gpu.leaves, leaves_bytes, lo, hi);
-    }
-    if snap.dirty.palette_changed {
-      // palette 2048B 太小，整块写
-      queue.write_buffer(&gpu.palette, 0, palette_bytes);
+    for (lo, hi) in snap.volumes.dirty.palette_ranges.iter().copied() {
+      // palette 2KB 太小，单 range 整块写更稳（区间已按 palette_base 偏移）
+      write_partial(&queue, &gpu.palette, palette_bytes, lo, hi);
     }
   }
-  // state / comp 每次都整块写（state 4KB、comp 在 MVP 3 tiles 下是 64KB，都很小）
+  // state / comp 每次都整块写（state 4KB、comp 每 chunk 8KB，都很小）
   write(
     &device,
     &queue,
@@ -537,9 +567,9 @@ fn prepare(
     "gate_state",
     &snap.state_bytes,
   );
-  // comp: 每个 tile 1 字；build 后可能为 0 字节，ensure 至少 4B。
+  // comp: 每 chunk 8KB 占位；build 后可能为 0 字节，ensure 至少 4B。
   // comp_bytes 只是预估上限；实际内容读 grid 时已经按真实 size 存。
-  // MVP 下 comp 数据直接从 CPU 侧构建：UploadSnapshot 当前没带 comp 字节，
+  // comp 数据直接从 CPU 侧构建：UploadSnapshot 当前没带 comp 字节，
   // 这里用 gpu.comp size ≥ 预估的占位（历史行为：仅 buffer 大小对齐）。
   {
     let placeholder = vec![0u8; comp_bytes.max(4)];
@@ -554,25 +584,66 @@ fn prepare(
     );
   }
 
-  gpu.globals.set(snap.buffers.globals);
+  // globals：从主世界 GridDesc[0] 构造向后兼容 BrickMapGlobals（Phase 1 shader 字节兼容，
+  // Phase 2 重写 dda.wgsl 后移除——届时 shader 走 grid_descs_buf，不再读 globals）。
+  let main_desc = snap
+    .volumes
+    .grid_descs
+    .first()
+    .copied()
+    .unwrap_or_default();
+  let globals = BrickMapGlobals {
+    index_origin_x: main_desc.index_origin_x,
+    index_origin_y: main_desc.index_origin_y,
+    index_origin_z: main_desc.index_origin_z,
+    index_origin_w: 0,
+    index_dims_x: main_desc.index_dims_x,
+    index_dims_y: main_desc.index_dims_y,
+    index_dims_z: main_desc.index_dims_z,
+    index_dims_w: 0,
+    tile_count: main_desc.chunk_count,
+    // node_words / node_free_words 等字段在 VolumesBuilder 内部，未暴露；
+    // shader 重写后这些字段不再使用，此处置 0 不影响 Phase 2 之后的路径。
+    node_words: 0,
+    node_free_words: 0,
+    brick_slabs: 0,
+    brick_free: 0,
+    rejected_tiles: 0,
+    _pad0: 0,
+    _pad1: 0,
+    _pad2: 0,
+    _pad3: 0,
+    _pad4: 0,
+  };
+  gpu.globals.set(globals);
   gpu.globals.write_buffer(&device, &queue);
+
+  gpu.grid_descs_count = snap.volumes.grid_descs.len() as u32;
 
   let elapsed = t0.elapsed();
   let cpu_ms = elapsed.as_secs_f32() * 1000.0;
-  let tx_bytes_total =
-    (struct_tx_bytes + leaves_tx_bytes + palette_tx_bytes + snap.state_bytes.len()) as f64;
+  let tx_bytes_total = (struct_tx_bytes
+    + leaves_tx_bytes
+    + palette_tx_bytes
+    + grid_descs_tx_bytes
+    + snap.state_bytes.len()) as f64;
   let mb = tx_bytes_total / (1 << 20) as f64;
-  // full: tiles = 总 tile_count；incremental: tiles = 本轮 dirty tile 数（不再误导）
-  let tiles_show = if is_full {
-    snap.buffers.globals.tile_count as usize
+  // full: chunks = 所有 volume 的 chunk_count 之和；incremental: chunks = 本轮 dirty 数
+  let chunks_show = if is_full {
+    snap
+      .volumes
+      .grid_descs
+      .iter()
+      .map(|g| g.chunk_count as usize)
+      .sum::<usize>()
   } else {
-    snap.dirty_tiles
+    snap.volumes.dirty_chunks
   };
   debug!(target: "gate",
-    "UPLOAD[{}]: bytes={:.2}MB (s {}KB,l {}KB,pal {}KB,state 4KB), tiles={}, comp={}KB, elapsed={:?}",
-    snap.mode_tag, mb,
+    "UPLOAD[{}]: bytes={:.2}MB (s {}KB,l {}KB,pal {}KB,gd {}KB,state 4KB), chunks={}, comp={}KB, elapsed={:?}",
+    snap.volumes.mode_tag, mb,
     struct_tx_bytes / 1024, leaves_tx_bytes / 1024, palette_tx_bytes / 1024,
-    tiles_show, comp_bytes / 1024, elapsed,
+    grid_descs_tx_bytes / 1024, chunks_show, comp_bytes / 1024, elapsed,
   );
   // P2.7：写入共享通道（render↔main Arc<Mutex>，OQ-2 选 A 不提供 GPU 值）
   static SAMPLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -589,7 +660,8 @@ fn prepare(
     + gpu.leaves.size()
     + gpu.palette.size()
     + gpu.comp.size()
-    + gpu.state.size();
+    + gpu.state.size()
+    + gpu.grid_descs_buf.size();
   if vram > 2u64 << 30 {
     bevy::log::warn!("GPU VRAM 超过旧预算线（仅提示）: {vram} bytes");
   }
@@ -602,9 +674,9 @@ fn prepare(
     );
   }
   debug!(target: "gate",
-    "GpuBrickMap: struct_buf={}B leaves={}B palette={}B comp={}B state={}B bind_group_ready=pending(P2.4)",
+    "GpuBrickMap: struct_buf={}B leaves={}B palette={}B comp={}B state={}B grid_descs={}B(count={}) bind_group_ready=pending(P2.4)",
     gpu.struct_buf.size(), gpu.leaves.size(), gpu.palette.size(),
-    gpu.comp.size(), gpu.state.size(),
+    gpu.comp.size(), gpu.state.size(), gpu.grid_descs_buf.size(), gpu.grid_descs_count,
   );
   // 消费完本帧 snapshot 必须移除；否则 prepare 每帧都读旧 snapshot → 140MB/帧假上传
   commands.remove_resource::<UploadSnapshot>();
@@ -614,8 +686,13 @@ fn prepare(
 // Plugin
 // ----------------------------------------------------------------------------
 
-pub struct BrickMapUploadPlugin;
-impl Plugin for BrickMapUploadPlugin {
+/// 统一体素渲染上传插件（主世界 + 物体同一路径）
+///
+/// Phase 3 OBJ→Volume 统一后，OBJ 不再有独立 ObjScene/RenderObj/GpuObjPool 三段
+/// 管道，而是作为 `Volumes.list[1..N]` 中的普通 `VolumeGrid`，走与主世界完全相同的
+/// dirty → VolumesBuilder → UploadSnapshot 增量上传路径。
+pub struct VolumePlugin;
+impl Plugin for VolumePlugin {
   fn build(&self, app: &mut App) {
     // Render↔main 共享通道（UploadCpuSample）：插入同一个 Arc<Mutex> Resource 到两个世界
     let ch = UploadCpuSampleChannel::default();
@@ -644,7 +721,8 @@ impl Plugin for BrickMapUploadPlugin {
 
 #[cfg(test)]
 mod tests {
-  use super::super::wire::{BrickMapBuffers, INDEX_WORDS, STATE_TOTAL_WORDS};
+  use super::super::builder::BrickMapBuilder;
+  use super::super::wire::{CHUNK_INDEX_WORDS, STATE_TOTAL_WORDS};
   use super::*;
   use gate_voxel::fill_box;
 
@@ -664,11 +742,13 @@ mod tests {
 
   #[test]
   fn comp_state_api_on_grid() {
-    let mut g = gate_voxel::TileGrid::new();
-    let t = gate_voxel::TileCoord::new(0, 0, 0);
-    assert_eq!(g.get_comp(t, 17), 0);
-    g.set_comp(t, 17, 0xABCD);
-    assert_eq!(g.get_comp(t, 17), 0xABCD);
+    let mut g = gate_voxel::VolumeGrid::new();
+    let chunk = gate_voxel::ChunkCoord::new(0, 0, 0);
+    // set_comp 挂 level 2 brick (bx,by,bz)；get_comp 查 voxel 所在 brick
+    g.set_comp(chunk, 1, 1, 1, 0xABCD);
+    let voxel = gate_voxel::VoxelCoord::new(16 + 5, 16 + 3, 16 + 2);
+    assert_eq!(g.get_comp(voxel), 0xABCD);
+    assert_eq!(g.get_comp(gate_voxel::VoxelCoord::new(1, 1, 1)), 0);
     g.set_state(7, 2, 0x42);
     assert_eq!(g.get_state(7, 2), 0x42);
     assert_eq!(g.get_state(99, 0), 0);
@@ -677,7 +757,7 @@ mod tests {
 
   #[test]
   fn wire_constants() {
-    assert_eq!(TILE_COMP_WORDS * 4, 32768 * 2); // u16[32768] → 64KB
+    assert_eq!(CHUNK_COMP_WORDS * 4, 4096 * 2); // u16[4096] → 8KB/chunk
     assert_eq!(STATE_TOTAL_WORDS * 4, 4096); // 256×4×4B
   }
 
@@ -705,16 +785,21 @@ mod tests {
 
   #[test]
   fn buffer_data_roundtrip() {
-    let mut g = gate_voxel::TileGrid::new();
-    fill_box(&mut g, glam::IVec3::ZERO, glam::IVec3::splat(8), 4, 1);
+    let mut g = gate_voxel::VolumeGrid::new();
+    fill_box(&mut g, glam::IVec3::ZERO, glam::IVec3::splat(8), 1);
     g.set_state(5, 3, 0xCAFEBABE);
     let state = g.state_table_bytes();
     let off = 5 * 16 + 3 * 4; // entry 5 + field 3
     assert_eq!(state[off..off + 4], 0xCAFEBABEu32.to_le_bytes());
-    let buffers: BrickMapBuffers = BrickMapBuilder::build_full(&g).buffers().clone();
+    let buffers = BrickMapBuilder::build_full(&g).buffers().clone();
     let bytes = u8_of_u32(&buffers.b_struct);
     assert_eq!(bytes.len(), buffers.b_struct.len() * 4);
     assert!(buffers.globals.tile_count >= 1);
-    assert!(!buffers.b_struct[0..INDEX_WORDS].iter().all(|&w| w == 0));
+    // chunk 窗口条目非零（Region ① 至少 1 个 chunk）
+    assert!(
+      !buffers.b_struct[..CHUNK_INDEX_WORDS]
+        .iter()
+        .all(|&w| w == 0)
+    );
   }
 }
