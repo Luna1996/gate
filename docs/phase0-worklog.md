@@ -258,4 +258,84 @@ N=10 场景构建 78s 卡死 + 5.9GB OOM → 全部修复后 N=10 实测：1264 
 
 ## 明天继续的切入点
 
-打开 gate-render/src/brickmap/upload.rs 第 84 行（`pub grid: gate_voxel::TileGrid`），开始把 upload mirror 从 TileGrid/TileCoord 迁移到 VolumeGrid/ChunkCoord。ChunkTree.serialize() 已经能输出正确的紧凑 GPU buffer。
+（已完成，切入点保留备查）upload mirror 迁移 VolumeGrid/ChunkCoord 已随 Phase 1 结束。
+
+---
+
+## 帧率根因与层次栈式 mask DDA（2026-09-03）
+
+**现象**：Brick Tree 上屏后 200+ fps → ~30 fps（6.7× 下降）。
+
+**根因（数 storage load 账定位，非架构/正确性问题）**：移植期遍历器把 Brick Tree 当**点查询结构**用——cell_occupied 每个 16³ 粗步从根重走 DFS（~9 load/粗步），sample_brickmap 每细步从根走 4 层（9-13 load/步）；旧五步链位图粗步仅 2 load。天空射线跨 5632 世界 ≈ 352 粗步：旧 ~700 load vs 新 ~3170 load，综合 ~6× 与实测吻合。
+
+**修法（WGSL + CPU 逐字镜像）**：层次栈式 mask DDA（devlog #17/#18 遍历范式）：
+- chunk 间 256³ A&W（ci=floor(start/256)，delta_c=delta*256，窗口外 chunk=空气直接步进，空 chunk entry=0 仅 1 load 跨越；chunk budget=(dx+dy+dz)*3+16）
+- chunk 内 4 层栈帧（256→64→16→4→1）：节点 mask 一次 load 进寄存器，4³=64 子块间 A&W 步进只查 bit（零 load）；bit=0 uniform 子块整格跳过/整格命中（palette 直决）；bit=1 popcount 定位 child offset 压栈下钻；level 3 分裂读 leaf palette；t_out>=t_exit 弹栈
+- 栈帧字段：node_addr/node_min/cell(0..3)³/tmax 三轴/t_enter/t_exit/face_id；`sub = 64 >> (level*2)`
+- child 定位：child_idx=cz*16+cy*4+cx，mask 拆 lo/hi 两 u32，slot=countOneBits(低于 idx 位)
+- face_id 0..5=±xyz（穿入面）；face_normal_from_index：0→-X,1→+X,2→-Y,3→+Y,4→-Z,5→+Z
+- **t 标尺**：trace_chunk/trace_volume_tree 内全部 ro 系绝对 t（不用相对标尺）；物体路径 ro/rd 已烘焙 1/scale（WGSL `/ g.scale`，CPU `/ tr.scale`），局部射线参数 = 世界射线参数，物体 ray 直接调 trace_volume_tree，无 tl0 偏移还原
+- **budget = 65536**（WGSL/CPU 同值）：几何上界 = 对角射线穿全分裂 chunk 节点读数 ~25k 量级；真实场景每 chunk 几十~几百次迭代；纯防挂死安全网
+
+**代码落点**：WGSL `dda.wgsl` TreeFrame/init_tree_frame/trace_chunk/trace_grid（chunk_budget）；CPU 镜像 `dda.rs` TreeHit/TreeFrameCpu/init_tree_frame_cpu/trace_chunk_cpu/trace_volume_tree/cpu_reference_dda_ray_tree；多 volume 三函数（object_ray_unified/trace_volumes/volumes_occluded）切树路径；sample_brickmap 点查询保留给 implicit normals；旧两级 DDA 保留（旧等价测试仍用）。
+
+**验证**：
+- 新等价性测试 `tree_traversal_equivalence_300_rays`：跨 chunk/负坐标场景（4 特征体），8 轴平行射线（含起点在体内 UB）+ 300 随机射线（球壳心 (128,32,128) r32..1500，state=20260904）；新层次遍历 vs 逐体素 full DDA 参考：hit/miss + palette 严格一致、|t| 容差 1.0 fine、命中面法线 n·d < 0
+- cargo test --workspace：**116 passed / 0 failed / 0 警告**；wgsl naga parse+validate 通过
+- 后台启动正常：1264 chunks / 247MB 树 / build_full 513ms / 无 wgpu validation 错误
+- 帧率目验待用户 F5（目标恢复 200fps 量级；预期天空射线 ~90 load vs 旧 ~3170 load）
+
+**naga 陷阱（本次实测新增）**：`active` 是 WGSL 保留关键字（改 axis_on）；struct/函数必须先声明后使用（Grid 前移到 sample_brickmap 前、FineHit 前移到 trace_chunk 前）。
+
+### 层次遍历虚影 bug 修复（2026-09-03 下午）
+
+**现象**：demo 场景实心体（浮空岛叠球等）被射线「穿透」成噪声虚影，测试场景（小坐标 build_full）却全绿。
+
+**定位（CPU 侧复现 → 插桩）**：新增 `tree_equivalence_demo_like_edit_compact` 测试（地形分层柱 16×8×16 非 brick 对齐 + fill_bricks(e=16) + clear_voxel 空气孔洞 + 倒锥叠球 + 交替 palette 编辑 + compact_all）——rand26 射线 CPU 树遍历与逐体素参考分歧：t=37.7 虚假命中 pal 7（地形色，命中点在地形上方 10 fine 空气里）。
+
+**根因（浮点边界 → 越界回绕）**：层次遍历内层帧的 tmax 用 `tmax += delta*sub` 累计，与下钻时父帧保存的 t_exit（同一几何边界的另一条计算路径）差 1 ulp。步进判定 `t_out >= t_exit` 差一步该弹栈却做了步进 → **cell 越界（-1）** → `child_idx = cz*16+cy*4+cx` 负数回绕成别的子块 bit（-1 → idx 23，恰是下方地形列）→ 下钻进零厚度退化帧（t_enter==t_exit）→ 擦边假命中。小坐标测试场景 ulp 误差不足触发；demo 5632 世界大量触发 → 满屏噪声。
+
+**修复（WGSL + CPU 逐字镜像同步，三处）**：
+1. 推进循环：步进后 cell 越界（<0 或 >3）→ 视为节点耗尽弹栈（禁止越界索引）
+2. 零厚度擦边不下钻/不命中（`cell_exit > t_enter` 才下钻；uniform 子块与 leaf 命中同样要求 `t_enter < cell_exit`）——与逐体素点查语义一致（不入内部不命中）
+3. trace_chunk 入口 t0>=t1 早退 miss（chunk 角擦边）
+
+**验证**：demo 复刻测试 300 随机射线 + 10 轴射线全过；workspace 117 测试全绿；实机启动无 wgpu 报错。
+
+### 世界规模运行时可调（2026-09-03 下午，快速调试档）
+
+正确性调试期启动 55s 不可接受 → 世界规模改为运行时可调：
+- `GATE_TILES` env（默认 **2** = 快速调试档，启动构建 **4.45s**，12.5×；`GATE_TILES=10` = 完整压测场景）
+- 场景结构性坐标全部改为以 `EXT_FINE_HALF`（世界中心）为锚：城堡/大道/河/森林/物体芯片 A·B·C/初始相机；const → LazyLock
+- 城堡外 криstal 簇与 tile(2,0,0) 热点带越界守卫（小世界自动跳过）
+- N=2 实测：80 chunks / 99MB 树 / build_full 203ms
+
+### grow 扩容 usage bug + 芯片摆放（2026-09-03）
+
+- **`ensure_with_copy` 二次扩容必炸**：grow 路径新建 buffer 的 usage 缺 `COPY_SRC`（初始创建有），第二次扩容时旧 buffer（上次 grow 产物）作为 `copy_buffer_to_buffer` 源 → validation error 退出。小场景（99MB buffer）+ 120 帧编辑触发生长，很快踩中。修复：grow 新建 buffer usage 补 `COPY_SRC`。实机 100s 多轮编辑零错误。
+- 芯片三枚拿到城堡区平地（y=16），三角错开避让大道/边界/彼此，各给不同 yaw+俯仰（25°/160°/-75° + 15°/-30°/40°）与缩放（2.0/1.3/2.2）。
+- 帧率仍 ~30：PresentMode 已是 AutoNoVsync（非 vsync 砍半），待 GPU 计时剖析主/阴影射线占比。
+
+### 帧率剖析与修复：30 → ~56 fps（2026-09-03 晚）
+
+**方法**：FrameTimeDiagnosticsPlugin + LogDiagnosticsPlugin 落日志（fps/frame_time + gate_dda_compute/elapsed_gpu GPU 耗时），配合 env 诊断开关（GATE_SKIP_SHADOW / GATE_SKIP_IMPLN / GATE_SKIP_CHUNKWALK / GATE_SKYOUT / GATE_MAKEGRID_ONLY / GATE_CAM=sky）逐层二分。**关键教训：诊断跑出的 fps 必须先确认 shader 编译成功**（naga parse 失败时 compute 管线静默缺失 → 黑屏假高速）。
+
+**二分数据（gate_dda_compute GPU 耗时，1.44M 像素 overview）**：
+- 完整路径 31.3ms ≈ frame_time 31.5ms → 100% 在 DDA compute pass
+- 跳阴影射线 26.1ms（阴影占 ~5ms）；跳 implicit normal 6 邻域 ≈ 0（免费）
+- 纯天空输出（跳全部 trace）0.05ms → 遍历框架本身占 ~全部
+- CPU 镜像计数：典型射线仅 ~13-31 次迭代 → **不是迭代步数问题，是 WGSL 函数调用开销**
+
+**根因**：**naga/驱动不内联 WGSL 函数**——每个函数调用（含大/小参数、含返回 struct）实测 ~µs 级开销。slab_box 每 pixel 被调 8 次（4 volume × 2 slab）= 1150 万次调用/帧 → 仅此一项 ~14-17ms。
+
+**修复（全部实测验证）**：
+1. slab_box 内联进 trace_grid（世界 + 局部两个 slab）——**17ms → 2.75ms**（skip-chunkwalk 模式对照）
+2. init_tree_frame 内联进 trace_chunk 两处调用点（根帧 + 下钻）——23.4 → 17.7ms
+3. face_index_from_normal 内联进 trace_grid（entry_face 计算）
+4. trace_grid 改名 trace_grid_idx：参数从 15 字段 Grid 结构体改为 `idx: u32` 直读 grid_descs（make_grid 仅在命中时构造 best_grid 用）
+- **反例存档**：4 独立变量静态分支栈版实测 2× 慢（59.8 vs 27.6ms）——勿再试
+- **陷阱存档**：PowerShell Set-Content -Encoding utf8 会给文件加 BOM，naga 拒绝（"\u{feff}" parse error）；WGSL 里误写 Rust 的 `#[allow]` 属性 = parse error
+
+**战果**：31.5ms（30fps）→ **17.8ms（55-56 fps，GPU-bound）**。等价性测试全绿（117 tests）。
+
+**遗留（下一杠杆，2026-09-04 定向修正）**：skip-chunkwalk（纯 GridDesc 读 + slab，全 miss）稳态仍有 ~16.6ms GPU 且与负载弱相关（偶发 0.07ms 毛刺）——真实遍历仅占 ~1.2ms，底噪是大头。基准对齐：Douglas 1660 Ti 主+阴影全程 7ms。下一刀（1:1 最终方案 #17→#23 内，#7 光栅系 G-buffer/pass 拆分已废弃不学）：①二分矩阵重测（skyout/makegrid_only/skip-chunkwalk/full）定位 floor 层；②lazy descriptor 读（先 slab 8 字、chunk-walk 字段 slab 通过后才读——射线不用的数据不预读，与按需读树同构）；③若仍高上 #18 方向位掩码 LUT 预过滤（他实测 100→80ms）。

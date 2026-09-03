@@ -66,13 +66,29 @@ impl<'a> BrickMapView<'a> {
   }
 
   /// chunk 窗口查找 → DFS 树绝对字基址（0 = 无 chunk）
-  fn chunk_base(&self, chunk: IVec3) -> Option<usize> {
+  /// 层次栈式 DDA（dda.rs trace_chunk_cpu）逐 chunk 调用，镜像 WGSL 窗口 entry 查找。
+  pub(crate) fn chunk_base(&self, chunk: IVec3) -> Option<usize> {
     let ip = chunk_index_pos(self.origin, self.dims, chunk)?;
     let entry = self.b_struct[ip];
     if entry == 0 {
       return None;
     }
     Some(entry as usize - 1)
+  }
+
+  /// b_struct 字切片（层次遍历按绝对字址读节点 fixed 字 + child offset）
+  pub(crate) fn b_struct(&self) -> &[u32] {
+    self.b_struct
+  }
+
+  /// chunk 窗口 origin（chunk 单位；可为负）
+  pub(crate) fn origin(&self) -> IVec3 {
+    self.origin
+  }
+
+  /// chunk 窗口 dims（chunk 单位）
+  pub(crate) fn dims(&self) -> IVec3 {
+    self.dims
   }
 
   /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
@@ -184,7 +200,10 @@ mod tests {
   #[test]
   fn negative_fine_chunk_lookup() {
     let f = IVec3::new(-1, -257, 256);
-    assert_eq!(f.div_euclid(IVec3::splat(CHUNK_SIZE)), IVec3::new(-1, -2, 1));
+    assert_eq!(
+      f.div_euclid(IVec3::splat(CHUNK_SIZE)),
+      IVec3::new(-1, -2, 1)
+    );
     assert_eq!(
       f.rem_euclid(IVec3::splat(CHUNK_SIZE)),
       IVec3::new(255, 255, 0)

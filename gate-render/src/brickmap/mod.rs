@@ -11,16 +11,18 @@ pub mod upload;
 mod view;
 pub mod wire;
 
-pub use builder::{BrickMapBuilder, ChunkUpdate, DirtyRanges, VolumesBuilder, VolumesDirtyRanges, VolumesSnapshot};
+pub use builder::{
+  BrickMapBuilder, ChunkUpdate, DirtyRanges, VolumesBuilder, VolumesDirtyRanges, VolumesSnapshot,
+};
 pub use dda::{
   DdaCameraConfig, DdaHit, DdaImages, DdaViewUniform, DebugNormals, OrbitCamera, RenderScale,
-  VIEW_SIZE, VolumeHit, cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray,
-  cpu_reference_dda_ray_aabb_skip, cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes,
-  cpu_reference_volumes_occluded, create_dda_image,
+  TreeHit, VIEW_SIZE, VolumeHit, cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray,
+  cpu_reference_dda_ray_aabb_skip, cpu_reference_dda_ray_tree, cpu_reference_dda_ray_two_level,
+  cpu_reference_trace_volumes, cpu_reference_volumes_occluded, create_dda_image,
 };
 pub use upload::{
-  BindingLimits, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,
-  UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelScene,
+  BindingLimits, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget, UploadCpuSample,
+  UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelScene,
 };
 pub use view::BrickMapView;
 pub use wire::{BrickMapBuffers, BrickMapGlobals, GridDesc};

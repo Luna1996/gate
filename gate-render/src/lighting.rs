@@ -184,7 +184,11 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
 /// Phase 3 统一：`vols[0]` = 主世界（obj_id=-1），`vols[1..N]` = 物体（obj_id=0..N-1）。
 /// `hit.obj_id` 决定从哪个 volume 的 `b_palette` 取色。
 fn hit_mat(vols: &[(&BrickMapBuffers, VolumeTransform)], hit: &VolumeHit) -> (Vec3, f32, f32) {
-  let idx = if hit.obj_id == -1 { 0 } else { hit.obj_id as usize + 1 };
+  let idx = if hit.obj_id == -1 {
+    0
+  } else {
+    hit.obj_id as usize + 1
+  };
   let pal_buf = &vols[idx].0.b_palette;
   let w0 = pal_buf[hit.pal as usize * 2];
   let w1 = pal_buf[hit.pal as usize * 2 + 1];
@@ -347,13 +351,8 @@ mod tests {
     let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
 
     // 顶面命中：N·L = 1，vis = 1（无遮挡）
-    let hit = cpu_reference_trace_volumes(
-      &vols,
-      Vec3::new(256.0, 640.0, 256.0),
-      -Vec3::Y,
-      4096.0,
-    )
-    .expect("顶面必有命中");
+    let hit = cpu_reference_trace_volumes(&vols, Vec3::new(256.0, 640.0, 256.0), -Vec3::Y, 4096.0)
+      .expect("顶面必有命中");
     assert_eq!(hit.obj_id, -1);
     let rgb = cpu_reference_shade_hit(
       &vols,
@@ -371,13 +370,8 @@ mod tests {
     );
 
     // 底面命中：N·L = -1 → 直射 0，仅环境项
-    let hit = cpu_reference_trace_volumes(
-      &vols,
-      Vec3::new(256.0, -128.0, 256.0),
-      Vec3::Y,
-      4096.0,
-    )
-    .expect("底面必有命中");
+    let hit = cpu_reference_trace_volumes(&vols, Vec3::new(256.0, -128.0, 256.0), Vec3::Y, 4096.0)
+      .expect("底面必有命中");
     let rgb = cpu_reference_shade_hit(
       &vols,
       &lp,
@@ -411,11 +405,10 @@ mod tests {
     fill_bricks(&mut og, IVec3::ZERO, IVec3::splat(64), 16, 5);
     let obj_bufs = BrickMapBuilder::build_full(&og).buffers().clone();
     let obj_tr = VolumeTransform::new(Vec3::new(240.0, 592.0, 240.0), Mat3::IDENTITY, 1.0);
-    let vols_with: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![
-      (&world, VolumeTransform::IDENTITY),
-      (&obj_bufs, obj_tr),
-    ];
-    let vols_empty: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
+    let vols_with: Vec<(&BrickMapBuffers, VolumeTransform)> =
+      vec![(&world, VolumeTransform::IDENTITY), (&obj_bufs, obj_tr)];
+    let vols_empty: Vec<(&BrickMapBuffers, VolumeTransform)> =
+      vec![(&world, VolumeTransform::IDENTITY)];
 
     let hit = VolumeHit {
       t: 384.0,
@@ -455,13 +448,8 @@ mod tests {
     let lp = build_light_pool(&theme);
     let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
 
-    let hit = cpu_reference_trace_volumes(
-      &vols,
-      Vec3::new(256.0, 640.0, 256.0),
-      -Vec3::Y,
-      4096.0,
-    )
-    .expect("顶面命中");
+    let hit = cpu_reference_trace_volumes(&vols, Vec3::new(256.0, 640.0, 256.0), -Vec3::Y, 4096.0)
+      .expect("顶面命中");
     let rgb = cpu_reference_shade_hit(
       &vols,
       &lp,
@@ -477,13 +465,8 @@ mod tests {
     );
 
     // 底面直出同值（radiance 无方向性）
-    let hit = cpu_reference_trace_volumes(
-      &vols,
-      Vec3::new(256.0, -128.0, 256.0),
-      Vec3::Y,
-      4096.0,
-    )
-    .expect("底面命中");
+    let hit = cpu_reference_trace_volumes(&vols, Vec3::new(256.0, -128.0, 256.0), Vec3::Y, 4096.0)
+      .expect("底面命中");
     let rgb = cpu_reference_shade_hit(
       &vols,
       &lp,

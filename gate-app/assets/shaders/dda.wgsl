@@ -1,11 +1,12 @@
 // ============================================================================
-// DDA Compute Shader：全屏逐像素两级 A&W 步进（cell 粗步 + cell 内细步）
-// + brickmap 五步寻址
+// DDA Compute Shader：全屏逐像素层次栈式 mask DDA（Douglas devlog #17 / 64-tree）
 //
-// 两级结构（P2.x 性能改造，Rust 参考 cpu_reference_dda_ray_two_level）：
-//   粗级：cell（16 fine）粒度 A&W，每步 cell_occupied（寻址链 ①+②，2 load），
-//         空 cell 一次跨越 16 fine——空气穿越访存 ~40× 低于单级 fine 步进。
-//   细级：占用 cell 内有界 fine DDA（≤48 步），sample_brickmap 全链取 palette。
+// 遍历结构（Rust 参考 cpu_reference_dda_ray_tree，dda.rs 逐字镜像）：
+//   chunk 间：256³ 一格 A&W，窗口 entry=0 的空 chunk 只 1 load 直接跨越；
+//   chunk 内：4 层栈帧（256→64→16→4→1），节点 mask 一次 load 进寄存器，
+//             子块步进只查 bit（零 load）；bit=1 分裂才压栈下钻，
+//             bit=0 uniform 子块整格跳过/整格命中。
+// sample_brickmap（树点查询）仅保留给 implicit normals 6 邻域 occupancy。
 //
 // BG0（与 Rust DdaViewUniform 144B + out tex rgba8unorm 对应）：
 //   @group(0) @binding(0) = out storage tex（DDA 写入 rgba8unorm，linear RGB）
@@ -160,10 +161,33 @@ struct LightPool {
 @group(3) @binding(0) var<uniform> light_u: LightPool;
 
 
+// 统一网格上下文——一套 DDA 跑所有网格（主世界 + 物体）
+// 由 `make_grid(idx)` 从 `grid_descs[idx]` 构造；携带 tree_base/palette_base/
+// index_origin/dims 作为数据源基址，trace_grid → trace_chunk 统一从
+// b_struct[tree_base + ...] / b_palette[palette_base + ...] 取数据。
+struct Grid {
+  w_mn: vec3<f32>,              // 世界 AABB min
+  w_mx: vec3<f32>,              // 世界 AABB max
+  l_min: vec3<f32>,             // 局部 AABB min（fine 坐标）= vec3(0.0)
+  l_max: vec3<f32>,             // 局部 AABB max（fine 坐标）= vec3(256.0)
+  max_chunk_steps: u32,         // chunk 间 DDA 步数上限
+  col0: vec3<f32>,              // 变换矩阵列（旋转）
+  col1: vec3<f32>,
+  col2: vec3<f32>,
+  pos: vec3<f32>,               // 物体位置
+  scale: f32,
+  tree_base: u32,               // b_struct 内本 volume 树基址（含 chunk 窗口段）
+  palette_base: u32,            // b_palette 内本 volume palette 基址
+  index_origin: vec3<i32>,      // chunk 窗口 origin（chunk 单位）
+  index_dims: vec3<u32>,        // chunk 窗口 dims（chunk 单位）
+  obj_id: i32,                  // -1 = 主世界，>=0 = 物体索引（debug/implicit normal 用）
+}
+
 // Douglas Brick Tree mask DDA 采样（1:1 复刻 devlog #17/#18）
 // fine → chunk 窗口定位 → DFS 树 4 层 mask 遍历 → palette
 // Phase 3 统一：从 Grid 参数读取 tree_base / index_origin / index_dims，
 // 而非 BG1 globals（主世界 + 物体走同一路径，b_struct[tree_base + ...] 取树）。
+// 仅 implicit normals 6 邻域 occupancy 点查询用；主遍历走层次栈式 trace_chunk。
 fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
   // ---- chunk 窗口定位 ----
   let m = ((fine % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
@@ -222,83 +246,198 @@ fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
   return b_struct[node_addr + 2u];
 }
 
-// A&W：给定当前细格坐标分量与步进方向，返回下一格边界的坐标
-// （WGSL 不支持函数内嵌套 fn 定义，必须放模块顶层——曾因嵌套导致整 shader 编译失败黑屏）
-fn next_boundary(c: i32, s: i32) -> f32 {
-  var v = f32(c);
-  if (s >= 0) { v = v + 1.0; }
-  return v;
+// ============================================================================
+// 层次栈式 mask DDA（Douglas devlog #17 / sparse 64-tree 遍历）
+//
+// 旧两级 DDA 把树当点查询结构：每个 16³ 粗步从根重新 DFS（~9 load）、每个细步
+// 再走 4 层（~13 load），树的层次连贯性全部丢弃。层次遍历把节点 mask 一次 load
+// 进寄存器，在该节点 4³=64 个子块间做 A&W 步进——每步只查 mask bit（零 load）；
+// bit=1（分裂）才压栈下钻，bit=0 uniform 子块整格跳过/整格命中。
+// 空气穿越代价：空 chunk 1 load（窗口 entry=0）、有树空 chunk ~4 load（根节点），
+// 与旧粗步 9 load/16³ 相比量级下降。
+//
+// 栈深 4（256→64→16→4→1）；chunk 间 256³ A&W 由 trace_grid 维护。
+// CPU 逐字镜像：gate-render/src/brickmap/dda.rs `cpu_reference_dda_ray_tree`。
+// ============================================================================
+
+// 栈帧：一层分裂节点的 DDA 状态
+struct TreeFrame {
+  node_addr: u32,      // 节点绝对字址（b_struct）
+  node_min: vec3<f32>, // 节点区域原点（局部 fine 坐标）
+  cell: vec3<i32>,     // 当前子块坐标 0..3
+  tmax: vec3<f32>,     // 到下一子块边界的 t（绝对，ro 系）
+  t_enter: f32,        // 进入当前子块的 t
+  t_exit: f32,         // 节点出口 t
+  face: u32,           // 进入当前子块的面 0..5（±xyz）
 }
 
-// 粗级（cell = 16 fine）版 next_boundary：返回下一个粗边界的 fine 坐标
-fn next_coarse_boundary(c: i32, s: i32) -> f32 {
-  if (s >= 0) { return f32((c + 1) << 4); }
-  return f32(c << 4);
+// init_tree_frame 的函数体已直接展开进 trace_chunk 的两处调用点（根帧 + 下钻）——
+// naga/驱动不内联 WGSL 函数，每次调用实测 ~µs 级开销（slab_box 内联 17ms→2.75ms 实证）
+
+// 层次遍历命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
+//   pre-check 命中（射线起点在固体 leaf 内，相机在体内 UB）：face_id 由调用方
+//   用 normalize(-rd) 反推（首 chunk entry_face）。
+struct FineHit {
+  hit: bool,
+  t: f32,
+  pal: u32,
+  face_id: u32,
 }
 
-// Brick Tree 占用检查：coarse cell（16³）内是否有非空体素
-// 走 DFS 到 level 2（16³ brick），mask=0 → palette!=0 即占用；mask!=0 → 分裂=有内容
-// Phase 3 统一：从 Grid 参数读取 tree_base / index_origin / index_dims。
-fn cell_occupied(g: Grid, cc: vec3<i32>) -> bool {
-  let fine = cc * 16;
-  // ---- chunk 窗口定位 ----
-  let m = ((fine % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
-  let chunk_i = (fine - m) / vec3<i32>(i32(CHUNK_SIZE));
-  let origin = g.index_origin;
-  let dims = g.index_dims;
-  let rel = chunk_i - origin;
-  if (any(rel < vec3<i32>(0))) { return false; }
-  let rel_u = vec3<u32>(rel);
-  if (any(rel_u >= dims)) { return false; }
-  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
-  let entry = b_struct[index_addr];
-  if (entry == 0u) { return false; }
-  let chunk_base = g.tree_base + entry - 1u;
-
-  // ---- DFS 到 level 2（16³ brick）----
-  let local = vec3<u32>(m);
-  var node_addr = chunk_base;
-  for (var level = 0u; level < 2u; level = level + 1u) {
-    let mask_lo = b_struct[node_addr];
-    let mask_hi = b_struct[node_addr + 1u];
-    let palette = b_struct[node_addr + 2u];
-    let shift = 8u - (level + 1u) * 2u;
-    let cx = (local.x >> shift) & 3u;
-    let cy = (local.y >> shift) & 3u;
-    let cz = (local.z >> shift) & 3u;
-    let child_idx = cz * 16u + cy * 4u + cx;
-    var mask_word: u32 = mask_lo;
-    var bit_in_word: u32 = child_idx;
-    if (child_idx >= 32u) {
-      mask_word = mask_hi;
-      bit_in_word = child_idx - 32u;
-    }
-    let bit = 1u << bit_in_word;
-    if ((mask_word & bit) == 0u) {
-      // uniform brick：palette!=0 即占用
-      return palette != 0u;
-    }
-    // 分裂 → 下钻
-    var popcount_below: u32;
-    if (child_idx < 32u) {
-      popcount_below = countOneBits(mask_lo & ((1u << bit_in_word) - 1u));
-    } else {
-      popcount_below = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
-    }
-    let child_offset = b_struct[node_addr + NODE_FIXED_WORDS + popcount_below];
-    node_addr = chunk_base + child_offset;
+// 单 chunk 内层次遍历。chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 fine）。
+// 射线段 [t0, t1]（ro 系绝对 t）；entry_face = 进入本 chunk 的面（首 chunk 由调用方
+// 用 normalize(-rd) 兜底，后续 chunk 为跨 chunk 面）。
+// 返回 FineHit（t 为 ro 系绝对 t）；走出 chunk 未命中 → hit=false。
+fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
+               ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>, delta: vec3<f32>,
+               t0: f32, t1: f32, entry_face: u32) -> FineHit {
+  // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
+  if (t0 >= t1) { return FineHit(false, 0.0, 0u, 0u); }
+  // 注：曾试过 4 变量静态分支版（避免动态索引局部内存）——实测反而 2× 慢（59.8ms
+  // vs 27.6ms），寄存器压力来自别处；数组栈版为实测最优，勿改回静态分支
+  var stack: array<TreeFrame, 4u>;
+  var depth: i32 = 0;
+  // ---- 根帧初始化（init_tree_frame 展开内联，level 0 → sub 64）----
+  {
+    let p = ro + rd * t0;
+    var cell = vec3<i32>(floor((p - chunk_min) / 64.0));
+    cell = clamp(cell, vec3<i32>(0), vec3<i32>(3));
+    let side = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0));
+    let boundary = chunk_min + (vec3<f32>(cell) + side) * 64.0;
+    var tmax = vec3<f32>(1e+30);
+    let axis_on = abs(rd) > vec3<f32>(1e-30);
+    tmax = select(tmax, (boundary - ro) / rd, axis_on);
+    tmax = max(tmax, vec3<f32>(t0));
+    stack[0] = TreeFrame(chunk_base, chunk_min, cell, tmax, t0, t1, entry_face);
   }
-  // level 2 brick 分裂了 → 有内容
-  return true;
+  var f = stack[0];
+  // 防挂死安全网：几何上界 = 对角射线穿越全分裂 chunk 的节点读数
+  // （depth3 ≤768 体素 + depth2 ≤192 + depth1 ≤12 + 各级帧内重读 ≈ 25k 量级）；
+  // 真实场景（uniform 盒体/地形/建筑，空气在高层整格跳过）每 chunk 仅几十~几百次。
+  var budget: u32 = 65536u;
+  loop {
+    if (budget == 0u) { break; }
+    budget = budget - 1u;
+    let level = u32(depth);
+    // 节点 fixed 字：mask_lo + mask_hi + palette
+    let mask_lo = b_struct[f.node_addr];
+    let mask_hi = b_struct[f.node_addr + 1u];
+    let palette = b_struct[f.node_addr + 2u];
+    // 当前子块的出口 t（三轴 tmax 最小值）；零厚度（== t_enter）= 擦边不入内部
+    let cell_exit = min(min(f.tmax.x, f.tmax.y), f.tmax.z);
+    if (mask_lo == 0u && mask_hi == 0u) {
+      // 整节点 uniform（mask==0）：palette 直决，无需逐子块步进
+      if (palette != 0u) { return FineHit(true, f.t_enter, palette, f.face); }
+      // 整节点空气 → 跳过整个节点区域（弹栈，父帧推进）
+      depth = depth - 1;
+      if (depth < 0) { return FineHit(false, 0.0, 0u, 0u); }
+      f = stack[depth];
+    } else {
+      let child_idx = u32(f.cell.z * 16 + f.cell.y * 4 + f.cell.x);
+      var mask_word: u32 = mask_lo;
+      var bit_in_word: u32 = child_idx;
+      if (child_idx >= 32u) {
+        mask_word = mask_hi;
+        bit_in_word = child_idx - 32u;
+      }
+      let bit = 1u << bit_in_word;
+      if ((mask_word & bit) == 0u) {
+        // uniform 子块：颜色 = 父节点 palette（零额外 load）。
+        // 零厚度擦边不入内部（与逐体素点查语义一致）
+        if (palette != 0u && f.t_enter < cell_exit) {
+          return FineHit(true, f.t_enter, palette, f.face);
+        }
+        // 空气子块 / 擦边 → 本帧推进一步（整子块跨越）
+      } else {
+        // 分裂 → popcount 定位紧凑 child offset
+        var pop_below: u32;
+        if (child_idx < 32u) {
+          pop_below = countOneBits(mask_lo & ((1u << bit_in_word) - 1u));
+        } else {
+          pop_below = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
+        }
+        let child_addr = chunk_base + b_struct[f.node_addr + NODE_FIXED_WORDS + pop_below];
+        if (level < 3u) {
+          // 下钻：子节点区域 = 当前子块；退化子块（出口==入口，零厚度擦边）不下钻
+          if (cell_exit > f.t_enter) {
+            let sub = 64u >> (level * 2u);
+            let child_min = f.node_min + vec3<f32>(f.cell) * f32(sub);
+            stack[depth] = f; // 寄存器态先落栈（弹出后要恢复的是已推进状态）
+            depth = depth + 1;
+            // ---- 子帧初始化（init_tree_frame 展开内联，sub = 64 >> (depth*2)）----
+            let sub_c = 64u >> (u32(depth) * 2u);
+            let cp = ro + rd * f.t_enter;
+            var ccell = vec3<i32>(floor((cp - child_min) / f32(sub_c)));
+            ccell = clamp(ccell, vec3<i32>(0), vec3<i32>(3));
+            let cside = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0));
+            let cboundary = child_min + (vec3<f32>(ccell) + cside) * f32(sub_c);
+            var ctmax = vec3<f32>(1e+30);
+            let caxis_on = abs(rd) > vec3<f32>(1e-30);
+            ctmax = select(ctmax, (cboundary - ro) / rd, caxis_on);
+            ctmax = max(ctmax, vec3<f32>(f.t_enter));
+            stack[depth] = TreeFrame(child_addr, child_min, ccell, ctmax,
+                                     f.t_enter, min(cell_exit, f.t_exit), f.face);
+            f = stack[depth];
+            continue;
+          }
+        } else {
+          // level 4 leaf（1³）：mask 必为 0，palette 即体素色；擦边不命中
+          let leaf_pal = b_struct[child_addr + 2u];
+          if (leaf_pal != 0u && f.t_enter < cell_exit) {
+            return FineHit(true, f.t_enter, leaf_pal, f.face);
+          }
+          // 空气 leaf / 擦边 → 本帧推进一步
+        }
+      }
+    }
+    // ---- 推进：f 常驻寄存器前进一步；耗尽/跨界则弹栈连推，直到真正一步或走出 chunk ----
+    loop {
+      if (min(min(f.tmax.x, f.tmax.y), f.tmax.z) >= f.t_exit) {
+        depth = depth - 1;
+        if (depth < 0) { return FineHit(false, 0.0, 0u, 0u); }
+        f = stack[depth];
+        continue;
+      }
+      let sub = 64u >> (u32(depth) * 2u); // 该层子块边长：64/16/4/1
+      if (f.tmax.x <= f.tmax.y && f.tmax.x <= f.tmax.z) {
+        f.t_enter = f.tmax.x;
+        f.tmax.x = f.tmax.x + delta.x * f32(sub);
+        f.cell.x = f.cell.x + sign_v.x;
+        f.face = select(0u, 1u, sign_v.x < 0);
+      } else if (f.tmax.y <= f.tmax.z) {
+        f.t_enter = f.tmax.y;
+        f.tmax.y = f.tmax.y + delta.y * f32(sub);
+        f.cell.y = f.cell.y + sign_v.y;
+        f.face = select(2u, 3u, sign_v.y < 0);
+      } else {
+        f.t_enter = f.tmax.z;
+        f.tmax.z = f.tmax.z + delta.z * f32(sub);
+        f.cell.z = f.cell.z + sign_v.z;
+        f.face = select(4u, 5u, sign_v.z < 0);
+      }
+      // 浮点边界（累计 tmax 与父帧 t_exit 差 1 ulp）：本步实际跨出了节点区域。
+      // 禁止越界索引（cell=-1 会回绕成 bit 23 等错误子块）→ 视为节点耗尽，弹栈
+      if (f.cell.x < 0 || f.cell.x > 3 ||
+          f.cell.y < 0 || f.cell.y > 3 ||
+          f.cell.z < 0 || f.cell.z > 3) {
+        depth = depth - 1;
+        if (depth < 0) { return FineHit(false, 0.0, 0u, 0u); }
+        f = stack[depth];
+        continue;
+      }
+      break;
+    }
+  }
+  return FineHit(false, 0.0, 0u, 0u);
 }
 
 // ============================================================================
-// P2.10 统一 DDA：trace_grid 一套管线同时服务主网格和逐物体 OBJ
-// 以下函数严格对应 Rust `brickmap/obj.rs` CPU 参考实现（逐字镜像）。
+// 统一 DDA：trace_grid 一套管线同时服务主网格和逐物体 OBJ
+// 以下函数严格对应 Rust `brickmap/dda.rs` CPU 参考实现（逐字镜像）。
 // ============================================================================
 
 // slab 法射线-AABB 求交，返回 (t_enter, t_exit)；平行且在外 → (1.0, 0.0) miss 哨兵
-// 对应 obj.rs::slab_box
+// 对应 dda.rs::slab_box
 fn slab_box(ro: vec3<f32>, rd: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>, t0: f32, t1: f32) -> vec2<f32> {
   var t_enter = t0;
   var t_exit = t1;
@@ -334,7 +473,7 @@ fn slab_box(ro: vec3<f32>, rd: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>, t0: f32,
 
 // ============================================================================
 // 统一 DDA 核心（Phase 3 OBJ→Volume 统一）
-// 主世界和物体本质都是体素网格 DDA——用相同的 slab→coarse→fine 流程，
+// 主世界和物体本质都是体素网格 DDA——用相同的 slab→chunk 间 A&W→trace_chunk 流程，
 // 差异通过 Grid 参数化（tree_base + 变换矩阵 + chunk 窗口）。
 // 零 kind 分支：所有 grid 从统一 b_struct[tree_base..] 读树、b_palette[palette_base..] 取色。
 // ============================================================================
@@ -349,103 +488,159 @@ struct UnifiedHit {
   obj_id: i32,         // -1 = 主世界, >=0 = 物体索引
 }
 
-// 统一网格上下文——一套 DDA 跑所有网格（主世界 + 物体）
-// 由 `make_grid(idx)` 从 `grid_descs[idx]` 构造；携带 tree_base/palette_base/
-// index_origin/dims 作为数据源基址，trace_grid → fine_scan_cell → grid_sample_voxel
-// 全链统一从 b_struct[tree_base + ...] / b_palette[palette_base + ...] 取数据。
-struct Grid {
-  w_mn: vec3<f32>,              // 世界 AABB min
-  w_mx: vec3<f32>,              // 世界 AABB max
-  l_min: vec3<f32>,             // 局部 AABB min（fine 坐标）= vec3(0.0)
-  l_max: vec3<f32>,             // 局部 AABB max（fine 坐标）= vec3(256.0)
-  cc_min: vec3<i32>,            // coarse cell 范围 min
-  cc_max: vec3<i32>,            // coarse cell 范围 max
-  max_coarse_steps: u32,
-  col0: vec3<f32>,              // 变换矩阵列（旋转）
-  col1: vec3<f32>,
-  col2: vec3<f32>,
-  pos: vec3<f32>,               // 物体位置
-  scale: f32,
-  tree_base: u32,               // b_struct 内本 volume 树基址（含 chunk 窗口段）
-  palette_base: u32,            // b_palette 内本 volume palette 基址
-  index_origin: vec3<i32>,      // chunk 窗口 origin（chunk 单位）
-  index_dims: vec3<u32>,        // chunk 窗口 dims（chunk 单位）
-  obj_id: i32,                  // -1 = 主世界，>=0 = 物体索引（debug/implicit normal 用）
-}
-
-// cell 占用查询——统一入口，零 kind 分支
-fn grid_cell_occupied(g: Grid, cc: vec3<i32>) -> bool {
-  return cell_occupied(g, cc);
-}
-
-// 体素采样——统一入口，零 kind 分支
-fn grid_sample_voxel(g: Grid, fc: vec3<i32>) -> u32 {
-  return sample_brickmap(g, fc);
-}
-
-// 统一两级 DDA：slab→coarse→fine_scan_cell（完全通用，零 kind 分支）
+// 统一层次 DDA：slab→chunk 间 A&W→trace_chunk（完全通用，零 kind 分支）
 // 所有网格（brickmap / obj / 未来任何体素 grid）走同一条路径
-fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> UnifiedHit {
-  let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, g.obj_id);
-  // ---- 世界 AABB 预剔除 ----
-  let bx = slab_box(origin, dir, g.w_mn, g.w_mx, 0.0, t_cap);
-  if (bx.y < max(bx.x, 0.0) || bx.x >= t_cap) { return miss; }
-  let t_hi_cap = min(bx.y, t_cap);
-  if (t_hi_cap <= max(bx.x, 0.0)) { return miss; }
+// 【性能】参数直接传 volume 索引（不传 15 字段 Grid 结构体）——WGSL 函数大结构体
+// 按值传参在 naga/驱动下实测有 ~µs 级开销（slab_box 内联 17ms→2.75ms 实证）；
+// slab 也直接内联（原 slab_box 调用版实测 17ms 纯调用开销）
+fn trace_grid_idx(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> UnifiedHit {
+  let d = grid_descs[idx];
+  let w_mn = d.aabb_min.xyz;
+  let w_mx = d.aabb_max.xyz;
+  let is_world = idx == 0u;
+  let l_min = select(vec3<f32>(0.0), d.aabb_min.xyz, is_world);
+  let l_max = select(vec3<f32>(f32(CHUNK_SIZE)), d.aabb_max.xyz, is_world);
+  let obj_id = select(-1i, i32(idx), idx > 0u);
+  let index_origin = vec3<i32>(d.index_origin_x, d.index_origin_y, d.index_origin_z);
+  let index_dims = vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z);
+  let tree_base = d.tree_base;
+  let dims_i = vec3<i32>(i32(d.index_dims_x), i32(d.index_dims_y), i32(d.index_dims_z));
+  let max_chunk_steps = u32(dims_i.x + dims_i.y + dims_i.z) * 3u + 16u;
+  let col0 = d.rot0.xyz;
+  let col1 = d.rot1.xyz;
+  let col2 = d.rot2.xyz;
+  let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, obj_id);
+  // ---- 世界 AABB 预剔除（slab 内联）----
+  var bx_enter = 0.0;
+  var bx_exit = t_cap;
+  if (abs(dir.x) < 1e-30) {
+    if (origin.x < w_mn.x || origin.x > w_mx.x) { return miss; }
+  } else {
+    let ta = (w_mn.x - origin.x) / dir.x;
+    let tb = (w_mx.x - origin.x) / dir.x;
+    bx_enter = max(bx_enter, min(ta, tb));
+    bx_exit = min(bx_exit, max(ta, tb));
+  }
+  if (abs(dir.y) < 1e-30) {
+    if (origin.y < w_mn.y || origin.y > w_mx.y) { return miss; }
+  } else {
+    let ta = (w_mn.y - origin.y) / dir.y;
+    let tb = (w_mx.y - origin.y) / dir.y;
+    bx_enter = max(bx_enter, min(ta, tb));
+    bx_exit = min(bx_exit, max(ta, tb));
+  }
+  if (abs(dir.z) < 1e-30) {
+    if (origin.z < w_mn.z || origin.z > w_mx.z) { return miss; }
+  } else {
+    let ta = (w_mn.z - origin.z) / dir.z;
+    let tb = (w_mx.z - origin.z) / dir.z;
+    bx_enter = max(bx_enter, min(ta, tb));
+    bx_exit = min(bx_exit, max(ta, tb));
+  }
+  if (bx_exit < max(bx_enter, 0.0) || bx_enter >= t_cap) { return miss; }
+  let t_hi_cap = min(bx_exit, t_cap);
+  if (t_hi_cap <= max(bx_enter, 0.0)) { return miss; }
   // ---- 局部变换 ----
-  let wp = origin - g.pos;
-  let ro = vec3<f32>(dot(wp, g.col0), dot(wp, g.col1), dot(wp, g.col2)) / g.scale;
-  let rd = vec3<f32>(dot(dir, g.col0), dot(dir, g.col1), dot(dir, g.col2)) / g.scale;
-  // ---- 局部 AABB slab ----
-  let tl = slab_box(ro, rd, g.l_min, g.l_max, 0.0, t_hi_cap);
-  if (tl.y < max(tl.x, 0.0)) { return miss; }
-  let tl0 = max(tl.x, 0.0);
-  let tl1 = min(tl.y, t_hi_cap);
+  let wp = origin - d.pos_scale.xyz;
+  let scale = d.pos_scale.w;
+  let ro = vec3<f32>(dot(wp, d.rot0.xyz), dot(wp, d.rot1.xyz), dot(wp, d.rot2.xyz)) / scale;
+  let rd = vec3<f32>(dot(dir, d.rot0.xyz), dot(dir, d.rot1.xyz), dot(dir, d.rot2.xyz)) / scale;
+  // ---- 局部 AABB slab（内联）----
+  var tl_enter = 0.0;
+  var tl_exit = t_hi_cap;
+  if (abs(rd.x) < 1e-30) {
+    if (ro.x < l_min.x || ro.x > l_max.x) { return miss; }
+  } else {
+    let ta = (l_min.x - ro.x) / rd.x;
+    let tb = (l_max.x - ro.x) / rd.x;
+    tl_enter = max(tl_enter, min(ta, tb));
+    tl_exit = min(tl_exit, max(ta, tb));
+  }
+  if (abs(rd.y) < 1e-30) {
+    if (ro.y < l_min.y || ro.y > l_max.y) { return miss; }
+  } else {
+    let ta = (l_min.y - ro.y) / rd.y;
+    let tb = (l_max.y - ro.y) / rd.y;
+    tl_enter = max(tl_enter, min(ta, tb));
+    tl_exit = min(tl_exit, max(ta, tb));
+  }
+  if (abs(rd.z) < 1e-30) {
+    if (ro.z < l_min.z || ro.z > l_max.z) { return miss; }
+  } else {
+    let ta = (l_min.z - ro.z) / rd.z;
+    let tb = (l_max.z - ro.z) / rd.z;
+    tl_enter = max(tl_enter, min(ta, tb));
+    tl_exit = min(tl_exit, max(ta, tb));
+  }
+  if (tl_exit < max(tl_enter, 0.0)) { return miss; }
+  let tl0 = max(tl_enter, 0.0);
+  let tl1 = min(tl_exit, t_hi_cap);
   if (tl1 <= tl0) { return miss; }
-  // ---- 两级 A&W ----
+  // debug_mode.z == 2（诊断）：跳过 chunk 步进层（二分 make_grid+slab vs 遍历成本）
+  if (view_u.debug_mode.z > 1.5) { return miss; }
+  // ---- chunk 间 A&W（256³ 一格）+ chunk 内层次 mask DDA（trace_chunk）----
   var sign_v = vec3<i32>(1i);
   sign_v = select(sign_v, vec3<i32>(-1i), rd < vec3<f32>(0.0));
   var delta = vec3<f32>(1e+30);
   delta = select(delta, 1.0 / abs(rd), abs(rd) > vec3<f32>(1e-30));
-  let delta_c = delta * 16.0;
+  let delta_c = delta * f32(CHUNK_SIZE);
   let start = ro + rd * tl0;
-  var cc = vec3<i32>(vec3<i32>(floor(start)) >> vec3<u32>(4u));
-  // cc clamp 统一对所有 grid 生效——越界时 cell_occupied / sample_voxel 自己过滤
-  cc = clamp(cc, g.cc_min, g.cc_max);
+  var ci = vec3<i32>(floor(start / f32(CHUNK_SIZE)));
+  // tmax_c：到下一 chunk 边界的 t（ro 系绝对）
+  let side_c = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0));
   var tmax_c = vec3<f32>(1e+30);
-  if (abs(rd.x) > 1e-30) { let t = (next_coarse_boundary(cc.x, sign_v.x) - start.x) / rd.x; tmax_c.x = max(t, 0.0); }
-  if (abs(rd.y) > 1e-30) { let t = (next_coarse_boundary(cc.y, sign_v.y) - start.y) / rd.y; tmax_c.y = max(t, 0.0); }
-  if (abs(rd.z) > 1e-30) { let t = (next_coarse_boundary(cc.z, sign_v.z) - start.z) / rd.z; tmax_c.z = max(t, 0.0); }
-  let t_rel_max = tl1 - tl0;
-  var t_in = 0.0;
-  // entry_axis：跨入当前 cell 的入口面索引。首格 t_in=0 时用 normalize(-rd) 兜底
-  // （相机贴面/UB；按用户约定 UB 直接返回该 voxel 颜色，face_id 仍按反方向反推）；
-  // 后续格在 coarse 推进时由「刚跨过的轴 + sign_v」更新。
-  var entry_axis: u32 = face_index_from_normal(normalize(-rd));
-  for (var step_c: u32 = 0u; step_c < g.max_coarse_steps; step_c = step_c + 1u) {
-    // 统一范围检查（所有 grid 都有 cc_min/cc_max）
-    if (any(cc < g.cc_min) || any(cc > g.cc_max)) { break; }
-    let t_out = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
-    if (grid_cell_occupied(g, cc)) {
-      let hi = min(t_out, t_rel_max);
-      let f = fine_scan_cell(g, start, rd, sign_v, delta, cc, t_in, hi, entry_axis);
-      if (f.hit) {
-        // 统一法线计算：fine_scan_cell 内部已推好 face_id，调用方零分支
-        let n_local = face_normal_from_index(f.face_id);
-        let n_world = normalize(n_local.x * g.col0 + n_local.y * g.col1 + n_local.z * g.col2);
-        return UnifiedHit(true, tl0 + f.t, f.pal, n_world, f.face_id, g.obj_id);
+  let bnd_c = (vec3<f32>(ci) + side_c) * f32(CHUNK_SIZE);
+  tmax_c = select(tmax_c, (bnd_c - ro) / rd, abs(rd) > vec3<f32>(1e-30));
+  tmax_c = max(tmax_c, vec3<f32>(tl0));
+  var t_enter_c = tl0;
+  // entry_face：跨入当前 chunk 的面。首 chunk 用 normalize(-rd) 兜底（相机贴面/UB；
+  // 按约定 UB 直接返回该 voxel 颜色，face_id 反推）；后续 chunk 由跨轴 + sign_v 更新。
+  // face_index_from_normal 内联（函数调用开销，见 worklog）
+  let en = normalize(-rd);
+  let eax = abs(en.x);
+  let eay = abs(en.y);
+  let eaz = abs(en.z);
+  var entry_face: u32 = 4u;
+  if (eax >= max(eay, eaz)) {
+    entry_face = select(0u, 1u, en.x >= 0.0);
+  } else if (eay >= eaz) {
+    entry_face = select(2u, 3u, en.y >= 0.0);
+  } else {
+    entry_face = select(4u, 5u, en.z >= 0.0);
+  }
+  for (var step_c: u32 = 0u; step_c < max_chunk_steps; step_c = step_c + 1u) {
+    let t_exit_c = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
+    let t1 = min(t_exit_c, tl1);
+    // ---- chunk 窗口定位（窗口外 = 空气，直接步进）----
+    let rel = ci - index_origin;
+    if (all(rel >= vec3<i32>(0)) && all(vec3<u32>(rel) < index_dims)) {
+      let rel_u = vec3<u32>(rel);
+      let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
+        + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+      let entry = b_struct[index_addr];
+      if (entry != 0u) {
+        let chunk_base = tree_base + entry - 1u;
+        let chunk_min = vec3<f32>(ci) * f32(CHUNK_SIZE);
+        let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v, delta,
+                            t_enter_c, t1, entry_face);
+        if (h.hit) {
+          // 统一法线计算：trace_chunk 内部已推好 face_id，调用方零分支
+          let n_local = face_normal_from_index(h.face_id);
+          let n_world = normalize(n_local.x * col0 + n_local.y * col1 + n_local.z * col2);
+          return UnifiedHit(true, h.t, h.pal, n_world, h.face_id, obj_id);
+        }
       }
     }
-    if (t_out >= t_rel_max) { break; }
+    if (t_exit_c >= tl1) { break; }
     if (tmax_c.x <= tmax_c.y && tmax_c.x <= tmax_c.z) {
-      t_in = tmax_c.x; tmax_c.x = tmax_c.x + delta_c.x; cc.x = cc.x + sign_v.x;
-      entry_axis = select(0u, 1u, sign_v.x < 0);
+      t_enter_c = tmax_c.x; tmax_c.x = tmax_c.x + delta_c.x; ci.x = ci.x + sign_v.x;
+      entry_face = select(0u, 1u, sign_v.x < 0);
     } else if (tmax_c.y <= tmax_c.z) {
-      t_in = tmax_c.y; tmax_c.y = tmax_c.y + delta_c.y; cc.y = cc.y + sign_v.y;
-      entry_axis = select(2u, 3u, sign_v.y < 0);
+      t_enter_c = tmax_c.y; tmax_c.y = tmax_c.y + delta_c.y; ci.y = ci.y + sign_v.y;
+      entry_face = select(2u, 3u, sign_v.y < 0);
     } else {
-      t_in = tmax_c.z; tmax_c.z = tmax_c.z + delta_c.z; cc.z = cc.z + sign_v.z;
-      entry_axis = select(4u, 5u, sign_v.z < 0);
+      t_enter_c = tmax_c.z; tmax_c.z = tmax_c.z + delta_c.z; ci.z = ci.z + sign_v.z;
+      entry_face = select(4u, 5u, sign_v.z < 0);
     }
   }
   return miss;
@@ -453,15 +648,12 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Unified
 
 // 构造统一 Grid：从 grid_descs[idx] 解码所有字段（主世界 idx=0，物体 idx≥1）。
 // 主世界 = identity 变换（pos=0/rot=I/scale=1），物体 = 任意变换。
-// chunk 窗口 cc_min/cc_max 由 GridDesc.index_origin/dims 算出；物体 dims=(1,1,1)。
+// chunk 步数上限由窗口 dims 估算（曼哈顿对角 ×3 + 余量）；物体 dims=(1,1,1)。
 fn make_grid(idx: u32) -> Grid {
   let d = grid_descs[idx];
   let origin = vec3<i32>(d.index_origin_x, d.index_origin_y, d.index_origin_z);
   let dims = vec3<i32>(i32(d.index_dims_x), i32(d.index_dims_y), i32(d.index_dims_z));
-  let cc_min = origin * 16;
-  let cc_max = (origin + dims) * 16 - vec3<i32>(1i, 1i, 1i);
-  let coarse_budget = (dims.x + dims.y + dims.z) * 16;
-  let coarse_limit = u32(coarse_budget) * 3u;
+  let chunk_budget = u32(dims.x + dims.y + dims.z) * 3u + 16u;
   // 主世界（idx=0，identity：局部=世界）：局部 AABB = 窗口 AABB（origin 可为负，
   // [0,256]³ 默认盒会把窗口绝大部分 slab 剔除）；物体 = 单 chunk 局部 [0,256]³。
   let is_world = idx == 0u;
@@ -470,8 +662,7 @@ fn make_grid(idx: u32) -> Grid {
   return Grid(
     d.aabb_min.xyz, d.aabb_max.xyz,       // 世界 AABB
     l_mn, l_mx,                            // 局部 AABB
-    cc_min, cc_max,
-    coarse_limit,
+    chunk_budget,
     d.rot0.xyz, d.rot1.xyz, d.rot2.xyz,    // 旋转矩阵列
     d.pos_scale.xyz, d.pos_scale.w,        // pos + scale
     d.tree_base, d.palette_base,           // 数据源基址
@@ -481,73 +672,12 @@ fn make_grid(idx: u32) -> Grid {
 }
 
 
-// 统一细扫：任意 grid（brickmap / obj）通用。算法 1:1 原始 Akenine-Möller。
-// 数据源唯一入口：grid_sample_voxel(g, fc)。
-// 返回 t 为相对 t_lo 的偏移；face_id 0..5 = ±xyz 六面（命中面法线索引）
-//   pre-check 命中（p 落在固体 voxel）：face_id = entry_axis（由调用方维护：
-//   首格用 normalize(-rd) 兜底，非首格用 coarse 上一步跨轴；相机在体内时 UB，
-//   直接返回该 voxel 颜色，face_id 用 normalize(-rd) 反推）
-struct FineHit {
-  hit: bool,
-  t: f32,
-  pal: u32,
-  face_id: u32,
-}
-fn fine_scan_cell(g: Grid, ro: vec3<f32>, rd: vec3<f32>, sign: vec3<i32>, delta: vec3<f32>,
-                  cc: vec3<i32>, t_lo: f32, t_hi: f32, entry_axis: u32) -> FineHit {
-  if (t_hi <= t_lo) { return FineHit(false, 0.0, 0u, 0u); }
-  let p = ro + rd * t_lo;
-  let base = vec3<i32>(cc << vec3<u32>(4u));
-  let fc0 = clamp(vec3<i32>(floor(p)), base, base + vec3<i32>(15));
-  let pal0_init = grid_sample_voxel(g, fc0);
-  if (pal0_init != 0u) { return FineHit(true, t_lo, pal0_init, entry_axis); }
-  var fc = fc0;
-  var tmax_f = vec3<f32>(1e+30);
-  if (abs(rd.x) > 1e-30) {
-    let t = (next_boundary(fc0.x, sign.x) - p.x) / rd.x;
-    tmax_f.x = max(t, 0.0);
-  }
-  if (abs(rd.y) > 1e-30) {
-    let t = (next_boundary(fc0.y, sign.y) - p.y) / rd.y;
-    tmax_f.y = max(t, 0.0);
-  }
-  if (abs(rd.z) > 1e-30) {
-    let t = (next_boundary(fc0.z, sign.z) - p.z) / rd.z;
-    tmax_f.z = max(t, 0.0);
-  }
-  let span = t_hi - t_lo;
-  var t_f = 0.0;
-  for (var i_f: u32 = 0u; i_f < 48u; i_f = i_f + 1u) {
-    if (t_f >= span) { break; }
-    var face_id: u32 = 5u;
-    if (tmax_f.x <= tmax_f.y && tmax_f.x <= tmax_f.z) {
-      t_f = tmax_f.x;
-      tmax_f.x = tmax_f.x + delta.x;
-      fc.x = fc.x + sign.x;
-      face_id = select(0u, 1u, sign.x < 0);
-    } else if (tmax_f.y <= tmax_f.z) {
-      t_f = tmax_f.y;
-      tmax_f.y = tmax_f.y + delta.y;
-      fc.y = fc.y + sign.y;
-      face_id = select(2u, 3u, sign.y < 0);
-    } else {
-      t_f = tmax_f.z;
-      tmax_f.z = tmax_f.z + delta.z;
-      fc.z = fc.z + sign.z;
-      face_id = select(4u, 5u, sign.z < 0);
-    }
-    let pal = grid_sample_voxel(g, fc);
-    if (pal != 0u) { return FineHit(true, t_lo + t_f, pal, face_id); }
-  }
-  return FineHit(false, 0.0, 0u, 0u);
-}
-
 // 遮挡快路径（阴影射线）：[0, t_max) 内任一 volume 命中即 true。
 // Phase 3 统一：遍历 grid_descs[0..arrayLength]，零 world/obj 分支。
 fn scene_occluded(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> bool {
   let n = arrayLength(&grid_descs);
   for (var i: u32 = 0u; i < n; i = i + 1u) {
-    let mh = trace_grid(make_grid(i), origin, dir, t_max);
+    let mh = trace_grid_idx(i, origin, dir, t_max);
     if (mh.hit) { return true; }
   }
   return false;
@@ -640,7 +770,8 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
 // Phase 3 统一：sample_brickmap 走 Grid 参数（g.tree_base + g.index_origin/dims）。
 // ============================================================================
 fn compute_implicit_normal(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t: f32, dda_n: vec3<f32>) -> vec3<f32> {
-  if (g.obj_id >= 0) { return dda_n; }  // 物体用 DDA 面法向
+  // debug_mode.w（诊断开关）：跳过 6 邻域点采样，直接用 DDA 面法线
+  if (g.obj_id >= 0 || view_u.debug_mode.w > 0.5) { return dda_n; }
   let hit_pos = origin + dir * t;
   // dda_n 指向外部（射线来向）；沿 -dda_n 微偏 → 命中体素中心
   let hit_fc = vec3<i32>(floor(hit_pos - dda_n * 0.001));
@@ -675,8 +806,9 @@ fn shade_hit(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, dda_n
   let sky_grad = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, smoothstep(0.0, 0.35, h));
   var col: vec3<f32> = base * (light_u.g.ambient.xyz * 0.4 + sky_grad * 0.6);
 
-  // 方向光硬阴影（Devlog #02：1 条射线，不通即阴影）
-  if (light_u.g.count > 0u) {
+  // 方向光硬阴影（Devlog #02：1 条射线，不通即阴影）。
+  // debug_mode.z（诊断开关）：跳过阴影射线（性能定位）
+  if (light_u.g.count > 0u && view_u.debug_mode.z < 0.5) {
     let ld = light_u.lights[0];
     if (ld.kind_pos_dir.x < 0.5) {
       let l_axis = ld.kind_pos_dir.yzw;
@@ -704,6 +836,19 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
 
+  // debug_mode.w > 1.5（诊断模式 2）：跳过全部 trace，直接天空色输出
+  // （把 17ms 固定开销二分：反投影+输出 vs make_grid/trace_grid 框架）
+  if (view_u.debug_mode.w > 1.5) {
+    let px0 = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
+    let uv0 = vec2<f32>(px0.x * 2.0 - 1.0, 1.0 - px0.y * 2.0);
+    let nh = view_u.inv_view_proj * vec4<f32>(uv0.x, uv0.y, 1.0, 1.0);
+    let fw = view_u.cam_pos_fine.xyz + (nh.xyz / nh.w - view_u.cam_pos_fine.xyz);
+    var col0 = sky(normalize(fw - view_u.cam_pos_fine.xyz));
+    col0 = linear_to_srgb(aces_tonemap(col0));
+    textureStore(out_tex, coord0, vec4<f32>(col0, 1.0));
+    return;
+  }
+
   // ---- 反投影：像素中心 (gid + 0.5) → NDC (u, v) ∈ [-1, 1] ----
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
   let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
@@ -717,6 +862,22 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let frustum_length = length(diff_world);
   let dir_fine = normalize(diff_world);
   let origin_fine = view_u.cam_pos_fine.xyz;
+  let n = arrayLength(&grid_descs);
+
+  // debug_mode.w > 3.5（诊断模式 3）：只做 make_grid（读 GridDesc）不 trace
+  // ——测量 make_grid 本身的成本（skip_chunkwalk 17ms 的最后嫌疑点）
+  if (view_u.debug_mode.w > 3.5) {
+    var sink = 0u;
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+      let gg = make_grid(i);
+      sink = sink + u32(gg.scale) + u32(gg.w_mn.x) + u32(gg.col2.z);
+    }
+    var col1 = sky(dir_fine);
+    col1 = col1 + vec3<f32>(f32(sink & 1u) * 0.001);
+    col1 = linear_to_srgb(aces_tonemap(col1));
+    textureStore(out_tex, coord0, vec4<f32>(col1, 1.0));
+    return;
+  }
 
   // ---- trace_scene：遍历 grid_descs[0..N] 取最近命中（Phase 3 统一）----
   var best_t = 1e+30;
@@ -724,10 +885,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var best_n = vec3<f32>(0.0);
   var best_face_id: u32 = 0u;
   var best_grid: Grid = make_grid(0u);  // 命中 volume 的 Grid（shade_hit 取色 + implicit normal 用）
-  let n = arrayLength(&grid_descs);
   for (var i: u32 = 0u; i < n; i = i + 1u) {
     let cap = min(best_t, frustum_length);
-    let mh = trace_grid(make_grid(i), origin_fine, dir_fine, cap);
+    let mh = trace_grid_idx(i, origin_fine, dir_fine, cap);
     if (mh.hit && mh.t < best_t) {
       best_t = mh.t;
       best_pal = mh.pal;

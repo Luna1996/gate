@@ -10,7 +10,7 @@
 //!
 //! Level 链：256 → 64 → 16 → 4 → 1（4 次分裂到 1³ 体素）
 
-use super::coords::{child_linear_idx, BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT};
+use super::coords::{BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT, child_linear_idx};
 
 /// 结构化节点（编辑用）
 ///
@@ -164,19 +164,16 @@ impl ChunkTree {
   /// 查询指定体素（1³，level 4）的 palette；未设置返回 None
   pub fn get_voxel(&self, local_x: i32, local_y: i32, local_z: i32) -> Option<u8> {
     if self.nodes.is_empty() {
-      return if self.root_palette == 0 { None } else { Some(self.root_palette) };
+      return if self.root_palette == 0 {
+        None
+      } else {
+        Some(self.root_palette)
+      };
     }
     self.get_at(local_x, local_y, local_z, Some(0), CHUNK_SIZE)
   }
 
-  fn get_at(
-    &self,
-    x: i32,
-    y: i32,
-    z: i32,
-    idx: Option<usize>,
-    extent: i32,
-  ) -> Option<u8> {
+  fn get_at(&self, x: i32, y: i32, z: i32, idx: Option<usize>, extent: i32) -> Option<u8> {
     let (mask, palette) = match idx {
       Some(i) => match &self.nodes[i] {
         Node::Uniform(p) => return if *p == 0 { None } else { Some(*p) },
@@ -213,16 +210,18 @@ impl ChunkTree {
     let next_y = y - iy * child_extent;
     let next_z = z - iz * child_extent;
 
-    self.get_at(
-      next_x, next_y, next_z, Some(child_idx), child_extent,
-    )
+    self.get_at(next_x, next_y, next_z, Some(child_idx), child_extent)
   }
 
   /// uniform 查询：level L 的 brick 是否全同色
   pub fn get_uniform(&self, local_x: i32, local_y: i32, local_z: i32, level: u8) -> Option<u8> {
     let query_extent = LEVEL_EXTENT[level as usize];
     if self.nodes.is_empty() {
-      return if self.root_palette == 0 { None } else { Some(self.root_palette) };
+      return if self.root_palette == 0 {
+        None
+      } else {
+        Some(self.root_palette)
+      };
     }
     self.get_uniform_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
   }
@@ -269,9 +268,12 @@ impl ChunkTree {
           None => return None,
           Some(c) => match first_color {
             None => first_color = Some(c),
-            Some(f) if f != c => { all_same = false; break; }
+            Some(f) if f != c => {
+              all_same = false;
+              break;
+            }
             _ => {}
-          }
+          },
         }
       }
       return if all_same { first_color } else { None };
@@ -309,8 +311,19 @@ impl ChunkTree {
 
   fn first_uniform_color(&self, idx: usize) -> Option<u8> {
     match &self.nodes[idx] {
-      Node::Uniform(p) => if *p == 0 { None } else { Some(*p) },
-      Node::Split { mask, children, palette, .. } => {
+      Node::Uniform(p) => {
+        if *p == 0 {
+          None
+        } else {
+          Some(*p)
+        }
+      }
+      Node::Split {
+        mask,
+        children,
+        palette,
+        ..
+      } => {
         if *mask == 0 {
           // lazy Split：整节点 uniform（防御 trailing_zeros(0)=64 越界）
           return if *palette == 0 { None } else { Some(*palette) };
@@ -407,7 +420,11 @@ impl ChunkTree {
     // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
     // 首次编辑才创建节点 + 置 bit + 紧凑表插入
     let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
-      Node::Split { mask, palette, children } => {
+      Node::Split {
+        mask,
+        palette,
+        children,
+      } => {
         let bit = 1u64 << child_i;
         let ci = if (mask & bit) != 0 {
           Some(children[child_slot(*mask, child_i) as usize] as usize)
@@ -517,7 +534,11 @@ impl ChunkTree {
     // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
     // 首次编辑才创建节点 + 置 bit + 紧凑表插入
     let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
-      Node::Split { mask, palette, children } => {
+      Node::Split {
+        mask,
+        palette,
+        children,
+      } => {
         let bit = 1u64 << child_i;
         let ci = if (mask & bit) != 0 {
           Some(children[child_slot(*mask, child_i) as usize] as usize)
@@ -541,7 +562,14 @@ impl ChunkTree {
         new as usize
       }
     };
-    self.set_recursive(next_x, next_y, next_z, palette, Some(child_idx), child_extent);
+    self.set_recursive(
+      next_x,
+      next_y,
+      next_z,
+      palette,
+      Some(child_idx),
+      child_extent,
+    );
 
     // 回溯：try merge
     self.try_merge(p);
@@ -585,7 +613,10 @@ impl ChunkTree {
         let c: Option<u8> = if (mask & bit) != 0 {
           match &self.nodes[children[child_slot(mask, i) as usize] as usize] {
             Node::Uniform(p) => Some(*p),
-            Node::Split { .. } => { all_uniform_same = false; break; }
+            Node::Split { .. } => {
+              all_uniform_same = false;
+              break;
+            }
           }
         } else {
           Some(palette)
@@ -594,9 +625,12 @@ impl ChunkTree {
           None => {}
           Some(c) => match first_color {
             None => first_color = Some(c),
-            Some(f) if f != c => { all_uniform_same = false; break; }
+            Some(f) if f != c => {
+              all_uniform_same = false;
+              break;
+            }
             _ => {}
-          }
+          },
         }
       }
     } // children 不可变借用结束
@@ -646,12 +680,7 @@ impl ChunkTree {
     self.nodes = new_nodes;
   }
 
-  fn collect_reachable(
-    &self,
-    idx: Option<usize>,
-    out: &mut Vec<Node>,
-    map: &mut Vec<usize>,
-  ) {
+  fn collect_reachable(&self, idx: Option<usize>, out: &mut Vec<Node>, map: &mut Vec<usize>) {
     let old = match idx {
       Some(i) => i,
       None => return,
@@ -674,7 +703,11 @@ impl ChunkTree {
   // =========================================================================
 
   pub fn node_count(&self) -> usize {
-    self.nodes.iter().filter(|n| matches!(n, Node::Split { .. })).count()
+    self
+      .nodes
+      .iter()
+      .filter(|n| matches!(n, Node::Split { .. }))
+      .count()
   }
 
   pub fn leaf_count(&self) -> usize {

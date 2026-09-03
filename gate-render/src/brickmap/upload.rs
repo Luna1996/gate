@@ -376,7 +376,8 @@ fn ensure_with_copy(
   let new_buf = device.create_buffer(&BufferDescriptor {
     label: Some(label),
     size: new_size,
-    usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+    // COPY_SRC：本 buffer 下次扩容时要作为前缀拷贝的源（缺它第二次 grow 必炸）
+    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
     mapped_at_creation: false,
   });
   if prefix_valid && cap > 0 {
@@ -586,12 +587,7 @@ pub(crate) fn prepare(
 
   // globals：从主世界 GridDesc[0] 构造向后兼容 BrickMapGlobals（Phase 1 shader 字节兼容，
   // Phase 2 重写 dda.wgsl 后移除——届时 shader 走 grid_descs_buf，不再读 globals）。
-  let main_desc = snap
-    .volumes
-    .grid_descs
-    .first()
-    .copied()
-    .unwrap_or_default();
+  let main_desc = snap.volumes.grid_descs.first().copied().unwrap_or_default();
   let globals = BrickMapGlobals {
     index_origin_x: main_desc.index_origin_x,
     index_origin_y: main_desc.index_origin_y,

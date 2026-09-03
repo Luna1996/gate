@@ -130,7 +130,10 @@ pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u
           }
         }
         if max_d2 <= r2 as i64 {
-          if grid.fill_brick(IVec3::new(bx, by, bz), 4, palette).is_some() {
+          if grid
+            .fill_brick(IVec3::new(bx, by, bz), 4, palette)
+            .is_some()
+          {
             count += 64;
           }
         } else {
@@ -216,7 +219,11 @@ fn glyph(ch: u8) -> &'static [u8; 7] {
 }
 
 pub fn text_size(text: &str) -> IVec3 {
-  let cols = if text.is_empty() { 0 } else { text.len() as i32 * 6 - 1 };
+  let cols = if text.is_empty() {
+    0
+  } else {
+    text.len() as i32 * 6 - 1
+  };
   IVec3::new(cols, 7, 1)
 }
 

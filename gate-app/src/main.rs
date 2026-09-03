@@ -9,17 +9,19 @@ use bevy::{
   window::{PresentMode, Window},
 };
 use glam::{Mat3, Vec3};
+use std::sync::LazyLock;
 
 use gate_render::{
-  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals,
-  OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene, create_dda_image,
-  cpu_reference_trace_volumes,
+  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, OrbitCamera,
+  UploadBudget, VIEW_SIZE, VoxelScene, cpu_reference_trace_volumes, create_dda_image,
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
   widgets::{label, px},
 };
-use gate_voxel::{PaletteEntry, VolumeTransform, Volumes, draw_text, fill_box, fill_bricks, fill_sphere};
+use gate_voxel::{
+  PaletteEntry, VolumeTransform, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
+};
 
 /// 以 crate 目录为锚的 assets 路径，F5 / 终端启动行为一致
 pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
@@ -100,6 +102,11 @@ fn main() {
     // 装配后 DiagnosticsRecorder 才存在，4×pass 的 time_span 才会记录 GPU/CPU 耗时；
     // 未装配时 gate-render 的 span 走 Option<&T> no-op，不影响渲染
     .add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
+    // fps/帧时 + gate_dda_compute/blit GPU 耗时每秒落日志（帧率剖析用）
+    .add_plugins((
+      bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
+      bevy::diagnostic::LogDiagnosticsPlugin::default(),
+    ))
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
     .add_systems(Startup, setup)
@@ -133,15 +140,20 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     Default::default()
   });
   commands.insert_resource(theme);
-  commands.insert_resource(DdaImages {
-    target: dda_handle,
-  });
+  commands.insert_resource(DdaImages { target: dda_handle });
   // P2.6：轨道相机为唯一相机状态源；DdaCameraConfig 由 from_orbit 生成
-  // （极限场景：世界中心 2560,160,2560；eye 从 +X/+Z 45° 俯视距离 5200 fine 一览 10×10 大陆全境）
-  let orbit = OrbitCamera::from_eye(
-    Vec3::new(2560.0 + 3800.0, 2600.0, 2560.0 + 3800.0),
-    Vec3::new(2560.0, 320.0, 2560.0),
-  );
+  // （初始机位：世界中心俯视 45°，距离随规模缩放，一览全境）
+  // 诊断：GATE_CAM=sky → 仰视天空（纯 miss，验证 GPU 时间是否随负载变化）
+  let c = *EXT_FINE_HALF as f32;
+  let dist = 380.0 * *EXT_N_TILES as f32;
+  let orbit = if std::env::var("GATE_CAM").as_deref() == Ok("sky") {
+    OrbitCamera::from_eye(Vec3::new(c, 320.0, c), Vec3::new(c, 5000.0, c))
+  } else {
+    OrbitCamera::from_eye(
+      Vec3::new(c + dist, 2600.0, c + dist),
+      Vec3::new(c, 320.0, c),
+    )
+  };
   commands.insert_resource(orbit);
   commands.insert_resource(DdaCameraConfig::from_orbit(
     &orbit,
@@ -204,26 +216,37 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // 旧 ObjScene/Pack_obj_pool/ObjObject 三段管道已删除；物体 = 普通的 VolumeGrid，
   // 通过 Volumes.add_object() 注册变换，走与主世界相同的 dirty → builder → upload 路径。
   let mut volumes = Volumes::new(grid);
-  // A 贴地：城堡平台顶面（y=272）上，identity / scale 1
-  {
-    let id = volumes.add_object(Vec3::new(2352.0, 272.0, 2352.0), Mat3::IDENTITY, 1.0);
-    if let Some(v) = volumes.object_mut(id) {
-      *v = build_chip_prefab();
-    }
-  }
-  // B 交叠：嵌入北城墙（z 2048..2056）——突出部遮挡墙 / 嵌入部被墙遮挡
-  {
-    let id = volumes.add_object(Vec3::new(2600.0, 260.0, 1980.0), Mat3::IDENTITY, 1.0);
-    if let Some(v) = volumes.object_mut(id) {
-      *v = build_chip_prefab();
-    }
-  }
-  // C 旋转 + 缩放：地面 yaw30° / scale 2，压中央大道
+  // 物体锚点随世界中心缩放（c = 世界中心）；三枚芯片都拿到城堡区平地（地面 y=16），
+  // 南侧三角错开、互不重叠、避开大道（z = c±32）；姿态/缩放各异便于分辨
+  let c = *EXT_FINE_HALF as f32;
+  // A：yaw 25° + 俯仰 15°，scale 2.0
   {
     let id = volumes.add_object(
-      Vec3::new(1600.0, 16.0, 2600.0),
-      Mat3::from_rotation_y(30.0_f32.to_radians()),
+      Vec3::new(c - 320.0, 16.0, c - 320.0),
+      Mat3::from_rotation_y(25.0_f32.to_radians()) * Mat3::from_rotation_x(15.0_f32.to_radians()),
       2.0,
+    );
+    if let Some(v) = volumes.object_mut(id) {
+      *v = build_chip_prefab();
+    }
+  }
+  // B：yaw 160° + 俯仰 -30°，scale 1.3
+  {
+    let id = volumes.add_object(
+      Vec3::new(c + 300.0, 16.0, c - 200.0),
+      Mat3::from_rotation_y(160.0_f32.to_radians()) * Mat3::from_rotation_x(-30.0_f32.to_radians()),
+      1.3,
+    );
+    if let Some(v) = volumes.object_mut(id) {
+      *v = build_chip_prefab();
+    }
+  }
+  // C：yaw -75° + 俯仰 40°，scale 2.2
+  {
+    let id = volumes.add_object(
+      Vec3::new(c - 100.0, 16.0, c + 300.0),
+      Mat3::from_rotation_y(-75.0_f32.to_radians()) * Mat3::from_rotation_x(40.0_f32.to_radians()),
+      2.2,
     );
     if let Some(v) = volumes.object_mut(id) {
       *v = build_chip_prefab();
@@ -287,11 +310,20 @@ fn paint_demo_palette(grid: &mut gate_voxel::VolumeGrid) {
 //   · 保留 tile(1,0,0) 每 120 帧 L4 黄↔青交替（验证 132KB/180µs 增量上传路径）
 //   · 世界大标语 "GATE ENGINE" 立在入口大道
 // ─────────────────────────────────────────────────────────────────────
-const EXT_N_TILES_X: i32 = 10;
-const EXT_N_TILES_Z: i32 = 10;
-const EXT_FINE_X: i32 = EXT_N_TILES_X * 512;
-const EXT_FINE_Z: i32 = EXT_N_TILES_Z * 512;
-const EXT_FINE_HALF: i32 = EXT_FINE_X / 2; // 2560
+// 世界规模（tile 数，1 tile = 512 fine）：env `GATE_TILES` 可调。
+// 默认 2 = 快速调试档（启动 ~几秒；正确性调试期默认小场景）；
+// `GATE_TILES=10` = 完整压测场景（启动 ~55s，性能验收用）。
+// 场景内所有结构性坐标（城堡/大道/河）均以 EXT_FINE_HALF 为锚，随规模等比成立。
+static EXT_N_TILES: LazyLock<i32> = LazyLock::new(|| {
+  std::env::var("GATE_TILES")
+    .ok()
+    .and_then(|s| s.parse::<i32>().ok())
+    .unwrap_or(2)
+    .clamp(2, 10)
+});
+static EXT_FINE_X: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
+static EXT_FINE_Z: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
+static EXT_FINE_HALF: LazyLock<i32> = LazyLock::new(|| *EXT_FINE_X / 2);
 
 /// 正弦高度场（确定性，不用 rand）：
 /// h(x,z) = 16 + A·sin(x·k1)·cos(z·k2) + 山体距 4 角的反比隆起
@@ -308,26 +340,26 @@ fn terrain_h(x: i32, z: i32) -> i32 {
     (600.0 / d).min(1.0) * 780.0 // 山顶 ~800
   };
   let sn = corner_snow(0, 0)
-    + corner_snow(EXT_FINE_X - 1, 0)
-    + corner_snow(0, EXT_FINE_Z - 1)
-    + corner_snow(EXT_FINE_X - 1, EXT_FINE_Z - 1);
+    + corner_snow(*EXT_FINE_X - 1, 0)
+    + corner_snow(0, *EXT_FINE_Z - 1)
+    + corner_snow(*EXT_FINE_X - 1, *EXT_FINE_Z - 1);
   let hf = 16.0 + s1 * 80.0 + s2 * 120.0 + sn;
   // 4 对齐：fill_box 高度层全部 4³ 整块（非对齐会退化为逐体素边缘 →
   // 4³ Split 碎片化，树序列化输出曾膨胀到 1.9GB）。阶梯化 4 级符合像素风。
   ((hf as i32).clamp(16, 1020)) & !3
 }
 
-/// 离中央堡 (2560, 2560) 的距离
+/// 离中央堡（世界中心）的距离
 fn dist_to_castle(x: i32, z: i32) -> i32 {
-  let dx = x - 2560;
-  let dz = z - 2560;
+  let dx = x - *EXT_FINE_HALF;
+  let dz = z - *EXT_FINE_HALF;
   ((dx * dx + dz * dz) as f32).sqrt() as i32
 }
 
 /// 中央峡谷蜿蜒河（x,z 在河道走廊内返回 true）
 fn in_river(x: i32, z: i32) -> bool {
-  let t = z as f32 / EXT_FINE_Z as f32; // 0..1
-  let river_center = EXT_FINE_HALF as f32   // 中线 2560
+  let t = z as f32 / *EXT_FINE_Z as f32; // 0..1
+  let river_center = *EXT_FINE_HALF as f32 // 世界中线
     + (t * std::f32::consts::TAU).sin() * 700.0 // 正弦摆 ±700
     + ((t * 12.566).cos() * 180.0); // 次级摆幅
   let dx = (x as f32) - river_center;
@@ -351,9 +383,9 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   //      y=16..h 使用 palette 2 山岩；y>h-40 且 h>520 → palette 3 雪峰
   // ================================================================
   let mut z = 0i32;
-  while z < EXT_FINE_Z {
+  while z < *EXT_FINE_Z {
     let mut x = 0i32;
-    while x < EXT_FINE_X {
+    while x < *EXT_FINE_X {
       let h = terrain_h(x, z);
       let dc = dist_to_castle(x, z);
       // 中央堡区 (radius<700) 不开地形，后面由城堡结构接管
@@ -406,11 +438,11 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     z += 16;
   }
   mark!("(1) terrain columns");
-  // 全地图 L0 基础地板（y=0..16，pal 1 草地）——覆盖 0..10 tile 的 X/Z，Y=0..1
+  // 全地图 L0 基础地板（y=0..16，pal 1 草地）
   fill_bricks(
     grid,
     IVec3::new(0, 0, 0),
-    IVec3::new(EXT_FINE_X, 16, EXT_FINE_Z),
+    IVec3::new(*EXT_FINE_X, 16, *EXT_FINE_Z),
     16,
     1,
   );
@@ -419,11 +451,11 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   // ================================================================
   //  (2) 中央大道 + 入口大标语 "GATE ENGINE"
   // ================================================================
-  // 中央大道（X 向，Z=2496..2528，宽 32 fine）深灰铺路
+  // 中央大道（X 向，中线 ±32 宽）深灰铺路
   fill_box(
     grid,
-    IVec3::new(0, 16, 2496),
-    IVec3::new(EXT_FINE_X, 8, 32),
+    IVec3::new(0, 16, *EXT_FINE_HALF - 32),
+    IVec3::new(*EXT_FINE_X, 8, 32),
     12,
   );
   // 大标语（L1，每像素 8³，放在入口 X=64 Y=32 Z=256 朝向 -Z）
@@ -431,7 +463,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   mark!("(2) road+text");
 
   // ================================================================
-  //  (3) 中央天空之城（中央 2560±520 方区）
+  //  (3) 中央天空之城（世界中心 ±520 方区）
   //     · 浮空岛底（倒锥状，L1 pal 13 深蓝灰）底 y=600 顶 y=240
   //     · 城墙平台 400×400×32（y=240..272 pal 4 石）
   //     · 四面城墙 8 宽 × 64 高 × 400 长（y=272..336）
@@ -440,8 +472,8 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   //     · 正殿中心高塔 80×80×192（y=464..656）+ L3 金顶球
   //     · 四角旗帜（L4 红飘带形状）
   // ================================================================
-  let cx = 2560i32;
-  let cz = 2560i32;
+  let cx = *EXT_FINE_HALF;
+  let cz = *EXT_FINE_HALF;
   // 浮空岛底（倒锥：按 y 降低半径收窄）——L0 级 16 步扫描
   let island_base_y = 128i32; // 岛底尖
   let island_top_y = 240i32; // 岛顶面（城墙在此升起）
@@ -497,7 +529,13 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   ] {
     let tx = cx + ox;
     let tz = cz + oz;
-    fill_bricks(grid, IVec3::new(tx, 272, tz), IVec3::new(96, 160, 96), 16, 4);
+    fill_bricks(
+      grid,
+      IVec3::new(tx, 272, tz),
+      IVec3::new(96, 160, 96),
+      16,
+      4,
+    );
     // 角楼顶金色 16
     fill_box(
       grid,
@@ -581,14 +619,14 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     let mut i = 0i32;
     while n_planted < 170 && i < 2000 {
       // 确定性 2 互素线性同余 → (x,z) 伪散点
-      let x = (i * 211 + 83) % EXT_FINE_X;
-      let z = ((i * 977 + 419) ^ 0xA53) % EXT_FINE_Z;
+      let x = (i * 211 + 83) % *EXT_FINE_X;
+      let z = ((i * 977 + 419) ^ 0xA53) % *EXT_FINE_Z;
       let x = x.abs();
       let z = z.abs();
       let h = terrain_h(x, z);
       let ok = dist_to_castle(x, z) > 900
         && !in_river(x, z)
-        && !(2496..=2528).contains(&z) // 中央大道
+        && !((*EXT_FINE_HALF - 32)..=(*EXT_FINE_HALF + 32)).contains(&z) // 中央大道
         && h < 360;
       if ok {
         // 树干 （L1, 24 宽 16 宽 24 深 高 80）
@@ -614,7 +652,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     (768, 4352, 70, 9, 10, 223), // 左下 水晶紫/红
   ];
   for &(cx_, cz_, cnt, pa, pb, seed) in crystal_clusters.iter() {
-    if cx_ >= EXT_FINE_X || cz_ >= EXT_FINE_Z {
+    if cx_ >= *EXT_FINE_X || cz_ >= *EXT_FINE_Z {
       continue; // 簇中心在世界外（N 缩小时）跳过，避免 t 无限增长溢出
     }
     let h = terrain_h(cx_, cz_);
@@ -628,13 +666,8 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
       let pal = if (t & 1) == 0 { pa } else { pb };
       let px_ = cx_ + sx;
       let pz_ = cz_ + sz;
-      if px_ >= 0 && pz_ >= 0 && px_ < EXT_FINE_X && pz_ < EXT_FINE_Z {
-        fill_box(
-          grid,
-          IVec3::new(px_, h + hy, pz_),
-          IVec3::new(1, 1, 1),
-          pal,
-        );
+      if px_ >= 0 && pz_ >= 0 && px_ < *EXT_FINE_X && pz_ < *EXT_FINE_Z {
+        fill_box(grid, IVec3::new(px_, h + hy, pz_), IVec3::new(1, 1, 1), pal);
         placed += 1;
       }
       t += 1;
@@ -644,16 +677,13 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
 
   // ================================================================
   //  (6) 保留：tile(1,0,0) 内 L4 32³ 热点（每 120 帧黄↔青交替）
-  //      tile(2,0,0) 中心 32³ 蓝 L4（旧 demo）
+  //      tile(2,0,0) 中心 32³ 蓝 L4（旧 demo，世界缩小时跳过）
   //      → 保持增量上传特性展示（UPLOAD 132KB/180µs）
   // ================================================================
   fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 11);
-  fill_box(
-    grid,
-    IVec3::new(1264, 240, 240),
-    IVec3::new(32, 32, 32),
-    7,
-  );
+  if 1264 + 32 <= *EXT_FINE_X {
+    fill_box(grid, IVec3::new(1264, 240, 240), IVec3::new(32, 32, 32), 7);
+  }
   let t0 = gate_voxel::ChunkCoord::new(0, 0, 0);
   grid.set_state(0, 1, 0xDEAD);
   grid.set_state(1, 0, 0xBEEF);
@@ -999,11 +1029,14 @@ fn demo_ui_setup(
         position_type: PositionType::Absolute,
         left: px(8.0),
         top: px(8.0),
+        // 黑底半透明面板：天空/亮色场景下 FPS 文本可读
+        padding: UiRect::all(px(4.0)),
         ..default()
       })
-      .with_children(|root| {
-        let e = label(&ctx, root, "FPS: CUR ---, AVG ---, MIN ---, MAX ---");
-        root.world_mut().entity_mut(e).insert(FpsText);
+      .insert(BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)))
+      .with_children(|panel| {
+        let e = label(&ctx, panel, "FPS: CUR ---, AVG ---, MIN ---, MAX ---");
+        panel.world_mut().entity_mut(e).insert(FpsText);
       });
   });
 }
@@ -1114,12 +1147,7 @@ mod aabb_zoom_tests {
   }
   fn build_scene(grid: &mut gate_voxel::VolumeGrid) {
     use gate_voxel::{draw_text, fill_box, fill_bricks, fill_sphere};
-    fill_box(
-      grid,
-      glam::IVec3::ZERO,
-      glam::IVec3::new(512, 16, 512),
-      1,
-    );
+    fill_box(grid, glam::IVec3::ZERO, glam::IVec3::new(512, 16, 512), 1);
     for i in (0..512).step_by(128) {
       fill_box(
         grid,

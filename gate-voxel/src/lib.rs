@@ -13,7 +13,7 @@ pub mod volume;
 
 // ============ 核心坐标 ============
 pub use coords::{
-  BrickCoord, ChunkCoord, VoxelCoord, BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT, MAX_LEVEL,
+  BRICK_FACTOR, BrickCoord, CHUNK_SIZE, ChunkCoord, LEVEL_EXTENT, MAX_LEVEL, VoxelCoord,
   child_linear_idx,
 };
 
@@ -24,7 +24,9 @@ pub use chunk_tree::ChunkTree;
 pub use dirty::DirtyTracker;
 
 // ============ Volume 容器 ============
-pub use volume::{COMP_BRICKS_PER_CHUNK, COMP_BRICK_EXTENT, DirtyEdit, VolumeGrid, VolumeTransform, Volumes};
+pub use volume::{
+  COMP_BRICK_EXTENT, COMP_BRICKS_PER_CHUNK, DirtyEdit, VolumeGrid, VolumeTransform, Volumes,
+};
 
 // ============ 调色板 ============
 pub use palette::{AIR_INDEX, Palette, PaletteEntry, PaletteFlags};

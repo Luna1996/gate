@@ -36,7 +36,12 @@ fn fill_checkerboard(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, cell: i32
       let mut x = min.x;
       while x < min.x + extent.x {
         let parity = ((x / cell) ^ (y / cell) ^ (z / cell)) & 1;
-        fill_box(grid, IVec3::new(x, y, z), IVec3::splat(cell), parity as u8 + 1);
+        fill_box(
+          grid,
+          IVec3::new(x, y, z),
+          IVec3::splat(cell),
+          parity as u8 + 1,
+        );
         x += cell;
       }
       y += cell;
@@ -156,17 +161,16 @@ fn incremental_burst_frame_budget() {
     let t0 = Instant::now();
     for c in &coords {
       assert!(
-        matches!(builder.update_chunk(&grid, *c), gate_render::ChunkUpdate::Rebuilt),
+        matches!(
+          builder.update_chunk(&grid, *c),
+          gate_render::ChunkUpdate::Rebuilt
+        ),
         "已渲染脏 chunk 应走 Rebuilt（{c:?}）"
       );
     }
     let el = t0.elapsed();
     let ranges = builder.take_dirty_ranges();
-    let bytes: usize = ranges
-      .struct_ranges
-      .iter()
-      .map(|r| r.1 - r.0)
-      .sum();
+    let bytes: usize = ranges.struct_ranges.iter().map(|r| r.1 - r.0).sum();
     frames_ms.push(el.as_secs_f64() * 1000.0);
     frame_bytes.push(bytes);
     frame_chunks.push(coords.len());
@@ -302,7 +306,10 @@ fn vram_layout_budget_2gb() {
   // ① 定长前缀回归锚：Region ① 稠密 chunk 窗口 = 64³ 字 = 1MB
   assert_eq!(TREE_BASE, 64 * 64 * 64);
   assert_eq!(TREE_BASE * 4, 1_048_576);
-  println!("[P2.9d] 定长前缀（chunk 窗口）= {:.1}MB", TREE_BASE as f64 * 4.0 / 1048576.0);
+  println!(
+    "[P2.9d] 定长前缀（chunk 窗口）= {:.1}MB",
+    TREE_BASE as f64 * 4.0 / 1048576.0
+  );
 
   // ② 中粒度棋盘单 chunk 的树区成本线：64³ cell=16 棋盘（level 2 粒度异色）
   let mut grid = VolumeGrid::new();
@@ -341,8 +348,7 @@ fn vram_layout_budget_2gb() {
     1,
   );
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
-  let total_mb =
-    (bufs.b_struct.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
+  let total_mb = (bufs.b_struct.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
   println!(
     "[P2.9d] 典型工作间 buffers 合计={total_mb:.2}MB（含 1MB chunk 窗口）→ GPU 同规格 + CPU 镜像 ×2 = {:.1}MB（v4 预算 ≤350MB）",
     total_mb * 2.0
@@ -393,7 +399,12 @@ fn obj_16_objects_trace_scene_budget() {
     &world as &gate_render::BrickMapBuffers,
     VolumeTransform::IDENTITY,
   ))
-  .chain(chip_bufs.iter().zip(transforms.iter().copied()).map(|(b, t)| (b as &gate_render::BrickMapBuffers, t)))
+  .chain(
+    chip_bufs
+      .iter()
+      .zip(transforms.iter().copied())
+      .map(|(b, t)| (b as &gate_render::BrickMapBuffers, t)),
+  )
   .collect();
 
   // 体量留档：v1 每物体 = 1 chunk 树（窗口 1MB + 树）+ palette

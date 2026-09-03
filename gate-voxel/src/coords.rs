@@ -71,7 +71,11 @@ impl VoxelCoord {
   }
 
   pub fn from_ivec3(v: IVec3) -> Self {
-    Self { x: v.x, y: v.y, z: v.z }
+    Self {
+      x: v.x,
+      y: v.y,
+      z: v.z,
+    }
   }
 
   pub fn to_ivec3(self) -> IVec3 {
@@ -117,7 +121,13 @@ pub struct BrickCoord {
 
 impl BrickCoord {
   pub fn new(level: u8, chunk: ChunkCoord, x: u32, y: u32, z: u32) -> Self {
-    Self { level, chunk, x, y, z }
+    Self {
+      level,
+      chunk,
+      x,
+      y,
+      z,
+    }
   }
 
   /// brick 边长（体素）

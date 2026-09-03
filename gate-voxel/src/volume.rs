@@ -347,7 +347,9 @@ impl VolumeGrid {
       Some(a) => a,
       None => return 0,
     };
-    arr[bx + by * COMP_BRICK_EXTENT as usize + bz * COMP_BRICK_EXTENT as usize * COMP_BRICK_EXTENT as usize]
+    arr[bx
+      + by * COMP_BRICK_EXTENT as usize
+      + bz * COMP_BRICK_EXTENT as usize * COMP_BRICK_EXTENT as usize]
   }
 
   pub fn comp_layer(&self) -> &HashMap<ChunkCoord, Box<[u16; COMP_BRICKS_PER_CHUNK]>> {
@@ -427,9 +429,7 @@ mod tests {
   #[test]
   fn batch_edit_dedupes_dirty() {
     let mut grid = VolumeGrid::new();
-    let ops: Vec<(VoxelCoord, u8)> = (0..100)
-      .map(|i| (VoxelCoord::new(i, 0, 0), 1u8))
-      .collect();
+    let ops: Vec<(VoxelCoord, u8)> = (0..100).map(|i| (VoxelCoord::new(i, 0, 0), 1u8)).collect();
     assert_eq!(grid.batch_edit(ops), 100);
     assert_eq!(grid.dirty.data_dirty_count(), 1); // 全在 chunk (0,0,0)
   }
@@ -457,7 +457,10 @@ mod tests {
     assert_eq!(vols.len(), 3);
 
     // 可变访问
-    vols.object_mut(0).unwrap().set_voxel_ivec3(IVec3::new(5, 5, 5), 3);
+    vols
+      .object_mut(0)
+      .unwrap()
+      .set_voxel_ivec3(IVec3::new(5, 5, 5), 3);
     assert_eq!(
       vols.object(0).unwrap().get_voxel(VoxelCoord::new(5, 5, 5)),
       Some(3)
@@ -465,10 +468,7 @@ mod tests {
 
     // 主世界可变
     vols.main_mut().set_voxel_ivec3(IVec3::new(10, 10, 10), 7);
-    assert_eq!(
-      vols.main().get_voxel(VoxelCoord::new(10, 10, 10)),
-      Some(7)
-    );
+    assert_eq!(vols.main().get_voxel(VoxelCoord::new(10, 10, 10)), Some(7));
 
     // all() 切片
     assert_eq!(vols.all().len(), 3);

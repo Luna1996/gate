@@ -25,9 +25,7 @@ use glam::{IVec3, Vec4};
 use super::wire::{CHUNK_SIZE, GridDesc, pack_palette_entry};
 use rayon::prelude::*;
 
-use super::wire::{
-  BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_WORDS, TREE_BASE,
-};
+use super::wire::{BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_WORDS, TREE_BASE};
 
 /// 稠密 chunk 窗口线性位置（stride = CHUNK_INDEX_CAP，与 view.rs 同构）；窗口外 None
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
@@ -164,9 +162,7 @@ impl BrickMapBuilder {
     let mut b = Self::new_unbuilt(grid);
     let mut coords: Vec<ChunkCoord> = grid
       .chunk_coords()
-      .filter(|&c| {
-        chunk_index_pos(b.origin, b.dims, c.0).is_some() && chunk_has_content(grid, c)
-      })
+      .filter(|&c| chunk_index_pos(b.origin, b.dims, c.0).is_some() && chunk_has_content(grid, c))
       .collect();
     coords.sort_by_key(|&c| coord_key(c));
 
@@ -263,8 +259,8 @@ impl BrickMapBuilder {
   /// append 一个 chunk 的序列化树 + 写窗口条目（幂等覆盖同 chunk 旧条目）
   fn append_chunk(&mut self, coord: ChunkCoord, words: &[u32]) {
     let base = self.buffers.b_struct.len();
-    let ip = chunk_index_pos(self.origin, self.dims, coord.0)
-      .expect("append_chunk 只接受窗口内 chunk");
+    let ip =
+      chunk_index_pos(self.origin, self.dims, coord.0).expect("append_chunk 只接受窗口内 chunk");
     self.buffers.b_struct[ip] = base as u32 + 1;
     self.buffers.b_struct.extend_from_slice(words);
     self.base_of.insert(coord, (base, words.len()));
@@ -274,8 +270,8 @@ impl BrickMapBuilder {
 
   /// chunk 变空：条目清零 + 旧树作废
   fn release_chunk(&mut self, coord: ChunkCoord, old_words: usize) {
-    let ip = chunk_index_pos(self.origin, self.dims, coord.0)
-      .expect("release_chunk 只接受窗口内 chunk");
+    let ip =
+      chunk_index_pos(self.origin, self.dims, coord.0).expect("release_chunk 只接受窗口内 chunk");
     self.garbage_words += old_words;
     self.buffers.b_struct[ip] = 0;
     self.base_of.remove(&coord);
@@ -438,7 +434,11 @@ impl VolumesBuilder {
       let g = &buffers.globals;
       let tr = self.transforms[i];
       let origin = IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z);
-      let dims = IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32);
+      let dims = IVec3::new(
+        g.index_dims_x as i32,
+        g.index_dims_y as i32,
+        g.index_dims_z as i32,
+      );
       let mut desc = GridDesc::from_transform(
         tr.pos,
         tr.rot,
@@ -575,7 +575,13 @@ mod tests {
   use gate_voxel::{fill_box, fill_sphere};
 
   /// view 与 grid 在给定区域逐最细格一致（stride 控制采样密度）
-  fn assert_view_matches(grid: &VolumeGrid, b: &BrickMapBuilder, lo: IVec3, hi: IVec3, stride: i32) {
+  fn assert_view_matches(
+    grid: &VolumeGrid,
+    b: &BrickMapBuilder,
+    lo: IVec3,
+    hi: IVec3,
+    stride: i32,
+  ) {
     let view = BrickMapView::new(b.buffers());
     let mut z = lo.z;
     while z < hi.z {
@@ -628,10 +634,16 @@ mod tests {
     {
       let g = &b.buffers().globals;
       assert_eq!(g.tile_count, 1);
-      assert_eq!(g.node_words as usize, b.buffers().b_struct.len() - TREE_BASE);
+      assert_eq!(
+        g.node_words as usize,
+        b.buffers().b_struct.len() - TREE_BASE
+      );
       assert!(g.node_words > 0, "单体素分裂树非空");
       // 单 chunk 窗口：min-1 起 +3
-      assert_eq!((g.index_origin_x, g.index_origin_y, g.index_origin_z), (-1, -1, -1));
+      assert_eq!(
+        (g.index_origin_x, g.index_origin_y, g.index_origin_z),
+        (-1, -1, -1)
+      );
       assert_eq!((g.index_dims_x, g.index_dims_y, g.index_dims_z), (3, 3, 3));
       // 窗口条目 = 树基址 + 1
       let ip = chunk_index_pos(b.origin(), b.dims(), IVec3::ZERO).unwrap();
@@ -642,8 +654,16 @@ mod tests {
     let v = BrickMapView::new(b.buffers());
     assert_eq!(v.get_voxel(IVec3::new(5, 6, 7)), Some(3));
     assert_eq!(v.get_voxel(IVec3::new(6, 6, 7)), None);
-    assert_eq!(v.get_voxel(IVec3::new(255, 255, 255)), None, "同 chunk 邻域空");
-    assert_eq!(v.get_voxel(IVec3::new(256, 0, 0)), None, "相邻 chunk 窗口内无树");
+    assert_eq!(
+      v.get_voxel(IVec3::new(255, 255, 255)),
+      None,
+      "同 chunk 邻域空"
+    );
+    assert_eq!(
+      v.get_voxel(IVec3::new(256, 0, 0)),
+      None,
+      "相邻 chunk 窗口内无树"
+    );
     assert_eq!(v.get_voxel(IVec3::new(-1, 0, 0)), None);
     assert!(v.cell_occupied(IVec3::new(0, 0, 0)));
     assert!(!v.cell_occupied(IVec3::new(1, 0, 0)));
@@ -662,7 +682,13 @@ mod tests {
     // 内容 chunk：x∈{-2,-1,0,1}，y/z∈{-2..0}：窗口必含负分量
     assert!(g.tile_count >= 4, "应覆盖多个 chunk（含负坐标）");
     assert!(g.index_origin_x < 0 && g.index_origin_y < 0);
-    assert_view_matches(&grid, &b, IVec3::new(-310, -310, -310), IVec3::splat(310), 7);
+    assert_view_matches(
+      &grid,
+      &b,
+      IVec3::new(-310, -310, -310),
+      IVec3::splat(310),
+      7,
+    );
   }
 
   #[test]
@@ -719,7 +745,10 @@ mod tests {
     let total: usize = d.struct_ranges.iter().map(|&(a, hi)| hi - a).sum();
     assert!(total > 0, "增量应有脏区间");
     // 2 个 chunk 树 + 窗口条目远小于 Region ① 的 1MB
-    assert!(total < 2 * 1024 * 1024, "增量脏区间应远小于 1MB 窗口，实际 {total}B");
+    assert!(
+      total < 2 * 1024 * 1024,
+      "增量脏区间应远小于 1MB 窗口，实际 {total}B"
+    );
   }
 
   #[test]
@@ -768,7 +797,11 @@ mod tests {
 
     // 编辑 3：清空 chunk (1,0,0) → 条目清零 + garbage
     let free_before = b.buffers().globals.node_free_words as usize;
-    assert!(grid.clear_voxel(gate_voxel::VoxelCoord::new(260, 10, 10)).is_some());
+    assert!(
+      grid
+        .clear_voxel(gate_voxel::VoxelCoord::new(260, 10, 10))
+        .is_some()
+    );
     assert_eq!(
       b.update_chunk(&grid, ChunkCoord::new(1, 0, 0)),
       ChunkUpdate::Released
@@ -983,7 +1016,10 @@ mod tests {
 
     // 编辑物体（头部 volume）→ 主世界 tree_base 漂移 → full
     let mut vols = vols;
-    vols.object_mut(0).unwrap().set_voxel_ivec3(IVec3::new(5, 5, 5), 9);
+    vols
+      .object_mut(0)
+      .unwrap()
+      .set_voxel_ivec3(IVec3::new(5, 5, 5), 9);
     let chunks = vols.object_mut(0).unwrap().dirty.drain_data_budget(100);
     for c in chunks {
       vb.update_chunk(&vols, 1, c);
