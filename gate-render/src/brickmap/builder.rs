@@ -20,13 +20,14 @@
 use std::collections::HashMap;
 
 use gate_voxel::{ChunkCoord, VolumeGrid, VolumeTransform, Volumes};
-use glam::IVec3;
+use glam::{IVec3, Vec4};
+
+use super::wire::{CHUNK_SIZE, GridDesc, pack_palette_entry};
 use rayon::prelude::*;
 
 use super::wire::{
-  BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_WORDS, TREE_BASE, pack_palette_entry,
+  BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_WORDS, TREE_BASE,
 };
-use super::wire::GridDesc;
 
 /// 稠密 chunk 窗口线性位置（stride = CHUNK_INDEX_CAP，与 view.rs 同构）；窗口外 None
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
@@ -436,16 +437,36 @@ impl VolumesBuilder {
       let buffers = self.builders[i].buffers();
       let g = &buffers.globals;
       let tr = self.transforms[i];
-      grid_descs.push(GridDesc::from_transform(
+      let origin = IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z);
+      let dims = IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32);
+      let mut desc = GridDesc::from_transform(
         tr.pos,
         tr.rot,
         tr.scale,
         tree_bases[i],
         palette_bases[i],
         g.tile_count,
-        IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z),
-        IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32),
-      ));
+        origin,
+        dims,
+      );
+      if i == 0 {
+        // 主世界（identity：局部=世界）：AABB = chunk 窗口范围（fine 单位）。
+        // from_transform 默认给 [0,256]³·scale——窗口 origin 可为负且 dims 巨大，
+        // 默认盒会把窗口绝大部分 slab 剔除 → 全屏只渲染 chunk(0,0,0) 附近一小块。
+        desc.aabb_min = Vec4::new(
+          (origin.x * CHUNK_SIZE as i32) as f32,
+          (origin.y * CHUNK_SIZE as i32) as f32,
+          (origin.z * CHUNK_SIZE as i32) as f32,
+          0.0,
+        );
+        desc.aabb_max = Vec4::new(
+          ((origin.x + dims.x) * CHUNK_SIZE as i32) as f32,
+          ((origin.y + dims.y) * CHUNK_SIZE as i32) as f32,
+          ((origin.z + dims.z) * CHUNK_SIZE as i32) as f32,
+          0.0,
+        );
+      }
+      grid_descs.push(desc);
     }
 
     // 漂移检测：volume 数变化 / 任一 tree_base 或 palette_base 变化 → 全量

@@ -99,29 +99,69 @@ pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, pal
 }
 
 /// 填充球体（立方中心到球心距离 ≤ 半径）
+///
+/// 按 4³ 分块：8 角全在球内的整块走 [`VolumeGrid::fill_brick`]（O(depth) 树
+/// 路径写入），边缘壳逐体素。纯逐体素对大球慢 64× 且 Split 节点爆炸
+/// （浮空岛 8 层嵌套大球曾拖死启动：数亿次 set_voxel / GB 级节点）。
 pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u8) -> usize {
   assert!(radius > 0);
   let r2 = radius * radius;
   let lo = center - IVec3::splat(radius);
   let hi = center + IVec3::splat(radius);
-  let mut count = 0;
-  let mut z = lo.z;
-  while z <= hi.z {
-    let mut y = lo.y;
-    while y <= hi.y {
-      let mut x = lo.x;
-      while x <= hi.x {
-        let d = IVec3::new(x, y, z) - center;
-        if d.dot(d) <= r2 {
-          if grid.set_voxel_ivec3(IVec3::new(x, y, z), palette).is_some() {
-            count += 1;
+  let mut count = 0usize;
+  // 4³ 网格分块遍历
+  let blk_lo = IVec3::new(lo.x & !3, lo.y & !3, lo.z & !3);
+  let blk_hi = IVec3::new((hi.x + 3) & !3, (hi.y + 3) & !3, (hi.z + 3) & !3);
+  let mut bz = blk_lo.z;
+  while bz <= blk_hi.z {
+    let mut by = blk_lo.y;
+    while by <= blk_hi.y {
+      let mut bx = blk_lo.x;
+      while bx <= blk_hi.x {
+        // 8 角最大距离平方 ≤ r² → 整块在球内
+        let mut max_d2 = 0i64;
+        for cz in [0i32, 4] {
+          for cy in [0, 4] {
+            for cx in [0, 4] {
+              let corner = IVec3::new(bx + cx, by + cy, bz + cz);
+              let d = (corner - center).as_i64vec3();
+              max_d2 = max_d2.max(d.dot(d));
+            }
           }
         }
-        x += 1;
+        if max_d2 <= r2 as i64 {
+          if grid.fill_brick(IVec3::new(bx, by, bz), 4, palette).is_some() {
+            count += 64;
+          }
+        } else {
+          // 边缘壳：逐体素
+          let x_end = (bx + 4).min(hi.x + 1);
+          let y_end = (by + 4).min(hi.y + 1);
+          let z_end = (bz + 4).min(hi.z + 1);
+          let mut z = bz.max(lo.z);
+          while z < z_end {
+            let mut y = by.max(lo.y);
+            while y < y_end {
+              let mut x = bx.max(lo.x);
+              while x < x_end {
+                let d = (IVec3::new(x, y, z) - center).as_i64vec3();
+                if d.dot(d) <= r2 as i64
+                  && grid.set_voxel_ivec3(IVec3::new(x, y, z), palette).is_some()
+                {
+                  count += 1;
+                }
+                x += 1;
+              }
+              y += 1;
+            }
+            z += 1;
+          }
+        }
+        bx += 4;
       }
-      y += 1;
+      by += 4;
     }
-    z += 1;
+    bz += 4;
   }
   count
 }

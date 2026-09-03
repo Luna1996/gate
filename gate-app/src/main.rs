@@ -153,14 +153,33 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   commands.insert_resource(DebugNormals::default());
 
   // ---- demo scene：调色板 + 多分辨率混合极限场景 ----
+  let t0 = std::time::Instant::now();
   let mut grid = gate_voxel::VolumeGrid::new();
   paint_demo_palette(&mut grid);
+  bevy::log::info!("STEP 1: palette done ({:?})", t0.elapsed());
   build_demo_scene(&mut grid);
+  bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
+  bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
 
   // 诊断：打印 brickmap globals
   {
+    let t1 = std::time::Instant::now();
+    // 树输出量诊断：serialize 总字数 + 最大 chunk（build_full OOM 排查）
+    let mut words_per_chunk: Vec<(usize, _)> = grid
+      .chunk_coords()
+      .map(|c| (grid.chunk(c).map(|t| t.len_words()).unwrap_or(0), c))
+      .collect();
+    let total_words: usize = words_per_chunk.iter().map(|(w, _)| *w).sum();
+    words_per_chunk.sort_unstable_by_key(|(w, _)| std::cmp::Reverse(*w));
+    bevy::log::info!(
+      "TREE SIZE: total={}MB chunks={} top3={:?}",
+      total_words * 4 / 1024 / 1024,
+      words_per_chunk.len(),
+      &words_per_chunk[..3.min(words_per_chunk.len())],
+    );
     let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
+    bevy::log::info!("STEP 4: diag build_full done ({:?})", t1.elapsed());
     let g = &bufs.globals;
     let n_chunks = grid.chunk_coords().count();
     bevy::log::info!(
@@ -268,8 +287,8 @@ fn paint_demo_palette(grid: &mut gate_voxel::VolumeGrid) {
 //   · 保留 tile(1,0,0) 每 120 帧 L4 黄↔青交替（验证 132KB/180µs 增量上传路径）
 //   · 世界大标语 "GATE ENGINE" 立在入口大道
 // ─────────────────────────────────────────────────────────────────────
-const EXT_N_TILES_X: i32 = 1;
-const EXT_N_TILES_Z: i32 = 1;
+const EXT_N_TILES_X: i32 = 10;
+const EXT_N_TILES_Z: i32 = 10;
 const EXT_FINE_X: i32 = EXT_N_TILES_X * 512;
 const EXT_FINE_Z: i32 = EXT_N_TILES_Z * 512;
 const EXT_FINE_HALF: i32 = EXT_FINE_X / 2; // 2560
@@ -293,7 +312,9 @@ fn terrain_h(x: i32, z: i32) -> i32 {
     + corner_snow(0, EXT_FINE_Z - 1)
     + corner_snow(EXT_FINE_X - 1, EXT_FINE_Z - 1);
   let hf = 16.0 + s1 * 80.0 + s2 * 120.0 + sn;
-  (hf as i32).clamp(16, 1020)
+  // 4 对齐：fill_box 高度层全部 4³ 整块（非对齐会退化为逐体素边缘 →
+  // 4³ Split 碎片化，树序列化输出曾膨胀到 1.9GB）。阶梯化 4 级符合像素风。
+  ((hf as i32).clamp(16, 1020)) & !3
 }
 
 /// 离中央堡 (2560, 2560) 的距离
@@ -314,6 +335,17 @@ fn in_river(x: i32, z: i32) -> bool {
 }
 
 fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
+  let t0 = std::time::Instant::now();
+  macro_rules! mark {
+    ($name:expr) => {
+      bevy::log::info!(
+        "SCENE {}: {:?} chunks={}",
+        $name,
+        t0.elapsed(),
+        grid.chunk_count()
+      )
+    };
+  }
   // ================================================================
   //  (1) 基础地形：按 16 fine (L0) 步长采样高度场 → fill_box 铺柱
   //      y=16..h 使用 palette 2 山岩；y>h-40 且 h>520 → palette 3 雪峰
@@ -331,11 +363,11 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
       if !in_castle_plate {
         // 先铺 L0 地面（所有格子 y=0..16 统一由稍后 L0 全地图填，这里只填 16..h 山体）
         let top = h;
-        let snow_line = top - 38;
+        let snow_line = top - 40; // 4 对齐（top 已对齐 4）
         if in_r {
-          // 河床：先填一层灰色岩，再加 8 fine 高河蓝
-          fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, 12, 16), 2);
-          fill_box(grid, IVec3::new(x, 28, z), IVec3::new(16, 8, 16), 7);
+          // 河床：4 对齐（岩 8 + 蓝 8 = y 16..32，原 12+8 的 12 非对齐会碎片化）
+          fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, 8, 16), 2);
+          fill_box(grid, IVec3::new(x, 24, z), IVec3::new(16, 8, 16), 7);
         } else if top > 16 {
           // 山体主体（palette 2 山岩）
           let rock_h = (snow_line - 16).max(0).min(top - 16);
@@ -373,6 +405,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     }
     z += 16;
   }
+  mark!("(1) terrain columns");
   // 全地图 L0 基础地板（y=0..16，pal 1 草地）——覆盖 0..10 tile 的 X/Z，Y=0..1
   fill_bricks(
     grid,
@@ -381,6 +414,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     16,
     1,
   );
+  mark!("(1b) floor");
 
   // ================================================================
   //  (2) 中央大道 + 入口大标语 "GATE ENGINE"
@@ -394,6 +428,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   );
   // 大标语（L1，每像素 8³，放在入口 X=64 Y=32 Z=256 朝向 -Z）
   draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 8);
+  mark!("(2) road+text");
 
   // ================================================================
   //  (3) 中央天空之城（中央 2560±520 方区）
@@ -418,6 +453,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     fill_sphere(grid, IVec3::new(cx, y, cz), r, 13);
     y += 16;
   }
+  mark!("(3a) floating island");
   // 城墙平台（y=240..272，512×512×32）
   fill_bricks(
     grid,
@@ -515,6 +551,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   );
   // 金顶球（L2 r=64，塔顶 y=720+80=800）
   fill_sphere(grid, IVec3::new(cx, 800, cz), 64, 11);
+  mark!("(3b) castle walls+towers");
   // 四角旗帜（L4 红飘带：从角楼顶 4 角斜向上拉出小立方体串）
   for &(ox, oz) in &[
     (-512, -512),
@@ -563,6 +600,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
       i += 1;
     }
   }
+  mark!("(4) forest");
 
   // ================================================================
   //  (5) 3 处 L4 水晶矿簇（每处 60~100 个 1³ 彩色小立方体，密集堆叠，
@@ -576,6 +614,9 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
     (768, 4352, 70, 9, 10, 223), // 左下 水晶紫/红
   ];
   for &(cx_, cz_, cnt, pa, pb, seed) in crystal_clusters.iter() {
+    if cx_ >= EXT_FINE_X || cz_ >= EXT_FINE_Z {
+      continue; // 簇中心在世界外（N 缩小时）跳过，避免 t 无限增长溢出
+    }
     let h = terrain_h(cx_, cz_);
     let mut t = 0i32;
     let mut placed = 0usize;
@@ -599,6 +640,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
       t += 1;
     }
   }
+  mark!("(5) crystals");
 
   // ================================================================
   //  (6) 保留：tile(1,0,0) 内 L4 32³ 热点（每 120 帧黄↔青交替）
@@ -617,6 +659,7 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   grid.set_state(1, 0, 0xBEEF);
   grid.set_comp(t0, 0, 0, 0, 0x1122);
   grid.set_comp(t0, 1, 0, 0, 0x3344);
+  mark!("(6) hotspots+state");
 }
 
 // ================= P2.10 OBJ 硬编码芯片预制件 =================

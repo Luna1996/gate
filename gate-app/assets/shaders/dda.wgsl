@@ -64,16 +64,8 @@ fn face_color_from_index(f: u32) -> vec3<f32> {
   return vec3<f32>(1.0);
 }
 
-// palette 解包（wire.rs pack_palette_entry 反函数，palette_idx = 0 => AIR，调用方已提前返回）
-// word_0 = color.r | color.g<<8 | color.b<<16 | roughness<<24
-// 返回 sRGB 颜色分量 [0,255] → 外部再转 f32
-fn palette_rgb_u8(pal_idx: u32) -> vec3<u32> {
-  let w0 = b_palette[pal_idx * 2u];
-  let r = w0 & 0xFFu;
-  let g = (w0 >> 8u) & 0xFFu;
-  let b = (w0 >> 16u) & 0xFFu;
-  return vec3<u32>(r, g, b);
-}
+// palette 解包已并入 hit_mat(g.palette_base, pal)——多 volume 拼接后必须带
+// palette_base 偏移，否则会读到别的 volume 的颜色。
 
 // --- BG0：输出 + 视图 uniform（v5 single-pass per-pixel shade_hit）---
 // @binding(0) = out storage write（rgba8unorm，linear RGB；ACES → sRGB 后输出）
@@ -470,9 +462,14 @@ fn make_grid(idx: u32) -> Grid {
   let cc_max = (origin + dims) * 16 - vec3<i32>(1i, 1i, 1i);
   let coarse_budget = (dims.x + dims.y + dims.z) * 16;
   let coarse_limit = u32(coarse_budget) * 3u;
+  // 主世界（idx=0，identity：局部=世界）：局部 AABB = 窗口 AABB（origin 可为负，
+  // [0,256]³ 默认盒会把窗口绝大部分 slab 剔除）；物体 = 单 chunk 局部 [0,256]³。
+  let is_world = idx == 0u;
+  let l_mn = select(vec3<f32>(0.0), d.aabb_min.xyz, is_world);
+  let l_mx = select(vec3<f32>(f32(CHUNK_SIZE)), d.aabb_max.xyz, is_world);
   return Grid(
     d.aabb_min.xyz, d.aabb_max.xyz,       // 世界 AABB
-    vec3<f32>(0.0), vec3<f32>(f32(CHUNK_SIZE)),  // 局部 AABB [0,256]³
+    l_mn, l_mx,                            // 局部 AABB
     cc_min, cc_max,
     coarse_limit,
     d.rot0.xyz, d.rot1.xyz, d.rot2.xyz,    // 旋转矩阵列

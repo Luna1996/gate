@@ -13,19 +13,30 @@
 use super::coords::{child_linear_idx, BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT};
 
 /// 结构化节点（编辑用）
+///
+/// 内存约束：N=10 场景树节点量级在百万，每节点字节数直接决定能否启动
+/// （64 槽 Vec<Option<usize>> = 552B/节点曾致 5.9GB OOM）。紧凑 child 表
+/// 与 GPU wire 格式同构：只存 mask bit=1 的子块（按位序）。
 #[derive(Debug, Clone)]
 enum Node {
   /// uniform leaf：整 brick 同一 palette
   Uniform(u8),
-  /// 分裂节点：64 个子块，mask bit=1 表示子块被分裂
+  /// 分裂节点：mask bit=1 的子块有独立节点，bit=0 = uniform（颜色 = palette）
   Split {
     mask: u64,
-    /// 64 子块：每个是 uniform 颜色（palette）或分裂节点索引
-    /// None 表示这个子块和 parent palette 相同（uniform，不存独立子节点）
-    children: Vec<Option<usize>>,
+    /// 紧凑 child 表（按 mask 位序）：children[j] = 第 j 个 bit=1 子块的
+    /// nodes 下标；j = popcount(mask & (bit_i - 1))。len() == popcount(mask)
+    children: Vec<u32>,
     /// uniform 子块的默认 palette（mask bit=0 时子块颜色 = 此值）
     palette: u8,
   },
+}
+
+/// mask 中子块位序 i → 紧凑表下标（GPU DDA 同款 popcount 定位，O(1)）
+#[inline]
+fn child_slot(mask: u64, i: u32) -> u32 {
+  debug_assert!(i < 64 && (mask & (1u64 << i)) != 0, "child_slot 要求 bit=1");
+  (mask & ((1u64 << i) - 1)).count_ones()
 }
 
 /// Douglas Brick Tree 1:1（分裂树，4³=64 分裂因子，u64 mask）
@@ -69,18 +80,12 @@ impl ChunkTree {
       out.push(0); // mask high
       out.push(self.root_palette as u32);
     } else {
-      self.serialize_node(Some(0), self.root_palette, CHUNK_SIZE, &mut out);
+      self.serialize_node(Some(0), CHUNK_SIZE, &mut out);
     }
     out
   }
 
-  fn serialize_node(
-    &self,
-    idx: Option<usize>,
-    default_palette: u8,
-    extent: i32,
-    out: &mut Vec<u32>,
-  ) {
+  fn serialize_node(&self, idx: Option<usize>, extent: i32, out: &mut Vec<u32>) {
     let (mask, palette_u32) = match idx {
       None => (0u64, self.root_palette as u32),
       Some(i) => match &self.nodes[i] {
@@ -114,11 +119,9 @@ impl ChunkTree {
         out[offsets_start + slot] = child_offset;
         slot += 1;
 
-        // 这个子块的 palette：children[i] 是分裂节点索引，或 None
-        // children[i] 的 default_palette 取决于它是 split 还是 uniform
         let child_idx = match idx {
           Some(p) => match &self.nodes[p] {
-            Node::Split { children, .. } => children[i as usize],
+            Node::Split { children, .. } => children[child_slot(mask, i) as usize] as usize,
             _ => unreachable!(),
           },
           None => {
@@ -127,17 +130,7 @@ impl ChunkTree {
             unreachable!()
           }
         };
-        let child_default = match child_idx {
-          Some(ci) => match &self.nodes[ci] {
-            Node::Uniform(p) => *p,
-            Node::Split { palette, .. } => *palette,
-          },
-          None => {
-            // mask bit=1 但没有子节点索引？不应该
-            default_palette
-          }
-        };
-        self.serialize_node(child_idx, child_default, child_extent, out);
+        self.serialize_node(Some(child_idx), child_extent, out);
       }
     }
   }
@@ -213,7 +206,7 @@ impl ChunkTree {
     // 分裂子块：下钻
     let p = idx.unwrap();
     let child_idx = match &self.nodes[p] {
-      Node::Split { children, .. } => children[child_i as usize],
+      Node::Split { children, .. } => children[child_slot(mask, child_i) as usize] as usize,
       _ => unreachable!(),
     };
     let next_x = x - ix * child_extent;
@@ -221,7 +214,7 @@ impl ChunkTree {
     let next_z = z - iz * child_extent;
 
     self.get_at(
-      next_x, next_y, next_z, child_idx, child_extent,
+      next_x, next_y, next_z, Some(child_idx), child_extent,
     )
   }
 
@@ -268,10 +261,7 @@ impl ChunkTree {
       for i in 0u32..64 {
         let bit = 1u64 << i;
         let c: Option<u8> = if (mask & bit) != 0 {
-          match children[i as usize] {
-            Some(ci) => self.first_uniform_color(ci),
-            None => Some(palette),
-          }
+          self.first_uniform_color(children[child_slot(mask, i) as usize] as usize)
         } else {
           Some(palette)
         };
@@ -304,7 +294,7 @@ impl ChunkTree {
 
     let p = idx.unwrap();
     let child_idx = match &self.nodes[p] {
-      Node::Split { children, .. } => children[child_i as usize],
+      Node::Split { children, .. } => children[child_slot(mask, child_i) as usize] as usize,
       _ => unreachable!(),
     };
     self.get_uniform_at(
@@ -312,7 +302,7 @@ impl ChunkTree {
       y - iy * child_extent,
       z - iz * child_extent,
       query_extent,
-      child_idx,
+      Some(child_idx),
       child_extent,
     )
   }
@@ -321,16 +311,13 @@ impl ChunkTree {
     match &self.nodes[idx] {
       Node::Uniform(p) => if *p == 0 { None } else { Some(*p) },
       Node::Split { mask, children, palette, .. } => {
-        let i = mask.trailing_zeros() as usize;
-        let bit = 1u64 << i;
-        if (mask & bit) != 0 {
-          match children[i] {
-            Some(ci) => self.first_uniform_color(ci),
-            None => if *palette == 0 { None } else { Some(*palette) },
-          }
-        } else {
-          if *palette == 0 { None } else { Some(*palette) }
+        if *mask == 0 {
+          // lazy Split：整节点 uniform（防御 trailing_zeros(0)=64 越界）
+          return if *palette == 0 { None } else { Some(*palette) };
         }
+        let i = mask.trailing_zeros();
+        // mask bit=1 ⇔ 紧凑表有该子块（不变式），直接取首个 bit=1 子块颜色
+        self.first_uniform_color(children[child_slot(*mask, i) as usize] as usize)
       }
     }
   }
@@ -341,9 +328,8 @@ impl ChunkTree {
 
   /// 填充对齐 brick（extent ∈ LEVEL_EXTENT）：树路径 O(depth) 写入。
   ///
-  /// 大体积均匀填充专用——逐体素 [`Self::set_voxel`] 每个新 4³ 块要分裂 65 个
-  /// 节点（SPLIT_ALL），百万级填充会内存爆炸；brick 级写与 GPU wire 格式的
-  /// Uniform 节点同构。返回：是否实际修改。
+  /// 大体积均匀填充专用：一次调用只沿路径创建 ≤depth 个节点（lazy split），
+  /// 比逐体素 [`Self::set_voxel`] 少 64× 节点创建。返回：是否实际修改。
   pub fn fill_brick(&mut self, local: [i32; 3], extent: i32, palette: u8) -> bool {
     assert!(
       LEVEL_EXTENT.contains(&extent),
@@ -401,22 +387,14 @@ impl ChunkTree {
       node_idx = Some(0);
     }
     if node_idx.is_none() {
-      // root uniform（nodes 为空）→ 创建 split root
+      // root uniform（nodes 为空）→ 创建 split root（lazy：mask=0，紧凑表为空）
       let cur = self.root_palette;
       let split_idx = self.nodes.len();
-      self.nodes.push(Node::Split { mask: 0, palette: cur, children: vec![None; 64] });
-      let start = self.nodes.len();
-      for _ in 0..64 {
-        self.nodes.push(Node::Uniform(cur));
-      }
-      let split = &mut self.nodes[split_idx];
-      if let Node::Split { mask, children, palette } = split {
-        *mask = 0xFFFFFFFFFFFFFFFF;
-        *palette = cur;
-        for i in 0..64 {
-          children[i] = Some(start + i);
-        }
-      }
+      self.nodes.push(Node::Split {
+        mask: 0,
+        palette: cur,
+        children: Vec::new(),
+      });
       node_idx = Some(split_idx);
     }
 
@@ -425,17 +403,40 @@ impl ChunkTree {
     let ix = x[0] / child_extent;
     let iy = x[1] / child_extent;
     let iz = x[2] / child_extent;
-    let child_i = child_linear_idx(ix, iy, iz) as usize;
-    let child_idx = match &self.nodes[p] {
-      Node::Split { children, .. } => children[child_i],
+    let child_i = child_linear_idx(ix, iy, iz) as u32;
+    // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
+    // 首次编辑才创建节点 + 置 bit + 紧凑表插入
+    let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
+      Node::Split { mask, palette, children } => {
+        let bit = 1u64 << child_i;
+        let ci = if (mask & bit) != 0 {
+          Some(children[child_slot(*mask, child_i) as usize] as usize)
+        } else {
+          None
+        };
+        (ci, *palette, *mask)
+      }
       _ => unreachable!(),
+    };
+    let child_idx = match child_idx {
+      Some(ci) => ci,
+      None => {
+        let new = self.nodes.len() as u32;
+        self.nodes.push(Node::Uniform(parent_pal));
+        if let Node::Split { mask, children, .. } = &mut self.nodes[p] {
+          let slot = child_slot(cur_mask | (1u64 << child_i), child_i) as usize;
+          children.insert(slot, new);
+          *mask |= 1u64 << child_i;
+        }
+        new as usize
+      }
     };
     let next = [
       x[0] - ix * child_extent,
       x[1] - iy * child_extent,
       x[2] - iz * child_extent,
     ];
-    self.fill_recursive(next, extent, palette, child_idx, child_extent);
+    self.fill_recursive(next, extent, palette, Some(child_idx), child_extent);
     // 回溯：try merge
     self.try_merge(p);
   }
@@ -493,108 +494,114 @@ impl ChunkTree {
 
     // 如果是 root uniform（idx=None, nodes 为空），需要把 root 变成 split
     if node_idx.is_none() {
-      // 创建 split root
+      // 创建 split root（lazy：mask=0，紧凑表为空，子节点按需创建）
       let split_idx = self.nodes.len();
-      self.nodes.push(Node::Split { mask: 0, palette: self.root_palette, children: vec![None; 64] });
-      // 创建 64 个 Uniform(cur_palette) 子节点
-      let start = self.nodes.len();
-      for _ in 0..64 {
-        self.nodes.push(Node::Uniform(cur_palette));
-      }
-      // 更新 split_idx 的 mask + children
-      let split = &mut self.nodes[split_idx];
-      if let Node::Split { mask, children, palette } = split {
-        *mask = 0xFFFFFFFFFFFFFFFF;
-        *palette = cur_palette;
-        for i in 0..64 {
-          children[i] = Some(start + i);
-        }
-      }
+      self.nodes.push(Node::Split {
+        mask: 0,
+        palette: cur_palette,
+        children: Vec::new(),
+      });
       node_idx = Some(split_idx);
     }
 
     let p = node_idx.unwrap();
-    let children = match &self.nodes[p] {
-      Node::Split { children, .. } => children.clone(),
-      _ => unreachable!(),
-    };
-
     let child_extent = extent / BRICK_FACTOR;
     let ix = (x / child_extent).clamp(0, BRICK_FACTOR - 1);
     let iy = (y / child_extent).clamp(0, BRICK_FACTOR - 1);
     let iz = (z / child_extent).clamp(0, BRICK_FACTOR - 1);
-    let child_i = child_linear_idx(ix, iy, iz);
+    let child_i = child_linear_idx(ix, iy, iz) as u32;
     let next_x = x - ix * child_extent;
     let next_y = y - iy * child_extent;
     let next_z = z - iz * child_extent;
 
-    // mask bit=0 且 children[child_i] = None → 这个子块还不存在（uniform = parent palette）
-    // 需要创建 split node 并 replace
-    let child_idx = children[child_i as usize];
-    self.set_recursive(next_x, next_y, next_z, palette, child_idx, child_extent);
-
-    // 更新 children 里可能新增的节点引用
-    // （如果 uniform leaf 被 split 了，children[child_i] 现在应该指向新节点）
+    // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
+    // 首次编辑才创建节点 + 置 bit + 紧凑表插入
+    let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
+      Node::Split { mask, palette, children } => {
+        let bit = 1u64 << child_i;
+        let ci = if (mask & bit) != 0 {
+          Some(children[child_slot(*mask, child_i) as usize] as usize)
+        } else {
+          None
+        };
+        (ci, *palette, *mask)
+      }
+      _ => unreachable!(),
+    };
+    let child_idx = match child_idx {
+      Some(ci) => ci,
+      None => {
+        let new = self.nodes.len() as u32;
+        self.nodes.push(Node::Uniform(parent_pal));
+        if let Node::Split { mask, children, .. } = &mut self.nodes[p] {
+          let slot = child_slot(cur_mask | (1u64 << child_i), child_i) as usize;
+          children.insert(slot, new);
+          *mask |= 1u64 << child_i;
+        }
+        new as usize
+      }
+    };
+    self.set_recursive(next_x, next_y, next_z, palette, Some(child_idx), child_extent);
 
     // 回溯：try merge
     self.try_merge(p);
   }
 
-  /// 把一个 uniform 节点变成 split 节点（64 个 uniform 子节点 = old_palette）
+  /// 把一个 uniform 节点变成 split 节点（lazy：mask=0 全 uniform，子节点按需创建）
+  ///
+  /// Douglas 语义（devlog #17）：mask bit=0 → uniform leaf（颜色 = 父节点
+  /// palette_u32），**不占内存**。只有真正被编辑的子块才置 bit + 建节点。
+  /// 旧实现（SPLIT_ALL + 64 个同色 Uniform 子节点）每 4³ 块浪费 65 节点
+  /// （≈36KB），大场景编辑内存爆炸 ~65×。
   fn split_uniform(&mut self, idx: usize, old_palette: u8) {
-    // 创建 64 个 Uniform 子节点
-    let start = self.nodes.len();
-    for _ in 0..64 {
-      self.nodes.push(Node::Uniform(old_palette));
-    }
-    let mut children = vec![None; 64];
-    for i in 0..64 {
-      children[i] = Some(start + i);
-    }
     self.nodes[idx] = Node::Split {
-      mask: 0xFFFFFFFFFFFFFFFF,
+      mask: 0,
       palette: old_palette,
-      children,
+      children: Vec::new(),
     };
   }
 
   fn try_merge(&mut self, idx: usize) {
-    let split = match &self.nodes[idx] {
-      Node::Split { mask, children, palette } => (*mask, children.clone(), *palette),
+    let (mask, palette) = match &self.nodes[idx] {
+      Node::Split { mask, palette, .. } => (*mask, *palette),
       _ => return,
     };
-    let (mask, children, palette) = split;
 
     if mask == 0 {
       return;
     }
 
+    // 阶段 1：只读扫描（零分配；旧实现 clone 64 槽 children Vec，
+    // 每次 512B × 百万级调用 = 巨量分配流量拖慢编辑 + 内存高水位）
     let mut first_color: Option<u8> = None;
     let mut all_uniform_same = true;
-
-    for i in 0u32..64 {
-      let bit = 1u64 << i;
-      let c: Option<u8> = if (mask & bit) != 0 {
-        match children[i as usize] {
-          Some(ci) => match &self.nodes[ci] {
+    {
+      let children = match &self.nodes[idx] {
+        Node::Split { children, .. } => children,
+        _ => unreachable!(),
+      };
+      for i in 0u32..64 {
+        let bit = 1u64 << i;
+        let c: Option<u8> = if (mask & bit) != 0 {
+          match &self.nodes[children[child_slot(mask, i) as usize] as usize] {
             Node::Uniform(p) => Some(*p),
             Node::Split { .. } => { all_uniform_same = false; break; }
-          },
-          None => Some(palette),
-        }
-      } else {
-        Some(palette)
-      };
-      match c {
-        None => {}
-        Some(c) => match first_color {
-          None => first_color = Some(c),
-          Some(f) if f != c => { all_uniform_same = false; break; }
-          _ => {}
+          }
+        } else {
+          Some(palette)
+        };
+        match c {
+          None => {}
+          Some(c) => match first_color {
+            None => first_color = Some(c),
+            Some(f) if f != c => { all_uniform_same = false; break; }
+            _ => {}
+          }
         }
       }
-    }
+    } // children 不可变借用结束
 
+    // 阶段 2：可变写
     if all_uniform_same {
       let merged = first_color.unwrap_or(0);
       if idx == 0 {
@@ -617,9 +624,9 @@ impl ChunkTree {
 
   /// GC：重建 nodes Vec 只保留 root 可达的有效节点，回收废弃索引
   ///
-  /// 编辑（set_voxel/fill_brick/clear）过程中 split_uniform 创建 65 节点，
-  /// try_merge 合并同色后子节点变废但仍在 Vec（容量只增不减）。长时间编辑后
-  /// nodes 膨胀到 GB 级——本方法 DFS 标记可达节点，compact 到连续新 Vec，
+  /// 编辑（set_voxel/fill_brick/clear）过程中 split + try_merge 会留下被
+  /// merge 掉的子节点（索引变废但仍在 Vec，容量只增不减）。长时间编辑后
+  /// nodes 膨胀——本方法 DFS 标记可达节点，compact 到连续新 Vec，
   /// 重写 children 索引。O(n) 时间 + O(n) 临时空间，编辑完成后调一次即可。
   pub fn compact(&mut self) {
     if self.nodes.len() <= 1 {
@@ -632,9 +639,7 @@ impl ChunkTree {
     for n in new_nodes.iter_mut() {
       if let Node::Split { children, .. } = n {
         for c in children.iter_mut() {
-          if let Some(old) = *c {
-            *c = Some(idx_map[old]);
-          }
+          *c = idx_map[*c as usize] as u32;
         }
       }
     }
@@ -658,10 +663,8 @@ impl ChunkTree {
     map[old] = new_idx;
     out.push(self.nodes[old].clone());
     if let Node::Split { children, .. } = &self.nodes[old] {
-      for c in children.iter() {
-        if let Some(child_old) = c {
-          self.collect_reachable(Some(*child_old), out, map);
-        }
+      for &c in children.iter() {
+        self.collect_reachable(Some(c as usize), out, map);
       }
     }
   }
@@ -800,11 +803,16 @@ mod tests {
     t.set_voxel(100, 100, 100, 7);
     let ser = t.serialize();
     assert!(ser.len() >= 3);
-    // root 应该是 split
+    // root 是 split：只有 (100,100,100) 所在 64³ 子块的 bit=1（lazy split，
+    // mask bit=0 子块 = uniform AIR，不占 child offset——Douglas #17 语义）
     let mask = (ser[1] as u64) << 32 | ser[0] as u64;
-    assert_eq!(mask, 0xFFFFFFFFFFFFFFFF);
-    // 有 64 个 child offset
-    assert!(ser.len() >= 3 + 64);
+    assert_ne!(mask, 0);
+    assert_eq!(mask.count_ones(), 1, "lazy split：单 bit 而非 SPLIT_ALL");
+    // 只有 1 个 child offset（紧凑存储）
+    assert_eq!(ser.len(), 3 + 1 + 3 + 1 + 3 + 1 + 3 + 1 + 3);
+    // 序列化后读回语义不变
+    assert_eq!(t.get_voxel(100, 100, 100), Some(7));
+    assert_eq!(t.get_voxel(0, 0, 0), None);
   }
 
   #[test]

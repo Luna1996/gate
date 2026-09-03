@@ -232,10 +232,25 @@ else child_offset = nodes[idx + 3 + popcount(mask & (bit-1))]  // 单 cycle popc
 
 ---
 
+## CPU 编辑层性能约束（2026-09-03 确立，违反即启动卡死/内存爆炸）
+
+N=10 场景构建 78s 卡死 + 5.9GB OOM → 全部修复后 N=10 实测：1264 chunks 场景 53.4s 构建 / 树输出 247MB / build_full 415ms / 稳定渲染：
+
+1. **lazy split 是 Douglas 语义的一部分**（devlog #17）：split_uniform 必须 `Split { mask: 0, children 全 None }`，编辑落到哪个子块才置 bit + 建 1 节点。禁止「SPLIT_ALL + 64 个同色 Uniform 子节点」写法（每 4³ 块 65 节点 ≈ 36KB，65× 内存浪费）；`first_uniform_color` 需防御 mask=0（trailing_zeros(0)=64 越界）
+2. **Node 用紧凑 child 表（与 GPU wire 同构）**：`children: Vec<u32>` 只存 mask bit=1 的子块（`child_slot(mask,i) = popcount(mask & (bit-1))` 定位，O(1)），禁用 `Vec<Option<usize>>` 64 槽（552B/节点 → 40B，14×）。插入用 `children.insert(slot, idx)`（壳区域槽位少，O(n) 可忽略）
+3. **编辑热路径禁止 clone children Vec**：try_merge 用两阶段（只读扫描 + 可变写），每次 clone 64 槽（512B）× 百万级调用 = 巨量分配流量
+4. **大体积球/盒填充必须 4³ 分块**：fill_sphere/fill_box 整块命中走 fill_brick（O(depth)），仅边缘壳逐体素；纯逐体素 set_voxel 对大球是数亿次 O(depth) 调用
+5. **场景尺寸参数必须 4 对齐**：terrain_h 输出 `& !3`、snow_line=40、河床层高 4 的倍数——非对齐高度使每列顶部边缘块退化为逐体素 1³ 编辑 → 4³ Split 碎片化，树序列化输出 1935MB → 247MB（8×）。阶梯化 4 级符合像素风
+6. **demo 场景坐标必须随 EXT_FINE 缩放校验**：世界外的循环体素/簇会导致 placed 永不达标 → 计数器 i32 溢出 panic（已加簇中心超界 continue）
+
+分节耗时（N=10，5120²）：地形 47.5s / 浮空岛 5.4s / 其余 <0.6s / compact_all 2.7s / build_full 0.42s。剩余大头是地形列循环的 400 万级 fill_brick 调用（CPU 编辑层 40B/节点紧凑表已达标；再优化需 batch/延迟 serialize，属 Phase 4+ 范畴）。
+
+---
+
 ## 已知限制
 
 - Phase 0 serialize() 每次调用全量 DFS flatten——编辑频繁但 serialize 很少（只在上传 GPU 前调用），实际开销可控
-- split_uniform_leaf 总是 SPLIT_ALL——uniform 大块分裂产生 64 个 child，然后 merge 回溯。没有"只分裂 mask bit=1 的子块"的动态行为
+- CPU 编辑层 Node ≈ 552B/节点（children: Vec<Option<usize>> 64×8B），约为 GPU wire 格式（3 words + 4B/child）的 35×。当前量级可接受；若后期 CPU 侧内存成为瓶颈可压缩 children 布局
 - 无 per-voxel normal（Douglas #22 也没了，符合 1:1 复刻）
 - VRAM 从 ~2GB 降到 ~350MB（TileIndex/CellDirs/TileBitmaps/b_leaves 全删）
 
