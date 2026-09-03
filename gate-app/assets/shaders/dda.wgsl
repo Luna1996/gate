@@ -65,10 +65,7 @@ fn face_color_from_index(f: u32) -> vec3<f32> {
   return vec3<f32>(1.0);
 }
 
-// palette 解包已并入 hit_mat(g.palette_base, pal)——多 volume 拼接后必须带
-// palette_base 偏移，否则会读到别的 volume 的颜色。
-
-// --- BG0：输出 + 视图 uniform（v5 single-pass per-pixel shade_hit）---
+// --- BG0：输出 + 视图 uniform ---
 // @binding(0) = out storage write（rgba8unorm，linear RGB；ACES → sRGB 后输出）
 // @binding(1) = uniform DdaViewUniform
 @group(0) @binding(0) var out_tex: texture_storage_2d<rgba8unorm, write>;
@@ -134,31 +131,6 @@ struct GridDesc {
   _pad1: u32,
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
-
-// ---- BG3：光源池（P3.1；P3.2 发光元件并入，816B：48B header + 16×48B）----
-struct LightGlobals {
-  count: u32,
-  _pad0: u32,
-  _pad1: u32,
-  _pad2: u32,
-  ambient: vec4<f32>,      // rgb = 环境色（线性），w reserved
-  exposure_pad: vec4<f32>, // x = 曝光系数
-}
-struct LightDesc {
-  // x = kind（0 = 方向光 / 1 = 点光）；yzw = L 轴（指向光，已归一，方向光）或球心位置（fine，点光）
-  kind_pos_dir: vec4<f32>,
-  // rgb = 线性色，w = 强度（方向光无量纲；点光为米制衰减系数）
-  color_intensity: vec4<f32>,
-  // x = 方向光盘角半径（rad）/ 点光球半径（fine）
-  shape: vec4<f32>,
-}
-struct LightPool {
-  g: LightGlobals,
-  lights: array<LightDesc, 8u>,
-  sky_top: vec4<f32>,
-  sky_horizon: vec4<f32>,
-}
-@group(3) @binding(0) var<uniform> light_u: LightPool;
 
 
 // 统一网格上下文——一套 DDA 跑所有网格（主世界 + 物体）
@@ -493,22 +465,22 @@ struct UnifiedHit {
 // 【性能】参数直接传 volume 索引（不传 15 字段 Grid 结构体）——WGSL 函数大结构体
 // 按值传参在 naga/驱动下实测有 ~µs 级开销（slab_box 内联 17ms→2.75ms 实证）；
 // slab 也直接内联（原 slab_box 调用版实测 17ms 纯调用开销）
-fn trace_grid_idx(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> UnifiedHit {
-  let d = grid_descs[idx];
-  let w_mn = d.aabb_min.xyz;
-  let w_mx = d.aabb_max.xyz;
-  let is_world = idx == 0u;
-  let l_min = select(vec3<f32>(0.0), d.aabb_min.xyz, is_world);
-  let l_max = select(vec3<f32>(f32(CHUNK_SIZE)), d.aabb_max.xyz, is_world);
-  let obj_id = select(-1i, i32(idx), idx > 0u);
-  let index_origin = vec3<i32>(d.index_origin_x, d.index_origin_y, d.index_origin_z);
-  let index_dims = vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z);
-  let tree_base = d.tree_base;
-  let dims_i = vec3<i32>(i32(d.index_dims_x), i32(d.index_dims_y), i32(d.index_dims_z));
-  let max_chunk_steps = u32(dims_i.x + dims_i.y + dims_i.z) * 3u + 16u;
-  let col0 = d.rot0.xyz;
-  let col1 = d.rot1.xyz;
-  let col2 = d.rot2.xyz;
+// trace_grid 版本：接收 Grid 参数（make_grid 已读过 grid_descs，一次读完），
+// 消除旧 trace_grid_idx 内部重复读 grid_descs[idx] 的 storage buffer 双读。
+// 原 trace_grid_idx(idx,...) 改名并改签名。
+fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> UnifiedHit {
+  let w_mn = g.w_mn;
+  let w_mx = g.w_mx;
+  let l_min = g.l_min;
+  let l_max = g.l_max;
+  let index_origin = g.index_origin;
+  let index_dims = g.index_dims;
+  let tree_base = g.tree_base;
+  let max_chunk_steps = g.max_chunk_steps;
+  let col0 = g.col0;
+  let col1 = g.col1;
+  let col2 = g.col2;
+  let obj_id = g.obj_id;
   let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, obj_id);
   // ---- 世界 AABB 预剔除（slab 内联）----
   var bx_enter = 0.0;
@@ -541,10 +513,10 @@ fn trace_grid_idx(idx: u32, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Un
   let t_hi_cap = min(bx_exit, t_cap);
   if (t_hi_cap <= max(bx_enter, 0.0)) { return miss; }
   // ---- 局部变换 ----
-  let wp = origin - d.pos_scale.xyz;
-  let scale = d.pos_scale.w;
-  let ro = vec3<f32>(dot(wp, d.rot0.xyz), dot(wp, d.rot1.xyz), dot(wp, d.rot2.xyz)) / scale;
-  let rd = vec3<f32>(dot(dir, d.rot0.xyz), dot(dir, d.rot1.xyz), dot(dir, d.rot2.xyz)) / scale;
+  let wp = origin - g.pos;
+  let scale = g.scale;
+  let ro = vec3<f32>(dot(wp, col0), dot(wp, col1), dot(wp, col2)) / scale;
+  let rd = vec3<f32>(dot(dir, col0), dot(dir, col1), dot(dir, col2)) / scale;
   // ---- 局部 AABB slab（内联）----
   var tl_enter = 0.0;
   var tl_exit = t_hi_cap;
@@ -672,65 +644,14 @@ fn make_grid(idx: u32) -> Grid {
 }
 
 
-// 遮挡快路径（阴影射线）：[0, t_max) 内任一 volume 命中即 true。
-// Phase 3 统一：遍历 grid_descs[0..arrayLength]，零 world/obj 分支。
-fn scene_occluded(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> bool {
-  let n = arrayLength(&grid_descs);
-  for (var i: u32 = 0u; i < n; i = i + 1u) {
-    let mh = trace_grid_idx(i, origin, dir, t_max);
-    if (mh.hit) { return true; }
-  }
-  return false;
-}
-
-// ============================================================================
-// Douglas devlog #02 基础光影：方向光硬阴影 + sky 渐变环境光 + 发光体素 radiance 直出
-// - 方向光：命中点向太阳投 1 条射线，不通即阴影（硬阴影，无锥采样）
-// - sky 渐变环境光：按法线 y 混合天顶/地平线
-// - 发光体素直出：albedo × emissive × GAIN，无方向性、不受阴影
-// - 无点光源、无 Phong 高光
-// ============================================================================
-
-const SHADOW_BIAS: f32 = 0.5;
-const SHADOW_DIR_T_MAX: f32 = 65536.0;
-const EMISSIVE_EMIT_GAIN: f32 = 4.0;
-
-// 命中点材质：palette 两 words 解包 albedo + roughness + emissive
-// roughness 保留（palette 数据完整性），但 Douglas 方案高光已删除
-struct HitMat {
-  albedo: vec3<f32>,
-  rough: f32,
-  emissive: f32,
-}
-// Phase 3 统一：palette_base 参数替代 obj 分支——主世界 + 物体都从
-// b_palette[palette_base + pal*2..] 取色，零 kind 分支。
-fn hit_mat(palette_base: u32, pal: u32) -> HitMat {
+// ---- palette albedo 解包 ----
+fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   let w0 = b_palette[palette_base + pal * 2u];
-  let w1 = b_palette[palette_base + pal * 2u + 1u];
-  return HitMat(
-    vec3<f32>(
-      f32(w0 & 0xFFu),
-      f32((w0 >> 8u) & 0xFFu),
-      f32((w0 >> 16u) & 0xFFu),
-    ) / 255.0,
-    f32((w0 >> 24u) & 0xFFu) / 255.0,
-    f32(w1 & 0xFFu) / 255.0,
-  );
-}
-
-// ============================================================================
-// P3.5 色调映射 + 颜色空间转换
-// ============================================================================
-
-// ACES Filmic 色调映射（简化版，Narkowicz 近似）
-// 把 HDR 线性值压缩进 [0,1]，高光不截断、暗部不发黑
-fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
-  let a = 2.51;
-  let b = 0.03;
-  let c = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+  return vec3<f32>(
+    f32(w0 & 0xFFu),
+    f32((w0 >> 8u) & 0xFFu),
+    f32((w0 >> 16u) & 0xFFu),
+  ) / 255.0;
 }
 
 // 线性 → sRGB 转换
@@ -744,91 +665,7 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 // ============================================================================
-// sky(dir) → 线性色（渐变 + 太阳辉光晕）
-// Douglas 方案：无软阴影太阳盘（方向光硬阴影 shape.x = 0），只保留渐变 + 轻微 glow
-// ============================================================================
-fn sky(dir: vec3<f32>) -> vec3<f32> {
-  let d = normalize(dir);
-  let h = clamp(d.y, 0.0, 1.0);
-  let t = smoothstep(0.0, 0.35, h);
-  var col: vec3<f32> = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, t);
-  if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
-    let sdir = light_u.lights[0].kind_pos_dir.yzw;
-    let cos_a = max(dot(d, sdir), 0.0);
-    let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    let glow = pow(max(cos_a, 0.0), 64.0) * 0.05 * select(1.0, 0.0, h > 0.0);
-    col = col + sun_c * glow;
-  }
-  return col;
-}
-
-// ============================================================================
-// Douglas devlog #22 implicit normals：GPU 运行时按邻域体素 occupancy 有限差分
-// - 命中体素中心 + 6 方向采样 → 密度差 → 连续 per-voxel 法向
-// - 不存储、不烘焙、随 DDA trace 实时算（比 Douglas 的 upload-time bake 更动态）
-// - 主世界用 sample_brickmap（2~3 级寻址）；物体暂用 DDA 面法向（obj_id >= 0 跳过）
-// Phase 3 统一：sample_brickmap 走 Grid 参数（g.tree_base + g.index_origin/dims）。
-// ============================================================================
-fn compute_implicit_normal(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t: f32, dda_n: vec3<f32>) -> vec3<f32> {
-  // debug_mode.w（诊断开关）：跳过 6 邻域点采样，直接用 DDA 面法线
-  if (g.obj_id >= 0 || view_u.debug_mode.w > 0.5) { return dda_n; }
-  let hit_pos = origin + dir * t;
-  // dda_n 指向外部（射线来向）；沿 -dda_n 微偏 → 命中体素中心
-  let hit_fc = vec3<i32>(floor(hit_pos - dda_n * 0.001));
-  // 6 邻域 occupancy（1 = 实心，0 = 空气）
-  let sx_n = f32(sample_brickmap(g, hit_fc + vec3<i32>(-1, 0, 0)) != 0u);
-  let sx_p = f32(sample_brickmap(g, hit_fc + vec3<i32>( 1, 0, 0)) != 0u);
-  let sy_n = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0,-1, 0)) != 0u);
-  let sy_p = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0, 1, 0)) != 0u);
-  let sz_n = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0, 0,-1)) != 0u);
-  let sz_p = f32(sample_brickmap(g, hit_fc + vec3<i32>( 0, 0, 1)) != 0u);
-  let raw = vec3<f32>(sx_n - sx_p, sy_n - sy_p, sz_n - sz_p);
-  let len2 = dot(raw, raw);
-  return normalize(mix(dda_n, raw, 0.5));
-}
-
-// Douglas devlog #02 基础光影合成：
-// 1. sky 渐变环境光（按法线 y）
-// 2. 方向光硬阴影（命中点向太阳投 1 条射线，不通即阴影）
-// 3. 发光体素 radiance 直出（无方向性、不受阴影）
-// 无点光源、无 Phong 高光
-// Per-pixel shading 入口（douglas #02/#22 基础光影）。
-// Phase 3 统一：Grid 参数携带 palette_base（hit_mat 取色）+ obj_id（implicit normal 分流）。
-fn shade_hit(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t: f32, pal: u32, dda_n: vec3<f32>,
-             shadow_t_max: f32) -> vec3<f32> {
-  let n = compute_implicit_normal(g, origin, dir, t, dda_n);
-  let p = origin + dir * t;
-  let mat = hit_mat(g.palette_base, pal);
-  let base = mat.albedo;
-
-  // sky 渐变环境光
-  let h = clamp(n.y, 0.0, 1.0);
-  let sky_grad = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, smoothstep(0.0, 0.35, h));
-  var col: vec3<f32> = base * (light_u.g.ambient.xyz * 0.4 + sky_grad * 0.6);
-
-  // 方向光硬阴影（Devlog #02：1 条射线，不通即阴影）。
-  // debug_mode.z（诊断开关）：跳过阴影射线（性能定位）
-  if (light_u.g.count > 0u && view_u.debug_mode.z < 0.5) {
-    let ld = light_u.lights[0];
-    if (ld.kind_pos_dir.x < 0.5) {
-      let l_axis = ld.kind_pos_dir.yzw;
-      let ndl = max(dot(n, l_axis), 0.0);
-      if (ndl > 0.0) {
-        let o = p + n * SHADOW_BIAS;
-        let vis = select(0.0, 1.0, !scene_occluded(o, l_axis, SHADOW_DIR_T_MAX));
-        let c = ld.color_intensity.xyz * ld.color_intensity.w;
-        col = col + base * c * (ndl * vis);
-      }
-    }
-  }
-
-  // 发光体素 radiance 直出（Devlog #19 radiance 分支 3 的直接光版本）
-  col = col + base * (mat.emissive * EMISSIVE_EMIT_GAIN);
-  return col * light_u.g.exposure_pad.x;
-}
-
-// ============================================================================
-// DDA 主入口：每个像素 = workgroup 内一个 invocation（8x8x1）
+// DDA 主入口：unlit — 命中 → palette albedo 直出，miss → 天空色常量
 // ============================================================================
 @compute @workgroup_size(8, 8, 1)
 fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -836,16 +673,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  // debug_mode.w > 1.5（诊断模式 2）：跳过全部 trace，直接天空色输出
-  // （把 17ms 固定开销二分：反投影+输出 vs make_grid/trace_grid 框架）
+  // debug_mode.w > 1.5（诊断模式）：跳过全部 trace，直接天空色输出
   if (view_u.debug_mode.w > 1.5) {
-    let px0 = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
-    let uv0 = vec2<f32>(px0.x * 2.0 - 1.0, 1.0 - px0.y * 2.0);
-    let nh = view_u.inv_view_proj * vec4<f32>(uv0.x, uv0.y, 1.0, 1.0);
-    let fw = view_u.cam_pos_fine.xyz + (nh.xyz / nh.w - view_u.cam_pos_fine.xyz);
-    var col0 = sky(normalize(fw - view_u.cam_pos_fine.xyz));
-    col0 = linear_to_srgb(aces_tonemap(col0));
-    textureStore(out_tex, coord0, vec4<f32>(col0, 1.0));
+    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(vec3<f32>(0.52, 0.80, 1.0)), 1.0));
     return;
   }
 
@@ -864,63 +694,53 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let origin_fine = view_u.cam_pos_fine.xyz;
   let n = arrayLength(&grid_descs);
 
-  // debug_mode.w > 3.5（诊断模式 3）：只做 make_grid（读 GridDesc）不 trace
-  // ——测量 make_grid 本身的成本（skip_chunkwalk 17ms 的最后嫌疑点）
+  // debug_mode.w > 3.5（诊断模式）：只做 make_grid（读 GridDesc）不 trace
   if (view_u.debug_mode.w > 3.5) {
     var sink = 0u;
     for (var i: u32 = 0u; i < n; i = i + 1u) {
       let gg = make_grid(i);
       sink = sink + u32(gg.scale) + u32(gg.w_mn.x) + u32(gg.col2.z);
     }
-    var col1 = sky(dir_fine);
+    var col1 = vec3<f32>(0.52, 0.80, 1.0);
     col1 = col1 + vec3<f32>(f32(sink & 1u) * 0.001);
-    col1 = linear_to_srgb(aces_tonemap(col1));
-    textureStore(out_tex, coord0, vec4<f32>(col1, 1.0));
+    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col1), 1.0));
     return;
   }
 
-  // ---- trace_scene：遍历 grid_descs[0..N] 取最近命中（Phase 3 统一）----
+  // ---- trace_scene：主世界先跑 + lazy 物体遍历 ----
   var best_t = 1e+30;
   var best_pal: u32 = 0u;
-  var best_n = vec3<f32>(0.0);
-  var best_face_id: u32 = 0u;
-  var best_grid: Grid = make_grid(0u);  // 命中 volume 的 Grid（shade_hit 取色 + implicit normal 用）
-  for (var i: u32 = 0u; i < n; i = i + 1u) {
-    let cap = min(best_t, frustum_length);
-    let mh = trace_grid_idx(i, origin_fine, dir_fine, cap);
-    if (mh.hit && mh.t < best_t) {
-      best_t = mh.t;
-      best_pal = mh.pal;
-      best_n = mh.n;
-      best_face_id = mh.face_id;
-      best_grid = make_grid(i);
+  let g0 = make_grid(0u);
+  var best_grid: Grid = g0;
+  {
+    let cap0 = min(best_t, frustum_length);
+    let mh0 = trace_grid(g0, origin_fine, dir_fine, cap0);
+    if (mh0.hit && mh0.t < best_t) {
+      best_t = mh0.t;
+      best_pal = mh0.pal;
+      best_grid = g0;
+    }
+  }
+  if (best_t < 1e+29) {
+    for (var i: u32 = 1u; i < n; i = i + 1u) {
+      let gi = make_grid(i);
+      let capi = min(best_t, frustum_length);
+      let mhi = trace_grid(gi, origin_fine, dir_fine, capi);
+      if (mhi.hit && mhi.t < best_t) {
+        best_t = mhi.t;
+        best_pal = mhi.pal;
+        best_grid = gi;
+      }
     }
   }
 
-  // ---- v5 single-pass 着色（per-pixel，无 hashmap）----
+  // ---- unlit 输出 ----
   if (best_t < 1e+29) {
-    // debug_mode.x: implicit normal 可视化
-    if (view_u.debug_mode.x > 0.5) {
-      let n_implicit = compute_implicit_normal(best_grid, origin_fine, dir_fine, best_t, best_n);
-      textureStore(out_tex, coord0, vec4<f32>(n_implicit * 0.5 + 0.5, 1.0));
-      return;
-    }
-    // debug_mode.y: face 6 色 + sky=品红（G-buffer 状态图定位工具）
-    if (view_u.debug_mode.y > 0.5) {
-      textureStore(out_tex, coord0, vec4<f32>(face_color_from_index(best_face_id), 1.0));
-      return;
-    }
-    // 正常着色：shade_hit（per-pixel 硬阴影 + emissive）→ ACES → sRGB
-    var col = shade_hit(best_grid, origin_fine, dir_fine, best_t, best_pal, best_n, SHADOW_DIR_T_MAX);
-    col = aces_tonemap(col);
-    col = linear_to_srgb(col);
-    textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
+    let albedo = palette_albedo(best_grid.palette_base, best_pal);
+    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(albedo), 1.0));
   } else {
-    // sky
-    var col = sky(dir_fine);
-    col = aces_tonemap(col);
-    col = linear_to_srgb(col);
-    textureStore(out_tex, coord0, vec4<f32>(col, 1.0));
+    // 天空色常量
+    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(vec3<f32>(0.52, 0.80, 1.0)), 1.0));
   }
 }
 

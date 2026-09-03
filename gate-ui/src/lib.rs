@@ -20,9 +20,9 @@ pub use theme::{
   parse_hex_color, parse_theme_ron,
 };
 pub use widgets::{
-  CheckboxBox, InteractionPrev, PlotCanvas, PlotData, PlotDomain, PlotExtents, RingList,
+  CheckboxBox, InteractionPrev, PlotCanvas, PlotData, PlotDomain, PlotExtents, PlotYAxis, RingList,
   SliderRange, SliderStep, SliderThumb, SliderValue, UiClick, UiCtx, UiSlider, blank_plot_image,
   button, button_state_system, checkbox, checkbox_state_system, clamp_step, color_of, label,
-  label_muted, list, panel, plot, plot_redraw_system, px, ring_list_sync_system, slider,
-  slider_drag_system, slider_visual_system,
+  label_muted, list, panel, plot, plot_redraw_system, plot_yaxis, px, ring_list_sync_system,
+  slider, slider_drag_system, slider_visual_system,
 };

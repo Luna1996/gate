@@ -293,30 +293,37 @@ impl BrickMapBuilder {
 // VolumesBuilder：多 volume 统一构建器（Phase 3 OBJ→Volume 统一）
 // ============================================================================
 
-/// 统一脏字节区间（多 volume 合并后，已按各 volume tree_base 偏移）
-#[derive(Debug, Default, Clone)]
-pub struct VolumesDirtyRanges {
-  /// b_struct 内的脏字节区间列表（闭开 [lo, hi)，字对齐）
-  pub struct_ranges: Vec<(usize, usize)>,
-  /// b_palette 内的脏字节区间列表（每 volume 512 字 = 2048B）
-  pub palette_ranges: Vec<(usize, usize)>,
+/// u32 字切片 → 本机字节序 u8 Vec（wire 按小端直存，x86/ARM 均 LE；同 u8_of_u32 约定）
+fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+  let mut v = Vec::with_capacity(words.len() * 4);
+  // SAFETY: &[u32] → &[u8] 等长重解释，仅用于立即拷贝进 v
+  v.extend_from_slice(unsafe {
+    std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
+  });
+  v
 }
 
 /// 多 volume 统一快照（与 GPU buffer 字节一一对应）
 #[derive(Debug, Clone)]
 pub struct VolumesSnapshot {
-  /// 所有 volume 的 b_struct 顺序拼接
+  /// full 模式：所有 volume 的 b_struct 顺序拼接；incremental 模式为空（内容走 struct_blobs）
   pub b_struct: Vec<u32>,
-  /// 所有 volume 的 b_palette 顺序拼接（每 volume 512 字）
+  /// full 模式：所有 volume 的 b_palette 顺序拼接；incremental 模式为空
   pub b_palette: Vec<u32>,
   /// 恒空（Douglas 格式 palette 直存节点；字段保留维持绑定结构稳定）
   pub b_leaves: Vec<u32>,
   /// 每 volume 一个 GridDesc（tree_base/palette_base 指向上述统一 buffer）
   pub grid_descs: Vec<GridDesc>,
-  /// "full" = 整块写；"incremental" = 仅写 dirty 区间
+  /// "full" = 整块写；"incremental" = 仅写脏块
   pub mode_tag: &'static str,
-  /// 增量脏区间（mode_tag="full" 时为空）
-  pub dirty: VolumesDirtyRanges,
+  /// incremental 模式：b_struct 脏块（统一 buffer 内字节偏移 + 内容）；full 为空
+  pub struct_blobs: Vec<(usize, Vec<u8>)>,
+  /// incremental 模式：b_palette 脏块（统一 buffer 内字节偏移 + 内容）；full 为空
+  pub palette_blobs: Vec<(usize, Vec<u8>)>,
+  /// 统一 b_struct 总字节数（两种模式都有效；buffer 容量 ensure 用）
+  pub struct_total_bytes: usize,
+  /// 统一 b_palette 总字节数
+  pub palette_total_bytes: usize,
   /// 本轮更新的 dirty chunk 总数（跨所有 volume；日志用）
   pub dirty_chunks: usize,
 }
@@ -413,18 +420,18 @@ impl VolumesBuilder {
     // b_struct 布局序：物体 1..N 先，主世界 0 后（主世界编辑不漂移物体）
     let layout_order: Vec<usize> = (1..n).chain(std::iter::once(0)).collect();
 
-    let mut b_struct = Vec::new();
-    let mut b_palette = Vec::new();
-    // tree_bases[i] / palette_bases[i] = volume i 在统一 buffer 内的基址
+    // tree_bases[i] / palette_bases[i] = volume i 在统一 buffer 内的字基址。
+    // 只累加字数，不拼接字节——全量拼接在增量帧是 100MB+ 级 memcpy（帧卡顿根因）。
     let mut tree_bases = vec![0u32; n];
     let mut palette_bases = vec![0u32; n];
-
+    let mut struct_total_words = 0usize;
+    let mut palette_total_words = 0usize;
     for &i in &layout_order {
       let buffers = self.builders[i].buffers();
-      tree_bases[i] = b_struct.len() as u32;
-      palette_bases[i] = b_palette.len() as u32;
-      b_struct.extend_from_slice(&buffers.b_struct);
-      b_palette.extend_from_slice(&buffers.b_palette);
+      tree_bases[i] = struct_total_words as u32;
+      palette_bases[i] = palette_total_words as u32;
+      struct_total_words += buffers.b_struct.len();
+      palette_total_words += buffers.b_palette.len();
     }
 
     // GridDesc 数组按 volume 索引顺序（0=主世界，1..N=物体）
@@ -485,46 +492,53 @@ impl VolumesBuilder {
 
     let dirty_chunks: usize = self.builders.iter().map(|b| b.dirty_struct.len()).sum();
 
-    let dirty = if need_full {
-      // 全量路径：丢弃各 builder 的脏区间（整块写覆盖）
+    let mut b_struct = Vec::new();
+    let mut b_palette = Vec::new();
+    let mut struct_blobs = Vec::new();
+    let mut palette_blobs = Vec::new();
+
+    if need_full {
+      // 全量路径：丢弃各 builder 的脏区间（整块写覆盖），拼接完整字节
       for b in &mut self.builders {
         let _ = b.take_dirty_ranges();
       }
-      VolumesDirtyRanges::default()
+      for &i in &layout_order {
+        let buffers = self.builders[i].buffers();
+        b_struct.extend_from_slice(&buffers.b_struct);
+        b_palette.extend_from_slice(&buffers.b_palette);
+      }
     } else {
-      // 增量路径：各 builder 的脏区间按 tree_base 偏移
-      let mut struct_ranges = Vec::new();
-      let mut palette_ranges = Vec::new();
+      // 增量路径：只把各 builder 的脏区间内容拷贝成独立字节块（KB~MB 级），
+      // 偏移按 tree_base/palette_base 平移到统一 buffer。prepare 逐块 write_buffer。
       for i in 0..n {
         let dr = self.builders[i].take_dirty_ranges();
-        let tb = tree_bases[i] as usize * 4;
-        let pb = palette_bases[i] as usize * 4;
+        let tb = tree_bases[i] as usize;
+        let pb = palette_bases[i] as usize;
+        let buffers = self.builders[i].buffers();
         for (lo, hi) in dr.struct_ranges {
-          struct_ranges.push((lo + tb, hi + tb));
+          let (lw, hw) = (lo / 4, hi / 4);
+          struct_blobs.push((tb * 4 + lo, words_to_bytes(&buffers.b_struct[lw..hw])));
         }
         if dr.palette_changed {
-          palette_ranges.push((pb, pb + PALETTE_WORDS * 4));
+          palette_blobs.push((pb * 4, words_to_bytes(&buffers.b_palette)));
         }
       }
-      VolumesDirtyRanges {
-        struct_ranges,
-        palette_ranges,
-      }
-    };
+    }
 
     self.prev_tree_bases = tree_bases;
     self.prev_palette_bases = palette_bases;
     self.force_full = false;
-
-    let mode_tag = if need_full { "full" } else { "incremental" };
 
     VolumesSnapshot {
       b_struct,
       b_palette,
       b_leaves: Vec::new(),
       grid_descs,
-      mode_tag,
-      dirty,
+      mode_tag: if need_full { "full" } else { "incremental" },
+      struct_blobs,
+      palette_blobs,
+      struct_total_bytes: struct_total_words * 4,
+      palette_total_bytes: palette_total_words * 4,
       dirty_chunks,
     }
   }
@@ -1001,8 +1015,10 @@ mod tests {
       snap.mode_tag, "incremental",
       "主世界编辑（尾部）不应漂移物体 tree_base"
     );
-    // dirty 区间应非空
-    assert!(!snap.dirty.struct_ranges.is_empty());
+    // 增量脏块应非空
+    assert!(!snap.struct_blobs.is_empty());
+    // 增量模式不带整量字节
+    assert!(snap.b_struct.is_empty() && snap.b_palette.is_empty());
     // GridDesc tree_base 未变
     assert_eq!(snap.grid_descs[1].tree_base, 0, "物体 tree_base 不变");
   }
@@ -1029,8 +1045,8 @@ mod tests {
       snap.mode_tag, "full",
       "物体编辑（头部）漂移主世界 tree_base → 全量"
     );
-    // dirty 区间为空（full 路径丢弃）
-    assert!(snap.dirty.struct_ranges.is_empty());
+    // 增量脏块为空（full 路径逐块上传无意义）
+    assert!(snap.struct_blobs.is_empty());
   }
 
   #[test]
@@ -1076,16 +1092,22 @@ mod tests {
     assert_eq!(snap.mode_tag, "incremental");
     // 主世界 tree_base = 物体 b_struct 长度
     let main_tree_base = snap.grid_descs[0].tree_base as usize * 4;
-    // 所有 dirty 区间的 lo 应 ≥ main_tree_base（主世界在尾部）
-    for &(lo, hi) in &snap.dirty.struct_ranges {
+    // 所有脏块偏移应 ≥ main_tree_base（主世界在尾部）且不越界
+    for (off, payload) in &snap.struct_blobs {
       assert!(
-        lo >= main_tree_base,
-        "dirty lo {} 应 ≥ 主世界 tree_base {}",
-        lo,
+        *off >= main_tree_base,
+        "blob 偏移 {} 应 ≥ 主世界 tree_base {}",
+        off,
         main_tree_base
       );
-      assert!(hi > lo, "dirty 区间非空");
-      assert!(hi <= snap.b_struct.len() * 4, "dirty hi 不越界");
+      assert!(!payload.is_empty(), "blob 非空");
+      assert!(
+        off + payload.len() <= snap.struct_total_bytes,
+        "blob 尾部 {} 不越界 {}",
+        off + payload.len(),
+        snap.struct_total_bytes
+      );
     }
+    assert!(!snap.struct_blobs.is_empty());
   }
 }

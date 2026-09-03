@@ -17,7 +17,7 @@ use gate_render::{
 };
 use gate_ui::{
   ThemeFont, UiCtx, UiTheme,
-  widgets::{label, px},
+  widgets::{PlotData, PlotDomain, blank_plot_image, label, plot_yaxis, px},
 };
 use gate_voxel::{
   PaletteEntry, VolumeTransform, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
@@ -29,6 +29,8 @@ pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
 /// 程序侧日志落盘（方案 3）：LogPlugin custom_layer 追加无色文件层，
 /// 每次启动截断重写（永远最新一轮）；默认 stderr 彩色层保留不变
 pub const LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/latest.log");
+/// 帧率诊断日志：fps_line_feed 每 0.25s 写一行 CUR/AVG/MIN/MAX
+pub const FPS_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/fps.log");
 
 // ---- 相机参数（P2.6 from_orbit 使用；用户已取消"最远距离"限制）----
 // CAM_FAR = 透视投影 far 面；dda.wgsl 内 DDA 射线 t_max 同步到此量级。
@@ -70,7 +72,7 @@ fn main() {
             wgpu_hal::vulkan::instance=off,\
             wgpu_hal::vulkan::surface=off"
             .into(),
-          // 日志落盘层（方案 3）：无 ANSI 色码，写 logs/latest.log；
+          // 日志落盘层（方案 3）：无色文件层，写 logs/latest.log；
           // 默认 stderr 彩色层不受影响，终端 / LLDB log 照常有色输出
           custom_layer: |_app| {
             use bevy::log::BoxedLayer;
@@ -78,12 +80,9 @@ fn main() {
             std::fs::create_dir_all(path.parent().expect("LOG_PATH 必有父目录")).ok()?;
             let file = std::fs::File::create(path).ok()?;
             let (writer, guard) = tracing_appender::non_blocking(file);
-            // WorkerGuard 须活到进程退出；App 构建处无处安放，直接泄漏——
-            // worker 线程满缓冲 / 每 10ms 即落盘，进程退出由 OS 收尾，尾部丢失可忽略
             std::mem::forget(guard);
-            // 本地时区时间戳（默认 SystemTime timer 是 UTC，+8 区看日志像"慢 8 小时"；
-            // Windows 下 current_local_offset 安全，此处仍在 main 早期单线程阶段，失败回退 UTC）
-            let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+            let offset =
+              time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
             let timer = tracing_subscriber::fmt::time::OffsetTime::new(
               offset,
               time::format_description::well_known::Rfc3339,
@@ -102,11 +101,6 @@ fn main() {
     // 装配后 DiagnosticsRecorder 才存在，4×pass 的 time_span 才会记录 GPU/CPU 耗时；
     // 未装配时 gate-render 的 span 走 Option<&T> no-op，不影响渲染
     .add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
-    // fps/帧时 + gate_dda_compute/blit GPU 耗时每秒落日志（帧率剖析用）
-    .add_plugins((
-      bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
-      bevy::diagnostic::LogDiagnosticsPlugin::default(),
-    ))
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
     .add_systems(Startup, setup)
@@ -117,7 +111,8 @@ fn main() {
         left_click_pick_recenter.after(orbit_camera_input),
         edit_tile_every_120_frames,
         demo_ui_setup,
-        fps_line_feed,
+        // 先推帧时长样本，gate-ui 的 plot_redraw_system 同帧再重绘折线图
+        fps_line_feed.before(gate_ui::plot_redraw_system),
         debug_normals_toggle,
       ),
     )
@@ -949,7 +944,7 @@ fn edit_tile_every_120_frames(mut frame: Local<u64>, scene: Option<ResMut<VoxelS
   }
   if (*frame).is_multiple_of(120) {
     // 每 120 帧重写 tile(1,0,0) 内 32³ L4 热点（fine 656..688），palette 金↔青交替
-    // 与 setup 热点重合同区域 → 必定产生 DirtyEdit → UPLOAD[incremental] ~ 132KB / ~180µs
+    // 与 setup 热点重合同区域 → 必定产生 DirtyEdit → UPLOAD[incremental]
     let pal = if (*frame / 120) % 2 == 1 { 11 } else { 8 };
     let origin = IVec3::new(656, 64, 64);
     let mut z = 0;
@@ -980,6 +975,12 @@ fn edit_tile_every_120_frames(mut frame: Local<u64>, scene: Option<ResMut<VoxelS
 
 const FPS_REFRESH_SECS: f32 = 0.25;
 const FPS_WINDOW_SECS: f32 = 5.0;
+
+/// 帧时长折线图：画布纹理尺寸（宽 ≈ FPS 文本宽；高 64px，1:1 显示）
+const FRAME_PLOT_W: u32 = 320;
+const FRAME_PLOT_H: u32 = 64;
+/// 折线环形样本容量（≈ 画布像素宽，约 1 样本/px；60fps 下约 6s 窗口）
+const FRAME_PLOT_CAP: usize = 360;
 
 #[derive(Component)]
 struct FpsText;
@@ -1024,11 +1025,19 @@ fn demo_ui_setup(
 
   commands.queue(move |world: &mut World| {
     let ctx = UiCtx::new(&theme, font.as_ref());
+    // 帧时长折线图画布纹理（透明背景，面板黑底透出）
+    let plot_image = world
+      .resource_mut::<Assets<Image>>()
+      .add(blank_plot_image(FRAME_PLOT_W, FRAME_PLOT_H));
     world
       .spawn(Node {
         position_type: PositionType::Absolute,
         left: px(8.0),
         top: px(8.0),
+        // 纵向：FPS 行 + 帧时长折线图；子节点横向拉伸 → 图表与 FPS 行等宽
+        flex_direction: FlexDirection::Column,
+        row_gap: px(4.0),
+        align_items: AlignItems::Stretch,
         // 黑底半透明面板：天空/亮色场景下 FPS 文本可读
         padding: UiRect::all(px(4.0)),
         ..default()
@@ -1037,20 +1046,49 @@ fn demo_ui_setup(
       .with_children(|panel| {
         let e = label(&ctx, panel, "FPS: CUR ---, AVG ---, MIN ---, MAX ---");
         panel.world_mut().entity_mut(e).insert(FpsText);
+        // 帧时长（ms）折线：白色折线、左侧纵轴标签按数据动态调整、透明底
+        plot_yaxis(
+          &ctx,
+          panel,
+          plot_image,
+          FRAME_PLOT_CAP,
+          PlotDomain::Auto,
+          Color::WHITE,
+          false,
+          Some("ms"),
+          FRAME_PLOT_H as f32,
+        );
       });
   });
 }
 
-/// 每 0.25s 刷新一次左上角 FPS 行（文本只在变化时写入）
+/// 每 0.25s 刷新一次左上角 FPS 行 + 写一行到 logs/fps.log
+///
+/// 每帧（早于 0.25s 早退）把帧时长 ms 压入折线图环形缓冲：
+/// PlotData Changed → gate-ui 的 plot_redraw_system 自动光栅化重绘。
 fn fps_line_feed(
   time: Res<Time>,
   mut q: Query<&mut Text, With<FpsText>>,
+  mut q_plot: Query<&mut PlotData>,
   mut window: Local<VecDeque<f32>>, // 逐帧 delta，按时间裁剪到 5s
   mut acc: Local<f32>,
   mut frames: Local<u32>,
+  mut log_file: Local<Option<std::fs::File>>,
 ) {
+  // 首次调用：创建/截断 fps.log
+  if log_file.is_none() {
+    let path = std::path::Path::new(FPS_LOG_PATH);
+    if let Some(parent) = path.parent() {
+      std::fs::create_dir_all(parent).ok();
+    }
+    *log_file = std::fs::File::create(path).ok();
+  }
   let dt = time.delta_secs();
   window.push_back(dt);
+  // 帧时长折线图：每帧压入 ms（UI 未 spawn 时查询为空，跳过）
+  if let Ok(mut plot) = q_plot.single_mut() {
+    plot.push(dt * 1000.0);
+  }
   let mut sum = 0.0f32;
   for &d in window.iter() {
     sum += d;
@@ -1090,12 +1128,26 @@ fn fps_line_feed(
     fps3(min),
     fps3(max)
   );
+  let elapsed = time.elapsed_secs();
   *acc = 0.0;
   *frames = 0;
   if let Ok(mut t) = q.single_mut()
     && t.0 != txt
   {
     t.0 = txt;
+  }
+  // 写 fps.log：elapsed_secs,CUR,AVG,MIN,MAX
+  use std::io::Write;
+  if let Some(f) = log_file.as_mut() {
+    let _ = writeln!(
+      f,
+      "{:.2},{},{},{},{}",
+      elapsed,
+      fps3(cur),
+      fps3(avg),
+      fps3(min),
+      fps3(max)
+    );
   }
 }
 

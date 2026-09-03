@@ -161,33 +161,19 @@ impl DdaCameraConfig {
 pub struct DdaViewUniform {
   pub inv_view_proj: Mat4,
   pub cam_pos_fine: Vec4, // w=1
-  /// x = debug_mode（1 = 法向可视化，2 = face 6 色诊断）；yzw reserved
+  /// x/y = debug 可视化（保留）；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
   pub debug_mode: Vec4,
 }
 
-/// 【诊断开关（性能定位用，定位完可删）】env 控制：
-/// `GATE_SKIP_SHADOW=1` = 跳过方向光阴影射线；`GATE_SKIP_IMPLN=1` = 跳过 implicit
-/// normal 6 邻域点采样（直接用 DDA 面法线）。用于把 30fps 的开销拆到阴影/法线/遍历。
-static SKIP_SHADOW: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_SKIP_SHADOW")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
-static SKIP_IMPLN: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_SKIP_IMPLN")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
-/// 【诊断】GATE_SKYOUT=1：dda_main 跳过全部 trace 直接输出天空色（固定开销二分用）
-static SKY_OUT: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_SKYOUT")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
-/// 【诊断】GATE_SKIP_CHUNKWALK=1：trace_grid 在局部 slab 后直接 miss（二分
-/// make_grid+slab 与 chunk 循环+trace_chunk 的成本）
+/// 【诊断】GATE_SKIP_CHUNKWALK=1：trace_grid 在局部 slab 后直接 miss
 static SKIP_CHUNKWALK: LazyLock<bool> = LazyLock::new(|| {
   std::env::var("GATE_SKIP_CHUNKWALK")
+    .map(|v| v == "1")
+    .unwrap_or(false)
+});
+/// 【诊断】GATE_SKYOUT=1：dda_main 跳过全部 trace 直接输出天空色
+static SKY_OUT: LazyLock<bool> = LazyLock::new(|| {
+  std::env::var("GATE_SKYOUT")
     .map(|v| v == "1")
     .unwrap_or(false)
 });
@@ -202,25 +188,12 @@ impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32) -> Self {
     Self {
       inv_view_proj: cfg.inv_view_proj,
-      // 世界单位 = fine 单位（0.25cm）；DDA 着色器 dir 同样不缩放
       cam_pos_fine: cfg.position_world.extend(1.0),
       debug_mode: Vec4::new(
         (debug_mode == 1) as u32 as f32, // x = 法向可视化
         (debug_mode == 2) as u32 as f32, // y = face 6 色诊断
-        // z = 1 跳过阴影射线；z = 2 跳过 chunk 步进层（诊断）
-        if *SKIP_CHUNKWALK {
-          2.0
-        } else {
-          *SKIP_SHADOW as u32 as f32
-        },
-        *SKIP_IMPLN as u32 as f32
-          + if *SKY_OUT {
-            2.0
-          } else if *MAKEGRID_ONLY {
-            4.0
-          } else {
-            0.0
-          }, // w = +2 跳全部 trace / +4 只 make_grid（诊断）
+        if *SKIP_CHUNKWALK { 2.0 } else { 0.0 }, // z = 2 跳过 chunk 步进
+        if *SKY_OUT { 2.0 } else if *MAKEGRID_ONLY { 4.0 } else { 0.0 },
       ),
     }
   }
@@ -2050,8 +2023,6 @@ use bevy::{
 use std::borrow::Cow;
 
 use super::upload::GpuBrickMap;
-use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
-
 pub const DDA_SHADER_ASSET_PATH: &str = "shaders/dda.wgsl";
 
 // --- DdaImages：main-world 创建的 handle，ExtractResource 自动传到 render world（main.rs setup 注入） ---
@@ -2064,8 +2035,6 @@ struct DdaBg1BindGroup(BindGroup);
 #[derive(Resource)]
 struct DdaBg2BindGroup(BindGroup);
 #[derive(Resource)]
-struct DdaBg3BindGroup(BindGroup);
-#[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
 #[derive(Resource)]
@@ -2074,7 +2043,6 @@ struct DdaPipelines {
   bg0_layout: BindGroupLayoutDescriptor,
   bg1_layout: BindGroupLayoutDescriptor,
   bg2_layout: BindGroupLayoutDescriptor,
-  bg3_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
   compute_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
@@ -2099,7 +2067,6 @@ impl Plugin for BrickMapDdaPlugin {
     };
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
-      .add_systems(bevy::render::ExtractSchedule, extract_light_pool)
       .add_systems(RenderStartup, init_dda_pipelines)
       .add_systems(
         Render,
@@ -2130,16 +2097,6 @@ fn extract_camera_config(
   let debug_mode = debug.map(|d| d.0).unwrap_or(0);
   let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode);
   commands.insert_resource(uniform);
-}
-
-/// main world `LightingTheme` → render world `LightPoolUniform`
-/// 方向光 + 天空 + 环境 + 曝光；Douglas 方案：无点光源/发光体素 NEE。
-fn extract_light_pool(
-  mut commands: bevy::ecs::system::Commands,
-  theme: Option<bevy::render::Extract<bevy::ecs::system::Res<LightingTheme>>>,
-) {
-  let t = theme.map(|t| t.clone()).unwrap_or_default();
-  commands.insert_resource(build_light_pool(&t));
 }
 
 fn init_dda_pipelines(
@@ -2188,15 +2145,6 @@ fn init_dda_pipelines(
     ),
   );
 
-  // ---- BG3：光源池 uniform（P3.1，LightPoolUniform 432B）----
-  let bg3 = BindGroupLayoutDescriptor::new(
-    "DdaBg3",
-    &BindGroupLayoutEntries::single(
-      ShaderStages::COMPUTE,
-      uniform_buffer::<LightPoolUniform>(false),
-    ),
-  );
-
   // ---- blit BG layout：与 Gradient 完全一致（texture_2d f32）----
   let blit = BindGroupLayoutDescriptor::new(
     "DdaBlit",
@@ -2208,7 +2156,7 @@ fn init_dda_pipelines(
 
   // ---- Compute pipeline：dda.wgsl single entry point dda_main ----
   let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
-  let layouts = vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone()];
+  let layouts = vec![bg0.clone(), bg1.clone(), bg2.clone()];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
     layout: layouts,
@@ -2244,7 +2192,6 @@ fn init_dda_pipelines(
     bg0_layout: bg0,
     bg1_layout: bg1,
     bg2_layout: bg2,
-    bg3_layout: bg3,
     blit_layout: blit,
     compute_pipeline: compute,
     blit_pipeline,
@@ -2259,27 +2206,20 @@ fn prepare_dda_bind_groups(
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
-  light_pool: Option<Res<LightPoolUniform>>,
   render_device: Res<RenderDevice>,
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
 ) {
-  // Prepare 与 Extract 的跨 world 同步在首帧可能还没完成，这些缺失是正常的，
-  // 下一帧自动补齐；不应当 warn 级别噪音。
   let Some(images) = images else {
     bevy::log::info_once!("DDA prepare: no DdaImages");
     return;
   };
   let Some(view_uniform) = view_uniform else {
-    bevy::log::info_once!("DDA prepare: no DdaViewUniform (extract_camera_config 未产出)");
+    bevy::log::info_once!("DDA prepare: no DdaViewUniform");
     return;
   };
   let Some(gpu) = gpu_brickmap else {
     bevy::log::info_once!("DDA prepare: no GpuBrickMap");
-    return;
-  };
-  let Some(light_pool) = light_pool else {
-    bevy::log::info_once!("DDA prepare: no LightPoolUniform (extract_light_pool 未产出)");
     return;
   };
   let Some(tex_view) = gpu_images.get(&images.target) else {
@@ -2287,19 +2227,12 @@ fn prepare_dda_bind_groups(
     return;
   };
 
-  // ---- 写 DdaViewUniform 到 UniformBuffer ----
   let mut u = UniformBuffer::from(view_uniform.into_inner());
   u.write_buffer(&render_device, &queue);
 
-  // ---- 写光源池 uniform（P3.1，432B/帧）----
-  let mut lp = UniformBuffer::from(*light_pool);
-  lp.write_buffer(&render_device, &queue);
-
-  // ---- 通过 PipelineCache 把 Descriptor 转成 BindGroupLayout handle ----
   let bg0_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_layout);
   let bg1_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg1_layout);
   let bg2_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg2_layout);
-  let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
   let blit_layout = pipeline_cache.get_bind_group_layout(&pipelines.blit_layout);
 
   // ---- BG0：out tex write + view uniform（v5 single-pass）----
@@ -2333,9 +2266,6 @@ fn prepare_dda_bind_groups(
     &BindGroupEntries::sequential((gpu.grid_descs_buf.as_entire_binding(),)),
   );
 
-  // ---- BG3：光源池 uniform ----
-  let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp));
-
   // ---- Blit BG：dda tex（和 gradient 相同的 texture_2d blit layout）----
   let blit_bg = render_device.create_bind_group(
     None,
@@ -2346,7 +2276,6 @@ fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBg0BindGroup(bg0));
   commands.insert_resource(DdaBg1BindGroup(bg1));
   commands.insert_resource(DdaBg2BindGroup(bg2));
-  commands.insert_resource(DdaBg3BindGroup(bg3));
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
@@ -2355,13 +2284,12 @@ fn dispatch_dda(
   bg0: Option<Res<DdaBg0BindGroup>>,
   bg1: Option<Res<DdaBg1BindGroup>>,
   bg2: Option<Res<DdaBg2BindGroup>>,
-  bg3: Option<Res<DdaBg3BindGroup>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
 ) {
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) =
-    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref())
+  let (Some(bg0), Some(bg1), Some(bg2)) =
+    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref())
   else {
     bevy::log::debug_once!("DDA dispatch: bind groups missing");
     return;
@@ -2389,7 +2317,6 @@ fn dispatch_dda(
     pass.set_bind_group(0, &bg0.0, &[]);
     pass.set_bind_group(1, &bg1.0, &[]);
     pass.set_bind_group(2, &bg2.0, &[]);
-    pass.set_bind_group(3, &bg3.0, &[]);
     pass.dispatch_workgroups(gx, gy, 1);
   }
   span.end(ctx.command_encoder());

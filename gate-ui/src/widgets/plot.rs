@@ -31,6 +31,8 @@ pub struct PlotData {
   y_domain: PlotDomain,
   pub line_color: Color,
   pub grid: bool,
+  /// 纵轴数值后缀（plot_yaxis 标签用），如 "ms"；None → 纯数字
+  pub unit: Option<&'static str>,
 }
 
 impl PlotData {
@@ -41,7 +43,14 @@ impl PlotData {
       y_domain,
       line_color,
       grid,
+      unit: None,
     }
+  }
+
+  /// 链式设置纵轴单位后缀
+  pub fn with_unit(mut self, unit: &'static str) -> Self {
+    self.unit = Some(unit);
+    self
   }
 
   /// 压入样本；超出容量时顶替最旧样本，返回被顶替者
@@ -208,6 +217,10 @@ pub struct PlotCanvas;
 #[derive(Component, Debug)]
 pub struct PlotExtents;
 
+/// 左侧纵轴标签列标记（plot_yaxis spawn；列内子实体按 spawn 顺序 = 上(max)/中/下(min)）
+#[derive(Component, Debug)]
+pub struct PlotYAxis;
+
 /// 主题折线图：数据 + 画布（ImageNode）+ 极值文本。
 /// `image_handle` 由调用方预先注册（`Assets<Image>::add(blank_plot_image(..))`）。
 pub fn plot(
@@ -251,12 +264,91 @@ pub fn plot(
     .id()
 }
 
+/// 带左侧纵轴标签的折线图（调试覆盖层用）：
+///
+/// 布局：root(Row) = [纵轴标签列 + 画布]。
+/// - 纵轴列：3 个右对齐标签（上=max / 中=mid / 下=min），`SpaceBetween`
+///   顶到画布的上/中/下；数值在 `plot_redraw_system` 中按值域刷新。
+/// - 画布：`flex_grow = 1.0` 撑满父容器剩余宽度（与同行文本等宽），
+///   高度固定 `canvas_h` px；纹理透明，背景由父面板提供。
+#[allow(clippy::too_many_arguments)]
+pub fn plot_yaxis(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  image_handle: Handle<Image>,
+  capacity: usize,
+  y_domain: PlotDomain,
+  line_color: Color,
+  grid: bool,
+  unit: Option<&'static str>,
+  canvas_h: f32,
+) -> Entity {
+  let c = &ctx.theme.colors;
+  let m = &ctx.theme.metrics;
+  parent
+    .spawn((
+      Name::new("ui-plot-yaxis"),
+      PlotData {
+        unit,
+        ..PlotData::new(capacity, y_domain, line_color, grid)
+      },
+      Node {
+        flex_direction: FlexDirection::Row,
+        column_gap: px(m.spacing.xs),
+        align_items: AlignItems::Stretch,
+        ..default()
+      },
+    ))
+    .with_children(|root| {
+      // 纵轴标签列：高度随画布拉伸，SpaceBetween 分布 max/mid/min
+      root
+        .spawn((
+          Name::new("ui-plot-yaxis-labels"),
+          PlotYAxis,
+          Node {
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::FlexEnd,
+            ..default()
+          },
+        ))
+        .with_children(|col| {
+          for _ in 0..3 {
+            col.spawn(label_bundle(
+              ctx,
+              String::new(),
+              m.font_size.sm,
+              color_of(&c.text),
+            ));
+          }
+        });
+      // 画布：宽度 flex_grow 撑满，高度固定
+      root.spawn((
+        Name::new("ui-plot-canvas"),
+        PlotCanvas,
+        ImageNode {
+          image: image_handle,
+          ..default()
+        },
+        Node {
+          flex_grow: 1.0,
+          height: px(canvas_h),
+          ..default()
+        },
+      ));
+    })
+    .id()
+}
+
 /// 重绘（OQ-3 结论）：PlotData 变更 → 光栅化写回 Image（Handle 不变）+ 更新极值文本
 pub fn plot_redraw_system(
   mut images: ResMut<Assets<Image>>,
   mut q_roots: Query<(Entity, &Children, &PlotData), Changed<PlotData>>,
   mut q_canvas: Query<&mut ImageNode>,
-  mut q_text: Query<&mut Text, With<PlotExtents>>,
+  q_yaxis: Query<&Children, With<PlotYAxis>>,
+  // 单个 Text 查询覆盖两类标签：plot() 的极值文本（root 直接子节点）
+  // 与 plot_yaxis() 的纵轴标签（纵轴列的子节点）；按层级定位，无实体重叠。
+  mut q_text: Query<&mut Text>,
 ) {
   for (root_e, children, data) in &mut q_roots {
     let mut handle = None;
@@ -283,6 +375,23 @@ pub fn plot_redraw_system(
     for ch in children.iter() {
       if let Ok(mut t) = q_text.get_mut(ch) {
         t.set_if_neq(Text::new(text.clone()));
+      }
+    }
+    // 左侧纵轴标签（plot_yaxis 变体）：列内子实体顺序 = 上(max)/中/下(min)。
+    // 定宽 5 字符 + 可选单位后缀，等宽字体下不抖动。
+    let vals = [domain.1, (domain.0 + domain.1) * 0.5, domain.0];
+    for ch in children.iter() {
+      let Ok(labels) = q_yaxis.get(ch) else {
+        continue;
+      };
+      for (i, label_e) in labels.iter().enumerate() {
+        if let Ok(mut t) = q_text.get_mut(label_e) {
+          let s = match data.unit {
+            Some(u) => format!("{:>5.1}{u}", vals[i]),
+            None => format!("{:>5.1}", vals[i]),
+          };
+          t.set_if_neq(Text::new(s));
+        }
       }
     }
     let _ = root_e;
@@ -431,5 +540,59 @@ mod tests {
       }
     }
     assert!(found, "extents label updated");
+  }
+
+  #[test]
+  fn plot_yaxis_labels_track_domain() {
+    let theme = default_theme();
+    let mut app = App::new();
+    app.init_resource::<Assets<Image>>();
+    app.insert_resource(theme.clone());
+    app.insert_resource(ThemeFont::default());
+    app.add_systems(Update, plot_redraw_system);
+
+    let handle = app
+      .world_mut()
+      .resource_mut::<Assets<Image>>()
+      .add(blank_plot_image(64, 32));
+    let ctx = UiCtx::new(&theme, None);
+    let mut plot_e = None;
+    app.world_mut().spawn_empty().with_children(|p| {
+      plot_e = Some(plot_yaxis(
+        &ctx,
+        p,
+        handle,
+        64,
+        PlotDomain::Auto,
+        Color::WHITE,
+        false,
+        Some("ms"),
+        32.0,
+      ));
+    });
+    let plot_e = plot_e.expect("plot_yaxis spawned");
+
+    // 样本 2.0 / 10.0 → Auto 域 (2,10)：标签 上=10.0 中=6.0 下=2.0
+    {
+      let mut data = app.world_mut().get_mut::<PlotData>(plot_e).unwrap();
+      data.push(2.0);
+      data.push(10.0);
+    }
+    app.update();
+
+    let root_children = app.world().get::<Children>(plot_e).unwrap().iter().collect::<Vec<_>>();
+    let mut labels = vec![];
+    for ch in root_children {
+      if app.world().get::<PlotYAxis>(ch).is_some() {
+        for l in app.world().get::<Children>(ch).unwrap().iter() {
+          labels.push(app.world().get::<Text>(l).unwrap().0.clone());
+        }
+      }
+    }
+    assert_eq!(labels.len(), 3, "three y-axis labels");
+    assert!(labels[0].contains("10.0"), "top label = max: {}", labels[0]);
+    assert!(labels[1].contains("6.0"), "mid label = mid: {}", labels[1]);
+    assert!(labels[2].contains("2.0"), "bottom label = min: {}", labels[2]);
+    assert!(labels[0].ends_with("ms"), "unit suffix: {}", labels[0]);
   }
 }

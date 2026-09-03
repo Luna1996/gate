@@ -179,8 +179,9 @@ pub struct BuilderMirror {
 
 /// ExtractSchedule 产出 → PrepareResources 消费（render world resource）
 ///
-/// Phase 3 统一：`volumes: VolumesSnapshot` 包含统一 `b_struct`/`b_palette`/
-/// `b_leaves`/`grid_descs` + `mode_tag` + `dirty`（VolumesDirtyRanges）+ `dirty_chunks`。
+/// Phase 3 统一：`volumes: VolumesSnapshot`。full 模式带完整 `b_struct`/`b_palette`
+/// 整块 DMA；incremental 模式不带整量字节（避免 100MB+ 级 memcpy 卡顿），
+/// 改为 `struct_blobs`/`palette_blobs` 脏块（偏移+内容）逐块 write_buffer。
 /// state/comp 仍是主世界 only（Phase 2 shader 重写后再扩展）。
 #[derive(Resource, Clone)]
 pub struct UploadSnapshot {
@@ -404,19 +405,37 @@ fn write(device: &RenderDevice, queue: &RenderQueue, cur: &mut Buffer, label: &s
   }
 }
 
-/// 部分写：只写 [lo, hi)。GPU buffer 必须已经 ≥ hi（full 模式已 ensure 过一次）。
-fn write_partial(queue: &RenderQueue, cur: &Buffer, bytes: &[u8], lo: usize, hi: usize) {
-  let hi = hi.min(bytes.len());
-  if lo >= hi {
+/// 增量路径专用：保证 buffer 容量 ≥ `need_bytes`；扩容时创建新 buffer 并把旧内容
+/// **GPU-GPU 拷贝**为前缀（不占 PCIe）。新增尾部 [cap..need) 不在这里写——
+/// 调用方随后逐块 `write_buffer` 脏块，追加的树尾部恰好被脏块全覆盖。
+fn ensure_capacity(
+  device: &RenderDevice,
+  queue: &RenderQueue,
+  cur: &mut Buffer,
+  label: &str,
+  need_bytes: u64,
+) {
+  let cap = cur.size();
+  if cap >= need_bytes {
     return;
   }
-  debug_assert!(
-    cur.size() >= hi as u64,
-    "write_partial: buffer size {}B < hi {}B",
-    cur.size(),
-    hi
-  );
-  queue.write_buffer(cur, lo as u64, &bytes[lo..hi]);
+  let new_size = grow_size(cap, need_bytes);
+  let new_buf = device.create_buffer(&BufferDescriptor {
+    label: Some(label),
+    size: new_size,
+    // COPY_SRC：本 buffer 下次扩容时要作为前缀拷贝的源（缺它第二次 grow 必炸）
+    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+    mapped_at_creation: false,
+  });
+  if cap > 0 {
+    // COPY_BUFFER_ALIGNMENT=4；cap 恒为 words×4 或初始 4B，天然对齐。
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+      label: Some("gate_grow_prefix_copy"),
+    });
+    enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
+    queue.submit([enc.finish()]);
+  }
+  *cur = new_buf;
 }
 
 // ----------------------------------------------------------------------------
@@ -451,39 +470,23 @@ pub(crate) fn prepare(
     }
   }
 
-  let struct_bytes = u8_of_u32(&snap.volumes.b_struct);
-  let palette_bytes = u8_of_u32(&snap.volumes.b_palette);
-  // b_leaves 恒空（Douglas 格式 palette 直存节点）；空 Vec 维持 buffer 结构稳定
-  let leaves_bytes = u8_of_u32(&snap.volumes.b_leaves);
-  let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
+  let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
   let comp_bytes = snap.comp_chunks * CHUNK_COMP_WORDS * 4;
 
-  // bytes 统计（日志用）：full = 整块；incremental = dirty ranges 求和
-  let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
-  let (struct_tx_bytes, palette_tx_bytes) = if is_full {
-    (struct_bytes.len(), palette_bytes.len())
-  } else {
-    let s = snap
-      .volumes
-      .dirty
-      .struct_ranges
-      .iter()
-      .map(|&(a, b)| (b.min(struct_bytes.len())).saturating_sub(a))
-      .sum::<usize>();
-    let p = snap
-      .volumes
-      .dirty
-      .palette_ranges
-      .iter()
-      .map(|&(a, b)| (b.min(palette_bytes.len())).saturating_sub(a))
-      .sum::<usize>();
-    (s, p)
-  };
-  let leaves_tx_bytes = if is_full { leaves_bytes.len() } else { 0 };
-  let grid_descs_tx_bytes = if is_full { grid_descs_bytes.len() } else { 0 };
+  // 传输字节统计（日志用）
+  let (struct_tx_bytes, palette_tx_bytes, leaves_tx_bytes, grid_descs_tx_bytes);
 
   if is_full {
-    // 全量：整块 + ensure 保证 GPU 容量够
+    // 全量：整块 DMA + ensure 保证 GPU 容量够
+    let struct_bytes = u8_of_u32(&snap.volumes.b_struct);
+    let palette_bytes = u8_of_u32(&snap.volumes.b_palette);
+    // b_leaves 恒空（Douglas 格式 palette 直存节点）；空 Vec 维持 buffer 结构稳定
+    let leaves_bytes = u8_of_u32(&snap.volumes.b_leaves);
+    let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
+    struct_tx_bytes = struct_bytes.len();
+    palette_tx_bytes = palette_bytes.len();
+    leaves_tx_bytes = leaves_bytes.len();
+    grid_descs_tx_bytes = grid_descs_bytes.len();
     write(
       &device,
       &queue,
@@ -491,13 +494,7 @@ pub(crate) fn prepare(
       "gate_struct",
       struct_bytes,
     );
-    write(
-      &device,
-      &queue,
-      &mut gpu.leaves,
-      "gate_leaves",
-      leaves_bytes,
-    );
+    write(&device, &queue, &mut gpu.leaves, "gate_leaves", leaves_bytes);
     write(
       &device,
       &queue,
@@ -513,52 +510,49 @@ pub(crate) fn prepare(
       grid_descs_bytes,
     );
   } else {
-    // 增量镜像路径（prefix_valid=true）：CPU 镜像 [0..cap) 与 GPU 一致，扩容走
-    // GPU-GPU 前缀拷贝 + 只 DMA 增长尾部；随后 write_partial 覆写脏区（冗余但正确）。
-    // 不再出现旧 2× 翻倍策略"首次编辑整写 163MB"的 PCIe 尖峰。
-    // GridDesc 数组：volume 数变化（新增/删除物体）已由 VolumesBuilder.snapshot 判定
-    // 为 need_full → 走上面的整块写；incremental 路径下 grid_descs 数组不变，
-    // 跳过 grid_descs_buf 的 write（仅 ensure 维持容量）。
-    ensure_with_copy(
+    // 增量路径：snapshot 不再全量拼接 b_struct（旧实现每个脏帧 memcpy 100MB+，
+    // 是编辑 spike 的根因）。这里只按总字节 ensure 容量（扩容走 GPU-GPU 前缀
+    // 拷贝，不占 PCIe），随后逐脏块 write_buffer——每块 = chunk 窗口条目字 +
+    // 新 append 的树尾部（KB~MB 级）；追加尾部恰好覆盖扩容后的新区域。
+    // GridDesc：volume 数变化已由 snapshot 判 need_full；增量路径内容不变，
+    // 仅 ensure 维持容量。leaves 恒空，跳过。
+    ensure_capacity(
       &device,
       &queue,
       &mut gpu.struct_buf,
       "gate_struct",
-      struct_bytes,
-      true,
+      snap.volumes.struct_total_bytes as u64,
     );
-    ensure_with_copy(
-      &device,
-      &queue,
-      &mut gpu.leaves,
-      "gate_leaves",
-      leaves_bytes,
-      true,
-    );
-    ensure_with_copy(
+    ensure_capacity(
       &device,
       &queue,
       &mut gpu.palette,
       "gate_palette",
-      palette_bytes,
-      true,
+      snap.volumes.palette_total_bytes as u64,
     );
-    ensure_with_copy(
+    let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
+    ensure_capacity(
       &device,
       &queue,
       &mut gpu.grid_descs_buf,
       "gate_grid_descs",
-      grid_descs_bytes,
-      true,
+      grid_descs_bytes.len() as u64,
     );
 
-    for (lo, hi) in snap.volumes.dirty.struct_ranges.iter().copied() {
-      write_partial(&queue, &gpu.struct_buf, struct_bytes, lo, hi);
+    let mut s_tx = 0usize;
+    for (off, payload) in &snap.volumes.struct_blobs {
+      queue.write_buffer(&gpu.struct_buf, *off as u64, payload);
+      s_tx += payload.len();
     }
-    for (lo, hi) in snap.volumes.dirty.palette_ranges.iter().copied() {
-      // palette 2KB 太小，单 range 整块写更稳（区间已按 palette_base 偏移）
-      write_partial(&queue, &gpu.palette, palette_bytes, lo, hi);
+    let mut p_tx = 0usize;
+    for (off, payload) in &snap.volumes.palette_blobs {
+      queue.write_buffer(&gpu.palette, *off as u64, payload);
+      p_tx += payload.len();
     }
+    struct_tx_bytes = s_tx;
+    palette_tx_bytes = p_tx;
+    leaves_tx_bytes = 0;
+    grid_descs_tx_bytes = 0;
   }
   // state / comp 每次都整块写（state 4KB、comp 每 chunk 8KB，都很小）
   write(
@@ -663,9 +657,9 @@ pub(crate) fn prepare(
   }
   if !limits.force_multi() {
     debug_assert!(
-      struct_bytes.len() as u64 <= limits.max_storage_buffer_binding_size,
+      snap.volumes.struct_total_bytes as u64 <= limits.max_storage_buffer_binding_size,
       "b_struct {} bytes > binding limit {}",
-      struct_bytes.len(),
+      snap.volumes.struct_total_bytes,
       limits.max_storage_buffer_binding_size,
     );
   }

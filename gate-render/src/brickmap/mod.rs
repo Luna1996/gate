@@ -11,9 +11,7 @@ pub mod upload;
 mod view;
 pub mod wire;
 
-pub use builder::{
-  BrickMapBuilder, ChunkUpdate, DirtyRanges, VolumesBuilder, VolumesDirtyRanges, VolumesSnapshot,
-};
+pub use builder::{BrickMapBuilder, ChunkUpdate, DirtyRanges, VolumesBuilder, VolumesSnapshot};
 pub use dda::{
   DdaCameraConfig, DdaHit, DdaImages, DdaViewUniform, DebugNormals, OrbitCamera, RenderScale,
   TreeHit, VIEW_SIZE, VolumeHit, cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray,
