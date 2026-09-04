@@ -1,7 +1,8 @@
 // WGSL: 全屏三角 blit，storage texture → ViewTarget（P0.3 阶段 B）
-// 用 textureLoad 免 sampler（1:1 拷贝，无缩放）
+// 渲染分辨率可低于窗口（Douglas #17 降分辨率策略）：uv 双线性采样上采样
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_sampler: sampler;
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
@@ -21,13 +22,10 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-  let dims = vec2<f32>(textureDimensions(src_tex, 0i));
-  let uv = vec2<u32>(in.uv * dims);
-  let uv_c = clamp(uv, vec2<u32>(0u), vec2<u32>(dims) - vec2<u32>(1u));
-  let c = textureLoad(src_tex, uv_c, 0i);
+  let c = textureSample(src_tex, src_sampler, in.uv).rgb;
   // view target 是 sRGB：硬件会把输出做 linear→sRGB 编码。
   // 先做 sRGB→linear 转换，两次抵消 → 屏幕像素 = storage texture 字节（渐变不被 gamma 提升）
-  return vec4<f32>(srgb_to_linear(c.rgb), 1.0);
+  return vec4<f32>(srgb_to_linear(c), 1.0);
 }
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {

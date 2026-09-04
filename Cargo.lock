@@ -2083,6 +2083,7 @@ dependencies = [
  "time",
  "tracing-appender",
  "tracing-subscriber",
+ "vox-rs",
 ]
 
 [[package]]
@@ -4130,6 +4131,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vox-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1808b378125b28688611c70c6230bc40d1489bf1205d6486c338184bdb6cdb6a"
 
 [[package]]
 name = "walkdir"

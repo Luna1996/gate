@@ -580,7 +580,12 @@ mod tests {
     }
     app.update();
 
-    let root_children = app.world().get::<Children>(plot_e).unwrap().iter().collect::<Vec<_>>();
+    let root_children = app
+      .world()
+      .get::<Children>(plot_e)
+      .unwrap()
+      .iter()
+      .collect::<Vec<_>>();
     let mut labels = vec![];
     for ch in root_children {
       if app.world().get::<PlotYAxis>(ch).is_some() {
@@ -592,7 +597,11 @@ mod tests {
     assert_eq!(labels.len(), 3, "three y-axis labels");
     assert!(labels[0].contains("10.0"), "top label = max: {}", labels[0]);
     assert!(labels[1].contains("6.0"), "mid label = mid: {}", labels[1]);
-    assert!(labels[2].contains("2.0"), "bottom label = min: {}", labels[2]);
+    assert!(
+      labels[2].contains("2.0"),
+      "bottom label = min: {}",
+      labels[2]
+    );
     assert!(labels[0].ends_with("ms"), "unit suffix: {}", labels[0]);
   }
 }

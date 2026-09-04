@@ -209,6 +209,7 @@ pub struct UploadCpuSampleChannel(pub std::sync::Arc<std::sync::Mutex<Option<Upl
 /// `grid_descs_buf`：Phase 3 新增，GridDesc 数组（144B/entry）——主世界 + 物体统一描述符，
 /// shader `trace_scene` 遍历无 kind 分支。`grid_descs_count` 跟踪有效条目数。
 /// `globals`：保留旧 BrickMapGlobals uniform（Phase 1 shader 字节兼容，重写后移除）。
+/// `leaves`：恒空占位（Douglas 格式 palette 直存节点；BG1 binding(1) 布局占位必需）。
 #[derive(Resource)]
 pub struct GpuBrickMap {
   pub struct_buf: Buffer,
@@ -474,18 +475,15 @@ pub(crate) fn prepare(
   let comp_bytes = snap.comp_chunks * CHUNK_COMP_WORDS * 4;
 
   // 传输字节统计（日志用）
-  let (struct_tx_bytes, palette_tx_bytes, leaves_tx_bytes, grid_descs_tx_bytes);
+  let (struct_tx_bytes, palette_tx_bytes, grid_descs_tx_bytes);
 
   if is_full {
     // 全量：整块 DMA + ensure 保证 GPU 容量够
     let struct_bytes = u8_of_u32(&snap.volumes.b_struct);
     let palette_bytes = u8_of_u32(&snap.volumes.b_palette);
-    // b_leaves 恒空（Douglas 格式 palette 直存节点）；空 Vec 维持 buffer 结构稳定
-    let leaves_bytes = u8_of_u32(&snap.volumes.b_leaves);
     let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
     struct_tx_bytes = struct_bytes.len();
     palette_tx_bytes = palette_bytes.len();
-    leaves_tx_bytes = leaves_bytes.len();
     grid_descs_tx_bytes = grid_descs_bytes.len();
     write(
       &device,
@@ -494,7 +492,6 @@ pub(crate) fn prepare(
       "gate_struct",
       struct_bytes,
     );
-    write(&device, &queue, &mut gpu.leaves, "gate_leaves", leaves_bytes);
     write(
       &device,
       &queue,
@@ -551,7 +548,6 @@ pub(crate) fn prepare(
     }
     struct_tx_bytes = s_tx;
     palette_tx_bytes = p_tx;
-    leaves_tx_bytes = 0;
     grid_descs_tx_bytes = 0;
   }
   // state / comp 每次都整块写（state 4KB、comp 每 chunk 8KB，都很小）
@@ -613,7 +609,6 @@ pub(crate) fn prepare(
   let elapsed = t0.elapsed();
   let cpu_ms = elapsed.as_secs_f32() * 1000.0;
   let tx_bytes_total = (struct_tx_bytes
-    + leaves_tx_bytes
     + palette_tx_bytes
     + grid_descs_tx_bytes
     + snap.state_bytes.len()) as f64;
@@ -630,9 +625,9 @@ pub(crate) fn prepare(
     snap.volumes.dirty_chunks
   };
   debug!(target: "gate",
-    "UPLOAD[{}]: bytes={:.2}MB (s {}KB,l {}KB,pal {}KB,gd {}KB,state 4KB), chunks={}, comp={}KB, elapsed={:?}",
+    "UPLOAD[{}]: bytes={:.2}MB (s {}KB,pal {}KB,gd {}KB,state 4KB), chunks={}, comp={}KB, elapsed={:?}",
     snap.volumes.mode_tag, mb,
-    struct_tx_bytes / 1024, leaves_tx_bytes / 1024, palette_tx_bytes / 1024,
+    struct_tx_bytes / 1024, palette_tx_bytes / 1024,
     grid_descs_tx_bytes / 1024, chunks_show, comp_bytes / 1024, elapsed,
   );
   // P2.7：写入共享通道（render↔main Arc<Mutex>，OQ-2 选 A 不提供 GPU 值）

@@ -119,7 +119,6 @@ impl BrickMapBuilder {
       buffers: BrickMapBuffers {
         // Region ① 稠密 chunk 窗口（1MB）+ 空树区
         b_struct: vec![0; TREE_BASE],
-        b_leaves: Vec::new(),
         b_palette: vec![0; PALETTE_WORDS],
         globals: BrickMapGlobals {
           index_origin_x: origin.x,
@@ -310,8 +309,6 @@ pub struct VolumesSnapshot {
   pub b_struct: Vec<u32>,
   /// full 模式：所有 volume 的 b_palette 顺序拼接；incremental 模式为空
   pub b_palette: Vec<u32>,
-  /// 恒空（Douglas 格式 palette 直存节点；字段保留维持绑定结构稳定）
-  pub b_leaves: Vec<u32>,
   /// 每 volume 一个 GridDesc（tree_base/palette_base 指向上述统一 buffer）
   pub grid_descs: Vec<GridDesc>,
   /// "full" = 整块写；"incremental" = 仅写脏块
@@ -532,7 +529,6 @@ impl VolumesBuilder {
     VolumesSnapshot {
       b_struct,
       b_palette,
-      b_leaves: Vec::new(),
       grid_descs,
       mode_tag: if need_full { "full" } else { "incremental" },
       struct_blobs,
@@ -631,7 +627,6 @@ mod tests {
     assert_eq!(g.brick_slabs, 0);
     assert_eq!(g.rejected_tiles, 0);
     assert_eq!(b.buffers().b_struct.len(), TREE_BASE);
-    assert_eq!(b.buffers().b_leaves.len(), 0);
     assert_eq!(b.buffers().b_palette.len(), PALETTE_WORDS);
     // 调色板 0 条目 = AIR 全零
     assert_eq!(&b.buffers().b_palette[..2], &[0, 0]);

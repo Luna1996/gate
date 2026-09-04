@@ -1,4 +1,5 @@
 pub mod brickmap;
+pub mod ddgi;
 pub mod lighting;
 mod responsive;
 
@@ -9,9 +10,9 @@ pub use brickmap::{
   BuilderMirror, ChunkUpdate, DdaCameraConfig, DdaImages, DdaViewUniform, DebugNormals,
   DirtyRanges, GpuBrickMap, GridDesc, OrbitCamera, UploadBudget, UploadCpuSample,
   UploadCpuSampleChannel, UploadSnapshot, VolumeHit, VolumesBuilder, VolumesSnapshot, VoxelScene,
-  cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray,
-  cpu_reference_dda_ray_aabb_skip, cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes,
-  cpu_reference_volumes_occluded, create_dda_image,
+  cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip,
+  cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes, cpu_reference_volumes_occluded,
+  create_dda_image,
 };
 pub use brickmap::{RenderScale, VIEW_SIZE};
 pub use lighting::{
@@ -27,6 +28,7 @@ impl Plugin for GateRenderPlugin {
     app.add_plugins((
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
+      ddgi::DdgiPlugin,
     ));
   }
 }

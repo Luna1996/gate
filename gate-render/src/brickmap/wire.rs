@@ -237,8 +237,6 @@ fn transform_aabb(pos: Vec3, rot: Mat3, scale: f32) -> (Vec3, Vec3) {
 pub struct BrickMapBuffers {
   /// Region ① chunk 窗口 + Region ② 各 chunk DFS 树
   pub b_struct: Vec<u32>,
-  /// 恒空（Douglas 格式无 leaves buffer；字段保留维持打包结构稳定）
-  pub b_leaves: Vec<u32>,
   pub b_palette: Vec<u32>,
   pub globals: BrickMapGlobals,
 }

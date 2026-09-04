@@ -18,7 +18,7 @@ pub use coords::{
 };
 
 // ============ Brick Tree ============
-pub use chunk_tree::ChunkTree;
+pub use chunk_tree::{BrickState, ChunkTree};
 
 // ============ 脏追踪 ============
 pub use dirty::DirtyTracker;

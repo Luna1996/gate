@@ -39,6 +39,38 @@ fn child_slot(mask: u64, i: u32) -> u32 {
   (mask & ((1u64 << i) - 1)).count_ones()
 }
 
+/// 节点 palette word 打包：低字节 = uniform 子块色（既有 wire 语义），
+/// 高字节 = LOD 子树多数色（GPU 八叉树早停用，dda.wgsl 解码 (w>>8)&0xFF）
+#[inline]
+fn pack_pal_lod(palette: u8, lod: u8) -> u32 {
+  palette as u32 | ((lod as u32) << 8)
+}
+
+/// brick 三态（R3-10 DDGI 探针烘焙：cell 16³ = level 2 brick）
+///
+/// `get_uniform` 的 `None` 语义同时涵盖「uniform 空气」与「含空气混合」，
+/// 探针烘焙需要区分 Air（居中放探针）/ Solid（无探针）/ Mixed（BFS 找最大空叶），
+/// 故单独提供三态查询。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrickState {
+  /// 整 brick 空气（palette 0）
+  Air,
+  /// 整 brick 同一非零 palette
+  Solid(u8),
+  /// 空气与实体混合（或多种颜色混合）
+  Mixed,
+}
+
+/// palette → brick 三态（palette 0 = AIR）
+#[inline]
+fn brick_state_of(palette: u8) -> BrickState {
+  if palette == 0 {
+    BrickState::Air
+  } else {
+    BrickState::Solid(palette)
+  }
+}
+
 /// Douglas Brick Tree 1:1（分裂树，4³=64 分裂因子，u64 mask）
 #[derive(Debug, Clone)]
 pub struct ChunkTree {
@@ -78,13 +110,18 @@ impl ChunkTree {
       // root uniform（没有 Split 节点）
       out.push(0); // mask low
       out.push(0); // mask high
-      out.push(self.root_palette as u32);
+      out.push(pack_pal_lod(self.root_palette, self.root_palette));
     } else {
       self.serialize_node(Some(0), CHUNK_SIZE, &mut out);
     }
     out
   }
 
+  /// DFS 序列化（上传 GPU struct buffer）。
+  ///
+  /// **wire v2**（2026-09-04 DDA 加速）：**叶父层（level 3）inline 64 palette**，
+  /// 消除 level 4 叶节点（3 word → 0）和 child_addr indirection（2 load → 1）。
+  /// 上层（level 0-2）保持紧凑格式（省空间，稀疏节点不膨胀 64×）。
   fn serialize_node(&self, idx: Option<usize>, extent: i32, out: &mut Vec<u32>) {
     let (mask, palette_u32) = match idx {
       None => (0u64, self.root_palette as u32),
@@ -93,45 +130,98 @@ impl ChunkTree {
         Node::Split { mask, palette, .. } => (*mask, *palette as u32),
       },
     };
+    let lod = self.node_lod(idx);
 
-    // 写 3 words: mask_lo, mask_hi, palette
+    // 写 3 words: mask_lo, mask_hi, palette(low) | lod(high)
     out.push(mask as u32);
     out.push((mask >> 32) as u32);
-    out.push(palette_u32);
+    out.push(pack_pal_lod(palette_u32 as u8, lod));
 
     if mask == 0 {
       return;
     }
 
-    // 写 child offset 表（只存 mask bit=1 的子块）
     let child_extent = extent / BRICK_FACTOR;
-    let num_children = mask.count_ones() as usize;
-    // 先占位，后面回填 offset
-    let offsets_start = out.len();
-    out.resize(out.len() + num_children, 0);
 
-    // 递归写子节点（DFS 顺序）
-    let mut slot = 0usize;
-    for i in 0u32..64 {
-      let bit = 1u64 << i;
-      if (mask & bit) != 0 {
-        let child_offset = out.len() as u32;
-        out[offsets_start + slot] = child_offset;
-        slot += 1;
-
-        let child_idx = match idx {
-          Some(p) => match &self.nodes[p] {
-            Node::Split { children, .. } => children[child_slot(mask, i) as usize] as usize,
-            _ => unreachable!(),
-          },
-          None => {
-            // root split 后也应该走 Split 分支
-            // 但 idx=None 时 mask=0 已经 return 了，所以不会到这里
-            unreachable!()
-          }
-        };
-        self.serialize_node(Some(child_idx), child_extent, out);
+    if child_extent == 1 {
+      // 叶父层（level 3）：inline 64 palette word（非紧凑，bit=0 位填 0）
+      // 消除 level 4 叶节点；GPU 读 b_struct[node + 3 + child_idx] 直取 palette
+      let inline_start = out.len();
+      out.resize(out.len() + 64, 0);
+      for i in 0u32..64 {
+        let bit = 1u64 << i;
+        if (mask & bit) != 0 {
+          let child_idx = match idx {
+            Some(p) => match &self.nodes[p] {
+              Node::Split { children, .. } => children[child_slot(mask, i) as usize] as usize,
+              _ => unreachable!(),
+            },
+            None => unreachable!(),
+          };
+          let (pal, lod_val) = match &self.nodes[child_idx] {
+            Node::Uniform(p) => (*p, *p),
+            Node::Split { .. } => unreachable!(),
+          };
+          out[inline_start + i as usize] = pack_pal_lod(pal, lod_val);
+        }
       }
+    } else {
+      // 内部层（level 0-2）：紧凑 child offset 表（只存 mask bit=1 的子块）
+      let num_children = mask.count_ones() as usize;
+      let offsets_start = out.len();
+      out.resize(out.len() + num_children, 0);
+      let mut slot = 0usize;
+      for i in 0u32..64 {
+        let bit = 1u64 << i;
+        if (mask & bit) != 0 {
+          let child_offset = out.len() as u32;
+          out[offsets_start + slot] = child_offset;
+          slot += 1;
+          let child_idx = match idx {
+            Some(p) => match &self.nodes[p] {
+              Node::Split { children, .. } => children[child_slot(mask, i) as usize] as usize,
+              _ => unreachable!(),
+            },
+            None => unreachable!(),
+          };
+          self.serialize_node(Some(child_idx), child_extent, out);
+        }
+      }
+    }
+  }
+
+  /// 节点 LOD 代表色 = 子树「实体多数色」（排除空气计票；子树无实体 → 0）。
+  /// bit=0 子块 = 本节点 uniform palette（=0 空气不计票）；bit=1 子块 = 子节点
+  /// lod 递归。uniform 节点 = 自身色（空气 → 0）。
+  /// GPU 侧 lod!=0 即早停：区域含实体就按多数固体色整块出图——触发条件保证
+  /// 区域投影 <1px，剪影/颜色误差 ≤ 子块边长 = 亚像素。排除空气是关键：
+  /// 地形薄表面区域空气占多数，若含空气计票则 lod 恒 0 永不早停。
+  fn node_lod(&self, idx: Option<usize>) -> u8 {
+    match idx {
+      None => self.root_palette,
+      Some(i) => match &self.nodes[i] {
+        Node::Uniform(p) => *p,
+        Node::Split { mask, palette, children } => {
+          let mut counts = [0u16; 256];
+          for i in 0u32..64 {
+            let c = if *mask & (1u64 << i) != 0 {
+              let child = children[child_slot(*mask, i) as usize] as usize;
+              self.node_lod(Some(child))
+            } else {
+              *palette
+            };
+            if c != 0 {
+              counts[c as usize] += 1;
+            }
+          }
+          counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| **c)
+            .map(|(i, _)| i as u8)
+            .unwrap_or(0)
+        }
+      },
     }
   }
 
@@ -224,6 +314,117 @@ impl ChunkTree {
       };
     }
     self.get_uniform_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
+  }
+
+  /// brick 三态查询（DDGI 探针烘焙）：Air / Solid(palette) / Mixed
+  ///
+  /// `local_*` = chunk 内 fine 坐标（brick 最小角），`level` ∈ 0..5 对应
+  /// `LEVEL_EXTENT` = [256, 64, 16, 4, 1]。
+  pub fn get_brick_state(&self, local_x: i32, local_y: i32, local_z: i32, level: u8) -> BrickState {
+    let query_extent = LEVEL_EXTENT[level as usize];
+    if self.nodes.is_empty() {
+      return if self.root_palette == 0 {
+        BrickState::Air
+      } else {
+        BrickState::Solid(self.root_palette)
+      };
+    }
+    self.brick_state_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
+  }
+
+  fn brick_state_at(
+    &self,
+    x: i32,
+    y: i32,
+    z: i32,
+    query_extent: i32,
+    idx: Option<usize>,
+    cur_extent: i32,
+  ) -> BrickState {
+    let (mask, palette) = match idx {
+      None => (0u64, self.root_palette),
+      Some(i) => match &self.nodes[i] {
+        Node::Uniform(p) => return brick_state_of(*p),
+        Node::Split { mask, palette, .. } => (*mask, *palette),
+      },
+    };
+
+    if cur_extent <= query_extent {
+      // 到达查询粒度：聚合整个节点的 64 子块三态
+      return self.aggregate_node_state(mask, palette, idx);
+    }
+
+    // cur_extent > query_extent：下钻
+    let child_extent = cur_extent / BRICK_FACTOR;
+    if mask == 0 {
+      return brick_state_of(palette);
+    }
+    let ix = (x / child_extent).clamp(0, BRICK_FACTOR - 1);
+    let iy = (y / child_extent).clamp(0, BRICK_FACTOR - 1);
+    let iz = (z / child_extent).clamp(0, BRICK_FACTOR - 1);
+    let child_i = child_linear_idx(ix, iy, iz);
+    let bit_i = 1u64 << child_i;
+
+    if (mask & bit_i) == 0 {
+      return brick_state_of(palette);
+    }
+
+    let p = idx.unwrap();
+    let child_idx = match &self.nodes[p] {
+      Node::Split { children, .. } => children[child_slot(mask, child_i) as usize] as usize,
+      _ => unreachable!(),
+    };
+    self.brick_state_at(
+      x - ix * child_extent,
+      y - iy * child_extent,
+      z - iz * child_extent,
+      query_extent,
+      Some(child_idx),
+      child_extent,
+    )
+  }
+
+  /// 聚合节点完整区域的 64 子块 → 三态（到达查询粒度时调用）
+  ///
+  /// 早退：任一子块与已见态冲突 → Mixed。bit=0 子块 = 父 palette 的 uniform。
+  fn aggregate_node_state(&self, mask: u64, palette: u8, idx: Option<usize>) -> BrickState {
+    // None = 未定；Some(st) = 已见唯一态；再遇异态 → Mixed
+    let mut seen: Option<BrickState> = None;
+    let children: &[u32] = match idx {
+      Some(i) => match &self.nodes[i] {
+        Node::Split { children, .. } => children.as_slice(),
+        _ => unreachable!(),
+      },
+      None => return brick_state_of(palette), // 空 nodes + root palette
+    };
+    for i in 0u32..64 {
+      let bit = 1u64 << i;
+      let st = if (mask & bit) != 0 {
+        self.node_state(children[child_slot(mask, i) as usize] as usize)
+      } else {
+        brick_state_of(palette)
+      };
+      match (seen, st) {
+        (None, s) => seen = Some(s),
+        (Some(prev), s) if prev == s => {}
+        (Some(_), _) => return BrickState::Mixed,
+      }
+    }
+    seen.unwrap_or(brick_state_of(palette))
+  }
+
+  /// 单节点完整区域三态（不限查询窗口；与 aggregate_node_state 互递归，Mixed 早退）
+  fn node_state(&self, idx: usize) -> BrickState {
+    match &self.nodes[idx] {
+      Node::Uniform(p) => brick_state_of(*p),
+      Node::Split { mask, palette, .. } => {
+        if *mask == 0 {
+          // lazy Split：整节点 uniform（防御 trailing_zeros(0) 同款哨兵）
+          return brick_state_of(*palette);
+        }
+        self.aggregate_node_state(*mask, *palette, Some(idx))
+      }
+    }
   }
 
   fn get_uniform_at(
@@ -747,7 +948,10 @@ mod tests {
   fn uniform_chunk_readback() {
     let t = ChunkTree::uniform(42);
     assert_eq!(t.get_voxel(100, 50, 200), Some(42));
-    assert_eq!(t.serialize()[2], 42);
+    // palette word：低字节 = uniform 色，高字节 = lod（uniform 节点 lod = 自身色）
+    let w = t.serialize()[2];
+    assert_eq!(w & 0xFF, 42);
+    assert_eq!((w >> 8) & 0xFF, 42);
   }
 
   #[test]
@@ -774,6 +978,45 @@ mod tests {
     assert_eq!(t.get_voxel(5, 5, 5), Some(7));
     assert!(t.clear_voxel(5, 5, 5));
     assert_eq!(t.get_voxel(5, 5, 5), None);
+  }
+
+  /// R3-10 DDGI：三态查询（get_uniform 的 None 无法区分 Air/Mixed，此处锁语义）
+  #[test]
+  fn brick_state_three_way() {
+    // 空 chunk = Air（各级一致）
+    let t = ChunkTree::empty();
+    assert_eq!(t.get_brick_state(0, 0, 0, 2), BrickState::Air);
+    assert_eq!(t.get_brick_state(16, 16, 16, 2), BrickState::Air);
+    // 全 chunk uniform 实体：层级 0..4 全 Solid
+    let t = ChunkTree::uniform(5);
+    for level in 0..5u8 {
+      assert_eq!(t.get_brick_state(0, 0, 0, level), BrickState::Solid(5));
+    }
+    // 16³ cell 内单体素：该 cell Mixed，邻 cell Air，64³ 父 brick 也 Mixed
+    let mut t = ChunkTree::empty();
+    t.set_voxel(5, 6, 7, 3);
+    assert_eq!(t.get_brick_state(0, 0, 0, 2), BrickState::Mixed);
+    assert_eq!(t.get_brick_state(16, 0, 0, 2), BrickState::Air);
+    assert_eq!(t.get_brick_state(0, 0, 0, 1), BrickState::Mixed);
+    // 4³ 子砖粒度：含体素的 4³ brick Mixed，全空 4³ brick Air
+    assert_eq!(t.get_brick_state(4, 4, 4, 3), BrickState::Mixed);
+    assert_eq!(t.get_brick_state(0, 0, 0, 3), BrickState::Air);
+    // 整 4³ brick 填充：该 brick Solid，兄弟 Air
+    t.fill_brick([16, 0, 0], 4, 9);
+    assert_eq!(t.get_brick_state(16, 0, 0, 3), BrickState::Solid(9));
+    assert_eq!(t.get_brick_state(0, 0, 0, 3), BrickState::Air);
+    // 清掉后回到 Air（merge 生效）
+    for dz in 0..4 {
+      for dy in 0..4 {
+        for dx in 0..4 {
+          t.clear_voxel(16 + dx, dy, dz);
+        }
+      }
+    }
+    assert_eq!(t.get_brick_state(16, 0, 0, 3), BrickState::Air);
+    // 256³ 全 chunk 填充（fill_brick 整 chunk 规范形）→ level 0 Solid
+    t.fill_brick([0, 0, 0], 256, 4);
+    assert_eq!(t.get_brick_state(0, 0, 0, 0), BrickState::Solid(4));
   }
 
   #[test]
@@ -837,12 +1080,14 @@ mod tests {
     let ser = t.serialize();
     assert!(ser.len() >= 3);
     // root 是 split：只有 (100,100,100) 所在 64³ 子块的 bit=1（lazy split，
-    // mask bit=0 子块 = uniform AIR，不占 child offset——Douglas #17 语义）
+    // mask bit=0 子块 = uniform AIR——Douglas #17 语义）
     let mask = (ser[1] as u64) << 32 | ser[0] as u64;
     assert_ne!(mask, 0);
     assert_eq!(mask.count_ones(), 1, "lazy split：单 bit 而非 SPLIT_ALL");
-    // 只有 1 个 child offset（紧凑存储）
-    assert_eq!(ser.len(), 3 + 1 + 3 + 1 + 3 + 1 + 3 + 1 + 3);
+    // wire v2 混合格式：levels 0-2 紧凑（3+1 offset=4 words/层，单 child），
+    // level 3 叶父层 inline palette（3+64=67 words，不递归到 level 4 叶节点）
+    // 总 = 4 + 4 + 4 + 67 = 79 words
+    assert_eq!(ser.len(), 79);
     // 序列化后读回语义不变
     assert_eq!(t.get_voxel(100, 100, 100), Some(7));
     assert_eq!(t.get_voxel(0, 0, 0), None);

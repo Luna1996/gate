@@ -34,14 +34,16 @@ pub(crate) fn xyz(v: Vec4) -> Vec3 {
 pub const MAX_LIGHTS: usize = 8;
 /// 阴影射线起点沿法线偏移（fine），消除自遮挡 acne
 pub const SHADOW_BIAS: f32 = 0.5;
-/// 方向光阴影射线 t_max：覆盖整个可见场景
-pub const SHADOW_DIR_T_MAX: f32 = 65536.0;
+/// 方向光阴影射线 t_max：场景 AABB 对角 ≈3118（[-256,-512,-256]~[1536,1536,1280]），
+/// 表面点沿任意方向的遮挡必在其内；65536 的空气段让每条阴影射线多空走 8×（性能）。
+/// 改世界尺度（GATE_TILES）时按对角线同步放大。
+pub const SHADOW_DIR_T_MAX: f32 = 8192.0;
 /// 发光体素 radiance 直出增益
 pub const EMISSIVE_EMIT_GAIN: f32 = 4.0;
 
 /// 光源描述（shader 镜像，48B；uniform 数组 stride 16 的倍数 ✓）
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, ShaderType)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, ShaderType)]
 pub struct LightDesc {
   /// x = kind（0 = 方向光）；yzw = L 轴（指向光，已归一）
   pub kind_pos_dir: Vec4,
@@ -53,7 +55,7 @@ pub struct LightDesc {
 
 /// 光池 header（48B）：count + 环境色 + 曝光
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, ShaderType)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, ShaderType)]
 pub struct LightGlobals {
   pub count: u32,
   pub _pad0: u32,
@@ -67,7 +69,7 @@ pub struct LightGlobals {
 
 /// BG3 uniform 整体，WGSL `LightPool` 逐字段镜像。
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Resource, ShaderType)]
+#[derive(Debug, Default, Clone, Copy, Resource, ShaderType)]
 pub struct LightPoolUniform {
   pub g: LightGlobals,
   pub lights: [LightDesc; MAX_LIGHTS],
@@ -104,7 +106,10 @@ pub struct SkyCfg {
 }
 
 /// 光照主题（`assets/lighting/*.ron`）：方向光 + 环境 + 天空 + 曝光
-#[derive(Debug, Clone, PartialEq, Resource, Deserialize)]
+/// ExtractResource：main world 资源自动提取进 render world（BG3 光池数据源）
+#[derive(
+  Debug, Clone, PartialEq, Resource, Deserialize, bevy::render::extract_resource::ExtractResource,
+)]
 pub struct LightingTheme {
   pub sun: Option<DirLightCfg>,
   pub ambient: [f32; 3],

@@ -27,7 +27,7 @@
 | **内部观察（v3）** | **仅剖面切割**（DDA 裁剪平面，近零成本），不做 X-ray 半透明 | 编辑/调试封闭电路刚需；管线早期预留 |
 | **光照主题（v3）** | 数据驱动配置（光源/环境/曝光资产化），首发仅深调**暗色实验室**；另含**「自然日光」户外主题**（天空/雾/太阳参数资产化，对标 Douglas Dwyer devlog 观感，demo 场景验收用） | M3 调优矩阵不随主题数翻倍；其余主题后置扩展 |
 | **动态体素对象 OBJ**（已被 v4 吸收，独立决策项取消） | **已被数据结构 v4 吸收**：Volume 统一架构下（见数据结构 v4 行 + 世界结构行），主世界和独立物体共享完全相同的 ChunkTree 格式（256³ chunk + 4³ 分裂 + u64 mask + compact child offset）、完全相同的 Douglas mask DDA 路径（每层单次 load → bitwise AND → popcount）、完全相同的单一 struct buffer 池。差异只通过 GridDesc（变换矩阵 + 世界 AABB + tree_base/tree_depth/palette_base）吸收。原 BrickMapGlobals vs ObjDesc 分裂、BG0 vs BG2 分裂、kind 分支、obj 五步链、1-tile 限制——**全部删除**。细节见 `docs/unified-grid-plan.md`（v4 chunk256³ 最终版）+ ADR-0007（v4 最终版） | 原 OBJ v6/v7 独立决策项不再需要。统一后 shader 删掉 obj_cell_occupied / obj_sample_voxel 整套实现（~200 行），obj.rs 文件删除，VRAM 共享池化。未来多 chunk 物体、动态 Volume 拆分（碎裂/切割）无障碍。Phase 0 gate-voxel Tile 内重写（chunk 128³→256³ + 4³ 分裂 + 编辑 API）是前置条件 |
-| **光源表示（v3.2）** | 方向光 = 带角半径太阳盘（**软阴影**锥采样）；点光 = 球形光（立体角采样）；**发光元件进 NEE 光源列表**（ComponentTable 聚合驱动，数量有界） | Douglas octo 观感对标（PT 光照/软阴影/自发光照明是其标志性画面）；「通电电路照亮暗室」= 电路游戏核心视觉语言，M2 即具备而非等 P9 |
+| **光源表示（v6）** | 直光 = 方向光**硬阴影**（DDA 命中后 1 条太阳射线，per-pixel，#17 形态）；发光体素 = emissive radiance 直出（无方向性、不受阴影）；**无点光源、无 Phong 高光、无软阴影锥采样、无 NEE 光源列表**；「通电电路照亮暗室」由 emissive 直出 + DDGI 无限反弹实现（R3-10 probe endpoint emissive 分支） | 1:1 对齐 Douglas 最终架构（docs/douglas-final.md §1 黑名单/§5）——他从未使用点光源/高光/软阴影，v3.2 的 NEE+软阴影扩展架构已被实践证伪废弃；当前 GPU 主路径保持 unlit，光照待按 #22/#23 统一实施 |
 | **光照量化粒度（v5）** | **逐体素 flat shading，1:1 复刻 Douglas #22/#23**：无 per-voxel 光照缓存；直光硬阴影 per-pixel 直接算；间接光从 DDGI probe irradiance 采样；composite 主 pass 一次出 final color | 废弃逐面着色 + face_light hashmap（控制流 bug 反复 + 碰撞率 39%+ 无根治方案）；hashmap 是 #19 PT indirect 时代遗物，Douglas #23 已移除 |
 | **体素 normal 存储策略（v4）** | **CPU 侧不存 normal（天生对齐 Douglas #22），GPU 侧 upload 时 bake normal → 渲染缓存**：normal 不是体素固有属性，是可丢弃的派生数据；dirty tile upload 时一次性派生生成，edit 操作不触发 CPU 侧 normal 维护 | gate 从数据结构设计上就不存在 Douglas #22 的 "edit 后同步维护邻居 normal → huge headache" 问题 |
 | **纹理路线（v5）** | **Triplanar PBR 纹理系统**（对标 Douglas #22）：upload bake normal + triplanar 纹理坐标 + albedo/roughness/metallic 进 GPU 渲染缓存；shader triplanar 采样 × per-voxel 光照值 = 最终颜色 | 视觉基础升级（纯色块 → 纹理化材质）+ 架构一致性（与 bake normal 同构） |
@@ -115,6 +115,8 @@ OBJ 动态体素对象线（随主线穿插推进）：**P2.10 多网格渲染 �
 流式大世界引擎线（与内容线解耦的引擎能力线）：**P14 全部为引擎能力、零游戏内容耦合**——14.1 tile 驻留管理器可在 P3 后任意点插入（机制全是 P2.3/P2.9/P2.10 雏形扩用），14.2 程序化分页 → 14.3 LOD → 14.4 重定基+剔除（依赖 M4 冲刺位），与 OBJ 线并行推进
 
 **v3.10 施工队列重排（2026-09-02，用户指令）**：未完成任务已按「数据结构 > 基础渲染 > 光影效果 > 玩法外壳 > 其他」重排进下方 **R1-R5 施工队列**；原 P3-P14 阶段结构改为「P0-P2 + P3 已完成项存档 + R1-R5 队列」，阶段号保留作 ID（全文交叉引用不变），同类内保持原编号顺序。上图为里程碑依赖视图（两个生死里程碑不变），R1-R5 为施工优先级视图；M2 验收门（3.7）仍由 R2+R3 完成后触发。
+
+**当前主线重定向（2026-09-04，用户指令）**：**电路玩法线整体后置**（R4 全部、R4-8+ 模拟、P5/P6/P7/P8、R2-1 状态通道、R3-7 全息变体）；当前唯一主线 = **引擎复刻**——渲染+光照最终方案一次到位（R3-18 直光层 → R3-10 DDGI → R3-11/13 合成 → R3-3/4/5 观感包 → R6 triplanar 纹理 + bake normal），随后引擎能力线（P14 流式、物理复刻 #26-#29）。
 
 两个生死里程碑：
 1. **P2.7 首个画面上屏**——砖块图 + DDA 是否真的能在 Bevy 里跑起来

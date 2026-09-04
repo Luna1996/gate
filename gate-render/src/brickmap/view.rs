@@ -27,12 +27,13 @@ fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   )
 }
 
-/// 读一个节点的 (mask, palette_u32)。`node` 为 b_struct 内绝对字址。
+/// 读一个节点的 (mask, palette)。`node` 为 b_struct 内绝对字址。
+/// palette word 低字节 = uniform 子块色（高字节 = LOD 子树多数色，GPU 早停用）
 #[inline]
 fn read_node(b_struct: &[u32], node: usize) -> (u64, u32) {
   let lo = b_struct[node] as u64;
   let hi = b_struct[node + 1] as u64;
-  (hi << 32 | lo, b_struct[node + 2])
+  (hi << 32 | lo, b_struct[node + 2] & 0xFF)
 }
 
 /// 砖块图只读视图：持有与 GPU buffer 字节一致的缓冲区引用
@@ -92,6 +93,7 @@ impl<'a> BrickMapView<'a> {
   }
 
   /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
+  /// wire v2：level 3（叶父层）inline palette 直读，消除 level 4 叶节点
   pub fn get_voxel(&self, fine: IVec3) -> Option<u8> {
     let chunk = fine.div_euclid(IVec3::splat(CHUNK_SIZE));
     let base = self.chunk_base(chunk)?;
@@ -101,7 +103,6 @@ impl<'a> BrickMapView<'a> {
     loop {
       let (mask, pal) = read_node(self.b_struct, node);
       if mask == 0 {
-        // uniform leaf（含 level 4 Uniform）：palette 0 = AIR
         return (pal != 0).then_some(pal as u8);
       }
       let child_extent = extent >> 2;
@@ -111,11 +112,15 @@ impl<'a> BrickMapView<'a> {
       let ci = (iz * 16 + iy * 4 + ix) as u64;
       let bit = 1u64 << ci;
       if mask & bit == 0 {
-        // uniform 子块：颜色 = 本节点 palette_u32（零额外 load）
         return (pal != 0).then_some(pal as u8);
       }
+      if child_extent == 1 {
+        // wire v2：叶父层 inline palette = b_struct[node + 3 + ci]
+        let leaf_pal = self.b_struct[node + 3 + ci as usize] & 0xFF;
+        return (leaf_pal != 0).then_some(leaf_pal as u8);
+      }
+      // level 0-2：紧凑 popcount 定位 child offset
       let slot = (mask & (bit - 1)).count_ones() as usize;
-      // child offset = chunk 内相对字址 → 绝对 = base + offset
       node = base + self.b_struct[node + 3 + slot] as usize;
       local = IVec3::new(
         local.x - ix * child_extent,
@@ -162,6 +167,7 @@ impl<'a> BrickMapView<'a> {
       if mask & bit == 0 {
         return pal != 0;
       }
+      // level 0-2：紧凑 popcount 定位 child offset
       let slot = (mask & (bit - 1)).count_ones() as usize;
       node = base + self.b_struct[node + 3 + slot] as usize;
       local = IVec3::new(

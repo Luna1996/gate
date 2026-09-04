@@ -4,6 +4,10 @@
 //! 纹理用 `Assets<Image>::get_mut + resize`（Handle 不变，引用方零改动），
 //! GpuImage 由资产管线在下一次 Prepare 自动按新描述符重建；
 //! DDA shader 有越界剔除（textureDimensions），div_ceil 派发安全。
+//!
+//! 分辨率策略（2026-09-04 用户裁决纠正）：**默认全分辨率**（Douglas 最终画面 sharp =
+//! 独显全速 + FXAA；1660 Ti 7ms 是全速数字）。降分辨率只是他的**集显降档路径**
+//! （#17「体素世界低分辨率反而可爱」）——`GATE_RES_SCALE=2` 显式开启，勿默认。
 
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
@@ -15,12 +19,35 @@ use crate::brickmap::dda::{DdaImages, RenderScale};
 const MIN_DIM: u32 = 64;
 const MAX_DIM: u32 = 4096;
 
+/// 渲染分辨率 = 窗口物理像素 ÷ factor。默认 1（全分辨率，最终方案 sharp）；
+/// `GATE_RES_SCALE=2` 开启集显降档路径（Douglas #17）
+fn render_scale_factor() -> u32 {
+  static FACTOR: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+    std::env::var("GATE_RES_SCALE")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .filter(|&f| f >= 1)
+      .unwrap_or(1)
+  });
+  *FACTOR
+}
+
 fn size_is_sane(s: UVec2) -> bool {
   (MIN_DIM..=MAX_DIM).contains(&s.x) && (MIN_DIM..=MAX_DIM).contains(&s.y)
 }
 
+/// 窗口物理尺寸 → 渲染目标尺寸（每轴 ÷ factor 向下取整，钳到合法下限）
+fn render_size_for_window(full: UVec2) -> UVec2 {
+  let f = render_scale_factor();
+  UVec2::new(
+    (full.x / f).max(MIN_DIM),
+    (full.y / f).max(MIN_DIM),
+  )
+}
+
 /// 每帧对照主窗口物理尺寸；变化 → 原地重建 DDA 目标纹理并更新 RenderScale
-/// （aspect 侧由 gate-app orbit_camera_input 同帧跟随）。
+/// （aspect 侧由 gate-app orbit_camera_input 同帧跟随，用全窗尺寸——NDC 与渲染
+/// 分辨率无关，反投影/拾取在全分辨率语义下保持正确）。
 /// 退化尺寸（<64 或 >4096）：跳过本次 resize 保留上一组合法尺寸，warn 仅一次。
 pub fn resize_render_targets(
   windows: Query<&Window>,
@@ -30,24 +57,25 @@ pub fn resize_render_targets(
   mut warned: Local<bool>,
 ) {
   let Ok(window) = windows.single() else { return };
-  let new_size = UVec2::new(window.physical_width(), window.physical_height());
-  if !size_is_sane(new_size) {
+  let full = UVec2::new(window.physical_width(), window.physical_height());
+  if !size_is_sane(full) {
     if !*warned {
       warn!(
         "degenerate window size {}x{}, resize skipped (keep {}x{})",
-        new_size.x, new_size.y, scale.size.x, scale.size.y
+        full.x, full.y, scale.size.x, scale.size.y
       );
       *warned = true;
     }
     return;
   }
   *warned = false;
+  let new_size = render_size_for_window(full);
   if new_size == scale.size {
     return;
   }
   info!(
-    "render targets resized: {}x{} -> {}x{}",
-    scale.size.x, scale.size.y, new_size.x, new_size.y
+    "render targets resized: {}x{} (window {}x{}, factor {})",
+    new_size.x, new_size.y, full.x, full.y, render_scale_factor()
   );
   let extent = Extent3d {
     width: new_size.x,
@@ -102,5 +130,12 @@ mod tests {
     assert!(!size_is_sane(UVec2::new(65496, 720)));
     assert!(!size_is_sane(UVec2::new(0, 720)));
     assert!(!size_is_sane(UVec2::new(4097, 100)));
+  }
+
+  /// 分辨率策略：默认全分辨率（factor=1）；GATE_RES_SCALE=2 降档路径
+  #[test]
+  fn render_size_follows_factor() {
+    assert_eq!(render_size_for_window(UVec2::new(1600, 900)), UVec2::new(1600, 900));
+    assert_eq!(render_size_for_window(UVec2::new(100, 100)), UVec2::new(100, 100));
   }
 }

@@ -8,7 +8,8 @@ use bevy::{
   prelude::*,
   window::{PresentMode, Window},
 };
-use glam::{Mat3, Vec3};
+use glam::{IVec3, Vec3};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use gate_render::{
@@ -22,6 +23,8 @@ use gate_ui::{
 use gate_voxel::{
   PaletteEntry, VolumeTransform, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
 };
+
+mod vox_scene;
 
 /// 以 crate 目录为锚的 assets 路径，F5 / 终端启动行为一致
 pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
@@ -81,8 +84,7 @@ fn main() {
             let file = std::fs::File::create(path).ok()?;
             let (writer, guard) = tracing_appender::non_blocking(file);
             std::mem::forget(guard);
-            let offset =
-              time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+            let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
             let timer = tracing_subscriber::fmt::time::OffsetTime::new(
               offset,
               time::format_description::well_known::Rfc3339,
@@ -100,20 +102,23 @@ fn main() {
     // P2.7：渲染诊断（Bevy 0.19 非默认装配，仅 tracing-tracy feature 才自动加）——
     // 装配后 DiagnosticsRecorder 才存在，4×pass 的 time_span 才会记录 GPU/CPU 耗时；
     // 未装配时 gate-render 的 span 走 Option<&T> no-op，不影响渲染
-    .add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
+    // .add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
+    // 每秒打印 DiagnosticsStore（含 gate_dda_trace 等 GPU span，性能分解用）
+    .add_plugins(bevy::diagnostic::LogDiagnosticsPlugin::default())
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
+    .insert_resource(gate_render::brickmap::vis_cache::VisCacheEnabled(true))
     .add_systems(Startup, setup)
     .add_systems(
       Update,
       (
         orbit_camera_input,
         left_click_pick_recenter.after(orbit_camera_input),
-        edit_tile_every_120_frames,
         demo_ui_setup,
         // 先推帧时长样本，gate-ui 的 plot_redraw_system 同帧再重绘折线图
         fps_line_feed.before(gate_ui::plot_redraw_system),
         debug_normals_toggle,
+        vis_cache_toggle,
       ),
     )
     .run();
@@ -131,23 +136,61 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   .map_err(|e| format!("read: {e}"))
   .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))
   .unwrap_or_else(|e| {
-    bevy::log::warn!("lighting/dark_lab.ron 加载失败（{e}），回退内置默认主题");
+    bevy::log::warn!("lighting/day_outdoor.ron 加载失败（{e}），回退内置默认主题");
     Default::default()
   });
   commands.insert_resource(theme);
   commands.insert_resource(DdaImages { target: dda_handle });
-  // P2.6：轨道相机为唯一相机状态源；DdaCameraConfig 由 from_orbit 生成
-  // （初始机位：世界中心俯视 45°，距离随规模缩放，一览全境）
-  // 诊断：GATE_CAM=sky → 仰视天空（纯 miss，验证 GPU 时间是否随负载变化）
+  commands.insert_resource(DebugNormals(
+    if std::env::var("GATE_UNLIT").as_deref() == Ok("1") { 3 } else { 0 }
+  ));
+
+  // ---- 场景：GATE_SCENE=vox（默认）→ MagicaVoxel nuke.vox；=demo → 旧极限场景 ----
+  let t0 = std::time::Instant::now();
+  let mut grid = gate_voxel::VolumeGrid::new();
+  // 相机初始机位：demo 路径 = 世界中心俯视；vox 路径由场景 AABB 推出
   let c = *EXT_FINE_HALF as f32;
   let dist = 380.0 * *EXT_N_TILES as f32;
+  let mut cam_eye = Vec3::new(c + dist, 2600.0, c + dist);
+  let mut cam_target = Vec3::new(c, 320.0, c);
+  match std::env::var("GATE_SCENE").as_deref() {
+    Ok("demo") => {
+      paint_demo_palette(&mut grid);
+      bevy::log::info!("STEP 1: palette done ({:?})", t0.elapsed());
+      build_demo_scene(&mut grid);
+      bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
+    }
+    _ => {
+      let anchor = IVec3::new(*EXT_FINE_HALF, 16, *EXT_FINE_HALF);
+      let path = Path::new(ASSETS_PATH).join("vox/nuke.vox");
+      let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
+        .expect("nuke.vox 加载失败");
+      cam_target = info.center();
+      let dir = Vec3::new(1.0, 0.55, 1.0).normalize();
+      cam_eye = cam_target + dir * (info.diagonal() * 1.15).max(dist);
+      bevy::log::info!(
+        "VOX SCENE: instances={} written={} dropped={} aabb=[{}]-[{}]",
+        info.instances_used,
+        info.voxels_written,
+        info.voxels_dropped,
+        info.aabb_min,
+        info.aabb_max,
+      );
+      bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
+    }
+  }
+  grid.compact_all(); // GC：回收编辑过程累积的废弃节点
+  bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
+
+  // P2.6：轨道相机为唯一相机状态源；DdaCameraConfig 由 from_orbit 生成
+  // （初始机位：场景中心俯视；诊断：GATE_CAM=sky → 仰视天空，纯 miss 验证 GPU 负载）
   let orbit = if std::env::var("GATE_CAM").as_deref() == Ok("sky") {
-    OrbitCamera::from_eye(Vec3::new(c, 320.0, c), Vec3::new(c, 5000.0, c))
-  } else {
     OrbitCamera::from_eye(
-      Vec3::new(c + dist, 2600.0, c + dist),
-      Vec3::new(c, 320.0, c),
+      Vec3::new(cam_target.x, 320.0, cam_target.z),
+      Vec3::new(cam_target.x, 5000.0, cam_target.z),
     )
+  } else {
+    OrbitCamera::from_eye(cam_eye, cam_target)
   };
   commands.insert_resource(orbit);
   commands.insert_resource(DdaCameraConfig::from_orbit(
@@ -157,17 +200,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     CAM_NEAR,
     CAM_FAR,
   ));
-  commands.insert_resource(DebugNormals::default());
-
-  // ---- demo scene：调色板 + 多分辨率混合极限场景 ----
-  let t0 = std::time::Instant::now();
-  let mut grid = gate_voxel::VolumeGrid::new();
-  paint_demo_palette(&mut grid);
-  bevy::log::info!("STEP 1: palette done ({:?})", t0.elapsed());
-  build_demo_scene(&mut grid);
-  bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
-  grid.compact_all(); // GC：回收编辑过程累积的废弃节点
-  bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
 
   // 诊断：打印 brickmap globals
   {
@@ -210,43 +242,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // ---- Phase 3 OBJ→Volume 统一：物体作为 Volumes.list[1..N] 加入容器 ----
   // 旧 ObjScene/Pack_obj_pool/ObjObject 三段管道已删除；物体 = 普通的 VolumeGrid，
   // 通过 Volumes.add_object() 注册变换，走与主世界相同的 dirty → builder → upload 路径。
-  let mut volumes = Volumes::new(grid);
-  // 物体锚点随世界中心缩放（c = 世界中心）；三枚芯片都拿到城堡区平地（地面 y=16），
-  // 南侧三角错开、互不重叠、避开大道（z = c±32）；姿态/缩放各异便于分辨
-  let c = *EXT_FINE_HALF as f32;
-  // A：yaw 25° + 俯仰 15°，scale 2.0
-  {
-    let id = volumes.add_object(
-      Vec3::new(c - 320.0, 16.0, c - 320.0),
-      Mat3::from_rotation_y(25.0_f32.to_radians()) * Mat3::from_rotation_x(15.0_f32.to_radians()),
-      2.0,
-    );
-    if let Some(v) = volumes.object_mut(id) {
-      *v = build_chip_prefab();
-    }
-  }
-  // B：yaw 160° + 俯仰 -30°，scale 1.3
-  {
-    let id = volumes.add_object(
-      Vec3::new(c + 300.0, 16.0, c - 200.0),
-      Mat3::from_rotation_y(160.0_f32.to_radians()) * Mat3::from_rotation_x(-30.0_f32.to_radians()),
-      1.3,
-    );
-    if let Some(v) = volumes.object_mut(id) {
-      *v = build_chip_prefab();
-    }
-  }
-  // C：yaw -75° + 俯仰 40°，scale 2.2
-  {
-    let id = volumes.add_object(
-      Vec3::new(c - 100.0, 16.0, c + 300.0),
-      Mat3::from_rotation_y(-75.0_f32.to_radians()) * Mat3::from_rotation_x(40.0_f32.to_radians()),
-      2.2,
-    );
-    if let Some(v) = volumes.object_mut(id) {
-      *v = build_chip_prefab();
-    }
-  }
+  let volumes = Volumes::new(grid);
 
   commands.insert_resource(VoxelScene {
     volumes,
@@ -671,9 +667,8 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   mark!("(5) crystals");
 
   // ================================================================
-  //  (6) 保留：tile(1,0,0) 内 L4 32³ 热点（每 120 帧黄↔青交替）
-  //      tile(2,0,0) 中心 32³ 蓝 L4（旧 demo，世界缩小时跳过）
-  //      → 保持增量上传特性展示（UPLOAD 132KB/180µs）
+  //  (6) 静态 L4 32³ 精度热点：tile(1,0,0) 金色 32³ + tile(2,0,0) 蓝 32³
+  //      （原「每 120 帧黄↔青交替」闪烁测试已移除，仅保留静态场景）
   // ================================================================
   fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 11);
   if 1264 + 32 <= *EXT_FINE_X {
@@ -685,75 +680,6 @@ fn build_demo_scene(grid: &mut gate_voxel::VolumeGrid) {
   grid.set_comp(t0, 0, 0, 0, 0x1122);
   grid.set_comp(t0, 1, 0, 0, 0x3344);
   mark!("(6) hotspots+state");
-}
-
-// ================= P2.10 OBJ 硬编码芯片预制件 =================
-//
-// 电子学级小网格（128×32×128 fine，独立 1-chunk VolumeGrid，全链复用
-// VolumeGrid/BrickMapBuilder）。含 L0 PCB / 引脚 / die + L4 走线（1-fine
-// 细线，练习 brick slab 路径）。三枚实例见 setup()：贴地 / 交叠 / 旋转缩放。
-
-fn build_chip_prefab() -> gate_voxel::VolumeGrid {
-  let mut g = gate_voxel::VolumeGrid::new();
-  // 芯片自带 palette（物体独立 256 条；1 PCB 绿 / 2 走线青 / 3 引脚金 / 4 die 银灰）
-  let pal = g.palette_mut();
-  let chip_colors: &[(u8, [u8; 3], u8)] = &[
-    (1, [26, 84, 52], 200),
-    (2, [68, 230, 220], 150),
-    (3, [248, 210, 72], 160),
-    (4, [188, 196, 208], 170),
-  ];
-  for &(idx, color, rough) in chip_colors {
-    let mut e = PaletteEntry::default();
-    e.color = color;
-    e.roughness = rough;
-    pal.set(idx, e);
-  }
-  // PCB 基板（L0）+ 中央 die + 四边引脚
-  fill_box(&mut g, IVec3::ZERO, IVec3::new(128, 16, 128), 1);
-  fill_box(&mut g, IVec3::new(48, 16, 48), IVec3::new(32, 16, 32), 4);
-  for s in 0..4 {
-    fill_box(
-      &mut g,
-      IVec3::new(8 + s * 32, 16, 0),
-      IVec3::new(16, 8, 8),
-      3,
-    );
-    fill_box(
-      &mut g,
-      IVec3::new(8 + s * 32, 16, 120),
-      IVec3::new(16, 8, 8),
-      3,
-    );
-    fill_box(
-      &mut g,
-      IVec3::new(0, 16, 8 + s * 32),
-      IVec3::new(8, 8, 16),
-      3,
-    );
-    fill_box(
-      &mut g,
-      IVec3::new(120, 16, 8 + s * 32),
-      IVec3::new(8, 8, 16),
-      3,
-    );
-  }
-  // L4 走线（1-fine 细线，PCB 上表面 y=32）
-  for i in 0..7 {
-    fill_box(
-      &mut g,
-      IVec3::new(16 + i * 16, 32, 16),
-      IVec3::new(1, 1, 96),
-      2,
-    );
-    fill_box(
-      &mut g,
-      IVec3::new(16, 32, 16 + i * 16),
-      IVec3::new(96, 1, 1),
-      2,
-    );
-  }
-  g
 }
 
 /// 轨道相机输入（P2.6 spec FR-3/FR-4）：
@@ -923,44 +849,26 @@ fn left_click_pick_recenter(
 /// 按 N 切换法向向量可视化调试
 fn debug_normals_toggle(keys: Res<ButtonInput<KeyCode>>, mut dbg_res: ResMut<DebugNormals>) {
   if keys.just_pressed(KeyCode::KeyN) {
-    // 三态循环：0 = 正常 → 1 = 法向向量 → 2 = face 6 色
-    dbg_res.0 = (dbg_res.0 + 1) % 3;
+    // 四态循环：0 = 正常 → 1 = 法向向量 → 2 = face 6 色 → 3 = unlit（跳过全部光照）
+    dbg_res.0 = (dbg_res.0 + 1) % 4;
     let label = match dbg_res.0 {
       1 => "ON (法向向量)",
       2 => "ON (face 6 色)",
+      3 => "UNLIT (跳过全部光照，测纯 trace 帧率)",
       _ => "OFF (正常)",
     };
     bevy::log::info!("DebugNormals: mode {} — {label}", dbg_res.0);
   }
 }
 
-/// 每 120 帧改一次 tile (1,0,0) 触发增量上传（验证 UPLOAD[incremental] 日志）
-/// 用 set_voxel 填 palette 交替 → 确保一定产生 DirtyEdit（而不是 clear 空胞 no-op）
-fn edit_tile_every_120_frames(mut frame: Local<u64>, scene: Option<ResMut<VoxelScene>>) {
-  *frame += 1;
-  let Some(mut scene) = scene else { return };
-  if *frame == 1 {
-    scene.demo_force_full_rebuild = false;
-  }
-  if (*frame).is_multiple_of(120) {
-    // 每 120 帧重写 tile(1,0,0) 内 32³ L4 热点（fine 656..688），palette 金↔青交替
-    // 与 setup 热点重合同区域 → 必定产生 DirtyEdit → UPLOAD[incremental]
-    let pal = if (*frame / 120) % 2 == 1 { 11 } else { 8 };
-    let origin = IVec3::new(656, 64, 64);
-    let mut z = 0;
-    while z < 32 {
-      let mut y = 0;
-      while y < 32 {
-        let mut x = 0;
-        while x < 32 {
-          let pos = origin + IVec3::new(x, y, z);
-          scene.volumes.main_mut().set_voxel_ivec3(pos, pal);
-          x += 1;
-        }
-        y += 1;
-      }
-      z += 1;
-    }
+/// 按 V 切换逐体素直光可见性缓存（Douglas #19 per-voxel vis；默认开）
+fn vis_cache_toggle(
+  keys: Res<ButtonInput<KeyCode>>,
+  mut enabled: ResMut<gate_render::brickmap::vis_cache::VisCacheEnabled>,
+) {
+  if keys.just_pressed(KeyCode::KeyV) {
+    enabled.0 = !enabled.0;
+    bevy::log::info!("VisCache enabled = {}", enabled.0);
   }
 }
 

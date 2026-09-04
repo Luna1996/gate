@@ -39,6 +39,10 @@ pub struct VolumeGrid {
   pub transform: VolumeTransform,
   /// 渲染器分配的 obj_id（主世界 = -1；物体 = 0..N-1，对应 `Volumes.list[1..]` 索引）。
   pub obj_id: i32,
+  /// 体素编辑单调代数（每次实际改变体素的 set/clear/fill +1；noop 同色重复写不递增）。
+  /// 渲染侧探针烘焙等派生数据据此判断「自上次构建以来世界是否被编辑」→ 触发重烘。
+  /// palette 变化不计入（探针位置不变，辐射度由射线更新 EMA 自然收敛）。
+  edit_generation: u64,
 }
 
 impl Default for VolumeGrid {
@@ -52,6 +56,7 @@ impl Default for VolumeGrid {
       state_dirty: true,
       transform: VolumeTransform::IDENTITY,
       obj_id: -1,
+      edit_generation: 0,
     }
   }
 }
@@ -194,6 +199,11 @@ impl VolumeGrid {
     self.obj_id
   }
 
+  /// 体素编辑代数（派生数据重烘判据；palette 变化不计入）
+  pub fn edit_generation(&self) -> u64 {
+    self.edit_generation
+  }
+
   pub fn palette(&self) -> &Palette {
     &self.palette
   }
@@ -244,6 +254,17 @@ impl VolumeGrid {
     tree.get_uniform(local.x, local.y, local.z, level)
   }
 
+  /// brick 三态查询（DDGI 探针烘焙）：chunk 缺失 = 无限空气 = Air
+  pub fn get_brick_state(&self, voxel: VoxelCoord, level: u8) -> crate::chunk_tree::BrickState {
+    use crate::chunk_tree::BrickState;
+    let chunk = voxel.chunk();
+    let Some(tree) = self.chunks.get(&chunk) else {
+      return BrickState::Air;
+    };
+    let local = voxel.in_chunk();
+    tree.get_brick_state(local.x, local.y, local.z, level)
+  }
+
   // =========================================================================
   // 体素编辑
   // =========================================================================
@@ -255,6 +276,7 @@ impl VolumeGrid {
     let tree = self.chunks.entry(chunk).or_insert_with(ChunkTree::empty);
     if tree.set_voxel(local.x, local.y, local.z, palette) {
       self.dirty.mark_data(chunk);
+      self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk })
     } else {
       None
@@ -285,6 +307,7 @@ impl VolumeGrid {
     };
     if changed {
       self.dirty.mark_data(cc);
+      self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk: cc })
     } else {
       None
@@ -301,6 +324,7 @@ impl VolumeGrid {
         self.chunks.remove(&chunk);
       }
       self.dirty.mark_data(chunk);
+      self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk })
     } else {
       None
@@ -394,6 +418,27 @@ mod tests {
     assert_eq!(grid.get_voxel(VoxelCoord::new(5, 6, 7)), None);
     assert!(grid.set_voxel(VoxelCoord::new(5, 6, 7), 1).is_some());
     assert_eq!(grid.get_voxel(VoxelCoord::new(5, 6, 7)), Some(1));
+  }
+
+  #[test]
+  fn edit_generation_tracks_real_changes() {
+    let mut grid = VolumeGrid::new();
+    assert_eq!(grid.edit_generation(), 0);
+    // 实际写入 +1
+    assert!(grid.set_voxel(VoxelCoord::new(1, 2, 3), 5).is_some());
+    assert_eq!(grid.edit_generation(), 1);
+    // 同色重复写 = noop，代数不变
+    assert!(grid.set_voxel(VoxelCoord::new(1, 2, 3), 5).is_none());
+    assert_eq!(grid.edit_generation(), 1);
+    // fill_brick +1
+    assert!(grid.fill_brick(IVec3::new(16, 0, 0), 4, 7).is_some());
+    assert_eq!(grid.edit_generation(), 2);
+    // clear +1；清空后 chunk 删除
+    assert!(grid.clear_voxel(VoxelCoord::new(1, 2, 3)).is_some());
+    assert_eq!(grid.edit_generation(), 3);
+    // 清空气 = noop
+    assert!(grid.clear_voxel(VoxelCoord::new(100, 100, 100)).is_none());
+    assert_eq!(grid.edit_generation(), 3);
   }
 
   #[test]

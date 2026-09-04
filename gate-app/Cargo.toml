@@ -16,3 +16,4 @@ tracing-subscriber = { version = "0.3.20", features = ["time"] }
 tracing-appender = "0.2"
 # formatting = Rfc3339 格式化；local-offset = current_local_offset()（Windows 安全，main 早期单线程）
 time = { version = "0.3", features = ["formatting", "local-offset"] }
+vox-rs = "0.2.0"

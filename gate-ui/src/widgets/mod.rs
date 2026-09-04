@@ -17,8 +17,8 @@ pub use label::{label, label_muted};
 pub use list::{RingList, list, ring_list_sync_system};
 pub use panel::panel;
 pub use plot::{
-  PLOT_H, PLOT_W, PlotCanvas, PlotData, PlotDomain, PlotExtents, PlotYAxis, blank_plot_image,
-  plot, plot_redraw_system, plot_yaxis,
+  PLOT_H, PLOT_W, PlotCanvas, PlotData, PlotDomain, PlotExtents, PlotYAxis, blank_plot_image, plot,
+  plot_redraw_system, plot_yaxis,
 };
 pub use slider::{
   SliderRange, SliderStep, SliderThumb, SliderValue, UiSlider, clamp_step, slider,

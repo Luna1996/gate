@@ -339,3 +339,12 @@ N=10 场景构建 78s 卡死 + 5.9GB OOM → 全部修复后 N=10 实测：1264 
 **战果**：31.5ms（30fps）→ **17.8ms（55-56 fps，GPU-bound）**。等价性测试全绿（117 tests）。
 
 **遗留（下一杠杆，2026-09-04 定向修正）**：skip-chunkwalk（纯 GridDesc 读 + slab，全 miss）稳态仍有 ~16.6ms GPU 且与负载弱相关（偶发 0.07ms 毛刺）——真实遍历仅占 ~1.2ms，底噪是大头。基准对齐：Douglas 1660 Ti 主+阴影全程 7ms。下一刀（1:1 最终方案 #17→#23 内，#7 光栅系 G-buffer/pass 拆分已废弃不学）：①二分矩阵重测（skyout/makegrid_only/skip-chunkwalk/full）定位 floor 层；②lazy descriptor 读（先 slab 8 字、chunk-walk 字段 slab 通过后才读——射线不用的数据不预读，与按需读树同构）；③若仍高上 #18 方向位掩码 LUT 预过滤（他实测 100→80ms）。
+
+**2026-09-04 更新**：底噪已修复（用户验证，unlit 化重构 + 每帧时长折线图验证），本节遗留项关闭；#18 LUT / beam / 阴影降档转为 R2-2/R2-4 降档池候选（仅 R3-8 性能验收不达标时启用）。**渲染+光照 = 当前主战役，且不做过渡态直接上 Douglas 最终方案**（用户指令）：R3-18 直光层 + R3-10 DDGI（#23 1:1）合并「最终光照管线」战役一次到位；电路玩法线（R4/模拟/P5-P8/R2-1/R3-7）整体后置，主线 = 引擎复刻；旧 P3.1/P3.2 自研光照代码不接回。
+
+**R3-18 直光层实现（战役 1 第一刀，2026-09-04）**：
+- GPU 侧：dda.wgsl 加 BG3 `LightPool`（464B，与 LightPoolUniform 逐字段镜像）；`sky_color()`（渐变 smoothstep(0.35) + 太阳盘 pow64×0.05 光晕）、`trace_scene()`（主射线/阴影射线共用：主世界先跑 + 逐物体收缩 t_cap；**物体循环不再被世界 miss 短路**——顺带修复天空背景前物体不可见的潜在 bug）、`shade_hit()`（albedo×(ambient×0.4+sky_grad×0.6) + 太阳硬阴影 NdotL×vis + emissive×4.0 直出 + 曝光）；dda_main 命中→着色 / miss→天空渐变
+- Rust 侧：LightingTheme 加 ExtractResource（main→render world 自动提取）；DdaPipelines 加 bg3 布局；LightPoolGpu 持久 UniformBuffer（prepare 覆写，不逐帧重分配）；常量镜像 wgsl_consts::SHADOW_BIAS/SHADOW_DIR_T_MAX/EMISSIVE_EMIT_GAIN
+- 踩坑：dda.wgsl 再次混入 UTF-8 BOM（`\u{feff}`，naga parse 拒绝）——写文件后必须确认无 BOM
+- 验证：全 workspace 测试通过（wgsl_shaders_parse_and_validate 含新 BG3）、cargo check 0 警告、cargo fmt 干净
+- **待 F5 验收**：太阳硬阴影可见、天空渐变+太阳盘、暗处发光体素 emissive 照明、整体亮度合理（曝光 1.0）
