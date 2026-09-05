@@ -394,6 +394,17 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   let ro_c = ro - chunk_min;
   // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv）
   let inv_rd = 1.0 / rd;
+  // 不变量预计算（sign_v / rd 在整个 trace_chunk 内不变）
+  let abs_inv_rd = abs(inv_rd);                  // 优化1：省每轮 abs(inv_rd)
+  let axis_on = abs(rd) > vec3<f32>(1e-30);      // 优化1：省每轮 abs(rd)>eps
+  let oct = select(0u, 1u, sign_v.x >= 0)        // 优化2：省每次 LUT 检查 3 个 select
+    | (select(0u, 1u, sign_v.y >= 0) << 1u)
+    | (select(0u, 1u, sign_v.z >= 0) << 2u);
+  let dir_side = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0)); // 优化3
+  let face_base = vec3<u32>(                     // 优化4：省 inner 每步 select+比较
+    select(1u, 0u, sign_v.x >= 0),
+    select(1u, 0u, sign_v.y >= 0),
+    select(1u, 0u, sign_v.z >= 0));
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
@@ -417,7 +428,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let b = bricks[level];
       // WGSL 移位 RHS 必须 u32
       let sh = vec3<u32>(level * 2u);
-      let cell = clamp(vec3<i32>(v >> sh) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
+      let cell = vec3<i32>(v >> sh) & vec3<i32>(3); // &3 恒 0..3，clamp 死代码已删
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
         // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
@@ -475,11 +486,8 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let b = bricks[level];
       if (b.pal == 0u) {
         let sh = vec3<u32>(level * 2u);
-        let ecell = clamp(vec3<i32>(v >> sh) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
+        let ecell = vec3<i32>(v >> sh) & vec3<i32>(3);
         let entry_i = u32(ecell.z * 16 + ecell.y * 4 + ecell.x);
-        let oct = select(0u, 1u, sign_v.x >= 0)
-          | (select(0u, 1u, sign_v.y >= 0) << 1u)
-          | (select(0u, 1u, sign_v.z >= 0) << 2u);
         let lut_base = min(oct * 64u + entry_i, 511u);
         var reach = b_leaves[lut_base];
         reach = select(reach, ~u64(0), lut_disable);
@@ -495,14 +503,12 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     let s_mask = ~(s - 1i);    // 对齐掩码（two's complement: ~(s-1) = -s）
     // side_distance_for_ray：v 对齐到 s 的基址；正向 → 基址+s，负向 → 基址
     let base_v = v & vec3<i32>(s_mask);
-    let boundary = vec3<f32>(base_v)
-      + select(vec3<f32>(0.0), vec3<f32>(f32(s)), sign_v >= vec3<i32>(0));
+    let boundary = vec3<f32>(base_v) + dir_side * f32(s);
     var side = vec3<f32>(1e+30);
-    let axis_on = abs(rd) > vec3<f32>(1e-30);
     side = select(side, (boundary - ro_c) * inv_rd, axis_on);
     side = max(side, vec3<f32>(cur_t));
     // 每轴步长 t 增量（level 不变则不变）：inner 里 O(1) 加法
-    let step_inc = vec3<f32>(f32(s)) * abs(inv_rd);
+    let step_inc = f32(s) * abs_inv_rd;
     var step_axis: u32 = 0u;
     var changed = false;
     loop {
@@ -518,7 +524,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       // 沿 mn 轴整子块跨越
       v[mn] = v[mn] + sign_v[mn] * s;
       side[mn] = side[mn] + step_inc[mn];
-      face = mn * 2u + select(1u, 0u, sign_v[mn] >= 0);
+      face = mn * 2u + face_base[mn];
       // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
       let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
       if (crossed) { changed = true; break; }
@@ -528,7 +534,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       // （traverse 节点 load + LUT + side 重算）；仅「分裂子块」回 traverse 下钻。
       let b = bricks[level];
       let sh2 = vec3<u32>(log2);
-      let cell = clamp(vec3<i32>(v >> sh2) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
+      let cell = vec3<i32>(v >> sh2) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
         // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
@@ -557,9 +563,10 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     let positive = sign_v[step_axis] >= 0;
     let cur_log2 = level * 2u;
     let m: u32 = 0xFFFFFFFFu << cur_log2;
+    let not_m = ~m;                              // = (1<<cur_log2)-1，复用于 region_max
     let vmin_u = u32(v[step_axis]); // i32→u32 位环绕（负值公式自然处理）
     var comp: u32;
-    if (positive) { comp = vmin_u & m; } else { comp = (vmin_u & m) | ~m; }
+    if (positive) { comp = vmin_u & m; } else { comp = (vmin_u & m) | not_m; }
     let tz_i = firstTrailingBit(comp + select(1u, 0u, positive)); // 0 → -1
     var new_level: u32 = 0xFFFFFFFFu;
     if (tz_i >= 0) { new_level = u32(tz_i) >> 1u; }
@@ -570,7 +577,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     let mi = i32(m);
     let base = v & vec3<i32>(mi);
     let p = ro_c + rd * cur_t;
-    let region_max = base + vec3<i32>(i32(~m));
+    let region_max = base + vec3<i32>(i32(not_m));
     v = clamp(vec3<i32>(floor(p)), base, region_max);
     v[step_axis] = i32(comp);
   }
@@ -760,15 +767,16 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   let face_x = (dir_word >> 8u) & 0xFFu;
   let face_y = (dir_word >> 16u) & 0xFFu;
   let face_z = (dir_word >> 24u) & 0xFFu;
-  var delta = vec3<f32>(1e+30);
-  delta = select(delta, 1.0 / abs(rd), abs(rd) > vec3<f32>(1e-30));
+  // 预计算 inv_rd（6 次除法 → 3 次除法 + 3 次乘法）
+  let grid_inv_rd = 1.0 / rd;
+  let grid_axis_on = abs(rd) > vec3<f32>(1e-30);
+  let delta = select(vec3<f32>(1e+30), abs(grid_inv_rd), grid_axis_on);
   let delta_c = delta * f32(CHUNK_SIZE);
   let start = ro + rd * tl0;
   var ci = vec3<i32>(floor(start / f32(CHUNK_SIZE)));
   // tmax_c：到下一 chunk 边界的 t（ro 系绝对）
-  var tmax_c = vec3<f32>(1e+30);
   let bnd_c = (vec3<f32>(ci) + side) * f32(CHUNK_SIZE);
-  tmax_c = select(tmax_c, (bnd_c - ro) / rd, abs(rd) > vec3<f32>(1e-30));
+  var tmax_c = select(vec3<f32>(1e+30), (bnd_c - ro) * grid_inv_rd, grid_axis_on);
   tmax_c = max(tmax_c, vec3<f32>(tl0));
   var t_enter_c = tl0;
   // LOD 早停 t 阈值系数：子块(局部单位 sub)投影 < 1px ⇔ t > sub * (scale / 像素角大小)
