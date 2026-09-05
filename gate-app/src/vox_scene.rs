@@ -5,6 +5,14 @@
 //! 读取时把场景图烘焙成 flat instances（transform 已组合父级链），
 //! 逐实例把稠密体素数组经 4×4 矩阵（90° 旋转 + 整数平移）变换后写入主世界。
 //!
+//! **翻转轴补偿**（1-voxel 偏移 + 接缝串色根因）：voxel p 的立方体是
+//! [p, p+1)，点变换 world = R·(p−pivot) + t 只给出 max 角；旋转带负号
+//! 的轴（如 Y→−X）上真实立方体区间是 [q−1, q]，必须注册 min 角
+//! q−1——否则该实例沿翻转轴整体偏移 +1 voxel，与邻接模块重叠、
+//! last-writer-wins 串色。补偿 = 每实例常量 flip_j = min(0, m_0j, m_1j, m_2j)
+//! （vox 轴系，见 `instance_flip`）；90°/180° 旋转必有 1~2 个翻转轴，
+//! identity 实例不受影响。
+//!
 //! palette 映射：vox 色号 1..=255 → gate palette 同号（0 = AIR）；
 //! MATL 材质的 rough/emit 线性映射到 PaletteEntry.roughness/emissive。
 
@@ -165,7 +173,9 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene) {
 /// 会给每个模型附加与尺寸相关的 c 偏移，rebase 后不同尺寸模块相互错位）。
 /// 父级 group 链已由 vox-rs 默认 ReadOptions flatten 烘焙进 transform。
 ///
-/// 坐标系适配：vox Z-up → gate Y-up，交换输出 (X, Z, Y)。
+/// 坐标系适配：vox (X 右, Y 远, Z 上) 右手系 → gate (X 右, Y 上, Z 近) 右手系。
+/// vox Y 远离观察者、gate Z 朝向观察者，方向相反，须取反 gate Z = −vox Y
+/// 以保持手性（旧映射 (X, Z, Y) 行列式 = −1 = 反射 → 场景左右镜像）。
 /// R 元素 ∈ {0, ±1}、t 为整数、pivot 为整数 → 纯整数运算无舍入误差。
 #[inline]
 fn xform(
@@ -183,8 +193,21 @@ fn xform(
   let wx = t.m00 as i32 * lx + t.m10 as i32 * ly + t.m20 as i32 * lz + t.m30 as i32;
   let wy = t.m01 as i32 * lx + t.m11 as i32 * ly + t.m21 as i32 * lz + t.m31 as i32;
   let wz = t.m02 as i32 * lx + t.m12 as i32 * ly + t.m22 as i32 * lz + t.m32 as i32;
-  // vox (X 右, Y 前, Z 上) → gate (X 右, Y 上, Z 前)
-  (wx, wz, wy)
+  // gate Z = −vox Y（手性修正）
+  (wx, wz, -wy)
+}
+
+/// 翻转轴补偿（vox 轴系）：世界 j 轴的映射系数 m_ij ∈ {0, ±1} 且恰有一个
+/// 非零。该系数为 −1 时，voxel 立方体 [p, p+1) 经变换后落在 [q−1, q]，
+/// 注册格点须取 min 角 q−1 = 点变换结果 −1；系数非负则取 max 角即点变换
+/// 本身。逐实例常量，identity 旋转全 0。
+#[inline]
+fn instance_flip(t: &vox_rs::Transform) -> IVec3 {
+  IVec3::new(
+    t.m00.min(t.m10).min(t.m20).min(0.0) as i32,
+    t.m01.min(t.m11).min(t.m21).min(0.0) as i32,
+    t.m02.min(t.m12).min(t.m22).min(0.0) as i32,
+  )
 }
 
 /// 模型盒 8 角（格点 0 与 size）经变换后的整数 AABB。
@@ -215,9 +238,25 @@ fn bucket_instance(
   models: &[vox_rs::Model],
   offset: IVec3,
 ) -> HashMap<ChunkCoord, Vec<u32>> {
-  let m = &models[inst.model_index];
+  bucket_model(
+    &models[inst.model_index],
+    &inst.transform,
+    instance_flip(&inst.transform),
+    offset,
+  )
+}
+
+/// 单模型体素分桶核心（诊断测试复用）：`flip` 为 vox 轴系翻转补偿
+/// （见 `instance_flip`），非零轴注册 min 角；诊断时传 ZERO 复现旧行为。
+fn bucket_model(
+  m: &vox_rs::Model,
+  t: &vox_rs::Transform,
+  flip: IVec3,
+  offset: IVec3,
+) -> HashMap<ChunkCoord, Vec<u32>> {
   let (sx, sy, sz) = (m.size_x as usize, m.size_y as usize, m.size_z as usize);
-  let t = &inst.transform;
+  // flip 是 vox 轴系常量 → 预换到 gate 轴系（gate Z = −vox Y 故 z 分量取反）
+  let flip_gate = IVec3::new(flip.x, flip.z, -flip.y);
   let mut map: HashMap<ChunkCoord, Vec<u32>> = HashMap::new();
   let mut cur_key: Option<ChunkCoord> = None;
   let mut cur_buf: Vec<u32> = Vec::new();
@@ -228,9 +267,9 @@ fn bucket_instance(
         if c == 0 {
           continue;
         }
-        let world =
-          IVec3::from(xform(t, m.size_x, m.size_y, m.size_z, x as u32, y as u32, z as u32))
-            + offset;
+        let world = IVec3::from(xform(t, m.size_x, m.size_y, m.size_z, x as u32, y as u32, z as u32))
+          + flip_gate
+          + offset;
         let cc = ChunkCoord(world.div_euclid(IVec3::splat(CHUNK_SIZE)));
         if cur_key != Some(cc) {
           if let Some(k) = cur_key.take() {
@@ -317,14 +356,14 @@ mod tests {
       m32: 50.0,
       ..vox_rs::Transform::identity()
     };
-    // pivot 体素 → 平移 t（gate 轴交换后 y/z 互换）
-    assert_eq!(xform(&t, 4, 4, 4, 2, 2, 2), (100, 50, 200));
-    // 角体素 (0,0,0) → t − (2,2,2) vox → gate (98, 48, 198)
-    assert_eq!(xform(&t, 4, 4, 4, 0, 0, 0), (98, 48, 198));
+    // pivot 体素 → 平移 t（gate 轴交换 + Z 取反后 y/z 互换且 z 取负）
+    assert_eq!(xform(&t, 4, 4, 4, 2, 2, 2), (100, 50, -200));
+    // 角体素 (0,0,0) → t − (2,2,2) vox → gate (98, 48, -198)
+    assert_eq!(xform(&t, 4, 4, 4, 0, 0, 0), (98, 48, -198));
 
     // 奇数尺寸：pivot = floor(size/2)，ogt 文档的 3×4×1 例子 pivot=(1,2,0)
     assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 1, 2, 0), (0, 0, 0));
-    assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 0, 0, 0), (-1, 0, -2));
+    assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 0, 0, 0), (-1, 0, 2));
 
     // 绕 vox Z 轴 90° 旋转（packed byte 33：row0=+Y, row1=−X, row2=+Z），
     // vox 空间 (wx,wy) = (ly, −lx)
@@ -336,11 +375,11 @@ mod tests {
       m
     };
     // pivot 恒落到 t
-    assert_eq!(xform(&r, 4, 4, 4, 2, 2, 2), (100, 50, 200));
-    // (0,0,0)：l=(−2,−2,−2) → vox (−2, 2, −2)+t = (98, 202, 48) → gate (98, 48, 202)
-    assert_eq!(xform(&r, 4, 4, 4, 0, 0, 0), (98, 48, 202));
-    // (4,0,0) 角：l=(2,−2,−2) → vox (−2, −2, −2)+t = (98, 198, 48) → gate (98, 48, 198)
-    assert_eq!(xform(&r, 4, 4, 4, 4, 0, 0), (98, 48, 198));
+    assert_eq!(xform(&r, 4, 4, 4, 2, 2, 2), (100, 50, -200));
+    // (0,0,0)：l=(−2,−2,−2) → vox (−2, 2, −2)+t = (98, 202, 48) → gate (98, 48, -202)
+    assert_eq!(xform(&r, 4, 4, 4, 0, 0, 0), (98, 48, -202));
+    // (4,0,0) 角：l=(2,−2,−2) → vox (−2, −2, −2)+t = (98, 198, 48) → gate (98, 48, -198)
+    assert_eq!(xform(&r, 4, 4, 4, 4, 0, 0), (98, 48, -198));
   }
 
   /// 真实资产全实例不变量：每个可见实例的 pivot 体素（floor(size/2)）
@@ -374,7 +413,7 @@ mod tests {
         (
           inst.transform.m30 as i32,
           inst.transform.m32 as i32,
-          inst.transform.m31 as i32
+          -(inst.transform.m31 as i32),
         ),
         "instance {} pivot 未落到 nTRN 平移 t（size={}×{}×{}）",
         checked,
@@ -386,5 +425,182 @@ mod tests {
     }
     assert!(checked > 0);
     println!("pivot invariant OK over {checked} visible instances");
+  }
+
+  /// 翻转轴补偿单元：2×1×1 模型旋转 X→−Y、Y→X（vox 系），立方体注册
+  /// min 角后几何对称展开于 t；无补偿（旧行为）整体沿 gate y +1。
+  #[test]
+  fn bucket_model_flip_snaps_min_corner() {
+    // vox：world_x = +local_y (m10=1)、world_y = −local_x (m01=−1)、
+    // world_z = +local_z；t = (100, 50, 0)。m00/m11 显式清零（置换矩阵）。
+    let t = vox_rs::Transform {
+      m00: 0.0,
+      m01: -1.0,
+      m10: 1.0,
+      m11: 0.0,
+      m30: 100.0,
+      m31: 50.0,
+      ..vox_rs::Transform::identity()
+    };
+    assert_eq!(instance_flip(&t), IVec3::new(0, -1, 0));
+    let model = vox_rs::Model {
+      size_x: 2,
+      size_y: 1,
+      size_z: 1,
+      voxels: vec![1, 2],
+    };
+    let cells = |buf: &[u32]| -> Vec<(IVec3, u8)> {
+      buf.iter()
+        .map(|&p| {
+          (
+            IVec3::new(
+              (p & 0xFF) as i32,
+              ((p >> 8) & 0xFF) as i32,
+              ((p >> 16) & 0xFF) as i32,
+            ),
+            (p >> 24) as u8,
+          )
+        })
+        .collect()
+    };
+    // 补偿后：p=0 → gate(100,0,250) 色1；p=1 → gate(100,0,251) 色2
+    // （offset.z=300 推到正值区间；几何 z 对称于 300−t_y=250）
+    let off = IVec3::new(0, 0, 300);
+    let fixed = bucket_model(&model, &t, instance_flip(&t), off);
+    let v = cells(&fixed[&ChunkCoord(IVec3::ZERO)]);
+    assert!(v.contains(&(IVec3::new(100, 0, 250), 1)), "{v:?}");
+    assert!(v.contains(&(IVec3::new(100, 0, 251), 2)), "{v:?}");
+    // 旧行为（flip=0）：注册 max 角 → 整体 z −1（1-voxel 偏移根因）
+    let old = bucket_model(&model, &t, IVec3::ZERO, off);
+    let v = cells(&old[&ChunkCoord(IVec3::ZERO)]);
+    assert!(v.contains(&(IVec3::new(100, 0, 249), 1)), "{v:?}");
+    assert!(v.contains(&(IVec3::new(100, 0, 250), 2)), "{v:?}");
+  }
+
+  /// 诊断（全量资产 + 排序扫描，较慢，单跑）：
+  /// `cargo test -p gate-app --release nuke_flip_conflict -- --ignored --nocapture`
+  ///
+  /// 统计「同一格被写成 ≥2 种颜色」的跨实例冲突体素数，对比翻转补偿
+  /// 前/后。正确拼装的场景模块间应无空隙无重叠 → 补偿后冲突数应骤降；
+  /// 剩余冲突按「写入方是否全为 identity 实例」分类——identity 对相撞
+  /// 与旋转约定无关，只能是作者有意放置的相交几何（管道穿墙等）。
+  #[test]
+  #[ignore = "全量资产诊断：--release -- --ignored 单跑"]
+  fn nuke_flip_conflict_diagnostic() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/vox/nuke.vox");
+    if !path.exists() {
+      return;
+    }
+    let file = std::fs::File::open(&path).unwrap();
+    let mut r = std::io::BufReader::new(file);
+    let scene = vox_rs::Scene::read(&mut r).unwrap();
+
+    let run = |use_flip: bool| -> (usize, usize, usize, usize) {
+      let per_instance: Vec<HashMap<ChunkCoord, Vec<u64>>> = scene
+        .instances
+        .par_iter()
+        .filter_map(|inst| {
+          if inst.hidden {
+            return None;
+          }
+          let flip = if use_flip {
+            instance_flip(&inst.transform)
+          } else {
+            IVec3::ZERO
+          };
+          let t = &inst.transform;
+          let identity_rot = t.m00 == 1.0
+            && t.m11 == 1.0
+            && t.m22 == 1.0
+            && t.m01 == 0.0
+            && t.m02 == 0.0
+            && t.m10 == 0.0
+            && t.m12 == 0.0
+            && t.m20 == 0.0
+            && t.m21 == 0.0;
+          Some(bucket_model(
+            &scene.models[inst.model_index],
+            t,
+            flip,
+            IVec3::ZERO,
+          ))
+          .map(|map| {
+            map
+              .into_iter()
+              .map(|(cc, v)| {
+                (
+                  cc,
+                  v.into_iter()
+                    .map(|p| ((p as u64) << 1) | identity_rot as u64)
+                    .collect::<Vec<u64>>(),
+                )
+              })
+              .collect::<HashMap<_, _>>()
+          })
+        })
+        .collect();
+      let mut buckets: HashMap<ChunkCoord, Vec<u64>> = HashMap::new();
+      for map in per_instance {
+        for (cc, v) in map {
+          buckets.entry(cc).or_default().extend(v);
+        }
+      }
+      // 逐 chunk 排序扫描：key = packed32<<1 | identity_rot（packed =
+      // local24 | palette<<24 → L 在 key bit 1..24、P 在 bit 25..32、rot
+      // 在 bit 0）。按 L 排序后同格连续；统计写多次格数、异色冲突格数、
+      // 其中全 identity 写入方的冲突格数。
+      buckets
+        .into_par_iter()
+        .map(|(_, mut v)| {
+          v.sort_unstable_by_key(|&k| (k >> 1) & 0x00FF_FFFF);
+          let (mut multi, mut conflict, mut conflict_id) = (0usize, 0usize, 0usize);
+          let mut i = 0;
+          while i < v.len() {
+            let coord = (v[i] >> 1) & 0x00FF_FFFF;
+            let mut seen = [0u64; 4]; // palette < 256 的 distinct 位图
+            let mut npals = 0usize;
+            let (mut any_rot, mut any_id) = (false, false);
+            let mut j = i;
+            while j < v.len() && ((v[j] >> 1) & 0x00FF_FFFF) == coord {
+              let k = v[j];
+              let pal = ((k >> 25) & 0xFF) as usize;
+              let bit = 1u64 << (pal & 63);
+              if seen[pal >> 6] & bit == 0 {
+                seen[pal >> 6] |= bit;
+                npals += 1;
+              }
+              if k & 1 == 1 {
+                any_id = true;
+              } else {
+                any_rot = true;
+              }
+              j += 1;
+            }
+            if j - i > 1 {
+              multi += 1;
+            }
+            if npals > 1 {
+              conflict += 1;
+              if any_id && !any_rot {
+                conflict_id += 1;
+              }
+            }
+            i = j;
+          }
+          (v.len(), multi, conflict, conflict_id)
+        })
+        .reduce(
+          || (0, 0, 0, 0),
+          |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3),
+        )
+    };
+
+    let (w0, m0, c0, _) = run(false);
+    let (w1, m1, c1, c1_id) = run(true);
+    println!("before(flip=0): written={w0} multi_cells={m0} conflict_cells={c0}");
+    println!("after (flip) : written={w1} multi_cells={m1} conflict_cells={c1}");
+    println!("after: 冲突中全 identity 写入方对={c1_id}（含旋转方={}", c1 - c1_id);
+    assert_eq!(w0, w1, "两约定写入体素数应一致");
+    assert!(c1 < c0 / 2, "翻转补偿后异色冲突应减半以上（before={c0} after={c1}）");
   }
 }

@@ -133,7 +133,7 @@ struct DdaViewUniform {
 
 // --- BG1：brick map 全部数据 + globals ---
 @group(1) @binding(0) var<storage, read> b_struct: array<u32>;
-@group(1) @binding(1) var<storage, read> b_leaves: array<u32>;
+@group(1) @binding(1) var<storage, read> b_leaves: array<u64>;
 @group(1) @binding(2) var<storage, read> b_palette: array<u32>;
 
 // --- BG5：逐体素直光可见性缓存（Douglas #19：每体素 1 条阴影射线 + hashmap 跨帧复用）---
@@ -480,12 +480,9 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         let oct = select(0u, 1u, sign_v.x >= 0)
           | (select(0u, 1u, sign_v.y >= 0) << 1u)
           | (select(0u, 1u, sign_v.z >= 0) << 2u);
-        let lut_base = min(oct * 128u + entry_i * 2u, 1022u);
-        var rl = b_leaves[lut_base];
-        var rh = b_leaves[lut_base + 1u];
-        rl = select(rl, 0xFFFFFFFFu, lut_disable);
-        rh = select(rh, 0xFFFFFFFFu, lut_disable);
-        let reach = (u64(rh) << 32u) | u64(rl);
+        let lut_base = min(oct * 64u + entry_i, 511u);
+        var reach = b_leaves[lut_base];
+        reach = select(reach, ~u64(0), lut_disable);
         if ((b.mask & reach) == u64(0)) {
           level = level + 1u;
           if (level > 3u) { return FineHit(false, 0.0, 0u, 0u); }
