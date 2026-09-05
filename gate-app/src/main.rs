@@ -34,6 +34,10 @@ pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
 pub const LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/latest.log");
 /// 帧率诊断日志：fps_line_feed 每 0.25s 写一行 CUR/AVG/MIN/MAX
 pub const FPS_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/fps.log");
+/// 逐帧真实帧时日志：每帧一行 `elapsed_secs,frame_ms`（vsync 下为墙钟帧时间，
+/// 0.25s 攒一批刷盘）。帧时波动/周期尖刺定位用
+pub const FRAME_TIME_LOG_PATH: &str =
+  concat!(env!("CARGO_MANIFEST_DIR"), "/logs/frame_time.log");
 
 // ---- 相机参数（P2.6 from_orbit 使用；用户已取消"最远距离"限制）----
 // CAM_FAR = 透视投影 far 面；dda.wgsl 内 DDA 射线 t_max 同步到此量级。
@@ -47,13 +51,19 @@ const ROT_SPEED: f32 = 0.005; // rad/px（右键拖拽旋转）
 const ZOOM_LOG_SPEED: f32 = 0.35; // /行（滚轮乘法缩放，各距离档手感一致）
 
 fn main() {
-  App::new()
-    .add_plugins(
+  // 【诊断】GATE_BENCH=1：静默后台（窗口不可见）+ vsync Fifo + 渲染诊断 + 逐帧帧时日志
+  let bench = std::env::var("GATE_BENCH").as_deref() == Ok("1");
+  let mut app = App::new();
+  app.add_plugins(
       DefaultPlugins
         .set(WindowPlugin {
           primary_window: Some(Window {
             resolution: VIEW_SIZE.into(),
-            present_mode: PresentMode::AutoNoVsync,
+            // 【诊断】GATE_BENCH=1：① Fifo vsync（帧时测量用真实墙钟时间，不吃
+            // immediate 模式的 frame pacing 伪影；高刷屏 vblank 6.9ms < trace 帧时，
+            // 不会封顶掩盖差异）；② visible=false 静默后台运行，不抢前台焦点
+            focused: false,
+            present_mode: PresentMode::AutoVsync,
             resizable: true, // 2.7a FR-5：解锁任意 resize（渲染目标 + aspect 由响应式系统跟随）
             ..default()
           }),
@@ -98,15 +108,31 @@ fn main() {
           },
           ..default()
         }),
-    )
-    // P2.7：渲染诊断（Bevy 0.19 非默认装配，仅 tracing-tracy feature 才自动加）——
-    // 装配后 DiagnosticsRecorder 才存在，4×pass 的 time_span 才会记录 GPU/CPU 耗时；
-    // 未装配时 gate-render 的 span 走 Option<&T> no-op，不影响渲染
-    // .add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
-    // 每秒打印 DiagnosticsStore（含 gate_dda_trace 等 GPU span，性能分解用）
-    .add_plugins(bevy::diagnostic::LogDiagnosticsPlugin::default())
+  );
+  // P2.7：渲染诊断（Bevy 0.19 非默认装配，仅 tracing-tracy feature 才自动加）——
+  // 装配后 DiagnosticsStore 才存在：左上角折线图推真实 GPU 帧时（gate_frame span），
+  // GATE_BENCH=1 时另加逐秒均值打印与 logs/gpu_frame.log。
+  // 未装配时 gate-render 的 span 走 Option<&T> no-op，不影响渲染。
+  app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+  if bench {
+    app.add_plugins(bevy::diagnostic::LogDiagnosticsPlugin::default());
+  }
+  app
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
+    // 【诊断】GATE_BENCH=1：后台/失焦窗口也用 Continuous 更新（Bevy 默认失焦切
+    // reactive_low_power 60Hz，后台跑帧时 fps.log 会被 60 封顶，无法比较 trace 变体）
+    .insert_resource(bevy::winit::WinitSettings {
+      focused_mode: bevy::winit::UpdateMode::Continuous,
+      unfocused_mode: if std::env::var("GATE_BENCH").as_deref() == Ok("1") {
+        bevy::winit::UpdateMode::Continuous
+      } else {
+        bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_secs_f64(
+          1.0 / 60.0,
+        ))
+      },
+      ..Default::default()
+    })
     .insert_resource(gate_render::brickmap::vis_cache::VisCacheEnabled(true))
     .add_systems(Startup, setup)
     .add_systems(
@@ -120,8 +146,73 @@ fn main() {
         debug_normals_toggle,
         vis_cache_toggle,
       ),
-    )
-    .run();
+    );
+  // 【诊断】GATE_BENCH=1：逐帧记录 GPU pass 时间到 logs/gpu_frame.log
+  // （elapsed,wall_ms,trace_gpu_ms,ddgi_gpu_ms），定位帧时波动是 GPU 还是 CPU/present
+  if bench {
+    app.add_systems(Update, gpu_frame_log);
+  }
+  app.run();
+}
+
+/// 逐帧 GPU pass 时间日志（仅 GATE_BENCH=1 装配）。
+/// render world 的 time_span 每帧由 RenderDiagnosticsPlugin 同步到主世界
+/// DiagnosticsStore；读 latest value 攒批 0.25s 刷 logs/gpu_frame.log。
+/// 列：elapsed_secs,wall_ms,frame_gpu_ms,trace_gpu_ms,ddgi_gpu_ms。
+/// frame_gpu = ddgi+trace+blit 三 pass span 之和（GPU 帧真实工作量的近似：
+/// pass 间 gap 与 span 外开销未计）。不能做跨系统嵌套 span —— bevy_render
+/// open_spans 按 thread_id 分栈，并行 executor 下 begin/end 落不同线程会 panic。
+fn gpu_frame_log(
+  time: Res<Time>,
+  store: Option<Res<bevy::diagnostic::DiagnosticsStore>>,
+  mut log_file: Local<Option<std::fs::File>>,
+  mut buf: Local<String>,
+  mut acc: Local<f32>,
+) {
+  if log_file.is_none() {
+    *log_file = std::fs::File::create(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/logs/gpu_frame.log"
+    ))
+    .ok();
+  }
+  let dt = time.delta_secs();
+  // DiagnosticPath::new 要求 'static（Cow<'static, str>）→ 路径用字面值常量
+  let gpu_ms = |store: Option<&bevy::diagnostic::DiagnosticsStore>, path: &'static str| -> f64 {
+    store
+      .and_then(|s| s.get(&bevy::diagnostic::DiagnosticPath::new(path)))
+      .and_then(|d| d.value())
+      .unwrap_or(-1.0)
+  };
+  let trace = gpu_ms(store.as_deref(), "render/gate_dda_trace/elapsed_gpu");
+  let ddgi = gpu_ms(store.as_deref(), "render/gate_ddgi_update/elapsed_gpu");
+  let blit = gpu_ms(store.as_deref(), "render/gate_dda_blit/elapsed_gpu");
+  let parts = [trace, ddgi, blit];
+  let frame = if parts.iter().any(|&v| v >= 0.0) {
+    parts.iter().filter(|&&v| v >= 0.0).sum()
+  } else {
+    -1.0
+  };
+  use std::fmt::Write as _;
+  let _ = writeln!(
+    *buf,
+    "{:.3},{:.3},{:.3},{:.3},{:.3}",
+    time.elapsed_secs(),
+    dt * 1000.0,
+    frame,
+    trace,
+    ddgi
+  );
+  *acc += dt;
+  if *acc >= FPS_REFRESH_SECS
+    && let Some(f) = log_file.as_mut()
+    && !buf.is_empty()
+  {
+    use std::io::Write as _;
+    let _ = f.write_all(buf.as_bytes());
+    buf.clear();
+    *acc = 0.0;
+  }
 }
 
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -141,9 +232,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   });
   commands.insert_resource(theme);
   commands.insert_resource(DdaImages { target: dda_handle });
-  commands.insert_resource(DebugNormals(
-    if std::env::var("GATE_UNLIT").as_deref() == Ok("1") { 3 } else { 0 }
-  ));
+  commands.insert_resource(DebugNormals(3));
 
   // ---- 场景：GATE_SCENE=vox（默认）→ MagicaVoxel nuke.vox；=demo → 旧极限场景 ----
   let t0 = std::time::Instant::now();
@@ -165,9 +254,8 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
       let path = Path::new(ASSETS_PATH).join("vox/nuke.vox");
       let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
         .expect("nuke.vox 加载失败");
-      cam_target = info.center();
-      let dir = Vec3::new(1.0, 0.55, 1.0).normalize();
-      cam_eye = cam_target + dir * (info.diagonal() * 1.15).max(dist);
+      cam_target = Vec3::new(551.6, 329.2, 664.5);
+      cam_eye = Vec3::new(430.2, 359.3, 560.8);
       bevy::log::info!(
         "VOX SCENE: instances={} written={} dropped={} aabb=[{}]-[{}]",
         info.instances_used,
@@ -893,6 +981,9 @@ const FRAME_PLOT_CAP: usize = 360;
 #[derive(Component)]
 struct FpsText;
 
+#[derive(Component)]
+struct CamInfoText;
+
 /// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
 fn fps3(v: f32) -> u32 {
   (v.round() as u32).min(999)
@@ -963,40 +1054,80 @@ fn demo_ui_setup(
           PlotDomain::Auto,
           Color::WHITE,
           false,
-          Some("ms"),
+          None,
           FRAME_PLOT_H as f32,
         );
+        // 折线图下方：相机当前位置/角度信息
+        let e = label(&ctx, panel, "(---,---,---) -> (---,---,---)");
+        panel.world_mut().entity_mut(e).insert(CamInfoText);
       });
   });
 }
 
 /// 每 0.25s 刷新一次左上角 FPS 行 + 写一行到 logs/fps.log
 ///
-/// 每帧（早于 0.25s 早退）把帧时长 ms 压入折线图环形缓冲：
+/// 每帧（早于 0.25s 早退）把真实 GPU 帧时 ms（gate_frame span）压入折线图环形缓冲：
 /// PlotData Changed → gate-ui 的 plot_redraw_system 自动光栅化重绘。
 fn fps_line_feed(
   time: Res<Time>,
-  mut q: Query<&mut Text, With<FpsText>>,
+  store: Option<Res<bevy::diagnostic::DiagnosticsStore>>,
+  orbit: Res<OrbitCamera>,
+  mut q: ParamSet<(
+    Query<&mut Text, With<FpsText>>,
+    Query<&mut Text, With<CamInfoText>>,
+  )>,
   mut q_plot: Query<&mut PlotData>,
   mut window: Local<VecDeque<f32>>, // 逐帧 delta，按时间裁剪到 5s
   mut acc: Local<f32>,
   mut frames: Local<u32>,
   mut log_file: Local<Option<std::fs::File>>,
+  mut ft_log: Local<Option<std::fs::File>>,
+  mut ft_buf: Local<String>,
 ) {
-  // 首次调用：创建/截断 fps.log
+  // 首次调用：创建/截断 fps.log + frame_time.log
   if log_file.is_none() {
     let path = std::path::Path::new(FPS_LOG_PATH);
     if let Some(parent) = path.parent() {
       std::fs::create_dir_all(parent).ok();
     }
     *log_file = std::fs::File::create(path).ok();
+    *ft_log = std::fs::File::create(FRAME_TIME_LOG_PATH).ok();
   }
   let dt = time.delta_secs();
-  window.push_back(dt);
-  // 帧时长折线图：每帧压入 ms（UI 未 spawn 时查询为空，跳过）
-  if let Ok(mut plot) = q_plot.single_mut() {
-    plot.push(dt * 1000.0);
+  // 折线图推真实 GPU 帧时 = trace+beam+ddgi+blit 四 pass span 之和（跨系统嵌套 span
+  // 不可行：bevy_render open_spans 按 thread 分栈，并行 executor 下跨节点配对 panic）。
+  // vsync 下 delta_secs 恒 ≈16.7（vblank 节拍），不反映真实工作量。
+  // 诊断未就绪（全 -1）→ 跳过推入，绝不退回 delta（否则 vsync 下 16.7 混进 auto 域
+  // 把真实曲线压在底部）。诊断约 0.7s 后上线，空白期折线图不动即可。
+  use std::fmt::Write as _;
+  let gpu_ms = |path: &'static str| -> f32 {
+    store
+      .as_deref()
+      .and_then(|s| s.get(&bevy::diagnostic::DiagnosticPath::new(path)))
+      .and_then(|d| d.value())
+      .map(|v| v as f32)
+      .unwrap_or(-1.0)
+  };
+  let parts = [
+    gpu_ms("render/gate_dda_trace/elapsed_gpu"),
+    gpu_ms("render/gate_beam/elapsed_gpu"),
+    gpu_ms("render/gate_ddgi_update/elapsed_gpu"),
+    gpu_ms("render/gate_dda_blit/elapsed_gpu"),
+  ];
+  let diag_ready = parts.iter().any(|&v| v >= 0.0);
+  if diag_ready
+    && let Ok(mut plot) = q_plot.single_mut()
+  {
+    let v: f32 = parts.iter().filter(|&&v| v >= 0.0).sum();
+    plot.push(v);
   }
+  window.push_back(dt);
+  // 逐帧一行：elapsed,dt[,trace,beam,ddgi,blit]（-1 = 诊断未上线），随 0.25s 刷盘
+  let mut line = format!("{:.3},{:.3}", time.elapsed_secs(), dt * 1000.0);
+  if diag_ready {
+    let _ = write!(line, ",{:.3},{:.3},{:.3},{:.3}", parts[0], parts[1], parts[2], parts[3]);
+  }
+  let _ = writeln!(*ft_buf, "{}", line);
   let mut sum = 0.0f32;
   for &d in window.iter() {
     sum += d;
@@ -1039,10 +1170,22 @@ fn fps_line_feed(
   let elapsed = time.elapsed_secs();
   *acc = 0.0;
   *frames = 0;
-  if let Ok(mut t) = q.single_mut()
+  if let Ok(mut t) = q.p0().single_mut()
     && t.0 != txt
   {
     t.0 = txt;
+  }
+  // 相机信息：眼位 -> 目标点
+  let eye = orbit.eye();
+  let tgt = orbit.target;
+  let cam_txt = format!(
+    "({:>7.1},{:>7.1},{:>7.1}) -> ({:>7.1},{:>7.1},{:>7.1})",
+    eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z
+  );
+  if let Some(mut t) = q.p1().iter_mut().next()
+    && t.0 != cam_txt
+  {
+    t.0 = cam_txt;
   }
   // 写 fps.log：elapsed_secs,CUR,AVG,MIN,MAX
   use std::io::Write;
@@ -1056,6 +1199,13 @@ fn fps_line_feed(
       fps3(min),
       fps3(max)
     );
+  }
+  // 刷逐帧帧时批次（frame_time.log）
+  if let Some(f) = ft_log.as_mut()
+    && !ft_buf.is_empty()
+  {
+    let _ = f.write_all(ft_buf.as_bytes());
+    ft_buf.clear();
   }
 }
 

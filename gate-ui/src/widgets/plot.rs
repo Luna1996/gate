@@ -378,7 +378,7 @@ pub fn plot_redraw_system(
       }
     }
     // 左侧纵轴标签（plot_yaxis 变体）：列内子实体顺序 = 上(max)/中/下(min)。
-    // 定宽 5 字符 + 可选单位后缀，等宽字体下不抖动。
+    // 格式 000.0（5 位定宽 0 填充）+ 可选单位后缀，等宽字体下不抖动。
     let vals = [domain.1, (domain.0 + domain.1) * 0.5, domain.0];
     for ch in children.iter() {
       let Ok(labels) = q_yaxis.get(ch) else {
@@ -387,8 +387,8 @@ pub fn plot_redraw_system(
       for (i, label_e) in labels.iter().enumerate() {
         if let Ok(mut t) = q_text.get_mut(label_e) {
           let s = match data.unit {
-            Some(u) => format!("{:>5.1}{u}", vals[i]),
-            None => format!("{:>5.1}", vals[i]),
+            Some(u) => format!("{:05.1}{u}", vals[i]),
+            None => format!("{:05.1}", vals[i]),
           };
           t.set_if_neq(Text::new(s));
         }
@@ -595,13 +595,64 @@ mod tests {
       }
     }
     assert_eq!(labels.len(), 3, "three y-axis labels");
-    assert!(labels[0].contains("10.0"), "top label = max: {}", labels[0]);
-    assert!(labels[1].contains("6.0"), "mid label = mid: {}", labels[1]);
-    assert!(
-      labels[2].contains("2.0"),
-      "bottom label = min: {}",
-      labels[2]
-    );
-    assert!(labels[0].ends_with("ms"), "unit suffix: {}", labels[0]);
+    assert_eq!(labels[0], "010.0ms", "top label = max, 0-padded");
+    assert_eq!(labels[1], "006.0ms", "mid label = mid, 0-padded");
+    assert_eq!(labels[2], "002.0ms", "bottom label = min, 0-padded");
+  }
+
+  #[test]
+  fn plot_yaxis_labels_no_unit_zero_padded() {
+    let theme = default_theme();
+    let mut app = App::new();
+    app.init_resource::<Assets<Image>>();
+    app.insert_resource(theme.clone());
+    app.insert_resource(ThemeFont::default());
+    app.add_systems(Update, plot_redraw_system);
+
+    let handle = app
+      .world_mut()
+      .resource_mut::<Assets<Image>>()
+      .add(blank_plot_image(64, 32));
+    let ctx = UiCtx::new(&theme, None);
+    let mut plot_e = None;
+    app.world_mut().spawn_empty().with_children(|p| {
+      plot_e = Some(plot_yaxis(
+        &ctx,
+        p,
+        handle,
+        64,
+        PlotDomain::Auto,
+        Color::WHITE,
+        false,
+        None,
+        32.0,
+      ));
+    });
+    let plot_e = plot_e.expect("plot_yaxis spawned");
+
+    {
+      let mut data = app.world_mut().get_mut::<PlotData>(plot_e).unwrap();
+      data.push(2.0);
+      data.push(10.0);
+    }
+    app.update();
+
+    let root_children = app
+      .world()
+      .get::<Children>(plot_e)
+      .unwrap()
+      .iter()
+      .collect::<Vec<_>>();
+    let mut labels = vec![];
+    for ch in root_children {
+      if app.world().get::<PlotYAxis>(ch).is_some() {
+        for l in app.world().get::<Children>(ch).unwrap().iter() {
+          labels.push(app.world().get::<Text>(l).unwrap().0.clone());
+        }
+      }
+    }
+    assert_eq!(labels[0], "010.0", "no unit suffix, 0-padded");
+    assert_eq!(labels[1], "006.0");
+    assert_eq!(labels[2], "002.0");
   }
 }

@@ -29,7 +29,9 @@ use bevy::{
 };
 
 use super::builder::{VolumesBuilder, VolumesSnapshot};
-use super::wire::{BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, TREE_BASE};
+use super::wire::{
+  march_mask_lut_words, BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, TREE_BASE,
+};
 
 // ----------------------------------------------------------------------------
 // Limits + BufferLayout（CPU 单测覆盖单/多两模式）
@@ -474,6 +476,17 @@ pub(crate) fn prepare(
   let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
   let comp_bytes = snap.comp_chunks * CHUNK_COMP_WORDS * 4;
 
+  // P4：方向可达掩码 LUT（Douglas #18 Bitwise Masking）→ b_leaves。
+  // 全局常量（8 octant × 64 入口格 × 2 u32 = 4KB），与 volume 无关；
+  // 只在 buffer 尚未容纳时写一次，之后零 PCIe。
+  {
+    let lut_need = (MARCH_MASK_WORDS * 4) as u64;
+    if gpu.leaves.size() < lut_need {
+      let lut = march_mask_lut_words();
+      write(&device, &queue, &mut gpu.leaves, "gate_leaves", u8_of_u32(&lut));
+    }
+  }
+
   // 传输字节统计（日志用）
   let (struct_tx_bytes, palette_tx_bytes, grid_descs_tx_bytes);
 
@@ -595,7 +608,7 @@ pub(crate) fn prepare(
     brick_slabs: 0,
     brick_free: 0,
     rejected_tiles: 0,
-    _pad0: 0,
+    grid_count: snap.volumes.grid_descs.len() as u32,
     _pad1: 0,
     _pad2: 0,
     _pad3: 0,

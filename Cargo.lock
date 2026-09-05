@@ -2080,6 +2080,7 @@ dependencies = [
  "gate-ui",
  "gate-voxel",
  "glam",
+ "rayon",
  "time",
  "tracing-appender",
  "tracing-subscriber",
@@ -2113,6 +2114,7 @@ name = "gate-voxel"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "rayon",
 ]
 
 [[package]]

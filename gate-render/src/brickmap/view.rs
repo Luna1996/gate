@@ -93,7 +93,7 @@ impl<'a> BrickMapView<'a> {
   }
 
   /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
-  /// wire v2：level 3（叶父层）inline palette 直读，消除 level 4 叶节点
+  /// wire v3：level 3（叶父层）inline 4 体素/word，消除 level 4 叶节点
   pub fn get_voxel(&self, fine: IVec3) -> Option<u8> {
     let chunk = fine.div_euclid(IVec3::splat(CHUNK_SIZE));
     let base = self.chunk_base(chunk)?;
@@ -115,8 +115,10 @@ impl<'a> BrickMapView<'a> {
         return (pal != 0).then_some(pal as u8);
       }
       if child_extent == 1 {
-        // wire v2：叶父层 inline palette = b_struct[node + 3 + ci]
-        let leaf_pal = self.b_struct[node + 3 + ci as usize] & 0xFF;
+        // wire v3：叶父层 inline 4 体素/word = b_struct[node + 3 + (ci >> 2)]，
+        // palette = 该 word 的第 (ci & 3) 字节
+        let w = self.b_struct[node + 3 + (ci >> 2) as usize];
+        let leaf_pal = (w >> ((ci & 3) as u32 * 8)) & 0xFF;
         return (leaf_pal != 0).then_some(leaf_pal as u8);
       }
       // level 0-2：紧凑 popcount 定位 child offset

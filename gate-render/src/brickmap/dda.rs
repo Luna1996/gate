@@ -23,8 +23,11 @@ use std::sync::LazyLock;
 pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
 /// 初始渲染分辨率（窗口创建尺寸；resize 后由 RenderScale 资源接管，FR-5）
 pub const VIEW_SIZE: UVec2 = UVec2::new(1280, 720);
-/// compute dispatch 工作组边长（DDA 8×8，与原 gradient 一致）
+/// compute dispatch 工作组边长（DDA 8×8，与原 gradient 一致）——beam pass 用
 pub const WORKGROUP_SIZE: u32 = 8;
+/// 主 DDA pass 工作组边长：必须与 dda.wgsl 中 dda_main 的 @workgroup_size
+/// 严格一致，否则 dispatch 覆盖不足漏 trace 像素（实测 2×2 反而更慢，维持 8）
+pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
 /// 当前渲染分辨率（main world `resize_render_targets` 更新，提取进 render world；
 /// dispatch workgroup 数随它重算，shader 侧自行越界剔除）
@@ -191,6 +194,20 @@ static LOD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
     .map(|v| v == "1")
     .unwrap_or(false)
 });
+/// 【诊断】GATE_NO_BEAM=1：关闭 beam 预 pass，主 pass 从 t=0 起步（A/B 用）。
+/// 默认开启 beam（P4 修复保守距离后）。
+static BEAM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+  std::env::var("GATE_NO_BEAM")
+    .map(|v| v == "1")
+    .unwrap_or(false)
+});
+/// 【诊断】GATE_NO_LUT=1：关闭方向可达掩码剔除（Bitwise Masking A/B 用）。
+/// shader 端 eff = mask（旁路 LUT），lod.w 通道传递。
+static LUT_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+  std::env::var("GATE_NO_LUT")
+    .map(|v| v == "1")
+    .unwrap_or(false)
+});
 
 impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
@@ -213,7 +230,12 @@ impl DdaViewUniform {
           0.0
         },
       ),
-      lod: Vec4::new(px_ang, (!*LOD_DISABLED) as u32 as f32, 0.0, 0.0),
+      lod: Vec4::new(
+        px_ang,
+        (!*LOD_DISABLED) as u32 as f32,
+        *BEAM_DISABLED as u32 as f32,
+        *LUT_DISABLED as u32 as f32, // w = 1 → shader 旁路方向掩码剔除
+      ),
     }
   }
 }
@@ -225,11 +247,13 @@ pub struct DdaImages {
 }
 
 /// 工厂：DDA 目标纹理（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）
+/// COPY_DST：bevy resize 路径 copy_image_on_resize 会向新纹理拷贝旧内容，缺 COPY_DST 即验证崩溃
 pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
   let mut image =
     Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba8Unorm, None);
   image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-  image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+  image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING |
+    TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
   images.add(image)
 }
 
@@ -927,57 +951,23 @@ fn face_normal_from_index(f: u8) -> Vec3 {
   }
 }
 
-/// 栈帧（镜像 WGSL TreeFrame）：一层分裂节点的 DDA 状态。
+/// brick 缓存（镜像 WGSL Brick）：一层分裂节点的掩码常驻，跨级跳时零加载复用。
+/// level 编号与 Douglas octo_march_core 一致：3 = 根（256³，子块 64³）、
+/// 2（64³，子块 16³）、1（16³，子块 4³）、0（4³，inline 1³ 叶）。
 #[derive(Clone, Copy)]
-struct TreeFrameCpu {
-  node_addr: usize,   // 节点绝对字址（b_struct）
-  node_min: [f32; 3], // 节点区域原点（局部 fine 坐标）
-  cell: [i32; 3],     // 当前子块坐标 0..3
-  tmax: [f32; 3],     // 到下一子块边界的 t（ro 系绝对）
-  t_enter: f32,       // 进入当前子块的 t
-  t_exit: f32,        // 节点出口 t
-  face: u8,           // 进入当前子块的面 0..5
+struct BrickCpu {
+  addr: usize, // 节点绝对字址（b_struct）
+  mask: u64,   // 64bit 分裂掩码（bit=1 = 子块分裂；bit=0 = 统一子块，色=pal）
+  pal: u8,     // 节点 palette（统一子块颜色，0=空气）
 }
 
-/// 镜像 WGSL init_tree_frame：level 决定子块边长 sub = 64 >> (level*2)。
-#[allow(clippy::too_many_arguments)]
-fn init_tree_frame_cpu(
-  node_addr: usize,
-  node_min: [f32; 3],
-  ro: [f32; 3],
-  rd: [f32; 3],
-  sign: [i32; 3],
-  t_enter: f32,
-  t_exit: f32,
-  face: u8,
-  level: u32,
-) -> TreeFrameCpu {
-  let sub = 64u32 >> (level * 2);
-  let mut cell = [0i32; 3];
-  let mut tmax = [1e30f32; 3];
-  for i in 0..3 {
-    let p = ro[i] + rd[i] * t_enter;
-    let c = ((p - node_min[i]) / sub as f32).floor() as i32;
-    cell[i] = c.clamp(0, 3);
-    if rd[i].abs() > 1e-30 {
-      // sign>=0 → (cell+1)*sub 边界；sign<0 → cell*sub 边界
-      let side = if sign[i] >= 0 { 1.0 } else { 0.0 };
-      let boundary = node_min[i] + (cell[i] as f32 + side) * sub as f32;
-      tmax[i] = ((boundary - ro[i]) / rd[i]).max(t_enter);
-    }
-  }
-  TreeFrameCpu {
-    node_addr,
-    node_min,
-    cell,
-    tmax,
-    t_enter,
-    t_exit,
-    face,
-  }
-}
-
-/// 镜像 WGSL trace_chunk：单 chunk 内 4 层栈帧 mask DDA。
+/// 镜像 WGSL trace_chunk：单 chunk 内 Douglas 式整数体素层级 DDA
+/// （octo_march_core：integer fine voxel + brick mask 栈 + firstTrailingBit 跨级跳）。
+///
+/// 旧 tmax 栈帧版每步增量维护 4 帧 tmax/cell，弹栈必重载节点头；本版状态只有
+/// 整数体素坐标 v + bricks[4]（下钻载入、跳层复用），边界距离按整数对齐每次重算
+/// （side_distance_for_ray），跨 brick 后用 firstTrailingBit 一次跳到最粗可行层
+/// （尾随零位 = 对齐 run 长度），消除逐层弹栈/重载/再下钻链。
 ///
 /// chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 fine）；
 /// 射线段 [t0, t1]（ro 系绝对 t）；entry_face = 进入本 chunk 的面。
@@ -990,159 +980,171 @@ fn trace_chunk_cpu(
   ro: [f32; 3],
   rd: [f32; 3],
   sign: [i32; 3],
-  delta: [f32; 3],
   t0: f32,
   t1: f32,
   entry_face: u8,
 ) -> Option<(f32, u8, u8)> {
-  let empty = TreeFrameCpu {
-    node_addr: 0,
-    node_min: [0.0; 3],
-    cell: [0; 3],
-    tmax: [0.0; 3],
-    t_enter: 0.0,
-    t_exit: 0.0,
-    face: 0,
-  };
-  let mut stack = [empty; 4];
-  stack[0] = init_tree_frame_cpu(chunk_base, chunk_min, ro, rd, sign, t0, t1, entry_face, 0);
-  let mut depth: i32 = 0;
-  // 当前帧常驻局部变量（镜像 WGSL 寄存器版）：栈只在下钻/弹栈时读写
-  let mut f = stack[0];
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
   if t0 >= t1 {
     return None;
   }
-  // 防挂死安全网（与 WGSL trace_chunk 同值）：几何上界 = 对角射线穿越全分裂 chunk
-  // 的节点读数 ≈ 25k 量级；真实场景每 chunk 仅几十~几百次迭代。
+  // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
+  let ro_c = [ro[0] - chunk_min[0], ro[1] - chunk_min[1], ro[2] - chunk_min[2]];
+  let read_brick = |addr: usize| BrickCpu {
+    addr,
+    mask: ((b_struct[addr + 1] as u64) << 32) | b_struct[addr] as u64,
+    pal: (b_struct[addr + 2] & 0xFF) as u8,
+  };
+  let mut bricks = [BrickCpu { addr: 0, mask: 0, pal: 0 }; 4];
+  bricks[3] = read_brick(chunk_base);
+  let mut level: u32 = 3;
+  // 当前体素（chunk 局部 fine 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
+  let p0 = [ro_c[0] + rd[0] * t0, ro_c[1] + rd[1] * t0, ro_c[2] + rd[2] * t0];
+  let mut v = [
+    (p0[0].floor() as i32).clamp(0, 255),
+    (p0[1].floor() as i32).clamp(0, 255),
+    (p0[2].floor() as i32).clamp(0, 255),
+  ];
+  let mut cur_t = t0;
+  let mut face = entry_face;
+  // 防挂死安全网（与 WGSL trace_chunk 同值）
   let mut budget: u32 = 65536;
   loop {
     if budget == 0 {
       return None;
     }
     budget -= 1;
-    let level = depth as u32;
-    // 节点 fixed 字（wire v2：level 3 inline palette，level 0-2 紧凑 popcount）
-    let mask_lo = b_struct[f.node_addr];
-    let mask_hi = b_struct[f.node_addr + 1];
-    let palette = b_struct[f.node_addr + 2] & 0xFF;
-    let child_idx = (f.cell[2] * 16 + f.cell[1] * 4 + f.cell[0]) as usize;
-    if mask_lo == 0 && mask_hi == 0 {
-      // 整节点 uniform（mask==0）：palette 直决
-      if palette != 0 {
-        return Some((f.t_enter, palette as u8, f.face));
+    if level > 3 {
+      return None;
+    }
+    // ---- traverse：从当前 level 下钻到 v 处内容（Douglas traverse_bit_set）----
+    loop {
+      let b = bricks[level as usize];
+      let log2 = level * 2;
+      let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
+      let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
+      if level == 0 {
+        // 叶节点 inline palette：4 体素/word，低 2 位选字节
+        // （到此必为 mask!=0 的 inline 叶：mask==0 统一叶在父层下钻快路径已处理）
+        let w = b_struct[b.addr + 3 + (idx >> 2)];
+        let leaf_pal = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
+        if leaf_pal != 0 {
+          return Some((cur_t, leaf_pal, face));
+        }
+        break; // 空气 leaf
       }
-      // 整节点空气 → 弹栈（父帧推进）
-      depth -= 1;
-      if depth < 0 {
+      let bit = 1u64 << idx;
+      if b.mask & bit == 0 {
+        // 统一子块：颜色 = 节点 palette（0=空气）
+        if b.pal != 0 {
+          return Some((cur_t, b.pal, face));
+        }
+        break; // 空气统一子块
+      }
+      // 分裂子块 → popcount 定位 child
+      let pop_below = (b.mask & (bit - 1)).count_ones() as usize;
+      let child_addr = chunk_base + b_struct[b.addr + 3 + pop_below] as usize;
+      let cb = read_brick(child_addr);
+      // 统一子节点快路径（旧 c_mask==0）：wire 任意层的分裂位都可能指向 3 字统一
+      // 节点（mask=0，pal 直决；叶层统一节点无 inline 16 字，禁读 addr+3 之后）
+      if cb.mask == 0 {
+        if cb.pal != 0 {
+          return Some((cur_t, cb.pal, face));
+        }
+        break;
+      }
+      level -= 1;
+      bricks[level as usize] = cb;
+    }
+    // ---- v 处为空气：当前 level brick 内 DDA（Douglas dda）----
+    let log2 = level * 2;
+    let s = 1i32 << log2; // 子块边长 fine：1/4/16/64
+    let mut side = [1e30f32; 3];
+    for i in 0..3 {
+      if rd[i].abs() > 1e-30 {
+        // side_distance_for_ray：v 对齐到 s 的基址；正向 → 基址+s，负向 → 基址
+        let base = v[i] & !(s - 1);
+        let boundary = if sign[i] >= 0 { base + s } else { base };
+        side[i] = ((boundary as f32 - ro_c[i]) / rd[i]).max(cur_t);
+      }
+    }
+    let mut step_axis: usize;
+    let mut changed = false;
+    loop {
+      // 选最近边界轴
+      let min = if side[0] <= side[1] && side[0] <= side[2] {
+        0
+      } else if side[1] <= side[2] {
+        1
+      } else {
+        2
+      };
+      step_axis = min;
+      cur_t = side[min];
+      if cur_t >= t1 {
+        return None; // 段内再无子块可入
+      }
+      let old_cell = (v[min] >> log2) & 3;
+      // 沿 min 轴整子块跨越
+      v[min] += sign[min] * s;
+      side[min] += s as f32 / rd[min].abs();
+      face = (min * 2) as u8 + if sign[min] < 0 { 1 } else { 0 };
+      // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
+      let crossed = if sign[min] >= 0 { old_cell == 3 } else { old_cell == 0 };
+      if crossed {
+        changed = true;
+        break;
+      }
+      // 新子块内容：level 0 查 inline palette（mask!=0 inline 叶才有）；
+      // level 1..3 = 分裂位或节点统一实体色
+      let b = bricks[level as usize];
+      let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
+      let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
+      let occ = if level == 0 {
+        if b.mask == 0 {
+          b.pal != 0
+        } else {
+          let w = b_struct[b.addr + 3 + (idx >> 2)];
+          ((w >> ((idx & 3) * 8)) & 0xFF) != 0
+        }
+      } else {
+        (b.mask & (1u64 << idx)) != 0 || b.pal != 0
+      };
+      if occ {
+        break; // 有内容 → 回 traverse 下钻/命中
+      }
+      // 空气子块 → 回 loop 顶重选 min 轴继续
+    }
+    if changed {
+      level += 1;
+      if level > 3 {
         return None;
       }
-      f = stack[depth as usize];
-    } else {
-      // 当前子块的出口 t（三轴 tmax 最小值）；零厚度（== t_enter）= 擦边不入内部
-      let cell_exit = f.tmax[0].min(f.tmax[1]).min(f.tmax[2]);
-      let (mask_word, bit_in_word) = if child_idx < 32 {
-        (mask_lo, child_idx)
-      } else {
-        (mask_hi, child_idx - 32)
-      };
-      let bit = 1u32 << bit_in_word;
-      if mask_word & bit == 0 {
-        // uniform 子块：颜色 = 父节点 palette（零额外 load）。
-        // 零厚度擦边不入内部（与逐体素点查语义一致）
-        if palette != 0 && f.t_enter < cell_exit {
-          return Some((f.t_enter, palette as u8, f.face));
-        }
-        // 空气子块 / 擦边 → 本帧推进一步（整子块跨越）
-      } else {
-        // 分裂 → level 0-2 紧凑 popcount，level 3 inline palette
-        if level < 3 {
-          let pop_below = if child_idx < 32 {
-            (mask_lo & ((1u32 << bit_in_word) - 1)).count_ones()
-          } else {
-            mask_lo.count_ones() + (mask_hi & ((1u32 << bit_in_word) - 1)).count_ones()
-          };
-          let child_addr = chunk_base + b_struct[f.node_addr + 3 + pop_below as usize] as usize;
-          // 下钻：子节点区域 = 当前子块；退化子块（出口==入口，零厚度擦边）不下钻
-          if cell_exit > f.t_enter {
-            let sub = 64u32 >> (level * 2);
-            let child_min = [
-              f.node_min[0] + f.cell[0] as f32 * sub as f32,
-              f.node_min[1] + f.cell[1] as f32 * sub as f32,
-              f.node_min[2] + f.cell[2] as f32 * sub as f32,
-            ];
-            // 寄存器态先落栈（弹出后要恢复的是已推进状态）
-            stack[depth as usize] = f;
-            depth += 1;
-            stack[depth as usize] = init_tree_frame_cpu(
-              child_addr,
-              child_min,
-              ro,
-              rd,
-              sign,
-              f.t_enter,
-              cell_exit.min(f.t_exit),
-              f.face,
-              depth as u32,
-            );
-            f = stack[depth as usize];
-            continue;
-          }
-        } else {
-          // level 3 叶（1³）：wire v2 inline palette = b_struct[node + 3 + child_idx]
-          let leaf_pal = b_struct[f.node_addr + 3 + child_idx] & 0xFF;
-          if leaf_pal != 0 && f.t_enter < cell_exit {
-            return Some((f.t_enter, leaf_pal as u8, f.face));
-          }
-          // 空气 leaf / 擦边 → 本帧推进一步
-        }
-      }
     }
-    // ---- 推进：f 常驻局部变量前进一步；耗尽/跨界则弹栈连推（镜像 WGSL）----
-    loop {
-      if f.tmax[0].min(f.tmax[1]).min(f.tmax[2]) >= f.t_exit {
-        depth -= 1;
-        if depth < 0 {
-          return None;
-        }
-        f = stack[depth as usize];
-        continue;
-      }
-      let sub = 64u32 >> (depth as u32 * 2); // 该层子块边长：64/16/4/1
-      if f.tmax[0] <= f.tmax[1] && f.tmax[0] <= f.tmax[2] {
-        f.t_enter = f.tmax[0];
-        f.tmax[0] = f.tmax[0] + delta[0] * sub as f32;
-        f.cell[0] += sign[0];
-        f.face = if sign[0] < 0 { 1 } else { 0 };
-      } else if f.tmax[1] <= f.tmax[2] {
-        f.t_enter = f.tmax[1];
-        f.tmax[1] = f.tmax[1] + delta[1] * sub as f32;
-        f.cell[1] += sign[1];
-        f.face = if sign[1] < 0 { 3 } else { 2 };
-      } else {
-        f.t_enter = f.tmax[2];
-        f.tmax[2] = f.tmax[2] + delta[2] * sub as f32;
-        f.cell[2] += sign[2];
-        f.face = if sign[2] < 0 { 5 } else { 4 };
-      }
-      // 浮点边界（累计 tmax 与父帧 t_exit 差 1 ulp）：本步实际跨出了节点区域。
-      // 禁止越界索引（cell=-1 会回绕成 bit 23 等错误子块）→ 视为节点耗尽，弹栈
-      if f.cell[0] < 0
-        || f.cell[0] > 3
-        || f.cell[1] < 0
-        || f.cell[1] > 3
-        || f.cell[2] < 0
-        || f.cell[2] > 3
-      {
-        depth -= 1;
-        if depth < 0 {
-          return None;
-        }
-        f = stack[depth as usize];
-        continue;
-      }
-      break;
+    // ---- firstTrailingBit 层级自适应跨级跳（Douglas march 尾部）----
+    // 步进轴新坐标的尾随零位 = 对齐 run 长度：正向 comp=对齐基址（tz 直接读），
+    // 负向 comp=区域尾址+1（基址|~mask 后 +1）。tz>>1 = 可跨步的最粗 level。
+    let positive = sign[step_axis] >= 0;
+    let cur_log2 = level * 2;
+    let m: u32 = 0xFFFF_FFFFu32.wrapping_shl(cur_log2);
+    let vmin_u = v[step_axis] as u32; // i32→u32 环绕（负值公式自然处理）
+    let comp = if positive { vmin_u & m } else { (vmin_u & m) | !m };
+    let tz = comp.wrapping_add(if positive { 0 } else { 1 }).trailing_zeros();
+    let new_level = tz >> 1;
+    level = level.max(new_level);
+    if level > 3 {
+      return None; // 跨出 chunk（tz≥8）
     }
+    // 对齐快照：v 钳到 cur_t 射线点所在的当前 level 区域，步进轴取精确边界整数
+    // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
+    let mi = m as i32;
+    let base = [v[0] & mi, v[1] & mi, v[2] & mi];
+    let p = [ro_c[0] + rd[0] * cur_t, ro_c[1] + rd[1] * cur_t, ro_c[2] + rd[2] * cur_t];
+    for i in 0..3 {
+      let pf = p[i].floor() as i32;
+      v[i] = pf.clamp(base[i], base[i] + !mi);
+    }
+    v[step_axis] = comp as i32;
   }
 }
 
@@ -1231,7 +1233,6 @@ fn trace_volume_tree(
         ro_a,
         rd_a,
         sign,
-        delta,
         t_enter_c,
         t1,
         entry_face,
@@ -2012,6 +2013,102 @@ mod dda_ref_tests {
       cmp(&format!("rand{ray}"), origin, dir, 4096.0);
     }
   }
+
+  /// firstTrailingBit 层级自适应大步进 fuzz：跨 chunk 随机块（4³/16³/64³ 多尺度，
+  /// 逼出统一叶节点、inline 叶、多层对齐跨跳）+ 2000 条球壳随机射线 + 16 条
+  /// 轴平行/对角退化射线，暴力逐体素参考 vs 新整数体素层级遍历严格比对
+  /// （palette 一致、t 容差 1.0、命中面法线反向）。
+  #[test]
+  fn tree_traversal_fuzz_2000_rays_multiscale() {
+    let mut g = VolumeGrid::new();
+    let mut state: u64 = 0xDEAD_BEEF_0001_0001;
+    // ---- 随机块：尺度 4/16/64 三档，坐标跨 chunk（±768），少量单体素 ----
+    for _ in 0..220 {
+      let scale = [4i32, 16, 64][(frand(&mut state) * 3.0) as usize];
+      let bx = ((frand(&mut state) * 384.0) as i32 - 192) * 4;
+      let by = ((frand(&mut state) * 64.0) as i32) * 4;
+      let bz = ((frand(&mut state) * 384.0) as i32 - 192) * 4;
+      let pal = 1 + (frand(&mut state) * 12.0) as u8;
+      fill_box(
+        &mut g,
+        IVec3::new(bx, by, bz),
+        IVec3::splat(scale),
+        pal,
+      );
+    }
+    for _ in 0..400 {
+      let vx = ((frand(&mut state) * 1024.0) as i32) - 512;
+      let vy = (frand(&mut state) * 160.0) as i32;
+      let vz = ((frand(&mut state) * 1024.0) as i32) - 512;
+      g.set_voxel_ivec3(IVec3::new(vx, vy, vz), 1 + (frand(&mut state) * 12.0) as u8);
+    }
+    // 几个跨 chunk 大球（跨边界对齐场景）
+    fill_sphere(&mut g, IVec3::new(256, 40, 256), 56, 5);
+    fill_sphere(&mut g, IVec3::new(-256, 24, -256), 40, 6);
+    let bufs = BrickMapBuilder::build_full(&g).buffers().clone();
+
+    let cmp = |tag: &str, o: Vec3, d: Vec3, t_max: f32| {
+      let full = cpu_reference_dda_ray(&bufs, o, d, t_max, 8_000_000);
+      let tree = cpu_reference_dda_ray_tree(&bufs, o, d, t_max);
+      match (full, tree) {
+        (Some((tf, pf)), Some(h)) => {
+          assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}", h.t);
+          assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
+          let n = face_normal_from_index(h.face_id);
+          assert!(
+            n.dot(d) < 0.001,
+            "[{tag}] face normal {n:?} not against dir {d:?} (face_id={})",
+            h.face_id
+          );
+        }
+        (None, None) => {}
+        (f, t) => panic!("[{tag}] hit mismatch o={o:?} d={d:?}\n  full={f:?}\n  tree={t:?}"),
+      }
+    };
+
+    // 轴平行/对角退化射线（贴边界坐标，压 firstTrailingBit 对齐位模式）
+    let axis_rays: [(Vec3, Vec3); 16] = [
+      (Vec3::new(-800.0, 0.0, 0.0), Vec3::X),
+      (Vec3::new(800.0, 1.0, 0.0), -Vec3::X),
+      (Vec3::new(0.0, -200.0, 0.0), Vec3::Y),
+      (Vec3::new(0.0, 400.0, 0.0), -Vec3::Y),
+      (Vec3::new(0.0, 8.0, -800.0), Vec3::Z),
+      (Vec3::new(0.0, 8.0, 800.0), -Vec3::Z),
+      (Vec3::new(-800.0, -800.0, -800.0), Vec3::ONE),
+      (Vec3::new(800.0, 400.0, 800.0), -Vec3::ONE),
+      (Vec3::new(-768.0, 16.0, -256.0), Vec3::X),
+      (Vec3::new(-512.0, 16.0, 256.0), Vec3::X),
+      (Vec3::new(256.0, 16.0, -512.0), Vec3::new(0.0, 0.0, 1.0)),
+      (Vec3::new(300.0, -64.0, 300.0), Vec3::Y),
+      (Vec3::new(64.0, 64.0, 64.0), Vec3::new(1.0, -0.3, 0.7)),
+      (Vec3::new(-64.0, 200.0, -64.0), Vec3::new(-1.0, -1.0, -1.0)),
+      (Vec3::new(512.0, 32.0, -512.0), Vec3::new(-1.0, 0.2, 1.0)),
+      (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.1, 0.05)),
+    ];
+    for (i, (o, d)) in axis_rays.iter().enumerate() {
+      cmp(&format!("axis{i}"), *o, d.normalize(), 4096.0);
+    }
+
+    // 2000 条球壳随机射线
+    for ray in 0..2000 {
+      let r = 16.0 + frand(&mut state) * 1400.0;
+      let theta = frand(&mut state) * std::f32::consts::TAU;
+      let phi = (frand(&mut state) * 2.0 - 1.0).acos();
+      let origin = Vec3::new(
+        r * phi.sin() * theta.cos(),
+        r * phi.cos().abs() * 0.5 + 16.0,
+        r * phi.sin() * theta.sin(),
+      );
+      let dtheta = frand(&mut state) * std::f32::consts::TAU;
+      let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
+      let dir = Vec3::new(
+        dphi.sin() * dtheta.cos(),
+        dphi.cos(),
+        dphi.sin() * dtheta.sin(),
+      );
+      cmp(&format!("rand{ray}"), origin, dir, 4096.0);
+    }
+  }
 }
 
 // ============================================================================
@@ -2031,8 +2128,10 @@ use bevy::{
       BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
       CachedComputePipelineId, CachedRenderPipelineId,
       ColorTargetState, ColorWrites, ComputePassDescriptor, ComputePipelineDescriptor,
-      FragmentState, PipelineCache, RenderPassDescriptor, SamplerBindingType, ShaderStages,
-      StorageTextureAccess, TextureFormat, TextureSampleType, UniformBuffer,
+      Extent3d, FragmentState,
+      PipelineCache, RenderPassDescriptor, SamplerBindingType,
+      ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension,
+      TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer,
       VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, texture_2d, texture_storage_2d, uniform_buffer,
@@ -2070,6 +2169,13 @@ struct DdaBlitBindGroup(BindGroup);
 #[derive(Resource)]
 struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 
+/// P3 beam depth texture 缓存：低分辨率 r32float，resize 时重建
+#[derive(Resource, Default)]
+struct BeamDepthCache {
+  texture: Option<Texture>,
+  size: UVec2,
+}
+
 #[derive(Resource)]
 #[allow(dead_code)]
 struct DdaPipelines {
@@ -2082,6 +2188,7 @@ struct DdaPipelines {
   blit_layout: BindGroupLayoutDescriptor,
   compute_pipeline: CachedComputePipelineId,
   ddgi_pipeline: CachedComputePipelineId,
+  beam_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
 }
 
@@ -2147,7 +2254,7 @@ fn init_dda_pipelines(
   pipeline_cache: Res<PipelineCache>,
   _render_device: Res<RenderDevice>,
 ) {
-  // ---- BG0：out tex write + DdaViewUniform uniform（v5 single-pass）----
+  // ---- BG0：out tex write + DdaViewUniform uniform + beam depth rw（v5 single-pass + P3 beam）----
   let bg0 = BindGroupLayoutDescriptor::new(
     "DdaBg0",
     &BindGroupLayoutEntries::sequential(
@@ -2155,6 +2262,8 @@ fn init_dda_pipelines(
       (
         texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
         uniform_buffer::<DdaViewUniform>(false),
+        // @binding(2) beam_depth：低分辨率 r32float，beam pass 写最近命中 t，主 pass 读
+        texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
       ),
     ),
   );
@@ -2235,9 +2344,17 @@ fn init_dda_pipelines(
   });
   let ddgi = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_ddgi_update")),
+    layout: layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("ddgi_update")),
+    ..default()
+  });
+  // P3 beam 预 pass：低分辨率输出最近命中 t，主 pass 取邻域 min t 跳过空空间
+  let beam = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_beam")),
     layout: layouts,
     shader: dda_shader,
-    entry_point: Some(Cow::from("ddgi_update")),
+    entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
 
@@ -2274,9 +2391,11 @@ fn init_dda_pipelines(
     blit_layout: blit,
     compute_pipeline: compute,
     ddgi_pipeline: ddgi,
+    beam_pipeline: beam,
     blit_pipeline,
   });
   commands.insert_resource(LightPoolGpu(UniformBuffer::default()));
+  commands.insert_resource(BeamDepthCache::default());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2293,6 +2412,8 @@ fn prepare_dda_bind_groups(
   render_device: Res<RenderDevice>,
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
+  scale: Res<RenderScale>,
+  mut beam_cache: ResMut<BeamDepthCache>,
 ) {
   let Some(images) = images else {
     bevy::log::info_once!("DDA prepare: no DdaImages");
@@ -2320,11 +2441,38 @@ fn prepare_dda_bind_groups(
   let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
   let blit_layout = pipeline_cache.get_bind_group_layout(&pipelines.blit_layout);
 
-  // ---- BG0：out tex write + view uniform（v5 single-pass）----
+  // ---- P3 beam depth：低分辨率 r32float（全分辨率 / 4），resize 时重建 ----
+  const BEAM_DIV: u32 = 4;
+  let beam_size = UVec2::new(
+    scale.size.x.div_ceil(BEAM_DIV),
+    scale.size.y.div_ceil(BEAM_DIV),
+  );
+  if beam_cache.texture.is_none() || beam_cache.size != beam_size {
+    let tex = render_device.create_texture(&TextureDescriptor {
+      label: Some("gate_beam_depth"),
+      size: Extent3d {
+        width: beam_size.x,
+        height: beam_size.y,
+        depth_or_array_layers: 1,
+      },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D2,
+      format: TextureFormat::R32Float,
+      usage: TextureUsages::STORAGE_BINDING | TextureUsages::COPY_SRC,
+      view_formats: &[],
+    });
+    beam_cache.texture = Some(tex);
+    beam_cache.size = beam_size;
+  }
+  let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
+  let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
+
+  // ---- BG0：out tex write + view uniform + beam depth rw ----
   let bg0 = render_device.create_bind_group(
     None,
     &bg0_layout,
-    &BindGroupEntries::sequential((&tex_view.texture_view, &u)),
+    &BindGroupEntries::sequential((&tex_view.texture_view, &u, &beam_view)),
   );
 
   // ---- BG1：struct + leaves + palette + globals ----
@@ -2426,12 +2574,16 @@ fn dispatch_dda(
       None
     });
   let ddgi_pipe = pipeline_cache.get_compute_pipeline(pipelines.ddgi_pipeline);
+  let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
 
   let recorder = ctx.diagnostic_recorder();
   let recorder = recorder.as_deref();
 
-  let gx = scale.size.x.div_ceil(WORKGROUP_SIZE);
-  let gy = scale.size.y.div_ceil(WORKGROUP_SIZE);
+  let gx = scale.size.x.div_ceil(DDA_WORKGROUP_SIZE);
+  let gy = scale.size.y.div_ceil(DDA_WORKGROUP_SIZE);
+  // P3 beam：低分辨率 dispatch = ceil(size / 4) / 8
+  let bx = scale.size.x.div_ceil(4).div_ceil(WORKGROUP_SIZE);
+  let by = scale.size.y.div_ceil(4).div_ceil(WORKGROUP_SIZE);
 
   // ---- DDGI 探针射线更新（R3-10）：独立 compute pass ----
   // ddgi_update 写 ddgi_irr/ddgi_depth storage，dda_main 读同 buffer；wgpu 只在
@@ -2461,7 +2613,33 @@ fn dispatch_dda(
     }
   }
 
-  // ---- 主射线 trace + 直光/合成着色（读 DDGI buffer，排在 ddgi pass barrier 之后）----
+  // ---- P3 beam 预 pass：低分辨率 trace 只输出最近命中 t（独立 compute pass，
+  // beam 写 beam_depth，主 pass 读同 texture → pass 边界 barrier 保证可见性）----
+  // GATE_NO_BEAM=1：跳过 beam pass，主 pass t_min=0（穿墙定位用）
+  if !*BEAM_DISABLED {
+    if let Some(beam_pipe) = beam_pipe {
+      let span = recorder.time_span(ctx.command_encoder(), "gate_beam");
+      {
+        let mut pass = ctx
+          .command_encoder()
+          .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("gate_beam"),
+            ..default()
+          });
+        pass.set_pipeline(beam_pipe);
+        pass.set_bind_group(0, &bg0.0, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
+        pass.set_bind_group(5, &bg5.0, &[]);
+        pass.dispatch_workgroups(bx, by, 1);
+      }
+      span.end(ctx.command_encoder());
+    }
+  }
+
+  // ---- 主 DDA pass ----
   if let Some(dda_pipe) = dda_pipe {
     let span = recorder.time_span(ctx.command_encoder(), "gate_dda_trace");
     {

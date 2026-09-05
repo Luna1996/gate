@@ -119,8 +119,11 @@ impl ChunkTree {
 
   /// DFS 序列化（上传 GPU struct buffer）。
   ///
-  /// **wire v2**（2026-09-04 DDA 加速）：**叶父层（level 3）inline 64 palette**，
+  /// **wire v2**（2026-09-04 DDA 加速）：**叶父层（level 3）inline palette**，
   /// 消除 level 4 叶节点（3 word → 0）和 child_addr indirection（2 load → 1）。
+  /// **wire v3**（2026-09-04 叶子打包）：叶父层 inline 64 word → **16 word**，
+  /// 4 体素/word（每字节 = 一个 palette，child_idx 低 2 位选字节），256B→64B/节点。
+  /// v2 每体素 word 的高 3 字节（lod 死数据）无读者，直接丢弃。
   /// 上层（level 0-2）保持紧凑格式（省空间，稀疏节点不膨胀 64×）。
   fn serialize_node(&self, idx: Option<usize>, extent: i32, out: &mut Vec<u32>) {
     let (mask, palette_u32) = match idx {
@@ -144,10 +147,11 @@ impl ChunkTree {
     let child_extent = extent / BRICK_FACTOR;
 
     if child_extent == 1 {
-      // 叶父层（level 3）：inline 64 palette word（非紧凑，bit=0 位填 0）
-      // 消除 level 4 叶节点；GPU 读 b_struct[node + 3 + child_idx] 直取 palette
+      // 叶父层（level 3，wire v3）：inline 16 word，4 体素/word（每字节 = palette）。
+      // 读端：b_struct[node + 3 + (child_idx >> 2)] 的第 (child_idx & 3) 字节。
+      // bit=0 体素 = 0（AIR）。
       let inline_start = out.len();
-      out.resize(out.len() + 64, 0);
+      out.resize(out.len() + 16, 0);
       for i in 0u32..64 {
         let bit = 1u64 << i;
         if (mask & bit) != 0 {
@@ -158,11 +162,11 @@ impl ChunkTree {
             },
             None => unreachable!(),
           };
-          let (pal, lod_val) = match &self.nodes[child_idx] {
-            Node::Uniform(p) => (*p, *p),
+          let pal = match &self.nodes[child_idx] {
+            Node::Uniform(p) => *p,
             Node::Split { .. } => unreachable!(),
           };
-          out[inline_start + i as usize] = pack_pal_lod(pal, lod_val);
+          out[inline_start + (i >> 2) as usize] |= (pal as u32) << ((i & 3) * 8);
         }
       }
     } else {
@@ -861,42 +865,50 @@ impl ChunkTree {
   ///
   /// 编辑（set_voxel/fill_brick/clear）过程中 split + try_merge 会留下被
   /// merge 掉的子节点（索引变废但仍在 Vec，容量只增不减）。长时间编辑后
-  /// nodes 膨胀——本方法 DFS 标记可达节点，compact 到连续新 Vec，
-  /// 重写 children 索引。O(n) 时间 + O(n) 临时空间，编辑完成后调一次即可。
+  /// nodes 膨胀——本方法迭代 DFS 把可达节点 **move** 到连续新 Vec（零 clone，
+  /// 避免每 Split 一次堆分配），重写 children 索引。O(n) 时间 + O(n) 临时
+  /// 空间，编辑完成后调一次即可。
   pub fn compact(&mut self) {
     if self.nodes.len() <= 1 {
       return; // 空 root 或单节点，无废弃
     }
     let mut new_nodes: Vec<Node> = Vec::with_capacity(self.nodes.len());
-    let mut idx_map = vec![usize::MAX; self.nodes.len()];
-    self.collect_reachable(Some(0), &mut new_nodes, &mut idx_map);
+    let mut idx_map = vec![u32::MAX; self.nodes.len()];
+    let mut stack: Vec<usize> = vec![0];
+    while let Some(old) = stack.pop() {
+      if idx_map[old] != u32::MAX {
+        continue; // 已访问（树形无重访，防御性保留）
+      }
+      idx_map[old] = new_nodes.len() as u32;
+      // 占位替换 + move：Split 的 children 随节点搬入新 Vec，零堆分配
+      let node = std::mem::replace(&mut self.nodes[old], Node::Uniform(0));
+      match node {
+        Node::Uniform(p) => new_nodes.push(Node::Uniform(p)),
+        Node::Split {
+          mask,
+          palette,
+          children,
+        } => {
+          for &c in &children {
+            stack.push(c as usize);
+          }
+          new_nodes.push(Node::Split {
+            mask,
+            palette,
+            children,
+          });
+        }
+      }
+    }
     // 重写 children 索引：old → new
     for n in new_nodes.iter_mut() {
       if let Node::Split { children, .. } = n {
         for c in children.iter_mut() {
-          *c = idx_map[*c as usize] as u32;
+          *c = idx_map[*c as usize];
         }
       }
     }
     self.nodes = new_nodes;
-  }
-
-  fn collect_reachable(&self, idx: Option<usize>, out: &mut Vec<Node>, map: &mut Vec<usize>) {
-    let old = match idx {
-      Some(i) => i,
-      None => return,
-    };
-    if map[old] != usize::MAX {
-      return; // 已访问（防环）
-    }
-    let new_idx = out.len();
-    map[old] = new_idx;
-    out.push(self.nodes[old].clone());
-    if let Node::Split { children, .. } = &self.nodes[old] {
-      for &c in children.iter() {
-        self.collect_reachable(Some(c as usize), out, map);
-      }
-    }
   }
 
   // =========================================================================
@@ -1066,6 +1078,45 @@ mod tests {
     assert_eq!(t.get_uniform(16, 0, 0, 2), None);
   }
 
+  /// compact 回收 merge 留下的废弃节点：语义（serialize）不变 + 节点数收缩 + 幂等
+  #[test]
+  fn compact_reclaims_garbage_preserving_semantics() {
+    let mut t = ChunkTree::empty();
+    // 同一 64³ 块内两个异色 16³ 区域逐体素填充：每 16³ = 64 个 4³ 砖，
+    // 每砖填满即 merge 成 Uniform（丢弃的 64 叶滞留 Vec 成为废弃垃圾），
+    // 末砖合并后 16³ 节点自身也 merge 成 Uniform(7)/Uniform(3)
+    for z in 0..16i32 {
+      for y in 0..16i32 {
+        for x in 0..16i32 {
+          t.set_voxel(x, y, z, 7);
+          t.set_voxel(64 + x, y, z, 3);
+        }
+      }
+    }
+    // 戳个洞：16³ Uniform(7) 重分裂 → 4³ Split + 叶，try_merge 均不合并
+    t.clear_voxel(0, 0, 0);
+    let ser_before = t.serialize();
+    let len_before = t.nodes.len();
+    assert!(len_before > 8000, "预期存在大量废弃节点，got {len_before}");
+
+    t.compact();
+    assert_eq!(t.serialize(), ser_before, "compact 不得改变语义");
+    // 可达：root Split(2 bits) + 64³(0,0,0) Split + 16³(7) Split + 4³ Split
+    //       + 叶(0) + 64³(1,0,0) Split + 16³(3) Uniform（两 16³ 分属不同 64³ 块）
+    assert_eq!(t.nodes.len(), 7, "废弃节点应被回收");
+    assert_eq!(t.get_voxel(0, 0, 0), None);
+    assert_eq!(t.get_voxel(15, 15, 15), Some(7));
+    assert_eq!(t.get_voxel(64, 0, 0), Some(3));
+    assert_eq!(t.get_voxel(79, 15, 15), Some(3));
+    assert_eq!(t.get_voxel(63, 63, 63), None);
+    assert_eq!(t.get_voxel(80, 0, 0), None);
+
+    let ser_clean = t.serialize();
+    t.compact();
+    assert_eq!(t.nodes.len(), 7);
+    assert_eq!(t.serialize(), ser_clean, "compact 幂等");
+  }
+
   #[test]
   fn empty_uniform_returns_none() {
     let t = ChunkTree::empty();
@@ -1077,6 +1128,8 @@ mod tests {
   fn node_layout_roundtrip() {
     let mut t = ChunkTree::empty();
     t.set_voxel(100, 100, 100, 7);
+    // 同 4³ brick 内再放一个异色体素（in-brick ci=1），锁定字节打包语义
+    t.set_voxel(101, 100, 100, 9);
     let ser = t.serialize();
     assert!(ser.len() >= 3);
     // root 是 split：只有 (100,100,100) 所在 64³ 子块的 bit=1（lazy split，
@@ -1084,12 +1137,23 @@ mod tests {
     let mask = (ser[1] as u64) << 32 | ser[0] as u64;
     assert_ne!(mask, 0);
     assert_eq!(mask.count_ones(), 1, "lazy split：单 bit 而非 SPLIT_ALL");
-    // wire v2 混合格式：levels 0-2 紧凑（3+1 offset=4 words/层，单 child），
-    // level 3 叶父层 inline palette（3+64=67 words，不递归到 level 4 叶节点）
-    // 总 = 4 + 4 + 4 + 67 = 79 words
-    assert_eq!(ser.len(), 79);
+    // wire v3 混合格式：levels 0-2 紧凑（3+1 offset=4 words/层，单 child），
+    // level 3 叶父层 inline 16 word（3+16=19 words，4 体素/word）
+    // 总 = 4 + 4 + 4 + 19 = 31 words
+    assert_eq!(ser.len(), 31);
+    // 叶父层节点在字 12（root 0-3, 64³ 4-7, 16³ 8-11），inline 区 15..31
+    // 体素 (100,100,100)：4³ brick 内坐标 (0,0,0) → ci=0 → word15 字节0 = 7
+    // 体素 (101,100,100)：(1,0,0) → ci=1 → word15 字节1 = 9
+    // 同 word 其余体素 = AIR（0）
+    assert_eq!(ser[15] & 0xFF, 7, "ci=0 字节 = palette 7");
+    assert_eq!((ser[15] >> 8) & 0xFF, 9, "ci=1 字节 = palette 9");
+    assert_eq!((ser[15] >> 16) & 0xFF, 0, "ci=2 字节 = AIR");
+    assert_eq!((ser[15] >> 24) & 0xFF, 0, "ci=3 字节 = AIR");
+    assert_eq!(ser[16], 0, "word16（ci=4..7）= AIR");
     // 序列化后读回语义不变
     assert_eq!(t.get_voxel(100, 100, 100), Some(7));
+    assert_eq!(t.get_voxel(101, 100, 100), Some(9));
+    assert_eq!(t.get_voxel(102, 100, 100), None);
     assert_eq!(t.get_voxel(0, 0, 0), None);
   }
 

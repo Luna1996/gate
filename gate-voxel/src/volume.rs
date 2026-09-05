@@ -228,11 +228,28 @@ impl VolumeGrid {
     self.chunks.len()
   }
 
-  /// GC 所有 chunk：回收编辑过程中累积的废弃节点（见 [`ChunkTree::compact`]）
+  /// GC 所有 chunk：回收编辑过程中累积的废弃节点（见 [`ChunkTree::compact`]）。
+  ///
+  /// chunk 间零共享 → rayon 并行；导入后全场景百万级节点，串行 ~1s → 并行 ~0.1s。
   pub fn compact_all(&mut self) {
-    for tree in self.chunks.values_mut() {
-      tree.compact();
-    }
+    use rayon::prelude::*;
+    self.chunks.par_iter_mut().for_each(|(_, tree)| tree.compact());
+  }
+
+  /// 挂载外部预构建的 chunk 树（大体积批量导入专用）。
+  ///
+  /// 用 `tree` 整体替换 `cc` 上的树，标脏并按 `applied_edits` 累加编辑代数
+  /// （保持「每次实际改变体素 +1」语义：导入方统计并行建树时真实生效的写入数）。
+  ///
+  /// # 调用契约
+  /// `tree` 的体素集合即该 chunk 的最终状态——同 coord 已有非空树时会被
+  /// 整体覆盖（导入方保证 fresh grid 或接受覆盖）。空树不挂载（避免污染
+  /// chunk 表 + 空转脏标记），由调用方跳过。
+  pub fn mount_chunk_tree(&mut self, cc: ChunkCoord, tree: ChunkTree, applied_edits: u64) {
+    debug_assert!(!tree.is_empty(), "mount_chunk_tree 不接受空树");
+    self.chunks.insert(cc, tree);
+    self.dirty.mark_data(cc);
+    self.edit_generation = self.edit_generation.wrapping_add(applied_edits);
   }
 
   // =========================================================================

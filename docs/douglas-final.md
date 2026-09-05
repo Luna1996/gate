@@ -93,7 +93,12 @@
 ### 4.2 性能三件套（#18，集显 120→60ms）
 1. **brick 内 DDA 化**（120→100ms）：ray-box 求交 → tMax 加减。
 2. **方向位掩码 LUT 预过滤**（100→80ms）：编译期对每种（进入位置 × 主方向组合）预计算「可能命中的体素掩码」；运行时 `occupancy_mask & dir_mask == 0` → 整个 brick 几条指令跳过。
-3. **Beam 多分辨率保守起步**（80→60ms）：低分辨率先跑一遍（限制步进深度），全分辨率射线以**周围 4-6 条低分辨率射线的最小距离**为起点 → 平均行程大减。带保守性证明：**输出与非 beam 版逐像素一致**。
+   - **【2026-09-05 勘误，对照 #18 原文】** #18 原话：*"at compile time I generate a lookup for every starting position and set of cardinal directions that array could have"*——查表键是**起始格（brick 内 DDA 入口格）× 基方向（octant，方向符号组合）**，不是任意方向；掩码语义是"该射线**可能经过**的体素集合"（可达掩码，保守超集）。AND 结果**同时用作 DDA 循环内的有效占用表**（不止整砖跳过）：*"before I begin the DDA loop I check the voxel position and its direction, I get the bit mask corresponding to all of the voxels that the ray could possibly hit"*。注：术语"LUT"是 gate 侧实现名（Look-Up Table），Douglas 原文只说 lookup。gate 实现：`march_mask_lut_words()` 8 octant × 64 入口格 × 64bit = 4KB，读 `b_leaves`（原 Douglas 占位缓冲重定向）；gate 语义差异——mask bit=1 = 分裂 ≠ 含实体，故仅 `palette==0`（uniform 子块=空气）节点可用 `mask & reach` 剔除，popcount 定位仍用原 mask。
+   - **【2026-09-05 整砖级简化 + 同层空气跳过 = 最终方案】** 整砖级 `mask & reach == 0` 判断单独使用时 trace 2.3→3.7ms（+60%），因缺层级大步进导致不可达分裂子块被下钻再弹栈。**配合同层空气快速跳过**（推进 loop 内连续推进 mask bit==0 子块，不回主循环）后，不可达分裂子块下钻后被同层跳过快速处理 → trace 2.4→1.7ms（-29%）。最终方案：eff 仅用于整砖级 `eff==0` 跳过判断，砖内子块一律用原始 mask 判断（与 Douglas 原文一致）；弹栈必须用 `continue`（不能 `break`），否则父帧 `f.t_enter` 未更新导致重复下钻死循环。
+   - **【2026-09-05 死循环 bug 修复】** `eff==0 && palette==0`（方向掩码把节点所有分裂子块都过滤为不可达）时，**不能直接弹栈**——若该子块本身是 split 节点（mask bit=1，被 reach 过滤导致 eff=0），弹栈后父帧 `f.cell` 未推进，同一子块 eff bit 仍=1 → 立即重复下钻 → 死循环耗满 budget（实测 trace 698ms + DeviceLost）。修复：把 `t_enter` 推到 `cell_exit`，让内层推进 loop 自然跨出节点（`tmax>=t_exit` → 弹栈），父帧随之推进。Douglas 原文未提此细节（其 mask bit=1 语义=含实体，eff=0 节点必为 uniform 空气，无 split 节点被过滤的情形）。
+3. **Beam 多分辨率保守起步**（80→60ms）：低分辨率先跑一遍，全分辨率射线以**周围 4-6 条低分辨率射线的最小距离**为起点 → 平均行程大减。带保守性证明：**输出与非 beam 版逐像素一致**。
+   - **【2026-09-05 勘误，对照 #18 原文】** 旧摘要写"限制步进深度"不准确。#18 原文：*"we also make sure that the low resolution Rays never step far enough into the scene that these voxels could get smaller than that minimum size required for a voxel to always be hit by one low resolution Ray"*。正确机制是**限制行进距离**而非八叉树深度。#18 原文未给最小尺寸公式；gate 推导：凸投影（最坏 45° 菱形）必含 beam 网格点需投影双向宽 ≥ 2·beam 间距，且最近网格点距主像素 ≤ 1.5 格（3×3 邻域覆盖）→ D_safe ≈ 1/(2√2·beam_间距·像素角大小)。旧实现 D = beam_间距/像素角大小**超保守距离 8 倍**（远处亚间距体素被 beam 漏记 → 主射线从错误 t_min 起步 → 穿墙）；主 pass 邻域须 **3×3 对称**（2×2 右下偏置窗漏对角网格点）；beam miss 必须存 D_safe 而非 t_cap（存 t_cap 时邻域全 miss 会把主射线起点推到视锥末端 → 整条射线假 miss）。错误地限制八叉树深度（depth_cap）会使稀疏/薄壁几何体被低分辨率射线漏过 → 远处穿墙。全深度 beam 反而更快（返回 t 更接近真实命中，主 pass 少走）。
+   - **【2026-09-05 P5 加固，gate 侧】**「min t 起步」仍有残余误差：邻域 beam 命中主射线首命中体素时可从**侧面/远面**入射（两射线穿过同一单位体素，入口 t 差 ≤ 体素视向对角 √3 + 3×3 半宽横向偏移 ≈ 0.53，合计 ~2.3 世界单位），直接以 min t 起步会跳过 ≤2.3 单位内的薄壁/剪影命中 → 近距离穿墙残影。gate 修复：主 pass 起点统一回退 `BEAM_BACKOFF = 4` 世界单位（对比可跳过的 ~D_safe≈百单位，成本近似零）。Douglas 原文未提此裕量；其「逐像素一致」应是经验观察，非严格证明。
 
 ### 4.3 管线拓扑（#19 时代形态，#22/#23 沿用其结构）
 ```
@@ -114,6 +119,7 @@ beam 低分辨率预 pass
 
 ### 4.5 LOD / 天空
 - 八叉树层级遍历早停 = 天然 LOD（#2）；DDGI 探针 4 级 LOD（#23）。
+- **【2026-09-05 勘误，对照 #2 原文】** #2：*"if i want to use a higher lod i simply don't traverse all the way down to the bottom level of my voxel octree i just stop at the selected level of detail and then use the materials stored there to draw the voxel"*。"materials stored there" = 节点自身存储的材质。**uniform 节点**的材质即其 palette（精确色），早停无误差；**split 节点**没有单一表面色（子树多数色≠表面色，内部色会渗出造成"穿墙"）。正确做法：LOD 早停只对 uniform 子节点生效（mask==0 → 用其精确 palette），split 子节点一律继续下钻。旧实现对子树实体多数色（排除空气计票）早停 → 表面/内部色不一致时颜色穿墙。
 - 程序化昼夜天空盒：太阳/月亮/星星 + 可调云量（#16）；DDGI 射线命中天空取天空色（#23）。
 
 ### 4.6 性能本质观（贯穿他全部优化决策）

@@ -13,13 +13,17 @@
 //!       每 chunk 树（ChunkTree::serialize() 原样）：
 //!       node = [mask_lo, mask_hi, palette_u32] + popcount(mask) 个 child offset
 //!       child offset = chunk 内相对字址（shader 端加 chunk base 转绝对）
+//!       （wire v3：level 3 叶父层例外——inline 16 word，4 体素/word，
+//!         每字节 = 一个 palette，读端按 child_idx 低 2 位选字节）
 //! ```
 //!
 //! mask bit=1 → 子块被分裂（child offset 有效）；bit=0 → uniform 子块，
 //! 颜色 = 该节点 palette_u32（零额外 load）。palette=0 = AIR。
 //!
-//! b_leaves 已删除（Douglas 格式 palette 直存节点 fixed 字）——字段保留空 Vec
-//! 以维持 GpuBrickMap/obj 打包结构稳定，Phase 2 shader 重写时移除。
+//! b_leaves：原 Douglas 格式占位（palette 直存节点后恒空）——**P4 重定向为
+//! 方向可达掩码 LUT**（Douglas #18 Bitwise Masking，octo-release
+//! `march_masks: array<array<vec4<u32>, BRICK_ENTRIES>, 8>` 同构），见
+//! [`march_mask_lut_words`]。
 
 use gate_voxel::PaletteEntry;
 use glam::{IVec3, Mat3, Vec3, Vec4};
@@ -105,7 +109,8 @@ pub struct BrickMapGlobals {
   pub brick_free: u32,
   /// 超出 chunk 窗口被拒绝的 chunk 数
   pub rejected_tiles: u32,
-  pub _pad0: u32,
+  /// grid_descs 有效条目数（主世界 + 物体）
+  pub grid_count: u32,
   pub _pad1: u32,
   pub _pad2: u32,
   pub _pad3: u32,
@@ -213,6 +218,71 @@ impl GridDesc {
       _pad1: 0,
     }
   }
+}
+
+// ============ P4：方向可达掩码 LUT（Douglas #18 Bitwise Masking）============
+
+/// LUT octant 数：射线方向符号组合。编码与 dda.wgsl `dir_mask` 一致：
+/// bit0 = x 正方向、bit1 = y 正、bit2 = z 正（正 = 1，零分量按正处理 = 保守）。
+pub const MARCH_MASK_OCTANTS: usize = 8;
+/// LUT 入口格数：4³ brick 内的 DDA 起始格。编码与 dda.wgsl `child_idx` 一致：
+/// `z*16 + y*4 + x`。
+pub const MARCH_MASK_ENTRIES: usize = 64;
+/// 每入口格掩码字数（64-bit 子块占用 → 2×u32）
+pub const MARCH_MASK_WORDS_PER_ENTRY: usize = 2;
+/// LUT 总字数：8 × 64 × 2 = 1024 u32 = 4KB（b_leaves 重定向内容）
+pub const MARCH_MASK_WORDS: usize =
+  MARCH_MASK_OCTANTS * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY;
+
+/// 生成方向可达掩码 LUT（#18 Bitwise Masking；octo-release
+/// `march_masks: array<array<vec4<u32>, BRICK_ENTRIES>, 8>` 同构，低 64 bit 有效）。
+///
+/// `lut[octant][entry]` = 从 brick 内入口格 `entry` 出发、方向符号 = `octant` 的
+/// 射线**可能经过**的子块集合（64-bit，bit i = 子块 `x + y*4 + z*16`）。
+///
+/// 精确刻画（+x 轴推导）：射线从格 e 内一点向 +x 走经过格 p ⟺ 存在 u ≥ 0 使
+/// e.x + u ∈ [p.x, p.x+1] ⟺ p.x + 1 ≥ e.x。实现再加 ±1 格浮点裕量（入口格
+/// clamp / 浮点边界误差免疫）：octant 分量正 → `p_i ≥ e_i − 1`；负 →
+/// `p_i ≤ e_i + 1`。掩码恒为真实可达集的**保守超集** → shader 端
+/// `occupancy & reach` 剔除绝不漏真实命中（不穿墙）。
+///
+/// 子块含实体与否的判定归 shader（本 LUT 只答"几何上能否经过"）：
+/// gate 语义 mask bit=1 = 分裂 ≠ 实体，uniform 子块色 = 节点 palette——
+/// palette==0（空气）节点才可用 `mask & reach` 剔除，见 dda.wgsl trace_chunk。
+pub fn march_mask_lut_words() -> Vec<u32> {
+  let mut out = vec![0u32; MARCH_MASK_WORDS];
+  for oct in 0..MARCH_MASK_OCTANTS {
+    let pos = [oct & 1 != 0, (oct >> 1) & 1 != 0, (oct >> 2) & 1 != 0];
+    for entry in 0..MARCH_MASK_ENTRIES {
+      let e = [
+        (entry & 3) as i32,
+        ((entry >> 2) & 3) as i32,
+        ((entry >> 4) & 3) as i32,
+      ];
+      let mut mask = 0u64;
+      for p in 0..MARCH_MASK_ENTRIES {
+        let q = [
+          (p & 3) as i32,
+          ((p >> 2) & 3) as i32,
+          ((p >> 4) & 3) as i32,
+        ];
+        let ok = [0, 1, 2].iter().all(|&i| {
+          if pos[i] {
+            q[i] >= e[i] - 1
+          } else {
+            q[i] <= e[i] + 1
+          }
+        });
+        if ok {
+          mask |= 1u64 << p;
+        }
+      }
+      let base = entry * MARCH_MASK_WORDS_PER_ENTRY + oct * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY;
+      out[base] = mask as u32;
+      out[base + 1] = (mask >> 32) as u32;
+    }
+  }
+  out
 }
 
 /// 局部 [0,256]³·scale 经旋转平移后的世界 AABB（与 obj.rs 旧 world_aabb 同型）
@@ -323,5 +393,116 @@ mod tests {
         5 | (6 << 8) | (7 << 16)
       ]
     );
+  }
+
+  // ---- P4：方向可达掩码 LUT ----
+
+  /// 读 LUT 单项（octant × entry → u64 掩码），布局与 shader 端
+  /// `b_leaves[oct*128 + entry*2 ..]` 一致
+  fn lut_get(lut: &[u32], oct: usize, entry: usize) -> u64 {
+    let base = oct * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY
+      + entry * MARCH_MASK_WORDS_PER_ENTRY;
+    lut[base] as u64 | ((lut[base + 1] as u64) << 32)
+  }
+
+  fn entry_index(x: i32, y: i32, z: i32) -> usize {
+    (z * 16 + y * 4 + x) as usize
+  }
+
+  #[test]
+  fn march_mask_lut_size_and_self_reach() {
+    let lut = march_mask_lut_words();
+    assert_eq!(lut.len(), MARCH_MASK_WORDS);
+    assert_eq!(MARCH_MASK_WORDS, 1024, "8 octant × 64 entry × 2 u32 = 4KB");
+    // 入口格自身恒可达（p_i ≥ e_i − 1 含 p=e；p_i ≤ e_i + 1 同理）
+    for oct in 0..MARCH_MASK_OCTANTS {
+      for entry in 0..MARCH_MASK_ENTRIES {
+        assert_ne!(
+          lut_get(&lut, oct, entry) & (1u64 << entry),
+          0,
+          "oct={oct} entry={entry} 自身必须可达"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn march_mask_lut_corner_entries() {
+    let lut = march_mask_lut_words();
+    // octant 7 = (+,+,+)（bit1=正）。entry (0,0,0) → p_i ≥ −1 恒真 → 全 64 格可达
+    assert_eq!(lut_get(&lut, 7, entry_index(0, 0, 0)), u64::MAX);
+    // entry (3,3,3) (+,+,+) → p_i ≥ 2 → 恰 {2,3}³ 8 格
+    let mut want = 0u64;
+    for z in 2..4 {
+      for y in 2..4 {
+        for x in 2..4 {
+          want |= 1u64 << entry_index(x, y, z);
+        }
+      }
+    }
+    assert_eq!(lut_get(&lut, 7, entry_index(3, 3, 3)), want);
+    // octant 0 = (−,−,−)，entry (0,0,0) → p_i ≤ 1 → {0,1}³ 8 格
+    let mut want_lo = 0u64;
+    for z in 0..2 {
+      for y in 0..2 {
+        for x in 0..2 {
+          want_lo |= 1u64 << entry_index(x, y, z);
+        }
+      }
+    }
+    assert_eq!(lut_get(&lut, 0, entry_index(0, 0, 0)), want_lo);
+  }
+
+  #[test]
+  fn march_mask_lut_monotone_and_bounded() {
+    let lut = march_mask_lut_words();
+    // 单调性：+轴入口沿正向推进 → 条件 p_i ≥ e_i−1 收紧 → 掩码缩小（子集）；
+    // −轴条件 p_i ≤ e_i+1 放宽 → 掩码扩大（超集）。按轴符号分别验证。
+    for oct in 0..MARCH_MASK_OCTANTS {
+      let x_pos = oct & 1 != 0;
+      for y in 0..4 {
+        for z in 0..4 {
+          let mut prev = if x_pos { u64::MAX } else { 0u64 };
+          for x in 0..4 {
+            let m = lut_get(&lut, oct, entry_index(x, y, z));
+            if x_pos {
+              assert_eq!(m & prev, m, "oct={oct} +x 入口未单调缩小 @ ({x},{y},{z})");
+            } else {
+              assert_eq!(m | prev, m, "oct={oct} −x 入口未单调扩大 @ ({x},{y},{z})");
+            }
+            prev = m;
+          }
+        }
+      }
+    }
+    // 保守下界：任一 (oct, entry) 可达集 ≥ 8 格（每轴至少 {e−1..3} 或 {0..e+1} 取 2 格）
+    for oct in 0..MARCH_MASK_OCTANTS {
+      for entry in 0..MARCH_MASK_ENTRIES {
+        assert!(
+          lut_get(&lut, oct, entry).count_ones() >= 8,
+          "oct={oct} entry={entry} 可达集异常小（过激进剔除风险）"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn march_mask_lut_axis_aligned_exact() {
+    // 纯 +x 方向（oct bit0=1, bit1/2=0 → 符号 (+,−,−)）从 (0,y,z) 出发的精确可达集：
+    // x 轴向走遍 0..4，y/z 向 ≤ e+1 裕量内。抽查 entry (0, 3, 3)：
+    // 可达 = 全 x × y ≤ 3（恒真）× z ≤ 3（恒真）→ 全 64 格
+    let lut = march_mask_lut_words();
+    // (+,−,−) = bit0=1, bit1=0, bit2=0 → oct 1
+    assert_eq!(lut_get(&lut, 1, entry_index(0, 3, 3)), u64::MAX);
+    // 同方向 entry (3, 0, 0)：x ≥ 2 且 y ≤ 1 且 z ≤ 1 → 2×2×2 = 8 格
+    let mut want = 0u64;
+    for z in 0..2 {
+      for y in 0..2 {
+        for x in 2..4 {
+          want |= 1u64 << entry_index(x, y, z);
+        }
+      }
+    }
+    assert_eq!(lut_get(&lut, 1, entry_index(3, 0, 0)), want);
   }
 }

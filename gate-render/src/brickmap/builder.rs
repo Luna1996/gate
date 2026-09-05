@@ -135,7 +135,7 @@ impl BrickMapBuilder {
           brick_slabs: 0,
           brick_free: 0,
           rejected_tiles: rejected as u32,
-          _pad0: 0,
+          grid_count: 0,
           _pad1: 0,
           _pad2: 0,
           _pad3: 0,
