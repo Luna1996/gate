@@ -382,13 +382,18 @@ struct Brick {
 //
 // depth_cap（beam 保守模式）：gate 深度 d=(3-level) 的分裂子块且 d>=depth_cap 时
 // 返回子块入口 t（保守下界）；主/阴影 pass depth_cap=3 恒不触发（d<=2）。
+// lod_t_scale：LOD 远场早停阈值系数（scale/像素角大小）；远距 split 子节点投影
+// <1px 时用子树 LOD 多数色整块出图（亚像素误差）。WGSL-only 近似，CPU 镜像不含。
 fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
                ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
-               t0: f32, t1: f32, entry_face: u32, depth_cap: u32) -> FineHit {
+               t0: f32, t1: f32, entry_face: u32, depth_cap: u32,
+               lod_t_scale: f32) -> FineHit {
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
   if (t0 >= t1) { return FineHit(false, 0.0, 0u, 0u); }
   // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = ro - chunk_min;
+  // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv）
+  let inv_rd = 1.0 / rd;
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
@@ -412,14 +417,16 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let b = bricks[level];
       // WGSL 移位 RHS 必须 u32
       let sh = vec3<u32>(level * 2u);
-      let cell = clamp((v >> sh) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
+      let cell = clamp(vec3<i32>(v >> sh) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
-        // 叶节点 inline palette：4 体素/word，低 2 位选字节
-        // （到此必为 mask!=0 的 inline 叶：mask==0 统一叶在父层下钻快路径已处理）
-        let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
-        let leaf_pal = (w >> ((idx & 3u) * 8u)) & 0xFFu;
-        if (leaf_pal != 0u) { return FineHit(true, cur_t, leaf_pal, face); }
+        // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
+        // bit=0 空气体素零 load（mask 在手）。
+        if ((b.mask & (u64(1) << idx)) != u64(0)) {
+          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
+          let leaf_pal = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+          if (leaf_pal != 0u) { return FineHit(true, cur_t, leaf_pal, face); }
+        }
         break; // 空气 leaf
       }
       let bit = u64(1) << idx;
@@ -437,13 +444,26 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
       let c_ml = b_struct[child_addr];
       let c_mh = b_struct[child_addr + 1u];
-      let c_pal = b_struct[child_addr + 2u] & 0xFFu;
+      let c_pw = b_struct[child_addr + 2u];
+      let c_pal = c_pw & 0xFFu;
       let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
       // 统一子节点快路径（旧 c_mask==0）：wire 任意层的分裂位都可能指向 3 字统一
       // 节点（mask=0，pal 直决；叶层统一节点无 inline 16 字，禁读 addr+3 之后）
       if (c_mask == u64(0)) {
         if (c_pal != 0u) { return FineHit(true, cur_t, c_pal, face); }
         break;
+      }
+      // LOD 远场早停（冷路径：uniform 开关 + 远场门控，近场/关闭时近零开销）。
+      // 大场景远距射线：split 子节点投影 <1px 时用子树 LOD 多数色（palette word
+      // 高字节 = node_lod）整块出图，亚像素误差，省深层下钻。child_extent = 子块
+      // fine 边长 = 1<<(level*2)（root→64 … level1→4）。WGSL-only 近似开关
+      // （CPU 参考实现不含，旧栈版 trace_chunk 同位置同语义）。
+      if (view_u.lod.y > 0.5 && cur_t > 4.0 * lod_t_scale) {
+        let child_extent = f32(1u << (level * 2u));
+        if (cur_t > child_extent * lod_t_scale) {
+          let c_lod = (c_pw >> 8u) & 0xFFu;
+          if (c_lod != 0u) { return FineHit(true, cur_t, c_lod, face); }
+        }
       }
       level = level - 1u;
       bricks[level] = Brick(child_addr, c_mask, c_pal);
@@ -455,7 +475,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let b = bricks[level];
       if (b.pal == 0u) {
         let sh = vec3<u32>(level * 2u);
-        let ecell = clamp((v >> sh) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
+        let ecell = clamp(vec3<i32>(v >> sh) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
         let entry_i = u32(ecell.z * 16 + ecell.y * 4 + ecell.x);
         let oct = select(0u, 1u, sign_v.x >= 0)
           | (select(0u, 1u, sign_v.y >= 0) << 1u)
@@ -482,8 +502,10 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       + select(vec3<f32>(0.0), vec3<f32>(f32(s)), sign_v >= vec3<i32>(0));
     var side = vec3<f32>(1e+30);
     let axis_on = abs(rd) > vec3<f32>(1e-30);
-    side = select(side, (boundary - ro_c) / rd, axis_on);
+    side = select(side, (boundary - ro_c) * inv_rd, axis_on);
     side = max(side, vec3<f32>(cur_t));
+    // 每轴步长 t 增量（level 不变则不变）：inner 里 O(1) 加法
+    let step_inc = vec3<f32>(f32(s)) * abs(inv_rd);
     var step_axis: u32 = 0u;
     var changed = false;
     loop {
@@ -498,29 +520,34 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let old_cell = (v[mn] >> log2) & 3;
       // 沿 mn 轴整子块跨越
       v[mn] = v[mn] + sign_v[mn] * s;
-      side[mn] = side[mn] + f32(s) / abs(rd[mn]);
+      side[mn] = side[mn] + step_inc[mn];
       face = mn * 2u + select(1u, 0u, sign_v[mn] >= 0);
       // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
       let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
       if (crossed) { changed = true; break; }
       // 新子块内容：level 0 查 inline palette（mask!=0 inline 叶才有）；
-      // level 1..3 = 分裂位或节点统一实体色
+      // level 1..3 = 分裂位或节点统一实体色。
+      // 命中直接返回（cur_t=进入距离、face=进入面）——省一整轮外层
+      // （traverse 节点 load + LUT + side 重算）；仅「分裂子块」回 traverse 下钻。
       let b = bricks[level];
       let sh2 = vec3<u32>(log2);
-      let cell = clamp((v >> sh2) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
+      let cell = clamp(vec3<i32>(v >> sh2) & vec3<i32>(3), vec3<i32>(0), vec3<i32>(3));
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
-      var occ = false;
       if (level == 0u) {
-        if (b.mask == u64(0)) {
-          occ = b.pal != 0u;
-        } else {
+        // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
+        if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
-          occ = ((w >> ((idx & 3u) * 8u)) & 0xFFu) != 0u;
+          let dp = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+          if (dp != 0u) { return FineHit(true, cur_t, dp, face); }
+        } else if (b.mask == u64(0) && b.pal != 0u) {
+          // 防御：uniform 叶（正常下钻快路径已处理）
+          return FineHit(true, cur_t, b.pal, face);
         }
       } else {
-        occ = ((b.mask & (u64(1) << idx)) != u64(0)) || (b.pal != 0u);
+        let mb = (b.mask & (u64(1) << idx)) != u64(0);
+        if (mb) { break; } // 分裂子块 → 回 traverse 下钻
+        if (b.pal != 0u) { return FineHit(true, cur_t, b.pal, face); } // 统一实体
       }
-      if (occ) { break; } // 有内容 → 回 traverse 下钻/命中
       // 空气子块 → 回 loop 顶重选 mn 轴继续
     }
     if (changed) {
@@ -533,7 +560,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     let positive = sign_v[step_axis] >= 0;
     let cur_log2 = level * 2u;
     let m: u32 = 0xFFFFFFFFu << cur_log2;
-    let vmin_u = bitcast<u32>(v[step_axis]); // i32→u32 位环绕（负值公式自然处理）
+    let vmin_u = u32(v[step_axis]); // i32→u32 位环绕（负值公式自然处理）
     var comp: u32;
     if (positive) { comp = vmin_u & m; } else { comp = (vmin_u & m) | ~m; }
     let tz_i = firstTrailingBit(comp + select(1u, 0u, positive)); // 0 → -1
@@ -543,12 +570,12 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     if (level > 3u) { return FineHit(false, 0.0, 0u, 0u); } // 跨出 chunk（tz≥8）
     // 对齐快照：v 钳到 cur_t 射线点所在的当前 level 区域，步进轴取精确边界整数
     // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
-    let mi = bitcast<i32>(m);
+    let mi = i32(m);
     let base = v & vec3<i32>(mi);
     let p = ro_c + rd * cur_t;
-    let region_max = base + vec3<i32>(bitcast<i32>(~m));
+    let region_max = base + vec3<i32>(i32(~m));
     v = clamp(vec3<i32>(floor(p)), base, region_max);
-    v[step_axis] = bitcast<i32>(comp);
+    v[step_axis] = i32(comp);
   }
   return FineHit(false, 0.0, 0u, 0u);
 }
@@ -747,6 +774,9 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   tmax_c = select(tmax_c, (bnd_c - ro) / rd, abs(rd) > vec3<f32>(1e-30));
   tmax_c = max(tmax_c, vec3<f32>(tl0));
   var t_enter_c = tl0;
+  // LOD 早停 t 阈值系数：子块(局部单位 sub)投影 < 1px ⇔ t > sub * (scale / 像素角大小)
+  // （局部 sub × scale = 世界边长；t 为世界距离）。lod.x=0 时早停条件永不成立。
+  let lod_t_scale = scale / view_u.lod.x;
   // entry_face：跨入当前 chunk 的面。首 chunk 用 normalize(-rd) 兜底（相机贴面/UB；
   // 按约定 UB 直接返回该 voxel 颜色，face_id 反推）；后续 chunk 由跨轴 + sign_v 更新。
   // face_index_from_normal 内联（函数调用开销，见 worklog）
@@ -778,7 +808,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
         // P3 beam：chunk 内遍历从 max(chunk 入口, t_min) 开始，跳过 t_min 前的空空间
         let t0c = max(t_enter_c, t_min);
         let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v,
-                            t0c, t1, entry_face, depth_cap);
+                            t0c, t1, entry_face, depth_cap, lod_t_scale);
         if (h.hit) {
           // 统一法线计算：trace_chunk 内部已推好 face_id，调用方零分支
           let n_local = face_normal_from_index(h.face_id);

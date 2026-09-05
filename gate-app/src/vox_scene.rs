@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
 
-use glam::{IVec3, Vec3};
+use glam::{IVec3};
 use gate_voxel::{ChunkCoord, ChunkTree, PaletteEntry, VolumeGrid, CHUNK_SIZE};
 use rayon::prelude::*;
 
@@ -23,20 +23,6 @@ pub struct VoxSceneInfo {
   pub instances_used: usize,
   pub voxels_written: usize,
   pub voxels_dropped: usize,
-}
-
-impl VoxSceneInfo {
-  /// AABB 中心（相机轨道 target）
-  pub fn center(&self) -> Vec3 {
-    let c = (self.aabb_min + self.aabb_max) / 2;
-    Vec3::new(c.x as f32, c.y as f32, c.z as f32)
-  }
-
-  /// AABB 对角线长度（相机初始距离依据）
-  pub fn diagonal(&self) -> f32 {
-    let d = self.aabb_max - self.aabb_min;
-    Vec3::new(d.x as f32, d.y as f32, d.z as f32).length()
-  }
 }
 
 /// 读 .vox → palette 映射 → 体素写入 grid。

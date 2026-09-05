@@ -990,6 +990,8 @@ fn trace_chunk_cpu(
   }
   // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = [ro[0] - chunk_min[0], ro[1] - chunk_min[1], ro[2] - chunk_min[2]];
+  // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv；与 WGSL inv_rd 镜像）
+  let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
   let read_brick = |addr: usize| BrickCpu {
     addr,
     mask: ((b_struct[addr + 1] as u64) << 32) | b_struct[addr] as u64,
@@ -1024,12 +1026,14 @@ fn trace_chunk_cpu(
       let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
       let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
       if level == 0 {
-        // 叶节点 inline palette：4 体素/word，低 2 位选字节
-        // （到此必为 mask!=0 的 inline 叶：mask==0 统一叶在父层下钻快路径已处理）
-        let w = b_struct[b.addr + 3 + (idx >> 2)];
-        let leaf_pal = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
-        if leaf_pal != 0 {
-          return Some((cur_t, leaf_pal, face));
+        // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
+        // bit=0 空气体素零 load（mask 在手）。
+        if (b.mask & (1u64 << idx)) != 0 {
+          let w = b_struct[b.addr + 3 + (idx >> 2)];
+          let leaf_pal = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
+          if leaf_pal != 0 {
+            return Some((cur_t, leaf_pal, face));
+          }
         }
         break; // 空气 leaf
       }
@@ -1065,9 +1069,15 @@ fn trace_chunk_cpu(
         // side_distance_for_ray：v 对齐到 s 的基址；正向 → 基址+s，负向 → 基址
         let base = v[i] & !(s - 1);
         let boundary = if sign[i] >= 0 { base + s } else { base };
-        side[i] = ((boundary as f32 - ro_c[i]) / rd[i]).max(cur_t);
+        side[i] = ((boundary as f32 - ro_c[i]) * inv_rd[i]).max(cur_t);
       }
     }
+    // 每轴步长 t 增量（level 不变则不变）：inner 里 O(1) 加法
+    let step_inc = [
+      s as f32 * inv_rd[0].abs(),
+      s as f32 * inv_rd[1].abs(),
+      s as f32 * inv_rd[2].abs(),
+    ];
     let mut step_axis: usize;
     let mut changed = false;
     loop {
@@ -1087,7 +1097,7 @@ fn trace_chunk_cpu(
       let old_cell = (v[min] >> log2) & 3;
       // 沿 min 轴整子块跨越
       v[min] += sign[min] * s;
-      side[min] += s as f32 / rd[min].abs();
+      side[min] += step_inc[min];
       face = (min * 2) as u8 + if sign[min] < 0 { 1 } else { 0 };
       // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
       let crossed = if sign[min] >= 0 { old_cell == 3 } else { old_cell == 0 };
@@ -1096,22 +1106,32 @@ fn trace_chunk_cpu(
         break;
       }
       // 新子块内容：level 0 查 inline palette（mask!=0 inline 叶才有）；
-      // level 1..3 = 分裂位或节点统一实体色
+      // level 1..3 = 分裂位或节点统一实体色。
+      // 命中直接返回（cur_t=进入距离、face=进入面）——省一整轮外层
+      // （traverse 节点 load + side 重算）；仅「分裂子块」回 traverse 下钻。
       let b = bricks[level as usize];
       let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
       let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
-      let occ = if level == 0 {
-        if b.mask == 0 {
-          b.pal != 0
-        } else {
+      if level == 0 {
+        // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
+        if b.mask != 0 && (b.mask & (1u64 << idx)) != 0 {
           let w = b_struct[b.addr + 3 + (idx >> 2)];
-          ((w >> ((idx & 3) * 8)) & 0xFF) != 0
+          let dp = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
+          if dp != 0 {
+            return Some((cur_t, dp, face));
+          }
+        } else if b.mask == 0 && b.pal != 0 {
+          // 防御：uniform 叶（正常下钻快路径已处理）
+          return Some((cur_t, b.pal, face));
         }
       } else {
-        (b.mask & (1u64 << idx)) != 0 || b.pal != 0
-      };
-      if occ {
-        break; // 有内容 → 回 traverse 下钻/命中
+        let mb = (b.mask & (1u64 << idx)) != 0;
+        if mb {
+          break; // 分裂子块 → 回 traverse 下钻
+        }
+        if b.pal != 0 {
+          return Some((cur_t, b.pal, face)); // 统一实体
+        }
       }
       // 空气子块 → 回 loop 顶重选 min 轴继续
     }
