@@ -183,3 +183,65 @@
 
 石墙房间内侧暗部有间接光细节；草地绿色反弹到墙脚（颜色渗透）；木地板人字纹清晰
 （镜面反射属 R6 不验收）；无墙面漏光、无明显八面体折缝。
+
+---
+
+## 8. 交接进度（handoff，2026-09-07）
+
+> 跨机器接续用。本机 IDE 记忆/偏好不随仓库走，本章自包含。
+
+**进度快照**：M1、M2 全部 done（commit `abf1caa`，master 已推送）；M3 未开始。
+测试基线：`cargo test -p gate-render --release` = 84+7+1 全绿，其中 ddgi 单测 30 个。
+
+**下一步 = M3-1 `ddgi_active` 判定**，严格走 gate-wgsl-shader-optimization 技能闭环
+（CPU 参考先行 → `cargo test` fuzz 等价门禁 → WGSL 逐字镜像 → GATE_BENCH 同会话 A/B）：
+
+1. **CPU 镜像尚不存在**——先在 [ddgi.rs](../gate-render/src/ddgi.rs) 写 active 判定 CPU 参考
+   + 单测。三条件 OR：本 cell 或 6 邻接 cell 有体素 / 与非网格对齐 object bbox 重叠
+   （`object_buckets`）；级联归属用现成的 [`outside_lower_grid`](../gate-render/src/ddgi.rs)
+   （半开区间，部分重叠保守归更细级）。subgroup worklist 分配在 CPU 侧用普通计数模拟，
+   WGSL 侧 subgroup 不可用时 fallback `atomicAdd`（风险表已记，标注偏差）。
+2. M1-3 已就绪的 CPU 参考函数（M3-2/M3-3 直接镜像）：`pcg_hash`/`ray_rand`/`rand2`/
+   `uniform_sphere_dir`/`fibonacci_dir`（射线）、`collect_radiance`（投影）、
+   `update_irradiance_texel`（EMA+tonemap+亮度钳制+暗化保底）、`age_after_scroll`/
+   `age_after_update`/`probe_reusable`/`can_skip_update`（age/reuse）、
+   `oct_encode`/`oct_decode`/`oct_texel`/`oct_texel_dir`（八面体映射）。
+   M3-4 的 CPU 采样对照 = `cpu_sample_ddgi`（ddgi.rs，6 组端到端单测已覆盖）。
+3. **WGSL 现状**：无独立 ddgi shader，仅 `gate-app/assets/shaders/dda.wgsl`（trace+unlit
+   直出，旧 vis_table/direct/gi/denoise 光照链已注释拆除，见该文件 L48/L840/L1008）与
+   `blit.wgsl`。M3 新建 ddgi 三 pass shader；常量逐字对齐 ddgi.rs 模块头「WGSL 对齐表」
+   （L15-31，改一处必改两处，`wire_constants`/`v2_wire_constants` 单测防漂移）。
+4. **插件壳现状**：旧 `DdgiPlugin`（ddgi.rs L1103）仍是 **storage buffer 载体**
+   （DdgiGpu：positions/cell_index/irradiance/depth buffer + meta uniform + BG4），
+   只做烘焙上传、无渲染 pass，保持可编译。M4-1 重构为 rgba16f/r32 纹理数组 + 元数据
+   双缓冲 ping-pong + BG4 重排 + SHADER_F16/subgroup features；M5-1 才 one-step 删旧链路。
+
+**环境与命令（Windows / PowerShell）**
+- 跑测试（一律 release）：`cargo test -p gate-render --release ddgi`
+- 跑 bench：`$env:GATE_BENCH='1'` 后启动 gate-app（后台静默、vsync、写日志）；
+  日志在 `gate-app/logs/`（`frame_time.log` wall 帧时、`gpu_frame.log` 逐帧 GPU pass、
+  `latest.log` 应用日志）。M1-1 基线留存 `gate-app/logs/baseline-pre-ddgi-rework-20260906/`
+  （RTX 3070 / nuke.vox：wall p50=16.663ms、frame_gpu p50=0.662ms），M5-3 对比用。
+- **禁止自行截图验证渲染**；允许并推荐跑 gate-app 后读 `gate-app/logs/` 验证行为。
+
+**跨机器必知的坑（本机项目记忆，仓库外）**
+- 改 `.wgsl` 一律用编辑器/Edit 工具，**禁用 PowerShell `Set-Content`/`-replace`**：
+  会加 UTF-8 BOM → naga `expected global item found "\u{feff}"`，shader 整个加载失败、
+  画面全黑且无弹窗（仅 latest.log 有 ERROR）。
+- shader `@workgroup_size` 与 Rust dispatch（gx/gy/workgroup 数）必须严格一致：
+  只改 shader 不改 dispatch → 仅左上 1/4 屏被 trace 且 GPU 时长虚假降低 4×。
+- shader 优化后必须先验证渲染正确再采信 bench 时序：射线集体假 miss 提前终止会让 trace
+  时序「大幅优化」而画面全黑。
+- PowerShell 不支持 `&&` 和 bash heredoc；git 用 `git -C <path>`；多段 commit message
+  用多个 `-m`；`2>&1` 的 CLIXML 包装会吞 Bevy 日志尾部，重定向用
+  `| Out-File run.log -Encoding utf8`。
+- 沙箱拦截 `target/debug/incremental`（已设 `[profile.dev] incremental=false` 规避）；
+  `Start-Process -WindowStyle Hidden` 会使 winit 窗口句柄失效。
+- wgpu 29.0.4 已知未修 Vulkan bug：初始帧 VUID validation 报错、偶发 DeviceLost
+  （GATE_BENCH 后台节流低复现），非 gate 代码问题。
+
+**参考资料**
+- `docs/douglas/23_devlog23_ddgi.md`：Devlog #23 大纲（transcripts 字幕文件为 0 字节空文件）。
+- RTXGI 源码对照：`ProbeBlendingCS.hlsl` L508-550（更新链 EMA/tonemap/迟滞，M1-3 已逐字对齐）。
+- `docs/todo/r3-lighting.md`：旧 R3 光照规划，部分决策已被本 spec §3 推翻（SUPERSEDED）。
+- 开放点 **D-Open1**：depth 纹理 f16 在 t_max=8192 处精度不足，M4-1 做 r32f vs f16 A/B 定夺。
