@@ -1012,16 +1012,15 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   //   法线 = 逐体素 6 邻域差分（voxel_normal_world，无缓存，Douglas #22 一体素一色）。
   var col = sky_color(dir_fine);
   if (best.uh.hit) {
-    col = palette_albedo(best.palette_base, best.uh.pal);
-    // let alb = palette_albedo(best.palette_base, best.uh.pal);
-    // let n = voxel_normal_world(best.uh.obj_id, best.uh.voxel);
-    // let sun = max(dot(n, light_u.lights[0].kind_pos_dir.yzw), 0.0);
-    // let h = clamp(n.y, 0.0, 1.0);
-    // let x = clamp(h / 0.35, 0.0, 1.0);
-    // let t_sky = x * x * (3.0 - 2.0 * x);
-    // let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
-    // let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    // col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * sun);
+    let alb = palette_albedo(best.palette_base, best.uh.pal);
+    let n = voxel_normal_world(best.uh.obj_id, best.uh.voxel);
+    let sun = max(dot(n, light_u.lights[0].kind_pos_dir.yzw), 0.0);
+    let h = clamp(n.y, 0.0, 1.0);
+    let x = clamp(h / 0.35, 0.0, 1.0);
+    let t_sky = x * x * (3.0 - 2.0 * x);
+    let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
+    let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * sun);
   }
   textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
 }
