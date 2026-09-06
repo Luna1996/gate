@@ -42,11 +42,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // ---- 场景：GATE_SCENE=vox（默认）→ MagicaVoxel nuke.vox；=demo → 旧极限场景 ----
   let t0 = std::time::Instant::now();
   let mut grid = VolumeGrid::new();
-  // 相机初始机位：demo 路径 = 世界中心俯视；vox 路径由场景 AABB 推出
-  let c = *EXT_FINE_HALF as f32;
-  let dist = 380.0 * *EXT_N_TILES as f32;
-  let mut cam_eye = Vec3::new(c + dist, 2600.0, c + dist);
-  let mut cam_target = Vec3::new(c, 320.0, c);
+  let mut cam_eye = Vec3::new(1., 0., 0.);
+  let mut cam_target = Vec3::new(0., 0., 0.);
   match std::env::var("GATE_SCENE").as_deref() {
     Ok("demo") => {
       paint_demo_palette(&mut grid);
@@ -59,8 +56,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
       let path = Path::new(ASSETS_PATH).join("vox/nuke.vox");
       let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
         .expect("nuke.vox 加载失败");
-      cam_target = Vec3::new(551.6, 329.2, 664.5);
-      cam_eye = Vec3::new(430.2, 359.3, 560.8);
+      cam_eye = Vec3::new(406.5, 339.5, 431.5);
+      cam_target = Vec3::new(551.5, 330.5, 359.5);
       bevy::log::info!(
         "VOX SCENE: instances={} written={} dropped={} aabb=[{}]-[{}]",
         info.instances_used,
