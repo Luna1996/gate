@@ -1,0 +1,62 @@
+{
+  "version": "1.0",
+  "goal": "DDGI 1:1 重做（R3-10 战役 v2）：按 Douglas 当前代码严格复刻 DDGI 管线，一次到位交付",
+  "source": "docs/ddgi-rework-spec.md",
+  "createdAt": "2026-09-06T21:30:00+08:00",
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "规格与 CPU 参考底座",
+      "status": "done",
+      "subTasks": [
+        { "id": "M1-1", "title": "采重做前 GATE_BENCH 基线数据", "status": "done", "priority": "P0", "acceptanceCriteria": "logs/ 留存基线帧时（同场景同相机路径），M5-3 对比用", "note": "RTX 3070/nuke.vox，稳态 wall p50=16.663ms、frame_gpu p50=0.662ms；留存 gate-app/logs/baseline-pre-ddgi-rework-20260906/" },
+        { "id": "M1-2", "title": "ddgi.rs 常量与 wire 契约重定义（纹理数组布局/packed offset+age/age/reuse/预算/级联常量）", "status": "done", "priority": "P0", "acceptanceCriteria": "wire_constants 单测更新锁死；与 WGSL 逐字对齐表完成", "note": "级联常量占位 + WGSL 对齐表在 ddgi.rs 模块头；顺修 probe_in_layer 层内回绕 bug" },
+        { "id": "M1-3", "title": "CPU 参考实现（PCG hash/随机方向/collect_radiance/EMA+tonemap+blowup+迟滞/can_skip_update 推断/reuse bounds/age）", "status": "done", "priority": "P0", "acceptanceCriteria": "每函数独立单测；推断实现带 // INFERENCE: 注释", "note": "更新链对照 RTXGI ProbeBlendingCS.hlsl L508-550 逐字修正：亮度钳制作用于 delta 本身、不受 prev 全黑豁免；暗化保底 sign 用 lerp_delta；81 测试全绿" }
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "探针烘焙重做（CPU 侧）",
+      "status": "done",
+      "subTasks": [
+        { "id": "M2-1", "title": "bake_probe_grid 全 cell 覆盖（删活跃壳）", "status": "done", "priority": "P0", "acceptanceCriteria": "64³ 封闭房间单测：探针数 = cell 总数 − Solid cell 数；空气 cell 居中", "note": "域 = chunk bbox cell 域去 ±1 ring；Air/Mixed 全覆盖、Solid 跳过；挖空 chunk 不回收 → 全空气覆盖（运行时 ddgi_active 剔除）；81 测试全绿" },
+        { "id": "M2-2", "title": "探针元数据双缓冲纹理上传（packed offset+age）", "status": "done", "priority": "P0", "acceptanceCriteria": "上传/回读 roundtrip 单测", "note": "build_meta_texture_data 层主序 16×16/层、1 texel=1 packed meta、初烘 age=0；顺修 unpack_probe_meta 保留位掩码；meta_texture_roundtrip/meta_build_mirrors_probe_grid 全绿" },
+        { "id": "M2-3", "title": "4 级级联烘焙 + outside_lower_grid 空间划分", "status": "done", "priority": "P0", "acceptanceCriteria": "各级 64³ 房间分布单测；级间嵌套关系锁单测", "note": "cell_state_at（32/128 走 2×2×2 子 cell 递归合成）+ probe_position_sized（probe_leaf_sized 真实空叶尺寸择优：Air=cell_size/4³=4/1³=1，顺修 DDGI_CELL.min(half) 压平 bug——4³ 叶凭距离压过 16³ 空叶违反「空叶大者优先」）+ bake_cascade_grid + outside_lower_grid；cascade_room_distribution（LOD1 角 cell (24,24,24) / LOD3 (96,32,32) / LOD4 (192,64,64) 锁死）+ cascade_nesting_and_outside_lower_grid（部分重叠保守归更细级）；84 测试全绿" }
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "每帧 GPU 管线（WGSL 逐字镜像）",
+      "status": "pending",
+      "subTasks": [
+        { "id": "M3-1", "title": "ddgi_active 判定 shader（shared halo + 三条件 OR + subgroup worklist + indirect 参数 + next 元数据写入）", "status": "pending", "priority": "P0", "acceptanceCriteria": "fuzz 等价门禁 vs CPU 镜像通过；subgroup fallback atomicAdd 已标注" },
+        { "id": "M3-2", "title": "ddgi_cast 射线投射 shader（dispatch_indirect + PCG 随机 + 端点着色 + 样本缓冲）", "status": "pending", "priority": "P0", "acceptanceCriteria": "CPU 镜像同输入射线序列逐位一致；4096 预算分摊单测" },
+        { "id": "M3-3", "title": "ddgi_update 投影 shader（collect_radiance f16 + EMA/tonemap/blowup/迟滞 + can_skip + depth 稀疏写）", "status": "pending", "priority": "P0", "acceptanceCriteria": "fuzz 等价门禁 vs M1-3；π·Σ/Σw 公式逐字比对" },
+        { "id": "M3-4", "title": "sample_ddgi 采样重写（纹理数组 + 双缓冲 + 距离选级 + 过渡带）", "status": "pending", "priority": "P0", "acceptanceCriteria": "6 组既有端到端单测迁移全绿" }
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "渲染编排接线（gate-render）",
+      "status": "pending",
+      "subTasks": [
+        { "id": "M4-1", "title": "DdgiPlugin 重构（rgba16f/depth 纹理数组 + ping-pong + BG4 重排 + SHADER_F16/subgroup features）", "status": "pending", "priority": "P0", "acceptanceCriteria": "空跑管线创建成功；feature 缺失报错明确" },
+        { "id": "M4-2", "title": "三 pass 编排（active→cast→update 先于主 trace）", "status": "pending", "priority": "P0", "acceptanceCriteria": "pass 序确认；间接 dispatch 数与活跃探针数一致" },
+        { "id": "M4-3", "title": "级联滚动 CPU 侧（volume 原点 cell 对齐步进 + reuse bounds 计算 + per-LOD dispatch 参数）", "status": "pending", "priority": "P0", "acceptanceCriteria": "bounds 移动单测：平移后旧区域 age 继承、新区域归零" },
+        { "id": "M4-4", "title": "编辑响应重接（edit_generation → base 重烘 + 全级 age 归零）", "status": "pending", "priority": "P1", "acceptanceCriteria": "编辑后探针分布更新单测；收敛行为日志验证" }
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "清理与验收",
+      "status": "pending",
+      "subTasks": [
+        { "id": "M5-1", "title": "旧代码/旧单测 one-step 删除（活跃壳/环形轮转/1ray↔1texel/buffer 载体）", "status": "pending", "priority": "P0", "acceptanceCriteria": "rg 无残留引用；cargo check 通过" },
+        { "id": "M5-2", "title": "全量测试", "status": "pending", "priority": "P0", "acceptanceCriteria": "cargo test --release 全绿" },
+        { "id": "M5-3", "title": "GATE_BENCH A/B 对比 + 4096 预算调参", "status": "pending", "priority": "P0", "acceptanceCriteria": "帧时不劣于 M1-1 基线；最终预算值记录" },
+        { "id": "M5-4", "title": "demo 场景目验引导（暗部/颜色渗透/漏光/折缝四项）", "status": "pending", "priority": "P0", "acceptanceCriteria": "用户目验四项通过" },
+        { "id": "M5-5", "title": "文档收尾（r3-lighting.md SUPERSEDED 标注 + ddgi.rs 头注释 + 项目记忆）", "status": "pending", "priority": "P1", "acceptanceCriteria": "文档与实现一致；无过期描述" }
+      ]
+    }
+  ]
+}

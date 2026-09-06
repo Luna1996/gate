@@ -1,0 +1,185 @@
+# DDGI 1:1 重做规格（R3-10 战役 v2）
+
+> 生成于 2026-09-06 grill 会话。基准优先级：**Douglas 当前代码（截图实锤）> Devlog #23 视频 > 三篇论文**。
+> 本文档 SUPERSEDED r3-lighting.md 中 R3-10 的「已定决策（2026-09-04，spike 0-4 副产物）」全部 6 条。
+> 信息来源：#23 字幕逐字 + 8 张截图（4 运行时/图解 + 4 代码：sort.glsl 210-262 行、
+> get_probe_flags_intersection/probe_near_surface、collect_radiance）。
+
+---
+
+## 1. 目标与验收线
+
+把 gate 现有 DDGI 实现（R3-10 spike 0-5a）按 Douglas 当前代码严格 1:1 重做。
+
+**验收（三条全过）**：
+1. 单测全绿（`cargo test --release`；CPU 镜像固定种子锁新数学 + fuzz 等价门禁）
+2. GATE_BENCH 时序不劣于重做前基线（重做前先采基线数据）
+3. 用户在现有 demo 场景目验四项：暗部不死黑 / LED 颜色渗透 / 无漏光 / 无明显折缝
+
+**交付方式**：一次到位（核心循环 + 滚动级联同批交付），one-step 迁移。
+
+---
+
+## 2. 已锁定决策（12 条）
+
+### 架构映射
+| # | 决策 | 证据 |
+|---|------|------|
+| D1 | 探针网格 = 世界级全 cell 覆盖（16³ cell = level 2 brick，含纯空气 cell），**废除活跃壳** | 截图1：全空间黄点铺满；字节码 per-model 的世界级推广 |
+| D2 | 活跃判定每帧 GPU，三条件 OR：本 cell 有表面 ∨ 6 邻接 flags 交集有表面 ∨ OBJ bbox 桶重叠；shared memory 3D halo 数组（local 域外扩 1 圈）+ memoryBarrierShared + barrier | 截图3：`probe_near_surface` 逐字 |
+| D3 | 烘焙算法零改动：Air 居中 / Mixed BFS 4³ 空子砖靠中心 / Solid 无探针 | 截图3（漫画图解）与现有 `bake_probe_grid` 逐条吻合 |
+
+### 每帧三段式管线
+| # | 决策 | 证据 |
+|---|------|------|
+| D4 | ①活跃判定 pass：逐 LOD dispatch（`outside_lower_grid()` 空间划分——本 LOD 只管更细网格覆盖外）；产出 worklist（subgroupExclusiveAdd + subgroupBroadcastFirst 分配）、indirect dispatch 参数、探针元数据 next 写入 | 截图1/2：sort.glsl；RenderDoc `vkCmdDispatchIndirect` |
+| D5 | ②射线投射 pass：`dispatch_workgroups_indirect` 消费 worklist；**4096 射线/帧固定总预算**分摊活跃探针（起步值，bench 后调）；球面均匀随机方向（PCG hash + 帧号种子，Fibonacci 球保留）；端点 = sky / emissive 直出 / 直光 1-bounce + 上一帧 DDGI（自闭环无限反弹） | 字幕 + RenderDoc；预算值无实锤取现值 |
+| D6 | ③irradiance 投影：`irr = π·Σ max(0, dot(d, dir_i))·L_i / Σ max(0, dot(d, dir_i))`（对 texel 方向遍历本帧全部射线样本），**全程 f16**（`SHADER_F16` feature + rgba16f）；射线数与 texel 数解耦，**废除 1ray↔1texel** | 截图4：`collect_radiance` 逐字 |
+
+### 存储
+| # | 决策 | 证据 |
+|---|------|------|
+| D7 | 载体 = 2D 纹理数组（**废除 storage buffer**）：irradiance rgba16f 8×8 oct texel/探针/层；depth 独立 image 资源（16×16 oct）；探针元数据（packed offset+age）= **双缓冲纹理 ping-pong**（previous 读 / next 写），废除 positions/cell_index buffer | RenderDoc：`2D Array Image 252` + `CS RW 0 → depth_target` + `previous/next_ddgi_probes` texelFetch/imageStore |
+| D8 | depth 语义保留：未写 texel = tmax 远距初值（0 会被 chevron 误判贴墙）；depth 稀疏写 + chevron 剔除权重不变 | 现有已验证资产 |
+
+### LOD 级联
+| # | 决策 | 证据 |
+|---|------|------|
+| D9 | 4 级相机滚动级联（Majercik 2021 §5）：级数/每级 cell 数/覆盖半径/级间混合带宽全部抄论文默认；base 世界级 16³ cell 为最细级；采样按相机距离选级 + 过渡带混合（base 全覆盖 → 粗级服务远场） | 截图1 远场稀疏实证；用户拍板（推翻「固定下采样」推荐） |
+| D10 | 滚动数据继承 = **age + reuse bounds**：age∈[0,255] 随更新 +1；`reusable = reuse_min_bound ≤ cell < reuse_max_bound && offset 未变` → 继承 age，否则 age=0 重新收敛（EMA 历史随纹理 ping-pong 继承，无条带重烘） | 截图2：250-256 行逐字 |
+| D11 | 探针状态机（Production §3 生命周期）不纳入——age/can_skip 已覆盖其职能 | 用户裁决 |
+
+### 范围外
+| # | 排除项 | 去向 |
+|---|--------|------|
+| D12 | OBJ 自身探针、电介质/金属/镜面材质、god rays 介质散射 | P14 / R6 / R3-17 |
+
+### 推断实现（非 1:1 实锤，代码中标注）
+- `can_skip_update(cell, cell_center, age)` 具体逻辑：截图/示意图均未覆盖 → 按 Majercik 2021 探针更新分摊逻辑保守实现（age 越大跳过概率越高，随机 hash 驱动）
+- oct 分辨率：论文默认 8×8 起步；Douglas 2025 版疑似 16×16（RenderDoc 目测）→ 目验 irradiance 模糊再升
+- `irradiance = π·result/result.w` 之后的 EMA/tonemap/blowup/迟滞行未截到 → 按 Majercik 2019 §4 全套补齐（已锁定）
+
+---
+
+## 3. 被推翻的旧决策（删除清单）
+
+| 旧决策（2026-09-04） | 替代 |
+|----------------------|------|
+| 烘焙时活跃壳（只给壳 cell 分配探针） | D1 全 cell + D2 每帧判定 |
+| 4096/帧环形轮转 64 探针/帧 | D5 固定预算分摊活跃探针（worklist） |
+| 1 ray ↔ 1 texel 确定性写 | D6 随机射线 + 投影累积 |
+| storage buffer 载体（rgba32f/r32） | D7 纹理数组（rgba16f + depth 独立） |
+| LOD 级联推迟 P14 | D9 本战役一次到位 |
+| 「条带重烘」滚动迁移设想（grill 中间方案） | D10 age+reuse bounds 继承 |
+
+**连带删除**：`RAYS_PER_PROBE=64` 常量语义、活跃壳逻辑、环形轮转 frame_plan、positions/cell_index buffer、
+对应旧单测；`probe_idx = (cycle_base + wg) % probe_count` 全链路。
+
+**保留资产（已验证 1:1，零改动）**：BFS 放置算法、oct 编解码、chevron/锐利背面采样权重、
+端点自闭环、pre-exposure 约定、edit_generation 重烘触发机制（语义改为 base 重烘 + age 归零）。
+
+---
+
+## 4. Milestone + Sub-task
+
+> 执行纪律：改 dda.wgsl 必须走 `gate-wgsl-shader-optimization` 闭环
+> （CPU 参考先行 → cargo test fuzz 等价门禁 → WGSL 逐字镜像 → GATE_BENCH 同会话交替 A/B）。
+> 所有测试 `cargo test --release`；wgsl 一律用 Edit 工具改（禁 PowerShell，BOM 坑）；
+> 同文件编辑串行；`@workgroup_size` 与 Rust dispatch 严格一致。
+
+### M1：规格与 CPU 参考底座
+| ID | sub-task | 验收标准 | 优先级 | 依赖 |
+|----|---------|---------|--------|------|
+| M1-1 | 采重做前 GATE_BENCH 基线数据（当前 spike 0-5a 实现） | logs/ 留存基线帧时（同场景同相机路径），M5-3 对比用 | P0 | — |
+| M1-2 | ddgi.rs 常量与 wire 契约重定义：纹理数组布局（每层探针数、层序）、packed offset+age 位域（bitfieldInsert 镜像 DDGI_LOG2_PROBE_SPACING）、age/reuse 常量、ray budget、级联常量占位 | `wire_constants` 单测更新锁死；与 WGSL 侧逐字对齐表完成 | P0 | — |
+| M1-3 | CPU 参考实现（skill 闭环第一步）：PCG hash（固定种子）、球面均匀方向生成、collect_radiance 投影公式、EMA+tonemap/blowup/迟滞（Majercik 2019 §4）、can_skip_update（推断实现，标注）、reuse bounds 判定、age 传递 | 每个函数有独立单测；已知输入→期望输出锁死；推断实现带 `// INFERENCE:` 注释 | P0 | M1-2 |
+
+### M1 基线数据（M1-1，2026-09-06 已采）
+- 环境：RTX 3070（Vulkan，driver 610.88）/ nuke.vox（instances=1802，written=31,720,800）/ GATE_BENCH=1 隐藏窗口 + Fifo vsync / 相机静止在初始位姿（轨道相机无输入，天然可复现）
+- 稳态（t≥30s，3312 帧）：wall_ms p50=16.663 / p95=16.875 / p99=17.240（vsync 60Hz ±1%）
+- GPU：frame_gpu_ms p50=0.662 / p95=0.681；trace_ms p50=0.649 / p95=0.668
+- **注意**：frame_gpu = trace+blit 之和；旧 DDGI/direct/GI pass 已在 spike 0-5a 全拆（dda.rs:2349），日志 ddgi/direct/gi 列 -1 属预期而非采集故障
+- 留存：`gate-app/logs/baseline-pre-ddgi-rework-20260906/`（gpu_frame.log / frame_time.log / fps.log / latest.log）；`*.log` 被 gitignore，跨机协作需 `git add -f` 该目录
+- 构建状态：db6b52e（工作区含 ddgi.rs M1-2 常量改动，仅 CPU 侧，不影响渲染时序）
+
+### M2：探针烘焙重做（CPU 侧）
+| ID | sub-task | 验收标准 | 优先级 | 依赖 |
+|----|---------|---------|--------|------|
+| M2-1 | `bake_probe_grid` 扩展：全 cell 覆盖（纯空气 cell 也放探针居中），删活跃壳筛选 | 64³ 封闭房间单测：探针数 = cell 总数 − Solid cell 数；空气 cell 居中 | P0 | M1-2 |
+| M2-2 | 探针元数据双缓冲纹理上传：packed offset+age(u8) 布局、previous/next 两份、初烘 age=0 | 上传/回读 roundtrip 单测 | P0 | M2-1 |
+| M2-3 | 4 级级联烘焙：每级 cell 尺寸 BFS 推广（32³/64³/128³/256³ cell，抄论文默认）、`outside_lower_grid` 空间划分掩码 | 各级 64³ 房间分布单测；级间嵌套关系锁单测 | P0 | M2-1 |
+
+### M3：每帧 GPU 管线（WGSL 逐字镜像）
+| ID | sub-task | 验收标准 | 优先级 | 依赖 |
+|----|---------|---------|--------|------|
+| M3-1 | `ddgi_active` 判定 shader：shared halo 数组 + 三条件 OR（含 object_buckets）+ subgroup worklist 分配 + indirect 参数写入 + next 元数据 imageStore + outside_lower_grid | fuzz 等价门禁 vs CPU 镜像（固定种子）通过；subgroup feature 缺失时 fallback atomicAdd（标注偏差） | P0 | M1-3, M2-3 |
+| M3-2 | `ddgi_cast` 射线投射 shader：dispatch_indirect 消费 worklist、PCG 随机方向、端点着色（sky/emissive/直光+prev DDGI 自闭环）、directions/radiances 样本缓冲写入 | CPU 镜像同输入射线序列 → 样本缓冲逐位一致；4096 预算分摊逻辑单测 | P0 | M3-1 |
+| M3-3 | `ddgi_update` 投影 shader：collect_radiance f16 逐字镜像、EMA+tonemap/blowup/迟滞、can_skip_update、depth 稀疏写（tmax 初值语义） | fuzz 等价门禁 vs M1-3；`π·Σ/Σw` 公式逐字比对测试 | P0 | M3-2 |
+| M3-4 | `sample_ddgi` 采样重写：纹理数组访问、双缓冲读 previous、距离选级 + 过渡带混合、age 无关性验证 | 6 组既有端到端单测迁移全绿（全同色归一化/背面剔除/chevron 遮挡/NO_PROBE 早退/oct 方向色/64³ 房间） | P0 | M3-3, M2-2 |
+
+### M4：渲染编排接线（gate-render）
+| ID | sub-task | 验收标准 | 优先级 | 依赖 |
+|----|---------|---------|--------|------|
+| M4-1 | DdgiPlugin 重构：rgba16f/depth 纹理数组创建、双缓冲 ping-pong、BG4 布局重排、`SHADER_F16`+subgroup features 启用与探测 | 空跑管线创建成功；feature 不支持时的报错信息明确 | P0 | M2-2, M3-4 |
+| M4-2 | 三 pass 编排：active → cast → update 全部先于主 trace dispatch；indirect dispatch workgroup_size 与 shader 一致 | RenderDoc/日志确认 pass 序；间接 dispatch 数与活跃探针数一致（日志抽验） | P0 | M3-1..3 |
+| M4-3 | 级联滚动 CPU 侧：相机 → 每 LOD volume 原点（cell 对齐步进）、reuse bounds 计算、per-LOD dispatch 参数 | bounds 移动单测：相机平移后旧区域 age 继承、新区域归零 | P0 | M2-3, M3-1 |
+| M4-4 | 编辑响应重接：edit_generation → base 重烘 + 全级 age 归零（重新收敛） | 编辑后探针分布更新单测；收敛行为日志验证 | P1 | M4-3 |
+
+### M5：清理与验收
+| ID | sub-task | 验收标准 | 优先级 | 依赖 |
+|----|---------|---------|--------|------|
+| M5-1 | 旧代码/旧单测 one-step 删除（§3 清单全项） | `rg -i "活跃壳\|cycle_base\|RAYS_PER_PROBE"` 无残留引用；cargo check 通过 | P0 | M4 全部 |
+| M5-2 | 全量测试 | `cargo test --release` 全绿 | P0 | M5-1 |
+| M5-3 | GATE_BENCH A/B 对比 | 帧时不劣于 M1-1 基线；4096 预算调参（记录最终值）；劣化则定位回修 | P0 | M5-2 |
+| M5-4 | demo 场景目验引导 | 给用户四项检查清单（暗部/颜色渗透/漏光/折缝）+ 观感锚点（Douglas 图4：暗部有间接细节、草地反弹墙脚） | P0 | M5-3 |
+| M5-5 | 文档收尾：r3-lighting.md R3-10 更新（本 spec 链接、旧决策标 SUPERSEDED）、ddgi.rs 模块头注释同步、项目记忆更新 | 文档与实现一致；无过期描述 | P1 | M5-4 通过 |
+
+### 并行分支
+- M2 与 M1-3 可并行（M2 只依赖 M1-2）
+- M3-1/M3-2/M3-3 串行（样本缓冲依赖链），M3-4 依赖 M3-3
+- M4-3 可与 M3-3 并行启动（CPU 侧纯计算）
+
+---
+
+## 5. 风险预判与 fallback
+
+| 风险 | 影响 | fallback | 定位阶段 |
+|------|------|----------|---------|
+| wgpu 29 subgroup 原语后端支持差异 | M3-1 worklist 分配 | per-invocation `atomicAdd`（记录为已知偏差，性能差异小） | M3-1 |
+| rgba16f storage write / depth 格式精度（f16 在 t_max=8192 处间隔 >1 世界单位，chevron 半宽=4） | M4-1 | depth 改 r32f + `textureLoad`（最近邻本就无需 filter）或相对深度归一化 f16——**开放点 D-Open1，实现时 A/B 定** | M4-1 |
+| 三 pass + 判定开销 > 环形轮转（每帧新增活跃判定全 cell 扫描） | M5-3 bench | 判定 pass 每 cell 1 线程（非 1 workgroup）降开销；预算/级联参数调优 | M5-3 |
+| indirect dispatch 与 `@workgroup_size` 不一致 → 部分屏幕 trace | M4-2 | dispatch 参数单测 + 日志抽验（既有坑：仅左上 1/4 屏） | M4-2 |
+| 级联滚动边界闪烁（reuse bounds 算错） | M5-4 目验 | bounds 单测先行（M4-3）；目验异常时 dump age 图排查 | M5-4 |
+| SHADER_F16 精度不足（irradiance 累积） | M3-3 | 累积步骤升 f32（result 用 f32 vec4，仅存储 f16）——偏离截图但保数值安全，标注 | M3-3/M5-4 |
+| base 世界级全 cell 探针数失控（nuke 体素 AABB ≈ 121×39×71 cell ≈ 335k 探针，irr+depth ≈ 385MB） | M2-3 显存 | base 烘焙范围钳到体素 AABB（与 D1 不冲突：D1 反对的是活跃壳，不是世界包围盒裁剪；表面 cell 均在 AABB 内，采样完备性不受影响）；仍超则 base cell 升 32 | M2-3 |
+
+---
+
+## 6. Checklist（执行时勾选）
+
+- [x] M1-1 基线数据采集（数据见 §4「M1 基线数据」）
+- [x] M1-2 常量/wire 契约 + 单测（级联占位 + WGSL 对齐表在 ddgi.rs 模块头；顺修 probe_in_layer 层内回绕 bug）
+- [x] M1-3 CPU 参考 + 单测（PCG hash/球面均匀方向/collect_radiance/更新链/age+reuse/can_skip 推断；更新链对照 RTXGI ProbeBlendingCS.hlsl L508-550 逐字修正：亮度钳制不受 prev 全黑豁免、暗化保底用 sign(lerp_delta)；81 测试全绿）
+- [x] M2-1 全 cell 烘焙 + 单测（域 = chunk bbox cell 域去 ±1 ring；Air/Mixed 全覆盖、Solid 跳过、删 neighbor_has_solid；挖空 chunk 不回收 → 全空气覆盖语义，运行时 ddgi_active 剔除；81 测试全绿）
+- [x] M2-2 元数据双缓冲纹理 + roundtrip（build_meta_texture_data 层主序 16×16/层、1 texel=1 packed meta、初烘 age=0；顺修 unpack_probe_meta 保留位掩码；82 测试全绿）
+- [x] M2-3 级联烘焙 + outside_lower_grid（cell_state_at 三态分类（32/128 走 2×2×2 子 cell 递归合成）+ probe_position_sized 推广 BFS + bake_cascade_grid + outside_lower_grid 半开区间划分；顺修 probe_leaf_sized 真实空叶尺寸（Air=cell_size / 4³ 空砖=4 / 1³ 兜底=1）使「空叶大者优先」真正生效——原 DDGI_CELL.min(half) 压平会让贴墙 4³ 叶探针凭距离压过 16³ 空叶探针；84 测试全绿）
+- [ ] M3-1 ddgi_active（含 subgroup/atomic 裁决）
+- [ ] M3-2 ddgi_cast（含预算分摊）
+- [ ] M3-3 ddgi_update（含 f16 门禁）
+- [ ] M3-4 sample_ddgi + 6 组单测迁移
+- [ ] M4-1 资源/features/BG4
+- [ ] M4-2 三 pass 编排 + indirect 一致性
+- [ ] M4-3 级联滚动 + reuse bounds
+- [ ] M4-4 编辑响应重接
+- [ ] M5-1 旧代码清除
+- [ ] M5-2 全量测试绿
+- [ ] M5-3 bench A/B（不劣化）
+- [ ] M5-4 目验四项通过
+- [ ] M5-5 文档/记忆收尾
+
+---
+
+## 7. 目验观感锚点（Douglas #23 图4）
+
+石墙房间内侧暗部有间接光细节；草地绿色反弹到墙脚（颜色渗透）；木地板人字纹清晰
+（镜面反射属 R6 不验收）；无墙面漏光、无明显八面体折缝。
