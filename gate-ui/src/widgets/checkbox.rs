@@ -1,7 +1,12 @@
-//! checkbox：勾选切换 + 勾选视觉。
+//! checkbox：勾选切换 + 勾选视觉（docs/ui-dark-theme.md §5.3）。
 //!
 //! 复用 bevy_ui `Checked` / `Checkable`（presence 语义，自带 a11y 联动）：
 //! 有 `Checked` = 勾选，无 = 未勾选。
+//!
+//! 视觉：16×16 圆角 4 盒子；未选中 = 抬升表面 + 边框（hover 边框提亮），
+//! 选中 = 强调填充 + 主色对勾标记。
+
+use std::ops::Deref;
 
 use bevy::prelude::*;
 use bevy::ui::{Checkable, Checked, FocusPolicy, Interaction};
@@ -14,16 +19,46 @@ use crate::theme::UiTheme;
 #[derive(Component, Debug, Default)]
 pub struct CheckboxBox;
 
+/// 盒子边长（px）
+const BOX_SIZE: f32 = 16.0;
+
+/// 勾选框句柄（Deref 到根实体 Entity）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CheckboxHandle(pub Entity);
+
+impl Deref for CheckboxHandle {
+  type Target = Entity;
+  fn deref(&self) -> &Entity {
+    &self.0
+  }
+}
+
+impl From<CheckboxHandle> for Entity {
+  fn from(h: CheckboxHandle) -> Entity {
+    h.0
+  }
+}
+
+/// 勾选框配置（全部字段进 Config；Default = 无文本、未勾选）
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckboxConfig {
+  pub text: Option<String>,
+  pub checked: bool,
+}
+
+/// 勾选状态变化事件（用户点击翻转时触发；EntityEvent，target = 根实体）。
+/// `Checked` 组件仍是真源，事件只是通知，主动读状态可 Query/Has。
+#[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
+pub struct CheckboxToggled {
+  pub entity: Entity,
+  /// 翻转后的新状态
+  pub checked: bool,
+}
+
 /// 勾选框（可选文本标签）
-pub fn checkbox(
-  ctx: &UiCtx,
-  parent: &mut ChildSpawner,
-  text: Option<&str>,
-  checked: bool,
-) -> Entity {
+pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) -> CheckboxHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
-  let size = m.font_size.lg;
   let mut ec = parent.spawn((
     Name::new("ui-checkbox"),
     Interaction::default(),
@@ -42,38 +77,38 @@ pub fn checkbox(
         Name::new("ui-checkbox-box"),
         CheckboxBox,
         Node {
-          width: px(size),
-          height: px(size),
+          width: px(BOX_SIZE),
+          height: px(BOX_SIZE),
           border: UiRect::all(px(m.border_width)),
-          border_radius: BorderRadius::all(px(m.corner_radius / 2.0)),
+          border_radius: BorderRadius::all(px(m.corner_radius_sm)),
           align_items: AlignItems::Center,
           justify_content: JustifyContent::Center,
           ..default()
         },
-        BackgroundColor(Color::NONE),
-        BorderColor::all(color_of(&c.panel_border)),
+        BackgroundColor(color_of(&c.surface_elevated)),
+        BorderColor::all(color_of(&c.border)),
       ))
       .with_children(|box_node| {
         box_node.spawn((
           Name::new("ui-checkbox-mark"),
           Node {
-            width: px(size * 0.5),
-            height: px(size * 0.5),
-            border_radius: BorderRadius::all(px(m.corner_radius / 4.0)),
+            width: px(BOX_SIZE * 0.5),
+            height: px(BOX_SIZE * 0.5),
             ..default()
           },
-          BackgroundColor(color_of(&c.accent)),
+          // 对勾标记 = 主文本色（强调填充上的最高对比）
+          BackgroundColor(color_of(&c.text_primary)),
           Visibility::Hidden,
         ));
       });
-    if let Some(t) = text {
-      spawn_label(ctx, root, t.to_string(), m.font_size.md, color_of(&c.text));
+    if let Some(t) = config.text {
+      spawn_label(ctx, root, t, m.font_size.md, color_of(&c.text_body));
     }
   });
-  if checked {
+  if config.checked {
     ec.insert(Checked);
   }
-  ec.id()
+  CheckboxHandle(ec.id())
 }
 
 /// 勾选状态机查询集（type alias 满足 clippy::type_complexity）
@@ -85,18 +120,21 @@ type CheckboxQuery = (
   &'static Children,
 );
 
-/// 勾选状态机：释放时翻转 Checked；方块背景/勾选标记跟随状态（每帧重算）
+/// 勾选状态机：释放时翻转 Checked 并触发 [`CheckboxToggled`]；
+/// 盒子背景/边框/勾选标记跟随状态（每帧重算）
 pub fn checkbox_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
   mut q: Query<CheckboxQuery, With<Checkable>>,
-  mut boxes: Query<(&mut BackgroundColor, &Children), With<CheckboxBox>>,
+  mut boxes: Query<(&mut BackgroundColor, &mut BorderColor, &Children), With<CheckboxBox>>,
   mut marks: Query<&mut Visibility, Without<CheckboxBox>>,
 ) {
   let Some(theme) = theme else { return };
   let c = &theme.colors;
-  let accent = color_of(&c.accent);
-  let none = Color::NONE;
+  let accent = color_of(&c.accent_fill);
+  let elevated = color_of(&c.surface_elevated);
+  let border = color_of(&c.border);
+  let border_strong = color_of(&c.border_strong);
   for (e, inter, mut prev, checked, children) in &mut q {
     // click = 按下并释放（与 button 判定一致）
     if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
@@ -105,19 +143,32 @@ pub fn checkbox_state_system(
       } else {
         commands.entity(e).insert(Checked);
       }
+      commands.trigger(CheckboxToggled { entity: e, checked: !checked });
     }
     prev.0 = *inter;
-    // 视觉：方块填充 = 勾选时 accent
+    let hovered = *inter == Interaction::Hovered;
+    // 视觉：选中 → 强调填充；未选中 → 抬升表面（hover 边框提亮）
+    let (target_bg, target_border) = if checked {
+      (accent, accent)
+    } else if hovered {
+      (elevated, border_strong)
+    } else {
+      (elevated, border)
+    };
     for child in children.iter() {
-      if let Ok((mut bg, box_children)) = boxes.get_mut(child) {
-        let target = if checked { accent } else { none };
-        if bg.0 != target {
-          bg.0 = target;
+      if let Ok((mut bg, mut bc, box_children)) = boxes.get_mut(child) {
+        if bg.0 != target_bg {
+          bg.0 = target_bg;
+        }
+        if bc.top != target_border {
+          *bc = BorderColor::all(target_border);
         }
         for mark in box_children.iter() {
           if let Ok(mut vis) = marks.get_mut(mark) {
+            // 选中 = Inherited（跟随祖先显隐）；显式 Visible 会无视祖先
+            // Hidden 强制可见 → 面板整体隐藏时勾选标记单独悬浮
             let target_vis = if checked {
-              Visibility::Visible
+              Visibility::Inherited
             } else {
               Visibility::Hidden
             };
@@ -138,10 +189,17 @@ mod tests {
 
   #[test]
   fn checkbox_toggle_and_visual() {
+    use std::sync::{Arc, Mutex};
+
     let theme = default_theme();
     let mut app = App::new();
     app.insert_resource(theme.clone());
     app.add_systems(Update, checkbox_state_system);
+    let toggles = Arc::new(Mutex::new(Vec::<(Entity, bool)>::new()));
+    let sink = toggles.clone();
+    app.add_observer(move |ev: On<CheckboxToggled>| {
+      sink.lock().unwrap().push((ev.entity, ev.checked));
+    });
 
     let root = app
       .world_mut()
@@ -154,7 +212,12 @@ mod tests {
       .id();
     let box_e = app
       .world_mut()
-      .spawn((CheckboxBox, BackgroundColor::default(), Children::default()))
+      .spawn((
+        CheckboxBox,
+        BackgroundColor::default(),
+        BorderColor::all(Color::NONE),
+        Children::default(),
+      ))
       .id();
     let mark = app
       .world_mut()
@@ -163,11 +226,11 @@ mod tests {
     app.world_mut().entity_mut(box_e).add_child(mark);
     app.world_mut().entity_mut(root).add_child(box_e);
 
-    // 初始未勾选：方块透明、标记隐藏
+    // 初始未勾选：盒子抬升表面、标记隐藏
     app.update();
     assert_eq!(
       app.world().get::<BackgroundColor>(box_e).unwrap().0,
-      Color::NONE
+      color_of(&theme.colors.surface_elevated)
     );
     assert_eq!(
       *app.world().get::<Visibility>(mark).unwrap(),
@@ -191,14 +254,20 @@ mod tests {
       app.world().get::<Checked>(root).is_some(),
       "release toggles on"
     );
+    assert_eq!(
+      *toggles.lock().unwrap(),
+      vec![(root, true)],
+      "toggle-on emits CheckboxToggled(true)"
+    );
     app.update();
     assert_eq!(
       app.world().get::<BackgroundColor>(box_e).unwrap().0,
-      color_of(&theme.colors.accent)
+      color_of(&theme.colors.accent_fill)
     );
     assert_eq!(
       *app.world().get::<Visibility>(mark).unwrap(),
-      Visibility::Visible
+      Visibility::Inherited,
+      "checked mark inherits (Visible would ignore ancestor Hidden)"
     );
 
     // 再点击一次：翻回未勾选
@@ -218,10 +287,15 @@ mod tests {
       app.world().get::<Checked>(root).is_none(),
       "release toggles off"
     );
+    assert_eq!(
+      *toggles.lock().unwrap(),
+      vec![(root, true), (root, false)],
+      "toggle-off emits CheckboxToggled(false)"
+    );
     app.update();
     assert_eq!(
       app.world().get::<BackgroundColor>(box_e).unwrap().0,
-      Color::NONE
+      color_of(&theme.colors.surface_elevated)
     );
   }
 
@@ -233,9 +307,10 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(checkbox(&ctx, p, Some("opt"), false));
+      child = Some(checkbox(&ctx, p, CheckboxConfig { text: Some("opt".into()), checked: false }));
     });
-    let e = child.expect("checkbox spawned");
+    let h = child.expect("checkbox spawned");
+    let e = *h;
     let w = app.world();
     assert!(w.get::<Checkable>(e).is_some());
     assert!(w.get::<Checked>(e).is_none(), "unchecked initial");

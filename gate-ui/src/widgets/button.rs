@@ -1,8 +1,19 @@
-//! button：Interaction 状态机 + hover/pressed 视觉态 + UiClick 观察者事件。
+//! button：三变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
+//!
+//! 变体（docs/ui-dark-theme.md §5.2）：
+//! - [`ButtonVariant::Primary`]：强调填充（主操作）
+//! - [`ButtonVariant::Danger`]：破坏性操作填充
+//! - [`ButtonVariant::Secondary`]：抬升表面 + 边框（次操作）
+//! - [`ButtonVariant::Ghost`]：透明底（工具栏/低调操作）
+//!
+//! 统一反馈：hover 提亮一档；pressed 填充压深 + [`UiTransform`] scale 0.98（绕节点中心）。
+//! focus ring（键盘导航）待 bevy_ui 焦点导航接入后启用 Outline。
+
+use std::ops::Deref;
 
 use bevy::prelude::*;
 use bevy::ui::widget::Button;
-use bevy::ui::{FocusPolicy, Interaction};
+use bevy::ui::{FocusPolicy, Interaction, UiTransform};
 
 use super::{UiCtx, color_of, px, spawn_label};
 use crate::theme::UiTheme;
@@ -19,14 +30,52 @@ pub struct UiClick {
 #[derive(Component, Clone, Copy, Debug, PartialEq, Default)]
 pub struct InteractionPrev(pub Interaction);
 
-/// 主题按钮（文本子标签）
-pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, text: &str) -> Entity {
-  let c = &ctx.theme.colors;
+/// 按钮变体（驱动状态机配色）
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ButtonVariant {
+  #[default]
+  Primary,
+  Secondary,
+  Ghost,
+  Danger,
+}
+
+/// 按压触觉反馈：pressed 时绕节点中心缩放到 98%
+const PRESSED_SCALE: f32 = 0.98;
+
+/// 按钮句柄（Deref 到根实体 Entity）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ButtonHandle(pub Entity);
+
+impl Deref for ButtonHandle {
+  type Target = Entity;
+  fn deref(&self) -> &Entity {
+    &self.0
+  }
+}
+
+impl From<ButtonHandle> for Entity {
+  fn from(h: ButtonHandle) -> Entity {
+    h.0
+  }
+}
+
+/// 按钮配置（全部字段进 Config；Default = 空文本 + Primary）
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ButtonConfig {
+  pub text: String,
+  pub variant: ButtonVariant,
+}
+
+/// 主题按钮（文本子标签；变体由 [`ButtonConfig::variant`] 决定）
+pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, config: ButtonConfig) -> ButtonHandle {
   let m = &ctx.theme.metrics;
-  parent
+  let (bg, border, text_color) = variant_colors(ctx.theme, config.variant, Interaction::None);
+  let e = parent
     .spawn((
       Name::new("ui-button"),
       Button,
+      config.variant,
       Interaction::default(),
       InteractionPrev::default(),
       Node {
@@ -37,53 +86,128 @@ pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, text: &str) -> Entity {
           bottom: px(m.spacing.sm),
         },
         border: UiRect::all(px(m.border_width)),
-        border_radius: BorderRadius::all(px(m.corner_radius)),
         align_items: AlignItems::Center,
         justify_content: JustifyContent::Center,
         ..default()
       },
-      BackgroundColor(color_of(&c.accent)),
-      BorderColor::all(color_of(&c.panel_border)),
+      BackgroundColor(bg),
+      BorderColor::all(border),
+      UiTransform::default(),
       FocusPolicy::Block,
     ))
     .with_children(|b| {
-      spawn_label(ctx, b, text.to_string(), m.font_size.md, color_of(&c.text));
+      spawn_label(ctx, b, config.text, m.font_size.md, text_color);
     })
-    .id()
+    .id();
+  ButtonHandle(e)
 }
 
-/// 按钮状态机：hover/pressed 视觉 + 释放触发 UiClick（每帧重算）
+/// 变体 × 交互态 → (背景, 边框, 文字) 配色
+fn variant_colors(
+  theme: &UiTheme,
+  variant: ButtonVariant,
+  inter: Interaction,
+) -> (Color, Color, Color) {
+  let c = &theme.colors;
+  let none = Color::NONE;
+  match variant {
+    ButtonVariant::Primary => {
+      let bg = match inter {
+        Interaction::Pressed => color_of(&c.accent_fill_pressed),
+        Interaction::Hovered => color_of(&c.accent_fill_hover),
+        Interaction::None => color_of(&c.accent_fill),
+      };
+      (bg, bg, color_of(&c.text_primary))
+    }
+    ButtonVariant::Danger => {
+      // danger 只有一档填充；hover 靠 scale 之外的边框提亮区分
+      let bg = color_of(&c.danger_fill);
+      let border = match inter {
+        Interaction::Hovered => color_of(&c.danger),
+        _ => color_of(&c.danger_fill),
+      };
+      (bg, border, color_of(&c.text_primary))
+    }
+    ButtonVariant::Secondary => {
+      let bg = match inter {
+        Interaction::Pressed => color_of(&c.surface_card),
+        Interaction::Hovered => color_of(&c.surface_overlay),
+        Interaction::None => color_of(&c.surface_elevated),
+      };
+      let border = match inter {
+        Interaction::None => color_of(&c.border),
+        _ => color_of(&c.border_strong),
+      };
+      (bg, border, color_of(&c.text_body))
+    }
+    ButtonVariant::Ghost => {
+      let bg = match inter {
+        Interaction::Pressed => color_of(&c.surface_card),
+        Interaction::Hovered => color_of(&c.surface_elevated),
+        Interaction::None => none,
+      };
+      let text = match inter {
+        Interaction::None => color_of(&c.text_muted),
+        _ => color_of(&c.text_body),
+      };
+      (bg, none, text)
+    }
+  }
+}
+
+/// 按钮状态机查询集（type alias 满足 clippy::type_complexity）
+type ButtonQuery = (
+  Entity,
+  &'static Interaction,
+  &'static mut InteractionPrev,
+  &'static mut BackgroundColor,
+  &'static mut BorderColor,
+  &'static mut UiTransform,
+  &'static ButtonVariant,
+  &'static Children,
+);
+
+/// 按钮状态机：hover/pressed 视觉 + 按压缩放 + 释放触发 UiClick（每帧重算）
 ///
 /// 注意必须 With<Button>：0.19 中 Node require BackgroundColor，所有 UI 节点都带
-/// 该组件；无过滤会把 checkbox 行等带 Interaction 的节点也刷成 accent 色。
+/// 该组件；无过滤会把 checkbox 行等带 Interaction 的节点也刷成按钮配色。
 pub fn button_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
-  mut q: Query<
-    (
-      Entity,
-      &Interaction,
-      &mut InteractionPrev,
-      &mut BackgroundColor,
-    ),
-    With<Button>,
-  >,
+  mut q: Query<ButtonQuery, With<Button>>,
+  mut q_text: Query<&mut TextColor>,
 ) {
   let Some(theme) = theme else { return };
-  let c = &theme.colors;
-  for (e, inter, mut prev, mut bg) in &mut q {
+  for (e, inter, mut prev, mut bg, mut border, mut ui_t, variant, children) in &mut q {
     // click = 在按钮上按下并释放（拖出后释放视为取消）
     if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
       commands.trigger(UiClick { entity: e });
     }
     prev.0 = *inter;
-    let target = match inter {
-      Interaction::Pressed => color_of(&c.accent_pressed),
-      Interaction::Hovered => color_of(&c.accent_hover),
-      Interaction::None => color_of(&c.accent),
+    let (target_bg, target_border, target_text) = variant_colors(&theme, *variant, *inter);
+    if bg.0 != target_bg {
+      bg.0 = target_bg;
+    }
+    let target_border = BorderColor::all(target_border);
+    if *border != target_border {
+      *border = target_border;
+    }
+    // 按压缩放（绕节点中心，bevy_ui 布局以节点中心为变换原点）
+    let target_scale = if *inter == Interaction::Pressed {
+      PRESSED_SCALE
+    } else {
+      1.0
     };
-    if bg.0 != target {
-      bg.0 = target;
+    if (ui_t.scale.x - target_scale).abs() > f32::EPSILON {
+      ui_t.scale = Vec2::splat(target_scale);
+    }
+    // 文本子标签颜色（按钮只有一个文本子节点）
+    for child in children.iter() {
+      if let Ok(mut tc) = q_text.get_mut(child) {
+        if tc.0 != target_text {
+          tc.0 = target_text;
+        }
+      }
     }
   }
 }
@@ -101,16 +225,41 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(button(&ctx, p, "OK"));
+      child = Some(button(&ctx, p, ButtonConfig { text: "OK".into(), ..default() }));
     });
-    let e = child.expect("button spawned");
+    let h = child.expect("button spawned");
+    let e = *h;
+    assert_eq!(Entity::from(h), e, "handle derefs to root entity");
     let w = app.world();
     assert!(w.get::<Button>(e).is_some());
     assert!(w.get::<Interaction>(e).is_some());
     assert!(w.get::<InteractionPrev>(e).is_some());
+    assert_eq!(
+      *w.get::<ButtonVariant>(e).unwrap(),
+      ButtonVariant::Primary,
+      "ButtonConfig::default() is primary"
+    );
     // 文本子标签
-    let children = w.get::<Children>(e).expect("button has children");
+    let children = w.get::<Children>(e).unwrap();
     assert_eq!(children.len(), 1, "button contains one label");
+  }
+
+  #[test]
+  fn variants_spawn() {
+    let theme = default_theme();
+    let ctx = UiCtx::new(&theme, None);
+    let mut app = App::new();
+    let root = app.world_mut().spawn_empty().id();
+    let (mut s, mut g, mut d) = (None, None, None);
+    app.world_mut().entity_mut(root).with_children(|p| {
+      s = Some(button(&ctx, p, ButtonConfig { text: "S".into(), variant: ButtonVariant::Secondary, ..default() }));
+      g = Some(button(&ctx, p, ButtonConfig { text: "G".into(), variant: ButtonVariant::Ghost, ..default() }));
+      d = Some(button(&ctx, p, ButtonConfig { text: "D".into(), variant: ButtonVariant::Danger, ..default() }));
+    });
+    let w = app.world();
+    assert_eq!(*w.get::<ButtonVariant>(*s.unwrap()).unwrap(), ButtonVariant::Secondary);
+    assert_eq!(*w.get::<ButtonVariant>(*g.unwrap()).unwrap(), ButtonVariant::Ghost);
+    assert_eq!(*w.get::<ButtonVariant>(*d.unwrap()).unwrap(), ButtonVariant::Danger);
   }
 
   #[test]
@@ -131,14 +280,18 @@ mod tests {
       .world_mut()
       .spawn((
         Button,
+        ButtonVariant::Primary,
         Interaction::None,
         InteractionPrev::default(),
         BackgroundColor::default(),
+        BorderColor::all(Color::NONE),
+        UiTransform::default(),
+        Children::default(),
       ))
       .id();
     let bg_of = |app: &App| app.world().get::<BackgroundColor>(btn).unwrap().0;
 
-    // hover：视觉切 accent_hover，无 click
+    // hover：视觉切 accent_fill_hover，无 click
     app
       .world_mut()
       .get_mut::<Interaction>(btn)
@@ -146,9 +299,9 @@ mod tests {
       .set_if_neq(Interaction::Hovered);
     app.update();
     assert!(clicks.lock().unwrap().is_empty());
-    assert_eq!(bg_of(&app), color_of(&theme.colors.accent_hover));
+    assert_eq!(bg_of(&app), color_of(&theme.colors.accent_fill_hover));
 
-    // 按下：视觉切 accent_pressed，无 click
+    // 按下：视觉切 accent_fill_pressed + 缩放 0.98，无 click
     app
       .world_mut()
       .get_mut::<Interaction>(btn)
@@ -156,9 +309,20 @@ mod tests {
       .set_if_neq(Interaction::Pressed);
     app.update();
     assert!(clicks.lock().unwrap().is_empty());
-    assert_eq!(bg_of(&app), color_of(&theme.colors.accent_pressed));
+    assert_eq!(bg_of(&app), color_of(&theme.colors.accent_fill_pressed));
+    assert!(
+      (app
+        .world()
+        .get::<UiTransform>(btn)
+        .unwrap()
+        .scale
+        .x - 0.98)
+        .abs()
+        < 1e-6,
+      "pressed scale 0.98"
+    );
 
-    // 释放（仍在按钮上）：触发 click，视觉回 accent_hover
+    // 释放（仍在按钮上）：触发 click，视觉回 accent_fill_hover，缩放回 1.0
     app
       .world_mut()
       .get_mut::<Interaction>(btn)
@@ -169,6 +333,10 @@ mod tests {
       *clicks.lock().unwrap(),
       vec![btn],
       "release inside triggers UiClick"
+    );
+    assert!(
+      (app.world().get::<UiTransform>(btn).unwrap().scale.x - 1.0).abs() < 1e-6,
+      "scale restored"
     );
 
     // 按下后拖出释放：视为取消，不触发 click

@@ -22,8 +22,12 @@ cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许�
    `tree_traversal_fuzz_2000_rays_multiscale`（随机块尺度 4/16/64、跨 chunk、轴/对角退化射线；
    palette 严格一致、t 容差 1.0、命中面法线反向）。
 3. WGSL `trace_chunk` 与 `trace_chunk_cpu` **控制流逐字对应**。例外（WGSL-only，需在注释里
-   写明 "WGSL-only 近似，CPU 镜像不含"）：方向可达掩码 LUT（b_leaves）、LOD 远场早停
-   （lod_t_scale）、beam depth_cap——这些是 GPU 近似开关，CPU 测试作为它们关闭时的精确 oracle。
+   写明 "WGSL-only 近似，CPU 镜像不含"）：方向可达掩码 LUT（b_leaves）、beam depth_cap
+   ——这些是 GPU 近似开关，CPU 测试作为它们关闭时的精确 oracle。
+   **禁止恢复 split 子节点远场多数色 LOD 早停**（曾两次导致拉远穿墙+逐面着色，
+   2026-09-06 二次移除）：子树多数色≠表面色 → 内部色渗出穿墙；命中点落子块入口
+   空气体素 → 隐式法线退化回退面法线。LOD 早停只允许 uniform 节点（c_mask==0
+   快路径即精确 palette）。正确 LOD 走 R1-12 子树折叠（预计算粗体素），不做多数色近似。
 
 ## WGSL 编辑方式（naga 坑，已踩过）
 
@@ -60,8 +64,8 @@ cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许�
 - 仅 mask!=0 的 level-0 节点有 inline palette：
   `(b_struct[addr+3+(idx>>2)] >> ((idx&3)*8)) & 0xFF`。inline 叶节点的 mask bit=1 = 该
   体素非空——空气体素（bit=0）先查 mask 再决定是否 load inline word（热路径省 load）。
-- palette word 打包：低字节=uniform 子块色，**高字节=(w>>8)&0xFF = LOD 子树多数色**
-  （`node_lod`，远场早停用）。
+- palette word 打包：低字节=uniform 子块色，高字节=(w>>8)&0xFF = `node_lod` 子树多数色
+  （wire 格式保留、builder 仍写入，但 **shader 禁用于远场早停**——色渗出穿墙，见铁律 3）。
 - LUT（b_leaves）布局：`lut_base = min(oct*128 + entry_i*2, 1022)`，oct bit0=x正/bit1=y正/bit2=z正
   （零分量按正），entry `z*16+y*4+x`；仅 `pal==0` 空气节点可用 `mask & reach` 剔除。
   `lut_disable = view_u.lod.w > 0.5`（GATE_NO_LUT）。
@@ -92,10 +96,10 @@ PowerShell 统计：过滤 `t -gt 10`，对 trace 列排序取 median/p25/p75/p9
 - 正确做法：**同一会话内交替 on/off 多轮**（on,off,on,off 各取 median），median 差异
   小于 p25–p75 带宽即视为无差异。
 - 诊断开关（环境变量，进程启动前设置）：`GATE_NO_LUT=1`（关 b_leaves 掩码剔除）、
-  `GATE_NO_LOD=1`（关远场早停）、`GATE_NO_BEAM=1`。无 env 开关的改动，临时把 WGSL
-  条件改成 `false && ...` 做 A/B，测完恢复。
+  `GATE_NO_BEAM=1`。`GATE_NO_LOD=1` 已失效（远场早停已移除，见铁律 3）。无 env 开关的
+  改动，临时把 WGSL 条件改成 `false && ...` 做 A/B，测完恢复。
 - 热路径优化（除法→预计算 inv_rd 乘法、命中直返省一整轮外层、bit-first 空气零 load）
-  要同时改 CPU 镜像并过测试；近似开关（LOD/LUT）只加 WGSL，注释标明。
+  要同时改 CPU 镜像并过测试；近似开关（LUT）只加 WGSL，注释标明。
 
 ## 常用命令
 

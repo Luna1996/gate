@@ -1,28 +1,66 @@
-//! FR-2 基础 widget 层：retained spawn API（UiCtx + ChildSpawner → Entity），token 驱动。
+//! FR-2 基础 widget 层：retained spawn API（token 驱动），三件套统一约定。
+//!
+//! ## 组件 API 约定（v2）
+//!
+//! 每个 widget 由三件套组成，全部自由函数、无 builder：
+//!
+//! 1. **`XxxConfig`**：全部参数进 Config（含必填如 text），`..default()` 补齐可选字段。
+//!    布局字段（宽高/边距）不进 Config——调用方拿到 Handle 后自行改 `Node`。
+//!    预设档（label 字号/颜色、panel 表面）用 enum 表达，颜色字号永远成对来自令牌。
+//! 2. **`XxxHandle`**：spawn 返回类型，Deref 到根实体 `Entity`（零开销新类型）。
+//!    多实体 widget 用具名字段：`ScrollViewHandle { entity, content }`、
+//!    `TabViewHandle { entity, contents }`。不挂 sugar 方法，后续按需再加。
+//! 3. **事件**：仅交互型 widget（button/slider/checkbox/tab_view）发事件；
+//!    展示型（label/panel/plot/list/table/splitter）不发。组件永远是真源，
+//!    事件只是通知——主动读值仍可 Query。命名：动作用名词（`UiClick`）、
+//!    变化用 -ed 过去式（`SliderValueChanged`/`CheckboxToggled`/`TabChanged`）。
+//!
+//! 豁免：`splitter` 无任何配置项，不设 Config；`row`/`column`/`spacer` 等布局
+//! 容器不纳入本层，直接用 bevy_ui 原生 `Node`。
 //!
 //! 响应式布局约定（FR-2）：容器级尺寸/边距优先 `Val::Percent` / `Val::Vw/Vh`；
 //! 控件本体（按钮/滑杆）允许固定像素——面板锚定边缘，窗口任意尺寸下不越界不重叠。
 
 pub mod button;
 pub mod checkbox;
+pub mod grid;
 pub mod label;
 pub mod list;
 pub mod panel;
 pub mod plot;
+pub mod scroll_view;
 pub mod slider;
+pub mod splitter;
+pub mod table;
+pub mod tab_view;
+pub mod toggle_switch;
 
-pub use button::{InteractionPrev, UiClick, button, button_state_system};
-pub use checkbox::{CheckboxBox, checkbox, checkbox_state_system};
-pub use label::{label, label_muted};
-pub use list::{RingList, list, ring_list_sync_system};
-pub use panel::panel;
+pub use button::{
+  ButtonConfig, ButtonHandle, ButtonVariant, InteractionPrev, UiClick, button, button_state_system,
+};
+pub use checkbox::{CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system};
+pub use grid::{GridConfig, GridHandle, UiGrid, grid, grid_cell};
+pub use label::{LabelConfig, LabelHandle, LabelStyle, label};
+pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
+pub use panel::{PanelConfig, PanelHandle, PanelSurface, panel};
 pub use plot::{
-  PLOT_H, PLOT_W, PlotCanvas, PlotData, PlotDomain, PlotExtents, PlotYAxis, blank_plot_image, plot,
-  plot_redraw_system, plot_yaxis,
+  PLOT_H, PLOT_W, PlotCanvas, PlotConfig, PlotData, PlotDomain, PlotExtents, PlotHandle,
+  PlotLayout, PlotYAxis, blank_plot_image, plot, plot_redraw_system,
+};
+pub use scroll_view::{
+  ScrollConfig, ScrollContent, ScrollView, ScrollViewHandle, ScrollViewport, scroll_view,
+  scroll_view_system,
 };
 pub use slider::{
-  SliderRange, SliderStep, SliderThumb, SliderValue, UiSlider, clamp_step, slider,
-  slider_drag_system, slider_visual_system,
+  SliderConfig, SliderHandle, SliderRange, SliderStep, SliderThumb, SliderValue,
+  SliderValueChanged, UiSlider, clamp_step, slider, slider_drag_system, slider_visual_system,
+};
+pub use splitter::{Splitter, splitter};
+pub use table::{TableConfig, TableCell, TableHandle, UiTable, table};
+pub use tab_view::{TabButton, TabChanged, TabConfig, TabContent, TabView, TabViewHandle, tab_view, tab_view_system};
+pub use toggle_switch::{
+  ToggleKnob, ToggleSwitch, ToggleSwitchConfig, ToggleSwitchHandle, ToggleSwitchToggled,
+  ToggleTrack, toggle_switch, toggle_switch_state_system,
 };
 
 use bevy::log::warn;

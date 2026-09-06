@@ -4,6 +4,7 @@
 //! 逻辑（环形顶替）纯数据可 headless 单测；渲染同步用 change 检测只在脏时重建。
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 
 use bevy::prelude::*;
 
@@ -44,20 +45,50 @@ impl RingList {
   }
 }
 
+/// 环形列表句柄（Deref 到根实体 Entity）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ListHandle(pub Entity);
+
+impl Deref for ListHandle {
+  type Target = Entity;
+  fn deref(&self) -> &Entity {
+    &self.0
+  }
+}
+
+impl From<ListHandle> for Entity {
+  fn from(h: ListHandle) -> Entity {
+    h.0
+  }
+}
+
+/// 环形列表配置（Default = 容量 8）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListConfig {
+  pub capacity: usize,
+}
+
+impl Default for ListConfig {
+  fn default() -> Self {
+    Self { capacity: 8 }
+  }
+}
+
 /// 环形列表容器（纵向排列）
-pub fn list(ctx: &UiCtx, parent: &mut ChildSpawner, capacity: usize) -> Entity {
+pub fn list(ctx: &UiCtx, parent: &mut ChildSpawner, config: ListConfig) -> ListHandle {
   let m = &ctx.theme.metrics;
-  parent
+  let e = parent
     .spawn((
       Name::new("ui-list"),
-      RingList::new(capacity),
+      RingList::new(config.capacity),
       Node {
         flex_direction: FlexDirection::Column,
         row_gap: px(m.spacing.xs),
         ..default()
       },
     ))
-    .id()
+    .id();
+  ListHandle(e)
 }
 
 /// 脏时同步：RingList changed → 重建文本子实体（条目顺序 = 自上而下）
@@ -72,7 +103,7 @@ pub fn ring_list_sync_system(
   };
   let ctx = UiCtx::new(&theme, theme_font.handle.as_ref());
   let fs = &theme.metrics.font_size;
-  let color = color_of(&theme.colors.text);
+  let color = color_of(&theme.colors.text_body);
   for (e, ring) in &mut q {
     commands.entity(e).despawn_related::<Children>();
     for item in ring.items() {

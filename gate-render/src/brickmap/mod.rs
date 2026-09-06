@@ -9,7 +9,6 @@ mod builder;
 pub mod dda;
 pub mod upload;
 mod view;
-pub mod vis_cache;
 pub mod wire;
 
 pub use builder::{BrickMapBuilder, ChunkUpdate, DirtyRanges, VolumesBuilder, VolumesSnapshot};

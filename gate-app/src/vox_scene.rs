@@ -158,6 +158,11 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene) {
       .unwrap_or(0);
     pal.set(i as u8, e);
   }
+  // 材质统计（诊断白像素：emissive 体素在直接光 + GI 射线端点都会高频贡献亮度）
+  let em: Vec<u8> = (1..=255u8)
+    .filter(|&i| pal.get(i).emissive > 0)
+    .collect();
+  bevy::log::info!("VOX MATERIAL: {} emissive palette indices = {:?}", em.len(), em);
 }
 
 /// vox-rs Transform（移植自 ogt_vox，二者矩阵字段逐一同构）：平移在
@@ -602,5 +607,147 @@ mod tests {
     println!("after: 冲突中全 identity 写入方对={c1_id}（含旋转方={}", c1 - c1_id);
     assert_eq!(w0, w1, "两约定写入体素数应一致");
     assert!(c1 < c0 / 2, "翻转补偿后异色冲突应减半以上（before={c0} after={c1}）");
+  }
+
+  /// 一次性诊断（#[ignore]，手动 cargo test -- --ignored 跑）：
+  /// 按用户截图机位（eye/target 取自 FPS overlay）离屏渲染 480x270，
+  /// 复刻 dda_main unlit（debug_mode==3）路径的逐体素法线着色，
+  /// 找出「孤立高亮点」：ndl≈1 但 8 邻域暗/未命中，打印其体素/6邻域/法线，
+  /// 判定是几何真相（细小特征剪影）还是遍历把切向邻体素带出。
+  #[test]
+  #[ignore = "诊断：需 nuke.vox 资产，CPU 离屏渲染 ~ 分钟级"]
+  fn nuke_white_pixel_diagnostic() {
+    use gate_render::brickmap::cpu_reference_dda_ray_tree;
+    use gate_render::{BrickMapBuilder, BrickMapView, DdaCameraConfig, OrbitCamera};
+    use glam::{IVec3, Vec3, Vec4};
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/vox/nuke.vox");
+    if !path.exists() {
+      return;
+    }
+    // 默认 GATE_TILES=2 → anchor = EXT_FINE_HALF = (512,16,512)，与 scene.rs 启动一致
+    let mut grid = VolumeGrid::new();
+    let info = load_vox_scene(&mut grid, &path, IVec3::new(512, 16, 512)).expect("load nuke.vox");
+    println!("voxels written = {} aabb=[{}]-[{}]", info.voxels_written, info.aabb_min, info.aabb_max);
+    let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
+    let view = BrickMapView::new(&bufs);
+
+    // 截图机位（FPS overlay 文本）
+    let eye = Vec3::new(835.0, 251.8, 438.4);
+    let target = Vec3::new(658.3, 213.2, 472.7);
+    let orbit = OrbitCamera::from_eye(eye, target);
+    let cfg = DdaCameraConfig::from_orbit(&orbit, 60.0_f32.to_radians(), 16.0 / 9.0, 1.0, 65536.0);
+
+    // day_outdoor.ron：sun dir（光传播）(0.5,-0.8,0.3) → L 指向太阳 = 反向
+    let l = Vec3::new(-0.5, 0.8, -0.3).normalize();
+
+    const W: usize = 480;
+    const H: usize = 270;
+
+    // face_id 0..5 → ±轴（镜像 dda.rs face_normal_from_index）
+    let face_n = |f: u8| match f {
+      0 => Vec3::new(-1.0, 0.0, 0.0),
+      1 => Vec3::new(1.0, 0.0, 0.0),
+      2 => Vec3::new(0.0, -1.0, 0.0),
+      3 => Vec3::new(0.0, 1.0, 0.0),
+      4 => Vec3::new(0.0, 0.0, -1.0),
+      _ => Vec3::new(0.0, 0.0, 1.0),
+    };
+
+    #[derive(Clone, Copy)]
+    struct Px {
+      hit: bool,
+      ndl: f32,
+      fdl: f32,
+      pal: u8,
+    }
+    let mut img = vec![Px { hit: false, ndl: 0.0, fdl: 0.0, pal: 0 }; W * H];
+
+    let mut n_hits = 0u32;
+    for py in 0..H {
+      for px in 0..W {
+        let u = (px as f32 + 0.5) / W as f32 * 2.0 - 1.0;
+        let vv = 1.0 - (py as f32 + 0.5) / H as f32 * 2.0;
+        let n4 = cfg.inv_view_proj * Vec4::new(u, vv, 0.0, 1.0);
+        let f4 = cfg.inv_view_proj * Vec4::new(u, vv, 1.0, 1.0);
+        let near = n4.truncate() / n4.w;
+        let far = f4.truncate() / f4.w;
+        let dir = (far - near).normalize();
+
+        if let Some(h) = cpu_reference_dda_ray_tree(&bufs, near, dir, 20000.0) {
+          n_hits += 1;
+          // 逐体素隐式法线（镜像 implicit_normal_local）：d 指向实体反侧 = 朝外
+          let solid = |dv: IVec3| view.get_voxel(h.voxel + dv).is_some() as i32;
+          let d = Vec3::new(
+            (solid(IVec3::new(-1, 0, 0)) - solid(IVec3::new(1, 0, 0))) as f32,
+            (solid(IVec3::new(0, -1, 0)) - solid(IVec3::new(0, 1, 0))) as f32,
+            (solid(IVec3::new(0, 0, -1)) - solid(IVec3::new(0, 0, 1))) as f32,
+          );
+          let fn_ = face_n(h.face_id);
+          let n = if d.length_squared() > 0.25 { d.normalize() } else { fn_ };
+          img[py * W + px] = Px {
+            hit: true,
+            ndl: n.dot(l).max(0.0),
+            fdl: fn_.dot(l).max(0.0),
+            pal: h.pal,
+          };
+        }
+      }
+    }
+
+    // 孤立高亮点：ndl≥0.9 且 8 邻域多数（≥6/8）暗（未命中或 ndl<0.2）
+    let mut sparks = 0u32;
+    let mut sparks_face_dark = 0u32; // 命中面本身背光（fdl<0.2）却被逐体素法线点亮
+    let mut printed = 0u32;
+    for py in 1..H - 1 {
+      for px in 1..W - 1 {
+        let c = img[py * W + px];
+        if !c.hit || c.ndl < 0.9 {
+          continue;
+        }
+        let mut dark = 0;
+        for dy in -1i32..=1 {
+          for dx in -1i32..=1 {
+            if dx == 0 && dy == 0 {
+              continue;
+            }
+            let q = img[(py as i32 + dy) as usize * W + (px as i32 + dx) as usize];
+            if !q.hit || q.ndl < 0.2 {
+              dark += 1;
+            }
+          }
+        }
+        if dark < 6 {
+          continue;
+        }
+        sparks += 1;
+        if c.fdl < 0.2 {
+          sparks_face_dark += 1;
+        }
+        if printed >= 40 {
+          continue;
+        }
+        // 取该像素命中体素详情重放一遍（打印用）
+        let u = (px as f32 + 0.5) / W as f32 * 2.0 - 1.0;
+        let vv = 1.0 - (py as f32 + 0.5) / H as f32 * 2.0;
+        let n4 = cfg.inv_view_proj * Vec4::new(u, vv, 0.0, 1.0);
+        let f4 = cfg.inv_view_proj * Vec4::new(u, vv, 1.0, 1.0);
+        let near = n4.truncate() / n4.w;
+        let far = f4.truncate() / f4.w;
+        let dir = (far - near).normalize();
+        let h = cpu_reference_dda_ray_tree(&bufs, near, dir, 20000.0).unwrap();
+        let occ = |dv: IVec3| view.get_voxel(h.voxel + dv).map(|p| p as i32).unwrap_or(-1);
+        println!(
+          "SPARK px=({px},{py}) pal={} voxel={} face={} ndl={:.2} fdl={:.2} t={:.1} occ[+x={} -x={} +y={} -y={} +z={} -z={}]",
+          h.pal, h.voxel, h.face_id, c.ndl, c.fdl, h.t,
+          occ(IVec3::new(1, 0, 0)), occ(IVec3::new(-1, 0, 0)),
+          occ(IVec3::new(0, 1, 0)), occ(IVec3::new(0, -1, 0)),
+          occ(IVec3::new(0, 0, 1)), occ(IVec3::new(0, 0, -1)),
+        );
+        printed += 1;
+      }
+    }
+    let total = W * H;
+    println!("hits={n_hits}/{total} sparks={sparks} of which face_backlit_but_voxel_lit={sparks_face_dark}");
   }
 }

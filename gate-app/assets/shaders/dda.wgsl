@@ -45,24 +45,10 @@ const CHUNK_INDEX_CAP: u32 = 64u;
 const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
 const TREE_BASE: u32 = 262144u;          // Region ② 起始
 
-// R3-18 直光层常量（与 Rust lighting.rs / wgsl_consts 镜像，单测防漂移）
-const SHADOW_BIAS: f32 = 0.5;        // 阴影射线起点沿法线偏移（fine）
-// 方向光阴影射线 t_max：场景 AABB 对角 ≈3118（[-256,-512,-256]~[1536,1536,1280]），
-// 表面点沿任意方向的遮挡必在其内；65536 的空气段让每条阴影射线多空走 8×（性能）。
-// 改世界尺度（GATE_TILES）时按对角线同步放大。
-const SHADOW_DIR_T_MAX: f32 = 8192.0;
-const EMISSIVE_EMIT_GAIN: f32 = 4.0;  // 发光体素 radiance 直出增益
-
-// R3-10 DDGI 常量（与 Rust ddgi.rs 镜像，单测防漂移）
-const DDGI_CELL: f32 = 16.0;            // 探针 cell 边长（fine）
-const DDGI_IRR_TEXELS: u32 = 8u;        // 八面体 irradiance 边长（64 texel/探针）
-const DDGI_DEPTH_TEXELS: u32 = 16u;     // 八面体 depth 边长（256 texel/探针）
-const DDGI_RAYS_PER_PROBE: u32 = 64u;   // = 8×8，1 ray ↔ 1 irradiance texel
-const DDGI_IRR_STRIDE: u32 = 64u;       // vec4 数/探针（8×8）
-const DDGI_DEPTH_STRIDE: u32 = 256u;    // f32 数/探针（16×16）
-// 采样权重（Rust ddgi.rs 常量镜像）
-const DDGI_NORMAL_BIAS: f32 = 0.2;      // 前后权重锐度（Rohacek §3.2 锐利背面剔除）
-const DDGI_DEPTH_BIAS: f32 = 4.0;       // 漏光 chevron 半宽 = cell × 0.25（Rohacek §3.3）
+// 光照管线状态（Devlog 23 代际）：octo GPU hashmap（vis_table/vis_norm/gi_rad +
+// direct/gi/denoise pass）因缓存噪声（散点闪烁）已整条拆除；DDGI 探针光照待重新
+// 实现。当前 dda_main = unlit：逐体素隐式法线调制 albedo（sky 环境 + 太阳 NdotL，
+// 无阴影射线/无 GI/无 emissive）。
 
 // P2：方向位掩码 LUT。射线方向符号编码为 3-bit 掩码（bit0=x>=0, bit1=y>=0,
 // bit2=z>=0，共 8 种），查表一次性得到 side（boundary 计算用）和三轴步进 face id，
@@ -136,19 +122,6 @@ struct DdaViewUniform {
 @group(1) @binding(1) var<storage, read> b_leaves: array<u64>;
 @group(1) @binding(2) var<storage, read> b_palette: array<u32>;
 
-// --- BG5：逐体素直光可见性缓存（Douglas #19：每体素 1 条阴影射线 + hashmap 跨帧复用）---
-struct VisCacheMeta {
-  enabled: u32,       // 0 = 旁路（每像素直接投射）
-  capacity_mask: u32, // 表容量 - 1（2 的幂）
-  _pad0: u32,
-  _pad1: u32,
-}
-@group(5) @binding(0) var<storage, read_write> vis_table: array<atomic<u32>>;
-@group(5) @binding(1) var<uniform> vis_meta: VisCacheMeta;
-// per-voxel implicit normal 表（Douglas #22：6 邻域 occupancy 差分，一体素一法线）
-// slot 64bit = (hi: tag32, lo: oct_x16 | oct_y16)；hi==0 && lo==0 = 空
-@group(5) @binding(2) var<storage, read_write> vis_norm: array<atomic<u32>>;
-
 // BrickMapGlobals scalar mirror（wire.rs 110-130）
 struct Globals {
   index_origin_x: i32,
@@ -221,33 +194,6 @@ struct LightPool {
   sky_horizon: vec4<f32>, // 天空地平线色（线性）
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
-
-// --- BG4：DDGI 探针（R3-10；与 Rust DdgiMeta/buffer 布局逐字段镜像）---
-//   @binding(0) = DdgiMeta uniform（64B）
-//   @binding(1) = positions: vec4[probe_count]（xyz = 世界 fine 位置，w = active）
-//   @binding(2) = cell_index: u32[cell_grid]（dense cell → probe id，u32::MAX = 无探针）
-//   @binding(3) = irradiance: vec4[probe_count×64]（read_write；8×8 八面体/探针，EMA 累积）
-//   @binding(4) = depth: f32[probe_count×256]（read_write；16×16 八面体/探针，EMA 累积）
-// ddgi_update 写 3/4；dda_main（spike 4 采样接入后）只读 1..4；同一 BG4 两个 pass 复用。
-struct DdgiMeta {
-  probe_count: u32,
-  active_count: u32,
-  probes_this_frame: u32,
-  cycle_base: u32,
-  frame: u32,
-  _pad0: u32,
-  grid_origin: vec4<f32>,   // xyz = cell 网格原点（cell 单位）
-  grid_dims: vec4<f32>,     // xyz = cell 网格 dims（cell 单位）
-  cell_tmax_alpha: vec4<f32>, // x=cell(16), y=射线 t_max, z=EMA α, w reserved
-}
-@group(4) @binding(0) var<uniform> ddgi: DdgiMeta;
-@group(4) @binding(1) var<storage, read> ddgi_pos: array<vec4<f32>>;
-@group(4) @binding(2) var<storage, read> ddgi_cell: array<u32>;
-@group(4) @binding(3) var<storage, read_write> ddgi_irr: array<vec4<f32>>;
-@group(4) @binding(4) var<storage, read_write> ddgi_depth: array<f32>;
-// cell_index 无探针哨兵（Rust NO_PROBE = u32::MAX）
-const DDGI_NO_PROBE: u32 = 4294967295u;
-
 
 // 统一网格上下文——一套 DDA 跑所有网格（主世界 + 物体）
 // 由 `make_grid(idx)` 从 `grid_descs[idx]` 构造；携带 tree_base/palette_base/
@@ -361,11 +307,15 @@ fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
 // 层级命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
 //   pre-check 命中（射线起点在固体 leaf 内，相机在体内 UB）：face_id 由调用方
 //   用 normalize(-rd) 反推（首 chunk entry_face）。
+// voxel：命中固体体素 chunk 局部 fine 整数坐标——DDA 步进本身精确（整数加法），
+//   无浮点噪声；着色阶段直接消费，禁用任何「命中点 ± 法线半步」启发式重建
+//   （启发式在体素棱边/UB fallback face 下会选错邻体素 → 6 邻域差分串色）。
 struct FineHit {
   hit: bool,
   t: f32,
   pal: u32,
   face_id: u32,
+  voxel: vec3<i32>,
 }
 
 // brick 缓存槽：一层分裂节点常驻（对应 CPU BrickCpu / Douglas BrickMaskEntry）
@@ -382,14 +332,13 @@ struct Brick {
 //
 // depth_cap（beam 保守模式）：gate 深度 d=(3-level) 的分裂子块且 d>=depth_cap 时
 // 返回子块入口 t（保守下界）；主/阴影 pass depth_cap=3 恒不触发（d<=2）。
-// lod_t_scale：LOD 远场早停阈值系数（scale/像素角大小）；远距 split 子节点投影
-// <1px 时用子树 LOD 多数色整块出图（亚像素误差）。WGSL-only 近似，CPU 镜像不含。
+// LOD：split 子节点一律下钻（#2 勘误：远场多数色早停色渗出→穿墙 + 逐面着色，
+// 见 docs/douglas-final.md；uniform 子节点精确 palette 早停 = c_mask==0 快路径）。
 fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
                ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
-               t0: f32, t1: f32, entry_face: u32, depth_cap: u32,
-               lod_t_scale: f32) -> FineHit {
+               t0: f32, t1: f32, entry_face: u32, depth_cap: u32) -> FineHit {
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
-  if (t0 >= t1) { return FineHit(false, 0.0, 0u, 0u); }
+  if (t0 >= t1) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
   // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = ro - chunk_min;
   // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv）
@@ -422,7 +371,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   loop {
     if (budget == 0u) { break; }
     budget = budget - 1u;
-    if (level > 3u) { return FineHit(false, 0.0, 0u, 0u); }
+    if (level > 3u) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
     // ---- traverse：从当前 level 下钻到 v 处内容（Douglas traverse_bit_set）----
     loop {
       let b = bricks[level];
@@ -436,19 +385,19 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         if ((b.mask & (u64(1) << idx)) != u64(0)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
           let leaf_pal = (w >> ((idx & 3u) * 8u)) & 0xFFu;
-          if (leaf_pal != 0u) { return FineHit(true, cur_t, leaf_pal, face); }
+          if (leaf_pal != 0u) { return FineHit(true, cur_t, leaf_pal, face, v); }
         }
         break; // 空气 leaf
       }
       let bit = u64(1) << idx;
       if ((b.mask & bit) == u64(0)) {
         // 统一子块：颜色 = 节点 palette（0=空气）
-        if (b.pal != 0u) { return FineHit(true, cur_t, b.pal, face); }
+        if (b.pal != 0u) { return FineHit(true, cur_t, b.pal, face, v); }
         break; // 空气统一子块
       }
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
       let gd = 3u - level;
-      if (gd >= depth_cap) { return FineHit(true, cur_t, b.pal, face); }
+      if (gd >= depth_cap) { return FineHit(true, cur_t, b.pal, face, v); }
       // 分裂子块 → popcount 定位 child（用原始 mask，非 LUT eff）
       let below = b.mask & (bit - u64(1));
       let pop = countOneBits(u32(below)) + countOneBits(u32(below >> 32u));
@@ -461,21 +410,13 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       // 统一子节点快路径（旧 c_mask==0）：wire 任意层的分裂位都可能指向 3 字统一
       // 节点（mask=0，pal 直决；叶层统一节点无 inline 16 字，禁读 addr+3 之后）
       if (c_mask == u64(0)) {
-        if (c_pal != 0u) { return FineHit(true, cur_t, c_pal, face); }
+        if (c_pal != 0u) { return FineHit(true, cur_t, c_pal, face, v); }
         break;
       }
-      // LOD 远场早停（冷路径：uniform 开关 + 远场门控，近场/关闭时近零开销）。
-      // 大场景远距射线：split 子节点投影 <1px 时用子树 LOD 多数色（palette word
-      // 高字节 = node_lod）整块出图，亚像素误差，省深层下钻。child_extent = 子块
-      // fine 边长 = 1<<(level*2)（root→64 … level1→4）。WGSL-only 近似开关
-      // （CPU 参考实现不含，旧栈版 trace_chunk 同位置同语义）。
-      if (view_u.lod.y > 0.5 && cur_t > 4.0 * lod_t_scale) {
-        let child_extent = f32(1u << (level * 2u));
-        if (cur_t > child_extent * lod_t_scale) {
-          let c_lod = (c_pw >> 8u) & 0xFFu;
-          if (c_lod != 0u) { return FineHit(true, cur_t, c_lod, face); }
-        }
-      }
+      // 勘误（#2，用户实测）：split 子节点远场多数色早停（palette 高字节 node_lod）
+      // 色渗出→穿墙，且命中点落子块入口空气体素 → 6 邻域差分退化回退面法线 →
+      // 逐面着色。禁恢复：split 一律下钻；uniform 子节点早停已由上方 c_mask==0
+      // 快路径以精确 palette 覆盖（docs/douglas-final.md #2 勘误）。
       level = level - 1u;
       bricks[level] = Brick(child_addr, c_mask, c_pal);
     }
@@ -493,7 +434,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         reach = select(reach, ~u64(0), lut_disable);
         if ((b.mask & reach) == u64(0)) {
           level = level + 1u;
-          if (level > 3u) { return FineHit(false, 0.0, 0u, 0u); }
+          if (level > 3u) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
         }
       }
     }
@@ -519,7 +460,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       else { mn = 2u; }
       step_axis = mn;
       cur_t = side[mn];
-      if (cur_t >= t1) { return FineHit(false, 0.0, 0u, 0u); } // 段内再无子块可入
+      if (cur_t >= t1) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); } // 段内再无子块可入
       let old_cell = (v[mn] >> log2) & 3;
       // 沿 mn 轴整子块跨越
       v[mn] = v[mn] + sign_v[mn] * s;
@@ -541,21 +482,21 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
           let dp = (w >> ((idx & 3u) * 8u)) & 0xFFu;
-          if (dp != 0u) { return FineHit(true, cur_t, dp, face); }
+          if (dp != 0u) { return FineHit(true, cur_t, dp, face, v); }
         } else if (b.mask == u64(0) && b.pal != 0u) {
           // 防御：uniform 叶（正常下钻快路径已处理）
-          return FineHit(true, cur_t, b.pal, face);
+          return FineHit(true, cur_t, b.pal, face, v);
         }
       } else {
         let mb = (b.mask & (u64(1) << idx)) != u64(0);
         if (mb) { break; } // 分裂子块 → 回 traverse 下钻
-        if (b.pal != 0u) { return FineHit(true, cur_t, b.pal, face); } // 统一实体
+        if (b.pal != 0u) { return FineHit(true, cur_t, b.pal, face, v); } // 统一实体
       }
       // 空气子块 → 回 loop 顶重选 mn 轴继续
     }
     if (changed) {
       level = level + 1u;
-      if (level > 3u) { return FineHit(false, 0.0, 0u, 0u); }
+      if (level > 3u) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
     }
     // ---- firstTrailingBit 层级自适应跨级跳（Douglas march 尾部）----
     // 步进轴新坐标的尾随零位 = 对齐 run 长度：正向 comp=对齐基址（tz 直接读），
@@ -571,7 +512,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     var new_level: u32 = 0xFFFFFFFFu;
     if (tz_i >= 0) { new_level = u32(tz_i) >> 1u; }
     level = max(level, new_level);
-    if (level > 3u) { return FineHit(false, 0.0, 0u, 0u); } // 跨出 chunk（tz≥8）
+    if (level > 3u) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); } // 跨出 chunk（tz≥8）
     // 对齐快照：v 钳到 cur_t 射线点所在的当前 level 区域，步进轴取精确边界整数
     // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
     let mi = i32(m);
@@ -581,7 +522,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     v = clamp(vec3<i32>(floor(p)), base, region_max);
     v[step_axis] = i32(comp);
   }
-  return FineHit(false, 0.0, 0u, 0u);
+  return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0));
 }
 
 // ============================================================================
@@ -632,12 +573,15 @@ fn slab_box(ro: vec3<f32>, rd: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>, t0: f32,
 // ============================================================================
 
 // 统一命中结构：hit/t/pal/n(世界空间法线)/face_id(0..5)/obj_id(-1=主世界,>=0=物体)
+// voxel：命中固体体素 grid 局部 fine 整数坐标（主世界 = 世界坐标）——DDA 整数步进
+//   精确产出，dda_main 着色（voxel_normal_world 6 邻域差分）直接消费，零启发式重建。
 struct UnifiedHit {
   hit: bool,
   t: f32,
   pal: u32,
   n: vec3<f32>,        // 世界空间法线（光影用）
   face_id: u32,        // 命中面 0..5（与 face_index_from_normal 对齐）
+  voxel: vec3<i32>,    // grid 局部 fine 命中体素（trace_chunk 的 v + ci*256）
   obj_id: i32,         // -1 = 主世界, >=0 = 物体索引
 }
 
@@ -662,7 +606,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   let col1 = g.col1;
   let col2 = g.col2;
   let obj_id = g.obj_id;
-  let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, obj_id);
+  let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), obj_id);
   // ---- 世界 AABB 预剔除（slab 内联）----
   var bx_enter = 0.0;
   var bx_exit = t_cap;
@@ -779,9 +723,6 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   var tmax_c = select(vec3<f32>(1e+30), (bnd_c - ro) * grid_inv_rd, grid_axis_on);
   tmax_c = max(tmax_c, vec3<f32>(tl0));
   var t_enter_c = tl0;
-  // LOD 早停 t 阈值系数：子块(局部单位 sub)投影 < 1px ⇔ t > sub * (scale / 像素角大小)
-  // （局部 sub × scale = 世界边长；t 为世界距离）。lod.x=0 时早停条件永不成立。
-  let lod_t_scale = scale / view_u.lod.x;
   // entry_face：跨入当前 chunk 的面。首 chunk 用 normalize(-rd) 兜底（相机贴面/UB；
   // 按约定 UB 直接返回该 voxel 颜色，face_id 反推）；后续 chunk 由跨轴 + sign_v 更新。
   // face_index_from_normal 内联（函数调用开销，见 worklog）
@@ -813,12 +754,14 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
         // P3 beam：chunk 内遍历从 max(chunk 入口, t_min) 开始，跳过 t_min 前的空空间
         let t0c = max(t_enter_c, t_min);
         let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v,
-                            t0c, t1, entry_face, depth_cap, lod_t_scale);
+                            t0c, t1, entry_face, depth_cap);
         if (h.hit) {
           // 统一法线计算：trace_chunk 内部已推好 face_id，调用方零分支
           let n_local = face_normal_from_index(h.face_id);
           let n_world = normalize(n_local.x * col0 + n_local.y * col1 + n_local.z * col2);
-          return UnifiedHit(true, h.t, h.pal, n_world, h.face_id, obj_id);
+          // chunk 局部 v → grid 局部体素（ci 为 trace_chunk 命中时所在 chunk，未步进）
+          let voxel = h.voxel + ci * i32(CHUNK_SIZE);
+          return UnifiedHit(true, h.t, h.pal, n_world, h.face_id, voxel, obj_id);
         }
       }
     }
@@ -858,7 +801,10 @@ fn make_grid(idx: u32) -> Grid {
     d.pos_scale.xyz, d.pos_scale.w,        // pos + scale
     d.tree_base, d.palette_base,           // 数据源基址
     origin, vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z),
-    select(-1i, i32(idx), idx > 0u),       // idx=0 → 主世界(-1)，idx≥1 → 物体
+    // obj_id 约定（镜像 cpu_reference_trace_volumes）：idx=0 主世界→-1；
+    // idx≥1 物体→0 基 obj_id = idx-1（volume.rs list[0]=主世界, list[1..]=物体
+    // obj_id 0..N-1）。下游 voxel_normal_world 按 obj_id+1 反查 grid_descs。
+    select(-1i, i32(idx) - 1i, idx > 0u),
   );
 }
 
@@ -872,18 +818,6 @@ fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
     f32((w0 >> 16u) & 0xFFu),
   ) / 255.0;
 }
-
-// palette emissive 解包（w1 低 8bit，Rust hit_mat 镜像）
-fn palette_emissive(palette_base: u32, pal: u32) -> f32 {
-  let w1 = b_palette[palette_base + pal * 2u + 1u];
-  return f32(w1 & 0xFFu) / 255.0;
-}
-
-// ============================================================================
-// R3-18 直光层（Douglas #02/#17/#23；CPU 镜像 lighting.rs::cpu_reference_sky/shade_hit）
-//   final = albedo × (ambient×0.4 + sky_grad×0.6) + albedo × sun × NdotL × vis + emissive 直出
-//   着色粒度 = 逐体素 flat（v5 决策）；阴影 = 命中点 1 条向太阳射线（硬阴影）
-// ============================================================================
 
 // 天空渐变 + 太阳盘光晕（miss 像素输出；CPU 镜像 cpu_reference_sky）
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
@@ -902,172 +836,43 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
 }
 
 // ============================================================================
-// 逐体素直光可见性缓存（Douglas #19：每体素 1 条阴影射线 + hashmap 跨帧复用，
-// 1660 Ti 实测省 1-2ms）。方向光 vis 视角无关 → 跨帧持久；编辑时整表清零
-// （edit_generation，Rust 侧）。slot = tag30<<2 | state（0=空 1=遮挡 2=可见）。
-// 语义：per-voxel vis 由受光面（朝太阳面）中心唯一一条射线判定，全面共享；
-// ndl 仍按命中面法线（#22 隐式法线明暗不变）。
+// 逐体素隐式法线（Douglas #22：6 邻域 occupancy 差分，一体素一法线 → 一体素一色）。
+// Devlog 23：octo 的 hashmap 法线/可见性缓存（vis_norm/vis_table + 每体素阴影射线）
+// 因缓存噪声（错朝向亮斑/暗斑、散点串色闪烁，"too many noise"）整条弃用——法线
+// 直接逐像素计算（6 次树点查，beam 跳过空空间后成本可忽略），无任何跨帧缓存。
+// 光照下一代方案 = DDGI 探针（R3-10 基础设施保留于 ddgi.rs，待重新接线）。
 // ============================================================================
-
-// key 折叠：obj_id(4bit) + 体素局部坐标三轴各 14bit（±8192）→ 32bit hash
-fn vis_key(obj_id: i32, v: vec3<i32>) -> u32 {
-  let o = (u32(obj_id) + 1u) & 15u;
-  let x = u32(v.x) & 16383u;
-  let y = u32(v.y) & 16383u;
-  let z = u32(v.z) & 16383u;
-  var h = (o * 0x9E3779B1u) ^ (x * 0x85EBCA6Bu) ^ (y * 0xC2B2AE35u) ^ (z * 0x27D4EB2Fu);
-  h = h ^ (h >> 15u);
-  h = h * 0x2C1B3C6Du;
-  h = h ^ (h >> 12u);
-  return h;
-}
-
-// 线性探测查询（读侧无原子——竞态最坏读到撕裂 tag → miss 重投射，无害）
-fn vis_lookup(k: u32) -> u32 {
-  let tag = k & 0x3FFFFFFFu;
-  var idx = k & vis_meta.capacity_mask;
-  for (var i = 0u; i < 4u; i = i + 1u) {
-    let slot = atomicLoad(&vis_table[idx]);
-    if (slot == 0u) { return 0u; }
-    if ((slot >> 2u) == tag) { return slot & 3u; }
-    idx = (idx + 1u) & vis_meta.capacity_mask;
-  }
-  return 0u;
-}
-
-// CAS 插入（两线程同 key 竞态：一方成功，另一方投射结果相同值，无害）
-fn vis_insert(k: u32, state: u32) {
-  let tag = k & 0x3FFFFFFFu;
-  let val = (tag << 2u) | (state & 3u);
-  var idx = k & vis_meta.capacity_mask;
-  for (var i = 0u; i < 4u; i = i + 1u) {
-    let r = atomicCompareExchangeWeak(&vis_table[idx], 0u, val);
-    if (r.exchanged) { return; }
-    if ((r.old_value >> 2u) == tag) { return; }
-    idx = (idx + 1u) & vis_meta.capacity_mask;
-  }
-}
-
-// 体素局部坐标：主世界 identity 直取；物体经 Grid 逆变换
-fn vis_voxel_local(obj_id: i32, p_world: vec3<f32>) -> vec3<i32> {
-  if (obj_id < 0) {
-    return vec3<i32>(floor(p_world));
-  }
-  let gg = make_grid(u32(obj_id) + 1u);
-  let wp = p_world - gg.pos;
-  let lp = vec3<f32>(dot(wp, gg.col0), dot(wp, gg.col1), dot(wp, gg.col2)) / gg.scale;
-  return vec3<i32>(floor(lp));
-}
-
-// ============================================================================
-// per-voxel implicit normal（Douglas #22：6 邻域 occupancy 差分，一体素一法线
-// → 一体素一色）。首算贵（6 次树点查）→ 64bit 表缓存跨帧复用，稳态 O(1)。
-// ============================================================================
-
-// 八面体方向 16bit 量化（DDGI oct 复用；normal 是单位向量）
-fn vis_norm_encode(n: vec3<f32>) -> u32 {
-  let e = oct_encode(n) * 0.5 + vec2<f32>(0.5);
-  let q = vec2<u32>(clamp(e, vec2<f32>(0.0), vec2<f32>(1.0)) * 65535.0);
-  return (q.x << 16u) | q.y;
-}
-fn vis_norm_decode(v: u32) -> vec3<f32> {
-  let e = vec2<f32>(f32((v >> 16u) & 0xFFFFu), f32(v & 0xFFFFu)) / 65535.0 * 2.0 - vec2<f32>(1.0);
-  return oct_decode(e);
-}
 
 // 6 邻域 occupancy 差分；退化（零向量）→ 回退 face normal（局部系）
-fn implicit_normal_local(g: Grid, v: vec3<i32>, fallback: vec3<f32>) -> vec3<f32> {
+fn implicit_normal_local(g: Grid, v: vec3<i32>) -> vec3<f32> {
   let px = select(0u, 1u, sample_brickmap(g, v + vec3<i32>(1, 0, 0)) != 0u);
   let nx = select(0u, 1u, sample_brickmap(g, v + vec3<i32>(-1, 0, 0)) != 0u);
   let py = select(0u, 1u, sample_brickmap(g, v + vec3<i32>(0, 1, 0)) != 0u);
   let ny = select(0u, 1u, sample_brickmap(g, v + vec3<i32>(0, -1, 0)) != 0u);
   let pz = select(0u, 1u, sample_brickmap(g, v + vec3<i32>(0, 0, 1)) != 0u);
   let nz = select(0u, 1u, sample_brickmap(g, v + vec3<i32>(0, 0, -1)) != 0u);
-  let d = vec3<f32>(f32(nx) - f32(px), f32(ny) - f32(py), f32(nz) - f32(pz));
-  let len = length(d);
-  return select(fallback, d / len, len > 0.5);
+  let nv = vec3<f32>(f32(nx) - f32(px), f32(ny) - f32(py), f32(nz) - f32(pz));
+  let nl = length(nv);
+  return select(nv / nl, vec3<f32>(1, 0, 0), nl == 0);
 }
 
-// per-voxel normal 世界系（带缓存）；miss → 6 邻域差分（局部系）→ 世界系。
-// fallback_face_id：差分零向量（孤立体素/全实心）时退回命中面法向。
-fn vis_normal(obj_id: i32, v_local: vec3<i32>, fallback_face_id: u32) -> vec3<f32> {
-  let k = vis_key(obj_id, v_local);
-  let tag = k;
-  let idx = k & vis_meta.capacity_mask;
-  if (tag != 0u) {
-    let hi = atomicLoad(&vis_norm[idx * 2u]);
-    if (hi == tag) {
-      let lo = atomicLoad(&vis_norm[idx * 2u + 1u]);
-      return vis_norm_decode(lo);
-    }
-  }
-  // miss：6 邻域差分
+// 逐体素法线世界系（无缓存）：物体网格局部系差分后经旋转列换世界系；
+// face_id = 差分退化（孤立体素/全实心）时回退的命中面法向。
+// obj_id=-1（主世界）→ make_grid(0) identity，局部系即世界系。
+fn voxel_normal_world(obj_id: i32, v_local: vec3<i32>) -> vec3<f32> {
   let gg = make_grid(u32(obj_id) + 1u);
-  let fd_local = face_normal_from_index(fallback_face_id);
-  let n_local = implicit_normal_local(gg, v_local, fd_local);
-  let n_world = normalize(n_local.x * gg.col0 + n_local.y * gg.col1 + n_local.z * gg.col2);
-  if (tag != 0u) {
-    let enc = vis_norm_encode(n_world);
-    // 插入先 lo 后 hi：读侧 hi==tag 成立时 lo 必已写入（零撕裂）；
-    // 反序会读到 (新 hi, 旧 lo=0) → decode 出错法线 1 帧
-    atomicStore(&vis_norm[idx * 2u + 1u], enc);
-    atomicStore(&vis_norm[idx * 2u], tag);
-  }
-  return n_world;
+  let n_local = implicit_normal_local(gg, v_local);
+  return normalize(n_local.x * gg.col0 + n_local.y * gg.col1 + n_local.z * gg.col2);
 }
 
-// 太阳遮挡判定（带缓存）。未算 → 从体素受光面中心投唯一一条阴影射线并插入。
-fn vis_sun_blocked(obj_id: i32, p_world: vec3<f32>, n: vec3<f32>) -> bool {
-  let l_axis = light_u.lights[0].kind_pos_dir.yzw;
-  if (vis_meta.enabled == 0u) {
-    // 旁路：沿用旧逐像素路径（命中点 + 面法线偏移投射线）
-    let o = p_world + n * SHADOW_BIAS;
-    let sh = trace_scene(o, l_axis, SHADOW_DIR_T_MAX, 0.0, 3u);
-    return sh.uh.hit;
-  }
-  let v_local = vis_voxel_local(obj_id, p_world);
-  let k = vis_key(obj_id, v_local);
-  var st = vis_lookup(k);
-  if (st == 0u) {
-    let fd = -l_axis;
-    let an = abs(fd);
-    var nf = vec3<f32>(0.0);
-    if (an.x >= max(an.y, an.z)) {
-      nf = vec3<f32>(select(-1.0, 1.0, fd.x >= 0.0), 0.0, 0.0);
-    } else if (an.y >= an.z) {
-      nf = vec3<f32>(0.0, select(-1.0, 1.0, fd.y >= 0.0), 0.0);
-    } else {
-      nf = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, fd.z >= 0.0));
-    }
-    // 局部受光面中心 → 世界
-    let fc_local = vec3<f32>(v_local) + vec3<f32>(0.5) + nf * 0.5;
-    var o_world: vec3<f32>;
-    if (obj_id < 0) {
-      o_world = fc_local + nf * SHADOW_BIAS;
-    } else {
-      let gg = make_grid(u32(obj_id) + 1u);
-      let rows = mat3x3<f32>(
-        vec3<f32>(gg.col0.x, gg.col1.x, gg.col2.x),
-        vec3<f32>(gg.col0.y, gg.col1.y, gg.col2.y),
-        vec3<f32>(gg.col0.z, gg.col1.z, gg.col2.z),
-      );
-      o_world = gg.pos + (rows * fc_local) * gg.scale + nf * SHADOW_BIAS;
-    }
-    let sh = trace_scene(o_world, l_axis, SHADOW_DIR_T_MAX, 0.0, 3u);
-    st = select(2u, 1u, sh.uh.hit);
-    vis_insert(k, st);
-  }
-  return st == 1u;
-}
-
-// 场景级命中：UnifiedHit + 命中 volume 的 palette 基址（shade_hit 取材质用）
+// 场景级命中：UnifiedHit + 命中 volume 的 palette 基址（dda_main 取 albedo 用）
 struct SceneHit {
   uh: UnifiedHit,
   palette_base: u32,
 }
 
-// 主世界先跑 + 逐物体收缩 t_cap 取最近命中（主射线/阴影射线共用）。
-// 物体循环不被世界 miss 短路：天空背景前的物体必须可见，阴影射线必须被物体遮挡。
+// 主世界先跑 + 逐物体收缩 t_cap 取最近命中（beam 预 pass 与 dda_main 主射线共用）。
+// 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
 fn trace_scene(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
   var best_t = 1e+30;
   // P1：g0 只构造一次（旧代码 make_grid(0u) 调两次 = 144B GridDesc 双读）
@@ -1088,52 +893,6 @@ fn trace_scene(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_
     }
   }
   return best;
-}
-
-// 直光着色（CPU 镜像 cpu_reference_shade_hit）：sky 渐变环境光 + 太阳硬阴影 + emissive 直出。
-// 返回 pre-exposure 线性辐射度：DDGI probe 端点着色必须存 pre-exposure 值（曝光只在
-// 最终合成施加一次，否则 EMA 累积会把曝光平方化）；dda_main 走 shade_hit 包装乘曝光。
-fn shade_hit_linear(origin: vec3<f32>, dir: vec3<f32>, hit: SceneHit) -> vec3<f32> {
-  let p = origin + dir * hit.uh.t;
-  // per-voxel implicit normal（Douglas #22：6 邻域差分一体素一法线 → 一体素一色）。
-  // 面法线（hit.uh.n）仅作差分退化 fallback 与 debug 可视化；跨面不再变明暗。
-  let v_local = vis_voxel_local(hit.uh.obj_id, p);
-  let n = vis_normal(hit.uh.obj_id, v_local, hit.uh.face_id);
-  let base = palette_albedo(hit.palette_base, hit.uh.pal);
-  let emissive = palette_emissive(hit.palette_base, hit.uh.pal);
-
-  // sky 渐变环境光（按法线 y 混合地平线/天顶，smoothstep(0.35)）
-  let h = clamp(n.y, 0.0, 1.0);
-  let x = clamp(h / 0.35, 0.0, 1.0);
-  let t_sky = x * x * (3.0 - 2.0 * x);
-  let sky_grad = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
-  var col = base * (light_u.g.ambient.xyz * 0.4 + sky_grad * 0.6);
-
-  // 方向光硬阴影（1 条射线，不通即阴影；无点光源/无软阴影/无 NEE）
-  // 逐体素直光（Douglas #19）：vis 按体素受光面唯一射线判定 + 缓存复用
-  if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
-    let l_axis = light_u.lights[0].kind_pos_dir.yzw;
-    let ndl = max(dot(n, l_axis), 0.0);
-    if (ndl > 0.0) {
-      let blocked = vis_sun_blocked(hit.uh.obj_id, p, n);
-      let vis = select(1.0, 0.0, blocked);
-      let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-      col = col + base * sun_c * (ndl * vis);
-    }
-  }
-
-  // 发光体素 radiance 直出（无方向性、不受阴影）
-  col = col + base * (emissive * EMISSIVE_EMIT_GAIN);
-  // DDGI 间接光（R3-10 spike 4）：探针三线性采样的入射辐射度 × albedo。
-  // probe 射线端点也走本函数 → 自动采样上一帧 DDGI（自闭环 = 无限反弹）；
-  // 首帧 irradiance 为 0，随 EMA 收敛逐步填充。
-  col = col + base * sample_ddgi(p, n);
-  return col;
-}
-
-// 主射线着色：pre-exposure 线性辐射度 × 曝光（最终合成唯一曝光点）
-fn shade_hit(origin: vec3<f32>, dir: vec3<f32>, hit: SceneHit) -> vec3<f32> {
-  return shade_hit_linear(origin, dir, hit) * light_u.g.exposure_pad.x;
 }
 
 // 线性 → sRGB 转换
@@ -1205,12 +964,6 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  // debug_mode.w > 1.5（诊断模式）：跳过全部 trace，直接天空色输出
-  if (view_u.debug_mode.w > 1.5) {
-    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(vec3<f32>(0.52, 0.80, 1.0)), 1.0));
-    return;
-  }
-
   // ---- 反投影：像素中心 (gid + 0.5) → NDC (u, v) ∈ [-1, 1] ----
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
   let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
@@ -1225,21 +978,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir_fine = normalize(diff_world);
   let origin_fine = view_u.cam_pos_fine.xyz;
 
-  // debug_mode.w > 3.5（诊断模式）：只做 make_grid（读 GridDesc）不 trace
-  if (view_u.debug_mode.w > 3.5) {
-    let n = arrayLength(&grid_descs);
-    var sink = 0u;
-    for (var i: u32 = 0u; i < n; i = i + 1u) {
-      let gg = make_grid(i);
-      sink = sink + u32(gg.scale) + u32(gg.w_mn.x) + u32(gg.col2.z);
-    }
-    var col1 = vec3<f32>(0.52, 0.80, 1.0);
-    col1 = col1 + vec3<f32>(f32(sink & 1u) * 0.001);
-    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col1), 1.0));
-    return;
-  }
-
-  // ---- 场景 trace + 直光着色 ----
+  // ---- 场景 trace（P3 beam 起点跳过空空间）+ unlit 逐体素法线着色 ----
   // P3 beam：取当前像素 3×3 beam 邻域的最小命中 t 作为起点，跳过空空间。
   // beam 像素 = floor(全分辨率像素 / BEAM_DIV)；邻域 clamp 到 beam 边界。
   // lod.z > 0.5（GATE_NO_BEAM=1）：关闭 beam，t_min=0。
@@ -1266,217 +1005,24 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     t_min = max(t_min - BEAM_BACKOFF, 0.0);
   }
   let best = trace_scene(origin_fine, dir_fine, frustum_length, t_min, 3u);
-  if (view_u.debug_mode.w > 0.5 && view_u.debug_mode.w < 1.5) {
-    let alb = palette_albedo(best.palette_base, best.uh.pal);
-    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(alb), 1.0));
-    return;
-  }
+  // unlit（Devlog 23：hashmap 光照链 vis_table/vis_norm/gi_rad + direct/gi/denoise
+  // pass 因缓存噪声整条弃用，DDGI 探针光照待重新接线）：
+  //   miss → 天空渐变 + 太阳盘光晕；
+  //   命中 → albedo · (sky 环境 0.6 + ambient 0.4 + 太阳色 · max(0,N·L))，
+  //   法线 = 逐体素 6 邻域差分（voxel_normal_world，无缓存，Douglas #22 一体素一色）。
+  var col = sky_color(dir_fine);
   if (best.uh.hit) {
-    let col = shade_hit(origin_fine, dir_fine, best);
-    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
-  } else {
-    // 天空渐变 + 太阳盘光晕
-    textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(sky_color(dir_fine)), 1.0));
+    let alb = palette_albedo(best.palette_base, best.uh.pal);
+    let n = voxel_normal_world(best.uh.obj_id, best.uh.voxel);
+    let sun = max(dot(n, light_u.lights[0].kind_pos_dir.yzw), 0.0);
+    let h = clamp(n.y, 0.0, 1.0);
+    let x = clamp(h / 0.35, 0.0, 1.0);
+    let t_sky = x * x * (3.0 - 2.0 * x);
+    let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
+    let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * sun);
   }
+  textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
 }
 
-// ============================================================================
-// R3-10 DDGI 射线更新 pass（Majercik 2019 §4；CPU 镜像 ddgi.rs 数学函数）
-//
-// 1 workgroup = 1 探针，workgroup_size = 64（= DDGI_RAYS_PER_PROBE）；
-// 每帧 dispatch (probes_this_frame, 1, 1)，workgroup 环形轮转
-// （probe_id = (cycle_base + wid) % probe_count），固定射线预算不随屏上探针数波动。
-// 每线程：1 射线 trace_scene → 端点着色（sky / emissive 直出 / 直光 1-bounce）→
-// EMA 写 8×8 irradiance texel（1 ray ↔ 1 texel，方向 = irradiance oct texel 中心）
-// + 同方向 16×16 depth texel（漏光治理用，稀疏写；未写 texel 保持 tmax 远距初值）。
-// ============================================================================
-
-// 八面体编解码（Majercik 2019 §3；CPU 镜像 ddgi.rs oct_encode/oct_decode）
-fn oct_sign_not_zero(x: f32) -> f32 {
-  return select(-1.0, 1.0, x >= 0.0);
-}
-fn oct_encode(n: vec3<f32>) -> vec2<f32> {
-  let d = n / (abs(n.x) + abs(n.y) + abs(n.z));
-  if (d.z < 0.0) {
-    return vec2<f32>(
-      (1.0 - abs(d.y)) * oct_sign_not_zero(d.x),
-      (1.0 - abs(d.x)) * oct_sign_not_zero(d.y),
-    );
-  }
-  return vec2<f32>(d.x, d.y);
-}
-fn oct_decode(e: vec2<f32>) -> vec3<f32> {
-  var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
-  if (n.z < 0.0) {
-    let ox = (1.0 - abs(n.y)) * oct_sign_not_zero(n.x);
-    let oy = (1.0 - abs(n.x)) * oct_sign_not_zero(n.y);
-    n.x = ox;
-    n.y = oy;
-  }
-  return normalize(n);
-}
-// texel 中心 → 方向（边长 S）；ray 方向取自 irradiance 8×8 texel 中心
-fn oct_texel_dir(tx: u32, ty: u32, s: u32) -> vec3<f32> {
-  let e = (vec2<f32>(f32(tx), f32(ty)) + vec2<f32>(0.5)) / f32(s) * 2.0 - vec2<f32>(1.0);
-  return oct_decode(e);
-}
-// 方向 → depth 16×16 texel 下标（同方向映射，稀疏写）
-fn oct_texel_index(n: vec3<f32>, s: u32) -> vec2<u32> {
-  let e = oct_encode(n) * 0.5 + vec2<f32>(0.5);
-  let f = e * f32(s);
-  return vec2<u32>(
-    clamp(u32(i32(floor(f.x))), 0u, s - 1u),
-    clamp(u32(i32(floor(f.y))), 0u, s - 1u),
-  );
-}
-
-// ============================================================================
-// DDGI 着色采样（Majercik 2019 §5 + Rohacek §3.2/§3.3）
-// 最近 8 cell 三线性 × 锐利背面权重 × 漏光深度 chevron，归一化加权和。
-// 返回探针方向到达 p 点的入射辐射度（pre-exposure）；调用方乘 albedo。
-// ============================================================================
-
-// irradiance 8×8 单 texel
-fn ddgi_irr_fetch(id: u32, tx: u32, ty: u32) -> vec3<f32> {
-  return ddgi_irr[id * DDGI_IRR_STRIDE + ty * DDGI_IRR_TEXELS + tx].rgb;
-}
-// irradiance 八面体双线性采样（边界硬钳；八面体折缝处轻微接缝，spike 5 精修候选）
-fn ddgi_irr_sample(id: u32, d: vec3<f32>) -> vec3<f32> {
-  let e = oct_encode(d) * 0.5 + vec2<f32>(0.5);
-  let g = e * f32(DDGI_IRR_TEXELS) - vec2<f32>(0.5);
-  let g0 = vec2<i32>(floor(g));
-  let f = g - vec2<f32>(g0);
-  let x0 = clamp(g0.x, 0, i32(DDGI_IRR_TEXELS) - 1);
-  let y0 = clamp(g0.y, 0, i32(DDGI_IRR_TEXELS) - 1);
-  let x1 = clamp(g0.x + 1, 0, i32(DDGI_IRR_TEXELS) - 1);
-  let y1 = clamp(g0.y + 1, 0, i32(DDGI_IRR_TEXELS) - 1);
-  let c00 = ddgi_irr_fetch(id, u32(x0), u32(y0));
-  let c10 = ddgi_irr_fetch(id, u32(x1), u32(y0));
-  let c01 = ddgi_irr_fetch(id, u32(x0), u32(y1));
-  let c11 = ddgi_irr_fetch(id, u32(x1), u32(y1));
-  return mix(
-    mix(c00, c10, vec3<f32>(f.x)),
-    mix(c01, c11, vec3<f32>(f.x)),
-    vec3<f32>(f.y),
-  );
-}
-// depth 16×16 最近邻（保守剔除：不跨 texel 混合深度）
-fn ddgi_depth_sample(id: u32, d: vec3<f32>) -> f32 {
-  let e = oct_encode(d) * 0.5 + vec2<f32>(0.5);
-  let g = vec2<i32>(floor(e * f32(DDGI_DEPTH_TEXELS)));
-  let g0 = clamp(g, vec2<i32>(0), vec2<i32>(i32(DDGI_DEPTH_TEXELS) - 1));
-  return ddgi_depth[id * DDGI_DEPTH_STRIDE + u32(g0.y) * DDGI_DEPTH_TEXELS + u32(g0.x)];
-}
-
-// 世界点 p（表面法线 n）的 DDGI 间接入射辐射度；无探针/全剔除 → 0
-fn sample_ddgi(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-  if (ddgi.probe_count == 0u) { return vec3<f32>(0.0); }
-  let cell_f = p / vec3<f32>(DDGI_CELL);
-  let c0 = floor(cell_f);
-  let f = cell_f - c0;
-  let dims = ddgi.grid_dims.xyz;
-  var total = vec3<f32>(0.0);
-  var wsum = 0.0;
-  for (var iz = 0i; iz < 2; iz = iz + 1i) {
-    for (var iy = 0i; iy < 2; iy = iy + 1i) {
-      for (var ix = 0i; ix < 2; ix = ix + 1i) {
-        let corner = c0 + vec3<f32>(f32(ix), f32(iy), f32(iz));
-        let rel = corner - ddgi.grid_origin.xyz;
-        if (any(rel < vec3<f32>(0.0)) || any(rel >= dims)) { continue; }
-        let ru = vec3<u32>(rel);
-        let ci = ru.x + ru.y * u32(dims.x) + ru.z * u32(dims.x) * u32(dims.y);
-        let id = ddgi_cell[ci];
-        if (id == DDGI_NO_PROBE) { continue; }
-        // 三线性权重（corner=(c0+1) 取 f，否则 1-f）
-        let wtri = select(1.0 - f.x, f.x, ix == 1i)
-                 * select(1.0 - f.y, f.y, iy == 1i)
-                 * select(1.0 - f.z, f.z, iz == 1i);
-        if (wtri <= 1e-6) { continue; }
-        let probe = ddgi_pos[id].xyz;
-        let to = p - probe;
-        let dist = length(to);
-        let dir = to / max(dist, 1e-4);
-        // 锐利背面剔除（Rohacek §3.2）：探针在表面后侧 → 权重 0（穿墙不漏光）
-        let wn = clamp(dot(n, dir) / DDGI_NORMAL_BIAS, 0.0, 1.0);
-        if (wn <= 0.0) { continue; }
-        // 漏光 chevron（Rohacek §3.3 / Majercik §5）：
-        // dtex = 探针沿 dir 到最近几何距离；墙在探针与 p 之间（dtex < dist）→ 降权/剔除
-        let dtex = ddgi_depth_sample(id, dir);
-        let wd = clamp((dtex - dist) / DDGI_DEPTH_BIAS + 0.5, 0.0, 1.0);
-        if (wd <= 0.0) { continue; }
-        let irr = ddgi_irr_sample(id, dir);
-        let w = wtri * wn * wd;
-        total = total + irr * w;
-        wsum = wsum + w;
-      }
-    }
-  }
-  if (wsum < 1e-4) { return vec3<f32>(0.0); }
-  return total / wsum;
-}
-
-// Fibonacci 球方向（Majercik 2019 §4；CPU 镜像 ddgi.rs fibonacci_dir）
-// 当前射线方向直接取 oct texel 中心（1 ray ↔ 1 texel），本函数保留给后续
-// 帧间相位旋转/蓝噪声抖动（R3-14）。
-fn fibonacci_dir(i: u32, n: u32) -> vec3<f32> {
-  let golden = 3.14159265359 * (3.0 - sqrt(5.0));
-  let y = 1.0 - (2.0 * f32(i) + 1.0) / f32(n);
-  let r = sqrt(max(1.0 - y * y, 0.0));
-  let a = golden * f32(i);
-  return vec3<f32>(r * cos(a), y, r * sin(a));
-}
-
-// probe 射线端点着色（ddgi.rs 模块头契约）：
-//   sky 命中 → sky() 渐变；emissive 体素 → albedo × emissive × GAIN（gate 通电照亮暗室）；
-//   普通命中 → 直光着色（太阳硬阴影 + sky 环境，1-bounce；pre-exposure）。
-// 上一帧 DDGI 自闭环（无限反弹）在 spike 4 采样函数落地后接入。
-fn probe_endpoint_shade(origin: vec3<f32>, rd: vec3<f32>, sh: SceneHit) -> vec3<f32> {
-  let emissive = palette_emissive(sh.palette_base, sh.uh.pal);
-  if (emissive > 0.0) {
-    let albedo = palette_albedo(sh.palette_base, sh.uh.pal);
-    return albedo * (emissive * EMISSIVE_EMIT_GAIN);
-  }
-  return shade_hit_linear(origin, rd, sh);
-}
-
-@compute @workgroup_size(DDGI_RAYS_PER_PROBE, 1, 1)
-fn ddgi_update(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(workgroup_id) wid: vec3<u32>,
-) {
-  if (ddgi.probe_count == 0u) { return; }
-  let wg = wid.x;
-  if (wg >= ddgi.probes_this_frame) { return; }
-  let ray = gid.x;  // 0..63
-  let probe_id = (ddgi.cycle_base + wg) % ddgi.probe_count;
-  let origin = ddgi_pos[probe_id].xyz;
-
-  // 射线方向 = irradiance 8×8 texel 中心（1 ray ↔ 1 texel）
-  let tx = ray % DDGI_IRR_TEXELS;
-  let ty = ray / DDGI_IRR_TEXELS;
-  let rd = oct_texel_dir(tx, ty, DDGI_IRR_TEXELS);
-
-  let t_max = ddgi.cell_tmax_alpha.y;
-  let sh = trace_scene(origin, rd, t_max, 0.0, 3u);
-
-  var radiance: vec3<f32>;
-  var dist: f32 = t_max;
-  if (sh.uh.hit) {
-    dist = sh.uh.t;
-    radiance = probe_endpoint_shade(origin, rd, sh);
-  } else {
-    radiance = sky_color(rd);
-  }
-
-  // ---- irradiance EMA（8×8，texel 与射线 1:1）----
-  let irr_idx = probe_id * DDGI_IRR_STRIDE + ray;
-  let old = ddgi_irr[irr_idx];
-  let alpha = ddgi.cell_tmax_alpha.z;
-  ddgi_irr[irr_idx] = vec4<f32>(mix(old.rgb, radiance, vec3<f32>(alpha)), 1.0);
-
-  // ---- depth EMA（16×16，同方向 oct 映射；稀疏 texel 保持 tmax 初值）----
-  let dt = oct_texel_index(rd, DDGI_DEPTH_TEXELS);
-  let d_idx = probe_id * DDGI_DEPTH_STRIDE + dt.y * DDGI_DEPTH_TEXELS + dt.x;
-  ddgi_depth[d_idx] = mix(ddgi_depth[d_idx], dist, alpha);
-}
 

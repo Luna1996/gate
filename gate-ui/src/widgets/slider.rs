@@ -1,7 +1,10 @@
-//! slider：SliderValue + clamp/step + 拖动 + accent 填充视觉。
+//! slider：SliderValue + clamp/step + 拖动 + 强调填充视觉（docs/ui-dark-theme.md §5.4）。
 //!
 //! 拖动逻辑复用 bevy_ui `RelativeCursorPosition`（ui_focus_system 自动更新）；
 //! 归一化坐标以节点中心为原点（-0.5..0.5），映射到 0..1。
+//! 视觉：4px 抬升表面轨道槽 + 强调填充段；16px 顶层表面滑块（拖拽放大到 18px）。
+
+use std::ops::Deref;
 
 use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, Interaction, RelativeCursorPosition};
@@ -41,8 +44,50 @@ pub struct SliderFill;
 #[derive(Component, Debug, Default)]
 pub struct SliderThumb;
 
-const THUMB_SIZE: f32 = 14.0;
-const TRACK_HEIGHT: f32 = 6.0;
+/// 滑杆句柄（Deref 到根实体 Entity）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SliderHandle(pub Entity);
+
+impl Deref for SliderHandle {
+  type Target = Entity;
+  fn deref(&self) -> &Entity {
+    &self.0
+  }
+}
+
+impl From<SliderHandle> for Entity {
+  fn from(h: SliderHandle) -> Entity {
+    h.0
+  }
+}
+
+/// 滑杆配置（全部字段进 Config；Default = [0,1] 连续、初值 0）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SliderConfig {
+  pub min: f32,
+  pub max: f32,
+  pub value: f32,
+  pub step: Option<f32>,
+}
+
+impl Default for SliderConfig {
+  fn default() -> Self {
+    Self { min: 0.0, max: 1.0, value: 0.0, step: None }
+  }
+}
+
+/// 滑杆值变化事件（仅用户拖动产生的变化触发；EntityEvent，target = 滑杆根实体）。
+/// 组件 [`SliderValue`] 仍是真源，事件只是通知，主动读值可 Query。
+#[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
+pub struct SliderValueChanged {
+  pub entity: Entity,
+  pub value: f32,
+}
+
+const THUMB_SIZE: f32 = 16.0;
+/// 拖拽中滑块放大尺寸
+const THUMB_SIZE_DRAG: f32 = 18.0;
+const TRACK_HEIGHT: f32 = 4.0;
 
 /// clamp + step 归一（纯函数）
 pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {
@@ -55,26 +100,19 @@ pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {
 }
 
 /// 主题滑杆（横向；宽度由父容器 flex 决定，最小 120px）
-#[allow(clippy::too_many_arguments)]
-pub fn slider(
-  ctx: &UiCtx,
-  parent: &mut ChildSpawner,
-  min: f32,
-  max: f32,
-  value: f32,
-  step: Option<f32>,
-) -> Entity {
+pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> SliderHandle {
   let c = &ctx.theme.colors;
-  let v = clamp_step(value, min, max, step);
-  let norm = normalize(v, min, max);
-  parent
+  let m = &ctx.theme.metrics;
+  let v = clamp_step(config.value, config.min, config.max, config.step);
+  let norm = normalize(v, config.min, config.max);
+  let e = parent
     .spawn((
       Name::new("ui-slider"),
       UiSlider,
       Interaction::default(),
       RelativeCursorPosition::default(),
-      SliderRange { min, max },
-      SliderStep(step),
+      SliderRange { min: config.min, max: config.max },
+      SliderStep(config.step),
       SliderValue(v),
       Node {
         min_width: px(120.0),
@@ -85,20 +123,19 @@ pub fn slider(
       FocusPolicy::Block,
     ))
     .with_children(|root| {
-      // 轨道
+      // 轨道槽（抬升表面，无圆角）
       root
         .spawn((
           Name::new("ui-slider-track"),
           Node {
             flex_grow: 1.0,
             height: px(TRACK_HEIGHT),
-            border_radius: BorderRadius::all(px(TRACK_HEIGHT / 2.0)),
             ..default()
           },
-          BackgroundColor(color_of(&c.panel_border)),
+          BackgroundColor(color_of(&c.surface_elevated)),
         ))
         .with_children(|track| {
-          // 填充
+          // 填充段（强调色，无圆角）
           track.spawn((
             Name::new("ui-slider-fill"),
             SliderFill,
@@ -108,13 +145,12 @@ pub fn slider(
               top: Val::ZERO,
               bottom: Val::ZERO,
               width: Val::Percent(norm * 100.0),
-              border_radius: BorderRadius::all(px(TRACK_HEIGHT / 2.0)),
               ..default()
             },
-            BackgroundColor(color_of(&c.accent)),
+            BackgroundColor(color_of(&c.accent_fill)),
           ));
         });
-      // 滑块（绝对定位，margin 负半宽居中）
+      // 滑块（顶层表面 + 提亮边框；方形，无圆角；绝对定位，margin 负半宽居中）
       root.spawn((
         Name::new("ui-slider-thumb"),
         SliderThumb,
@@ -124,14 +160,15 @@ pub fn slider(
           margin: UiRect::left(Val::Px(-THUMB_SIZE / 2.0)),
           width: px(THUMB_SIZE),
           height: px(THUMB_SIZE),
-          border_radius: BorderRadius::MAX,
+          border: UiRect::all(px(m.border_width)),
           ..default()
         },
-        BackgroundColor(color_of(&c.text)),
-        BorderColor::all(color_of(&c.accent)),
+        BackgroundColor(color_of(&c.surface_top)),
+        BorderColor::all(color_of(&c.border_strong)),
       ));
     })
-    .id()
+    .id();
+  SliderHandle(e)
 }
 
 fn normalize(v: f32, min: f32, max: f32) -> f32 {
@@ -142,9 +179,12 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
   }
 }
 
-/// 拖动：按下时把光标归一化 x（-0.5..0.5 中心原点）映射为值（每帧重算）
+/// 拖动：按下时把光标归一化 x（-0.5..0.5 中心原点）映射为值（每帧重算）；
+/// 值变化时触发 [`SliderValueChanged`]（仅用户拖动，程序写 SliderValue 不触发）
 pub fn slider_drag_system(
+  mut commands: Commands,
   mut q: Query<(
+    Entity,
     &Interaction,
     &RelativeCursorPosition,
     &SliderRange,
@@ -152,7 +192,7 @@ pub fn slider_drag_system(
     &mut SliderValue,
   )>,
 ) {
-  for (inter, rcp, range, step, mut val) in &mut q {
+  for (e, inter, rcp, range, step, mut val) in &mut q {
     if *inter != Interaction::Pressed {
       continue;
     }
@@ -162,23 +202,35 @@ pub fn slider_drag_system(
     let v = clamp_step(target, range.min, range.max, step.0);
     if (val.0 - v).abs() > f32::EPSILON {
       val.0 = v;
+      commands.trigger(SliderValueChanged { entity: e, value: v });
     }
   }
 }
 
-/// 视觉：填充宽度 + 滑块位置跟随 SliderValue
+/// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px
 pub fn slider_visual_system(
-  mut q_root: Query<(&SliderValue, &SliderRange, &Children), With<UiSlider>>,
+  mut q_root: Query<
+    (&SliderValue, &SliderRange, &Interaction, &Children),
+    With<UiSlider>,
+  >,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
   mut thumbs: Query<&mut Node, With<SliderThumb>>,
 ) {
-  for (val, range, children) in &mut q_root {
+  for (val, range, inter, children) in &mut q_root {
     let pct = normalize(val.0, range.min, range.max) * 100.0;
+    let thumb_size = if *inter == Interaction::Pressed {
+      THUMB_SIZE_DRAG
+    } else {
+      THUMB_SIZE
+    };
     for child in children.iter() {
       if let Ok(mut node) = fills.get_mut(child) {
         node.width = Val::Percent(pct);
       } else if let Ok(mut node) = thumbs.get_mut(child) {
         node.left = Val::Percent(pct);
+        node.width = px(thumb_size);
+        node.height = px(thumb_size);
+        node.margin = UiRect::left(Val::Px(-thumb_size / 2.0));
       }
     }
   }
@@ -211,9 +263,10 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(slider(&ctx, p, 0.0, 100.0, 25.0, Some(5.0)));
+      child = Some(slider(&ctx, p, SliderConfig { min: 0.0, max: 100.0, value: 25.0, step: Some(5.0) }));
     });
-    let e = child.expect("slider spawned");
+    let h = child.expect("slider spawned");
+    let e = *h;
     let w = app.world();
     assert_eq!(
       w.get::<SliderValue>(e).unwrap().0,
@@ -225,9 +278,16 @@ mod tests {
   }
 
   #[test]
-  fn slider_drag_updates_value() {
+  fn slider_drag_updates_value_and_emits_event() {
+    use std::sync::{Arc, Mutex};
+
     let mut app = App::new();
     app.add_systems(Update, slider_drag_system);
+    let events = Arc::new(Mutex::new(Vec::<(Entity, f32)>::new()));
+    let sink = events.clone();
+    app.add_observer(move |ev: On<SliderValueChanged>| {
+      sink.lock().unwrap().push((ev.entity, ev.value));
+    });
     let e = app
       .world_mut()
       .spawn((
@@ -245,8 +305,13 @@ mod tests {
     app.update();
     // x=0.25（中心原点）→ norm=0.75
     assert!((app.world().get::<SliderValue>(e).unwrap().0 - 0.75).abs() < 1e-6);
+    assert_eq!(
+      *events.lock().unwrap(),
+      vec![(e, 0.75)],
+      "value change emits SliderValueChanged"
+    );
 
-    // 未按下不更新
+    // 未按下不更新，也不发事件
     app
       .world_mut()
       .get_mut::<Interaction>(e)
@@ -259,6 +324,7 @@ mod tests {
       .normalized = Some(Vec2::new(-0.5, 0.0));
     app.update();
     assert!((app.world().get::<SliderValue>(e).unwrap().0 - 0.75).abs() < 1e-6);
+    assert_eq!(events.lock().unwrap().len(), 1, "no event when not pressed");
   }
 
   #[test]
@@ -271,6 +337,7 @@ mod tests {
         UiSlider,
         SliderValue(0.5),
         SliderRange::default(),
+        Interaction::default(),
         Children::default(),
       ))
       .id();

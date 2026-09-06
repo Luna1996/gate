@@ -68,44 +68,99 @@ impl<'de> Deserialize<'de> for HexColor {
 
 // ---------- 主题结构 ----------
 
-/// 颜色组（FR-1）。全部带 alpha。
+/// 颜色组（docs/ui-dark-theme.md §2）。全部带 alpha。
+///
+/// 暗色令牌：5 层表面（亮度即海拔）+ HUD 半透明变体 + 3 档边框 + 4 档文字
+/// + 单一强调蓝（填充三态 + 文字/线条一档）+ 降饱和语义色。
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeColors {
-  pub panel_bg: HexColor,
-  pub panel_border: HexColor,
-  pub text: HexColor,
+  // ---- 表面 5 层（L0 基底 → L4 顶层，每层亮约 3-4%）----
+  pub surface_base: HexColor,
+  pub surface_card: HexColor,
+  pub surface_elevated: HexColor,
+  pub surface_overlay: HexColor,
+  pub surface_top: HexColor,
+  /// HUD 半透明卡片（浮在 3D 场景上，alpha 下限 90%）
+  pub surface_card_hud: HexColor,
+  /// 模态遮罩
+  pub scrim: HexColor,
+  // ---- 边框 3 档（1px）----
+  pub border_subtle: HexColor,
+  pub border: HexColor,
+  pub border_strong: HexColor,
+  // ---- 文字 4 档（禁纯白）----
+  pub text_primary: HexColor,
+  pub text_body: HexColor,
   pub text_muted: HexColor,
-  pub accent: HexColor,
-  pub accent_hover: HexColor,
-  pub accent_pressed: HexColor,
+  /// 仅限 ≥18px 大号弱化标签
+  pub text_faint: HexColor,
+  // ---- 强调色（全灰度：主操作靠亮度差区分，无任何彩色）----
+  /// 主按钮填充（最亮表面，靠亮度突出主操作）
+  pub accent_fill: HexColor,
+  /// 主按钮 hover 填充（提亮一档）
+  pub accent_fill_hover: HexColor,
+  /// 主按钮按压填充（压暗）
+  pub accent_fill_pressed: HexColor,
+  /// 强调文字/图标/折线（主文本色，最高对比）
+  pub accent_text: HexColor,
+  // ---- 语义色（全灰度：仅靠亮度差区分，无彩色）----
+  /// success 文字 = 正文灰
   pub success: HexColor,
+  /// success 填充 = 抬升表面
+  pub success_fill: HexColor,
+  /// warning 文字 = 说明灰
   pub warning: HexColor,
+  /// warning 填充 = 卡片表面
+  pub warning_fill: HexColor,
+  /// danger 文字 = 主文本色
   pub danger: HexColor,
+  /// danger 填充 = 强边框灰（最深灰表示危险态）
+  pub danger_fill: HexColor,
 }
 
 impl Default for ThemeColors {
   fn default() -> Self {
     Self {
-      panel_bg: HexColor("1E1E2ECC".into()),
-      panel_border: HexColor("45475ACC".into()),
-      text: HexColor("CDD6F4".into()),
-      text_muted: HexColor("9399B2".into()),
-      accent: HexColor("89B4FA".into()),
-      accent_hover: HexColor("74C7EC".into()),
-      accent_pressed: HexColor("7287FD".into()),
-      success: HexColor("A6E3A1".into()),
-      warning: HexColor("F9E2AF".into()),
-      danger: HexColor("F38BA8".into()),
+      surface_base: HexColor("09090B".into()),
+      surface_card: HexColor("131316".into()),
+      surface_elevated: HexColor("1A1A20".into()),
+      surface_overlay: HexColor("222228".into()),
+      surface_top: HexColor("2A2A31".into()),
+      // HUD 面板不透明（与卡片同色，靠边框与场景分隔）
+      surface_card_hud: HexColor("131316".into()),
+      scrim: HexColor("09090B".into()),
+      border_subtle: HexColor("232329".into()),
+      border: HexColor("2A2A31".into()),
+      border_strong: HexColor("3F3F46".into()),
+      text_primary: HexColor("FAFAFA".into()),
+      text_body: HexColor("D4D4D8".into()),
+      text_muted: HexColor("A1A1AA".into()),
+      text_faint: HexColor("71717A".into()),
+      // 强调全灰度：主操作靠最亮表面突出
+      accent_fill: HexColor("2A2A31".into()),
+      accent_fill_hover: HexColor("3F3F46".into()),
+      accent_fill_pressed: HexColor("1A1A20".into()),
+      accent_text: HexColor("FAFAFA".into()),
+      // 语义全灰度
+      success: HexColor("D4D4D8".into()),
+      success_fill: HexColor("1A1A20".into()),
+      warning: HexColor("A1A1AA".into()),
+      warning_fill: HexColor("131316".into()),
+      danger: HexColor("FAFAFA".into()),
+      danger_fill: HexColor("3F3F46".into()),
     }
   }
 }
 
-/// 度量组（FR-1）
+/// 度量组（FR-1 + docs/ui-dark-theme.md §3）
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeMetrics {
+  /// 容器圆角：面板、按钮、弹窗（rounded-lg）
   pub corner_radius: f32,
+  /// 小控件圆角：checkbox、slider thumb、标签 chip
+  pub corner_radius_sm: f32,
   pub border_width: f32,
   pub spacing: Spacing,
   pub font_size: FontSize,
@@ -114,7 +169,9 @@ pub struct ThemeMetrics {
 impl Default for ThemeMetrics {
   fn default() -> Self {
     Self {
-      corner_radius: 8.0,
+      // 无圆角：硬边界面，靠 1px 边框与亮度差分层级
+      corner_radius: 0.0,
+      corner_radius_sm: 0.0,
       border_width: 1.0,
       spacing: Spacing::default(),
       font_size: FontSize::default(),
@@ -448,10 +505,13 @@ impl Plugin for GateUiPlugin {
           ui_scale_autofit,
           crate::widgets::button_state_system,
           crate::widgets::checkbox_state_system,
+          crate::widgets::toggle_switch_state_system,
           crate::widgets::slider_drag_system,
           crate::widgets::slider_visual_system,
           crate::widgets::ring_list_sync_system,
           crate::widgets::plot_redraw_system,
+          crate::widgets::scroll_view_system,
+          crate::widgets::tab_view_system,
           crate::capture::ui_pointer_capture_system,
           crate::world_anchor::world_anchor_apply_text.after(ui_theme_font_install_default),
           crate::world_anchor::world_anchor_system,
@@ -471,16 +531,30 @@ mod tests {
     let t = default_theme();
     let c = &t.colors;
     for (name, hc) in [
-      ("panel_bg", &c.panel_bg),
-      ("panel_border", &c.panel_border),
-      ("text", &c.text),
+      ("surface_base", &c.surface_base),
+      ("surface_card", &c.surface_card),
+      ("surface_elevated", &c.surface_elevated),
+      ("surface_overlay", &c.surface_overlay),
+      ("surface_top", &c.surface_top),
+      ("surface_card_hud", &c.surface_card_hud),
+      ("scrim", &c.scrim),
+      ("border_subtle", &c.border_subtle),
+      ("border", &c.border),
+      ("border_strong", &c.border_strong),
+      ("text_primary", &c.text_primary),
+      ("text_body", &c.text_body),
       ("text_muted", &c.text_muted),
-      ("accent", &c.accent),
-      ("accent_hover", &c.accent_hover),
-      ("accent_pressed", &c.accent_pressed),
+      ("text_faint", &c.text_faint),
+      ("accent_fill", &c.accent_fill),
+      ("accent_fill_hover", &c.accent_fill_hover),
+      ("accent_fill_pressed", &c.accent_fill_pressed),
+      ("accent_text", &c.accent_text),
       ("success", &c.success),
+      ("success_fill", &c.success_fill),
       ("warning", &c.warning),
+      ("warning_fill", &c.warning_fill),
       ("danger", &c.danger),
+      ("danger_fill", &c.danger_fill),
     ] {
       assert!(
         hc.to_color().is_some(),
@@ -495,11 +569,12 @@ mod tests {
     let src = r#"
 (
     colors: (
-        panel_bg: "1E1E2ECC",
-        accent: "89B4FA",
+        surface_card: "141414",
+        accent_text: "60A5FA",
     ),
     metrics: (
         corner_radius: 6.0,
+        corner_radius_sm: 3.0,
         spacing: (xs: 2.0, sm: 4.0, md: 8.0, lg: 16.0),
     ),
     ui_scale: 1.25,
@@ -508,8 +583,10 @@ mod tests {
 )
 "#;
     let t = parse_theme_ron(src).expect("valid theme.ron should parse");
-    assert_eq!(t.colors.accent.0, "89B4FA");
+    assert_eq!(t.colors.surface_card.0, "141414");
+    assert_eq!(t.colors.accent_text.0, "60A5FA");
     assert_eq!(t.metrics.corner_radius, 6.0);
+    assert_eq!(t.metrics.corner_radius_sm, 3.0);
     // 未写字段回默认
     assert_eq!(t.colors.danger, ThemeColors::default().danger);
     assert_eq!(t.metrics.font_size, FontSize::default());
@@ -524,7 +601,7 @@ mod tests {
 
   #[test]
   fn bad_hex_rejected() {
-    let r: Result<UiTheme, _> = ron::de::from_str("( colors: ( accent: \"XYZ\" ) )");
+    let r: Result<UiTheme, _> = ron::de::from_str("( colors: ( accent_fill: \"XYZ\" ) )");
     assert!(
       r.is_err(),
       "invalid hex must be rejected at deserialize time"

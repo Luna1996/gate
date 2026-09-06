@@ -1,20 +1,43 @@
-// gate-ui 主题令牌 —— Modern UI 暗色（与内置默认主题一致的数据化镜像，可改此文件换肤）
+// gate-ui 主题令牌 —— 暗色设计规格（docs/ui-dark-theme.md）
 // 颜色格式："RRGGBB"（alpha=FF）或 "RRGGBBAA"；字段缺失回退内置默认
+// 全灰度：无任何彩色，强调/语义色均靠亮度差区分。彩色由调用方手动传入。
 (
   colors: (
-    panel_bg: "1E1E2ECC",
-    panel_border: "45475ACC",
-    text: "CDD6F4",
-    text_muted: "9399B2",
-    accent: "89B4FA",
-    accent_hover: "74C7EC",
-    accent_pressed: "7287FD",
-    success: "A6E3A1",
-    warning: "F9E2AF",
-    danger: "F38BA8",
+    // 表面 5 层（亮度即海拔，每层亮约 3-4%，1px 边框分隔，永不用纯黑）
+    surface_base:      "09090B",
+    surface_card:      "131316",
+    surface_elevated:  "1A1A20",
+    surface_overlay:   "222228",
+    surface_top:       "2A2A31",
+    // HUD 面板不透明（与卡片同色，靠边框与场景分隔）
+    surface_card_hud:  "131316",
+    scrim:             "09090B",
+    // 边框 3 档
+    border_subtle:     "232329",
+    border:            "2A2A31",
+    border_strong:     "3F3F46",
+    // 文字 4 档（禁纯白；text_faint 仅限 ≥18px 大号标签）
+    text_primary:      "FAFAFA",
+    text_body:         "D4D4D8",
+    text_muted:        "A1A1AA",
+    text_faint:        "71717A",
+    // 强调色（全灰度：主操作靠最亮表面突出）
+    accent_fill:         "2A2A31",
+    accent_fill_hover:   "3F3F46",
+    accent_fill_pressed: "1A1A20",
+    accent_text:         "FAFAFA",
+    // 语义色（全灰度：仅靠亮度差区分）
+    success:           "D4D4D8",
+    success_fill:      "1A1A20",
+    warning:           "A1A1AA",
+    warning_fill:      "131316",
+    danger:            "FAFAFA",
+    danger_fill:       "3F3F46",
   ),
   metrics: (
-    corner_radius: 8.0,
+    // 无圆角：硬边界面，靠 1px 边框与亮度差分层级
+    corner_radius: 0.0,
+    corner_radius_sm: 0.0,
     border_width: 1.0,
     spacing: (xs: 4.0, sm: 8.0, md: 12.0, lg: 16.0),
     font_size: (sm: 12.0, md: 14.0, lg: 18.0),

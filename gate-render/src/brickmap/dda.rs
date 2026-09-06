@@ -914,12 +914,15 @@ pub fn cpu_reference_dda_ray_two_level(
 //   trace_volume_tree  ↔ trace_grid 的局部 slab + chunk 间 256³ A&W 段
 // ============================================================================
 
-/// 层次遍历命中记录（镜像 WGSL FineHit）：face_id 0..5 = ±xyz 六面。
+/// 层次遍历命中记录（镜像 WGSL FineHit/UnifiedHit）：face_id 0..5 = ±xyz 六面。
+/// voxel = 命中固体体素 grid 局部 fine 整数坐标——DDA 整数步进精确产出，
+/// 着色（per-voxel normal/GI key）直接消费，禁用「命中点 ± 法线半步」启发式重建。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TreeHit {
   pub t: f32,
   pub pal: u8,
   pub face_id: u8,
+  pub voxel: IVec3,
 }
 
 /// 镜像 WGSL face_index_from_normal：取最大分量轴，法向分量 ≥0 → 正面索引。
@@ -971,7 +974,7 @@ struct BrickCpu {
 ///
 /// chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 fine）；
 /// 射线段 [t0, t1]（ro 系绝对 t）；entry_face = 进入本 chunk 的面。
-/// 返回 (t, pal, face_id) 或 None（走出 chunk 未命中 / budget 耗尽）。
+/// 返回 (t, pal, face_id, chunk 局部命中体素 v) 或 None（走出 chunk 未命中 / budget 耗尽）。
 #[allow(clippy::too_many_arguments)]
 fn trace_chunk_cpu(
   b_struct: &[u32],
@@ -983,7 +986,7 @@ fn trace_chunk_cpu(
   t0: f32,
   t1: f32,
   entry_face: u8,
-) -> Option<(f32, u8, u8)> {
+) -> Option<(f32, u8, u8, [i32; 3])> {
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
   if t0 >= t1 {
     return None;
@@ -1032,7 +1035,7 @@ fn trace_chunk_cpu(
           let w = b_struct[b.addr + 3 + (idx >> 2)];
           let leaf_pal = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
           if leaf_pal != 0 {
-            return Some((cur_t, leaf_pal, face));
+            return Some((cur_t, leaf_pal, face, v));
           }
         }
         break; // 空气 leaf
@@ -1041,7 +1044,7 @@ fn trace_chunk_cpu(
       if b.mask & bit == 0 {
         // 统一子块：颜色 = 节点 palette（0=空气）
         if b.pal != 0 {
-          return Some((cur_t, b.pal, face));
+          return Some((cur_t, b.pal, face, v));
         }
         break; // 空气统一子块
       }
@@ -1053,7 +1056,7 @@ fn trace_chunk_cpu(
       // 节点（mask=0，pal 直决；叶层统一节点无 inline 16 字，禁读 addr+3 之后）
       if cb.mask == 0 {
         if cb.pal != 0 {
-          return Some((cur_t, cb.pal, face));
+          return Some((cur_t, cb.pal, face, v));
         }
         break;
       }
@@ -1118,11 +1121,11 @@ fn trace_chunk_cpu(
           let w = b_struct[b.addr + 3 + (idx >> 2)];
           let dp = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
           if dp != 0 {
-            return Some((cur_t, dp, face));
+            return Some((cur_t, dp, face, v));
           }
         } else if b.mask == 0 && b.pal != 0 {
           // 防御：uniform 叶（正常下钻快路径已处理）
-          return Some((cur_t, b.pal, face));
+          return Some((cur_t, b.pal, face, v));
         }
       } else {
         let mb = (b.mask & (1u64 << idx)) != 0;
@@ -1130,7 +1133,7 @@ fn trace_chunk_cpu(
           break; // 分裂子块 → 回 traverse 下钻
         }
         if b.pal != 0 {
-          return Some((cur_t, b.pal, face)); // 统一实体
+          return Some((cur_t, b.pal, face, v)); // 统一实体
         }
       }
       // 空气子块 → 回 loop 顶重选 min 轴继续
@@ -1246,7 +1249,7 @@ fn trace_volume_tree(
         ci[1] as f32 * 256.0,
         ci[2] as f32 * 256.0,
       ];
-      if let Some((t, pal, face_id)) = trace_chunk_cpu(
+      if let Some((t, pal, face_id, v)) = trace_chunk_cpu(
         view.b_struct(),
         chunk_base,
         chunk_min,
@@ -1257,7 +1260,9 @@ fn trace_volume_tree(
         t1,
         entry_face,
       ) {
-        return Some(TreeHit { t, pal, face_id });
+        // chunk 局部 v → grid 局部体素（镜像 WGSL trace_grid 的 ci*256 换算）
+        let voxel = IVec3::new(v[0], v[1], v[2]) + IVec3::new(ci[0], ci[1], ci[2]) * 256;
+        return Some(TreeHit { t, pal, face_id, voxel });
       }
     }
     if t_exit_c >= tl1 {
@@ -2074,6 +2079,15 @@ mod dda_ref_tests {
         (Some((tf, pf)), Some(h)) => {
           assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}", h.t);
           assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
+          // 命中体素固体性（voxel 显式携带的正确性门禁）：DDA 携带的 voxel 必须
+          // 恰是 palette 一致的固体体素——着色链（per-voxel normal/GI key）以它为准
+          let view = BrickMapView::new(&bufs);
+          assert_eq!(
+            view.get_voxel(h.voxel),
+            Some(h.pal),
+            "[{tag}] hit voxel {:?} not solid pal {pf} o={o:?} d={d:?}",
+            h.voxel
+          );
           let n = face_normal_from_index(h.face_id);
           assert!(
             n.dot(d) < 0.001,
@@ -2181,8 +2195,6 @@ struct DdaBg2BindGroup(BindGroup);
 #[derive(Resource)]
 struct DdaBg3BindGroup(BindGroup);
 #[derive(Resource)]
-struct DdaBg5BindGroup(BindGroup);
-#[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
 /// BG3 光池持久 GPU buffer（主题静态：prepare 覆写同 buffer，避免逐帧重分配）
@@ -2203,11 +2215,8 @@ struct DdaPipelines {
   bg1_layout: BindGroupLayoutDescriptor,
   bg2_layout: BindGroupLayoutDescriptor,
   bg3_layout: BindGroupLayoutDescriptor,
-  bg4_layout: BindGroupLayoutDescriptor,
-  bg5_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
   compute_pipeline: CachedComputePipelineId,
-  ddgi_pipeline: CachedComputePipelineId,
   beam_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
 }
@@ -2232,7 +2241,6 @@ impl Plugin for BrickMapDdaPlugin {
       return;
     };
     render_app
-      .add_plugins(crate::brickmap::vis_cache::VisCachePlugin)
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
       .add_systems(RenderStartup, init_dda_pipelines)
       .add_systems(
@@ -2325,13 +2333,6 @@ fn init_dda_pipelines(
     ),
   );
 
-  // ---- BG4：DDGI 探针（R3-10；meta + positions/cell_index + irradiance/depth rw）----
-  // 布局由 ddgi 模块定义（dda_main 采样只读、ddgi_update 写，同一 5 组布局两 pipeline 共用）
-  let bg4 = crate::ddgi::ddgi_bg4_layout();
-
-  // ---- BG5：逐体素直光可见性缓存（Douglas #19；rw 表 + meta uniform）----
-  let bg5 = super::vis_cache::vis_cache_bg5_layout();
-
   // ---- blit BG layout：storage texture（filterable 上采样采样）+ linear sampler ----
   let blit = BindGroupLayoutDescriptor::new(
     "DdaBlit",
@@ -2344,29 +2345,16 @@ fn init_dda_pipelines(
     ),
   );
 
-  // ---- Compute pipeline：dda.wgsl 两个入口（dda_main 主 trace+着色 / ddgi_update 探针更新）----
-  // 两入口共用 BG0-5 同一组布局
+  // ---- Compute pipeline：dda.wgsl 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
+  // Devlog 23：hashmap 光照链（vis_table/direct/gi/denoise）与 DDGI 探针更新 pass 已全部
+  // 拆除，两入口仅绑 BG0-3（输出+view/brickmap/grid_descs/光池）。
   let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
-  let layouts = vec![
-    bg0.clone(),
-    bg1.clone(),
-    bg2.clone(),
-    bg3.clone(),
-    bg4.clone(),
-    bg5.clone(),
-  ];
+  let layouts = vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone()];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
     layout: layouts.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("dda_main")),
-    ..default()
-  });
-  let ddgi = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_ddgi_update")),
-    layout: layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("ddgi_update")),
     ..default()
   });
   // P3 beam 预 pass：低分辨率输出最近命中 t，主 pass 取邻域 min t 跳过空空间
@@ -2406,11 +2394,8 @@ fn init_dda_pipelines(
     bg1_layout: bg1,
     bg2_layout: bg2,
     bg3_layout: bg3,
-    bg4_layout: bg4,
-    bg5_layout: bg5,
     blit_layout: blit,
     compute_pipeline: compute,
-    ddgi_pipeline: ddgi,
     beam_pipeline: beam,
     blit_pipeline,
   });
@@ -2428,7 +2413,6 @@ fn prepare_dda_bind_groups(
   gpu_brickmap: Option<Res<GpuBrickMap>>,
   lighting: Option<Res<LightingTheme>>,
   light_gpu: Option<ResMut<LightPoolGpu>>,
-  vis_gpu: Option<Res<super::vis_cache::VisCacheGpu>>,
   render_device: Res<RenderDevice>,
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
@@ -2544,21 +2528,6 @@ fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBg1BindGroup(bg1));
   commands.insert_resource(DdaBg2BindGroup(bg2));
   commands.insert_resource(DdaBg3BindGroup(bg3));
-  // ---- BG5：逐体素直光可见性缓存 + per-voxel normal 表（VisCacheGpu）----
-  if let Some(vis) = vis_gpu {
-    let vis_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg5_layout);
-    let meta_binding = vis.meta.binding().expect("VisCacheMeta uniform 未初始化");
-    let bg5 = render_device.create_bind_group(
-      None,
-      &vis_layout,
-      &BindGroupEntries::sequential((
-        vis.table.as_entire_binding(),
-        meta_binding,
-        vis.norm.as_entire_binding(),
-      )),
-    );
-    commands.insert_resource(DdaBg5BindGroup(bg5));
-  }
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
@@ -2568,21 +2537,15 @@ fn dispatch_dda(
   bg1: Option<Res<DdaBg1BindGroup>>,
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
-  bg4: Option<Res<crate::ddgi::DdgiBg4>>,
-  bg5: Option<Res<DdaBg5BindGroup>>,
-  ddgi_gpu: Option<Res<crate::ddgi::DdgiGpu>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
 ) {
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4), Some(bg5)) = (
-    bg0.as_ref(),
-    bg1.as_ref(),
-    bg2.as_ref(),
-    bg3.as_ref(),
-    bg4.as_ref(),
-    bg5.as_ref(),
-  ) else {
+  // Devlog 23：光照链已拆除——主 pass trace 命中后直接 unlit 着色直出 out_tex
+  // （无缓存逐体素法线 + 天空渐变 + 太阳方向光项），无后续 direct/gi/denoise pass。
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) =
+    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref())
+  else {
     bevy::log::debug_once!("DDA dispatch: bind groups missing");
     return;
   };
@@ -2593,7 +2556,6 @@ fn dispatch_dda(
       bevy::log::debug_once!("DDA dispatch: dda pipeline not ready");
       None
     });
-  let ddgi_pipe = pipeline_cache.get_compute_pipeline(pipelines.ddgi_pipeline);
   let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
 
   let recorder = ctx.diagnostic_recorder();
@@ -2604,34 +2566,6 @@ fn dispatch_dda(
   // P3 beam：低分辨率 dispatch = ceil(size / 4) / 8
   let bx = scale.size.x.div_ceil(4).div_ceil(WORKGROUP_SIZE);
   let by = scale.size.y.div_ceil(4).div_ceil(WORKGROUP_SIZE);
-
-  // ---- DDGI 探针射线更新（R3-10）：独立 compute pass ----
-  // ddgi_update 写 ddgi_irr/ddgi_depth storage，dda_main 读同 buffer；wgpu 只在
-  // pass 边界自动插 memory barrier，同 pass 内 dispatch 间读写同 storage 是
-  // race（UB），必须分 pass。管线布局 5 组共用，bind group 跨 set_pipeline 保持绑定。
-  if let (Some(ddgi_pipe), Some(ddgi_gpu)) = (ddgi_pipe, ddgi_gpu.as_ref()) {
-    let ptf = crate::ddgi::frame_plan(ddgi_gpu.probe_count, ddgi_gpu.frame).probes_this_frame;
-    if ptf > 0 {
-      let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_update");
-      {
-        let mut pass = ctx
-          .command_encoder()
-          .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("gate_ddgi_update"),
-            ..default()
-          });
-        pass.set_pipeline(ddgi_pipe);
-        pass.set_bind_group(0, &bg0.0, &[]);
-        pass.set_bind_group(1, &bg1.0, &[]);
-        pass.set_bind_group(2, &bg2.0, &[]);
-        pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, &bg4.0, &[]);
-        pass.set_bind_group(5, &bg5.0, &[]);
-        pass.dispatch_workgroups(ptf, 1, 1);
-      }
-      span.end(ctx.command_encoder());
-    }
-  }
 
   // ---- P3 beam 预 pass：低分辨率 trace 只输出最近命中 t（独立 compute pass，
   // beam 写 beam_depth，主 pass 读同 texture → pass 边界 barrier 保证可见性）----
@@ -2651,15 +2585,13 @@ fn dispatch_dda(
         pass.set_bind_group(1, &bg1.0, &[]);
         pass.set_bind_group(2, &bg2.0, &[]);
         pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, &bg4.0, &[]);
-        pass.set_bind_group(5, &bg5.0, &[]);
         pass.dispatch_workgroups(bx, by, 1);
       }
       span.end(ctx.command_encoder());
     }
   }
 
-  // ---- 主 DDA pass ----
+  // ---- 主 DDA pass：trace + unlit 着色直出 ----
   if let Some(dda_pipe) = dda_pipe {
     let span = recorder.time_span(ctx.command_encoder(), "gate_dda_trace");
     {
@@ -2674,8 +2606,6 @@ fn dispatch_dda(
       pass.set_bind_group(1, &bg1.0, &[]);
       pass.set_bind_group(2, &bg2.0, &[]);
       pass.set_bind_group(3, &bg3.0, &[]);
-      pass.set_bind_group(4, &bg4.0, &[]);
-      pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     }
     span.end(ctx.command_encoder());
