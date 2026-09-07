@@ -1092,6 +1092,7 @@ const DDGI_NORMAL_BIAS: f32 = 0.2;
 const DDGI_DEPTH_BIAS: f32 = 4.0;
 const DDGI_T_MAX: f32 = 8192.0;
 const DDGI_RAY_BUDGET: u32 = 4096u;
+const DDGI_PROBE_BUDGET: u32 = 4096u; // 每帧更新探针上限（≤65535 workgroup 限制 + 预算语义）
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
 const DDGI_EMIT_GAIN: f32 = 4.0;
@@ -1376,13 +1377,22 @@ fn ddgi_halo_idx(l: vec3<i32>) -> u32 {
   return u32((l.z + 1) * 36 + (l.y + 1) * 6 + (l.x + 1));
 }
 
-// ①清除 pass：indirect 语义 [0]=count [1]=1 [2]=1 [3]=0
+// ①清除 pass：dispatch = [count(全量), min(seal 覆写), 1, 1]——copy 桥接取 [1..4]
+// 作 indirect [x,y,z]；cast/update 的 count 读 [1]（钳制后 ≤ DDGI_PROBE_BUDGET，
+// 规避 max_compute_workgroups_per_dimension = 65535 静默跳过——gate 特有规模坑）
 @compute @workgroup_size(1, 1, 1)
 fn ddgi_clear() {
   atomicStore(&ddgi_dispatch[0u], 0u);
-  atomicStore(&ddgi_dispatch[1u], 1u);
+  atomicStore(&ddgi_dispatch[1u], 0u);
   atomicStore(&ddgi_dispatch[2u], 1u);
-  atomicStore(&ddgi_dispatch[3u], 0u);
+  atomicStore(&ddgi_dispatch[3u], 1u);
+}
+
+// ①.5 seal：全量 count → 钳制值 dispatch[1]（1 线程；active 的 atomic 计数已终结）
+@compute @workgroup_size(1, 1, 1)
+fn ddgi_seal() {
+  let count = atomicLoad(&ddgi_dispatch[0u]);
+  atomicStore(&ddgi_dispatch[1u], min(count, DDGI_PROBE_BUDGET));
 }
 
 // ②活跃判定（cpu_ddgi_active 逐字；@workgroup_size(4,4,4)，每 cell 1 线程）
@@ -1396,6 +1406,8 @@ fn ddgi_active(
   let dims = vec3<u32>(ddgi_u.grid_dims.xyz);
   if (any(gid >= dims)) { return; }
   let own_flags = ddgi_flags_cell(gid);
+  // 先写自己（循环的 skip 规则会跳过 d=0 的 owner 格——域内 halo 位置全靠各 owner 写）
+  ddgi_halo[ddgi_halo_idx(vec3<i32>(lid))] = own_flags;
   for (var dz = -1; dz <= 1; dz = dz + 1) {
     for (var dy = -1; dy <= 1; dy = dy + 1) {
       for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -1536,7 +1548,8 @@ fn ddgi_cast(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  let count = atomicLoad(&ddgi_dispatch[0u]);
+  // count = seal 钳制后的值（dispatch[1] ≤ DDGI_PROBE_BUDGET；dispatch[0] 是全量仅诊断）
+  let count = atomicLoad(&ddgi_dispatch[1u]);
   if (wid.x >= count) { return; }
   let probe_id = ddgi_worklist[wid.x];
   let origin = ddgi_positions[probe_id].xyz;
@@ -1597,13 +1610,18 @@ fn ddgi_update(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  let count = atomicLoad(&ddgi_dispatch[0u]);
+  // count = seal 钳制后的值（同 cast：dispatch[1]）
+  let count = atomicLoad(&ddgi_dispatch[1u]);
   if (wid.x >= count) { return; }
   let probe_id = ddgi_worklist[wid.x];
   // 与 ddgi_cast 同公式（同 count → 同 rays → 样本缓冲布局一致）
   let rays = max(DDGI_RAY_BUDGET / count, 1u);
   let seg0 = wid.x * rays;
   let tid = lid.x;
+  // [诊断] imageStore 路径证明：wid=0 强制写 layer0 绿点（回读 L0 nz 应 ≥1）
+  if (wid.x == 0u && tid == 0u) {
+    textureStore(ddgi_irr_next, vec2<i32>(0, 0), 0, vec4<f32>(0.0, 1.0, 0.0, 1.0));
+  }
   // ---- irradiance 8×8：1 线程 = 1 texel ----
   {
     let tx = tid % 8u;

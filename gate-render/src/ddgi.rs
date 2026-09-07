@@ -1811,10 +1811,10 @@ use bevy::render::{
   render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     Buffer, BufferBindingType, BufferDescriptor, BufferUsages, CachedComputePipelineId,
-    ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, Origin3d, ShaderStages,
-    StorageTextureAccess, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureView, TextureViewDescriptor, TextureViewDimension, UniformBuffer,
+    ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, MapMode, Origin3d, ShaderStages,
+    StorageTextureAccess, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
+    Texture, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, UniformBuffer,
   },
   renderer::{RenderDevice, RenderQueue},
 };
@@ -1959,11 +1959,12 @@ pub fn ddgi_bg4_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
-/// DDGI compute 管线（dda.wgsl 四 entry；布局 = BG0-3（dda 复用）+ BG4 v2）
+/// DDGI compute 管线（dda.wgsl 五 entry；布局 = BG0-3（dda 复用）+ BG4 v2）
 #[derive(Debug, Clone, Copy)]
 pub struct DdgiPipelines {
   pub clear: CachedComputePipelineId,
   pub active: CachedComputePipelineId,
+  pub seal: CachedComputePipelineId,
   pub cast: CachedComputePipelineId,
   pub update: CachedComputePipelineId,
 }
@@ -2011,6 +2012,12 @@ pub struct DdgiGpu {
   pub baked_generation: u64,
   /// 四 entry 管线（DdaPipelines 就绪后排队一次）
   pub pipelines: Option<DdgiPipelines>,
+  /// 诊断回读（每 120 帧三阶段：copy → map_async → 读+unmap；wgpu 规则：
+  /// submit 时 buffer 不得处于 Pending/Mapped，三阶段保证每次 submit 时 Unmapped）
+  pub readback: Buffer,
+  pub readback_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+  /// 0=idle 1=copied 2=mapped(等回调)
+  pub readback_state: u32,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
@@ -2060,7 +2067,20 @@ fn dummy_indirect_buffer(device: &RenderDevice, label: &str) -> Buffer {
   device.create_buffer(&BufferDescriptor {
     label: Some(label.into()),
     size: 16,
-    usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+    usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+    mapped_at_creation: false,
+  })
+}
+
+/// 诊断 staging（16B dispatch + 8 irr 采样层 + 1 depth 采样层）；MAP_READ + COPY_DST
+fn ddgi_readback_buffer(device: &RenderDevice) -> Buffer {
+  device.create_buffer(&BufferDescriptor {
+    label: Some("ddgi_readback".into()),
+    size: 256u64
+      + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64
+      + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * 4) as u64
+      + 64,
+    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
     mapped_at_creation: false,
   })
 }
@@ -2142,6 +2162,9 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>) {
     indirect: dummy_indirect_buffer(&device, "ddgi_indirect(empty)"),
     worklist: dummy_buffer(&device, "ddgi_worklist(empty)"),
     samples: dummy_buffer(&device, "ddgi_samples(empty)"),
+    readback: ddgi_readback_buffer(&device),
+    readback_rx: std::sync::Mutex::new(None),
+    readback_state: 0,
     irr_prev: irr.clone(),
     irr_next: irr,
     depth_prev: dep.clone(),
@@ -2197,6 +2220,7 @@ fn queue_ddgi_pipelines(
   gpu.pipelines = Some(DdgiPipelines {
     clear: mk("gate_ddgi_clear", "ddgi_clear"),
     active: mk("gate_ddgi_active", "ddgi_active"),
+    seal: mk("gate_ddgi_seal", "ddgi_seal"),
     cast: mk("gate_ddgi_cast", "ddgi_cast"),
     update: mk("gate_ddgi_update", "ddgi_update"),
   });
@@ -2218,16 +2242,15 @@ fn dispatch_ddgi(
   bg2: Option<Res<crate::brickmap::dda::DdaBg2BindGroup>>,
   bg3: Option<Res<crate::brickmap::dda::DdaBg3BindGroup>>,
   bg4: Option<Res<DdgiBg4>>,
-  gpu: Option<Res<DdgiGpu>>,
+  mut gpu: ResMut<DdgiGpu>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
 ) {
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4), Some(gpu)) = (
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
     bg0.as_ref(),
     bg1.as_ref(),
     bg2.as_ref(),
     bg3.as_ref(),
     bg4.as_ref(),
-    gpu.as_ref(),
   ) else {
     return;
   };
@@ -2237,9 +2260,10 @@ fn dispatch_ddgi(
   let Some(pipes) = gpu.pipelines else {
     return;
   };
-  let (Some(p_clear), Some(p_active), Some(p_cast), Some(p_update)) = (
+  let (Some(p_clear), Some(p_active), Some(p_seal), Some(p_cast), Some(p_update)) = (
     pipeline_cache.get_compute_pipeline(pipes.clear),
     pipeline_cache.get_compute_pipeline(pipes.active),
+    pipeline_cache.get_compute_pipeline(pipes.seal),
     pipeline_cache.get_compute_pipeline(pipes.cast),
     pipeline_cache.get_compute_pipeline(pipes.update),
   ) else {
@@ -2319,10 +2343,24 @@ fn dispatch_ddgi(
     }
     span.end(ctx.command_encoder());
   }
-  // dispatch → indirect 桥接（encoder copy 在 pass 边界外，atomic 计数已终结）
+  // ②.5 seal（1 线程）：全量 count → 钳制值 dispatch[1]（≤ DDGI_PROBE_BUDGET，
+  // 规避 max_compute_workgroups_per_dimension = 65535 静默跳过——gate 特有规模坑）
+  {
+    let mut pass = ctx
+      .command_encoder()
+      .begin_compute_pass(&ComputePassDescriptor {
+        label: Some("gate_ddgi_seal"),
+        ..Default::default()
+      });
+    pass.set_pipeline(p_seal);
+    set_bgs(&mut pass);
+    pass.dispatch_workgroups(1, 1, 1);
+  }
+  // dispatch[1..4]（min,1,1）→ indirect[0..3] 桥接（encoder copy 在 pass 边界外，
+  // active 的 atomic 计数已终结；cast/update 的 count 读 dispatch[1] 同源）
   {
     let encoder = ctx.command_encoder();
-    encoder.copy_buffer_to_buffer(&gpu.dispatch, 0, &gpu.indirect, 0, 16);
+    encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 12);
   }
   // ③cast（indirect：x = dispatch[0] 活跃探针数）
   {
@@ -2355,6 +2393,134 @@ fn dispatch_ddgi(
       pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
     }
     span.end(ctx.command_encoder());
+  }
+
+  // ---- 诊断回读三阶段（wgpu 规则：submit 时 buffer 必须 Unmapped，故 copy 与
+  // map_async 分帧；每阶段一帧，回调完成后读+unmap 回 idle）----
+  match gpu.readback_state {
+    1 => {
+      // 上一帧 copy 已 submit → 请求映射（本帧 submit 时 buffer 无被录命令）
+      let (tx, rx) = std::sync::mpsc::channel();
+      gpu.readback.slice(..).map_async(MapMode::Read, move |_| {
+        let _ = tx.send(());
+      });
+      *gpu.readback_rx.lock().unwrap() = Some(rx);
+      gpu.readback_state = 2;
+    }
+    2 => {
+      let done = gpu
+        .readback_rx
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|rx| rx.try_recv().ok())
+        .is_some();
+      if done {
+        let data = gpu.readback.slice(..).get_mapped_range();
+        let word = |i: usize| {
+          u32::from_le_bytes([
+            data[i * 4],
+            data[i * 4 + 1],
+            data[i * 4 + 2],
+            data[i * 4 + 3],
+          ])
+        };
+        let count = word(0);
+        let indirect0 = word(4);
+        let wl = [word(8), word(9), word(10), word(11)];
+        // 8 个采样层（layer = k*160）：各层非零 texel 数
+        let texels_per_layer = (IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 2) as usize;
+        let mut summary = String::new();
+        for k in 0..8usize {
+          let base = 64 + k * texels_per_layer;
+          let nz = (base..base + texels_per_layer)
+            .filter(|&i| word(i) != 0)
+            .count();
+          let layer = k * 160;
+          summary.push_str(&format!(" L{layer}:{nz}"));
+        }
+        // depth 采样层 650（中心）：被 EMA 拉离 tmax=8192 的 texel 数 = update 写入实证
+        let dep_base = 64 + 8 * texels_per_layer;
+        let dep_texels = (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
+        let dep_lt = (dep_base..dep_base + dep_texels)
+          .filter(|&i| f32::from_bits(word(i)) < 8000.0)
+          .count();
+        drop(data);
+        gpu.readback.unmap();
+        gpu.readback_state = 0;
+        bevy::log::info!(
+          "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}] irr:{summary} depth650_lt8k:{}",
+          gpu.frame,
+          count,
+          indirect0,
+          wl[0],
+          wl[1],
+          wl[2],
+          wl[3],
+          dep_lt
+        );
+      }
+    }
+    _ => {
+      if gpu.frame % 120 == 0 {
+        {
+          let encoder = ctx.command_encoder();
+          encoder.copy_buffer_to_buffer(&gpu.dispatch, 0, &gpu.readback, 0, 16);
+          // 诊断：indirect[0]（桥接是否生效）+ worklist 头部（active 写入是否可见）
+          encoder.copy_buffer_to_buffer(&gpu.indirect, 0, &gpu.readback, 16, 16);
+          encoder.copy_buffer_to_buffer(&gpu.worklist, 0, &gpu.readback, 32, 64);
+          // 8 个均匀采样层（layer = k*160）+ depth 层 650——读 **next**（本帧 update
+          // 刚写完，encoder 顺序在 update pass 之后；prev 要到下帧 swap 才有新值）
+          for k in 0..8u32 {
+            encoder.copy_texture_to_buffer(
+              TexelCopyTextureInfo {
+                texture: &gpu.irr_next,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+              },
+              TexelCopyBufferInfo {
+                buffer: &gpu.readback,
+                layout: TexelCopyBufferLayout {
+                  offset: 256
+                    + (k as u64) * (IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64,
+                  bytes_per_row: Some(IRRADIANCE_LAYER_TEXELS * 8),
+                  rows_per_image: Some(IRRADIANCE_LAYER_TEXELS),
+                },
+              },
+              Extent3d {
+                width: IRRADIANCE_LAYER_TEXELS,
+                height: IRRADIANCE_LAYER_TEXELS,
+                depth_or_array_layers: 1,
+              },
+            );
+          }
+          // depth 采样层 650（tmax=8192 初值；EMA 拉低 = update 写入实证）
+          encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+              texture: &gpu.depth_next,
+              mip_level: 0,
+              origin: Origin3d::ZERO,
+              aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+              buffer: &gpu.readback,
+              layout: TexelCopyBufferLayout {
+                offset: 256 + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64,
+                bytes_per_row: Some(DEPTH_LAYER_TEXELS * 4),
+                rows_per_image: Some(DEPTH_LAYER_TEXELS),
+              },
+            },
+            Extent3d {
+              width: DEPTH_LAYER_TEXELS,
+              height: DEPTH_LAYER_TEXELS,
+              depth_or_array_layers: 1,
+            },
+          );
+        }
+        gpu.readback_state = 1;
+      }
+    }
   }
 }
 
