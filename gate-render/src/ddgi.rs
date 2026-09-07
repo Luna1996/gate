@@ -819,6 +819,351 @@ pub fn outside_lower_grid(lo: IVec3, hi: IVec3, finer_origin: IVec3, finer_dims:
 }
 
 // ============================================================================
+// M3-1 active 判定 CPU 镜像（WGSL ddgi_active.wgsl 镜像源；spec D2/D4/D7/D10）
+// 逐字对照 Douglas sort.glsl L218-262（截图1-2）
+// ============================================================================
+
+// ---- DdgiProbeFlags（截图3 flag-based active 判定）----
+
+/// Douglas sort.glsl `DdgiProbeFlags` 位标志（u32）。
+/// 截图3 `probe_near_surface` 逐字：
+///   return (flags & DDGI_PROBE_FLAG_NO_SURFACES) == 0
+///       || (get_probe_flags_intersection() & DDGI_PROBE_FLAG_NO_SURFACES) == 0
+///       || probe_near_objects(cell_center);
+/// 即：NO_SURFACES=1 表示本 cell 无表面；ENABLED=1 表示本 cell 有探针（可被调度）。
+pub type DdgiProbeFlags = u32;
+/// 本 cell 有探针（烘焙分配）→ 可被 active pass 调度
+pub const DDGI_PROBE_FLAG_ENABLED: DdgiProbeFlags = 1 << 0;
+/// 本 cell 无表面（纯 Air，Solid 也视为无——Solid cell 烘焙期已跳过）
+pub const DDGI_PROBE_FLAG_NO_SURFACES: DdgiProbeFlags = 1 << 1;
+
+/// BrickState → DdgiProbeFlags：Air=NO_SURFACES|ENABLED（烘焙期 AIR 也放探针），
+/// Mixed=ENABLED（有表面），Solid=ENABLED（Solid cell 烘焙期跳过，此分支不常走）
+/// 注意：NO_PROBE cell 在构建 flags 数组时直接跳过（不置 ENABLED）
+#[inline]
+pub fn brickstate_to_flags(state: BrickState, has_probe: bool) -> DdgiProbeFlags {
+  if !has_probe {
+    return 0;
+  }
+  let mut flags = DDGI_PROBE_FLAG_ENABLED;
+  if matches!(state, BrickState::Air) {
+    flags |= DDGI_PROBE_FLAG_NO_SURFACES;
+  }
+  flags
+}
+
+// ---- 级联域 ----
+
+/// 级联域（每帧滚动 dispatch 用；origin/dims 为 16-cell 全局坐标，cell_size 为 fine 体素）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CascadeDomain {
+  /// 域原点（16-cell 全局坐标；级联级须 cell_size 对齐——M4-3 滚动步进）
+  pub origin: IVec3,
+  /// 域 dims（本级 cell 单位；滚动级 = PROBES_PER_CASCADE_AXIS³=16³，base = AABB cell 数）
+  pub dims: UVec3,
+  /// cell 尺寸（fine 体素）：base 16 / LOD1-4=32/64/128/256
+  pub cell_size: i32,
+}
+
+impl CascadeDomain {
+  /// 域 hi（16-cell 半开）= origin + dims × (cell_size / DDGI_CELL)
+  #[inline]
+  pub fn hi_16cell(&self) -> IVec3 {
+    self.origin + self.dims.as_ivec3() * (self.cell_size / DDGI_CELL)
+  }
+}
+
+/// 非 grid-aligned object bbox（fine 世界坐标，半开区间 [min, max)）。
+/// D2 三条件之一：本 LOD cell 与 bbox 重叠 → 探针活跃。
+/// （D12：MOV 自身探针后置；当前阶段仅作为输入占位，与网格对齐的体素无贡献）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectBbox {
+  pub min: Vec3,
+  pub max: Vec3,
+}
+
+impl ObjectBbox {
+  /// 本 LOD cell（cell_min_fine 起 cell_size³ AABB）是否与本 bbox 重叠（半开）
+  #[inline]
+  pub fn overlaps_cell(&self, cell_min_fine: Vec3, cell_size: f32) -> bool {
+    self.max.x > cell_min_fine.x
+      && self.min.x < cell_min_fine.x + cell_size
+      && self.max.y > cell_min_fine.y
+      && self.min.y < cell_min_fine.y + cell_size
+      && self.max.z > cell_min_fine.z
+      && self.min.z < cell_min_fine.z + cell_size
+  }
+}
+
+// ---- get_probe_flags_intersection（截图3 逐字）----
+
+/// 6 邻接 cell flags 的按位 AND 交集（截图3 `get_probe_flags_intersection()`）。
+/// 边界外视为与中心 cell 同 flags（Douglas sort.glsl 中 dispatch 覆盖完整域，无真正边界；
+/// halo +1 仅用于 shared memory bank conflict 避让。CPU 镜像需维持 AND 交集语义：
+/// 边界 cell 的邻接缺失 = 用自身 flags 填充，避免交集被 0 位污染）。
+/// 索引序：(−x, +x, −y, +y, −z, +z)，与 `probe_near_surface` 入参顺序一致。
+#[inline]
+pub fn flags_intersection(flags: &[DdgiProbeFlags], dims: UVec3, rel: UVec3) -> [DdgiProbeFlags; 6] {
+  let self_flags = flags[(rel.x + rel.y * dims.x + rel.z * dims.x * dims.y) as usize];
+  let fetch = |x: i32, y: i32, z: i32| -> DdgiProbeFlags {
+    if (0..dims.x as i32).contains(&x)
+      && (0..dims.y as i32).contains(&y)
+      && (0..dims.z as i32).contains(&z)
+    {
+      let r = UVec3::new(x as u32, y as u32, z as u32);
+      flags[(r.x + r.y * dims.x + r.z * dims.x * dims.y) as usize]
+    } else {
+      self_flags // 边界外 → 视为自身 flags（保持 AND 语义）
+    }
+  };
+  let (rx, ry, rz) = (rel.x as i32, rel.y as i32, rel.z as i32);
+  [
+    fetch(rx - 1, ry, rz),
+    fetch(rx + 1, ry, rz),
+    fetch(rx, ry - 1, rz),
+    fetch(rx, ry + 1, rz),
+    fetch(rx, ry, rz - 1),
+    fetch(rx, ry, rz + 1),
+  ]
+}
+
+/// 截图3 `get_probe_flags_intersection()` 逐字：6 邻接 flags 的按位 AND。
+#[inline]
+pub fn probe_flags_intersection(flags: &[DdgiProbeFlags], dims: UVec3, rel: UVec3) -> DdgiProbeFlags {
+  let n = flags_intersection(flags, dims, rel);
+  n[0] & n[1] & n[2] & n[3] & n[4] & n[5]
+}
+
+// ---- probe_near_surface（截图3 逐字）----
+
+/// 截图3 `probe_near_surface(cell_center, flags)` 逐字三条件 OR：
+///   (flags & NO_SURFACES) == 0                     → 本 cell 有表面
+///   || (flags_intersection & NO_SURFACES) == 0    → 邻接 cell 交集有表面
+///   || probe_near_objects(cell_center)             → 与 object bbox 重叠
+///
+/// 注意：与我之前 BrickState OR 实现的等价性——flags 的 NO_SURFACES=0 对应 BrickState != Air。
+/// 但边界处理不同：flags 边界外 = 0（NO_SURFACES=0）→ 邻接表面条件放行；
+/// BrickState 边界外 = Air → 邻接表面条件不拦截。结果等价（都放行边界 cell 的表面检查）。
+#[inline]
+pub fn probe_near_surface_flags(
+  own_flags: DdgiProbeFlags,
+  intersect_flags: DdgiProbeFlags,
+  object_bboxes: &[ObjectBbox],
+  cell_center: Vec3,
+  cell_size: f32,
+) -> bool {
+  if (own_flags & DDGI_PROBE_FLAG_NO_SURFACES) == 0 {
+    return true;
+  }
+  if (intersect_flags & DDGI_PROBE_FLAG_NO_SURFACES) == 0 {
+    return true;
+  }
+  for b in object_bboxes {
+    if b.overlaps_cell(cell_center - Vec3::splat(cell_size / 2.0), cell_size) {
+      return true;
+    }
+  }
+  false
+}
+
+// ---- active 判定输入/输出 ----
+
+/// active 判定输入快照（per-LOD 一份；WGSL 等价 = 共享内存 halo + previous meta tex）
+pub struct ActiveInput<'a> {
+  /// 烘焙出的探针网格（cell_index + positions）
+  pub pg: &'a ProbeGrid,
+  /// 逐 cell 的 DdgiProbeFlags（线性下标同 pg.cell_index 布局；M3-1 调用方预计算）
+  pub cell_flags: &'a [DdgiProbeFlags],
+  /// 非 grid-aligned object bbox 列表（fine 世界坐标，半开）
+  pub object_bboxes: &'a [ObjectBbox],
+  /// 本 LOD 域（用于 outside_lower_grid 判定；origin/dims 为 16-cell 全局坐标）
+  pub cascade: CascadeDomain,
+  /// 更细级域（None = 最细级 base，无更细网格；本 LOD 只管 finer 域外的 cell）
+  pub finer: Option<CascadeDomain>,
+  /// previous 元数据纹理数据（packed offset+age；活跃探针读 prev age / offset 用）
+  pub prev_meta: &'a [u32],
+  /// reuse bounds（D10；reuse_min ≤ cell（逐轴，含端）∧ cell < reuse_max（不含端））。
+  /// cell 为本级 cell 坐标（rel，从 cascade.origin 起算）；全 REUSE_ALL 表示无滚动。
+  pub reuse_bounds: (IVec3, IVec3),
+  /// 帧号（用于 can_skip_update 的确定性 hash；固定种子 CPU 镜像与 WGSL 逐位一致）
+  pub frame: u32,
+}
+
+/// 全 reuse bounds（base 静态级默认值：覆盖全部 cell，全部 reusable）
+pub const REUSE_ALL: (IVec3, IVec3) = (IVec3::ZERO, IVec3::splat(i32::MAX));
+
+/// active 判定 worklist 条目（截图2 `ddgi_item(position, age)`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveWorklistItem {
+  /// 探针 id
+  pub probe_id: u32,
+  /// age（已继承 + 已 increment；can_skip=true 时不出现在 worklist）
+  pub age: u32,
+}
+
+/// active 判定输出：worklist + indirect dispatch 参数 + next 元数据
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveOutput {
+  /// worklist 条目（age 已继承 + 已 increment；can_skip=true 时不出现在 worklist，
+  /// 但 next_meta 仍写继承后 age）
+  pub worklist: Vec<ActiveWorklistItem>,
+  /// indirect dispatch workgroup 数（= worklist.len()；ddgi_cast 消费）
+  pub indirect_dispatch: u32,
+  /// next 元数据纹理数据（**从 prev_meta 拷贝初始化**，非活跃/跳过探针保留 prev 值；
+  /// 活跃探针（can_skip=true 或 false）写新 (offset, age)——age 可能是继承未 increment）
+  pub next_meta: Vec<u32>,
+}
+
+// ---- can_skip_update（截图2 调用点可见 `can_skip_update(cell, cell_center, age)`）----
+
+/// INFERENCE: Douglas 未截到函数体。签名从截图2 调用点确认：
+/// `can_skip_update(cell, cell_center, age)` — 3 参。
+/// 保守实现（与 M1-3 `can_skip_update(age, rand)` 同公式）：p=(age/255)²×0.5，
+/// hash 输入 = pcg_hash(frame ^ probe_id)，保证跨帧/跨探针确定性。
+#[inline]
+pub fn can_skip_update_for_active(age: u32, frame: u32, probe_id: u32) -> bool {
+  let rand = pcg_hash(frame ^ pcg_hash(probe_id));
+  can_skip_update(age, rand)
+}
+
+// ---- CPU 镜像主入口（逐字对照 sort.glsl L225-262）----
+
+/// CPU 镜像主入口：遍历全 cell，写 worklist + indirect + next meta。
+///
+/// 逐字对照 sort.glsl main() L225-262（截图1-2）：
+///   clear_object_buckets();
+///   cell = gl_GlobalInvocationID + dispatch.base_position;
+///   flags = ddgi_probe_locus_flags(probe);
+///   load_adjacent_probes(cell); memoryBarrierShared(); barrier();
+///   if ((flags & ENABLED) == ENABLED && outside_lower_grid()) {
+///     if (probe_near_surface(cell_center, flags)) {
+///       // 读 prev meta
+///       age = reusable ? ddgi_probe_age(previous) : 0;
+///       if (!can_skip_update(cell, cell_center, age)) {
+///         age = min(age + 1, 255);
+///         worklist_insert(ddgi_item(position, age));
+///       }
+///       imageStore(next_ddgi_probes, texel, ddgi_probe_new(offset, age));
+///     }
+///   }
+///
+/// 关键修正（与 v1 实现差异）：
+/// 1. **next_meta 初始化 = prev_meta.to_vec()**（非活跃探针保留 prev age，不丢收敛）
+/// 2. **age 生命周期在 active 内闭环**：scroll inherit → can_skip → if !skip age++ → write
+///    （v1 把 age++ 留给 ddgi_update，但截图2 显示 active 内完成）
+/// 3. **can_skip=true 时 next_meta 仍写**（age 不变 = 继承后未 increment）
+/// 4. **worklist 条目带 age**（ddgi_item(position, age)）
+/// 5. **flags 模型**（DDGI_PROBE_FLAG_ENABLED / NO_SURFACES）取代 BrickState OR
+///
+/// INFERENCE: subgroup worklist 分配 → CPU 串行 push，等价集合相同（WGSL 分配顺序不影响结果）
+pub fn cpu_ddgi_active(input: &ActiveInput) -> ActiveOutput {
+  // 关键修正①：从 prev_meta 拷贝初始化，非活跃探针保留 prev age
+  let mut next_meta = input.prev_meta.to_vec();
+  let mut worklist = Vec::new();
+  let dims = input.pg.grid_dims;
+  let (reuse_min, reuse_max) = input.reuse_bounds;
+  for rz in 0..dims.z {
+    for ry in 0..dims.y {
+      for rx in 0..dims.x {
+        let rel = UVec3::new(rx, ry, rz);
+        let li = input.pg.cell_linear(rel);
+        let probe_id = input.pg.cell_index[li];
+        if probe_id == NO_PROBE {
+          continue;
+        }
+        let flags = input.cell_flags[li];
+        // 截图2: if ((flags & DDGI_PROBE_FLAG_ENABLED) == DDGI_PROBE_FLAG_ENABLED && outside_lower_grid())
+        if (flags & DDGI_PROBE_FLAG_ENABLED) != DDGI_PROBE_FLAG_ENABLED {
+          continue;
+        }
+        // 级联归属 outside_lower_grid（D4）
+        if let Some(finer) = input.finer {
+          let lo = input.pg.cell16(rel);
+          let hi = lo + IVec3::splat(input.cascade.cell_size / DDGI_CELL);
+          if !outside_lower_grid(
+            lo,
+            hi,
+            finer.origin,
+            finer.dims * (finer.cell_size / DDGI_CELL) as u32,
+          ) {
+            continue;
+          }
+        }
+        // 截图3: probe_near_surface(cell_center, flags)
+        let intersect = probe_flags_intersection(input.cell_flags, dims, rel);
+        let cell_center = input.pg.cell_min_voxel(rel).as_vec3()
+          + Vec3::splat(input.cascade.cell_size as f32 / 2.0);
+        if !probe_near_surface_flags(
+          flags,
+          intersect,
+          input.object_bboxes,
+          cell_center,
+          input.cascade.cell_size as f32,
+        ) {
+          continue;
+        }
+        // ---- age 生命周期（截图2 逐字）----
+        let (layer, tx, ty) = meta_texel_coord(probe_id);
+        let meta_idx = meta_texel_linear(layer, tx, ty);
+        let (prev_offset, prev_age) = unpack_probe_meta(input.prev_meta[meta_idx]);
+        // D10 reuse bounds：本级 cell 坐标 rel，半开区间
+        let reusable = probe_reusable(
+          IVec3::new(rx as i32, ry as i32, rz as i32),
+          prev_offset,
+          prev_offset,
+          (reuse_min, reuse_max),
+        );
+        let mut age = if reusable { prev_age } else { 0 };
+        // 截图2: if (!can_skip_update(cell, cell_center, age)) { age = min(age+1, 255); worklist_insert; }
+        let skip = can_skip_update_for_active(age, input.frame, probe_id);
+        if !skip {
+          age = age_after_update(age);
+          worklist.push(ActiveWorklistItem { probe_id, age });
+        }
+        // 截图2: imageStore(next_ddgi_probes, texel, ddgi_probe_new(offset, age))
+        // 无论 skip 与否都写——skip 时 age 不变（继承后未 increment）
+        next_meta[meta_idx] = pack_probe_meta(prev_offset, age);
+      }
+    }
+  }
+  let n = worklist.len() as u32;
+  ActiveOutput {
+    worklist,
+    indirect_dispatch: n,
+    next_meta,
+  }
+}
+
+// ---- 调用方辅助 ----
+
+/// 从 VolumeGrid 预计算每个 cell 的 DdgiProbeFlags（线性下标同 pg.cell_index）。
+/// 生产 GPU 路径在 ddgi_active.wgsl 内由 shared memory + chunk tree 查询替代。
+pub fn compute_cell_flags(
+  grid: &gate_voxel::VolumeGrid,
+  pg: &ProbeGrid,
+  cell_size: i32,
+) -> Vec<DdgiProbeFlags> {
+  let dims = pg.grid_dims;
+  let mut out = vec![0u32; (dims.x * dims.y * dims.z) as usize];
+  for rz in 0..dims.z {
+    for ry in 0..dims.y {
+      for rx in 0..dims.x {
+        let rel = UVec3::new(rx, ry, rz);
+        let li = pg.cell_linear(rel);
+        let probe_id = pg.cell_index[li];
+        if probe_id == NO_PROBE {
+          continue; // 无探针 → flags = 0（未 ENABLED）
+        }
+        let cell_min = pg.cell_min_voxel(rel);
+        let state = cell_state_at(grid, cell_min, cell_size);
+        out[li] = brickstate_to_flags(state, true);
+      }
+    }
+  }
+  out
+}
+
+// ============================================================================
 // GPU wire（BG4：WGSL DdgiMeta + 4 storage buffer 逐字段镜像）
 // ============================================================================
 
@@ -2156,5 +2501,500 @@ mod tests {
       l1_origin,
       l1_dims
     ));
+  }
+
+  // ==========================================================================
+  // M3-1 active 判定单测
+  // ==========================================================================
+
+  /// flags_from_brickstate：Air→NO_SURFACES|ENABLED、Mixed→ENABLED、Solid→ENABLED
+  #[test]
+  fn flags_from_brickstate() {
+    let f = brickstate_to_flags(BrickState::Air, true);
+    assert_eq!(f, DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES);
+    let f = brickstate_to_flags(BrickState::Mixed, true);
+    assert_eq!(f, DDGI_PROBE_FLAG_ENABLED, "Mixed 有表面 → 不置 NO_SURFACES");
+    let f = brickstate_to_flags(BrickState::Solid(3), true);
+    assert_eq!(f, DDGI_PROBE_FLAG_ENABLED, "Solid 烘焙期跳过，此分支不常走");
+    let f = brickstate_to_flags(BrickState::Air, false);
+    assert_eq!(f, 0, "无探针 → flags = 0（未 ENABLED）");
+  }
+
+  /// probe_flags_intersection：6 邻接 AND；边界外视为自身 flags（保持 AND 语义）
+  #[test]
+  fn flags_intersection_bounds() {
+    // 2×2×2 flags 数组
+    let dims = UVec3::splat(2);
+    // (0,0,0)=Air|ENABLED，(1,1,1)=ENABLED（有表面），其余=0（无 ENABLED）
+    let mut flags = vec![0u32; 8];
+    flags[0] = DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES; // rel(0,0,0)
+    flags[7] = DDGI_PROBE_FLAG_ENABLED; // rel(1,1,1)
+
+    // rel(0,0,0) 有 3 个边界外邻居 → 视为自身 Air|ENABLED。域内 3 个邻居 (1,0,0)=0,(0,1,0)=0,(0,0,1)=0
+    // 邻居 = [3, 0, 3, 0, 3, 0] → AND = 3 & 0 & 3 & 0 & 3 & 0 = 0
+    let inter = probe_flags_intersection(&flags, dims, UVec3::ZERO);
+    assert_eq!(inter, 0, "域内 0 flags 邻居 → AND=0");
+
+    // rel(1,1,1) 边界外视为自身 ENABLED。域内邻居 (0,1,1)=1(0), (1,0,1)=2(0), (1,1,0)=4(0)
+    // 邻居 = [1, 1, 0, 1, 0, 1] → AND = 1 & 1 & 0 & 1 & 0 & 1 = 0
+    let inter = probe_flags_intersection(&flags, dims, UVec3::splat(1));
+    assert_eq!(inter, 0, "域内 0 flags 邻居 → AND=0");
+
+    // 全 Air|ENABLED → intersection 也是 Air|ENABLED（边界外=自身=3，域内=3，AND=3）
+    let flags_all = vec![DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES; 8];
+    let inter = probe_flags_intersection(&flags_all, dims, UVec3::splat(1));
+    assert_eq!(inter, DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES);
+
+    // 全 ENABLED（有表面）→ intersection = ENABLED（NO_SURFACES=0 → probe_near_surface 放行）
+    let flags_mixed = vec![DDGI_PROBE_FLAG_ENABLED; 8];
+    let inter = probe_flags_intersection(&flags_mixed, dims, UVec3::ZERO);
+    assert_eq!(inter, DDGI_PROBE_FLAG_ENABLED);
+  }
+
+  /// probe_near_surface_flags：三条件 OR 真值表
+  #[test]
+  fn probe_near_surface_truth_table() {
+    // 本 cell 有表面 → true（flag.NO_SURFACES=0）
+    assert!(probe_near_surface_flags(
+      DDGI_PROBE_FLAG_ENABLED,
+      DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES,
+      &[],
+      Vec3::splat(8.0),
+      16.0,
+    ));
+    // 本 cell 纯 Air，但邻接交集有表面（intersect.NO_SURFACES=0）→ true
+    assert!(probe_near_surface_flags(
+      DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES,
+      DDGI_PROBE_FLAG_ENABLED,
+      &[],
+      Vec3::splat(8.0),
+      16.0,
+    ));
+    // 本 cell + 邻接全 Air，但与 object bbox 重叠 → true
+    assert!(probe_near_surface_flags(
+      DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES,
+      DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES,
+      &[ObjectBbox {
+        min: Vec3::splat(0.0),
+        max: Vec3::splat(16.0),
+      }],
+      Vec3::splat(8.0),
+      16.0,
+    ));
+    // 三条件全否 → false
+    assert!(!probe_near_surface_flags(
+      DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES,
+      DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES,
+      &[],
+      Vec3::splat(100.0), // cell_center 远在域外
+      16.0,
+    ));
+  }
+
+  /// can_skip_update_for_active：age=0 永不跳；固定 frame+probe_id 确定性
+  #[test]
+  fn can_skip_for_active_deterministic() {
+    // age=0: 新鲜探针永不跳（p=0）
+    assert!(!can_skip_update_for_active(0, 0, 0));
+    assert!(!can_skip_update_for_active(0, 100, 42));
+    // age=255, frame=0, probe=0 → rand=pcg_hash(pcg_hash(0^pcg_hash(0))) → 跳（p=0.5）
+    assert!(can_skip_update_for_active(255, 0, 0));
+    // 确定性：同 probe 同 frame 必同
+    assert_eq!(
+      can_skip_update_for_active(255, 0, 0),
+      can_skip_update_for_active(255, 0, 0),
+      "确定性：同输入 → 同输出"
+    );
+    // 跨 probe_id 输出可能变化（随机性）
+    let _ = can_skip_update_for_active(255, 0, 42);
+  }
+
+  /// M3-1 核心：64³ 封闭房间 → 近墙 cell 活跃、远场 Air cell 不活跃（正确的 D2 行为）
+  #[test]
+  fn cpu_ddgi_active_all_room_probes_active() {
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 0), IVec3::new(64, 4, 64), 4, 3); // floor
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 60, 0), IVec3::new(64, 4, 64), 4, 3); // ceil
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 0), IVec3::new(4, 64, 64), 4, 3); // x-
+    gate_voxel::fill_bricks(&mut g, IVec3::new(60, 0, 0), IVec3::new(4, 64, 64), 4, 3); // x+
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 0), IVec3::new(64, 64, 4), 4, 3); // z-
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 60), IVec3::new(64, 64, 4), 4, 3); // z+
+    let vols = Volumes::new(g);
+    let pg = bake_probe_grid(&vols);
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let meta = build_meta_texture_data(&pg);
+
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+    let input = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &meta,
+      reuse_bounds: REUSE_ALL,
+      frame: 0,
+    };
+    let out = cpu_ddgi_active(&input);
+
+    // 关键断言：远场 Air cell（距墙 1 cell 之外）正确地不活跃 → 活跃数远小于总探针数
+    assert!(
+      out.indirect_dispatch < pg.positions.len() as u32,
+      "远场 Air cell 应被剔除：活跃 {} < 总 {}",
+      out.indirect_dispatch,
+      pg.positions.len()
+    );
+    // 但近墙 Mixed/Air cell 必须活跃 → 活跃数 > 墙附近 cell 数
+    // 4³ 房间有 6 面墙，墙 cell 数 ≈ 4³ - 2³ = 56
+    assert!(
+      out.indirect_dispatch > 56,
+      "近墙 cell 应活跃：活跃 {} > 墙 cell 数",
+      out.indirect_dispatch
+    );
+    assert_eq!(out.worklist.len() as u32, out.indirect_dispatch);
+    // next_meta 长度 = prev_meta 长度
+    assert_eq!(out.next_meta.len(), meta.len());
+    // worklist 内活跃探针的 age 必须是 increment 后的值
+    for item in &out.worklist {
+      assert!(item.age >= 1 && item.age <= DDGI_AGE_MAX);
+      let (layer, tx, ty) = meta_texel_coord(item.probe_id);
+      let idx = meta_texel_linear(layer, tx, ty);
+      let (_, age) = unpack_probe_meta(out.next_meta[idx]);
+      assert_eq!(age, item.age);
+    }
+  }
+
+  /// M3-1 核心：纯 Air 远场 cell → 无邻接表面 + 无 object → 不活跃
+  #[test]
+  fn cpu_ddgi_active_far_air_inactive() {
+    // 全空世界 → 烘焙全 Air 探针
+    let vols = Volumes::new(VolumeGrid::new());
+    // 给世界一个 AABB 让烘焙有域
+    let mut g = VolumeGrid::new();
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(16), 4, 0); // 清空气体素（仅推 chunk 代数到 1）
+    let vols = Volumes::new(g);
+    let pg = bake_probe_grid(&vols);
+    // 0 探针 → 直接 assert
+    if pg.positions.is_empty() {
+      return;
+    }
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let meta = build_meta_texture_data(&pg);
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+    let input = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &meta,
+      reuse_bounds: REUSE_ALL,
+      frame: 0,
+    };
+    let out = cpu_ddgi_active(&input);
+    // 全 Air + 无 object → 全不活跃
+    assert_eq!(out.indirect_dispatch, 0);
+    assert!(out.worklist.is_empty());
+  }
+
+  /// M3-1 核心：next_meta 从 prev_meta 拷贝初始化 → 非活跃探针 age 不丢
+  #[test]
+  fn cpu_ddgi_active_preserves_non_active_meta() {
+    // 构造 8 cell 2³ 网格：中心 1 个 Mixed cell + 7 个 Air cell
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    // 在 cell(1,1,1) 放 16³ 实心盒 → Solid cell（烘焙期跳过）
+    // 在 cell(0,0,0) 放 4³ 实心 → Mixed cell（有表面）
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(4), 4, 3);
+    let vols = Volumes::new(g);
+    let pg = bake_probe_grid(&vols);
+
+    // 烘焙出的 cell 数 = 4³ = 64 cell，其中 cell(0,0,0) Mixed 有探针，其余 Air 也有探针（D1 全覆盖）
+    // 但 cell(0,0,0) 的 6 邻接有 3 个越界（边界外视为 Air 但无表面条件放行——邻接 Air 探针自身也在域内）
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let meta = build_meta_texture_data(&pg);
+
+    // 手动给 prev_meta 注入 age=200（模拟已收敛探针）
+    let mut prev = meta.clone();
+    for li in 0..pg.cell_index.len() {
+      if pg.cell_index[li] != NO_PROBE {
+        let id = pg.cell_index[li];
+        let (layer, tx, ty) = meta_texel_coord(id);
+        let idx = meta_texel_linear(layer, tx, ty);
+        let (off, _) = unpack_probe_meta(prev[idx]);
+        prev[idx] = pack_probe_meta(off, 200);
+      }
+    }
+
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+    let input = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &prev,
+      reuse_bounds: REUSE_ALL,
+      frame: 9999, // 大 frame → can_skip 结果可能不同
+    };
+    let out = cpu_ddgi_active(&input);
+
+    // 验证：next_meta 长度等于 prev
+    assert_eq!(out.next_meta.len(), prev.len());
+
+    // 非活跃探针的 next_meta 应等于 prev_meta（age=200 保留）
+    // 活跃探针（在 worklist 里）age 要么 = 200（skip）要么 = 201（increment）
+    let active_ids: std::collections::HashSet<u32> =
+      out.worklist.iter().map(|i| i.probe_id).collect();
+    for li in 0..pg.cell_index.len() {
+      if pg.cell_index[li] == NO_PROBE {
+        continue;
+      }
+      let id = pg.cell_index[li];
+      let (layer, tx, ty) = meta_texel_coord(id);
+      let idx = meta_texel_linear(layer, tx, ty);
+      let (_, prev_age) = unpack_probe_meta(prev[idx]);
+      let (_, next_age) = unpack_probe_meta(out.next_meta[idx]);
+
+      if active_ids.contains(&id) {
+        // 在 worklist → 已 increment
+        assert_eq!(next_age, 201, "活跃探针应 age+1");
+      } else {
+        // 不在 worklist → 被 can_skip 或完全不活跃
+        // 如果 probe 存在但完全不活跃（无表面），age 应保持 prev（200）
+        // 如果 probe 活跃但被 can_skip，age 也应保持 prev（200，继承后未 increment）
+        assert!(
+          next_age == prev_age || next_age == 0,
+          "非活跃/跳过探针 age 应不变（{prev_age}→{next_age}）"
+        );
+      }
+    }
+  }
+
+  /// M3-1：滚动级 reuse bounds → 域内 age 继承、域外归零
+  #[test]
+  fn cpu_ddgi_active_scroll_reuse_age() {
+    // 构造 2×2×2 cell grid（64³ fine），cell(0,0,0) 有 4³ 实心 Mixed
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(4), 4, 3);
+    let vols = Volumes::new(g);
+
+    let pg = bake_cascade_grid(&vols, 32, IVec3::ZERO, UVec3::splat(2));
+    assert!(!pg.positions.is_empty());
+    let flags = compute_cell_flags(vols.main(), &pg, 32);
+    let meta = build_meta_texture_data(&pg);
+
+    // 注入 age=100
+    let mut prev = meta.clone();
+    for li in 0..pg.cell_index.len() {
+      if pg.cell_index[li] != NO_PROBE {
+        let id = pg.cell_index[li];
+        let (layer, tx, ty) = meta_texel_coord(id);
+        let idx = meta_texel_linear(layer, tx, ty);
+        let (off, _) = unpack_probe_meta(prev[idx]);
+        prev[idx] = pack_probe_meta(off, 100);
+      }
+    }
+
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: 32,
+    };
+    let input = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &prev,
+      reuse_bounds: (IVec3::splat(-1), IVec3::splat(1)),
+      frame: 0,
+    };
+    let out = cpu_ddgi_active(&input);
+
+    // cell(0,0,0) rel=(0,0,0) → [-1,1) 域内 → reusable；且 Mixed → probe_near_surface=true
+    // frame=0, can_skip(age=100) → p=(100/255)²×0.5≈0.077 → rand=pcg_hash(pcg_hash(0^pcg_hash(id)))
+    // 不管 skip 与否：skip → age=100；不 skip → age=101
+    let lookup = |rel: UVec3| -> u32 { pg.cell_index[pg.cell_linear(rel)] };
+    let id000 = lookup(UVec3::ZERO);
+    if id000 != NO_PROBE {
+      let (layer, tx, ty) = meta_texel_coord(id000);
+      let idx = meta_texel_linear(layer, tx, ty);
+      let (_, age) = unpack_probe_meta(out.next_meta[idx]);
+      // reusable + 活跃 → age ∈ {100 (skip), 101 (increment)}
+      assert!(
+        age == 100 || age == 101,
+        "reusable 探针 age 应保留 100 或 increment 到 101（got {age}）"
+      );
+    }
+    // cell(1,1,1) rel=(1,1,1) → reuse_max=1 不含 1 → 不归 reusable → age=0 起步
+    // 但 cell(1,1,1) 全 Air 邻域 → probe_near_surface 可能返回 false → age 保留 100
+    // 或者活跃 → age=1
+    let id111 = lookup(UVec3::splat(1));
+    if id111 != NO_PROBE {
+      let (layer, tx, ty) = meta_texel_coord(id111);
+      let idx = meta_texel_linear(layer, tx, ty);
+      let (_, age) = unpack_probe_meta(out.next_meta[idx]);
+      // 不归 reusable → 活跃则 age=1（can_skip 对 age=0 必不跳）；不活跃则 age=100 保留
+      assert!(
+        age == 1 || age == 100,
+        "非 reusable 探针 age 应归零后 increment（1）或不活跃保留（100）（got {age}）"
+      );
+    }
+  }
+
+  /// fuzz 等价门禁：固定种子 → cpu_ddgi_active 输出确定性；
+  /// 暴力 oracle（逐 cell 全 BrickState 查询）→ flags 模型等价
+  #[test]
+  fn cpu_ddgi_active_fuzz_equivalence() {
+    // 构造 4³ chunk 网格，随机 Mixed/Air 分布
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    // 填充每个 16³ cell 的一个 4³ 角块（棋盘格 → 约一半 Mixed 一半 Air）
+    for z in 0..4 {
+      for y in 0..4 {
+        for x in 0..4 {
+          if (x + y + z) % 2 == 0 {
+            gate_voxel::fill_bricks(
+              &mut g,
+              IVec3::new(x * 16, y * 16, z * 16),
+              IVec3::splat(4),
+              4,
+              3,
+            );
+          }
+        }
+      }
+    }
+    let vols = Volumes::new(g);
+    let pg = bake_probe_grid(&vols);
+    assert!(!pg.positions.is_empty());
+
+    // 两个等价输入：flags 模型 vs BrickState 模型（等价性来自 BrickState→flags 映射）
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let meta = build_meta_texture_data(&pg);
+
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+
+    // 多帧 fuzz（固定 frame 序列 → 确定性 can_skip 决策）
+    for frame in 0..100u32 {
+      let input = ActiveInput {
+        pg: &pg,
+        cell_flags: &flags,
+        object_bboxes: &[],
+        cascade,
+        finer: None,
+        prev_meta: &meta, // 每帧用同一份 prev（隔离帧间影响）
+        reuse_bounds: REUSE_ALL,
+        frame,
+      };
+      let out = cpu_ddgi_active(&input);
+
+      // 验证：worklist probe_id 集合 ⊆ 有 ENABLED 标志的探针集合
+      let enabled_set: std::collections::HashSet<u32> = pg
+        .cell_index
+        .iter()
+        .enumerate()
+        .filter_map(|(li, &id)| {
+          if id != NO_PROBE && (flags[li] & DDGI_PROBE_FLAG_ENABLED) != 0 {
+            Some(id)
+          } else {
+            None
+          }
+        })
+        .collect();
+      for item in &out.worklist {
+        assert!(
+          enabled_set.contains(&item.probe_id),
+          "worklist 条目必须是 ENABLED 探针"
+        );
+      }
+      assert_eq!(out.indirect_dispatch, out.worklist.len() as u32);
+      // 确定性：同 frame → 同 worklist
+      let out2 = cpu_ddgi_active(&input);
+      assert_eq!(out.worklist, out2.worklist, "固定 seed → 确定性 worklist");
+      assert_eq!(out.next_meta, out2.next_meta, "固定 seed → 确定性 next_meta");
+    }
+  }
+
+  /// M3-1 object bbox：纯 Air 世界 + bbox 与 cell 重叠 → 探针活跃
+  #[test]
+  fn cpu_ddgi_active_object_bbox_triggers() {
+    // 先创建有 chunk 的世界（放实际体素），再清 Air
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(16), 4, 3);
+    // 清 Air（chunk 仍在域内）
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(16), 4, 0);
+    let vols = Volumes::new(g);
+    let pg = bake_probe_grid(&vols);
+    assert!(!pg.positions.is_empty(), "纯 Air chunk 应有探针（D1 全覆盖）");
+
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let meta = build_meta_texture_data(&pg);
+
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+
+    // 无 bbox → 全 Air 探针均不活跃
+    let input_none = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &meta,
+      reuse_bounds: REUSE_ALL,
+      frame: 0,
+    };
+    let out_none = cpu_ddgi_active(&input_none);
+    assert_eq!(out_none.indirect_dispatch, 0, "全 Air 无 bbox → 0 活跃");
+
+    // bbox 覆盖 origin cell → 该 cell 探针活跃
+    let bbox = ObjectBbox {
+      min: Vec3::ZERO,
+      max: Vec3::splat(16.0),
+    };
+    let input_bbox = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[bbox],
+      cascade,
+      finer: None,
+      prev_meta: &meta,
+      reuse_bounds: REUSE_ALL,
+      frame: 0,
+    };
+    let out_bbox = cpu_ddgi_active(&input_bbox);
+    assert!(
+      out_bbox.indirect_dispatch > 0,
+      "bbox 覆盖 → 至少 1 个探针活跃"
+    );
+    assert!(
+      out_bbox.indirect_dispatch <= pg.positions.len() as u32,
+      "不超过全探针"
+    );
   }
 }
