@@ -846,6 +846,40 @@ pub fn outside_lower_grid(lo: IVec3, hi: IVec3, finer_origin: IVec3, finer_dims:
 }
 
 // ============================================================================
+// M4-3 级联滚动（CPU 侧滚动数学；WGSL 侧 reuse 继承已在 ddgi_active）
+// ============================================================================
+
+/// 相机 fine 坐标 → 级联滚动原点（**16-cell 全局坐标**，cell_size 对齐）。
+/// 窗口以相机所在 cell 为中心对称展开（PROBES_PER_CASCADE_AXIS³）：
+/// origin_cell = (⌊cam/cell_size⌋ − half) × cell_size / 16。
+/// 相机移动不足一个 cell 时原点不动（cell 对齐步进 = 天然 reuse 分带）。
+#[inline]
+pub fn cascade_scroll_origin(cam_fine: Vec3, cell_size: i32) -> IVec3 {
+  let cam_cell = (cam_fine / cell_size as f32).floor().as_ivec3();
+  let half = (PROBES_PER_CASCADE_AXIS / 2) as i32;
+  (cam_cell - half) * cell_size / DDGI_CELL
+}
+
+/// 滚动 reuse bounds（**新网格 rel 坐标**，半开 [lo, hi) 逐轴）：
+/// shift = (new_origin − old_origin) / (cell_size/16)（级联 cell 单位）；
+/// 新 rel 的世界 cell 与旧网格重叠 ⟺ rel − shift ∈ [0, dims) ⟺ rel ∈ [shift, dims+shift)，
+/// 与 [0, dims) 交 = [max(shift,0), min(dims+shift, dims))。
+/// ddgi_active 对 reusable 探针继承 prev age（D10），窗外归零重新收敛。
+#[inline]
+pub fn scroll_reuse_bounds(
+  old_origin: IVec3,
+  new_origin: IVec3,
+  dims: UVec3,
+  cell_size: i32,
+) -> (IVec3, IVec3) {
+  let shift = (new_origin - old_origin) / (cell_size / DDGI_CELL);
+  let d = dims.as_ivec3();
+  let lo = shift.max(IVec3::ZERO);
+  let hi = (d + shift).min(d).max(lo);
+  (lo, hi)
+}
+
+// ============================================================================
 // M3-1 active 判定 CPU 镜像（WGSL ddgi_active.wgsl 镜像源；spec D2/D4/D7/D10）
 // 逐字对照 Douglas sort.glsl L218-262（截图1-2）
 // ============================================================================
@@ -5029,5 +5063,70 @@ mod tests {
     );
     // 房间墙在探针射程内 → 存在非远距 depth
     assert!(depth.iter().any(|d| *d < PROBE_T_MAX), "应有墙面命中深度");
+  }
+
+  // ==========================================================================
+  // M4-3 级联滚动单测
+  // ==========================================================================
+
+  /// cascade_scroll_origin：cell 对齐 + 相机居中 + 亚 cell 移动不动点
+  #[test]
+  fn cascade_scroll_origin_test() {
+    let dims = UVec3::splat(PROBES_PER_CASCADE_AXIS);
+    // 相机 fine (300,500,700)、cell 32：cam_cell=(9,15,21)，half=8 → origin=(1,7,13)×2=(2,14,26)
+    let o = cascade_scroll_origin(Vec3::new(300.0, 500.0, 700.0), 32);
+    assert_eq!(o, IVec3::new(2, 14, 26));
+    // cell_size 对齐：origin×16 必为 cell_size 整倍数
+    for a in 0..3 {
+      assert_eq!((o[a] * DDGI_CELL) % 32, 0, "origin 须 32-cell 对齐");
+    }
+    // 覆盖检查：相机 cell ∈ [origin, origin+dims)（16-cell）
+    let hi = o + dims.as_ivec3() * (32 / DDGI_CELL);
+    let cam_cell16 = IVec3::new(9, 15, 21) * 2;
+    assert!(
+      cam_cell16.cmpge(o).all() && cam_cell16.cmplt(hi).all(),
+      "相机居中"
+    );
+    // 亚 cell 移动 → 原点不动（cell 对齐步进）
+    let o2 = cascade_scroll_origin(Vec3::new(310.0, 505.0, 700.0), 32);
+    assert_eq!(o, o2, "移动 < 1 cell 原点不动");
+    // 跨过 cell 边界 → 原点步进一格（16-cell）
+    let o3 = cascade_scroll_origin(Vec3::new(322.0, 500.0, 700.0), 32);
+    assert_eq!(
+      o3.x,
+      o.x + 2,
+      "跨 cell 边界步进 1 级联 cell（=2 个 16-cell）"
+    );
+    // 负坐标：floor 语义（-100/32→-4，-5/32→-1，33/32→1；cam_cell=(-4,-1,1)
+    // → (-4,-1,1)-8 = (-12,-9,-7) × 2）
+    let o4 = cascade_scroll_origin(Vec3::new(-100.0, -5.0, 33.0), 32);
+    assert_eq!(o4, IVec3::new(-24, -18, -14));
+  }
+
+  /// scroll_reuse_bounds：shift=0 全 reuse / 正负向滚动分带 / 大跳全重置
+  #[test]
+  fn scroll_reuse_bounds_test() {
+    let dims = UVec3::splat(16);
+    let cs = 32;
+    let o0 = cascade_scroll_origin(Vec3::splat(500.0), cs);
+    // 不动：全 reuse
+    let (lo, hi) = scroll_reuse_bounds(o0, o0, dims, cs);
+    assert_eq!((lo, hi), (IVec3::ZERO, IVec3::splat(16)));
+    // +1 级联 cell：rel 0 列出新（世界 cell 无旧数据）→ [1,16)
+    let o1 = o0 + IVec3::splat(2); // 2 个 16-cell = 1 级联 cell
+    let (lo, hi) = scroll_reuse_bounds(o0, o1, dims, cs);
+    assert_eq!((lo, hi), (IVec3::splat(1), IVec3::splat(16)));
+    // -1 级联 cell：末列出新 → [0,15)
+    let (lo, hi) = scroll_reuse_bounds(o1, o0, dims, cs);
+    assert_eq!((lo, hi), (IVec3::ZERO, IVec3::splat(15)));
+    // 大跳（超 1 窗口）：无重叠 → 空区间（lo==hi）→ 全部 age 归零
+    let o2 = o0 + IVec3::splat(2 * 16 * 3); // 跳 3 个窗口
+    let (lo, hi) = scroll_reuse_bounds(o0, o2, dims, cs);
+    assert!(lo.cmpge(hi).all(), "无重叠 → 空 reuse 区间");
+    // 混合轴：x 动 y 不动
+    let o3 = o0 + IVec3::new(2, 0, 0);
+    let (lo, hi) = scroll_reuse_bounds(o0, o3, dims, cs);
+    assert_eq!(lo.x, 1, "x 轴新列");
+    assert_eq!((lo.y, hi.y), (0, 16), "y 轴全 reuse");
   }
 }
