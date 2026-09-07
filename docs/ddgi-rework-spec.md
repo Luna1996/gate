@@ -168,7 +168,7 @@
 - [x] M3-3 ddgi_update（CPU 镜像 + f16 门禁 + 6 单测 + WGSL 镜像 done，commit `5fc032f`/`186e223`）
 - [x] M3-4 sample_ddgi（6 组 CPU 单测 M3-2 已绿；WGSL ddgi_sample 单级联版 done `186e223`；级联距离选级 + 过渡带混合随 M4-3 滚动接线）
 - [x] M4-1 资源/features/BG4（commit `87f4c45`：DdgiUniform 112B + BG4 v2 13 binding + D7 纹理数组双缓冲 + dispatch 兼 indirect + 四管线排队 + 插件挂回；空跑验收过：demo 334k 探针 1307 层无 ERROR。**SHADER_F16/subgroup features 均不需要**——rgba16f 是纹理格式、subgroup 走 atomicAdd fallback；wgpu 默认 max_texture_array_layers=2048）
-- [x] M4-2 三 pass 编排 + indirect 一致性（commit `ac8fc48`：dispatch_ddgi 挂 RenderGraph .before(dispatch_dda)，copy→clear→active→[copy 桥接]→cast→update；ping-pong 帧首交换；dda_main 命中着色 +alb·ddgi_sample 间接项接线，beam 同布局全量绑定。**wgpu 验证三连坑**：copy src==dst 同 handle 非法（烘焙必须建 6 张独立纹理）/ 纹理 usage 缺 COPY_SRC / 同 dispatch scope 内 STORAGE 与 INDIRECT 互斥（dispatch 计数与 indirect buffer 拆双 buffer，encoder copy 桥接）。真机零 ERROR，ddgi_update=0.009ms 活跃）
+- [x] M4-2 三 pass 编排 + indirect 一致性（commit `ac8fc48`；目验反馈修复 `e89422c`：dda_main 补 R3-18 太阳硬阴影射线（vis_cache 拆除时遗失）+ **逐体素锚定着色**（albedo/normal/体素中心/阴影原点/DDGI 采样点统一体素中心，#22 一体素一色）+ CPU oracle 日志（`DDGI active oracle: 81281/334422`，GPU count 对照）。**wgpu 验证三连坑**：copy src==dst 同 handle 非法（烘焙必须建 6 张独立纹理）/ 纹理 usage 缺 COPY_SRC / 同 dispatch scope 内 STORAGE 与 INDIRECT 互斥（dispatch 计数与 indirect buffer 拆双 buffer，encoder copy 桥接）。真机零 ERROR，trace 1.35→1.82ms（阴影射线 +0.47ms），ddgi_update=0.009ms）
 - [ ] M4-3 级联滚动 + reuse bounds
 - [ ] M4-4 编辑响应重接
 - [ ] M5-1 旧代码清除
