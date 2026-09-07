@@ -225,7 +225,14 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(button(&ctx, p, ButtonConfig { text: "OK".into(), ..default() }));
+      child = Some(button(
+        &ctx,
+        p,
+        ButtonConfig {
+          text: "OK".into(),
+          ..default()
+        },
+      ));
     });
     let h = child.expect("button spawned");
     let e = *h;
@@ -252,14 +259,47 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let (mut s, mut g, mut d) = (None, None, None);
     app.world_mut().entity_mut(root).with_children(|p| {
-      s = Some(button(&ctx, p, ButtonConfig { text: "S".into(), variant: ButtonVariant::Secondary, ..default() }));
-      g = Some(button(&ctx, p, ButtonConfig { text: "G".into(), variant: ButtonVariant::Ghost, ..default() }));
-      d = Some(button(&ctx, p, ButtonConfig { text: "D".into(), variant: ButtonVariant::Danger, ..default() }));
+      s = Some(button(
+        &ctx,
+        p,
+        ButtonConfig {
+          text: "S".into(),
+          variant: ButtonVariant::Secondary,
+          ..default()
+        },
+      ));
+      g = Some(button(
+        &ctx,
+        p,
+        ButtonConfig {
+          text: "G".into(),
+          variant: ButtonVariant::Ghost,
+          ..default()
+        },
+      ));
+      d = Some(button(
+        &ctx,
+        p,
+        ButtonConfig {
+          text: "D".into(),
+          variant: ButtonVariant::Danger,
+          ..default()
+        },
+      ));
     });
     let w = app.world();
-    assert_eq!(*w.get::<ButtonVariant>(*s.unwrap()).unwrap(), ButtonVariant::Secondary);
-    assert_eq!(*w.get::<ButtonVariant>(*g.unwrap()).unwrap(), ButtonVariant::Ghost);
-    assert_eq!(*w.get::<ButtonVariant>(*d.unwrap()).unwrap(), ButtonVariant::Danger);
+    assert_eq!(
+      *w.get::<ButtonVariant>(*s.unwrap()).unwrap(),
+      ButtonVariant::Secondary
+    );
+    assert_eq!(
+      *w.get::<ButtonVariant>(*g.unwrap()).unwrap(),
+      ButtonVariant::Ghost
+    );
+    assert_eq!(
+      *w.get::<ButtonVariant>(*d.unwrap()).unwrap(),
+      ButtonVariant::Danger
+    );
   }
 
   #[test]
@@ -311,14 +351,7 @@ mod tests {
     assert!(clicks.lock().unwrap().is_empty());
     assert_eq!(bg_of(&app), color_of(&theme.colors.accent_fill_pressed));
     assert!(
-      (app
-        .world()
-        .get::<UiTransform>(btn)
-        .unwrap()
-        .scale
-        .x - 0.98)
-        .abs()
-        < 1e-6,
+      (app.world().get::<UiTransform>(btn).unwrap().scale.x - 0.98).abs() < 1e-6,
       "pressed scale 0.98"
     );
 

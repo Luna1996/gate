@@ -93,7 +93,9 @@ mod tests {
   }
 
   fn set_cursor(app: &mut App, pos: Option<(f32, f32)>) {
-    let mut windows = app.world_mut().query_filtered::<&mut Window, With<PrimaryWindow>>();
+    let mut windows = app
+      .world_mut()
+      .query_filtered::<&mut Window, With<PrimaryWindow>>();
     let mut window = windows.single_mut(app.world_mut()).unwrap();
     window.set_physical_cursor_position(pos.map(|(x, y)| DVec2::new(x as f64, y as f64)));
   }
@@ -139,10 +141,7 @@ mod tests {
     assert!(captured(&mut app), "visible again → captured");
 
     // FocusPolicy::Pass 的节点本身不捕获
-    app
-      .world_mut()
-      .entity_mut(node)
-      .insert(FocusPolicy::Pass);
+    app.world_mut().entity_mut(node).insert(FocusPolicy::Pass);
     assert!(!captured(&mut app), "Pass node does not capture");
   }
 }

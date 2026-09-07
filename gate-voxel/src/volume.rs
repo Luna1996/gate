@@ -233,7 +233,10 @@ impl VolumeGrid {
   /// chunk 间零共享 → rayon 并行；导入后全场景百万级节点，串行 ~1s → 并行 ~0.1s。
   pub fn compact_all(&mut self) {
     use rayon::prelude::*;
-    self.chunks.par_iter_mut().for_each(|(_, tree)| tree.compact());
+    self
+      .chunks
+      .par_iter_mut()
+      .for_each(|(_, tree)| tree.compact());
   }
 
   /// 挂载外部预构建的 chunk 树（大体积批量导入专用）。

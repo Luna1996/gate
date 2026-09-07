@@ -22,8 +22,8 @@ pub use theme::{
 pub use widgets::{
   ButtonConfig, ButtonHandle, ButtonVariant, CheckboxBox, CheckboxConfig, CheckboxHandle,
   CheckboxToggled, GridConfig, GridHandle, InteractionPrev, LabelConfig, LabelHandle, LabelStyle,
-  ListConfig, ListHandle, PanelConfig, PanelHandle, PanelSurface, PlotCanvas, PlotConfig,
-  PlotData, PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis, RingList, ScrollConfig,
+  ListConfig, ListHandle, PanelConfig, PanelHandle, PanelSurface, PlotCanvas, PlotConfig, PlotData,
+  PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis, RingList, ScrollConfig,
   ScrollContent, ScrollView, ScrollViewHandle, ScrollViewport, SliderConfig, SliderHandle,
   SliderRange, SliderStep, SliderThumb, SliderValue, SliderValueChanged, TabButton, TabChanged,
   TabConfig, TabContent, TabView, TabViewHandle, TableCell, TableConfig, TableHandle, ToggleKnob,
@@ -31,6 +31,6 @@ pub use widgets::{
   UiCtx, UiGrid, UiSlider, UiTable, blank_plot_image, button, button_state_system, checkbox,
   checkbox_state_system, clamp_step, color_of, grid, grid_cell, label, list, panel, plot,
   plot_redraw_system, px, ring_list_sync_system, scroll_view, scroll_view_system, slider,
-  slider_drag_system, slider_visual_system, splitter, table, tab_view, tab_view_system,
+  slider_drag_system, slider_visual_system, splitter, tab_view, tab_view_system, table,
   toggle_switch, toggle_switch_state_system,
 };

@@ -81,7 +81,13 @@ pub struct LabelConfig {
 pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> LabelHandle {
   let fs = &ctx.theme.metrics.font_size;
   let (size, color) = config.style.tokens();
-  let e = spawn_label(ctx, parent, config.text, size(fs), color_of(&color(&ctx.theme.colors)));
+  let e = spawn_label(
+    ctx,
+    parent,
+    config.text,
+    size(fs),
+    color_of(&color(&ctx.theme.colors)),
+  );
   LabelHandle(e)
 }
 
@@ -98,7 +104,14 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(label(&ctx, p, LabelConfig { text: "hello".into(), ..default() }));
+      child = Some(label(
+        &ctx,
+        p,
+        LabelConfig {
+          text: "hello".into(),
+          ..default()
+        },
+      ));
     });
     let e = *child.expect("label spawned");
     let w = app.world();
@@ -125,10 +138,38 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut got = Vec::new();
     app.world_mut().entity_mut(root).with_children(|p| {
-      got.push(*label(&ctx, p, LabelConfig { text: "t".into(), style: LabelStyle::Title }));
-      got.push(*label(&ctx, p, LabelConfig { text: "m".into(), style: LabelStyle::Muted }));
-      got.push(*label(&ctx, p, LabelConfig { text: "f".into(), style: LabelStyle::FaintLg }));
-      got.push(*label(&ctx, p, LabelConfig { text: "s".into(), style: LabelStyle::Success }));
+      got.push(*label(
+        &ctx,
+        p,
+        LabelConfig {
+          text: "t".into(),
+          style: LabelStyle::Title,
+        },
+      ));
+      got.push(*label(
+        &ctx,
+        p,
+        LabelConfig {
+          text: "m".into(),
+          style: LabelStyle::Muted,
+        },
+      ));
+      got.push(*label(
+        &ctx,
+        p,
+        LabelConfig {
+          text: "f".into(),
+          style: LabelStyle::FaintLg,
+        },
+      ));
+      got.push(*label(
+        &ctx,
+        p,
+        LabelConfig {
+          text: "s".into(),
+          style: LabelStyle::Success,
+        },
+      ));
     });
     let w = app.world();
     assert_eq!(

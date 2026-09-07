@@ -261,11 +261,7 @@ pub fn march_mask_lut_words() -> Vec<u32> {
       ];
       let mut mask = 0u64;
       for p in 0..MARCH_MASK_ENTRIES {
-        let q = [
-          (p & 3) as i32,
-          ((p >> 2) & 3) as i32,
-          ((p >> 4) & 3) as i32,
-        ];
+        let q = [(p & 3) as i32, ((p >> 2) & 3) as i32, ((p >> 4) & 3) as i32];
         let ok = [0, 1, 2].iter().all(|&i| {
           if pos[i] {
             q[i] >= e[i] - 1
@@ -277,7 +273,8 @@ pub fn march_mask_lut_words() -> Vec<u32> {
           mask |= 1u64 << p;
         }
       }
-      let base = entry * MARCH_MASK_WORDS_PER_ENTRY + oct * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY;
+      let base =
+        entry * MARCH_MASK_WORDS_PER_ENTRY + oct * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY;
       out[base] = mask as u32;
       out[base + 1] = (mask >> 32) as u32;
     }
@@ -400,8 +397,8 @@ mod tests {
   /// 读 LUT 单项（octant × entry → u64 掩码），布局与 shader 端
   /// `b_leaves[oct*128 + entry*2 ..]` 一致
   fn lut_get(lut: &[u32], oct: usize, entry: usize) -> u64 {
-    let base = oct * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY
-      + entry * MARCH_MASK_WORDS_PER_ENTRY;
+    let base =
+      oct * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY + entry * MARCH_MASK_WORDS_PER_ENTRY;
     lut[base] as u64 | ((lut[base + 1] as u64) << 32)
   }
 

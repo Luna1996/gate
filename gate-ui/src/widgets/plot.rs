@@ -292,7 +292,10 @@ impl Default for PlotConfig {
 pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
-  let canvas_border = (UiRect::all(px(m.border_width)), BorderColor::all(color_of(&c.border)));
+  let canvas_border = (
+    UiRect::all(px(m.border_width)),
+    BorderColor::all(color_of(&c.border)),
+  );
   match config.layout {
     PlotLayout::Plain => {
       let canvas_width = match config.canvas_width {
@@ -563,7 +566,11 @@ mod tests {
       .unwrap();
     let data = img.data.as_ref().unwrap();
     let i = ((PLOT_H / 4 * PLOT_W) * 4) as usize;
-    assert_eq!(data[i + 3], 0, "empty plot stays transparent (no indicator)");
+    assert_eq!(
+      data[i + 3],
+      0,
+      "empty plot stays transparent (no indicator)"
+    );
 
     // push 两个样本 → 对角线出现
     {

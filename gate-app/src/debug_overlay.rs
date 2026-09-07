@@ -165,7 +165,10 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
               checked: false, // 默认隐藏 showcase，与 spawn_showcase 初始 Hidden 同步
             },
           );
-          cell.world_mut().entity_mut(*t).insert(ShowcaseVisibilityToggle);
+          cell
+            .world_mut()
+            .entity_mut(*t)
+            .insert(ShowcaseVisibilityToggle);
         });
       });
       // grid 默认 width: Percent(100) → 绝对定位根下改为收缩到内容宽（shrink-to-fit）

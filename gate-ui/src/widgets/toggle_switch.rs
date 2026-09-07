@@ -166,7 +166,10 @@ pub fn toggle_switch_state_system(
       } else {
         commands.entity(e).insert(Checked);
       }
-      commands.trigger(ToggleSwitchToggled { entity: e, checked: !checked });
+      commands.trigger(ToggleSwitchToggled {
+        entity: e,
+        checked: !checked,
+      });
     }
     prev.0 = *inter;
     let hovered = *inter == Interaction::Hovered;

@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
 
-use glam::{IVec3};
-use gate_voxel::{ChunkCoord, ChunkTree, PaletteEntry, VolumeGrid, CHUNK_SIZE};
+use gate_voxel::{CHUNK_SIZE, ChunkCoord, ChunkTree, PaletteEntry, VolumeGrid};
+use glam::IVec3;
 use rayon::prelude::*;
 
 /// 加载结果：场景 AABB（世界坐标）+ 统计
@@ -159,10 +159,12 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene) {
     pal.set(i as u8, e);
   }
   // 材质统计（诊断白像素：emissive 体素在直接光 + GI 射线端点都会高频贡献亮度）
-  let em: Vec<u8> = (1..=255u8)
-    .filter(|&i| pal.get(i).emissive > 0)
-    .collect();
-  bevy::log::info!("VOX MATERIAL: {} emissive palette indices = {:?}", em.len(), em);
+  let em: Vec<u8> = (1..=255u8).filter(|&i| pal.get(i).emissive > 0).collect();
+  bevy::log::info!(
+    "VOX MATERIAL: {} emissive palette indices = {:?}",
+    em.len(),
+    em
+  );
 }
 
 /// vox-rs Transform（移植自 ogt_vox，二者矩阵字段逐一同构）：平移在
@@ -272,8 +274,9 @@ fn bucket_model(
         if c == 0 {
           continue;
         }
-        let world = IVec3::from(xform(t, m.size_x, m.size_y, m.size_z, x as u32, y as u32, z as u32))
-          + flip_gate
+        let world = IVec3::from(xform(
+          t, m.size_x, m.size_y, m.size_z, x as u32, y as u32, z as u32,
+        )) + flip_gate
           + offset;
         let cc = ChunkCoord(world.div_euclid(IVec3::splat(CHUNK_SIZE)));
         if cur_key != Some(cc) {
@@ -283,9 +286,8 @@ fn bucket_model(
           cur_key = Some(cc);
         }
         let local = world.rem_euclid(IVec3::splat(CHUNK_SIZE));
-        cur_buf.push(
-          local.x as u32 | (local.y as u32) << 8 | (local.z as u32) << 16 | (c as u32) << 24,
-        );
+        cur_buf
+          .push(local.x as u32 | (local.y as u32) << 8 | (local.z as u32) << 16 | (c as u32) << 24);
       }
     }
   }
@@ -367,8 +369,14 @@ mod tests {
     assert_eq!(xform(&t, 4, 4, 4, 0, 0, 0), (98, 48, -198));
 
     // 奇数尺寸：pivot = floor(size/2)，ogt 文档的 3×4×1 例子 pivot=(1,2,0)
-    assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 1, 2, 0), (0, 0, 0));
-    assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 0, 0, 0), (-1, 0, 2));
+    assert_eq!(
+      xform(&vox_rs::Transform::identity(), 3, 4, 1, 1, 2, 0),
+      (0, 0, 0)
+    );
+    assert_eq!(
+      xform(&vox_rs::Transform::identity(), 3, 4, 1, 0, 0, 0),
+      (-1, 0, 2)
+    );
 
     // 绕 vox Z 轴 90° 旋转（packed byte 33：row0=+Y, row1=−X, row2=+Z），
     // vox 空间 (wx,wy) = (ly, −lx)
@@ -455,7 +463,8 @@ mod tests {
       voxels: vec![1, 2],
     };
     let cells = |buf: &[u32]| -> Vec<(IVec3, u8)> {
-      buf.iter()
+      buf
+        .iter()
         .map(|&p| {
           (
             IVec3::new(
@@ -604,8 +613,14 @@ mod tests {
     let (w1, m1, c1, c1_id) = run(true);
     println!("before(flip=0): written={w0} multi_cells={m0} conflict_cells={c0}");
     println!("after (flip) : written={w1} multi_cells={m1} conflict_cells={c1}");
-    println!("after: 冲突中全 identity 写入方对={c1_id}（含旋转方={}", c1 - c1_id);
+    println!(
+      "after: 冲突中全 identity 写入方对={c1_id}（含旋转方={}",
+      c1 - c1_id
+    );
     assert_eq!(w0, w1, "两约定写入体素数应一致");
-    assert!(c1 < c0 / 2, "翻转补偿后异色冲突应减半以上（before={c0} after={c1}）");
+    assert!(
+      c1 < c0 / 2,
+      "翻转补偿后异色冲突应减半以上（before={c0} after={c1}）"
+    );
   }
 }

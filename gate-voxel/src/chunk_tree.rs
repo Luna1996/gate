@@ -205,7 +205,11 @@ impl ChunkTree {
       None => self.root_palette,
       Some(i) => match &self.nodes[i] {
         Node::Uniform(p) => *p,
-        Node::Split { mask, palette, children } => {
+        Node::Split {
+          mask,
+          palette,
+          children,
+        } => {
           let mut counts = [0u16; 256];
           for i in 0u32..64 {
             let c = if *mask & (1u64 << i) != 0 {

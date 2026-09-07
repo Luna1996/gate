@@ -143,7 +143,10 @@ pub fn checkbox_state_system(
       } else {
         commands.entity(e).insert(Checked);
       }
-      commands.trigger(CheckboxToggled { entity: e, checked: !checked });
+      commands.trigger(CheckboxToggled {
+        entity: e,
+        checked: !checked,
+      });
     }
     prev.0 = *inter;
     let hovered = *inter == Interaction::Hovered;
@@ -307,7 +310,14 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(checkbox(&ctx, p, CheckboxConfig { text: Some("opt".into()), checked: false }));
+      child = Some(checkbox(
+        &ctx,
+        p,
+        CheckboxConfig {
+          text: Some("opt".into()),
+          checked: false,
+        },
+      ));
     });
     let h = child.expect("checkbox spawned");
     let e = *h;

@@ -14,10 +14,14 @@ use gate_render::{
   VoxelScene, create_dda_image,
 };
 use gate_voxel::{
-  PaletteEntry, Volumes, VolumeGrid, draw_text, fill_box, fill_bricks, fill_sphere,
+  PaletteEntry, VolumeGrid, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
 };
 
-use crate::{ASSETS_PATH, camera::{CAM_FAR, CAM_NEAR, FOV_Y}, vox_scene};
+use crate::{
+  ASSETS_PATH,
+  camera::{CAM_FAR, CAM_NEAR, FOV_Y},
+  vox_scene,
+};
 
 pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let dda_handle = create_dda_image(&mut images);
@@ -54,8 +58,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     _ => {
       let anchor = IVec3::new(*EXT_FINE_HALF, 16, *EXT_FINE_HALF);
       let path = Path::new(ASSETS_PATH).join("vox/nuke.vox");
-      let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
-        .expect("nuke.vox 加载失败");
+      let info = vox_scene::load_vox_scene(&mut grid, &path, anchor).expect("nuke.vox 加载失败");
       cam_eye = Vec3::new(406.5, 339.5, 431.5);
       cam_target = Vec3::new(551.5, 330.5, 359.5);
       bevy::log::info!(

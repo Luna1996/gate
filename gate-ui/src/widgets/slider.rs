@@ -72,7 +72,12 @@ pub struct SliderConfig {
 
 impl Default for SliderConfig {
   fn default() -> Self {
-    Self { min: 0.0, max: 1.0, value: 0.0, step: None }
+    Self {
+      min: 0.0,
+      max: 1.0,
+      value: 0.0,
+      step: None,
+    }
   }
 }
 
@@ -111,7 +116,10 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
       UiSlider,
       Interaction::default(),
       RelativeCursorPosition::default(),
-      SliderRange { min: config.min, max: config.max },
+      SliderRange {
+        min: config.min,
+        max: config.max,
+      },
       SliderStep(config.step),
       SliderValue(v),
       Node {
@@ -202,17 +210,17 @@ pub fn slider_drag_system(
     let v = clamp_step(target, range.min, range.max, step.0);
     if (val.0 - v).abs() > f32::EPSILON {
       val.0 = v;
-      commands.trigger(SliderValueChanged { entity: e, value: v });
+      commands.trigger(SliderValueChanged {
+        entity: e,
+        value: v,
+      });
     }
   }
 }
 
 /// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px
 pub fn slider_visual_system(
-  mut q_root: Query<
-    (&SliderValue, &SliderRange, &Interaction, &Children),
-    With<UiSlider>,
-  >,
+  mut q_root: Query<(&SliderValue, &SliderRange, &Interaction, &Children), With<UiSlider>>,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
   mut thumbs: Query<&mut Node, With<SliderThumb>>,
 ) {
@@ -263,7 +271,16 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(slider(&ctx, p, SliderConfig { min: 0.0, max: 100.0, value: 25.0, step: Some(5.0) }));
+      child = Some(slider(
+        &ctx,
+        p,
+        SliderConfig {
+          min: 0.0,
+          max: 100.0,
+          value: 25.0,
+          step: Some(5.0),
+        },
+      ));
     });
     let h = child.expect("slider spawned");
     let e = *h;

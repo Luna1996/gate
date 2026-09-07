@@ -189,9 +189,7 @@ pub(crate) fn left_click_pick_recenter(
 #[cfg(test)]
 mod aabb_zoom_tests {
   use super::*;
-  use gate_render::{
-    BrickMapGlobals, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip,
-  };
+  use gate_render::{BrickMapGlobals, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip};
   use gate_voxel::PaletteEntry;
   use glam::{Mat4, Vec3, Vec4};
 

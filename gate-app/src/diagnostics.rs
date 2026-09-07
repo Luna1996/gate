@@ -19,11 +19,8 @@ pub(crate) fn gpu_frame_log(
   mut acc: Local<f32>,
 ) {
   if log_file.is_none() {
-    *log_file = std::fs::File::create(concat!(
-      env!("CARGO_MANIFEST_DIR"),
-      "/logs/gpu_frame.log"
-    ))
-    .ok();
+    *log_file =
+      std::fs::File::create(concat!(env!("CARGO_MANIFEST_DIR"), "/logs/gpu_frame.log")).ok();
   }
   let dt = time.delta_secs();
   // DiagnosticPath::new 要求 'static（Cow<'static, str>）→ 路径用字面值常量

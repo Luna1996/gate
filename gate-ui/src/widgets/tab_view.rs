@@ -245,7 +245,10 @@ pub fn tab_view_system(
       let Ok((tab_btn, inter, mut prev)) = q_tab.get_mut(tab_e) else {
         continue;
       };
-      if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered && view.active != tab_btn.index {
+      if prev.0 == Interaction::Pressed
+        && *inter == Interaction::Hovered
+        && view.active != tab_btn.index
+      {
         view.active = tab_btn.index;
         commands.trigger(TabChanged {
           entity: view_e,
@@ -317,7 +320,10 @@ mod tests {
   use crate::theme::default_theme;
 
   fn cfg() -> TabConfig {
-    TabConfig { tabs: vec!["a".into(), "b".into()], active: 0 }
+    TabConfig {
+      tabs: vec!["a".into(), "b".into()],
+      active: 0,
+    }
   }
 
   #[test]

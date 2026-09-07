@@ -31,14 +31,16 @@ pub mod plot;
 pub mod scroll_view;
 pub mod slider;
 pub mod splitter;
-pub mod table;
 pub mod tab_view;
+pub mod table;
 pub mod toggle_switch;
 
 pub use button::{
   ButtonConfig, ButtonHandle, ButtonVariant, InteractionPrev, UiClick, button, button_state_system,
 };
-pub use checkbox::{CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system};
+pub use checkbox::{
+  CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system,
+};
 pub use grid::{GridConfig, GridHandle, UiGrid, grid, grid_cell};
 pub use label::{LabelConfig, LabelHandle, LabelStyle, label};
 pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
@@ -56,8 +58,10 @@ pub use slider::{
   SliderValueChanged, UiSlider, clamp_step, slider, slider_drag_system, slider_visual_system,
 };
 pub use splitter::{Splitter, splitter};
-pub use table::{TableConfig, TableCell, TableHandle, UiTable, table};
-pub use tab_view::{TabButton, TabChanged, TabConfig, TabContent, TabView, TabViewHandle, tab_view, tab_view_system};
+pub use tab_view::{
+  TabButton, TabChanged, TabConfig, TabContent, TabView, TabViewHandle, tab_view, tab_view_system,
+};
+pub use table::{TableCell, TableConfig, TableHandle, UiTable, table};
 pub use toggle_switch::{
   ToggleKnob, ToggleSwitch, ToggleSwitchConfig, ToggleSwitchHandle, ToggleSwitchToggled,
   ToggleTrack, toggle_switch, toggle_switch_state_system,

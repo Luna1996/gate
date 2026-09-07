@@ -67,7 +67,11 @@ impl Default for ScrollConfig {
 /// 创建可滚动视图。
 ///
 /// `height`：viewport 高度（Val，可传 px/vh/percent）。
-pub fn scroll_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: ScrollConfig) -> ScrollViewHandle {
+pub fn scroll_view(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  config: ScrollConfig,
+) -> ScrollViewHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
   let mut content_e = None;
@@ -90,22 +94,21 @@ pub fn scroll_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: ScrollConfig)
     ))
     .with_children(|vp| {
       content_e = Some(
-        vp
-          .spawn((
-            Name::new("ui-scroll-content"),
-            ScrollContent,
-            Node {
-              position_type: PositionType::Absolute,
-              top: Val::Px(0.0),
-              left: Val::Px(0.0),
-              right: Val::Px(0.0),
-              flex_direction: FlexDirection::Column,
-              row_gap: px(m.spacing.xs),
-              padding: UiRect::all(px(m.spacing.sm)),
-              ..default()
-            },
-          ))
-          .id(),
+        vp.spawn((
+          Name::new("ui-scroll-content"),
+          ScrollContent,
+          Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(m.spacing.xs),
+            padding: UiRect::all(px(m.spacing.sm)),
+            ..default()
+          },
+        ))
+        .id(),
       );
     })
     .id();
@@ -118,10 +121,7 @@ pub fn scroll_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: ScrollConfig)
 /// 滚轮滚动系统：累加本帧 MouseWheel.y，更新悬停中 viewport 的 scroll_y
 pub fn scroll_view_system(
   mut scroll_reader: MessageReader<MouseWheel>,
-  mut q_vp: Query<
-    (&mut ScrollView, &Interaction, &Children, &ComputedNode),
-    With<ScrollViewport>,
-  >,
+  mut q_vp: Query<(&mut ScrollView, &Interaction, &Children, &ComputedNode), With<ScrollViewport>>,
   mut q_content: Query<(&mut Node, &ComputedNode), With<ScrollContent>>,
 ) {
   // 滚轮 y：正值 = 向上滚（winit/Windows 传统鼠标滚轮正向），内容应下移看上面的内容

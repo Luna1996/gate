@@ -30,7 +30,7 @@ use bevy::{
 
 use super::builder::{VolumesBuilder, VolumesSnapshot};
 use super::wire::{
-  march_mask_lut_words, BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, TREE_BASE,
+  BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, TREE_BASE, march_mask_lut_words,
 };
 
 // ----------------------------------------------------------------------------
@@ -483,7 +483,13 @@ pub(crate) fn prepare(
     let lut_need = (MARCH_MASK_WORDS * 4) as u64;
     if gpu.leaves.size() < lut_need {
       let lut = march_mask_lut_words();
-      write(&device, &queue, &mut gpu.leaves, "gate_leaves", u8_of_u32(&lut));
+      write(
+        &device,
+        &queue,
+        &mut gpu.leaves,
+        "gate_leaves",
+        u8_of_u32(&lut),
+      );
     }
   }
 
@@ -621,10 +627,8 @@ pub(crate) fn prepare(
 
   let elapsed = t0.elapsed();
   let cpu_ms = elapsed.as_secs_f32() * 1000.0;
-  let tx_bytes_total = (struct_tx_bytes
-    + palette_tx_bytes
-    + grid_descs_tx_bytes
-    + snap.state_bytes.len()) as f64;
+  let tx_bytes_total =
+    (struct_tx_bytes + palette_tx_bytes + grid_descs_tx_bytes + snap.state_bytes.len()) as f64;
   let mb = tx_bytes_total / (1 << 20) as f64;
   // full: chunks = 所有 volume 的 chunk_count 之和；incremental: chunks = 本轮 dirty 数
   let chunks_show = if is_full {

@@ -39,10 +39,7 @@ fn size_is_sane(s: UVec2) -> bool {
 /// 窗口物理尺寸 → 渲染目标尺寸（每轴 ÷ factor 向下取整，钳到合法下限）
 fn render_size_for_window(full: UVec2) -> UVec2 {
   let f = render_scale_factor();
-  UVec2::new(
-    (full.x / f).max(MIN_DIM),
-    (full.y / f).max(MIN_DIM),
-  )
+  UVec2::new((full.x / f).max(MIN_DIM), (full.y / f).max(MIN_DIM))
 }
 
 /// 每帧对照主窗口物理尺寸；变化 → 原地重建 DDA 目标纹理并更新 RenderScale
@@ -75,7 +72,11 @@ pub fn resize_render_targets(
   }
   info!(
     "render targets resized: {}x{} (window {}x{}, factor {})",
-    new_size.x, new_size.y, full.x, full.y, render_scale_factor()
+    new_size.x,
+    new_size.y,
+    full.x,
+    full.y,
+    render_scale_factor()
   );
   let extent = Extent3d {
     width: new_size.x,
@@ -135,7 +136,13 @@ mod tests {
   /// 分辨率策略：默认全分辨率（factor=1）；GATE_RES_SCALE=2 降档路径
   #[test]
   fn render_size_follows_factor() {
-    assert_eq!(render_size_for_window(UVec2::new(1600, 900)), UVec2::new(1600, 900));
-    assert_eq!(render_size_for_window(UVec2::new(100, 100)), UVec2::new(100, 100));
+    assert_eq!(
+      render_size_for_window(UVec2::new(1600, 900)),
+      UVec2::new(1600, 900)
+    );
+    assert_eq!(
+      render_size_for_window(UVec2::new(100, 100)),
+      UVec2::new(100, 100)
+    );
   }
 }
