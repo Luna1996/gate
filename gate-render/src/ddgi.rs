@@ -26,6 +26,8 @@
 //! | DDGI_AGE_MAX | DDGI_AGE_MAX | 255 | age 饱和值 |
 //! | META_OFFSET_BITS / META_AGE_SHIFT / META_OFFSET_QUANT | 同名 | 5 / 15 / 32 | 元数据位域 |
 //! | DDGI_ALPHA | DDGI_ALPHA | 0.1 | EMA 新样本权重 |
+//! | DDGI_DEPTH_ALPHA | DDGI_DEPTH_ALPHA | 0.2 | depth EMA 新样本权重（INFERENCE）|
+//! | DDGI_TEXEL_MIN_WEIGHT | DDGI_TEXEL_MIN_WEIGHT | 1e-4 | texel 零覆盖稀疏写阈值（INFERENCE）|
 //! | DDGI_NORMAL_BIAS / DDGI_DEPTH_BIAS | 同名 | 0.2 / 4.0 | 采样权重 |
 //! | PROBE_T_MAX | PROBE_T_MAX | 8192.0 | 射线远距 |
 
@@ -281,6 +283,14 @@ pub fn uniform_sphere_dir(u: [f32; 2]) -> Vec3 {
 /// Σw≈0（本方向无正权样本）→ 返回 0。
 #[inline]
 pub fn collect_radiance(d: Vec3, samples: &[(Vec3, Vec3)]) -> Vec3 {
+  let (sum, wsum) = collect_radiance_ex(d, samples);
+  if wsum <= 0.0 { Vec3::ZERO } else { sum * (std::f32::consts::PI / wsum) }
+}
+
+/// [`collect_radiance`] 带 Σw 版（M3-3 update 需要区分「零覆盖 → 保留 prev」与
+/// 「投影为 0 → 正常暗化」，单一返回值无法表达）
+#[inline]
+pub fn collect_radiance_ex(d: Vec3, samples: &[(Vec3, Vec3)]) -> (Vec3, f32) {
   let mut sum = Vec3::ZERO;
   let mut wsum = 0.0;
   for &(dir, l) in samples {
@@ -288,7 +298,7 @@ pub fn collect_radiance(d: Vec3, samples: &[(Vec3, Vec3)]) -> Vec3 {
     sum += l * w;
     wsum += w;
   }
-  if wsum <= 0.0 { Vec3::ZERO } else { sum * (std::f32::consts::PI / wsum) }
+  (sum, wsum)
 }
 
 // ---- 更新链：EMA + tonemap + 迟滞 ----
@@ -1343,6 +1353,190 @@ pub fn cpu_ddgi_cast(input: &CastInput) -> CastOutput {
 }
 
 // ============================================================================
+// M3-3 update 投影 CPU 镜像（WGSL ddgi_update.wgsl 镜像源；spec D6/D8）
+// 消费 M3-2 样本缓冲 → collect_radiance 投影 + EMA/tonemap/迟滞 → irr/depth；
+// irradiance 全程 f16 存储语义（rgba16f：读侧已舍入 / 累积 f32 / 写回舍入——
+// 风险表「累积 f32 仅存储 f16」fallback 的 CPU 侧体现）；depth 走 r32f（D-Open1）
+// ============================================================================
+
+/// depth EMA 新样本权重（INFERENCE：RTXGI depthHysteresis 默认 0.2；Douglas 未截图，
+/// M5-3 调参）
+pub const DDGI_DEPTH_ALPHA: f32 = 0.2;
+/// texel 零覆盖阈值：Σw < 此值 → 保留 prev 不写（稀疏写——D8「未写 texel = 保留」
+/// 哲学推广到 irradiance；INFERENCE：Douglas collect_radiance 的除零防护未截图，
+/// NaN/0 写进 f16 纹理会摧毁收敛 → 保守跳过）
+pub const DDGI_TEXEL_MIN_WEIGHT: f32 = 1e-4;
+
+// ---- f16 模拟（rgba16f 存储语义；WGSL imageStore 自动 f32→f16 的 CPU 镜像）----
+
+/// f32 → f16 位模式（IEEE 754 binary16，round-to-nearest-even；Inf/NaN/次规格数正确）
+pub fn f32_to_f16(v: f32) -> u16 {
+  let bits = v.to_bits();
+  let sign = ((bits >> 16) & 0x8000) as u16;
+  let exp = ((bits >> 23) & 0xFF) as i32;
+  let mant = bits & 0x007F_FFFF;
+  if exp == 0xFF {
+    // Inf / NaN（NaN 统一压成静默 NaN，语义足够）
+    return sign | if mant == 0 { 0x7C00 } else { 0x7E00 };
+  }
+  if exp == 0 {
+    // f32 次规格数 < 2^-126，远小于 f16 最小次规格数 2^-24 → ±0
+    return sign;
+  }
+  let e = exp - 127; // 无偏指数
+  // round-to-nearest-even：q = val >> shift，余数过半或恰半且 q 为奇 → 进位
+  let round_shift = |val: u32, shift: u32| -> u32 {
+    let half = 1u32 << (shift - 1);
+    let rem = val & ((1u32 << shift) - 1);
+    let q = val >> shift;
+    if rem > half || (rem == half && (q & 1) == 1) {
+      q + 1
+    } else {
+      q
+    }
+  };
+  if e >= 16 {
+    return sign | 0x7C00; // 溢出 → ±Inf
+  }
+  if e >= -14 {
+    // f16 规格数：mant23（不含隐含位）高 10 位舍入
+    let m16 = round_shift(mant, 13);
+    if m16 == 0x400 {
+      // 尾数进位 → 指数 +1（e=15 时恰溢出 → Inf）
+      let e16 = (e + 15 + 1) as u16;
+      return if e16 >= 0x1F { sign | 0x7C00 } else { sign | (e16 << 10) };
+    }
+    return sign | (((e + 15) as u16) << 10) | m16 as u16;
+  }
+  // f16 次规格数：value = m（24 位含隐含 1）× 2^(e-23)，以 2^-24 为单位 → m >> (-e-1)
+  let shift = (-e - 1) as u32; // e ∈ [-25,-15] → shift ∈ [14,24]；e < -25 → 0
+  if shift > 24 {
+    return sign;
+  }
+  let m = mant | 0x0080_0000;
+  let m16 = round_shift(m, shift);
+  if m16 == 0x400 {
+    // 恰好升入规格数 2^-14（e16=1, mant=0）
+    return sign | (1u16 << 10);
+  }
+  sign | m16 as u16
+}
+
+/// f16 位模式 → f32（按位构造，无精度损失；规格/次规格/Inf/NaN 全覆盖）
+pub fn f16_to_f32(h: u16) -> f32 {
+  let sign = ((h & 0x8000) as u32) << 16;
+  let exp = ((h >> 10) & 0x1F) as u32;
+  let mant = (h & 0x03FF) as u32;
+  let bits = match (exp, mant) {
+    (0x1F, 0) => sign | 0x7F80_0000,                  // ±Inf
+    (0x1F, _) => sign | 0x7F80_0000 | (mant << 13),   // NaN
+    (0, 0) => sign,                                   // ±0
+    (0, m) => {
+      // 次规格数：value = m × 2^-24 → 规格化到 f32（m 非零，lz ∈ [22,31]）
+      let lz = m.leading_zeros();
+      sign | ((134 - lz) << 23) | (m << (lz - 8))
+    }
+    (e, m) => sign | ((e + 112) << 23) | (m << 13),   // 规格数
+  };
+  f32::from_bits(bits)
+}
+
+/// f16 往返舍入 = 「存进 rgba16f 再读出」的值（update 读/写两侧共用）
+#[inline]
+pub fn f16_round(v: f32) -> f32 {
+  f16_to_f32(f32_to_f16(v))
+}
+
+// ---- depth 单 texel 更新 ----
+
+/// 单 texel depth 更新（D8：余弦加权平均 + EMA）：
+/// new = Σ w_i·dist_i / Σ w_i（w = max(0, d·dir_i)，与 irradiance 投影同权重——
+/// texel 深度对应该方向可见几何；sky 射线 dist=tmax 远距哨兵自然拉向无遮挡）；
+/// out = lerp(prev, new, DDGI_DEPTH_ALPHA)。Σw < 阈值 → 保留 prev（稀疏写）。
+#[inline]
+pub fn update_depth_texel(prev: f32, d: Vec3, samples: &[RaySample]) -> f32 {
+  let mut sum = 0.0;
+  let mut wsum = 0.0;
+  for s in samples {
+    let w = d.dot(s.dir).max(0.0);
+    sum += s.dist * w;
+    wsum += w;
+  }
+  if wsum < DDGI_TEXEL_MIN_WEIGHT {
+    return prev;
+  }
+  prev + (sum / wsum - prev) * DDGI_DEPTH_ALPHA
+}
+
+/// update 输入（消费 M3-1 worklist + M3-2 样本缓冲 + 上一帧 irr/depth）
+pub struct UpdateInput<'a> {
+  /// M3-1 active 输出的 worklist（can_skip 探针不在其中——天然不更新）
+  pub worklist: &'a [ActiveWorklistItem],
+  /// M3-2 cast 输出（契约：samples.len() == worklist.len() × rays_per_probe）
+  pub cast: &'a CastOutput,
+  /// 上一帧 irradiance（probe_count × 64 Vec4，8×8 oct/探针；f16 纹理的 CPU 侧
+  /// 镜像——读侧经 f16_round，与「纹理里存的本就是 f16 值」一致）
+  pub prev_irr: &'a [Vec4],
+  /// 上一帧 depth（probe_count × 256 f32，16×16 oct/探针；r32f → 无舍入）
+  pub prev_depth: &'a [f32],
+}
+
+/// update 输出：写回后的 irr/depth（非 worklist 探针 = prev 拷贝——ping-pong 语义：
+/// 帧末 prev/next 交换，next 即下一帧的 previous）
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateOutput {
+  pub irr: Vec<Vec4>,
+  pub depth: Vec<f32>,
+}
+
+/// CPU 镜像主入口：worklist 每槽位（= 1 探针）遍历 texel 投影 + 更新链。
+///
+/// WGSL `ddgi_update.wgsl` 等价（dispatch_workgroups_indirect 消费 M3-1 indirect
+/// 参数，workgroup 数 = worklist.len()，1 workgroup = 1 探针）：
+/// - @workgroup_size(64)（= 8×8 irr texel 数；depth 256 texel = 线程序内 4 轮）
+/// - 每 texel：collect_radiance_ex（D6 π·Σw·L/Σw）→ Σw < 阈值 → 稀疏保留 prev
+///   → update_irradiance_texel（M1-3 更新链逐字）→ f16_round 写回
+/// - depth：update_depth_texel（余弦加权均值 + EMA）
+/// - 非本帧探针：纹理不写 = 保留（CPU 镜像 = prev 拷贝初始化）
+pub fn cpu_ddgi_update(input: &UpdateInput) -> UpdateOutput {
+  let mut irr = input.prev_irr.to_vec();
+  let mut depth = input.prev_depth.to_vec();
+  let rays = input.cast.rays_per_probe as usize;
+  for (slot, item) in input.worklist.iter().enumerate() {
+    let id = item.probe_id as usize;
+    let seg = &input.cast.samples[slot * rays..(slot + 1) * rays];
+    let tuples: Vec<(Vec3, Vec3)> = seg.iter().map(|s| (s.dir, s.radiance)).collect();
+    // ---- irradiance 8×8（f16 存储语义：读舍入 / 累积 f32 / 写舍入）----
+    for ty in 0..IRRADIANCE_TEXELS {
+      for tx in 0..IRRADIANCE_TEXELS {
+        let d = oct_texel_dir(tx, ty, IRRADIANCE_TEXELS);
+        let (sum, wsum) = collect_radiance_ex(d, &tuples);
+        if wsum < DDGI_TEXEL_MIN_WEIGHT {
+          continue; // 稀疏写：本 texel 方向无正权样本
+        }
+        let new = sum * (std::f32::consts::PI / wsum);
+        let idx = id * IRRADIANCE_TEXELS as usize * IRRADIANCE_TEXELS as usize
+          + (ty * IRRADIANCE_TEXELS + tx) as usize;
+        let pv = irr[idx].truncate(); // 读侧 = f16 纹理值（分量舍入）
+        let prev = Vec3::new(f16_round(pv.x), f16_round(pv.y), f16_round(pv.z));
+        let out = update_irradiance_texel(prev, new);
+        irr[idx] = Vec4::new(f16_round(out.x), f16_round(out.y), f16_round(out.z), 1.0);
+      }
+    }
+    // ---- depth 16×16（r32f：无舍入）----
+    for ty in 0..DEPTH_TEXELS {
+      for tx in 0..DEPTH_TEXELS {
+        let d = oct_texel_dir(tx, ty, DEPTH_TEXELS);
+        let idx = id * DEPTH_WORDS_PER_PROBE as usize
+          + (ty * DEPTH_TEXELS + tx) as usize;
+        depth[idx] = update_depth_texel(depth[idx], d, seg);
+      }
+    }
+  }
+  UpdateOutput { irr, depth }
+}
+
+// ============================================================================
 // GPU wire（BG4：WGSL DdgiMeta + 4 storage buffer 逐字段镜像）
 // ============================================================================
 
@@ -1871,6 +2065,9 @@ mod tests {
     assert_eq!(DDGI_CASCADE_CELL_SIZES, [16, 32, 64, 128, 256]);
     assert_eq!(PROBES_PER_CASCADE_AXIS, 16);
     assert_eq!(PROBES_PER_LAYER, PROBES_PER_CASCADE_AXIS * PROBES_PER_CASCADE_AXIS);
+    // M3-3 新增（WGSL 镜像防漂移）
+    assert_eq!(DDGI_DEPTH_ALPHA, 0.2);
+    assert_eq!(DDGI_TEXEL_MIN_WEIGHT, 1e-4);
   }
 
   /// probe id → (layer, u, v) 映射：连续 id 铺满 16×16 层网格后进位
@@ -3455,5 +3652,316 @@ mod tests {
       exposure: 1.0,
       sky: None,
     }
+  }
+
+  // ==========================================================================
+  // M3-3 update 投影单测
+  // ==========================================================================
+
+  /// f16 转换黄金值 + 幂等 + 相对误差界（rgba16f 存储语义锁死）
+  #[test]
+  fn f16_conversion_golden() {
+    // f16 精确表示值：往返恒等
+    for v in [0.0, -0.0, 1.0, 0.5, -2.0, 1024.0, 8192.0, 65504.0, 2.0f32.powi(-14)] {
+      assert_eq!(f16_round(v), v, "f16 精确值往返 {v}");
+    }
+    // 位级黄金值（改实现必炸）
+    assert_eq!(f32_to_f16(1.0), 0x3C00);
+    assert_eq!(f32_to_f16(-2.0), 0xC000);
+    assert_eq!(f32_to_f16(0.1), 0x2E66);
+    assert_eq!(f32_to_f16(8192.0), 0x7000, "2^13 → e16=28");
+    assert_eq!(f32_to_f16(f32::INFINITY), 0x7C00);
+    assert_eq!(f16_to_f32(0x2E66), 0.0999755859375);
+    assert_eq!(f16_to_f32(0x3C00), 1.0);
+    assert_eq!(f16_to_f32(0x8000), -0.0);
+    // 0.1 → f16 最近值（0x2E66 = 0.0999755859375）
+    assert_eq!(f16_round(0.1), 0.0999755859375);
+    // ties-to-even：1 + 2^-11 恰在 1.0 与 1+2^-10 中间 → 偶侧（1.0）
+    assert_eq!(f16_round(1.0 + 2.0f32.powi(-11)), 1.0);
+    // 0.75 ULP → 上取；1+3×2^-11 恰在 1+2^-10 与 1+2^-9 中间 → 偶侧上格（mant=2）
+    assert_eq!(f16_round(1.0 + 6.0 * 2.0f32.powi(-13)), 1.0 + 2.0f32.powi(-10));
+    assert_eq!(f16_round(1.0 + 3.0 * 2.0f32.powi(-11)), 1.0 + 2.0f32.powi(-9));
+    // 溢出 → Inf；顶点下不舍入上（65505 距 65504 近、距 65536 远）
+    assert!(f16_round(70000.0).is_infinite());
+    assert!(f16_round(-70000.0).is_infinite());
+    assert_eq!(f16_round(65505.0), 65504.0);
+    assert!(f16_round(65520.0).is_infinite(), "恰半 → 偶侧 Inf");
+    // 次规格数：6e-8 > 2^-25（半 ULP）→ 上取 2^-24；2.9e-8 < 半 → 0
+    assert_eq!(f16_round(6.0e-8), 2.0f32.powi(-24));
+    assert_eq!(f16_round(2.9e-8), 0.0);
+    assert_eq!(f16_round(2.0f32.powi(-25)), 0.0, "恰半 ULP → 偶侧 0");
+    // NaN 语义
+    assert!(f16_round(f32::NAN).is_nan());
+    // fuzz（固定 xorshift）：幂等 + 规格数区间相对误差 ≤ ~2^-11
+    let mut s: u64 = 0xDD63;
+    let mut rand = move || {
+      s ^= s << 13;
+      s ^= s >> 7;
+      s ^= s << 17;
+      s
+    };
+    for _ in 0..4096 {
+      let x = (rand() % 60_000_001) as f32 / 1000.0; // [0, 60000)
+      let r = f16_round(x);
+      assert_eq!(f16_round(r), r, "幂等 x={x} r={r}");
+      if x >= 2.0f32.powi(-14) && r.is_finite() {
+        assert!((r - x).abs() <= x * 5.0e-4 + 1e-9, "rel err x={x} r={r}");
+      }
+    }
+  }
+
+  /// update_depth_texel：零覆盖保留 / 余弦加权均值 / EMA 公式
+  #[test]
+  fn update_depth_texel_math() {
+    let mk = |dirs_dists: &[(Vec3, f32)]| -> Vec<RaySample> {
+      dirs_dists
+        .iter()
+        .map(|&(d, t)| RaySample {
+          dir: d,
+          radiance: Vec3::ONE,
+          dist: t,
+        })
+        .collect()
+    };
+    // 零覆盖：texel -Z 对 +Z 射线 → 保留 prev
+    let s = mk(&[(Vec3::Z, 10.0)]);
+    assert_eq!(update_depth_texel(8192.0, -Vec3::Z, &s), 8192.0);
+    // 全覆盖：EMA 一步向新均值走
+    let out = update_depth_texel(8192.0, Vec3::Z, &s);
+    let expect = 8192.0 + (10.0 - 8192.0) * DDGI_DEPTH_ALPHA;
+    assert!((out - expect).abs() < 1e-4, "{out} vs {expect}");
+    // 余弦加权均值：两条对称 45° 射线（dist 10/20）→ texel +Z 等权 → mean = 15
+    let r2 = 2.0f32.sqrt() / 2.0;
+    let s = mk(&[(Vec3::new(r2, 0.0, r2), 10.0), (Vec3::new(-r2, 0.0, r2), 20.0)]);
+    assert_eq!(update_depth_texel(15.0, Vec3::Z, &s), 15.0, "prev == mean → 不动");
+    let out = update_depth_texel(0.0, Vec3::Z, &s);
+    assert!((out - 15.0 * DDGI_DEPTH_ALPHA).abs() < 1e-5);
+    // 空样本 → 零覆盖 → 保留
+    assert_eq!(update_depth_texel(42.0, Vec3::Z, &[]), 42.0);
+  }
+
+  /// 均匀覆盖投影：恒定 radiance C → 全部 64 texel = f16(πC)；depth 向 D 走一步
+  #[test]
+  fn cpu_ddgi_update_uniform_projection() {
+    let c = 0.05f32;
+    let d = 10.0f32;
+    let rays = 64u32;
+    let samples: Vec<RaySample> = (0..rays)
+      .map(|i| RaySample {
+        dir: fibonacci_dir(i, rays),
+        radiance: Vec3::splat(c),
+        dist: d,
+      })
+      .collect();
+    let cast = CastOutput {
+      samples,
+      rays_per_probe: rays,
+    };
+    let worklist = [ActiveWorklistItem {
+      probe_id: 0,
+      age: 1,
+    }];
+    let prev_irr = vec![Vec4::ZERO; 64];
+    let prev_depth = vec![PROBE_T_MAX; 256];
+    let out = cpu_ddgi_update(&UpdateInput {
+      worklist: &worklist,
+      cast: &cast,
+      prev_irr: &prev_irr,
+      prev_depth: &prev_depth,
+    });
+    // prev 全黑 → hysteresis=0 直采；lum(πC)=0.157 < 1 无亮化钳制 → out = f16(πC)
+    let expect = f16_round(std::f32::consts::PI * c);
+    for t in &out.irr {
+      let v = t.truncate();
+      assert!(
+        (v - Vec3::splat(expect)).length() < 1e-6,
+        "irr texel {v:?} vs πC={expect}"
+      );
+    }
+    // depth：全部 texel 新均值 = D → EMA 一步
+    let expect_d = PROBE_T_MAX + (d - PROBE_T_MAX) * DDGI_DEPTH_ALPHA;
+    for t in &out.depth {
+      assert!((t - expect_d).abs() < 1e-3, "{t} vs {expect_d}");
+    }
+  }
+
+  /// 稀疏写 + ping-pong 拷贝语义：零覆盖 texel 保留 prev；非 worklist 探针不写
+  #[test]
+  fn cpu_ddgi_update_sparse_and_untouched() {
+    // 单射线 +Z：+Z 角 texel (0,0) 更新；-Z 角 texel (7,7) 零覆盖保留
+    let samples = vec![RaySample {
+      dir: Vec3::Z,
+      radiance: Vec3::ONE,
+      dist: 5.0,
+    }];
+    let cast = CastOutput {
+      samples,
+      rays_per_probe: 1,
+    };
+    let worklist = [ActiveWorklistItem {
+      probe_id: 0,
+      age: 1,
+    }];
+    // 两探针数组：probe0 = worklist 内，probe1 = 不在（prev 值应原样保留）
+    let mut prev_irr = vec![Vec4::new(0.5, 0.5, 0.5, 1.0); 128];
+    for t in prev_irr.iter_mut().skip(64) {
+      *t = Vec4::new(0.25, 0.25, 0.25, 1.0);
+    }
+    let mut prev_depth = vec![100.0f32; 512];
+    for t in prev_depth.iter_mut().skip(256) {
+      *t = 200.0;
+    }
+    let out = cpu_ddgi_update(&UpdateInput {
+      worklist: &worklist,
+      cast: &cast,
+      prev_irr: &prev_irr,
+      prev_depth: &prev_depth,
+    });
+    // probe1（非 worklist）完全不写
+    assert!(out.irr[64..].iter().all(|t| t.truncate() == Vec3::splat(0.25)));
+    assert!(out.depth[256..].iter().all(|t| *t == 200.0));
+    // probe0 的 -Z 角 texel：oct 图四角均为下半球折叠区（dir·(+Z) < 0）→ 零覆盖保留。
+    // irr 8×8 图角 (7,7)、depth 16×16 图角 (15,15)；+Z 在图中心（irr (4,4) / depth (8,8)）
+    let idx_mz = 7 * IRRADIANCE_TEXELS as usize + 7;
+    assert_eq!(out.irr[idx_mz].truncate(), Vec3::splat(0.5), "-Z 角 texel 保留");
+    assert_eq!(out.irr[0].truncate(), Vec3::splat(0.5), "-Z 角 texel (0,0) 保留");
+    let dep_mz = 15 * DEPTH_TEXELS as usize + 15;
+    assert_eq!(out.depth[dep_mz], 100.0, "-Z depth 角 texel 保留");
+    // probe0 的 +Z 中心 texel：覆盖 → 更新（单样本投影 = π，链路钳制后 > prev）
+    let idx_pz = 4 * IRRADIANCE_TEXELS as usize + 4;
+    assert!(out.irr[idx_pz].truncate().x > 0.5, "+Z texel 应被更新（π·1 投影）");
+    let new_depth = 100.0 + (5.0 - 100.0) * DDGI_DEPTH_ALPHA;
+    let dep_pz = 8 * DEPTH_TEXELS as usize + 8;
+    assert!(
+      (out.depth[dep_pz] - new_depth).abs() < 1e-4,
+      "+Z depth EMA {} vs {}",
+      out.depth[dep_pz],
+      new_depth
+    );
+  }
+
+  /// f16 收敛门禁：恒定目标 200 帧 → EMA + f16 存储不发散不停摆（误差 < 1%）
+  #[test]
+  fn cpu_ddgi_update_f16_convergence() {
+    let c = 0.05f32;
+    let target = std::f32::consts::PI * c;
+    let rays = 64u32;
+    let samples: Vec<RaySample> = (0..rays)
+      .map(|i| RaySample {
+        dir: fibonacci_dir(i, rays),
+        radiance: Vec3::splat(c),
+        dist: 100.0,
+      })
+      .collect();
+    let cast = CastOutput {
+      samples,
+      rays_per_probe: rays,
+    };
+    let worklist = [ActiveWorklistItem {
+      probe_id: 0,
+      age: 200,
+    }];
+    let mut irr = vec![Vec4::ZERO; 64];
+    let mut depth = vec![PROBE_T_MAX; 256];
+    for _ in 0..200 {
+      let out = cpu_ddgi_update(&UpdateInput {
+        worklist: &worklist,
+        cast: &cast,
+        prev_irr: &irr,
+        prev_depth: &depth,
+      });
+      irr = out.irr;
+      depth = out.depth;
+    }
+    let t0 = irr[0].truncate().x;
+    assert!(
+      (t0 - target).abs() < 1.5e-3,
+      "200 帧后 {t0} vs {target}（f16 存储不停摆）"
+    );
+    // depth 快速收敛（新权重 0.2）：tmax → 100
+    assert!((depth[0] - 100.0).abs() < 1.0, "depth 收敛 {}", depth[0]);
+    // 全部 texel 有限（f16 门禁：无 NaN/Inf 泄漏）
+    assert!(irr
+      .iter()
+      .all(|t| t.x.is_finite() && t.y.is_finite() && t.z.is_finite()));
+  }
+
+  /// active → cast → update 全链 ×30 帧：能量增长（自闭环无限反弹）+ 全程有限
+  #[test]
+  fn cpu_ddgi_pipeline_multiframe() {
+    let vols_world = room_world();
+    let mut g = room_grid();
+    let vols = Volumes::new(std::mem::take(&mut g));
+    let pg = bake_probe_grid(&vols);
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let pool = build_light_pool(&room_theme());
+    let vols_slice: Vec<(&BrickMapBuffers, VolumeTransform)> =
+      vec![(&vols_world, VolumeTransform::IDENTITY)];
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+
+    let mut meta = build_meta_texture_data(&pg);
+    let (mut irr, mut depth) = initial_probe_data(pg.positions.len() as u32);
+    let mut sum1 = 0.0f32;
+    let mut sum30 = 0.0f32;
+    for frame in 1..=30u32 {
+      let active = cpu_ddgi_active(&ActiveInput {
+        pg: &pg,
+        cell_flags: &flags,
+        object_bboxes: &[],
+        cascade,
+        finer: None,
+        prev_meta: &meta,
+        reuse_bounds: REUSE_ALL,
+        frame,
+      });
+      meta = active.next_meta;
+      let rays = cast_rays_per_probe(active.worklist.len() as u32);
+      let prev = DdgiProbeArrays {
+        grid_origin: pg.grid_origin,
+        grid_dims: pg.grid_dims,
+        positions: &pg.positions,
+        cell_index: &pg.cell_index,
+        irr: &irr,
+        depth: &depth,
+      };
+      let cast = cpu_ddgi_cast(&CastInput {
+        vols: &vols_slice,
+        light_pool: &pool,
+        pg: &pg,
+        worklist: &active.worklist,
+        rays_per_probe: rays,
+        frame,
+        prev: &prev,
+      });
+      let upd = cpu_ddgi_update(&UpdateInput {
+        worklist: &active.worklist,
+        cast: &cast,
+        prev_irr: &irr,
+        prev_depth: &depth,
+      });
+      irr = upd.irr;
+      depth = upd.depth;
+      assert!(
+        irr.iter().all(|t| t.x.is_finite() && t.y.is_finite() && t.z.is_finite()),
+        "frame {frame} 出现 NaN/Inf"
+      );
+      if frame == 1 {
+        sum1 = irr.iter().map(|t| t.x + t.y + t.z).sum();
+      }
+      if frame == 30 {
+        sum30 = irr.iter().map(|t| t.x + t.y + t.z).sum();
+      }
+    }
+    assert!(sum1 > 0.0, "首帧应有直光贡献（sum1={sum1}）");
+    assert!(
+      sum30 > sum1,
+      "30 帧自闭环能量增长：sum30={sum30} vs sum1={sum1}"
+    );
+    // 房间墙在探针射程内 → 存在非远距 depth
+    assert!(depth.iter().any(|d| *d < PROBE_T_MAX), "应有墙面命中深度");
   }
 }
