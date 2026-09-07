@@ -1067,6 +1067,7 @@ const DDGI_TEXEL_MIN_WEIGHT: f32 = 1e-4;
 const DDGI_NORMAL_BIAS: f32 = 0.2;
 const DDGI_DEPTH_BIAS: f32 = 4.0;
 const DDGI_T_MAX: f32 = 8192.0;
+const DDGI_RAY_BUDGET: u32 = 4096u;
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
 const DDGI_EMIT_GAIN: f32 = 4.0;
@@ -1515,7 +1516,8 @@ fn ddgi_cast(
   if (wid.x >= count) { return; }
   let probe_id = ddgi_worklist[wid.x];
   let origin = ddgi_positions[probe_id].xyz;
-  let rays = u32(ddgi_u.params.y);
+  // 固定预算分摊（cast_rays_per_probe 镜像）：count 为 active pass 终值（pass 边界保证）
+  let rays = max(DDGI_RAY_BUDGET / count, 1u);
   let frame = u32(ddgi_u.params.x);
   let tid = lid.x;
   for (var i = tid; i < rays; i = i + 64u) {
@@ -1574,7 +1576,8 @@ fn ddgi_update(
   let count = atomicLoad(&ddgi_dispatch[0u]);
   if (wid.x >= count) { return; }
   let probe_id = ddgi_worklist[wid.x];
-  let rays = u32(ddgi_u.params.y);
+  // 与 ddgi_cast 同公式（同 count → 同 rays → 样本缓冲布局一致）
+  let rays = max(DDGI_RAY_BUDGET / count, 1u);
   let seg0 = wid.x * rays;
   let tid = lid.x;
   // ---- irradiance 8×8：1 线程 = 1 texel ----

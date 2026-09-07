@@ -252,8 +252,10 @@ pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
   let mut image =
     Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba8Unorm, None);
   image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-  image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING |
-    TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
+  image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING
+    | TextureUsages::TEXTURE_BINDING
+    | TextureUsages::COPY_SRC
+    | TextureUsages::COPY_DST;
   images.add(image)
 }
 
@@ -992,7 +994,11 @@ fn trace_chunk_cpu(
     return None;
   }
   // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
-  let ro_c = [ro[0] - chunk_min[0], ro[1] - chunk_min[1], ro[2] - chunk_min[2]];
+  let ro_c = [
+    ro[0] - chunk_min[0],
+    ro[1] - chunk_min[1],
+    ro[2] - chunk_min[2],
+  ];
   // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv；与 WGSL inv_rd 镜像）
   let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
   let read_brick = |addr: usize| BrickCpu {
@@ -1000,11 +1006,19 @@ fn trace_chunk_cpu(
     mask: ((b_struct[addr + 1] as u64) << 32) | b_struct[addr] as u64,
     pal: (b_struct[addr + 2] & 0xFF) as u8,
   };
-  let mut bricks = [BrickCpu { addr: 0, mask: 0, pal: 0 }; 4];
+  let mut bricks = [BrickCpu {
+    addr: 0,
+    mask: 0,
+    pal: 0,
+  }; 4];
   bricks[3] = read_brick(chunk_base);
   let mut level: u32 = 3;
   // 当前体素（chunk 局部 fine 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
-  let p0 = [ro_c[0] + rd[0] * t0, ro_c[1] + rd[1] * t0, ro_c[2] + rd[2] * t0];
+  let p0 = [
+    ro_c[0] + rd[0] * t0,
+    ro_c[1] + rd[1] * t0,
+    ro_c[2] + rd[2] * t0,
+  ];
   let mut v = [
     (p0[0].floor() as i32).clamp(0, 255),
     (p0[1].floor() as i32).clamp(0, 255),
@@ -1103,7 +1117,11 @@ fn trace_chunk_cpu(
       side[min] += step_inc[min];
       face = (min * 2) as u8 + if sign[min] < 0 { 1 } else { 0 };
       // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
-      let crossed = if sign[min] >= 0 { old_cell == 3 } else { old_cell == 0 };
+      let crossed = if sign[min] >= 0 {
+        old_cell == 3
+      } else {
+        old_cell == 0
+      };
       if crossed {
         changed = true;
         break;
@@ -1151,8 +1169,14 @@ fn trace_chunk_cpu(
     let cur_log2 = level * 2;
     let m: u32 = 0xFFFF_FFFFu32.wrapping_shl(cur_log2);
     let vmin_u = v[step_axis] as u32; // i32→u32 环绕（负值公式自然处理）
-    let comp = if positive { vmin_u & m } else { (vmin_u & m) | !m };
-    let tz = comp.wrapping_add(if positive { 0 } else { 1 }).trailing_zeros();
+    let comp = if positive {
+      vmin_u & m
+    } else {
+      (vmin_u & m) | !m
+    };
+    let tz = comp
+      .wrapping_add(if positive { 0 } else { 1 })
+      .trailing_zeros();
     let new_level = tz >> 1;
     level = level.max(new_level);
     if level > 3 {
@@ -1162,7 +1186,11 @@ fn trace_chunk_cpu(
     // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
     let mi = m as i32;
     let base = [v[0] & mi, v[1] & mi, v[2] & mi];
-    let p = [ro_c[0] + rd[0] * cur_t, ro_c[1] + rd[1] * cur_t, ro_c[2] + rd[2] * cur_t];
+    let p = [
+      ro_c[0] + rd[0] * cur_t,
+      ro_c[1] + rd[1] * cur_t,
+      ro_c[2] + rd[2] * cur_t,
+    ];
     for i in 0..3 {
       let pf = p[i].floor() as i32;
       v[i] = pf.clamp(base[i], base[i] + !mi);
@@ -1262,7 +1290,12 @@ fn trace_volume_tree(
       ) {
         // chunk 局部 v → grid 局部体素（镜像 WGSL trace_grid 的 ci*256 换算）
         let voxel = IVec3::new(v[0], v[1], v[2]) + IVec3::new(ci[0], ci[1], ci[2]) * 256;
-        return Some(TreeHit { t, pal, face_id, voxel });
+        return Some(TreeHit {
+          t,
+          pal,
+          face_id,
+          voxel,
+        });
       }
     }
     if t_exit_c >= tl1 {
@@ -2054,12 +2087,7 @@ mod dda_ref_tests {
       let by = ((frand(&mut state) * 64.0) as i32) * 4;
       let bz = ((frand(&mut state) * 384.0) as i32 - 192) * 4;
       let pal = 1 + (frand(&mut state) * 12.0) as u8;
-      fill_box(
-        &mut g,
-        IVec3::new(bx, by, bz),
-        IVec3::splat(scale),
-        pal,
-      );
+      fill_box(&mut g, IVec3::new(bx, by, bz), IVec3::splat(scale), pal);
     }
     for _ in 0..400 {
       let vx = ((frand(&mut state) * 1024.0) as i32) - 512;
@@ -2077,8 +2105,16 @@ mod dda_ref_tests {
       let tree = cpu_reference_dda_ray_tree(&bufs, o, d, t_max);
       match (full, tree) {
         (Some((tf, pf)), Some(h)) => {
-          assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}", h.t);
-          assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
+          assert_eq!(
+            pf, h.pal,
+            "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}",
+            h.t
+          );
+          assert!(
+            (tf - h.t).abs() <= 1.0,
+            "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}",
+            h.t
+          );
           // 命中体素固体性（voxel 显式携带的正确性门禁）：DDA 携带的 voxel 必须
           // 恰是 palette 一致的固体体素——着色链（per-voxel normal/GI key）以它为准
           let view = BrickMapView::new(&bufs);
@@ -2160,13 +2196,11 @@ use bevy::{
     render_asset::RenderAssets,
     render_resource::{
       BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-      CachedComputePipelineId, CachedRenderPipelineId,
-      ColorTargetState, ColorWrites, ComputePassDescriptor, ComputePipelineDescriptor,
-      Extent3d, FragmentState,
-      PipelineCache, RenderPassDescriptor, SamplerBindingType,
-      ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension,
-      TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer,
-      VertexState,
+      CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+      ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, FragmentState, PipelineCache,
+      RenderPassDescriptor, SamplerBindingType, ShaderStages, StorageTextureAccess,
+      TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+      TextureViewDescriptor, UniformBuffer, VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, texture_2d, texture_storage_2d, uniform_buffer,
       },
@@ -2210,14 +2244,14 @@ struct BeamDepthCache {
 
 #[derive(Resource)]
 #[allow(dead_code)]
-struct DdaPipelines {
-  bg0_layout: BindGroupLayoutDescriptor,
-  bg1_layout: BindGroupLayoutDescriptor,
-  bg2_layout: BindGroupLayoutDescriptor,
-  bg3_layout: BindGroupLayoutDescriptor,
+pub(crate) struct DdaPipelines {
+  pub(crate) bg0_layout: BindGroupLayoutDescriptor,
+  pub(crate) bg1_layout: BindGroupLayoutDescriptor,
+  pub(crate) bg2_layout: BindGroupLayoutDescriptor,
+  pub(crate) bg3_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
-  compute_pipeline: CachedComputePipelineId,
-  beam_pipeline: CachedComputePipelineId,
+  pub(crate) compute_pipeline: CachedComputePipelineId,
+  pub(crate) beam_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
 }
 
@@ -2469,7 +2503,10 @@ fn prepare_dda_bind_groups(
     beam_cache.texture = Some(tex);
     beam_cache.size = beam_size;
   }
-  let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
+  let beam_tex = beam_cache
+    .texture
+    .as_ref()
+    .expect("beam texture not created");
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
 
   // ---- BG0：out tex write + view uniform + beam depth rw ----

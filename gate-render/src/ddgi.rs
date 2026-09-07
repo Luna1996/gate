@@ -112,7 +112,10 @@ pub fn probe_layer(probe_id: u32) -> u32 {
 #[inline]
 pub fn probe_in_layer(probe_id: u32) -> [u32; 2] {
   let in_layer = probe_id % PROBES_PER_LAYER;
-  [in_layer % PROBES_PER_LAYER_AXIS, in_layer / PROBES_PER_LAYER_AXIS]
+  [
+    in_layer % PROBES_PER_LAYER_AXIS,
+    in_layer / PROBES_PER_LAYER_AXIS,
+  ]
 }
 
 /// probe id + oct texel → irradiance 数组 (layer, u, v)
@@ -156,7 +159,11 @@ pub fn pack_probe_meta(offset_fine2: [u32; 3], age: u32) -> u32 {
 pub fn unpack_probe_meta(packed: u32) -> ([u32; 3], u32) {
   let mask = (1u32 << META_OFFSET_BITS) - 1;
   (
-    [packed & mask, (packed >> META_OFFSET_BITS) & mask, (packed >> (META_OFFSET_BITS * 2)) & mask],
+    [
+      packed & mask,
+      (packed >> META_OFFSET_BITS) & mask,
+      (packed >> (META_OFFSET_BITS * 2)) & mask,
+    ],
     (packed >> META_AGE_SHIFT) & 0xFF,
   )
 }
@@ -204,8 +211,11 @@ pub fn meta_texel_linear(layer: u32, x: u32, y: u32) -> usize {
 #[inline]
 pub fn offset_to_world_sized(offset_fine2: [u32; 3], cell_min: IVec3, cell_size: i32) -> Vec3 {
   cell_min.as_vec3()
-    + Vec3::new(offset_fine2[0] as f32, offset_fine2[1] as f32, offset_fine2[2] as f32)
-      * (cell_size as f32 / META_OFFSET_QUANT)
+    + Vec3::new(
+      offset_fine2[0] as f32,
+      offset_fine2[1] as f32,
+      offset_fine2[2] as f32,
+    ) * (cell_size as f32 / META_OFFSET_QUANT)
 }
 
 /// base 版（cell_size=16）
@@ -284,7 +294,11 @@ pub fn uniform_sphere_dir(u: [f32; 2]) -> Vec3 {
 #[inline]
 pub fn collect_radiance(d: Vec3, samples: &[(Vec3, Vec3)]) -> Vec3 {
   let (sum, wsum) = collect_radiance_ex(d, samples);
-  if wsum <= 0.0 { Vec3::ZERO } else { sum * (std::f32::consts::PI / wsum) }
+  if wsum <= 0.0 {
+    Vec3::ZERO
+  } else {
+    sum * (std::f32::consts::PI / wsum)
+  }
 }
 
 /// [`collect_radiance`] 带 Σw 版（M3-3 update 需要区分「零覆盖 → 保留 prev」与
@@ -345,7 +359,11 @@ fn max_component(c: Vec3) -> f32 {
 #[inline]
 pub fn update_irradiance_texel(prev: Vec3, new: Vec3) -> Vec3 {
   let new_t = new.powf(1.0 / DDGI_IRRAD_GAMMA);
-  let mut h = if prev == Vec3::ZERO { 0.0 } else { DDGI_HYSTERESIS };
+  let mut h = if prev == Vec3::ZERO {
+    0.0
+  } else {
+    DDGI_HYSTERESIS
+  };
   if max_component(prev - new_t) > DDGI_BIG_CHANGE {
     h = (h - DDGI_CHANGE_DROP).max(0.0);
   }
@@ -676,11 +694,7 @@ fn chunk_bbox(mut it: impl Iterator<Item = IVec3>) -> Option<(IVec3, IVec3)> {
 /// 任意 cell 尺寸的三态分类。gate 树层级 {256,64,16,4,1} 不含 32/128 →
 /// 2×2×2 子 cell 递归合成：全 Air → Air；全 Solid → Solid（DDGI「全满」语义，
 /// 多色实心也算满，palette 不参与）；否则 Mixed。
-pub fn cell_state_at(
-  grid: &gate_voxel::VolumeGrid,
-  cell_min: IVec3,
-  cell_size: i32,
-) -> BrickState {
+pub fn cell_state_at(grid: &gate_voxel::VolumeGrid, cell_min: IVec3, cell_size: i32) -> BrickState {
   match cell_size {
     256 => grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), 0),
     64 => grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), 1),
@@ -913,7 +927,11 @@ impl ObjectBbox {
 /// 边界 cell 的邻接缺失 = 用自身 flags 填充，避免交集被 0 位污染）。
 /// 索引序：(−x, +x, −y, +y, −z, +z)，与 `probe_near_surface` 入参顺序一致。
 #[inline]
-pub fn flags_intersection(flags: &[DdgiProbeFlags], dims: UVec3, rel: UVec3) -> [DdgiProbeFlags; 6] {
+pub fn flags_intersection(
+  flags: &[DdgiProbeFlags],
+  dims: UVec3,
+  rel: UVec3,
+) -> [DdgiProbeFlags; 6] {
   let self_flags = flags[(rel.x + rel.y * dims.x + rel.z * dims.x * dims.y) as usize];
   let fetch = |x: i32, y: i32, z: i32| -> DdgiProbeFlags {
     if (0..dims.x as i32).contains(&x)
@@ -939,7 +957,11 @@ pub fn flags_intersection(flags: &[DdgiProbeFlags], dims: UVec3, rel: UVec3) -> 
 
 /// 截图3 `get_probe_flags_intersection()` 逐字：6 邻接 flags 的按位 AND。
 #[inline]
-pub fn probe_flags_intersection(flags: &[DdgiProbeFlags], dims: UVec3, rel: UVec3) -> DdgiProbeFlags {
+pub fn probe_flags_intersection(
+  flags: &[DdgiProbeFlags],
+  dims: UVec3,
+  rel: UVec3,
+) -> DdgiProbeFlags {
   let n = flags_intersection(flags, dims, rel);
   n[0] & n[1] & n[2] & n[3] & n[4] & n[5]
 }
@@ -1179,8 +1201,12 @@ pub fn compute_cell_flags(
 // 端点着色（sky / emissive 直出 / 直光+prev DDGI 自闭环）→ 样本缓冲
 // ============================================================================
 
-use crate::brickmap::{BrickMapBuffers, VolumeHit, cpu_reference_trace_volumes, cpu_reference_volumes_occluded};
-use crate::lighting::{EMISSIVE_EMIT_GAIN, SHADOW_BIAS, SHADOW_DIR_T_MAX, cpu_reference_sky, xyz, yzw};
+use crate::brickmap::{
+  BrickMapBuffers, VolumeHit, cpu_reference_trace_volumes, cpu_reference_volumes_occluded,
+};
+use crate::lighting::{
+  EMISSIVE_EMIT_GAIN, SHADOW_BIAS, SHADOW_DIR_T_MAX, cpu_reference_sky, xyz, yzw,
+};
 use gate_voxel::VolumeTransform;
 
 /// D5 预算分摊：4096 射线/帧固定总预算 → 每活跃探针射线数（活跃探针均摊，
@@ -1343,7 +1369,11 @@ pub fn cpu_ddgi_cast(input: &CastInput) -> CastOutput {
       let dir = cast_ray_dir(item.probe_id, input.frame, i, rays);
       let (radiance, dist) =
         cast_endpoint_radiance(input.vols, input.light_pool, input.prev, origin, dir);
-      samples.push(RaySample { dir, radiance, dist });
+      samples.push(RaySample {
+        dir,
+        radiance,
+        dist,
+      });
     }
   }
   CastOutput {
@@ -1404,7 +1434,11 @@ pub fn f32_to_f16(v: f32) -> u16 {
     if m16 == 0x400 {
       // 尾数进位 → 指数 +1（e=15 时恰溢出 → Inf）
       let e16 = (e + 15 + 1) as u16;
-      return if e16 >= 0x1F { sign | 0x7C00 } else { sign | (e16 << 10) };
+      return if e16 >= 0x1F {
+        sign | 0x7C00
+      } else {
+        sign | (e16 << 10)
+      };
     }
     return sign | (((e + 15) as u16) << 10) | m16 as u16;
   }
@@ -1428,15 +1462,15 @@ pub fn f16_to_f32(h: u16) -> f32 {
   let exp = ((h >> 10) & 0x1F) as u32;
   let mant = (h & 0x03FF) as u32;
   let bits = match (exp, mant) {
-    (0x1F, 0) => sign | 0x7F80_0000,                  // ±Inf
-    (0x1F, _) => sign | 0x7F80_0000 | (mant << 13),   // NaN
-    (0, 0) => sign,                                   // ±0
+    (0x1F, 0) => sign | 0x7F80_0000,                // ±Inf
+    (0x1F, _) => sign | 0x7F80_0000 | (mant << 13), // NaN
+    (0, 0) => sign,                                 // ±0
     (0, m) => {
       // 次规格数：value = m × 2^-24 → 规格化到 f32（m 非零，lz ∈ [22,31]）
       let lz = m.leading_zeros();
       sign | ((134 - lz) << 23) | (m << (lz - 8))
     }
-    (e, m) => sign | ((e + 112) << 23) | (m << 13),   // 规格数
+    (e, m) => sign | ((e + 112) << 23) | (m << 13), // 规格数
   };
   f32::from_bits(bits)
 }
@@ -1527,8 +1561,7 @@ pub fn cpu_ddgi_update(input: &UpdateInput) -> UpdateOutput {
     for ty in 0..DEPTH_TEXELS {
       for tx in 0..DEPTH_TEXELS {
         let d = oct_texel_dir(tx, ty, DEPTH_TEXELS);
-        let idx = id * DEPTH_WORDS_PER_PROBE as usize
-          + (ty * DEPTH_TEXELS + tx) as usize;
+        let idx = id * DEPTH_WORDS_PER_PROBE as usize + (ty * DEPTH_TEXELS + tx) as usize;
         depth[idx] = update_depth_texel(depth[idx], d, seg);
       }
     }
@@ -1768,64 +1801,206 @@ pub fn cpu_sample_ddgi(a: &DdgiProbeArrays, p: Vec3, n: Vec3) -> Vec3 {
 // 渲染侧：BG4 布局 + 烘焙提取 + GPU 资源 + 每帧 prepare（DdgiPlugin）
 // ============================================================================
 
+use bevy::asset::AssetServer;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, Res, ResMut};
 use bevy::render::{
   Render, RenderApp, RenderStartup, RenderSystems,
   render_resource::{
-    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-    BufferDescriptor, BufferUsages, ShaderStages, UniformBuffer,
-    binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
+    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+    Buffer, BufferBindingType, BufferDescriptor, BufferUsages, CachedComputePipelineId,
+    ComputePipelineDescriptor, Extent3d, Origin3d, ShaderStages, StorageTextureAccess,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+    TextureViewDescriptor, TextureViewDimension, UniformBuffer,
   },
   renderer::{RenderDevice, RenderQueue},
 };
+use std::borrow::Cow;
 
-/// BG4 布局：DdgiMeta uniform + positions/cell_index 只读 + irradiance/depth read_write
-///
-/// 两个 compute pipeline（dda_main / ddgi_update）共用同一 5 组布局：
-/// ddgi_update 写 3/4，dda_main（spike 4 后）只读；同 BG 顺序两 pass 复用。
-pub fn ddgi_bg4_layout() -> BindGroupLayoutDescriptor {
-  BindGroupLayoutDescriptor::new(
-    "DdgiBg4",
-    &BindGroupLayoutEntries::sequential(
-      ShaderStages::COMPUTE,
-      (
-        uniform_buffer::<DdgiMeta>(false),           // 0 meta
-        storage_buffer_read_only_sized(false, None), // 1 positions
-        storage_buffer_read_only_sized(false, None), // 2 cell_index
-        storage_buffer_sized(false, None),           // 3 irradiance rw
-        storage_buffer_sized(false, None),           // 4 depth rw
+/// BG4 v2 uniform（dda.wgsl `DdgiUniform` 逐字段镜像，112B）：
+/// grid_origin.w = cell 边长、grid_dims.w = 探针数、params = (frame, rays 观测位,
+/// 保留, object bbox 数)、finer_min.w <= 0 = 无更细级（rays_per_probe 由 GPU 侧
+/// 从 dispatch count 自派生 = cast_rays_per_probe 公式，无需 CPU 回读）。
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, bevy::ecs::resource::Resource, ShaderType)]
+pub struct DdgiUniform {
+  pub grid_origin: Vec4,
+  pub grid_dims: Vec4,
+  pub params: Vec4,
+  pub reuse_min: Vec4,
+  pub reuse_max: Vec4,
+  pub finer_min: Vec4,
+  pub finer_size: Vec4,
+}
+
+impl DdgiUniform {
+  /// ProbeGrid + 帧状态 → uniform（M4-3 滚动后 reuse/finer 由 CPU 每帧覆写）
+  pub fn new(
+    pg: &ProbeGrid,
+    frame: u32,
+    reuse_bounds: (IVec3, IVec3),
+    finer: Option<CascadeDomain>,
+    object_count: u32,
+  ) -> Self {
+    Self {
+      grid_origin: Vec4::new(
+        pg.grid_origin.x as f32,
+        pg.grid_origin.y as f32,
+        pg.grid_origin.z as f32,
+        pg.cell_size as f32,
       ),
-    ),
+      grid_dims: Vec4::new(
+        pg.grid_dims.x as f32,
+        pg.grid_dims.y as f32,
+        pg.grid_dims.z as f32,
+        pg.positions.len() as f32,
+      ),
+      params: Vec4::new(frame as f32, 0.0, 0.0, object_count as f32),
+      reuse_min: Vec4::new(
+        reuse_bounds.0.x as f32,
+        reuse_bounds.0.y as f32,
+        reuse_bounds.0.z as f32,
+        0.0,
+      ),
+      reuse_max: Vec4::new(
+        reuse_bounds.1.x as f32,
+        reuse_bounds.1.y as f32,
+        reuse_bounds.1.z as f32,
+        0.0,
+      ),
+      finer_min: finer.map_or(Vec4::ZERO, |f| {
+        Vec4::new(
+          f.origin.x as f32,
+          f.origin.y as f32,
+          f.origin.z as f32,
+          f.cell_size as f32,
+        )
+      }),
+      finer_size: finer.map_or(Vec4::ZERO, |f| {
+        Vec4::new(f.dims.x as f32, f.dims.y as f32, f.dims.z as f32, 0.0)
+      }),
+    }
+  }
+}
+
+/// BG4 v2 布局（dda.wgsl group(4) 13 binding 逐字镜像；改 shader 必同步此处）：
+/// 0=uniform 1=positions(ro) 2=cell_index(ro) 3/4=irr/depth_prev(纹理数组采样读)
+/// 5/6=irr/depth_next(storage write) 7/8=meta prev/next(r32uint) 9=dispatch(rw atomic)
+/// 10=objects(ro) 11=samples(rw) 12=worklist(rw)
+pub fn ddgi_bg4_layout() -> BindGroupLayoutDescriptor {
+  const C: ShaderStages = ShaderStages::COMPUTE;
+  let tex = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Texture {
+      sample_type,
+      view_dimension: TextureViewDimension::D2Array,
+      multisampled: false,
+    },
+    count: None,
+  };
+  let store = |binding: u32, format: TextureFormat| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format,
+      view_dimension: TextureViewDimension::D2Array,
+    },
+    count: None,
+  };
+  let buf = |binding: u32, read_only: bool| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  };
+  BindGroupLayoutDescriptor::new(
+    "DdgiBg4v2",
+    &[
+      BindGroupLayoutEntry {
+        binding: 0,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(DdgiUniform::min_size()),
+        },
+        count: None,
+      },
+      buf(1, true),
+      buf(2, true),
+      tex(3, TextureSampleType::Float { filterable: true }), // irr prev（rgba16f）
+      tex(4, TextureSampleType::Float { filterable: false }), // depth prev（r32）
+      store(5, TextureFormat::Rgba16Float),
+      store(6, TextureFormat::R32Float),
+      tex(7, TextureSampleType::Uint), // meta prev（r32uint）
+      store(8, TextureFormat::R32Uint),
+      buf(9, false),
+      buf(10, true),
+      buf(11, false),
+      buf(12, false),
+    ],
   )
+}
+
+/// DDGI compute 管线（dda.wgsl 四 entry；布局 = BG0-3（dda 复用）+ BG4 v2）
+#[derive(Debug, Clone, Copy)]
+pub struct DdgiPipelines {
+  pub clear: CachedComputePipelineId,
+  pub active: CachedComputePipelineId,
+  pub cast: CachedComputePipelineId,
+  pub update: CachedComputePipelineId,
 }
 
 /// Extract 产物：烘焙好的探针网格 + 对应的世界编辑代数（prepare 消费后移除）
 #[derive(bevy::ecs::resource::Resource)]
 pub struct ProbeBake(pub ProbeGrid, pub u64);
 
-/// 渲染 world 持久 DDGI GPU 资源（RenderStartup 占位 4B 空缓冲，烘焙后重建）
+/// 渲染 world 持久 DDGI GPU 资源（RenderStartup 建 1×1 占位纹理/4B 空缓冲，
+/// 烘焙后重建；D7 双缓冲 ping-pong：prev 采样读 / next 更新写，帧末交换指针 M4-2）
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiGpu {
-  pub meta: UniformBuffer<DdgiMeta>,
+  pub uniform: UniformBuffer<DdgiUniform>,
   pub positions: Buffer,
   pub cell_index: Buffer,
-  pub irradiance: Buffer,
-  pub depth: Buffer,
+  pub objects: Buffer,
+  /// [count, 1, 1, 0]；[0] 由 ddgi_active atomicAdd，兼 cast/update 的 indirect buffer
+  pub dispatch: Buffer,
+  pub worklist: Buffer,
+  pub samples: Buffer,
+  pub irr_prev: Texture,
+  pub irr_next: Texture,
+  pub depth_prev: Texture,
+  pub depth_next: Texture,
+  pub meta_prev: Texture,
+  pub meta_next: Texture,
+  pub irr_prev_view: TextureView,
+  pub irr_next_view: TextureView,
+  pub depth_prev_view: TextureView,
+  pub depth_next_view: TextureView,
+  pub meta_prev_view: TextureView,
+  pub meta_next_view: TextureView,
+  /// 纹理数组层数（= meta_texture_layers(probe_count)）
+  pub layers: u32,
   pub probe_count: u32,
-  /// cell 网格原点/dims（meta 每帧覆写用，避免持有完整 cell_index CPU 副本）
-  pub grid_origin: Vec4,
-  pub grid_dims: Vec4,
-  /// 已推进帧号（prepare 自增；cycle_base = frame × probes_this_frame % count）
+  /// 已推进帧号（prepare 自增）
   pub frame: u32,
   /// 当前 GPU 探针数据对应的世界编辑代数（u64::MAX = 尚未烘焙；编辑后触发重烘）
   pub baked_generation: u64,
+  /// 四 entry 管线（DdaPipelines 就绪后排队一次）
+  pub pipelines: Option<DdgiPipelines>,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiBg4(pub BindGroup);
 
-/// DDGI 插件：main world VoxelScene → 一次性烘焙 → GPU buffer/meta/BG4
+/// DDGI 插件：main world VoxelScene → 一次性烘焙 → GPU 纹理数组/buffer/BG4 + 管线
 pub struct DdgiPlugin;
 
 impl bevy::app::Plugin for DdgiPlugin {
@@ -1838,33 +2013,155 @@ impl bevy::app::Plugin for DdgiPlugin {
       .add_systems(bevy::render::ExtractSchedule, extract_ddgi_bake)
       .add_systems(
         Render,
-        prepare_ddgi.in_set(RenderSystems::PrepareBindGroups),
+        (queue_ddgi_pipelines, prepare_ddgi).in_set(RenderSystems::PrepareBindGroups),
       );
   }
 }
 
-/// 4B 占位 storage buffer（管线布局始终可绑；probe_count=0 时 ddgi_update 早退）
+/// 4B 占位 storage buffer（管线布局始终可绑；probe_count=0 时 ddgi pass 早退）
 fn dummy_buffer(device: &RenderDevice, label: &str) -> Buffer {
+  dummy_sized_buffer(device, label, 4)
+}
+
+fn dummy_sized_buffer(device: &RenderDevice, label: &str, size: u64) -> Buffer {
   device.create_buffer(&BufferDescriptor {
     label: Some(label.into()),
-    size: 4,
+    size: size.max(4),
     usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
     mapped_at_creation: false,
   })
 }
 
+fn ddgi_array_view(tex: &Texture) -> TextureView {
+  tex.create_view(&TextureViewDescriptor {
+    dimension: Some(TextureViewDimension::D2Array),
+    ..Default::default()
+  })
+}
+
+/// 纹理数组（D7 载体；usage = 采样读 + storage 写 + 初始数据上传）
+fn ddgi_array_tex(
+  device: &RenderDevice,
+  label: &str,
+  format: TextureFormat,
+  size: (u32, u32),
+  layers: u32,
+) -> Texture {
+  device.create_texture(&TextureDescriptor {
+    label: Some(label.into()),
+    size: Extent3d {
+      width: size.0,
+      height: size.1,
+      depth_or_array_layers: layers,
+    },
+    mip_level_count: 1,
+    sample_count: 1,
+    dimension: TextureDimension::D2,
+    format,
+    usage: TextureUsages::TEXTURE_BINDING
+      | TextureUsages::STORAGE_BINDING
+      | TextureUsages::COPY_DST,
+    view_formats: &[],
+  })
+}
+
 fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>) {
+  let (irr, irr_v) = {
+    let t = ddgi_array_tex(
+      &device,
+      "ddgi_irr(empty)",
+      TextureFormat::Rgba16Float,
+      (4, 4),
+      1,
+    );
+    let v = ddgi_array_view(&t);
+    (t, v)
+  };
+  let (dep, dep_v) = {
+    let t = ddgi_array_tex(
+      &device,
+      "ddgi_depth(empty)",
+      TextureFormat::R32Float,
+      (4, 4),
+      1,
+    );
+    let v = ddgi_array_view(&t);
+    (t, v)
+  };
+  let (meta, meta_v) = {
+    let t = ddgi_array_tex(
+      &device,
+      "ddgi_meta(empty)",
+      TextureFormat::R32Uint,
+      (4, 4),
+      1,
+    );
+    let v = ddgi_array_view(&t);
+    (t, v)
+  };
   commands.insert_resource(DdgiGpu {
-    meta: UniformBuffer::default(),
+    uniform: UniformBuffer::default(),
     positions: dummy_buffer(&device, "ddgi_positions(empty)"),
     cell_index: dummy_buffer(&device, "ddgi_cell_index(empty)"),
-    irradiance: dummy_buffer(&device, "ddgi_irradiance(empty)"),
-    depth: dummy_buffer(&device, "ddgi_depth(empty)"),
+    objects: dummy_buffer(&device, "ddgi_objects(empty)"),
+    dispatch: dummy_buffer(&device, "ddgi_dispatch(empty)"),
+    worklist: dummy_buffer(&device, "ddgi_worklist(empty)"),
+    samples: dummy_buffer(&device, "ddgi_samples(empty)"),
+    irr_prev: irr.clone(),
+    irr_next: irr,
+    depth_prev: dep.clone(),
+    depth_next: dep,
+    meta_prev: meta.clone(),
+    meta_next: meta,
+    irr_prev_view: irr_v.clone(),
+    irr_next_view: irr_v,
+    depth_prev_view: dep_v.clone(),
+    depth_next_view: dep_v,
+    meta_prev_view: meta_v.clone(),
+    meta_next_view: meta_v,
+    layers: 1,
     probe_count: 0,
-    grid_origin: Vec4::ZERO,
-    grid_dims: Vec4::ZERO,
     frame: 0,
     baked_generation: u64::MAX,
+    pipelines: None,
+  });
+}
+
+/// 四 entry 管线排队（一次；BG0-3 复用 dda 布局 + BG4 v2；layout 收 Descriptor）
+fn queue_ddgi_pipelines(
+  dda: Option<Res<crate::brickmap::dda::DdaPipelines>>,
+  pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
+  asset_server: Res<AssetServer>,
+  mut gpu: ResMut<DdgiGpu>,
+) {
+  if gpu.pipelines.is_some() {
+    return;
+  }
+  let Some(dda) = dda else {
+    return;
+  };
+  let layout = vec![
+    dda.bg0_layout.clone(),
+    dda.bg1_layout.clone(),
+    dda.bg2_layout.clone(),
+    dda.bg3_layout.clone(),
+    ddgi_bg4_layout(),
+  ];
+  let shader = asset_server.load(crate::brickmap::dda::DDA_SHADER_ASSET_PATH);
+  let mk = |label: &'static str, entry: &'static str| {
+    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+      label: Some(Cow::from(label)),
+      layout: layout.clone(),
+      shader: shader.clone(),
+      entry_point: Some(Cow::from(entry)),
+      ..Default::default()
+    })
+  };
+  gpu.pipelines = Some(DdgiPipelines {
+    clear: mk("gate_ddgi_clear", "ddgi_clear"),
+    active: mk("gate_ddgi_active", "ddgi_active"),
+    cast: mk("gate_ddgi_cast", "ddgi_cast"),
+    update: mk("gate_ddgi_update", "ddgi_update"),
   });
 }
 
@@ -1935,16 +2232,22 @@ fn prepare_ddgi(
   bake: Option<Res<ProbeBake>>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
-  // ---- 新烘焙（含编辑后重烘）：重建 4 个 storage buffer（尺寸变化）----
+  // ---- 新烘焙（含编辑后重烘）：重建纹理数组 + buffer（尺寸变化）----
   if let Some(bake) = bake {
     let generation = bake.1;
     let pg = &bake.0;
     let n = pg.positions.len() as u32;
-    let pos_bytes = vec4_bytes(&pack_probe_positions(pg));
-    let cell_bytes = u32_bytes(&pg.cell_index);
-    let (irr0, dep0) = initial_probe_data(n);
-    let irr_bytes = vec4_bytes(&irr0);
-    let dep_bytes = f32_bytes(&dep0);
+    let layers = meta_texture_layers(n);
+    // 层数上限保护（验收：资源不支持时报错明确；fallback = spec §5 base cell 升 32）
+    let max_layers = device.limits().max_texture_array_layers;
+    if layers > max_layers {
+      bevy::log::error!(
+        "DDGI bake 需要 {layers} 层纹理数组，超设备上限 {max_layers}（探针 {n}）；\
+         本代 DDGI 禁用。缓解 = spec §5 风险表：base cell 升 32（探针数 ÷8）"
+      );
+      commands.remove_resource::<ProbeBake>();
+      return;
+    }
 
     let make = |label: &str, bytes: &[u8]| {
       let buf = device.create_buffer(&BufferDescriptor {
@@ -1956,64 +2259,145 @@ fn prepare_ddgi(
       queue.write_buffer(&buf, 0, bytes);
       buf
     };
-    gpu.positions = make("ddgi_positions", &pos_bytes);
-    gpu.cell_index = make("ddgi_cell_index", &cell_bytes);
-    gpu.irradiance = make("ddgi_irradiance", &irr_bytes);
-    gpu.depth = make("ddgi_depth", &dep_bytes);
+    gpu.positions = make("ddgi_positions", &vec4_bytes(&pack_probe_positions(pg)));
+    gpu.cell_index = make("ddgi_cell_index", &u32_bytes(&pg.cell_index));
+    gpu.objects = dummy_buffer(&device, "ddgi_objects"); // D12：MOV 探针后置
+    // dispatch（indirect buffer 语义 [count,1,1,0]）：STORAGE + INDIRECT
+    let dispatch = device.create_buffer(&BufferDescriptor {
+      label: Some("ddgi_dispatch".into()),
+      size: 16,
+      usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    queue.write_buffer(&dispatch, 0, &0u32.to_le_bytes());
+    gpu.dispatch = dispatch;
+    gpu.worklist = make("ddgi_worklist", &u32_bytes(&vec![0u32; n as usize]));
+    // 样本缓冲容量 = max(8192, 2×probe_count) vec4（rays GPU 自派生后总射线数 ≤ max(4096, count)）
+    let sample_slots = (n * 2).max(8192);
+    gpu.samples = dummy_sized_buffer(&device, "ddgi_samples", sample_slots as u64 * 16);
+
+    // ---- D7 纹理数组（irr 128² rgba16f / depth 256² r32 / meta 16² r32uint）----
+    // WebGPU 零初始化保证 → irr 无需上传；depth 初值 tmax（0 会被 chevron 误判贴墙）
+    // 与 meta（packed offset+age=0）经 write_texture 双份写入（ping-pong 两份同数据）。
+    let (irr, irr_v) = {
+      let t = ddgi_array_tex(
+        &device,
+        "ddgi_irr",
+        TextureFormat::Rgba16Float,
+        (IRRADIANCE_LAYER_TEXELS, IRRADIANCE_LAYER_TEXELS),
+        layers,
+      );
+      let v = ddgi_array_view(&t);
+      (t, v)
+    };
+    let (dep, dep_v) = {
+      let t = ddgi_array_tex(
+        &device,
+        "ddgi_depth",
+        TextureFormat::R32Float,
+        (DEPTH_LAYER_TEXELS, DEPTH_LAYER_TEXELS),
+        layers,
+      );
+      let v = ddgi_array_view(&t);
+      (t, v)
+    };
+    let (meta, meta_v) = {
+      let t = ddgi_array_tex(
+        &device,
+        "ddgi_meta",
+        TextureFormat::R32Uint,
+        (PROBES_PER_LAYER_AXIS, PROBES_PER_LAYER_AXIS),
+        layers,
+      );
+      let v = ddgi_array_view(&t);
+      (t, v)
+    };
+    let dep_data = f32_bytes(&vec![
+      PROBE_T_MAX;
+      (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * layers)
+        as usize
+    ]);
+    let meta_data = u32_bytes(&build_meta_texture_data(pg));
+    for tex in [&dep, &meta] {
+      let (bytes_per_row, rows, data): (u32, u32, &[u8]) =
+        if tex.format() == TextureFormat::R32Float {
+          (DEPTH_LAYER_TEXELS * 4, DEPTH_LAYER_TEXELS, &dep_data)
+        } else {
+          (PROBES_PER_LAYER_AXIS * 4, PROBES_PER_LAYER_AXIS, &meta_data)
+        };
+      queue.write_texture(
+        TexelCopyTextureInfo {
+          texture: tex,
+          mip_level: 0,
+          origin: Origin3d::ZERO,
+          aspect: TextureAspect::All,
+        },
+        data,
+        TexelCopyBufferLayout {
+          offset: 0,
+          bytes_per_row: Some(bytes_per_row),
+          rows_per_image: Some(rows),
+        },
+        Extent3d {
+          width: bytes_per_row / 4,
+          height: rows,
+          depth_or_array_layers: layers,
+        },
+      );
+    }
+    gpu.irr_prev = irr.clone();
+    gpu.irr_next = irr;
+    gpu.depth_prev = dep.clone();
+    gpu.depth_next = dep;
+    gpu.meta_prev = meta.clone();
+    gpu.meta_next = meta;
+    gpu.irr_prev_view = irr_v.clone();
+    gpu.irr_next_view = irr_v;
+    gpu.depth_prev_view = dep_v.clone();
+    gpu.depth_next_view = dep_v;
+    gpu.meta_prev_view = meta_v.clone();
+    gpu.meta_next_view = meta_v;
+    gpu.layers = layers;
     gpu.probe_count = n;
     gpu.baked_generation = generation;
-    gpu.grid_origin = Vec4::new(
-      pg.grid_origin.x as f32,
-      pg.grid_origin.y as f32,
-      pg.grid_origin.z as f32,
-      0.0,
-    );
-    gpu.grid_dims = Vec4::new(
-      pg.grid_dims.x as f32,
-      pg.grid_dims.y as f32,
-      pg.grid_dims.z as f32,
-      0.0,
-    );
     gpu.frame = 0;
+    gpu
+      .uniform
+      .get_mut()
+      .clone_from(&DdgiUniform::new(pg, 0, REUSE_ALL, None, 0));
     bevy::log::info!(
-      "DDGI gpu: {} probes (irr {}KB, depth {}KB, cell_index {}KB)",
-      n,
-      irr_bytes.len() / 1024,
-      dep_bytes.len() / 1024,
-      cell_bytes.len() / 1024,
+      "DDGI gpu v2: {n} probes {layers} layers (irr {}KB, depth {}KB, meta {}KB)",
+      IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * layers * 8 / 1024,
+      DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * layers * 4 / 1024,
+      meta_data.len() / 1024,
     );
     commands.remove_resource::<ProbeBake>();
   }
 
-  // ---- 每帧：推进帧号 + 写 meta uniform + 建 BG4 ----
-  // probe_count=0 时同样建 BG4（dummy buffer + 零 meta）：dda_main 管线布局含
-  // group 4，pass 内必须绑定；ddgi_update 读 probe_count=0 早退。
+  // ---- 每帧：推进帧号 + 写 uniform + 建 BG4 v2 ----
+  // probe_count=0 同样建 BG（占位资源可绑；ddgi pass 按 count=0 早退）。
   gpu.frame = gpu.frame.wrapping_add(1);
-  let plan = frame_plan(gpu.probe_count, gpu.frame);
-  let meta = DdgiMeta {
-    probe_count: gpu.probe_count,
-    active_count: gpu.probe_count,
-    probes_this_frame: plan.probes_this_frame,
-    cycle_base: plan.cycle_base,
-    frame: gpu.frame,
-    _pad0: 0,
-    grid_origin: gpu.grid_origin,
-    grid_dims: gpu.grid_dims,
-    cell_tmax_alpha: Vec4::new(DDGI_CELL as f32, PROBE_T_MAX, DDGI_ALPHA, 0.0),
-  };
-  *gpu.meta.get_mut() = meta;
-  gpu.meta.write_buffer(&device, &queue);
+  gpu.uniform.get_mut().params.x = gpu.frame as f32;
+  gpu.uniform.write_buffer(&device, &queue);
 
-  let layout = pipeline_cache.get_bind_group_layout(&ddgi_bg4_layout());
+  let bg4_layout = pipeline_cache.get_bind_group_layout(&ddgi_bg4_layout());
   let bg4 = device.create_bind_group(
     None,
-    &layout,
+    &bg4_layout,
     &BindGroupEntries::sequential((
-      &gpu.meta,
+      &gpu.uniform,
       gpu.positions.as_entire_binding(),
       gpu.cell_index.as_entire_binding(),
-      gpu.irradiance.as_entire_binding(),
-      gpu.depth.as_entire_binding(),
+      &gpu.irr_prev_view,
+      &gpu.depth_prev_view,
+      &gpu.irr_next_view,
+      &gpu.depth_next_view,
+      &gpu.meta_prev_view,
+      &gpu.meta_next_view,
+      gpu.dispatch.as_entire_binding(),
+      gpu.objects.as_entire_binding(),
+      gpu.samples.as_entire_binding(),
+      gpu.worklist.as_entire_binding(),
     )),
   );
   commands.insert_resource(DdgiBg4(bg4));
@@ -2064,10 +2448,44 @@ mod tests {
     // 级联：base + 4 级 ×2 递增；滚动级 16³ 探针/级 = 16 层纹理
     assert_eq!(DDGI_CASCADE_CELL_SIZES, [16, 32, 64, 128, 256]);
     assert_eq!(PROBES_PER_CASCADE_AXIS, 16);
-    assert_eq!(PROBES_PER_LAYER, PROBES_PER_CASCADE_AXIS * PROBES_PER_CASCADE_AXIS);
+    assert_eq!(
+      PROBES_PER_LAYER,
+      PROBES_PER_CASCADE_AXIS * PROBES_PER_CASCADE_AXIS
+    );
     // M3-3 新增（WGSL 镜像防漂移）
     assert_eq!(DDGI_DEPTH_ALPHA, 0.2);
     assert_eq!(DDGI_TEXEL_MIN_WEIGHT, 1e-4);
+  }
+
+  /// M4-1：DdgiUniform wire（112B = 7×vec4；dda.wgsl DdgiUniform 逐字段镜像）
+  #[test]
+  fn ddgi_uniform_wire() {
+    assert_eq!(<DdgiUniform as ShaderType>::min_size().get(), 112);
+    let g = world_with_cell_box();
+    let vols = Volumes::new(g);
+    let pg = bake_probe_grid(&vols);
+    let u = DdgiUniform::new(
+      &pg,
+      7,
+      (IVec3::splat(-1), IVec3::splat(3)),
+      Some(CascadeDomain {
+        origin: IVec3::ZERO,
+        dims: UVec3::splat(16),
+        cell_size: 32,
+      }),
+      2,
+    );
+    assert_eq!(u.grid_origin.w, DDGI_CELL as f32, "w = cell 边长");
+    assert_eq!(u.grid_dims.w, pg.positions.len() as f32, "w = 探针数");
+    assert_eq!(u.params.x, 7.0);
+    assert_eq!(u.params.w, 2.0, "w = object bbox 数");
+    assert_eq!(u.finer_min.w, 32.0, "finer cell 边长");
+    assert_eq!(u.reuse_max.y, 3.0, "reuse bounds 逐字写入");
+    // 无更细级 → finer 零（shader 以 finer_min.w <= 0 关闭级联归属）
+    let u0 = DdgiUniform::new(&pg, 0, REUSE_ALL, None, 0);
+    assert_eq!(u0.finer_min, Vec4::ZERO);
+    assert_eq!(u0.finer_size, Vec4::ZERO);
+    assert_eq!(u0.reuse_max.y, i32::MAX as f32, "REUSE_ALL = [0, i32::MAX)");
   }
 
   /// probe id → (layer, u, v) 映射：连续 id 铺满 16×16 层网格后进位
@@ -2094,7 +2512,10 @@ mod tests {
   fn meta_pack_roundtrip() {
     // 全零 / 全满 / age 饱和边界
     assert_eq!(pack_probe_meta([0, 0, 0], 0), 0);
-    assert_eq!(pack_probe_meta([31, 31, 31], 255), 31 | 31 << 5 | 31 << 10 | 255 << 15);
+    assert_eq!(
+      pack_probe_meta([31, 31, 31], 255),
+      31 | 31 << 5 | 31 << 10 | 255 << 15
+    );
     let (off, age) = unpack_probe_meta(pack_probe_meta([1, 17, 31], 200));
     assert_eq!((off, age), ([1, 17, 31], 200));
     // quantize：Air 居中探针 (cell+8) → ×2 = 16 精确
@@ -2106,8 +2527,9 @@ mod tests {
     assert_eq!(quantize_offset(half, cell * DDGI_CELL), [15, 15, 15]);
     // 反解回世界坐标误差 < 1/64 cell
     let (off, _) = unpack_probe_meta(pack_probe_meta(quantize_offset(half, cell * DDGI_CELL), 0));
-    let back = cell_min_vec(cell) + Vec3::new(off[0] as f32, off[1] as f32, off[2] as f32)
-      * (DDGI_CELL as f32 / META_OFFSET_QUANT);
+    let back = cell_min_vec(cell)
+      + Vec3::new(off[0] as f32, off[1] as f32, off[2] as f32)
+        * (DDGI_CELL as f32 / META_OFFSET_QUANT);
     assert!(back.distance(half) < 1e-4);
   }
 
@@ -2137,7 +2559,11 @@ mod tests {
 
     // 层数 = ceil(4096 / 256) = 16；数据长度 = 层数 × 256
     let layers = meta_texture_layers(pg.positions.len() as u32);
-    assert_eq!(pg.positions.len(), 16 * 16 * 16, "全 cell 覆盖（全 Mixed，无 Solid）");
+    assert_eq!(
+      pg.positions.len(),
+      16 * 16 * 16,
+      "全 cell 覆盖（全 Mixed，无 Solid）"
+    );
     assert_eq!(layers, 16);
     let data = build_meta_texture_data(&pg);
     assert_eq!(data.len(), layers as usize * PROBES_PER_LAYER as usize);
@@ -2234,11 +2660,17 @@ mod tests {
     let r2 = 2.0f32.sqrt() / 2.0;
     let irr = collect_radiance(
       Vec3::Z,
-      &[(Vec3::new(r2, 0.0, r2), Vec3::splat(2.0)), (Vec3::Z, Vec3::splat(4.0))],
+      &[
+        (Vec3::new(r2, 0.0, r2), Vec3::splat(2.0)),
+        (Vec3::Z, Vec3::splat(4.0)),
+      ],
     );
     assert!((irr.x - 9.96446).abs() < 1e-3, "irr.x={}", irr.x);
     // 全部样本在背面 → Σw=0 → 0
-    assert_eq!(collect_radiance(Vec3::Z, &[(-Vec3::Z, Vec3::splat(5.0))]), Vec3::ZERO);
+    assert_eq!(
+      collect_radiance(Vec3::Z, &[(-Vec3::Z, Vec3::splat(5.0))]),
+      Vec3::ZERO
+    );
     // 空样本 → 0
     assert_eq!(collect_radiance(Vec3::Z, &[]), Vec3::ZERO);
   }
@@ -2249,22 +2681,39 @@ mod tests {
     let close = |a: Vec3, b: Vec3, e: f32| a.distance(b) < e;
     // ① prev 全黑 → hysteresis=0 直采；但 RTXGI L529-533 亮度钳制作用于 delta 本身，
     //    不因 hysteresis=0 豁免：lum(3,1,2)=1.4974>1.0 → delta×0.25 → (0.75,0.25,0.5)
-    assert!(close(update_irradiance_texel(Vec3::ZERO, Vec3::new(3.0, 1.0, 2.0)),
-      Vec3::new(0.75, 0.25, 0.5), 1e-6));
+    assert!(close(
+      update_irradiance_texel(Vec3::ZERO, Vec3::new(3.0, 1.0, 2.0)),
+      Vec3::new(0.75, 0.25, 0.5),
+      1e-6
+    ));
     // ② 稳态：prev == new → 不动
-    assert!(close(update_irradiance_texel(Vec3::ONE, Vec3::ONE), Vec3::ONE, 1e-6));
+    assert!(close(
+      update_irradiance_texel(Vec3::ONE, Vec3::ONE),
+      Vec3::ONE,
+      1e-6
+    ));
     // ③ 大暗化（|prev−new| 最大分量 0.5 > 0.2 → h=0.95−0.75=0.2）→ EMA 步 0.8·0.5=0.4
-    assert!(close(update_irradiance_texel(Vec3::ONE, Vec3::splat(0.5)), Vec3::splat(0.6), 1e-4));
+    assert!(close(
+      update_irradiance_texel(Vec3::ONE, Vec3::splat(0.5)),
+      Vec3::splat(0.6),
+      1e-4
+    ));
     // ④ 大亮化（delta 亮度 4.9 > 1.0 → delta×0.25）→ 0.1 + 0.05·1.225 = 0.16125
-    assert!(close(update_irradiance_texel(Vec3::splat(0.1), Vec3::splat(5.0)),
-      Vec3::splat(0.16125), 1e-4));
+    assert!(close(
+      update_irradiance_texel(Vec3::splat(0.1), Vec3::splat(5.0)),
+      Vec3::splat(0.16125),
+      1e-4
+    ));
     // ⑤ 暗化保底步进：EMA 步 0.05·0.001=5e-5 < 1/1024 → 抬到 1/1024（且 ≤ |delta|）
     let out = update_irradiance_texel(Vec3::splat(0.001), Vec3::ZERO);
     assert!(out.x > 0.0 && out.x < 1e-4, "out={out:?}");
     assert!((out.x - (0.001 - 1.0 / 1024.0)).abs() < 1e-6);
     // ⑥ 无大暗化的普通 EMA（0.1→0.15：0.05·0.95 权重）
-    assert!(close(update_irradiance_texel(Vec3::splat(0.1), Vec3::splat(0.15)),
-      Vec3::splat(0.1 + 0.05 * (1.0 - DDGI_HYSTERESIS)), 1e-5));
+    assert!(close(
+      update_irradiance_texel(Vec3::splat(0.1), Vec3::splat(0.15)),
+      Vec3::splat(0.1 + 0.05 * (1.0 - DDGI_HYSTERESIS)),
+      1e-5
+    ));
   }
 
   /// age / reuse 生命周期：滚动继承（bounds 内+offset 未变）↔ 归零；更新 +1 饱和
@@ -2277,11 +2726,30 @@ mod tests {
     assert_eq!(age_after_scroll(false, 200), 0, "不可复用 → 重新收敛");
     // bounds = [-2, 3)：含下端、不含上端
     let bounds = (IVec3::splat(-2), IVec3::splat(3));
-    assert!(probe_reusable(IVec3::ZERO, [16, 16, 16], [16, 16, 16], bounds));
-    assert!(probe_reusable(IVec3::splat(-2), [0, 0, 0], [0, 0, 0], bounds), "下端含");
-    assert!(!probe_reusable(IVec3::splat(3), [0, 0, 0], [0, 0, 0], bounds), "上端不含");
-    assert!(!probe_reusable(IVec3::splat(-3), [0, 0, 0], [0, 0, 0], bounds));
-    assert!(!probe_reusable(IVec3::ZERO, [8, 16, 16], [16, 16, 16], bounds), "offset 变 → 重烘");
+    assert!(probe_reusable(
+      IVec3::ZERO,
+      [16, 16, 16],
+      [16, 16, 16],
+      bounds
+    ));
+    assert!(
+      probe_reusable(IVec3::splat(-2), [0, 0, 0], [0, 0, 0], bounds),
+      "下端含"
+    );
+    assert!(
+      !probe_reusable(IVec3::splat(3), [0, 0, 0], [0, 0, 0], bounds),
+      "上端不含"
+    );
+    assert!(!probe_reusable(
+      IVec3::splat(-3),
+      [0, 0, 0],
+      [0, 0, 0],
+      bounds
+    ));
+    assert!(
+      !probe_reusable(IVec3::ZERO, [8, 16, 16], [16, 16, 16], bounds),
+      "offset 变 → 重烘"
+    );
   }
 
   /// can_skip 档位（INFERENCE 实现）：age=0 永不跳；age=255 → p=0.5
@@ -2290,7 +2758,10 @@ mod tests {
     assert!(!can_skip_update(0, 0), "新鲜探针永不跳");
     assert!(can_skip_update(255, 0), "全熟 + rand=0 → 跳");
     assert!(!can_skip_update(255, 0xFFFF), "rand 高位 → 不跳");
-    assert!(!can_skip_update(255, 0x8000), "边界：p=0.5 时 rand/65536=0.5 不跳");
+    assert!(
+      !can_skip_update(255, 0x8000),
+      "边界：p=0.5 时 rand/65536=0.5 不跳"
+    );
     assert!(can_skip_update(128, 0));
   }
 
@@ -2415,7 +2886,10 @@ mod tests {
     assert_ne!(lookup(&pg, solid_cell + IVec3::X * 2), NO_PROBE);
     assert_ne!(lookup(&pg, solid_cell + IVec3::X + IVec3::Y), NO_PROBE);
     // 探针总数 = cell 总数 − Solid cell 数 = 16³ − 1
-    assert_eq!(pg.positions.len(), CELLS_PER_CHUNK as usize * CELLS_PER_CHUNK as usize * CELLS_PER_CHUNK as usize - 1);
+    assert_eq!(
+      pg.positions.len(),
+      CELLS_PER_CHUNK as usize * CELLS_PER_CHUNK as usize * CELLS_PER_CHUNK as usize - 1
+    );
   }
 
   /// Mixed cell：BFS 找到靠中心的 4³ 空子砖（填补 (0,0,0) 子砖 → 探针在 (6,6,6)）
@@ -2508,7 +2982,10 @@ mod tests {
     let plan = frame_plan(pg.positions.len() as u32, 0);
     let meta = DdgiMeta::build(&pg, &plan);
     assert_eq!(meta.probe_count, pg.positions.len() as u32);
-    assert_eq!(meta.active_count, meta.probe_count, "v1：分配即全量（v2 由 ddgi_active 每帧判定接管）");
+    assert_eq!(
+      meta.active_count, meta.probe_count,
+      "v1：分配即全量（v2 由 ddgi_active 每帧判定接管）"
+    );
     assert_eq!(meta.probes_this_frame, plan.probes_this_frame);
     assert_eq!(meta.grid_origin, Vec4::new(0.0, 0.0, 0.0, 0.0));
     assert_eq!(meta.grid_dims, Vec4::new(16.0, 16.0, 16.0, 0.0));
@@ -2739,7 +3216,11 @@ mod tests {
       assert_eq!(pg.positions[idx as usize], expect, "远场 cell {far} 居中");
     }
     // M2-1 验收公式：探针数 = cell 总数 − Solid cell 数 = 16³ − 0
-    assert_eq!(pg.positions.len(), 16 * 16 * 16, "探针数 = cell 总数 − Solid 数");
+    assert_eq!(
+      pg.positions.len(),
+      16 * 16 * 16,
+      "探针数 = cell 总数 − Solid 数"
+    );
   }
 
   /// 编辑驱动重烘：空世界 0 探针 → 填盒（代数推进）→ 挖空回全空气覆盖；
@@ -2789,9 +3270,15 @@ mod tests {
     let l1 = bake_cascade_grid(&vols, 32, IVec3::ZERO, UVec3::splat(2));
     assert_eq!(l1.positions.len(), 8, "墙 4 厚无全满 32³ cell → 8/8 全覆盖");
     // 角 cell (0,0,0)：8 个 16³ 子 cell 仅 (1,1,1) 纯空 → 探针 (24,24,24)
-    assert_eq!(l1.positions[lookup(&l1, UVec3::ZERO) as usize], Vec3::splat(24.0));
+    assert_eq!(
+      l1.positions[lookup(&l1, UVec3::ZERO) as usize],
+      Vec3::splat(24.0)
+    );
     // 对角 cell (1,1,1)：仅 (0,0,0) 子 cell 纯空 → (40,40,40)
-    assert_eq!(l1.positions[lookup(&l1, UVec3::splat(1)) as usize], Vec3::splat(40.0));
+    assert_eq!(
+      l1.positions[lookup(&l1, UVec3::splat(1)) as usize],
+      Vec3::splat(40.0)
+    );
 
     // LOD2 cell=64：单 cell 覆盖全房。8 个 32³ 子 cell 全 Mixed，各恰含一个纯空
     // 16³ 子 cell（叶 16、距中心 (32,32,32) d²=192 全平手）→ 遍历序首个 (0,0,0)
@@ -2827,16 +3314,56 @@ mod tests {
     let (fo, fd) = (IVec3::ZERO, UVec3::splat(32));
     // 完全在更细域内 → 归更细级（!outside）
     assert!(!outside_lower_grid(IVec3::ZERO, IVec3::splat(4), fo, fd));
-    assert!(!outside_lower_grid(IVec3::new(28, 4, 4), IVec3::new(32, 8, 8), fo, fd));
-    assert!(!outside_lower_grid(IVec3::new(0, 0, 28), IVec3::new(4, 4, 32), fo, fd));
+    assert!(!outside_lower_grid(
+      IVec3::new(28, 4, 4),
+      IVec3::new(32, 8, 8),
+      fo,
+      fd
+    ));
+    assert!(!outside_lower_grid(
+      IVec3::new(0, 0, 28),
+      IVec3::new(4, 4, 32),
+      fo,
+      fd
+    ));
     // 部分重叠（域边缘/跨界）→ 保守归更细级
-    assert!(!outside_lower_grid(IVec3::new(28, 0, 0), IVec3::new(32, 4, 4), fo, fd));
-    assert!(!outside_lower_grid(IVec3::new(30, 0, 0), IVec3::new(34, 4, 4), fo, fd));
-    assert!(!outside_lower_grid(IVec3::new(-2, 0, 0), IVec3::new(2, 4, 4), fo, fd));
+    assert!(!outside_lower_grid(
+      IVec3::new(28, 0, 0),
+      IVec3::new(32, 4, 4),
+      fo,
+      fd
+    ));
+    assert!(!outside_lower_grid(
+      IVec3::new(30, 0, 0),
+      IVec3::new(34, 4, 4),
+      fo,
+      fd
+    ));
+    assert!(!outside_lower_grid(
+      IVec3::new(-2, 0, 0),
+      IVec3::new(2, 4, 4),
+      fo,
+      fd
+    ));
     // 完全在外（含半开区间紧贴）→ 归本 LOD
-    assert!(outside_lower_grid(IVec3::new(32, 0, 0), IVec3::new(36, 4, 4), fo, fd));
-    assert!(outside_lower_grid(IVec3::new(-4, 0, 0), IVec3::new(0, 4, 4), fo, fd));
-    assert!(outside_lower_grid(IVec3::new(0, 40, 0), IVec3::new(4, 44, 4), fo, fd));
+    assert!(outside_lower_grid(
+      IVec3::new(32, 0, 0),
+      IVec3::new(36, 4, 4),
+      fo,
+      fd
+    ));
+    assert!(outside_lower_grid(
+      IVec3::new(-4, 0, 0),
+      IVec3::new(0, 4, 4),
+      fo,
+      fd
+    ));
+    assert!(outside_lower_grid(
+      IVec3::new(0, 40, 0),
+      IVec3::new(4, 44, 4),
+      fo,
+      fd
+    ));
 
     // 级间嵌套不变式：对齐滚动下 coarser 域 ⊇ finer 域。
     // 例：LOD2 64-cell 网格 origin (0,0,0)（4 对齐）dims 16³ → 16-cell [0,64)；
@@ -2851,7 +3378,10 @@ mod tests {
     let l2_hi = l2_origin + IVec3::splat(16 * 4); // 64-cell × 16³
     let l1_hi = l1_origin + IVec3::splat(16 * 2); // 32-cell × 16³
     for a in 0..3 {
-      assert!(l2_origin[a] <= l1_origin[a] && l1_hi[a] <= l2_hi[a], "coarser ⊇ finer");
+      assert!(
+        l2_origin[a] <= l1_origin[a] && l1_hi[a] <= l2_hi[a],
+        "coarser ⊇ finer"
+      );
     }
     // 嵌套域下的归属（LOD2 cell 4 宽，4 对齐）：
     // LOD1 域内 [16,20) → 归 LOD1；域边部分重叠 [8,12)/[40,44) → 保守归 LOD1；
@@ -2899,7 +3429,10 @@ mod tests {
     let f = brickstate_to_flags(BrickState::Air, true);
     assert_eq!(f, DDGI_PROBE_FLAG_ENABLED | DDGI_PROBE_FLAG_NO_SURFACES);
     let f = brickstate_to_flags(BrickState::Mixed, true);
-    assert_eq!(f, DDGI_PROBE_FLAG_ENABLED, "Mixed 有表面 → 不置 NO_SURFACES");
+    assert_eq!(
+      f, DDGI_PROBE_FLAG_ENABLED,
+      "Mixed 有表面 → 不置 NO_SURFACES"
+    );
     let f = brickstate_to_flags(BrickState::Solid(3), true);
     assert_eq!(f, DDGI_PROBE_FLAG_ENABLED, "Solid 烘焙期跳过，此分支不常走");
     let f = brickstate_to_flags(BrickState::Air, false);
@@ -3318,7 +3851,10 @@ mod tests {
       // 确定性：同 frame → 同 worklist
       let out2 = cpu_ddgi_active(&input);
       assert_eq!(out.worklist, out2.worklist, "固定 seed → 确定性 worklist");
-      assert_eq!(out.next_meta, out2.next_meta, "固定 seed → 确定性 next_meta");
+      assert_eq!(
+        out.next_meta, out2.next_meta,
+        "固定 seed → 确定性 next_meta"
+      );
     }
   }
 
@@ -3333,7 +3869,10 @@ mod tests {
     gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::splat(16), 4, 0);
     let vols = Volumes::new(g);
     let pg = bake_probe_grid(&vols);
-    assert!(!pg.positions.is_empty(), "纯 Air chunk 应有探针（D1 全覆盖）");
+    assert!(
+      !pg.positions.is_empty(),
+      "纯 Air chunk 应有探针（D1 全覆盖）"
+    );
 
     let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
     let meta = build_meta_texture_data(&pg);
@@ -3463,11 +4002,18 @@ mod tests {
     // 从房内向上：天花厚 4（fine 60..64），从 (32, 40, 32) 直上穿天花命中？
     // 用房外高空向上 → 必 miss（世界只有 64³ 房子）
     let dir = Vec3::new(0.3, 1.0, -0.2).normalize();
-    let (rad, dist) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(500.0, 2000.0, 500.0), dir);
+    let (rad, dist) =
+      cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(500.0, 2000.0, 500.0), dir);
     assert_eq!(dist, PROBE_T_MAX, "miss → 远距哨兵");
     assert_eq!(rad, cpu_reference_sky(dir, &pool), "miss → sky 色（逐位）");
     // 向下也应 miss（世界在 2000 下方但 t_max=8192 内…（2000-64）/|dy|…取足够远处）
-    let (rad2, dist2) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(2000.0, 2000.0, 2000.0), -Vec3::Y);
+    let (rad2, dist2) = cast_endpoint_radiance(
+      &vols,
+      &pool,
+      &prev,
+      Vec3::new(2000.0, 2000.0, 2000.0),
+      -Vec3::Y,
+    );
     assert_eq!(dist2, PROBE_T_MAX);
     assert_eq!(rad2, cpu_reference_sky(-Vec3::Y, &pool));
   }
@@ -3492,11 +4038,15 @@ mod tests {
       irr: &[],
       depth: &[],
     };
-    let (rad, dist) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(16.0, 100.0, 16.0), -Vec3::Y);
+    let (rad, dist) =
+      cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(16.0, 100.0, 16.0), -Vec3::Y);
     assert_eq!(dist, 100.0 - 16.0, "命中顶面 y=16 → t=84");
     let base = Vec3::new(1.0, 128.0 / 255.0, 0.0);
     let expect = base * ((200.0 / 255.0) * EMISSIVE_EMIT_GAIN);
-    assert!((rad - expect).length() < 1e-5, "emissive 直出 {rad:?} vs {expect:?}");
+    assert!(
+      (rad - expect).length() < 1e-5,
+      "emissive 直出 {rad:?} vs {expect:?}"
+    );
   }
 
   /// 端点常规分支：直光 1-bounce（顶面 ndl=1 无遮挡）+ prev DDGI 自闭环（均匀色归一化）
@@ -3525,7 +4075,8 @@ mod tests {
     };
 
     // 命中顶面 (17,16,15)（避开 cell 边界；归一化采样 = irr_color）
-    let (rad, dist) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(17.0, 100.0, 15.0), -Vec3::Y);
+    let (rad, dist) =
+      cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(17.0, 100.0, 15.0), -Vec3::Y);
     assert_eq!(dist, 100.0 - 16.0);
     let base = Vec3::new(128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0);
     // 直光：ndl=1、无遮挡 → base × sun(1,1,1)×2；间接：base × irr_color
@@ -3537,7 +4088,8 @@ mod tests {
 
     // 底面命中（从下方向上打）：直光 ndl<0；且法线 -Y 前侧（下方）无探针
     // （2×2×2 网格探针全在 y≥8 > p.y=0）→ 锐利背面剔除 → 间接亦为 0 → 黑
-    let (rad_b, _) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(17.0, -100.0, 15.0), Vec3::Y);
+    let (rad_b, _) =
+      cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(17.0, -100.0, 15.0), Vec3::Y);
     assert!(
       rad_b.length() < 1e-5,
       "背光底面：直光 ndl<0 + 法线前侧无探针 → 黑（got {rad_b:?}）"
@@ -3662,7 +4214,17 @@ mod tests {
   #[test]
   fn f16_conversion_golden() {
     // f16 精确表示值：往返恒等
-    for v in [0.0, -0.0, 1.0, 0.5, -2.0, 1024.0, 8192.0, 65504.0, 2.0f32.powi(-14)] {
+    for v in [
+      0.0,
+      -0.0,
+      1.0,
+      0.5,
+      -2.0,
+      1024.0,
+      8192.0,
+      65504.0,
+      2.0f32.powi(-14),
+    ] {
       assert_eq!(f16_round(v), v, "f16 精确值往返 {v}");
     }
     // 位级黄金值（改实现必炸）
@@ -3679,8 +4241,14 @@ mod tests {
     // ties-to-even：1 + 2^-11 恰在 1.0 与 1+2^-10 中间 → 偶侧（1.0）
     assert_eq!(f16_round(1.0 + 2.0f32.powi(-11)), 1.0);
     // 0.75 ULP → 上取；1+3×2^-11 恰在 1+2^-10 与 1+2^-9 中间 → 偶侧上格（mant=2）
-    assert_eq!(f16_round(1.0 + 6.0 * 2.0f32.powi(-13)), 1.0 + 2.0f32.powi(-10));
-    assert_eq!(f16_round(1.0 + 3.0 * 2.0f32.powi(-11)), 1.0 + 2.0f32.powi(-9));
+    assert_eq!(
+      f16_round(1.0 + 6.0 * 2.0f32.powi(-13)),
+      1.0 + 2.0f32.powi(-10)
+    );
+    assert_eq!(
+      f16_round(1.0 + 3.0 * 2.0f32.powi(-11)),
+      1.0 + 2.0f32.powi(-9)
+    );
     // 溢出 → Inf；顶点下不舍入上（65505 距 65504 近、距 65536 远）
     assert!(f16_round(70000.0).is_infinite());
     assert!(f16_round(-70000.0).is_infinite());
@@ -3732,8 +4300,15 @@ mod tests {
     assert!((out - expect).abs() < 1e-4, "{out} vs {expect}");
     // 余弦加权均值：两条对称 45° 射线（dist 10/20）→ texel +Z 等权 → mean = 15
     let r2 = 2.0f32.sqrt() / 2.0;
-    let s = mk(&[(Vec3::new(r2, 0.0, r2), 10.0), (Vec3::new(-r2, 0.0, r2), 20.0)]);
-    assert_eq!(update_depth_texel(15.0, Vec3::Z, &s), 15.0, "prev == mean → 不动");
+    let s = mk(&[
+      (Vec3::new(r2, 0.0, r2), 10.0),
+      (Vec3::new(-r2, 0.0, r2), 20.0),
+    ]);
+    assert_eq!(
+      update_depth_texel(15.0, Vec3::Z, &s),
+      15.0,
+      "prev == mean → 不动"
+    );
     let out = update_depth_texel(0.0, Vec3::Z, &s);
     assert!((out - 15.0 * DDGI_DEPTH_ALPHA).abs() < 1e-5);
     // 空样本 → 零覆盖 → 保留
@@ -3818,18 +4393,33 @@ mod tests {
       prev_depth: &prev_depth,
     });
     // probe1（非 worklist）完全不写
-    assert!(out.irr[64..].iter().all(|t| t.truncate() == Vec3::splat(0.25)));
+    assert!(
+      out.irr[64..]
+        .iter()
+        .all(|t| t.truncate() == Vec3::splat(0.25))
+    );
     assert!(out.depth[256..].iter().all(|t| *t == 200.0));
     // probe0 的 -Z 角 texel：oct 图四角均为下半球折叠区（dir·(+Z) < 0）→ 零覆盖保留。
     // irr 8×8 图角 (7,7)、depth 16×16 图角 (15,15)；+Z 在图中心（irr (4,4) / depth (8,8)）
     let idx_mz = 7 * IRRADIANCE_TEXELS as usize + 7;
-    assert_eq!(out.irr[idx_mz].truncate(), Vec3::splat(0.5), "-Z 角 texel 保留");
-    assert_eq!(out.irr[0].truncate(), Vec3::splat(0.5), "-Z 角 texel (0,0) 保留");
+    assert_eq!(
+      out.irr[idx_mz].truncate(),
+      Vec3::splat(0.5),
+      "-Z 角 texel 保留"
+    );
+    assert_eq!(
+      out.irr[0].truncate(),
+      Vec3::splat(0.5),
+      "-Z 角 texel (0,0) 保留"
+    );
     let dep_mz = 15 * DEPTH_TEXELS as usize + 15;
     assert_eq!(out.depth[dep_mz], 100.0, "-Z depth 角 texel 保留");
     // probe0 的 +Z 中心 texel：覆盖 → 更新（单样本投影 = π，链路钳制后 > prev）
     let idx_pz = 4 * IRRADIANCE_TEXELS as usize + 4;
-    assert!(out.irr[idx_pz].truncate().x > 0.5, "+Z texel 应被更新（π·1 投影）");
+    assert!(
+      out.irr[idx_pz].truncate().x > 0.5,
+      "+Z texel 应被更新（π·1 投影）"
+    );
     let new_depth = 100.0 + (5.0 - 100.0) * DDGI_DEPTH_ALPHA;
     let dep_pz = 8 * DEPTH_TEXELS as usize + 8;
     assert!(
@@ -3881,9 +4471,11 @@ mod tests {
     // depth 快速收敛（新权重 0.2）：tmax → 100
     assert!((depth[0] - 100.0).abs() < 1.0, "depth 收敛 {}", depth[0]);
     // 全部 texel 有限（f16 门禁：无 NaN/Inf 泄漏）
-    assert!(irr
-      .iter()
-      .all(|t| t.x.is_finite() && t.y.is_finite() && t.z.is_finite()));
+    assert!(
+      irr
+        .iter()
+        .all(|t| t.x.is_finite() && t.y.is_finite() && t.z.is_finite())
+    );
   }
 
   /// active → cast → update 全链 ×30 帧：能量增长（自闭环无限反弹）+ 全程有限
@@ -3946,7 +4538,9 @@ mod tests {
       irr = upd.irr;
       depth = upd.depth;
       assert!(
-        irr.iter().all(|t| t.x.is_finite() && t.y.is_finite() && t.z.is_finite()),
+        irr
+          .iter()
+          .all(|t| t.x.is_finite() && t.y.is_finite() && t.z.is_finite()),
         "frame {frame} 出现 NaN/Inf"
       );
       if frame == 1 {

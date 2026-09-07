@@ -25,11 +25,12 @@ pub struct GateRenderPlugin;
 
 impl Plugin for GateRenderPlugin {
   fn build(&self, app: &mut App) {
-    // Devlog 23：DDGI 探针 pass 已下线（ddgi 模块保留——数学/布局供下一代 DDGI 复用，
-    // 重新接线时再挂回）；octo hashmap 光照链（vis_cache/direct/gi/denoise）已整体拆除。
+    // R3-10 DDGI M4-1 重新挂回（资源/纹理数组/管线就绪；pass 编排 M4-2 接线）。
+    // octo hashmap 光照链（vis_cache/direct/gi/denoise）保持拆除。
     app.add_plugins((
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
+      ddgi::DdgiPlugin,
     ));
   }
 }
