@@ -1874,7 +1874,12 @@ impl DdgiUniform {
         pg.grid_dims.z as f32,
         pg.positions.len() as f32,
       ),
-      params: Vec4::new(frame as f32, Self::debug_mode(), Self::debug_gain(), object_count as f32),
+      params: Vec4::new(
+        frame as f32,
+        Self::debug_mode(),
+        Self::debug_gain(),
+        object_count as f32,
+      ),
       reuse_min: Vec4::new(
         reuse_bounds.0.x as f32,
         reuse_bounds.0.y as f32,
@@ -2364,11 +2369,11 @@ fn dispatch_ddgi(
     set_bgs(&mut pass);
     pass.dispatch_workgroups(1, 1, 1);
   }
-  // dispatch[1..4]（min,1,1）→ indirect[0..3] 桥接（encoder copy 在 pass 边界外，
-  // active 的 atomic 计数已终结；cast/update 的 count 读 dispatch[1] 同源）
+  // dispatch[1]（min）→ indirect[0] 桥接（4B；indirect[1]=y=1 [2]=z=1 由烘焙期一次性
+  // 初始化常驻——copy 若带 dispatch[2..] 会把轮转 base/z=0 带进 y/z → 零 workgroup）
   {
     let encoder = ctx.command_encoder();
-    encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 12);
+    encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 4);
   }
   // ③cast（indirect：x = dispatch[0] 活跃探针数）
   {
@@ -2693,7 +2698,10 @@ fn prepare_ddgi(
     });
     queue.write_buffer(&dispatch, 0, &0u32.to_le_bytes());
     gpu.dispatch = dispatch;
+    // indirect：[x=min(seal 桥接覆写), y=1, z=1, pad=0]——y/z 一次性常驻
     gpu.indirect = dummy_indirect_buffer(&device, "ddgi_indirect");
+    queue.write_buffer(&gpu.indirect, 4, &1u32.to_le_bytes());
+    queue.write_buffer(&gpu.indirect, 8, &1u32.to_le_bytes());
     gpu.worklist = make("ddgi_worklist", &u32_bytes(&vec![0u32; n as usize]));
     // 样本缓冲容量 = max(8192, 2×probe_count) vec4（rays GPU 自派生后总射线数 ≤ max(4096, count)）
     let sample_slots = (n * 2).max(8192);
