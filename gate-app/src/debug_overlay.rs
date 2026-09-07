@@ -63,13 +63,17 @@ pub(crate) struct FpsPlot;
 #[derive(Component)]
 struct ShowcaseVisibilityToggle;
 
+/// 「DDGI 间接光」开关标记（观察者写 gate_render::ddgi::DdgiEnabled 主世界资源）
+#[derive(Component)]
+struct DdgiGiToggle;
+
 /// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
 pub(crate) fn fps3(v: f32) -> u32 {
   (v.round() as u32).min(999)
 }
 
-/// 左上角 debug-view 面板（grid 布局 1 列 4 行：FPS 行 / 帧时长折线 / 相机信息 /
-/// showcase 显隐开关），在 commands.queue 闭包内调用（直接操作 World）。
+/// 左上角 debug-view 面板（grid 布局 1 列 5 行：FPS 行 / 帧时长折线 / 相机信息 /
+/// showcase 显隐开关 / DDGI 间接光开关），在 commands.queue 闭包内调用（直接操作 World）。
 ///
 /// 视觉全部由 grid 提供：容器 border = 外框，1px gap = 行间格线，
 /// cell 用不透明 Card 面盖出格子（grid_cell 约定：HUD 档半透明会露格线）。
@@ -93,7 +97,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       },
     ))
     .with_children(|root| {
-      // 1 列 4 行：FPS / 折线 / 相机 / showcase 开关，行间 1px 格线
+      // 1 列 5 行：FPS / 折线 / 相机 / showcase 开关 / DDGI 开关，行间 1px 格线
       let g = grid(
         &ctx,
         root,
@@ -170,6 +174,19 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             .entity_mut(*t)
             .insert(ShowcaseVisibilityToggle);
         });
+        // ---- 行 5：DDGI 间接光开关（默认开；观察者写 DdgiEnabled 资源 → 渲染链路） ----
+        let c5 = grid_cell(&ctx, g, PanelSurface::Card);
+        g.world_mut().entity_mut(c5).with_children(|cell| {
+          let t = toggle_switch(
+            &ctx,
+            cell,
+            ToggleSwitchConfig {
+              text: Some("DDGI GI".into()),
+              checked: true, // 默认开，与 DdgiEnabled::default()=true 同步
+            },
+          );
+          cell.world_mut().entity_mut(*t).insert(DdgiGiToggle);
+        });
       });
       // grid 默认 width: Percent(100) → 绝对定位根下改为收缩到内容宽（shrink-to-fit）
       if let Some(mut n) = root.world_mut().get_mut::<Node>(*g) {
@@ -192,6 +209,19 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           Visibility::Hidden
         };
       }
+    },
+  );
+
+  // 「DDGI GI」开关 → 写 DdgiEnabled 主世界资源（extract 每帧拷到渲染世界：
+  // 关 = dispatch compute 链早退 + trace shader 跳过探针采样 gi=0）
+  world.add_observer(
+    |ev: On<ToggleSwitchToggled>,
+     q_toggle: Query<(), With<DdgiGiToggle>>,
+     mut ddgi: ResMut<gate_render::ddgi::DdgiEnabled>| {
+      if q_toggle.get(ev.entity).is_err() {
+        return;
+      }
+      ddgi.0 = ev.checked;
     },
   );
 }

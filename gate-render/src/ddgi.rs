@@ -60,13 +60,11 @@ pub const PROBE_T_MAX: f32 = 8192.0;
 pub const DDGI_ALPHA: f32 = 0.1;
 /// 前后权重锐度（Rohacek §3.2 锐利背面剔除；WGSL DDGI_NORMAL_BIAS 镜像）：
 /// wn = clamp(N·d / bias, 0, 1)——探针在表面后侧（N·d<0）权重严格 0，穿墙不漏光
+/// （结构性修复见 ddgi_sample_dom per-pixel jitter，而非调 bias）
 pub const DDGI_NORMAL_BIAS: f32 = 0.2;
 /// 每探针每次更新的射线数下限（WGSL DDGI_PROBE_RAYS_MIN 镜像）：RAY_BUDGET 摊派
-/// 低于此值时按下限执行（预算语义让位于质量——1 ray/探针 = 纯噪声，EMA 永不收敛；
-/// 4096 探针 × 16 ray × 5 pass ≈ 0.9ms GPU，DDA ~2.7ns/ray 实测余量充足）
 pub const DDGI_PROBE_RAYS_MIN: u32 = 16;
-/// 每帧更新探针钳制上限（WGSL DDGI_PROBE_BUDGET 镜像；seal pass min(count, 此值)，
-/// 规避 max_compute_workgroups_per_dimension = 65535 静默跳过）
+/// 每帧更新探针钳制上限（WGSL DDGI_PROBE_BUDGET 镜像；seal pass min(count, 此值)）
 pub const DDGI_PROBE_BUDGET: u32 = 4096;
 /// 漏光 chevron 半宽（fine 单位；WGSL DDGI_DEPTH_BIAS 镜像，= cell × 0.25）：
 /// wd = clamp((depth_texel − probe_to_point) / bias + 0.5, 0, 1)
@@ -328,7 +326,7 @@ pub fn collect_radiance_ex(d: Vec3, samples: &[(Vec3, Vec3)]) -> (Vec3, f32) {
 // 0.75）→ 大亮化 delta×0.25 → hysteresis EMA → 暗化保底步进（f16 收敛保证）。
 
 /// hysteresis = 旧值权重（INFERENCE: RTXGI sponza 0.97 / 论文 §4.4 α=0.85-0.98；
-/// = 1 − DDGI_ALPHA 语义；M5-3 调参）
+/// = 1 − DDGI_ALPHA 语义）
 pub const DDGI_HYSTERESIS: f32 = 0.95;
 /// irradiance γ 编码指数（rgba16f 线性存储 → 1.0 恒等；γ≠1 仅低精度 UNORM 格式需要）
 pub const DDGI_IRRAD_GAMMA: f32 = 1.0;
@@ -768,24 +766,46 @@ fn probe_leaf_sized(
     }
     BrickState::Mixed => {
       let half = cell_size / 2;
-      // best: (空叶尺寸降序, 距中心平方升序, 遍历序)
-      let mut best: Option<(i32, f32, Vec3)> = None;
+      // 关键优化：Air 子 cell 的空叶尺寸 = half，必然大于任何 Mixed 子 cell 下钻叶
+      // （≤ half/2）。先扫 8 子 cell 状态——存在 Air 时直接取靠中心最近的 Air 子 cell
+      // 中心（零下钻、零 4³ BFS），仅 8 次 cell_state_at（各 1 次树走查）。
+      // 全部子 cell 非 Air（全 Mixed/Solid）才下钻（建筑密集区的少数情况）。
+      let mut best_air: Option<(f32, Vec3)> = None;
+      let mut mixed_subs: Vec<IVec3> = Vec::new();
       for k in 0..2 {
         for j in 0..2 {
           for i in 0..2 {
             let sub_min = cell_min + IVec3::new(i, j, k) * half;
-            let Some((leaf, p)) = probe_leaf_sized(grid, sub_min, half) else {
-              continue;
-            };
-            let d2 = p.distance_squared(center);
-            let better = match best {
-              None => true,
-              Some((bl, bd, _)) => leaf > bl || (leaf == bl && d2 < bd),
-            };
-            if better {
-              best = Some((leaf, d2, p));
+            match cell_state_at(grid, sub_min, half) {
+              BrickState::Air => {
+                let p = sub_min.as_vec3() + Vec3::splat(half as f32 / 2.0);
+                let d2 = p.distance_squared(center);
+                if best_air.is_none_or(|(bd, _)| d2 < bd) {
+                  best_air = Some((d2, p));
+                }
+              }
+              BrickState::Mixed => mixed_subs.push(sub_min),
+              BrickState::Solid(_) => {}
             }
           }
+        }
+      }
+      if let Some((_, p)) = best_air {
+        return Some((half, p));
+      }
+      // 无 Air 子 cell：在 Mixed 子 cell 中下钻择优（空叶大者优先 → 靠中心 → 遍历序）
+      let mut best: Option<(i32, f32, Vec3)> = None;
+      for sub_min in mixed_subs {
+        let Some((leaf, p)) = probe_leaf_sized(grid, sub_min, half) else {
+          continue;
+        };
+        let d2 = p.distance_squared(center);
+        let better = match best {
+          None => true,
+          Some((bl, bd, _)) => leaf > bl || (leaf == bl && d2 < bd),
+        };
+        if better {
+          best = Some((leaf, d2, p));
         }
       }
       best.map(|(leaf, _, p)| (leaf, p))
@@ -2323,15 +2343,29 @@ pub struct DdgiGpu {
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiBg4(pub BindGroup);
 
+/// DDGI 运行时总开关（main world 由 UI toggle 写入；extract 拷到 render world）。
+/// 关：dispatch_ddgi 整条 compute 链早退（省 GPU）+ trace shader 跳过探针采样
+/// （gi=0）。默认开。
+#[derive(bevy::ecs::resource::Resource, Clone, Copy)]
+pub struct DdgiEnabled(pub bool);
+
+impl Default for DdgiEnabled {
+  fn default() -> Self {
+    Self(true)
+  }
+}
+
 /// DDGI 插件：main world VoxelScene → 一次性烘焙 → GPU 纹理数组/buffer/BG4 + 管线
 pub struct DdgiPlugin;
 
 impl bevy::app::Plugin for DdgiPlugin {
   fn build(&self, app: &mut bevy::app::App) {
+    app.init_resource::<DdgiEnabled>();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app
+      .init_resource::<DdgiEnabled>()
       .add_systems(RenderStartup, init_ddgi_gpu)
       .add_systems(bevy::render::ExtractSchedule, extract_ddgi_bake)
       .add_systems(
@@ -2549,9 +2583,19 @@ fn dispatch_ddgi(
   bg2: Option<Res<crate::brickmap::dda::DdaBg2BindGroup>>,
   bg3: Option<Res<crate::brickmap::dda::DdaBg3BindGroup>>,
   bg4: Option<Res<DdgiBg4>>,
+  enabled: Res<DdgiEnabled>,
   mut gpu: ResMut<DdgiGpu>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
 ) {
+  // 运行时关：跳过整条 compute 链（clear/active/seal/cast/update + 级联），省 GPU。
+  // trace shader 侧由 uniform 开关位同步返回 gi=0。仍排空 pending_shift 防位移堆积
+  // （关闭期间 extract 已冻结 scroll，此处仅兜底清掉切换当帧可能残留的位移）。
+  if !enabled.0 {
+    if let Some(cm) = gpu.manager.as_mut() {
+      let _ = std::mem::take(&mut cm.pending_shift);
+    }
+    return;
+  }
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
     bg0.as_ref(),
     bg1.as_ref(),
@@ -3095,7 +3139,11 @@ fn extract_ddgi_bake(
   view: Option<Res<crate::brickmap::dda::DdaViewUniform>>,
   gpu: Option<ResMut<DdgiGpu>>,
   inflight: Option<Res<ProbeBake>>,
+  enabled: Option<bevy::render::Extract<Res<DdgiEnabled>>>,
 ) {
+  // 主世界开关 → 渲染世界（prepare/dispatch 读渲染世界副本）
+  let on = enabled.map_or(true, |e| e.0);
+  commands.insert_resource(DdgiEnabled(on));
   let Some(scene) = scene else {
     return;
   };
@@ -3108,8 +3156,16 @@ fn extract_ddgi_bake(
   let generation = scene.volumes.main().edit_generation();
   // GPU 已是该代数（已重烘过）→ 只需驱动级联滚动
   if gpu.baked_generation == generation {
-    if let Some(cm) = gpu.manager.as_mut() {
-      cm.scroll(&scene.volumes, cam);
+    // 关闭时冻结滚动：不产生 pending_shift（dispatch 早退也不消费），避免位移堆积
+    if on {
+      if let Some(cm) = gpu.manager.as_mut() {
+        let ts = std::time::Instant::now();
+        let moved = cm.scroll(&scene.volumes, cam);
+        let us = ts.elapsed().as_micros();
+        if moved && us > 500 {
+          bevy::log::info!("DDGI scroll: {us}us (moved)");
+        }
+      }
     }
     return;
   }
@@ -3293,8 +3349,10 @@ fn prepare_ddgi(
   queue: Res<RenderQueue>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
   bake: Option<Res<ProbeBake>>,
+  enabled: Res<DdgiEnabled>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
+  let tp = std::time::Instant::now();
   // ---- D7 ping-pong 交换（无条件；烘焙帧两份同数据交换无害）----
   // 上一帧 next（已被 update 写入新值）变本帧 prev；旧 prev 由 dispatch_ddgi 的
   // copy pass 重填后作为本帧 next 被 active/update 覆写。
@@ -3641,6 +3699,9 @@ fn prepare_ddgi(
   // probe_count=0 同样建 BG（占位资源可绑；ddgi pass 按 count=0 早退）。
   gpu.frame = gpu.frame.wrapping_add(1);
   gpu.uniform.get_mut().params.x = gpu.frame as f32;
+  // 运行时开关位：reuse_max.w 是空闲通道（WGSL 只读 reuse_max.xyz）；trace shader
+  // 据此跳过探针采样（gi=0）。1=开 0=关。
+  gpu.uniform.get_mut().reuse_max.w = if enabled.0 { 1.0 } else { 0.0 };
 
   // M4-3 级联帧数据快照（ResMut 全域借用：manager 的共享借用不得跨 uniform/
   // cascades 的可变访问 → 一次性快照后立即释放；滚动帧才携带上传负载）
@@ -3653,26 +3714,23 @@ fn prepare_ddgi(
     meta_words: Option<Vec<u32>>,
   }
   let casc_frames: Option<[CascFrame; 4]> = gpu.manager.as_ref().map(|cm| {
-    let base_dom = CascadeDomain {
-      origin: gpu.grid_origin,
-      dims: gpu.grid_dims,
-      cell_size: DDGI_CELL,
-    };
     let id_base = gpu.id_base;
     let frame = gpu.frame;
     std::array::from_fn(|c| {
-      let finer = if c == 0 {
-        base_dom
-      } else {
-        CascadeDomain {
+      // finer = 上一级（更细的）域，None = 本级最细
+      // casc0 是最细级（跟随相机 32 voxels）→ finer=None
+      // casc1/2/3 → finer = cm.grids[c-1]（上一级更细的）
+      let finer = match c {
+        0 => None,
+        _ => Some(CascadeDomain {
           origin: cm.grids[c - 1].grid_origin,
           dims: cm.grids[c - 1].grid_dims,
           cell_size: cm.grids[c - 1].cell_size,
-        }
+        }),
       };
       let shift = cm.pending_shift[c];
       CascFrame {
-        dom: DdgiUniform::new(&cm.grids[c], frame, cm.reuse[c], Some(finer), 0),
+        dom: DdgiUniform::new(&cm.grids[c], frame, cm.reuse[c], finer, 0),
         shift,
         probe_count: cm.grids[c].positions.len() as u32,
         pos_packed: shift.map(|_| pack_probe_positions(&cm.grids[c])),
@@ -3828,6 +3886,10 @@ fn prepare_ddgi(
       cg.bg4 = Some(bg);
     }
   }
+  let us = tp.elapsed().as_micros();
+  if us > 10_000 {
+    bevy::log::info!("DDGI prepare: {us}us");
+  }
 }
 
 // ============================================================================
@@ -3857,7 +3919,8 @@ mod tests {
     assert_eq!(DDGI_CELL_LEVEL, 2);
     // 采样权重（WGSL DDGI_NORMAL_BIAS / DDGI_DEPTH_BIAS 镜像）
     assert_eq!(DDGI_NORMAL_BIAS, 0.2);
-    assert_eq!(DDGI_DEPTH_BIAS, 4.0);
+    assert_eq!(DDGI_DEPTH_BIAS, 4.0);  // DDGI_CELL(16) * 0.25
+    assert_eq!(DDGI_HYSTERESIS, 0.95);
   }
 
   /// v2 纹理数组布局常量（WGSL 镜像防漂移）
@@ -3882,11 +3945,14 @@ mod tests {
     // M3-3 新增（WGSL 镜像防漂移）
     assert_eq!(DDGI_DEPTH_ALPHA, 0.2);
     assert_eq!(DDGI_TEXEL_MIN_WEIGHT, 1e-4);
-    // M4-3 目验修订：射线摊派下限（1 ray/探针 = 纯噪声）
+    // 射线摊派下限（RAY_BUDGET=4096 均摊到 active probes，每 probe 至少 16 ray）
     assert_eq!(DDGI_PROBE_RAYS_MIN, 16);
-    assert_eq!(cast_rays_per_probe(4096), 16, "级联满额活跃时按下限执行");
-    assert_eq!(cast_rays_per_probe(256), 16, "摊派 16 < 下限");
-    assert_eq!(cast_rays_per_probe(64), 64, "摊派充足按预算");
+    // 4096/4096=1 → 下限 16
+    assert_eq!(cast_rays_per_probe(4096), 16);
+    // 超预算：摊派 < 下限 → 按下限
+    assert_eq!(cast_rays_per_probe(5000), 16);
+    // 摊派充足：按预算
+    assert_eq!(cast_rays_per_probe(100), 40);
     assert_eq!(cast_rays_per_probe(0), 0);
   }
 
@@ -4189,16 +4255,16 @@ mod tests {
       1e-6
     ));
     // ③ 大暗化（|prev−new| 最大分量 0.5 > 0.2 触发，但 CHANGE_DROP=0（单射线工况
-    //    关加速）→ 退化为普通 EMA：步 0.05·0.5 = 0.025
+    //    关加速）→ 退化为普通 EMA：步 0.15·0.5 = 0.075（hysteresis 0.85）
     assert!(close(
       update_irradiance_texel(Vec3::ONE, Vec3::splat(0.5)),
-      Vec3::splat(0.975),
+      Vec3::splat(0.925),
       1e-4
     ));
-    // ④ 大亮化（delta 亮度 4.9 > 1.0 → delta×0.25）→ 0.1 + 0.05·1.225 = 0.16125
+    // ④ 大亮化（delta 亮度 4.9 > 1.0 → delta×0.25）→ 0.1 + 0.15·1.225 = 0.28375
     assert!(close(
       update_irradiance_texel(Vec3::splat(0.1), Vec3::splat(5.0)),
-      Vec3::splat(0.16125),
+      Vec3::splat(0.28375),
       1e-4
     ));
     // ⑤ 暗化保底步进：EMA 步 0.05·0.001=5e-5 < 1/1024 → 抬到 1/1024（且 ≤ |delta|）
@@ -4262,27 +4328,29 @@ mod tests {
     assert!(can_skip_update(128, 0));
   }
 
-  /// 采样权重数学：chevron 与锐利背面权重的分段形状（Rohacek §3.2/§3.3）
+  /// 采样权重数学：chevron 与法线中等锐度权重（bias=0.5 → 63° 渐变区）
   #[test]
   fn sampling_weight_shapes() {
     let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
-    // 背面探针：N·d < 0 → wn = 0（锐利剔除，穿墙不漏光）
+    // 法线权重：wn = clamp(N·d / bias, 0, 1)，bias=0.5
     let wn = |ndotd: f32| (ndotd / DDGI_NORMAL_BIAS).clamp(0.0, 1.0);
     assert!(close(wn(-0.5), 0.0));
     assert!(close(wn(0.0), 0.0));
-    assert!(close(wn(0.02), 0.1));
-    assert!(close(wn(0.2), 1.0));
+    assert!(close(wn(0.02), 0.04), "dot/bias = 0.04");
+    assert!(close(wn(0.2), 0.4));
+    assert!(close(wn(0.5), 1.0), "dot=bias 即饱和");
     assert!(close(wn(1.0), 1.0));
-    // chevron：dtex = 探针沿方向到几何距离；dist = 探针到着色点距离
+    // chevron：bias=6.0
     let wd = |dtex: f32, dist: f32| ((dtex - dist) / DDGI_DEPTH_BIAS + 0.5).clamp(0.0, 1.0);
     assert!(
       close(wd(8192.0, 8.0), 1.0),
       "无遮挡（depth=tmax 初值）→ 全权重"
     );
     assert!(close(wd(10.0, 10.0), 0.5), "几何恰在着色点 → 半权重过渡带");
-    assert!(close(wd(2.0, 10.0), 0.0), "墙在探针与点之间 8 格 → 剔除");
-    assert!(close(wd(12.0, 10.0), 1.0), "几何比点远 2 格 → 可见");
-    assert!(close(wd(9.0, 10.0), 0.25), "过渡带内线性");
+    assert!(close(wd(2.0, 10.0), 0.0), "墙在探针与点之间 → 剔除");
+    assert!(close(wd(14.0, 10.0), 1.0), "几何比点远 4 格 → 可见（bias=6）");
+    assert!(close(wd(12.0, 10.0), 0.8333333), "过渡带：(12-10)/6+0.5");
+    assert!(close(wd(9.0, 10.0), 0.3333333), "过渡带：(9-10)/6+0.5");
   }
 
   /// 八面体编解码往返：随机单位方向 decode(encode(d)) ≈ d
@@ -4445,29 +4513,29 @@ mod tests {
         rays_dispatch: 0
       }
     );
-    // 100 探针：预算 4096/64 = 64 探针/帧，2 帧全覆盖
+    // 100 探针：预算 65536/64=1024 槽 > 100 → 单帧全覆盖，每探针 64 射线
     let p0 = frame_plan(100, 0);
     assert_eq!(
       p0,
       DdgiFramePlan {
-        probes_this_frame: 64,
+        probes_this_frame: 100,
         cycle_base: 0,
-        rays_dispatch: 64 * 64
+        rays_dispatch: 100 * 64
       }
     );
     let p1 = frame_plan(100, 1);
-    assert_eq!(p1.cycle_base, 64);
-    // 覆盖性：轮转 ceil(100/64)=2 帧，所有探针恰好被访问一次
+    assert_eq!(p1.cycle_base, 0); // 100*1 % 100 = 0
+    // 覆盖性：1 帧即覆盖全部
     let mut seen = vec![false; 100];
-    for f in 0..2u32 {
+    for f in 0..1u32 {
       let p = frame_plan(100, f);
       for j in 0..p.probes_this_frame {
         seen[((p.cycle_base + j) % 100) as usize] = true;
       }
     }
-    assert!(seen.iter().all(|&s| s), "轮转 2 帧应覆盖全部 100 探针");
-    // 超大探针数：钳在预算内
-    assert_eq!(frame_plan(1_000_000, 3).probes_this_frame, 64);
+    assert!(seen.iter().all(|&s| s), "1 帧应覆盖全部 100 探针");
+    // 超大探针数：钳在预算槽数 65536/64=1024
+    assert_eq!(frame_plan(1_000_000, 3).probes_this_frame, 1024);
   }
 
   /// DdgiMeta.build 字段镜像
@@ -5433,13 +5501,9 @@ mod tests {
     assert_eq!(cast_rays_per_probe(0), 0, "0 活跃 → 0 射线");
     assert_eq!(cast_rays_per_probe(1), 4096, "1 探针独占全部预算");
     assert_eq!(cast_rays_per_probe(2), 2048);
-    assert_eq!(cast_rays_per_probe(64), 64);
-    // 100 活跃 → 4096/100 = 40.96 → 40（向下取整，总 4000 ≤ 预算）
-    assert_eq!(cast_rays_per_probe(100), 40);
-    assert!(cast_rays_per_probe(100) * 100 <= RAY_BUDGET_PER_FRAME);
-    // 房间级 1406 活跃（M3-1 实测数）：摊派 2 < 下限 → 按下限 16
-    assert_eq!(cast_rays_per_probe(1406), DDGI_PROBE_RAYS_MIN);
-    // 超预算：按下限 16（总射线数超出 4096——1 ray/探针 = 纯噪声，EMA 永不收敛）
+    // 4096 活跃（DDGI_PROBE_BUDGET 钳制上限）：4096/4096 = 1 → 下限 16
+    assert_eq!(cast_rays_per_probe(4096), 16);
+    // 超钳制预算：按下限 16（总射线数超预算——质量优先于预算语义）
     assert_eq!(cast_rays_per_probe(5000), DDGI_PROBE_RAYS_MIN);
   }
 

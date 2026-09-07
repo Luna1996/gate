@@ -1042,11 +1042,17 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
     // R3-10 DDGI 间接项（Douglas #23）：体素中心采样上一帧 irradiance（自闭环）；
     // 采样方向 = 体素 implicit normal（RTXGI 约定，M3-2 修正）。一体素一色。
+    // **采样点沿法线偏移 DDGI_NORMAL_BIAS（与 cast pass 一致，Majercik 2019 §4 惯例）——
+    // 裸 p_voxel 可能落在几何体内部→深度一致性检测误剔所有探针→暗斑**。
     // params.z = 诊断增益（GATE_DDGI_GAIN）；params.y = 调试模式（GATE_DDGI_DEBUG）。
     // **除 π**：collect_radiance 存储 = π·L̄（物理辐照度 E），本引擎直光约定 =
     // albedo×E（π 折进 albedo）→ 间接光必须 albedo×E/π 才与直光同标度
     // （π 未除曾致全场曝白 π 倍、穹顶原色淹没）。
-    let gi = ddgi_sample(p_voxel, n) * ddgi_u.params.z / DDGI_PI;
+    let gi_on = ddgi_u.reuse_max.w > 0.5;
+    var gi = vec3<f32>(0.0);
+    if (gi_on) {
+      gi = ddgi_sample(p_voxel + n * DDGI_NORMAL_BIAS, n) * ddgi_u.params.z / DDGI_PI;
+    }
     col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * ndl * sun) + alb * gi;
     // GATE_DDGI_DEBUG（params.y）诊断分路：
     // 1 = GI 单项（×8 提亮 + 15% 直光兜底可视）——斑块是否来自探针数据本身
@@ -1113,10 +1119,9 @@ const DDGI_NORMAL_BIAS: f32 = 0.2;
 const DDGI_DEPTH_BIAS: f32 = 4.0;
 const DDGI_T_MAX: f32 = 8192.0;
 const DDGI_RAY_BUDGET: u32 = 4096u;
-// 每探针射线数下限（ddgi.rs DDGI_PROBE_RAYS_MIN 镜像）：预算摊派低于此值按下限
-// 执行——1 ray/探针 = 纯噪声，EMA 永不收敛（级联 4096 探针全活跃即触发）
+// 每探针射线数下限（ddgi.rs DDGI_PROBE_RAYS_MIN 镜像）：预算摊派低于此值按下限执行
 const DDGI_PROBE_RAYS_MIN: u32 = 16u;
-const DDGI_PROBE_BUDGET: u32 = 4096u; // 每帧更新探针上限（≤65535 workgroup 限制 + 预算语义）
+const DDGI_PROBE_BUDGET: u32 = 4096u;
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
 const DDGI_EMIT_GAIN: f32 = 4.0;
@@ -1139,7 +1144,7 @@ struct DdgiUniform {
   grid_dims: vec4<f32>,   // xyz = dims（本级 cell 单位），w = probe_count
   params: vec4<f32>,      // x = frame, y = rays_per_probe, z = 保留, w = object bbox 数
   reuse_min: vec4<f32>,   // xyz = reuse bounds min（cell rel，i32 存 f32）
-  reuse_max: vec4<f32>,   // xyz = reuse bounds max（不含端）
+  reuse_max: vec4<f32>,   // xyz = reuse bounds max（不含端）；w = DDGI 运行时开关（1=开 0=关）
   finer_min: vec4<f32>,   // xyz = 更细级域原点（16-cell），w = 更细级 cell 边长（<=0 = 无）
   finer_size: vec4<f32>,  // xyz = 更细级域 dims（cell 单位）
 };
@@ -1666,7 +1671,6 @@ fn ddgi_sample_dom(
         // （WGSL 独有门控：CPU 镜像采样数组无 meta，M5-4 目验仲裁）
         let mc = ddgi_meta_coord(id);
         let m = textureLoad(ddgi_meta_prev, vec2<i32>(vec2<u32>(mc.y, mc.z)), i32(mc.x), 0).x;
-        if (ddgi_meta_age(m) == 0u) { continue; }
         let wx = select(1.0 - fr.x, fr.x, ix == 1u);
         let wy = select(1.0 - fr.y, fr.y, iy == 1u);
         let wz = select(1.0 - fr.z, fr.z, iz == 1u);
@@ -1681,7 +1685,12 @@ fn ddgi_sample_dom(
         let dtex = ddgi_depth_sample(id, dir);
         let wd = clamp((dtex - dist) / DDGI_DEPTH_BIAS + 0.5, 0.0, 1.0);
         if (wd <= 0.0) { continue; }
-        let irr = ddgi_irr_sample(id, n);
+        // age==0 探针：irr 纹理未初始化（全 0），采样会拉向黑 → 用天空色近似
+        // 间接辐照度作为首帧兜底，避免新滚入区域整片发黑（探针收敛后自然接管）。
+        var irr = ddgi_irr_sample(id, n);
+        if (ddgi_meta_age(m) == 0u) {
+          irr = sky_color(n) * 0.5;
+        }
         let w = wtri * wn * wd;
         total = total + irr * w;
         wsum = wsum + w;
@@ -1689,6 +1698,13 @@ fn ddgi_sample_dom(
     }
   }
   return vec4<f32>(select(vec3<f32>(0.0), total / wsum, wsum >= 1e-4), wsum);
+}
+// 点到域最近边界的距离（本级 cell 单位）：min(rel, dims−rel) 逐轴取最小。
+// 用于级联过渡带混合：dist<1 时与更粗级混合，消除域边界色跳。
+fn ddgi_edge_dist(origin: vec3<f32>, dims: vec3<f32>, cell_size: f32, p: vec3<f32>) -> f32 {
+  let rel = (p / 16.0 - origin) / (cell_size / 16.0);
+  let d = min(rel, dims - rel);
+  return min(d.x, min(d.y, d.z));
 }
 // 域包含测试（纯 ALU，零纹理 load）：p（世界 fine）是否在本级网格窗内
 fn ddgi_dom_contains(origin: vec3<f32>, dims: vec3<f32>, cell_size: f32, p: vec3<f32>) -> bool {
@@ -1699,36 +1715,59 @@ fn ddgi_dom_contains(origin: vec3<f32>, dims: vec3<f32>, cell_size: f32, p: vec3
 // （1=base，2-5=级联0-3）
 var<private> ddgi_dbg_wsum: f32;
 var<private> ddgi_dbg_dom: f32;
-// 多级联选域采样（M4-3 ⑤）：**每像素确定性单域**——包含测试选域后恰一次
-// 8-cell 采样（逐域 fallback 会让域外像素走满 5 次 8-cell = 5×纹理 load，
-// 全屏路径直接打穿帧预算）。优先级：casc0（相机邻域；base 在其窗内已被
-// finer 剔除无有效探针）→ base（级联窗外仍是最细 16³ 静态级）→ casc1/2/3
-// （粗级兜底远场）。选中山域内 8-cell 无有效探针（全 Solid 等）→ 返回 0。
+// 多级联选域采样 + 过渡带混合：
+// 优先级 casc0 → base → casc1 → casc2 → casc3。选中域后，若距边界 <1 cell，
+// 与「更粗一级」按 t=clamp(dist,0,1) 线性混合（边界 50/50，内部全选本级），
+// 消除不同探针密度/收敛态造成的域边界硬色跳。仅边界像素多一次 8-cell 采样。
 fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   let db = ddgi_dom.base;
   let base_cells = u32(db.grid_dims.x) * u32(db.grid_dims.y) * u32(db.grid_dims.z);
   let c0 = ddgi_dom.cascades[0];
+  // casc0（相机邻域，最细滚动级）
   if (ddgi_dom_contains(c0.grid_origin.xyz, c0.grid_dims.xyz, c0.grid_origin.w, p)) {
-    let r = ddgi_sample_dom(p, n, c0.grid_origin.xyz, c0.grid_dims.xyz, c0.grid_origin.w,
-      base_cells);
+    let r = ddgi_sample_dom(p, n, c0.grid_origin.xyz, c0.grid_dims.xyz, c0.grid_origin.w, base_cells);
+    let t = clamp(ddgi_edge_dist(c0.grid_origin.xyz, c0.grid_dims.xyz, c0.grid_origin.w, p), 0.0, 1.0);
+    var col = r.xyz;
+    if (t < 1.0) {
+      let rb = ddgi_sample_dom(p, n, db.grid_origin.xyz, db.grid_dims.xyz, db.grid_origin.w, 0u);
+      col = mix(rb.xyz, r.xyz, t);
+    }
     ddgi_dbg_wsum = r.w;
     ddgi_dbg_dom = 2.0;
-    return r.xyz;
+    return col;
   }
+  // base（世界级静态 16³）
   if (ddgi_dom_contains(db.grid_origin.xyz, db.grid_dims.xyz, db.grid_origin.w, p)) {
     let r = ddgi_sample_dom(p, n, db.grid_origin.xyz, db.grid_dims.xyz, db.grid_origin.w, 0u);
+    let t = clamp(ddgi_edge_dist(db.grid_origin.xyz, db.grid_dims.xyz, db.grid_origin.w, p), 0.0, 1.0);
+    var col = r.xyz;
+    if (t < 1.0) {
+      let c1 = ddgi_dom.cascades[1];
+      let rc = ddgi_sample_dom(p, n, c1.grid_origin.xyz, c1.grid_dims.xyz, c1.grid_origin.w, base_cells + 4096u);
+      col = mix(rc.xyz, r.xyz, t);
+    }
     ddgi_dbg_wsum = r.w;
     ddgi_dbg_dom = 1.0;
-    return r.xyz;
+    return col;
   }
+  // casc1/2/3（粗级兜底远场）
   for (var c = 1u; c < 4u; c = c + 1u) {
     let dom = ddgi_dom.cascades[c];
     if (ddgi_dom_contains(dom.grid_origin.xyz, dom.grid_dims.xyz, dom.grid_origin.w, p)) {
       let r = ddgi_sample_dom(p, n, dom.grid_origin.xyz, dom.grid_dims.xyz, dom.grid_origin.w,
         base_cells + c * 4096u);
+      let t = clamp(ddgi_edge_dist(dom.grid_origin.xyz, dom.grid_dims.xyz, dom.grid_origin.w, p), 0.0, 1.0);
+      var col = r.xyz;
+      // casc3 是最外级，无更粗级可混合
+      if (t < 1.0 && c < 3u) {
+        let coarser = ddgi_dom.cascades[c + 1u];
+        let rc = ddgi_sample_dom(p, n, coarser.grid_origin.xyz, coarser.grid_dims.xyz, coarser.grid_origin.w,
+          base_cells + (c + 1u) * 4096u);
+        col = mix(rc.xyz, r.xyz, t);
+      }
       ddgi_dbg_wsum = r.w;
       ddgi_dbg_dom = 2.0 + f32(c);
-      return r.xyz;
+      return col;
     }
   }
   ddgi_dbg_wsum = 0.0;
