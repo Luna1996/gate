@@ -1020,7 +1020,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t_sky = x * x * (3.0 - 2.0 * x);
     let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * sun);
+    // R3-10 DDGI 间接项（Douglas #23）：命中点采样上一帧 irradiance（自闭环）；
+    // 采样方向 = 表面法线（RTXGI 约定，M3-2 修正）。pre-exposure：曝光在末段统一。
+    let p_hit = origin_fine + dir_fine * best.uh.t;
+    let gi = ddgi_sample(p_hit, n);
+    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * sun) + alb * gi;
   }
   textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
 }

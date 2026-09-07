@@ -2221,13 +2221,13 @@ pub const DDA_SHADER_ASSET_PATH: &str = "shaders/dda.wgsl";
 // （类型定义在 L110 附近，#[derive(Resource, Clone, ExtractResource)]）
 // 这里再用 use 明确
 #[derive(Resource)]
-struct DdaBg0BindGroup(BindGroup);
+pub(crate) struct DdaBg0BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
-struct DdaBg1BindGroup(BindGroup);
+pub(crate) struct DdaBg1BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
-struct DdaBg2BindGroup(BindGroup);
+pub(crate) struct DdaBg2BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
-struct DdaBg3BindGroup(BindGroup);
+pub(crate) struct DdaBg3BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
@@ -2383,7 +2383,15 @@ fn init_dda_pipelines(
   // Devlog 23：hashmap 光照链（vis_table/direct/gi/denoise）与 DDGI 探针更新 pass 已全部
   // 拆除，两入口仅绑 BG0-3（输出+view/brickmap/grid_descs/光池）。
   let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
-  let layouts = vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone()];
+  // R3-10 M4-2：dda_main/beam 布局加 BG4（DDGI 资源）——dda_main 命中着色采样
+  // ddgi_sample（间接项），beam 不用但同布局须全量绑定
+  let layouts = vec![
+    bg0.clone(),
+    bg1.clone(),
+    bg2.clone(),
+    bg3.clone(),
+    crate::ddgi::ddgi_bg4_layout(),
+  ];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
     layout: layouts.clone(),
@@ -2568,21 +2576,26 @@ fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
-fn dispatch_dda(
+pub(crate) fn dispatch_dda(
   mut ctx: RenderContext,
   bg0: Option<Res<DdaBg0BindGroup>>,
   bg1: Option<Res<DdaBg1BindGroup>>,
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
+  bg4: Option<Res<crate::ddgi::DdgiBg4>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
 ) {
   // Devlog 23：光照链已拆除——主 pass trace 命中后直接 unlit 着色直出 out_tex
   // （无缓存逐体素法线 + 天空渐变 + 太阳方向光项），无后续 direct/gi/denoise pass。
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) =
-    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref())
-  else {
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
+    bg0.as_ref(),
+    bg1.as_ref(),
+    bg2.as_ref(),
+    bg3.as_ref(),
+    bg4.as_ref(),
+  ) else {
     bevy::log::debug_once!("DDA dispatch: bind groups missing");
     return;
   };
@@ -2622,6 +2635,7 @@ fn dispatch_dda(
         pass.set_bind_group(1, &bg1.0, &[]);
         pass.set_bind_group(2, &bg2.0, &[]);
         pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
         pass.dispatch_workgroups(bx, by, 1);
       }
       span.end(ctx.command_encoder());
@@ -2643,6 +2657,7 @@ fn dispatch_dda(
       pass.set_bind_group(1, &bg1.0, &[]);
       pass.set_bind_group(2, &bg2.0, &[]);
       pass.set_bind_group(3, &bg3.0, &[]);
+      pass.set_bind_group(4, &bg4.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     }
     span.end(ctx.command_encoder());

@@ -1804,15 +1804,17 @@ pub fn cpu_sample_ddgi(a: &DdgiProbeArrays, p: Vec3, n: Vec3) -> Vec3 {
 use bevy::asset::AssetServer;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, Res, ResMut};
+use bevy::prelude::RenderGraph;
 use bevy::render::{
   Render, RenderApp, RenderStartup, RenderSystems,
+  diagnostic::RecordDiagnostics,
   render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     Buffer, BufferBindingType, BufferDescriptor, BufferUsages, CachedComputePipelineId,
-    ComputePipelineDescriptor, Extent3d, Origin3d, ShaderStages, StorageTextureAccess,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-    TextureViewDescriptor, TextureViewDimension, UniformBuffer,
+    ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, Origin3d, ShaderStages,
+    StorageTextureAccess, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureView, TextureViewDescriptor, TextureViewDimension, UniformBuffer,
   },
   renderer::{RenderDevice, RenderQueue},
 };
@@ -1970,8 +1972,11 @@ pub struct DdgiGpu {
   pub positions: Buffer,
   pub cell_index: Buffer,
   pub objects: Buffer,
-  /// [count, 1, 1, 0]；[0] 由 ddgi_active atomicAdd，兼 cast/update 的 indirect buffer
+  /// [count, 1, 1, 0]；[0] 由 ddgi_active atomicAdd。**不能**兼 indirect——同
+  /// dispatch scope 内 STORAGE 与 INDIRECT 互斥（wgpu 验证），indirect 走独立 buffer。
   pub dispatch: Buffer,
+  /// indirect 专用（COPY_DST + INDIRECT）：active 后由 encoder 从 dispatch 整拷 16B
+  pub indirect: Buffer,
   pub worklist: Buffer,
   pub samples: Buffer,
   pub irr_prev: Texture,
@@ -1989,6 +1994,9 @@ pub struct DdgiGpu {
   /// 纹理数组层数（= meta_texture_layers(probe_count)）
   pub layers: u32,
   pub probe_count: u32,
+  /// cell 网格（dispatch_ddgi 的 active dispatch 数 + uniform 模板来源）
+  pub grid_origin: IVec3,
+  pub grid_dims: UVec3,
   /// 已推进帧号（prepare 自增）
   pub frame: u32,
   /// 当前 GPU 探针数据对应的世界编辑代数（u64::MAX = 尚未烘焙；编辑后触发重烘）
@@ -2014,6 +2022,13 @@ impl bevy::app::Plugin for DdgiPlugin {
       .add_systems(
         Render,
         (queue_ddgi_pipelines, prepare_ddgi).in_set(RenderSystems::PrepareBindGroups),
+      )
+      // M4-2：四 pass 链在主 trace（dispatch_dda）之前编码
+      .add_systems(
+        RenderGraph,
+        dispatch_ddgi
+          .in_set(bevy::render::renderer::RenderGraphSystems::Render)
+          .before(crate::brickmap::dda::dispatch_dda),
       );
   }
 }
@@ -2028,6 +2043,16 @@ fn dummy_sized_buffer(device: &RenderDevice, label: &str, size: u64) -> Buffer {
     label: Some(label.into()),
     size: size.max(4),
     usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+    mapped_at_creation: false,
+  })
+}
+
+/// indirect dispatch 专用 buffer（INDIRECT + COPY_DST；与 storage 绑定互斥故独立）
+fn dummy_indirect_buffer(device: &RenderDevice, label: &str) -> Buffer {
+  device.create_buffer(&BufferDescriptor {
+    label: Some(label.into()),
+    size: 16,
+    usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
     mapped_at_creation: false,
   })
 }
@@ -2060,7 +2085,8 @@ fn ddgi_array_tex(
     format,
     usage: TextureUsages::TEXTURE_BINDING
       | TextureUsages::STORAGE_BINDING
-      | TextureUsages::COPY_DST,
+      | TextureUsages::COPY_DST
+      | TextureUsages::COPY_SRC, // ping-pong copy 的 source 侧
     view_formats: &[],
   })
 }
@@ -2105,6 +2131,7 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>) {
     cell_index: dummy_buffer(&device, "ddgi_cell_index(empty)"),
     objects: dummy_buffer(&device, "ddgi_objects(empty)"),
     dispatch: dummy_buffer(&device, "ddgi_dispatch(empty)"),
+    indirect: dummy_indirect_buffer(&device, "ddgi_indirect(empty)"),
     worklist: dummy_buffer(&device, "ddgi_worklist(empty)"),
     samples: dummy_buffer(&device, "ddgi_samples(empty)"),
     irr_prev: irr.clone(),
@@ -2121,6 +2148,8 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>) {
     meta_next_view: meta_v,
     layers: 1,
     probe_count: 0,
+    grid_origin: IVec3::ZERO,
+    grid_dims: UVec3::ONE,
     frame: 0,
     baked_generation: u64::MAX,
     pipelines: None,
@@ -2163,6 +2192,162 @@ fn queue_ddgi_pipelines(
     cast: mk("gate_ddgi_cast", "ddgi_cast"),
     update: mk("gate_ddgi_update", "ddgi_update"),
   });
+}
+
+/// 四 pass 编排（M4-2；在 dispatch_dda 主 trace 之前执行）：
+/// copy（prev→next 重填，encoder 级无 pass 冲突）→ ①clear → ②active（间接计
+/// 数 atomicAdd）→ ③cast（indirect）→ ④update（indirect）。
+/// race 纪律：pass 间读写同 storage/texture 必须分 pass（wgpu 只在 pass 边界插
+/// barrier）；clear→active 同 buffer 亦然。
+/// ping-pong 语义：本帧 prev = 上一帧 update 产物（cast 的 ddgi_sample 读它 =
+/// 「上一帧 DDGI 输出」自闭环）；next 经 copy 重填后只被本帧处理探针覆写，帧末
+/// prepare 交换指针。
+#[allow(clippy::too_many_arguments)]
+fn dispatch_ddgi(
+  mut ctx: bevy::render::renderer::RenderContext,
+  bg0: Option<Res<crate::brickmap::dda::DdaBg0BindGroup>>,
+  bg1: Option<Res<crate::brickmap::dda::DdaBg1BindGroup>>,
+  bg2: Option<Res<crate::brickmap::dda::DdaBg2BindGroup>>,
+  bg3: Option<Res<crate::brickmap::dda::DdaBg3BindGroup>>,
+  bg4: Option<Res<DdgiBg4>>,
+  gpu: Option<Res<DdgiGpu>>,
+  pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
+) {
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4), Some(gpu)) = (
+    bg0.as_ref(),
+    bg1.as_ref(),
+    bg2.as_ref(),
+    bg3.as_ref(),
+    bg4.as_ref(),
+    gpu.as_ref(),
+  ) else {
+    return;
+  };
+  if gpu.probe_count == 0 {
+    return;
+  }
+  let Some(pipes) = gpu.pipelines else {
+    return;
+  };
+  let (Some(p_clear), Some(p_active), Some(p_cast), Some(p_update)) = (
+    pipeline_cache.get_compute_pipeline(pipes.clear),
+    pipeline_cache.get_compute_pipeline(pipes.active),
+    pipeline_cache.get_compute_pipeline(pipes.cast),
+    pipeline_cache.get_compute_pipeline(pipes.update),
+  ) else {
+    bevy::log::debug_once!("DDGI dispatch: pipelines not ready");
+    return;
+  };
+
+  // ---- copy：prev→next 三对整体重填（M5-3 优化：in-place/级联限定 copy）----
+  {
+    let encoder = ctx.command_encoder();
+    for (src, dst, size) in [
+      (&gpu.meta_prev, &gpu.meta_next, PROBES_PER_LAYER_AXIS),
+      (&gpu.irr_prev, &gpu.irr_next, IRRADIANCE_LAYER_TEXELS),
+      (&gpu.depth_prev, &gpu.depth_next, DEPTH_LAYER_TEXELS),
+    ] {
+      encoder.copy_texture_to_texture(
+        TexelCopyTextureInfo {
+          texture: src,
+          mip_level: 0,
+          origin: Origin3d::ZERO,
+          aspect: TextureAspect::All,
+        },
+        TexelCopyTextureInfo {
+          texture: dst,
+          mip_level: 0,
+          origin: Origin3d::ZERO,
+          aspect: TextureAspect::All,
+        },
+        Extent3d {
+          width: size,
+          height: size,
+          depth_or_array_layers: gpu.layers,
+        },
+      );
+    }
+  }
+
+  let set_bgs = |pass: &mut bevy::render::render_resource::ComputePass| {
+    pass.set_bind_group(0, &bg0.0, &[]);
+    pass.set_bind_group(1, &bg1.0, &[]);
+    pass.set_bind_group(2, &bg2.0, &[]);
+    pass.set_bind_group(3, &bg3.0, &[]);
+    pass.set_bind_group(4, &bg4.0, &[]);
+  };
+  let recorder = ctx.diagnostic_recorder();
+  let recorder = recorder.as_deref();
+
+  // ①clear（1 线程清 indirect 计数）
+  {
+    let mut pass = ctx
+      .command_encoder()
+      .begin_compute_pass(&ComputePassDescriptor {
+        label: Some("gate_ddgi_clear"),
+        ..Default::default()
+      });
+    pass.set_pipeline(p_clear);
+    set_bgs(&mut pass);
+    pass.dispatch_workgroups(1, 1, 1);
+  }
+  // ②active（@workgroup_size(4,4,4)，dispatch = ceil(dims/4)）
+  {
+    let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_active");
+    {
+      let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+          label: Some("gate_ddgi_active"),
+          ..Default::default()
+        });
+      pass.set_pipeline(p_active);
+      set_bgs(&mut pass);
+      pass.dispatch_workgroups(
+        gpu.grid_dims.x.div_ceil(4),
+        gpu.grid_dims.y.div_ceil(4),
+        gpu.grid_dims.z.div_ceil(4),
+      );
+    }
+    span.end(ctx.command_encoder());
+  }
+  // dispatch → indirect 桥接（encoder copy 在 pass 边界外，atomic 计数已终结）
+  {
+    let encoder = ctx.command_encoder();
+    encoder.copy_buffer_to_buffer(&gpu.dispatch, 0, &gpu.indirect, 0, 16);
+  }
+  // ③cast（indirect：x = dispatch[0] 活跃探针数）
+  {
+    let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_cast");
+    {
+      let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+          label: Some("gate_ddgi_cast"),
+          ..Default::default()
+        });
+      pass.set_pipeline(p_cast);
+      set_bgs(&mut pass);
+      pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+    }
+    span.end(ctx.command_encoder());
+  }
+  // ④update（indirect：同 count；1 wg = 1 探针）
+  {
+    let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_update");
+    {
+      let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+          label: Some("gate_ddgi_update"),
+          ..Default::default()
+        });
+      pass.set_pipeline(p_update);
+      set_bgs(&mut pass);
+      pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+    }
+    span.end(ctx.command_encoder());
+  }
 }
 
 /// main world VoxelScene → render world ProbeBake（版本驱动：世界编辑代数变化即重烘）
@@ -2232,6 +2417,34 @@ fn prepare_ddgi(
   bake: Option<Res<ProbeBake>>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
+  // ---- D7 ping-pong 交换（无条件；烘焙帧两份同数据交换无害）----
+  // 上一帧 next（已被 update 写入新值）变本帧 prev；旧 prev 由 dispatch_ddgi 的
+  // copy pass 重填后作为本帧 next 被 active/update 覆写。
+  {
+    let g = &mut *gpu;
+    let DdgiGpu {
+      irr_prev,
+      irr_next,
+      irr_prev_view,
+      irr_next_view,
+      depth_prev,
+      depth_next,
+      depth_prev_view,
+      depth_next_view,
+      meta_prev,
+      meta_next,
+      meta_prev_view,
+      meta_next_view,
+      ..
+    } = g;
+    std::mem::swap(irr_prev, irr_next);
+    std::mem::swap(irr_prev_view, irr_next_view);
+    std::mem::swap(depth_prev, depth_next);
+    std::mem::swap(depth_prev_view, depth_next_view);
+    std::mem::swap(meta_prev, meta_next);
+    std::mem::swap(meta_prev_view, meta_next_view);
+  }
+
   // ---- 新烘焙（含编辑后重烘）：重建纹理数组 + buffer（尺寸变化）----
   if let Some(bake) = bake {
     let generation = bake.1;
@@ -2261,16 +2474,18 @@ fn prepare_ddgi(
     };
     gpu.positions = make("ddgi_positions", &vec4_bytes(&pack_probe_positions(pg)));
     gpu.cell_index = make("ddgi_cell_index", &u32_bytes(&pg.cell_index));
-    gpu.objects = dummy_buffer(&device, "ddgi_objects"); // D12：MOV 探针后置
-    // dispatch（indirect buffer 语义 [count,1,1,0]）：STORAGE + INDIRECT
+    gpu.objects = dummy_sized_buffer(&device, "ddgi_objects", 16); // D12：MOV 后置；runtime-sized vec4 数组最小 1 元素
+    // dispatch（atomic 计数 [count,1,1,0]）：STORAGE；indirect 走独立 buffer（同
+    // dispatch scope 内 STORAGE 与 INDIRECT 互斥——wgpu 验证，active 后整拷桥接）
     let dispatch = device.create_buffer(&BufferDescriptor {
       label: Some("ddgi_dispatch".into()),
       size: 16,
-      usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
       mapped_at_creation: false,
     });
     queue.write_buffer(&dispatch, 0, &0u32.to_le_bytes());
     gpu.dispatch = dispatch;
+    gpu.indirect = dummy_indirect_buffer(&device, "ddgi_indirect");
     gpu.worklist = make("ddgi_worklist", &u32_bytes(&vec![0u32; n as usize]));
     // 样本缓冲容量 = max(8192, 2×probe_count) vec4（rays GPU 自派生后总射线数 ≤ max(4096, count)）
     let sample_slots = (n * 2).max(8192);
@@ -2279,10 +2494,12 @@ fn prepare_ddgi(
     // ---- D7 纹理数组（irr 128² rgba16f / depth 256² r32 / meta 16² r32uint）----
     // WebGPU 零初始化保证 → irr 无需上传；depth 初值 tmax（0 会被 chevron 误判贴墙）
     // 与 meta（packed offset+age=0）经 write_texture 双份写入（ping-pong 两份同数据）。
-    let (irr, irr_v) = {
+    // ping-pong 两半必须是**独立 Texture**（同 handle copy src==dst 非法，语义上
+    // 也是两份存储）；命名 _a/_b。
+    let (irr_a, irr_av) = {
       let t = ddgi_array_tex(
         &device,
-        "ddgi_irr",
+        "ddgi_irr_a",
         TextureFormat::Rgba16Float,
         (IRRADIANCE_LAYER_TEXELS, IRRADIANCE_LAYER_TEXELS),
         layers,
@@ -2290,10 +2507,21 @@ fn prepare_ddgi(
       let v = ddgi_array_view(&t);
       (t, v)
     };
-    let (dep, dep_v) = {
+    let (irr_b, irr_bv) = {
       let t = ddgi_array_tex(
         &device,
-        "ddgi_depth",
+        "ddgi_irr_b",
+        TextureFormat::Rgba16Float,
+        (IRRADIANCE_LAYER_TEXELS, IRRADIANCE_LAYER_TEXELS),
+        layers,
+      );
+      let v = ddgi_array_view(&t);
+      (t, v)
+    };
+    let (dep_a, dep_av) = {
+      let t = ddgi_array_tex(
+        &device,
+        "ddgi_depth_a",
         TextureFormat::R32Float,
         (DEPTH_LAYER_TEXELS, DEPTH_LAYER_TEXELS),
         layers,
@@ -2301,10 +2529,32 @@ fn prepare_ddgi(
       let v = ddgi_array_view(&t);
       (t, v)
     };
-    let (meta, meta_v) = {
+    let (dep_b, dep_bv) = {
       let t = ddgi_array_tex(
         &device,
-        "ddgi_meta",
+        "ddgi_depth_b",
+        TextureFormat::R32Float,
+        (DEPTH_LAYER_TEXELS, DEPTH_LAYER_TEXELS),
+        layers,
+      );
+      let v = ddgi_array_view(&t);
+      (t, v)
+    };
+    let (meta_a, meta_av) = {
+      let t = ddgi_array_tex(
+        &device,
+        "ddgi_meta_a",
+        TextureFormat::R32Uint,
+        (PROBES_PER_LAYER_AXIS, PROBES_PER_LAYER_AXIS),
+        layers,
+      );
+      let v = ddgi_array_view(&t);
+      (t, v)
+    };
+    let (meta_b, meta_bv) = {
+      let t = ddgi_array_tex(
+        &device,
+        "ddgi_meta_b",
         TextureFormat::R32Uint,
         (PROBES_PER_LAYER_AXIS, PROBES_PER_LAYER_AXIS),
         layers,
@@ -2318,7 +2568,7 @@ fn prepare_ddgi(
         as usize
     ]);
     let meta_data = u32_bytes(&build_meta_texture_data(pg));
-    for tex in [&dep, &meta] {
+    for tex in [&dep_a, &dep_b, &meta_a, &meta_b] {
       let (bytes_per_row, rows, data): (u32, u32, &[u8]) =
         if tex.format() == TextureFormat::R32Float {
           (DEPTH_LAYER_TEXELS * 4, DEPTH_LAYER_TEXELS, &dep_data)
@@ -2345,20 +2595,22 @@ fn prepare_ddgi(
         },
       );
     }
-    gpu.irr_prev = irr.clone();
-    gpu.irr_next = irr;
-    gpu.depth_prev = dep.clone();
-    gpu.depth_next = dep;
-    gpu.meta_prev = meta.clone();
-    gpu.meta_next = meta;
-    gpu.irr_prev_view = irr_v.clone();
-    gpu.irr_next_view = irr_v;
-    gpu.depth_prev_view = dep_v.clone();
-    gpu.depth_next_view = dep_v;
-    gpu.meta_prev_view = meta_v.clone();
-    gpu.meta_next_view = meta_v;
+    gpu.irr_prev = irr_a;
+    gpu.irr_next = irr_b;
+    gpu.depth_prev = dep_a;
+    gpu.depth_next = dep_b;
+    gpu.meta_prev = meta_a;
+    gpu.meta_next = meta_b;
+    gpu.irr_prev_view = irr_av;
+    gpu.irr_next_view = irr_bv;
+    gpu.depth_prev_view = dep_av;
+    gpu.depth_next_view = dep_bv;
+    gpu.meta_prev_view = meta_av;
+    gpu.meta_next_view = meta_bv;
     gpu.layers = layers;
     gpu.probe_count = n;
+    gpu.grid_origin = pg.grid_origin;
+    gpu.grid_dims = pg.grid_dims;
     gpu.baked_generation = generation;
     gpu.frame = 0;
     gpu
