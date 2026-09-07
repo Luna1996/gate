@@ -1042,7 +1042,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
     // R3-10 DDGI 间接项（Douglas #23）：体素中心采样上一帧 irradiance（自闭环）；
     // 采样方向 = 体素 implicit normal（RTXGI 约定，M3-2 修正）。一体素一色。
-    let gi = ddgi_sample(p_voxel, n);
+    // params.z = 诊断增益（GATE_DDGI_GAIN，默认 1；M5-3 调参/链路定位用）
+    let gi = ddgi_sample(p_voxel, n) * ddgi_u.params.z;
     col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * ndl * sun) + alb * gi;
   }
   textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));

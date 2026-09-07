@@ -1837,6 +1837,14 @@ pub struct DdgiUniform {
 }
 
 impl DdgiUniform {
+  /// 诊断增益（GATE_DDGI_GAIN，默认 1；M5-3 调参/链路定位用，params.z 下发）
+  pub fn debug_gain() -> f32 {
+    std::env::var("GATE_DDGI_GAIN")
+      .ok()
+      .and_then(|v| v.parse::<f32>().ok())
+      .unwrap_or(1.0)
+  }
+
   /// ProbeGrid + 帧状态 → uniform（M4-3 滚动后 reuse/finer 由 CPU 每帧覆写）
   pub fn new(
     pg: &ProbeGrid,
@@ -1858,7 +1866,7 @@ impl DdgiUniform {
         pg.grid_dims.z as f32,
         pg.positions.len() as f32,
       ),
-      params: Vec4::new(frame as f32, 0.0, 0.0, object_count as f32),
+      params: Vec4::new(frame as f32, 0.0, Self::debug_gain(), object_count as f32),
       reuse_min: Vec4::new(
         reuse_bounds.0.x as f32,
         reuse_bounds.0.y as f32,
