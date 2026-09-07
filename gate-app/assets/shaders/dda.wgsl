@@ -1025,4 +1025,607 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
 }
 
+// ============================================================================
+// R3-10 DDGI 三 pass + 采样（M3 WGSL 逐字镜像）
+//
+// CPU 镜像源 = gate-render/src/ddgi.rs「M3-1/M3-2/M3-3」章节 +
+// cpu_sample_ddgi/cpu_irr_sample/cpu_depth_sample（docs/ddgi-rework-spec.md
+// D2/D4/D5/D6/D7/D10；截图1-3 sort.glsl L218-262 + RTXGI Irradiance.hlsl 对照）。
+// 改本段必同步 ddgi.rs CPU 镜像与「WGSL 对齐表」常量（wire 单测防漂移）。
+//
+// pass 编排（M4-2 接线）：①ddgi_clear（1 线程清 indirect 计数）→ ②ddgi_active
+// （逐 cell 4³ workgroup，subgroup 不可用 → atomicAdd worklist，风险表已记）→
+// ③ddgi_cast（indirect，1 workgroup = 1 活跃探针，固定射线预算均摊）→
+// ④ddgi_update（indirect，1 workgroup = 1 探针，64 线程 = 64 irr texel）。
+// 三 pass 间 dispatch 读写同 storage = race（UB），必须分 compute pass（wgpu 只在
+// pass 边界插 barrier）。
+//
+// M4-2 待接线的 ping-pong 语义（CPU 镜像用 prev 拷贝表达，纹理是新鲜分配的）：
+// meta/irr/depth 的 next 纹理在 active/update 只写「本帧处理的探针」，其余 texel
+// 需在 pass 前做 prev→next 整体 copy（wgpu copy_texture_array；meta 335KB/帧、
+// irr+depth 仅级联级 16³ 探针 ≈ 24MB/帧，base 世界级改 in-place 双缓冲——M4-1 定）。
+//
+// 采样方向约定（RTXGI 实锤，M3-2 修正）：背面权重 = n·(接收点→探针)；
+// irradiance oct 采样方向 = 表面法线；depth = 探针→接收点。
+// ============================================================================
+
+// ---- 常量（ddgi.rs「WGSL 对齐表」逐字）----
+const DDGI_CELL: u32 = 16u;
+const DDGI_IRR_TEXELS: u32 = 8u;
+const DDGI_DEPTH_TEXELS: u32 = 16u;
+const DDGI_PROBES_PER_LAYER_AXIS: u32 = 16u;
+const DDGI_PROBES_PER_LAYER: u32 = 256u;
+const DDGI_META_OFFSET_BITS: u32 = 5u;
+const DDGI_META_AGE_SHIFT: u32 = 15u;
+const DDGI_AGE_MAX: u32 = 255u;
+const DDGI_NO_PROBE: u32 = 0xFFFFFFFFu;
+const DDGI_FLAG_ENABLED: u32 = 1u;
+const DDGI_FLAG_NO_SURFACES: u32 = 2u;
+const DDGI_ALPHA: f32 = 0.1; // 存储语义已并入 update 链常数（hysteresis = 1-α）
+const DDGI_DEPTH_ALPHA: f32 = 0.2;
+const DDGI_TEXEL_MIN_WEIGHT: f32 = 1e-4;
+const DDGI_NORMAL_BIAS: f32 = 0.2;
+const DDGI_DEPTH_BIAS: f32 = 4.0;
+const DDGI_T_MAX: f32 = 8192.0;
+const DDGI_SHADOW_T_MAX: f32 = 8192.0;
+const DDGI_SHADOW_BIAS: f32 = 0.5;
+const DDGI_EMIT_GAIN: f32 = 4.0;
+const DDGI_PI: f32 = 3.14159265;
+const CAN_SKIP_MAX: f32 = 0.5;
+// 更新链阈值（RTXGI ProbeBlendingCS.hlsl L508-550 逐字）
+const DDGI_HYSTERESIS: f32 = 0.95;
+const DDGI_IRRAD_GAMMA: f32 = 1.0;
+const DDGI_BIG_CHANGE: f32 = 0.2;
+const DDGI_BRIGHTNESS: f32 = 1.0;
+const DDGI_MIN_STEP: f32 = 0.0009765625; // 1/1024
+const DDGI_CHANGE_DROP: f32 = 0.75;
+const DDGI_DELTA_CLAMP: f32 = 0.25;
+
+// ---- group(4)：v2 DDGI 资源（M4-1 建 Rust 侧绑定；常量见 ddgi.rs 对齐表）----
+struct DdgiUniform {
+  grid_origin: vec4<f32>, // xyz = 网格原点（16-cell 全局坐标），w = cell 边长（fine）
+  grid_dims: vec4<f32>,   // xyz = dims（本级 cell 单位），w = probe_count
+  params: vec4<f32>,      // x = frame, y = rays_per_probe, z = 保留, w = object bbox 数
+  reuse_min: vec4<f32>,   // xyz = reuse bounds min（cell rel，i32 存 f32）
+  reuse_max: vec4<f32>,   // xyz = reuse bounds max（不含端）
+  finer_min: vec4<f32>,   // xyz = 更细级域原点（16-cell），w = 更细级 cell 边长（<=0 = 无）
+  finer_size: vec4<f32>,  // xyz = 更细级域 dims（cell 单位）
+};
+@group(4) @binding(0) var<uniform> ddgi_u: DdgiUniform;
+@group(4) @binding(1) var<storage, read> ddgi_positions: array<vec4<f32>>; // xyz = 世界 fine 坐标
+@group(4) @binding(2) var<storage, read> ddgi_cell_index: array<u32>;      // dense cell → probe id
+@group(4) @binding(3) var ddgi_irr_prev: texture_2d_array<f32>;            // rgba16f 128×128×L
+@group(4) @binding(4) var ddgi_depth_prev: texture_2d_array<f32>;          // r32 256×256×L
+@group(4) @binding(5) var ddgi_irr_next: texture_storage_2d_array<rgba16float, write>;
+@group(4) @binding(6) var ddgi_depth_next: texture_storage_2d_array<r32float, write>;
+@group(4) @binding(7) var ddgi_meta_prev: texture_2d_array<u32>;           // r32uint 16×16×L
+@group(4) @binding(8) var ddgi_meta_next: texture_storage_2d_array<r32uint, write>;
+@group(4) @binding(9) var<storage, read_write> ddgi_dispatch: array<atomic<u32>>; // [0]=count [1]=1 [2]=1 [3]=0（兼 indirect buffer）
+@group(4) @binding(10) var<storage, read> ddgi_objects: array<vec4<f32>>;  // 2 vec4/bbox（min.xyz+pad / max.xyz+pad）
+@group(4) @binding(11) var<storage, read_write> ddgi_samples: array<vec4<f32>>; // [dir.xyz, dist]+[radiance.xyz, 0]
+@group(4) @binding(12) var<storage, read_write> ddgi_worklist: array<u32>; // 活跃探针 id（[slot]，slot = atomicAdd 序号）
+
+// ---- PCG hash / 随机（ray_rand 种子链与 CPU 逐位一致）----
+fn ddgi_pcg(v: u32) -> u32 {
+  let state = v * 747796405u + 2891336453u;
+  let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+fn ddgi_ray_rand(probe_id: u32, frame: u32, ray_index: u32) -> u32 {
+  return ddgi_pcg(probe_id ^ ddgi_pcg(frame ^ ddgi_pcg(ray_index)));
+}
+fn ddgi_rand2(r: u32) -> vec2<f32> {
+  return vec2<f32>(f32(r & 0xFFFFu), f32(r >> 16u)) / 65536.0;
+}
+
+// ---- Fibonacci 球 + Shoemake 随机旋转（cast_ray_dir 镜像）----
+fn ddgi_fibonacci(i: u32, n: u32) -> vec3<f32> {
+  let golden = DDGI_PI * (3.0 - sqrt(5.0));
+  let y = 1.0 - (2.0 * f32(i) + 1.0) / f32(n);
+  let r = sqrt(max(1.0 - y * y, 0.0));
+  let a = golden * f32(i);
+  return vec3<f32>(r * cos(a), y, r * sin(a));
+}
+// Shoemake 均匀旋转四元数 q=(x,y,z,w)
+fn ddgi_random_quat(u1: f32, u2: f32, u3: f32) -> vec4<f32> {
+  let s1 = sqrt(1.0 - u1);
+  let s2 = sqrt(u1);
+  let a2 = 2.0 * DDGI_PI * u2;
+  let a3 = 2.0 * DDGI_PI * u3;
+  return vec4<f32>(s1 * sin(a2), s1 * cos(a2), s2 * sin(a3), s2 * cos(a3));
+}
+fn ddgi_quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let t = 2.0 * cross(q.xyz, v);
+  return v + q.w * t + cross(q.xyz, t);
+}
+fn ddgi_ray_dir(probe_id: u32, frame: u32, ray_index: u32, rays_total: u32) -> vec3<f32> {
+  let base = ddgi_fibonacci(ray_index, max(rays_total, 1u));
+  let seed = ddgi_ray_rand(probe_id, frame, 0u);
+  let u = ddgi_rand2(seed);
+  let u3 = f32(ddgi_pcg(seed) & 0xFFFFu) / 65536.0;
+  return ddgi_quat_rotate(ddgi_random_quat(u.x, u.y, u3), base);
+}
+
+// ---- 八面体映射（oct_encode/decode/texel_dir 镜像）----
+fn ddgi_snz(v: f32) -> f32 {
+  return select(-1.0, 1.0, v >= 0.0);
+}
+fn ddgi_oct_encode(n: vec3<f32>) -> vec2<f32> {
+  let d = n / (abs(n.x) + abs(n.y) + abs(n.z));
+  let p = d.xy;
+  if (d.z < 0.0) {
+    return vec2<f32>((1.0 - abs(p.y)) * ddgi_snz(p.x), (1.0 - abs(p.x)) * ddgi_snz(p.y));
+  }
+  return p;
+}
+fn ddgi_oct_decode(e: vec2<f32>) -> vec3<f32> {
+  var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0) {
+    let t = vec2<f32>((1.0 - abs(n.y)) * ddgi_snz(n.x), (1.0 - abs(n.x)) * ddgi_snz(n.y));
+    n.x = t.x;
+    n.y = t.y;
+  }
+  return normalize(n);
+}
+fn ddgi_oct_texel_dir(tx: u32, ty: u32, s: u32) -> vec3<f32> {
+  let e = (vec2<f32>(f32(tx), f32(ty)) + vec2<f32>(0.5)) / f32(s) * 2.0 - vec2<f32>(1.0);
+  return ddgi_oct_decode(e);
+}
+
+// ---- 纹理坐标映射（probe_layer/in_layer/irr/depth/meta_texel_coord 镜像）----
+fn ddgi_probe_in_layer(id: u32) -> vec2<u32> {
+  let in_layer = id % DDGI_PROBES_PER_LAYER;
+  return vec2<u32>(in_layer % DDGI_PROBES_PER_LAYER_AXIS, in_layer / DDGI_PROBES_PER_LAYER_AXIS);
+}
+fn ddgi_irr_coord(id: u32, tx: u32, ty: u32) -> vec3<u32> {
+  let p = ddgi_probe_in_layer(id);
+  return vec3<u32>(id / DDGI_PROBES_PER_LAYER, p.x * DDGI_IRR_TEXELS + tx, p.y * DDGI_IRR_TEXELS + ty);
+}
+fn ddgi_depth_coord(id: u32, tx: u32, ty: u32) -> vec3<u32> {
+  let p = ddgi_probe_in_layer(id);
+  return vec3<u32>(id / DDGI_PROBES_PER_LAYER, p.x * DDGI_DEPTH_TEXELS + tx, p.y * DDGI_DEPTH_TEXELS + ty);
+}
+fn ddgi_meta_coord(id: u32) -> vec3<u32> {
+  let p = ddgi_probe_in_layer(id);
+  return vec3<u32>(id / DDGI_PROBES_PER_LAYER, p.x, p.y);
+}
+
+// ---- 元数据位域（pack/unpack_probe_meta 镜像）----
+fn ddgi_meta_pack(offset_fine2: vec3<u32>, age: u32) -> u32 {
+  return (offset_fine2.x & 31u)
+    | ((offset_fine2.y & 31u) << DDGI_META_OFFSET_BITS)
+    | ((offset_fine2.z & 31u) << (2u * DDGI_META_OFFSET_BITS))
+    | ((age & 255u) << DDGI_META_AGE_SHIFT);
+}
+fn ddgi_meta_offset(p: u32) -> vec3<u32> {
+  let m = (1u << DDGI_META_OFFSET_BITS) - 1u;
+  return vec3<u32>(p & m, (p >> DDGI_META_OFFSET_BITS) & m, (p >> (2u * DDGI_META_OFFSET_BITS)) & m);
+}
+fn ddgi_meta_age(p: u32) -> u32 {
+  return (p >> DDGI_META_AGE_SHIFT) & 255u;
+}
+
+// ---- can_skip_update（CPU INFERENCE 实现镜像；签名 3 参对齐截图2 调用点）----
+fn ddgi_can_skip(age: u32, frame: u32, probe_id: u32) -> bool {
+  let rand = ddgi_pcg(frame ^ ddgi_pcg(probe_id));
+  let a = f32(age) / f32(DDGI_AGE_MAX);
+  let p = a * a * CAN_SKIP_MAX;
+  return f32(rand & 0xFFFFu) / 65536.0 < p;
+}
+
+// ---- 更新链（update_irradiance_texel 逐字：γ-tonemap → 大暗化 h-0.75 →
+// 大亮化 delta×0.25 → hysteresis EMA → 暗化保底步进）----
+fn ddgi_lum(c: vec3<f32>) -> f32 {
+  return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+fn ddgi_maxc(c: vec3<f32>) -> f32 {
+  return max(c.x, max(c.y, c.z));
+}
+fn ddgi_update_texel(prev: vec3<f32>, proj: vec3<f32>) -> vec3<f32> {
+  let new_t = pow(proj, vec3<f32>(1.0 / DDGI_IRRAD_GAMMA));
+  var h = select(DDGI_HYSTERESIS, 0.0, all(prev == vec3<f32>(0.0)));
+  if (ddgi_maxc(prev - new_t) > DDGI_BIG_CHANGE) {
+    h = max(h - DDGI_CHANGE_DROP, 0.0);
+  }
+  var delta = new_t - prev;
+  if (ddgi_lum(delta) > DDGI_BRIGHTNESS) {
+    delta = delta * DDGI_DELTA_CLAMP;
+  }
+  var lerp_delta = (1.0 - h) * delta;
+  if (ddgi_maxc(new_t) < ddgi_maxc(prev)) {
+    let s = vec3<f32>(sign(lerp_delta.x), sign(lerp_delta.y), sign(lerp_delta.z));
+    lerp_delta = vec3<f32>(
+      clamp(max(abs(lerp_delta.x), DDGI_MIN_STEP), 0.0, abs(delta.x)),
+      clamp(max(abs(lerp_delta.y), DDGI_MIN_STEP), 0.0, abs(delta.y)),
+      clamp(max(abs(lerp_delta.z), DDGI_MIN_STEP), 0.0, abs(delta.z)),
+    ) * s;
+  }
+  return prev + lerp_delta;
+}
+
+// ---- 16³ cell 三态树走查（get_brick_state(level 2) 的 shader 版）----
+// 返回：0 = 纯空气；0xFFFFFFFF = Mixed（有表面）；>0 = Solid（有表面）。
+// 走查：chunk 窗口 → 根（256³）→ 64³ → 16³ 节点；路径上 mask bit=0 即统一
+// 子块（palette 直决，覆盖 ≥16³ 精确）；16³ 节点 mask!=0 → Mixed。
+fn ddgi_cell_state(cell_min_fine: vec3<i32>) -> u32 {
+  let g = make_grid(0u);
+  let cs = vec3<i32>(i32(CHUNK_SIZE));
+  let m = ((cell_min_fine % cs) + cs) % cs;
+  let chunk_i = (cell_min_fine - m) / cs;
+  let rel = chunk_i - g.index_origin;
+  if (any(rel < vec3<i32>(0))) { return 0u; }
+  let rel_u = vec3<u32>(rel);
+  if (any(rel_u >= g.index_dims)) { return 0u; }
+  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+  let entry = b_struct[index_addr];
+  if (entry == 0u) { return 0u; }
+  let chunk_base = g.tree_base + entry - 1u;
+  let local = vec3<u32>(m);
+  var node_addr = chunk_base;
+  for (var level = 0u; level < 2u; level = level + 1u) {
+    let mask_lo = b_struct[node_addr];
+    let mask_hi = b_struct[node_addr + 1u];
+    let palette = b_struct[node_addr + 2u] & 0xFFu;
+    let shift = 8u - (level + 1u) * 2u;
+    let cx = (local.x >> shift) & 3u;
+    let cy = (local.y >> shift) & 3u;
+    let cz = (local.z >> shift) & 3u;
+    let child_idx = cz * 16u + cy * 4u + cx;
+    var mask_word: u32 = mask_lo;
+    var bit_in_word: u32 = child_idx;
+    if (child_idx >= 32u) {
+      mask_word = mask_hi;
+      bit_in_word = child_idx - 32u;
+    }
+    if ((mask_word & (1u << bit_in_word)) == 0u) {
+      return palette; // ≥16³ 统一子块（0=空气精确，>0=Solid）
+    }
+    var pop: u32;
+    if (child_idx < 32u) {
+      pop = countOneBits(mask_lo & ((1u << bit_in_word) - 1u));
+    } else {
+      pop = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
+    }
+    node_addr = chunk_base + b_struct[node_addr + NODE_FIXED_WORDS + pop];
+  }
+  // 16³ 节点：mask!=0 → Mixed；mask==0 → 统一 palette（分裂位可指 3 字统一节点）
+  if (b_struct[node_addr] != 0u || b_struct[node_addr + 1u] != 0u) {
+    return 0xFFFFFFFFu;
+  }
+  return b_struct[node_addr + 2u] & 0xFFu;
+}
+
+// BrickState→flags 镜像：无探针 = 0；空气 = ENABLED|NO_SURFACES；其余 = ENABLED
+fn ddgi_state_flags(state: u32, has_probe: bool) -> u32 {
+  if (!has_probe) { return 0u; }
+  var f = DDGI_FLAG_ENABLED;
+  if (state == 0u) { f = f | DDGI_FLAG_NO_SURFACES; }
+  return f;
+}
+
+// 单 cell flags（cell 须在域内；NO_PROBE → 0）
+fn ddgi_flags_cell(cell: vec3<u32>) -> u32 {
+  let dx = u32(ddgi_u.grid_dims.x);
+  let li = cell.x + cell.y * dx + cell.z * dx * u32(ddgi_u.grid_dims.y);
+  let probe_id = ddgi_cell_index[li];
+  if (probe_id == DDGI_NO_PROBE) { return 0u; }
+  let step = ddgi_u.grid_origin.w / 16.0;
+  let cell_min = vec3<i32>((ddgi_u.grid_origin.xyz + vec3<f32>(cell) * step) * 16.0);
+  return ddgi_state_flags(ddgi_cell_state(cell_min), true);
+}
+
+// DDGI cell 网格原点（16-cell）→ cell 的 fine 体素最小角
+fn ddgi_cell_min(cell: vec3<u32>) -> vec3<i32> {
+  let step = ddgi_u.grid_origin.w / 16.0;
+  return vec3<i32>((ddgi_u.grid_origin.xyz + vec3<f32>(cell) * step) * 16.0);
+}
+
+// outside_lower_grid 镜像（半开区间，部分重叠保守归更细级）
+fn ddgi_outside_lower(lo: vec3<i32>, hi: vec3<i32>, fo: vec3<i32>, fd: vec3<i32>) -> bool {
+  let fo_hi = fo + fd;
+  return lo.x >= fo_hi.x || hi.x <= fo.x
+    || lo.y >= fo_hi.y || hi.y <= fo.y
+    || lo.z >= fo_hi.z || hi.z <= fo.z;
+}
+
+// probe_near_surface 三条件 OR 镜像（own / 6 邻接交集 / object bbox）
+fn ddgi_near_surface(own: u32, inter: u32, cell_center: vec3<f32>, half: f32) -> bool {
+  if ((own & DDGI_FLAG_NO_SURFACES) == 0u) { return true; }
+  if ((inter & DDGI_FLAG_NO_SURFACES) == 0u) { return true; }
+  let n = u32(ddgi_u.params.w);
+  for (var i = 0u; i < n; i = i + 1u) {
+    let mn = ddgi_objects[i * 2u].xyz;
+    let mx = ddgi_objects[i * 2u + 1u].xyz;
+    if (mx.x > cell_center.x - half && mn.x < cell_center.x + half
+      && mx.y > cell_center.y - half && mn.y < cell_center.y + half
+      && mx.z > cell_center.z - half && mn.z < cell_center.z + half) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 6³ 共享 halo 数组：4³ cell/workgroup + 1 圈 halo（Douglas sort.glsl 同款）
+var<workgroup> ddgi_halo: array<u32, 216u>;
+fn ddgi_halo_idx(l: vec3<i32>) -> u32 {
+  return u32((l.z + 1) * 36 + (l.y + 1) * 6 + (l.x + 1));
+}
+
+// ①清除 pass：indirect 语义 [0]=count [1]=1 [2]=1 [3]=0
+@compute @workgroup_size(1, 1, 1)
+fn ddgi_clear() {
+  atomicStore(&ddgi_dispatch[0u], 0u);
+  atomicStore(&ddgi_dispatch[1u], 1u);
+  atomicStore(&ddgi_dispatch[2u], 1u);
+  atomicStore(&ddgi_dispatch[3u], 0u);
+}
+
+// ②活跃判定（cpu_ddgi_active 逐字；@workgroup_size(4,4,4)，每 cell 1 线程）
+// halo 装载：域内 owner 写 [0,3]³；边缘线程写 ±1 halo 与「owner 出域」的格
+// （OOB 全局 → 自身 flags，与 CPU flags_intersection 同语义——INFERENCE）。
+@compute @workgroup_size(4, 4, 4)
+fn ddgi_active(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let dims = vec3<u32>(ddgi_u.grid_dims.xyz);
+  if (any(gid >= dims)) { return; }
+  let own_flags = ddgi_flags_cell(gid);
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        let d = vec3<i32>(dx, dy, dz);
+        let l = vec3<i32>(lid) + d;
+        if (any(l < vec3<i32>(0)) || any(l > vec3<i32>(4))) { continue; }
+        let l_own = all(l >= vec3<i32>(0)) && all(l <= vec3<i32>(3));
+        let cell = vec3<i32>(gid) + d;
+        let cell_in = all(cell >= vec3<i32>(0)) && all(vec3<u32>(cell) < dims);
+        if (l_own && cell_in) { continue; } // 域内 owner 负责写
+        ddgi_halo[ddgi_halo_idx(l)] = select(own_flags, ddgi_flags_cell(vec3<u32>(cell)), cell_in);
+      }
+    }
+  }
+  workgroupBarrier();
+  let c = vec3<i32>(lid) + vec3<i32>(1);
+  let inter = ddgi_halo[ddgi_halo_idx(c + vec3<i32>(-1, 0, 0))]
+    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(1, 0, 0))]
+    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, -1, 0))]
+    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 1, 0))]
+    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 0, -1))]
+    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 0, 1))];
+
+  let dx = dims.x;
+  let probe_id = ddgi_cell_index[gid.x + gid.y * dx + gid.z * dx * dims.y];
+  if (probe_id == DDGI_NO_PROBE) { return; }
+  if ((own_flags & DDGI_FLAG_ENABLED) != DDGI_FLAG_ENABLED) { return; }
+  // 级联归属（finer_min.w <= 0 = 无更细级）
+  if (ddgi_u.finer_min.w > 0.0) {
+    let step = ddgi_u.grid_origin.w / 16.0;
+    let lo = vec3<i32>(ddgi_u.grid_origin.xyz + vec3<f32>(gid) * step);
+    let hi = lo + vec3<i32>(vec3<f32>(step));
+    let fo = vec3<i32>(ddgi_u.finer_min.xyz);
+    let fd = vec3<i32>(ddgi_u.finer_size.xyz) * vec3<i32>(vec3<f32>(ddgi_u.finer_min.w / 16.0));
+    if (!ddgi_outside_lower(lo, hi, fo, fd)) { return; }
+  }
+  let cell_size = ddgi_u.grid_origin.w;
+  let cell_center = vec3<f32>(ddgi_cell_min(gid)) + vec3<f32>(cell_size * 0.5);
+  if (!ddgi_near_surface(own_flags, inter, cell_center, cell_size * 0.5)) { return; }
+  // age 生命周期（截图2 L249-258 逐字）：reusable 继承 → can_skip → age+1 进 worklist
+  let tc = ddgi_meta_coord(probe_id);
+  let coord = vec2<i32>(vec2<u32>(tc.y, tc.z));
+  let layer = i32(tc.x);
+  let prev = textureLoad(ddgi_meta_prev, coord, layer, 0).x;
+  let prev_offset = ddgi_meta_offset(prev);
+  let rel_i = vec3<i32>(gid);
+  let reusable = all(rel_i >= vec3<i32>(ddgi_u.reuse_min.xyz)) && all(rel_i < vec3<i32>(ddgi_u.reuse_max.xyz));
+  var age = select(0u, ddgi_meta_age(prev), reusable);
+  if (!ddgi_can_skip(age, u32(ddgi_u.params.x), probe_id)) {
+    age = min(age + 1u, DDGI_AGE_MAX);
+    let slot = atomicAdd(&ddgi_dispatch[0u], 1u);
+    ddgi_worklist[slot] = probe_id;
+  }
+  textureStore(ddgi_meta_next, coord, layer, vec4<u32>(ddgi_meta_pack(prev_offset, age), 0u, 0u, 0u));
+}
+
+// ---- DDGI 采样（M3-4：cpu_sample_ddgi / cpu_irr_sample / cpu_depth_sample 逐字；
+// 单级联版，级联距离选级 + 过渡带混合随 M4-3 滚动接线）----
+fn ddgi_irr_fetch(id: u32, tx: i32, ty: i32) -> vec3<f32> {
+  let c = ddgi_irr_coord(id, u32(tx), u32(ty));
+  return textureLoad(ddgi_irr_prev, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0).xyz;
+}
+fn ddgi_irr_sample(id: u32, d: vec3<f32>) -> vec3<f32> {
+  let s = f32(DDGI_IRR_TEXELS);
+  let e = ddgi_oct_encode(d) * 0.5 + vec2<f32>(0.5);
+  let g2 = e * s - vec2<f32>(0.5);
+  let g0 = floor(g2);
+  let f = g2 - g0;
+  let x0 = clamp(i32(g0.x), 0, 7);
+  let y0 = clamp(i32(g0.y), 0, 7);
+  let x1 = clamp(i32(g0.x) + 1, 0, 7);
+  let y1 = clamp(i32(g0.y) + 1, 0, 7);
+  let c00 = ddgi_irr_fetch(id, x0, y0);
+  let c10 = ddgi_irr_fetch(id, x1, y0);
+  let c01 = ddgi_irr_fetch(id, x0, y1);
+  let c11 = ddgi_irr_fetch(id, x1, y1);
+  return mix(mix(c00, c10, vec3<f32>(f.x)), mix(c01, c11, vec3<f32>(f.x)), vec3<f32>(f.y));
+}
+fn ddgi_depth_sample(id: u32, d: vec3<f32>) -> f32 {
+  let s = f32(DDGI_DEPTH_TEXELS);
+  let e = ddgi_oct_encode(d) * 0.5 + vec2<f32>(0.5);
+  let g2 = floor(e * s);
+  let x = clamp(i32(g2.x), 0, 15);
+  let y = clamp(i32(g2.y), 0, 15);
+  let c = ddgi_depth_coord(id, u32(x), u32(y));
+  return textureLoad(ddgi_depth_prev, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0).x;
+}
+// 8 cell 三线性 × 锐利背面（n·(接收点→探针)）× 漏光 chevron，加权归一化
+fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let cell_f = p / 16.0;
+  let c0 = floor(cell_f);
+  let fr = cell_f - c0;
+  var total = vec3<f32>(0.0);
+  var wsum = 0.0;
+  for (var iz = 0u; iz < 2u; iz = iz + 1u) {
+    for (var iy = 0u; iy < 2u; iy = iy + 1u) {
+      for (var ix = 0u; ix < 2u; ix = ix + 1u) {
+        let corner = c0 + vec3<f32>(vec3<u32>(ix, iy, iz));
+        let rel = corner - ddgi_u.grid_origin.xyz;
+        if (rel.x < 0.0 || rel.y < 0.0 || rel.z < 0.0
+          || rel.x >= ddgi_u.grid_dims.x || rel.y >= ddgi_u.grid_dims.y || rel.z >= ddgi_u.grid_dims.z) {
+          continue;
+        }
+        let ru = vec3<u32>(rel);
+        let ci = ru.x + ru.y * u32(ddgi_u.grid_dims.x) + ru.z * u32(ddgi_u.grid_dims.x) * u32(ddgi_u.grid_dims.y);
+        let id = ddgi_cell_index[ci];
+        if (id == DDGI_NO_PROBE) { continue; }
+        let wx = select(1.0 - fr.x, fr.x, ix == 1u);
+        let wy = select(1.0 - fr.y, fr.y, iy == 1u);
+        let wz = select(1.0 - fr.z, fr.z, iz == 1u);
+        let wtri = wx * wy * wz;
+        if (wtri <= 1e-6) { continue; }
+        let probe = ddgi_positions[id].xyz;
+        let to = p - probe;
+        let dist = length(to);
+        let dir = to / max(dist, 1e-4);
+        let wn = clamp(dot(n, -dir) / DDGI_NORMAL_BIAS, 0.0, 1.0);
+        if (wn <= 0.0) { continue; }
+        let dtex = ddgi_depth_sample(id, dir);
+        let wd = clamp((dtex - dist) / DDGI_DEPTH_BIAS + 0.5, 0.0, 1.0);
+        if (wd <= 0.0) { continue; }
+        let irr = ddgi_irr_sample(id, n);
+        let w = wtri * wn * wd;
+        total = total + irr * w;
+        wsum = wsum + w;
+      }
+    }
+  }
+  return select(vec3<f32>(0.0), total / wsum, wsum >= 1e-4);
+}
+
+// ③射线投射（cpu_ddgi_cast / cast_endpoint_radiance 逐字；indirect 1 wg = 1 探针，
+// @workgroup_size(64) 线程内跨步循环；样本缓冲 slot×rays+i 线性布局）
+// 已知差异（CPU 镜像同记）：法线走 GPU 真实路径 voxel_normal_world（逐体素差分），
+// CPU 参考为 trace 面法线——WGSL 侧以本文件为准，M5-4 目验仲裁。
+@compute @workgroup_size(64, 1, 1)
+fn ddgi_cast(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let count = atomicLoad(&ddgi_dispatch[0u]);
+  if (wid.x >= count) { return; }
+  let probe_id = ddgi_worklist[wid.x];
+  let origin = ddgi_positions[probe_id].xyz;
+  let rays = u32(ddgi_u.params.y);
+  let frame = u32(ddgi_u.params.x);
+  let tid = lid.x;
+  for (var i = tid; i < rays; i = i + 64u) {
+    let dir = ddgi_ray_dir(probe_id, frame, i, rays);
+    var radiance = vec3<f32>(0.0);
+    var dist = DDGI_T_MAX;
+    let hit = trace_scene(origin, dir, DDGI_T_MAX, 0.0, 3u);
+    if (!hit.uh.hit) {
+      radiance = sky_color(dir);
+      dist = DDGI_T_MAX;
+    } else {
+      let p = origin + dir * hit.uh.t;
+      let n = voxel_normal_world(hit.uh.obj_id, hit.uh.voxel);
+      let base = palette_albedo(hit.palette_base, hit.uh.pal);
+      let w1 = b_palette[hit.palette_base + hit.uh.pal * 2u + 1u];
+      let emissive = f32(w1 & 0xFFu) / 255.0;
+      if (emissive > 0.0) {
+        // emissive 直出（无方向性、不受阴影）
+        radiance = base * (emissive * DDGI_EMIT_GAIN);
+        dist = hit.uh.t;
+      } else {
+        // 直光 1-bounce（方向光硬阴影）+ prev DDGI 自闭环（无限反弹）
+        var col = vec3<f32>(0.0);
+        if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
+          let l = light_u.lights[0].kind_pos_dir.yzw;
+          let ndl = max(dot(n, l), 0.0);
+          if (ndl > 0.0) {
+            let o = p + n * DDGI_SHADOW_BIAS;
+            let sh = trace_scene(o, l, DDGI_SHADOW_T_MAX, 0.0, 3u);
+            let vis = select(1.0, 0.0, sh.uh.hit);
+            let c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+            col = col + base * c * (ndl * vis);
+          }
+        }
+        let irr = ddgi_sample(p + n * DDGI_NORMAL_BIAS, n);
+        col = col + base * irr;
+        radiance = col;
+        dist = hit.uh.t;
+      }
+    }
+    let si = (wid.x * rays + i) * 2u;
+    ddgi_samples[si] = vec4<f32>(dir, dist);
+    ddgi_samples[si + 1u] = vec4<f32>(radiance, 0.0);
+  }
+}
+
+// ④投影更新（cpu_ddgi_update 逐字；indirect 1 wg = 1 探针，64 线程 = 64 irr texel，
+// depth 256 texel = 线程内 4 轮；零覆盖 texel 拷贝 prev——next 纹理是新鲜的）
+// f16 语义：rgba16f textureLoad 硬件转 f32（= f16_round 读）+ imageStore 舍入
+// （= f16_round 写），CPU 侧 f32_to_f16/f16_to_f32 黄金值单测已锁。
+@compute @workgroup_size(64, 1, 1)
+fn ddgi_update(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let count = atomicLoad(&ddgi_dispatch[0u]);
+  if (wid.x >= count) { return; }
+  let probe_id = ddgi_worklist[wid.x];
+  let rays = u32(ddgi_u.params.y);
+  let seg0 = wid.x * rays;
+  let tid = lid.x;
+  // ---- irradiance 8×8：1 线程 = 1 texel ----
+  {
+    let tx = tid % 8u;
+    let ty = tid / 8u;
+    let d = ddgi_oct_texel_dir(tx, ty, DDGI_IRR_TEXELS);
+    var sum = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var i = 0u; i < rays; i = i + 1u) {
+      let s0 = ddgi_samples[(seg0 + i) * 2u];
+      let w = max(dot(d, s0.xyz), 0.0);
+      sum = sum + ddgi_samples[(seg0 + i) * 2u + 1u].xyz * w;
+      wsum = wsum + w;
+    }
+    let c = ddgi_irr_coord(probe_id, tx, ty);
+    let coord = vec2<i32>(vec2<u32>(c.y, c.z));
+    let layer = i32(c.x);
+    let prev = textureLoad(ddgi_irr_prev, coord, layer, 0);
+    if (wsum < DDGI_TEXEL_MIN_WEIGHT) {
+      textureStore(ddgi_irr_next, coord, layer, prev);
+    } else {
+      let proj = sum * (DDGI_PI / wsum);
+      let outc = ddgi_update_texel(prev.xyz, proj);
+      textureStore(ddgi_irr_next, coord, layer, vec4<f32>(outc, 1.0));
+    }
+  }
+  // ---- depth 16×16：1 线程 × 4 轮（余弦加权均值 + EMA；r32 无舍入）----
+  for (var r = 0u; r < 4u; r = r + 1u) {
+    let ti = r * 64u + tid;
+    let tx = ti % 16u;
+    let ty = ti / 16u;
+    let d = ddgi_oct_texel_dir(tx, ty, DDGI_DEPTH_TEXELS);
+    var wsum = 0.0;
+    var dsum = 0.0;
+    for (var i = 0u; i < rays; i = i + 1u) {
+      let s0 = ddgi_samples[(seg0 + i) * 2u];
+      let w = max(dot(d, s0.xyz), 0.0);
+      dsum = dsum + s0.w * w;
+      wsum = wsum + w;
+    }
+    let c = ddgi_depth_coord(probe_id, tx, ty);
+    let coord = vec2<i32>(vec2<u32>(c.y, c.z));
+    let layer = i32(c.x);
+    let prev = textureLoad(ddgi_depth_prev, coord, layer, 0).x;
+    var outd = prev;
+    if (wsum >= DDGI_TEXEL_MIN_WEIGHT) {
+      outd = prev + (dsum / wsum - prev) * DDGI_DEPTH_ALPHA;
+    }
+    textureStore(ddgi_depth_next, coord, layer, vec4<f32>(outd, 0.0, 0.0, 0.0));
+  }
+}
+
 
