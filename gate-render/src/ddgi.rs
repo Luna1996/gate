@@ -879,6 +879,96 @@ pub fn scroll_reuse_bounds(
   (lo, hi)
 }
 
+/// M4-3 级联滚动管理器（CPU 侧）：4 级滚动级联的 origin/网格/meta/reuse 快照。
+/// 滚动时逐级：重烘 `bake_cascade_grid` → meta 重映射（重叠 cell 搬运旧 age/offset，
+/// 新 cell age=0）→ 更新 reuse bounds。GPU 接线（positions/cell_index/meta 上传 +
+/// irr/depth 分层 shifted copy）消费本结构快照。
+pub struct CascadeManager {
+  /// 级联 cell 尺寸（DDGI_CASCADE_CELL_SIZES[1..5] = 32/64/128/256）
+  pub cell_sizes: [i32; 4],
+  /// 每级当前原点（16-cell 全局坐标）
+  pub origins: [IVec3; 4],
+  /// 每级当前探针网格（16³ cell）
+  pub grids: [ProbeGrid; 4],
+  /// 每级当前 meta（4096 word，packed offset+age；层布局 = build_meta_texture_data）
+  pub metas: [Vec<u32>; 4],
+  /// 每级当前 reuse bounds（新网格 rel 坐标，半开）
+  pub reuse: [(IVec3, IVec3); 4],
+}
+
+impl CascadeManager {
+  /// 初建：以相机位置烘焙 4 级（age 全 0，reuse 全域）
+  pub fn new(vols: &Volumes, cam_fine: Vec3) -> Self {
+    let cell_sizes: [i32; 4] = DDGI_CASCADE_CELL_SIZES[1..5].try_into().unwrap();
+    let dims = UVec3::splat(PROBES_PER_CASCADE_AXIS);
+    let mut origins = [IVec3::ZERO; 4];
+    let mut grids: [ProbeGrid; 4] = Default::default();
+    let mut metas = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let reuse = [(IVec3::ZERO, dims.as_ivec3()); 4];
+    for c in 0..4 {
+      origins[c] = cascade_scroll_origin(cam_fine, cell_sizes[c]);
+      grids[c] = bake_cascade_grid(vols, cell_sizes[c], origins[c], dims);
+      metas[c] = build_meta_texture_data(&grids[c]);
+    }
+    Self {
+      cell_sizes,
+      origins,
+      grids,
+      metas,
+      reuse,
+    }
+  }
+
+  /// 滚动：相机驱动的逐级原点推进。返回是否有任何一级移动（GPU 上传/搬运触发用）。
+  /// 每级：原点未动 → 仅更新 reuse=全域；移动 → 重烘 + meta 重映射（重叠 cell
+  /// 搬运旧 age/offset，同世界 cell 烘焙确定性保证 offset 一致）+ 新 reuse bounds。
+  pub fn scroll(&mut self, vols: &Volumes, cam_fine: Vec3) -> bool {
+    let dims = UVec3::splat(PROBES_PER_CASCADE_AXIS);
+    let mut moved = false;
+    for c in 0..4 {
+      let new_origin = cascade_scroll_origin(cam_fine, self.cell_sizes[c]);
+      if new_origin == self.origins[c] {
+        self.reuse[c] = (IVec3::ZERO, dims.as_ivec3());
+        continue;
+      }
+      let bounds = scroll_reuse_bounds(self.origins[c], new_origin, dims, self.cell_sizes[c]);
+      let new_grid = bake_cascade_grid(vols, self.cell_sizes[c], new_origin, dims);
+      // meta 重映射：新 bake 基线（age=0）→ 重叠 cell 从旧 meta 搬运 (offset, age)
+      let mut new_meta = build_meta_texture_data(&new_grid);
+      let shift = (new_origin - self.origins[c]) / (self.cell_sizes[c] / DDGI_CELL);
+      for rz in 0..dims.z {
+        for ry in 0..dims.y {
+          for rx in 0..dims.x {
+            let rel = UVec3::new(rx, ry, rz);
+            let new_id = new_grid.cell_index[new_grid.cell_linear(rel)];
+            if new_id == NO_PROBE {
+              continue;
+            }
+            let old_rel = rel.as_ivec3() - shift;
+            if old_rel.cmpge(IVec3::ZERO).all() && old_rel.cmplt(dims.as_ivec3()).all() {
+              let old_id = self.grids[c].cell_index[self.grids[c].cell_linear(old_rel.as_uvec3())];
+              if old_id != NO_PROBE {
+                // 同世界 cell → 烘焙确定性 → offset 相同，仅搬运 age
+                let (layer, tx, ty) = meta_texel_coord(old_id);
+                let (_, age) = unpack_probe_meta(self.metas[c][meta_texel_linear(layer, tx, ty)]);
+                let (n_layer, n_tx, n_ty) = meta_texel_coord(new_id);
+                let (off, _) = unpack_probe_meta(new_meta[meta_texel_linear(n_layer, n_tx, n_ty)]);
+                new_meta[meta_texel_linear(n_layer, n_tx, n_ty)] = pack_probe_meta(off, age);
+              }
+            }
+          }
+        }
+      }
+      self.origins[c] = new_origin;
+      self.grids[c] = new_grid;
+      self.metas[c] = new_meta;
+      self.reuse[c] = bounds;
+      moved = true;
+    }
+    moved
+  }
+}
+
 // ============================================================================
 // M3-1 active 判定 CPU 镜像（WGSL ddgi_active.wgsl 镜像源；spec D2/D4/D7/D10）
 // 逐字对照 Douglas sort.glsl L218-262（截图1-2）
@@ -5128,5 +5218,62 @@ mod tests {
     let (lo, hi) = scroll_reuse_bounds(o0, o3, dims, cs);
     assert_eq!(lo.x, 1, "x 轴新列");
     assert_eq!((lo.y, hi.y), (0, 16), "y 轴全 reuse");
+  }
+
+  /// CascadeManager：初建 + 滚动 meta 重映射（重叠 cell 搬运 age，新 cell 归零）
+  #[test]
+  fn cascade_manager_scroll_remap() {
+    // 64³ 封闭房间（六面 4 厚墙）——近墙 cell 探针在滚出窗口后 age 应保留
+    let mut g = room_grid();
+    let vols = Volumes::new(g);
+    g = room_grid();
+    // 初始相机在房间中心 fine (32,32,32)
+    let mut cm = CascadeManager::new(&vols, Vec3::splat(32.0));
+    // 手动注入 age=100 到 LOD1（cell 32）所有探针 meta
+    for id in 0..cm.grids[0].positions.len() as u32 {
+      let (layer, tx, ty) = meta_texel_coord(id);
+      let idx = meta_texel_linear(layer, tx, ty);
+      let (off, _) = unpack_probe_meta(cm.metas[0][idx]);
+      cm.metas[0][idx] = pack_probe_meta(off, 100);
+    }
+    let old_origin = cm.origins[0];
+    // 相机 +64 fine（+2 级联 cell）→ 窗口滑动 2 列
+    cm.scroll(&vols, Vec3::new(96.0, 32.0, 32.0));
+    assert_eq!(
+      cm.origins[0],
+      old_origin + IVec3::new(4, 0, 0),
+      "+64 fine = +2 级联 cell = +4 16-cell"
+    );
+    // reuse bounds（级联 cell 单位）：x ∈ [2, 16)（shift = 4 16-cell / 2 = 2 级联 cell）
+    assert_eq!(cm.reuse[0].0, IVec3::new(2, 0, 0));
+    assert_eq!(cm.reuse[0].1, IVec3::new(16, 16, 16));
+    // 重映射验证：shift=2 级联 cell → 重叠区 = 新 rel x ∈ [2,16)（old_rel = rel−2）
+    // → age=100 保留；新列 rel x < 2（old_rel 出负界）→ age=0
+    let new_grid = &cm.grids[0];
+    let mut carried = 0;
+    let mut reset = 0;
+    for rz in 0..16u32 {
+      for ry in 0..16u32 {
+        for rx in 0..16u32 {
+          let id = new_grid.cell_index[new_grid.cell_linear(UVec3::new(rx, ry, rz))];
+          if id == NO_PROBE {
+            continue;
+          }
+          let (layer, tx, ty) = meta_texel_coord(id);
+          let (_, age) = unpack_probe_meta(cm.metas[0][meta_texel_linear(layer, tx, ty)]);
+          if rx >= 2 {
+            assert_eq!(age, 100, "重叠 cell ({rx},{ry},{rz}) 应搬运 age=100");
+            carried += 1;
+          } else {
+            assert_eq!(age, 0, "新列 cell ({rx},{ry},{rz}) 应 age=0");
+            reset += 1;
+          }
+        }
+      }
+    }
+    assert!(
+      carried > 0 && reset > 0,
+      "应同时存在搬运与新列（carried={carried} reset={reset}）"
+    );
   }
 }
