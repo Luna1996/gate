@@ -163,9 +163,9 @@
 - [x] M2-1 全 cell 烘焙 + 单测（域 = chunk bbox cell 域去 ±1 ring；Air/Mixed 全覆盖、Solid 跳过、删 neighbor_has_solid；挖空 chunk 不回收 → 全空气覆盖语义，运行时 ddgi_active 剔除；81 测试全绿）
 - [x] M2-2 元数据双缓冲纹理 + roundtrip（build_meta_texture_data 层主序 16×16/层、1 texel=1 packed meta、初烘 age=0；顺修 unpack_probe_meta 保留位掩码；82 测试全绿）
 - [x] M2-3 级联烘焙 + outside_lower_grid（cell_state_at 三态分类（32/128 走 2×2×2 子 cell 递归合成）+ probe_position_sized 推广 BFS + bake_cascade_grid + outside_lower_grid 半开区间划分；顺修 probe_leaf_sized 真实空叶尺寸（Air=cell_size / 4³ 空砖=4 / 1³ 兜底=1）使「空叶大者优先」真正生效——原 DDGI_CELL.min(half) 压平会让贴墙 4³ 叶探针凭距离压过 16³ 空叶探针；84 测试全绿）
-- [ ] M3-1 ddgi_active（含 subgroup/atomic 裁决）
-- [ ] M3-2 ddgi_cast（含预算分摊）
-- [ ] M3-3 ddgi_update（含 f16 门禁）
+- [x] M3-1 ddgi_active（CPU 镜像 + 10 单测 done，commit `2551233`；WGSL 待 M3 三 pass 同批镜像）
+- [x] M3-2 ddgi_cast（CPU 镜像 + 6 单测 done，commit `ed1fbeb`；含 RTXGI 实锤的采样方向修正）
+- [x] M3-3 ddgi_update（CPU 镜像 + f16 门禁 + 6 单测 done，commit `5fc032f`；WGSL 待同批镜像）
 - [ ] M3-4 sample_ddgi + 6 组单测迁移
 - [ ] M4-1 资源/features/BG4
 - [ ] M4-2 三 pass 编排 + indirect 一致性
@@ -190,11 +190,12 @@
 
 > 跨机器接续用。本机 IDE 记忆/偏好不随仓库走，本章自包含。
 
-**进度快照**：M1、M2 全部 done（`abf1caa`）；M3-1/M3-2 **CPU 镜像 + 单测 done**
-（`2551233` active / `ed1fbeb` cast+采样修正，master 本地）；WGSL 三 pass 均未写。
-测试基线：`cargo test -p gate-render --release` 全绿，ddgi 单测 46 个。
+**进度快照**：M1、M2 全部 done（`abf1caa`）；M3-1/M3-2/M3-3 **CPU 镜像 + 单测全 done**
+（`2551233` active / `ed1fbeb` cast+采样修正 / `5fc032f` update+f16 门禁，master 本地）；
+WGSL 三 pass 均未写。测试基线：`cargo test -p gate-render --release` = 106+7+1 全绿，
+其中 ddgi 单测 52 个。
 
-**M3-1/M3-2 CPU 镜像已落地**（ddgi.rs「M3-1/M3-2」章节，可作 WGSL 镜像源）：
+**M3-1/2/3 CPU 镜像已落地**（ddgi.rs「M3-x」章节，可作 WGSL 镜像源）：
 - M3-1：`DdgiProbeFlags`（ENABLED/NO_SURFACES 位标志）+ `brickstate_to_flags` +
   `probe_flags_intersection`（6 邻接 AND，边界外视为自身 flags）+ `probe_near_surface_flags`
   （三条件 OR）+ `cpu_ddgi_active`（worklist 带 age、next_meta 从 prev_meta 拷贝、
@@ -206,30 +207,37 @@
   emissive→albedo×emissive×gain 直出；常规→直光 1-bounce + prev DDGI 自闭环，
   间接采样点偏移 DDGI_NORMAL_BIAS，pre-exposure）+ `cpu_ddgi_cast`
   （样本缓冲 slot×rays+i 布局，逐位确定性）。
+- M3-3：`f32_to_f16`/`f16_to_f32`/`f16_round`（rgba16f 存储语义 CPU 镜像，
+  round-to-nearest-even 全分支正确，位级黄金值锁死）+ `collect_radiance_ex`
+  （带 Σw，区分「零覆盖→保留 prev」与「投影为 0→正常暗化」）+ `update_depth_texel`
+  （余弦加权均值 + EMA，`DDGI_DEPTH_ALPHA`=0.2 INFERENCE）+ `cpu_ddgi_update`
+  （投影→M1-3 更新链→f16_round 写回；读侧 f16 舍入模拟纹理值；零覆盖 texel 稀疏
+  保留 prev——`DDGI_TEXEL_MIN_WEIGHT`=1e-4 INFERENCE；非 worklist 探针 prev 拷贝
+  = ping-pong 语义；@workgroup_size(64)=8×8 irr texel，depth 256=线程内 4 轮）。
 - **采样方向修正（RTXGI Irradiance.hlsl 实锤，旧代码两处反向）**：
   ① 背面权重 = clamp(n·(接收点→探针)/DDGI_NORMAL_BIAS)——探针在法线前侧（空气侧）
   通过；② irradiance oct 采样方向 = **表面法线 n**（oct 图按「接收法线」索引，与 D6
   collect_radiance 的 (d·dir_i)+ 余弦权重同源）；③ depth 方向 = 探针→接收点（正确未动）。
   旧 GI pass 从未目验（spike 0-5a 已拆），M3-2 真实几何端点测试首次暴露。
 
-**下一步 = M3-3 `ddgi_update` CPU 镜像**（消费 cast 样本缓冲 → collect_radiance 投影 +
-EMA/tonemap/迟滞 + depth EMA + f16 门禁），仍走技能闭环（CPU 先行 → fuzz → WGSL）。
-M1-3 已就绪函数直接复用：`collect_radiance`/`update_irradiance_texel`/
-`oct_texel_dir`。M3-3 完成后三 pass WGSL 同批逐字镜像（共享 D7 纹理数组绑定），
-wgsl_compile.rs 注册新 shader 做 naga 门禁。
-
-1. M3-3 设计要点：每 workgroup = 1 worklist 槽位（1 探针），遍历 8×8 irr texel：
-   对 texel 方向 d 汇总本探针射线段 samples[slot×rays..]（D6 π·Σw·L/Σw）→
-   `update_irradiance_texel`（prev 从 irr 纹理读，f16 存储语义）；depth 16×16 同理
-   EMA（chevron 半宽 DDGI_DEPTH_BIAS 不变）；can_skip 探针不进 worklist 无需处理。
-2. **WGSL 现状**：无独立 ddgi shader，仅 `gate-app/assets/shaders/dda.wgsl`（trace+unlit
-   直出，旧 vis_table/direct/gi/denoise 光照链已注释拆除，见该文件 L48/L840/L1008）与
-   `blit.wgsl`。M3 新建 ddgi 三 pass shader；常量逐字对齐 ddgi.rs 模块头「WGSL 对齐表」
-   （L15-31，改一处必改两处，`wire_constants`/`v2_wire_constants` 单测防漂移）。
-3. **插件壳现状**：旧 `DdgiPlugin`（ddgi.rs）仍是 **storage buffer 载体**
+**下一步 = 三 pass WGSL 同批逐字镜像**（ddgi_active / ddgi_cast / ddgi_update 三个
+新 shader 文件或 dda.wgsl 内三 entry，共享 D7 纹理数组绑定 + BG4 重排）：
+1. 每个函数组在 WGSL 侧对照 ddgi.rs 对应 CPU 镜像逐字翻译；常量对齐模块头
+   「WGSL 对齐表」（含新增 DDGI_DEPTH_ALPHA / DDGI_TEXEL_MIN_WEIGHT），
+   `wire_constants`/`v2_wire_constants` 单测防漂移；wgsl_compile.rs 注册新 shader
+   做 naga parse+validate 门禁。
+2. M3-1 subgroup worklist 分配（subgroupExclusiveAdd + subgroupBroadcastFirst），
+   不可用时 fallback `atomicAdd`（风险表已记，标注偏差）；M3-2 需要 trace_grid +
+   sky/emissive/直光着色 + prev DDGI 采样（dda.wgsl 现有资产复用）；M3-3 需要
+   SHADER_F16 feature + rgba16f storage write（M4-1 资源就绪后才能真跑，可先写好
+   过 naga 门禁）。
+3. **WGSL 现状**：无独立 ddgi shader，仅 `gate-app/assets/shaders/dda.wgsl`（trace+unlit
+   直出，旧 vis_table/direct/gi/denoise 光照链已注释拆除）与 `blit.wgsl`。
+4. **插件壳现状**：旧 `DdgiPlugin`（ddgi.rs）仍是 **storage buffer 载体**
    （DdgiGpu：positions/cell_index/irradiance/depth buffer + meta uniform + BG4），
    只做烘焙上传、无渲染 pass，保持可编译。M4-1 重构为 rgba16f/r32 纹理数组 + 元数据
    双缓冲 ping-pong + BG4 重排 + SHADER_F16/subgroup features；M5-1 才 one-step 删旧链路。
+5. M3-4（sample_ddgi 迁移）依赖 WGSL 侧纹理数组就绪，与 M4-1 同批做。
 
 **环境与命令（Windows / PowerShell）**
 - 跑测试（一律 release）：`cargo test -p gate-render --release ddgi`
