@@ -168,7 +168,7 @@
 - [x] M3-3 ddgi_update（CPU 镜像 + f16 门禁 + 6 单测 + WGSL 镜像 done，commit `5fc032f`/`186e223`）
 - [x] M3-4 sample_ddgi（6 组 CPU 单测 M3-2 已绿；WGSL ddgi_sample 单级联版 done `186e223`；级联距离选级 + 过渡带混合随 M4-3 滚动接线）
 - [x] M4-1 资源/features/BG4（commit `87f4c45`：DdgiUniform 112B + BG4 v2 13 binding + D7 纹理数组双缓冲 + dispatch 兼 indirect + 四管线排队 + 插件挂回；空跑验收过：demo 334k 探针 1307 层无 ERROR。**SHADER_F16/subgroup features 均不需要**——rgba16f 是纹理格式、subgroup 走 atomicAdd fallback；wgpu 默认 max_texture_array_layers=2048）
-- [ ] M4-2 三 pass 编排 + indirect 一致性
+- [x] M4-2 三 pass 编排 + indirect 一致性（commit `ac8fc48`：dispatch_ddgi 挂 RenderGraph .before(dispatch_dda)，copy→clear→active→[copy 桥接]→cast→update；ping-pong 帧首交换；dda_main 命中着色 +alb·ddgi_sample 间接项接线，beam 同布局全量绑定。**wgpu 验证三连坑**：copy src==dst 同 handle 非法（烘焙必须建 6 张独立纹理）/ 纹理 usage 缺 COPY_SRC / 同 dispatch scope 内 STORAGE 与 INDIRECT 互斥（dispatch 计数与 indirect buffer 拆双 buffer，encoder copy 桥接）。真机零 ERROR，ddgi_update=0.009ms 活跃）
 - [ ] M4-3 级联滚动 + reuse bounds
 - [ ] M4-4 编辑响应重接
 - [ ] M5-1 旧代码清除
@@ -220,26 +220,18 @@ WGSL 三 pass 均未写。测试基线：`cargo test -p gate-render --release` =
   collect_radiance 的 (d·dir_i)+ 余弦权重同源）；③ depth 方向 = 探针→接收点（正确未动）。
   旧 GI pass 从未目验（spike 0-5a 已拆），M3-2 真实几何端点测试首次暴露。
 
-**下一步 = M4-2 四 pass 编排**：在 dda.rs 的 compute pass 记录系统（dda_main/beam
-所在 Render 系统）**前置**插入 DDGI pass 链：clear（1 线程）→ active（ceil(dims/4)³，
-@wg(4,4,4)）→ cast（indirect x=dispatch[0]）→ update（indirect），全部先于主 trace
-dispatch；帧末（或下帧 prepare 前）prev/next 纹理指针交换（DdgiGpu 持有
- irr_prev/next 等 6 纹理 + 6 view，交换 = 字段互换）。
-1. **pass 间 race 纪律**：三 pass 读写同 storage 必须分 compute pass（wgpu 只在
-   pass 边界插 barrier）；clear→active 同 buffer 不同字也须 pass 边界。
-2. **next 纹理 copy pass（M4-1 遗留决策点）**：active/update 只写本帧处理探针，
-   其余 texel 需在 pass 前 prev→next 整体 copy（wgpu CopyTextureToTexture，两份
-   同尺寸数组逐层拷；meta 1.3MB + irr/depth 500MB/帧对 334k 探针过重 → base 世界级
-   改 in-place 双缓冲（active/update 直接读写同纹理，放弃 prev 隔离——EMA 本就
-   渐进，读写同帧同 texel 无 race（1 wg = 1 探针独占））或仅级联级 copy。M4-2 先
-   做 copy 版跑通正确性，bench 后再优化（M5-3）。
-3. indirect 一致性抽验：日志打印 dispatch count（staging readback 或 debug overlay）；
-   `@workgroup_size` 与 dispatch 数严格一致（既有坑：仅左上 1/4 屏）。
-4. WGSL 已就绪（rays GPU 自派生 max(4096/count,1)，commit `87f4c45` 同步）；CPU
-   镜像 cpu_ddgi_* 全链 52 单测 = 行为 oracle。
-5. 验收：GATE_BENCH 下 latest.log 无 ERROR；四 pass GPU 时长入 gpu_frame.log；
-   画面（DDGI 光照还未接进 dda_main 着色——M4-2 只验证 pass 链自洽运行 +
-   irradiance 收敛（可用 debug readback 或目验探针可视化））。
+**下一步 = M4-3 级联滚动 + reuse bounds（CPU 侧纯计算）**：
+1. prepare 每帧：相机位置 → 各级滚动 volume 原点（cell 对齐步进，Majercik 2021 §5）
+   → reuse bounds（`age_after_scroll`/`probe_reusable` CPU 镜像已有）→ 写 DdgiUniform
+   的 reuse_min/reuse_max/finer_min/finer_size；级联级用 `bake_cascade_grid`（M2-3
+   已有）+ `outside_lower_grid` 归属（WGSL ddgi_active 已读 uniform finer 字段）。
+2. 纹理层分配：级联滚动后 cell→probe 映射变化，age 继承条件 = bounds 内 ∧ offset
+   未变（D10）。bounds 移动单测先行（M4-3 验收）。
+3. base 世界级 copy 版现状 = 500MB/帧（334k 探针 demo，GPU copy ~1ms 级）——目验
+   正确性后 M5-3 bench 再优化（in-place 需 rgba16f read_write storage，风险表 D-Open1）。
+4. M4-4 编辑响应：extract 已按 edit_generation 重烘 base；级联级 age 归零随 M4-3。
+5. 验收：bounds 移动单测绿；真机滚动 latest.log 无 ERROR；M5-4 目验四项（暗部
+   不死黑 / LED 颜色渗透 / 无漏光 / 无折缝）——dda_main 间接项已接线（`ac8fc48`）。
 
 **环境与命令（Windows / PowerShell）**
 - 跑测试（一律 release）：`cargo test -p gate-render --release ddgi`
