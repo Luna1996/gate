@@ -1,5 +1,4 @@
 pub mod brickmap;
-pub mod ddgi;
 pub mod lighting;
 mod responsive;
 
@@ -25,12 +24,9 @@ pub struct GateRenderPlugin;
 
 impl Plugin for GateRenderPlugin {
   fn build(&self, app: &mut App) {
-    // R3-10 DDGI M4-1 重新挂回（资源/纹理数组/管线就绪；pass 编排 M4-2 接线）。
-    // octo hashmap 光照链（vis_cache/direct/gi/denoise）保持拆除。
     app.add_plugins((
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
-      ddgi::DdgiPlugin,
     ));
   }
 }
