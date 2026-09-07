@@ -819,13 +819,11 @@ fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   ) / 255.0;
 }
 
-// 天空渐变 + 太阳盘光晕（miss 像素输出；CPU 镜像 cpu_reference_sky）
+// 纯色天空 + 太阳盘光晕（miss 像素输出；CPU 镜像 cpu_reference_sky）
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
   let d = normalize(dir);
+  var col = vec3<f32>(0.53, 0.71, 0.93); // Minecraft-style 天蓝（linear ≈ sRGB #87CEEB）
   let h = clamp(d.y, 0.0, 1.0);
-  let x = clamp(h / 0.35, 0.0, 1.0);
-  let t = x * x * (3.0 - 2.0 * x);
-  var col = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t));
   if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
     let sdir = light_u.lights[0].kind_pos_dir.yzw;
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
@@ -1035,10 +1033,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           && !(all(sh.uh.voxel == best.uh.voxel) && sh.uh.obj_id == best.uh.obj_id),
       );
     }
-    let h = clamp(n.y, 0.0, 1.0);
-    let x = clamp(h / 0.35, 0.0, 1.0);
-    let t_sky = x * x * (3.0 - 2.0 * x);
-    let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
+    let sky = vec3<f32>(0.53, 0.71, 0.93); // Minecraft-style 天蓝（linear ≈ sRGB #87CEEB）
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
     col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * ndl * sun);
   }
