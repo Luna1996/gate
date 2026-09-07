@@ -1046,7 +1046,14 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // **除 π**：collect_radiance 存储 = π·L̄（物理辐照度 E），本引擎直光约定 =
     // albedo×E（π 折进 albedo）→ 间接光必须 albedo×E/π 才与直光同标度
     // （π 未除曾致全场曝白 π 倍、穹顶原色淹没）。
-    let gi = ddgi_sample(p_voxel, n) * ddgi_u.params.z / DDGI_PI;
+    let gi_raw = ddgi_sample(p_voxel, n) * ddgi_u.params.z / DDGI_PI;
+    // DEBUG=4：gi 二值化海报化（luma 阈值）——逐体素场等值线必呈体素锯齿阶梯；
+    // 平滑等值线 = 存在未知的逐像素泄漏（实证用）
+    let gi = select(
+      vec3<f32>(0.02),
+      vec3<f32>(0.0, 1.0, 0.0),
+      (gi_raw.x + gi_raw.y + gi_raw.z) > 0.3,
+    );
     col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * ndl * sun) + alb * gi;
   }
   textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
