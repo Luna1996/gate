@@ -190,28 +190,43 @@
 
 > 跨机器接续用。本机 IDE 记忆/偏好不随仓库走，本章自包含。
 
-**进度快照**：M1、M2 全部 done（commit `abf1caa`，master 已推送）；M3 未开始。
-测试基线：`cargo test -p gate-render --release` = 84+7+1 全绿，其中 ddgi 单测 30 个。
+**进度快照**：M1、M2 全部 done（`abf1caa`）；M3-1/M3-2 **CPU 镜像 + 单测 done**
+（`2551233` active / `ed1fbeb` cast+采样修正，master 本地）；WGSL 三 pass 均未写。
+测试基线：`cargo test -p gate-render --release` 全绿，ddgi 单测 46 个。
 
-**下一步 = M3-1 `ddgi_active` 判定**，严格走 gate-wgsl-shader-optimization 技能闭环
-（CPU 参考先行 → `cargo test` fuzz 等价门禁 → WGSL 逐字镜像 → GATE_BENCH 同会话 A/B）：
+**M3-1/M3-2 CPU 镜像已落地**（ddgi.rs「M3-1/M3-2」章节，可作 WGSL 镜像源）：
+- M3-1：`DdgiProbeFlags`（ENABLED/NO_SURFACES 位标志）+ `brickstate_to_flags` +
+  `probe_flags_intersection`（6 邻接 AND，边界外视为自身 flags）+ `probe_near_surface_flags`
+  （三条件 OR）+ `cpu_ddgi_active`（worklist 带 age、next_meta 从 prev_meta 拷贝、
+  age 生命周期 active 内闭环：scroll→can_skip→increment）+ `compute_cell_flags`。
+  逐字对照 sort.glsl L218-262（截图1-3）。
+- M3-2：`cast_rays_per_probe`（4096 预算均摊，保底 1）+ `cast_ray_dir`
+  （Fibonacci 球 × PCG 随机旋转——旋转种子 = ray_rand(probe,frame,0)，帧内保
+  Fibonacci 蓝噪声结构）+ `cast_endpoint_radiance`（miss→sky/PROBE_T_MAX；
+  emissive→albedo×emissive×gain 直出；常规→直光 1-bounce + prev DDGI 自闭环，
+  间接采样点偏移 DDGI_NORMAL_BIAS，pre-exposure）+ `cpu_ddgi_cast`
+  （样本缓冲 slot×rays+i 布局，逐位确定性）。
+- **采样方向修正（RTXGI Irradiance.hlsl 实锤，旧代码两处反向）**：
+  ① 背面权重 = clamp(n·(接收点→探针)/DDGI_NORMAL_BIAS)——探针在法线前侧（空气侧）
+  通过；② irradiance oct 采样方向 = **表面法线 n**（oct 图按「接收法线」索引，与 D6
+  collect_radiance 的 (d·dir_i)+ 余弦权重同源）；③ depth 方向 = 探针→接收点（正确未动）。
+  旧 GI pass 从未目验（spike 0-5a 已拆），M3-2 真实几何端点测试首次暴露。
 
-1. **CPU 镜像尚不存在**——先在 [ddgi.rs](../gate-render/src/ddgi.rs) 写 active 判定 CPU 参考
-   + 单测。三条件 OR：本 cell 或 6 邻接 cell 有体素 / 与非网格对齐 object bbox 重叠
-   （`object_buckets`）；级联归属用现成的 [`outside_lower_grid`](../gate-render/src/ddgi.rs)
-   （半开区间，部分重叠保守归更细级）。subgroup worklist 分配在 CPU 侧用普通计数模拟，
-   WGSL 侧 subgroup 不可用时 fallback `atomicAdd`（风险表已记，标注偏差）。
-2. M1-3 已就绪的 CPU 参考函数（M3-2/M3-3 直接镜像）：`pcg_hash`/`ray_rand`/`rand2`/
-   `uniform_sphere_dir`/`fibonacci_dir`（射线）、`collect_radiance`（投影）、
-   `update_irradiance_texel`（EMA+tonemap+亮度钳制+暗化保底）、`age_after_scroll`/
-   `age_after_update`/`probe_reusable`/`can_skip_update`（age/reuse）、
-   `oct_encode`/`oct_decode`/`oct_texel`/`oct_texel_dir`（八面体映射）。
-   M3-4 的 CPU 采样对照 = `cpu_sample_ddgi`（ddgi.rs，6 组端到端单测已覆盖）。
-3. **WGSL 现状**：无独立 ddgi shader，仅 `gate-app/assets/shaders/dda.wgsl`（trace+unlit
+**下一步 = M3-3 `ddgi_update` CPU 镜像**（消费 cast 样本缓冲 → collect_radiance 投影 +
+EMA/tonemap/迟滞 + depth EMA + f16 门禁），仍走技能闭环（CPU 先行 → fuzz → WGSL）。
+M1-3 已就绪函数直接复用：`collect_radiance`/`update_irradiance_texel`/
+`oct_texel_dir`。M3-3 完成后三 pass WGSL 同批逐字镜像（共享 D7 纹理数组绑定），
+wgsl_compile.rs 注册新 shader 做 naga 门禁。
+
+1. M3-3 设计要点：每 workgroup = 1 worklist 槽位（1 探针），遍历 8×8 irr texel：
+   对 texel 方向 d 汇总本探针射线段 samples[slot×rays..]（D6 π·Σw·L/Σw）→
+   `update_irradiance_texel`（prev 从 irr 纹理读，f16 存储语义）；depth 16×16 同理
+   EMA（chevron 半宽 DDGI_DEPTH_BIAS 不变）；can_skip 探针不进 worklist 无需处理。
+2. **WGSL 现状**：无独立 ddgi shader，仅 `gate-app/assets/shaders/dda.wgsl`（trace+unlit
    直出，旧 vis_table/direct/gi/denoise 光照链已注释拆除，见该文件 L48/L840/L1008）与
    `blit.wgsl`。M3 新建 ddgi 三 pass shader；常量逐字对齐 ddgi.rs 模块头「WGSL 对齐表」
    （L15-31，改一处必改两处，`wire_constants`/`v2_wire_constants` 单测防漂移）。
-4. **插件壳现状**：旧 `DdgiPlugin`（ddgi.rs L1103）仍是 **storage buffer 载体**
+3. **插件壳现状**：旧 `DdgiPlugin`（ddgi.rs）仍是 **storage buffer 载体**
    （DdgiGpu：positions/cell_index/irradiance/depth buffer + meta uniform + BG4），
    只做烘焙上传、无渲染 pass，保持可编译。M4-1 重构为 rgba16f/r32 纹理数组 + 元数据
    双缓冲 ping-pong + BG4 重排 + SHADER_F16/subgroup features；M5-1 才 one-step 删旧链路。
