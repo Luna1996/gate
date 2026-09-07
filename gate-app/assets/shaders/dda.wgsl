@@ -1012,19 +1012,38 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   //   法线 = 逐体素 6 邻域差分（voxel_normal_world，无缓存，Douglas #22 一体素一色）。
   var col = sky_color(dir_fine);
   if (best.uh.hit) {
+    // ---- 逐体素着色（Douglas #22/#23：一体素一色）----
+    // albedo/法线/采样点/阴影射线全部体素锚定——同体素跨像素同色，无逐面/逐像素变明暗。
     let alb = palette_albedo(best.palette_base, best.uh.pal);
     let n = voxel_normal_world(best.uh.obj_id, best.uh.voxel);
-    let sun = max(dot(n, light_u.lights[0].kind_pos_dir.yzw), 0.0);
+    // 体素中心 → 世界系（主世界 identity 直等于体素中心；物体经旋转/缩放变换）
+    let gg = make_grid(u32(best.uh.obj_id) + 1u);
+    let vc = vec3<f32>(best.uh.voxel) + vec3<f32>(0.5);
+    let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
+    // R3-18 直光硬阴影（#02/#17 形态）：1 条太阳射线，不通即阴影。
+    // 射线原点 = 体素中心 + n×0.5（贴向空气侧邻域）；起点若落回自身体素
+    // （对角 implicit normal 时可能）→ pre-check 自命中 → 视为无遮挡（self-hit 防护）
+    let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
+    let ndl = max(dot(n, sun_dir), 0.0);
+    var sun = 0.0;
+    if (ndl > 0.0) {
+      let sh = trace_scene(p_voxel + n * 0.5, sun_dir, 8192.0, 0.0, 3u);
+      sun = select(
+        1.0,
+        0.0,
+        sh.uh.hit
+          && !(all(sh.uh.voxel == best.uh.voxel) && sh.uh.obj_id == best.uh.obj_id),
+      );
+    }
     let h = clamp(n.y, 0.0, 1.0);
     let x = clamp(h / 0.35, 0.0, 1.0);
     let t_sky = x * x * (3.0 - 2.0 * x);
     let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    // R3-10 DDGI 间接项（Douglas #23）：命中点采样上一帧 irradiance（自闭环）；
-    // 采样方向 = 表面法线（RTXGI 约定，M3-2 修正）。pre-exposure：曝光在末段统一。
-    let p_hit = origin_fine + dir_fine * best.uh.t;
-    let gi = ddgi_sample(p_hit, n);
-    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * sun) + alb * gi;
+    // R3-10 DDGI 间接项（Douglas #23）：体素中心采样上一帧 irradiance（自闭环）；
+    // 采样方向 = 体素 implicit normal（RTXGI 约定，M3-2 修正）。一体素一色。
+    let gi = ddgi_sample(p_voxel, n);
+    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * ndl * sun) + alb * gi;
   }
   textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
 }

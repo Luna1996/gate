@@ -2371,6 +2371,32 @@ fn extract_ddgi_bake(
   }
   let t0 = std::time::Instant::now();
   let pg = bake_probe_grid(&scene.volumes);
+  // M4-2 诊断 oracle：CPU 镜像预期活跃探针数（GPU ddgi_active 的对照值；
+  // GPU 侧若疑似 count=0，用此值与 ddgi_update span 时长对照定位）
+  {
+    let flags = compute_cell_flags(scene.volumes.main(), &pg, DDGI_CELL);
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+    let meta = build_meta_texture_data(&pg);
+    let active = cpu_ddgi_active(&ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &meta,
+      reuse_bounds: REUSE_ALL,
+      frame: 1,
+    });
+    bevy::log::info!(
+      "DDGI active oracle (CPU): {} / {} probes expected",
+      active.worklist.len(),
+      pg.positions.len(),
+    );
+  }
   bevy::log::info!(
     "DDGI bake (gen {generation}): probes={} cells={}x{}x{}={} ({:?})",
     pg.positions.len(),
