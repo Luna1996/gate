@@ -333,8 +333,11 @@ pub const DDGI_BIG_CHANGE: f32 = 0.2;
 pub const DDGI_BRIGHTNESS: f32 = 1.0;
 /// RTXGI c_threshold：暗化方向单帧最小步进（1/1024，保证向目标值收敛不停滞）
 pub const DDGI_MIN_STEP: f32 = 1.0 / 1024.0;
-/// 大变化时 hysteresis 减量（RTXGI 硬编码 0.75）
-pub const DDGI_CHANGE_DROP: f32 = 0.75;
+/// 大变化时 hysteresis 减量。RTXGI 硬编码 0.75，但其估计来自多射线（低方差）；
+/// gate 预算下每探针 1 射线/帧，单样本估计在 0↔π·L_sky 间振荡，0.75 加速会把
+/// 5% EMA 变成 80% 噪声跟踪器 → 永不收敛（22322 帧闪烁实证）。0.0 = 关加速，
+/// 纯 5% EMA 几何收敛到时间均值；多射线工况（budget 调参后）M5-3 再评估
+pub const DDGI_CHANGE_DROP: f32 = 0.0;
 /// 亮度超阈时 delta 缩放（RTXGI 硬编码 0.25）
 pub const DDGI_DELTA_CLAMP: f32 = 0.25;
 
@@ -3160,10 +3163,11 @@ mod tests {
       Vec3::ONE,
       1e-6
     ));
-    // ③ 大暗化（|prev−new| 最大分量 0.5 > 0.2 → h=0.95−0.75=0.2）→ EMA 步 0.8·0.5=0.4
+    // ③ 大暗化（|prev−new| 最大分量 0.5 > 0.2 触发，但 CHANGE_DROP=0（单射线工况
+    //    关加速）→ 退化为普通 EMA：步 0.05·0.5 = 0.025
     assert!(close(
       update_irradiance_texel(Vec3::ONE, Vec3::splat(0.5)),
-      Vec3::splat(0.6),
+      Vec3::splat(0.975),
       1e-4
     ));
     // ④ 大亮化（delta 亮度 4.9 > 1.0 → delta×0.25）→ 0.1 + 0.05·1.225 = 0.16125
