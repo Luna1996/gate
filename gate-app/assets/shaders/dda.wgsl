@@ -202,8 +202,8 @@ struct LightPool {
 struct Grid {
   w_mn: vec3<f32>,              // 世界 AABB min
   w_mx: vec3<f32>,              // 世界 AABB max
-  l_min: vec3<f32>,             // 局部 AABB min（fine 坐标）= vec3(0.0)
-  l_max: vec3<f32>,             // 局部 AABB max（fine 坐标）= vec3(256.0)
+  l_min: vec3<f32>,             // 局部 AABB min（voxel 坐标）= vec3(0.0)
+  l_max: vec3<f32>,             // 局部 AABB max（voxel 坐标）= vec3(256.0)
   max_chunk_steps: u32,         // chunk 间 DDA 步数上限
   col0: vec3<f32>,              // 变换矩阵列（旋转）
   col1: vec3<f32>,
@@ -218,14 +218,14 @@ struct Grid {
 }
 
 // Douglas Brick Tree mask DDA 采样（1:1 复刻 devlog #17/#18）
-// fine → chunk 窗口定位 → DFS 树 4 层 mask 遍历 → palette
+// voxel → chunk 窗口定位 → DFS 树 4 层 mask 遍历 → palette
 // Phase 3 统一：从 Grid 参数读取 tree_base / index_origin / index_dims，
 // 而非 BG1 globals（主世界 + 物体走同一路径，b_struct[tree_base + ...] 取树）。
 // 仅 implicit normals 6 邻域 occupancy 点查询用；主遍历走层次栈式 trace_chunk。
-fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
+fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   // ---- chunk 窗口定位 ----
-  let m = ((fine % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
-  let chunk_i = (fine - m) / vec3<i32>(i32(CHUNK_SIZE));
+  let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
+  let chunk_i = (voxel - m) / vec3<i32>(i32(CHUNK_SIZE));
   let origin = g.index_origin;
   let dims = g.index_dims;
   let rel = chunk_i - origin;
@@ -240,7 +240,7 @@ fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
   let chunk_base = g.tree_base + entry - 1u;
 
   // ---- DFS 4 层 mask 遍历（wire v3：level 3 inline 4 体素/word，level 0-2 紧凑）----
-  let local = vec3<u32>(m);  // chunk 内 fine 坐标 0..255
+  let local = vec3<u32>(m);  // chunk 内 voxel 坐标 0..255
   var node_addr = chunk_base;
   for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
     let mask_lo = b_struct[node_addr];
@@ -290,7 +290,7 @@ fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
 //
 // 旧 tmax 栈帧版为每层节点维护 tmax/cell/t_enter/t_exit（13 字 ×4 帧），弹栈必
 // 重载节点头（3+2 LUT load）。本版状态只有：
-//   v: vec3<i32>           chunk 局部 fine 整数体素坐标
+//   v: vec3<i32>           chunk 局部 voxel 整数体素坐标
 //   bricks[4]: Brick       每层分裂节点的 addr/mask/pal（下钻载入、跨级跳复用）
 //   level: u32             3=根(256³,子块64³) … 0=叶(4³,inline 1³)
 // 边界距离按整数对齐每次重算（side_distance_for_ray，纯函数无状态）；brick 内
@@ -307,7 +307,7 @@ fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
 // 层级命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
 //   pre-check 命中（射线起点在固体 leaf 内，相机在体内 UB）：face_id 由调用方
 //   用 normalize(-rd) 反推（首 chunk entry_face）。
-// voxel：命中固体体素 chunk 局部 fine 整数坐标——DDA 步进本身精确（整数加法），
+// voxel：命中固体体素 chunk 局部 voxel 整数坐标——DDA 步进本身精确（整数加法），
 //   无浮点噪声；着色阶段直接消费，禁用任何「命中点 ± 法线半步」启发式重建
 //   （启发式在体素棱边/UB fallback face 下会选错邻体素 → 6 邻域差分串色）。
 struct FineHit {
@@ -325,7 +325,7 @@ struct Brick {
   pal: u32,   // 节点 palette（统一子块颜色，0=空气）
 }
 
-// 单 chunk 内层级遍历。chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 fine）。
+// 单 chunk 内层级遍历。chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 voxel）。
 // 射线段 [t0, t1]（ro 系绝对 t）；entry_face = 进入本 chunk 的面（首 chunk 由调用方
 // 用 normalize(-rd) 兜底，后续 chunk 为跨 chunk 面）。
 // 返回 FineHit（t 为 ro 系绝对 t）；走出 chunk 未命中 → hit=false。
@@ -339,7 +339,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
                t0: f32, t1: f32, entry_face: u32, depth_cap: u32) -> FineHit {
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
   if (t0 >= t1) { return FineHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
-  // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
+  // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = ro - chunk_min;
   // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv）
   let inv_rd = 1.0 / rd;
@@ -360,7 +360,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   let r_pal = b_struct[chunk_base + 2u] & 0xFFu;
   bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal);
   var level: u32 = 3u;
-  // 当前体素（chunk 局部 fine 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
+  // 当前体素（chunk 局部 voxel 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
   let p0 = ro_c + rd * t0;
   var v = clamp(vec3<i32>(floor(p0)), vec3<i32>(0), vec3<i32>(255));
   var cur_t = t0;
@@ -440,7 +440,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     }
     // ---- v 处为空气：当前 level brick 内 DDA（Douglas dda）----
     let log2 = level * 2u;
-    let s = 1i << (level * 2u); // 子块边长 fine：1/4/16/64
+    let s = 1i << (level * 2u); // 子块边长 voxel：1/4/16/64
     let s_mask = ~(s - 1i);    // 对齐掩码（two's complement: ~(s-1) = -s）
     // side_distance_for_ray：v 对齐到 s 的基址；正向 → 基址+s，负向 → 基址
     let base_v = v & vec3<i32>(s_mask);
@@ -573,7 +573,7 @@ fn slab_box(ro: vec3<f32>, rd: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>, t0: f32,
 // ============================================================================
 
 // 统一命中结构：hit/t/pal/n(世界空间法线)/face_id(0..5)/obj_id(-1=主世界,>=0=物体)
-// voxel：命中固体体素 grid 局部 fine 整数坐标（主世界 = 世界坐标）——DDA 整数步进
+// voxel：命中固体体素 grid 局部 voxel 整数坐标（主世界 = 世界坐标）——DDA 整数步进
 //   精确产出，dda_main 着色（voxel_normal_world 6 邻域差分）直接消费，零启发式重建。
 struct UnifiedHit {
   hit: bool,
@@ -581,7 +581,7 @@ struct UnifiedHit {
   pal: u32,
   n: vec3<f32>,        // 世界空间法线（光影用）
   face_id: u32,        // 命中面 0..5（与 face_index_from_normal 对齐）
-  voxel: vec3<i32>,    // grid 局部 fine 命中体素（trace_chunk 的 v + ci*256）
+  voxel: vec3<i32>,    // grid 局部 voxel 命中体素（trace_chunk 的 v + ci*256）
   obj_id: i32,         // -1 = 主世界, >=0 = 物体索引
 }
 

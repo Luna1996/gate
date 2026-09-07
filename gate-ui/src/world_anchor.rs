@@ -33,7 +33,7 @@ impl Default for AnchorCamera {
 /// 世界空间锚点（挂任意 UI 节点；v0 距离缩放作用于本实体 TextFont）
 #[derive(Component, Clone, Copy, Debug)]
 pub struct WorldAnchor {
-  /// 锚点世界坐标（fine 单位，与渲染世界一致）
+  /// 锚点世界坐标（voxel 单位，与渲染世界一致）
   pub pos_fine: Vec3,
   /// 手动开关（投影系统之外的总闸）
   pub visible: bool,

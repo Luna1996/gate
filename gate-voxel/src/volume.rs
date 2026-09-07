@@ -307,7 +307,7 @@ impl VolumeGrid {
   /// 填充对齐 brick（extent ∈ {256,64,16,4,1}，Douglas wire Uniform 节点同构）。
   ///
   /// 大体积均匀填充专用：树路径 O(depth)，不逐体素分裂（见 [`ChunkTree::fill_brick`]）。
-  /// `voxel` 为 brick 最小角的世界 fine 坐标。
+  /// `voxel` 为 brick 最小角的世界 voxel 坐标。
   pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: u8) -> Option<DirtyEdit> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));

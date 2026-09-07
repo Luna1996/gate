@@ -30,7 +30,7 @@ use glam::{IVec3, Mat3, Vec3, Vec4};
 
 // ============ 层级常量（与 gate-voxel coords.rs 一致）============
 
-/// chunk 边长（体素/fine 单位）：256³（Douglas 早期 chunk 大小）
+/// chunk 边长（体素/voxel 单位）：256³（Douglas 早期 chunk 大小）
 pub const CHUNK_SIZE: i32 = 256;
 /// 分裂因子（4³ = 64 子块）
 pub const BRICK_FACTOR: i32 = 4;
@@ -41,7 +41,7 @@ pub const NODE_FIXED_WORDS: usize = 3;
 
 // ============ b_struct Region ①：稠密 chunk 窗口 ============
 
-/// 稠密 chunk 窗口每轴上限（64 chunk × 256 = 16384 fine 覆盖半径）
+/// 稠密 chunk 窗口每轴上限（64 chunk × 256 = 16384 voxel 覆盖半径）
 pub const CHUNK_INDEX_CAP: usize = 64;
 /// Region ① 字数：64³ = 262144 字 = 1MB
 pub const CHUNK_INDEX_WORDS: usize = CHUNK_INDEX_CAP * CHUNK_INDEX_CAP * CHUNK_INDEX_CAP;
@@ -78,8 +78,8 @@ pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
 //
 // **字段名与旧版逐字相同（80B 布局不变）**——Phase 1 保持 dda.wgsl 的 Globals
 // struct 字节兼容（shader 逻辑 Phase 2 重写，本阶段画面为空属预期）。
-// 语义升级：index_origin/dims 从 tile 窗口（×512 fine）变为 **chunk 窗口**
-// （×256 fine）；tile_count 语义变为 chunk_count。
+// 语义升级：index_origin/dims 从 tile 窗口（×512 voxel）变为 **chunk 窗口**
+// （×256 voxel）；tile_count 语义变为 chunk_count。
 
 /// encase 0.12.1 在 uniform 模式下对 Rust fixed-size `[i32/u32; N]` 断言
 /// "array stride must be a multiple of 16"（按 element stride=4 判，而非按 array

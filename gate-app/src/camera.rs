@@ -13,7 +13,7 @@ use gate_voxel::VolumeTransform;
 
 // ---- 相机参数（P2.6 from_orbit 使用；用户已取消"最远距离"限制）----
 // CAM_FAR = 透视投影 far 面；dda.wgsl 内 DDA 射线 t_max 同步到此量级。
-// 原 4000（10m）→ 现 65536（163.84m）足够 zoom-out 到整个 tile 场景（~1000 fine）
+// 原 4000（10m）→ 现 65536（163.84m）足够 zoom-out 到整个 tile 场景（~1000 voxel）
 // 缩成屏幕 1% 像素仍可见。DIST_MAX 已删除，滚轮 zoom-out 距离本身无上限。
 pub(crate) const FOV_Y: f32 = 60.0_f32.to_radians();
 pub(crate) const CAM_NEAR: f32 = 1.0;
@@ -104,7 +104,7 @@ fn window_height(windows: &Query<&Window>) -> f32 {
 
 /// 左键点击：把旋转中心（OrbitCamera.target）搬到点击像素命中的体素位置。
 /// - 未命中任何体素 / 物体 → 不做操作。
-/// - 命中点用射线入点 fine 坐标（命中面外侧向内偏半个 fine，避免 target 贴着面导致
+/// - 命中点用射线入点 voxel 坐标（命中面外侧向内偏半个 voxel，避免 target 贴着面导致
 ///   距离过近时 pitch clamp 抖动）。
 /// - UI 捕获指针（UI 控件上点击）时跳过，避免误触发。
 /// - CPU picking：用 `cpu_reference_trace_volumes` 同步跑主世界+物体两级 DDA，
@@ -167,10 +167,10 @@ pub(crate) fn left_click_pick_recenter(
     .collect();
   // ---- 3) trace_volumes：主世界 + 物体统一求最近 ----
   if let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, cfg.position_world, dir, t_max) {
-    // 命中点 = origin + t·dir；再朝命中法线方向推半个 fine（让 target 落在体素内部）。
+    // 命中点 = origin + t·dir；再朝命中法线方向推半个 voxel（让 target 落在体素内部）。
     let mut p = cfg.position_world + dir * hit.t;
     let half = 0.5;
-    p += hit.normal * half; // 法线朝射线来向 → *+half 把点推进命中体素内 0.5 fine
+    p += hit.normal * half; // 法线朝射线来向 → *+half 把点推进命中体素内 0.5 voxel
     orbit.target = p;
     bevy::log::info!(
       "PICK → target=({:.1},{:.1},{:.1})  t={:.1}  pal={}  obj_id={}",
@@ -303,7 +303,7 @@ mod aabb_zoom_tests {
       (g.index_origin_y + g.index_dims_y as i32) as f32 * 512.0,
       (g.index_origin_z + g.index_dims_z as i32) as f32 * 512.0,
     );
-    // 初始 distance (700-260,560-120,700-260).len() ≈ 866 fine
+    // 初始 distance (700-260,560-120,700-260).len() ≈ 866 voxel
     let base_offset = base_eye - target;
     let base_dist = base_offset.length();
     let base_dir = base_offset / base_dist;
@@ -335,8 +335,8 @@ mod aabb_zoom_tests {
           let diff = far - near;
           let frustum_len = diff.length();
           let dir = diff.normalize();
-          // 极限场景 AABB 尺寸：12×5×12 tile = (5632, 2560, 5632) fine，
-          // 对角穿越 worst-case ~9000 fine；给 16384 留 2× 余量避免截断漏画。
+          // 极限场景 AABB 尺寸：12×5×12 tile = (5632, 2560, 5632) voxel，
+          // 对角穿越 worst-case ~9000 voxel；给 16384 留 2× 余量避免截断漏画。
           let aabb_max_steps: u32 = 16384;
           let r_full = cpu_reference_dda_ray(&buffers, eye, dir, frustum_len, 2_000_000);
           let r_skip = cpu_reference_dda_ray_aabb_skip(
@@ -362,7 +362,7 @@ mod aabb_zoom_tests {
         }
       }
       println!(
-        "ZOOM lines={lines:>3} distance={distance:>8.0} AABB fine min=({:.0},{:.0},{:.0}) max=({:.0},{:.0},{:.0})\n  \
+        "ZOOM lines={lines:>3} distance={distance:>8.0} AABB voxel min=({:.0},{:.0},{:.0}) max=({:.0},{:.0},{:.0})\n  \
          32x32 full_hits={full_hits}/{} skip_hits={skip_hits}/{} diff_hit={diff_hit} diff_pal={diff_pal}",
         aabb_min.x,
         aabb_min.y,

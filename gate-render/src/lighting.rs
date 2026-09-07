@@ -32,7 +32,7 @@ pub(crate) fn xyz(v: Vec4) -> Vec3 {
 
 /// 光源上限（uniform 数组长度；当前只用 lights[0] = 方向光）
 pub const MAX_LIGHTS: usize = 8;
-/// 阴影射线起点沿法线偏移（fine），消除自遮挡 acne
+/// 阴影射线起点沿法线偏移（voxel），消除自遮挡 acne
 pub const SHADOW_BIAS: f32 = 0.5;
 /// 方向光阴影射线 t_max：场景 AABB 对角 ≈3118（[-256,-512,-256]~[1536,1536,1280]），
 /// 表面点沿任意方向的遮挡必在其内；65536 的空气段让每条阴影射线多空走 8×（性能）。

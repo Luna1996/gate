@@ -181,8 +181,8 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
 // ─────────────────────────────────────────────────────────────────────
 // 世界：tiles x∈[0..10] z∈[0..10] y∈[0..2] 共 10×3×10=300 实有 tile，
 //       brickmap compute_window origin=(-1,-1,-1) dims=(12,5,12)=720 砖，
-//       fine AABB ≈ (-512,-512,-512)..(5632,2048,5632)，对角穿越 ≈9000 fine。
-// 内容分布（fine 单位 0..5120 XY 平面，y 高度）：
+//       voxel AABB ≈ (-512,-512,-512)..(5632,2048,5632)，对角穿越 ≈9000 voxel。
+// 内容分布（voxel 单位 0..5120 XY 平面，y 高度）：
 //   · 基础 L0 地面（全地图高 16）+ 起伏正弦高度场山体
 //   · 4 座雪峰（四角，y 到 800）· 中部峡谷蜿蜒河流 L2
 //   · 160 棵散点树（L2 粗节节省体素）在非山非河格
@@ -191,7 +191,7 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
 //   · 保留 tile(1,0,0) 每 120 帧 L4 黄↔青交替（验证 132KB/180µs 增量上传路径）
 //   · 世界大标语 "GATE ENGINE" 立在入口大道
 // ─────────────────────────────────────────────────────────────────────
-// 世界规模（tile 数，1 tile = 512 fine）：env `GATE_TILES` 可调。
+// 世界规模（tile 数，1 tile = 512 voxel）：env `GATE_TILES` 可调。
 // 默认 2 = 快速调试档（启动 ~几秒；正确性调试期默认小场景）；
 // `GATE_TILES=10` = 完整压测场景（启动 ~55s，性能验收用）。
 // 场景内所有结构性坐标（城堡/大道/河）均以 EXT_FINE_HALF 为锚，随规模等比成立。
@@ -260,7 +260,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     };
   }
   // ================================================================
-  //  (1) 基础地形：按 16 fine (L0) 步长采样高度场 → fill_box 铺柱
+  //  (1) 基础地形：按 16 voxel (L0) 步长采样高度场 → fill_box 铺柱
   //      y=16..h 使用 palette 2 山岩；y>h-40 且 h>520 → palette 3 雪峰
   // ================================================================
   let mut z = 0i32;
@@ -287,7 +287,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
           if rock_h > 0 {
             fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, rock_h, 16), 2);
           }
-          // 雪顶（h > 560 时，顶部 38 fine 改 palette 3 雪）
+          // 雪顶（h > 560 时，顶部 38 voxel 改 palette 3 雪）
           if top > 560 {
             let snow_h = top - snow_line;
             if snow_h > 0 {
@@ -299,7 +299,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
               );
             }
           } else {
-            // 低矮山坡顶部覆草（palette 1，最顶 16 fine）
+            // 低矮山坡顶部覆草（palette 1，最顶 16 voxel）
             let grass_h = (top - 16).min(16);
             if grass_h > 0 && top - grass_h >= 16 {
               fill_box(
@@ -435,7 +435,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   );
   // 正殿正门（Z- 方向，挖一矩形门洞：clear_voxel）
   {
-    // L1 每步 = 8 fine；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
+    // L1 每步 = 8 voxel；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
     let e = 8i32; // L1 边长
     let mn = IVec3::new(cx - 48, 336, cz - 264);
     let ex = mn + IVec3::new(96, 96, 8);
@@ -543,7 +543,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
       // 确定性位置抖动
       let sx = ((t * 37 + seed) % 96) - 48;
       let sz = ((t * 131 + seed * 3) % 96) - 48;
-      let hy = (t * 53) % 14; // 高度 0..13 fine
+      let hy = (t * 53) % 14; // 高度 0..13 voxel
       let pal = if (t & 1) == 0 { pa } else { pb };
       let px_ = cx_ + sx;
       let pz_ = cz_ + sz;

@@ -322,7 +322,7 @@ impl ChunkTree {
 
   /// brick 三态查询（DDGI 探针烘焙）：Air / Solid(palette) / Mixed
   ///
-  /// `local_*` = chunk 内 fine 坐标（brick 最小角），`level` ∈ 0..5 对应
+  /// `local_*` = chunk 内 voxel 坐标（brick 最小角），`level` ∈ 0..5 对应
   /// `LEVEL_EXTENT` = [256, 64, 16, 4, 1]。
   pub fn get_brick_state(&self, local_x: i32, local_y: i32, local_z: i32, level: u8) -> BrickState {
     let query_extent = LEVEL_EXTENT[level as usize];
