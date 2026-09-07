@@ -167,7 +167,7 @@
 - [x] M3-2 ddgi_cast（CPU 镜像 + 6 单测 + WGSL 镜像 done，commit `ed1fbeb`/`186e223`；含 RTXGI 实锤的采样方向修正）
 - [x] M3-3 ddgi_update（CPU 镜像 + f16 门禁 + 6 单测 + WGSL 镜像 done，commit `5fc032f`/`186e223`）
 - [x] M3-4 sample_ddgi（6 组 CPU 单测 M3-2 已绿；WGSL ddgi_sample 单级联版 done `186e223`；级联距离选级 + 过渡带混合随 M4-3 滚动接线）
-- [ ] M4-1 资源/features/BG4
+- [x] M4-1 资源/features/BG4（commit `87f4c45`：DdgiUniform 112B + BG4 v2 13 binding + D7 纹理数组双缓冲 + dispatch 兼 indirect + 四管线排队 + 插件挂回；空跑验收过：demo 334k 探针 1307 层无 ERROR。**SHADER_F16/subgroup features 均不需要**——rgba16f 是纹理格式、subgroup 走 atomicAdd fallback；wgpu 默认 max_texture_array_layers=2048）
 - [ ] M4-2 三 pass 编排 + indirect 一致性
 - [ ] M4-3 级联滚动 + reuse bounds
 - [ ] M4-4 编辑响应重接
@@ -220,26 +220,26 @@ WGSL 三 pass 均未写。测试基线：`cargo test -p gate-render --release` =
   collect_radiance 的 (d·dir_i)+ 余弦权重同源）；③ depth 方向 = 探针→接收点（正确未动）。
   旧 GI pass 从未目验（spike 0-5a 已拆），M3-2 真实几何端点测试首次暴露。
 
-**下一步 = M4-1 渲染侧资源重构**（DdgiPlugin：rgba16f/r32 纹理数组 + 元数据双缓冲
-ping-pong + BG4 重排 + SHADER_F16/subgroup features + DdgiUniform Rust 镜像 +
-12 binding wire 单测），随后 M4-2 三 pass 编排（clear → active → cast → update，
-全部先于主 trace dispatch；indirect 一致性抽验）。**WGSL 三 pass + ddgi_sample 已
-全部就位**（dda.wgsl 末段 `186e223`，naga parse+validate 门禁通过，wgsl_compile 单测）：
-- group(4) 绑定布局（WGSL 侧真相，M4-1 Rust 逐字镜像）：0=uniform DdgiUniform（112B：
-  grid_origin[cell_size 在 w]/grid_dims[probe_count 在 w]/params[frame,rays,_,obj_n]/
-  reuse_min/reuse_max/finer_min[cell_size 在 w]/finer_size）；1=positions(f32x4)；
-  2=cell_index(u32)；3/4=irr/depth_prev(texture_2d_array 采样读)；5/6=irr/depth_next
-  (storage write)；7/8=meta prev/next(r32uint)；9=dispatch(array<atomic<u32>> 4 字，
-  [0]=count 兼 indirect buffer，须 start-of-pass 清零 pass)；10=objects(2 vec4/bbox)；
-  11=samples(2 vec4/射线)；12=worklist(u32 探针 id)。
-- dispatch 形态：clear @wg(1) 1 次；active @wg(4,4,4) = ceil(dims/4)³；cast/update
-  @wg(64) indirect（x = dispatch[0]）。
-- **WGSL 踩坑（已修）**：`new` 是 WGSL 保留字（→proj）；atomicAdd 须
-  `array<atomic<u32>>`（dispatch 计数与 worklist 条目拆 binding 9/12）。
-- **M4-2 待接线**：next 纹理是新鲜分配的 → pass 前 prev→next 整体 copy（meta 全量
-  ~KB-335KB/帧；irr/depth 仅级联级 16³ ≈ 24MB/帧；base 世界级改 in-place 双缓冲或
-  跳过 copy——M4-1 A/B 定）；法线已知差异（WGSL voxel_normal_world vs CPU 面法线）
-  目验仲裁。
+**下一步 = M4-2 四 pass 编排**：在 dda.rs 的 compute pass 记录系统（dda_main/beam
+所在 Render 系统）**前置**插入 DDGI pass 链：clear（1 线程）→ active（ceil(dims/4)³，
+@wg(4,4,4)）→ cast（indirect x=dispatch[0]）→ update（indirect），全部先于主 trace
+dispatch；帧末（或下帧 prepare 前）prev/next 纹理指针交换（DdgiGpu 持有
+ irr_prev/next 等 6 纹理 + 6 view，交换 = 字段互换）。
+1. **pass 间 race 纪律**：三 pass 读写同 storage 必须分 compute pass（wgpu 只在
+   pass 边界插 barrier）；clear→active 同 buffer 不同字也须 pass 边界。
+2. **next 纹理 copy pass（M4-1 遗留决策点）**：active/update 只写本帧处理探针，
+   其余 texel 需在 pass 前 prev→next 整体 copy（wgpu CopyTextureToTexture，两份
+   同尺寸数组逐层拷；meta 1.3MB + irr/depth 500MB/帧对 334k 探针过重 → base 世界级
+   改 in-place 双缓冲（active/update 直接读写同纹理，放弃 prev 隔离——EMA 本就
+   渐进，读写同帧同 texel 无 race（1 wg = 1 探针独占））或仅级联级 copy。M4-2 先
+   做 copy 版跑通正确性，bench 后再优化（M5-3）。
+3. indirect 一致性抽验：日志打印 dispatch count（staging readback 或 debug overlay）；
+   `@workgroup_size` 与 dispatch 数严格一致（既有坑：仅左上 1/4 屏）。
+4. WGSL 已就绪（rays GPU 自派生 max(4096/count,1)，commit `87f4c45` 同步）；CPU
+   镜像 cpu_ddgi_* 全链 52 单测 = 行为 oracle。
+5. 验收：GATE_BENCH 下 latest.log 无 ERROR；四 pass GPU 时长入 gpu_frame.log；
+   画面（DDGI 光照还未接进 dda_main 着色——M4-2 只验证 pass 链自洽运行 +
+   irradiance 收敛（可用 debug readback 或目验探针可视化））。
 
 **环境与命令（Windows / PowerShell）**
 - 跑测试（一律 release）：`cargo test -p gate-render --release ddgi`
