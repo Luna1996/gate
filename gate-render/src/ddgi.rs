@@ -1164,6 +1164,185 @@ pub fn compute_cell_flags(
 }
 
 // ============================================================================
+// M3-2 cast 射线投射 CPU 镜像（WGSL ddgi_cast.wgsl 镜像源；spec D5）
+// 消费 M3-1 worklist → 4096 预算分摊 → Fibonacci+PCG 旋转方向 →
+// 端点着色（sky / emissive 直出 / 直光+prev DDGI 自闭环）→ 样本缓冲
+// ============================================================================
+
+use crate::brickmap::{BrickMapBuffers, VolumeHit, cpu_reference_trace_volumes, cpu_reference_volumes_occluded};
+use crate::lighting::{EMISSIVE_EMIT_GAIN, SHADOW_BIAS, SHADOW_DIR_T_MAX, cpu_reference_sky, xyz, yzw};
+use gate_voxel::VolumeTransform;
+
+/// D5 预算分摊：4096 射线/帧固定总预算 → 每活跃探针射线数（活跃探针均摊，
+/// 性能不随屏上探针数波动——Douglas「roughly the same number of rays per frame,
+/// dividing them amongst all of the active probes」）。
+/// active=0 → 0；4096/active 向下取整，保底 1（活跃数超预算时总射线数会超出
+/// 4096——实际活跃探针数远低于此；预算值起步，M5-3 bench 后调）。
+#[inline]
+pub fn cast_rays_per_probe(active_count: u32) -> u32 {
+  if active_count == 0 {
+    0
+  } else {
+    (RAY_BUDGET_PER_FRAME / active_count).max(1)
+  }
+}
+
+/// Shoemake 均匀随机旋转四元数（u ∈ [0,1)³；Graphics Gems III）
+#[inline]
+fn random_quat(u1: f32, u2: f32, u3: f32) -> glam::Quat {
+  let s1 = (1.0 - u1).sqrt();
+  let s2 = u1.sqrt();
+  let (su2, cu2) = (std::f32::consts::TAU * u2).sin_cos();
+  let (su3, cu3) = (std::f32::consts::TAU * u3).sin_cos();
+  glam::Quat::from_xyzw(s1 * su2, s1 * cu2, s2 * su3, s2 * cu3)
+}
+
+/// 射线方向（D5「球面均匀随机方向（PCG hash + 帧号种子，Fibonacci 球保留）」+
+/// Douglas 字幕「cast random rays according to a Fibonacci sphere」）：
+/// Fibonacci 球基方向（帧内低差异均匀覆盖）× PCG 随机旋转（探针×帧号种子——
+/// 帧间/探针间去相关；随机的是旋转，帧内保持 Fibonacci 蓝噪声结构）。
+#[inline]
+pub fn cast_ray_dir(probe_id: u32, frame: u32, ray_index: u32, rays_total: u32) -> Vec3 {
+  let base = fibonacci_dir(ray_index, rays_total.max(1));
+  let seed = ray_rand(probe_id, frame, 0);
+  let u = rand2(seed);
+  let u3 = (pcg_hash(seed) & 0xFFFF) as f32 / 65536.0;
+  random_quat(u[0], u[1], u3) * base
+}
+
+/// 命中点材质（palette 两 words 解包；lighting.rs hit_mat 同型，DDGI 侧独立维护）
+#[inline]
+fn hit_mat_ddgi(vols: &[(&BrickMapBuffers, VolumeTransform)], hit: &VolumeHit) -> (Vec3, f32) {
+  let idx = if hit.obj_id == -1 {
+    0
+  } else {
+    hit.obj_id as usize + 1
+  };
+  let pal = &vols[idx].0.b_palette;
+  let w0 = pal[hit.pal as usize * 2];
+  let w1 = pal[hit.pal as usize * 2 + 1];
+  let albedo = Vec3::new(
+    (w0 & 0xFF) as f32,
+    ((w0 >> 8) & 0xFF) as f32,
+    ((w0 >> 16) & 0xFF) as f32,
+  ) / 255.0;
+  let emissive = (w1 & 0xFF) as f32 / 255.0;
+  (albedo, emissive)
+}
+
+/// D5 端点着色（pre-exposure，spec §3 保留约定——DDGI 存原始 radiance，
+/// 曝光在最终像素着色时施加）：
+/// - miss → sky 色（cpu_reference_sky），dist = PROBE_T_MAX（depth 远距哨兵）
+/// - emissive 命中 → albedo × emissive × gain 直出（无方向性、不受阴影）
+/// - 常规命中 → 直光 1-bounce（ndl × 硬阴影射线）+ prev DDGI 采样（自闭环
+///   无限反弹——命中点用上一帧 irradiance 着色，反弹数随帧数累积）
+/// 返回 (radiance, dist)。
+/// INFERENCE: 间接采样点沿法线偏移 DDGI_NORMAL_BIAS（Majercik 2019 §4 惯例，
+/// Douglas 未截图此细节）；法线 = trace 面法线（与 lighting CPU 参考同一已知
+/// 差异：GPU 侧 per-voxel implicit normal 未同步 CPU 镜像）。
+pub fn cast_endpoint_radiance(
+  vols: &[(&BrickMapBuffers, VolumeTransform)],
+  light_pool: &crate::lighting::LightPoolUniform,
+  prev: &DdgiProbeArrays,
+  origin: Vec3,
+  dir: Vec3,
+) -> (Vec3, f32) {
+  match cpu_reference_trace_volumes(vols, origin, dir, PROBE_T_MAX) {
+    None => (cpu_reference_sky(dir, light_pool), PROBE_T_MAX),
+    Some(hit) => {
+      let p = origin + dir * hit.t;
+      let n = hit.normal;
+      let (base, emissive) = hit_mat_ddgi(vols, &hit);
+      if emissive > 0.0 {
+        return (base * (emissive * EMISSIVE_EMIT_GAIN), hit.t);
+      }
+      let mut col = Vec3::ZERO;
+      // 直光 1-bounce（方向光硬阴影；cpu_reference_shade_hit 直射段同型）
+      if light_pool.g.count > 0 && light_pool.lights[0].kind_pos_dir.x < 0.5 {
+        let ld = &light_pool.lights[0];
+        let l = yzw(ld.kind_pos_dir);
+        let ndl = n.dot(l).max(0.0);
+        if ndl > 0.0 {
+          let o = p + n * SHADOW_BIAS;
+          let vis = if cpu_reference_volumes_occluded(vols, o, l, SHADOW_DIR_T_MAX) {
+            0.0
+          } else {
+            1.0
+          };
+          col += base * xyz(ld.color_intensity) * ld.color_intensity.w * (ndl * vis);
+        }
+      }
+      // prev DDGI 自闭环（无限反弹）：命中点偏移后采样上一帧 irradiance
+      let irr = cpu_sample_ddgi(prev, p + n * DDGI_NORMAL_BIAS, n);
+      col += base * irr;
+      (col, hit.t)
+    }
+  }
+}
+
+/// cast 输入（消费 M3-1 active 输出 + 上一帧探针数组）
+pub struct CastInput<'a> {
+  /// 世界 volumes（[0] = 主世界 identity；CPU 参考用 BrickMapBuffers）
+  pub vols: &'a [(&'a BrickMapBuffers, VolumeTransform)],
+  pub light_pool: &'a crate::lighting::LightPoolUniform,
+  /// 探针网格（positions；probe id → 世界坐标）
+  pub pg: &'a ProbeGrid,
+  /// M3-1 active 输出的 worklist
+  pub worklist: &'a [ActiveWorklistItem],
+  /// 每探针射线数 = cast_rays_per_probe(worklist.len())
+  pub rays_per_probe: u32,
+  /// 帧号（方向旋转种子）
+  pub frame: u32,
+  /// 上一帧探针数组（irradiance/depth；自闭环输入）
+  pub prev: &'a DdgiProbeArrays<'a>,
+}
+
+/// 单条射线样本（M3-3 ddgi_update 消费：collect_radiance 投影 + depth EMA）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RaySample {
+  /// 射线方向（cast_ray_dir 产物）
+  pub dir: Vec3,
+  /// 端点 radiance（pre-exposure）
+  pub radiance: Vec3,
+  /// 命中距离（sky = PROBE_T_MAX 远距哨兵；depth EMA 输入）
+  pub dist: f32,
+}
+
+/// cast 输出：样本缓冲（WGSL storage buffer 镜像；线性下标 = slot × rays_per_probe
+/// + ray_index，slot = worklist 序号——M3-3 update 每工作群消费自己的射线段）
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastOutput {
+  pub samples: Vec<RaySample>,
+  pub rays_per_probe: u32,
+}
+
+/// CPU 镜像主入口：worklist → 每探针 rays_per_probe 条射线 → 端点着色 → 样本缓冲。
+///
+/// WGSL `ddgi_cast.wgsl` 等价（dispatch_workgroups_indirect 消费 M3-1 indirect 参数，
+/// workgroup 数 = worklist.len()，1 workgroup = 1 探针）：
+/// - @workgroup_size(64)（rays_total 上限；超出部分线程内循环 `for i in (tid..n).step(64)`）
+/// - 方向 = cast_ray_dir 逐字镜像（fibonacci_dir + random_quat(pcg seed)）
+/// - 端点 = cast_endpoint_radiance 逐字镜像（trace_grid + sky/emissive/直光+prev 采样）
+/// - 样本写 storage buffer（dir.xyz, radiance.xyz, dist）按 slot×n+i 线性布局
+pub fn cpu_ddgi_cast(input: &CastInput) -> CastOutput {
+  let rays = input.rays_per_probe;
+  let mut samples = Vec::with_capacity(input.worklist.len() * rays as usize);
+  for item in input.worklist {
+    let origin = input.pg.positions[item.probe_id as usize];
+    for i in 0..rays {
+      let dir = cast_ray_dir(item.probe_id, input.frame, i, rays);
+      let (radiance, dist) =
+        cast_endpoint_radiance(input.vols, input.light_pool, input.prev, origin, dir);
+      samples.push(RaySample { dir, radiance, dist });
+    }
+  }
+  CastOutput {
+    samples,
+    rays_per_probe: rays,
+  }
+}
+
+// ============================================================================
 // GPU wire（BG4：WGSL DdgiMeta + 4 storage buffer 逐字段镜像）
 // ============================================================================
 
@@ -1357,19 +1536,27 @@ pub fn cpu_sample_ddgi(a: &DdgiProbeArrays, p: Vec3, n: Vec3) -> Vec3 {
         let probe = a.positions[id as usize];
         let to = p - probe;
         let dist = to.length();
-        let dir = to / dist.max(1e-4);
-        // 锐利背面剔除（Rohacek §3.2）
-        let wn = (n.dot(dir) / DDGI_NORMAL_BIAS).clamp(0.0, 1.0);
+        let dir = to / dist.max(1e-4); // dir = 探针→接收点（depth 检查方向）
+        // 锐利背面剔除（Rohacek §3.2；RTXGI Irradiance.hlsl 逐字对照）：
+        // wn = clamp(n·(接收点→探针)/bias)——探针在法线前侧（空气侧）通过，
+        // 后侧（墙内/地下）严格 0，穿墙不漏光。
+        // （RTXGI: worldPosToAdjProbe = normalize(probePos - worldPos)，
+        //   wrapShading = dot(worldPosToAdjProbe, direction)）
+        let wn = (n.dot(-dir) / DDGI_NORMAL_BIAS).clamp(0.0, 1.0);
         if wn <= 0.0 {
           continue;
         }
-        // 漏光 chevron（Rohacek §3.3）
+        // 漏光 chevron（Rohacek §3.3；depth 沿 探针→接收点 方向取：
+        // 探针到墙距离 < 探针到接收点距离 → 剔除）
         let dtex = cpu_depth_sample(a.depth, id, dir);
         let wd = ((dtex - dist) / DDGI_DEPTH_BIAS + 0.5).clamp(0.0, 1.0);
         if wd <= 0.0 {
           continue;
         }
-        let irr = cpu_irr_sample(a.irr, id, dir);
+        // irradiance 采样方向 = 表面法线（RTXGI: octantCoords =
+        // GetOctahedralCoordinates(direction)；探针 oct 图按「接收法线」索引——
+        // 与 D6 collect_radiance 的 (d·dir_i)+ 余弦权重同源）
+        let irr = cpu_irr_sample(a.irr, id, n);
         let w = wtri * wn * wd;
         total += irr * w;
         wsum += w;
@@ -2200,7 +2387,7 @@ mod tests {
       irr: &irr,
       depth: &depth,
     };
-    // p=(12,12,12) 在 8 cell 交界，n=+Y：下方 4 探针贡献，归一化后仍为探针色
+    // p=(12,12,12) 在 8 cell 交界，n=+Y：上方 4 探针（法线前侧）贡献，归一化后仍为探针色
     let c = cpu_sample_ddgi(&a, Vec3::splat(12.0), Vec3::Y);
     assert!(
       (c - Vec3::new(1.0, 0.2, 0.1)).length() < 1e-5,
@@ -2208,7 +2395,7 @@ mod tests {
     );
   }
 
-  /// 探针全在表面法线后侧（p 在所有探针上方）→ wsum=0 → 黑
+  /// 探针全在表面法线后侧 → wsum=0 → 黑（锐利背面剔除）
   #[test]
   fn cpu_sample_backface_all_rejected() {
     let positions = eight_probe_positions();
@@ -2222,12 +2409,13 @@ mod tests {
       irr: &irr,
       depth: &depth,
     };
-    // p.y=4 < 所有探针 y(8/24)：探针全在 p 上方，n=+Y → N·d<0 全剔除
-    let c = cpu_sample_ddgi(&a, Vec3::new(12.0, 4.0, 12.0), Vec3::Y);
+    // p.y=4 < 所有探针 y(8/24)：探针全在 p 上方；n=-Y（法线朝下 = 前侧在下方）
+    // → 探针全在表面后侧 → N·(接收点→探针) < 0 全剔除
+    let c = cpu_sample_ddgi(&a, Vec3::new(12.0, 4.0, 12.0), -Vec3::Y);
     assert_eq!(c, Vec3::ZERO, "背面探针必须全剔除");
   }
 
-  /// depth 全 1.0（探针贴墙）而 p 距探针 ~7 → chevron wd=0 → 黑（漏光治理）
+  /// depth 全 1.0（探针贴墙）而 p 距前侧探针 ~7 → chevron wd=0 → 黑（漏光治理）
   #[test]
   fn cpu_sample_depth_chevron_occludes() {
     let positions = eight_probe_positions();
@@ -2241,7 +2429,8 @@ mod tests {
       irr: &irr,
       depth: &depth,
     };
-    // n=-Y 取上方探针（p 上方 y=24 的探针 dir.y>0 与 -Y 同向），depth=1 全遮挡
+    // n=-Y（法线朝下）：前侧探针 = p 下方 y=8 探针（距离 ~7）；
+    // depth=1（探针与 p 之间有墙）→ chevron 全遮挡 → 黑
     let c = cpu_sample_ddgi(&a, Vec3::splat(12.0), -Vec3::Y);
     assert_eq!(c, Vec3::ZERO, "墙在探针与 p 之间 → chevron 全剔除");
   }
@@ -2303,11 +2492,11 @@ mod tests {
       irr: &irr,
       depth: &depth,
     };
-    // p 在探针正上方 1 格，n=+Y → dir≈+Y → 红
-    let up = cpu_sample_ddgi(&a, Vec3::new(20.0, 12.5, 20.0), Vec3::Y);
+    // p 在探针正下方 1 格，n=+Y（探针在法线前侧=上方）→ 采样方向 n=+Y → 红
+    let up = cpu_sample_ddgi(&a, Vec3::new(20.0, 10.5, 20.0), Vec3::Y);
     assert!(up.x > 0.8 && up.z < 0.2, "朝上采样应见红半球：{up:?}");
-    // p 在探针正下方 1 格，n=-Y → dir≈-Y → 蓝
-    let down = cpu_sample_ddgi(&a, Vec3::new(20.0, 10.5, 20.0), -Vec3::Y);
+    // p 在探针正上方 1 格，n=-Y（探针在法线前侧=下方）→ 采样方向 n=-Y → 蓝
+    let down = cpu_sample_ddgi(&a, Vec3::new(20.0, 12.5, 20.0), -Vec3::Y);
     assert!(down.z > 0.8 && down.x < 0.2, "朝下采样应见蓝半球：{down:?}");
   }
 
@@ -2996,5 +3185,275 @@ mod tests {
       out_bbox.indirect_dispatch <= pg.positions.len() as u32,
       "不超过全探针"
     );
+  }
+
+  // ==========================================================================
+  // M3-2 cast 射线投射单测
+  // ==========================================================================
+
+  use crate::brickmap::BrickMapBuilder;
+  use crate::lighting::{DirLightCfg, LightingTheme, build_light_pool, cpu_reference_sky};
+
+  /// M3-2 验收：4096 预算分摊逻辑
+  #[test]
+  fn cast_budget_math() {
+    assert_eq!(cast_rays_per_probe(0), 0, "0 活跃 → 0 射线");
+    assert_eq!(cast_rays_per_probe(1), 4096, "1 探针独占全部预算");
+    assert_eq!(cast_rays_per_probe(2), 2048);
+    assert_eq!(cast_rays_per_probe(64), 64);
+    // 100 活跃 → 4096/100 = 40.96 → 40（向下取整，总 4000 ≤ 预算）
+    assert_eq!(cast_rays_per_probe(100), 40);
+    assert!(cast_rays_per_probe(100) * 100 <= RAY_BUDGET_PER_FRAME);
+    // 房间级 1406 活跃（M3-1 实测数）
+    assert_eq!(cast_rays_per_probe(1406), 2);
+    // 超预算：保底 1（总射线数会超出 4096，Douglas「roughly」语义）
+    assert_eq!(cast_rays_per_probe(5000), 1);
+  }
+
+  /// 射线方向：单位长度 + 确定性 + 帧间/探针间变化 + 跨帧统计均匀
+  #[test]
+  fn cast_ray_dir_uniform_and_deterministic() {
+    let n = 64u32;
+    // 确定性：同输入 → 同方向
+    let a = cast_ray_dir(7, 100, 13, n);
+    let b = cast_ray_dir(7, 100, 13, n);
+    assert_eq!(a, b);
+    // 单位长度（旋转保持）
+    assert!((a.length() - 1.0).abs() < 1e-5, "|dir|={}", a.length());
+    // 帧变化 → 方向变化（旋转去相关）
+    assert_ne!(cast_ray_dir(7, 100, 13, n), cast_ray_dir(7, 101, 13, n));
+    // 探针变化 → 方向变化
+    assert_ne!(cast_ray_dir(7, 100, 13, n), cast_ray_dir(8, 100, 13, n));
+    // 帧内 Fibonacci 结构：同一探针同帧内不同 ray_index → 不同方向
+    assert_ne!(cast_ray_dir(7, 100, 0, n), cast_ray_dir(7, 100, 1, n));
+
+    // 统计均匀：跨 1024 帧 × 64 射线，均值 z≈0、上半球≈0.5（旋转的均匀性）
+    let mut mean_z = 0.0f32;
+    let mut upper = 0u32;
+    let total = 1024u32 * n;
+    for frame in 0..1024u32 {
+      for i in 0..n {
+        let d = cast_ray_dir(42, frame, i, n);
+        assert!((d.length() - 1.0).abs() < 1e-4);
+        mean_z += d.z;
+        if d.z > 0.0 {
+          upper += 1;
+        }
+      }
+    }
+    mean_z /= total as f32;
+    assert!(mean_z.abs() < 0.01, "z 均值 {mean_z}");
+    let ratio = upper as f32 / total as f32;
+    assert!((ratio - 0.5).abs() < 0.01, "上半球占比 {ratio}");
+  }
+
+  /// 端点 miss 分支：radiance = sky(dir)，dist = PROBE_T_MAX
+  #[test]
+  fn cast_endpoint_sky_branch() {
+    let world = room_world();
+    let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
+    let pool = build_light_pool(&room_theme());
+    // 上一帧探针数组（空——miss 分支不消费，但需要传入）
+    let positions: Vec<Vec3> = Vec::new();
+    let prev = DdgiProbeArrays {
+      grid_origin: IVec3::ZERO,
+      grid_dims: UVec3::ZERO,
+      positions: &positions,
+      cell_index: &[],
+      irr: &[],
+      depth: &[],
+    };
+    // 从房内向上：天花厚 4（fine 60..64），从 (32, 40, 32) 直上穿天花命中？
+    // 用房外高空向上 → 必 miss（世界只有 64³ 房子）
+    let dir = Vec3::new(0.3, 1.0, -0.2).normalize();
+    let (rad, dist) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(500.0, 2000.0, 500.0), dir);
+    assert_eq!(dist, PROBE_T_MAX, "miss → 远距哨兵");
+    assert_eq!(rad, cpu_reference_sky(dir, &pool), "miss → sky 色（逐位）");
+    // 向下也应 miss（世界在 2000 下方但 t_max=8192 内…（2000-64）/|dy|…取足够远处）
+    let (rad2, dist2) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(2000.0, 2000.0, 2000.0), -Vec3::Y);
+    assert_eq!(dist2, PROBE_T_MAX);
+    assert_eq!(rad2, cpu_reference_sky(-Vec3::Y, &pool));
+  }
+
+  /// 端点 emissive 分支：albedo × emissive × gain 直出（不受阴影/间接光影响）
+  #[test]
+  fn cast_endpoint_emissive_branch() {
+    // 发光地板：32×16×32 盒（pal=5 emissive=200）
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(5).color = [255, 128, 0];
+    g.palette_mut().get_mut(5).emissive = 200;
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::new(32, 16, 32), 4, 5);
+    let world = BrickMapBuilder::build_full(&g).buffers().clone();
+    let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
+    let pool = build_light_pool(&room_theme());
+    let positions: Vec<Vec3> = Vec::new();
+    let prev = DdgiProbeArrays {
+      grid_origin: IVec3::ZERO,
+      grid_dims: UVec3::ZERO,
+      positions: &positions,
+      cell_index: &[],
+      irr: &[],
+      depth: &[],
+    };
+    let (rad, dist) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(16.0, 100.0, 16.0), -Vec3::Y);
+    assert_eq!(dist, 100.0 - 16.0, "命中顶面 y=16 → t=84");
+    let base = Vec3::new(1.0, 128.0 / 255.0, 0.0);
+    let expect = base * ((200.0 / 255.0) * EMISSIVE_EMIT_GAIN);
+    assert!((rad - expect).length() < 1e-5, "emissive 直出 {rad:?} vs {expect:?}");
+  }
+
+  /// 端点常规分支：直光 1-bounce（顶面 ndl=1 无遮挡）+ prev DDGI 自闭环（均匀色归一化）
+  #[test]
+  fn cast_endpoint_direct_plus_indirect() {
+    // 32×16×32 常规盒（pal=3 无发光），太阳 -Y 强度 2
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    gate_voxel::fill_bricks(&mut g, IVec3::ZERO, IVec3::new(32, 16, 32), 4, 3);
+    let world = BrickMapBuilder::build_full(&g).buffers().clone();
+    let vols: Vec<(&BrickMapBuffers, VolumeTransform)> = vec![(&world, VolumeTransform::IDENTITY)];
+    let pool = build_light_pool(&room_theme());
+
+    // 上一帧 DDGI：2×2×2 均匀色探针网格（同 cpu_sample_uniform_color_normalizes 布局）
+    let positions = eight_probe_positions();
+    let irr_color = Vec3::new(0.3, 0.6, 0.9);
+    let (irr, depth) = uniform_probe_data(irr_color, PROBE_T_MAX);
+    let cell_index = cell_index_2x2x2(std::array::from_fn(|i| Some(i as u32)));
+    let prev = DdgiProbeArrays {
+      grid_origin: IVec3::ZERO,
+      grid_dims: UVec3::splat(2),
+      positions: &positions,
+      cell_index: &cell_index,
+      irr: &irr,
+      depth: &depth,
+    };
+
+    // 命中顶面 (17,16,15)（避开 cell 边界；归一化采样 = irr_color）
+    let (rad, dist) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(17.0, 100.0, 15.0), -Vec3::Y);
+    assert_eq!(dist, 100.0 - 16.0);
+    let base = Vec3::new(128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0);
+    // 直光：ndl=1、无遮挡 → base × sun(1,1,1)×2；间接：base × irr_color
+    let expect = base * 2.0 + base * irr_color;
+    assert!(
+      (rad - expect).length() < 1e-4,
+      "直光+间接 {rad:?} vs {expect:?}"
+    );
+
+    // 底面命中（从下方向上打）：直光 ndl<0；且法线 -Y 前侧（下方）无探针
+    // （2×2×2 网格探针全在 y≥8 > p.y=0）→ 锐利背面剔除 → 间接亦为 0 → 黑
+    let (rad_b, _) = cast_endpoint_radiance(&vols, &pool, &prev, Vec3::new(17.0, -100.0, 15.0), Vec3::Y);
+    assert!(
+      rad_b.length() < 1e-5,
+      "背光底面：直光 ndl<0 + 法线前侧无探针 → 黑（got {rad_b:?}）"
+    );
+  }
+
+  /// M3-2 验收：active → cast 全链 + 同输入射线序列 → 样本缓冲逐位一致
+  #[test]
+  fn cpu_ddgi_cast_full_deterministic() {
+    let vols_world = room_world();
+    let mut g = room_grid();
+    let vols = Volumes::new(std::mem::take(&mut g));
+    let pg = bake_probe_grid(&vols);
+    let flags = compute_cell_flags(vols.main(), &pg, DDGI_CELL);
+    let meta = build_meta_texture_data(&pg);
+
+    // active（M3-1）
+    let cascade = CascadeDomain {
+      origin: pg.grid_origin,
+      dims: pg.grid_dims,
+      cell_size: DDGI_CELL,
+    };
+    let active_input = ActiveInput {
+      pg: &pg,
+      cell_flags: &flags,
+      object_bboxes: &[],
+      cascade,
+      finer: None,
+      prev_meta: &meta,
+      reuse_bounds: REUSE_ALL,
+      frame: 7,
+    };
+    let active = cpu_ddgi_active(&active_input);
+    assert!(active.worklist.len() > 100, "房间近墙探针应大批活跃");
+
+    // prev 探针数组（初值：irr=0 / depth=tmax）
+    let (irr0, dep0) = initial_probe_data(pg.positions.len() as u32);
+    let prev = DdgiProbeArrays {
+      grid_origin: pg.grid_origin,
+      grid_dims: pg.grid_dims,
+      positions: &pg.positions,
+      cell_index: &pg.cell_index,
+      irr: &irr0,
+      depth: &dep0,
+    };
+    let pool = build_light_pool(&room_theme());
+    let vols_slice: Vec<(&BrickMapBuffers, VolumeTransform)> =
+      vec![(&vols_world, VolumeTransform::IDENTITY)];
+
+    let rays = cast_rays_per_probe(active.worklist.len() as u32);
+    assert!(rays >= 1, "预算分摊保底 1");
+    let cast_input = CastInput {
+      vols: &vols_slice,
+      light_pool: &pool,
+      pg: &pg,
+      worklist: &active.worklist,
+      rays_per_probe: rays,
+      frame: 7,
+      prev: &prev,
+    };
+    let out = cpu_ddgi_cast(&cast_input);
+
+    // 样本数 = worklist × rays_per_probe；槽位布局 slot×rays+i
+    assert_eq!(out.samples.len(), active.worklist.len() * rays as usize);
+    assert_eq!(out.rays_per_probe, rays);
+    // 样本合法性：单位方向、dist ∈ (0, PROBE_T_MAX]、sky 远距哨兵存在
+    let mut has_sky = false;
+    for s in &out.samples {
+      assert!((s.dir.length() - 1.0).abs() < 1e-4);
+      assert!(s.dist > 0.0 && s.dist <= PROBE_T_MAX);
+      assert!(s.radiance.x.is_finite() && s.radiance.y.is_finite() && s.radiance.z.is_finite());
+      if s.dist == PROBE_T_MAX {
+        has_sky = true;
+      }
+    }
+    // 房间探针在房内/墙内：向上射线穿天花（4 厚墙）→ 命中或穿出后 miss；
+    // 房内探针必然存在 miss 射线（穿墙后 t_max 内无物）→ sky 样本存在
+    assert!(has_sky, "封闭房间也应存在 sky 样本（穿墙远射）");
+
+    // 逐位一致（M3-2 验收）：同输入 → 同样本缓冲
+    let out2 = cpu_ddgi_cast(&cast_input);
+    assert_eq!(out.samples, out2.samples, "固定种子 → 样本缓冲逐位一致");
+  }
+
+  /// room 单测共用世界：64³ 封闭房间（六面 4 厚墙，pal=3）
+  fn room_grid() -> VolumeGrid {
+    let mut g = VolumeGrid::new();
+    g.palette_mut().get_mut(3).color = [128, 64, 32];
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 0), IVec3::new(64, 4, 64), 4, 3);
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 60, 0), IVec3::new(64, 4, 64), 4, 3);
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 0), IVec3::new(4, 64, 64), 4, 3);
+    gate_voxel::fill_bricks(&mut g, IVec3::new(60, 0, 0), IVec3::new(4, 64, 64), 4, 3);
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 0), IVec3::new(64, 64, 4), 4, 3);
+    gate_voxel::fill_bricks(&mut g, IVec3::new(0, 0, 60), IVec3::new(64, 64, 4), 4, 3);
+    g
+  }
+
+  fn room_world() -> BrickMapBuffers {
+    BrickMapBuilder::build_full(&room_grid()).buffers().clone()
+  }
+
+  /// room 单测共用光池：太阳 -Y 强度 2
+  fn room_theme() -> LightingTheme {
+    LightingTheme {
+      sun: Some(DirLightCfg {
+        dir: [0.0, -1.0, 0.0],
+        angular_radius_deg: 0.0,
+        color: [1.0, 1.0, 1.0],
+        intensity: 2.0,
+      }),
+      ambient: [0.1, 0.1, 0.1],
+      exposure: 1.0,
+      sky: None,
+    }
   }
 }
