@@ -2470,6 +2470,7 @@ fn prepare_dda_bind_groups(
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
   ddgi_gpu: Option<Res<crate::ddgi::DdgiGpu>>,
+  dbg: Option<Res<crate::ddgi::DdgiDebugSettings>>,
   lighting: Option<Res<LightingTheme>>,
   light_gpu: Option<ResMut<LightPoolGpu>>,
   render_device: Res<RenderDevice>,
@@ -2496,10 +2497,12 @@ fn prepare_dda_bind_groups(
   };
 
   let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
-  // probe 可视化参数：总探针数 = base(id_base 层对齐) + 4 级联×4096；方块边长 3px
+  // probe 可视化参数：总探针数 = base(id_base 层对齐) + 4 级联×4096；方块边长 3px；
+  // z = 层级选择（0=All, 1..=4=LOD0~3 级联, 5=Base）、w = id_base（id<id_base → base 探针）
   if let Some(g) = ddgi_gpu.as_ref() {
     let total = g.id_base + 4 * 4096;
-    view.probe_viz_params = Vec4::new(total as f32, 3.0, 0.0, 0.0);
+    let sel = dbg.map_or(0.0, |d| d.probe_viz_lod).clamp(0.0, 5.0);
+    view.probe_viz_params = Vec4::new(total as f32, 3.0, sel, g.id_base as f32);
   }
   let mut u = UniformBuffer::from(view);
   u.write_buffer(&render_device, &queue);
@@ -2689,7 +2692,8 @@ pub(crate) fn dispatch_dda(
   }
 
   // ---- probe 可视化 pass：探针位置画黄色方块（toggle 开时执行）----
-  // 每探针 1 线程，投影到屏幕空间画 dot_size×dot_size 方块；不做深度测试。
+  // 每探针 1 线程：活跃过滤（positions.w）+ 视锥剔除 + 遮挡射线（复用
+  // trace_scene，本 pass 已绑定全部 bind group）→ 仅屏幕内可见探针画方块。
   if dbg.map_or(false, |d| d.probe_viz) {
     if let Some(gpu) = gpu.as_ref() {
       if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {

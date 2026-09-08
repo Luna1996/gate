@@ -196,12 +196,11 @@ pub(crate) fn probe_click_inspect(
     info!("PROBE INSPECT → 无可用探针（ProbeGrid.positions 为空）");
     return;
   };
-  // 反查 cell 坐标：probe 在 cell 内部，cell_min = floor(pos/cell_size)，cell16 = (pos/16 - origin)
-  let ddgi_cell = 16.0_f32;
-  let cell16 = IVec3::new(
-    ((probe_pos.x / ddgi_cell) as i32) - pg.grid_origin.x,
-    ((probe_pos.y / ddgi_cell) as i32) - pg.grid_origin.y,
-    ((probe_pos.z / ddgi_cell) as i32) - pg.grid_origin.z,
+  // 反查 cell 坐标：probe 在 cell 内部，cell_rel = (pos/cell_size - origin)（base-cell 单位）
+  let cell_rel = IVec3::new(
+    ((probe_pos.x / pg.cell_size as f32) as i32) - pg.grid_origin.x,
+    ((probe_pos.y / pg.cell_size as f32) as i32) - pg.grid_origin.y,
+    ((probe_pos.z / pg.cell_size as f32) as i32) - pg.grid_origin.z,
   );
   let cell_dims = pg.grid_dims.as_ivec3();
   let cell_size = pg.cell_size as f32;
@@ -213,7 +212,7 @@ pub(crate) fn probe_click_inspect(
         if dx == 0 && dy == 0 && dz == 0 {
           continue;
         }
-        let n = cell16 + IVec3::new(dx, dy, dz) * (pg.cell_size / 16);
+        let n = cell_rel + IVec3::new(dx, dy, dz);
         if n.x < 0
           || n.y < 0
           || n.z < 0
@@ -231,7 +230,7 @@ pub(crate) fn probe_click_inspect(
     }
   }
   info!(
-    "PROBE INSPECT → hit=({:.1},{:.1},{:.1}) probe_id={} probe_pos=({:.1},{:.1},{:.1}) dist={:.2} cell16=({},{},{}) cell_size={} neighbors={}/26",
+    "PROBE INSPECT → hit=({:.1},{:.1},{:.1}) probe_id={} probe_pos=({:.1},{:.1},{:.1}) dist={:.2} cell_rel=({},{},{}) cell_size={} neighbors={}/26",
     p.x,
     p.y,
     p.z,
@@ -240,17 +239,17 @@ pub(crate) fn probe_click_inspect(
     probe_pos.y,
     probe_pos.z,
     dist,
-    cell16.x,
-    cell16.y,
-    cell16.z,
+    cell_rel.x,
+    cell_rel.y,
+    cell_rel.z,
     cell_size,
     neighbor_count,
   );
-  let cell_li = (cell16.x + cell16.y * cell_dims.x + cell16.z * cell_dims.x * cell_dims.y) as usize;
+  let cell_li = (cell_rel.x + cell_rel.y * cell_dims.x + cell_rel.z * cell_dims.x * cell_dims.y) as usize;
   if cell_li < pg.cell_index.len() {
     info!(
       "PROBE INSPECT → cell[{},{},{}].probe_id = {} (匹配 probe_id={})",
-      cell16.x, cell16.y, cell16.z, pg.cell_index[cell_li], probe_id,
+      cell_rel.x, cell_rel.y, cell_rel.z, pg.cell_index[cell_li], probe_id,
     );
   }
 }

@@ -84,6 +84,18 @@ struct DdgiGainValueLabel;
 #[derive(Component)]
 struct DdgiProbeVizToggle;
 
+/// Probe Viz 层级滑杆标记（写 DdgiDebugSettings.probe_viz_lod）
+#[derive(Component)]
+struct DdgiProbeVizLodSlider;
+
+/// Probe Viz 层级数值标签（滑杆右侧，实时显示当前层级名）
+#[derive(Component)]
+struct DdgiProbeVizLodValueLabel;
+
+/// Probe Viz 层级名（滑杆 stop 序：0=All, 1..=4=LOD0~3, 5=Base；
+/// Douglas #23 = base 烘焙网格 + 4 LOD，视频切换的 LOD 0~3 即 4 个下采样级）
+const DDGI_PROBE_VIZ_LODS: [&str; 6] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3", "Base"];
+
 /// 调试模式名（按钮文本 + 日志用）
 const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
 
@@ -301,6 +313,54 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           );
           cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
         });
+        // ---- 行 9：Probe Viz 层级滑杆（0..=5 步进 1：All / LOD0~3 / Base；
+        //      写 DdgiDebugSettings.probe_viz_lod）----
+        let c9 = grid_cell(&ctx, g, PanelSurface::Card);
+        g.world_mut()
+          .entity_mut(c9)
+          .insert(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: px(8.0),
+            align_items: AlignItems::Center,
+            padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)),
+            ..default()
+          })
+          .with_children(|cell| {
+            label(
+              &ctx,
+              cell,
+              LabelConfig {
+                text: "LOD".into(),
+                style: LabelStyle::Muted,
+                ..default()
+              },
+            );
+            let s = slider(
+              &ctx,
+              cell,
+              SliderConfig {
+                min: 0.0,
+                max: 5.0,
+                value: 0.0,
+                step: Some(1.0),
+              },
+            );
+            cell.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
+            // 右侧实时层级名标签
+            let vl = label(
+              &ctx,
+              cell,
+              LabelConfig {
+                text: DDGI_PROBE_VIZ_LODS[0].into(),
+                style: LabelStyle::Muted,
+                ..default()
+              },
+            );
+            cell
+              .world_mut()
+              .entity_mut(*vl)
+              .insert(DdgiProbeVizLodValueLabel);
+          });
       });
       // grid 默认 width: Percent(100) → 绝对定位根下改为收缩到内容宽（shrink-to-fit）
       if let Some(mut n) = root.world_mut().get_mut::<Node>(*g) {
@@ -387,6 +447,23 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       dbg.gain = ev.value;
       if let Ok(mut t) = q_label.single_mut() {
         t.0 = format!("{:.1}", ev.value);
+      }
+    },
+  );
+
+  // Probe Viz 层级滑杆 → 写 DdgiDebugSettings.probe_viz_lod + 刷新右侧层级名标签
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<DdgiProbeVizLodSlider>>,
+     mut q_label: Query<&mut Text, With<DdgiProbeVizLodValueLabel>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      dbg.probe_viz_lod = ev.value;
+      if let Ok(mut t) = q_label.single_mut() {
+        let i = (ev.value.round() as usize).min(DDGI_PROBE_VIZ_LODS.len() - 1);
+        t.0 = DDGI_PROBE_VIZ_LODS[i].into();
       }
     },
   );

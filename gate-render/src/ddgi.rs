@@ -16,7 +16,7 @@
 //! ## WGSL 对齐表（M3 落地 ddgi WGSL 时逐字镜像；改一处必改两处）
 //! | Rust | WGSL（计划名） | 值 | 语义 |
 //! |---|---|---|---|
-//! | DDGI_CELL | DDGI_CELL | 16 | cell 边长（fine 体素） |
+//! | DDGI_CELL | DDGI_CELL | 16 | cell 边长（fine 体素）= level 2 brick |
 //! | IRRADIANCE_TEXELS | IRRADIANCE_TEXELS | 8 | irr oct 边长 |
 //! | DEPTH_TEXELS | DEPTH_TEXELS | 16 | depth oct 边长 |
 //! | PROBES_PER_LAYER_AXIS | PROBES_PER_LAYER_AXIS | 16 | 层内单轴探针数 |
@@ -25,19 +25,23 @@
 //! | DDGI_CASCADE_CELL_SIZES | CASCADE_CELL_SIZES | 16/32/64/128/256 | 各级 cell 边长（[base,LOD1-4]） |
 //! | DDGI_AGE_MAX | DDGI_AGE_MAX | 255 | age 饱和值 |
 //! | META_OFFSET_BITS / META_AGE_SHIFT / META_OFFSET_QUANT | 同名 | 5 / 15 / 32 | 元数据位域 |
-//! | DDGI_NORMAL_BIAS / DDGI_DEPTH_BIAS | 同名 | 0.2 / 4.0 | 采样权重 |
+//! | DDGI_NORMAL_BIAS / DDGI_DEPTH_BIAS | 同名 | 0.2 / 16.0 | 采样权重 |
 //! | PROBE_T_MAX | PROBE_T_MAX | 8192.0 | 射线远距 |
 
 use bevy::render::render_resource::ShaderType;
 use glam::{IVec3, UVec3, Vec3, Vec4};
 
-use gate_voxel::{BrickState, Volumes, VoxelCoord};
+use gate_voxel::{BrickState, LEVEL_EXTENT, Volumes, VoxelCoord};
 
 // ============================================================================
 // 常量（WGSL 侧逐字对齐）
 // ============================================================================
 
-/// 探针 cell 边长（fine 体素）= 16³ = level 2 brick（Douglas #23 / Rohacek §3.1）
+/// 探针 cell 边长（fine 体素）= 16³ = level 2 brick = **Douglas #23 LOD=0 绝对
+/// 间距**（2026-09-08 活跃过滤 + 遮挡剔除 viz 目验定案：64³ 间距 = Douglas
+/// LOD=1——比他稀 4×；最初"16³ 太密"实为 viz 画了全部探针（含天空远场）的
+/// 语义偏差，活跃/遮挡过滤后 16³ 才是他的真实密度。放置规则 = cell 树层级
+/// BFS 最大空叶 + LOD 下采样）
 pub const DDGI_CELL: i32 = 16;
 /// cell 对应树层级（LEVEL_EXTENT[2] = 16）
 pub const DDGI_CELL_LEVEL: u8 = 2;
@@ -61,7 +65,7 @@ pub const DDGI_PROBE_RAYS_MIN: u32 = 32;
 pub const DDGI_PROBE_BUDGET: u32 = 4096;
 /// 漏光 chevron 半宽（fine 单位）＝ 所在域 cell × 0.25；本常量 = base 域（cell 16）
 /// 参考值。WGSL ddgi_sample_dom 已改为按采样域逐域计算（级联 32/64/128/256 →
-/// 8/16/32/64），固定 4 对粗级联相对过窄会误剔远角合法探针（网格状黑块）：
+/// 8/16/32/64），固定值对粗级联相对过窄会误剔远角合法探针（网格状黑块）：
 /// wd = clamp((depth_texel − probe_to_point) / bias + 0.5, 0, 1)
 pub const DDGI_DEPTH_BIAS: f32 = DDGI_CELL as f32 * 0.25;
 /// cell_index 无探针哨兵
@@ -89,7 +93,8 @@ pub const DEPTH_LAYER_TEXELS: u32 = PROBES_PER_LAYER_AXIS * DEPTH_TEXELS;
 pub const DDGI_LODS: u32 = 4;
 /// age 上限（u8 饱和；reusable 继承、can_skip_update 分摊依据）
 pub const DDGI_AGE_MAX: u32 = 255;
-/// 元数据 packed u32 位域（gate 版：offset 量化 ×2 → 5 bit/轴精确表达 .5 半体素中心）
+/// 元数据 packed u32 位域（Douglas #23 截图逐字：offset 量化 ×2 → 5 bit/轴，
+/// [0,32) 半体素精度恰覆盖 16³ cell）
 /// layout: [0..5) offset_x | [5..10) offset_y | [10..15) offset_z | [15..23) age | [23..32) 保留
 pub const META_OFFSET_BITS: u32 = 5;
 pub const META_AGE_SHIFT: u32 = META_OFFSET_BITS * 3;
@@ -140,7 +145,7 @@ pub fn depth_texel_coord(probe_id: u32, tx: u32, ty: u32) -> (u32, u32, u32) {
   )
 }
 
-/// 探针元数据打包：offset（cell 内 fine ×2，各 5 bit）+ age（8 bit）
+/// 探针元数据打包：offset（cell 内 fine ×2，各 7 bit）+ age（8 bit）
 ///
 /// Douglas sort.glsl `ddgi_probe_new(normalized_offset, age).offset_age` 的 gate 等价：
 /// 归一化量化换成分辨率无损的定点（BFS 空叶中心含 .5 半体素，×2 后恰为整数）。
@@ -154,7 +159,7 @@ pub fn pack_probe_meta(offset_fine2: [u32; 3], age: u32) -> u32 {
     | age << META_AGE_SHIFT
 }
 
-/// 解包 (offset_fine2, age)（age 钳 8 bit：[23..32) 保留位忽略，对齐 WGSL bitfieldExtract）
+/// 解包 (offset_fine2, age)（age 钳 8 bit：[29..32) 保留位忽略，对齐 WGSL bitfieldExtract）
 #[inline]
 pub fn unpack_probe_meta(packed: u32) -> ([u32; 3], u32) {
   let mask = (1u32 << META_OFFSET_BITS) - 1;
@@ -168,8 +173,8 @@ pub fn unpack_probe_meta(packed: u32) -> ([u32; 3], u32) {
   )
 }
 
-/// 探针世界位置 → cell 内 offset 量化值（32 quanta/cell；base 16³ cell = ×2 定点，
-/// BFS 空叶中心含 .5 半体素 → 精确；级联 cell 分辨率 = cell_size/32 fine）
+/// 探针世界位置 → cell 内 offset 量化值（128 quanta/cell；base 64³ cell = ×2 定点，
+/// BFS 空叶中心含 .5 半体素 → 精确；级联 cell 分辨率 = cell_size/128 fine）
 #[inline]
 pub fn quantize_offset_sized(probe_world: Vec3, cell_min: IVec3, cell_size: i32) -> [u32; 3] {
   let rel = probe_world - cell_min.as_vec3();
@@ -179,7 +184,7 @@ pub fn quantize_offset_sized(probe_world: Vec3, cell_min: IVec3, cell_size: i32)
   [q.x as u32, q.y as u32, q.z as u32]
 }
 
-/// base 版（cell_size=16，×2 定点）
+/// base 版（cell_size=64，×2 定点）
 #[inline]
 pub fn quantize_offset(probe_world: Vec3, cell_min: IVec3) -> [u32; 3] {
   quantize_offset_sized(probe_world, cell_min, DDGI_CELL)
@@ -206,8 +211,8 @@ pub fn meta_texel_linear(layer: u32, x: u32, y: u32) -> usize {
   (layer * PROBES_PER_LAYER + y * PROBES_PER_LAYER_AXIS + x) as usize
 }
 
-/// packed offset_fine2 → 探针世界坐标（cell_min + offset×cell_size/32；
-/// base 16 = ×0.5 半体素无损；级联 cell 采样侧按本级 cell_size 解码）
+/// packed offset_fine2 → 探针世界坐标（cell_min + offset×cell_size/128；
+/// base 64 = ×0.5 半体素无损；级联 cell 采样侧按本级 cell_size 解码）
 #[inline]
 pub fn offset_to_world_sized(offset_fine2: [u32; 3], cell_min: IVec3, cell_size: i32) -> Vec3 {
   cell_min.as_vec3()
@@ -218,7 +223,7 @@ pub fn offset_to_world_sized(offset_fine2: [u32; 3], cell_min: IVec3, cell_size:
     ) * (cell_size as f32 / META_OFFSET_QUANT)
 }
 
-/// base 版（cell_size=16）
+/// base 版（cell_size=64）
 #[inline]
 pub fn offset_to_world(offset_fine2: [u32; 3], cell_min: IVec3) -> Vec3 {
   offset_to_world_sized(offset_fine2, cell_min, DDGI_CELL)
@@ -251,15 +256,15 @@ pub fn build_meta_texture_data(pg: &ProbeGrid) -> Vec<u32> {
 }
 
 // ============================================================================
-// 探针烘焙（Rohacek §3.1 BFS 最大空叶 + D1 全 cell 覆盖）
+// 探针烘焙（Douglas #23：cell 树层级 BFS 最大空叶 + D1 全 cell 覆盖）
 // ============================================================================
 
 /// 探针烘焙结果（CPU 真相源 → GPU 打包入口；base 与级联级共用）
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProbeGrid {
-  /// 采样网格原点（**16-cell 全局坐标**；级联级须 cell_size 对齐）
+  /// 采样网格原点（**base-cell 全局坐标**，DDGI_CELL 单位；级联级须 cell_size 对齐）
   pub grid_origin: IVec3,
-  /// 采样网格 dims（**本级 cell 单位**；base cell_size=16 时与 16-cell 同构）
+  /// 采样网格 dims（**本级 cell 单位**；base cell_size=DDGI_CELL 时与 base-cell 同构）
   pub grid_dims: UVec3,
   /// 本级 cell 尺寸（fine 体素）：base 16，级联 32/64/128/256
   pub cell_size: i32,
@@ -268,6 +273,11 @@ pub struct ProbeGrid {
   pub cell_index: Vec<u32>,
   /// 探针位置（世界 fine 坐标；下标 = probe id）
   pub positions: Vec<Vec3>,
+  /// 活跃位（id 对齐 positions；Douglas #23 近表面语义 = 本 cell 或 6 面邻接
+  /// cell 含体素，烘焙期 CPU 判定）：probe viz 只画活跃探针（positions.w 携带）；
+  /// cast 预算剔除仍由每帧 GPU ddgi_active 判定（多一条非网格对齐物体 bbox
+  /// 条件，烘焙期不可知，故烘焙位偏保守 = 只多不少）
+  pub active: Vec<bool>,
 }
 
 impl Default for ProbeGrid {
@@ -278,6 +288,7 @@ impl Default for ProbeGrid {
       cell_size: DDGI_CELL,
       cell_index: Vec::new(),
       positions: Vec::new(),
+      active: Vec::new(),
     }
   }
 }
@@ -289,9 +300,9 @@ impl ProbeGrid {
     (rel.x + rel.y * self.grid_dims.x + rel.z * self.grid_dims.x * self.grid_dims.y) as usize
   }
 
-  /// 本级 cell 偏移 → 16-cell 全局坐标（cell_size/16 步长）
+  /// 本级 cell 偏移 → base-cell 全局坐标（cell_size/DDGI_CELL 步长）
   #[inline]
-  pub fn cell16(&self, rel: UVec3) -> IVec3 {
+  pub fn cell_base(&self, rel: UVec3) -> IVec3 {
     let step = self.cell_size / DDGI_CELL;
     self.grid_origin + IVec3::new(rel.x as i32, rel.y as i32, rel.z as i32) * step
   }
@@ -299,17 +310,18 @@ impl ProbeGrid {
   /// 本级 cell 的 fine 体素最小角
   #[inline]
   pub fn cell_min_voxel(&self, rel: UVec3) -> IVec3 {
-    self.cell16(rel) * DDGI_CELL
+    self.cell_base(rel) * DDGI_CELL
   }
 }
 
 /// 烘焙主世界探针网格（当前只覆盖 vols.list[0]；物体互反射探针后置）
 ///
 /// D1 全 cell 覆盖：域 = chunk bbox cell 域，已存在 chunk 的全部非 Solid cell
-/// 均放探针（Air 居中 / Mixed BFS 偏移 / Solid 无）。纯空气 cell 一律有探针，
-/// 活跃性由每帧 ddgi_active 判定剔除（D2），烘焙期不再筛活跃壳。
+/// 均放探针（Air 居中 / Mixed BFS 偏移 / Solid 及多色全实无）。纯空气 cell 一律有探针；
+/// 烘焙期并行记录活跃位（Douglas 近表面语义，probe viz 过滤用），cast 预算
+/// 剔除仍由每帧 ddgi_active 判定（D2，多 object bbox 条件）。
 /// 域内未分配 chunk 的 cell 留 NO_PROBE（从未有体素数据的远场，表面不可达）。
-/// 稀疏遍历：每个已存在 chunk 迭代其 16³ cell 区，不扫 bbox 全空间。
+/// 稀疏遍历：每个已存在 chunk 迭代其 4³ cell 区，不扫 bbox 全空间。
 pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
   let grid = vols.main();
   let chunks: Vec<IVec3> = grid.chunk_coords().map(|c| c.0).collect();
@@ -326,6 +338,7 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
     cell_size: DDGI_CELL,
     cell_index: vec![NO_PROBE; dims.x as usize * dims.y as usize * dims.z as usize],
     positions: Vec::new(),
+    active: Vec::new(),
   };
 
   for chunk in &chunks {
@@ -335,17 +348,26 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
           let cell = chunk * CELLS_PER_CHUNK + IVec3::new(rx, ry, rz);
           let rel = (cell - lo).as_uvec3();
           let li = pg.cell_linear(rel);
-          let state =
-            grid.get_brick_state(VoxelCoord::from_ivec3(cell * DDGI_CELL), DDGI_CELL_LEVEL);
+          let cell_min = cell * DDGI_CELL;
+          let state = grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), DDGI_CELL_LEVEL);
           // 全实心 cell 无探针（Douglas：全满 → 无探针）
           if matches!(state, BrickState::Solid(_)) {
             continue;
           }
-          let Some(pos) = probe_position(grid, cell * DDGI_CELL, state) else {
-            continue; // Mixed 但中心 ±4 盒内无空体素：无探针
+          // Air → cell 正中；Mixed → 树层级 BFS 最大空叶（#23 字幕：空 cell 居中 /
+          // 半满推向空边 / 全满不放）。gate 树 Mixed 是双义的（空实混合 / 多色全实，
+          // 见 BrickState 文档）：多色全实 cell 沿树无空叶 → None = DDGI「全满」
+          // （palette 不参与）→ 无探针，与 Solid 同途。
+          let Some(pos) = (match state {
+            BrickState::Air => Some(cell_min.as_vec3() + Vec3::splat(DDGI_CELL as f32 / 2.0)),
+            _ => probe_position_in_cell(grid, cell_min, DDGI_CELL_LEVEL).map(|(_, p)| p),
+          }) else {
+            continue;
           };
           pg.cell_index[li] = pg.positions.len() as u32;
           pg.positions.push(pos);
+          pg.active
+            .push(probe_is_active(grid, cell_min, DDGI_CELL));
         }
       }
     }
@@ -353,75 +375,122 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
   pg
 }
 
-/// 探针位置：Air 居中 / Mixed 沿树 BFS 找靠中心最大空叶（Rohacek §3.1）
+/// 探针位置 + 所在空叶尺寸（Douglas #23 bake 逐字映射）：从 cell 所在树层级出发，
+/// 沿**真实树层级**（4³ 细分，LEVEL_EXTENT）BFS 向下找「最大空叶」，探针放叶中心；
+/// 同层空叶取靠 cell 中心最近（严格更小才替换 → 平局取遍历序首个 = 靠中心优先遍历）；
+/// 全满 → None。返回 (空叶边长 fine, 叶中心)——叶尺寸参与级联父级择优（大者优先）。
 ///
-/// BFS 序 = 空块由大到小：16³ cell 全空 → cell 中心；4³ 空子砖（level 3）
-/// 取靠 cell 中心最近；再无则中心 ±4 盒内最近 1³ 空体素；全满 → None。
-fn probe_position(
+/// gate 树语义：uniform（Air）节点即叶 → 任一层发现 Air 子块即停（空叶由大到小）；
+/// 末层（1³ 体素）扫上层 Mixed 4³ 砖的全部体素取最近空体素。Mixed cell 沿树必有
+/// 空叶（子块状态不全同 → 必含 Air 分支），恒 Some。
+fn probe_position_in_cell(
   grid: &gate_voxel::VolumeGrid,
   cell_min: IVec3,
-  state: BrickState,
-) -> Option<Vec3> {
-  probe_position_leaf(grid, cell_min, state).map(|(_, p)| p)
-}
-
-/// [`probe_position`] 带「探针所处空叶尺寸」（Air=16 / 4³ 空砖=4 / 1³ 兜底=1）。
-/// 级联推广的下钻择优依赖真实叶尺寸（空叶大者优先），故单独暴露。
-fn probe_position_leaf(
-  grid: &gate_voxel::VolumeGrid,
-  cell_min: IVec3,
-  state: BrickState,
+  level: u8,
 ) -> Option<(i32, Vec3)> {
-  let center_f = cell_min.as_vec3() + Vec3::splat(DDGI_CELL as f32 / 2.0);
-  match state {
-    BrickState::Air => Some((DDGI_CELL, center_f)),
-    BrickState::Solid(_) => None,
-    BrickState::Mixed => {
-      // BFS 层 1：4³ 空子砖，取靠 cell 中心最近（严格更小才替换 → 平局取遍历序首个）
-      let mut best: Option<(f32, Vec3)> = None;
+  let center = cell_min.as_vec3() + Vec3::splat(LEVEL_EXTENT[level as usize] as f32 / 2.0);
+  // parents = 当前层待下钻的 Mixed 节点（首层 = cell 本身；caller 已排除 Solid）
+  let mut parents: Vec<IVec3> = vec![cell_min];
+  for lvl in (level + 1)..=4 {
+    let ext = LEVEL_EXTENT[lvl as usize];
+    let half = ext as f32 / 2.0;
+    let mut best: Option<(f32, Vec3)> = None;
+    let mut mixed: Vec<IVec3> = Vec::new();
+    for p in &parents {
       for k in 0..4 {
         for j in 0..4 {
           for i in 0..4 {
-            let sub_min = cell_min + IVec3::new(i, j, k) * 4;
-            if grid.get_brick_state(VoxelCoord::from_ivec3(sub_min), 3) != BrickState::Air {
-              continue;
-            }
-            let c = sub_min.as_vec3() + Vec3::splat(2.0);
-            let d2 = c.distance_squared(center_f);
-            if best.is_none_or(|(bd, _)| d2 < bd) {
-              best = Some((d2, c));
-            }
-          }
-        }
-      }
-      if best.is_some() {
-        return best.map(|(_, c)| (4, c));
-      }
-      // BFS 层 2：中心 ±4 盒内最近 1³ 空体素（薄墙 cell 兜底）
-      let center_i = cell_min + IVec3::splat(DDGI_CELL / 2);
-      let mut best: Option<(f32, Vec3)> = None;
-      for dz in -4..=4 {
-        for dy in -4..=4 {
-          for dx in -4..=4 {
-            let v = center_i + IVec3::new(dx, dy, dz);
-            if !is_air_voxel(grid, VoxelCoord::from_ivec3(v)) {
-              continue;
-            }
-            let d2 = (v.as_vec3() + Vec3::splat(0.5)).distance_squared(center_f);
-            if best.is_none_or(|(bd, _)| d2 < bd) {
-              best = Some((d2, v.as_vec3() + Vec3::splat(0.5)));
+            let sub = *p + IVec3::new(i, j, k) * ext;
+            if lvl == 4 {
+              // 末层：Mixed 4³ 砖的体素（Mixed 必含空体素）
+              if !is_air_voxel(grid, VoxelCoord::from_ivec3(sub)) {
+                continue;
+              }
+              let c = sub.as_vec3() + Vec3::splat(0.5);
+              let d2 = c.distance_squared(center);
+              if best.is_none_or(|(bd, _)| d2 < bd) {
+                best = Some((d2, c));
+              }
+            } else {
+              match grid.get_brick_state(VoxelCoord::from_ivec3(sub), lvl) {
+                BrickState::Air => {
+                  let c = sub.as_vec3() + Vec3::splat(half);
+                  let d2 = c.distance_squared(center);
+                  if best.is_none_or(|(bd, _)| d2 < bd) {
+                    best = Some((d2, c));
+                  }
+                }
+                BrickState::Mixed => mixed.push(sub),
+                BrickState::Solid(_) => {}
+              }
             }
           }
         }
       }
-      best.map(|(_, c)| (1, c))
     }
+    if best.is_some() || lvl == 4 {
+      return best.map(|(_, c)| (ext, c));
+    }
+    parents = mixed;
   }
+  None
 }
 
 #[inline]
 fn is_air_voxel(grid: &gate_voxel::VolumeGrid, v: VoxelCoord) -> bool {
   matches!(grid.get_voxel(v), None | Some(0))
+}
+
+/// 区域是否含体素（任一非 Air brick）：**从最粗到最细**取首个整除 cell_size 的
+/// 对齐树层级扫描（256→64→16→4→1），查询数最少（16→1 次 level2 / 32→8 次
+/// level2 / 64→1 次 level1 / 128→8 次 level1 / 256→1 次 level0）。cell 原点
+/// 按 cell_size 对齐，而层级砖粒度整除 cell_size → 扫描坐标天然对齐。
+/// （2026-09-08 白屏卡死根因：曾写成 (0..=4).rev() 细到粗——128³ cell 逐体素
+/// 扫 200 万次/区域、1024 级联 30 万亿次，首帧烘焙永久阻塞主线程）
+fn region_has_voxels(grid: &gate_voxel::VolumeGrid, min: IVec3, size: i32) -> bool {
+  for lvl in 0..=4 {
+    let ext = LEVEL_EXTENT[lvl as usize];
+    if size % ext != 0 {
+      continue;
+    }
+    let n = size / ext;
+    for dz in 0..n {
+      for dy in 0..n {
+        for dx in 0..n {
+          let p = min + IVec3::new(dx, dy, dz) * ext;
+          if !matches!(
+            grid.get_brick_state(VoxelCoord::from_ivec3(p), lvl),
+            BrickState::Air
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+  false
+}
+
+/// 探针活跃位（Douglas #23 语义逐字）：本 cell 或 6 面邻接 cell 含体素 → 活跃。
+/// 「附近无表面的探针其光照数据不会被用到」——probe viz 只画活跃探针，与
+/// WGSL ddgi_active 的 probe_near_surface 前两条件同源（第三条 object bbox
+/// 仅运行时可知，烘焙期保守忽略）。只查面邻接不查角邻接（字幕：
+/// "left, right, down, up, back, front"）。
+pub fn probe_is_active(grid: &gate_voxel::VolumeGrid, cell_min: IVec3, cell_size: i32) -> bool {
+  if region_has_voxels(grid, cell_min, cell_size) {
+    return true;
+  }
+  [
+    IVec3::X,
+    IVec3::NEG_X,
+    IVec3::Y,
+    IVec3::NEG_Y,
+    IVec3::Z,
+    IVec3::NEG_Z,
+  ]
+  .iter()
+  .any(|d| region_has_voxels(grid, cell_min + *d * cell_size, cell_size))
 }
 
 #[inline]
@@ -445,9 +514,11 @@ fn chunk_bbox(mut it: impl Iterator<Item = IVec3>) -> Option<(IVec3, IVec3)> {
 /// 多色实心也算满，palette 不参与）；否则 Mixed。
 pub fn cell_state_at(grid: &gate_voxel::VolumeGrid, cell_min: IVec3, cell_size: i32) -> BrickState {
   match cell_size {
+    // 树层级直查：256 = level 0 brick、64 = level 1、16 = level 2（DDGI_CELL）
     256 => grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), 0),
     64 => grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), 1),
     16 => grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), DDGI_CELL_LEVEL),
+    // 非树层级（32/128）：halves 32→16 / 128→64 必达树层级
     32 | 128 => {
       let half = cell_size / 2;
       let (mut all_air, mut all_solid) = (true, true);
@@ -503,7 +574,7 @@ fn probe_leaf_sized(
     BrickState::Air => Some((cell_size, center)),
     BrickState::Solid(_) => None,
     BrickState::Mixed if cell_size == DDGI_CELL => {
-      probe_position_leaf(grid, cell_min, BrickState::Mixed)
+      probe_position_in_cell(grid, cell_min, DDGI_CELL_LEVEL)
     }
     BrickState::Mixed => {
       let half = cell_size / 2;
@@ -574,9 +645,10 @@ fn bake_cascade_cell(
 
 /// 烘焙一个级联级探针网格（D9：cell 尺寸 ×2 递增的相机滚动级 / base 世界级）。
 ///
-/// `origin_cell` 为 **16-cell 全局坐标**（级联级须 cell_size 对齐，M4-3 滚动步进）；
+/// `origin_cell` 为 **base-cell 全局坐标**（级联级须 cell_size 对齐，M4-3 滚动步进）；
 /// `dims_cells` 为本级 cell 单位（滚动级 = PROBES_PER_CASCADE_AXIS³ = 16³）。
-/// 全 cell 覆盖语义同 base（D1）：非 Solid cell 一律放探针，活跃性交给 ddgi_active。
+/// 全 cell 覆盖语义同 base（D1）：非 Solid cell 一律放探针，活跃位同 base 烘焙
+/// 期记录（probe viz 过滤用），cast 剔除交给每帧 ddgi_active。
 ///
 /// **slot 身份 id**（M4-3 目验修订）：级联探针 id = 线性 cell 下标（base 仍是
 /// 扫描序）→ meta/irr/depth texel 布局 = cell 网格本身，GPU shifted copy 的
@@ -596,6 +668,7 @@ pub fn bake_cascade_grid(
     cell_size,
     cell_index: vec![NO_PROBE; total],
     positions: vec![Vec3::ZERO; total],
+    active: vec![false; total],
   };
   for rz in 0..dims_cells.z {
     for ry in 0..dims_cells.y {
@@ -607,6 +680,7 @@ pub fn bake_cascade_grid(
         };
         pg.cell_index[li] = li as u32;
         pg.positions[li] = pos;
+        pg.active[li] = probe_is_active(grid, pg.cell_min_voxel(rel), cell_size);
       }
     }
   }
@@ -614,8 +688,7 @@ pub fn bake_cascade_grid(
 }
 
 /// 滚动增量烘焙：重叠 cell 直接搬运旧 slot id/探针位置（零下钻），仅滚入的
-/// 新列带现场 `bake_cascade_cell`——滚动帧 CPU 成本从全域 16³ 下钻降到一个
-/// 列带（~16×，消除滚动帧秒级卡顿）。旧重叠 cell 原本 NO_PROBE（Solid/无
+/// 新列带现场 `bake_cascade_cell`——滚动帧 CPU 成本从全域 16³ 下钻降到一个/// 列带（~16×，消除滚动帧秒级卡顿）。旧重叠 cell 原本 NO_PROBE（Solid/无
 /// 空叶）且世界未变 → 维持 NO_PROBE（确定性一致；世界编辑走全量重烘）。
 pub fn bake_cascade_grid_shifted(
   vols: &Volumes,
@@ -633,6 +706,7 @@ pub fn bake_cascade_grid_shifted(
     cell_size,
     cell_index: vec![NO_PROBE; total],
     positions: vec![Vec3::ZERO; total],
+    active: vec![false; total],
   };
   let old_dims = old.grid_dims.as_ivec3();
   for rz in 0..dims_cells.z {
@@ -646,6 +720,7 @@ pub fn bake_cascade_grid_shifted(
           if old.cell_index[old_li] != NO_PROBE {
             pg.cell_index[li] = li as u32;
             pg.positions[li] = old.positions[old_li];
+            pg.active[li] = old.active[old_li];
           }
           continue;
         }
@@ -654,6 +729,7 @@ pub fn bake_cascade_grid_shifted(
         };
         pg.cell_index[li] = li as u32;
         pg.positions[li] = pos;
+        pg.active[li] = probe_is_active(grid, pg.cell_min_voxel(rel), cell_size);
       }
     }
   }
@@ -661,7 +737,7 @@ pub fn bake_cascade_grid_shifted(
 }
 
 /// D4 outside_lower_grid：本 LOD cell 是否在更细网格覆盖外（true = 归本 LOD 管）。
-/// 全部区间为 16-cell 全局坐标：本 cell [lo, hi) 与更细域 [fo, fo+fd) 无重叠 → outside。
+/// 全部区间为 base-cell（64³）全局坐标：本 cell [lo, hi) 与更细域 [fo, fo+fd) 无重叠 → outside。
 /// 级联滚动步进保证域边缘 cell 对齐（M4-3），部分重叠 cell 归更细级（保守划分）。
 /// **WGSL ddgi_active 调用点先把 finer 域向内收缩 2 本级 cell（光晕）再传入**：
 /// 否则 finer 窗口边缘内 1 cell 的本级探针零数据（age=0 永不更新），而采样端
@@ -682,9 +758,9 @@ pub fn outside_lower_grid(lo: IVec3, hi: IVec3, finer_origin: IVec3, finer_dims:
 // M4-3 级联滚动（CPU 侧滚动数学；WGSL 侧 reuse 继承已在 ddgi_active）
 // ============================================================================
 
-/// 相机 fine 坐标 → 级联滚动原点（**16-cell 全局坐标**，cell_size 对齐）。
+/// 相机 fine 坐标 → 级联滚动原点（**base-cell 全局坐标**，cell_size 对齐）。
 /// 窗口以相机所在 cell 为中心对称展开（PROBES_PER_CASCADE_AXIS³）：
-/// origin_cell = (⌊cam/cell_size⌋ − half) × cell_size / 16。
+/// origin_cell = (⌊cam/cell_size⌋ − half) × cell_size / DDGI_CELL。
 /// 相机移动不足一个 cell 时原点不动（cell 对齐步进 = 天然 reuse 分带）。
 #[inline]
 pub fn cascade_scroll_origin(cam_fine: Vec3, cell_size: i32) -> IVec3 {
@@ -718,11 +794,11 @@ pub fn scroll_reuse_bounds(
 /// GPU 接线（positions/cell_index/meta 上传 + irr/depth 分层 shifted copy）消费
 /// 本结构快照。级联 id = slot（线性 cell 下标），texel 布局 = cell 网格。
 pub struct CascadeManager {
-  /// 级联 cell 尺寸（DDGI_CASCADE_CELL_SIZES[1..5] = 32/64/128/256）
+  /// 级联 cell 尺寸（DDGI_CASCADE_CELL_SIZES[1..5] = 128/256/512/1024）
   pub cell_sizes: [i32; 4],
-  /// 每级当前原点（16-cell 全局坐标）
+  /// 每级当前原点（base-cell 全局坐标）
   pub origins: [IVec3; 4],
-  /// 每级当前探针网格（16³ cell）
+  /// 每级当前探针网格（本级 cell 单位 16³）
   pub grids: [ProbeGrid; 4],
   /// 每级当前 meta（4096 word，packed offset+age；层布局 = build_meta_texture_data）
   pub metas: [Vec<u32>; 4],
@@ -815,6 +891,16 @@ impl CascadeManager {
       self.reuse[c] = bounds;
       self.pending_shift[c] = Some(shift);
       moved = true;
+      // #region debug-point D:scroll-mark（假设 D：滚动帧扰动与闪烁时刻相关性）
+      bevy::log::info!(
+        "[DEBUG][D] cascade c{} scroll shift=({},{},{}) cell_size={}（本帧滚动级）",
+        c,
+        shift.x,
+        shift.y,
+        shift.z,
+        self.cell_sizes[c]
+      );
+      // #endregion
     }
     moved
   }
@@ -848,21 +934,21 @@ pub fn cascade_ci_global(cell_index: &[u32], id_base: u32) -> Vec<u32> {
 // 级联域（每帧滚动 dispatch 的域描述；光照判定逻辑在 WGSL ddgi_active）
 // ============================================================================
 
-/// 级联域（每帧滚动 dispatch 用；origin/dims 为 16-cell 全局坐标，cell_size 为 fine 体素）
+/// 级联域（每帧滚动 dispatch 用；origin/dims 为 base-cell 全局坐标，cell_size 为 fine 体素）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CascadeDomain {
-  /// 域原点（16-cell 全局坐标；级联级须 cell_size 对齐——M4-3 滚动步进）
+  /// 域原点（base-cell 全局坐标；级联级须 cell_size 对齐——M4-3 滚动步进）
   pub origin: IVec3,
   /// 域 dims（本级 cell 单位；滚动级 = PROBES_PER_CASCADE_AXIS³=16³，base = AABB cell 数）
   pub dims: UVec3,
-  /// cell 尺寸（fine 体素）：base 16 / LOD1-4=32/64/128/256
+  /// cell 尺寸（fine 体素）：base 64 / LOD1-4=128/256/512/1024
   pub cell_size: i32,
 }
 
 impl CascadeDomain {
-  /// 域 hi（16-cell 半开）= origin + dims × (cell_size / DDGI_CELL)
+  /// 域 hi（base-cell 半开）= origin + dims × (cell_size / DDGI_CELL)
   #[inline]
-  pub fn hi_16cell(&self) -> IVec3 {
+  pub fn hi_base_cell(&self) -> IVec3 {
     self.origin + self.dims.as_ivec3() * (self.cell_size / DDGI_CELL)
   }
 }
@@ -870,11 +956,13 @@ impl CascadeDomain {
 /// 全 reuse bounds（base 静态级默认值：覆盖全部 cell，全部 reusable）
 pub const REUSE_ALL: (IVec3, IVec3) = (IVec3::ZERO, IVec3::splat(i32::MAX));
 
-/// 探针位置打包：xyz = 世界 fine 坐标，w = active(1.0)
+/// 探针位置打包：xyz = 世界 fine 坐标，w = 活跃位（1.0 活跃 / 0 不活跃；
+/// Douglas #23 近表面语义，probe viz 只画 w≠0 的探针；采样/cast 不读 w）
 pub fn pack_probe_positions(pg: &ProbeGrid) -> Vec<Vec4> {
   pg.positions
     .iter()
-    .map(|p| Vec4::new(p.x, p.y, p.z, 1.0))
+    .zip(&pg.active)
+    .map(|(p, &a)| Vec4::new(p.x, p.y, p.z, if a { 1.0 } else { 0.0 }))
     .collect()
 }
 
@@ -1133,6 +1221,9 @@ pub struct DdgiGpu {
   pub readback_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
   /// 0=idle 1=copied 2=mapped(等回调)
   pub readback_state: u32,
+  /// 诊断回读采样层距（copy 时 = (base_layers+64)/8 定格；解析侧据此还原层号，
+  /// 防烘焙改变纹理层数后 copy/parse 错位）
+  pub readback_step: u32,
   /// M4-3 级联 CPU 管理器（extract 侧滚动驱动；None = 尚未烘焙）
   pub manager: Option<CascadeManager>,
   /// 级联探针 id 基址 = base_layers × 256（id 空间偏移 → WGSL 坐标函数零改动）
@@ -1174,6 +1265,10 @@ pub struct DdgiDebugSettings {
   pub mode: f32,
   pub gain: f32,
   pub probe_viz: bool,
+  /// probe viz 层级选择（0=All 全部, 1..=4=LOD0~3 滚动级联 32/64/128/256,
+  /// 5=Base 16³ 世界烘焙网格）。Douglas #23 = base 烘焙网格 + 4 LOD 同构，
+  /// 他视频切换的 LOD 0~3 即这 4 个下采样级（base 不占 LOD 编号）
+  pub probe_viz_lod: f32,
 }
 
 impl Default for DdgiDebugSettings {
@@ -1182,6 +1277,7 @@ impl Default for DdgiDebugSettings {
       mode: 0.0,
       gain: 1.0,
       probe_viz: false,
+      probe_viz_lod: 0.0,
     }
   }
 }
@@ -1336,6 +1432,7 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>) {
     readback: ddgi_readback_buffer(&device),
     readback_rx: std::sync::Mutex::new(None),
     readback_state: 0,
+    readback_step: 1,
     manager: None,
     id_base: 0,
     cascades: Vec::new(),
@@ -1854,7 +1951,7 @@ fn dispatch_ddgi(
         let count = word(0);
         let indirect0 = word(4);
         let wl = [word(8), word(9), word(10), word(11)];
-        // 8 个采样层（layer = k*160）：各层非零 texel 数
+        // 8 个采样层（层距 = copy 时定格的 readback_step）：各层非零 texel 数
         let texels_per_layer = (IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 2) as usize;
         let mut summary = String::new();
         for k in 0..8usize {
@@ -1862,10 +1959,10 @@ fn dispatch_ddgi(
           let nz = (base..base + texels_per_layer)
             .filter(|&i| word(i) != 0)
             .count();
-          let layer = k * 160;
+          let layer = k as u32 * gpu.readback_step;
           summary.push_str(&format!(" L{layer}:{nz}"));
         }
-        // depth 采样层 650（中心）：被 EMA 拉离 tmax=8192 的 texel 数 = update 写入实证
+        // depth 采样层 0（tmax=8192 初值；EMA 拉低 = update 写入实证）
         let dep_base = 64 + 8 * texels_per_layer;
         let dep_texels = (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
         let dep_lt = (dep_base..dep_base + dep_texels)
@@ -1886,12 +1983,15 @@ fn dispatch_ddgi(
         // 黑探针普查（同 8 采样层，2048 探针）：a0 = age=0（未激活，采样端已门控）；
         // blk = age≥1 且 irr 全零（被当有效探针采样 → 暗块/黑块直接来源）；ok = 正常。
         // blk 全局探针 id（= layer×256+p）取前 8 个供世界坐标定位（cell = id 反查）。
+        // blk 的 age 直方图：新 age = 滚动重置/新激活列（假设 B/D）；高 age = 从未被
+        // cast 更新的陈旧探针（假设 B/E：预算钳制或活跃集翻转）
         let meta_base =
           64 + 8 * texels_per_layer + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
         let (mut a0, mut blk, mut ok) = (0u32, 0u32, 0u32);
+        let (mut b_a1, mut b_a8, mut b_a32, mut b_a64) = (0u32, 0u32, 0u32, 0u32);
         let mut blk_ids = String::new();
         for k in 0..8usize {
-          let layer = k * 160;
+          let layer = k as u32 * gpu.readback_step;
           let ibase = 64 + k * texels_per_layer;
           // meta 区按拷贝行距 256B（64 word/行）读回：层 = 16 行 × 64 word，
           // 探针 p 的 word 下标 = 行 p/16 × 64 + 列 p%16（其余为 pad 零）
@@ -1922,8 +2022,16 @@ fn dispatch_ddgi(
               ok += 1;
             } else {
               blk += 1;
+              // #region debug-point B:blk-age-hist（假设 B：黑探针 age 分布定位来源）
+              match age {
+                1..=7 => b_a1 += 1,
+                8..=31 => b_a8 += 1,
+                32..=63 => b_a32 += 1,
+                _ => b_a64 += 1,
+              }
+              // #endregion
               if blk <= 8 {
-                blk_ids.push_str(&format!(" {}", layer as u32 * PROBES_PER_LAYER + p as u32));
+                blk_ids.push_str(&format!(" {}@{}", layer as u32 * PROBES_PER_LAYER + p as u32, age));
               }
             }
           }
@@ -1931,7 +2039,42 @@ fn dispatch_ddgi(
         drop(data);
         gpu.readback.unmap();
         gpu.readback_state = 0;
-        bevy::log::info!(
+        // #region debug-point B:server-relay（readback 汇总行 → 调试服务器 NDJSON；
+        // std-only 裸 HTTP POST，服务器离线时连接即失败静默跳过；~4Hz 低频）
+        fn dbg_relay(hyp: &str, msg: &str) {
+          let url = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../.dbg/ddgi-black-spots-flicker.env"
+          ))
+          .ok()
+          .and_then(|s| {
+            s.lines()
+              .find(|l| l.starts_with("DEBUG_SERVER_URL="))
+              .map(|l| l["DEBUG_SERVER_URL=".len()..].trim().to_string())
+          })
+          .unwrap_or_else(|| "http://127.0.0.1:7777/event".into());
+          let rest = url.strip_prefix("http://").unwrap_or(&url);
+          let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, p),
+            None => (rest, "event"),
+          };
+          let body = format!(
+            "{{\"sessionId\":\"ddgi-black-spots-flicker\",\"runId\":\"pre-fix\",\"hypothesisId\":\"{hyp}\",\"location\":\"ddgi.rs:readback\",\"msg\":\"[DEBUG] {}\"}}",
+            msg.replace('\\', "\\\\").replace('"', "\\\"")
+          );
+          if let Ok(mut s) = std::net::TcpStream::connect(authority) {
+            use std::io::Write as _;
+            let _ = s.write_all(
+              format!(
+                "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+              )
+              .as_bytes(),
+            );
+          }
+        }
+        // #endregion
+        let line = format!(
           "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}]{} irr:{summary} depth650_lt8k:{} census: a0={a0} blk={blk} ok={ok} blk_ids:[{blk_ids}]",
           gpu.frame,
           count,
@@ -1943,6 +2086,11 @@ fn dispatch_ddgi(
           casc,
           dep_lt,
         );
+        bevy::log::info!("{}", line);
+        // #region debug-point B/E:relay-send（假设 B=黑探针普查、E=预算/活跃信号）
+        dbg_relay("B", &format!("census a0={a0} blk={blk} ok={ok} blk_age[1-7/8-31/32-63/64+]={b_a1}/{b_a8}/{b_a32}/{b_a64} ids:[{blk_ids}] frame={}", gpu.frame));
+        dbg_relay("E", &format!("dispatch0={count} indirect0={indirect0} wl=[{},{},{},{}]{} depth_lt8k={dep_lt} frame={}", wl[0], wl[1], wl[2], wl[3], casc, gpu.frame));
+        // #endregion
       }
     }
     _ => {
@@ -1959,14 +2107,18 @@ fn dispatch_ddgi(
             encoder.copy_buffer_to_buffer(&cg.dispatch, 0, &gpu.readback, o, 16);
             encoder.copy_buffer_to_buffer(&cg.indirect, 0, &gpu.readback, o + 64, 16);
           }
-          // 8 个均匀采样层（layer = k*160）+ depth 层 650——读 **next**（本帧 update
-          // 刚写完，encoder 顺序在 update pass 之后；prev 要到下帧 swap 才有新值）
+          // 8 个均匀采样层（层距 = 总层数/8）+ depth 层 0——读 **next**（本帧 update
+          // 刚写完，encoder 顺序在 update pass 之后；prev 要到下帧 swap 才有新值）。
+          // 层距动态：base 16³ 重做后纹理总层 = base_layers+64 可能 < 旧硬编码 160，
+          // 固定步距越界（2026-09-08 Validation Error：Z 160..161 > 85 层）。
+          let step = ((gpu.base_layers + 64) / 8).max(1);
+          gpu.readback_step = step;
           for k in 0..8u32 {
             encoder.copy_texture_to_buffer(
               TexelCopyTextureInfo {
                 texture: &gpu.irr_next,
                 mip_level: 0,
-                origin: Origin3d::ZERO,
+                origin: Origin3d { x: 0, y: 0, z: k * step },
                 aspect: TextureAspect::All,
               },
               TexelCopyBufferInfo {
@@ -2013,11 +2165,7 @@ fn dispatch_ddgi(
               TexelCopyTextureInfo {
                 texture: &gpu.meta_next,
                 mip_level: 0,
-                origin: Origin3d {
-                  x: 0,
-                  y: 0,
-                  z: k * 160,
-                },
+                origin: Origin3d { x: 0, y: 0, z: k * step },
                 aspect: TextureAspect::All,
               },
               TexelCopyBufferInfo {
@@ -2065,6 +2213,7 @@ fn extract_ddgi_bake(
       mode: d.mode,
       gain: d.gain,
       probe_viz: d.probe_viz,
+      probe_viz_lod: d.probe_viz_lod,
     },
     None => DdgiDebugSettings::default(),
   };
@@ -2523,7 +2672,8 @@ fn prepare_ddgi(
         let off = gpu.id_base + (c as u32) * 4096;
         let g = &cm.grids[c];
         for (id, pos) in g.positions.iter().enumerate() {
-          pos_all[off as usize + id] = Vec4::new(pos.x, pos.y, pos.z, 1.0);
+          pos_all[off as usize + id] =
+            Vec4::new(pos.x, pos.y, pos.z, if g.active[id] { 1.0 } else { 0.0 });
         }
         all_ci_data.extend(cascade_ci_global(&g.cell_index, off));
       }
@@ -2840,5 +2990,125 @@ fn prepare_ddgi(
   let us = tp.elapsed().as_micros();
   if us > 10_000 {
     bevy::log::info!("DDGI prepare: {us}us");
+  }
+}
+
+
+// ============================================================================
+// 单测：活跃位语义（Douglas #23 近表面判定）+ positions.w 打包
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn probe_active_only_near_surface() {
+    let mut grid = gate_voxel::VolumeGrid::new();
+    // 64³ 实心砖 @ cell (1,0,0)（fine [64,128)³）
+    let _ = grid.fill_brick(IVec3::new(64, 0, 0), 64, 1);
+    // 本 cell 面邻接实心砖 → 活跃（cell(0,0,0) 自身为 Air）
+    assert!(probe_is_active(&grid, IVec3::ZERO, 64));
+    // 实心砖另一侧的 Air cell → 活跃
+    assert!(probe_is_active(&grid, IVec3::new(128, 0, 0), 64));
+    // 对角 cell（仅角/棱邻接，无面邻接）→ 不活跃（Douglas 只查 6 面邻接）
+    assert!(!probe_is_active(&grid, IVec3::new(128, 64, 0), 64));
+    // 远场（间隔 >1 cell）→ 不活跃
+    assert!(!probe_is_active(&grid, IVec3::new(320, 320, 320), 64));
+    // 16³ cell（DDGI_CELL）粒度：+x 面邻实心砖的 cell 活跃，斜向不活跃
+    assert!(probe_is_active(&grid, IVec3::new(48, 0, 0), 16));
+    assert!(!probe_is_active(&grid, IVec3::new(32, 32, 0), 16));
+  }
+
+  #[test]
+  fn probe_active_region_query_covers_all_cell_sizes() {
+    let mut grid = gate_voxel::VolumeGrid::new();
+    // 整个 chunk(0,0,0) 填实（256³ = level 0 Solid）
+    let _ = grid.fill_brick(IVec3::ZERO, 256, 2);
+    // cell_size 256（level 0 单次查询）：紧邻 chunk 的 cell 活跃，隔一个不活跃
+    assert!(probe_is_active(&grid, IVec3::new(256, 0, 0), 256));
+    assert!(!probe_is_active(&grid, IVec3::new(512, 0, 0), 256));
+    // cell_size 512（2³ level 0 查询）：覆盖到 chunk 0 的 cell 活跃，未覆盖不活跃
+    assert!(probe_is_active(&grid, IVec3::ZERO, 512));
+    assert!(!probe_is_active(&grid, IVec3::new(512, 512, 512), 512));
+    // 单体素 Mixed 砖也算含体素
+    let mut grid2 = gate_voxel::VolumeGrid::new();
+    let _ = grid2.set_voxel_ivec3(IVec3::new(10, 10, 10), 3);
+    assert!(probe_is_active(&grid2, IVec3::ZERO, 64));
+  }
+
+  #[test]
+  fn bake_grid_carries_active_flags() {
+    let mut vols = Volumes::new(gate_voxel::VolumeGrid::new());
+    {
+      // 64³ 实心砖 @ fine [64,128)×[0,64)² = rel cells (4..8, 0..4, 0..4)（16³ cell）
+      let _ = vols.main_mut().fill_brick(IVec3::new(64, 0, 0), 64, 1);
+    }
+    let pg = bake_probe_grid(&vols);
+    let main = vols.main();
+    assert_eq!(pg.positions.len(), pg.active.len());
+    for z in 0..pg.grid_dims.z as i32 {
+      for y in 0..pg.grid_dims.y as i32 {
+        for x in 0..pg.grid_dims.x as i32 {
+          let rel = UVec3::new(x as u32, y as u32, z as u32);
+          let id = pg.cell_index[pg.cell_linear(rel)];
+          let cell_min = IVec3::new(x, y, z) * DDGI_CELL;
+          if id == NO_PROBE {
+            // 只有全 Solid cell 无探针（Air/Mixed 均有）
+            assert!(matches!(
+              cell_state_at(main, cell_min, DDGI_CELL),
+              BrickState::Solid(_)
+            ));
+            continue;
+          }
+          // 活跃位与 probe_is_active 直算一致
+          assert_eq!(
+            pg.active[id as usize],
+            probe_is_active(main, cell_min, DDGI_CELL)
+          );
+        }
+      }
+    }
+    // cell (3,0,0) 面邻实心砖 → 活跃；cell (0,0,0) 远场 → 不活跃
+    assert!(
+      pg.active[pg.cell_index[pg.cell_linear(UVec3::new(3, 0, 0))] as usize]
+    );
+    assert!(
+      !pg.active[pg.cell_index[pg.cell_linear(UVec3::new(0, 0, 0))] as usize]
+    );
+  }
+
+  #[test]
+  fn multicolor_solid_cell_bakes_no_probe() {
+    // 树 Mixed 双义回归（2026-09-08 panic 修复）：多色全实 16³ cell 沿树无空叶
+    // （BrickState::Mixed 含「多色混合」义），BFS None = DDGI「全满」→ 无探针
+    let mut vols = Volumes::new(gate_voxel::VolumeGrid::new());
+    let _ = vols.main_mut().fill_brick(IVec3::ZERO, 16, 1);
+    // 打一个异色体素 → 树 Mixed（仍无任何空气）
+    let _ = vols.main_mut().set_voxel_ivec3(IVec3::ZERO, 2);
+    assert!(matches!(
+      cell_state_at(vols.main(), IVec3::ZERO, DDGI_CELL),
+      BrickState::Mixed
+    ));
+    let pg = bake_probe_grid(&vols);
+    assert_eq!(pg.cell_index[pg.cell_linear(UVec3::ZERO)], NO_PROBE);
+    // 对照：同砖留一个空体素（真空实混合）→ 必有探针
+    let _ = vols.main_mut().set_voxel_ivec3(IVec3::new(8, 8, 8), 0);
+    let pg = bake_probe_grid(&vols);
+    assert_ne!(pg.cell_index[pg.cell_linear(UVec3::ZERO)], NO_PROBE);
+  }
+
+  #[test]
+  fn pack_positions_encodes_active_in_w() {
+    let mut pg = ProbeGrid::default();
+    pg.positions = vec![Vec3::splat(1.0), Vec3::splat(2.0)];
+    pg.active = vec![true, false];
+    let packed = pack_probe_positions(&pg);
+    assert_eq!(packed[0].w, 1.0);
+    assert_eq!(packed[1].w, 0.0);
+    assert_eq!(
+      Vec3::new(packed[1].x, packed[1].y, packed[1].z),
+      Vec3::splat(2.0)
+    );
   }
 }
