@@ -24,8 +24,8 @@
 //   @group(2) @binding(0) = grid_descs: array<GridDesc>（144B/entry，主世界 + 物体统一描述符）
 //   shader `dda_main` 用 `arrayLength(&grid_descs)` 取 volume 数，遍历 trace_grid 无 kind 分支。
 //
-// BG3（R3-18 直光层：光照光池，与 Rust LightPoolUniform 464B 1:1）：
-//   @group(3) @binding(0) = uniform LightPool（LightGlobals 48B + 8×LightDesc 384B + sky_top/horizon 32B）
+// BG3（R3-18 直光层：光照光池，与 Rust LightPoolUniform 448B 1:1）：
+//   @group(3) @binding(0) = uniform LightPool（LightGlobals 48B + 8×LightDesc 384B + sky_color 16B）
 //   数据源 = assets/lighting/*.ron 主题（main world LightingTheme → ExtractResource → build_light_pool）
 //
 // 顶部常量与 Rust `brickmap::dda::wgsl_consts` 完全一致（单测 TR-2.1 assert_eq 防漂移）。
@@ -172,7 +172,7 @@ struct GridDesc {
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
 
-// --- BG3：光照光池（R3-18 直光层；与 Rust LightPoolUniform 逐字段镜像，464B）---
+// --- BG3：光照光池（R3-18 直光层；与 Rust LightPoolUniform 逐字段镜像，448B）---
 // 只用 lights[0] = 方向光（kind=0）；硬阴影方案无点光源/无软阴影（Douglas #02/#17/#23）。
 struct LightDesc {
   kind_pos_dir: vec4<f32>,    // x = kind（0=方向光）；yzw = L 轴（指向光，已归一）
@@ -190,8 +190,7 @@ struct LightGlobals {
 struct LightPool {
   g: LightGlobals,
   lights: array<LightDesc, 8u>,
-  sky_top: vec4<f32>,     // 天空天顶色（线性）
-  sky_horizon: vec4<f32>, // 天空地平线色（线性）
+  sky_color: vec4<f32>,   // 天空纯色（miss 背景 + sky 环境光共用；Minecraft #78A7FF）
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
 
@@ -819,20 +818,9 @@ fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   ) / 255.0;
 }
 
-// 天空渐变 + 太阳盘光晕（miss 像素输出；CPU 镜像 cpu_reference_sky）
-fn sky_color(dir: vec3<f32>) -> vec3<f32> {
-  let d = normalize(dir);
-  let h = clamp(d.y, 0.0, 1.0);
-  let x = clamp(h / 0.35, 0.0, 1.0);
-  let t = x * x * (3.0 - 2.0 * x);
-  var col = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t));
-  if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
-    let sdir = light_u.lights[0].kind_pos_dir.yzw;
-    let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    let glow = pow(max(dot(d, sdir), 0.0), 64.0) * 0.05 * select(0.0, 1.0, h > 0.0);
-    col = col + sun_c * glow;
-  }
-  return col;
+// 天空纯色（miss 像素输出 + 探针射线 miss 端点；Minecraft 白天平原 #78A7FF）
+fn sky_rgb() -> vec3<f32> {
+  return light_u.sky_color.xyz;
 }
 
 // ============================================================================
@@ -956,7 +944,7 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ============================================================================
-// DDA 主入口：R3-18 直光层 — 命中 → 直光着色（硬阴影 + sky 环境 + emissive），miss → 天空渐变
+// DDA 主入口：R3-18 直光层 — 命中 → 直光着色（硬阴影 + sky 环境 + emissive），miss → 纯色天空
 // ============================================================================
 @compute @workgroup_size(8, 8, 1)
 fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1007,10 +995,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let best = trace_scene(origin_fine, dir_fine, frustum_length, t_min, 3u);
   // unlit（Devlog 23：hashmap 光照链 vis_table/vis_norm/gi_rad + direct/gi/denoise
   // pass 因缓存噪声整条弃用，DDGI 探针光照待重新接线）：
-  //   miss → 天空渐变 + 太阳盘光晕；
+  //   miss → 纯色天空；
   //   命中 → albedo · (sky 环境 0.6 + ambient 0.4 + 太阳色 · max(0,N·L))，
   //   法线 = 逐体素 6 邻域差分（voxel_normal_world，无缓存，Douglas #22 一体素一色）。
-  var col = sky_color(dir_fine);
+  var col = sky_rgb();
   if (best.uh.hit) {
     // ---- 逐体素着色（Douglas #22/#23：一体素一色）----
     // albedo/法线/采样点/阴影射线全部体素锚定——同体素跨像素同色，无逐面/逐像素变明暗。
@@ -1035,10 +1023,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           && !(all(sh.uh.voxel == best.uh.voxel) && sh.uh.obj_id == best.uh.obj_id),
       );
     }
-    let h = clamp(n.y, 0.0, 1.0);
-    let x = clamp(h / 0.35, 0.0, 1.0);
-    let t_sky = x * x * (3.0 - 2.0 * x);
-    let sky = mix(light_u.sky_horizon.xyz, light_u.sky_top.xyz, vec3<f32>(t_sky));
+    let sky = light_u.sky_color.xyz;
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
     // R3-10 DDGI 间接项（Douglas #23）：体素中心采样上一帧 irradiance（自闭环）；
     // 采样方向 = 体素 implicit normal（RTXGI 约定，M3-2 修正）。一体素一色。
@@ -1689,7 +1674,7 @@ fn ddgi_sample_dom(
         // 间接辐照度作为首帧兜底，避免新滚入区域整片发黑（探针收敛后自然接管）。
         var irr = ddgi_irr_sample(id, n);
         if (ddgi_meta_age(m) == 0u) {
-          irr = sky_color(n) * 0.5;
+          irr = sky_rgb() * 0.5;
         }
         let w = wtri * wn * wd;
         total = total + irr * w;
@@ -1807,7 +1792,7 @@ fn ddgi_cast(
     var dist = DDGI_T_MAX;
     let hit = trace_scene(origin, dir, DDGI_T_MAX, 0.0, 3u);
     if (!hit.uh.hit) {
-      radiance = sky_color(dir);
+      radiance = sky_rgb();
       dist = DDGI_T_MAX;
     } else {
       let p = origin + dir * hit.uh.t;
