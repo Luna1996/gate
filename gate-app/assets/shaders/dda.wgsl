@@ -110,10 +110,12 @@ const BEAM_DIV: u32 = 4u;
 const BEAM_BACKOFF: f32 = 4.0;
 
 struct DdaViewUniform {
-  inv_view_proj: mat4x4<f32>,  // 64B
-  cam_pos_fine: vec4<f32>,     // 16B，w=1
-  debug_mode: vec4<f32>,       // 16B：x = 法向可视化，y = face 6 色诊断
-  lod: vec4<f32>,              // 16B：x = 像素角大小(rad)，y = LOD 早停开关
+  view_proj: mat4x4<f32>,       // 64B：世界→裁剪空间（probe 可视化投影用）
+  inv_view_proj: mat4x4<f32>,   // 64B
+  cam_pos_fine: vec4<f32>,      // 16B，w=1
+  debug_mode: vec4<f32>,        // 16B：x = 法向可视化，y = face 6 色诊断
+  lod: vec4<f32>,               // 16B：x = 像素角大小(rad)，y = LOD 早停开关
+  probe_viz_params: vec4<f32>,  // 16B：x = 总探针数，y = 方块边长(px)
 }
 @group(0) @binding(1) var<uniform> view_u: DdaViewUniform;
 
@@ -808,19 +810,37 @@ fn make_grid(idx: u32) -> Grid {
 }
 
 
-// ---- palette albedo 解包 ----
+// ---- sRGB → linear 转换（palette/sky 均以 sRGB u8/255 存储，光照前必须转 linear） ----
+fn srgb_channel_to_linear(c: f32) -> f32 {
+  if (c <= 0.04045) {
+    return c / 12.92;
+  }
+  return pow((c + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    srgb_channel_to_linear(c.x),
+    srgb_channel_to_linear(c.y),
+    srgb_channel_to_linear(c.z),
+  );
+}
+
+// ---- palette albedo 解包（sRGB → linear）----
 fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   let w0 = b_palette[palette_base + pal * 2u];
-  return vec3<f32>(
+  let srgb = vec3<f32>(
     f32(w0 & 0xFFu),
     f32((w0 >> 8u) & 0xFFu),
     f32((w0 >> 16u) & 0xFFu),
   ) / 255.0;
+  return srgb_to_linear(srgb);
 }
 
 // 天空纯色（miss 像素输出 + 探针射线 miss 端点；Minecraft 白天平原 #78A7FF）
+// sRGB → linear（与 palette_albedo 同空间；光照全程 linear，输出经 linear_to_srgb 还原）
 fn sky_rgb() -> vec3<f32> {
-  return light_u.sky_color.xyz;
+  return srgb_to_linear(light_u.sky_color.xyz);
 }
 
 // ============================================================================
@@ -1027,8 +1047,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
     // R3-10 DDGI 间接项（Douglas #23）：体素中心采样上一帧 irradiance（自闭环）；
     // 采样方向 = 体素 implicit normal（RTXGI 约定，M3-2 修正）。一体素一色。
-    // **采样点沿法线偏移 DDGI_NORMAL_BIAS（与 cast pass 一致，Majercik 2019 §4 惯例）——
-    // 裸 p_voxel 可能落在几何体内部→深度一致性检测误剔所有探针→暗斑**。
+    // **采样点 = 体素中心 + 0.5（体素半宽，穿到表面）+ DDGI_NORMAL_BIAS（面外空气侧）
+    // （与 cast pass 采样点「表面命中点 + NORMAL_BIAS」同一空气位置）——p_voxel 是
+    // solid 体素中心，仅偏 NORMAL_BIAS=0.2 仍留在墙皮内 0.3：探针→采样点连线穿墙，
+    // 深度 chevron 判「被遮挡」→ wd 衰减/剔除 → GI=0 暗色方块（关 BASE_AMBIENT 纯黑）**。
     // params.z = 诊断增益（GATE_DDGI_GAIN）；params.y = 调试模式（GATE_DDGI_DEBUG）。
     // **除 π**：collect_radiance 存储 = π·L̄（物理辐照度 E），本引擎直光约定 =
     // albedo×E（π 折进 albedo）→ 间接光必须 albedo×E/π 才与直光同标度
@@ -1036,25 +1058,37 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gi_on = ddgi_u.reuse_max.w > 0.5;
     var gi = vec3<f32>(0.0);
     if (gi_on) {
-      gi = ddgi_sample(p_voxel + n * DDGI_NORMAL_BIAS, n) * ddgi_u.params.z / DDGI_PI;
+      gi = ddgi_sample(p_voxel + n * (0.5 + DDGI_NORMAL_BIAS), n) * ddgi_u.params.z / DDGI_PI;
     }
-    col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4 + sun_c * ndl * sun) + alb * gi;
+    col = alb * (sun_c * ndl * sun + sky * DDGI_BASE_AMBIENT + gi);
     // GATE_DDGI_DEBUG（params.y）诊断分路：
     // 1 = GI 单项（×8 提亮 + 15% 直光兜底可视）——斑块是否来自探针数据本身
     // 2 = wsum 热度（权重和 0..8 灰度）——斑块是否来自深度/背面剔除图案
     // 3 = 选域 id 着色（base=绿，级联0-3=红/蓝/黄/品红）——斑块是否跨域错选
+    // 4 = 探针状态：wsum>0 且 dom≠0 → 探针正常（绿）；wsum=0 且 dom≠0 →
+    //     域内所有探针被剔除（age=0/背面/深度）→ 暗块根因（红）；dom=0 →
+    //     域边界外（选域失败，蓝）。直接复用上一帧 ddgi_sample 的 dbg 输出
+    //     字段，不新增纹理访问，逐像素即时定位暗块来源
     if (ddgi_u.params.y > 0.5) {
       if (ddgi_u.params.y < 1.5) {
-        col = alb * (sky * 0.6 + light_u.g.ambient.xyz * 0.4) * 0.15 + alb * gi * 8.0;
+        col = alb * sky * DDGI_BASE_AMBIENT * 0.15 + alb * gi * 8.0;
       } else if (ddgi_u.params.y < 2.5) {
         col = alb * vec3<f32>(clamp(ddgi_dbg_wsum * 0.125, 0.0, 1.0)) * 2.0;
-      } else {
+      } else if (ddgi_u.params.y < 3.5) {
         let d = ddgi_dbg_dom;
         col = vec3<f32>(0.9, 0.2, 0.2);
         col = select(col, vec3<f32>(0.2, 0.4, 0.9), d > 2.5);
         col = select(col, vec3<f32>(0.9, 0.9, 0.2), d > 3.5);
         col = select(col, vec3<f32>(0.9, 0.2, 0.9), d > 4.5);
         col = select(vec3<f32>(0.1, 0.8, 0.2), col, d > 0.5);
+      } else {
+        // case 4：探针状态码——即时定位暗块来源
+        // dom=0 → 选域失败（像素在所有 DDGI 域外）→ 蓝
+        // wsum=0 且 dom≠0 → 域内所有候选探针被剔除 → 红（暗块根因）
+        // wsum>0 → 探针有有效贡献 → 绿（正常）
+        col = vec3<f32>(0.2, 0.4, 0.9); // dom=0: 域边界外
+        col = select(vec3<f32>(0.9, 0.15, 0.15), col, ddgi_dbg_dom > 0.5 && ddgi_dbg_wsum <= 0.0);
+        col = select(vec3<f32>(0.15, 0.85, 0.25), col, ddgi_dbg_dom > 0.5 && ddgi_dbg_wsum > 0.0);
       }
     }
   }
@@ -1101,11 +1135,17 @@ const DDGI_ALPHA: f32 = 0.1; // 存储语义已并入 update 链常数（hystere
 const DDGI_DEPTH_ALPHA: f32 = 0.2;
 const DDGI_TEXEL_MIN_WEIGHT: f32 = 1e-4;
 const DDGI_NORMAL_BIAS: f32 = 0.2;
-const DDGI_DEPTH_BIAS: f32 = 4.0;
+// 深度 chevron 半宽已改为采样点所在域逐域计算 cell_size×0.25（ddgi_sample_dom），
+// 不再是全局常量——粗级联 cell 大，固定 4 会把远角合法探针误剔成网格状黑块
 const DDGI_T_MAX: f32 = 8192.0;
-const DDGI_RAY_BUDGET: u32 = 4096u;
-// 每探针射线数下限（ddgi.rs DDGI_PROBE_RAYS_MIN 镜像）：预算摊派低于此值按下限执行
-const DDGI_PROBE_RAYS_MIN: u32 = 16u;
+// 每帧总射线预算（5 个 pass 组各自摊派）：count×rays = clamp 恒 ≤ 131072 = samples
+// 缓冲 slot 数（4096×32）。base active 恒钳 4096 → 32 射线不变；级联 active 仅
+// ~900-2760 → 摊到 32-72 射线/探针（近场降噪：级联全量每帧更新，低射线纯噪声）
+const DDGI_RAY_BUDGET: u32 = 65536u;
+// 每探针射线数下限（ddgi.rs DDGI_PROBE_RAYS_MIN 镜像）：预算摊派低于此值按下限执行。
+// 32 = 8×8 irr texel 的半 texel/射线：16 射线时 base 探针每次更新均值噪声 ±30%+，
+// 邻探针收敛值互相差一个量级 → 逐 16³ cell 的方块斑驳 + 轮换跳变（黑块闪烁主源）
+const DDGI_PROBE_RAYS_MIN: u32 = 32u;
 const DDGI_PROBE_BUDGET: u32 = 4096u;
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
@@ -1113,13 +1153,24 @@ const DDGI_EMIT_GAIN: f32 = 4.0;
 const DDGI_PI: f32 = 3.14159265;
 const CAN_SKIP_MAX: f32 = 0.5;
 // 更新链阈值（RTXGI ProbeBlendingCS.hlsl L508-550 逐字）
-const DDGI_HYSTERESIS: f32 = 0.95;
+const DDGI_HYSTERESIS: f32 = 0.85;
 const DDGI_IRRAD_GAMMA: f32 = 1.0;
 const DDGI_BIG_CHANGE: f32 = 0.2;
 const DDGI_BRIGHTNESS: f32 = 1.0;
 const DDGI_MIN_STEP: f32 = 0.0009765625; // 1/1024
-const DDGI_CHANGE_DROP: f32 = 0.75;
+// 大变化加速必须为 0：每探针仅 16 射线时估计噪声极大（8×8 texel 摊不到 0.25 射线/texel），
+// 0.75 会让滞回 0.85→0.1 = 单次更新跳 90% 噪声值——base 探针每 ~25 帧轮换跳一次
+// （中距离正方形黑块跳现）、级联每帧跳（近场持续闪烁）。
+const DDGI_CHANGE_DROP: f32 = 0.0;
 const DDGI_DELTA_CLAMP: f32 = 0.25;
+// 探针射线 miss 端点的 sky radiance 缩放：1.0 = 探针与相机看到同一份 sky 能量。
+// 0.15 时代整个间接场只有 15% 天能量——背光面收敛后仍近黑（方块观感的能量根源）
+const DDGI_SKY_RADIANCE_SCALE: f32 = 1.0;
+// 探针射线起点沿方向偏移（避免 probe 紧贴表面 self-hit）
+const DDGI_RAY_BIAS: f32 = 0.5;
+// 最终着色的 sky 环境兜底（#02 架构层）：DDGI 未收敛/被深度测试剔除的角落由此
+// 托底，0.0 时任何 gi=0 的背光体素（ndl·sun=0）直接渲染成纯黑方块
+const DDGI_BASE_AMBIENT: f32 = 0.2;
 
 // ---- group(4)：v3 DDGI 资源（M4-1 建 Rust 侧绑定；M4-3 增 13/14 全域采样绑定；
 // 常量见 ddgi.rs 对齐表；binding 0/2/9/11/12 为「本级」pass 数据——base 与级联
@@ -1562,13 +1613,22 @@ fn ddgi_active(
   let probe_id = ddgi_cell_index[gid.x + gid.y * dx + gid.z * dx * dims.y];
   if (probe_id == DDGI_NO_PROBE) { return; }
   if ((own_flags & DDGI_FLAG_ENABLED) != DDGI_FLAG_ENABLED) { return; }
-  // 级联归属（finer_min.w <= 0 = 无更细级）
+  // 级联归属（finer_min.w <= 0 = 无更细级）。**2 cell 光晕**：把 finer 域向内收缩
+  // 2 本级 cell 再判剔除——否则 finer 窗口边缘内 1 cell 的粗级探针「完全没有数据」
+  // （irr=0/age=0 永不更新），而 ddgi_sample 的过渡带恰在该带与本级混合 →
+  // mix(黑, 本级) = 跟随相机的纯黑环带，且 cast 自闭环在环带上采样会向外毒化扩散
+  //（位置锁定黑块/贴近整面变黑）。收缩后粗级在边缘 2 cell 环带保有有效数据。
   if (ddgi_u.finer_min.w > 0.0) {
     let step = ddgi_u.grid_origin.w / 16.0;
     let lo = vec3<i32>(ddgi_u.grid_origin.xyz + vec3<f32>(gid) * step);
     let hi = lo + vec3<i32>(vec3<f32>(step));
-    let fo = vec3<i32>(ddgi_u.finer_min.xyz);
-    let fd = vec3<i32>(ddgi_u.finer_size.xyz) * vec3<i32>(vec3<f32>(ddgi_u.finer_min.w / 16.0));
+    let m = vec3<i32>(vec3<f32>(2.0 * step));
+    let fo = vec3<i32>(ddgi_u.finer_min.xyz) + m;
+    let fd = max(
+      vec3<i32>(ddgi_u.finer_size.xyz) * vec3<i32>(vec3<f32>(ddgi_u.finer_min.w / 16.0))
+        - vec3<i32>(vec3<f32>(4.0 * step)),
+      vec3<i32>(0),
+    );
     if (!ddgi_outside_lower(lo, hi, fo, fd)) { return; }
   }
   let cell_size = ddgi_u.grid_origin.w;
@@ -1668,14 +1728,18 @@ fn ddgi_sample_dom(
         let wn = clamp(dot(n, -dir) / DDGI_NORMAL_BIAS, 0.0, 1.0);
         if (wn <= 0.0) { continue; }
         let dtex = ddgi_depth_sample(id, dir);
-        let wd = clamp((dtex - dist) / DDGI_DEPTH_BIAS + 0.5, 0.0, 1.0);
+        // 漏光 chevron 半宽随域 cell 缩放（base 16→4 同旧值；级联 32/64/128/256 →
+        // 8/16/32/64）——固定 4 对粗级联相对过窄，深度量化误差（±dist×半 texel 锥角）
+        // 会把远角合法探针误剔成 0 贡献，剔除边界呈网格状黑块
+        let dep_bias = cell_size * 0.25;
+        let wd = clamp((dtex - dist) / dep_bias + 0.5, 0.0, 1.0);
         if (wd <= 0.0) { continue; }
-        // age==0 探针：irr 纹理未初始化（全 0），采样会拉向黑 → 用天空色近似
-        // 间接辐照度作为首帧兜底，避免新滚入区域整片发黑（探针收敛后自然接管）。
-        var irr = ddgi_irr_sample(id, n);
+        // age==0 探针：未初始化（irr 全 0），不参与采样——
+        // 避免 sky 假色灌入污染整个 field（探针收敛后自然接管）。
         if (ddgi_meta_age(m) == 0u) {
-          irr = sky_rgb() * 0.5;
+          continue;
         }
+        let irr = ddgi_irr_sample(id, n);
         let w = wtri * wn * wd;
         total = total + irr * w;
         wsum = wsum + w;
@@ -1790,12 +1854,16 @@ fn ddgi_cast(
     let dir = ddgi_ray_dir(probe_id, frame, i, rays);
     var radiance = vec3<f32>(0.0);
     var dist = DDGI_T_MAX;
-    let hit = trace_scene(origin, dir, DDGI_T_MAX, 0.0, 3u);
+    let hit = trace_scene(origin + dir * DDGI_RAY_BIAS, dir, DDGI_T_MAX, 0.0, 3u);
     if (!hit.uh.hit) {
-      radiance = sky_rgb();
+      radiance = sky_rgb() * DDGI_SKY_RADIANCE_SCALE;
       dist = DDGI_T_MAX;
     } else {
-      let p = origin + dir * hit.uh.t;
+      // t 相对偏移起点（origin + dir*RAY_BIAS）：真实探针距离/命中点须加回
+      // RAY_BIAS——漏加使 depth 纹理系统性偏小 0.5，采样端 chevron（dep_bias
+      // = cell×0.25 = 4）把贴墙探针整体压权/剔除 → 暗色方块的第二个来源
+      let t_hit = DDGI_RAY_BIAS + hit.uh.t;
+      let p = origin + dir * t_hit;
       let n = voxel_normal_world(hit.uh.obj_id, hit.uh.voxel);
       let base = palette_albedo(hit.palette_base, hit.uh.pal);
       let w1 = b_palette[hit.palette_base + hit.uh.pal * 2u + 1u];
@@ -1803,7 +1871,7 @@ fn ddgi_cast(
       if (emissive > 0.0) {
         // emissive 直出（无方向性、不受阴影）
         radiance = base * (emissive * DDGI_EMIT_GAIN);
-        dist = hit.uh.t;
+        dist = t_hit;
       } else {
         // 直光 1-bounce（方向光硬阴影）+ prev DDGI 自闭环（无限反弹）
         var col = vec3<f32>(0.0);
@@ -1819,15 +1887,60 @@ fn ddgi_cast(
           }
         }
         let irr = ddgi_sample(p + n * DDGI_NORMAL_BIAS, n);
-        col = col + base * irr;
+        col = col + base * irr / DDGI_PI;
         radiance = col;
-        dist = hit.uh.t;
+        dist = t_hit;
       }
     }
     // 样本下标 = 本帧处理序号（非旋转 slot；见 ddgi_cast 顶部注释）
     let si = (wid.x * rays + i) * 2u;
     ddgi_samples[si] = vec4<f32>(dir, dist);
     ddgi_samples[si + 1u] = vec4<f32>(radiance, 0.0);
+  }
+}
+
+// ============================================================================
+// probe_viz_main：探针位置可视化（devlog #23 风格黄色方块）
+// 每线程处理一个探针，投影到屏幕空间后画一个小黄色方块到 out_tex（覆盖 DDA 输出）。
+// 不做深度测试：所有在视锥内的探针都画在最上层，便于观察探针分布/缺失/扎堆。
+// 参数来源：view_u.probe_viz_params（x=总探针数, y=方块边长px）；屏幕尺寸用
+// textureDimensions(out_tex) 取（无需 push constant，bevy 0.19 ComputePipelineDescriptor
+// 不支持 push_constant_ranges）。
+// ============================================================================
+@compute @workgroup_size(64)
+fn probe_viz_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let probe_count = u32(view_u.probe_viz_params.x);
+  let dot_size = u32(view_u.probe_viz_params.y);
+  let id = gid.x;
+  if (id >= probe_count) {
+    return;
+  }
+  let pos = ddgi_positions[id].xyz;
+  // 跳过 padding 槽（未占用探针位 positions 全零 → 原点扎堆污染视图）
+  if (pos.x == 0.0 && pos.y == 0.0 && pos.z == 0.0) {
+    return;
+  }
+  // 世界 → 裁剪空间
+  let clip = view_u.view_proj * vec4<f32>(pos, 1.0);
+  if (clip.w <= 0.0) {
+    return; // 相机后方
+  }
+  let ndc = clip.xyz / clip.w;
+  // NDC x,y ∈ [-1,1]，z ∈ [0,1]（wgpu 深度范围）
+  if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+    return;
+  }
+  let dims = vec2<f32>(textureDimensions(out_tex));
+  let px = vec2<f32>((ndc.x * 0.5 + 0.5) * dims.x, (1.0 - (ndc.y * 0.5 + 0.5)) * dims.y);
+  let ci = vec2<i32>(px);
+  let half = i32(dot_size) / 2;
+  for (var dy = -half; dy <= half; dy++) {
+    for (var dx = -half; dx <= half; dx++) {
+      let p = vec2<i32>(ci.x + dx, ci.y + dy);
+      if (p.x >= 0 && p.y >= 0 && u32(p.x) < u32(dims.x) && u32(p.y) < u32(dims.y)) {
+        textureStore(out_tex, vec2<u32>(p), vec4<f32>(1.0, 0.85, 0.0, 1.0));
+      }
+    }
   }
 }
 

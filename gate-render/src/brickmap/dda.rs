@@ -158,16 +158,19 @@ impl DdaCameraConfig {
   }
 }
 
-/// Render-world 着色器绑定的 camera uniform（ShaderType derive = 96B）
-/// WGSL `DdaViewUniform` 逐字对齐（mat4x4 + 3 × vec4 = 64+48 = 112B）
+/// Render-world 着色器绑定的 camera uniform
+/// WGSL `DdaViewUniform` 逐字对齐（2×mat4x4 + 4×vec4 = 128+64 = 192B）
 #[derive(Resource, Clone, Copy, ShaderType)]
 pub struct DdaViewUniform {
+  pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
   pub cam_pos_fine: Vec4, // w=1
   /// x/y = debug 可视化（保留）；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
   pub debug_mode: Vec4,
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（GATE_NO_LOD=1 关）
   pub lod: Vec4,
+  /// 探针可视化参数：x = 总探针数(base+级联)，y = 方块边长(px)，z/w 保留
+  pub probe_viz_params: Vec4,
 }
 
 /// 【诊断】GATE_SKIP_CHUNKWALK=1：trace_grid 在局部 slab 后直接 miss
@@ -214,6 +217,7 @@ impl DdaViewUniform {
     // 像素角大小：垂直 FOV 60°（gate-app FOV_Y 镜像）均分到 render_h 像素
     let px_ang = 2.0 * 30.0_f32.to_radians().tan() / render_h.max(1.0);
     Self {
+      view_proj: cfg.view_proj,
       inv_view_proj: cfg.inv_view_proj,
       cam_pos_fine: cfg.position_world.extend(1.0),
       debug_mode: Vec4::new(
@@ -236,6 +240,8 @@ impl DdaViewUniform {
         *BEAM_DISABLED as u32 as f32,
         *LUT_DISABLED as u32 as f32, // w = 1 → shader 旁路方向掩码剔除
       ),
+      // probe_viz_params 在 prepare_dda_bind_groups 中覆写（需 DdgiGpu.probe_count）
+      probe_viz_params: Vec4::ZERO,
     }
   }
 }
@@ -2252,6 +2258,7 @@ pub(crate) struct DdaPipelines {
   blit_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
   pub(crate) beam_pipeline: CachedComputePipelineId,
+  pub(crate) probe_viz_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
 }
 
@@ -2402,9 +2409,17 @@ fn init_dda_pipelines(
   // P3 beam 预 pass：低分辨率输出最近命中 t，主 pass 取邻域 min t 跳过空空间
   let beam = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_beam")),
+    layout: layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("beam_main")),
+    ..default()
+  });
+  // probe 可视化 pass：每探针一线程，投影到屏幕画黄色方块（BG0 写 out_tex + BG4 读 positions）
+  let probe_viz = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_probe_viz")),
     layout: layouts,
     shader: dda_shader,
-    entry_point: Some(Cow::from("beam_main")),
+    entry_point: Some(Cow::from("probe_viz_main")),
     ..default()
   });
 
@@ -2439,6 +2454,7 @@ fn init_dda_pipelines(
     blit_layout: blit,
     compute_pipeline: compute,
     beam_pipeline: beam,
+    probe_viz_pipeline: probe_viz,
     blit_pipeline,
   });
   commands.insert_resource(LightPoolGpu(UniformBuffer::default()));
@@ -2453,6 +2469,7 @@ fn prepare_dda_bind_groups(
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
+  ddgi_gpu: Option<Res<crate::ddgi::DdgiGpu>>,
   lighting: Option<Res<LightingTheme>>,
   light_gpu: Option<ResMut<LightPoolGpu>>,
   render_device: Res<RenderDevice>,
@@ -2478,7 +2495,13 @@ fn prepare_dda_bind_groups(
     return;
   };
 
-  let mut u = UniformBuffer::from(view_uniform.into_inner());
+  let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
+  // probe 可视化参数：总探针数 = base(id_base 层对齐) + 4 级联×4096；方块边长 3px
+  if let Some(g) = ddgi_gpu.as_ref() {
+    let total = g.id_base + 4 * 4096;
+    view.probe_viz_params = Vec4::new(total as f32, 3.0, 0.0, 0.0);
+  }
+  let mut u = UniformBuffer::from(view);
   u.write_buffer(&render_device, &queue);
 
   let bg0_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_layout);
@@ -2583,6 +2606,8 @@ pub(crate) fn dispatch_dda(
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
   bg4: Option<Res<crate::ddgi::DdgiBg4>>,
+  gpu: Option<Res<crate::ddgi::DdgiGpu>>,
+  dbg: Option<Res<crate::ddgi::DdgiDebugSettings>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
@@ -2661,6 +2686,34 @@ pub(crate) fn dispatch_dda(
       pass.dispatch_workgroups(gx, gy, 1);
     }
     span.end(ctx.command_encoder());
+  }
+
+  // ---- probe 可视化 pass：探针位置画黄色方块（toggle 开时执行）----
+  // 每探针 1 线程，投影到屏幕空间画 dot_size×dot_size 方块；不做深度测试。
+  if dbg.map_or(false, |d| d.probe_viz) {
+    if let Some(gpu) = gpu.as_ref() {
+      if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
+        let probe_count = gpu.id_base + 4 * 4096;
+        let span = recorder.time_span(ctx.command_encoder(), "gate_probe_viz");
+        {
+          let mut pass = ctx.command_encoder().begin_compute_pass(
+            &ComputePassDescriptor {
+              label: Some("gate_probe_viz"),
+              ..default()
+            },
+          );
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(0, &bg0.0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          let wg = probe_count.div_ceil(64);
+          pass.dispatch_workgroups(wg, 1, 1);
+        }
+        span.end(ctx.command_encoder());
+      }
+    }
   }
 }
 

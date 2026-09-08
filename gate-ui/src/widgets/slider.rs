@@ -131,7 +131,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
       FocusPolicy::Block,
     ))
     .with_children(|root| {
-      // 轨道槽（抬升表面，无圆角）
+      // 轨道槽（抬升表面 +1 阶：surface_elevated → surface_overlay，增强与填充对比）
       root
         .spawn((
           Name::new("ui-slider-track"),
@@ -140,10 +140,11 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
             height: px(TRACK_HEIGHT),
             ..default()
           },
-          BackgroundColor(color_of(&c.surface_elevated)),
+          BackgroundColor(color_of(&c.surface_overlay)),
         ))
         .with_children(|track| {
-          // 填充段（强调色，无圆角）
+          // 填充段（accent_fill → accent_fill_hover，提亮一阶并与 thumb 面区分；
+          // 原 accent_fill == surface_top == thumb 面色，导致填充与滑块同色不可辨）
           track.spawn((
             Name::new("ui-slider-fill"),
             SliderFill,
@@ -155,7 +156,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
               width: Val::Percent(norm * 100.0),
               ..default()
             },
-            BackgroundColor(color_of(&c.accent_fill)),
+            BackgroundColor(color_of(&c.accent_fill_hover)),
           ));
         });
       // 滑块（顶层表面 + 提亮边框；方形，无圆角；绝对定位，margin 负半宽居中）
@@ -219,10 +220,14 @@ pub fn slider_drag_system(
 }
 
 /// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px
+///
+/// 注意：fill 是 track 的子节点（slider root 的孙节点），不能只遍历 root 的直接
+/// Children——需要下钻 track 的 Children 才能命中 SliderFill。thumb 是 root 直接子。
 pub fn slider_visual_system(
   mut q_root: Query<(&SliderValue, &SliderRange, &Interaction, &Children), With<UiSlider>>,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
   mut thumbs: Query<&mut Node, With<SliderThumb>>,
+  q_track_children: Query<&Children, Without<UiSlider>>,
 ) {
   for (val, range, inter, children) in &mut q_root {
     let pct = normalize(val.0, range.min, range.max) * 100.0;
@@ -232,13 +237,20 @@ pub fn slider_visual_system(
       THUMB_SIZE
     };
     for child in children.iter() {
-      if let Ok(mut node) = fills.get_mut(child) {
-        node.width = Val::Percent(pct);
-      } else if let Ok(mut node) = thumbs.get_mut(child) {
+      // thumb 是 root 直接子
+      if let Ok(mut node) = thumbs.get_mut(child) {
         node.left = Val::Percent(pct);
         node.width = px(thumb_size);
         node.height = px(thumb_size);
         node.margin = UiRect::left(Val::Px(-thumb_size / 2.0));
+      }
+      // fill 在 track 内部（孙节点）：下钻 track 的 Children 找 SliderFill
+      if let Ok(tc) = q_track_children.get(child) {
+        for fill_entity in tc.iter() {
+          if let Ok(mut node) = fills.get_mut(fill_entity) {
+            node.width = Val::Percent(pct);
+          }
+        }
       }
     }
   }
@@ -358,9 +370,12 @@ mod tests {
         Children::default(),
       ))
       .id();
+    // 真实结构：root → track → fill；root → thumb
+    let track = app.world_mut().spawn((Children::default(),)).id();
     let fill = app.world_mut().spawn((SliderFill, Node::default())).id();
     let thumb = app.world_mut().spawn((SliderThumb, Node::default())).id();
-    app.world_mut().entity_mut(e).add_child(fill);
+    app.world_mut().entity_mut(track).add_child(fill);
+    app.world_mut().entity_mut(e).add_child(track);
     app.world_mut().entity_mut(e).add_child(thumb);
     app.update();
     let fill_node = app.world().get::<Node>(fill).unwrap();

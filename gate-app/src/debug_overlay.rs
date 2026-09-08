@@ -11,9 +11,10 @@ use gate_render::OrbitCamera;
 use gate_ui::{
   UiCtx,
   widgets::{
-    GridConfig, LabelConfig, LabelStyle, PanelSurface, PlotConfig, PlotData, PlotDomain,
-    PlotLayout, ToggleSwitchConfig, ToggleSwitchToggled, blank_plot_image, color_of, grid,
-    grid_cell, label, plot, px, toggle_switch,
+    ButtonConfig, ButtonVariant, GridConfig, LabelConfig, LabelStyle, PanelSurface, PlotConfig,
+    PlotData, PlotDomain, PlotLayout, SliderConfig, SliderValueChanged, ToggleSwitchConfig,
+    ToggleSwitchToggled, UiClick, blank_plot_image, button, color_of, grid, grid_cell, label, plot,
+    px, slider, toggle_switch,
   },
 };
 
@@ -66,6 +67,25 @@ struct ShowcaseVisibilityToggle;
 /// 「DDGI 间接光」开关标记（观察者写 gate_render::ddgi::DdgiEnabled 主世界资源）
 #[derive(Component)]
 struct DdgiGiToggle;
+
+/// DDGI 调试模式按钮标记（值 = 模式 0..4，互斥单选）
+#[derive(Component)]
+struct DdgiDebugModeBtn(u8);
+
+/// DDGI 增益滑杆标记
+#[derive(Component)]
+struct DdgiGainSlider;
+
+/// DDGI 增益数值标签（滑杆右侧，实时显示当前值）
+#[derive(Component)]
+struct DdgiGainValueLabel;
+
+/// Probe Viz 开关标记（写 DdgiDebugSettings.probe_viz → 探针位置黄色方块可视化）
+#[derive(Component)]
+struct DdgiProbeVizToggle;
+
+/// 调试模式名（按钮文本 + 日志用）
+const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
 
 /// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
 pub(crate) fn fps3(v: f32) -> u32 {
@@ -187,6 +207,100 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           );
           cell.world_mut().entity_mut(*t).insert(DdgiGiToggle);
         });
+        // ---- 行 6：DDGI 调试模式（5 按钮互斥单选；写 DdgiDebugSettings.mode）----
+        // 默认 mode=0（Normal）→ 第 0 个按钮 Primary（选中态），其余 Ghost。
+        // 直接把 cell 设为 row 方向（不套中间容器，避免 grid cell 内 flex 宽度算异常）
+        let c6 = grid_cell(&ctx, g, PanelSurface::Card);
+        g.world_mut()
+          .entity_mut(c6)
+          .insert(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: px(4.0),
+            align_items: AlignItems::Center,
+            padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)),
+            ..default()
+          })
+          .with_children(|cell| {
+            for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
+              let variant = if i == 0 {
+                ButtonVariant::Primary
+              } else {
+                ButtonVariant::Ghost
+              };
+              let b = button(
+                &ctx,
+                cell,
+                ButtonConfig {
+                  text: (*name).into(),
+                  variant,
+                },
+              );
+              cell
+                .world_mut()
+                .entity_mut(*b)
+                .insert(DdgiDebugModeBtn(i as u8));
+            }
+          });
+        // ---- 行 7：DDGI 增益滑杆（0.1..4.0，默认 1.0；写 DdgiDebugSettings.gain）----
+        let c7 = grid_cell(&ctx, g, PanelSurface::Card);
+        g.world_mut()
+          .entity_mut(c7)
+          .insert(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: px(8.0),
+            align_items: AlignItems::Center,
+            padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)),
+            ..default()
+          })
+          .with_children(|cell| {
+            label(
+              &ctx,
+              cell,
+              LabelConfig {
+                text: "Gain".into(),
+                style: LabelStyle::Muted,
+                ..default()
+              },
+            );
+            let s = slider(
+              &ctx,
+              cell,
+              SliderConfig {
+                min: 0.1,
+                max: 4.0,
+                value: 1.0,
+                step: Some(0.1),
+              },
+            );
+            cell.world_mut().entity_mut(*s).insert(DdgiGainSlider);
+            // 右侧实时数值标签
+            let vl = label(
+              &ctx,
+              cell,
+              LabelConfig {
+                text: "1.0".into(),
+                style: LabelStyle::Muted,
+                ..default()
+              },
+            );
+            cell
+              .world_mut()
+              .entity_mut(*vl)
+              .insert(DdgiGainValueLabel);
+          });
+        // ---- 行 8：Probe Viz 开关（探针位置黄色方块可视化；写 DdgiDebugSettings.probe_viz）----
+        let c8 = grid_cell(&ctx, g, PanelSurface::Card);
+        g.world_mut().entity_mut(c8).with_children(|cell| {
+          let t = toggle_switch(
+            &ctx,
+            cell,
+            ToggleSwitchConfig {
+              text: Some("Probe Viz".into()),
+              checked: false,
+            },
+          );
+          cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
+        });
       });
       // grid 默认 width: Percent(100) → 绝对定位根下改为收缩到内容宽（shrink-to-fit）
       if let Some(mut n) = root.world_mut().get_mut::<Node>(*g) {
@@ -222,6 +336,58 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         return;
       }
       ddgi.0 = ev.checked;
+    },
+  );
+
+  // 「Probe Viz」开关 → 写 DdgiDebugSettings.probe_viz（渲染世界 probe_viz_main dispatch）
+  world.add_observer(
+    |ev: On<ToggleSwitchToggled>,
+     q_toggle: Query<(), With<DdgiProbeVizToggle>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      if q_toggle.get(ev.entity).is_err() {
+        return;
+      }
+      dbg.probe_viz = ev.checked;
+    },
+  );
+
+  // DDGI 调试模式按钮 → 写 DdgiDebugSettings.mode + 互斥切换按钮变体（选中=Primary）
+  world.add_observer(
+    |ev: On<UiClick>,
+     q_btn: Query<&DdgiDebugModeBtn>,
+     mut q_all: Query<(Entity, &mut ButtonVariant), With<DdgiDebugModeBtn>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      let Ok(btn) = q_btn.get(ev.entity) else {
+        return;
+      };
+      let mode = btn.0 as f32;
+      dbg.mode = mode;
+      // 互斥：选中按钮 Primary，其余 Ghost
+      for (e, mut var) in &mut q_all.iter_mut() {
+        if e == ev.entity {
+          *var = ButtonVariant::Primary;
+        } else {
+          *var = ButtonVariant::Ghost;
+        }
+      }
+      let name = DDGI_DEBUG_MODES.get(btn.0 as usize).unwrap_or(&"?");
+      info!("DDGI debug mode → {} ({})", mode, name);
+    },
+  );
+
+  // DDGI 增益滑杆 → 写 DdgiDebugSettings.gain + 刷新右侧数值标签
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<DdgiGainSlider>>,
+     mut q_label: Query<&mut Text, With<DdgiGainValueLabel>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      dbg.gain = ev.value;
+      if let Ok(mut t) = q_label.single_mut() {
+        t.0 = format!("{:.1}", ev.value);
+      }
     },
   );
 }

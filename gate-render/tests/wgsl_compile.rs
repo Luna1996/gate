@@ -15,7 +15,6 @@ fn compile_wgsl(rel_path: &str) {
   let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel_path} 读取失败: {e}"));
   let module = naga::front::wgsl::parse_str(&src)
     .unwrap_or_else(|e| panic!("{rel_path} naga parse 失败: {e:?}"));
-  // validate 需要常量评估等能力：默认 Options 即可
   let mut validator = naga::valid::Validator::new(
     naga::valid::ValidationFlags::all(),
     naga::valid::Capabilities::all(),
@@ -23,7 +22,6 @@ fn compile_wgsl(rel_path: &str) {
   let info = validator
     .validate(&module)
     .unwrap_or_else(|e| panic!("{rel_path} naga validate 失败: {e:?}"));
-  // validate 通过即 shader 合法（entry point 集合非空由 dda_main/blit 的运行时装配保证）
   let _ = info;
 }
 

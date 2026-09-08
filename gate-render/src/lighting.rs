@@ -27,7 +27,8 @@ pub const SHADOW_BIAS: f32 = 0.5;
 pub const SHADOW_DIR_T_MAX: f32 = 8192.0;
 /// 发光体素 radiance 直出增益
 pub const EMISSIVE_EMIT_GAIN: f32 = 4.0;
-/// 天空纯色（Minecraft 白天平原天空 #78A7FF；palette 同为 u8/255 直读，无需 sRGB 转换）
+/// 天空纯色（Minecraft 白天平原天空 #78A7FF；sRGB u8/255 直读——
+/// sRGB→linear 转换在 WGSL sky_rgb() 内做，CPU 侧不碰光照数学）
 pub const MINECRAFT_SKY: [f32; 3] = [120.0 / 255.0, 167.0 / 255.0, 1.0];
 
 /// 光源描述（shader 镜像，48B；uniform 数组 stride 16 的倍数 ✓）

@@ -54,10 +54,14 @@ pub const PROBE_T_MAX: f32 = 8192.0;
 /// （结构性修复见 ddgi_sample_dom per-pixel jitter，而非调 bias）
 pub const DDGI_NORMAL_BIAS: f32 = 0.2;
 /// 每探针每次更新的射线数下限（WGSL DDGI_PROBE_RAYS_MIN 镜像）：RAY_BUDGET 摊派
-pub const DDGI_PROBE_RAYS_MIN: u32 = 16;
+/// 低于此值按下限执行。32 而非 16：base 轮换窗口恒钳 4096 探针，16 射线/探针的
+/// Monte-Carlo 噪声让邻探针收敛值差一个量级（逐 cell 方块斑驳 + 轮换跳变）。
+pub const DDGI_PROBE_RAYS_MIN: u32 = 32;
 /// 每帧更新探针钳制上限（WGSL DDGI_PROBE_BUDGET 镜像；seal pass min(count, 此值)）
 pub const DDGI_PROBE_BUDGET: u32 = 4096;
-/// 漏光 chevron 半宽（fine 单位；WGSL DDGI_DEPTH_BIAS 镜像，= cell × 0.25）：
+/// 漏光 chevron 半宽（fine 单位）＝ 所在域 cell × 0.25；本常量 = base 域（cell 16）
+/// 参考值。WGSL ddgi_sample_dom 已改为按采样域逐域计算（级联 32/64/128/256 →
+/// 8/16/32/64），固定 4 对粗级联相对过窄会误剔远角合法探针（网格状黑块）：
 /// wd = clamp((depth_texel − probe_to_point) / bias + 0.5, 0, 1)
 pub const DDGI_DEPTH_BIAS: f32 = DDGI_CELL as f32 * 0.25;
 /// cell_index 无探针哨兵
@@ -659,6 +663,10 @@ pub fn bake_cascade_grid_shifted(
 /// D4 outside_lower_grid：本 LOD cell 是否在更细网格覆盖外（true = 归本 LOD 管）。
 /// 全部区间为 16-cell 全局坐标：本 cell [lo, hi) 与更细域 [fo, fo+fd) 无重叠 → outside。
 /// 级联滚动步进保证域边缘 cell 对齐（M4-3），部分重叠 cell 归更细级（保守划分）。
+/// **WGSL ddgi_active 调用点先把 finer 域向内收缩 2 本级 cell（光晕）再传入**：
+/// 否则 finer 窗口边缘内 1 cell 的本级探针零数据（age=0 永不更新），而采样端
+/// 过渡带恰在该带与本级混合 → mix(黑) = 跟随相机的纯黑环带 + cast 自闭环毒化扩散。
+/// 本谓词保持纯几何语义（单测覆盖）；光晕收缩只发生在 WGSL 调用点。
 #[inline]
 pub fn outside_lower_grid(lo: IVec3, hi: IVec3, finer_origin: IVec3, finer_dims: UVec3) -> bool {
   let fo_hi = finer_origin + finer_dims.as_ivec3();
@@ -910,29 +918,18 @@ pub struct DdgiUniform {
 }
 
 impl DdgiUniform {
-  /// 诊断增益（GATE_DDGI_GAIN，默认 1；M5-3 调参/链路定位用，params.z 下发）
-  pub fn debug_gain() -> f32 {
-    std::env::var("GATE_DDGI_GAIN")
-      .ok()
-      .and_then(|v| v.parse::<f32>().ok())
-      .unwrap_or(1.0)
-  }
-
-  /// 调试模式（GATE_DDGI_DEBUG，默认 0=正常；params.y 下发，语义见 dda_main 注释）
-  pub fn debug_mode() -> f32 {
-    std::env::var("GATE_DDGI_DEBUG")
-      .ok()
-      .and_then(|v| v.parse::<f32>().ok())
-      .unwrap_or(0.0)
-  }
-
-  /// ProbeGrid + 帧状态 → uniform（M4-3 滚动后 reuse/finer 由 CPU 每帧覆写）
+  /// ProbeGrid + 帧状态 + 调试参数 → uniform（M4-3 滚动后 reuse/finer 由 CPU 每帧覆写）
+  ///
+  /// mode/gain 来自渲染世界 DdgiDebugSettings（主世界 DebugView UI 驱动，extract
+  /// 每帧拷贝），不再读 GATE_DDGI_DEBUG / GATE_DDGI_GAIN 环境变量。
   pub fn new(
     pg: &ProbeGrid,
     frame: u32,
     reuse_bounds: (IVec3, IVec3),
     finer: Option<CascadeDomain>,
     object_count: u32,
+    mode: f32,
+    gain: f32,
   ) -> Self {
     Self {
       grid_origin: Vec4::new(
@@ -947,12 +944,7 @@ impl DdgiUniform {
         pg.grid_dims.z as f32,
         pg.positions.len() as f32,
       ),
-      params: Vec4::new(
-        frame as f32,
-        Self::debug_mode(),
-        Self::debug_gain(),
-        object_count as f32,
-      ),
+      params: Vec4::new(frame as f32, mode, gain, object_count as f32),
       reuse_min: Vec4::new(
         reuse_bounds.0.x as f32,
         reuse_bounds.0.y as f32,
@@ -1170,17 +1162,43 @@ impl Default for DdgiEnabled {
   }
 }
 
+/// DDGI 运行时调试参数（主世界 DebugView UI 写入 → extract 拷到渲染世界 →
+/// prepare_ddgi 每帧写进 DdgiUniform.params.y/.z）。
+///
+/// 取代原 GATE_DDGI_DEBUG / GATE_DDGI_GAIN 环境变量：运行时可热切换，无需重启。
+/// - mode：params.y，0=正常，1=GI 提亮，2=wsum 热度，3=选域 id，4=探针状态
+/// - gain：params.z，诊断增益（调参/链路定位用）
+/// - probe_viz：探针位置可视化开关（devlog #23 风格黄色方块）
+#[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
+pub struct DdgiDebugSettings {
+  pub mode: f32,
+  pub gain: f32,
+  pub probe_viz: bool,
+}
+
+impl Default for DdgiDebugSettings {
+  fn default() -> Self {
+    Self {
+      mode: 0.0,
+      gain: 1.0,
+      probe_viz: false,
+    }
+  }
+}
+
 /// DDGI 插件：main world VoxelScene → 一次性烘焙 → GPU 纹理数组/buffer/BG4 + 管线
 pub struct DdgiPlugin;
 
 impl bevy::app::Plugin for DdgiPlugin {
   fn build(&self, app: &mut bevy::app::App) {
     app.init_resource::<DdgiEnabled>();
+    app.init_resource::<DdgiDebugSettings>();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app
       .init_resource::<DdgiEnabled>()
+      .init_resource::<DdgiDebugSettings>()
       .add_systems(RenderStartup, init_ddgi_gpu)
       .add_systems(bevy::render::ExtractSchedule, extract_ddgi_bake)
       .add_systems(
@@ -1221,13 +1239,17 @@ fn dummy_indirect_buffer(device: &RenderDevice, label: &str) -> Buffer {
   })
 }
 
-/// 诊断 staging（16B dispatch + 8 irr 采样层 + 1 depth 采样层）；MAP_READ + COPY_DST
+/// 诊断 staging（16B dispatch + 8 irr 采样层 + 1 depth 采样层 + 8 meta 采样层
+/// ——黑探针普查用：逐探针 age × irr 非零分类）；MAP_READ + COPY_DST
 fn ddgi_readback_buffer(device: &RenderDevice) -> Buffer {
   device.create_buffer(&BufferDescriptor {
     label: Some("ddgi_readback".into()),
     size: 256u64
       + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64
       + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * 4) as u64
+      // meta 8 采样层：256B 行距 × 16 行/层（COPY_BYTES_PER_ROW_ALIGNMENT，
+      // 行宽 64B 不达标 → Validation Error）
+      + (8 * (META_COPY_BPR as u64 * PROBES_PER_LAYER_AXIS as u64))
       + 64,
     usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
     mapped_at_creation: false,
@@ -1861,11 +1883,56 @@ fn dispatch_ddgi(
             word(40 + c * 4)
           ));
         }
+        // 黑探针普查（同 8 采样层，2048 探针）：a0 = age=0（未激活，采样端已门控）；
+        // blk = age≥1 且 irr 全零（被当有效探针采样 → 暗块/黑块直接来源）；ok = 正常。
+        // blk 全局探针 id（= layer×256+p）取前 8 个供世界坐标定位（cell = id 反查）。
+        let meta_base =
+          64 + 8 * texels_per_layer + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
+        let (mut a0, mut blk, mut ok) = (0u32, 0u32, 0u32);
+        let mut blk_ids = String::new();
+        for k in 0..8usize {
+          let layer = k * 160;
+          let ibase = 64 + k * texels_per_layer;
+          // meta 区按拷贝行距 256B（64 word/行）读回：层 = 16 行 × 64 word，
+          // 探针 p 的 word 下标 = 行 p/16 × 64 + 列 p%16（其余为 pad 零）
+          let mb = meta_base + k * (PROBES_PER_LAYER_AXIS as usize * META_ROW_WORDS);
+          for p in 0..PROBES_PER_LAYER as usize {
+            let age = (word(
+              mb + (p / PROBES_PER_LAYER_AXIS as usize) * META_ROW_WORDS
+                + (p % PROBES_PER_LAYER_AXIS as usize),
+            ) >> META_AGE_SHIFT)
+              & 0xFF;
+            if age == 0 {
+              a0 += 1;
+              continue;
+            }
+            let px = p % PROBES_PER_LAYER_AXIS as usize;
+            let py = p / PROBES_PER_LAYER_AXIS as usize;
+            let mut nz = false;
+            'scan: for ty in 0..IRRADIANCE_TEXELS as usize {
+              let row = ibase + (((py * 8 + ty) * IRRADIANCE_LAYER_TEXELS as usize) + px * 8) * 2;
+              for tx in 0..IRRADIANCE_TEXELS as usize {
+                if word(row + tx * 2) != 0 || word(row + tx * 2 + 1) != 0 {
+                  nz = true;
+                  break 'scan;
+                }
+              }
+            }
+            if nz {
+              ok += 1;
+            } else {
+              blk += 1;
+              if blk <= 8 {
+                blk_ids.push_str(&format!(" {}", layer as u32 * PROBES_PER_LAYER + p as u32));
+              }
+            }
+          }
+        }
         drop(data);
         gpu.readback.unmap();
         gpu.readback_state = 0;
         bevy::log::info!(
-          "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}]{} irr:{summary} depth650_lt8k:{}",
+          "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}]{} irr:{summary} depth650_lt8k:{} census: a0={a0} blk={blk} ok={ok} blk_ids:[{blk_ids}]",
           gpu.frame,
           count,
           indirect0,
@@ -1874,7 +1941,7 @@ fn dispatch_ddgi(
           wl[2],
           wl[3],
           casc,
-          dep_lt
+          dep_lt,
         );
       }
     }
@@ -1940,6 +2007,38 @@ fn dispatch_ddgi(
               depth_or_array_layers: 1,
             },
           );
+          // 黑探针普查：同 8 个采样层的 meta（逐探针 age；布局 = 16×16 u32/层）
+          for k in 0..8u32 {
+            encoder.copy_texture_to_buffer(
+              TexelCopyTextureInfo {
+                texture: &gpu.meta_next,
+                mip_level: 0,
+                origin: Origin3d {
+                  x: 0,
+                  y: 0,
+                  z: k * 160,
+                },
+                aspect: TextureAspect::All,
+              },
+              TexelCopyBufferInfo {
+                buffer: &gpu.readback,
+                layout: TexelCopyBufferLayout {
+                  offset: 256
+                    + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64
+                    + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * 4) as u64
+                    + (k as u64) * (META_COPY_BPR as u64 * PROBES_PER_LAYER_AXIS as u64),
+                  // 行距 256B 对齐（行宽 64B 违规 → Validation Error）
+                  bytes_per_row: Some(META_COPY_BPR),
+                  rows_per_image: Some(PROBES_PER_LAYER_AXIS),
+                },
+              },
+              Extent3d {
+                width: PROBES_PER_LAYER_AXIS,
+                height: PROBES_PER_LAYER_AXIS,
+                depth_or_array_layers: 1,
+              },
+            );
+          }
         }
         gpu.readback_state = 1;
       }
@@ -1955,10 +2054,21 @@ fn extract_ddgi_bake(
   gpu: Option<ResMut<DdgiGpu>>,
   inflight: Option<Res<ProbeBake>>,
   enabled: Option<bevy::render::Extract<Res<DdgiEnabled>>>,
+  debug: Option<bevy::render::Extract<Res<DdgiDebugSettings>>>,
 ) {
   // 主世界开关 → 渲染世界（prepare/dispatch 读渲染世界副本）
   let on = enabled.map_or(true, |e| e.0);
   commands.insert_resource(DdgiEnabled(on));
+  // 主世界 DDGI 调试参数 → 渲染世界（prepare_ddgi 写进 uniform.params.y/.z）
+  let dbg = match debug {
+    Some(d) => DdgiDebugSettings {
+      mode: d.mode,
+      gain: d.gain,
+      probe_viz: d.probe_viz,
+    },
+    None => DdgiDebugSettings::default(),
+  };
+  commands.insert_resource(dbg);
   let Some(scene) = scene else {
     return;
   };
@@ -2025,6 +2135,32 @@ fn u32_bytes(v: &[u32]) -> Vec<u8> {
   let mut out = Vec::with_capacity(v.len() * 4);
   for c in v {
     out.extend_from_slice(&c.to_le_bytes());
+  }
+  out
+}
+
+/// meta 拷贝行距：wgpu COPY_BYTES_PER_ROW_ALIGNMENT = 256B。meta 行宽
+/// 16 texel × 4B = 64B 不达标——所有 buffer↔meta 纹理拷贝（write_texture /
+/// copy_texture_to_buffer）必须按 256B 行距排布（每行 64 word：前 16 word 数据
+/// + 48 pad word；violation = Validation Error 退出）。
+pub const META_COPY_BPR: u32 = 256;
+const META_ROW_WORDS: usize = META_COPY_BPR as usize / 4;
+
+/// 紧凑 meta words（层主序 16×16 u32/层，`build_meta_texture_data` 布局）→
+/// 256B 行距 padded 字节流。层内 (x,y) 不变，仅行尾补 pad。
+fn meta_padded_bytes(flat_words: &[u32]) -> Vec<u8> {
+  let per_layer = PROBES_PER_LAYER as usize;
+  let layers = flat_words.len() / per_layer;
+  debug_assert_eq!(flat_words.len() % per_layer, 0);
+  let mut out = vec![0u8; layers * PROBES_PER_LAYER_AXIS as usize * META_ROW_WORDS * 4];
+  for l in 0..layers {
+    for y in 0..PROBES_PER_LAYER_AXIS as usize {
+      for x in 0..PROBES_PER_LAYER_AXIS as usize {
+        let src = l * per_layer + y * PROBES_PER_LAYER_AXIS as usize + x;
+        let dst = l * (PROBES_PER_LAYER_AXIS as usize * META_ROW_WORDS) + y * META_ROW_WORDS + x;
+        out[dst * 4..dst * 4 + 4].copy_from_slice(&flat_words[src].to_le_bytes());
+      }
+    }
   }
   out
 }
@@ -2096,10 +2232,20 @@ fn cascade_scroll_reset(
     ] {
       let list: &[[i32; 4]] = if full { full_rects } else { rects };
       for &[x, y, w, h] in list {
-        let texels = (w * h) as usize * words;
-        let mut data = Vec::with_capacity(texels * 4);
-        for _ in 0..texels {
-          data.extend_from_slice(&pattern);
+        // 行距 256B 对齐（COPY_BYTES_PER_ROW_ALIGNMENT）：w=8/16 列带的裸行宽
+        // 64B 不达标 → 每行补 pad 到 256B 边界
+        let row_bytes = (w as usize) * 4 * words;
+        let bpr = ((row_bytes + 255) / 256) * 256;
+        let row_texels = (w as usize) * words;
+        let pad_words = bpr / 4 - row_texels;
+        let mut data = Vec::with_capacity((row_texels + pad_words) * (h as usize) * 4);
+        for _ in 0..h {
+          for _ in 0..row_texels {
+            data.extend_from_slice(&pattern);
+          }
+          for _ in 0..pad_words {
+            data.extend_from_slice(&[0u8; 4]);
+          }
         }
         for tex in [tex_pair.0, tex_pair.1] {
           queue.write_texture(
@@ -2116,7 +2262,7 @@ fn cascade_scroll_reset(
             &data,
             TexelCopyBufferLayout {
               offset: 0,
-              bytes_per_row: Some((w * 4 * words as i32) as u32),
+              bytes_per_row: Some(bpr as u32),
               rows_per_image: Some(h as u32),
             },
             Extent3d {
@@ -2139,6 +2285,7 @@ fn prepare_ddgi(
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
   bake: Option<Res<ProbeBake>>,
   enabled: Res<DdgiEnabled>,
+  dbg: Res<DdgiDebugSettings>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
   let tp = std::time::Instant::now();
@@ -2296,13 +2443,24 @@ fn prepare_ddgi(
       (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * layers)
         as usize
     ]);
-    let meta_data = u32_bytes(&build_meta_texture_data(pg));
+    // meta 行宽 64B 不达 256B 拷贝对齐 → padded 行距字节流
+    let meta_data = meta_padded_bytes(&build_meta_texture_data(pg));
     for tex in [&dep_a, &dep_b, &meta_a, &meta_b] {
-      let (bytes_per_row, rows, data): (u32, u32, &[u8]) =
+      let (bytes_per_row, rows, width, data): (u32, u32, u32, &[u8]) =
         if tex.format() == TextureFormat::R32Float {
-          (DEPTH_LAYER_TEXELS * 4, DEPTH_LAYER_TEXELS, &dep_data)
+          (
+            DEPTH_LAYER_TEXELS * 4,
+            DEPTH_LAYER_TEXELS,
+            DEPTH_LAYER_TEXELS,
+            &dep_data,
+          )
         } else {
-          (PROBES_PER_LAYER_AXIS * 4, PROBES_PER_LAYER_AXIS, &meta_data)
+          (
+            META_COPY_BPR,
+            PROBES_PER_LAYER_AXIS,
+            PROBES_PER_LAYER_AXIS,
+            &meta_data,
+          )
         };
       queue.write_texture(
         TexelCopyTextureInfo {
@@ -2318,7 +2476,7 @@ fn prepare_ddgi(
           rows_per_image: Some(rows),
         },
         Extent3d {
-          width: bytes_per_row / 4,
+          width,
           height: rows,
           depth_or_array_layers: layers,
         },
@@ -2346,7 +2504,7 @@ fn prepare_ddgi(
     gpu
       .uniform
       .get_mut()
-      .clone_from(&DdgiUniform::new(pg, 0, REUSE_ALL, None, 0));
+      .clone_from(&DdgiUniform::new(pg, 0, REUSE_ALL, None, 0, dbg.mode, dbg.gain));
 
     // ---- M4-3 级联资源（4 级 × 4096 探针；纹理层 [base_layers + c×16, +16)）----
     // 级联探针 id = id_base + c×4096 + internal_id（id_base = base_layers×256，层
@@ -2422,7 +2580,7 @@ fn prepare_ddgi(
       ]);
       for c in 0..4usize {
         let layer0 = layers + c as u32 * 16;
-        let meta_c = u32_bytes(&cm.metas[c]);
+        let meta_c = meta_padded_bytes(&cm.metas[c]);
         for tex in [&gpu.meta_prev, &gpu.meta_next] {
           queue.write_texture(
             TexelCopyTextureInfo {
@@ -2438,7 +2596,7 @@ fn prepare_ddgi(
             &meta_c,
             TexelCopyBufferLayout {
               offset: 0,
-              bytes_per_row: Some(PROBES_PER_LAYER_AXIS * 4),
+              bytes_per_row: Some(META_COPY_BPR),
               rows_per_image: Some(PROBES_PER_LAYER_AXIS),
             },
             Extent3d {
@@ -2488,6 +2646,10 @@ fn prepare_ddgi(
   // probe_count=0 同样建 BG（占位资源可绑；ddgi pass 按 count=0 早退）。
   gpu.frame = gpu.frame.wrapping_add(1);
   gpu.uniform.get_mut().params.x = gpu.frame as f32;
+  // DDGI 调试参数（主世界 DebugView UI 驱动，extract 每帧拷贝）：mode→params.y，
+  // gain→params.z。base uniform 在烘焙帧一次性设置，此处每帧覆写保证运行时热切换生效。
+  gpu.uniform.get_mut().params.y = dbg.mode;
+  gpu.uniform.get_mut().params.z = dbg.gain;
   // 运行时开关位：reuse_max.w 是空闲通道（WGSL 只读 reuse_max.xyz）；trace shader
   // 据此跳过探针采样（gi=0）。1=开 0=关。
   gpu.uniform.get_mut().reuse_max.w = if enabled.0 { 1.0 } else { 0.0 };
@@ -2519,7 +2681,7 @@ fn prepare_ddgi(
       };
       let shift = cm.pending_shift[c];
       CascFrame {
-        dom: DdgiUniform::new(&cm.grids[c], frame, cm.reuse[c], finer, 0),
+        dom: DdgiUniform::new(&cm.grids[c], frame, cm.reuse[c], finer, 0, dbg.mode, dbg.gain),
         shift,
         probe_count: cm.grids[c].positions.len() as u32,
         pos_packed: shift.map(|_| pack_probe_positions(&cm.grids[c])),
@@ -2584,10 +2746,10 @@ fn prepare_ddgi(
             },
             aspect: TextureAspect::All,
           },
-          &u32_bytes(meta),
+          &meta_padded_bytes(meta),
           TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(PROBES_PER_LAYER_AXIS * 4),
+            bytes_per_row: Some(META_COPY_BPR),
             rows_per_image: Some(PROBES_PER_LAYER_AXIS),
           },
           Extent3d {

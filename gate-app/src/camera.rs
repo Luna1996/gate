@@ -1,10 +1,11 @@
-//! 相机与输入：轨道相机拖拽/滚轮、左键拾取 recenter、调试开关（V 可见性缓存）。
+//! 相机与输入：轨道相机拖拽/滚轮、左键拾取 recenter、Shift+左键探针点查、调试开关（V 可见性缓存）。
 
 use bevy::{
   input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
   prelude::*,
 };
 
+use gate_render::ddgi::{NO_PROBE, bake_probe_grid};
 use gate_render::{
   BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, OrbitCamera, VIEW_SIZE, VoxelScene,
   cpu_reference_trace_volumes,
@@ -102,7 +103,157 @@ fn window_height(windows: &Query<&Window>) -> f32 {
     .unwrap_or(VIEW_SIZE.y as f32)
 }
 
-/// 左键点击：把旋转中心（OrbitCamera.target）搬到点击像素命中的体素位置。
+/// Shift+左键探针点查：与 left_click_pick_recenter 共享 ray 构造 + picking，
+/// 但 Shift 保持时不走 recenter 逻辑——改而用 bake_probe_grid 临时烘焙主世界探针网格
+/// （点击低频，单次 ~500ms 可接受），遍历找 3D 欧氏距离最近的探针，日志输出
+/// probe_id / 世界坐标 / cell 坐标 / cell_size / 邻近 cell occupancy 等详细数据。
+///
+/// 为什么用 bake_probe_grid 而非复用渲染世界 ProbeBake？
+/// bevy 0.19 Extract 单向 main→render，主世界拿不到渲染世界资源；让 extract 双写
+/// 主世界 ProbeDebugCopy 需要改 RenderApp 架构。点击诊断是调试工具，接受单次烘焙成本。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_click_inspect(
+  mouse: Res<ButtonInput<MouseButton>>,
+  keys: Res<ButtonInput<KeyCode>>,
+  captured: Res<gate_ui::UiPointerCaptured>,
+  windows: Query<&Window>,
+  cfg: Res<DdaCameraConfig>,
+  scene: Option<Res<VoxelScene>>,
+) {
+  if !mouse.just_pressed(MouseButton::Left) {
+    return;
+  }
+  let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+  if !shift {
+    return;
+  }
+  if captured.0 {
+    return;
+  }
+  let Some(scene) = scene else {
+    return;
+  };
+  let Ok(window) = windows.single() else {
+    return;
+  };
+  let Some(cursor) = window.cursor_position() else {
+    return;
+  };
+  // 射线构造（同 left_click_pick_recenter）
+  let sf = window.scale_factor() as f32;
+  let phys = cursor * sf;
+  let pw = window.physical_width().max(1) as f32;
+  let ph = window.physical_height().max(1) as f32;
+  let u = (phys.x / pw) * 2.0 - 1.0;
+  let v = 1.0 - (phys.y / ph) * 2.0;
+  let near = cfg.inv_view_proj * Vec4::new(u, v, 0.0, 1.0);
+  let far = cfg.inv_view_proj * Vec4::new(u, v, 1.0, 1.0);
+  let near = near.truncate() / near.w;
+  let far = far.truncate() / far.w;
+  let dir = (far - near).normalize_or_zero();
+  if dir.length_squared() < 1e-20 {
+    return;
+  }
+  let t_max = (CAM_FAR - CAM_NEAR).max((far - near).length());
+  // CPU picking（同 left_click_pick_recenter）
+  let per_vol_bufs: Vec<BrickMapBuffers> = scene
+    .volumes
+    .list
+    .iter()
+    .map(|v| BrickMapBuilder::build_full(v).buffers().clone())
+    .collect();
+  let vols_with_tr: Vec<(&BrickMapBuffers, VolumeTransform)> = per_vol_bufs
+    .iter()
+    .zip(scene.volumes.list.iter().map(|v| v.transform))
+    .map(|(b, t)| (b, t))
+    .collect();
+  let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, cfg.position_world, dir, t_max) else {
+    info!("PROBE INSPECT → 点击位置无体素命中（空气或场景外）");
+    return;
+  };
+  let mut p = cfg.position_world + dir * hit.t;
+  p += hit.normal * 0.5;
+  // 临时烘焙主世界探针网格（~500ms，可接受）
+  let t0 = std::time::Instant::now();
+  let pg = bake_probe_grid(&scene.volumes);
+  info!(
+    "PROBE INSPECT → bake_probe_grid {}ms ({} probes, {} cells)",
+    t0.elapsed().as_millis(),
+    pg.positions.len(),
+    pg.cell_index.len()
+  );
+  // 遍历找 3D 欧氏距离最近的探针
+  let mut best: Option<(u32, Vec3, f32)> = None;
+  for (i, pos) in pg.positions.iter().enumerate() {
+    let d = pos.distance(p);
+    match best {
+      None => best = Some((i as u32, *pos, d)),
+      Some((_, _, bd)) if d < bd => best = Some((i as u32, *pos, d)),
+      _ => {}
+    }
+  }
+  let Some((probe_id, probe_pos, dist)) = best else {
+    info!("PROBE INSPECT → 无可用探针（ProbeGrid.positions 为空）");
+    return;
+  };
+  // 反查 cell 坐标：probe 在 cell 内部，cell_min = floor(pos/cell_size)，cell16 = (pos/16 - origin)
+  let ddgi_cell = 16.0_f32;
+  let cell16 = IVec3::new(
+    ((probe_pos.x / ddgi_cell) as i32) - pg.grid_origin.x,
+    ((probe_pos.y / ddgi_cell) as i32) - pg.grid_origin.y,
+    ((probe_pos.z / ddgi_cell) as i32) - pg.grid_origin.z,
+  );
+  let cell_dims = pg.grid_dims.as_ivec3();
+  let cell_size = pg.cell_size as f32;
+  // 6 邻域 cell occupancy（判断「孤岛探针」是否被 3D 剔除）
+  let mut neighbor_count = 0u32;
+  for dz in -1..=1 {
+    for dy in -1..=1 {
+      for dx in -1..=1 {
+        if dx == 0 && dy == 0 && dz == 0 {
+          continue;
+        }
+        let n = cell16 + IVec3::new(dx, dy, dz) * (pg.cell_size / 16);
+        if n.x < 0
+          || n.y < 0
+          || n.z < 0
+          || n.x >= cell_dims.x
+          || n.y >= cell_dims.y
+          || n.z >= cell_dims.z
+        {
+          continue;
+        }
+        let li = (n.x + n.y * cell_dims.x + n.z * cell_dims.x * cell_dims.y) as usize;
+        if li < pg.cell_index.len() && pg.cell_index[li] != NO_PROBE {
+          neighbor_count += 1;
+        }
+      }
+    }
+  }
+  info!(
+    "PROBE INSPECT → hit=({:.1},{:.1},{:.1}) probe_id={} probe_pos=({:.1},{:.1},{:.1}) dist={:.2} cell16=({},{},{}) cell_size={} neighbors={}/26",
+    p.x,
+    p.y,
+    p.z,
+    probe_id,
+    probe_pos.x,
+    probe_pos.y,
+    probe_pos.z,
+    dist,
+    cell16.x,
+    cell16.y,
+    cell16.z,
+    cell_size,
+    neighbor_count,
+  );
+  let cell_li = (cell16.x + cell16.y * cell_dims.x + cell16.z * cell_dims.x * cell_dims.y) as usize;
+  if cell_li < pg.cell_index.len() {
+    info!(
+      "PROBE INSPECT → cell[{},{},{}].probe_id = {} (匹配 probe_id={})",
+      cell16.x, cell16.y, cell16.z, pg.cell_index[cell_li], probe_id,
+    );
+  }
+}
 /// - 未命中任何体素 / 物体 → 不做操作。
 /// - 命中点用射线入点 fine 坐标（命中面外侧向内偏半个 fine，避免 target 贴着面导致
 ///   距离过近时 pitch clamp 抖动）。
