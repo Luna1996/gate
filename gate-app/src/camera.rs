@@ -245,7 +245,8 @@ pub(crate) fn probe_click_inspect(
     cell_size,
     neighbor_count,
   );
-  let cell_li = (cell_rel.x + cell_rel.y * cell_dims.x + cell_rel.z * cell_dims.x * cell_dims.y) as usize;
+  let cell_li =
+    (cell_rel.x + cell_rel.y * cell_dims.x + cell_rel.z * cell_dims.x * cell_dims.y) as usize;
   if cell_li < pg.cell_index.len() {
     info!(
       "PROBE INSPECT → cell[{},{},{}].probe_id = {} (匹配 probe_id={})",

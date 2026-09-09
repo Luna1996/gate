@@ -69,6 +69,16 @@ pub const DDGI_DEPTH_BIAS: f32 = DDGI_CELL as f32 * 0.25;
 /// cell_index 无探针哨兵
 pub const NO_PROBE: u32 = u32::MAX;
 
+/// per-cell 探针标志（Douglas sort.glsl `DdgiProbeFlags` 逐位；烘焙期随探针放置
+/// 一次性确定并上传，GPU ddgi_active 只读不重算——单一真相源，根除 GPU 运行时
+/// 几何走查与 CPU 烘焙判定分歧导致的 viz 红点）：
+/// - bit0 ENABLED：本 cell 放了探针（Air 居中 / Mixed 偏移；Solid 全满无探针 = 0）
+/// - bit1 NO_SURFACES：本 cell 纯空气无表面（Air）。Solid/Mixed = 0。
+/// Solid cell（无探针）flags=0：6 邻居按位 AND 时把 NO_SURFACES 位拉 0 →
+/// 邻接 Solid 等价「邻居有表面」，与 Mixed 同效（Douglas intersection 语义）。
+pub const DDGI_FLAG_ENABLED: u8 = 1;
+pub const DDGI_FLAG_NO_SURFACES: u8 = 2;
+
 /// 每探针 irradiance 字数（rgba32f texel = 4 words；f16 打包为后续优化）
 pub const IRRADIANCE_WORDS_PER_PROBE: u32 = IRRADIANCE_TEXELS * IRRADIANCE_TEXELS * 4;
 /// 每探针 depth 字数（r32f texel = 1 word）
@@ -269,6 +279,9 @@ pub struct ProbeGrid {
   /// dense cell → probe 下标（NO_PROBE = 无探针）
   /// 线性地址 = x + y*dims.x + z*dims.x*dims.y（rel 为本级 cell 坐标）
   pub cell_index: Vec<u32>,
+  /// dense cell → DdgiProbeFlags（DDGI_FLAG_*；与 cell_index 平行，per-cell）。
+  /// 烘焙期几何三态 → ENABLED/NO_SURFACES，GPU active 只读（单一真相源）。
+  pub cell_flags: Vec<u8>,
   /// 探针位置（世界 fine 坐标；下标 = probe id）
   pub positions: Vec<Vec3>,
   /// 活跃位（id 对齐 positions；Douglas #23 近表面语义 = 本 cell 或 6 面邻接
@@ -285,6 +298,7 @@ impl Default for ProbeGrid {
       grid_dims: UVec3::ZERO,
       cell_size: DDGI_CELL,
       cell_index: Vec::new(),
+      cell_flags: Vec::new(),
       positions: Vec::new(),
       active: Vec::new(),
     }
@@ -330,11 +344,13 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
   let hi_excl = (max_chunk + 1) * CELLS_PER_CHUNK;
   let dims = (hi_excl - lo).as_uvec3();
 
+  let total_cells = dims.x as usize * dims.y as usize * dims.z as usize;
   let mut pg = ProbeGrid {
     grid_origin: lo,
     grid_dims: dims,
     cell_size: DDGI_CELL,
-    cell_index: vec![NO_PROBE; dims.x as usize * dims.y as usize * dims.z as usize],
+    cell_index: vec![NO_PROBE; total_cells],
+    cell_flags: vec![0u8; total_cells],
     positions: Vec::new(),
     active: Vec::new(),
   };
@@ -348,7 +364,8 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
           let li = pg.cell_linear(rel);
           let cell_min = cell * DDGI_CELL;
           let state = grid.get_brick_state(VoxelCoord::from_ivec3(cell_min), DDGI_CELL_LEVEL);
-          // 全实心 cell 无探针（Douglas：全满 → 无探针）
+          // 全实心 cell 无探针（Douglas：全满 → 无探针）；flags 留 0（not ENABLED，
+          // AND 邻接时等价「有表面」拉低 NO_SURFACES）
           if matches!(state, BrickState::Solid(_)) {
             continue;
           }
@@ -356,13 +373,21 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
           // 半满推向空边 / 全满不放）。gate 树 Mixed 是双义的（空实混合 / 多色全实，
           // 见 BrickState 文档）：多色全实 cell 沿树无空叶 → None = DDGI「全满」
           // （palette 不参与）→ 无探针，与 Solid 同途。
-          let Some(pos) = (match state {
-            BrickState::Air => Some(cell_min.as_vec3() + Vec3::splat(DDGI_CELL as f32 / 2.0)),
-            _ => probe_position_in_cell(grid, cell_min, DDGI_CELL_LEVEL).map(|(_, p)| p),
+          let air = matches!(state, BrickState::Air);
+          let Some(pos) = (if air {
+            Some(cell_min.as_vec3() + Vec3::splat(DDGI_CELL as f32 / 2.0))
+          } else {
+            probe_position_in_cell(grid, cell_min, DDGI_CELL_LEVEL).map(|(_, p)| p)
           }) else {
             continue;
           };
           pg.cell_index[li] = pg.positions.len() as u32;
+          // Air = ENABLED|NO_SURFACES（纯空气，近表面靠邻居）；Mixed = ENABLED（本 cell 有表面）
+          pg.cell_flags[li] = if air {
+            DDGI_FLAG_ENABLED | DDGI_FLAG_NO_SURFACES
+          } else {
+            DDGI_FLAG_ENABLED
+          };
           pg.positions.push(pos);
           pg.active.push(probe_is_active(grid, cell_min, DDGI_CELL));
         }
@@ -622,22 +647,26 @@ fn probe_leaf_sized(
   }
 }
 
-/// 单 cell 探针烘焙（Solid / Mixed 下钻无空叶 → None；cell_min 由 origin/rel 推导）
+/// 单 cell 探针烘焙（Solid / Mixed 下钻无空叶 → None；cell_min 由 origin/rel 推导）。
+/// 返回 (探针位置, per-cell flags)：Air → ENABLED|NO_SURFACES；Mixed → ENABLED。
 fn bake_cascade_cell(
   grid: &gate_voxel::VolumeGrid,
   cell_size: i32,
   origin: IVec3,
   rel: UVec3,
-) -> Option<Vec3> {
+) -> Option<(Vec3, u8)> {
   let step = cell_size / DDGI_CELL;
   let cell_min = (origin + IVec3::new(rel.x as i32, rel.y as i32, rel.z as i32) * step) * DDGI_CELL;
-  if matches!(
-    cell_state_at(grid, cell_min, cell_size),
-    BrickState::Solid(_)
-  ) {
+  let state = cell_state_at(grid, cell_min, cell_size);
+  if matches!(state, BrickState::Solid(_)) {
     return None;
   }
-  probe_position_sized(grid, cell_min, cell_size)
+  if matches!(state, BrickState::Air) {
+    let center = cell_min.as_vec3() + Vec3::splat(cell_size as f32 / 2.0);
+    return Some((center, DDGI_FLAG_ENABLED | DDGI_FLAG_NO_SURFACES));
+  }
+  // Mixed：BFS 找空叶偏移；多色全实无空叶 → None（全满无探针）
+  probe_position_sized(grid, cell_min, cell_size).map(|p| (p, DDGI_FLAG_ENABLED))
 }
 
 /// 烘焙一个级联级探针网格（D9：cell 尺寸 ×2 递增的相机滚动级 / base 世界级）。
@@ -664,6 +693,7 @@ pub fn bake_cascade_grid(
     grid_dims: dims_cells,
     cell_size,
     cell_index: vec![NO_PROBE; total],
+    cell_flags: vec![0u8; total],
     positions: vec![Vec3::ZERO; total],
     active: vec![false; total],
   };
@@ -672,10 +702,11 @@ pub fn bake_cascade_grid(
       for rx in 0..dims_cells.x {
         let rel = UVec3::new(rx, ry, rz);
         let li = pg.cell_linear(rel);
-        let Some(pos) = bake_cascade_cell(grid, cell_size, origin_cell, rel) else {
+        let Some((pos, flags)) = bake_cascade_cell(grid, cell_size, origin_cell, rel) else {
           continue;
         };
         pg.cell_index[li] = li as u32;
+        pg.cell_flags[li] = flags;
         pg.positions[li] = pos;
         pg.active[li] = probe_is_active(grid, pg.cell_min_voxel(rel), cell_size);
       }
@@ -829,11 +860,12 @@ pub struct DdgiDomains {
   pub cascades: [DdgiUniform; 4],
 }
 
-/// BG4 v3 布局（dda.wgsl group(4) 15 binding 逐字镜像；改 shader 必同步此处）：
+/// BG4 v3 布局（dda.wgsl group(4) 16 binding 逐字镜像；改 shader 必同步此处）：
 /// 0=uniform(本级域) 1=positions(ro) 2=cell_index(ro,本级 dense) 3/4=irr/depth_prev
 /// (纹理数组采样读) 5/6=irr/depth_next(storage write) 7/8=meta prev/next(r32uint)
 /// 9=dispatch(rw atomic) 10=objects(ro) 11=samples(rw) 12=worklist(rw)
-/// 13=uniform(全域 DdgiDomains 560B) 14=all_ci(ro,全域 dense cell_index)
+/// 13=uniform(全域 DdgiDomains 320B) 14=all_ci(ro,全域 dense cell_index)
+/// 15=cell_flags(ro,本级 dense DdgiProbeFlags)
 pub fn ddgi_bg4_layout() -> BindGroupLayoutDescriptor {
   const C: ShaderStages = ShaderStages::COMPUTE;
   let tex = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
@@ -902,6 +934,7 @@ pub fn ddgi_bg4_layout() -> BindGroupLayoutDescriptor {
         count: None,
       },
       buf(14, true),
+      buf(15, true), // cell_flags（本级 dense DdgiProbeFlags，ro）
     ],
   )
 }
@@ -920,6 +953,7 @@ pub struct DdgiPipelines {
 pub struct CascadeGpu {
   pub uniform: UniformBuffer<DdgiUniform>,
   pub cell_index: Buffer,
+  pub cell_flags: Buffer,
   pub worklist: Buffer,
   pub samples: Buffer,
   pub dispatch: Buffer,
@@ -940,6 +974,8 @@ pub struct DdgiGpu {
   pub uniform: UniformBuffer<DdgiUniform>,
   pub positions: Buffer,
   pub cell_index: Buffer,
+  /// base dense per-cell DdgiProbeFlags（binding 15；烘焙上传，active 只读）
+  pub cell_flags: Buffer,
   pub objects: Buffer,
   /// [count, 1, 1, 0]；[0] 由 ddgi_active atomicAdd。**不能**兼 indirect——同
   /// dispatch scope 内 STORAGE 与 INDIRECT 互斥（wgpu 验证），indirect 走独立 buffer。
@@ -1188,6 +1224,7 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>) {
     uniform: UniformBuffer::default(),
     positions: dummy_buffer(&device, "ddgi_positions(empty)"),
     cell_index: dummy_buffer(&device, "ddgi_cell_index(empty)"),
+    cell_flags: dummy_buffer(&device, "ddgi_cell_flags(empty)"),
     objects: dummy_buffer(&device, "ddgi_objects(empty)"),
     dispatch: dummy_buffer(&device, "ddgi_dispatch(empty)"),
     indirect: dummy_indirect_buffer(&device, "ddgi_indirect(empty)"),
@@ -2037,6 +2074,8 @@ fn prepare_ddgi(
     };
     gpu.positions = make("ddgi_positions", &vec4_bytes(&pack_probe_positions(pg)));
     gpu.cell_index = make("ddgi_cell_index", &u32_bytes(&pg.cell_index));
+    let flags_u32: Vec<u32> = pg.cell_flags.iter().map(|&f| f as u32).collect();
+    gpu.cell_flags = make("ddgi_cell_flags", &u32_bytes(&flags_u32));
     gpu.objects = dummy_sized_buffer(&device, "ddgi_objects", 16); // D12：MOV 后置；runtime-sized vec4 数组最小 1 元素
     // dispatch（atomic 计数 [count,1,1,0]）：STORAGE；indirect 走独立 buffer（同
     // dispatch scope 内 STORAGE 与 INDIRECT 互斥——wgpu 验证，active 后整拷桥接）
@@ -2221,28 +2260,32 @@ fn prepare_ddgi(
     }
     gpu.positions = make("ddgi_positions", &vec4_bytes(&pos_all));
     gpu.all_ci = make("ddgi_all_ci", &u32_bytes(&all_ci_data));
-    // 级联 ci（全局 id 平移）与 probe_count 先快照到本地（manager 共享借用不得
-    // 跨 gpu.cascades 的可变构建），再构建级联 GPU 槽
-    let (casc_ci, casc_cnt): ([Vec<u32>; 4], [u32; 4]) = {
+    // 级联 ci（全局 id 平移）、cell_flags 与 probe_count 先快照到本地（manager 共享
+    // 借用不得跨 gpu.cascades 的可变构建），再构建级联 GPU 槽
+    let (casc_ci, casc_flags, casc_cnt): ([Vec<u32>; 4], [Vec<u32>; 4], [u32; 4]) = {
       let mut ci = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+      let mut fl = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
       let mut cnt = [0u32; 4];
       if let Some(cm) = gpu.manager.as_ref() {
         for c in 0..4usize {
           let off = gpu.id_base + (c as u32) * 4096;
           ci[c] = cascade_ci_global(&cm.grids[c].cell_index, off);
+          fl[c] = cm.grids[c].cell_flags.iter().map(|&f| f as u32).collect();
           cnt[c] = cm.grids[c].positions.len() as u32;
         }
       } else {
         for c in 0..4usize {
           ci[c] = vec![NO_PROBE; 4096];
+          fl[c] = vec![0u32; 4096];
         }
       }
-      (ci, cnt)
+      (ci, fl, cnt)
     };
     gpu.cascades = (0..4)
       .map(|c| CascadeGpu {
         uniform: UniformBuffer::default(),
         cell_index: make("ddgi_ci_c", &u32_bytes(&casc_ci[c])),
+        cell_flags: make("ddgi_flags_c", &u32_bytes(&casc_flags[c])),
         worklist: make("ddgi_wl_c", &u32_bytes(&vec![0u32; 4096])),
         // 钳制满额 × 射线下限：4096 slot × DDGI_PROBE_RAYS_MIN × [dir, radiance] vec4
         samples: make(
@@ -2405,10 +2448,11 @@ fn prepare_ddgi(
       gpu.worklist.as_entire_binding(),
       &gpu.casc_u,
       gpu.all_ci.as_entire_binding(),
+      gpu.cell_flags.as_entire_binding(),
     )),
   );
   commands.insert_resource(DdgiBg4(bg4));
-  // 每级联一份 BG4_c：0/2/9/11/12 = 本级 uniform/ci/dispatch/samples/worklist；
+  // 每级联一份 BG4_c：0/2/9/11/12/15 = 本级 uniform/ci/dispatch/samples/worklist/flags；
   // 1（positions）/3-8（纹理）/10（objects）/13（全域 uniform）/14（all_ci）共享。
   // 共享借用作用域内建 BG（owned BindGroup），结束后写回——规避 ResMut 借用冲突
   for c in 0..4usize {
@@ -2435,6 +2479,7 @@ fn prepare_ddgi(
           cg.worklist.as_entire_binding(),
           &gpu.casc_u,
           gpu.all_ci.as_entire_binding(),
+          cg.cell_flags.as_entire_binding(),
         )),
       )
     };

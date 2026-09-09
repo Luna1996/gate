@@ -295,10 +295,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ..default()
               },
             );
-            cell
-              .world_mut()
-              .entity_mut(*vl)
-              .insert(DdgiGainValueLabel);
+            cell.world_mut().entity_mut(*vl).insert(DdgiGainValueLabel);
           });
         // ---- 行 8：Probe Viz 开关（探针位置黄色方块可视化；写 DdgiDebugSettings.probe_viz）----
         let c8 = grid_cell(&ctx, g, PanelSurface::Card);
@@ -345,7 +342,10 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 step: Some(1.0),
               },
             );
-            cell.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
+            cell
+              .world_mut()
+              .entity_mut(*s)
+              .insert(DdgiProbeVizLodSlider);
             // 右侧实时层级名标签
             let vl = label(
               &ctx,
