@@ -31,7 +31,7 @@ pub(crate) fn gpu_frame_log(
       .unwrap_or(-1.0)
   };
   let trace = gpu_ms(store.as_deref(), "render/gate_dda_trace/elapsed_gpu");
-  let ddgi = gpu_ms(store.as_deref(), "render/gate_ddgi_update/elapsed_gpu");
+  let ddgi = gpu_ms(store.as_deref(), "render/gate_ddgi_total/elapsed_gpu");
   let direct = gpu_ms(store.as_deref(), "render/gate_direct_light/elapsed_gpu");
   let gi_ind = gpu_ms(store.as_deref(), "render/gate_gi_indirect/elapsed_gpu");
   let gi_den = gpu_ms(store.as_deref(), "render/gate_gi_denoise/elapsed_gpu");

@@ -2317,7 +2317,7 @@ fn extract_camera_config(
   commands.insert_resource(uniform);
 }
 
-fn init_dda_pipelines(
+pub(crate) fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
   pipeline_cache: Res<PipelineCache>,
@@ -2615,6 +2615,7 @@ pub(crate) fn dispatch_dda(
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
 ) {
+  let tdda = std::time::Instant::now();
   // Devlog 23：光照链已拆除——主 pass trace 命中后直接 unlit 着色直出 out_tex
   // （无缓存逐体素法线 + 天空渐变 + 太阳方向光项），无后续 direct/gi/denoise pass。
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
@@ -2718,6 +2719,12 @@ pub(crate) fn dispatch_dda(
         span.end(ctx.command_encoder());
       }
     }
+  }
+  let us = tdda.elapsed().as_micros();
+  if let Some(g) = gpu.as_ref()
+    && g.frame > 1 && g.frame <= 5
+  {
+    bevy::log::info!("DISP_DDA[{}]: {}us", g.frame, us);
   }
 }
 

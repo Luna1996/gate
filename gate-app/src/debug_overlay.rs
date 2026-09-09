@@ -533,8 +533,7 @@ pub(crate) fn fps_line_feed(
   let parts = [
     gpu_ms("render/gate_dda_trace/elapsed_gpu"),
     gpu_ms("render/gate_beam/elapsed_gpu"),
-    gpu_ms("render/gate_ddgi_update/elapsed_gpu"),
-    gpu_ms("render/gate_direct_light/elapsed_gpu"),
+    gpu_ms("render/gate_ddgi_total/elapsed_gpu"),
     gpu_ms("render/gate_dda_blit/elapsed_gpu"),
   ];
   let diag_ready = parts.iter().any(|&v| v >= 0.0);
@@ -543,7 +542,7 @@ pub(crate) fn fps_line_feed(
     plot.push(v);
   }
   window.push_back(dt);
-  // 逐帧一行：elapsed,dt[,trace,beam,ddgi,blit]（-1 = 诊断未上线），随 0.25s 刷盘
+  // 逐帧一行：elapsed,dt[,trace,beam,ddgi_total,blit]（-1 = 诊断未上线），随 0.25s 刷盘
   let mut line = format!("{:.3},{:.3}", time.elapsed_secs(), dt * 1000.0);
   if diag_ready {
     let _ = write!(

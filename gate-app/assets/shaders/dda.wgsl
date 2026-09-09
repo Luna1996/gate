@@ -1160,14 +1160,9 @@ const DDGI_NORMAL_BIAS: f32 = 0.2;
 // 深度 chevron 半宽已改为采样点所在域逐域计算 cell_size×0.25（ddgi_sample_dom），
 // 不再是全局常量——粗级联 cell 大，固定 4 会把远角合法探针误剔成网格状黑块
 const DDGI_T_MAX: f32 = 8192.0;
-// 每帧总射线预算（5 个 pass 组各自摊派）：count×rays = clamp 恒 ≤ 131072 = samples
-// 缓冲 slot 数（4096×32）。base active 恒钳 4096 → 32 射线不变；级联 active 仅
-// ~900-2760 → 摊到 32-72 射线/探针（近场降噪：级联全量每帧更新，低射线纯噪声）
+// 每帧总射线预算（seal 钳 count ≤ 4096 → rays = RAY_BUDGET/count ≥ 16）：严格
+// count×rays ≤ 65536，样本下标 ×2 ≤ 131072 = samples 缓冲 slot 数（RAY_BUDGET×2）
 const DDGI_RAY_BUDGET: u32 = 65536u;
-// 每探针射线数下限（ddgi.rs DDGI_PROBE_RAYS_MIN 镜像）：预算摊派低于此值按下限执行。
-// 32 = 8×8 irr texel 的半 texel/射线：16 射线时 base 探针每次更新均值噪声 ±30%+，
-// 邻探针收敛值互相差一个量级 → 逐 cell 的方块斑驳 + 轮换跳变（黑块闪烁主源）
-const DDGI_PROBE_RAYS_MIN: u32 = 32u;
 const DDGI_PROBE_BUDGET: u32 = 4096u;
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
@@ -1919,8 +1914,8 @@ fn ddgi_cast(
   let probe_id = ddgi_worklist[slot];
   let origin = ddgi_positions[probe_id].xyz;
   // 固定预算分摊（cast_rays_per_probe 镜像）：count 为 active pass 终值（pass 边界
-  // 保证）；低于 DDGI_PROBE_RAYS_MIN 按下限（1 ray = 纯噪声，EMA 永不收敛）
-  let rays = max(DDGI_RAY_BUDGET / count, DDGI_PROBE_RAYS_MIN);
+  // 保证）；严格 RAY_BUDGET/count 无下限（与 ddgi_update 同式，样本布局一致）
+  let rays = max(DDGI_RAY_BUDGET / count, 1u);
   let frame = u32(ddgi_u.params.x);
   let tid = lid.x;
   for (var i = tid; i < rays; i = i + 64u) {
@@ -1946,19 +1941,9 @@ fn ddgi_cast(
         radiance = base * (emissive * DDGI_EMIT_GAIN);
         dist = t_hit;
       } else {
-        // 直光 1-bounce（方向光硬阴影）+ prev DDGI 自闭环（无限反弹）
+        // 直光在主渲染 pass（方向光硬阴影 per-pixel），cast 只收
+        // prev DDGI 自闭环（无限反弹）：命中面辐射 = albedo × 邻域 GI
         var col = vec3<f32>(0.0);
-        if (light_u.g.count > 0u && light_u.lights[0].kind_pos_dir.x < 0.5) {
-          let l = light_u.lights[0].kind_pos_dir.yzw;
-          let ndl = max(dot(n, l), 0.0);
-          if (ndl > 0.0) {
-            let o = p + n * DDGI_SHADOW_BIAS;
-            let sh = trace_scene(o, l, DDGI_SHADOW_T_MAX, 0.0, 3u);
-            let vis = select(1.0, 0.0, sh.uh.hit);
-            let c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-            col = col + base * c * (ndl * vis);
-          }
-        }
         let irr = ddgi_sample(p + n * DDGI_NORMAL_BIAS, n);
         col = col + base * irr / DDGI_PI;
         radiance = col;
@@ -2072,8 +2057,9 @@ fn ddgi_update(
   let base = (u32(ddgi_u.params.x) * DDGI_PROBE_BUDGET) % max(full, 1u);
   let slot = (base + wid.x) % max(full, 1u);
   let probe_id = ddgi_worklist[slot];
-  // 与 ddgi_cast 同公式（同 count → 同 rays → 样本缓冲布局一致）
-  let rays = max(DDGI_RAY_BUDGET / count, DDGI_PROBE_RAYS_MIN);
+  // 与 ddgi_cast 同公式（同 count → 同 rays → 样本缓冲布局一致）；无下限：严格
+  // RAY_BUDGET/count 摊派（seal 钳 count ≤ 4096 → rays ≥ 16，下限不会触发）
+  let rays = max(DDGI_RAY_BUDGET / count, 1u);
   let seg0 = wid.x * rays;
   let tid = lid.x;
   // ---- irradiance 8×8：1 线程 = 1 texel ----

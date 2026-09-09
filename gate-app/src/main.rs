@@ -52,7 +52,7 @@ fn main() {
           // immediate 模式的 frame pacing 伪影；高刷屏 vblank 6.9ms < trace 帧时，
           // 不会封顶掩盖差异）；② visible=false 静默后台运行，不抢前台焦点
           focused: false,
-          present_mode: PresentMode::AutoVsync,
+          present_mode: PresentMode::AutoNoVsync,
           resizable: true, // 2.7a FR-5：解锁任意 resize（渲染目标 + aspect 由响应式系统跟随）
           ..default()
         }),
@@ -70,7 +70,7 @@ fn main() {
         //    时序异常，不影响渲染功能与画面正确性；wgpu 升级后自动恢复。
         // 2) wgpu_hal::vulkan::surface = off：同来源的 surface 层偶发错误。
         //    其余 wgpu/winit/bevy_render 的错误照常打印，避免掩盖真实问题。
-        filter: "info,\
+        filter: "info,wgpu=debug,wgpu_core=debug,\
           wgpu_hal::vulkan::instance=off,\
           wgpu_hal::vulkan::surface=off"
           .into(),

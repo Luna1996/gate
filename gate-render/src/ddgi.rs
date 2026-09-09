@@ -57,10 +57,10 @@ pub const PROBE_T_MAX: f32 = 8192.0;
 /// wn = clamp(N·d / bias, 0, 1)——探针在表面后侧（N·d<0）权重严格 0，穿墙不漏光
 /// （结构性修复见 ddgi_sample_dom per-pixel jitter，而非调 bias）
 pub const DDGI_NORMAL_BIAS: f32 = 0.2;
-/// 每探针每次更新的射线数下限（WGSL DDGI_PROBE_RAYS_MIN 镜像）：RAY_BUDGET 摊派
-/// 低于此值按下限执行。32 而非 16：base 轮换窗口恒钳 4096 探针，16 射线/探针的
-/// Monte-Carlo 噪声让邻探针收敛值差一个量级（逐 cell 方块斑驳 + 轮换跳变）。
-pub const DDGI_PROBE_RAYS_MIN: u32 = 32;
+/// Douglas Devlog #23：固定 LOD — 烘焙时一次性生成，不做 camera-following scroll
+pub const DDGI_FIXED_LODS: bool = true;
+/// Douglas Devlog #23：总射线数固定预算。性能不随屏上 probe 数波动（摊派到活跃探针）
+pub const DDGI_RAY_BUDGET: u32 = 65536;
 /// 每帧更新探针钳制上限（WGSL DDGI_PROBE_BUDGET 镜像；seal pass min(count, 此值)）
 pub const DDGI_PROBE_BUDGET: u32 = 4096;
 /// 漏光 chevron 半宽（fine 单位）＝ 所在域 cell × 0.25；本常量 = base 域（cell 16）
@@ -1296,10 +1296,12 @@ impl bevy::app::Plugin for DdgiPlugin {
       .init_resource::<DdgiEnabled>()
       .init_resource::<DdgiDebugSettings>()
       .add_systems(RenderStartup, init_ddgi_gpu)
+      // DDGI pipeline 排队必须在 DDA pipeline 之后（需要 dda.bg0-3 layouts）
+      .add_systems(RenderStartup, queue_ddgi_pipelines.after(crate::brickmap::dda::init_dda_pipelines))
       .add_systems(bevy::render::ExtractSchedule, extract_ddgi_bake)
       .add_systems(
         Render,
-        (queue_ddgi_pipelines, prepare_ddgi).in_set(RenderSystems::PrepareBindGroups),
+        prepare_ddgi.in_set(RenderSystems::PrepareBindGroups),
       )
       // M4-2：四 pass 链在主 trace（dispatch_dda）之前编码
       .add_systems(
@@ -1469,6 +1471,8 @@ fn queue_ddgi_pipelines(
   asset_server: Res<AssetServer>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
+  bevy::log::info!("QUEUE_DDGI_PIPES called: has_dda={} has_pipes={}",
+    dda.is_some(), gpu.pipelines.is_some());
   if gpu.pipelines.is_some() {
     return;
   }
@@ -1530,6 +1534,11 @@ fn dispatch_ddgi(
     }
     return;
   }
+  let td = std::time::Instant::now();
+  if gpu.frame <= 5 {
+    bevy::log::info!("DISP_DDGI entry: frame={} probe_count={} has_bg4={} has_pipes={}",
+      gpu.frame, gpu.probe_count, bg4.is_some(), gpu.pipelines.is_some());
+  }
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
     bg0.as_ref(),
     bg1.as_ref(),
@@ -1552,7 +1561,12 @@ fn dispatch_ddgi(
     pipeline_cache.get_compute_pipeline(pipes.cast),
     pipeline_cache.get_compute_pipeline(pipes.update),
   ) else {
-    bevy::log::debug_once!("DDGI dispatch: pipelines not ready");
+    bevy::log::info!("DISP_DDGI MISS_PIPES: c={:?} a={:?} s={:?} ca={:?} u={:?}",
+      pipeline_cache.get_compute_pipeline(pipes.clear).is_some(),
+      pipeline_cache.get_compute_pipeline(pipes.active).is_some(),
+      pipeline_cache.get_compute_pipeline(pipes.seal).is_some(),
+      pipeline_cache.get_compute_pipeline(pipes.cast).is_some(),
+      pipeline_cache.get_compute_pipeline(pipes.update).is_some());
     return;
   };
 
@@ -1742,6 +1756,7 @@ fn dispatch_ddgi(
   };
   let recorder = ctx.diagnostic_recorder();
   let recorder = recorder.as_deref();
+  let ddgi_total = recorder.time_span(ctx.command_encoder(), "gate_ddgi_total");
 
   // ①clear（1 线程清 indirect 计数）
   {
@@ -1825,6 +1840,10 @@ fn dispatch_ddgi(
       pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
     }
     span.end(ctx.command_encoder());
+  }
+  let base_dispatch_us = td.elapsed().as_micros();
+  if gpu.frame > 1 && gpu.frame <= 5 {
+    bevy::log::info!("DISP_DDGI base[{}]: {}us", gpu.frame, base_dispatch_us);
   }
 
   // ---- M4-3 级联链：每级一组 ①clear → ②active（16³ cell → 4³ wg）→ ②.5seal →
@@ -1917,6 +1936,7 @@ fn dispatch_ddgi(
       span.end(ctx.command_encoder());
     }
   }
+  ddgi_total.end(ctx.command_encoder());
 
   // ---- 诊断回读三阶段（wgpu 规则：submit 时 buffer 必须 Unmapped，故 copy 与
   // map_async 分帧；每阶段一帧，回调完成后读+unmap 回 idle）----
@@ -1988,7 +2008,6 @@ fn dispatch_ddgi(
         let meta_base =
           64 + 8 * texels_per_layer + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
         let (mut a0, mut blk, mut ok) = (0u32, 0u32, 0u32);
-        let (mut b_a1, mut b_a8, mut b_a32, mut b_a64) = (0u32, 0u32, 0u32, 0u32);
         let mut blk_ids = String::new();
         for k in 0..8usize {
           let layer = k as u32 * gpu.readback_step;
@@ -2022,14 +2041,6 @@ fn dispatch_ddgi(
               ok += 1;
             } else {
               blk += 1;
-              // #region debug-point B:blk-age-hist（假设 B：黑探针 age 分布定位来源）
-              match age {
-                1..=7 => b_a1 += 1,
-                8..=31 => b_a8 += 1,
-                32..=63 => b_a32 += 1,
-                _ => b_a64 += 1,
-              }
-              // #endregion
               if blk <= 8 {
                 blk_ids.push_str(&format!(" {}@{}", layer as u32 * PROBES_PER_LAYER + p as u32, age));
               }
@@ -2039,41 +2050,6 @@ fn dispatch_ddgi(
         drop(data);
         gpu.readback.unmap();
         gpu.readback_state = 0;
-        // #region debug-point B:server-relay（readback 汇总行 → 调试服务器 NDJSON；
-        // std-only 裸 HTTP POST，服务器离线时连接即失败静默跳过；~4Hz 低频）
-        fn dbg_relay(hyp: &str, msg: &str) {
-          let url = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../.dbg/ddgi-black-spots-flicker.env"
-          ))
-          .ok()
-          .and_then(|s| {
-            s.lines()
-              .find(|l| l.starts_with("DEBUG_SERVER_URL="))
-              .map(|l| l["DEBUG_SERVER_URL=".len()..].trim().to_string())
-          })
-          .unwrap_or_else(|| "http://127.0.0.1:7777/event".into());
-          let rest = url.strip_prefix("http://").unwrap_or(&url);
-          let (authority, path) = match rest.split_once('/') {
-            Some((a, p)) => (a, p),
-            None => (rest, "event"),
-          };
-          let body = format!(
-            "{{\"sessionId\":\"ddgi-black-spots-flicker\",\"runId\":\"pre-fix\",\"hypothesisId\":\"{hyp}\",\"location\":\"ddgi.rs:readback\",\"msg\":\"[DEBUG] {}\"}}",
-            msg.replace('\\', "\\\\").replace('"', "\\\"")
-          );
-          if let Ok(mut s) = std::net::TcpStream::connect(authority) {
-            use std::io::Write as _;
-            let _ = s.write_all(
-              format!(
-                "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-              )
-              .as_bytes(),
-            );
-          }
-        }
-        // #endregion
         let line = format!(
           "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}]{} irr:{summary} depth650_lt8k:{} census: a0={a0} blk={blk} ok={ok} blk_ids:[{blk_ids}]",
           gpu.frame,
@@ -2087,10 +2063,6 @@ fn dispatch_ddgi(
           dep_lt,
         );
         bevy::log::info!("{}", line);
-        // #region debug-point B/E:relay-send（假设 B=黑探针普查、E=预算/活跃信号）
-        dbg_relay("B", &format!("census a0={a0} blk={blk} ok={ok} blk_age[1-7/8-31/32-63/64+]={b_a1}/{b_a8}/{b_a32}/{b_a64} ids:[{blk_ids}] frame={}", gpu.frame));
-        dbg_relay("E", &format!("dispatch0={count} indirect0={indirect0} wl=[{},{},{},{}]{} depth_lt8k={dep_lt} frame={}", wl[0], wl[1], wl[2], wl[3], casc, gpu.frame));
-        // #endregion
       }
     }
     _ => {
@@ -2230,14 +2202,17 @@ fn extract_ddgi_bake(
   let generation = scene.volumes.main().edit_generation();
   // GPU 已是该代数（已重烘过）→ 只需驱动级联滚动
   if gpu.baked_generation == generation {
-    // 关闭时冻结滚动：不产生 pending_shift（dispatch 早退也不消费），避免位移堆积
-    if on {
-      if let Some(cm) = gpu.manager.as_mut() {
-        let ts = std::time::Instant::now();
-        let moved = cm.scroll(&scene.volumes, cam);
-        let us = ts.elapsed().as_micros();
-        if moved && us > 500 {
-          bevy::log::info!("DDGI scroll: {us}us (moved)");
+    // Douglas Devlog #23：LOD 烘焙时一次性生成，不做 camera-following scroll
+    if !DDGI_FIXED_LODS {
+      // 关闭时冻结滚动：不产生 pending_shift（dispatch 早退也不消费），避免位移堆积
+      if on {
+        if let Some(cm) = gpu.manager.as_mut() {
+          let ts = std::time::Instant::now();
+          let moved = cm.scroll(&scene.volumes, cam);
+          let us = ts.elapsed().as_micros();
+          if moved && us > 500 {
+            bevy::log::info!("DDGI scroll: {us}us (moved)");
+          }
         }
       }
     }
@@ -2438,6 +2413,7 @@ fn prepare_ddgi(
   mut gpu: ResMut<DdgiGpu>,
 ) {
   let tp = std::time::Instant::now();
+  let t0 = std::time::Instant::now();
   // ---- D7 ping-pong 交换（无条件；烘焙帧两份同数据交换无害）----
   // 上一帧 next（已被 update 写入新值）变本帧 prev；旧 prev 由 dispatch_ddgi 的
   // copy pass 重填后作为本帧 next 被 active/update 覆写。
@@ -2465,6 +2441,7 @@ fn prepare_ddgi(
     std::mem::swap(meta_prev, meta_next);
     std::mem::swap(meta_prev_view, meta_next_view);
   }
+  let t1 = std::time::Instant::now();
 
   // ---- 新烘焙（含编辑后重烘）：重建纹理数组 + buffer（尺寸变化）----
   if let Some(bake) = bake {
@@ -2511,11 +2488,8 @@ fn prepare_ddgi(
     queue.write_buffer(&gpu.indirect, 4, &1u32.to_le_bytes());
     queue.write_buffer(&gpu.indirect, 8, &1u32.to_le_bytes());
     gpu.worklist = make("ddgi_worklist", &u32_bytes(&vec![0u32; n as usize]));
-    // 样本缓冲容量：base = max(2×probe_count, 钳制满额×射线下限) vec4
-    // （seal 钳 4096 × DDGI_PROBE_RAYS_MIN × [dir, radiance]）
-    let sample_slots = (n * 2)
-      .max(8192)
-      .max(DDGI_PROBE_BUDGET * DDGI_PROBE_RAYS_MIN * 2);
+    // 样本缓冲容量：严格按总射线预算（Douglas 65536 射线 × 2 = dir + radiance）
+    let sample_slots = DDGI_RAY_BUDGET * 2;
     gpu.samples = dummy_sized_buffer(&device, "ddgi_samples", sample_slots as u64 * 16);
 
     // ---- D7 纹理数组（irr 128² rgba16f / depth 256² r32 / meta 16² r32uint）----
@@ -2708,7 +2682,7 @@ fn prepare_ddgi(
         // 钳制满额 × 射线下限：4096 slot × DDGI_PROBE_RAYS_MIN × [dir, radiance] vec4
         samples: make(
           "ddgi_samp_c",
-          &vec![0u8; 4096 * DDGI_PROBE_RAYS_MIN as usize * 2 * 16],
+          &vec![0u8; (DDGI_RAY_BUDGET as usize) * 2 * 16],
         ),
         dispatch: make("ddgi_disp_c", &[0u8; 16]),
         indirect: dummy_indirect_buffer(&device, "ddgi_ind_c"),
@@ -2849,6 +2823,7 @@ fn prepare_ddgi(
   }
   let base_u = *gpu.uniform.get_mut();
   gpu.uniform.write_buffer(&device, &queue);
+  let t2 = std::time::Instant::now();
 
   // 级联 uniform（本级域 + finer = 上一级域）+ probe_count
   if let Some(frames) = &casc_frames {
@@ -2929,7 +2904,10 @@ fn prepare_ddgi(
       }),
   };
   gpu.casc_u.write_buffer(&device, &queue);
+  let t3 = std::time::Instant::now();
 
+  // --- 计时：BG4 创建到底花多少时间 ---
+  let t_bg4 = std::time::Instant::now();
   let bg4_layout = pipeline_cache.get_bind_group_layout(&ddgi_bg4_layout());
   let bg4 = device.create_bind_group(
     None,
@@ -2987,9 +2965,18 @@ fn prepare_ddgi(
       cg.bg4 = Some(bg);
     }
   }
-  let us = tp.elapsed().as_micros();
-  if us > 10_000 {
-    bevy::log::info!("DDGI prepare: {us}us");
+  let bg4_us = t_bg4.elapsed().as_micros();
+  // 每帧打印 prepare 各段时间（诊断用）
+  let total_us = tp.elapsed().as_micros();
+  // 每帧打印 prepare 各段时间（诊断用，只打前 8 帧）
+  if gpu.frame > 1 && gpu.frame <= 10 {
+    let pp_us = (t1 - t0).as_micros();
+    let base_u_us = (t2 - t1).as_micros();
+    let casc_u_us = (t3 - t2).as_micros();
+    bevy::log::info!(
+      "PREP[{}]: total={}us pp={}us base_u={}us casc_u={}us bg4={}us",
+      gpu.frame, total_us, pp_us, base_u_us, casc_u_us, bg4_us,
+    );
   }
 }
 
