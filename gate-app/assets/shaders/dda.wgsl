@@ -287,7 +287,316 @@ fn sample_brickmap(g: Grid, fine: vec3<i32>) -> u32 {
 }
 
 // ============================================================================
-// Douglas 式整数体素层级自适应 DDA（octo_march_core: march_intersection_buffer）
+// DDGI GPU 烘焙：brick region 三态查询（CPU gate-voxel chunk_tree.rs
+// `brick_state_at` / `aggregate_node_state` 逐字镜像）。
+// 返回 0=Air(全空) / 1=Solid(全实) / 2=Mixed(空实混合)；无 chunk/空洞 = Air。
+// level 对应 LEVEL_EXTENT=[256,64,16,4,1]：1=64³ 节点、2=16³、3=4³。
+// 仅查主世界 grid（make_grid(0) identity）。探针放置（ddgi_get_probe）逐 cell
+// 在 GPU 上调用，取代旧 CPU bake_probe_grid 的几何遍历。
+// ============================================================================
+
+// 三态合并哨兵：3=尚未见任何子块
+fn ddgi_merge_state(a: u32, b: u32) -> u32 {
+  if (a == 3u) { return b; }
+  if (a == b) { return a; }
+  return 2u; // 空实混合 → Mixed
+}
+
+// mask 中 child_idx 之前的分裂子块数（紧凑 child 数组下标；镜像 sample_brickmap）
+fn ddgi_pop_below(cidx: u32, mask_lo: u32, mask_hi: u32) -> u32 {
+  if (cidx < 32u) {
+    return countOneBits(mask_lo & ((1u << cidx) - 1u));
+  }
+  return countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << (cidx - 32u)) - 1u));
+}
+
+// chunk 定位：返回 chunk 树绝对基址（0 = 无此 chunk/空洞 → 调用方按 Air 处理）
+fn ddgi_chunk_base(g: Grid, fine: vec3<i32>) -> u32 {
+  let m = ((fine % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
+  let chunk_i = (fine - m) / vec3<i32>(256);
+  let rel = chunk_i - g.index_origin;
+  if (any(rel < vec3<i32>(0))) { return 0u; }
+  let rel_u = vec3<u32>(rel);
+  if (any(rel_u >= g.index_dims)) { return 0u; }
+  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
+    + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+  let entry = b_struct[index_addr];
+  if (entry == 0u) { return 0u; }
+  return g.tree_base + entry - 1u;
+}
+
+// 聚合 4³ 节点（level 3）：64 个 inline voxel（bit=0=节点 palette，bit=1=inline byte）
+fn ddgi_agg4(chunk_base: u32, node: u32) -> u32 {
+  let mask_lo = b_struct[node];
+  let mask_hi = b_struct[node + 1u];
+  let pal = b_struct[node + 2u] & 0xFFu;
+  var seen: u32 = 3u;
+  for (var idx = 0u; idx < 64u; idx = idx + 1u) {
+    let in_hi = idx >= 32u;
+    let word = select(mask_lo, mask_hi, in_hi);
+    let bit_in = select(idx, idx - 32u, in_hi);
+    var vp = pal;
+    if (((word >> bit_in) & 1u) != 0u) {
+      // level3 inline：4 voxel/word = b_struct[node+3+(idx>>2)]，byte (idx&3)
+      let w = b_struct[node + NODE_FIXED_WORDS + (idx >> 2u)];
+      vp = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    }
+    let st = select(1u, 0u, vp == 0u); // palette 0=Air 否则 Solid
+    seen = ddgi_merge_state(seen, st);
+    if (seen == 2u) { return 2u; }
+  }
+  return select(0u, seen, seen != 3u);
+}
+
+// 聚合 16³ 节点（level 2）：64 个 4³ 子块（bit=0=uniform palette，bit=1=child 4节点）
+fn ddgi_agg16(chunk_base: u32, node: u32) -> u32 {
+  let mask_lo = b_struct[node];
+  let mask_hi = b_struct[node + 1u];
+  let pal = b_struct[node + 2u] & 0xFFu;
+  var seen: u32 = 3u;
+  for (var idx = 0u; idx < 64u; idx = idx + 1u) {
+    let in_hi = idx >= 32u;
+    let word = select(mask_lo, mask_hi, in_hi);
+    let bit_in = select(idx, idx - 32u, in_hi);
+    var st: u32;
+    if (((word >> bit_in) & 1u) == 0u) {
+      st = select(1u, 0u, pal == 0u);
+    } else {
+      let child = chunk_base + b_struct[node + NODE_FIXED_WORDS + ddgi_pop_below(idx, mask_lo, mask_hi)];
+      st = ddgi_agg4(chunk_base, child);
+    }
+    seen = ddgi_merge_state(seen, st);
+    if (seen == 2u) { return 2u; }
+  }
+  return select(0u, seen, seen != 3u);
+}
+
+// 聚合 64³ 节点（level 1）：64 个 16³ 子块（bit=1=child 16节点）
+fn ddgi_agg64(chunk_base: u32, node: u32) -> u32 {
+  let mask_lo = b_struct[node];
+  let mask_hi = b_struct[node + 1u];
+  let pal = b_struct[node + 2u] & 0xFFu;
+  var seen: u32 = 3u;
+  for (var idx = 0u; idx < 64u; idx = idx + 1u) {
+    let in_hi = idx >= 32u;
+    let word = select(mask_lo, mask_hi, in_hi);
+    let bit_in = select(idx, idx - 32u, in_hi);
+    var st: u32;
+    if (((word >> bit_in) & 1u) == 0u) {
+      st = select(1u, 0u, pal == 0u);
+    } else {
+      let child = chunk_base + b_struct[node + NODE_FIXED_WORDS + ddgi_pop_below(idx, mask_lo, mask_hi)];
+      st = ddgi_agg16(chunk_base, child);
+    }
+    seen = ddgi_merge_state(seen, st);
+    if (seen == 2u) { return 2u; }
+  }
+  return select(0u, seen, seen != 3u);
+}
+
+// 对齐 brick 三态：origin = brick 最小角 fine，level ∈ {1=64,2=16,3=4}。
+// 下钻到目标节点（uniform 子块早退），到达后聚合该节点完整区域。
+fn ddgi_brick_state(g: Grid, origin: vec3<i32>, level: u32) -> u32 {
+  let cb = ddgi_chunk_base(g, origin);
+  if (cb == 0u) { return 0u; } // 无 chunk/空洞 = Air
+  let m = ((origin % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
+  let local = vec3<u32>(m);
+  var node = cb;
+  for (var cur = 0u; cur < level; cur = cur + 1u) {
+    let mask_lo = b_struct[node];
+    let mask_hi = b_struct[node + 1u];
+    let pal = b_struct[node + 2u] & 0xFFu;
+    let shift = 8u - (cur + 1u) * 2u; // cur0→6(64) cur1→4(16) cur2→2(4)
+    let cx = (local.x >> shift) & 3u;
+    let cy = (local.y >> shift) & 3u;
+    let cz = (local.z >> shift) & 3u;
+    let cidx = cz * 16u + cy * 4u + cx;
+    let in_hi = cidx >= 32u;
+    let word = select(mask_lo, mask_hi, in_hi);
+    let bit_in = select(cidx, cidx - 32u, in_hi);
+    if (((word >> bit_in) & 1u) == 0u) {
+      return select(1u, 0u, pal == 0u); // 父块 uniform → 目标 brick 同色
+    }
+    let child = cb + b_struct[node + NODE_FIXED_WORDS + ddgi_pop_below(cidx, mask_lo, mask_hi)];
+    if (cur + 1u == level) {
+      if (level == 1u) { return ddgi_agg64(cb, child); }
+      if (level == 2u) { return ddgi_agg16(cb, child); }
+      return ddgi_agg4(cb, child);
+    }
+    node = child;
+  }
+  return 0u; // 不可达
+}
+
+// ============================================================================
+// DDGI GPU 探针放置（CPU ddgi.rs probe_leaf_sized/probe_position_in_cell 语义
+// 镜像；WGSL 禁递归 → 显式栈 DFS）。cell_size ∈ {16,32,64,128}。
+// 归一化 offset：探针在 cell 内相对位置 u∈[0,1)，量化 q=round(u*32) 存 5bit；
+// 探针世界坐标 = cell_origin + (q/32)*cell_size（所有 LOD 通用，与 cell 尺寸无关）。
+// ============================================================================
+
+// 任意 cell 尺寸三态：16→level2、64→level1 直查；32=8×16、128=8×64 二分聚合。
+// 非递归（naga 静态调用图拒绝自调用）：half 必为 16/64，直查对应树层级。
+fn ddgi_cell_state_sized(g: Grid, cmin: vec3<i32>, size: i32) -> u32 {
+  if (size == 16) { return ddgi_brick_state(g, cmin, 2u); }
+  if (size == 64) { return ddgi_brick_state(g, cmin, 1u); }
+  // 32 → half=16(level2)；128 → half=64(level1)
+  let half = size / 2;
+  let hlevel = select(2u, 1u, size == 128);
+  var seen: u32 = 3u;
+  for (var k = 0; k < 2; k = k + 1) {
+    for (var j = 0; j < 2; j = j + 1) {
+      for (var i = 0; i < 2; i = i + 1) {
+        let sub = cmin + vec3<i32>(i, j, k) * half;
+        seen = ddgi_merge_state(seen, ddgi_brick_state(g, sub, hlevel));
+        if (seen == 2u) { return 2u; }
+      }
+    }
+  }
+  return seen;
+}
+
+// 16³ Mixed cell 内 4³→4³ BFS（probe_position_in_cell 逐字）：level3(4³) 找 Air
+// 4-brick 中心，无则 level4(1³) 扫空体素中心；取靠 cell 中心最近。返回 xyz=p,w=found
+fn ddgi_leaf16(g: Grid, cmin: vec3<i32>, center: vec3<f32>) -> vec4<f32> {
+  var best_d2 = 1e30;
+  var best_p = vec3<f32>(0.0);
+  var found = 0.0;
+  var mixed: array<vec3<i32>, 64>;
+  var nmix = 0u;
+  // lvl3：4³ 个 4³ brick
+  for (var k = 0; k < 4; k = k + 1) {
+    for (var j = 0; j < 4; j = j + 1) {
+      for (var i = 0; i < 4; i = i + 1) {
+        let sub = cmin + vec3<i32>(i, j, k) * 4;
+        let st = ddgi_brick_state(g, sub, 3u);
+        if (st == 0u) { // Air 4-brick → 叶中心 = sub + 2
+          let p = vec3<f32>(sub) + 2.0;
+          let d2 = dot(p - center, p - center);
+          if (d2 < best_d2) { best_d2 = d2; best_p = p; found = 1.0; }
+        } else if (st == 2u && nmix < 64u) {
+          mixed[nmix] = sub;
+          nmix = nmix + 1u;
+        }
+      }
+    }
+  }
+  if (found > 0.5) { return vec4<f32>(best_p, 1.0); }
+  // lvl4：每个 Mixed 4-brick 内 4³ 体素找空气
+  for (var m = 0u; m < nmix; m = m + 1u) {
+    let par = mixed[m];
+    for (var k = 0; k < 4; k = k + 1) {
+      for (var j = 0; j < 4; j = j + 1) {
+        for (var i = 0; i < 4; i = i + 1) {
+          let v = par + vec3<i32>(i, j, k);
+          if (sample_brickmap(g, v) == 0u) {
+            let p = vec3<f32>(v) + 0.5;
+            let d2 = dot(p - center, p - center);
+            if (d2 < best_d2) { best_d2 = d2; best_p = p; found = 1.0; }
+          }
+        }
+      }
+    }
+  }
+  return vec4<f32>(best_p, found);
+}
+
+// 探针放置结果
+struct DdgiProbePlace {
+  enabled: u32,   // 0/1
+  no_surf: u32,   // 0/1（cell 纯空气）
+  off_q: vec3<u32>, // 归一化 offset 量化 [0,32)
+}
+
+// 逐 cell 探针放置（Douglas get_ddgi_probe）：Solid/全实无空叶 → enabled=0；
+// Air → cell 中心；Mixed → BFS 最大空叶中心（靠 cell 中心最近，确定性）。
+fn ddgi_get_probe(g: Grid, cmin: vec3<i32>, size: i32) -> DdgiProbePlace {
+  var out = DdgiProbePlace(0u, 0u, vec3<u32>(0u));
+  let st = ddgi_cell_state_sized(g, cmin, size);
+  if (st == 1u) { return out; } // Solid
+  let center = vec3<f32>(cmin) + f32(size) * 0.5;
+  var leaf_p = center;
+  if (st == 2u) {
+    // 显式栈 DFS（8 叉二分 → 16 转 4³ BFS）；best = 空叶尺寸最大、靠 center 最近。
+    // 不变量：某 Mixed 节点扫到 Air 子(leaf=half) 即早退不入栈 Mixed（half 必大于
+    // Mixed 子下钻叶 ≤half/2）；故进入 jsize<=16 分支时 best 只会是同级小叶(≤4)。
+    var stack: array<vec4<i32>, 72>;
+    var sp = 0u;
+    stack[sp] = vec4<i32>(cmin, size); sp = sp + 1u;
+    var best_leaf = 0;
+    var best_d2 = 1e30;
+    var best_p = vec3<f32>(0.0);
+    var have = false;
+    while (sp > 0u) {
+      sp = sp - 1u;
+      let job = stack[sp];
+      let jmin = job.xyz;
+      let jsize = job.w;
+      let jst = ddgi_cell_state_sized(g, jmin, jsize);
+      if (jst == 0u) { // Air 节点 → 叶 = jsize
+        let p = vec3<f32>(jmin) + f32(jsize) * 0.5;
+        let d2 = dot(p - center, p - center);
+        if (!have || jsize > best_leaf || (jsize == best_leaf && d2 < best_d2)) {
+          have = true; best_leaf = jsize; best_d2 = d2; best_p = p;
+        }
+        continue;
+      }
+      if (jst == 1u) { continue; } // Solid 不下钻
+      // Mixed
+      if (jsize <= 16) {
+        // 到达 16：4³→4³ BFS；叶 ≤4，恒小于二分 half(≥16)，仅与同级小叶比 d2
+        let r = ddgi_leaf16(g, jmin, center);
+        if (r.w > 0.5 && (!have || best_leaf <= 4)) {
+          let d2 = dot(r.xyz - center, r.xyz - center);
+          if (!have || d2 < best_d2) {
+            have = true; best_leaf = 4; best_d2 = d2; best_p = r.xyz;
+          }
+        }
+        continue;
+      }
+      let half = jsize / 2;
+      // 扫 8 子：有 Air 子 → 取最近 Air 中心(leaf=half) 早退；否则 Mixed 子入栈
+      var air_d2 = 1e30;
+      var air_p = vec3<f32>(0.0);
+      var have_air = false;
+      var nsub = 0u;
+      var subs: array<vec3<i32>, 8>;
+      for (var k = 0; k < 2; k = k + 1) {
+        for (var j = 0; j < 2; j = j + 1) {
+          for (var i = 0; i < 2; i = i + 1) {
+            let sub = jmin + vec3<i32>(i, j, k) * half;
+            let sst = ddgi_cell_state_sized(g, sub, half);
+            if (sst == 0u) {
+              let p = vec3<f32>(sub) + f32(half) * 0.5;
+              let d2 = dot(p - center, p - center);
+              if (d2 < air_d2) { air_d2 = d2; air_p = p; have_air = true; }
+            } else if (sst == 2u) {
+              subs[nsub] = sub; nsub = nsub + 1u;
+            }
+          }
+        }
+      }
+      if (have_air) {
+        if (!have || half > best_leaf || (half == best_leaf && air_d2 < best_d2)) {
+          have = true; best_leaf = half; best_d2 = air_d2; best_p = air_p;
+        }
+        continue;
+      }
+      for (var s = 0u; s < nsub; s = s + 1u) {
+        if (sp < 72u) { stack[sp] = vec4<i32>(subs[s], half); sp = sp + 1u; }
+      }
+    }
+    if (!have) { return out; } // 多色全实无空叶
+    leaf_p = best_p;
+  }
+  out.enabled = 1u;
+  out.no_surf = select(0u, 1u, st == 0u);
+  // 归一化 offset 量化 [0,32)（q/32 = cell 内相对位置）
+  let u = clamp((leaf_p - vec3<f32>(cmin)) / f32(size), vec3<f32>(0.0), vec3<f32>(1.0));
+  out.off_q = vec3<u32>(round(u * 31.0));
+  return out;
+}
+
 //
 // 旧 tmax 栈帧版为每层节点维护 tmax/cell/t_enter/t_exit（13 字 ×4 帧），弹栈必
 // 重载节点头（3+2 LUT load）。本版状态只有：
@@ -1147,6 +1456,13 @@ const DDGI_IRR_TEXELS: u32 = 8u;
 const DDGI_DEPTH_TEXELS: u32 = 16u;
 const DDGI_PROBES_PER_LAYER_AXIS: u32 = 16u;
 const DDGI_PROBES_PER_LAYER: u32 = 256u;
+// 相机滚动 LOD 级联：4 级，cell_size = 16/32/64/128；每级 16³=4096 固定槽
+const DDGI_LOD_COUNT: u32 = 4u;
+const DDGI_SLOTS_PER_LOD: u32 = 4096u; // 16³
+const DDGI_TOTAL_SLOTS: u32 = 16384u;  // 4×4096
+const DDGI_TOTAL_LAYERS: u32 = 64u;    // 16384/256
+const DDGI_WINDOW_AXIS: u32 = 16u;     // 窗口单轴 cell
+const DDGI_SCROLL_STEP: i32 = 8;       // 半窗滚动步长（cell）
 const DDGI_META_OFFSET_BITS: u32 = 5u;
 const DDGI_META_AGE_SHIFT: u32 = 15u;
 const DDGI_AGE_MAX: u32 = 255u;
@@ -1188,42 +1504,32 @@ const DDGI_RAY_BIAS: f32 = 0.5;
 // 托底，0.0 时任何 gi=0 的背光体素（ndl·sun=0）直接渲染成纯黑方块
 const DDGI_BASE_AMBIENT: f32 = 0.2;
 
-// ---- group(4)：v3 DDGI 资源（M4-1 建 Rust 侧绑定；M4-3 增 13/14 全域采样绑定；
-// 常量见 ddgi.rs 对齐表；binding 0/2/9/11/12 为「本级」pass 数据——base 与级联
-// 各建一份 bind group，纹理 3-8 与 positions/objects 13/14 共享）----
+// ---- group(4)：DDGI 资源（全 GPU 烘焙架构——探针放置/flags/坐标每帧由 active
+// pass 遍历 con tree 现算，CPU 零几何；槽身份 = (lod, cell_in_window) 固定，
+// 4 级相机滚动 LOD 窗口。binding 见下；Rust 侧 ddgi_bg4_layout 逐字镜像）----
+struct DdgiLod {
+  origin: vec4<i32>,      // xyz = 窗口角（本级 cell 全局坐标），w = cell_size（fine）
+  prev_origin: vec4<i32>, // xyz = 上一帧窗口角（ping-pong prev meta 寻址），w = pad
+  reuse_min: vec4<i32>,   // xyz = 复用界 min（本级 cell 全局，含），w = pad
+  reuse_max: vec4<i32>,   // xyz = 复用界 max（本级 cell 全局，不含），w = pad
+};
 struct DdgiUniform {
-  grid_origin: vec4<f32>, // xyz = 网格原点（base-cell 全局坐标），w = cell 边长（fine）
-  grid_dims: vec4<f32>,   // xyz = dims（本级 cell 单位），w = probe_count
-  params: vec4<f32>,      // x = frame, y = rays_per_probe, z = gain, w = object bbox 数
-  misc: vec4<f32>,        // x = DDGI 运行时开关（1=开 0=关）；yzw 保留
+  lods: array<DdgiLod, 4>, // 4 级相机锚定滚动窗口（lod0=16 … lod3=128）
+  params: vec4<f32>,       // x = frame, y = 调试模式, z = gain, w = object bbox 数
+  misc: vec4<f32>,         // x = DDGI 运行时开关（1=开 0=关）；yzw 保留
 };
 @group(4) @binding(0) var<uniform> ddgi_u: DdgiUniform;
-@group(4) @binding(1) var<storage, read> ddgi_positions: array<vec4<f32>>; // xyz = 世界 fine 坐标，w = 活跃位（viz 过滤）
-@group(4) @binding(2) var<storage, read> ddgi_cell_index: array<u32>;      // dense cell → probe id
-@group(4) @binding(3) var ddgi_irr_prev: texture_2d_array<f32>;            // rgba16f 128×128×L
-@group(4) @binding(4) var ddgi_depth_prev: texture_2d_array<f32>;          // r32 256×256×L
-@group(4) @binding(5) var ddgi_irr_next: texture_storage_2d_array<rgba16float, write>;
-@group(4) @binding(6) var ddgi_depth_next: texture_storage_2d_array<r32float, write>;
-@group(4) @binding(7) var ddgi_meta_prev: texture_2d_array<u32>;           // r32uint 16×16×L
-@group(4) @binding(8) var ddgi_meta_next: texture_storage_2d_array<r32uint, write>;
-@group(4) @binding(9) var<storage, read_write> ddgi_dispatch: array<atomic<u32>>; // [0]=count [1]=1 [2]=1 [3]=0（兼 indirect buffer）
-@group(4) @binding(10) var<storage, read> ddgi_objects: array<vec4<f32>>;  // 2 vec4/bbox（min.xyz+pad / max.xyz+pad）
-@group(4) @binding(11) var<storage, read_write> ddgi_samples: array<vec4<f32>>; // [dir.xyz, dist]+[radiance.xyz, 0]
-@group(4) @binding(12) var<storage, read_write> ddgi_worklist: array<u32>; // 活跃探针 id（[slot]，slot = atomicAdd 序号）
-// M4-3 多级联采样（binding 0/2 是「本级」pass 数据；13/14 是全域采样数据）：
-// 13 = base + 4 级级联的域参数（每域 DdgiUniform 64B，总 320B）；
-// 14 = 全量 dense cell_index（base 区 ++ 级联区；级联 ci 上传时已平移为全局探针 id）
-struct DdgiDomains {
-  base: DdgiUniform,
-  cascades: array<DdgiUniform, 4>,
-};
-@group(4) @binding(13) var<uniform> ddgi_dom: DdgiDomains;
-@group(4) @binding(14) var<storage, read> ddgi_all_ci: array<u32>;
-// binding 15 = 本级 dense cell → DdgiProbeFlags（DDGI_FLAG_*；烘焙期随探针放置一次
-// 确定上传，active pass 只读——Douglas sort.glsl get_ddgi_probe/locus_flags 的单一
-// 真相源；不再每帧走几何树重算，根除 GPU/CPU 几何分歧红点）。base BG4 绑 base、
-// 级联 BG4_c 绑本级。
-@group(4) @binding(15) var<storage, read> ddgi_cell_flags: array<u32>;
+@group(4) @binding(1) var ddgi_irr_prev: texture_2d_array<f32>;            // rgba16f 128×128×64
+@group(4) @binding(2) var ddgi_depth_prev: texture_2d_array<f32>;          // r32 256×256×64
+@group(4) @binding(3) var ddgi_irr_next: texture_storage_2d_array<rgba16float, write>;
+@group(4) @binding(4) var ddgi_depth_next: texture_storage_2d_array<r32float, write>;
+@group(4) @binding(5) var ddgi_meta_prev: texture_2d_array<u32>;           // r32uint 16×16×64（packed off+age）
+@group(4) @binding(6) var ddgi_meta_next: texture_storage_2d_array<r32uint, write>;
+@group(4) @binding(7) var<storage, read_write> ddgi_dispatch: array<atomic<u32>>; // [0]=count [1]=seal [2..3]=0
+@group(4) @binding(8) var<storage, read> ddgi_objects: array<vec4<f32>>;  // 2 vec4/bbox（min.xyz+pad / max.xyz+pad）
+@group(4) @binding(9) var<storage, read_write> ddgi_samples: array<vec4<f32>>; // [dir.xyz, dist]+[radiance.xyz, 0]
+@group(4) @binding(10) var<storage, read_write> ddgi_worklist: array<u32>;    // 本帧活跃 slot（atomicAdd 序号）
+@group(4) @binding(11) var<storage, read_write> ddgi_slot_pos: array<vec4<f32>>; // slot → xyz=探针世界 fine 坐标，w=lod
 
 // ---- PCG hash / 随机（ray_rand 种子链与 CPU 逐位一致）----
 fn ddgi_pcg(v: u32) -> u32 {
@@ -1293,6 +1599,19 @@ fn ddgi_oct_texel_dir(tx: u32, ty: u32, s: u32) -> vec3<f32> {
 }
 
 // ---- 纹理坐标映射（probe_layer/in_layer/irr/depth/meta_texel_coord 镜像）----
+// 固定槽编码（Rust ddgi_slot 镜像）：slot = lod·4096 + (x + y·16 + z·256)，
+// cell ∈ [0,16) 窗口内坐标。slot 即线性探针 id，直接喂入下列 texel 映射
+// （layer = slot/256 ∈ [0,64)）。
+fn ddgi_slot(lod: u32, cell: vec3<u32>) -> u32 {
+  return lod * DDGI_SLOTS_PER_LOD
+    + cell.x
+    + cell.y * DDGI_PROBES_PER_LAYER_AXIS
+    + cell.z * DDGI_PROBES_PER_LAYER;
+}
+// 各级 cell 边长：16<<lod = 16/32/64/128
+fn ddgi_lod_cell_size(lod: u32) -> i32 {
+  return 16i << lod;
+}
 fn ddgi_probe_in_layer(id: u32) -> vec2<u32> {
   let in_layer = id % DDGI_PROBES_PER_LAYER;
   return vec2<u32>(in_layer % DDGI_PROBES_PER_LAYER_AXIS, in_layer / DDGI_PROBES_PER_LAYER_AXIS);
@@ -1355,10 +1674,24 @@ fn ddgi_update_texel(prev: vec3<f32>, proj: vec3<f32>) -> vec3<f32> {
   return prev + lerp_delta;
 }
 
-// DDGI cell 网格原点（base-cell）→ cell 的 fine 体素最小角
-fn ddgi_cell_min(cell: vec3<u32>) -> vec3<i32> {
-  let step = ddgi_u.grid_origin.w / f32(DDGI_CELL);
-  return vec3<i32>((ddgi_u.grid_origin.xyz + vec3<f32>(cell) * step) * f32(DDGI_CELL));
+// DDGI 窗口 (lod, cell_in_window) → cell 的 fine 体素最小角（世界坐标）
+fn ddgi_cell_min_lod(lod: u32, cell: vec3<u32>) -> vec3<i32> {
+  let L = ddgi_u.lods[lod];
+  return (L.origin.xyz + vec3<i32>(cell)) * L.origin.w;
+}
+// slot → lod / 窗口内 cell（与 ddgi_slot 互逆）
+fn ddgi_slot_lod(slot: u32) -> u32 {
+  return slot / DDGI_SLOTS_PER_LOD;
+}
+fn ddgi_slot_cell(slot: u32) -> vec3<u32> {
+  let local = slot % DDGI_SLOTS_PER_LOD;
+  return vec3<u32>(local % DDGI_WINDOW_AXIS, (local / DDGI_WINDOW_AXIS) % DDGI_WINDOW_AXIS, local / DDGI_PROBES_PER_LAYER);
+}
+// 邻居 flags（halo 用）：只需 NO_SURFACES 位正确——Air→2（不拉低 AND），
+// Solid/Mixed→0（有表面，拉低 AND）。不做 BFS offset（三态查询，Air/Solid 早退）。
+fn ddgi_neighbor_nosurf(g: Grid, cmin: vec3<i32>, size: i32) -> u32 {
+  let st = ddgi_cell_state_sized(g, cmin, size);
+  return select(0u, DDGI_FLAG_NO_SURFACES, st == 0u);
 }
 
 // 6³ 共享 halo 数组：4³ cell/workgroup + 1 圈 halo（Douglas sort.glsl 同款）
@@ -1386,25 +1719,39 @@ fn ddgi_seal() {
   atomicStore(&ddgi_dispatch[1u], min(count, DDGI_PROBE_BUDGET));
 }
 
-// ②活跃判定（cpu_ddgi_active 逐字；@workgroup_size(4,4,4)，每 cell 1 线程）
-// halo 装载：域内 owner 写 [0,3]³；边缘线程写 ±1 halo 与「owner 出域」的格
-// （OOB 全局 → 自身 flags，与 CPU flags_intersection 同语义——INFERENCE）。
+// ②活跃判定（Douglas sort.glsl 逐字；@workgroup_size(4,4,4)，每 (lod,cell) 1 线程）。
+// 单 dispatch (16,16,64)：lod = gid.z/16，cell_in_window = (gid.x, gid.y, gid.z%16)。
+// workgroup(4,4,4) 不跨 lod 边界（16 是 4 的倍数）→ halo 完全在本 lod 窗口内。
+// 每线程 GPU 烘焙：ddgi_get_probe 遍历 con tree 得 enabled/no_surf/offset；halo
+// 6 面邻居 flags 按位 AND 判近表面；outside_lower_grid 抑制细窗口内的粗探针；
+// reuse 带内 normalized offset 匹配则沿用上帧 age；末尾单一 meta textureStore。
 @compute @workgroup_size(4, 4, 4)
 fn ddgi_active(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  let dims = vec3<u32>(ddgi_u.grid_dims.xyz);
-  if (any(gid >= dims)) { return; }
-  let dx = dims.x;
-  let li0 = gid.x + gid.y * dx + gid.z * dx * dims.y;
-  let cell_size = i32(ddgi_u.grid_origin.w);
-  // ---- per-cell flags（Douglas sort.glsl：get_ddgi_probe → locus_flags，烘焙期
-  // 单一真相源上传，active 只读不重算几何）。halo（workgroup 共享内存）载 flags 字：
-  // 域内 owner 写 [0,3]³；边缘格由边缘线程填——域内读 ddgi_cell_flags，**出域 OOB
-  // = NO_SURFACES（空气，位值 2）**。OOB 绝不能填 0：0=Solid 语义会把 6 邻居 AND
-  // 的 NO_SURFACES 位拉 0 → 网格边缘探针全部误激活（规则红点壳层根因）。
-  let own_flags = ddgi_cell_flags[li0];
+  if (any(gid >= vec3<u32>(DDGI_WINDOW_AXIS, DDGI_WINDOW_AXIS, DDGI_WINDOW_AXIS * DDGI_LOD_COUNT))) {
+    return;
+  }
+  let lod = gid.z / DDGI_WINDOW_AXIS;
+  let cell = vec3<u32>(gid.x, gid.y, gid.z % DDGI_WINDOW_AXIS);
+  let L = ddgi_u.lods[lod];
+  let cs = L.origin.w;
+  let cmin = (L.origin.xyz + vec3<i32>(cell)) * cs;
+  let g = make_grid(0u);
+
+  // ---- ① GPU 烘焙：遍历 con tree 放探针（CPU 零几何）----
+  let place = ddgi_get_probe(g, cmin, cs);
+  let own_flags = select(
+    0u,
+    select(DDGI_FLAG_ENABLED, DDGI_FLAG_ENABLED | DDGI_FLAG_NO_SURFACES, place.no_surf == 1u),
+    place.enabled == 1u,
+  );
+  // 探针世界坐标 = cell 角 + normalized offset × cell_size（off_q/32）
+  let probe_pos = vec3<f32>(cmin) + (vec3<f32>(place.off_q) / 32.0) * f32(cs);
+
+  // ---- halo flags（workgroup 共享）：owner 写 [1,4]³；边缘格由边缘线程填，
+  // 出窗 OOB = NO_SURFACES(2)（绝不能填 0：Solid 语义拉低 6 邻居 AND → 边缘误激活）
   ddgi_halo[ddgi_halo_idx(vec3<i32>(lid))] = own_flags;
   for (var dz = -1; dz <= 1; dz = dz + 1) {
     for (var dy = -1; dy <= 1; dy = dy + 1) {
@@ -1413,13 +1760,13 @@ fn ddgi_active(
         let l = vec3<i32>(lid) + d;
         if (any(l < vec3<i32>(0)) || any(l > vec3<i32>(4))) { continue; }
         let l_own = all(l >= vec3<i32>(0)) && all(l <= vec3<i32>(3));
-        let cell = vec3<i32>(gid) + d;
-        let cell_in = all(cell >= vec3<i32>(0)) && all(vec3<u32>(cell) < dims);
+        let ncell = vec3<i32>(cell) + d;
+        let cell_in = all(ncell >= vec3<i32>(0)) && all(vec3<u32>(ncell) < vec3<u32>(DDGI_WINDOW_AXIS));
         if (l_own && cell_in) { continue; } // 域内 owner 负责写
         var nbr_flags: u32 = DDGI_FLAG_NO_SURFACES; // OOB = 空气（不拉低 AND）
         if (cell_in) {
-          let cu = vec3<u32>(cell);
-          nbr_flags = ddgi_cell_flags[cu.x + cu.y * dx + cu.z * dx * dims.y];
+          let nmin = (L.origin.xyz + ncell) * cs;
+          nbr_flags = ddgi_neighbor_nosurf(g, nmin, cs);
         }
         ddgi_halo[ddgi_halo_idx(l)] = nbr_flags;
       }
@@ -1427,55 +1774,72 @@ fn ddgi_active(
   }
   workgroupBarrier();
 
-  // ENABLED（本 cell 放了探针）= Douglas L243 外层门；Solid/空 cell flags=0 直接返回
-  //（唯一免写 meta 的分支：无探针即无 meta texel）
-  if ((own_flags & DDGI_FLAG_ENABLED) == 0u) { return; }
-  let probe_id = ddgi_cell_index[li0];
-  // meta 读提前：**所有 ENABLED 探针统一走末尾单一 textureStore**（硬约束：
-  // textureStore 在条件块外）。inactive 写 age=0，offset 保留（烘焙期静态属性）。
-  let tc = ddgi_meta_coord(probe_id);
-  let coord = vec2<i32>(vec2<u32>(tc.y, tc.z));
-  let layer = i32(tc.x);
-  let prev = textureLoad(ddgi_meta_prev, coord, layer, 0).x;
-  let prev_offset = ddgi_meta_offset(prev);
-  // near surface（Douglas probe_near_surface 逐字，截图3 L252-257）：
-  //   本 cell (flags & NO_SURFACES)==0
-  //   || 6 面邻居 flags 按位 AND 后 (and & NO_SURFACES)==0（任一邻居有表面；
-  //      Solid 邻居 flags=0 / Mixed 位1=0 都把 AND 位拉 0，Air/OOB 位1=1 保持）
-  //   || object bbox 重叠（运行时）。只查面邻接 left/right/down/up/back/front。
-  let c = vec3<i32>(lid);
-  let and6 = ddgi_halo[ddgi_halo_idx(c + vec3<i32>(-1, 0, 0))]
-    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(1, 0, 0))]
-    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, -1, 0))]
-    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 1, 0))]
-    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 0, -1))]
-    & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 0, 1))];
-  var near = ((own_flags & DDGI_FLAG_NO_SURFACES) == 0u)
-    || ((and6 & DDGI_FLAG_NO_SURFACES) == 0u);
-  // 第三条（Douglas）：与非网格对齐对象 bbox 重叠 → 活跃（烘焙期不知，仅运行时）
-  if (!near) {
-    let half = f32(cell_size) * 0.5;
-    let center = vec3<f32>(ddgi_cell_min(gid)) + vec3<f32>(half);
-    let n = u32(ddgi_u.params.w);
-    for (var i = 0u; i < n; i = i + 1u) {
-      let mn = ddgi_objects[i * 2u].xyz;
-      let mx = ddgi_objects[i * 2u + 1u].xyz;
-      if (mx.x > center.x - half && mn.x < center.x + half
-        && mx.y > center.y - half && mn.y < center.y + half
-        && mx.z > center.z - half && mn.z < center.z + half) {
-        near = true;
+  let slot = ddgi_slot(lod, cell);
+  let tc = ddgi_meta_coord(slot);
+  let mcoord = vec2<i32>(vec2<u32>(tc.y, tc.z));
+  let mlayer = i32(tc.x);
+
+  // ---- ② 近表面 + outside_lower + reuse → age / worklist（Douglas sort.glsl）----
+  var age = 0u;
+  if ((own_flags & DDGI_FLAG_ENABLED) != 0u) {
+    let c = vec3<i32>(lid);
+    let and6 = ddgi_halo[ddgi_halo_idx(c + vec3<i32>(-1, 0, 0))]
+      & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(1, 0, 0))]
+      & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, -1, 0))]
+      & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 1, 0))]
+      & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 0, -1))]
+      & ddgi_halo[ddgi_halo_idx(c + vec3<i32>(0, 0, 1))];
+    var near = ((own_flags & DDGI_FLAG_NO_SURFACES) == 0u)
+      || ((and6 & DDGI_FLAG_NO_SURFACES) == 0u);
+    // 第三条：非网格对齐对象 bbox 重叠 → 近表面（运行时）
+    if (!near) {
+      let half = f32(cs) * 0.5;
+      let center = vec3<f32>(cmin) + vec3<f32>(half);
+      let n = u32(ddgi_u.params.w);
+      for (var i = 0u; i < n; i = i + 1u) {
+        let mn = ddgi_objects[i * 2u].xyz;
+        let mx = ddgi_objects[i * 2u + 1u].xyz;
+        if (mx.x > center.x - half && mn.x < center.x + half
+          && mx.y > center.y - half && mn.y < center.y + half
+          && mx.z > center.z - half && mn.z < center.z + half) {
+          near = true;
+        }
       }
     }
+    // outside_lower_grid：粗探针仅在更细一级（lod-1）窗口物理范围**外**激活
+    // （同心锚定下 lod-1 窗口 ⊃ 所有更细窗口，查一级即可）；lod0 恒 outside。
+    var outside = true;
+    if (lod > 0u) {
+      let Lo = ddgi_u.lods[lod - 1u];
+      let lo_f = vec3<f32>(Lo.origin.xyz) * f32(Lo.origin.w);
+      let hi_f = lo_f + vec3<f32>(f32(Lo.origin.w * i32(DDGI_WINDOW_AXIS)));
+      outside = !(all(probe_pos >= lo_f) && all(probe_pos < hi_f));
+    }
+    if (near && outside) {
+      // reuse：本 cell 落在 current∩previous 重叠带、且上帧同物理槽 normalized
+      // offset 与本帧一致 → 沿用 age（探针未跳变）；否则 age=0（新探针）。
+      let cell_global = L.origin.xyz + vec3<i32>(cell);
+      let in_reuse = all(cell_global >= L.reuse_min.xyz) && all(cell_global < L.reuse_max.xyz);
+      if (in_reuse) {
+        let prev_cell = cell_global - L.prev_origin.xyz;
+        if (all(prev_cell >= vec3<i32>(0)) && all(vec3<u32>(prev_cell) < vec3<u32>(DDGI_WINDOW_AXIS))) {
+          let prev_slot = ddgi_slot(lod, vec3<u32>(prev_cell));
+          let pc = ddgi_meta_coord(prev_slot);
+          let prev_word = textureLoad(ddgi_meta_prev, vec2<i32>(vec2<u32>(pc.y, pc.z)), i32(pc.x), 0).x;
+          let prev_off = ddgi_meta_offset(prev_word);
+          if (all(prev_off == place.off_q)) {
+            age = min(ddgi_meta_age(prev_word) + 1u, DDGI_AGE_MAX);
+          }
+        }
+      }
+      let wslot = atomicAdd(&ddgi_dispatch[0u], 1u);
+      ddgi_worklist[wslot] = slot;
+    }
   }
-  // age 生命周期（Douglas：near 探针 age=min(prev+1, MAX) 进 worklist；否则 age=0。
-  // 末尾单一 textureStore——提前 return 不写会让 meta_next 残留旧 age>0，viz 误激活）
-  var age = 0u;
-  if (near) {
-    age = min(ddgi_meta_age(prev) + 1u, DDGI_AGE_MAX);
-    let slot = atomicAdd(&ddgi_dispatch[0u], 1u);
-    ddgi_worklist[slot] = probe_id;
-  }
-  textureStore(ddgi_meta_next, coord, layer, vec4<u32>(ddgi_meta_pack(prev_offset, age), 0u, 0u, 0u));
+  // 探针坐标写 slot（viz/sample 读；inactive 槽 age=0 采样跳过）
+  ddgi_slot_pos[slot] = vec4<f32>(probe_pos, f32(lod));
+  // 末尾单一 meta store（块外）：inactive/Solid age=0，offset 记录本帧放置
+  textureStore(ddgi_meta_next, mcoord, mlayer, vec4<u32>(ddgi_meta_pack(place.off_q, age), 0u, 0u, 0u));
 }
 
 // ---- DDGI 采样（M3-4：cpu_sample_ddgi / cpu_irr_sample / cpu_depth_sample 镜像；
@@ -1511,17 +1875,20 @@ fn ddgi_depth_sample(id: u32, d: vec3<f32>) -> f32 {
   return textureLoad(ddgi_depth_prev, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0).x;
 }
 // 8 cell 三线性 × 锐利背面（n·(接收点→探针)）× 漏光 chevron，加权归一化。
-// 返回 vec4(rgb, wsum)——wsum 供多级联 fallback 判覆盖。
-fn ddgi_sample_dom(
-  p: vec3<f32>,
-  n: vec3<f32>,
-  origin: vec3<f32>,
-  dims: vec3<f32>,
-  cell_size: f32,
-  ci_off: u32,
-) -> vec4<f32> {
-  let step = cell_size / f32(DDGI_CELL);
-  let cell_f = (p / f32(DDGI_CELL) - origin) / step;
+// 固定槽 (lod,cell)：slot = ddgi_slot(lod, corner)；探针坐标读 slot_pos（active
+// 现算写入）；age==0 槽 = 本帧无有效探针（Solid/远场/outside_lower），等价旧
+// NO_PROBE 布尔门跳过（非 age 权重门）。返回 vec4(rgb, wsum)。
+fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
+  let L = ddgi_u.lods[lod];
+  let o = vec3<f32>(L.origin.xyz) * f32(L.origin.w);
+  let ext = vec3<f32>(f32(L.origin.w * i32(DDGI_WINDOW_AXIS)));
+  return all(p >= o) && all(p < o + ext);
+}
+fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32) -> vec4<f32> {
+  let L = ddgi_u.lods[lod];
+  let cs = f32(L.origin.w);
+  let o = vec3<f32>(L.origin.xyz) * cs;
+  let cell_f = (p - o) / cs;
   let c0 = floor(cell_f);
   let fr = cell_f - c0;
   var total = vec3<f32>(0.0);
@@ -1531,36 +1898,31 @@ fn ddgi_sample_dom(
     for (var iy = 0u; iy < 2u; iy = iy + 1u) {
       for (var ix = 0u; ix < 2u; ix = ix + 1u) {
         let corner = c0 + vec3<f32>(vec3<u32>(ix, iy, iz));
-        if (corner.x < 0.0 || corner.y < 0.0 || corner.z < 0.0
-          || corner.x >= dims.x || corner.y >= dims.y || corner.z >= dims.z) {
+        if (any(corner < vec3<f32>(0.0)) || any(corner >= vec3<f32>(f32(DDGI_WINDOW_AXIS)))) {
           ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u;
           continue;
         }
-        let ru = vec3<u32>(corner);
-        let ci = ci_off + ru.x + ru.y * u32(dims.x) + ru.z * u32(dims.x) * u32(dims.y);
-        let id = ddgi_all_ci[ci];
-        if (id == DDGI_NO_PROBE) { ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u; continue; }
+        let slot = ddgi_slot(lod, vec3<u32>(corner));
+        let mc = ddgi_meta_coord(slot);
+        let mw = textureLoad(ddgi_meta_prev, vec2<i32>(vec2<u32>(mc.y, mc.z)), i32(mc.x), 0).x;
+        if (ddgi_meta_age(mw) == 0u) { ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u; continue; }
         let wx = select(1.0 - fr.x, fr.x, ix == 1u);
         let wy = select(1.0 - fr.y, fr.y, iy == 1u);
         let wz = select(1.0 - fr.z, fr.z, iz == 1u);
         let wtri = wx * wy * wz;
         if (wtri <= 1e-6) { continue; }
-        let probe = ddgi_positions[id].xyz;
+        let probe = ddgi_slot_pos[slot].xyz;
         let to = p - probe;
         let dist = length(to);
         let dir = to / max(dist, 1e-4);
         let wn = clamp(dot(n, -dir) / DDGI_NORMAL_BIAS, 0.0, 1.0);
         if (wn <= 0.0) { ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u; continue; }
-        let dtex = ddgi_depth_sample(id, dir);
-        // 漏光 chevron 半宽随域 cell 缩放（base 16→4；级联 32/64/128/256 →
-        // 8/16/32/64）——固定 4 对粗级联相对过窄，深度量化误差（±dist×半 texel 锥角）
-        // 会把远角合法探针误剔成 0 贡献，剔除边界呈网格状黑块
-        let dep_bias = cell_size * 0.25;
+        let dtex = ddgi_depth_sample(slot, dir);
+        // 漏光 chevron 半宽随 lod cell 缩放（16→4；32/64/128→8/16/32）
+        let dep_bias = cs * 0.25;
         let wd = clamp((dtex - dist) / dep_bias + 0.5, 0.0, 1.0);
         if (wd <= 0.0) { ddgi_dbg_rej.z = ddgi_dbg_rej.z + 1u; continue; }
-        // （旧 age==0 门控已拆：Douglas 采样不读 meta；未更新探针 irr=0，混入仅
-        // 稀释 wsum——归一化 total/wsum 数学等价，还省采样热路径 meta 纹理读）
-        let irr = ddgi_irr_sample(id, n);
+        let irr = ddgi_irr_sample(slot, n);
         let w = wtri * wn * wd;
         total = total + irr * w;
         wsum = wsum + w;
@@ -1568,11 +1930,6 @@ fn ddgi_sample_dom(
     }
   }
   return vec4<f32>(select(vec3<f32>(0.0), total / wsum, wsum >= 1e-4), wsum);
-}
-// 域包含测试（纯 ALU，零纹理 load）：p（世界 fine）是否在本级网格窗内
-fn ddgi_dom_contains(origin: vec3<f32>, dims: vec3<f32>, cell_size: f32, p: vec3<f32>) -> bool {
-  let rel = (p / f32(DDGI_CELL) - origin) / (cell_size / f32(DDGI_CELL));
-  return all(rel >= vec3<f32>(0.0)) && all(rel < dims);
 }
 // 诊断输出（params.y 调试模式读取；每次 ddgi_sample 写入）：wsum + 选中域
 // （1=base，2-5=级联0-3）；rej = 8 邻居探针拒绝原因计数（x=无探针/越界,
@@ -1582,40 +1939,19 @@ var<private> ddgi_dbg_wsum: f32;
 var<private> ddgi_dbg_dom: f32;
 var<private> ddgi_dbg_rej: vec4<u32>;
 var<private> ddgi_dbg_rej_out: vec4<u32>;
-// 多级联选域采样：优先级 casc0 → base → casc1 → casc2 → casc3，最细可用域直出
-// （Douglas 无跨域混合；旧「边界 <1 cell 过渡带混合」为滚动级联伴生自创，已拆）。
+// LOD 选择采样：细 → 粗（lod0=16 最密 … lod3=128 最疏），第一个覆盖 p 且 wsum
+// 足够的窗口直出（Douglas 无跨域混合；outside_lower 保证细窗口内粗探针 age=0）。
+// 边缘 wsum 不足（corner 越窗 / 全 inactive）→ 落到更粗窗口兜底。
 fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-  let db = ddgi_dom.base;
-  let base_cells = u32(db.grid_dims.x) * u32(db.grid_dims.y) * u32(db.grid_dims.z);
-  let c0 = ddgi_dom.cascades[0];
-  // casc0（相机邻域，最细级）——选域 = 纯包含测试优先级链（最细可用域直出）。
-  // （旧「边界 <1 cell 与更粗域线性混合」已拆：那是滚动级联时代消除边界色跳的
-  // gate 自创，Douglas 采样 = 最近 8 探针投票，无跨域混合；scroll 已删，动机消失）
-  if (ddgi_dom_contains(c0.grid_origin.xyz, c0.grid_dims.xyz, c0.grid_origin.w, p)) {
-    let r = ddgi_sample_dom(p, n, c0.grid_origin.xyz, c0.grid_dims.xyz, c0.grid_origin.w, base_cells);
-    ddgi_dbg_rej_out = ddgi_dbg_rej;
-    ddgi_dbg_wsum = r.w;
-    ddgi_dbg_dom = 2.0;
-    return r.xyz;
-  }
-  // base（世界级静态 16³）
-  if (ddgi_dom_contains(db.grid_origin.xyz, db.grid_dims.xyz, db.grid_origin.w, p)) {
-    let r = ddgi_sample_dom(p, n, db.grid_origin.xyz, db.grid_dims.xyz, db.grid_origin.w, 0u);
-    ddgi_dbg_rej_out = ddgi_dbg_rej;
-    ddgi_dbg_wsum = r.w;
-    ddgi_dbg_dom = 1.0;
-    return r.xyz;
-  }
-  // casc1/2/3（粗级兜底远场）
-  for (var c = 1u; c < 4u; c = c + 1u) {
-    let dom = ddgi_dom.cascades[c];
-    if (ddgi_dom_contains(dom.grid_origin.xyz, dom.grid_dims.xyz, dom.grid_origin.w, p)) {
-      let r = ddgi_sample_dom(p, n, dom.grid_origin.xyz, dom.grid_dims.xyz, dom.grid_origin.w,
-        base_cells + c * 4096u);
+  for (var lod = 0u; lod < DDGI_LOD_COUNT; lod = lod + 1u) {
+    if (ddgi_lod_contains(lod, p)) {
+      let r = ddgi_sample_lod(p, n, lod);
       ddgi_dbg_rej_out = ddgi_dbg_rej;
       ddgi_dbg_wsum = r.w;
-      ddgi_dbg_dom = 2.0 + f32(c);
-      return r.xyz;
+      ddgi_dbg_dom = f32(lod) + 1.0;
+      if (r.w >= 1e-4) {
+        return r.xyz;
+      }
     }
   }
   ddgi_dbg_wsum = 0.0;
@@ -1644,7 +1980,8 @@ fn ddgi_cast(
   let base = (u32(ddgi_u.params.x) * DDGI_PROBE_BUDGET) % max(full, 1u);
   let slot = (base + wid.x) % max(full, 1u);
   let probe_id = ddgi_worklist[slot];
-  let origin = ddgi_positions[probe_id].xyz;
+  // 探针世界坐标：active pass 现算写入 slot_pos（全 GPU 烘焙，无 positions 上传）
+  let origin = ddgi_slot_pos[probe_id].xyz;
   // 固定预算分摊（cast_rays_per_probe 镜像）：count 为 active pass 终值（pass 边界
   // 保证）；严格 RAY_BUDGET/count 无下限（与 ddgi_update 同式，样本布局一致）
   let rays = max(DDGI_RAY_BUDGET / count, 1u);
@@ -1690,55 +2027,37 @@ fn ddgi_cast(
 }
 
 // ============================================================================
-// probe_viz_main：探针位置可视化（devlog #23 风格黄色方块）
-// 每线程处理一个探针，投影到屏幕空间后画一个小黄色方块到 out_tex（覆盖 DDA 输出）。
-// 只画**活跃**探针（Douglas #23：本 cell + 6 面邻接 cell 无体素 → 近表面无表面
-// 可照亮，不显示；烘焙期 CPU 判定经 positions.w 携带，与 ddgi_active 的
-// probe_near_surface 前两条件同源）。
-// **遮挡测试**：屏幕内探针各做一条相机→探针的 DDA 射线（复用 trace_scene，viz
-// pass 已绑定全部 bind group），命中且 t < 距离-0.5（半体素容差防贴面探针误剔）
-// → 被几何挡住不画。放在视锥剔除之后：屏幕外探针不付 DDA 成本。
-// 参数来源：view_u.probe_viz_params（x=总探针数, y=方块边长px, z=层级选择,
-// w=id_base）；屏幕尺寸用 textureDimensions(out_tex) 取（无需 push constant，
-// bevy 0.19 ComputePipelineDescriptor 不支持 push_constant_ranges）。
-// 层级选择（Douglas #23 = base 烘焙网格 + 4 LOD 同构）：z=0 画全部；1..=4 只画
-// LOD0~3（级联 c = (id-id_base)/4096）；5 只画 Base（id<id_base = 16³ 世界烘焙网格）。
+// probe_viz_main：探针位置可视化（devlog #23 风格）。每线程一个固定槽
+// (lod,cell) → slot ∈ [0,16384)；坐标读 slot_pos（active 现算），age==0 不画。
+// 颜色按 lod 分（目验相机同心 4 级壳层：lod0 黄 / lod1 青 / lod2 蓝 / lod3 品红）。
+// 遮挡测试：屏幕内探针做相机→探针 DDA，命中且 t<dist-0.5 → 被挡不画。
+// 参数：view_u.probe_viz_params（x=总槽数, y=方块边长px, z=层级选择 0=全部/1..4=lod）。
 // ============================================================================
 @compute @workgroup_size(64)
 fn probe_viz_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let probe_count = u32(view_u.probe_viz_params.x);
   let dot_size = u32(view_u.probe_viz_params.y);
   let id = gid.x;
-  if (id >= probe_count) {
+  if (id >= DDGI_TOTAL_SLOTS) {
     return;
   }
-  // 层级过滤（放最前：被滤掉的探针零成本，不付 padding/活跃/视锥/遮挡测试）
+  let lod = id / DDGI_SLOTS_PER_LOD;
+  // 层级过滤：z=0 全部；1..4 只画 LOD(z-1)
   let sel = u32(view_u.probe_viz_params.z);
-  if (sel != 0u) {
-    let id_base = u32(view_u.probe_viz_params.w);
-    // 探针组：base = 5；级联 c ∈ [0,4) = LOD c
-    let grp = select((id - id_base) / 4096u, 5u, id < id_base);
-    let want = select(sel - 1u, 5u, sel == 5u);
-    if (grp != want) {
-      return;
-    }
-  }
-  let pos = ddgi_positions[id];
-  // 跳过 padding 槽（未占用探针位 positions 全零 → 原点扎堆污染视图）
-  if (pos.x == 0.0 && pos.y == 0.0 && pos.z == 0.0) {
+  if (sel != 0u && lod != sel - 1u) {
     return;
   }
-  // 运行时活跃过滤：读 GPU meta age（ddgi_active 每帧写入），age==0 = 本帧未激活
-  // （远场无表面 / near_surface 未通过）→ 不画。active 判定与烘焙同源（cell_flags
-  // 单一真相源），Douglas #23 probe viz 只画近表面活跃探针（黄色方块）。
+  // 运行时活跃过滤：age==0 = 本帧未激活（Solid/远场/outside_lower）→ 不画
   let mc = ddgi_meta_coord(id);
   let meta_word = textureLoad(ddgi_meta_prev, vec2<i32>(vec2<u32>(mc.y, mc.z)), i32(mc.x), 0).x;
   if (ddgi_meta_age(meta_word) == 0u) {
-    return; // GPU 本帧未激活 → 不画
+    return;
   }
-  // 活跃探针统一黄色（Douglas #23 风格）；旧 pos.w 红/黄对照已删——active 现与
-  // 烘焙 cell_flags 同源，无 GPU/CPU 两套几何判定可分歧。
-  let dot_col = vec4<f32>(1.0, 0.85, 0.0, 1.0);
+  let pos = ddgi_slot_pos[id];
+  // lod 分色（近密远疏壳层目验）
+  var dot_col = vec4<f32>(1.0, 0.85, 0.0, 1.0); // lod0 黄
+  if (lod == 1u) { dot_col = vec4<f32>(0.2, 1.0, 0.8, 1.0); }
+  else if (lod == 2u) { dot_col = vec4<f32>(0.4, 0.6, 1.0, 1.0); }
+  else if (lod == 3u) { dot_col = vec4<f32>(1.0, 0.4, 0.9, 1.0); }
   // 世界 → 裁剪空间
   let clip = view_u.view_proj * vec4<f32>(pos.xyz, 1.0);
   if (clip.w <= 0.0) {

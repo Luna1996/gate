@@ -92,9 +92,9 @@ struct DdgiProbeVizLodSlider;
 #[derive(Component)]
 struct DdgiProbeVizLodValueLabel;
 
-/// Probe Viz 层级名（滑杆 stop 序：0=All, 1..=4=LOD0~3, 5=Base；
-/// Douglas #23 = base 烘焙网格 + 4 LOD，视频切换的 LOD 0~3 即 4 个下采样级）
-const DDGI_PROBE_VIZ_LODS: [&str; 6] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3", "Base"];
+/// Probe Viz 层级名（滑杆 stop 序：0=All 全部, 1..=4=LOD0~3；
+/// 新架构 = 4 级相机滚动 LOD 固定槽，无 base 世界级烘焙网格）
+const DDGI_PROBE_VIZ_LODS: [&str; 5] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3"];
 
 /// 调试模式名（按钮文本 + 日志用）
 const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
@@ -337,7 +337,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
               cell,
               SliderConfig {
                 min: 0.0,
-                max: 5.0,
+                max: 4.0,
                 value: 0.0,
                 step: Some(1.0),
               },

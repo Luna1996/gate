@@ -26,7 +26,7 @@ use bevy::{
 use gate_render::VIEW_SIZE;
 use gate_ui::{ThemeFont, UiCtx, UiTheme};
 
-use camera::{left_click_pick_recenter, orbit_camera_input, probe_click_inspect};
+use camera::{left_click_pick_recenter, orbit_camera_input};
 use debug_overlay::{DemoUiRoot, debug_overlay_toggle, fps_line_feed, spawn_debug_view};
 use diagnostics::gpu_frame_log;
 use scene::setup;
@@ -125,10 +125,6 @@ fn main() {
       Update,
       (
         orbit_camera_input,
-        // Shift+左键探针点查（必须在 left_click_pick_recenter 之前拦截左键）
-        probe_click_inspect
-          .after(orbit_camera_input)
-          .before(left_click_pick_recenter),
         left_click_pick_recenter.after(orbit_camera_input),
         demo_ui_setup,
         // 先推帧时长样本，gate-ui 的 plot_redraw_system 同帧再重绘折线图

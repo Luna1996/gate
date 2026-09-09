@@ -169,7 +169,8 @@ pub struct DdaViewUniform {
   pub debug_mode: Vec4,
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（GATE_NO_LOD=1 关）
   pub lod: Vec4,
-  /// 探针可视化参数：x = 总探针数(base+级联)，y = 方块边长(px)，z/w 保留
+  /// 探针可视化参数：x = 总槽数（DDGI_TOTAL_SLOTS=16384），y = 方块边长(px)，
+  /// z = 层级选择（0=全部，1..=4=LOD0..3），w 保留
   pub probe_viz_params: Vec4,
 }
 
@@ -240,7 +241,7 @@ impl DdaViewUniform {
         *BEAM_DISABLED as u32 as f32,
         *LUT_DISABLED as u32 as f32, // w = 1 → shader 旁路方向掩码剔除
       ),
-      // probe_viz_params 在 prepare_dda_bind_groups 中覆写（需 DdgiGpu.probe_count）
+      // probe_viz_params 在 prepare_dda_bind_groups 中覆写（DDGI_TOTAL_SLOTS 固定槽数）
       probe_viz_params: Vec4::ZERO,
     }
   }
@@ -2497,12 +2498,12 @@ fn prepare_dda_bind_groups(
   };
 
   let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
-  // probe 可视化参数：总探针数 = base(id_base 层对齐) + 4 级联×4096；方块边长 3px；
-  // z = 层级选择（0=All, 1..=4=LOD0~3 级联, 5=Base）、w = id_base（id<id_base → base 探针）
-  if let Some(g) = ddgi_gpu.as_ref() {
-    let total = g.id_base + 4 * 4096;
-    let sel = dbg.map_or(0.0, |d| d.probe_viz_lod).clamp(0.0, 5.0);
-    view.probe_viz_params = Vec4::new(total as f32, 3.0, sel, g.id_base as f32);
+  // probe 可视化参数：x = 总槽数（4 LOD × 4096 固定槽，新架构无 base 网格）；
+  // y = 方块边长 3px；z = 层级选择（0=全部，1..=4=LOD0..3）；w 不再使用
+  if let Some(_g) = ddgi_gpu.as_ref() {
+    let total = crate::ddgi::DDGI_TOTAL_SLOTS;
+    let sel = dbg.map_or(0.0, |d| d.probe_viz_lod).clamp(0.0, 4.0);
+    view.probe_viz_params = Vec4::new(total as f32, 3.0, sel, 0.0);
   }
   let mut u = UniformBuffer::from(view);
   u.write_buffer(&render_device, &queue);
@@ -2693,12 +2694,13 @@ pub(crate) fn dispatch_dda(
   }
 
   // ---- probe 可视化 pass：探针位置画黄色方块（toggle 开时执行）----
-  // 每探针 1 线程：活跃过滤（positions.w）+ 视锥剔除 + 遮挡射线（复用
-  // trace_scene，本 pass 已绑定全部 bind group）→ 仅屏幕内可见探针画方块。
+  // 每槽 1 线程：活跃过滤（meta age）+ 视锥剔除 + 遮挡射线（复用 trace_scene，
+  // 本 pass 已绑定全部 bind group）→ 仅屏幕内可见探针画方块。
   if dbg.map_or(false, |d| d.probe_viz) {
-    if let Some(gpu) = gpu.as_ref() {
+    if gpu.is_some() {
       if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
-        let probe_count = gpu.id_base + 4 * 4096;
+        // 新架构：固定 16384 槽（4 LOD × 4096），viz 逐槽读 meta/slot_pos 现算坐标
+        let probe_count = crate::ddgi::DDGI_TOTAL_SLOTS;
         let span = recorder.time_span(ctx.command_encoder(), "gate_probe_viz");
         {
           let mut pass = ctx
