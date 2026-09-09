@@ -1055,7 +1055,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // **除 π**：collect_radiance 存储 = π·L̄（物理辐照度 E），本引擎直光约定 =
     // albedo×E（π 折进 albedo）→ 间接光必须 albedo×E/π 才与直光同标度
     // （π 未除曾致全场曝白 π 倍、穹顶原色淹没）。
-    let gi_on = ddgi_u.reuse_max.w > 0.5;
+    let gi_on = ddgi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     if (gi_on) {
       gi = ddgi_sample(p_voxel + n * (0.5 + DDGI_NORMAL_BIAS), n) * ddgi_u.params.z / DDGI_PI;
@@ -1168,7 +1168,6 @@ const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
 const DDGI_EMIT_GAIN: f32 = 4.0;
 const DDGI_PI: f32 = 3.14159265;
-const CAN_SKIP_MAX: f32 = 0.5;
 // 更新链阈值（RTXGI ProbeBlendingCS.hlsl L508-550 逐字）
 const DDGI_HYSTERESIS: f32 = 0.85;
 const DDGI_IRRAD_GAMMA: f32 = 1.0;
@@ -1195,11 +1194,8 @@ const DDGI_BASE_AMBIENT: f32 = 0.2;
 struct DdgiUniform {
   grid_origin: vec4<f32>, // xyz = 网格原点（base-cell 全局坐标），w = cell 边长（fine）
   grid_dims: vec4<f32>,   // xyz = dims（本级 cell 单位），w = probe_count
-  params: vec4<f32>,      // x = frame, y = rays_per_probe, z = 保留, w = object bbox 数
-  reuse_min: vec4<f32>,   // xyz = reuse bounds min（cell rel，i32 存 f32）
-  reuse_max: vec4<f32>,   // xyz = reuse bounds max（不含端）；w = DDGI 运行时开关（1=开 0=关）
-  finer_min: vec4<f32>,   // xyz = 更细级域原点（base-cell），w = 更细级 cell 边长（<=0 = 无）
-  finer_size: vec4<f32>,  // xyz = 更细级域 dims（cell 单位）
+  params: vec4<f32>,      // x = frame, y = rays_per_probe, z = gain, w = object bbox 数
+  misc: vec4<f32>,        // x = DDGI 运行时开关（1=开 0=关）；yzw 保留
 };
 @group(4) @binding(0) var<uniform> ddgi_u: DdgiUniform;
 @group(4) @binding(1) var<storage, read> ddgi_positions: array<vec4<f32>>; // xyz = 世界 fine 坐标，w = 活跃位（viz 过滤）
@@ -1215,7 +1211,7 @@ struct DdgiUniform {
 @group(4) @binding(11) var<storage, read_write> ddgi_samples: array<vec4<f32>>; // [dir.xyz, dist]+[radiance.xyz, 0]
 @group(4) @binding(12) var<storage, read_write> ddgi_worklist: array<u32>; // 活跃探针 id（[slot]，slot = atomicAdd 序号）
 // M4-3 多级联采样（binding 0/2 是「本级」pass 数据；13/14 是全域采样数据）：
-// 13 = base + 4 级级联的域参数（每域 DdgiUniform 112B，总 560B）；
+// 13 = base + 4 级级联的域参数（每域 DdgiUniform 64B，总 320B）；
 // 14 = 全量 dense cell_index（base 区 ++ 级联区；级联 ci 上传时已平移为全局探针 id）
 struct DdgiDomains {
   base: DdgiUniform,
@@ -1322,14 +1318,6 @@ fn ddgi_meta_offset(p: u32) -> vec3<u32> {
 }
 fn ddgi_meta_age(p: u32) -> u32 {
   return (p >> DDGI_META_AGE_SHIFT) & 255u;
-}
-
-// ---- can_skip_update（CPU INFERENCE 实现镜像；签名 3 参对齐截图2 调用点）----
-fn ddgi_can_skip(age: u32, frame: u32, probe_id: u32) -> bool {
-  let rand = ddgi_pcg(frame ^ ddgi_pcg(probe_id));
-  let a = f32(age) / f32(DDGI_AGE_MAX);
-  let p = a * a * CAN_SKIP_MAX;
-  return f32(rand & 0xFFFFu) / 65536.0 < p;
 }
 
 // ---- 更新链（update_irradiance_texel 逐字：γ-tonemap → 大暗化 h-0.75 →
@@ -1557,31 +1545,6 @@ fn ddgi_cell_min(cell: vec3<u32>) -> vec3<i32> {
   return vec3<i32>((ddgi_u.grid_origin.xyz + vec3<f32>(cell) * step) * f32(DDGI_CELL));
 }
 
-// outside_lower_grid 镜像（半开区间，部分重叠保守归更细级）
-fn ddgi_outside_lower(lo: vec3<i32>, hi: vec3<i32>, fo: vec3<i32>, fd: vec3<i32>) -> bool {
-  let fo_hi = fo + fd;
-  return lo.x >= fo_hi.x || hi.x <= fo.x
-    || lo.y >= fo_hi.y || hi.y <= fo.y
-    || lo.z >= fo_hi.z || hi.z <= fo.z;
-}
-
-// probe_near_surface 三条件 OR 镜像（own / 6 邻接交集 / object bbox）
-fn ddgi_near_surface(own: u32, inter: u32, cell_center: vec3<f32>, half: f32) -> bool {
-  if ((own & DDGI_FLAG_NO_SURFACES) == 0u) { return true; }
-  if ((inter & DDGI_FLAG_NO_SURFACES) == 0u) { return true; }
-  let n = u32(ddgi_u.params.w);
-  for (var i = 0u; i < n; i = i + 1u) {
-    let mn = ddgi_objects[i * 2u].xyz;
-    let mx = ddgi_objects[i * 2u + 1u].xyz;
-    if (mx.x > cell_center.x - half && mn.x < cell_center.x + half
-      && mx.y > cell_center.y - half && mn.y < cell_center.y + half
-      && mx.z > cell_center.z - half && mn.z < cell_center.z + half) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // 6³ 共享 halo 数组：4³ cell/workgroup + 1 圈 halo（Douglas sort.glsl 同款）
 var<workgroup> ddgi_halo: array<u32, 216u>;
 fn ddgi_halo_idx(l: vec3<i32>) -> u32 {
@@ -1645,25 +1608,16 @@ fn ddgi_active(
 
   let dx = dims.x;
   let probe_id = ddgi_cell_index[gid.x + gid.y * dx + gid.z * dx * dims.y];
-  if (probe_id == DDGI_NO_PROBE) { return; } // 全满 solid cell 无探针，无需 active
-  // 级联归属（finer_min.w <= 0 = 无更细级）。**2 cell 光晕**：把 finer 域向内收缩
-  // 2 本级 cell 再判剔除——否则 finer 窗口边缘内 1 cell 的粗级探针「完全没有数据」
-  // （irr=0/age=0 永不更新），而 ddgi_sample 的过渡带恰在该带与本级混合 →
-  // mix(黑, 本级) = 跟随相机的纯黑环带，且 cast 自闭环在环带上采样会向外毒化扩散
-  //（位置锁定黑块/贴近整面变黑）。收缩后粗级在边缘 2 cell 环带保有有效数据。
-  if (ddgi_u.finer_min.w > 0.0) {
-    let step = ddgi_u.grid_origin.w / f32(DDGI_CELL);
-    let lo = vec3<i32>(ddgi_u.grid_origin.xyz + vec3<f32>(gid) * step);
-    let hi = lo + vec3<i32>(vec3<f32>(step));
-    let m = vec3<i32>(vec3<f32>(2.0 * step));
-    let fo = vec3<i32>(ddgi_u.finer_min.xyz) + m;
-    let fd = max(
-      vec3<i32>(ddgi_u.finer_size.xyz) * vec3<i32>(vec3<f32>(ddgi_u.finer_min.w / f32(DDGI_CELL)))
-        - vec3<i32>(vec3<f32>(4.0 * step)),
-      vec3<i32>(0),
-    );
-    if (!ddgi_outside_lower(lo, hi, fo, fd)) { return; }
-  }
+  if (probe_id == DDGI_NO_PROBE) { return; } // 全满 solid cell 无探针（唯一免写 meta 的分支）
+  // meta 读提前：**所有非 NO_PROBE 探针统一走末尾单一 textureStore**（硬约束：
+  // textureStore 在条件块外）。旧版 inactive/级联剔除探针提前 return 不写 →
+  // meta_next 残留上次活跃的 age>0 → viz 把已不活跃探针当 GPU 激活（pos.w=0）→
+  // 红点回归。inactive 统一 age=0，offset 保留（烘焙期静态属性，不该被清）。
+  let tc = ddgi_meta_coord(probe_id);
+  let coord = vec2<i32>(vec2<u32>(tc.y, tc.z));
+  let layer = i32(tc.x);
+  let prev = textureLoad(ddgi_meta_prev, coord, layer, 0).x;
+  let prev_offset = ddgi_meta_offset(prev);
   // near surface：本 cell 或 6 面邻接 cell 有体素（OR，逐字 CPU probe_is_active：
   // 只查面邻接 left/right/down/up/back/front，不查角邻接）。
   let c = vec3<i32>(lid);
@@ -1689,18 +1643,14 @@ fn ddgi_active(
       }
     }
   }
-  if (!near) { return; }
-  // age 生命周期（截图2 L249-258 逐字）：reusable 继承 → can_skip → age+1 进 worklist
-  let tc = ddgi_meta_coord(probe_id);
-  let coord = vec2<i32>(vec2<u32>(tc.y, tc.z));
-  let layer = i32(tc.x);
-  let prev = textureLoad(ddgi_meta_prev, coord, layer, 0).x;
-  let prev_offset = ddgi_meta_offset(prev);
-  let rel_i = vec3<i32>(gid);
-  let reusable = all(rel_i >= vec3<i32>(ddgi_u.reuse_min.xyz)) && all(rel_i < vec3<i32>(ddgi_u.reuse_max.xyz));
-  var age = select(0u, ddgi_meta_age(prev), reusable);
-  if (!ddgi_can_skip(age, u32(ddgi_u.params.x), probe_id)) {
-    age = min(age + 1u, DDGI_AGE_MAX);
+  // age 生命周期（Douglas：active 探针 age=min(prev+1, MAX) 进 worklist；inactive
+  // age=0。无 reusable（那是滚动级联时代的 age 继承残留）、无 can_skip 概率跳过——
+  // 所有近表面探针每帧全量进 worklist）。**末尾单一 textureStore（条件块外）**——
+  // 提前 return 不写会让 meta_next 残留旧 age>0，viz 把已不活跃探针当 GPU 激活 →
+  // 红点回归。
+  var age = 0u;
+  if (near) {
+    age = min(ddgi_meta_age(prev) + 1u, DDGI_AGE_MAX);
     let slot = atomicAdd(&ddgi_dispatch[0u], 1u);
     ddgi_worklist[slot] = probe_id;
   }

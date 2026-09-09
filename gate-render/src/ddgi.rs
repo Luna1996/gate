@@ -57,8 +57,6 @@ pub const PROBE_T_MAX: f32 = 8192.0;
 /// wn = clamp(N·d / bias, 0, 1)——探针在表面后侧（N·d<0）权重严格 0，穿墙不漏光
 /// （结构性修复见 ddgi_sample_dom per-pixel jitter，而非调 bias）
 pub const DDGI_NORMAL_BIAS: f32 = 0.2;
-/// Douglas Devlog #23：固定 LOD — 烘焙时一次性生成，不做 camera-following scroll
-pub const DDGI_FIXED_LODS: bool = true;
 /// Douglas Devlog #23：总射线数固定预算。性能不随屏上 probe 数波动（摊派到活跃探针）
 pub const DDGI_RAY_BUDGET: u32 = 65536;
 /// 每帧更新探针钳制上限（WGSL DDGI_PROBE_BUDGET 镜像；seal pass min(count, 此值)）
@@ -366,8 +364,7 @@ pub fn bake_probe_grid(vols: &Volumes) -> ProbeGrid {
           };
           pg.cell_index[li] = pg.positions.len() as u32;
           pg.positions.push(pos);
-          pg.active
-            .push(probe_is_active(grid, cell_min, DDGI_CELL));
+          pg.active.push(probe_is_active(grid, cell_min, DDGI_CELL));
         }
       }
     }
@@ -506,7 +503,7 @@ fn chunk_bbox(mut it: impl Iterator<Item = IVec3>) -> Option<(IVec3, IVec3)> {
 }
 
 // ============================================================================
-// 级联烘焙（M2-3：D9 每级 cell 尺寸 BFS 推广 + D4 outside_lower_grid 空间划分）
+// 级联烘焙（M2-3：D9 每级 cell 尺寸 BFS 推广；固定 LOD——Douglas #23 烘焙时一次生成）
 // ============================================================================
 
 /// 任意 cell 尺寸的三态分类。gate 树层级 {256,64,16,4,1} 不含 32/128 →
@@ -687,81 +684,10 @@ pub fn bake_cascade_grid(
   pg
 }
 
-/// 滚动增量烘焙：重叠 cell 直接搬运旧 slot id/探针位置（零下钻），仅滚入的
-/// 新列带现场 `bake_cascade_cell`——滚动帧 CPU 成本从全域 16³ 下钻降到一个/// 列带（~16×，消除滚动帧秒级卡顿）。旧重叠 cell 原本 NO_PROBE（Solid/无
-/// 空叶）且世界未变 → 维持 NO_PROBE（确定性一致；世界编辑走全量重烘）。
-pub fn bake_cascade_grid_shifted(
-  vols: &Volumes,
-  cell_size: i32,
-  new_origin: IVec3,
-  dims_cells: UVec3,
-  old: &ProbeGrid,
-  shift: IVec3,
-) -> ProbeGrid {
-  let grid = vols.main();
-  let total = (dims_cells.x * dims_cells.y * dims_cells.z) as usize;
-  let mut pg = ProbeGrid {
-    grid_origin: new_origin,
-    grid_dims: dims_cells,
-    cell_size,
-    cell_index: vec![NO_PROBE; total],
-    positions: vec![Vec3::ZERO; total],
-    active: vec![false; total],
-  };
-  let old_dims = old.grid_dims.as_ivec3();
-  for rz in 0..dims_cells.z {
-    for ry in 0..dims_cells.y {
-      for rx in 0..dims_cells.x {
-        let rel = UVec3::new(rx, ry, rz);
-        let li = pg.cell_linear(rel);
-        let old_rel = rel.as_ivec3() - shift;
-        if old_rel.cmpge(IVec3::ZERO).all() && old_rel.cmplt(old_dims).all() {
-          let old_li = old.cell_linear(old_rel.as_uvec3());
-          if old.cell_index[old_li] != NO_PROBE {
-            pg.cell_index[li] = li as u32;
-            pg.positions[li] = old.positions[old_li];
-            pg.active[li] = old.active[old_li];
-          }
-          continue;
-        }
-        let Some(pos) = bake_cascade_cell(grid, cell_size, new_origin, rel) else {
-          continue;
-        };
-        pg.cell_index[li] = li as u32;
-        pg.positions[li] = pos;
-        pg.active[li] = probe_is_active(grid, pg.cell_min_voxel(rel), cell_size);
-      }
-    }
-  }
-  pg
-}
-
-/// D4 outside_lower_grid：本 LOD cell 是否在更细网格覆盖外（true = 归本 LOD 管）。
-/// 全部区间为 base-cell（64³）全局坐标：本 cell [lo, hi) 与更细域 [fo, fo+fd) 无重叠 → outside。
-/// 级联滚动步进保证域边缘 cell 对齐（M4-3），部分重叠 cell 归更细级（保守划分）。
-/// **WGSL ddgi_active 调用点先把 finer 域向内收缩 2 本级 cell（光晕）再传入**：
-/// 否则 finer 窗口边缘内 1 cell 的本级探针零数据（age=0 永不更新），而采样端
-/// 过渡带恰在该带与本级混合 → mix(黑) = 跟随相机的纯黑环带 + cast 自闭环毒化扩散。
-/// 本谓词保持纯几何语义（单测覆盖）；光晕收缩只发生在 WGSL 调用点。
-#[inline]
-pub fn outside_lower_grid(lo: IVec3, hi: IVec3, finer_origin: IVec3, finer_dims: UVec3) -> bool {
-  let fo_hi = finer_origin + finer_dims.as_ivec3();
-  lo.x >= fo_hi.x
-    || hi.x <= finer_origin.x
-    || lo.y >= fo_hi.y
-    || hi.y <= finer_origin.y
-    || lo.z >= fo_hi.z
-    || hi.z <= finer_origin.z
-}
-
-// ============================================================================
-// M4-3 级联滚动（CPU 侧滚动数学；WGSL 侧 reuse 继承已在 ddgi_active）
-// ============================================================================
-
-/// 相机 fine 坐标 → 级联滚动原点（**base-cell 全局坐标**，cell_size 对齐）。
+/// 相机 fine 坐标 → 级联窗口原点（**base-cell 全局坐标**，cell_size 对齐）。
 /// 窗口以相机所在 cell 为中心对称展开（PROBES_PER_CASCADE_AXIS³）：
 /// origin_cell = (⌊cam/cell_size⌋ − half) × cell_size / DDGI_CELL。
-/// 相机移动不足一个 cell 时原点不动（cell 对齐步进 = 天然 reuse 分带）。
+/// （仅初建定位用——Douglas 固定 LOD 烘焙架构无滚动，窗口位置此后恒定。）
 #[inline]
 pub fn cascade_scroll_origin(cam_fine: Vec3, cell_size: i32) -> IVec3 {
   let cam_cell = (cam_fine / cell_size as f32).floor().as_ivec3();
@@ -769,30 +695,9 @@ pub fn cascade_scroll_origin(cam_fine: Vec3, cell_size: i32) -> IVec3 {
   (cam_cell - half) * cell_size / DDGI_CELL
 }
 
-/// 滚动 reuse bounds（**新网格 rel 坐标**，半开 [lo, hi) 逐轴）：
-/// shift = (new_origin − old_origin) / (cell_size/16)（级联 cell 单位）；
-/// 新 rel 的世界 cell 与旧网格重叠 ⟺ rel − shift ∈ [0, dims) ⟺ rel ∈ [shift, dims+shift)，
-/// 与 [0, dims) 交 = [max(shift,0), min(dims+shift, dims))。
-/// ddgi_active 对 reusable 探针继承 prev age（D10），窗外归零重新收敛。
-#[inline]
-pub fn scroll_reuse_bounds(
-  old_origin: IVec3,
-  new_origin: IVec3,
-  dims: UVec3,
-  cell_size: i32,
-) -> (IVec3, IVec3) {
-  let shift = (new_origin - old_origin) / (cell_size / DDGI_CELL);
-  let d = dims.as_ivec3();
-  let lo = shift.max(IVec3::ZERO);
-  let hi = (d + shift).min(d).max(lo);
-  (lo, hi)
-}
-
-/// M4-3 级联滚动管理器（CPU 侧）：4 级滚动级联的 origin/网格/meta/reuse 快照。
-/// 滚动时逐级：增量烘焙（`bake_cascade_grid_shifted`，重叠搬运/新列下钻）→
-/// meta 重映射（重叠 cell 搬运旧 age/offset，新 cell age=0）→ 更新 reuse bounds。
-/// GPU 接线（positions/cell_index/meta 上传 + irr/depth 分层 shifted copy）消费
-/// 本结构快照。级联 id = slot（线性 cell 下标），texel 布局 = cell 网格。
+/// 4 级固定级联管理器（CPU 侧）：初建时以相机位置烘焙，此后网格恒定
+/// （Douglas Devlog #23：LOD 烘焙时一次性生成，不做 camera-following scroll）。
+/// 级联 id = slot（线性 cell 下标），texel 布局 = cell 网格。
 pub struct CascadeManager {
   /// 级联 cell 尺寸（DDGI_CASCADE_CELL_SIZES[1..5] = 128/256/512/1024）
   pub cell_sizes: [i32; 4],
@@ -802,22 +707,16 @@ pub struct CascadeManager {
   pub grids: [ProbeGrid; 4],
   /// 每级当前 meta（4096 word，packed offset+age；层布局 = build_meta_texture_data）
   pub metas: [Vec<u32>; 4],
-  /// 每级当前 reuse bounds（新网格 rel 坐标，半开）
-  pub reuse: [(IVec3, IVec3); 4],
-  /// 本帧滚动位移（级联 cell 单位，extract 侧 scroll 写入、dispatch 侧 shifted
-  /// copy 消费后清空）；None = 本级未动。prepare 读它触发 positions/ci/meta 上传。
-  pub pending_shift: [Option<IVec3>; 4],
 }
 
 impl CascadeManager {
-  /// 初建：以相机位置烘焙 4 级（age 全 0，reuse 全域）
+  /// 初建：以相机位置烘焙 4 级（age 全 0）
   pub fn new(vols: &Volumes, cam_fine: Vec3) -> Self {
     let cell_sizes: [i32; 4] = DDGI_CASCADE_CELL_SIZES[1..5].try_into().unwrap();
     let dims = UVec3::splat(PROBES_PER_CASCADE_AXIS);
     let mut origins = [IVec3::ZERO; 4];
     let mut grids: [ProbeGrid; 4] = Default::default();
     let mut metas = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let reuse = [(IVec3::ZERO, dims.as_ivec3()); 4];
     for c in 0..4 {
       origins[c] = cascade_scroll_origin(cam_fine, cell_sizes[c]);
       grids[c] = bake_cascade_grid(vols, cell_sizes[c], origins[c], dims);
@@ -828,95 +727,8 @@ impl CascadeManager {
       origins,
       grids,
       metas,
-      reuse,
-      pending_shift: [None; 4],
     }
   }
-
-  /// 滚动：相机驱动的逐级原点推进。返回是否有任何一级移动（GPU 上传/搬运触发用）。
-  /// 每级：原点未动 → 仅更新 reuse=全域；移动 → 重烘 + meta 重映射（重叠 cell
-  /// 搬运旧 age/offset，同世界 cell 烘焙确定性保证 offset 一致）+ 新 reuse bounds。
-  /// **每帧至多滚一级（最细优先）**：滚动帧的 CPU 重烘 + GPU 上传/搬运集中在
-  /// 一级，避免同帧多级齐滚造成卡顿；粗级顺延一帧（原点不动 → 下帧重算）。
-  pub fn scroll(&mut self, vols: &Volumes, cam_fine: Vec3) -> bool {
-    let dims = UVec3::splat(PROBES_PER_CASCADE_AXIS);
-    let mut moved = false;
-    for c in 0..4 {
-      let new_origin = cascade_scroll_origin(cam_fine, self.cell_sizes[c]);
-      if new_origin == self.origins[c] || moved {
-        self.reuse[c] = (IVec3::ZERO, dims.as_ivec3());
-        self.pending_shift[c] = None;
-        continue;
-      }
-      let bounds = scroll_reuse_bounds(self.origins[c], new_origin, dims, self.cell_sizes[c]);
-      let shift = (new_origin - self.origins[c]) / (self.cell_sizes[c] / DDGI_CELL);
-      // 增量烘焙：重叠 cell 搬运（零下钻），仅滚入列带现场烘焙（slot id 布局下
-      // GPU shifted copy 的矩形平移假设成立）
-      let new_grid = bake_cascade_grid_shifted(
-        vols,
-        self.cell_sizes[c],
-        new_origin,
-        dims,
-        &self.grids[c],
-        shift,
-      );
-      // meta 重映射：新 bake 基线（age=0）→ 重叠 cell 从旧 meta 搬运 (offset, age)
-      let mut new_meta = build_meta_texture_data(&new_grid);
-      for rz in 0..dims.z {
-        for ry in 0..dims.y {
-          for rx in 0..dims.x {
-            let rel = UVec3::new(rx, ry, rz);
-            let new_id = new_grid.cell_index[new_grid.cell_linear(rel)];
-            if new_id == NO_PROBE {
-              continue;
-            }
-            let old_rel = rel.as_ivec3() - shift;
-            if old_rel.cmpge(IVec3::ZERO).all() && old_rel.cmplt(dims.as_ivec3()).all() {
-              let old_id = self.grids[c].cell_index[self.grids[c].cell_linear(old_rel.as_uvec3())];
-              if old_id != NO_PROBE {
-                // 同世界 cell → 烘焙确定性 → offset 相同，仅搬运 age
-                let (layer, tx, ty) = meta_texel_coord(old_id);
-                let (_, age) = unpack_probe_meta(self.metas[c][meta_texel_linear(layer, tx, ty)]);
-                let (n_layer, n_tx, n_ty) = meta_texel_coord(new_id);
-                let (off, _) = unpack_probe_meta(new_meta[meta_texel_linear(n_layer, n_tx, n_ty)]);
-                new_meta[meta_texel_linear(n_layer, n_tx, n_ty)] = pack_probe_meta(off, age);
-              }
-            }
-          }
-        }
-      }
-      self.origins[c] = new_origin;
-      self.grids[c] = new_grid;
-      self.metas[c] = new_meta;
-      self.reuse[c] = bounds;
-      self.pending_shift[c] = Some(shift);
-      moved = true;
-      // #region debug-point D:scroll-mark（假设 D：滚动帧扰动与闪烁时刻相关性）
-      bevy::log::info!(
-        "[DEBUG][D] cascade c{} scroll shift=({},{},{}) cell_size={}（本帧滚动级）",
-        c,
-        shift.x,
-        shift.y,
-        shift.z,
-        self.cell_sizes[c]
-      );
-      // #endregion
-    }
-    moved
-  }
-}
-
-/// 单轴滚动位移 → 重叠区 (新格 lo, 宽)（本级 cell 单位；None = 无重叠整轴复位）。
-/// shift = 新格 − 旧格：新 rel ∈ [max(0,s), min(dims, dims+s)) 与旧 rel − s 对齐；
-/// `dims` = PROBES_PER_CASCADE_AXIS（16）。irr/depth shifted copy 与新列复位共用。
-#[inline]
-pub fn axis_shift_range(s: i32, dims: i32) -> Option<(i32, i32)> {
-  if s.abs() >= dims {
-    return None; // 一帧跨整窗：无重叠
-  }
-  let lo = s.max(0);
-  let hi = (dims + s).min(dims);
-  Some((lo, hi - lo))
 }
 
 /// dense cell_index → 全局探针 id 视图（NO_PROBE 保留，其余 + `id_base` 偏移）。
@@ -933,28 +745,6 @@ pub fn cascade_ci_global(cell_index: &[u32], id_base: u32) -> Vec<u32> {
 // ============================================================================
 // 级联域（每帧滚动 dispatch 的域描述；光照判定逻辑在 WGSL ddgi_active）
 // ============================================================================
-
-/// 级联域（每帧滚动 dispatch 用；origin/dims 为 base-cell 全局坐标，cell_size 为 fine 体素）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CascadeDomain {
-  /// 域原点（base-cell 全局坐标；级联级须 cell_size 对齐——M4-3 滚动步进）
-  pub origin: IVec3,
-  /// 域 dims（本级 cell 单位；滚动级 = PROBES_PER_CASCADE_AXIS³=16³，base = AABB cell 数）
-  pub dims: UVec3,
-  /// cell 尺寸（fine 体素）：base 64 / LOD1-4=128/256/512/1024
-  pub cell_size: i32,
-}
-
-impl CascadeDomain {
-  /// 域 hi（base-cell 半开）= origin + dims × (cell_size / DDGI_CELL)
-  #[inline]
-  pub fn hi_base_cell(&self) -> IVec3 {
-    self.origin + self.dims.as_ivec3() * (self.cell_size / DDGI_CELL)
-  }
-}
-
-/// 全 reuse bounds（base 静态级默认值：覆盖全部 cell，全部 reusable）
-pub const REUSE_ALL: (IVec3, IVec3) = (IVec3::ZERO, IVec3::splat(i32::MAX));
 
 /// 探针位置打包：xyz = 世界 fine 坐标，w = 活跃位（1.0 活跃 / 0 不活跃；
 /// Douglas #23 近表面语义，probe viz 只画 w≠0 的探针；采样/cast 不读 w）
@@ -989,36 +779,27 @@ use bevy::render::{
 };
 use std::borrow::Cow;
 
-/// BG4 v2 uniform（dda.wgsl `DdgiUniform` 逐字段镜像，112B）：
-/// grid_origin.w = cell 边长、grid_dims.w = 探针数、params = (frame, rays 观测位,
-/// 保留, object bbox 数)、finer_min.w <= 0 = 无更细级（rays_per_probe 由 GPU 侧
+/// BG4 v2 uniform（dda.wgsl `DdgiUniform` 逐字段镜像，64B）：
+/// grid_origin.w = cell 边长、grid_dims.w = 探针数、params = (frame, 调试模式,
+/// gain, object bbox 数)、misc.x = DDGI 运行时开关（rays_per_probe 由 GPU 侧
 /// 从 dispatch count 自派生，无需 CPU 回读）。
+/// （旧 reuse/finer 4 字段是滚动级联时代的 age 继承/域归属残留——Douglas 固定
+/// LOD 烘焙架构无 scroll，2026-09-09 随滚动路线一并拆除。）
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, bevy::ecs::resource::Resource, ShaderType)]
 pub struct DdgiUniform {
   pub grid_origin: Vec4,
   pub grid_dims: Vec4,
   pub params: Vec4,
-  pub reuse_min: Vec4,
-  pub reuse_max: Vec4,
-  pub finer_min: Vec4,
-  pub finer_size: Vec4,
+  pub misc: Vec4,
 }
 
 impl DdgiUniform {
-  /// ProbeGrid + 帧状态 + 调试参数 → uniform（M4-3 滚动后 reuse/finer 由 CPU 每帧覆写）
+  /// ProbeGrid + 帧状态 + 调试参数 → uniform
   ///
   /// mode/gain 来自渲染世界 DdgiDebugSettings（主世界 DebugView UI 驱动，extract
   /// 每帧拷贝），不再读 GATE_DDGI_DEBUG / GATE_DDGI_GAIN 环境变量。
-  pub fn new(
-    pg: &ProbeGrid,
-    frame: u32,
-    reuse_bounds: (IVec3, IVec3),
-    finer: Option<CascadeDomain>,
-    object_count: u32,
-    mode: f32,
-    gain: f32,
-  ) -> Self {
+  pub fn new(pg: &ProbeGrid, frame: u32, object_count: u32, mode: f32, gain: f32) -> Self {
     Self {
       grid_origin: Vec4::new(
         pg.grid_origin.x as f32,
@@ -1033,35 +814,13 @@ impl DdgiUniform {
         pg.positions.len() as f32,
       ),
       params: Vec4::new(frame as f32, mode, gain, object_count as f32),
-      reuse_min: Vec4::new(
-        reuse_bounds.0.x as f32,
-        reuse_bounds.0.y as f32,
-        reuse_bounds.0.z as f32,
-        0.0,
-      ),
-      reuse_max: Vec4::new(
-        reuse_bounds.1.x as f32,
-        reuse_bounds.1.y as f32,
-        reuse_bounds.1.z as f32,
-        0.0,
-      ),
-      finer_min: finer.map_or(Vec4::ZERO, |f| {
-        Vec4::new(
-          f.origin.x as f32,
-          f.origin.y as f32,
-          f.origin.z as f32,
-          f.cell_size as f32,
-        )
-      }),
-      finer_size: finer.map_or(Vec4::ZERO, |f| {
-        Vec4::new(f.dims.x as f32, f.dims.y as f32, f.dims.z as f32, 0.0)
-      }),
+      misc: Vec4::ZERO,
     }
   }
 }
 
-/// BG4 v3 全域采样 uniform（dda.wgsl `DdgiDomains` 逐字段镜像，560B = base +
-/// 4 级级联各 112B；binding 13，ddgi_sample 的 base 优先→级联 fallback 数据源）。
+/// BG4 v3 全域采样 uniform（dda.wgsl `DdgiDomains` 逐字段镜像，320B = base +
+/// 4 级级联各 64B；binding 13，ddgi_sample 的 base 优先→级联 fallback 数据源）。
 /// binding 0（本级 pass uniform）与之并存：base BG4 绑 base 域、级联 BG4_c 绑本级域。
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, bevy::ecs::resource::Resource, ShaderType)]
@@ -1297,7 +1056,10 @@ impl bevy::app::Plugin for DdgiPlugin {
       .init_resource::<DdgiDebugSettings>()
       .add_systems(RenderStartup, init_ddgi_gpu)
       // DDGI pipeline 排队必须在 DDA pipeline 之后（需要 dda.bg0-3 layouts）
-      .add_systems(RenderStartup, queue_ddgi_pipelines.after(crate::brickmap::dda::init_dda_pipelines))
+      .add_systems(
+        RenderStartup,
+        queue_ddgi_pipelines.after(crate::brickmap::dda::init_dda_pipelines),
+      )
       .add_systems(bevy::render::ExtractSchedule, extract_ddgi_bake)
       .add_systems(
         Render,
@@ -1471,8 +1233,11 @@ fn queue_ddgi_pipelines(
   asset_server: Res<AssetServer>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
-  bevy::log::info!("QUEUE_DDGI_PIPES called: has_dda={} has_pipes={}",
-    dda.is_some(), gpu.pipelines.is_some());
+  bevy::log::info!(
+    "QUEUE_DDGI_PIPES called: has_dda={} has_pipes={}",
+    dda.is_some(),
+    gpu.pipelines.is_some()
+  );
   if gpu.pipelines.is_some() {
     return;
   }
@@ -1526,18 +1291,19 @@ fn dispatch_ddgi(
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
 ) {
   // 运行时关：跳过整条 compute 链（clear/active/seal/cast/update + 级联），省 GPU。
-  // trace shader 侧由 uniform 开关位同步返回 gi=0。仍排空 pending_shift 防位移堆积
-  // （关闭期间 extract 已冻结 scroll，此处仅兜底清掉切换当帧可能残留的位移）。
+  // trace shader 侧由 uniform 开关位同步返回 gi=0。
   if !enabled.0 {
-    if let Some(cm) = gpu.manager.as_mut() {
-      let _ = std::mem::take(&mut cm.pending_shift);
-    }
     return;
   }
   let td = std::time::Instant::now();
   if gpu.frame <= 5 {
-    bevy::log::info!("DISP_DDGI entry: frame={} probe_count={} has_bg4={} has_pipes={}",
-      gpu.frame, gpu.probe_count, bg4.is_some(), gpu.pipelines.is_some());
+    bevy::log::info!(
+      "DISP_DDGI entry: frame={} probe_count={} has_bg4={} has_pipes={}",
+      gpu.frame,
+      gpu.probe_count,
+      bg4.is_some(),
+      gpu.pipelines.is_some()
+    );
   }
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
     bg0.as_ref(),
@@ -1561,32 +1327,25 @@ fn dispatch_ddgi(
     pipeline_cache.get_compute_pipeline(pipes.cast),
     pipeline_cache.get_compute_pipeline(pipes.update),
   ) else {
-    bevy::log::info!("DISP_DDGI MISS_PIPES: c={:?} a={:?} s={:?} ca={:?} u={:?}",
+    bevy::log::info!(
+      "DISP_DDGI MISS_PIPES: c={:?} a={:?} s={:?} ca={:?} u={:?}",
       pipeline_cache.get_compute_pipeline(pipes.clear).is_some(),
       pipeline_cache.get_compute_pipeline(pipes.active).is_some(),
       pipeline_cache.get_compute_pipeline(pipes.seal).is_some(),
       pipeline_cache.get_compute_pipeline(pipes.cast).is_some(),
-      pipeline_cache.get_compute_pipeline(pipes.update).is_some());
+      pipeline_cache.get_compute_pipeline(pipes.update).is_some()
+    );
     return;
   };
 
-  // M4-3：捕获并消费本帧级联滚动位移（extract 侧 scroll 写入；prepare 已完成
-  // positions/ci/meta 上传与新列复位）。None = 本级未动（shift=0 → 整层 copy）。
-  let pending_shift: [Option<IVec3>; 4] =
-    gpu.manager.as_mut().map_or([None, None, None, None], |m| {
-      std::mem::take(&mut m.pending_shift)
-    });
-
-  // ---- copy：base 区 prev→next 三对整体重填 + 级联区 shifted copy ----
-  // 级联 irr/depth 不走整域 copy：滚动帧重叠矩形按位移搬运（保收敛，写 next），
-  // 新列由 prepare 复位；无滚动帧 shift=0 退化为逐层整 copy（语义同 base 区）。
+  // ---- copy：base 区 prev→next 三对整体重填 + 级联区逐层整 copy ----
+  // 固定 LOD 无滚动（Douglas #23）：级联 irr/depth 同 base 区整域 copy（旧
+  // shifted copy 的重叠矩形搬运是滚动级联时代产物，随 scroll 一并拆除）。
   // meta 体量小（16² × 4B/层），全层 copy（base + 级联 64 层）。
   {
     let encoder = ctx.command_encoder();
-    for (c, shift_opt) in pending_shift.iter().enumerate() {
-      let shift = shift_opt.unwrap_or(IVec3::ZERO);
+    for c in 0..4 {
       let layer0 = gpu.base_layers + c as u32 * 16;
-      let dims = PROBES_PER_CASCADE_AXIS as i32;
       let pairs = [
         (
           &gpu.irr_prev,
@@ -1601,108 +1360,35 @@ fn dispatch_ddgi(
           DEPTH_LAYER_TEXELS,
         ),
       ];
-      if shift == IVec3::ZERO {
-        // 无滚动：整域单次 16 层 copy（语义同 base 区 prev→next）
-        for (src, dst, _, size) in pairs {
-          encoder.copy_texture_to_texture(
-            TexelCopyTextureInfo {
-              texture: src,
-              mip_level: 0,
-              origin: Origin3d {
-                x: 0,
-                y: 0,
-                z: layer0,
-              },
-              aspect: TextureAspect::All,
-            },
-            TexelCopyTextureInfo {
-              texture: dst,
-              mip_level: 0,
-              origin: Origin3d {
-                x: 0,
-                y: 0,
-                z: layer0,
-              },
-              aspect: TextureAspect::All,
-            },
-            Extent3d {
-              width: size,
-              height: size,
-              depth_or_array_layers: PROBES_PER_CASCADE_AXIS,
-            },
-          );
-        }
-        continue;
-      }
-      // xy 重叠矩形（texel；irr 每探针 cell 8、depth 16）；轴无重叠 → 本纹理跳过。
-      // **双向拷贝**：prev→next 供本帧管线与 swap 后采样；next→prev 镜像回写
-      // 供同帧 update 的 EMA 基准读到搬运后的新格数据（否则 EMA 混入旧格错位
-      // 探针的纹理 → 滚动帧光斑污染）。
-      for (tex_prev, tex_next, t, _) in pairs {
-        let (Some((lx, wx)), Some((ly, wy))) = (
-          axis_shift_range(shift.x, dims),
-          axis_shift_range(shift.y, dims),
-        ) else {
-          continue;
-        };
-        for r in 0..dims {
-          let r_old = r - shift.z;
-          if !(0..dims).contains(&r_old) {
-            continue;
-          }
-          let src = TexelCopyTextureInfo {
-            texture: tex_prev,
+      // 整域单次 16 层 copy（语义同 base 区 prev→next）
+      for (src, dst, _, size) in pairs {
+        encoder.copy_texture_to_texture(
+          TexelCopyTextureInfo {
+            texture: src,
             mip_level: 0,
             origin: Origin3d {
-              x: ((lx - shift.x) * t) as u32,
-              y: ((ly - shift.y) * t) as u32,
-              z: layer0 + (r_old as u32),
+              x: 0,
+              y: 0,
+              z: layer0,
             },
             aspect: TextureAspect::All,
-          };
-          let dst = TexelCopyTextureInfo {
-            texture: tex_next,
+          },
+          TexelCopyTextureInfo {
+            texture: dst,
             mip_level: 0,
             origin: Origin3d {
-              x: (lx * t) as u32,
-              y: (ly * t) as u32,
-              z: layer0 + (r as u32),
+              x: 0,
+              y: 0,
+              z: layer0,
             },
             aspect: TextureAspect::All,
-          };
-          let extent = Extent3d {
-            width: (wx * t) as u32,
-            height: (wy * t) as u32,
-            depth_or_array_layers: 1,
-          };
-          encoder.copy_texture_to_texture(src, dst, extent);
-          // 镜像（src/dst 互换）：两份纹理同持新格数据
-          let TexelCopyTextureInfo {
-            texture: st,
-            origin: so,
-            ..
-          } = src;
-          let TexelCopyTextureInfo {
-            texture: dt,
-            origin: do_,
-            ..
-          } = dst;
-          encoder.copy_texture_to_texture(
-            TexelCopyTextureInfo {
-              texture: dt,
-              mip_level: 0,
-              origin: do_,
-              aspect: TextureAspect::All,
-            },
-            TexelCopyTextureInfo {
-              texture: st,
-              mip_level: 0,
-              origin: so,
-              aspect: TextureAspect::All,
-            },
-            extent,
-          );
-        }
+          },
+          Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: PROBES_PER_CASCADE_AXIS,
+          },
+        );
       }
     }
     for (src, dst, size, layers) in [
@@ -2042,7 +1728,11 @@ fn dispatch_ddgi(
             } else {
               blk += 1;
               if blk <= 8 {
-                blk_ids.push_str(&format!(" {}@{}", layer as u32 * PROBES_PER_LAYER + p as u32, age));
+                blk_ids.push_str(&format!(
+                  " {}@{}",
+                  layer as u32 * PROBES_PER_LAYER + p as u32,
+                  age
+                ));
               }
             }
           }
@@ -2052,15 +1742,7 @@ fn dispatch_ddgi(
         gpu.readback_state = 0;
         let line = format!(
           "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}]{} irr:{summary} depth650_lt8k:{} census: a0={a0} blk={blk} ok={ok} blk_ids:[{blk_ids}]",
-          gpu.frame,
-          count,
-          indirect0,
-          wl[0],
-          wl[1],
-          wl[2],
-          wl[3],
-          casc,
-          dep_lt,
+          gpu.frame, count, indirect0, wl[0], wl[1], wl[2], wl[3], casc, dep_lt,
         );
         bevy::log::info!("{}", line);
       }
@@ -2090,7 +1772,11 @@ fn dispatch_ddgi(
               TexelCopyTextureInfo {
                 texture: &gpu.irr_next,
                 mip_level: 0,
-                origin: Origin3d { x: 0, y: 0, z: k * step },
+                origin: Origin3d {
+                  x: 0,
+                  y: 0,
+                  z: k * step,
+                },
                 aspect: TextureAspect::All,
               },
               TexelCopyBufferInfo {
@@ -2137,7 +1823,11 @@ fn dispatch_ddgi(
               TexelCopyTextureInfo {
                 texture: &gpu.meta_next,
                 mip_level: 0,
-                origin: Origin3d { x: 0, y: 0, z: k * step },
+                origin: Origin3d {
+                  x: 0,
+                  y: 0,
+                  z: k * step,
+                },
                 aspect: TextureAspect::All,
               },
               TexelCopyBufferInfo {
@@ -2200,22 +1890,9 @@ fn extract_ddgi_bake(
     .map(|v| v.cam_pos_fine.truncate())
     .unwrap_or(Vec3::splat(32.0));
   let generation = scene.volumes.main().edit_generation();
-  // GPU 已是该代数（已重烘过）→ 只需驱动级联滚动
+  // GPU 已是该代数（已重烘过）→ 无事可做（Douglas #23：LOD 烘焙时一次性生成，
+  // 不做 camera-following scroll——滚动级联路线已整体拆除）
   if gpu.baked_generation == generation {
-    // Douglas Devlog #23：LOD 烘焙时一次性生成，不做 camera-following scroll
-    if !DDGI_FIXED_LODS {
-      // 关闭时冻结滚动：不产生 pending_shift（dispatch 早退也不消费），避免位移堆积
-      if on {
-        if let Some(cm) = gpu.manager.as_mut() {
-          let ts = std::time::Instant::now();
-          let moved = cm.scroll(&scene.volumes, cam);
-          let us = ts.elapsed().as_micros();
-          if moved && us > 500 {
-            bevy::log::info!("DDGI scroll: {us}us (moved)");
-          }
-        }
-      }
-    }
     return;
   }
   // 同代数烘焙已在排队（prepare 尚未消费）→ 不重复烘焙
@@ -2287,118 +1964,6 @@ fn meta_padded_bytes(flat_words: &[u32]) -> Vec<u8> {
     }
   }
   out
-}
-
-/// 滚动复位矩形集（texel 单位 [x, y, w, h]，层内）：新窗 − 重叠窗（x 全高条 + y
-/// 全高条，角部重复写同值无害）；任一轴无重叠 → 单矩形 = 整层。
-/// `t` = 每探针 cell 的 texel 数（irr 8 / depth 16），`lt` = 层边长（128 / 256）。
-fn scroll_reset_rects(shift: IVec3, t: i32, lt: i32) -> Vec<[i32; 4]> {
-  let dims = PROBES_PER_CASCADE_AXIS as i32;
-  let Some((lx, wx)) = axis_shift_range(shift.x, dims) else {
-    return vec![[0, 0, lt, lt]];
-  };
-  let Some((ly, wy)) = axis_shift_range(shift.y, dims) else {
-    return vec![[0, 0, lt, lt]];
-  };
-  let mut r = Vec::with_capacity(4);
-  let (x0, x1, y0, y1) = (lx * t, (lx + wx) * t, ly * t, (ly + wy) * t);
-  if x0 > 0 {
-    r.push([0, 0, x0, lt]);
-  }
-  if x1 < lt {
-    r.push([x1, 0, lt - x1, lt]);
-  }
-  if y0 > 0 {
-    r.push([0, 0, lt, y0]);
-  }
-  if y1 < lt {
-    r.push([0, y1, lt, lt - y1]);
-  }
-  r
-}
-
-/// 滚动帧级联 irr/depth 新列复位（queue 直写 prev/next 两份；与 dispatch 侧
-/// shifted copy 的重叠区不相交，顺序无关——级联区不走整域 copy，故两份都要补）。
-/// z 轴出层 → 整层复位。irr 填 0（无间接光）、depth 填 tmax（远距哨兵；初值 0
-/// 会被漏光剔除读成「探针贴墙」误伤全部贡献）。
-fn cascade_scroll_reset(
-  queue: &RenderQueue,
-  layer0: u32,
-  shift: IVec3,
-  irr: (&Texture, &Texture),
-  depth: (&Texture, &Texture),
-) {
-  let z_dims = PROBES_PER_CASCADE_AXIS as i32;
-  let irr_rects = scroll_reset_rects(
-    shift,
-    IRRADIANCE_TEXELS as i32,
-    IRRADIANCE_LAYER_TEXELS as i32,
-  );
-  let dep_rects = scroll_reset_rects(shift, DEPTH_TEXELS as i32, DEPTH_LAYER_TEXELS as i32);
-  let irr_full = vec![[
-    0,
-    0,
-    IRRADIANCE_LAYER_TEXELS as i32,
-    IRRADIANCE_LAYER_TEXELS as i32,
-  ]];
-  let dep_full = vec![[0, 0, DEPTH_LAYER_TEXELS as i32, DEPTH_LAYER_TEXELS as i32]];
-  for r in 0..z_dims {
-    let full = !(0..z_dims).contains(&(r - shift.z));
-    for (tex_pair, rects, full_rects, words, pattern) in [
-      (irr, &irr_rects, &irr_full, 2usize, [0u8; 4]),
-      (
-        depth,
-        &dep_rects,
-        &dep_full,
-        1usize,
-        PROBE_T_MAX.to_le_bytes(),
-      ),
-    ] {
-      let list: &[[i32; 4]] = if full { full_rects } else { rects };
-      for &[x, y, w, h] in list {
-        // 行距 256B 对齐（COPY_BYTES_PER_ROW_ALIGNMENT）：w=8/16 列带的裸行宽
-        // 64B 不达标 → 每行补 pad 到 256B 边界
-        let row_bytes = (w as usize) * 4 * words;
-        let bpr = ((row_bytes + 255) / 256) * 256;
-        let row_texels = (w as usize) * words;
-        let pad_words = bpr / 4 - row_texels;
-        let mut data = Vec::with_capacity((row_texels + pad_words) * (h as usize) * 4);
-        for _ in 0..h {
-          for _ in 0..row_texels {
-            data.extend_from_slice(&pattern);
-          }
-          for _ in 0..pad_words {
-            data.extend_from_slice(&[0u8; 4]);
-          }
-        }
-        for tex in [tex_pair.0, tex_pair.1] {
-          queue.write_texture(
-            TexelCopyTextureInfo {
-              texture: tex,
-              mip_level: 0,
-              origin: Origin3d {
-                x: x as u32,
-                y: y as u32,
-                z: layer0 + r as u32,
-              },
-              aspect: TextureAspect::All,
-            },
-            &data,
-            TexelCopyBufferLayout {
-              offset: 0,
-              bytes_per_row: Some(bpr as u32),
-              rows_per_image: Some(h as u32),
-            },
-            Extent3d {
-              width: w as u32,
-              height: h as u32,
-              depth_or_array_layers: 1,
-            },
-          );
-        }
-      }
-    }
-  }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2627,7 +2192,7 @@ fn prepare_ddgi(
     gpu
       .uniform
       .get_mut()
-      .clone_from(&DdgiUniform::new(pg, 0, REUSE_ALL, None, 0, dbg.mode, dbg.gain));
+      .clone_from(&DdgiUniform::new(pg, 0, 0, dbg.mode, dbg.gain));
 
     // ---- M4-3 级联资源（4 级 × 4096 探针；纹理层 [base_layers + c×16, +16)）----
     // 级联探针 id = id_base + c×4096 + internal_id（id_base = base_layers×256，层
@@ -2774,58 +2339,27 @@ fn prepare_ddgi(
   // gain→params.z。base uniform 在烘焙帧一次性设置，此处每帧覆写保证运行时热切换生效。
   gpu.uniform.get_mut().params.y = dbg.mode;
   gpu.uniform.get_mut().params.z = dbg.gain;
-  // 运行时开关位：reuse_max.w 是空闲通道（WGSL 只读 reuse_max.xyz）；trace shader
-  // 据此跳过探针采样（gi=0）。1=开 0=关。
-  gpu.uniform.get_mut().reuse_max.w = if enabled.0 { 1.0 } else { 0.0 };
+  // 运行时开关位：misc.x（WGSL 读 misc.x）；trace shader 据此跳过探针采样（gi=0）。
+  // 1=开 0=关。
+  gpu.uniform.get_mut().misc.x = if enabled.0 { 1.0 } else { 0.0 };
 
-  // M4-3 级联帧数据快照（ResMut 全域借用：manager 的共享借用不得跨 uniform/
-  // cascades 的可变访问 → 一次性快照后立即释放；滚动帧才携带上传负载）
+  // M4-3 级联帧数据快照（固定级联：网格恒定，每帧仅刷新 uniform 域参数）
   struct CascFrame {
     dom: DdgiUniform,
-    shift: Option<IVec3>,
     probe_count: u32,
-    pos_packed: Option<Vec<Vec4>>,
-    ci_words: Option<Vec<u32>>,
-    meta_words: Option<Vec<u32>>,
   }
   let casc_frames: Option<[CascFrame; 4]> = gpu.manager.as_ref().map(|cm| {
-    let id_base = gpu.id_base;
     let frame = gpu.frame;
-    std::array::from_fn(|c| {
-      // finer = 上一级（更细的）域，None = 本级最细
-      // casc0 是最细级（跟随相机 32 voxels）→ finer=None
-      // casc1/2/3 → finer = cm.grids[c-1]（上一级更细的）
-      let finer = match c {
-        0 => None,
-        _ => Some(CascadeDomain {
-          origin: cm.grids[c - 1].grid_origin,
-          dims: cm.grids[c - 1].grid_dims,
-          cell_size: cm.grids[c - 1].cell_size,
-        }),
-      };
-      let shift = cm.pending_shift[c];
-      CascFrame {
-        dom: DdgiUniform::new(&cm.grids[c], frame, cm.reuse[c], finer, 0, dbg.mode, dbg.gain),
-        shift,
-        probe_count: cm.grids[c].positions.len() as u32,
-        pos_packed: shift.map(|_| pack_probe_positions(&cm.grids[c])),
-        ci_words: shift
-          .map(|_| cascade_ci_global(&cm.grids[c].cell_index, id_base + (c as u32) * 4096)),
-        meta_words: shift.map(|_| cm.metas[c].clone()),
-      }
+    std::array::from_fn(|c| CascFrame {
+      dom: DdgiUniform::new(&cm.grids[c], frame, 0, dbg.mode, dbg.gain),
+      probe_count: cm.grids[c].positions.len() as u32,
     })
   });
-  // base uniform finer = LOD1 域（base 被 LOD1 覆盖的 cell 不再出探针）
-  if let Some(frames) = &casc_frames {
-    let u = gpu.uniform.get_mut();
-    u.finer_min = frames[0].dom.grid_origin;
-    u.finer_size = frames[0].dom.grid_dims;
-  }
   let base_u = *gpu.uniform.get_mut();
   gpu.uniform.write_buffer(&device, &queue);
   let t2 = std::time::Instant::now();
 
-  // 级联 uniform（本级域 + finer = 上一级域）+ probe_count
+  // 级联 uniform（本级域）+ probe_count
   if let Some(frames) = &casc_frames {
     for (c, f) in frames.iter().enumerate() {
       let Some(cg) = gpu.cascades.get_mut(c) else {
@@ -2834,63 +2368,6 @@ fn prepare_ddgi(
       *cg.uniform.get_mut() = f.dom;
       cg.uniform.write_buffer(&device, &queue);
       cg.probe_count = f.probe_count;
-    }
-    // 滚动帧增量（pending_shift 由 extract 侧 scroll 写入）：本级 ci（binding 2）
-    // 与 all_ci 段（binding 14）同数据（全局 id 平移）；positions 段按 internal id；
-    // meta 快照重传 16 层（重叠 age 搬运 + 新列基线）+ irr/depth 新列复位
-    for (c, f) in frames.iter().enumerate() {
-      let Some(shift) = f.shift else {
-        continue;
-      };
-      let Some(cg) = gpu.cascades.get(c) else {
-        continue;
-      };
-      let ci_off = gpu.id_base + (c as u32) * 4096;
-      if let Some(pos) = &f.pos_packed {
-        queue.write_buffer(&gpu.positions, ci_off as u64 * 16, &vec4_bytes(pos));
-      }
-      if let Some(ci) = &f.ci_words {
-        let bytes = u32_bytes(ci);
-        queue.write_buffer(&cg.cell_index, 0, &bytes);
-        queue.write_buffer(
-          &gpu.all_ci,
-          (gpu.base_ci_words + (c as u32) * 4096) as u64 * 4,
-          &bytes,
-        );
-      }
-      if let Some(meta) = &f.meta_words {
-        let layer0 = gpu.base_layers + c as u32 * 16;
-        queue.write_texture(
-          TexelCopyTextureInfo {
-            texture: &gpu.meta_prev,
-            mip_level: 0,
-            origin: Origin3d {
-              x: 0,
-              y: 0,
-              z: layer0,
-            },
-            aspect: TextureAspect::All,
-          },
-          &meta_padded_bytes(meta),
-          TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(META_COPY_BPR),
-            rows_per_image: Some(PROBES_PER_LAYER_AXIS),
-          },
-          Extent3d {
-            width: PROBES_PER_LAYER_AXIS,
-            height: PROBES_PER_LAYER_AXIS,
-            depth_or_array_layers: 16,
-          },
-        );
-        cascade_scroll_reset(
-          &queue,
-          layer0,
-          shift,
-          (&gpu.irr_prev, &gpu.irr_next),
-          (&gpu.depth_prev, &gpu.depth_next),
-        );
-      }
     }
   }
 
@@ -2975,11 +2452,15 @@ fn prepare_ddgi(
     let casc_u_us = (t3 - t2).as_micros();
     bevy::log::info!(
       "PREP[{}]: total={}us pp={}us base_u={}us casc_u={}us bg4={}us",
-      gpu.frame, total_us, pp_us, base_u_us, casc_u_us, bg4_us,
+      gpu.frame,
+      total_us,
+      pp_us,
+      base_u_us,
+      casc_u_us,
+      bg4_us,
     );
   }
 }
-
 
 // ============================================================================
 // 单测：活跃位语义（Douglas #23 近表面判定）+ positions.w 打包
@@ -3057,12 +2538,8 @@ mod tests {
       }
     }
     // cell (3,0,0) 面邻实心砖 → 活跃；cell (0,0,0) 远场 → 不活跃
-    assert!(
-      pg.active[pg.cell_index[pg.cell_linear(UVec3::new(3, 0, 0))] as usize]
-    );
-    assert!(
-      !pg.active[pg.cell_index[pg.cell_linear(UVec3::new(0, 0, 0))] as usize]
-    );
+    assert!(pg.active[pg.cell_index[pg.cell_linear(UVec3::new(3, 0, 0))] as usize]);
+    assert!(!pg.active[pg.cell_index[pg.cell_linear(UVec3::new(0, 0, 0))] as usize]);
   }
 
   #[test]

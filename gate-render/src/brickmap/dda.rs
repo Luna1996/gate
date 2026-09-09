@@ -2701,12 +2701,12 @@ pub(crate) fn dispatch_dda(
         let probe_count = gpu.id_base + 4 * 4096;
         let span = recorder.time_span(ctx.command_encoder(), "gate_probe_viz");
         {
-          let mut pass = ctx.command_encoder().begin_compute_pass(
-            &ComputePassDescriptor {
+          let mut pass = ctx
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
               label: Some("gate_probe_viz"),
               ..default()
-            },
-          );
+            });
           pass.set_pipeline(pipe);
           pass.set_bind_group(0, &bg0.0, &[]);
           pass.set_bind_group(1, &bg1.0, &[]);
@@ -2722,7 +2722,8 @@ pub(crate) fn dispatch_dda(
   }
   let us = tdda.elapsed().as_micros();
   if let Some(g) = gpu.as_ref()
-    && g.frame > 1 && g.frame <= 5
+    && g.frame > 1
+    && g.frame <= 5
   {
     bevy::log::info!("DISP_DDA[{}]: {}us", g.frame, us);
   }
