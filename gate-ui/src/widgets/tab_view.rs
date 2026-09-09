@@ -31,6 +31,9 @@ use crate::theme::UiTheme;
 pub struct TabView {
   pub active: usize,
   pub count: usize,
+  /// true = 自适应高度模式：活动页流入布局撑开容器，切页面板高度随内容变化；
+  /// false = 填充模式：root flex_grow 撑满宿主剩余高，页面绝对定位叠放
+  pub fit_content: bool,
 }
 
 /// tab 按钮标记（挂在 tab 节点上，index = 对应 content 下标）
@@ -69,13 +72,20 @@ impl Deref for TabViewHandle {
   }
 }
 
-/// 标签页配置（全部字段进 Config；Default = 空 tabs、初始选中 0）
+/// 标签页配置（全部字段进 Config；Default = 空 tabs、初始选中 0、填充模式）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TabConfig {
   /// 标签名列表
   pub tabs: Vec<String>,
   /// 初始选中下标（越界自动钳到最后一个）
   pub active: usize,
+  /// 高度模式：
+  /// - false（默认）= 填充模式：root `flex_grow:1` 撑满宿主剩余高度，页面绝对定位
+  ///   100% 高叠放（宿主必须有确定高度，页内用 scroll_view 滚动）；
+  /// - true = 自适应高度：root/容器高度 auto，活动页 Relative 流入布局撑开容器，
+  ///   隐藏页 Absolute 脱流不占位——切页时面板高度随活动页内容变化。
+  ///   页内不可放 Percent(100%) 高的 scroll_view（auto 高度下解析为 0）
+  pub fit_content: bool,
 }
 
 /// 创建标签页。
@@ -91,14 +101,19 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
   let root = parent
     .spawn((
       Name::new("ui-tab-view"),
-      TabView { active, count },
+      TabView {
+        active,
+        count,
+        fit_content: config.fit_content,
+      },
       Node {
         flex_direction: FlexDirection::Column,
         width: Val::Percent(100.0),
-        // 撑满宿主剩余高度：flex 后尺寸视为 definite，子级 Val::Percent 高度才能解析。
-        // 否则 root 高度 auto → content 容器塌缩 → 内部 scroll_view(Percent(100%)) 高 0，
-        // Overflow::clip 会把全部内容裁掉（在固定高度面板内表现为"tab 里没有控件"）。
-        flex_grow: 1.0,
+        // 填充模式：撑满宿主剩余高度——flex 后尺寸视为 definite，子级 Val::Percent
+        // 高度才能解析（否则 root 高度 auto → content 容器塌缩 → 内部
+        // scroll_view(Percent(100%)) 高 0，Overflow::clip 裁掉全部内容）。
+        // 自适应模式：不 grow，高度 auto 随活动页内容收缩。
+        flex_grow: if config.fit_content { 0.0 } else { 1.0 },
         ..default()
       },
     ))
@@ -168,7 +183,8 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
           Node {
             flex_direction: FlexDirection::Column,
             width: Val::Percent(100.0),
-            flex_grow: 1.0,
+            // 填充模式 grow 撑满 tab bar 以下剩余高度；自适应模式 auto 随活动页
+            flex_grow: if config.fit_content { 0.0 } else { 1.0 },
             // 页面绝对定位叠放，溢出由页内 scroll_view 裁剪，此处兜底
             overflow: Overflow::clip(),
             ..default()
@@ -176,22 +192,34 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
         ))
         .with_children(|container| {
           for i in 0..count {
+            let is_active = i == active;
+            // 填充模式：全部页面绝对定位叠放（同位重叠、脱离流布局，隐藏页不
+            // 占位，切页内容位置不漂移），高度 100% 吃满容器。
+            // 自适应模式：活动页 Relative 流入布局撑开容器高度；隐藏页 Absolute
+            // 脱流不占位（无显式高度，随自身内容但不可见）。
+            let in_flow = config.fit_content && is_active;
             let e = container
               .spawn((
                 Name::new(format!("ui-tab-content-{i}")),
                 TabContent { index: i },
-                // 绝对定位叠放：所有页面同位重叠、脱离流布局——
-                // 隐藏页不占位，切页时内容位置不随页序漂移
                 Node {
-                  position_type: PositionType::Absolute,
+                  position_type: if in_flow {
+                    PositionType::Relative
+                  } else {
+                    PositionType::Absolute
+                  },
                   top: px(0.0),
                   left: px(0.0),
                   width: Val::Percent(100.0),
-                  height: Val::Percent(100.0),
+                  height: if config.fit_content {
+                    Val::Auto
+                  } else {
+                    Val::Percent(100.0)
+                  },
                   flex_direction: FlexDirection::Column,
                   ..default()
                 },
-                if i == active {
+                if is_active {
                   // Inherited（非 Visible！）：Visible 会无视祖先强制可见，
                   // 面板被整体隐藏时页面会单独悬浮（propagate_recursive 遇
                   // Visible 直接置 true，覆盖父级 Hidden）
@@ -221,7 +249,7 @@ pub fn tab_view_system(
   mut q_tab_node: Query<(&mut BackgroundColor, &mut BorderColor, &Children)>,
   mut q_tab_text: Query<&mut TextColor>,
   q_children: Query<&Children>,
-  mut q_content: Query<(&TabContent, &mut Visibility)>,
+  mut q_content: Query<(&TabContent, &mut Visibility, &mut Node)>,
   theme: Option<Res<UiTheme>>,
 ) {
   let Some(theme) = theme else {
@@ -301,14 +329,24 @@ pub fn tab_view_system(
       continue;
     };
     for content_e in cc_children.iter() {
-      if let Ok((tc, mut vis)) = q_content.get_mut(content_e) {
+      if let Ok((tc, mut vis, mut node)) = q_content.get_mut(content_e) {
+        let is_active = tc.index == view.active;
         // 选中页 = Inherited（跟随祖先，面板整体隐藏时页面跟着隐藏）；
         // 显式 Visible 会无视祖先强制可见 → 页面单独悬浮
-        *vis = if tc.index == view.active {
+        *vis = if is_active {
           Visibility::Inherited
         } else {
           Visibility::Hidden
         };
+        // 自适应模式：活动页必须流入布局（Relative）才能撑开容器高度；
+        // 隐藏页脱流（Absolute）不占位。填充模式全部 Absolute，不动。
+        if view.fit_content {
+          node.position_type = if is_active {
+            PositionType::Relative
+          } else {
+            PositionType::Absolute
+          };
+        }
       }
     }
   }
@@ -323,6 +361,7 @@ mod tests {
     TabConfig {
       tabs: vec!["a".into(), "b".into()],
       active: 0,
+      fit_content: false,
     }
   }
 
@@ -434,6 +473,82 @@ mod tests {
       changes.lock().unwrap().len(),
       changes_before,
       "re-click active tab emits no event"
+    );
+  }
+
+  #[test]
+  fn fit_content_mode_layout_and_switch() {
+    let theme = default_theme();
+    let mut app = App::new();
+    app.insert_resource(theme.clone());
+    app.add_systems(Update, tab_view_system);
+
+    let root = app.world_mut().spawn_empty().id();
+    let mut res = None;
+    let ctx = UiCtx::new(&theme, None);
+    app.world_mut().entity_mut(root).with_children(|p| {
+      res = Some(tab_view(
+        &ctx,
+        p,
+        TabConfig {
+          tabs: vec!["a".into(), "b".into()],
+          active: 0,
+          fit_content: true,
+        },
+      ));
+    });
+    let h = res.unwrap();
+    let w = app.world();
+    assert!(w.get::<TabView>(*h).unwrap().fit_content);
+    assert_eq!(
+      w.get::<Node>(*h).unwrap().flex_grow,
+      0.0,
+      "fit-content root does not grow (auto height)"
+    );
+    // 活动页流入布局（Relative + auto 高），隐藏页脱流（Absolute）
+    assert_eq!(
+      w.get::<Node>(h.contents[0]).unwrap().position_type,
+      PositionType::Relative,
+      "active page in flow"
+    );
+    assert_eq!(
+      w.get::<Node>(h.contents[0]).unwrap().height,
+      Val::Auto,
+      "active page height auto"
+    );
+    assert_eq!(
+      w.get::<Node>(h.contents[1]).unwrap().position_type,
+      PositionType::Absolute,
+      "inactive page out of flow"
+    );
+
+    // 切到 tab 1：位置类型随可见性翻转
+    let bar = w.get::<Children>(*h).unwrap()[0];
+    let tab1 = w.get::<Children>(bar).unwrap()[1];
+    drop(w);
+    app
+      .world_mut()
+      .get_mut::<Interaction>(tab1)
+      .unwrap()
+      .set_if_neq(Interaction::Pressed);
+    app.update();
+    app
+      .world_mut()
+      .get_mut::<Interaction>(tab1)
+      .unwrap()
+      .set_if_neq(Interaction::Hovered);
+    app.update();
+
+    let w = app.world();
+    assert_eq!(
+      w.get::<Node>(h.contents[0]).unwrap().position_type,
+      PositionType::Absolute,
+      "page 0 now out of flow"
+    );
+    assert_eq!(
+      w.get::<Node>(h.contents[1]).unwrap().position_type,
+      PositionType::Relative,
+      "page 1 now in flow"
     );
   }
 }

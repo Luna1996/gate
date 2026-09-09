@@ -330,15 +330,47 @@ pub struct DdgiGpu {
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiBg4(pub BindGroup);
 
-/// DDGI 运行时总开关（main world 由 UI toggle 写入；extract 拷到 render world）。
-/// 关：dispatch_ddgi 整条 compute 链早退（省 GPU）+ trace shader 跳过探针采样
-/// （gi=0）。默认开。
-#[derive(bevy::ecs::resource::Resource, Clone, Copy)]
-pub struct DdgiEnabled(pub bool);
+/// DDGI 运行时分阶段档位（main world 由 DebugView 档位 slider 写入；extract 拷到
+/// render world）。三阶段逐级依赖，高档位包含所有低档位工作：
+/// - [`DdgiStage::OFF`]（0）：全关。dispatch 链整体早退（省 GPU），trace shader
+///   misc.x=0 跳过探针采样（gi=0）。
+/// - [`DdgiStage::ACTIVE`]（1）：① 计算 Active Probe（copy/clear/active/seal）。
+///   probe worklist/meta 产出，Probe Viz 可看探针放置结果；无射线、纹理不更新。
+/// - [`DdgiStage::CAST`]（2）：② + 从 Active Probe 发射 RayQuery（cast）并把样本
+///   投影积分进 irradiance/depth 纹理（update）；探针数据有效，但 voxel 着色仍不
+///   采样（misc.x=0），可用调试模式可视化探针数据而不影响画面。
+/// - [`DdgiStage::FULL`]（3）：③ + voxel 着色采样探针（trace shader misc.x=1，
+///   完整 DDGI 间接光）。
+///
+/// 默认 0（关）。
+#[derive(bevy::ecs::resource::Resource, Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct DdgiStage(pub u8);
 
-impl Default for DdgiEnabled {
-  fn default() -> Self {
-    Self(true)
+impl DdgiStage {
+  /// 0：全关
+  pub const OFF: u8 = 0;
+  /// 1：仅 Active Probe 计算
+  pub const ACTIVE: u8 = 1;
+  /// 2：Active + RayQuery 投射/积分
+  pub const CAST: u8 = 2;
+  /// 3：完整 DDGI（voxel 着色采样探针）
+  pub const FULL: u8 = 3;
+
+  /// 钳制到合法档位 [0, 3]
+  pub fn new(v: u8) -> Self {
+    Self(v.min(Self::FULL))
+  }
+  /// ① 是否运行 Active Probe 计算（档位 ≥ 1）
+  pub fn run_active(&self) -> bool {
+    self.0 >= Self::ACTIVE
+  }
+  /// ② 是否运行 RayQuery 投射 + 纹理积分（档位 ≥ 2）
+  pub fn run_cast(&self) -> bool {
+    self.0 >= Self::CAST
+  }
+  /// ③ voxel 着色是否采样探针（档位 ≥ 3）
+  pub fn shade_gi(&self) -> bool {
+    self.0 >= Self::FULL
   }
 }
 
@@ -373,13 +405,13 @@ pub struct DdgiPlugin;
 
 impl bevy::app::Plugin for DdgiPlugin {
   fn build(&self, app: &mut bevy::app::App) {
-    app.init_resource::<DdgiEnabled>();
+    app.init_resource::<DdgiStage>();
     app.init_resource::<DdgiDebugSettings>();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app
-      .init_resource::<DdgiEnabled>()
+      .init_resource::<DdgiStage>()
       .init_resource::<DdgiDebugSettings>()
       .add_systems(RenderStartup, init_ddgi_gpu)
       // DDGI pipeline 排队必须在 DDA pipeline 之后（需要 dda.bg0-3 layouts）
@@ -669,12 +701,15 @@ fn dispatch_ddgi(
   bg2: Option<Res<crate::brickmap::dda::DdaBg2BindGroup>>,
   bg3: Option<Res<crate::brickmap::dda::DdaBg3BindGroup>>,
   bg4: Option<Res<DdgiBg4>>,
-  enabled: Res<DdgiEnabled>,
+  stage: Res<DdgiStage>,
   mut gpu: ResMut<DdgiGpu>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
 ) {
-  // 运行时关：跳过整条 compute 链，省 GPU。trace shader 侧由 uniform 开关位 gi=0。
-  if !enabled.0 {
+  // 档位 0：整条 compute 链早退（省 GPU）。trace shader 侧由 misc.x 开关位 gi=0。
+  // 档位 1：只跑 copy/clear/active/seal（① Active Probe）；
+  // 档位 2：加跑桥接 copy/cast/update（② RayQuery + 积分）；
+  // 档位 3：compute 同档位 2，voxel 着色采样由 prepare 写 misc.x=1 开启（③）。
+  if !stage.run_active() {
     return;
   }
   if gpu.frame <= 5 {
@@ -791,43 +826,48 @@ fn dispatch_ddgi(
     set_bgs(&mut pass, &bg4.0);
     pass.dispatch_workgroups(1, 1, 1);
   }
-  // dispatch[1]（min）→ indirect[0] 桥接（4B；indirect[1]=y=1 [2]=z=1 常驻——
-  // copy 若带 dispatch[2..] 会把零值带进 y/z → 零 workgroup）
-  {
-    let encoder = ctx.command_encoder();
-    encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 4);
-  }
-  // ③cast（indirect：x = dispatch[1] 钳制后本帧处理探针数）
-  {
-    let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_cast");
+  // ② RayQuery 段（档位 ≥ 2）：桥接 copy → cast（indirect）→ update（indirect）。
+  // 档位 1 只算 Active Probe（probe worklist/meta 就绪，供 Probe Viz 目验），
+  // 不发射线、不写 irradiance/depth 纹理。
+  if stage.run_cast() {
+    // dispatch[1]（min）→ indirect[0] 桥接（4B；indirect[1]=y=1 [2]=z=1 常驻——
+    // copy 若带 dispatch[2..] 会把零值带进 y/z → 零 workgroup）
     {
-      let mut pass = ctx
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-          label: Some("gate_ddgi_cast"),
-          ..Default::default()
-        });
-      pass.set_pipeline(p_cast);
-      set_bgs(&mut pass, &bg4.0);
-      pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+      let encoder = ctx.command_encoder();
+      encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 4);
     }
-    span.end(ctx.command_encoder());
-  }
-  // ④update（indirect：同 count；1 wg = 1 探针）
-  {
-    let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_update");
+    // ③cast（indirect：x = dispatch[1] 钳制后本帧处理探针数）
     {
-      let mut pass = ctx
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-          label: Some("gate_ddgi_update"),
-          ..Default::default()
-        });
-      pass.set_pipeline(p_update);
-      set_bgs(&mut pass, &bg4.0);
-      pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+      let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_cast");
+      {
+        let mut pass = ctx
+          .command_encoder()
+          .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("gate_ddgi_cast"),
+            ..Default::default()
+          });
+        pass.set_pipeline(p_cast);
+        set_bgs(&mut pass, &bg4.0);
+        pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+      }
+      span.end(ctx.command_encoder());
     }
-    span.end(ctx.command_encoder());
+    // ④update（indirect：同 count；1 wg = 1 探针）
+    {
+      let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_update");
+      {
+        let mut pass = ctx
+          .command_encoder()
+          .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("gate_ddgi_update"),
+            ..Default::default()
+          });
+        pass.set_pipeline(p_update);
+        set_bgs(&mut pass, &bg4.0);
+        pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+      }
+      span.end(ctx.command_encoder());
+    }
   }
   ddgi_total.end(ctx.command_encoder());
 
@@ -1045,12 +1085,13 @@ fn dispatch_ddgi(
 /// main world 无任何几何资源需要提取。
 fn extract_ddgi_settings(
   mut commands: Commands,
-  enabled: Option<bevy::render::Extract<Res<DdgiEnabled>>>,
+  stage: Option<bevy::render::Extract<Res<DdgiStage>>>,
   debug: Option<bevy::render::Extract<Res<DdgiDebugSettings>>>,
 ) {
-  // 主世界开关 → 渲染世界（prepare/dispatch 读渲染世界副本）
-  let on = enabled.map_or(true, |e| e.0);
-  commands.insert_resource(DdgiEnabled(on));
+  // 主世界档位 → 渲染世界（prepare/dispatch 读渲染世界副本）；
+  // 资源缺失/越界回退 = 0 关（与 DdgiStage::default()=OFF 一致）
+  let s = stage.map_or(DdgiStage::OFF, |s| s.0.min(DdgiStage::FULL));
+  commands.insert_resource(DdgiStage(s));
   // 主世界 DDGI 调试参数 → 渲染世界（prepare_ddgi 写进 uniform.params.y/.z）
   let dbg = debug.map_or_else(DdgiDebugSettings::default, |d| DdgiDebugSettings {
     mode: d.mode,
@@ -1079,7 +1120,7 @@ fn prepare_ddgi(
   queue: Res<RenderQueue>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
   view: Option<Res<crate::brickmap::dda::DdaViewUniform>>,
-  enabled: Res<DdgiEnabled>,
+  stage: Res<DdgiStage>,
   dbg: Res<DdgiDebugSettings>,
   mut gpu: ResMut<DdgiGpu>,
 ) {
@@ -1133,9 +1174,10 @@ fn prepare_ddgi(
   }
   gpu.have_prev = true;
   // params：x=frame, y=调试 mode, z=gain, w=object bbox 数（暂为 0）；
-  // misc.x = DDGI 运行时开关（trace shader 据此跳过探针采样 gi=0）
+  // misc.x = ③ voxel 着色采样开关（仅档位 3 = FULL 置 1；trace shader 据此跳过
+  // 探针采样 gi=0）。档位 1/2 compute 照跑但着色端不消费探针数据
   u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, 0.0);
-  u.misc = Vec4::new(if enabled.0 { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
+  u.misc = Vec4::new(if stage.shade_gi() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
 

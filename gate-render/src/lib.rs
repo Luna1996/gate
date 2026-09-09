@@ -1,4 +1,5 @@
 pub mod brickmap;
+pub mod cpu_probe;
 pub mod ddgi;
 pub mod lighting;
 mod responsive;
@@ -31,6 +32,7 @@ impl Plugin for GateRenderPlugin {
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
       ddgi::DdgiPlugin,
+      cpu_probe::CpuProbePlugin,
     ));
   }
 }

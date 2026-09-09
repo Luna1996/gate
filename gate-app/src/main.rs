@@ -48,11 +48,12 @@ fn main() {
       .set(WindowPlugin {
         primary_window: Some(Window {
           resolution: VIEW_SIZE.into(),
-          // 【诊断】GATE_BENCH=1：① Fifo vsync（帧时测量用真实墙钟时间，不吃
-          // immediate 模式的 frame pacing 伪影；高刷屏 vblank 6.9ms < trace 帧时，
-          // 不会封顶掩盖差异）；② visible=false 静默后台运行，不抢前台焦点
+          // 默认 Fifo 硬垂直同步（与 DebugView「VSync」开关默认开同步；vblank 墙钟
+          // 节拍稳定帧时，GATE_BENCH=1 帧时测量也用同一模式）。开关关闭 → AutoNoVsync
+          // 不封顶测裸 GPU 吞吐；bevy_render 检测 present_mode 变化自动重配 swapchain。
+          // focused=false：启动不抢前台焦点（静默后台）
           focused: false,
-          present_mode: PresentMode::AutoNoVsync,
+          present_mode: PresentMode::Fifo,
           resizable: true, // 2.7a FR-5：解锁任意 resize（渲染目标 + aspect 由响应式系统跟随）
           ..default()
         }),

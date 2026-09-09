@@ -2696,6 +2696,8 @@ pub(crate) fn dispatch_dda(
   // ---- probe 可视化 pass：探针位置画黄色方块（toggle 开时执行）----
   // 每槽 1 线程：活跃过滤（meta age）+ 视锥剔除 + 遮挡射线（复用 trace_scene，
   // 本 pass 已绑定全部 bind group）→ 仅屏幕内可见探针画方块。
+  // 注：probe_viz 是独立调试开关，有意不与 DDGI 档位联动（档位 0 时 meta 冻结，
+  // 仍可可视化冻结状态用于排查）。
   if dbg.map_or(false, |d| d.probe_viz) {
     if gpu.is_some() {
       if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {

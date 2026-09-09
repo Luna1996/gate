@@ -92,6 +92,8 @@ pub struct SliderValueChanged {
 const THUMB_SIZE: f32 = 16.0;
 /// 拖拽中滑块放大尺寸
 const THUMB_SIZE_DRAG: f32 = 18.0;
+/// 根节点水平内边距 = 半 thumb 宽：thumb 行程首尾完全在根命中矩形内
+const THUMB_INSET: f32 = THUMB_SIZE / 2.0;
 const TRACK_HEIGHT: f32 = 4.0;
 
 /// clamp + step 归一（纯函数）
@@ -105,6 +107,13 @@ pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {
 }
 
 /// 主题滑杆（横向；宽度由父容器 flex 决定，最小 120px）
+///
+/// 几何：根节点水平内边距 = 半 thumb 宽（[`THUMB_INSET`]），track 与 thumb 都在
+/// 内容盒内——thumb 行程首尾各止于根边缘内 8px，**任何档位 thumb 都完整落在根
+/// 命中区内**（旧几何 thumb 为根直接子、`left:0%/100% + 负 margin` 居中，首尾
+/// 半幅溢出根命中矩形，端点滑块难点中）。thumb 是 track 子节点（与 fill 同一
+/// 绝对定位包含块 → 位置天然对齐），`top:50%` 相对 4px track 高 + 负 margin
+/// 半高实现垂直居中。
 pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> SliderHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -126,12 +135,16 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
         min_width: px(120.0),
         height: px(24.0),
         align_items: AlignItems::Center,
+        // 半 thumb 水平内缩：thumb 行程端点不超出根命中矩形
+        padding: UiRect::horizontal(px(THUMB_INSET)),
         ..default()
       },
       FocusPolicy::Block,
     ))
     .with_children(|root| {
-      // 轨道槽（抬升表面 +1 阶：surface_elevated → surface_overlay，增强与填充对比）
+      // 轨道槽（抬升表面 +1 阶：surface_elevated → surface_overlay，增强与填充对比）。
+      // flex_grow 撑满内容盒（根宽 - 2*THUMB_INSET）；fill 与 thumb 均为其绝对
+      // 定位子节点，包含块 = track 边框盒
       root
         .spawn((
           Name::new("ui-slider-track"),
@@ -158,23 +171,30 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
             },
             BackgroundColor(color_of(&c.accent_fill_hover)),
           ));
+          // 滑块（顶层表面 + 提亮边框；方形，无圆角；绝对定位：left 按值百分比，
+          // margin 左/上各负半尺寸把滑块中心钉在定位点；top:50% 相对 track 高 4px
+          // = 2px，配合 -半高 margin 实现垂直居中于 track 中心线）
+          track.spawn((
+            Name::new("ui-slider-thumb"),
+            SliderThumb,
+            Node {
+              position_type: PositionType::Absolute,
+              left: Val::Percent(norm * 100.0),
+              top: Val::Percent(50.0),
+              margin: UiRect {
+                left: px(-THUMB_SIZE / 2.0),
+                top: px(-THUMB_SIZE / 2.0),
+                ..default()
+              },
+              width: px(THUMB_SIZE),
+              height: px(THUMB_SIZE),
+              border: UiRect::all(px(m.border_width)),
+              ..default()
+            },
+            BackgroundColor(color_of(&c.surface_top)),
+            BorderColor::all(color_of(&c.border_strong)),
+          ));
         });
-      // 滑块（顶层表面 + 提亮边框；方形，无圆角；绝对定位，margin 负半宽居中）
-      root.spawn((
-        Name::new("ui-slider-thumb"),
-        SliderThumb,
-        Node {
-          position_type: PositionType::Absolute,
-          left: Val::Percent(norm * 100.0),
-          margin: UiRect::left(Val::Px(-THUMB_SIZE / 2.0)),
-          width: px(THUMB_SIZE),
-          height: px(THUMB_SIZE),
-          border: UiRect::all(px(m.border_width)),
-          ..default()
-        },
-        BackgroundColor(color_of(&c.surface_top)),
-        BorderColor::all(color_of(&c.border_strong)),
-      ));
     })
     .id();
   SliderHandle(e)
@@ -188,25 +208,42 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
   }
 }
 
-/// 拖动：按下时把光标归一化 x（-0.5..0.5 中心原点）映射为值（每帧重算）；
-/// 值变化时触发 [`SliderValueChanged`]（仅用户拖动，程序写 SliderValue 不触发）
+/// 拖动：按下时把光标位置映射为值（每帧重算）；值变化时触发
+/// [`SliderValueChanged`]（仅用户拖动，程序写 SliderValue 不触发）。
+///
+/// 映射基准 = 根节点**内容盒**（track 行程区 = 根宽 - 2×[`THUMB_INSET`]）：
+/// 光标在两侧内边距带内即吸附 min/max（端点档位命中区与中段一样宽，不再只有
+/// 1px 边界）。有 step 时经 [`clamp_step`] 逐档吸附（离散档位 slider）。
 pub fn slider_drag_system(
   mut commands: Commands,
   mut q: Query<(
     Entity,
     &Interaction,
     &RelativeCursorPosition,
+    &ComputedNode,
     &SliderRange,
     &SliderStep,
     &mut SliderValue,
   )>,
 ) {
-  for (e, inter, rcp, range, step, mut val) in &mut q {
+  for (e, inter, rcp, node, range, step, mut val) in &mut q {
     if *inter != Interaction::Pressed {
       continue;
     }
     let Some(n) = rcp.normalized else { continue };
-    let norm = (n.x + 0.5).clamp(0.0, 1.0);
+    // normalized 以根节点中心为原点（-0.5..0.5）；ComputedNode.size 与
+    // padding（BorderRect：min_inset.x=左、max_inset.x=右）同为物理 px，
+    // 比值运算单位自洽（不需要 inverse_scale_factor）
+    let root_w = node.size().x;
+    let cursor_x = (n.x + 0.5) * root_w;
+    let pad_l = node.padding.min_inset.x;
+    let pad_r = node.padding.max_inset.x;
+    let content_w = root_w - pad_l - pad_r;
+    let norm = if content_w > 0.0 {
+      ((cursor_x - pad_l) / content_w).clamp(0.0, 1.0)
+    } else {
+      0.0
+    };
     let target = range.min + norm * (range.max - range.min);
     let v = clamp_step(target, range.min, range.max, step.0);
     if (val.0 - v).abs() > f32::EPSILON {
@@ -221,8 +258,10 @@ pub fn slider_drag_system(
 
 /// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px
 ///
-/// 注意：fill 是 track 的子节点（slider root 的孙节点），不能只遍历 root 的直接
-/// Children——需要下钻 track 的 Children 才能命中 SliderFill。thumb 是 root 直接子。
+/// 注意：fill 与 thumb 都是 track 的子节点（slider root 的孙节点），不能只遍历
+/// root 的直接 Children——需要下钻 track 的 Children 分别命中 SliderFill 与
+/// SliderThumb。thumb 的 `top:50% + margin-top:-半高` 垂直居中也在此同步（尺寸
+/// 随拖拽放大）。
 pub fn slider_visual_system(
   mut q_root: Query<(&SliderValue, &SliderRange, &Interaction, &Children), With<UiSlider>>,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
@@ -237,18 +276,24 @@ pub fn slider_visual_system(
       THUMB_SIZE
     };
     for child in children.iter() {
-      // thumb 是 root 直接子
-      if let Ok(mut node) = thumbs.get_mut(child) {
-        node.left = Val::Percent(pct);
-        node.width = px(thumb_size);
-        node.height = px(thumb_size);
-        node.margin = UiRect::left(Val::Px(-thumb_size / 2.0));
-      }
-      // fill 在 track 内部（孙节点）：下钻 track 的 Children 找 SliderFill
+      // fill/thumb 都在 track 内部（孙节点）：下钻 track 的 Children
       if let Ok(tc) = q_track_children.get(child) {
-        for fill_entity in tc.iter() {
-          if let Ok(mut node) = fills.get_mut(fill_entity) {
+        for sub in tc.iter() {
+          if let Ok(mut node) = fills.get_mut(sub) {
             node.width = Val::Percent(pct);
+          }
+          if let Ok(mut node) = thumbs.get_mut(sub) {
+            node.left = Val::Percent(pct);
+            // top:50% 相对 track 高（4px）= 2px，margin 负半高把中心钉在 track
+            // 中心线；拖拽放大时尺寸与负 margin 同步
+            node.top = Val::Percent(50.0);
+            node.width = px(thumb_size);
+            node.height = px(thumb_size);
+            node.margin = UiRect {
+              left: px(-thumb_size / 2.0),
+              top: px(-thumb_size / 2.0),
+              ..default()
+            };
           }
         }
       }
@@ -302,8 +347,22 @@ mod tests {
       25.0,
       "initial value clamp/step"
     );
-    let children = w.get::<Children>(e).unwrap();
-    assert_eq!(children.len(), 2, "track + thumb");
+    let root_children = w.get::<Children>(e).unwrap();
+    assert_eq!(root_children.len(), 1, "root only has track (thumb moved under track)");
+    let track = root_children[0];
+    let track_children = w.get::<Children>(track).unwrap();
+    assert_eq!(track_children.len(), 2, "track holds fill + thumb");
+    let has_fill = track_children
+      .iter()
+      .any(|c| w.get::<SliderFill>(c).is_some());
+    let has_thumb = track_children
+      .iter()
+      .any(|c| w.get::<SliderThumb>(c).is_some());
+    assert!(has_fill && has_thumb, "fill + thumb both under track");
+    // 根节点水平内边距 = 半 thumb（thumb 行程端点不溢出命中区）
+    let pad = w.get::<Node>(e).unwrap().padding;
+    assert_eq!(pad.left, px(THUMB_INSET));
+    assert_eq!(pad.right, px(THUMB_INSET));
   }
 
   #[test]
@@ -317,6 +376,9 @@ mod tests {
     app.add_observer(move |ev: On<SliderValueChanged>| {
       sink.lock().unwrap().push((ev.entity, ev.value));
     });
+    // ComputedNode：根宽 100px、无水平内边距 → cursor_x = (0.25+0.5)*100 = 75
+    let mut computed = ComputedNode::default();
+    computed.size = Vec2::new(100.0, 24.0);
     let e = app
       .world_mut()
       .spawn((
@@ -326,13 +388,14 @@ mod tests {
           cursor_over: true,
           normalized: Some(Vec2::new(0.25, 0.0)),
         },
+        computed,
         SliderRange::default(),
         SliderStep(None),
         SliderValue(0.0),
       ))
       .id();
     app.update();
-    // x=0.25（中心原点）→ norm=0.75
+    // x=0.25（中心原点）→ cursor_x=75 → 内容盒 norm=0.75
     assert!((app.world().get::<SliderValue>(e).unwrap().0 - 0.75).abs() < 1e-6);
     assert_eq!(
       *events.lock().unwrap(),
@@ -354,6 +417,34 @@ mod tests {
     app.update();
     assert!((app.world().get::<SliderValue>(e).unwrap().0 - 0.75).abs() < 1e-6);
     assert_eq!(events.lock().unwrap().len(), 1, "no event when not pressed");
+
+    // 水平内边距带（THUMB_INSET 半 thumb）：根宽 100px + padding 8px →
+    // 内容盒 [8,92]。按下时光标在左 8px 内边距带（根左边缘外旧几何的点击
+    // 死区）→ 吸附 min=0；右带 → 吸附 max=1（端点命中区与中段等宽）
+    {
+      let mut cn = app.world_mut().get_mut::<ComputedNode>(e).unwrap();
+      cn.padding.min_inset.x = 8.0;
+      cn.padding.max_inset.x = 8.0;
+    }
+    app
+      .world_mut()
+      .get_mut::<Interaction>(e)
+      .unwrap()
+      .set_if_neq(Interaction::Pressed);
+    app
+      .world_mut()
+      .get_mut::<RelativeCursorPosition>(e)
+      .unwrap()
+      .normalized = Some(Vec2::new(-0.48, 0.0)); // cursor_x = 2px < 8px padding
+    app.update();
+    assert_eq!(app.world().get::<SliderValue>(e).unwrap().0, 0.0, "left inset band clamps to min");
+    app
+      .world_mut()
+      .get_mut::<RelativeCursorPosition>(e)
+      .unwrap()
+      .normalized = Some(Vec2::new(0.48, 0.0)); // cursor_x = 98px > 92px content end
+    app.update();
+    assert_eq!(app.world().get::<SliderValue>(e).unwrap().0, 1.0, "right inset band clamps to max");
   }
 
   #[test]
@@ -370,13 +461,13 @@ mod tests {
         Children::default(),
       ))
       .id();
-    // 真实结构：root → track → fill；root → thumb
+    // 真实结构：root → track → fill + thumb（thumb 与 fill 同在 track 下）
     let track = app.world_mut().spawn((Children::default(),)).id();
     let fill = app.world_mut().spawn((SliderFill, Node::default())).id();
     let thumb = app.world_mut().spawn((SliderThumb, Node::default())).id();
     app.world_mut().entity_mut(track).add_child(fill);
+    app.world_mut().entity_mut(track).add_child(thumb);
     app.world_mut().entity_mut(e).add_child(track);
-    app.world_mut().entity_mut(e).add_child(thumb);
     app.update();
     let fill_node = app.world().get::<Node>(fill).unwrap();
     assert!(matches!(fill_node.width, Val::Percent(p) if (p - 50.0).abs() < 1e-5));

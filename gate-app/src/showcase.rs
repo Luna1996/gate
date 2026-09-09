@@ -82,6 +82,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
         TabConfig {
           tabs: vec!["组件".into(), "数据".into()],
           active: 0,
+          fit_content: false,
         },
       );
       // ---- tab 0：组件展示 ----
