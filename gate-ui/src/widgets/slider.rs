@@ -348,7 +348,11 @@ mod tests {
       "initial value clamp/step"
     );
     let root_children = w.get::<Children>(e).unwrap();
-    assert_eq!(root_children.len(), 1, "root only has track (thumb moved under track)");
+    assert_eq!(
+      root_children.len(),
+      1,
+      "root only has track (thumb moved under track)"
+    );
     let track = root_children[0];
     let track_children = w.get::<Children>(track).unwrap();
     assert_eq!(track_children.len(), 2, "track holds fill + thumb");
@@ -437,14 +441,22 @@ mod tests {
       .unwrap()
       .normalized = Some(Vec2::new(-0.48, 0.0)); // cursor_x = 2px < 8px padding
     app.update();
-    assert_eq!(app.world().get::<SliderValue>(e).unwrap().0, 0.0, "left inset band clamps to min");
+    assert_eq!(
+      app.world().get::<SliderValue>(e).unwrap().0,
+      0.0,
+      "left inset band clamps to min"
+    );
     app
       .world_mut()
       .get_mut::<RelativeCursorPosition>(e)
       .unwrap()
       .normalized = Some(Vec2::new(0.48, 0.0)); // cursor_x = 98px > 92px content end
     app.update();
-    assert_eq!(app.world().get::<SliderValue>(e).unwrap().0, 1.0, "right inset band clamps to max");
+    assert_eq!(
+      app.world().get::<SliderValue>(e).unwrap().0,
+      1.0,
+      "right inset band clamps to max"
+    );
   }
 
   #[test]

@@ -1,8 +1,10 @@
-//! 左上角调试 overlay：FPS（CUR/AVG/MIN/MAX）+ 真实 GPU 帧时折线 + CPU 工作时长折线
-//! （实测、不含 vsync/acquire 等待）+ 相机信息。
+//! 左上角调试 overlay：FPS（CUR/AVG/MIN/MAX）读数 + 相机信息 + 渲染开关。
+//!
+//! 逐帧 GPU/CPU 剖析已改由 Tracy + wgpu-profiler 承担（`--features profile`，
+//! Tracy GUI 看时间线），旧的自研折线/落盘帧时统计已删除。
 //!
 //! 装配入口 [`demo_ui_setup`](crate::demo_ui_setup) 在主题/字体就绪后调用
-//! [`spawn_debug_view`] 一次性生成；[`fps_line_feed`] 每帧喂统计数据。
+//! [`spawn_debug_view`] 一次性生成；[`fps_line_feed`] 每帧喂 FPS 统计。
 
 use std::collections::VecDeque;
 
@@ -13,24 +15,13 @@ use gate_render::OrbitCamera;
 use gate_ui::{
   UiCtx,
   widgets::{
-    ButtonConfig, ButtonVariant, GridConfig, LabelConfig, LabelStyle, PanelSurface, PlotConfig,
-    PlotData, PlotDomain, PlotLayout, SliderConfig, SliderValueChanged, TabConfig,
-    ToggleSwitchConfig, ToggleSwitchToggled, UiClick, blank_plot_image, button, color_of, grid,
-    grid_cell, label, plot, px, slider, tab_view, toggle_switch,
+    ButtonConfig, ButtonVariant, GridConfig, LabelConfig, LabelStyle, SliderConfig,
+    SliderValueChanged, TabConfig, ToggleSwitchConfig, ToggleSwitchToggled, UiClick, button,
+    color_of, grid, label, px, slider, tab_view, toggle_switch,
   },
 };
 
 use crate::showcase::ShowcaseRoot;
-
-/// fps_line_feed 每 0.25s 写一行 CUR/AVG/MIN/MAX
-pub(crate) const FPS_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/fps.log");
-/// 逐帧帧时日志：每帧一行
-/// `elapsed,dt,trace,beam,ddgi_total,probe_viz,blit,cpu_total,seg_main,seg_pre,seg_acq,seg_prep,seg_graph,seg_submit`
-///（-1 = 该来源未上线；cpu_total = 实测 CPU 工作时长（不含 seg_acq acquire/vblank
-/// 等待段）；seg_* 为 gate-render 六段时间戳分解），0.25s 攒一批刷盘。
-/// 帧时波动/周期尖刺定位用
-pub(crate) const FRAME_TIME_LOG_PATH: &str =
-  concat!(env!("CARGO_MANIFEST_DIR"), "/logs/frame_time.log");
 
 // ================= 左上角单行 FPS（CUR/AVG/MIN/MAX） =================
 //
@@ -46,14 +37,6 @@ const FPS_WINDOW_SECS: f32 = 5.0;
 
 /// debug-view 面板固定宽度（px；高度 auto 随当前 tab 页内容收缩）
 const DEBUG_VIEW_W: f32 = 360.0;
-/// 帧时长折线图：画布纹理尺寸（宽 ≈ FPS 文本宽；高 64px，1:1 显示）
-const FRAME_PLOT_W: u32 = 320;
-const FRAME_PLOT_H: u32 = 64;
-/// 折线环形样本容量（≈ 画布像素宽，约 1 样本/px；60fps 下约 6s 窗口）
-const FRAME_PLOT_CAP: usize = 360;
-/// GPU span 诊断新鲜度上限（秒）：超过未更新的测量视为 span 已停录（如 DDGI 档位 0
-/// 早退），残值不可用。GPU 时间戳回读延迟只有 1-2 帧，0.25s 余量充足
-const GPU_DIAG_MAX_AGE: f32 = 0.25;
 
 #[derive(Component)]
 pub(crate) struct FpsText;
@@ -65,14 +48,6 @@ pub(crate) struct DemoUiRoot;
 
 #[derive(Component)]
 pub(crate) struct CamInfoText;
-
-/// GPU 帧时折线标记（fps_line_feed 用它过滤 PlotData，避免命中 showcase 折线）
-#[derive(Component)]
-pub(crate) struct GpuPlot;
-
-/// CPU 工作时长折线标记（gate-render 实测、不含 acquire/vblank 等待；与 GPU span 折线对照）
-#[derive(Component)]
-pub(crate) struct CpuPlot;
 
 /// 「右上角面板」开关标记（ToggleSwitchToggled 观察者以此过滤事件）
 #[derive(Component)]
@@ -132,23 +107,16 @@ pub(crate) fn fps3(v: f32) -> u32 {
 
 /// 左上角 debug-view 面板：**固定宽度 360px、高度 auto**（随当前 Tab 页内容收缩）。
 /// TabView（fit_content 自适应高度模式）两页：
-/// - Stats：FPS 读数 / GPU 帧时折线 / CPU 工作时长折线 / 相机信息 / VSync / UI Showcase
+/// - Stats：FPS 读数 / 相机信息 / VSync / UI Showcase
 /// - DDGI：阶段档位滑杆 / 调试模式按钮 / Gain 滑杆 / Probe Viz 开关 / LOD 滑杆
 ///   （全部控件合并在同一个 cell 内纵向排列）
 ///
-/// 视觉：root 提供外框 + HUD 卡面底色；每页一个 grid（去外框避免双线，保留
-/// 1px gap 填色格线），cell 用不透明 Card 面（grid_cell 约定：HUD 档半透明会露格线）。
+/// 视觉：root 提供外框 + HUD 卡面底色；每页一个 grid（去外框/gap，行分割线由
+/// cell bottom border 承担，避免右侧叠成 2px）。
 /// 定位由本函数设置（PositionType::Absolute + 左上 8px 锚定）。
 pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
-  // 帧时长折线图画布（透明背景，折线区域由画布 1px border 包围）：GPU / CPU 各一
-  let gpu_plot_image = world
-    .resource_mut::<Assets<Image>>()
-    .add(blank_plot_image(FRAME_PLOT_W, FRAME_PLOT_H));
-  let cpu_plot_image = world
-    .resource_mut::<Assets<Image>>()
-    .add(blank_plot_image(FRAME_PLOT_W, FRAME_PLOT_H));
   // 绝对定位根：定宽 + 高度 auto（TabView fit_content 随活动页收缩）；外框/底色本节点提供
   world
     .spawn((
@@ -156,8 +124,8 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       DemoUiRoot,
       Node {
         position_type: PositionType::Absolute,
-        left: px(8.0),
-        top: px(8.0),
+        left: px(m.spacing.sm),
+        top: px(m.spacing.sm),
         width: px(DEBUG_VIEW_W),
         flex_direction: FlexDirection::Column,
         border: UiRect::all(px(m.border_width)),
@@ -167,6 +135,36 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       BorderColor::all(color_of(&c.border)),
     ))
     .with_children(|root| {
+      // ---- FPS 关键读数（顶部，所有 Tab 可见；主文本色 text_primary） ----
+      let fps_cell = root
+        .spawn((
+          Name::new("debug-fps"),
+          Node {
+            padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)),
+            border: UiRect::bottom(px(m.border_width)),
+            ..default()
+          },
+          BackgroundColor(color_of(&c.surface_card)),
+          BorderColor {
+            bottom: color_of(&c.border),
+            ..BorderColor::DEFAULT
+          },
+        ))
+        .id();
+      root.world_mut().entity_mut(fps_cell).with_children(|cell| {
+        let e = label(
+          ctx,
+          cell,
+          LabelConfig {
+            text: "FPS: CUR ---, AVG ---, MIN ---, MAX ---".into(),
+            ..default()
+          },
+        );
+        cell
+          .world_mut()
+          .entity_mut(*e)
+          .insert((FpsText, TextColor(color_of(&c.text_primary))));
+      });
       let tv = tab_view(
         ctx,
         root,
@@ -183,110 +181,28 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         .with_children(|page| {
           let g = tab_page_grid(ctx, page);
           page.world_mut().entity_mut(g).with_children(|g| {
-            // ---- FPS 关键读数（主文本色 text_primary） ----
-            let c1 = grid_cell(ctx, g, PanelSurface::Card);
-            g.world_mut().entity_mut(c1).with_children(|cell| {
+            // ---- 相机当前位置/角度信息（与 FPS 同档同色；两行行间距 = padding sm）----
+            let c2 = tab_cell(ctx, g);
+            g.world_mut().entity_mut(c2).with_children(|cell| {
               let e = label(
                 ctx,
                 cell,
                 LabelConfig {
-                  text: "FPS: CUR ---, AVG ---, MIN ---, MAX ---".into(),
+                  text: "CAMERA (---,---,---)\nTARGET (---,---,---)".into(),
                   ..default()
                 },
               );
-              cell
-                .world_mut()
-                .entity_mut(*e)
-                .insert((FpsText, TextColor(color_of(&c.text_primary))));
-            });
-            // ---- GPU 帧时折线（强调蓝；muted 标题 + YAxis ms；宽度 Auto 撑满格子）----
-            let c2 = grid_cell(ctx, g, PanelSurface::Card);
-            g.world_mut()
-              .entity_mut(c2)
-              .insert(Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: px(ctx.theme.metrics.spacing.sm),
-                ..default()
-              })
-              .with_children(|cell| {
-                label(
-                  ctx,
-                  cell,
-                  LabelConfig {
-                    text: "GPU".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                let p = plot(
-                  ctx,
-                  cell,
-                  PlotConfig {
-                    layout: PlotLayout::YAxis,
-                    image: gpu_plot_image,
-                    capacity: FRAME_PLOT_CAP,
-                    y_domain: PlotDomain::Auto,
-                    line_color: color_of(&c.accent_text),
-                    y_axis_width: Val::Auto,
-                    canvas_width: Val::Auto,
-                    unit: Some("ms"),
-                    canvas_h: FRAME_PLOT_H as f32,
-                  },
-                );
-                cell.world_mut().entity_mut(*p).insert(GpuPlot);
-              });
-            // ---- CPU 工作时长折线（warning 色；gate-render 实测 ms，不含 acquire 等待）----
-            let c3 = grid_cell(ctx, g, PanelSurface::Card);
-            g.world_mut()
-              .entity_mut(c3)
-              .insert(Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: px(ctx.theme.metrics.spacing.sm),
-                ..default()
-              })
-              .with_children(|cell| {
-                label(
-                  ctx,
-                  cell,
-                  LabelConfig {
-                    text: "CPU".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                let p = plot(
-                  ctx,
-                  cell,
-                  PlotConfig {
-                    layout: PlotLayout::YAxis,
-                    image: cpu_plot_image,
-                    capacity: FRAME_PLOT_CAP,
-                    y_domain: PlotDomain::Auto,
-                    line_color: color_of(&c.warning),
-                    y_axis_width: Val::Auto,
-                    canvas_width: Val::Auto,
-                    unit: Some("ms"),
-                    canvas_h: FRAME_PLOT_H as f32,
-                  },
-                );
-                cell.world_mut().entity_mut(*p).insert(CpuPlot);
-              });
-            // ---- 相机当前位置/角度信息（说明文字 muted） ----
-            let c4 = grid_cell(ctx, g, PanelSurface::Card);
-            g.world_mut().entity_mut(c4).with_children(|cell| {
-              let e = label(
-                ctx,
-                cell,
-                LabelConfig {
-                  text: "(---,---,---)->(---,---,---)".into(),
-                  style: LabelStyle::Muted,
-                },
-              );
-              cell.world_mut().entity_mut(*e).insert(CamInfoText);
+              cell.world_mut().entity_mut(*e).insert((
+                CamInfoText,
+                TextColor(color_of(&c.text_primary)),
+                bevy::text::LineHeight::Px(
+                  ctx.theme.metrics.font_size.md + ctx.theme.metrics.spacing.sm,
+                ),
+              ));
             });
             // ---- 垂直同步开关（默认开 = Fifo；观察者写 Window.present_mode，
             //      bevy_render 检测变化自动重配 swapchain；关 = AutoNoVsync 不封顶） ----
-            let c5 = grid_cell(ctx, g, PanelSurface::Card);
+            let c5 = tab_cell(ctx, g);
             g.world_mut().entity_mut(c5).with_children(|cell| {
               let t = toggle_switch(
                 ctx,
@@ -299,8 +215,8 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
               cell.world_mut().entity_mut(*t).insert(VsyncToggle);
             });
             // ---- 「右上角面板」显隐开关（默认隐藏；观察者写 ShowcaseRoot Visibility）----
-            let c6 = grid_cell(ctx, g, PanelSurface::Card);
-            g.world_mut().entity_mut(c6).with_children(|cell| {
+            let c4 = tab_cell(ctx, g);
+            g.world_mut().entity_mut(c4).with_children(|cell| {
               let t = toggle_switch(
                 ctx,
                 cell,
@@ -325,7 +241,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           page.world_mut().entity_mut(g).with_children(|g| {
             // 全部 DDGI 控件合并在同一个 cell 内纵向排列，子行间距 sm=4px：
             // 阶段档位滑杆 / 调试模式按钮行 / Gain 滑杆行 / Probe Viz 开关 / LOD 滑杆行
-            let cell = grid_cell(ctx, g, PanelSurface::Card);
+            let cell = tab_cell(ctx, g);
             g.world_mut()
               .entity_mut(cell)
               .insert(Node {
@@ -335,193 +251,184 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ..default()
               })
               .with_children(|cell| {
-            // -- 阶段档位滑杆（0=Off/1=Active/2=Cast/3=Full，step=1 整数吸附；
-            //    默认 0 关，与 DdgiStage::default()=OFF 同步）--
-            cell
-              .spawn((
-                Name::new("ddgi-stage-row"),
-                Node {
-                  flex_direction: FlexDirection::Row,
-                  column_gap: px(ctx.theme.metrics.spacing.md),
-                  align_items: AlignItems::Center,
-                  ..default()
-                },
-              ))
-              .with_children(|row| {
-                label(
-                  &ctx,
-                  row,
-                  LabelConfig {
-                    text: "DDGI".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                let s = slider(
-                  &ctx,
-                  row,
-                  SliderConfig {
-                    min: 0.0,
-                    max: 3.0,
-                    value: 0.0,
-                    step: Some(1.0),
-                  },
-                );
-                row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
-                let vl = label(
-                  &ctx,
-                  row,
-                  LabelConfig {
-                    text: "0 Off".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*vl)
-                  .insert(DdgiStageValueLabel);
-              });
-            // -- 调试模式按钮行（5 按钮互斥单选；默认 mode=0 Normal = Primary）--
-            cell
-              .spawn((
-                Name::new("ddgi-mode-row"),
-                Node {
-                  flex_direction: FlexDirection::Row,
-                  column_gap: px(ctx.theme.metrics.spacing.sm),
-                  align_items: AlignItems::Center,
-                  ..default()
-                },
-              ))
-              .with_children(|row| {
-                for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
-                  let variant = if i == 0 {
-                    ButtonVariant::Primary
-                  } else {
-                    ButtonVariant::Ghost
-                  };
-                  let b = button(
-                    &ctx,
-                    row,
-                    ButtonConfig {
-                      text: (*name).into(),
-                      variant,
+                // -- 阶段档位滑杆（0=Off/1=Active/2=Cast/3=Full，step=1 整数吸附；
+                //    默认 0 关，与 DdgiStage::default()=OFF 同步）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-stage-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
                     },
-                  );
-                  row
-                    .world_mut()
-                    .entity_mut(*b)
-                    .insert(DdgiDebugModeBtn(i as u8));
-                }
-              });
-            // -- Gain 滑杆行（0.1..4.0，默认 1.0；右侧实时数值）--
-            cell
-              .spawn((
-                Name::new("ddgi-gain-row"),
-                Node {
-                  flex_direction: FlexDirection::Row,
-                  column_gap: px(ctx.theme.metrics.spacing.md),
-                  align_items: AlignItems::Center,
-                  ..default()
-                },
-              ))
-              .with_children(|row| {
-                label(
+                  ))
+                  .with_children(|row| {
+                    label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "DDGI".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      &ctx,
+                      row,
+                      SliderConfig {
+                        min: 0.0,
+                        max: 3.0,
+                        value: 0.0,
+                        step: Some(1.0),
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
+                    let vl = label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "0 Off".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*vl).insert(DdgiStageValueLabel);
+                  });
+                // -- 调试模式按钮行（5 按钮互斥单选；默认 mode=0 Normal = Primary）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-mode-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.sm),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
+                      let variant = if i == 0 {
+                        ButtonVariant::Primary
+                      } else {
+                        ButtonVariant::Ghost
+                      };
+                      let b = button(
+                        &ctx,
+                        row,
+                        ButtonConfig {
+                          text: (*name).into(),
+                          variant,
+                        },
+                      );
+                      row
+                        .world_mut()
+                        .entity_mut(*b)
+                        .insert(DdgiDebugModeBtn(i as u8));
+                    }
+                  });
+                // -- Gain 滑杆行（0.1..4.0，默认 1.0；右侧实时数值）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-gain-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "Gain".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      &ctx,
+                      row,
+                      SliderConfig {
+                        min: 0.1,
+                        max: 4.0,
+                        value: 1.0,
+                        step: Some(0.1),
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(DdgiGainSlider);
+                    let vl = label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "1.0".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*vl).insert(DdgiGainValueLabel);
+                  });
+                // -- Probe Viz 开关（探针位置黄色方块可视化，默认关）--
+                let t = toggle_switch(
                   &ctx,
-                  row,
-                  LabelConfig {
-                    text: "Gain".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
+                  cell,
+                  ToggleSwitchConfig {
+                    text: Some("Probe Viz".into()),
+                    checked: false,
                   },
                 );
-                let s = slider(
-                  &ctx,
-                  row,
-                  SliderConfig {
-                    min: 0.1,
-                    max: 4.0,
-                    value: 1.0,
-                    step: Some(0.1),
-                  },
-                );
-                row.world_mut().entity_mut(*s).insert(DdgiGainSlider);
-                let vl = label(
-                  &ctx,
-                  row,
-                  LabelConfig {
-                    text: "1.0".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*vl)
-                  .insert(DdgiGainValueLabel);
-              });
-            // -- Probe Viz 开关（探针位置黄色方块可视化，默认关）--
-            let t = toggle_switch(
-              &ctx,
-              cell,
-              ToggleSwitchConfig {
-                text: Some("Probe Viz".into()),
-                checked: false,
-              },
-            );
-            cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
-            // -- Probe Viz 层级滑杆行（0..=4 步进 1：All / LOD0~3）--
-            cell
-              .spawn((
-                Name::new("ddgi-probe-lod-row"),
-                Node {
-                  flex_direction: FlexDirection::Row,
-                  column_gap: px(ctx.theme.metrics.spacing.md),
-                  align_items: AlignItems::Center,
-                  ..default()
-                },
-              ))
-              .with_children(|row| {
-                label(
-                  &ctx,
-                  row,
-                  LabelConfig {
-                    text: "LOD".into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                let s = slider(
-                  &ctx,
-                  row,
-                  SliderConfig {
-                    min: 0.0,
-                    max: 4.0,
-                    value: 0.0,
-                    step: Some(1.0),
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*s)
-                  .insert(DdgiProbeVizLodSlider);
-                let vl = label(
-                  &ctx,
-                  row,
-                  LabelConfig {
-                    text: DDGI_PROBE_VIZ_LODS[0].into(),
-                    style: LabelStyle::Muted,
-                    ..default()
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*vl)
-                  .insert(DdgiProbeVizLodValueLabel);
+                cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
+                // -- Probe Viz 层级滑杆行（0..=4 步进 1：All / LOD0~3）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-probe-lod-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "LOD".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      &ctx,
+                      row,
+                      SliderConfig {
+                        min: 0.0,
+                        max: 4.0,
+                        value: 0.0,
+                        step: Some(1.0),
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
+                    let vl = label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: DDGI_PROBE_VIZ_LODS[0].into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row
+                      .world_mut()
+                      .entity_mut(*vl)
+                      .insert(DdgiProbeVizLodValueLabel);
+                  });
               });
           });
         });
-      });
     });
 
   // 「右上角面板」开关 → 切换 showcase 整体显隐（ShowcaseRoot 的 Visibility）
@@ -560,7 +467,11 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       } else {
         PresentMode::AutoNoVsync
       };
-      info!("VSync {} → present_mode {:?}", if ev.checked { "on" } else { "off" }, win.present_mode);
+      info!(
+        "VSync {} → present_mode {:?}",
+        if ev.checked { "on" } else { "off" },
+        win.present_mode
+      );
     },
   );
 
@@ -582,7 +493,11 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         let i = (v as usize).min(DDGI_STAGES.len() - 1);
         t.0 = format!("{} {}", v, DDGI_STAGES[i]);
       }
-      info!("DDGI stage → {} ({})", ddgi.0, DDGI_STAGES.get(v as usize).unwrap_or(&"?"));
+      info!(
+        "DDGI stage → {} ({})",
+        ddgi.0,
+        DDGI_STAGES.get(v as usize).unwrap_or(&"?")
+      );
     },
   );
 
@@ -656,8 +571,9 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
   );
 }
 
-/// Tab 页内网格：1 列 auto 行高 + 1px gap 填色格线。**去外框**——面板 root
-/// 已提供外框，grid 自带全边框会叠成双线；容器 border 底色保留（填 gap 成格线）。
+/// Tab 页内网格：1 列 auto 行高。**去外框 + 去 gap 底色**——面板 root 已提供外框，
+/// 行分割线由每个 cell 的 bottom border 承担（避免 grid BackgroundColor 在右侧溢出
+/// 叠成 2px 边框）。
 fn tab_page_grid(ctx: &UiCtx, page: &mut ChildSpawner) -> Entity {
   let g = grid(
     ctx,
@@ -670,8 +586,37 @@ fn tab_page_grid(ctx: &UiCtx, page: &mut ChildSpawner) -> Entity {
   page.world_mut().entity_mut(*g).remove::<BorderColor>();
   if let Some(mut n) = page.world_mut().get_mut::<Node>(*g) {
     n.border = UiRect::DEFAULT;
+    n.row_gap = px(0.0);
+    n.column_gap = px(0.0);
   }
+  // 背景与 cell 一致（surface_card），行分割线改由 cell bottom border 画
+  page
+    .world_mut()
+    .entity_mut(*g)
+    .insert(BackgroundColor(color_of(&ctx.theme.colors.surface_card)));
   *g
+}
+
+/// Tab 页内 cell：surface_card 背景 + 1px 底部分割线（与 root 外框同色）。
+/// 最后一行的底边线落在 root 内边框上方，不与外框叠加。
+fn tab_cell(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
+  let c = &ctx.theme.colors;
+  let m = &ctx.theme.metrics;
+  parent
+    .spawn((
+      Name::new("ui-grid-cell"),
+      Node {
+        padding: UiRect::all(px(m.spacing.sm)),
+        border: UiRect::bottom(px(m.border_width)),
+        ..default()
+      },
+      BackgroundColor(color_of(&c.surface_card)),
+      BorderColor {
+        bottom: color_of(&c.border),
+        ..BorderColor::DEFAULT
+      },
+    ))
+    .id()
 }
 
 /// F3 切换左上角 debug overlay 显隐（默认显示；只影响本面板，不动 showcase）
@@ -690,125 +635,23 @@ pub(crate) fn debug_overlay_toggle(
   }
 }
 
-/// 每 0.25s 刷新一次左上角 FPS 行 + 写一行到 logs/fps.log
+/// 每 0.25s 刷新一次左上角 FPS 行（CUR/AVG/MIN/MAX）+ 相机位置行。
 ///
-/// 每帧（早于 0.25s 早退）压入两条折线环形缓冲，PlotData Changed → gate-ui 的
-/// plot_redraw_system 自动光栅化重绘：
-/// - GPU 折线：各 pass span 之和 ms（诊断未就绪跳过，绝不退回 dt）
-/// - CPU 折线：gate-render 实测的本帧 CPU 工作时长 ms（两段纯 CPU 区间相加，
-///   vsync/帧队列反压在 prepare_windows acquire 处的阻塞已排除；晚 1 帧，无值跳过）
-#[allow(clippy::too_many_arguments)]
+/// 逐帧 delta 压入 5s 滚动窗口；GPU/CPU 逐段剖析已交由 Tracy + wgpu-profiler
+/// （`--features profile`，Tracy GUI 时间线），这里只留用户直视的 FPS 读数。
 pub(crate) fn fps_line_feed(
   time: Res<Time>,
-  store: Option<Res<bevy::diagnostic::DiagnosticsStore>>,
-  cpu_report: Option<Res<gate_render::cpu_probe::CpuWorkReport>>,
   orbit: Res<OrbitCamera>,
   mut q: ParamSet<(
     Query<&mut Text, With<FpsText>>,
     Query<&mut Text, With<CamInfoText>>,
   )>,
-  mut q_plot: ParamSet<(
-    Query<&mut PlotData, With<GpuPlot>>,
-    Query<&mut PlotData, With<CpuPlot>>,
-  )>,
   mut window: Local<VecDeque<f32>>, // 逐帧 delta，按时间裁剪到 5s
   mut acc: Local<f32>,
   mut frames: Local<u32>,
-  mut log_file: Local<Option<std::fs::File>>,
-  mut ft_log: Local<Option<std::fs::File>>,
-  mut ft_buf: Local<String>,
 ) {
-  // 首次调用：创建/截断 fps.log + frame_time.log
-  if log_file.is_none() {
-    let path = std::path::Path::new(FPS_LOG_PATH);
-    if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent).ok();
-    }
-    *log_file = std::fs::File::create(path).ok();
-    *ft_log = std::fs::File::create(FRAME_TIME_LOG_PATH).ok();
-  }
   let dt = time.delta_secs();
-  // 折线图推真实 GPU 帧时 = trace+beam+ddgi+blit 四 pass span 之和（跨系统嵌套 span
-  // 不可行：bevy_render open_spans 按 thread 分栈，并行 executor 下跨节点配对 panic）。
-  // vsync 下 delta_secs 恒 ≈16.7（vblank 节拍），不反映真实工作量。
-  // 诊断未就绪（全 -1）→ 跳过推入，绝不退回 delta（否则 vsync 下 16.7 混进 auto 域
-  // 把真实曲线压在底部）。诊断约 0.7s 后上线，空白期折线图不动即可。
-  //
-  // **新鲜度门控**：`DiagnosticsStore` 中一个 span 诊断一旦被创建，其最近测量值会
-  // 永久残留——span 不再录制（如 DDGI 档位 0 早退，gate_ddgi_total 不写时间戳）后
-  // `Diagnostic::value()` 仍返回最后一次值。实测 DDGI 关闭后 51.4ms 冷启动残值被
-  // 折线图当成当前值，800fps 下曲线仍贴在 52ms。GPU 回读延迟只有 1-2 帧（<33ms），
-  // 超过 GPU_DIAG_MAX_AGE 未更新的测量一律视为失效（-1），杜绝残值。
-  use std::fmt::Write as _;
-  let now = std::time::Instant::now();
-  let gpu_ms = |path: &'static str| -> f32 {
-    store
-      .as_deref()
-      .and_then(|s| s.get_measurement(&bevy::diagnostic::DiagnosticPath::new(path)))
-      .filter(|m| now.duration_since(m.time).as_secs_f32() < GPU_DIAG_MAX_AGE)
-      .map(|m| m.value as f32)
-      .unwrap_or(-1.0)
-  };
-  let parts = [
-    gpu_ms("render/gate_dda_trace/elapsed_gpu"),
-    gpu_ms("render/gate_beam/elapsed_gpu"),
-    gpu_ms("render/gate_ddgi_total/elapsed_gpu"),
-    gpu_ms("render/gate_probe_viz/elapsed_gpu"),
-    gpu_ms("render/gate_dda_blit/elapsed_gpu"),
-  ];
-  let diag_ready = parts.iter().any(|&v| v >= 0.0);
-  if diag_ready {
-    let v: f32 = parts.iter().filter(|&&v| v >= 0.0).sum();
-    if let Ok(mut plot) = q_plot.p0().single_mut() {
-      plot.push(v);
-    }
-  }
-  // CPU 折线：gate-render 实测的本帧 CPU 工作时长（ms）——主世界 First → render
-  // 侧 acquire 前 + acquire 后 → RenderGraph Finish 两段纯 CPU 区间，vsync 下
-  // prepare_windows 的 vblank/反压阻塞不包含在内（详见 gate-render cpu_probe 模块
-  // 文档）。render 侧 Finish 集产出，主世界晚 1 帧 try_recv；无值跳过不补 dt
-  //（dt 含 present 等待，vsync 下恒 16.7 会把真实曲线压平）。
-  let mut cpu_timing: Option<gate_render::cpu_probe::CpuTiming> = None;
-  if let Some(report) = cpu_report.as_deref()
-    && let Ok(mut guard) = report.0.lock()
-    && let Some(rx) = guard.as_mut()
-  {
-    while let Ok(v) = rx.try_recv() {
-      cpu_timing = Some(v);
-    }
-  }
-  if let Some(t) = cpu_timing
-    && let Ok(mut plot) = q_plot.p1().single_mut()
-  {
-    plot.push(t.total);
-  }
   window.push_back(dt);
-  // 逐帧一行：elapsed,dt,5×gpu spans,cpu_total,seg_main,seg_pre,seg_acq,seg_prep,seg_graph,seg_submit
-  //（-1 = 该来源未上线；seg_acq = acquire/vblank 等待段，不计入 cpu_total），随 0.25s 刷盘
-  if diag_ready {
-    let _ = write!(
-      *ft_buf,
-      "{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
-      time.elapsed_secs(),
-      dt * 1000.0,
-      parts[0],
-      parts[1],
-      parts[2],
-      parts[3],
-      parts[4],
-    );
-  } else {
-    let _ = write!(*ft_buf, "{:.3},{:.3},-1,-1,-1,-1,-1", time.elapsed_secs(), dt * 1000.0);
-  }
-  if let Some(t) = cpu_timing {
-    let _ = writeln!(
-      *ft_buf,
-      ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
-      t.total, t.seg_main, t.seg_pre, t.seg_acq, t.seg_prep, t.seg_graph, t.seg_submit
-    );
-  } else {
-    let _ = writeln!(*ft_buf, ",-1,-1,-1,-1,-1,-1,-1");
-  };
   let mut sum = 0.0f32;
   for &d in window.iter() {
     sum += d;
@@ -848,7 +691,6 @@ pub(crate) fn fps_line_feed(
     fps3(min),
     fps3(max)
   );
-  let elapsed = time.elapsed_secs();
   *acc = 0.0;
   *frames = 0;
   if let Ok(mut t) = q.p0().single_mut()
@@ -856,36 +698,16 @@ pub(crate) fn fps_line_feed(
   {
     t.0 = txt;
   }
-  // 相机信息：眼位 -> 目标点
+  // 相机信息：CAMERA / TARGET 两行
   let eye = orbit.eye();
   let tgt = orbit.target;
   let cam_txt = format!(
-    "({:.1}, {:.1}, {:.1}) -> ({:.1}, {:.1}, {:.1})",
+    "CAMERA ({:.1}, {:.1}, {:.1})\nTARGET ({:.1}, {:.1}, {:.1})",
     eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z
   );
   if let Some(mut t) = q.p1().iter_mut().next()
     && t.0 != cam_txt
   {
     t.0 = cam_txt;
-  }
-  // 写 fps.log：elapsed_secs,CUR,AVG,MIN,MAX
-  use std::io::Write;
-  if let Some(f) = log_file.as_mut() {
-    let _ = writeln!(
-      f,
-      "{:.2},{},{},{},{}",
-      elapsed,
-      fps3(cur),
-      fps3(avg),
-      fps3(min),
-      fps3(max)
-    );
-  }
-  // 刷逐帧帧时批次（frame_time.log）
-  if let Some(f) = ft_log.as_mut()
-    && !ft_buf.is_empty()
-  {
-    let _ = f.write_all(ft_buf.as_bytes());
-    ft_buf.clear();
   }
 }

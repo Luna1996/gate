@@ -159,14 +159,13 @@ use bevy::ecs::system::{Commands, Res, ResMut};
 use bevy::prelude::RenderGraph;
 use bevy::render::{
   Render, RenderApp, RenderStartup, RenderSystems,
-  diagnostic::RecordDiagnostics,
   render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     Buffer, BufferBindingType, BufferDescriptor, BufferUsages, CachedComputePipelineId,
-    ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, MapMode, Origin3d, ShaderStages,
-    StorageTextureAccess, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
-    Texture, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
-    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, UniformBuffer,
+    ComputePipelineDescriptor, Extent3d, MapMode, Origin3d, ShaderStages, StorageTextureAccess,
+    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureView, TextureViewDescriptor, TextureViewDimension, UniformBuffer,
   },
   renderer::{RenderDevice, RenderQueue},
 };
@@ -704,6 +703,7 @@ fn dispatch_ddgi(
   stage: Res<DdgiStage>,
   mut gpu: ResMut<DdgiGpu>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
+  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
   // 档位 0：整条 compute 链早退（省 GPU）。trace shader 侧由 misc.x 开关位 gi=0。
   // 档位 1：只跑 copy/clear/active/seal（① Active Probe）；
@@ -780,52 +780,42 @@ fn dispatch_ddgi(
     pass.set_bind_group(3, &bg3.0, &[]);
     pass.set_bind_group(4, bg4, &[]);
   };
-  let recorder = ctx.diagnostic_recorder();
-  let recorder = recorder.as_deref();
-  let ddgi_total = recorder.time_span(ctx.command_encoder(), "gate_ddgi_total");
 
   // ①clear（1 wg：dispatch[0] 清零）
-  {
-    let mut pass = ctx
-      .command_encoder()
-      .begin_compute_pass(&ComputePassDescriptor {
-        label: Some("gate_ddgi_clear"),
-        ..Default::default()
-      });
-    pass.set_pipeline(p_clear);
-    set_bgs(&mut pass, &bg4.0);
-    pass.dispatch_workgroups(1, 1, 1);
-  }
+  crate::profiler::gpu_compute_pass(
+    &mut profiler,
+    ctx.command_encoder(),
+    "gate_ddgi_clear",
+    |pass| {
+      pass.set_pipeline(p_clear);
+      set_bgs(pass, &bg4.0);
+      pass.dispatch_workgroups(1, 1, 1);
+    },
+  );
   // ②active（@workgroup_size(4,4,4)：dispatch 4×4×16 → gid 覆盖 16×16 cell × 64 层
   // = 4 LOD × 16 层/级；每 (lod,cell) 1 线程遍历 con tree 现算探针放置）
-  {
-    let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_active");
-    {
-      let mut pass = ctx
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-          label: Some("gate_ddgi_active"),
-          ..Default::default()
-        });
+  crate::profiler::gpu_compute_pass(
+    &mut profiler,
+    ctx.command_encoder(),
+    "gate_ddgi_active",
+    |pass| {
       pass.set_pipeline(p_active);
-      set_bgs(&mut pass, &bg4.0);
+      set_bgs(pass, &bg4.0);
       pass.dispatch_workgroups(4, 4, 16);
-    }
-    span.end(ctx.command_encoder());
-  }
+    },
+  );
   // ②.5 seal（1 wg）：全量 count → 钳制值 dispatch[1]（≤ DDGI_PROBE_BUDGET，
   // 规避 max_compute_workgroups_per_dimension = 65535 静默跳过——gate 特有规模坑）
-  {
-    let mut pass = ctx
-      .command_encoder()
-      .begin_compute_pass(&ComputePassDescriptor {
-        label: Some("gate_ddgi_seal"),
-        ..Default::default()
-      });
-    pass.set_pipeline(p_seal);
-    set_bgs(&mut pass, &bg4.0);
-    pass.dispatch_workgroups(1, 1, 1);
-  }
+  crate::profiler::gpu_compute_pass(
+    &mut profiler,
+    ctx.command_encoder(),
+    "gate_ddgi_seal",
+    |pass| {
+      pass.set_pipeline(p_seal);
+      set_bgs(pass, &bg4.0);
+      pass.dispatch_workgroups(1, 1, 1);
+    },
+  );
   // ② RayQuery 段（档位 ≥ 2）：桥接 copy → cast（indirect）→ update（indirect）。
   // 档位 1 只算 Active Probe（probe worklist/meta 就绪，供 Probe Viz 目验），
   // 不发射线、不写 irradiance/depth 纹理。
@@ -837,39 +827,28 @@ fn dispatch_ddgi(
       encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 4);
     }
     // ③cast（indirect：x = dispatch[1] 钳制后本帧处理探针数）
-    {
-      let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_cast");
-      {
-        let mut pass = ctx
-          .command_encoder()
-          .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("gate_ddgi_cast"),
-            ..Default::default()
-          });
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_ddgi_cast",
+      |pass| {
         pass.set_pipeline(p_cast);
-        set_bgs(&mut pass, &bg4.0);
+        set_bgs(pass, &bg4.0);
         pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
-      }
-      span.end(ctx.command_encoder());
-    }
+      },
+    );
     // ④update（indirect：同 count；1 wg = 1 探针）
-    {
-      let span = recorder.time_span(ctx.command_encoder(), "gate_ddgi_update");
-      {
-        let mut pass = ctx
-          .command_encoder()
-          .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("gate_ddgi_update"),
-            ..Default::default()
-          });
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_ddgi_update",
+      |pass| {
         pass.set_pipeline(p_update);
-        set_bgs(&mut pass, &bg4.0);
+        set_bgs(pass, &bg4.0);
         pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
-      }
-      span.end(ctx.command_encoder());
-    }
+      },
+    );
   }
-  ddgi_total.end(ctx.command_encoder());
 
   // ---- 诊断回读三阶段（wgpu 规则：submit 时 buffer 必须 Unmapped，故 copy 与
   // map_async 分帧；每阶段一帧，回调完成后读+unmap 回 idle）----

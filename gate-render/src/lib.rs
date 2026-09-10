@@ -1,7 +1,7 @@
 pub mod brickmap;
-pub mod cpu_probe;
 pub mod ddgi;
 pub mod lighting;
+pub mod profiler;
 mod responsive;
 
 use bevy::prelude::*;
@@ -32,7 +32,7 @@ impl Plugin for GateRenderPlugin {
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
       ddgi::DdgiPlugin,
-      cpu_probe::CpuProbePlugin,
+      profiler::GateProfilerPlugin,
     ));
   }
 }

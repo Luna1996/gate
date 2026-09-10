@@ -4,6 +4,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# 性能剖析：Tracy CPU zones（bevy trace feature 让所有 system 成 span +
+# 手写 TracyLayer）+ gate-render 的 wgpu-profiler GPU zones。
+# 用法：cargo run -p gate-app --features profile，Tracy GUI 连接进程。
+profile = [
+  "gate-render/profile",
+  "bevy/trace",
+  "dep:tracy-client",
+]
+
 [dependencies]
 bevy = { workspace = true }
 glam = { workspace = true }
@@ -12,8 +22,11 @@ gate-render = { workspace = true }
 gate-ui = { workspace = true }
 # 方案 3 日志落盘：版本对齐 bevy_log 0.19.1 内部用法（subcriber 需含默认 fmt/ansi features）
 # "time" feature：OffsetTime 本地时区时间戳（latest.log 此前是 UTC，跨机器核对日志误导）
+tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["time"] }
 tracing-appender = "0.2"
+# CPU 帧剖析（feature = "profile"）：Tracy 客户端
+tracy-client = { workspace = true, optional = true }
 # formatting = Rfc3339 格式化；local-offset = current_local_offset()（Windows 安全，main 早期单线程）
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 vox-rs = "0.2.0"

@@ -33,6 +33,14 @@ bevy = { version = "=0.19.1", default-features = false, features = [
   "reflect_auto_register",
   "async_executor",
 ] }
+# 注：bevy "trace" feature 不在这里常开——由 gate-app/gate-render 的 profile
+# feature 按需开启（bevy/trace），非剖析构建零 span 开销。
+# GPU 帧剖析（feature = "profile" 启用）：0.27 对齐 wgpu 29；tracy feature
+# 让 GPU zone 直接进 Tracy 时间线（与 tracy-client 0.18 配套）
+wgpu-profiler = { version = "0.27", features = ["tracy"] }
+# CPU 帧剖析（feature = "profile" 启用）：Tracy 客户端；手写 tracing-subscriber
+# Layer 桥接（tracing-tracy 与本 workspace 依赖版本错配，不可用）
+tracy-client = "0.18"
 gate-voxel = { path = "gate-voxel" }
 gate-render = { path = "gate-render" }
 gate-ui = { path = "gate-ui" }

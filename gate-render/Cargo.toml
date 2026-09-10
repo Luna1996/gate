@@ -4,6 +4,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# 性能剖析：启用 wgpu-profiler GPU scope（数据进 Tracy，需配套 gate-app/profile）
+profile = ["dep:wgpu-profiler"]
+
 [dependencies]
 bevy = { workspace = true }
 glam = { workspace = true }
@@ -12,6 +16,8 @@ rayon = { workspace = true }
 # P3.1 光照主题 RON 解析（版本随 workspace，避免双份编译）
 serde = { workspace = true }
 ron = { workspace = true }
+# GPU 帧剖析（feature = "profile"）：compute/render pass 时间戳 → Tracy
+wgpu-profiler = { workspace = true, optional = true }
 
 [dev-dependencies]
 # 集成测试（tests/p29_limits.rs）需要直接构造 TileGrid / 调用 fill_box

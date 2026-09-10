@@ -2199,15 +2199,14 @@ use bevy::{
   core_pipeline::schedule::{Core2d, Core2dSystems, camera_driver},
   render::{
     Render, RenderApp, RenderStartup, RenderSystems,
-    diagnostic::RecordDiagnostics,
     render_asset::RenderAssets,
     render_resource::{
       BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
       CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-      ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, FragmentState, PipelineCache,
-      RenderPassDescriptor, SamplerBindingType, ShaderStages, StorageTextureAccess,
-      TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-      TextureViewDescriptor, UniformBuffer, VertexState,
+      ComputePipelineDescriptor, Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
+      SamplerBindingType, ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension,
+      TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer,
+      VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, texture_2d, texture_storage_2d, uniform_buffer,
       },
@@ -2615,8 +2614,8 @@ pub(crate) fn dispatch_dda(
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
+  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
-  let tdda = std::time::Instant::now();
   // Devlog 23：光照链已拆除——主 pass trace 命中后直接 unlit 着色直出 out_tex
   // （无缓存逐体素法线 + 天空渐变 + 太阳方向光项），无后续 direct/gi/denoise pass。
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
@@ -2638,9 +2637,6 @@ pub(crate) fn dispatch_dda(
     });
   let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
 
-  let recorder = ctx.diagnostic_recorder();
-  let recorder = recorder.as_deref();
-
   let gx = scale.size.x.div_ceil(DDA_WORKGROUP_SIZE);
   let gy = scale.size.y.div_ceil(DDA_WORKGROUP_SIZE);
   // P3 beam：低分辨率 dispatch = ceil(size / 4) / 8
@@ -2650,47 +2646,34 @@ pub(crate) fn dispatch_dda(
   // ---- P3 beam 预 pass：低分辨率 trace 只输出最近命中 t（独立 compute pass，
   // beam 写 beam_depth，主 pass 读同 texture → pass 边界 barrier 保证可见性）----
   // GATE_NO_BEAM=1：跳过 beam pass，主 pass t_min=0（穿墙定位用）
-  if !*BEAM_DISABLED {
-    if let Some(beam_pipe) = beam_pipe {
-      let span = recorder.time_span(ctx.command_encoder(), "gate_beam");
-      {
-        let mut pass = ctx
-          .command_encoder()
-          .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("gate_beam"),
-            ..default()
-          });
-        pass.set_pipeline(beam_pipe);
-        pass.set_bind_group(0, &bg0.0, &[]);
-        pass.set_bind_group(1, &bg1.0, &[]);
-        pass.set_bind_group(2, &bg2.0, &[]);
-        pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, &bg4.0, &[]);
-        pass.dispatch_workgroups(bx, by, 1);
-      }
-      span.end(ctx.command_encoder());
-    }
-  }
-
-  // ---- 主 DDA pass：trace + unlit 着色直出 ----
-  if let Some(dda_pipe) = dda_pipe {
-    let span = recorder.time_span(ctx.command_encoder(), "gate_dda_trace");
-    {
-      let mut pass = ctx
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-          label: Some("gate_dda_trace"),
-          ..default()
-        });
-      pass.set_pipeline(dda_pipe);
+  if !*BEAM_DISABLED && let Some(beam_pipe) = beam_pipe {
+    crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_beam", |pass| {
+      pass.set_pipeline(beam_pipe);
       pass.set_bind_group(0, &bg0.0, &[]);
       pass.set_bind_group(1, &bg1.0, &[]);
       pass.set_bind_group(2, &bg2.0, &[]);
       pass.set_bind_group(3, &bg3.0, &[]);
       pass.set_bind_group(4, &bg4.0, &[]);
-      pass.dispatch_workgroups(gx, gy, 1);
-    }
-    span.end(ctx.command_encoder());
+      pass.dispatch_workgroups(bx, by, 1);
+    });
+  }
+
+  // ---- 主 DDA pass：trace + unlit 着色直出 ----
+  if let Some(dda_pipe) = dda_pipe {
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_dda_trace",
+      |pass| {
+        pass.set_pipeline(dda_pipe);
+        pass.set_bind_group(0, &bg0.0, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+      },
+    );
   }
 
   // ---- probe 可视化 pass：探针位置画黄色方块（toggle 开时执行）----
@@ -2703,45 +2686,37 @@ pub(crate) fn dispatch_dda(
       if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
         // 新架构：固定 16384 槽（4 LOD × 4096），viz 逐槽读 meta/slot_pos 现算坐标
         let probe_count = crate::ddgi::DDGI_TOTAL_SLOTS;
-        let span = recorder.time_span(ctx.command_encoder(), "gate_probe_viz");
-        {
-          let mut pass = ctx
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-              label: Some("gate_probe_viz"),
-              ..default()
-            });
-          pass.set_pipeline(pipe);
-          pass.set_bind_group(0, &bg0.0, &[]);
-          pass.set_bind_group(1, &bg1.0, &[]);
-          pass.set_bind_group(2, &bg2.0, &[]);
-          pass.set_bind_group(3, &bg3.0, &[]);
-          pass.set_bind_group(4, &bg4.0, &[]);
-          let wg = probe_count.div_ceil(64);
-          pass.dispatch_workgroups(wg, 1, 1);
-        }
-        span.end(ctx.command_encoder());
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_probe_viz",
+          |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bg0.0, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, &bg4.0, &[]);
+            let wg = probe_count.div_ceil(64);
+            pass.dispatch_workgroups(wg, 1, 1);
+          },
+        );
       }
     }
-  }
-  let us = tdda.elapsed().as_micros();
-  if let Some(g) = gpu.as_ref()
-    && g.frame > 1
-    && g.frame <= 5
-  {
-    bevy::log::info!("DISP_DDA[{}]: {}us", g.frame, us);
   }
 }
 
 // DDA blit 挂 Core2d PostProcess，Gradient blit 也挂在同一 set，
 // 通过 build() 里显式 .after(gradient::blit_view) 保证 DDA 后执行覆盖渐变画面
 // （Bevy 同 set 系统默认无序，靠 add_systems 注册顺序不可靠——实机截图已复现此 bug）
+#[cfg_attr(not(feature = "profile"), allow(unused_variables, unused_mut))]
 fn blit_dda_view(
   mut ctx: RenderContext,
   views: Query<&ViewTarget>,
   blit_bg: Option<Res<DdaBlitBindGroup>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
+  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
   let (Some(bg), Ok(target)) = (blit_bg.as_ref(), views.single()) else {
     bevy::log::debug_once!("DDA blit: bg or ViewTarget missing");
@@ -2751,12 +2726,28 @@ fn blit_dda_view(
     bevy::log::debug_once!("DDA blit: blit pipeline not ready");
     return;
   };
-  // 说明见 gradient.rs blit_view 同注释：forget_lifetime 与 pass_span 类型冲突 → time_span 覆盖整段
-  // recorder 缺失（插件未装配）→ Option<&T> impl no-op，draw 绝不跳过
-  let recorder = ctx.diagnostic_recorder();
-  let recorder = recorder.as_deref();
-  let span = recorder.time_span(ctx.command_encoder(), "gate_dda_blit");
-  let pass = ctx
+  // profile 构建：scoped_render_pass（pass 时间戳 → wgpu-profiler → Tracy）；
+  // profiler 未就绪/非 profile 构建：常规 begin_render_pass。
+  #[cfg(feature = "profile")]
+  if let Some(profiler) = crate::profiler::profiler_mut(&mut profiler) {
+    let mut encoder_scope = profiler.scope("gate_dda_blit", ctx.command_encoder());
+    let mut pass = encoder_scope.scoped_render_pass(
+      "gate_dda_blit",
+      RenderPassDescriptor {
+        label: Some("gate_dda_blit"),
+        color_attachments: &[Some(target.get_color_attachment())],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        ..default()
+      },
+    );
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &bg.0, &[]);
+    pass.draw(0..3, 0..1);
+    return;
+  }
+  let mut pass = ctx
     .command_encoder()
     .begin_render_pass(&RenderPassDescriptor {
       label: Some("gate_dda_blit"),
@@ -2765,11 +2756,9 @@ fn blit_dda_view(
       timestamp_writes: None,
       occlusion_query_set: None,
       ..default()
-    });
-  let mut pass = pass.forget_lifetime();
+    })
+    .forget_lifetime();
   pass.set_pipeline(pipe);
   pass.set_bind_group(0, &bg.0, &[]);
   pass.draw(0..3, 0..1);
-  drop(pass);
-  span.end(ctx.command_encoder());
 }
