@@ -564,7 +564,6 @@ mod tests {
     // 切到 tab 1：位置类型随可见性翻转
     let bar = w.get::<Children>(*h).unwrap()[0];
     let tab1 = w.get::<Children>(bar).unwrap()[1];
-    drop(w);
     app
       .world_mut()
       .get_mut::<Interaction>(tab1)
