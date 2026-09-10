@@ -12,9 +12,13 @@ pub const PROBES_PER_LAYER: u32 = PROBES_PER_LAYER_AXIS * PROBES_PER_LAYER_AXIS;
 pub const IRRADIANCE_LAYER_TEXELS: u32 = PROBES_PER_LAYER_AXIS * IRRADIANCE_TEXELS;
 pub const DEPTH_LAYER_TEXELS: u32 = PROBES_PER_LAYER_AXIS * DEPTH_TEXELS;
 pub const DDGI_LODS: u32 = 4;
-pub const META_AGE_SHIFT: u32 = 15;
-pub const META_COPY_BPR: u32 = 256;
-const META_ROW_WORDS: usize = META_COPY_BPR as usize / 4;
+pub const META_AGE_SHIFT: u32 = 24;
+// indirect args / 计数器合一 buffer（word 布局与 WGSL DDGI_INDIR_* 对应）：
+//   [0..16) cast args ×4 LOD；[16..32) collect args ×4 LOD；[32..36) rpp；[36..40) 活跃计数器
+pub const DDGI_INDIRECT_BYTES: u64 = 256; // 256B 对齐
+pub const DDGI_COUNTER_CLEAR_OFFSET: u64 = 36 * 4;
+pub const DDGI_COUNTER_CLEAR_BYTES: u64 = 16;
+pub const DDGI_WORKLIST_ITEM_BYTES: u64 = 16; // vec4(probe_pos.xyz, packed age|lod)
 
 pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
 pub const PROBES_PER_CASCADE_AXIS: u32 = 16;
@@ -83,10 +87,10 @@ use bevy::render::{
   render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     Buffer, BufferBindingType, BufferDescriptor, BufferUsages, CachedComputePipelineId,
-    ComputePipelineDescriptor, Extent3d, MapMode, Origin3d, ShaderStages, StorageTextureAccess,
-    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureView, TextureViewDescriptor, TextureViewDimension, UniformBuffer,
+    ComputePipelineDescriptor, Extent3d, Origin3d, ShaderStages, StorageTextureAccess,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+    TextureViewDescriptor, TextureViewDimension, UniformBuffer,
   },
   renderer::{RenderDevice, RenderQueue},
 };
@@ -160,32 +164,27 @@ pub fn ddgi_bg4_layout() -> BindGroupLayoutDescriptor {
       store(4, TextureFormat::R32Float),
       tex(5, TextureSampleType::Uint),
       store(6, TextureFormat::R32Uint),
+      // 7: indirect/计数器合一 rw；8: objects ro；9: worklist rw；10: slot_pos rw
       buf(7, false),
       buf(8, true),
       buf(9, false),
       buf(10, false),
-      buf(11, false),
     ],
   )
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct DdgiPipelines {
-  pub clear: CachedComputePipelineId,
-  pub active: CachedComputePipelineId,
+  pub sort: CachedComputePipelineId,
   pub seal: CachedComputePipelineId,
-  pub cast: CachedComputePipelineId,
-  pub update: CachedComputePipelineId,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiGpu {
   pub uniform: UniformBuffer<DdgiUniform>,
   pub objects: Buffer,
-  pub dispatch: Buffer,
   pub indirect: Buffer,
   pub worklist: Buffer,
-  pub samples: Buffer,
   pub slot_pos: Buffer,
   pub irr_prev: Texture,
   pub irr_next: Texture,
@@ -203,10 +202,6 @@ pub struct DdgiGpu {
   pub prev_origins: [IVec3; 4],
   pub have_prev: bool,
   pub pipelines: Option<DdgiPipelines>,
-  pub readback: Buffer,
-  pub readback_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-  pub readback_state: u32,
-  pub readback_step: u32,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
@@ -305,26 +300,20 @@ fn zero_storage_buffer(
   buf
 }
 
-fn dummy_indirect_buffer(device: &RenderDevice, label: &str) -> Buffer {
-  device.create_buffer(&BufferDescriptor {
-    label: Some(label.into()),
-    size: 16,
-    usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+/// indirect args / 计数器合一 buffer：既要作为 storage（atomic）被 sort/seal 读写，
+/// 又要在阶段二作为 indirect dispatch 参数源。
+fn ddgi_indirect_buffer(device: &RenderDevice, queue: &RenderQueue) -> Buffer {
+  let buf = device.create_buffer(&BufferDescriptor {
+    label: Some("ddgi_indirect".into()),
+    size: DDGI_INDIRECT_BYTES,
+    usage: BufferUsages::STORAGE
+      | BufferUsages::INDIRECT
+      | BufferUsages::COPY_DST
+      | BufferUsages::COPY_SRC,
     mapped_at_creation: false,
-  })
-}
-
-fn ddgi_readback_buffer(device: &RenderDevice) -> Buffer {
-  device.create_buffer(&BufferDescriptor {
-    label: Some("ddgi_readback".into()),
-    size: 256u64
-      + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64
-      + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * 4) as u64
-      + (8 * (META_COPY_BPR as u64 * PROBES_PER_LAYER_AXIS as u64))
-      + 64,
-    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-    mapped_at_creation: false,
-  })
+  });
+  queue.write_buffer(&buf, 0, &vec![0u8; DDGI_INDIRECT_BYTES as usize]);
+  buf
 }
 
 fn ddgi_array_view(tex: &Texture) -> TextureView {
@@ -429,31 +418,21 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>, queue: Res<R
     "ddgi_slot_pos",
     DDGI_TOTAL_SLOTS as u64 * 16,
   );
+  // per-LOD 4096 项 ×4 LOD ×16B（vec4 item）
   let worklist = zero_storage_buffer(
     &device,
     &queue,
     "ddgi_worklist",
-    DDGI_TOTAL_SLOTS as u64 * 4,
+    DDGI_TOTAL_SLOTS as u64 * DDGI_WORKLIST_ITEM_BYTES,
   );
-  let samples = zero_storage_buffer(
-    &device,
-    &queue,
-    "ddgi_samples",
-    DDGI_RAY_BUDGET as u64 * 2 * 16,
-  );
-  let dispatch = zero_storage_buffer(&device, &queue, "ddgi_dispatch", 16);
-  let indirect = dummy_indirect_buffer(&device, "ddgi_indirect");
-  queue.write_buffer(&indirect, 4, &1u32.to_le_bytes());
-  queue.write_buffer(&indirect, 8, &1u32.to_le_bytes());
+  let indirect = ddgi_indirect_buffer(&device, &queue);
   let objects = dummy_sized_buffer(&device, "ddgi_objects", 16);
 
   commands.insert_resource(DdgiGpu {
     uniform: UniformBuffer::default(),
     objects,
-    dispatch,
     indirect,
     worklist,
-    samples,
     slot_pos,
     irr_prev: irr_a,
     irr_next: irr_b,
@@ -471,10 +450,6 @@ fn init_ddgi_gpu(mut commands: Commands, device: Res<RenderDevice>, queue: Res<R
     prev_origins: [IVec3::ZERO; 4],
     have_prev: false,
     pipelines: None,
-    readback: ddgi_readback_buffer(&device),
-    readback_rx: std::sync::Mutex::new(None),
-    readback_state: 0,
-    readback_step: 1,
   });
 }
 
@@ -508,11 +483,8 @@ fn queue_ddgi_pipelines(
     })
   };
   gpu.pipelines = Some(DdgiPipelines {
-    clear: mk("gate_ddgi_clear", "ddgi_clear"),
-    active: mk("gate_ddgi_active", "ddgi_active"),
+    sort: mk("gate_ddgi_sort", "ddgi_sort"),
     seal: mk("gate_ddgi_seal", "ddgi_seal"),
-    cast: mk("gate_ddgi_cast", "ddgi_cast"),
-    update: mk("gate_ddgi_update", "ddgi_update"),
   });
 }
 
@@ -525,20 +497,13 @@ fn dispatch_ddgi(
   bg3: Option<Res<crate::brickmap::dda::DdaBg3BindGroup>>,
   bg4: Option<Res<DdgiBg4>>,
   stage: Res<DdgiStage>,
-  mut gpu: ResMut<DdgiGpu>,
+  dbg: Option<Res<DdgiDebugSettings>>,
+  gpu: Res<DdgiGpu>,
   pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
-  if !stage.run_active() {
+  if !stage.run_active() && !dbg.map_or(false, |d| d.probe_viz) {
     return;
-  }
-  if gpu.frame <= 5 {
-    bevy::log::info!(
-      "DISP_DDGI entry: frame={} has_bg4={} has_pipes={}",
-      gpu.frame,
-      bg4.is_some(),
-      gpu.pipelines.is_some()
-    );
   }
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
     bg0.as_ref(),
@@ -552,44 +517,12 @@ fn dispatch_ddgi(
   let Some(pipes) = gpu.pipelines else {
     return;
   };
-  let (Some(p_clear), Some(p_active), Some(p_seal), Some(p_cast), Some(p_update)) = (
-    pipeline_cache.get_compute_pipeline(pipes.clear),
-    pipeline_cache.get_compute_pipeline(pipes.active),
+  let (Some(p_sort), Some(p_seal)) = (
+    pipeline_cache.get_compute_pipeline(pipes.sort),
     pipeline_cache.get_compute_pipeline(pipes.seal),
-    pipeline_cache.get_compute_pipeline(pipes.cast),
-    pipeline_cache.get_compute_pipeline(pipes.update),
   ) else {
     return;
   };
-
-  {
-    let encoder = ctx.command_encoder();
-    for (src, dst, size) in [
-      (&gpu.irr_prev, &gpu.irr_next, IRRADIANCE_LAYER_TEXELS),
-      (&gpu.depth_prev, &gpu.depth_next, DEPTH_LAYER_TEXELS),
-      (&gpu.meta_prev, &gpu.meta_next, PROBES_PER_LAYER_AXIS),
-    ] {
-      encoder.copy_texture_to_texture(
-        TexelCopyTextureInfo {
-          texture: src,
-          mip_level: 0,
-          origin: Origin3d::ZERO,
-          aspect: TextureAspect::All,
-        },
-        TexelCopyTextureInfo {
-          texture: dst,
-          mip_level: 0,
-          origin: Origin3d::ZERO,
-          aspect: TextureAspect::All,
-        },
-        Extent3d {
-          width: size,
-          height: size,
-          depth_or_array_layers: DDGI_TOTAL_LAYERS,
-        },
-      );
-    }
-  }
 
   let set_bgs = |pass: &mut bevy::render::render_resource::ComputePass, bg4: &BindGroup| {
     pass.set_bind_group(0, &bg0.0, &[]);
@@ -599,255 +532,32 @@ fn dispatch_ddgi(
     pass.set_bind_group(4, bg4, &[]);
   };
 
+  // sort：探针定位 + slot_pos/meta 刷新（probe_viz 依赖其新鲜度）；始终跑。
   crate::profiler::gpu_compute_pass(
     &mut profiler,
     ctx.command_encoder(),
-    "gate_ddgi_clear",
+    "gate_ddgi_sort",
     |pass| {
-      pass.set_pipeline(p_clear);
-      set_bgs(pass, &bg4.0);
-      pass.dispatch_workgroups(1, 1, 1);
-    },
-  );
-  crate::profiler::gpu_compute_pass(
-    &mut profiler,
-    ctx.command_encoder(),
-    "gate_ddgi_active",
-    |pass| {
-      pass.set_pipeline(p_active);
+      pass.set_pipeline(p_sort);
       set_bgs(pass, &bg4.0);
       pass.dispatch_workgroups(4, 4, 16);
     },
   );
-  crate::profiler::gpu_compute_pass(
-    &mut profiler,
-    ctx.command_encoder(),
-    "gate_ddgi_seal",
-    |pass| {
-      pass.set_pipeline(p_seal);
-      set_bgs(pass, &bg4.0);
-      pass.dispatch_workgroups(1, 1, 1);
-    },
-  );
-  if stage.run_cast() {
-    {
-      let encoder = ctx.command_encoder();
-      encoder.copy_buffer_to_buffer(&gpu.dispatch, 4, &gpu.indirect, 0, 4);
-    }
+  // seal：为 cast/collect 准备 per-LOD indirect args；只在需要阶段二时跑。
+  if stage.run_active() {
     crate::profiler::gpu_compute_pass(
       &mut profiler,
       ctx.command_encoder(),
-      "gate_ddgi_cast",
+      "gate_ddgi_seal",
       |pass| {
-        pass.set_pipeline(p_cast);
+        pass.set_pipeline(p_seal);
         set_bgs(pass, &bg4.0);
-        pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
-      },
-    );
-    crate::profiler::gpu_compute_pass(
-      &mut profiler,
-      ctx.command_encoder(),
-      "gate_ddgi_update",
-      |pass| {
-        pass.set_pipeline(p_update);
-        set_bgs(pass, &bg4.0);
-        pass.dispatch_workgroups_indirect(&gpu.indirect, 0);
+        pass.dispatch_workgroups(1, 1, 1);
       },
     );
   }
-
-  match gpu.readback_state {
-    1 => {
-      let (tx, rx) = std::sync::mpsc::channel();
-      gpu.readback.slice(..).map_async(MapMode::Read, move |_| {
-        let _ = tx.send(());
-      });
-      *gpu.readback_rx.lock().unwrap() = Some(rx);
-      gpu.readback_state = 2;
-    }
-    2 => {
-      let done = gpu
-        .readback_rx
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|rx| rx.try_recv().ok())
-        .is_some();
-      if done {
-        let data = gpu.readback.slice(..).get_mapped_range();
-        let word = |i: usize| {
-          u32::from_le_bytes([
-            data[i * 4],
-            data[i * 4 + 1],
-            data[i * 4 + 2],
-            data[i * 4 + 3],
-          ])
-        };
-        let count = word(0);
-        let indirect0 = word(4);
-        let wl = [word(8), word(9), word(10), word(11)];
-        let texels_per_layer = (IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 2) as usize;
-        let mut summary = String::new();
-        for k in 0..8usize {
-          let base = 64 + k * texels_per_layer;
-          let nz = (base..base + texels_per_layer)
-            .filter(|&i| word(i) != 0)
-            .count();
-          let layer = k as u32 * gpu.readback_step;
-          summary.push_str(&format!(" L{layer}:{nz}"));
-        }
-        let dep_base = 64 + 8 * texels_per_layer;
-        let dep_texels = (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
-        let dep_lt = (dep_base..dep_base + dep_texels)
-          .filter(|&i| f32::from_bits(word(i)) < 8000.0)
-          .count();
-        let meta_base =
-          64 + 8 * texels_per_layer + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS) as usize;
-        let (mut a0, mut blk, mut ok) = (0u32, 0u32, 0u32);
-        let mut blk_ids = String::new();
-        for k in 0..8usize {
-          let layer = k as u32 * gpu.readback_step;
-          let ibase = 64 + k * texels_per_layer;
-          let mb = meta_base + k * (PROBES_PER_LAYER_AXIS as usize * META_ROW_WORDS);
-          for p in 0..PROBES_PER_LAYER as usize {
-            let age = (word(
-              mb + (p / PROBES_PER_LAYER_AXIS as usize) * META_ROW_WORDS
-                + (p % PROBES_PER_LAYER_AXIS as usize),
-            ) >> META_AGE_SHIFT)
-              & 0xFF;
-            if age == 0 {
-              a0 += 1;
-              continue;
-            }
-            let px = p % PROBES_PER_LAYER_AXIS as usize;
-            let py = p / PROBES_PER_LAYER_AXIS as usize;
-            let mut nz = false;
-            'scan: for ty in 0..IRRADIANCE_TEXELS as usize {
-              let row = ibase + (((py * 8 + ty) * IRRADIANCE_LAYER_TEXELS as usize) + px * 8) * 2;
-              for tx in 0..IRRADIANCE_TEXELS as usize {
-                if word(row + tx * 2) != 0 || word(row + tx * 2 + 1) != 0 {
-                  nz = true;
-                  break 'scan;
-                }
-              }
-            }
-            if nz {
-              ok += 1;
-            } else {
-              blk += 1;
-              if blk <= 8 {
-                blk_ids.push_str(&format!(
-                  " {}@{}",
-                  layer as u32 * PROBES_PER_LAYER + p as u32,
-                  age
-                ));
-              }
-            }
-          }
-        }
-        drop(data);
-        gpu.readback.unmap();
-        gpu.readback_state = 0;
-        let line = format!(
-          "DDGI readback: frame={} dispatch0={} indirect0={} wl=[{},{},{},{}] irr:{summary} depth0_lt8k:{} census: a0={a0} blk={blk} ok={ok} blk_ids:[{blk_ids}]",
-          gpu.frame, count, indirect0, wl[0], wl[1], wl[2], wl[3], dep_lt,
-        );
-        bevy::log::info!("{}", line);
-      }
-    }
-    _ => {
-      if gpu.frame % 120 == 0 {
-        {
-          let encoder = ctx.command_encoder();
-          encoder.copy_buffer_to_buffer(&gpu.dispatch, 0, &gpu.readback, 0, 16);
-          encoder.copy_buffer_to_buffer(&gpu.indirect, 0, &gpu.readback, 16, 16);
-          encoder.copy_buffer_to_buffer(&gpu.worklist, 0, &gpu.readback, 32, 64);
-          let step = DDGI_TOTAL_LAYERS / 8;
-          gpu.readback_step = step;
-          for k in 0..8u32 {
-            encoder.copy_texture_to_buffer(
-              TexelCopyTextureInfo {
-                texture: &gpu.irr_next,
-                mip_level: 0,
-                origin: Origin3d {
-                  x: 0,
-                  y: 0,
-                  z: k * step,
-                },
-                aspect: TextureAspect::All,
-              },
-              TexelCopyBufferInfo {
-                buffer: &gpu.readback,
-                layout: TexelCopyBufferLayout {
-                  offset: 256
-                    + (k as u64) * (IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64,
-                  bytes_per_row: Some(IRRADIANCE_LAYER_TEXELS * 8),
-                  rows_per_image: Some(IRRADIANCE_LAYER_TEXELS),
-                },
-              },
-              Extent3d {
-                width: IRRADIANCE_LAYER_TEXELS,
-                height: IRRADIANCE_LAYER_TEXELS,
-                depth_or_array_layers: 1,
-              },
-            );
-          }
-          encoder.copy_texture_to_buffer(
-            TexelCopyTextureInfo {
-              texture: &gpu.depth_next,
-              mip_level: 0,
-              origin: Origin3d::ZERO,
-              aspect: TextureAspect::All,
-            },
-            TexelCopyBufferInfo {
-              buffer: &gpu.readback,
-              layout: TexelCopyBufferLayout {
-                offset: 256 + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64,
-                bytes_per_row: Some(DEPTH_LAYER_TEXELS * 4),
-                rows_per_image: Some(DEPTH_LAYER_TEXELS),
-              },
-            },
-            Extent3d {
-              width: DEPTH_LAYER_TEXELS,
-              height: DEPTH_LAYER_TEXELS,
-              depth_or_array_layers: 1,
-            },
-          );
-          for k in 0..8u32 {
-            encoder.copy_texture_to_buffer(
-              TexelCopyTextureInfo {
-                texture: &gpu.meta_next,
-                mip_level: 0,
-                origin: Origin3d {
-                  x: 0,
-                  y: 0,
-                  z: k * step,
-                },
-                aspect: TextureAspect::All,
-              },
-              TexelCopyBufferInfo {
-                buffer: &gpu.readback,
-                layout: TexelCopyBufferLayout {
-                  offset: 256
-                    + (8 * IRRADIANCE_LAYER_TEXELS * IRRADIANCE_LAYER_TEXELS * 8) as u64
-                    + (DEPTH_LAYER_TEXELS * DEPTH_LAYER_TEXELS * 4) as u64
-                    + (k as u64) * (META_COPY_BPR as u64 * PROBES_PER_LAYER_AXIS as u64),
-                  bytes_per_row: Some(META_COPY_BPR),
-                  rows_per_image: Some(PROBES_PER_LAYER_AXIS),
-                },
-              },
-              Extent3d {
-                width: PROBES_PER_LAYER_AXIS,
-                height: PROBES_PER_LAYER_AXIS,
-                depth_or_array_layers: 1,
-              },
-            );
-          }
-        }
-        gpu.readback_state = 1;
-      }
-    }
-  }
+  // 阶段二 cast / 阶段三 collect 待接入：seal 已在 indirect buffer 备好 per-LOD
+  // dispatch 参数（offset 0 = cast×4 LOD，offset 64 = collect×4 LOD）与 rpp（offset 128）。
 }
 
 fn extract_ddgi_settings(
@@ -934,6 +644,13 @@ fn prepare_ddgi(
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
 
+  // 每帧清零活跃计数器（indirect words [36..40)）；indirect args 由 seal 当帧覆写。
+  queue.write_buffer(
+    &gpu.indirect,
+    DDGI_COUNTER_CLEAR_OFFSET,
+    &[0u8; DDGI_COUNTER_CLEAR_BYTES as usize],
+  );
+
   let bg4_layout = pipeline_cache.get_bind_group_layout(&ddgi_bg4_layout());
   let bg4 = device.create_bind_group(
     None,
@@ -946,9 +663,8 @@ fn prepare_ddgi(
       &gpu.depth_next_view,
       &gpu.meta_prev_view,
       &gpu.meta_next_view,
-      gpu.dispatch.as_entire_binding(),
+      gpu.indirect.as_entire_binding(),
       gpu.objects.as_entire_binding(),
-      gpu.samples.as_entire_binding(),
       gpu.worklist.as_entire_binding(),
       gpu.slot_pos.as_entire_binding(),
     )),
