@@ -274,7 +274,6 @@ impl VolumeGrid {
     tree.get_uniform(local.x, local.y, local.z, level)
   }
 
-  /// brick 三态查询（DDGI 探针烘焙）：chunk 缺失 = 无限空气 = Air
   pub fn get_brick_state(&self, voxel: VoxelCoord, level: u8) -> crate::chunk_tree::BrickState {
     use crate::chunk_tree::BrickState;
     let chunk = voxel.chunk();

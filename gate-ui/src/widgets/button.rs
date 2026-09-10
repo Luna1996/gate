@@ -1,4 +1,4 @@
-//! button：三变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
+﻿//! button：三变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
 //!
 //! 变体（docs/ui-dark-theme.md §5.2）：
 //! - [`ButtonVariant::Primary`]：强调填充（主操作）
@@ -15,7 +15,7 @@ use bevy::prelude::*;
 use bevy::ui::widget::Button;
 use bevy::ui::{FocusPolicy, Interaction, UiTransform};
 
-use super::{UiCtx, color_of, px, spawn_label};
+use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
 
 /// 按钮点击事件（EntityEvent，target = 按钮实体）。
@@ -60,41 +60,51 @@ impl From<ButtonHandle> for Entity {
   }
 }
 
-/// 按钮配置（全部字段进 Config；Default = 空文本 + Primary）
+/// 按钮配置（全部字段进 Config；Default = 空文本 + Primary、不禁用）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ButtonConfig {
   pub text: String,
   pub variant: ButtonVariant,
+  /// true = 禁用态：不响应点击、不缩放、配色暗一档
+  pub disabled: bool,
 }
 
 /// 主题按钮（文本子标签；变体由 [`ButtonConfig::variant`] 决定）
 pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, config: ButtonConfig) -> ButtonHandle {
   let m = &ctx.theme.metrics;
   let (bg, border, text_color) = variant_colors(ctx.theme, config.variant, Interaction::None);
-  let e = parent
-    .spawn((
-      Name::new("ui-button"),
-      Button,
-      config.variant,
-      Interaction::default(),
-      InteractionPrev::default(),
-      Node {
-        padding: UiRect {
-          left: px(m.spacing.md),
-          right: px(m.spacing.md),
-          top: px(m.spacing.sm),
-          bottom: px(m.spacing.sm),
-        },
-        border: UiRect::all(px(m.border_width)),
-        align_items: AlignItems::Center,
-        justify_content: JustifyContent::Center,
-        ..default()
+  let (bg, border, text_color) = if config.disabled {
+    (dim_color(bg), dim_color(border), dim_color(text_color))
+  } else {
+    (bg, border, text_color)
+  };
+  let mut ec = parent.spawn((
+    Name::new("ui-button"),
+    Button,
+    config.variant,
+    Interaction::default(),
+    InteractionPrev::default(),
+    Node {
+      padding: UiRect {
+        left: px(m.spacing.md),
+        right: px(m.spacing.md),
+        top: px(m.spacing.sm),
+        bottom: px(m.spacing.sm),
       },
-      BackgroundColor(bg),
-      BorderColor::all(border),
-      UiTransform::default(),
-      FocusPolicy::Block,
-    ))
+      border: UiRect::all(px(m.border_width)),
+      align_items: AlignItems::Center,
+      justify_content: JustifyContent::Center,
+      ..default()
+    },
+    BackgroundColor(bg),
+    BorderColor::all(border),
+    UiTransform::default(),
+    FocusPolicy::Block,
+  ));
+  if config.disabled {
+    ec.insert(UiDisabled);
+  }
+  let e = ec
     .with_children(|b| {
       spawn_label(ctx, b, config.text, m.font_size.md, text_color);
     })
@@ -165,9 +175,12 @@ type ButtonQuery = (
   &'static mut UiTransform,
   &'static ButtonVariant,
   &'static Children,
+  Has<UiDisabled>,
 );
 
 /// 按钮状态机：hover/pressed 视觉 + 按压缩放 + 释放触发 UiClick（每帧重算）
+///
+/// Disabled 态：跳过 click、忽略 Interaction（配色恒为 None 态并降亮）、不缩放。
 ///
 /// 注意必须 With<Button>：0.19 中 Node require BackgroundColor，所有 UI 节点都带
 /// 该组件；无过滤会把 checkbox 行等带 Interaction 的节点也刷成按钮配色。
@@ -178,7 +191,35 @@ pub fn button_state_system(
   mut q_text: Query<&mut TextColor>,
 ) {
   let Some(theme) = theme else { return };
-  for (e, inter, mut prev, mut bg, mut border, mut ui_t, variant, children) in &mut q {
+  for (e, inter, mut prev, mut bg, mut border, mut ui_t, variant, children, disabled) in &mut q {
+    if disabled {
+      // Disabled：恒为 None 态配色 + 降亮；不发 click、不缩放
+      let (target_bg, target_border, target_text) =
+        variant_colors(&theme, *variant, Interaction::None);
+      let target_bg = dim_color(target_bg);
+      let target_border = dim_color(target_border);
+      let target_text = dim_color(target_text);
+      if bg.0 != target_bg {
+        bg.0 = target_bg;
+      }
+      let target_border = BorderColor::all(target_border);
+      if *border != target_border {
+        *border = target_border;
+      }
+      if (ui_t.scale.x - 1.0).abs() > f32::EPSILON {
+        ui_t.scale = Vec2::splat(1.0);
+      }
+      for child in children.iter() {
+        if let Ok(mut tc) = q_text.get_mut(child) {
+          if tc.0 != target_text {
+            tc.0 = target_text;
+          }
+        }
+      }
+      // 重置 prev 避免 re-enable 瞬间误触发 click
+      prev.0 = Interaction::None;
+      continue;
+    }
     // click = 在按钮上按下并释放（拖出后释放视为取消）
     if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
       commands.trigger(UiClick { entity: e });

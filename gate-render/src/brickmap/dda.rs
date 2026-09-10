@@ -169,8 +169,6 @@ pub struct DdaViewUniform {
   pub debug_mode: Vec4,
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（GATE_NO_LOD=1 关）
   pub lod: Vec4,
-  /// 探针可视化参数：x = 总槽数（DDGI_TOTAL_SLOTS=16384），y = 方块边长(px)，
-  /// z = 层级选择（0=全部，1..=4=LOD0..3），w 保留
   pub probe_viz_params: Vec4,
 }
 
@@ -241,7 +239,6 @@ impl DdaViewUniform {
         *BEAM_DISABLED as u32 as f32,
         *LUT_DISABLED as u32 as f32, // w = 1 → shader 旁路方向掩码剔除
       ),
-      // probe_viz_params 在 prepare_dda_bind_groups 中覆写（DDGI_TOTAL_SLOTS 固定槽数）
       probe_viz_params: Vec4::ZERO,
     }
   }
@@ -2387,11 +2384,7 @@ pub(crate) fn init_dda_pipelines(
   );
 
   // ---- Compute pipeline：dda.wgsl 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
-  // Devlog 23：hashmap 光照链（vis_table/direct/gi/denoise）与 DDGI 探针更新 pass 已全部
-  // 拆除，两入口仅绑 BG0-3（输出+view/brickmap/grid_descs/光池）。
   let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
-  // R3-10 M4-2：dda_main/beam 布局加 BG4（DDGI 资源）——dda_main 命中着色采样
-  // ddgi_sample（间接项），beam 不用但同布局须全量绑定
   let layouts = vec![
     bg0.clone(),
     bg1.clone(),
@@ -2414,7 +2407,6 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
-  // probe 可视化 pass：每探针一线程，投影到屏幕画黄色方块（BG0 写 out_tex + BG4 读 positions）
   let probe_viz = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_probe_viz")),
     layout: layouts,
@@ -2676,15 +2668,9 @@ pub(crate) fn dispatch_dda(
     );
   }
 
-  // ---- probe 可视化 pass：探针位置画黄色方块（toggle 开时执行）----
-  // 每槽 1 线程：活跃过滤（meta age）+ 视锥剔除 + 遮挡射线（复用 trace_scene，
-  // 本 pass 已绑定全部 bind group）→ 仅屏幕内可见探针画方块。
-  // 注：probe_viz 是独立调试开关，有意不与 DDGI 档位联动（档位 0 时 meta 冻结，
-  // 仍可可视化冻结状态用于排查）。
   if dbg.map_or(false, |d| d.probe_viz) {
     if gpu.is_some() {
       if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
-        // 新架构：固定 16384 槽（4 LOD × 4096），viz 逐槽读 meta/slot_pos 现算坐标
         let probe_count = crate::ddgi::DDGI_TOTAL_SLOTS;
         crate::profiler::gpu_compute_pass(
           &mut profiler,

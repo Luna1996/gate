@@ -168,8 +168,7 @@ mod tests {
 
   #[test]
   fn level_2_brick_aligns() {
-    // level 2 = 16³ = gate cell = DDGI probe cell
-    let v = VoxelCoord::new(256 + 16 * 3 + 5, 0, 0); // chunk (1,0,0), x = 53
+    let v = VoxelCoord::new(256 + 16 * 3 + 5, 0, 0);
     let (chunk, bx, by, bz) = v.to_level_brick(2);
     assert_eq!(chunk, ChunkCoord::new(1, 0, 0));
     assert_eq!(bx, 3);

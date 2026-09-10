@@ -83,6 +83,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
           tabs: vec!["组件".into(), "数据".into()],
           active: 0,
           fit_content: false,
+          ..default()
         },
       );
       // ---- tab 0：组件展示 ----
@@ -104,6 +105,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "UI 组件展示".into(),
                 style: LabelStyle::Title,
+                ..default()
               },
             );
             label(
@@ -112,6 +114,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "gate-ui widget showcase".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
 
@@ -122,6 +125,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "buttons".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             root
@@ -151,6 +155,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                   ButtonConfig {
                     text: "secondary".into(),
                     variant: ButtonVariant::Secondary,
+                    ..default()
                   },
                 );
                 row
@@ -163,6 +168,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                   ButtonConfig {
                     text: "ghost".into(),
                     variant: ButtonVariant::Ghost,
+                    ..default()
                   },
                 );
                 row
@@ -177,6 +183,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               ButtonConfig {
                 text: "danger / destructive".into(),
                 variant: ButtonVariant::Danger,
+                ..default()
               },
             );
             root
@@ -191,6 +198,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "checkbox".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             let cb1 = checkbox(
@@ -199,6 +207,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               CheckboxConfig {
                 text: Some("选项 A（默认勾选）".into()),
                 checked: true,
+                ..default()
               },
             );
             root
@@ -211,6 +220,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               CheckboxConfig {
                 text: Some("选项 B".into()),
                 checked: false,
+                ..default()
               },
             );
             root
@@ -225,6 +235,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "slider（0..100, step 5）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             root
@@ -245,6 +256,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                     max: 100.0,
                     value: 40.0,
                     step: Some(5.0),
+                    ..default()
                   },
                 );
                 {
@@ -271,6 +283,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "plot（折线 + 纵轴标签）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             let p = plot(
@@ -297,6 +310,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "list / RingList（事件日志，cap 6）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             let inner_panel = panel(
@@ -336,6 +350,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                   LabelConfig {
                     text: "success".into(),
                     style: LabelStyle::Success,
+                    ..default()
                   },
                 );
                 label(
@@ -344,6 +359,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                   LabelConfig {
                     text: "warning".into(),
                     style: LabelStyle::Warning,
+                    ..default()
                   },
                 );
                 label(
@@ -352,6 +368,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                   LabelConfig {
                     text: "danger".into(),
                     style: LabelStyle::Danger,
+                    ..default()
                   },
                 );
                 label(
@@ -360,6 +377,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                   LabelConfig {
                     text: "accent".into(),
                     style: LabelStyle::Accent,
+                    ..default()
                   },
                 );
               });
@@ -371,6 +389,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "faint: lg 18px only".into(),
                 style: LabelStyle::FaintLg,
+                ..default()
               },
             );
 
@@ -381,6 +400,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "splitter（分割线）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             // 父为 Column → 横线
@@ -421,6 +441,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "grid（3 列，格线十字连通）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             let g = grid(
@@ -459,6 +480,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "scroll view（滚轮滚动）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             let sv = scroll_view(ctx, root, ScrollConfig { height: px(120.0) });
@@ -499,6 +521,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "数据展示".into(),
                 style: LabelStyle::Title,
+                ..default()
               },
             );
             label(
@@ -507,6 +530,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               LabelConfig {
                 text: "table（表头 + 斑马纹）".into(),
                 style: LabelStyle::Muted,
+                ..default()
               },
             );
             table(

@@ -74,6 +74,29 @@ use bevy::ui::widget::Label;
 
 use crate::theme::{HexColor, UiTheme};
 
+/// Disabled 态标记组件。挂在 widget 根节点上表示该控件不可交互、视觉暗一档。
+///
+/// 各 widget 状态机统一约定：检测到 `UiDisabled` 时跳过交互逻辑（不发事件、
+/// 不翻转状态），并把当前配色经 [`dim_color`] 降亮后输出。
+#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UiDisabled;
+
+/// Disabled 态降亮系数：RGB 通道乘以此值，保持 alpha。
+/// 0.55 给出清晰的"灰化"观感，与主题 5 层表面的亮度差相当（约暗一档）。
+const DISABLED_DIM: f32 = 0.55;
+
+/// 将颜色暗一档（disabled 态通用）：线性空间下 RGB 乘 [`DISABLED_DIM`]，alpha 不变。
+///
+/// 用线性空间而非 sRGB 直接相乘，保证感知亮度均匀下降（sRGB 直接乘会偏暗）。
+pub fn dim_color(color: Color) -> Color {
+  let lin = color.to_linear();
+  let mut v = lin.to_vec4();
+  v[0] *= DISABLED_DIM;
+  v[1] *= DISABLED_DIM;
+  v[2] *= DISABLED_DIM;
+  Color::linear_rgba(v[0], v[1], v[2], v[3])
+}
+
 /// spawn 上下文：主题令牌 + 字体（None → SystemUi 系统字体）
 pub struct UiCtx<'a> {
   pub theme: &'a UiTheme,

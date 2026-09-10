@@ -23,7 +23,7 @@ use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, Interaction};
 
 use super::button::InteractionPrev;
-use super::{UiCtx, color_of, px, spawn_label};
+use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
 
 /// 标签页状态（挂在 root 节点上）
@@ -72,7 +72,7 @@ impl Deref for TabViewHandle {
   }
 }
 
-/// 标签页配置（全部字段进 Config；Default = 空 tabs、初始选中 0、填充模式）
+/// 标签页配置（全部字段进 Config；Default = 空 tabs、初始选中 0、填充模式、无禁用 tab）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TabConfig {
   /// 标签名列表
@@ -86,6 +86,9 @@ pub struct TabConfig {
   ///   隐藏页 Absolute 脱流不占位——切页时面板高度随活动页内容变化。
   ///   页内不可放 Percent(100%) 高的 scroll_view（auto 高度下解析为 0）
   pub fit_content: bool,
+  /// 禁用的 tab 下标列表：这些 tab 不可点击切换、配色暗一档。
+  /// 若当前 active 恰在禁用列表中，仍显示其内容（禁用只阻止切换，不强制切走）。
+  pub disabled_tabs: Vec<usize>,
 }
 
 /// 创建标签页。
@@ -133,47 +136,52 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
         .with_children(|bar| {
           for (i, name) in config.tabs.iter().enumerate() {
             let is_active = i == active;
-            bar
-              .spawn((
-                Name::new(format!("ui-tab-{i}")),
-                TabButton { index: i },
-                Interaction::default(),
-                InteractionPrev::default(),
-                Node {
-                  padding: UiRect {
-                    left: px(m.spacing.md),
-                    right: px(m.spacing.md),
-                    top: px(m.spacing.sm),
-                    bottom: px(m.spacing.sm),
-                  },
-                  border: UiRect::bottom(px(if is_active { 2.0 } else { 0.0 })),
-                  ..default()
+            let is_disabled = config.disabled_tabs.contains(&i);
+            let mut tab_ec = bar.spawn((
+              Name::new(format!("ui-tab-{i}")),
+              TabButton { index: i },
+              Interaction::default(),
+              InteractionPrev::default(),
+              Node {
+                padding: UiRect {
+                  left: px(m.spacing.md),
+                  right: px(m.spacing.md),
+                  top: px(m.spacing.sm),
+                  bottom: px(m.spacing.sm),
                 },
-                BackgroundColor(if is_active {
-                  color_of(&c.surface_elevated)
-                } else {
-                  Color::NONE
-                }),
-                BorderColor::all(if is_active {
+                border: UiRect::bottom(px(if is_active { 2.0 } else { 0.0 })),
+                ..default()
+              },
+              BackgroundColor(if is_active {
+                color_of(&c.surface_elevated)
+              } else {
+                Color::NONE
+              }),
+              BorderColor::all(if is_active {
+                color_of(&c.text_primary)
+              } else {
+                Color::NONE
+              }),
+              FocusPolicy::Block,
+            ));
+            if is_disabled {
+              tab_ec.insert(UiDisabled);
+            }
+            tab_ec.with_children(|tab| {
+              spawn_label(
+                ctx,
+                tab,
+                name.clone(),
+                m.font_size.sm,
+                if is_active {
                   color_of(&c.text_primary)
+                } else if is_disabled {
+                  dim_color(color_of(&c.text_muted))
                 } else {
-                  Color::NONE
-                }),
-                FocusPolicy::Block,
-              ))
-              .with_children(|tab| {
-                spawn_label(
-                  ctx,
-                  tab,
-                  name.clone(),
-                  m.font_size.sm,
-                  if is_active {
-                    color_of(&c.text_primary)
-                  } else {
-                    color_of(&c.text_muted)
-                  },
-                );
-              });
+                  color_of(&c.text_muted)
+                },
+              );
+            });
           }
         });
       // ---- content container ----
@@ -242,11 +250,24 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
 }
 
 /// 标签页状态机：点击 tab 切换 active（触发 [`TabChanged`]）+ tab 视觉 + content 可见性
+///
+/// Disabled tab（带 [`UiDisabled`]）：跳过点击切换、配色降亮一档；若 active 恰为
+/// 禁用 tab，仍显示其内容（禁用只阻止切换，不强制切走）。
 pub fn tab_view_system(
   mut commands: Commands,
   mut q_views: Query<(Entity, &mut TabView, &Children)>,
-  mut q_tab: Query<(&TabButton, &Interaction, &mut InteractionPrev)>,
-  mut q_tab_node: Query<(&mut BackgroundColor, &mut BorderColor, &Children)>,
+  mut q_tab: Query<(
+    &TabButton,
+    &Interaction,
+    &mut InteractionPrev,
+    Has<UiDisabled>,
+  )>,
+  mut q_tab_node: Query<(
+    &mut BackgroundColor,
+    &mut BorderColor,
+    &Children,
+    Has<UiDisabled>,
+  )>,
   mut q_tab_text: Query<&mut TextColor>,
   q_children: Query<&Children>,
   mut q_content: Query<(&TabContent, &mut Visibility, &mut Node)>,
@@ -270,10 +291,11 @@ pub fn tab_view_system(
 
     // 阶段 1：检测点击，更新 active（需要 mut InteractionPrev）
     for tab_e in bar_children.iter() {
-      let Ok((tab_btn, inter, mut prev)) = q_tab.get_mut(tab_e) else {
+      let Ok((tab_btn, inter, mut prev, disabled)) = q_tab.get_mut(tab_e) else {
         continue;
       };
-      if prev.0 == Interaction::Pressed
+      if !disabled
+        && prev.0 == Interaction::Pressed
         && *inter == Interaction::Hovered
         && view.active != tab_btn.index
       {
@@ -288,14 +310,14 @@ pub fn tab_view_system(
 
     // 阶段 2：更新 tab 视觉（只读 InteractionPrev，写 BackgroundColor/BorderColor/TextColor）
     for tab_e in bar_children.iter() {
-      let Ok((tab_btn, inter, _)) = q_tab.get(tab_e) else {
+      let Ok((tab_btn, inter, _, _)) = q_tab.get(tab_e) else {
         continue;
       };
       let is_active = tab_btn.index == view.active;
-      let hovered = *inter != Interaction::None;
-      let Ok((mut bg, mut bc, tab_children)) = q_tab_node.get_mut(tab_e) else {
+      let Ok((mut bg, mut bc, tab_children, disabled)) = q_tab_node.get_mut(tab_e) else {
         continue;
       };
+      let hovered = !disabled && *inter != Interaction::None;
       let target_bg = if is_active {
         color_of(&c.surface_elevated)
       } else if hovered {
@@ -303,11 +325,21 @@ pub fn tab_view_system(
       } else {
         Color::NONE
       };
+      let target_bg = if disabled && target_bg != Color::NONE {
+        dim_color(target_bg)
+      } else {
+        target_bg
+      };
       bg.0 = target_bg;
       let target_border = if is_active {
         color_of(&c.text_primary)
       } else {
         Color::NONE
+      };
+      let target_border = if disabled && target_border != Color::NONE {
+        dim_color(target_border)
+      } else {
+        target_border
       };
       *bc = BorderColor::all(target_border);
       let text_color = if is_active {
@@ -316,6 +348,11 @@ pub fn tab_view_system(
         color_of(&c.text_body)
       } else {
         color_of(&c.text_muted)
+      };
+      let text_color = if disabled {
+        dim_color(text_color)
+      } else {
+        text_color
       };
       for child in tab_children.iter() {
         if let Ok(mut tc) = q_tab_text.get_mut(child) {
@@ -362,6 +399,7 @@ mod tests {
       tabs: vec!["a".into(), "b".into()],
       active: 0,
       fit_content: false,
+      ..default()
     }
   }
 
@@ -494,6 +532,7 @@ mod tests {
           tabs: vec!["a".into(), "b".into()],
           active: 0,
           fit_content: true,
+          ..default()
         },
       ));
     });

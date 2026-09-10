@@ -46,11 +46,6 @@ fn pack_pal_lod(palette: u8, lod: u8) -> u32 {
   palette as u32 | ((lod as u32) << 8)
 }
 
-/// brick 三态（R3-10 DDGI 探针烘焙：cell 16³ = level 2 brick）
-///
-/// `get_uniform` 的 `None` 语义同时涵盖「uniform 空气」与「含空气混合」，
-/// 探针烘焙需要区分 Air（居中放探针）/ Solid（无探针）/ Mixed（BFS 找最大空叶），
-/// 故单独提供三态查询。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrickState {
   /// 整 brick 空气（palette 0）
@@ -324,10 +319,6 @@ impl ChunkTree {
     self.get_uniform_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
   }
 
-  /// brick 三态查询（DDGI 探针烘焙）：Air / Solid(palette) / Mixed
-  ///
-  /// `local_*` = chunk 内 fine 坐标（brick 最小角），`level` ∈ 0..5 对应
-  /// `LEVEL_EXTENT` = [256, 64, 16, 4, 1]。
   pub fn get_brick_state(&self, local_x: i32, local_y: i32, local_z: i32, level: u8) -> BrickState {
     let query_extent = LEVEL_EXTENT[level as usize];
     if self.nodes.is_empty() {
@@ -996,7 +987,6 @@ mod tests {
     assert_eq!(t.get_voxel(5, 5, 5), None);
   }
 
-  /// R3-10 DDGI：三态查询（get_uniform 的 None 无法区分 Air/Mixed，此处锁语义）
   #[test]
   fn brick_state_three_way() {
     // 空 chunk = Air（各级一致）

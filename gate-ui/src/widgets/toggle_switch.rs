@@ -1,4 +1,4 @@
-//! toggle_switch：滑动开关（docs/ui-dark-theme.md §5.3 选中态语义）。
+﻿//! toggle_switch：滑动开关（docs/ui-dark-theme.md §5.3 选中态语义）。
 //!
 //! 复用 `Checked` presence 语义（与 checkbox 一致）：有 `Checked` = 开，无 = 关。
 //!
@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, Interaction};
 
 use super::button::InteractionPrev;
-use super::{UiCtx, color_of, px, spawn_label};
+use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
 use bevy::ui::Checked;
 
@@ -49,11 +49,13 @@ impl From<ToggleSwitchHandle> for Entity {
   }
 }
 
-/// 开关配置（Default = 无文本、关）
+/// 开关配置（Default = 无文本、关、不禁用）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToggleSwitchConfig {
   pub text: Option<String>,
   pub checked: bool,
+  /// true = 禁用态：不响应点击翻转、配色暗一档（开关状态仍可见）
+  pub disabled: bool,
 }
 
 /// 开关状态变化事件（用户点击翻转时触发；EntityEvent，target = 根实体）。
@@ -73,6 +75,18 @@ pub fn toggle_switch(
 ) -> ToggleSwitchHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
+  let track_bg = color_of(&c.surface_elevated);
+  let track_border = color_of(&c.border);
+  let knob_off = color_of(&c.text_muted);
+  let (track_bg, track_border, knob_off) = if config.disabled {
+    (
+      dim_color(track_bg),
+      dim_color(track_border),
+      dim_color(knob_off),
+    )
+  } else {
+    (track_bg, track_border, knob_off)
+  };
   let mut ec = parent.spawn((
     Name::new("ui-toggle-switch"),
     ToggleSwitch,
@@ -97,8 +111,8 @@ pub fn toggle_switch(
           border_radius: BorderRadius::all(px(m.corner_radius_sm)),
           ..default()
         },
-        BackgroundColor(color_of(&c.surface_elevated)),
-        BorderColor::all(color_of(&c.border)),
+        BackgroundColor(track_bg),
+        BorderColor::all(track_border),
       ))
       .with_children(|track| {
         track.spawn((
@@ -110,13 +124,22 @@ pub fn toggle_switch(
             height: px(TRACK_H - m.border_width * 2.0),
             ..default()
           },
-          BackgroundColor(color_of(&c.text_muted)),
+          BackgroundColor(knob_off),
         ));
       });
     if let Some(t) = config.text {
-      spawn_label(ctx, root, t, m.font_size.md, color_of(&c.text_body));
+      let text_color = color_of(&c.text_body);
+      let text_color = if config.disabled {
+        dim_color(text_color)
+      } else {
+        text_color
+      };
+      spawn_label(ctx, root, t, m.font_size.md, text_color);
     }
   });
+  if config.disabled {
+    ec.insert(UiDisabled);
+  }
   if config.checked {
     ec.insert(Checked);
   }
@@ -130,6 +153,7 @@ type ToggleQuery = (
   &'static mut InteractionPrev,
   Has<Checked>,
   &'static Children,
+  Has<UiDisabled>,
 );
 type TrackData = (
   &'static mut BackgroundColor,
@@ -142,6 +166,8 @@ type KnobFilter = (With<ToggleKnob>, Without<ToggleTrack>);
 
 /// 开关状态机：释放时翻转 `Checked` 并触发 [`ToggleSwitchToggled`]；
 /// 轨道/滑块配色与滑块位置跟随状态（每帧重算）
+///
+/// Disabled 态：跳过翻转逻辑，配色降亮一档，滑块位置仍按当前 checked 状态。
 pub fn toggle_switch_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -158,21 +184,23 @@ pub fn toggle_switch_state_system(
   let knob_off = color_of(&c.text_muted);
   let knob_on = color_of(&c.text_primary);
   let left_on = px(TRACK_W - TRACK_H);
-  for (e, inter, mut prev, checked, children) in &mut q {
-    // click = 按下并释放（与 button/checkbox 判定一致）
-    if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
-      if checked {
-        commands.entity(e).remove::<Checked>();
-      } else {
-        commands.entity(e).insert(Checked);
+  for (e, inter, mut prev, checked, children, disabled) in &mut q {
+    if !disabled {
+      // click = 按下并释放（与 button/checkbox 判定一致）
+      if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
+        if checked {
+          commands.entity(e).remove::<Checked>();
+        } else {
+          commands.entity(e).insert(Checked);
+        }
+        commands.trigger(ToggleSwitchToggled {
+          entity: e,
+          checked: !checked,
+        });
       }
-      commands.trigger(ToggleSwitchToggled {
-        entity: e,
-        checked: !checked,
-      });
     }
     prev.0 = *inter;
-    let hovered = *inter == Interaction::Hovered;
+    let hovered = !disabled && *inter == Interaction::Hovered;
     // 视觉：开 → 强调填充轨道 + 主色滑块；关 → 抬升轨道 + 灰滑块（hover 边框提亮）
     let (target_bg, target_border) = if checked {
       (accent, accent)
@@ -183,6 +211,15 @@ pub fn toggle_switch_state_system(
     };
     let target_left = if checked { left_on } else { px(0.0) };
     let target_knob = if checked { knob_on } else { knob_off };
+    let (target_bg, target_border, target_knob) = if disabled {
+      (
+        dim_color(target_bg),
+        dim_color(target_border),
+        dim_color(target_knob),
+      )
+    } else {
+      (target_bg, target_border, target_knob)
+    };
     for child in children.iter() {
       if let Ok((mut bg, mut bc, track_children)) = tracks.get_mut(child) {
         if bg.0 != target_bg {

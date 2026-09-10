@@ -8,7 +8,7 @@ use std::ops::Deref;
 
 use bevy::prelude::*;
 
-use super::{UiCtx, color_of, spawn_label};
+use super::{UiCtx, color_of, dim_color};
 
 /// 文本预设档：四档正文（primary/body/muted/faint）+ 四档语义色
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -70,24 +70,28 @@ impl From<LabelHandle> for Entity {
   }
 }
 
-/// 标签配置（全部字段进 Config；Default = 空文本 + Body 档）
+/// 标签配置（全部字段进 Config；Default = 空文本 + Body 档、不禁用）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LabelConfig {
   pub text: String,
   pub style: LabelStyle,
+  /// true = 禁用态：文本颜色经 [`dim_color`] 降亮一档（不可交互，纯视觉）
+  pub disabled: bool,
 }
 
 /// 主题文本标签
 pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> LabelHandle {
   let fs = &ctx.theme.metrics.font_size;
   let (size, color) = config.style.tokens();
-  let e = spawn_label(
-    ctx,
-    parent,
-    config.text,
-    size(fs),
-    color_of(&color(&ctx.theme.colors)),
-  );
+  let color = color_of(&color(&ctx.theme.colors));
+  let color = if config.disabled {
+    dim_color(color)
+  } else {
+    color
+  };
+  let e = parent
+    .spawn(super::label_bundle(ctx, config.text, size(fs), color))
+    .id();
   LabelHandle(e)
 }
 
@@ -144,6 +148,7 @@ mod tests {
         LabelConfig {
           text: "t".into(),
           style: LabelStyle::Title,
+          ..default()
         },
       ));
       got.push(*label(
@@ -152,6 +157,7 @@ mod tests {
         LabelConfig {
           text: "m".into(),
           style: LabelStyle::Muted,
+          ..default()
         },
       ));
       got.push(*label(
@@ -160,6 +166,7 @@ mod tests {
         LabelConfig {
           text: "f".into(),
           style: LabelStyle::FaintLg,
+          ..default()
         },
       ));
       got.push(*label(
@@ -168,6 +175,7 @@ mod tests {
         LabelConfig {
           text: "s".into(),
           style: LabelStyle::Success,
+          ..default()
         },
       ));
     });

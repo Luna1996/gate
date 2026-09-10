@@ -57,47 +57,34 @@ struct ShowcaseVisibilityToggle;
 #[derive(Component)]
 struct VsyncToggle;
 
-/// DDGI 阶段档位滑杆标记（0-3 吸附档位；观察者写 gate_render::ddgi::DdgiStage）
 #[derive(Component)]
 struct DdgiStageSlider;
 
-/// DDGI 阶段档位数值标签（滑杆右侧，实时显示档位名）
 #[derive(Component)]
 struct DdgiStageValueLabel;
 
-/// DDGI 调试模式按钮标记（值 = 模式 0..4，互斥单选）
 #[derive(Component)]
 struct DdgiDebugModeBtn(u8);
 
-/// DDGI 增益滑杆标记
 #[derive(Component)]
 struct DdgiGainSlider;
 
-/// DDGI 增益数值标签（滑杆右侧，实时显示当前值）
 #[derive(Component)]
 struct DdgiGainValueLabel;
 
-/// Probe Viz 开关标记（写 DdgiDebugSettings.probe_viz → 探针位置黄色方块可视化）
 #[derive(Component)]
 struct DdgiProbeVizToggle;
 
-/// Probe Viz 层级滑杆标记（写 DdgiDebugSettings.probe_viz_lod）
 #[derive(Component)]
 struct DdgiProbeVizLodSlider;
 
-/// Probe Viz 层级数值标签（滑杆右侧，实时显示当前层级名）
 #[derive(Component)]
 struct DdgiProbeVizLodValueLabel;
 
-/// Probe Viz 层级名（滑杆 stop 序：0=All 全部, 1..=4=LOD0~3；
-/// 新架构 = 4 级相机滚动 LOD 固定槽，无 base 世界级烘焙网格）
 const DDGI_PROBE_VIZ_LODS: [&str; 5] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3"];
 
-/// 调试模式名（按钮文本 + 日志用）
 const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
 
-/// DDGI 阶段档位名（slider stop 序：0=全关，1=①Active Probe，2=+②RayQuery
-/// cast/update，3=+③voxel 着色采样完整 DDGI）
 const DDGI_STAGES: [&str; 4] = ["Off", "Active", "Cast", "Full"];
 
 /// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
@@ -108,8 +95,6 @@ pub(crate) fn fps3(v: f32) -> u32 {
 /// 左上角 debug-view 面板：**固定宽度 360px、高度 auto**（随当前 Tab 页内容收缩）。
 /// TabView（fit_content 自适应高度模式）两页：
 /// - Stats：FPS 读数 / 相机信息 / VSync / UI Showcase
-/// - DDGI：阶段档位滑杆 / 调试模式按钮 / Gain 滑杆 / Probe Viz 开关 / LOD 滑杆
-///   （全部控件合并在同一个 cell 内纵向排列）
 ///
 /// 视觉：root 提供外框 + HUD 卡面底色；每页一个 grid（去外框/gap，行分割线由
 /// cell bottom border 承担，避免右侧叠成 2px）。
@@ -172,6 +157,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           tabs: vec!["Stats".into(), "DDGI".into()],
           active: 0,
           fit_content: true,
+          ..default()
         },
       );
       // ============ Tab 0：Stats ============
@@ -210,6 +196,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ToggleSwitchConfig {
                   text: Some("VSync".into()),
                   checked: true, // 默认开，与启动 present_mode=Fifo 同步
+                  ..default()
                 },
               );
               cell.world_mut().entity_mut(*t).insert(VsyncToggle);
@@ -223,6 +210,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ToggleSwitchConfig {
                   text: Some("UI Showcase".into()),
                   checked: false, // 默认隐藏 showcase，与 spawn_showcase 初始 Hidden 同步
+                  ..default()
                 },
               );
               cell
@@ -232,15 +220,12 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             });
           });
         });
-      // ============ Tab 1：DDGI 调试组 ============
       root
         .world_mut()
         .entity_mut(tv.contents[1])
         .with_children(|page| {
           let g = tab_page_grid(ctx, page);
           page.world_mut().entity_mut(g).with_children(|g| {
-            // 全部 DDGI 控件合并在同一个 cell 内纵向排列，子行间距 sm=4px：
-            // 阶段档位滑杆 / 调试模式按钮行 / Gain 滑杆行 / Probe Viz 开关 / LOD 滑杆行
             let cell = tab_cell(ctx, g);
             g.world_mut()
               .entity_mut(cell)
@@ -251,8 +236,6 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ..default()
               })
               .with_children(|cell| {
-                // -- 阶段档位滑杆（0=Off/1=Active/2=Cast/3=Full，step=1 整数吸附；
-                //    默认 0 关，与 DdgiStage::default()=OFF 同步）--
                 cell
                   .spawn((
                     Name::new("ddgi-stage-row"),
@@ -281,6 +264,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                         max: 3.0,
                         value: 0.0,
                         step: Some(1.0),
+                        ..default()
                       },
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
@@ -319,6 +303,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                         ButtonConfig {
                           text: (*name).into(),
                           variant,
+                          ..default()
                         },
                       );
                       row
@@ -356,6 +341,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                         max: 4.0,
                         value: 1.0,
                         step: Some(0.1),
+                        ..default()
                       },
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiGainSlider);
@@ -370,13 +356,13 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*vl).insert(DdgiGainValueLabel);
                   });
-                // -- Probe Viz 开关（探针位置黄色方块可视化，默认关）--
                 let t = toggle_switch(
                   &ctx,
                   cell,
                   ToggleSwitchConfig {
                     text: Some("Probe Viz".into()),
                     checked: false,
+                    ..default()
                   },
                 );
                 cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
@@ -409,6 +395,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                         max: 4.0,
                         value: 0.0,
                         step: Some(1.0),
+                        ..default()
                       },
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
@@ -475,10 +462,6 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
     },
   );
 
-  // DDGI 阶段档位滑杆 → 写 DdgiStage 主世界资源（extract 每帧拷到渲染世界）：
-  // 0=关 dispatch 早退；1=只跑 active probe 选择；2=+RayQuery cast/update；
-  // 3=+voxel 着色采样完整 GI（trace shader misc.x gi 开关）。step=1 吸附，
-  // round 后取整；同步刷新右侧 "N Name" 档位名标签
   world.add_observer(
     |ev: On<SliderValueChanged>,
      q_slider: Query<(), With<DdgiStageSlider>>,
@@ -702,7 +685,7 @@ pub(crate) fn fps_line_feed(
   let eye = orbit.eye();
   let tgt = orbit.target;
   let cam_txt = format!(
-    "CAMERA ({:.1}, {:.1}, {:.1})\nTARGET ({:.1}, {:.1}, {:.1})",
+    "CAMERA: ({:>7.1}, {:>7.1}, {:>7.1})\nTARGET: ({:>7.1}, {:>7.1}, {:>7.1})",
     eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z
   );
   if let Some(mut t) = q.p1().iter_mut().next()

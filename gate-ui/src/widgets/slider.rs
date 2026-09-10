@@ -9,7 +9,7 @@ use std::ops::Deref;
 use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, Interaction, RelativeCursorPosition};
 
-use super::{UiCtx, color_of, px};
+use super::{UiCtx, UiDisabled, color_of, dim_color, px};
 
 /// 滑杆根节点标记
 #[derive(Component, Debug, Default)]
@@ -61,13 +61,15 @@ impl From<SliderHandle> for Entity {
   }
 }
 
-/// 滑杆配置（全部字段进 Config；Default = [0,1] 连续、初值 0）
+/// 滑杆配置（全部字段进 Config；Default = [0,1] 连续、初值 0、不禁用）
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SliderConfig {
   pub min: f32,
   pub max: f32,
   pub value: f32,
   pub step: Option<f32>,
+  /// true = 禁用态：不响应拖动、配色暗一档（当前值仍显示）
+  pub disabled: bool,
 }
 
 impl Default for SliderConfig {
@@ -77,6 +79,7 @@ impl Default for SliderConfig {
       max: 1.0,
       value: 0.0,
       step: None,
+      disabled: false,
     }
   }
 }
@@ -119,85 +122,100 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
   let m = &ctx.theme.metrics;
   let v = clamp_step(config.value, config.min, config.max, config.step);
   let norm = normalize(v, config.min, config.max);
-  let e = parent
-    .spawn((
-      Name::new("ui-slider"),
-      UiSlider,
-      Interaction::default(),
-      RelativeCursorPosition::default(),
-      SliderRange {
-        min: config.min,
-        max: config.max,
-      },
-      SliderStep(config.step),
-      SliderValue(v),
-      Node {
-        min_width: px(120.0),
-        height: px(24.0),
-        align_items: AlignItems::Center,
-        // 半 thumb 水平内缩：thumb 行程端点不超出根命中矩形
-        padding: UiRect::horizontal(px(THUMB_INSET)),
-        ..default()
-      },
-      FocusPolicy::Block,
-    ))
-    .with_children(|root| {
-      // 轨道槽（抬升表面 +1 阶：surface_elevated → surface_overlay，增强与填充对比）。
-      // flex_grow 撑满内容盒（根宽 - 2*THUMB_INSET）；fill 与 thumb 均为其绝对
-      // 定位子节点，包含块 = track 边框盒
-      root
-        .spawn((
-          Name::new("ui-slider-track"),
+  let track_bg = color_of(&c.surface_overlay);
+  let fill_bg = color_of(&c.accent_fill_hover);
+  let thumb_bg = color_of(&c.surface_top);
+  let thumb_border = color_of(&c.border_strong);
+  let (track_bg, fill_bg, thumb_bg, thumb_border) = if config.disabled {
+    (
+      dim_color(track_bg),
+      dim_color(fill_bg),
+      dim_color(thumb_bg),
+      dim_color(thumb_border),
+    )
+  } else {
+    (track_bg, fill_bg, thumb_bg, thumb_border)
+  };
+  let mut ec = parent.spawn((
+    Name::new("ui-slider"),
+    UiSlider,
+    Interaction::default(),
+    RelativeCursorPosition::default(),
+    SliderRange {
+      min: config.min,
+      max: config.max,
+    },
+    SliderStep(config.step),
+    SliderValue(v),
+    Node {
+      min_width: px(120.0),
+      height: px(24.0),
+      align_items: AlignItems::Center,
+      // 半 thumb 水平内缩：thumb 行程端点不超出根命中矩形
+      padding: UiRect::horizontal(px(THUMB_INSET)),
+      ..default()
+    },
+    FocusPolicy::Block,
+  ));
+  ec.with_children(|root| {
+    // 轨道槽（抬升表面 +1 阶：surface_elevated → surface_overlay，增强与填充对比）。
+    // flex_grow 撑满内容盒（根宽 - 2*THUMB_INSET）；fill 与 thumb 均为其绝对
+    // 定位子节点，包含块 = track 边框盒
+    root
+      .spawn((
+        Name::new("ui-slider-track"),
+        Node {
+          flex_grow: 1.0,
+          height: px(TRACK_HEIGHT),
+          ..default()
+        },
+        BackgroundColor(track_bg),
+      ))
+      .with_children(|track| {
+        // 填充段（accent_fill → accent_fill_hover，提亮一阶并与 thumb 面区分；
+        // 原 accent_fill == surface_top == thumb 面色，导致填充与滑块同色不可辨）
+        track.spawn((
+          Name::new("ui-slider-fill"),
+          SliderFill,
           Node {
-            flex_grow: 1.0,
-            height: px(TRACK_HEIGHT),
+            position_type: PositionType::Absolute,
+            left: Val::ZERO,
+            top: Val::ZERO,
+            bottom: Val::ZERO,
+            width: Val::Percent(norm * 100.0),
             ..default()
           },
-          BackgroundColor(color_of(&c.surface_overlay)),
-        ))
-        .with_children(|track| {
-          // 填充段（accent_fill → accent_fill_hover，提亮一阶并与 thumb 面区分；
-          // 原 accent_fill == surface_top == thumb 面色，导致填充与滑块同色不可辨）
-          track.spawn((
-            Name::new("ui-slider-fill"),
-            SliderFill,
-            Node {
-              position_type: PositionType::Absolute,
-              left: Val::ZERO,
-              top: Val::ZERO,
-              bottom: Val::ZERO,
-              width: Val::Percent(norm * 100.0),
+          BackgroundColor(fill_bg),
+        ));
+        // 滑块（顶层表面 + 提亮边框；方形，无圆角；绝对定位：left 按值百分比，
+        // margin 左/上各负半尺寸把滑块中心钉在定位点；top:50% 相对 track 高 4px
+        // = 2px，配合 -半高 margin 实现垂直居中于 track 中心线）
+        track.spawn((
+          Name::new("ui-slider-thumb"),
+          SliderThumb,
+          Node {
+            position_type: PositionType::Absolute,
+            left: Val::Percent(norm * 100.0),
+            top: Val::Percent(50.0),
+            margin: UiRect {
+              left: px(-THUMB_SIZE / 2.0),
+              top: px(-THUMB_SIZE / 2.0),
               ..default()
             },
-            BackgroundColor(color_of(&c.accent_fill_hover)),
-          ));
-          // 滑块（顶层表面 + 提亮边框；方形，无圆角；绝对定位：left 按值百分比，
-          // margin 左/上各负半尺寸把滑块中心钉在定位点；top:50% 相对 track 高 4px
-          // = 2px，配合 -半高 margin 实现垂直居中于 track 中心线）
-          track.spawn((
-            Name::new("ui-slider-thumb"),
-            SliderThumb,
-            Node {
-              position_type: PositionType::Absolute,
-              left: Val::Percent(norm * 100.0),
-              top: Val::Percent(50.0),
-              margin: UiRect {
-                left: px(-THUMB_SIZE / 2.0),
-                top: px(-THUMB_SIZE / 2.0),
-                ..default()
-              },
-              width: px(THUMB_SIZE),
-              height: px(THUMB_SIZE),
-              border: UiRect::all(px(m.border_width)),
-              ..default()
-            },
-            BackgroundColor(color_of(&c.surface_top)),
-            BorderColor::all(color_of(&c.border_strong)),
-          ));
-        });
-    })
-    .id();
-  SliderHandle(e)
+            width: px(THUMB_SIZE),
+            height: px(THUMB_SIZE),
+            border: UiRect::all(px(m.border_width)),
+            ..default()
+          },
+          BackgroundColor(thumb_bg),
+          BorderColor::all(thumb_border),
+        ));
+      });
+  });
+  if config.disabled {
+    ec.insert(UiDisabled);
+  }
+  SliderHandle(ec.id())
 }
 
 fn normalize(v: f32, min: f32, max: f32) -> f32 {
@@ -224,10 +242,11 @@ pub fn slider_drag_system(
     &SliderRange,
     &SliderStep,
     &mut SliderValue,
+    Has<UiDisabled>,
   )>,
 ) {
-  for (e, inter, rcp, node, range, step, mut val) in &mut q {
-    if *inter != Interaction::Pressed {
+  for (e, inter, rcp, node, range, step, mut val, disabled) in &mut q {
+    if disabled || *inter != Interaction::Pressed {
       continue;
     }
     let Some(n) = rcp.normalized else { continue };
@@ -258,19 +277,30 @@ pub fn slider_drag_system(
 
 /// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px
 ///
+/// Disabled 态：滑块不放大（恒为 16px），配色由 spawn 时降亮。
+///
 /// 注意：fill 与 thumb 都是 track 的子节点（slider root 的孙节点），不能只遍历
 /// root 的直接 Children——需要下钻 track 的 Children 分别命中 SliderFill 与
 /// SliderThumb。thumb 的 `top:50% + margin-top:-半高` 垂直居中也在此同步（尺寸
 /// 随拖拽放大）。
 pub fn slider_visual_system(
-  mut q_root: Query<(&SliderValue, &SliderRange, &Interaction, &Children), With<UiSlider>>,
+  mut q_root: Query<
+    (
+      &SliderValue,
+      &SliderRange,
+      &Interaction,
+      &Children,
+      Has<UiDisabled>,
+    ),
+    With<UiSlider>,
+  >,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
   mut thumbs: Query<&mut Node, With<SliderThumb>>,
   q_track_children: Query<&Children, Without<UiSlider>>,
 ) {
-  for (val, range, inter, children) in &mut q_root {
+  for (val, range, inter, children, disabled) in &mut q_root {
     let pct = normalize(val.0, range.min, range.max) * 100.0;
-    let thumb_size = if *inter == Interaction::Pressed {
+    let thumb_size = if !disabled && *inter == Interaction::Pressed {
       THUMB_SIZE_DRAG
     } else {
       THUMB_SIZE
@@ -336,6 +366,7 @@ mod tests {
           max: 100.0,
           value: 25.0,
           step: Some(5.0),
+          ..default()
         },
       ));
     });
