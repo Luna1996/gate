@@ -93,6 +93,14 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     CAM_NEAR,
     CAM_FAR,
   ));
+  // 幽灵模式相机（camera::CameraMode = Orbit 为缺省）：起点 = 轨道眼位。
+  // 这样切到 Fly 时视野原地不动（见 camera::sync_camera_mode_switch）；
+  // 首帧该系统的 is_changed() 分支因此是幂等的，不会动初始机位。
+  commands.insert_resource(crate::camera::CameraMode::default());
+  commands.insert_resource(crate::camera::FlyCamera {
+    pos: orbit.eye(),
+    speed: crate::camera::FLY_SPEED_DEFAULT,
+  });
 
   // 诊断：打印 brickmap globals
   {

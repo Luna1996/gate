@@ -54,8 +54,6 @@ pub fn load_vox_scene(
     t0.elapsed(),
   );
 
-  paint_vox_palette(grid, &scene);
-
   // ---- 首遍：实例 AABB（gate 坐标，xform 已含 Z-up→Y-up）----
   let mut lo = IVec3::splat(i32::MAX);
   let mut hi = IVec3::splat(i32::MIN);
@@ -92,6 +90,33 @@ pub fn load_vox_scene(
       Some(bucket_instance(inst, &scene.models, offset))
     })
     .collect();
+  // ---- 几何实际引用的色号集（u32 打包：palette 在高 8 位）----
+  // .vox 文件常常声明满 255 个材质，但几何只用其中一部分。"没人引用的槽"可以安全地
+  // 让给编辑材质（gate-app/src/edit.rs 按"条目全零"认领），所以这里先算出真正的引用集，
+  // paint_vox_palette 只铺被引用的条目、其余保持全零。
+  let used_pal: [bool; 256] = per_instance
+    .par_iter()
+    .fold(
+      || [false; 256],
+      |mut acc, map| {
+        for words in map.values() {
+          for &w in words {
+            acc[((w >> 24) & 0xFF) as usize] = true;
+          }
+        }
+        acc
+      },
+    )
+    .reduce(
+      || [false; 256],
+      |mut a, b| {
+        for i in 0..256 {
+          a[i] |= b[i];
+        }
+        a
+      },
+    );
+  paint_vox_palette(grid, &scene, &used_pal);
   // 实例桶 → chunk 全局桶（文件序遍历，保持旧串行写入序）
   let mut buckets: HashMap<ChunkCoord, Vec<u32>> = HashMap::new();
   for map in per_instance {
@@ -141,9 +166,18 @@ pub fn load_vox_scene(
 }
 
 /// vox RGBA + MATL → gate palette（色号 1..=255，0 = AIR 不映射）
-fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene) {
+///
+/// **只铺几何真正引用的色号**（`used_pal`）：其余槽保持全零，正好给编辑材质当空槽
+/// （`gate-app/src/edit.rs::material_slot` 按"条目全零"认领）。
+/// .vox 文件常常声明满 255 个材质而几何只用到其中一小部分；旧实现无脑铺满 1..=255，
+/// 于是**一个空槽都不剩** —— 编辑材质只能覆盖已有材质并告警。
+fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[bool; 256]) {
   let pal = grid.palette_mut();
+  let mut painted = 0usize;
   for i in 1..=255usize {
+    if !used_pal[i] {
+      continue;
+    }
     let rgba = scene.palette.colors[i];
     let mat = &scene.materials[i];
     let mut e = PaletteEntry::default();
@@ -157,13 +191,16 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene) {
       .map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8)
       .unwrap_or(0);
     pal.set(i as u8, e);
+    painted += 1;
   }
   // 材质统计（诊断白像素：emissive 体素在直接光 + GI 射线端点都会高频贡献亮度）
   let em: Vec<u8> = (1..=255u8).filter(|&i| pal.get(i).emissive > 0).collect();
   bevy::log::info!(
-    "VOX MATERIAL: {} emissive palette indices = {:?}",
+    "VOX MATERIAL: {} emissive palette indices = {:?}（引用 {} 个色号，空槽 {} 个留给编辑材质）",
     em.len(),
-    em
+    em,
+    painted,
+    255 - painted
   );
 }
 

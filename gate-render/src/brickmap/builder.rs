@@ -206,6 +206,11 @@ impl BrickMapBuilder {
       }
     };
     self.refresh_globals();
+    // 顺带重铺 palette（256 条 × 2 字 = 2KB）：编辑材质是"用时才写进调色板"的
+    // （见 gate-app/src/edit.rs），所以 palette 必须和触发它的那次体素编辑**同一帧**上传 ——
+    // 否则新放的体素会以槽位上一任材质的颜色出现。2KB 相对被编辑 chunk 的 KB~MB 可忽略，
+    // 因此不做修订号比对，凡"真的改了东西"的 chunk 更新都带上。
+    self.write_palette(grid);
     out
   }
 

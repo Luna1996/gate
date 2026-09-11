@@ -143,6 +143,13 @@ struct Globals {
   _pad4: u32,
 }
 @group(1) @binding(3) var<uniform> g: Globals;
+// @binding(4)/(5)：光照场（Douglas #15 AO fill + 「体素即光源」发光密度 ε 共用一张纹理）。
+// 16-voxel cell 网格，**相机中心 + 世界锚定槽位**：纹素下标 = 世界 cell mod dims（见
+// `light_field_uv`），相机滚动只换新进窗口的那条带，纹素身份不整幅失效。
+// Rgba16Unorm：.rgb = 发光密度 ε、.a = AO fill；采样即硬件三线性插值
+// （Douglas 原文："a single Hardware filtered texture read"）。
+@group(1) @binding(4) var light_tex: texture_3d<f32>;
+@group(1) @binding(5) var light_samp: sampler;
 
 // --- BG2：GridDesc 数组（Phase 3 OBJ→Volume 统一；144B/entry，与 Rust GridDesc 字节一致）---
 //   主世界 = grid_descs[0]（identity 变换），物体 = grid_descs[1..N]
@@ -1009,10 +1016,99 @@ fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   return srgb_to_linear(srgb);
 }
 
+/// palette 条目的自发光强度（0..1）。word1 低字节（wire.rs `pack_palette_entry` 同布局）。
+/// 发光体素是这个世界的**光源本体**：着色时 radiance 直出，不吃方向/阴影（见 lighting.rs 注释）。
+fn palette_emissive(palette_base: u32, pal: u32) -> f32 {
+  return f32(b_palette[palette_base + pal * 2u + 1u] & 0xFFu) / 255.0;
+}
+
 // 天空纯色（miss 像素输出 + 探针射线 miss 端点；Minecraft 白天平原 #78A7FF）
 // sRGB → linear（与 palette_albedo 同空间；光照全程 linear，输出经 linear_to_srgb 还原）
 fn sky_rgb() -> vec3<f32> {
   return srgb_to_linear(light_u.sky_color.xyz);
+}
+
+// ============================================================================
+// 光照场（Douglas #15 的 AO fill + 「体素即光源」的发光密度 ε，共用一张 3D 纹理）。
+//
+// 形态与 DDGI 级联同构，因此是可流式的：
+//   · cell = LIGHT_FIELD_CELL 体素（= Douglas #15 的 16³ 填充率网格），dims = 32³
+//   · 原点 = align_down(相机 − dims/2·cell, cell)：相机恒在盒中心（偏差 < 1 cell）
+//   · 槽位 = 世界 cell mod dims（**世界锚定**）：相机滚动只换「新进窗口那条带」的纹素，
+//     其余纹素保持自己的世界身份 → 纹素不会因相机移动而整幅失效
+// 与 Rust `brickmap/upload.rs::light_field_origin_cell` 是同一个式子，必须逐字一致。
+// ============================================================================
+const LIGHT_FIELD_CELL: f32 = 16.0;
+const LIGHT_FIELD_DIM: i32 = 32;
+/// 场窗口原点（世界 voxel，按 cell 对齐；相机恒在盒中心）。
+fn light_field_origin_voxel() -> vec3<f32> {
+  let half = f32(LIGHT_FIELD_DIM / 2) * LIGHT_FIELD_CELL;
+  return floor((view_u.cam_pos_voxel.xyz - vec3<f32>(half)) / LIGHT_FIELD_CELL) * LIGHT_FIELD_CELL;
+}
+/// 世界 voxel 位置 → 光照场纹理 uv。
+/// 连续 cell 坐标卷绕到 [0, dim) 后归一化。纹素 c 存的是**整个 cell** [16c, 16c+16) 的
+/// 均值（CPU tally 如此），故采样位置取 `r` 本身：cell 中心（r = c+0.5）恰好落在纹素 c 的
+/// 中心（硬件三线性在此取到纹素原值），cell 边界处才与相邻纹素各半 —— 与 tally 语义一致。
+fn light_field_uv(p_voxel: vec3<f32>) -> vec3<f32> {
+  let d = vec3<f32>(f32(LIGHT_FIELD_DIM));
+  let cc = p_voxel / LIGHT_FIELD_CELL;
+  let r = cc - floor(cc / d) * d;
+  return r / d;
+}
+/// 点是否落在场窗口内。窗口外不采样：环面卷绕会把远处几何映到错误纹素。
+fn light_field_contains(p_voxel: vec3<f32>) -> bool {
+  let rel = p_voxel - light_field_origin_voxel();
+  let s = vec3<f32>(f32(LIGHT_FIELD_DIM) * LIGHT_FIELD_CELL);
+  return all(rel >= vec3<f32>(0.0)) && all(rel < s);
+}
+/// AO（Douglas #15）：只作用于**间接**部分（常量天光 + GI），直射太阳由阴影负责。
+/// 模型：平面上以该点为中心的球（这里是 16³ 块）恰好一半实体 → 不压暗；
+/// 地板与墙的夹角处 ≈ 3/4 实体 → 按超出 50% 的部分压暗。
+const AO_GAIN: f32 = 2.0;
+fn light_field_ao(p_voxel: vec3<f32>, obj_id: i32) -> f32 {
+  if (obj_id >= 0) { return 1.0; }
+  if (!light_field_contains(p_voxel)) { return 1.0; }
+  let fill = textureSampleLevel(light_tex, light_samp, light_field_uv(p_voxel), 0.0).a;
+  return clamp(1.0 - (fill - 0.5) * AO_GAIN, 0.0, 1.0);
+}
+/// 发光密度 ε（0..1，= cell 内 Σ 发光强度 / cell 体积）。
+fn light_field_emit(p_voxel: vec3<f32>) -> vec3<f32> {
+  return textureSampleLevel(light_tex, light_samp, light_field_uv(p_voxel), 0.0).rgb;
+}
+/// cast 射线**沿程累加**发光（「体素即光源」在 GI 传输侧的接法）。
+///
+/// 为什么必须按体积聚合：单个发光体素 2cm，射线在 32cm 探针间距下命中它的概率 ~3e-5
+/// （rpp=10 时约每 3000 帧一次）—— 逐体素求交在采样上不可行。这里把 cell 的发光摊成
+/// **密度** ε 并沿程积分 radiance += ε·ΔL（功率守恒：摊开面积不改变该点收到的期待辐照度，
+/// 但方差降 256 倍）。只累加到几何首命中 t_max 为止 → 两侧遮挡依然正确，不引入漏光。
+fn light_field_gather(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> vec3<f32> {
+  // 射线 × 包围球求交（球保守包含盒；用二次式而非 slab，避免 dir 分量为 0 的除零）
+  let size = f32(LIGHT_FIELD_DIM) * LIGHT_FIELD_CELL;
+  let center = light_field_origin_voxel() + vec3<f32>(size * 0.5);
+  let radius = size * 0.8660254; // 半对角线
+  let oc = origin - center;
+  let b = dot(oc, dir);
+  let disc = b * b - (dot(oc, oc) - radius * radius);
+  if (disc <= 0.0) { return vec3<f32>(0.0); }
+  let sq = sqrt(disc);
+  let t_lo = max(-b - sq, 0.0);
+  let t_hi = min(-b + sq, t_max);
+  if (t_hi <= t_lo) { return vec3<f32>(0.0); }
+  // 粗步进：步长 = 1 cell，头半步居中（2·半径/步长 ≈ 55 步上限）
+  let step = LIGHT_FIELD_CELL;
+  var t = t_lo + step * 0.5;
+  var acc = vec3<f32>(0.0);
+  var i = 0;
+  loop {
+    if (t >= t_hi || i >= 64) { break; }
+    let p = origin + dir * t;
+    if (light_field_contains(p)) {
+      acc = acc + light_field_emit(p) * step;
+    }
+    t = t + step;
+    i = i + 1;
+  }
+  return acc;
 }
 
 
@@ -1182,13 +1278,16 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vc = vec3<f32>(best.uh.voxel) + vec3<f32>(0.5);
     let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
     // R3-18 直光硬阴影（#02/#17 形态）：1 条太阳射线，不通即阴影。
-    // 射线原点 = 体素中心 + n×0.5（贴向空气侧邻域）；起点若落回自身体素
-    // （对角 implicit normal 时可能）→ pre-check 自命中 → 视为无遮挡（self-hit 防护）
+    // 射线原点 = 体素中心 + n×(0.5 + SHADOW_SURFACE_EPS)（贴向空气侧邻域）。
+    // 那个 eps 是必需的：+n×0.5 恰好落在面平面上，对 -X/-Y/-Z 面坐标是整数 → DDA 的
+    // floor 落回**体素自己** → t=0 自命中；而下面的自命中防护把「命中自己」当无遮挡 →
+    // 这三向的面无论墙多厚都吃到太阳（封闭无光房间的明暗会完全跟着面朝向走）。
+    // +X/+Y/+Z 面落在高侧边界，floor 到邻域空气格，所以旧代码只在这半边出错。
     let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = 0.0;
     if (ndl > 0.0) {
-      let sh = trace_scene(p_voxel + n * 0.5, sun_dir, 8192.0, 0.0, 3u);
+      let sh = trace_scene(p_voxel + n * (0.5 + SHADOW_SURFACE_EPS), sun_dir, 8192.0, 0.0, 3u);
       sun = select(
         1.0,
         0.0,
@@ -1201,14 +1300,24 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gi_on = ddgi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     if (gi_on) {
-      // 只把点从「命中体素中心」推到体素表面（0.5 体素）；更远的、随 cell 尺寸缩放的外推
-      // 在 ddgi_sample_lod 内部按该 LOD 的 cs 施加（DDGI_BIAS_CELLS）。
-      gi = ddgi_sample(p_voxel + n * 0.5, n) * ddgi_u.params.z / DDGI_PI;
+      // 只把点从「命中体素中心」推到体素表面外侧（0.5 + eps 体素，见阴影射线处注释）；
+      // 更远的、随 cell 尺寸缩放的外推在 ddgi_sample_lod 内部按该 LOD 的 cs 施加
+      // （DDGI_BIAS_CELLS）。这里的 eps 让「点是否在某个 LOD 盒内」的判定不落在盒边界上。
+      gi = ddgi_sample(p_voxel + n * (0.5 + SHADOW_SURFACE_EPS), n) * ddgi_u.params.z / DDGI_PI;
     }
-    col = alb * (sun_c * ndl * sun + sky * DDGI_BASE_AMBIENT + gi);
+    // AO（Douglas #15）只作用于**间接**部分（常量天光 ambient + GI）；直射太阳由阴影负责。
+    // 这正好治"墙角/接缝不该发亮"：常量 ambient 无遮挡，凹角处本来和开阔面一样亮。
+    let ao = light_field_ao(p_voxel, best.uh.obj_id);
+    // 天光常量只在「本像素不在任何级联盒内」时兜底（ddgi_dbg_dom==0 = 无探针覆盖）。
+    // 级联内的环境光**一律由 GI 提供**：无光室内的探针辐照度≈0 → 画面接近全黑；
+    // 若这里无条件加常量，封闭空间会被同一个常量抬亮，室内外就没有亮度差。
+    let amb = select(sky * DDGI_SKY_AMBIENT, vec3<f32>(0.0), ddgi_dbg_dom > 0.5);
+    col = alb * (sun_c * ndl * sun + (amb + gi) * ao);
+    // 自发光体素：radiance 直出（不吃方向、不吃阴影）——「每个体素都能是光源」的着色侧。
+    col = col + alb * palette_emissive(best.palette_base, best.uh.pal) * DDGI_EMIT_GAIN;
     if (ddgi_u.params.y > 0.5) {
       if (ddgi_u.params.y < 1.5) {
-        col = alb * sky * DDGI_BASE_AMBIENT * 0.15 + alb * gi * 8.0;
+        col = alb * sky * DDGI_SKY_AMBIENT * 0.15 + alb * gi * 8.0;
       } else if (ddgi_u.params.y < 2.5) {
         col = alb * vec3<f32>(clamp(ddgi_dbg_wsum * 0.125, 0.0, 1.0)) * 2.0;
       } else if (ddgi_u.params.y < 3.5) {
@@ -1223,8 +1332,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         col = select(col, vec3<f32>(0.9, 0.2, 0.9), d > 3.5);    // 品红：LOD3
       } else {
         // Probe：先看「数据有没有取到」，再看 8 个角是被哪道闸门剔掉的。
+        //   亮黄 = 壳内 8 角被 wn 全剔（薄几何），用**同级**放宽 wn 兜住 → GI 有效（见
+        //          ddgi_sample 壳内分支注释）；**不退到粗级**，所以不会跨墙漏光
         //   浅绿 = 壳没给出数据，但**更粗一级 LOD 兜住了** → GI 有效，只是精度粗
-        //          （相机滚动时新进入窗口的那条带属于这一类，不是异常）
+        //          （相机滚动时新进入窗口的那条带属于这一类，不是异常）；
+        //          但粗级探针在远处、方向掠射时深度图判不出遮挡 → 封闭空间里它是漏光来源
         //   绿   = 权重和 > 0 且辐照度非 0 → 本壳直接正常
         //   白   = 权重和 > 0，但辐照度 ≈ 0 → 过闸的探针图集是空的（写入/寻址问题）
         //   青   = 无数据闸门：探针没进本帧 worklist（near=false）、年龄太小，或该方向纹素
@@ -1234,7 +1346,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         //   红   = depth 遮挡闸门（wd <= 0）
         //   灰   = 角越界（clamp 路径不会出现）
         // 旧版在这里对 dom<0.5 直接涂蓝，把这份直方图整个短路掉了。
-        if (ddgi_dbg_fb > 1.5) {
+        if (ddgi_dbg_fb > 2.5) {
+          col = vec3<f32>(0.98, 0.98, 0.35);
+        } else if (ddgi_dbg_fb > 1.5) {
           col = vec3<f32>(0.55, 0.95, 0.35);
         } else if (ddgi_dbg_wsum >= 1e-4) {
           col = select(
@@ -1280,24 +1394,69 @@ const DDGI_AGE_MAX: u32 = 255u;
 const DDGI_NO_PROBE: u32 = 0xFFFFFFFFu;
 const DDGI_FLAG_ENABLED: u32 = 1u;
 const DDGI_FLAG_NO_SURFACES: u32 = 2u;
-const DDGI_ALPHA: f32 = 0.06;
-const DDGI_DEPTH_ALPHA: f32 = 0.10;
+/// 时域混合系数（每帧向新采样靠拢的比例）。rpp 偏低时单帧估计方差大，亮区边界随噪声
+/// 逐帧移动（静止相机也在脉动）。0.06→0.03 未见效 → 再降到 0.015（≈67 帧 / 1.1s）。
+/// 这是**稳态**（探针年龄足够大）用的比例；年轻探针走 `ddgi_age_alpha` 的 1/age 快收敛，
+/// 见该函数注释 —— 稳态逐帧脉动由这个值负责，所以不要为了"收敛快"去调大它。
+const DDGI_ALPHA: f32 = 0.015;
+/// 深度图时域系数（图集两通道：mean / std）。20° 窄锥下每纹素每帧样本少，
+/// 先靠 0.05 收敛；预算加到 1048576（rpp≈40）后样本够了，回到 0.03 换更稳的值。
+const DDGI_DEPTH_ALPHA: f32 = 0.03;
+/// Chebyshev 软遮挡里 std 的下限（占 mean 的比例）。窄锥后真实 std 已很小且准，
+/// 下限只需防「std≈0 时退化成刀锋」并把残留噪声吸收掉；0.02 → 过渡带约 2%·距离。
+const DDGI_DEPTH_SOFTNESS: f32 = 0.02;
+/// 深度聚集核的方向门限：`max(0, dot - 此值)`。0.94 → 只统计落在纹素方向 **20°** 锥内的命中。
+/// 必须收窄到接近纹素本身的角度：存的是"该方向最近表面距离"，而宽锥的**均值系统性偏大**
+/// （例：天花板外侧探针朝下纹素，天花板在 8 体素，60° 锥落点覆盖 8~16 → 均值 11；
+/// 内侧点 dist≈9 < 11 → 被判"可见" → 一条贴缝亮带）。20° 锥在 8 体素处的横向半径仅 1.4
+/// 体素 → 均值≈8.06，内侧点立刻被正确判为遮挡。
+/// 代价：每纹素摊到的射线变少（≈0.3 条/帧）→ 靠 DDGI_DEPTH_ALPHA 加快收敛补偿。
+const DDGI_DEPTH_COS_BIAS: f32 = 0.94;
+/// 空间混合（探针间去噪）里"自身"的权重参照。邻居权重和按探针实际间距加权
+/// （见 `ddgi_probe_blend_irr`），典型约 3（6 邻居 × ~0.5）→ 2.0 表示自身约占 40%。
+const DDGI_BLEND_SELF: f32 = 2.0;
+/// 探针放置的最小净距（体素）：候选空叶的**半宽**必须 ≥ 此值才接受。
+/// Douglas #23："these heuristics ensure that the probes end up spaced as far apart as
+/// possible with some distance between themselves and the nearest surface"。探针贴在表面上时
+/// 半球被几何切掉一半 → 辐照度畸变、方差大，与相邻"自由"探针的差异被插值放大成探针晶格
+/// 亮斑，贴面漏带也随之而来。
+///
+/// **取值 2.0（= 恢复 Douglas 的"下钻到子叶"）**：`ddgi_place_probe` 三级候选的准入条件是
+/// 空叶半宽 8（16³ 子块）/ 2（4³ 子块）/ 0.5（1³ 体素）。曾经取 4.0 → 后两级（2 ≥ 4、0.5 ≥ 4
+/// 全假）被整段关掉，只剩"整个 32cm 立方全空"这一级。后果：**任何离几何 < 32cm 的 cell 都
+/// 没有探针**。而 LOD0 的 cell 本身就是 32cm —— 于是贴着墙的那一圈像素，壳内 8 个角永远
+/// 一个有效探针都没有，只能走 `ddgi_sample` 的"退到更粗 LOD"兜底；兜底返回的是**归一化**
+/// 平均（有一个探针入选就占满结果），粗级探针又可能落在墙外侧、看得见天空 → 封闭房间内壁
+/// 被整片点亮成跟粗级 cell 对齐的条纹（用权重门槛去堵它只会把那一圈变成黑块 —— 试过，
+/// 两个症状都更差）。
+/// 取 2.0 ⇒ 4³ 那级恢复：贴墙 cell 会在墙内侧一个**全空 8cm 立方**的中心拿到探针（离表面
+/// ≥4cm），壳内就有数据了，根本不需要粗级兜底；1³ 那级（0.5）仍关闭 —— 探针不会贴到面上。
+const DDGI_PROBE_MIN_CLEARANCE: f32 = 2.0;
 const DDGI_TEXEL_MIN_WEIGHT: f32 = 1e-4;
-/// 前后判定（wn）的锐度：wn = clamp(dot(n,-dir)/此值, 0, 1)。0.2 ≈ 78° 起满权重，
-/// 90° 处归零。只影响这一项的过渡宽度，不参与采样点偏移。
-const DDGI_NORMAL_BIAS: f32 = 0.2;
+/// 前后判定（wn）的锐度：wn = clamp(dot(n,-dir)/此值, 0, 1)。
+/// = 1.0 → 真正的余弦（60° 处 0.5、78° 处 0.2），与 Douglas/原版 DDGI 的「探针在体素
+/// 前 vs 后」一致；= 0.2 时 78° 以内全部钳到满权重，会把**掠射探针**（墙角/凸边外侧那些
+/// 看到开阔空间、天花板、外部天空的探针）按满权重混进来 —— 这正是「角落/接缝处柔和高亮」
+/// 的来源（这类探针与着色点之间不穿几何，depth 闸门合理地放行，只能靠权重压）。
+/// 注意：此值不改变拒绝集合（wn=0 恒为 dot<=0），只改相对权重 → 调它不会产生新黑区。
+const DDGI_NORMAL_BIAS: f32 = 1.0;
 /// 采样点沿法线的外推量 = 该 LOD 的 cell 边长 × 此系数（参考实现里的 normal_bias 语义）。
 /// 必须随间距缩放：固定的 0.7 体素（1.4cm）相对 LOD0 的 64cm cell 等于贴在表面上，
 /// 会让前后判定落在临界值上、整面被判「探针在背面」。
 const DDGI_BIAS_CELLS: f32 = 0.1;
 const DDGI_T_MAX: f32 = 8192.0;
 /// 每帧射线总预算，由 `ddgi_seal` 均分给全部活跃探针（rpp = 预算/活跃数，钳 [1,256]）。
-/// 必须与 Rust 侧 `DDGI_RAY_BUDGET` 一致：改小 → cast/collect 帧时按比例下降，
-/// 代价是每探针样本变少（噪声靠 α=0.06 的时域混合吸收）。
+/// 必须与 Rust 侧 `DDGI_RAY_BUDGET` 一致。曾试过 262144 / 1048576 压"探针晶格亮斑"与
+/// 深度闸门抖动：帧时涨了但问题没解决（根因是探针网格对贴缝尺度欠采样 + 深度角度均值偏差，
+/// 不是射线数量），已退回 131072。
 const DDGI_RAY_BUDGET: u32 = 131072u;
 const DDGI_PROBE_BUDGET: u32 = 4096u;
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
+/// 着色点从体素表面再外推的量（体素）。见 dda_main 阴影射线处注释：`+n×0.5` 恰好落在
+/// 面平面上，负向面的坐标是整数 → DDA floor 落回自身体素 → 自命中被当成「无遮挡」→ 漏光。
+/// 必须与 Rust `brickmap::dda::wgsl_consts::SHADOW_SURFACE_EPS` 一致（有对齐测试）。
+const SHADOW_SURFACE_EPS: f32 = 0.03125;
 const DDGI_EMIT_GAIN: f32 = 4.0;
 const DDGI_PI: f32 = 3.14159265;
 const DDGI_HYSTERESIS: f32 = 0.85;
@@ -1309,7 +1468,13 @@ const DDGI_CHANGE_DROP: f32 = 0.0;
 const DDGI_DELTA_CLAMP: f32 = 0.25;
 const DDGI_SKY_RADIANCE_SCALE: f32 = 1.0;
 const DDGI_RAY_BIAS: f32 = 0.5;
-const DDGI_BASE_AMBIENT: f32 = 0.2;
+/// 天光环境项：**只在该像素根本没有任何级联探针覆盖时**兜底（见着色处用 ddgi_dbg_dom 判定）。
+/// 级联内的环境光一律由 DDGI 提供（带遮挡）：无光室内 → 探针辐照度≈0 → 接近全黑。
+const DDGI_SKY_AMBIENT: f32 = 0.05;
+/// 探针射线命中时的辐亮度下限。**必须为 0**：任何非零下限都会被反馈回路放大成
+/// ≈ alb·sky·FLOOR/(1-alb) 的"室内自发光"，封闭空间永远压不黑。
+/// 首帧的种子由**能看到天空的射线**提供（miss → sky_rgb），所以不需要这个下限。
+const DDGI_CAST_FLOOR: f32 = 0.0;
 
 // 世界空间探针网格（每 LOD）：origin.xyz = 世界原点（voxel）、origin.w = cell 边长；
 // dims.xyz = cell 维度、dims.w = 该 LOD 在全局 slot 数组中的起始下标。
@@ -1351,7 +1516,9 @@ struct DdgiUniform {
 // 只放两个存储纹理：其它缓冲（worklist / samples / indirect / uniform）全部复用 BG4 的绑定。
 // 同一 buffer 若同时在两个 bind group 里以「只读 + 读写」两种方式绑定，wgpu 会判定使用冲突。
 @group(5) @binding(0) var ddgi_irr_out: texture_storage_2d_array<rgba16float, write>;
-@group(5) @binding(1) var ddgi_depth_out: texture_storage_2d_array<r32float, write>;
+// depth 写入侧：.x = mean（命中距离余弦加权均值）、.y = std（该均值的标准差）。
+// 与采样侧读法一一对应；存 std 而不是 mean² 是为了避免 f16 溢出/掉精度（mean² 可达 8192²）。
+@group(5) @binding(1) var ddgi_depth_out: texture_storage_2d_array<rgba16float, write>;
 
 // ===== @group(6)：seal 的 dispatch 参数写入侧（只被 ddgi_seal 使用）=====
 // [0..16) cast args ×4 LOD；[16..32) collect args ×4 LOD（每 LOD 4 word：x, y, z, pad，y = lod+1）。
@@ -1546,6 +1713,24 @@ fn ddgi_lum(c: vec3<f32>) -> f32 {
 fn ddgi_maxc(c: vec3<f32>) -> f32 {
   return max(c.x, max(c.y, c.z));
 }
+/// 时域混合系数按**探针年龄**给：历史越短越信当帧样本。
+///
+/// 为什么需要：老实现是「age ≤ 1 直写一帧原始估计，之后恒用 DDGI_ALPHA(0.015)」。那一帧
+/// 原始估计只有 rpp 条射线（满活跃时 rpp≈4）→ 方差极大；而 0.015 的时间常数 ≈67 帧。
+/// 合起来就是「先糊一帧、再花 1 秒慢慢擦」——刚加载、相机滚动带进新探针的那条带，正好都
+/// 落在新探针上，于是感知到的就是"DDGI 收敛很慢"。
+///
+/// 换成 1/age 的**等权滑动平均**后：
+///   · 年龄 n 的样本方差按 1/n 下降（统计上的最优等权平均）→ 前 5 帧就把噪声压掉一半以上，
+///     而感知上的"收敛"恰恰发生在这几帧；
+///   · 年龄 ≥ 1/DDGI_ALPHA（≈67）时自动切回 DDGI_ALPHA → **稳态逐帧脉动完全不变**
+///     （静止画面不会因此变吵）；DDGI_ALPHA 想调也不会和这里打架。
+/// age ≤ 1 时 1/age = 1 → 与原 `snap`（直写）行为逐位一致，所以新烘探针第一帧仍是精确覆写。
+fn ddgi_age_alpha(age: u32, base: f32) -> f32 {
+  return max(base, 1.0 / f32(max(age, 1u)));
+}
+
+// ddgi_update_texel：历史遗留的旧混合路径，**当前无人调用**（collect 直接用 mix(prev,new,a)）。
 fn ddgi_update_texel(prev: vec3<f32>, proj: vec3<f32>) -> vec3<f32> {
   let new_t = pow(proj, vec3<f32>(1.0 / DDGI_IRRAD_GAMMA));
   var h = select(DDGI_HYSTERESIS, 0.0, all(prev == vec3<f32>(0.0)));
@@ -1634,6 +1819,8 @@ fn ddgi_seal(@builtin(local_invocation_id) lid: vec3<u32>) {
 // 4³、再兜底 1³。优先级与原实现一致（16³ 优于 4³），但避免了「每个混合 16³ 子块都展开 64
 // 次 4³ 查询」——粗 LOD（cs=128 → n16=8）最坏是 512×64 次查询/cell，相机滚动触发 bake 时
 // 这是主要开销。
+// 最小净距：每轮的候选还要过 DDGI_PROBE_MIN_CLEARANCE（空叶半宽 ≥ 该值）。默认 4 →
+// 只有 16³ 那轮有效，4³/1³ 兜底被关掉（拿不到合格空叶的 cell 就不放探针，交给邻居覆盖）。
 fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec4<f32> {
   let n16 = max(cs / 16, 1);
   // 轮 1：最近的「全空 16³ 子块」
@@ -1644,7 +1831,7 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec
     for (var j = 0; j < n16; j = j + 1) {
       for (var i = 0; i < n16; i = i + 1) {
         let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        if (ddgi_cell_state_sized(g, sub16, 16) == 0u) {
+        if (ddgi_cell_state_sized(g, sub16, 16) == 0u && 8.0 >= DDGI_PROBE_MIN_CLEARANCE) {
           let p = vec3<f32>(sub16) + vec3<f32>(8.0);
           let d2 = dot(p - center, p - center);
           if (d2 < b16_d2) { b16_d2 = d2; b16_p = p; f16 = true; }
@@ -1661,7 +1848,7 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec
     for (var j = 0; j < n16; j = j + 1) {
       for (var i = 0; i < n16; i = i + 1) {
         let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        if (ddgi_cell_state_sized(g, sub16, 16) == 2u) {
+        if (ddgi_cell_state_sized(g, sub16, 16) == 2u && 2.0 >= DDGI_PROBE_MIN_CLEARANCE) {
           for (var kk = 0; kk < 4; kk = kk + 1) {
             for (var jj = 0; jj < 4; jj = jj + 1) {
               for (var ii = 0; ii < 4; ii = ii + 1) {
@@ -1687,7 +1874,7 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec
     for (var j = 0; j < n16; j = j + 1) {
       for (var i = 0; i < n16; i = i + 1) {
         let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        if (ddgi_cell_state_sized(g, sub16, 16) == 2u) {
+        if (ddgi_cell_state_sized(g, sub16, 16) == 2u && 0.5 >= DDGI_PROBE_MIN_CLEARANCE) {
           let r = ddgi_leaf16(g, sub16, center);
           if (r.w > 0.5) {
             let d2 = dot(r.xyz - center, r.xyz - center);
@@ -1745,8 +1932,14 @@ fn ddgi_bake(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 探针仍落在中心（与 Douglas「totally empty cell → probe right in the center」一致）。
   let center_v = vec3<i32>(center);
   let sub16 = cmin + ((center_v - cmin) / 16) * 16;
+  // 中心捷径也必须过最小净距：它所在的 16³ 子块全空，但中心本身可能贴在子块的某个面上
+  // （子块外紧邻实体）→ 到最近表面的距离只有"到子块面的距离"。要求六个面都 ≥ CLEARANCE。
+  let off = vec3<f32>(center_v - sub16);
+  let face_lo = min(min(off.x, off.y), off.z);
+  let face_hi = min(min(15.0 - off.x, 15.0 - off.y), 15.0 - off.z);
   let center_ok = sample_brickmap(g, center_v) == 0u
-    && ddgi_cell_state_sized(g, sub16, 16) == 0u;
+    && ddgi_cell_state_sized(g, sub16, 16) == 0u
+    && min(face_lo, face_hi) >= DDGI_PROBE_MIN_CLEARANCE;
   var p = center;
   if (!center_ok) {
     let r = ddgi_place_probe(g, cmin, cs, center);
@@ -1905,14 +2098,34 @@ fn ddgi_irr_sample(id: u32, d: vec3<f32>) -> vec3<f32> {
   let c11 = ddgi_irr_fetch(id, x1, y1);
   return mix(mix(c00, c10, vec3<f32>(f.x)), mix(c01, c11, vec3<f32>(f.x)), vec3<f32>(f.y));
 }
-fn ddgi_depth_sample(id: u32, d: vec3<f32>) -> f32 {
+fn ddgi_depth_fetch(id: u32, x: i32, y: i32) -> vec2<f32> {
+  let c = ddgi_depth_coord(id, u32(x), u32(y));
+  return textureLoad(ddgi_depth, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0).xy;
+}
+// 返回 vec2(mean, std)：距离均值与该均值的标准差（图集 .x/.y）。
+// 在原方向最近邻之外再取 2×2 邻域**取平均**：深度图每个纹素是 rpp 条射线估出来的，
+// 射线方向逐帧重随机 → 单纹素读数逐帧抖动；4 点平均把噪声压 ~2×，同时抹掉最近邻在
+// 纹素边界上的硬跳变。平均后的方差用 std 的平方近似（只用于软遮挡过渡宽度）。
+// 全 0（无数据）纹素不参与；四个都无数据才回 0（采样侧按「无数据」剔除）。
+fn ddgi_depth_sample(id: u32, d: vec3<f32>) -> vec2<f32> {
   let s = f32(DDGI_DEPTH_TEXELS);
   let e = ddgi_oct_encode(d) * 0.5 + vec2<f32>(0.5);
-  let g2 = floor(e * s);
-  let x = clamp(i32(g2.x), 0, 15);
-  let y = clamp(i32(g2.y), 0, 15);
-  let c = ddgi_depth_coord(id, u32(x), u32(y));
-  return textureLoad(ddgi_depth, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0).x;
+  let g2 = e * s - vec2<f32>(0.5);
+  let x0 = clamp(i32(floor(g2.x)), 0, 15);
+  let y0 = clamp(i32(floor(g2.y)), 0, 15);
+  let x1 = clamp(x0 + 1, 0, 15);
+  let y1 = clamp(y0 + 1, 0, 15);
+  let v00 = ddgi_depth_fetch(id, x0, y0);
+  let v10 = ddgi_depth_fetch(id, x1, y0);
+  let v01 = ddgi_depth_fetch(id, x0, y1);
+  let v11 = ddgi_depth_fetch(id, x1, y1);
+  var acc = vec2<f32>(0.0);
+  var n = 0.0;
+  if (v00.x > 0.0) { acc = acc + v00; n = n + 1.0; }
+  if (v10.x > 0.0) { acc = acc + v10; n = n + 1.0; }
+  if (v01.x > 0.0) { acc = acc + v01; n = n + 1.0; }
+  if (v11.x > 0.0) { acc = acc + v11; n = n + 1.0; }
+  return select(vec2<f32>(0.0), acc / max(n, 1.0), n > 0.0);
 }
 // p 是否落在 LOD(lod) 的「壳」内：在 LOD(lod) 盒内、且不在更细一级 LOD 盒内。
 // 嵌套级联下任意点恰好属于一级 → 每像素只采样一个 LOD（也保证只在探针真正活跃的区域取数）。
@@ -1930,7 +2143,9 @@ fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
 // clamp_cells = true：把越界的世界 cell 号 clamp 进本级窗口（级联之外的退化采样）。
 // 级联只覆盖相机周围有限体积；越界时若直接判空，相机上方/远方的表面会整片无 GI。
 // clamp 之后用最靠近的可用探针给一个粗粒度估计 —— 空间上仍随位置变化，只是精度粗。
-fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32, clamp_cells: bool) -> vec4<f32> {
+// relax_normal = true：把背向探针闸门 wn 的下限抬到 0.25。**只在像素不在任何级联盒内时**
+// 使用；壳内回退到更粗 LOD 时必须为 false，否则隔墙探针会被放进平均 → 漏光。
+fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32, clamp_cells: bool, relax_normal: bool) -> vec4<f32> {
   let L = ddgi_u.lods[lod];
   let cs = f32(L.origin.w);
   // 探针的**标称位置在 cell 中心**（bake 取 center = cmin + cs*0.5；中心是实心时才搬到
@@ -1983,26 +2198,40 @@ fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32, clamp_cells: bool) -> v
         let dist = length(to);
         let dir = to / max(dist, 1e-4);
         let wn = clamp(dot(n, -dir) / DDGI_NORMAL_BIAS, 0.0, 1.0);
-        // 正常路径按标准 DDGI 剔除背向探针；退化路径（clamp_cells）放宽 wn。
-        // 否则「整个面法线朝向不利」（探针全落在背面，例如薄墙对面那侧）会让整面全被剔除、
-        // 表现为一整面没有 GI 而被周围有 GI 的面包围。遮挡仍由 depth map（wd）负责。
-        if (!clamp_cells && wn <= 0.0) { ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u; continue; }
-        let wn_w = select(wn, max(wn, 0.25), clamp_cells);
+        // 背向探针闸门（wn）：非放宽路径一律剔除。放宽（wn 下限 0.25）只留给**像素不在任何
+        // 级联盒内**的情况（relax_normal）；壳内回退到更粗 LOD 时不再放宽 —— 那属于「本壳
+        // 8 角无有效采样」，此时放宽会让背向/隔墙探针也满权重参与平均 → 漏光。遮挡仍由
+        // depth map（wd）负责。
+        if (!relax_normal && wn <= 0.0) { ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u; continue; }
+        let wn_w = select(wn, max(wn, 0.25), relax_normal);
         let dtex = ddgi_depth_sample(slot, dir);
         // 该方向没有任何命中记录（纹素从未被写过，或刚被 collect 显式清零）→ **无数据**，
         // 不是「无遮挡」：判为不可见并计入无数据闸门。旧版把「无数据」当「无遮挡」→ 新鲜
         // 探针以 0 辐照度满权重参与平均 → 大片「白（辐照度≈0）↔绿」翻转（动态闪烁）。
-        if (dtex <= 0.0) { ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u; continue; }
-        // 遮挡判定：容差随距离放大（max(cs*0.25, dist*3%)），过渡带 ±1.0·bias。
-        // 深度图只有 16×16 纹素（≈11°），dtex 是该纹素的余弦加权平均，且每帧射线方向重随机
-        // → dtex 逐帧抖动；容差太紧（LOD0 仅 16cm）会让卡在阈值上的角逐帧翻转（静态闪烁）。
-        let dep_bias = max(cs * 0.25, dist * 0.03);
-        let wd = clamp((dtex - dist) / dep_bias + 1.0, 0.0, 1.0);
-        if (wd <= 0.0) { ddgi_dbg_rej.z = ddgi_dbg_rej.z + 1u; continue; }
+        if (dtex.x <= 0.0) { ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u; continue; }
+        // ---- 遮挡：Chebyshev 软判定（对齐 Majercik / RTXGI）----
+        // 旧版是 `clamp((dtex-dist)/bias+1)` + `<=0 剔除` 的**刀锋**判定：dtex 抖一点，
+        // 探针就在「入选/落选」之间翻 → 亮区边界伸缩（静止相机也闪）；而要把 bias 调大到
+        // 不翻，就必然大面积漏光。Chebyshev 用 mean + 方差：**深度越不确定（std 越大）
+        // 过渡越宽**，只有深度一致（真是一堵墙）时才接近硬判定 → 同时兼顾抗漏与抗闪。
+        // d_vis 减一个小偏置：贴在该深度图记录的那个面上的采样点，不应因浮点误差落到
+        // mean 外侧被判成全额遮挡。**这个偏置不能大**：它等价于"允许点比最近表面再近
+        // bias"，会在每处贴面/接缝制造一条 bias 宽的漏带（旧值 cs*0.1 = LOD0 3.2 体素，
+        // 与深度均值偏大叠加就是可见亮带）。改成 cs*0.05，让 std/Softness 去吸收抖动。
+        let d_vis = dist - max(cs * 0.02, dist * 0.005);
+        let mean = dtex.x;
+        var wd = 1.0;
+        if (d_vis > mean) {
+          let soft = max(dtex.y, mean * DDGI_DEPTH_SOFTNESS);
+          let delta = d_vis - mean;
+          wd = (soft * soft) / (soft * soft + delta * delta);
+        }
+        // wd 极小 = 实质遮挡：保留统计与提前退出（不再做 0/1 硬剔除，避免临界翻转）
+        if (wd <= 1e-3) { ddgi_dbg_rej.z = ddgi_dbg_rej.z + 1u; continue; }
         let irr = ddgi_irr_sample(slot, n);
         // 该方向的辐照度纹素从未被写过 → 同样是「无数据」，不能以 0 参与平均（否则唯一被
         // 接受的角若是空的，平均值就是 0）。已写入的纹素恒 > 0：collect 里
-        // radiance ≥ albedo·sky·DDGI_BASE_AMBIENT > 0，所以「≈0」可安全当作「无数据」。
+        // radiance ≥ albedo·sky·DDGI_CAST_FLOOR > 0，所以「≈0」可安全当作「无数据」。
         if (max(irr.x, max(irr.y, irr.z)) < DDGI_TEXEL_MIN_WEIGHT) {
           ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u;
           continue;
@@ -2038,7 +2267,7 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     if (ddgi_lod_contains(lod, p)) {
       in_cascade = true;
       shell_lod = lod;
-      let r = ddgi_sample_lod(p, n, lod, false);
+      let r = ddgi_sample_lod(p, n, lod, false, false);
       ddgi_dbg_rej_out = ddgi_dbg_rej;
       ddgi_dbg_wsum = r.w;
       ddgi_dbg_dom = f32(lod) + 1.0;
@@ -2046,6 +2275,25 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       if (r.w >= 1e-4) {
         return r.xyz;
       }
+      // 壳内 8 角被 wn 背向闸门**全剔**的最常见来源是薄几何（线缆/薄板/薄边/薄梁）：
+      // 贴着细长物件时，最近的空叶都在**侧面**（上面/下面/两侧），dir 与命中面法线近乎
+      // 垂直 → wn≈0 → 被 `wn <= 0` 硬剔 → 壳内一个角都不剩。
+      // 对这种情形优先用**同一级**放宽 wn（下限 0.25）重试，而不是直接退到粗级 LOD：
+      //   · 同级探针只在 32~64cm 外，16×16 深度图在这个尺度上可信 → 即使放宽 wn 也不会
+      //     让隔墙探针漏进来；
+      //   · 粗级探针在 1.3~2.6m 外、且多为掠射方向 → **超出深度图的角度分辨率** → 掠射
+      //     方向上的薄墙在深度图里"看起来"在更远处 → wd 判不出遮挡。而 ddgi_sample 返回的是
+      //     **归一化**平均（一个探针入选就占满结果）→ 一个隔墙粗级探针就能把整片点亮成
+      //     跟着粗级 cell 走的亮条纹 —— 封闭空间里那些"细条"就是这么来的。
+      //   · 仍是同一个 cell 邻域（不 clamp、不换级），位置连续、不产生块状跳变。
+      let rej_shell = ddgi_dbg_rej; // 诊断用：保留未放宽时的剔除统计
+      let r2 = ddgi_sample_lod(p, n, lod, false, true);
+      if (r2.w >= 1e-4) {
+        ddgi_dbg_wsum = r2.w;
+        ddgi_dbg_fb = 3.0; // 3 = 同级放宽 wn 后成功（Probe 档亮黄）
+        return r2.xyz;
+      }
+      ddgi_dbg_rej = rej_shell;
       // 嵌套级联下 p 至多落在一级的壳内，无需继续向上试
       break;
     }
@@ -2059,8 +2307,13 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   // ddgi_dbg_dom 不再清零 —— 它如实标出「该像素根本不在任何级联盒内」（绿）。
   var start = 0u;
   if (in_cascade) { start = shell_lod + 1u; }
+  // clamp/放宽只留给「不在任何壳内」的退化路径：
+  //   ① 壳内回退（in_cascade）：盒子严格嵌套 → p 必然也在更粗级的窗口内，无需 clamp；
+  //      且**不放宽 wn** —— 否则背向/隔墙探针也会参与平均，正是漏光的来源之一。
+  //   ② 壳外（!in_cascade）：越界 cell 必须 clamp 到最粗一级窗口才取得到数据，并放宽 wn。
+  let relax_normal = !in_cascade;
   for (var lod = start; lod < DDGI_LOD_COUNT; lod = lod + 1u) {
-    let r = ddgi_sample_lod(p, n, lod, true);
+    let r = ddgi_sample_lod(p, n, lod, true, relax_normal);
     if (r.w >= 1e-4) {
       if (!in_cascade) {
         // 不在任何壳内：退化结果与剔除统计都归它
@@ -2124,14 +2377,63 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hit_p = probe_pos + dir * dist;
     let n = sh.uh.n;
     // 入射辐照度 E → 出射辐亮度 L = albedo·E/π（与着色侧 col += albedo·E/π 同约定）。
-    // 加一项 albedo·sky·BASE_AMBIENT 作下限，避免首帧 GI 全 0 时反馈回路死锁在 0。
+    // 加一项 albedo·sky·CAST_FLOOR 作下限，避免首帧 GI 全 0 时反馈回路死锁在 0；
+    // 该下限必须小，否则封闭房间的探针也被抬亮（室内外没有亮度差）。
     let gi = ddgi_sample(hit_p + n * 0.5, n);
-    radiance = alb * (gi / DDGI_PI + sky_rgb() * DDGI_BASE_AMBIENT);
+    // 命中发光体素 → 出射辐亮度含**自身发射**（直出，不吃 GI/入射）：这是"体素即光源"
+    // 往 GI 里注入光的关键接法（Douglas：命中体素取它的 lit color，发光体素的 lit color 含 emission）。
+    radiance = alb * (gi / DDGI_PI + sky_rgb() * DDGI_CAST_FLOOR)
+      + alb * palette_emissive(sh.palette_base, sh.uh.pal) * DDGI_EMIT_GAIN;
   }
   // 样本下标 = 全局射线编号（tid 本身就是「该 LOD 起始射线号 + 本探针号×rpp + 射线号」）
   let si = tid * 2u;
+  // 沿程发光聚合（「体素即光源」）：叠加在命中辐亮度之上，累加到几何首命中（无命中 → T_MAX）。
+  // 这是**间接**贡献（发光 cell 摊成的体积密度）；命中发光体素时的自身发射由上面的
+  // palette_emissive 直出项负责，两者语义不重叠。
+  radiance = radiance + light_field_gather(probe_pos + dir * DDGI_RAY_BIAS, dir, dist);
   ddgi_samples[si] = vec4<f32>(dir, dist);
   ddgi_samples[si + 1u] = vec4<f32>(radiance, 1.0);
+}
+
+// ---- 空间混合（RTXGI ProbeBlending 的简化）----
+// 采样端 gi = Σ(irr·w)/Σw，w = wtri·wn·wd。`wn` 会把"探针落在背面"的那半边剔掉，于是
+// 同一个 cell 内权重在「探针处 ≈1 ↔ cell 角 ≈0.5」之间变化；归一化后，加权平均会把
+// **每个探针自己的辐照度**顶出来 → 与探针间距同周期的晶格亮斑（墙角/接缝亮带的来源）。
+// 相邻探针的辐照度越接近，这个重分配越看不出来 → 把 6 个网格邻居的同名纹素混进来。
+fn ddgi_irr_nbr(id: u32, tx: u32, ty: u32) -> vec3<f32> {
+  let c = ddgi_irr_coord(id, tx, ty);
+  return textureLoad(ddgi_irr, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0).xyz;
+}
+/// 6 个轴向邻居的同名纹素按探针**实际间距**加权求和；返回 (加权和, 权重和)。
+/// 只接受同 LOD 网格内、本帧 ENABLED 且纹素有效的邻居（避免混进空槽/旧世界 cell 的残留）。
+fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
+  let dims = ddgi_u.lods[lod].dims.xyz;
+  let base = ddgi_lod_slot_base(lod);
+  let cell = ddgi_slot_cell(lod, pidx);
+  let cs = f32(ddgi_u.lods[lod].origin.w);
+  let self_pos = ddgi_slot_pos[base + pidx].xyz;
+  var acc = vec3<f32>(0.0);
+  var wacc = 0.0;
+  for (var a = 0u; a < 3u; a = a + 1u) {
+    let stride = select(select(1u, dims.x, a == 1u), dims.x * dims.y, a == 2u);
+    let extent = select(select(dims.x, dims.y, a == 1u), dims.z, a == 2u);
+    let coord = select(select(cell.x, cell.y, a == 1u), cell.z, a == 2u);
+    for (var s = 0u; s < 2u; s = s + 1u) {
+      let plus = s == 1u;
+      if (plus && coord + 1u >= extent) { continue; }
+      if (!plus && coord == 0u) { continue; }
+      let nidx = select(pidx - stride, pidx + stride, plus);
+      let nslot = base + nidx;
+      if ((ddgi_meta[nslot] & DDGI_META_ENABLED) == 0u) { continue; }
+      let v = ddgi_irr_nbr(nslot, tx, ty);
+      if (max(v.x, max(v.y, v.z)) < DDGI_TEXEL_MIN_WEIGHT) { continue; }
+      let npos = ddgi_slot_pos[nslot].xyz;
+      let w = max(0.0, 1.0 - length(npos - self_pos) / (cs * 2.0));
+      acc = acc + v * w;
+      wacc = wacc + w;
+    }
+  }
+  return vec4<f32>(acc, wacc);
 }
 
 // ============================================================================
@@ -2180,11 +2482,16 @@ fn ddgi_collect(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (wsum > 1e-5) {
       let irr_new = DDGI_PI * sum / wsum;
+      // 先空间混合（和 6 邻居同名纹素），再时域混合 —— 见 ddgi_probe_blend_irr 注释
+      let nb = ddgi_probe_blend_irr(lod, atlas_slot - ddgi_lod_slot_base(lod), tx, ty);
+      let irr_s = (irr_new * DDGI_BLEND_SELF + nb.xyz) / (DDGI_BLEND_SELF + nb.w);
       let cc = ddgi_irr_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
       let prev = textureLoad(ddgi_irr, idx, i32(cc.x), 0).xyz;
-      let a = select(DDGI_ALPHA, 1.0, snap);
-      textureStore(ddgi_irr_out, idx, i32(cc.x), vec4<f32>(mix(prev, irr_new, a), 1.0));
+      // 年龄越小时向新样本靠拢越多（1/age 等权滑动平均）→ 新探针几帧内成型；
+      // 年龄大了自动切回 DDGI_ALPHA，稳态脉动不变。见 ddgi_age_alpha。
+      let a = ddgi_age_alpha(age, DDGI_ALPHA);
+      textureStore(ddgi_irr_out, idx, i32(cc.x), vec4<f32>(mix(prev, irr_s, a), 1.0));
     } else if (snap) {
       // 新（重）烘的探针：本帧没有射线覆盖到的方向 → **显式清零**。
       // 不清零的话这里留着的是「该槽位上一任世界 cell」的读数（槽位是世界锚定环面映射，
@@ -2194,27 +2501,53 @@ fn ddgi_collect(@builtin(global_invocation_id) gid: vec3<u32>) {
       textureStore(ddgi_irr_out, vec2<i32>(vec2<u32>(cc.y, cc.z)), i32(cc.x), vec4<f32>(0.0));
     }
   } else {
-    // ---- depth：余弦加权平均命中距离（未命中 = T_MAX → 不产生遮挡）----
+    // ---- depth：余弦加权平均**命中**距离（漏光根因修复）----
+    // 旧版把未命中（dist = DDGI_T_MAX = 8192）也按余弦权重加进均值。每个 16×16 深度纹素
+    // 每帧只摊到约 1 条射线、方向还逐帧重随机，于是只要某一帧有射线看到天空/远处，均值就
+    // 被抬到数百（α=0.1 的 EMA 平衡值 ≈ Σw·dist/Σw，未命中项直接贡献 ~8192），且回落极慢。
+    // 结果 dtex 系统性偏大 → 遮挡判定 `dtex - dist` 几乎恒为正 → 深度闸门形同虚设 →
+    // 隔墙探针全部通过 → 严重漏光。改为**只累计命中射线**（未命中不参与）：dtex 逼近
+    // 「该方向最近表面距离」，遮挡自然收紧。该方向一条都没命中 → 无遮挡物，不更新
+    // （保留上次命中均值；从未命中则保持 0 = 无数据，采样侧按「无数据」剔除）。
     let t = texel - DDGI_IRR_TEXELS * DDGI_IRR_TEXELS;
     let tx = t % DDGI_DEPTH_TEXELS;
     let ty = t / DDGI_DEPTH_TEXELS;
     let td = ddgi_oct_texel_dir(tx, ty, DDGI_DEPTH_TEXELS);
     var dsum = 0.0;
-    var dwsum = 0.0;
+    var dsum2 = 0.0;
+    var whsum = 0.0;
     for (var i = 0u; i < rpp; i = i + 1u) {
       let s = ddgi_samples[(si + i) * 2u];
-      let w = max(0.0, dot(td, s.xyz));
-      dsum = dsum + w * s.w;
-      dwsum = dwsum + w;
+      if (s.w < DDGI_T_MAX) {
+        // 深度是「该方向最近表面距离」，**只能统计落在本纹素锥内的射线**。
+        // 不能用辐照度那种半球余弦（`max(0,dot)`）：那会把 90° 内的斜向射线（沿天花板打到
+        // 远处/天空）一并平均进来，`mean` 被抬到远超真实的最近距离。后果是"贴在天花板外侧
+        // 的探针"对整个天花板厚度+ε 范围内的内侧点都通过遮挡判定 → 天花板/墙角一条亮带
+        // （边界随体素锯齿走）。减去 0.5 ≈ 只保留 60° 锥内的射线。
+        let w = max(0.0, dot(td, s.xyz) - DDGI_DEPTH_COS_BIAS);
+        dsum = dsum + w * s.w;
+        dsum2 = dsum2 + w * s.w * s.w;
+        whsum = whsum + w;
+      }
     }
-    if (dwsum > 1e-5) {
-      let dep_new = dsum / dwsum;
+    if (whsum > 1e-5) {
+      let mean = dsum / whsum;
+      // 二阶矩 → 标准差。存 std 而不是 mean²：mean² 在 f16 里会溢出
+      // （最远 8192 → 8192² = 6.7e7 远超 f16 上限 65504）。
+      let dep_std = sqrt(max(dsum2 / whsum - mean * mean, 0.0));
       let cc = ddgi_depth_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
-      let prev = textureLoad(ddgi_depth, idx, i32(cc.x), 0).x;
-      let a = select(DDGI_DEPTH_ALPHA, 1.0, snap);
-      // r32float 存储纹素的 store 值类型是 vec4<f32>（naga 校验要求），只取 .x 通道
-      textureStore(ddgi_depth_out, idx, i32(cc.x), vec4<f32>(mix(prev, dep_new, a), 0.0, 0.0, 0.0));
+      let prev = textureLoad(ddgi_depth, idx, i32(cc.x), 0).xy;
+      // 深度也走同样的年龄斜坡：新探针的深度图第一帧只摊到约 1 条射线/纹素，噪声极大，
+      // 若沿用 0.03 的慢混合，遮挡判定会带着错误读数持续 ~1 秒（表现是"漏光/发暗慢慢退"）。
+      let a = ddgi_age_alpha(age, DDGI_DEPTH_ALPHA);
+      // 存储纹素的 store 值类型是 vec4<f32>（naga 校验要求）：.x = mean、.y = std
+      textureStore(
+        ddgi_depth_out,
+        idx,
+        i32(cc.x),
+        vec4<f32>(mix(prev, vec2<f32>(mean, dep_std), vec2<f32>(a)), 0.0, 0.0),
+      );
     } else if (snap) {
       // 同 irradiance：新（重）烘探针未被覆盖的方向显式清零，避免残留上一任世界 cell 的深度
       let cc = ddgi_depth_coord(atlas_slot, tx, ty);

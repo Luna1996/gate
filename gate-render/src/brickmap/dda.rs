@@ -141,6 +141,30 @@ impl OrbitCamera {
 }
 
 impl DdaCameraConfig {
+  /// 眼位 + 视线方向构造（幽灵/飞行相机用；轨道相机走 [`Self::from_orbit`]）。
+  ///
+  /// `forward` 必须是朝向场景的单位向量（调用方从 yaw/pitch 取，且 pitch 已 clamp 到 ±89°，
+  /// 所以它与 +Y 不共线 → look_at_rh 的 up 基准不会退化）。与
+  /// `look_at_rh(eye, eye + forward, +Y)` 逐字等价。
+  pub fn from_eye_forward(
+    eye: Vec3,
+    forward: Vec3,
+    fov_y: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+  ) -> Self {
+    let f = forward.normalize();
+    let view = Mat4::look_at_rh(eye, eye + f, Vec3::Y);
+    let proj = Mat4::perspective_rh(fov_y, aspect, near, far);
+    let view_proj = proj.mul(view);
+    Self {
+      view_proj,
+      inv_view_proj: view_proj.inverse(),
+      position_world: eye,
+    }
+  }
+
   /// 唯一矩阵构造点（spec FR-2）：orbit 参数 → perspective_rh × look_at_rh。
   ///
   /// fov/aspect/near/far 为显式参数（app 传 60° / 1280:720 / 1.0 / 4000），
@@ -423,6 +447,21 @@ pub mod wgsl_consts {
   pub const SHADOW_BIAS: f32 = crate::lighting::SHADOW_BIAS;
   pub const SHADOW_DIR_T_MAX: f32 = crate::lighting::SHADOW_DIR_T_MAX;
   pub const EMISSIVE_EMIT_GAIN: f32 = crate::lighting::EMISSIVE_EMIT_GAIN;
+  // 光照场（Douglas #15 的 AO fill + 「体素即光源」的发光密度 ε 共用一张 3D 纹理）。
+  // cell = 16 voxel（与 Douglas AO 的 16³ 填充率同格），dims = 32³ cell
+  // → 世界覆盖 = 32×16 = 512 voxel = ±5.12m（相机中心）。
+  // 寻址与 DDGI 同构：原点按 cell 向下对齐、槽位 = 世界 cell mod dims（世界锚定，
+  // 相机滚动只换新进的那条带）。纹理格式 Rgba16Unorm：.rgb = ε、.a = AO fill。
+  // 注意 upload.rs 的铺图依赖 LIGHT_FIELD_DIM×8 是 256 的整数倍（行对齐）。
+  pub const LIGHT_FIELD_CELL: u32 = 16;
+  pub const LIGHT_FIELD_DIM: u32 = 32;
+  /// 起点从体素表面再外推的量（体素）。着色点锚在**体素中心**，`+ n×0.5` 恰好落在面平面
+  /// 上；对 -X/-Y/-Z 面这个坐标是整数 → DDA 的 `floor` 落回**体素自己** → 自命中，而
+  /// dda_main 的自命中防护把「命中自己」当**无遮挡** → 那三向的面无论墙多厚都吃到太阳
+  /// （封闭无光房间里的明暗会完全跟着面朝向走）。
+  /// 外推 1/32 体素（≈0.6mm）把起点推过边界；足够小，不会漏掉紧贴表面的薄遮挡物。
+  /// 必须与 WGSL `SHADOW_SURFACE_EPS` 一致（tests/wgsl_compile.rs 有对齐测试）。
+  pub const SHADOW_SURFACE_EPS: f32 = 0.03125;
 }
 
 /// 与 WGSL `popcount(mask & (bit - 1u64))` 等价：mask bit=1 子块在 child offset
@@ -1550,6 +1589,38 @@ mod dda_ref_tests {
     (x & 0xFFFF_FFFF) as u32
   }
 
+  /// 阴影射线起点锚在「命中体素中心 + n×(0.5 + SHADOW_SURFACE_EPS)」（dda_main）。
+  /// 两个不变量一起锁：
+  ///   · 不加 eps（旧写法）→ 对 -X/-Y/-Z 面起点正好落在体素**低侧边界**，floor 落回自己 →
+  ///     t=0 自命中。这就是「无遮挡」误判的根因，写成断言防止有人把 eps 删掉。
+  ///   · 加 eps 后 → 起点落在邻域空气格，背离墙面的射线必须无命中（真的遮挡测试）。
+  ///   · +X 面（高侧边界）本来就正常，作为对照。
+  #[test]
+  fn shadow_ray_start_offset_clears_hit_voxel() {
+    use super::wgsl_consts::SHADOW_SURFACE_EPS;
+    // 2 体素厚的墙：x ∈ [10,12)，y/z ∈ [0,64)
+    let mut g = VolumeGrid::new();
+    fill_box(&mut g, IVec3::new(10, 0, 0), IVec3::new(2, 64, 64), 1);
+    let buffers = BrickMapBuilder::build_full(&g).buffers().clone();
+    let trace = |v: IVec3, n: glam::Vec3, eps: f32| {
+      let center = v.as_vec3() + glam::Vec3::splat(0.5);
+      cpu_reference_dda_ray_tree(&buffers, center + n * (0.5 + eps), n, 8192.0)
+    };
+    let lo = (IVec3::new(10, 32, 32), glam::Vec3::new(-1.0, 0.0, 0.0));
+    let hi = (IVec3::new(11, 32, 32), glam::Vec3::new(1.0, 0.0, 0.0));
+    // 根因：无 eps 时低侧面自命中（返回的就是出发点体素）
+    let bad = trace(lo.0, lo.1, 0.0).expect("旧写法应自命中（这就是漏光的根因）");
+    assert_eq!(bad.voxel, lo.0, "自命中应发生在出发点体素");
+    // 修复：eps 推过边界后，低侧面必须与高侧面一样「背离墙面 → 无命中」
+    for (v, n) in [lo, hi] {
+      assert!(
+        trace(v, n, SHADOW_SURFACE_EPS).is_none(),
+        "v={v:?} n={n:?}: 外推 {SHADOW_SURFACE_EPS} 后仍不该有命中（实得 {:?}）",
+        trace(v, n, SHADOW_SURFACE_EPS)
+      );
+    }
+  }
+
   /// 0..1 f32
   fn frand(state: &mut u64) -> f32 {
     (xorshift64(state) as f32) / (u32::MAX as f32)
@@ -2205,7 +2276,8 @@ use bevy::{
       TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer,
       VertexState,
       binding_types::{
-        sampler, storage_buffer_read_only_sized, texture_2d, texture_storage_2d, uniform_buffer,
+        sampler, storage_buffer_read_only_sized, texture_2d, texture_3d, texture_storage_2d,
+        uniform_buffer,
       },
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -2345,6 +2417,10 @@ pub(crate) fn init_dda_pipelines(
         storage_buffer_read_only_sized(false, None), // @binding(1) b_leaves（恒空占位）
         storage_buffer_read_only_sized(false, None), // @binding(2) b_palette
         uniform_buffer::<super::wire::BrickMapGlobals>(false), // @binding(3) globals
+        // @binding(4)/(5)：AO（Douglas #15）——每 16³ 块实心占比的 3D 纹理 + 线性过滤采样器
+        // （"implemented as a single Hardware filtered texture read"）。
+        texture_3d(TextureSampleType::Float { filterable: true }),
+        sampler(SamplerBindingType::Filtering),
       ),
     ),
   );
@@ -2555,6 +2631,8 @@ fn prepare_dda_bind_groups(
       gpu.leaves.as_entire_binding(),
       gpu.palette.as_entire_binding(),
       globals_bind,
+      &gpu.light_view,
+      &gpu.light_sampler,
     )),
   );
 

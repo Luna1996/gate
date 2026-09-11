@@ -210,6 +210,108 @@ pub struct UploadSnapshot {
   pub comp_chunks: usize,
 }
 
+// ----------------------------------------------------------------------------
+// 光照场（Douglas #15 的 AO fill + 「体素即光源」的发光密度 ε，共用一张 3D 纹理）
+//
+// 形态：16-voxel cube 网格（cell），相机中心、按 cell 向下对齐、世界锚定槽位
+// （`slot = 世界 cell mod dims`，与 DDGI 的 `ddgi_slot` 同构）。这三个性质合起来
+// 让它可流式：相机滚动只换「新进窗口的那条带」的世界 cell，其余槽位保持自己的身份，
+// 不需要整幅重铺；世界编辑只重算脏 chunk。
+//
+// 纹理 Rgba16Unorm，dims = LIGHT_FIELD_DIM³：
+//   .rgb = 发光密度 ε（Σ 发光强度 / cell 体积，0..1）→ cast 射线沿程累加 ε·L
+//   .a   = 实心占比 AO fill（0.5 = 平面不压暗，≈0.75 = 夹角压暗）
+// CPU 侧按 chunk 缓存 tally（每 chunk = 16³ = 4096 个 cell），见 [`LightChunk`]。
+// ----------------------------------------------------------------------------
+
+use super::dda::wgsl_consts::{LIGHT_FIELD_CELL, LIGHT_FIELD_DIM};
+
+/// 光照场单个 chunk 的 CPU tally：16³ = 4096 个 16-voxel cell。
+/// 本地序 `lx + ly*16 + lz*256`（lx/ly/lz 是 chunk 内的 cell 号，×16 即体素局部坐标）。
+#[derive(Clone, Debug)]
+pub struct LightChunk {
+  /// 每 cell 的实心占比 ×255（0..=255）
+  pub fill: Box<[u8]>,
+  /// 每 cell 的发光密度 ε（0..1，= Σ 发光强度 / 4096）
+  pub emit: Box<[f32]>,
+}
+
+/// 光照场 CPU 状态（render world）：按 chunk 的 tally 缓存 + 上次铺图的世界原点。
+#[derive(Resource, Default)]
+pub struct LightFieldCpu {
+  pub cache: std::collections::HashMap<gate_voxel::ChunkCoord, LightChunk>,
+  /// 上次铺图的世界原点（cell 单位，已按 cell 对齐）
+  pub origin_cell: IVec3,
+  /// 是否已铺过一次（首帧之前 cache 为空、origin 无意义）
+  pub valid: bool,
+}
+
+/// extract → prepare：本帧要整幅重铺的光照场纹素字节
+/// （Rgba16Unorm，dims³ × 8B，行主序 x 最快；bytes_per_row = dims×8 天然 256 对齐）。
+#[derive(Resource, Clone)]
+pub struct LightFieldUpdate {
+  pub data: Vec<u8>,
+}
+
+/// 光照场窗口原点（cell 单位）：`align_down(cam - dims/2·cell, cell)`。
+///
+/// 与 WGSL `light_field_origin_voxel` 同一式子（shader 直接从 `view_u.cam_pos_voxel`
+/// 推），两边必须逐字一致，否则 AO/发光会整体错位。
+pub fn light_field_origin_cell(cam_voxel: glam::Vec3) -> IVec3 {
+  let cell = LIGHT_FIELD_CELL as i32;
+  let half = (LIGHT_FIELD_DIM as i32 / 2) * cell;
+  let c = cam_voxel.floor().as_ivec3() - IVec3::splat(half);
+  IVec3::new(c.x.div_euclid(cell), c.y.div_euclid(cell), c.z.div_euclid(cell))
+}
+
+/// 单个 chunk 的 16³ cell tally：同时产出 AO fill 与发光密度 ε（一次树查询供两者）。
+///
+/// 代价控制：cell 的三态 Air/Solid 一次查询即得（绝大多数 cell，Solid 还直接给出 palette
+/// → ε 精确）；仅 Mixed 才展开 64 个 4³ 子块。Mixed 子块按 fill=32（半实心）近似，
+/// ε 取 0 —— 发光块（灯）在调色板语义下是均质色，通常在 16³ 或 4³ 上就是 Solid，不受此近似影响。
+fn build_light_chunk(tree: &gate_voxel::ChunkTree, palette: &gate_voxel::Palette) -> LightChunk {
+  use gate_voxel::BrickState;
+  let emis = |pal: u8| -> f32 { palette.get(pal).emissive as f32 / 255.0 };
+  let mut fill = vec![0u8; 16 * 16 * 16].into_boxed_slice();
+  let mut emit = vec![0f32; 16 * 16 * 16].into_boxed_slice();
+  for lz in 0..16i32 {
+    for ly in 0..16i32 {
+      for lx in 0..16i32 {
+        let bx = lx * 16;
+        let by = ly * 16;
+        let bz = lz * 16;
+        // (实心体素数 0..4096, 发光强度之和 0..4096)
+        let (v, e): (u32, f32) = match tree.get_brick_state(bx, by, bz, 2) {
+          BrickState::Air => (0, 0.0),
+          BrickState::Solid(pal) => (4096, 4096.0 * emis(pal)),
+          BrickState::Mixed => {
+            let (mut n, mut es) = (0u32, 0f32);
+            for kk in 0..4i32 {
+              for jj in 0..4i32 {
+                for ii in 0..4i32 {
+                  match tree.get_brick_state(bx + ii * 4, by + jj * 4, bz + kk * 4, 3) {
+                    BrickState::Air => {}
+                    BrickState::Solid(pal) => {
+                      n += 64;
+                      es += 64.0 * emis(pal);
+                    }
+                    BrickState::Mixed => n += 32,
+                  }
+                }
+              }
+            }
+            (n, es)
+          }
+        };
+        let i = (lx + ly * 16 + lz * 256) as usize;
+        fill[i] = (v * 255 / 4096) as u8;
+        emit[i] = e / 4096.0;
+      }
+    }
+  }
+  LightChunk { fill, emit }
+}
+
 /// P2.7 上传 CPU 耗时样本（render world 资源，由 prepare 每帧 insert_resource 覆盖。
 /// render→main 同步由 P2.7 Task 2 gate-app sync_gpu_timings 内**通过 Arc<Mutex> 共享**，
 /// 详见下方 [`UploadCpuSampleChannel`]。上传段的 GPU 拷贝在 submit 时发生，测不到——OQ-2 选 A。
@@ -243,6 +345,14 @@ pub struct GpuBrickMap {
   /// 主世界 chunk 窗口（chunk 单位）CPU 副本：DDGI 世界空间探针网格推导用
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
+  /// 光照场（AO fill + 发光密度 ε）：Rgba16Unorm 3D 纹理 + **硬件三线性过滤**
+  /// （Douglas #15："implemented as a single Hardware filtered texture read"）。
+  /// 尺寸 = LIGHT_FIELD_DIM³，纹素 ↔ 一个 16-voxel cell；相机中心 + 世界锚定槽位，
+  /// 由 extract 侧铺好后整幅重写（见 [`LightFieldUpdate`]）。
+  /// 首次铺好前绑定 1³ 占位（采样恒 0 → AO=1、ε=0）。
+  pub light_tex: Texture,
+  pub light_view: TextureView,
+  pub light_sampler: Sampler,
 }
 
 // ----------------------------------------------------------------------------
@@ -260,6 +370,35 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     })
   };
   let globals = UniformBuffer::<BrickMapGlobals>::default();
+  // 光照场占位：1³ 空纹理 + 线性过滤采样器（真实 32³ 在 prepare 里首次铺图时创建）
+  let light_sampler = device.create_sampler(&SamplerDescriptor {
+    label: Some("gate_light_field_sampler"),
+    address_mode_u: AddressMode::ClampToEdge,
+    address_mode_v: AddressMode::ClampToEdge,
+    address_mode_w: AddressMode::ClampToEdge,
+    mag_filter: FilterMode::Linear,
+    min_filter: FilterMode::Linear,
+    mipmap_filter: MipmapFilterMode::Nearest,
+    ..Default::default()
+  });
+  let light_tex = device.create_texture(&TextureDescriptor {
+    label: Some("gate_light_field"),
+    size: Extent3d {
+      width: 1,
+      height: 1,
+      depth_or_array_layers: 1,
+    },
+    mip_level_count: 1,
+    sample_count: 1,
+    dimension: TextureDimension::D3,
+    format: TextureFormat::Rgba16Unorm,
+    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+    view_formats: &[],
+  });
+  let light_view = light_tex.create_view(&TextureViewDescriptor {
+    dimension: Some(TextureViewDimension::D3),
+    ..Default::default()
+  });
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     leaves: make("gate_leaves"),
@@ -271,6 +410,9 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     globals,
     main_window_origin: IVec3::ZERO,
     main_window_dims: UVec3::ZERO,
+    light_tex,
+    light_view,
+    light_sampler,
   });
 }
 
@@ -285,7 +427,9 @@ fn extract(
   scene: Option<Extract<Res<VoxelScene>>>,
   budget: Option<Extract<Res<UploadBudget>>>,
   main_pending: Option<Extract<Res<MainPending>>>,
+  camera: Option<Extract<Res<super::dda::DdaCameraConfig>>>,
   mut mirror: ResMut<BuilderMirror>,
+  mut light_field: ResMut<LightFieldCpu>,
 ) {
   let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
     return;
@@ -335,11 +479,39 @@ fn extract(
   }
   commands.insert_resource(ddgi_dirty);
 
-  // 如果非首帧 + 非强制全量 + 无脏 chunk → 跳过构建/上传（省 CPU 构建 + PCIe）
+  let volumes_ref = &scene.volumes;
+  // ---- 光照场（相机中心 + 世界锚定 + 可流式）：窗口移动或脏 chunk 落入窗口才重铺 ----
+  // 必须放在 `!dirty_any` 早退**之前**：相机滚动通常不带世界变化，但 AO/发光场得跟着相机走。
+  // 铺图整幅重来（32³ = 256KB）只在相机跨过 16 体素边界或世界编辑时发生；tally 走缓存，
+  // 新进窗口的 chunk 才需要读树（单个 chunk ≈3ms）。
+  let dirty_main: Vec<gate_voxel::ChunkCoord> = if need_full {
+    Vec::new() // full 会清空缓存，无需逐 chunk 剔除
+  } else {
+    pending_data
+      .iter()
+      .filter(|(v, _)| *v == 0)
+      .map(|(_, c)| *c)
+      .collect()
+  };
+  let cam_voxel = camera
+    .as_ref()
+    .map(|c| c.position_world)
+    .unwrap_or(glam::Vec3::ZERO);
+  if let Some(data) = update_light_field(
+    &mut light_field,
+    volumes_ref,
+    cam_voxel,
+    &dirty_main,
+    need_full,
+  ) {
+    commands.insert_resource(LightFieldUpdate { data });
+  }
+
+  // 非首帧 + 非强制全量 + 无脏 chunk → 跳过体素构建/上传（省 CPU 构建 + PCIe）；
+  // 光照场上面已经先行更新过（相机滚动不产生世界脏区）。
   if !dirty_any {
     return;
   }
-  let volumes_ref = &scene.volumes;
   let builder = mirror
     .builder
     .get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref));
@@ -362,6 +534,116 @@ fn extract(
     state_bytes,
     comp_chunks,
   });
+}
+
+/// 光照场增量更新（extract 侧）：相机中心 + 世界锚定槽位；窗口移动或脏 chunk 落入窗口时才铺。
+///
+/// - 窗口内缺失的 chunk → tally 进缓存；世界编辑只让脏 chunk 从缓存剔除后重算
+/// - 窗口外的缓存条目 → 淘汰（缓存规模恒 ≈ 覆盖窗口的 chunk 数）
+/// - 整幅铺图：dims³ 纹素，行主序 x 最快，Rgba16Unorm 8B/纹素（bytes_per_row = dims×8，
+///   天然 256 对齐，故无需补行）
+///
+/// 世界锚定槽位的意义与 DDGI `ddgi_slot` 相同：相机滚动换掉的只是「新进窗口那条带」的
+/// 世界 cell，其余纹素保持自己的身份 → 不会整幅错位/失效。
+///
+/// 返回 `None` = 本帧无需重铺（纹理沿用上一帧）。
+fn update_light_field(
+  lf: &mut LightFieldCpu,
+  volumes: &gate_voxel::Volumes,
+  cam_voxel: glam::Vec3,
+  dirty_main: &[gate_voxel::ChunkCoord],
+  force_full: bool,
+) -> Option<Vec<u8>> {
+  let dim = LIGHT_FIELD_DIM as i32;
+  let cs = LIGHT_FIELD_CELL as i32;
+  let origin_cell = light_field_origin_cell(cam_voxel);
+  // 场窗口的世界 voxel AABB（max 不含）
+  let win_lo = origin_cell * cs;
+  let win_hi = win_lo + IVec3::splat(dim * cs);
+  // 与窗口相交的 chunk 范围（chunk = CHUNK_SIZE 体素 = 16 cell）
+  let csz = IVec3::splat(gate_voxel::CHUNK_SIZE);
+  let c_lo = win_lo.div_euclid(csz);
+  let c_hi = (win_hi - IVec3::ONE).div_euclid(csz);
+
+  if force_full {
+    lf.cache.clear();
+  }
+  let moved = !lf.valid || origin_cell != lf.origin_cell;
+  // 脏 chunk 落在窗口内 → 剔除缓存，稍后重算（内容/palette 变了）
+  let mut edited = false;
+  for c in dirty_main {
+    if c.0.cmpge(c_lo).all() && c.0.cmple(c_hi).all() {
+      lf.cache.remove(c);
+      edited = true;
+    }
+  }
+  if !moved && !edited {
+    return None;
+  }
+
+  // 补齐窗口内缺失的 chunk（世界上不存在的 chunk 不插缓存 → 该区域保持空气：fill 0 / ε 0）
+  let grid = volumes.main();
+  let palette = grid.palette();
+  let t0 = std::time::Instant::now();
+  let mut tallied = 0usize;
+  for cz in c_lo.z..=c_hi.z {
+    for cy in c_lo.y..=c_hi.y {
+      for cx in c_lo.x..=c_hi.x {
+        let coord = gate_voxel::ChunkCoord::new(cx, cy, cz);
+        if lf.cache.contains_key(&coord) {
+          continue;
+        }
+        if let Some(tree) = grid.chunk(coord) {
+          lf.cache.insert(coord, build_light_chunk(tree, palette));
+          tallied += 1;
+        }
+      }
+    }
+  }
+  // 淘汰窗口外的条目
+  lf.cache
+    .retain(|c, _| c.0.cmpge(c_lo).all() && c.0.cmple(c_hi).all());
+
+  // 整幅铺图：纹素下标 = **世界锚定槽位** `((wc mod dim) + dim) mod dim`（与 WGSL
+  // `light_field_uv` 同一式子）。不能用 `wc − 窗口原点`：窗口原点是 cell 对齐而非 dim 对齐，
+  // 两者差一个常量偏移 → 纹素与着色采样错位。
+  let dimv = IVec3::splat(dim);
+  let mut data = vec![0u8; (dim * dim * dim) as usize * 8];
+  for (coord, t) in lf.cache.iter() {
+    for lz in 0..16i32 {
+      for ly in 0..16i32 {
+        for lx in 0..16i32 {
+          let wc = coord.0 * 16 + IVec3::new(lx, ly, lz);
+          let rel = wc - origin_cell;
+          if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dimv).any() {
+            continue;
+          }
+          let si = (lx + ly * 16 + lz * 256) as usize;
+          let r = wc.rem_euclid(dimv);
+          let ti = (r.x + r.y * dim + r.z * dim * dim) as usize;
+          // Rgba16Unorm：.rgb = ε、.a = fill（fill 是 0..255 → ×257 到 0..65535）
+          let e = (t.emit[si].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+          let a = (t.fill[si] as u32 * 257) as u16;
+          let ob = ti * 8;
+          data[ob..ob + 2].copy_from_slice(&e.to_le_bytes());
+          data[ob + 2..ob + 4].copy_from_slice(&e.to_le_bytes());
+          data[ob + 4..ob + 6].copy_from_slice(&e.to_le_bytes());
+          data[ob + 6..ob + 8].copy_from_slice(&a.to_le_bytes());
+        }
+      }
+    }
+  }
+  lf.origin_cell = origin_cell;
+  lf.valid = true;
+  bevy::log::debug!(
+    target: "gate",
+    "LIGHT FIELD: origin_cell={:?} tallied={} cached={} elapsed={:?}",
+    origin_cell,
+    tallied,
+    lf.cache.len(),
+    t0.elapsed()
+  );
+  Some(data)
 }
 
 // ----------------------------------------------------------------------------
@@ -495,15 +777,72 @@ fn ensure_capacity(
 // PrepareResources：snapshot → GPU 写；首帧探测 limits
 // ----------------------------------------------------------------------------
 
+/// 光照场整幅重铺：dims³ 纹素，行主序 x 最快，Rgba16Unorm 8B/纹素。
+/// 尺寸固定（LIGHT_FIELD_DIM），仅在占位纹理不匹配时重建；此后每次只 write_texture。
+fn upload_light_field(
+  device: &RenderDevice,
+  queue: &RenderQueue,
+  gpu: &mut GpuBrickMap,
+  data: &[u8],
+) {
+  let dim = LIGHT_FIELD_DIM;
+  let want = Extent3d {
+    width: dim,
+    height: dim,
+    depth_or_array_layers: dim,
+  };
+  let cur = gpu.light_tex.size();
+  if cur.width != dim || cur.height != dim || cur.depth_or_array_layers != dim {
+    gpu.light_tex = device.create_texture(&TextureDescriptor {
+      label: Some("gate_light_field"),
+      size: want,
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D3,
+      format: TextureFormat::Rgba16Unorm,
+      usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+      view_formats: &[],
+    });
+    gpu.light_view = gpu.light_tex.create_view(&TextureViewDescriptor {
+      dimension: Some(TextureViewDimension::D3),
+      ..Default::default()
+    });
+  }
+  // bytes_per_row = dim×8 = 256，天然满足 wgpu 的 256 对齐 → 无需补行
+  debug_assert_eq!(data.len(), (dim as usize).pow(3) * 8);
+  queue.write_texture(
+    TexelCopyTextureInfo {
+      texture: &gpu.light_tex,
+      mip_level: 0,
+      origin: Origin3d::ZERO,
+      aspect: TextureAspect::All,
+    },
+    data,
+    TexelCopyBufferLayout {
+      offset: 0,
+      bytes_per_row: Some(dim * 8),
+      rows_per_image: Some(dim),
+    },
+    want,
+  );
+}
+
 pub(crate) fn prepare(
   mut commands: Commands,
-  snapshot: Option<Res<UploadSnapshot>>,
+  snapshot: Option<ResMut<UploadSnapshot>>,
+  light: Option<ResMut<LightFieldUpdate>>,
   mut gpu: ResMut<GpuBrickMap>,
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
   sample_channel: Option<Res<UploadCpuSampleChannel>>,
   mut revision: ResMut<BrickMapRevision>,
 ) {
+  // ---- 光照场（相机中心 + 世界锚定）：整幅重铺（Rgba16Unorm，dims³×8B）----
+  // 放在 UploadSnapshot 早退之前：相机滚动只更新光照场、不带体素上传。
+  if let Some(u) = light.as_ref() {
+    upload_light_field(&device, &queue, &mut gpu, &u.data);
+    commands.remove_resource::<LightFieldUpdate>();
+  }
   let Some(snap) = snapshot else { return };
   let t0 = std::time::Instant::now();
 
@@ -686,6 +1025,7 @@ pub(crate) fn prepare(
     main_desc.index_dims_y,
     main_desc.index_dims_z,
   );
+
   // 世界数据已更新 → 修订号自增（下游 GPU pass 据此触发重烘焙）
   revision.0 = revision.0.wrapping_add(1);
 
@@ -772,6 +1112,7 @@ impl Plugin for VolumePlugin {
     render_app
       .insert_resource(ch)
       .init_resource::<BrickMapRevision>()
+      .init_resource::<LightFieldCpu>()
       .insert_resource(BuilderMirror {
         pending_full: true,
         ..Default::default()
@@ -792,6 +1133,91 @@ mod tests {
   use super::super::wire::{CHUNK_INDEX_WORDS, STATE_TOTAL_WORDS};
   use super::*;
   use gate_voxel::fill_box;
+
+  /// 光照场窗口原点：按 cell 对齐（世界锚定槽位 `wc mod dim` 的铺图依赖它整除精确）
+  /// + 相机恒落在盒中心（偏差 < 1 cell）。
+  #[test]
+  fn light_field_origin_is_cell_aligned_and_centered() {
+    let cell = LIGHT_FIELD_CELL as i32;
+    let dim = LIGHT_FIELD_DIM as i32;
+    for cam in [
+      glam::Vec3::new(0.0, 0.0, 0.0),
+      glam::Vec3::new(1000.3, -333.7, 7.2),
+      glam::Vec3::new(-1.5, -7.5, 12345.9),
+    ] {
+      let o_vox = light_field_origin_cell(cam) * cell;
+      assert_eq!(o_vox.rem_euclid(IVec3::splat(cell)), IVec3::ZERO);
+      let rel = cam.floor().as_ivec3() - o_vox;
+      assert!(
+        rel.cmpge(IVec3::ZERO).all() && rel.cmplt(IVec3::splat(dim * cell)).all(),
+        "cam {cam:?} 不在场窗口内"
+      );
+      let d = (rel - IVec3::splat(dim / 2 * cell)).abs();
+      assert!(d.cmplt(IVec3::splat(cell)).all(), "cam {cam:?} 偏离盒心 {d:?}");
+    }
+  }
+
+  /// 光照场纹素 8B → bytes_per_row = dim×8；upload 依赖它天然满足 wgpu 的 256 对齐（不补行）。
+  /// 并锁死「chunk 恰好是整数个 cell」（tally 的 chunk↔cell 换算依赖它）。
+  #[test]
+  fn light_field_row_alignment() {
+    assert_eq!((LIGHT_FIELD_DIM * 8) % 256, 0);
+    assert_eq!(gate_voxel::CHUNK_SIZE % LIGHT_FIELD_CELL as i32, 0);
+    assert_eq!(gate_voxel::CHUNK_SIZE / LIGHT_FIELD_CELL as i32, 16);
+  }
+
+  fn emissive_grid() -> gate_voxel::Volumes {
+    let mut g = gate_voxel::VolumeGrid::new();
+    let mut e = gate_voxel::PaletteEntry::default();
+    e.emissive = 255;
+    g.palette_mut().set(1, e);
+    // 单个 16³ 实心发光块 = 恰好一个 cell（世界 cell (24,24,24) = 体素 [384,400)）
+    fill_box(&mut g, IVec3::splat(384), IVec3::splat(16), 1);
+    gate_voxel::Volumes::new(g)
+  }
+
+  fn slot_texel(dim: i32, wc: IVec3) -> usize {
+    let r = wc.rem_euclid(IVec3::splat(dim));
+    (r.x + r.y * dim + r.z * dim * dim) as usize
+  }
+
+  /// tally：整块实心发光 → fill=255、ε=1；相邻空气 cell → 0。
+  #[test]
+  fn light_chunk_tally_fill_and_emissive() {
+    let vol = emissive_grid();
+    let tree = vol.main().chunk(gate_voxel::ChunkCoord::new(1, 1, 1)).unwrap();
+    let t = build_light_chunk(tree, vol.main().palette());
+    let solid = 8 + 8 * 16 + 8 * 256; // chunk-local cell (8,8,8)
+    assert_eq!(t.fill[solid], 255);
+    assert!((t.emit[solid] - 1.0).abs() < 1e-6);
+    assert_eq!(t.fill[0], 0);
+    assert_eq!(t.emit[0], 0.0);
+  }
+
+  /// 铺图必须用**世界锚定槽位** `wc mod dim`（与 WGSL `light_field_uv` 同式子）：
+  /// 同一个世界 cell 在两处相机位置下都在窗口内时 → 同一个纹素、内容不变。
+  /// 这正是「相机滚动只换新进那条带、其余纹素身份不变」（可流式）的代数形式。
+  #[test]
+  fn light_field_blit_is_world_anchored() {
+    let dim = LIGHT_FIELD_DIM as i32;
+    let cell = LIGHT_FIELD_CELL as i32;
+    let vol = emissive_grid();
+    let ti = slot_texel(dim, IVec3::splat(24));
+    let read = |origin_cell: i32, lf: &mut LightFieldCpu| -> [u8; 8] {
+      let cam = glam::Vec3::splat((origin_cell * cell + dim / 2 * cell) as f32);
+      let data = update_light_field(lf, &vol, cam, &[], false).expect("窗口移动应重铺");
+      assert_eq!(light_field_origin_cell(cam).x, origin_cell);
+      let mut out = [0u8; 8];
+      out.copy_from_slice(&data[ti * 8..ti * 8 + 8]);
+      out
+    };
+    let mut lf = LightFieldCpu::default();
+    let a = read(16, &mut lf);
+    let b = read(24, &mut lf); // 窗口整体滚 8 个 cell，cell 24 仍在窗口内
+    // Rgba16Unorm：ε = 1 → 65535、fill = 255 → 65535
+    assert_eq!(a, [0xFFu8; 8], "发光 cell 未落在世界锚定槽位");
+    assert_eq!(a, b, "相机移动后同一世界 cell 的纹素内容变了");
+  }
 
   #[test]
   fn limits_select_layout() {

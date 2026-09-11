@@ -21,6 +21,7 @@ use gate_ui::{
   },
 };
 
+use crate::edit::{BrushShape, EDIT_MATERIALS, EDIT_SIZE_MAX, EDIT_SIZE_MIN, EditSettings};
 use crate::showcase::ShowcaseRoot;
 
 // ================= 左上角单行 FPS（CUR/AVG/MIN/MAX） =================
@@ -81,11 +82,64 @@ struct DdgiProbeVizLodSlider;
 #[derive(Component)]
 struct DdgiProbeVizLodValueLabel;
 
+/// 「Fly mode」开关标记（观察者写 [`crate::camera::CameraMode`]）
+#[derive(Component)]
+struct CameraModeToggle;
+
+#[derive(Component)]
+struct CameraSpeedSlider;
+
+#[derive(Component)]
+struct CameraSpeedValueLabel;
+
+/// 笔触形状按钮（互斥；值 = 该按钮代表的形状）
+#[derive(Component)]
+struct EditShapeBtn(BrushShape);
+
+#[derive(Component)]
+struct EditSizeSlider;
+
+#[derive(Component)]
+struct EditSizeValueLabel;
+
+#[derive(Component)]
+struct EditMaterialSlider;
+
+#[derive(Component)]
+struct EditMaterialValueLabel;
+
+/// 材质预览色块（只显示，不参与交互 —— button_state_system 会覆盖 Button 的背景色，
+/// 所以这里用裸 Node + BackgroundColor）
+#[derive(Component)]
+struct EditMaterialSwatch;
+
 const DDGI_PROBE_VIZ_LODS: [&str; 5] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3"];
 
 const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
 
 const DDGI_STAGES: [&str; 4] = ["Off", "Active", "Cast", "Full"];
+
+/// 速度显示文本（voxel/s；1 voxel = 2cm）
+fn speed_text(v: f32) -> String {
+  format!("{} v/s", v.round() as i32)
+}
+
+/// 笔触跨度文本：size → (2N-1)³ 的边长（纯 ASCII，避免字体缺字形成方框）
+fn brush_span_text(size: u32) -> String {
+  format!("{size} vx (span {})", 2 * size.max(1) - 1)
+}
+
+/// 材质预览色
+fn material_color(i: usize) -> Color {
+  let c = EDIT_MATERIALS[i.min(EDIT_MATERIALS.len() - 1)].color;
+  Color::srgb_u8(c[0], c[1], c[2])
+}
+
+/// 材质显示文本（名称 + 自发光）
+fn material_text(i: usize) -> String {
+  let m = &EDIT_MATERIALS[i.min(EDIT_MATERIALS.len() - 1)];
+  format!("{} em{}", m.name, m.emissive)
+}
 
 /// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
 pub(crate) fn fps3(v: f32) -> u32 {
@@ -93,13 +147,36 @@ pub(crate) fn fps3(v: f32) -> u32 {
 }
 
 /// 左上角 debug-view 面板：**固定宽度 360px、高度 auto**（随当前 Tab 页内容收缩）。
-/// TabView（fit_content 自适应高度模式）两页：
+/// TabView（fit_content 自适应高度模式）三页：
 /// - Stats：FPS 读数 / 相机信息 / VSync / UI Showcase
+/// - DDGI：阶段档 / 调试模式 / Gain / Probe Viz / LOD
+/// - Camera：轨道↔幽灵模式开关 / 飞行速度 / 操作说明
+///
+/// **所有控件的初始状态都从对应 Resource 读取**（UI 只是资源的视图）—— 缺省值只在
+/// `DdgiStage::from_env` / `DdgiDebugSettings::default` / `camera` 里写一次，
+/// 避免"资源默认变了、UI 还写着旧值"这类漂移。
 ///
 /// 视觉：root 提供外框 + HUD 卡面底色；每页一个 grid（去外框/gap，行分割线由
 /// cell bottom border 承担，避免右侧叠成 2px）。
 /// 定位由本函数设置（PositionType::Absolute + 左上 8px 锚定）。
 pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
+  // ---- 初始状态：全部从资源读（见函数注释）----
+  let ddgi_stage = world
+    .get_resource::<gate_render::ddgi::DdgiStage>()
+    .map_or(0, |s| s.0.min(DDGI_STAGES.len() as u8 - 1));
+  let ddgi_dbg = world
+    .get_resource::<gate_render::ddgi::DdgiDebugSettings>()
+    .copied()
+    .unwrap_or_default();
+  let cam_fly = world
+    .get_resource::<crate::camera::CameraMode>()
+    .is_some_and(|m| *m == crate::camera::CameraMode::Fly);
+  let fly_speed = world
+    .get_resource::<crate::camera::FlyCamera>()
+    .map_or(crate::camera::FLY_SPEED_DEFAULT, |f| f.speed)
+    .clamp(crate::camera::FLY_SPEED_MIN, crate::camera::FLY_SPEED_MAX);
+  let edit = world.get_resource::<EditSettings>().copied().unwrap_or_default();
+  let edit_mat = edit.material.min(EDIT_MATERIALS.len() - 1);
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
   // 绝对定位根：定宽 + 高度 auto（TabView fit_content 随活动页收缩）；外框/底色本节点提供
@@ -154,7 +231,12 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         ctx,
         root,
         TabConfig {
-          tabs: vec!["Stats".into(), "DDGI".into()],
+          tabs: vec![
+            "Stats".into(),
+            "DDGI".into(),
+            "Camera".into(),
+            "Edit".into(),
+          ],
           active: 0,
           fit_content: true,
           ..default()
@@ -262,7 +344,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       SliderConfig {
                         min: 0.0,
                         max: 3.0,
-                        value: 0.0,
+                        value: f32::from(ddgi_stage),
                         step: Some(1.0),
                         ..default()
                       },
@@ -272,14 +354,18 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       &ctx,
                       row,
                       LabelConfig {
-                        text: "0 Off".into(),
+                        text: format!(
+                          "{} {}",
+                          ddgi_stage,
+                          DDGI_STAGES[(ddgi_stage as usize).min(DDGI_STAGES.len() - 1)]
+                        ),
                         style: LabelStyle::Muted,
                         ..default()
                       },
                     );
                     row.world_mut().entity_mut(*vl).insert(DdgiStageValueLabel);
                   });
-                // -- 调试模式按钮行（5 按钮互斥单选；默认 mode=0 Normal = Primary）--
+                // -- 调试模式按钮行（5 按钮互斥单选；选中项 = DdgiDebugSettings.mode）--
                 cell
                   .spawn((
                     Name::new("ddgi-mode-row"),
@@ -291,8 +377,9 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     },
                   ))
                   .with_children(|row| {
+                    let active = ddgi_dbg.mode.round() as u8;
                     for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
-                      let variant = if i == 0 {
+                      let variant = if i as u8 == active {
                         ButtonVariant::Primary
                       } else {
                         ButtonVariant::Ghost
@@ -339,7 +426,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       SliderConfig {
                         min: 0.1,
                         max: 4.0,
-                        value: 1.0,
+                        value: ddgi_dbg.gain.clamp(0.1, 4.0),
                         step: Some(0.1),
                         ..default()
                       },
@@ -349,7 +436,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       &ctx,
                       row,
                       LabelConfig {
-                        text: "1.0".into(),
+                        text: format!("{:.1}", ddgi_dbg.gain),
                         style: LabelStyle::Muted,
                         ..default()
                       },
@@ -361,7 +448,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   cell,
                   ToggleSwitchConfig {
                     text: Some("Probe Viz".into()),
-                    checked: false,
+                    checked: ddgi_dbg.probe_viz,
                     ..default()
                   },
                 );
@@ -393,7 +480,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       SliderConfig {
                         min: 0.0,
                         max: 4.0,
-                        value: 0.0,
+                        value: ddgi_dbg.probe_viz_lod.clamp(0.0, 4.0),
                         step: Some(1.0),
                         ..default()
                       },
@@ -403,7 +490,9 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       &ctx,
                       row,
                       LabelConfig {
-                        text: DDGI_PROBE_VIZ_LODS[0].into(),
+                        text: DDGI_PROBE_VIZ_LODS
+                          [(ddgi_dbg.probe_viz_lod.round() as usize).min(DDGI_PROBE_VIZ_LODS.len() - 1)]
+                        .into(),
                         style: LabelStyle::Muted,
                         ..default()
                       },
@@ -414,6 +503,238 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       .insert(DdgiProbeVizLodValueLabel);
                   });
               });
+          });
+        });
+      // ============ Tab 2：Camera（轨道 ↔ 幽灵模式 + 飞行速度）============
+      root
+        .world_mut()
+        .entity_mut(tv.contents[2])
+        .with_children(|page| {
+          let g = tab_page_grid(ctx, page);
+          page.world_mut().entity_mut(g).with_children(|g| {
+            // 相机模式开关：关 = 轨道（P2.6 原行为），开 = 幽灵飞行。**唯一切换入口**。
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              let t = toggle_switch(
+                ctx,
+                cell,
+                ToggleSwitchConfig {
+                  text: Some("Fly mode".into()),
+                  checked: cam_fly,
+                  ..default()
+                },
+              );
+              cell.world_mut().entity_mut(*t).insert(CameraModeToggle);
+            });
+            // 飞行速度（voxel/s；只在 Fly 模式下生效，1 voxel = 2cm）
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("cam-speed-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.md),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: "Speed".into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  let s = slider(
+                    &ctx,
+                    row,
+                    SliderConfig {
+                      min: crate::camera::FLY_SPEED_MIN,
+                      max: crate::camera::FLY_SPEED_MAX,
+                      value: fly_speed,
+                      step: Some(crate::camera::FLY_SPEED_STEP),
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*s).insert(CameraSpeedSlider);
+                  let vl = label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: speed_text(fly_speed),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*vl).insert(CameraSpeedValueLabel);
+                });
+            });
+          });
+        });
+      // ============ Tab 3：Edit（体素编辑笔触：形状 / 大小 / 材质）============
+      // 生效范围：**仅幽灵模式**（轨道模式左键仍是 recenter，见 camera::left_click_pick_recenter）。
+      // 左键放置（只填空气）/ 右键擦除（挖空）；笔触以命中格为中心按形状展开。
+      root
+        .world_mut()
+        .entity_mut(tv.contents[3])
+        .with_children(|page| {
+          let g = tab_page_grid(ctx, page);
+          page.world_mut().entity_mut(g).with_children(|g| {
+            // -- 形状：Sphere / Cube 互斥按钮 --
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("edit-shape-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.sm),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: "Shape".into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  for (shape, name) in [
+                    (BrushShape::Sphere, "Sphere"),
+                    (BrushShape::Cube, "Cube"),
+                  ] {
+                    let variant = if shape == edit.shape {
+                      ButtonVariant::Primary
+                    } else {
+                      ButtonVariant::Ghost
+                    };
+                    let b = button(
+                      &ctx,
+                      row,
+                      ButtonConfig {
+                        text: name.into(),
+                        variant,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*b).insert(EditShapeBtn(shape));
+                  }
+                });
+            });
+            // -- 笔触大小（voxel；1 = 单格，N = (2N-1) 跨度）--
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("edit-size-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.md),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: "Size".into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  let s = slider(
+                    &ctx,
+                    row,
+                    SliderConfig {
+                      min: EDIT_SIZE_MIN as f32,
+                      max: EDIT_SIZE_MAX as f32,
+                      value: edit.size as f32,
+                      step: Some(1.0),
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*s).insert(EditSizeSlider);
+                  let vl = label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: brush_span_text(edit.size),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*vl).insert(EditSizeValueLabel);
+                });
+            });
+            // -- 材质（预设表下标；右侧名称 + 自发光 + 预览色块）--
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("edit-mat-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.md),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: "Mat".into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  let s = slider(
+                    &ctx,
+                    row,
+                    SliderConfig {
+                      min: 0.0,
+                      max: (EDIT_MATERIALS.len() - 1) as f32,
+                      value: edit_mat as f32,
+                      step: Some(1.0),
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*s).insert(EditMaterialSlider);
+                  let vl = label(
+                    &ctx,
+                    row,
+                    LabelConfig {
+                      text: material_text(edit_mat),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*vl).insert(EditMaterialValueLabel);
+                  row.spawn((
+                    Name::new("edit-mat-swatch"),
+                    EditMaterialSwatch,
+                    Node {
+                      width: px(44.0),
+                      height: px(m.font_size.md),
+                      border: UiRect::all(px(m.border_width)),
+                      ..default()
+                    },
+                    BackgroundColor(material_color(edit_mat)),
+                    BorderColor::all(color_of(&c.border)),
+                  ));
+                });
+            });
           });
         });
     });
@@ -552,6 +873,102 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       }
     },
   );
+
+  // 「Fly mode」开关 → 写 CameraMode（位置对齐由 camera::sync_camera_mode_switch 负责）
+  world.add_observer(
+    |ev: On<ToggleSwitchToggled>,
+     q_toggle: Query<(), With<CameraModeToggle>>,
+     mut mode: ResMut<crate::camera::CameraMode>| {
+      if q_toggle.get(ev.entity).is_err() {
+        return;
+      }
+      *mode = if ev.checked {
+        crate::camera::CameraMode::Fly
+      } else {
+        crate::camera::CameraMode::Orbit
+      };
+    },
+  );
+
+  // 飞行速度滑杆 → 写 FlyCamera.speed + 刷新右侧数值标签
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<CameraSpeedSlider>>,
+     mut q_label: Query<&mut Text, With<CameraSpeedValueLabel>>,
+     mut fly: ResMut<crate::camera::FlyCamera>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      fly.speed =
+        ev.value
+          .clamp(crate::camera::FLY_SPEED_MIN, crate::camera::FLY_SPEED_MAX);
+      if let Ok(mut t) = q_label.single_mut() {
+        t.0 = speed_text(fly.speed);
+      }
+      info!("fly speed → {} v/s", fly.speed.round() as i32);
+    },
+  );
+
+  // Edit：笔触形状按钮 → 写 EditSettings.shape + 互斥切换变体（选中=Primary）
+  world.add_observer(
+    |ev: On<UiClick>,
+     q_btn: Query<&EditShapeBtn>,
+     mut q_all: Query<(Entity, &mut ButtonVariant, &EditShapeBtn)>,
+     mut settings: ResMut<EditSettings>| {
+      let Ok(btn) = q_btn.get(ev.entity) else {
+        return;
+      };
+      settings.shape = btn.0;
+      for (_e, mut var, b) in &mut q_all {
+        *var = if b.0 == btn.0 {
+          ButtonVariant::Primary
+        } else {
+          ButtonVariant::Ghost
+        };
+      }
+      info!("edit brush shape → {:?}", btn.0);
+    },
+  );
+
+  // Edit：笔触大小滑杆 → 写 EditSettings.size + 刷新跨度标签
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<EditSizeSlider>>,
+     mut q_label: Query<&mut Text, With<EditSizeValueLabel>>,
+     mut settings: ResMut<EditSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      let v = (ev.value.round() as u32).clamp(EDIT_SIZE_MIN, EDIT_SIZE_MAX);
+      settings.size = v;
+      if let Ok(mut t) = q_label.single_mut() {
+        t.0 = brush_span_text(v);
+      }
+      info!("edit brush size → {v} vx");
+    },
+  );
+
+  // Edit：材质滑杆 → 写 EditSettings.material + 刷新名称标签与预览色块
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<EditMaterialSlider>>,
+     mut q_label: Query<&mut Text, With<EditMaterialValueLabel>>,
+     mut q_swatch: Query<&mut BackgroundColor, With<EditMaterialSwatch>>,
+     mut settings: ResMut<EditSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      let i = (ev.value.round() as usize).min(EDIT_MATERIALS.len() - 1);
+      settings.material = i;
+      if let Ok(mut t) = q_label.single_mut() {
+        t.0 = material_text(i);
+      }
+      if let Ok(mut bg) = q_swatch.single_mut() {
+        bg.0 = material_color(i);
+      }
+      info!("edit material → {}", EDIT_MATERIALS[i].name);
+    },
+  );
 }
 
 /// Tab 页内网格：1 列 auto 行高。**去外框 + 去 gap 底色**——面板 root 已提供外框，
@@ -625,6 +1042,8 @@ pub(crate) fn debug_overlay_toggle(
 pub(crate) fn fps_line_feed(
   time: Res<Time>,
   orbit: Res<OrbitCamera>,
+  mode: Res<crate::camera::CameraMode>,
+  fly: Res<crate::camera::FlyCamera>,
   mut q: ParamSet<(
     Query<&mut Text, With<FpsText>>,
     Query<&mut Text, With<CamInfoText>>,
@@ -681,12 +1100,28 @@ pub(crate) fn fps_line_feed(
   {
     t.0 = txt;
   }
-  // 相机信息：CAMERA / TARGET 两行
-  let eye = orbit.eye();
-  let tgt = orbit.target;
+  // 相机信息两行：轨道模式 = 眼位 + 注视点；幽灵模式 = 飞行眼位 + 朝向角。
+  // （幽灵模式下没有"轨道目标"，继续显示它只会给出误导读数。）
+  let (eye, line2) = match *mode {
+    crate::camera::CameraMode::Orbit => {
+      let t = orbit.target;
+      (
+        orbit.eye(),
+        format!("TARGET: ({:>7.1}, {:>7.1}, {:>7.1})", t.x, t.y, t.z),
+      )
+    }
+    crate::camera::CameraMode::Fly => (
+      fly.pos,
+      format!(
+        "DIR(deg): yaw {:>6.1}, pitch {:>5.1}",
+        orbit.yaw.to_degrees(),
+        orbit.pitch.to_degrees()
+      ),
+    ),
+  };
   let cam_txt = format!(
-    "CAMERA: ({:>7.1}, {:>7.1}, {:>7.1})\nTARGET: ({:>7.1}, {:>7.1}, {:>7.1})",
-    eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z
+    "CAMERA: ({:>7.1}, {:>7.1}, {:>7.1})\n{}",
+    eye.x, eye.y, eye.z, line2
   );
   if let Some(mut t) = q.p1().iter_mut().next()
     && t.0 != cam_txt

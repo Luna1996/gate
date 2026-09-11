@@ -23,7 +23,11 @@ pub const DEPTH_TEXELS: u32 = 16;
 pub const PROBE_T_MAX: f32 = 8192.0;
 /// 每帧射线总预算。WGSL `ddgi_seal` 把它**均分**给全部活跃探针（rpp = 预算 / 活跃数，
 /// 钳在 [1, 256]），所以这是一条直接线性的画质/帧时旋钮：减半 → cast/collect 的帧时也
-/// 大致减半，代价是每探针样本减半、图集噪声变大（由 α=0.06 的时域混合吸收）。
+/// 大致减半，代价是每探针样本减半、图集噪声变大。
+///
+/// 【历史】曾试过 262144 / 1048576 来压制"探针晶格亮斑"与深度闸门抖动，**帧时涨了但问题
+/// 没解决**（根因是探针网格对贴缝尺度欠采样 + 深度的角度均值偏差，不是射线数量），已退回
+/// 131072。若要再动这条线，请先备好可验证的收益。
 /// 必须与 WGSL `DDGI_RAY_BUDGET` 保持一致。
 pub const DDGI_RAY_BUDGET: u32 = 131072;
 
@@ -32,14 +36,17 @@ pub const DDGI_LODS: u32 = 4;
 pub const DDGI_BASE_CELL: i32 = 16;
 /// 4 级 LOD cell 边长（每级 ×2）。
 ///
-/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [32,64,128,256]：
-/// LOD0 的 probe 间距 64cm 是 DDGI 的正常量级（0.5–2m），换来的是整体作用范围 ×4。
-pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [32, 64, 128, 256];
+/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [16,32,64,128]：
+/// 探针数 / 射线预算 / 显存全不变（dims 不变），只是把同样的探针铺在**更小的体积**上 ——
+/// 近场探针间距 64cm→32cm。这是"探针晶格"伪影（GI 场的空间变化比探针网格更细时，
+/// 三线性插值把每个探针自己的值暴露成 0.64m 周期的亮斑）最直接的降压手段。
+/// 代价：每级覆盖范围减半（见下），远景靠更粗级兜底。
+pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
 /// 各级 LOD 的 cell 维度（4 级相同）。每级 cell ×2 且维度不变 → 覆盖范围逐级 ×2，
 /// 形成严格嵌套的级联。水平 32 格、垂直 16 格（体素世界水平视野远大于垂直）。
-/// cell [32,64,128,256] 时各级覆盖范围 = dims×cell：
-/// 1024×512×1024 / 2048×1024×2048 / 4096×2048×4096 / 8192×4096×8192 voxel
-/// = 20.5×10.2×20.5 / 41×20.5×41 / 82×41×82 / 164×82×164 m（半宽到 ±82m）。
+/// cell [16,32,64,128] 时各级覆盖范围 = dims×cell：
+/// 512×256×512 / 1024×512×1024 / 2048×1024×2048 / 4096×2048×4096 voxel
+/// = 10.2×5.1×10.2 / 20.5×10.2×20.5 / 41×20.5×41 / 82×41×82 m（半宽到 ±41m）。
 /// 每级 16384 槽 → 共 65536 槽（= 占位纹理容量，全部槽位可采样）。
 pub const DDGI_LOD_DIMS: UVec3 = UVec3::new(32, 16, 32);
 // 槽位映射是**世界锚定**的：shader 里 `slot = slot_base + (世界 cell 号 mod dims)`（见
@@ -222,7 +229,10 @@ pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
     "DdgiBg5",
     &[
       store(0, TextureFormat::Rgba16Float),
-      store(1, TextureFormat::R32Float),
+      // depth 图集也从单通道升到 Rgba16Float：.x = mean、.y = std（距离标准差），
+      // 供采样侧做 Chebyshev 软遮挡（参考 Majercik/RTXGI）。R32Float 只有均值，
+      // 只能做刀锋判定 → 深度一抖就"入选/落选"翻转（亮区边界伸缩）。
+      store(1, TextureFormat::Rgba16Float),
     ],
   )
 }
@@ -328,15 +338,17 @@ impl DdgiStage {
   pub fn new(v: u8) -> Self {
     Self(v.min(Self::FULL))
   }
-  /// 【诊断】`GATE_DDGI_STAGE=0..3`：启动即进入指定阶段（缺省 0 = Off）。
-  /// 存在的理由：默认 Off 要靠 UI 滑杆才能打开，`GATE_BENCH=1` 的无 UI 跑法没法切，
-  /// 拿不到「DDGI=Full」状态下的帧时数据。与 GATE_NO_LOD / GATE_SKIP_CHUNKWALK 同风格。
+  /// `GATE_DDGI_STAGE=0..3` 覆盖启动阶段（与 GATE_NO_LOD / GATE_SKIP_CHUNKWALK 同风格）。
+  ///
+  /// **缺省 = FULL(3)**：DDGI 已稳定，默认开启（用户明确要求）。曾经缺省 Off、只能靠 UI
+  /// 滑杆打开，`GATE_BENCH=1` 的无 UI 跑法因此拿不到 Full 的帧时数据 —— 现在反过来：
+  /// 需要基准对比「DDGI=Off」时显式 `GATE_DDGI_STAGE=0`。
   fn from_env() -> Self {
     Self::new(
       std::env::var("GATE_DDGI_STAGE")
         .ok()
         .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(Self::OFF),
+        .unwrap_or(Self::FULL),
     )
   }
   pub fn run_active(&self) -> bool {
@@ -376,7 +388,14 @@ impl bevy::app::Plugin for DdgiPlugin {
   fn build(&self, app: &mut bevy::app::App) {
     use bevy::ecs::schedule::IntoScheduleConfigs;
     use bevy::prelude::RenderGraph;
-    app.insert_resource(DdgiStage::from_env());
+    let stage = DdgiStage::from_env();
+    bevy::log::info!(
+      target: "gate",
+      "DDGI stage = {} ({}) —— 缺省 Full；GATE_DDGI_STAGE=0..3 可覆盖",
+      stage.0,
+      ["Off", "Active", "Cast", "Full"][stage.0.min(3) as usize],
+    );
+    app.insert_resource(stage);
     app.init_resource::<DdgiDebugSettings>();
     let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
       return;
@@ -517,7 +536,7 @@ fn ddgi_array_tex(
   })
 }
 
-/// 图集清零。Rgba16Float / R32Float 的 0.0 都是全 0 字节，直接写零块。
+/// 图集清零。Rgba16Float 的 0.0 是全 0 字节，直接写零块。
 /// 必须清零：probe 一 enabled 就可能被采样，但它的图集纹素要等第一次 collect 才有效，
 /// 否则会读到未初始化显存（NaN/垃圾污染 GI）。
 fn zero_array_tex(
@@ -574,8 +593,8 @@ fn init_ddgi_gpu(
     mk_atlas("ddgi_irr_b", TextureFormat::Rgba16Float, (irr_axis, irr_axis), 8),
   ];
   let depth = [
-    mk_atlas("ddgi_depth_a", TextureFormat::R32Float, (dep_axis, dep_axis), 4),
-    mk_atlas("ddgi_depth_b", TextureFormat::R32Float, (dep_axis, dep_axis), 4),
+    mk_atlas("ddgi_depth_a", TextureFormat::Rgba16Float, (dep_axis, dep_axis), 8),
+    mk_atlas("ddgi_depth_b", TextureFormat::Rgba16Float, (dep_axis, dep_axis), 8),
   ];
 
   let slot_pos = zero_storage_buffer(&device, &queue, "ddgi_slot_pos", 4096 * 16);

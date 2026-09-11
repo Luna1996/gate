@@ -30,3 +30,18 @@ fn wgsl_shaders_parse_and_validate() {
   compile_wgsl("shaders/dda.wgsl");
   compile_wgsl("shaders/blit.wgsl");
 }
+
+/// `SHADOW_SURFACE_EPS` 是「阴影/GI 起点推过体素边界」的量化契约，必须与 Rust 侧常量
+/// 逐字一致。值 ≤0 会让 -X/-Y/-Z 面的阴影射线在 t=0 自命中出发点体素，而 dda_main 把
+/// 自命中当「无遮挡」→ 封闭空间漏直射太阳光（室内明暗完全跟着面朝向走）。
+/// CPU 侧的行为由 `brickmap::dda::dda_ref_tests::shadow_ray_start_offset_clears_hit_voxel` 锁定。
+#[test]
+fn shadow_surface_eps_matches_rust_const() {
+  let path = manifest_dir().join("../gate-app/assets/shaders/dda.wgsl");
+  let src = std::fs::read_to_string(&path).expect("读 dda.wgsl");
+  let expect = format!(
+    "const SHADOW_SURFACE_EPS: f32 = {};",
+    gate_render::brickmap::dda::wgsl_consts::SHADOW_SURFACE_EPS
+  );
+  assert!(src.contains(&expect), "dda.wgsl 中未找到 `{expect}`");
+}

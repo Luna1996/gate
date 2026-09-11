@@ -12,6 +12,7 @@
 
 mod camera;
 mod debug_overlay;
+mod edit;
 mod scene;
 mod showcase;
 #[cfg(feature = "profile")]
@@ -28,8 +29,12 @@ use bevy::{
 use gate_render::VIEW_SIZE;
 use gate_ui::{ThemeFont, UiCtx, UiTheme};
 
-use camera::{left_click_pick_recenter, orbit_camera_input};
+use camera::{
+  build_camera_config, camera_look_input, fly_camera_input, left_click_pick_recenter,
+  orbit_camera_input, sync_camera_mode_switch,
+};
 use debug_overlay::{DemoUiRoot, debug_overlay_toggle, fps_line_feed, spawn_debug_view};
+use edit::voxel_edit_input;
 use scene::setup;
 use showcase::{showcase_demo_system, spawn_showcase};
 
@@ -128,6 +133,8 @@ fn main() {
   app
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
+    // 体素编辑设置（形状/大小/材质/材质→调色板槽缓存）；DebugView 的 Edit tab 是它的视图
+    .init_resource::<edit::EditSettings>()
     // 【诊断】GATE_BENCH=1：后台/失焦窗口也用 Continuous 更新（Bevy 默认失焦切
     // reactive_low_power 60Hz，后台跑帧时 fps 会被 60 封顶）
     .insert_resource(bevy::winit::WinitSettings {
@@ -143,8 +150,20 @@ fn main() {
     .add_systems(
       Update,
       (
-        orbit_camera_input,
-        left_click_pick_recenter.after(orbit_camera_input),
+        // 相机链：模式切换对齐 → 转头（共享）→ 两套模式各自输入 → 左键拾取 → 唯一矩阵构造点
+        // → 体素编辑（要读本帧的 cfg，所以排在矩阵构造之后）。
+        // 必须严格串行：它们都读写 OrbitCamera/FlyCamera/DdaCameraConfig，且 build_camera_config
+        // 需要拿到同帧的输入结果（旧实现把矩阵重建放在 orbit_camera_input 末尾，拆出来后才有多模式）。
+        (
+          sync_camera_mode_switch,
+          camera_look_input,
+          orbit_camera_input,
+          fly_camera_input,
+          left_click_pick_recenter,
+          build_camera_config,
+          voxel_edit_input,
+        )
+          .chain(),
         demo_ui_setup,
         // 先推帧时长样本，gate-ui 的 plot_redraw_system 同帧再重绘折线图
         fps_line_feed.before(gate_ui::plot_redraw_system),
@@ -160,6 +179,10 @@ fn main() {
   // 【剖析】profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
+  // 【诊断】GATE_EDIT_SELFTEST=1：无鼠标输入地走通一次"编辑 → 增量上传"链路
+  if std::env::var("GATE_EDIT_SELFTEST").as_deref() == Ok("1") {
+    app.add_systems(Update, edit::edit_selftest);
+  }
   app.run();
 }
 
