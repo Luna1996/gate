@@ -29,6 +29,55 @@ use bevy::render::renderer::{
 pub(crate) struct GpuProfilerRes {
   #[cfg(feature = "profile")]
   profiler: Option<wgpu_profiler::GpuProfiler>,
+  #[cfg(feature = "profile")]
+  report: PassReport,
+}
+
+/// 逐 pass GPU 耗时聚合器：把 `process_finished_frame` 返回的结果按 label 累计，
+/// 每 [`REPORT_PERIOD_SECS`] 秒往日志打一行平均耗时。
+///
+/// 存在的理由：wgpu-profiler 原本只在 Tracy 模式下消费结果，没连 Tracy GUI 就完全
+/// 看不到数字，归因只能靠猜。这里直接落日志，`--features profile` 即可读数。
+#[cfg(feature = "profile")]
+#[derive(Default)]
+struct PassReport {
+  /// label → 累计秒数
+  acc: std::collections::BTreeMap<String, f64>,
+  frames: u32,
+  last: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "profile")]
+const REPORT_PERIOD_SECS: f32 = 2.0;
+
+#[cfg(feature = "profile")]
+impl PassReport {
+  fn push(&mut self, results: &[wgpu_profiler::GpuTimerQueryResult]) {
+    for r in results {
+      if let Some(t) = &r.time {
+        *self.acc.entry(r.label.clone()).or_insert(0.0) += t.end - t.start;
+      }
+    }
+    self.frames += 1;
+    let now = std::time::Instant::now();
+    let start = *self.last.get_or_insert(now);
+    let dt = now.duration_since(start).as_secs_f32();
+    if dt < REPORT_PERIOD_SECS || self.frames == 0 {
+      return;
+    }
+    let n = self.frames as f64;
+    let ms = |s: f64| s / n * 1000.0;
+    let mut line = format!("GPU[{dt:.1}s x{}] ", self.frames);
+    let mut total = 0.0;
+    for (label, s) in &self.acc {
+      total += ms(*s);
+      line.push_str(&format!("{label}={:.2}ms ", ms(*s)));
+    }
+    bevy::log::info!("GPU 逐 pass 均值（共 {total:.2}ms/frame）：{line}");
+    self.acc.clear();
+    self.frames = 0;
+    self.last = Some(now);
+  }
 }
 
 /// 取 profiler 可变引用（render pass 无闭包 helper，调用方手动 scope）。
@@ -158,12 +207,15 @@ fn resolve_profiler_queries(
 /// Finish 集（submit 已完成）：结束本帧并处理已就绪帧（tracy 模式自动上报）。
 #[cfg(feature = "profile")]
 fn finish_profiler_frame(mut res: ResMut<GpuProfilerRes>, queue: Res<RenderQueue>) {
-  let Some(profiler) = res.profiler.as_mut() else {
-    return;
-  };
-  if let Err(e) = profiler.end_frame() {
-    bevy::log::warn_once!("wgpu-profiler end_frame 失败：{e:?}");
+  let period = queue.get_timestamp_period();
+  let results = res.profiler.as_mut().and_then(|profiler| {
+    if let Err(e) = profiler.end_frame() {
+      bevy::log::warn_once!("wgpu-profiler end_frame 失败：{e:?}");
+    }
+    profiler.process_finished_frame(period)
+  });
+  // tracy 模式下这些 zone 已直送 Tracy；这里再自行聚合一遍落日志，方便没有 Tracy GUI 时读数
+  if let Some(results) = results {
+    res.report.push(&results);
   }
-  // tracy 模式下结果直接上报 Tracy；返回值（Option<Vec<GpuTimerQueryResult>>）无需消费
-  profiler.process_finished_frame(queue.get_timestamp_period());
 }

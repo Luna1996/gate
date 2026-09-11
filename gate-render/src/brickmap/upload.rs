@@ -104,6 +104,18 @@ impl Default for UploadBudget {
 #[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrickMapRevision(pub u64);
 
+/// DDGI 脏区（render world）：本帧上传**实际改动**的世界 voxel AABB（`max_voxel` 不含）。
+///
+/// `full = true` 表示全量上传（首帧 / force_full / 非增量）→ DDGI 需整体重烘；
+/// 否则 [min, max) 是本次改动 chunk 的合并包围盒，DDGI 的 bake 只重烘与之相交的 cell。
+/// 每帧由 extract 覆盖写入，保证不会残留上一帧的脏区。
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct BrickMapDirty {
+  pub full: bool,
+  pub min_voxel: IVec3,
+  pub max_voxel: IVec3,
+}
+
 /// 主世界 Pending 资源：在主 world `Last` schedule 按预算 drain dirty，供只读提取
 ///
 /// data_chunks / comp_chunks 元素 = `(volume_idx, coord)`：主世界 = 0，物体 = 1..N。
@@ -296,6 +308,33 @@ fn extract(
     std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
   let dirty_any = need_full || !pending_data.is_empty() || !_pending_comp.is_empty();
+
+  // ---- DDGI 脏区：本帧实际重建的 chunk（仅主世界 volume 0）的合并 AABB ----
+  // 全量上传 → full（DDGI 整体重烘）；增量 → 改动 chunk 的包围盒，bake 只跑相交 cell。
+  // 无论有没有脏区都覆盖写入，避免上一帧的脏区残留导致重复重烘。
+  let mut ddgi_dirty = BrickMapDirty::default();
+  if dirty_any {
+    if need_full {
+      ddgi_dirty.full = true;
+    } else {
+      let (mut lo, mut hi): (Option<IVec3>, Option<IVec3>) = (None, None);
+      for (vol_idx, c) in pending_data.iter().chain(_pending_comp.iter()) {
+        if *vol_idx != 0 {
+          continue;
+        }
+        let cl = c.0 * gate_voxel::CHUNK_SIZE;
+        let ch = cl + IVec3::splat(gate_voxel::CHUNK_SIZE);
+        lo = Some(lo.map_or(cl, |v| v.min(cl)));
+        hi = Some(hi.map_or(ch, |v| v.max(ch)));
+      }
+      if let (Some(lo), Some(hi)) = (lo, hi) {
+        ddgi_dirty.min_voxel = lo;
+        ddgi_dirty.max_voxel = hi;
+      }
+    }
+  }
+  commands.insert_resource(ddgi_dirty);
+
   // 如果非首帧 + 非强制全量 + 无脏 chunk → 跳过构建/上传（省 CPU 构建 + PCIe）
   if !dirty_any {
     return;
