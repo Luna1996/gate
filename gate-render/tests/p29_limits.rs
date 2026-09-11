@@ -20,8 +20,8 @@ use gate_voxel::{VolumeGrid, VolumeTransform, fill_box};
 use glam::{IVec3, Mat3, Vec3};
 use std::time::Instant;
 
-/// 单 chunk 的 fine 边长（Douglas Brick Tree：256³）
-const CHUNK_FINE: i32 = 256;
+/// 单 chunk 的 voxel 边长（Douglas Brick Tree：256³）
+const CHUNK_VOXEL: i32 = 256;
 /// 帧预算（60fps 口径）
 const FRAME_MS: f64 = 16.7;
 
@@ -53,7 +53,7 @@ fn fill_checkerboard(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, cell: i32
 /// n 个沿 x 排列的 chunk，各在 chunk 原点放 span³ 棋盘（条带异色防折叠）
 fn fill_chunk_checkers(grid: &mut VolumeGrid, chunk_x0: i32, n: usize, span: i32, cell: i32) {
   for i in 0..n as i32 {
-    let base = IVec3::new((chunk_x0 + i) * CHUNK_FINE, 0, 0);
+    let base = IVec3::new((chunk_x0 + i) * CHUNK_VOXEL, 0, 0);
     fill_checkerboard(grid, base, IVec3::splat(span), cell);
   }
 }
@@ -91,7 +91,7 @@ impl Lcg {
 #[test]
 fn million_voxel_build_full_budget() {
   let mut grid = VolumeGrid::new();
-  // 63 chunk × 32768 = 2,064,384 fine 体素 ≥ 100 万（「百万级」口径沿用）
+  // 63 chunk × 32768 = 2,064,384 voxel 体素 ≥ 100 万（「百万级」口径沿用）
   // cell=4 棋盘 → 分裂到 level 3，树规模贴近真实异色场景
   // 63 而非 64：compute_window 留 1 chunk 生长边距，64 连续 chunk 必丢 1
   let t0 = Instant::now();
@@ -137,10 +137,10 @@ fn incremental_burst_frame_budget() {
   assert!(stale.struct_ranges.is_empty() && !stale.palette_changed);
 
   // 连发：63 chunk 全标脏（真实编辑路径 set_voxel → DirtyTracker 自动 mark）；
-  // 用 1 fine 微编辑模拟 P4.2 同帧高频编辑的最小粒度。
+  // 用 1 voxel 微编辑模拟 P4.2 同帧高频编辑的最小粒度。
   // palette 7：棋盘只占 1..=2，保证每次编辑都是真实改写（同色写回返回 None）
   for i in 0..63isize {
-    let edited = grid.set_voxel_ivec3(IVec3::new(i as i32 * CHUNK_FINE + 8, 8, 8), 7);
+    let edited = grid.set_voxel_ivec3(IVec3::new(i as i32 * CHUNK_VOXEL + 8, 8, 8), 7);
     assert!(edited.is_some(), "微编辑应生效（颜色必变）");
   }
   assert_eq!(grid.dirty.data_dirty_count(), 63);
@@ -197,8 +197,8 @@ fn incremental_burst_frame_budget() {
 // P2.9c：大场景 DDA 三档（CPU 两级参考实现代理）
 // ============================================================================
 
-/// A 空旷远距：1 chunk 有内容，射线自 8192 fine 外穿越空旷区。
-/// 哨兵：两级 DDA 空旷射线 ≈ t_max/16 粗步；若退化回单级（16384 fine 步），
+/// A 空旷远距：1 chunk 有内容，射线自 8192 voxel 外穿越空旷区。
+/// 哨兵：两级 DDA 空旷射线 ≈ t_max/16 粗步；若退化回单级（16384 voxel 步），
 /// 耗时 ×15 立即爆阈值（对应实机 DC 43ms→2.75ms 改造的回归锚）。
 #[test]
 fn dda_regime_a_open_far_budget() {
@@ -337,13 +337,13 @@ fn vram_layout_budget_2gb() {
   fill_chunk_checkers(&mut grid, 0, 32, 16, 4);
   fill_checkerboard(
     &mut grid,
-    IVec3::new(32 * CHUNK_FINE, 0, 0),
+    IVec3::new(32 * CHUNK_VOXEL, 0, 0),
     IVec3::splat(64),
     16,
   );
   fill_checkerboard(
     &mut grid,
-    IVec3::new(33 * CHUNK_FINE, 0, 0),
+    IVec3::new(33 * CHUNK_VOXEL, 0, 0),
     IVec3::new(64, 64, 48),
     1,
   );
@@ -366,7 +366,7 @@ fn obj_16_objects_trace_scene_budget() {
   for i in 0..4i32 {
     fill_box(
       &mut grid,
-      IVec3::new(i * CHUNK_FINE, 0, 0),
+      IVec3::new(i * CHUNK_VOXEL, 0, 0),
       IVec3::new(128, 64, 64),
       (i % 6 + 1) as u8,
     );

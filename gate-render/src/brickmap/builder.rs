@@ -454,7 +454,7 @@ impl VolumesBuilder {
         dims,
       );
       if i == 0 {
-        // 主世界（identity：局部=世界）：AABB = chunk 窗口范围（fine 单位）。
+        // 主世界（identity：局部=世界）：AABB = chunk 窗口范围（voxel 单位）。
         // from_transform 默认给 [0,256]³·scale——窗口 origin 可为负且 dims 巨大，
         // 默认盒会把窗口绝大部分 slab 剔除 → 全屏只渲染 chunk(0,0,0) 附近一小块。
         desc.aabb_min = Vec4::new(
@@ -603,7 +603,7 @@ mod tests {
           assert_eq!(
             view.get_voxel(f),
             grid.get_voxel(gate_voxel::VoxelCoord::from_ivec3(f)),
-            "fine {f:?} 不一致"
+            "voxel {f:?} 不一致"
           );
           x += stride;
         }

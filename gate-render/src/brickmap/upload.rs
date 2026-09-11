@@ -32,6 +32,7 @@ use super::builder::{VolumesBuilder, VolumesSnapshot};
 use super::wire::{
   BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, TREE_BASE, march_mask_lut_words,
 };
+use glam::{IVec3, UVec3};
 
 // ----------------------------------------------------------------------------
 // Limits + BufferLayout（CPU 单测覆盖单/多两模式）
@@ -97,6 +98,11 @@ impl Default for UploadBudget {
     }
   }
 }
+
+/// 体素世界修订号（render world）：每完成一次真实上传（prepare 消费到 snapshot）自增。
+/// 供依赖体素数据的下游 GPU pass（如 DDGI 探针烘焙）判定「世界是否变了」。
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrickMapRevision(pub u64);
 
 /// 主世界 Pending 资源：在主 world `Last` schedule 按预算 drain dirty，供只读提取
 ///
@@ -222,6 +228,9 @@ pub struct GpuBrickMap {
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
   pub globals: UniformBuffer<BrickMapGlobals>,
+  /// 主世界 chunk 窗口（chunk 单位）CPU 副本：DDGI 世界空间探针网格推导用
+  pub main_window_origin: IVec3,
+  pub main_window_dims: UVec3,
 }
 
 // ----------------------------------------------------------------------------
@@ -248,6 +257,8 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     grid_descs_buf: make("gate_grid_descs"),
     grid_descs_count: 0,
     globals,
+    main_window_origin: IVec3::ZERO,
+    main_window_dims: UVec3::ZERO,
   });
 }
 
@@ -452,6 +463,7 @@ pub(crate) fn prepare(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
   sample_channel: Option<Res<UploadCpuSampleChannel>>,
+  mut revision: ResMut<BrickMapRevision>,
 ) {
   let Some(snap) = snapshot else { return };
   let t0 = std::time::Instant::now();
@@ -624,6 +636,19 @@ pub(crate) fn prepare(
   gpu.globals.write_buffer(&device, &queue);
 
   gpu.grid_descs_count = snap.volumes.grid_descs.len() as u32;
+  // 主世界 chunk 窗口 CPU 副本（DDGI 世界探针网格推导）
+  gpu.main_window_origin = IVec3::new(
+    main_desc.index_origin_x,
+    main_desc.index_origin_y,
+    main_desc.index_origin_z,
+  );
+  gpu.main_window_dims = UVec3::new(
+    main_desc.index_dims_x,
+    main_desc.index_dims_y,
+    main_desc.index_dims_z,
+  );
+  // 世界数据已更新 → 修订号自增（下游 GPU pass 据此触发重烘焙）
+  revision.0 = revision.0.wrapping_add(1);
 
   let elapsed = t0.elapsed();
   let cpu_ms = elapsed.as_secs_f32() * 1000.0;
@@ -707,6 +732,7 @@ impl Plugin for VolumePlugin {
     };
     render_app
       .insert_resource(ch)
+      .init_resource::<BrickMapRevision>()
       .insert_resource(BuilderMirror {
         pending_full: true,
         ..Default::default()

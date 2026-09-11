@@ -19,8 +19,8 @@ pub use dda::{
   cpu_reference_trace_volumes, cpu_reference_volumes_occluded, create_dda_image,
 };
 pub use upload::{
-  BindingLimits, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget, UploadCpuSample,
-  UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelScene,
+  BindingLimits, BrickMapRevision, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,
+  UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelScene,
 };
 pub use view::BrickMapView;
 pub use wire::{BrickMapBuffers, BrickMapGlobals, GridDesc};

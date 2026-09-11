@@ -49,8 +49,8 @@ impl Default for RenderScale {
 /// 主 world Startup 注入的静态视图配置（P2.4 不变）
 ///
 /// 手算 perspective_rh(fovy=60°, aspect=1280/720) × look_at_rh：
-/// - eye fine (700, 560, 700)，target fine (260, 120, 260)，距离 ~762
-/// - 覆盖 tile(0,0,0) 全场景（fine 0..512）+ tile(1,0,0) 内增量热点（x 656..688）
+/// - eye voxel (700, 560, 700)，target voxel (260, 120, 260)，距离 ~762
+/// - 覆盖 tile(0,0,0) 全场景（voxel 0..512）+ tile(1,0,0) 内增量热点（x 656..688）
 /// - up = Vec3::Y，far 4000（DDA 用 inv_view_proj 反投影方向，far 只影响精度）
 #[derive(Resource, Clone, Copy)]
 pub struct DdaCameraConfig {
@@ -92,14 +92,14 @@ pub struct DebugNormals(pub u32);
 
 /// 相机约束常量（spec FR-3 clamp；pub 供 gate-app 输入 system 与测试断言）
 pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians(); // ±89° 防万向节锁（up 与 view 共线）
-pub const DIST_MIN: f32 = 32.0; // 最近 32 fine（8cm，不穿进体素内部失稳）
+pub const DIST_MIN: f32 = 32.0; // 最近 32 voxel（8cm，不穿进体素内部失稳）
 // DIST_MAX：原 8000（20m），用户要求取消"最远距离"设置——不再有上限 clamp。
 // 为了避免滚轮异常操作产生 NaN（乘 0 或 exp overflow），仅保留下界 DIST_MIN。
 // （透视 far 面由 CAM_FAR 负责，滚轮无限拉远时远处依然能可见，只要 CAM_FAR 足够大）
 
 /// 轨道相机参数（main world 资源，gate-app 输入 system 操作；P2.6 spec FR-1）
 ///
-/// 字段语义：target = 注视点（fine）、distance = 相机到 target 距离（fine）、
+/// 字段语义：target = 注视点（voxel）、distance = 相机到 target 距离（voxel）、
 /// yaw = 绕 +Y 方位角（rad，atan2(x, z)）、pitch = 仰角（rad，+ 为上仰）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
@@ -164,7 +164,7 @@ impl DdaCameraConfig {
 pub struct DdaViewUniform {
   pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
-  pub cam_pos_fine: Vec4, // w=1
+  pub cam_pos_voxel: Vec4, // w=1
   /// x/y = debug 可视化（保留）；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
   pub debug_mode: Vec4,
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（GATE_NO_LOD=1 关）
@@ -218,7 +218,7 @@ impl DdaViewUniform {
     Self {
       view_proj: cfg.view_proj,
       inv_view_proj: cfg.inv_view_proj,
-      cam_pos_fine: cfg.position_world.extend(1.0),
+      cam_pos_voxel: cfg.position_world.extend(1.0),
       debug_mode: Vec4::new(
         (debug_mode == 1) as u32 as f32,         // x = 法向可视化
         (debug_mode == 2) as u32 as f32,         // y = face 6 色诊断
@@ -492,7 +492,7 @@ use crate::brickmap::{BrickMapBuffers, BrickMapView};
 
 /// A&W 细格步进 DDA 参考实现（CPU）。
 ///
-/// 完全新写 step（不共享 view.rs 结构）。仅调用 `BrickMapView::get_voxel(fine: IVec3)`
+/// 完全新写 step（不共享 view.rs 结构）。仅调用 `BrickMapView::get_voxel(voxel: IVec3)`
 /// 进行 palette 查询。返回 `Some((hit_t, palette))` 或 `None`（t >= t_max 前未命中 / 超步）
 ///
 /// 关键正确性约定：cell 坐标用整数增量维护（floor(origin) 起步，每次穿越 +sign），
@@ -500,8 +500,8 @@ use crate::brickmap::{BrickMapBuffers, BrickMapView};
 /// 整数边界上，floor 会随机取到穿越前/后的胞，导致对角胞漏检（DDA vs brute 不等价）。
 pub fn cpu_reference_dda_ray(
   buffers: &BrickMapBuffers,
-  origin_fine: Vec3,
-  dir_fine: Vec3, // fine units（归一化），magnitude 任意（delta 按 |dir| 缩放）
+  origin_voxel: Vec3,
+  dir_voxel: Vec3, // voxel units（归一化），magnitude 任意（delta 按 |dir| 缩放）
   t_max: f32,
   max_steps: u32,
 ) -> Option<(f32, u8)> {
@@ -509,50 +509,50 @@ pub fn cpu_reference_dda_ray(
   let mut t = 0.0f32;
   // init A&W 变量
   let sign = [
-    if dir_fine.x >= 0.0 { 1 } else { -1 },
-    if dir_fine.y >= 0.0 { 1 } else { -1 },
-    if dir_fine.z >= 0.0 { 1 } else { -1 },
+    if dir_voxel.x >= 0.0 { 1 } else { -1 },
+    if dir_voxel.y >= 0.0 { 1 } else { -1 },
+    if dir_voxel.z >= 0.0 { 1 } else { -1 },
   ];
   let delta = [
-    if dir_fine.x.abs() > 1e-30 {
-      (1.0 / dir_fine.x).abs()
+    if dir_voxel.x.abs() > 1e-30 {
+      (1.0 / dir_voxel.x).abs()
     } else {
       f32::INFINITY
     },
-    if dir_fine.y.abs() > 1e-30 {
-      (1.0 / dir_fine.y).abs()
+    if dir_voxel.y.abs() > 1e-30 {
+      (1.0 / dir_voxel.y).abs()
     } else {
       f32::INFINITY
     },
-    if dir_fine.z.abs() > 1e-30 {
-      (1.0 / dir_fine.z).abs()
+    if dir_voxel.z.abs() > 1e-30 {
+      (1.0 / dir_voxel.z).abs()
     } else {
       f32::INFINITY
     },
   ];
   let mut cell = [
-    origin_fine.x.floor() as i32,
-    origin_fine.y.floor() as i32,
-    origin_fine.z.floor() as i32,
+    origin_voxel.x.floor() as i32,
+    origin_voxel.y.floor() as i32,
+    origin_voxel.z.floor() as i32,
   ];
   let next_boundary = |c: i32, s: i32| -> f32 {
     // s=1 -> 下一个上界 (c+1).0; s=-1 -> 当前下界 c.0（负数 floor 刚好也是下一个朝向的边界）
     (if s >= 0 { c + 1 } else { c }) as f32
   };
-  let tmax_x = if dir_fine.x.abs() <= 1e-30 {
+  let tmax_x = if dir_voxel.x.abs() <= 1e-30 {
     f32::INFINITY
   } else {
-    (next_boundary(cell[0], sign[0]) - origin_fine.x) / dir_fine.x
+    (next_boundary(cell[0], sign[0]) - origin_voxel.x) / dir_voxel.x
   };
-  let tmax_y = if dir_fine.y.abs() <= 1e-30 {
+  let tmax_y = if dir_voxel.y.abs() <= 1e-30 {
     f32::INFINITY
   } else {
-    (next_boundary(cell[1], sign[1]) - origin_fine.y) / dir_fine.y
+    (next_boundary(cell[1], sign[1]) - origin_voxel.y) / dir_voxel.y
   };
-  let tmax_z = if dir_fine.z.abs() <= 1e-30 {
+  let tmax_z = if dir_voxel.z.abs() <= 1e-30 {
     f32::INFINITY
   } else {
-    (next_boundary(cell[2], sign[2]) - origin_fine.z) / dir_fine.z
+    (next_boundary(cell[2], sign[2]) - origin_voxel.z) / dir_voxel.z
   };
   let mut tmax = [tmax_x, tmax_y, tmax_z];
 
@@ -721,21 +721,21 @@ pub fn cpu_reference_dda_ray_aabb_skip(
   None
 }
 
-/// 细级：单个粗 cell（16³ fine）内的有界 fine DDA。
+/// 细级：单个粗 cell（16³ voxel）内的有界 voxel DDA。
 /// 射线段限制在 [t_lo, t_hi]（该 cell 的入出区间，自 origin 全局标尺）。
 ///
-/// 入口 fine 胞用「解析 + clamp」确定：p = origin + dir·t_lo 落在 cell 入口面上时，
+/// 入口 voxel 胞用「解析 + clamp」确定：p = origin + dir·t_lo 落在 cell 入口面上时，
 /// floor(p) 可能因浮点误差取到邻胞——clamp 到 [base, base+15] 保证起点一定在本 cell 内。
-/// clamp 不会漏检：入口面外侧的最后一个 fine 胞属于前一个粗 cell，其细扫已覆盖。
-/// 采样序列与 full DDA 在同区间的序列逐胞一致（fine 边界与粗边界 16 对齐）。
+/// clamp 不会漏检：入口面外侧的最后一个 voxel 胞属于前一个粗 cell，其细扫已覆盖。
+/// 采样序列与 full DDA 在同区间的序列逐胞一致（voxel 边界与粗边界 16 对齐）。
 #[allow(clippy::too_many_arguments)] // cell 局部细扫的固有参数面（view+射线+cell 窗口）
-fn dda_fine_scan_cell(
+fn dda_voxel_scan_cell(
   view: &BrickMapView,
   origin: Vec3,
   dir: Vec3,
   sign: [i32; 3],
-  delta: [f32; 3], // fine 步距（|dir| 分量倒数或 INF）
-  cc: [i32; 3],    // 粗 cell 坐标（1 单位 = 16 fine）
+  delta: [f32; 3], // voxel 步距（|dir| 分量倒数或 INF）
+  cc: [i32; 3],    // 粗 cell 坐标（1 单位 = 16 voxel）
   t_lo: f32,
   t_hi: f32,
 ) -> Option<(f32, u8, u8)> {
@@ -749,7 +749,7 @@ fn dda_fine_scan_cell(
   for i in 0..3 {
     fc[i] = (pc[i].floor() as i32).clamp(base[i], base[i] + 15);
   }
-  // fine tmax：相对 t_lo 的距离（自 cell 入口重算，非累加——与 full 的 ulp 差异见主函数注释）
+  // voxel tmax：相对 t_lo 的距离（自 cell 入口重算，非累加——与 full 的 ulp 差异见主函数注释）
   let mut tmax_f = [f32::INFINITY; 3];
   for i in 0..3 {
     if dir[i].abs() > 1e-30 {
@@ -760,7 +760,7 @@ fn dda_fine_scan_cell(
   }
   let span = t_hi - t_lo;
   let mut t_f = 0.0f32;
-  // 初始 fine 胞采样（起点在体内 → 无跨越面，axis=3 哨兵：调用方以 -dir 作法线）
+  // 初始 voxel 胞采样（起点在体内 → 无跨越面，axis=3 哨兵：调用方以 -dir 作法线）
   if let Some(pal) = view.get_voxel(IVec3::from_array(fc)) {
     return Some((t_lo, pal, 3));
   }
@@ -804,32 +804,32 @@ pub struct DdaHit {
 /// 两级 DDA 参考实现（cell 粗步 + cell 内细步）。
 ///
 /// 语义与 `cpu_reference_dda_ray` 完全一致：射线 (origin, dir, t∈[0,t_max]) 上
-/// 首个非空 fine 体素，返回命中记录或 None。
+/// 首个非空 voxel 体素，返回命中记录或 None。
 ///
 /// 结构（WGSL dda_main 逐字对应的源）：
-///   1. 粗级 A&W：cell 粒度（16 fine）步进，delta_c = delta × 16（f32 乘 2 的幂，精确）；
+///   1. 粗级 A&W：cell 粒度（16 voxel）步进，delta_c = delta × 16（f32 乘 2 的幂，精确）；
 ///      每步先做 `BrickMapView::cell_occupied`（①+②，2 次 load），空 cell 整段跳过。
-///   2. 细级：占用 cell 内 `dda_fine_scan_cell`，区间 [t_in, min(t_out, t_max)]。
+///   2. 细级：占用 cell 内 `dda_voxel_scan_cell`，区间 [t_in, min(t_out, t_max)]。
 ///   3. 退出条件：t_out ≥ t_max（cell 出口越过上限）或粗步数耗尽。
 ///
-/// 与 full 版的已知数值差异（两级等价性单测以 1.0 fine 容差覆盖，命中体素/palette 严格一致）：
-///   - full 逐 fine 累加 tmax += delta；两级粗级按 delta_c = 16·delta 累加、细级自 cell
-///     入口重算——长路径 ulp 漂移可达 ~0.1 fine，只影响返回 t 值，不影响命中胞序
+/// 与 full 版的已知数值差异（两级等价性单测以 1.0 voxel 容差覆盖，命中体素/palette 严格一致）：
+///   - full 逐 voxel 累加 tmax += delta；两级粗级按 delta_c = 16·delta 累加、细级自 cell
+///     入口重算——长路径 ulp 漂移可达 ~0.1 voxel，只影响返回 t 值，不影响命中胞序
 ///     （胞序由边界穿越的整数序决定，仅角点精确相切时才可能翻转，测度零）。
 pub fn cpu_reference_dda_ray_two_level(
   buffers: &BrickMapBuffers,
-  origin_fine: Vec3,
-  dir_fine: Vec3, // fine units（归一化），magnitude 任意（delta 按 |dir| 缩放）
+  origin_voxel: Vec3,
+  dir_voxel: Vec3, // voxel units（归一化），magnitude 任意（delta 按 |dir| 缩放）
   t_max: f32,
   max_steps: u32,
 ) -> Option<DdaHit> {
   let view = BrickMapView::new(buffers);
-  let o = [origin_fine.x, origin_fine.y, origin_fine.z];
-  let d = [dir_fine.x, dir_fine.y, dir_fine.z];
+  let o = [origin_voxel.x, origin_voxel.y, origin_voxel.z];
+  let d = [dir_voxel.x, dir_voxel.y, dir_voxel.z];
   let sign = [
-    if dir_fine.x >= 0.0 { 1 } else { -1 },
-    if dir_fine.y >= 0.0 { 1 } else { -1 },
-    if dir_fine.z >= 0.0 { 1 } else { -1 },
+    if dir_voxel.x >= 0.0 { 1 } else { -1 },
+    if dir_voxel.y >= 0.0 { 1 } else { -1 },
+    if dir_voxel.z >= 0.0 { 1 } else { -1 },
   ];
   let delta = [
     if d[0].abs() > 1e-30 {
@@ -848,7 +848,7 @@ pub fn cpu_reference_dda_ray_two_level(
       f32::INFINITY
     },
   ];
-  // 粗 delta = fine delta × 16（精确）
+  // 粗 delta = voxel delta × 16（精确）
   let delta_c = [delta[0] * 16.0, delta[1] * 16.0, delta[2] * 16.0];
   // 粗 cell：floor(origin) >> 4（算术右移 = floor 除法，负坐标正确）
   let mut cc = [
@@ -868,12 +868,12 @@ pub fn cpu_reference_dda_ray_two_level(
   let mut t_in = 0.0f32; // 当前粗 cell 的入口 t（初始 cell = 0）
   for _ in 0..max_steps {
     let t_out = tmax_c[0].min(tmax_c[1]).min(tmax_c[2]);
-    // 占用查询先行：空 cell 不做任何 fine 采样（性能核心）
+    // 占用查询先行：空 cell 不做任何 voxel 采样（性能核心）
     if view.cell_occupied(IVec3::from_array(cc))
-      && let Some((t, pal, axis)) = dda_fine_scan_cell(
+      && let Some((t, pal, axis)) = dda_voxel_scan_cell(
         &view,
-        origin_fine,
-        dir_fine,
+        origin_voxel,
+        dir_voxel,
         sign,
         delta,
         cc,
@@ -920,8 +920,8 @@ pub fn cpu_reference_dda_ray_two_level(
 //   trace_volume_tree  ↔ trace_grid 的局部 slab + chunk 间 256³ A&W 段
 // ============================================================================
 
-/// 层次遍历命中记录（镜像 WGSL FineHit/UnifiedHit）：face_id 0..5 = ±xyz 六面。
-/// voxel = 命中固体体素 grid 局部 fine 整数坐标——DDA 整数步进精确产出，
+/// 层次遍历命中记录（镜像 WGSL VoxelHit/UnifiedHit）：face_id 0..5 = ±xyz 六面。
+/// voxel = 命中固体体素 grid 局部 voxel 整数坐标——DDA 整数步进精确产出，
 /// 着色（per-voxel normal/GI key）直接消费，禁用「命中点 ± 法线半步」启发式重建。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TreeHit {
@@ -971,14 +971,14 @@ struct BrickCpu {
 }
 
 /// 镜像 WGSL trace_chunk：单 chunk 内 Douglas 式整数体素层级 DDA
-/// （octo_march_core：integer fine voxel + brick mask 栈 + firstTrailingBit 跨级跳）。
+/// （octo_march_core：integer voxel voxel + brick mask 栈 + firstTrailingBit 跨级跳）。
 ///
 /// 旧 tmax 栈帧版每步增量维护 4 帧 tmax/cell，弹栈必重载节点头；本版状态只有
 /// 整数体素坐标 v + bricks[4]（下钻载入、跳层复用），边界距离按整数对齐每次重算
 /// （side_distance_for_ray），跨 brick 后用 firstTrailingBit 一次跳到最粗可行层
 /// （尾随零位 = 对齐 run 长度），消除逐层弹栈/重载/再下钻链。
 ///
-/// chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 fine）；
+/// chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 voxel）；
 /// 射线段 [t0, t1]（ro 系绝对 t）；entry_face = 进入本 chunk 的面。
 /// 返回 (t, pal, face_id, chunk 局部命中体素 v) 或 None（走出 chunk 未命中 / budget 耗尽）。
 #[allow(clippy::too_many_arguments)]
@@ -997,7 +997,7 @@ fn trace_chunk_cpu(
   if t0 >= t1 {
     return None;
   }
-  // chunk 局部 fine 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
+  // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = [
     ro[0] - chunk_min[0],
     ro[1] - chunk_min[1],
@@ -1017,7 +1017,7 @@ fn trace_chunk_cpu(
   }; 4];
   bricks[3] = read_brick(chunk_base);
   let mut level: u32 = 3;
-  // 当前体素（chunk 局部 fine 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
+  // 当前体素（chunk 局部 voxel 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
   let p0 = [
     ro_c[0] + rd[0] * t0,
     ro_c[1] + rd[1] * t0,
@@ -1083,7 +1083,7 @@ fn trace_chunk_cpu(
     }
     // ---- v 处为空气：当前 level brick 内 DDA（Douglas dda）----
     let log2 = level * 2;
-    let s = 1i32 << log2; // 子块边长 fine：1/4/16/64
+    let s = 1i32 << log2; // 子块边长 voxel：1/4/16/64
     let mut side = [1e30f32; 3];
     for i in 0..3 {
       if rd[i].abs() > 1e-30 {
@@ -1205,8 +1205,8 @@ fn trace_chunk_cpu(
 
 /// 镜像 WGSL trace_grid 的「局部 AABB slab + chunk 间 256³ A&W + trace_chunk」段。
 ///
-/// ro/rd 为局部 fine 坐标（rd 含 1/scale；t 为射线参数，主世界/物体同一标尺）；
-/// 局部 AABB [l_min, l_max]（fine）；view 携带 chunk 窗口与 b_struct。
+/// ro/rd 为局部 voxel 坐标（rd 含 1/scale；t 为射线参数，主世界/物体同一标尺）；
+/// 局部 AABB [l_min, l_max]（voxel）；view 携带 chunk 窗口与 b_struct。
 /// chunk 步数上限与 WGSL make_grid 一致：(dims.x+dims.y+dims.z)*3 + 16。
 fn trace_volume_tree(
   view: &BrickMapView,
@@ -1331,8 +1331,8 @@ fn trace_volume_tree(
 /// 语义同 `cpu_reference_dda_ray`：射线 (origin, dir, t∈[0,t_max]) 上首个非空体素。
 pub fn cpu_reference_dda_ray_tree(
   buffers: &BrickMapBuffers,
-  origin_fine: Vec3,
-  dir_fine: Vec3,
+  origin_voxel: Vec3,
+  dir_voxel: Vec3,
   t_max: f32,
 ) -> Option<TreeHit> {
   let view = BrickMapView::new(buffers);
@@ -1348,7 +1348,7 @@ pub fn cpu_reference_dda_ray_tree(
     ((origin.y + dims.y) * 256) as f32,
     ((origin.z + dims.z) * 256) as f32,
   );
-  trace_volume_tree(&view, origin_fine, dir_fine, l_min, l_max, t_max)
+  trace_volume_tree(&view, origin_voxel, dir_voxel, l_min, l_max, t_max)
 }
 
 /// 对固定场景 & 静态 DdaCameraConfig，按 32x32 网格渲染 ASCII 画（用于 AC-4 对照实机截图）
@@ -1360,7 +1360,7 @@ pub fn cpu_dda_ascii_grid_32x32(cfg: &DdaCameraConfig, buffers: &BrickMapBuffers
   let h = 32usize;
   let mut out = Vec::with_capacity(w * h);
   let inv_vp = cfg.inv_view_proj;
-  let cam_pos_fine = cfg.position_world; // 世界单位 = fine 单位
+  let cam_pos_voxel = cfg.position_world; // 世界单位 = voxel 单位
   for y in 0..h {
     for x in 0..w {
       // NDC：像素中心 (x+0.5, y+0.5)/size → 2u-1, 1-2v
@@ -1371,8 +1371,8 @@ pub fn cpu_dda_ascii_grid_32x32(cfg: &DdaCameraConfig, buffers: &BrickMapBuffers
       let near = near.truncate() / near.w;
       let far = far.truncate() / far.w;
       let dir_world = (far - near).normalize();
-      let dir_fine = dir_world;
-      let ch = match cpu_reference_dda_ray(buffers, cam_pos_fine, dir_fine, 2000.0, 2048) {
+      let dir_voxel = dir_world;
+      let ch = match cpu_reference_dda_ray(buffers, cam_pos_voxel, dir_voxel, 2000.0, 2048) {
         None => '.',
         Some((_, 1)) => 'X',
         Some((_, 2)) => 'o',
@@ -1555,7 +1555,7 @@ mod dda_ref_tests {
     (xorshift64(state) as f32) / (u32::MAX as f32)
   }
 
-  /// 测试专用相机：小场景（fine 0..16）配近相机，与 demo 的 build_static 解耦
+  /// 测试专用相机：小场景（voxel 0..16）配近相机，与 demo 的 build_static 解耦
   fn test_cam() -> DdaCameraConfig {
     let eye = Vec3::new(24.0, 20.0, 24.0);
     let target = Vec3::new(8.0, 8.0, 8.0);
@@ -1572,9 +1572,9 @@ mod dda_ref_tests {
 
   fn build_box_sphere_scene() -> (BrickMapBuffers, DdaCameraConfig) {
     let mut g = VolumeGrid::new();
-    // box 16³ fine → 0..16，pal=1
+    // box 16³ voxel → 0..16，pal=1
     fill_box(&mut g, IVec3::ZERO, IVec3::splat(16), 1);
-    // sphere at (8,8,8) fine, r=4 fine (1cm), pal=2
+    // sphere at (8,8,8) voxel, r=4 voxel (1cm), pal=2
     fill_sphere(&mut g, IVec3::new(8, 8, 8), 4, 2);
     // hotspots pal 3+4: 1x1x1 at (12, 2, 12) pal3 and (14,2,14) pal4
     g.set_voxel_ivec3(IVec3::new(12, 2, 12), 3);
@@ -1585,7 +1585,7 @@ mod dda_ref_tests {
 
   /// 50 条随机射线：cpu_reference_dda_ray 和 "独立枚举细格" 双方法结果一致
   /// （"独立枚举" = 不调用 BrickMapView.get_voxel 而是逐位置 floor 枚举 get_voxel，
-  ///  实际上 DDA ref 实现已经用 view.get_voxel，第二验证方式是暴力从 t=0 到 t 按 0.5 fine 扫）
+  ///  实际上 DDA ref 实现已经用 view.get_voxel，第二验证方式是暴力从 t=0 到 t 按 0.5 voxel 扫）
   #[test]
   fn dda_reference_equivalence_50_rays() {
     let (bufs, cfg) = build_box_sphere_scene();
@@ -1601,23 +1601,23 @@ mod dda_ref_tests {
       let near = near.truncate() / near.w;
       let far = far.truncate() / far.w;
       let dir_world = (far - near).normalize();
-      let dir_fine = dir_world; // 世界单位 = fine 单位，dir 模长 1
-      let a = cpu_reference_dda_ray(&bufs, origin, dir_fine, 2000.0, 2048);
-      // Brute-force：以 0.5 fine 实际距离扫 2000 步；取首个非空
-      // dir_fine.length() = 1，t = 实际 fine 距离
-      let d_len = dir_fine.length().max(1e-20);
-      let step_fine = 0.5f32; // 0.5 fine 步长保证 1-fine 胞至少 2 采样
+      let dir_voxel = dir_world; // 世界单位 = voxel 单位，dir 模长 1
+      let a = cpu_reference_dda_ray(&bufs, origin, dir_voxel, 2000.0, 2048);
+      // Brute-force：以 0.5 voxel 实际距离扫 2000 步；取首个非空
+      // dir_voxel.length() = 1，t = 实际 voxel 距离
+      let d_len = dir_voxel.length().max(1e-20);
+      let step_voxel = 0.5f32; // 0.5 voxel 步长保证 1-voxel 胞至少 2 采样
       let mut brute: Option<(f32, u8)> = None;
       let view = BrickMapView::new(&bufs);
       for i in 0..2000u32 {
-        let s = i as f32 * step_fine; // 实际 fine 距离
+        let s = i as f32 * step_voxel; // 实际 voxel 距离
         if s / d_len >= 2000.0 {
           break;
         }
         let t = s / d_len;
-        let p = origin + dir_fine * t;
-        let fine = IVec3::new(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
-        if let Some(pal) = view.get_voxel(fine) {
+        let p = origin + dir_voxel * t;
+        let voxel = IVec3::new(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+        if let Some(pal) = view.get_voxel(voxel) {
           brute = Some((t, pal));
           break;
         }
@@ -1625,12 +1625,12 @@ mod dda_ref_tests {
       match (a, brute) {
         (Some((ta, pa)), Some((tb, pb))) => {
           assert_eq!(pa, pb, "palette mismatch");
-          // 0.5 fine coarse vs A&W 精确边界：ta 通常在 (tb-1, tb+0.5) 区间
+          // 0.5 voxel coarse vs A&W 精确边界：ta 通常在 (tb-1, tb+0.5) 区间
           assert!((ta - tb).abs() <= 1.0, "t mismatch {ta} vs {tb}");
         }
         (None, None) => {}
         (a, b) => {
-          panic!("hit pattern diff: a={a:?} b={b:?} origin={origin:?} dir={dir_fine:?}")
+          panic!("hit pattern diff: a={a:?} b={b:?} origin={origin:?} dir={dir_voxel:?}")
         }
       }
     }
@@ -1691,16 +1691,16 @@ mod dda_ref_tests {
   #[test]
   fn aabb_skip_equivalence_300_rays() {
     let (bufs, _cfg) = build_box_sphere_scene();
-    // 场景 AABB：fine 坐标 [0, 0, 0] .. [16, 16, 16]（brickmap 全在此区间）
+    // 场景 AABB：voxel 坐标 [0, 0, 0] .. [16, 16, 16]（brickmap 全在此区间）
     let aabb_min = Vec3::new(0.0, 0.0, 0.0);
     let aabb_max = Vec3::new(16.0, 16.0, 16.0);
     let mut state: u64 = 12345;
     let mut count = 0usize;
     // 5 种相机场景，每种 60 条随机视锥射线
     let cameras: Vec<(Vec3, Vec3)> = vec![
-      // 近相机（在 AABB 外 24 fine 处，和 test_cam 一致）
+      // 近相机（在 AABB 外 24 voxel 处，和 test_cam 一致）
       (Vec3::new(24.0, 20.0, 24.0), Vec3::new(8.0, 8.0, 8.0)),
-      // 远相机（在 AABB 外 50k fine 处——模拟用户 zoom-out 很多下的情况）
+      // 远相机（在 AABB 外 50k voxel 处——模拟用户 zoom-out 很多下的情况）
       (
         Vec3::new(50_000.0, 40_000.0, 50_000.0),
         Vec3::new(8.0, 8.0, 8.0),
@@ -1709,7 +1709,7 @@ mod dda_ref_tests {
       (Vec3::new(8.5, 8.5, 2.0), Vec3::new(8.5, 8.5, 16.0)),
       // 斜 + 轻微轴平行（xz 面视线，dir.y 很小）
       (Vec3::new(30.0, 8.0, 30.0), Vec3::new(8.0, 8.0, 8.0)),
-      // 负坐标远端 + 指向 AABB（测试负 fine 坐标 floor 与 slab 求交）
+      // 负坐标远端 + 指向 AABB（测试负 voxel 坐标 floor 与 slab 求交）
       (
         Vec3::new(-10_000.0, 10_000.0, -10_000.0),
         Vec3::new(8.0, 8.0, 8.0),
@@ -1731,7 +1731,7 @@ mod dda_ref_tests {
         let diff = far - near;
         let frustum_len = diff.length();
         let dir = diff.normalize();
-        // 原版 DDA：给足够大的 steps = 2_000_000（覆盖远镜头 50k fine 的距离），
+        // 原版 DDA：给足够大的 steps = 2_000_000（覆盖远镜头 50k voxel 的距离），
         // t_max = frustum_len（视锥外不算命中）。max_steps 足够大所以一定能走穿。
         let full = cpu_reference_dda_ray(&bufs, *eye, dir, frustum_len, 2_000_000);
         // AABB skip 版：max_steps 只给 2048（GPU 最终上限，比 AABB 对角 ~1732 略大），
@@ -1744,7 +1744,7 @@ mod dda_ref_tests {
               pf, ps,
               "palette diff eye={eye:?} tgt={target:?} full_t={tf} skip_t={ts}"
             );
-            // t 差 ≤ 1 fine（浮点计算的 floor 与首胞命中边界误差）
+            // t 差 ≤ 1 voxel（浮点计算的 floor 与首胞命中边界误差）
             assert!(
               (tf - ts).abs() <= 1.0,
               "t diff eye={eye:?} full_t={tf} skip_t={ts} pal={pf}"
@@ -1763,7 +1763,7 @@ mod dda_ref_tests {
 
   /// 两级 DDA 等价性：多物体场景（多 cell 体 + cell 间隙 + 负坐标）+ 固定退化方向 +
   /// 300 条随机射线，cpu_reference_dda_ray vs cpu_reference_dda_ray_two_level。
-  /// 命中/未命中与 palette 严格一致；hit_t 容差 1.0 fine（同 aabb_skip 先例：
+  /// 命中/未命中与 palette 严格一致；hit_t 容差 1.0 voxel（同 aabb_skip 先例：
   /// full 累加 tmax vs 两级粗/细分别重算，长路径 ulp 漂移只影响 t 值不影响命中胞）。
   #[test]
   fn two_level_equivalence_300_rays() {
@@ -1807,7 +1807,7 @@ mod dda_ref_tests {
     // ---- 300 条随机射线：球形壳内随机起点 + 随机方向（含大量纯空穿越） ----
     let mut state: u64 = 20260831;
     for ray in 0..300 {
-      // 起点距场景中心 32~600 fine 的球壳
+      // 起点距场景中心 32~600 voxel 的球壳
       let r = 32.0 + frand(&mut state) * 568.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
       let phi = (frand(&mut state) * 2.0 - 1.0).acos();
@@ -1849,7 +1849,7 @@ mod dda_ref_tests {
   /// 层次栈式 mask DDA 等价性：跨 chunk（含负坐标窗口）场景 + 8 条轴平行退化射线
   /// + 300 条随机射线，cpu_reference_dda_ray（full 逐体素参考）vs
   /// cpu_reference_dda_ray_tree（WGSL trace_grid/trace_chunk 的 CPU 逐字镜像）。
-  /// hit/miss 与 palette 严格一致；hit_t 容差 1.0 fine；命中面法线必须反向于射线
+  /// hit/miss 与 palette 严格一致；hit_t 容差 1.0 voxel；命中面法线必须反向于射线
   /// （n·dir < 0：face_id 是射线穿入面）。
   #[test]
   fn tree_traversal_equivalence_300_rays() {
@@ -1928,7 +1928,7 @@ mod dda_ref_tests {
     // ---- 300 条随机射线：球壳随机起点 + 球面均匀随机方向 ----
     let mut state: u64 = 20260904;
     for ray in 0..300 {
-      // 起点距场景中心 (128,32,128) 32~1500 fine 的球壳（覆盖 ±512 远块）
+      // 起点距场景中心 (128,32,128) 32~1500 voxel 的球壳（覆盖 ±512 远块）
       let r = 32.0 + frand(&mut state) * 1468.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
       let phi = (frand(&mut state) * 2.0 - 1.0).acos();
@@ -2489,10 +2489,10 @@ fn prepare_dda_bind_groups(
   };
 
   let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
-  // probe 可视化参数：x = 总槽数（4 LOD × 4096 固定槽，新架构无 base 网格）；
-  // y = 方块边长 3px；z = 层级选择（0=全部，1..=4=LOD0..3）；w 不再使用
-  if let Some(_g) = ddgi_gpu.as_ref() {
-    let total = crate::ddgi::DDGI_TOTAL_SLOTS;
+  // probe 可视化参数：x = 世界空间探针总槽数（4 LOD 世界网格）；y = 方块边长 3px；
+  // z = 层级选择（0=全部，1..=4=LOD0..3）；w 不再使用
+  if let Some(g) = ddgi_gpu.as_ref() {
+    let total = g.total_slots;
     let sel = dbg.map_or(0.0, |d| d.probe_viz_lod).clamp(0.0, 4.0);
     view.probe_viz_params = Vec4::new(total as f32, 3.0, sel, 0.0);
   }
@@ -2669,9 +2669,9 @@ pub(crate) fn dispatch_dda(
   }
 
   if dbg.map_or(false, |d| d.probe_viz) {
-    if gpu.is_some() {
+    if let Some(ddgi) = gpu.as_ref() {
       if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
-        let probe_count = crate::ddgi::DDGI_TOTAL_SLOTS;
+        let probe_count = ddgi.total_slots;
         crate::profiler::gpu_compute_pass(
           &mut profiler,
           ctx.command_encoder(),

@@ -5,7 +5,7 @@
 //! 语义与 `VolumeGrid::get_voxel` 严格一致：Some(palette 1..=255) / None（空）。
 //!
 //! 寻址链（3 步，全部 storage load）：
-//! ① chunk 窗口：fine → chunk（floor div 256）→ entry（0 = 无 chunk）
+//! ① chunk 窗口：voxel → chunk（floor div 256）→ entry（0 = 无 chunk）
 //! ② chunk base → 根节点 fixed（mask_lo/mask_hi/palette，8B）
 //! ③ mask bit 测试 → popcount 定位 child offset → 下钻（每层 1 次 load，
 //!    uniform 子块零额外 load——palette 直存父节点 fixed 字）
@@ -94,10 +94,10 @@ impl<'a> BrickMapView<'a> {
 
   /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
   /// wire v3：level 3（叶父层）inline 4 体素/word，消除 level 4 叶节点
-  pub fn get_voxel(&self, fine: IVec3) -> Option<u8> {
-    let chunk = fine.div_euclid(IVec3::splat(CHUNK_SIZE));
+  pub fn get_voxel(&self, voxel: IVec3) -> Option<u8> {
+    let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let base = self.chunk_base(chunk)?;
-    let mut local = fine.rem_euclid(IVec3::splat(CHUNK_SIZE));
+    let mut local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
     let mut node = base;
     let mut extent = CHUNK_SIZE;
     loop {
@@ -133,8 +133,8 @@ impl<'a> BrickMapView<'a> {
     }
   }
 
-  /// cell 灭占用查询（两级 DDA 粗步专用）：cc 为 cell 坐标（1 单位 = 16 fine）。
-  /// 语义：false ⇒ get_voxel 对该 cell 内全部 16³ fine 位置都返回 None。
+  /// cell 灭占用查询（两级 DDA 粗步专用）：cc 为 cell 坐标（1 单位 = 16 voxel）。
+  /// 语义：false ⇒ get_voxel 对该 cell 内全部 16³ voxel 位置都返回 None。
   ///
   /// 走树到 level 2（16³）粒度：
   /// - 中途 mask=0（uniform）→ occupied = palette != 0
@@ -142,13 +142,13 @@ impl<'a> BrickMapView<'a> {
   /// - 到达 extent=16 的 Split 节点 → occupied = true
   ///   （ChunkTree merge 不变式：Split ⇒ 64 槽颜色不全同 ⇒ 至少一槽非 AIR）
   pub fn cell_occupied(&self, cc: IVec3) -> bool {
-    // cell 的最小角 fine → chunk + local（cell 恒不跨 chunk：16 | 256）
-    let fine_min = cc * 16;
-    let chunk = fine_min.div_euclid(IVec3::splat(CHUNK_SIZE));
+    // cell 的最小角 voxel → chunk + local（cell 恒不跨 chunk：16 | 256）
+    let voxel_min = cc * 16;
+    let chunk = voxel_min.div_euclid(IVec3::splat(CHUNK_SIZE));
     let Some(base) = self.chunk_base(chunk) else {
       return false;
     };
-    let mut local = fine_min.rem_euclid(IVec3::splat(CHUNK_SIZE));
+    let mut local = voxel_min.rem_euclid(IVec3::splat(CHUNK_SIZE));
     let mut node = base;
     let mut extent = CHUNK_SIZE;
     loop {
@@ -204,9 +204,9 @@ mod tests {
     }
   }
 
-  /// 负坐标 chunk 定位：fine -1 → chunk -1（div_euclid），local 255（rem_euclid）
+  /// 负坐标 chunk 定位：voxel -1 → chunk -1（div_euclid），local 255（rem_euclid）
   #[test]
-  fn negative_fine_chunk_lookup() {
+  fn negative_voxel_chunk_lookup() {
     let f = IVec3::new(-1, -257, 256);
     assert_eq!(
       f.div_euclid(IVec3::splat(CHUNK_SIZE)),

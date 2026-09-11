@@ -56,7 +56,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
       bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
     }
     _ => {
-      let anchor = IVec3::new(*EXT_FINE_HALF, 16, *EXT_FINE_HALF);
+      let anchor = IVec3::new(*EXT_VOXEL_HALF, 16, *EXT_VOXEL_HALF);
       let path = Path::new(ASSETS_PATH).join("vox/nuke.vox");
       let info = vox_scene::load_vox_scene(&mut grid, &path, anchor).expect("nuke.vox 加载失败");
       cam_eye = Vec3::new(406.5, 339.5, 431.5);
@@ -184,8 +184,8 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
 // ─────────────────────────────────────────────────────────────────────
 // 世界：tiles x∈[0..10] z∈[0..10] y∈[0..2] 共 10×3×10=300 实有 tile，
 //       brickmap compute_window origin=(-1,-1,-1) dims=(12,5,12)=720 砖，
-//       fine AABB ≈ (-512,-512,-512)..(5632,2048,5632)，对角穿越 ≈9000 fine。
-// 内容分布（fine 单位 0..5120 XY 平面，y 高度）：
+//       voxel AABB ≈ (-512,-512,-512)..(5632,2048,5632)，对角穿越 ≈9000 voxel。
+// 内容分布（voxel 单位 0..5120 XY 平面，y 高度）：
 //   · 基础 L0 地面（全地图高 16）+ 起伏正弦高度场山体
 //   · 4 座雪峰（四角，y 到 800）· 中部峡谷蜿蜒河流 L2
 //   · 160 棵散点树（L2 粗节节省体素）在非山非河格
@@ -194,10 +194,10 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
 //   · 保留 tile(1,0,0) 每 120 帧 L4 黄↔青交替（验证 132KB/180µs 增量上传路径）
 //   · 世界大标语 "GATE ENGINE" 立在入口大道
 // ─────────────────────────────────────────────────────────────────────
-// 世界规模（tile 数，1 tile = 512 fine）：env `GATE_TILES` 可调。
+// 世界规模（tile 数，1 tile = 512 voxel）：env `GATE_TILES` 可调。
 // 默认 2 = 快速调试档（启动 ~几秒；正确性调试期默认小场景）；
 // `GATE_TILES=10` = 完整压测场景（启动 ~55s，性能验收用）。
-// 场景内所有结构性坐标（城堡/大道/河）均以 EXT_FINE_HALF 为锚，随规模等比成立。
+// 场景内所有结构性坐标（城堡/大道/河）均以 EXT_VOXEL_HALF 为锚，随规模等比成立。
 static EXT_N_TILES: LazyLock<i32> = LazyLock::new(|| {
   std::env::var("GATE_TILES")
     .ok()
@@ -205,9 +205,9 @@ static EXT_N_TILES: LazyLock<i32> = LazyLock::new(|| {
     .unwrap_or(2)
     .clamp(2, 10)
 });
-static EXT_FINE_X: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
-static EXT_FINE_Z: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
-static EXT_FINE_HALF: LazyLock<i32> = LazyLock::new(|| *EXT_FINE_X / 2);
+static EXT_VOXEL_X: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
+static EXT_VOXEL_Z: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
+static EXT_VOXEL_HALF: LazyLock<i32> = LazyLock::new(|| *EXT_VOXEL_X / 2);
 
 /// 正弦高度场（确定性，不用 rand）：
 /// h(x,z) = 16 + A·sin(x·k1)·cos(z·k2) + 山体距 4 角的反比隆起
@@ -224,9 +224,9 @@ fn terrain_h(x: i32, z: i32) -> i32 {
     (600.0 / d).min(1.0) * 780.0 // 山顶 ~800
   };
   let sn = corner_snow(0, 0)
-    + corner_snow(*EXT_FINE_X - 1, 0)
-    + corner_snow(0, *EXT_FINE_Z - 1)
-    + corner_snow(*EXT_FINE_X - 1, *EXT_FINE_Z - 1);
+    + corner_snow(*EXT_VOXEL_X - 1, 0)
+    + corner_snow(0, *EXT_VOXEL_Z - 1)
+    + corner_snow(*EXT_VOXEL_X - 1, *EXT_VOXEL_Z - 1);
   let hf = 16.0 + s1 * 80.0 + s2 * 120.0 + sn;
   // 4 对齐：fill_box 高度层全部 4³ 整块（非对齐会退化为逐体素边缘 →
   // 4³ Split 碎片化，树序列化输出曾膨胀到 1.9GB）。阶梯化 4 级符合像素风。
@@ -235,15 +235,15 @@ fn terrain_h(x: i32, z: i32) -> i32 {
 
 /// 离中央堡（世界中心）的距离
 fn dist_to_castle(x: i32, z: i32) -> i32 {
-  let dx = x - *EXT_FINE_HALF;
-  let dz = z - *EXT_FINE_HALF;
+  let dx = x - *EXT_VOXEL_HALF;
+  let dz = z - *EXT_VOXEL_HALF;
   ((dx * dx + dz * dz) as f32).sqrt() as i32
 }
 
 /// 中央峡谷蜿蜒河（x,z 在河道走廊内返回 true）
 fn in_river(x: i32, z: i32) -> bool {
-  let t = z as f32 / *EXT_FINE_Z as f32; // 0..1
-  let river_center = *EXT_FINE_HALF as f32 // 世界中线
+  let t = z as f32 / *EXT_VOXEL_Z as f32; // 0..1
+  let river_center = *EXT_VOXEL_HALF as f32 // 世界中线
     + (t * std::f32::consts::TAU).sin() * 700.0 // 正弦摆 ±700
     + ((t * 12.566).cos() * 180.0); // 次级摆幅
   let dx = (x as f32) - river_center;
@@ -263,13 +263,13 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     };
   }
   // ================================================================
-  //  (1) 基础地形：按 16 fine (L0) 步长采样高度场 → fill_box 铺柱
+  //  (1) 基础地形：按 16 voxel (L0) 步长采样高度场 → fill_box 铺柱
   //      y=16..h 使用 palette 2 山岩；y>h-40 且 h>520 → palette 3 雪峰
   // ================================================================
   let mut z = 0i32;
-  while z < *EXT_FINE_Z {
+  while z < *EXT_VOXEL_Z {
     let mut x = 0i32;
-    while x < *EXT_FINE_X {
+    while x < *EXT_VOXEL_X {
       let h = terrain_h(x, z);
       let dc = dist_to_castle(x, z);
       // 中央堡区 (radius<700) 不开地形，后面由城堡结构接管
@@ -290,7 +290,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
           if rock_h > 0 {
             fill_box(grid, IVec3::new(x, 16, z), IVec3::new(16, rock_h, 16), 2);
           }
-          // 雪顶（h > 560 时，顶部 38 fine 改 palette 3 雪）
+          // 雪顶（h > 560 时，顶部 38 voxel 改 palette 3 雪）
           if top > 560 {
             let snow_h = top - snow_line;
             if snow_h > 0 {
@@ -302,7 +302,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
               );
             }
           } else {
-            // 低矮山坡顶部覆草（palette 1，最顶 16 fine）
+            // 低矮山坡顶部覆草（palette 1，最顶 16 voxel）
             let grass_h = (top - 16).min(16);
             if grass_h > 0 && top - grass_h >= 16 {
               fill_box(
@@ -326,7 +326,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   fill_bricks(
     grid,
     IVec3::new(0, 0, 0),
-    IVec3::new(*EXT_FINE_X, 16, *EXT_FINE_Z),
+    IVec3::new(*EXT_VOXEL_X, 16, *EXT_VOXEL_Z),
     16,
     1,
   );
@@ -338,8 +338,8 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   // 中央大道（X 向，中线 ±32 宽）深灰铺路
   fill_box(
     grid,
-    IVec3::new(0, 16, *EXT_FINE_HALF - 32),
-    IVec3::new(*EXT_FINE_X, 8, 32),
+    IVec3::new(0, 16, *EXT_VOXEL_HALF - 32),
+    IVec3::new(*EXT_VOXEL_X, 8, 32),
     12,
   );
   // 大标语（L1，每像素 8³，放在入口 X=64 Y=32 Z=256 朝向 -Z）
@@ -356,8 +356,8 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   //     · 正殿中心高塔 80×80×192（y=464..656）+ L3 金顶球
   //     · 四角旗帜（L4 红飘带形状）
   // ================================================================
-  let cx = *EXT_FINE_HALF;
-  let cz = *EXT_FINE_HALF;
+  let cx = *EXT_VOXEL_HALF;
+  let cz = *EXT_VOXEL_HALF;
   // 浮空岛底（倒锥：按 y 降低半径收窄）——L0 级 16 步扫描
   let island_base_y = 128i32; // 岛底尖
   let island_top_y = 240i32; // 岛顶面（城墙在此升起）
@@ -438,7 +438,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   );
   // 正殿正门（Z- 方向，挖一矩形门洞：clear_voxel）
   {
-    // L1 每步 = 8 fine；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
+    // L1 每步 = 8 voxel；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
     let e = 8i32; // L1 边长
     let mn = IVec3::new(cx - 48, 336, cz - 264);
     let ex = mn + IVec3::new(96, 96, 8);
@@ -503,14 +503,14 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     let mut i = 0i32;
     while n_planted < 170 && i < 2000 {
       // 确定性 2 互素线性同余 → (x,z) 伪散点
-      let x = (i * 211 + 83) % *EXT_FINE_X;
-      let z = ((i * 977 + 419) ^ 0xA53) % *EXT_FINE_Z;
+      let x = (i * 211 + 83) % *EXT_VOXEL_X;
+      let z = ((i * 977 + 419) ^ 0xA53) % *EXT_VOXEL_Z;
       let x = x.abs();
       let z = z.abs();
       let h = terrain_h(x, z);
       let ok = dist_to_castle(x, z) > 900
         && !in_river(x, z)
-        && !((*EXT_FINE_HALF - 32)..=(*EXT_FINE_HALF + 32)).contains(&z) // 中央大道
+        && !((*EXT_VOXEL_HALF - 32)..=(*EXT_VOXEL_HALF + 32)).contains(&z) // 中央大道
         && h < 360;
       if ok {
         // 树干 （L1, 24 宽 16 宽 24 深 高 80）
@@ -536,7 +536,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     (768, 4352, 70, 9, 10, 223), // 左下 水晶紫/红
   ];
   for &(cx_, cz_, cnt, pa, pb, seed) in crystal_clusters.iter() {
-    if cx_ >= *EXT_FINE_X || cz_ >= *EXT_FINE_Z {
+    if cx_ >= *EXT_VOXEL_X || cz_ >= *EXT_VOXEL_Z {
       continue; // 簇中心在世界外（N 缩小时）跳过，避免 t 无限增长溢出
     }
     let h = terrain_h(cx_, cz_);
@@ -546,11 +546,11 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
       // 确定性位置抖动
       let sx = ((t * 37 + seed) % 96) - 48;
       let sz = ((t * 131 + seed * 3) % 96) - 48;
-      let hy = (t * 53) % 14; // 高度 0..13 fine
+      let hy = (t * 53) % 14; // 高度 0..13 voxel
       let pal = if (t & 1) == 0 { pa } else { pb };
       let px_ = cx_ + sx;
       let pz_ = cz_ + sz;
-      if px_ >= 0 && pz_ >= 0 && px_ < *EXT_FINE_X && pz_ < *EXT_FINE_Z {
+      if px_ >= 0 && pz_ >= 0 && px_ < *EXT_VOXEL_X && pz_ < *EXT_VOXEL_Z {
         fill_box(grid, IVec3::new(px_, h + hy, pz_), IVec3::new(1, 1, 1), pal);
         placed += 1;
       }
@@ -564,7 +564,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   //      （原「每 120 帧黄↔青交替」闪烁测试已移除，仅保留静态场景）
   // ================================================================
   fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 11);
-  if 1264 + 32 <= *EXT_FINE_X {
+  if 1264 + 32 <= *EXT_VOXEL_X {
     fill_box(grid, IVec3::new(1264, 240, 240), IVec3::new(32, 32, 32), 7);
   }
   let t0 = gate_voxel::ChunkCoord::new(0, 0, 0);

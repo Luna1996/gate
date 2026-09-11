@@ -33,8 +33,8 @@ impl Default for AnchorCamera {
 /// 世界空间锚点（挂任意 UI 节点；v0 距离缩放作用于本实体 TextFont）
 #[derive(Component, Clone, Copy, Debug)]
 pub struct WorldAnchor {
-  /// 锚点世界坐标（fine 单位，与渲染世界一致）
-  pub pos_fine: Vec3,
+  /// 锚点世界坐标（voxel 单位，与渲染世界一致）
+  pub pos_voxel: Vec3,
   /// 手动开关（投影系统之外的总闸）
   pub visible: bool,
   /// 近大远小（按 reference_distance / 距离 缩放 font_size）
@@ -112,7 +112,7 @@ pub fn world_anchor_system(
   for (e, anchor, mut node, mut vis, tf, base) in &mut q {
     let mut show = anchor.visible;
     if show {
-      match project_to_screen(cam.view_proj, anchor.pos_fine, screen) {
+      match project_to_screen(cam.view_proj, anchor.pos_voxel, screen) {
         Some(px) => {
           let left = Val::Px(px.x);
           let top = Val::Px(px.y);
@@ -137,7 +137,7 @@ pub fn world_anchor_system(
     if anchor.scale_with_distance
       && let Some(mut tf) = tf
     {
-      let dist = anchor.pos_fine.distance(cam.position_world);
+      let dist = anchor.pos_voxel.distance(cam.position_world);
       let s = anchor_distance_scale(dist, anchor.reference_distance);
       match base {
         Some(b) => {
@@ -174,7 +174,7 @@ fn vis_of(v: bool) -> Visibility {
 pub fn world_anchor_label(
   commands: &mut Commands,
   text: &str,
-  pos_fine: Vec3,
+  pos_voxel: Vec3,
   color: Color,
 ) -> Entity {
   commands
@@ -182,7 +182,7 @@ pub fn world_anchor_label(
       Name::new("ui-world-anchor"),
       Label,
       WorldAnchor {
-        pos_fine,
+        pos_voxel,
         visible: true,
         scale_with_distance: true,
         reference_distance: 760.0,

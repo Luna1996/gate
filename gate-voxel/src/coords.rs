@@ -10,7 +10,7 @@
 //! - Level 1: 64³
 //! - Level 2: 16³ ← 组件粒度（= DDGI probe cell = gate cell）
 //! - Level 3: 4³
-//! - Level 4: 1³ ← 编辑最细粒度
+//! - Level 4: 1³ ← 编辑最细粒度（voxel，0.25cm）；代码中坐标量词统一用 `voxel`
 
 use glam::IVec3;
 
