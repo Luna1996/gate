@@ -13,7 +13,7 @@ use gate_voxel::VolumeTransform;
 
 // ---- 相机参数（P2.6 from_orbit 使用；用户已取消"最远距离"限制）----
 // CAM_FAR = 透视投影 far 面；dda.wgsl 内 DDA 射线 t_max 同步到此量级。
-// 原 4000（10m）→ 现 65536（163.84m）足够 zoom-out 到整个 tile 场景（~1000 voxel）
+// 原 4000（80m）→ 现 65536（1310.72m）足够 zoom-out 到整个 tile 场景（~1000 voxel）
 // 缩成屏幕 1% 像素仍可见。DIST_MAX 已删除，滚轮 zoom-out 距离本身无上限。
 pub(crate) const FOV_Y: f32 = 60.0_f32.to_radians();
 pub(crate) const CAM_NEAR: f32 = 1.0;

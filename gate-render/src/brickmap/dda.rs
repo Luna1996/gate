@@ -67,7 +67,7 @@ impl DdaCameraConfig {
     let up = Vec3::Y;
     let aspect = VIEW_SIZE.x as f32 / VIEW_SIZE.y as f32;
     let fovy = 60.0_f32.to_radians();
-    // near = 最细格点（0.25cm）粒度；near/far 比过大（如 0.01/4000）会让
+    // near = 最细格点（2cm）粒度；near/far 比过大（如 0.01/4000）会让
     // inv_view_proj 条件数爆炸（求逆误差 5e-3），反投影射线方向失真
     let near = 1.0;
     let far = 4000.0;

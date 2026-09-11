@@ -24,7 +24,7 @@ cargo clippy --workspace --all-targets    # lint
 ### 已实现
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| **SVO 体素数据结构** | ✅ 生产可用 | `HashMap<TileCoord, Tile>` + 每胞 4 层精化下钻（L0 4cm → L4 0.25cm）；调色板压缩；CPU/Rust `BrickMapBuffers` 与 GPU storage buffer 字节同构。Tile 跨坐标自动创建。|
+| **SVO 体素数据结构** | ✅ 生产可用 | `HashMap<TileCoord, Tile>` + 每胞 4 层精化下钻（L0 32cm → L4 2cm）；调色板压缩；CPU/Rust `BrickMapBuffers` 与 GPU storage buffer 字节同构。Tile 跨坐标自动创建。|
 | **GPU 砖块图线性化（upload）** | ✅ 生产可用 | 节点流编码为 `b_struct` + `b_leaves` + `b_palette` 三块 storage buffer；`dirty-range tracking` 增量部分写：3-tile MVP 热点交换 140MB→132KB，278ms→200µs。|
 | **DDA 计算着色器光追** | ✅ 生产可用 | `workgroup 8×8`；AABB slab 三轴射线-砖块图求交跳过空段（empty-ray 0 步），1 voxel 胞 Amanatides&Woo 步进；相对标尺 v3（slab 全局 t → start_v 推进 → 循环变量全相对 start_v），`max_steps=16384` 覆盖 9000 voxel 对角穿越，AABB-skip 与 brute-force full DDA 头 100% 等价。|
 | **GPU 调度集成（Bevy 0.19）** | ✅ 生产可用 | no render nodes；extract/prepare/queue/render/blit 全部系统级显式调度；half-res RenderScale；compute 输出 texture 2D → Core2d PostProcess blit 到 ViewTarget（sRGB 精确匹配）。MSAA 强制关闭（自定义 multisample.count=1 冲突）。|
@@ -123,12 +123,12 @@ gate-app/          Demo 应用入口
 
 ---
 
-## 4. 常量体系（所有世界坐标 voxel 单位 = 0.25cm）
+## 4. 常量体系（所有世界坐标 voxel 单位 = 2cm）
 
 | 符号 | 值 | 含义 |
 |---|---|---|
-| `TILE_SUB` | 512 voxel | 每 tile 512 voxel = 128cm |
-| `SUB_PER_CELL` | 16 voxel | 每粗胞 16 voxel = 4cm（L0 底）|
+| `TILE_SUB` | 512 voxel | 每 tile 512 voxel = 10.24m |
+| `SUB_PER_CELL` | 16 voxel | 每粗胞 16 voxel = 32cm（L0 底）|
 | `TILE_CELLS` | 32³ = 32,768 | 每 tile 粗胞数 |
 | `TILE_INDEX_CAP` | 128 | 砖块图 index 表每轴容量 |
 | `PALETTE_WORDS` | 512 | 512 字 × 2 slot/字 packed = 1024 palette 项；实际 0=AIR |
