@@ -82,6 +82,20 @@ struct DdgiProbeVizLodSlider;
 #[derive(Component)]
 struct DdgiProbeVizLodValueLabel;
 
+/// 借针半径滑杆（0=Off/1=±1/2=±2），诊断跨墙借针漏光 A/B
+#[derive(Component)]
+struct DdgiBorrowSlider;
+
+#[derive(Component)]
+struct DdgiBorrowValueLabel;
+
+/// Chebyshev std 信任系数滑杆（0=忽略 std 硬判定 / 1=正常），A/B 诊断
+#[derive(Component)]
+struct DdgiSoftSlider;
+
+#[derive(Component)]
+struct DdgiSoftValueLabel;
+
 /// 「Fly mode」开关标记（观察者写 [`crate::camera::CameraMode`]）
 #[derive(Component)]
 struct CameraModeToggle;
@@ -118,6 +132,9 @@ const DDGI_PROBE_VIZ_LODS: [&str; 5] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3
 const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
 
 const DDGI_STAGES: [&str; 4] = ["Off", "Active", "Cast", "Full"];
+
+/// 借针半径档：0=关闭（无针 cell 的插值角直接缺席，Douglas 原架构）/ ±1 / ±2（默认现状）
+const DDGI_BORROW_RADII: [&str; 3] = ["Off", "\u{00b1}1", "\u{00b1}2"];
 
 /// 速度显示文本（voxel/s；1 voxel = 2cm）
 fn speed_text(v: f32) -> String {
@@ -442,6 +459,102 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       },
                     );
                     row.world_mut().entity_mut(*vl).insert(DdgiGainValueLabel);
+                  });
+                // -- Borrow 借针半径行（0=Off / 1=±1 / 2=±2，步进 1；诊断跨墙借针漏光）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-borrow-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "Borrow".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      &ctx,
+                      row,
+                      SliderConfig {
+                        min: 0.0,
+                        max: 2.0,
+                        value: ddgi_dbg.borrow_radius.clamp(0.0, 2.0),
+                        step: Some(1.0),
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(DdgiBorrowSlider);
+                    let vl = label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: format!(
+                          "{} {}",
+                          ddgi_dbg.borrow_radius.round() as i32,
+                          DDGI_BORROW_RADII
+                            [(ddgi_dbg.borrow_radius.round() as usize).min(DDGI_BORROW_RADII.len() - 1)]
+                        ),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row
+                      .world_mut()
+                      .entity_mut(*vl)
+                      .insert(DdgiBorrowValueLabel);
+                  });
+                // -- Chebyshev std 信任系数（0=忽略 std 退成硬判定 / 1=现状）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-soft-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "Cheb std".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      &ctx,
+                      row,
+                      SliderConfig {
+                        min: 0.0,
+                        max: 1.0,
+                        value: ddgi_dbg.depth_soft_k.clamp(0.0, 1.0),
+                        step: Some(0.05),
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(DdgiSoftSlider);
+                    let vl = label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: format!("{:.2}", ddgi_dbg.depth_soft_k),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*vl).insert(DdgiSoftValueLabel);
                   });
                 let t = toggle_switch(
                   &ctx,
@@ -854,6 +967,44 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       if let Ok(mut t) = q_label.single_mut() {
         t.0 = format!("{:.1}", ev.value);
       }
+    },
+  );
+
+  // Borrow 借针半径滑杆 → 写 DdgiDebugSettings.borrow_radius + 刷新档位标签。
+  // sort 每帧按 params.w 重写借针间接表，下一帧即生效（见 ddgi.rs 字段注释）。
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<DdgiBorrowSlider>>,
+     mut q_label: Query<&mut Text, With<DdgiBorrowValueLabel>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      let v = ev.value.round().clamp(0.0, 2.0);
+      dbg.borrow_radius = v;
+      if let Ok(mut t) = q_label.single_mut() {
+        let i = (v as usize).min(DDGI_BORROW_RADII.len() - 1);
+        t.0 = format!("{} {}", v as i32, DDGI_BORROW_RADII[i]);
+      }
+      info!("DDGI borrow radius → {} ({})", v as i32, DDGI_BORROW_RADII[v as usize]);
+    },
+  );
+
+  // Cheb std 滑杆 → 写 DdgiDebugSettings.depth_soft_k + 刷新数值标签。
+  // 0 = 忽略深度 std（硬判定）；1 = 正常使用 std。
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<DdgiSoftSlider>>,
+     mut q_label: Query<&mut Text, With<DdgiSoftValueLabel>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      dbg.depth_soft_k = ev.value.clamp(0.0, 1.0);
+      if let Ok(mut t) = q_label.single_mut() {
+        t.0 = format!("{:.2}", ev.value);
+      }
+      info!("DDGI cheb std k → {:.2}", ev.value);
     },
   );
 

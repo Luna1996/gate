@@ -45,3 +45,20 @@ fn shadow_surface_eps_matches_rust_const() {
   );
   assert!(src.contains(&expect), "dda.wgsl 中未找到 `{expect}`");
 }
+
+/// DDGI 图集纹素数在 Rust 与 WGSL **两处独立声明**：Rust 侧决定纹理尺寸 / 显存 / collect
+/// 线程数，WGSL 侧决定八面体方向分辨率与纹素坐标。任一侧漏改都会让两边错位 —— 典型症状是
+/// 深度纹素写进**相邻探针**、或方向查到错纹理，表现为跟着探针投影走的成片锯齿/亮暗块，
+/// 而且**不会**有编译错误。此测试把这类静默错位挡在 CI。
+#[test]
+fn ddgi_texels_match_rust_consts() {
+  let path = manifest_dir().join("../gate-app/assets/shaders/dda.wgsl");
+  let src = std::fs::read_to_string(&path).expect("读 dda.wgsl");
+  for (name, val) in [
+    ("DDGI_IRR_TEXELS", gate_render::ddgi::IRRADIANCE_TEXELS),
+    ("DDGI_DEPTH_TEXELS", gate_render::ddgi::DEPTH_TEXELS),
+  ] {
+    let expect = format!("const {name}: u32 = {val}u;");
+    assert!(src.contains(&expect), "dda.wgsl 中未找到 `{expect}`");
+  }
+}

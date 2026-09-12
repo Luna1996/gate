@@ -5,9 +5,11 @@
 //!   16/32/64/128 voxel），覆盖范围逐级 ×2 且严格嵌套（LOD(l-1) 盒 ⊂ LOD(l) 盒）。
 //!   相机移动使某级 origin 按该级 cell 对齐滚动时，只重烘「世界 cell 发生变化」的槽位
 //!   （`ddgi_cell_id` 增量缓存），未变的槽位续龄。
-//! - **烘焙（`ddgi_bake`）**：世界数据变化（上传修订号自增）时才跑一次。逐 cell 沿 4³ 分裂树
+//! - **烘焙（`ddgi_bake0..3`）**：世界数据变化（上传修订号自增）时才跑一次。逐 cell 沿 4³ 分裂树
 //!   **BFS 找「最大的全空叶」并把探针放在其中心**（同级优先靠 cell 中心；全满 cell 无探针；
 //!   全空 cell 居中）——即 Douglas 的探针放置启发式。结果写入 `ddgi_cell` storage buffer。
+//!   按 LOD 拆成 4 个独立 compute pass（细→粗）：粗级要继承**本帧**细级的放置结果
+//!   （Douglas 的 "down sample the generated data"），而 pass 边界才是内存屏障。
 //! - **活跃判定（`ddgi_sort`）**：每帧逐 cell，读烘焙记录（不再重算树 BFS）；探针存在且
 //!   「本 cell 或 6 邻接 cell 有体素」（或与非网格对齐物体 AABB 重叠）→ 活跃 → atomicAdd 进
 //!   per-LOD worklist；同时刷新 age / slot_pos / meta。
@@ -18,19 +20,20 @@
 use bevy::render::render_resource::{CachedComputePipelineId, ShaderType};
 use glam::{IVec3, IVec4, UVec3, UVec4, Vec4};
 
-/// 辐照度图每探针 4×4（= 16 纹素）。**它是静态闪烁/亮区伸缩的第一杠杆**，同时也是收敛速度的杠杆：
-/// 采样返回的是归一化平均（total/wsum），对权重变化极敏感，而纹素值每帧都在抖（射线方向逐帧
-/// 重随机化）→ 探针的值在"呼吸" → 三线性插值出的峰值（探针晶格短划/亮斑）随之伸缩。
-/// 同一笔射线预算摊到更少的纹素上 ⇒ 每纹素每帧的射线数 ×4 ⇒ 单帧样本方差 ÷4。
-/// 代价：方向分辨率变粗（16 个方向覆盖半球，每格 ~45°）；漫反射 GI 是低频量，纹素间还有
-/// 硬件三线性过滤，观感上通常是"更柔和"。必须与 WGSL `DDGI_IRR_TEXELS` 一致（有对齐测试）。
+/// 辐照度图每探针 4×4（= 16 纹素）。
+///
+/// 【为什么不用原版的 8×8】曾对齐 DDGI 原版试过 8×8 / 16×16（见 DEPTH_TEXELS 注释）：
+/// 实测**画质没有明显改善**，代价却很实在（显存 ×4、collect 线程 ×4、帧轮换周期 ×4）。
+/// 方向分辨率降低带来的模糊由 DDGI_ALPHA 的时间累积与纹素间插值承担。
+/// 必须与 WGSL `DDGI_IRR_TEXELS` 一致。
 pub const IRRADIANCE_TEXELS: u32 = 4;
-/// 深度图每探针 8×8（= 64 纹素）。**收敛速度由它决定**（见 WGSL 同名常量处推导）：
-/// 探针填充成本 ∝ 每探针纹素数，而射线预算是固定的。旧值 16×16 = 256 纹素占每探针
-/// 总纹素（64 + 256 = 320）的 80% → rpp≈4 时要 64~128 帧才写满一遍，是"收敛过慢"主因。
-/// 降到 8 之后 辐照度 : 深度 = 64 : 64，两者同时 ~16 帧填满，总成本 ÷2.5（零帧时成本）。
-/// 代价：`wd` 遮挡判定的角分辨率减半，由 Chebyshev 自适应软判定吸收。
-/// 必须与 WGSL `DDGI_DEPTH_TEXELS` 一致（有对齐测试）。
+/// 深度图每探针 8×8（= 64 纹素）。
+///
+/// 【为什么不用原版的 16×16】曾试过 16×16（每纹素 ~11°，现在 ~22°）：**实测漏光没有明显
+/// 改善** —— 说明当时的漏光主因不在深度角分辨率，而在别处（射线方向未绑定纹素 / 借针跨墙 /
+/// 级联硬切，见 dda.wgsl 对应注释）。代价则是深度图集 64MB → 256MB、collect 线程 80 → 320、
+/// 帧轮换周期 ×4。故回退到 8×8。
+/// 必须与 WGSL `DDGI_DEPTH_TEXELS` 一致。
 pub const DEPTH_TEXELS: u32 = 8;
 pub const PROBE_T_MAX: f32 = 8192.0;
 /// 每帧射线总预算。WGSL `ddgi_seal` 把它**均分**给全部活跃探针（rpp = 预算 / 活跃数，
@@ -211,6 +214,9 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
       // 3：烘焙输出（bake 写 / sort 读）4：age/flags（读写）5：indirect/counter（读写）
       // 6：worklist（读写）7：slot_pos（读写）8：cell_id（读写，滚动增量）
       // 9：cast 射线样本（cast 写 / collect 读）
+      // 10：cell→slot 间接表（读写）—— 允许一个 cell 指向**邻近 cell 的探针**，
+      //     这样"探针必须离表面足够远"和"每个采样点都有 8 个可用角"可以同时成立。
+      //     初始化成"指向自身"时与旧行为逐位等价（见 create 处的 identity 填充）。
       buf(3, false),
       buf(4, false),
       buf(5, false),
@@ -218,6 +224,7 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
       buf(7, false),
       buf(8, false),
       buf(9, false),
+      buf(10, false),
     ],
   )
 }
@@ -272,7 +279,10 @@ pub fn ddgi_bg6_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
 
 #[derive(Debug, Clone, Copy)]
 pub struct DdgiPipelines {
-  pub bake: CachedComputePipelineId,
+  /// per-LOD 烘焙入口（lod 0..DDGI_LODS，细→粗）。**必须逐级拆成独立 pass**：
+  /// 粗级的探针放置要读本帧细级的 bake 输出，而同一 pass 内没有顺序保证，
+  /// 只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
+  pub bake: [CachedComputePipelineId; DDGI_LODS as usize],
   pub sort: CachedComputePipelineId,
   pub seal: CachedComputePipelineId,
   pub cast: CachedComputePipelineId,
@@ -295,6 +305,9 @@ pub struct DdgiGpu {
   pub args: bevy::render::render_resource::Buffer,
   pub worklist: bevy::render::render_resource::Buffer,
   pub slot_pos: bevy::render::render_resource::Buffer,
+  /// cell → slot 间接表（每 LOD 16384 项，u32）。初始化 = 指向自身；bake 可把"本格放不出
+  /// 探针"的 cell 指向邻近 cell 的探针（见 WGSL `ddgi_slot`）。
+  pub cell_slot: bevy::render::render_resource::Buffer,
   /// 烘焙输出：每 slot 一条 (flags | off_b)
   pub cell: bevy::render::render_resource::Buffer,
   /// 每 slot 已烘焙的世界 cell 键 + 有效标志（滚动增量烘焙）
@@ -381,6 +394,21 @@ pub struct DdgiDebugSettings {
   pub gain: f32,
   pub probe_viz: bool,
   pub probe_viz_lod: f32,
+  /// 借针搜索半径（格），对应 WGSL `params.w`：0 = 关闭借针（Douglas 原架构：
+  /// 无针 cell 的插值角直接缺席），1 = ±1 邻域，2 = ±2 邻域（现状默认）。
+  /// 仅作诊断 A/B：验证跨墙借针对室内墙角漏光的贡献。sort 每帧重写间接表，
+  /// 拖动滑杆下一帧即生效，无需 rebake。
+  pub borrow_radius: f32,
+  /// Chebyshev 里 **std 项的信任系数**，对应 WGSL `misc.z`（0..1，默认 1 = 正常使用 std）。
+  ///
+  /// 拖到 0 = 完全忽略 std，`soft` 退回固定下限 `DDGI_DEPTH_SOFT_MIN`（硬判定：更能压漏光，
+  /// 但过渡带变窄、动态时更易闪）。保留作 A/B 诊断用。
+  ///
+  /// 注：该系数最初是为确认一个已修复的缺陷而加 —— 射线方向当时是「Fibonacci 球 + 每帧
+  /// 随机四元数整体重旋」，每个深度纹素跨帧收到的是全球随机方向，`std` 度量的是「20° 锥内
+  /// 几何起伏」而非「同方向噪声」，墙角虚高 → 软漏光。现在射线已**绑定到深度纹素**（见
+  /// dda.wgsl 的 cast「射线 ↔ 深度纹素绑定」），std 语义已正确。
+  pub depth_soft_k: f32,
 }
 
 impl Default for DdgiDebugSettings {
@@ -390,6 +418,8 @@ impl Default for DdgiDebugSettings {
       gain: 1.0,
       probe_viz: false,
       probe_viz_lod: 0.0,
+      borrow_radius: 2.0,
+      depth_soft_k: 1.0,
     }
   }
 }
@@ -614,6 +644,16 @@ fn init_ddgi_gpu(
   let cell = zero_storage_buffer(&device, &queue, "ddgi_cell", 4096 * 4);
   let cell_id = zero_storage_buffer(&device, &queue, "ddgi_cell_id", 4096 * 16);
   let meta = zero_storage_buffer(&device, &queue, "ddgi_meta", 4096 * 4);
+  // cell→slot 间接表：表长固定（= Σ 各级 dims 乘积），一次性建满 + 填成 **identity**
+  // （`ddgi_slot` 返回绝对 slot 下标，所以 identity = [0,1,2,...]）。
+  // identity 状态与"没有这张表"逐位等价 → 这一步本身不改画面，只建立通路（Step 1 第 1 小步）。
+  let n_cells = (DDGI_LODS * DDGI_LOD_DIMS.x * DDGI_LOD_DIMS.y * DDGI_LOD_DIMS.z) as usize;
+  let cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", (n_cells * 4) as u64);
+  let mut identity = Vec::with_capacity(n_cells * 4);
+  for i in 0..n_cells as u32 {
+    identity.extend_from_slice(&i.to_le_bytes());
+  }
+  queue.write_buffer(&cell_slot, 0, &identity);
   let samples = zero_storage_buffer(&device, &queue, "ddgi_samples", DDGI_SAMPLE_BYTES);
   let indirect = ddgi_indirect_buffer(&device, &queue, "ddgi_indirect");
   let args = ddgi_indirect_buffer(&device, &queue, "ddgi_args");
@@ -624,6 +664,7 @@ fn init_ddgi_gpu(
     args,
     worklist,
     slot_pos,
+    cell_slot,
     cell,
     cell_id,
     meta,
@@ -684,7 +725,12 @@ fn queue_ddgi_pipelines(
     })
   };
   gpu.pipelines = Some(DdgiPipelines {
-    bake: mk(&pipeline_cache, "gate_ddgi_bake", "ddgi_bake", base.clone()),
+    bake: [
+      mk(&pipeline_cache, "gate_ddgi_bake0", "ddgi_bake0", base.clone()),
+      mk(&pipeline_cache, "gate_ddgi_bake1", "ddgi_bake1", base.clone()),
+      mk(&pipeline_cache, "gate_ddgi_bake2", "ddgi_bake2", base.clone()),
+      mk(&pipeline_cache, "gate_ddgi_bake3", "ddgi_bake3", base.clone()),
+    ],
     sort: mk(&pipeline_cache, "gate_ddgi_sort", "ddgi_sort", base.clone()),
     seal: mk(&pipeline_cache, "gate_ddgi_seal", "ddgi_seal", seal_layout),
     cast: mk(&pipeline_cache, "gate_ddgi_cast", "ddgi_cast", base.clone()),
@@ -729,9 +775,6 @@ fn dispatch_ddgi(
   let Some(pipes) = gpu.pipelines else {
     return;
   };
-  let Some(p_bake) = pipeline_cache.get_compute_pipeline(pipes.bake) else {
-    return;
-  };
   let Some(p_sort) = pipeline_cache.get_compute_pipeline(pipes.sort) else {
     return;
   };
@@ -753,20 +796,47 @@ fn dispatch_ddgi(
   // 1D dispatch：WG=64，各 pass 覆盖 total_slots（bake 仅在修订号变化时跑）
   let wg_slots = gpu.total_slots.div_ceil(64).min(65535);
 
-  // 烘焙：世界数据变化时重算探针位置（BFS 最大空叶）
+  // 烘焙：世界数据变化时重算探针位置（BFS 最大空叶）。
+  // **按 LOD 逐级派发 4 个独立 pass（细→粗）**：粗级的放置要继承本帧细级的 bake 输出，
+  // 同一 pass 内没有顺序保证，只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
   if bake.map_or(false, |b| b.0) {
-    crate::profiler::gpu_compute_pass(
-      &mut profiler,
-      ctx.command_encoder(),
-      "gate_ddgi_bake",
-      |pass| {
-        pass.set_pipeline(p_bake);
-        set_bgs(pass, &bg4.0);
-        pass.dispatch_workgroups(wg_slots, 1, 1);
-      },
-    );
-    // 真正派发过了才撤销挂起标志（本函数上面任何一处提前 return 都会保留它）
-    gpu.bake_pending = false;
+    let n_lods = DDGI_LODS as usize;
+    let wg_per_lod = (DDGI_LOD_DIMS.x * DDGI_LOD_DIMS.y * DDGI_LOD_DIMS.z)
+      .div_ceil(64)
+      .min(65535);
+    const LABELS: [&str; DDGI_LODS as usize] = [
+      "gate_ddgi_bake0",
+      "gate_ddgi_bake1",
+      "gate_ddgi_bake2",
+      "gate_ddgi_bake3",
+    ];
+    // 4 个入口必须**全部**就绪才开跑：否则会出现"细级烘了、粗级没烘"的半帧状态。
+    let mut p_bake: [Option<&bevy::render::render_resource::ComputePipeline>; DDGI_LODS as usize] =
+      [None; DDGI_LODS as usize];
+    let mut ready = true;
+    for lod in 0..n_lods {
+      p_bake[lod] = pipeline_cache.get_compute_pipeline(pipes.bake[lod]);
+      if p_bake[lod].is_none() {
+        ready = false;
+      }
+    }
+    if ready {
+      for lod in 0..n_lods {
+        let p = p_bake[lod].unwrap();
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          LABELS[lod],
+          |pass| {
+            pass.set_pipeline(p);
+            set_bgs(pass, &bg4.0);
+            pass.dispatch_workgroups(wg_per_lod, 1, 1);
+          },
+        );
+      }
+      // 真正派发过了才撤销挂起标志（否则保留它，等下一帧管线就绪再烘）
+      gpu.bake_pending = false;
+    }
   }
   // sort：读烘焙结果做活跃判定 + worklist 压缩 + age/slot_pos/meta 刷新（probe_viz 依赖其新鲜度）
   crate::profiler::gpu_compute_pass(
@@ -845,6 +915,8 @@ fn extract_ddgi_settings(
     gain: d.gain,
     probe_viz: d.probe_viz,
     probe_viz_lod: d.probe_viz_lod,
+    borrow_radius: d.borrow_radius,
+    depth_soft_k: d.depth_soft_k,
   });
   commands.insert_resource(dbg);
 }
@@ -923,11 +995,13 @@ fn prepare_ddgi(
       dims: UVec4::new(d.x, d.y, d.z, gpu.grid.lod_slot_base[lod]),
     };
   }
-  u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, 0.0);
+  // params: x=frame, y=debug mode, z=gain, w=借针半径（0=关闭，见 DdgiDebugSettings）
+  u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, dbg.borrow_radius);
   u.misc = Vec4::new(
     if stage.shade_gi() { 1.0 } else { 0.0 },
     gpu.total_slots as f32,
-    0.0,
+    // z = Chebyshev std 信任系数（见 DdgiDebugSettings.depth_soft_k）
+    dbg.depth_soft_k,
     0.0,
   );
   u.dirty_min = Vec4::new(
@@ -967,6 +1041,7 @@ fn prepare_ddgi(
       gpu.slot_pos.as_entire_binding(),
       gpu.cell_id.as_entire_binding(),
       gpu.samples.as_entire_binding(),
+      gpu.cell_slot.as_entire_binding(),
     )),
   );
   commands.insert_resource(DdgiBg4(bg4));
