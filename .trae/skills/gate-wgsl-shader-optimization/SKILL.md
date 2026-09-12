@@ -72,22 +72,39 @@ cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许�
 
 ## GATE_BENCH 实测流程
 
+**必须带 `profile` feature 构建**（否则 `GateProfilerPlugin` 只注册空资源，不产生任何数据）：
+
 ```powershell
-# release 构建后，后台静默跑（PresentMode::Fifo vsync）
+cargo build -p gate-app --release --features profile
 $env:GATE_BENCH="1"
 Start-Process -FilePath <target\release\gate-app.exe> -ArgumentList "--nuke" `
   -WorkingDirectory "c:\repo\repo.rust\gate\gate-app" -WindowStyle Minimized
-Start-Sleep -Seconds 22   # 等场景加载 + 帧率稳定，取 t>10s 的帧
+Start-Sleep -Seconds 30
+Select-String -Path gate-app\logs\latest.log -Pattern "逐 pass" | Select-Object -Last 2
 ```
 
-读 `gate-app/logs/gpu_frame.log`，列：`elapsed_secs,wall_ms,frame_gpu_ms,trace_gpu_ms,ddgi_gpu_ms`。
-PowerShell 统计：过滤 `t -gt 10`，对 trace 列排序取 median/p25/p75/p90。
+数据源是 **`latest.log` 里的 `GPU 逐 pass 均值（共 X ms/frame）：…` 行**，它**每 2 秒**输出
+一个聚合窗口（`GPU[2.0s x120]` = 该窗口 120 帧的均值）；列名 = compute pass 的 label
+（`gate_dda_trace` / `gate_ddgi_cast` / `gate_ddgi_bake0..3` / …），合计即当帧全部 GPU 工作。
 
-- **先验 wall_ms(dt) 中位 ≈ 16.67**：后台/DWM 节流会造假数据（曾见 4fps 陷阱），dt 不对
-  则该次数据作废。
+- **必须取稳态窗口**：启动后头几秒会夹带一次性成本（首帧 `ddgi_dirty.full` → 全量烘焙，
+  `bake1` 在该窗口可达 1.4ms）。用 `Select-Object -Last 1` 只取最后一个窗口，或确认相邻
+  窗口数值一致后再读数 —— 曾因取到启动窗口，把一次性烘焙误判成"每帧 1.4ms 的瓶颈"。
+- **`gpu_frame.log` / `frame_time.log` / `fps.log` 已废弃**（写入代码在重构中消失，文件
+  最后更新停在 9/7、9/9）。旧版本节教的 `wall_ms` / `frame_gpu_ms` 列与现在的 pass 均值
+  **不同源、不可比**，不要再拿它当基线。
 - 画面错误会表现为 trace "假优化"（射线集体 miss → 黑屏但时序变好）。日志里搜
   `DeviceLost`/`ERROR`；最终画面由用户目测确认，不要自己截图。
-- trace pass 基线参考：RTX 3070 / nuke.vox，trace 中位 ~0.5–0.7ms，整帧 GPU 工作 <1ms。
+- **稳态基线**（RTX 3070 / nuke.vox / 1280×720，2026-09-12，各取 2 个稳态窗口）：
+
+  | 配置 | 合计 | 明细（ms） |
+  |---|---|---|
+  | `GATE_DDGI_STAGE=0`（DDGI 关） | 1.32 | trace 1.27 |
+  | 默认（DDGI Full） | 2.86 | trace 1.60 + cast 0.94 + collect 0.22 + sort 0.05 + seal 0.01 |
+
+  ⇒ DDGI 净开销 ≈ 1.55ms，`cast` 占 61%（131072 条射线的场景 trace + 命中点采样）。
+  **注意**：trace 在 DDGI 开时由 1.27 涨到 1.60，那 0.33ms 是**着色侧 `ddgi_sample`** 的
+  成本（含级联混合带），不要误当成 ray 遍历变慢。
 
 ## A/B 方法论（关键教训）
 
@@ -98,15 +115,20 @@ PowerShell 统计：过滤 `t -gt 10`，对 trace 列排序取 median/p25/p75/p9
 - 诊断开关（环境变量，进程启动前设置）：`GATE_NO_LUT=1`（关 b_leaves 掩码剔除）、
   `GATE_NO_BEAM=1`。`GATE_NO_LOD=1` 已失效（远场早停已移除，见铁律 3）。无 env 开关的
   改动，临时把 WGSL 条件改成 `false && ...` 做 A/B，测完恢复。
+- **DDGI 的 A/B**：整条链路用 `GATE_DDGI_STAGE=0`(Off) / `3`(Full)；局部单点用运行时滑杆
+  （Debug 面板：Borrow 借针半径、Cheb std 深度信任系数，见 `DdgiDebugSettings`）——
+  滑杆可同会话内来回切，比改常量重编译可靠得多。
 - 热路径优化（除法→预计算 inv_rd 乘法、命中直返省一整轮外层、bit-first 空气零 load）
   要同时改 CPU 镜像并过测试；近似开关（LUT）只加 WGSL，注释标明。
 
 ## 常用命令
 
 ```
-cargo test -p gate-render --lib brickmap::dda::        # CPU 等价性门禁
-cargo build -p gate-app --release                     # 发布构建（shader 运行时加载）
-cargo run -p gate-app --release -- --nuke             # 正常运行（GATE_BENCH=1 加基准）
+cargo test -p gate-render --lib brickmap::dda::         # CPU 等价性门禁（trace_chunk 遍历）
+cargo test -p gate-render --test wgsl_compile --release # shader naga 校验 + Rust/WGSL 常量对齐
+cargo build -p gate-app --release                      # 发布构建（shader 运行时加载）
+cargo build -p gate-app --release --features profile   # 带 GPU pass 计时（GATE_BENCH 用）
+cargo run -p gate-app --release -- --nuke              # 正常运行（GATE_BENCH=1 加基准）
 ```
 参考资料：Douglas octo-release 算法原文在 `gate-app/logs/octo_march_core.txt`
 （march_intersection_buffer / traverse_bit_set / dda / firstTrailingBit）。
