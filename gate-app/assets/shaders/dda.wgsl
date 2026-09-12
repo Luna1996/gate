@@ -1112,19 +1112,36 @@ fn light_field_gather(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> vec3<f32
 }
 
 
-// 着色法线 = 命中面法线（`UnifiedHit.n`，trace_chunk 按进入面直接产出，已是世界系单位向量）。
+// 着色法线 = **逐体素（隐式）法线**：命中体素 6 邻域占据差分的负梯度；退化时退回面法线。
 //
-// 为什么不用「逐体素隐式法线」（6 邻域占用差分）：1 体素厚的薄板（地板/墙，体素世界的主力
-// 几何）的 ±x/±z 邻接都实心、±y 都空气，二值差分三项全部抵消 → 恒为零向量，任何**对称**
-// 模板（±2、±4…）都一样退化 —— 因为薄板两侧往外都是空气。几何上薄板两侧本来就不存在唯一
-// 的方向，逐面法线是唯一有定义的答案。
+// 向外 = 占据度的负梯度，占据度用 `sample_brickmap != 0`（air/palette 0 = 非占据）。
+// 效果：球/柱/斜面这类体素化曲面按 26 邻域方向的平滑法线着色（不再是一格一格的平面），
+// 而薄板仍是面法线 —— 两边的极端都各得其所。
 //
-// 实测后果：旧实现退化时硬编码 (1,0,0)，所有薄板法线变成 +X → 垂直于 X 的薄墙只有 +X 那
-// 侧碰巧正确，-X 那侧 8 个角探针全落在背面，被 DDGI 的 wn 背向剔除剔光（Probe 品红、GI
-// 整面全黑）；地板则是一半探针被误用（漏光/发暗），太阳直光也按 +X 计算。
+// 【退化回退为什么必须是面法线】1 体素厚的薄板（地板/墙 —— 体素世界的主力几何）的 ±x/±z
+// 邻接全实心、±y 全空气，二值差分三项全部抵消 → 零向量；任何**对称**模板（±2、±4…）同样
+// 退化，因为薄板两侧往外都是空气 —— 几何上本来就不存在唯一方向，面法线是唯一有定义的答案。
 //
-// 代价：放弃「同体素跨像素同色」（体素在棱边处会有逐面明暗差）。收益：每像素少 6 次
-// sample_brickmap（一次 chunk 定位 + 最多 4 层树下钻）。
+// 旧实现正是在这一步硬编码 (1,0,0)：薄墙只有 +X 那侧碰巧正确，-X 侧 8 个角探针全落背面、
+// 被 DDGI 的 wn 闸门剔光（Probe 品红、整面全黑），地板则一半探针被误用（漏光/发暗），太阳
+// 直光也按 +X 计算。**那次失败的是"退化回退"，不是隐式法线本身** —— 所以这次按面法线退。
+//
+// 代价：每像素 6 次 sample_brickmap（一次 chunk 定位 + 最多 4 层树下钻）。
+fn voxel_normal(g: Grid, voxel: vec3<i32>, face_n: vec3<f32>) -> vec3<f32> {
+  let x = vec3<i32>(1, 0, 0);
+  let y = vec3<i32>(0, 1, 0);
+  let z = vec3<i32>(0, 0, 1);
+  // 占据度差分（- 侧减 + 侧）：实心一侧计数更大 → 差分**直接指向空气侧 = 向外法线**
+  // （例：+X 面朝空气 → -X 是实心、+X 是空气 → d.x = 1-0 = +1 ✓）
+  let d = vec3<f32>(
+    f32(sample_brickmap(g, voxel - x) != 0u) - f32(sample_brickmap(g, voxel + x) != 0u),
+    f32(sample_brickmap(g, voxel - y) != 0u) - f32(sample_brickmap(g, voxel + y) != 0u),
+    f32(sample_brickmap(g, voxel - z) != 0u) - f32(sample_brickmap(g, voxel + z) != 0u),
+  );
+  let len = length(d);
+  // 退化（薄板/实心内部）→ 退回面法线；否则归一到 26 邻域方向之一
+  return select(face_n, d / len, len > 1e-3);
+}
 
 // 场景级命中：UnifiedHit + 命中 volume 的 palette 基址（dda_main 取 albedo 用）
 struct SceneHit {
@@ -1268,15 +1285,20 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let best = trace_scene(origin_voxel, dir_voxel, frustum_length, t_min, 3u);
   var col = sky_rgb();
   if (best.uh.hit) {
-    // ---- 逐体素着色（Douglas #22/#23：一体素一色）+ 逐面法线 ----
-    // albedo/采样点/阴影射线体素锚定（同体素同色）；法线取命中面 —— 薄板不存在唯一的
-    // 逐体素法线（见 voxel_normal 处注释），故按面着色。
+    // ---- 逐体素着色（Douglas #22/#23：一体素一色）+ 逐体素法线 ----
+    // albedo/采样点/阴影射线体素锚定（同体素同色）；法线取**隐式逐体素法线**（退化退面法线，
+    // 见 voxel_normal 注释）—— 它同时决定太阳 N·L、阴影射线/GI 采样点的外推方向、DDGI 方向采样。
     let alb = palette_albedo(best.palette_base, best.uh.pal);
-    let n = best.uh.n;
     // 体素中心 → 世界系（主世界 identity 直等于体素中心；物体经旋转/缩放变换）
     let gg = make_grid(u32(best.uh.obj_id) + 1u);
     let vc = vec3<f32>(best.uh.voxel) + vec3<f32>(0.5);
     let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
+    let n = voxel_normal(gg, best.uh.voxel, best.uh.n);
+    // 沿 n 的外推距离：**必须保证离开命中体素**。轴向法线时 0.5+eps 就够，但逐体素法线在
+    // 棱边/圆角处是斜的，0.5·n 的分量 < 0.5 → 起点仍在体素内 → DDA 先命中所属体素的邻居
+    // （厚墙的棱边被自己遮住 → 每条棱一圈暗边）。0.5/max|n| 正是「从中心沿 n 走多远离开
+    // 单位立方体」，任何方向都保证落在空气侧。
+    let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
     // R3-18 直光硬阴影（#02/#17 形态）：1 条太阳射线，不通即阴影。
     // 射线原点 = 体素中心 + n×(0.5 + SHADOW_SURFACE_EPS)（贴向空气侧邻域）。
     // 那个 eps 是必需的：+n×0.5 恰好落在面平面上，对 -X/-Y/-Z 面坐标是整数 → DDA 的
@@ -1287,7 +1309,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = 0.0;
     if (ndl > 0.0) {
-      let sh = trace_scene(p_voxel + n * (0.5 + SHADOW_SURFACE_EPS), sun_dir, 8192.0, 0.0, 3u);
+      let sh = trace_scene(p_voxel + n * n_off, sun_dir, 8192.0, 0.0, 3u);
       sun = select(
         1.0,
         0.0,
@@ -1300,26 +1322,61 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gi_on = ddgi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     if (gi_on) {
-      // 只把点从「命中体素中心」推到体素表面外侧（0.5 + eps 体素，见阴影射线处注释）；
+      // 只把点推到体素表面外侧（沿 n 走 n_off，保证离开命中体素，见其定义处注释）；
       // 更远的、随 cell 尺寸缩放的外推在 ddgi_sample_lod 内部按该 LOD 的 cs 施加
-      // （DDGI_BIAS_CELLS）。这里的 eps 让「点是否在某个 LOD 盒内」的判定不落在盒边界上。
-      gi = ddgi_sample(p_voxel + n * (0.5 + SHADOW_SURFACE_EPS), n) * ddgi_u.params.z / DDGI_PI;
+      // （DDGI_BIAS_CELLS）。
+      gi = ddgi_sample(p_voxel + n * n_off, n) * ddgi_u.params.z / DDGI_PI;
     }
-    // AO（Douglas #15）只作用于**间接**部分（常量天光 ambient + GI）；直射太阳由阴影负责。
-    // 这正好治"墙角/接缝不该发亮"：常量 ambient 无遮挡，凹角处本来和开阔面一样亮。
+    // AO（Douglas #15）只作用于**常量天光**这一项。
+    //
+    // 【为什么不能乘在 gi 上】gi 是**已经带遮挡信息的全局光照** —— 探针射线本身就逐方向做了
+    // 遮挡判定（wd/Chebyshev），再乘一个 16³ 粗粒度填充率的 AO 属于**重复计算**。它的症状
+    // 很好认：AO 只乘间接项 → 关掉 DDGI 时 gi=0、只剩 0.05 常量天光，AO 作用在一个很小的
+    // 量上（"不开 DDGI 就没斑"）；开着时 gi 是 0.2~0.4，同一个 AO 把它乘暗 → 圆柱/薄肋上
+    // 出现**块状暗斑**，而且光照场是相机中心、cell 0.32m、随相机滚动重铺 → **微小视角变化
+    // 就整片跳变**。这正是"光影斑点 + 暗部骤变"的主因。
+    //
+    // 常量天光没有任何遮挡信息（凹角与开阔面一样亮），AO 正是为它准备的 —— 所以只留这一项。
     let ao = light_field_ao(p_voxel, best.uh.obj_id);
-    // 天光常量只在「本像素不在任何级联盒内」时兜底（ddgi_dbg_dom==0 = 无探针覆盖）。
-    // 级联内的环境光**一律由 GI 提供**：无光室内的探针辐照度≈0 → 画面接近全黑；
-    // 若这里无条件加常量，封闭空间会被同一个常量抬亮，室内外就没有亮度差。
-    let amb = select(sky * DDGI_SKY_AMBIENT, vec3<f32>(0.0), ddgi_dbg_dom > 0.5);
-    col = alb * (sun_c * ndl * sun + (amb + gi) * ao);
+    // 天光常量在两种情形下兜底：① 本像素不在任何级联盒内（ddgi_dbg_dom==0，无探针覆盖）；
+    // ② 在级联内但**采样不可信/无数据**（见下）。级联内数据可信时一律由 GI 提供 ——
+    // 无光室内的探针辐照度≈0 → 画面接近全黑；若无条件加常量，室内外就没有亮度差。
+    //
+    // 【为什么不能"采样失败就归零"】ddgi_sample 返回的是**归一化**平均（total/wsum）：
+    // wsum 只决定"有几个探针参与了这次平均"，**不决定返回值的幅度**。于是 wsum 在阈值
+    // 1e-4 附近时，结果会从"某一个边缘探针的满幅值"直接跳到 0（或跳到粗级 LOD 的值）。
+    // 这一跳就是两个被反复报告的观感问题的共同根因：
+    //   ① 薄几何/曲面上"8 角探针被剔空"的像素间接光整项归零 → **零星黑斑**
+    //      （不开 DDGI 时 amb 是常量，所以看不到）；
+    //   ② 相机稍微一动，这些像素就在「有 GI」与「纯黑」之间翻 → **阴影暗部骤变**。
+    // 改成按置信度淡出到天光常量：探针数据正常 → conf≈1（室内依旧由 ≈0 的辐照度决定，
+    // 仍然黑）；探针不可信 → conf→0（退化成常量天光，与 DDGI 关闭时的观感一致）。全程连续。
+    //
+    // wsum = Σ wtri·wn·wd，trilinear 权重和为 1 → wsum ∈ [0,1]。开阔平直表面约 0.3~0.6，
+    // 曲面/薄几何部分覆盖时 0.02~0.2，"仅剩一个边缘探针"约 1e-4~0.02。
+    // 阈值取 [0, 0.02]：**只覆盖"基本没有可用样本"的区间**。
+    //
+    // 【重要】conf 只用来**补天光常量**，绝不去缩放 GI 的幅度。曾经用它乘过 gi，结果：
+    // wsum 是**随时间累积**的覆盖度（每帧只有 rpp 条射线去填一整张探针纹理图），一开始很小、
+    // 几十帧才长上来 —— 乘上去等于让整幅画面的间接光幅度慢慢爬升，表现为「收敛极慢」，
+    // 同时覆盖度偏低的像素被压暗 → 暗斑范围更大更明显。这个教训记在这里，别再犯。
+    let conf = smoothstep(DDGI_CONF_LO, DDGI_CONF_HI, ddgi_dbg_wsum);
+    let amb_sky = sky * DDGI_SKY_AMBIENT;
+    let in_casc = ddgi_dbg_dom > 0.5;
+    let amb = select(amb_sky, amb_sky * (1.0 - conf), in_casc);
+    col = alb * (sun_c * ndl * sun + amb * ao + gi);
     // 自发光体素：radiance 直出（不吃方向、不吃阴影）——「每个体素都能是光源」的着色侧。
     col = col + alb * palette_emissive(best.palette_base, best.uh.pal) * DDGI_EMIT_GAIN;
     if (ddgi_u.params.y > 0.5) {
       if (ddgi_u.params.y < 1.5) {
         col = alb * sky * DDGI_SKY_AMBIENT * 0.15 + alb * gi * 8.0;
       } else if (ddgi_u.params.y < 2.5) {
-        col = alb * vec3<f32>(clamp(ddgi_dbg_wsum * 0.125, 0.0, 1.0)) * 2.0;
+        // wsum 档 = 采样置信度的**灰度直方图**（1:1，不吃 albedo）。
+        // wsum = Σ wtri·wn·wd 是 trilinear 权重和 ∈ [0,1]（开阔表面 ~0.3-0.6）→ 直接当灰度。
+        // 旧版写成 `alb * clamp(wsum*0.125,0,1) * 2`：既乘了 albedo（深色材质即使覆盖正常
+        // 也显示近黑）又整体偏低 16× —— 结果"哪里到底有没有数据"根本读不出来，
+        // 是上一轮把 wsum 当成 GI 幅度缩放系数的误判成因之一。
+        col = vec3<f32>(clamp(ddgi_dbg_wsum, 0.0, 1.0));
       } else if (ddgi_u.params.y < 3.5) {
         // d = 「包含该像素的壳」所在 LOD + 1（纯几何包含，与采样是否成功无关）；
         // d = 0 表示没有任何 LOD 盒包含该像素 —— 这是覆盖率问题，不是剔除问题。
@@ -1381,8 +1438,28 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 
-const DDGI_IRR_TEXELS: u32 = 8u;
-const DDGI_DEPTH_TEXELS: u32 = 16u;
+/// 辐照度图每探针 4×4（= 16 纹素）。
+///
+/// 【为什么从 8 降下来】同一笔射线预算摊到**更少的纹素**上 → 每个纹素每帧摊到的射线数 ×4
+/// （rpp≈4 时：8×8 每纹素 ~0.06 条/帧 → 4×4 ~0.25 条/帧）→ **单帧样本方差 ÷4**。
+/// 这同时治两件事：
+///   ① 收敛更快（写满一遍的帧数 ÷4）；
+///   ② **静态闪烁/亮区伸缩** —— 纹素值每帧都在抖（射线方向逐帧重随机化），而采样返回的是
+///      归一化平均（total/wsum），对权重变化极敏感 → 每个探针的值在"呼吸" → 亮区边界伸缩。
+///      降低每纹素的样本方差是直接压制它的手段。
+/// 代价：方向分辨率变粗（4×4 = 16 个方向覆盖半球，每格 ~45°）。漫反射 GI 本来就是低频量，
+/// 加上纹素间的硬件三线性过滤，观感上通常只表现为"更柔和"。
+const DDGI_IRR_TEXELS: u32 = 4u;
+/// 深度图每探针 8×8（= 64 纹素）。
+///
+/// 【为什么从 16 降下来】收敛速度 ≈ 累计射线数 ÷ (探针数 × **每探针纹素数**)，而射线预算
+/// 是固定的 —— 所以"填满一张探针纹理图要多少帧"直接由纹素数决定。旧值 16×16 = **256 纹素**
+/// 占每探针总纹素（64 辐照度 + 256 深度 = 320）的 **80%**：rpp≈4 时要 64~128 帧才把每个
+/// 纹素写一遍，正是"收敛过慢"的主因（辐照度只要 16 帧）。
+/// 降到 8×8 后两者平衡（各 ~16 帧），填充总成本 ÷2.5，**零帧时成本**。
+/// 代价：`wd` 遮挡判定的角分辨率减半 —— Chebyshev 软判定（soft = max(std, mean·softness)）
+/// 本身按深度不确定度自适应放宽，能吸收这层粗糙度。
+const DDGI_DEPTH_TEXELS: u32 = 8u;
 const DDGI_PROBES_PER_LAYER_AXIS: u32 = 16u;
 const DDGI_PROBES_PER_LAYER: u32 = 256u;
 const DDGI_LOD_COUNT: u32 = 4u;
@@ -1431,6 +1508,22 @@ const DDGI_BLEND_SELF: f32 = 2.0;
 /// 两个症状都更差）。
 /// 取 2.0 ⇒ 4³ 那级恢复：贴墙 cell 会在墙内侧一个**全空 8cm 立方**的中心拿到探针（离表面
 /// ≥4cm），壳内就有数据了，根本不需要粗级兜底；1³ 那级（0.5）仍关闭 —— 探针不会贴到面上。
+/// 【保持 2.0 —— 提到 4.0 需要先改放置策略，见下】
+///
+/// Douglas 的原则确实是"探针必须离最近表面有距离"（"don't want probes right up against
+/// walls… half of the probe's memory and half of the probe samples are being wasted"）。
+/// 但**这个原则不能单独搬过来**，两次实测都失败：
+///   ① 第一次（插值还按名义 cell 中心）：偏移变大 → 值被安放到错位置 → 连 LOD0 都出伪影；
+///   ② 第二次（插值已按探针实际位置）：近处**又**变坏 —— 说明根因不在插值，而在**放置**。
+///
+/// 根因：我们的放置是「**每个 cell 塞一个探针**，取离 cell 中心最近、且满足净距的全空叶」。
+/// 净距要求越严 → 能通过的 cell 越少 → **贴墙一圈的 cell 直接没有探针** → 那些像素可信的角
+/// 变少 → 归一化平均被少数探针支配 → 近处变糊/出块。
+/// 而 Douglas 的放置不是"逐 cell 填格"：他**选**一批彼此尽量远离、离表面有距离的位置，
+/// 再把细级数据 **down-sample** 出粗级（见 DDGI 那集）。位置与刚性格点解耦，所以他能用大净距。
+/// ⇒ 想恢复 4.0，必须先把放置改成"选择式 + 逐级 down-sample"（这是结构改动，不是常量）。
+///
+/// 1³ 那级（0.5）仍关闭 —— 探针不会贴到面上。
 const DDGI_PROBE_MIN_CLEARANCE: f32 = 2.0;
 const DDGI_TEXEL_MIN_WEIGHT: f32 = 1e-4;
 /// 前后判定（wn）的锐度：wn = clamp(dot(n,-dir)/此值, 0, 1)。
@@ -1468,9 +1561,16 @@ const DDGI_CHANGE_DROP: f32 = 0.0;
 const DDGI_DELTA_CLAMP: f32 = 0.25;
 const DDGI_SKY_RADIANCE_SCALE: f32 = 1.0;
 const DDGI_RAY_BIAS: f32 = 0.5;
-/// 天光环境项：**只在该像素根本没有任何级联探针覆盖时**兜底（见着色处用 ddgi_dbg_dom 判定）。
-/// 级联内的环境光一律由 DDGI 提供（带遮挡）：无光室内 → 探针辐照度≈0 → 接近全黑。
+/// 天光环境项：在该像素**没有任何级联探针覆盖**、或**采样置信度过低（无数据/仅剩边缘探针）**
+/// 时兜底。数据可信的级联内像素一律由 DDGI 提供环境光（带遮挡）：无光室内 → 探针辐照度≈0
+/// → 接近全黑。详见着色处 conf / amb / gi_eff 的推导（那里解释了为什么不能"失败就归零"）。
 const DDGI_SKY_AMBIENT: f32 = 0.05;
+/// 采样置信度区间：`conf = smoothstep(LO, HI, wsum)`，**只用来在"基本没有可用样本"时
+/// 补上天光常量**（绝不用来缩放 GI 幅度，理由见着色处注释）。
+/// wsum = Σ wtri·wn·wd（trilinear 权重和为 1）→ ∈ [0,1]。HI=0.02 只覆盖
+/// "仅剩一个边缘探针"（1e-4~0.02）这一档，正常覆盖（≥0.02）完全不受影响。
+const DDGI_CONF_LO: f32 = 0.0;
+const DDGI_CONF_HI: f32 = 0.02;
 /// 探针射线命中时的辐亮度下限。**必须为 0**：任何非零下限都会被反馈回路放大成
 /// ≈ alb·sky·FLOOR/(1-alb) 的"室内自发光"，封闭空间永远压不黑。
 /// 首帧的种子由**能看到天空的射线**提供（miss → sky_rgb），所以不需要这个下限。
@@ -2188,21 +2288,41 @@ fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32, clamp_cells: bool, rela
         if ((mw & DDGI_META_ACTIVE) == 0u) { ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u; continue; }
         // 年龄太小（刚换过世界 cell / 刚编辑）→ 图集里是旧位置或未覆盖的读数，跳过
         if (ddgi_meta_age(mw) < DDGI_MIN_SAMPLE_AGE) { ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u; continue; }
-        let wx = select(1.0 - fr.x, fr.x, ix == 1);
-        let wy = select(1.0 - fr.y, fr.y, iy == 1);
-        let wz = select(1.0 - fr.z, fr.z, iz == 1);
-        let wtri = wx * wy * wz;
-        if (wtri <= 1e-6) { continue; }
+        // 权重按**探针的实际位置**算，而不是名义 cell 中心 —— 这是 Douglas 采样里那一步：
+        //   "we fetch the probes' offsets within their cells and we compute additional blending
+        //    factors based upon which probes have line of sight visibility to the voxel and which
+        //    probes are in front of the voxel versus which probes are behind the voxel."
+        //
+        // 为什么必须这样：探针是被放在 cell 内**任意位置**的（放置规则是"离 cell 中心最近的
+        // 全空叶"，还要满足最小净距），插值却假装它在 cell 中心 → 偏移越大，这个值被安放到
+        // 越错的位置 → 跟着晶格走的菱形/三角伪影。**伪影强度正比于偏移量**，所以 cell 越大
+        // （LOD1 的 0.64m）越明显；把最小净距从 2 提到 4 会让偏移整体变大，于是连 LOD0 都
+        // 开始出伪影 —— 那次实测就是这么失败回来的（见 DDGI_PROBE_MIN_CLEARANCE 注释）。
+        //
+        // 每个轴用线性支撑 max(0, 1 - |Δ|/cs)（支撑半径正好一个 cell，跨 cell 连续），
+        // 三个轴相乘。八角的和不再恒为 1 —— 但下游本来就取归一化平均（total/wsum），
+        // 所以不需要额外归一化，而且这正好让"某个角被闸门剔掉"这件事的影响变小。
         let probe = ddgi_slot_pos[slot].xyz;
+        let d_ax = abs(ps - probe) / cs;
+        let wtri = max(0.0, 1.0 - d_ax.x) * max(0.0, 1.0 - d_ax.y) * max(0.0, 1.0 - d_ax.z);
+        if (wtri <= 1e-6) { continue; }
         let to = ps - probe;
         let dist = length(to);
         let dir = to / max(dist, 1e-4);
-        let wn = clamp(dot(n, -dir) / DDGI_NORMAL_BIAS, 0.0, 1.0);
-        // 背向探针闸门（wn）：非放宽路径一律剔除。放宽（wn 下限 0.25）只留给**像素不在任何
-        // 级联盒内**的情况（relax_normal）；壳内回退到更粗 LOD 时不再放宽 —— 那属于「本壳
-        // 8 角无有效采样」，此时放宽会让背向/隔墙探针也满权重参与平均 → 漏光。遮挡仍由
-        // depth map（wd）负责。
-        if (!relax_normal && wn <= 0.0) { ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u; continue; }
+        // 背向探针闸门：**两条路径一律剔除**（含放宽路径）。放宽（wn 下限 0.25）是为薄几何的
+        // **掠射**探针准备的（探针在表面侧方，dot ≈ 0），不是为**背向**探针（探针在表面背后）。
+        //
+        // 【为什么必须先用未 clamp 的 dot 判定】`clamp(dot, 0, 1)` 把 dot≈0（掠射）与 dot<0
+        // （背向）抹成同一个 0，放宽路径的 `max(wn, 0.25)` 于是把背向探针也拉进平均。而墙后/
+        // 箱体内部的探针辐照度 ≈0（那里本来无光 —— 例如这个大圆柱是个罐体，背面就是罐内），
+        // 一旦入选就把像素压成**暗斑**；哪几个角入选又随 cell 邻域摆动 → 斑块跟着晶格走、
+        // 随相机跳变。这正是「GI 模式里也有暗斑」的来源。
+        let wn_raw = dot(n, -dir) / DDGI_NORMAL_BIAS;
+        if (wn_raw <= 0.0) {
+          ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u;
+          continue;
+        }
+        let wn = clamp(wn_raw, 0.0, 1.0);
         let wn_w = select(wn, max(wn, 0.25), relax_normal);
         let dtex = ddgi_depth_sample(slot, dir);
         // 该方向没有任何命中记录（纹素从未被写过，或刚被 collect 显式清零）→ **无数据**，
@@ -2229,13 +2349,21 @@ fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32, clamp_cells: bool, rela
         // wd 极小 = 实质遮挡：保留统计与提前退出（不再做 0/1 硬剔除，避免临界翻转）
         if (wd <= 1e-3) { ddgi_dbg_rej.z = ddgi_dbg_rej.z + 1u; continue; }
         let irr = ddgi_irr_sample(slot, n);
-        // 该方向的辐照度纹素从未被写过 → 同样是「无数据」，不能以 0 参与平均（否则唯一被
-        // 接受的角若是空的，平均值就是 0）。已写入的纹素恒 > 0：collect 里
-        // radiance ≥ albedo·sky·DDGI_CAST_FLOOR > 0，所以「≈0」可安全当作「无数据」。
-        if (max(irr.x, max(irr.y, irr.z)) < DDGI_TEXEL_MIN_WEIGHT) {
-          ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u;
-          continue;
-        }
+        // 【旧闸门已删】这里曾经有一道 `max(irr) < DDGI_TEXEL_MIN_WEIGHT(1e-4) → 剔除`，
+        // 理由是"已写入的纹素恒 > 0（radiance ≥ albedo·sky·DDGI_CAST_FLOOR）"。但
+        // **DDGI_CAST_FLOOR 后来被改成 0**（室内要能压黑），这个前提就不成立了：射线打在
+        // 全黑表面 / 暗室里的**已写入**纹素，值本来就是 0 —— 用值阈值会把"真的暗"当成
+        // "没数据"剔掉。
+        //
+        // 为什么它会造成**静态也闪 / 亮区边界伸缩**：纹素值每帧按 age 斜率做 alpha 混合，
+        // 而 rpp 只有几条射线 → 值本来就在抖动。值在 1e-4 附近抖动时，该探针会逐帧在
+        // "入选/落选"之间翻，而归一化平均（total/wsum）对**集合变化**很敏感（低 wsum 的
+        // 像素尤其：1~2 个探针就占满结果）→ 画面闪、亮区边界伸缩。
+        // Domain/Probe 档看不出来：它们只看几何归属与闸门直方图，不看这个连续值。
+        //
+        // "这个方向有没有被采样过"由**深度纹素**负责（未采样 → snap 清零 → 上面的
+        // `dtex.x <= 0` 已剔除；命中/未命中都会写深度），所以这里直接用采样值即可：
+        // 真的暗方向本来就该以 ~0 参与平均。
         let w = wtri * wn_w * wd;
         total = total + irr * w;
         wsum = wsum + w;
@@ -2286,6 +2414,9 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       //     **归一化**平均（一个探针入选就占满结果）→ 一个隔墙粗级探针就能把整片点亮成
       //     跟着粗级 cell 走的亮条纹 —— 封闭空间里那些"细条"就是这么来的。
       //   · 仍是同一个 cell 邻域（不 clamp、不换级），位置连续、不产生块状跳变。
+      //   · 放宽**只抬掠射探针的权重**（wn_raw > 0 但很小）；wn_raw <= 0 的背向探针在任何
+      //     路径下都被剔除 —— 它们是墙后/箱体内部的探针（辐照度≈0），拉进来会把像素压成
+      //     「跟着 cell 晶格走、随相机跳变」的暗斑（见 ddgi_sample_lod 的闸门注释）。
       let rej_shell = ddgi_dbg_rej; // 诊断用：保留未放宽时的剔除统计
       let r2 = ddgi_sample_lod(p, n, lod, false, true);
       if (r2.w >= 1e-4) {
@@ -2375,7 +2506,14 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
     dist = sh.uh.t;
     let alb = palette_albedo(sh.palette_base, sh.uh.pal);
     let hit_p = probe_pos + dir * dist;
-    let n = sh.uh.n;
+    // 与 dda_main 同一套逐体素法线（退化退面法线）：反弹辐照度的方向必须与着色侧一致，
+    // 否则曲面上的间接光会与直射/环境光"对不上"。代价是每条 GI 射线 6 次 sample_brickmap
+    // （射线数 ≈ 屏幕像素数的 1/7，可接受）。
+    let n = voxel_normal(
+      make_grid(u32(sh.uh.obj_id) + 1u),
+      sh.uh.voxel,
+      sh.uh.n,
+    );
     // 入射辐照度 E → 出射辐亮度 L = albedo·E/π（与着色侧 col += albedo·E/π 同约定）。
     // 加一项 albedo·sky·CAST_FLOOR 作下限，避免首帧 GI 全 0 时反馈回路死锁在 0；
     // 该下限必须小，否则封闭房间的探针也被抬亮（室内外没有亮度差）。
