@@ -1560,9 +1560,13 @@ const DDGI_BIAS_CELLS: f32 = 0.1;
 const DDGI_T_MAX: f32 = 8192.0;
 /// 级联混合带宽度（以**当前级** cell 边长为单位）：像素距某个 LOD 盒边界的距离小于
 /// `cs × 此值` 时，在该级与相邻级之间过渡，消除「跨过盒边界突然换一套光照」的硬边
-/// （用户报告的「LOD0/LOD1 边界很明显」）。0.5 = 半格（LOD1 的 cs=32 体素 → 带宽 16 体素）。
+/// （用户报告的「LOD0/LOD1 边界很明显」）。
+/// **取 1.0 = 论文的 "one grid cell"**：DDGI 2021（Scaling Probe-Based DDGI）处理相机锁定
+/// volume 的级联过渡时明确写「tightening the transition region by **one grid cell** (along
+/// each axis)」—— 过渡带就是一个格宽，**不是越宽越好**（太宽会让细级精度被粗级提前稀释，
+/// 反而把近场做糊）。
 /// 边界两侧恰好都是 0.5/0.5，所以跨边界连续 —— 推导见 ddgi_cascade_blend。
-const DDGI_CASCADE_BLEND: f32 = 0.5;
+const DDGI_CASCADE_BLEND: f32 = 1.0;
 /// 「覆盖内 GI ↔ 覆盖外天光兜底」过渡带的宽度（以**最粗级** cell 为单位）。
 /// 着色侧用它把 `amb` 从"盒内由 conf 决定"**平滑过渡**到"盒外全量天光"。
 /// 旧版用布尔 `in_casc` 直接 select：盒边界上 `amb` 从 `(1-conf)·sky` **硬跳**到 `sky`
@@ -1603,7 +1607,17 @@ const DDGI_SKY_AMBIENT: f32 = 0.05;
 /// 就完全不受影响 —— 这一点**不能**换成 wsum：凹角/远处粗级的存活权重天然低，用 wsum 会
 /// 把"本该黑"判成"不可信"而把天光常量加回来（室内墙角漏光）。见着色处注释。
 const DDGI_CONF_LO: f32 = 0.0;
-const DDGI_CONF_HI: f32 = 0.02;
+/// `cov` 的上界：conf = smoothstep(LO, HI, cov)。
+///
+/// 【为什么必须给足带宽】旧值 0.02 ≈ 「全有或全无」：8 个角里只要还有一个有数据就
+/// conf=1（不补天光），等最后一个角失效才 conf=0（补满）—— 于是**覆盖边界上 amb 从 0
+/// 一步跳到 amb_far**，那就是肉眼可见的"有 GI / 无 GI 割裂"。边界本身不可能消除
+/// （覆盖必然有限），能做的只是让「有 GI ↔ 无 GI」的差**被摊平在过渡带里**。
+/// 取 0.5：`cov` 的满值约 1（8 个角的 wtri 之和），所以过渡发生在「最后 1~2 个角失效」
+/// 对应的空间范围内（约 1~2 个 cell 宽）。嫌边界还明显就继续往 1.0 提。
+/// **不能**换成 wsum：凹角/远处粗级的存活权重天然低，用 wsum 会把"本该黑"判成"不可信"
+/// 而把天光常量加回来（室内墙角漏光）。见着色处注释。
+const DDGI_CONF_HI: f32 = 0.5;
 /// 探针射线命中时的辐亮度下限。**必须为 0**：任何非零下限都会被反馈回路放大成
 /// ≈ alb·sky·FLOOR/(1-alb) 的"室内自发光"，封闭空间永远压不黑。
 /// 首帧的种子由**能看到天空的射线**提供（miss → sky_rgb），所以不需要这个下限。
@@ -1682,19 +1696,30 @@ const DDGI_INDIR_COLL_TOTAL: u32 = 9u;    // 全局 collect 线程总数
 // 收敛跳帧参数（Douglas can_skip_update）：age 达阈值 + 距相机 > SKIP_DIST×spacing 才跳；
 // 每 LOD 按周期强制刷新（帧号 + slot 错峰），兜住「offset 没变但光照变了」的编辑。
 const DDGI_SKIP_AGE: vec4<u32> = vec4<u32>(32u, 24u, 16u, 12u);
+/// 换主（相机滚动）时把 age 打散到 `[1, N]` 的相位抖动周期：让"当帧直写"这个动作按**槽位号**
+/// 错开到 N 帧，避免整圈 cell 在同一帧一起直写、从而在 LOD 分界线留下一条完整的浅灰带。
+/// 原理：槽位号连续 ⇒ 世界 cell 相邻 ⇒ 取模后相位分散 ⇒ 每一帧只有 1/N 的换主探针在直写，
+/// 且在空间上是散点、不成带状。见 `ddgi_bake_one` 的换主说明。
+/// N 越大越分散，代价是单个探针"旧的近似值"最多停留 N 帧；8 是折中。
+/// 必须让 `1 + N - 1 < DDGI_SKIP_AGE`（最小 12），否则换主的探针会被判 converged 而停止投线。
+const DDGI_BAKE_STAGGER: u32 = 8u;
 const DDGI_REFRESH_PERIOD: vec4<u32> = vec4<u32>(64u, 96u, 128u, 160u);
 /// can_skip_update 的「远离相机」半径（单位 = 本级 cell 边长）。LOD0 的 cell 是 32 体素
 /// （64cm），所以 24 → 15.36m：这个半径外的探针一旦收敛（age ≥ SKIP_AGE）就只在
 /// REFRESH_PERIOD 的强制刷新帧投线，近场刷新频率完全不变。
 const DDGI_SKIP_DIST_CELLS: f32 = 24.0;
-/// 采样门限：槽位**换主**（相机滚过）或探针**新生**时 age 从 0 起步，图集还没写全 → 跳过它，
-/// 让那条带短暂由粗一级 LOD 顶替。只跳 1 帧即可 —— 第一次 collect（age 1）本来就用 `snap`
-/// 直接覆写所有被覆盖的纹素，且未被覆盖的纹素会被显式清零（见 collect），所以 age 2 起读数
-/// 就是干净的。
+/// 采样门限：探针**新生**（首次烘焙）时 age 从 0 起步、图集还没写 → 跳过 age=0 那一帧。
+/// **值必须 = 1**：判据是 `age < MIN`，MIN=1 → 只跳 age=0。
+/// 【注意「滚动换主」现在不走这条】换主时 bake 把 age 压到 1 并**保留图集历史**（见
+/// ddgi_bake_one 的换主说明），所以相机滚动不会再让任何探针被跳过；需要跳的只剩"从未烘过"
+/// 的 age=0。
+/// 历史：旧值 2 配合"换主 age 归零 + collect 显式清零"曾使相机移动时整圈 cell 整片无数据
+/// （那些角不计入 cov → conf=0 → 只剩很暗的天光兜底）→ 表现为"移动时 LOD 交汇处冒黑斑、
+/// 几帧后收敛"。两头都改掉后这条链才断。
 /// **这条门限不针对"世界编辑"**：编辑同一 world cell 时 bake 不重置 age（见 ddgi_bake_one），
 /// 被波及的探针 age 仍然很大、不会被这里跳过 —— 否则那条带会突然退到粗级再切回来，正是编辑后
 /// 光影闪烁的一半来源。
-const DDGI_MIN_SAMPLE_AGE: u32 = 2u;
+const DDGI_MIN_SAMPLE_AGE: u32 = 1u;
 /// collect 每探针的纹素线程数 = **从纹素数派生**（16 irr(4×4) + 64 depth(8×8) = 80）。
 ///
 /// 【必须是派生值，不能写死】历史上它曾写死某个值而在纹素数变化后不同步：`ddgi_seal` 拿
@@ -2235,17 +2260,35 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
   let same_cell = prev.w != 0 && all(prev.xyz == wcell);
   if (!dirty && same_cell) { return; }
   ddgi_cell_id[slot] = vec4<i32>(wcell, 1);
-  // 只有**换主**才重置 age/enabled/active 与"指向邻居"：换主意味着图集里这一格存的是上一个
-  // 世界 cell 的读数，必须丢弃（采样侧据此走 snap 重写；cell_slot 的旧指向也可能属于上一任）。
+  // 【保留】换主与编辑**都**保留图集历史，这里只维护 cell_slot 的指向（旧指向可能属于上一任）。
   //
-  // 而「同一 cell 只因世界编辑被重烘」**保留** age / meta / cell_slot —— 探针的逻辑身份没变、
+  // 「同一 cell 只因世界编辑被重烘」**保留** age / meta / cell_slot —— 探针的逻辑身份没变、
   // 位置最多在 cell 内微调，图集历史仍然有效。保留它，时域平均就能把新光照**渐入**；反之若在
-  // 这里清零，sort 会走 snap 直写一帧高方差估计、采样侧又因 MIN_SAMPLE_AGE 短暂跳过本针退到
+  // 这里清零，sort 会走直写一帧高方差估计、采样侧又因 MIN_SAMPLE_AGE 短暂跳过本针退到
   // 粗级 LOD —— 编辑后附近十几帧的光影闪烁正是这条链造成的。对齐 Douglas：编辑不重置累积量。
   // （cell_slot 无需在这里维护：sort 每帧对 enabled/disabled 两条分支都会重写它，且它只被采样
   //   侧的 ddgi_slot 读，烘焙的粗级继承不读 → 当帧 sort 之前没有任何读者。）
+  // 【换主同样不丢弃图集历史】旧版在这里 `= 0u`（age 归零）→ 采样侧跳过 + collect 清零 →
+  // 滚动时那一圈 cell 整片无数据 → 相机一移动就冒黑斑。但**滚动换主 = 平移一格**，新 cell
+  // 与旧 cell 是紧邻邻居，旧读数是**极好的近似** —— 这与上面「编辑保留历史、靠 EMA 渐入」
+  // 是同一个判断，没理由两种处理。真正的"内容已改变"只来自世界编辑。
+  //
+  // 【换主：age = 1 + 相位抖动 —— 目前观感最好的一档】取值实验（2026-09-12）走了五种：
+  //   · age = SKIP_AGE   → converged=true → 探针**停止投线** → 旧值永久残留 → 灰色尾巴（最差）
+  //   · age = SKIP_AGE-1 → 保证投线、alpha≈0.03，但换主当帧仍有可见跳变（浅灰带）
+  //   · age = 1          → 无残留、收敛最快，但整圈换主的探针同帧全部直写 → 一条完整的浅灰带
+  //   · age = 1+slot%N（本版）→ 把"直写"按**槽位号**错开到 N 帧：任何一帧只有 1/N 的换主探针
+  //     在直写，且它们在空间上是散点（槽位号连续 ⇒ 世界 cell 相邻 ⇒ 取模后相位分散）→
+  //     不再形成完整的一条带。
+  //   · 【失败，别再试】解耦出 RESIDENT 位、让换主后走"稳态档慢收敛" —— 实测**更差**。原因：
+  //     换主同时**改变了探针位置**（`ddgi_place_probe` 按新 cell 重算），而图集里还是旧位置的
+  //     值；**位置变了、值不变 ⇒ 误差被"慢"放大而不是被抹平**。方向必须是让值**快速**跟上新
+  //     位置（即论文说的 "speed transitions"），不是把过渡拉长。
+  // age ∈ [1, N] 全部 < DDGI_SKIP_AGE（最小 12）→ converged 恒 false → **保证每帧投线** ✓
+  // 注意：换主**不能清零图集**（那是黑斑的来源，见上一条注释）。
+  // enabled/active 乐观置真：不等 sort 重建，避免"有图集却被判不活跃"的当帧空档。
   if (!same_cell) {
-    ddgi_meta[slot] = 0u;
+    ddgi_meta[slot] = ddgi_meta_pack(1u + (slot % DDGI_BAKE_STAGGER), true, true);
     ddgi_cell_slot[slot] = slot;
   }
   let g = make_grid(0u);
@@ -2685,8 +2728,8 @@ fn ddgi_sample_lod(p: vec3<f32>, n: vec3<f32>, lod: u32, clamp_cells: bool, rela
         // 像素尤其：1~2 个探针就占满结果）→ 画面闪、亮区边界伸缩。
         // Domain/Probe 档看不出来：它们只看几何归属与闸门直方图，不看这个连续值。
         //
-        // "这个方向有没有被采样过"由**深度纹素**负责（未采样 → snap 清零 → 上面的
-        // `dtex.x <= 0` 已剔除；命中/未命中都会写深度），所以这里直接用采样值即可：
+        // "这个方向有没有被采样过"由**深度纹素**负责（从未采样 → 图集里还是启动清零后的 0 →
+        // 上面的 `dtex.x <= 0` 已剔除；命中/未命中都会写深度），所以这里直接用采样值即可：
         // 真的暗方向本来就该以 ~0 参与平均。
         let w = wtri * wn_w * wd;
         total = total + irr * w;
@@ -3030,7 +3073,6 @@ fn ddgi_collect(@builtin(global_invocation_id) gid: vec3<u32>) {
   let atlas_slot = ddgi_lod_slot_base(lod) + ((packed >> 8u) & 0xFFFFu);
   // 该探针的首条射线在全局射线空间里的编号 = 本 LOD 起始射线号 + 探针号×rpp
   let si = atomicLoad(&ddgi_indirect[DDGI_INDIR_RAYBASE_BASE + lod]) + probe_idx * rpp;
-  let snap = age <= 1u; // 刚唤醒 → 不做 hysteresis，直接写入
 
   if (texel < DDGI_IRR_TEXELS * DDGI_IRR_TEXELS) {
     // ---- irradiance：E = π · Σ(w·L) / Σw，w = max(0, dot(texel_dir, ray_dir)) ----
@@ -3065,13 +3107,6 @@ fn ddgi_collect(@builtin(global_invocation_id) gid: vec3<u32>) {
         i32(cc.x),
         vec4<f32>(mix(prev.xyz, irr_s, a), mix(prev.w, 1.0, a)),
       );
-    } else if (snap) {
-      // 新（重）烘的探针：本帧没有射线覆盖到的方向 → **显式清零**。
-      // 不清零的话这里留着的是「该槽位上一任世界 cell」的读数（槽位是世界锚定环面映射，
-      // 相机滚动时新进入窗口的格子会复用刚离开格子的槽位）→ 会被当成有效数据使用。
-      // 清零后采样侧的两条「无数据」判据（dtex<=0 / irr≈0）才能精确识别它。
-      let cc = ddgi_irr_coord(atlas_slot, tx, ty);
-      textureStore(ddgi_irr_out, vec2<i32>(vec2<u32>(cc.y, cc.z)), i32(cc.x), vec4<f32>(0.0));
     } else {
       // 本帧没有属于本纹素的射线 → 把上一帧读数**原样搬到本帧缓冲**。
       // 不搬的话 ping-pong 会让该纹素在 A/B 两个缓冲之间交替：采样每帧读到的是
@@ -3149,18 +3184,9 @@ fn ddgi_collect(@builtin(global_invocation_id) gid: vec3<u32>) {
         i32(cc.x),
         vec4<f32>(em, dep_std, 0.0, 0.0),
       );
-    } else if (snap) {
-      // 同 irradiance：新（重）烘探针未被覆盖的方向显式清零，避免残留上一任世界 cell 的深度
-      let cc = ddgi_depth_coord(atlas_slot, tx, ty);
-      textureStore(
-        ddgi_depth_out,
-        vec2<i32>(vec2<u32>(cc.y, cc.z)),
-        i32(cc.x),
-        vec4<f32>(0.0, 0.0, 0.0, 0.0),
-      );
     } else {
-      // 同 irradiance：本帧无样本时把上一帧读数搬到本帧缓冲，避免 ping-pong 逐帧振荡
-      // （详见 irradiance 分支同位置注释）。
+      // 同 irradiance：本帧无样本时把上一帧读数搬到本帧缓冲（含"滚动换主"——旧读数来自
+      // 紧邻的上一任世界 cell，是有效近似，不能清零；见 bake 的换主说明）。
       let cc = ddgi_depth_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
       textureStore(ddgi_depth_out, idx, i32(cc.x), textureLoad(ddgi_depth, idx, i32(cc.x), 0));
