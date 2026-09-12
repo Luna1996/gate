@@ -1,6 +1,7 @@
 {
   "version": "1.0",
   "goal": "DDGI 1:1 重做（R3-10 战役 v2）：按 Douglas 当前代码严格复刻 DDGI 管线，一次到位交付",
+  "statusNote": "【2026-09-12 核对，与代码库已严重脱节，需重新评估】(1) M1-3 / M2 标记 done，但其声明的产物（bake_cascade_grid / probe_position_sized / probe_leaf_sized / outside_lower_grid / cell_state_at / collect_radiance）在仓库中已无任何定义 —— git 历史显示由 750793b「清理废弃文档、资源与调试UI冗余代码」删除。(2) source 字段声明的规格文档 docs/ddgi-rework-spec.md 不存在。(3) 当前实际运行的 WGSL/编排实现（dda.wgsl 的 ddgi_bake0-3 / ddgi_sort / ddgi_cast / ddgi_collect / ddgi_sample + ddgi.rs 的 DdgiPlugin）**不是** M3 所要求的「CPU 参考逐字镜像」，而是在既有实现上的持续修正（射线绑定纹素、级联混合带、Chebyshev 软下限绝对化等，见提交 84a8933），因此 M3/M4 的 pending 状态是**准确**的。(4) M1-1 的基线文件 gpu_frame.log 已停止更新（写入代码在重构中消失），M5-3 的验收标准需改用 --features profile 的 pass 均值口径重新定义，2026-09-12 稳态基线见 SKILL.md。",
   "source": "docs/ddgi-rework-spec.md",
   "createdAt": "2026-09-06T21:30:00+08:00",
   "milestones": [
