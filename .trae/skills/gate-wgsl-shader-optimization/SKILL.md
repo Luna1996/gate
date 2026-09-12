@@ -42,6 +42,12 @@ cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许�
   i32 移位 RHS 报 "automatic conversions cannot convert vec3<i32> to u32"。
 - `countOneBits` 不要作用于 u64：拆 `countOneBits(u32(x)) + countOneBits(u32(x >> 32u))`。
 - **没有 `u32(bool)` 转换**：用 `select(0u, 1u, cond)`。
+- **`f16` 是 WGSL 保留字，不能当标识符**：naga 报 `name \`f16\` is a reserved keyword`。
+  同一类还有 `f64` / `i8` / `i16` / `i64` / `u8` / `u16` / `u64`（作**类型名**合法，作
+  变量名不合法）以及 `asm` / `do` / `enum` / `typedef` / `union` / `unless` / `using` / `with`。
+  **注意仓库里的 naga 版本可能暂时宽松**——`cargo test --test wgsl_compile` 会通过，但 IDE
+  的新版 naga 已经报错，升级后会变成运行期硬错误。见到就改名（2026-09-12 修了
+  `ddgi_place_probe` 的局部变量 `f16` → `found16`）。
 - i32↔u32 位环绕用 `bitcast<u32>` / `bitcast<i32>`（firstTrailingBit 公式需要）。
 - `firstTrailingBit` 返回 i32，0 → -1（全零），特判跨出 chunk。
 - `cargo build` **不会**发现 shader 错误：naga 在运行时编译，错误只在

@@ -1986,7 +1986,7 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec
   // 轮 1：最近的「全空 16³ 子块」
   var b16_d2 = 1e30;
   var b16_p = vec3<f32>(0.0);
-  var f16 = false;
+  var found16 = false;
   for (var k = 0; k < n16; k = k + 1) {
     for (var j = 0; j < n16; j = j + 1) {
       for (var i = 0; i < n16; i = i + 1) {
@@ -1997,12 +1997,12 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec
         if (ddgi_cell_state_sized(g, sub16, 16) == 0u && 8.0 >= 2.0) {
           let p = vec3<f32>(sub16) + vec3<f32>(8.0);
           let d2 = dot(p - center, p - center);
-          if (d2 < b16_d2) { b16_d2 = d2; b16_p = p; f16 = true; }
+          if (d2 < b16_d2) { b16_d2 = d2; b16_p = p; found16 = true; }
         }
       }
     }
   }
-  if (f16) { return vec4<f32>(b16_p, 1.0); }
+  if (found16) { return vec4<f32>(b16_p, 1.0); }
   // 轮 2：无空 16³ → 在混合 16³ 内找最近的「全空 4³」
   var b4_d2 = 1e30;
   var b4_p = vec3<f32>(0.0);
