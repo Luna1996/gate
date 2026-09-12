@@ -96,6 +96,13 @@ struct DdgiSoftSlider;
 #[derive(Component)]
 struct DdgiSoftValueLabel;
 
+/// 级联覆盖外的天光兜底强度滑杆（调到与覆盖内衔接为止，见 DdgiDebugSettings.far_ambient）
+#[derive(Component)]
+struct DdgiFarAmbSlider;
+
+#[derive(Component)]
+struct DdgiFarAmbValueLabel;
+
 /// 「Fly mode」开关标记（观察者写 [`crate::camera::CameraMode`]）
 #[derive(Component)]
 struct CameraModeToggle;
@@ -556,6 +563,50 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*vl).insert(DdgiSoftValueLabel);
                   });
+                // -- 覆盖外天光兜底强度（调到与覆盖内亮度衔接、消除级联边界割裂）--
+                cell
+                  .spawn((
+                    Name::new("ddgi-far-amb-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: "Far amb".into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      &ctx,
+                      row,
+                      SliderConfig {
+                        min: 0.0,
+                        max: 1.0,
+                        value: ddgi_dbg.far_ambient.clamp(0.0, 1.0),
+                        step: Some(0.05),
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(DdgiFarAmbSlider);
+                    let vl = label(
+                      &ctx,
+                      row,
+                      LabelConfig {
+                        text: format!("{:.2}", ddgi_dbg.far_ambient),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*vl).insert(DdgiFarAmbValueLabel);
+                  });
                 let t = toggle_switch(
                   &ctx,
                   cell,
@@ -1005,6 +1056,24 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         t.0 = format!("{:.2}", ev.value);
       }
       info!("DDGI cheb std k → {:.2}", ev.value);
+    },
+  );
+
+  // Far amb 滑杆 → 写 DdgiDebugSettings.far_ambient（级联覆盖外的天光兜底强度）。
+  // 覆盖内由 DDGI 提供环境光、覆盖外只有常量，调这个值让两者在盒边界处衔接。
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<(), With<DdgiFarAmbSlider>>,
+     mut q_label: Query<&mut Text, With<DdgiFarAmbValueLabel>>,
+     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
+      if q_slider.get(ev.entity).is_err() {
+        return;
+      }
+      dbg.far_ambient = ev.value.clamp(0.0, 1.0);
+      if let Ok(mut t) = q_label.single_mut() {
+        t.0 = format!("{:.2}", ev.value);
+      }
+      info!("DDGI far ambient → {:.2}", ev.value);
     },
   );
 

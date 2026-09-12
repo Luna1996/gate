@@ -49,19 +49,25 @@ pub const DDGI_RAY_BUDGET: u32 = 131072;
 pub const DDGI_LODS: u32 = 4;
 /// 最细 LOD 的 cell 边长（voxel）。
 pub const DDGI_BASE_CELL: i32 = 16;
-/// 4 级 LOD cell 边长（每级 ×2）。
+/// 4 级 LOD cell 边长（voxel）。**不再是等比数列** —— LOD3 特意放大以换取覆盖范围。
 ///
-/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [16,32,64,128]：
+/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。前三级 [16,32,64] 等比：
 /// 探针数 / 射线预算 / 显存全不变（dims 不变），只是把同样的探针铺在**更小的体积**上 ——
 /// 近场探针间距 64cm→32cm。这是"探针晶格"伪影（GI 场的空间变化比探针网格更细时，
 /// 三线性插值把每个探针自己的值暴露成 0.64m 周期的亮斑）最直接的降压手段。
-/// 代价：每级覆盖范围减半（见下），远景靠更粗级兜底。
-pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
-/// 各级 LOD 的 cell 维度（4 级相同）。每级 cell ×2 且维度不变 → 覆盖范围逐级 ×2，
-/// 形成严格嵌套的级联。水平 32 格、垂直 16 格（体素世界水平视野远大于垂直）。
-/// cell [16,32,64,128] 时各级覆盖范围 = dims×cell：
-/// 512×256×512 / 1024×512×1024 / 2048×1024×2048 / 4096×2048×4096 voxel
-/// = 10.2×5.1×10.2 / 20.5×10.2×20.5 / 41×20.5×41 / 82×41×82 m（半宽到 ±41m）。
+///
+/// 【LOD3 为什么是 256 而非 128】最粗级承担**覆盖兜底**：覆盖 = dims × cell，而窗口
+/// **跟随相机** → 相机拉远时场景滑出窗口 → 覆盖外只能吃常量兜底（fallback），表现成
+/// "有 GI / 无 GI"割裂。cell 128→256 使覆盖 82m → 164m，而**成本≈0**（dims 没动 →
+/// 槽位数 / 射线预算 / 图集 / collect 全不变），代价只是最粗级探针间距 2.56m → 5.12m。
+/// 注意：cell 不再等比后**不能从 cs 反推 lod**（`ddgi_place_probe` 现在显式接收 lod）。
+pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 256];
+/// 各级 LOD 的 cell 维度（4 级相同）。**dims 不变**，靠 cell 变大来扩大覆盖（前三级 ×2、
+/// LOD3 ×4，见上），形成严格嵌套的级联。水平 32 格、垂直 16 格（体素世界水平视野远大于垂直）。
+/// cell [16,32,64,256] 时各级覆盖范围 = dims×cell：
+/// 512×256×512 / 1024×512×1024 / 2048×1024×2048 / 8192×4096×8192 voxel
+/// = 10.2×5.1×10.2 / 20.5×10.2×20.5 / 41×20.5×41 / **164×82×164 m**（半宽到 ±82m）。
+/// 前三级严格嵌套；LOD3 因 cell 放大而跨得更大，嵌套关系仍成立（更大即包含）。
 /// 每级 16384 槽 → 共 65536 槽（= 占位纹理容量，全部槽位可采样）。
 pub const DDGI_LOD_DIMS: UVec3 = UVec3::new(32, 16, 32);
 // 槽位映射是**世界锚定**的：shader 里 `slot = slot_base + (世界 cell 号 mod dims)`（见
@@ -409,6 +415,13 @@ pub struct DdgiDebugSettings {
   /// 几何起伏」而非「同方向噪声」，墙角虚高 → 软漏光。现在射线已**绑定到深度纹素**（见
   /// dda.wgsl 的 cast「射线 ↔ 深度纹素绑定」），std 语义已正确。
   pub depth_soft_k: f32,
+  /// 级联覆盖**之外**的天光兜底强度，对应 WGSL `misc.w`（0..1，默认 0.25）。
+  ///
+  /// 覆盖内的环境光由 DDGI 算出，覆盖外只能靠常量兜底 —— 两者强度不匹配时，级联盒边界
+  /// 就是一条"亮 ↔ 暗"的硬边（相机拉远必然出现"有 GI / 无 GI 同屏"）。
+  /// **不能直接用 `DDGI_SKY_AMBIENT` 调大**：它还兼作覆盖内无数据时的兜底，调大会让室内
+  /// 凹角跟着变亮（漏光感）。所以覆盖外单独一个系数，运行时滑杆调到与覆盖内衔接为止。
+  pub far_ambient: f32,
 }
 
 impl Default for DdgiDebugSettings {
@@ -420,6 +433,7 @@ impl Default for DdgiDebugSettings {
       probe_viz_lod: 0.0,
       borrow_radius: 2.0,
       depth_soft_k: 1.0,
+      far_ambient: 0.25,
     }
   }
 }
@@ -917,6 +931,7 @@ fn extract_ddgi_settings(
     probe_viz_lod: d.probe_viz_lod,
     borrow_radius: d.borrow_radius,
     depth_soft_k: d.depth_soft_k,
+    far_ambient: d.far_ambient,
   });
   commands.insert_resource(dbg);
 }
@@ -1002,7 +1017,8 @@ fn prepare_ddgi(
     gpu.total_slots as f32,
     // z = Chebyshev std 信任系数（见 DdgiDebugSettings.depth_soft_k）
     dbg.depth_soft_k,
-    0.0,
+    // w = 级联覆盖外的天光兜底强度（见 DdgiDebugSettings.far_ambient）
+    dbg.far_ambient,
   );
   u.dirty_min = Vec4::new(
     dirty_min.x as f32,
