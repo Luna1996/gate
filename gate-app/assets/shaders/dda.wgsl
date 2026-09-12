@@ -1687,9 +1687,13 @@ const DDGI_REFRESH_PERIOD: vec4<u32> = vec4<u32>(64u, 96u, 128u, 160u);
 /// （64cm），所以 24 → 15.36m：这个半径外的探针一旦收敛（age ≥ SKIP_AGE）就只在
 /// REFRESH_PERIOD 的强制刷新帧投线，近场刷新频率完全不变。
 const DDGI_SKIP_DIST_CELLS: f32 = 24.0;
-/// 采样门限：刚被（重）烘的探针（age 0/1）图集还没写全，跳过它，让那条带短暂由粗一级
-/// LOD 顶替。只跳 1 帧即可 —— 第一次 collect（age 1）本来就用 `snap` 直接覆写所有被覆盖
-/// 的纹素，且未被覆盖的纹素会被显式清零（见 collect），所以 age 2 起读数就是干净的。
+/// 采样门限：槽位**换主**（相机滚过）或探针**新生**时 age 从 0 起步，图集还没写全 → 跳过它，
+/// 让那条带短暂由粗一级 LOD 顶替。只跳 1 帧即可 —— 第一次 collect（age 1）本来就用 `snap`
+/// 直接覆写所有被覆盖的纹素，且未被覆盖的纹素会被显式清零（见 collect），所以 age 2 起读数
+/// 就是干净的。
+/// **这条门限不针对"世界编辑"**：编辑同一 world cell 时 bake 不重置 age（见 ddgi_bake_one），
+/// 被波及的探针 age 仍然很大、不会被这里跳过 —— 否则那条带会突然退到粗级再切回来，正是编辑后
+/// 光影闪烁的一半来源。
 const DDGI_MIN_SAMPLE_AGE: u32 = 2u;
 /// collect 每探针的纹素线程数 = **从纹素数派生**（16 irr(4×4) + 64 depth(8×8) = 80）。
 ///
@@ -2225,13 +2229,25 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
     && all(cell_lo < ddgi_u.dirty_max.xyz);
   let wcell = cmin / cs;
   let prev = ddgi_cell_id[slot];
-  if (!dirty && prev.w != 0 && all(prev.xyz == wcell)) { return; }
+  // 「同一世界 cell」= 本槽位没有换主。这是区分「编辑重烘」与「滚动换主」的**唯一**判据：
+  // 槽位是世界锚定的环面映射（见 ddgi_slot_own 注释），相机没滚过本格时，编辑世界也**不会**
+  // 改变 wcell。所以 wcell 未变 ⇒ 本次重烘只可能是「世界编辑」，不是「槽位换主」。
+  let same_cell = prev.w != 0 && all(prev.xyz == wcell);
+  if (!dirty && same_cell) { return; }
   ddgi_cell_id[slot] = vec4<i32>(wcell, 1);
-  ddgi_meta[slot] = 0u; // 换 world cell / 落入脏区 → 重置 age/enabled/active（sort 当帧随后重建）
-  // 同时清掉"指向邻居"：本 slot 现在代表的世界 cell 变了，旧指向可能属于上一任 cell。
-  // 不清的话，世界改变后的头 1~2 帧采样可能短暂指向不相干的探针（MIN_SAMPLE_AGE 只盖住
-  // 大部分，不是全部）。指回自身 = 最保守的状态，随后本帧的放置结果会覆盖它。
-  ddgi_cell_slot[slot] = slot;
+  // 只有**换主**才重置 age/enabled/active 与"指向邻居"：换主意味着图集里这一格存的是上一个
+  // 世界 cell 的读数，必须丢弃（采样侧据此走 snap 重写；cell_slot 的旧指向也可能属于上一任）。
+  //
+  // 而「同一 cell 只因世界编辑被重烘」**保留** age / meta / cell_slot —— 探针的逻辑身份没变、
+  // 位置最多在 cell 内微调，图集历史仍然有效。保留它，时域平均就能把新光照**渐入**；反之若在
+  // 这里清零，sort 会走 snap 直写一帧高方差估计、采样侧又因 MIN_SAMPLE_AGE 短暂跳过本针退到
+  // 粗级 LOD —— 编辑后附近十几帧的光影闪烁正是这条链造成的。对齐 Douglas：编辑不重置累积量。
+  // （cell_slot 无需在这里维护：sort 每帧对 enabled/disabled 两条分支都会重写它，且它只被采样
+  //   侧的 ddgi_slot 读，烘焙的粗级继承不读 → 当帧 sort 之前没有任何读者。）
+  if (!same_cell) {
+    ddgi_meta[slot] = 0u;
+    ddgi_cell_slot[slot] = slot;
+  }
   let g = make_grid(0u);
   let st = ddgi_cell_state_sized(g, cmin, cs);
   // 物体（非主世界 volume）不在主世界 brick tree 里 → 单独判：cell 与任一物体相交就
