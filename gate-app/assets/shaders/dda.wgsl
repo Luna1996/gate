@@ -1460,8 +1460,8 @@ const DDGI_IRR_TEXELS: u32 = 4u;
 /// 深度图每探针 8×8（= 64 纹素）。
 ///
 /// 【为什么不用原版的 16×16】曾试过 16×16（每纹素 ~11°，现在 ~22°）：**实测漏光没有明显
-/// 改善** —— 说明当时的漏光主因**不在深度角分辨率**，而在别处（射线方向未绑定纹素 / 借针
-/// 跨墙 / 级联硬切，这三处都已单独修过）。而代价很实在：深度图集 64MB → 256MB、
+/// 改善** —— 说明当时的漏光主因**不在深度角分辨率**，而在别处（射线方向未绑定纹素 / 跨墙指向
+/// / 级联硬切；其中跨墙指向对应的旧"借针"机制现已删除）。而代价很实在：深度图集 64MB → 256MB、
 /// collect 线程 80 → 320、帧轮换周期 ×4。故回退到 8×8。
 const DDGI_DEPTH_TEXELS: u32 = 8u;
 // 图集布局：每层 `AXIS × AXIS` 个探针，共 `DDGI_ATLAS_LAYERS`(Rust 侧) 层。
@@ -1518,52 +1518,25 @@ const DDGI_DEPTH_SOFT_MIN: f32 = 0.5;
 /// 空间混合（探针间去噪）里"自身"的权重参照。邻居权重和按探针实际间距加权
 /// （见 `ddgi_probe_blend_irr`），典型约 3（6 邻居 × ~0.5）→ 2.0 表示自身约占 40%。
 const DDGI_BLEND_SELF: f32 = 2.0;
-/// 探针放置的最小净距（体素）：候选空叶的**半宽**必须 ≥ 此值才接受。
-/// Douglas #23："these heuristics ensure that the probes end up spaced as far apart as
-/// possible with some distance between themselves and the nearest surface"。探针贴在表面上时
-/// 半球被几何切掉一半 → 辐照度畸变、方差大，与相邻"自由"探针的差异被插值放大成探针晶格
-/// 亮斑，贴面漏带也随之而来。
-///
-/// **取值 2.0（= 恢复 Douglas 的"下钻到子叶"）**：`ddgi_place_probe` 三级候选的准入条件是
-/// 空叶半宽 8（16³ 子块）/ 2（4³ 子块）/ 0.5（1³ 体素）。曾经取 4.0 → 后两级（2 ≥ 4、0.5 ≥ 4
-/// 全假）被整段关掉，只剩"整个 32cm 立方全空"这一级。后果：**任何离几何 < 32cm 的 cell 都
-/// 没有探针**。而 LOD0 的 cell 本身就是 32cm —— 于是贴着墙的那一圈像素，壳内 8 个角永远
-/// 一个有效探针都没有，只能走 `ddgi_sample` 的"退到更粗 LOD"兜底；兜底返回的是**归一化**
-/// 平均（有一个探针入选就占满结果），粗级探针又可能落在墙外侧、看得见天空 → 封闭房间内壁
-/// 被整片点亮成跟粗级 cell 对齐的条纹（用权重门槛去堵它只会把那一圈变成黑块 —— 试过，
-/// 两个症状都更差）。
-/// 取 2.0 ⇒ 4³ 那级恢复：贴墙 cell 会在墙内侧一个**全空 8cm 立方**的中心拿到探针（离表面
-/// ≥4cm），壳内就有数据了，根本不需要粗级兜底；1³ 那级（0.5）仍关闭 —— 探针不会贴到面上。
-/// 【保持 2.0 —— 提到 4.0 需要先改放置策略，见下】
-///
-/// Douglas 的原则确实是"探针必须离最近表面有距离"（"don't want probes right up against
-/// walls… half of the probe's memory and half of the probe samples are being wasted"）。
-/// 但**这个原则不能单独搬过来**，两次实测都失败：
-///   ① 第一次（插值还按名义 cell 中心）：偏移变大 → 值被安放到错位置 → 连 LOD0 都出伪影；
-///   ② 第二次（插值已按探针实际位置）：近处**又**变坏 —— 说明根因不在插值，而在**放置**。
-///
-/// 根因：我们的放置是「**每个 cell 塞一个探针**，取离 cell 中心最近、且满足净距的全空叶」。
-/// 净距要求越严 → 能通过的 cell 越少 → **贴墙一圈的 cell 直接没有探针** → 那些像素可信的角
-/// 变少 → 归一化平均被少数探针支配 → 近处变糊/出块。
-/// 而 Douglas 的放置不是"逐 cell 填格"：他**选**一批彼此尽量远离、离表面有距离的位置，
-/// 再把细级数据 **down-sample** 出粗级（见 DDGI 那集）。位置与刚性格点解耦，所以他能用大净距。
-/// ⇒ 想恢复 4.0，必须先把放置改成"选择式 + 逐级 down-sample"（这是结构改动，不是常量）。
-///
-/// 1³ 那级（0.5）仍关闭 —— 探针不会贴到面上。
-/// 【现在是**真正可调**的净距（体素）】
-///
-/// 语义：候选探针位置到最近固体的距离（`ddgi_probe_clearance`，1 体素粒度）必须 ≥ 本值。
-/// 它只在第 2/3 档里**逐个候选点**过滤，**不再能一刀关掉整档** —— 密度由"第 1/2 档是否启用"
-/// 决定，而它们现在是固定的；放不出探针的 cell 由 Step 1 的 cell→path 指向邻近探针兜住。
-///
-/// 历史（为什么曾经必须是 2.0）：那时各档比的是"空叶半宽"（8.0/2.0/0.5）这个代理，净距一调大
-/// 就等于整档禁用 → 只有 100% 空气的 cell 有探针 → 密度崩塌 → 三角锯齿 + 黑斑。
-/// 换成体素距离判据后，这个耦合被拆掉了，所以现在取 Douglas 的 4 体素（8cm）。
-const DDGI_PROBE_MIN_CLEARANCE: f32 = 4.0;
-// （原 DDGI_SHARE_K 已删）它把插值基的支撑半径放大到 K 个 cell，用来让 Step 1 共享过来
-// 的探针拿到非零权重。代价是越过 cell 边界时"离开 stencil 的角"权重不归零却被丢弃 →
-// 权重场在每个 cell 边界跳变（放射状三角锯齿）。现在插值基改用晶格名义三线性基，
-// 共享探针天然拿到它所属角的权重，不需要放大支撑。
+// （原 DDGI_PROBE_MIN_CLEARANCE 已删）探针放置现在**只有 Douglas #23 的字幕规则**，没有独立的
+// "净距门槛"。
+//
+// 【为什么移除净距硬门槛】我们曾要求"候选空叶半宽 / 探针到最近固体的距离 ≥ 4 体素"。它偏离了
+// Douglas 的规则，也正是**墙体接缝漏光**的直接来源：一个 cell 里同时存在大片空腔与贴几何的小
+// 空位时，硬门槛会把探针挤到贴墙的小空位（或干脆不放探针）→ 探针贴着墙面 → 深度图朝外方向记
+// 的是墙 → 可见性判定失真 → 漏光。
+//
+// Douglas 的原话（#23 字幕）："it traverses downward until it finds a totally empty leaf in the
+// [oc]tree and it does this in a breadth first manner so that one of the **largest** subnodes is
+// selected and then it just places the probe at the center of that subnode… for a cell that was
+// totally full of voxels, no probe would be generated." —— **只按"最大的全空子块"选点**，同级
+// 并列时才靠 cell 中心，并没有"净距"这条额外门槛。现按此还原，见 `ddgi_place_probe`。
+//
+// 【为什么不会出现空洞】层级一直下探到 1³ 体素，所以**格内只要还有空体素，就一定放得出探针**
+// （1³ 是保底档，不再有任何门槛把它挡掉）。既然格内必有探针，就不再需要把无针 cell 指向邻居。
+// （原 DDGI_SHARE_K 已删）它把插值基的支撑半径放大到 K 个 cell。代价是越过 cell 边界时
+// "离开 stencil 的角"权重不归零却被丢弃 → 权重场在每个 cell 边界跳变（放射状三角锯齿）。
+// 现在插值基改用晶格名义三线性基，每个探针天然拿到它所属角的权重，不需要放大支撑。
 /// 邻居纹素的**覆盖度**下限（irr 图集第 4 通道 = 该纹素被写过多少次的时间累积，见 collect）。
 /// 为什么需要它：空间混合（`ddgi_probe_blend_irr`）必须能拿**暗邻居**去稀释亮邻居，
 /// 否则一颗跨墙拿到天光的探针没人稀释，就会在自己的投影处形成一个亮斑（室内墙角漏光）。
@@ -1660,7 +1633,7 @@ struct DdgiChunk {
 };
 struct DdgiUniform {
   lods: array<DdgiLod, 4>,
-  // x=帧计数, y=调试模式(0..4), z=GI 增益, w=借针半径（0=关，见 ddgi_find_neighbor_probe）
+  // x=帧计数, y=调试模式(0..4), z=GI 增益, w=保留通道（旧借针半径，机制已删除），恒 0
   params: vec4<f32>,
   // x=GI 开关, y=总槽位数, z=Chebyshev std 信任系数（0..1，见采样侧 soft 计算）,
   // w=级联覆盖**之外**的天光兜底强度（见着色侧 amb_far / DdgiDebugSettings.far_ambient）
@@ -1694,13 +1667,14 @@ struct DdgiUniform {
 @group(4) @binding(8) var<storage, read_write> ddgi_cell_id: array<vec4<i32>>;
 // 9：阶段二 cast 输出的射线样本：每样本 2 个 vec4 = (方向.xyz, 命中距离) / (辐亮度.xyz, 1)
 @group(4) @binding(9) var<storage, read_write> ddgi_samples: array<vec4<f32>>;
-/// cell → slot 间接表（Step 1）：表长 = Σ 各级槽数，索引 = **绝对 slot 下标**（即
-/// `ddgi_slot` 在 identity 下的返回值）。identity 状态与"没有这张表"逐位等价。
-/// 用途：允许"本格放不出满足净距的探针"的 cell 指向**邻近 cell 的探针** —— 这样 Douglas 的
-/// "探针必须离表面有距离"（否则半张深度/辐照度图都浪费在贴着的那一小片表面上）与"每个采样点
-/// 都有 8 个可用角"就不再互斥（我们两次单独调净距都失败的根因就在这里）。
+/// LOD0 的两张 chunk 段表 + 一段**无读者**的保留前缀。
 ///
-/// 【尾部还打包了 LOD0 的两张 chunk 表】BG4 的 storage binding 已用满 8 个（WGSL 下限），
+/// 【旧「cell → slot 借针间接表」已删】它曾允许"本格放不出探针"的 cell 指向邻近 cell 的探针。
+/// 放置规则改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，这个需求消失，
+/// 因此 `ddgi_slot` 直接返回 `ddgi_slot_own`，前段 `[0, total_slots)` 不再被任何代码读取
+/// （Rust 侧仍按 identity 铺一遍以保持下面的偏移不变，见 `DdgiGpu::cell_slot`）。
+///
+/// 【为什么复用这张 buffer 放 chunk 表】BG4 的 storage binding 已用满 8 个（WGSL 下限），
 /// 不再新增 binding：`[total_slots, +num_chunks)` = chunk_base，之后到 `+lod0_slots`
 /// = slot_chunk。偏移由 `misc.y` 与 chunk 维度算出，见 `ddgi_chunk_base_off`/`ddgi_slot_chunk_off`。
 @group(4) @binding(10) var<storage, read_write> ddgi_cell_slot: array<u32>;
@@ -1878,9 +1852,8 @@ fn ddgi_lod0_local_linear(wc: vec3<i32>) -> u32 {
 // 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份 → 图集不再因为相机
 // 移动而整体失效。LOD0 的 chunk 锚定同理：段基址与相机无关，探针世界位置 = chunk 原点 +
 // 局部 cell 中心 —— 也是世界固定。
-/// **纯算术**槽位（不经 cell→slot 间接表）。凡是要读「某个世界 cell **自己** 的烘焙记录」
-/// 的地方（判定邻接占用、粗级继承细级探针位置）都必须用它 —— 间接表表达的是
-/// "采样这个 cell 时该去哪读探针"，不是"这个 cell 的记录在哪"；走间接表会读到邻居的记录。
+/// 世界 cell → 槽位的**纯算术**映射（`ddgi_slot` 现在直接返回它）。凡是要读「某个世界 cell
+/// **自己** 的烘焙记录/探针位置」的地方（判定邻接占用、粗级继承细级探针位置）都必须用它。
 ///
 /// ⚠️ lod==0 且该 chunk 没领段 / 越界时返回 0（不是一个有意义的槽位）：调用方**必须**
 /// 先用 `ddgi_cell_in_window` 过滤。返回 0 只保证不越界读。
@@ -1898,9 +1871,9 @@ fn ddgi_slot_own(lod: u32, wc: vec3<i32>) -> u32 {
   return ddgi_lod_slot_base(lod) + u32(r.x) + u32(r.y) * d.x + u32(r.z) * d.x * d.y;
 }
 fn ddgi_slot(lod: u32, wc: vec3<i32>) -> u32 {
-  // 经 cell→slot 间接表（见 binding(10) 注释）。identity 时 `ddgi_cell_slot[own] == own`，
-  // 与"直接返回 own"逐位等价 —— 所以建立这条通路本身不改画面，是 Step 1 的第 1 小步。
-  return ddgi_cell_slot[ddgi_slot_own(lod, wc)];
+  // 直接返回本格自己的槽位。（旧的 cell → slot 借针间接表已删，见 binding(10) 注释：放置规则
+  // 改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，无需再重定向。）
+  return ddgi_slot_own(lod, wc);
 }
 /// 窗口原点（cell 单位）。origin.xyz 已按 cs 对齐，故整除精确。（LOD0 的编址原点在
 /// `ddgi_u.chunk`，不在这里；本函数只服务 lod>=1 与 LOD0 的**空间盒**包含判定。）
@@ -2111,13 +2084,33 @@ fn ddgi_seal(@builtin(local_invocation_id) lid: vec3<u32>) {
 // 相机滚动只影响发生滚动的那一级 LOD，其余级不动。
 // ============================================================================
 
-// 在 [cmin, cmin+cs) 内按 16³ → 4³ → 1³ 逐级找靠中心的空叶；返回 (p, found)。
-// 三轮扫描惰性求值：先只找最近的空 16³，命中即返回；仅当整个 cell 都没有空 16³ 时才展开
-// 4³、再兜底 1³。优先级与原实现一致（16³ 优于 4³），但避免了「每个混合 16³ 子块都展开 64
-// 次 4³ 查询」——粗 LOD（cs=128 → n16=8）最坏是 512×64 次查询/cell，相机滚动触发 bake 时
-// 这是主要开销。
-// 最小净距：每轮的候选还要过 DDGI_PROBE_MIN_CLEARANCE（空叶半宽 ≥ 该值）。默认 4 →
-// 只有 16³ 那轮有效，4³/1³ 兜底被关掉（拿不到合格空叶的 cell 就不放探针，交给邻居覆盖）。
+/// 对齐的 8³ 子块是否**完全空**（= 它的 8 个 4³ 子节点全空）。
+///
+/// brickmap 的分裂因子是 4（256³→64³→16³→4³→1³），没有原生 8³ 节点，所以这里聚合 2³ 个 4³
+/// 节点。8³ 正是 Douglas 八叉树里 16³ 的下一层（字幕："traverses downward until it finds a
+/// totally empty leaf"）；加上它才能让"优先选**最大的**空子区域"在 16³ 与 4³ 之间不漏档。
+fn ddgi_block8_empty(g: Grid, o: vec3<i32>) -> bool {
+  for (var k = 0; k < 2; k = k + 1) {
+    for (var j = 0; j < 2; j = j + 1) {
+      for (var i = 0; i < 2; i = i + 1) {
+        if (ddgi_brick_state(g, o + vec3<i32>(i, j, k) * 4, 3u) != 0u) { return false; }
+      }
+    }
+  }
+  return true;
+}
+
+// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ → 1³ 逐级找靠中心的空叶；返回 (p, found)。
+/// 规则**严格对齐 Douglas #23 字幕**：
+///   · "one of the **largest** subnodes is selected" —— 从粗到细，**第一个**含"完全空子块"的
+///     层级胜出；
+///   · "places the probe at the center of that subnode" —— 探针放在该子块中心；
+///   · 同级并列时取**离 cell 中心最近**的（Douglas："a certain order that prioritizes subnodes
+///     near the center of the cell"）；
+///   · "for a cell that was totally full of voxels, no probe would be generated"（调用方已挡）。
+/// 惰性求值：只有上一级完全找不到空块时才展开下一级；16³/8³/4³ 都只在**混合 16³** 子块内展开
+/// （全空 16³ 已在上一级命中、全满 16³ 必然没有空子块），避免整格扫描的指数开销。
+/// **没有净距门槛**（曾加过 4 体素硬门槛，见上方注释）；层级下探到 1³ ⇒ 格内有空体素必有探针。
 fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u32) -> vec4<f32> {
   let n16 = max(cs / 16, 1);
   // ---- Step 2：粗级 LOD **优先继承细级探针的位置** ----
@@ -2170,15 +2163,16 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
       return vec4<f32>(best_p, 1.0);
     }
   }
-  // 轮 1：从大到小找**最大的全空子块**（对齐 Douglas #23："in a breadth first manner so
-  // that one of the **largest** subnodes is selected"），同级内取离 cell 中心最近的。
+  // 轮 1（16³ 及以上）：从大到小找**最大的全空子块**（对齐 Douglas #23："in a breadth first
+  // manner so that one of the **largest** subnodes is selected"），同级内取离 cell 中心最近的。
   //
   // 【为什么不能固定 16³ 粒度】旧实现只试 16³，且取「离 center 最近」——对「薄板地面 +
   // 下方也是空气」的 cell，center 附近若落在地表**下方**，被选中的空块也在下方 → 探针落到
   // 地下 → 对朝上的地面，8 个角的 wn = dot(n, 指向探针) 全 ≤ 0 → 被硬剔（Probe 档品红）
   // → 该片 GI 纯黑、与周边形成硬边（"有 GI / 无 GI"割裂）。优先取**更大的**空块能让探针
   // 落在"更开阔、离薄板更远"的一侧，因为同级内更大的空块其中心离表面更远。
-  // 注意尺寸从大到小**逐个试到底**：16³ 那一轮仍在，所以探针密度不降（旧行为的兜底不变）。
+  // cs 本身也在列表里 ⇒ 全空 cell 的"最大空叶"就是整格 → 探针落在正中（Douglas："for a
+  // totally empty cell the probe would end up right in the center"）。
   let sizes = array<i32, 3>(64, 32, 16);
   for (var si = 0; si < 3; si = si + 1) {
     let sz = sizes[si];
@@ -2191,8 +2185,6 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
       for (var j = 0; j < n; j = j + 1) {
         for (var i = 0; i < n; i = i + 1) {
           let sub = cmin + vec3<i32>(i, j, k) * sz;
-          // 整块全空即可用；空块半宽 = sz/2 ≥ 8 体素，天然满足净距要求，
-          // 所以这一档与 `DDGI_PROBE_MIN_CLEARANCE` 解耦（不再能一刀把整档关掉）。
           if (ddgi_cell_state_sized(g, sub, sz) == 0u) {
             let p = vec3<f32>(sub) + vec3<f32>(f32(sz) * 0.5);
             let d2 = dot(p - center, p - center);
@@ -2203,7 +2195,34 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     }
     if (found) { return vec4<f32>(b_p, 1.0); }
   }
-  // 轮 2：无空 16³ → 在混合 16³ 内找最近的「全空 4³」
+  // 轮 2（8³）：无空 16³ → 在**混合 16³** 内找最近的「全空 8³」（8³ 是 16³ 的下一层）。
+  var b8_d2 = 1e30;
+  var b8_p = vec3<f32>(0.0);
+  var f8 = false;
+  for (var k = 0; k < n16; k = k + 1) {
+    for (var j = 0; j < n16; j = j + 1) {
+      for (var i = 0; i < n16; i = i + 1) {
+        let sub16 = cmin + vec3<i32>(i, j, k) * 16;
+        if (ddgi_cell_state_sized(g, sub16, 16) == 2u) {
+          for (var kk = 0; kk < 2; kk = kk + 1) {
+            for (var jj = 0; jj < 2; jj = jj + 1) {
+              for (var ii = 0; ii < 2; ii = ii + 1) {
+                let sub8 = sub16 + vec3<i32>(ii, jj, kk) * 8;
+                if (ddgi_block8_empty(g, sub8)) {
+                  let p = vec3<f32>(sub8) + vec3<f32>(4.0);
+                  let d2 = dot(p - center, p - center);
+                  if (d2 < b8_d2) { b8_d2 = d2; b8_p = p; f8 = true; }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (f8) { return vec4<f32>(b8_p, 1.0); }
+  // 轮 3（4³）：无空 8³ → 在混合 16³ 内找最近的「全空 4³」。**无净距门槛**——全空 4³ 的中心
+  // 离最近表面 ≥2 体素，直接采用。
   var b4_d2 = 1e30;
   var b4_p = vec3<f32>(0.0);
   var f4 = false;
@@ -2211,19 +2230,13 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     for (var j = 0; j < n16; j = j + 1) {
       for (var i = 0; i < n16; i = i + 1) {
         let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        // 第 2 档：全空 4³ 叶（半宽 2）—— 贴墙 cell 靠这一档拿到探针，**必须始终可用**
-        // （它的存在与否直接决定近场探针密度；用固定阈值 2.0 准入，与净距常量解耦）。
-        if (ddgi_cell_state_sized(g, sub16, 16) == 2u && 2.0 >= 2.0) {
+        if (ddgi_cell_state_sized(g, sub16, 16) == 2u) {
           for (var kk = 0; kk < 4; kk = kk + 1) {
             for (var jj = 0; jj < 4; jj = jj + 1) {
               for (var ii = 0; ii < 4; ii = ii + 1) {
                 let sub4 = sub16 + vec3<i32>(ii, jj, kk) * 4;
                 if (ddgi_brick_state(g, sub4, 3u) == 0u) {
                   let p = vec3<f32>(sub4) + vec3<f32>(2.0);
-                  // 真实距离判据（**体素粒度**，见 ddgi_probe_clearance）：取代"空叶半宽"代理。
-                  // 低于净距的候选点直接不采用 —— 这个 cell 仍可由 Step 1 的 cell→slot 指向
-                  // 邻近探针，所以不会留下空洞（这正是"净距"第一次成为可调量、而不是整档开关）。
-                  if (ddgi_probe_clearance(g, p) < DDGI_PROBE_MIN_CLEARANCE) { continue; }
                   let d2 = dot(p - center, p - center);
                   if (d2 < b4_d2) { b4_d2 = d2; b4_p = p; f4 = true; }
                 }
@@ -2235,7 +2248,8 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     }
   }
   if (f4) { return vec4<f32>(b4_p, 1.0); }
-  // 兜底：mixed 16³ 内逐 1³ 找最近空体素（ddgi_leaf16）
+  // 轮 4（1³）：兜底档，mixed 16³ 内逐 1³ 找最近空体素（ddgi_leaf16）。这是"格内只要还有空
+  // 体素就一定放得出探针"这条不变式的**保底**。
   var b1_d2 = 1e30;
   var b1_p = vec3<f32>(0.0);
   var f1 = false;
@@ -2243,13 +2257,9 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     for (var j = 0; j < n16; j = j + 1) {
       for (var i = 0; i < n16; i = i + 1) {
         let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        // 第 3 档（全空 1³，半宽 0.5）：**第一次用真实距离判据**。紧贴表面的候选点会因
-        // "对齐 16³ box 非全空"而返回 0 → 被净距挡住（这一档实际上仍几乎不触发）；
-        // 只有当候选点周围真有 ≥ half 的空 box 时才会启用 —— 那正是"离表面有距离"的定义，
-        // 而不是再靠调常量。第 1/2 档保持不变（它们决定近场密度，不能拿代理去卡）。
         if (ddgi_cell_state_sized(g, sub16, 16) == 2u) {
           let r = ddgi_leaf16(g, sub16, center);
-          if (r.w > 0.5 && ddgi_probe_clearance(g, r.xyz) >= DDGI_PROBE_MIN_CLEARANCE) {
+          if (r.w > 0.5) {
             let d2 = dot(r.xyz - center, r.xyz - center);
             if (d2 < b1_d2) { b1_d2 = d2; b1_p = r.xyz; f1 = true; }
           }
@@ -2258,148 +2268,6 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     }
   }
   return vec4<f32>(b1_p, select(0.0, 1.0, f1));
-}
-
-/// Step 1：本 cell 放不出满足净距的探针时，在**同一 LOD** 的 ±r 环面邻域里找最近的
-/// **已放置探针**，返回它的 slot；找不到就返回自身（那时该 cell 仍无数据，采样照旧走兜底）。
-///
-/// 为什么需要：放置规则要求"探针离表面有距离"（Douglas），但我们的槽位原本与 cell 一一对应
-/// ⇒ 净距一严，贴墙一圈的 cell 直接没有探针 ⇒ 那些像素可信的角变少 ⇒ 近处变糊/出块
-/// （两次单独调净距失败的根因）。有了指向，位置与刚性格点解耦，两个目标才能同时成立。
-///
-/// 只在**自身放出了探针**（bake 记录 ENABLED）的邻域里选 —— 指向过的 cell 在 bake 里
-/// ENABLED=0，所以天然不会形成"指向的指向"链。邻域用槽位线性下标算：x ±1、y ±dim.x、z ±dim.x·dim.y。
-///
-/// 半径 r 由 `params.w`（Debug 面板 Borrow 滑杆）运行时给定：**r=0 直接返回自身 = 关闭借针**，
-/// 即 Douglas 原架构（无针 cell 的插值角直接缺席，由深度/法线闸门之外的归一化消化）。
-/// 诊断用途：验证 ±2 借针不检查中间实体 → 粗级跨墙指向是不是室内墙角漏光的主因。
-fn ddgi_find_neighbor_probe(slot: u32) -> u32 {
-  let r = i32(ddgi_u.params.w + 0.5);
-  if (r <= 0) { return slot; }
-  // ⚠️ 各级 dims/slot_base **不再相同**（dims 按世界 AABB 算：LOD0 122×39×72 … LOD3 16×5×10），
-  // 所以必须先反查 slot 属于哪一级，再用那一级的 dims/base 解局部坐标。
-  // 历史 bug：这里曾用 `lods[0].dims` 统一反解（当时各级 dims 恒等 32×16×32），改成按世界算之后
-  // LOD1/2/3 的局部坐标与 base 全算错 → 借针表指向错误槽位 → **采样读到空探针 → 成片黑块**。
-  let my_lod = ddgi_slot_lod_of(slot);
-  if (my_lod == 0u) {
-    // LOD0 是 chunk 段编址：**槽位线性邻域不再是空间邻域**（跨 chunk 会跳到别的段）→
-    // 改在**世界 cell** 空间里搜：候选 cell 必须落在「已领段」的 chunk 内（`ddgi_cell_in_window`
-    // 已含此判定），再取它自己的槽位。不跨 chunk 环绕 —— 环绕在 chunk 编址下没有意义，
-    // 而且旧环绕只在网格边界才生效，±2 邻域内两者结果一致。
-    let wc = ddgi_slot_world_cell(0u, slot);
-    var best0 = slot;
-    var best0_d2 = 1e30;
-    for (var k: i32 = -r; k <= r; k = k + 1) {
-      for (var j: i32 = -r; j <= r; j = j + 1) {
-        for (var i: i32 = -r; i <= r; i = i + 1) {
-          if (i == 0 && j == 0 && k == 0) { continue; }
-          let nwc = wc + vec3<i32>(i, j, k);
-          if (!ddgi_cell_in_window(0u, nwc)) { continue; }
-          let nb = ddgi_slot_own(0u, nwc);
-          if (nb == slot) { continue; }
-          // 同 LOD1~3：判"邻域有没有探针"读 bake 的输出（ddgi_cell 的 ENABLED 位），不读 meta。
-          if ((ddgi_cell[nb] & DDGI_REC_ENABLED) == 0u) { continue; }
-          let d2 = f32(i * i + j * j + k * k);
-          if (d2 < best0_d2) {
-            best0_d2 = d2;
-            best0 = nb;
-          }
-        }
-      }
-    }
-    return best0;
-  }
-  let d = ddgi_u.lods[my_lod].dims.xyz;
-  let base = ddgi_u.lods[my_lod].dims.w;
-  let dim_xy = d.x * d.y;
-  let local = slot - base;
-  let lx0 = i32(local % d.x);
-  let ly0 = i32((local / d.x) % d.y);
-  let lz0 = i32(local / dim_xy);
-  var best = slot;
-  var best_d2 = 1e30;
-  for (var k: i32 = -r; k <= r; k = k + 1) {
-    for (var j: i32 = -r; j <= r; j = j + 1) {
-      for (var i: i32 = -r; i <= r; i = i + 1) {
-        if (i == 0 && j == 0 && k == 0) { continue; }
-        let lx = (lx0 + i + i32(d.x) * 8) % i32(d.x);
-        let ly = (ly0 + j + i32(d.y) * 8) % i32(d.y);
-        let lz = (lz0 + k + i32(d.z) * 8) % i32(d.z);
-        let nb = base + u32(lx) + u32(ly) * d.x + u32(lz) * dim_xy;
-        // 判"邻域有没有探针"必须读 **bake 的输出**（ddgi_cell 的 ENABLED 位），不能读
-        // ddgi_meta：meta 正是本 pass（sort）此刻在写的数组，同 pass 内读别人的 meta 无顺序
-        // 保证（读到上一帧的值 → 指向会逐帧抖）。ddgi_cell 由 bake 写、sort 只读，稳定。
-        // 顺带：被"指向"过的 cell 在 bake 里 ENABLED=0，所以天然不会形成"指向的指向"链。
-        if ((ddgi_cell[nb] & DDGI_REC_ENABLED) == 0u) { continue; }
-        let d2 = f32(i * i + j * j + k * k);
-        if (d2 < best_d2) {
-          best_d2 = d2;
-          best = nb;
-        }
-      }
-    }
-  }
-  return best;
-}
-
-/// 小尺度净空（体素）：沿 6 个轴向逐格外查，遇到固体即停 → 取六向**最小步数**（保守下界）。
-/// 为什么要它：`ddgi_cell_state_sized` 最小只支持 16 体素（half 8），而第 1/2 档要区分的
-/// 恰恰是 Douglas 那种量级（净距 2/4 体素 = 4/8cm）。只靠层级 box 会让"准入"退化成
-/// "要求 ≥8 体素净空" ⇒ 探针密度崩塌（三角锯齿 + 黑斑的成因）。代价 6×max_steps 次点查询。
-fn ddgi_axis_clearance(g: Grid, p: vec3<i32>, max_steps: i32) -> f32 {
-  let dirs = array<vec3<i32>, 6>(
-    vec3<i32>(1, 0, 0),
-    vec3<i32>(-1, 0, 0),
-    vec3<i32>(0, 1, 0),
-    vec3<i32>(0, -1, 0),
-    vec3<i32>(0, 0, 1),
-    vec3<i32>(0, 0, -1),
-  );
-  var best = f32(max_steps);
-  for (var d = 0; d < 6; d = d + 1) {
-    var steps = max_steps;
-    for (var i = 1; i <= max_steps; i = i + 1) {
-      if (sample_brickmap(g, p + dirs[d] * i) != 0u) {
-        steps = i - 1;
-        break;
-      }
-    }
-    best = min(best, f32(steps));
-  }
-  return best;
-}
-
-/// 探针到最近固体的**距离下界估计**（体素）：以 pos 为中心、边长 size 的**对齐 box** 全空 ⇒
-/// 该 box 内无固体。从大往小试 size ∈ {256,128,64,32,16}，命中即返回 half = size/2。
-///
-/// 为什么需要：原来各档比的是"空叶半宽"（8.0 / 2.0 / 0.5），那是个**粗糙代理** ——
-/// 净距一调大就等于把整档关掉（第 2 档 `2.0 >= 4.0` 恒假）⇒ 只有 100% 空气的 cell 有探针
-/// ⇒ 密度崩塌 ⇒ 三角锯齿 + 黑斑。要真正落实 Douglas 的"探针离表面有距离"，判据必须是距离。
-///
-/// 代价：复用现成的层级查询 `ddgi_cell_state_sized`（子查询数 = (size/64)³ 量级，
-/// 256→64 次、128→8、64→1）⇒ 通常 1~8 次查询，**不是** 9³ 邻域扫描那种 729 次。
-/// 注意：box 必须对齐到 size（用位掩码，负数也正确），且 pos 要落在**半宽之内**才算数
-/// （贴着 box 边的话"下界"就退化成 0，不能当距离用）。
-fn ddgi_probe_clearance(g: Grid, pos: vec3<f32>) -> f32 {
-  let pi = vec3<i32>(floor(pos));
-  // ① 小尺度（1~8 体素）：轴向扫描，粒度 1 体素 —— 第 1/2 档要区分的正是这一档精度
-  let small = ddgi_axis_clearance(g, pi, 8);
-  if (small < 8.0) { return small; }
-  // ② 大尺度（≥16 体素）：层级对齐 box，命中即返回 half（粗粒度下界）
-  let sizes = array<i32, 5>(256, 128, 64, 32, 16);
-  for (var s = 0; s < 5; s = s + 1) {
-    let size = sizes[s];
-    let half = size / 2;
-    let lo = pi & vec3<i32>(~(size - 1)); // 对齐到下界（位掩码，负数同样正确）
-    // pos 必须在 box 的**半宽以内**，否则"box 全空"给不出 half 这么强的下界
-    let d = abs(pi - (lo + vec3<i32>(half)));
-    if (any(d > vec3<i32>(half / 2))) { continue; }
-    if (ddgi_cell_state_sized(g, lo, size) == 0u) {
-      return f32(half);
-    }
-  }
-  // 两个尺度都没给出更强结论 → 就用轴向扫描的结论（≥8 体素范围内 6 向无固体）
-  return small;
 }
 
 /// 单级烘焙：lod 由**派发该 pass 时确定**（见下面 4 个入口）。idx = 该级内的槽位下标。
@@ -2432,14 +2300,11 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
   let same_cell = prev.w != 0 && all(prev.xyz == wcell);
   if (!dirty && same_cell) { return; }
   ddgi_cell_id[slot] = vec4<i32>(wcell, 1);
-  // 【保留】换主与编辑**都**保留图集历史，这里只维护 cell_slot 的指向（旧指向可能属于上一任）。
-  //
-  // 「同一 cell 只因世界编辑被重烘」**保留** age / meta / cell_slot —— 探针的逻辑身份没变、
-  // 位置最多在 cell 内微调，图集历史仍然有效。保留它，时域平均就能把新光照**渐入**；反之若在
-  // 这里清零，sort 会走直写一帧高方差估计、采样侧又因 MIN_SAMPLE_AGE 短暂跳过本针退到
-  // 粗级 LOD —— 编辑后附近十几帧的光影闪烁正是这条链造成的。对齐 Douglas：编辑不重置累积量。
-  // （cell_slot 无需在这里维护：sort 每帧对 enabled/disabled 两条分支都会重写它，且它只被采样
-  //   侧的 ddgi_slot 读，烘焙的粗级继承不读 → 当帧 sort 之前没有任何读者。）
+  // 【保留】换主与编辑**都**保留图集历史（age / meta）。「同一 cell 只因世界编辑被重烘」**保留**
+  // 探针的逻辑身份、位置最多在 cell 内微调，图集历史仍然有效。保留它，时域平均就能把新光照
+  // **渐入**；反之若在这里清零，sort 会走直写一帧高方差估计、采样侧又因 MIN_SAMPLE_AGE 短暂跳过
+  // 本针退到粗级 LOD —— 编辑后附近十几帧的光影闪烁正是这条链造成的。对齐 Douglas：编辑不重置
+  // 累积量。
   // 【换主同样不丢弃图集历史】旧版在这里 `= 0u`（age 归零）→ 采样侧跳过 + collect 清零 →
   // 滚动时那一圈 cell 整片无数据 → 相机一移动就冒黑斑。但**滚动换主 = 平移一格**，新 cell
   // 与旧 cell 是紧邻邻居，旧读数是**极好的近似** —— 这与上面「编辑保留历史、靠 EMA 渐入」
@@ -2461,7 +2326,6 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
   // enabled/active 乐观置真：不等 sort 重建，避免"有图集却被判不活跃"的当帧空档。
   if (!same_cell) {
     ddgi_meta[slot] = ddgi_meta_pack(1u + (slot % DDGI_BAKE_STAGGER), true, true);
-    ddgi_cell_slot[slot] = slot;
   }
   let g = make_grid(0u);
   let st = ddgi_cell_state_sized(g, cmin, cs);
@@ -2483,7 +2347,7 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
   // "生成了 ⇒ 必定判活"，不再有"有探针却永远不投线"的槽位。
   // 【覆盖性】像素的 8 个角格都落在「其所属 cell 的 ±1 邻域」内：角格要么自己就是含表面的
   // 格，要么与含表面的格 6 邻接（斜向角格也至少有一个 6 邻接面格）→ 一定满足本条 →
-  // 不会出现"该有针的地方没针"。（偏出去的角格由 cell_slot 借针表兜底。）
+  // 不会出现"该有针的地方没针"。
   let one = vec3<f32>(f32(cs));
   let obj_near = obj_hit || ddgi_box_hits_object(cell_lo - one, cell_hi + one);
   var near_surface = st != 0u || obj_near;
@@ -2502,29 +2366,20 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
   }
   let occupied = select(0u, 1u, st != 0u || obj_hit);
   let center = vec3<f32>(cmin) + f32(cs) * 0.5;
-  // 放置启发式（对齐 Douglas #23）：「取最大空子块的中心」——这保证探针与最近表面之间
-  // **留出距离**（他说这正是深度/光照数据分辨率被充分利用的前提）。
-  // 旧版加了一条捷径：只要 cell 中心不是实心就直接用中心 → 中心恰好落在薄壁旁的空侧时，
-  // 探针就贴在表面上，前后判定落在临界值附近抖动，整面被判「探针在背面」而全剔掉。
-  // 现在改为：中心必须落在一个**完全空的 16³ 子块**内才直接采用，否则交给
-  // ddgi_place_probe 按「最大空叶 + 靠近中心」重新找。全空 cell 的最大空叶就是整格 →
-  // 探针仍落在中心（与 Douglas「totally empty cell → probe right in the center」一致）。
-  let center_v = vec3<i32>(center);
-  let sub16 = cmin + ((center_v - cmin) / 16) * 16;
-  // 中心捷径也必须过最小净距：它所在的 16³ 子块全空，但中心本身可能贴在子块的某个面上
-  // （子块外紧邻实体）→ 到最近表面的距离只有"到子块面的距离"。要求六个面都 ≥ CLEARANCE。
-  let off = vec3<f32>(center_v - sub16);
-  let face_lo = min(min(off.x, off.y), off.z);
-  let face_hi = min(min(15.0 - off.x, 15.0 - off.y), 15.0 - off.z);
-  let center_ok = sample_brickmap(g, center_v) == 0u
-    && ddgi_cell_state_sized(g, sub16, 16) == 0u
-    && min(face_lo, face_hi) >= DDGI_PROBE_MIN_CLEARANCE;
-  var p = center;
-  if (!center_ok) {
-    let r = ddgi_place_probe(g, cmin, cs, center, lod);
-    if (r.w <= 0.5) { ddgi_cell[slot] = ddgi_rec_pack(0u, occupied, vec3<u32>(0u)); return; }
-    p = r.xyz;
-  }
+  // 放置规则（严格对齐 Douglas #23）：见 `ddgi_place_probe` —— 从粗到细取「第一个完全空的
+  // 子块」的中心；同级并列取离 cell 中心最近的。全空 cell 的最大空叶就是整格 → 探针落在正中
+  // （Douglas："for a totally empty cell the probe would end up right in the center"）。
+  // 全满 cell 已在上面 `st == 1u` 处返回、不放探针。
+  //
+  // 【为什么删掉了"中心捷径"】旧版有一条捷径：cell 中心落在完全空的 16³ 子块内就直接用中心。
+  // 对 LOD0（cs=16 ⇒ 子块 = 整格）它恰好等价于本函数轮 1 的"整格全空 → 居中"，删掉不改结果；
+  // 对 LOD1~3（cs≥32）它的 `off = center_v - sub16` 恒为 0 → 旧净距门槛下**从不触发**，于是
+  // 粗级总能先走 `ddgi_place_probe` 的"继承细级探针位置"。若只去掉净距项而不删捷径，LOD1~3
+  // 会开始走捷径、绕开继承 → 粗级不再与细级自洽。所以整条删掉，放置只留 `ddgi_place_probe`
+  // 这一条 Douglas 规则。
+  let r = ddgi_place_probe(g, cmin, cs, center, lod);
+  if (r.w <= 0.5) { ddgi_cell[slot] = ddgi_rec_pack(0u, occupied, vec3<u32>(0u)); return; }
+  var p = r.xyz;
   // 主世界的 place_probe 看不到物体体素：探针可能正落在物体内部（射线起点即实心，
   // 首命中 t≈0，辐亮度/深度全错）→ 推到物体 AABB 外。
   p = ddgi_push_out_of_objects(p);
@@ -2613,8 +2468,18 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cmin = wc * cs;
 
   let enabled = (rec & DDGI_REC_ENABLED) != 0u;
-  // ---- 「本 cell 附近有没有几何」：先算，enabled / !enabled 两条路径都要用 ----
-  // 顺序上的原因：`!enabled` 的格也需要它来决定**要不要做借针搜索**（见下）。
+  if (!enabled) {
+    // 本格没有探针：清 meta 与 slot_pos 即可。
+    // （旧的"借针"机制会在这里把本格指向邻近探针；放置规则改成 Douglas 的"最大的全空子块"后
+    //   格内必有探针，重定向不再需要，相关间接表已删除。）
+    ddgi_meta[slot] = 0u;
+    ddgi_slot_pos[slot] = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    return;
+  }
+  let off = vec3<f32>(ddgi_rec_off(rec)) / 255.0;
+  let probe_pos = vec3<f32>(cmin) + off * f32(cs);
+
+  // ---- 「本 cell 附近有没有几何」：活跃判定的输入（只对 enabled 的格计算）----
   var near = (rec & DDGI_REC_OCCUPIED) != 0u;
   if (!near) {
     near = ddgi_neighbor_occupied(lod, wc + vec3<i32>(-1, 0, 0))
@@ -2626,34 +2491,13 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   if (!near) {
     // 物体：主世界 brick tree 里没有它的体素，必须用 grid_descs 的世界 AABB 判。
-    // 旧版读的是从未被写入的 ddgi_objects（旧门控量 u.params.w 当时恒 0；注意该通道
-    // 现在已改作借针半径，见 ddgi_find_neighbor_probe，与本判定无关）→ 那段是死代码，
-    // 物体所在 cell 永不判活 → 图集恒 0 → 物体整面没有 GI。
+    // 旧版读的是从未被写入的 ddgi_objects（那段是死代码）→ 物体所在 cell 永不判活
+    // → 图集恒 0 → 物体整面没有 GI。
     near = ddgi_box_hits_object(
       vec3<f32>(cmin),
       vec3<f32>(cmin) + vec3<f32>(f32(cs)),
     );
   }
-  if (!enabled) {
-    ddgi_meta[slot] = 0u;
-    ddgi_slot_pos[slot] = vec4<f32>(0.0, 0.0, 0.0, -1.0);
-    // Step 1：本格放不出探针 → 指向同 LOD 邻近**已放置**的探针（找不到则指回自身）。
-    // 这样贴墙一圈不会留下空洞，而探针本身仍可以离表面足够远。搜索半径由 params.w
-    // （Borrow 滑杆）控制，r=0 时直接指回自身 = 借针关闭，该插值角在采样时自然缺席。
-    //
-    // ⚠️ **只在"附近有几何"时才搜**：bake 的 spawn 门控让"离表面超过 1 格"的纯空气格
-    // 也不再生成探针，这类格子占了绝大多数（30 多万）。它们的 ±2 邻域里同样没有任何已
-    // 放置的探针，却要为每格白扫 5³=125 次 `ddgi_cell` —— sort 会因此慢一个数量级。
-    // 远处空气格没有任何采样者（像素必然贴着表面），指回自身（=没有数据）完全等价。
-    if (near) {
-      ddgi_cell_slot[slot] = ddgi_find_neighbor_probe(slot);
-    } else {
-      ddgi_cell_slot[slot] = slot;
-    }
-    return;
-  }
-  let off = vec3<f32>(ddgi_rec_off(rec)) / 255.0;
-  let probe_pos = vec3<f32>(cmin) + off * f32(cs);
 
   // ---- age 继承（同 slot 且 world cell 未变 → 续龄；换 cell 时 bake 已清零）----
   var age = ddgi_meta_age(ddgi_meta[slot]);
@@ -2683,8 +2527,6 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   ddgi_meta[slot] = ddgi_meta_pack(age, true, is_active);
   ddgi_slot_pos[slot] = vec4<f32>(probe_pos, f32(lod));
-  // 本格有自己的探针 → 指回自身（清掉上一帧可能留下的"指向邻居"）
-  ddgi_cell_slot[slot] = slot;
 }
 
 fn ddgi_irr_fetch(id: u32, tx: i32, ty: i32) -> vec4<f32> {
@@ -2860,8 +2702,8 @@ fn ddgi_sample_lod(
         //    probes are in front of the voxel versus which probes are behind the voxel."
         // 而"哪个值算在哪个格点上"是插值的事，与探针在格内的偏移无关）。
         //
-        // 顺带：Step 1 的"指向"共享过来的探针拿到的就是这个角的名义权重，不再需要放大
-        // 支撑半径（DDGI_SHARE_K 已删）。
+        // 顺带：每个探针拿到的都是它所属角的名义权重（旧的"借针"共享机制与 DDGI_SHARE_K
+        // 都已删除，不再需要放大支撑半径）。
         let wl = vec3<f32>(
           select(1.0 - fr.x, fr.x, ix == 1),
           select(1.0 - fr.y, fr.y, iy == 1),
@@ -2870,11 +2712,11 @@ fn ddgi_sample_lod(
         let wtri = wl.x * wl.y * wl.z;
         if (wtri <= 1e-6) { continue; }
         let probe = ddgi_slot_pos[slot].xyz;
-        // 【不再去重】旧的去重是在"支撑半径按探针实际位置算"时加的：那时同一个探针从多个角
-        // 贡献的是**同一个权重**，累加等于把它的位置权重成倍放大。现在基是名义三线性基
-        // （8 角和 = 1），同一份辐照度落在两个角上，本就该拿这两个角的权重之和 —— 那正是
-        // "两个角的代表是同一个值"的正确插值结果。去重反而会把它压成其中一个角的基值，
-        // 等于把一个共享探针又摆回了那个角点，晶格伪影会原样回来。
+        // 【不去重】基是名义三线性基（8 角和 = 1）：同一份辐照度若落在两个角上，本就该拿
+        // 这两个角的权重之和 —— 那正是"两个角的代表是同一个值"的正确插值结果。去重反而会把
+        // 它压成其中一个角的基值，等于把该值又摆回了那个角点，晶格伪影会原样回来。
+        // （旧版是因为"支撑半径按探针实际位置算 + 借针共享"才需要去重；借针已删，基的语义未变，
+        //   去重仍不必要。）
         let to = ps - probe;
         let dist = length(to);
         let dir = to / max(dist, 1e-4);

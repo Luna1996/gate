@@ -30,9 +30,9 @@ pub const IRRADIANCE_TEXELS: u32 = 4;
 /// 深度图每探针 8×8（= 64 纹素）。
 ///
 /// 【为什么不用原版的 16×16】曾试过 16×16（每纹素 ~11°，现在 ~22°）：**实测漏光没有明显
-/// 改善** —— 说明当时的漏光主因不在深度角分辨率，而在别处（射线方向未绑定纹素 / 借针跨墙 /
-/// 级联硬切，见 dda.wgsl 对应注释）。代价则是深度图集 64MB → 256MB、collect 线程 80 → 320、
-/// 帧轮换周期 ×4。故回退到 8×8。
+/// 改善** —— 说明当时的漏光主因不在深度角分辨率，而在别处（射线方向未绑定纹素 / 跨墙指向 /
+/// 级联硬切，见 dda.wgsl 对应注释；其中跨墙指向对应的旧"借针"机制现已删除）。代价则是深度图集
+/// 64MB → 256MB、collect 线程 80 → 320、帧轮换周期 ×4。故回退到 8×8。
 /// 必须与 WGSL `DDGI_DEPTH_TEXELS` 一致。
 pub const DEPTH_TEXELS: u32 = 8;
 pub const PROBE_T_MAX: f32 = 8192.0;
@@ -262,7 +262,7 @@ pub struct DdgiChunkUniform {
 /// 判定规则（内容驱动，见任务点 4）：chunk 自己有几何，**或**它的邻域（cell 粒度）内有几何
 /// —— 后者保证「贴着几何表面的采样者，其 8 个插值角格能拿到探针」：采样者的角格最多跨到
 /// 相邻 cell，而相邻 cell 若落在邻 chunk，就必须给那个 chunk 也分配段，否则那 4 个角会凭空
-/// 缺失（在 chunk 边界上留下可见接缝）。不需要「借针」式间接表。
+/// 缺失（在 chunk 边界上留下可见接缝）。
 #[derive(bevy::ecs::resource::Resource, Clone, Debug, Default, PartialEq)]
 pub struct DdgiLod0Chunks {
   /// 需要 LOD0 段的 chunk 坐标（世界体素坐标 / 256）。
@@ -424,9 +424,9 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
       // 3：烘焙输出（bake 写 / sort 读）4：age/flags（读写）5：indirect/counter（读写）
       // 6：worklist（读写）7：slot_pos（读写）8：cell_id（读写，滚动增量）
       // 9：cast 射线样本（cast 写 / collect 读）
-      // 10：cell→slot 间接表（读写）—— 允许一个 cell 指向**邻近 cell 的探针**，
-      //     这样"探针必须离表面足够远"和"每个采样点都有 8 个可用角"可以同时成立。
-      //     初始化成"指向自身"时与旧行为逐位等价（见 create 处的 identity 填充）。
+      // 10：LOD0 的两张 chunk 表 + 一段无读者的保留前缀（读写；见 `DdgiGpu::cell_slot`）。
+      //     旧「cell → slot 借针间接表」曾用前段做"无针 cell 指向邻近探针"，该机制已删除；
+      //     前段保留为 identity 仅为保持两张 chunk 表的偏移不变。
       buf(3, false),
       buf(4, false),
       buf(5, false),
@@ -515,12 +515,15 @@ pub struct DdgiGpu {
   pub args: bevy::render::render_resource::Buffer,
   pub worklist: bevy::render::render_resource::Buffer,
   pub slot_pos: bevy::render::render_resource::Buffer,
-  /// cell → slot 间接表（每 LOD 16384 项，u32）。初始化 = 指向自身；bake 可把"本格放不出
-  /// 探针"的 cell 指向邻近 cell 的探针（见 WGSL `ddgi_slot`）。
+  /// LOD0 chunk 段的两张表（复用一张 u32 数组，见 WGSL binding(10) 注释）。
   ///
-  /// 【buffer 尾部还打包了 LOD0 chunk 段的两张表】BG4 的 storage binding 已经用满 8 个
-  /// （WebGPU/WGSL 下限），所以不再新增 binding，而是复用这张 u32 数组的尾部：
-  ///   [0, total_slots)                          —— cell → slot 间接表（identity 起步）
+  /// 【旧的「cell → slot 借针间接表」已删】它曾让"本格放不出探针"的 cell 指向邻近探针。
+  /// 放置规则改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，重定向不再
+  /// 需要。前段 `[0, total_slots)` 因此**没有任何读者**，但仍在下面按 identity 铺一遍 ——
+  /// 只为保持两张 chunk 表的偏移（由 WGSL 的 `misc.y` = total_slots 算出）不变。
+  ///
+  /// 【buffer 布局】BG4 的 storage binding 已经用满 8 个（WebGPU/WGSL 下限），所以尾部复用：
+  ///   [0, total_slots)                          —— 保留前缀（identity，无读者）
   ///   [total_slots, +num_chunks)                —— chunk_base：chunk 线性下标 → LOD0 段基址
   ///   [total_slots+num_chunks, +lod0_slots)     —— slot_chunk：LOD0 局部槽位 → 所属 chunk 线性下标
   /// 三个区间的偏移在 WGSL 里由 `misc.y`(=total_slots) 与 chunk 维度算出。
@@ -640,11 +643,6 @@ pub struct DdgiDebugSettings {
   pub gain: f32,
   pub probe_viz: bool,
   pub probe_viz_lod: f32,
-  /// 借针搜索半径（格），对应 WGSL `params.w`：0 = 关闭借针（Douglas 原架构：
-  /// 无针 cell 的插值角直接缺席），1 = ±1 邻域，2 = ±2 邻域（现状默认）。
-  /// 仅作诊断 A/B：验证跨墙借针对室内墙角漏光的贡献。sort 每帧重写间接表，
-  /// 拖动滑杆下一帧即生效，无需 rebake。
-  pub borrow_radius: f32,
   /// Chebyshev 里 **std 项的信任系数**，对应 WGSL `misc.z`（0..1，默认 1 = 正常使用 std）。
   ///
   /// 拖到 0 = 完全忽略 std，`soft` 退回固定下限 `DDGI_DEPTH_SOFT_MIN`（硬判定：更能压漏光，
@@ -671,7 +669,6 @@ impl Default for DdgiDebugSettings {
       gain: 1.0,
       probe_viz: false,
       probe_viz_lod: 0.0,
-      borrow_radius: 2.0,
       depth_soft_k: 1.0,
       far_ambient: 0.25,
     }
@@ -923,7 +920,7 @@ fn init_ddgi_gpu(
   let cell = zero_storage_buffer(&device, &queue, "ddgi_cell", 4096 * 4);
   let cell_id = zero_storage_buffer(&device, &queue, "ddgi_cell_id", 4096 * 16);
   let meta = zero_storage_buffer(&device, &queue, "ddgi_meta", 4096 * 4);
-  // cell→slot 间接表 + LOD0 chunk 段表（尾部打包，见 `DdgiGpu::cell_slot` 注释）。
+  // LOD0 chunk 段表 + 保留前缀（同一 buffer，见 `DdgiGpu::cell_slot` 注释）。
   // 内容尺寸随世界 AABB / LOD0 chunk 集变化 → 这里只放占位，`prepare_ddgi` 按构建键重建。
   let cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", 4);
   let samples = zero_storage_buffer(&device, &queue, "ddgi_samples", DDGI_SAMPLE_BYTES);
@@ -1202,7 +1199,6 @@ fn extract_ddgi_settings(
     gain: d.gain,
     probe_viz: d.probe_viz,
     probe_viz_lod: d.probe_viz_lod,
-    borrow_radius: d.borrow_radius,
     depth_soft_k: d.depth_soft_k,
     far_ambient: d.far_ambient,
   });
@@ -1333,13 +1329,13 @@ fn prepare_ddgi(
   ensure_storage_buffer(&device, &queue, &mut gpu.slot_pos, "ddgi_slot_pos", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.worklist, "ddgi_worklist", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.cell_id, "ddgi_cell_id", s * 16);
-  // `cell_slot`：尾部同时打包 LOD0 的两张 chunk 表（见 `DdgiGpu::cell_slot` 注释）。
-  //   [0, total_slots)                        cell→slot 间接表，identity 起步
+  // `cell_slot`：LOD0 的两张 chunk 表 + 一段无读者的保留前缀（见 `DdgiGpu::cell_slot` 注释）。
+  //   [0, total_slots)                        保留前缀（identity，旧借针间接表；已无读者）
   //   [total_slots, +num_chunks)              chunk_base（未分配 = DDGI_CHUNK_NO_BASE 哨兵）
   //   [total_slots+num_chunks, +lod0_slots)   slot_chunk（LOD0 局部槽 → chunk 线性下标）
   // 构建键（total / chunk 数 / LOD0 槽数 / 池 serial）变了才重建 —— 内容尺寸变化、或池发生了
-  // 「领段/归还」都要重铺；新增的间接表项必须填 identity，否则新槽位读到 0 会指向 slot 0
-  // （症状：大面积无 GI 且无任何报错）。
+  // 「领段/归还」都要重铺。前段保留前缀仍按 identity 铺（只为让后面两张表的偏移不变，
+  // 由 WGSL 的 `misc.y` = total_slots 定位）。
   let key = (total, num_chunks, lod0_slots, gpu.pool.serial);
   if gpu.cell_slot_key != Some(key) {
     let words = (total + num_chunks + lod0_slots) as usize;
@@ -1389,8 +1385,8 @@ fn prepare_ddgi(
       dims: UVec4::new(d.x, d.y, d.z, gpu.grid.lod_slot_base[lod]),
     };
   }
-  // params: x=frame, y=debug mode, z=gain, w=借针半径（0=关闭，见 DdgiDebugSettings）
-  u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, dbg.borrow_radius);
+  // params: x=frame, y=debug mode, z=gain, w=保留通道（旧借针半径，机制已删除），恒 0
+  u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, 0.0);
   u.misc = Vec4::new(
     if stage.shade_gi() { 1.0 } else { 0.0 },
     gpu.total_slots as f32,
@@ -1660,5 +1656,198 @@ mod tests {
       "LOD0 chunk 池 + LOD1~3 总槽位 {total} 超出图集容量 {capacity}",
     );
     assert!(lod0_slots <= 0x7FFFF, "LOD0 局部下标必须装进 worklist 的 19 位");
+  }
+
+  // ==========================================================================
+  // 探针放置规则的镜像测试（Douglas #23）
+  // ==========================================================================
+  // 把 dda.wgsl 的 `ddgi_place_probe`（新）与"改造前"的净距硬门槛（旧）各镜像一遍，
+  // 在合成 16³ 体素图案上统计"格内还有空体素、却放不出探针"的格数。
+  //
+  // 镜像方式（逐条对应 WGSL，只取 LOD0 的自放置部分；LOD1~3 的"继承细级"不影响本对比）：
+  //   · 占用 = 一个 16³ 布尔数组（true = 固体，越界按空气）。
+  //   · 新规则：从大到小 [16,8,4,1] 找**完全空**的对齐子块，第一个命中的层级胜出，
+  //     同级并列取子块中心离 cell 中心 (8,8,8) 最近者。
+  //   · 旧规则（已删的 `DDGI_PROBE_MIN_CLEARANCE`）：16³ 那一级要求整格全空；否则只在 4³ 级里
+  //     找"中心到最近固体 6 向轴向净距 ≥ 4 体素"的空块（取最近中心者）；4³ 级全被拒时退到
+  //     1³（`ddgi_leaf16`），同样过净距 → 贴几何的空腔因此放不出探针。
+
+  /// 16³ cell 占用：[z][y][x]，越界按空气。
+  type Cell16 = [[[bool; 16]; 16]; 16];
+
+  fn solid(o: &Cell16, x: i32, y: i32, z: i32) -> bool {
+    if x < 0 || x >= 16 || y < 0 || y >= 16 || z < 0 || z >= 16 {
+      return false;
+    }
+    o[z as usize][y as usize][x as usize]
+  }
+
+  fn block_empty(o: &Cell16, m: [i32; 3], size: i32) -> bool {
+    for dz in 0..size {
+      for dy in 0..size {
+        for dx in 0..size {
+          if solid(o, m[0] + dx, m[1] + dy, m[2] + dz) {
+            return false;
+          }
+        }
+      }
+    }
+    true
+  }
+
+  /// 6 向轴向净距（体素），镜像旧 `ddgi_axis_clearance`（越界即停，最多 8 步）。
+  fn clear6(o: &Cell16, p: [i32; 3]) -> i32 {
+    let dirs = [
+      [1, 0, 0],
+      [-1, 0, 0],
+      [0, 1, 0],
+      [0, -1, 0],
+      [0, 0, 1],
+      [0, 0, -1],
+    ];
+    let mut best = 8;
+    for d in dirs {
+      let mut steps = 8;
+      for i in 1..=8 {
+        if solid(o, p[0] + d[0] * i, p[1] + d[1] * i, p[2] + d[2] * i) {
+          steps = i - 1;
+          break;
+        }
+      }
+      best = best.min(steps);
+    }
+    best
+  }
+
+  /// 某个 size 的对齐全空子块里，离 cell 中心最近者的中心；找不到返回 None。
+  fn nearest_empty_center(o: &Cell16, size: i32) -> Option<[f32; 3]> {
+    let n = 16 / size;
+    let mut best: Option<([f32; 3], i32)> = None;
+    for iz in 0..n {
+      for iy in 0..n {
+        for ix in 0..n {
+          let m = [ix * size, iy * size, iz * size];
+          if !block_empty(o, m, size) {
+            continue;
+          }
+          let h = size as f32 * 0.5;
+          let p = [m[0] as f32 + h, m[1] as f32 + h, m[2] as f32 + h];
+          let d2 = ((p[0] - 8.0).powi(2) + (p[1] - 8.0).powi(2) + (p[2] - 8.0).powi(2)) as i32;
+          if best.map_or(true, |(_, b)| d2 < b) {
+            best = Some((p, d2));
+          }
+        }
+      }
+    }
+    best.map(|(p, _)| p)
+  }
+
+  /// 新规则（Douglas #23）：层级 16³ → 8³ → 4³ → 1³，第一个含全空子块的层级胜出。
+  fn place_new(o: &Cell16) -> Option<[f32; 3]> {
+    if block_empty(o, [0, 0, 0], 16) {
+      return Some([8.0, 8.0, 8.0]); // 全空 cell → 正中
+    }
+    for size in [8, 4] {
+      if let Some(p) = nearest_empty_center(o, size) {
+        return Some(p);
+      }
+    }
+    nearest_empty_center(o, 1) // 1³ 保底：只要格内有空体素就一定放得出探针
+  }
+
+  /// 旧规则（已删的净距硬门槛）：整格全空 → 居中；否则 4³ 候选须净距 ≥ 4；
+  /// 4³ 级无合格者时退到 1³（`ddgi_leaf16`：只有在**没有空 4³** 时才会下探 1³）。
+  fn place_old(o: &Cell16) -> Option<[f32; 3]> {
+    if block_empty(o, [0, 0, 0], 16) {
+      return Some([8.0, 8.0, 8.0]);
+    }
+    let mut best: Option<([f32; 3], i32)> = None;
+    let mut any4 = false;
+    for iz in 0..4 {
+      for iy in 0..4 {
+        for ix in 0..4 {
+          let m = [ix * 4, iy * 4, iz * 4];
+          if !block_empty(o, m, 4) {
+            continue;
+          }
+          any4 = true;
+          if clear6(o, [m[0] + 2, m[1] + 2, m[2] + 2]) < 4 {
+            continue;
+          }
+          let p = [m[0] as f32 + 2.0, m[1] as f32 + 2.0, m[2] as f32 + 2.0];
+          let d2 = ((p[0] - 8.0).powi(2) + (p[1] - 8.0).powi(2) + (p[2] - 8.0).powi(2)) as i32;
+          if best.map_or(true, |(_, b)| d2 < b) {
+            best = Some((p, d2));
+          }
+        }
+      }
+    }
+    if let Some((p, _)) = best {
+      return Some(p);
+    }
+    if any4 {
+      return None;
+    }
+    let p = nearest_empty_center(o, 1)?;
+    let pi = [p[0] as i32, p[1] as i32, p[2] as i32];
+    if clear6(o, pi) >= 4 {
+      Some(p)
+    } else {
+      None
+    }
+  }
+
+  #[test]
+  fn probe_placement_matches_douglas_and_fixes_clearance_gap() {
+    // 图案集合：闭包返回 true 表示该体素是固体。
+    let mut cases: Vec<(&str, Box<dyn Fn(i32, i32, i32) -> bool>)> = Vec::new();
+    // 半空间：固体 x >= a（a=1..15）
+    for a in 1..16 {
+      cases.push(("halfspace", Box::new(move |x, _, _| x >= a)));
+    }
+    // 中缝墙：固体 x ∈ [5,11)（两侧空腔都太窄，旧净距门槛够不到）
+    cases.push(("wall5_11", Box::new(|x, _, _| (5..11).contains(&x))));
+    // 实心块里挖一个 2³ 空气口袋（x,y,z ∈ [6,8)）
+    cases.push((
+      "pocket2",
+      Box::new(|x, y, z| !((6..8).contains(&x) && (6..8).contains(&y) && (6..8).contains(&z))),
+    ));
+
+    let mut empty_cells = 0;
+    let mut new_miss = 0;
+    let mut old_miss = 0;
+    for (name, f) in cases.iter() {
+      let mut o: Cell16 = [[[false; 16]; 16]; 16];
+      let mut n_solid = 0;
+      for z in 0..16 {
+        for y in 0..16 {
+          for x in 0..16 {
+            let s = f(x, y, z);
+            o[z as usize][y as usize][x as usize] = s;
+            n_solid += s as i32;
+          }
+        }
+      }
+      if n_solid == 16 * 16 * 16 {
+        continue; // 全满 cell：两种规则都按 Douglas 不放探针
+      }
+      empty_cells += 1;
+      if place_new(&o).is_none() {
+        new_miss += 1;
+      }
+      if place_old(&o).is_none() {
+        old_miss += 1;
+      }
+      assert!(
+        place_new(&o).is_some(),
+        "{name}: 新规则必须保证「格内有空体素 ⇒ 一定放得出探针」"
+      );
+    }
+    println!("probe placement: cells={empty_cells} new_miss={new_miss} old_miss={old_miss}");
+    assert_eq!(new_miss, 0, "新规则必须满足「格内有空体素 ⇒ 一定放得出探针」");
+    assert!(
+      old_miss >= 6,
+      "贴几何的空腔在旧净距门槛下本应放不出探针（用于证明改造必要），实测 old_miss={old_miss}",
+    );
   }
 }
