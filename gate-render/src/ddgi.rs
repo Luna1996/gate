@@ -77,6 +77,198 @@ pub const DDGI_LOD_DIMS: UVec3 = UVec3::new(32, 16, 32);
 // 全换掉 → 整级图集变成旧位置的读数 → 深度判定成片失败（Probe 大片红）+ 下一帧重写
 // （大片绿），即「相机移动时的 GI 闪烁」。前提：`from_camera` 的原点必须是 cell 整数倍。
 
+// ---- LOD0 的 chunk 锚定（其它 LOD 保持上面的世界 AABB 规则网格）----
+//
+// LOD0 不再铺「一整个世界 AABB 的规则网格」，而是**按 chunk 拥有**：世界体素卷按
+// `DDGI_CHUNK_VOXELS`(256³) 切成 chunk，每个「需要探针」的 chunk 从探针池里领一段**固定
+// 大小**的 LOD0 槽位（4096 = (256/16)³），chunk 内的 cell 编址为 chunk 局部：
+//     slot = chunk_base[chunk] + local_cell_linear（局部 cell 索引，见 `DDGI_CHUNK_LOD0_AXIS`）
+// 探针世界位置 = chunk 世界原点 + 局部 cell 中心 —— **相对世界固定**（与旧实现一致），
+// 所以「相机移动不闪」这条不变式不受影响。
+//
+// 边界与不变量（务必与 WGSL 的 `ddgi_slot_own`/`ddgi_slot_world_cell` 对照）：
+//   · **只服务 LOD0**。LOD1~3 仍由 `DdgiWorldGrid::from_world` 的规则网格提供（滚动频率低、
+//     伪影不明显），槽位基址排在 LOD0 段之后。
+//   · chunk 段的基址**一旦分配就不再改变**（只有 chunk 被释放才归还进空闲链表）。基址一变，
+//     该 chunk 全部探针就会换槽位 → 图集整段错位 → 与「世界锚定」同样的闪烁。
+//   · 池是**高水位**定容的：`lod0_slots = next_base`，空闲段的空洞同样占槽位（无流式加载时
+//     没有释放，等价于紧凑分配）。
+/// chunk 边长（voxel）：世界体素卷按它切块（= 引擎自己的 brick chunk 粒度）。
+pub const DDGI_CHUNK_VOXELS: i32 = 256;
+/// 每 chunk 每轴含多少个 LOD0 cell：256 / 16 = 16。
+pub const DDGI_CHUNK_LOD0_AXIS: i32 = DDGI_CHUNK_VOXELS / DDGI_LOD_CELL_SIZES[0];
+/// 每 chunk 的 LOD0 段大小 = (256/16)³ = 4096。
+pub const DDGI_CHUNK_LOD0_SLOTS: u32 =
+  (DDGI_CHUNK_LOD0_AXIS as u32) * (DDGI_CHUNK_LOD0_AXIS as u32) * (DDGI_CHUNK_LOD0_AXIS as u32);
+/// 探针池里「该 chunk 未分配段」的哨兵基址。
+pub const DDGI_CHUNK_NO_BASE: u32 = u32::MAX;
+
+/// LOD0 的 chunk 网格几何（chunk 单位）。
+///
+/// 原点 = 世界 AABB 向下对齐到 256 后再**向外扩 1 chunk**，维度 = 覆盖 AABB 所需 chunk 数
+/// **+2**。多这一圈是为了给「贴着 AABB 边界、需要在邻 chunk 放探针」的 chunk 留出编址空间；
+/// 未分配段的 chunk 由 `DDGI_CHUNK_NO_BASE` 标记。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DdgiChunkGeom {
+  pub origin: IVec3,
+  pub dims: UVec3,
+}
+
+impl Default for DdgiChunkGeom {
+  fn default() -> Self {
+    Self {
+      origin: IVec3::ZERO,
+      dims: UVec3::ONE,
+    }
+  }
+}
+
+impl DdgiChunkGeom {
+  pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
+    let c = DDGI_CHUNK_VOXELS;
+    let aligned = IVec3::new(
+      align_down(aabb_min.x, c),
+      align_down(aabb_min.y, c),
+      align_down(aabb_min.z, c),
+    ) / c
+      - IVec3::ONE;
+    let span = (aabb_max - aligned * c).max(IVec3::ONE);
+    let dims = UVec3::new(
+      ((span.x + c - 1) / c).max(1) as u32 + 2,
+      ((span.y + c - 1) / c).max(1) as u32 + 2,
+      ((span.z + c - 1) / c).max(1) as u32 + 2,
+    );
+    Self {
+      origin: aligned,
+      dims,
+    }
+  }
+
+  #[inline]
+  pub fn len(&self) -> u32 {
+    self.dims.x * self.dims.y * self.dims.z
+  }
+
+  /// chunk 坐标 → 网格内线性下标（含边界检查）
+  #[inline]
+  pub fn linear(&self, cc: IVec3) -> Option<u32> {
+    let r = cc - self.origin;
+    if r.x < 0
+      || r.y < 0
+      || r.z < 0
+      || r.x as u32 >= self.dims.x
+      || r.y as u32 >= self.dims.y
+      || r.z as u32 >= self.dims.z
+    {
+      return None;
+    }
+    Some((r.x as u32) + (r.y as u32) * self.dims.x + (r.z as u32) * self.dims.x * self.dims.y)
+  }
+
+  #[inline]
+  pub fn coord(&self, idx: u32) -> IVec3 {
+    let d = self.dims;
+    self.origin
+      + IVec3::new(
+        (idx % d.x) as i32,
+        ((idx / d.x) % d.y) as i32,
+        (idx / (d.x * d.y)) as i32,
+      )
+  }
+}
+
+/// LOD0 探针池：chunk → 段基址（段大小恒为 `DDGI_CHUNK_LOD0_SLOTS`），配一个空闲链表。
+///
+/// 【为什么要有池】现在没有 chunk 流式加载（见 `vox_scene`：整个 nuke.vox 一次性载入），
+/// 所以这条路的收益是**内容驱动的内存节省** —— 只有「有几何」（或紧邻几何）的 chunk 才领段，
+/// 空 chunk 不占 LOD0 槽位；池 + 空闲链表是为将来接流式（chunk 卸载时归还段）预留的接口。
+///
+/// 【为什么不重排基址】`sync` 只做「新 chunk 领段、消失的 chunk 归还」，**已有 chunk 的基址
+/// 保持不变** —— 这是「移动/编辑不闪」的前提（基址变了 = 该 chunk 全部探针换槽位，图集里
+/// 还是旧位置的值 → 误差被放大）。
+#[derive(Clone, Debug, Default)]
+pub struct DdgiChunkPool {
+  pub geom: DdgiChunkGeom,
+  /// 每 chunk 的段基址（`DDGI_CHUNK_NO_BASE` = 未分配）
+  pub bases: Vec<u32>,
+  /// 空闲段基址（chunk 释放时归还，LIFO 复用）
+  pub free: Vec<u32>,
+  /// 池高水位（下一个新段基址）→ LOD0 槽位数 = 它
+  pub next_base: u32,
+  /// 任何分配/归并都自增：`prepare_ddgi` 据此判定「池变了 → 需要重烘」。
+  pub serial: u64,
+}
+
+impl DdgiChunkPool {
+  #[inline]
+  pub fn lod0_slots(&self) -> u32 {
+    self.next_base
+  }
+
+  /// 与期望的 chunk 集合同步。返回「是否发生变化」。
+  pub fn sync(&mut self, geom: DdgiChunkGeom, wanted: &[IVec3]) -> bool {
+    let mut changed = false;
+    if self.geom != geom || self.bases.len() != geom.len() as usize {
+      self.geom = geom;
+      self.bases = vec![DDGI_CHUNK_NO_BASE; geom.len() as usize];
+      self.free.clear();
+      self.next_base = 0;
+      changed = true;
+    }
+    let mut want: Vec<u32> = wanted
+      .iter()
+      .filter_map(|cc| self.geom.linear(*cc))
+      .collect();
+    want.sort_unstable();
+    want.dedup();
+    for &l in want.iter() {
+      if self.bases[l as usize] == DDGI_CHUNK_NO_BASE {
+        let base = self.free.pop().unwrap_or_else(|| {
+          let b = self.next_base;
+          self.next_base += DDGI_CHUNK_LOD0_SLOTS;
+          b
+        });
+        self.bases[l as usize] = base;
+        changed = true;
+      }
+    }
+    for l in 0..self.bases.len() {
+      let b = self.bases[l];
+      if b != DDGI_CHUNK_NO_BASE && want.binary_search(&(l as u32)).is_err() {
+        self.bases[l] = DDGI_CHUNK_NO_BASE;
+        self.free.push(b);
+        changed = true;
+      }
+    }
+    if changed {
+      self.serial = self.serial.wrapping_add(1);
+    }
+    changed
+  }
+}
+
+/// LOD0 段如何编址 —— uniform 里给 shader 的那两个 vec4（见 WGSL `DdgiUniform.chunk`）。
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, ShaderType)]
+pub struct DdgiChunkUniform {
+  /// xyz = chunk 网格原点（chunk 坐标），w = 每 chunk 每轴 cell 数（16）
+  pub origin: IVec4,
+  /// xyz = chunk 网格维度，w = LOD0 已分配槽数（池高水位）
+  pub dims: UVec4,
+}
+
+/// 主世界算出的「LOD0 需要探针段的 chunk」集合（chunk 坐标，由主世界体素内容决定）。
+///
+/// 判定规则（内容驱动，见任务点 4）：chunk 自己有几何，**或**它的邻域（cell 粒度）内有几何
+/// —— 后者保证「贴着几何表面的采样者，其 8 个插值角格能拿到探针」：采样者的角格最多跨到
+/// 相邻 cell，而相邻 cell 若落在邻 chunk，就必须给那个 chunk 也分配段，否则那 4 个角会凭空
+/// 缺失（在 chunk 边界上留下可见接缝）。不需要「借针」式间接表。
+#[derive(bevy::ecs::resource::Resource, Clone, Debug, Default, PartialEq)]
+pub struct DdgiLod0Chunks {
+  /// 需要 LOD0 段的 chunk 坐标（世界体素坐标 / 256）。
+  pub chunks: Vec<IVec3>,
+}
+
 // indirect args / 计数器合一 buffer（word 布局与 WGSL DDGI_INDIR_* 对应）：
 //   [0..16) cast args ×4 LOD；[16..32) collect args ×4 LOD；[32..36) rpp；[36..40) 活跃计数器
 pub const DDGI_INDIRECT_BYTES: u64 = 256;
@@ -186,6 +378,8 @@ pub struct DdgiUniform {
   pub dirty_min: Vec4,
   /// xyz = max（不含）；与 dirty_min 一起决定哪些 cell 强制重烘（局部编辑增量）
   pub dirty_max: Vec4,
+  /// LOD0 的 chunk 段编址（仅 lod==0 用；LOD1~3 走 `lods`）。见 `DdgiChunkUniform`。
+  pub chunk: DdgiChunkUniform,
 }
 
 pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescriptor {
@@ -323,7 +517,20 @@ pub struct DdgiGpu {
   pub slot_pos: bevy::render::render_resource::Buffer,
   /// cell → slot 间接表（每 LOD 16384 项，u32）。初始化 = 指向自身；bake 可把"本格放不出
   /// 探针"的 cell 指向邻近 cell 的探针（见 WGSL `ddgi_slot`）。
+  ///
+  /// 【buffer 尾部还打包了 LOD0 chunk 段的两张表】BG4 的 storage binding 已经用满 8 个
+  /// （WebGPU/WGSL 下限），所以不再新增 binding，而是复用这张 u32 数组的尾部：
+  ///   [0, total_slots)                          —— cell → slot 间接表（identity 起步）
+  ///   [total_slots, +num_chunks)                —— chunk_base：chunk 线性下标 → LOD0 段基址
+  ///   [total_slots+num_chunks, +lod0_slots)     —— slot_chunk：LOD0 局部槽位 → 所属 chunk 线性下标
+  /// 三个区间的偏移在 WGSL 里由 `misc.y`(=total_slots) 与 chunk 维度算出。
   pub cell_slot: bevy::render::render_resource::Buffer,
+  /// LOD0 探针池（chunk → 段基址，见 `DdgiChunkPool`）。
+  pub pool: DdgiChunkPool,
+  /// 上一次同步进来的 LOD0 chunk 集合（变化才重建池/反查表）。
+  pub last_chunks: Vec<IVec3>,
+  /// `cell_slot` 的构建键 `(total_slots, num_chunks, lod0_slots, pool.serial)`；变了才重建。
+  pub cell_slot_key: Option<(u32, u32, u32, u64)>,
   /// 烘焙输出：每 slot 一条 (flags | off_b)
   pub cell: bevy::render::render_resource::Buffer,
   /// 每 slot 已烘焙的世界 cell 键 + 有效标志（滚动增量烘焙）
@@ -492,6 +699,7 @@ impl bevy::app::Plugin for DdgiPlugin {
     render_app
       .init_resource::<DdgiStage>()
       .init_resource::<DdgiWorldAabb>()
+      .init_resource::<DdgiLod0Chunks>()
       .init_resource::<DdgiDebugSettings>()
       .init_resource::<DdgiBakeThisFrame>()
       .add_systems(bevy::render::RenderStartup, init_ddgi_gpu)
@@ -590,13 +798,16 @@ fn ddgi_array_view(
 
 /// irradiance / depth 图集容量：每层 `40×40 = 1600` 探针 × 256 层 = **409600**。
 ///
-/// 【为什么是 40】各级 LOD 的 dims 现在按**世界 AABB** 计算（见 `from_world`），nuke.vox
-/// 下总和 ≈ 393776（122×39×72 + 62×20×36 + 32×10×18 + 16×5×10）。40 给到 409600 的余量。
+/// 【为什么是 40 / 现在的余量有多紧】LOD0 改为 chunk 锚定后，总槽位 = LOD0 池高水位
+/// （nuke.vox：86 chunk × 4096 = 352256）+ LOD1~3 的世界规则网格（44640 + 5760 + 800）
+/// = **403456**，距 409600 只剩 6144（改造前 393776）。**余量已经很薄**：世界再大一点、
+/// 或 LOD0 需要更多 chunk 段，就会越界。真要扩，先看这两条测试。
 ///
-/// ⚠️ `from_world` **不做钳制**（早期注释曾声称会钳制并告警，实际没有）：超出容量会静默
-/// 越界写图集。约束由测试守着 —— `world_grid_layout_and_atlas_capacity` 断言实际场景的
-/// total_slots ≤ 容量，`wgsl_compile.rs::ddgi_worklist_pack_covers_atlas_capacity` 断言容量
-/// 本身装得进 worklist 的 19 位 cell 下标。世界变大时先看这两条。
+/// ⚠️ 池 / `from_world` **都不做钳制**：超出容量会静默越界写图集。约束由测试守着 ——
+/// `world_grid_layout_and_atlas_capacity`（旧规则网格）与 `chunk_lod0_atlas_capacity`
+/// （新 chunk 池 + LOD1~3）断言实际场景的 total_slots ≤ 容量，
+/// `wgsl_compile.rs::ddgi_worklist_pack_covers_atlas_capacity` 断言容量本身装得进 worklist
+/// 的 19 位 cell 下标。
 pub const DDGI_ATLAS_LAYERS: u32 = 256;
 pub const DDGI_ATLAS_PROBES_PER_LAYER_AXIS: u32 = 40;
 /// 阶段二射线样本缓冲：每样本 2×vec4 = (方向.xyz, 命中距离) + (辐亮度.xyz, 1)。
@@ -712,16 +923,9 @@ fn init_ddgi_gpu(
   let cell = zero_storage_buffer(&device, &queue, "ddgi_cell", 4096 * 4);
   let cell_id = zero_storage_buffer(&device, &queue, "ddgi_cell_id", 4096 * 16);
   let meta = zero_storage_buffer(&device, &queue, "ddgi_meta", 4096 * 4);
-  // cell→slot 间接表：表长固定（= Σ 各级 dims 乘积），一次性建满 + 填成 **identity**
-  // （`ddgi_slot` 返回绝对 slot 下标，所以 identity = [0,1,2,...]）。
-  // identity 状态与"没有这张表"逐位等价 → 这一步本身不改画面，只建立通路（Step 1 第 1 小步）。
-  let n_cells = (DDGI_LODS * DDGI_LOD_DIMS.x * DDGI_LOD_DIMS.y * DDGI_LOD_DIMS.z) as usize;
-  let cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", (n_cells * 4) as u64);
-  let mut identity = Vec::with_capacity(n_cells * 4);
-  for i in 0..n_cells as u32 {
-    identity.extend_from_slice(&i.to_le_bytes());
-  }
-  queue.write_buffer(&cell_slot, 0, &identity);
+  // cell→slot 间接表 + LOD0 chunk 段表（尾部打包，见 `DdgiGpu::cell_slot` 注释）。
+  // 内容尺寸随世界 AABB / LOD0 chunk 集变化 → 这里只放占位，`prepare_ddgi` 按构建键重建。
+  let cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", 4);
   let samples = zero_storage_buffer(&device, &queue, "ddgi_samples", DDGI_SAMPLE_BYTES);
   let indirect = ddgi_indirect_buffer(&device, &queue, "ddgi_indirect");
   let args = ddgi_indirect_buffer(&device, &queue, "ddgi_args");
@@ -733,6 +937,9 @@ fn init_ddgi_gpu(
     worklist,
     slot_pos,
     cell_slot,
+    pool: DdgiChunkPool::default(),
+    last_chunks: Vec::new(),
+    cell_slot_key: None,
     cell,
     cell_id,
     meta,
@@ -869,11 +1076,18 @@ fn dispatch_ddgi(
   // 同一 pass 内没有顺序保证，只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
   if bake.map_or(false, |b| b.0) {
     let n_lods = DDGI_LODS as usize;
-    // 每级的 dispatch 大小按**该级实际 dims** 算 —— dims 现在随世界 AABB 变化（不再固定
-    // 32×16×32），写死会让烘焙只覆盖一小部分 cell，症状是"大部分区域无 GI"（且无报错）。
+    // 每级的 dispatch 大小按**该级实际槽数**算 —— LOD1~3 的 dims 随世界 AABB 变化（不再固定
+    // 32×16×32），LOD0 的槽数则是探针池的高水位（chunk 段之和，不等于空间盒 dims 乘积）。
+    // 写死/用 dims 乘积都会让烘焙只覆盖一部分 cell，症状是"大部分区域无 GI"（且无报错）。
+    let lod0_slots = gpu.grid.lod_slot_base[1];
     let wg_per_lod: [u32; DDGI_LODS as usize] = std::array::from_fn(|lod| {
-      let d = gpu.grid.lod_dims[lod];
-      (d.x * d.y * d.z).div_ceil(64).max(1).min(65535)
+      let n = if lod == 0 {
+        lod0_slots
+      } else {
+        let d = gpu.grid.lod_dims[lod];
+        d.x * d.y * d.z
+      };
+      n.div_ceil(64).max(1).min(65535)
     });
     const LABELS: [&str; DDGI_LODS as usize] = [
       "gate_ddgi_bake0",
@@ -979,6 +1193,7 @@ fn extract_ddgi_settings(
   stage: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiStage>>>,
   debug: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiDebugSettings>>>,
   world_aabb: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiWorldAabb>>>,
+  lod0_chunks: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiLod0Chunks>>>,
 ) {
   let s = stage.map_or(DdgiStage::OFF, |s| s.0.min(DdgiStage::FULL));
   commands.insert_resource(DdgiStage(s));
@@ -996,6 +1211,7 @@ fn extract_ddgi_settings(
     min: a.min,
     max: a.max,
   }));
+  commands.insert_resource(lod0_chunks.map_or_else(DdgiLod0Chunks::default, |c| c.clone()));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1009,15 +1225,42 @@ fn prepare_ddgi(
   stage: bevy::ecs::system::Res<DdgiStage>,
   dbg: bevy::ecs::system::Res<DdgiDebugSettings>,
   world: bevy::ecs::system::Res<DdgiWorldAabb>,
+  lod0_chunks: Option<bevy::ecs::system::Res<DdgiLod0Chunks>>,
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
-  // ---- 嵌套级联网格推导（相机中心 → 4 级 LOD 各自独立原点）----
-  // 4 级网格**全部锚定世界 AABB**：相机移动不改变任何一级的原点 → 结构上不存在"换主"
-  // → 不再有"移动时闪"。dims 按世界跨度 / cell 算（细级 cell 小 → dims 大；但纯空气 cell
-  // 被 `near` 判定排除，不进 worklist，所以 33 万槽位不会变成 33 万条射线）。
-  let grid = DdgiWorldGrid::from_world(world.min, world.max);
+  // ---- 网格推导 ----
+  // LOD1~3 仍**全部锚定世界 AABB**（相机移动不改变原点 → 不换主 → 不闪）。
+  // LOD0 换成 **chunk 锚定**：由 `DdgiChunkPool` 从探针池给「需要探针的 chunk」分配固定
+  // 4096 槽的段；只有分配到的段才占 LOD0 槽位（内容驱动）。两种网格的边界见 `DdgiChunkGeom`
+  // 与 `DdgiChunkPool` 的注释；槽位段顺序恒为 LOD0（池）→ LOD1 → LOD2 → LOD3。
+  let base_grid = DdgiWorldGrid::from_world(world.min, world.max);
+  let chunk_geom = DdgiChunkGeom::from_world(world.min, world.max);
+  let lod0_chunks = lod0_chunks.map_or_else(Vec::new, |c| c.chunks.clone());
+
+  // 探针池同步：只在「chunk 集变化」或「chunk 网格几何变化」时真正做事。已有 chunk 的段基址
+  // **保持不变**（见 `DdgiChunkPool::sync`）—— 基址一变即等价于该 chunk 换槽位。
+  let chunks_changed = gpu.last_chunks != lod0_chunks;
+  let geom_changed = gpu.pool.geom != chunk_geom;
+  let pool_changed = if chunks_changed || geom_changed {
+    let changed = gpu.pool.sync(chunk_geom, &lod0_chunks);
+    gpu.last_chunks = lod0_chunks;
+    changed
+  } else {
+    false
+  };
+  let lod0_slots = gpu.pool.lod0_slots();
+
+  let mut grid = base_grid;
+  grid.lod_slot_base[0] = 0;
+  let mut base = lod0_slots;
+  for lod in 1..DDGI_LODS as usize {
+    grid.lod_slot_base[lod] = base;
+    base += grid.lod_count(lod);
+  }
+  grid.total_slots = base;
   let total = grid.total_slots;
-  let grid_changed = grid != gpu.grid;
+  let grid_changed = grid != gpu.grid || pool_changed;
+  let num_chunks = chunk_geom.len();
 
   // ---- 推进网格/修订号状态（仅在本帧会跑 pass 时）----
   // 否则「关闭期间世界已更新/相机已移动」会被吞掉 → 之后打开时不会补烘。
@@ -1028,11 +1271,16 @@ fn prepare_ddgi(
     gpu.grid = grid;
     gpu.total_slots = total;
     if grid_changed {
-      // 网格变了就打一次实际数值：dims 现在随世界 AABB 变化，出问题时（无 GI / 黑带）
-      // 第一件事就是核对各级 origin/dims/slot_base 是否与预期一致。
+      // 网格变了就打一次实际数值：LOD0 的 dims 字段仍是**空间盒**（级联包含 / 混合带用它），
+      // 槽位数不再等于 dims 乘积，而是池高水位 —— 出问题时第一件事就是核对它们。
       for lod in 0..DDGI_LODS as usize {
         let o = grid.lod_origins[lod];
         let d = grid.lod_dims[lod];
+        let count = if lod == 0 {
+          lod0_slots
+        } else {
+          grid.lod_count(lod)
+        };
         bevy::log::info!(
           "DDGI LOD{lod}: cell={} origin=({},{},{}) dims=({},{},{}) slot_base={} count={}",
           DDGI_LOD_CELL_SIZES[lod],
@@ -1043,14 +1291,22 @@ fn prepare_ddgi(
           d.y,
           d.z,
           grid.lod_slot_base[lod],
-          grid.lod_count(lod),
+          count,
         );
       }
+      bevy::log::info!(
+        "DDGI LOD0 chunk 池: chunks={}/{} lod0_slots={}（旧 AABB 规则网格 LOD0={}，差 {}）",
+        gpu.pool.bases.iter().filter(|&&b| b != DDGI_CHUNK_NO_BASE).count(),
+        num_chunks,
+        lod0_slots,
+        grid.lod_count(0),
+        grid.lod_count(0) as i64 - lod0_slots as i64,
+      );
       bevy::log::info!("DDGI 总槽位 = {total}（图集容量 409600）");
     }
     gpu.last_revision = rev;
   }
-  // 相机滚动（grid 变化）→ 按「世界 cell 键」增量补烘；世界编辑 → 只失效脏区内的 cell
+  // 相机滚动（grid 变化）/ 池变化 → 按「世界 cell 键」增量补烘；世界编辑 → 只失效脏区内的 cell
   // （bake 用 uniform 里的脏区 AABB 跳过 cell_id 键检查，不再整块清缓存）。
   // `gpu.bake_pending` 让请求**黏住**：本帧若因 pipeline 未编译好而没真正派发（见
   // dispatch_ddgi 的提前返回），下一帧仍会重试，而不是被「已推进的 grid/last_revision」
@@ -1077,18 +1333,40 @@ fn prepare_ddgi(
   ensure_storage_buffer(&device, &queue, &mut gpu.slot_pos, "ddgi_slot_pos", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.worklist, "ddgi_worklist", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.cell_id, "ddgi_cell_id", s * 16);
-  // `cell_slot`（借针间接表）的默认值是 identity（`cell_slot[i] = i`，等价于"没有这张表"）。
-  // ⚠️ 它必须随 total_slots **一起扩容**，且新增部分要填 identity —— 否则新槽位读到 0 会
-  // 指向 slot 0，采样彻底错乱（症状：大面积无 GI，且没有任何报错）。
-  // 历史遗留：dims 固定 32×16×32 时 65536 恰好够用，所以这里一直没有扩容；改成按世界
-  // AABB 算 dims（总槽位 37 万）之后就漏了。
-  if gpu.cell_slot.size() < s * 4 {
-    gpu.cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", s * 4);
-    let mut identity = Vec::with_capacity(total as usize * 4);
+  // `cell_slot`：尾部同时打包 LOD0 的两张 chunk 表（见 `DdgiGpu::cell_slot` 注释）。
+  //   [0, total_slots)                        cell→slot 间接表，identity 起步
+  //   [total_slots, +num_chunks)              chunk_base（未分配 = DDGI_CHUNK_NO_BASE 哨兵）
+  //   [total_slots+num_chunks, +lod0_slots)   slot_chunk（LOD0 局部槽 → chunk 线性下标）
+  // 构建键（total / chunk 数 / LOD0 槽数 / 池 serial）变了才重建 —— 内容尺寸变化、或池发生了
+  // 「领段/归还」都要重铺；新增的间接表项必须填 identity，否则新槽位读到 0 会指向 slot 0
+  // （症状：大面积无 GI 且无任何报错）。
+  let key = (total, num_chunks, lod0_slots, gpu.pool.serial);
+  if gpu.cell_slot_key != Some(key) {
+    let words = (total + num_chunks + lod0_slots) as usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(words * 4);
     for i in 0..total {
-      identity.extend_from_slice(&i.to_le_bytes());
+      buf.extend_from_slice(&i.to_le_bytes());
     }
-    queue.write_buffer(&gpu.cell_slot, 0, &identity);
+    for l in 0..num_chunks {
+      let b = gpu.pool.bases[l as usize];
+      buf.extend_from_slice(&b.to_le_bytes());
+    }
+    let mut slot_chunk = vec![0u32; lod0_slots as usize];
+    for l in 0..num_chunks {
+      let b = gpu.pool.bases[l as usize];
+      if b != DDGI_CHUNK_NO_BASE {
+        // 反向表：该段内 4096 个局部槽位都属于 chunk `l`
+        for k in 0..DDGI_CHUNK_LOD0_SLOTS {
+          slot_chunk[(b + k) as usize] = l;
+        }
+      }
+    }
+    for v in slot_chunk.iter() {
+      buf.extend_from_slice(&v.to_le_bytes());
+    }
+    gpu.cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", (words as u64) * 4);
+    queue.write_buffer(&gpu.cell_slot, 0, &buf);
+    gpu.cell_slot_key = Some(key);
   }
   ensure_storage_buffer(
     &device,
@@ -1128,6 +1406,22 @@ fn prepare_ddgi(
     dirty_valid,
   );
   u.dirty_max = Vec4::new(dirty_max.x as f32, dirty_max.y as f32, dirty_max.z as f32, 0.0);
+  // LOD0 的 chunk 段编址（只有 lod==0 读它）：原点/维度（chunk 单位）、每 chunk cell 数、
+  // 已分配槽数。WGSL 用 `misc.y`(=total_slots) + 这里的维度定位 cell_slot 尾部的两张表。
+  u.chunk = DdgiChunkUniform {
+    origin: IVec4::new(
+      chunk_geom.origin.x,
+      chunk_geom.origin.y,
+      chunk_geom.origin.z,
+      DDGI_CHUNK_LOD0_AXIS,
+    ),
+    dims: UVec4::new(
+      chunk_geom.dims.x,
+      chunk_geom.dims.y,
+      chunk_geom.dims.z,
+      lod0_slots,
+    ),
+  };
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
 
@@ -1278,5 +1572,93 @@ mod tests {
     for lod in 0..DDGI_LODS as usize {
       assert_eq!(slot_of(&g1, lod, wc), slot_of(&g2, lod, wc));
     }
+  }
+
+  /// chunk 网格必须能编址「内容 AABB 之内所有体素所属的 chunk」，且线性下标唯一。
+  #[test]
+  fn chunk_geom_covers_aabb_and_roundtrips() {
+    let lo = IVec3::new(-454, 16, -56);
+    let hi = IVec3::new(1478, 631, 1080);
+    let g = DdgiChunkGeom::from_world(lo, hi);
+    let cmin = lo.div_euclid(IVec3::splat(DDGI_CHUNK_VOXELS));
+    let cmax = (hi - IVec3::ONE).div_euclid(IVec3::splat(DDGI_CHUNK_VOXELS));
+    for z in cmin.z..=cmax.z {
+      for y in cmin.y..=cmax.y {
+        for x in cmin.x..=cmax.x {
+          let cc = IVec3::new(x, y, z);
+          let l = g.linear(cc).expect("内容 chunk 必须在 chunk 网格内");
+          assert_eq!(g.coord(l), cc, "linear/coord 不是互逆");
+        }
+      }
+    }
+    // coord/linear 全域互逆
+    for i in 0..g.len() {
+      assert_eq!(g.linear(g.coord(i)), Some(i));
+    }
+  }
+
+  /// 探针池：每 chunk 领一段固定 4096 槽、段两两不重叠；**已有基址不因再次同步而改变**。
+  #[test]
+  fn chunk_pool_segments_are_disjoint_and_stable() {
+    let geom = DdgiChunkGeom::from_world(IVec3::new(-454, 16, -56), IVec3::new(1478, 631, 1080));
+    let mut pool = DdgiChunkPool::default();
+    // 86 个 chunk（nuke.vox 实测：内容 82 ∪ 边界邻域 4）
+    let wanted: Vec<IVec3> = (0..86).map(|i| geom.coord(i * 5 + 3)).collect();
+    assert!(pool.sync(geom, &wanted));
+    assert_eq!(pool.lod0_slots(), 86 * DDGI_CHUNK_LOD0_SLOTS);
+    // 段基址恰为 0,4096,8192,...（互不重叠）
+    let mut bases: Vec<u32> = wanted
+      .iter()
+      .map(|c| pool.bases[geom.linear(*c).unwrap() as usize])
+      .collect();
+    bases.sort_unstable();
+    for (i, b) in bases.iter().enumerate() {
+      assert_eq!(*b, i as u32 * DDGI_CHUNK_LOD0_SLOTS);
+    }
+    // 幂等：同样集合再同步 → 无变化、基址逐位不变（这是「移动/编辑不闪」的前提）
+    let before = pool.bases.clone();
+    let serial = pool.serial;
+    assert!(!pool.sync(geom, &wanted));
+    assert_eq!(pool.bases, before);
+    assert_eq!(pool.serial, serial);
+  }
+
+  /// 归还的段进空闲链表，新 chunk 复用（LIFO）；高水位不缩（池只增不减地定容）。
+  #[test]
+  fn chunk_pool_free_list_reuses_released_base() {
+    let geom = DdgiChunkGeom::from_world(IVec3::ZERO, IVec3::splat(4096));
+    let mut pool = DdgiChunkPool::default();
+    let a = geom.coord(7);
+    let b = geom.coord(9);
+    assert!(pool.sync(geom, &[a, b]));
+    let base_a = pool.bases[geom.linear(a).unwrap() as usize];
+    let base_b = pool.bases[geom.linear(b).unwrap() as usize];
+    assert_eq!(base_a, 0);
+    assert_eq!(pool.lod0_slots(), 2 * DDGI_CHUNK_LOD0_SLOTS);
+    // 释放 b：a 的基址不变，b 的段归还
+    assert!(pool.sync(geom, &[a]));
+    assert_eq!(pool.bases[geom.linear(a).unwrap() as usize], base_a);
+    assert_eq!(pool.free, vec![base_b]);
+    // 新 chunk c 复用 b 的段（LIFO），高水位保持
+    let c = geom.coord(11);
+    assert!(pool.sync(geom, &[a, c]));
+    assert_eq!(pool.bases[geom.linear(c).unwrap() as usize], base_b);
+    assert_eq!(pool.lod0_slots(), 2 * DDGI_CHUNK_LOD0_SLOTS);
+  }
+
+  /// 新布局（LOD0 chunk 池 + LOD1~3 世界网格）必须仍装得进图集，且 LOD0 局部下标装得进
+  /// worklist 的 19 位。
+  #[test]
+  fn chunk_lod0_atlas_capacity() {
+    let lod0_slots = 86 * DDGI_CHUNK_LOD0_SLOTS;
+    let g = DdgiWorldGrid::from_world(IVec3::new(-454, 16, -56), IVec3::new(1478, 631, 1080));
+    let total = lod0_slots + g.lod_count(1) + g.lod_count(2) + g.lod_count(3);
+    let capacity =
+      DDGI_ATLAS_LAYERS * DDGI_ATLAS_PROBES_PER_LAYER_AXIS * DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
+    assert!(
+      total <= capacity,
+      "LOD0 chunk 池 + LOD1~3 总槽位 {total} 超出图集容量 {capacity}",
+    );
+    assert!(lod0_slots <= 0x7FFFF, "LOD0 局部下标必须装进 worklist 的 19 位");
   }
 }

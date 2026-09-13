@@ -82,6 +82,14 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
   bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
 
+  // ---- DDGI LOD0 的 chunk 探针段分配集（内容驱动）----
+  // 判定见 `lod0_needed_chunks`：只有「有几何」或「几何贴着 chunk 边界（16 体素内）」的 chunk
+  // 才领一段固定 4096 槽的 LOD0 探针段，空 chunk 不占 LOD0 槽位。相机移动不参与 —— 与
+  // `DdgiWorldAabb` 一样只依赖世界内容，保证「移动不闪」。
+  let ddgi_lod0_chunks = gate_render::ddgi::DdgiLod0Chunks {
+    chunks: lod0_needed_chunks(&grid),
+  };
+
   // P2.6：轨道相机为唯一相机状态源；DdaCameraConfig 由 from_orbit 生成
   // （初始机位：场景中心俯视；诊断：GATE_CAM=sky → 仰视天空，纯 miss 验证 GPU 负载）
   let orbit = if std::env::var("GATE_CAM").as_deref() == Ok("sky") {
@@ -95,6 +103,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   commands.insert_resource(orbit);
   // DDGI 四级网格锚定世界 AABB：相机移动时原点不变 → 不存在换主、不存在移动闪。
   commands.insert_resource(ddgi_world_aabb);
+  // LOD0 的 chunk 探针段分配集（内容驱动，见 `lod0_needed_chunks`）。
+  commands.insert_resource(ddgi_lod0_chunks);
   commands.insert_resource(DdaCameraConfig::from_orbit(
     &orbit,
     FOV_Y,
@@ -162,6 +172,65 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     max_bytes_per_frame: 4 * 1024 * 1024,
     incremental: true,
   });
+}
+
+/// DDGI LOD0 需要探针段的 chunk 集合（chunk 坐标 = 世界 voxel / 256）。
+///
+/// 规则（内容驱动，见 `gate_render::ddgi::DdgiLod0Chunks`）：
+///   ① 自己有几何的 chunk 领一段；
+///   ② 几何**贴着 chunk 边界**（面/棱/角，16 体素以内，即最外一层 16³ brick 非空）时，
+///      对应的相邻 chunk 也要领一段 —— 否则贴着该边界的采样者，其 8 个插值角里落在邻 chunk
+///      的那 4 个会凭空缺席，chunk 边界上会留下可见接缝。
+/// 判定只扫 chunk 最外一层的 16³ brick（`ChunkTree::get_brick_state` level 2），
+/// 每 chunk 最多 1352 次查询 —— 整个 nuke.vox 约 11 万次，启动期可忽略。
+fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
+  use std::collections::HashSet;
+  use gate_voxel::BrickState;
+  // 每轴 16 个 16³ brick（256 / 16）；边界层 = 坐标 0 或 15
+  const BRICKS: i32 = 16;
+  let axis_offsets = |b: i32| -> [i32; 2] {
+    if b == 0 {
+      [-1, 0]
+    } else if b == BRICKS - 1 {
+      [1, 0]
+    } else {
+      [0, 0]
+    }
+  };
+  let mut needed: HashSet<IVec3> = HashSet::new();
+  for c in grid.chunk_coords() {
+    let Some(tree) = grid.chunk(c) else { continue };
+    if tree.is_empty() {
+      continue;
+    }
+    needed.insert(c.0);
+    for bx in 0..BRICKS {
+      for by in 0..BRICKS {
+        for bz in 0..BRICKS {
+          if bx != 0 && bx != BRICKS - 1 && by != 0 && by != BRICKS - 1 && bz != 0 && bz != BRICKS - 1
+          {
+            continue;
+          }
+          if tree.get_brick_state(bx * 16, by * 16, bz * 16, 2) == BrickState::Air {
+            continue;
+          }
+          for dx in axis_offsets(bx) {
+            for dy in axis_offsets(by) {
+              for dz in axis_offsets(bz) {
+                if dx == 0 && dy == 0 && dz == 0 {
+                  continue;
+                }
+                needed.insert(c.0 + IVec3::new(dx, dy, dz));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  let mut out: Vec<IVec3> = needed.into_iter().collect();
+  out.sort_unstable_by_key(|c| (c.x, c.y, c.z));
+  out
 }
 
 /// demo 调色板（PaletteEntry._pad 私有 → 跨 crate 用 default + 逐字段赋值）

@@ -1653,6 +1653,11 @@ struct DdgiLod {
   origin: vec4<i32>,
   dims: vec4<u32>,
 };
+// LOD0 的 chunk 段编址（见 DdgiUniform.chunk）
+struct DdgiChunk {
+  origin: vec4<i32>,
+  dims: vec4<u32>,
+};
 struct DdgiUniform {
   lods: array<DdgiLod, 4>,
   // x=帧计数, y=调试模式(0..4), z=GI 增益, w=借针半径（0=关，见 ddgi_find_neighbor_probe）
@@ -1663,6 +1668,10 @@ struct DdgiUniform {
   // 脏区（世界 voxel AABB）：dirty_min.xyz = min、w = 1 表示有效；dirty_max.xyz = max（不含）
   dirty_min: vec4<f32>,
   dirty_max: vec4<f32>,
+  // LOD0 的 chunk 段编址（**只被 lod==0 读**；LOD1~3 走上面的 lods 世界网格）：
+  //   origin.xyz = chunk 网格原点（chunk 坐标），origin.w = 每 chunk 每轴 cell 数（16）
+  //   dims.xyz   = chunk 网格维度，dims.w = LOD0 已分配槽数（探针池高水位）
+  chunk: DdgiChunk,
 };
 @group(4) @binding(0) var<uniform> ddgi_u: DdgiUniform;
 // 图集**采样侧**（cast 回读 GI、着色 ddgi_sample 用）。写入侧在 @group(5)：
@@ -1685,11 +1694,15 @@ struct DdgiUniform {
 @group(4) @binding(8) var<storage, read_write> ddgi_cell_id: array<vec4<i32>>;
 // 9：阶段二 cast 输出的射线样本：每样本 2 个 vec4 = (方向.xyz, 命中距离) / (辐亮度.xyz, 1)
 @group(4) @binding(9) var<storage, read_write> ddgi_samples: array<vec4<f32>>;
-/// cell → slot 间接表（Step 1）：表长 = Σ 各级 dims 乘积，索引 = **绝对 slot 下标**（即
+/// cell → slot 间接表（Step 1）：表长 = Σ 各级槽数，索引 = **绝对 slot 下标**（即
 /// `ddgi_slot` 在 identity 下的返回值）。identity 状态与"没有这张表"逐位等价。
 /// 用途：允许"本格放不出满足净距的探针"的 cell 指向**邻近 cell 的探针** —— 这样 Douglas 的
 /// "探针必须离表面有距离"（否则半张深度/辐照度图都浪费在贴着的那一小片表面上）与"每个采样点
 /// 都有 8 个可用角"就不再互斥（我们两次单独调净距都失败的根因就在这里）。
+///
+/// 【尾部还打包了 LOD0 的两张 chunk 表】BG4 的 storage binding 已用满 8 个（WGSL 下限），
+/// 不再新增 binding：`[total_slots, +num_chunks)` = chunk_base，之后到 `+lod0_slots`
+/// = slot_chunk。偏移由 `misc.y` 与 chunk 维度算出，见 `ddgi_chunk_base_off`/`ddgi_slot_chunk_off`。
 @group(4) @binding(10) var<storage, read_write> ddgi_cell_slot: array<u32>;
 
 // ===== @group(5)：collect 的图集写入侧（只被 ddgi_collect 使用）=====
@@ -1799,22 +1812,86 @@ fn ddgi_lod_cell_size(lod: u32) -> i32 {
   return ddgi_u.lods[lod].origin.w;
 }
 fn ddgi_lod_count(lod: u32) -> u32 {
+  // LOD0 的槽数是**探针池高水位**（chunk 段之和），不等于空间盒 dims 乘积 —— 后者仍是
+  // 级联包含/混合带用的空间盒。LOD1~3 仍是规则网格 → 等于 dims 乘积。
+  if (lod == 0u) { return ddgi_u.chunk.dims.w; }
   let d = ddgi_u.lods[lod].dims;
   return d.x * d.y * d.z;
 }
 fn ddgi_lod_slot_base(lod: u32) -> u32 {
   return ddgi_u.lods[lod].dims.w;
 }
-// ---- 世界锚定的槽位映射 ----
-// 槽位残差 = 世界 cell 号对网格维度取正模；槽位下标 = slot_base + 线性(残差)。
-// 关键性质：**「槽位 ↔ 世界 cell」的身份与相机无关**。相机滚动只会让「新进入窗口的那条带」
-// 换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份 → 图集不再因为相机移动而
-// 整体失效。改之前槽位是「相对相机窗口的格号」，滚一格就把整级所有槽位的世界 cell 全换掉
-// → 整级图集变成旧位置的读数 → 深度判定成片失败（大片红）+ 下一帧重写（大片绿）= 动态闪烁。
+// ---- LOD0 的 chunk 段编址 ----
+// 【与 LOD1~3 的边界】LOD0 **只**用下面这套 chunk 公式；lod>=1 一律走「世界锚定的环面映射」
+// （见 ddgi_slot_own 的后半段）。两套编址互不干扰，唯一交汇点是槽位段顺序：
+//   [0, lod0_slots) 属 LOD0（池分配），之后依次是 LOD1/2/3 的规则网格段。
+//
+// cell_slot buffer 尾部打包了两张 LOD0 表（见 Rust `DdgiGpu::cell_slot`）：
+//   [total_slots, +num_chunks)               chunk_base：chunk 线性下标 → 段基址
+//   [total_slots+num_chunks, +lod0_slots)    slot_chunk：LOD0 局部槽 → chunk 线性下标
+fn ddgi_chunk_axis() -> i32 { return ddgi_u.chunk.origin.w; }
+fn ddgi_chunk_count() -> u32 {
+  let d = ddgi_u.chunk.dims.xyz;
+  return d.x * d.y * d.z;
+}
+fn ddgi_chunk_base_off() -> u32 { return u32(ddgi_u.misc.y); }
+fn ddgi_slot_chunk_off() -> u32 { return u32(ddgi_u.misc.y) + ddgi_chunk_count(); }
+/// 向下取整除法（WGSL 的 `/` 对 i32 是**截断**，负数会算错 → chunk 坐标必须用它）
+fn ddgi_floor_div(a: i32, b: i32) -> i32 {
+  return select(a / b, (a - b + 1) / b, a < 0);
+}
+fn ddgi_rem_pos(v: i32, a: i32) -> i32 { return v - ddgi_floor_div(v, a) * a; }
+/// 世界 cell → chunk 在 chunk 网格内的坐标（可为越界值，调用方须过 ddgi_chunk_in_grid）
+fn ddgi_wc_to_chunk(wc: vec3<i32>) -> vec3<i32> {
+  let a = ddgi_chunk_axis();
+  let o = ddgi_u.chunk.origin.xyz;
+  return vec3<i32>(
+    ddgi_floor_div(wc.x, a) - o.x,
+    ddgi_floor_div(wc.y, a) - o.y,
+    ddgi_floor_div(wc.z, a) - o.z,
+  );
+}
+fn ddgi_chunk_linear(cc: vec3<i32>) -> u32 {
+  let d = ddgi_u.chunk.dims.xyz;
+  return u32(cc.x) + u32(cc.y) * d.x + u32(cc.z) * d.x * d.y;
+}
+fn ddgi_chunk_in_grid(cc: vec3<i32>) -> bool {
+  let d = vec3<i32>(ddgi_u.chunk.dims.xyz);
+  return all(cc >= vec3<i32>(0)) && all(cc < d);
+}
+/// chunk 的 LOD0 段基址（`DDGI_NO_PROBE` = 该 chunk 没领段）
+fn ddgi_chunk_base_of(cc: vec3<i32>) -> u32 {
+  return ddgi_cell_slot[ddgi_chunk_base_off() + ddgi_chunk_linear(cc)];
+}
+/// LOD0 局部 cell 线性下标（chunk 内，x + y*axis + z*axis²）
+fn ddgi_lod0_local_linear(wc: vec3<i32>) -> u32 {
+  let a = ddgi_chunk_axis();
+  let lx = u32(ddgi_rem_pos(wc.x, a));
+  let ly = u32(ddgi_rem_pos(wc.y, a));
+  let lz = u32(ddgi_rem_pos(wc.z, a));
+  let ua = u32(a);
+  return lx + ly * ua + lz * ua * ua;
+}
+
+// ---- 槽位映射（按 lod 分派：lod==0 → chunk 局部；lod>=1 → 世界锚定环面）----
+// 世界锚定的关键性质：**「槽位 ↔ 世界 cell」的身份与相机无关**。相机滚动只会让「新进入窗口的
+// 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份 → 图集不再因为相机
+// 移动而整体失效。LOD0 的 chunk 锚定同理：段基址与相机无关，探针世界位置 = chunk 原点 +
+// 局部 cell 中心 —— 也是世界固定。
 /// **纯算术**槽位（不经 cell→slot 间接表）。凡是要读「某个世界 cell **自己** 的烘焙记录」
 /// 的地方（判定邻接占用、粗级继承细级探针位置）都必须用它 —— 间接表表达的是
 /// "采样这个 cell 时该去哪读探针"，不是"这个 cell 的记录在哪"；走间接表会读到邻居的记录。
+///
+/// ⚠️ lod==0 且该 chunk 没领段 / 越界时返回 0（不是一个有意义的槽位）：调用方**必须**
+/// 先用 `ddgi_cell_in_window` 过滤。返回 0 只保证不越界读。
 fn ddgi_slot_own(lod: u32, wc: vec3<i32>) -> u32 {
+  if (lod == 0u) {
+    let cc = ddgi_wc_to_chunk(wc);
+    if (!ddgi_chunk_in_grid(cc)) { return 0u; }
+    let base = ddgi_chunk_base_of(cc);
+    if (base == DDGI_NO_PROBE) { return 0u; }
+    return base + ddgi_lod0_local_linear(wc);
+  }
   let d = ddgi_u.lods[lod].dims.xyz;
   let di = vec3<i32>(d);
   let r = ((wc % di) + di) % di;
@@ -1825,23 +1902,57 @@ fn ddgi_slot(lod: u32, wc: vec3<i32>) -> u32 {
   // 与"直接返回 own"逐位等价 —— 所以建立这条通路本身不改画面，是 Step 1 的第 1 小步。
   return ddgi_cell_slot[ddgi_slot_own(lod, wc)];
 }
-/// 窗口原点（cell 单位）。origin.xyz 已按 cs 对齐，故整除精确。
+/// 窗口原点（cell 单位）。origin.xyz 已按 cs 对齐，故整除精确。（LOD0 的编址原点在
+/// `ddgi_u.chunk`，不在这里；本函数只服务 lod>=1 与 LOD0 的**空间盒**包含判定。）
 fn ddgi_origin_cell(lod: u32) -> vec3<i32> {
   return ddgi_u.lods[lod].origin.xyz / ddgi_u.lods[lod].origin.w;
 }
-/// 槽位在本级内的下标 → 该槽位**当前**覆盖的世界 cell（环面映射的逆）
+/// 槽位在本级内的下标 → 该槽位**当前**覆盖的世界 cell
 fn ddgi_slot_world_cell(lod: u32, idx: u32) -> vec3<i32> {
+  if (lod == 0u) {
+    // LOD0：反查表给出该槽所属 chunk，再解 chunk 内局部 cell。
+    // （槽位池没有空洞时 idx∈[0,lod0_slots) 全部有主；有空洞时这里是"指向 chunk 0"的
+    //   无效解 —— 但空洞槽位不会被任何 cell 的 ddgi_slot_own 引用，bake 对其多写一次无害。）
+    let cl = ddgi_cell_slot[ddgi_slot_chunk_off() + idx];
+    let base = ddgi_cell_slot[ddgi_chunk_base_off() + cl];
+    let l = idx - base;
+    let a = u32(ddgi_chunk_axis());
+    let lc = vec3<i32>(i32(l % a), i32((l / a) % a), i32(l / (a * a)));
+    let d = ddgi_u.chunk.dims.xyz;
+    let cc = vec3<i32>(i32(cl % d.x), i32((cl / d.x) % d.y), i32(cl / (d.x * d.y)));
+    return (ddgi_u.chunk.origin.xyz + cc) * ddgi_chunk_axis() + lc;
+  }
   let di = vec3<i32>(ddgi_u.lods[lod].dims.xyz);
   let o = ddgi_origin_cell(lod);
   let r = vec3<i32>(ddgi_slot_cell(lod, idx));
   return o + ((r - o) % di + di) % di;
 }
-/// 世界 cell 是否在本级窗口内
+/// 世界 cell 是否在本级**可编址**窗口内。LOD0 = 该 cell 所属 chunk **领了段**（内容驱动：
+/// 空 chunk 的 cell 没有探针，采样侧必须把它们当"窗口外"剔除，否则会读到槽位 0 的数据）。
 fn ddgi_cell_in_window(lod: u32, wc: vec3<i32>) -> bool {
+  if (lod == 0u) {
+    // LOD0 = **旧 LOD0 空间窗口（世界 AABB 对齐的规则盒）∩ 该 cell 所属 chunk 已领段**。
+    // 加上空间盒这一半是为了与改造前**逐格一致**：chunk 锚定后编址域被 256 对齐放大，若只判
+    // "chunk 已领段"，AABB 之外那一圈（落在已领段 chunk 的 padding 里）会被当成窗口内 →
+    // 比旧实现多出几个角 → 采样结果在 AABB 边界上会变。加上空间盒后"只会少、不会多"。
+    let c = wc - ddgi_origin_cell(0u);
+    if (!(all(c >= vec3<i32>(0)) && all(c < vec3<i32>(ddgi_u.lods[0].dims.xyz)))) { return false; }
+    let cc = ddgi_wc_to_chunk(wc);
+    if (!ddgi_chunk_in_grid(cc)) { return false; }
+    return ddgi_chunk_base_of(cc) != DDGI_NO_PROBE;
+  }
   let c = wc - ddgi_origin_cell(lod);
   return all(c >= vec3<i32>(0)) && all(c < vec3<i32>(ddgi_u.lods[lod].dims.xyz));
 }
+/// 槽位在本级内的下标 → 局部 cell 坐标（chunk 内 0..axis / 网格内 0..dims）
 fn ddgi_slot_cell(lod: u32, idx: u32) -> vec3<u32> {
+  if (lod == 0u) {
+    let cl = ddgi_cell_slot[ddgi_slot_chunk_off() + idx];
+    let base = ddgi_cell_slot[ddgi_chunk_base_off() + cl];
+    let l = idx - base;
+    let a = u32(ddgi_chunk_axis());
+    return vec3<u32>(l % a, (l / a) % a, l / (a * a));
+  }
   let d = ddgi_u.lods[lod].dims;
   return vec3<u32>(idx % d.x, (idx / d.x) % d.y, idx / (d.x * d.y));
 }
@@ -2036,6 +2147,9 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
           // 位置必须与细级**同一帧**自洽，否则相机滚动时粗级会继承到"上一个世界 cell 的
           // 探针位置"（可能落在实体内部）→ 粗级边界跳变/锯齿。bake 已拆成 per-LOD 的 4 个
           // pass（细→粗），pass 边界就是内存屏障，这里读到的正是本帧细级刚算出的结果。
+          // 细级该 cell 必须**可编址**：LOD0 下 = 它所属 chunk 已领段（未领段时 ddgi_slot_own
+          // 返回 0；下面的 cell_id 比对虽也能过滤掉，但显式挡掉更清晰，避免读无关槽位）。
+          if (!ddgi_cell_in_window(flod, fwc)) { continue; }
           let fslot = ddgi_slot_own(flod, fwc);
           // 该槽位必须**当前确实覆盖 fwc**（细级窗口外 / 环面绕到别的世界 cell → 跳过），
           // 且本帧 bake 已写过它（cell_id.w != 0）。
@@ -2167,6 +2281,34 @@ fn ddgi_find_neighbor_probe(slot: u32) -> u32 {
   // 历史 bug：这里曾用 `lods[0].dims` 统一反解（当时各级 dims 恒等 32×16×32），改成按世界算之后
   // LOD1/2/3 的局部坐标与 base 全算错 → 借针表指向错误槽位 → **采样读到空探针 → 成片黑块**。
   let my_lod = ddgi_slot_lod_of(slot);
+  if (my_lod == 0u) {
+    // LOD0 是 chunk 段编址：**槽位线性邻域不再是空间邻域**（跨 chunk 会跳到别的段）→
+    // 改在**世界 cell** 空间里搜：候选 cell 必须落在「已领段」的 chunk 内（`ddgi_cell_in_window`
+    // 已含此判定），再取它自己的槽位。不跨 chunk 环绕 —— 环绕在 chunk 编址下没有意义，
+    // 而且旧环绕只在网格边界才生效，±2 邻域内两者结果一致。
+    let wc = ddgi_slot_world_cell(0u, slot);
+    var best0 = slot;
+    var best0_d2 = 1e30;
+    for (var k: i32 = -r; k <= r; k = k + 1) {
+      for (var j: i32 = -r; j <= r; j = j + 1) {
+        for (var i: i32 = -r; i <= r; i = i + 1) {
+          if (i == 0 && j == 0 && k == 0) { continue; }
+          let nwc = wc + vec3<i32>(i, j, k);
+          if (!ddgi_cell_in_window(0u, nwc)) { continue; }
+          let nb = ddgi_slot_own(0u, nwc);
+          if (nb == slot) { continue; }
+          // 同 LOD1~3：判"邻域有没有探针"读 bake 的输出（ddgi_cell 的 ENABLED 位），不读 meta。
+          if ((ddgi_cell[nb] & DDGI_REC_ENABLED) == 0u) { continue; }
+          let d2 = f32(i * i + j * j + k * k);
+          if (d2 < best0_d2) {
+            best0_d2 = d2;
+            best0 = nb;
+          }
+        }
+      }
+    }
+    return best0;
+  }
   let d = ddgi_u.lods[my_lod].dims.xyz;
   let base = ddgi_u.lods[my_lod].dims.w;
   let dim_xy = d.x * d.y;
@@ -2669,6 +2811,8 @@ fn ddgi_sample_lod(
   let fr = wc_f - floor(wc_f);
   let o_cell = ddgi_origin_cell(lod);
   let di = vec3<i32>(L.dims.xyz);
+  // 退化 clamp 的域就是本级空间盒（LOD0 的下面的 cell_in_window 还会再叠"chunk 已领段"
+  // 的判定 → clamp 落到空 chunk 的 cell 会被剔除，退回更粗一级）。
   var total = vec3<f32>(0.0);
   var wsum = 0.0;
   // 覆盖度：只累加「有可用数据」的角（见下面的分界注释）。与 wsum 的区别是本函数的核心 ——
@@ -2680,6 +2824,12 @@ fn ddgi_sample_lod(
         var wc = wc0 + vec3<i32>(ix, iy, iz);
         if (clamp_cells) {
           wc = clamp(wc, o_cell, o_cell + di - vec3<i32>(1));
+          // LOD0：clamp 到的 cell 可能落在**没领段**的 chunk（空 chunk）→ 与"窗口外"同样剔除。
+          // LOD1~3 的 clamp 域就是规则网格，此判定恒真，不改变原行为。
+          if (!ddgi_cell_in_window(lod, wc)) {
+            ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u;
+            continue;
+          }
         } else if (!ddgi_cell_in_window(lod, wc)) {
           ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u;
           continue;
@@ -3127,11 +3277,37 @@ fn ddgi_irr_nbr(id: u32, tx: u32, ty: u32) -> vec4<f32> {
 fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
   let dims = ddgi_u.lods[lod].dims.xyz;
   let base = ddgi_lod_slot_base(lod);
-  let cell = ddgi_slot_cell(lod, pidx);
   let cs = f32(ddgi_u.lods[lod].origin.w);
   let self_pos = ddgi_slot_pos[base + pidx].xyz;
   var acc = vec3<f32>(0.0);
   var wacc = 0.0;
+  if (lod == 0u) {
+    // LOD0 是 chunk 段编址：**槽位线性邻居不再是空间邻居**（跨 chunk 会跳到别的段）→
+    // 改在世界 cell 空间里取 6 个面邻居。邻居集与 LOD1~3 的 stride 版完全对应（同为 ±1 cell），
+    // 只是跨 chunk 时用 `ddgi_slot_own` 现算槽位。
+    let wc = ddgi_slot_world_cell(0u, pidx);
+    for (var a = 0u; a < 6u; a = a + 1u) {
+      var off = vec3<i32>(1, 0, 0);
+      if (a == 1u) { off = vec3<i32>(-1, 0, 0); }
+      else if (a == 2u) { off = vec3<i32>(0, 1, 0); }
+      else if (a == 3u) { off = vec3<i32>(0, -1, 0); }
+      else if (a == 4u) { off = vec3<i32>(0, 0, 1); }
+      else if (a == 5u) { off = vec3<i32>(0, 0, -1); }
+      let nwc = wc + off;
+      if (!ddgi_cell_in_window(0u, nwc)) { continue; }
+      let nslot = ddgi_slot_own(0u, nwc);
+      if (nslot == base + pidx) { continue; }
+      if ((ddgi_meta[nslot] & DDGI_META_ENABLED) == 0u) { continue; }
+      let v = ddgi_irr_nbr(nslot, tx, ty);
+      if (v.w < DDGI_TEXEL_MIN_COVERAGE) { continue; }
+      let npos = ddgi_slot_pos[nslot].xyz;
+      let w = max(0.0, 1.0 - length(npos - self_pos) / (cs * 2.0));
+      acc = acc + v.xyz * w;
+      wacc = wacc + w;
+    }
+    return vec4<f32>(acc, wacc);
+  }
+  let cell = ddgi_slot_cell(lod, pidx);
   for (var a = 0u; a < 3u; a = a + 1u) {
     let stride = select(select(1u, dims.x, a == 1u), dims.x * dims.y, a == 2u);
     let extent = select(select(dims.x, dims.y, a == 1u), dims.z, a == 2u);
