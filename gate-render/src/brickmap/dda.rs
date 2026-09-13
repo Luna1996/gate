@@ -2254,6 +2254,84 @@ mod dda_ref_tests {
       cmp(&format!("rand{ray}"), origin, dir, 4096.0);
     }
   }
+
+  /// 世界查询统一接口等价性：薄墙（1 体素厚）/ 薄板 / 凹角（L 形交角）/ 掠射
+  /// （|dir·面法线| ≈ 0）这几类几何是「epsilon / 起点偏置 / 层次遍历」最易分歧、
+  /// 也最易漏光的形态 —— 专门锁 tree 遍历 vs 暴力逐体素参考的一致性。
+  /// 不改动既有断言期望值，仅新增场景。
+  #[test]
+  fn world_query_equivalence_thin_concave_grazing() {
+    let mut g = VolumeGrid::new();
+    // 薄墙：x=64 单层（1 体素厚）
+    fill_box(&mut g, IVec3::new(64, 0, 0), IVec3::new(1, 128, 128), 1);
+    // 薄板：y=32 单层
+    fill_box(&mut g, IVec3::new(0, 32, 0), IVec3::new(128, 1, 128), 2);
+    // 凹角：两片薄墙交于 (x=100, z=100) 棱
+    fill_box(&mut g, IVec3::new(100, 0, 100), IVec3::new(1, 64, 64), 3);
+    fill_box(&mut g, IVec3::new(100, 0, 100), IVec3::new(64, 64, 1), 4);
+    // 悬空薄板（y 非 4³ 对齐，压 4³ 边缘碎裂）
+    fill_box(&mut g, IVec3::new(-64, 17, -64), IVec3::new(96, 2, 96), 5);
+    let bufs = BrickMapBuilder::build_full(&g).buffers().clone();
+
+    let cmp = |tag: &str, o: Vec3, d: Vec3, t_max: f32| {
+      let full = cpu_reference_dda_ray(&bufs, o, d, t_max, 4_000_000);
+      let tree = cpu_reference_dda_ray_tree(&bufs, o, d, t_max);
+      match (full, tree) {
+        (Some((tf, pf)), Some(h)) => {
+          assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?}");
+          assert!(
+            (tf - h.t).abs() <= 1.0,
+            "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}",
+            h.t
+          );
+          let n = face_normal_from_index(h.face_id);
+          assert!(
+            n.dot(d) < 0.001,
+            "[{tag}] face normal {n:?} not against dir {d:?} (face_id={})",
+            h.face_id
+          );
+        }
+        (None, None) => {}
+        (f, t) => panic!("[{tag}] hit mismatch o={o:?} d={d:?}\n  full={f:?}\n  tree={t:?}"),
+      }
+    };
+
+    // 掠射 / 贴面 / 穿薄层：命中面法线与射线几乎垂直
+    let grazing: [(Vec3, Vec3); 8] = [
+      (Vec3::new(63.5, 40.0, 40.0), Vec3::new(-1.0, 0.0, 0.001)),
+      (Vec3::new(40.0, 32.5, 40.0), Vec3::new(0.001, -1.0, 0.0)),
+      (Vec3::new(150.0, 40.0, 100.5), Vec3::new(-1.0, 0.0, 0.0005)),
+      (Vec3::new(64.5, 200.0, 64.0), Vec3::new(0.0, -1.0, 0.0)),
+      (Vec3::new(40.0, 200.0, 40.0), Vec3::new(0.0, -1.0, 0.0)),
+      (Vec3::new(130.0, 30.0, 130.0), Vec3::new(-1.0, 0.0, -1.0)),
+      (Vec3::new(64.0, 64.0, -100.0), Vec3::new(0.0, 0.0, 1.0)),
+      (Vec3::new(0.0, 33.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+    ];
+    for (i, (o, d)) in grazing.iter().enumerate() {
+      cmp(&format!("graze{i}"), *o, d.normalize(), 8192.0);
+    }
+
+    // 随机射线：球壳起点覆盖负区 / 薄板 / 凹角
+    let mut state: u64 = 0xC0FFEE_0000_0007;
+    for ray in 0..400 {
+      let r = 8.0 + frand(&mut state) * 320.0;
+      let theta = frand(&mut state) * std::f32::consts::TAU;
+      let phi = (frand(&mut state) * 2.0 - 1.0).acos();
+      let origin = Vec3::new(
+        r * phi.sin() * theta.cos(),
+        r * phi.cos() + 32.0,
+        r * phi.sin() * theta.sin(),
+      ) + Vec3::new(32.0, 0.0, 32.0);
+      let dtheta = frand(&mut state) * std::f32::consts::TAU;
+      let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
+      let dir = Vec3::new(
+        dphi.sin() * dtheta.cos(),
+        dphi.cos(),
+        dphi.sin() * dtheta.sin(),
+      );
+      cmp(&format!("rand{ray}"), origin, dir, 2048.0);
+    }
+  }
 }
 
 // ============================================================================

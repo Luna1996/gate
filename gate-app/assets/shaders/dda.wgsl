@@ -470,7 +470,7 @@ fn ddgi_leaf16(g: Grid, cmin: vec3<i32>, center: vec3<f32>) -> vec4<f32> {
       for (var j = 0; j < 4; j = j + 1) {
         for (var i = 0; i < 4; i = i + 1) {
           let v = par + vec3<i32>(i, j, k);
-          if (sample_brickmap(g, v) == 0u) {
+          if (!world_solid(g, v)) {
             let p = vec3<f32>(v) + 0.5;
             let d2 = dot(p - center, p - center);
             if (d2 < best_d2) { best_d2 = d2; best_p = p; found = 1.0; }
@@ -1114,7 +1114,7 @@ fn light_field_gather(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> vec3<f32
 
 // 着色法线 = **逐体素（隐式）法线**：命中体素 6 邻域占据差分的负梯度；退化时退回面法线。
 //
-// 向外 = 占据度的负梯度，占据度用 `sample_brickmap != 0`（air/palette 0 = 非占据）。
+// 向外 = 占据度的负梯度，占据度用 `world_solid`（palette 0 = 非占据）。
 // 效果：球/柱/斜面这类体素化曲面按 26 邻域方向的平滑法线着色（不再是一格一格的平面），
 // 而薄板仍是面法线 —— 两边的极端都各得其所。
 //
@@ -1126,7 +1126,7 @@ fn light_field_gather(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> vec3<f32
 // 被 DDGI 的 wn 闸门剔光（Probe 品红、整面全黑），地板则一半探针被误用（漏光/发暗），太阳
 // 直光也按 +X 计算。**那次失败的是"退化回退"，不是隐式法线本身** —— 所以这次按面法线退。
 //
-// 代价：每像素 6 次 sample_brickmap（一次 chunk 定位 + 最多 4 层树下钻）。
+// 代价：每像素 6 次 world_solid（一次 chunk 定位 + 最多 4 层树下钻）。
 fn voxel_normal(g: Grid, voxel: vec3<i32>, face_n: vec3<f32>) -> vec3<f32> {
   let x = vec3<i32>(1, 0, 0);
   let y = vec3<i32>(0, 1, 0);
@@ -1134,9 +1134,9 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_n: vec3<f32>) -> vec3<f32> {
   // 占据度差分（- 侧减 + 侧）：实心一侧计数更大 → 差分**直接指向空气侧 = 向外法线**
   // （例：+X 面朝空气 → -X 是实心、+X 是空气 → d.x = 1-0 = +1 ✓）
   let d = vec3<f32>(
-    f32(sample_brickmap(g, voxel - x) != 0u) - f32(sample_brickmap(g, voxel + x) != 0u),
-    f32(sample_brickmap(g, voxel - y) != 0u) - f32(sample_brickmap(g, voxel + y) != 0u),
-    f32(sample_brickmap(g, voxel - z) != 0u) - f32(sample_brickmap(g, voxel + z) != 0u),
+    f32(world_solid(g, voxel - x)) - f32(world_solid(g, voxel + x)),
+    f32(world_solid(g, voxel - y)) - f32(world_solid(g, voxel + y)),
+    f32(world_solid(g, voxel - z)) - f32(world_solid(g, voxel + z)),
   );
   let len = length(d);
   // 退化（薄板/实心内部）→ 退回面法线；否则归一到 26 邻域方向之一
@@ -1151,10 +1151,9 @@ struct SceneHit {
 
 // 主世界先跑 + 逐物体收缩 t_cap 取最近命中（beam 预 pass 与 dda_main 主射线共用）。
 // 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
-fn trace_scene(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
+// g0 = 主世界网格（由 world_raycast 统一入口提供，避免重复读 grid_descs）。
+fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
   var best_t = 1e+30;
-  // P1：g0 只构造一次（旧代码 make_grid(0u) 调两次 = 144B GridDesc 双读）
-  let g0 = make_grid(0u);
   var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap), 0u);
   if (best.uh.hit) {
     best_t = best.uh.t;
@@ -1171,6 +1170,71 @@ fn trace_scene(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_
     }
   }
   return best;
+}
+
+// ============================================================================
+// 世界查询统一接口（唯一入口）—— 2026-09-13 抽取，纯结构重构（渲染结果逐像素不变）
+//
+// 【为什么要有它】本文件曾并存多套「世界里有没有实体 / 射线是否穿过世界」的实现：
+//   ① 主可见性 trace_scene→trace_grid→trace_chunk 的体素/brickmap DDA；
+//   ② DDGI 探针投线 ddgi_cast（原先直接调 trace_scene）；
+//   ③ 逐角几何遮挡（原先自带一套粗层预算 DDA + 硬距离/步数上限，现统一到完整层次 DDA，
+//      与主 trace 同一套遍历 —— 见「逐角几何遮挡参数」常量处的说明）；
+//   ④ 探针放置的占用查询（ddgi_brick_state / ddgi_cell_state_sized / ddgi_leaf16）。
+// 它们读同一份 brickmap 数据，但起点/终点偏置、epsilon、步进规则、「实体」判定各自为政，
+// 是漏光类问题反复出现的工程根因。现在**所有世界求值只走下面两个入口**；
+// 以后新增调用者必须走这里，禁止再写私有遍历。
+//
+//   world_solid(g, voxel) -> bool                      单点占据（1³ 体素）：palette != 0 即实体
+//   world_raycast(g0, origin, dir, max_t, cfg) -> WorldHit   世界求交（射线 / 线段）
+//
+// 【块级占用】ddgi_brick_state / ddgi_cell_state_sized 是 4³/16³/64³ 的**聚合**块查询
+// （0=全空 / 1=全实 / 2=混合），其 1³ 语义与 world_solid 同源（都是 palette != 0）。
+// 探针放置的「子块是否全空」正是它们的应用；它们已收口于同一份树，无需第二实现。
+// ============================================================================
+
+/// 单点占据：grid 局部体素坐标 voxel 处是否实体（palette != 0）。
+/// 与探针放置的「全空/全满」判定**同一语义**；是所有点查询的唯一入口
+/// （voxel_normal 6 邻域、ddgi_place_probe 的 1³ 空叶兜底）。
+fn world_solid(g: Grid, voxel: vec3<i32>) -> bool {
+  return sample_brickmap(g, voxel) != 0u;
+}
+
+/// 世界求交配置：用**显式字段**覆盖各调用者合理的差异，绝不让每处各写一份遍历。
+/// 现在只有**完整层次 DDA**（trace_scene：主世界 + 逐物体；返回精确 t/normal/voxel/palette）：
+///   · t_min：起点沿 dir 跳过的距离（beam 预 pass / 逐角遮挡起点偏置用）；
+///   · depth_cap：树深度上限（3 = 全深度，即不限制）。
+struct WorldRayQuery {
+  t_min: f32,
+  depth_cap: u32,
+}
+
+/// 完整层次 DDA 的配置构造。
+fn world_cfg_full(t_min: f32, depth_cap: u32) -> WorldRayQuery {
+  return WorldRayQuery(t_min, depth_cap);
+}
+
+/// 世界求交结果（完整层次 DDA，字段皆有定义）。
+struct WorldHit {
+  hit: bool,
+  t: f32,               // 命中距离（ro 系绝对 t）；未命中 = 0
+  point: vec3<f32>,     // 命中点 = origin + dir*t
+  pal: u32,
+  n: vec3<f32>,         // 世界空间法线
+  face_id: u32,         // 命中面 0..5
+  voxel: vec3<i32>,     // grid 局部命中体素
+  obj_id: i32,          // -1 = 主世界，>=0 = 物体
+  palette_base: u32,    // 命中 volume 的 palette 基址
+}
+
+/// 世界求交**唯一入口**。g0 = 主世界网格（make_grid(0u)），trace_scene 在其基础上追加逐物体网格。
+/// trace_scene→trace_grid→trace_chunk 自带 65536 步防挂死安全网；超限返回 miss（= 保守判可见），
+/// 正常射线（含逐角遮挡的 cell 对角线线段）远不会触发。
+fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: WorldRayQuery) -> WorldHit {
+  let s = trace_scene(g0, origin, dir, max_t, cfg.t_min, cfg.depth_cap);
+  return WorldHit(
+    s.uh.hit, s.uh.t, origin + dir * s.uh.t, s.uh.pal, s.uh.n,
+    s.uh.face_id, s.uh.voxel, s.uh.obj_id, s.palette_base);
 }
 
 // 线性 → sRGB 转换
@@ -1225,11 +1289,11 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let t_cap_beam = min(t_cap, d_beam);
 
   // depth_cap=3：八叉树全深度（不限制深度，只限制行进距离 t_cap_beam）
-  let h = trace_scene(origin, dir, t_cap_beam, 0.0, 3u);
+  let h = world_raycast(make_grid(0u), origin, dir, t_cap_beam, world_cfg_full(0.0, 3u));
   // miss 存 t_cap_beam（非 t_cap）：3×3 邻域全 miss 时主射线起点 ≤ d_beam，
   // d_beam 之外的几何由主射线完整 trace。旧 bug 存 t_cap（frustum 全长）时，
   // 全 miss 邻域把主射线起点推到 frustum 末端 → 整条射线假 miss（场景丢失）。
-  let t = select(t_cap_beam, h.uh.t, h.uh.hit);
+  let t = select(t_cap_beam, h.t, h.hit);
   textureStore(beam_depth, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(t, 0.0, 0.0, 0.0));
 }
 
@@ -1282,18 +1346,18 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 命中 → 薄壁/剪影穿墙。d_beam 之外 t_min ≤ d_beam < 首命中 t，本就安全。
     t_min = max(t_min - BEAM_BACKOFF, 0.0);
   }
-  let best = trace_scene(origin_voxel, dir_voxel, frustum_length, t_min, 3u);
+  let best = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length, world_cfg_full(t_min, 3u));
   var col = sky_rgb();
-  if (best.uh.hit) {
+  if (best.hit) {
     // ---- 逐体素着色（Douglas #22/#23：一体素一色）+ 逐体素法线 ----
     // albedo/采样点/阴影射线体素锚定（同体素同色）；法线取**隐式逐体素法线**（退化退面法线，
     // 见 voxel_normal 注释）—— 它同时决定太阳 N·L、阴影射线/GI 采样点的外推方向、DDGI 方向采样。
-    let alb = palette_albedo(best.palette_base, best.uh.pal);
+    let alb = palette_albedo(best.palette_base, best.pal);
     // 体素中心 → 世界系（主世界 identity 直等于体素中心；物体经旋转/缩放变换）
-    let gg = make_grid(u32(best.uh.obj_id) + 1u);
-    let vc = vec3<f32>(best.uh.voxel) + vec3<f32>(0.5);
+    let gg = make_grid(u32(best.obj_id) + 1u);
+    let vc = vec3<f32>(best.voxel) + vec3<f32>(0.5);
     let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
-    let n = voxel_normal(gg, best.uh.voxel, best.uh.n);
+    let n = voxel_normal(gg, best.voxel, best.n);
     // 沿 n 的外推距离：**必须保证离开命中体素**。轴向法线时 0.5+eps 就够，但逐体素法线在
     // 棱边/圆角处是斜的，0.5·n 的分量 < 0.5 → 起点仍在体素内 → DDA 先命中所属体素的邻居
     // （厚墙的棱边被自己遮住 → 每条棱一圈暗边）。0.5/max|n| 正是「从中心沿 n 走多远离开
@@ -1309,12 +1373,12 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = 0.0;
     if (ndl > 0.0) {
-      let sh = trace_scene(p_voxel + n * n_off, sun_dir, 8192.0, 0.0, 3u);
+      let sh = world_raycast(make_grid(0u), p_voxel + n * n_off, sun_dir, 8192.0, world_cfg_full(0.0, 3u));
       sun = select(
         1.0,
         0.0,
-        sh.uh.hit
-          && !(all(sh.uh.voxel == best.uh.voxel) && sh.uh.obj_id == best.uh.obj_id),
+        sh.hit
+          && !(all(sh.voxel == best.voxel) && sh.obj_id == best.obj_id),
       );
     }
     let sky = light_u.sky_color.xyz;
@@ -1337,7 +1401,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 就整片跳变**。这正是"光影斑点 + 暗部骤变"的主因。
     //
     // 常量天光没有任何遮挡信息（凹角与开阔面一样亮），AO 正是为它准备的 —— 所以只留这一项。
-    let ao = light_field_ao(p_voxel, best.uh.obj_id);
+    let ao = light_field_ao(p_voxel, best.obj_id);
     // 天光常量在两种情形下兜底：① 本像素不在任何级联盒内（ddgi_dbg_dom==0，无探针覆盖）；
     // ② 在级联内但**采样不可信/无数据**（见下）。级联内数据可信时一律由 GI 提供 ——
     // 无光室内的探针辐照度≈0 → 画面接近全黑；若无条件加常量，室内外就没有亮度差。
@@ -1377,7 +1441,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let amb = mix(amb_far, amb_sky, t_edge) * (1.0 - conf);
     col = alb * (sun_c * ndl * sun + amb * ao + gi);
     // 自发光体素：radiance 直出（不吃方向、不吃阴影）——「每个体素都能是光源」的着色侧。
-    col = col + alb * palette_emissive(best.palette_base, best.uh.pal) * DDGI_EMIT_GAIN;
+    col = col + alb * palette_emissive(best.palette_base, best.pal) * DDGI_EMIT_GAIN;
     if (ddgi_u.params.y > 0.5) {
       if (ddgi_u.params.y < 1.5) {
         col = alb * sky * DDGI_SKY_AMBIENT * 0.15 + alb * gi * 8.0;
@@ -1413,11 +1477,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         //   品红 = 法线背向闸门（wn <= 0）
         //   红   = depth 遮挡闸门（wd <= 0）
         //   灰   = 角越界（clamp 路径不会出现）
-        //   天蓝 = 末级**背向兜底**成功（8 角全在表面背面 → 允许 |wn| 参与平均，见 ddgi_sample）
         // 旧版在这里对 dom<0.5 直接涂蓝，把这份直方图整个短路掉了。
-        if (ddgi_dbg_fb > 3.5) {
-          col = vec3<f32>(0.25, 0.6, 1.0);
-        } else if (ddgi_dbg_fb > 2.5) {
+        if (ddgi_dbg_fb > 2.5) {
           col = vec3<f32>(0.98, 0.98, 0.35);
         } else if (ddgi_dbg_fb > 1.5) {
           col = vec3<f32>(0.55, 0.95, 0.35);
@@ -1554,6 +1615,38 @@ const DDGI_NORMAL_BIAS: f32 = 1.0;
 /// 必须随间距缩放：固定的 0.7 体素（1.4cm）相对 LOD0 的 64cm cell 等于贴在表面上，
 /// 会让前后判定落在临界值上、整面被判「探针在背面」。
 const DDGI_BIAS_CELLS: f32 = 0.1;
+// ============================================================================
+// 逐角几何遮挡（真·线段求交）参数 —— 见 ddgi_sample_lod 调用点。
+//
+// 【为什么需要它】现有的两个可见性量都是**代理量**：
+//   · wn 只看法线点积（纯方向，完全不知道探针与采样点之间隔着什么）；
+//   · wd 是 Chebyshev，用**探针自己那张深度图**近似——它检验的是"探针沿该方向的最近
+//     表面"，而不是"探针→采样点这条线段本身"（薄墙/掠射方向在深度图里分辨率不够）。
+//   于是隔着墙/楼板/薄板的探针：wn>0 且 wd≈1，两道闸门都放行 → 高权重漏光（墙体接缝、
+//   天花板与墙的交界处亮线）。这里补一层**线段求交**，把这类探针的权重直接置 0。
+//
+// 【为什么不设距离上限、也不设固定步数预算】遮挡线段就是「采样点所在 cell 的 8 个角 →
+//   采样点」，长度 ≤ 一个 cell 对角线 = cs·√3（cs=16/32/64/128 → 28/55/111/222 体素）。
+//   旧实现走 4 体素粗层线性步进 + 固定 48 体素可达(=12 步) + 超限**保守判可见**：LOD1/2/3
+//   的对角线 55/111/222 全部 > 48 ⇒ 线段一开始就被判可见，粗级 LOD 的逐角遮挡**等于没做**
+//   （这就是远处/粗级漏光更明显的原因）。现在遮挡改走 `world_raycast` 的完整层次 DDA
+//   （与主可见性 trace_scene 同一套 trace_grid→trace_chunk 遍历、同一 palette!=0 实体判定）：
+//   线段多长就精确走到多长，故不需要距离上限；层次 DDA 从当前格逐级下钻，cell 对角线线段只需
+//   少量迭代，故也不需要固定步数上限。真挂死由 trace_chunk 自带的 65536 步安全网兜底
+//   （超限返回 miss = 保守判可见，正常线段远不会触发）。
+//   【薄墙一致性】同一套遍历/同一实体语义 ⇒ 遮挡对贴接收面的薄墙的判定与主 trace **逐字一致**，
+//   不会像粗层格那样整块跳过而漏掉薄墙。
+//
+/// 线段终点偏置（体素）：从 `max_t = 线段长` 里扣除，停在采样点前。采样点已沿法线外推过
+/// （dda_main 的 n_off ≥ 0.5 再叠 ddgi_sample_lod 的 DDGI_BIAS_CELLS·cs ≥ 1.6 体素@LOD0），
+/// 留 1 体素既不会擦到接收面自身，也不会吃掉贴在接收面上的那面薄墙（穿墙点比终点早 ≥1.6 体素）。
+const DDGI_OCCL_END_BIAS: f32 = 1.0;
+/// 逐角遮挡的**权重阈值 ε**（**丢弃**语义）：角最终权重 `w = wtri·wn_w·wd < ε` ⇒ 把该角
+/// 当作 0 **直接丢弃**（跳过遮挡求交、不计入 total/wsum）。误差被 ε 死死界定（最坏只是少
+/// 贡献一点弱光），**结构上不可能漏光**。这与旧门槛相反（旧写法"权重低 ⇒ 不测，但权重照旧
+/// 保留"✗：跳过的角仍以原权重参与平均 → 等于绕过几何遮挡 → 接缝/薄墙弱权重角照样漏光）。
+/// A/B 档：0（= 无条件检测全部 8 角，正确但 +1.2ms）/ 0.005（默认）/ 0.01 / 0.02。
+const DDGI_OCCL_W_MIN: f32 = 0.005;
 const DDGI_T_MAX: f32 = 8192.0;
 /// 级联混合带宽度（以**当前级** cell 边长为单位）：像素距某个 LOD 盒边界的距离小于
 /// `cs × 此值` 时，在该级与相邻级之间过渡，消除「跨过盒边界突然换一套光照」的硬边
@@ -2536,7 +2629,19 @@ fn ddgi_irr_fetch(id: u32, tx: i32, ty: i32) -> vec4<f32> {
 /// 返回 vec4(辐照度.xyz, 覆盖度)。**覆盖度** = 该纹素被 collect 写过的程度（每写一次向 1
 /// 靠拢）。采样侧用它区分"探针真的活过"与"探针从未被投线" —— 见 `ddgi_sample_lod` 里
 /// 「深度没有记录 = 没有遮挡物」那段：只有活着的探针才允许在深度纹素为 0 时按无遮挡处理。
-fn ddgi_irr_sample(id: u32, d: vec3<f32>) -> vec4<f32> {
+/// 八面体双线性采样的「与探针无关」那一半：4 个纹素坐标 + 两个轴的插值权重。
+/// `ddgi_sample_lod` 的 8 角循环里**采样方向 `n` 是循环不变量**（只有 slot 随角变），
+/// 故这半边（含 `ddgi_oct_encode` 的除法与分支、floor、clamp）提到循环外算一次即可。
+/// 与原来逐角各算一遍是**同一批表达式的同一次求值**，数值逐位不变。
+struct DdgiIrrTaps {
+  x0: i32,
+  y0: i32,
+  x1: i32,
+  y1: i32,
+  fx: vec4<f32>,
+  fy: vec4<f32>,
+}
+fn ddgi_irr_taps(d: vec3<f32>) -> DdgiIrrTaps {
   let s = f32(DDGI_IRR_TEXELS);
   let e = ddgi_oct_encode(d) * 0.5 + vec2<f32>(0.5);
   let g2 = e * s - vec2<f32>(0.5);
@@ -2547,17 +2652,22 @@ fn ddgi_irr_sample(id: u32, d: vec3<f32>) -> vec4<f32> {
   // **相邻探针**的纹素 0（45° 宽的一个八面体楔形，插值权重可达 0.5）——
   // 于是整个楔形方向取到的是别人的辐照度，在表面上表现为**跟着探针投影走的大三角锯齿**。
   let tmax = i32(DDGI_IRR_TEXELS) - 1;
-  let x0 = clamp(i32(g0.x), 0, tmax);
-  let y0 = clamp(i32(g0.y), 0, tmax);
-  let x1 = clamp(i32(g0.x) + 1, 0, tmax);
-  let y1 = clamp(i32(g0.y) + 1, 0, tmax);
-  let c00 = ddgi_irr_fetch(id, x0, y0);
-  let c10 = ddgi_irr_fetch(id, x1, y0);
-  let c01 = ddgi_irr_fetch(id, x0, y1);
-  let c11 = ddgi_irr_fetch(id, x1, y1);
-  let fx = vec4<f32>(vec3<f32>(f.x), f.x);
-  let fy = vec4<f32>(vec3<f32>(f.y), f.y);
-  return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+  return DdgiIrrTaps(
+    clamp(i32(g0.x), 0, tmax),
+    clamp(i32(g0.y), 0, tmax),
+    clamp(i32(g0.x) + 1, 0, tmax),
+    clamp(i32(g0.y) + 1, 0, tmax),
+    vec4<f32>(vec3<f32>(f.x), f.x),
+    vec4<f32>(vec3<f32>(f.y), f.y),
+  );
+}
+/// 用已算好的纹素坐标/权重对探针 `id` 取 4 个纹素做双线性。权重与 tap 顺序与改造前一致。
+fn ddgi_irr_sample(id: u32, t: DdgiIrrTaps) -> vec4<f32> {
+  let c00 = ddgi_irr_fetch(id, t.x0, t.y0);
+  let c10 = ddgi_irr_fetch(id, t.x1, t.y0);
+  let c01 = ddgi_irr_fetch(id, t.x0, t.y1);
+  let c11 = ddgi_irr_fetch(id, t.x1, t.y1);
+  return mix(mix(c00, c10, t.fx), mix(c01, c11, t.fx), t.fy);
 }
 fn ddgi_depth_fetch(id: u32, x: i32, y: i32) -> vec2<f32> {
   let c = ddgi_depth_coord(id, u32(x), u32(y));
@@ -2620,6 +2730,7 @@ fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
   let hi_f = lo_f + vec3<f32>(Lo.dims.xyz) * f32(Lo.origin.w);
   return !(all(p >= lo_f) && all(p < hi_f));
 }
+
 // clamp_cells = true：把越界的世界 cell 号 clamp 进本级窗口（级联之外的退化采样）。
 // 级联只覆盖相机周围有限体积；越界时若直接判空，相机上方/远方的表面会整片无 GI。
 // clamp 之后用最靠近的可用探针给一个粗粒度估计 —— 空间上仍随位置变化，只是精度粗。
@@ -2631,10 +2742,19 @@ fn ddgi_sample_lod(
   lod: u32,
   clamp_cells: bool,
   relax_normal: bool,
-  allow_backface: bool,
 ) -> vec4<f32> {
   let L = ddgi_u.lods[lod];
   let cs = f32(L.origin.w);
+  // 主世界网格（逐角几何遮挡用 trace 数据源）。本函数可能被级联混合/兜底调用多次，
+  // 在此构造一次即可复用给全部 8 个角，避免每个角各读一次 grid_descs。
+  let gw = make_grid(0u);
+  // 逐角几何遮挡配置（world_raycast 完整层次 DDA，与主可见性 trace_scene 同一套遍历）。
+  // t_min = 0：从探针位置本身起测。探针放置规则（取 cell 内最大空子区域、探针放在该空区
+  // 中心）保证探针必位于空区，因此 t > 0 处任何一次命中都是**真遮挡**，不需要起点偏置；
+  // 原先的 START_BIAS=0.5 体素起步跳过会漏掉紧贴探针的薄墙（1~2 体素厚）⇒ 该角被误判为
+  // 「可见」⇒ 墙上出现零星方块状漏光。
+  // max_t 在调用点按「线段长 − END_BIAS」传入，不设距离上限。
+  let occl_cfg = world_cfg_full(0.0, 3u);
   // 探针的**标称位置在 cell 中心**（bake 取 center = cmin + cs*0.5；中心是实心时才搬到
   // 最近空叶），所以相邻两个探针位于 (c+0.5)·cs 与 (c+1.5)·cs —— 三线性插值必须在这两者
   // 之间做，即先把 cell 坐标**平移半格**再 floor。
@@ -2653,19 +2773,29 @@ fn ddgi_sample_lod(
   let fr = wc_f - floor(wc_f);
   let o_cell = ddgi_origin_cell(lod);
   let di = vec3<i32>(L.dims.xyz);
+  // clamp 的上界（含端点）= o_cell + di - 1：只依赖 lod，是 8 角循环的不变量 → 提到循环外。
+  // （原式 `o_cell + di - vec3<i32>(1)` 逐角重算；两式整数运算逐位等价。）
+  let wc_hi = o_cell + di - vec3<i32>(1);
+  // 辐照度采样的方向 = 循环不变量 n（只有 slot 随角变）→ 八面体纹素坐标/权重循环外算一次。
+  let irr_taps = ddgi_irr_taps(n);
   // 退化 clamp 的域就是本级空间盒（LOD0 的下面的 cell_in_window 还会再叠"chunk 已领段"
   // 的判定 → clamp 落到空 chunk 的 cell 会被剔除，退回更粗一级）。
   var total = vec3<f32>(0.0);
   var wsum = 0.0;
   // 覆盖度：只累加「有可用数据」的角（见下面的分界注释）。与 wsum 的区别是本函数的核心 ——
   var cov = 0.0;
+  // 含**背向角**的覆盖度（名义权重和，同样不含 wn/wd 闸门）。背向角现在一律剔除、不进 cov，
+  // 但已删除的「末级背向兜底（r3）」那次调用在开关=0 时会把背向角也计入它末尾覆写的
+  // ddgi_dbg_cov。为了让删 r3 后的 ddgi_dbg_cov 与当时逐像素一致，这里单独记下，由
+  // ddgi_sample 在 r3 原位补回（见那里的说明）。
+  var cov_all = 0.0;
   ddgi_dbg_rej = vec4<u32>(0u, 0u, 0u, 0u);
   for (var iz = 0; iz < 2; iz = iz + 1) {
     for (var iy = 0; iy < 2; iy = iy + 1) {
       for (var ix = 0; ix < 2; ix = ix + 1) {
         var wc = wc0 + vec3<i32>(ix, iy, iz);
         if (clamp_cells) {
-          wc = clamp(wc, o_cell, o_cell + di - vec3<i32>(1));
+          wc = clamp(wc, o_cell, wc_hi);
           // LOD0：clamp 到的 cell 可能落在**没领段**的 chunk（空 chunk）→ 与"窗口外"同样剔除。
           // LOD1~3 的 clamp 域就是规则网格，此判定恒真，不改变原行为。
           if (!ddgi_cell_in_window(lod, wc)) {
@@ -2733,7 +2863,7 @@ fn ddgi_sample_lod(
         let dtex = ddgi_depth_sample(slot, dir);
         // 本点方向的辐照度（.w = 该纹素的**覆盖度**：被 collect 写过就 →1）。提前取，用于下面
         // 判断"探针到底活没活"。
-        let irr4 = ddgi_irr_sample(slot, n);
+        let irr4 = ddgi_irr_sample(slot, irr_taps);
         // 【深度"没有记录" = 没有遮挡物，不是"没有数据"】
         // 深度图集是**逐纹素轮换**写入的：每个探针每帧只写 rpp 个纹素（rpp 还可以低到 1），
         // 所以启动后几十帧里绝大部分纹素仍是 0。旧版把"纹素是 0"直接当成"无数据"剔除该角 →
@@ -2750,7 +2880,7 @@ fn ddgi_sample_lod(
         }
         // 注意：**cov 不在这里累加** —— 还要先过下面的背向闸门，见那里的说明。
         // ============ 往下是「数据是否可用」判定 + 照明决策 ============
-        // 背向探针闸门：**两条路径一律剔除**（含放宽路径）。放宽（wn 下限 0.25）是为薄几何的
+        // 背向探针闸门：**所有路径一律剔除**（含放宽路径）。放宽（wn 下限 0.25）是为薄几何的
         // **掠射**探针准备的（探针在表面侧方，dot ≈ 0），不是为**背向**探针（探针在表面背后）。
         //
         // 【为什么必须先用未 clamp 的 dot 判定】`clamp(dot, 0, 1)` 把 dot≈0（掠射）与 dot<0
@@ -2758,18 +2888,15 @@ fn ddgi_sample_lod(
         // 箱体内部的探针辐照度 ≈0（那里本来无光 —— 例如这个大圆柱是个罐体，背面就是罐内），
         // 一旦入选就把像素压成**暗斑**；哪几个角入选又随 cell 邻域摆动 → 斑块跟着晶格走、
         // 随相机跳变。这正是「GI 模式里也有暗斑」的来源。
+        // 【背向兜底（原 r3）已删除】不再有任何路径允许背向角参与加权平均。
         let wn_raw = dot(n, -dir) / DDGI_NORMAL_BIAS;
-        var wn = clamp(wn_raw, 0.0, 1.0);
         if (wn_raw <= 0.0) {
-          // `allow_backface` 只在**末级兜底**里为真 —— 见 ddgi_sample 里那次调用的说明。
-          // 关键：即使允许背向，**wd（Chebyshev 遮挡）闸门照旧生效**（见下），所以真正隔着
-          // 一堵墙的探针仍会被挡掉；被放进来的只有"离表面几格、中间无遮挡物"的近邻探针。
-          if (!allow_backface) {
-            ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u;
-            continue;
-          }
-          wn = clamp(-wn_raw, 0.0, 1.0);
+          ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u;
+          // 背向角只计入「含背向角」的覆盖度（复刻删 r3 前开关=0 的 ddgi_dbg_cov），不进 cov。
+          cov_all = cov_all + wtri;
+          continue;
         }
+        let wn = clamp(wn_raw, 0.0, 1.0);
         // 到这里 = 本角数据**对本点可用**（探针在正面 + 该方向有深度记录）→ 计入覆盖度。
         // 【为什么 wn 要排除、wd 不用】wn ≤ 0 = 探针落在表面**背面**，它的数据对本点无效，
         // 属于「没有可用数据」→ 必须让 cov 反映出来：否则 8 角全在背面时 cov 依然满 →
@@ -2777,6 +2904,7 @@ fn ddgi_sample_lod(
         // 而 wd（被墙挡住）是"本点本来就该暗"的**正确结果**，不是数据缺失 → 仍算有数据；
         // 早期用 wsum 当置信度正是把 wd 也误判成"没数据"，凹角被补天光 → 室内漏光。
         cov = cov + wtri;
+        cov_all = cov_all + wtri;
         let wn_w = select(wn, max(wn, 0.25), relax_normal);
         // ---- 遮挡：Chebyshev 软判定（对齐 Majercik / RTXGI）----
         // 旧版是 `clamp((dtex-dist)/bias+1)` + `<=0 剔除` 的**刀锋**判定：dtex 抖一点，
@@ -2822,7 +2950,38 @@ fn ddgi_sample_lod(
         //
         // "这个方向有没有被采样过"由**深度纹素**负责，但"没有记录"只表示**没有遮挡物**
         // （只有探针本身也是死的才剔除，见上面的覆盖度判定）。真的暗方向本来就该以 ~0 参与平均。
+        //
+        // ================= 权重阈值：弱权重角直接**丢弃** =================
+        // 角的最终权重 w = wtri * wn_w * wd（本计算**不依赖**下面的遮挡求交结果，故先算）。
+        // w < ε ⇒ 把该角当作 0 **丢弃**：跳过遮挡检测、不计入 total/wsum。
+        // 【正确语义 / 为什么结构上不可能漏光】误差被 ε 死死界定 —— 最坏只是少贡献一点弱光。
+        // 注意"丢弃"必须与"不检测"一致：旧门槛的写法是"权重低 ⇒ 不测，但权重**照旧保留**"✗，
+        // 那样跳过的角仍以原权重参与 total/wsum 平均 → 等于绕过几何遮挡 → 墙体接缝/薄墙处
+        // 的弱权重角照样漏光（这就是旧门槛漏光的根因）。这里"不测 == 不贡献" ✓。
         let w = wtri * wn_w * wd;
+        if (w < DDGI_OCCL_W_MIN) { continue; }
+        // ---- 追加：逐角几何遮挡（真·线段可见性）----
+        // wn/wd 都是代理量（见 DDGI_OCCL_* 常量顶注）→ 这里对**每个角**再补一次
+        // 「探针→采样点」线段求交。命中实体 ⇒ 该角权重直接置 0：既不进 total，也不算进
+        // wsum（wsum 归一化 → 它就是 wsum 调试图看到的那套权重，用户据此验收）。
+        // 【cov 已在上面累加、与本判定无关】被 ε 丢弃的角仍算「有数据」（cov 在 wn 闸门之后、
+        // 本权重判定之前累加）→ 不改变 conf/天光兜底，远场亮度/灰度与无条件版一致。
+        // 只有通过 ε 阈值的**存活角**才做求交 —— 强权重角才是漏光主因，弱角已由 ε 界定。
+        // 求交走完整层次 DDA：max_t = 线段长（无距离上限），薄墙判定与主 trace
+        // 一致；超 65536 步安全网才回退保守可见（正常线段远不会触发）。
+        // 线段 = ps - probe，与上面的 `to` 是**同一个表达式**（probe / ps 都是不可变 let，其间无改写）
+        // → 直接复用 `to` / `dist`（dist = length(to) = length(seg)），省一次 vec3 相减与一次 length。
+        // `to / dist` 与原来的 `seg / seg_len` 是同一批操作数的同一次求值 → 逐位相同（注：不是 dir，
+        // dir 的分母是 max(dist,1e-4)，在 dist<1e-4 的退化情形与这里刻意不同，保持原样）。
+        // dist == 0（探针与采样点重合的退化情形）无方向可言 → 跳过求交、权重不变（防除零）。
+        // 背向角与 w < ε 的弱权重角已在上面 `continue` 剔除 → 走到这里的角 wn_w > 0 且 w ≥ ε。
+        if (dist > 0.0) {
+          // END_BIAS 从 max_t 扣除：停在采样点前，既不自相交也不吃掉贴接收面的薄墙。
+          if (world_raycast(gw, probe, to / dist, dist - DDGI_OCCL_END_BIAS, occl_cfg).hit) {
+            ddgi_dbg_rej.z = ddgi_dbg_rej.z + 1u;
+            continue;
+          }
+        }
         total = total + irr * w;
         wsum = wsum + w;
       }
@@ -2836,12 +2995,17 @@ fn ddgi_sample_lod(
   // 覆盖度单独带出（返回值只有 4 个分量，且 .w 已被 wsum 占用）—— 着色侧用它决定
   // "要不要退回常量天光"，见 ddgi_dbg_cov 声明处与 ddgi_sample_lod 的分界注释。
   ddgi_dbg_cov = cov;
+  ddgi_dbg_cov_all = cov_all;
   return vec4<f32>(select(vec3<f32>(0.0), total / wsum, ok), wsum);
 }
 var<private> ddgi_dbg_wsum: f32;
 // 「有可用数据的角」的名义权重覆盖度（Σ wtri，**不含** wn/wd 两道照明闸门）。
 // 它是天光常量兜底的唯一判据 —— 见 ddgi_sample_lod 里 cov 的注释。
 var<private> ddgi_dbg_cov: f32;
+// 同上，但**把背向角也计入**。背向角现在一律剔除、不进 ddgi_dbg_cov；此量仅用于在
+// ddgi_sample 的「末级背向兜底（原 r3）」原位复刻删 r3 前开关=0 覆写过的 ddgi_dbg_cov，
+// 保证逐像素一致（见 ddgi_sample 壳内分支与 ddgi_sample_lod 的 cov_all 说明）。
+var<private> ddgi_dbg_cov_all: f32;
 // 0 = 没有任何 LOD 盒包含该像素；lod+1 = 该像素落在这一级的「壳」内。
 // 语义是**纯几何包含**，不被采样成功与否影响（旧版在 fallback 里把它清零，导致
 // 「越界」和「壳内但无数据」在 Domain 模式里都是绿色，无法区分）。
@@ -2884,7 +3048,7 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
     // ① 外侧：p 在 LOD(lod-1) 盒外（距离为正）且落在混合带内
     let d = -ddgi_box_edge_dist(lod - 1u, p);
     if (d >= 0.0 && d < W) {
-      let rf = ddgi_sample_lod(p, n, lod - 1u, true, false, false);
+      let rf = ddgi_sample_lod(p, n, lod - 1u, true, false);
       if (rf.w >= 1e-4) {
         out = mix(main_c, rf.xyz, 0.5 * (1.0 - d / W));
       }
@@ -2894,7 +3058,7 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
     // ② 内侧：p 在 LOD(lod) 盒内（距离为正）且靠近其外边界
     let d = ddgi_box_edge_dist(lod, p);
     if (d >= 0.0 && d < W) {
-      let rc = ddgi_sample_lod(p, n, lod + 1u, false, false, false);
+      let rc = ddgi_sample_lod(p, n, lod + 1u, false, false);
       if (rc.w >= 1e-4) {
         out = mix(main_c, rc.xyz, 0.5 * (1.0 - d / W));
       }
@@ -2923,7 +3087,7 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     if (ddgi_lod_contains(lod, p)) {
       in_cascade = true;
       shell_lod = lod;
-      let r = ddgi_sample_lod(p, n, lod, false, false, false);
+      let r = ddgi_sample_lod(p, n, lod, false, false);
       ddgi_dbg_rej_out = ddgi_dbg_rej;
       ddgi_dbg_wsum = r.w;
       ddgi_dbg_dom = f32(lod) + 1.0;
@@ -2947,26 +3111,22 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       //     路径下都被剔除 —— 它们是墙后/箱体内部的探针（辐照度≈0），拉进来会把像素压成
       //     「跟着 cell 晶格走、随相机跳变」的暗斑（见 ddgi_sample_lod 的闸门注释）。
       let rej_shell = ddgi_dbg_rej; // 诊断用：保留未放宽时的剔除统计
-      let r2 = ddgi_sample_lod(p, n, lod, false, true, false);
+      let r2 = ddgi_sample_lod(p, n, lod, false, true);
       if (r2.w >= 1e-4) {
         ddgi_dbg_wsum = r2.w;
         ddgi_dbg_fb = 3.0; // 3 = 同级放宽 wn 后成功（Probe 档亮黄）
         return ddgi_cascade_blend(p, n, lod, r2.xyz);
       }
-      // ---- 末级兜底：8 个角**全在表面背面**（Probe 档的大片品红）----
-      // 唯一合理的解释是这一级的探针被放到了几何的**另一侧**：`ddgi_place_probe` 取"离 cell
-      // 中心最近的空子块"，而薄板地面/薄壳的子块在表面两侧**大小与距离都对称** → 平局按
-      // 迭代序（低 z/y/x 优先）打破，于是约一半的 cell 把探针放到了背面；粗级又靠
-      // down-sample 继承同一位置 → **四级一起错** → 硬剔后一个角都不剩 → 整片纯黑
-      // （与实测「大片品红 + 纯黑 + 边界跟着 cell 对齐走」完全吻合）。
-      // 近旁几格（≤ 一个 cell）的探针光照是有效近似，且 wd（Chebyshev 遮挡）闸门照旧生效
-      // ——真正隔墙的探针会被它挡掉 —— 所以这里允许背向参与平均，把"黑"换回"近似的光"。
-      let r3 = ddgi_sample_lod(p, n, lod, false, false, true);
-      if (r3.w >= 1e-4) {
-        ddgi_dbg_wsum = r3.w;
-        ddgi_dbg_fb = 4.0; // 4 = 背向兜底成功（Probe 档天蓝）
-        return ddgi_cascade_blend(p, n, lod, r3.xyz);
-      }
+      // ---- 末级背向兜底（原 r3）已删除 ----
+      // 原代码在此再调一次 ddgi_sample_lod(..., allow_backface=true)，把「探针在表面背面」的角
+      // 也按 |wn| 放进加权平均，只为避免「8 角全背向 → 整片纯黑」。背向探针对漫反射半球本不该
+      // 贡献辐照度，现改为**所有路径一律剔除**（见 ddgi_sample_lod 的背向闸门）→ 这里直接落到
+      // 下面的「逐级退粗」兜底。
+      // 【与删 r3 前「开关=0」逐像素一致】那次调用在开关=0 时背向角权重恒 0、wsum 必然 < 1e-4，
+      // 返回值被丢弃；但它末尾的 `ddgi_dbg_cov = cov` 会把**背向角**也算进覆盖度。若不复刻，
+      // 这些像素的 cov 会少掉背向角那一份 → conf 变小 → 天光兜底变多（远场发灰）。最近一次调用
+      // （上面的 r2）同时算出的 cov_all 正是当时的覆写值，补回它。
+      ddgi_dbg_cov = ddgi_dbg_cov_all;
       ddgi_dbg_rej = rej_shell;
       // 嵌套级联下 p 至多落在一级的壳内，无需继续向上试
       break;
@@ -2987,7 +3147,7 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   //   ② 壳外（!in_cascade）：越界 cell 必须 clamp 到最粗一级窗口才取得到数据，并放宽 wn。
   let relax_normal = !in_cascade;
   for (var lod = start; lod < DDGI_LOD_COUNT; lod = lod + 1u) {
-    let r = ddgi_sample_lod(p, n, lod, true, relax_normal, false);
+    let r = ddgi_sample_lod(p, n, lod, true, relax_normal);
     if (r.w >= 1e-4) {
       if (!in_cascade) {
         // 不在任何壳内：退化结果与剔除统计都归它
@@ -3064,20 +3224,20 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
   let jit = ddgi_rand2(ddgi_ray_rand(ddgi_lod_slot_base(lod) + cell_idx, frame, ray));
   let te = ((vec2<f32>(f32(ttx), f32(tty)) + jit) / f32(ndim)) * 2.0 - vec2<f32>(1.0);
   let dir = ddgi_oct_decode(te);
-  let sh = trace_scene(probe_pos + dir * DDGI_RAY_BIAS, dir, DDGI_T_MAX, 0.0, 3u);
+  let sh = world_raycast(make_grid(0u), probe_pos + dir * DDGI_RAY_BIAS, dir, DDGI_T_MAX, world_cfg_full(0.0, 3u));
   var radiance = sky_rgb();
   var dist = DDGI_T_MAX;
-  if (sh.uh.hit) {
-    dist = sh.uh.t;
-    let alb = palette_albedo(sh.palette_base, sh.uh.pal);
+  if (sh.hit) {
+    dist = sh.t;
+    let alb = palette_albedo(sh.palette_base, sh.pal);
     let hit_p = probe_pos + dir * dist;
     // 与 dda_main 同一套逐体素法线（退化退面法线）：反弹辐照度的方向必须与着色侧一致，
-    // 否则曲面上的间接光会与直射/环境光"对不上"。代价是每条 GI 射线 6 次 sample_brickmap
+    // 否则曲面上的间接光会与直射/环境光"对不上"。代价是每条 GI 射线 6 次 world_solid
     // （射线数 ≈ 屏幕像素数的 1/7，可接受）。
     let n = voxel_normal(
-      make_grid(u32(sh.uh.obj_id) + 1u),
-      sh.uh.voxel,
-      sh.uh.n,
+      make_grid(u32(sh.obj_id) + 1u),
+      sh.voxel,
+      sh.n,
     );
     // 入射辐照度 E → 出射辐亮度 L = albedo·E/π（与着色侧 col += albedo·E/π 同约定）。
     // 加一项 albedo·sky·CAST_FLOOR 作下限，避免首帧 GI 全 0 时反馈回路死锁在 0；
@@ -3086,7 +3246,7 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 命中发光体素 → 出射辐亮度含**自身发射**（直出，不吃 GI/入射）：这是"体素即光源"
     // 往 GI 里注入光的关键接法（Douglas：命中体素取它的 lit color，发光体素的 lit color 含 emission）。
     radiance = alb * (gi / DDGI_PI + sky_rgb() * DDGI_CAST_FLOOR)
-      + alb * palette_emissive(sh.palette_base, sh.uh.pal) * DDGI_EMIT_GAIN;
+      + alb * palette_emissive(sh.palette_base, sh.pal) * DDGI_EMIT_GAIN;
   }
   // 样本下标 = 全局射线编号（tid 本身就是「该 LOD 起始射线号 + 本探针号×rpp + 射线号」）
   let si = tid * 2u;
@@ -3375,8 +3535,8 @@ fn probe_viz_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let to_probe = pos.xyz - view_u.cam_pos_voxel.xyz;
   let dist = length(to_probe);
-  let hit = trace_scene(view_u.cam_pos_voxel.xyz, to_probe / dist, dist, 0.0, 3u);
-  if (hit.uh.hit && hit.uh.t < dist - 0.5) {
+  let hit = world_raycast(make_grid(0u), view_u.cam_pos_voxel.xyz, to_probe / dist, dist, world_cfg_full(0.0, 3u));
+  if (hit.hit && hit.t < dist - 0.5) {
     return;
   }
   let dims = vec2<f32>(textureDimensions(out_tex));
