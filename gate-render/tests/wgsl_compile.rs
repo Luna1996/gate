@@ -62,3 +62,51 @@ fn ddgi_texels_match_rust_consts() {
     assert!(src.contains(&expect), "dda.wgsl 中未找到 `{expect}`");
   }
 }
+
+/// DDGI **图集布局**也在两处独立声明：Rust 决定纹理尺寸与「槽位 → 层」的映射，WGSL 决定
+/// 采样时的 layer 内寻址（`ddgi_probe_in_layer`）。两者不一致 → 写进图集的探针**读不回来**，
+/// 症状是**按网格边界切开的大面积无 GI**，且没有任何编译/运行时报错。
+/// 已踩过一次：Rust 改成 40 而 WGSL 还是 16 → 大部分探针读到空白。此测试把它挡在 CI。
+#[test]
+fn ddgi_atlas_layout_matches_rust_consts() {
+  let path = manifest_dir().join("../gate-app/assets/shaders/dda.wgsl");
+  let src = std::fs::read_to_string(&path).expect("读 dda.wgsl");
+  let axis = gate_render::ddgi::DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
+  let expect = format!("const DDGI_PROBES_PER_LAYER_AXIS: u32 = {axis}u;");
+  assert!(src.contains(&expect), "dda.wgsl 中未找到 `{expect}`");
+  // 每层探针数必须**派生**自 AXIS（写死的 256=16² 正是那次错位的另一半原因）
+  let derived =
+    "const DDGI_PROBES_PER_LAYER: u32 = DDGI_PROBES_PER_LAYER_AXIS * DDGI_PROBES_PER_LAYER_AXIS;";
+  assert!(
+    src.contains(derived),
+    "dda.wgsl 的 DDGI_PROBES_PER_LAYER 应是派生式，未找到 `{derived}`"
+  );
+}
+
+/// worklist `.w` 里 cell 下标的位宽必须装得下**图集容量**。
+///
+/// 该下标是「本级内的线性 cell 下标」，上限 = 该级 cell 数 ≤ 总槽位 ≤ 图集容量
+/// （`DDGI_ATLAS_LAYERS × AXIS²`）。曾经只用 16 位：dims 改成按世界 AABB 算之后 LOD0 有
+/// 342576 个 cell，下标在 collect 侧被 `& 0xFFFF` 截断 → `atlas_slot` 折回低 65536 个槽位
+/// → 一部分探针的图集被远处探针反复覆写、其余恒空 → **部分区域正常、部分区域全黑**，
+/// 而**没有任何编译/运行时报错**。此测试把它挡在 CI。
+#[test]
+fn ddgi_worklist_pack_covers_atlas_capacity() {
+  let path = manifest_dir().join("../gate-app/assets/shaders/dda.wgsl");
+  let src = std::fs::read_to_string(&path).expect("读 dda.wgsl");
+  const MASK: u32 = 0x7FFFF; // 19 位；必须与 dda.wgsl 的 DDGI_WL_IDX_MASK 一致
+  let expect = format!("const DDGI_WL_IDX_MASK: u32 = 0x{MASK:X}u;");
+  assert!(src.contains(&expect), "dda.wgsl 中未找到 `{expect}`");
+  let bits = MASK.count_ones();
+  // lod 位段必须紧跟在下标之后（age 8 位 + 下标 bits 位）
+  let lod_shift = format!("const DDGI_WL_LOD_SHIFT: u32 = {}u;", 8 + bits);
+  assert!(src.contains(&lod_shift), "dda.wgsl 中未找到 `{lod_shift}`");
+  let capacity = gate_render::ddgi::DDGI_ATLAS_LAYERS
+    * gate_render::ddgi::DDGI_ATLAS_PROBES_PER_LAYER_AXIS
+    * gate_render::ddgi::DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
+  assert!(
+    capacity <= MASK + 1,
+    "图集容量 {capacity} 超出 worklist cell 下标位宽（{bits} 位）—— \
+     LOD0 的 cell 下标会被截断，症状是部分区域全黑。调大 DDGI_WL_IDX_MASK / DDGI_WL_LOD_SHIFT"
+  );
+}

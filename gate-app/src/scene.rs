@@ -46,6 +46,9 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // ---- 场景：GATE_SCENE=vox（默认）→ MagicaVoxel nuke.vox；=demo → 旧极限场景 ----
   let t0 = std::time::Instant::now();
   let mut grid = VolumeGrid::new();
+  // DDGI 四级网格的锚点：世界 AABB。相机移动时任何一级的原点都**不变** → 结构上不存在
+  // "槽位换主" → 不再有"移动时闪"（Douglas 的 DDGI 正是如此）。demo 场景无 AABB 时用默认值。
+  let mut ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb::default();
   let mut cam_eye = Vec3::new(1., 0., 0.);
   let mut cam_target = Vec3::new(0., 0., 0.);
   match std::env::var("GATE_SCENE").as_deref() {
@@ -70,6 +73,10 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         info.aabb_max,
       );
       bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
+      ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb {
+        min: info.aabb_min,
+        max: info.aabb_max,
+      };
     }
   }
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
@@ -86,6 +93,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     OrbitCamera::from_eye(cam_eye, cam_target)
   };
   commands.insert_resource(orbit);
+  // DDGI 四级网格锚定世界 AABB：相机移动时原点不变 → 不存在换主、不存在移动闪。
+  commands.insert_resource(ddgi_world_aabb);
   commands.insert_resource(DdaCameraConfig::from_orbit(
     &orbit,
     FOV_Y,

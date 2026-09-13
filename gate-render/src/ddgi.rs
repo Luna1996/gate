@@ -117,28 +117,38 @@ impl DdgiWorldGrid {
     DDGI_LOD_CELL_SIZES[lod]
   }
 
-  /// 由相机世界坐标（voxel）推导 4 级嵌套级联。
+  /// 由**世界 AABB** 推导 4 级嵌套级联 —— 四级**全部锚定世界**，相机完全不参与。
   ///
-  /// 每级：dims 固定为 `DDGI_LOD_DIMS`，cell 边长 = `DDGI_LOD_CELL_SIZES[lod]`；原点取
-  /// `cam - half·cell` 并**按 cell 边长向下对齐**。这带来两个必须成立的不变量：
-  /// - **相机恒在盒中心（偏差 < 1 个 cell）**：覆盖率最大化且不随相机漂移。旧版按
-  ///   `cell×8` 对齐、再前移半步，导致相机在盒内游走（覆盖浮动）；现在不需要了。
-  /// - **原点恒是 cell 的整数倍**：shader 里「世界 cell 号 = 原点 / cell」才能精确整除，
-  ///   世界锚定的槽位映射（`slot = 世界 cell mod dims`）才成立。
+  /// 【为什么这样】Douglas Devlog #23 的 DDGI 在相机移动时**绝不闪烁**，因为他的网格
+  /// **不随相机变**；而"相机中心窗口"一滚就换主（槽位 `mod dims` 复用）→ 整圈探针换主
+  /// → 移动时闪（本会话实测多轮）。四级都锚定世界后，相机移动**不改变任何一级的原点**
+  /// → 结构上不存在"换主"。
   ///
-  /// 因覆盖范围逐级 ×2，LOD(l-1) 盒严格包含于 LOD(l) 盒内。
-  pub fn from_camera(camera_voxel: IVec3) -> Self {
+  /// 【dims 按世界算】每级 dims = ceil(世界跨度 / cell)。cell 逐级 ×2、AABB 相同 ⇒
+  /// dims 逐级减半 ⇒ LOD(l-1) 盒严格包含于 LOD(l) 盒内（嵌套不变式）。
+  ///
+  /// 【稀疏性从哪来】细级按世界算有 ~33 万个 cell（cell=16），但绝大多数是纯空气 →
+  /// `near` 判定为假 → 不进 worklist → **不参与 cast/collect**。代价只在图集容量
+  /// （409600 槽 ≈ 240MB）和 `sort`（每帧扫全槽位，+0.2ms）。
+  ///
+  /// 【原点对齐】按 cell 向下对齐，保证 shader 里「世界 cell 号 = (p - origin) / cell」
+  /// 精确整除 —— 世界锚定的槽位映射（`slot = base + 世界 cell mod dims`）才成立。
+  pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
     let mut out = Self::default();
-    let dims = DDGI_LOD_DIMS;
-    let half_cells = (DDGI_LOD_DIMS / 2).as_ivec3();
     let mut base = 0u32;
     for lod in 0..DDGI_LODS as usize {
       let cell = DDGI_LOD_CELL_SIZES[lod];
-      let half = half_cells * cell;
       let origin = IVec3::new(
-        align_down(camera_voxel.x - half.x, cell),
-        align_down(camera_voxel.y - half.y, cell),
-        align_down(camera_voxel.z - half.z, cell),
+        align_down(aabb_min.x, cell),
+        align_down(aabb_min.y, cell),
+        align_down(aabb_min.z, cell),
+      );
+      let span = (aabb_max - origin).max(IVec3::ONE);
+      let c = cell as i32;
+      let dims = UVec3::new(
+        ((span.x + c - 1) / c).max(1) as u32,
+        ((span.y + c - 1) / c).max(1) as u32,
+        ((span.z + c - 1) / c).max(1) as u32,
       );
       out.lod_origins[lod] = origin;
       out.lod_dims[lod] = dims;
@@ -394,6 +404,29 @@ impl DdgiStage {
   }
 }
 
+/// 已加载世界的 AABB（voxel 坐标，闭区间）。
+///
+/// DDGI 的 4 级网格**全部锚定到它**（见 `DdgiWorldGrid::from_world`）—— 相机移动时
+/// 任何一级的原点都**不变**，从根上消除"槽位换主"（相机滚动 → 槽位 `mod dims` 复用 →
+/// 整圈探针换主 → 移动时闪）。这正是 Douglas 的 DDGI 移动时不闪的原因：他的网格不随相机变。
+///
+/// 由主世界算出（`vox_scene` 的 AABB）并 extract 到 render world；未设置时取单位盒
+/// （退化为 1×1×1 格，不会 panic）。
+#[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DdgiWorldAabb {
+  pub min: IVec3,
+  pub max: IVec3,
+}
+
+impl Default for DdgiWorldAabb {
+  fn default() -> Self {
+    Self {
+      min: IVec3::ZERO,
+      max: IVec3::ONE,
+    }
+  }
+}
+
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
 pub struct DdgiDebugSettings {
   pub mode: f32,
@@ -419,8 +452,8 @@ pub struct DdgiDebugSettings {
   ///
   /// 覆盖内的环境光由 DDGI 算出，覆盖外只能靠常量兜底 —— 两者强度不匹配时，级联盒边界
   /// 就是一条"亮 ↔ 暗"的硬边（相机拉远必然出现"有 GI / 无 GI 同屏"）。
-  /// **不能直接用 `DDGI_SKY_AMBIENT` 调大**：它还兼作覆盖内无数据时的兜底，调大会让室内
-  /// 凹角跟着变亮（漏光感）。所以覆盖外单独一个系数，运行时滑杆调到与覆盖内衔接为止。
+  /// **不能直接用 `DDGI_SKY_AMBIENT` 调大**：它还兼作 DDGI 关闭时的环境光，调大会让
+  /// 未开 DDGI 的画面整体提亮。所以覆盖外单独一个系数，运行时滑杆调到与覆盖内衔接为止。
   pub far_ambient: f32,
 }
 
@@ -458,6 +491,7 @@ impl bevy::app::Plugin for DdgiPlugin {
     };
     render_app
       .init_resource::<DdgiStage>()
+      .init_resource::<DdgiWorldAabb>()
       .init_resource::<DdgiDebugSettings>()
       .init_resource::<DdgiBakeThisFrame>()
       .add_systems(bevy::render::RenderStartup, init_ddgi_gpu)
@@ -554,15 +588,35 @@ fn ddgi_array_view(
   })
 }
 
-/// irradiance / depth 图集容量：= 各级 LOD 槽数总和 65536；每层 16×16 = 256 探针 → 256 层。
+/// irradiance / depth 图集容量：每层 `40×40 = 1600` 探针 × 256 层 = **409600**。
+///
+/// 【为什么是 40】各级 LOD 的 dims 现在按**世界 AABB** 计算（见 `from_world`），nuke.vox
+/// 下总和 ≈ 393776（122×39×72 + 62×20×36 + 32×10×18 + 16×5×10）。40 给到 409600 的余量。
+///
+/// ⚠️ `from_world` **不做钳制**（早期注释曾声称会钳制并告警，实际没有）：超出容量会静默
+/// 越界写图集。约束由测试守着 —— `world_grid_layout_and_atlas_capacity` 断言实际场景的
+/// total_slots ≤ 容量，`wgsl_compile.rs::ddgi_worklist_pack_covers_atlas_capacity` 断言容量
+/// 本身装得进 worklist 的 19 位 cell 下标。世界变大时先看这两条。
 pub const DDGI_ATLAS_LAYERS: u32 = 256;
-pub const DDGI_ATLAS_PROBES_PER_LAYER_AXIS: u32 = 16;
+pub const DDGI_ATLAS_PROBES_PER_LAYER_AXIS: u32 = 40;
 /// 阶段二射线样本缓冲：每样本 2×vec4 = (方向.xyz, 命中距离) + (辐亮度.xyz, 1)。
 ///
-/// 样本下标 = **全局射线编号**（`ddgi_cast` 里 `si = tid * 2`），而 seal 保证全局射线
-/// 总数 ≤ `DDGI_RAY_BUDGET`，所以槽数直接取预算即可。
+/// 样本下标 = **全局射线编号**（`ddgi_cast` 里 `si = tid * 2`）。容量必须覆盖 `total_ray`
+/// 上界 —— 而它不是 `DDGI_RAY_BUDGET`：seal 的 `rpp = max(1, BUDGET / total_active)` 有
+/// **下限 1**，所以活跃探针数超过预算时 `total_ray = total_active`（每针 1 条），上界是
+/// **总槽位数**（每个活跃探针占一个不同槽位）。
+///
+/// 【旧前提已失效】原注释断言"seal 保证全局射线总数 ≤ DDGI_RAY_BUDGET" —— 那建立在
+/// "总活跃探针数 ≤ 槽数 65536 < 预算 131072"之上。dims 改成按世界 AABB 算之后槽位涨到
+/// 39 万，该前提不成立；越界写被 wgpu 丢弃（不报错）→ 那些探针的样本恒 0 → **成片无 GI**。
 pub const DDGI_SAMPLE_SLOTS: u32 = DDGI_RAY_BUDGET;
 pub const DDGI_SAMPLE_BYTES: u64 = (DDGI_SAMPLE_SLOTS as u64) * 32;
+
+/// 覆盖 `total_slots` 个探针所需的样本缓冲字节数（见 `DDGI_SAMPLE_SLOTS` 的说明）。
+#[inline]
+fn ddgi_sample_bytes(total_slots: u32) -> u64 {
+  DDGI_RAY_BUDGET.max(total_slots) as u64 * 32
+}
 
 fn ddgi_array_tex(
   device: &bevy::render::renderer::RenderDevice,
@@ -815,9 +869,12 @@ fn dispatch_ddgi(
   // 同一 pass 内没有顺序保证，只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
   if bake.map_or(false, |b| b.0) {
     let n_lods = DDGI_LODS as usize;
-    let wg_per_lod = (DDGI_LOD_DIMS.x * DDGI_LOD_DIMS.y * DDGI_LOD_DIMS.z)
-      .div_ceil(64)
-      .min(65535);
+    // 每级的 dispatch 大小按**该级实际 dims** 算 —— dims 现在随世界 AABB 变化（不再固定
+    // 32×16×32），写死会让烘焙只覆盖一小部分 cell，症状是"大部分区域无 GI"（且无报错）。
+    let wg_per_lod: [u32; DDGI_LODS as usize] = std::array::from_fn(|lod| {
+      let d = gpu.grid.lod_dims[lod];
+      (d.x * d.y * d.z).div_ceil(64).max(1).min(65535)
+    });
     const LABELS: [&str; DDGI_LODS as usize] = [
       "gate_ddgi_bake0",
       "gate_ddgi_bake1",
@@ -844,7 +901,7 @@ fn dispatch_ddgi(
           |pass| {
             pass.set_pipeline(p);
             set_bgs(pass, &bg4.0);
-            pass.dispatch_workgroups(wg_per_lod, 1, 1);
+            pass.dispatch_workgroups(wg_per_lod[lod], 1, 1);
           },
         );
       }
@@ -921,6 +978,7 @@ fn extract_ddgi_settings(
   mut commands: bevy::ecs::system::Commands,
   stage: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiStage>>>,
   debug: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiDebugSettings>>>,
+  world_aabb: Option<bevy::render::Extract<bevy::ecs::system::Res<DdgiWorldAabb>>>,
 ) {
   let s = stage.map_or(DdgiStage::OFF, |s| s.0.min(DdgiStage::FULL));
   commands.insert_resource(DdgiStage(s));
@@ -934,6 +992,10 @@ fn extract_ddgi_settings(
     far_ambient: d.far_ambient,
   });
   commands.insert_resource(dbg);
+  commands.insert_resource(world_aabb.map_or_else(DdgiWorldAabb::default, |a| DdgiWorldAabb {
+    min: a.min,
+    max: a.max,
+  }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -942,19 +1004,18 @@ fn prepare_ddgi(
   device: bevy::ecs::system::Res<bevy::render::renderer::RenderDevice>,
   queue: bevy::ecs::system::Res<bevy::render::renderer::RenderQueue>,
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
-  view: Option<bevy::ecs::system::Res<crate::brickmap::dda::DdaViewUniform>>,
   revision: Option<bevy::ecs::system::Res<crate::brickmap::upload::BrickMapRevision>>,
   dirty: Option<bevy::ecs::system::Res<crate::brickmap::upload::BrickMapDirty>>,
   stage: bevy::ecs::system::Res<DdgiStage>,
   dbg: bevy::ecs::system::Res<DdgiDebugSettings>,
+  world: bevy::ecs::system::Res<DdgiWorldAabb>,
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
   // ---- 嵌套级联网格推导（相机中心 → 4 级 LOD 各自独立原点）----
-  let cam = view
-    .as_ref()
-    .map(|v| v.cam_pos_voxel.truncate().floor().as_ivec3())
-    .unwrap_or(IVec3::ZERO);
-  let grid = DdgiWorldGrid::from_camera(cam);
+  // 4 级网格**全部锚定世界 AABB**：相机移动不改变任何一级的原点 → 结构上不存在"换主"
+  // → 不再有"移动时闪"。dims 按世界跨度 / cell 算（细级 cell 小 → dims 大；但纯空气 cell
+  // 被 `near` 判定排除，不进 worklist，所以 33 万槽位不会变成 33 万条射线）。
+  let grid = DdgiWorldGrid::from_world(world.min, world.max);
   let total = grid.total_slots;
   let grid_changed = grid != gpu.grid;
 
@@ -966,6 +1027,27 @@ fn prepare_ddgi(
   if will_run {
     gpu.grid = grid;
     gpu.total_slots = total;
+    if grid_changed {
+      // 网格变了就打一次实际数值：dims 现在随世界 AABB 变化，出问题时（无 GI / 黑带）
+      // 第一件事就是核对各级 origin/dims/slot_base 是否与预期一致。
+      for lod in 0..DDGI_LODS as usize {
+        let o = grid.lod_origins[lod];
+        let d = grid.lod_dims[lod];
+        bevy::log::info!(
+          "DDGI LOD{lod}: cell={} origin=({},{},{}) dims=({},{},{}) slot_base={} count={}",
+          DDGI_LOD_CELL_SIZES[lod],
+          o.x,
+          o.y,
+          o.z,
+          d.x,
+          d.y,
+          d.z,
+          grid.lod_slot_base[lod],
+          grid.lod_count(lod),
+        );
+      }
+      bevy::log::info!("DDGI 总槽位 = {total}（图集容量 409600）");
+    }
     gpu.last_revision = rev;
   }
   // 相机滚动（grid 变化）→ 按「世界 cell 键」增量补烘；世界编辑 → 只失效脏区内的 cell
@@ -995,7 +1077,26 @@ fn prepare_ddgi(
   ensure_storage_buffer(&device, &queue, &mut gpu.slot_pos, "ddgi_slot_pos", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.worklist, "ddgi_worklist", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.cell_id, "ddgi_cell_id", s * 16);
-  ensure_storage_buffer(&device, &queue, &mut gpu.samples, "ddgi_samples", DDGI_SAMPLE_BYTES);
+  // `cell_slot`（借针间接表）的默认值是 identity（`cell_slot[i] = i`，等价于"没有这张表"）。
+  // ⚠️ 它必须随 total_slots **一起扩容**，且新增部分要填 identity —— 否则新槽位读到 0 会
+  // 指向 slot 0，采样彻底错乱（症状：大面积无 GI，且没有任何报错）。
+  // 历史遗留：dims 固定 32×16×32 时 65536 恰好够用，所以这里一直没有扩容；改成按世界
+  // AABB 算 dims（总槽位 37 万）之后就漏了。
+  if gpu.cell_slot.size() < s * 4 {
+    gpu.cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", s * 4);
+    let mut identity = Vec::with_capacity(total as usize * 4);
+    for i in 0..total {
+      identity.extend_from_slice(&i.to_le_bytes());
+    }
+    queue.write_buffer(&gpu.cell_slot, 0, &identity);
+  }
+  ensure_storage_buffer(
+    &device,
+    &queue,
+    &mut gpu.samples,
+    "ddgi_samples",
+    ddgi_sample_bytes(total),
+  );
 
   gpu.frame = gpu.frame.wrapping_add(1);
 
@@ -1101,85 +1202,81 @@ mod tests {
   }
 
   #[test]
-  fn cascade_is_nested_and_camera_centered() {
-    let cam = IVec3::new(1000, -333, 7);
-    let g = DdgiWorldGrid::from_camera(cam);
-    // 4 级维度相同，cell 逐级 ×2 → 覆盖范围逐级 ×2
-    for lod in 0..DDGI_LODS as usize {
-      assert_eq!(g.lod_dims[lod], DDGI_LOD_DIMS);
-    }
-    // 相机落在每级盒内（居中，对齐误差 ≤ cell）
-    for lod in 0..DDGI_LODS as usize {
-      let (lo, hi) = lod_aabb(&g, lod);
-      assert!(cam.cmpge(lo).all() && cam.cmplt(hi).all(), "lod {lod} 盒未包含相机");
-    }
-    // 相邻级严格嵌套：LOD(l-1) ⊂ LOD(l)
-    for lod in 1..DDGI_LODS as usize {
-      let (plo, phi) = lod_aabb(&g, lod - 1);
-      let (lo, hi) = lod_aabb(&g, lod);
-      assert!(plo.cmpge(lo).all() && phi.cmple(hi).all(), "lod {lod} 未包含 lod {}", lod - 1);
-    }
-    // 各级原点按自身 cell 对齐
+  fn world_grid_covers_aabb_and_is_nested() {
+    // AABB 起点故意不对齐到 cell，验证"向下对齐到 AABB 外侧"
+    let lo = IVec3::new(37, -11, 5);
+    let hi = lo + IVec3::new(1932, 615, 1136);
+    let g = DdgiWorldGrid::from_world(lo, hi);
     for lod in 0..DDGI_LODS as usize {
       let cell = DDGI_LOD_CELL_SIZES[lod];
       let o = g.lod_origins[lod];
+      // 原点落在 AABB 之外（向下对齐），且是 cell 的整数倍（shader 的整除前提）
+      assert!(o.cmple(lo).all(), "lod {lod} 原点未向下对齐到 AABB 外侧");
       assert_eq!(o.x.rem_euclid(cell), 0);
       assert_eq!(o.y.rem_euclid(cell), 0);
       assert_eq!(o.z.rem_euclid(cell), 0);
+      // 该级覆盖必须罩住整个 AABB
+      let (l, h) = lod_aabb(&g, lod);
+      assert!(l.cmple(lo).all() && hi.cmplt(h).all(), "lod {lod} 未罩住世界 AABB");
+    }
+    // 相邻级严格嵌套（cell ×2 → dims 减半）
+    for lod in 1..DDGI_LODS as usize {
+      let (plo, phi) = lod_aabb(&g, lod - 1);
+      let (l, h) = lod_aabb(&g, lod);
+      assert!(
+        plo.cmpge(l).all() && phi.cmple(h).all(),
+        "lod {lod} 未包含 lod {}",
+        lod - 1
+      );
     }
   }
 
   #[test]
-  fn cascade_slot_layout_is_consistent() {
-    let g = DdgiWorldGrid::from_camera(IVec3::ZERO);
-    let per_lod = DDGI_LOD_DIMS.x * DDGI_LOD_DIMS.y * DDGI_LOD_DIMS.z;
+  fn world_grid_layout_and_atlas_capacity() {
+    // nuke.vox 的 AABB 量级（来自启动日志 aabb=[[-454,16,-56]]-[[1478,631,1080]]）
+    let lo = IVec3::new(-454, 16, -56);
+    let hi = IVec3::new(1478, 631, 1080);
+    let g = DdgiWorldGrid::from_world(lo, hi);
+    // 槽位块连续排布
     let mut acc = 0u32;
     for lod in 0..DDGI_LODS as usize {
       assert_eq!(g.lod_slot_base[lod], acc);
-      assert_eq!(g.lod_count(lod), per_lod);
-      acc += per_lod;
+      acc += g.lod_count(lod);
     }
     assert_eq!(g.total_slots, acc);
     assert!(!g.is_empty());
+    // 【关键】nuke.vox 量级下必须装得进图集 —— 否则运行期会越界写图集
+    let capacity = DDGI_ATLAS_LAYERS
+      * DDGI_ATLAS_PROBES_PER_LAYER_AXIS
+      * DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
+    assert!(
+      g.total_slots <= capacity,
+      "槽位 {} 超出图集容量 {}（需调大 DDGI_ATLAS_PROBES_PER_LAYER_AXIS）",
+      g.total_slots,
+      capacity
+    );
   }
 
-  /// 世界锚定槽位映射的核心不变式：**同一个世界 cell，在相机移动前后映射到同一个槽位**
-  /// （只要它还在窗口内）。shader 里 `ddgi_slot = slot_base + (世界 cell mod dims)` 就是
-  /// 这个式子；这里用 Rust 复刻它，保证「槽位身份与世界绑定」这条性质不被 from_camera 改动
-  /// （例如原点不再按 cell 对齐）悄悄破坏。
+  /// 世界锚定的槽位映射：**同一世界 cell 的槽位与相机无关**。
+  ///
+  /// 这是"移动时不闪"的根据 —— `from_world` 的签名里**根本没有相机参数**，网格是只依赖
+  /// 世界 AABB 的纯函数。将来若有人把相机重新引入网格推导，这条会立刻失败。
   #[test]
-  fn world_cell_slot_identity_survives_camera_movement() {
+  fn world_cell_slot_is_camera_independent() {
     let slot_of = |g: &DdgiWorldGrid, lod: usize, wc: IVec3| -> u32 {
       let dims = g.lod_dims[lod].as_ivec3();
       let r = wc.rem_euclid(dims);
-      g.lod_slot_base[lod]
-        + (r.x + r.y * dims.x + r.z * dims.x * dims.y) as u32
+      g.lod_slot_base[lod] + (r.x + r.y * dims.x + r.z * dims.x * dims.y) as u32
     };
-    // 同一世界 cell 在两处相机位置下都在窗口内 → 槽位必须相同
-    let wc = IVec3::new(4096, 128, -2048);
-    let g1 = DdgiWorldGrid::from_camera(wc + IVec3::new(0, 64, 0));
-    let g2 = DdgiWorldGrid::from_camera(wc + IVec3::new(48, 96, -32));
+    let lo = IVec3::new(-454, 16, -56);
+    let hi = IVec3::new(1478, 631, 1080);
+    // 同样的 AABB 必须给出完全相同的网格（纯函数 → 槽位映射恒定）
+    let g1 = DdgiWorldGrid::from_world(lo, hi);
+    let g2 = DdgiWorldGrid::from_world(lo, hi);
+    assert_eq!(g1, g2, "from_world 不是纯函数");
+    let wc = IVec3::new(512, 128, -128);
     for lod in 0..DDGI_LODS as usize {
-      assert_eq!(
-        slot_of(&g1, lod, wc),
-        slot_of(&g2, lod, wc),
-        "lod {lod}: 相移动后同一世界 cell 的槽位变了"
-      );
-    }
-    // 相机恒在盒中心（偏差 < 1 个 cell）：这条保证「原点 = 相机 - half·cell 后按 cell 对齐」
-    // 不会退化，从而 shader 的「原点 / cell」整除成立。
-    for cam in [IVec3::new(0, 0, 0), IVec3::new(-1, -7, 12345), wc] {
-      let g = DdgiWorldGrid::from_camera(cam);
-      for lod in 0..DDGI_LODS as usize {
-        let cell = DDGI_LOD_CELL_SIZES[lod];
-        let center = g.lod_origins[lod]
-          + g.lod_dims[lod].as_ivec3() / 2 * cell;
-        let off = (cam - center).abs();
-        assert!(
-          off.cmplt(IVec3::splat(cell)).all(),
-          "lod {lod}: 相机偏离盒心 {off:?} ≥ 1 cell"
-        );
-      }
+      assert_eq!(slot_of(&g1, lod, wc), slot_of(&g2, lod, wc));
     }
   }
 }
