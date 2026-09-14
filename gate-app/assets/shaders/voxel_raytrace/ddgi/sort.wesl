@@ -10,7 +10,10 @@ import package::world::{world_cfg_full, world_raycast};
 //   ① 读烘焙记录 ddgi_cell[slot]（探针是否存在 / 本 cell 是否有体素 / cell 内偏移）
 //   ② 活跃 = 有探针 && (本 cell 有体素 || 6 邻接 cell 任一有体素 || 与非网格对齐物体 AABB 重叠)
 //      且不落在更细 LOD 覆盖范围内（避免各 LOD 重复投线）
-//   ③ can_skip_update：收敛 + 远离相机 + 非强制刷新帧 → 本帧不投线
+//   ③ 本帧要不要投线：**按「屏幕会不会用到它」**——`used`（上一帧被着色采样过，漏桶计数）
+//      ∪ `!converged`（新探针/换主）∪ `due`（按槽位错峰的强制刷新）。取代了旧的"收敛 + 远离
+//      相机"距离判据（那条判据在四级同 AABB 的布局下会让整个世界的粗级探针每帧都投线，
+//      把预算吃光 → rpp 钉在下限 1）。见 DDGI_USAGE_STICKY。
 //   ④ 幸存者 atomicAdd 进 per-LOD worklist（item = 探针世界坐标 + age/lod）
 //   ⑤ 全 slot 写 meta（age/enabled）与 slot_pos
 // ============================================================================

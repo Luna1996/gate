@@ -1,10 +1,10 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_COLL_BASE, DDGI_INDIR_COLL_TOTAL, DDGI_INDIR_COUNT_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RAY_TOTAL, DDGI_INDIR_RPP_BASE, beam_depth, ddgi_args, ddgi_cell, ddgi_indirect, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist, light_u, out_tex, view_u};
-import package::common::{linear_to_srgb, palette_albedo, palette_emissive, sky_rgb};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_COLL_BASE, DDGI_INDIR_COLL_TOTAL, DDGI_INDIR_COUNT_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RAY_TOTAL, DDGI_INDIR_RPP_BASE, beam_depth, ddgi_args, ddgi_cell, ddgi_indirect, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist, eye_adapt, eye_adapt_ro, light_u, out_tex, out_tex_src, view_u};
+import package::common::{linear_to_srgb, palette_albedo, palette_emissive, sky_rgb, srgb_to_linear};
 import package::ddgi::bake::{ddgi_bake_one};
 import package::ddgi::collect::{ddgi_collect_one};
-import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKIP_DIST_CELLS, DDGI_SKY_AMBIENT, DDGI_T_MAX, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
+import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
 import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
-import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample};
+import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
 import package::lightfield::{light_field_ao, light_field_gather};
 import package::trace::{make_grid};
@@ -104,6 +104,17 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(out_tex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  // ---- 「屏幕使用」记账开关（工作集选择的唯一依据，见 DDGI_USAGE_STICKY）----
+  // 只让 1/(MASK+1)² 的像素记账，且按帧轮转 ⇒ 8 帧覆盖全屏一次：把记账的全局写入量压到
+  // ~10 万次/帧（可忽略）。cast 里的 GI 回读不设这个开关（恒 0）→ 不记账。
+  let usage_frame = u32(ddgi_u.params.x);
+  ddgi_usage_track = select(
+    0u,
+    1u,
+    ((gid.x + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u
+      && ((gid.y + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u,
+  );
 
   // ---- 反投影：像素中心 (gid + 0.5) → NDC (u, v) ∈ [-1, 1] ----
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
@@ -308,7 +319,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
   }
-  textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(col), 1.0));
+  // 眼睛适应（自动曝光）：曝光在 sRGB 编码**之前**乘 —— 暗场提亮才用得上全部 8bit 动态范围
+  // （放到编码之后乘会把暗部的量化台阶一起放大成色带）。见文件末尾 eye_adapt_* 两个入口。
+  let exposure = bitcast<f32>(eye_adapt_ro[0u]);
+  let exposed = col * select(1.0, exposure, exposure > 0.0);
+  textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(exposed), 1.0));
 }
 
 
@@ -439,12 +454,20 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   let is_active = near;
 
   if (is_active) {
-    // ---- can_skip_update：收敛 + 远离相机 + 非强制刷新帧 → 本帧不投线 ----
+    // ---- 本帧要不要投线：**按「屏幕会不会用到它」**，不再按距离猜 ----
+    // 三个入选项（见 consts 的 DDGI_USAGE_STICKY）：
+    //   ① `used`：上一帧被着色采样过（漏桶计数 > 0）—— 屏幕正在用它的数据；
+    //   ② `!converged`：年龄不足（新探针 / 相机滚动换主）—— 让它尽快成型；
+    //   ③ `due`：按槽位号错峰的强制刷新 —— 兜住"从没上过屏"的探针，避免它们的图集永远是空
+    //      数据（相机转过去时那片区域才不会一开始全黑），也保证世界编辑后远场最终能跟上。
+    // 记账在这里**读后衰减**（-1/帧）：本帧没被着色用到 → 下一帧就不再 >0。
+    let usage = ddgi_cell_slot[slot];
+    ddgi_cell_slot[slot] = select(0u, usage - 1u, usage > 0u);
+    let used = usage > 0u;
     let frame = u32(ddgi_u.params.x);
     let converged = age >= DDGI_SKIP_AGE[lod];
-    let far = length(probe_pos - view_u.cam_pos_voxel.xyz) > f32(cs) * DDGI_SKIP_DIST_CELLS;
     let due = (frame + slot) % DDGI_REFRESH_PERIOD[lod] == 0u;
-    if (!(converged && far && !due)) {
+    if (used || !converged || due) {
       age = min(age + 1u, DDGI_AGE_MAX);
       let wslot = atomicAdd(&ddgi_indirect[DDGI_INDIR_COUNT_BASE + lod], 1u);
       // worklist 是**压缩后**的列表，它的下标（wslot）只是排名，不是 cell 下标。
@@ -609,4 +632,101 @@ fn probe_viz_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
   }
+}
+
+// ============================================================================
+// 眼睛适应（自动曝光）——结构对齐 UE/Unity 的 EyeAdaptation：
+//   pass1 `eye_adapt_histogram`：out_tex 按 1/16 步长抽样 → sRGB 还原 → log2 亮度 → 64 桶直方图
+//   pass2 `eye_adapt_update`：取 5%~95% 百分位区间求平均（剔除"一小块亮窗/太阳"这类离群值）
+//                             → 反馈 + 分方向时间平滑 → 写曝光系数（下一帧 `dda_main` 用）
+// 两个 pass 都极小：pass1 = 1 个 WG（256 线程覆盖全部 ~880 个抽样点），pass2 = 1 个线程。
+// 【为什么统计"曝光之后"的颜色】UE 的直方图同样在当前曝光已应用的颜色上统计 —— 反馈环把
+// "百分位平均亮度"压到 EYE_KEY（目标中灰），这就是"进暗处几秒后能看见"的机制本身。
+// ============================================================================
+/// log2 亮度的桶覆盖：[-12, +12] 共 24 档 / 64 桶 = 0.375 档每桶。8bit 量化远粗于桶宽，
+/// 所以从 8bit 的 out_tex 统计完全够用。
+const EYE_LUM_MIN_LOG2: f32 = -12.0;
+const EYE_LUM_RANGE_LOG2: f32 = 24.0;
+const EYE_HIST_BINS: u32 = 64u;
+/// 活参数区起始字（= 状态/调试区 8 + 直方图 64）。**这些原来是编译期常量**，现在由
+/// debug overlay 的「Eye」页实时调（Rust 侧 [`EyeAdaptSettings`] 变化才上传 20B）。
+/// 下标 = `eye_p(i)` 的实参，顺序即语义，改 Rust 结构体时必须同步这里：
+///   0 ev_max  1 ev_min  2 tau_brighten  3 tau_darken  4 key
+const EYE_PARAM_BASE: u32 = 8u + EYE_HIST_BINS;
+
+fn eye_p(i: u32) -> f32 {
+  return bitcast<f32>(atomicLoad(&eye_adapt[EYE_PARAM_BASE + i]));
+}
+
+/// WG 内共享直方图。**必须是 workgroup 作用域的模块级变量** —— WGSL 规定原子类型只能出现在
+/// storage / workgroup 地址空间，函数内的局部 var 不能是 atomic。
+var<workgroup> eye_hist: array<atomic<u32>, 64>;
+
+@compute @workgroup_size(256)
+fn eye_adapt_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = vec2<i32>(textureDimensions(out_tex_src));
+  // 先局部原子累加，最后一次性写全局（全局原子量压到 64/帧）。
+  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { atomicStore(&eye_hist[i], 0u); }
+  workgroupBarrier();
+  // 抽样：x/y 各每 16 像素取一个中心点；256 线程按 grid-stride 覆盖全部抽样点。
+  let stride = 16u;
+  let axis = u32(dims.x / 16);
+  let step = axis * u32(dims.y / 16);
+  let bin_w = EYE_LUM_RANGE_LOG2 / f32(EYE_HIST_BINS);
+  for (var k = gid.x; k < step; k = k + 256u) {
+    let sx = i32((k % axis) * stride + stride / 2u);
+    let sy = i32((k / axis) * stride + stride / 2u);
+    if (sx >= dims.x || sy >= dims.y) { continue; }
+    let c = textureLoad(out_tex_src, vec2<i32>(sx, sy), 0).rgb;
+    let luma = dot(srgb_to_linear(c), vec3<f32>(0.2126, 0.7152, 0.0722));
+    let b = u32(clamp((log2(max(luma, 1e-5)) - EYE_LUM_MIN_LOG2) / bin_w, 0.0, f32(EYE_HIST_BINS - 1u)));
+    atomicAdd(&eye_hist[b], 1u);
+  }
+  workgroupBarrier();
+  for (var i = gid.x; i < EYE_HIST_BINS; i = i + 256u) {
+    let v = atomicLoad(&eye_hist[i]);
+    if (v > 0u) { atomicAdd(&eye_adapt[8u + i], v); }
+  }
+}
+
+@compute @workgroup_size(1)
+fn eye_adapt_update() {
+  var total = 0.0;
+  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { total = total + f32(atomicLoad(&eye_adapt[8u + i])); }
+  if (total > 0.0) {
+    // 5%~95% 百分位裁剪：按累计计数取区间内的加权平均 log2 亮度
+    let lo = total * 0.05;
+    let hi = total * 0.95;
+    let bin_w = EYE_LUM_RANGE_LOG2 / f32(EYE_HIST_BINS);
+    var cum = 0.0;
+    var acc = 0.0;
+    var wsum = 0.0;
+    for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) {
+      let n = f32(atomicLoad(&eye_adapt[8u + i]));
+      let c0 = cum;
+      cum = cum + n;
+      let w = max(0.0, min(cum, hi) - max(c0, lo));
+      acc = acc + (EYE_LUM_MIN_LOG2 + (f32(i) + 0.5) * bin_w) * w;
+      wsum = wsum + w;
+    }
+    if (wsum > 0.0) {
+      let avg_log2 = acc / wsum;
+      atomicStore(&eye_adapt[4u], bitcast<u32>(avg_log2));
+      let ev_cur = bitcast<f32>(atomicLoad(&eye_adapt[1u]));
+      // 反馈：把"当前（已含曝光）的平均亮度"往目标中灰拉 → 还差多少档
+      let ev_want = clamp(ev_cur + (log2(eye_p(4u)) - avg_log2), eye_p(1u), eye_p(0u));
+      atomicStore(&eye_adapt[5u], bitcast<u32>(ev_want));
+      let dt = clamp(bitcast<f32>(atomicLoad(&eye_adapt[3u])), 0.0, 0.25);
+      let tau = select(eye_p(3u), eye_p(2u), ev_want > ev_cur);
+      // 与帧率无关的指数平滑
+      let k = select(0.0, 1.0 - exp(-dt / max(tau, 1e-3)), dt > 0.0);
+      let ev_new = mix(ev_cur, ev_want, k);
+      atomicStore(&eye_adapt[1u], bitcast<u32>(ev_new));
+      let manual = bitcast<f32>(atomicLoad(&eye_adapt[2u]));
+      let exp_val = exp2(clamp(ev_new + manual, eye_p(1u), eye_p(0u)));
+      atomicStore(&eye_adapt[0u], bitcast<u32>(exp_val));
+    }
+  }
+  // 直方图清零，留给下一帧累加（本 pass 与 pass1 分属不同 pass，pass 边界即屏障）
+  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { atomicStore(&eye_adapt[8u + i], 0u); }
 }

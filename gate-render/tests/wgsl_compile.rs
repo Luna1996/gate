@@ -70,6 +70,8 @@ fn dda_entry_points_are_preserved() {
       "ddgi_collect",
       "ddgi_seal",
       "ddgi_sort",
+      "eye_adapt_histogram",
+      "eye_adapt_update",
       "probe_viz_main",
     ],
     "dda entry point 集合与 pipeline 期望不符"
@@ -93,76 +95,81 @@ fn shadow_surface_eps_matches_rust_const() {
   );
 }
 
-/// DDGI 图集纹素数在 Rust 与 WGSL **两处独立声明**：Rust 侧决定纹理尺寸 / 显存 / collect
-/// 线程数，WGSL 侧决定八面体方向分辨率与纹素坐标。任一侧漏改都会让两边错位 —— 典型症状是
-/// 深度纹素写进**相邻探针**、或方向查到错纹理，表现为跟着探针投影走的成片锯齿/亮暗块，
-/// 而且**不会**有编译错误。此测试把这类静默错位挡在 CI。
+/// DDGI 的跨端常量（图集纹素数 / 层内轴 / 层数 / 级数 / 射线预算 / indirect word 布局）**以
+/// WESL 为单一来源**：Rust 侧不再声明副本，而是启动时解析 `.wesl` 源码（`wesl_consts`）。
+///
+/// 这里做的是**端到端**校验：拿编译产物（展平后的 WGSL，即实际交给 GPU 的那份）再解析一遍，
+/// 与 `ddgi_consts()` 逐项对齐 —— 覆盖"解析器和 WESL 编译器看到的不是同一份/同一批常量"
+/// 这类漂移（例如常量写成了派生式、或搬到了解析器扫不到的目录）。
+/// 历史症状：`DDGI_PROBES_PER_LAYER_AXIS` 一边 40 一边 16 → 大部分探针写到图集外（大面积无
+/// GI）；`DDGI_RAY_BUDGET` 一边 131072 一边 65536 → rpp 静默减半（室内噪声变大）。
 #[test]
-fn ddgi_texels_match_rust_consts() {
-  let src = std::fs::read_to_string(asset_path(DDA_CONSTS_WESL)).expect("读 ddgi/consts.wesl");
-  for (name, val) in [
-    ("DDGI_IRR_TEXELS", gate_render::ddgi::IRRADIANCE_TEXELS),
-    ("DDGI_DEPTH_TEXELS", gate_render::ddgi::DEPTH_TEXELS),
+fn ddgi_cross_boundary_consts_match_compiled_wgsl() {
+  let dda = gate_render::shader::compile_dda_wesl().expect("dda WESL 包编译失败");
+  let used =
+    gate_render::wesl_consts::parse_u32_consts_in_source(&dda);
+  let c = gate_render::wesl_consts::ddgi_consts();
+  // DDGI_ATLAS_LAYERS 不参与 WESL 的寻址（只有 Rust 用它定纹理层数）→ 展平后可能被剔除，
+  // 不在此断言；其余常量都是 shader 真正要用的，必须逐字一致。
+  for (name, want) in [
+    ("DDGI_IRR_TEXELS", c.irr_texels),
+    ("DDGI_DEPTH_TEXELS", c.depth_texels),
+    ("DDGI_PROBES_PER_LAYER_AXIS", c.probes_per_layer_axis),
+    ("DDGI_LOD_COUNT", c.lod_count),
+    ("DDGI_RAY_BUDGET", c.ray_budget),
+    ("DDGI_WL_IDX_MASK", c.wl_idx_mask),
+    ("DDGI_WL_LOD_SHIFT", c.wl_lod_shift),
+    ("DDGI_INDIR_CAST_BASE", c.indir_cast_base),
+    ("DDGI_INDIR_COLL_BASE", c.indir_coll_base),
+    ("DDGI_INDIR_RPP_BASE", c.indir_rpp_base),
+    ("DDGI_INDIR_COUNT_BASE", c.indir_count_base),
   ] {
-    let expect = format!("const {name}: u32 = {val}u;");
-    assert!(
-      src.contains(&expect),
-      "ddgi/consts.wesl 中未找到 `{expect}`"
+    assert_eq!(
+      used.get(name).copied(),
+      Some(want),
+      "编译产物里的 `{name}` 与 Rust 解析值不一致：Rust 侧按它分配显存/算偏移，\
+       不一致会静默错位（症状：大面积无 GI、或 rpp 异常）"
     );
   }
 }
 
-/// DDGI **图集布局**也在两处独立声明：Rust 决定纹理尺寸与「槽位 → 层」的映射，WGSL 决定
-/// 采样时的 layer 内寻址（`ddgi_probe_in_layer`）。两者不一致 → 写进图集的探针**读不回来**，
-/// 症状是**按网格边界切开的大面积无 GI**，且没有任何编译/运行时报错。
-/// 已踩过一次：Rust 改成 40 而 WGSL 还是 16 → 大部分探针读到空白。此测试把它挡在 CI。
+/// 每层探针数必须**派生**自 AXIS（写死的 256=16² 正是那次"探针读到空白"错位的另一半原因），
+/// 且 `DDGI_LOD_COUNT` 必须等于 Rust 的 `DDGI_LODS`（后者要定 `[T; N]` 数组与 uniform 布局的
+/// 长度，编译期常量无法来自运行期解析，由 `wesl_consts::load` 断言）。
 #[test]
-fn ddgi_atlas_layout_matches_rust_consts() {
+fn ddgi_derived_consts_and_lod_count_are_consistent() {
   let src = std::fs::read_to_string(asset_path(DDA_CONSTS_WESL)).expect("读 ddgi/consts.wesl");
-  let axis = gate_render::ddgi::DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
-  let expect = format!("const DDGI_PROBES_PER_LAYER_AXIS: u32 = {axis}u;");
-  assert!(
-    src.contains(&expect),
-    "ddgi/consts.wesl 中未找到 `{expect}`"
-  );
-  // 每层探针数必须**派生**自 AXIS（写死的 256=16² 正是那次错位的另一半原因）
   let derived =
     "const DDGI_PROBES_PER_LAYER: u32 = DDGI_PROBES_PER_LAYER_AXIS * DDGI_PROBES_PER_LAYER_AXIS;";
   assert!(
     src.contains(derived),
     "ddgi/consts.wesl 的 DDGI_PROBES_PER_LAYER 应是派生式，未找到 `{derived}`"
   );
+  let c = gate_render::wesl_consts::ddgi_consts();
+  assert_eq!(c.lod_count, gate_render::ddgi::DDGI_LODS);
 }
 
-/// worklist `.w` 里 cell 下标的位宽必须装得下**图集容量**。
+/// worklist `.w` 里 cell 下标的位宽必须装得下**图集容量**，且 lod 位段紧接在下标之后。
 ///
 /// 该下标是「本级内的线性 cell 下标」，上限 = 该级 cell 数 ≤ 总槽位 ≤ 图集容量
-/// （`DDGI_ATLAS_LAYERS × AXIS²`）。曾经只用 16 位：dims 改成按世界 AABB 算之后 LOD0 有
+/// （`DDGI_ATLAS_LAYERS × 层内轴²`）。曾经只用 16 位：dims 改成按世界 AABB 算之后 LOD0 有
 /// 342576 个 cell，下标在 collect 侧被 `& 0xFFFF` 截断 → `atlas_slot` 折回低 65536 个槽位
 /// → 一部分探针的图集被远处探针反复覆写、其余恒空 → **部分区域正常、部分区域全黑**，
 /// 而**没有任何编译/运行时报错**。此测试把它挡在 CI。
 #[test]
 fn ddgi_worklist_pack_covers_atlas_capacity() {
-  let src = std::fs::read_to_string(asset_path(DDA_CONSTS_WESL)).expect("读 ddgi/consts.wesl");
-  const MASK: u32 = 0x7FFFF; // 19 位；必须与 ddgi/consts.wesl 的 DDGI_WL_IDX_MASK 一致
-  let expect = format!("const DDGI_WL_IDX_MASK: u32 = 0x{MASK:X}u;");
+  let c = gate_render::wesl_consts::ddgi_consts();
+  let (mask, shift) = (c.wl_idx_mask, c.wl_lod_shift);
+  let capacity = c.atlas_capacity();
   assert!(
-    src.contains(&expect),
-    "ddgi/consts.wesl 中未找到 `{expect}`"
-  );
-  let bits = MASK.count_ones();
-  // lod 位段必须紧跟在下标之后（age 8 位 + 下标 bits 位）
-  let lod_shift = format!("const DDGI_WL_LOD_SHIFT: u32 = {}u;", 8 + bits);
-  assert!(
-    src.contains(&lod_shift),
-    "ddgi/consts.wesl 中未找到 `{lod_shift}`"
-  );
-  let capacity = gate_render::ddgi::DDGI_ATLAS_LAYERS
-    * gate_render::ddgi::DDGI_ATLAS_PROBES_PER_LAYER_AXIS
-    * gate_render::ddgi::DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
-  assert!(
-    capacity <= MASK + 1,
-    "图集容量 {capacity} 超出 worklist cell 下标位宽（{bits} 位）—— \
+    capacity <= mask + 1,
+    "图集容量 {capacity} 超出 worklist cell 下标位宽 0x{mask:X} —— \
      LOD0 的 cell 下标会被截断，症状是部分区域全黑。调大 DDGI_WL_IDX_MASK / DDGI_WL_LOD_SHIFT"
+  );
+  // lod 位段必须紧跟在 age(8 位) + 下标之后
+  assert_eq!(
+    shift,
+    8 + mask.count_ones(),
+    "DDGI_WL_LOD_SHIFT 与 DDGI_WL_IDX_MASK 的位宽不匹配（应为 8 + 下标位宽）"
   );
 }

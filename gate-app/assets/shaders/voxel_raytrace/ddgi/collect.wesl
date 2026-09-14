@@ -1,5 +1,5 @@
 import package::bindings::{DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RPP_BASE, ddgi_depth, ddgi_depth_out, ddgi_indirect, ddgi_irr, ddgi_irr_out, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist};
-import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
+import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_CONV_SAMPLES, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
 import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_meta_nbr, ddgi_nbr_bit_lod0, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
 
 // ---- 空间混合（RTXGI ProbeBlending 的简化）----
@@ -160,10 +160,15 @@ fn ddgi_collect_one(tid: u32) {
       let prev = textureLoad(ddgi_irr, idx, i32(cc.x), 0);
       // 年龄越小时向新样本靠拢越多（1/age 等权滑动平均）→ 新探针几帧内成型；
       // 年龄大了自动切回 DDGI_ALPHA，稳态脉动不变。见 ddgi_age_alpha。
-      let a = ddgi_age_alpha(age, DDGI_ALPHA);
+      // 【首次写入热启动】该纹素**从没被写过**（覆盖度 0）时直接取新样本（a=1）：
+      //   ① 否则它要从 0 以 alpha 慢慢爬 —— rpp≈1 时一个纹素每 ⌈64/rpp⌉ 帧才更新一次，
+      //      alpha=0.015 意味着它几十秒里都停在"≈0"（一片假黑，且会被判成"有数据"）。
+      //   ② 覆盖度因此**一写即到 1**，"该纹素有没有数据"这条**持久**判据才可用 —— 采样侧
+      //      原来靠逐帧的 DDGI_META_ACTIVE 兜这个，那正是 Probe 档逐帧翻转的来源。
       // .w = 该纹素的**覆盖度**：每被写过一次就向 1 靠拢一次；从未写过则恒为 0。
       // 只有它能把"已写入但真黑"与"从未写过"分开（两者的值都是 0）—— 空间混合需要这个
       // 信号才能拿暗邻居稀释亮邻居，见 DDGI_TEXEL_MIN_COVERAGE / ddgi_probe_blend_irr。
+      let a = select(ddgi_age_alpha(age, DDGI_ALPHA), 1.0, prev.w <= 0.0);
       textureStore(
         ddgi_irr_out,
         idx,
@@ -220,10 +225,21 @@ fn ddgi_collect_one(tid: u32) {
       let mean2 = dsum2 / f32(cnt);
       let cc = ddgi_depth_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
-      let prev = textureLoad(ddgi_depth, idx, i32(cc.x), 0).xy;
-      // 深度也走同样的年龄斜坡：新探针的深度图第一帧只摊到约 1 条射线/纹素，噪声极大，
-      // 若沿用 0.03 的慢混合，遮挡判定会带着错误读数持续 ~1 秒（表现是"漏光/发暗慢慢退"）。
-      let a = ddgi_age_alpha(age, DDGI_DEPTH_ALPHA);
+      let prev4 = textureLoad(ddgi_depth, idx, i32(cc.x), 0);
+      let prev = prev4.xy;
+      // 【收敛时钟 = 纹素自己的更新次数，不是探针年龄】射线按「绑定纹素 + 帧轮换」分配后，
+      // 每个深度纹素每 ⌈64/rpp⌉ 帧才拿到 1 条样本（rpp=1 → 64 帧）。而 age 每帧都 +1，
+      // 于是 `ddgi_age_alpha(age, ..)` 的 1/age 斜坡早在 age≈33 就跑完了，之后每次更新
+      // 只按 DDGI_DEPTH_ALPHA=0.03 的地板混 → 有效时间常数被乘上 ⌈64/rpp⌉（rpp=1 ≈2133 帧
+      // / 35s），稳态残噪永远停在 ~12% 不再下降 ⇒ 深度图**长期收敛不了**。室内所有射线都
+      // 打在墙上、Chebyshev 的 wd 时刻生效，mean/std 一直抖 = 8 个角逐帧在入选/落选之间翻
+      // = 整片闪。改成按纹素自己的计数（存 .z，Rgba16Float 整数精确）后，前 33 次更新就是
+      // 1/n 的等权平均 —— 与辐照度用 1/age 是同一条思路，只是时钟换成纹素自己的更新次数。
+      // 【为什么还保留 age 项】换主（相机滚动）时 bake 把 age 压到 1~8，那几帧**必须直写**
+      // 新位置附近的读数（见 bake 的换主说明）；而计数是跨换主继承的（图集不因换主清零）
+      // ⇒ 只有 age 项能在这几帧把 alpha 抬回 1。两者取 max 即可，互不冲突。
+      let n_upd = min(prev4.z + 1.0, DDGI_DEPTH_CONV_SAMPLES);
+      let a = max(ddgi_age_alpha(age, DDGI_DEPTH_ALPHA), 1.0 / n_upd);
       // 【为什么存的是「距离均值的跨帧序列 std」而不是本帧 std】
       // 绑定后每个纹素每 ⌈64/rpp⌉ 帧才拿到一条射线（rpp≈4 → 16 帧），绝大多数帧里
       // cnt 至多为 1 → 本帧 std 恒等于 0 → 采样侧
@@ -240,12 +256,13 @@ fn ddgi_collect_one(tid: u32) {
       let em = mix(prev.x, mean, a);
       let em2 = mix(pm2, mean2, a);
       let dep_std = sqrt(max(em2 - em * em, 0.0));
-      // 存储纹素的 store 值类型是 vec4<f32>（naga 校验要求）：.x = mean、.y = std
+      // 存储纹素的 store 值类型是 vec4<f32>（naga 校验要求）：
+      // .x = mean、.y = std、.z = 本纹素累计更新次数（收敛时钟，采样侧不读）
       textureStore(
         ddgi_depth_out,
         idx,
         i32(cc.x),
-        vec4<f32>(em, dep_std, 0.0, 0.0),
+        vec4<f32>(em, dep_std, n_upd, 0.0),
       );
     } else {
       // 同 irradiance：本帧无样本时把上一帧读数搬到本帧缓冲（含"滚动换主"——旧读数来自

@@ -72,6 +72,22 @@ pub(crate) fn look_forward(yaw: f32, pitch: f32) -> Vec3 {
   Vec3::new(-sin_yaw * cos_pitch, -sin_pitch, -cos_yaw * cos_pitch)
 }
 
+/// 【诊断】GATE_ORBIT=1：相机每帧**边转边沿圆轨迹平移**（0.35 rad/s + 50 体素/s ≈ 2 m/s）。
+///
+/// 用途：复现"相机移动中"才出现的帧时/画质问题。**必须带平移** —— 纯旋转不改变相机所在的
+/// world cell / chunk，滚动网格、chunk 池同步、"最大空子块"重烘这些路径一次都不会触发，
+/// 结果看起来和静止一模一样（第一次就是这么白测的）。半径 ≈ 333 体素（13m），会跨过
+/// LOD0 cell（0.64m）、LOD1~3 cell 与 256 体素的 chunk 边界。
+/// 配 `GATE_BENCH=1` 启动，日志里每 2 秒那行"GPU 逐 pass 均值"就是移动中的统计。
+pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>) {
+  let dt = time.delta_secs();
+  orbit.yaw -= 0.35 * dt;
+  let a = time.elapsed_secs() * 0.15;
+  let speed = 500.0 * dt; // 体素/帧（≈20 m/s @60fps：每 ~13 帧跨一个 256 体素 chunk）
+  orbit.target += Vec3::new(-a.sin(), 0.0, a.cos()) * speed;
+  orbit.clamp();
+}
+
 /// 共享转头：右键拖拽旋转 yaw/pitch。两种模式都生效 —— 轨道是「绕目标转」，幽灵是「原地转头」，
 /// 只有矩阵构造按模式取目标/眼位。`pitch` 已 clamp 到 ±89°，保证视线与 +Y 不共线。
 pub(crate) fn camera_look_input(

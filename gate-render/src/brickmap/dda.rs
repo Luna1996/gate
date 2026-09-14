@@ -227,6 +227,12 @@ static BEAM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
     .map(|v| v == "1")
     .unwrap_or(false)
 });
+// 【已迁移】"眼睛适应总开关"从环境变量搬到了 `EyeAdaptSettings::enabled`（debug overlay 的
+// Eye 页有开关）。`GATE_NO_EYE_ADAPT=1` 仍可用，但只决定**初值**（见 `from_env`）。
+//
+// 【历史待查】上线时报告过"动态掉到个位数帧"，静态 A/B（同会话 on/off）只量到 +0.04ms
+// （histogram 0.02 + update 0.02）⇒ 疑似有一条只在相机移动路径上的开销没被量到。
+// 复现工具：`GATE_ORBIT=1`（相机自动巡航）+ `GATE_BENCH=1`，看逐 pass 哪一项爆掉。
 /// 【诊断】GATE_NO_LUT=1：关闭方向可达掩码剔除（Bitwise Masking A/B 用）。
 /// shader 端 eff = mask（旁路 LUT），lod.w 通道传递。
 static LUT_DISABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -2354,7 +2360,8 @@ use bevy::{
       TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer,
       VertexState,
       binding_types::{
-        sampler, storage_buffer_read_only_sized, texture_2d, texture_3d, texture_storage_2d,
+        sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, texture_3d,
+        texture_storage_2d,
         uniform_buffer,
       },
     },
@@ -2402,10 +2409,116 @@ pub(crate) struct DdaPipelines {
   pub(crate) bg2_layout: BindGroupLayoutDescriptor,
   pub(crate) bg3_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
+  /// BG7：眼睛适应（out_tex 采样视图 + 状态/直方图 storage）
+  eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
   pub(crate) beam_pipeline: CachedComputePipelineId,
   pub(crate) probe_viz_pipeline: CachedComputePipelineId,
+  /// eye_adapt_histogram / eye_adapt_update（各 1 个 WG）
+  eye_histogram_pipeline: CachedComputePipelineId,
+  eye_update_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
+}
+
+/// 眼睛适应的 GPU 状态（一个 288B 的 storage buffer）+ 上一帧时间戳（算 dt）。
+/// word 布局见 bindings.wesl 的 `eye_adapt`。
+#[derive(bevy::ecs::resource::Resource)]
+pub struct EyeAdaptGpu {
+  pub buf: Option<Buffer>,
+  /// 渲染侧墙钟（与 profiler 同源）：适应速度因此与帧率无关
+  pub last: Option<std::time::Instant>,
+  pub bg: Option<BindGroup>,
+  /// 活参数（UI 可调）。挂在 GPU 资源上而不是单独一个 system param ——
+  /// `prepare_dda_bind_groups` 已经是 Bevy 的 16 参数上限，再加一个会失去 SystemParamFunction。
+  pub settings: EyeAdaptSettings,
+  /// 参数区需要重传（`sync_eye_adapt_settings` 置位，prepare 消费；初值 true 保证首帧上传缺省）
+  pub settings_dirty: bool,
+}
+
+impl Default for EyeAdaptGpu {
+  fn default() -> Self {
+    Self {
+      buf: None,
+      last: None,
+      bg: None,
+      settings: EyeAdaptSettings::default(),
+      settings_dirty: true,
+    }
+  }
+}
+
+/// 把 main world 的活参数搬进 [`EyeAdaptGpu`]（**只做搬运**，真正上传在
+/// `prepare_dda_bind_groups` 里做，那里才有 queue 和 buffer 句柄）。
+/// `Res::is_changed` 由 `ExtractResourcePlugin` 在同步时标记 ⇒ 只有 UI 真改过才为真。
+fn sync_eye_adapt_settings(
+  eye_set: Option<Res<EyeAdaptSettings>>,
+  mut eye: ResMut<EyeAdaptGpu>,
+) {
+  let Some(s) = eye_set else {
+    return;
+  };
+  if !s.is_changed() || eye.settings == *s {
+    return;
+  }
+  eye.settings = *s;
+  eye.settings_dirty = true;
+}
+
+/// 眼睛适应（自动曝光）的**活参数**：由 debug overlay 的「Eye」页实时调，改完下一帧生效，
+/// 不用重启也不用重编译 —— 这些值原来是 WESL 里的 `const`。
+///
+/// 传输链路：本资源（main world）→ `ExtractResourcePlugin`（只在变化时才同步进 render world，
+/// 并标记 changed）→ `prepare_dda_bind_groups` 检测 `is_changed()` 后写 buffer 参数区 20B
+/// → 下一帧 WESL 的 `eye_p(i)` 读到新值。**稳态零写入**。
+///
+/// 下标顺序即语义，与 WESL 侧 `eye_p(i)` 一一对应（改这里必须同步 `main.wesl`）。
+#[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
+pub struct EyeAdaptSettings {
+  /// **总开关**：关掉 = 两个 eye pass 停发 + 曝光回落 1.0（= 关闭自动曝光）。
+  /// 不占参数区槽位（host 侧开关，shader 不需要读到它）。初值受 `GATE_NO_EYE_ADAPT=1`
+  /// 影响，之后由 debug overlay 的 Eye 页开关接管。
+  pub enabled: bool,
+  /// [0] 提亮上限（档，≥0）：适应暗处的最大增益 = 2^ev_max
+  pub ev_max: f32,
+  /// [1] 压暗上限（档，≤0）：适应亮处的最大衰减 = 2^ev_min
+  pub ev_min: f32,
+  /// [2] 变亮时间常数（秒）：往亮处适应多快（太小像"闪光"）
+  pub tau_brighten: f32,
+  /// [3] 变暗时间常数（秒）：往暗处适应多快（太小像"眨眼"）
+  pub tau_darken: f32,
+  /// [4] 目标中灰：百分位平均亮度被压到这个值
+  pub key: f32,
+}
+
+impl Default for EyeAdaptSettings {
+  /// 缺省取**保守**值：+6 档（×64）/ −3 档（÷8）。极暗/极亮场景可以现场往 ±12 档推，
+  /// 但上限越大，暗场里的 GI 残噪被同倍放大得越狠。
+  fn default() -> Self {
+    Self { enabled: true, ev_max: 6.0, ev_min: -3.0, tau_brighten: 2.0, tau_darken: 1.0, key: 0.18 }
+  }
+}
+
+impl EyeAdaptSettings {
+  /// 缺省 + 环境变量覆盖：`GATE_NO_EYE_ADAPT=1` 只决定**初值**，之后以面板开关为准
+  /// （保留这个入口是为了无 UI 的自动化 A/B 也能一行命令切）。
+  pub fn from_env() -> Self {
+    let off = std::env::var("GATE_NO_EYE_ADAPT").map(|v| v == "1").unwrap_or(false);
+    Self { enabled: !off, ..Self::default() }
+  }
+}
+
+/// `eye_adapt` buffer 里**参数区**的起始字（= 状态/调试区 8 + 直方图 64）
+const EYE_PARAM_WORD: u64 = 72;
+/// 参数区字节偏移（同 `EYE_PARAM_WORD`）
+const EYE_PARAM_OFFSET: u64 = EYE_PARAM_WORD * 4;
+
+/// 参数区打包：5 个 f32 = 20B，顺序 = WESL `eye_p(i)` 的下标 = [`EyeAdaptSettings`] 字段顺序
+fn eye_param_bytes(s: EyeAdaptSettings) -> [u8; 20] {
+  let mut out = [0u8; 20];
+  for (i, v) in [s.ev_max, s.ev_min, s.tau_brighten, s.tau_darken, s.key].iter().enumerate() {
+    out[i * 4..i * 4 + 4].copy_from_slice(&v.to_bits().to_le_bytes());
+  }
+  out
 }
 
 pub struct BrickMapDdaPlugin;
@@ -2421,8 +2534,11 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<RenderScale>::default(),
       // LightingTheme 提取进 render world（R3-18 直光层：BG3 光池数据源）
       bevy::render::extract_resource::ExtractResourcePlugin::<LightingTheme>::default(),
+      // 眼睛适应的活参数（debug overlay 的 Eye 页可调；变化才同步 → 稳态零上传）
+      bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       crate::responsive::ResponsivePlugin,
     ));
+    app.insert_resource(EyeAdaptSettings::from_env());
 
     // main → render 的 ExtractSchedule：把 DdaCameraConfig 从 main world 读
     // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
@@ -2437,8 +2553,14 @@ impl Plugin for BrickMapDdaPlugin {
       .add_systems(RenderStartup, init_dda_pipelines)
       .add_systems(
         Render,
+        // 活参数搬运（main world 的 EyeAdaptSettings → EyeAdaptGpu）：必须排在 prepare 之前
+        sync_eye_adapt_settings.in_set(RenderSystems::PrepareResources),
+      )
+      .add_systems(
+        Render,
         prepare_dda_bind_groups
           .in_set(RenderSystems::PrepareBindGroups)
+          .after(sync_eye_adapt_settings)
           // prepare_dda_bind_groups 在 prepare (upload.rs) 之后运行：先 upload 写
           // grid_descs_buf 再绑 DDA BG2（同帧最稳，避免差一帧的旧 GridDesc 绑定）。
           .after(super::upload::prepare),
@@ -2485,6 +2607,9 @@ pub(crate) fn init_dda_pipelines(
         uniform_buffer::<DdaViewUniform>(false),
         // @binding(2) beam_depth：低分辨率 r32float，beam pass 写最近命中 t，主 pass 读
         texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
+        // @binding(3) 眼睛适应的状态/直方图（**只读**视图；`dda_main` 只取曝光系数）。
+        // 同一 buffer 在 BG7 以 read_write 被 eye_adapt_* 两个入口读写（不同 pass，屏障保证顺序）。
+        storage_buffer_read_only_sized(false, None),
       ),
     ),
   );
@@ -2542,6 +2667,18 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
+  // ---- BG7：眼睛适应（out_tex 采样视图 + 状态/直方图 storage 读写）----
+  let eye = BindGroupLayoutDescriptor::new(
+    "DdaBgEye",
+    &BindGroupLayoutEntries::sequential(
+      ShaderStages::COMPUTE,
+      (
+        texture_2d(TextureSampleType::Float { filterable: true }),
+        storage_buffer_sized(false, None),
+      ),
+    ),
+  );
+
   // ---- Compute pipeline：shaders/voxel_raytrace/ 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
   let dda_shader = dda_shader.0.clone();
   let layouts = vec![
@@ -2551,6 +2688,11 @@ pub(crate) fn init_dda_pipelines(
     bg3.clone(),
     crate::ddgi::ddgi_bg4_layout(),
   ];
+  // 眼睛适应的两个入口自己的布局：**8 份相同的 eye layout**。
+  // 原因：wgpu 要求 bind group 按索引**从 0 开始成前缀地**设置（跳过低索引直接设高索引会报
+  // "expects a BindGroup to be set at index 0"）；而这两个入口的绑定在 @group(7)。
+  // 于是把同一个 eye BG 依次设到 0~7 —— 每个索引的 layout 必须一致，故这里重复 8 份。
+  let eye_layouts = vec![eye.clone(); 8];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
     layout: layouts.clone(),
@@ -2564,6 +2706,23 @@ pub(crate) fn init_dda_pipelines(
     layout: layouts.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("beam_main")),
+    ..default()
+  });
+  // 眼睛适应（自动曝光）：直方图统计（1 个 WG）+ 适应更新（1 个线程）。
+  // 结构对齐 UE EyeAdaptation：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 →
+  // 反馈 + 分方向时间平滑 → 曝光系数（下一帧 dda_main 读 BG0 binding(3)）。
+  let eye_histogram = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_eye_histogram")),
+    layout: eye_layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("eye_adapt_histogram")),
+    ..default()
+  });
+  let eye_update = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_eye_update")),
+    layout: eye_layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("eye_adapt_update")),
     ..default()
   });
   let probe_viz = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -2603,13 +2762,17 @@ pub(crate) fn init_dda_pipelines(
     bg2_layout: bg2,
     bg3_layout: bg3,
     blit_layout: blit,
+    eye_layout: eye,
     compute_pipeline: compute,
     beam_pipeline: beam,
     probe_viz_pipeline: probe_viz,
+    eye_histogram_pipeline: eye_histogram,
+    eye_update_pipeline: eye_update,
     blit_pipeline,
   });
   commands.insert_resource(LightPoolGpu(UniformBuffer::default()));
   commands.insert_resource(BeamDepthCache::default());
+  commands.insert_resource(EyeAdaptGpu::default());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2617,6 +2780,7 @@ fn prepare_dda_bind_groups(
   mut commands: Commands,
   pipelines: Res<DdaPipelines>,
   gpu_images: Res<RenderAssets<GpuImage>>,
+  mut eye: ResMut<EyeAdaptGpu>,
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
@@ -2659,6 +2823,7 @@ fn prepare_dda_bind_groups(
   u.write_buffer(&render_device, &queue);
 
   let bg0_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_layout);
+  let eye_layout = pipeline_cache.get_bind_group_layout(&pipelines.eye_layout);
   let bg1_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg1_layout);
   let bg2_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg2_layout);
   let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
@@ -2695,11 +2860,74 @@ fn prepare_dda_bind_groups(
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
 
   // ---- BG0：out tex write + view uniform + beam depth rw ----
+  // ---- 眼睛适应的状态/直方图 buffer（word 布局见 bindings.wesl 的 `eye_adapt`）----
+  // 同一 buffer 两处绑定：BG0 binding(3) 只读（`dda_main` 取曝光）+ BG7 binding(1) 读写
+  // （`eye_adapt_*` 写状态/累加直方图）。首帧把曝光初始化为 1.0（否则第一帧全黑）。
+  const EYE_WORDS: u64 = 80;
+  if eye.buf.is_none() {
+    let b = render_device.create_buffer(&BufferDescriptor {
+      label: Some("dda_eye_adapt"),
+      size: EYE_WORDS * 4,
+      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    let mut init = [0u8; (EYE_WORDS * 4) as usize];
+    init[..4].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+    queue.write_buffer(&b, 0, &init);
+    // 参数区初值（首帧 settings_dirty 也会再写一次，这里是保险）
+    queue.write_buffer(&b, EYE_PARAM_OFFSET, &eye_param_bytes(eye.settings));
+    eye.buf = Some(b);
+  }
+  // clone 一份句柄（Buffer 内部是 Arc）：后面还要改 eye.last/eye.bg，避免借用冲突
+  let eye_buf = eye.buf.clone().expect("刚插入");
+  // dt 只在开启眼睛适应时才上传（关闭时这条路径**完全不碰**任何每帧写入 ⇒ 零开销）。
+  // 形状上也可疑：这是 CPU 写、而 GPU 的 eye_adapt_* 也在写同一张 buffer（buffer 粒度的
+  // 写-写冲突），待查清单里的第 ① 条。
+  let now = std::time::Instant::now();
+  if eye.settings.enabled {
+    let dt = eye.last.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32());
+    queue.write_buffer(&eye_buf, 12, &dt.clamp(0.0, 0.25).to_bits().to_le_bytes());
+  }
+  eye.last = Some(now);
+  // 活参数：只在设置变化时上传 20B（稳态零写入，也不去每帧碰这张 GPU 也在写的 buffer）
+  if std::mem::take(&mut eye.settings_dirty) {
+    let s = eye.settings;
+    queue.write_buffer(&eye_buf, EYE_PARAM_OFFSET, &eye_param_bytes(s));
+    // 关掉总开关的瞬间把曝光回落到 1.0：两个 eye pass 同时停发 ⇒ 之后没人再改 word[0]，
+    // 否则画面会"冻结"在关掉那一刻的曝光上（看着像渲染卡住了）。
+    if !s.enabled {
+      queue.write_buffer(&eye_buf, 0, &1.0f32.to_bits().to_le_bytes());
+    }
+    // 每次真正推送都记一行：既是"UI 改完真的到了 GPU"的证据，也方便回看调过哪些值
+    bevy::log::info!(
+      target: "gate",
+      "eye adapt 参数 → GPU：{} EV+ {:.2} / EV- {:.2} / tau+ {:.2}s / tau- {:.2}s / key {:.3}",
+      if s.enabled { "on" } else { "off" },
+      s.ev_max,
+      s.ev_min,
+      s.tau_brighten,
+      s.tau_darken,
+      s.key,
+    );
+  }
+
   let bg0 = render_device.create_bind_group(
     None,
     &bg0_layout,
-    &BindGroupEntries::sequential((&tex_view.texture_view, &u, &beam_view)),
+    &BindGroupEntries::sequential((
+      &tex_view.texture_view,
+      &u,
+      &beam_view,
+      eye_buf.as_entire_binding(),
+    )),
   );
+  // BG7：眼睛适应（out_tex 采样视图 + 状态/直方图读写）
+  let eye_bg = render_device.create_bind_group(
+    None,
+    &eye_layout,
+    &BindGroupEntries::sequential((&tex_view.texture_view, eye_buf.as_entire_binding())),
+  );
+  eye.bg = Some(eye_bg);
 
   // ---- BG1：struct + leaves + palette + globals ----
   // globals：GpuBrickMap.globals 是 UniformBuffer，直接拿 binding
@@ -2763,6 +2991,7 @@ pub(crate) fn dispatch_dda(
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
   bg4: Option<Res<crate::ddgi::DdgiBg4>>,
+  eye: Option<Res<EyeAdaptGpu>>,
   gpu: Option<Res<crate::ddgi::DdgiGpu>>,
   dbg: Option<Res<crate::ddgi::DdgiDebugSettings>>,
   pipeline_cache: Res<PipelineCache>,
@@ -2829,6 +3058,40 @@ pub(crate) fn dispatch_dda(
       },
     );
   }
+
+  // ---- 眼睛适应：直方图统计（1 个 WG）+ 适应更新（1 个线程）----
+  // 必须排在主 pass 之后（统计"本帧已曝光"的画面：反馈环把百分位平均亮度压到目标中灰）；
+  // 曝光系数由下一帧的 `dda_main` 通过 BG0 binding(3) 读到。
+  if eye.as_ref().is_some_and(|e| e.settings.enabled)
+    && let Some(eye_bg) = eye.as_ref().and_then(|e| e.bg.as_ref())
+    && let Some(h) = pipeline_cache.get_compute_pipeline(pipelines.eye_histogram_pipeline)
+      && let Some(u) = pipeline_cache.get_compute_pipeline(pipelines.eye_update_pipeline) {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_eye_histogram",
+          |pass| {
+            pass.set_pipeline(h);
+            // eye pipeline 的布局是 8 份相同 layout ⇒ 必须从 0 起逐个设（见 init_dda_pipelines）
+            for i in 0..8u32 {
+              pass.set_bind_group(i, eye_bg, &[]);
+            }
+            pass.dispatch_workgroups(1, 1, 1);
+          },
+        );
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_eye_update",
+          |pass| {
+            pass.set_pipeline(u);
+            for i in 0..8u32 {
+              pass.set_bind_group(i, eye_bg, &[]);
+            }
+            pass.dispatch_workgroups(1, 1, 1);
+          },
+        );
+      }
 
   if dbg.is_some_and(|d| d.probe_viz)
     && let Some(ddgi) = gpu.as_ref()

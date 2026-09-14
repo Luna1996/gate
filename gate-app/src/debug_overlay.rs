@@ -107,6 +107,18 @@ struct EditMaterialValueLabel;
 #[derive(Component)]
 struct EditMaterialSwatch;
 
+/// 眼睛适应参数滑块（值 = 参数下标 0..5，与 WESL `eye_p(i)` / Rust `EyeAdaptSettings` 同序）
+#[derive(Component)]
+struct EyeParamSlider(u8);
+
+/// 眼睛适应参数的实时数值标签（值 = 参数下标，与滑块配对）
+#[derive(Component)]
+struct EyeParamValue(u8);
+
+/// 眼睛适应**总开关**（取代 GATE_NO_EYE_ADAPT 环境变量；关掉 = 两个 eye pass 停发 + 曝光回 1.0）
+#[derive(Component)]
+struct EyeAdaptToggle;
+
 const DDGI_PROBE_VIZ_LODS: [&str; 5] = ["All", "LOD 0", "LOD 1", "LOD 2", "LOD 3"];
 
 const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
@@ -116,6 +128,11 @@ const DDGI_STAGES: [&str; 4] = ["Off", "Active", "Cast", "Full"];
 /// 速度显示文本（voxel/s；1 voxel = 2cm）
 fn speed_text(v: f32) -> String {
   format!("{} v/s", v.round() as i32)
+}
+
+/// Eye 页数值标签文本：统一 2 位小数（滑块的步长有 0.25 / 0.1 / 0.01 三档，2 位足够读）
+fn value_text(v: f32) -> String {
+  format!("{v:.2}")
 }
 
 /// 笔触跨度文本：size → (2N-1)³ 的边长（纯 ASCII，避免字体缺字形成方框）
@@ -141,10 +158,12 @@ pub(crate) fn fps3(v: f32) -> u32 {
 }
 
 /// 左上角 debug-view 面板：**固定宽度 360px、高度 auto**（随当前 Tab 页内容收缩）。
-/// TabView（fit_content 自适应高度模式）三页：
+/// TabView（fit_content 自适应高度模式）五页：
 /// - Stats：FPS 读数 / 相机信息 / VSync / UI Showcase
 /// - DDGI：阶段档 / 调试模式 / Gain / Probe Viz / LOD
 /// - Camera：轨道↔幽灵模式开关 / 飞行速度 / 操作说明
+/// - Edit：体素编辑笔触（形状 / 大小 / 材质）
+/// - Eye：眼睛适应（自动曝光）活参数（EV 上下限 / 时间常数 / 目标中灰）
 ///
 /// **所有控件的初始状态都从对应 Resource 读取**（UI 只是资源的视图）—— 缺省值只在
 /// `DdgiStage::from_env` / `DdgiDebugSettings::default` / `camera` 里写一次，
@@ -171,6 +190,10 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
     .clamp(crate::camera::FLY_SPEED_MIN, crate::camera::FLY_SPEED_MAX);
   let edit = world.get_resource::<EditSettings>().copied().unwrap_or_default();
   let edit_mat = edit.material.min(EDIT_MATERIALS.len() - 1);
+  let eye_set = world
+    .get_resource::<gate_render::EyeAdaptSettings>()
+    .copied()
+    .unwrap_or_default();
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
   // 绝对定位根：定宽 + 高度 auto（TabView fit_content 随活动页收缩）；外框/底色本节点提供
@@ -230,6 +253,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             "DDGI".into(),
             "Camera".into(),
             "Edit".into(),
+            "Eye".into(),
           ],
           active: 0,
           fit_content: true,
@@ -694,6 +718,88 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           });
         });
       strip_last_cell_bottom(root.world_mut(), tv.contents[3]);
+      // ============ Tab 4：Eye（眼睛适应 / 自动曝光的活参数）============
+      // 链路：这里改 → `EyeAdaptSettings`（ExtractResource 变化才同步进 render world）→
+      // `prepare_dda_bind_groups` 见 is_changed 写 buffer 参数区 20B → 下一帧 WESL `eye_p(i)` 读。
+      // 所以拖动滑块**立即生效**（不用重启、不用重编译）。
+      root
+        .world_mut()
+        .entity_mut(tv.contents[4])
+        .with_children(|page| {
+          let g = tab_page_grid(ctx, page);
+          page.world_mut().entity_mut(g).with_children(|g| {
+            // -- 总开关（= 原来的 GATE_NO_EYE_ADAPT=1，现在运行时可切）--
+            let tcell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(tcell).with_children(|cell| {
+              let t = toggle_switch(
+                ctx,
+                cell,
+                ToggleSwitchConfig {
+                  text: Some("Auto exposure".into()),
+                  checked: eye_set.enabled,
+                  ..default()
+                },
+              );
+              cell.world_mut().entity_mut(*t).insert(EyeAdaptToggle);
+            });
+            // (参数下标, 标签, min, max, step, 初值) —— 下标顺序与 WESL `eye_p(i)` 一致
+            for (idx, name, min, max, step, val) in [
+              (0u8, "EV up", 0.0f32, 12.0f32, 0.25f32, eye_set.ev_max),
+              (1, "EV dn", -12.0, 0.0, 0.25, eye_set.ev_min),
+              (2, "Tau up", 0.1, 8.0, 0.1, eye_set.tau_brighten),
+              (3, "Tau dn", 0.1, 8.0, 0.1, eye_set.tau_darken),
+              (4, "Key", 0.02, 0.5, 0.01, eye_set.key),
+            ] {
+              let cell = tab_cell(ctx, g);
+              g.world_mut().entity_mut(cell).with_children(|cell| {
+                cell
+                  .spawn((
+                    Name::new("eye-param-row"),
+                    Node {
+                      flex_direction: FlexDirection::Row,
+                      column_gap: px(ctx.theme.metrics.spacing.md),
+                      align_items: AlignItems::Center,
+                      ..default()
+                    },
+                  ))
+                  .with_children(|row| {
+                    label(
+                      ctx,
+                      row,
+                      LabelConfig {
+                        text: name.into(),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    let s = slider(
+                      ctx,
+                      row,
+                      SliderConfig {
+                        min,
+                        max,
+                        value: val,
+                        step: Some(step),
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*s).insert(EyeParamSlider(idx));
+                    let vl = label(
+                      ctx,
+                      row,
+                      LabelConfig {
+                        text: value_text(val),
+                        style: LabelStyle::Muted,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*vl).insert(EyeParamValue(idx));
+                  });
+              });
+            }
+          });
+        });
+      strip_last_cell_bottom(root.world_mut(), tv.contents[4]);
     });
 
   // 「右上角面板」开关 → 切换 showcase 整体显隐（ShowcaseRoot 的 Visibility）
@@ -758,6 +864,58 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         "DDGI stage → {} ({})",
         ddgi.0,
         DDGI_STAGES.get(v as usize).unwrap_or(&"?")
+      );
+    },
+  );
+
+  // 「Eye」页总开关 → EyeAdaptSettings.enabled（关掉 = 两个 eye pass 停发 + 曝光回落 1.0）
+  world.add_observer(
+    |ev: On<ToggleSwitchToggled>,
+     q_toggle: Query<(), With<EyeAdaptToggle>>,
+     mut eye: ResMut<gate_render::EyeAdaptSettings>| {
+      if q_toggle.get(ev.entity).is_err() {
+        return;
+      }
+      eye.enabled = ev.checked;
+      info!(
+        target: "gate",
+        "eye adapt 总开关 → {}",
+        if ev.checked { "on" } else { "off" }
+      );
+    },
+  );
+
+  // 「Eye」页参数滑块 → 写 EyeAdaptSettings（渲染侧下一帧见 is_changed 后上传 20B 到参数区）。
+  // 立刻生效：不用重启、不用重编译。
+  world.add_observer(
+    |ev: On<SliderValueChanged>,
+     q_slider: Query<&EyeParamSlider>,
+     mut q_label: Query<(&EyeParamValue, &mut Text)>,
+     mut eye: ResMut<gate_render::EyeAdaptSettings>| {
+      let Ok(sl) = q_slider.get(ev.entity) else {
+        return;
+      };
+      let v = ev.value;
+      match sl.0 {
+        0 => eye.ev_max = v,
+        1 => eye.ev_min = v,
+        2 => eye.tau_brighten = v.max(0.01),
+        3 => eye.tau_darken = v.max(0.01),
+        _ => eye.key = v.max(0.001),
+      }
+      for (idx, mut t) in &mut q_label.iter_mut() {
+        if idx.0 == sl.0 {
+          t.0 = value_text(v);
+        }
+      }
+      info!(
+        target: "gate",
+        "eye adapt: EV+ {:.2} / EV- {:.2} / tau+ {:.2}s / tau- {:.2}s / key {:.3}",
+        eye.ev_max,
+        eye.ev_min,
+        eye.tau_brighten,
+        eye.tau_darken,
+        eye.key
       );
     },
   );

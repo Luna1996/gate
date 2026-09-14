@@ -20,35 +20,15 @@
 use bevy::render::render_resource::{CachedComputePipelineId, ShaderType};
 use glam::{IVec3, IVec4, UVec3, UVec4, Vec4};
 
-/// 辐照度图每探针 4×4（= 16 纹素）。
-///
-/// 【为什么不用原版的 8×8】曾对齐 DDGI 原版试过 8×8 / 16×16（见 DEPTH_TEXELS 注释）：
-/// 实测**画质没有明显改善**，代价却很实在（显存 ×4、collect 线程 ×4、帧轮换周期 ×4）。
-/// 方向分辨率降低带来的模糊由 DDGI_ALPHA 的时间累积与纹素间插值承担。
-/// 必须与 WGSL `DDGI_IRR_TEXELS` 一致。
-pub const IRRADIANCE_TEXELS: u32 = 4;
-/// 深度图每探针 8×8（= 64 纹素）。
-///
-/// 【为什么不用原版的 16×16】曾试过 16×16（每纹素 ~11°，现在 ~22°）：**实测漏光没有明显
-/// 改善** —— 说明当时的漏光主因不在深度角分辨率，而在别处（射线方向未绑定纹素 / 跨墙指向 /
-/// 级联硬切，见 shaders/voxel_raytrace/ 对应注释；其中跨墙指向对应的旧"借针"机制现已删除）。代价则是深度图集
-/// 64MB → 256MB、collect 线程 80 → 320、帧轮换周期 ×4。故回退到 8×8。
-/// 必须与 WGSL `DDGI_DEPTH_TEXELS` 一致。
-pub const DEPTH_TEXELS: u32 = 8;
-pub const PROBE_T_MAX: f32 = 8192.0;
-/// 每帧射线总预算。WGSL `ddgi_seal` 把它**均分**给全部活跃探针（rpp = 预算 / 活跃数，
-/// 钳在 [1, 256]），所以这是一条直接线性的画质/帧时旋钮：减半 → cast/collect 的帧时也
-/// 大致减半，代价是每探针样本减半、图集噪声变大。
-///
-/// 【历史】曾试过 262144 / 1048576 来压制"探针晶格亮斑"与深度闸门抖动，**帧时涨了但问题
-/// 没解决**（根因是探针网格对贴缝尺度欠采样 + 深度的角度均值偏差，不是射线数量），已退回
-/// 131072。若要再动这条线，请先备好可验证的收益。
-/// 必须与 WGSL `DDGI_RAY_BUDGET` 保持一致。
-pub const DDGI_RAY_BUDGET: u32 = 131072;
+use crate::wesl_consts::ddgi_consts;
 
+// 图集纹素数（irr / depth）与每帧射线预算（`DDGI_RAY_BUDGET`）的**权威值都在 WESL**
+// （`ddgi/consts.wesl` 的 `DDGI_IRR_TEXELS` / `DDGI_DEPTH_TEXELS` / `DDGI_RAY_BUDGET`）：
+// Rust 侧由 `wesl_consts::ddgi_consts()` 启动时解析**同一份源码**得到，不再各留一份副本
+// —— 原先两处各写一份，出现过「预算一边 131072、一边 65536 → rpp 静默减半」的漂移。
+// 为什么取 4×4 / 8×8、动预算的代价是什么，见 WESL 那三条常量各自的注释（那里既是文档
+// 也是唯一的调参入口）。
 pub const DDGI_LODS: u32 = 4;
-/// 最细 LOD 的 cell 边长（voxel）。
-pub const DDGI_BASE_CELL: i32 = 16;
 /// 4 级 LOD cell 边长（voxel），等比 ×2。
 ///
 /// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [16,32,64,128]：
@@ -63,13 +43,6 @@ pub const DDGI_BASE_CELL: i32 = 16;
 /// **cell 与 dims 是一对此消彼长的量**：要"覆盖更大 + 间距不变"，只能加大 dims
 /// （或增加级数），代价落在 collect/sort/图集，而不是改 cell。
 pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
-/// 各级 LOD 的 cell 维度（4 级相同）。每级 cell ×2 且维度不变 → 覆盖范围逐级 ×2，
-/// 形成严格嵌套的级联。水平 32 格、垂直 16 格（体素世界水平视野远大于垂直）。
-/// cell [16,32,64,128] 时各级覆盖范围 = dims×cell：
-/// 512×256×512 / 1024×512×1024 / 2048×1024×2048 / 4096×2048×4096 voxel
-/// = 10.2×5.1×10.2 / 20.5×10.2×20.5 / 41×20.5×41 / 82×41×82 m（半宽到 ±41m）。
-/// 每级 16384 槽 → 共 65536 槽（= 占位纹理容量，全部槽位可采样）。
-pub const DDGI_LOD_DIMS: UVec3 = UVec3::new(32, 16, 32);
 // 槽位映射是**世界锚定**的：shader 里 `slot = slot_base + (世界 cell 号 mod dims)`（见
 // `ddgi_slot`）。因此「槽位 ↔ 世界 cell」的身份与相机无关 —— 相机滚动只会让「新进入窗口的
 // 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份，图集不会因相机
@@ -275,16 +248,9 @@ pub struct DdgiLod0Chunks {
   pub chunks: Vec<IVec3>,
 }
 
-// indirect args / 计数器合一 buffer（word 布局与 WGSL DDGI_INDIR_* 对应）：
-//   [0..16) cast args ×4 LOD；[16..32) collect args ×4 LOD；[32..36) rpp；[36..40) 活跃计数器
-pub const DDGI_INDIRECT_BYTES: u64 = 256;
-pub const DDGI_COUNTER_CLEAR_OFFSET: u64 = 36 * 4;
-pub const DDGI_COUNTER_CLEAR_BYTES: u64 = 16;
-pub const DDGI_WORKLIST_ITEM_BYTES: u64 = 16; // vec4(probe_pos.xyz, packed age|lod)
-/// meta word = age(8 bit) | ENABLED<<8 | ACTIVE<<9；0 = 无探针哨兵。
-pub const DDGI_META_ENABLED: u32 = 1 << 8;
-/// ACTIVE：本帧需要投线（本 cell 或 6 邻接有体素/物体，且不在更细 LOD 覆盖内）。
-pub const DDGI_META_ACTIVE: u32 = 1 << 9;
+// indirect args / 计数器合一 buffer 的 word 布局（cast args / collect args / rpp / 活跃计数器）
+// **权威值在 WESL**：`bindings.wesl` 的 `DDGI_INDIR_*_BASE`。Rust 只按解析出的 word 偏移算
+// 字节偏移与清零区间（见 `wesl_consts::DdgiConsts::indirect_bytes` 等）—— 布局改动只需改 WESL。
 
 #[inline]
 fn align_down(v: i32, a: i32) -> i32 {
@@ -775,16 +741,18 @@ fn ddgi_indirect_buffer(
   label: &str,
 ) -> bevy::render::render_resource::Buffer {
   use bevy::render::render_resource::{BufferDescriptor, BufferUsages};
+  // 字节数由 WESL 的 word 布局推出（`DDGI_INDIR_*_BASE` / 计数器段 + 每 LOD 一个 word）。
+  let bytes = ddgi_consts().indirect_bytes();
   let buf = device.create_buffer(&BufferDescriptor {
     label: Some(label),
-    size: DDGI_INDIRECT_BYTES,
+    size: bytes,
     usage: BufferUsages::STORAGE
       | BufferUsages::INDIRECT
       | BufferUsages::COPY_DST
       | BufferUsages::COPY_SRC,
     mapped_at_creation: false,
   });
-  queue.write_buffer(&buf, 0, &vec![0u8; DDGI_INDIRECT_BYTES as usize]);
+  queue.write_buffer(&buf, 0, &vec![0u8; bytes as usize]);
   buf
 }
 
@@ -798,38 +766,24 @@ fn ddgi_array_view(
   })
 }
 
-/// irradiance / depth 图集容量：每层 `40×40 = 1600` 探针 × 256 层 = **409600**。
+/// 图集容量（可寻址探针槽位上限）与射线样本缓冲的说明。
 ///
-/// 【为什么是 40 / 现在的余量有多紧】LOD0 改为 chunk 锚定后，总槽位 = LOD0 池高水位
-/// （nuke.vox：86 chunk × 4096 = 352256）+ LOD1~3 的世界规则网格（44640 + 5760 + 800）
-/// = **403456**，距 409600 只剩 6144（改造前 393776）。**余量已经很薄**：世界再大一点、
-/// 或 LOD0 需要更多 chunk 段，就会越界。真要扩，先看这两条测试。
+/// 【容量从哪来】`DDGI_ATLAS_LAYERS × DDGI_PROBES_PER_LAYER_AXIS²` —— 两个量都是 WESL 侧的
+/// 权威值（见 `consts.wesl`），这里只经 `wesl_consts::ddgi_consts()` 读取。当前 40×40×256
+/// = **409600**：nuke.vox 下总槽位 = LOD0 池高水位（86 chunk × 4096 = 352256）+ LOD1~3
+/// （44640 + 5760 + 800）= **403456**，余量只剩 6144。**余量很薄**：世界再大一点、或 LOD0
+/// 多领几个 chunk 段就会越界。
 ///
 /// ⚠️ 池 / `from_world` **都不做钳制**：超出容量会静默越界写图集。约束由测试守着 ——
 /// `world_grid_layout_and_atlas_capacity`（旧规则网格）与 `chunk_lod0_atlas_capacity`
-/// （新 chunk 池 + LOD1~3）断言实际场景的 total_slots ≤ 容量，
-/// `wgsl_compile.rs::ddgi_worklist_pack_covers_atlas_capacity` 断言容量本身装得进 worklist
-/// 的 19 位 cell 下标。
-pub const DDGI_ATLAS_LAYERS: u32 = 256;
-pub const DDGI_ATLAS_PROBES_PER_LAYER_AXIS: u32 = 40;
-/// 阶段二射线样本缓冲：每样本 2×vec4 = (方向.xyz, 命中距离) + (辐亮度.xyz, 1)。
+/// （新 chunk 池 + LOD1~3）断言实际场景的 total_slots ≤ 容量，`wesl_consts` 的单测断言
+/// 容量装得进 worklist 的 cell 下标位宽。
 ///
-/// 样本下标 = **全局射线编号**（`ddgi_cast` 里 `si = tid * 2`）。容量必须覆盖 `total_ray`
-/// 上界 —— 而它不是 `DDGI_RAY_BUDGET`：seal 的 `rpp = max(1, BUDGET / total_active)` 有
-/// **下限 1**，所以活跃探针数超过预算时 `total_ray = total_active`（每针 1 条），上界是
-/// **总槽位数**（每个活跃探针占一个不同槽位）。
-///
-/// 【旧前提已失效】原注释断言"seal 保证全局射线总数 ≤ DDGI_RAY_BUDGET" —— 那建立在
-/// "总活跃探针数 ≤ 槽数 65536 < 预算 131072"之上。dims 改成按世界 AABB 算之后槽位涨到
-/// 39 万，该前提不成立；越界写被 wgpu 丢弃（不报错）→ 那些探针的样本恒 0 → **成片无 GI**。
-pub const DDGI_SAMPLE_SLOTS: u32 = DDGI_RAY_BUDGET;
-pub const DDGI_SAMPLE_BYTES: u64 = (DDGI_SAMPLE_SLOTS as u64) * 32;
-
-/// 覆盖 `total_slots` 个探针所需的样本缓冲字节数（见 `DDGI_SAMPLE_SLOTS` 的说明）。
-#[inline]
-fn ddgi_sample_bytes(total_slots: u32) -> u64 {
-  DDGI_RAY_BUDGET.max(total_slots) as u64 * 32
-}
+/// 【样本缓冲容量】每样本 2×vec4 = (方向.xyz, 命中距离) + (辐亮度.xyz, 1)，下标 = 全局射线
+/// 编号（`ddgi_cast` 的 `si = tid * 2`）。容量**不是** `ray_budget`：seal 的
+/// `rpp = max(1, BUDGET / total_active)` 有下限 1，活跃探针数超过预算时
+/// `total_ray = total_active`，上界是**总槽位数**；越界写被 wgpu 静默丢弃 → 那些探针恒 0
+/// → 成片无 GI。故取 `max(预算, 总槽位)`，见 `wesl_consts::DdgiConsts::sample_bytes`。
 
 fn ddgi_array_tex(
   device: &bevy::render::renderer::RenderDevice,
@@ -845,7 +799,7 @@ fn ddgi_array_tex(
     size: Extent3d {
       width: size.0,
       height: size.1,
-      depth_or_array_layers: DDGI_ATLAS_LAYERS,
+      depth_or_array_layers: ddgi_consts().atlas_layers,
     },
     mip_level_count: 1,
     sample_count: 1,
@@ -872,7 +826,7 @@ fn zero_array_tex(
   use bevy::render::render_resource::{
     Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
   };
-  let bytes = (size.0 * size.1 * DDGI_ATLAS_LAYERS * bytes_per_texel) as usize;
+  let bytes = (size.0 * size.1 * ddgi_consts().atlas_layers * bytes_per_texel) as usize;
   bevy::log::info!(target: "gate", "DDGI 图集清零 {label}: {:.1}MB", bytes as f64 / (1 << 20) as f64);
   let data = vec![0u8; bytes];
   queue.write_texture(
@@ -891,7 +845,7 @@ fn zero_array_tex(
     Extent3d {
       width: size.0,
       height: size.1,
-      depth_or_array_layers: DDGI_ATLAS_LAYERS,
+      depth_or_array_layers: ddgi_consts().atlas_layers,
     },
   );
 }
@@ -902,8 +856,9 @@ fn init_ddgi_gpu(
   queue: bevy::ecs::system::Res<bevy::render::renderer::RenderQueue>,
 ) {
   use bevy::render::render_resource::TextureFormat;
-  let irr_axis = DDGI_ATLAS_PROBES_PER_LAYER_AXIS * IRRADIANCE_TEXELS;
-  let dep_axis = DDGI_ATLAS_PROBES_PER_LAYER_AXIS * DEPTH_TEXELS;
+  let c = ddgi_consts();
+  let irr_axis = c.probes_per_layer_axis * c.irr_texels;
+  let dep_axis = c.probes_per_layer_axis * c.depth_texels;
   let mk_atlas = |label: &str, format: TextureFormat, size: (u32, u32), bpt: u32| {
     let tex = ddgi_array_tex(&device, label, format, size);
     // 两侧都要清零：首帧 BG4 采样 a、collect 写 b；翻转后 a 才被写，不清零会读到未初始化显存。
@@ -928,7 +883,7 @@ fn init_ddgi_gpu(
   // LOD0 chunk 段表 + 保留前缀（同一 buffer，见 `DdgiGpu::cell_slot` 注释）。
   // 内容尺寸随世界 AABB / LOD0 chunk 集变化 → 这里只放占位，`prepare_ddgi` 按构建键重建。
   let cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", 4);
-  let samples = zero_storage_buffer(&device, &queue, "ddgi_samples", DDGI_SAMPLE_BYTES);
+  let samples = zero_storage_buffer(&device, &queue, "ddgi_samples", c.sample_bytes(0));
   let indirect = ddgi_indirect_buffer(&device, &queue, "ddgi_indirect");
   let args = ddgi_indirect_buffer(&device, &queue, "ddgi_args");
 
@@ -1161,8 +1116,9 @@ fn dispatch_ddgi(
       bg5.as_ref(),
     ) {
       // cast / collect 各一次间接 dispatch（覆盖全部 LOD；LOD 由 shader 用 seal 写的前缀和还原）。
-      // 注意两个 args 必须放在不同 buffer 段：cast 在 ddgi_args 词 0（字节 0），
-      // collect 在词 16（字节 64）。
+      // 两个 args 段的字节偏移取自 WESL 的 `DDGI_INDIR_CAST_BASE` / `DDGI_INDIR_COLL_BASE`。
+      let c = ddgi_consts();
+      let (cast_off, coll_off) = (c.args_cast_offset(), c.args_coll_offset());
       crate::profiler::gpu_compute_pass(
         &mut profiler,
         ctx.command_encoder(),
@@ -1170,7 +1126,7 @@ fn dispatch_ddgi(
         |pass| {
           pass.set_pipeline(p_cast);
           set_bgs(pass, &bg4.0);
-          pass.dispatch_workgroups_indirect(&gpu.args, 0);
+          pass.dispatch_workgroups_indirect(&gpu.args, cast_off);
         },
       );
       crate::profiler::gpu_compute_pass(
@@ -1181,7 +1137,7 @@ fn dispatch_ddgi(
           pass.set_pipeline(p_coll);
           set_bgs(pass, &bg4.0);
           pass.set_bind_group(5, &bg5.0, &[]);
-          pass.dispatch_workgroups_indirect(&gpu.args, 64);
+          pass.dispatch_workgroups_indirect(&gpu.args, coll_off);
         },
       );
       // 本帧写过图集 → 下一帧采样侧翻到刚写完的那一半
@@ -1338,15 +1294,15 @@ fn prepare_ddgi(
   //   [total_slots, +num_chunks)              chunk_base（未分配 = DDGI_CHUNK_NO_BASE 哨兵）
   //   [total_slots+num_chunks, +lod0_slots)   slot_chunk（LOD0 局部槽 → chunk 线性下标）
   // 构建键（total / chunk 数 / LOD0 槽数 / 池 serial）变了才重建 —— 内容尺寸变化、或池发生了
-  // 「领段/归还」都要重铺。前段保留前缀仍按 identity 铺（只为让后面两张表的偏移不变，
-  // 由 WGSL 的 `misc.y` = total_slots 定位）。
+  // 「领段/归还」都要重铺。前缀 `[0, total)` 是**每槽位的「屏幕使用」漏桶计数**（着色侧 +1、
+  // `ddgi_sort` 每帧 -1，见 WGSL `ddgi_usage_mark` / `DDGI_USAGE_STICKY`）→ 必须清零。
   let key = (total, num_chunks, lod0_slots, gpu.pool.serial);
   if gpu.cell_slot_key != Some(key) {
     let words = (total + num_chunks + lod0_slots) as usize;
     let mut buf: Vec<u8> = Vec::with_capacity(words * 4);
-    for i in 0..total {
-      buf.extend_from_slice(&i.to_le_bytes());
-    }
+    // 计数前缀归零（旧实现铺 identity 只为了占位，现在这段有读者了：非零值会让工作集立刻
+    // 退化回"全体活跃探针"，等于没优化）。
+    buf.resize(total as usize * 4, 0);
     for l in 0..num_chunks {
       let b = gpu.pool.bases[l as usize];
       buf.extend_from_slice(&b.to_le_bytes());
@@ -1373,7 +1329,7 @@ fn prepare_ddgi(
     &queue,
     &mut gpu.samples,
     "ddgi_samples",
-    ddgi_sample_bytes(total),
+    ddgi_consts().sample_bytes(total),
   );
 
   gpu.frame = gpu.frame.wrapping_add(1);
@@ -1424,11 +1380,11 @@ fn prepare_ddgi(
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
 
-  // 每帧清零活跃计数器（indirect words [36..40)）；indirect args 由 seal 当帧覆写。
+  // 每帧清零活跃探针计数器段；indirect args 由 seal 当帧覆写。
   queue.write_buffer(
     &gpu.indirect,
-    DDGI_COUNTER_CLEAR_OFFSET,
-    &[0u8; DDGI_COUNTER_CLEAR_BYTES as usize],
+    ddgi_consts().counter_clear_offset(),
+    &vec![0u8; ddgi_consts().counter_clear_bytes() as usize],
   );
 
   // ---- BG4（图集采样侧 + 各 pass 共用缓冲）----
@@ -1538,12 +1494,10 @@ mod tests {
     assert_eq!(g.total_slots, acc);
     assert!(!g.is_empty());
     // 【关键】nuke.vox 量级下必须装得进图集 —— 否则运行期会越界写图集
-    let capacity = DDGI_ATLAS_LAYERS
-      * DDGI_ATLAS_PROBES_PER_LAYER_AXIS
-      * DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
+    let capacity = ddgi_consts().atlas_capacity();
     assert!(
       g.total_slots <= capacity,
-      "槽位 {} 超出图集容量 {}（需调大 DDGI_ATLAS_PROBES_PER_LAYER_AXIS）",
+      "槽位 {} 超出图集容量 {}（需调大 DDGI_PROBES_PER_LAYER_AXIS / DDGI_ATLAS_LAYERS）",
       g.total_slots,
       capacity
     );
@@ -1651,13 +1605,17 @@ mod tests {
     let lod0_slots = 86 * DDGI_CHUNK_LOD0_SLOTS;
     let g = DdgiWorldGrid::from_world(IVec3::new(-454, 16, -56), IVec3::new(1478, 631, 1080));
     let total = lod0_slots + g.lod_count(1) + g.lod_count(2) + g.lod_count(3);
-    let capacity =
-      DDGI_ATLAS_LAYERS * DDGI_ATLAS_PROBES_PER_LAYER_AXIS * DDGI_ATLAS_PROBES_PER_LAYER_AXIS;
+    let c = ddgi_consts();
+    let capacity = c.atlas_capacity();
     assert!(
       total <= capacity,
       "LOD0 chunk 池 + LOD1~3 总槽位 {total} 超出图集容量 {capacity}",
     );
-    assert!(lod0_slots <= 0x7FFFF, "LOD0 局部下标必须装进 worklist 的 19 位");
+    assert!(
+      lod0_slots <= c.wl_idx_mask,
+      "LOD0 局部下标必须装进 worklist 的 cell 下标位宽（0x{:X}）",
+      c.wl_idx_mask
+    );
   }
 
   // ==========================================================================

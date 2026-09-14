@@ -4,14 +4,16 @@ pub mod lighting;
 pub mod profiler;
 mod responsive;
 pub mod shader;
+pub mod wesl_consts;
 
 use bevy::prelude::*;
 
 pub use brickmap::{
   BindingLimits, BrickMapBuffers, BrickMapBuilder, BrickMapGlobals, BrickMapView, BufferLayout,
   BuilderMirror, ChunkUpdate, DdaCameraConfig, DdaImages, DdaViewUniform, DebugNormals,
-  DirtyRanges, GpuBrickMap, GridDesc, OrbitCamera, UploadBudget, UploadCpuSample,
-  UploadCpuSampleChannel, UploadSnapshot, VolumeHit, VolumesBuilder, VolumesSnapshot, VoxelScene,
+  DirtyRanges, EyeAdaptSettings, GpuBrickMap, GridDesc, OrbitCamera, UploadBudget,
+   UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VolumeHit, VolumesBuilder,
+   VolumesSnapshot, VoxelScene,
   cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip,
   cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes, cpu_reference_volumes_occluded,
   create_dda_image,

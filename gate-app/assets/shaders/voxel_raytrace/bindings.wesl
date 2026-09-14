@@ -4,6 +4,10 @@
 // @binding(2) = beam depth storage（r32float，低分辨率最近命中 t；beam pass 写，主 pass 读）
 @group(0) @binding(0) var out_tex: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
+/// @binding(3)：眼睛适应的状态/直方图（**只读**视图，给 `dda_main` 取曝光系数）。
+/// 同一 buffer 在 @group(7) @binding(1) 以 read_write 被 `eye_adapt_*` 两个入口读写
+/// （读写落在不同 pass，pass 边界即屏障；布局见 bindings.wesl 末尾的说明）。
+@group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 
 // P3 beam 比例：低分辨率 = 全分辨率 / BEAM_DIV（4 = 1/4 分辨率，像素数 1/16）
 const BEAM_DIV: u32 = 4u;
@@ -156,12 +160,17 @@ struct DdgiUniform {
 @group(4) @binding(8) var<storage, read_write> ddgi_cell_id: array<vec4<i32>>;
 // 9：阶段二 cast 输出的射线样本：每样本 2 个 vec4 = (方向.xyz, 命中距离) / (辐亮度.xyz, 1)
 @group(4) @binding(9) var<storage, read_write> ddgi_samples: array<vec4<f32>>;
-/// LOD0 的两张 chunk 段表 + 一段**无读者**的保留前缀。
+/// LOD0 的两张 chunk 段表 + 一段**每槽位的「屏幕使用」漏桶计数**。
+///
+/// 【前缀 [0, total_slots) = 使用计数】着色侧每帧给"它采样到的探针槽位"记一次（见
+/// `ddgi_usage_mark` / DDGI_USAGE_STICKY），`ddgi_sort` 读一次并衰减一次 —— 它是"这个探针的
+/// 数据会不会被屏幕用到"的**直接度量**，工作集选择就靠它（取代了旧的按距离节流）。
+/// Rust 侧重建本 buffer 时把这段**填 0**（旧的 identity 填充会让每个槽位一上来就"被用过"）。
 ///
 /// 【旧「cell → slot 借针间接表」已删】它曾允许"本格放不出探针"的 cell 指向邻近 cell 的探针。
 /// 放置规则改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，这个需求消失，
-/// 因此 `ddgi_slot` 直接返回 `ddgi_slot_own`，前段 `[0, total_slots)` 不再被任何代码读取
-/// （Rust 侧仍按 identity 铺一遍以保持下面的偏移不变，见 `DdgiGpu::cell_slot`）。
+/// 因此 `ddgi_slot` 直接返回 `ddgi_slot_own`，前段 `[0, total_slots)` 不再被任何寻址代码读取
+/// （只有上面的使用计数在读写它）。
 ///
 /// 【为什么复用这张 buffer 放 chunk 表】BG4 的 storage binding 已用满 8 个（WGSL 下限），
 /// 不再新增 binding：`[total_slots, +num_chunks)` = chunk_base，之后到 `+lod0_slots`
@@ -172,7 +181,8 @@ struct DdgiUniform {
 // 只放两个存储纹理：其它缓冲（worklist / samples / indirect / uniform）全部复用 BG4 的绑定。
 // 同一 buffer 若同时在两个 bind group 里以「只读 + 读写」两种方式绑定，wgpu 会判定使用冲突。
 @group(5) @binding(0) var ddgi_irr_out: texture_storage_2d_array<rgba16float, write>;
-// depth 写入侧：.x = mean（绑定纹素的命中距离均值）、.y = std（该均值的跨帧标准差）。
+// depth 写入侧：.x = mean（绑定纹素的命中距离均值）、.y = std（该均值的跨帧标准差）、
+// .z = 本纹素累计更新次数（混色权重的收敛时钟，见 collect 的深度分支 / DDGI_DEPTH_CONV_SAMPLES）。
 // 与采样侧读法一一对应；存 std 而不是 mean² 是为了避免 f16 溢出/掉精度（mean² 可达 8192²）。
 @group(5) @binding(1) var ddgi_depth_out: texture_storage_2d_array<rgba16float, write>;
 
@@ -193,3 +203,15 @@ const DDGI_INDIR_RAYBASE_BASE: u32 = 0u;  // ray_base[lod]：该级首线程在�
 const DDGI_INDIR_COLLBASE_BASE: u32 = 4u; // coll_base[lod]
 const DDGI_INDIR_RAY_TOTAL: u32 = 8u;     // 全局 cast 线程总数
 const DDGI_INDIR_COLL_TOTAL: u32 = 9u;    // 全局 collect 线程总数
+
+// ===== @group(7)：眼睛适应（自动曝光）——被 `dda_main`（读曝光）与 eye_adapt_* 两个入口使用 =====
+/// `out_tex` 的**采样视图**（同一张图：它本来就带 TEXTURE_BINDING，blit 也在采样它）。
+/// 亮度统计要靠它读上一帧/本帧的画面 —— 统计点选"曝光已应用之后"的颜色，与 UE 的
+/// EyeAdaptation 一致（靠反馈把直方图均值压到目标中灰）。
+@group(7) @binding(0) var out_tex_src: texture_2d<f32>;
+/// 状态 + 直方图合一（word 布局，f32 一律 bitcast 存取）：
+///   [0] 曝光系数（`dda_main` 每像素 atomicLoad 一次）
+///   [1] 已适应的 EV（累积量）   [2] 备用（手动 EV 偏移）   [3] 帧间隔 dt（秒，CPU 每帧写）
+///   [4] 调试：直方图百分位平均 log2 亮度   [5] 调试：目标 EV
+///   [8..72) 64 桶 log2 亮度直方图（本帧计数；`eye_adapt_update` 末尾清零）
+@group(7) @binding(1) var<storage, read_write> eye_adapt: array<atomic<u32>>;

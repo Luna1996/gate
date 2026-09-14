@@ -85,6 +85,9 @@ pub fn build_dda_shader(app: &mut App) {
       panic!("{msg}");
     }
   };
+  // 同一份包里的跨端常量（图集尺寸 / 射线预算 / indirect word 布局）也在这里解析一次：
+  // 失败即 panic，把"Rust 拿错值去分配显存"挡在启动最前面（见 `wesl_consts`）。
+  crate::wesl_consts::ddgi_consts();
   let handle = app
     .world_mut()
     .resource_mut::<Assets<Shader>>()

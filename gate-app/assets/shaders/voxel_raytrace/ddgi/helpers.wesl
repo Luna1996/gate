@@ -1,7 +1,7 @@
 import package::bindings::{b_struct, ddgi_cell_slot, ddgi_u, g};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, NODE_FIXED_WORDS};
-import package::ddgi::consts::{DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS};
+import package::ddgi::consts::{DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS, DDGI_USAGE_STICKY};
 import package::world::{world_solid};
 
 fn ddgi_merge_state(a: u32, b: u32) -> u32 {
@@ -329,6 +329,23 @@ fn ddgi_slot(lod: u32, wc: vec3<i32>) -> u32 {
   // 直接返回本格自己的槽位。（旧的 cell → slot 借针间接表已删，见 binding(10) 注释：放置规则
   // 改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，无需再重定向。）
   return ddgi_slot_own(lod, wc);
+}
+/// 「屏幕使用」漏桶计数：给这个槽位记一次（上限 DDGI_USAGE_STICKY，`ddgi_sort` 每帧 -1）。
+///
+/// 由**着色**路径在每个"候选角"上调用（见 `ddgi_sample_lod` 的闸门之后 / 图集取样之前），
+/// 代表"本帧有像素会用这个探针的数据"。工作集选择（sort）就靠它 —— 见 DDGI_USAGE_STICKY 的
+/// 说明：射线的去处**跟着像素走**，而不是按距离猜。
+///
+/// 【为什么不用原子】并发丢更新无害：判据只关心 >0 与衰减节奏，竞态只会**低估计数**，
+/// 而抽样记账本身每 8 帧就会给同一个可见探针再加一次（上限饱和）。用原子反而把每个角的
+/// 记账变成独占访问 —— 相邻像素共享同几个槽位，会撞在同一个 cache line 上。
+/// 【为什么必须只在着色路径调用】cast 里回读 GI 时也会走 `ddgi_sample`；若那里也记账，
+/// 射线多的探针会给自己加更多射线（正反馈）。
+fn ddgi_usage_mark(slot: u32) {
+  let c = ddgi_cell_slot[slot];
+  if (c < DDGI_USAGE_STICKY) {
+    ddgi_cell_slot[slot] = c + 1u;
+  }
 }
 /// 窗口原点（cell 单位）。origin.xyz 已按 cs 对齐，故整除精确。（LOD0 的编址原点在
 /// `ddgi_u.chunk`，不在这里；本函数只服务 lod>=1 与 LOD0 的**空间盒**包含判定。）

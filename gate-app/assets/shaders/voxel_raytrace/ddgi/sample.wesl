@@ -1,6 +1,6 @@
 import package::bindings::{ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u};
 import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
-import package::ddgi::helpers::{ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot};
+import package::ddgi::helpers::{ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast};
 
@@ -191,10 +191,14 @@ fn ddgi_sample_lod(
         let slot = ddgi_slot(lod, wc);
         let mw = ddgi_meta[slot];
         if ((mw & DDGI_META_ENABLED) == 0u) { ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u; continue; }
-        // 本帧没被判活（sort 的 near=false 或落在更细一级盒内）→ 该探针从不进 worklist，
-        // 图集纹素恒为 0。它必须被排除：否则会以 0 辐照度 + 满权重参与平均，把整片 GI
-        // 拉向黑。不能指望下面的 depth 闸门兜住它 —— 它连 depth 都是 0，会被判成「无遮挡」。
-        if ((mw & DDGI_META_ACTIVE) == 0u) { ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u; continue; }
+        // 【已删闸门】这里原本有一条 `(mw & DDGI_META_ACTIVE) == 0 → 剔除`。
+        // 它的本意是"别让图集里没数据的探针以 0 辐照度满权重参与平均"，但 ACTIVE 是
+        // **逐帧**量（由 sort 的 near/worklist 每帧重判）⇒ 同一像素的角会在"有数据/没数据"
+        // 之间逐帧翻转：Probe 档表现为浅绿(粗级兜住)↔品红(wn 闸门)高频闪，Normal 档里
+        // 同源地让 GI 逐帧抖动。而"图集里到底有没有数据"是**持久**的，判据在下面就够：
+        // 下面的纹理覆盖度闸门（irr4.w）—— 配 collect 的「首次写入热启动」后，写过一次
+        // 该纹素覆盖度就到 1，所以这条持久闸门是可靠的。
+        // （ACTIVE 仍由 sort 维护，但它只用来决定"这帧要不要发新射线"，不再当采样闸门。）
         // 年龄太小（刚换过世界 cell / 刚编辑）→ 图集里是旧位置或未覆盖的读数，跳过
         if (ddgi_meta_age(mw) < DDGI_MIN_SAMPLE_AGE) { ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u; continue; }
         // 插值基 = **晶格名义位置**上的三线性基（用上面的 `fr`），不是探针实际位置上的 tent。
@@ -223,6 +227,12 @@ fn ddgi_sample_lod(
         );
         let wtri = wl.x * wl.y * wl.z;
         if (wtri <= 1e-6) { continue; }
+        // ---- 记账：本探针的数据**本帧会被屏幕用到**（工作集选择的唯一依据）----
+        // 位置在"所有几何/状态闸门之后、图集取样之前"：只要这个角是**候选**（探针有数据、
+        // 本帧判活、年龄够、三线性权重非零），就算被用到 —— 注意**不要求它过后面那些
+        // 可见性闸门**（wn/wd/遮挡）。否则数据坏掉的探针会被永久拒绝 → 永远拿不到射线 →
+        // 永远修不好（自锁）。见 DDGI_USAGE_STICKY / ddgi_usage_mark。
+        if (ddgi_usage_track != 0u) { ddgi_usage_mark(slot); }
         let probe = ddgi_slot_pos[slot].xyz;
         // 【不去重】基是名义三线性基（8 角和 = 1）：同一份辐照度若落在两个角上，本就该拿
         // 这两个角的权重之和 —— 那正是"两个角的代表是同一个值"的正确插值结果。去重反而会把
@@ -381,6 +391,10 @@ fn ddgi_sample_lod(
   return vec4<f32>(select(vec3<f32>(0.0), total / wsum, ok), wsum);
 }
 var<private> ddgi_dbg_wsum: f32;
+/// 1 = 本次 invoke 是**着色**（`dda_main`），0 = cast 的 GI 回读（`ddgi_cast`）——由调用方在
+/// 入口设置。只用来决定 `ddgi_sample_lod` 要不要给"屏幕使用"计数记账（见 `ddgi_usage_mark`：
+/// cast 里记账会形成"射线多的探针拿到更多射线"的正反馈）。
+var<private> ddgi_usage_track: u32;
 // 「有可用数据的角」的名义权重覆盖度（Σ wtri，**不含** wn/wd 两道照明闸门）。
 // 它是天光常量兜底的唯一判据 —— 见 ddgi_sample_lod 里 cov 的注释。
 var<private> ddgi_dbg_cov: f32;
@@ -470,6 +484,11 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       in_cascade = true;
       shell_lod = lod;
       let r = ddgi_sample_lod(p, n, lod, false, false);
+      // 记账只在**这一次（主级 = 本像素所在壳的 LOD）**里发生：后面还有 ①同级放宽重试
+      // （r2，同一批槽位，重复记账无意义）、②级联混合伙伴、③"逐级退粗"兜底 —— 后两者各自
+      // 再走 8 个角，且兜底那条会用 `clamp_cells` 把角 clamp 到本级窗口（可能离屏幕很远）。
+      // 不关掉的话"被用到"的集合会被稀释成几万个 → `rpp` 上不去（实测 rpp 只到 2）。
+      ddgi_usage_track = 0u;
       ddgi_dbg_rej_out = ddgi_dbg_rej;
       ddgi_dbg_wsum = r.w;
       ddgi_dbg_dom = f32(lod) + 1.0;

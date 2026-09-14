@@ -182,6 +182,10 @@ fn main() {
   if std::env::var("GATE_EDIT_SELFTEST").as_deref() == Ok("1") {
     app.add_systems(Update, edit::edit_selftest);
   }
+  // 【诊断】GATE_ORBIT=1：相机自动绕目标转 → 复现"相机移动中"的帧时问题（配 GATE_BENCH=1 读逐 pass）
+  if std::env::var("GATE_ORBIT").as_deref() == Ok("1") {
+    app.add_systems(Update, camera::auto_orbit_system);
+  }
   app.run();
 }
 
