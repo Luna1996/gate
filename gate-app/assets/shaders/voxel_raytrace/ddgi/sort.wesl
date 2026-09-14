@@ -1,5 +1,8 @@
 import package::bindings::{ddgi_cell, g, grid_descs};
-import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_slot_own};
+import package::ddgi::consts::{DDGI_META_NBR_MASK};
+import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_nbr_dir, ddgi_slot_own};
+import package::trace::{make_grid};
+import package::world::{world_cfg_full, world_raycast};
 
 // ============================================================================
 // 阶段一 sort（Douglas pass #1：探针活跃性判定 + worklist 压缩）。
@@ -57,3 +60,25 @@ fn ddgi_neighbor_occupied(lod: u32, wc: vec3<i32>) -> bool {
   // 重定向到邻近探针所在的槽位（读到的就是邻居的记录，判定会串位）。
   return (ddgi_cell[ddgi_slot_own(lod, wc)] & DDGI_REC_OCCUPIED) != 0u;
 }
+
+/// 6 邻接可见性掩码：从探针位置沿 6 个轴向各走 1 个 cell（长度 = cs），
+/// **不撞几何**则对应位置 1。空间混合（`ddgi_probe_blend_irr`）用它门控 —— 同一开阔
+/// 区域内的邻接照常混合（去噪保留），跨墙的那一位被清掉 → 不再把墙外探针的天空辐照度
+/// 抹到墙内（凹角整片漏光的根因：混合本身不做任何可见性判定）。
+///
+/// 【起点 = 探针本身，不做内缩】探针由 `ddgi_place_probe` 放在**空叶**内 ⇒ 起点处必为空气，
+/// 任何 t>0 的命中都是真遮挡。若为省事把起点沿轴内缩 1 体素，会**漏掉紧贴探针的薄墙**
+/// （探针可落在混合 16³ 里的 1³ 空体素上，最近表面仅 1 体素）→ 那面墙方向被误判为可见。
+/// 【终点 = 邻居 cell 中心】邻居探针的标称位置在邻居 cell 中心，故长度取 cs。邻居 cell 若
+/// 是实心（无探针），射线会在其内部命中 → 该位为 0（被遮挡），正是我们要的语义。
+fn ddgi_nbr_vis_mask(probe_pos: vec3<f32>, cs: f32) -> u32 {
+  let gw = make_grid(0u);
+  let cfg = world_cfg_full(0.0, 3u);
+  var mask: u32 = 0u;
+  for (var a = 0u; a < 6u; a = a + 1u) {
+    let hit = world_raycast(gw, probe_pos, ddgi_nbr_dir(a), cs, cfg);
+    if (!hit.hit) { mask = mask | (1u << a); }
+  }
+  return mask & DDGI_META_NBR_MASK;
+}
+

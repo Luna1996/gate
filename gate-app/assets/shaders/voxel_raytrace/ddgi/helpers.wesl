@@ -1,7 +1,7 @@
 import package::bindings::{b_struct, ddgi_cell_slot, ddgi_u, g};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, NODE_FIXED_WORDS};
-import package::ddgi::consts::{DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS};
+import package::ddgi::consts::{DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS};
 import package::world::{world_solid};
 
 fn ddgi_merge_state(a: u32, b: u32) -> u32 {
@@ -417,16 +417,45 @@ fn ddgi_rec_pack(enabled: u32, occupied: u32, off_b: vec3<u32>) -> u32 {
 fn ddgi_rec_off(rec: u32) -> vec3<u32> {
   return vec3<u32>((rec >> 8u) & 0xFFu, (rec >> 16u) & 0xFFu, (rec >> 24u) & 0xFFu);
 }
-// meta word = age(低 8bit) | ENABLED | ACTIVE；0 = 无探针
+// meta word = age(低 8bit) | ENABLED | ACTIVE | 邻接可见性掩码(bit10-15) | NBR_VALID(bit16)
 //   ENABLED：烘焙阶段放了探针（有 irr/depth 数据可采样）
 //   ACTIVE ：本 cell 或 6 邻接有体素 / 物体，且未被更细 LOD 覆盖 —— 本帧需要投线
+//   NBR    ：6 邻接可见性掩码（见 DDGI_META_NBR_SHIFT），**由 sort 每帧为活跃探针重算**。
+//   NBR_VALID：掩码是否已算过。bake 与「非活跃」路径写 0 → 掩码无效 → 消费侧**不做门控**
+//            （退回改造前行为），避免把"还没算"误当成"全被挡住"而整片关掉混合。
 fn ddgi_meta_pack(age: u32, enabled: bool, is_active: bool) -> u32 {
   return (age & 0xFFu)
     | select(0u, DDGI_META_ENABLED, enabled)
     | select(0u, DDGI_META_ACTIVE, is_active);
 }
+/// 把本帧算出的邻接可见性掩码写进 meta（同时置 NBR_VALID）。
+fn ddgi_meta_with_nbr(p: u32, nbr_mask: u32) -> u32 {
+  return (p & ~(DDGI_META_NBR_MASK << DDGI_META_NBR_SHIFT) & ~DDGI_META_NBR_VALID)
+    | ((nbr_mask & DDGI_META_NBR_MASK) << DDGI_META_NBR_SHIFT)
+    | DDGI_META_NBR_VALID;
+}
 fn ddgi_meta_age(p: u32) -> u32 {
   return p & 0xFFu;
+}
+/// 读回邻接可见性掩码（`ddgi_probe_blend_irr` 的空间混合门控用）。
+fn ddgi_meta_nbr(p: u32) -> u32 {
+  return (p >> DDGI_META_NBR_SHIFT) & DDGI_META_NBR_MASK;
+}
+/// 6 邻接方向单位向量，位序与 `DDGI_META_NBR_SHIFT` 一致：0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z。
+/// 同轴两位相邻 ⇒ 反向 = `bit ^ 1u`。
+fn ddgi_nbr_dir(a: u32) -> vec3<f32> {
+  if (a == 0u) { return vec3<f32>(-1.0, 0.0, 0.0); }
+  if (a == 1u) { return vec3<f32>(1.0, 0.0, 0.0); }
+  if (a == 2u) { return vec3<f32>(0.0, -1.0, 0.0); }
+  if (a == 3u) { return vec3<f32>(0.0, 1.0, 0.0); }
+  if (a == 4u) { return vec3<f32>(0.0, 0.0, -1.0); }
+  return vec3<f32>(0.0, 0.0, 1.0);
+}
+/// `ddgi_probe_blend_irr` 的 **LOD0 分支**邻居循环下标（+X,-X,+Y,-Y,+Z,-Z）→ 掩码位。
+/// LOD1~3 分支用 `a * 2 + (plus ? 1 : 0)`（两分支的循环结构不同，故各有一个映射）。
+/// 注意分号写法：`(a >> 1u) * 2u + (1u - (a & 1u))` —— +X→1, -X→0, +Y→3, -Y→2, +Z→5, -Z→4。
+fn ddgi_nbr_bit_lod0(a: u32) -> u32 {
+  return (a >> 1u) * 2u + (1u - (a & 1u));
 }
 
 fn ddgi_lum(c: vec3<f32>) -> f32 {

@@ -3,9 +3,9 @@ import package::common::{linear_to_srgb, palette_albedo, palette_emissive, sky_r
 import package::ddgi::bake::{ddgi_bake_one};
 import package::ddgi::collect::{ddgi_collect_one};
 import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKIP_DIST_CELLS, DDGI_SKY_AMBIENT, DDGI_T_MAX, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
-import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_pack, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
+import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
 import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample};
-import package::ddgi::sort::{ddgi_box_hits_object, ddgi_neighbor_occupied};
+import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
 import package::lightfield::{light_field_ao, light_field_gather};
 import package::trace::{make_grid};
 import package::world::{voxel_normal, world_cfg_full, world_raycast};
@@ -456,7 +456,14 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  ddgi_meta[slot] = ddgi_meta_pack(age, true, is_active);
+  // ---- 邻接可见性掩码（空间混合门控）：只对**活跃**探针算（非活跃的不投线、图集不更新，
+  // 也不会作为混来源被邻居采用 → 省 6 条射线/探针）。见 ddgi_nbr_vis_mask 的说明。
+  // 非活跃路径不置 NBR_VALID → 消费侧按"未算过"处理（不做门控），不会误关混合。----
+  var meta_word = ddgi_meta_pack(age, true, is_active);
+  if (is_active) {
+    meta_word = ddgi_meta_with_nbr(meta_word, ddgi_nbr_vis_mask(probe_pos, f32(cs)));
+  }
+  ddgi_meta[slot] = meta_word;
   ddgi_slot_pos[slot] = vec4<f32>(probe_pos, f32(lod));
 }
 

@@ -1,6 +1,6 @@
 import package::bindings::{DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RPP_BASE, ddgi_depth, ddgi_depth_out, ddgi_indirect, ddgi_irr, ddgi_irr_out, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist};
-import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
-import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
+import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
+import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_meta_nbr, ddgi_nbr_bit_lod0, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
 
 // ---- 空间混合（RTXGI ProbeBlending 的简化）----
 // 采样端 gi = Σ(irr·w)/Σw，w = wtri·wn·wd。`wn` 会把"探针落在背面"的那半边剔掉，于是
@@ -32,6 +32,10 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
     // 改在世界 cell 空间里取 6 个面邻居。邻居集与 LOD1~3 的 stride 版完全对应（同为 ±1 cell），
     // 只是跨 chunk 时用 `ddgi_slot_own` 现算槽位。
     let wc = ddgi_slot_world_cell(0u, pidx);
+    let self_meta = ddgi_meta[base + pidx];
+    let self_nbr = ddgi_meta_nbr(self_meta);
+    // NBR_VALID 未置位（非活跃探针 / 掩码未算）→ 不做门控，退回改造前行为。
+    let self_gate = (self_meta & DDGI_META_NBR_VALID) != 0u;
     for (var a = 0u; a < 6u; a = a + 1u) {
       var off = vec3<i32>(1, 0, 0);
       if (a == 1u) { off = vec3<i32>(-1, 0, 0); }
@@ -43,7 +47,16 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
       if (!ddgi_cell_in_window(0u, nwc)) { continue; }
       let nslot = ddgi_slot_own(0u, nwc);
       if (nslot == base + pidx) { continue; }
-      if ((ddgi_meta[nslot] & DDGI_META_ENABLED) == 0u) { continue; }
+      // ---- 邻接可见性门控（与 LOD1~3 分支同一套语义，位序映射见 ddgi_nbr_bit_lod0）----
+      let sbit = ddgi_nbr_bit_lod0(a);
+      let nmeta = ddgi_meta[nslot];
+      if (self_gate) {
+        if ((self_nbr & (1u << sbit)) == 0u) { continue; }
+        // 反向也判（邻居掩码已算时才判）：本方向通、反向被挡属薄墙，按被挡处理。
+        if ((nmeta & DDGI_META_NBR_VALID) != 0u
+            && (ddgi_meta_nbr(nmeta) & (1u << (sbit ^ 1u))) == 0u) { continue; }
+      }
+      if ((nmeta & DDGI_META_ENABLED) == 0u) { continue; }
       let v = ddgi_irr_nbr(nslot, tx, ty);
       if (v.w < DDGI_TEXEL_MIN_COVERAGE) { continue; }
       let npos = ddgi_slot_pos[nslot].xyz;
@@ -54,6 +67,9 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
     return vec4<f32>(acc, wacc);
   }
   let cell = ddgi_slot_cell(lod, pidx);
+  let self_meta = ddgi_meta[base + pidx];
+  let self_nbr = ddgi_meta_nbr(self_meta);
+  let self_gate = (self_meta & DDGI_META_NBR_VALID) != 0u;
   for (var a = 0u; a < 3u; a = a + 1u) {
     let stride = select(select(1u, dims.x, a == 1u), dims.x * dims.y, a == 2u);
     let extent = select(select(dims.x, dims.y, a == 1u), dims.z, a == 2u);
@@ -62,9 +78,22 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
       let plus = s == 1u;
       if (plus && coord + 1u >= extent) { continue; }
       if (!plus && coord == 0u) { continue; }
-      let nidx = select(pidx - stride, pidx + stride, plus);
-      let nslot = base + nidx;
-      if ((ddgi_meta[nslot] & DDGI_META_ENABLED) == 0u) { continue; }
+      // ---- 邻接可见性门控：本探针向该邻居方向的线段被几何挡住 → 不混 ----
+      // 位序 = a*2 + (plus ? 1 : 0)（0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z）。
+      // 【为什么必须门控】混合完全不看可见性，一个「能看到天空」的探针会把它的天空辐照度
+      // 抹给隔墙的暗探针 → 封闭房间的凹角整片漏光（且逐帧向外扩散成平滑梯度）。
+      // 反向也判：邻居的掩码里「指向本探针」那一位（bit^1）为 0 → 同样不混，
+      // 避免单向不对称（本方向通、反向被挡的薄墙情形）。
+      // 掩码未算（NBR_VALID=0）的一侧不参与判定 → 退回改造前行为，不会误关混合。
+      let sbit = a * 2u + select(0u, 1u, plus);
+      let nslot = base + select(pidx - stride, pidx + stride, plus);
+      let nmeta = ddgi_meta[nslot];
+      if (self_gate) {
+        if ((self_nbr & (1u << sbit)) == 0u) { continue; }
+        if ((nmeta & DDGI_META_NBR_VALID) != 0u
+            && (ddgi_meta_nbr(nmeta) & (1u << (sbit ^ 1u))) == 0u) { continue; }
+      }
+      if ((nmeta & DDGI_META_ENABLED) == 0u) { continue; }
       let v = ddgi_irr_nbr(nslot, tx, ty);
       if (v.w < DDGI_TEXEL_MIN_COVERAGE) { continue; }
       let npos = ddgi_slot_pos[nslot].xyz;

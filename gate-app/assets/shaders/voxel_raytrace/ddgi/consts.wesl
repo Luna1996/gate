@@ -21,9 +21,22 @@ const DDGI_PROBES_PER_LAYER_AXIS: u32 = 40u;
 const DDGI_PROBES_PER_LAYER: u32 = DDGI_PROBES_PER_LAYER_AXIS * DDGI_PROBES_PER_LAYER_AXIS;
 const DDGI_LOD_COUNT: u32 = 4u;
 // meta word = age(低 8bit) | ENABLED(烘焙放了探针) | ACTIVE(本 cell 或 6 邻接有体素/物体，
-// 且不在更细 LOD 覆盖内)；0 = 无探针哨兵
+// 且不在更细 LOD 覆盖内) | 邻接可见性掩码(bit10-15)；0 = 无探针哨兵
 const DDGI_META_ENABLED: u32 = 256u;
 const DDGI_META_ACTIVE: u32 = 512u;
+/// 邻接可见性掩码在 meta 里的位偏移（占 bit10-15，共 6 位）。
+///
+/// 位序（**相邻两位同轴**，故「反向」= `bit ^ 1u`）：
+///   0 = -X, 1 = +X, 2 = -Y, 3 = +Y, 4 = -Z, 5 = +Z
+/// bit=1 = 从本探针沿该轴走 cs 距离**不撞几何**（该方向与邻居之间是通的）。
+/// 由 `ddgi_sort` 每帧为活跃探针写入（6 条 cs 长射线），`ddgi_probe_blend_irr` 读来门控
+/// 空间混合 —— 见 `ddgi_nbr_vis_mask` 的说明。
+const DDGI_META_NBR_SHIFT: u32 = 10u;
+/// 掩码取值域（6 位）。
+const DDGI_META_NBR_MASK: u32 = 0x3Fu;
+/// 「邻接可见性掩码已由本帧 sort 算过」的有效位（bit16）。
+/// 未置位时消费侧**不做门控**（退回改造前行为）—— 见 `ddgi_meta_with_nbr` 的说明。
+const DDGI_META_NBR_VALID: u32 = 65536u;
 const DDGI_AGE_MAX: u32 = 255u;
 /// worklist `.w` 的位段打包：age(低 8 位) | cell 下标(19 位) | lod(2 位)。
 ///
@@ -152,7 +165,7 @@ const DDGI_CASCADE_FADE_CELLS: f32 = 2.0;
 /// 必须与 Rust 侧 `DDGI_RAY_BUDGET` 一致。曾试过 262144 / 1048576 压"探针晶格亮斑"与
 /// 深度闸门抖动：帧时涨了但问题没解决（根因是探针网格对贴缝尺度欠采样 + 深度角度均值偏差，
 /// 不是射线数量），已退回 131072。
-const DDGI_RAY_BUDGET: u32 = 131072u;
+const DDGI_RAY_BUDGET: u32 = 65536u;
 const DDGI_PROBE_BUDGET: u32 = 4096u;
 const DDGI_SHADOW_T_MAX: f32 = 8192.0;
 const DDGI_SHADOW_BIAS: f32 = 0.5;
