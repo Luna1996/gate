@@ -68,12 +68,6 @@ struct DdgiStageValueLabel;
 struct DdgiDebugModeBtn(u8);
 
 #[derive(Component)]
-struct DdgiGainSlider;
-
-#[derive(Component)]
-struct DdgiGainValueLabel;
-
-#[derive(Component)]
 struct DdgiProbeVizToggle;
 
 #[derive(Component)]
@@ -81,20 +75,6 @@ struct DdgiProbeVizLodSlider;
 
 #[derive(Component)]
 struct DdgiProbeVizLodValueLabel;
-
-/// Chebyshev std 信任系数滑杆（0=忽略 std 硬判定 / 1=正常），A/B 诊断
-#[derive(Component)]
-struct DdgiSoftSlider;
-
-#[derive(Component)]
-struct DdgiSoftValueLabel;
-
-/// 级联覆盖外的天光兜底强度滑杆（调到与覆盖内衔接为止，见 DdgiDebugSettings.far_ambient）
-#[derive(Component)]
-struct DdgiFarAmbSlider;
-
-#[derive(Component)]
-struct DdgiFarAmbValueLabel;
 
 /// 「Fly mode」开关标记（观察者写 [`crate::camera::CameraMode`]）
 #[derive(Component)]
@@ -316,297 +296,170 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             });
           });
         });
+      strip_last_cell_bottom(root.world_mut(), tv.contents[0]);
       root
         .world_mut()
         .entity_mut(tv.contents[1])
         .with_children(|page| {
           let g = tab_page_grid(ctx, page);
           page.world_mut().entity_mut(g).with_children(|g| {
+            // -- DDGI 阶段滑杆行 --
             let cell = tab_cell(ctx, g);
-            g.world_mut()
-              .entity_mut(cell)
-              .insert(Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: px(ctx.theme.metrics.spacing.sm),
-                padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)),
-                ..default()
-              })
-              .with_children(|cell| {
-                cell
-                  .spawn((
-                    Name::new("ddgi-stage-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.md),
-                      align_items: AlignItems::Center,
-                      ..default()
-                    },
-                  ))
-                  .with_children(|row| {
-                    label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: "DDGI".into(),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    let s = slider(
-                      ctx,
-                      row,
-                      SliderConfig {
-                        min: 0.0,
-                        max: 3.0,
-                        value: f32::from(ddgi_stage),
-                        step: Some(1.0),
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
-                    let vl = label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: format!(
-                          "{} {}",
-                          ddgi_stage,
-                          DDGI_STAGES[(ddgi_stage as usize).min(DDGI_STAGES.len() - 1)]
-                        ),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*vl).insert(DdgiStageValueLabel);
-                  });
-                // -- 调试模式按钮行（5 按钮互斥单选；选中项 = DdgiDebugSettings.mode）--
-                cell
-                  .spawn((
-                    Name::new("ddgi-mode-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.sm),
-                      align_items: AlignItems::Center,
-                      ..default()
-                    },
-                  ))
-                  .with_children(|row| {
-                    let active = ddgi_dbg.mode.round() as u8;
-                    for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
-                      let variant = if i as u8 == active {
-                        ButtonVariant::Primary
-                      } else {
-                        ButtonVariant::Ghost
-                      };
-                      let b = button(
-                        ctx,
-                        row,
-                        ButtonConfig {
-                          text: (*name).into(),
-                          variant,
-                          ..default()
-                        },
-                      );
-                      row
-                        .world_mut()
-                        .entity_mut(*b)
-                        .insert(DdgiDebugModeBtn(i as u8));
-                    }
-                  });
-                // -- Gain 滑杆行（0.1..4.0，默认 1.0；右侧实时数值）--
-                cell
-                  .spawn((
-                    Name::new("ddgi-gain-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.md),
-                      align_items: AlignItems::Center,
-                      ..default()
-                    },
-                  ))
-                  .with_children(|row| {
-                    label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: "Gain".into(),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    let s = slider(
-                      ctx,
-                      row,
-                      SliderConfig {
-                        min: 0.1,
-                        max: 4.0,
-                        value: ddgi_dbg.gain.clamp(0.1, 4.0),
-                        step: Some(0.1),
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*s).insert(DdgiGainSlider);
-                    let vl = label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: format!("{:.1}", ddgi_dbg.gain),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*vl).insert(DdgiGainValueLabel);
-                  });
-                // -- Chebyshev std 信任系数（0=忽略 std 退成硬判定 / 1=现状）--
-                cell
-                  .spawn((
-                    Name::new("ddgi-soft-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.md),
-                      align_items: AlignItems::Center,
-                      ..default()
-                    },
-                  ))
-                  .with_children(|row| {
-                    label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: "Cheb std".into(),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    let s = slider(
-                      ctx,
-                      row,
-                      SliderConfig {
-                        min: 0.0,
-                        max: 1.0,
-                        value: ddgi_dbg.depth_soft_k.clamp(0.0, 1.0),
-                        step: Some(0.05),
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*s).insert(DdgiSoftSlider);
-                    let vl = label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: format!("{:.2}", ddgi_dbg.depth_soft_k),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*vl).insert(DdgiSoftValueLabel);
-                  });
-                // -- 覆盖外天光兜底强度（调到与覆盖内亮度衔接、消除级联边界割裂）--
-                cell
-                  .spawn((
-                    Name::new("ddgi-far-amb-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.md),
-                      align_items: AlignItems::Center,
-                      ..default()
-                    },
-                  ))
-                  .with_children(|row| {
-                    label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: "Far amb".into(),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    let s = slider(
-                      ctx,
-                      row,
-                      SliderConfig {
-                        min: 0.0,
-                        max: 1.0,
-                        value: ddgi_dbg.far_ambient.clamp(0.0, 1.0),
-                        step: Some(0.05),
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*s).insert(DdgiFarAmbSlider);
-                    let vl = label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: format!("{:.2}", ddgi_dbg.far_ambient),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*vl).insert(DdgiFarAmbValueLabel);
-                  });
-                let t = toggle_switch(
-                  ctx,
-                  cell,
-                  ToggleSwitchConfig {
-                    text: Some("Probe Viz".into()),
-                    checked: ddgi_dbg.probe_viz,
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("ddgi-stage-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.md),
+                    align_items: AlignItems::Center,
                     ..default()
                   },
-                );
-                cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
-                // -- Probe Viz 层级滑杆行（0..=4 步进 1：All / LOD0~3）--
-                cell
-                  .spawn((
-                    Name::new("ddgi-probe-lod-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.md),
-                      align_items: AlignItems::Center,
+                ))
+                .with_children(|row| {
+                  label(
+                    ctx,
+                    row,
+                    LabelConfig {
+                      text: "DDGI".into(),
+                      style: LabelStyle::Muted,
                       ..default()
                     },
-                  ))
-                  .with_children(|row| {
-                    label(
+                  );
+                  let s = slider(
+                    ctx,
+                    row,
+                    SliderConfig {
+                      min: 0.0,
+                      max: 3.0,
+                      value: f32::from(ddgi_stage),
+                      step: Some(1.0),
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
+                  let vl = label(
+                    ctx,
+                    row,
+                    LabelConfig {
+                      text: format!(
+                        "{} {}",
+                        ddgi_stage,
+                        DDGI_STAGES[(ddgi_stage as usize).min(DDGI_STAGES.len() - 1)]
+                      ),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*vl).insert(DdgiStageValueLabel);
+                });
+            });
+            // -- 调试模式按钮行（5 按钮互斥单选；选中项 = DdgiDebugSettings.mode）--
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("ddgi-mode-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.sm),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  let active = ddgi_dbg.mode.round() as u8;
+                  for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
+                    let variant = if i as u8 == active {
+                      ButtonVariant::Primary
+                    } else {
+                      ButtonVariant::Ghost
+                    };
+                    let b = button(
                       ctx,
                       row,
-                      LabelConfig {
-                        text: "LOD".into(),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    let s = slider(
-                      ctx,
-                      row,
-                      SliderConfig {
-                        min: 0.0,
-                        max: 4.0,
-                        value: ddgi_dbg.probe_viz_lod.clamp(0.0, 4.0),
-                        step: Some(1.0),
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
-                    let vl = label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: DDGI_PROBE_VIZ_LODS
-                          [(ddgi_dbg.probe_viz_lod.round() as usize).min(DDGI_PROBE_VIZ_LODS.len() - 1)]
-                        .into(),
-                        style: LabelStyle::Muted,
+                      ButtonConfig {
+                        text: (*name).into(),
+                        variant,
                         ..default()
                       },
                     );
                     row
                       .world_mut()
-                      .entity_mut(*vl)
-                      .insert(DdgiProbeVizLodValueLabel);
-                  });
-              });
+                      .entity_mut(*b)
+                      .insert(DdgiDebugModeBtn(i as u8));
+                  }
+                });
+            });
+            // -- Probe Viz 开关 --
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              let t = toggle_switch(
+                ctx,
+                cell,
+                ToggleSwitchConfig {
+                  text: Some("Probe Viz".into()),
+                  checked: ddgi_dbg.probe_viz,
+                  ..default()
+                },
+              );
+              cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
+            });
+            // -- Probe Viz 层级滑杆行（0..=4 步进 1：All / LOD0~3）--
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("ddgi-probe-lod-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.md),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    ctx,
+                    row,
+                    LabelConfig {
+                      text: "LOD".into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  let s = slider(
+                    ctx,
+                    row,
+                    SliderConfig {
+                      min: 0.0,
+                      max: 4.0,
+                      value: ddgi_dbg.probe_viz_lod.clamp(0.0, 4.0),
+                      step: Some(1.0),
+                      ..default()
+                    },
+                  );
+                  row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
+                  let vl = label(
+                    ctx,
+                    row,
+                    LabelConfig {
+                      text: DDGI_PROBE_VIZ_LODS
+                        [(ddgi_dbg.probe_viz_lod.round() as usize).min(DDGI_PROBE_VIZ_LODS.len() - 1)]
+                      .into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  row
+                    .world_mut()
+                    .entity_mut(*vl)
+                    .insert(DdgiProbeVizLodValueLabel);
+                });
+            });
           });
         });
+      strip_last_cell_bottom(root.world_mut(), tv.contents[1]);
       // ============ Tab 2：Camera（轨道 ↔ 幽灵模式 + 飞行速度）============
       root
         .world_mut()
@@ -677,6 +530,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             });
           });
         });
+      strip_last_cell_bottom(root.world_mut(), tv.contents[2]);
       // ============ Tab 3：Edit（体素编辑笔触：形状 / 大小 / 材质）============
       // 生效范围：**仅幽灵模式**（轨道模式左键仍是 recenter，见 camera::left_click_pick_recenter）。
       // 左键放置（只填空气）/ 右键擦除（挖空）；笔触以命中格为中心按形状展开。
@@ -839,6 +693,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             });
           });
         });
+      strip_last_cell_bottom(root.world_mut(), tv.contents[3]);
     });
 
   // 「右上角面板」开关 → 切换 showcase 整体显隐（ShowcaseRoot 的 Visibility）
@@ -940,58 +795,6 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       }
       let name = DDGI_DEBUG_MODES.get(btn.0 as usize).unwrap_or(&"?");
       info!("DDGI debug mode → {} ({})", mode, name);
-    },
-  );
-
-  // DDGI 增益滑杆 → 写 DdgiDebugSettings.gain + 刷新右侧数值标签
-  world.add_observer(
-    |ev: On<SliderValueChanged>,
-     q_slider: Query<(), With<DdgiGainSlider>>,
-     mut q_label: Query<&mut Text, With<DdgiGainValueLabel>>,
-     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
-      if q_slider.get(ev.entity).is_err() {
-        return;
-      }
-      dbg.gain = ev.value;
-      if let Ok(mut t) = q_label.single_mut() {
-        t.0 = format!("{:.1}", ev.value);
-      }
-    },
-  );
-
-  // Cheb std 滑杆 → 写 DdgiDebugSettings.depth_soft_k + 刷新数值标签。
-  // 0 = 忽略深度 std（硬判定）；1 = 正常使用 std。
-  world.add_observer(
-    |ev: On<SliderValueChanged>,
-     q_slider: Query<(), With<DdgiSoftSlider>>,
-     mut q_label: Query<&mut Text, With<DdgiSoftValueLabel>>,
-     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
-      if q_slider.get(ev.entity).is_err() {
-        return;
-      }
-      dbg.depth_soft_k = ev.value.clamp(0.0, 1.0);
-      if let Ok(mut t) = q_label.single_mut() {
-        t.0 = format!("{:.2}", ev.value);
-      }
-      info!("DDGI cheb std k → {:.2}", ev.value);
-    },
-  );
-
-  // Far amb 滑杆 → 写 DdgiDebugSettings.far_ambient（级联覆盖外的天光兜底强度）。
-  // 覆盖内由 DDGI 提供环境光、覆盖外只有常量，调这个值让两者在盒边界处衔接。
-  world.add_observer(
-    |ev: On<SliderValueChanged>,
-     q_slider: Query<(), With<DdgiFarAmbSlider>>,
-     mut q_label: Query<&mut Text, With<DdgiFarAmbValueLabel>>,
-     mut dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>| {
-      if q_slider.get(ev.entity).is_err() {
-        return;
-      }
-      dbg.far_ambient = ev.value.clamp(0.0, 1.0);
-      if let Ok(mut t) = q_label.single_mut() {
-        t.0 = format!("{:.2}", ev.value);
-      }
-      info!("DDGI far ambient → {:.2}", ev.value);
     },
   );
 
@@ -1136,7 +939,6 @@ fn tab_page_grid(ctx: &UiCtx, page: &mut ChildSpawner) -> Entity {
 }
 
 /// Tab 页内 cell：surface_card 背景 + 1px 底部分割线（与 root 外框同色）。
-/// 最后一行的底边线落在 root 内边框上方，不与外框叠加。
 fn tab_cell(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -1155,6 +957,23 @@ fn tab_cell(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
       },
     ))
     .id()
+}
+
+/// 去掉某 Tab 页网格**最后一个 cell** 的 bottom 分割线。
+///
+/// root 外框在面板底边已画了 1px；末行 cell 若再画一条，两条同色线相邻叠加 = 视觉 2px。
+/// 内部行分隔线仍由各 cell 的 bottom border 承担（见 [`tab_cell`]）。
+/// page 的孩子只有一个（[`tab_page_grid`] 产出的 grid），grid 的孩子即各 cell。
+fn strip_last_cell_bottom(world: &mut World, page: Entity) {
+  let Some(grid) = world.get::<Children>(page).and_then(|c| c.first().copied()) else {
+    return;
+  };
+  let Some(last) = world.get::<Children>(grid).and_then(|c| c.last().copied()) else {
+    return;
+  };
+  if let Some(mut node) = world.get_mut::<Node>(last) {
+    node.border.bottom = px(0.0);
+  }
 }
 
 /// F3 切换左上角 debug overlay 显隐（默认显示；只影响本面板，不动 showcase）
