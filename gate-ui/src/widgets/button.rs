@@ -210,11 +210,10 @@ pub fn button_state_system(
         ui_t.scale = Vec2::splat(1.0);
       }
       for child in children.iter() {
-        if let Ok(mut tc) = q_text.get_mut(child) {
-          if tc.0 != target_text {
+        if let Ok(mut tc) = q_text.get_mut(child)
+          && tc.0 != target_text {
             tc.0 = target_text;
           }
-        }
       }
       // 重置 prev 避免 re-enable 瞬间误触发 click
       prev.0 = Interaction::None;
@@ -244,11 +243,10 @@ pub fn button_state_system(
     }
     // 文本子标签颜色（按钮只有一个文本子节点）
     for child in children.iter() {
-      if let Ok(mut tc) = q_text.get_mut(child) {
-        if tc.0 != target_text {
+      if let Ok(mut tc) = q_text.get_mut(child)
+        && tc.0 != target_text {
           tc.0 = target_text;
         }
-      }
     }
   }
 }

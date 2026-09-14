@@ -32,14 +32,13 @@ pub enum LabelStyle {
   Danger,
 }
 
+/// 字号档取用器 / 颜色令牌取用器
+type SizeFn = fn(&crate::theme::FontSize) -> f32;
+type ColorFn = fn(&crate::theme::ThemeColors) -> &crate::theme::HexColor;
+
 impl LabelStyle {
   /// (字号档, 颜色令牌)
-  fn tokens(
-    self,
-  ) -> (
-    fn(&crate::theme::FontSize) -> f32,
-    fn(&crate::theme::ThemeColors) -> &crate::theme::HexColor,
-  ) {
+  fn tokens(self) -> (SizeFn, ColorFn) {
     match self {
       Self::Body => (|fs| fs.md, |c| &c.text_body),
       Self::Muted => (|fs| fs.sm, |c| &c.text_muted),
@@ -83,7 +82,7 @@ pub struct LabelConfig {
 pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> LabelHandle {
   let fs = &ctx.theme.metrics.font_size;
   let (size, color) = config.style.tokens();
-  let color = color_of(&color(&ctx.theme.colors));
+  let color = color_of(color(&ctx.theme.colors));
   let color = if config.disabled {
     dim_color(color)
   } else {

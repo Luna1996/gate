@@ -114,7 +114,9 @@ gate-app/          Demo 应用入口
                    - src/main.rs  Startup / Update / 系统注册 / 极限场景 build_demo_scene（10×10 大陆）
                                    demo_scene_aabb_zoom_out_headless headless 单测（5 档 zoom diff_hit/pal==0）
                    - assets/
-                       shaders/    dda.wgsl（compute DDA，抄自 Rust cpu_reference_dda_ray_aabb_skip v3 同构）
+                       shaders/    voxel_raytrace/  WESL 包（体素光追 GPU 程序，DDA 抄自 Rust cpu_reference_dda_ray_aabb_skip v3 同构）
+                                           main.wesl=入口点 + import；bindings/common/brickmap/trace/world/
+                                           lightfield + ddgi/*（consts/helpers/bake/sort/sample/collect）
                                    blit.wgsl（fullscreen triangle bilinear upsample + sRGB cancel）
                                    gradient.wgsl（背景）
                        ui/theme.ron   暗色实验室主题配置

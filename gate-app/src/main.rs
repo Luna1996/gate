@@ -144,7 +144,6 @@ fn main() {
       } else {
         bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_secs_f64(1.0 / 60.0))
       },
-      ..Default::default()
     })
     .add_systems(Startup, setup)
     .add_systems(

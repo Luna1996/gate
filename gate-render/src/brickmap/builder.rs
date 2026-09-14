@@ -10,8 +10,8 @@
 //! 多 volume 路径（[`VolumesBuilder`]，Phase 3 OBJ→Volume 统一）：
 //! 持有 `Vec<BrickMapBuilder>`（主世界 + 物体），输出统一 `b_struct` + `b_palette`
 //! + `GridDesc` 数组。各 volume 的 b_struct 顺序拼接，`GridDesc.tree_base`
-//! 指向统一 buffer 内的绝对字基址。增量脏区间按 `tree_base` 偏移后传给 GPU
-//! partial write；任一前置 volume 增长导致后续 tree_base 漂移 → 自动降级全量。
+//!   指向统一 buffer 内的绝对字基址。增量脏区间按 `tree_base` 偏移后传给 GPU
+//!   partial write；任一前置 volume 增长导致后续 tree_base 漂移 → 自动降级全量。
 //!
 //! 分配纪律：树区 append-only bump，零空闲链。旧版 pow2 桶/槽位/slab 空闲链
 //! 全删除：新格式 palette 直存节点、chunk 树尺寸随内容任意变化，原地复用
@@ -463,15 +463,15 @@ impl VolumesBuilder {
         // from_transform 默认给 [0,256]³·scale——窗口 origin 可为负且 dims 巨大，
         // 默认盒会把窗口绝大部分 slab 剔除 → 全屏只渲染 chunk(0,0,0) 附近一小块。
         desc.aabb_min = Vec4::new(
-          (origin.x * CHUNK_SIZE as i32) as f32,
-          (origin.y * CHUNK_SIZE as i32) as f32,
-          (origin.z * CHUNK_SIZE as i32) as f32,
+          (origin.x * CHUNK_SIZE) as f32,
+          (origin.y * CHUNK_SIZE) as f32,
+          (origin.z * CHUNK_SIZE) as f32,
           0.0,
         );
         desc.aabb_max = Vec4::new(
-          ((origin.x + dims.x) * CHUNK_SIZE as i32) as f32,
-          ((origin.y + dims.y) * CHUNK_SIZE as i32) as f32,
-          ((origin.z + dims.z) * CHUNK_SIZE as i32) as f32,
+          ((origin.x + dims.x) * CHUNK_SIZE) as f32,
+          ((origin.y + dims.y) * CHUNK_SIZE) as f32,
+          ((origin.z + dims.z) * CHUNK_SIZE) as f32,
           0.0,
         );
       }

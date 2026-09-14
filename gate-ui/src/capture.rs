@@ -30,6 +30,7 @@ pub struct UiPointerCaptured(pub bool);
 /// - `ComputedNode::contains_point`（节点变换后的物理像素矩形；圆角按实际半径）
 /// - `clip_check_recursive`（光标被任一 `Overflow::clip()` 祖先裁掉则不算命中）
 /// - `FocusPolicy::Pass` 的节点本身不捕获（下层 Block 节点仍可命中）
+#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn ui_pointer_capture_system(
   windows: Query<&Window, With<PrimaryWindow>>,
   nodes: Query<(

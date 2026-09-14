@@ -6,7 +6,7 @@
 //! - 发光体素：radiance 直出（albedo × emissive，无方向性、不受阴影）
 //! - 无点光源、无 Phong 高光、无软阴影锥采样
 //!
-//! 光照数学全部在 GPU（dda.wgsl）；CPU 侧只做数据打包，不做任何光照计算。
+//! 光照数学全部在 GPU（shaders/voxel_raytrace/）；CPU 侧只做数据打包，不做任何光照计算。
 //!
 //! Uniform 布局（WGSL `LightPool` 逐字段镜像）：
 //!   LightGlobals(48B) + 8×LightDesc(384B) + sky_color(16B) = 448B

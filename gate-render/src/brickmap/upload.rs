@@ -659,7 +659,7 @@ fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
   unsafe {
     std::slice::from_raw_parts(
       descs.as_ptr() as *const u8,
-      descs.len() * std::mem::size_of::<GridDesc>(),
+      std::mem::size_of_val(descs),
     )
   }
 }
@@ -827,6 +827,7 @@ fn upload_light_field(
   );
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy render system：每个资源独立注入
 pub(crate) fn prepare(
   mut commands: Commands,
   snapshot: Option<ResMut<UploadSnapshot>>,
@@ -985,7 +986,7 @@ pub(crate) fn prepare(
   }
 
   // globals：从主世界 GridDesc[0] 构造向后兼容 BrickMapGlobals（Phase 1 shader 字节兼容，
-  // Phase 2 重写 dda.wgsl 后移除——届时 shader 走 grid_descs_buf，不再读 globals）。
+  // Phase 2 重写 shaders/voxel_raytrace/ 后移除——届时 shader 走 grid_descs_buf，不再读 globals）。
   let main_desc = snap.volumes.grid_descs.first().copied().unwrap_or_default();
   let globals = BrickMapGlobals {
     index_origin_x: main_desc.index_origin_x,

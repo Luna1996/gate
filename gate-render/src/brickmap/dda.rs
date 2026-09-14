@@ -4,7 +4,7 @@
 //! - 静态视图（Startup 注入 Mat4，P2.6 再接动态相机）
 //! - BG0：storage tex + 相机 uniform
 //! - BG1：b_struct + b_leaves + palette + globals uniform（五 buffer + 两 uniform）
-//! - DDA 着色器：`shaders/dda.wgsl`
+//! - DDA 着色器：WESL 包 `shaders/voxel_raytrace/`（入口 `shaders/voxel_raytrace/main.wesl`，见 `crate::shader`）
 
 use bevy::{
   asset::RenderAssetUsages,
@@ -25,7 +25,7 @@ pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
 pub const VIEW_SIZE: UVec2 = UVec2::new(1280, 720);
 /// compute dispatch 工作组边长（DDA 8×8，与原 gradient 一致）——beam pass 用
 pub const WORKGROUP_SIZE: u32 = 8;
-/// 主 DDA pass 工作组边长：必须与 dda.wgsl 中 dda_main 的 @workgroup_size
+/// 主 DDA pass 工作组边长：必须与 shaders/voxel_raytrace/ 中 dda_main 的 @workgroup_size
 /// 严格一致，否则 dispatch 覆盖不足漏 trace 像素（实测 2×2 反而更慢，维持 8）
 pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
@@ -944,7 +944,7 @@ pub fn cpu_reference_dda_ray_two_level(
 }
 
 // ============================================================================
-// 层次栈式 mask DDA（WGSL dda.wgsl TreeFrame/init_tree_frame/trace_chunk/
+// 层次栈式 mask DDA（WGSL shaders/voxel_raytrace/ TraceFrame/init_tree_frame/trace_chunk/
 // trace_grid chunk 间循环的 CPU 逐字镜像）
 //
 // 旧两级 DDA 把树当点查询结构：每粗步从根重走 DFS（~9 load）、每细步再走 4 层
@@ -1919,9 +1919,9 @@ mod dda_ref_tests {
 
   /// 层次栈式 mask DDA 等价性：跨 chunk（含负坐标窗口）场景 + 8 条轴平行退化射线
   /// + 300 条随机射线，cpu_reference_dda_ray（full 逐体素参考）vs
-  /// cpu_reference_dda_ray_tree（WGSL trace_grid/trace_chunk 的 CPU 逐字镜像）。
-  /// hit/miss 与 palette 严格一致；hit_t 容差 1.0 voxel；命中面法线必须反向于射线
-  /// （n·dir < 0：face_id 是射线穿入面）。
+  ///   cpu_reference_dda_ray_tree（WGSL trace_grid/trace_chunk 的 CPU 逐字镜像）。
+  ///   hit/miss 与 palette 严格一致；hit_t 容差 1.0 voxel；命中面法线必须反向于射线
+  ///   （n·dir < 0：face_id 是射线穿入面）。
   #[test]
   fn tree_traversal_equivalence_300_rays() {
     // ---- 跨 chunk / 负坐标场景（fill_box 第二参 = size，区间 [min, min+size)）----
@@ -2022,8 +2022,8 @@ mod dda_ref_tests {
   /// demo 场景特征复刻等价性：地形分层柱（非 brick 对齐 y）+ fill_bricks(e=16) 平台
   /// + 实心墙内 clear_voxel 单体孔洞（air-in-solid）+ 倒锥叠球（跨 chunk）
   /// + 交替 palette 增量编辑 + compact_all（GC 后节点流）。
-  /// 现有 tree_traversal_equivalence_300_rays 只覆盖 build_full 未压缩 + 实体-in-空气
-  /// 模式；本测试锁定 demo 实际数据模式下的层次遍历正确性。
+  ///   现有 tree_traversal_equivalence_300_rays 只覆盖 build_full 未压缩 + 实体-in-空气
+  ///   模式；本测试锁定 demo 实际数据模式下的层次遍历正确性。
   #[test]
   fn tree_equivalence_demo_like_edit_compact() {
     use gate_voxel::{VoxelCoord, fill_bricks};
@@ -2312,7 +2312,7 @@ mod dda_ref_tests {
     }
 
     // 随机射线：球壳起点覆盖负区 / 薄板 / 凹角
-    let mut state: u64 = 0xC0FFEE_0000_0007;
+    let mut state: u64 = 0xC0FF_EE00_0000_0007;
     for ray in 0..400 {
       let r = 8.0 + frand(&mut state) * 320.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
@@ -2368,7 +2368,6 @@ use std::borrow::Cow;
 
 use super::upload::GpuBrickMap;
 use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
-pub const DDA_SHADER_ASSET_PATH: &str = "shaders/dda.wgsl";
 
 // --- DdaImages：main-world 创建的 handle，ExtractResource 自动传到 render world（main.rs setup 注入） ---
 // （类型定义在 L110 附近，#[derive(Resource, Clone, ExtractResource)]）
@@ -2413,6 +2412,9 @@ pub struct BrickMapDdaPlugin;
 
 impl Plugin for BrickMapDdaPlugin {
   fn build(&self, app: &mut App) {
+    // 编译 dda WESL 包（shaders/voxel_raytrace/，入口 main.wesl）→ 插入 `Shader` 资产 + `DdaShaderHandle`。
+    crate::shader::build_dda_shader(app);
+
     app.add_plugins((
       bevy::render::extract_resource::ExtractResourcePlugin::<DdaImages>::default(),
       // RenderScale 提取进 render world（dispatch workgroup 数随 resize 重算）
@@ -2425,9 +2427,11 @@ impl Plugin for BrickMapDdaPlugin {
     // main → render 的 ExtractSchedule：把 DdaCameraConfig 从 main world 读
     // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
     // 供 PrepareBindGroups 每帧写 uniform buffer）
+    let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
+    render_app.insert_resource(dda_shader);
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
       .add_systems(RenderStartup, init_dda_pipelines)
@@ -2467,6 +2471,7 @@ fn extract_camera_config(
 pub(crate) fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
+  dda_shader: Res<crate::shader::DdaShaderHandle>,
   pipeline_cache: Res<PipelineCache>,
   _render_device: Res<RenderDevice>,
 ) {
@@ -2537,8 +2542,8 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  // ---- Compute pipeline：dda.wgsl 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
-  let dda_shader = asset_server.load(DDA_SHADER_ASSET_PATH);
+  // ---- Compute pipeline：shaders/voxel_raytrace/ 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
+  let dda_shader = dda_shader.0.clone();
   let layouts = vec![
     bg0.clone(),
     bg1.clone(),
@@ -2750,6 +2755,7 @@ fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy render system：各 bind group + 资源逐一注入
 pub(crate) fn dispatch_dda(
   mut ctx: RenderContext,
   bg0: Option<Res<DdaBg0BindGroup>>,
@@ -2824,9 +2830,9 @@ pub(crate) fn dispatch_dda(
     );
   }
 
-  if dbg.map_or(false, |d| d.probe_viz) {
-    if let Some(ddgi) = gpu.as_ref() {
-      if let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
+  if dbg.is_some_and(|d| d.probe_viz)
+    && let Some(ddgi) = gpu.as_ref()
+      && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
         let probe_count = ddgi.total_slots;
         crate::profiler::gpu_compute_pass(
           &mut profiler,
@@ -2844,8 +2850,6 @@ pub(crate) fn dispatch_dda(
           },
         );
       }
-    }
-  }
 }
 
 // DDA blit 挂 Core2d PostProcess，Gradient blit 也挂在同一 set，

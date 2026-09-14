@@ -232,6 +232,7 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
 /// 映射基准 = 根节点**内容盒**（track 行程区 = 根宽 - 2×[`THUMB_INSET`]）：
 /// 光标在两侧内边距带内即吸附 min/max（端点档位命中区与中段一样宽，不再只有
 /// 1px 边界）。有 step 时经 [`clamp_step`] 逐档吸附（离散档位 slider）。
+#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_drag_system(
   mut commands: Commands,
   mut q: Query<(
@@ -283,6 +284,7 @@ pub fn slider_drag_system(
 /// root 的直接 Children——需要下钻 track 的 Children 分别命中 SliderFill 与
 /// SliderThumb。thumb 的 `top:50% + margin-top:-半高` 垂直居中也在此同步（尺寸
 /// 随拖拽放大）。
+#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_visual_system(
   mut q_root: Query<
     (
@@ -412,8 +414,10 @@ mod tests {
       sink.lock().unwrap().push((ev.entity, ev.value));
     });
     // ComputedNode：根宽 100px、无水平内边距 → cursor_x = (0.25+0.5)*100 = 75
-    let mut computed = ComputedNode::default();
-    computed.size = Vec2::new(100.0, 24.0);
+    let computed = ComputedNode {
+      size: Vec2::new(100.0, 24.0),
+      ..Default::default()
+    };
     let e = app
       .world_mut()
       .spawn((

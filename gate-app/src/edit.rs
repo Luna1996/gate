@@ -96,7 +96,7 @@ pub const EDIT_MATERIALS: [EditMaterial; 6] = [
     color: [232, 198, 72],
     emissive: 0,
   },
-  // 自发光：发光体素是"光源本体"——着色直出 + 经 GI 传播（dda.wgsl palette_emissive）
+  // 自发光：发光体素是"光源本体"——着色直出 + 经 GI 传播（shaders/voxel_raytrace/common.wesl palette_emissive）
   EditMaterial {
     name: "Lamp",
     color: [255, 238, 196],
@@ -283,6 +283,7 @@ pub fn apply_brush(
 /// 体素编辑输入（**仅幽灵模式**；轨道模式左键仍是 recenter）。
 /// - 左键 = 放置（当前形状/大小/材质）
 /// - 右键 = 擦除；按下到释放累计位移 > [`DRAG_PX`] 视为「拖拽转头」，不编辑
+#[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
 pub(crate) fn voxel_edit_input(
   mouse: Res<ButtonInput<MouseButton>>,
   motion: Res<AccumulatedMouseMotion>,
@@ -324,7 +325,7 @@ pub(crate) fn voxel_edit_input(
     (hit, 0u8)
   } else {
     // 放置落点 = 命中面外侧一格
-    let slot = ensure_material(grid, &mut *settings, mat_idx);
+    let slot = ensure_material(grid, &mut settings, mat_idx);
     (hit + face, slot)
   };
   let changed = apply_brush(grid, center, shape, size, pal);

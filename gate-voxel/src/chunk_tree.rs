@@ -40,7 +40,7 @@ fn child_slot(mask: u64, i: u32) -> u32 {
 }
 
 /// 节点 palette word 打包：低字节 = uniform 子块色（既有 wire 语义），
-/// 高字节 = LOD 子树多数色（GPU 八叉树早停用，dda.wgsl 解码 (w>>8)&0xFF）
+/// 高字节 = LOD 子树多数色（GPU 八叉树早停用，shaders/voxel_raytrace/ 解码 (w>>8)&0xFF）
 #[inline]
 fn pack_pal_lod(palette: u8, lod: u8) -> u32 {
   palette as u32 | ((lod as u32) << 8)
@@ -464,16 +464,16 @@ impl ChunkTree {
         } else {
           Some(palette)
         };
-        match c {
-          None => return None,
-          Some(c) => match first_color {
-            None => first_color = Some(c),
-            Some(f) if f != c => {
-              all_same = false;
-              break;
-            }
-            _ => {}
-          },
+        {
+            let c = c?;
+            match first_color {
+          None => first_color = Some(c),
+          Some(f) if f != c => {
+            all_same = false;
+            break;
+          }
+          _ => {}
+        }
         }
       }
       return if all_same { first_color } else { None };
@@ -616,7 +616,7 @@ impl ChunkTree {
     let ix = x[0] / child_extent;
     let iy = x[1] / child_extent;
     let iz = x[2] / child_extent;
-    let child_i = child_linear_idx(ix, iy, iz) as u32;
+    let child_i = child_linear_idx(ix, iy, iz);
     // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
     // 首次编辑才创建节点 + 置 bit + 紧凑表插入
     let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
@@ -726,7 +726,7 @@ impl ChunkTree {
     let ix = (x / child_extent).clamp(0, BRICK_FACTOR - 1);
     let iy = (y / child_extent).clamp(0, BRICK_FACTOR - 1);
     let iz = (z / child_extent).clamp(0, BRICK_FACTOR - 1);
-    let child_i = child_linear_idx(ix, iy, iz) as u32;
+    let child_i = child_linear_idx(ix, iy, iz);
     let next_x = x - ix * child_extent;
     let next_y = y - iy * child_extent;
     let next_z = z - iz * child_extent;

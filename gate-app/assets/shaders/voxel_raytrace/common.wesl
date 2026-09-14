@@ -1,0 +1,104 @@
+import package::bindings::{b_palette, g, light_u};
+
+// --- 常量区（与 Rust wgsl_consts mod 字节对齐）---
+// Douglas Brick Tree：256³ chunk，4³ 分裂因子，4 层（256→64→16→4→1）
+const CHUNK_SIZE: u32 = 256u;
+const BRICK_FACTOR: u32 = 4u;
+const MAX_LEVEL: u32 = 4u;
+const NODE_FIXED_WORDS: u32 = 3u;    // mask_lo + mask_hi + palette
+// b_struct Region ①：稠密 chunk 窗口（64³ = 262144 字 = 1MB）
+const CHUNK_INDEX_CAP: u32 = 64u;
+const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
+const TREE_BASE: u32 = 262144u;          // Region ② 起始
+
+
+// P2：方向位掩码 LUT。射线方向符号编码为 3-bit 掩码（bit0=x>=0, bit1=y>=0,
+// bit2=z>=0，共 8 种），查表一次性得到 side（boundary 计算用）和三轴步进 face id，
+// 消除 trace_chunk/trace_grid 热循环内的 select(vec3(0),vec3(1),sign>=0) 与
+// select(0u,1u,sign<0) 等运行时方向分支。打包：bits0-2=side, bits8-15=face_x,
+// bits16-23=face_y, bits24-31=face_z。face 规则：sign<0 穿对面（x→1, y→3, z→5）。
+const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
+  0x05030100u, // dir=0 (-,-,-): side=(0,0,0), face=(1,3,5)
+  0x05030001u, // dir=1 (+,-,-): side=(1,0,0), face=(0,3,5)
+  0x05020102u, // dir=2 (-,+,-): side=(0,1,0), face=(1,2,5)
+  0x05020003u, // dir=3 (+,+,-): side=(1,1,0), face=(0,2,5)
+  0x04030104u, // dir=4 (-,-,+): side=(0,0,1), face=(1,3,4)
+  0x04030005u, // dir=5 (+,-,+): side=(1,0,1), face=(0,3,4)
+  0x04020106u, // dir=6 (-,+,+): side=(0,1,1), face=(1,2,4)
+  0x04020007u, // dir=7 (+,+,+): side=(1,1,1), face=(0,2,4)
+);
+
+// ---- Pure face math helpers (no hashmap dependency) ----
+fn face_index_from_normal(n: vec3<f32>) -> u32 {
+  let ax = abs(n.x); let ay = abs(n.y); let az = abs(n.z);
+  if (ax >= max(ay, az)) { return select(0u, 1u, n.x >= 0.0); }
+  if (ay >= az)          { return select(2u, 3u, n.y >= 0.0); }
+  return select(4u, 5u, n.z >= 0.0);
+}
+fn face_normal_from_index(f: u32) -> vec3<f32> {
+  if (f == 0u) { return vec3<f32>(-1.0, 0.0, 0.0); }
+  if (f == 1u) { return vec3<f32>( 1.0, 0.0, 0.0); }
+  if (f == 2u) { return vec3<f32>(0.0, -1.0, 0.0); }
+  if (f == 3u) { return vec3<f32>(0.0,  1.0, 0.0); }
+  if (f == 4u) { return vec3<f32>(0.0, 0.0, -1.0); }
+  if (f == 5u) { return vec3<f32>(0.0, 0.0,  1.0); }
+  return vec3<f32>(0.0);
+}
+fn face_color_from_index(f: u32) -> vec3<f32> {
+  if (f == 0u) { return vec3<f32>(1.0, 0.2, 0.2); }
+  if (f == 1u) { return vec3<f32>(0.2, 1.0, 0.2); }
+  if (f == 2u) { return vec3<f32>(0.2, 0.2, 1.0); }
+  if (f == 3u) { return vec3<f32>(1.0, 1.0, 0.2); }
+  if (f == 4u) { return vec3<f32>(0.2, 1.0, 1.0); }
+  if (f == 5u) { return vec3<f32>(1.0, 0.2, 1.0); }
+  return vec3<f32>(1.0);
+}
+
+// ---- sRGB → linear 转换（palette/sky 均以 sRGB u8/255 存储，光照前必须转 linear） ----
+fn srgb_channel_to_linear(c: f32) -> f32 {
+  if (c <= 0.04045) {
+    return c / 12.92;
+  }
+  return pow((c + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    srgb_channel_to_linear(c.x),
+    srgb_channel_to_linear(c.y),
+    srgb_channel_to_linear(c.z),
+  );
+}
+
+// ---- palette albedo 解包（sRGB → linear）----
+fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
+  let w0 = b_palette[palette_base + pal * 2u];
+  let srgb = vec3<f32>(
+    f32(w0 & 0xFFu),
+    f32((w0 >> 8u) & 0xFFu),
+    f32((w0 >> 16u) & 0xFFu),
+  ) / 255.0;
+  return srgb_to_linear(srgb);
+}
+
+/// palette 条目的自发光强度（0..1）。word1 低字节（wire.rs `pack_palette_entry` 同布局）。
+/// 发光体素是这个世界的**光源本体**：着色时 radiance 直出，不吃方向/阴影（见 lighting.rs 注释）。
+fn palette_emissive(palette_base: u32, pal: u32) -> f32 {
+  return f32(b_palette[palette_base + pal * 2u + 1u] & 0xFFu) / 255.0;
+}
+
+// 天空纯色（miss 像素输出 + 探针射线 miss 端点；Minecraft 白天平原 #78A7FF）
+// sRGB → linear（与 palette_albedo 同空间；光照全程 linear，输出经 linear_to_srgb 还原）
+fn sky_rgb() -> vec3<f32> {
+  return srgb_to_linear(light_u.sky_color.xyz);
+}
+
+// 线性 → sRGB 转换
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+  let l = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  return vec3<f32>(
+    select(12.92 * l.r, pow(l.r, 1.0 / 2.4) * 1.055 - 0.055, l.r > 0.0031308),
+    select(12.92 * l.g, pow(l.g, 1.0 / 2.4) * 1.055 - 0.055, l.g > 0.0031308),
+    select(12.92 * l.b, pow(l.b, 1.0 / 2.4) * 1.055 - 0.055, l.b > 0.0031308)
+  );
+}

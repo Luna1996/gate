@@ -253,6 +253,7 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
 ///
 /// Disabled tab（带 [`UiDisabled`]）：跳过点击切换、配色降亮一档；若 active 恰为
 /// 禁用 tab，仍显示其内容（禁用只阻止切换，不强制切走）。
+#[allow(clippy::too_many_arguments)] // Bevy system：各 Query 逐一注入
 pub fn tab_view_system(
   mut commands: Commands,
   mut q_views: Query<(Entity, &mut TabView, &Children)>,
@@ -279,7 +280,7 @@ pub fn tab_view_system(
   let c = &theme.colors;
 
   for (view_e, mut view, view_children) in &mut q_views {
-    let Some(&bar) = view_children.get(0) else {
+    let Some(&bar) = view_children.first() else {
       continue;
     };
     let Some(&content_container) = view_children.get(1) else {

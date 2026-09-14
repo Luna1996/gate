@@ -53,6 +53,12 @@ glam = "=0.32.1"
 rayon = "1"
 # P3.1 WGSL 编译期校验测试（版本锁 bevy_render 传递的 naga，避免双份编译）
 naga = { version = "=29.0.4", features = ["wgsl-in"] }
+# WESL（wgsl 超集，带 import）编译：dda shader 拆包后由 wesl-rs 在运行时编译回 WGSL。
+# 本项目未启用 bevy 的 shader_format_wesl（不使用其 ShaderLoader，见 gate-render/src/shader.rs），
+# 故 bevy_shader 的可选 wesl 依赖不参与构建，不存在同 crate 编译两份的问题。
+# naga-ext：WESL 自带校验器默认不认识 u64/i64/f16 等 Naga 扩展类型
+# （b_leaves: array<u64> 会报 "cannot find declaration of `u64`"）。
+wesl = { version = "0.5", features = ["naga-ext"] }
 
 # Bevy 官方推荐：依赖全优化，本项目代码保持可调试
 # 没有它 debug build 慢 10-50 倍（窗口卡死/无响应的根因之一）

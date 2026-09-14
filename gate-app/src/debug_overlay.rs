@@ -344,7 +344,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   ))
                   .with_children(|row| {
                     label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: "DDGI".into(),
@@ -353,7 +353,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       },
                     );
                     let s = slider(
-                      &ctx,
+                      ctx,
                       row,
                       SliderConfig {
                         min: 0.0,
@@ -365,7 +365,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
                     let vl = label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: format!(
@@ -399,7 +399,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                         ButtonVariant::Ghost
                       };
                       let b = button(
-                        &ctx,
+                        ctx,
                         row,
                         ButtonConfig {
                           text: (*name).into(),
@@ -426,7 +426,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   ))
                   .with_children(|row| {
                     label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: "Gain".into(),
@@ -435,7 +435,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       },
                     );
                     let s = slider(
-                      &ctx,
+                      ctx,
                       row,
                       SliderConfig {
                         min: 0.1,
@@ -447,7 +447,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiGainSlider);
                     let vl = label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: format!("{:.1}", ddgi_dbg.gain),
@@ -470,7 +470,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   ))
                   .with_children(|row| {
                     label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: "Cheb std".into(),
@@ -479,7 +479,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       },
                     );
                     let s = slider(
-                      &ctx,
+                      ctx,
                       row,
                       SliderConfig {
                         min: 0.0,
@@ -491,7 +491,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiSoftSlider);
                     let vl = label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: format!("{:.2}", ddgi_dbg.depth_soft_k),
@@ -514,7 +514,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   ))
                   .with_children(|row| {
                     label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: "Far amb".into(),
@@ -523,7 +523,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       },
                     );
                     let s = slider(
-                      &ctx,
+                      ctx,
                       row,
                       SliderConfig {
                         min: 0.0,
@@ -535,7 +535,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiFarAmbSlider);
                     let vl = label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: format!("{:.2}", ddgi_dbg.far_ambient),
@@ -546,7 +546,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     row.world_mut().entity_mut(*vl).insert(DdgiFarAmbValueLabel);
                   });
                 let t = toggle_switch(
-                  &ctx,
+                  ctx,
                   cell,
                   ToggleSwitchConfig {
                     text: Some("Probe Viz".into()),
@@ -568,7 +568,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   ))
                   .with_children(|row| {
                     label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: "LOD".into(),
@@ -577,7 +577,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       },
                     );
                     let s = slider(
-                      &ctx,
+                      ctx,
                       row,
                       SliderConfig {
                         min: 0.0,
@@ -589,7 +589,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     );
                     row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
                     let vl = label(
-                      &ctx,
+                      ctx,
                       row,
                       LabelConfig {
                         text: DDGI_PROBE_VIZ_LODS
@@ -643,7 +643,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ))
                 .with_children(|row| {
                   label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: "Speed".into(),
@@ -652,7 +652,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     },
                   );
                   let s = slider(
-                    &ctx,
+                    ctx,
                     row,
                     SliderConfig {
                       min: crate::camera::FLY_SPEED_MIN,
@@ -664,7 +664,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   );
                   row.world_mut().entity_mut(*s).insert(CameraSpeedSlider);
                   let vl = label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: speed_text(fly_speed),
@@ -701,7 +701,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ))
                 .with_children(|row| {
                   label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: "Shape".into(),
@@ -719,7 +719,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       ButtonVariant::Ghost
                     };
                     let b = button(
-                      &ctx,
+                      ctx,
                       row,
                       ButtonConfig {
                         text: name.into(),
@@ -746,7 +746,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ))
                 .with_children(|row| {
                   label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: "Size".into(),
@@ -755,7 +755,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     },
                   );
                   let s = slider(
-                    &ctx,
+                    ctx,
                     row,
                     SliderConfig {
                       min: EDIT_SIZE_MIN as f32,
@@ -767,7 +767,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   );
                   row.world_mut().entity_mut(*s).insert(EditSizeSlider);
                   let vl = label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: brush_span_text(edit.size),
@@ -793,7 +793,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ))
                 .with_children(|row| {
                   label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: "Mat".into(),
@@ -802,7 +802,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     },
                   );
                   let s = slider(
-                    &ctx,
+                    ctx,
                     row,
                     SliderConfig {
                       min: 0.0,
@@ -814,7 +814,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                   );
                   row.world_mut().entity_mut(*s).insert(EditMaterialSlider);
                   let vl = label(
-                    &ctx,
+                    ctx,
                     row,
                     LabelConfig {
                       text: material_text(edit_mat),
@@ -1177,6 +1177,7 @@ pub(crate) fn debug_overlay_toggle(
 ///
 /// 逐帧 delta 压入 5s 滚动窗口；GPU/CPU 逐段剖析已交由 Tracy + wgpu-profiler
 /// （`--features profile`，Tracy GUI 时间线），这里只留用户直视的 FPS 读数。
+#[allow(clippy::type_complexity, clippy::too_many_arguments)] // Bevy system：ParamSet/资源逐一注入
 pub(crate) fn fps_line_feed(
   time: Res<Time>,
   orbit: Res<OrbitCamera>,

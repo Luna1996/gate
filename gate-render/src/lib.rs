@@ -3,6 +3,7 @@ pub mod ddgi;
 pub mod lighting;
 pub mod profiler;
 mod responsive;
+pub mod shader;
 
 use bevy::prelude::*;
 

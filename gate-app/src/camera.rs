@@ -16,7 +16,7 @@ use gate_render::{
 use gate_voxel::VolumeTransform;
 
 // ---- 相机参数（P2.6 from_orbit 使用；用户已取消"最远距离"限制）----
-// CAM_FAR = 透视投影 far 面；dda.wgsl 内 DDA 射线 t_max 同步到此量级。
+// CAM_FAR = 透视投影 far 面；shaders/voxel_raytrace/ 内 DDA 射线 t_max 同步到此量级。
 // 原 4000（80m）→ 现 65536（1310.72m）足够 zoom-out 到整个 tile 场景（~1000 voxel）
 // 缩成屏幕 1% 像素仍可见。DIST_MAX 已删除，滚轮 zoom-out 距离本身无上限。
 pub(crate) const FOV_Y: f32 = 60.0_f32.to_radians();
@@ -93,6 +93,7 @@ pub(crate) fn camera_look_input(
 /// - 中键拖拽 = 平移 target（按当前距离缩放 pan 速度，1:1 跟手）
 /// - 滚轮 = 对数缩放（exp(±ZOOM_LOG_SPEED·lines)，各距离档手感一致）+ Shift 细调 1/10
 /// - 旋转（右键）在 [`camera_look_input`]，两模式共享
+#[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
 pub(crate) fn orbit_camera_input(
   mouse: Res<ButtonInput<MouseButton>>,
   keys: Res<ButtonInput<KeyCode>>,
@@ -252,7 +253,7 @@ fn window_height(windows: &Query<&Window>) -> f32 {
 /// 避免 NDC / y 翻转 / 退化保护在两处各写一遍。指针不在窗口内 / 矩阵退化 → None。
 pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
   let cursor = window.cursor_position()?;
-  let sf = window.scale_factor() as f32;
+  let sf = window.scale_factor();
   let phys = cursor * sf; // 物理像素（左上原点，y 向下）
   let pw = window.physical_width().max(1) as f32;
   let ph = window.physical_height().max(1) as f32;
@@ -319,7 +320,6 @@ pub(crate) fn left_click_pick_recenter(
   let vols_with_tr: Vec<(&BrickMapBuffers, VolumeTransform)> = per_vol_bufs
     .iter()
     .zip(scene.volumes.list.iter().map(|v| v.transform))
-    .map(|(b, t)| (b, t))
     .collect();
   // ---- 3) trace_volumes：主世界 + 物体统一求最近 ----
   if let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, origin, dir, t_max) {

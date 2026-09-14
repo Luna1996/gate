@@ -1,11 +1,11 @@
 ---
 name: "gate-wgsl-shader-optimization"
-description: "gate 体素光追引擎（Rust+Bevy+wgpu）WGSL compute shader 优化闭环：CPU 参考实现先行→cargo test fuzz 等价门禁→WGSL 逐字镜像→GATE_BENCH 同会话交替 A/B。修改/优化 dda.wgsl 或 brickmap DDA 遍历算法时必须遵循。"
+description: "gate 体素光追引擎（Rust+Bevy+wgpu）WGSL compute shader 优化闭环：CPU 参考实现先行→cargo test fuzz 等价门禁→WGSL 逐字镜像→GATE_BENCH 同会话交替 A/B。修改/优化 shaders/voxel_raytrace/*.wesl 或 brickmap DDA 遍历算法时必须遵循。"
 ---
 
 # gate WGSL Shader 优化工作流
 
-适用于 `gate-app/assets/shaders/*.wgsl`（核心是 `dda.wgsl` 的 chunk 内层次遍历 `trace_chunk`）
+适用于 `gate-app/assets/shaders/voxel_raytrace/*.wesl`（WESL 包；核心是 `trace.wesl` 的 chunk 内层次遍历 `trace_chunk`）
 与 `gate-render/src/brickmap/dda.rs`（CPU 参考实现）。用户偏好：**CPU 参考实现先行 +
 cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许读 `gate-app/logs/` 日志；画面
 由用户目测确认）。
@@ -31,13 +31,31 @@ cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许�
 
 ## WGSL 编辑方式（naga 坑，已踩过）
 
-- **只能用 Edit 工具改 .wgsl**。PowerShell/重定向写文件会加 BOM → naga 编译失败。
-- dda.wgsl 是**混合行尾**（CRLF+LF），大块 old_string 常匹配失败。对策：小范围唯一锚点
+- **只能用 Edit 工具改 `.wesl`**。PowerShell/重定向写文件会加 BOM → naga 编译失败。
+- WESL 包统一 **LF + UTF-8 无 BOM**；大块 old_string 匹配失败时改用小范围唯一锚点
   分段 Edit；确需整段替换时，按行号用 .NET 拼接：
   ```powershell
   $enc = New-Object System.Text.UTF8Encoding($false)  # 无 BOM
   [System.IO.File]::WriteAllText($p, [string]::Join("`n", $lines) + "`n", $enc)
   ```
+- **WESL 包结构**（`gate-app/assets/shaders/voxel_raytrace/`）：入口 `main.wesl`（含全部 `@compute`
+  入口点 + import 头），其余按子系统拆分 —— `bindings.wesl`（全部 `@group/@binding` + 接口
+  struct）、`common.wesl`（常量/face/sRGB）、`brickmap.wesl`、`trace.wesl`、`world.wesl`、
+  `lightfield.wesl`、`ddgi/{consts,helpers,bake,sort,sample,collect}.wesl`。
+  - 跨模块引用**必须 import**：`import package::ddgi::cast::{foo, Bar};`（`package::` 是包根
+    锚点，子目录即模块路径；未 import 的符号报 "cannot find declaration"）。
+  - **入口点（`@compute`）必须写在 `main.wesl`**：WESL 会改写非根模块的声明名，且 strip 只
+    保留根模块的入口点 —— 放子模块会被改名/剔除，pipeline 按字符串找不到入口（黑屏）。
+  - 编译入口：`gate-render/src/shader.rs::build_dda_shader`（由 `BrickMapDdaPlugin::build` 调用）
+    —— 用 `wesl` crate 编译整包 → 展平 WGSL → 作为 `Shader` 资产插入 `Assets<Shader>`，并把
+    handle 经 `DdaShaderHandle` 注入 render world 供 pipeline 创建读取。**不注册 `.wesl`
+    AssetLoader**：Bevy 的 `ShaderLoader` 已无条件占用该扩展名，重复注册会报
+    "Duplicate AssetLoader"（虽然后注册者胜出，但依赖顺序很脆）。mangler 固定 `NoMangler`，
+    常量/入口点名与 Rust 契约逐字一致；编译失败 `error!` + `panic!`（fail fast）。
+  - 改任一 `.wesl` → **重启 app** 即生效（启动时读盘重编译，无需 cargo 重编译）；WESL 编译失败
+    → `error!` 落 `latest.log` 并 panic（fail fast，不静默黑屏）。
+  - `naga-ext`：`b_leaves: array<u64>` 需要 wesl 的 `naga-ext` feature（否则 WESL 校验器报
+    `cannot find declaration of u64`），已在 workspace `Cargo.toml` 打开。
 - 移位 RHS 必须 u32：`v >> vec3<u32>(level*2u)`、标量 `v[mn] >> log2`（log2 声明 u32）；
   i32 移位 RHS 报 "automatic conversions cannot convert vec3<i32> to u32"。
 - `countOneBits` 不要作用于 u64：拆 `countOneBits(u32(x)) + countOneBits(u32(x >> 32u))`。
@@ -50,8 +68,10 @@ cargo test 等价性门禁，禁止自行截图验证画面正确性**（允许�
   `ddgi_place_probe` 的局部变量 `f16` → `found16`）。
 - i32↔u32 位环绕用 `bitcast<u32>` / `bitcast<i32>`（firstTrailingBit 公式需要）。
 - `firstTrailingBit` 返回 i32，0 → -1（全零），特判跨出 chunk。
-- `cargo build` **不会**发现 shader 错误：naga 在运行时编译，错误只在
-  `gate-app/logs/latest.log`（搜 `ERROR` / `pipeline_cache`）。改完 shader 必须跑一次看日志。
+- `cargo build` **不会**发现 shader 错误：WESL/naga 都在运行时编译，错误只在
+  `gate-app/logs/latest.log`（搜 `ERROR` / `wesl` / `pipeline_cache`）。改完 shader 必须跑一次看日志。
+  CI 侧 `cargo test -p gate-render --test wgsl_compile` 可提前抓 **WESL 编译 / naga 校验 /
+  入口点集合 / Rust-WGSL 常量对齐** 四类错误，改 shader 后先跑它。
 - **wgsl-analyzer 误报 u64**：`u64`/`i64` 对应可选的 shader-int64 能力，naga 在支持的
   GPU（Vulkan shaderInt64）上正常编译，但 wgsl-analyzer 0.12.224 及更早版本的类型检查器
   不认识 u64（2026-03 PR #456 才加，配置项 `extensions.shaderInt64`），会报一堆
@@ -131,7 +151,7 @@ Select-String -Path gate-app\logs\latest.log -Pattern "逐 pass" | Select-Object
 
 ```
 cargo test -p gate-render --lib brickmap::dda::         # CPU 等价性门禁（trace_chunk 遍历）
-cargo test -p gate-render --test wgsl_compile --release # shader naga 校验 + Rust/WGSL 常量对齐
+cargo test -p gate-render --test wgsl_compile --release # WESL 编译 + naga 校验 + 入口点/常量对齐
 cargo build -p gate-app --release                      # 发布构建（shader 运行时加载）
 cargo build -p gate-app --release --features profile   # 带 GPU pass 计时（GATE_BENCH 用）
 cargo run -p gate-app --release -- --nuke              # 正常运行（GATE_BENCH=1 加基准）

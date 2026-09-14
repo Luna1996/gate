@@ -174,8 +174,8 @@ pub fn load_vox_scene(
 fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[bool; 256]) {
   let pal = grid.palette_mut();
   let mut painted = 0usize;
-  for i in 1..=255usize {
-    if !used_pal[i] {
+  for (i, &used) in used_pal.iter().enumerate().take(256).skip(1) {
+    if !used {
       continue;
     }
     let rgba = scene.palette.colors[i];

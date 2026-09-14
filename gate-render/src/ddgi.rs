@@ -31,7 +31,7 @@ pub const IRRADIANCE_TEXELS: u32 = 4;
 ///
 /// 【为什么不用原版的 16×16】曾试过 16×16（每纹素 ~11°，现在 ~22°）：**实测漏光没有明显
 /// 改善** —— 说明当时的漏光主因不在深度角分辨率，而在别处（射线方向未绑定纹素 / 跨墙指向 /
-/// 级联硬切，见 dda.wgsl 对应注释；其中跨墙指向对应的旧"借针"机制现已删除）。代价则是深度图集
+/// 级联硬切，见 shaders/voxel_raytrace/ 对应注释；其中跨墙指向对应的旧"借针"机制现已删除）。代价则是深度图集
 /// 64MB → 256MB、collect 线程 80 → 320、帧轮换周期 ×4。故回退到 8×8。
 /// 必须与 WGSL `DDGI_DEPTH_TEXELS` 一致。
 pub const DEPTH_TEXELS: u32 = 8;
@@ -147,6 +147,12 @@ impl DdgiChunkGeom {
   #[inline]
   pub fn len(&self) -> u32 {
     self.dims.x * self.dims.y * self.dims.z
+  }
+
+  /// 空网格（dims 全零）：`from_world` 保证每轴 ≥2，实际不会出现，仅补全 lint 契约。
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    self.dims.x == 0 || self.dims.y == 0 || self.dims.z == 0
   }
 
   /// chunk 坐标 → 网格内线性下标（含边界检查）
@@ -328,15 +334,14 @@ impl DdgiWorldGrid {
   pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
     let mut out = Self::default();
     let mut base = 0u32;
-    for lod in 0..DDGI_LODS as usize {
-      let cell = DDGI_LOD_CELL_SIZES[lod];
+    for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
       let origin = IVec3::new(
         align_down(aabb_min.x, cell),
         align_down(aabb_min.y, cell),
         align_down(aabb_min.z, cell),
       );
       let span = (aabb_max - origin).max(IVec3::ONE);
-      let c = cell as i32;
+      let c = cell;
       let dims = UVec3::new(
         ((span.x + c - 1) / c).max(1) as u32,
         ((span.y + c - 1) / c).max(1) as u32,
@@ -651,7 +656,7 @@ pub struct DdgiDebugSettings {
   /// 注：该系数最初是为确认一个已修复的缺陷而加 —— 射线方向当时是「Fibonacci 球 + 每帧
   /// 随机四元数整体重旋」，每个深度纹素跨帧收到的是全球随机方向，`std` 度量的是「20° 锥内
   /// 几何起伏」而非「同方向噪声」，墙角虚高 → 软漏光。现在射线已**绑定到深度纹素**（见
-  /// dda.wgsl 的 cast「射线 ↔ 深度纹素绑定」），std 语义已正确。
+  /// shaders/voxel_raytrace/ 的 cast「射线 ↔ 深度纹素绑定」），std 语义已正确。
   pub depth_soft_k: f32,
   /// 级联覆盖**之外**的天光兜底强度，对应 WGSL `misc.w`（0..1，默认 0.25）。
   ///
@@ -727,7 +732,7 @@ fn dummy_sized_buffer(
 ) -> bevy::render::render_resource::Buffer {
   use bevy::render::render_resource::{BufferDescriptor, BufferUsages};
   device.create_buffer(&BufferDescriptor {
-    label: Some(label.into()),
+    label: Some(label),
     size: size.max(4),
     usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
     mapped_at_creation: false,
@@ -771,7 +776,7 @@ fn ddgi_indirect_buffer(
 ) -> bevy::render::render_resource::Buffer {
   use bevy::render::render_resource::{BufferDescriptor, BufferUsages};
   let buf = device.create_buffer(&BufferDescriptor {
-    label: Some(label.into()),
+    label: Some(label),
     size: DDGI_INDIRECT_BYTES,
     usage: BufferUsages::STORAGE
       | BufferUsages::INDIRECT
@@ -836,7 +841,7 @@ fn ddgi_array_tex(
     Extent3d, TextureDescriptor, TextureDimension, TextureUsages,
   };
   device.create_texture(&TextureDescriptor {
-    label: Some(label.into()),
+    label: Some(label),
     size: Extent3d {
       width: size.0,
       height: size.1,
@@ -956,7 +961,7 @@ fn init_ddgi_gpu(
 fn queue_ddgi_pipelines(
   dda: Option<bevy::ecs::system::Res<crate::brickmap::dda::DdaPipelines>>,
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
-  asset_server: bevy::ecs::system::Res<bevy::asset::AssetServer>,
+  dda_shader: bevy::ecs::system::Res<crate::shader::DdaShaderHandle>,
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
   use bevy::render::render_resource::{BindGroupLayoutDescriptor, ComputePipelineDescriptor, PipelineCache};
@@ -983,7 +988,7 @@ fn queue_ddgi_pipelines(
   let mut seal_layout = base.clone();
   seal_layout.push(BindGroupLayoutDescriptor::new("DdgiBgEmpty5", &[]));
   seal_layout.push(ddgi_bg6_layout());
-  let shader = asset_server.load(crate::brickmap::dda::DDA_SHADER_ASSET_PATH);
+  let shader = dda_shader.0.clone();
   let mk = |pipeline_cache: &PipelineCache,
             label: &'static str,
             entry: &'static str,
@@ -1032,7 +1037,7 @@ fn dispatch_ddgi(
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
   mut profiler: bevy::ecs::system::ResMut<crate::profiler::GpuProfilerRes>,
 ) {
-  if !stage.run_active() && !dbg.map_or(false, |d| d.probe_viz) {
+  if !stage.run_active() && !dbg.is_some_and(|d| d.probe_viz) {
     return;
   }
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
@@ -1071,7 +1076,7 @@ fn dispatch_ddgi(
   // 烘焙：世界数据变化时重算探针位置（BFS 最大空叶）。
   // **按 LOD 逐级派发 4 个独立 pass（细→粗）**：粗级的放置要继承本帧细级的 bake 输出，
   // 同一 pass 内没有顺序保证，只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
-  if bake.map_or(false, |b| b.0) {
+  if bake.is_some_and(|b| b.0) {
     let n_lods = DDGI_LODS as usize;
     // 每级的 dispatch 大小按**该级实际槽数**算 —— LOD1~3 的 dims 随世界 AABB 变化（不再固定
     // 32×16×32），LOD0 的槽数则是探针池的高水位（chunk 段之和，不等于空间盒 dims 乘积）。
@@ -1084,7 +1089,7 @@ fn dispatch_ddgi(
         let d = gpu.grid.lod_dims[lod];
         d.x * d.y * d.z
       };
-      n.div_ceil(64).max(1).min(65535)
+      n.div_ceil(64).clamp(1, 65535)
     });
     const LABELS: [&str; DDGI_LODS as usize] = [
       "gate_ddgi_bake0",
@@ -1096,9 +1101,9 @@ fn dispatch_ddgi(
     let mut p_bake: [Option<&bevy::render::render_resource::ComputePipeline>; DDGI_LODS as usize] =
       [None; DDGI_LODS as usize];
     let mut ready = true;
-    for lod in 0..n_lods {
-      p_bake[lod] = pipeline_cache.get_compute_pipeline(pipes.bake[lod]);
-      if p_bake[lod].is_none() {
+    for (slot, &pipe_id) in p_bake.iter_mut().zip(pipes.bake.iter()) {
+      *slot = pipeline_cache.get_compute_pipeline(pipe_id);
+      if slot.is_none() {
         ready = false;
       }
     }
@@ -1149,8 +1154,8 @@ fn dispatch_ddgi(
   }
   // 阶段二 cast / 阶段三 collect：seal 已备好 per-LOD indirect args
   // （byte 0 = cast×4 LOD，byte 64 = collect×4 LOD）与 rpp（byte 128）。
-  if stage.run_cast() {
-    if let (Some(p_cast), Some(p_coll), Some(bg5)) = (
+  if stage.run_cast()
+    && let (Some(p_cast), Some(p_coll), Some(bg5)) = (
       pipeline_cache.get_compute_pipeline(pipes.cast),
       pipeline_cache.get_compute_pipeline(pipes.collect),
       bg5.as_ref(),
@@ -1182,7 +1187,6 @@ fn dispatch_ddgi(
       // 本帧写过图集 → 下一帧采样侧翻到刚写完的那一半
       gpu.parity ^= 1;
     }
-  }
 }
 
 fn extract_ddgi_settings(
@@ -1269,7 +1273,7 @@ fn prepare_ddgi(
     if grid_changed {
       // 网格变了就打一次实际数值：LOD0 的 dims 字段仍是**空间盒**（级联包含 / 混合带用它），
       // 槽位数不再等于 dims 乘积，而是池高水位 —— 出问题时第一件事就是核对它们。
-      for lod in 0..DDGI_LODS as usize {
+      for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
         let o = grid.lod_origins[lod];
         let d = grid.lod_dims[lod];
         let count = if lod == 0 {
@@ -1279,7 +1283,7 @@ fn prepare_ddgi(
         };
         bevy::log::info!(
           "DDGI LOD{lod}: cell={} origin=({},{},{}) dims=({},{},{}) slot_base={} count={}",
-          DDGI_LOD_CELL_SIZES[lod],
+          cell,
           o.x,
           o.y,
           o.z,
@@ -1376,8 +1380,7 @@ fn prepare_ddgi(
 
   // ---- uniform ----
   let mut u = DdgiUniform::default();
-  for lod in 0..DDGI_LODS as usize {
-    let cell = DDGI_LOD_CELL_SIZES[lod];
+  for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
     let d = gpu.grid.lod_dims[lod];
     let o = gpu.grid.lod_origins[lod];
     u.lods[lod] = DdgiLod {
@@ -1497,8 +1500,7 @@ mod tests {
     let lo = IVec3::new(37, -11, 5);
     let hi = lo + IVec3::new(1932, 615, 1136);
     let g = DdgiWorldGrid::from_world(lo, hi);
-    for lod in 0..DDGI_LODS as usize {
-      let cell = DDGI_LOD_CELL_SIZES[lod];
+    for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
       let o = g.lod_origins[lod];
       // 原点落在 AABB 之外（向下对齐），且是 cell 的整数倍（shader 的整除前提）
       assert!(o.cmple(lo).all(), "lod {lod} 原点未向下对齐到 AABB 外侧");
@@ -1661,7 +1663,7 @@ mod tests {
   // ==========================================================================
   // 探针放置规则的镜像测试（Douglas #23）
   // ==========================================================================
-  // 把 dda.wgsl 的 `ddgi_place_probe`（新）与"改造前"的净距硬门槛（旧）各镜像一遍，
+  // 把 shaders/voxel_raytrace/ 的 `ddgi_place_probe`（新）与"改造前"的净距硬门槛（旧）各镜像一遍，
   // 在合成 16³ 体素图案上统计"格内还有空体素、却放不出探针"的格数。
   //
   // 镜像方式（逐条对应 WGSL，只取 LOD0 的自放置部分；LOD1~3 的"继承细级"不影响本对比）：
@@ -1676,7 +1678,7 @@ mod tests {
   type Cell16 = [[[bool; 16]; 16]; 16];
 
   fn solid(o: &Cell16, x: i32, y: i32, z: i32) -> bool {
-    if x < 0 || x >= 16 || y < 0 || y >= 16 || z < 0 || z >= 16 {
+    if !(0..16).contains(&x) || !(0..16).contains(&y) || !(0..16).contains(&z) {
       return false;
     }
     o[z as usize][y as usize][x as usize]
@@ -1733,7 +1735,7 @@ mod tests {
           let h = size as f32 * 0.5;
           let p = [m[0] as f32 + h, m[1] as f32 + h, m[2] as f32 + h];
           let d2 = ((p[0] - 8.0).powi(2) + (p[1] - 8.0).powi(2) + (p[2] - 8.0).powi(2)) as i32;
-          if best.map_or(true, |(_, b)| d2 < b) {
+          if best.is_none_or(|(_, b)| d2 < b) {
             best = Some((p, d2));
           }
         }
@@ -1776,7 +1778,7 @@ mod tests {
           }
           let p = [m[0] as f32 + 2.0, m[1] as f32 + 2.0, m[2] as f32 + 2.0];
           let d2 = ((p[0] - 8.0).powi(2) + (p[1] - 8.0).powi(2) + (p[2] - 8.0).powi(2)) as i32;
-          if best.map_or(true, |(_, b)| d2 < b) {
+          if best.is_none_or(|(_, b)| d2 < b) {
             best = Some((p, d2));
           }
         }
@@ -1800,7 +1802,8 @@ mod tests {
   #[test]
   fn probe_placement_matches_douglas_and_fixes_clearance_gap() {
     // 图案集合：闭包返回 true 表示该体素是固体。
-    let mut cases: Vec<(&str, Box<dyn Fn(i32, i32, i32) -> bool>)> = Vec::new();
+    type SolidPattern = Box<dyn Fn(i32, i32, i32) -> bool>;
+    let mut cases: Vec<(&str, SolidPattern)> = Vec::new();
     // 半空间：固体 x >= a（a=1..15）
     for a in 1..16 {
       cases.push(("halfspace", Box::new(move |x, _, _| x >= a)));

@@ -1,6 +1,6 @@
 //! Brick Tree wire 格式：常量、编码函数、全局参数（Phase 1，Douglas 1:1）
 //!
-//! 本模块是 CPU 构建器（builder.rs）与 GPU shader（Phase 2 重写 dda.wgsl）之间的
+//! 本模块是 CPU 构建器（builder.rs）与 GPU shader（Phase 2 重写 shaders/voxel_raytrace/）之间的
 //! 字节契约。纯数据变换、零渲染依赖，可脱离渲染运行时单测。
 //!
 //! ## b_struct 布局（Douglas Brick Tree 紧凑 DFS 格式）
@@ -76,7 +76,7 @@ pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
 
 // ============ GPU 全局参数 ============
 //
-// **字段名与旧版逐字相同（80B 布局不变）**——Phase 1 保持 dda.wgsl 的 Globals
+// **字段名与旧版逐字相同（80B 布局不变）**——Phase 1 保持 shaders/voxel_raytrace/ 的 Globals
 // struct 字节兼容（shader 逻辑 Phase 2 重写，本阶段画面为空属预期）。
 // 语义升级：index_origin/dims 从 tile 窗口（×512 voxel）变为 **chunk 窗口**
 // （×256 voxel）；tile_count 语义变为 chunk_count。
@@ -185,6 +185,7 @@ impl GridDesc {
   };
 
   /// 从 VolumeTransform + tree/palette 基址构造
+  #[allow(clippy::too_many_arguments)] // 逐字段展开，语义即参数名（wire 契约）
   pub fn from_transform(
     pos: Vec3,
     rot: Mat3,
@@ -222,10 +223,10 @@ impl GridDesc {
 
 // ============ P4：方向可达掩码 LUT（Douglas #18 Bitwise Masking）============
 
-/// LUT octant 数：射线方向符号组合。编码与 dda.wgsl `dir_mask` 一致：
+/// LUT octant 数：射线方向符号组合。编码与 shaders/voxel_raytrace/ `dir_mask` 一致：
 /// bit0 = x 正方向、bit1 = y 正、bit2 = z 正（正 = 1，零分量按正处理 = 保守）。
 pub const MARCH_MASK_OCTANTS: usize = 8;
-/// LUT 入口格数：4³ brick 内的 DDA 起始格。编码与 dda.wgsl `child_idx` 一致：
+/// LUT 入口格数：4³ brick 内的 DDA 起始格。编码与 shaders/voxel_raytrace/ `child_idx` 一致：
 /// `z*16 + y*4 + x`。
 pub const MARCH_MASK_ENTRIES: usize = 64;
 /// 每入口格掩码字数（64-bit 子块占用 → 2×u32）
@@ -248,7 +249,7 @@ pub const MARCH_MASK_WORDS: usize =
 ///
 /// 子块含实体与否的判定归 shader（本 LUT 只答"几何上能否经过"）：
 /// gate 语义 mask bit=1 = 分裂 ≠ 实体，uniform 子块色 = 节点 palette——
-/// palette==0（空气）节点才可用 `mask & reach` 剔除，见 dda.wgsl trace_chunk。
+/// palette==0（空气）节点才可用 `mask & reach` 剔除，见 shaders/voxel_raytrace/ trace_chunk。
 pub fn march_mask_lut_words() -> Vec<u32> {
   let mut out = vec![0u32; MARCH_MASK_WORDS];
   for oct in 0..MARCH_MASK_OCTANTS {

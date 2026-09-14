@@ -181,10 +181,11 @@ impl VolumeGrid {
   /// 构造独立物体 volume（OBJ→Volume 统一入口）。
   /// `obj_id` 由渲染器分配（>=0）；`pos/rot/scale` 为世界变换。
   pub fn new_object(obj_id: i32, pos: Vec3, rot: Mat3, scale: f32) -> Self {
-    let mut g = Self::default();
-    g.obj_id = obj_id;
-    g.transform = VolumeTransform::new(pos, rot, scale);
-    g
+    Self {
+      obj_id,
+      transform: VolumeTransform::new(pos, rot, scale),
+      ..Self::default()
+    }
   }
 
   pub fn transform(&self) -> VolumeTransform {
