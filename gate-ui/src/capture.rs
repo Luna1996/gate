@@ -16,6 +16,18 @@ use bevy::window::PrimaryWindow;
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
 pub struct UiPointerCaptured(pub bool);
 
+/// 鼠标拦截标记：挂在任意 UI 节点上（控件根节点即可，其后代一并被覆盖）。
+///
+/// 语义 = 「悬停其上的鼠标事件（按键、移动、滚轮）全部吞掉」：本节点及祖先
+/// [`FocusPolicy::Block`]（组件库默认）会终止 bevy_ui 的命中链，下层 UI 收不到 hover；
+/// 同时 [`MouseIntercepted`] 置真，3D 场景输入侧据此跳过（见 gate-app 相机输入）。
+#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MouseIntercept;
+
+/// 指针是否落在带 [`MouseIntercept`] 的节点上（每帧重算）
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
+pub struct MouseIntercepted(pub bool);
+
 /// UI 节点树命中测试（每帧重算；set_if_neq 仅在翻转时触发 change 检测）
 ///
 /// 判定条件与 bevy_ui `ui_focus_system` / picking backend 逐条对齐：
@@ -35,16 +47,22 @@ pub fn ui_pointer_capture_system(
     &UiGlobalTransform,
     Option<&InheritedVisibility>,
     Option<&FocusPolicy>,
+    Option<&MouseIntercept>,
   )>,
   clipping: Query<(&ComputedNode, &UiGlobalTransform, &Node)>,
   child_of: Query<&ChildOf, Without<OverrideClip>>,
   mut captured: ResMut<UiPointerCaptured>,
+  mut intercepted: ResMut<MouseIntercepted>,
 ) {
   let mut over_ui = false;
+  let mut over_intercept = false;
   if let Ok(window) = windows.single()
     && let Some(cursor) = window.physical_cursor_position()
   {
-    for (entity, node, transform, vis, focus) in &nodes {
+    for (entity, node, transform, vis, focus, intercept) in &nodes {
+      if over_ui && over_intercept {
+        break; // 两个标志都已确定，无需继续遍历
+      }
       if !vis.is_some_and(|v| v.get()) {
         continue;
       }
@@ -59,11 +77,14 @@ pub fn ui_pointer_capture_system(
         && clip_check_recursive(cursor, entity, &clipping, &child_of)
       {
         over_ui = true;
-        break;
+        if intercept.is_some() {
+          over_intercept = true;
+        }
       }
     }
   }
   captured.set_if_neq(UiPointerCaptured(over_ui));
+  intercepted.set_if_neq(MouseIntercepted(over_intercept));
 }
 
 #[cfg(test)]
@@ -101,6 +122,7 @@ mod tests {
   fn capture_flips_with_hit_test() {
     let mut app = App::new();
     app.init_resource::<UiPointerCaptured>();
+    app.init_resource::<MouseIntercepted>();
     app.add_systems(Update, ui_pointer_capture_system);
     app.world_mut().spawn((Window::default(), PrimaryWindow));
 
@@ -129,5 +151,33 @@ mod tests {
     // FocusPolicy::Pass 的节点本身不捕获
     app.world_mut().entity_mut(node).insert(FocusPolicy::Pass);
     assert!(!captured(&mut app), "Pass node does not capture");
+  }
+
+  #[test]
+  fn mouse_intercept_needs_marker() {
+    let mut app = App::new();
+    app.init_resource::<UiPointerCaptured>();
+    app.init_resource::<MouseIntercepted>();
+    app.add_systems(Update, ui_pointer_capture_system);
+    app.world_mut().spawn((Window::default(), PrimaryWindow));
+    let node = spawn_node(&mut app, 200.0, 200.0, 100.0, 100.0);
+
+    let intercepted = |app: &mut App| {
+      app.update();
+      app.world().resource::<MouseIntercepted>().0
+    };
+
+    // 无标记：捕获但不算拦截
+    set_cursor(&mut app, Some((210.0, 190.0)));
+    assert!(captured(&mut app), "cursor over node → captured");
+    assert!(!intercepted(&mut app), "without marker no interception");
+
+    // 加标记 → 拦截
+    app.world_mut().entity_mut(node).insert(MouseIntercept);
+    assert!(intercepted(&mut app), "marker node intercepts");
+
+    // 光标移开 → 不拦截
+    set_cursor(&mut app, Some((10.0, 10.0)));
+    assert!(!intercepted(&mut app), "cursor off marker node");
   }
 }

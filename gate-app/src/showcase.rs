@@ -1,6 +1,6 @@
 //! 右上角 gate-ui 组件展示窗：全部 widget 的功能演示面板。
 //!
-//! [`spawn_showcase`] 在主题/字体就绪后由 `demo_ui_setup` 一次性调用；
+//! [`spawn_showcase`] 在主题/字体就绪后由 `debug_ui_setup` 一次性调用；
 //! 交互（button/checkbox/slider）经观察者写入事件日志，[`showcase_demo_system`]
 //! 每帧给演示折线喂正弦样本。
 

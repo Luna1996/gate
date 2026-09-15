@@ -1,11 +1,11 @@
 //! gate 演示应用入口：插件装配 + 系统注册。
 //!
-//! 模块：[`scene`] 场景搭建 / [`camera`] 相机与输入 / [`debug_overlay`] 左上角 FPS HUD /
+//! 模块：[`scene`] 场景搭建 / [`camera`] 相机与输入 / [`debug_menu`] 左上角调试菜单（gate-ui menu 容器）/
 //! [`showcase`] 右上角组件展示窗 / [`vox_scene`] MagicaVoxel .vox 导入。
 //! 性能剖析：`--features profile` 启动后用 Tracy GUI 连接（CPU 与 wgpu-profiler GPU zone 同时间线）。
 
 mod camera;
-mod debug_overlay;
+mod debug_menu;
 mod edit;
 mod scene;
 mod showcase;
@@ -19,6 +19,7 @@ use bevy::{
   prelude::*,
   window::{PresentMode, PrimaryWindow, Window, WindowResolution},
 };
+use rust_i18n::t;
 
 use gate_render::VIEW_SIZE;
 use gate_ui::{ThemeFont, UiCtx, UiTheme};
@@ -27,7 +28,10 @@ use camera::{
   build_camera_config, camera_look_input, fly_camera_input, left_click_pick_recenter,
   orbit_camera_input, sync_camera_mode_switch,
 };
-use debug_overlay::{DemoUiRoot, debug_overlay_toggle, fps_line_feed, spawn_debug_view};
+use debug_menu::{
+  DebugUiRoot, FpsOverlayVisible, FpsWindow, camera_info_tick, debug_menu_toggle, fps_overlay_tick,
+  save_menu_on_exit, spawn_debug_menu_ui, sync_ui_locale,
+};
 use edit::voxel_edit_input;
 use scene::setup;
 use showcase::{showcase_demo_system, spawn_showcase};
@@ -54,7 +58,7 @@ fn main() {
   #[cfg(feature = "profile")]
   let _tracy_client = tracy_client::Client::start();
 
-  // i18n：把当前语言定成缺省中文。必须在任何 `t!` 求值之前 —— UI 由 demo_ui_setup
+  // i18n：把当前语言定成缺省中文。必须在任何 `t!` 求值之前 —— UI 由 debug_ui_setup
   // 启动时一次性 spawn，文本生成后不再重算。
   rust_i18n::set_locale(DEFAULT_LOCALE);
 
@@ -70,7 +74,7 @@ fn main() {
           // （DDA 目标固定 VIEW_SIZE，再 blit 到窗口）。
           resolution: WindowResolution::new(VIEW_SIZE.x, VIEW_SIZE.y)
             .with_scale_factor_override(1.0),
-          // Fifo 硬垂直同步（与 DebugView「VSync」开关默认开一致）；关闭 → AutoNoVsync
+          // Fifo 硬垂直同步（与 DebugMenu「视频/垂直同步」开关默认开一致）；关闭 → AutoNoVsync
           // 不封顶测裸 GPU 吞吐，bevy_render 检测 present_mode 变化后重配 swapchain。
           // focused=false：启动不抢前台焦点。
           focused: false,
@@ -125,8 +129,13 @@ fn main() {
   app
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
-    // 体素编辑设置（形状/大小/材质/材质→调色板槽缓存）；DebugView 的 Edit tab 是它的视图
+    // 体素编辑设置（形状/大小/材质/材质→调色板槽缓存）；DebugMenu 的「游戏/编辑」是它的视图
     .init_resource::<edit::EditSettings>()
+    // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
+    .init_resource::<FpsOverlayVisible>()
+    .init_resource::<FpsWindow>()
+    // UI 文案解析器：菜单树存 i18n key，gate-ui 经它解析（切语言后 sync_ui_locale 触发重解析）
+    .insert_resource(gate_ui::UiTranslator::new(|key| t!(key).to_string()))
     // GATE_BENCH=1：失焦窗口也用 Continuous 更新（Bevy 默认失焦切 reactive_low_power
     // 60Hz，后台跑帧时 fps 会被封顶到 60）
     .insert_resource(bevy::winit::WinitSettings {
@@ -155,18 +164,22 @@ fn main() {
           voxel_edit_input,
         )
           .chain(),
-        demo_ui_setup,
-        // 先推帧时长样本，gate-ui 的 plot_redraw_system 同帧再重绘折线图
-        fps_line_feed.before(gate_ui::plot_redraw_system),
+        debug_ui_setup,
+        // 右上角 FPS 覆盖层（开关打开时每帧刷新）+ 纯文本行的相机信息
+        (fps_overlay_tick, camera_info_tick),
+        // 语言切换 → 菜单/UI 文案整体重解析
+        sync_ui_locale,
         // 右上角组件展示窗：交互事件日志 / slider 实时值 / 演示折线喂数
         showcase_demo_system,
-        // F3 切换左上角 debug overlay 显隐（默认显示）
-        debug_overlay_toggle,
+        // F3 切换 DebugMenu 显隐（默认显示）
+        debug_menu_toggle,
         // 每帧强制 scale_factor=1.0：resize/换显示器时 winit 会重设 OS DPI 值并覆盖
         // override，重设保证 UI 恒为 1 物理像素/逻辑像素
         enforce_integer_scale_factor,
       ),
-    );
+    )
+    // 退出前把 DebugMenu 当前状态写回 TOML（下次启动的初值来源）
+    .add_systems(Last, save_menu_on_exit);
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
@@ -221,18 +234,19 @@ fn enforce_integer_scale_factor(mut q: Query<&mut Window, With<PrimaryWindow>>) 
 
 /// 主题就绪后 spawn 一次（RON 成功或回退默认都会插入 UiTheme 资源）。
 ///
-/// one-shot = 存在性守卫：spawn 的根节点挂 [`DemoUiRoot`]，查到即跳过；命令 apply
+/// one-shot = 存在性守卫：spawn 的根节点挂 [`DebugUiRoot`]，查到即跳过；命令 apply
 /// 后 marker 当帧生效，守卫最迟下一帧命中。
 ///
 /// 等待条件：`theme.font_path` 非 None 时字体资产须已 `LoadState::Loaded`，否则
 /// TextPipeline 会在不含 CJK 的默认 slot 上生成字形缓存，之后即使 override default
-/// slot，已缓存的 atlas 条目光栅化仍是方框。
-fn demo_ui_setup(
+/// slot，已缓存的 atlas 条目光栅化仍是方框。图标字体同理（菜单标题栏/箭头）。
+fn debug_ui_setup(
   theme: Option<Res<UiTheme>>,
   font: Option<Res<ThemeFont>>,
+  icon: Option<Res<gate_ui::IconFont>>,
   server: Option<Res<AssetServer>>,
   mut commands: Commands,
-  q_spawned: Query<(), With<DemoUiRoot>>,
+  q_spawned: Query<(), With<DebugUiRoot>>,
 ) {
   if !q_spawned.is_empty() {
     return;
@@ -240,20 +254,38 @@ fn demo_ui_setup(
   let Some(theme) = theme else {
     return;
   };
-  let font = match (server.as_ref(), font.as_ref(), theme.font_path.as_ref()) {
-    (Some(srv), Some(f), Some(_)) => match &f.handle {
-      Some(h) if matches!(srv.load_state(h.id()), LoadState::Loaded) => Some(h.clone()),
-      _ => return,
-    },
-    (_, _, None) => None,
+  let loaded = |h: &Option<Handle<Font>>| match (server.as_ref(), h) {
+    (Some(srv), Some(h)) => matches!(srv.load_state(h.id()), LoadState::Loaded),
+    (None, _) => true,
+    _ => false,
+  };
+  let font = match (font.as_ref(), theme.font_path.as_ref()) {
+    (Some(f), Some(_)) => {
+      if !loaded(&f.handle) {
+        return;
+      }
+      f.handle.clone()
+    }
+    (_, None) => None,
     _ => return,
+  };
+  let icon_font = match (icon.as_ref(), theme.icon_font_path.as_ref()) {
+    (Some(i), Some(_)) => {
+      if !loaded(&i.handle) {
+        return;
+      }
+      i.handle.clone()
+    }
+    _ => None,
   };
   let theme = theme.clone();
 
   commands.queue(move |world: &mut World| {
-    let ctx = UiCtx::new(&theme, font.as_ref());
-    // 左上角调试 overlay + 右上角组件展示窗：同一主题上下文，一次性生成
-    spawn_debug_view(world, &ctx);
+    // 图标字体挂进 ctx：菜单标题栏按钮与子菜单箭头用 FA 字形
+    let ctx = UiCtx::new(&theme, font.as_ref()).with_icon_font(icon_font.as_ref());
+    // 左上角调试菜单 + 右上角组件展示窗：同一主题上下文，一次性生成
+    world.spawn((Name::new("debug-ui-root"), DebugUiRoot));
+    spawn_debug_menu_ui(world, &ctx);
     spawn_showcase(world, &ctx);
   });
 }

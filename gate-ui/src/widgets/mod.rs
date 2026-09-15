@@ -22,7 +22,9 @@ pub mod slider;
 pub mod splitter;
 pub mod tab_view;
 pub mod table;
+pub mod text_input;
 pub mod toggle_switch;
+pub mod tooltip;
 
 pub use button::{
   ButtonConfig, ButtonHandle, ButtonVariant, InteractionPrev, UiClick, button, button_state_system,
@@ -31,7 +33,10 @@ pub use checkbox::{
   CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system,
 };
 pub use grid::{GridConfig, GridHandle, UiGrid, grid, grid_cell};
-pub use label::{LabelConfig, LabelHandle, LabelStyle, label};
+pub use label::{
+  ELLIPSIS, EllipsisText, LabelConfig, LabelHandle, LabelOverflow, LabelStyle, label,
+  label_ellipsis_system, middle_ellipsis,
+};
 pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
 pub use panel::{PanelConfig, PanelHandle, PanelSurface, panel};
 pub use plot::{
@@ -51,9 +56,19 @@ pub use tab_view::{
   TabButton, TabChanged, TabConfig, TabContent, TabView, TabViewHandle, tab_view, tab_view_system,
 };
 pub use table::{TableCell, TableConfig, TableHandle, UiTable, table};
+pub use text_input::{
+  CARET_CHAR, DRAG_THRESHOLD_PX, NUMBER_DRAG_PX_PER_STEP, TextInputChanged, TextInputConfig,
+  TextInputFocus, TextInputHandle, TextInputKind, TextInputRoot, TextInputState, TextInputText,
+  TextInputValue, text_input, text_input_keyboard_system, text_input_pointer_system,
+  text_input_visual_system,
+};
 pub use toggle_switch::{
   ToggleKnob, ToggleSwitch, ToggleSwitchConfig, ToggleSwitchHandle, ToggleSwitchToggled,
   ToggleTrack, toggle_switch, toggle_switch_state_system,
+};
+pub use tooltip::{
+  TOOLTIP_DELAY, TOOLTIP_MARGIN, TOOLTIP_MAX_W, TOOLTIP_OFFSET, Tooltip, TooltipLayer,
+  TooltipLayerEntity, TooltipText, tooltip_system,
 };
 
 use bevy::log::warn;
@@ -90,11 +105,36 @@ pub fn dim_color(color: Color) -> Color {
 pub struct UiCtx<'a> {
   pub theme: &'a UiTheme,
   pub font: Option<&'a Handle<Font>>,
+  /// 图标字体（FontAwesome Free Solid）；None → 图标回退 [`Self::font`]
+  pub icon_font: Option<&'a Handle<Font>>,
+  /// 文案解析器（key → 当前语言文案）；None → key 原样当文案
+  pub translate: Option<crate::i18n::TranslatorFn>,
 }
 
 impl<'a> UiCtx<'a> {
   pub fn new(theme: &'a UiTheme, font: Option<&'a Handle<Font>>) -> Self {
-    Self { theme, font }
+    Self { theme, font, icon_font: None, translate: None }
+  }
+
+  /// 补上图标字体（菜单容器的标题栏/子菜单箭头用）
+  pub fn with_icon_font(mut self, icon_font: Option<&'a Handle<Font>>) -> Self {
+    self.icon_font = icon_font;
+    self
+  }
+
+  /// 补上文案解析器（取 [`UiTranslator::handle`](crate::i18n::UiTranslator::handle)）；
+  /// 控件文案字段写 key 时经 [`Self::text`] 解析
+  pub fn with_translate(mut self, translate: Option<crate::i18n::TranslatorFn>) -> Self {
+    self.translate = translate;
+    self
+  }
+
+  /// key → 当前语言文案（未注入解析器 → 原样返回，方便 TOML/测试直接写字面量）
+  pub fn text(&self, key: &str) -> String {
+    match &self.translate {
+      Some(f) => f(key),
+      None => key.to_string(),
+    }
   }
 
   /// TextFont.font 来源：显式 ThemeFont → 自定义字体（含 CJK 的 TTF）；否则 →
@@ -104,6 +144,14 @@ impl<'a> UiCtx<'a> {
     match self.font {
       Some(h) => FontSource::from(h),
       None => FontSource::default(),
+    }
+  }
+
+  /// 图标字体的来源（未配置 → 回退正文来源）
+  pub fn icon_source(&self) -> FontSource {
+    match self.icon_font {
+      Some(h) => FontSource::from(h),
+      None => self.font_source(),
     }
   }
 }
@@ -131,6 +179,29 @@ pub(crate) fn label_bundle(ctx: &UiCtx, text: String, size: f32, color: Color) -
     TextColor(color),
     TextLayout::default(),
   )
+}
+
+/// 图标文本 bundle（FontAwesome 字形；字号单独给，不受 LabelStyle 档位约束）
+pub(crate) fn icon_bundle(ctx: &UiCtx, glyph: &str, size: f32, color: Color) -> impl Bundle {
+  (
+    Name::new("ui-icon"),
+    Label,
+    Text::new(glyph.to_string()),
+    TextFont { font: ctx.icon_source(), font_size: bevy::text::FontSize::Px(size), ..default() },
+    TextColor(color),
+    TextLayout::default(),
+  )
+}
+
+/// 图标文本实体（内部复用：标题栏/子菜单箭头）
+pub(crate) fn spawn_icon(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  glyph: &str,
+  size: f32,
+  color: Color,
+) -> Entity {
+  parent.spawn(icon_bundle(ctx, glyph, size, color)).id()
 }
 
 /// 标签文本实体（内部复用：button/checkbox 文本）

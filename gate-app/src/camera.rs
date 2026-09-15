@@ -26,17 +26,14 @@ const ROT_SPEED: f32 = 0.005; // rad/px（右键拖拽旋转）
 pub(crate) const ZOOM_LOG_SPEED: f32 = 0.35; // /行（滚轮乘法缩放，各距离档手感一致）
 
 // ---- 幽灵模式（Minecraft spectator 风格：无碰撞自由飞行）----
-// 速度单位 = voxel/s；1 voxel = 2cm（512 voxel = 10.24m）→ 128 v/s ≈ 2.6 m/s。
-/// 默认飞行速度（voxel/s；低速档基础速度）
+// 速度单位 = voxel/s；1 voxel = 2cm（512 voxel = 10.24m）→ 128 v/s ≈ 2.56 m/s。
+/// 默认飞行速度（voxel/s；低速档基础速度）。运行期由 DebugMenu 的
+/// 「玩家/相机/自由模式速度」覆盖（TOML 为初值来源），这里只是资源缺省值。
 pub(crate) const FLY_SPEED_DEFAULT: f32 = 128.0;
 /// 高速档倍率：高速档实际速度 = 基础速度 × 此值
 pub(crate) const FLY_SPEED_FAST_MUL: f32 = 2.0;
-/// 飞行速度滑杆的范围 / 步进（Camera tab 与 clamp 共用；16 v/s ≈ 0.32 m/s，2048 v/s ≈ 41 m/s）
-pub(crate) const FLY_SPEED_MIN: f32 = 16.0;
-pub(crate) const FLY_SPEED_MAX: f32 = 2048.0;
-pub(crate) const FLY_SPEED_STEP: f32 = 16.0;
 
-/// 相机模式（main world Resource）。切换的唯一入口是 DebugView 的 Camera tab 互斥按钮组。
+/// 相机模式（main world Resource）。切换的唯一入口是 DebugMenu 的「玩家/相机/相机模式」切换组。
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CameraMode {
   /// 轨道相机：右键旋转 / 中键平移 / 滚轮缩放
@@ -99,9 +96,10 @@ pub(crate) fn camera_look_input(
   mouse: Res<ButtonInput<MouseButton>>,
   motion: Res<AccumulatedMouseMotion>,
   captured: Res<gate_ui::UiPointerCaptured>,
+  intercepted: Res<gate_ui::MouseIntercepted>,
   mut orbit: ResMut<OrbitCamera>,
 ) {
-  if captured.0 || !mouse.pressed(MouseButton::Right) {
+  if captured.0 || intercepted.0 || !mouse.pressed(MouseButton::Right) {
     return;
   }
   let delta = motion.delta;
@@ -121,6 +119,7 @@ pub(crate) fn orbit_camera_input(
   motion: Res<AccumulatedMouseMotion>,
   scroll: Res<AccumulatedMouseScroll>,
   captured: Res<gate_ui::UiPointerCaptured>,
+  intercepted: Res<gate_ui::MouseIntercepted>,
   windows: Query<&Window>,
   mode: Res<CameraMode>,
   mut orbit: ResMut<OrbitCamera>,
@@ -128,8 +127,8 @@ pub(crate) fn orbit_camera_input(
   if *mode != CameraMode::Orbit {
     return;
   }
-  // UI 指针捕获优先：hover/按下控件时吞掉拖拽/滚轮
-  if !captured.0 {
+  // UI 指针捕获/鼠标拦截优先：hover/按下控件时吞掉拖拽/滚轮
+  if !captured.0 && !intercepted.0 {
     let delta = motion.delta;
     if mouse.pressed(MouseButton::Middle) {
       // 正交基：forward = eye→target；right = forward × Y；up = right × forward
@@ -162,16 +161,18 @@ pub(crate) fn orbit_camera_input(
 /// 幽灵模式飞行输入（仅 Fly 模式，无碰撞）：WASD 沿视线平移，Space 上升 / Shift 下降（世界 +Y）。
 /// 前进/右向取自当前 yaw/pitch；斜向移动归一化，速度与单键一致。
 ///
-/// 不按 `UiPointerCaptured` 闸门：它只对鼠标有意义，用它挡键盘会导致鼠标停在 DebugView
-/// 面板上时飞不动。
+/// 不按 `UiPointerCaptured` 闸门：它只对鼠标有意义，用它挡键盘会导致鼠标停在 DebugMenu
+/// 面板上时飞不动。但**文本输入框编辑态**（[`gate_ui::TextInputFocus`]）必须挡键盘，
+/// 否则打字会同时驱动相机。
 pub(crate) fn fly_camera_input(
   keys: Res<ButtonInput<KeyCode>>,
   time: Res<Time>,
+  focus: Res<gate_ui::TextInputFocus>,
   mode: Res<CameraMode>,
   orbit: Res<OrbitCamera>,
   mut fly: ResMut<FlyCamera>,
 ) {
-  if *mode != CameraMode::Fly {
+  if *mode != CameraMode::Fly || focus.0.is_some() {
     return;
   }
   // Control 切换低速/高速档（just_pressed = 按一下切一次，不是按住）
@@ -306,6 +307,7 @@ pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3
 pub(crate) fn left_click_pick_recenter(
   mouse: Res<ButtonInput<MouseButton>>,
   captured: Res<gate_ui::UiPointerCaptured>,
+  intercepted: Res<gate_ui::MouseIntercepted>,
   windows: Query<&Window>,
   cfg: Res<DdaCameraConfig>,
   mode: Res<CameraMode>,
@@ -318,7 +320,7 @@ pub(crate) fn left_click_pick_recenter(
   if !mouse.just_pressed(MouseButton::Left) {
     return;
   }
-  if captured.0 {
+  if captured.0 || intercepted.0 {
     return; // UI 控件点击 → 吞掉
   }
   let Some(scene) = scene else {

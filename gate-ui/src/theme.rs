@@ -220,6 +220,8 @@ pub struct UiTheme {
   pub auto_fit_ui_scale: bool,
   /// 字体资产路径；None → bevy default_font
   pub font_path: Option<String>,
+  /// 图标字体（FontAwesome Free Solid）资产路径；None → 图标回退正文字体
+  pub icon_font_path: Option<String>,
 }
 
 impl Default for UiTheme {
@@ -230,6 +232,7 @@ impl Default for UiTheme {
       ui_scale: 1.0,
       auto_fit_ui_scale: false,
       font_path: None,
+      icon_font_path: None,
     }
   }
 }
@@ -475,29 +478,57 @@ impl Plugin for GateUiPlugin {
       .init_resource::<UiScale>()
       .init_resource::<UiThemeState>()
       .init_resource::<ThemeFont>()
+      .init_resource::<crate::icon::IconFont>()
       .init_resource::<crate::capture::UiPointerCaptured>()
+      .init_resource::<crate::capture::MouseIntercepted>()
+      .init_resource::<crate::widgets::TextInputFocus>()
+      .init_resource::<crate::widgets::TooltipLayerEntity>()
+      .init_resource::<crate::i18n::UiTranslator>()
       .init_resource::<crate::world_anchor::AnchorCamera>()
       .register_asset_loader(RonThemeLoader)
       .add_systems(PreStartup, ui_theme_request)
       .add_systems(
         Update,
         (
-          ui_theme_resolve,
-          ui_theme_font_load,
-          ui_theme_font_install_default.after(ui_theme_font_load),
-          ui_scale_autofit,
-          crate::widgets::button_state_system,
-          crate::widgets::checkbox_state_system,
-          crate::widgets::toggle_switch_state_system,
-          crate::widgets::slider_drag_system,
-          crate::widgets::slider_visual_system,
-          crate::widgets::ring_list_sync_system,
-          crate::widgets::plot_redraw_system,
-          crate::widgets::scroll_view_system,
-          crate::widgets::tab_view_system,
-          crate::capture::ui_pointer_capture_system,
-          crate::world_anchor::world_anchor_apply_text.after(ui_theme_font_install_default),
-          crate::world_anchor::world_anchor_system,
+          // 主题/字体/缩放接线
+          (
+            ui_theme_resolve,
+            ui_theme_font_load,
+            ui_theme_font_install_default.after(ui_theme_font_load),
+            crate::icon::icon_font_load.after(ui_theme_resolve),
+            crate::icon::icon_font_report.after(crate::icon::icon_font_load),
+            ui_scale_autofit,
+          ),
+          // 各 widget 状态机
+          (
+            crate::widgets::button_state_system,
+            crate::widgets::checkbox_state_system,
+            crate::widgets::toggle_switch_state_system,
+            crate::widgets::slider_drag_system,
+            crate::widgets::slider_visual_system,
+            crate::widgets::ring_list_sync_system,
+            crate::widgets::plot_redraw_system,
+            crate::widgets::scroll_view_system,
+            crate::widgets::tab_view_system,
+          ),
+          // 文本相关（省略号/输入框）+ 悬浮提示
+          (
+            crate::widgets::label_ellipsis_system,
+            crate::widgets::text_input_pointer_system,
+            crate::widgets::text_input_keyboard_system,
+            crate::widgets::text_input_visual_system,
+            crate::widgets::tooltip_system,
+          ),
+          // 语言切换后重解析 keyed 文本 + 输入门控 + 菜单容器/分页动画
+          (
+            crate::i18n::i18n_refresh_system,
+            crate::capture::ui_pointer_capture_system,
+            crate::menu::menu_system,
+          ),
+          (
+            crate::world_anchor::world_anchor_apply_text.after(ui_theme_font_install_default),
+            crate::world_anchor::world_anchor_system,
+          ),
         ),
       );
   }

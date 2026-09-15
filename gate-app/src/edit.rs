@@ -229,6 +229,7 @@ pub(crate) fn voxel_edit_input(
   mouse: Res<ButtonInput<MouseButton>>,
   motion: Res<AccumulatedMouseMotion>,
   captured: Res<gate_ui::UiPointerCaptured>,
+  intercepted: Res<gate_ui::MouseIntercepted>,
   windows: Query<&Window>,
   cfg: Res<DdaCameraConfig>,
   mode: Res<CameraMode>,
@@ -243,7 +244,7 @@ pub(crate) fn voxel_edit_input(
   if mouse.pressed(MouseButton::Right) {
     *right_drag_px += motion.delta.length();
   }
-  if *mode != CameraMode::Fly || captured.0 {
+  if *mode != CameraMode::Fly || captured.0 || intercepted.0 {
     return;
   }
   let place = mouse.just_pressed(MouseButton::Left);

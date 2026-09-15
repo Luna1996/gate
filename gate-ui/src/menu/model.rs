@@ -1,0 +1,506 @@
+//! 菜单模型：层级 + 控件状态的**可序列化**表示（TOML 持久化）。
+//!
+//! 单靠一份 [`MenuFile`] 就能完整重建菜单 UI（层级、文案、值、选中态、窗口位置/收起/停留路径），
+//! 唯一的例外是控件回调——UI 重建完成后由调用方按节点 id 路径挂上（见 `MenuActionEvent`）。
+//!
+//! **文案字段存 i18n key**（`label` / `options` / `tooltip` / `text` / [`InputField::label`]）：
+//! 渲染时经 `UiTranslator` 解析为当前语言，语言切换后由 `i18n_refresh_system` 重解析。
+//! 未注入解析器时 key 原样显示，所以直接写字面量（`label = "视频"`）同样成立。
+//! `id` 是与语言无关的回调路径段（标题栏就显示它，如 `/render/ddgi`），务必显式给出。
+
+use serde::{Deserialize, Serialize, Serializer};
+
+use super::consts::DEFAULT_WINDOW_POS;
+use crate::widgets::TextInputKind;
+
+/// 写盘用的浮点包装：f32 → 6 位小数的 f64（消除 f32→f64 的二进制尾巴）
+struct Rounded(f32);
+
+impl Serialize for Rounded {
+  fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(((self.0 as f64) * 1e6).round() / 1e6)
+  }
+}
+
+/// f32 字段的序列化助手（配合 `#[serde(serialize_with = ...)]`）
+fn ser_f32<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+  Rounded(*v).serialize(s)
+}
+
+/// Option<f32> 字段的序列化助手
+fn ser_opt_f32<S: Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
+  match v {
+    Some(x) => s.serialize_some(&Rounded(*x)),
+    None => s.serialize_none(),
+  }
+}
+
+/// 菜单持久化文件（TOML 顶层结构）
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct MenuFile {
+  /// 窗口状态（位置/收起/停留路径）
+  #[serde(default)]
+  pub window: WindowState,
+  /// 根节点的子项
+  #[serde(default)]
+  pub items: Vec<MenuNode>,
+}
+
+/// 窗口状态
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WindowState {
+  #[serde(serialize_with = "ser_f32")]
+  pub x: f32,
+  #[serde(serialize_with = "ser_f32")]
+  pub y: f32,
+  /// true = 只显示标题栏
+  #[serde(default)]
+  pub collapsed: bool,
+  /// 停留节点路径（节点 id 序列；空 = 根）
+  #[serde(default)]
+  pub path: Vec<String>,
+}
+
+impl Default for WindowState {
+  fn default() -> Self {
+    Self { x: DEFAULT_WINDOW_POS.x, y: DEFAULT_WINDOW_POS.y, collapsed: false, path: Vec::new() }
+  }
+}
+
+/// 输入框字段（`min` 有值 = 数字模式，否则纯文本）
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct InputField {
+  /// 字段名前缀的 i18n key（空 = 无前缀）
+  #[serde(default)]
+  pub label: String,
+  pub text: String,
+  /// 数字模式下限（有值即数字模式）
+  #[serde(default, serialize_with = "ser_opt_f32")]
+  pub min: Option<f32>,
+  #[serde(default, serialize_with = "ser_opt_f32")]
+  pub max: Option<f32>,
+  #[serde(default, serialize_with = "ser_opt_f32")]
+  pub step: Option<f32>,
+  #[serde(default)]
+  pub decimals: u32,
+}
+
+impl InputField {
+  /// 纯文本字段
+  pub fn text(label: impl Into<String>, text: impl Into<String>) -> Self {
+    Self { label: label.into(), text: text.into(), min: None, max: None, step: None, decimals: 0 }
+  }
+
+  /// 数字字段（支持点击拖拽调值）
+  pub fn number(
+    label: impl Into<String>,
+    text: impl Into<String>,
+    min: f32,
+    max: f32,
+    step: f32,
+    decimals: u32,
+  ) -> Self {
+    Self {
+      label: label.into(),
+      text: text.into(),
+      min: Some(min),
+      max: Some(max),
+      step: Some(step),
+      decimals,
+    }
+  }
+
+  /// 落到 widget 层的输入模式
+  pub fn kind(&self) -> TextInputKind {
+    match self.min {
+      Some(min) => TextInputKind::Number {
+        min,
+        max: self.max.unwrap_or(min),
+        step: self.step.unwrap_or(0.0),
+        decimals: self.decimals as usize,
+      },
+      None => TextInputKind::Text,
+    }
+  }
+}
+
+/// 菜单节点（层级 + 控件状态）
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MenuNode {
+  /// 子菜单：点击进入下级
+  SubMenu {
+    #[serde(default)]
+    id: String,
+    label: String,
+    #[serde(default)]
+    children: Vec<MenuNode>,
+  },
+  /// 按钮组（等宽并排；点击只上报，不改模型状态）
+  Buttons {
+    #[serde(default)]
+    id: String,
+    label: String,
+    items: Vec<String>,
+  },
+  /// 滑动条（左名称 | 中滑杆 | 右数值）
+  Slider {
+    #[serde(default)]
+    id: String,
+    label: String,
+    #[serde(serialize_with = "ser_f32")]
+    value: f32,
+    #[serde(serialize_with = "ser_f32")]
+    min: f32,
+    #[serde(serialize_with = "ser_f32")]
+    max: f32,
+    /// 步长；0 = 连续
+    #[serde(default, serialize_with = "ser_f32")]
+    step: f32,
+    /// 数值显示小数位
+    #[serde(default = "default_decimals")]
+    decimals: u32,
+    #[serde(default)]
+    tooltip: Option<String>,
+  },
+  /// 切换组（无空隙并排，选中态持久化）
+  SwitchGroup {
+    #[serde(default)]
+    id: String,
+    label: String,
+    options: Vec<String>,
+    selected: usize,
+  },
+  /// 开关项（左文字 | 右 toggle）
+  Toggle {
+    #[serde(default)]
+    id: String,
+    label: String,
+    checked: bool,
+    #[serde(default)]
+    tooltip: Option<String>,
+  },
+  /// 输入框（一个或多个等宽输入框）
+  Input {
+    #[serde(default)]
+    id: String,
+    label: String,
+    fields: Vec<InputField>,
+  },
+  /// 颜色选择器（左名称 | 中 HEX 输入 | 右色块）
+  Color {
+    #[serde(default)]
+    id: String,
+    label: String,
+    hex: String,
+  },
+  /// 纯文本（内容可由调用方运行时改写）
+  Text {
+    #[serde(default)]
+    id: String,
+    text: String,
+  },
+}
+
+fn default_decimals() -> u32 {
+  2
+}
+
+/// 取显式 id，缺省回退 label（回调路径用 id，显示用 label）
+fn pick<'a>(id: &'a str, label: &'a str) -> &'a str {
+  if id.is_empty() { label } else { id }
+}
+
+impl MenuNode {
+  /// 回调标识（路径段）
+  pub fn id(&self) -> &str {
+    match self {
+      Self::SubMenu { id, label, .. }
+      | Self::Buttons { id, label, .. }
+      | Self::Slider { id, label, .. }
+      | Self::SwitchGroup { id, label, .. }
+      | Self::Toggle { id, label, .. }
+      | Self::Input { id, label, .. }
+      | Self::Color { id, label, .. } => pick(id, label),
+      Self::Text { id, text } => pick(id, text),
+    }
+  }
+
+  /// 行内显示文案的 i18n key（子菜单/按钮组/滑杆/切换组/开关项/输入框/颜色选择器的左侧文字）
+  pub fn label(&self) -> &str {
+    match self {
+      Self::SubMenu { label, .. }
+      | Self::Buttons { label, .. }
+      | Self::Slider { label, .. }
+      | Self::SwitchGroup { label, .. }
+      | Self::Toggle { label, .. }
+      | Self::Input { label, .. }
+      | Self::Color { label, .. } => label,
+      Self::Text { text, .. } => text,
+    }
+  }
+
+  /// 子节点（仅子菜单有）
+  pub fn children(&self) -> &[MenuNode] {
+    match self {
+      Self::SubMenu { children, .. } => children,
+      _ => &[],
+    }
+  }
+
+  /// 子节点（可变）
+  pub fn children_mut(&mut self) -> &mut Vec<MenuNode> {
+    match self {
+      Self::SubMenu { children, .. } => children,
+      _ => unreachable!("children_mut 只对 SubMenu 有意义"),
+    }
+  }
+
+  /// 是否可进入下级
+  pub fn is_sub_menu(&self) -> bool {
+    matches!(self, Self::SubMenu { .. })
+  }
+
+  /// 悬浮提示文案（没有则 None）
+  pub fn tooltip(&self) -> Option<&str> {
+    match self {
+      Self::Slider { tooltip, .. } | Self::Toggle { tooltip, .. } => tooltip.as_deref(),
+      _ => None,
+    }
+  }
+}
+
+impl MenuFile {
+  /// 按 id 路径取节点（空路径 = None，根不是节点）
+  pub fn node(&self, path: &[String]) -> Option<&MenuNode> {
+    let (first, rest) = path.split_first()?;
+    let mut cur = self.items.iter().find(|n| n.id() == first)?;
+    for seg in rest {
+      cur = cur.children().iter().find(|n| n.id() == seg)?;
+    }
+    Some(cur)
+  }
+
+  /// 按 id 路径取节点（可变）
+  pub fn node_mut(&mut self, path: &[String]) -> Option<&mut MenuNode> {
+    let (first, rest) = path.split_first()?;
+    let mut cur = self.items.iter_mut().find(|n| n.id() == first)?;
+    for seg in rest {
+      cur = cur.children_mut().iter_mut().find(|n| n.id() == seg)?;
+    }
+    Some(cur)
+  }
+
+  /// 某路径下的子项列表（空路径 = 根）
+  pub fn children_of(&self, path: &[String]) -> &[MenuNode] {
+    if path.is_empty() { &self.items } else { self.node(path).map(|n| n.children()).unwrap_or(&[]) }
+  }
+
+  /// 序列化为 TOML（持久化写盘用）。f32 字段经 [`Rounded`] 输出 6 位小数，
+  /// 否则 f32 → f64 会写出 `0.10000000149011612` 这类二进制噪声值。
+  pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+    toml::to_string_pretty(self)
+  }
+
+  /// 从 TOML 反序列化
+  pub fn from_toml(src: &str) -> Result<Self, toml::de::Error> {
+    toml::from_str(src)
+  }
+
+  /// 校验/纠偏：选中下标越界钳位（TOML 被手改后不至于 panic）
+  pub fn sanitize(&mut self) {
+    for node in &mut self.items {
+      sanitize_node(node);
+    }
+  }
+}
+
+fn sanitize_node(node: &mut MenuNode) {
+  match node {
+    MenuNode::SwitchGroup { options, selected, .. } => {
+      *selected = (*selected).min(options.len().saturating_sub(1));
+    }
+    MenuNode::Slider { value, min, max, step, .. } => {
+      if *max < *min {
+        std::mem::swap(min, max);
+      }
+      let v = value.clamp(*min, *max);
+      *value = if *step > 0.0 { *min + ((v - *min) / *step).round() * *step } else { v };
+      *value = value.clamp(*min, *max);
+    }
+    MenuNode::SubMenu { children, .. } => {
+      for c in children.iter_mut() {
+        sanitize_node(c);
+      }
+    }
+    _ => {}
+  }
+}
+
+// ---------- 节点构造助手（写默认菜单树用，省去手填 id/字段名） ----------
+
+/// 子菜单节点
+pub fn sub_menu(id: &str, label: &str, children: Vec<MenuNode>) -> MenuNode {
+  MenuNode::SubMenu { id: id.into(), label: label.into(), children }
+}
+
+/// 按钮组节点
+pub fn buttons(id: &str, label: &str, items: &[&str]) -> MenuNode {
+  MenuNode::Buttons {
+    id: id.into(),
+    label: label.into(),
+    items: items.iter().map(|s| (*s).to_string()).collect(),
+  }
+}
+
+/// 滑动条节点
+pub fn slider(
+  id: &str,
+  label: &str,
+  value: f32,
+  min: f32,
+  max: f32,
+  step: f32,
+  decimals: u32,
+  tooltip: Option<&str>,
+) -> MenuNode {
+  MenuNode::Slider {
+    id: id.into(),
+    label: label.into(),
+    value,
+    min,
+    max,
+    step,
+    decimals,
+    tooltip: tooltip.map(|s| s.to_string()),
+  }
+}
+
+/// 切换组节点
+pub fn switch_group(id: &str, label: &str, options: &[&str], selected: usize) -> MenuNode {
+  MenuNode::SwitchGroup {
+    id: id.into(),
+    label: label.into(),
+    options: options.iter().map(|s| (*s).to_string()).collect(),
+    selected,
+  }
+}
+
+/// 开关项节点
+pub fn toggle(id: &str, label: &str, checked: bool) -> MenuNode {
+  MenuNode::Toggle { id: id.into(), label: label.into(), checked, tooltip: None }
+}
+
+/// 带提示的开关项节点
+pub fn toggle_tip(id: &str, label: &str, checked: bool, tooltip: &str) -> MenuNode {
+  MenuNode::Toggle {
+    id: id.into(),
+    label: label.into(),
+    checked,
+    tooltip: Some(tooltip.to_string()),
+  }
+}
+
+/// 输入框节点
+pub fn input(id: &str, label: &str, fields: Vec<InputField>) -> MenuNode {
+  MenuNode::Input { id: id.into(), label: label.into(), fields }
+}
+
+/// 颜色选择器节点
+pub fn color(id: &str, label: &str, hex: &str) -> MenuNode {
+  MenuNode::Color { id: id.into(), label: label.into(), hex: hex.into() }
+}
+
+/// 纯文本节点
+pub fn text(id: &str, content: &str) -> MenuNode {
+  MenuNode::Text { id: id.into(), text: content.into() }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn sample() -> MenuFile {
+    MenuFile {
+      window: WindowState { x: 12.0, y: 34.0, collapsed: true, path: vec!["video".into()] },
+      items: vec![
+        sub_menu(
+          "video",
+          "视频",
+          vec![
+            toggle("vsync", "垂直同步", true),
+            slider("scale", "缩放", 1.5, 0.5, 3.0, 0.1, 2, Some("提示")),
+          ],
+        ),
+        switch_group("mode", "模式", &["轨道", "自由"], 1),
+        input("brush", "笔触", vec![InputField::number("大小", "3", 1.0, 16.0, 1.0, 0)]),
+        color("tint", "颜色", "FF8000"),
+        text("cam", "(0, 0, 0)"),
+        buttons("acts", "操作", &["重置", "导出"]),
+      ],
+    }
+  }
+
+  #[test]
+  fn toml_roundtrip_keeps_everything() {
+    let m = sample();
+    let s = m.to_toml().expect("serialize");
+    let back = MenuFile::from_toml(&s).expect("deserialize");
+    assert_eq!(m, back, "TOML 往返必须无损\n{s}");
+  }
+
+  #[test]
+  fn toml_text_is_human_readable() {
+    let s = sample().to_toml().unwrap();
+    assert!(s.contains("kind = \"sub_menu\""), "{s}");
+    assert!(s.contains("[[items]]"), "{s}");
+    assert!(s.contains("[[items.children]]"), "{s}");
+    assert!(s.contains("kind = \"switch_group\""), "{s}");
+  }
+
+  #[test]
+  fn path_lookup_walks_children() {
+    let m = sample();
+    let p = |s: &str| -> Vec<String> {
+      s.split('/').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
+    };
+    assert!(m.node(&p("video")).unwrap().is_sub_menu());
+    assert_eq!(m.node(&p("video/vsync")).unwrap().label(), "垂直同步");
+    assert!(m.node(&p("video/nope")).is_none());
+    assert_eq!(m.children_of(&p("")).len(), 6);
+    assert_eq!(m.children_of(&p("video")).len(), 2);
+  }
+
+  #[test]
+  fn sanitize_clamps_out_of_range() {
+    let mut m = MenuFile {
+      window: WindowState::default(),
+      items: vec![
+        switch_group("g", "组", &["a", "b"], 9),
+        slider("s", "滑", 99.0, 0.0, 10.0, 1.0, 0, None),
+      ],
+    };
+    m.sanitize();
+    assert_eq!(m.node(&["g".into()]).unwrap().id(), "g");
+    match &m.items[0] {
+      MenuNode::SwitchGroup { selected, .. } => assert_eq!(*selected, 1),
+      other => panic!("{other:?}"),
+    }
+    match &m.items[1] {
+      MenuNode::Slider { value, .. } => assert_eq!(*value, 10.0),
+      other => panic!("{other:?}"),
+    }
+  }
+
+  #[test]
+  fn id_falls_back_to_label() {
+    let n = MenuNode::Toggle {
+      id: String::new(),
+      label: "垂直同步".into(),
+      checked: false,
+      tooltip: None,
+    };
+    assert_eq!(n.id(), "垂直同步");
+    assert_eq!(n.label(), "垂直同步");
+  }
+}

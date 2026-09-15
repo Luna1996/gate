@@ -1,0 +1,263 @@
+[window]
+x = 8.0
+y = 8.0
+collapsed = false
+path = []
+
+[[items]]
+kind = "sub_menu"
+id = "video"
+label = "menu.video"
+
+[[items.children]]
+kind = "toggle"
+id = "fullscreen"
+label = "menu.video.fullscreen"
+checked = false
+
+[[items.children]]
+kind = "toggle"
+id = "vsync"
+label = "menu.video.vsync"
+checked = true
+
+[[items.children]]
+kind = "toggle"
+id = "aa"
+label = "menu.video.aa"
+checked = false
+
+[[items.children]]
+kind = "toggle"
+id = "fps"
+label = "menu.video.fps"
+checked = false
+
+[[items]]
+kind = "sub_menu"
+id = "render"
+label = "menu.render"
+
+[[items.children]]
+kind = "sub_menu"
+id = "ddgi"
+label = "menu.render.ddgi"
+
+[[items.children.children]]
+kind = "toggle"
+id = "enabled"
+label = "menu.render.ddgi.enabled"
+checked = true
+
+[[items.children.children]]
+kind = "switch_group"
+id = "mode"
+label = "menu.render.ddgi.mode"
+options = [
+    "menu.render.ddgi.mode.normal",
+    "menu.render.ddgi.mode.gi",
+    "menu.render.ddgi.mode.wsum",
+    "menu.render.ddgi.mode.domain",
+    "menu.render.ddgi.mode.probe",
+]
+selected = 0
+
+[[items.children.children]]
+kind = "switch_group"
+id = "probe"
+label = "menu.render.ddgi.probe"
+options = [
+    "menu.render.ddgi.probe.none",
+    "menu.render.ddgi.probe.lod0",
+    "menu.render.ddgi.probe.lod1",
+    "menu.render.ddgi.probe.lod2",
+    "menu.render.ddgi.probe.lod3",
+    "menu.render.ddgi.probe.all",
+]
+selected = 0
+
+[[items.children]]
+kind = "sub_menu"
+id = "exposure"
+label = "menu.render.exposure"
+
+[[items.children.children]]
+kind = "toggle"
+id = "enabled"
+label = "menu.render.exposure.enabled"
+checked = true
+
+[[items.children.children]]
+kind = "slider"
+id = "ev_up"
+label = "menu.render.exposure.ev_up"
+value = 3.0
+min = 0.0
+max = 12.0
+step = 0.25
+decimals = 2
+tooltip = "menu.render.exposure.ev_up.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "ev_dn"
+label = "menu.render.exposure.ev_dn"
+value = -3.0
+min = -12.0
+max = 0.0
+step = 0.25
+decimals = 2
+tooltip = "menu.render.exposure.ev_dn.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "tau_up"
+label = "menu.render.exposure.tau_up"
+value = 2.0
+min = 0.1
+max = 8.0
+step = 0.1
+decimals = 2
+tooltip = "menu.render.exposure.tau_up.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "tau_dn"
+label = "menu.render.exposure.tau_dn"
+value = 1.0
+min = 0.1
+max = 8.0
+step = 0.1
+decimals = 2
+tooltip = "menu.render.exposure.tau_dn.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "key"
+label = "menu.render.exposure.key"
+value = 0.18
+min = 0.02
+max = 0.5
+step = 0.01
+decimals = 3
+tooltip = "menu.render.exposure.key.tip"
+
+[[items]]
+kind = "sub_menu"
+id = "player"
+label = "menu.player"
+
+[[items.children]]
+kind = "sub_menu"
+id = "camera"
+label = "menu.player.camera"
+
+[[items.children.children]]
+kind = "text"
+id = "pos"
+text = "menu.player.camera.pos"
+
+[[items.children.children]]
+kind = "text"
+id = "dir"
+text = "menu.player.camera.dir"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "mode"
+label = "menu.player.camera.mode"
+options = [
+    "menu.player.camera.mode.orbit",
+    "menu.player.camera.mode.fly",
+]
+selected = 1
+
+[[items.children.children]]
+kind = "slider"
+id = "speed"
+label = "menu.player.camera.speed"
+value = 2.6
+min = 0.32
+max = 40.0
+step = 0.1
+decimals = 1
+
+[[items]]
+kind = "sub_menu"
+id = "game"
+label = "menu.game"
+
+[[items.children]]
+kind = "sub_menu"
+id = "edit"
+label = "menu.game.edit"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "shape"
+label = "menu.game.edit.shape"
+options = [
+    "menu.game.edit.shape.sphere",
+    "menu.game.edit.shape.cube",
+]
+selected = 0
+
+[[items.children.children]]
+kind = "input"
+id = "size"
+label = "menu.game.edit.size"
+
+[[items.children.children.fields]]
+label = ""
+text = "3"
+min = 1.0
+max = 16.0
+step = 1.0
+decimals = 0
+
+[[items.children.children]]
+kind = "color"
+id = "color"
+label = "menu.game.edit.color"
+hex = "96989E"
+
+[[items.children.children]]
+kind = "slider"
+id = "emissive"
+label = "menu.game.edit.emissive"
+value = 0.0
+min = 0.0
+max = 255.0
+step = 1.0
+decimals = 0
+
+[[items.children.children]]
+kind = "slider"
+id = "alpha"
+label = "menu.game.edit.alpha"
+value = 100.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+
+[[items.children.children]]
+kind = "slider"
+id = "smooth"
+label = "menu.game.edit.smooth"
+value = 50.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+
+[[items]]
+kind = "sub_menu"
+id = "ui"
+label = "menu.ui"
+
+[[items.children]]
+kind = "toggle"
+id = "showcase"
+label = "menu.ui.showcase"
+checked = false

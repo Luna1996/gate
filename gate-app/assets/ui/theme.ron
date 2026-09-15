@@ -45,4 +45,6 @@
   ui_scale: 1.0,
   auto_fit_ui_scale: false,
   font_path: Some("fonts/MapleMono-NF-CN-Regular.ttf"),
+  // FontAwesome Free Solid（FA 5.15.4），码点常量来自 font-awesome crate
+  icon_font_path: Some("fonts/fa-solid-900.ttf"),
 )

@@ -1,0 +1,883 @@
+//! DebugMenu：gate-app 的调试菜单（gate-ui 通用 menu 模块的第一个使用者）。
+//!
+//! 两层分工：gate-ui 提供容器/通用组件/模型与交互驱动；本文件提供
+//! 1. 默认菜单树 [`default_menu`]（同时是 `assets/ui/debug_menu.toml` 的内容，测试保证一致）；
+//! 2. 启动时读 TOML 作为**全部调试常量的初值来源**，退出时把当前状态写回；
+//! 3. 统一回调 [`MenuActionEvent`] → 各调试资源的观察者；
+//! 4. 纯文本行（相机位置/角度）与右上角 FPS 覆盖层的刷新。
+//!
+//! 未实现功能的项（全屏、抗锯齿、材质自发光/透明度/光滑度、颜色覆盖）只预留 UI：
+//! 收到动作只记日志，不写任何资源。
+
+use std::collections::VecDeque;
+
+use bevy::prelude::*;
+use bevy::window::{PresentMode, PrimaryWindow, Window};
+use rust_i18n::t;
+
+use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
+use gate_ui::{
+  DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
+  WindowState,
+  menu::{color, input, slider, sub_menu, switch_group, text, toggle},
+  spawn_debug_menu,
+};
+
+use crate::camera::{CameraMode, FlyCamera};
+use crate::edit::{BrushShape, EDIT_SIZE_MAX, EDIT_SIZE_MIN, EditSettings};
+use crate::showcase::ShowcaseRoot;
+
+/// 菜单 TOML 相对 assets 目录的路径（初值来源 + 退出时写回）
+pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
+
+/// 1 m = 50 voxel（1 voxel = 2cm）：菜单里速度用 m/s，资源里用 voxel/s
+pub const VOXEL_PER_METER: f32 = 50.0;
+
+/// 相机信息纯文本行的刷新间隔（秒）
+pub const CAM_INFO_REFRESH_SECS: f32 = 0.25;
+
+/// FPS 统计窗口（秒）：当前 / 平均 / 最低 / 最高都在这个窗口内算
+pub const FPS_WINDOW_SECS: f32 = 1.0;
+
+/// DDGI 诊断模式选项的 i18n key（下标 = `DdgiDebugSettings.mode`，顺序与 WESL 一致）
+pub const DDGI_MODE_KEYS: [&str; 5] = [
+  "menu.render.ddgi.mode.normal",
+  "menu.render.ddgi.mode.gi",
+  "menu.render.ddgi.mode.wsum",
+  "menu.render.ddgi.mode.domain",
+  "menu.render.ddgi.mode.probe",
+];
+
+/// 探针绘制选项的 i18n key：无 / LOD0..3 / 全（下标 0 = 不绘制）
+pub const PROBE_KEYS: [&str; 6] = [
+  "menu.render.ddgi.probe.none",
+  "menu.render.ddgi.probe.lod0",
+  "menu.render.ddgi.probe.lod1",
+  "menu.render.ddgi.probe.lod2",
+  "menu.render.ddgi.probe.lod3",
+  "menu.render.ddgi.probe.all",
+];
+/// 「全」对应的 `probe_viz_lod`（WESL 里 4 = All）
+const PROBE_VIZ_LOD_ALL: f32 = 4.0;
+
+// ===================== 默认菜单树（= assets/ui/debug_menu.toml） =====================
+
+/// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（见单测）。
+///
+/// 文案字段一律写 **i18n key**（本表 `menu.*`），运行时经 gate-ui 的 `UiTranslator` 解析；
+/// `id` 是与语言无关的回调路径段（标题栏显示它）。
+pub fn default_menu() -> MenuFile {
+  MenuFile {
+    window: WindowState::default(),
+    items: vec![
+      sub_menu(
+        "video",
+        "menu.video",
+        vec![
+          toggle("fullscreen", "menu.video.fullscreen", false),
+          toggle("vsync", "menu.video.vsync", true),
+          toggle("aa", "menu.video.aa", false),
+          toggle("fps", "menu.video.fps", false),
+        ],
+      ),
+      sub_menu(
+        "render",
+        "menu.render",
+        vec![
+          sub_menu(
+            "ddgi",
+            "menu.render.ddgi",
+            vec![
+              toggle("enabled", "menu.render.ddgi.enabled", true),
+              switch_group("mode", "menu.render.ddgi.mode", &DDGI_MODE_KEYS, 0),
+              switch_group("probe", "menu.render.ddgi.probe", &PROBE_KEYS, 0),
+            ],
+          ),
+          sub_menu(
+            "exposure",
+            "menu.render.exposure",
+            vec![
+              toggle("enabled", "menu.render.exposure.enabled", true),
+              slider(
+                "ev_up",
+                "menu.render.exposure.ev_up",
+                3.0,
+                0.0,
+                12.0,
+                0.25,
+                2,
+                Some("menu.render.exposure.ev_up.tip"),
+              ),
+              slider(
+                "ev_dn",
+                "menu.render.exposure.ev_dn",
+                -3.0,
+                -12.0,
+                0.0,
+                0.25,
+                2,
+                Some("menu.render.exposure.ev_dn.tip"),
+              ),
+              slider(
+                "tau_up",
+                "menu.render.exposure.tau_up",
+                2.0,
+                0.1,
+                8.0,
+                0.1,
+                2,
+                Some("menu.render.exposure.tau_up.tip"),
+              ),
+              slider(
+                "tau_dn",
+                "menu.render.exposure.tau_dn",
+                1.0,
+                0.1,
+                8.0,
+                0.1,
+                2,
+                Some("menu.render.exposure.tau_dn.tip"),
+              ),
+              slider(
+                "key",
+                "menu.render.exposure.key",
+                0.18,
+                0.02,
+                0.5,
+                0.01,
+                3,
+                Some("menu.render.exposure.key.tip"),
+              ),
+            ],
+          ),
+        ],
+      ),
+      sub_menu(
+        "player",
+        "menu.player",
+        vec![sub_menu(
+          "camera",
+          "menu.player.camera",
+          vec![
+            text("pos", "menu.player.camera.pos"),
+            text("dir", "menu.player.camera.dir"),
+            switch_group(
+              "mode",
+              "menu.player.camera.mode",
+              &["menu.player.camera.mode.orbit", "menu.player.camera.mode.fly"],
+              1,
+            ),
+            slider("speed", "menu.player.camera.speed", 2.6, 0.32, 40.0, 0.1, 1, None),
+          ],
+        )],
+      ),
+      sub_menu(
+        "game",
+        "menu.game",
+        vec![sub_menu(
+          "edit",
+          "menu.game.edit",
+          vec![
+            switch_group(
+              "shape",
+              "menu.game.edit.shape",
+              &["menu.game.edit.shape.sphere", "menu.game.edit.shape.cube"],
+              0,
+            ),
+            input(
+              "size",
+              "menu.game.edit.size",
+              vec![InputField::number("", "3", 1.0, 16.0, 1.0, 0)],
+            ),
+            color("color", "menu.game.edit.color", "96989E"),
+            slider("emissive", "menu.game.edit.emissive", 0.0, 0.0, 255.0, 1.0, 0, None),
+            slider("alpha", "menu.game.edit.alpha", 100.0, 0.0, 100.0, 1.0, 0, None),
+            slider("smooth", "menu.game.edit.smooth", 50.0, 0.0, 100.0, 1.0, 0, None),
+          ],
+        )],
+      ),
+      sub_menu("ui", "menu.ui", vec![toggle("showcase", "menu.ui.showcase", false)]),
+    ],
+  }
+}
+
+/// 读菜单 TOML（相对 [`crate::ASSETS_PATH`]）；缺失/解析失败 → 内置默认 + warn
+pub fn load_menu() -> MenuFile {
+  let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
+  match std::fs::read_to_string(&path) {
+    Ok(src) => match MenuFile::from_toml(&src) {
+      Ok(mut m) => {
+        m.sanitize();
+        info!("debug menu loaded from {}", path.display());
+        m
+      }
+      Err(e) => {
+        warn!("debug menu TOML parse failed ({e}); using built-in defaults");
+        let mut m = default_menu();
+        m.sanitize();
+        m
+      }
+    },
+    Err(e) => {
+      warn!("debug menu TOML missing ({e}); using built-in defaults");
+      let mut m = default_menu();
+      m.sanitize();
+      m
+    }
+  }
+}
+
+/// 把当前菜单状态写回 TOML（退出前调用）
+pub fn save_menu(model: &MenuFile) {
+  let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
+  let Ok(src) = model.to_toml() else {
+    warn!("debug menu serialize failed; not saved");
+    return;
+  };
+  if let Some(dir) = path.parent()
+    && let Err(e) = std::fs::create_dir_all(dir)
+  {
+    warn!("debug menu dir create failed ({e})");
+    return;
+  }
+  match std::fs::write(&path, src) {
+    Ok(()) => info!("debug menu saved to {}", path.display()),
+    Err(e) => warn!("debug menu save failed ({e})"),
+  }
+}
+
+// ===================== 组件/资源 =====================
+
+/// UI 已生成的守卫标记（debug_menu_setup 的存在性守卫）
+#[derive(Component)]
+pub(crate) struct DebugUiRoot;
+
+/// 右上角 FPS 覆盖层根
+#[derive(Component)]
+pub(crate) struct FpsOverlay;
+
+/// FPS 覆盖层文本
+#[derive(Component)]
+pub(crate) struct FpsOverlayText;
+
+/// FPS 覆盖层是否显示（`video/fps` 开关）
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct FpsOverlayVisible(pub bool);
+
+/// 每帧 delta 的 1s 滚动窗口（FPS 统计）
+#[derive(Resource, Default)]
+pub struct FpsWindow(VecDeque<f32>);
+
+// ===================== 生成 =====================
+
+/// 建 DebugMenu + FPS 覆盖层 + 回调观察者。主题/字体就绪后由 [`crate::debug_ui_setup`] 调用一次。
+pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
+  let model = load_menu();
+  // 文案解析器取资源里的（语言切换只需 bump 版本，见 sync_ui_locale）
+  let translate = world.resource::<UiTranslator>().handle();
+  let ctx = UiCtx::new(ctx.theme, ctx.font)
+    .with_icon_font(ctx.icon_font)
+    .with_translate(translate);
+  spawn_debug_menu(world, &ctx, model);
+  apply_initial_state(world);
+  spawn_fps_overlay(world, &ctx);
+  register_callbacks(world);
+}
+
+/// 语言切换后让 gate-ui 重解析全部 keyed 文本（菜单树整体跟着换语言）。
+///
+/// 解析闭包读的是 rust-i18n 的当前 locale，所以这里只需 bump 版本触发重解析。
+pub(crate) fn sync_ui_locale(
+  mut translator: ResMut<UiTranslator>,
+  mut last: Local<String>,
+) {
+  let now = rust_i18n::locale().to_string();
+  if now != *last {
+    info!("UI 语言 → {now}");
+    *last = now;
+    translator.bump();
+  }
+}
+
+/// 右上角 FPS 覆盖层：黑底白字，格式 "(cur, avg, min, max)"，每帧更新
+fn spawn_fps_overlay(world: &mut World, ctx: &UiCtx) {
+  let visible = world.resource::<FpsOverlayVisible>().0;
+  let mut e = world.spawn((
+    Name::new("fps-overlay"),
+    FpsOverlay,
+    Node {
+      position_type: PositionType::Absolute,
+      right: px(6.0),
+      top: px(6.0),
+      padding: UiRect::axes(px(6.0), px(2.0)),
+      ..default()
+    },
+    BackgroundColor(Color::BLACK),
+    Visibility::Hidden,
+  ));
+  e.with_children(|p| {
+    let h = label(
+      ctx,
+      p,
+      LabelConfig { text: "(--, --, --, --)".into(), style: LabelStyle::Muted, ..default() },
+    );
+    p.world_mut().entity_mut(*h).insert((FpsOverlayText, TextColor(Color::WHITE)));
+  });
+  let root = e.id();
+  if visible {
+    world.entity_mut(root).insert(Visibility::Visible);
+  }
+}
+
+/// 用菜单模型初始化各调试资源的初值（TOML = 所有调试常量的初值来源）
+fn apply_initial_state(world: &mut World) {
+  let model = match gate_ui::menu_model(world) {
+    Some(m) => m.clone(),
+    None => return,
+  };
+  let get_bool = |path: &str, dflt: bool| -> bool {
+    match model.node(&split(path)) {
+      Some(MenuNode::Toggle { checked, .. }) => *checked,
+      _ => dflt,
+    }
+  };
+  let get_sel = |path: &str| -> Option<usize> {
+    match model.node(&split(path)) {
+      Some(MenuNode::SwitchGroup { selected, .. }) => Some(*selected),
+      _ => None,
+    }
+  };
+  let get_val = |path: &str| -> Option<f32> {
+    match model.node(&split(path)) {
+      Some(MenuNode::Slider { value, .. }) => Some(*value),
+      _ => None,
+    }
+  };
+  let get_text = |path: &str| -> Option<String> {
+    match model.node(&split(path)) {
+      Some(MenuNode::Input { fields, .. }) => fields.first().map(|f| f.text.clone()),
+      _ => None,
+    }
+  };
+
+  // 视频
+  world.resource_mut::<FpsOverlayVisible>().0 = get_bool("video/fps", false);
+  let mut q_win = world.query_filtered::<&mut Window, With<PrimaryWindow>>();
+  if let Some(mut win) = q_win.iter_mut(world).next() {
+    win.present_mode =
+      if get_bool("video/vsync", true) { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
+  }
+  drop(q_win);
+
+  // 渲染 / DDGI
+  {
+    let stage = if get_bool("render/ddgi/enabled", true) {
+      gate_render::ddgi::DdgiStage::FULL
+    } else {
+      gate_render::ddgi::DdgiStage::OFF
+    };
+    *world.resource_mut::<gate_render::ddgi::DdgiStage>() =
+      gate_render::ddgi::DdgiStage::new(stage);
+    let mut dbg = world.resource_mut::<gate_render::ddgi::DdgiDebugSettings>();
+    if let Some(m) = get_sel("render/ddgi/mode") {
+      dbg.mode = m as f32;
+    }
+    let probe = get_sel("render/ddgi/probe").unwrap_or(0);
+    dbg.probe_viz = probe > 0;
+    dbg.probe_viz_lod = if probe == 0 {
+      0.0
+    } else if probe + 1 >= PROBE_KEYS.len() {
+      PROBE_VIZ_LOD_ALL
+    } else {
+      (probe - 1) as f32
+    };
+  }
+  // 渲染 / 曝光
+  {
+    let mut eye = world.resource_mut::<gate_render::EyeAdaptSettings>();
+    eye.enabled = get_bool("render/exposure/enabled", true);
+    if let Some(v) = get_val("render/exposure/ev_up") {
+      eye.ev_max = v;
+    }
+    if let Some(v) = get_val("render/exposure/ev_dn") {
+      eye.ev_min = v;
+    }
+    if let Some(v) = get_val("render/exposure/tau_up") {
+      eye.tau_brighten = v;
+    }
+    if let Some(v) = get_val("render/exposure/tau_dn") {
+      eye.tau_darken = v;
+    }
+    if let Some(v) = get_val("render/exposure/key") {
+      eye.key = v;
+    }
+  }
+  // 玩家 / 相机
+  {
+    if let Some(i) = get_sel("player/camera/mode") {
+      *world.resource_mut::<CameraMode>() =
+        if i == 0 { CameraMode::Orbit } else { CameraMode::Fly };
+    }
+    if let Some(v) = get_val("player/camera/speed") {
+      world.resource_mut::<FlyCamera>().speed = v * VOXEL_PER_METER;
+    }
+  }
+  // 游戏 / 编辑
+  {
+    let mut edit = world.resource_mut::<EditSettings>();
+    if let Some(i) = get_sel("game/edit/shape") {
+      edit.shape = if i == 0 { BrushShape::Sphere } else { BrushShape::Cube };
+    }
+    if let Some(t) = get_text("game/edit/size")
+      && let Ok(v) = t.trim().parse::<u32>()
+    {
+      edit.size = v.clamp(EDIT_SIZE_MIN, EDIT_SIZE_MAX);
+    }
+  }
+  info!(
+    target: "gate",
+    "debug menu 初值已应用：vsync={} fps={} ddgi={} cam={:?} speed={:.2}m/s shape={:?} size={}",
+    get_bool("video/vsync", true),
+    get_bool("video/fps", false),
+    get_bool("render/ddgi/enabled", true),
+    world.resource::<CameraMode>(),
+    world.resource::<FlyCamera>().speed / VOXEL_PER_METER,
+    world.resource::<EditSettings>().shape,
+    world.resource::<EditSettings>().size,
+  );
+}
+
+/// 路径字符串 → id 段
+fn split(path: &str) -> Vec<String> {
+  path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+}
+
+// ===================== 回调（统一事件按 path 分派） =====================
+
+fn register_callbacks(world: &mut World) {
+  // ---- 视频 ----
+  world.add_observer(
+    |ev: On<MenuActionEvent>,
+     mut q_win: Query<&mut Window, With<PrimaryWindow>>,
+     mut fps: ResMut<FpsOverlayVisible>| {
+      let MenuAction::Toggle(on) = ev.action else { return };
+      match ev.path.as_str() {
+        "video/vsync" => {
+          let Ok(mut win) = q_win.single_mut() else { return };
+          win.present_mode = if on { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
+          info!("VSync {} → present_mode {:?}", if on { "on" } else { "off" }, win.present_mode);
+        }
+        "video/fps" => {
+          fps.0 = on;
+          info!("FPS 覆盖层 → {}", if on { "on" } else { "off" });
+        }
+        "video/fullscreen" | "video/aa" => {
+          info!(target: "gate", "{} = {}（UI 预留，功能未实现）", ev.path, on);
+        }
+        _ => {}
+      }
+    },
+  );
+
+  // ---- 渲染（DDGI / 曝光）----
+  world.add_observer(
+    |ev: On<MenuActionEvent>,
+     mut ddgi_stage: ResMut<gate_render::ddgi::DdgiStage>,
+     mut ddgi_dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>,
+     mut eye: ResMut<gate_render::EyeAdaptSettings>| {
+      match (ev.path.as_str(), &ev.action) {
+        ("render/ddgi/enabled", MenuAction::Toggle(on)) => {
+          *ddgi_stage = gate_render::ddgi::DdgiStage::new(if *on {
+            gate_render::ddgi::DdgiStage::FULL
+          } else {
+            gate_render::ddgi::DdgiStage::OFF
+          });
+          info!("DDGI → stage {}", ddgi_stage.0);
+        }
+        ("render/ddgi/mode", MenuAction::Select(i)) => {
+          ddgi_dbg.mode = *i as f32;
+          let name = DDGI_MODE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
+          info!("DDGI 诊断模式 → {name}");
+        }
+        ("render/ddgi/probe", MenuAction::Select(i)) => {
+          ddgi_dbg.probe_viz = *i > 0;
+          ddgi_dbg.probe_viz_lod = if *i == 0 {
+            0.0
+          } else if *i + 1 >= PROBE_KEYS.len() {
+            PROBE_VIZ_LOD_ALL
+          } else {
+            (*i - 1) as f32
+          };
+          let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
+          info!("探针绘制 → {name}");
+        }
+        ("render/exposure/enabled", MenuAction::Toggle(on)) => {
+          eye.enabled = *on;
+          info!(target: "gate", "自动曝光 → {}", if *on { "on" } else { "off" });
+        }
+        ("render/exposure/ev_up", MenuAction::Value(v)) => eye.ev_max = *v,
+        ("render/exposure/ev_dn", MenuAction::Value(v)) => eye.ev_min = *v,
+        ("render/exposure/tau_up", MenuAction::Value(v)) => eye.tau_brighten = v.max(0.01),
+        ("render/exposure/tau_dn", MenuAction::Value(v)) => eye.tau_darken = v.max(0.01),
+        ("render/exposure/key", MenuAction::Value(v)) => eye.key = v.max(0.001),
+        _ => {}
+      }
+    },
+  );
+
+  // ---- 玩家（相机）----
+  world.add_observer(
+    |ev: On<MenuActionEvent>, mut mode: ResMut<CameraMode>, mut fly: ResMut<FlyCamera>| match (
+      ev.path.as_str(),
+      &ev.action,
+    ) {
+      ("player/camera/mode", MenuAction::Select(i)) => {
+        *mode = if *i == 0 { CameraMode::Orbit } else { CameraMode::Fly };
+        info!("相机模式 → {:?}", *mode);
+      }
+      ("player/camera/speed", MenuAction::Value(v)) => {
+        fly.speed = *v * VOXEL_PER_METER;
+        info!("飞行速度 → {:.2} m/s（{:.0} v/s）", v, fly.speed);
+      }
+      _ => {}
+    },
+  );
+
+  // ---- 游戏（编辑）+ 界面 ----
+  world.add_observer(
+    |ev: On<MenuActionEvent>,
+     mut edit: ResMut<EditSettings>,
+     mut q_show: Query<&mut Visibility, With<ShowcaseRoot>>| {
+      match (ev.path.as_str(), &ev.action) {
+        ("game/edit/shape", MenuAction::Select(i)) => {
+          edit.shape = if *i == 0 { BrushShape::Sphere } else { BrushShape::Cube };
+          info!("笔触形状 → {:?}", edit.shape);
+        }
+        ("game/edit/size", MenuAction::Text(t)) => {
+          if let Ok(v) = t.trim().parse::<u32>() {
+            edit.size = v.clamp(EDIT_SIZE_MIN, EDIT_SIZE_MAX);
+            info!("笔触大小 → {} vx（跨度 {}）", edit.size, 2 * edit.size - 1);
+          }
+        }
+        ("game/edit/color", MenuAction::Text(t)) => {
+          info!(target: "gate", "笔触颜色 → {t}（UI 预留，功能未实现）");
+        }
+        ("game/edit/emissive", MenuAction::Value(v)) => {
+          info!(target: "gate", "自发光 → {v:.0}（UI 预留，功能未实现）");
+        }
+        ("game/edit/alpha", MenuAction::Value(v)) => {
+          info!(target: "gate", "透明度 → {v:.0}%（UI 预留，功能未实现）");
+        }
+        ("game/edit/smooth", MenuAction::Value(v)) => {
+          info!(target: "gate", "光滑度 → {v:.0}%（UI 预留，功能未实现）");
+        }
+        ("ui/showcase", MenuAction::Toggle(on)) => {
+          if let Ok(mut vis) = q_show.single_mut() {
+            *vis = if *on { Visibility::Visible } else { Visibility::Hidden };
+          }
+        }
+        _ => {}
+      }
+    },
+  );
+}
+
+// ===================== 每帧刷新 =====================
+
+/// 纯文本行（相机位置/角度）：每 [`CAM_INFO_REFRESH_SECS`] 刷新一次
+#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+pub(crate) fn camera_info_tick(
+  time: Res<Time>,
+  orbit: Res<gate_render::OrbitCamera>,
+  mode: Res<CameraMode>,
+  fly: Res<FlyCamera>,
+  q_rows: Query<(&gate_ui::MenuItem, &Children)>,
+  mut q_text: Query<&mut Text>,
+  mut acc: Local<f32>,
+) {
+  *acc += time.delta_secs();
+  if *acc < CAM_INFO_REFRESH_SECS {
+    return;
+  }
+  *acc = 0.0;
+  let eye = match *mode {
+    CameraMode::Orbit => orbit.eye(),
+    CameraMode::Fly => fly.pos,
+  };
+  // 数字先 format! 好再塞占位符：语言切换不会改变数字列宽（见 locales 约定）
+  let pos = t!(
+    "menu.camera.pos.value",
+    v = format!("({:.1}, {:.1}, {:.1})", eye.x, eye.y, eye.z)
+  )
+  .to_string();
+  let dir = t!(
+    "menu.camera.dir.value",
+    yaw = format!("{:.1}", orbit.yaw.to_degrees()),
+    pitch = format!("{:.1}", orbit.pitch.to_degrees())
+  )
+  .to_string();
+  for (item, children) in &q_rows {
+    let text = match item.path.as_str() {
+      "player/camera/pos" => pos.clone(),
+      "player/camera/dir" => dir.clone(),
+      _ => continue,
+    };
+    for c in children.iter() {
+      if let Ok(mut t) = q_text.get_mut(c)
+        && t.0 != text
+      {
+        t.0 = text.clone();
+      }
+    }
+  }
+}
+
+/// 右上角 FPS：1s 窗口内统计 当前/平均/最低/最高，每帧更新
+#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+pub(crate) fn fps_overlay_tick(
+  time: Res<Time>,
+  visible: Res<FpsOverlayVisible>,
+  mut window: ResMut<FpsWindow>,
+  mut q_root: Query<&mut Visibility, With<FpsOverlay>>,
+  mut q_text: Query<&mut Text, With<FpsOverlayText>>,
+) {
+  if let Ok(mut vis) = q_root.single_mut() {
+    let target = if visible.0 { Visibility::Visible } else { Visibility::Hidden };
+    if *vis != target {
+      *vis = target;
+    }
+  }
+  if !visible.0 {
+    return;
+  }
+  let dt = time.delta_secs();
+  if dt > 0.0 {
+    window.0.push_back(dt);
+  }
+  let mut sum = 0.0f32;
+  for &d in window.0.iter() {
+    sum += d;
+  }
+  while sum > FPS_WINDOW_SECS
+    && let Some(old) = window.0.pop_front()
+  {
+    sum -= old;
+  }
+  let mut min_dt = f32::MAX;
+  let mut max_dt = 0.0f32;
+  for &d in window.0.iter() {
+    min_dt = min_dt.min(d);
+    max_dt = max_dt.max(d);
+  }
+  let cur = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+  let avg = if sum > 0.0 { window.0.len() as f32 / sum } else { 0.0 };
+  let min = if max_dt > 0.0 { 1.0 / max_dt } else { 0.0 };
+  let max = if min_dt < f32::MAX && min_dt > 0.0 { 1.0 / min_dt } else { 0.0 };
+  let text = format!("({:>3}, {:>3}, {:>3}, {:>3})", fps3(cur), fps3(avg), fps3(min), fps3(max));
+  if let Ok(mut t) = q_text.single_mut()
+    && t.0 != text
+  {
+    t.0 = text;
+  }
+}
+
+/// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
+fn fps3(v: f32) -> u32 {
+  (v.round() as u32).min(999)
+}
+
+/// F3 切换整个 DebugMenu 显隐（只影响菜单，不动 showcase）
+pub(crate) fn debug_menu_toggle(
+  keys: Res<ButtonInput<KeyCode>>,
+  mut q: Query<&mut Visibility, With<DebugMenuRoot>>,
+) {
+  if keys.just_pressed(KeyCode::F3) {
+    for mut vis in &mut q {
+      *vis = if *vis == Visibility::Hidden { Visibility::Visible } else { Visibility::Hidden };
+    }
+  }
+}
+
+/// 退出前把当前菜单状态写回 TOML（AppExit 那一帧执行一次）
+pub(crate) fn save_menu_on_exit(
+  mut exit: MessageReader<AppExit>,
+  q_menu: Query<&gate_ui::DebugMenu>,
+  mut saved: Local<bool>,
+) {
+  if *saved {
+    return;
+  }
+  let mut quitting = false;
+  for _ in exit.read() {
+    quitting = true;
+  }
+  if !quitting {
+    return;
+  }
+  *saved = true;
+  if let Ok(menu) = q_menu.single() {
+    // 当前停留路径也一并持久化
+    let mut model = menu.model.clone();
+    model.window.path = menu.path.clone();
+    model.window.collapsed = menu.collapsed;
+    save_menu(&model);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn default_menu_matches_asset_toml() {
+    let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
+    let src = std::fs::read_to_string(&path)
+      .unwrap_or_else(|e| panic!("缺初始菜单资产 {}: {e}", path.display()));
+    let from_file = MenuFile::from_toml(&src).expect("TOML 可解析");
+    let built = default_menu();
+    assert_eq!(from_file, built, "assets/ui/debug_menu.toml 必须与 default_menu() 逐字一致");
+    let regenerated = built.to_toml().expect("可序列化");
+    assert_eq!(regenerated, src, "序列化结果必须与资产文件逐字一致（含格式）");
+  }
+
+  #[test]
+  #[ignore = "工具用：把默认菜单写成 assets/ui/debug_menu.toml（改默认值后重跑一次）"]
+  fn generate_default_toml() {
+    let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
+    let src = default_menu().to_toml().expect("可序列化");
+    std::fs::write(&path, src).expect("写入菜单资产");
+    println!("wrote {}", path.display());
+  }
+
+  #[test]
+  fn paths_used_by_callbacks_exist() {
+    let m = default_menu();
+    for path in [
+      "video/vsync",
+      "video/fps",
+      "video/fullscreen",
+      "video/aa",
+      "render/ddgi/enabled",
+      "render/ddgi/mode",
+      "render/ddgi/probe",
+      "render/exposure/enabled",
+      "render/exposure/ev_up",
+      "render/exposure/tau_dn",
+      "render/exposure/key",
+      "player/camera/mode",
+      "player/camera/speed",
+      "game/edit/shape",
+      "game/edit/size",
+      "ui/showcase",
+    ] {
+      assert!(m.node(&split(path)).is_some(), "回调路径不存在：{path}");
+    }
+  }
+
+  #[test]
+  fn probe_option_mapping() {
+    // 下标 → (probe_viz, probe_viz_lod)：0 无 / 1..4 LOD0..3 / 5 全(4)
+    let map = |i: usize| {
+      (
+        i > 0,
+        if i == 0 {
+          0.0
+        } else if i + 1 >= PROBE_KEYS.len() {
+          PROBE_VIZ_LOD_ALL
+        } else {
+          (i - 1) as f32
+        },
+      )
+    };
+    assert_eq!(map(0), (false, 0.0));
+    assert_eq!(map(1), (true, 0.0));
+    assert_eq!(map(4), (true, 3.0));
+    assert_eq!(map(5), (true, 4.0));
+  }
+
+  /// 菜单树里所有文案字段都是 i18n key，且必须在本表里存在（否则 UI 上会显示裸 key）
+  #[test]
+  fn every_menu_text_key_is_translated() {
+    use std::collections::BTreeSet;
+    let m = default_menu();
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    fn walk(node: &MenuNode, keys: &mut BTreeSet<String>) {
+      keys.insert(node.label().to_string());
+      if let Some(t) = node.tooltip() {
+        keys.insert(t.to_string());
+      }
+      match node {
+        MenuNode::SwitchGroup { options, .. } | MenuNode::Buttons { items: options, .. } => {
+          keys.extend(options.iter().cloned());
+        }
+        MenuNode::Input { fields, .. } => {
+          for f in fields {
+            if !f.label.is_empty() {
+              keys.insert(f.label.clone());
+            }
+          }
+        }
+        _ => {}
+      }
+      for c in node.children() {
+        walk(c, keys);
+      }
+    }
+    for n in &m.items {
+      walk(n, &mut keys);
+    }
+    assert!(keys.len() > 30, "菜单文案 key 数量异常：{}", keys.len());
+    for key in &keys {
+      let translated = t!(key.as_str()).to_string();
+      assert_ne!(&translated, key, "locales 缺 key：{key}");
+      assert!(!translated.is_empty(), "空文案：{key}");
+    }
+    // 相机信息行的动态文案 key 也要在
+    for key in ["menu.camera.pos.value", "menu.camera.dir.value"] {
+      assert_ne!(t!(key).to_string(), key, "locales 缺 key：{key}");
+    }
+  }
+
+  #[test]
+  fn default_menu_ids_are_language_free() {
+    // id 是回调路径（标题栏显示），不能是 i18n key
+    let m = default_menu();
+    let mut ids: Vec<String> = Vec::new();
+    fn walk(node: &MenuNode, ids: &mut Vec<String>) {
+      ids.push(node.id().to_string());
+      for c in node.children() {
+        walk(c, ids);
+      }
+    }
+    for n in &m.items {
+      walk(n, &mut ids);
+    }
+    for id in ids {
+      assert!(!id.starts_with("menu."), "id 不该是文案 key：{id}");
+      assert!(!id.contains('.'), "id 应为单段 slug：{id}");
+    }
+  }
+
+  #[test]
+  fn speed_conversion_roundtrip() {
+    // 2.6 m/s ↔ 130 v/s
+    assert!((2.6 * VOXEL_PER_METER - 130.0).abs() < 1e-3);
+  }
+
+  #[test]
+  fn edit_size_bounds_in_menu() {
+    let m = default_menu();
+    let Some(MenuNode::Input { fields, .. }) = m.node(&split("game/edit/size")) else {
+      panic!("笔触大小项存在")
+    };
+    let kind = fields[0].kind();
+    assert_eq!(kind.normalize(0.0), 1.0, "低于下限钳到 1");
+    assert_eq!(kind.normalize(99.0), 16.0, "高于上限钳到 16");
+  }
+
+  #[test]
+  fn fast_speed_mul_constant_used() {
+    // 高速档倍率只用于相机侧，这里保证常量仍是 2.0（菜单只写基础速度）
+    assert!((crate::camera::FLY_SPEED_FAST_MUL - 2.0).abs() < 1e-6);
+  }
+}
