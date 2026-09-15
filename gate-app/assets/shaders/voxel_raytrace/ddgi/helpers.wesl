@@ -2,7 +2,6 @@ import package::bindings::{b_struct, ddgi_cell_slot, ddgi_u, g};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, NODE_FIXED_WORDS};
 import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS, DDGI_USAGE_STICKY};
-import package::world::{world_solid};
 
 fn ddgi_merge_state(a: u32, b: u32) -> u32 {
   if (a == 3u) { return b; }
@@ -155,46 +154,9 @@ fn ddgi_cell_state_sized(g: Grid, cmin: vec3<i32>, size: i32) -> u32 {
   return seen;
 }
 
-fn ddgi_leaf16(g: Grid, cmin: vec3<i32>, center: vec3<f32>) -> vec4<f32> {
-  var best_d2 = 1e30;
-  var best_p = vec3<f32>(0.0);
-  var found = 0.0;
-  var mixed: array<vec3<i32>, 64>;
-  var nmix = 0u;
-  for (var k = 0; k < 4; k = k + 1) {
-    for (var j = 0; j < 4; j = j + 1) {
-      for (var i = 0; i < 4; i = i + 1) {
-        let sub = cmin + vec3<i32>(i, j, k) * 4;
-        let st = ddgi_brick_state(g, sub, 3u);
-        if (st == 0u) {
-          let p = vec3<f32>(sub) + 2.0;
-          let d2 = dot(p - center, p - center);
-          if (d2 < best_d2) { best_d2 = d2; best_p = p; found = 1.0; }
-        } else if (st == 2u && nmix < 64u) {
-          mixed[nmix] = sub;
-          nmix = nmix + 1u;
-        }
-      }
-    }
-  }
-  if (found > 0.5) { return vec4<f32>(best_p, 1.0); }
-  for (var m = 0u; m < nmix; m = m + 1u) {
-    let par = mixed[m];
-    for (var k = 0; k < 4; k = k + 1) {
-      for (var j = 0; j < 4; j = j + 1) {
-        for (var i = 0; i < 4; i = i + 1) {
-          let v = par + vec3<i32>(i, j, k);
-          if (!world_solid(g, v)) {
-            let p = vec3<f32>(v) + 0.5;
-            let d2 = dot(p - center, p - center);
-            if (d2 < best_d2) { best_d2 = d2; best_p = p; found = 1.0; }
-          }
-        }
-      }
-    }
-  }
-  return vec4<f32>(best_p, found);
-}
+// （原 `ddgi_leaf16` 已删）它曾在"连 4³ 全空子块都没有"的 cell 里逐 1³ 体素找一个空位，
+// 把探针塞进 1~3 体素宽的窄缝/接缝。那种探针位于进不了光的缝隙里，辐照度恒 ≈0，会把缝两侧的
+// 像素稳定压成**纯黑窄带**。现在这种 cell 直接**不放探针**（见 bake 的 ddgi_place_probe）。
 
 // ============================================================================
 

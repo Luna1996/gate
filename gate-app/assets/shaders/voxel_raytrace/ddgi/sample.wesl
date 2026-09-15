@@ -1,5 +1,5 @@
 import package::bindings::{ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u};
-import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
+import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FIELD_MIN_W, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
 import package::ddgi::helpers::{ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast};
@@ -118,12 +118,19 @@ fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
 // clamp 之后用最靠近的可用探针给一个粗粒度估计 —— 空间上仍随位置变化，只是精度粗。
 // relax_normal = true：把背向探针闸门 wn 的下限抬到 0.25。**只在像素不在任何级联盒内时**
 // 使用；壳内回退到更粗 LOD 时必须为 false，否则隔墙探针会被放进平均 → 漏光。
+// allow_backface = true：**完全放开 wn 的符号闸门**（背向探针也参与），只保留两个精确判据
+// （Chebyshev wd + 逐角线段求交）来过滤。仅供 `ddgi_sample` 的末级兜底 r3' 使用（那是
+// "r1/r2 都失败"的像素，典型表现就是 Probe 档品红 + 纯黑点）；r1/r2/级联/退粗路径一律 false。
+// ⚠️ 放开后这些背向角会**通过 wn 闸门**，于是也被计入返回的 `cov`（= "有可用数据"）。
+// 消费侧必须知道这一点：`ddgi_sample` 在 r1/r2/r3' 全失败时会把 `ddgi_dbg_cov` 恢复成
+// **主级那一份严格值**（`cov_strict`），否则 conf 会被 r3' 抬满、天光兜底失效（见那里的说明）。
 fn ddgi_sample_lod(
   p: vec3<f32>,
   n: vec3<f32>,
   lod: u32,
   clamp_cells: bool,
   relax_normal: bool,
+  allow_backface: bool,
 ) -> vec4<f32> {
   let L = ddgi_u.lods[lod];
   let cs = f32(L.origin.w);
@@ -166,11 +173,9 @@ fn ddgi_sample_lod(
   var wsum = 0.0;
   // 覆盖度：只累加「有可用数据」的角（见下面的分界注释）。与 wsum 的区别是本函数的核心 ——
   var cov = 0.0;
-  // 含**背向角**的覆盖度（名义权重和，同样不含 wn/wd 闸门）。背向角现在一律剔除、不进 cov，
-  // 但已删除的「末级背向兜底（r3）」那次调用在开关=0 时会把背向角也计入它末尾覆写的
-  // ddgi_dbg_cov。为了让删 r3 后的 ddgi_dbg_cov 与当时逐像素一致，这里单独记下，由
-  // ddgi_sample 在 r3 原位补回（见那里的说明）。
-  var cov_all = 0.0;
+  // 「本点一侧辐照度场」的两个累加器（含义见模块级 ddgi_field 的说明）。
+  var fld = vec3<f32>(0.0);
+  var fw = 0.0;
   ddgi_dbg_rej = vec4<u32>(0u, 0u, 0u, 0u);
   for (var iz = 0; iz < 2; iz = iz + 1) {
     for (var iy = 0; iy < 2; iy = iy + 1) {
@@ -296,12 +301,16 @@ fn ddgi_sample_lod(
         // 箱体内部的探针辐照度 ≈0（那里本来无光 —— 例如这个大圆柱是个罐体，背面就是罐内），
         // 一旦入选就把像素压成**暗斑**；哪几个角入选又随 cell 邻域摆动 → 斑块跟着晶格走、
         // 随相机跳变。这正是「GI 模式里也有暗斑」的来源。
-        // 【背向兜底（原 r3）已删除】不再有任何路径允许背向角参与加权平均。
+        // 【唯一的例外：`allow_backface`（末级兜底 r3'，见 ddgi_sample）】它把符号闸门整个放开，
+        // 但**不**放松精确判据（Chebyshev wd + 逐角线段求交）。所以这里放行的背向角，其
+        // 「探针→本点」线段上**一点几何都没有** —— 本点确实看得见那个探针（薄几何两侧/掠射/
+        // 法线退化处正是这种情形），它的辐亮度对该方向是有效估计；而被墙/箱体真正挡住的背向角
+        // 会被线段求交剔掉。权重仍用地板 0.25（见 `wn_w`），不会让单个角独占归一化结果。
         let wn_raw = dot(n, -dir) / DDGI_NORMAL_BIAS;
-        if (wn_raw <= 0.0) {
+        if (!allow_backface && wn_raw <= 0.0) {
+          // 背向角 = 探针落在表面背面 ⇒ 它的数据对本点无效 ⇒ **不算「有可用数据」**
+          // （不进 cov，见下面 cov 累加处的说明）。
           ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u;
-          // 背向角只计入「含背向角」的覆盖度（复刻删 r3 前开关=0 的 ddgi_dbg_cov），不进 cov。
-          cov_all = cov_all + wtri;
           continue;
         }
         let wn = clamp(wn_raw, 0.0, 1.0);
@@ -312,7 +321,15 @@ fn ddgi_sample_lod(
         // 而 wd（被墙挡住）是"本点本来就该暗"的**正确结果**，不是数据缺失 → 仍算有数据；
         // 早期用 wsum 当置信度正是把 wd 也误判成"没数据"，凹角被补天光 → 室内漏光。
         cov = cov + wtri;
-        cov_all = cov_all + wtri;
+        // 与可见性无关的「同侧辐照度场」累加（供末级兜底 r4，见模块级 ddgi_field 的说明）：
+        // 只要求 `wn_raw > 0`（探针与法线同侧）+ 本角有数据，**不**受 wd / 权重阈值 ε /
+        // 线段求交影响 ⇒ 必须在那些闸门之前累加。余弦权重用 clamp 后的 `wn`，
+        // 于是绕角掠射的角（wn≈0）权重自然趋 0，不会把墙外/邻室的光搬进来。
+        if (wn_raw > 0.0) {
+          let wc_c = wn * wtri;
+          fld = fld + irr4.xyz * wc_c;
+          fw = fw + wc_c;
+        }
         let wn_w = select(wn, max(wn, 0.25), relax_normal);
         // ---- 遮挡：Chebyshev 软判定（对齐 Majercik / RTXGI）----
         // 旧版是 `clamp((dtex-dist)/bias+1)` + `<=0 剔除` 的**刀锋**判定：dtex 抖一点，
@@ -403,7 +420,10 @@ fn ddgi_sample_lod(
   // 覆盖度单独带出（返回值只有 4 个分量，且 .w 已被 wsum 占用）—— 着色侧用它决定
   // "要不要退回常量天光"，见 ddgi_dbg_cov 声明处与 ddgi_sample_lod 的分界注释。
   ddgi_dbg_cov = cov;
-  ddgi_dbg_cov_all = cov_all;
+  // 同侧辐照度场（与可见性无关）也单独带出 —— 供 ddgi_sample 的末级兜底 r4 用，
+  // 见模块级 ddgi_field 的说明。
+  ddgi_field = fld;
+  ddgi_field_w = fw;
   return vec4<f32>(select(vec3<f32>(0.0), total / wsum, ok), wsum);
 }
 var<private> ddgi_dbg_wsum: f32;
@@ -413,11 +433,17 @@ var<private> ddgi_dbg_wsum: f32;
 var<private> ddgi_usage_track: u32;
 // 「有可用数据的角」的名义权重覆盖度（Σ wtri，**不含** wn/wd 两道照明闸门）。
 // 它是天光常量兜底的唯一判据 —— 见 ddgi_sample_lod 里 cov 的注释。
+// ⚠️ 语义上**背向角（wn ≤ 0）不算有可用数据**：末级全失败时 `ddgi_sample` 会把它恢复成
+// 主级那一份严格值（`cov_strict`），正是这个语义让"8 角全在背面"的像素退回常量天光，
+// 而不是掉进"GI=0 且 conf=1 ⇒ 纯黑点"。
 var<private> ddgi_dbg_cov: f32;
-// 同上，但**把背向角也计入**。背向角现在一律剔除、不进 ddgi_dbg_cov；此量仅用于在
-// ddgi_sample 的「末级背向兜底（原 r3）」原位复刻删 r3 前开关=0 覆写过的 ddgi_dbg_cov，
-// 保证逐像素一致（见 ddgi_sample 壳内分支与 ddgi_sample_lod 的 cov_all 说明）。
-var<private> ddgi_dbg_cov_all: f32;
+// 「与可见性无关」的**本点一侧辐照度场**插值结果 —— Σ wtri·wn·irr 与 Σ wtri·wn，
+// 只累加 `wn_raw > 0`（探针与表面法线**同侧**）且有数据的角，**不**看 wd / 权重阈值 ε /
+// 逐角线段求交。由每次 `ddgi_sample_lod` 末尾发布（与 ddgi_dbg_cov 同渠道）；
+// `ddgi_sample` 在主级那一次之后立刻存副本，供"所有 LOD、所有路径都没给出值"的像素做
+// 末级兜底 r4（见那里的推导：犄角旮旯里 GI=0 + cov 已满 ⇒ 纯黑点）。
+var<private> ddgi_field: vec3<f32>;
+var<private> ddgi_field_w: f32;
 // 0 = 没有任何 LOD 盒包含该像素；lod+1 = 该像素落在这一级的「壳」内。
 // 语义是**纯几何包含**，不被采样成功与否影响（旧版在 fallback 里把它清零，导致
 // 「越界」和「壳内但无数据」在 Domain 模式里都是绿色，无法区分）。
@@ -460,7 +486,7 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
     // ① 外侧：p 在 LOD(lod-1) 盒外（距离为正）且落在混合带内
     let d = -ddgi_box_edge_dist(lod - 1u, p);
     if (d >= 0.0 && d < W) {
-      let rf = ddgi_sample_lod(p, n, lod - 1u, true, false);
+      let rf = ddgi_sample_lod(p, n, lod - 1u, true, false, false);
       if (rf.w >= 1e-4) {
         out = mix(main_c, rf.xyz, 0.5 * (1.0 - d / W));
       }
@@ -470,7 +496,7 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
     // ② 内侧：p 在 LOD(lod) 盒内（距离为正）且靠近其外边界
     let d = ddgi_box_edge_dist(lod, p);
     if (d >= 0.0 && d < W) {
-      let rc = ddgi_sample_lod(p, n, lod + 1u, false, false);
+      let rc = ddgi_sample_lod(p, n, lod + 1u, false, false, false);
       if (rc.w >= 1e-4) {
         out = mix(main_c, rc.xyz, 0.5 * (1.0 - d / W));
       }
@@ -495,11 +521,18 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   ddgi_dbg_edge = clamp(ddgi_box_edge_dist(outer, p) / max(w_edge, 1e-3), 0.0, 1.0);
   var in_cascade = false;
   var shell_lod = DDGI_LOD_COUNT;
+  // 主级（壳）那一次采样带出的「同侧辐照度场」副本 —— 末级兜底 r4 用它（见函数末尾）。
+  // 必须在这里声明：r4 的判定在壳循环之外，而 r2/r3'/级联混合/退粗都会重新发布 ddgi_field。
+  var field_irr_shell = vec3<f32>(0.0);
+  var field_w_shell = 0.0;
+  // 主级（严格闸门）算出的覆盖度副本 —— 同样必须在循环外持有：后面 r2/r3'/级联/退粗都会
+  // 覆写 `ddgi_dbg_cov`，而"全失败"时决定天光兜底的那份覆盖度必须来自主级（见函数末尾）。
+  var cov_strict_shell = 0.0;
   for (var lod = 0u; lod < DDGI_LOD_COUNT; lod = lod + 1u) {
     if (ddgi_lod_contains(lod, p)) {
       in_cascade = true;
       shell_lod = lod;
-      let r = ddgi_sample_lod(p, n, lod, false, false);
+      let r = ddgi_sample_lod(p, n, lod, false, false, false);
       // 【记账在**所有**能给出显示值的路径里都要发生，别只记主级】下面依次还有 ①同级放宽
       // 重试（r2）、②级联混合伙伴、③"逐级退粗"兜底 —— 它们给出的值**都会被显示**。
       // 从前这里有一句 `ddgi_usage_track = 0u;`（只让主级记账），理由是"兜底那条会用
@@ -515,6 +548,13 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       ddgi_dbg_wsum = r.w;
       ddgi_dbg_dom = f32(lod) + 1.0;
       ddgi_dbg_fb = 0.0;
+      // 主级（严格闸门，背向角**不算**有数据）算出的覆盖度 —— 后面 r2/r3' 会覆写
+      // `ddgi_dbg_cov`，所以这里先存下来：末级全失败时要用**它**（而不是"含背向角"的那份）
+      // 决定天光兜底，见失败分支里的说明。
+      cov_strict_shell = ddgi_dbg_cov;
+      // 同时存下主级带出的「同侧辐照度场」（r2/r3'/退粗都会重新发布，见 ddgi_field 说明）。
+      field_irr_shell = ddgi_field;
+      field_w_shell = ddgi_field_w;
       if (r.w >= 1e-4) {
         // 主级成功 → 过一遍级联混合（不在混合带内则原样返回）
         return ddgi_cascade_blend(p, n, lod, r.xyz);
@@ -534,22 +574,34 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       //     路径下都被剔除 —— 它们是墙后/箱体内部的探针（辐照度≈0），拉进来会把像素压成
       //     「跟着 cell 晶格走、随相机跳变」的暗斑（见 ddgi_sample_lod 的闸门注释）。
       let rej_shell = ddgi_dbg_rej; // 诊断用：保留未放宽时的剔除统计
-      let r2 = ddgi_sample_lod(p, n, lod, false, true);
+      let r2 = ddgi_sample_lod(p, n, lod, false, true, false);
       if (r2.w >= 1e-4) {
         ddgi_dbg_wsum = r2.w;
         ddgi_dbg_fb = 3.0; // 3 = 同级放宽 wn 后成功（Probe 档亮黄）
         return ddgi_cascade_blend(p, n, lod, r2.xyz);
       }
-      // ---- 末级背向兜底（原 r3）已删除 ----
-      // 原代码在此再调一次 ddgi_sample_lod(..., allow_backface=true)，把「探针在表面背面」的角
-      // 也按 |wn| 放进加权平均，只为避免「8 角全背向 → 整片纯黑」。背向探针对漫反射半球本不该
-      // 贡献辐照度，现改为**所有路径一律剔除**（见 ddgi_sample_lod 的背向闸门）→ 这里直接落到
-      // 下面的「逐级退粗」兜底。
-      // 【与删 r3 前「开关=0」逐像素一致】那次调用在开关=0 时背向角权重恒 0、wsum 必然 < 1e-4，
-      // 返回值被丢弃；但它末尾的 `ddgi_dbg_cov = cov` 会把**背向角**也算进覆盖度。若不复刻，
-      // 这些像素的 cov 会少掉背向角那一份 → conf 变小 → 天光兜底变多（远场发灰）。最近一次调用
-      // （上面的 r2）同时算出的 cov_all 正是当时的覆写值，补回它。
-      ddgi_dbg_cov = ddgi_dbg_cov_all;
+      // ---- 末级兜底 r3'：**背向闸门放开 + 只留精确判据**（治"纯黑点"）----
+      // 【为什么需要它】r1/r2 都失败时，像素会在 Probe 档显示品红（= 8 个角全被 wn 背向闸门
+      // 剔掉）。这类像素缺的不是"天光兜底"（下面的失败分支已经会让它生效），而是一个
+      // **能用的探针** —— 于是这里再给一次机会。
+      // r3' 把 wn 的**符号闸门**整个放开（allow_backface=true），只保留两个**精确**判据：
+      //   ① Chebyshev（wd，该探针自己的深度图）② 逐角线段求交（探针→本点，几何精确）。
+      // 于是"探针在表面背面、但线段上完全没有几何"的角能给出**有物理依据**的值（薄几何两侧、
+      // 掠射、法线退化处正是这种配置：本点确实看得见那个探针）；而被墙/箱体真正挡住的背向角
+      // 会被线段求交剔掉 —— 所以不会重演"箱体内的暗探针混进平均压出暗斑"。
+      // 权重用 r2 的地板 0.25（见 ddgi_sample_lod 的 `wn_w`），单个角不会独占归一化结果。
+      // 【为什么只在这一条路径放开】r1/r2/级联/退粗全部保持严格 ⇒ 正常像素一字不变；
+      // out-of-cascade 的退化路径也不放开（那里采的是被 clamp 的远处角，放开会把远场拉灰）。
+      let r3 = ddgi_sample_lod(p, n, lod, false, true, true);
+      if (r3.w >= 1e-4) {
+        ddgi_dbg_wsum = r3.w;
+        ddgi_dbg_fb = 4.0; // 4 = 背向放开后成功（Probe 档紫）
+        return ddgi_cascade_blend(p, n, lod, r3.xyz);
+      }
+      // 【覆盖度会用**主级的严格值**】见函数末尾：那里的 `ddgi_dbg_cov = cov_strict_shell`
+      // 保证"全失败"的像素按"本点自己这一侧到底有没有可用数据"决定天光兜底，
+      // 而不是被下面"退粗"调用的覆盖度（粗级数据更全）顶成 conf=1 ⇒ GI=0 ⇒ 纯黑点。
+      ddgi_dbg_cov = cov_strict_shell;
       ddgi_dbg_rej = rej_shell;
       // 嵌套级联下 p 至多落在一级的壳内，无需继续向上试
       break;
@@ -570,7 +622,7 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   //   ② 壳外（!in_cascade）：越界 cell 必须 clamp 到最粗一级窗口才取得到数据，并放宽 wn。
   let relax_normal = !in_cascade;
   for (var lod = start; lod < DDGI_LOD_COUNT; lod = lod + 1u) {
-    let r = ddgi_sample_lod(p, n, lod, true, relax_normal);
+    let r = ddgi_sample_lod(p, n, lod, true, relax_normal, false);
     if (r.w >= 1e-4) {
       if (!in_cascade) {
         // 不在任何壳内：退化结果与剔除统计都归它
@@ -593,5 +645,33 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     ddgi_dbg_fb = 1.0;
     ddgi_dbg_rej_out = ddgi_dbg_rej;
   }
+  // ---- 末级兜底 r4：**本点一侧的探针场插值**（忽略可见性判据）----
+  // 【治什么】走到这里 = 该像素在**所有** LOD、**所有**路径下都没能给出值。若主级还有
+  // "同侧且有数据"的角（`field_w_shell` 够大，见 DDGI_FIELD_MIN_W），说明本点周围**确实有
+  // 代表它的探针** —— 只是那些角全都过不了精确判据：`wd`（Chebyshev 判为被挡）、权重阈值
+  // ε（薄弱角被静默丢弃）、或逐角线段求交（半遮挡/贴边）。这正是"犄角旮旯"里的配置
+  // （角薄、又被自己所在的凹槽挡掉一半），其表现就是 **Probe 档品红 + 纯黑点**：
+  // GI=0 而 cov（按设计 wd 不计入）已满 ⇒ conf=1 ⇒ 常量天光也不生效。
+  // 这里改用"忽略可见性、只按同侧余弦权重"的同级插值 —— 它就是本点附近的辐照度场，
+  // 量级与周边一致（亮处不黑、暗处不亮），比纯黑或常量天光都更接近正确解。
+  // 【为什么不漏光】① 只累加 `wn_raw > 0`（探针与法线**同侧**）的角 —— 8 角全在背面时
+  // `field_w_shell = 0`，本分支不生效，仍走"cov=0 ⇒ 常量天光"；② 权重用余弦 `wn`，
+  // 绕角掠射的角权重趋 0，再由 DDGI_FIELD_MIN_W 挡住"只有掠射角"的情形。
+  // 【conf】这里同时把 `ddgi_dbg_cov` 置 1：已经拿到"本点一侧的场"= 有数据，
+  // 再叠常量天光会重复计入天空那一份（见 cov 的语义）。
+  if (in_cascade && field_w_shell >= DDGI_FIELD_MIN_W) {
+    ddgi_dbg_fb = 5.0; // 5 = 同侧场插值兜底（Probe 档青绿）
+    ddgi_dbg_wsum = field_w_shell;
+    ddgi_dbg_cov = 1.0;
+    return field_irr_shell / field_w_shell;
+  }
+  // 连"本点一侧的场"都拿不到（`field_w_shell` 太小 = 只有绕角掠射的角，或 8 角全在背面）
+  // ⇒ 退回常量天光。这里把 `ddgi_dbg_cov` 定成**主级的严格值**：它是"本点自己这一侧到底有
+  // 多少可用数据"的度量，conf = smoothstep(0, 0.5, 它) 于是给出连续的兜底强度
+  // （cov=0 = 8 角全背面 ⇒ 满额天光；部分在正面 ⇒ 部分天光）。
+  // 【为什么不能留用上面"退粗"循环最后一次调用写的 cov】粗级 cell 大、覆盖更全，
+  // 它的 cov 常常是满的 ⇒ conf=1 ⇒ amb=0，而值又是 0 ⇒ **纯黑点**（本函数要治的正是这个）。
+  // 壳外（!in_cascade）没有主级，保持原行为（用退化调用自己的 cov）。
+  if (in_cascade) { ddgi_dbg_cov = cov_strict_shell; }
   return vec3<f32>(0.0);
 }

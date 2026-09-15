@@ -70,7 +70,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
 //   ② DDGI 探针投线 ddgi_cast（原先直接调 trace_scene）；
 //   ③ 逐角几何遮挡（原先自带一套粗层预算 DDA + 硬距离/步数上限，现统一到完整层次 DDA，
 //      与主 trace 同一套遍历 —— 见「逐角几何遮挡参数」常量处的说明）；
-//   ④ 探针放置的占用查询（ddgi_brick_state / ddgi_cell_state_sized / ddgi_leaf16）。
+//   ④ 探针放置的占用查询（ddgi_brick_state / ddgi_cell_state_sized）。
 // 它们读同一份 brickmap 数据，但起点/终点偏置、epsilon、步进规则、「实体」判定各自为政，
 // 是漏光类问题反复出现的工程根因。现在**所有世界求值只走下面两个入口**；
 // 以后新增调用者必须走这里，禁止再写私有遍历。

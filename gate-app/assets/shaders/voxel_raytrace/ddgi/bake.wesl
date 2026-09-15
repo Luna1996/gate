@@ -1,7 +1,7 @@
 import package::bindings::{ddgi_cell, ddgi_cell_id, ddgi_meta, ddgi_u, g};
 import package::brickmap::{Grid};
 import package::ddgi::consts::{DDGI_BAKE_STAGGER};
-import package::ddgi::helpers::{DDGI_REC_ENABLED, ddgi_brick_state, ddgi_cell_in_window, ddgi_cell_state_sized, ddgi_leaf16, ddgi_lod_cell_size, ddgi_lod_count, ddgi_lod_slot_base, ddgi_meta_pack, ddgi_rec_off, ddgi_rec_pack, ddgi_slot_own, ddgi_slot_world_cell};
+import package::ddgi::helpers::{DDGI_REC_ENABLED, ddgi_brick_state, ddgi_cell_in_window, ddgi_cell_state_sized, ddgi_lod_cell_size, ddgi_lod_count, ddgi_lod_slot_base, ddgi_meta_pack, ddgi_rec_off, ddgi_rec_pack, ddgi_slot_own, ddgi_slot_world_cell};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_push_out_of_objects};
 import package::trace::{make_grid};
 
@@ -21,7 +21,8 @@ fn ddgi_block8_empty(g: Grid, o: vec3<i32>) -> bool {
   return true;
 }
 
-// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ → 1³ 逐级找靠中心的空叶；返回 (p, found)。
+// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ 逐级找靠中心的空叶；返回 (p, found)。
+// 全部找不到（格内自由空间全是 <4 体素宽的窄缝）→ **返回 found = false，不放探针**。
 /// 规则**严格对齐 Douglas #23 字幕**：
 ///   · "one of the **largest** subnodes is selected" —— 从粗到细，**第一个**含"完全空子块"的
 ///     层级胜出；
@@ -31,7 +32,8 @@ fn ddgi_block8_empty(g: Grid, o: vec3<i32>) -> bool {
 ///   · "for a cell that was totally full of voxels, no probe would be generated"（调用方已挡）。
 /// 惰性求值：只有上一级完全找不到空块时才展开下一级；16³/8³/4³ 都只在**混合 16³** 子块内展开
 /// （全空 16³ 已在上一级命中、全满 16³ 必然没有空子块），避免整格扫描的指数开销。
-/// **没有净距门槛**（曾加过 4 体素硬门槛，见上方注释）；层级下探到 1³ ⇒ 格内有空体素必有探针。
+/// **没有净距门槛**（曾加过 4 体素硬门槛，见上方注释）；层级只下探到 4³ ⇒ 格内自由空间若
+/// 全是 <4 体素宽的窄缝，本格**没有探针**（见函数尾部的说明）。
 fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u32) -> vec4<f32> {
   let n16 = max(cs / 16, 1);
   // ---- Step 2：粗级 LOD **优先继承细级探针的位置** ----
@@ -169,26 +171,21 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     }
   }
   if (f4) { return vec4<f32>(b4_p, 1.0); }
-  // 轮 4（1³）：兜底档，mixed 16³ 内逐 1³ 找最近空体素（ddgi_leaf16）。这是"格内只要还有空
-  // 体素就一定放得出探针"这条不变式的**保底**。
-  var b1_d2 = 1e30;
-  var b1_p = vec3<f32>(0.0);
-  var f1 = false;
-  for (var k = 0; k < n16; k = k + 1) {
-    for (var j = 0; j < n16; j = j + 1) {
-      for (var i = 0; i < n16; i = i + 1) {
-        let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        if (ddgi_cell_state_sized(g, sub16, 16) == 2u) {
-          let r = ddgi_leaf16(g, sub16, center);
-          if (r.w > 0.5) {
-            let d2 = dot(r.xyz - center, r.xyz - center);
-            if (d2 < b1_d2) { b1_d2 = d2; b1_p = r.xyz; f1 = true; }
-          }
-        }
-      }
-    }
-  }
-  return vec4<f32>(b1_p, select(0.0, 1.0, f1));
+  // ---- 到这里就**不放探针**（原「轮 4：1³ 保底档」已删）----
+  // 旧版在没有任何 ≥4³ 全空子块时，还会逐 1³ 体素找一个空位（ddgi_leaf16）把探针塞进去，
+  // 理由是"格内只要还有空体素，就一定放得出探针"。那个不变式在这里**主动放弃**：
+  // 能满足"连 4³ 空区都没有"的 cell，其空腔必然是 **1~3 体素宽的窄缝/接缝**（两个物体之间的
+  // 缝、薄板内部的空腔）。这种缝里进不了光 ⇒ 塞进去的探针辐照度恒 ≈0 —— 它不会变暗变亮，
+  // 就是**恒 0**（射线全打在贴着的墙上，自反馈回路没有天空那道非零种子，见 ddgi_cast 的
+  // DDGI_CAST_FLOOR 注释）。而它是"本点同侧"的合法角 ⇒ 缝两侧的像素会稳定地采到它
+  // ⇒ 表现就是**纯黑窄带**（Probe 档：r4 同侧场兜底=青绿 / 粗级兜底=浅绿，两条路径都只能
+  // 把这份 ≈0 传下去）。
+  // 不放探针之后：该 cell 的 `ENABLED=0`，采样侧按"无探针"剔除（Probe 橙），像素改用
+  // **周围 cell 的探针**——它们落在开阔空间里，值是对的 ⇒ 窄缝表面与周边同亮度（1 体素宽的
+  // 缝本来就只是建模接缝，其表面视觉上就等同于周边表面）。
+  // 【覆盖性】三线性 stencil 跨 8 个 cell，个别 cell 无针不会留洞；只有"整片 8 个 cell 都
+  // 没有 4³ 空区"才会没数据 —— 那意味着该处被实体包住，本来也不可见（不可见处由常量天光兜底）。
+  return vec4<f32>(vec3<f32>(0.0), 0.0);
 }
 
 /// 单级烘焙：lod 由**派发该 pass 时确定**（见下面 4 个入口）。idx = 该级内的槽位下标。
