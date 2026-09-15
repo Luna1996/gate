@@ -271,7 +271,14 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     col = col + alb * palette_emissive(best.palette_base, best.pal) * DDGI_EMIT_GAIN;
     if (ddgi_u.params.y > 0.5) {
       if (ddgi_u.params.y < 1.5) {
-        col = alb * sky * DDGI_SKY_AMBIENT * 0.15 + alb * gi * 8.0;
+        // GI 档 = **纯 gi**（×8 放大便于观察），刻意**不加**任何常量天光项。
+        // 【为什么去掉旧的 `+ sky·DDGI_SKY_AMBIENT·0.15`】本档的唯一用途是把"间接光项自身的
+        // 漏光"从 `sun` 与 `amb`（天光常量 × 逐体素 AO）里**二分**出来。掺任何常量项都会把
+        // "细缝里那点本来就该有的微光"和"漏光"混在一起（旧版也与 consts.wesl 里"那一档只
+        // 显示 gi，吃掉 sun/amb"的说明不符）。`gi = 0` 处现在是纯黑 —— 这正是判据：
+        // **漏光若在本档里出现 ⇒ 它在 gi（探针场）侧；若本档里干净、只有 Normal 档漏
+        //   ⇒ 它是 amb（天光常量 × 16³ AO）或 sun 侧。**
+        col = alb * gi * 8.0;
       } else if (ddgi_u.params.y < 2.5) {
         // wsum 档 = 采样置信度的**灰度直方图**（1:1，不吃 albedo）。
         // wsum = Σ wtri·wn·wd 是 trilinear 权重和 ∈ [0,1]（开阔表面 ~0.3-0.6）→ 直接当灰度。
@@ -291,16 +298,19 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         col = select(col, vec3<f32>(0.9, 0.2, 0.9), d > 3.5);    // 品红：LOD3
       } else {
         // Probe：先看「数据有没有取到」，再看 8 个角是被哪道闸门剔掉的。
-        //   青绿 = 所有路径都没给出值，改用**同侧探针场插值**（忽略可见性）兜住 → 见
-        //          ddgi_sample 的 r4。这类点就是"犄角旮旯里的品红纯黑点"。
+        //   青绿 = 本级壳 r1/r2/r3' 全失败，改用**同侧探针场插值**兜住 → 见
+        //          ddgi_sample 的 r4。这类点就是"犄角旯里的品红纯黑点"。
+        //          场的分子只收「同侧 ∧ **通过精确线段求交**」的角（实测补上的一条：早先只要求
+        //          "同侧 + 有数据"，于是细缝/薄板两侧被墙挡住的角也进分子 → 漏光，见那里注释）。
         //   紫   = 壳内 r1/r2 都失败后，**背向闸门放开**的末级兜底 r3' 成功 → GI 有效
         //          （线段求交确认"探针确实看得见本点"，见 ddgi_sample 的 r3' 说明）。
         //          这些像素在 r3' 之前就是"Probe 品红 + 纯黑点"。
         //   亮黄 = 壳内 8 角被 wn 全剔（薄几何），用**同级**放宽 wn 兜住 → GI 有效（见
         //          ddgi_sample 壳内分支注释）；**不退到粗级**，所以不会跨墙漏光
-        //   浅绿 = 壳没给出数据，但**更粗一级 LOD 兜住了** → GI 有效，只是精度粗
-        //          （相机滚动时新进入窗口的那条带属于这一类，不是异常）；
-        //          但粗级探针在远处、方向掠射时深度图判不出遮挡 → 封闭空间里它是漏光来源
+        //   【已删】浅绿(`#c4f9a0`, fb=2) = 旧「退粗到更粗一级 LOD 兜住」—— 该路径整体删除：
+        //          它不是 Douglas/论文的算法（Devlog #23 的采样只有三线性权重 + 视线可见性 +
+        //          前后 wn 三个因子），且是"跟着粗级 cell 走的亮条纹"那一类漏光的唯一来源。
+        //          见 ddgi/sample.wesl 里那段【已删】说明。
         //   绿   = 权重和 > 0 且辐照度非 0 → 本壳直接正常
         //   白   = 权重和 > 0，但辐照度 ≈ 0 → 过闸的探针图集是空的（写入/寻址问题）
         //   青   = 无数据闸门：探针没进本帧 worklist（near=false）、年龄太小，或该方向纹素
@@ -308,7 +318,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         //   橙   = ENABLED 闸门（该 cell 全满 → bake 没放探针）
         //   品红 = 法线背向闸门（wn <= 0）
         //   红   = depth 遮挡闸门（wd <= 0）
-        //   灰   = 角越界（clamp 路径不会出现）
+        //   灰   = 该像素没跑过任何 sample_lod（级联盒外，fb=1 ⇒ 着色侧给满额 amb_far），
+        //          或 8 角全被窗口/ENABLED 剔掉（级联盒刚进来的那一圈）
         // 旧版在这里对 dom<0.5 直接涂蓝，把这份直方图整个短路掉了。
         if (ddgi_dbg_fb > 4.5) {
           col = vec3<f32>(0.0, 0.6, 0.55);
@@ -316,8 +327,6 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           col = vec3<f32>(0.65, 0.35, 0.95);
         } else if (ddgi_dbg_fb > 2.5) {
           col = vec3<f32>(0.98, 0.98, 0.35);
-        } else if (ddgi_dbg_fb > 1.5) {
-          col = vec3<f32>(0.55, 0.95, 0.35);
         } else if (ddgi_dbg_wsum >= 1e-4) {
           col = select(
             vec3<f32>(0.15, 0.85, 0.25),
