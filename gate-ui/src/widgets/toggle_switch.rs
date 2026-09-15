@@ -1,4 +1,4 @@
-﻿//! toggle_switch：滑动开关（docs/ui-dark-theme.md §5.3 选中态语义）。
+//! toggle_switch：滑动开关（docs/ui-dark-theme.md §5.3 选中态语义）。
 //!
 //! 复用 `Checked` presence 语义（与 checkbox 一致）：有 `Checked` = 开，无 = 关。
 //!
@@ -78,11 +78,7 @@ pub fn toggle_switch(
   let track_border = color_of(&c.border);
   let knob_off = color_of(&c.text_muted);
   let (track_bg, track_border, knob_off) = if config.disabled {
-    (
-      dim_color(track_bg),
-      dim_color(track_border),
-      dim_color(knob_off),
-    )
+    (dim_color(track_bg), dim_color(track_border), dim_color(knob_off))
   } else {
     (track_bg, track_border, knob_off)
   };
@@ -91,11 +87,7 @@ pub fn toggle_switch(
     ToggleSwitch,
     Interaction::default(),
     InteractionPrev::default(),
-    Node {
-      align_items: AlignItems::Center,
-      column_gap: px(m.spacing.sm),
-      ..default()
-    },
+    Node { align_items: AlignItems::Center, column_gap: px(m.spacing.sm), ..default() },
     FocusPolicy::Block,
   ));
   ec.with_children(|root| {
@@ -128,11 +120,7 @@ pub fn toggle_switch(
       });
     if let Some(t) = config.text {
       let text_color = color_of(&c.text_body);
-      let text_color = if config.disabled {
-        dim_color(text_color)
-      } else {
-        text_color
-      };
+      let text_color = if config.disabled { dim_color(text_color) } else { text_color };
       spawn_label(ctx, root, t, m.font_size.md, text_color);
     }
   });
@@ -154,11 +142,7 @@ type ToggleQuery = (
   &'static Children,
   Has<UiDisabled>,
 );
-type TrackData = (
-  &'static mut BackgroundColor,
-  &'static mut BorderColor,
-  &'static Children,
-);
+type TrackData = (&'static mut BackgroundColor, &'static mut BorderColor, &'static Children);
 type TrackFilter = (With<ToggleTrack>, Without<ToggleSwitch>);
 type KnobData = (&'static mut Node, &'static mut BackgroundColor);
 type KnobFilter = (With<ToggleKnob>, Without<ToggleTrack>);
@@ -192,10 +176,7 @@ pub fn toggle_switch_state_system(
         } else {
           commands.entity(e).insert(Checked);
         }
-        commands.trigger(ToggleSwitchToggled {
-          entity: e,
-          checked: !checked,
-        });
+        commands.trigger(ToggleSwitchToggled { entity: e, checked: !checked });
       }
     }
     prev.0 = *inter;
@@ -211,11 +192,7 @@ pub fn toggle_switch_state_system(
     let target_left = if checked { left_on } else { px(0.0) };
     let target_knob = if checked { knob_on } else { knob_off };
     let (target_bg, target_border, target_knob) = if disabled {
-      (
-        dim_color(target_bg),
-        dim_color(target_border),
-        dim_color(target_knob),
-      )
+      (dim_color(target_bg), dim_color(target_border), dim_color(target_knob))
     } else {
       (target_bg, target_border, target_knob)
     };

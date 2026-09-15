@@ -58,9 +58,7 @@ impl Default for Palette {
 
 impl Palette {
   pub fn new() -> Self {
-    Self {
-      entries: Box::new([PaletteEntry::default(); 256]),
-    }
+    Self { entries: Box::new([PaletteEntry::default(); 256]) }
   }
 
   pub fn get(&self, idx: u8) -> &PaletteEntry {

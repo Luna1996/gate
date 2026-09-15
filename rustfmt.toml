@@ -1,1 +1,19 @@
+# Google 风格 Rust 格式化配置。
+# Google 官方风格指南不含 Rust（https://google.github.io/styleguide/ 未列 Rust）；
+# 本文件对齐 Google 系主力 Rust 代码库 Fuchsia 的配置：
+# https://fuchsia.googlesource.com/fuchsia/+/refs/heads/main/rustfmt.toml
+edition = "2024"
+
+# 行宽默认 100。`use_small_heuristics = "Default"` 的启发式会把行切得过碎
+# （rustfmt#3119 / #3120），Fuchsia 取 "Max"。
+use_small_heuristics = "Max"
+
+# 统一 LF 行尾。
+newline_style = "Unix"
+
+# import 粒度：Fuchsia 取 "Module"（同一模块合并为一条 use）。该选项 nightly-only，
+# stable rustfmt 会忽略并输出告警，故默认不启用；改用 nightly 时取消下一行注释即可。
+# imports_granularity = "Module"
+
+# 本仓库既有缩进为 2 空格；Fuchsia 用默认 4。删掉本行即回到 4 空格（会全仓重排缩进）。
 tab_spaces = 2

@@ -233,21 +233,12 @@ pub fn march_mask_lut_words() -> Vec<u32> {
   for oct in 0..MARCH_MASK_OCTANTS {
     let pos = [oct & 1 != 0, (oct >> 1) & 1 != 0, (oct >> 2) & 1 != 0];
     for entry in 0..MARCH_MASK_ENTRIES {
-      let e = [
-        (entry & 3) as i32,
-        ((entry >> 2) & 3) as i32,
-        ((entry >> 4) & 3) as i32,
-      ];
+      let e = [(entry & 3) as i32, ((entry >> 2) & 3) as i32, ((entry >> 4) & 3) as i32];
       let mut mask = 0u64;
       for p in 0..MARCH_MASK_ENTRIES {
         let q = [(p & 3) as i32, ((p >> 2) & 3) as i32, ((p >> 4) & 3) as i32];
-        let ok = [0, 1, 2].iter().all(|&i| {
-          if pos[i] {
-            q[i] >= e[i] - 1
-          } else {
-            q[i] <= e[i] + 1
-          }
-        });
+        let ok =
+          [0, 1, 2].iter().all(|&i| if pos[i] { q[i] >= e[i] - 1 } else { q[i] <= e[i] + 1 });
         if ok {
           mask |= 1u64 << p;
         }
@@ -311,11 +302,7 @@ mod tests {
     // 与 WGSL Globals 字节兼容：19 个 u32 = 76B，
     // encase 写 UniformBuffer 时整体 round 到 16B 对齐（80B）
     let _ = BrickMapGlobals::default();
-    assert_eq!(
-      std::mem::size_of::<BrickMapGlobals>(),
-      19 * 4,
-      "19 个 u32 字段 = 76B"
-    );
+    assert_eq!(std::mem::size_of::<BrickMapGlobals>(), 19 * 4, "19 个 u32 字段 = 76B");
   }
 
   #[test]
@@ -364,10 +351,7 @@ mod tests {
     e.flags = PaletteFlags(7);
     assert_eq!(
       pack_palette_entry(&e),
-      [
-        1 | (2 << 8) | (3 << 16) | (4 << 24),
-        5 | (6 << 8) | (7 << 16)
-      ]
+      [1 | (2 << 8) | (3 << 16) | (4 << 24), 5 | (6 << 8) | (7 << 16)]
     );
   }
 

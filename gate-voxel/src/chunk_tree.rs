@@ -52,11 +52,7 @@ pub enum BrickState {
 /// palette → brick 三态（palette 0 = AIR）
 #[inline]
 fn brick_state_of(palette: u8) -> BrickState {
-  if palette == 0 {
-    BrickState::Air
-  } else {
-    BrickState::Solid(palette)
-  }
+  if palette == 0 { BrickState::Air } else { BrickState::Solid(palette) }
 }
 
 /// Douglas Brick Tree 1:1（分裂树，4³=64 分裂因子，u64 mask）
@@ -73,18 +69,12 @@ impl ChunkTree {
 
   /// 空 chunk：root uniform AIR（palette=0）
   pub fn empty() -> Self {
-    Self {
-      nodes: Vec::new(),
-      root_palette: 0,
-    }
+    Self { nodes: Vec::new(), root_palette: 0 }
   }
 
   /// 全 uniform palette chunk
   pub fn uniform(palette: u8) -> Self {
-    Self {
-      nodes: Vec::new(),
-      root_palette: palette,
-    }
+    Self { nodes: Vec::new(), root_palette: palette }
   }
 
   // =========================================================================
@@ -187,11 +177,7 @@ impl ChunkTree {
       None => self.root_palette,
       Some(i) => match &self.nodes[i] {
         Node::Uniform(p) => *p,
-        Node::Split {
-          mask,
-          palette,
-          children,
-        } => {
+        Node::Split { mask, palette, children } => {
           let mut counts = [0u16; 256];
           for i in 0u32..64 {
             let c = if *mask & (1u64 << i) != 0 {
@@ -204,12 +190,7 @@ impl ChunkTree {
               counts[c as usize] += 1;
             }
           }
-          counts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, c)| **c)
-            .map(|(i, _)| i as u8)
-            .unwrap_or(0)
+          counts.iter().enumerate().max_by_key(|(_, c)| **c).map(|(i, _)| i as u8).unwrap_or(0)
         }
       },
     }
@@ -244,11 +225,7 @@ impl ChunkTree {
   /// 查询指定体素（1³，level 4）的 palette；未设置返回 None
   pub fn get_voxel(&self, local_x: i32, local_y: i32, local_z: i32) -> Option<u8> {
     if self.nodes.is_empty() {
-      return if self.root_palette == 0 {
-        None
-      } else {
-        Some(self.root_palette)
-      };
+      return if self.root_palette == 0 { None } else { Some(self.root_palette) };
     }
     self.get_at(local_x, local_y, local_z, Some(0), CHUNK_SIZE)
   }
@@ -297,11 +274,7 @@ impl ChunkTree {
   pub fn get_uniform(&self, local_x: i32, local_y: i32, local_z: i32, level: u8) -> Option<u8> {
     let query_extent = LEVEL_EXTENT[level as usize];
     if self.nodes.is_empty() {
-      return if self.root_palette == 0 {
-        None
-      } else {
-        Some(self.root_palette)
-      };
+      return if self.root_palette == 0 { None } else { Some(self.root_palette) };
     }
     self.get_uniform_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
   }
@@ -452,15 +425,15 @@ impl ChunkTree {
           Some(palette)
         };
         {
-            let c = c?;
-            match first_color {
-          None => first_color = Some(c),
-          Some(f) if f != c => {
-            all_same = false;
-            break;
+          let c = c?;
+          match first_color {
+            None => first_color = Some(c),
+            Some(f) if f != c => {
+              all_same = false;
+              break;
+            }
+            _ => {}
           }
-          _ => {}
-        }
         }
       }
       return if all_same { first_color } else { None };
@@ -505,12 +478,7 @@ impl ChunkTree {
           Some(*p)
         }
       }
-      Node::Split {
-        mask,
-        children,
-        palette,
-        ..
-      } => {
+      Node::Split { mask, children, palette, .. } => {
         if *mask == 0 {
           // lazy Split：整节点 uniform（防御 trailing_zeros(0)=64 越界）
           return if *palette == 0 { None } else { Some(*palette) };
@@ -544,10 +512,8 @@ impl ChunkTree {
     // 只读预检查：非零 palette 且 brick 已 uniform 同色 → noop
     //（palette=0 时 get_uniform 的 None 语义与「非 uniform」歧义，跳过预检查）
     if palette != 0 {
-      let level = LEVEL_EXTENT
-        .iter()
-        .position(|&e| e == extent)
-        .expect("LEVEL_EXTENT.contains 已保证") as u8;
+      let level =
+        LEVEL_EXTENT.iter().position(|&e| e == extent).expect("LEVEL_EXTENT.contains 已保证") as u8;
       if self.get_uniform(local[0], local[1], local[2], level) == Some(palette) {
         return false;
       }
@@ -590,11 +556,7 @@ impl ChunkTree {
       // root uniform（nodes 为空）→ 创建 split root（lazy：mask=0，紧凑表为空）
       let cur = self.root_palette;
       let split_idx = self.nodes.len();
-      self.nodes.push(Node::Split {
-        mask: 0,
-        palette: cur,
-        children: Vec::new(),
-      });
+      self.nodes.push(Node::Split { mask: 0, palette: cur, children: Vec::new() });
       node_idx = Some(split_idx);
     }
 
@@ -607,11 +569,7 @@ impl ChunkTree {
     // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
     // 首次编辑才创建节点 + 置 bit + 紧凑表插入
     let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
-      Node::Split {
-        mask,
-        palette,
-        children,
-      } => {
+      Node::Split { mask, palette, children } => {
         let bit = 1u64 << child_i;
         let ci = if (mask & bit) != 0 {
           Some(children[child_slot(*mask, child_i) as usize] as usize)
@@ -635,11 +593,7 @@ impl ChunkTree {
         new as usize
       }
     };
-    let next = [
-      x[0] - ix * child_extent,
-      x[1] - iy * child_extent,
-      x[2] - iz * child_extent,
-    ];
+    let next = [x[0] - ix * child_extent, x[1] - iy * child_extent, x[2] - iz * child_extent];
     self.fill_recursive(next, extent, palette, Some(child_idx), child_extent);
     // 回溯：try merge
     self.try_merge(p);
@@ -700,11 +654,7 @@ impl ChunkTree {
     if node_idx.is_none() {
       // 创建 split root（lazy：mask=0，紧凑表为空，子节点按需创建）
       let split_idx = self.nodes.len();
-      self.nodes.push(Node::Split {
-        mask: 0,
-        palette: cur_palette,
-        children: Vec::new(),
-      });
+      self.nodes.push(Node::Split { mask: 0, palette: cur_palette, children: Vec::new() });
       node_idx = Some(split_idx);
     }
 
@@ -721,11 +671,7 @@ impl ChunkTree {
     // lazy split：mask bit=0 → 子块 uniform（= 本节点 palette），
     // 首次编辑才创建节点 + 置 bit + 紧凑表插入
     let (child_idx, parent_pal, cur_mask) = match &self.nodes[p] {
-      Node::Split {
-        mask,
-        palette,
-        children,
-      } => {
+      Node::Split { mask, palette, children } => {
         let bit = 1u64 << child_i;
         let ci = if (mask & bit) != 0 {
           Some(children[child_slot(*mask, child_i) as usize] as usize)
@@ -749,14 +695,7 @@ impl ChunkTree {
         new as usize
       }
     };
-    self.set_recursive(
-      next_x,
-      next_y,
-      next_z,
-      palette,
-      Some(child_idx),
-      child_extent,
-    );
+    self.set_recursive(next_x, next_y, next_z, palette, Some(child_idx), child_extent);
 
     // 回溯：try merge
     self.try_merge(p);
@@ -767,11 +706,7 @@ impl ChunkTree {
   /// mask bit=0 → uniform leaf（颜色 = 父节点 palette），不占内存；只有真正被编辑的
   /// 子块才置 bit + 建节点。
   fn split_uniform(&mut self, idx: usize, old_palette: u8) {
-    self.nodes[idx] = Node::Split {
-      mask: 0,
-      palette: old_palette,
-      children: Vec::new(),
-    };
+    self.nodes[idx] = Node::Split { mask: 0, palette: old_palette, children: Vec::new() };
   }
 
   fn try_merge(&mut self, idx: usize) {
@@ -861,19 +796,11 @@ impl ChunkTree {
       let node = std::mem::replace(&mut self.nodes[old], Node::Uniform(0));
       match node {
         Node::Uniform(p) => new_nodes.push(Node::Uniform(p)),
-        Node::Split {
-          mask,
-          palette,
-          children,
-        } => {
+        Node::Split { mask, palette, children } => {
           for &c in &children {
             stack.push(c as usize);
           }
-          new_nodes.push(Node::Split {
-            mask,
-            palette,
-            children,
-          });
+          new_nodes.push(Node::Split { mask, palette, children });
         }
       }
     }
@@ -893,11 +820,7 @@ impl ChunkTree {
   // =========================================================================
 
   pub fn node_count(&self) -> usize {
-    self
-      .nodes
-      .iter()
-      .filter(|n| matches!(n, Node::Split { .. }))
-      .count()
+    self.nodes.iter().filter(|n| matches!(n, Node::Split { .. })).count()
   }
 
   pub fn leaf_count(&self) -> usize {

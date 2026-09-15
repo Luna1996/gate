@@ -60,22 +60,14 @@ pub struct FlyCamera {
 
 impl Default for FlyCamera {
   fn default() -> Self {
-    Self {
-      pos: Vec3::new(700.0, 560.0, 700.0),
-      speed: FLY_SPEED_DEFAULT,
-      fast: false,
-    }
+    Self { pos: Vec3::new(700.0, 560.0, 700.0), speed: FLY_SPEED_DEFAULT, fast: false }
   }
 }
 
 impl FlyCamera {
   /// 本帧实际飞行速度（含高速档倍率）
   pub fn effective_speed(&self) -> f32 {
-    if self.fast {
-      self.speed * FLY_SPEED_FAST_MUL
-    } else {
-      self.speed
-    }
+    if self.fast { self.speed * FLY_SPEED_FAST_MUL } else { self.speed }
   }
 }
 
@@ -279,10 +271,7 @@ pub(crate) fn build_camera_config(
 
 /// 主窗口物理高度（pan_per_px 1:1 基准；无窗口时回退 VIEW_SIZE.y）
 fn window_height(windows: &Query<&Window>) -> f32 {
-  windows
-    .single()
-    .map(|w| w.physical_height().max(1) as f32)
-    .unwrap_or(VIEW_SIZE.y as f32)
+  windows.single().map(|w| w.physical_height().max(1) as f32).unwrap_or(VIEW_SIZE.y as f32)
 }
 
 /// 屏幕光标 → 世界射线 `(origin, dir)`（voxel 空间；origin = 相机眼位）。
@@ -344,16 +333,10 @@ pub(crate) fn left_click_pick_recenter(
   let t_max = CAM_FAR - CAM_NEAR;
   // CPU picking：点击时从 VoxelScene.volumes 同步 build_full 各 volume 的 brickmap 再 trace。
   // 不做跨帧缓存 —— 编辑会改写 chunk，缓存会与渲染画面不一致（假命中）。
-  let per_vol_bufs: Vec<BrickMapBuffers> = scene
-    .volumes
-    .list
-    .iter()
-    .map(|v| BrickMapBuilder::build_full(v).buffers().clone())
-    .collect();
-  let vols_with_tr: Vec<(&BrickMapBuffers, VolumeTransform)> = per_vol_bufs
-    .iter()
-    .zip(scene.volumes.list.iter().map(|v| v.transform))
-    .collect();
+  let per_vol_bufs: Vec<BrickMapBuffers> =
+    scene.volumes.list.iter().map(|v| BrickMapBuilder::build_full(v).buffers().clone()).collect();
+  let vols_with_tr: Vec<(&BrickMapBuffers, VolumeTransform)> =
+    per_vol_bufs.iter().zip(scene.volumes.list.iter().map(|v| v.transform)).collect();
   // trace_volumes：主世界 + 物体统一求最近
   if let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, origin, dir, t_max) {
     let mut p = origin + dir * hit.t;
@@ -382,18 +365,10 @@ mod camera_math_tests {
   #[test]
   fn look_forward_is_view_direction() {
     for (yaw, pitch) in [(0.0, 0.0), (0.7, 0.3), (-1.2, -0.9), (3.0, 1.5), (0.0, -1.55)] {
-      let o = OrbitCamera {
-        target: Vec3::ZERO,
-        distance: 100.0,
-        yaw,
-        pitch,
-      };
+      let o = OrbitCamera { target: Vec3::ZERO, distance: 100.0, yaw, pitch };
       let expect = (-o.eye()).normalize();
       let got = look_forward(yaw, pitch);
-      assert!(
-        (got - expect).length() < 1e-6,
-        "yaw={yaw} pitch={pitch}: {got:?} vs {expect:?}"
-      );
+      assert!((got - expect).length() < 1e-6, "yaw={yaw} pitch={pitch}: {got:?} vs {expect:?}");
     }
   }
 
@@ -410,10 +385,7 @@ mod camera_math_tests {
     let eye = o.eye();
     // Fly → Orbit：把 target 放到「沿当前朝向 distance 处」→ 重建出的 eye 必须回到原处
     let target2 = eye + look_forward(o.yaw, o.pitch) * o.distance;
-    let o2 = OrbitCamera {
-      target: target2,
-      ..o
-    };
+    let o2 = OrbitCamera { target: target2, ..o };
     assert!((o2.eye() - eye).length() < 1e-3, "eye={eye:?} → {:?}", o2.eye());
   }
 }
@@ -461,55 +433,18 @@ mod aabb_zoom_tests {
     use gate_voxel::{draw_text, fill_box, fill_bricks, fill_sphere};
     fill_box(grid, glam::IVec3::ZERO, glam::IVec3::new(512, 16, 512), 1);
     for i in (0..512).step_by(128) {
-      fill_box(
-        grid,
-        glam::IVec3::new(i, 16, 0),
-        glam::IVec3::new(4, 4, 512),
-        6,
-      );
-      fill_box(
-        grid,
-        glam::IVec3::new(0, 16, i),
-        glam::IVec3::new(512, 4, 4),
-        6,
-      );
+      fill_box(grid, glam::IVec3::new(i, 16, 0), glam::IVec3::new(4, 4, 512), 6);
+      fill_box(grid, glam::IVec3::new(0, 16, i), glam::IVec3::new(512, 4, 4), 6);
     }
-    fill_bricks(
-      grid,
-      glam::IVec3::new(128, 16, 128),
-      glam::IVec3::new(128, 256, 128),
-      16,
-      2,
-    );
+    fill_bricks(grid, glam::IVec3::new(128, 16, 128), glam::IVec3::new(128, 256, 128), 16, 2);
     fill_sphere(grid, glam::IVec3::new(192, 320, 192), 64, 5);
-    fill_box(
-      grid,
-      glam::IVec3::new(256, 192, 144),
-      glam::IVec3::new(96, 4, 32),
-      2,
-    );
-    fill_bricks(
-      grid,
-      glam::IVec3::new(352, 16, 128),
-      glam::IVec3::new(64, 192, 64),
-      16,
-      6,
-    );
+    fill_box(grid, glam::IVec3::new(256, 192, 144), glam::IVec3::new(96, 4, 32), 2);
+    fill_bricks(grid, glam::IVec3::new(352, 16, 128), glam::IVec3::new(64, 192, 64), 16, 6);
     fill_sphere(grid, glam::IVec3::new(384, 80, 320), 48, 2);
     fill_sphere(grid, glam::IVec3::new(192, 48, 352), 24, 4);
     draw_text(grid, glam::IVec3::new(64, 16, 448), "GATE", 5);
-    fill_box(
-      grid,
-      glam::IVec3::new(656, 64, 64),
-      glam::IVec3::new(32, 32, 32),
-      5,
-    );
-    fill_box(
-      grid,
-      glam::IVec3::new(1264, 240, 240),
-      glam::IVec3::new(32, 32, 32),
-      4,
-    );
+    fill_box(grid, glam::IVec3::new(656, 64, 64), glam::IVec3::new(32, 32, 32), 5);
+    fill_box(grid, glam::IVec3::new(1264, 240, 240), glam::IVec3::new(32, 32, 32), 4);
   }
 
   #[test]

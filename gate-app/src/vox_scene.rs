@@ -165,14 +165,8 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
     let mat = &scene.materials[i];
     let mut e = PaletteEntry::default();
     e.color = [rgba.r, rgba.g, rgba.b];
-    e.roughness = mat
-      .rough
-      .map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8)
-      .unwrap_or(200);
-    e.emissive = mat
-      .emit
-      .map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8)
-      .unwrap_or(0);
+    e.roughness = mat.rough.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(200);
+    e.emissive = mat.emit.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(0);
     pal.set(i as u8, e);
     painted += 1;
   }
@@ -253,12 +247,7 @@ fn bucket_instance(
   models: &[vox_rs::Model],
   offset: IVec3,
 ) -> HashMap<ChunkCoord, Vec<u32>> {
-  bucket_model(
-    &models[inst.model_index],
-    &inst.transform,
-    instance_flip(&inst.transform),
-    offset,
-  )
+  bucket_model(&models[inst.model_index], &inst.transform, instance_flip(&inst.transform), offset)
 }
 
 /// 单模型体素分桶核心（测试复用）：`flip` 为 vox 轴系翻转补偿（见 `instance_flip`），
@@ -282,10 +271,10 @@ fn bucket_model(
         if c == 0 {
           continue;
         }
-        let world = IVec3::from(xform(
-          t, m.size_x, m.size_y, m.size_z, x as u32, y as u32, z as u32,
-        )) + flip_gate
-          + offset;
+        let world =
+          IVec3::from(xform(t, m.size_x, m.size_y, m.size_z, x as u32, y as u32, z as u32))
+            + flip_gate
+            + offset;
         let cc = ChunkCoord(world.div_euclid(IVec3::splat(CHUNK_SIZE)));
         if cur_key != Some(cc) {
           if let Some(k) = cur_key.take() {
@@ -324,10 +313,7 @@ mod tests {
     );
     assert!(info.instances_used > 0);
     assert!(info.voxels_written > 0);
-    assert!(
-      info.voxels_dropped < info.voxels_written,
-      "重写占比过大，疑似实例重复"
-    );
+    assert!(info.voxels_dropped < info.voxels_written, "重写占比过大，疑似实例重复");
     assert!(info.aabb_max.cmpgt(info.aabb_min).all(), "AABB 非退化");
     // 有实体 chunk 落盘（中心点可能是空气，不做点查断言）
     assert!(grid.chunk_count() > 0);
@@ -365,26 +351,16 @@ mod tests {
   #[test]
   fn xform_pivot_convention() {
     // identity 旋转 + t=(100,200,50)，4³ 模型 pivot=(2,2,2)
-    let t = vox_rs::Transform {
-      m30: 100.0,
-      m31: 200.0,
-      m32: 50.0,
-      ..vox_rs::Transform::identity()
-    };
+    let t =
+      vox_rs::Transform { m30: 100.0, m31: 200.0, m32: 50.0, ..vox_rs::Transform::identity() };
     // pivot 体素 → 平移 t（gate 轴交换 + Z 取反后 y/z 互换且 z 取负）
     assert_eq!(xform(&t, 4, 4, 4, 2, 2, 2), (100, 50, -200));
     // 角体素 (0,0,0) → t − (2,2,2) vox → gate (98, 48, -198)
     assert_eq!(xform(&t, 4, 4, 4, 0, 0, 0), (98, 48, -198));
 
     // 奇数尺寸：pivot = floor(size/2)，ogt 文档的 3×4×1 例子 pivot=(1,2,0)
-    assert_eq!(
-      xform(&vox_rs::Transform::identity(), 3, 4, 1, 1, 2, 0),
-      (0, 0, 0)
-    );
-    assert_eq!(
-      xform(&vox_rs::Transform::identity(), 3, 4, 1, 0, 0, 0),
-      (-1, 0, 2)
-    );
+    assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 1, 2, 0), (0, 0, 0));
+    assert_eq!(xform(&vox_rs::Transform::identity(), 3, 4, 1, 0, 0, 0), (-1, 0, 2));
 
     // 绕 vox Z 轴 90° 旋转（packed byte 33：row0=+Y, row1=−X, row2=+Z），
     // vox 空间 (wx,wy) = (ly, −lx)
@@ -431,11 +407,7 @@ mod tests {
       );
       assert_eq!(
         (gx, gy, gz),
-        (
-          inst.transform.m30 as i32,
-          inst.transform.m32 as i32,
-          -(inst.transform.m31 as i32),
-        ),
+        (inst.transform.m30 as i32, inst.transform.m32 as i32, -(inst.transform.m31 as i32),),
         "instance {} pivot 未落到 nTRN 平移 t（size={}×{}×{}）",
         checked,
         m.size_x,
@@ -464,22 +436,13 @@ mod tests {
       ..vox_rs::Transform::identity()
     };
     assert_eq!(instance_flip(&t), IVec3::new(0, -1, 0));
-    let model = vox_rs::Model {
-      size_x: 2,
-      size_y: 1,
-      size_z: 1,
-      voxels: vec![1, 2],
-    };
+    let model = vox_rs::Model { size_x: 2, size_y: 1, size_z: 1, voxels: vec![1, 2] };
     let cells = |buf: &[u32]| -> Vec<(IVec3, u8)> {
       buf
         .iter()
         .map(|&p| {
           (
-            IVec3::new(
-              (p & 0xFF) as i32,
-              ((p >> 8) & 0xFF) as i32,
-              ((p >> 16) & 0xFF) as i32,
-            ),
+            IVec3::new((p & 0xFF) as i32, ((p >> 8) & 0xFF) as i32, ((p >> 16) & 0xFF) as i32),
             (p >> 24) as u8,
           )
         })
@@ -525,11 +488,7 @@ mod tests {
           if inst.hidden {
             return None;
           }
-          let flip = if use_flip {
-            instance_flip(&inst.transform)
-          } else {
-            IVec3::ZERO
-          };
+          let flip = if use_flip { instance_flip(&inst.transform) } else { IVec3::ZERO };
           let t = &inst.transform;
           let identity_rot = t.m00 == 1.0
             && t.m11 == 1.0
@@ -540,13 +499,7 @@ mod tests {
             && t.m12 == 0.0
             && t.m20 == 0.0
             && t.m21 == 0.0;
-          Some(bucket_model(
-            &scene.models[inst.model_index],
-            t,
-            flip,
-            IVec3::ZERO,
-          ))
-          .map(|map| {
+          Some(bucket_model(&scene.models[inst.model_index], t, flip, IVec3::ZERO)).map(|map| {
             map
               .into_iter()
               .map(|(cc, v)| {
@@ -611,24 +564,15 @@ mod tests {
           }
           (v.len(), multi, conflict, conflict_id)
         })
-        .reduce(
-          || (0, 0, 0, 0),
-          |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3),
-        )
+        .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
     };
 
     let (w0, m0, c0, _) = run(false);
     let (w1, m1, c1, c1_id) = run(true);
     println!("before(flip=0): written={w0} multi_cells={m0} conflict_cells={c0}");
     println!("after (flip) : written={w1} multi_cells={m1} conflict_cells={c1}");
-    println!(
-      "after: 冲突中全 identity 写入方对={c1_id}（含旋转方={}",
-      c1 - c1_id
-    );
+    println!("after: 冲突中全 identity 写入方对={c1_id}（含旋转方={}", c1 - c1_id);
     assert_eq!(w0, w1, "两约定写入体素数应一致");
-    assert!(
-      c1 < c0 / 2,
-      "翻转补偿后异色冲突应减半以上（before={c0} after={c1}）"
-    );
+    assert!(c1 < c0 / 2, "翻转补偿后异色冲突应减半以上（before={c0} after={c1}）");
   }
 }

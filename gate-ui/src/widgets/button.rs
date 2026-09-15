@@ -1,4 +1,4 @@
-﻿//! button：四变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
+//! button：四变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
 //!
 //! 变体（docs/ui-dark-theme.md §5.2）：Primary（强调填充，主操作）/ Danger（破坏性操作）/
 //! Secondary（抬升表面 + 边框）/ Ghost（透明底，工具栏等低调操作）。
@@ -207,9 +207,10 @@ pub fn button_state_system(
       }
       for child in children.iter() {
         if let Ok(mut tc) = q_text.get_mut(child)
-          && tc.0 != target_text {
-            tc.0 = target_text;
-          }
+          && tc.0 != target_text
+        {
+          tc.0 = target_text;
+        }
       }
       // 重置 prev 避免 re-enable 瞬间误触发 click
       prev.0 = Interaction::None;
@@ -229,20 +230,17 @@ pub fn button_state_system(
       *border = target_border;
     }
     // 按压缩放（绕节点中心，bevy_ui 布局以节点中心为变换原点）
-    let target_scale = if *inter == Interaction::Pressed {
-      PRESSED_SCALE
-    } else {
-      1.0
-    };
+    let target_scale = if *inter == Interaction::Pressed { PRESSED_SCALE } else { 1.0 };
     if (ui_t.scale.x - target_scale).abs() > f32::EPSILON {
       ui_t.scale = Vec2::splat(target_scale);
     }
     // 文本子标签颜色（按钮只有一个文本子节点）
     for child in children.iter() {
       if let Ok(mut tc) = q_text.get_mut(child)
-        && tc.0 != target_text {
-          tc.0 = target_text;
-        }
+        && tc.0 != target_text
+      {
+        tc.0 = target_text;
+      }
     }
   }
 }
@@ -260,14 +258,7 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(button(
-        &ctx,
-        p,
-        ButtonConfig {
-          text: "OK".into(),
-          ..default()
-        },
-      ));
+      child = Some(button(&ctx, p, ButtonConfig { text: "OK".into(), ..default() }));
     });
     let h = child.expect("button spawned");
     let e = *h;
@@ -297,44 +288,23 @@ mod tests {
       s = Some(button(
         &ctx,
         p,
-        ButtonConfig {
-          text: "S".into(),
-          variant: ButtonVariant::Secondary,
-          ..default()
-        },
+        ButtonConfig { text: "S".into(), variant: ButtonVariant::Secondary, ..default() },
       ));
       g = Some(button(
         &ctx,
         p,
-        ButtonConfig {
-          text: "G".into(),
-          variant: ButtonVariant::Ghost,
-          ..default()
-        },
+        ButtonConfig { text: "G".into(), variant: ButtonVariant::Ghost, ..default() },
       ));
       d = Some(button(
         &ctx,
         p,
-        ButtonConfig {
-          text: "D".into(),
-          variant: ButtonVariant::Danger,
-          ..default()
-        },
+        ButtonConfig { text: "D".into(), variant: ButtonVariant::Danger, ..default() },
       ));
     });
     let w = app.world();
-    assert_eq!(
-      *w.get::<ButtonVariant>(*s.unwrap()).unwrap(),
-      ButtonVariant::Secondary
-    );
-    assert_eq!(
-      *w.get::<ButtonVariant>(*g.unwrap()).unwrap(),
-      ButtonVariant::Ghost
-    );
-    assert_eq!(
-      *w.get::<ButtonVariant>(*d.unwrap()).unwrap(),
-      ButtonVariant::Danger
-    );
+    assert_eq!(*w.get::<ButtonVariant>(*s.unwrap()).unwrap(), ButtonVariant::Secondary);
+    assert_eq!(*w.get::<ButtonVariant>(*g.unwrap()).unwrap(), ButtonVariant::Ghost);
+    assert_eq!(*w.get::<ButtonVariant>(*d.unwrap()).unwrap(), ButtonVariant::Danger);
   }
 
   #[test]
@@ -367,21 +337,13 @@ mod tests {
     let bg_of = |app: &App| app.world().get::<BackgroundColor>(btn).unwrap().0;
 
     // hover：视觉切 accent_fill_hover，无 click
-    app
-      .world_mut()
-      .get_mut::<Interaction>(btn)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(btn).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
     assert!(clicks.lock().unwrap().is_empty());
     assert_eq!(bg_of(&app), color_of(&theme.colors.accent_fill_hover));
 
     // 按下：视觉切 accent_fill_pressed + 缩放 0.98，无 click
-    app
-      .world_mut()
-      .get_mut::<Interaction>(btn)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(btn).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
     assert!(clicks.lock().unwrap().is_empty());
     assert_eq!(bg_of(&app), color_of(&theme.colors.accent_fill_pressed));
@@ -391,39 +353,19 @@ mod tests {
     );
 
     // 释放（仍在按钮上）：触发 click，视觉回 accent_fill_hover，缩放回 1.0
-    app
-      .world_mut()
-      .get_mut::<Interaction>(btn)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(btn).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
-    assert_eq!(
-      *clicks.lock().unwrap(),
-      vec![btn],
-      "release inside triggers UiClick"
-    );
+    assert_eq!(*clicks.lock().unwrap(), vec![btn], "release inside triggers UiClick");
     assert!(
       (app.world().get::<UiTransform>(btn).unwrap().scale.x - 1.0).abs() < 1e-6,
       "scale restored"
     );
 
     // 按下后拖出释放：视为取消，不触发 click
-    app
-      .world_mut()
-      .get_mut::<Interaction>(btn)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(btn).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(btn)
-      .unwrap()
-      .set_if_neq(Interaction::None);
+    app.world_mut().get_mut::<Interaction>(btn).unwrap().set_if_neq(Interaction::None);
     app.update();
-    assert_eq!(
-      clicks.lock().unwrap().len(),
-      1,
-      "release outside does not click"
-    );
+    assert_eq!(clicks.lock().unwrap().len(), 1, "release outside does not click");
   }
 }

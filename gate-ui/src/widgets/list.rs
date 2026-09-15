@@ -19,20 +19,13 @@ pub struct RingList {
 
 impl RingList {
   pub fn new(capacity: usize) -> Self {
-    Self {
-      capacity,
-      items: VecDeque::new(),
-    }
+    Self { capacity, items: VecDeque::new() }
   }
 
   /// 压入条目；超出容量时顶替最旧条目，返回被顶替者
   pub fn push(&mut self, text: impl Into<String>) -> Option<String> {
     self.items.push_back(text.into());
-    if self.items.len() > self.capacity {
-      self.items.pop_front()
-    } else {
-      None
-    }
+    if self.items.len() > self.capacity { self.items.pop_front() } else { None }
   }
 
   pub fn items(&self) -> impl Iterator<Item = &str> {
@@ -80,11 +73,7 @@ pub fn list(ctx: &UiCtx, parent: &mut ChildSpawner, config: ListConfig) -> ListH
     .spawn((
       Name::new("ui-list"),
       RingList::new(config.capacity),
-      Node {
-        flex_direction: FlexDirection::Column,
-        row_gap: px(m.spacing.xs),
-        ..default()
-      },
+      Node { flex_direction: FlexDirection::Column, row_gap: px(m.spacing.xs), ..default() },
     ))
     .id();
   ListHandle(e)
@@ -153,10 +142,8 @@ mod tests {
     app.update();
     let children = app.world().get::<Children>(e).expect("children synced");
     assert_eq!(children.len(), 2);
-    let texts: Vec<String> = children
-      .iter()
-      .map(|c| app.world().get::<Text>(c).unwrap().0.clone())
-      .collect();
+    let texts: Vec<String> =
+      children.iter().map(|c| app.world().get::<Text>(c).unwrap().0.clone()).collect();
     assert_eq!(texts, ["one", "two"]);
 
     // 顶替后重建：只保留最新两条
@@ -167,10 +154,8 @@ mod tests {
     app.update();
     let children = app.world().get::<Children>(e).unwrap();
     assert_eq!(children.len(), 2, "capacity bounded");
-    let texts: Vec<String> = children
-      .iter()
-      .map(|c| app.world().get::<Text>(c).unwrap().0.clone())
-      .collect();
+    let texts: Vec<String> =
+      children.iter().map(|c| app.world().get::<Text>(c).unwrap().0.clone()).collect();
     assert_eq!(texts, ["two", "three"]);
   }
 }

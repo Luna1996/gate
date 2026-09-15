@@ -111,10 +111,7 @@ impl<'a> UiCtx<'a> {
 /// HexColor → Color（运行时构造的非法 hex 回退白色并 warn，不 panic）
 pub fn color_of(hc: &HexColor) -> Color {
   hc.to_color().unwrap_or_else(|| {
-    warn!(
-      "invalid hex color {:?} in runtime value, fallback white",
-      hc.0
-    );
+    warn!("invalid hex color {:?} in runtime value, fallback white", hc.0);
     Color::WHITE
   })
 }
@@ -130,11 +127,7 @@ pub(crate) fn label_bundle(ctx: &UiCtx, text: String, size: f32, color: Color) -
     Name::new("ui-label"),
     Label,
     Text::new(text),
-    TextFont {
-      font: ctx.font_source(),
-      font_size: bevy::text::FontSize::Px(size),
-      ..default()
-    },
+    TextFont { font: ctx.font_source(), font_size: bevy::text::FontSize::Px(size), ..default() },
     TextColor(color),
     TextLayout::default(),
   )
@@ -160,7 +153,5 @@ pub(crate) fn spawn_label_cmd(
   size: f32,
   color: Color,
 ) -> Entity {
-  commands
-    .spawn((label_bundle(ctx, text, size, color), ChildOf(parent)))
-    .id()
+  commands.spawn((label_bundle(ctx, text, size, color), ChildOf(parent))).id()
 }

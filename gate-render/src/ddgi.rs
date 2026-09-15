@@ -87,32 +87,24 @@ pub struct DdgiChunkGeom {
 
 impl Default for DdgiChunkGeom {
   fn default() -> Self {
-    Self {
-      origin: IVec3::ZERO,
-      dims: UVec3::ONE,
-    }
+    Self { origin: IVec3::ZERO, dims: UVec3::ONE }
   }
 }
 
 impl DdgiChunkGeom {
   pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
     let c = DDGI_CHUNK_VOXELS;
-    let aligned = IVec3::new(
-      align_down(aabb_min.x, c),
-      align_down(aabb_min.y, c),
-      align_down(aabb_min.z, c),
-    ) / c
-      - IVec3::ONE;
+    let aligned =
+      IVec3::new(align_down(aabb_min.x, c), align_down(aabb_min.y, c), align_down(aabb_min.z, c))
+        / c
+        - IVec3::ONE;
     let span = (aabb_max - aligned * c).max(IVec3::ONE);
     let dims = UVec3::new(
       ((span.x + c - 1) / c).max(1) as u32 + 2,
       ((span.y + c - 1) / c).max(1) as u32 + 2,
       ((span.z + c - 1) / c).max(1) as u32 + 2,
     );
-    Self {
-      origin: aligned,
-      dims,
-    }
+    Self { origin: aligned, dims }
   }
 
   #[inline]
@@ -146,11 +138,7 @@ impl DdgiChunkGeom {
   pub fn coord(&self, idx: u32) -> IVec3 {
     let d = self.dims;
     self.origin
-      + IVec3::new(
-        (idx % d.x) as i32,
-        ((idx / d.x) % d.y) as i32,
-        (idx / (d.x * d.y)) as i32,
-      )
+      + IVec3::new((idx % d.x) as i32, ((idx / d.x) % d.y) as i32, (idx / (d.x * d.y)) as i32)
   }
 }
 
@@ -190,10 +178,7 @@ impl DdgiChunkPool {
       self.next_base = 0;
       changed = true;
     }
-    let mut want: Vec<u32> = wanted
-      .iter()
-      .filter_map(|cc| self.geom.linear(*cc))
-      .collect();
+    let mut want: Vec<u32> = wanted.iter().filter_map(|cc| self.geom.linear(*cc)).collect();
     want.sort_unstable();
     want.dedup();
     for &l in want.iter() {
@@ -585,10 +570,7 @@ pub struct DdgiWorldAabb {
 
 impl Default for DdgiWorldAabb {
   fn default() -> Self {
-    Self {
-      min: IVec3::ZERO,
-      max: IVec3::ONE,
-    }
+    Self { min: IVec3::ZERO, max: IVec3::ONE }
   }
 }
 
@@ -822,11 +804,7 @@ fn zero_array_tex(
       bytes_per_row: Some(size.0 * bytes_per_texel),
       rows_per_image: Some(size.1),
     },
-    Extent3d {
-      width: size.0,
-      height: size.1,
-      depth_or_array_layers: ddgi_consts().atlas_layers,
-    },
+    Extent3d { width: size.0, height: size.1, depth_or_array_layers: ddgi_consts().atlas_layers },
   );
 }
 
@@ -899,7 +877,9 @@ fn queue_ddgi_pipelines(
   dda_shader: bevy::ecs::system::Res<crate::shader::DdaShaderHandle>,
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
-  use bevy::render::render_resource::{BindGroupLayoutDescriptor, ComputePipelineDescriptor, PipelineCache};
+  use bevy::render::render_resource::{
+    BindGroupLayoutDescriptor, ComputePipelineDescriptor, PipelineCache,
+  };
   use std::borrow::Cow;
   if gpu.pipelines.is_some() {
     return;
@@ -946,12 +926,7 @@ fn queue_ddgi_pipelines(
     sort: mk(&pipeline_cache, "gate_ddgi_sort", "ddgi_sort", base.clone()),
     seal: mk(&pipeline_cache, "gate_ddgi_seal", "ddgi_seal", seal_layout),
     cast: mk(&pipeline_cache, "gate_ddgi_cast", "ddgi_cast", base.clone()),
-    collect: mk(
-      &pipeline_cache,
-      "gate_ddgi_collect",
-      "ddgi_collect",
-      collect_layout,
-    ),
+    collect: mk(&pipeline_cache, "gate_ddgi_collect", "ddgi_collect", collect_layout),
   });
 }
 
@@ -975,13 +950,9 @@ fn dispatch_ddgi(
   if !stage.run_active() && !dbg.is_some_and(|d| d.probe_viz) {
     return;
   }
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
-    bg0.as_ref(),
-    bg1.as_ref(),
-    bg2.as_ref(),
-    bg3.as_ref(),
-    bg4.as_ref(),
-  ) else {
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
+    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref(), bg4.as_ref())
+  else {
     return;
   };
   let Some(pipes) = gpu.pipelines else {
@@ -1026,12 +997,8 @@ fn dispatch_ddgi(
       };
       n.div_ceil(64).clamp(1, 65535)
     });
-    const LABELS: [&str; DDGI_LODS as usize] = [
-      "gate_ddgi_bake0",
-      "gate_ddgi_bake1",
-      "gate_ddgi_bake2",
-      "gate_ddgi_bake3",
-    ];
+    const LABELS: [&str; DDGI_LODS as usize] =
+      ["gate_ddgi_bake0", "gate_ddgi_bake1", "gate_ddgi_bake2", "gate_ddgi_bake3"];
     // 4 个入口必须**全部**就绪才开跑：否则会出现"细级烘了、粗级没烘"的半帧状态。
     let mut p_bake: [Option<&bevy::render::render_resource::ComputePipeline>; DDGI_LODS as usize] =
       [None; DDGI_LODS as usize];
@@ -1094,35 +1061,36 @@ fn dispatch_ddgi(
       pipeline_cache.get_compute_pipeline(pipes.cast),
       pipeline_cache.get_compute_pipeline(pipes.collect),
       bg5.as_ref(),
-    ) {
-      // cast / collect 各一次间接 dispatch（覆盖全部 LOD；LOD 由 shader 用 seal 写的前缀和还原）。
-      // 两个 args 段的字节偏移取自 WESL 的 `DDGI_INDIR_CAST_BASE` / `DDGI_INDIR_COLL_BASE`。
-      let c = ddgi_consts();
-      let (cast_off, coll_off) = (c.args_cast_offset(), c.args_coll_offset());
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_ddgi_cast",
-        |pass| {
-          pass.set_pipeline(p_cast);
-          set_bgs(pass, &bg4.0);
-          pass.dispatch_workgroups_indirect(&gpu.args, cast_off);
-        },
-      );
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_ddgi_collect",
-        |pass| {
-          pass.set_pipeline(p_coll);
-          set_bgs(pass, &bg4.0);
-          pass.set_bind_group(5, &bg5.0, &[]);
-          pass.dispatch_workgroups_indirect(&gpu.args, coll_off);
-        },
-      );
-      // 本帧写过图集 → 下一帧采样侧翻到刚写完的那一半
-      gpu.parity ^= 1;
-    }
+    )
+  {
+    // cast / collect 各一次间接 dispatch（覆盖全部 LOD；LOD 由 shader 用 seal 写的前缀和还原）。
+    // 两个 args 段的字节偏移取自 WESL 的 `DDGI_INDIR_CAST_BASE` / `DDGI_INDIR_COLL_BASE`。
+    let c = ddgi_consts();
+    let (cast_off, coll_off) = (c.args_cast_offset(), c.args_coll_offset());
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_ddgi_cast",
+      |pass| {
+        pass.set_pipeline(p_cast);
+        set_bgs(pass, &bg4.0);
+        pass.dispatch_workgroups_indirect(&gpu.args, cast_off);
+      },
+    );
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_ddgi_collect",
+      |pass| {
+        pass.set_pipeline(p_coll);
+        set_bgs(pass, &bg4.0);
+        pass.set_bind_group(5, &bg5.0, &[]);
+        pass.dispatch_workgroups_indirect(&gpu.args, coll_off);
+      },
+    );
+    // 本帧写过图集 → 下一帧采样侧翻到刚写完的那一半
+    gpu.parity ^= 1;
+  }
 }
 
 fn extract_ddgi_settings(
@@ -1143,10 +1111,9 @@ fn extract_ddgi_settings(
     far_ambient: d.far_ambient,
   });
   commands.insert_resource(dbg);
-  commands.insert_resource(world_aabb.map_or_else(DdgiWorldAabb::default, |a| DdgiWorldAabb {
-    min: a.min,
-    max: a.max,
-  }));
+  commands.insert_resource(
+    world_aabb.map_or_else(DdgiWorldAabb::default, |a| DdgiWorldAabb { min: a.min, max: a.max }),
+  );
   commands.insert_resource(lod0_chunks.map_or_else(DdgiLod0Chunks::default, |c| c.clone()));
 }
 
@@ -1211,11 +1178,7 @@ fn prepare_ddgi(
       for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
         let o = grid.lod_origins[lod];
         let d = grid.lod_dims[lod];
-        let count = if lod == 0 {
-          lod0_slots
-        } else {
-          grid.lod_count(lod)
-        };
+        let count = if lod == 0 { lod0_slots } else { grid.lod_count(lod) };
         bevy::log::info!(
           "DDGI LOD{lod}: cell={} origin=({},{},{}) dims=({},{},{}) slot_base={} count={}",
           cell,
@@ -1252,11 +1215,7 @@ fn prepare_ddgi(
   // ---- 脏区：本帧上传实际改动的世界 voxel AABB（max 不含）----
   // 全量上传 → ±1e9（等价于全部 cell 失效）；增量 → 改动 chunk 的合并包围盒。
   let (dirty_min, dirty_max, dirty_valid) = match dirty.as_ref() {
-    Some(d) if d.full => (
-      IVec3::splat(-1_000_000_000),
-      IVec3::splat(1_000_000_000),
-      1.0f32,
-    ),
+    Some(d) if d.full => (IVec3::splat(-1_000_000_000), IVec3::splat(1_000_000_000), 1.0f32),
     Some(d) if d.min_voxel != d.max_voxel => (d.min_voxel, d.max_voxel, 1.0f32),
     _ => (IVec3::ZERO, IVec3::ZERO, 0.0f32),
   };
@@ -1331,12 +1290,7 @@ fn prepare_ddgi(
     // w = 级联覆盖外的天光兜底强度（见 DdgiDebugSettings.far_ambient）
     dbg.far_ambient,
   );
-  u.dirty_min = Vec4::new(
-    dirty_min.x as f32,
-    dirty_min.y as f32,
-    dirty_min.z as f32,
-    dirty_valid,
-  );
+  u.dirty_min = Vec4::new(dirty_min.x as f32, dirty_min.y as f32, dirty_min.z as f32, dirty_valid);
   u.dirty_max = Vec4::new(dirty_max.x as f32, dirty_max.y as f32, dirty_max.z as f32, 0.0);
   // LOD0 的 chunk 段编址（只有 lod==0 读它）：原点/维度（chunk 单位）、每 chunk cell 数、
   // 已分配槽数。WGSL 用 `misc.y`(=total_slots) + 这里的维度定位 cell_slot 尾部的两张表。
@@ -1347,12 +1301,7 @@ fn prepare_ddgi(
       chunk_geom.origin.z,
       DDGI_CHUNK_LOD0_AXIS,
     ),
-    dims: UVec4::new(
-      chunk_geom.dims.x,
-      chunk_geom.dims.y,
-      chunk_geom.dims.z,
-      lod0_slots,
-    ),
+    dims: UVec4::new(chunk_geom.dims.x, chunk_geom.dims.y, chunk_geom.dims.z, lod0_slots),
   };
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
@@ -1394,10 +1343,7 @@ fn prepare_ddgi(
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
-    &BindGroupEntries::sequential((
-      &gpu.irr[1 - p].view,
-      &gpu.depth[1 - p].view,
-    )),
+    &BindGroupEntries::sequential((&gpu.irr[1 - p].view, &gpu.depth[1 - p].view)),
   );
   commands.insert_resource(DdgiBg5(bg5));
 
@@ -1419,11 +1365,9 @@ mod tests {
   /// 判定 LOD(l-1) 盒是否严格包含于 LOD(l) 盒（嵌套级联的核心不变式）。
   fn lod_aabb(g: &DdgiWorldGrid, lod: usize) -> (IVec3, IVec3) {
     let o = g.lod_origins[lod];
-    let ext = IVec3::new(
-      g.lod_dims[lod].x as i32,
-      g.lod_dims[lod].y as i32,
-      g.lod_dims[lod].z as i32,
-    ) * DDGI_LOD_CELL_SIZES[lod];
+    let ext =
+      IVec3::new(g.lod_dims[lod].x as i32, g.lod_dims[lod].y as i32, g.lod_dims[lod].z as i32)
+        * DDGI_LOD_CELL_SIZES[lod];
     (o, o + ext)
   }
 
@@ -1448,11 +1392,7 @@ mod tests {
     for lod in 1..DDGI_LODS as usize {
       let (plo, phi) = lod_aabb(&g, lod - 1);
       let (l, h) = lod_aabb(&g, lod);
-      assert!(
-        plo.cmpge(l).all() && phi.cmple(h).all(),
-        "lod {lod} 未包含 lod {}",
-        lod - 1
-      );
+      assert!(plo.cmpge(l).all() && phi.cmple(h).all(), "lod {lod} 未包含 lod {}", lod - 1);
     }
   }
 
@@ -1536,10 +1476,8 @@ mod tests {
     assert!(pool.sync(geom, &wanted));
     assert_eq!(pool.lod0_slots(), 86 * DDGI_CHUNK_LOD0_SLOTS);
     // 段基址恰为 0,4096,8192,...（互不重叠）
-    let mut bases: Vec<u32> = wanted
-      .iter()
-      .map(|c| pool.bases[geom.linear(*c).unwrap() as usize])
-      .collect();
+    let mut bases: Vec<u32> =
+      wanted.iter().map(|c| pool.bases[geom.linear(*c).unwrap() as usize]).collect();
     bases.sort_unstable();
     for (i, b) in bases.iter().enumerate() {
       assert_eq!(*b, i as u32 * DDGI_CHUNK_LOD0_SLOTS);
@@ -1584,10 +1522,7 @@ mod tests {
     let total = lod0_slots + g.lod_count(1) + g.lod_count(2) + g.lod_count(3);
     let c = ddgi_consts();
     let capacity = c.atlas_capacity();
-    assert!(
-      total <= capacity,
-      "LOD0 chunk 池 + LOD1~3 总槽位 {total} 超出图集容量 {capacity}",
-    );
+    assert!(total <= capacity, "LOD0 chunk 池 + LOD1~3 总槽位 {total} 超出图集容量 {capacity}",);
     assert!(
       lod0_slots <= c.wl_idx_mask,
       "LOD0 局部下标必须装进 worklist 的 cell 下标位宽（0x{:X}）",
@@ -1634,14 +1569,7 @@ mod tests {
 
   /// 6 向轴向净距（体素），对照规则的判定用（越界即停，最多 8 步）。
   fn clear6(o: &Cell16, p: [i32; 3]) -> i32 {
-    let dirs = [
-      [1, 0, 0],
-      [-1, 0, 0],
-      [0, 1, 0],
-      [0, -1, 0],
-      [0, 0, 1],
-      [0, 0, -1],
-    ];
+    let dirs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
     let mut best = 8;
     for d in dirs {
       let mut steps = 8;
@@ -1727,11 +1655,7 @@ mod tests {
     }
     let p = nearest_empty_center(o, 1)?;
     let pi = [p[0] as i32, p[1] as i32, p[2] as i32];
-    if clear6(o, pi) >= 4 {
-      Some(p)
-    } else {
-      None
-    }
+    if clear6(o, pi) >= 4 { Some(p) } else { None }
   }
 
   #[test]
@@ -1776,10 +1700,7 @@ mod tests {
       if place_old(&o).is_none() {
         old_miss += 1;
       }
-      assert!(
-        place_new(&o).is_some(),
-        "{name}: 新规则必须保证「格内有空体素 ⇒ 一定放得出探针」"
-      );
+      assert!(place_new(&o).is_some(), "{name}: 新规则必须保证「格内有空体素 ⇒ 一定放得出探针」");
     }
     println!("probe placement: cells={empty_cells} new_miss={new_miss} old_miss={old_miss}");
     assert_eq!(new_miss, 0, "新规则必须满足「格内有空体素 ⇒ 一定放得出探针」");

@@ -36,13 +36,7 @@ pub struct PlotData {
 
 impl PlotData {
   pub fn new(capacity: usize, y_domain: PlotDomain, line_color: Color) -> Self {
-    Self {
-      capacity,
-      samples: VecDeque::new(),
-      y_domain,
-      line_color,
-      unit: None,
-    }
+    Self { capacity, samples: VecDeque::new(), y_domain, line_color, unit: None }
   }
 
   /// 链式设置纵轴单位后缀
@@ -54,11 +48,7 @@ impl PlotData {
   /// 压入样本；超出容量时顶替最旧样本，返回被顶替者
   pub fn push(&mut self, v: f32) -> Option<f32> {
     self.samples.push_back(v);
-    if self.samples.len() > self.capacity {
-      self.samples.pop_front()
-    } else {
-      None
-    }
+    if self.samples.len() > self.capacity { self.samples.pop_front() } else { None }
   }
 
   pub fn len(&self) -> usize {
@@ -87,11 +77,7 @@ impl PlotData {
           min = min.min(v);
           max = max.max(v);
         }
-        if (max - min).abs() < f32::EPSILON {
-          (min - 1.0, max + 1.0)
-        } else {
-          (min, max)
-        }
+        if (max - min).abs() < f32::EPSILON { (min - 1.0, max + 1.0) } else { (min, max) }
       }
     }
   }
@@ -103,11 +89,7 @@ impl PlotData {
 /// `plot_redraw_system` 需要直接写 `image.data` 做 CPU 光栅化；缺此标志 → 折线图空白。
 pub fn blank_plot_image(w: u32, h: u32) -> Image {
   Image::new(
-    Extent3d {
-      width: w,
-      height: h,
-      depth_or_array_layers: 1,
-    },
+    Extent3d { width: w, height: h, depth_or_array_layers: 1 },
     TextureDimension::D2,
     vec![0; (w * h * 4) as usize],
     TextureFormat::Rgba8UnormSrgb,
@@ -287,10 +269,7 @@ impl Default for PlotConfig {
 pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
-  let canvas_border = (
-    UiRect::all(px(m.border_width)),
-    BorderColor::all(color_of(&c.border)),
-  );
+  let canvas_border = (UiRect::all(px(m.border_width)), BorderColor::all(color_of(&c.border)));
   match config.layout {
     PlotLayout::Plain => {
       let canvas_width = match config.canvas_width {
@@ -304,20 +283,13 @@ pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotH
             unit: config.unit,
             ..PlotData::new(config.capacity, config.y_domain, config.line_color)
           },
-          Node {
-            flex_direction: FlexDirection::Column,
-            row_gap: px(m.spacing.xs),
-            ..default()
-          },
+          Node { flex_direction: FlexDirection::Column, row_gap: px(m.spacing.xs), ..default() },
         ))
         .with_children(|root| {
           root.spawn((
             Name::new("ui-plot-canvas"),
             PlotCanvas,
-            ImageNode {
-              image: config.image,
-              ..default()
-            },
+            ImageNode { image: config.image, ..default() },
             Node {
               width: canvas_width,
               height: px(config.canvas_h),
@@ -382,10 +354,7 @@ pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotH
           root.spawn((
             Name::new("ui-plot-canvas"),
             PlotCanvas,
-            ImageNode {
-              image: config.image,
-              ..default()
-            },
+            ImageNode { image: config.image, ..default() },
             Node {
               flex_grow: canvas_grow,
               width: canvas_width,
@@ -531,10 +500,8 @@ mod tests {
     app.insert_resource(ThemeFont::default());
     app.add_systems(Update, plot_redraw_system);
 
-    let handle = app
-      .world_mut()
-      .resource_mut::<Assets<Image>>()
-      .add(blank_plot_image(PLOT_W, PLOT_H));
+    let handle =
+      app.world_mut().resource_mut::<Assets<Image>>().add(blank_plot_image(PLOT_W, PLOT_H));
     let ctx = UiCtx::new(&theme, None);
     let mut plot_e = None;
     app.world_mut().spawn_empty().with_children(|p| {
@@ -554,18 +521,10 @@ mod tests {
 
     // 首帧（空数据）：插入即 Changed，触发一次重绘；无横线 indicator → 保持透明
     app.update();
-    let img = app
-      .world()
-      .resource::<Assets<Image>>()
-      .get(&handle)
-      .unwrap();
+    let img = app.world().resource::<Assets<Image>>().get(&handle).unwrap();
     let data = img.data.as_ref().unwrap();
     let i = ((PLOT_H / 4 * PLOT_W) * 4) as usize;
-    assert_eq!(
-      data[i + 3],
-      0,
-      "empty plot stays transparent (no indicator)"
-    );
+    assert_eq!(data[i + 3], 0, "empty plot stays transparent (no indicator)");
 
     // push 两个样本 → 对角线出现
     {
@@ -574,19 +533,11 @@ mod tests {
       data.push(1.0);
     }
     app.update();
-    let img = app
-      .world()
-      .resource::<Assets<Image>>()
-      .get(&handle)
-      .unwrap();
+    let img = app.world().resource::<Assets<Image>>().get(&handle).unwrap();
     let data = img.data.as_ref().unwrap();
     // 起点 (0,63) → 纯线色（accent_text #FAFAFA）
     let i0 = ((63 * PLOT_W) * 4) as usize;
-    assert_eq!(
-      &data[i0..i0 + 4],
-      &[250, 250, 250, 255],
-      "accent_text line start"
-    );
+    assert_eq!(&data[i0..i0 + 4], &[250, 250, 250, 255], "accent_text line start");
     // 对角线中点落 (128,31) 或 (128,32) 之一（Bresenham 取整）
     let mid_alpha = |y: u32| data[((y * PLOT_W + 128) * 4 + 3) as usize];
     assert!(
@@ -595,12 +546,7 @@ mod tests {
     );
 
     // 极值文本更新
-    let children = app
-      .world()
-      .get::<Children>(plot_e)
-      .unwrap()
-      .iter()
-      .collect::<Vec<_>>();
+    let children = app.world().get::<Children>(plot_e).unwrap().iter().collect::<Vec<_>>();
     let mut found = false;
     for ch in children {
       if let Some(t) = app.world().get::<Text>(ch)
@@ -621,10 +567,7 @@ mod tests {
     app.insert_resource(ThemeFont::default());
     app.add_systems(Update, plot_redraw_system);
 
-    let handle = app
-      .world_mut()
-      .resource_mut::<Assets<Image>>()
-      .add(blank_plot_image(64, 32));
+    let handle = app.world_mut().resource_mut::<Assets<Image>>().add(blank_plot_image(64, 32));
     let ctx = UiCtx::new(&theme, None);
     let mut plot_e = None;
     app.world_mut().spawn_empty().with_children(|p| {
@@ -654,12 +597,7 @@ mod tests {
     }
     app.update();
 
-    let root_children = app
-      .world()
-      .get::<Children>(plot_e)
-      .unwrap()
-      .iter()
-      .collect::<Vec<_>>();
+    let root_children = app.world().get::<Children>(plot_e).unwrap().iter().collect::<Vec<_>>();
     let mut labels = vec![];
     for ch in root_children {
       if app.world().get::<PlotYAxis>(ch).is_some() {
@@ -683,10 +621,7 @@ mod tests {
     app.insert_resource(ThemeFont::default());
     app.add_systems(Update, plot_redraw_system);
 
-    let handle = app
-      .world_mut()
-      .resource_mut::<Assets<Image>>()
-      .add(blank_plot_image(64, 32));
+    let handle = app.world_mut().resource_mut::<Assets<Image>>().add(blank_plot_image(64, 32));
     let ctx = UiCtx::new(&theme, None);
     let mut plot_e = None;
     app.world_mut().spawn_empty().with_children(|p| {
@@ -715,12 +650,7 @@ mod tests {
     }
     app.update();
 
-    let root_children = app
-      .world()
-      .get::<Children>(plot_e)
-      .unwrap()
-      .iter()
-      .collect::<Vec<_>>();
+    let root_children = app.world().get::<Children>(plot_e).unwrap().iter().collect::<Vec<_>>();
     let mut labels = vec![];
     for ch in root_children {
       if app.world().get::<PlotYAxis>(ch).is_some() {

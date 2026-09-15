@@ -130,12 +130,7 @@ fn value_text(v: f32) -> String {
 
 /// 笔触跨度文本：size → (2N-1)³ 的边长
 fn brush_span_text(size: u32) -> String {
-  t!(
-    "edit.size.value",
-    size = size,
-    span = 2 * size.max(1) - 1
-  )
-  .to_string()
+  t!("edit.size.value", size = size, span = 2 * size.max(1) - 1).to_string()
 }
 
 /// DDGI 阶段名的本地化标签（下标与 [`DDGI_STAGES`] 同序）。
@@ -179,24 +174,16 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
   let ddgi_stage = world
     .get_resource::<gate_render::ddgi::DdgiStage>()
     .map_or(0, |s| s.0.min(DDGI_STAGES.len() as u8 - 1));
-  let ddgi_dbg = world
-    .get_resource::<gate_render::ddgi::DdgiDebugSettings>()
-    .copied()
-    .unwrap_or_default();
-  let cam_mode = world
-    .get_resource::<crate::camera::CameraMode>()
-    .copied()
-    .unwrap_or_default();
+  let ddgi_dbg =
+    world.get_resource::<gate_render::ddgi::DdgiDebugSettings>().copied().unwrap_or_default();
+  let cam_mode = world.get_resource::<crate::camera::CameraMode>().copied().unwrap_or_default();
   let fly_speed = world
     .get_resource::<crate::camera::FlyCamera>()
     .map_or(crate::camera::FLY_SPEED_DEFAULT, |f| f.speed)
     .clamp(crate::camera::FLY_SPEED_MIN, crate::camera::FLY_SPEED_MAX);
   let edit = world.get_resource::<EditSettings>().copied().unwrap_or_default();
   let edit_mat = edit.material.min(EDIT_MATERIALS.len() - 1);
-  let eye_set = world
-    .get_resource::<gate_render::EyeAdaptSettings>()
-    .copied()
-    .unwrap_or_default();
+  let eye_set = world.get_resource::<gate_render::EyeAdaptSettings>().copied().unwrap_or_default();
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
   // 绝对定位根：定宽 + 高度 auto；外框与底色由本节点提供
@@ -227,25 +214,12 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             ..default()
           },
           BackgroundColor(color_of(&c.surface_card)),
-          BorderColor {
-            bottom: color_of(&c.border),
-            ..BorderColor::DEFAULT
-          },
+          BorderColor { bottom: color_of(&c.border), ..BorderColor::DEFAULT },
         ))
         .id();
       root.world_mut().entity_mut(fps_cell).with_children(|cell| {
-        let e = label(
-          ctx,
-          cell,
-          LabelConfig {
-            text: t!("stats.fps_idle").into(),
-            ..default()
-          },
-        );
-        cell
-          .world_mut()
-          .entity_mut(*e)
-          .insert((FpsText, TextColor(color_of(&c.text_primary))));
+        let e = label(ctx, cell, LabelConfig { text: t!("stats.fps_idle").into(), ..default() });
+        cell.world_mut().entity_mut(*e).insert((FpsText, TextColor(color_of(&c.text_primary))));
       });
       let tv = tab_view(
         ctx,
@@ -264,577 +238,492 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         },
       );
       // ============ Tab 0：Stats ============
-      root
-        .world_mut()
-        .entity_mut(tv.contents[0])
-        .with_children(|page| {
-          let g = tab_page_grid(ctx, page);
-          page.world_mut().entity_mut(g).with_children(|g| {
-            // ---- 相机位置/朝向信息（与 FPS 同档同色；两行行距 = padding sm）----
-            let c2 = tab_cell(ctx, g);
-            g.world_mut().entity_mut(c2).with_children(|cell| {
-              let e = label(
-                ctx,
-                cell,
-                LabelConfig {
-                  text: t!("stats.cam_idle").into(),
-                  ..default()
-                },
-              );
-              cell.world_mut().entity_mut(*e).insert((
-                CamInfoText,
-                TextColor(color_of(&c.text_primary)),
-                bevy::text::LineHeight::Px(
-                  ctx.theme.metrics.font_size.md + ctx.theme.metrics.spacing.sm,
-                ),
-              ));
-            });
-            // ---- 垂直同步开关（默认开 = Fifo；观察者写 Window.present_mode，
-            //      bevy_render 检测变化后自动重配 swapchain；关 = AutoNoVsync） ----
-            let c5 = tab_cell(ctx, g);
-            g.world_mut().entity_mut(c5).with_children(|cell| {
-              let t = toggle_switch(
-                ctx,
-                cell,
-                ToggleSwitchConfig {
-                  text: Some(t!("stats.vsync").into()),
-                  checked: true, // 默认开，与启动 present_mode=Fifo 同步
-                  ..default()
-                },
-              );
-              cell.world_mut().entity_mut(*t).insert(VsyncToggle);
-            });
-            // ---- 「右上角面板」显隐开关（默认隐藏；观察者写 ShowcaseRoot Visibility）----
-            let c4 = tab_cell(ctx, g);
-            g.world_mut().entity_mut(c4).with_children(|cell| {
-              let t = toggle_switch(
-                ctx,
-                cell,
-                ToggleSwitchConfig {
-                  text: Some(t!("stats.showcase").into()),
-                  checked: false, // 默认隐藏 showcase，与 spawn_showcase 初始 Hidden 同步
-                  ..default()
-                },
-              );
-              cell
-                .world_mut()
-                .entity_mut(*t)
-                .insert(ShowcaseVisibilityToggle);
-            });
+      root.world_mut().entity_mut(tv.contents[0]).with_children(|page| {
+        let g = tab_page_grid(ctx, page);
+        page.world_mut().entity_mut(g).with_children(|g| {
+          // ---- 相机位置/朝向信息（与 FPS 同档同色；两行行距 = padding sm）----
+          let c2 = tab_cell(ctx, g);
+          g.world_mut().entity_mut(c2).with_children(|cell| {
+            let e =
+              label(ctx, cell, LabelConfig { text: t!("stats.cam_idle").into(), ..default() });
+            cell.world_mut().entity_mut(*e).insert((
+              CamInfoText,
+              TextColor(color_of(&c.text_primary)),
+              bevy::text::LineHeight::Px(
+                ctx.theme.metrics.font_size.md + ctx.theme.metrics.spacing.sm,
+              ),
+            ));
+          });
+          // ---- 垂直同步开关（默认开 = Fifo；观察者写 Window.present_mode，
+          //      bevy_render 检测变化后自动重配 swapchain；关 = AutoNoVsync） ----
+          let c5 = tab_cell(ctx, g);
+          g.world_mut().entity_mut(c5).with_children(|cell| {
+            let t = toggle_switch(
+              ctx,
+              cell,
+              ToggleSwitchConfig {
+                text: Some(t!("stats.vsync").into()),
+                checked: true, // 默认开，与启动 present_mode=Fifo 同步
+                ..default()
+              },
+            );
+            cell.world_mut().entity_mut(*t).insert(VsyncToggle);
+          });
+          // ---- 「右上角面板」显隐开关（默认隐藏；观察者写 ShowcaseRoot Visibility）----
+          let c4 = tab_cell(ctx, g);
+          g.world_mut().entity_mut(c4).with_children(|cell| {
+            let t = toggle_switch(
+              ctx,
+              cell,
+              ToggleSwitchConfig {
+                text: Some(t!("stats.showcase").into()),
+                checked: false, // 默认隐藏 showcase，与 spawn_showcase 初始 Hidden 同步
+                ..default()
+              },
+            );
+            cell.world_mut().entity_mut(*t).insert(ShowcaseVisibilityToggle);
           });
         });
+      });
       strip_last_cell_bottom(root.world_mut(), tv.contents[0]);
-      root
-        .world_mut()
-        .entity_mut(tv.contents[1])
-        .with_children(|page| {
-          let g = tab_page_grid(ctx, page);
-          page.world_mut().entity_mut(g).with_children(|g| {
-            // -- DDGI 阶段滑杆行 --
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("ddgi-stage-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.md),
-                    align_items: AlignItems::Center,
-                    ..default()
-                  },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: "DDGI".into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  let s = slider(
-                    ctx,
-                    row,
-                    SliderConfig {
-                      min: 0.0,
-                      max: 3.0,
-                      value: f32::from(ddgi_stage),
-                      step: Some(1.0),
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
-                  let vl = label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: format!(
-                        "{} {}",
-                        ddgi_stage,
-                        ddgi_stage_label((ddgi_stage as usize).min(DDGI_STAGES.len() - 1))
-                      ),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*vl).insert(DdgiStageValueLabel);
-                });
-            });
-            // -- 调试模式按钮行（5 按钮互斥单选；选中项 = DdgiDebugSettings.mode）--
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("ddgi-mode-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.sm),
-                    align_items: AlignItems::Center,
-                    ..default()
-                  },
-                ))
-                .with_children(|row| {
-                  let active = ddgi_dbg.mode.round() as u8;
-                  for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
-                    let variant = if i as u8 == active {
-                      ButtonVariant::Primary
-                    } else {
-                      ButtonVariant::Ghost
-                    };
-                    let b = button(
-                      ctx,
-                      row,
-                      ButtonConfig {
-                        text: (*name).into(),
-                        variant,
-                        ..default()
-                      },
-                    );
-                    row
-                      .world_mut()
-                      .entity_mut(*b)
-                      .insert(DdgiDebugModeBtn(i as u8));
-                  }
-                });
-            });
-            // -- Probe Viz 开关 --
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              let t = toggle_switch(
-                ctx,
-                cell,
-                ToggleSwitchConfig {
-                  text: Some(t!("ddgi.probe_viz").into()),
-                  checked: ddgi_dbg.probe_viz,
+      root.world_mut().entity_mut(tv.contents[1]).with_children(|page| {
+        let g = tab_page_grid(ctx, page);
+        page.world_mut().entity_mut(g).with_children(|g| {
+          // -- DDGI 阶段滑杆行 --
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("ddgi-stage-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.md),
+                  align_items: AlignItems::Center,
                   ..default()
                 },
-              );
-              cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
-            });
-            // -- Probe Viz 层级滑杆行（0..=4 步进 1：All / LOD0~3）--
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("ddgi-probe-lod-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.md),
-                    align_items: AlignItems::Center,
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig { text: "DDGI".into(), style: LabelStyle::Muted, ..default() },
+                );
+                let s = slider(
+                  ctx,
+                  row,
+                  SliderConfig {
+                    min: 0.0,
+                    max: 3.0,
+                    value: f32::from(ddgi_stage),
+                    step: Some(1.0),
                     ..default()
                   },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: "LOD".into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  let s = slider(
-                    ctx,
-                    row,
-                    SliderConfig {
-                      min: 0.0,
-                      max: 4.0,
-                      value: ddgi_dbg.probe_viz_lod.clamp(0.0, 4.0),
-                      step: Some(1.0),
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
-                  let vl = label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: DDGI_PROBE_VIZ_LODS
-                        [(ddgi_dbg.probe_viz_lod.round() as usize).min(DDGI_PROBE_VIZ_LODS.len() - 1)]
-                      .into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  row
-                    .world_mut()
-                    .entity_mut(*vl)
-                    .insert(DdgiProbeVizLodValueLabel);
-                });
-            });
+                );
+                row.world_mut().entity_mut(*s).insert(DdgiStageSlider);
+                let vl = label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: format!(
+                      "{} {}",
+                      ddgi_stage,
+                      ddgi_stage_label((ddgi_stage as usize).min(DDGI_STAGES.len() - 1))
+                    ),
+                    style: LabelStyle::Muted,
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*vl).insert(DdgiStageValueLabel);
+              });
+          });
+          // -- 调试模式按钮行（5 按钮互斥单选；选中项 = DdgiDebugSettings.mode）--
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("ddgi-mode-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.sm),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                let active = ddgi_dbg.mode.round() as u8;
+                for (i, name) in DDGI_DEBUG_MODES.iter().enumerate() {
+                  let variant =
+                    if i as u8 == active { ButtonVariant::Primary } else { ButtonVariant::Ghost };
+                  let b =
+                    button(ctx, row, ButtonConfig { text: (*name).into(), variant, ..default() });
+                  row.world_mut().entity_mut(*b).insert(DdgiDebugModeBtn(i as u8));
+                }
+              });
+          });
+          // -- Probe Viz 开关 --
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            let t = toggle_switch(
+              ctx,
+              cell,
+              ToggleSwitchConfig {
+                text: Some(t!("ddgi.probe_viz").into()),
+                checked: ddgi_dbg.probe_viz,
+                ..default()
+              },
+            );
+            cell.world_mut().entity_mut(*t).insert(DdgiProbeVizToggle);
+          });
+          // -- Probe Viz 层级滑杆行（0..=4 步进 1：All / LOD0~3）--
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("ddgi-probe-lod-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.md),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig { text: "LOD".into(), style: LabelStyle::Muted, ..default() },
+                );
+                let s = slider(
+                  ctx,
+                  row,
+                  SliderConfig {
+                    min: 0.0,
+                    max: 4.0,
+                    value: ddgi_dbg.probe_viz_lod.clamp(0.0, 4.0),
+                    step: Some(1.0),
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*s).insert(DdgiProbeVizLodSlider);
+                let vl = label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: DDGI_PROBE_VIZ_LODS[(ddgi_dbg.probe_viz_lod.round() as usize)
+                      .min(DDGI_PROBE_VIZ_LODS.len() - 1)]
+                    .into(),
+                    style: LabelStyle::Muted,
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*vl).insert(DdgiProbeVizLodValueLabel);
+              });
           });
         });
+      });
       strip_last_cell_bottom(root.world_mut(), tv.contents[1]);
       // ============ Tab 2：Camera（轨道/自由 互斥按钮 + 飞行速度）============
-      root
-        .world_mut()
-        .entity_mut(tv.contents[2])
-        .with_children(|page| {
-          let g = tab_page_grid(ctx, page);
-          page.world_mut().entity_mut(g).with_children(|g| {
-            // 相机模式：互斥按钮组（轨道 / 自由）。**唯一切换入口**。
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("cam-mode-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.sm),
-                    align_items: AlignItems::Center,
+      root.world_mut().entity_mut(tv.contents[2]).with_children(|page| {
+        let g = tab_page_grid(ctx, page);
+        page.world_mut().entity_mut(g).with_children(|g| {
+          // 相机模式：互斥按钮组（轨道 / 自由）。**唯一切换入口**。
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("cam-mode-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.sm),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: t!("camera.mode").into(),
+                    style: LabelStyle::Muted,
                     ..default()
                   },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: t!("camera.mode").into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  for (mode, name) in [
-                    (
-                      crate::camera::CameraMode::Orbit,
-                      t!("camera.mode.orbit"),
-                    ),
-                    (crate::camera::CameraMode::Fly, t!("camera.mode.fly")),
-                  ] {
-                    let variant = if mode == cam_mode {
-                      ButtonVariant::Primary
-                    } else {
-                      ButtonVariant::Ghost
-                    };
-                    let b = button(
-                      ctx,
-                      row,
-                      ButtonConfig {
-                        text: name.into(),
-                        variant,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*b).insert(CameraModeBtn(mode));
-                  }
-                });
-            });
-            // 飞行速度（voxel/s；只在 Fly 模式下生效，1 voxel = 2cm）
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("cam-speed-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.md),
-                    align_items: AlignItems::Center,
+                );
+                for (mode, name) in [
+                  (crate::camera::CameraMode::Orbit, t!("camera.mode.orbit")),
+                  (crate::camera::CameraMode::Fly, t!("camera.mode.fly")),
+                ] {
+                  let variant =
+                    if mode == cam_mode { ButtonVariant::Primary } else { ButtonVariant::Ghost };
+                  let b =
+                    button(ctx, row, ButtonConfig { text: name.into(), variant, ..default() });
+                  row.world_mut().entity_mut(*b).insert(CameraModeBtn(mode));
+                }
+              });
+          });
+          // 飞行速度（voxel/s；只在 Fly 模式下生效，1 voxel = 2cm）
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("cam-speed-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.md),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: t!("camera.speed").into(),
+                    style: LabelStyle::Muted,
                     ..default()
                   },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: t!("camera.speed").into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  let s = slider(
-                    ctx,
-                    row,
-                    SliderConfig {
-                      min: crate::camera::FLY_SPEED_MIN,
-                      max: crate::camera::FLY_SPEED_MAX,
-                      value: fly_speed,
-                      step: Some(crate::camera::FLY_SPEED_STEP),
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*s).insert(CameraSpeedSlider);
-                  let vl = label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: speed_text(fly_speed),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*vl).insert(CameraSpeedValueLabel);
-                });
-            });
+                );
+                let s = slider(
+                  ctx,
+                  row,
+                  SliderConfig {
+                    min: crate::camera::FLY_SPEED_MIN,
+                    max: crate::camera::FLY_SPEED_MAX,
+                    value: fly_speed,
+                    step: Some(crate::camera::FLY_SPEED_STEP),
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*s).insert(CameraSpeedSlider);
+                let vl = label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: speed_text(fly_speed),
+                    style: LabelStyle::Muted,
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*vl).insert(CameraSpeedValueLabel);
+              });
           });
         });
+      });
       strip_last_cell_bottom(root.world_mut(), tv.contents[2]);
       // ============ Tab 3：Edit（体素编辑笔触：形状 / 大小 / 材质）============
       // 生效范围：**仅幽灵模式**（轨道模式左键仍是 recenter，见 camera::left_click_pick_recenter）。
       // 左键放置（只填空气）/ 右键擦除（挖空）；笔触以命中格为中心按形状展开。
-      root
-        .world_mut()
-        .entity_mut(tv.contents[3])
-        .with_children(|page| {
-          let g = tab_page_grid(ctx, page);
-          page.world_mut().entity_mut(g).with_children(|g| {
-            // -- 形状：Sphere / Cube 互斥按钮 --
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("edit-shape-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.sm),
-                    align_items: AlignItems::Center,
+      root.world_mut().entity_mut(tv.contents[3]).with_children(|page| {
+        let g = tab_page_grid(ctx, page);
+        page.world_mut().entity_mut(g).with_children(|g| {
+          // -- 形状：Sphere / Cube 互斥按钮 --
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("edit-shape-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.sm),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: t!("edit.shape").into(),
+                    style: LabelStyle::Muted,
                     ..default()
                   },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: t!("edit.shape").into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  for (shape, name) in [
-                    (BrushShape::Sphere, t!("edit.shape.sphere")),
-                    (BrushShape::Cube, t!("edit.shape.cube")),
-                  ] {
-                    let variant = if shape == edit.shape {
-                      ButtonVariant::Primary
-                    } else {
-                      ButtonVariant::Ghost
-                    };
-                    let b = button(
-                      ctx,
-                      row,
-                      ButtonConfig {
-                        text: name.into(),
-                        variant,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*b).insert(EditShapeBtn(shape));
-                  }
-                });
-            });
-            // -- 笔触大小（voxel；1 = 单格，N = (2N-1) 跨度）--
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("edit-size-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.md),
-                    align_items: AlignItems::Center,
+                );
+                for (shape, name) in [
+                  (BrushShape::Sphere, t!("edit.shape.sphere")),
+                  (BrushShape::Cube, t!("edit.shape.cube")),
+                ] {
+                  let variant =
+                    if shape == edit.shape { ButtonVariant::Primary } else { ButtonVariant::Ghost };
+                  let b =
+                    button(ctx, row, ButtonConfig { text: name.into(), variant, ..default() });
+                  row.world_mut().entity_mut(*b).insert(EditShapeBtn(shape));
+                }
+              });
+          });
+          // -- 笔触大小（voxel；1 = 单格，N = (2N-1) 跨度）--
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("edit-size-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.md),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: t!("edit.size").into(),
+                    style: LabelStyle::Muted,
                     ..default()
                   },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: t!("edit.size").into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  let s = slider(
-                    ctx,
-                    row,
-                    SliderConfig {
-                      min: EDIT_SIZE_MIN as f32,
-                      max: EDIT_SIZE_MAX as f32,
-                      value: edit.size as f32,
-                      step: Some(1.0),
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*s).insert(EditSizeSlider);
-                  let vl = label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: brush_span_text(edit.size),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*vl).insert(EditSizeValueLabel);
-                });
-            });
-            // -- 材质（预设表下标；右侧名称 + 自发光 + 预览色块）--
-            let cell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(cell).with_children(|cell| {
-              cell
-                .spawn((
-                  Name::new("edit-mat-row"),
-                  Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ctx.theme.metrics.spacing.md),
-                    align_items: AlignItems::Center,
+                );
+                let s = slider(
+                  ctx,
+                  row,
+                  SliderConfig {
+                    min: EDIT_SIZE_MIN as f32,
+                    max: EDIT_SIZE_MAX as f32,
+                    value: edit.size as f32,
+                    step: Some(1.0),
                     ..default()
                   },
-                ))
-                .with_children(|row| {
-                  label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: t!("edit.material").into(),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  let s = slider(
-                    ctx,
-                    row,
-                    SliderConfig {
-                      min: 0.0,
-                      max: (EDIT_MATERIALS.len() - 1) as f32,
-                      value: edit_mat as f32,
-                      step: Some(1.0),
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*s).insert(EditMaterialSlider);
-                  let vl = label(
-                    ctx,
-                    row,
-                    LabelConfig {
-                      text: material_text(edit_mat),
-                      style: LabelStyle::Muted,
-                      ..default()
-                    },
-                  );
-                  row.world_mut().entity_mut(*vl).insert(EditMaterialValueLabel);
-                  row.spawn((
-                    Name::new("edit-mat-swatch"),
-                    EditMaterialSwatch,
-                    Node {
-                      width: px(44.0),
-                      height: px(m.font_size.md),
-                      border: UiRect::all(px(m.border_width)),
-                      ..default()
-                    },
-                    BackgroundColor(material_color(edit_mat)),
-                    BorderColor::all(color_of(&c.border)),
-                  ));
-                });
-            });
+                );
+                row.world_mut().entity_mut(*s).insert(EditSizeSlider);
+                let vl = label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: brush_span_text(edit.size),
+                    style: LabelStyle::Muted,
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*vl).insert(EditSizeValueLabel);
+              });
+          });
+          // -- 材质（预设表下标；右侧名称 + 自发光 + 预览色块）--
+          let cell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(cell).with_children(|cell| {
+            cell
+              .spawn((
+                Name::new("edit-mat-row"),
+                Node {
+                  flex_direction: FlexDirection::Row,
+                  column_gap: px(ctx.theme.metrics.spacing.md),
+                  align_items: AlignItems::Center,
+                  ..default()
+                },
+              ))
+              .with_children(|row| {
+                label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: t!("edit.material").into(),
+                    style: LabelStyle::Muted,
+                    ..default()
+                  },
+                );
+                let s = slider(
+                  ctx,
+                  row,
+                  SliderConfig {
+                    min: 0.0,
+                    max: (EDIT_MATERIALS.len() - 1) as f32,
+                    value: edit_mat as f32,
+                    step: Some(1.0),
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*s).insert(EditMaterialSlider);
+                let vl = label(
+                  ctx,
+                  row,
+                  LabelConfig {
+                    text: material_text(edit_mat),
+                    style: LabelStyle::Muted,
+                    ..default()
+                  },
+                );
+                row.world_mut().entity_mut(*vl).insert(EditMaterialValueLabel);
+                row.spawn((
+                  Name::new("edit-mat-swatch"),
+                  EditMaterialSwatch,
+                  Node {
+                    width: px(44.0),
+                    height: px(m.font_size.md),
+                    border: UiRect::all(px(m.border_width)),
+                    ..default()
+                  },
+                  BackgroundColor(material_color(edit_mat)),
+                  BorderColor::all(color_of(&c.border)),
+                ));
+              });
           });
         });
+      });
       strip_last_cell_bottom(root.world_mut(), tv.contents[3]);
       // ============ Tab 4：Eye（眼睛适应 / 自动曝光的活参数）============
       // 链路：这里改 → `EyeAdaptSettings`（ExtractResource 变化才同步进 render world）→
       // `prepare_dda_bind_groups` 见 is_changed 写 buffer 参数区 20B → 下一帧 WESL `eye_p(i)` 读。
-      root
-        .world_mut()
-        .entity_mut(tv.contents[4])
-        .with_children(|page| {
-          let g = tab_page_grid(ctx, page);
-          page.world_mut().entity_mut(g).with_children(|g| {
-            // -- 眼睛适应总开关（运行时覆盖 GATE_NO_EYE_ADAPT 设定的初值）--
-            let tcell = tab_cell(ctx, g);
-            g.world_mut().entity_mut(tcell).with_children(|cell| {
-              let t = toggle_switch(
-                ctx,
-                cell,
-                ToggleSwitchConfig {
-                  text: Some(t!("eye.enabled").into()),
-                  checked: eye_set.enabled,
-                  ..default()
-                },
-              );
-              cell.world_mut().entity_mut(*t).insert(EyeAdaptToggle);
-            });
-            // (参数下标, 标签, min, max, step, 初值) —— 下标顺序与 WESL `eye_p(i)` 一致
-            for (idx, name, min, max, step, val) in [
-              (0u8, t!("eye.ev_up"), 0.0f32, 12.0f32, 0.25f32, eye_set.ev_max),
-              (1, t!("eye.ev_dn"), -12.0, 0.0, 0.25, eye_set.ev_min),
-              (2, t!("eye.tau_up"), 0.1, 8.0, 0.1, eye_set.tau_brighten),
-              (3, t!("eye.tau_dn"), 0.1, 8.0, 0.1, eye_set.tau_darken),
-              (4, t!("eye.key"), 0.02, 0.5, 0.01, eye_set.key),
-            ] {
-              let cell = tab_cell(ctx, g);
-              g.world_mut().entity_mut(cell).with_children(|cell| {
-                cell
-                  .spawn((
-                    Name::new("eye-param-row"),
-                    Node {
-                      flex_direction: FlexDirection::Row,
-                      column_gap: px(ctx.theme.metrics.spacing.md),
-                      align_items: AlignItems::Center,
-                      ..default()
-                    },
-                  ))
-                  .with_children(|row| {
-                    label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: name.into(),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    let s = slider(
-                      ctx,
-                      row,
-                      SliderConfig {
-                        min,
-                        max,
-                        value: val,
-                        step: Some(step),
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*s).insert(EyeParamSlider(idx));
-                    let vl = label(
-                      ctx,
-                      row,
-                      LabelConfig {
-                        text: value_text(val),
-                        style: LabelStyle::Muted,
-                        ..default()
-                      },
-                    );
-                    row.world_mut().entity_mut(*vl).insert(EyeParamValue(idx));
-                  });
-              });
-            }
+      root.world_mut().entity_mut(tv.contents[4]).with_children(|page| {
+        let g = tab_page_grid(ctx, page);
+        page.world_mut().entity_mut(g).with_children(|g| {
+          // -- 眼睛适应总开关（运行时覆盖 GATE_NO_EYE_ADAPT 设定的初值）--
+          let tcell = tab_cell(ctx, g);
+          g.world_mut().entity_mut(tcell).with_children(|cell| {
+            let t = toggle_switch(
+              ctx,
+              cell,
+              ToggleSwitchConfig {
+                text: Some(t!("eye.enabled").into()),
+                checked: eye_set.enabled,
+                ..default()
+              },
+            );
+            cell.world_mut().entity_mut(*t).insert(EyeAdaptToggle);
           });
+          // (参数下标, 标签, min, max, step, 初值) —— 下标顺序与 WESL `eye_p(i)` 一致
+          for (idx, name, min, max, step, val) in [
+            (0u8, t!("eye.ev_up"), 0.0f32, 12.0f32, 0.25f32, eye_set.ev_max),
+            (1, t!("eye.ev_dn"), -12.0, 0.0, 0.25, eye_set.ev_min),
+            (2, t!("eye.tau_up"), 0.1, 8.0, 0.1, eye_set.tau_brighten),
+            (3, t!("eye.tau_dn"), 0.1, 8.0, 0.1, eye_set.tau_darken),
+            (4, t!("eye.key"), 0.02, 0.5, 0.01, eye_set.key),
+          ] {
+            let cell = tab_cell(ctx, g);
+            g.world_mut().entity_mut(cell).with_children(|cell| {
+              cell
+                .spawn((
+                  Name::new("eye-param-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.md),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    ctx,
+                    row,
+                    LabelConfig { text: name.into(), style: LabelStyle::Muted, ..default() },
+                  );
+                  let s = slider(
+                    ctx,
+                    row,
+                    SliderConfig { min, max, value: val, step: Some(step), ..default() },
+                  );
+                  row.world_mut().entity_mut(*s).insert(EyeParamSlider(idx));
+                  let vl = label(
+                    ctx,
+                    row,
+                    LabelConfig { text: value_text(val), style: LabelStyle::Muted, ..default() },
+                  );
+                  row.world_mut().entity_mut(*vl).insert(EyeParamValue(idx));
+                });
+            });
+          }
         });
+      });
       strip_last_cell_bottom(root.world_mut(), tv.contents[4]);
     });
 
@@ -847,11 +736,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         return;
       }
       if let Ok(mut vis) = q_root.single_mut() {
-        *vis = if ev.checked {
-          Visibility::Visible
-        } else {
-          Visibility::Hidden
-        };
+        *vis = if ev.checked { Visibility::Visible } else { Visibility::Hidden };
       }
     },
   );
@@ -869,11 +754,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       let Ok(mut win) = q_win.single_mut() else {
         return;
       };
-      win.present_mode = if ev.checked {
-        PresentMode::Fifo
-      } else {
-        PresentMode::AutoNoVsync
-      };
+      win.present_mode = if ev.checked { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
       info!(
         "VSync {} → present_mode {:?}",
         if ev.checked { "on" } else { "off" },
@@ -896,11 +777,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         let i = (v as usize).min(DDGI_STAGES.len() - 1);
         t.0 = format!("{} {}", v, ddgi_stage_label(i));
       }
-      info!(
-        "DDGI stage → {} ({})",
-        ddgi.0,
-        DDGI_STAGES.get(v as usize).unwrap_or(&"?")
-      );
+      info!("DDGI stage → {} ({})", ddgi.0, DDGI_STAGES.get(v as usize).unwrap_or(&"?"));
     },
   );
 
@@ -1020,11 +897,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       };
       *mode = btn.0;
       for (_e, mut var, b) in &mut q_all {
-        *var = if b.0 == btn.0 {
-          ButtonVariant::Primary
-        } else {
-          ButtonVariant::Ghost
-        };
+        *var = if b.0 == btn.0 { ButtonVariant::Primary } else { ButtonVariant::Ghost };
       }
       info!("camera mode → {:?}", btn.0);
     },
@@ -1039,9 +912,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       if q_slider.get(ev.entity).is_err() {
         return;
       }
-      fly.speed =
-        ev.value
-          .clamp(crate::camera::FLY_SPEED_MIN, crate::camera::FLY_SPEED_MAX);
+      fly.speed = ev.value.clamp(crate::camera::FLY_SPEED_MIN, crate::camera::FLY_SPEED_MAX);
       if let Ok(mut t) = q_label.single_mut() {
         t.0 = speed_text(fly.speed);
       }
@@ -1060,11 +931,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       };
       settings.shape = btn.0;
       for (_e, mut var, b) in &mut q_all {
-        *var = if b.0 == btn.0 {
-          ButtonVariant::Primary
-        } else {
-          ButtonVariant::Ghost
-        };
+        *var = if b.0 == btn.0 { ButtonVariant::Primary } else { ButtonVariant::Ghost };
       }
       info!("edit brush shape → {:?}", btn.0);
     },
@@ -1114,14 +981,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
 /// Tab 页内网格：1 列 auto 行高，去外框 / 去 gap —— 面板 root 已提供外框，
 /// 行分割线由各 cell 的 bottom border 承担。
 fn tab_page_grid(ctx: &UiCtx, page: &mut ChildSpawner) -> Entity {
-  let g = grid(
-    ctx,
-    page,
-    GridConfig {
-      columns: 1,
-      row_height: None,
-    },
-  );
+  let g = grid(ctx, page, GridConfig { columns: 1, row_height: None });
   page.world_mut().entity_mut(*g).remove::<BorderColor>();
   if let Some(mut n) = page.world_mut().get_mut::<Node>(*g) {
     n.border = UiRect::DEFAULT;
@@ -1129,10 +989,7 @@ fn tab_page_grid(ctx: &UiCtx, page: &mut ChildSpawner) -> Entity {
     n.column_gap = px(0.0);
   }
   // 背景与 cell 一致（surface_card），行分割线改由 cell bottom border 画
-  page
-    .world_mut()
-    .entity_mut(*g)
-    .insert(BackgroundColor(color_of(&ctx.theme.colors.surface_card)));
+  page.world_mut().entity_mut(*g).insert(BackgroundColor(color_of(&ctx.theme.colors.surface_card)));
   *g
 }
 
@@ -1149,10 +1006,7 @@ fn tab_cell(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
         ..default()
       },
       BackgroundColor(color_of(&c.surface_card)),
-      BorderColor {
-        bottom: color_of(&c.border),
-        ..BorderColor::DEFAULT
-      },
+      BorderColor { bottom: color_of(&c.border), ..BorderColor::DEFAULT },
     ))
     .id()
 }
@@ -1178,11 +1032,7 @@ pub(crate) fn debug_overlay_toggle(
 ) {
   if keys.just_pressed(KeyCode::F3) {
     for mut vis in &mut q {
-      *vis = if *vis == Visibility::Visible {
-        Visibility::Hidden
-      } else {
-        Visibility::Visible
-      };
+      *vis = if *vis == Visibility::Visible { Visibility::Hidden } else { Visibility::Visible };
     }
   }
 }
@@ -1194,10 +1044,7 @@ pub(crate) fn fps_line_feed(
   orbit: Res<OrbitCamera>,
   mode: Res<crate::camera::CameraMode>,
   fly: Res<crate::camera::FlyCamera>,
-  mut q: ParamSet<(
-    Query<&mut Text, With<FpsText>>,
-    Query<&mut Text, With<CamInfoText>>,
-  )>,
+  mut q: ParamSet<(Query<&mut Text, With<FpsText>>, Query<&mut Text, With<CamInfoText>>)>,
   mut window: Local<VecDeque<f32>>, // 逐帧 delta，按时间裁剪到 5s
   mut acc: Local<f32>,
   mut frames: Local<u32>,
@@ -1225,17 +1072,9 @@ pub(crate) fn fps_line_feed(
     min_dt = min_dt.min(d);
   }
   let cur = *frames as f32 / *acc;
-  let avg = if sum > 0.0 {
-    window.len() as f32 / sum
-  } else {
-    0.0
-  };
+  let avg = if sum > 0.0 { window.len() as f32 / sum } else { 0.0 };
   let min = if max_dt > 0.0 { 1.0 / max_dt } else { 0.0 };
-  let max = if min_dt < f32::MAX && min_dt > 0.0 {
-    1.0 / min_dt
-  } else {
-    0.0
-  };
+  let max = if min_dt < f32::MAX && min_dt > 0.0 { 1.0 / min_dt } else { 0.0 };
   // 数字先各自 format! 成定长串，再交给 t! —— %{x} 是原样替换，不会吃掉 "{:>3}" 的
   // 宽度，所以 FPS/坐标的列宽与语言无关（中文只换前缀，数字对齐不变）。
   let txt = t!(

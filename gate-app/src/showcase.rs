@@ -54,9 +54,8 @@ pub(crate) struct ShowcaseRoot;
 pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
-  let showcase_plot_image = world
-    .resource_mut::<Assets<Image>>()
-    .add(blank_plot_image(SHOWCASE_PLOT_W, SHOWCASE_PLOT_H));
+  let showcase_plot_image =
+    world.resource_mut::<Assets<Image>>().add(blank_plot_image(SHOWCASE_PLOT_W, SHOWCASE_PLOT_H));
   world
     .spawn((
       Name::new("hud-showcase-panel"),
@@ -90,474 +89,354 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
         },
       );
       // ---- tab 0：组件展示 ----
-      root
-        .world_mut()
-        .entity_mut(tv.contents[0])
-        .with_children(|p| {
-          let sv = scroll_view(
+      root.world_mut().entity_mut(tv.contents[0]).with_children(|p| {
+        let sv = scroll_view(ctx, p, ScrollConfig { height: Val::Percent(100.0) });
+        p.world_mut().entity_mut(sv.content).with_children(|root| {
+          label(
             ctx,
-            p,
-            ScrollConfig {
-              height: Val::Percent(100.0),
+            root,
+            LabelConfig {
+              text: t!("showcase.title").into(),
+              style: LabelStyle::Title,
+              ..default()
             },
           );
-          p.world_mut().entity_mut(sv.content).with_children(|root| {
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.title").into(),
-                style: LabelStyle::Title,
-                ..default()
-              },
-            );
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.subtitle").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.subtitle").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
 
-            // ---- buttons：primary / secondary / ghost ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.buttons").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            root
-              .spawn((
-                Name::new("showcase-button-row"),
-                Node {
-                  column_gap: px(m.spacing.xs),
+          // ---- buttons：primary / secondary / ghost ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.buttons").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          root
+            .spawn((
+              Name::new("showcase-button-row"),
+              Node { column_gap: px(m.spacing.xs), ..default() },
+            ))
+            .with_children(|row| {
+              let b1 = button(
+                ctx,
+                row,
+                ButtonConfig { text: t!("showcase.button.primary").into(), ..default() },
+              );
+              row.world_mut().entity_mut(*b1).insert(ShowcaseButton("primary"));
+              let b2 = button(
+                ctx,
+                row,
+                ButtonConfig {
+                  text: t!("showcase.button.secondary").into(),
+                  variant: ButtonVariant::Secondary,
                   ..default()
                 },
-              ))
-              .with_children(|row| {
-                let b1 = button(
-                  ctx,
-                  row,
-                  ButtonConfig {
-                    text: t!("showcase.button.primary").into(),
-                    ..default()
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*b1)
-                  .insert(ShowcaseButton("primary"));
-                let b2 = button(
-                  ctx,
-                  row,
-                  ButtonConfig {
-                    text: t!("showcase.button.secondary").into(),
-                    variant: ButtonVariant::Secondary,
-                    ..default()
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*b2)
-                  .insert(ShowcaseButton("secondary"));
-                let b3 = button(
-                  ctx,
-                  row,
-                  ButtonConfig {
-                    text: t!("showcase.button.ghost").into(),
-                    variant: ButtonVariant::Ghost,
-                    ..default()
-                  },
-                );
-                row
-                  .world_mut()
-                  .entity_mut(*b3)
-                  .insert(ShowcaseButton("ghost"));
-              });
-            // ---- danger button（破坏性操作） ----
-            let b4 = button(
-              ctx,
-              root,
-              ButtonConfig {
-                text: t!("showcase.button.danger").into(),
-                variant: ButtonVariant::Danger,
-                ..default()
-              },
-            );
-            root
-              .world_mut()
-              .entity_mut(*b4)
-              .insert(ShowcaseButton("danger"));
-
-            // ---- checkbox ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.checkbox").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            let cb1 = checkbox(
-              ctx,
-              root,
-              CheckboxConfig {
-                text: Some(t!("showcase.checkbox.a").into()),
-                checked: true,
-                ..default()
-              },
-            );
-            root
-              .world_mut()
-              .entity_mut(*cb1)
-              .insert(ShowcaseCheckbox { label: "A" });
-            let cb2 = checkbox(
-              ctx,
-              root,
-              CheckboxConfig {
-                text: Some(t!("showcase.checkbox.b").into()),
-                checked: false,
-                ..default()
-              },
-            );
-            root
-              .world_mut()
-              .entity_mut(*cb2)
-              .insert(ShowcaseCheckbox { label: "B" });
-
-            // ---- slider：滑杆 + 实时值 ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.slider").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            root
-              .spawn((
-                Name::new("showcase-slider-row"),
-                Node {
-                  column_gap: px(m.spacing.sm),
-                  align_items: AlignItems::Center,
+              );
+              row.world_mut().entity_mut(*b2).insert(ShowcaseButton("secondary"));
+              let b3 = button(
+                ctx,
+                row,
+                ButtonConfig {
+                  text: t!("showcase.button.ghost").into(),
+                  variant: ButtonVariant::Ghost,
                   ..default()
                 },
-              ))
-              .with_children(|row| {
-                let s = slider(
-                  ctx,
-                  row,
-                  SliderConfig {
-                    min: 0.0,
-                    max: 100.0,
-                    value: 40.0,
-                    step: Some(5.0),
-                    ..default()
-                  },
-                );
-                {
-                  let w = row.world_mut();
-                  if let Some(mut node) = w.get_mut::<Node>(*s) {
-                    node.flex_grow = 1.0;
-                  }
+              );
+              row.world_mut().entity_mut(*b3).insert(ShowcaseButton("ghost"));
+            });
+          // ---- danger button（破坏性操作） ----
+          let b4 = button(
+            ctx,
+            root,
+            ButtonConfig {
+              text: t!("showcase.button.danger").into(),
+              variant: ButtonVariant::Danger,
+              ..default()
+            },
+          );
+          root.world_mut().entity_mut(*b4).insert(ShowcaseButton("danger"));
+
+          // ---- checkbox ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.checkbox").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          let cb1 = checkbox(
+            ctx,
+            root,
+            CheckboxConfig {
+              text: Some(t!("showcase.checkbox.a").into()),
+              checked: true,
+              ..default()
+            },
+          );
+          root.world_mut().entity_mut(*cb1).insert(ShowcaseCheckbox { label: "A" });
+          let cb2 = checkbox(
+            ctx,
+            root,
+            CheckboxConfig {
+              text: Some(t!("showcase.checkbox.b").into()),
+              checked: false,
+              ..default()
+            },
+          );
+          root.world_mut().entity_mut(*cb2).insert(ShowcaseCheckbox { label: "B" });
+
+          // ---- slider：滑杆 + 实时值 ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.slider").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          root
+            .spawn((
+              Name::new("showcase-slider-row"),
+              Node { column_gap: px(m.spacing.sm), align_items: AlignItems::Center, ..default() },
+            ))
+            .with_children(|row| {
+              let s = slider(
+                ctx,
+                row,
+                SliderConfig { min: 0.0, max: 100.0, value: 40.0, step: Some(5.0), ..default() },
+              );
+              {
+                let w = row.world_mut();
+                if let Some(mut node) = w.get_mut::<Node>(*s) {
+                  node.flex_grow = 1.0;
                 }
-                let v = label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: " 40.0".into(),
-                    ..default()
-                  },
-                );
-                row.world_mut().entity_mut(*v).insert(ShowcaseSliderValue);
-              });
-
-            // ---- plot：演示折线（正弦波喂入） ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.plot").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            let p = plot(
-              ctx,
-              root,
-              PlotConfig {
-                layout: PlotLayout::YAxis,
-                image: showcase_plot_image,
-                capacity: SHOWCASE_PLOT_CAP,
-                y_domain: PlotDomain::Fixed(-1.0, 1.0),
-                line_color: color_of(&c.accent_text),
-                y_axis_width: Val::Auto,
-                canvas_width: Val::Auto,
-                unit: None,
-                canvas_h: SHOWCASE_PLOT_H as f32,
-              },
-            );
-            root.world_mut().entity_mut(*p).insert(ShowcasePlot);
-
-            // ---- RingList：事件日志（L2 抬升嵌块内） ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.list").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            let inner_panel = panel(
-              ctx,
-              root,
-              PanelConfig {
-                surface: PanelSurface::Elevated,
-              },
-            );
-            root
-              .world_mut()
-              .entity_mut(*inner_panel)
-              .with_children(|inner| {
-                let l = list(ctx, inner, ListConfig { capacity: 6 });
-                let w = inner.world_mut();
-                w.entity_mut(*l).insert(ShowcaseLog);
-                // 种子日志在 spawn 处写入（组件真源初始化）
-                if let Some(mut ring) = w.get_mut::<RingList>(*l) {
-                  ring.push(t!("showcase.log.ready"));
-                  ring.push(t!("showcase.log.try_all"));
-                }
-              });
-
-            // ---- 语义色文字 ----
-            root
-              .spawn((
-                Name::new("showcase-semantic-row"),
-                Node {
-                  column_gap: px(m.spacing.sm),
-                  ..default()
-                },
-              ))
-              .with_children(|row| {
-                label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: "success".into(),
-                    style: LabelStyle::Success,
-                    ..default()
-                  },
-                );
-                label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: "warning".into(),
-                    style: LabelStyle::Warning,
-                    ..default()
-                  },
-                );
-                label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: "danger".into(),
-                    style: LabelStyle::Danger,
-                    ..default()
-                  },
-                );
-                label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: "accent".into(),
-                    style: LabelStyle::Accent,
-                    ..default()
-                  },
-                );
-              });
-
-            // ---- faint 档（仅 ≥18px 大号标签使用） ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.faint").into(),
-                style: LabelStyle::FaintLg,
-                ..default()
-              },
-            );
-
-            // ---- splitter：分割线（按父容器方向自动横/竖） ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.splitter").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            // 父为 Column → 横线
-            splitter(ctx, root);
-            root
-              .spawn((
-                Name::new("showcase-splitter-row"),
-                Node {
-                  column_gap: px(m.spacing.sm),
-                  ..default()
-                },
-              ))
-              .with_children(|row| {
-                label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: t!("showcase.splitter.left").into(),
-                    ..default()
-                  },
-                );
-                // 父为 Row → 竖线
-                splitter(ctx, row);
-                label(
-                  ctx,
-                  row,
-                  LabelConfig {
-                    text: t!("showcase.splitter.right").into(),
-                    ..default()
-                  },
-                );
-              });
-
-            // ---- grid：格线连通（gap 填色 trick，border-collapse 等效） ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.grid").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            let g = grid(
-              ctx,
-              root,
-              GridConfig {
-                columns: 3,
-                row_height: Some(28.0),
-              },
-            );
-            root.world_mut().entity_mut(*g).with_children(|g| {
-              for (i, s) in ["A1", "A2", "A3", "B1", "B2", "B3"].iter().enumerate() {
-                let surface = if i < 3 {
-                  PanelSurface::Card
-                } else {
-                  PanelSurface::Elevated
-                };
-                let cell = grid_cell(ctx, g, surface);
-                g.world_mut().entity_mut(cell).with_children(|cell| {
-                  label(
-                    ctx,
-                    cell,
-                    LabelConfig {
-                      text: (*s).into(),
-                      ..default()
-                    },
-                  );
-                });
               }
+              let v = label(ctx, row, LabelConfig { text: " 40.0".into(), ..default() });
+              row.world_mut().entity_mut(*v).insert(ShowcaseSliderValue);
             });
 
-            // ---- scroll view 演示（固定高度，内容超出可滚轮滚动） ----
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.scroll").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            let sv = scroll_view(ctx, root, ScrollConfig { height: px(120.0) });
-            root
-              .world_mut()
-              .entity_mut(sv.content)
-              .with_children(|svc| {
-                for i in 0..16 {
-                  label(
-                    ctx,
-                    svc,
-                    LabelConfig {
-                      text: t!("showcase.scroll_row", i = i).to_string(),
-                      ..default()
-                    },
-                  );
-                }
-              });
-          });
-        });
-
-      // ---- tab 1：数据展示（table） ----
-      root
-        .world_mut()
-        .entity_mut(tv.contents[1])
-        .with_children(|p| {
-          let sv = scroll_view(
+          // ---- plot：演示折线（正弦波喂入） ----
+          label(
             ctx,
-            p,
-            ScrollConfig {
-              height: Val::Percent(100.0),
+            root,
+            LabelConfig {
+              text: t!("showcase.section.plot").into(),
+              style: LabelStyle::Muted,
+              ..default()
             },
           );
-          p.world_mut().entity_mut(sv.content).with_children(|root| {
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.title.data").into(),
-                style: LabelStyle::Title,
-                ..default()
-              },
-            );
-            label(
-              ctx,
-              root,
-              LabelConfig {
-                text: t!("showcase.section.table").into(),
-                style: LabelStyle::Muted,
-                ..default()
-              },
-            );
-            table(
-              ctx,
-              root,
-              TableConfig {
-                headers: vec![
-                  t!("showcase.table.name").to_string(),
-                  t!("showcase.table.value").to_string(),
-                  t!("showcase.table.status").to_string(),
-                ],
-                rows: [
-                  ["fps", "60", "ok"],
-                  ["frame", "16.7ms", "ok"],
-                  ["mem", "1.2gb", "warn"],
-                  ["gpu", "rtx 3070", "ok"],
-                ]
-                .iter()
-                .map(|r| r.iter().map(|s| s.to_string()).collect())
-                .collect(),
-              },
-            );
+          let p = plot(
+            ctx,
+            root,
+            PlotConfig {
+              layout: PlotLayout::YAxis,
+              image: showcase_plot_image,
+              capacity: SHOWCASE_PLOT_CAP,
+              y_domain: PlotDomain::Fixed(-1.0, 1.0),
+              line_color: color_of(&c.accent_text),
+              y_axis_width: Val::Auto,
+              canvas_width: Val::Auto,
+              unit: None,
+              canvas_h: SHOWCASE_PLOT_H as f32,
+            },
+          );
+          root.world_mut().entity_mut(*p).insert(ShowcasePlot);
+
+          // ---- RingList：事件日志（L2 抬升嵌块内） ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.list").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          let inner_panel = panel(ctx, root, PanelConfig { surface: PanelSurface::Elevated });
+          root.world_mut().entity_mut(*inner_panel).with_children(|inner| {
+            let l = list(ctx, inner, ListConfig { capacity: 6 });
+            let w = inner.world_mut();
+            w.entity_mut(*l).insert(ShowcaseLog);
+            // 种子日志在 spawn 处写入（组件真源初始化）
+            if let Some(mut ring) = w.get_mut::<RingList>(*l) {
+              ring.push(t!("showcase.log.ready"));
+              ring.push(t!("showcase.log.try_all"));
+            }
+          });
+
+          // ---- 语义色文字 ----
+          root
+            .spawn((
+              Name::new("showcase-semantic-row"),
+              Node { column_gap: px(m.spacing.sm), ..default() },
+            ))
+            .with_children(|row| {
+              label(
+                ctx,
+                row,
+                LabelConfig { text: "success".into(), style: LabelStyle::Success, ..default() },
+              );
+              label(
+                ctx,
+                row,
+                LabelConfig { text: "warning".into(), style: LabelStyle::Warning, ..default() },
+              );
+              label(
+                ctx,
+                row,
+                LabelConfig { text: "danger".into(), style: LabelStyle::Danger, ..default() },
+              );
+              label(
+                ctx,
+                row,
+                LabelConfig { text: "accent".into(), style: LabelStyle::Accent, ..default() },
+              );
+            });
+
+          // ---- faint 档（仅 ≥18px 大号标签使用） ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.faint").into(),
+              style: LabelStyle::FaintLg,
+              ..default()
+            },
+          );
+
+          // ---- splitter：分割线（按父容器方向自动横/竖） ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.splitter").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          // 父为 Column → 横线
+          splitter(ctx, root);
+          root
+            .spawn((
+              Name::new("showcase-splitter-row"),
+              Node { column_gap: px(m.spacing.sm), ..default() },
+            ))
+            .with_children(|row| {
+              label(
+                ctx,
+                row,
+                LabelConfig { text: t!("showcase.splitter.left").into(), ..default() },
+              );
+              // 父为 Row → 竖线
+              splitter(ctx, row);
+              label(
+                ctx,
+                row,
+                LabelConfig { text: t!("showcase.splitter.right").into(), ..default() },
+              );
+            });
+
+          // ---- grid：格线连通（gap 填色 trick，border-collapse 等效） ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.grid").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          let g = grid(ctx, root, GridConfig { columns: 3, row_height: Some(28.0) });
+          root.world_mut().entity_mut(*g).with_children(|g| {
+            for (i, s) in ["A1", "A2", "A3", "B1", "B2", "B3"].iter().enumerate() {
+              let surface = if i < 3 { PanelSurface::Card } else { PanelSurface::Elevated };
+              let cell = grid_cell(ctx, g, surface);
+              g.world_mut().entity_mut(cell).with_children(|cell| {
+                label(ctx, cell, LabelConfig { text: (*s).into(), ..default() });
+              });
+            }
+          });
+
+          // ---- scroll view 演示（固定高度，内容超出可滚轮滚动） ----
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.scroll").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          let sv = scroll_view(ctx, root, ScrollConfig { height: px(120.0) });
+          root.world_mut().entity_mut(sv.content).with_children(|svc| {
+            for i in 0..16 {
+              label(
+                ctx,
+                svc,
+                LabelConfig { text: t!("showcase.scroll_row", i = i).to_string(), ..default() },
+              );
+            }
           });
         });
+      });
+
+      // ---- tab 1：数据展示（table） ----
+      root.world_mut().entity_mut(tv.contents[1]).with_children(|p| {
+        let sv = scroll_view(ctx, p, ScrollConfig { height: Val::Percent(100.0) });
+        p.world_mut().entity_mut(sv.content).with_children(|root| {
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.title.data").into(),
+              style: LabelStyle::Title,
+              ..default()
+            },
+          );
+          label(
+            ctx,
+            root,
+            LabelConfig {
+              text: t!("showcase.section.table").into(),
+              style: LabelStyle::Muted,
+              ..default()
+            },
+          );
+          table(
+            ctx,
+            root,
+            TableConfig {
+              headers: vec![
+                t!("showcase.table.name").to_string(),
+                t!("showcase.table.value").to_string(),
+                t!("showcase.table.status").to_string(),
+              ],
+              rows: [
+                ["fps", "60", "ok"],
+                ["frame", "16.7ms", "ok"],
+                ["mem", "1.2gb", "warn"],
+                ["gpu", "rtx 3070", "ok"],
+              ]
+              .iter()
+              .map(|r| r.iter().map(|s| s.to_string()).collect())
+              .collect(),
+            },
+          );
+        });
+      });
     });
 
   // 按钮点击 → 写事件日志（UiClick 观察者）。日志首条由 spawn 处播种。
@@ -583,11 +462,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
         return;
       };
       if let Ok(mut ring) = q_log.single_mut() {
-        ring.push(format!(
-          "checkbox {}: {}",
-          cb.label,
-          if ev.checked { "on" } else { "off" }
-        ));
+        ring.push(format!("checkbox {}: {}", cb.label, if ev.checked { "on" } else { "off" }));
       }
     },
   );
@@ -664,19 +539,13 @@ mod tests {
       .query_filtered::<Entity, With<ShowcasePlot>>()
       .single(app.world())
       .expect("showcase plot spawned");
-    let tab_pages: Vec<Entity> = app
-      .world_mut()
-      .query_filtered::<Entity, With<TabContent>>()
-      .iter(app.world())
-      .collect();
+    let tab_pages: Vec<Entity> =
+      app.world_mut().query_filtered::<Entity, With<TabContent>>().iter(app.world()).collect();
     assert_eq!(tab_pages.len(), 2, "both tab pages spawned");
 
     // 页面与演示控件都在面板子树内
     let chain = ancestor_chain(app.world(), plot);
-    assert!(
-      chain.contains(&panel),
-      "plot must be a descendant of the panel"
-    );
+    assert!(chain.contains(&panel), "plot must be a descendant of the panel");
     assert!(
       ancestor_chain(app.world(), tab_pages[0]).contains(&panel)
         && ancestor_chain(app.world(), tab_pages[1]).contains(&panel),

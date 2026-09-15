@@ -99,11 +99,7 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
   let root = parent
     .spawn((
       Name::new("ui-tab-view"),
-      TabView {
-        active,
-        count,
-        fit_content: config.fit_content,
-      },
+      TabView { active, count, fit_content: config.fit_content },
       Node {
         flex_direction: FlexDirection::Column,
         width: Val::Percent(100.0),
@@ -147,16 +143,8 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
                 border: UiRect::bottom(px(if is_active { 2.0 } else { 0.0 })),
                 ..default()
               },
-              BackgroundColor(if is_active {
-                color_of(&c.surface_elevated)
-              } else {
-                Color::NONE
-              }),
-              BorderColor::all(if is_active {
-                color_of(&c.text_primary)
-              } else {
-                Color::NONE
-              }),
+              BackgroundColor(if is_active { color_of(&c.surface_elevated) } else { Color::NONE }),
+              BorderColor::all(if is_active { color_of(&c.text_primary) } else { Color::NONE }),
               FocusPolicy::Block,
             ));
             if is_disabled {
@@ -214,11 +202,7 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
                   top: px(0.0),
                   left: px(0.0),
                   width: Val::Percent(100.0),
-                  height: if config.fit_content {
-                    Val::Auto
-                  } else {
-                    Val::Percent(100.0)
-                  },
+                  height: if config.fit_content { Val::Auto } else { Val::Percent(100.0) },
                   flex_direction: FlexDirection::Column,
                   ..default()
                 },
@@ -238,10 +222,7 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
     })
     .id();
 
-  TabViewHandle {
-    entity: root,
-    contents: content_entities,
-  }
+  TabViewHandle { entity: root, contents: content_entities }
 }
 
 /// 标签页状态机：点击 tab 切换 active（触发 [`TabChanged`]）+ tab 视觉 + content 可见性
@@ -252,18 +233,8 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
 pub fn tab_view_system(
   mut commands: Commands,
   mut q_views: Query<(Entity, &mut TabView, &Children)>,
-  mut q_tab: Query<(
-    &TabButton,
-    &Interaction,
-    &mut InteractionPrev,
-    Has<UiDisabled>,
-  )>,
-  mut q_tab_node: Query<(
-    &mut BackgroundColor,
-    &mut BorderColor,
-    &Children,
-    Has<UiDisabled>,
-  )>,
+  mut q_tab: Query<(&TabButton, &Interaction, &mut InteractionPrev, Has<UiDisabled>)>,
+  mut q_tab_node: Query<(&mut BackgroundColor, &mut BorderColor, &Children, Has<UiDisabled>)>,
   mut q_tab_text: Query<&mut TextColor>,
   q_children: Query<&Children>,
   mut q_content: Query<(&TabContent, &mut Visibility, &mut Node)>,
@@ -296,10 +267,7 @@ pub fn tab_view_system(
         && view.active != tab_btn.index
       {
         view.active = tab_btn.index;
-        commands.trigger(TabChanged {
-          entity: view_e,
-          index: tab_btn.index,
-        });
+        commands.trigger(TabChanged { entity: view_e, index: tab_btn.index });
       }
       prev.0 = *inter;
     }
@@ -321,17 +289,10 @@ pub fn tab_view_system(
       } else {
         Color::NONE
       };
-      let target_bg = if disabled && target_bg != Color::NONE {
-        dim_color(target_bg)
-      } else {
-        target_bg
-      };
+      let target_bg =
+        if disabled && target_bg != Color::NONE { dim_color(target_bg) } else { target_bg };
       bg.0 = target_bg;
-      let target_border = if is_active {
-        color_of(&c.text_primary)
-      } else {
-        Color::NONE
-      };
+      let target_border = if is_active { color_of(&c.text_primary) } else { Color::NONE };
       let target_border = if disabled && target_border != Color::NONE {
         dim_color(target_border)
       } else {
@@ -345,11 +306,7 @@ pub fn tab_view_system(
       } else {
         color_of(&c.text_muted)
       };
-      let text_color = if disabled {
-        dim_color(text_color)
-      } else {
-        text_color
-      };
+      let text_color = if disabled { dim_color(text_color) } else { text_color };
       for child in tab_children.iter() {
         if let Ok(mut tc) = q_tab_text.get_mut(child) {
           tc.0 = text_color;
@@ -366,19 +323,12 @@ pub fn tab_view_system(
         let is_active = tc.index == view.active;
         // 选中页 = Inherited（跟随祖先，面板整体隐藏时页面跟着隐藏）；
         // 显式 Visible 会无视祖先强制可见 → 页面单独悬浮
-        *vis = if is_active {
-          Visibility::Inherited
-        } else {
-          Visibility::Hidden
-        };
+        *vis = if is_active { Visibility::Inherited } else { Visibility::Hidden };
         // 自适应模式：活动页必须流入布局（Relative）才能撑开容器高度；
         // 隐藏页脱流（Absolute）不占位。填充模式全部 Absolute，不动。
         if view.fit_content {
-          node.position_type = if is_active {
-            PositionType::Relative
-          } else {
-            PositionType::Absolute
-          };
+          node.position_type =
+            if is_active { PositionType::Relative } else { PositionType::Absolute };
         }
       }
     }
@@ -391,12 +341,7 @@ mod tests {
   use crate::theme::default_theme;
 
   fn cfg() -> TabConfig {
-    TabConfig {
-      tabs: vec!["a".into(), "b".into()],
-      active: 0,
-      fit_content: false,
-      ..default()
-    }
+    TabConfig { tabs: vec!["a".into(), "b".into()], active: 0, fit_content: false, ..default() }
   }
 
   #[test]
@@ -420,10 +365,7 @@ mod tests {
       Visibility::Inherited,
       "active content inherits (Visible would ignore ancestor Hidden)"
     );
-    assert_eq!(
-      *w.get::<Visibility>(h.contents[1]).unwrap(),
-      Visibility::Hidden
-    );
+    assert_eq!(*w.get::<Visibility>(h.contents[1]).unwrap(), Visibility::Hidden);
   }
 
   #[test]
@@ -454,30 +396,14 @@ mod tests {
     let bar_children = w.get::<Children>(bar).unwrap();
     let tab1 = bar_children[1];
 
-    app
-      .world_mut()
-      .get_mut::<Interaction>(tab1)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(tab1).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(tab1)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(tab1).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
 
     let w = app.world();
-    assert_eq!(
-      w.get::<TabView>(*h).unwrap().active,
-      1,
-      "active switched to 1"
-    );
-    assert_eq!(
-      *changes.lock().unwrap(),
-      vec![(*h, 1)],
-      "switch emits TabChanged(1)"
-    );
+    assert_eq!(w.get::<TabView>(*h).unwrap().active, 1, "active switched to 1");
+    assert_eq!(*changes.lock().unwrap(), vec![(*h, 1)], "switch emits TabChanged(1)");
     assert_eq!(
       *w.get::<Visibility>(h.contents[0]).unwrap(),
       Visibility::Hidden,
@@ -491,23 +417,11 @@ mod tests {
 
     // 点击已选中的 tab：不重复发事件
     let changes_before = changes.lock().unwrap().len();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(tab1)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(tab1).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(tab1)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(tab1).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
-    assert_eq!(
-      changes.lock().unwrap().len(),
-      changes_before,
-      "re-click active tab emits no event"
-    );
+    assert_eq!(changes.lock().unwrap().len(), changes_before, "re-click active tab emits no event");
   }
 
   #[test]
@@ -524,12 +438,7 @@ mod tests {
       res = Some(tab_view(
         &ctx,
         p,
-        TabConfig {
-          tabs: vec!["a".into(), "b".into()],
-          active: 0,
-          fit_content: true,
-          ..default()
-        },
+        TabConfig { tabs: vec!["a".into(), "b".into()], active: 0, fit_content: true, ..default() },
       ));
     });
     let h = res.unwrap();
@@ -546,11 +455,7 @@ mod tests {
       PositionType::Relative,
       "active page in flow"
     );
-    assert_eq!(
-      w.get::<Node>(h.contents[0]).unwrap().height,
-      Val::Auto,
-      "active page height auto"
-    );
+    assert_eq!(w.get::<Node>(h.contents[0]).unwrap().height, Val::Auto, "active page height auto");
     assert_eq!(
       w.get::<Node>(h.contents[1]).unwrap().position_type,
       PositionType::Absolute,
@@ -560,17 +465,9 @@ mod tests {
     // 切到 tab 1：位置类型随可见性翻转
     let bar = w.get::<Children>(*h).unwrap()[0];
     let tab1 = w.get::<Children>(bar).unwrap()[1];
-    app
-      .world_mut()
-      .get_mut::<Interaction>(tab1)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(tab1).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(tab1)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(tab1).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
 
     let w = app.world();

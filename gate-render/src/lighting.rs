@@ -108,9 +108,7 @@ impl Default for LightingTheme {
       }),
       ambient: [0.08, 0.09, 0.12],
       exposure: 1.0,
-      sky: Some(SkyCfg {
-        color: MINECRAFT_SKY,
-      }),
+      sky: Some(SkyCfg { color: MINECRAFT_SKY }),
     }
   }
 }
@@ -133,11 +131,7 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
       exposure_pad: Vec4::new(theme.exposure, 0.0, 0.0, 0.0),
     },
     lights: [const {
-      LightDesc {
-        kind_pos_dir: Vec4::ZERO,
-        color_intensity: Vec4::ZERO,
-        shape: Vec4::ZERO,
-      }
+      LightDesc { kind_pos_dir: Vec4::ZERO, color_intensity: Vec4::ZERO, shape: Vec4::ZERO }
     }; MAX_LIGHTS],
     sky_color: Vec4::new(MINECRAFT_SKY[0], MINECRAFT_SKY[1], MINECRAFT_SKY[2], 0.0),
   };

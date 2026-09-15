@@ -25,9 +25,7 @@ fn validate_wgsl(label: &str, src: &str) -> naga::Module {
     naga::valid::ValidationFlags::all(),
     naga::valid::Capabilities::all(),
   );
-  validator
-    .validate(&module)
-    .unwrap_or_else(|e| panic!("{label} naga validate 失败: {e:?}"));
+  validator.validate(&module).unwrap_or_else(|e| panic!("{label} naga validate 失败: {e:?}"));
   module
 }
 
@@ -48,11 +46,7 @@ fn wgsl_shaders_parse_and_validate() {
 fn dda_entry_points_are_preserved() {
   let dda = gate_render::shader::compile_dda_wesl().expect("dda WESL 包编译失败");
   let module = validate_wgsl("dda (WESL)", &dda);
-  let mut names: Vec<&str> = module
-    .entry_points
-    .iter()
-    .map(|e| e.name.as_str())
-    .collect();
+  let mut names: Vec<&str> = module.entry_points.iter().map(|e| e.name.as_str()).collect();
   names.sort_unstable();
   assert_eq!(
     names,
@@ -86,10 +80,7 @@ fn shadow_surface_eps_matches_rust_const() {
     "const SHADOW_SURFACE_EPS: f32 = {};",
     gate_render::brickmap::dda::wgsl_consts::SHADOW_SURFACE_EPS
   );
-  assert!(
-    src.contains(&expect),
-    "ddgi/consts.wesl 中未找到 `{expect}`"
-  );
+  assert!(src.contains(&expect), "ddgi/consts.wesl 中未找到 `{expect}`");
 }
 
 /// DDGI 的跨端常量（图集纹素数 / 层内轴 / 层数 / 级数 / 射线预算 / indirect word 布局）**以
@@ -101,8 +92,7 @@ fn shadow_surface_eps_matches_rust_const() {
 #[test]
 fn ddgi_cross_boundary_consts_match_compiled_wgsl() {
   let dda = gate_render::shader::compile_dda_wesl().expect("dda WESL 包编译失败");
-  let used =
-    gate_render::wesl_consts::parse_u32_consts_in_source(&dda);
+  let used = gate_render::wesl_consts::parse_u32_consts_in_source(&dda);
   let c = gate_render::wesl_consts::ddgi_consts();
   // DDGI_ATLAS_LAYERS 不参与 WESL 的寻址（只有 Rust 用它定纹理层数）→ 展平后可能被剔除，
   // 不在此断言；其余常量都是 shader 真正要用的，必须逐字一致。

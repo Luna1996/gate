@@ -11,10 +11,8 @@ use bevy::prelude::*;
 use bevy::shader::Shader;
 
 /// voxel raytrace WESL 包根目录（内含 `main.wesl` 与各子模块）。
-pub const DDA_WESL_DIR: &str = concat!(
-  env!("CARGO_MANIFEST_DIR"),
-  "/../gate-app/assets/shaders/voxel_raytrace"
-);
+pub const DDA_WESL_DIR: &str =
+  concat!(env!("CARGO_MANIFEST_DIR"), "/../gate-app/assets/shaders/voxel_raytrace");
 
 /// dda shader 的逻辑资产路径（`Shader::path`，仅用于日志/诊断）。
 pub const DDA_SHADER_PATH: &str = "shaders/voxel_raytrace/main.wesl";
@@ -34,20 +32,11 @@ pub fn compile_dda_wesl() -> Result<String, wesl::Error> {
 /// 而非 `compile(文件路径)`：后者的「文件路径 → 模块路径」推断对根模块有歧义。
 pub fn compile_wesl_entry(entry: impl AsRef<Path>) -> Result<String, wesl::Error> {
   let entry = entry.as_ref();
-  let dir: PathBuf = entry
-    .parent()
-    .map(Path::to_path_buf)
-    .unwrap_or_else(|| PathBuf::from("."));
-  let stem = entry
-    .file_stem()
-    .and_then(|s| s.to_str())
-    .unwrap_or("package");
+  let dir: PathBuf = entry.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+  let stem = entry.file_stem().and_then(|s| s.to_str()).unwrap_or("package");
   // 入口模块：包根目录下 `<stem>.wesl`（`main.wesl` → `package::main`）。
-  let module_path = if stem == "package" {
-    "package".to_string()
-  } else {
-    format!("package::{stem}")
-  };
+  let module_path =
+    if stem == "package" { "package".to_string() } else { format!("package::{stem}") };
 
   let options = wesl::CompileOptions {
     // 禁用名字改写（mangler）：Rust 侧按源码里的常量名 / 入口点名引用，不能被 mangle。

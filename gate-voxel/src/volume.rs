@@ -75,11 +75,7 @@ impl Default for VolumeTransform {
 }
 
 impl VolumeTransform {
-  pub const IDENTITY: Self = Self {
-    pos: Vec3::ZERO,
-    rot: Mat3::IDENTITY,
-    scale: 1.0,
-  };
+  pub const IDENTITY: Self = Self { pos: Vec3::ZERO, rot: Mat3::IDENTITY, scale: 1.0 };
 
   pub fn new(pos: Vec3, rot: Mat3, scale: f32) -> Self {
     Self { pos, rot, scale }
@@ -175,11 +171,7 @@ impl VolumeGrid {
 
   /// 构造独立物体 volume：`obj_id` 由渲染器分配（>=0），`pos/rot/scale` 为世界变换。
   pub fn new_object(obj_id: i32, pos: Vec3, rot: Mat3, scale: f32) -> Self {
-    Self {
-      obj_id,
-      transform: VolumeTransform::new(pos, rot, scale),
-      ..Self::default()
-    }
+    Self { obj_id, transform: VolumeTransform::new(pos, rot, scale), ..Self::default() }
   }
 
   pub fn transform(&self) -> VolumeTransform {
@@ -228,10 +220,7 @@ impl VolumeGrid {
   /// chunk 间零共享 → rayon 并行。
   pub fn compact_all(&mut self) {
     use rayon::prelude::*;
-    self
-      .chunks
-      .par_iter_mut()
-      .for_each(|(_, tree)| tree.compact());
+    self.chunks.par_iter_mut().for_each(|(_, tree)| tree.compact());
   }
 
   /// 挂载外部预构建的 chunk 树（大体积批量导入专用）。
@@ -357,10 +346,8 @@ impl VolumeGrid {
 
   /// 写指定 ChunkCoord 下 level 2 brick (bx, by, bz) 的组件 ID
   pub fn set_comp(&mut self, chunk: ChunkCoord, bx: u32, by: u32, bz: u32, comp_id: u16) {
-    let arr = self
-      .comp_layer
-      .entry(chunk)
-      .or_insert_with(|| Box::new([0u16; COMP_BRICKS_PER_CHUNK]));
+    let arr =
+      self.comp_layer.entry(chunk).or_insert_with(|| Box::new([0u16; COMP_BRICKS_PER_CHUNK]));
     let idx = (bx as usize)
       + (by as usize) * COMP_BRICK_EXTENT as usize
       + (bz as usize) * COMP_BRICK_EXTENT as usize * COMP_BRICK_EXTENT as usize;
@@ -405,11 +392,7 @@ impl VolumeGrid {
 
   pub fn get_state(&self, id: u8, word: usize) -> u32 {
     debug_assert!(word < 4);
-    self
-      .state_table
-      .get(id as usize)
-      .map(|a| a[word])
-      .unwrap_or(0)
+    self.state_table.get(id as usize).map(|a| a[word]).unwrap_or(0)
   }
 
   pub fn state_table_bytes(&self) -> &[u8] {
@@ -512,14 +495,8 @@ mod tests {
     assert_eq!(vols.len(), 3);
 
     // 可变访问
-    vols
-      .object_mut(0)
-      .unwrap()
-      .set_voxel_ivec3(IVec3::new(5, 5, 5), 3);
-    assert_eq!(
-      vols.object(0).unwrap().get_voxel(VoxelCoord::new(5, 5, 5)),
-      Some(3)
-    );
+    vols.object_mut(0).unwrap().set_voxel_ivec3(IVec3::new(5, 5, 5), 3);
+    assert_eq!(vols.object(0).unwrap().get_voxel(VoxelCoord::new(5, 5, 5)), Some(3));
 
     // 主世界可变
     vols.main_mut().set_voxel_ivec3(IVec3::new(10, 10, 10), 7);

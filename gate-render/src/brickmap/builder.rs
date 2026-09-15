@@ -207,14 +207,7 @@ impl BrickMapBuilder {
 
   /// 调色板整表重铺（256 条全量 2KB，无增量必要）
   pub fn write_palette(&mut self, grid: &VolumeGrid) {
-    for (i, [a, b]) in self
-      .buffers
-      .b_palette
-      .as_chunks_mut::<2>()
-      .0
-      .iter_mut()
-      .enumerate()
-    {
+    for (i, [a, b]) in self.buffers.b_palette.as_chunks_mut::<2>().0.iter_mut().enumerate() {
       let [x, y] = pack_palette_entry(grid.palette().get(i as u8));
       *a = x;
       *b = y;
@@ -433,11 +426,7 @@ impl VolumesBuilder {
       let g = &buffers.globals;
       let tr = self.transforms[i];
       let origin = IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z);
-      let dims = IVec3::new(
-        g.index_dims_x as i32,
-        g.index_dims_y as i32,
-        g.index_dims_z as i32,
-      );
+      let dims = IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32);
       let mut desc = GridDesc::from_transform(
         tr.pos,
         tr.rot,
@@ -470,16 +459,8 @@ impl VolumesBuilder {
 
     // 漂移检测：volume 数变化 / 任一 tree_base 或 palette_base 变化 → 全量
     let bases_shifted = self.prev_tree_bases.len() != tree_bases.len()
-      || self
-        .prev_tree_bases
-        .iter()
-        .zip(tree_bases.iter())
-        .any(|(p, c)| p != c)
-      || self
-        .prev_palette_bases
-        .iter()
-        .zip(palette_bases.iter())
-        .any(|(p, c)| p != c);
+      || self.prev_tree_bases.iter().zip(tree_bases.iter()).any(|(p, c)| p != c)
+      || self.prev_palette_bases.iter().zip(palette_bases.iter()).any(|(p, c)| p != c);
     let need_full = self.force_full || bases_shifted;
 
     let dirty_chunks: usize = self.builders.iter().map(|b| b.dirty_struct.len()).sum();
@@ -638,16 +619,10 @@ mod tests {
     {
       let g = &b.buffers().globals;
       assert_eq!(g.tile_count, 1);
-      assert_eq!(
-        g.node_words as usize,
-        b.buffers().b_struct.len() - TREE_BASE
-      );
+      assert_eq!(g.node_words as usize, b.buffers().b_struct.len() - TREE_BASE);
       assert!(g.node_words > 0, "单体素分裂树非空");
       // 单 chunk 窗口：min-1 起 +3
-      assert_eq!(
-        (g.index_origin_x, g.index_origin_y, g.index_origin_z),
-        (-1, -1, -1)
-      );
+      assert_eq!((g.index_origin_x, g.index_origin_y, g.index_origin_z), (-1, -1, -1));
       assert_eq!((g.index_dims_x, g.index_dims_y, g.index_dims_z), (3, 3, 3));
       // 窗口条目 = 树基址 + 1
       let ip = chunk_index_pos(b.origin(), b.dims(), IVec3::ZERO).unwrap();
@@ -658,16 +633,8 @@ mod tests {
     let v = BrickMapView::new(b.buffers());
     assert_eq!(v.get_voxel(IVec3::new(5, 6, 7)), Some(3));
     assert_eq!(v.get_voxel(IVec3::new(6, 6, 7)), None);
-    assert_eq!(
-      v.get_voxel(IVec3::new(255, 255, 255)),
-      None,
-      "同 chunk 邻域空"
-    );
-    assert_eq!(
-      v.get_voxel(IVec3::new(256, 0, 0)),
-      None,
-      "相邻 chunk 窗口内无树"
-    );
+    assert_eq!(v.get_voxel(IVec3::new(255, 255, 255)), None, "同 chunk 邻域空");
+    assert_eq!(v.get_voxel(IVec3::new(256, 0, 0)), None, "相邻 chunk 窗口内无树");
     assert_eq!(v.get_voxel(IVec3::new(-1, 0, 0)), None);
     assert!(v.cell_occupied(IVec3::new(0, 0, 0)));
     assert!(!v.cell_occupied(IVec3::new(1, 0, 0)));
@@ -686,13 +653,7 @@ mod tests {
     // 内容 chunk：x∈{-2,-1,0,1}，y/z∈{-2..0}：窗口必含负分量
     assert!(g.tile_count >= 4, "应覆盖多个 chunk（含负坐标）");
     assert!(g.index_origin_x < 0 && g.index_origin_y < 0);
-    assert_view_matches(
-      &grid,
-      &b,
-      IVec3::new(-310, -310, -310),
-      IVec3::splat(310),
-      7,
-    );
+    assert_view_matches(&grid, &b, IVec3::new(-310, -310, -310), IVec3::splat(310), 7);
   }
 
   #[test]
@@ -707,20 +668,14 @@ mod tests {
 
     // 增量累积：同窗口空起，逐 chunk 重建（排序确定性顺序）
     let mut inc = BrickMapBuilder::new_unbuilt(&grid);
-    let mut coords: Vec<ChunkCoord> = grid
-      .chunk_coords()
-      .filter(|&c| chunk_has_content(&grid, c))
-      .collect();
+    let mut coords: Vec<ChunkCoord> =
+      grid.chunk_coords().filter(|&c| chunk_has_content(&grid, c)).collect();
     coords.sort_by_key(|&c| coord_key(c));
     for c in coords {
       assert_eq!(inc.update_chunk(&grid, c), ChunkUpdate::Rebuilt);
     }
 
-    assert_eq!(
-      full.buffers().b_struct,
-      inc.buffers().b_struct,
-      "b_struct 字节级一致"
-    );
+    assert_eq!(full.buffers().b_struct, inc.buffers().b_struct, "b_struct 字节级一致");
     assert_eq!(full.buffers().b_palette, inc.buffers().b_palette);
     assert_eq!(full.buffers().globals, inc.buffers().globals);
     for c in grid.chunk_coords() {
@@ -735,24 +690,15 @@ mod tests {
     fill_box(&mut grid, IVec3::new(300, 0, 0), IVec3::splat(64), 2);
     let mut b = BrickMapBuilder::build_full(&grid);
     let stale = b.take_dirty_ranges();
-    assert!(
-      stale.struct_ranges.is_empty() && !stale.palette_changed,
-      "build_full 不得残留脏区间"
-    );
+    assert!(stale.struct_ranges.is_empty() && !stale.palette_changed, "build_full 不得残留脏区间");
     // 一次真实增量后，脏区间只含该 chunk 自身（条目字 + 新树 << 树区总量）
     grid.set_voxel_ivec3(IVec3::new(3, 3, 3), 5);
-    assert_eq!(
-      b.update_chunk(&grid, ChunkCoord::new(0, 0, 0)),
-      ChunkUpdate::Rebuilt
-    );
+    assert_eq!(b.update_chunk(&grid, ChunkCoord::new(0, 0, 0)), ChunkUpdate::Rebuilt);
     let d = b.take_dirty_ranges();
     let total: usize = d.struct_ranges.iter().map(|&(a, hi)| hi - a).sum();
     assert!(total > 0, "增量应有脏区间");
     // 2 个 chunk 树 + 窗口条目远小于 Region ① 的 1MB
-    assert!(
-      total < 2 * 1024 * 1024,
-      "增量脏区间应远小于 1MB 窗口，实际 {total}B"
-    );
+    assert!(total < 2 * 1024 * 1024, "增量脏区间应远小于 1MB 窗口，实际 {total}B");
   }
 
   #[test]
@@ -765,18 +711,12 @@ mod tests {
     let base1 = b.chunk_base(ChunkCoord::new(1, 0, 0)).unwrap();
     // 排序 append：(0,0,0) 先于 (1,0,0) → 各树字数可由基址差反推
     let words0 = base1 - base0;
-    let words1 = grid
-      .chunk(ChunkCoord::new(1, 0, 0))
-      .expect("chunk (1,0,0) 存在")
-      .serialize()
-      .len();
+    let words1 =
+      grid.chunk(ChunkCoord::new(1, 0, 0)).expect("chunk (1,0,0) 存在").serialize().len();
 
     // 编辑 1：既有 chunk 加体素 → append 新树，旧树作废
     assert!(grid.set_voxel_ivec3(IVec3::new(3, 3, 3), 5).is_some());
-    assert_eq!(
-      b.update_chunk(&grid, ChunkCoord::new(0, 0, 0)),
-      ChunkUpdate::Rebuilt
-    );
+    assert_eq!(b.update_chunk(&grid, ChunkCoord::new(0, 0, 0)), ChunkUpdate::Rebuilt);
     assert_eq!(
       b.buffers().globals.node_free_words as usize,
       words0,
@@ -789,46 +729,24 @@ mod tests {
 
     // 编辑 2：窗口内新 chunk (2,0,0)
     grid.set_voxel_ivec3(IVec3::new(2 * 256 + 7, 7, 7), 6);
-    assert_eq!(
-      b.update_chunk(&grid, ChunkCoord::new(2, 0, 0)),
-      ChunkUpdate::Rebuilt
-    );
-    assert_eq!(
-      BrickMapView::new(b.buffers()).get_voxel(IVec3::new(2 * 256 + 7, 7, 7)),
-      Some(6)
-    );
+    assert_eq!(b.update_chunk(&grid, ChunkCoord::new(2, 0, 0)), ChunkUpdate::Rebuilt);
+    assert_eq!(BrickMapView::new(b.buffers()).get_voxel(IVec3::new(2 * 256 + 7, 7, 7)), Some(6));
     assert_eq!(b.buffers().globals.tile_count, 3);
 
     // 编辑 3：清空 chunk (1,0,0) → 条目清零 + garbage
     let free_before = b.buffers().globals.node_free_words as usize;
-    assert!(
-      grid
-        .clear_voxel(gate_voxel::VoxelCoord::new(260, 10, 10))
-        .is_some()
-    );
-    assert_eq!(
-      b.update_chunk(&grid, ChunkCoord::new(1, 0, 0)),
-      ChunkUpdate::Released
-    );
+    assert!(grid.clear_voxel(gate_voxel::VoxelCoord::new(260, 10, 10)).is_some());
+    assert_eq!(b.update_chunk(&grid, ChunkCoord::new(1, 0, 0)), ChunkUpdate::Released);
     assert_eq!(b.chunk_base(ChunkCoord::new(1, 0, 0)), None);
     assert_eq!(b.buffers().globals.tile_count, 2);
-    assert_eq!(
-      BrickMapView::new(b.buffers()).get_voxel(IVec3::new(260, 10, 10)),
-      None
-    );
+    assert_eq!(BrickMapView::new(b.buffers()).get_voxel(IVec3::new(260, 10, 10)), None);
     let free_after = b.buffers().globals.node_free_words as usize;
     assert_eq!(free_after - free_before, words1, "garbage += 旧树字数");
 
     // 编辑 4：窗口外 chunk → 不渲染不崩溃
     grid.set_voxel_ivec3(IVec3::new(50 * 256, 0, 0), 9);
-    assert_eq!(
-      b.update_chunk(&grid, ChunkCoord::new(50, 0, 0)),
-      ChunkUpdate::OutsideWindow
-    );
-    assert_eq!(
-      BrickMapView::new(b.buffers()).get_voxel(IVec3::new(50 * 256, 0, 0)),
-      None
-    );
+    assert_eq!(b.update_chunk(&grid, ChunkCoord::new(50, 0, 0)), ChunkUpdate::OutsideWindow);
+    assert_eq!(BrickMapView::new(b.buffers()).get_voxel(IVec3::new(50 * 256, 0, 0)), None);
   }
 
   #[test]
@@ -892,10 +810,7 @@ mod tests {
     // 终态与全量重建语义一致（布局可不同：增量有 garbage，内容必须一致）
     let fresh = BrickMapBuilder::build_full(&grid);
     assert_view_matches(&grid, &b, IVec3::splat(-300), IVec3::splat(300), 5);
-    let (a, b2) = (
-      BrickMapView::new(fresh.buffers()),
-      BrickMapView::new(b.buffers()),
-    );
+    let (a, b2) = (BrickMapView::new(fresh.buffers()), BrickMapView::new(b.buffers()));
     for z in -20..20 {
       for y in -20..20 {
         for x in -20..20 {
@@ -1001,10 +916,7 @@ mod tests {
       vb.update_chunk(&vols, 0, c);
     }
     let snap = vb.snapshot();
-    assert_eq!(
-      snap.mode_tag, "incremental",
-      "主世界编辑（尾部）不应漂移物体 tree_base"
-    );
+    assert_eq!(snap.mode_tag, "incremental", "主世界编辑（尾部）不应漂移物体 tree_base");
     // 增量脏块应非空
     assert!(!snap.struct_blobs.is_empty());
     // 增量模式不带整量字节
@@ -1022,19 +934,13 @@ mod tests {
 
     // 编辑物体（头部 volume）→ 主世界 tree_base 漂移 → full
     let mut vols = vols;
-    vols
-      .object_mut(0)
-      .unwrap()
-      .set_voxel_ivec3(IVec3::new(5, 5, 5), 9);
+    vols.object_mut(0).unwrap().set_voxel_ivec3(IVec3::new(5, 5, 5), 9);
     let chunks = vols.object_mut(0).unwrap().dirty.drain_data_budget(100);
     for c in chunks {
       vb.update_chunk(&vols, 1, c);
     }
     let snap = vb.snapshot();
-    assert_eq!(
-      snap.mode_tag, "full",
-      "物体编辑（头部）漂移主世界 tree_base → 全量"
-    );
+    assert_eq!(snap.mode_tag, "full", "物体编辑（头部）漂移主世界 tree_base → 全量");
     // 增量脏块为空（full 路径逐块上传无意义）
     assert!(snap.struct_blobs.is_empty());
   }
@@ -1084,12 +990,7 @@ mod tests {
     let main_tree_base = snap.grid_descs[0].tree_base as usize * 4;
     // 所有脏块偏移应 ≥ main_tree_base（主世界在尾部）且不越界
     for (off, payload) in &snap.struct_blobs {
-      assert!(
-        *off >= main_tree_base,
-        "blob 偏移 {} 应 ≥ 主世界 tree_base {}",
-        off,
-        main_tree_base
-      );
+      assert!(*off >= main_tree_base, "blob 偏移 {} 应 ≥ 主世界 tree_base {}", off, main_tree_base);
       assert!(!payload.is_empty(), "blob 非空");
       assert!(
         off + payload.len() <= snap.struct_total_bytes,

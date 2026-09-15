@@ -72,11 +72,7 @@ impl DdaCameraConfig {
     let view = Mat4::look_at_rh(eye, target, up);
     let view_proj = proj.mul(view);
     let inv_view_proj = view_proj.inverse();
-    Self {
-      view_proj,
-      inv_view_proj,
-      position_world: eye,
-    }
+    Self { view_proj, inv_view_proj, position_world: eye }
   }
 }
 
@@ -110,12 +106,7 @@ impl OrbitCamera {
     // atan2(y, |xz|) 等价 asin(y/len) 但 distance→0 时不出 NaN
     let pitch = offset.y.atan2(offset.xz().length());
     let yaw = offset.x.atan2(offset.z);
-    Self {
-      target,
-      distance,
-      yaw,
-      pitch,
-    }
+    Self { target, distance, yaw, pitch }
   }
 
   /// 轨道参数重建眼位（FR-1 公式：eye = target + distance·(sin_yaw·cos_pitch, sin_pitch, cos_yaw·cos_pitch)）
@@ -150,11 +141,7 @@ impl DdaCameraConfig {
     let view = Mat4::look_at_rh(eye, eye + f, Vec3::Y);
     let proj = Mat4::perspective_rh(fov_y, aspect, near, far);
     let view_proj = proj.mul(view);
-    Self {
-      view_proj,
-      inv_view_proj: view_proj.inverse(),
-      position_world: eye,
-    }
+    Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
   }
 
   /// 唯一矩阵构造点（spec FR-2）：orbit 参数 → perspective_rh × look_at_rh。
@@ -166,11 +153,7 @@ impl DdaCameraConfig {
     let view = Mat4::look_at_rh(eye, orbit.target, Vec3::Y);
     let proj = Mat4::perspective_rh(fov_y, aspect, near, far);
     let view_proj = proj.mul(view);
-    Self {
-      view_proj,
-      inv_view_proj: view_proj.inverse(),
-      position_world: eye,
-    }
+    Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
   }
 }
 
@@ -189,41 +172,23 @@ pub struct DdaViewUniform {
 }
 
 /// 【诊断】GATE_SKIP_CHUNKWALK=1：trace_grid 在局部 slab 后直接 miss
-static SKIP_CHUNKWALK: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_SKIP_CHUNKWALK")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
+static SKIP_CHUNKWALK: LazyLock<bool> =
+  LazyLock::new(|| std::env::var("GATE_SKIP_CHUNKWALK").map(|v| v == "1").unwrap_or(false));
 /// 【诊断】GATE_SKYOUT=1：dda_main 跳过全部 trace 直接输出天空色
-static SKY_OUT: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_SKYOUT")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
+static SKY_OUT: LazyLock<bool> =
+  LazyLock::new(|| std::env::var("GATE_SKYOUT").map(|v| v == "1").unwrap_or(false));
 /// 【诊断】GATE_MAKEGRID_ONLY=1：dda_main 只做 make_grid 不 trace
-static MAKEGRID_ONLY: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_MAKEGRID_ONLY")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
+static MAKEGRID_ONLY: LazyLock<bool> =
+  LazyLock::new(|| std::env::var("GATE_MAKEGRID_ONLY").map(|v| v == "1").unwrap_or(false));
 /// 【诊断】GATE_NO_LOD=1：关闭八叉树远场早停
-static LOD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_NO_LOD")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
+static LOD_DISABLED: LazyLock<bool> =
+  LazyLock::new(|| std::env::var("GATE_NO_LOD").map(|v| v == "1").unwrap_or(false));
 /// 【诊断】GATE_NO_BEAM=1：关闭 beam 预 pass，主 pass 从 t=0 起步。默认开启 beam。
-static BEAM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_NO_BEAM")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
+static BEAM_DISABLED: LazyLock<bool> =
+  LazyLock::new(|| std::env::var("GATE_NO_BEAM").map(|v| v == "1").unwrap_or(false));
 /// 【诊断】GATE_NO_LUT=1：关闭方向可达掩码剔除（lod.w 传 1 → shader 端 eff = mask 旁路 LUT）。
-static LUT_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-  std::env::var("GATE_NO_LUT")
-    .map(|v| v == "1")
-    .unwrap_or(false)
-});
+static LUT_DISABLED: LazyLock<bool> =
+  LazyLock::new(|| std::env::var("GATE_NO_LUT").map(|v| v == "1").unwrap_or(false));
 
 impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
@@ -302,23 +267,11 @@ mod tests {
     let target = Vec3::new(260.0, 120.0, 260.0);
     let orbit = OrbitCamera::from_eye(eye, target);
     // 中间量健全性：offset=(440,440,440) → distance=440√3≈762.1024、pitch=atan(1/√2)、yaw=45°
-    assert!(
-      (orbit.distance - 762.1024).abs() < 0.01,
-      "distance {}",
-      orbit.distance
-    );
-    assert!(
-      (orbit.pitch - 1.0_f32.atan2(2.0_f32.sqrt())).abs() < 1e-5,
-      "pitch {}",
-      orbit.pitch
-    );
+    assert!((orbit.distance - 762.1024).abs() < 0.01, "distance {}", orbit.distance);
+    assert!((orbit.pitch - 1.0_f32.atan2(2.0_f32.sqrt())).abs() < 1e-5, "pitch {}", orbit.pitch);
     assert!((orbit.yaw - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
     let rebuilt = orbit.eye();
-    assert!(
-      (rebuilt - eye).length() < 1e-4,
-      "eye rebuild drift {}",
-      (rebuilt - eye).length()
-    );
+    assert!((rebuilt - eye).length() < 1e-4, "eye rebuild drift {}", (rebuilt - eye).length());
     // 任意参数化往返：负 pitch / 大 yaw
     let eye2 = Vec3::new(-123.0, 40.0, 900.0);
     let target2 = Vec3::new(512.0, 256.0, -30.0);
@@ -330,23 +283,15 @@ mod tests {
   #[test]
   fn orbit_clamp_bounds() {
     // pitch clamp（上下界）+ distance 仅下界不再有 DIST_MAX 上限（用户已取消）
-    let mut o = OrbitCamera {
-      target: Vec3::ZERO,
-      distance: 1.0,
-      yaw: 0.0,
-      pitch: 95.0_f32.to_radians(),
-    };
+    let mut o =
+      OrbitCamera { target: Vec3::ZERO, distance: 1.0, yaw: 0.0, pitch: 95.0_f32.to_radians() };
     o.clamp();
     assert_eq!(o.pitch, PITCH_LIMIT);
     assert_eq!(o.distance, DIST_MIN);
     // 超大 distance（原 DIST_MAX=8000 的 100×）应保留原值（不上限 clamp）
     let big = 1.0e6;
-    let mut o2 = OrbitCamera {
-      target: Vec3::ZERO,
-      distance: big,
-      yaw: 0.0,
-      pitch: -95.0_f32.to_radians(),
-    };
+    let mut o2 =
+      OrbitCamera { target: Vec3::ZERO, distance: big, yaw: 0.0, pitch: -95.0_f32.to_radians() };
     o2.clamp();
     assert_eq!(o2.pitch, -PITCH_LIMIT);
     assert_eq!(o2.distance, big);
@@ -355,10 +300,8 @@ mod tests {
   /// AC-1③: from_orbit(from_eye(build_static 的 eye/target)) 与 build_static 三字段逐元素一致（<1e-5，回归保护）
   #[test]
   fn orbit_from_orbit_equals_build_static() {
-    let orbit = OrbitCamera::from_eye(
-      Vec3::new(700.0, 560.0, 700.0),
-      Vec3::new(260.0, 120.0, 260.0),
-    );
+    let orbit =
+      OrbitCamera::from_eye(Vec3::new(700.0, 560.0, 700.0), Vec3::new(260.0, 120.0, 260.0));
     let via_orbit = DdaCameraConfig::from_orbit(
       &orbit,
       60.0_f32.to_radians(),
@@ -381,10 +324,8 @@ mod tests {
   /// FR-5: 窗口 resize 后按新 aspect 重算（fov/near/far 固定，矩阵与 perspective_rh 直算一致）
   #[test]
   fn config_rebuild_follows_window_aspect() {
-    let orbit = OrbitCamera::from_eye(
-      Vec3::new(700.0, 560.0, 700.0),
-      Vec3::new(260.0, 120.0, 260.0),
-    );
+    let orbit =
+      OrbitCamera::from_eye(Vec3::new(700.0, 560.0, 700.0), Vec3::new(260.0, 120.0, 260.0));
     let fovy = 60.0_f32.to_radians();
     for &(w, h) in &[(1280u32, 720u32), (1920, 1080), (1024, 769), (960, 540)] {
       let aspect = w as f32 / h as f32;
@@ -401,10 +342,7 @@ mod tests {
       let r = cfg.view_proj * cfg.inv_view_proj;
       for i in 0..16 {
         let exp = if i / 4 == i % 4 { 1.0 } else { 0.0 };
-        assert!(
-          (r.to_cols_array()[i] - exp).abs() < 1e-3,
-          "{w}x{h} inv[{i}] drift"
-        );
+        assert!((r.to_cols_array()[i] - exp).abs() < 1e-3, "{w}x{h} inv[{i}] drift");
       }
     }
   }
@@ -540,27 +478,12 @@ pub fn cpu_reference_dda_ray(
     if dir_voxel.z >= 0.0 { 1 } else { -1 },
   ];
   let delta = [
-    if dir_voxel.x.abs() > 1e-30 {
-      (1.0 / dir_voxel.x).abs()
-    } else {
-      f32::INFINITY
-    },
-    if dir_voxel.y.abs() > 1e-30 {
-      (1.0 / dir_voxel.y).abs()
-    } else {
-      f32::INFINITY
-    },
-    if dir_voxel.z.abs() > 1e-30 {
-      (1.0 / dir_voxel.z).abs()
-    } else {
-      f32::INFINITY
-    },
+    if dir_voxel.x.abs() > 1e-30 { (1.0 / dir_voxel.x).abs() } else { f32::INFINITY },
+    if dir_voxel.y.abs() > 1e-30 { (1.0 / dir_voxel.y).abs() } else { f32::INFINITY },
+    if dir_voxel.z.abs() > 1e-30 { (1.0 / dir_voxel.z).abs() } else { f32::INFINITY },
   ];
-  let mut cell = [
-    origin_voxel.x.floor() as i32,
-    origin_voxel.y.floor() as i32,
-    origin_voxel.z.floor() as i32,
-  ];
+  let mut cell =
+    [origin_voxel.x.floor() as i32, origin_voxel.y.floor() as i32, origin_voxel.z.floor() as i32];
   let next_boundary = |c: i32, s: i32| -> f32 {
     // s=1 -> 下一个上界 (c+1).0; s=-1 -> 当前下界 c.0（负数 floor 刚好也是下一个朝向的边界）
     (if s >= 0 { c + 1 } else { c }) as f32
@@ -673,28 +596,12 @@ pub fn cpu_reference_dda_ray_aabb_skip(
     if dir.z >= 0.0 { 1 } else { -1 },
   ];
   let delta = [
-    if dir.x.abs() > 1e-30 {
-      (1.0 / dir.x).abs()
-    } else {
-      f32::INFINITY
-    },
-    if dir.y.abs() > 1e-30 {
-      (1.0 / dir.y).abs()
-    } else {
-      f32::INFINITY
-    },
-    if dir.z.abs() > 1e-30 {
-      (1.0 / dir.z).abs()
-    } else {
-      f32::INFINITY
-    },
+    if dir.x.abs() > 1e-30 { (1.0 / dir.x).abs() } else { f32::INFINITY },
+    if dir.y.abs() > 1e-30 { (1.0 / dir.y).abs() } else { f32::INFINITY },
+    if dir.z.abs() > 1e-30 { (1.0 / dir.z).abs() } else { f32::INFINITY },
   ];
   let next_boundary = |c: i32, s: i32| -> f32 { (if s >= 0 { c + 1 } else { c }) as f32 };
-  let mut cell = [
-    start.x.floor() as i32,
-    start.y.floor() as i32,
-    start.z.floor() as i32,
-  ];
+  let mut cell = [start.x.floor() as i32, start.y.floor() as i32, start.z.floor() as i32];
   // tmax 分量：相对 start 的距离
   let tmax_x = if dir.x.abs() <= 1e-30 {
     f32::INFINITY
@@ -851,30 +758,14 @@ pub fn cpu_reference_dda_ray_two_level(
     if dir_voxel.z >= 0.0 { 1 } else { -1 },
   ];
   let delta = [
-    if d[0].abs() > 1e-30 {
-      (1.0 / d[0]).abs()
-    } else {
-      f32::INFINITY
-    },
-    if d[1].abs() > 1e-30 {
-      (1.0 / d[1]).abs()
-    } else {
-      f32::INFINITY
-    },
-    if d[2].abs() > 1e-30 {
-      (1.0 / d[2]).abs()
-    } else {
-      f32::INFINITY
-    },
+    if d[0].abs() > 1e-30 { (1.0 / d[0]).abs() } else { f32::INFINITY },
+    if d[1].abs() > 1e-30 { (1.0 / d[1]).abs() } else { f32::INFINITY },
+    if d[2].abs() > 1e-30 { (1.0 / d[2]).abs() } else { f32::INFINITY },
   ];
   // 粗 delta = voxel delta × 16（精确）
   let delta_c = [delta[0] * 16.0, delta[1] * 16.0, delta[2] * 16.0];
   // 粗 cell：floor(origin) >> 4（算术右移 = floor 除法，负坐标正确）
-  let mut cc = [
-    (o[0].floor() as i32) >> 4,
-    (o[1].floor() as i32) >> 4,
-    (o[2].floor() as i32) >> 4,
-  ];
+  let mut cc = [(o[0].floor() as i32) >> 4, (o[1].floor() as i32) >> 4, (o[2].floor() as i32) >> 4];
   // 粗 tmax：到下一个粗边界的距离（相对 origin，同 full 版公式，边界 ×16）
   let mut tmax_c = [f32::INFINITY; 3];
   for i in 0..3 {
@@ -889,16 +780,8 @@ pub fn cpu_reference_dda_ray_two_level(
     let t_out = tmax_c[0].min(tmax_c[1]).min(tmax_c[2]);
     // 占用查询先行：空 cell 不做任何 voxel 采样（性能核心）
     if view.cell_occupied(IVec3::from_array(cc))
-      && let Some((t, pal, axis)) = dda_voxel_scan_cell(
-        &view,
-        origin_voxel,
-        dir_voxel,
-        sign,
-        delta,
-        cc,
-        t_in,
-        t_out.min(t_max),
-      )
+      && let Some((t, pal, axis)) =
+        dda_voxel_scan_cell(&view, origin_voxel, dir_voxel, sign, delta, cc, t_in, t_out.min(t_max))
     {
       return Some(DdaHit { t, pal, axis });
     }
@@ -1012,11 +895,7 @@ fn trace_chunk_cpu(
     return None;
   }
   // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
-  let ro_c = [
-    ro[0] - chunk_min[0],
-    ro[1] - chunk_min[1],
-    ro[2] - chunk_min[2],
-  ];
+  let ro_c = [ro[0] - chunk_min[0], ro[1] - chunk_min[1], ro[2] - chunk_min[2]];
   // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv；与 WGSL inv_rd 镜像）
   let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
   let read_brick = |addr: usize| BrickCpu {
@@ -1024,19 +903,11 @@ fn trace_chunk_cpu(
     mask: ((b_struct[addr + 1] as u64) << 32) | b_struct[addr] as u64,
     pal: (b_struct[addr + 2] & 0xFF) as u8,
   };
-  let mut bricks = [BrickCpu {
-    addr: 0,
-    mask: 0,
-    pal: 0,
-  }; 4];
+  let mut bricks = [BrickCpu { addr: 0, mask: 0, pal: 0 }; 4];
   bricks[3] = read_brick(chunk_base);
   let mut level: u32 = 3;
   // 当前体素（chunk 局部 voxel 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
-  let p0 = [
-    ro_c[0] + rd[0] * t0,
-    ro_c[1] + rd[1] * t0,
-    ro_c[2] + rd[2] * t0,
-  ];
+  let p0 = [ro_c[0] + rd[0] * t0, ro_c[1] + rd[1] * t0, ro_c[2] + rd[2] * t0];
   let mut v = [
     (p0[0].floor() as i32).clamp(0, 255),
     (p0[1].floor() as i32).clamp(0, 255),
@@ -1108,11 +979,8 @@ fn trace_chunk_cpu(
       }
     }
     // 每轴步长 t 增量（level 不变则不变）：inner 里 O(1) 加法
-    let step_inc = [
-      s as f32 * inv_rd[0].abs(),
-      s as f32 * inv_rd[1].abs(),
-      s as f32 * inv_rd[2].abs(),
-    ];
+    let step_inc =
+      [s as f32 * inv_rd[0].abs(), s as f32 * inv_rd[1].abs(), s as f32 * inv_rd[2].abs()];
     let mut step_axis: usize;
     let mut changed = false;
     loop {
@@ -1135,11 +1003,7 @@ fn trace_chunk_cpu(
       side[min] += step_inc[min];
       face = (min * 2) as u8 + if sign[min] < 0 { 1 } else { 0 };
       // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
-      let crossed = if sign[min] >= 0 {
-        old_cell == 3
-      } else {
-        old_cell == 0
-      };
+      let crossed = if sign[min] >= 0 { old_cell == 3 } else { old_cell == 0 };
       if crossed {
         changed = true;
         break;
@@ -1187,14 +1051,8 @@ fn trace_chunk_cpu(
     let cur_log2 = level * 2;
     let m: u32 = 0xFFFF_FFFFu32.wrapping_shl(cur_log2);
     let vmin_u = v[step_axis] as u32; // i32→u32 环绕（负值公式自然处理）
-    let comp = if positive {
-      vmin_u & m
-    } else {
-      (vmin_u & m) | !m
-    };
-    let tz = comp
-      .wrapping_add(if positive { 0 } else { 1 })
-      .trailing_zeros();
+    let comp = if positive { vmin_u & m } else { (vmin_u & m) | !m };
+    let tz = comp.wrapping_add(if positive { 0 } else { 1 }).trailing_zeros();
     let new_level = tz >> 1;
     level = level.max(new_level);
     if level > 3 {
@@ -1204,11 +1062,7 @@ fn trace_chunk_cpu(
     // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
     let mi = m as i32;
     let base = [v[0] & mi, v[1] & mi, v[2] & mi];
-    let p = [
-      ro_c[0] + rd[0] * cur_t,
-      ro_c[1] + rd[1] * cur_t,
-      ro_c[2] + rd[2] * cur_t,
-    ];
+    let p = [ro_c[0] + rd[0] * cur_t, ro_c[1] + rd[1] * cur_t, ro_c[2] + rd[2] * cur_t];
     for i in 0..3 {
       let pf = p[i].floor() as i32;
       v[i] = pf.clamp(base[i], base[i] + !mi);
@@ -1248,21 +1102,9 @@ fn trace_volume_tree(
     if rd.z >= 0.0 { 1 } else { -1 },
   ];
   let delta = [
-    if rd.x.abs() > 1e-30 {
-      rd.x.abs().recip()
-    } else {
-      1e30
-    },
-    if rd.y.abs() > 1e-30 {
-      rd.y.abs().recip()
-    } else {
-      1e30
-    },
-    if rd.z.abs() > 1e-30 {
-      rd.z.abs().recip()
-    } else {
-      1e30
-    },
+    if rd.x.abs() > 1e-30 { rd.x.abs().recip() } else { 1e30 },
+    if rd.y.abs() > 1e-30 { rd.y.abs().recip() } else { 1e30 },
+    if rd.z.abs() > 1e-30 { rd.z.abs().recip() } else { 1e30 },
   ];
   let delta_c = [delta[0] * 256.0, delta[1] * 256.0, delta[2] * 256.0];
   // ---- chunk 间 A&W（256³ 一格）+ chunk 内层次 mask DDA ----
@@ -1290,11 +1132,7 @@ fn trace_volume_tree(
     let t1 = t_exit_c.min(tl1);
     // 窗口查找（窗口外 / entry=0 的空 chunk = 空气，直接步进）
     if let Some(chunk_base) = view.chunk_base(IVec3::new(ci[0], ci[1], ci[2])) {
-      let chunk_min = [
-        ci[0] as f32 * 256.0,
-        ci[1] as f32 * 256.0,
-        ci[2] as f32 * 256.0,
-      ];
+      let chunk_min = [ci[0] as f32 * 256.0, ci[1] as f32 * 256.0, ci[2] as f32 * 256.0];
       if let Some((t, pal, face_id, v)) = trace_chunk_cpu(
         view.b_struct(),
         chunk_base,
@@ -1308,12 +1146,7 @@ fn trace_volume_tree(
       ) {
         // chunk 局部 v → grid 局部体素（镜像 WGSL trace_grid 的 ci*256 换算）
         let voxel = IVec3::new(v[0], v[1], v[2]) + IVec3::new(ci[0], ci[1], ci[2]) * 256;
-        return Some(TreeHit {
-          t,
-          pal,
-          face_id,
-          voxel,
-        });
+        return Some(TreeHit { t, pal, face_id, voxel });
       }
     }
     if t_exit_c >= tl1 {
@@ -1352,11 +1185,7 @@ pub fn cpu_reference_dda_ray_tree(
   let view = BrickMapView::new(buffers);
   let origin = view.origin();
   let dims = view.dims();
-  let l_min = Vec3::new(
-    (origin.x * 256) as f32,
-    (origin.y * 256) as f32,
-    (origin.z * 256) as f32,
-  );
+  let l_min = Vec3::new((origin.x * 256) as f32, (origin.y * 256) as f32, (origin.z * 256) as f32);
   let l_max = Vec3::new(
     ((origin.x + dims.x) * 256) as f32,
     ((origin.y + dims.y) * 256) as f32,
@@ -1470,16 +1299,10 @@ fn cpu_reference_object_ray_unified(
   }
   // ---- 局部变换（rd 含 1/scale → t 标尺不变）----
   let wp = origin - tr.pos;
-  let ro = Vec3::new(
-    wp.dot(tr.rot.x_axis),
-    wp.dot(tr.rot.y_axis),
-    wp.dot(tr.rot.z_axis),
-  ) / tr.scale;
-  let rd = Vec3::new(
-    dir.dot(tr.rot.x_axis),
-    dir.dot(tr.rot.y_axis),
-    dir.dot(tr.rot.z_axis),
-  ) / tr.scale;
+  let ro =
+    Vec3::new(wp.dot(tr.rot.x_axis), wp.dot(tr.rot.y_axis), wp.dot(tr.rot.z_axis)) / tr.scale;
+  let rd =
+    Vec3::new(dir.dot(tr.rot.x_axis), dir.dot(tr.rot.y_axis), dir.dot(tr.rot.z_axis)) / tr.scale;
   // ---- 局部 [0,256]³ slab + chunk 间 + 层次 DDA（镜像 WGSL trace_grid 物体分支）----
   let view = BrickMapView::new(bufs);
   let hit = trace_volume_tree(&view, ro, rd, Vec3::ZERO, Vec3::splat(256.0), t_hi_cap)?;
@@ -1514,12 +1337,7 @@ pub fn cpu_reference_trace_volumes(
     if let Some((t, pal, normal)) = hit
       && best.as_ref().is_none_or(|b| t < b.t)
     {
-      best = Some(VolumeHit {
-        t,
-        pal,
-        obj_id,
-        normal,
-      });
+      best = Some(VolumeHit { t, pal, obj_id, normal });
     }
   }
   best
@@ -1608,11 +1426,7 @@ mod dda_ref_tests {
     let proj = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 1.0, 4000.0);
     let view = Mat4::look_at_rh(eye, target, Vec3::Y);
     let view_proj = proj.mul(view);
-    DdaCameraConfig {
-      view_proj,
-      inv_view_proj: view_proj.inverse(),
-      position_world: eye,
-    }
+    DdaCameraConfig { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
   }
 
   fn build_box_sphere_scene() -> (BrickMapBuffers, DdaCameraConfig) {
@@ -1695,12 +1509,7 @@ mod dda_ref_tests {
       (IVec3::new(0, 8, 8), "box-x0-face pal1"),
     ];
     for (p, msg) in probes {
-      println!(
-        "probe get_voxel({:?}) {:?} = {:?}",
-        p,
-        msg,
-        view.get_voxel(p)
-      );
+      println!("probe get_voxel({:?}) {:?} = {:?}", p, msg, view.get_voxel(p));
     }
     let grid = cpu_dda_ascii_grid_32x32(&cfg, &bufs);
     let grid_w = 32usize;
@@ -1718,10 +1527,7 @@ mod dda_ref_tests {
     println!("COUNTS = {counts:?}");
     // 至少应有 32 个以上的非空（'.'）字符
     let non_empty: usize = grid.iter().filter(|c| **c != '.').count();
-    assert!(
-      non_empty >= 32,
-      "non_empty pixels only {non_empty}（<32，画面全空可疑）"
-    );
+    assert!(non_empty >= 32, "non_empty pixels only {non_empty}（<32，画面全空可疑）");
     // X 字符（盒体 pal1）≥ 8
     let xs: usize = grid.iter().filter(|c| **c == 'X').count();
     assert!(xs >= 8, "box pal=1 only {xs} 'X'");
@@ -1744,19 +1550,13 @@ mod dda_ref_tests {
       // 近相机（在 AABB 外 24 voxel 处，和 test_cam 一致）
       (Vec3::new(24.0, 20.0, 24.0), Vec3::new(8.0, 8.0, 8.0)),
       // 远相机（在 AABB 外 50k voxel 处——模拟用户 zoom-out 很多下的情况）
-      (
-        Vec3::new(50_000.0, 40_000.0, 50_000.0),
-        Vec3::new(8.0, 8.0, 8.0),
-      ),
+      (Vec3::new(50_000.0, 40_000.0, 50_000.0), Vec3::new(8.0, 8.0, 8.0)),
       // 相机在 AABB 内部（用户很近时贴脸模型）
       (Vec3::new(8.5, 8.5, 2.0), Vec3::new(8.5, 8.5, 16.0)),
       // 斜 + 轻微轴平行（xz 面视线，dir.y 很小）
       (Vec3::new(30.0, 8.0, 30.0), Vec3::new(8.0, 8.0, 8.0)),
       // 负坐标远端 + 指向 AABB（测试负 voxel 坐标 floor 与 slab 求交）
-      (
-        Vec3::new(-10_000.0, 10_000.0, -10_000.0),
-        Vec3::new(8.0, 8.0, 8.0),
-      ),
+      (Vec3::new(-10_000.0, 10_000.0, -10_000.0), Vec3::new(8.0, 8.0, 8.0)),
     ];
     for (eye, target) in &cameras {
       for _ in 0..60 {
@@ -1783,15 +1583,9 @@ mod dda_ref_tests {
           cpu_reference_dda_ray_aabb_skip(&bufs, *eye, dir, frustum_len, 2048, aabb_min, aabb_max);
         match (full, skip) {
           (Some((tf, pf)), Some((ts, ps))) => {
-            assert_eq!(
-              pf, ps,
-              "palette diff eye={eye:?} tgt={target:?} full_t={tf} skip_t={ts}"
-            );
+            assert_eq!(pf, ps, "palette diff eye={eye:?} tgt={target:?} full_t={tf} skip_t={ts}");
             // t 差 ≤ 1 voxel（浮点计算的 floor 与首胞命中边界误差）
-            assert!(
-              (tf - ts).abs() <= 1.0,
-              "t diff eye={eye:?} full_t={tf} skip_t={ts} pal={pf}"
-            );
+            assert!((tf - ts).abs() <= 1.0, "t diff eye={eye:?} full_t={tf} skip_t={ts} pal={pf}");
           }
           (None, None) => {}
           (f, s) => panic!(
@@ -1853,19 +1647,13 @@ mod dda_ref_tests {
       let r = 32.0 + frand(&mut state) * 568.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
       let phi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let origin = Vec3::new(
-        r * phi.sin() * theta.cos(),
-        r * phi.cos(),
-        r * phi.sin() * theta.sin(),
-      ) + Vec3::new(64.0, 48.0, 64.0);
+      let origin =
+        Vec3::new(r * phi.sin() * theta.cos(), r * phi.cos(), r * phi.sin() * theta.sin())
+          + Vec3::new(64.0, 48.0, 64.0);
       // 随机单位方向（球面均匀）
       let dtheta = frand(&mut state) * std::f32::consts::TAU;
       let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let dir = Vec3::new(
-        dphi.sin() * dtheta.cos(),
-        dphi.cos(),
-        dphi.sin() * dtheta.sin(),
-      );
+      let dir = Vec3::new(dphi.sin() * dtheta.cos(), dphi.cos(), dphi.sin() * dtheta.sin());
       let full = cpu_reference_dda_ray(&bufs, origin, dir, 2048.0, 2_000_000);
       let two = cpu_reference_dda_ray_two_level(&bufs, origin, dir, 2048.0, 16384);
       match (full, two) {
@@ -1875,10 +1663,7 @@ mod dda_ref_tests {
             pf, pt,
             "ray[{ray}] palette diff o={origin:?} d={dir:?} full_t={tf} two_t={tt}"
           );
-          assert!(
-            (tf - tt).abs() <= 1.0,
-            "ray[{ray}] t diff {tf} vs {tt} o={origin:?} d={dir:?}"
-          );
+          assert!((tf - tt).abs() <= 1.0, "ray[{ray}] t diff {tf} vs {tt} o={origin:?} d={dir:?}");
         }
         (None, None) => {}
         (f, t) => {
@@ -1898,12 +1683,7 @@ mod dda_ref_tests {
     // ---- 跨 chunk / 负坐标场景（fill_box 第二参 = size，区间 [min, min+size)）----
     let mut g = VolumeGrid::new();
     // 负区大块：x/y/z -512..-448（chunk -2 一带，窗口 origin 含负）
-    fill_box(
-      &mut g,
-      IVec3::new(-512, -64, -512),
-      IVec3::new(64, 96, 64),
-      1,
-    );
+    fill_box(&mut g, IVec3::new(-512, -64, -512), IVec3::new(64, 96, 64), 1);
     // 正区远块：512..608（chunk 2）
     fill_box(&mut g, IVec3::new(512, 0, 512), IVec3::new(96, 64, 96), 2);
     // 跨界球：心 (256,48,256) r=40，跨 x=256 / z=256 两条 chunk 边界
@@ -1918,27 +1698,15 @@ mod dda_ref_tests {
       "窗口 origin 应含负分量：({:?})",
       (gl.index_origin_x, gl.index_origin_y, gl.index_origin_z)
     );
-    assert!(
-      gl.tile_count >= 4,
-      "应跨多个 chunk：tile_count={}",
-      gl.tile_count
-    );
+    assert!(gl.tile_count >= 4, "应跨多个 chunk：tile_count={}", gl.tile_count);
 
     let cmp = |tag: &str, o: Vec3, d: Vec3, t_max: f32| {
       let full = cpu_reference_dda_ray(&bufs, o, d, t_max, 4_000_000);
       let tree = cpu_reference_dda_ray_tree(&bufs, o, d, t_max);
       match (full, tree) {
         (Some((tf, pf)), Some(h)) => {
-          assert_eq!(
-            pf, h.pal,
-            "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}",
-            h.t
-          );
-          assert!(
-            (tf - h.t).abs() <= 1.0,
-            "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}",
-            h.t
-          );
+          assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}", h.t);
+          assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
           // 面法线反向于射线（穿入面）；相机贴面 UB 射线 entry_face 同样反向
           let n = face_normal_from_index(h.face_id);
           assert!(
@@ -1974,18 +1742,12 @@ mod dda_ref_tests {
       let r = 32.0 + frand(&mut state) * 1468.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
       let phi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let origin = Vec3::new(
-        r * phi.sin() * theta.cos(),
-        r * phi.cos(),
-        r * phi.sin() * theta.sin(),
-      ) + Vec3::new(128.0, 32.0, 128.0);
+      let origin =
+        Vec3::new(r * phi.sin() * theta.cos(), r * phi.cos(), r * phi.sin() * theta.sin())
+          + Vec3::new(128.0, 32.0, 128.0);
       let dtheta = frand(&mut state) * std::f32::consts::TAU;
       let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let dir = Vec3::new(
-        dphi.sin() * dtheta.cos(),
-        dphi.cos(),
-        dphi.sin() * dtheta.sin(),
-      );
+      let dir = Vec3::new(dphi.sin() * dtheta.cos(), dphi.cos(), dphi.sin() * dtheta.sin());
       cmp(&format!("rand{ray}"), origin, dir, 4096.0);
     }
   }
@@ -2009,13 +1771,7 @@ mod dda_ref_tests {
       x += 16;
     }
     // ---- fill_bricks(e=16) 平台（level-2 uniform 节点模式）----
-    fill_bricks(
-      &mut g,
-      IVec3::new(-128, 32, -128),
-      IVec3::new(96, 16, 96),
-      16,
-      4,
-    );
+    fill_bricks(&mut g, IVec3::new(-128, 32, -128), IVec3::new(96, 16, 96), 16, 4);
     // ---- 实心墙 + clear_voxel 单体孔洞阵列（demo 正殿门模式：air-in-solid）----
     fill_box(&mut g, IVec3::new(0, 48, -72), IVec3::new(64, 64, 8), 4);
     let mut wy = 48;
@@ -2055,16 +1811,8 @@ mod dda_ref_tests {
       let tree = cpu_reference_dda_ray_tree(&bufs, o, d, t_max);
       match (full, tree) {
         (Some((tf, pf)), Some(h)) => {
-          assert_eq!(
-            pf, h.pal,
-            "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}",
-            h.t
-          );
-          assert!(
-            (tf - h.t).abs() <= 1.0,
-            "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}",
-            h.t
-          );
+          assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}", h.t);
+          assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
           let n = face_normal_from_index(h.face_id);
           assert!(
             n.dot(d) < 0.001,
@@ -2100,18 +1848,12 @@ mod dda_ref_tests {
       let r = 32.0 + frand(&mut state) * 900.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
       let phi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let origin = Vec3::new(
-        r * phi.sin() * theta.cos(),
-        r * phi.cos(),
-        r * phi.sin() * theta.sin(),
-      ) + Vec3::new(128.0, 48.0, 0.0);
+      let origin =
+        Vec3::new(r * phi.sin() * theta.cos(), r * phi.cos(), r * phi.sin() * theta.sin())
+          + Vec3::new(128.0, 48.0, 0.0);
       let dtheta = frand(&mut state) * std::f32::consts::TAU;
       let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let dir = Vec3::new(
-        dphi.sin() * dtheta.cos(),
-        dphi.cos(),
-        dphi.sin() * dtheta.sin(),
-      );
+      let dir = Vec3::new(dphi.sin() * dtheta.cos(), dphi.cos(), dphi.sin() * dtheta.sin());
       cmp(&format!("rand{ray}"), origin, dir, 4096.0);
     }
   }
@@ -2149,16 +1891,8 @@ mod dda_ref_tests {
       let tree = cpu_reference_dda_ray_tree(&bufs, o, d, t_max);
       match (full, tree) {
         (Some((tf, pf)), Some(h)) => {
-          assert_eq!(
-            pf, h.pal,
-            "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}",
-            h.t
-          );
-          assert!(
-            (tf - h.t).abs() <= 1.0,
-            "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}",
-            h.t
-          );
+          assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?} full_t={tf} tree_t={}", h.t);
+          assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
           // 命中体素固体性（voxel 显式携带的正确性门禁）：DDA 携带的 voxel 必须
           // 恰是 palette 一致的固体体素——着色链（per-voxel normal/GI key）以它为准
           let view = BrickMapView::new(&bufs);
@@ -2215,11 +1949,7 @@ mod dda_ref_tests {
       );
       let dtheta = frand(&mut state) * std::f32::consts::TAU;
       let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let dir = Vec3::new(
-        dphi.sin() * dtheta.cos(),
-        dphi.cos(),
-        dphi.sin() * dtheta.sin(),
-      );
+      let dir = Vec3::new(dphi.sin() * dtheta.cos(), dphi.cos(), dphi.sin() * dtheta.sin());
       cmp(&format!("rand{ray}"), origin, dir, 4096.0);
     }
   }
@@ -2247,11 +1977,7 @@ mod dda_ref_tests {
       match (full, tree) {
         (Some((tf, pf)), Some(h)) => {
           assert_eq!(pf, h.pal, "[{tag}] palette diff o={o:?} d={d:?}");
-          assert!(
-            (tf - h.t).abs() <= 1.0,
-            "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}",
-            h.t
-          );
+          assert!((tf - h.t).abs() <= 1.0, "[{tag}] t diff {tf} vs {} o={o:?} d={d:?}", h.t);
           let n = face_normal_from_index(h.face_id);
           assert!(
             n.dot(d) < 0.001,
@@ -2285,18 +2011,12 @@ mod dda_ref_tests {
       let r = 8.0 + frand(&mut state) * 320.0;
       let theta = frand(&mut state) * std::f32::consts::TAU;
       let phi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let origin = Vec3::new(
-        r * phi.sin() * theta.cos(),
-        r * phi.cos() + 32.0,
-        r * phi.sin() * theta.sin(),
-      ) + Vec3::new(32.0, 0.0, 32.0);
+      let origin =
+        Vec3::new(r * phi.sin() * theta.cos(), r * phi.cos() + 32.0, r * phi.sin() * theta.sin())
+          + Vec3::new(32.0, 0.0, 32.0);
       let dtheta = frand(&mut state) * std::f32::consts::TAU;
       let dphi = (frand(&mut state) * 2.0 - 1.0).acos();
-      let dir = Vec3::new(
-        dphi.sin() * dtheta.cos(),
-        dphi.cos(),
-        dphi.sin() * dtheta.sin(),
-      );
+      let dir = Vec3::new(dphi.sin() * dtheta.cos(), dphi.cos(), dphi.sin() * dtheta.sin());
       cmp(&format!("rand{ray}"), origin, dir, 2048.0);
     }
   }
@@ -2322,8 +2042,7 @@ use bevy::{
       VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, texture_3d,
-        texture_storage_2d,
-        uniform_buffer,
+        texture_storage_2d, uniform_buffer,
       },
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -2408,10 +2127,7 @@ impl Default for EyeAdaptGpu {
 /// 把 main world 的活参数搬进 [`EyeAdaptGpu`]（**只做搬运**，真正上传在
 /// `prepare_dda_bind_groups` 里做，那里才有 queue 和 buffer 句柄）。
 /// `Res::is_changed` 由 `ExtractResourcePlugin` 在同步时标记 ⇒ 只有 UI 真改过才为真。
-fn sync_eye_adapt_settings(
-  eye_set: Option<Res<EyeAdaptSettings>>,
-  mut eye: ResMut<EyeAdaptGpu>,
-) {
+fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResMut<EyeAdaptGpu>) {
   let Some(s) = eye_set else {
     return;
   };
@@ -2637,13 +2353,8 @@ pub(crate) fn init_dda_pipelines(
 
   // ---- Compute pipeline：shaders/voxel_raytrace/ 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
   let dda_shader = dda_shader.0.clone();
-  let layouts = vec![
-    bg0.clone(),
-    bg1.clone(),
-    bg2.clone(),
-    bg3.clone(),
-    crate::ddgi::ddgi_bg4_layout(),
-  ];
+  let layouts =
+    vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::ddgi::ddgi_bg4_layout()];
   // 眼睛适应的两个入口自己的布局：**8 份相同的 eye layout**。
   // 原因：wgpu 要求 bind group 按索引**从 0 开始成前缀地**设置（跳过低索引直接设高索引会报
   // "expects a BindGroup to be set at index 0"）；而这两个入口的绑定在 @group(7)。
@@ -2787,18 +2498,11 @@ fn prepare_dda_bind_groups(
 
   // ---- beam depth：低分辨率 r32float（全分辨率 / 4），resize 时重建 ----
   const BEAM_DIV: u32 = 4;
-  let beam_size = UVec2::new(
-    scale.size.x.div_ceil(BEAM_DIV),
-    scale.size.y.div_ceil(BEAM_DIV),
-  );
+  let beam_size = UVec2::new(scale.size.x.div_ceil(BEAM_DIV), scale.size.y.div_ceil(BEAM_DIV));
   if beam_cache.texture.is_none() || beam_cache.size != beam_size {
     let tex = render_device.create_texture(&TextureDescriptor {
       label: Some("gate_beam_depth"),
-      size: Extent3d {
-        width: beam_size.x,
-        height: beam_size.y,
-        depth_or_array_layers: 1,
-      },
+      size: Extent3d { width: beam_size.x, height: beam_size.y, depth_or_array_layers: 1 },
       mip_level_count: 1,
       sample_count: 1,
       dimension: TextureDimension::D2,
@@ -2809,10 +2513,7 @@ fn prepare_dda_bind_groups(
     beam_cache.texture = Some(tex);
     beam_cache.size = beam_size;
   }
-  let beam_tex = beam_cache
-    .texture
-    .as_ref()
-    .expect("beam texture not created");
+  let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
 
   // ---- BG0：out tex write + view uniform + beam depth rw ----
@@ -2956,23 +2657,17 @@ pub(crate) fn dispatch_dda(
 ) {
   // 主 pass trace 命中后直接 unlit 着色直出 out_tex
   // （逐体素法线 + 天空渐变 + 太阳方向光项），无后续 direct/gi/denoise pass。
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) = (
-    bg0.as_ref(),
-    bg1.as_ref(),
-    bg2.as_ref(),
-    bg3.as_ref(),
-    bg4.as_ref(),
-  ) else {
+  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
+    (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref(), bg4.as_ref())
+  else {
     bevy::log::debug_once!("DDA dispatch: bind groups missing");
     return;
   };
 
-  let dda_pipe = pipeline_cache
-    .get_compute_pipeline(pipelines.compute_pipeline)
-    .or_else(|| {
-      bevy::log::debug_once!("DDA dispatch: dda pipeline not ready");
-      None
-    });
+  let dda_pipe = pipeline_cache.get_compute_pipeline(pipelines.compute_pipeline).or_else(|| {
+    bevy::log::debug_once!("DDA dispatch: dda pipeline not ready");
+    None
+  });
   let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
 
   let gx = scale.size.x.div_ceil(DDA_WORKGROUP_SIZE);
@@ -3020,54 +2715,56 @@ pub(crate) fn dispatch_dda(
   if eye.as_ref().is_some_and(|e| e.settings.enabled)
     && let Some(eye_bg) = eye.as_ref().and_then(|e| e.bg.as_ref())
     && let Some(h) = pipeline_cache.get_compute_pipeline(pipelines.eye_histogram_pipeline)
-      && let Some(u) = pipeline_cache.get_compute_pipeline(pipelines.eye_update_pipeline) {
-        crate::profiler::gpu_compute_pass(
-          &mut profiler,
-          ctx.command_encoder(),
-          "gate_eye_histogram",
-          |pass| {
-            pass.set_pipeline(h);
-            // eye pipeline 的布局是 8 份相同 layout ⇒ 必须从 0 起逐个设（见 init_dda_pipelines）
-            for i in 0..8u32 {
-              pass.set_bind_group(i, eye_bg, &[]);
-            }
-            pass.dispatch_workgroups(1, 1, 1);
-          },
-        );
-        crate::profiler::gpu_compute_pass(
-          &mut profiler,
-          ctx.command_encoder(),
-          "gate_eye_update",
-          |pass| {
-            pass.set_pipeline(u);
-            for i in 0..8u32 {
-              pass.set_bind_group(i, eye_bg, &[]);
-            }
-            pass.dispatch_workgroups(1, 1, 1);
-          },
-        );
-      }
+    && let Some(u) = pipeline_cache.get_compute_pipeline(pipelines.eye_update_pipeline)
+  {
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_eye_histogram",
+      |pass| {
+        pass.set_pipeline(h);
+        // eye pipeline 的布局是 8 份相同 layout ⇒ 必须从 0 起逐个设（见 init_dda_pipelines）
+        for i in 0..8u32 {
+          pass.set_bind_group(i, eye_bg, &[]);
+        }
+        pass.dispatch_workgroups(1, 1, 1);
+      },
+    );
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_eye_update",
+      |pass| {
+        pass.set_pipeline(u);
+        for i in 0..8u32 {
+          pass.set_bind_group(i, eye_bg, &[]);
+        }
+        pass.dispatch_workgroups(1, 1, 1);
+      },
+    );
+  }
 
   if dbg.is_some_and(|d| d.probe_viz)
     && let Some(ddgi) = gpu.as_ref()
-      && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline) {
-        let probe_count = ddgi.total_slots;
-        crate::profiler::gpu_compute_pass(
-          &mut profiler,
-          ctx.command_encoder(),
-          "gate_probe_viz",
-          |pass| {
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &bg0.0, &[]);
-            pass.set_bind_group(1, &bg1.0, &[]);
-            pass.set_bind_group(2, &bg2.0, &[]);
-            pass.set_bind_group(3, &bg3.0, &[]);
-            pass.set_bind_group(4, &bg4.0, &[]);
-            let wg = probe_count.div_ceil(64);
-            pass.dispatch_workgroups(wg, 1, 1);
-          },
-        );
-      }
+    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline)
+  {
+    let probe_count = ddgi.total_slots;
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_probe_viz",
+      |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bg0.0, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
+        let wg = probe_count.div_ceil(64);
+        pass.dispatch_workgroups(wg, 1, 1);
+      },
+    );
+  }
 }
 
 #[cfg_attr(not(feature = "profile"), allow(unused_variables, unused_mut))]

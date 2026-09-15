@@ -74,13 +74,7 @@ pub struct SliderConfig {
 
 impl Default for SliderConfig {
   fn default() -> Self {
-    Self {
-      min: 0.0,
-      max: 1.0,
-      value: 0.0,
-      step: None,
-      disabled: false,
-    }
+    Self { min: 0.0, max: 1.0, value: 0.0, step: None, disabled: false }
   }
 }
 
@@ -124,12 +118,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
   let thumb_bg = color_of(&c.surface_top);
   let thumb_border = color_of(&c.border_strong);
   let (track_bg, fill_bg, thumb_bg, thumb_border) = if config.disabled {
-    (
-      dim_color(track_bg),
-      dim_color(fill_bg),
-      dim_color(thumb_bg),
-      dim_color(thumb_border),
-    )
+    (dim_color(track_bg), dim_color(fill_bg), dim_color(thumb_bg), dim_color(thumb_border))
   } else {
     (track_bg, fill_bg, thumb_bg, thumb_border)
   };
@@ -138,10 +127,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
     UiSlider,
     Interaction::default(),
     RelativeCursorPosition::default(),
-    SliderRange {
-      min: config.min,
-      max: config.max,
-    },
+    SliderRange { min: config.min, max: config.max },
     SliderStep(config.step),
     SliderValue(v),
     Node {
@@ -161,11 +147,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
     root
       .spawn((
         Name::new("ui-slider-track"),
-        Node {
-          flex_grow: 1.0,
-          height: px(TRACK_HEIGHT),
-          ..default()
-        },
+        Node { flex_grow: 1.0, height: px(TRACK_HEIGHT), ..default() },
         BackgroundColor(track_bg),
       ))
       .with_children(|track| {
@@ -193,11 +175,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
             position_type: PositionType::Absolute,
             left: Val::Percent(norm * 100.0),
             top: Val::Percent(50.0),
-            margin: UiRect {
-              left: px(-THUMB_SIZE / 2.0),
-              top: px(-THUMB_SIZE / 2.0),
-              ..default()
-            },
+            margin: UiRect { left: px(-THUMB_SIZE / 2.0), top: px(-THUMB_SIZE / 2.0), ..default() },
             width: px(THUMB_SIZE),
             height: px(THUMB_SIZE),
             border: UiRect::all(px(m.border_width)),
@@ -215,11 +193,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
 }
 
 fn normalize(v: f32, min: f32, max: f32) -> f32 {
-  if (max - min).abs() < f32::EPSILON {
-    0.0
-  } else {
-    ((v - min) / (max - min)).clamp(0.0, 1.0)
-  }
+  if (max - min).abs() < f32::EPSILON { 0.0 } else { ((v - min) / (max - min)).clamp(0.0, 1.0) }
 }
 
 /// 拖动：按下时把光标位置映射为值（每帧重算）；值变化时触发 [`SliderValueChanged`]
@@ -255,19 +229,12 @@ pub fn slider_drag_system(
     let pad_l = node.padding.min_inset.x;
     let pad_r = node.padding.max_inset.x;
     let content_w = root_w - pad_l - pad_r;
-    let norm = if content_w > 0.0 {
-      ((cursor_x - pad_l) / content_w).clamp(0.0, 1.0)
-    } else {
-      0.0
-    };
+    let norm = if content_w > 0.0 { ((cursor_x - pad_l) / content_w).clamp(0.0, 1.0) } else { 0.0 };
     let target = range.min + norm * (range.max - range.min);
     let v = clamp_step(target, range.min, range.max, step.0);
     if (val.0 - v).abs() > f32::EPSILON {
       val.0 = v;
-      commands.trigger(SliderValueChanged {
-        entity: e,
-        value: v,
-      });
+      commands.trigger(SliderValueChanged { entity: e, value: v });
     }
   }
 }
@@ -281,13 +248,7 @@ pub fn slider_drag_system(
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_visual_system(
   mut q_root: Query<
-    (
-      &SliderValue,
-      &SliderRange,
-      &Interaction,
-      &Children,
-      Has<UiDisabled>,
-    ),
+    (&SliderValue, &SliderRange, &Interaction, &Children, Has<UiDisabled>),
     With<UiSlider>,
   >,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
@@ -296,11 +257,8 @@ pub fn slider_visual_system(
 ) {
   for (val, range, inter, children, disabled) in &mut q_root {
     let pct = normalize(val.0, range.min, range.max) * 100.0;
-    let thumb_size = if !disabled && *inter == Interaction::Pressed {
-      THUMB_SIZE_DRAG
-    } else {
-      THUMB_SIZE
-    };
+    let thumb_size =
+      if !disabled && *inter == Interaction::Pressed { THUMB_SIZE_DRAG } else { THUMB_SIZE };
     for child in children.iter() {
       // fill/thumb 都在 track 内部（孙节点）：下钻 track 的 Children
       if let Ok(tc) = q_track_children.get(child) {
@@ -315,11 +273,8 @@ pub fn slider_visual_system(
             node.top = Val::Percent(50.0);
             node.width = px(thumb_size);
             node.height = px(thumb_size);
-            node.margin = UiRect {
-              left: px(-thumb_size / 2.0),
-              top: px(-thumb_size / 2.0),
-              ..default()
-            };
+            node.margin =
+              UiRect { left: px(-thumb_size / 2.0), top: px(-thumb_size / 2.0), ..default() };
           }
         }
       }
@@ -338,11 +293,7 @@ mod tests {
     assert_eq!(clamp_step(-1.0, 0.0, 1.0, None), 0.0, "clamp low");
     assert_eq!(clamp_step(2.0, 0.0, 1.0, None), 1.0, "clamp high");
     assert_eq!(clamp_step(0.44, 0.0, 1.0, Some(0.25)), 0.5, "step round");
-    assert_eq!(
-      clamp_step(7.0, 0.0, 10.0, Some(3.0)),
-      6.0,
-      "step aligned to min"
-    );
+    assert_eq!(clamp_step(7.0, 0.0, 10.0, Some(3.0)), 6.0, "step aligned to min");
     assert_eq!(clamp_step(5.0, 5.0, 5.0, None), 5.0, "degenerate range");
   }
 
@@ -357,38 +308,20 @@ mod tests {
       child = Some(slider(
         &ctx,
         p,
-        SliderConfig {
-          min: 0.0,
-          max: 100.0,
-          value: 25.0,
-          step: Some(5.0),
-          ..default()
-        },
+        SliderConfig { min: 0.0, max: 100.0, value: 25.0, step: Some(5.0), ..default() },
       ));
     });
     let h = child.expect("slider spawned");
     let e = *h;
     let w = app.world();
-    assert_eq!(
-      w.get::<SliderValue>(e).unwrap().0,
-      25.0,
-      "initial value clamp/step"
-    );
+    assert_eq!(w.get::<SliderValue>(e).unwrap().0, 25.0, "initial value clamp/step");
     let root_children = w.get::<Children>(e).unwrap();
-    assert_eq!(
-      root_children.len(),
-      1,
-      "root only has track (thumb moved under track)"
-    );
+    assert_eq!(root_children.len(), 1, "root only has track (thumb moved under track)");
     let track = root_children[0];
     let track_children = w.get::<Children>(track).unwrap();
     assert_eq!(track_children.len(), 2, "track holds fill + thumb");
-    let has_fill = track_children
-      .iter()
-      .any(|c| w.get::<SliderFill>(c).is_some());
-    let has_thumb = track_children
-      .iter()
-      .any(|c| w.get::<SliderThumb>(c).is_some());
+    let has_fill = track_children.iter().any(|c| w.get::<SliderFill>(c).is_some());
+    let has_thumb = track_children.iter().any(|c| w.get::<SliderThumb>(c).is_some());
     assert!(has_fill && has_thumb, "fill + thumb both under track");
     // 根节点水平内边距 = 半 thumb（thumb 行程端点不溢出命中区）
     let pad = w.get::<Node>(e).unwrap().padding;
@@ -408,19 +341,13 @@ mod tests {
       sink.lock().unwrap().push((ev.entity, ev.value));
     });
     // ComputedNode：根宽 100px、无水平内边距 → cursor_x = (0.25+0.5)*100 = 75
-    let computed = ComputedNode {
-      size: Vec2::new(100.0, 24.0),
-      ..Default::default()
-    };
+    let computed = ComputedNode { size: Vec2::new(100.0, 24.0), ..Default::default() };
     let e = app
       .world_mut()
       .spawn((
         UiSlider,
         Interaction::Pressed,
-        RelativeCursorPosition {
-          cursor_over: true,
-          normalized: Some(Vec2::new(0.25, 0.0)),
-        },
+        RelativeCursorPosition { cursor_over: true, normalized: Some(Vec2::new(0.25, 0.0)) },
         computed,
         SliderRange::default(),
         SliderStep(None),
@@ -430,23 +357,12 @@ mod tests {
     app.update();
     // x=0.25（中心原点）→ cursor_x=75 → 内容盒 norm=0.75
     assert!((app.world().get::<SliderValue>(e).unwrap().0 - 0.75).abs() < 1e-6);
-    assert_eq!(
-      *events.lock().unwrap(),
-      vec![(e, 0.75)],
-      "value change emits SliderValueChanged"
-    );
+    assert_eq!(*events.lock().unwrap(), vec![(e, 0.75)], "value change emits SliderValueChanged");
 
     // 未按下不更新，也不发事件
-    app
-      .world_mut()
-      .get_mut::<Interaction>(e)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
-    app
-      .world_mut()
-      .get_mut::<RelativeCursorPosition>(e)
-      .unwrap()
-      .normalized = Some(Vec2::new(-0.5, 0.0));
+    app.world_mut().get_mut::<Interaction>(e).unwrap().set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<RelativeCursorPosition>(e).unwrap().normalized =
+      Some(Vec2::new(-0.5, 0.0));
     app.update();
     assert!((app.world().get::<SliderValue>(e).unwrap().0 - 0.75).abs() < 1e-6);
     assert_eq!(events.lock().unwrap().len(), 1, "no event when not pressed");
@@ -458,33 +374,15 @@ mod tests {
       cn.padding.min_inset.x = 8.0;
       cn.padding.max_inset.x = 8.0;
     }
-    app
-      .world_mut()
-      .get_mut::<Interaction>(e)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
-    app
-      .world_mut()
-      .get_mut::<RelativeCursorPosition>(e)
-      .unwrap()
-      .normalized = Some(Vec2::new(-0.48, 0.0)); // cursor_x = 2px < 8px padding
+    app.world_mut().get_mut::<Interaction>(e).unwrap().set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<RelativeCursorPosition>(e).unwrap().normalized =
+      Some(Vec2::new(-0.48, 0.0)); // cursor_x = 2px < 8px padding
     app.update();
-    assert_eq!(
-      app.world().get::<SliderValue>(e).unwrap().0,
-      0.0,
-      "left inset band clamps to min"
-    );
-    app
-      .world_mut()
-      .get_mut::<RelativeCursorPosition>(e)
-      .unwrap()
-      .normalized = Some(Vec2::new(0.48, 0.0)); // cursor_x = 98px > 92px content end
+    assert_eq!(app.world().get::<SliderValue>(e).unwrap().0, 0.0, "left inset band clamps to min");
+    app.world_mut().get_mut::<RelativeCursorPosition>(e).unwrap().normalized =
+      Some(Vec2::new(0.48, 0.0)); // cursor_x = 98px > 92px content end
     app.update();
-    assert_eq!(
-      app.world().get::<SliderValue>(e).unwrap().0,
-      1.0,
-      "right inset band clamps to max"
-    );
+    assert_eq!(app.world().get::<SliderValue>(e).unwrap().0, 1.0, "right inset band clamps to max");
   }
 
   #[test]

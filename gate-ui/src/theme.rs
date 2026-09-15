@@ -58,9 +58,7 @@ impl<'de> Deserialize<'de> for HexColor {
     if parse_hex_color(&s).is_some() {
       Ok(HexColor(s))
     } else {
-      Err(serde::de::Error::custom(format!(
-        "invalid hex color {s:?} (expect RRGGBB or RRGGBBAA)"
-      )))
+      Err(serde::de::Error::custom(format!("invalid hex color {s:?} (expect RRGGBB or RRGGBBAA)")))
     }
   }
 }
@@ -189,12 +187,7 @@ pub struct Spacing {
 
 impl Default for Spacing {
   fn default() -> Self {
-    Self {
-      xs: 4.0,
-      sm: 8.0,
-      md: 12.0,
-      lg: 16.0,
-    }
+    Self { xs: 4.0, sm: 8.0, md: 12.0, lg: 16.0 }
   }
 }
 
@@ -209,11 +202,7 @@ pub struct FontSize {
 
 impl Default for FontSize {
   fn default() -> Self {
-    Self {
-      sm: 12.0,
-      md: 14.0,
-      lg: 18.0,
-    }
+    Self { sm: 12.0, md: 14.0, lg: 18.0 }
   }
 }
 
@@ -550,11 +539,7 @@ mod tests {
       ("danger", &c.danger),
       ("danger_fill", &c.danger_fill),
     ] {
-      assert!(
-        hc.to_color().is_some(),
-        "default {name} hex invalid: {}",
-        hc.0
-      );
+      assert!(hc.to_color().is_some(), "default {name} hex invalid: {}", hc.0);
     }
   }
 
@@ -596,10 +581,7 @@ mod tests {
   #[test]
   fn bad_hex_rejected() {
     let r: Result<UiTheme, _> = ron::de::from_str("( colors: ( accent_fill: \"XYZ\" ) )");
-    assert!(
-      r.is_err(),
-      "invalid hex must be rejected at deserialize time"
-    );
+    assert!(r.is_err(), "invalid hex must be rejected at deserialize time");
     assert!(parse_hex_color("1E1E2E").is_some());
     assert!(parse_hex_color("#1E1E2ECC").is_some());
     assert!(parse_hex_color("12345").is_none());

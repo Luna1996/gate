@@ -73,11 +73,7 @@ pub fn resize_render_targets(
     full.y,
     render_scale_factor()
   );
-  let extent = Extent3d {
-    width: new_size.x,
-    height: new_size.y,
-    depth_or_array_layers: 1,
-  };
+  let extent = Extent3d { width: new_size.x, height: new_size.y, depth_or_array_layers: 1 };
   for handle in dda.iter().map(|d| &d.target) {
     if let Some(mut img) = images.get_mut(handle) {
       img.resize(extent);
@@ -90,9 +86,7 @@ pub struct ResponsivePlugin;
 
 impl Plugin for ResponsivePlugin {
   fn build(&self, app: &mut App) {
-    app
-      .init_resource::<RenderScale>()
-      .add_systems(Update, resize_render_targets);
+    app.init_resource::<RenderScale>().add_systems(Update, resize_render_targets);
   }
 }
 
@@ -130,13 +124,7 @@ mod tests {
   /// 分辨率策略：默认全分辨率（factor=1）；GATE_RES_SCALE=2 降档路径
   #[test]
   fn render_size_follows_factor() {
-    assert_eq!(
-      render_size_for_window(UVec2::new(1600, 900)),
-      UVec2::new(1600, 900)
-    );
-    assert_eq!(
-      render_size_for_window(UVec2::new(100, 100)),
-      UVec2::new(100, 100)
-    );
+    assert_eq!(render_size_for_window(UVec2::new(1600, 900)), UVec2::new(1600, 900));
+    assert_eq!(render_size_for_window(UVec2::new(100, 100)), UVec2::new(100, 100));
   }
 }

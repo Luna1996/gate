@@ -17,15 +17,9 @@ pub struct Splitter;
 
 /// 分割线：按父容器主轴方向自动决定横（Column 父）/竖（Row 父）
 pub fn splitter(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
-  let horizontal = parent
-    .world()
-    .get::<Node>(parent.target_entity())
-    .is_none_or(|n| {
-      matches!(
-        n.flex_direction,
-        FlexDirection::Column | FlexDirection::ColumnReverse
-      )
-    });
+  let horizontal = parent.world().get::<Node>(parent.target_entity()).is_none_or(|n| {
+    matches!(n.flex_direction, FlexDirection::Column | FlexDirection::ColumnReverse)
+  });
   let (width, height, name) = if horizontal {
     (Val::Auto, px(1.0), "ui-splitter-h")
   } else {
@@ -36,13 +30,7 @@ pub fn splitter(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
     .spawn((
       Name::new(name),
       Splitter,
-      Node {
-        width,
-        height,
-        align_self: AlignSelf::Stretch,
-        flex_shrink: 0.0,
-        ..default()
-      },
+      Node { width, height, align_self: AlignSelf::Stretch, flex_shrink: 0.0, ..default() },
       BackgroundColor(color_of(&c.border)),
     ))
     .id()
@@ -58,20 +46,10 @@ mod tests {
     let theme = default_theme();
     let ctx = UiCtx::new(&theme, None);
     let mut app = App::new();
-    let col_root = app
-      .world_mut()
-      .spawn(Node {
-        flex_direction: FlexDirection::Column,
-        ..default()
-      })
-      .id();
-    let row_root = app
-      .world_mut()
-      .spawn(Node {
-        flex_direction: FlexDirection::Row,
-        ..default()
-      })
-      .id();
+    let col_root =
+      app.world_mut().spawn(Node { flex_direction: FlexDirection::Column, ..default() }).id();
+    let row_root =
+      app.world_mut().spawn(Node { flex_direction: FlexDirection::Row, ..default() }).id();
     // 父无 Node（未布局根）→ 回退为横线
     let bare_root = app.world_mut().spawn_empty().id();
 

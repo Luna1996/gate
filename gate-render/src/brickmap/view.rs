@@ -46,21 +46,13 @@ impl<'a> BrickMapView<'a> {
     Self {
       b_struct: &buffers.b_struct,
       origin: IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z),
-      dims: IVec3::new(
-        g.index_dims_x as i32,
-        g.index_dims_y as i32,
-        g.index_dims_z as i32,
-      ),
+      dims: IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32),
     }
   }
 
   /// 从裸字切片构造（obj pool 拼接采样用：切片 = 某物体 b_struct 的连续窗口）
   pub fn from_parts(b_struct: &'a [u32], origin: IVec3, dims: IVec3) -> Self {
-    Self {
-      b_struct,
-      origin,
-      dims,
-    }
+    Self { b_struct, origin, dims }
   }
 
   /// chunk 窗口查找 → DFS 树绝对字基址（0 = 无 chunk）
@@ -190,10 +182,7 @@ mod tests {
     for x in 0..4i64 {
       for y in 0..4i64 {
         for z in 0..4i64 {
-          assert_eq!(
-            (z * 16 + y * 4 + x) as u32,
-            child_linear_idx(x as i32, y as i32, z as i32)
-          );
+          assert_eq!((z * 16 + y * 4 + x) as u32, child_linear_idx(x as i32, y as i32, z as i32));
         }
       }
     }
@@ -203,14 +192,8 @@ mod tests {
   #[test]
   fn negative_voxel_chunk_lookup() {
     let f = IVec3::new(-1, -257, 256);
-    assert_eq!(
-      f.div_euclid(IVec3::splat(CHUNK_SIZE)),
-      IVec3::new(-1, -2, 1)
-    );
-    assert_eq!(
-      f.rem_euclid(IVec3::splat(CHUNK_SIZE)),
-      IVec3::new(255, 255, 0)
-    );
+    assert_eq!(f.div_euclid(IVec3::splat(CHUNK_SIZE)), IVec3::new(-1, -2, 1));
+    assert_eq!(f.rem_euclid(IVec3::splat(CHUNK_SIZE)), IVec3::new(255, 255, 0));
   }
 
   /// view 走 1 chunk 场景的完整读回（builder 等价性测试的主体在 builder.rs）

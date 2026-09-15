@@ -80,10 +80,7 @@ fn main() {
         }),
         ..default()
       })
-      .set(AssetPlugin {
-        file_path: ASSETS_PATH.into(),
-        ..default()
-      })
+      .set(AssetPlugin { file_path: ASSETS_PATH.into(), ..default() })
       .set(LogPlugin {
         // info 基线 + 定向屏蔽：wgpu_hal::vulkan 的 instance / surface 层会打印
         // wgpu 已知 bug 的 VUID 错误（仅首 1-2 帧 swapchain 时序异常，不影响画面正确性）；
@@ -106,10 +103,8 @@ fn main() {
             offset,
             time::format_description::well_known::Rfc3339,
           );
-          let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_timer(timer)
-            .with_writer(writer);
+          let file_layer =
+            tracing_subscriber::fmt::layer().with_ansi(false).with_timer(timer).with_writer(writer);
           #[cfg(feature = "profile")]
           {
             use tracing_subscriber::Layer as _;
@@ -125,10 +120,7 @@ fn main() {
       // profile feature：WgpuSettings 开 wgpu timestamp 特性（wgpu-profiler 的
       // GPU zone 必需，DX12/Vulkan 均支持，缺特性时 scope 静默空转）。
       // Bevy 0.19 的 WgpuSettings 不再是 Resource，须经 RenderPlugin.render_creation 注入。
-      .set(bevy::render::RenderPlugin {
-        render_creation: profile_render_creation(),
-        ..default()
-      }),
+      .set(bevy::render::RenderPlugin { render_creation: profile_render_creation(), ..default() }),
   );
   app
     .add_plugins(gate_render::GateRenderPlugin)

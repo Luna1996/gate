@@ -63,18 +63,12 @@ pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -
 /// extent 各轴必须是 e 的倍数且 min 各轴对齐 e；brick 级树路径写入
 /// （[`VolumeGrid::fill_brick`]），零逐体素分裂开销。返回实际写入的 brick 数。
 pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, palette: u8) -> usize {
-  assert!(
-    LEVEL_EXTENT.contains(&e),
-    "e 必须是 brick 粒度 {LEVEL_EXTENT:?} 之一（got {e}）"
-  );
+  assert!(LEVEL_EXTENT.contains(&e), "e 必须是 brick 粒度 {LEVEL_EXTENT:?} 之一（got {e}）");
   assert!(
     extent.x % e == 0 && extent.y % e == 0 && extent.z % e == 0,
     "extent 必须是 e 的倍数（extent={extent} e={e}）"
   );
-  assert!(
-    min.x % e == 0 && min.y % e == 0 && min.z % e == 0,
-    "min 必须对齐 e（min={min} e={e}）"
-  );
+  assert!(min.x % e == 0 && min.y % e == 0 && min.z % e == 0, "min 必须对齐 e（min={min} e={e}）");
   let hi = min + extent;
   let mut count = 0;
   let mut z = min.z;
@@ -126,10 +120,7 @@ pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u
           }
         }
         if max_d2 <= r2 as i64 {
-          if grid
-            .fill_brick(IVec3::new(bx, by, bz), 4, palette)
-            .is_some()
-          {
+          if grid.fill_brick(IVec3::new(bx, by, bz), 4, palette).is_some() {
             count += 64;
           }
         } else {
@@ -207,19 +198,11 @@ const FONT: &[(u8, [u8; 7])] = &[
 
 fn glyph(ch: u8) -> &'static [u8; 7] {
   const BLANK: [u8; 7] = [0; 7];
-  FONT
-    .iter()
-    .find(|(c, _)| *c == ch.to_ascii_uppercase())
-    .map(|(_, rows)| rows)
-    .unwrap_or(&BLANK)
+  FONT.iter().find(|(c, _)| *c == ch.to_ascii_uppercase()).map(|(_, rows)| rows).unwrap_or(&BLANK)
 }
 
 pub fn text_size(text: &str) -> IVec3 {
-  let cols = if text.is_empty() {
-    0
-  } else {
-    text.len() as i32 * 6 - 1
-  };
+  let cols = if text.is_empty() { 0 } else { text.len() as i32 * 6 - 1 };
   IVec3::new(cols, 7, 1)
 }
 

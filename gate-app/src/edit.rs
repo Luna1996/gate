@@ -51,37 +51,13 @@ pub struct EditMaterial {
 
 /// 材质表（Edit tab 的滑杆顺序 = 本表顺序）
 pub const EDIT_MATERIALS: [EditMaterial; 6] = [
-  EditMaterial {
-    name: "Grey",
-    color: [150, 152, 158],
-    emissive: 0,
-  },
-  EditMaterial {
-    name: "Red",
-    color: [196, 62, 58],
-    emissive: 0,
-  },
-  EditMaterial {
-    name: "Green",
-    color: [74, 178, 92],
-    emissive: 0,
-  },
-  EditMaterial {
-    name: "Blue",
-    color: [70, 118, 214],
-    emissive: 0,
-  },
-  EditMaterial {
-    name: "Yellow",
-    color: [232, 198, 72],
-    emissive: 0,
-  },
+  EditMaterial { name: "Grey", color: [150, 152, 158], emissive: 0 },
+  EditMaterial { name: "Red", color: [196, 62, 58], emissive: 0 },
+  EditMaterial { name: "Green", color: [74, 178, 92], emissive: 0 },
+  EditMaterial { name: "Blue", color: [70, 118, 214], emissive: 0 },
+  EditMaterial { name: "Yellow", color: [232, 198, 72], emissive: 0 },
   // 自发光：发光体素着色直出并经 GI 传播（shaders/voxel_raytrace/common.wesl palette_emissive）
-  EditMaterial {
-    name: "Lamp",
-    color: [255, 238, 196],
-    emissive: 200,
-  },
+  EditMaterial { name: "Lamp", color: [255, 238, 196], emissive: 200 },
 ];
 
 impl EditMaterial {
@@ -113,12 +89,7 @@ pub struct EditSettings {
 
 impl Default for EditSettings {
   fn default() -> Self {
-    Self {
-      shape: BrushShape::Sphere,
-      size: 3,
-      material: 0,
-      slots: [None; EDIT_MATERIALS.len()],
-    }
+    Self { shape: BrushShape::Sphere, size: 3, material: 0, slots: [None; EDIT_MATERIALS.len()] }
   }
 }
 
@@ -129,9 +100,7 @@ fn material_slot(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usize)
     return s;
   }
   let empty = PaletteEntry::default();
-  let free = (1u16..255)
-    .find(|&i| *grid.palette().get(i as u8) == empty)
-    .map(|i| i as u8);
+  let free = (1u16..255).find(|&i| *grid.palette().get(i as u8) == empty).map(|i| i as u8);
   let slot = match free {
     Some(s) => s,
     None => {
@@ -167,11 +136,7 @@ pub fn raycast_main(
   dir: Vec3,
   max_dist: f32,
 ) -> Option<(IVec3, IVec3, f32)> {
-  let mut v = IVec3::new(
-    origin.x.floor() as i32,
-    origin.y.floor() as i32,
-    origin.z.floor() as i32,
-  );
+  let mut v = IVec3::new(origin.x.floor() as i32, origin.y.floor() as i32, origin.z.floor() as i32);
   let step = IVec3::new(
     if dir.x >= 0.0 { 1 } else { -1 },
     if dir.y >= 0.0 { 1 } else { -1 },
@@ -369,25 +334,15 @@ mod tests {
   /// 1 体素厚的地板：y ∈ [0,1)，x/z ∈ [-64,64)
   fn grid_with_floor() -> VolumeGrid {
     let mut g = VolumeGrid::new();
-    fill_box(
-      &mut g,
-      IVec3::new(-64, 0, -64),
-      IVec3::new(128, 1, 128),
-      1,
-    );
+    fill_box(&mut g, IVec3::new(-64, 0, -64), IVec3::new(128, 1, 128), 1);
     g
   }
 
   #[test]
   fn raycast_hits_floor_top_face() {
     let g = grid_with_floor();
-    let (v, n, t) = raycast_main(
-      &g,
-      Vec3::new(0.5, 10.5, 0.5),
-      Vec3::new(0.0, -1.0, 0.0),
-      64.0,
-    )
-    .expect("应命中地板");
+    let (v, n, t) = raycast_main(&g, Vec3::new(0.5, 10.5, 0.5), Vec3::new(0.0, -1.0, 0.0), 64.0)
+      .expect("应命中地板");
     assert_eq!(v, IVec3::new(0, 0, 0), "命中格");
     assert_eq!(n, IVec3::Y, "入面法线应朝射线来向（+Y）");
     assert!((t - 9.5).abs() < 1e-3, "命中距离 t={t}（应为 10.5-1.0）");
@@ -400,30 +355,18 @@ mod tests {
     let g = grid_with_floor();
     // 手长不够 → 未命中
     assert!(
-      raycast_main(
-        &g,
-        Vec3::new(0.5, 1000.5, 0.5),
-        Vec3::new(0.0, -1.0, 0.0),
-        64.0
-      )
-      .is_none(),
+      raycast_main(&g, Vec3::new(0.5, 1000.5, 0.5), Vec3::new(0.0, -1.0, 0.0), 64.0).is_none(),
       "超过 hand reach 不该命中"
     );
     // 朝天空打 → 未命中
-    assert!(
-      raycast_main(&g, Vec3::new(0.5, 10.5, 0.5), Vec3::Y, 64.0).is_none(),
-      "朝天空不该命中"
-    );
+    assert!(raycast_main(&g, Vec3::new(0.5, 10.5, 0.5), Vec3::Y, 64.0).is_none(), "朝天空不该命中");
   }
 
   #[test]
   fn brush_shape_size_and_air_only_placement() {
     // 立方体：size=3 → 5³ 全中
     let mut cube = VolumeGrid::new();
-    assert_eq!(
-      apply_brush(&mut cube, IVec3::ZERO, BrushShape::Cube, 3, 7),
-      125
-    );
+    assert_eq!(apply_brush(&mut cube, IVec3::ZERO, BrushShape::Cube, 3, 7), 125);
     // 球：同样跨度但少（去掉 8 个角）
     let mut sphere = VolumeGrid::new();
     let n = apply_brush(&mut sphere, IVec3::ZERO, BrushShape::Sphere, 3, 7);

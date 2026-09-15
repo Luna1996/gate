@@ -114,13 +114,7 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(panel(
-        &ctx,
-        p,
-        PanelConfig {
-          surface: PanelSurface::Hud,
-        },
-      ));
+      child = Some(panel(&ctx, p, PanelConfig { surface: PanelSurface::Hud }));
     });
     let e = *child.expect("hud panel spawned");
     let bg = app.world().get::<BackgroundColor>(e).unwrap().0.to_srgba();

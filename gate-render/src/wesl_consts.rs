@@ -106,18 +106,14 @@ impl DdgiConsts {
   fn load() -> Self {
     let dir = Path::new(DDA_WESL_DIR);
     let values = parse_package_u32_consts(dir);
-    let missing: Vec<&str> = REQUIRED
-      .iter()
-      .copied()
-      .filter(|name| !values.contains_key(*name))
-      .collect();
+    let missing: Vec<&str> =
+      REQUIRED.iter().copied().filter(|name| !values.contains_key(*name)).collect();
     if !missing.is_empty() {
       let msg = format!(
         "WESL 跨端常量缺失（{}）：{:?}\n\
          —— 权威值只写在 .wesl 里，Rust 从源码解析；请检查 ddgi/consts.wesl 与 bindings.wesl，\
          并确保它们写成 `const NAME: u32 = <字面量>u;` 形式。",
-        DDA_WESL_DIR,
-        missing
+        DDA_WESL_DIR, missing
       );
       error!("{msg}");
       panic!("{msg}");
@@ -150,7 +146,9 @@ impl DdgiConsts {
       error!("{msg}");
       panic!("{msg}");
     }
-    if out.atlas_layers == 0 || out.probes_per_layer_axis == 0 || out.irr_texels == 0
+    if out.atlas_layers == 0
+      || out.probes_per_layer_axis == 0
+      || out.irr_texels == 0
       || out.depth_texels == 0
     {
       let msg = format!("WESL 跨端常量存在 0 值（图集尺寸会退化成空纹理）：{out:?}");
@@ -222,12 +220,7 @@ pub fn parse_u32_consts_in_source(src: &str) -> HashMap<String, u32> {
 /// `const DDGI_PROBES_PER_LAYER: u32 = A * A;`）返回 `None`：Rust 不需要它们（能从已解析的
 /// 基础量自己算），而误当字面量解析会得到错值。行尾 `//` 注释会被先剥掉。
 fn parse_u32_const_line(raw: &str) -> Option<(String, u32)> {
-  let line = raw
-    .trim()
-    .trim_start_matches('\u{feff}')
-    .split("//")
-    .next()?
-    .trim();
+  let line = raw.trim().trim_start_matches('\u{feff}').split("//").next()?.trim();
   let rest = line.strip_prefix("const ")?.trim_start();
   let (name, rest) = rest.split_once(':')?;
   let name = name.trim();
@@ -262,7 +255,9 @@ mod tests {
     );
     // 派生式不是字面量 → 必须跳过（否则会解析出错值）
     assert_eq!(
-      parse_u32_const_line("const DDGI_PROBES_PER_LAYER: u32 = DDGI_PROBES_PER_LAYER_AXIS * DDGI_PROBES_PER_LAYER_AXIS;"),
+      parse_u32_const_line(
+        "const DDGI_PROBES_PER_LAYER: u32 = DDGI_PROBES_PER_LAYER_AXIS * DDGI_PROBES_PER_LAYER_AXIS;"
+      ),
       None
     );
     // 注释里的示例、其它类型、非 const 行都不能被当成常量

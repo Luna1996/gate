@@ -33,9 +33,7 @@ pub struct BindingLimits {
 }
 impl BindingLimits {
   pub fn probe(device: &RenderDevice) -> Self {
-    Self {
-      max_storage_buffer_binding_size: device.limits().max_storage_buffer_binding_size,
-    }
+    Self { max_storage_buffer_binding_size: device.limits().max_storage_buffer_binding_size }
   }
   pub fn force_multi(&self) -> bool {
     self.max_storage_buffer_binding_size < SINGLE_THRESHOLD_BYTES
@@ -53,9 +51,7 @@ impl BufferLayout {
       let per = 64u64 << 20;
       let left = limits.max_storage_buffer_binding_size.min(per).max(4 << 20);
       let node_slices = ((TREE_BASE as u64).saturating_add(per) / left) as usize;
-      Self::Multi {
-        node_slices: node_slices.max(1),
-      }
+      Self::Multi { node_slices: node_slices.max(1) }
     } else {
       Self::Single
     }
@@ -79,10 +75,7 @@ pub struct UploadBudget {
 }
 impl Default for UploadBudget {
   fn default() -> Self {
-    Self {
-      max_bytes_per_frame: 4 * 1024 * 1024,
-      incremental: true,
-    }
+    Self { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true }
   }
 }
 
@@ -359,11 +352,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   });
   let light_tex = device.create_texture(&TextureDescriptor {
     label: Some("gate_light_field"),
-    size: Extent3d {
-      width: 1,
-      height: 1,
-      depth_or_array_layers: 1,
-    },
+    size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
     mip_level_count: 1,
     sample_count: 1,
     dimension: TextureDimension::D3,
@@ -413,12 +402,8 @@ fn extract(
   if main_pending.force_full {
     mirror.pending_full = true;
   }
-  mirror
-    .pending_data_chunks
-    .extend(main_pending.data_chunks.iter().copied());
-  mirror
-    .pending_comp_chunks
-    .extend(main_pending.comp_chunks.iter().copied());
+  mirror.pending_data_chunks.extend(main_pending.data_chunks.iter().copied());
+  mirror.pending_comp_chunks.extend(main_pending.comp_chunks.iter().copied());
 
   let first = mirror.builder.is_none();
   let pending_full = std::mem::take(&mut mirror.pending_full);
@@ -463,23 +448,12 @@ fn extract(
   let dirty_main: Vec<gate_voxel::ChunkCoord> = if need_full {
     Vec::new() // full 会清空缓存，无需逐 chunk 剔除
   } else {
-    pending_data
-      .iter()
-      .filter(|(v, _)| *v == 0)
-      .map(|(_, c)| *c)
-      .collect()
+    pending_data.iter().filter(|(v, _)| *v == 0).map(|(_, c)| *c).collect()
   };
-  let cam_voxel = camera
-    .as_ref()
-    .map(|c| c.position_world)
-    .unwrap_or(glam::Vec3::ZERO);
-  if let Some(data) = update_light_field(
-    &mut light_field,
-    volumes_ref,
-    cam_voxel,
-    &dirty_main,
-    need_full,
-  ) {
+  let cam_voxel = camera.as_ref().map(|c| c.position_world).unwrap_or(glam::Vec3::ZERO);
+  if let Some(data) =
+    update_light_field(&mut light_field, volumes_ref, cam_voxel, &dirty_main, need_full)
+  {
     commands.insert_resource(LightFieldUpdate { data });
   }
 
@@ -488,9 +462,7 @@ fn extract(
   if !dirty_any {
     return;
   }
-  let builder = mirror
-    .builder
-    .get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref));
+  let builder = mirror.builder.get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref));
   if need_full {
     *builder = VolumesBuilder::build_full(volumes_ref);
     pending_data.clear();
@@ -505,11 +477,7 @@ fn extract(
   // state/comp 只取主世界（物体侧暂无数据）
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();
-  commands.insert_resource(UploadSnapshot {
-    volumes: snapshot,
-    state_bytes,
-    comp_chunks,
-  });
+  commands.insert_resource(UploadSnapshot { volumes: snapshot, state_bytes, comp_chunks });
 }
 
 /// 光照场增量更新（extract 侧）：相机中心 + 世界锚定槽位；窗口移动或脏 chunk 落入窗口时才铺。
@@ -577,8 +545,7 @@ fn update_light_field(
     }
   }
   // 淘汰窗口外的条目
-  lf.cache
-    .retain(|c, _| c.0.cmpge(c_lo).all() && c.0.cmple(c_hi).all());
+  lf.cache.retain(|c, _| c.0.cmpge(c_lo).all() && c.0.cmple(c_hi).all());
 
   // 整幅铺图：纹素下标 = **世界锚定槽位** `((wc mod dim) + dim) mod dim`（与 WGSL
   // `light_field_uv` 同一式子）。不能用 `wc − 窗口原点`：窗口原点是 cell 对齐而非 dim 对齐，
@@ -632,12 +599,7 @@ fn u8_of_u32(w: &[u32]) -> &[u8] {
 
 /// GridDesc 数组 → u8 字节视图（`#[repr(C)]` + 144B/entry，可直接 cast）
 fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
-  unsafe {
-    std::slice::from_raw_parts(
-      descs.as_ptr() as *const u8,
-      std::mem::size_of_val(descs),
-    )
-  }
+  unsafe { std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs)) }
 }
 
 /// GPU buffer 扩容尺寸策略（纯函数，单测覆盖）。
@@ -685,9 +647,8 @@ fn ensure_with_copy(
     // 前缀经 GPU-GPU 拷贝（独立 encoder submit，不占 PCIe）；随后 write_buffer 的
     // 内部 submit 与之保持提交顺序，先拷贝后写尾部。
     // COPY_BUFFER_ALIGNMENT=4；cap 恒为 words×4 或初始 4B，天然对齐。
-    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
-      label: Some("gate_grow_prefix_copy"),
-    });
+    let mut enc = device
+      .create_command_encoder(&CommandEncoderDescriptor { label: Some("gate_grow_prefix_copy") });
     enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
     queue.submit([enc.finish()]);
     queue.write_buffer(&new_buf, cap, &bytes[cap as usize..need as usize]);
@@ -729,9 +690,8 @@ fn ensure_capacity(
   });
   if cap > 0 {
     // COPY_BUFFER_ALIGNMENT=4；cap 恒为 words×4 或初始 4B，天然对齐。
-    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
-      label: Some("gate_grow_prefix_copy"),
-    });
+    let mut enc = device
+      .create_command_encoder(&CommandEncoderDescriptor { label: Some("gate_grow_prefix_copy") });
     enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
     queue.submit([enc.finish()]);
   }
@@ -751,11 +711,7 @@ fn upload_light_field(
   data: &[u8],
 ) {
   let dim = LIGHT_FIELD_DIM;
-  let want = Extent3d {
-    width: dim,
-    height: dim,
-    depth_or_array_layers: dim,
-  };
+  let want = Extent3d { width: dim, height: dim, depth_or_array_layers: dim };
   let cur = gpu.light_tex.size();
   if cur.width != dim || cur.height != dim || cur.depth_or_array_layers != dim {
     gpu.light_tex = device.create_texture(&TextureDescriptor {
@@ -783,11 +739,7 @@ fn upload_light_field(
       aspect: TextureAspect::All,
     },
     data,
-    TexelCopyBufferLayout {
-      offset: 0,
-      bytes_per_row: Some(dim * 8),
-      rows_per_image: Some(dim),
-    },
+    TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dim * 8), rows_per_image: Some(dim) },
     want,
   );
 }
@@ -839,13 +791,7 @@ pub(crate) fn prepare(
     let lut_need = (MARCH_MASK_WORDS * 4) as u64;
     if gpu.leaves.size() < lut_need {
       let lut = march_mask_lut_words();
-      write(
-        &device,
-        &queue,
-        &mut gpu.leaves,
-        "gate_leaves",
-        u8_of_u32(&lut),
-      );
+      write(&device, &queue, &mut gpu.leaves, "gate_leaves", u8_of_u32(&lut));
     }
   }
 
@@ -860,27 +806,9 @@ pub(crate) fn prepare(
     struct_tx_bytes = struct_bytes.len();
     palette_tx_bytes = palette_bytes.len();
     grid_descs_tx_bytes = grid_descs_bytes.len();
-    write(
-      &device,
-      &queue,
-      &mut gpu.struct_buf,
-      "gate_struct",
-      struct_bytes,
-    );
-    write(
-      &device,
-      &queue,
-      &mut gpu.palette,
-      "gate_palette",
-      palette_bytes,
-    );
-    write(
-      &device,
-      &queue,
-      &mut gpu.grid_descs_buf,
-      "gate_grid_descs",
-      grid_descs_bytes,
-    );
+    write(&device, &queue, &mut gpu.struct_buf, "gate_struct", struct_bytes);
+    write(&device, &queue, &mut gpu.palette, "gate_palette", palette_bytes);
+    write(&device, &queue, &mut gpu.grid_descs_buf, "gate_grid_descs", grid_descs_bytes);
   } else {
     // 增量路径：只按总字节 ensure 容量（扩容走 GPU-GPU 前缀拷贝，不占 PCIe），随后逐脏块
     // write_buffer——每块 = chunk 窗口条目字 + 新 append 的树尾部（KB~MB 级）；追加尾部
@@ -923,26 +851,13 @@ pub(crate) fn prepare(
     grid_descs_tx_bytes = 0;
   }
   // state / comp 每次都整块写（state 4KB、comp 每 chunk 8KB，都很小）
-  write(
-    &device,
-    &queue,
-    &mut gpu.state,
-    "gate_state",
-    &snap.state_bytes,
-  );
+  write(&device, &queue, &mut gpu.state, "gate_state", &snap.state_bytes);
   // comp: 每 chunk 8KB 占位；build 后可能为 0 字节，确保至少 4B。
   // comp_bytes 只是预估上限，UploadSnapshot 不带 comp 字节，这里只保证 buffer 大小对齐。
   {
     let placeholder = vec![0u8; comp_bytes.max(4)];
     // comp 为占位通道（内容无意义）；保留旧前缀即可
-    ensure_with_copy(
-      &device,
-      &queue,
-      &mut gpu.comp,
-      "gate_comp",
-      &placeholder,
-      true,
-    );
+    ensure_with_copy(&device, &queue, &mut gpu.comp, "gate_comp", &placeholder, true);
   }
 
   // globals：从主世界 GridDesc[0] 构造 BrickMapGlobals（BG 绑定字节兼容保留）。
@@ -974,16 +889,10 @@ pub(crate) fn prepare(
 
   gpu.grid_descs_count = snap.volumes.grid_descs.len() as u32;
   // 主世界 chunk 窗口 CPU 副本（DDGI 世界探针网格推导）
-  gpu.main_window_origin = IVec3::new(
-    main_desc.index_origin_x,
-    main_desc.index_origin_y,
-    main_desc.index_origin_z,
-  );
-  gpu.main_window_dims = UVec3::new(
-    main_desc.index_dims_x,
-    main_desc.index_dims_y,
-    main_desc.index_dims_z,
-  );
+  gpu.main_window_origin =
+    IVec3::new(main_desc.index_origin_x, main_desc.index_origin_y, main_desc.index_origin_z);
+  gpu.main_window_dims =
+    UVec3::new(main_desc.index_dims_x, main_desc.index_dims_y, main_desc.index_dims_z);
 
   // 世界数据已更新 → 修订号自增（下游 GPU pass 据此触发重烘焙）
   revision.0 = revision.0.wrapping_add(1);
@@ -995,12 +904,7 @@ pub(crate) fn prepare(
   let mb = tx_bytes_total / (1 << 20) as f64;
   // full: chunks = 所有 volume 的 chunk_count 之和；incremental: chunks = 本轮 dirty 数
   let chunks_show = if is_full {
-    snap
-      .volumes
-      .grid_descs
-      .iter()
-      .map(|g| g.chunk_count as usize)
-      .sum::<usize>()
+    snap.volumes.grid_descs.iter().map(|g| g.chunk_count as usize).sum::<usize>()
   } else {
     snap.volumes.dirty_chunks
   };
@@ -1060,10 +964,7 @@ impl Plugin for VolumePlugin {
   fn build(&self, app: &mut App) {
     // Render↔main 共享通道（UploadCpuSample）：插入同一个 Arc<Mutex> Resource 到两个世界
     let ch = UploadCpuSampleChannel::default();
-    app
-      .insert_resource(ch.clone())
-      .init_resource::<MainPending>()
-      .add_systems(Last, poll_pending);
+    app.insert_resource(ch.clone()).init_resource::<MainPending>().add_systems(Last, poll_pending);
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
@@ -1071,10 +972,7 @@ impl Plugin for VolumePlugin {
       .insert_resource(ch)
       .init_resource::<BrickMapRevision>()
       .init_resource::<LightFieldCpu>()
-      .insert_resource(BuilderMirror {
-        pending_full: true,
-        ..Default::default()
-      })
+      .insert_resource(BuilderMirror { pending_full: true, ..Default::default() })
       .add_systems(RenderStartup, init_empty_gpu)
       .add_systems(ExtractSchedule, extract)
       .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources));
@@ -1179,13 +1077,9 @@ mod tests {
 
   #[test]
   fn limits_select_layout() {
-    let multi = BindingLimits {
-      max_storage_buffer_binding_size: 128 * (1 << 20),
-    };
+    let multi = BindingLimits { max_storage_buffer_binding_size: 128 * (1 << 20) };
     assert!(multi.force_multi());
-    let single = BindingLimits {
-      max_storage_buffer_binding_size: 2 * (1 << 30),
-    };
+    let single = BindingLimits { max_storage_buffer_binding_size: 2 * (1 << 30) };
     assert!(!single.force_multi());
     let _ml = BufferLayout::from_limits(&multi);
     let _sl = BufferLayout::from_limits(&single);
@@ -1228,10 +1122,7 @@ mod tests {
     // 刚跨过边界 → 立即扩到下一档（amortized）
     assert_eq!(grow_size(grown, grown + 1024), 192 * 1024 * 1024);
     // 连续跨档（160MiB+33MiB=193MiB → 224MiB）
-    assert_eq!(
-      grow_size(grown, grown + 33 * 1024 * 1024),
-      224 * 1024 * 1024
-    );
+    assert_eq!(grow_size(grown, grown + 33 * 1024 * 1024), 224 * 1024 * 1024);
   }
 
   #[test]
@@ -1247,10 +1138,6 @@ mod tests {
     assert_eq!(bytes.len(), buffers.b_struct.len() * 4);
     assert!(buffers.globals.tile_count >= 1);
     // chunk 窗口条目非零（Region ① 至少 1 个 chunk）
-    assert!(
-      !buffers.b_struct[..CHUNK_INDEX_WORDS]
-        .iter()
-        .all(|&w| w == 0)
-    );
+    assert!(!buffers.b_struct[..CHUNK_INDEX_WORDS].iter().all(|&w| w == 0));
   }
 }

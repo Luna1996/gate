@@ -72,10 +72,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         info.aabb_max,
       );
       bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
-      ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb {
-        min: info.aabb_min,
-        max: info.aabb_max,
-      };
+      ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb { min: info.aabb_min, max: info.aabb_max };
     }
   }
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
@@ -84,9 +81,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // ---- DDGI LOD0 的 chunk 探针段分配集（内容驱动）----
   // 判定见 `lod0_needed_chunks`：只有「有几何」或「几何贴着 chunk 边界（16 体素内）」的 chunk
   // 才领一段固定 4096 槽的 LOD0 探针段，空 chunk 不占槽位；与 `DdgiWorldAabb` 一样只依赖世界内容。
-  let ddgi_lod0_chunks = gate_render::ddgi::DdgiLod0Chunks {
-    chunks: lod0_needed_chunks(&grid),
-  };
+  let ddgi_lod0_chunks = gate_render::ddgi::DdgiLod0Chunks { chunks: lod0_needed_chunks(&grid) };
 
   // 轨道相机为唯一相机状态源，DdaCameraConfig 由 from_orbit 生成（初始机位 = 场景中心俯视）。
   // GATE_CAM=sky：改为相机朝天空（纯 miss 场景）。
@@ -122,10 +117,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   {
     let t1 = std::time::Instant::now();
     // 树输出量诊断：serialize 总字数 + 最大 chunk
-    let mut words_per_chunk: Vec<(usize, _)> = grid
-      .chunk_coords()
-      .map(|c| (grid.chunk(c).map(|t| t.len_words()).unwrap_or(0), c))
-      .collect();
+    let mut words_per_chunk: Vec<(usize, _)> =
+      grid.chunk_coords().map(|c| (grid.chunk(c).map(|t| t.len_words()).unwrap_or(0), c)).collect();
     let total_words: usize = words_per_chunk.iter().map(|(w, _)| *w).sum();
     words_per_chunk.sort_unstable_by_key(|(w, _)| std::cmp::Reverse(*w));
     bevy::log::info!(
@@ -161,14 +154,9 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // dirty → builder → upload 路径。
   let volumes = Volumes::new(grid);
 
-  commands.insert_resource(VoxelScene {
-    volumes,
-    demo_force_full_rebuild: true,
-  });
-  commands.insert_resource(UploadBudget {
-    max_bytes_per_frame: 4 * 1024 * 1024,
-    incremental: true,
-  });
+  commands.insert_resource(VoxelScene { volumes, demo_force_full_rebuild: true });
+  commands
+    .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
 }
 
 /// DDGI LOD0 需要探针段的 chunk 集合（chunk 坐标 = 世界 voxel / 256，见 `DdgiLod0Chunks`）。
@@ -177,8 +165,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 /// 相邻 chunk 也要领一段 —— 否则贴着边界的采样者缺 4 个插值角，chunk 边界会留下可见接缝。
 /// 判定只扫最外一层 16³ brick（`ChunkTree::get_brick_state` level 2）。
 fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
-  use std::collections::HashSet;
   use gate_voxel::BrickState;
+  use std::collections::HashSet;
   // 每轴 16 个 16³ brick（256 / 16）；边界层 = 坐标 0 或 15
   const BRICKS: i32 = 16;
   let axis_offsets = |b: i32| -> [i32; 2] {
@@ -200,7 +188,12 @@ fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
     for bx in 0..BRICKS {
       for by in 0..BRICKS {
         for bz in 0..BRICKS {
-          if bx != 0 && bx != BRICKS - 1 && by != 0 && by != BRICKS - 1 && bz != 0 && bz != BRICKS - 1
+          if bx != 0
+            && bx != BRICKS - 1
+            && by != 0
+            && by != BRICKS - 1
+            && bz != 0
+            && bz != BRICKS - 1
           {
             continue;
           }
@@ -273,11 +266,7 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
 // 世界规模（tile 数，1 tile = 512 voxel）：env `GATE_TILES` 可调，clamp 2..=10，默认 2。
 // 场景内所有结构性坐标（城堡/大道/河）均以 EXT_VOXEL_HALF 为锚，随规模等比成立。
 static EXT_N_TILES: LazyLock<i32> = LazyLock::new(|| {
-  std::env::var("GATE_TILES")
-    .ok()
-    .and_then(|s| s.parse::<i32>().ok())
-    .unwrap_or(2)
-    .clamp(2, 10)
+  std::env::var("GATE_TILES").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2).clamp(2, 10)
 });
 static EXT_VOXEL_X: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
 static EXT_VOXEL_Z: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
@@ -327,12 +316,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   let t0 = std::time::Instant::now();
   macro_rules! mark {
     ($name:expr) => {
-      bevy::log::info!(
-        "SCENE {}: {:?} chunks={}",
-        $name,
-        t0.elapsed(),
-        grid.chunk_count()
-      )
+      bevy::log::info!("SCENE {}: {:?} chunks={}", $name, t0.elapsed(), grid.chunk_count())
     };
   }
   // ================================================================
@@ -367,23 +351,13 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
           if top > 560 {
             let snow_h = top - snow_line;
             if snow_h > 0 {
-              fill_box(
-                grid,
-                IVec3::new(x, snow_line, z),
-                IVec3::new(16, snow_h, 16),
-                3,
-              );
+              fill_box(grid, IVec3::new(x, snow_line, z), IVec3::new(16, snow_h, 16), 3);
             }
           } else {
             // 低矮山坡顶部覆草（palette 1，最顶 16 voxel）
             let grass_h = (top - 16).min(16);
             if grass_h > 0 && top - grass_h >= 16 {
-              fill_box(
-                grid,
-                IVec3::new(x, top - grass_h, z),
-                IVec3::new(16, grass_h, 16),
-                1,
-              );
+              fill_box(grid, IVec3::new(x, top - grass_h, z), IVec3::new(16, grass_h, 16), 1);
             }
           }
         }
@@ -396,25 +370,14 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
   mark!("(1) terrain columns");
   // 全地图 L0 基础地板（y=0..16，pal 1 草地）
-  fill_bricks(
-    grid,
-    IVec3::new(0, 0, 0),
-    IVec3::new(*EXT_VOXEL_X, 16, *EXT_VOXEL_Z),
-    16,
-    1,
-  );
+  fill_bricks(grid, IVec3::new(0, 0, 0), IVec3::new(*EXT_VOXEL_X, 16, *EXT_VOXEL_Z), 16, 1);
   mark!("(1b) floor");
 
   // ================================================================
   //  (2) 中央大道 + 入口大标语 "GATE ENGINE"
   // ================================================================
   // 中央大道（X 向，中线 ±32 宽）深灰铺路
-  fill_box(
-    grid,
-    IVec3::new(0, 16, *EXT_VOXEL_HALF - 32),
-    IVec3::new(*EXT_VOXEL_X, 8, 32),
-    12,
-  );
+  fill_box(grid, IVec3::new(0, 16, *EXT_VOXEL_HALF - 32), IVec3::new(*EXT_VOXEL_X, 8, 32), 12);
   // 大标语（L1，每像素 8³）
   draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 8);
   mark!("(2) road+text");
@@ -439,71 +402,23 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
   mark!("(3a) floating island");
   // 城墙平台（y=240..272）
-  fill_bricks(
-    grid,
-    IVec3::new(cx - 512, 240, cz - 512),
-    IVec3::new(1024, 32, 1024),
-    16,
-    4,
-  );
+  fill_bricks(grid, IVec3::new(cx - 512, 240, cz - 512), IVec3::new(1024, 32, 1024), 16, 4);
   // 四面城墙（y=272..336 = 64 高）
   // 北 Z=cz-512, 南 Z=cz+512-8
-  fill_box(
-    grid,
-    IVec3::new(cx - 512, 272, cz - 512),
-    IVec3::new(1024, 64, 8),
-    4,
-  );
-  fill_box(
-    grid,
-    IVec3::new(cx - 512, 272, cz + 512 - 8),
-    IVec3::new(1024, 64, 8),
-    4,
-  );
-  fill_box(
-    grid,
-    IVec3::new(cx - 512, 272, cz - 512),
-    IVec3::new(8, 64, 1024),
-    4,
-  );
-  fill_box(
-    grid,
-    IVec3::new(cx + 512 - 8, 272, cz - 512),
-    IVec3::new(8, 64, 1024),
-    4,
-  );
+  fill_box(grid, IVec3::new(cx - 512, 272, cz - 512), IVec3::new(1024, 64, 8), 4);
+  fill_box(grid, IVec3::new(cx - 512, 272, cz + 512 - 8), IVec3::new(1024, 64, 8), 4);
+  fill_box(grid, IVec3::new(cx - 512, 272, cz - 512), IVec3::new(8, 64, 1024), 4);
+  fill_box(grid, IVec3::new(cx + 512 - 8, 272, cz - 512), IVec3::new(8, 64, 1024), 4);
   // 四角角楼 96×96×160（从 y=272 起比城墙多高 96）
-  for &(ox, oz) in &[
-    (-512, -512),
-    (512 - 96, -512),
-    (-512, 512 - 96),
-    (512 - 96, 512 - 96),
-  ] {
+  for &(ox, oz) in &[(-512, -512), (512 - 96, -512), (-512, 512 - 96), (512 - 96, 512 - 96)] {
     let tx = cx + ox;
     let tz = cz + oz;
-    fill_bricks(
-      grid,
-      IVec3::new(tx, 272, tz),
-      IVec3::new(96, 160, 96),
-      16,
-      4,
-    );
+    fill_bricks(grid, IVec3::new(tx, 272, tz), IVec3::new(96, 160, 96), 16, 4);
     // 角楼顶金色 16
-    fill_box(
-      grid,
-      IVec3::new(tx, 272 + 160, tz),
-      IVec3::new(96, 16, 96),
-      11,
-    );
+    fill_box(grid, IVec3::new(tx, 272 + 160, tz), IVec3::new(96, 16, 96), 11);
   }
   // 正殿（中心，y=336..464 = 128 高）
-  fill_bricks(
-    grid,
-    IVec3::new(cx - 256, 336, cz - 256),
-    IVec3::new(512, 128, 512),
-    16,
-    4,
-  );
+  fill_bricks(grid, IVec3::new(cx - 256, 336, cz - 256), IVec3::new(512, 128, 512), 16, 4);
   // 正殿正门（Z- 方向，挖一矩形门洞：clear_voxel）
   {
     // L1 每步 = 8 voxel；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
@@ -525,39 +440,18 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     }
   }
   // 高塔（y=464..720 = 256 高，底 96×96 上收顶）
-  fill_bricks(
-    grid,
-    IVec3::new(cx - 48, 464, cz - 48),
-    IVec3::new(96, 256, 96),
-    16,
-    4,
-  );
+  fill_bricks(grid, IVec3::new(cx - 48, 464, cz - 48), IVec3::new(96, 256, 96), 16, 4);
   // 塔顶平台 128×128×16
-  fill_box(
-    grid,
-    IVec3::new(cx - 64, 720, cz - 64),
-    IVec3::new(128, 16, 128),
-    11,
-  );
+  fill_box(grid, IVec3::new(cx - 64, 720, cz - 64), IVec3::new(128, 16, 128), 11);
   // 金顶球（L2 r=64，塔顶 y=720+80=800）
   fill_sphere(grid, IVec3::new(cx, 800, cz), 64, 11);
   mark!("(3b) castle walls+towers");
   // 四角旗帜（L4 红飘带：从角楼顶 4 角斜向上拉出小立方体串）
-  for &(ox, oz) in &[
-    (-512, -512),
-    (512 - 16, -512),
-    (-512, 512 - 16),
-    (512 - 16, 512 - 16),
-  ] {
+  for &(ox, oz) in &[(-512, -512), (512 - 16, -512), (-512, 512 - 16), (512 - 16, 512 - 16)] {
     let fx = cx + ox + 4;
     let fz = cz + oz + 4;
     for s in 0..16i32 {
-      fill_box(
-        grid,
-        IVec3::new(fx + s, 448 + s * 4, fz),
-        IVec3::new(8, 8, 8),
-        10,
-      );
+      fill_box(grid, IVec3::new(fx + s, 448 + s * 4, fz), IVec3::new(8, 8, 8), 10);
     }
   }
 

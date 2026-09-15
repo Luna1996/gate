@@ -77,22 +77,14 @@ pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> Tab
           for h in &config.headers {
             row.spawn((
               TableCell,
-              Node {
-                flex_grow: 1.0,
-                flex_basis: Val::Px(0.0),
-                ..default()
-              },
+              Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() },
               label_bundle(ctx, h.clone(), m.font_size.sm, color_of(&c.text_primary)),
             ));
           }
         });
       // ---- 数据行（斑马纹）----
       for (i, row_data) in config.rows.iter().enumerate() {
-        let bg = if i % 2 == 0 {
-          color_of(&c.surface_card)
-        } else {
-          color_of(&c.surface_base)
-        };
+        let bg = if i % 2 == 0 { color_of(&c.surface_card) } else { color_of(&c.surface_base) };
         root
           .spawn((
             Name::new("ui-table-row"),
@@ -109,11 +101,7 @@ pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> Tab
             for cell in row_data.iter().take(ncols) {
               row.spawn((
                 TableCell,
-                Node {
-                  flex_grow: 1.0,
-                  flex_basis: Val::Px(0.0),
-                  ..default()
-                },
+                Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() },
                 label_bundle(ctx, cell.clone(), m.font_size.sm, color_of(&c.text_body)),
               ));
             }
@@ -121,11 +109,7 @@ pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> Tab
             for _ in row_data.len()..ncols {
               row.spawn((
                 TableCell,
-                Node {
-                  flex_grow: 1.0,
-                  flex_basis: Val::Px(0.0),
-                  ..default()
-                },
+                Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() },
                 label_bundle(ctx, String::new(), m.font_size.sm, color_of(&c.text_body)),
               ));
             }
@@ -156,10 +140,7 @@ mod tests {
       tbl = Some(table(
         &ctx,
         p,
-        TableConfig {
-          headers: s(&["name", "value"]),
-          rows: vec![s(&["a", "1"]), s(&["b", "2"])],
-        },
+        TableConfig { headers: s(&["name", "value"]), rows: vec![s(&["a", "1"]), s(&["b", "2"])] },
       ));
     });
     let e = *tbl.expect("table spawned");
@@ -180,14 +161,8 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut tbl = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      tbl = Some(table(
-        &ctx,
-        p,
-        TableConfig {
-          headers: s(&["a", "b", "c"]),
-          rows: vec![s(&["x"])],
-        },
-      ));
+      tbl =
+        Some(table(&ctx, p, TableConfig { headers: s(&["a", "b", "c"]), rows: vec![s(&["x"])] }));
     });
     let e = *tbl.unwrap();
     let w = app.world();

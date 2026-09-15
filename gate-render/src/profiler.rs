@@ -92,10 +92,8 @@ pub(crate) fn gpu_compute_pass<T>(
     let mut pass = encoder_scope.scoped_compute_pass(label);
     body(&mut pass)
   } else {
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-      label: Some(label),
-      ..default()
-    });
+    let mut pass =
+      encoder.begin_compute_pass(&ComputePassDescriptor { label: Some(label), ..default() });
     body(&mut pass)
   }
 }
@@ -108,10 +106,8 @@ pub(crate) fn gpu_compute_pass<T>(
   label: &str,
   mut body: impl FnMut(&mut ComputePass<'_>) -> T,
 ) -> T {
-  let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-    label: Some(label),
-    ..default()
-  });
+  let mut pass =
+    encoder.begin_compute_pass(&ComputePassDescriptor { label: Some(label), ..default() });
   body(&mut pass)
 }
 

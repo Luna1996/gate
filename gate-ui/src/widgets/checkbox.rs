@@ -60,21 +60,14 @@ pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) 
   let m = &ctx.theme.metrics;
   let box_bg = color_of(&c.surface_elevated);
   let box_border = color_of(&c.border);
-  let (box_bg, box_border) = if config.disabled {
-    (dim_color(box_bg), dim_color(box_border))
-  } else {
-    (box_bg, box_border)
-  };
+  let (box_bg, box_border) =
+    if config.disabled { (dim_color(box_bg), dim_color(box_border)) } else { (box_bg, box_border) };
   let mut ec = parent.spawn((
     Name::new("ui-checkbox"),
     Interaction::default(),
     InteractionPrev::default(),
     Checkable,
-    Node {
-      align_items: AlignItems::Center,
-      column_gap: px(m.spacing.sm),
-      ..default()
-    },
+    Node { align_items: AlignItems::Center, column_gap: px(m.spacing.sm), ..default() },
     FocusPolicy::Block,
   ));
   ec.with_children(|root| {
@@ -97,11 +90,7 @@ pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) 
       .with_children(|box_node| {
         box_node.spawn((
           Name::new("ui-checkbox-mark"),
-          Node {
-            width: px(BOX_SIZE * 0.5),
-            height: px(BOX_SIZE * 0.5),
-            ..default()
-          },
+          Node { width: px(BOX_SIZE * 0.5), height: px(BOX_SIZE * 0.5), ..default() },
           // 对勾标记 = 主文本色（强调填充上的最高对比）
           BackgroundColor(color_of(&c.text_primary)),
           Visibility::Hidden,
@@ -109,11 +98,7 @@ pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) 
       });
     if let Some(t) = config.text {
       let text_color = color_of(&c.text_body);
-      let text_color = if config.disabled {
-        dim_color(text_color)
-      } else {
-        text_color
-      };
+      let text_color = if config.disabled { dim_color(text_color) } else { text_color };
       spawn_label(ctx, root, t, m.font_size.md, text_color);
     }
   });
@@ -162,10 +147,7 @@ pub fn checkbox_state_system(
         } else {
           commands.entity(e).insert(Checked);
         }
-        commands.trigger(CheckboxToggled {
-          entity: e,
-          checked: !checked,
-        });
+        commands.trigger(CheckboxToggled { entity: e, checked: !checked });
       }
     }
     prev.0 = *inter;
@@ -195,11 +177,7 @@ pub fn checkbox_state_system(
           if let Ok(mut vis) = marks.get_mut(mark) {
             // 选中 = Inherited（跟随祖先显隐）；显式 Visible 会无视祖先
             // Hidden 强制可见 → 面板整体隐藏时勾选标记单独悬浮
-            let target_vis = if checked {
-              Visibility::Inherited
-            } else {
-              Visibility::Hidden
-            };
+            let target_vis = if checked { Visibility::Inherited } else { Visibility::Hidden };
             if *vis != target_vis {
               *vis = target_vis;
             }
@@ -231,12 +209,7 @@ mod tests {
 
     let root = app
       .world_mut()
-      .spawn((
-        Interaction::None,
-        InteractionPrev::default(),
-        Checkable,
-        Children::default(),
-      ))
+      .spawn((Interaction::None, InteractionPrev::default(), Checkable, Children::default()))
       .id();
     let box_e = app
       .world_mut()
@@ -247,10 +220,7 @@ mod tests {
         Children::default(),
       ))
       .id();
-    let mark = app
-      .world_mut()
-      .spawn((Node::default(), Visibility::default()))
-      .id();
+    let mark = app.world_mut().spawn((Node::default(), Visibility::default())).id();
     app.world_mut().entity_mut(box_e).add_child(mark);
     app.world_mut().entity_mut(root).add_child(box_e);
 
@@ -260,28 +230,14 @@ mod tests {
       app.world().get::<BackgroundColor>(box_e).unwrap().0,
       color_of(&theme.colors.surface_elevated)
     );
-    assert_eq!(
-      *app.world().get::<Visibility>(mark).unwrap(),
-      Visibility::Hidden
-    );
+    assert_eq!(*app.world().get::<Visibility>(mark).unwrap(), Visibility::Hidden);
 
     // 按下 → 释放：翻转为勾选
-    app
-      .world_mut()
-      .get_mut::<Interaction>(root)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(root).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(root)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(root).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
-    assert!(
-      app.world().get::<Checked>(root).is_some(),
-      "release toggles on"
-    );
+    assert!(app.world().get::<Checked>(root).is_some(), "release toggles on");
     assert_eq!(
       *toggles.lock().unwrap(),
       vec![(root, true)],
@@ -299,22 +255,11 @@ mod tests {
     );
 
     // 再点击一次：翻回未勾选
-    app
-      .world_mut()
-      .get_mut::<Interaction>(root)
-      .unwrap()
-      .set_if_neq(Interaction::Pressed);
+    app.world_mut().get_mut::<Interaction>(root).unwrap().set_if_neq(Interaction::Pressed);
     app.update();
-    app
-      .world_mut()
-      .get_mut::<Interaction>(root)
-      .unwrap()
-      .set_if_neq(Interaction::Hovered);
+    app.world_mut().get_mut::<Interaction>(root).unwrap().set_if_neq(Interaction::Hovered);
     app.update();
-    assert!(
-      app.world().get::<Checked>(root).is_none(),
-      "release toggles off"
-    );
+    assert!(app.world().get::<Checked>(root).is_none(), "release toggles off");
     assert_eq!(
       *toggles.lock().unwrap(),
       vec![(root, true), (root, false)],
@@ -338,11 +283,7 @@ mod tests {
       child = Some(checkbox(
         &ctx,
         p,
-        CheckboxConfig {
-          text: Some("opt".into()),
-          checked: false,
-          ..default()
-        },
+        CheckboxConfig { text: Some("opt".into()), checked: false, ..default() },
       ));
     });
     let h = child.expect("checkbox spawned");

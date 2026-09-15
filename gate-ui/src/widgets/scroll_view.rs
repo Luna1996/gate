@@ -110,10 +110,7 @@ pub fn scroll_view(
       );
     })
     .id();
-  ScrollViewHandle {
-    entity: vp_e,
-    content: content_e.expect("scroll content spawned"),
-  }
+  ScrollViewHandle { entity: vp_e, content: content_e.expect("scroll content spawned") }
 }
 
 /// 滚轮滚动系统：累加本帧 MouseWheel.y，更新悬停中 viewport 的 scroll_y
@@ -184,10 +181,7 @@ mod tests {
     assert_eq!(h.entity, vp, "handle.entity is the viewport");
     assert!(w.get::<ScrollView>(vp).is_some());
     assert!(w.get::<ScrollViewport>(vp).is_some());
-    assert!(
-      w.get::<Interaction>(vp).is_some(),
-      "viewport has Interaction for hover detection"
-    );
+    assert!(w.get::<Interaction>(vp).is_some(), "viewport has Interaction for hover detection");
   }
 
   #[test]
@@ -200,10 +194,7 @@ mod tests {
       .world_mut()
       .spawn((
         ScrollContent,
-        Node {
-          position_type: PositionType::Absolute,
-          ..default()
-        },
+        Node { position_type: PositionType::Absolute, ..default() },
         ComputedNode {
           size: Vec2::new(0.0, 300.0), // content 高 300
           ..default()
@@ -220,25 +211,19 @@ mod tests {
           height: Val::Px(100.0), // viewport 高 100
           ..default()
         },
-        ComputedNode {
-          size: Vec2::new(0.0, 100.0),
-          ..default()
-        },
+        ComputedNode { size: Vec2::new(0.0, 100.0), ..default() },
       ))
       .id();
     app.world_mut().entity_mut(vp).add_child(content);
 
     // 模拟向下滚一大段（dy 负 → delta 负 → scroll_y 减小，钳到 -max_scroll）
-    app
-      .world_mut()
-      .resource_mut::<Messages<MouseWheel>>()
-      .write(MouseWheel {
-        unit: MouseScrollUnit::Line,
-        x: 0.0,
-        y: -100.0,
-        phase: TouchPhase::Moved,
-        window: Entity::PLACEHOLDER,
-      });
+    app.world_mut().resource_mut::<Messages<MouseWheel>>().write(MouseWheel {
+      unit: MouseScrollUnit::Line,
+      x: 0.0,
+      y: -100.0,
+      phase: TouchPhase::Moved,
+      window: Entity::PLACEHOLDER,
+    });
     app.update();
 
     let sv = app.world().get::<ScrollView>(vp).unwrap();
@@ -254,22 +239,15 @@ mod tests {
     assert_eq!(content_node.top, Val::Px(sv.scroll_y));
 
     // 再向上滚一大段（dy 正 → scroll_y 增大，钳回 0）
-    app
-      .world_mut()
-      .resource_mut::<Messages<MouseWheel>>()
-      .write(MouseWheel {
-        unit: MouseScrollUnit::Line,
-        x: 0.0,
-        y: 100.0,
-        phase: TouchPhase::Moved,
-        window: Entity::PLACEHOLDER,
-      });
+    app.world_mut().resource_mut::<Messages<MouseWheel>>().write(MouseWheel {
+      unit: MouseScrollUnit::Line,
+      x: 0.0,
+      y: 100.0,
+      phase: TouchPhase::Moved,
+      window: Entity::PLACEHOLDER,
+    });
     app.update();
     let sv = app.world().get::<ScrollView>(vp).unwrap();
-    assert!(
-      sv.scroll_y.abs() < 1.0,
-      "scroll up clamps back to 0, got {}",
-      sv.scroll_y
-    );
+    assert!(sv.scroll_y.abs() < 1.0, "scroll up clamps back to 0, got {}", sv.scroll_y);
   }
 }

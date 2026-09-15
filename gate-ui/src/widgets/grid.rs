@@ -45,10 +45,7 @@ pub struct GridConfig {
 
 impl Default for GridConfig {
   fn default() -> Self {
-    Self {
-      columns: 2,
-      row_height: None,
-    }
+    Self { columns: 2, row_height: None }
   }
 }
 
@@ -65,10 +62,7 @@ pub fn grid(ctx: &UiCtx, parent: &mut ChildSpawner, config: GridConfig) -> GridH
       Node {
         display: Display::Grid,
         grid_template_columns: vec![RepeatedGridTrack::fr(columns, 1.0)],
-        grid_auto_rows: config
-          .row_height
-          .map(|h| vec![GridTrack::px(h)])
-          .unwrap_or_default(),
+        grid_auto_rows: config.row_height.map(|h| vec![GridTrack::px(h)]).unwrap_or_default(),
         row_gap: px(m.border_width),
         column_gap: px(m.border_width),
         width: Val::Percent(100.0),
@@ -94,10 +88,7 @@ pub fn grid_cell(ctx: &UiCtx, parent: &mut ChildSpawner, surface: PanelSurface) 
   parent
     .spawn((
       Name::new("ui-grid-cell"),
-      Node {
-        padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)),
-        ..default()
-      },
+      Node { padding: UiRect::all(px(ctx.theme.metrics.spacing.sm)), ..default() },
       BackgroundColor(color_of(bg)),
     ))
     .id()
@@ -117,14 +108,7 @@ mod tests {
 
     let mut h = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      h = Some(grid(
-        &ctx,
-        p,
-        GridConfig {
-          columns: 3,
-          row_height: Some(28.0),
-        },
-      ));
+      h = Some(grid(&ctx, p, GridConfig { columns: 3, row_height: Some(28.0) }));
     });
     // row_height: None → 空（auto 行）
     let mut h2 = None;
@@ -134,14 +118,7 @@ mod tests {
     // columns 下限 1
     let mut h3 = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      h3 = Some(grid(
-        &ctx,
-        p,
-        GridConfig {
-          columns: 0,
-          ..default()
-        },
-      ));
+      h3 = Some(grid(&ctx, p, GridConfig { columns: 0, ..default() }));
     });
     let e = h.unwrap();
     let w = app.world();
@@ -149,21 +126,9 @@ mod tests {
     let n = w.get::<Node>(*e).unwrap();
     assert_eq!(n.display, Display::Grid);
     assert_eq!(n.grid_template_columns.len(), 1, "single repeated track");
-    assert_eq!(
-      n.row_gap,
-      px(theme.metrics.border_width),
-      "gap = border_width"
-    );
-    assert_eq!(
-      n.column_gap,
-      px(theme.metrics.border_width),
-      "gap = border_width"
-    );
-    assert_eq!(
-      n.border,
-      UiRect::all(px(theme.metrics.border_width)),
-      "outer frame"
-    );
+    assert_eq!(n.row_gap, px(theme.metrics.border_width), "gap = border_width");
+    assert_eq!(n.column_gap, px(theme.metrics.border_width), "gap = border_width");
+    assert_eq!(n.border, UiRect::all(px(theme.metrics.border_width)), "outer frame");
     assert_eq!(
       w.get::<BorderColor>(*e).unwrap(),
       &BorderColor::all(color_of(&theme.colors.border)),
@@ -180,11 +145,7 @@ mod tests {
     let n = w.get::<Node>(*h2.unwrap()).unwrap();
     assert!(n.grid_auto_rows.is_empty(), "no row_height means auto rows");
     let n = w.get::<Node>(*h3.unwrap()).unwrap();
-    assert_eq!(
-      n.grid_template_columns.len(),
-      1,
-      "clamped to at least 1 column"
-    );
+    assert_eq!(n.grid_template_columns.len(), 1, "clamped to at least 1 column");
   }
 
   #[test]

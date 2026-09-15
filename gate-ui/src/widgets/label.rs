@@ -82,14 +82,8 @@ pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> Lab
   let fs = &ctx.theme.metrics.font_size;
   let (size, color) = config.style.tokens();
   let color = color_of(color(&ctx.theme.colors));
-  let color = if config.disabled {
-    dim_color(color)
-  } else {
-    color
-  };
-  let e = parent
-    .spawn(super::label_bundle(ctx, config.text, size(fs), color))
-    .id();
+  let color = if config.disabled { dim_color(color) } else { color };
+  let e = parent.spawn(super::label_bundle(ctx, config.text, size(fs), color)).id();
   LabelHandle(e)
 }
 
@@ -106,14 +100,7 @@ mod tests {
     let root = app.world_mut().spawn_empty().id();
     let mut child = None;
     app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(label(
-        &ctx,
-        p,
-        LabelConfig {
-          text: "hello".into(),
-          ..default()
-        },
-      ));
+      child = Some(label(&ctx, p, LabelConfig { text: "hello".into(), ..default() }));
     });
     let e = *child.expect("label spawned");
     let w = app.world();
@@ -121,10 +108,7 @@ mod tests {
     assert_eq!(text.0.as_str(), "hello");
     assert!(w.get::<bevy::ui::widget::Label>(e).is_some());
     let tf = w.get::<TextFont>(e).expect("label has TextFont");
-    assert_eq!(
-      tf.font_size,
-      bevy::text::FontSize::Px(theme.metrics.font_size.md)
-    );
+    assert_eq!(tf.font_size, bevy::text::FontSize::Px(theme.metrics.font_size.md));
     assert_eq!(
       w.get::<TextColor>(e).unwrap().0,
       color_of(&theme.colors.text_body),
@@ -143,61 +127,36 @@ mod tests {
       got.push(*label(
         &ctx,
         p,
-        LabelConfig {
-          text: "t".into(),
-          style: LabelStyle::Title,
-          ..default()
-        },
+        LabelConfig { text: "t".into(), style: LabelStyle::Title, ..default() },
       ));
       got.push(*label(
         &ctx,
         p,
-        LabelConfig {
-          text: "m".into(),
-          style: LabelStyle::Muted,
-          ..default()
-        },
+        LabelConfig { text: "m".into(), style: LabelStyle::Muted, ..default() },
       ));
       got.push(*label(
         &ctx,
         p,
-        LabelConfig {
-          text: "f".into(),
-          style: LabelStyle::FaintLg,
-          ..default()
-        },
+        LabelConfig { text: "f".into(), style: LabelStyle::FaintLg, ..default() },
       ));
       got.push(*label(
         &ctx,
         p,
-        LabelConfig {
-          text: "s".into(),
-          style: LabelStyle::Success,
-          ..default()
-        },
+        LabelConfig { text: "s".into(), style: LabelStyle::Success, ..default() },
       ));
     });
     let w = app.world();
-    assert_eq!(
-      w.get::<TextColor>(got[0]).unwrap().0,
-      color_of(&theme.colors.text_primary)
-    );
+    assert_eq!(w.get::<TextColor>(got[0]).unwrap().0, color_of(&theme.colors.text_primary));
     assert_eq!(
       w.get::<TextFont>(got[0]).unwrap().font_size,
       bevy::text::FontSize::Px(theme.metrics.font_size.lg)
     );
-    assert_eq!(
-      w.get::<TextColor>(got[1]).unwrap().0,
-      color_of(&theme.colors.text_muted)
-    );
+    assert_eq!(w.get::<TextColor>(got[1]).unwrap().0, color_of(&theme.colors.text_muted));
     assert_eq!(
       w.get::<TextFont>(got[2]).unwrap().font_size,
       bevy::text::FontSize::Px(theme.metrics.font_size.lg),
       "FaintLg stays >=18px"
     );
-    assert_eq!(
-      w.get::<TextColor>(got[3]).unwrap().0,
-      color_of(&theme.colors.success)
-    );
+    assert_eq!(w.get::<TextColor>(got[3]).unwrap().0, color_of(&theme.colors.success));
   }
 }

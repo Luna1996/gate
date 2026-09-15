@@ -34,12 +34,7 @@ fn fill_checkerboard(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, cell: i32
       let mut x = min.x;
       while x < min.x + extent.x {
         let parity = ((x / cell) ^ (y / cell) ^ (z / cell)) & 1;
-        fill_box(
-          grid,
-          IVec3::new(x, y, z),
-          IVec3::splat(cell),
-          parity as u8 + 1,
-        );
+        fill_box(grid, IVec3::new(x, y, z), IVec3::splat(cell), parity as u8 + 1);
         x += cell;
       }
       y += cell;
@@ -60,10 +55,7 @@ fn fill_chunk_checkers(grid: &mut VolumeGrid, chunk_x0: i32, n: usize, span: i32
 struct Lcg(u64);
 impl Lcg {
   fn next_u32(&mut self) -> u32 {
-    self.0 = self
-      .0
-      .wrapping_mul(6364136223846793005)
-      .wrapping_add(1442695040888963407);
+    self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     (self.0 >> 33) as u32
   }
   /// 单位球面伪随机方向（拒绝采样，均匀性对计时断言足够）
@@ -103,11 +95,7 @@ fn million_voxel_build_full_budget() {
   let build = t0.elapsed();
 
   // CI 宽松上界：2s ≈ 数十倍余量（树序列化为主，63 chunk × 数百节点）
-  assert!(
-    build.as_secs_f64() < 2.0,
-    "build_full 超预算（CI 宽松 2s）：{:?}",
-    build
-  );
+  assert!(build.as_secs_f64() < 2.0, "build_full 超预算（CI 宽松 2s）：{:?}", build);
 
   let bufs = builder.buffers();
   assert_eq!(bufs.globals.tile_count as usize, 63);
@@ -153,16 +141,11 @@ fn incremental_burst_frame_budget() {
   let mut frame_chunks: Vec<usize> = Vec::new();
   let mut drained = 0usize;
   while grid.dirty.data_dirty_count() > 0 {
-    let coords = grid
-      .dirty
-      .drain_data_budget(grid.dirty.data_dirty_count().min(budget_n));
+    let coords = grid.dirty.drain_data_budget(grid.dirty.data_dirty_count().min(budget_n));
     let t0 = Instant::now();
     for c in &coords {
       assert!(
-        matches!(
-          builder.update_chunk(&grid, *c),
-          gate_render::ChunkUpdate::Rebuilt
-        ),
+        matches!(builder.update_chunk(&grid, *c), gate_render::ChunkUpdate::Rebuilt),
         "已渲染脏 chunk 应走 Rebuilt（{c:?}）"
       );
     }
@@ -218,10 +201,7 @@ fn dda_regime_a_open_far_budget() {
   }
   let el = t0.elapsed();
   // CI 宽松：实测毫秒级；阈值 500ms/千射线（单级退化 → >2s 爆）
-  assert!(
-    el.as_secs_f64() < 0.5,
-    "空旷远距 DDA 千射线耗时 {el:?} > 500ms（疑似两级步进退化）"
-  );
+  assert!(el.as_secs_f64() < 0.5, "空旷远距 DDA 千射线耗时 {el:?} > 500ms（疑似两级步进退化）");
   println!(
     "[P2.9c-A] 空旷远距 1000 rays: {el:?} ({:.1}µs/ray) hits={hits}/1000",
     el.as_micros() as f64 / 1000.0
@@ -302,10 +282,7 @@ fn vram_layout_budget_2gb() {
   // ① 定长前缀回归锚：Region ① 稠密 chunk 窗口 = 64³ 字 = 1MB
   assert_eq!(TREE_BASE, 64 * 64 * 64);
   assert_eq!(TREE_BASE * 4, 1_048_576);
-  println!(
-    "[P2.9d] 定长前缀（chunk 窗口）= {:.1}MB",
-    TREE_BASE as f64 * 4.0 / 1048576.0
-  );
+  println!("[P2.9d] 定长前缀（chunk 窗口）= {:.1}MB", TREE_BASE as f64 * 4.0 / 1048576.0);
 
   // ② 中粒度棋盘单 chunk 的树区成本线：64³ cell=16 棋盘（level 2 粒度异色）
   let mut grid = VolumeGrid::new();
@@ -331,18 +308,8 @@ fn vram_layout_budget_2gb() {
   //    外推 ×2（CPU 镜像+GPU 同规格）——仅留档
   let mut grid = VolumeGrid::new();
   fill_chunk_checkers(&mut grid, 0, 32, 16, 4);
-  fill_checkerboard(
-    &mut grid,
-    IVec3::new(32 * CHUNK_VOXEL, 0, 0),
-    IVec3::splat(64),
-    16,
-  );
-  fill_checkerboard(
-    &mut grid,
-    IVec3::new(33 * CHUNK_VOXEL, 0, 0),
-    IVec3::new(64, 64, 48),
-    1,
-  );
+  fill_checkerboard(&mut grid, IVec3::new(32 * CHUNK_VOXEL, 0, 0), IVec3::splat(64), 16);
+  fill_checkerboard(&mut grid, IVec3::new(33 * CHUNK_VOXEL, 0, 0), IVec3::new(64, 64, 48), 1);
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
   let total_mb = (bufs.b_struct.len() + bufs.b_palette.len()) as f64 * 4.0 / 1048576.0;
   println!(
@@ -378,9 +345,8 @@ fn obj_16_objects_trace_scene_budget() {
     assert!(edited.is_some(), "芯片板占用祖先存在，写入应生效");
   }
   // 16 个独立 chip 副本（每物体 = 独立 VolumeGrid）
-  let chip_bufs: Vec<_> = (0..16)
-    .map(|_| BrickMapBuilder::build_full(&chip).buffers().clone())
-    .collect();
+  let chip_bufs: Vec<_> =
+    (0..16).map(|_| BrickMapBuilder::build_full(&chip).buffers().clone()).collect();
   let transforms: Vec<VolumeTransform> = (0..16)
     .map(|i| {
       VolumeTransform::new(
@@ -391,17 +357,15 @@ fn obj_16_objects_trace_scene_budget() {
     })
     .collect();
   // vols[0] = 主世界，vols[1..17] = 物体
-  let vols: Vec<(&gate_render::BrickMapBuffers, VolumeTransform)> = std::iter::once((
-    &world as &gate_render::BrickMapBuffers,
-    VolumeTransform::IDENTITY,
-  ))
-  .chain(
-    chip_bufs
-      .iter()
-      .zip(transforms.iter().copied())
-      .map(|(b, t)| (b as &gate_render::BrickMapBuffers, t)),
-  )
-  .collect();
+  let vols: Vec<(&gate_render::BrickMapBuffers, VolumeTransform)> =
+    std::iter::once((&world as &gate_render::BrickMapBuffers, VolumeTransform::IDENTITY))
+      .chain(
+        chip_bufs
+          .iter()
+          .zip(transforms.iter().copied())
+          .map(|(b, t)| (b as &gate_render::BrickMapBuffers, t)),
+      )
+      .collect();
 
   // 体量留档：每物体 = 1 chunk 树（窗口 1MB + 树）+ palette
   let per_obj_kb = chip_bufs[0].b_struct.len() as f64 * 4.0 / 1024.0;

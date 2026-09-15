@@ -21,10 +21,7 @@ pub struct AnchorCamera {
 
 impl Default for AnchorCamera {
   fn default() -> Self {
-    Self {
-      view_proj: Mat4::IDENTITY,
-      position_world: Vec3::ZERO,
-    }
+    Self { view_proj: Mat4::IDENTITY, position_world: Vec3::ZERO }
   }
 }
 
@@ -68,10 +65,7 @@ pub fn project_to_screen(view_proj: Mat4, pos: Vec3, screen: Vec2) -> Option<Vec
   if ndc.x.abs() > 1.0 || ndc.y.abs() > 1.0 {
     return None;
   }
-  Some(Vec2::new(
-    (ndc.x * 0.5 + 0.5) * screen.x,
-    (1.0 - (ndc.y * 0.5 + 0.5)) * screen.y,
-  ))
+  Some(Vec2::new((ndc.x * 0.5 + 0.5) * screen.x, (1.0 - (ndc.y * 0.5 + 0.5)) * screen.y))
 }
 
 /// 距离缩放系数：reference_distance 处 = 1.0，近大远小，钳制 [0.25, 4.0]
@@ -101,10 +95,8 @@ pub fn world_anchor_system(
 ) {
   let Some(cam) = cam else { return };
   let Ok(window) = windows.single() else { return };
-  let screen = Vec2::new(
-    window.physical_width().max(1) as f32,
-    window.physical_height().max(1) as f32,
-  );
+  let screen =
+    Vec2::new(window.physical_width().max(1) as f32, window.physical_height().max(1) as f32);
   for (e, anchor, mut node, mut vis, tf, base) in &mut q {
     let mut show = anchor.visible;
     if show {
@@ -153,11 +145,7 @@ pub fn world_anchor_system(
 }
 
 fn vis_of(v: bool) -> Visibility {
-  if v {
-    Visibility::Inherited
-  } else {
-    Visibility::Hidden
-  }
+  if v { Visibility::Inherited } else { Visibility::Hidden }
 }
 
 /// 快捷 spawn：世界空间文本标注（绝对定位由系统每帧写入）。
@@ -183,11 +171,7 @@ pub fn world_anchor_label(
       },
       Node::default(),
       // 文本延迟到字体就绪后再插入（见 world_anchor_apply_text）
-      PendingAnchorText {
-        text: text.to_string(),
-        color,
-        font_size: FontSize::Px(14.0),
-      },
+      PendingAnchorText { text: text.to_string(), color, font_size: FontSize::Px(14.0) },
     ))
     .id()
 }
@@ -223,11 +207,7 @@ pub fn world_anchor_apply_text(
       .entity(e)
       .insert((
         Text::new(p.text.clone()),
-        TextFont {
-          font: font_source.clone(),
-          font_size: p.font_size,
-          ..default()
-        },
+        TextFont { font: font_source.clone(), font_size: p.font_size, ..default() },
         TextColor(p.color),
       ))
       .remove::<PendingAnchorText>();
@@ -262,15 +242,9 @@ mod tests {
     let vp = proj * view;
     let screen = Vec2::new(1600.0, 900.0);
     // 相机背后（视线朝原点，(10,10,10) 在身后）
-    assert_eq!(
-      project_to_screen(vp, Vec3::new(10.0, 10.0, 10.0), screen),
-      None
-    );
+    assert_eq!(project_to_screen(vp, Vec3::new(10.0, 10.0, 10.0), screen), None);
     // 视锥外横向远偏
-    assert_eq!(
-      project_to_screen(vp, Vec3::new(100.0, 0.0, 0.0), screen),
-      None
-    );
+    assert_eq!(project_to_screen(vp, Vec3::new(100.0, 0.0, 0.0), screen), None);
   }
 
   /// 距离缩放：基准处 1.0、单调递减、钳制 [0.25, 4]
