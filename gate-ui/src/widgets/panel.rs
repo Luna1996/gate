@@ -1,9 +1,6 @@
-//! panel：圆角面板容器（暗色表面令牌，docs/ui-dark-theme.md §5.1）。
+//! panel：面板容器（暗色表面令牌，docs/ui-dark-theme.md §5.1）。
 //!
-//! 层级靠表面色与 1px 边框表达，不用阴影：
-//! - [`panel`]：L1 不透明卡片（菜单/设置/模态本体）
-//! - [`panel_hud`]：L1 半透明卡片（浮在 3D 体素场景上的 HUD/调试 overlay，alpha 90%）
-//! - [`panel_elevated`]：L2 抬升嵌块（卡片内分区）
+//! 层级靠表面色与 1px 边框表达，不用阴影；表面档由 [`PanelSurface`] 选定（Card/Hud/Elevated）。
 //!
 //! 响应式约定：面板定位由调用方设置（PositionType::Absolute + Percent 边距锚定边缘），
 //! 本函数只给视觉令牌与 flex 纵向布局。

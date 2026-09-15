@@ -1,14 +1,11 @@
-//! Brick Tree 软件遍历器（Phase 1，Douglas mask DDA 的 CPU 参考实现）
+//! Brick Tree 软件遍历器：wire.rs §b_struct 寻址链的 CPU 独立实现（刻意不与 builder 共享
+//! 代码，等价性测试的意义就在于两套实现互为对照）。
 //!
-//! 独立实现 wire.rs §b_struct 寻址链——刻意不共享 builder 内部代码，
-//! 等价性测试的意义就在于两套实现互为对照（共享即自证）。
+//! 寻址链（3 步，全部 storage load）：① chunk 窗口：voxel → chunk（floor div 256）→ entry
+//! （0 = 无 chunk）② chunk base → 根节点 fixed（mask_lo/mask_hi/palette，8B）③ mask bit 测试
+//! → popcount 定位 child offset → 下钻（每层 1 次 load，uniform 子块零额外 load）。
+//!
 //! 语义与 `VolumeGrid::get_voxel` 严格一致：Some(palette 1..=255) / None（空）。
-//!
-//! 寻址链（3 步，全部 storage load）：
-//! ① chunk 窗口：voxel → chunk（floor div 256）→ entry（0 = 无 chunk）
-//! ② chunk base → 根节点 fixed（mask_lo/mask_hi/palette，8B）
-//! ③ mask bit 测试 → popcount 定位 child offset → 下钻（每层 1 次 load，
-//!    uniform 子块零额外 load——palette 直存父节点 fixed 字）
 
 use glam::IVec3;
 
@@ -28,7 +25,7 @@ fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
 }
 
 /// 读一个节点的 (mask, palette)。`node` 为 b_struct 内绝对字址。
-/// palette word 低字节 = uniform 子块色（高字节 = LOD 子树多数色，GPU 早停用）
+/// palette word 低字节 = uniform 子块色（高字节 = LOD 子树多数色）
 #[inline]
 fn read_node(b_struct: &[u32], node: usize) -> (u64, u32) {
   let lo = b_struct[node] as u64;
@@ -93,7 +90,7 @@ impl<'a> BrickMapView<'a> {
   }
 
   /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
-  /// wire v3：level 3（叶父层）inline 4 体素/word，消除 level 4 叶节点
+  /// 叶父层（level 3）inline 4 体素/word，故不存在 level 4 叶节点
   pub fn get_voxel(&self, voxel: IVec3) -> Option<u8> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let base = self.chunk_base(chunk)?;
@@ -115,7 +112,7 @@ impl<'a> BrickMapView<'a> {
         return (pal != 0).then_some(pal as u8);
       }
       if child_extent == 1 {
-        // wire v3：叶父层 inline 4 体素/word = b_struct[node + 3 + (ci >> 2)]，
+        // 叶父层 inline 4 体素/word = b_struct[node + 3 + (ci >> 2)]，
         // palette = 该 word 的第 (ci & 3) 字节
         let w = self.b_struct[node + 3 + (ci >> 2) as usize];
         let leaf_pal = (w >> ((ci & 3) as u32 * 8)) & 0xFF;
@@ -136,11 +133,9 @@ impl<'a> BrickMapView<'a> {
   /// cell 灭占用查询（两级 DDA 粗步专用）：cc 为 cell 坐标（1 单位 = 16 voxel）。
   /// 语义：false ⇒ get_voxel 对该 cell 内全部 16³ voxel 位置都返回 None。
   ///
-  /// 走树到 level 2（16³）粒度：
-  /// - 中途 mask=0（uniform）→ occupied = palette != 0
-  /// - mask bit=0（uniform 子块）→ occupied = palette != 0
-  /// - 到达 extent=16 的 Split 节点 → occupied = true
-  ///   （ChunkTree merge 不变式：Split ⇒ 64 槽颜色不全同 ⇒ 至少一槽非 AIR）
+  /// 走树到 level 2（16³）粒度：uniform（mask=0 或 mask bit=0）→ occupied = palette != 0；
+  /// 到达 extent=16 的 Split 节点 → occupied = true（ChunkTree merge 不变式：Split ⇒ 64 槽
+  /// 颜色不全同 ⇒ 至少一槽非 AIR）。
   pub fn cell_occupied(&self, cc: IVec3) -> bool {
     // cell 的最小角 voxel → chunk + local（cell 恒不跨 chunk：16 | 256）
     let voxel_min = cc * 16;

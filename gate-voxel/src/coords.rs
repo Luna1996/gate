@@ -1,16 +1,9 @@
-//! 坐标系与层级常量（Phase 0，Douglas Brick Tree 对齐）
+//! 坐标系与层级常量（Douglas Brick Tree 对齐）。
 //!
-//! 统一后坐标体系：
-//! - **VoxelCoord**：最细格（1³），i32³ 世界坐标，无边界
-//! - **ChunkCoord**：chunk（256³ 体素）分层 HashMap key
-//! - **BrickCoord**：Brick Tree 内 brick（level 指定分裂深度，256³ / 4^level 体素）
-//!
-//! 分裂树层级：256 → 64 → 16 → 4 → 1（4 层分裂，4³=64 分裂因子）
-//! - Level 0: 256³（chunk 整体 uniform leaf 时）
-//! - Level 1: 64³
-//! - Level 2: 16³ ← 组件粒度（= DDGI probe cell = gate cell）
-//! - Level 3: 4³
-//! - Level 4: 1³ ← 编辑最细粒度（voxel，2cm）；代码中坐标量词统一用 `voxel`
+//! VoxelCoord = 最细格（1³，i32³ 世界坐标，无边界）；ChunkCoord = 256³ chunk 的
+//! 分层 HashMap key；BrickCoord = 树内 brick（256³ / 4^level 体素）。
+//! 层级 256 → 64 → 16 → 4 → 1；Level 2（16³）= 组件粒度 = DDGI probe cell = gate cell，
+//! Level 4（1³）= 编辑最细粒度（voxel，2cm）。
 
 use glam::IVec3;
 

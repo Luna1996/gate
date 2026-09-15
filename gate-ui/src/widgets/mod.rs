@@ -1,25 +1,14 @@
-//! FR-2 基础 widget 层：retained spawn API（token 驱动），三件套统一约定。
+//! 基础 widget 层：retained spawn API（token 驱动），三件套统一约定。
 //!
-//! ## 组件 API 约定（v2）
-//!
-//! 每个 widget 由三件套组成，全部自由函数、无 builder：
-//!
-//! 1. **`XxxConfig`**：全部参数进 Config（含必填如 text），`..default()` 补齐可选字段。
+//! 1. **`XxxConfig`**：全部参数进 Config（含必填如 text），`..default()` 补齐可选字段；
 //!    布局字段（宽高/边距）不进 Config——调用方拿到 Handle 后自行改 `Node`。
-//!    预设档（label 字号/颜色、panel 表面）用 enum 表达，颜色字号永远成对来自令牌。
-//! 2. **`XxxHandle`**：spawn 返回类型，Deref 到根实体 `Entity`（零开销新类型）。
-//!    多实体 widget 用具名字段：`ScrollViewHandle { entity, content }`、
-//!    `TabViewHandle { entity, contents }`。不挂 sugar 方法，后续按需再加。
-//! 3. **事件**：仅交互型 widget（button/slider/checkbox/tab_view）发事件；
-//!    展示型（label/panel/plot/list/table/splitter）不发。组件永远是真源，
-//!    事件只是通知——主动读值仍可 Query。命名：动作用名词（`UiClick`）、
-//!    变化用 -ed 过去式（`SliderValueChanged`/`CheckboxToggled`/`TabChanged`）。
+//! 2. **`XxxHandle`**：spawn 返回类型，Deref 到根实体 `Entity`；多实体 widget 用具名字段
+//!    （`ScrollViewHandle { entity, content }`）。
+//! 3. **事件**：仅交互型 widget（button/slider/checkbox/tab_view）发事件，展示型不发；组件永远
+//!    是真源，事件只是通知。命名：动作用名词（`UiClick`）、变化用 -ed（`SliderValueChanged`）。
 //!
-//! 豁免：`splitter` 无任何配置项，不设 Config；`row`/`column`/`spacer` 等布局
-//! 容器不纳入本层，直接用 bevy_ui 原生 `Node`。
-//!
-//! 响应式布局约定（FR-2）：容器级尺寸/边距优先 `Val::Percent` / `Val::Vw/Vh`；
-//! 控件本体（按钮/滑杆）允许固定像素——面板锚定边缘，窗口任意尺寸下不越界不重叠。
+//! 豁免：`splitter` 无配置项，不设 Config；`row`/`column`/`spacer` 等布局容器直接用原生 `Node`。
+//! 响应式布局：容器级尺寸/边距优先 `Val::Percent` / `Val::Vw/Vh`，控件本体允许固定像素。
 
 pub mod button;
 pub mod checkbox;
@@ -108,14 +97,9 @@ impl<'a> UiCtx<'a> {
     Self { theme, font }
   }
 
-  /// TextFont.font 来源：
-  /// - 显式 ThemeFont → 自定义字体（MapleMono 等含 CJK 的 TTF，通常作为项目唯一字体）
-  /// - 否则 → `FontSource::default()`（= AssetId::<Font>::default() slot，由
-  ///   GateUiPlugin 在主题字体加载后覆盖；即使 theme.font_path 是 None，
-  ///   这条也将命中 Bevy 内置 FiraMono，结果与 FontSource::Handle(Handle::default()) 一致）。
-  ///   之前用 `FontSource::SystemUi`——它会退到操作系统 UI 字体，字形与项目字体不一致，
-  ///   且在英文系统上可能没有 CJK 字形。除非显式指定其他字体，所有 gate-ui 文本统一走
-  ///   主题字体，满足"除非额外指定，全部用同一字体"的需求。
+  /// TextFont.font 来源：显式 ThemeFont → 自定义字体（含 CJK 的 TTF）；否则 →
+  /// `FontSource::default()`（= `AssetId::<Font>::default()` slot，由 GateUiPlugin 在
+  /// 主题字体加载后覆盖，否则命中 Bevy 内置 FiraMono）。所有 gate-ui 文本统一走主题字体。
   pub fn font_source(&self) -> FontSource {
     match self.font {
       Some(h) => FontSource::from(h),

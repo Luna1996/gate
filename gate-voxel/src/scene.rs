@@ -1,6 +1,5 @@
-//! 测试场景构造器（Phase 0，Brick Tree 适配）
+//! 测试场景构造器：方块 / 球 / 文字的体素化工具，供单元测试与基准场景库使用。
 //!
-//! 方块 / 球 / 文字的体素化工具，供单元测试、基准场景库与 Phase 1 渲染验证使用。
 //! 统一用 1³ 体素写，Brick Tree 自适应合并 uniform leaf。
 
 use glam::IVec3;
@@ -8,10 +7,9 @@ use glam::IVec3;
 use crate::coords::LEVEL_EXTENT;
 use crate::volume::VolumeGrid;
 
-/// 填充与轴对齐包围盒相交的所有体素（1³，确定性）
+/// 填充与轴对齐包围盒相交的所有体素（1³，确定性）。
 ///
-/// 按 4³ 网格分块：完全含于 box 的整块走 `fill_brick`（O(depth) 树路径写入），
-/// 边缘块逐体素。纯逐体素 `set_voxel` 对大 box 慢 64 倍（每 4³ 块分裂 65 节点）。
+/// 按 4³ 网格分块：完全含于 box 的整块走 `fill_brick`（O(depth) 树路径写入），边缘块逐体素。
 pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -> usize {
   assert!(extent.cmpgt(IVec3::ZERO).all());
   let max = min + extent;
@@ -60,11 +58,10 @@ pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -
   count
 }
 
-/// 用 e³ 对齐 brick 填充 [min, min+extent) 盒（大体积均匀填充专用）
+/// 用 e³ 对齐 brick 填充 [min, min+extent) 盒（大体积均匀填充专用）。
 ///
-/// extent 各轴必须是 e 的倍数且 min 各轴对齐 e。brick 级树路径写入
-/// （[`VolumeGrid::fill_brick`]），零逐体素分裂开销——百万级 fill_box 会内存爆炸
-/// （每新 4³ 块分裂 65 节点），大盒一律走本函数。返回实际写入的 brick 数。
+/// extent 各轴必须是 e 的倍数且 min 各轴对齐 e；brick 级树路径写入
+/// （[`VolumeGrid::fill_brick`]），零逐体素分裂开销。返回实际写入的 brick 数。
 pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, palette: u8) -> usize {
   assert!(
     LEVEL_EXTENT.contains(&e),
@@ -98,11 +95,10 @@ pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, pal
   count
 }
 
-/// 填充球体（立方中心到球心距离 ≤ 半径）
+/// 填充球体（体素中心到球心距离 ≤ 半径）。
 ///
-/// 按 4³ 分块：8 角全在球内的整块走 [`VolumeGrid::fill_brick`]（O(depth) 树
-/// 路径写入），边缘壳逐体素。纯逐体素对大球慢 64× 且 Split 节点爆炸
-/// （浮空岛 8 层嵌套大球曾拖死启动：数亿次 set_voxel / GB 级节点）。
+/// 按 4³ 分块：8 角全在球内的整块走 [`VolumeGrid::fill_brick`]（O(depth) 树路径
+/// 写入），边缘壳逐体素。
 pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u8) -> usize {
   assert!(radius > 0);
   let r2 = radius * radius;
@@ -169,7 +165,7 @@ pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u
   count
 }
 
-/// 5×7 位图字体（和旧版相同）
+/// 5×7 位图字体
 const FONT: &[(u8, [u8; 7])] = &[
   (b'0', [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
   (b'1', [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E]),

@@ -1,11 +1,9 @@
-//! world_anchor：世界空间 UI 投影锚定（FR-3）。
+//! world_anchor：世界空间 UI 投影锚定。
 //!
 //! 每帧把锚点世界坐标经 view_proj 投影到屏幕像素，写入 UI 节点绝对定位（left/top）；
 //! NDC 越界 / 在相机背后 → `Visibility::Hidden`。可选距离缩放（作用于本实体 TextFont）。
-//!
-//! 依赖边界：gate-ui 不依赖 gate-render——投影矩阵经通用资源 [`AnchorCamera`]
-//! 由 app 侧同步（gate-app 从 DdaCameraConfig 拷贝），投影数学只依赖 Mat4。
-//! 遮挡检测（OQ-2，CPU DDA）v0 不做，后置 P7.3（需体素网格跨 crate 访问）。
+//! 依赖边界：gate-ui 不依赖 gate-render——投影矩阵经通用资源 [`AnchorCamera`] 由 app 侧同步，
+//! 投影数学只依赖 Mat4。遮挡检测（CPU DDA）需体素网格跨 crate 访问，暂不实现。
 
 use crate::theme::ThemeFont;
 use bevy::asset::{AssetServer, LoadState};
@@ -30,7 +28,7 @@ impl Default for AnchorCamera {
   }
 }
 
-/// 世界空间锚点（挂任意 UI 节点；v0 距离缩放作用于本实体 TextFont）
+/// 世界空间锚点（挂任意 UI 节点；距离缩放作用于本实体 TextFont）
 #[derive(Component, Clone, Copy, Debug)]
 pub struct WorldAnchor {
   /// 锚点世界坐标（voxel 单位，与渲染世界一致）
@@ -49,11 +47,9 @@ pub struct AnchorBaseFont(FontSize);
 
 /// `world_anchor_label()` 生成的待应用文本（文本 + 颜色）。
 ///
-/// 不直接 spawn Text/TextFont 的原因：`world_anchor_label` 通常在 Startup set
-/// 同步调用（例如 gate-app setup()），此时主题字体尚未异步加载，Assets<Font>
-/// default slot 是 Bevy 内置 FiraMono（CJK 字形缺失 → 方框）。gate-ui 的
-/// `world_anchor_apply_text` 系统在 ThemeFont Loaded 后把 Pending 记录里的
-/// Text/TextFont 组件真正插入实体，保证首帧栅格即使用主题字体渲染 CJK 字形。
+/// 延迟插入 Text/TextFont：spawn 常发生在主题字体异步加载完成前，此时 Assets<Font> 的
+/// default slot 仍是 Bevy 内置 FiraMono（CJK 字形缺失 → 方框）。`world_anchor_apply_text`
+/// 在 ThemeFont Loaded 后把文本组件真正插入实体，保证首帧栅格即用主题字体渲染 CJK。
 #[derive(Component, Clone, Debug)]
 pub struct PendingAnchorText {
   pub text: String,
@@ -164,13 +160,11 @@ fn vis_of(v: bool) -> Visibility {
   }
 }
 
-/// 快捷 spawn：世界空间文本标注（绝对定位由系统每帧写入）
+/// 快捷 spawn：世界空间文本标注（绝对定位由系统每帧写入）。
 ///
-/// 字体来源：`FontSource::default()`（Assets<Font> 的 AssetId::default() slot）。
-/// 为了保证 CJK 字形不变成方框，本函数**不会立即插入 Text/TextFont 组件**，而是
-/// 写入 [`PendingAnchorText`]；`world_anchor_apply_text` 在主题字体
-/// `LoadState::Loaded` + `ui_theme_font_install_default` 覆盖 default slot
-/// 之后才把真正的文本组件插入实体。
+/// 字体走 `FontSource::default()` slot；为保证 CJK 字形不变成方框，本函数**不会立即插入
+/// Text/TextFont 组件**，而是写入 [`PendingAnchorText`]，由 `world_anchor_apply_text`
+/// 在主题字体 `LoadState::Loaded` + default slot 被覆盖之后补插文本组件。
 pub fn world_anchor_label(
   commands: &mut Commands,
   text: &str,
@@ -200,14 +194,8 @@ pub fn world_anchor_label(
 
 /// 将 [`PendingAnchorText`] 转换为 `Text + TextFont + TextColor` 组件。
 ///
-/// 触发条件（任一满足，按优先级判断）：
-/// 1. ThemeFont.handle 已存在 且 `LoadState::Loaded` → 直接用主题字体 Handle
-///    （保证字形完整，与面板文本一致）；
-/// 2. ThemeFont 不存在 或 theme.font_path = None → 立即 fallback 到
-///    `FontSource::default()`（可能是 SystemUi/Bevy FiraMono，此时 CJK 风险
-///    交给项目调用方配置 theme.font_path 兜底）。
-///
-/// 不满足条件 → 下一帧重试（Pending 组件继续保留）。
+/// ThemeFont.handle 存在且 `LoadState::Loaded` → 直接用主题字体 Handle；ThemeFont 不存在
+/// 或 `font_path = None` → fallback 到 `FontSource::default()`；未就绪则下一帧重试。
 pub fn world_anchor_apply_text(
   mut commands: Commands,
   server: Option<Res<AssetServer>>,

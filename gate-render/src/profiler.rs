@@ -1,21 +1,9 @@
 //! GPU 帧剖析：wgpu-profiler 接入（cargo feature = "profile" 时启用）。
 //!
-//! profile 构建下：
-//! - [`RenderStartup`] 建 `GpuProfiler`（tracy 模式：GPU zone 直送 Tracy，
-//!   要求 gate-app main 最早期已 `tracy_client::Client::start()`；Tracy 未运行时
-//!   创建失败 → profiler = None，所有 scope 空转，渲染不受影响）；
-//! - resolve 系统挂 Render→Submit 之间：独立 encoder 调 `resolve_queries` 后 push
-//!   PendingCommandBuffers（与 bevy 自带 RenderDiagnosticsPlugin 同模式，保证 resolve
-//!   在所有带 query 的 command buffer 之后、同一次 submit 执行）；
-//! - finish 系统挂 Finish 集（submit 已完成）：`end_frame` + `process_finished_frame`；
-//! - 各 dispatch 系统经 [`gpu_compute_pass`] 打 compute pass scope；render pass
-//!   （blit）经 [`profiler_mut`] 取 profiler 手动开 scoped_render_pass。
-//!
-//! 非 profile 构建：本模块为零依赖空壳——资源是 unit、helper 等价于
-//! `begin_compute_pass`，渲染路径零开销。
-//!
-//! 设备特性：profile 构建需要 wgpu timestamp 特性，由 gate-app 经
-//! [`timestamp_wgpu_features`] 写入 WgpuSettings。
+//! profile 构建：`RenderStartup` 建 `GpuProfiler`（tracy 模式，要求 gate-app main 最早期已
+//! `tracy_client::Client::start()`，否则 profiler = None、scope 全空转）；resolve 系统挂
+//! Render→Submit 之间，`end_frame` / `process_finished_frame` 挂 Finish 集。非 profile 构建为
+//! 零依赖空壳（资源是 unit，helper 等价 `begin_compute_pass`）。device 需 wgpu timestamp 特性。
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{CommandEncoder, ComputePass, ComputePassDescriptor};
@@ -33,11 +21,9 @@ pub(crate) struct GpuProfilerRes {
   report: PassReport,
 }
 
-/// 逐 pass GPU 耗时聚合器：把 `process_finished_frame` 返回的结果按 label 累计，
-/// 每 [`REPORT_PERIOD_SECS`] 秒往日志打一行平均耗时。
-///
-/// 存在的理由：wgpu-profiler 原本只在 Tracy 模式下消费结果，没连 Tracy GUI 就完全
-/// 看不到数字，归因只能靠猜。这里直接落日志，`--features profile` 即可读数。
+/// 逐 pass GPU 耗时聚合器：把 `process_finished_frame` 的结果按 label 累计，每
+/// [`REPORT_PERIOD_SECS`] 秒往日志打一行平均耗时（wgpu-profiler 只在 Tracy 模式下消费
+/// 结果，落日志后无 Tracy GUI 也能读数）。
 #[cfg(feature = "profile")]
 #[derive(Default)]
 struct PassReport {
@@ -92,10 +78,8 @@ pub fn timestamp_wgpu_features() -> bevy::render::render_resource::WgpuFeatures 
   wgpu_profiler::GpuProfiler::ALL_WGPU_TIMER_FEATURES
 }
 
-/// 在一个 compute pass 外打 GPU scope（profile 关闭 = 直接 begin_compute_pass）。
-///
-/// profile 下 = encoder scope（同 label）→ scoped_compute_pass（pass 自身时间戳），
-/// body 拿到 [`ComputePass`] 录命令；pass/scope 随 block 结束自动关闭。
+/// 在一个 compute pass 外打 GPU scope（profile 下 = encoder scope → scoped_compute_pass，
+/// 含 pass 自身时间戳，body 拿到 [`ComputePass`] 录命令）；pass/scope 随 block 结束自动关闭。
 #[cfg(feature = "profile")]
 pub(crate) fn gpu_compute_pass<T>(
   res: &mut GpuProfilerRes,
@@ -164,8 +148,8 @@ fn init_gpu_profiler(
   adapter: Res<RenderAdapter>,
   mut res: ResMut<GpuProfilerRes>,
 ) {
-  // new_with_tracy_client 内部要求 tracy client 已 start（Client::running()）；
-  // gate-app 在 main 最早期启动 client。失败（Tracy 未运行）则空转。
+  // new_with_tracy_client 要求 tracy client 已 start（gate-app 在 main 最早期启动）；
+  // 失败（Tracy 未运行）则空转。
   let backend = adapter.get_info().backend;
   match wgpu_profiler::GpuProfiler::new_with_tracy_client(
     wgpu_profiler::GpuProfilerSettings::default(),
@@ -214,7 +198,7 @@ fn finish_profiler_frame(mut res: ResMut<GpuProfilerRes>, queue: Res<RenderQueue
     }
     profiler.process_finished_frame(period)
   });
-  // tracy 模式下这些 zone 已直送 Tracy；这里再自行聚合一遍落日志，方便没有 Tracy GUI 时读数
+  // tracy 模式下这些 zone 已直送 Tracy；此处再聚合一遍落日志，无 Tracy GUI 也能读数
   if let Some(results) = results {
     res.report.push(&results);
   }

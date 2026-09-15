@@ -1,16 +1,10 @@
-//! capture：UI 指针门控（FR-6）。
+//! capture：UI 指针门控。
 //!
-//! 复刻 bevy_ui 0.19 `ui_focus_system` 的命中判定：光标落在任意「可见 + 非零
-//! 尺寸 + 祖先裁剪区内」的 UI 节点上即视为 UI 捕获（每帧重算）；显式
-//! [`FocusPolicy::Pass`] 的节点不捕获（交互穿透到下层，与引擎 focus 链同语义）。
+//! 直接对 UI 节点树做命中测试，规则与 bevy_ui 0.19 `ui_focus_system` 一致：光标落在
+//! 「可见 + 非零尺寸 + 祖先裁剪区内」的 UI 节点上即视为捕获（每帧重算）；显式
+//! [`FocusPolicy::Pass`] 的节点不捕获，交互穿透到下层。
 //!
-//! 旧实现只统计带 `Interaction` 组件的节点是否 Hovered——但面板背景、容器、label
-//! 这类节点没有 `Interaction`（引擎 focus.rs 对它们只做命中/阻挡，不写状态），
-//! 悬停这些区域时 [`UiPointerCaptured`] 仍为 false，相机旋转/滚轮缩放/左键拾取
-//! 会穿透到 3D 场景。现改为直接对 UI 节点树做命中测试，规则与引擎一致。
-//!
-//! 轨道相机等游戏输入 system 开头检查 [`UiPointerCaptured`]，捕获时跳过一切
-//! 鼠标操作（按键/滚轮/移动）。
+//! 轨道相机等游戏输入 system 开头检查 [`UiPointerCaptured`]，捕获时跳过一切鼠标操作。
 
 use bevy::prelude::*;
 use bevy::ui::{
@@ -30,6 +24,8 @@ pub struct UiPointerCaptured(pub bool);
 /// - `ComputedNode::contains_point`（节点变换后的物理像素矩形；圆角按实际半径）
 /// - `clip_check_recursive`（光标被任一 `Overflow::clip()` 祖先裁掉则不算命中）
 /// - `FocusPolicy::Pass` 的节点本身不捕获（下层 Block 节点仍可命中）
+///
+/// 面板背景/容器/label 等节点没有 `Interaction`，故不能只统计 Interaction 状态。
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn ui_pointer_capture_system(
   windows: Query<&Window, With<PrimaryWindow>>,
@@ -55,7 +51,7 @@ pub fn ui_pointer_capture_system(
       if node.size() == Vec2::ZERO {
         continue;
       }
-      // FocusPolicy::Pass = 显式让交互穿透（本组件库目前全部用 Block，分支保真）
+      // FocusPolicy::Pass = 显式让交互穿透（本组件库全部用 Block）
       if focus == Some(&FocusPolicy::Pass) {
         continue;
       }

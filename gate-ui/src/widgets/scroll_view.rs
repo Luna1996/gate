@@ -5,10 +5,8 @@
 //! - content：绝对定位，`top = -scroll_y` 实现纵向偏移
 //! - 滚动量钳制在 `[-(content_h - viewport_h), 0]`
 //!
-//! 只响应光标悬停（Interaction::Hovered/Pressed）的 viewport，避免多个
-//! scroll view 同时滚动。
-//!
-//! bevy 0.19 中 MouseWheel 是 `Message`（非 Event），用 `MessageReader` 读取。
+//! 只响应光标悬停（Interaction::Hovered/Pressed）的 viewport。bevy 0.19 中 MouseWheel 是
+//! `Message`（非 Event），用 `MessageReader` 读取。
 
 use std::ops::Deref;
 
@@ -124,9 +122,8 @@ pub fn scroll_view_system(
   mut q_vp: Query<(&mut ScrollView, &Interaction, &Children, &ComputedNode), With<ScrollViewport>>,
   mut q_content: Query<(&mut Node, &ComputedNode), With<ScrollContent>>,
 ) {
-  // 滚轮 y：正值 = 向上滚（winit/Windows 传统鼠标滚轮正向），内容应下移看上面的内容
-  // → scroll_y 增大（趋向 0）。Pixel 单位（触控板）按典型行高 16px 折算成行，
-  // 与 gate-app 相机缩放口径一致。
+  // 滚轮 y：正值 = 向上滚（winit/Windows 传统鼠标滚轮正向），scroll_y 增大（趋向 0）。
+  // Pixel 单位（触控板）按典型行高 16px 折算成行。
   let mut lines = 0.0;
   for ev in scroll_reader.read() {
     match ev.unit {

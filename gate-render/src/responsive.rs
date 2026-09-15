@@ -1,13 +1,8 @@
 //! FR-5 场景响应式：窗口 resize → 渲染目标纹理原地重建 + RenderScale/Uniforms 跟随。
 //!
-//! 策略（spec FR-5 v0）：渲染内部分辨率跟随窗口物理像素。
-//! 纹理用 `Assets<Image>::get_mut + resize`（Handle 不变，引用方零改动），
-//! GpuImage 由资产管线在下一次 Prepare 自动按新描述符重建；
-//! DDA shader 有越界剔除（textureDimensions），div_ceil 派发安全。
-//!
-//! 分辨率策略（2026-09-04 用户裁决纠正）：**默认全分辨率**（Douglas 最终画面 sharp =
-//! 独显全速 + FXAA；1660 Ti 7ms 是全速数字）。降分辨率只是他的**集显降档路径**
-//! （#17「体素世界低分辨率反而可爱」）——`GATE_RES_SCALE=2` 显式开启，勿默认。
+//! 渲染内部分辨率 = 窗口物理像素 ÷ factor（`GATE_RES_SCALE`，默认 1 即全分辨率）。纹理用
+//! `Assets<Image>::get_mut + resize`（Handle 不变，引用方零改动），GpuImage 由资产管线在下
+//! 一次 Prepare 按新描述符重建；DDA shader 有越界剔除（textureDimensions），div_ceil 派发安全。
 
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
@@ -15,12 +10,12 @@ use bevy::render::render_resource::Extent3d;
 use crate::brickmap::dda::{DdaImages, RenderScale};
 
 /// 合法窗口尺寸范围：下限防最小化/折叠矩形，上限防超 GPU 纹理上限
-/// （实测 SetWindowPos 异常矩形曾上报 65496 物理高度——负值 u16 回绕）。
+/// （SetWindowPos 收到负高度会按 u16 回绕上报成 65496）。
 const MIN_DIM: u32 = 64;
 const MAX_DIM: u32 = 4096;
 
-/// 渲染分辨率 = 窗口物理像素 ÷ factor。默认 1（全分辨率，最终方案 sharp）；
-/// `GATE_RES_SCALE=2` 开启集显降档路径（Douglas #17）
+/// 渲染分辨率 = 窗口物理像素 ÷ factor。`GATE_RES_SCALE` 默认 1（全分辨率），
+/// 非数字或 <1 一律按 1 处理。
 fn render_scale_factor() -> u32 {
   static FACTOR: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
     std::env::var("GATE_RES_SCALE")
@@ -43,8 +38,8 @@ fn render_size_for_window(full: UVec2) -> UVec2 {
 }
 
 /// 每帧对照主窗口物理尺寸；变化 → 原地重建 DDA 目标纹理并更新 RenderScale
-/// （aspect 侧由 gate-app orbit_camera_input 同帧跟随，用全窗尺寸——NDC 与渲染
-/// 分辨率无关，反投影/拾取在全分辨率语义下保持正确）。
+/// （aspect 侧由 gate-app orbit_camera_input 同帧按全窗尺寸跟随——NDC 与渲染分辨率无关，
+/// 反投影/拾取在全分辨率语义下保持正确）。
 /// 退化尺寸（<64 或 >4096）：跳过本次 resize 保留上一组合法尺寸，warn 仅一次。
 pub fn resize_render_targets(
   windows: Query<&Window>,
@@ -83,7 +78,6 @@ pub fn resize_render_targets(
     height: new_size.y,
     depth_or_array_layers: 1,
   };
-  // target（out_tex）重建尺寸
   for handle in dda.iter().map(|d| &d.target) {
     if let Some(mut img) = images.get_mut(handle) {
       img.resize(extent);
@@ -122,7 +116,7 @@ mod tests {
     }
   }
 
-  /// 退化尺寸防御：65496（负高度 u16 回绕，实机实测）与 0/超上限必须拒绝
+  /// 退化尺寸防御：0 / 超上限 / 65496（负高度按 u16 回绕）必须拒绝
   #[test]
   fn degenerate_sizes_rejected() {
     assert!(size_is_sane(UVec2::new(1280, 720)));

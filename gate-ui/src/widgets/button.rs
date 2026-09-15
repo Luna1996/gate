@@ -1,13 +1,9 @@
-﻿//! button：三变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
+﻿//! button：四变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
 //!
-//! 变体（docs/ui-dark-theme.md §5.2）：
-//! - [`ButtonVariant::Primary`]：强调填充（主操作）
-//! - [`ButtonVariant::Danger`]：破坏性操作填充
-//! - [`ButtonVariant::Secondary`]：抬升表面 + 边框（次操作）
-//! - [`ButtonVariant::Ghost`]：透明底（工具栏/低调操作）
+//! 变体（docs/ui-dark-theme.md §5.2）：Primary（强调填充，主操作）/ Danger（破坏性操作）/
+//! Secondary（抬升表面 + 边框）/ Ghost（透明底，工具栏等低调操作）。
 //!
 //! 统一反馈：hover 提亮一档；pressed 填充压深 + [`UiTransform`] scale 0.98（绕节点中心）。
-//! focus ring（键盘导航）待 bevy_ui 焦点导航接入后启用 Outline。
 
 use std::ops::Deref;
 

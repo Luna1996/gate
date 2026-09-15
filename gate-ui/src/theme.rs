@@ -1,7 +1,6 @@
-//! FR-1 主题令牌：`UiTheme` RON 数据资产 + 内置暗色默认 + 加载/回退接线。
+//! 主题令牌：`UiTheme` RON 数据资产 + 内置暗色默认 + 加载/回退接线。
 //!
-//! 主题令牌数据资产化（对齐"光照主题为数据资产"哲学）：改 RON 换肤，不改代码。
-//! 加载失败/缺失 → 内置暗色默认 + `warn!`（不 panic，不静默）。
+//! 改 RON 换肤，不改代码；加载失败/缺失 → 内置暗色默认 + `warn!`（不 panic，不静默）。
 
 use bevy::app::{Plugin, PreStartup, Update};
 use bevy::asset::io::Reader;
@@ -70,8 +69,7 @@ impl<'de> Deserialize<'de> for HexColor {
 
 /// 颜色组（docs/ui-dark-theme.md §2）。全部带 alpha。
 ///
-/// 暗色令牌：5 层表面（亮度即海拔）+ HUD 半透明变体 + 3 档边框 + 4 档文字
-/// + 单一强调蓝（填充三态 + 文字/线条一档）+ 降饱和语义色。
+/// 暗色令牌：5 层表面（亮度即海拔）+ HUD 变体 + 3 档边框 + 4 档文字 + 全灰度强调/语义色。
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeColors {
@@ -153,7 +151,7 @@ impl Default for ThemeColors {
   }
 }
 
-/// 度量组（FR-1 + docs/ui-dark-theme.md §3）
+/// 度量组（docs/ui-dark-theme.md §3）
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeMetrics {
@@ -258,8 +256,7 @@ pub fn parse_theme_ron(src: &str) -> Result<UiTheme, ron::error::SpannedError> {
 }
 
 /// UiScale 推导：auto_fit 时按窗口高度缩放。
-/// 窗口高先钳上限 4096（实机实测 SetWindowPos 退化矩形曾上报 65496，
-/// 致 UiScale 飙到 90+），缩放系数再钳 [0.25, 4.0] 双向防极端。
+/// 窗口高上限钳 4096（平台可能上报退化矩形），缩放系数再钳 [0.25, 4.0] 防极端。
 pub fn autofit_ui_scale(ui_scale: f32, auto_fit: bool, window_height: f32) -> f32 {
   if auto_fit {
     let h = window_height.min(4096.0);
@@ -269,7 +266,7 @@ pub fn autofit_ui_scale(ui_scale: f32, auto_fit: bool, window_height: f32) -> f3
   }
 }
 
-// ---------- RON 资产加载器（bevy 0.19 已移除内置 RonAssetPlugin，自写） ----------
+// ---------- RON 资产加载器（bevy 0.19 无内置 RonAssetPlugin，自写） ----------
 
 /// RON 加载错误（IO 读取 + RON 解析）
 #[derive(Debug)]
@@ -308,7 +305,7 @@ impl From<ron::error::SpannedError> for RonLoadError {
   }
 }
 
-/// UiTheme 的 RON 资产加载器（bevy 0.19 已移除内置 RonAssetPlugin，自写；具体类型避免泛型 TypePath 边界）
+/// UiTheme 的 RON 资产加载器（bevy 0.19 无内置 RonAssetPlugin；具体类型避免泛型 TypePath 边界）
 #[derive(TypePath)]
 pub struct RonThemeLoader;
 
@@ -431,13 +428,11 @@ fn ui_theme_font_load(
   info!("ui theme font loading: {path}");
 }
 
-/// 一旦主题字体资产加载成功，就把它 clone 到 `AssetId::<Font>::default()` 的 storage slot。
+/// 主题字体资产加载成功后，clone 到 `AssetId::<Font>::default()` 的 storage slot。
 ///
-/// 这一步让**所有不显式指定字体**的文本（`FontSource::default()` / `TextFont::default()` /
-/// `FontSource::Handle(Handle::default())`）都使用主题字体，而不是 Bevy 内置的
-/// FiraMono-subset（该字体不含 CJK 字形 → 中文方框）。
-///
-/// 只执行一次（有路径记录 + 资产 Loaded）；headless 无 AssetServer 时跳过。
+/// 使所有不显式指定字体的文本（`FontSource::default()` / `TextFont::default()` /
+/// `FontSource::Handle(Handle::default())`）都用主题字体，而非 Bevy 内置 FiraMono-subset
+/// （该字体不含 CJK 字形 → 中文方框）。只执行一次；headless 无 AssetServer 时跳过。
 fn ui_theme_font_install_default(
   server: Option<Res<AssetServer>>,
   font: Res<ThemeFont>,
@@ -480,8 +475,7 @@ fn ui_theme_font_install_default(
   }
 }
 
-/// gate-ui 插件：主题资产注册 + UiScale 联动。
-/// widget 层（Task 2+）在此插件基础上追加。
+/// gate-ui 插件：主题资产注册 + UiScale 联动 + 各 widget 状态机注册。
 #[derive(Default)]
 pub struct GateUiPlugin;
 
@@ -632,7 +626,7 @@ mod tests {
     assert!((autofit_ui_scale(1.25, false, 1080.0) - 1.25).abs() < 1e-6);
     // 极小窗口有下限
     assert!((autofit_ui_scale(1.0, true, 100.0) - 0.25).abs() < 1e-6);
-    // 退化大窗口（实机实测 65496）有上限：h 钳 4096 → 系数钳 4.0
+    // 退化大窗口有上限：h 钳 4096 → 系数钳 4.0
     assert!((autofit_ui_scale(1.0, true, 65496.0) - 4.0).abs() < 1e-6);
     assert!((autofit_ui_scale(1.0, true, 4096.0) - 4.0).abs() < 1e-6);
   }

@@ -1,36 +1,21 @@
-//! Brick Tree wire 格式：常量、编码函数、全局参数（Phase 1，Douglas 1:1）
+//! Brick Tree wire 格式：常量、编码函数、全局参数。本模块是 CPU 构建器（builder.rs）与 GPU
+//! shader 之间的字节契约，纯数据变换、零渲染依赖，可脱离渲染运行时单测。
 //!
-//! 本模块是 CPU 构建器（builder.rs）与 GPU shader（Phase 2 重写 shaders/voxel_raytrace/）之间的
-//! 字节契约。纯数据变换、零渲染依赖，可脱离渲染运行时单测。
+//! b_struct：`[0 .. CHUNK_INDEX_WORDS)` 为稠密 chunk 窗口（CHUNK_INDEX_CAP³），
+//! entry = chunk DFS 树绝对字基址 + 1（0 = 无此 chunk）；其后为各 chunk 的 DFS 序列化树，
+//! 节点 = [mask_lo, mask_hi, palette_u32] + popcount(mask) 个 child offset（chunk 内相对字址）。
+//! mask bit=1 → 子块被分裂（child offset 有效）；bit=0 → uniform 子块，颜色 = 该节点
+//! palette_u32（零额外 load），palette=0 = AIR。
 //!
-//! ## b_struct 布局（Douglas Brick Tree 紧凑 DFS 格式）
-//!
-//! ```text
-//! b_struct:
-//! ├── [0 .. CHUNK_INDEX_WORDS)         稠密 chunk 窗口（CHUNK_INDEX_CAP³）
-//! │     entry = chunk DFS 树绝对字基址 + 1（0 = 无此 chunk）
-//! └── [CHUNK_INDEX_WORDS ..)           各 chunk 的 DFS 序列化树（append bump）
-//!       每 chunk 树（ChunkTree::serialize() 原样）：
-//!       node = [mask_lo, mask_hi, palette_u32] + popcount(mask) 个 child offset
-//!       child offset = chunk 内相对字址（shader 端加 chunk base 转绝对）
-//!       （wire v3：level 3 叶父层例外——inline 16 word，4 体素/word，
-//!         每字节 = 一个 palette，读端按 child_idx 低 2 位选字节）
-//! ```
-//!
-//! mask bit=1 → 子块被分裂（child offset 有效）；bit=0 → uniform 子块，
-//! 颜色 = 该节点 palette_u32（零额外 load）。palette=0 = AIR。
-//!
-//! b_leaves：原 Douglas 格式占位（palette 直存节点后恒空）——**P4 重定向为
-//! 方向可达掩码 LUT**（Douglas #18 Bitwise Masking，octo-release
-//! `march_masks: array<array<vec4<u32>, BRICK_ENTRIES>, 8>` 同构），见
-//! [`march_mask_lut_words`]。
+//! level 3 叶父层例外：inline 16 word，4 体素/word，读端按 child_idx 低 2 位选字节。
+//! b_leaves 存放方向可达掩码 LUT（Douglas #18 Bitwise Masking），见 [`march_mask_lut_words`]。
 
 use gate_voxel::PaletteEntry;
 use glam::{IVec3, Mat3, Vec3, Vec4};
 
 // ============ 层级常量（与 gate-voxel coords.rs 一致）============
 
-/// chunk 边长（体素/voxel 单位）：256³（Douglas 早期 chunk 大小）
+/// chunk 边长（voxel 单位）：256³
 pub const CHUNK_SIZE: i32 = 256;
 /// 分裂因子（4³ = 64 子块）
 pub const BRICK_FACTOR: i32 = 4;
@@ -61,7 +46,7 @@ pub const STATE_ENTRY_COUNT: usize = 256;
 /// StateTable 总字数（256×4 = 1024 = 4KB）
 pub const STATE_TOTAL_WORDS: usize = STATE_ENTRY_COUNT * STATE_WORDS_PER_ENTRY;
 
-// ============ PaletteEntry 打包（不变）============
+// ============ PaletteEntry 打包 ============
 
 /// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）
 pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
@@ -76,14 +61,11 @@ pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
 
 // ============ GPU 全局参数 ============
 //
-// **字段名与旧版逐字相同（80B 布局不变）**——Phase 1 保持 shaders/voxel_raytrace/ 的 Globals
-// struct 字节兼容（shader 逻辑 Phase 2 重写，本阶段画面为空属预期）。
-// 语义升级：index_origin/dims 从 tile 窗口（×512 voxel）变为 **chunk 窗口**
-// （×256 voxel）；tile_count 语义变为 chunk_count。
+// 字段名与整体布局须与 shaders/voxel_raytrace/ 的 Globals struct 字节兼容；
+// index_origin/dims 与 tile_count 均为 chunk 语义（×256 voxel）。
 
-/// encase 0.12.1 在 uniform 模式下对 Rust fixed-size `[i32/u32; N]` 断言
-/// "array stride must be a multiple of 16"（按 element stride=4 判，而非按 array
-/// stride=16），所以三轴字段全部**拆成具名 scalar**（x/y/z/w），尾部填充同理。
+/// 三轴字段全部拆成具名 scalar（x/y/z/w）、尾部填充同理：encase 0.12.1 在 uniform 模式下对
+/// Rust fixed-size `[i32/u32; N]` 断言 "array stride must be a multiple of 16"。
 /// 整体字节数 = 16+16+(7×4)+(5×4) = 32+28+20 = 80B（std140 允许末尾非 16 对齐）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]
@@ -98,13 +80,13 @@ pub struct BrickMapGlobals {
   pub index_dims_y: u32,
   pub index_dims_z: u32,
   pub index_dims_w: u32,
-  /// 有内容的 chunk 数（旧 tile_count 字段名保留 = WGSL 字节兼容）
+  /// 有内容的 chunk 数（字段名沿用 WGSL 侧 `tile_count`，保持字节兼容）
   pub tile_count: u32,
   /// b_struct 树区字数（不含 Region ① chunk 窗口）
   pub node_words: u32,
   /// 作废树区累计字数（增量 append 后未压缩的旧字节；全量重建归零）
   pub node_free_words: u32,
-  /// 0（b_leaves 已删除；字段保留 = WGSL 字节兼容）
+  /// 恒 0（字段保留以维持 WGSL 字节兼容）
   pub brick_slabs: u32,
   pub brick_free: u32,
   /// 超出 chunk 窗口被拒绝的 chunk 数
@@ -117,18 +99,17 @@ pub struct BrickMapGlobals {
   pub _pad4: u32,
 }
 
-// ============ GridDesc（Phase 2+3 统一描述符，144B）============
+// ============ GridDesc（主世界与物体统一描述符，144B）============
 //
-// 替代 BrickMapGlobals + ObjDesc：主世界与物体走同一 GridDesc 数组，
-// shader `trace_scene` 遍历数组无 kind 分支（§2.6 计划扩展为 144B 含 chunk 窗口）。
+// 主世界与物体走同一 GridDesc 数组，shader `trace_scene` 遍历数组无 kind 分支。
 //
 // 字段语义：
 // - pos_scale/rot0/rot1/rot2：`world = pos + rot · (local · scale)`，
 //   rot 列向量与 glam Mat3 一致（x_axis/y_axis/z_axis = 列）；主世界 = identity。
 // - aabb_min/max：局部 [0,256]³·scale 经变换后的世界外包盒（CPU 预算，剔除用）。
 // - tree_base：本 volume 的 b_struct 在 struct_buf 内的字基址（含 chunk 窗口段）。
-// - tree_depth：Douglas Brick Tree 最大分裂深度 = 4（256→64→16→4→1）。
-// - chunk_count：本 volume 的 chunk 数（主世界可能 N，物体 v1=1）。
+// - tree_depth：最大分裂深度 = 4（256→64→16→4→1）。
+// - chunk_count：本 volume 的 chunk 数（主世界可能 N，物体 = 1）。
 // - palette_base：本 volume 的 palette 在 palette_buf 内的字基址。
 // - index_origin/dims：本 volume 的稠密 chunk 窗口（chunk 单位）；物体 dims=(1,1,1)。
 //
@@ -221,7 +202,7 @@ impl GridDesc {
   }
 }
 
-// ============ P4：方向可达掩码 LUT（Douglas #18 Bitwise Masking）============
+// ============ 方向可达掩码 LUT（Douglas #18 Bitwise Masking）============
 
 /// LUT octant 数：射线方向符号组合。编码与 shaders/voxel_raytrace/ `dir_mask` 一致：
 /// bit0 = x 正方向、bit1 = y 正、bit2 = z 正（正 = 1，零分量按正处理 = 保守）。
@@ -231,25 +212,22 @@ pub const MARCH_MASK_OCTANTS: usize = 8;
 pub const MARCH_MASK_ENTRIES: usize = 64;
 /// 每入口格掩码字数（64-bit 子块占用 → 2×u32）
 pub const MARCH_MASK_WORDS_PER_ENTRY: usize = 2;
-/// LUT 总字数：8 × 64 × 2 = 1024 u32 = 4KB（b_leaves 重定向内容）
+/// LUT 总字数：8 × 64 × 2 = 1024 u32 = 4KB
 pub const MARCH_MASK_WORDS: usize =
   MARCH_MASK_OCTANTS * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY;
 
-/// 生成方向可达掩码 LUT（#18 Bitwise Masking；octo-release
-/// `march_masks: array<array<vec4<u32>, BRICK_ENTRIES>, 8>` 同构，低 64 bit 有效）。
+/// 生成方向可达掩码 LUT（与 octo-release `march_masks` 同构，低 64 bit 有效）。
 ///
 /// `lut[octant][entry]` = 从 brick 内入口格 `entry` 出发、方向符号 = `octant` 的
 /// 射线**可能经过**的子块集合（64-bit，bit i = 子块 `x + y*4 + z*16`）。
 ///
-/// 精确刻画（+x 轴推导）：射线从格 e 内一点向 +x 走经过格 p ⟺ 存在 u ≥ 0 使
-/// e.x + u ∈ [p.x, p.x+1] ⟺ p.x + 1 ≥ e.x。实现再加 ±1 格浮点裕量（入口格
-/// clamp / 浮点边界误差免疫）：octant 分量正 → `p_i ≥ e_i − 1`；负 →
-/// `p_i ≤ e_i + 1`。掩码恒为真实可达集的**保守超集** → shader 端
-/// `occupancy & reach` 剔除绝不漏真实命中（不穿墙）。
+/// 条件：octant 分量正 → `p_i ≥ e_i − 1`，负 → `p_i ≤ e_i + 1`（±1 是浮点边界裕量，
+/// 使掩码恒为真实可达集的**保守超集**）。故 shader 端 `occupancy & reach` 剔除绝不漏真实
+/// 命中（不穿墙）。
 ///
-/// 子块含实体与否的判定归 shader（本 LUT 只答"几何上能否经过"）：
-/// gate 语义 mask bit=1 = 分裂 ≠ 实体，uniform 子块色 = 节点 palette——
-/// palette==0（空气）节点才可用 `mask & reach` 剔除，见 shaders/voxel_raytrace/ trace_chunk。
+/// 子块是否含实体的判定归 shader（本 LUT 只答"几何上能否经过"）：mask bit=1 = 分裂 ≠ 实体，
+/// uniform 子块色 = 节点 palette，只有 palette==0（空气）节点才可用 `mask & reach` 剔除
+/// （见 shaders/voxel_raytrace/ trace_chunk）。
 pub fn march_mask_lut_words() -> Vec<u32> {
   let mut out = vec![0u32; MARCH_MASK_WORDS];
   for oct in 0..MARCH_MASK_OCTANTS {
@@ -283,7 +261,7 @@ pub fn march_mask_lut_words() -> Vec<u32> {
   out
 }
 
-/// 局部 [0,256]³·scale 经旋转平移后的世界 AABB（与 obj.rs 旧 world_aabb 同型）
+/// 局部 [0,256]³·scale 经旋转平移后的世界 AABB
 fn transform_aabb(pos: Vec3, rot: Mat3, scale: f32) -> (Vec3, Vec3) {
   let mut mn = Vec3::splat(f32::MAX);
   let mut mx = Vec3::splat(f32::MIN);
@@ -300,7 +278,7 @@ fn transform_aabb(pos: Vec3, rot: Mat3, scale: f32) -> (Vec3, Vec3) {
   (mn, mx)
 }
 
-/// 构建产物：与 GPU buffer 字节一一对应的内容（P2.3 原样上传）
+/// 构建产物：与 GPU buffer 字节一一对应的内容（原样上传）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrickMapBuffers {
   /// Region ① chunk 窗口 + Region ② 各 chunk DFS 树
@@ -330,7 +308,7 @@ mod tests {
 
   #[test]
   fn globals_layout_is_76_bytes() {
-    // WGSL Globals 字节兼容（Phase 1 shader 不重写）：19 个 u32 = 76B，
+    // 与 WGSL Globals 字节兼容：19 个 u32 = 76B，
     // encase 写 UniformBuffer 时整体 round 到 16B 对齐（80B）
     let _ = BrickMapGlobals::default();
     assert_eq!(
@@ -342,7 +320,7 @@ mod tests {
 
   #[test]
   fn grid_desc_layout_is_144_bytes() {
-    // Phase 2+3 统一描述符：6×Vec4(96) + 4×u32(16) + 4×i32(16) + 4×u32(16) = 144B
+    // 6×Vec4(96) + 4×u32(16) + 4×i32(16) + 4×u32(16) = 144B
     // storage buffer array stride = 144B（16B 对齐 ✓，std140 兼容）
     assert_eq!(std::mem::size_of::<GridDesc>(), 144, "GridDesc 必须 144B");
     // IDENTITY 常量健全
@@ -393,7 +371,7 @@ mod tests {
     );
   }
 
-  // ---- P4：方向可达掩码 LUT ----
+  // ---- 方向可达掩码 LUT ----
 
   /// 读 LUT 单项（octant × entry → u64 掩码），布局与 shader 端
   /// `b_leaves[oct*128 + entry*2 ..]` 一致

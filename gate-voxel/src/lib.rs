@@ -1,8 +1,7 @@
-//! gate-voxel：权威体素数据层 + Brick Tree（Phase 0）
+//! gate-voxel：权威体素数据层 + Douglas Brick Tree。
 //!
 //! 纯逻辑 crate，零渲染依赖，唯一外部依赖 `glam`。
-//! Phase 0 用 Douglas Brick Tree（4³ 分裂因子 + u64 mask + 紧凑 child offset + 自适应 uniform leaf）
-//! 替换旧的可变叶八叉树。
+//! Brick Tree = 4³ 分裂因子 + u64 mask + 紧凑 child offset + 自适应 uniform leaf。
 
 pub mod chunk_tree;
 pub mod coords;

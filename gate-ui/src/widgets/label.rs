@@ -1,8 +1,7 @@
 //! label：主题字号/颜色的文本标签（docs/ui-dark-theme.md §5.6）。
 //!
-//! 变体由 [`LabelStyle`] preset enum 表达：字号 + 颜色永远成对来自主题令牌，
-//! 不可能拼出非法组合（如 faint 档 <18px 违反对比度规则）。
-//! 禁止纯白：一律走主题令牌。
+//! 变体由 [`LabelStyle`] preset enum 表达：字号 + 颜色永远成对来自主题令牌，拼不出非法组合
+//! （如 faint 档 <18px 违反对比度规则）。禁止纯白：一律走主题令牌。
 
 use std::ops::Deref;
 

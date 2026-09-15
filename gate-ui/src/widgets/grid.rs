@@ -1,13 +1,10 @@
 //! grid：网格布局容器（bevy_ui 原生 CSS Grid + gap 填色格线）。
 //!
 //! 格线方案 = **gap 填色 trick**（等效 HTML table 的 `border-collapse: collapse`）：
-//! 容器背景 = `border` 令牌色，`row_gap/column_gap = border_width`（1px），
-//! cell 用不透明表面背景盖住容器底色，透出的部分即格线。
-//! 相比"相邻 cell 各画 border"的约定：线宽恒 1px 不叠加、十字交叉天然连通
-//! （就是同一块背景）、外框由容器 border 补齐且颜色一致。
+//! 容器背景 = `border` 令牌色，`row_gap/column_gap = border_width`（1px），cell 用不透明
+//! 表面背景盖住容器底色，透出的部分即格线——线宽恒 1px 不叠加、十字交叉天然连通，
+//! 外框由容器 border 补齐且颜色一致。
 //!
-//! 为什么不用 splitter 拼网格：flex 的 gap 是轨道间空隙，线元素活在兄弟流里，
-//! 无法得知并抵消自己在 gap 流中的位置，端点永远无法保证相接。
 //! 网格线需求一律用本组件；独立分割线仍用 [`super::splitter`]。
 
 use std::ops::Deref;
@@ -87,7 +84,7 @@ pub fn grid(ctx: &UiCtx, parent: &mut ChildSpawner, config: GridConfig) -> GridH
 }
 
 /// 网格 cell：不透明表面背景（遮住容器底色成格），无 border、带 sm 内边距。
-/// 必须作为 [`grid`] 的直接子项；[`PanelSurface::Hud`] 半透明会露格线，按 Card 处理。
+/// 必须作为 [`grid`] 的直接子项；cell 须不透明，故 [`PanelSurface::Hud`] 按 Card 处理。
 pub fn grid_cell(ctx: &UiCtx, parent: &mut ChildSpawner, surface: PanelSurface) -> Entity {
   let c = &ctx.theme.colors;
   let bg = match surface {

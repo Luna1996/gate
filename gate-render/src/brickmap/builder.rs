@@ -1,21 +1,13 @@
-//! CPU 砖块图构建器（Phase 1 + Phase 3 统一）
+//! CPU 砖块图构建器：`VolumeGrid` → wire 格式（wire.rs §b_struct 契约）。
 //!
-//! 单 volume 路径（[`BrickMapBuilder`]）：`VolumeGrid` → wire 格式（wire.rs §b_struct 契约）：
-//! - 全量构建 [`BrickMapBuilder::build_full`]：ChunkCoord 排序 + Rayon 并行
-//!   `ChunkTree::serialize()` + 树区顺序 append（字节级确定性）
-//! - 增量更新 [`BrickMapBuilder::update_chunk`]：单 chunk 重序列化 append +
-//!   窗口条目改指新基址；旧树字节作废（计入 `globals.node_free_words`，
-//!   全量重建归零压缩）——append-only，无原地修改（紧凑 DFS 格式编辑即失效）
+//! [`BrickMapBuilder`]（单 volume）：全量构建按 ChunkCoord 排序 + Rayon 并行
+//! `ChunkTree::serialize()` + 顺序 append（字节级确定性）；增量
+//! [`BrickMapBuilder::update_chunk`] 重序列化 append + 窗口条目改指新基址，旧树字节作废计入
+//! `globals.node_free_words`（全量重建归零）——append-only，无原地修改。
 //!
-//! 多 volume 路径（[`VolumesBuilder`]，Phase 3 OBJ→Volume 统一）：
-//! 持有 `Vec<BrickMapBuilder>`（主世界 + 物体），输出统一 `b_struct` + `b_palette`
-//! + `GridDesc` 数组。各 volume 的 b_struct 顺序拼接，`GridDesc.tree_base`
-//!   指向统一 buffer 内的绝对字基址。增量脏区间按 `tree_base` 偏移后传给 GPU
-//!   partial write；任一前置 volume 增长导致后续 tree_base 漂移 → 自动降级全量。
-//!
-//! 分配纪律：树区 append-only bump，零空闲链。旧版 pow2 桶/槽位/slab 空闲链
-//! 全删除：新格式 palette 直存节点、chunk 树尺寸随内容任意变化，原地复用
-//! 得不偿失（chunk 256³ 重建序列化 ≈ 数百 KB，PCIe 追加写远快于碎片整理）。
+//! [`VolumesBuilder`]（多 volume）：持有 `Vec<BrickMapBuilder>`，各 volume 的 b_struct 顺序拼接，
+//! `GridDesc.tree_base` 指向统一 buffer 内的绝对字基址；增量脏区间按 `tree_base` 偏移后传给 GPU
+//! partial write，任一前置 volume 增长导致后续 tree_base 漂移 → 自动降级全量。
 
 use std::collections::HashMap;
 
@@ -206,10 +198,9 @@ impl BrickMapBuilder {
       }
     };
     self.refresh_globals();
-    // 顺带重铺 palette（256 条 × 2 字 = 2KB）：编辑材质是"用时才写进调色板"的
-    // （见 gate-app/src/edit.rs），所以 palette 必须和触发它的那次体素编辑**同一帧**上传 ——
-    // 否则新放的体素会以槽位上一任材质的颜色出现。2KB 相对被编辑 chunk 的 KB~MB 可忽略，
-    // 因此不做修订号比对，凡"真的改了东西"的 chunk 更新都带上。
+    // 顺带重铺 palette（256 条 × 2 字 = 2KB）：材质是"用时才写进调色板"的
+    // （见 gate-app/src/edit.rs），故必须与触发它的那次体素编辑**同一帧**上传，
+    // 否则新放的体素会以槽位上一任材质的颜色出现。2KB 可忽略，不做修订号比对。
     self.write_palette(grid);
     out
   }
@@ -294,7 +285,7 @@ impl BrickMapBuilder {
 }
 
 // ============================================================================
-// VolumesBuilder：多 volume 统一构建器（Phase 3 OBJ→Volume 统一）
+// VolumesBuilder：多 volume 统一构建器
 // ============================================================================
 
 /// u32 字切片 → 本机字节序 u8 Vec（wire 按小端直存，x86/ARM 均 LE；同 u8_of_u32 约定）
@@ -411,19 +402,18 @@ impl VolumesBuilder {
     self.force_full = true;
   }
 
-  /// 取走统一快照：拼接所有 volume 的 b_struct/b_palette + 生成 GridDesc 数组
+  /// 取走统一快照：拼接所有 volume 的 b_struct/b_palette + 生成 GridDesc 数组。
   ///
-  /// **布局策略**：物体 (1..N) 先放，主世界 (0) 后放。主世界编辑是高频常见路径，
-  /// 放在尾部 → 其 b_struct 增长不漂移任何前置 volume 的 tree_base → 增量上传。
-  /// GridDesc 数组仍按 volume 索引顺序 [0, 1, 2, ...]（主世界 = 0），tree_base
-  /// 指向统一 buffer 内的实际位置。
+  /// 布局策略：物体 (1..N) 先放、主世界 (0) 后放，使主世界 b_struct 增长不漂移任何前置
+  /// volume 的 tree_base（→ 可走增量上传）；GridDesc 数组仍按 volume 索引顺序
+  /// [0, 1, 2, ...]（主世界 = 0），tree_base 指向统一 buffer 内的实际位置。
   pub fn snapshot(&mut self) -> VolumesSnapshot {
     let n = self.builders.len();
     // b_struct 布局序：物体 1..N 先，主世界 0 后（主世界编辑不漂移物体）
     let layout_order: Vec<usize> = (1..n).chain(std::iter::once(0)).collect();
 
     // tree_bases[i] / palette_bases[i] = volume i 在统一 buffer 内的字基址。
-    // 只累加字数，不拼接字节——全量拼接在增量帧是 100MB+ 级 memcpy（帧卡顿根因）。
+    // 只累加字数，不拼接字节。
     let mut tree_bases = vec![0u32; n];
     let mut palette_bases = vec![0u32; n];
     let mut struct_total_words = 0usize;
@@ -917,7 +907,7 @@ mod tests {
   }
 
   // ===========================================================================
-  // VolumesBuilder 测试（Phase 3 统一构建器）
+  // VolumesBuilder 测试（多 volume 统一构建器）
   // ===========================================================================
 
   use gate_voxel::Volumes;

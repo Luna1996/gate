@@ -1,7 +1,6 @@
 //! plot：折线图 widget（环形缓冲 + CPU 光栅化 + ImageNode）。
 //!
-//! 光栅化是纯函数（buf + 样本 → 像素），headless 单测断言像素；
-//! 重绘走 change 检测（OQ-3 结论：数据每帧更新时等价"每帧重绘"，静止时零成本）。
+//! 光栅化是纯函数（buf + 样本 → 像素），可 headless 断言像素；重绘走 change 检测。
 
 use std::collections::VecDeque;
 use std::ops::Deref;
@@ -13,7 +12,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use super::{UiCtx, color_of, label_bundle, px};
 
-/// 画布默认尺寸（v0 固定；面板宽高自适应重建后置）
+/// 画布默认尺寸（固定；面板宽高自适应重建暂缺）
 pub const PLOT_W: u32 = 256;
 pub const PLOT_H: u32 = 64;
 
@@ -100,9 +99,8 @@ impl PlotData {
 
 /// 空白 rgba8 画布（plot spawn 前由调用方注册进 Assets<Image>）。
 ///
-/// 必须带 `MAIN_WORLD`：bevy 0.19 中图像上传 GPU 后默认清空 CPU 端 `data`，
-/// 而 `plot_redraw_system` 需要直接写 `image.data` 做 CPU 光栅化。
-/// 缺此标志 → `image.data` 为 None → 重绘被跳过 → 折线图空白。
+/// 必须带 `MAIN_WORLD`：bevy 0.19 中图像上传 GPU 后默认清空 CPU 端 `data`，而
+/// `plot_redraw_system` 需要直接写 `image.data` 做 CPU 光栅化；缺此标志 → 折线图空白。
 pub fn blank_plot_image(w: u32, h: u32) -> Image {
   Image::new(
     Extent3d {
@@ -280,15 +278,12 @@ impl Default for PlotConfig {
 
 /// 主题折线图：数据 + 画布（ImageNode）+ 标签，布局由 [`PlotConfig::layout`] 决定。
 ///
-/// 画布（折线区域）一律带 1px 主题边框（`border` 令牌）包围；纹理透明，
-/// 背景由父容器提供。
+/// 画布（折线区域）一律带 1px 主题边框（`border` 令牌）包围；纹理透明，背景由父容器提供。
 ///
-/// - [`PlotLayout::Plain`]：root(Column) = 画布（宽 = `canvas_width`，
-///   Auto → 固定 PLOT_W）+ 极值文本
-/// - [`PlotLayout::YAxis`]：root(Row) = 纵轴标签列（3 个右对齐标签，SpaceBetween
-///   顶到画布上/中/下，数值在 `plot_redraw_system` 刷新，宽 = `y_axis_width`，
-///   Auto → 内容自适应）+ 画布（宽 = `canvas_width`，Auto → `flex_grow = 1.0`
-///   撑满父容器剩余宽度；高度固定 `canvas_h` px）
+/// - [`PlotLayout::Plain`]：root(Column) = 画布（Auto 宽 → 固定 PLOT_W）+ 极值文本
+/// - [`PlotLayout::YAxis`]：root(Row) = 纵轴标签列（3 个右对齐标签，SpaceBetween 顶到画布
+///   上/中/下，数值在 `plot_redraw_system` 刷新，Auto 宽 → 内容自适应）+ 画布（Auto 宽 →
+///   `flex_grow = 1.0` 撑满剩余宽度；高度固定 `canvas_h` px）
 pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -407,7 +402,7 @@ pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotH
   }
 }
 
-/// 重绘（OQ-3 结论）：PlotData 变更 → 光栅化写回 Image（Handle 不变）+ 更新极值文本
+/// 重绘：PlotData 变更 → 光栅化写回 Image（Handle 不变）+ 更新极值文本
 pub fn plot_redraw_system(
   mut images: ResMut<Assets<Image>>,
   mut q_roots: Query<(Entity, &Children, &PlotData), Changed<PlotData>>,

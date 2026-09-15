@@ -1,22 +1,19 @@
 // --- BG0：输出 + 视图 uniform ---
-// @binding(0) = out storage write（rgba8unorm，linear RGB；ACES → sRGB 后输出）
+// @binding(0) = out storage write（rgba8unorm，linear RGB，着色末尾转 sRGB）
 // @binding(1) = uniform DdaViewUniform
 // @binding(2) = beam depth storage（r32float，低分辨率最近命中 t；beam pass 写，主 pass 读）
 @group(0) @binding(0) var out_tex: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
-/// @binding(3)：眼睛适应的状态/直方图（**只读**视图，给 `dda_main` 取曝光系数）。
-/// 同一 buffer 在 @group(7) @binding(1) 以 read_write 被 `eye_adapt_*` 两个入口读写
-/// （读写落在不同 pass，pass 边界即屏障；布局见 bindings.wesl 末尾的说明）。
+/// @binding(3)：眼睛适应的状态/直方图只读视图，给 `dda_main` 取曝光系数。
+/// 同一 buffer 在 @group(7) @binding(1) 以 read_write 被 `eye_adapt_*` 两个入口读写；
+/// 读写落在不同 pass，pass 边界即屏障。
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 
-// P3 beam 比例：低分辨率 = 全分辨率 / BEAM_DIV（4 = 1/4 分辨率，像素数 1/16）
+// beam 比例：低分辨率 = 全分辨率 / BEAM_DIV（4 = 1/4 分辨率，像素数 1/16）
 const BEAM_DIV: u32 = 4u;
 
-// P5：beam 起点保守回退（世界单位）。邻域 beam 射线命中主射线首命中体素时，
-// 允许经侧面/远面入射——两射线穿过同一单位体素，入口 t 差 ≤ 体素视向对角 √3，
-// 加 3×3 半宽横向偏移（d_beam 内 t·px_ang ≤ 0.35/BEAM_DIV → 6px ≤ 0.53 体素）
-// ≈ 2.3；再留浮点裕量取 4。只多走 4 单位空空间，对比可跳过的 ~d_beam
-// （百单位级）近似零成本。旧实现直接以 min t 起步 → 薄壁/剪影处穿墙（用户实测）。
+// beam 起点保守回退（世界单位）：邻域 beam 射线可能从侧面/远面命中主射线首命中体素，
+// 入口 t 差 ≤ 体素视向对角 √3 + 3×3 半宽横向偏移 ≈ 2.3，再留浮点裕量取 4。
 const BEAM_BACKOFF: f32 = 4.0;
 
 struct DdaViewUniform {
@@ -57,18 +54,17 @@ struct Globals {
   _pad4: u32,
 }
 @group(1) @binding(3) var<uniform> g: Globals;
-// @binding(4)/(5)：光照场（Douglas #15 AO fill + 「体素即光源」发光密度 ε 共用一张纹理）。
-// 16-voxel cell 网格，**相机中心 + 世界锚定槽位**：纹素下标 = 世界 cell mod dims（见
-// `light_field_uv`），相机滚动只换新进窗口的那条带，纹素身份不整幅失效。
-// Rgba16Unorm：.rgb = 发光密度 ε、.a = AO fill；采样即硬件三线性插值
-// （Douglas 原文："a single Hardware filtered texture read"）。
+// @binding(4)/(5)：光照场（AO fill 与发光密度 ε 共用一张纹理）。
+// 16-voxel cell 网格，**相机中心 + 世界锚定槽位**：纹素下标 = 世界 cell mod dims
+// （见 `light_field_uv`），相机滚动只换新进窗口的那条带。
+// Rgba16Unorm：.rgb = 发光密度 ε、.a = AO fill；采样即硬件三线性插值。
 @group(1) @binding(4) var light_tex: texture_3d<f32>;
 @group(1) @binding(5) var light_samp: sampler;
 
-// --- BG2：GridDesc 数组（Phase 3 OBJ→Volume 统一；144B/entry，与 Rust GridDesc 字节一致）---
+// --- BG2：GridDesc 数组（144B/entry，与 Rust GridDesc 字节一致）---
 //   主世界 = grid_descs[0]（identity 变换），物体 = grid_descs[1..N]
-//   每个 GridDesc 携带变换、世界 AABB、tree_base（在 b_struct 内绝对字基址）、
-//   palette_base（在 b_palette 内绝对字基址）、chunk 窗口 origin/dims。
+//   每项携带变换、世界 AABB、tree_base（b_struct 内绝对字基址）、palette_base（b_palette
+//   内绝对字基址）、chunk 窗口 origin/dims。
 struct GridDesc {
   pos_scale: vec4<f32>,   // xyz = 位置，w = scale
   rot0: vec4<f32>,        // xyz = 旋转矩阵列 0，w = 0
@@ -91,8 +87,8 @@ struct GridDesc {
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
 
-// --- BG3：光照光池（R3-18 直光层；与 Rust LightPoolUniform 逐字段镜像，448B）---
-// 只用 lights[0] = 方向光（kind=0）；硬阴影方案无点光源/无软阴影（Douglas #02/#17/#23）。
+// --- BG3：光照光池（与 Rust LightPoolUniform 逐字段镜像，448B）---
+// 只用 lights[0] = 方向光（kind=0）。
 struct LightDesc {
   kind_pos_dir: vec4<f32>,    // x = kind（0=方向光）；yzw = L 轴（指向光，已归一）
   color_intensity: vec4<f32>, // rgb = 线性色，w = 强度
@@ -126,7 +122,7 @@ struct DdgiChunk {
 };
 struct DdgiUniform {
   lods: array<DdgiLod, 4>,
-  // x=帧计数, y=调试模式(0..4), z=GI 增益, w=保留通道（旧借针半径，机制已删除），恒 0
+  // x=帧计数, y=调试模式(0..4), z=GI 增益, w=保留（恒 0）
   params: vec4<f32>,
   // x=GI 开关, y=总槽位数, z=Chebyshev std 信任系数（0..1，见采样侧 soft 计算）,
   // w=级联覆盖**之外**的天光兜底强度（见着色侧 amb_far / DdgiDebugSettings.far_ambient）
@@ -148,10 +144,8 @@ struct DdgiUniform {
 @group(4) @binding(3) var<storage, read_write> ddgi_cell: array<u32>;
 @group(4) @binding(4) var<storage, read_write> ddgi_meta: array<u32>;
 // BG4 binding 5：indirect args / 计数器合一 buffer（array<atomic<u32>>，word 布局）：
-//   [0..16)  cast indirect args ×4 LOD（每 LOD 4 word：x, y, z, pad）
-//   [16..32) collect indirect args ×4 LOD
-//   [32..36) rpp（每探针射线数）×4 LOD
-//   [36..40) 活跃探针计数器 ×4 LOD（CPU 每帧清零；sort atomicAdd；seal 读取）
+//   [0..16)  cast indirect args ×4 LOD（每 LOD 4 word：x, y, z, pad）  [16..32) collect args ×4 LOD
+//   [32..36) rpp（每探针射线数）×4 LOD  [36..40) 活跃探针计数器 ×4 LOD（CPU 清零、sort atomicAdd、seal 读）
 @group(4) @binding(5) var<storage, read_write> ddgi_indirect: array<atomic<u32>>;
 // worklist item = vec4(probe_pos_voxel.xyz, bitcast<f32>(age | lod<<24))；每 LOD 段起于 slot_base[lod]
 @group(4) @binding(6) var<storage, read_write> ddgi_worklist: array<vec4<f32>>;
@@ -160,21 +154,12 @@ struct DdgiUniform {
 @group(4) @binding(8) var<storage, read_write> ddgi_cell_id: array<vec4<i32>>;
 // 9：阶段二 cast 输出的射线样本：每样本 2 个 vec4 = (方向.xyz, 命中距离) / (辐亮度.xyz, 1)
 @group(4) @binding(9) var<storage, read_write> ddgi_samples: array<vec4<f32>>;
-/// LOD0 的两张 chunk 段表 + 一段**每槽位的「屏幕使用」漏桶计数**。
+/// LOD0 的两张 chunk 段表 + 每槽位的「屏幕使用」漏桶计数（BG4 的 storage binding 已用满 8 个，
+/// 故复用本 buffer：偏移由 `misc.y` 与 chunk 维度算出，见 `ddgi_chunk_base_off` / `ddgi_slot_chunk_off`）。
 ///
-/// 【前缀 [0, total_slots) = 使用计数】着色侧每帧给"它采样到的探针槽位"记一次（见
-/// `ddgi_usage_mark` / DDGI_USAGE_STICKY），`ddgi_sort` 读一次并衰减一次 —— 它是"这个探针的
-/// 数据会不会被屏幕用到"的**直接度量**，工作集选择就靠它（取代了旧的按距离节流）。
-/// Rust 侧重建本 buffer 时把这段**填 0**（旧的 identity 填充会让每个槽位一上来就"被用过"）。
-///
-/// 【旧「cell → slot 借针间接表」已删】它曾允许"本格放不出探针"的 cell 指向邻近 cell 的探针。
-/// 放置规则改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，这个需求消失，
-/// 因此 `ddgi_slot` 直接返回 `ddgi_slot_own`，前段 `[0, total_slots)` 不再被任何寻址代码读取
-/// （只有上面的使用计数在读写它）。
-///
-/// 【为什么复用这张 buffer 放 chunk 表】BG4 的 storage binding 已用满 8 个（WGSL 下限），
-/// 不再新增 binding：`[total_slots, +num_chunks)` = chunk_base，之后到 `+lod0_slots`
-/// = slot_chunk。偏移由 `misc.y` 与 chunk 维度算出，见 `ddgi_chunk_base_off`/`ddgi_slot_chunk_off`。
+/// [0, total_slots) = 使用计数：着色侧每帧给「采样到的探针槽位」记一次（`ddgi_usage_mark`），
+/// `ddgi_sort` 读一次并衰减一次，作工作集选择的依据；Rust 侧重建本 buffer 时把这段填 0。
+/// [total_slots, +num_chunks) = chunk_base，之后到 +lod0_slots = slot_chunk。
 @group(4) @binding(10) var<storage, read_write> ddgi_cell_slot: array<u32>;
 
 // ===== @group(5)：collect 的图集写入侧（只被 ddgi_collect 使用）=====
@@ -198,16 +183,14 @@ const DDGI_INDIR_RPP_BASE: u32 = 32u;
 const DDGI_INDIR_COUNT_BASE: u32 = 36u;
 // ddgi_indirect 另用 [0..10)：cast/collect 走「全 LOD 连续线程空间」的映射表。
 // seal 算前缀和写这里，cast/collect 用二分（4 次循环）把全局 tid 还原成 (lod, probe, ray)。
-// 这样 dispatch 只需 2 次、且不需要用 indirect 的 y 维传 LOD（那条路不可靠）。
 const DDGI_INDIR_RAYBASE_BASE: u32 = 0u;  // ray_base[lod]：该级首线程在全局空间的位置
 const DDGI_INDIR_COLLBASE_BASE: u32 = 4u; // coll_base[lod]
 const DDGI_INDIR_RAY_TOTAL: u32 = 8u;     // 全局 cast 线程总数
 const DDGI_INDIR_COLL_TOTAL: u32 = 9u;    // 全局 collect 线程总数
 
 // ===== @group(7)：眼睛适应（自动曝光）——被 `dda_main`（读曝光）与 eye_adapt_* 两个入口使用 =====
-/// `out_tex` 的**采样视图**（同一张图：它本来就带 TEXTURE_BINDING，blit 也在采样它）。
-/// 亮度统计要靠它读上一帧/本帧的画面 —— 统计点选"曝光已应用之后"的颜色，与 UE 的
-/// EyeAdaptation 一致（靠反馈把直方图均值压到目标中灰）。
+/// `out_tex` 的采样视图（同一张图）。统计点取「曝光已应用之后」的颜色，
+/// 靠反馈把直方图均值压到目标中灰（同 UE EyeAdaptation）。
 @group(7) @binding(0) var out_tex_src: texture_2d<f32>;
 /// 状态 + 直方图合一（word 布局，f32 一律 bitcast 存取）：
 ///   [0] 曝光系数（`dda_main` 每像素 atomicLoad 一次）

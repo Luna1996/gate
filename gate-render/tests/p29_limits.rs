@@ -1,16 +1,14 @@
-//! P2.9 渲染极限性能测试（Douglas Brick Tree 版，v4 资源预算断言）
+//! 渲染极限性能测试（Douglas Brick Tree，资源预算断言）。
 //!
-//! 断言哲学（v3.1 决策沿用）：**CI 跑宽松上界**（防机器抖动误报），正式数字 `println!`
-//! 留档。本文件全部为 **CPU 侧代理断言**：
+//! 断言哲学：**CI 跑宽松上界**（防机器抖动误报），正式数字用 `println!` 留档。本文件全部为
+//! **CPU 侧代理断言**：
 //! - 构建 / 增量重建：`build_full` 与 `update_chunk` 的 CPU 时间
-//! - DDA 三档：CPU 两级参考实现 `cpu_reference_dda_ray_two_level`
-//!   （与 WGSL 逐字等价，`two_level_equivalence_300_rays` 单测锁定）的耗时
+//! - DDA 三档：CPU 两级参考实现 `cpu_reference_dda_ray_two_level` 的耗时（与 WGSL 逐字等价，
+//!   `two_level_equivalence_300_rays` 单测锁定）
 //! - 内存/VRAM：wire 布局公式 + 实测 buffers 字节
 //!
-//! 哨兵意义：两级 DDA 被改回单级（15× 退化）、chunk 树序列化布局膨胀、
-//! 增量 append 失控——任何一项都会立即爆掉本文件的阈值。
-//!
-//! GPU 侧（DC pass / PCIe 上传耗时）不在 headless CI 覆盖范围：由实机日志背书。
+//! 哨兵意义：两级 DDA 退化回单级、chunk 树序列化布局膨胀、增量 append 失控 —— 任何一项都会
+//! 立即爆掉本文件的阈值。GPU 侧（DC pass / PCIe 上传耗时）不在 headless CI 覆盖范围。
 
 use gate_render::brickmap::dda::cpu_reference_dda_ray_two_level;
 use gate_render::brickmap::dda::cpu_reference_trace_volumes;
@@ -137,7 +135,7 @@ fn incremental_burst_frame_budget() {
   assert!(stale.struct_ranges.is_empty() && !stale.palette_changed);
 
   // 连发：63 chunk 全标脏（真实编辑路径 set_voxel → DirtyTracker 自动 mark）；
-  // 用 1 voxel 微编辑模拟 P4.2 同帧高频编辑的最小粒度。
+  // 用 1 voxel 微编辑模拟同帧高频编辑的最小粒度。
   // palette 7：棋盘只占 1..=2，保证每次编辑都是真实改写（同色写回返回 None）
   for i in 0..63isize {
     let edited = grid.set_voxel_ivec3(IVec3::new(i as i32 * CHUNK_VOXEL + 8, 8, 8), 7);
@@ -198,8 +196,7 @@ fn incremental_burst_frame_budget() {
 // ============================================================================
 
 /// A 空旷远距：1 chunk 有内容，射线自 8192 voxel 外穿越空旷区。
-/// 哨兵：两级 DDA 空旷射线 ≈ t_max/16 粗步；若退化回单级（16384 voxel 步），
-/// 耗时 ×15 立即爆阈值（对应实机 DC 43ms→2.75ms 改造的回归锚）。
+/// 哨兵：两级 DDA 空旷射线 ≈ t_max/16 粗步；退化回单级（16384 voxel 步）会立即爆阈值。
 #[test]
 fn dda_regime_a_open_far_budget() {
   let mut grid = VolumeGrid::new();
@@ -220,7 +217,7 @@ fn dda_regime_a_open_far_budget() {
     }
   }
   let el = t0.elapsed();
-  // CI 宽松：实测毫秒级；阈值 500ms/千射线 ≈ 50× 余量（单级退化 → >2s 爆）
+  // CI 宽松：实测毫秒级；阈值 500ms/千射线（单级退化 → >2s 爆）
   assert!(
     el.as_secs_f64() < 0.5,
     "空旷远距 DDA 千射线耗时 {el:?} > 500ms（疑似两级步进退化）"
@@ -297,8 +294,7 @@ fn dda_regime_c_worst_depth_budget() {
 }
 
 // ============================================================================
-// P2.9d：系统内存 + VRAM 布局规模留档（v4 Douglas 格式：仅打印测量值留档，
-// 保留布局契约断言防结构漂移）
+// P2.9d：系统内存 + VRAM 布局规模留档（仅打印测量值，保留布局契约断言防结构漂移）
 // ============================================================================
 
 #[test]
@@ -322,7 +318,7 @@ fn vram_layout_budget_2gb() {
     node_per_chunk * 1000.0 / 1048576.0
   );
 
-  // ③ L4 满深度热点（19.7 万最细胞）的树区实测：最坏场景留档
+  // ③ L4 满深度热点（19.7 万最细胞）的树区：最坏场景留档
   let mut grid = VolumeGrid::new();
   fill_checkerboard(&mut grid, IVec3::ZERO, IVec3::new(64, 64, 48), 1);
   let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
@@ -381,7 +377,7 @@ fn obj_16_objects_trace_scene_budget() {
     let edited = chip.set_voxel_ivec3(IVec3::new(16 + i * 16, 32, 64), (i % 3 + 1) as u8);
     assert!(edited.is_some(), "芯片板占用祖先存在，写入应生效");
   }
-  // 16 个独立 chip 副本（Phase 3 统一：每物体 = 独立 VolumeGrid，不再共享 pool）
+  // 16 个独立 chip 副本（每物体 = 独立 VolumeGrid）
   let chip_bufs: Vec<_> = (0..16)
     .map(|_| BrickMapBuilder::build_full(&chip).buffers().clone())
     .collect();
@@ -407,7 +403,7 @@ fn obj_16_objects_trace_scene_budget() {
   )
   .collect();
 
-  // 体量留档：v1 每物体 = 1 chunk 树（窗口 1MB + 树）+ palette
+  // 体量留档：每物体 = 1 chunk 树（窗口 1MB + 树）+ palette
   let per_obj_kb = chip_bufs[0].b_struct.len() as f64 * 4.0 / 1024.0;
   println!(
     "[P2.9e] 16 物体: struct={:.1}KB/obj palette={}w",

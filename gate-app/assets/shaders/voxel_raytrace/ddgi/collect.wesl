@@ -3,23 +3,18 @@ import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS
 import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_meta_nbr, ddgi_nbr_bit_lod0, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
 
 // ---- 空间混合（RTXGI ProbeBlending 的简化）----
-// 采样端 gi = Σ(irr·w)/Σw，w = wtri·wn·wd。`wn` 会把"探针落在背面"的那半边剔掉，于是
-// 同一个 cell 内权重在「探针处 ≈1 ↔ cell 角 ≈0.5」之间变化；归一化后，加权平均会把
-// **每个探针自己的辐照度**顶出来 → 与探针间距同周期的晶格亮斑（墙角/接缝亮带的来源）。
-// 相邻探针的辐照度越接近，这个重分配越看不出来 → 把 6 个网格邻居的同名纹素混进来。
+// 采样端 gi = Σ(irr·w)/Σw，w = wtri·wn·wd。`wn` 剔掉"探针落在背面"的那半边后，归一化会把
+// 每个探针自己的辐照度顶出来 → 与探针间距同周期的晶格亮斑（墙角/接缝亮带）。
+// 把 6 个网格邻居的同名纹素混进来可压低它。
 fn ddgi_irr_nbr(id: u32, tx: u32, ty: u32) -> vec4<f32> {
   let c = ddgi_irr_coord(id, tx, ty);
   return textureLoad(ddgi_irr, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0);
 }
 /// 6 个轴向邻居的同名纹素按探针**实际间距**加权求和；返回 (加权和, 权重和)。
 /// 只接受同 LOD 网格内、本帧 ENABLED 且**该纹素有数据**的邻居。
-///
-/// 【为什么不能按值过滤】旧版是 `max(v) < 1e-4 → 跳过`。`DDGI_CAST_FLOOR` 改成 0 之后
-/// "已写入但真黑"与"从未写过"的值**都是 0**，按值判会把**暗邻居整批踢掉** —— 而暗邻居
-/// 恰恰是稀释亮邻居的唯一手段。后果：一颗落点在墙另一侧、看得到天光的探针，四周的暗邻居
-/// 全部不参与平均 ⇒ 它完全不被稀释 ⇒ 在自己的投影处形成一个亮斑（室内墙角/接缝的亮边；
-/// 粗级 cell 更大、更多邻居是实心格或未成型 ⇒ 更严重，对上"离越远越明显"）。
-/// 现在按第 4 通道的**覆盖度**判"有没有数据"（见 DDGI_TEXEL_MIN_COVERAGE）。
+/// "有数据"必须按第 4 通道的覆盖度判（DDGI_TEXEL_MIN_COVERAGE）：DDGI_CAST_FLOOR = 0 时
+/// "已写入但真黑"与"从未写过"的值都是 0，按值过滤会把暗邻居整批踢掉 —— 而暗邻居正是稀释
+/// 亮邻居的唯一手段。
 fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
   let dims = ddgi_u.lods[lod].dims.xyz;
   let base = ddgi_lod_slot_base(lod);
@@ -34,7 +29,7 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
     let wc = ddgi_slot_world_cell(0u, pidx);
     let self_meta = ddgi_meta[base + pidx];
     let self_nbr = ddgi_meta_nbr(self_meta);
-    // NBR_VALID 未置位（非活跃探针 / 掩码未算）→ 不做门控，退回改造前行为。
+    // NBR_VALID 未置位（非活跃探针 / 掩码未算）→ 不做门控。
     let self_gate = (self_meta & DDGI_META_NBR_VALID) != 0u;
     for (var a = 0u; a < 6u; a = a + 1u) {
       var off = vec3<i32>(1, 0, 0);
@@ -80,11 +75,9 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
       if (!plus && coord == 0u) { continue; }
       // ---- 邻接可见性门控：本探针向该邻居方向的线段被几何挡住 → 不混 ----
       // 位序 = a*2 + (plus ? 1 : 0)（0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z）。
-      // 【为什么必须门控】混合完全不看可见性，一个「能看到天空」的探针会把它的天空辐照度
-      // 抹给隔墙的暗探针 → 封闭房间的凹角整片漏光（且逐帧向外扩散成平滑梯度）。
-      // 反向也判：邻居的掩码里「指向本探针」那一位（bit^1）为 0 → 同样不混，
-      // 避免单向不对称（本方向通、反向被挡的薄墙情形）。
-      // 掩码未算（NBR_VALID=0）的一侧不参与判定 → 退回改造前行为，不会误关混合。
+      // 必须门控：混合本身不看可见性，能看到天空的探针会把天空辐照度抹给隔墙的暗探针
+      // ⇒ 封闭房间凹角整片漏光。反向也判（邻居掩码的 bit^1），避免薄墙造成的单向不对称；
+      // 两侧掩码未算（NBR_VALID=0）时不参与判定，不会误关混合。
       let sbit = a * 2u + select(0u, 1u, plus);
       let nslot = base + select(pidx - stride, pidx + stride, plus);
       let nmeta = ddgi_meta[nslot];
@@ -106,15 +99,12 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
 }
 
 // ============================================================================
-// 阶段三 collect（Douglas pass #3）：射线样本积成图集。
-//   · irradiance 4×4：按「样本方向 · 纹素方向」半球余弦加权（来自任何方向的射线都能贡献）。
-//   · depth 8×8：**只吃绑定到本纹素的射线**（见 cast 的「射线 ↔ 深度纹素绑定」）→
-//     mean/std 是「该方向最近距离」的均值与其噪声，Chebyshev 判定成立的前提。
-// 每探针 DDGI_COLLECT_THREADS 个线程：texel < 16 → irradiance 4×4；否则 depth 8×8。
-// 与上一帧做时域混合（hysteresis）；探针刚唤醒（age ≤ 1）时直接写入，避免残留旧世界位置的数据。
-// 读 ddgi_irr/ddgi_depth（BG4 采样侧），写 ddgi_irr_out/ddgi_depth_out（BG5 写入侧）。
-// ============================================================================
-// 一次 dispatch 覆盖全部 LOD：全局 tid → coll_base[lod] + probe_idx × 80 + texel。
+// 阶段三 collect：射线样本积成图集。
+//   · irradiance 4×4：按「样本方向 · 纹素方向」半球余弦加权（任何方向的射线都能贡献）。
+//   · depth 8×8：只吃绑定到本纹素的射线 ⇒ mean/std 是"该方向最近距离"的均值与噪声。
+// 每探针 DDGI_COLLECT_THREADS 个线程：texel < DDGI_IRR_TEXELS² → irradiance，否则 depth。
+// 读 ddgi_irr/ddgi_depth（BG4 采样侧），写 ddgi_irr_out/ddgi_depth_out（BG5 写入侧）；
+// 一次 dispatch 覆盖全部 LOD：全局 tid → coll_base[lod] + probe_idx × DDGI_COLLECT_THREADS + texel。
 // ============================================================================
 /// 单线程：处理「一个探针的一个纹素」。
 fn ddgi_collect_one(tid: u32) {
@@ -130,9 +120,8 @@ fn ddgi_collect_one(tid: u32) {
   let slot = ddgi_lod_slot_base(lod) + probe_idx;
   let packed = bitcast<u32>(ddgi_worklist[slot].w);
   let age = packed & 0xFFu;
-  // 图集纹素按「探针的 cell 下标」寻址，而 slot 只是压缩列表里的排名 ——
-  // 用错会把整张图集写成错位置换（表现：大面积发黑、只有局部有 GI）。
-  // ⚠️ 这里必须用 19 位掩码：16 位会把 LOD0（34 万 cell）的下标截断 → 见 DDGI_WL_IDX_MASK。
+  // 图集纹素按「探针的 cell 下标」寻址，而 slot 只是压缩列表里的排名，两者不可混用。
+  // 掩码必须是 DDGI_WL_IDX_MASK（19 位）：16 位会截断 LOD0（34 万 cell）的下标。
   let atlas_slot = ddgi_lod_slot_base(lod) + ((packed >> 8u) & DDGI_WL_IDX_MASK);
   // 该探针的首条射线在全局射线空间里的编号 = 本 LOD 起始射线号 + 探针号×rpp
   let si = atomicLoad(&ddgi_indirect[DDGI_INDIR_RAYBASE_BASE + lod]) + probe_idx * rpp;
@@ -158,18 +147,12 @@ fn ddgi_collect_one(tid: u32) {
       let cc = ddgi_irr_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
       let prev = textureLoad(ddgi_irr, idx, i32(cc.x), 0);
-      // 年龄越小时向新样本靠拢越多（1/age 等权滑动平均）→ 新探针几帧内成型；
-      // 年龄到上限（= 探针彻底收敛）后自动切到 DDGI_ALPHA 的长窗口，稳态脉动由它压住。
-      // 为什么"旧式 max(base, 1/age) 里 base 是死代码"、以及为什么切点取在年龄上限，
-      // 见 ddgi_age_alpha 的注释。
-      // 【首次写入热启动】该纹素**从没被写过**（覆盖度 0）时直接取新样本（a=1）：
-      //   ① 否则它要从 0 以 alpha 慢慢爬 —— rpp≈1 时一个纹素每 ⌈64/rpp⌉ 帧才更新一次，
-      //      alpha=0.015 意味着它几十秒里都停在"≈0"（一片假黑，且会被判成"有数据"）。
-      //   ② 覆盖度因此**一写即到 1**，"该纹素有没有数据"这条**持久**判据才可用 —— 采样侧
-      //      原来靠逐帧的 DDGI_META_ACTIVE 兜这个，那正是 Probe 档逐帧翻转的来源。
-      // .w = 该纹素的**覆盖度**：每被写过一次就向 1 靠拢一次；从未写过则恒为 0。
-      // 只有它能把"已写入但真黑"与"从未写过"分开（两者的值都是 0）—— 空间混合需要这个
-      // 信号才能拿暗邻居稀释亮邻居，见 DDGI_TEXEL_MIN_COVERAGE / ddgi_probe_blend_irr。
+      // a = ddgi_age_alpha(age, DDGI_ALPHA)：age 越小向新样本靠拢越多（1/age 等权平均），
+      // age 到上限后自动切到 DDGI_ALPHA 的长窗口（见 ddgi_age_alpha）。
+      // 该纹素从未被写过（覆盖度 0）时直接取新样本（a = 1）：否则 rpp 小时它每 ⌈64/rpp⌉ 帧才
+      // 更新一次，从 0 慢慢爬会长期停在假黑；覆盖度也因此一写即到 1，成为持久的"有没有数据"判据。
+      // .w = 该纹素的覆盖度（每写一次向 1 靠拢，从未写过恒 0），只有它能把"已写入但真黑"与
+      // "从未写过"分开（两者值都是 0），见 DDGI_TEXEL_MIN_COVERAGE。
       let a = select(ddgi_age_alpha(age, DDGI_ALPHA), 1.0, prev.w <= 0.0);
       textureStore(
         ddgi_irr_out,
@@ -178,24 +161,18 @@ fn ddgi_collect_one(tid: u32) {
         vec4<f32>(mix(prev.xyz, irr_s, a), mix(prev.w, 1.0, a)),
       );
     } else {
-      // 本帧没有属于本纹素的射线 → 把上一帧读数**原样搬到本帧缓冲**。
-      // 不搬的话 ping-pong 会让该纹素在 A/B 两个缓冲之间交替：采样每帧读到的是
-      // 「另一个缓冲里两帧前的值」→ 图集在「有数据 ↔ 0」之间逐帧翻转 → wsum 处处
-      // 高频闪（实测：Normal 档几乎看不出、wsum 档整个场景都在跳）。
-      // 旧实现「射线全球随机撒」几乎每帧都有射线落到每个纹素，掩盖了这个 bug；
-      // 改为「射线绑定纹素 + 帧轮换」（见 cast）后每纹素每 ⌈64/rpp⌉ 帧才写一次，才暴露。
+      // 本帧没有属于本纹素的射线 → 把上一帧读数原样搬到本帧缓冲。
+      // 不搬的话 ping-pong 下该纹素在 A/B 两缓冲间交替，采样每帧读到的是"另一个缓冲里的旧值"
+      // ⇒ 图集在"有数据 ↔ 0"之间逐帧翻转、wsum 高频闪。
       let cc = ddgi_irr_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
       textureStore(ddgi_irr_out, idx, i32(cc.x), textureLoad(ddgi_irr, idx, i32(cc.x), 0));
     }
   } else {
-    // ---- depth：本纹素绑定射线的**命中**距离统计 ----
-    // 两条铁律：① 只统计**属于本纹素**的射线（绑定，见 cast）；② 只累计**命中**射线。
-    // ② 的理由：早期版本把未命中（dist = DDGI_T_MAX = 8192）也加进均值，只要有射线看到
-    // 天空，均值就被抬到数百且回落极慢 → dtex 系统性偏大 → 遮挡判定几乎恒为「可见」
-    // → 深度闸门形同虚设 → 严重漏光。只累计命中后 dtex 逼近「该方向最近表面距离」；
-    // 该方向一条都没命中 → 无遮挡物 → 不更新（保留上次命中均值；从未命中则恒 0 =
-    // 无数据，采样侧按「无数据」剔除该角）。
+    // ---- depth：本纹素绑定射线的命中距离统计 ----
+    // 只统计属于本纹素的射线，且只累计命中（dist < DDGI_T_MAX）：本纹素存的是"该方向最近表面
+    // 距离"，混进未命中（天空）会把均值抬到数百且回落极慢 ⇒ 遮挡判定几乎恒为"可见"。
+    // 本方向一条都没命中 → 不更新（保留上次命中均值；从未命中则恒 0 = 无数据，采样侧剔除该角）。
     let t = texel - DDGI_IRR_TEXELS * DDGI_IRR_TEXELS;
     let tx = t % DDGI_DEPTH_TEXELS;
     let ty = t / DDGI_DEPTH_TEXELS;
@@ -205,17 +182,13 @@ fn ddgi_collect_one(tid: u32) {
     var dsum2 = 0.0;
     var cnt = 0u;
     for (var i = 0u; i < rpp; i = i + 1u) {
-      // 【与 cast 同一套绑定】本纹素只吃「属于它」的射线：(frame·rpp + i) % ntex == t。
-      // 本帧可能对应 0 条（rpp < ntex 且未轮到）、1 条（rpp == ntex）或若干条（rpp > ntex）。
-      // 这些射线的方向同属本纹素（只是纹素内抖动不同）→ 下面的 mean/mean2 就是
-      // 「该方向最近表面距离」的均值与**噪声**方差，正是 Chebyshev 需要的量。
-      // 旧版按 20° 锥权重把附近方向的射线也混进来，mean 被远处命中系统性抬高 →
-      // 隔墙采样点被判「可见」→ 漏光（详见 cast 里的注释）。
+      // 【与 cast 同一套绑定】本纹素只吃属于它的射线：(frame·rpp + i) % ntex == t。
+      // 本帧可能对应 0 条（rpp < ntex 且未轮到）、1 条（rpp == ntex）或若干条（rpp > ntex）；
+      // 这些射线方向同属本纹素（只是纹素内抖动不同）⇒ 下面的 mean/mean2 是该方向最近表面距离
+      // 的均值与噪声方差，正是 Chebyshev 需要的量（不可按角度锥把邻近方向混进来）。
       if ((frame * rpp + i) % ntex != t) { continue; }
       let s = ddgi_samples[(si + i) * 2u];
-      // 未命中（dist = DDGI_T_MAX）不参与：本纹素存的是「该方向最近表面距离」，
-      // 朝开阔方向的射线根本没有表面 → 不更新（保留上次命中均值；从未命中则恒为 0，
-      // 采样侧按「无数据」剔除该角）。
+      // 未命中（dist = DDGI_T_MAX）不参与：本纹素存的是"该方向最近表面距离"。
       if (s.w < DDGI_T_MAX) {
         dsum = dsum + s.w;
         dsum2 = dsum2 + s.w * s.w;
@@ -229,38 +202,17 @@ fn ddgi_collect_one(tid: u32) {
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
       let prev4 = textureLoad(ddgi_depth, idx, i32(cc.x), 0);
       let prev = prev4.xy;
-      // 【收敛时钟 = 纹素自己的更新次数，不是探针年龄】射线按「绑定纹素 + 帧轮换」分配后，
-      // 每个深度纹素每 ⌈64/rpp⌉ 帧才拿到 1 条样本。用**纹素自己的更新次数**（存 .z，
-      // Rgba16Float 整数精确，见 DDGI_DEPTH_CONV_SAMPLES）当斜坡时钟后，前
-      // DDGI_DEPTH_CONV_SAMPLES 次更新就是 1/n 的等权平均 —— 与辐照度用 age 是同一条思路，
-      // 只是时钟换成"这个纹素自己积累了多少样本"。
-      // 【为什么两项取 max】换主（相机滚动）/世界编辑时 age 被压回 1（见 sort 的脏区分支），
-      // 那几帧**必须**快速跟上新位置附近的读数（见 bake 的换主说明）；而计数是跨换主继承的
-      // （图集不因换主清零）⇒ 只有 age 项能在这几帧把 alpha 抬回大值。两者取 max 即可。
-      // 【为什么斜坡要长到 255（而不是原来的 64）】深度 mean/std 直接喂 Chebyshev 的 wd，
-      // 而 wd 又要跟两个**硬阈值**比（`wd <= 1e-3` 提前退出、`w < DDGI_OCCL_W_MIN` 丢弃）——
-      // 边际角（薄几何/细缝里那些 w 恰好压在阈值上的角）会随 mean 的逐帧抖动在"入选/落选"
-      // 之间翻，室内尤其明显（射线全打在墙上，这道闸门时刻生效）→ 表现就是"细微处逐帧跳变 +
-      // Probe 档在这些角上显示非绿色"。
-      // 工作集优化后 rpp 从恒 1 涨到 ~20（见 DDGI_RAY_BUDGET），同一个纹素的更新间隔从
-      // ⌈64/rpp⌉ = 64 帧缩到 ~3 帧 ⇒ 原本"几十秒才动一次、根本看不见"的残噪变成了**每帧
-      // 可见**的抖动（DDGI_DEPTH_ALPHA 的地板 0.03 是按"每次更新间隔 64 帧"调的）。
-      // 计数上限因此对齐 DDGI_AGE_MAX（255，f16 整数精确）：稳态窗口回到 255 个样本的量级
-      // （残噪 √(1/(2·255)) ≈ 4.4%，比 0.03 地板的 √(0.03/2) ≈ 12% 低 ~2.8×）。
+      // 收敛时钟 = 纹素自己的更新次数（存 .z，Rgba16Float 整数精确，见 DDGI_DEPTH_CONV_SAMPLES）：
+      // 前 DDGI_DEPTH_CONV_SAMPLES 次更新是 1/n 的等权平均 —— 与辐照度用 age 同思路，只是时钟
+      // 换成"这个纹素积累了多少样本"。
+      // alpha 取 age 项与 1/n_upd 的较大者：换主/编辑时 age 被压回 1，计数却是跨换主继承的
+      // ⇒ 只有 age 项能在那几帧把 alpha 抬回大值、快速跟上新位置。
       let n_upd = min(prev4.z + 1.0, DDGI_DEPTH_CONV_SAMPLES);
       let a = max(ddgi_age_alpha(age, DDGI_DEPTH_ALPHA), 1.0 / n_upd);
-      // 【为什么存的是「距离均值的跨帧序列 std」而不是本帧 std】
-      // 绑定后每个纹素每 ⌈64/rpp⌉ 帧才拿到一条射线（rpp≈4 → 16 帧），绝大多数帧里
-      // cnt 至多为 1 → 本帧 std 恒等于 0 → 采样侧
-      // `soft = max(dtex.y, mean·0.02)` 就退化成 0.02·mean 的**刀锋**。
-      // 而 mean 是单样本估计、跨帧方向抖动 → wd 在 ~1 与 ~0 之间翻 → 该角被
-      // `wd <= 1e-3` 整块剔掉又放回 → wsum（以及跟着它走的光影）逐帧跳、亮区边界伸缩，
-      // 相机静止也照样闪。Chebyshev 的过渡宽度本该由"深度读数有多不确定"决定，而不是
-      // 一个恒定的 2%。
-      // 做法：同时 EMA「距离」与「距离²」→ 存的是**落进本纹素的样本序列的 std**，
-      // 即 mean 的真实不确定度尺度（同一纹素内抖动方向落在不同距离上的离散度）。
-      // 注意 pm2 必须由上一帧的 (mean, std) 反推 —— 直接存 mean² 会在 f16 里溢出
-      // （最远 8192 → 8192² = 6.7e7 ≫ f16 上限 65504）。中间量都是 f32，最后只存 std。
+      // 存的是「落进本纹素的样本序列 std」而不是本帧 std：绝大多数帧里 cnt ≤ 1 ⇒ 本帧 std 恒 0，
+      // 会让 Chebyshev 的过渡宽度塌成固定比例的刀锋。
+      // 做法：同时 EMA「距离」与「距离²」，std 由两者反推。pm2 必须由上一帧的 (mean, std) 反推
+      // —— 直接存 mean² 会在 f16 里溢出（最远 8192 → 8192²  f16 上限 65504）。
       let pm2 = prev.x * prev.x + prev.y * prev.y;
       let em = mix(prev.x, mean, a);
       let em2 = mix(pm2, mean2, a);
@@ -274,8 +226,8 @@ fn ddgi_collect_one(tid: u32) {
         vec4<f32>(em, dep_std, n_upd, 0.0),
       );
     } else {
-      // 同 irradiance：本帧无样本时把上一帧读数搬到本帧缓冲（含"滚动换主"——旧读数来自
-      // 紧邻的上一任世界 cell，是有效近似，不能清零；见 bake 的换主说明）。
+      // 同 irradiance：本帧无样本时把上一帧读数搬到本帧缓冲。换主后旧读数来自紧邻的上一任
+      // 世界 cell，是有效近似，不能清零。
       let cc = ddgi_depth_coord(atlas_slot, tx, ty);
       let idx = vec2<i32>(vec2<u32>(cc.y, cc.z));
       textureStore(ddgi_depth_out, idx, i32(cc.x), textureLoad(ddgi_depth, idx, i32(cc.x), 0));
@@ -284,12 +236,7 @@ fn ddgi_collect_one(tid: u32) {
 }
 
 /// collect 入口：**grid-stride** 循环覆盖全部工作项。
-///
-/// 【为什么不能只派发 ceil(total_coll / 64) 个 workgroup】seal 把 collect 的 WG 数写成
-/// `min((total_coll + 63) / 64, 65535)`（65535 = `dispatchWorkgroupsIndirect` 的单维上限）。
-/// 而 `total_coll = Σ 活跃探针 × 80`。旧版隐含前提「活跃数 ≤ 槽数 65536」在 dims 改成按
-/// 世界 AABB 算后失效 —— 槽位 39 万、活跃数上一个量级 → WG 被钳到 65535（= 4.19M 线程
-/// = 52428 个探针），**排在后面的 LOD / 槽位永远不被 collect** → 图集恒空 → 成片无 GI，
-/// 且黑区范围随活跃数变化而移动（与实测吻合）。
-/// grid-stride 让「派发上限」与「覆盖完整性」解耦：每线程按 stride 走完自己的份额。
+/// seal 把 collect 的 WG 数钳在 `dispatchWorkgroupsIndirect` 的单维上限 65535，而
+/// `total_coll = Σ 活跃探针 × DDGI_COLLECT_THREADS` 远大于 65535 × 64 ⇒ 只派发一轮会漏掉
+/// 排在后面的 LOD / 槽位（图集恒空、成片无 GI）。grid-stride 让派发上限与覆盖完整性解耦。
 /// stride 必须等于派发上限（65535 × 64），见 Rust `dispatch_ddgi` 与 seal 的 `min(.., 65535)`。

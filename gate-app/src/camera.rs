@@ -1,8 +1,8 @@
-//! 相机与输入：两种相机模式（轨道 / 幽灵飞行）、左键拾取 recenter、调试开关（V 可见性缓存）。
+//! 相机与输入：两种相机模式（轨道 / 幽灵飞行）、左键拾取 recenter。
 //!
 //! 模式互斥由 [`CameraMode`] 单点决定：两套输入系统各自在「不是自己的模式」时直接返回，
-//! 由 [`build_camera_config`] 按当前模式统一构造 `DdaCameraConfig`（**唯一矩阵构造点**）。
-//! 朝向（yaw/pitch）两种模式**共享** —— 右键拖拽 = 转头，切换模式时视线方向连续。
+//! 由 [`build_camera_config`] 按当前模式统一构造 `DdaCameraConfig`（唯一矩阵构造点）。
+//! 朝向 yaw/pitch 两模式共享 —— 右键拖拽 = 转头，切换模式时视线方向连续。
 
 use bevy::{
   input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
@@ -15,14 +15,13 @@ use gate_render::{
 };
 use gate_voxel::VolumeTransform;
 
-// ---- 相机参数（P2.6 from_orbit 使用；用户已取消"最远距离"限制）----
+// ---- 相机参数 ----
 // CAM_FAR = 透视投影 far 面；shaders/voxel_raytrace/ 内 DDA 射线 t_max 同步到此量级。
-// 原 4000（80m）→ 现 65536（1310.72m）足够 zoom-out 到整个 tile 场景（~1000 voxel）
-// 缩成屏幕 1% 像素仍可见。DIST_MAX 已删除，滚轮 zoom-out 距离本身无上限。
+// 65536 voxel（1 voxel = 2cm → 1310.72m）足够 zoom-out 到整个 tile 场景。
 pub(crate) const FOV_Y: f32 = 60.0_f32.to_radians();
 pub(crate) const CAM_NEAR: f32 = 1.0;
 pub(crate) const CAM_FAR: f32 = 65536.0;
-// ---- 输入灵敏度（spec FR-3；手感调整只改这里）----
+// ---- 输入灵敏度（手感调整只改这里）----
 const ROT_SPEED: f32 = 0.005; // rad/px（右键拖拽旋转）
 pub(crate) const ZOOM_LOG_SPEED: f32 = 0.35; // /行（滚轮乘法缩放，各距离档手感一致）
 
@@ -30,7 +29,7 @@ pub(crate) const ZOOM_LOG_SPEED: f32 = 0.35; // /行（滚轮乘法缩放，各�
 // 速度单位 = voxel/s；1 voxel = 2cm（512 voxel = 10.24m）→ 128 v/s ≈ 2.6 m/s。
 /// 默认飞行速度（voxel/s；低速档基础速度）
 pub(crate) const FLY_SPEED_DEFAULT: f32 = 128.0;
-/// 高速档倍率：Shift 切到高速时实际速度 = 基础速度 × 此值（低速的 2 倍）
+/// 高速档倍率：高速档实际速度 = 基础速度 × 此值
 pub(crate) const FLY_SPEED_FAST_MUL: f32 = 2.0;
 /// 飞行速度滑杆的范围 / 步进（Camera tab 与 clamp 共用；16 v/s ≈ 0.32 m/s，2048 v/s ≈ 41 m/s）
 pub(crate) const FLY_SPEED_MIN: f32 = 16.0;
@@ -40,22 +39,22 @@ pub(crate) const FLY_SPEED_STEP: f32 = 16.0;
 /// 相机模式（main world Resource）。切换的唯一入口是 DebugView 的 Camera tab 互斥按钮组。
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CameraMode {
-  /// 轨道相机（P2.6）：右键旋转 / 中键平移 / 滚轮缩放
+  /// 轨道相机：右键旋转 / 中键平移 / 滚轮缩放
   Orbit,
-  /// 幽灵飞行：WASD 沿视线平移、Space 升 / Ctrl 降，**不做碰撞检测**（默认模式）
+  /// 幽灵飞行：WASD 沿视线平移、Space 升 / Shift 降，不做碰撞检测（默认模式）
   #[default]
   Fly,
 }
 
-/// 幽灵相机状态。**朝向不在这里** —— 复用 [`OrbitCamera`] 的 yaw/pitch（两模式共享同一套
-/// 朝向语义），所以切换模式时视线方向连续，只有位置需要对一次（见 [`sync_camera_mode_switch`]）。
+/// 幽灵相机状态。朝向不在这里 —— 复用 [`OrbitCamera`] 的 yaw/pitch（两模式共享），
+/// 切换模式时视线方向连续，只有位置需要对一次（见 [`sync_camera_mode_switch`]）。
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct FlyCamera {
   /// 眼位（voxel）
   pub pos: Vec3,
   /// 基础飞行速度（voxel/s；**低速档**值，滑杆改的就是它）
   pub speed: f32,
-  /// Shift 切换：true = 高速档（实际速度 = `speed` × [`FLY_SPEED_FAST_MUL`]）
+  /// true = 高速档（实际速度 = `speed` × [`FLY_SPEED_FAST_MUL`]）
   pub fast: bool,
 }
 
@@ -70,7 +69,7 @@ impl Default for FlyCamera {
 }
 
 impl FlyCamera {
-  /// 本帧实际飞行速度（低速档 = 基础速度，高速档 = 基础速度 × 倍率）
+  /// 本帧实际飞行速度（含高速档倍率）
   pub fn effective_speed(&self) -> f32 {
     if self.fast {
       self.speed * FLY_SPEED_FAST_MUL
@@ -88,18 +87,16 @@ pub(crate) fn look_forward(yaw: f32, pitch: f32) -> Vec3 {
   Vec3::new(-sin_yaw * cos_pitch, -sin_pitch, -cos_yaw * cos_pitch)
 }
 
-/// 【诊断】GATE_ORBIT=1：相机每帧**边转边沿圆轨迹平移**（0.35 rad/s + 50 体素/s ≈ 2 m/s）。
+/// GATE_ORBIT=1：相机每帧边转边沿圆轨迹平移（yaw 0.35 rad/s，平移 500 voxel/s），
+/// 半径约 333 体素，跨过 LOD0~3 cell 与 256 体素的 chunk 边界。
 ///
-/// 用途：复现"相机移动中"才出现的帧时/画质问题。**必须带平移** —— 纯旋转不改变相机所在的
-/// world cell / chunk，滚动网格、chunk 池同步、"最大空子块"重烘这些路径一次都不会触发，
-/// 结果看起来和静止一模一样（第一次就是这么白测的）。半径 ≈ 333 体素（13m），会跨过
-/// LOD0 cell（0.64m）、LOD1~3 cell 与 256 体素的 chunk 边界。
-/// 配 `GATE_BENCH=1` 启动，日志里每 2 秒那行"GPU 逐 pass 均值"就是移动中的统计。
+/// 必须带平移：纯旋转不改变相机所在的 world cell / chunk，"移动中"才触发的路径不会跑。
+/// 配 `GATE_BENCH=1` 启动，日志里每 2 秒那行 GPU 逐 pass 均值即移动中的统计。
 pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>) {
   let dt = time.delta_secs();
   orbit.yaw -= 0.35 * dt;
   let a = time.elapsed_secs() * 0.15;
-  let speed = 500.0 * dt; // 体素/帧（≈20 m/s @60fps：每 ~13 帧跨一个 256 体素 chunk）
+  let speed = 500.0 * dt; // 500 voxel/s
   orbit.target += Vec3::new(-a.sin(), 0.0, a.cos()) * speed;
   orbit.clamp();
 }
@@ -121,7 +118,7 @@ pub(crate) fn camera_look_input(
   orbit.clamp();
 }
 
-/// 轨道相机输入（P2.6 spec FR-3/FR-4；仅 Orbit 模式）：
+/// 轨道相机输入（仅 Orbit 模式）：
 /// - 中键拖拽 = 平移 target（按当前距离缩放 pan 速度，1:1 跟手）
 /// - 滚轮 = 对数缩放（exp(±ZOOM_LOG_SPEED·lines)，各距离档手感一致）+ Shift 细调 1/10
 /// - 旋转（右键）在 [`camera_look_input`]，两模式共享
@@ -139,7 +136,7 @@ pub(crate) fn orbit_camera_input(
   if *mode != CameraMode::Orbit {
     return;
   }
-  // UI 指针捕获优先（2.7a FR-6）：hover/按下控件时吞掉拖拽/滚轮
+  // UI 指针捕获优先：hover/按下控件时吞掉拖拽/滚轮
   if !captured.0 {
     let delta = motion.delta;
     if mouse.pressed(MouseButton::Middle) {
@@ -152,7 +149,7 @@ pub(crate) fn orbit_camera_input(
       orbit.target += (right * (-delta.x) + up * delta.y) * pan_per_px;
     }
 
-    // 滚轮缩放独立于拖拽（spec：滚轮可与拖拽共存）；Line 单位，Pixel 按典型行高 16px 折算
+    // 滚轮缩放独立于拖拽（两者可共存）；Line 单位，Pixel 按典型行高 16px 折算
     let lines = match scroll.unit {
       MouseScrollUnit::Line => scroll.delta.y,
       MouseScrollUnit::Pixel => scroll.delta.y / 16.0,
@@ -170,12 +167,11 @@ pub(crate) fn orbit_camera_input(
   }
 }
 
-/// 幽灵模式飞行输入（仅 Fly 模式，**无碰撞**）：WASD 沿视线平移，Space 上升 / Ctrl 下降（世界 +Y）。
-/// 前进/右向取自当前 yaw/pitch，所以「往哪看就往哪飞」；斜向移动归一化，速度与单键一致。
-/// Shift **按下切换**低速/高速档（高速 = 低速 × [`FLY_SPEED_FAST_MUL`]），不是按住加速。
+/// 幽灵模式飞行输入（仅 Fly 模式，无碰撞）：WASD 沿视线平移，Space 上升 / Shift 下降（世界 +Y）。
+/// 前进/右向取自当前 yaw/pitch；斜向移动归一化，速度与单键一致。
 ///
-/// **不按 UI 指针捕获闸门**：`UiPointerCaptured` 只对鼠标有意义（拖滑杆/点击控件），
-/// 用它挡键盘会导致"鼠标恰好停在 DebugView 面板上时飞不动"。
+/// 不按 `UiPointerCaptured` 闸门：它只对鼠标有意义，用它挡键盘会导致鼠标停在 DebugView
+/// 面板上时飞不动。
 pub(crate) fn fly_camera_input(
   keys: Res<ButtonInput<KeyCode>>,
   time: Res<Time>,
@@ -195,7 +191,7 @@ pub(crate) fn fly_camera_input(
       fly.effective_speed(),
     );
   }
-  // dt 上限 0.1s：断点/长卡顿后不会一帧瞬移出去（代价是那种帧里"飞得慢一点"）
+  // dt 上限 0.1s：长卡顿后不会一帧瞬移出去
   let dt = time.delta_secs().min(0.1);
   let forward = look_forward(orbit.yaw, orbit.pitch);
   let right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -219,7 +215,7 @@ pub(crate) fn fly_camera_input(
     dir -= Vec3::Y;
   }
   if let Some(d) = dir.try_normalize() {
-    // 先把速度读出来：`fly.pos += ... fly.effective_speed() ...` 会同时要求可变与不可变借用
+    // 先取出速度：同一表达式里再调 effective_speed() 会同时借用 fly 的可变与不可变
     let speed = fly.effective_speed();
     fly.pos += d * speed * dt;
   }
@@ -230,7 +226,7 @@ pub(crate) fn fly_camera_input(
 /// - Fly → Orbit：把轨道 target 放到「沿当前朝向 `distance` 处」，使 `orbit.eye() == fly.pos`
 ///
 /// 首帧资源刚插入时 `is_changed()` 也为真：只要 `FlyCamera` 初始化成轨道眼位（scene.rs 如此），
-/// 这一步是幂等的，不会动初始机位。
+/// 这一步幂等，不会动初始机位。
 pub(crate) fn sync_camera_mode_switch(
   mode: Res<CameraMode>,
   mut orbit: ResMut<OrbitCamera>,
@@ -256,9 +252,9 @@ pub(crate) fn sync_camera_mode_switch(
   );
 }
 
-/// 按当前模式重建 `DdaCameraConfig`（**唯一矩阵构造点**；幂等，成本 = 一次 4×4 求逆）。
+/// 按当前模式重建 `DdaCameraConfig`（唯一矩阵构造点；幂等，成本 = 一次 4×4 求逆）。
 /// 必须排在所有相机输入之后：同帧的位移/旋转当帧生效。aspect 读当前窗口物理尺寸
-/// （FR-5：resize 后 ≤1 帧生效）。
+/// （resize 后 ≤1 帧生效）。
 pub(crate) fn build_camera_config(
   mode: Res<CameraMode>,
   orbit: Res<OrbitCamera>,
@@ -312,14 +308,11 @@ pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3
   Some((cfg.position_world, dir))
 }
 
-/// 左键拾取 recenter（**仅轨道模式**）：射线命中体素表面 → 轨道目标移到命中点。
-/// - 未命中任何体素 / 物体 → 不做操作。
-/// - 命中点用射线入点 voxel 坐标（命中面外侧向内偏半个 voxel，避免 target 贴着面导致
-///   距离过近时 pitch clamp 抖动）。
-/// - UI 捕获指针（UI 控件上点击）时跳过，避免误触发。
-/// - 幽灵模式下不生效：那里没有"轨道目标"可言（左键留给体素编辑）。
-/// - CPU picking：用 `cpu_reference_trace_volumes` 同步跑主世界+物体两级 DDA，
-///   射线由 [`cursor_ray`] 从 `DdaCameraConfig.inv_view_proj` 反投影。
+/// 左键拾取 recenter（仅轨道模式）：射线命中体素表面 → 轨道目标移到命中点。
+/// 命中点沿入面法线推进半个 voxel（避免 target 贴面时距离过近导致 pitch clamp 抖动）；
+/// 未命中、UI 捕获指针、幽灵模式下一律不做操作。
+/// CPU picking：`cpu_reference_trace_volumes` 同步跑主世界+物体两级 DDA，射线由
+/// [`cursor_ray`] 从 `DdaCameraConfig.inv_view_proj` 反投影。
 #[allow(clippy::too_many_arguments)] // 多资源 = 点击成本可接受
 pub(crate) fn left_click_pick_recenter(
   mouse: Res<ButtonInput<MouseButton>>,
@@ -349,10 +342,8 @@ pub(crate) fn left_click_pick_recenter(
     return;
   };
   let t_max = CAM_FAR - CAM_NEAR;
-  // ---- 2) CPU picking：从 VoxelScene.volumes 同步构建各 volume brickmap + trace
-  // 点击低频（用户输入），且极限场景 ~300 chunk 单次 build_full <150ms；
-  // 故意不做跨帧缓存——编辑（每 120 帧 chunk 改写）会让缓存与实际渲染画面
-  // 不匹配，造成"点到空气也 recenter"的错觉。宁可点击时重建也不提供假命中。
+  // CPU picking：点击时从 VoxelScene.volumes 同步 build_full 各 volume 的 brickmap 再 trace。
+  // 不做跨帧缓存 —— 编辑会改写 chunk，缓存会与渲染画面不一致（假命中）。
   let per_vol_bufs: Vec<BrickMapBuffers> = scene
     .volumes
     .list
@@ -363,9 +354,8 @@ pub(crate) fn left_click_pick_recenter(
     .iter()
     .zip(scene.volumes.list.iter().map(|v| v.transform))
     .collect();
-  // ---- 3) trace_volumes：主世界 + 物体统一求最近 ----
+  // trace_volumes：主世界 + 物体统一求最近
   if let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, origin, dir, t_max) {
-    // 命中点 = origin + t·dir；再朝命中法线方向推半个 voxel（让 target 落在体素内部）。
     let mut p = origin + dir * hit.t;
     let half = 0.5;
     p += hit.normal * half; // 法线朝射线来向 → *+half 把点推进命中体素内 0.5 voxel
@@ -379,8 +369,7 @@ pub(crate) fn left_click_pick_recenter(
       hit.pal,
       hit.obj_id,
     );
-    // 注：DdaCameraConfig 由 orbit_camera_input 同帧末尾重建（本系统在其之后），
-    // 因此新 target 下帧生效，避免 Update 中段重复 cfg 构造。
+    // DdaCameraConfig 由 build_camera_config 在本系统之后同帧重建，新 target 当帧生效
   }
 }
 
@@ -389,7 +378,7 @@ mod camera_math_tests {
   use super::*;
 
   /// `look_forward` 必须 == 归一化视线方向（target - eye）。它是三处共用的唯一出处
-  /// （中键平移基、幽灵飞行前进方向、矩阵构造），符号写反会让三处同时错。
+  /// （中键平移基、飞行前进方向、矩阵构造），符号写反会让三处同时错。
   #[test]
   fn look_forward_is_view_direction() {
     for (yaw, pitch) in [(0.0, 0.0), (0.7, 0.3), (-1.2, -0.9), (3.0, 1.5), (0.0, -1.55)] {
@@ -408,8 +397,8 @@ mod camera_math_tests {
     }
   }
 
-  /// 幽灵相机启动位置 = 轨道眼位（场景初始化如此）→ 切换模式那一帧是幂等的，
-  /// 不会把初始机位搬走。这里直接锁住 Orbit 分支的式子。
+  /// 幽灵相机启动位置 = 轨道眼位（场景初始化如此）→ 切换模式那一帧幂等，不搬初始机位。
+  /// 这里直接锁住 Orbit 分支的式子。
   #[test]
   fn orbit_target_from_fly_eye_roundtrips() {
     let o = OrbitCamera {
@@ -437,12 +426,9 @@ mod aabb_zoom_tests {
   use glam::{Mat4, Vec3, Vec4};
 
   // ========================= AABB 滚远消失问题 headless 复现 =========================
-  //
-  // 用自建最小 demo 场景 + 轨道相机 zoom-out（0 / 1 / 2 / 5 行滚轮）
-  // 在 32x32 视锥网格上跑 CPU DDA：full 2M 步 vs AABB-skip 2048 步。
-  // 若任一场景 diff_hit+diff_pal > 0 → WGSL shader 必然也有完全一样的 bug，
-  // 因为 WGSL AABB 代码就是 `cpu_reference_dda_ray_aabb_skip` 的逐字翻译。
-  //
+  // 自建最小 demo 场景 + 轨道相机 zoom-out，在 32x32 视锥网格上跑 CPU DDA：
+  // full vs AABB-skip，断言逐像素一致 —— WGSL 的 AABB 代码是
+  // `cpu_reference_dda_ray_aabb_skip` 的逐字翻译，diff>0 即 shader 同 bug。
   // 运行：cargo test -p gate-app demo_scene_aabb_zoom_out -- --nocapture
 
   fn scene_for_aabb_zoom_headless() -> (gate_voxel::VolumeGrid, BrickMapGlobals) {
@@ -550,7 +536,7 @@ mod aabb_zoom_tests {
     let base_dir = base_offset / base_dist;
     // 每个 "滚轮 -1 行"（往外滚）: distance *= exp(0.35) ≈ 1.419
     let zoom_factor_for_lines = |lines: i32| (lines as f32 * ZOOM_LOG_SPEED).exp();
-    // 测试：0（初始）/ +2（两下滚出 distance ×≈2）/ +5（多滚几下 distance ×≈5.8）/ +10（×28，超远）/ +20（×815）
+    // 覆盖 0（初始）/ +2 / +5 / +10 / +20 行滚轮的 distance 档
     for lines in [0i32, 2, 5, 10, 20] {
       let factor = zoom_factor_for_lines(lines);
       let distance = base_dist * factor;
@@ -614,7 +600,7 @@ mod aabb_zoom_tests {
         grid_w * grid_w,
         grid_w * grid_w,
       );
-      // 硬断言：Rust AABB skip 与 full DDA 在真实 demo scene + 真实 zoom-out 操作下必须逐像素一致
+      // 硬断言：AABB skip 与 full DDA 逐像素一致
       assert!(
         diff_hit + diff_pal == 0,
         "zoom lines={lines} distance={distance}: full/skip MISMATCH {}/{} (hit+pal)",

@@ -1,14 +1,10 @@
 import package::bindings::{light_samp, light_tex, view_u};
 
 // ============================================================================
-// 光照场（Douglas #15 的 AO fill + 「体素即光源」的发光密度 ε，共用一张 3D 纹理）。
-//
-// 形态与 DDGI 级联同构，因此是可流式的：
-//   · cell = LIGHT_FIELD_CELL 体素（= Douglas #15 的 16³ 填充率网格），dims = 32³
-//   · 原点 = align_down(相机 − dims/2·cell, cell)：相机恒在盒中心（偏差 < 1 cell）
-//   · 槽位 = 世界 cell mod dims（**世界锚定**）：相机滚动只换「新进窗口那条带」的纹素，
-//     其余纹素保持自己的世界身份 → 纹素不会因相机移动而整幅失效
-// 与 Rust `brickmap/upload.rs::light_field_origin_cell` 是同一个式子，必须逐字一致。
+// 光照场：AO fill 与发光密度 ε 共用一张 3D 纹理（16³ 填充率网格，Douglas #15）。
+//   · cell = LIGHT_FIELD_CELL 体素，dims = 32³；原点 = align_down(相机 − dims/2·cell, cell)
+//   · 纹素下标 = 世界 cell mod dims（世界锚定）：相机滚动只换「新进窗口那条带」的纹素
+// 原点式与 Rust `brickmap/upload.rs::light_field_origin_cell` 是同一个式子，必须逐字一致。
 // ============================================================================
 const LIGHT_FIELD_CELL: f32 = 16.0;
 const LIGHT_FIELD_DIM: i32 = 32;
@@ -17,10 +13,9 @@ fn light_field_origin_voxel() -> vec3<f32> {
   let half = f32(LIGHT_FIELD_DIM / 2) * LIGHT_FIELD_CELL;
   return floor((view_u.cam_pos_voxel.xyz - vec3<f32>(half)) / LIGHT_FIELD_CELL) * LIGHT_FIELD_CELL;
 }
-/// 世界 voxel 位置 → 光照场纹理 uv。
-/// 连续 cell 坐标卷绕到 [0, dim) 后归一化。纹素 c 存的是**整个 cell** [16c, 16c+16) 的
-/// 均值（CPU tally 如此），故采样位置取 `r` 本身：cell 中心（r = c+0.5）恰好落在纹素 c 的
-/// 中心（硬件三线性在此取到纹素原值），cell 边界处才与相邻纹素各半 —— 与 tally 语义一致。
+/// 世界 voxel 位置 → 光照场纹理 uv：连续 cell 坐标卷绕到 [0, dim) 后归一化。
+/// 纹素 c 存的是整个 cell [16c, 16c+16) 的均值（CPU tally 同语义），故采样位置取 `r` 本身：
+/// cell 中心（r = c+0.5）落在纹素中心（三线性取到原值），cell 边界处与相邻纹素各半。
 fn light_field_uv(p_voxel: vec3<f32>) -> vec3<f32> {
   let d = vec3<f32>(f32(LIGHT_FIELD_DIM));
   let cc = p_voxel / LIGHT_FIELD_CELL;
@@ -47,12 +42,9 @@ fn light_field_ao(p_voxel: vec3<f32>, obj_id: i32) -> f32 {
 fn light_field_emit(p_voxel: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(light_tex, light_samp, light_field_uv(p_voxel), 0.0).rgb;
 }
-/// cast 射线**沿程累加**发光（「体素即光源」在 GI 传输侧的接法）。
-///
-/// 为什么必须按体积聚合：单个发光体素 2cm，射线在 32cm 探针间距下命中它的概率 ~3e-5
-/// （rpp=10 时约每 3000 帧一次）—— 逐体素求交在采样上不可行。这里把 cell 的发光摊成
-/// **密度** ε 并沿程积分 radiance += ε·ΔL（功率守恒：摊开面积不改变该点收到的期待辐照度，
-/// 但方差降 256 倍）。只累加到几何首命中 t_max 为止 → 两侧遮挡依然正确，不引入漏光。
+/// cast 射线沿程累加发光：把 cell 的发光摊成密度 ε 并积分 radiance += ε·ΔL
+/// （单体素 2cm，32cm 探针间距下命中概率 ~3e-5，逐体素求交在采样上不可行）。
+/// 只累加到几何首命中 t_max 为止 → 两侧遮挡依然正确，不引入漏光。
 fn light_field_gather(origin: vec3<f32>, dir: vec3<f32>, t_max: f32) -> vec3<f32> {
   // 射线 × 包围球求交（球保守包含盒；用二次式而非 slab，避免 dir 分量为 0 的除零）
   let size = f32(LIGHT_FIELD_DIM) * LIGHT_FIELD_CELL;

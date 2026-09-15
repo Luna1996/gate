@@ -1,10 +1,7 @@
 //! checkbox：勾选切换 + 勾选视觉（docs/ui-dark-theme.md §5.3）。
 //!
-//! 复用 bevy_ui `Checked` / `Checkable`（presence 语义，自带 a11y 联动）：
-//! 有 `Checked` = 勾选，无 = 未勾选。
-//!
-//! 视觉：16×16 圆角 4 盒子；未选中 = 抬升表面 + 边框（hover 边框提亮），
-//! 选中 = 强调填充 + 主色对勾标记。
+//! 复用 bevy_ui `Checked` / `Checkable`（presence 语义，自带 a11y 联动）：有 `Checked` = 勾选。
+//! 视觉：16×16 盒子；未选中 = 抬升表面 + 边框（hover 边框提亮），选中 = 强调填充 + 对勾标记。
 
 use std::ops::Deref;
 

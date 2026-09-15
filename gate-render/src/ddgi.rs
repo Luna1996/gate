@@ -1,21 +1,11 @@
-//! DDGI（Dynamic Diffuse Global Illumination）——阶段一：世界空间探针烘焙 + 活跃探针筛选。
+//! DDGI（Dynamic Diffuse Global Illumination）：世界空间探针烘焙 + 活跃探针筛选 + cast/collect。
 //!
-//! 架构（严格对齐 Douglas Devlog #23 / Majercik 2019, 2021）：
-//! - **嵌套级联 LOD，以相机为中心**：4 级 LOD 各自以相机为中心铺 16³ 网格（cell 边长
-//!   16/32/64/128 voxel），覆盖范围逐级 ×2 且严格嵌套（LOD(l-1) 盒 ⊂ LOD(l) 盒）。
-//!   相机移动使某级 origin 按该级 cell 对齐滚动时，只重烘「世界 cell 发生变化」的槽位
-//!   （`ddgi_cell_id` 增量缓存），未变的槽位续龄。
-//! - **烘焙（`ddgi_bake0..3`）**：世界数据变化（上传修订号自增）时才跑一次。逐 cell 沿 4³ 分裂树
-//!   **BFS 找「最大的全空叶」并把探针放在其中心**（同级优先靠 cell 中心；全满 cell 无探针；
-//!   全空 cell 居中）——即 Douglas 的探针放置启发式。结果写入 `ddgi_cell` storage buffer。
-//!   按 LOD 拆成 4 个独立 compute pass（细→粗）：粗级要继承**本帧**细级的放置结果
-//!   （Douglas 的 "down sample the generated data"），而 pass 边界才是内存屏障。
-//! - **活跃判定（`ddgi_sort`）**：每帧逐 cell，读烘焙记录（不再重算树 BFS）；探针存在且
-//!   「本 cell 或 6 邻接 cell 有体素」（或与非网格对齐物体 AABB 重叠）→ 活跃 → atomicAdd 进
-//!   per-LOD worklist；同时刷新 age / slot_pos / meta。
-//! - **seal**：按 LOD 把固定射线预算摊给活跃探针，写 cast/collect indirect args。
-//!
-//! 阶段二（cast）/ 阶段三（collect/着色）尚未接入；`irr/depth` 纹理沿用旧布局暂作占位。
+//! 4 级嵌套级联 LOD，各级以世界 AABB 锚定铺 16³ cell 网格（cell 边长 16/32/64/128 voxel，覆盖
+//! 逐级 ×2 且严格嵌套）；LOD0 额外按 chunk 从探针池领固定 4096 槽的段。烘焙 `ddgi_bake0..3`
+//! 逐 cell 沿 4³ 分裂树 BFS 找「最大的全空叶」并把探针放其中心，结果写 `ddgi_cell`（按 LOD 拆
+//! 4 个 pass，细→粗：粗级继承本帧细级的放置结果，pass 边界才是内存屏障）。`ddgi_sort` 每帧按
+//! 「本 cell 或 6 邻接 cell 有体素」判定活跃并 atomicAdd 进 per-LOD worklist，同时刷新
+//! age / slot_pos / meta；`seal` 把固定射线预算摊给活跃探针，写 cast/collect 的 indirect args。
 
 use bevy::render::render_resource::{CachedComputePipelineId, ShaderType};
 use glam::{IVec3, IVec4, UVec3, UVec4, Vec4};
@@ -23,76 +13,57 @@ use glam::{IVec3, IVec4, UVec3, UVec4, Vec4};
 use crate::wesl_consts::ddgi_consts;
 
 // 图集纹素数（irr / depth）与每帧射线预算（`DDGI_RAY_BUDGET`）的**权威值都在 WESL**
-// （`ddgi/consts.wesl` 的 `DDGI_IRR_TEXELS` / `DDGI_DEPTH_TEXELS` / `DDGI_RAY_BUDGET`）：
-// Rust 侧由 `wesl_consts::ddgi_consts()` 启动时解析**同一份源码**得到，不再各留一份副本
-// —— 原先两处各写一份，出现过「预算一边 131072、一边 65536 → rpp 静默减半」的漂移。
-// 为什么取 4×4 / 8×8、动预算的代价是什么，见 WESL 那三条常量各自的注释（那里既是文档
-// 也是唯一的调参入口）。
+// （`ddgi/consts.wesl`），Rust 侧由 `wesl_consts::ddgi_consts()` 启动时解析**同一份源码**得到，
+// 不再各留一份副本。为什么取 4×4 / 8×8、动预算的代价是什么，见 WESL 那三条常量各自的注释。
 pub const DDGI_LODS: u32 = 4;
 /// 4 级 LOD cell 边长（voxel），等比 ×2。
 ///
-/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [16,32,64,128]：
-/// 探针数 / 射线预算 / 显存全不变（dims 不变），只是把同样的探针铺在**更小的体积**上 ——
-/// 近场探针间距 64cm→32cm。这是"探针晶格"伪影（GI 场的空间变化比探针网格更细时，
-/// 三线性插值把每个探针自己的值暴露成 0.64m 周期的亮斑）最直接的降压手段。
+/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [16,32,64,128]：探针数 /
+/// 射线预算 / 显存全不变（dims 不变），只是把同样的探针铺在**更小的体积**上 —— 近场探针间距
+/// 64cm→32cm，缓解"探针晶格"伪影（GI 场的空间变化比探针网格更细时，三线性插值把每个探针
+/// 自己的值暴露成 0.64m 周期的亮斑）。
 ///
-/// 【为什么不能把最粗级放大到 256 来换覆盖】2026-09-12 试过并回退：覆盖 82m → 164m 且
-/// 槽位/预算/显存成本≈0（dims 没动），但**探针间距 2.56m → 5.12m** —— 对建筑尺度会严重
-/// 跨几何（8 角探针跨到墙背面/屋面之上/地面之下）→ 该面被 `wn ≤ 0` 全剔 → GI 黑区
-/// （Probe 档品红、GI/wsum 档纯黑），实测**比"覆盖不足"更伤画质**。
-/// **cell 与 dims 是一对此消彼长的量**：要"覆盖更大 + 间距不变"，只能加大 dims
-/// （或增加级数），代价落在 collect/sort/图集，而不是改 cell。
+/// **cell 与 dims 是一对此消彼长的量**：把最粗级放大到 256 会把探针间距等比放大到 5.12m，
+/// 8 角探针跨到墙背面/屋面之上/地面之下 → 该面被 `wn ≤ 0` 全剔 → GI 黑区。要"覆盖更大 +
+/// 间距不变"只能加大 dims（或增加级数），代价落在 collect/sort/图集，而不是改 cell。
 pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
 /// DDGI 世界网格相对世界 AABB **向外扩的量**（voxel，六个方向各扩这么多）。只作用于
 /// `DdgiWorldGrid`（LOD1~3 的规则网格与各级的"空间盒"）；**不动** `DdgiChunkGeom`
 /// （LOD0 的 chunk 段仍按真实 AABB 分配）⇒ LOD0 的 chunk 数、槽位段、探针池全部不变。
 ///
-/// 【不扩会怎样（实测症状）】各级原点按**自己的 cell**向下对齐（`align_down(min, cell)`），
-/// 级间粒度不同 ⇒ 世界边界面上会出现一圈"只有粗级覆盖"的环。nuke.vox 的 AABB `min.y = 16`：
-/// `align_down(16,16) = 16`，而 `align_down(16,32) = 0` ⇒ 落在 [0,16) 的点被判进 **LOD1 壳**。
-/// 而采样点还会沿法线外推（`dda_main` 的 `n_off ≥ 0.5` 体素）⇒ **世界底面朝下的面**正好掉出
-/// LOD0 盒、被按 LOD1（cell=32）采样 → `Domain` 档显示**黄色**（应为红）。
+/// 必须 ≥ 一个 LOD0 cell：各级原点按**自己的 cell** 向下对齐（`align_down(min, cell)`），级间
+/// 粒度不同 ⇒ 世界边界面上会出现一圈"只有粗级覆盖"的环（如 AABB `min.y = 16` 时
+/// `align_down(16,16)=16` 而 `align_down(16,32)=0` ⇒ 落在 [0,16) 的点被判进 LOD1 壳）。采样点
+/// 还会沿法线外推（`dda_main` 的 `n_off ≥ 0.5` 体素）⇒ 世界底面朝下的面会掉出 LOD0 盒、被按
+/// LOD1（cell=32）采样，而粗级探针位置是从细级继承的、落在世界内部（该面的上方）⇒ 该面
+/// `wn_raw < 0` 全部背向 → `wsum = 0` → GI≈0。
+/// 外扩 16 后，边界面上任意点到 LOD0 盒的 `min` 面至少 15 体素 ⇒ 稳定落在 LOD0 壳采样细级，
+/// 而细级在世界外侧的 cell 本来就有探针（`lod0_needed_chunks` 规则 ②：几何贴 chunk 边界
+/// 16 体素以内时相邻 chunk 也领段）。
 ///
-/// 更要命的是粗级 cell 的探针位置是**从细级继承**来的（`ddgi_place_probe` 的 `lod > 0` 分支：
-/// 取本 cell 覆盖的 8 个细级 cell 里最近的那个已放置探针）⇒ 它落在世界内部、位于该面的
-/// **上方** ⇒ 对朝下的面 `wn_raw < 0` 全部背向（Probe 档**品红**，且与"窗口外"的橙色角平票）
-/// ⇒ `wsum = 0` → `gi = 0`；而 `cov/conf` 只看"有没有数据"、不看朝向 ⇒ `amb` 被压到
-/// `DDGI_AMBIENT_FLOOR` ⇒ **世界底面的下表面纯黑 + GI≈0 处的阈值锯齿**。
-///
-/// 【扩一格 16 之后】边界面上任意点到 LOD0 盒的 `min` 面至少 **15 体素** ⇒ 稳定落在 LOD0 壳
-/// ⇒ 采样细级；而细级在世界外侧的 cell **本来就有探针**（`lod0_needed_chunks` 规则 ②：
-/// 几何贴 chunk 边界 16 体素以内时，相邻 chunk 也领段）⇒ 朝下的面终于拿到"外侧同侧探针"
-/// （它的下向辐照度就是天空）⇒ 被正确点亮。16 = 一个 LOD0 cell，正好覆盖"外推 ≤ 0.53 体素 +
-/// stencil 半格"所需的余量。
-///
-/// 【代价】LOD1~3 的原点最多再降 16、每轴 dims 至多 +1 ⇒ 总槽位小幅上升（nuke 量级：
-/// 352256(池) + 44640+5760+800 → +约 6300）⇒ `DDGI_ATLAS_LAYERS` 同步 256 → 272（+~10MB）。
-/// 容量/预算不变量由 `ddgi_worklist_pack_covers_atlas_capacity` / `chunk_lod0_atlas_capacity` /
-/// `vram_layout_budget_2gb` 守着。
+/// 代价：LOD1~3 的原点最多再降 16、每轴 dims 至多 +1 ⇒ 总槽位小幅上升，`DDGI_ATLAS_LAYERS`
+/// 需同步放大。容量/预算不变量由 `ddgi_worklist_pack_covers_atlas_capacity` /
+/// `chunk_lod0_atlas_capacity` / `vram_layout_budget_2gb` 守着。
 pub const DDGI_GRID_MARGIN: i32 = 16;
 // 槽位映射是**世界锚定**的：shader 里 `slot = slot_base + (世界 cell 号 mod dims)`（见
 // `ddgi_slot`）。因此「槽位 ↔ 世界 cell」的身份与相机无关 —— 相机滚动只会让「新进入窗口的
 // 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份，图集不会因相机
-// 移动而整体失效。旧版槽位是「相对相机窗口的格号」，滚一格就把整级所有槽位的世界 cell
-// 全换掉 → 整级图集变成旧位置的读数 → 深度判定成片失败（Probe 大片红）+ 下一帧重写
-// （大片绿），即「相机移动时的 GI 闪烁」。前提：`from_camera` 的原点必须是 cell 整数倍。
+// 移动而整体失效。前提：原点必须是 cell 整数倍。
 
 // ---- LOD0 的 chunk 锚定（其它 LOD 保持上面的世界 AABB 规则网格）----
 //
-// LOD0 不再铺「一整个世界 AABB 的规则网格」，而是**按 chunk 拥有**：世界体素卷按
+// LOD0 不铺「一整个世界 AABB 的规则网格」，而是**按 chunk 拥有**：世界体素卷按
 // `DDGI_CHUNK_VOXELS`(256³) 切成 chunk，每个「需要探针」的 chunk 从探针池里领一段**固定
 // 大小**的 LOD0 槽位（4096 = (256/16)³），chunk 内的 cell 编址为 chunk 局部：
 //     slot = chunk_base[chunk] + local_cell_linear（局部 cell 索引，见 `DDGI_CHUNK_LOD0_AXIS`）
-// 探针世界位置 = chunk 世界原点 + 局部 cell 中心 —— **相对世界固定**（与旧实现一致），
-// 所以「相机移动不闪」这条不变式不受影响。
+// 探针世界位置 = chunk 世界原点 + 局部 cell 中心 —— **相对世界固定**，故「相机移动不闪」不受影响。
 //
 // 边界与不变量（务必与 WGSL 的 `ddgi_slot_own`/`ddgi_slot_world_cell` 对照）：
-//   · **只服务 LOD0**。LOD1~3 仍由 `DdgiWorldGrid::from_world` 的规则网格提供（滚动频率低、
-//     伪影不明显），槽位基址排在 LOD0 段之后。
+//   · **只服务 LOD0**。LOD1~3 仍由 `DdgiWorldGrid::from_world` 的规则网格提供，槽位基址排在
+//     LOD0 段之后。
 //   · chunk 段的基址**一旦分配就不再改变**（只有 chunk 被释放才归还进空闲链表）。基址一变，
-//     该 chunk 全部探针就会换槽位 → 图集整段错位 → 与「世界锚定」同样的闪烁。
-//   · 池是**高水位**定容的：`lod0_slots = next_base`，空闲段的空洞同样占槽位（无流式加载时
-//     没有释放，等价于紧凑分配）。
+//     该 chunk 全部探针就会换槽位 → 图集整段错位 → 闪烁。
+//   · 池是**高水位**定容的：`lod0_slots = next_base`，空闲段的空洞同样占槽位。
 /// chunk 边长（voxel）：世界体素卷按它切块（= 引擎自己的 brick chunk 粒度）。
 pub const DDGI_CHUNK_VOXELS: i32 = 256;
 /// 每 chunk 每轴含多少个 LOD0 cell：256 / 16 = 16。
@@ -185,13 +156,11 @@ impl DdgiChunkGeom {
 
 /// LOD0 探针池：chunk → 段基址（段大小恒为 `DDGI_CHUNK_LOD0_SLOTS`），配一个空闲链表。
 ///
-/// 【为什么要有池】现在没有 chunk 流式加载（见 `vox_scene`：整个 nuke.vox 一次性载入），
-/// 所以这条路的收益是**内容驱动的内存节省** —— 只有「有几何」（或紧邻几何）的 chunk 才领段，
-/// 空 chunk 不占 LOD0 槽位；池 + 空闲链表是为将来接流式（chunk 卸载时归还段）预留的接口。
+/// 只有「有几何」（或紧邻几何）的 chunk 才领段，空 chunk 不占 LOD0 槽位；池 + 空闲链表也是
+/// 将来接 chunk 流式加载（卸载时归还段）的接口。
 ///
-/// 【为什么不重排基址】`sync` 只做「新 chunk 领段、消失的 chunk 归还」，**已有 chunk 的基址
-/// 保持不变** —— 这是「移动/编辑不闪」的前提（基址变了 = 该 chunk 全部探针换槽位，图集里
-/// 还是旧位置的值 → 误差被放大）。
+/// `sync` 只做「新 chunk 领段、消失的 chunk 归还」，**已有 chunk 的基址保持不变** —— 这是
+/// 「移动/编辑不闪」的前提（基址变了 = 该 chunk 全部探针换槽位，图集里还是旧位置的值）。
 #[derive(Clone, Debug, Default)]
 pub struct DdgiChunkPool {
   pub geom: DdgiChunkGeom,
@@ -265,10 +234,9 @@ pub struct DdgiChunkUniform {
 
 /// 主世界算出的「LOD0 需要探针段的 chunk」集合（chunk 坐标，由主世界体素内容决定）。
 ///
-/// 判定规则（内容驱动，见任务点 4）：chunk 自己有几何，**或**它的邻域（cell 粒度）内有几何
-/// —— 后者保证「贴着几何表面的采样者，其 8 个插值角格能拿到探针」：采样者的角格最多跨到
-/// 相邻 cell，而相邻 cell 若落在邻 chunk，就必须给那个 chunk 也分配段，否则那 4 个角会凭空
-/// 缺失（在 chunk 边界上留下可见接缝）。
+/// 判定规则：chunk 自己有几何，**或**它的邻域（cell 粒度）内有几何 —— 后者保证「贴着几何
+/// 表面的采样者，其 8 个插值角格能拿到探针」：采样者的角格最多跨到相邻 cell，而相邻 cell 若
+/// 落在邻 chunk，就必须给那个 chunk 也分配段，否则那 4 个角会凭空缺失（chunk 边界留接缝）。
 #[derive(bevy::ecs::resource::Resource, Clone, Debug, Default, PartialEq)]
 pub struct DdgiLod0Chunks {
   /// 需要 LOD0 段的 chunk 坐标（世界体素坐标 / 256）。
@@ -308,22 +276,17 @@ impl DdgiWorldGrid {
     DDGI_LOD_CELL_SIZES[lod]
   }
 
-  /// 由**世界 AABB** 推导 4 级嵌套级联 —— 四级**全部锚定世界**，相机完全不参与。
+  /// 由**世界 AABB** 推导 4 级嵌套级联 —— 四级**全部锚定世界**，相机完全不参与（相机移动不
+  /// 改变任何一级的原点 → 结构上不存在"槽位换主"，也就没有移动时的 GI 闪烁）。
   ///
-  /// 【为什么这样】Douglas Devlog #23 的 DDGI 在相机移动时**绝不闪烁**，因为他的网格
-  /// **不随相机变**；而"相机中心窗口"一滚就换主（槽位 `mod dims` 复用）→ 整圈探针换主
-  /// → 移动时闪（本会话实测多轮）。四级都锚定世界后，相机移动**不改变任何一级的原点**
-  /// → 结构上不存在"换主"。
+  /// dims = ceil(世界跨度 / cell)：cell 逐级 ×2、AABB 相同 ⇒ dims 逐级减半 ⇒ LOD(l-1) 盒严格
+  /// 包含于 LOD(l) 盒内（嵌套不变式）。
   ///
-  /// 【dims 按世界算】每级 dims = ceil(世界跨度 / cell)。cell 逐级 ×2、AABB 相同 ⇒
-  /// dims 逐级减半 ⇒ LOD(l-1) 盒严格包含于 LOD(l) 盒内（嵌套不变式）。
+  /// 细级按世界算有 ~33 万个 cell（cell=16），但绝大多数是纯空气 → `near` 判定为假 → 不进
+  /// worklist → **不参与 cast/collect**。代价只在图集容量和 `sort`（每帧扫全槽位）。
   ///
-  /// 【稀疏性从哪来】细级按世界算有 ~33 万个 cell（cell=16），但绝大多数是纯空气 →
-  /// `near` 判定为假 → 不进 worklist → **不参与 cast/collect**。代价只在图集容量
-  /// （409600 槽 ≈ 240MB）和 `sort`（每帧扫全槽位，+0.2ms）。
-  ///
-  /// 【原点对齐】按 cell 向下对齐，保证 shader 里「世界 cell 号 = (p - origin) / cell」
-  /// 精确整除 —— 世界锚定的槽位映射（`slot = base + 世界 cell mod dims`）才成立。
+  /// 原点按 cell 向下对齐，保证 shader 里「世界 cell 号 = (p - origin) / cell」精确整除 ——
+  /// 世界锚定的槽位映射（`slot = base + 世界 cell mod dims`）才成立。
   pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
     // 先向外扩 DDGI_GRID_MARGIN（原因见该常量的推导）。**只扩网格**：`DdgiChunkGeom` 仍按真实
     // AABB 算，所以 LOD0 的 chunk 段数量与分配完全不变。
@@ -426,9 +389,7 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
       // 3：烘焙输出（bake 写 / sort 读）4：age/flags（读写）5：indirect/counter（读写）
       // 6：worklist（读写）7：slot_pos（读写）8：cell_id（读写，滚动增量）
       // 9：cast 射线样本（cast 写 / collect 读）
-      // 10：LOD0 的两张 chunk 表 + 一段无读者的保留前缀（读写；见 `DdgiGpu::cell_slot`）。
-      //     旧「cell → slot 借针间接表」曾用前段做"无针 cell 指向邻近探针"，该机制已删除；
-      //     前段保留为 identity 仅为保持两张 chunk 表的偏移不变。
+      // 10：LOD0 的两张 chunk 表 + 使用计数前缀（读写；见 `DdgiGpu::cell_slot`）。
       buf(3, false),
       buf(4, false),
       buf(5, false),
@@ -460,9 +421,8 @@ pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
     "DdgiBg5",
     &[
       store(0, TextureFormat::Rgba16Float),
-      // depth 图集也从单通道升到 Rgba16Float：.x = mean、.y = std（距离标准差），
-      // 供采样侧做 Chebyshev 软遮挡（参考 Majercik/RTXGI）。R32Float 只有均值，
-      // 只能做刀锋判定 → 深度一抖就"入选/落选"翻转（亮区边界伸缩）。
+      // depth 图集用 Rgba16Float：.x = mean、.y = std（距离标准差），供采样侧做 Chebyshev
+      // 软遮挡。R32Float 只有均值，只能做刀锋判定 → 深度一抖就"入选/落选"翻转（亮区边界伸缩）。
       store(1, TextureFormat::Rgba16Float),
     ],
   )
@@ -519,13 +479,9 @@ pub struct DdgiGpu {
   pub slot_pos: bevy::render::render_resource::Buffer,
   /// LOD0 chunk 段的两张表（复用一张 u32 数组，见 WGSL binding(10) 注释）。
   ///
-  /// 【旧的「cell → slot 借针间接表」已删】它曾让"本格放不出探针"的 cell 指向邻近探针。
-  /// 放置规则改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，重定向不再
-  /// 需要。前段 `[0, total_slots)` 因此**没有任何读者**，但仍在下面按 identity 铺一遍 ——
-  /// 只为保持两张 chunk 表的偏移（由 WGSL 的 `misc.y` = total_slots 算出）不变。
-  ///
   /// 【buffer 布局】BG4 的 storage binding 已经用满 8 个（WebGPU/WGSL 下限），所以尾部复用：
-  ///   [0, total_slots)                          —— 保留前缀（identity，无读者）
+  ///   [0, total_slots)                          —— 使用计数（每 slot 的屏幕使用漏桶，着色侧 +1、
+  ///                                                `ddgi_sort` 每帧 -1）
   ///   [total_slots, +num_chunks)                —— chunk_base：chunk 线性下标 → LOD0 段基址
   ///   [total_slots+num_chunks, +lod0_slots)     —— slot_chunk：LOD0 局部槽位 → 所属 chunk 线性下标
   /// 三个区间的偏移在 WGSL 里由 `misc.y`(=total_slots) 与 chunk 维度算出。
@@ -591,11 +547,9 @@ impl DdgiStage {
   pub fn new(v: u8) -> Self {
     Self(v.min(Self::FULL))
   }
-  /// `GATE_DDGI_STAGE=0..3` 覆盖启动阶段（与 GATE_NO_LOD / GATE_SKIP_CHUNKWALK 同风格）。
+  /// `GATE_DDGI_STAGE=0..3` 覆盖启动阶段。
   ///
-  /// **缺省 = FULL(3)**：DDGI 已稳定，默认开启（用户明确要求）。曾经缺省 Off、只能靠 UI
-  /// 滑杆打开，`GATE_BENCH=1` 的无 UI 跑法因此拿不到 Full 的帧时数据 —— 现在反过来：
-  /// 需要基准对比「DDGI=Off」时显式 `GATE_DDGI_STAGE=0`。
+  /// **缺省 = FULL(3)**（DDGI 默认开启）；需要基准对比「DDGI=Off」时显式 `GATE_DDGI_STAGE=0`。
   fn from_env() -> Self {
     Self::new(
       std::env::var("GATE_DDGI_STAGE")
@@ -618,9 +572,8 @@ impl DdgiStage {
 
 /// 已加载世界的 AABB（voxel 坐标，闭区间）。
 ///
-/// DDGI 的 4 级网格**全部锚定到它**（见 `DdgiWorldGrid::from_world`）—— 相机移动时
-/// 任何一级的原点都**不变**，从根上消除"槽位换主"（相机滚动 → 槽位 `mod dims` 复用 →
-/// 整圈探针换主 → 移动时闪）。这正是 Douglas 的 DDGI 移动时不闪的原因：他的网格不随相机变。
+/// DDGI 的 4 级网格**全部锚定到它**（见 `DdgiWorldGrid::from_world`）—— 相机移动时任何一级的
+/// 原点都**不变**，从根上消除"槽位换主"导致的 GI 闪烁。
 ///
 /// 由主世界算出（`vox_scene` 的 AABB）并 extract 到 render world；未设置时取单位盒
 /// （退化为 1×1×1 格，不会 panic）。
@@ -648,12 +601,10 @@ pub struct DdgiDebugSettings {
   /// Chebyshev 里 **std 项的信任系数**，对应 WGSL `misc.z`（0..1，默认 1 = 正常使用 std）。
   ///
   /// 拖到 0 = 完全忽略 std，`soft` 退回固定下限 `DDGI_DEPTH_SOFT_MIN`（硬判定：更能压漏光，
-  /// 但过渡带变窄、动态时更易闪）。保留作 A/B 诊断用。
+  /// 但过渡带变窄、动态时更易闪）。保留作诊断用。
   ///
-  /// 注：该系数最初是为确认一个已修复的缺陷而加 —— 射线方向当时是「Fibonacci 球 + 每帧
-  /// 随机四元数整体重旋」，每个深度纹素跨帧收到的是全球随机方向，`std` 度量的是「20° 锥内
-  /// 几何起伏」而非「同方向噪声」，墙角虚高 → 软漏光。现在射线已**绑定到深度纹素**（见
-  /// shaders/voxel_raytrace/ 的 cast「射线 ↔ 深度纹素绑定」），std 语义已正确。
+  /// 前提：射线方向已**绑定到深度纹素**（见 shaders/voxel_raytrace/ 的 cast）—— 此时 `std`
+  /// 度量的是「20° 锥内几何起伏」而非「每帧全球随机方向的噪声」。
   pub depth_soft_k: f32,
   /// 级联覆盖**之外**的天光兜底强度，对应 WGSL `misc.w`（0..1，默认 0.25）。
   ///
@@ -800,15 +751,13 @@ fn ddgi_array_view(
 /// 图集容量（可寻址探针槽位上限）与射线样本缓冲的说明。
 ///
 /// 【容量从哪来】`DDGI_ATLAS_LAYERS × DDGI_PROBES_PER_LAYER_AXIS²` —— 两个量都是 WESL 侧的
-/// 权威值（见 `consts.wesl`），这里只经 `wesl_consts::ddgi_consts()` 读取。当前 40×40×256
-/// = **409600**：nuke.vox 下总槽位 = LOD0 池高水位（86 chunk × 4096 = 352256）+ LOD1~3
-/// （44640 + 5760 + 800）= **403456**，余量只剩 6144。**余量很薄**：世界再大一点、或 LOD0
-/// 多领几个 chunk 段就会越界。
+/// 权威值（见 `consts.wesl`），这里只经 `wesl_consts::ddgi_consts()` 读取。当前 409600 槽，
+/// nuke.vox 下 total_slots = 403456，余量只剩 6144，世界再大一点或 LOD0 多领几个 chunk 段
+/// 就会越界。
 ///
-/// ⚠️ 池 / `from_world` **都不做钳制**：超出容量会静默越界写图集。约束由测试守着 ——
-/// `world_grid_layout_and_atlas_capacity`（旧规则网格）与 `chunk_lod0_atlas_capacity`
-/// （新 chunk 池 + LOD1~3）断言实际场景的 total_slots ≤ 容量，`wesl_consts` 的单测断言
-/// 容量装得进 worklist 的 cell 下标位宽。
+/// 池 / `from_world` **都不做钳制**：超出容量会静默越界写图集。约束由测试守着 ——
+/// `world_grid_layout_and_atlas_capacity` 与 `chunk_lod0_atlas_capacity` 断言实际场景的
+/// total_slots ≤ 容量，`wesl_consts` 的单测断言容量装得进 worklist 的 cell 下标位宽。
 ///
 /// 【样本缓冲容量】每样本 2×vec4 = (方向.xyz, 命中距离) + (辐亮度.xyz, 1)，下标 = 全局射线
 /// 编号（`ddgi_cast` 的 `si = tid * 2`）。容量**不是** `ray_budget`：seal 的
@@ -1064,9 +1013,9 @@ fn dispatch_ddgi(
   // 同一 pass 内没有顺序保证，只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
   if bake.is_some_and(|b| b.0) {
     let n_lods = DDGI_LODS as usize;
-    // 每级的 dispatch 大小按**该级实际槽数**算 —— LOD1~3 的 dims 随世界 AABB 变化（不再固定
-    // 32×16×32），LOD0 的槽数则是探针池的高水位（chunk 段之和，不等于空间盒 dims 乘积）。
-    // 写死/用 dims 乘积都会让烘焙只覆盖一部分 cell，症状是"大部分区域无 GI"（且无报错）。
+    // 每级的 dispatch 大小按**该级实际槽数**算 —— LOD0 的槽数是探针池高水位（chunk 段之和，
+    // 不等于空间盒 dims 乘积），LOD1~3 是 dims 乘积。写死/用 dims 乘积都会让烘焙只覆盖一部分
+    // cell，症状是"大部分区域无 GI"（且无报错）。
     let lod0_slots = gpu.grid.lod_slot_base[1];
     let wg_per_lod: [u32; DDGI_LODS as usize] = std::array::from_fn(|lod| {
       let n = if lod == 0 {
@@ -1216,10 +1165,9 @@ fn prepare_ddgi(
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
   // ---- 网格推导 ----
-  // LOD1~3 仍**全部锚定世界 AABB**（相机移动不改变原点 → 不换主 → 不闪）。
+  // LOD1~3 **全部锚定世界 AABB**（相机移动不改变原点 → 不换主 → 不闪）。
   // LOD0 换成 **chunk 锚定**：由 `DdgiChunkPool` 从探针池给「需要探针的 chunk」分配固定
-  // 4096 槽的段；只有分配到的段才占 LOD0 槽位（内容驱动）。两种网格的边界见 `DdgiChunkGeom`
-  // 与 `DdgiChunkPool` 的注释；槽位段顺序恒为 LOD0（池）→ LOD1 → LOD2 → LOD3。
+  // 4096 槽的段（内容驱动）。槽位段顺序恒为 LOD0（池）→ LOD1 → LOD2 → LOD3。
   let base_grid = DdgiWorldGrid::from_world(world.min, world.max);
   let chunk_geom = DdgiChunkGeom::from_world(world.min, world.max);
   let lod0_chunks = lod0_chunks.map_or_else(Vec::new, |c| c.chunks.clone());
@@ -1297,7 +1245,7 @@ fn prepare_ddgi(
   // （bake 用 uniform 里的脏区 AABB 跳过 cell_id 键检查，不再整块清缓存）。
   // `gpu.bake_pending` 让请求**黏住**：本帧若因 pipeline 未编译好而没真正派发（见
   // dispatch_ddgi 的提前返回），下一帧仍会重试，而不是被「已推进的 grid/last_revision」
-  // 悄悄吞掉（症状：启动时就打开 DDGI → 一次也不烘焙 → cast/collect 恒为 0.02ms）。
+  // 悄悄吞掉（症状：启动时就打开 DDGI → 一次也不烘焙 → 整级图集恒空）。
   let need_bake = (grid_changed || rev_changed || gpu.bake_pending) && total > 0 && will_run;
   gpu.bake_pending = need_bake;
 
@@ -1320,19 +1268,17 @@ fn prepare_ddgi(
   ensure_storage_buffer(&device, &queue, &mut gpu.slot_pos, "ddgi_slot_pos", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.worklist, "ddgi_worklist", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.cell_id, "ddgi_cell_id", s * 16);
-  // `cell_slot`：LOD0 的两张 chunk 表 + 一段无读者的保留前缀（见 `DdgiGpu::cell_slot` 注释）。
-  //   [0, total_slots)                        保留前缀（identity，旧借针间接表；已无读者）
+  // `cell_slot`：使用计数前缀 + LOD0 的两张 chunk 表（见 `DdgiGpu::cell_slot` 注释）。
+  //   [0, total_slots)                        使用计数（着色侧 +1 / `ddgi_sort` 每帧 -1）
   //   [total_slots, +num_chunks)              chunk_base（未分配 = DDGI_CHUNK_NO_BASE 哨兵）
   //   [total_slots+num_chunks, +lod0_slots)   slot_chunk（LOD0 局部槽 → chunk 线性下标）
   // 构建键（total / chunk 数 / LOD0 槽数 / 池 serial）变了才重建 —— 内容尺寸变化、或池发生了
-  // 「领段/归还」都要重铺。前缀 `[0, total)` 是**每槽位的「屏幕使用」漏桶计数**（着色侧 +1、
-  // `ddgi_sort` 每帧 -1，见 WGSL `ddgi_usage_mark` / `DDGI_USAGE_STICKY`）→ 必须清零。
+  // 「领段/归还」都要重铺。
   let key = (total, num_chunks, lod0_slots, gpu.pool.serial);
   if gpu.cell_slot_key != Some(key) {
     let words = (total + num_chunks + lod0_slots) as usize;
     let mut buf: Vec<u8> = Vec::with_capacity(words * 4);
-    // 计数前缀归零（旧实现铺 identity 只为了占位，现在这段有读者了：非零值会让工作集立刻
-    // 退化回"全体活跃探针"，等于没优化）。
+    // 计数前缀必须归零（非零值会让工作集立刻退化回"全体活跃探针"，等于没优化）。
     buf.resize(total as usize * 4, 0);
     for l in 0..num_chunks {
       let b = gpu.pool.bases[l as usize];
@@ -1375,7 +1321,7 @@ fn prepare_ddgi(
       dims: UVec4::new(d.x, d.y, d.z, gpu.grid.lod_slot_base[lod]),
     };
   }
-  // params: x=frame, y=debug mode, z=gain, w=保留通道（旧借针半径，机制已删除），恒 0
+  // params: x=frame, y=debug mode, z=gain, w=保留通道，恒 0
   u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, 0.0);
   u.misc = Vec4::new(
     if stage.shade_gi() { 1.0 } else { 0.0 },
@@ -1512,7 +1458,7 @@ mod tests {
 
   #[test]
   fn world_grid_layout_and_atlas_capacity() {
-    // nuke.vox 的 AABB 量级（来自启动日志 aabb=[[-454,16,-56]]-[[1478,631,1080]]）
+    // nuke.vox 的 AABB
     let lo = IVec3::new(-454, 16, -56);
     let hi = IVec3::new(1478, 631, 1080);
     let g = DdgiWorldGrid::from_world(lo, hi);
@@ -1537,7 +1483,7 @@ mod tests {
   /// 世界锚定的槽位映射：**同一世界 cell 的槽位与相机无关**。
   ///
   /// 这是"移动时不闪"的根据 —— `from_world` 的签名里**根本没有相机参数**，网格是只依赖
-  /// 世界 AABB 的纯函数。将来若有人把相机重新引入网格推导，这条会立刻失败。
+  /// 世界 AABB 的纯函数。若把相机重新引入网格推导，这条会立刻失败。
   #[test]
   fn world_cell_slot_is_camera_independent() {
     let slot_of = |g: &DdgiWorldGrid, lod: usize, wc: IVec3| -> u32 {
@@ -1585,7 +1531,7 @@ mod tests {
   fn chunk_pool_segments_are_disjoint_and_stable() {
     let geom = DdgiChunkGeom::from_world(IVec3::new(-454, 16, -56), IVec3::new(1478, 631, 1080));
     let mut pool = DdgiChunkPool::default();
-    // 86 个 chunk（nuke.vox 实测：内容 82 ∪ 边界邻域 4）
+    // 86 个 chunk（nuke.vox：内容 82 ∪ 边界邻域 4）
     let wanted: Vec<IVec3> = (0..86).map(|i| geom.coord(i * 5 + 3)).collect();
     assert!(pool.sync(geom, &wanted));
     assert_eq!(pool.lod0_slots(), 86 * DDGI_CHUNK_LOD0_SLOTS);
@@ -1652,16 +1598,16 @@ mod tests {
   // ==========================================================================
   // 探针放置规则的镜像测试（Douglas #23）
   // ==========================================================================
-  // 把 shaders/voxel_raytrace/ 的 `ddgi_place_probe`（新）与"改造前"的净距硬门槛（旧）各镜像一遍，
-  // 在合成 16³ 体素图案上统计"格内还有空体素、却放不出探针"的格数。
+  // 把 shaders/voxel_raytrace/ 的 `ddgi_place_probe`（现行规则）与净距硬门槛（对照规则）各镜像
+  // 一遍，在合成 16³ 体素图案上统计"格内还有空体素、却放不出探针"的格数。
   //
-  // 镜像方式（逐条对应 WGSL，只取 LOD0 的自放置部分；LOD1~3 的"继承细级"不影响本对比）：
+  // 镜像方式（逐条对应 WGSL，只取 LOD0 的自放置部分）：
   //   · 占用 = 一个 16³ 布尔数组（true = 固体，越界按空气）。
-  //   · 新规则：从大到小 [16,8,4,1] 找**完全空**的对齐子块，第一个命中的层级胜出，
+  //   · 现行规则：从大到小 [16,8,4,1] 找**完全空**的对齐子块，第一个命中的层级胜出，
   //     同级并列取子块中心离 cell 中心 (8,8,8) 最近者。
-  //   · 旧规则（已删的 `DDGI_PROBE_MIN_CLEARANCE`）：16³ 那一级要求整格全空；否则只在 4³ 级里
-  //     找"中心到最近固体 6 向轴向净距 ≥ 4 体素"的空块（取最近中心者）；4³ 级全被拒时退到
-  //     1³（`ddgi_leaf16`），同样过净距 → 贴几何的空腔因此放不出探针。
+  //   · 对照规则（净距硬门槛）：16³ 那一级要求整格全空；否则只在 4³ 级里找"中心到最近固体
+  //     6 向轴向净距 ≥ 4 体素"的空块（取最近中心者）；4³ 级全被拒时退到 1³，同样过净距
+  //     → 贴几何的空腔因此放不出探针。
 
   /// 16³ cell 占用：[z][y][x]，越界按空气。
   type Cell16 = [[[bool; 16]; 16]; 16];
@@ -1686,7 +1632,7 @@ mod tests {
     true
   }
 
-  /// 6 向轴向净距（体素），镜像旧 `ddgi_axis_clearance`（越界即停，最多 8 步）。
+  /// 6 向轴向净距（体素），对照规则的判定用（越界即停，最多 8 步）。
   fn clear6(o: &Cell16, p: [i32; 3]) -> i32 {
     let dirs = [
       [1, 0, 0],
@@ -1733,7 +1679,7 @@ mod tests {
     best.map(|(p, _)| p)
   }
 
-  /// 新规则（Douglas #23）：层级 16³ → 8³ → 4³ → 1³，第一个含全空子块的层级胜出。
+  /// 现行规则（Douglas #23）：层级 16³ → 8³ → 4³ → 1³，第一个含全空子块的层级胜出。
   fn place_new(o: &Cell16) -> Option<[f32; 3]> {
     if block_empty(o, [0, 0, 0], 16) {
       return Some([8.0, 8.0, 8.0]); // 全空 cell → 正中
@@ -1746,8 +1692,8 @@ mod tests {
     nearest_empty_center(o, 1) // 1³ 保底：只要格内有空体素就一定放得出探针
   }
 
-  /// 旧规则（已删的净距硬门槛）：整格全空 → 居中；否则 4³ 候选须净距 ≥ 4；
-  /// 4³ 级无合格者时退到 1³（`ddgi_leaf16`：只有在**没有空 4³** 时才会下探 1³）。
+  /// 对照规则（净距硬门槛）：整格全空 → 居中；否则 4³ 候选须净距 ≥ 4；
+  /// 4³ 级无合格者时退到 1³（只有在**没有空 4³** 时才会下探 1³）。
   fn place_old(o: &Cell16) -> Option<[f32; 3]> {
     if block_empty(o, [0, 0, 0], 16) {
       return Some([8.0, 8.0, 8.0]);

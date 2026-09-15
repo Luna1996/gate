@@ -1,7 +1,6 @@
 //! list：固定容量环形列表（新条目顶替最旧条目）。
 //!
-//! v0 不做滚动裁剪（OQ-1 结论随 review 记录）：容量固定 + 同步重建子标签。
-//! 逻辑（环形顶替）纯数据可 headless 单测；渲染同步用 change 检测只在脏时重建。
+//! 不做滚动裁剪：容量固定 + 同步重建子标签；渲染同步用 change 检测，只在脏时重建。
 
 use std::collections::VecDeque;
 use std::ops::Deref;

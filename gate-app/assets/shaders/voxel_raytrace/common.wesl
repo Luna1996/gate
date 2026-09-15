@@ -12,11 +12,9 @@ const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
 const TREE_BASE: u32 = 262144u;          // Region ② 起始
 
 
-// P2：方向位掩码 LUT。射线方向符号编码为 3-bit 掩码（bit0=x>=0, bit1=y>=0,
-// bit2=z>=0，共 8 种），查表一次性得到 side（boundary 计算用）和三轴步进 face id，
-// 消除 trace_chunk/trace_grid 热循环内的 select(vec3(0),vec3(1),sign>=0) 与
-// select(0u,1u,sign<0) 等运行时方向分支。打包：bits0-2=side, bits8-15=face_x,
-// bits16-23=face_y, bits24-31=face_z。face 规则：sign<0 穿对面（x→1, y→3, z→5）。
+// 方向位掩码 LUT：3-bit 掩码（bit0=x>=0, bit1=y>=0, bit2=z>=0，共 8 种）→ side（boundary 计算用）
+// 与三轴步进 face id。打包：bits0-2=side, bits8-15=face_x, bits16-23=face_y, bits24-31=face_z；
+// face 规则：sign<0 穿对面（x→1, y→3, z→5）。
 const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
   0x05030100u, // dir=0 (-,-,-): side=(0,0,0), face=(1,3,5)
   0x05030001u, // dir=1 (+,-,-): side=(1,0,0), face=(0,3,5)
@@ -28,7 +26,7 @@ const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
   0x04020007u, // dir=7 (+,+,+): side=(1,1,1), face=(0,2,4)
 );
 
-// ---- Pure face math helpers (no hashmap dependency) ----
+// ---- face 索引（0..5 = -x,+x,-y,+y,-z,+z）与法线/诊断色的转换 ----
 fn face_index_from_normal(n: vec3<f32>) -> u32 {
   let ax = abs(n.x); let ay = abs(n.y); let az = abs(n.z);
   if (ax >= max(ay, az)) { return select(0u, 1u, n.x >= 0.0); }
@@ -81,14 +79,14 @@ fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   return srgb_to_linear(srgb);
 }
 
-/// palette 条目的自发光强度（0..1）。word1 低字节（wire.rs `pack_palette_entry` 同布局）。
-/// 发光体素是这个世界的**光源本体**：着色时 radiance 直出，不吃方向/阴影（见 lighting.rs 注释）。
+/// palette 条目的自发光强度（0..1），= word1 低字节（wire.rs `pack_palette_entry` 同布局）。
+/// 发光体素是光源本体：着色时 radiance 直出，不吃方向/阴影。
 fn palette_emissive(palette_base: u32, pal: u32) -> f32 {
   return f32(b_palette[palette_base + pal * 2u + 1u] & 0xFFu) / 255.0;
 }
 
-// 天空纯色（miss 像素输出 + 探针射线 miss 端点；Minecraft 白天平原 #78A7FF）
-// sRGB → linear（与 palette_albedo 同空间；光照全程 linear，输出经 linear_to_srgb 还原）
+// 天空纯色（miss 像素与探针射线 miss 端点共用；Minecraft 白天平原 #78A7FF）。
+// 输入为 sRGB，返回 linear（光照全程 linear，输出经 linear_to_srgb 还原）。
 fn sky_rgb() -> vec3<f32> {
   return srgb_to_linear(light_u.sky_color.xyz);
 }

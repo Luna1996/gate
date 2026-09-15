@@ -1,22 +1,10 @@
-//! WESL **跨端常量**的单一来源：权威值只写在 `.wesl` 里，Rust 启动时读同一份源码解析出来。
+//! WESL **跨端常量**的单一来源：权威值只写在 `.wesl` 里，Rust 启动时解析同一份源码。
 //!
-//! 【为什么需要】图集尺寸、层内探针轴、LOD 级数、射线预算、`ddgi_indirect` 的 word 布局
-//! 这些量**两侧都要知道**：WESL 侧按它们寻址 / 分配线程，Rust 侧按它们 `create_texture` /
-//! `create_buffer` / 算字节偏移。两处各写一份就会漂移，而漂移**没有任何编译或运行时报错**：
-//!   · `DDGI_PROBES_PER_LAYER_AXIS` 一边 40 一边 16 → 写进图集的探针读不回来（大面积无 GI）；
-//!   · `DDGI_RAY_BUDGET` 一边 131072 一边 65536 → rpp 静默减半（每探针样本减半、噪声变大）。
-//! 历史上这两次都真出现过，靠人的注释"必须与另一边一致"是守不住的。
-//!
-//! 【以 WESL 为准】Rust 侧不再声明这些值，改为解析 WESL 包源码里的 `const NAME: u32 = ...;`。
-//! 与 [`crate::shader::compile_dda_wesl`] 共用 `DDA_WESL_DIR`，所以改 `.wesl` 仍是"重启即生效"
-//! （不需要 cargo 重编译），也不存在"读的和编译的不是同一份"的窗口。
-//! 解析失败 / 缺失 → `error!` + `panic!`（与 WESL 编译失败同一策略：fail fast，绝不静默
-//! 拿错值去分配显存）。
-//!
-//! 【哪些量**不**在这里】只在 Rust 侧使用、WESL 从 uniform 读的（LOD cell 边长、chunk 边长、
-//! LOD0 段大小……）：权威在 Rust，WESL 只是消费者，不存在双声明。
-//! 例外是 `DDGI_LODS`：它要定 `[T; N]` 数组与 `ShaderType` 布局的长度，编译期常量无法来自
-//! 运行期解析 —— 故仍在 Rust 声明，由 [`ddgi_consts`] 在启动时与 `DDGI_LOD_COUNT` 断言一致。
+//! 图集尺寸 / LOD 级数 / 射线预算 / `ddgi_indirect` 的 word 布局两侧都要知道（WESL 按它们
+//! 寻址、分配线程，Rust 按它们 `create_texture` / `create_buffer` / 算字节偏移），各写一份
+//! 就会静默漂移且无任何编译或运行时报错。解析失败 / 常量缺失 → `error!` + `panic!`。
+//! 与 [`crate::shader::compile_dda_wesl`] 共用 `DDA_WESL_DIR`，改 `.wesl` 重启 app 即生效。
+//! 例外：`DDGI_LODS` 要定 `[T; N]` 数组与 `ShaderType` 布局长度，仍在 Rust 声明并断言一致。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

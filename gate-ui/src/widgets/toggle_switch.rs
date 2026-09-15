@@ -2,9 +2,8 @@
 //!
 //! 复用 `Checked` presence 语义（与 checkbox 一致）：有 `Checked` = 开，无 = 关。
 //!
-//! 视觉：32×16 轨道（圆角 sm）+ 12×12 方形滑块（absolute，左 = 关 / 右 = 开）：
-//! - 关：轨道 = 抬升表面 + 边框（hover 边框提亮），滑块 = 说明文字灰
-//! - 开：轨道 = 强调填充，滑块 = 主文本色（强调填充上的最高对比）
+//! 视觉：32×16 轨道（圆角 sm）+ 方形滑块（absolute，左 = 关 / 右 = 开）：关 = 抬升表面 +
+//! 边框（hover 边框提亮）+ 说明文字灰滑块；开 = 强调填充 + 主文本色滑块。
 
 use std::ops::Deref;
 
@@ -28,7 +27,7 @@ pub struct ToggleTrack;
 #[derive(Component, Debug, Default)]
 pub struct ToggleKnob;
 
-/// 轨道尺寸（px）
+/// 轨道尺寸（px）；滑块边长 = TRACK_H - 2×border_width
 const TRACK_W: f32 = 32.0;
 const TRACK_H: f32 = 16.0;
 

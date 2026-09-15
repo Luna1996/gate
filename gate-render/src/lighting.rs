@@ -1,16 +1,10 @@
-//! 光源 wire 契约 + 数据驱动主题。
+//! 光源 wire 契约 + 数据驱动主题：方向光硬阴影（命中点向太阳投 1 条射线，不通即阴影）+ sky
+//! 纯色环境光（Minecraft 白天天空蓝 #78A7FF）+ 发光体素 radiance 直出（albedo × emissive，
+//! 无方向性、不受阴影）；无点光源、无 Phong 高光、无软阴影锥采样。光照数学全部在 GPU
+//! （shaders/voxel_raytrace/），CPU 侧只做数据打包，不做任何光照计算。
 //!
-//! 严格对齐 Douglas Dwyer devlog #02 / #19 方案：
-//! - 方向光硬阴影（命中点向太阳投 1 条射线，不通即阴影）
-//! - sky 纯色环境光（Minecraft 白天天空蓝 #78A7FF）
-//! - 发光体素：radiance 直出（albedo × emissive，无方向性、不受阴影）
-//! - 无点光源、无 Phong 高光、无软阴影锥采样
-//!
-//! 光照数学全部在 GPU（shaders/voxel_raytrace/）；CPU 侧只做数据打包，不做任何光照计算。
-//!
-//! Uniform 布局（WGSL `LightPool` 逐字段镜像）：
-//!   LightGlobals(48B) + 8×LightDesc(384B) + sky_color(16B) = 448B
-//!   当前只填 lights[0] = 方向光；其余槽保留为 0 供未来扩展。
+//! Uniform 布局（WGSL `LightPool` 逐字段镜像）：LightGlobals(48B) + 8×LightDesc(384B) +
+//! sky_color(16B) = 448B；当前只填 lights[0] = 方向光，其余槽保留为 0。
 
 use bevy::ecs::resource::Resource;
 use bevy::render::render_resource::ShaderType;
@@ -21,9 +15,8 @@ use serde::Deserialize;
 pub const MAX_LIGHTS: usize = 8;
 /// 阴影射线起点沿法线偏移（voxel），消除自遮挡 acne
 pub const SHADOW_BIAS: f32 = 0.5;
-/// 方向光阴影射线 t_max：场景 AABB 对角 ≈3118（[-256,-512,-256]~[1536,1536,1280]），
-/// 表面点沿任意方向的遮挡必在其内；65536 的空气段让每条阴影射线多空走 8×（性能）。
-/// 改世界尺度（GATE_TILES）时按对角线同步放大。
+/// 方向光阴影射线 t_max：需 ≥ 场景 AABB 对角（当前 ≈3118，[-256,-512,-256]~[1536,1536,1280]），
+/// 表面点沿任意方向的遮挡必在其内。改世界尺度（GATE_TILES）时按对角线同步放大。
 pub const SHADOW_DIR_T_MAX: f32 = 8192.0;
 /// 发光体素 radiance 直出增益
 pub const EMISSIVE_EMIT_GAIN: f32 = 4.0;
@@ -76,7 +69,7 @@ pub struct LightPoolUniform {
 pub struct DirLightCfg {
   /// 光传播方向（指向场景）；打包时翻转为 L（指向光）
   pub dir: [f32; 3],
-  /// 太阳盘角半径（rad）——保留但 Douglas 硬阴影方案不使用
+  /// 太阳盘角半径（rad）——硬阴影管线不使用此值
   #[serde(default = "default_angular_radius")]
   pub angular_radius_deg: f32,
   pub color: [f32; 3],
@@ -128,7 +121,7 @@ pub fn parse_lighting_ron(src: &str) -> Result<LightingTheme, ron::error::Spanne
 }
 
 /// 构建光池 uniform：方向光（lights[0]）+ 天空 + 环境 + 曝光
-/// 当前只处理方向光，不做点光源/发光体素 NEE（Douglas 方案不支持）。
+/// 当前只处理方向光，不做点光源 / 发光体素 NEE。
 pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
   let mut u = LightPoolUniform {
     g: LightGlobals {
@@ -186,7 +179,7 @@ mod tests {
     assert_eq!(pool.sky_color.x, MINECRAFT_SKY[0]);
   }
 
-  /// RON 解析：未知字段（points 等）忽略，旧单色天空格式不再兼容 top/horizon
+  /// RON 解析：未知字段（points 等）忽略；未给 sky 字段则回退 Minecraft 纯色天空
   #[test]
   fn parse_ron_minimal_and_error() {
     let src = r#"(

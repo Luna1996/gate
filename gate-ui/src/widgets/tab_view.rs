@@ -4,18 +4,13 @@
 //! ```text
 //! root (TabView)
 //! ├── tab_bar (横向 flex，每个 tab 带 TabButton{index})
-//! │   ├── tab 0  ─── 子 Text
-//! │   └── tab 1  ─── 子 Text
 //! └── content_container
-//!     ├── content 0 (TabContent{index:0})  ← 调用方在此加子节点
-//!     └── content 1 (TabContent{index:1})
+//!     └── content N (TabContent{index:N})  ← 调用方在此加子节点
 //! ```
 //!
-//! 切换由 `tab_view_system` 驱动：
-//! - 点击 tab（Pressed→Hovered）→ 更新 `TabView.active`
-//! - 选中 tab：背景 surface_elevated + 底部 2px 边框 + 文字 text_primary
-//! - 未选中 tab：透明底 + 文字 text_muted（hover 时提亮）
-//! - 选中 content：Inherited（跟随祖先显隐）；其余：Hidden
+//! `tab_view_system` 驱动切换（点击 tab，Pressed→Hovered，更新 `TabView.active`）：选中 tab
+//! = surface_elevated 背景 + 2px 底边框 + text_primary 文字，未选中 = 透明底 + text_muted；
+//! 选中 content = Inherited（跟随祖先显隐），其余 Hidden。
 
 use std::ops::Deref;
 

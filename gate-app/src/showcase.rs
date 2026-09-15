@@ -21,8 +21,7 @@ use rust_i18n::t;
 
 // ---- 展示窗交互标记 ----
 
-/// 按钮标识（写进事件日志；**用英文标识符不用显示文案** —— 日志是开发侧痕迹，不翻译，
-/// 也不随语言变化）
+/// 按钮标识（写进事件日志：日志不翻译，故用英文标识符而非显示文案）
 #[derive(Component)]
 struct ShowcaseButton(&'static str);
 
@@ -50,7 +49,7 @@ const SHOWCASE_PLOT_CAP: usize = 128;
 #[derive(Component)]
 pub(crate) struct ShowcaseRoot;
 
-/// 右上角 hud-showcase-panel（tabview：组件/数据 两页，每页包 scrollview），
+/// 右上角 hud-showcase-panel：TabView 组件/数据两页，每页包 scrollview；
 /// 在 commands.queue 闭包内调用（直接操作 World）
 pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
   let c = &ctx.theme.colors;
@@ -75,7 +74,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
       },
       BackgroundColor(color_of(&c.surface_card_hud)),
       BorderColor::all(color_of(&c.border)),
-      // 默认隐藏（toggle 初始未勾选，两处状态一致；观察者按 ToggleSwitchToggled 翻转）
+      // 默认隐藏（与 toggle 初始未勾选一致；观察者按 ToggleSwitchToggled 翻转）
       Visibility::Hidden,
     ))
     .with_children(|root| {
@@ -331,7 +330,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                 let l = list(ctx, inner, ListConfig { capacity: 6 });
                 let w = inner.world_mut();
                 w.entity_mut(*l).insert(ShowcaseLog);
-                // 种子日志在 spawn 处写入（组件真源初始化），无需系统里的 seeded 标志
+                // 种子日志在 spawn 处写入（组件真源初始化）
                 if let Some(mut ring) = w.get_mut::<RingList>(*l) {
                   ring.push(t!("showcase.log.ready"));
                   ring.push(t!("showcase.log.try_all"));
@@ -684,9 +683,8 @@ mod tests {
       "tab pages must be descendants of the panel"
     );
 
-    // 回归契约：选中页必须 Visibility::Inherited（跟随祖先显隐）。
-    // bevy 语义里显式 Visible 无视祖先 Hidden（propagate_recursive 直接置 true），
-    // 面板被 toggle 隐藏时选中页会单独悬浮（tab 页面悬浮 bug）
+    // 契约：选中页必须 Visibility::Inherited（跟随祖先显隐）—— bevy 里显式 Visible
+    // 无视祖先 Hidden，面板被 toggle 隐藏时选中页会单独悬浮
     for (i, page) in tab_pages.iter().enumerate() {
       let vis = *app.world().get::<Visibility>(*page).unwrap();
       if i == 0 {

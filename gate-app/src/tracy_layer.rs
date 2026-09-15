@@ -1,13 +1,9 @@
 //! tracing-subscriber Layer → Tracy zone 桥接（cargo feature = "profile" 时编译）。
 //!
-//! 不用 tracing-tracy crate（其依赖的 tracy-client 与本 workspace 版本错配），手写
-//! 一个零依赖 Layer：span enter → `span_alloc` 开 zone，span exit → drop zone。
-//! bevy 开 "trace" feature 后所有 schedule/system 自动成为 tracing span，连同我们手动
-//! `info_span!` 标记的段，都会作为 CPU zone 出现在 Tracy 时间线（与 wgpu-profiler
-//! 的 GPU zone 对齐）。
-//!
-//! tracy [`Span`] 非 Send（zone context 线程局部），且 enter/exit 本就在同
-//! 线程配对，故每线程一张 Id→Span 表。
+//! span enter → `span_alloc` 开 zone，span exit → drop 关 zone。bevy 开 "trace" feature
+//! 后 schedule/system 自动成为 tracing span，作为 CPU zone 与 wgpu-profiler 的 GPU zone
+//! 在同一 Tracy 时间线对齐。
+//! tracy `Span` 非 Send（zone context 线程局部），enter/exit 同线程配对 → 每线程一张表。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -27,7 +23,7 @@ thread_local! {
 
 impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for TracyLayer {
   fn enabled(&self, _metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-    // Tracy 客户端未 start（理论上不会发生，profile 构建 main 最早期启动）时全层跳过
+    // Tracy 客户端未 start 时全层跳过
     tracy_client::Client::is_running()
   }
 
@@ -38,8 +34,7 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for TracyLayer {
     let Some(meta) = ctx.metadata(id) else {
       return;
     };
-    // name = span 名（bevy system 名 / info_span! 名）；function/file/line 用
-    // callsite（module path 作为 function，Tracy 源码定位直接点进源文件）
+    // name = span 名；function/file/line 取 callsite（Tracy 可定位到源文件）
     let span = client.span_alloc(
       Some(meta.name()),
       meta.target(),

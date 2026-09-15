@@ -1,27 +1,8 @@
-//! 体素编辑：幽灵模式下 **左键放置 / 右键擦除**，笔触 = 形状(球/立方) × 大小(voxel) × 材质。
-//!
-//! ## 目标选取
-//! 屏幕光标 → 世界射线（[`crate::camera::cursor_ray`]）→ 主世界体素 DDA（[`raycast_main`]，
-//! 走 `VolumeGrid::get_voxel` 树点查询）。放置落点取**命中面外侧一格**（Minecraft 惯例），
-//! 擦除取命中格自身；笔触以该格为中心展开。
-//!
-//! ## 为什么不用 recenter 那条 CPU picking
-//! `left_click_pick_recenter` 为了保证"绝不假命中"，每次点击都 `build_full` 整个 brickmap
-//! （极限场景 <150ms）。编辑是**连续点击**的操作，那个代价不能接受；这里用纯体素步进 +
-//! [`EDIT_REACH`] 上限，代价 O(命中距离)，且无任何持久分配。
-//!
-//! ## 数据侧（不需要额外失效广播）
-//! `VolumeGrid::set_voxel` 内部 `mark_data(chunk)` → 既有的增量上传链路
-//! （`poll_pending` → `builder.update_chunk` → GPU）自动把编辑推上去；同一个 dirty AABB
-//! 同时驱动 DDGI 重烘相交 cell 与光照场重算脏 chunk。
-//!
-//! ## 材质
-//! 预设（颜色 + 自发光）在**首次使用时**写进调色板的空槽（[`ensure_material`]）。
-//! `BrickMapBuilder::update_chunk` 会在同一帧顺带重铺 `b_palette`，所以新材质当帧就正确。
-//!
-//! ## 只在幽灵模式生效
-//! 轨道模式的左键仍然是 recenter（既有 UX，不动）；右键在两种模式下都是「拖拽转头」，
-//! 因此右键擦除要区分点击/拖拽（累计位移 < [`DRAG_PX`] 才算点击）。
+//! 体素编辑：幽灵模式下左键放置 / 右键擦除，笔触 = 形状（球/立方）× 大小（voxel）× 材质。
+//! 目标选取：光标 → 世界射线（[`crate::camera::cursor_ray`]）→ 主世界体素 DDA（[`raycast_main`]）；
+//! 放置落点取命中面外侧一格（Minecraft 惯例），擦除取命中格自身，笔触以该格为中心展开。
+//! `set_voxel` 内部 `mark_data(chunk)` 驱动增量上传（`poll_pending` → `update_chunk` → GPU），
+//! 同一 dirty AABB 同时驱动 DDGI 重烘与光照场重算；非幽灵模式不生效（左键仍是 recenter）。
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
@@ -60,8 +41,7 @@ const DRAG_PX: f32 = 4.0;
 // 材质预设
 // ============================================================================
 
-/// 编辑材质预设（颜色 sRGB + 自发光 0..255）。以后要加粗糙度/透射就在这里加字段，
-/// 并在 [`EditMaterial::entry`] 里落进 `PaletteEntry`。
+/// 编辑材质预设（颜色 sRGB + 自发光 0..255）；字段经 [`EditMaterial::entry`] 落进 `PaletteEntry`。
 #[derive(Clone, Copy, Debug)]
 pub struct EditMaterial {
   pub name: &'static str,
@@ -96,7 +76,7 @@ pub const EDIT_MATERIALS: [EditMaterial; 6] = [
     color: [232, 198, 72],
     emissive: 0,
   },
-  // 自发光：发光体素是"光源本体"——着色直出 + 经 GI 传播（shaders/voxel_raytrace/common.wesl palette_emissive）
+  // 自发光：发光体素着色直出并经 GI 传播（shaders/voxel_raytrace/common.wesl palette_emissive）
   EditMaterial {
     name: "Lamp",
     color: [255, 238, 196],
@@ -142,10 +122,8 @@ impl Default for EditSettings {
   }
 }
 
-/// 给指定材质取调色板槽（懒分配；结果缓存在 `settings.slots`）。
-///
-/// 空槽判据 = 条目全零（场景 .vox 从索引 1 起顺序占用，尾部通常有富余）。
-/// 一个空槽都没有 → 回退到 255 并 warn（会覆盖该槽原有材质，属于极端情况）。
+/// 给指定材质取调色板槽（懒分配，结果缓存在 `settings.slots`）。
+/// 空槽判据 = 条目全零（场景 palette 从索引 1 起占用）；一个空槽都没有 → 回退 255 并 warn。
 fn material_slot(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usize) -> u8 {
   if let Some(s) = settings.slots[idx] {
     return s;
@@ -181,9 +159,8 @@ fn ensure_material(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usiz
 
 /// 世界空间射线 × 体素的 Amanatides-Woo 步进。返回 `(命中体素, 入面法线, 命中 t)`。
 ///
-/// 入面法线指向**射线来向**（朝外），所以 `命中体素 + 法线` 就是前方那格空气 —— 放置落点。
-/// `dir` 分量可以为 0（`1.0/0.0 = inf`，该轴自然不会被选中）。
-/// 仅主世界（identity 变换；物体不在体素编辑范围内，见模块注释）。
+/// 入面法线指向射线来向（朝外），故 `命中体素 + 法线` 即前方那格空气 —— 放置落点。
+/// `dir` 分量可以为 0（`1.0/0.0 = inf`，该轴不会被选中）；仅主世界（identity 变换）。
 pub fn raycast_main(
   grid: &VolumeGrid,
   origin: Vec3,
@@ -239,9 +216,8 @@ pub fn raycast_main(
 // 笔触施加
 // ============================================================================
 
-/// 以 `center` 为中心施加一次笔触，返回**实际改变**的体素数。
-///
-/// `palette == 0` → 擦除（挖空）；否则只填充**空气格**（Minecraft 惯例：刷子不啃掉已有几何）。
+/// 以 `center` 为中心施加一次笔触，返回实际改变的体素数。
+/// `palette == 0` → 擦除（挖空）；否则只填充空气格（Minecraft 惯例：不啃掉已有几何）。
 /// 球判据 `d² ≤ r² + r`（r = size-1）：r=0 → 仅中心格；r=1 → 3³ 去掉 8 个角。
 pub fn apply_brush(
   grid: &mut VolumeGrid,
@@ -280,7 +256,7 @@ pub fn apply_brush(
 // 输入系统
 // ============================================================================
 
-/// 体素编辑输入（**仅幽灵模式**；轨道模式左键仍是 recenter）。
+/// 体素编辑输入（仅幽灵模式；轨道模式左键仍是 recenter）。
 /// - 左键 = 放置（当前形状/大小/材质）
 /// - 右键 = 擦除；按下到释放累计位移 > [`DRAG_PX`] 视为「拖拽转头」，不编辑
 #[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
@@ -344,12 +320,9 @@ pub(crate) fn voxel_edit_input(
   }
 }
 
-/// 【诊断】`GATE_EDIT_SELFTEST=1`：第 60 帧朝初始注视点刷一次笔触，
-/// 在**没有鼠标输入**的情况下走通整条编辑链路（`set_voxel` → `mark_data` → 增量上传 →
-/// DDGI 重烘 / 光照场重算）。只在设了该变量时才注册（见 main.rs），正常运行零开销。
-///
-/// 存在的理由：startup 走的是 full 上传路径，`builder.update_chunk` + struct_blobs 那条
-/// 增量链在运行时**没有别的调用者** —— 不先验证一次，就会把潜在问题留给用户第一次点击。
+/// `GATE_EDIT_SELFTEST=1`：第 60 帧朝初始注视点刷一次笔触，在没有鼠标输入的情况下走通整条
+/// 编辑链路（`set_voxel` → `mark_data` → 增量上传 → DDGI 重烘 / 光照场重算）。
+/// 只在设了该变量时才注册（见 main.rs），正常运行零开销。
 pub(crate) fn edit_selftest(
   scene: Option<ResMut<VoxelScene>>,
   orbit: Res<gate_render::OrbitCamera>,

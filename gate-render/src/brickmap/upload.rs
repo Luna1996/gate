@@ -1,22 +1,9 @@
-//! 砖块图上传通道（Phase 1，Douglas 1:1）
+//! 砖块图上传通道：主世界与物体走同一路径（dirty → VolumesBuilder → UploadSnapshot → GPU）。
 //!
-//! 裁决（遗留决策点一）：探测 `RenderDevice.limits().max_storage_buffer_binding_size`
-//! 并在**首帧 info 日志打印路径选择**。默认使用**单 buffer 路径**（NVIDIA 1660/3070
-//! 都 ≥2GB，最坏 b_struct < 1GB 阈值）。多 buffer 代码保留为 fallback
-//! 结构（`BufferLayout::Multi` + 单测覆盖），运行期若 limit<1GB 则 warn 并退化为
-//! 每帧全量上传，不 crash。
-//!
-//! 阶段拆分：
-//! - `RenderStartup`：device/queue 就绪后创建 0 大小的 `GpuBrickMap` buffers（占位）
-//! - `ExtractSchedule`（render sub-app 调度）：用 `Extract<ResMut<T>>` 访问主世界
-//!   `VoxelScene(Volumes)`，按预算 drain 脏 chunk，做全量/增量 CPU 构建，将字节
-//!   snapshot 写入 render world resource `UploadSnapshot`
-//! - `RenderSystems::PrepareResources`：读 `UploadSnapshot` →
-//!   * full：整块 `queue.write_buffer` 写 GPU buffer
-//!   * incremental：仅写 Builder 记录的脏字节区间（struct/palette），
-//!     典型单 chunk 编辑 → 窗口条目字 + 新树 append（KB 级），
-//!     不再整块 DMA，帧率不掉
-//! - info 打印 PROBE 结论 + UPLOAD[full|incremental]
+//! 启动时探测 `RenderDevice.limits().max_storage_buffer_binding_size` 选 `BufferLayout`，首帧
+//! info 打印结论；limit < 1GB 时 warn 并退化为每帧全量上传（不 crash）。
+//! 阶段：`RenderStartup` 建 0 大小占位 buffers；`ExtractSchedule` 按预算 drain 脏 chunk、做
+//! 全量/增量 CPU 构建并写 `UploadSnapshot`；`PrepareResources` 整块或按脏字节区间写 GPU。
 
 use bevy::{
   log::{debug, info, warn},
@@ -131,12 +118,9 @@ const PER_CHUNK_BYTES: usize = 256 * 1024;
 
 /// 在主 world `Last` 阶段（晚于用户 Update 编辑）：按预算 drain dirty → MainPending
 ///
-/// **关键**：进入时先清空 data_chunks / comp_chunks（上一帧的坐标已经在 ExtractSchedule
-/// 被 mirror 消费）；否则坐标会逐帧累积并重复 update_chunk，带来巨量假增量上传。
-/// force_full 同样在处理完一帧后复位。
-///
-/// Phase 3 统一：遍历 `scene.volumes.list` 的所有 volume（主世界 + 物体），
-/// 每个 volume 独立 drain dirty，附带 volume_idx。
+/// 进入时先清空 data_chunks / comp_chunks（上一帧的坐标已在 ExtractSchedule 被 mirror 消费）；
+/// 否则坐标会逐帧累积并重复 update_chunk，带来巨量假增量上传。force_full 处理完一帧后复位。
+/// 遍历所有 volume（主世界 + 物体）各自 drain dirty，附带 volume_idx。
 pub fn poll_pending(
   scene: Option<ResMut<VoxelScene>>,
   budget: Option<Res<UploadBudget>>,
@@ -160,11 +144,8 @@ pub fn poll_pending(
     total_data_backlog = total_data_backlog.saturating_add(grid.dirty.data_dirty_count());
     total_comp_backlog = total_comp_backlog.saturating_add(grid.dirty.comp_dirty_count());
   }
-  // 反推 backlog：Startup 首次构建有大量 chunk dirty，
-  // 若按 budget_n 逐帧 drain，每帧 builder.update_chunk 会 CPU 阻塞冻结 Prepare
-  // 全局调度 → BG1 绑定 / DDA dispatch 推迟 → 画面"只有 UI 全黑"。
-  // 当 backlog > 3× 预算（即明显处于 Startup 批量构建积压，而不是零星增量编辑），
-  // 一次性把 dirty 队列清空。这个判定不依赖任何外部 flag 时序，鲁棒。
+  // backlog > 3× 预算 = Startup 批量构建积压（而非零星增量编辑）→ 一次性清空 dirty 队列，
+  // 避免逐帧 drain 时 builder.update_chunk 阻塞 Prepare 全局调度（BG1 绑定 / DDA dispatch 推迟）。
   let (data_n, comp_n) = if total_data_backlog > budget_n * 3 {
     (total_data_backlog, total_comp_backlog.max(budget_n))
   } else {
@@ -187,8 +168,7 @@ pub fn poll_pending(
 
 /// ExtractSchedule 用的 CPU builder / pending 状态（render world resource）
 ///
-/// Phase 3 统一：`builder: Option<VolumesBuilder>` 持有 `Vec<BrickMapBuilder>`，
-/// pending chunks 带 volume_idx。
+/// `builder: Option<VolumesBuilder>` 持有 `Vec<BrickMapBuilder>`；pending chunks 带 volume_idx。
 #[derive(Resource, Default)]
 pub struct BuilderMirror {
   pub builder: Option<VolumesBuilder>,
@@ -199,10 +179,9 @@ pub struct BuilderMirror {
 
 /// ExtractSchedule 产出 → PrepareResources 消费（render world resource）
 ///
-/// Phase 3 统一：`volumes: VolumesSnapshot`。full 模式带完整 `b_struct`/`b_palette`
-/// 整块 DMA；incremental 模式不带整量字节（避免 100MB+ 级 memcpy 卡顿），
+/// full 模式带完整 `b_struct`/`b_palette` 整块 DMA；incremental 模式不带整量字节，
 /// 改为 `struct_blobs`/`palette_blobs` 脏块（偏移+内容）逐块 write_buffer。
-/// state/comp 仍是主世界 only（Phase 2 shader 重写后再扩展）。
+/// state/comp 只取主世界（尚无物体侧数据）。
 #[derive(Resource, Clone)]
 pub struct UploadSnapshot {
   pub volumes: VolumesSnapshot,
@@ -211,12 +190,11 @@ pub struct UploadSnapshot {
 }
 
 // ----------------------------------------------------------------------------
-// 光照场（Douglas #15 的 AO fill + 「体素即光源」的发光密度 ε，共用一张 3D 纹理）
+// 光照场（AO fill + 「体素即光源」的发光密度 ε，共用一张 3D 纹理）
 //
 // 形态：16-voxel cube 网格（cell），相机中心、按 cell 向下对齐、世界锚定槽位
-// （`slot = 世界 cell mod dims`，与 DDGI 的 `ddgi_slot` 同构）。这三个性质合起来
-// 让它可流式：相机滚动只换「新进窗口的那条带」的世界 cell，其余槽位保持自己的身份，
-// 不需要整幅重铺；世界编辑只重算脏 chunk。
+// （`slot = 世界 cell mod dims`，与 DDGI 的 `ddgi_slot` 同构）→ 可流式：相机滚动只换
+// 新进窗口那条带的世界 cell，其余槽位保持自己的身份；世界编辑只重算脏 chunk。
 //
 // 纹理 Rgba16Unorm，dims = LIGHT_FIELD_DIM³：
 //   .rgb = 发光密度 ε（Σ 发光强度 / cell 体积，0..1）→ cast 射线沿程累加 ε·L
@@ -266,9 +244,9 @@ pub fn light_field_origin_cell(cam_voxel: glam::Vec3) -> IVec3 {
 
 /// 单个 chunk 的 16³ cell tally：同时产出 AO fill 与发光密度 ε（一次树查询供两者）。
 ///
-/// 代价控制：cell 的三态 Air/Solid 一次查询即得（绝大多数 cell，Solid 还直接给出 palette
-/// → ε 精确）；仅 Mixed 才展开 64 个 4³ 子块。Mixed 子块按 fill=32（半实心）近似，
-/// ε 取 0 —— 发光块（灯）在调色板语义下是均质色，通常在 16³ 或 4³ 上就是 Solid，不受此近似影响。
+/// 代价控制：cell 三态一次查询即得（Solid 直接给出 palette → ε 精确），仅 Mixed 才展开
+/// 64 个 4³ 子块；Mixed 子块按 fill=32（半实心）近似、ε 取 0。发光块通常是 16³ 或 4³ 上
+/// 的 Solid，不受此近似影响。
 fn build_light_chunk(tree: &gate_voxel::ChunkTree, palette: &gate_voxel::Palette) -> LightChunk {
   use gate_voxel::BrickState;
   let emis = |pal: u8| -> f32 { palette.get(pal).emissive as f32 / 255.0 };
@@ -312,9 +290,8 @@ fn build_light_chunk(tree: &gate_voxel::ChunkTree, palette: &gate_voxel::Palette
   LightChunk { fill, emit }
 }
 
-/// P2.7 上传 CPU 耗时样本（render world 资源，由 prepare 每帧 insert_resource 覆盖。
-/// render→main 同步由 P2.7 Task 2 gate-app sync_gpu_timings 内**通过 Arc<Mutex> 共享**，
-/// 详见下方 [`UploadCpuSampleChannel`]。上传段的 GPU 拷贝在 submit 时发生，测不到——OQ-2 选 A。
+/// 上传 CPU 耗时样本（render world 资源，由 prepare 每帧 insert_resource 覆盖）。
+/// render→main 同步走 [`UploadCpuSampleChannel`]；上传段的 GPU 拷贝发生在 submit 时，测不到。
 #[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct UploadCpuSample {
   pub cpu_ms: f32,
@@ -328,10 +305,10 @@ pub struct UploadCpuSampleChannel(pub std::sync::Arc<std::sync::Mutex<Option<Upl
 
 /// GPU 资源（render world）：统一 struct/leaves/palette/comp/state + grid_descs + globals。
 ///
-/// `grid_descs_buf`：Phase 3 新增，GridDesc 数组（144B/entry）——主世界 + 物体统一描述符，
-/// shader `trace_scene` 遍历无 kind 分支。`grid_descs_count` 跟踪有效条目数。
-/// `globals`：保留旧 BrickMapGlobals uniform（Phase 1 shader 字节兼容，重写后移除）。
-/// `leaves`：恒空占位（Douglas 格式 palette 直存节点；BG1 binding(1) 布局占位必需）。
+/// `grid_descs_buf`：GridDesc 数组（144B/entry），主世界 + 物体统一描述符，shader
+/// `trace_scene` 遍历无 kind 分支；`grid_descs_count` 为有效条目数。
+/// `globals` 保留 BrickMapGlobals uniform、`leaves` 保留 BG1 binding(1) 布局占位以维持字节
+/// 兼容（`leaves` 实际存放方向可达掩码 LUT）。
 #[derive(Resource)]
 pub struct GpuBrickMap {
   pub struct_buf: Buffer,
@@ -345,8 +322,7 @@ pub struct GpuBrickMap {
   /// 主世界 chunk 窗口（chunk 单位）CPU 副本：DDGI 世界空间探针网格推导用
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
-  /// 光照场（AO fill + 发光密度 ε）：Rgba16Unorm 3D 纹理 + **硬件三线性过滤**
-  /// （Douglas #15："implemented as a single Hardware filtered texture read"）。
+  /// 光照场（AO fill + 发光密度 ε）：Rgba16Unorm 3D 纹理 + **硬件三线性过滤**。
   /// 尺寸 = LIGHT_FIELD_DIM³，纹素 ↔ 一个 16-voxel cell；相机中心 + 世界锚定槽位，
   /// 由 extract 侧铺好后整幅重写（见 [`LightFieldUpdate`]）。
   /// 首次铺好前绑定 1³ 占位（采样恒 0 → AO=1、ε=0）。
@@ -483,7 +459,7 @@ fn extract(
   // ---- 光照场（相机中心 + 世界锚定 + 可流式）：窗口移动或脏 chunk 落入窗口才重铺 ----
   // 必须放在 `!dirty_any` 早退**之前**：相机滚动通常不带世界变化，但 AO/发光场得跟着相机走。
   // 铺图整幅重来（32³ = 256KB）只在相机跨过 16 体素边界或世界编辑时发生；tally 走缓存，
-  // 新进窗口的 chunk 才需要读树（单个 chunk ≈3ms）。
+  // 新进窗口的 chunk 才需要读树。
   let dirty_main: Vec<gate_voxel::ChunkCoord> = if need_full {
     Vec::new() // full 会清空缓存，无需逐 chunk 剔除
   } else {
@@ -526,7 +502,7 @@ fn extract(
     }
   }
   let snapshot = builder.snapshot();
-  // state/comp 暂仍主世界 only（Phase 2 shader 重写后再扩展到物体）
+  // state/comp 只取主世界（物体侧暂无数据）
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();
   commands.insert_resource(UploadSnapshot {
@@ -543,8 +519,8 @@ fn extract(
 /// - 整幅铺图：dims³ 纹素，行主序 x 最快，Rgba16Unorm 8B/纹素（bytes_per_row = dims×8，
 ///   天然 256 对齐，故无需补行）
 ///
-/// 世界锚定槽位的意义与 DDGI `ddgi_slot` 相同：相机滚动换掉的只是「新进窗口那条带」的
-/// 世界 cell，其余纹素保持自己的身份 → 不会整幅错位/失效。
+/// 世界锚定槽位（同 DDGI `ddgi_slot`）：相机滚动只换新进窗口那条带的世界 cell，其余纹素
+/// 保持自己的身份 → 不会整幅错位/失效。
 ///
 /// 返回 `None` = 本帧无需重铺（纹理沿用上一帧）。
 fn update_light_field(
@@ -666,35 +642,24 @@ fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
 
 /// GPU buffer 扩容尺寸策略（纯函数，单测覆盖）。
 ///
-/// 旧策略 2× 翻倍的问题：b_struct 首次增长 ~10KB 就触发 163MB→327MB 翻倍 +
-/// 整份 163MB PCIe 重写（首编辑 51ms 卡顿的 DMA 大头），且 VRAM 空耗近一倍。
-/// 新策略：大 buffer（≥8MB，当前即 b_struct/b_leaves 大场景形态）按 32MB 水位
-/// 对齐——扩容 DMA 量小、重建间隔 ≥32MB 增长；小 buffer 维持 2×（palette 等翻倍成本可忽略）。
+/// 大 buffer（need ≥ 8MB，如 b_struct）按 32MB 水位向上对齐：扩容 DMA 量小、重建间隔 ≥32MB
+/// 增长；小 buffer（palette 等）维持 2× 增长，下限 64KB。
 fn grow_size(cap: u64, need: u64) -> u64 {
   const BIG: u64 = 8 << 20;
   const RESERVE: u64 = 32 << 20;
   if need >= BIG {
     need.div_ceil(RESERVE) * RESERVE
   } else {
-    need.max(cap * 2).max(65536) // ≥64KB，2× amortize（原策略）
+    need.max(cap * 2).max(65536) // ≥64KB，2× amortize
   }
 }
 
-/// 保证 buffer 能容纳 `bytes`，扩容时保留/写入新的整份内容（不丢旧字节）。
+/// 保证 buffer 能容纳 `bytes`，扩容时保留旧内容（不丢字节）。
 ///
-/// 之前的 bug（极限场景 GPU 端"全画面无体素"的根因）：
-///   ensure() 只 `create_buffer(size = bytes)` 然后返回，新 buffer 全是 0，
-///   之后 incremental 上传只 write_partial(dirty range)，164MB 里除了 dirty 的 6MB
-///   其它区域（tile index 表 / leaves 指针 / l1/l2 表）都保持 0，tile entry = 0 被
-///   WGSL sample_brickmap 当作空砖 → 全黑。
-///
-/// 修复：每次扩容（bytes > cur.size()）时创建更大 buffer（[`grow_size`] 水位策略）。
-///
-/// `prefix_valid`（增量镜像路径传 true）：bytes[0..cap) 与 GPU 现有内容一致
-/// （CPU 镜像是权威拷贝、每帧脏区间全覆盖上传，故成立）→ 旧 buffer 前缀用
-/// **GPU-GPU copy**（不占 PCIe，163MB <2ms）搬到新 buffer，只 write_buffer 新增
-/// 尾部 [cap..need)——单次扩容 PCIe 从整份 163MB 降到增长量（10KB 级）。
-/// full 重建等 GPU 旧内容不可信的场景传 false：整份 bytes 一次 DMA（原行为）。
+/// `prefix_valid`（增量镜像路径传 true）：bytes[0..cap) 与 GPU 现有内容一致（CPU 镜像是权威
+/// 拷贝，每帧脏区间全覆盖上传，故成立）→ 旧 buffer 前缀用 **GPU-GPU copy**（不占 PCIe）搬到
+/// 新 buffer，只 write_buffer 新增尾部 [cap..need)。GPU 旧内容不可信时（full 重建）传 false：
+/// 整份 bytes 一次 DMA。
 fn ensure_with_copy(
   device: &RenderDevice,
   queue: &RenderQueue,
@@ -867,7 +832,7 @@ pub(crate) fn prepare(
   let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
   let comp_bytes = snap.comp_chunks * CHUNK_COMP_WORDS * 4;
 
-  // P4：方向可达掩码 LUT（Douglas #18 Bitwise Masking）→ b_leaves。
+  // 方向可达掩码 LUT（Douglas #18 Bitwise Masking）→ b_leaves。
   // 全局常量（8 octant × 64 入口格 × 2 u32 = 4KB），与 volume 无关；
   // 只在 buffer 尚未容纳时写一次，之后零 PCIe。
   {
@@ -917,12 +882,9 @@ pub(crate) fn prepare(
       grid_descs_bytes,
     );
   } else {
-    // 增量路径：snapshot 不再全量拼接 b_struct（旧实现每个脏帧 memcpy 100MB+，
-    // 是编辑 spike 的根因）。这里只按总字节 ensure 容量（扩容走 GPU-GPU 前缀
-    // 拷贝，不占 PCIe），随后逐脏块 write_buffer——每块 = chunk 窗口条目字 +
-    // 新 append 的树尾部（KB~MB 级）；追加尾部恰好覆盖扩容后的新区域。
-    // GridDesc：volume 数变化已由 snapshot 判 need_full；增量路径内容不变，
-    // 仅 ensure 维持容量。leaves 恒空，跳过。
+    // 增量路径：只按总字节 ensure 容量（扩容走 GPU-GPU 前缀拷贝，不占 PCIe），随后逐脏块
+    // write_buffer——每块 = chunk 窗口条目字 + 新 append 的树尾部（KB~MB 级）；追加尾部
+    // 恰好覆盖扩容后的新区域。GridDesc 内容不变仅 ensure；leaves 存 LUT，跳过。
     ensure_capacity(
       &device,
       &queue,
@@ -968,13 +930,11 @@ pub(crate) fn prepare(
     "gate_state",
     &snap.state_bytes,
   );
-  // comp: 每 chunk 8KB 占位；build 后可能为 0 字节，ensure 至少 4B。
-  // comp_bytes 只是预估上限；实际内容读 grid 时已经按真实 size 存。
-  // comp 数据直接从 CPU 侧构建：UploadSnapshot 当前没带 comp 字节，
-  // 这里用 gpu.comp size ≥ 预估的占位（历史行为：仅 buffer 大小对齐）。
+  // comp: 每 chunk 8KB 占位；build 后可能为 0 字节，确保至少 4B。
+  // comp_bytes 只是预估上限，UploadSnapshot 不带 comp 字节，这里只保证 buffer 大小对齐。
   {
     let placeholder = vec![0u8; comp_bytes.max(4)];
-    // comp 为占位通道（内容无意义，历史行为仅对齐 buffer 大小）；保留旧前缀即可
+    // comp 为占位通道（内容无意义）；保留旧前缀即可
     ensure_with_copy(
       &device,
       &queue,
@@ -985,8 +945,7 @@ pub(crate) fn prepare(
     );
   }
 
-  // globals：从主世界 GridDesc[0] 构造向后兼容 BrickMapGlobals（Phase 1 shader 字节兼容，
-  // Phase 2 重写 shaders/voxel_raytrace/ 后移除——届时 shader 走 grid_descs_buf，不再读 globals）。
+  // globals：从主世界 GridDesc[0] 构造 BrickMapGlobals（BG 绑定字节兼容保留）。
   let main_desc = snap.volumes.grid_descs.first().copied().unwrap_or_default();
   let globals = BrickMapGlobals {
     index_origin_x: main_desc.index_origin_x,
@@ -998,8 +957,7 @@ pub(crate) fn prepare(
     index_dims_z: main_desc.index_dims_z,
     index_dims_w: 0,
     tile_count: main_desc.chunk_count,
-    // node_words / node_free_words 等字段在 VolumesBuilder 内部，未暴露；
-    // shader 重写后这些字段不再使用，此处置 0 不影响 Phase 2 之后的路径。
+    // node_words / node_free_words 等字段在 VolumesBuilder 内部、未暴露，置 0。
     node_words: 0,
     node_free_words: 0,
     brick_slabs: 0,
@@ -1052,7 +1010,7 @@ pub(crate) fn prepare(
     struct_tx_bytes / 1024, palette_tx_bytes / 1024,
     grid_descs_tx_bytes / 1024, chunks_show, comp_bytes / 1024, elapsed,
   );
-  // P2.7：写入共享通道（render↔main Arc<Mutex>，OQ-2 选 A 不提供 GPU 值）
+  // 写入 render↔main 共享通道（Arc<Mutex>）
   static SAMPLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
   let generation = SAMPLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
   let sample = UploadCpuSample { cpu_ms, generation };
@@ -1062,7 +1020,7 @@ pub(crate) fn prepare(
   {
     *g = Some(sample);
   }
-  // VRAM 规模留档（v3.9.1 用户指令：2GB 内存预算断言取消，仅打印不拦截）
+  // VRAM 规模留档：超过 2GB 只 warn，不拦截
   let vram = gpu.struct_buf.size()
     + gpu.leaves.size()
     + gpu.palette.size()
@@ -1093,10 +1051,9 @@ pub(crate) fn prepare(
 // Plugin
 // ----------------------------------------------------------------------------
 
-/// 统一体素渲染上传插件（主世界 + 物体同一路径）
+/// 统一体素渲染上传插件：主世界与物体同一路径。
 ///
-/// Phase 3 OBJ→Volume 统一后，OBJ 不再有独立 ObjScene/RenderObj/GpuObjPool 三段
-/// 管道，而是作为 `Volumes.list[1..N]` 中的普通 `VolumeGrid`，走与主世界完全相同的
+/// 物体是 `Volumes.list[1..N]` 中的普通 `VolumeGrid`，走与主世界完全相同的
 /// dirty → VolumesBuilder → UploadSnapshot 增量上传路径。
 pub struct VolumePlugin;
 impl Plugin for VolumePlugin {
@@ -1257,12 +1214,12 @@ mod tests {
 
   #[test]
   fn grow_size_watermark_policy() {
-    // 小 buffer：2×（原策略），下限 64KB
+    // 小 buffer：2×，下限 64KB
     assert_eq!(grow_size(4, 2048), 65536); // palette 首扩
     assert_eq!(grow_size(32768, 40000), 65536);
     assert_eq!(grow_size(40000, 50000), 80000); // 恰好 2×
     // 大 buffer：32MiB 水位对齐——首增 ~10KB 不再翻倍到 2×cap
-    let cap160m: u64 = 163_798_052; // 156.2MiB（实机 full 后 b_struct）
+    let cap160m: u64 = 163_798_052; // 156.2MiB（b_struct 典型满量）
     let need = cap160m + 10 * 1024; // 首次编辑真实增长 ~10KB
     let grown = grow_size(cap160m, need);
     assert_eq!(grown, 160 * 1024 * 1024); // → 160MiB（下一 32MiB 边界），非 2×=312MiB

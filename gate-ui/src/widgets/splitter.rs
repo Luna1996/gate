@@ -1,12 +1,11 @@
 //! splitter：元素间分割线（docs/ui-dark-theme.md 边框令牌，1px 硬边）。
 //!
-//! [`splitter`] 按父容器主轴方向自动定向：
-//! - 父为纵向布局（Column/ColumnReverse）→ 水平线，1px 高，横向铺满
-//! - 父为横向布局（Row/RowReverse，flex 默认）→ 垂直线，1px 宽，纵向铺满
+//! [`splitter`] 按父容器主轴方向自动定向：Column/ColumnReverse → 水平线（1px 高，横向铺满）；
+//! Row/RowReverse（flex 默认）→ 垂直线（1px 宽，纵向铺满）。
 //!
-//! 交叉轴尺寸用 [`AlignSelf::Stretch`] 强制铺满：不依赖父容器显式高度，
-//! auto 高度的行/列里也能拉伸到兄弟元素等高（Val::Percent 在不定父级下会塌缩成 0）。
-//! 与周围元素的间距由调用方容器的 gap 控制，本组件不带 margin。
+//! 交叉轴尺寸用 [`AlignSelf::Stretch`] 强制铺满：不依赖父容器显式高度，auto 高度的行/列里
+//! 也能拉伸到兄弟元素等高（Val::Percent 在不定父级下会塌缩成 0）。间距由调用方容器的 gap
+//! 控制，本组件不带 margin。
 
 use bevy::prelude::*;
 

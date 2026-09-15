@@ -1,8 +1,8 @@
 //! slider：SliderValue + clamp/step + 拖动 + 强调填充视觉（docs/ui-dark-theme.md §5.4）。
 //!
-//! 拖动逻辑复用 bevy_ui `RelativeCursorPosition`（ui_focus_system 自动更新）；
-//! 归一化坐标以节点中心为原点（-0.5..0.5），映射到 0..1。
-//! 视觉：4px 抬升表面轨道槽 + 强调填充段；16px 顶层表面滑块（拖拽放大到 18px）。
+//! 拖动复用 bevy_ui `RelativeCursorPosition`（ui_focus_system 自动更新）：归一化坐标以节点
+//! 中心为原点（-0.5..0.5），映射到 0..1。视觉：4px 抬升表面轨道槽 + 强调填充段；16px
+//! 顶层表面滑块（拖拽放大到 18px）。
 
 use std::ops::Deref;
 
@@ -111,12 +111,9 @@ pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {
 
 /// 主题滑杆（横向；宽度由父容器 flex 决定，最小 120px）
 ///
-/// 几何：根节点水平内边距 = 半 thumb 宽（[`THUMB_INSET`]），track 与 thumb 都在
-/// 内容盒内——thumb 行程首尾各止于根边缘内 8px，**任何档位 thumb 都完整落在根
-/// 命中区内**（旧几何 thumb 为根直接子、`left:0%/100% + 负 margin` 居中，首尾
-/// 半幅溢出根命中矩形，端点滑块难点中）。thumb 是 track 子节点（与 fill 同一
-/// 绝对定位包含块 → 位置天然对齐），`top:50%` 相对 4px track 高 + 负 margin
-/// 半高实现垂直居中。
+/// 几何：根节点水平内边距 = 半 thumb 宽（[`THUMB_INSET`]），track 与 thumb 都在内容盒内
+/// ——任何档位 thumb 都完整落在根命中区内。thumb 是 track 子节点（与 fill 同一绝对定位
+/// 包含块 → 位置天然对齐），`top:50%` 相对 4px track 高 + 负 margin 半高实现垂直居中。
 pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> SliderHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -172,8 +169,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
         BackgroundColor(track_bg),
       ))
       .with_children(|track| {
-        // 填充段（accent_fill → accent_fill_hover，提亮一阶并与 thumb 面区分；
-        // 原 accent_fill == surface_top == thumb 面色，导致填充与滑块同色不可辨）
+        // 填充段（accent_fill_hover：提亮一阶，与 thumb 面 surface_top 区分）
         track.spawn((
           Name::new("ui-slider-fill"),
           SliderFill,
@@ -226,12 +222,12 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
   }
 }
 
-/// 拖动：按下时把光标位置映射为值（每帧重算）；值变化时触发
-/// [`SliderValueChanged`]（仅用户拖动，程序写 SliderValue 不触发）。
+/// 拖动：按下时把光标位置映射为值（每帧重算）；值变化时触发 [`SliderValueChanged`]
+/// （仅用户拖动，程序写 SliderValue 不触发）。
 ///
-/// 映射基准 = 根节点**内容盒**（track 行程区 = 根宽 - 2×[`THUMB_INSET`]）：
-/// 光标在两侧内边距带内即吸附 min/max（端点档位命中区与中段一样宽，不再只有
-/// 1px 边界）。有 step 时经 [`clamp_step`] 逐档吸附（离散档位 slider）。
+/// 映射基准 = 根节点**内容盒**（track 行程区 = 根宽 - 2×[`THUMB_INSET`]）：光标在两侧
+/// 内边距带内即吸附 min/max（端点档位命中区与中段一样宽）。有 step 时经 [`clamp_step`]
+/// 逐档吸附。
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_drag_system(
   mut commands: Commands,
@@ -280,10 +276,8 @@ pub fn slider_drag_system(
 ///
 /// Disabled 态：滑块不放大（恒为 16px），配色由 spawn 时降亮。
 ///
-/// 注意：fill 与 thumb 都是 track 的子节点（slider root 的孙节点），不能只遍历
-/// root 的直接 Children——需要下钻 track 的 Children 分别命中 SliderFill 与
-/// SliderThumb。thumb 的 `top:50% + margin-top:-半高` 垂直居中也在此同步（尺寸
-/// 随拖拽放大）。
+/// fill 与 thumb 都是 track 的子节点（slider root 的孙节点），须下钻 track 的 Children
+/// 才命得中；thumb 的 `top:50% + margin-top:-半高` 垂直居中也在此同步（尺寸随拖拽放大）。
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_visual_system(
   mut q_root: Query<
@@ -458,8 +452,7 @@ mod tests {
     assert_eq!(events.lock().unwrap().len(), 1, "no event when not pressed");
 
     // 水平内边距带（THUMB_INSET 半 thumb）：根宽 100px + padding 8px →
-    // 内容盒 [8,92]。按下时光标在左 8px 内边距带（根左边缘外旧几何的点击
-    // 死区）→ 吸附 min=0；右带 → 吸附 max=1（端点命中区与中段等宽）
+    // 内容盒 [8,92]。按下时光标在左 8px 内边距带 → 吸附 min=0；右带 → 吸附 max=1
     {
       let mut cn = app.world_mut().get_mut::<ComputedNode>(e).unwrap();
       cn.padding.min_inset.x = 8.0;

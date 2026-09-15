@@ -1,20 +1,8 @@
-//! MagicaVoxel .vox 场景加载（vox-rs → VolumeGrid）
-//!
-//! nuke.vox 是「大场景分多个子网格」的导出：1193 组 SIZE+XYZI +
-//! nTRN/nGRP/nSHP 节点树（1804 个 nTRN）。vox-rs 以默认 ReadOptions
-//! 读取时把场景图烘焙成 flat instances（transform 已组合父级链），
-//! 逐实例把稠密体素数组经 4×4 矩阵（90° 旋转 + 整数平移）变换后写入主世界。
-//!
-//! **翻转轴补偿**（1-voxel 偏移 + 接缝串色根因）：voxel p 的立方体是
-//! [p, p+1)，点变换 world = R·(p−pivot) + t 只给出 max 角；旋转带负号
-//! 的轴（如 Y→−X）上真实立方体区间是 [q−1, q]，必须注册 min 角
-//! q−1——否则该实例沿翻转轴整体偏移 +1 voxel，与邻接模块重叠、
-//! last-writer-wins 串色。补偿 = 每实例常量 flip_j = min(0, m_0j, m_1j, m_2j)
-//! （vox 轴系，见 `instance_flip`）；90°/180° 旋转必有 1~2 个翻转轴，
-//! identity 实例不受影响。
-//!
-//! palette 映射：vox 色号 1..=255 → gate palette 同号（0 = AIR）；
-//! MATL 材质的 rough/emit 线性映射到 PaletteEntry.roughness/emissive。
+//! MagicaVoxel .vox 场景加载（vox-rs → VolumeGrid）：vox-rs 默认 ReadOptions 把场景图烘焙成
+//! flat instances（transform 已组合父级链），逐实例经 4×4 矩阵（90° 旋转 + 整数平移）写入主世界。
+//! 翻转轴补偿：映射系数为负的轴上 voxel 立方体实际区间是 [q−1, q]，须注册 min 角，否则实例沿该轴
+//! 偏移 +1 voxel、与邻接模块重叠。palette：vox 色号 1..=255 → gate palette 同号（0 = AIR），
+//! MATL 的 rough/emit 线性映射到 PaletteEntry.roughness/emissive。
 
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -75,10 +63,8 @@ pub fn load_vox_scene(
   let offset = anchor - IVec3::new((lo.x + hi.x) / 2, lo.y, (lo.z + hi.z) / 2);
 
   // ---- 次遍：并行分桶 → 并行建树 → 挂载 ----
-  // 逐体素 set_voxel_ivec3 是 31.7M 次「HashMap 哈希 + 两次树下降」的串行
-  // 瓶颈；改为按 chunk 分桶后 rayon 并行建树（chunk 间零共享）。
-  // 写入序与旧串行完全一致：collect 保序 → 文件序实例 → 实例内 x-major，
-  // 同 voxel 异色的 last-writer-wins 结果确定，最终树逐位相同。
+  // 按 chunk 分桶后 rayon 并行建树（chunk 间零共享）。写入序确定：collect 保序 →
+  // 文件序实例 → 实例内 x-major，故同 voxel 异色的 last-writer-wins 结果确定。
   let t1 = std::time::Instant::now();
   let per_instance: Vec<HashMap<ChunkCoord, Vec<u32>>> = scene
     .instances
@@ -91,9 +77,8 @@ pub fn load_vox_scene(
     })
     .collect();
   // ---- 几何实际引用的色号集（u32 打包：palette 在高 8 位）----
-  // .vox 文件常常声明满 255 个材质，但几何只用其中一部分。"没人引用的槽"可以安全地
-  // 让给编辑材质（gate-app/src/edit.rs 按"条目全零"认领），所以这里先算出真正的引用集，
-  // paint_vox_palette 只铺被引用的条目、其余保持全零。
+  // .vox 常声明满 255 个材质而几何只用一部分；未被引用的槽保持全零，留给编辑材质
+  // 按"条目全零"认领（见 gate-app/src/edit.rs）。
   let used_pal: [bool; 256] = per_instance
     .par_iter()
     .fold(
@@ -117,7 +102,7 @@ pub fn load_vox_scene(
       },
     );
   paint_vox_palette(grid, &scene, &used_pal);
-  // 实例桶 → chunk 全局桶（文件序遍历，保持旧串行写入序）
+  // 实例桶 → chunk 全局桶（文件序遍历，保证写入序）
   let mut buckets: HashMap<ChunkCoord, Vec<u32>> = HashMap::new();
   for map in per_instance {
     for (cc, mut v) in map {
@@ -167,10 +152,8 @@ pub fn load_vox_scene(
 
 /// vox RGBA + MATL → gate palette（色号 1..=255，0 = AIR 不映射）
 ///
-/// **只铺几何真正引用的色号**（`used_pal`）：其余槽保持全零，正好给编辑材质当空槽
+/// 只铺几何真正引用的色号（`used_pal`），其余槽保持全零 —— 空槽即编辑材质的可用槽
 /// （`gate-app/src/edit.rs::material_slot` 按"条目全零"认领）。
-/// .vox 文件常常声明满 255 个材质而几何只用到其中一小部分；旧实现无脑铺满 1..=255，
-/// 于是**一个空槽都不剩** —— 编辑材质只能覆盖已有材质并告警。
 fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[bool; 256]) {
   let pal = grid.palette_mut();
   let mut painted = 0usize;
@@ -193,7 +176,7 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
     pal.set(i as u8, e);
     painted += 1;
   }
-  // 材质统计（诊断白像素：emissive 体素在直接光 + GI 射线端点都会高频贡献亮度）
+  // 材质统计（emissive 体素在直接光与 GI 射线端点都会高频贡献亮度）
   let em: Vec<u8> = (1..=255u8).filter(|&i| pal.get(i).emissive > 0).collect();
   bevy::log::info!(
     "VOX MATERIAL: {} emissive palette indices = {:?}（引用 {} 个色号，空槽 {} 个留给编辑材质）",
@@ -204,23 +187,15 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
   );
 }
 
-/// vox-rs Transform（移植自 ogt_vox，二者矩阵字段逐一同构）：平移在
-/// m30..m32，点变换按行向量约定 p' = p·M：
-///   wx = m00·x + m10·y + m20·z + m30（wy/wz 同理）。
+/// vox-rs Transform（与 ogt_vox 矩阵字段逐一同构）：平移在 m30..m32，行向量约定 p' = p·M，
+/// 即 wx = m00·x + m10·y + m20·z + m30（wy/wz 同理）。
 ///
-/// **pivot 约定**（ogt_vox 头文件 "EXPLANATION OF MODEL PIVOTS"）：
-/// 模型中心 pivot = floor(size/2)（整数格点，**不是** size/2.0）；
-/// nTRN 平移 t 是 pivot 的世界坐标，变换绕 pivot 进行：
-///   world = R·(local − pivot) + t
-/// MagicaVoxel 编辑器内旋转物体时自动把中心补偿烘进 _t，加载方只需
-/// 减去 pivot 再乘矩阵——**切勿把 pivot 加回去**（旧实现 R·(p−c)+c+t
-/// 会给每个模型附加与尺寸相关的 c 偏移，rebase 后不同尺寸模块相互错位）。
+/// pivot 约定（ogt_vox "EXPLANATION OF MODEL PIVOTS"）：模型中心 pivot = floor(size/2)（整数格点），
+/// nTRN 平移 t 是 pivot 的世界坐标，world = R·(local − pivot) + t —— 切勿把 pivot 加回去。
 /// 父级 group 链已由 vox-rs 默认 ReadOptions flatten 烘焙进 transform。
 ///
-/// 坐标系适配：vox (X 右, Y 远, Z 上) 右手系 → gate (X 右, Y 上, Z 近) 右手系。
-/// vox Y 远离观察者、gate Z 朝向观察者，方向相反，须取反 gate Z = −vox Y
-/// 以保持手性（旧映射 (X, Z, Y) 行列式 = −1 = 反射 → 场景左右镜像）。
-/// R 元素 ∈ {0, ±1}、t 为整数、pivot 为整数 → 纯整数运算无舍入误差。
+/// 坐标系适配：vox (X 右, Y 远, Z 上) → gate (X 右, Y 上, Z 近)，须取反 gate Z = −vox Y 保持手性；
+/// R 元素 ∈ {0, ±1}、t 与 pivot 为整数 → 纯整数运算无舍入误差。
 #[inline]
 fn xform(
   t: &vox_rs::Transform,
@@ -241,10 +216,8 @@ fn xform(
   (wx, wz, -wy)
 }
 
-/// 翻转轴补偿（vox 轴系）：世界 j 轴的映射系数 m_ij ∈ {0, ±1} 且恰有一个
-/// 非零。该系数为 −1 时，voxel 立方体 [p, p+1) 经变换后落在 [q−1, q]，
-/// 注册格点须取 min 角 q−1 = 点变换结果 −1；系数非负则取 max 角即点变换
-/// 本身。逐实例常量，identity 旋转全 0。
+/// 翻转轴补偿（vox 轴系）：映射系数 m_ij 为 −1 时，voxel 立方体 [p, p+1) 变换后落在 [q−1, q]，
+/// 注册格点须取 min 角 q−1（系数非负则取 max 角，即点变换本身）。逐实例常量，identity 全 0。
 #[inline]
 fn instance_flip(t: &vox_rs::Transform) -> IVec3 {
   IVec3::new(
@@ -273,10 +246,8 @@ fn transformed_aabb(t: &vox_rs::Transform, sx: u32, sy: u32, sz: u32) -> (IVec3,
 }
 
 /// 单实例体素分桶：chunk → u32 打包（chunk 内 local 0..255 各 8 bit + palette）。
-///
-/// 并行建树的数据面：每 chunk 的体素收集为一个 `Vec<u32>`，chunk 间零共享。
-/// x-major 行切片迭代（无逐索引边界检查）+ last-chunk 缓存——连续体素几乎
-/// 都落同一 chunk，HashMap 只在跨 chunk 时触碰。
+/// 并行建树的数据面，chunk 间零共享；x-major 行切片迭代 + last-chunk 缓存，
+/// 连续体素几乎都落同一 chunk，HashMap 只在跨 chunk 时触碰。
 fn bucket_instance(
   inst: &vox_rs::Instance,
   models: &[vox_rs::Model],
@@ -290,8 +261,8 @@ fn bucket_instance(
   )
 }
 
-/// 单模型体素分桶核心（诊断测试复用）：`flip` 为 vox 轴系翻转补偿
-/// （见 `instance_flip`），非零轴注册 min 角；诊断时传 ZERO 复现旧行为。
+/// 单模型体素分桶核心（测试复用）：`flip` 为 vox 轴系翻转补偿（见 `instance_flip`），
+/// 非零轴注册 min 角；传 ZERO 即不补偿。
 fn bucket_model(
   m: &vox_rs::Model,
   t: &vox_rs::Transform,
@@ -477,8 +448,8 @@ mod tests {
     println!("pivot invariant OK over {checked} visible instances");
   }
 
-  /// 翻转轴补偿单元：2×1×1 模型旋转 X→−Y、Y→X（vox 系），立方体注册
-  /// min 角后几何对称展开于 t；无补偿（旧行为）整体沿 gate y +1。
+  /// 翻转轴补偿单元：2×1×1 模型旋转 X→−Y、Y→X（vox 系），注册 min 角后几何对称展开于 t；
+  /// 不补偿（flip=0）则整体沿 gate y +1。
   #[test]
   fn bucket_model_flip_snaps_min_corner() {
     // vox：world_x = +local_y (m10=1)、world_y = −local_x (m01=−1)、
@@ -521,7 +492,7 @@ mod tests {
     let v = cells(&fixed[&ChunkCoord(IVec3::ZERO)]);
     assert!(v.contains(&(IVec3::new(100, 0, 250), 1)), "{v:?}");
     assert!(v.contains(&(IVec3::new(100, 0, 251), 2)), "{v:?}");
-    // 旧行为（flip=0）：注册 max 角 → 整体 z −1（1-voxel 偏移根因）
+    // flip=0（不补偿，注册 max 角）：整体 z −1
     let old = bucket_model(&model, &t, IVec3::ZERO, off);
     let v = cells(&old[&ChunkCoord(IVec3::ZERO)]);
     assert!(v.contains(&(IVec3::new(100, 0, 249), 1)), "{v:?}");

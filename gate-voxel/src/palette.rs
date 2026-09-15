@@ -1,13 +1,11 @@
-//! 调色板（P1.3）：u8 索引 × 256 条目，材质参数 + 视觉/语义标志位
+//! 调色板：u8 索引 × 256 条目，材质参数 + 视觉/语义标志位。
 //!
-//! grill-me v3 裁决：256 色（u8 索引）够用；特殊体素走「调色板视觉变体 /
-//! CPU 校验标志 / 侧表数据」三级分流，不摊平进体素词。
+//! 特殊体素走「调色板视觉变体 / CPU 校验标志 / 侧表数据」三级分流，不摊平进体素数据。
 
 /// 调色板条目：RGB 颜色 + PBR 简化参数 + 标志位
 ///
-/// 体积对齐考虑（未来直接进 GPU uniform/storage buffer）：
-/// 3B color + 1B roughness + 1B emissive + 1B transmission + 1B flags = 7B，
-/// 补 1B padding = 8B/条目，256 条 = 2KB
+/// 体积对齐：3B color + 1B roughness + 1B emissive + 1B transmission + 1B flags = 7B，
+/// 补 1B padding = 8B/条目，256 条 = 2KB（可直接进 GPU buffer）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct PaletteEntry {
@@ -24,7 +22,7 @@ pub struct PaletteEntry {
   _pad: u8,
 }
 
-/// 标志位：手写 bit 常量，不引 bitflags crate（最小依赖偏好）
+/// 标志位：手写 bit 常量（不引 bitflags crate）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaletteFlags(pub u8);
 
@@ -49,7 +47,7 @@ pub struct Palette {
   entries: Box<[PaletteEntry; 256]>,
 }
 
-/// 索引 0 = 空（体素词里的 0 天然表示未占用，见 tile.rs）
+/// 索引 0 = 空（体素数据里的 0 天然表示未占用）
 pub const AIR_INDEX: u8 = 0;
 
 impl Default for Palette {
@@ -73,7 +71,7 @@ impl Palette {
     &mut self.entries[idx as usize]
   }
 
-  /// 写入条目，返回分配到的索引（AIR 槽不可占用）
+  /// 写入条目（AIR 槽不可占用，违规 panic）
   pub fn set(&mut self, idx: u8, entry: PaletteEntry) {
     assert!(idx != AIR_INDEX, "index 0 is reserved for air");
     self.entries[idx as usize] = entry;

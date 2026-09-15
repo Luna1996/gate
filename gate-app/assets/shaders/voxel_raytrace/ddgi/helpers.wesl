@@ -154,9 +154,6 @@ fn ddgi_cell_state_sized(g: Grid, cmin: vec3<i32>, size: i32) -> u32 {
   return seen;
 }
 
-// （原 `ddgi_leaf16` 已删）它曾在"连 4³ 全空子块都没有"的 cell 里逐 1³ 体素找一个空位，
-// 把探针塞进 1~3 体素宽的窄缝/接缝。那种探针位于进不了光的缝隙里，辐照度恒 ≈0，会把缝两侧的
-// 像素稳定压成**纯黑窄带**。现在这种 cell 直接**不放探针**（见 bake 的 ddgi_place_probe）。
 
 // ============================================================================
 
@@ -199,7 +196,7 @@ fn ddgi_oct_texel_dir(tx: u32, ty: u32, s: u32) -> vec3<f32> {
 
 // ---- 世界网格 slot 索引 ----
 fn ddgi_lod_cell_size(lod: u32) -> i32 {
-  // cell 边长的权威来源是 uniform（Rust 侧 DDGI_LOD_CELL_SIZES），不再硬编码 16<<lod
+  // cell 边长的权威来源是 uniform（Rust 侧 DDGI_LOD_CELL_SIZES）。
   return ddgi_u.lods[lod].origin.w;
 }
 fn ddgi_lod_count(lod: u32) -> u32 {
@@ -265,15 +262,12 @@ fn ddgi_lod0_local_linear(wc: vec3<i32>) -> u32 {
 }
 
 // ---- 槽位映射（按 lod 分派：lod==0 → chunk 局部；lod>=1 → 世界锚定环面）----
-// 世界锚定的关键性质：**「槽位 ↔ 世界 cell」的身份与相机无关**。相机滚动只会让「新进入窗口的
-// 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份 → 图集不再因为相机
-// 移动而整体失效。LOD0 的 chunk 锚定同理：段基址与相机无关，探针世界位置 = chunk 原点 +
-// 局部 cell 中心 —— 也是世界固定。
-/// 世界 cell → 槽位的**纯算术**映射（`ddgi_slot` 现在直接返回它）。凡是要读「某个世界 cell
-/// **自己** 的烘焙记录/探针位置」的地方（判定邻接占用、粗级继承细级探针位置）都必须用它。
-///
-/// ⚠️ lod==0 且该 chunk 没领段 / 越界时返回 0（不是一个有意义的槽位）：调用方**必须**
-/// 先用 `ddgi_cell_in_window` 过滤。返回 0 只保证不越界读。
+// 槽位与世界 cell 的身份绑定与相机无关：相机滚动只让新进入窗口的那条带换掉世界 cell
+// （旧数据本就该丢），其余槽位保持自己的身份 ⇒ 图集不因相机移动而整体失效。
+/// 世界 cell → 槽位的**纯算术**映射。读"某个世界 cell **自己**的烘焙记录/探针位置"的地方
+/// （判定邻接占用、粗级继承细级探针位置）必须用它。
+/// ⚠️ lod==0 且该 chunk 没领段 / 越界时返回 0（不是一个有意义的槽位，只保证不越界读）：
+/// 调用方**必须**先用 `ddgi_cell_in_window` 过滤。
 fn ddgi_slot_own(lod: u32, wc: vec3<i32>) -> u32 {
   if (lod == 0u) {
     let cc = ddgi_wc_to_chunk(wc);
@@ -288,35 +282,19 @@ fn ddgi_slot_own(lod: u32, wc: vec3<i32>) -> u32 {
   return ddgi_lod_slot_base(lod) + u32(r.x) + u32(r.y) * d.x + u32(r.z) * d.x * d.y;
 }
 fn ddgi_slot(lod: u32, wc: vec3<i32>) -> u32 {
-  // 直接返回本格自己的槽位。（旧的 cell → slot 借针间接表已删，见 binding(10) 注释：放置规则
-  // 改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，无需再重定向。）
   return ddgi_slot_own(lod, wc);
 }
 /// 「屏幕使用」粘滞标记：把该槽位置为**满值**（`DDGI_USAGE_STICKY`，`ddgi_sort` 每帧 -1）。
 ///
 /// 由**着色**路径在每个"候选角"上调用（见 `ddgi_sample_lod` 的闸门之后 / 图集取样之前），
-/// 代表"本帧有像素会用这个探针的数据"。工作集选择（sort）就靠它 —— 见 DDGI_USAGE_STICKY 的
-/// 说明：射线的去处**跟着像素走**，而不是按距离猜。
-///
-/// 【为什么置满值，而不是 `c + 1`（旧式）】记账是**抽样**的（见 DDGI_USAGE_SCAN_MASK），
-/// 一个探针每帧只可能被"落在它屏幕 footprint 里的那部分采样像素"点到。按 +1 计的话，一次
-/// 记账只换来 1 帧的 `used`（下一帧就被 -1 抹平），于是**footprint 很小的探针**（薄几何 /
-/// 细缝 / 小特征 —— 也就是"细微处"）会在工作集里**进进出出**：它可能每 ~4 帧才被点到一次，
-/// 而覆盖周期（MASK+1）本来就是 8 帧 ⇒ `used` 时而真时而假。后果不是"少投几条线"这么轻：
-/// 它的 `age` 长期停在离开工作集时的值（12~32，见 DDGI_SKIP_AGE），`ddgi_age_alpha` 据此
-/// 给它一个 1/12~1/32 的大增益（设计值的 94~250 倍）⇒ 每次零星刷新（`due` 错峰 / 偶尔被
-/// 采样到）都把图集值**跳 3%~8%** ⇒ 那些像素**逐帧跳变**（Probe 档在这些角上显示
-/// 品红/红/橙：主路径从来没能稳定入选，值全靠各级兜底拼出来）。
-/// 置满值才是 DDGI_USAGE_STICKY 注释所写的语义 ——"只要在最近 <本值> 帧里被屏幕采样过，
-/// 就留在工作集里"；记账的**密度**因此不再决定窗口长度，而只决定"多久必须被再点到一次"
-/// （窗口 ≥ 覆盖周期即可，见该常量的取值约束）。
-/// 【为什么不用原子】满值写入是**幂等**的：并发写同一个值，丢更新完全无害。用原子反而把每个
-/// 角的记账变成独占访问 —— 相邻像素共享同几个槽位，会撞在同一个 cache line 上。
-/// 【为什么必须只在着色路径调用】cast 里回读 GI 时也会走 `ddgi_sample`；若那里也记账，
-/// 射线多的探针会给自己加更多射线（正反馈）。
-/// 【在着色路径的哪些调用里记】**所有**可能给出显示值的 `ddgi_sample_lod` 调用（主级 / 同级
-/// 放宽 / 背向放开 / 级联混合伙伴 / 末级同侧场兜底），但只记**没被 clamp 过**的角 —— 见 `ddgi_sample_lod`
-/// 的记账注释：只记主级会让"只被兜底路径采样到"的探针永远拿不到射线，这正是逐帧跳变的成因之一。
+/// 代表"本帧有像素会用这个探针的数据"。工作集选择（sort）就靠它 —— 见 DDGI_USAGE_STICKY：
+/// 射线的去处跟着像素走，而不是按距离猜。
+/// 置满值（而非 +1）才能让记账的密度不决定窗口长度：footprint 很小的探针每 ~4 帧才被点到一次，
+/// 按 +1 计会被逐帧抹平 ⇒ 它进进出出工作集、`age` 长期停在 12~32 ⇒ 大增益 ⇒ 逐帧跳变。
+/// 满值写入是幂等的，故不必用原子（原子反而把记账变成独占访问，相邻像素会撞同一个 cache line）。
+/// 必须只在**着色**路径调用：cast 回读 GI 也走 `ddgi_sample`，那里记账会形成"射线多的探针拿到
+/// 更多射线"的正反馈。所有可能给出显示值的 `ddgi_sample_lod` 调用都要记（否则只被兜底路径采样
+/// 到的探针永远拿不到射线）。
 fn ddgi_usage_mark(slot: u32) {
   // 先读一次只是为了省重复写：满值时不再写（记账点每帧几十万次，读比写便宜）。
   if (ddgi_cell_slot[slot] != DDGI_USAGE_STICKY) {
@@ -352,10 +330,9 @@ fn ddgi_slot_world_cell(lod: u32, idx: u32) -> vec3<i32> {
 /// 空 chunk 的 cell 没有探针，采样侧必须把它们当"窗口外"剔除，否则会读到槽位 0 的数据）。
 fn ddgi_cell_in_window(lod: u32, wc: vec3<i32>) -> bool {
   if (lod == 0u) {
-    // LOD0 = **旧 LOD0 空间窗口（世界 AABB 对齐的规则盒）∩ 该 cell 所属 chunk 已领段**。
-    // 加上空间盒这一半是为了与改造前**逐格一致**：chunk 锚定后编址域被 256 对齐放大，若只判
-    // "chunk 已领段"，AABB 之外那一圈（落在已领段 chunk 的 padding 里）会被当成窗口内 →
-    // 比旧实现多出几个角 → 采样结果在 AABB 边界上会变。加上空间盒后"只会少、不会多"。
+    // LOD0 = 世界 AABB 对齐的空间盒 ∩ 该 cell 所属 chunk 已领段（两层都要判）。
+    // 只判"chunk 已领段"不够：chunk 锚定后编址域按 256 对齐放大，AABB 之外那一圈会落在已领段
+    // chunk 的 padding 里而被当成窗口内 ⇒ 叠上空间盒后结果只会更少、不会更多。
     let c = wc - ddgi_origin_cell(0u);
     if (!(all(c >= vec3<i32>(0)) && all(c < vec3<i32>(ddgi_u.lods[0].dims.xyz)))) { return false; }
     let cc = ddgi_wc_to_chunk(wc);
@@ -383,7 +360,7 @@ fn ddgi_slot_lod_of(slot: u32) -> u32 {
   }
   return 0u;
 }
-// 占位纹理索引（阶段二/三重做布局前仅用于越界保护）
+/// 探针在图集层内的 (x, y) 坐标（层号 = id / DDGI_PROBES_PER_LAYER）
 fn ddgi_probe_in_layer(id: u32) -> vec2<u32> {
   let in_layer = id % DDGI_PROBES_PER_LAYER;
   return vec2<u32>(in_layer % DDGI_PROBES_PER_LAYER_AXIS, in_layer / DDGI_PROBES_PER_LAYER_AXIS);
@@ -413,9 +390,9 @@ fn ddgi_rec_off(rec: u32) -> vec3<u32> {
 // meta word = age(低 8bit) | ENABLED | ACTIVE | 邻接可见性掩码(bit10-15) | NBR_VALID(bit16)
 //   ENABLED：烘焙阶段放了探针（有 irr/depth 数据可采样）
 //   ACTIVE ：本 cell 或 6 邻接有体素 / 物体，且未被更细 LOD 覆盖 —— 本帧需要投线
-//   NBR    ：6 邻接可见性掩码（见 DDGI_META_NBR_SHIFT），**由 sort 每帧为活跃探针重算**。
-//   NBR_VALID：掩码是否已算过。bake 与「非活跃」路径写 0 → 掩码无效 → 消费侧**不做门控**
-//            （退回改造前行为），避免把"还没算"误当成"全被挡住"而整片关掉混合。
+//   NBR    ：6 邻接可见性掩码（见 DDGI_META_NBR_SHIFT），由 sort 每帧为活跃探针重算
+//   NBR_VALID：掩码是否已算过；bake 与非活跃路径写 0 ⇒ 消费侧不做门控，
+//            避免把"还没算"误当成"全被挡住"而整片关掉混合。
 fn ddgi_meta_pack(age: u32, enabled: bool, is_active: bool) -> u32 {
   return (age & 0xFFu)
     | select(0u, DDGI_META_ENABLED, enabled)
@@ -459,28 +436,21 @@ fn ddgi_maxc(c: vec3<f32>) -> f32 {
 }
 /// 时域混合系数：分**收敛斜坡**与**稳态长窗口**两段，以 `age` 到达上限（`DDGI_AGE_MAX`）分界。
 ///
-///   · 斜坡段（`age < DDGI_AGE_MAX`）：`1/age` 的**等权滑动平均** —— `age` 就是"这个探针已经
-///     积累了多少次 collect"，所以 `1/age` 是真·等权平均：误差按 1/√n 下降（统计上的最优
-///     等权平均），前 5 帧就把噪声压掉一半以上。`age ≤ 1` 时 `1/age = 1` → 与原 `snap`
-///     （直写）逐位一致：新烘探针第一帧是精确覆写，换主/编辑时 age 被压到 1~8 → 这几帧快速
-///     跟上新位置（见 bake 的换主说明、sort 的脏区分支）。
-///   · 稳态段（`age` 已到上限 = 探针彻底收敛）：一律 `base`（长窗口，负责压稳态逐帧脉动）。
+///   · 斜坡段（`age < DDGI_AGE_MAX`）：`1/age` 的等权滑动平均 —— `age` 就是该探针已积累的
+///     collect 次数，故误差按 1/√n 下降。`age ≤ 1` 时为 1.0（精确覆写），换主/编辑时 age 被
+///     压到 1~8 ⇒ 这几帧快速跟上新位置。
+///   · 稳态段（`age` 已到上限）：一律 `base`（长窗口，负责压稳态逐帧脉动）。
 ///
-/// 【为什么不能写成 `max(base, 1/age)`（旧式）】`base` 是**稳态**窗口（辐照度取 1/3000），
-/// 而 `1/base` = 3000 **远大于** age 的上限 255（worklist/meta 只给它 8 位）⇒ `max` 永远取
-/// `1/age` ⇒ **`base` 是死代码**："稳态窗口 = 1/base 帧"从未生效，稳态增益被 age 上限钉在
-/// 1/255（是设计值的 12×）→ 静止画面一直有逐帧脉动。所以必须显式分成两段。
-///
-/// 【为什么在"age 到上限"处切，而不是更早】斜坡段的误差 = σ_est/√n，所以切得越早、留下的
-/// **静态**噪声越大（age=32 处切 → 0.18·σ_est，age=255 处切 → 0.06·σ_est）。等到上限再切，
-/// 静态噪声只比"继续用 1/age 往下压"差 1.4×，而**逐帧**抖动能低 3~5× —— 后者才是"静止相机
-/// 也看得见"的那个量。
+/// 不能写成 `max(base, 1/age)`：辐照度 base = 1/3000 ⇒ 1/base = 3000 远大于 age 上限 255
+/// （worklist/meta 只给它 8 位）⇒ max 恒取 1/age，base 永不生效。必须显式分两段。
+/// 切点取在 age 上限：斜坡段误差 = σ_est/√n，切得越早留下的静态噪声越大（age=32 处切
+/// → 0.18·σ_est；age=255 处切 → 0.06·σ_est）。
 fn ddgi_age_alpha(age: u32, base: f32) -> f32 {
   if (age < DDGI_AGE_MAX) { return 1.0 / f32(max(age, 1u)); }
   return base;
 }
 
-// ddgi_update_texel：历史遗留的旧混合路径，**当前无人调用**（collect 直接用 mix(prev,new,a)）。
+// ddgi_update_texel：未被调用（collect 直接用 mix(prev, new, a)）。
 fn ddgi_update_texel(prev: vec3<f32>, proj: vec3<f32>) -> vec3<f32> {
   let new_t = pow(proj, vec3<f32>(1.0 / DDGI_IRRAD_GAMMA));
   var h = select(DDGI_HYSTERESIS, 0.0, all(prev == vec3<f32>(0.0)));

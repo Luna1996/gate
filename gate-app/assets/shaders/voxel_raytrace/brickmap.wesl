@@ -1,10 +1,9 @@
 import package::bindings::{b_struct, g};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, MAX_LEVEL, NODE_FIXED_WORDS};
 
-// 统一网格上下文——一套 DDA 跑所有网格（主世界 + 物体）
-// 由 `make_grid(idx)` 从 `grid_descs[idx]` 构造；携带 tree_base/palette_base/
-// index_origin/dims 作为数据源基址，trace_grid → trace_chunk 统一从
-// b_struct[tree_base + ...] / b_palette[palette_base + ...] 取数据。
+// 统一网格上下文：一套 DDA 跑所有网格（主世界 + 物体）。
+// 由 `make_grid(idx)` 从 `grid_descs[idx]` 构造，携带 tree_base/palette_base/index_origin/dims
+// 作为数据源基址；trace_grid → trace_chunk 统一从 b_struct[tree_base + ...] / b_palette[palette_base + ...] 取数据。
 struct Grid {
   w_mn: vec3<f32>,              // 世界 AABB min
   w_mx: vec3<f32>,              // 世界 AABB max
@@ -23,11 +22,9 @@ struct Grid {
   obj_id: i32,                  // -1 = 主世界，>=0 = 物体索引（debug/implicit normal 用）
 }
 
-// Douglas Brick Tree mask DDA 采样（1:1 复刻 devlog #17/#18）
-// voxel → chunk 窗口定位 → DFS 树 4 层 mask 遍历 → palette
-// Phase 3 统一：从 Grid 参数读取 tree_base / index_origin / index_dims，
-// 而非 BG1 globals（主世界 + 物体走同一路径，b_struct[tree_base + ...] 取树）。
-// 仅 implicit normals 6 邻域 occupancy 点查询用；主遍历走层次栈式 trace_chunk。
+// 树点查询：voxel → chunk 窗口定位 → 4 层 mask 树遍历 → palette。
+// tree_base / index_origin / index_dims 取自 Grid 参数；窗口外或 entry==0 的 chunk 返回 0（空气）。
+// 仅 implicit normals 的 6 邻域 occupancy 用；主遍历走层次栈式 trace_chunk。
 fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   // ---- chunk 窗口定位 ----
   let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
@@ -45,7 +42,7 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   // 统一 buffer 内绝对字基址 = volume 基址 + entry - 1（entry 编码的是本 volume 内相对地址）
   let chunk_base = g.tree_base + entry - 1u;
 
-  // ---- DFS 4 层 mask 遍历（wire v3：level 3 inline 4 体素/word，level 0-2 紧凑）----
+  // ---- DFS 4 层 mask 遍历（level 3 inline 4 体素/word，level 0-2 紧凑）----
   let local = vec3<u32>(m);  // chunk 内 voxel 坐标 0..255
   var node_addr = chunk_base;
   for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
@@ -73,7 +70,7 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
     }
 
     if (level == 3u) {
-      // wire v3：level 3 inline palette，4 体素/word = b_struct[node + 3 + (child_idx >> 2)]
+      // level 3 inline palette，4 体素/word = b_struct[node + 3 + (child_idx >> 2)]
       // palette = 该 word 的第 (child_idx & 3) 字节
       let w = b_struct[node_addr + NODE_FIXED_WORDS + (child_idx >> 2u)];
       return (w >> ((child_idx & 3u) * 8u)) & 0xFFu;
@@ -88,5 +85,5 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
     }
     node_addr = chunk_base + b_struct[node_addr + NODE_FIXED_WORDS + popcount_below];
   }
-  return b_struct[node_addr + 2u] & 0xFFu;  // fallback（wire v2 下不可达）
+  return b_struct[node_addr + 2u] & 0xFFu;  // fallback（正常路径不可达）
 }

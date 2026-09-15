@@ -1,10 +1,8 @@
 //! 左上角调试 overlay：FPS（CUR/AVG/MIN/MAX）读数 + 相机信息 + 渲染开关。
 //!
-//! 逐帧 GPU/CPU 剖析已改由 Tracy + wgpu-profiler 承担（`--features profile`，
-//! Tracy GUI 看时间线），旧的自研折线/落盘帧时统计已删除。
-//!
-//! 装配入口 [`demo_ui_setup`](crate::demo_ui_setup) 在主题/字体就绪后调用
-//! [`spawn_debug_view`] 一次性生成；[`fps_line_feed`] 每帧喂 FPS 统计。
+//! [`spawn_debug_view`] 由 [`demo_ui_setup`](crate::demo_ui_setup) 在主题/字体就绪后调用
+//! 一次生成；[`fps_line_feed`] 每帧喂 FPS 统计。
+//! 逐帧 GPU/CPU 剖析由 Tracy + wgpu-profiler 承担（`--features profile`）。
 
 use std::collections::VecDeque;
 
@@ -27,13 +25,8 @@ use crate::edit::{BrushShape, EDIT_MATERIALS, EDIT_SIZE_MAX, EDIT_SIZE_MIN, Edit
 use crate::showcase::ShowcaseRoot;
 
 // ================= 左上角单行 FPS（CUR/AVG/MIN/MAX） =================
-//
-// 统计口径：滚动窗口 = 最近 5s 的逐帧 delta_secs：
-// - CUR = 本刷新周期（0.25s）帧数 / 实际耗时
-// - AVG = 窗口帧数 / 窗口总时长
-// - MIN = 1 / 窗口最大帧耗时（最差一帧）
-// - MAX = 1 / 窗口最小帧耗时（最好一帧）
-// 数字固定 3 位宽（上限 999）→ 文本定长，UI 不抖动。
+// 滚动窗口 = 最近 5s 的逐帧 delta：CUR = 本刷新周期（0.25s）帧数 / 耗时，AVG = 窗口帧数 /
+// 时长，MIN = 1 / 最大帧耗时，MAX = 1 / 最小帧耗时；数字 3 位定宽（上限 999）→ UI 不抖动。
 
 pub(crate) const FPS_REFRESH_SECS: f32 = 0.25;
 const FPS_WINDOW_SECS: f32 = 5.0;
@@ -44,8 +37,7 @@ const DEBUG_VIEW_W: f32 = 360.0;
 #[derive(Component)]
 pub(crate) struct FpsText;
 
-/// demo UI 已 spawn 的根标记：demo_ui_setup 的存在性守卫（查到即跳过），
-/// 替代 Local<bool> done 平行状态——产物本身就是"是否已跑过"的真源
+/// demo UI 已 spawn 的根标记：demo_ui_setup 的存在性守卫（查到即跳过）
 #[derive(Component)]
 pub(crate) struct DemoUiRoot;
 
@@ -104,8 +96,7 @@ struct EditMaterialSlider;
 #[derive(Component)]
 struct EditMaterialValueLabel;
 
-/// 材质预览色块（只显示，不参与交互 —— button_state_system 会覆盖 Button 的背景色，
-/// 所以这里用裸 Node + BackgroundColor）
+/// 材质预览色块（只显示不交互：button_state_system 会覆盖 Button 背景色，故用裸 Node）
 #[derive(Component)]
 struct EditMaterialSwatch;
 
@@ -117,7 +108,7 @@ struct EyeParamSlider(u8);
 #[derive(Component)]
 struct EyeParamValue(u8);
 
-/// 眼睛适应**总开关**（取代 GATE_NO_EYE_ADAPT 环境变量；关掉 = 两个 eye pass 停发 + 曝光回 1.0）
+/// 眼睛适应总开关（运行时覆盖 GATE_NO_EYE_ADAPT 设定的初值；关掉 = 两个 eye pass 停发 + 曝光回 1.0）
 #[derive(Component)]
 struct EyeAdaptToggle;
 
@@ -132,7 +123,7 @@ fn speed_text(v: f32) -> String {
   format!("{} v/s", v.round() as i32)
 }
 
-/// Eye 页数值标签文本：统一 2 位小数（滑块的步长有 0.25 / 0.1 / 0.01 三档，2 位足够读）
+/// Eye 页数值标签文本：统一 2 位小数（滑块步长 0.25 / 0.1 / 0.01，2 位足够读）
 fn value_text(v: f32) -> String {
   format!("{v:.2}")
 }
@@ -176,23 +167,15 @@ pub(crate) fn fps3(v: f32) -> u32 {
   (v.round() as u32).min(999)
 }
 
-/// 左上角 debug-view 面板：**固定宽度 360px、高度 auto**（随当前 Tab 页内容收缩）。
-/// TabView（fit_content 自适应高度模式）五页：
-/// - Stats：FPS 读数 / 相机信息 / VSync / UI Showcase
-/// - DDGI：阶段档 / 调试模式 / Gain / Probe Viz / LOD
-/// - Camera：相机模式互斥按钮（轨道 / 自由）/ 飞行速度 / 操作说明
-/// - Edit：体素编辑笔触（形状 / 大小 / 材质）
-/// - Eye：眼睛适应（自动曝光）活参数（EV 上下限 / 时间常数 / 目标中灰）
+/// 左上角 debug-view 面板：固定宽度 360px、高度 auto（TabView fit_content 随活动页收缩）。
+/// 五页：Stats（FPS / 相机信息 / VSync / Showcase）、DDGI（阶段 / 调试模式 / Probe Viz / LOD）、
+/// Camera（相机模式互斥按钮 / 飞行速度）、Edit（笔触形状 / 大小 / 材质）、
+/// Eye（自动曝光的 EV 上下限 / 时间常数 / 目标中灰）。
 ///
-/// **所有控件的初始状态都从对应 Resource 读取**（UI 只是资源的视图）—— 缺省值只在
-/// `DdgiStage::from_env` / `DdgiDebugSettings::default` / `camera` 里写一次，
-/// 避免"资源默认变了、UI 还写着旧值"这类漂移。
-///
-/// 视觉：root 提供外框 + HUD 卡面底色；每页一个 grid（去外框/gap，行分割线由
-/// cell bottom border 承担，避免右侧叠成 2px）。
-/// 定位由本函数设置（PositionType::Absolute + 左上 8px 锚定）。
+/// 所有控件初始状态都从对应 Resource 读取（UI 只是资源的视图）；面板由本函数设为
+/// PositionType::Absolute + 左上 8px 锚定，root 提供外框与 HUD 卡面底色。
 pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
-  // ---- 初始状态：全部从资源读（见函数注释）----
+  // ---- 初始状态：全部从资源读 ----
   let ddgi_stage = world
     .get_resource::<gate_render::ddgi::DdgiStage>()
     .map_or(0, |s| s.0.min(DDGI_STAGES.len() as u8 - 1));
@@ -216,7 +199,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
     .unwrap_or_default();
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
-  // 绝对定位根：定宽 + 高度 auto（TabView fit_content 随活动页收缩）；外框/底色本节点提供
+  // 绝对定位根：定宽 + 高度 auto；外框与底色由本节点提供
   world
     .spawn((
       Name::new("debug-view"),
@@ -287,7 +270,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         .with_children(|page| {
           let g = tab_page_grid(ctx, page);
           page.world_mut().entity_mut(g).with_children(|g| {
-            // ---- 相机当前位置/角度信息（与 FPS 同档同色；两行行间距 = padding sm）----
+            // ---- 相机位置/朝向信息（与 FPS 同档同色；两行行距 = padding sm）----
             let c2 = tab_cell(ctx, g);
             g.world_mut().entity_mut(c2).with_children(|cell| {
               let e = label(
@@ -307,7 +290,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
               ));
             });
             // ---- 垂直同步开关（默认开 = Fifo；观察者写 Window.present_mode，
-            //      bevy_render 检测变化自动重配 swapchain；关 = AutoNoVsync 不封顶） ----
+            //      bevy_render 检测变化后自动重配 swapchain；关 = AutoNoVsync） ----
             let c5 = tab_cell(ctx, g);
             g.world_mut().entity_mut(c5).with_children(|cell| {
               let t = toggle_switch(
@@ -775,14 +758,13 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       // ============ Tab 4：Eye（眼睛适应 / 自动曝光的活参数）============
       // 链路：这里改 → `EyeAdaptSettings`（ExtractResource 变化才同步进 render world）→
       // `prepare_dda_bind_groups` 见 is_changed 写 buffer 参数区 20B → 下一帧 WESL `eye_p(i)` 读。
-      // 所以拖动滑块**立即生效**（不用重启、不用重编译）。
       root
         .world_mut()
         .entity_mut(tv.contents[4])
         .with_children(|page| {
           let g = tab_page_grid(ctx, page);
           page.world_mut().entity_mut(g).with_children(|g| {
-            // -- 总开关（= 原来的 GATE_NO_EYE_ADAPT=1，现在运行时可切）--
+            // -- 眼睛适应总开关（运行时覆盖 GATE_NO_EYE_ADAPT 设定的初值）--
             let tcell = tab_cell(ctx, g);
             g.world_mut().entity_mut(tcell).with_children(|cell| {
               let t = toggle_switch(
@@ -939,8 +921,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
     },
   );
 
-  // 「Eye」页参数滑块 → 写 EyeAdaptSettings（渲染侧下一帧见 is_changed 后上传 20B 到参数区）。
-  // 立刻生效：不用重启、不用重编译。
+  // 「Eye」页参数滑块 → 写 EyeAdaptSettings（渲染侧下一帧见 is_changed 后上传 20B 到参数区）
   world.add_observer(
     |ev: On<SliderValueChanged>,
      q_slider: Query<&EyeParamSlider>,
@@ -1130,9 +1111,8 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
   );
 }
 
-/// Tab 页内网格：1 列 auto 行高。**去外框 + 去 gap 底色**——面板 root 已提供外框，
-/// 行分割线由每个 cell 的 bottom border 承担（避免 grid BackgroundColor 在右侧溢出
-/// 叠成 2px 边框）。
+/// Tab 页内网格：1 列 auto 行高，去外框 / 去 gap —— 面板 root 已提供外框，
+/// 行分割线由各 cell 的 bottom border 承担。
 fn tab_page_grid(ctx: &UiCtx, page: &mut ChildSpawner) -> Entity {
   let g = grid(
     ctx,
@@ -1177,10 +1157,7 @@ fn tab_cell(ctx: &UiCtx, parent: &mut ChildSpawner) -> Entity {
     .id()
 }
 
-/// 去掉某 Tab 页网格**最后一个 cell** 的 bottom 分割线。
-///
-/// root 外框在面板底边已画了 1px；末行 cell 若再画一条，两条同色线相邻叠加 = 视觉 2px。
-/// 内部行分隔线仍由各 cell 的 bottom border 承担（见 [`tab_cell`]）。
+/// 去掉某 Tab 页网格最后一个 cell 的 bottom 分割线（与 root 外框的 1px 底边相邻叠加会成 2px）。
 /// page 的孩子只有一个（[`tab_page_grid`] 产出的 grid），grid 的孩子即各 cell。
 fn strip_last_cell_bottom(world: &mut World, page: Entity) {
   let Some(grid) = world.get::<Children>(page).and_then(|c| c.first().copied()) else {
@@ -1210,10 +1187,7 @@ pub(crate) fn debug_overlay_toggle(
   }
 }
 
-/// 每 0.25s 刷新一次左上角 FPS 行（CUR/AVG/MIN/MAX）+ 相机位置行。
-///
-/// 逐帧 delta 压入 5s 滚动窗口；GPU/CPU 逐段剖析已交由 Tracy + wgpu-profiler
-/// （`--features profile`，Tracy GUI 时间线），这里只留用户直视的 FPS 读数。
+/// 每 0.25s 刷新一次左上角 FPS 行 + 相机位置行（逐帧 delta 压入 5s 滚动窗口）。
 #[allow(clippy::type_complexity, clippy::too_many_arguments)] // Bevy system：ParamSet/资源逐一注入
 pub(crate) fn fps_line_feed(
   time: Res<Time>,
@@ -1279,8 +1253,7 @@ pub(crate) fn fps_line_feed(
   {
     t.0 = txt;
   }
-  // 相机信息两行：轨道模式 = 眼位 + 注视点；幽灵模式 = 飞行眼位 + 朝向角。
-  // （幽灵模式下没有"轨道目标"，继续显示它只会给出误导读数。）
+  // 相机信息两行：Orbit = 眼位 + 注视点；Fly = 飞行眼位 + 朝向角（Fly 下无轨道目标）
   let (eye, line2) = match *mode {
     crate::camera::CameraMode::Orbit => {
       let target = orbit.target;

@@ -1,8 +1,7 @@
-//! 脏标记与每帧上传预算队列（Phase 0，适配 Volume + ChunkCoord）
+//! 脏标记与每帧上传预算队列。
 //!
-//! 数据脏 / 元件脏分离：体素编辑走 `data_dirty`（触发 Brick Tree 重建上传），
-//! 元件状态变化走 `comp_dirty`（只传 StateTable，不重铺体素数据）。
-//! 队列 FIFO + 去重，消费侧按帧预算 drain（Phase 1 上传通道用）。
+//! 数据脏 / 元件脏分离：体素编辑走 `data_dirty`（触发 Brick Tree 重建上传），元件状态
+//! 变化走 `comp_dirty`（只传 StateTable，不重铺体素数据）。队列 FIFO + 去重，按帧预算 drain。
 
 use std::collections::{HashSet, VecDeque};
 

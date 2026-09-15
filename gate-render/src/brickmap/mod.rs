@@ -1,9 +1,8 @@
-//! 砖块图 CPU 侧（Phase 1，Douglas 1:1）：wire 字节契约 + 构建器 + 软件遍历器 + DDA
+//! 砖块图 CPU 侧：wire 字节契约 + 构建器 + 软件遍历器 + DDA pass。
 //!
-//! - [`wire`]：CPU 构建器与 GPU shader（Phase 2 重写）之间的字节级契约，纯数据零渲染依赖
-//! - [`BrickMapBuilder`]：`VolumeGrid` → wire 格式；全量构建（Rayon 分批）+ 逐 chunk 增量（append-only）
-//! - [`BrickMapView`]：软件遍历器，独立实现寻址链，等价性测试互为对照
-//! - [`dda`]：DDA 主可见性 pass（WGSL compute + Core2d blit 上屏）
+//! [`wire`] 是 CPU 构建器与 GPU shader 之间的字节级契约（纯数据，零渲染依赖）；全量构建
+//! 走 Rayon 分批，逐 chunk 增量只 append；[`BrickMapView`] 独立实现寻址链，与 shader 互为
+//! 等价性对照。
 
 mod builder;
 pub mod dda;

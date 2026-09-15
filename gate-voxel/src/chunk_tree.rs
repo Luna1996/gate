@@ -1,22 +1,15 @@
-//! ChunkTree：Douglas Brick Tree 1:1 复刻（Phase 0 核心）
+//! ChunkTree：Douglas Brick Tree（分裂因子 4³=64，u64 occupancy mask per non-leaf，
+//! 紧凑 child offset，uniform leaf 自适应）。
 //!
-//! 分裂树，分裂因子 4³=64，u64 occupancy mask per non-leaf，
-//! 紧凑 child offset，uniform leaf 自适应。
-//!
-//! Phase 0 实现：
-//! - 编辑层用结构化节点（Node enum），保证 set/get/merge 逻辑正确
-//! - 序列化层 DFS flatten 成 `Vec<u32>` GPU buffer
-//! - 每次编辑后重新 flatten（Phase 0 简化，性能之后再优化）
-//!
-//! Level 链：256 → 64 → 16 → 4 → 1（4 次分裂到 1³ 体素）
+//! 编辑层用结构化节点（Node enum）；序列化层 DFS flatten 成 `Vec<u32>` GPU buffer。
+//! Level 链：256 → 64 → 16 → 4 → 1。
 
 use super::coords::{BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT, child_linear_idx};
 
 /// 结构化节点（编辑用）
 ///
-/// 内存约束：N=10 场景树节点量级在百万，每节点字节数直接决定能否启动
-/// （64 槽 Vec<Option<usize>> = 552B/节点曾致 5.9GB OOM）。紧凑 child 表
-/// 与 GPU wire 格式同构：只存 mask bit=1 的子块（按位序）。
+/// 内存约束：N=10 场景树节点量级在百万。紧凑 child 表与 GPU wire 格式同构：
+/// 只存 mask bit=1 的子块（按位序）。
 #[derive(Debug, Clone)]
 enum Node {
   /// uniform leaf：整 brick 同一 palette
@@ -114,12 +107,8 @@ impl ChunkTree {
 
   /// DFS 序列化（上传 GPU struct buffer）。
   ///
-  /// **wire v2**（2026-09-04 DDA 加速）：**叶父层（level 3）inline palette**，
-  /// 消除 level 4 叶节点（3 word → 0）和 child_addr indirection（2 load → 1）。
-  /// **wire v3**（2026-09-04 叶子打包）：叶父层 inline 64 word → **16 word**，
-  /// 4 体素/word（每字节 = 一个 palette，child_idx 低 2 位选字节），256B→64B/节点。
-  /// v2 每体素 word 的高 3 字节（lod 死数据）无读者，直接丢弃。
-  /// 上层（level 0-2）保持紧凑格式（省空间，稀疏节点不膨胀 64×）。
+  /// 上层（level 0-2）紧凑格式；叶父层（level 3）inline **16 word**，4 体素/word
+  /// （每字节 = 一个 palette，child_idx 低 2 位选字节）。
   fn serialize_node(&self, idx: Option<usize>, extent: i32, out: &mut Vec<u32>) {
     let (mask, palette_u32) = match idx {
       None => (0u64, self.root_palette as u32),
@@ -142,7 +131,7 @@ impl ChunkTree {
     let child_extent = extent / BRICK_FACTOR;
 
     if child_extent == 1 {
-      // 叶父层（level 3，wire v3）：inline 16 word，4 体素/word（每字节 = palette）。
+      // 叶父层（level 3）：inline 16 word，4 体素/word（每字节 = palette）。
       // 读端：b_struct[node + 3 + (child_idx >> 2)] 的第 (child_idx & 3) 字节。
       // bit=0 体素 = 0（AIR）。
       let inline_start = out.len();
@@ -190,11 +179,9 @@ impl ChunkTree {
   }
 
   /// 节点 LOD 代表色 = 子树「实体多数色」（排除空气计票；子树无实体 → 0）。
-  /// bit=0 子块 = 本节点 uniform palette（=0 空气不计票）；bit=1 子块 = 子节点
-  /// lod 递归。uniform 节点 = 自身色（空气 → 0）。
-  /// GPU 侧 lod!=0 即早停：区域含实体就按多数固体色整块出图——触发条件保证
-  /// 区域投影 <1px，剪影/颜色误差 ≤ 子块边长 = 亚像素。排除空气是关键：
-  /// 地形薄表面区域空气占多数，若含空气计票则 lod 恒 0 永不早停。
+  /// bit=0 子块 = 本节点 uniform palette（=0 空气不计票），bit=1 子块递归子节点 lod。
+  /// GPU 侧 lod!=0 即早停：区域含实体就整块出图；排除空气是关键，否则地形薄表面区域
+  /// 空气占多数，lod 恒 0 永不早停。
   fn node_lod(&self, idx: Option<usize>) -> u8 {
     match idx {
       None => self.root_palette,
@@ -242,7 +229,7 @@ impl ChunkTree {
   }
 
   pub fn node_mask(&self, _idx: u32) -> u64 {
-    // Phase 0 不暴露序列化内部
+    // 占位：本层不暴露序列化内部
     0
   }
 
@@ -418,7 +405,7 @@ impl ChunkTree {
       Node::Uniform(p) => brick_state_of(*p),
       Node::Split { mask, palette, .. } => {
         if *mask == 0 {
-          // lazy Split：整节点 uniform（防御 trailing_zeros(0) 同款哨兵）
+          // lazy Split：mask=0 即整节点 uniform（防御 trailing_zeros(0) 越界）
           return brick_state_of(*palette);
         }
         self.aggregate_node_state(*mask, *palette, Some(idx))
@@ -539,10 +526,10 @@ impl ChunkTree {
   // 编辑
   // =========================================================================
 
-  /// 填充对齐 brick（extent ∈ LEVEL_EXTENT）：树路径 O(depth) 写入。
+  /// 填充对齐 brick（extent ∈ LEVEL_EXTENT）：O(depth) 树路径写入。
   ///
-  /// 大体积均匀填充专用：一次调用只沿路径创建 ≤depth 个节点（lazy split），
-  /// 比逐体素 [`Self::set_voxel`] 少 64× 节点创建。返回：是否实际修改。
+  /// 一次调用只沿路径创建 ≤depth 个节点（lazy split），比逐体素 [`Self::set_voxel`]
+  /// 少 64× 节点创建。返回：是否实际修改。
   pub fn fill_brick(&mut self, local: [i32; 3], extent: i32, palette: u8) -> bool {
     assert!(
       LEVEL_EXTENT.contains(&extent),
@@ -775,12 +762,10 @@ impl ChunkTree {
     self.try_merge(p);
   }
 
-  /// 把一个 uniform 节点变成 split 节点（lazy：mask=0 全 uniform，子节点按需创建）
+  /// 把一个 uniform 节点变成 split 节点（lazy：mask=0 全 uniform，子节点按需创建）。
   ///
-  /// Douglas 语义（devlog #17）：mask bit=0 → uniform leaf（颜色 = 父节点
-  /// palette_u32），**不占内存**。只有真正被编辑的子块才置 bit + 建节点。
-  /// 旧实现（SPLIT_ALL + 64 个同色 Uniform 子节点）每 4³ 块浪费 65 节点
-  /// （≈36KB），大场景编辑内存爆炸 ~65×。
+  /// mask bit=0 → uniform leaf（颜色 = 父节点 palette），不占内存；只有真正被编辑的
+  /// 子块才置 bit + 建节点。
   fn split_uniform(&mut self, idx: usize, old_palette: u8) {
     self.nodes[idx] = Node::Split {
       mask: 0,
@@ -799,8 +784,7 @@ impl ChunkTree {
       return;
     }
 
-    // 阶段 1：只读扫描（零分配；旧实现 clone 64 槽 children Vec，
-    // 每次 512B × 百万级调用 = 巨量分配流量拖慢编辑 + 内存高水位）
+    // 阶段 1：只读扫描（零分配）
     let mut first_color: Option<u8> = None;
     let mut all_uniform_same = true;
     {
@@ -856,13 +840,11 @@ impl ChunkTree {
     self.nodes.is_empty() && self.root_palette == 0
   }
 
-  /// GC：重建 nodes Vec 只保留 root 可达的有效节点，回收废弃索引
+  /// GC：重建 nodes Vec 只保留 root 可达的有效节点，回收废弃索引。
   ///
-  /// 编辑（set_voxel/fill_brick/clear）过程中 split + try_merge 会留下被
-  /// merge 掉的子节点（索引变废但仍在 Vec，容量只增不减）。长时间编辑后
-  /// nodes 膨胀——本方法迭代 DFS 把可达节点 **move** 到连续新 Vec（零 clone，
-  /// 避免每 Split 一次堆分配），重写 children 索引。O(n) 时间 + O(n) 临时
-  /// 空间，编辑完成后调一次即可。
+  /// split + try_merge 会留下被 merge 掉的子节点（仍在 Vec 中占位，容量只增不减）。
+  /// 迭代 DFS 把可达节点 **move** 到连续新 Vec（零 clone）并重写 children 索引；
+  /// O(n) 时间 + O(n) 临时空间，编辑完成后调一次即可。
   pub fn compact(&mut self) {
     if self.nodes.len() <= 1 {
       return; // 空 root 或单节点，无废弃
@@ -1127,11 +1109,11 @@ mod tests {
     let ser = t.serialize();
     assert!(ser.len() >= 3);
     // root 是 split：只有 (100,100,100) 所在 64³ 子块的 bit=1（lazy split，
-    // mask bit=0 子块 = uniform AIR——Douglas #17 语义）
+    // mask bit=0 子块 = uniform AIR）
     let mask = (ser[1] as u64) << 32 | ser[0] as u64;
     assert_ne!(mask, 0);
     assert_eq!(mask.count_ones(), 1, "lazy split：单 bit 而非 SPLIT_ALL");
-    // wire v3 混合格式：levels 0-2 紧凑（3+1 offset=4 words/层，单 child），
+    // 混合格式：levels 0-2 紧凑（3+1 offset=4 words/层，单 child），
     // level 3 叶父层 inline 16 word（3+16=19 words，4 体素/word）
     // 总 = 4 + 4 + 4 + 19 = 31 words
     assert_eq!(ser.len(), 31);
