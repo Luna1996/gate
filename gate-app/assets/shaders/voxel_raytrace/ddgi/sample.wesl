@@ -1,6 +1,6 @@
-import package::bindings::{ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u};
+import package::bindings::{ddgi_cell, ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u};
 import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FIELD_MIN_W, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
-import package::ddgi::helpers::{ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
+import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast};
 
@@ -121,9 +121,10 @@ fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
 // allow_backface = true：**完全放开 wn 的符号闸门**（背向探针也参与），只保留两个精确判据
 // （Chebyshev wd + 逐角线段求交）来过滤。仅供 `ddgi_sample` 的末级兜底 r3' 使用（那是
 // "r1/r2 都失败"的像素，典型表现就是 Probe 档品红 + 纯黑点）；r1/r2/级联/退粗路径一律 false。
-// ⚠️ 放开后这些背向角会**通过 wn 闸门**，于是也被计入返回的 `cov`（= "有可用数据"）。
-// 消费侧必须知道这一点：`ddgi_sample` 在 r1/r2/r3' 全失败时会把 `ddgi_dbg_cov` 恢复成
-// **主级那一份严格值**（`cov_strict`），否则 conf 会被 r3' 抬满、天光兜底失效（见那里的说明）。
+// ⚠️【cov 与 allow_backface 已正交】`cov` 现在在**照明闸门之前**累加（只问"周围有没有探针
+// 数据"，不问朝向），所以无论 wn 闸门开不开，返回的 `cov` 都一样 —— 它不再受这个形参影响。
+// 消费侧仍需知道：`ddgi_sample` 在 r1/r2/r3' 全失败时会把 `ddgi_dbg_cov` 恢复成**主级那一份**
+// （`cov_strict`），以保证天光兜底用的是"主级壳"的覆盖度而不是退粗/兜底路径的（见那里的说明）。
 fn ddgi_sample_lod(
   p: vec3<f32>,
   n: vec3<f32>,
@@ -173,6 +174,10 @@ fn ddgi_sample_lod(
   var wsum = 0.0;
   // 覆盖度：只累加「有可用数据」的角（见下面的分界注释）。与 wsum 的区别是本函数的核心 ——
   var cov = 0.0;
+  // 「这个角所在 cell **根本放不下探针**」的名义权重和（全实心，或自由空间全是 <4 体素宽的
+  // 窄缝 → bake 没放探针，见 ddgi_place_probe）。它是 cov 的**分母修正项**：这类角由**几何**
+  // 决定，不代表"本点没有数据"，见下面 ENABLED 处的推导与结尾的归一化。
+  var cov_solid = 0.0;
   // 「本点一侧辐照度场」的两个累加器（含义见模块级 ddgi_field 的说明）。
   var fld = vec3<f32>(0.0);
   var fw = 0.0;
@@ -181,6 +186,16 @@ fn ddgi_sample_lod(
     for (var iy = 0; iy < 2; iy = iy + 1) {
       for (var ix = 0; ix < 2; ix = ix + 1) {
         var wc = wc0 + vec3<i32>(ix, iy, iz);
+        // 三线性权重先算：它只依赖循环下标与 `fr`（与 `wc` 无关），而下面"cell 放不下探针"的
+        // 分母修正需要用到它。语义与原来写在后面的那次求值**逐位相同**（同一批表达式）。
+        // 为什么用**晶格名义位置**的基而不是探针实际位置上的 tent：见下面 `wtri <= 1e-6` 处的
+        // 长注释（名义基在 8 角上恒好和为 1、cell 边界处权重恰好归零 → 权重场连续无跳变）。
+        let wl = vec3<f32>(
+          select(1.0 - fr.x, fr.x, ix == 1),
+          select(1.0 - fr.y, fr.y, iy == 1),
+          select(1.0 - fr.z, fr.z, iz == 1),
+        );
+        let wtri = wl.x * wl.y * wl.z;
         if (clamp_cells) {
           wc = clamp(wc, o_cell, wc_hi);
           // LOD0：clamp 到的 cell 可能落在**没领段**的 chunk（空 chunk）→ 与"窗口外"同样剔除。
@@ -195,7 +210,21 @@ fn ddgi_sample_lod(
         }
         let slot = ddgi_slot(lod, wc);
         let mw = ddgi_meta[slot];
-        if ((mw & DDGI_META_ENABLED) == 0u) { ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u; continue; }
+        if ((mw & DDGI_META_ENABLED) == 0u) {
+          // 【"这个角没有探针" ≠ "本点没有数据"】cell 放不下探针时 ENABLED=0 —— 原因全是**几何**
+          // 的（全实心；或自由空间只有 <4 体素宽的窄缝，见 ddgi_place_probe），与"本点附近有没有
+          // 可用数据"无关。把它当成"无数据"计进 cov，会让 conf 取决于**三线性 stencil 恰好有几个
+          // 角落在墙体内**，于是同一堵墙的相邻两面分道扬镳（实测：无光室内，正对镜头的墙面
+          // cov≈1 → conf=1 → 天光兜底被压掉 → **纯黑**；而斜向/贴边的面 stencil 跨到实心 cell
+          // → cov≈0.3 → conf≈0.6 → 天光兜底留着 → **有正常光影**，两者亮度差 ~10 倍且边界是硬边；
+          // 关掉 DDGI 时 conf 恒 0，所以那种情况下全场景反而是统一的）。
+          // 修法：这类角从 cov 的**分母**里剔除（见结尾的 `cov/(1-solid_w)`），让 cov 回到它本该
+          // 有的语义 ——「在**可能**有数据的角里，有多少真的有数据」。只有 OCCUPIED=1 才剔除：
+          // 纯空气但没放针的角（远离几何的 cell）仍然算"没数据"，那是真的没数据。
+          if ((ddgi_cell[slot] & DDGI_REC_OCCUPIED) != 0u) { cov_solid = cov_solid + wtri; }
+          ddgi_dbg_rej.x = ddgi_dbg_rej.x + 1u;
+          continue;
+        }
         // 【已删闸门】这里原本有一条 `(mw & DDGI_META_ACTIVE) == 0 → 剔除`。
         // 它的本意是"别让图集里没数据的探针以 0 辐照度满权重参与平均"，但 ACTIVE 是
         // **逐帧**量（由 sort 的 near/worklist 每帧重判）⇒ 同一像素的角会在"有数据/没数据"
@@ -225,12 +254,7 @@ fn ddgi_sample_lod(
         //
         // 顺带：每个探针拿到的都是它所属角的名义权重（旧的"借针"共享机制与 DDGI_SHARE_K
         // 都已删除，不再需要放大支撑半径）。
-        let wl = vec3<f32>(
-          select(1.0 - fr.x, fr.x, ix == 1),
-          select(1.0 - fr.y, fr.y, iy == 1),
-          select(1.0 - fr.z, fr.z, iz == 1),
-        );
-        let wtri = wl.x * wl.y * wl.z;
+        // （`wl` / `wtri` 已提到循环体开头算，见那里的说明。）
         if (wtri <= 1e-6) { continue; }
         // ---- 记账：本探针的数据**本帧会被屏幕用到**（工作集选择的唯一依据）----
         // 位置在"所有几何/状态闸门之后、图集取样之前"：只要这个角是**候选**（探针有数据、
@@ -291,8 +315,13 @@ fn ddgi_sample_lod(
           ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u;
           continue;
         }
-        // 注意：**cov 不在这里累加** —— 还要先过下面的背向闸门，见那里的说明。
-        // ============ 往下是「数据是否可用」判定 + 照明决策 ============
+        // ★ 覆盖度在**这里**累加：`cov` 回答的是「**本点周围有没有探针数据**」，与朝向/可见性无关。
+        // 这一行**必须**在所有照明闸门（wn / wd / ε / 线段求交）之前 —— 它曾经被放在下面的背向
+        // 闸门之后，于是 cov 变成"表面朝向的函数"：同一堵墙相邻两面一个 conf=1、一个 conf=0，
+        // 天光兜底只在一侧生效 ⇒ 亮度差几十倍、边界是硬边（实测：无光室内大墙纯黑、斜向侧边正常，
+        // 而 Probe 档两面都是「白 = 有数据但辐照度为 0」、GI 档两面同暗 —— 数据其实一模一样）。
+        cov = cov + wtri;
+        // ============ 往下是「照明是否可用」判定 + 照明决策 ============
         // 背向探针闸门：**所有路径一律剔除**（含放宽路径）。放宽（wn 下限 0.25）是为薄几何的
         // **掠射**探针准备的（探针在表面侧方，dot ≈ 0），不是为**背向**探针（探针在表面背后）。
         //
@@ -308,19 +337,26 @@ fn ddgi_sample_lod(
         // 会被线段求交剔掉。权重仍用地板 0.25（见 `wn_w`），不会让单个角独占归一化结果。
         let wn_raw = dot(n, -dir) / DDGI_NORMAL_BIAS;
         if (!allow_backface && wn_raw <= 0.0) {
-          // 背向角 = 探针落在表面背面 ⇒ 它的数据对本点无效 ⇒ **不算「有可用数据」**
-          // （不进 cov，见下面 cov 累加处的说明）。
+          // 背向角：探针落在表面背面 ⇒ 它的数据对本点的**照明**无效 ⇒ 不参与加权平均。
+          // 注意这只是**照明**闸门，不是"数据缺失"：cov 已在上面（照明闸门之前）累加，所以
+          // 这类角不再把 conf 拉低、不再触发"本点没有数据"的天光兜底。
           ddgi_dbg_rej.y = ddgi_dbg_rej.y + 1u;
           continue;
         }
         let wn = clamp(wn_raw, 0.0, 1.0);
-        // 到这里 = 本角数据**对本点可用**（探针在正面 + 该方向有深度记录）→ 计入覆盖度。
-        // 【为什么 wn 要排除、wd 不用】wn ≤ 0 = 探针落在表面**背面**，它的数据对本点无效，
-        // 属于「没有可用数据」→ 必须让 cov 反映出来：否则 8 角全在背面时 cov 依然满 →
-        // 天光兜底不生效 → 整片纯黑、与周边形成硬边（"有 GI / 无 GI"割裂）。
-        // 而 wd（被墙挡住）是"本点本来就该暗"的**正确结果**，不是数据缺失 → 仍算有数据；
-        // 早期用 wsum 当置信度正是把 wd 也误判成"没数据"，凹角被补天光 → 室内漏光。
-        cov = cov + wtri;
+        // 【历史：为什么 cov 曾经在这里累加、为什么改掉了】
+        // 旧版把 wn ≤ 0 的角算成「没有可用数据」（"背面探针的数据对本点无效"），用 cov 去表达。
+        // 但「照明无效」和「没有数据」是两件不同的事：斜向/贴边的面，其周围探针可以**整体**落在
+        // 切平面背后（wn 全 ≤ 0）而**数据完全存在**。旧写法于是把 cov 变成**朝向的函数**：
+        //   正对镜头的墙面：8 角 wn>0 → cov≈1 → conf=1 → 天光兜底被压掉 → **纯黑**；
+        //   斜向/贴边的面：多数角 wn≤0 → cov≈0 → conf=0 → **满额天光** → 亮。
+        // 同一堵墙相邻两面差几十倍，且边界是硬边（用户实测截图：一面纯黑、一面正常）。
+        // 现在 cov 只看"有没有探针数据"，朝向与遮挡**全部**交给照明闸门（wn / wd / ε / 线段求交）
+        // —— 它们照常把这些角排除出 `total/wsum`，只是不再借 `cov` 去关掉天光兜底。
+        // 【"8 角全在背面"的像素怎么办】仍有 r2（同级放宽 wn）→ r3'（放开符号闸门 + 线段求交
+        // 复核）→ r4（同侧场插值）这条链兜住；真的被几何挡住时它会正确地拿到 0（无光处本就该黑，
+        // 且此时它与周围一样黑，不会有硬边）。天光常量从此只补**真的没有探针**的地方
+        // （级联盒外 / 探针覆盖不到），语义纯粹得多。
         // 与可见性无关的「同侧辐照度场」累加（供末级兜底 r4，见模块级 ddgi_field 的说明）：
         // 只要求 `wn_raw > 0`（探针与法线同侧）+ 本角有数据，**不**受 wd / 权重阈值 ε /
         // 线段求交影响 ⇒ 必须在那些闸门之前累加。余弦权重用 clamp 后的 `wn`，
@@ -419,7 +455,11 @@ fn ddgi_sample_lod(
   ddgi_dbg_zero = select(0.0, 1.0, ok && max(max(abs(avg.x), abs(avg.y)), abs(avg.z)) < 1e-5);
   // 覆盖度单独带出（返回值只有 4 个分量，且 .w 已被 wsum 占用）—— 着色侧用它决定
   // "要不要退回常量天光"，见 ddgi_dbg_cov 声明处与 ddgi_sample_lod 的分界注释。
-  ddgi_dbg_cov = cov;
+  // 【分母修正】剔除"cell 放不下探针"的角（见上面 ENABLED 处的推导）：cov 的语义是
+  // "在**可能**有数据的角里，有多少真的有数据"，而不是"8 个角里有多少个落在空气里"。
+  // 下限 0.25 防极端（只剩 1~2 个可放针的角时，别把单个角的存在放大成"满覆盖"）。
+  // 恒有 cov ≤ 1 - cov_solid ⇒ 商 ≤ 1，不需要再 clamp 上界。
+  ddgi_dbg_cov = cov / max(1.0 - cov_solid, 0.25);
   // 同侧辐照度场（与可见性无关）也单独带出 —— 供 ddgi_sample 的末级兜底 r4 用，
   // 见模块级 ddgi_field 的说明。
   ddgi_field = fld;
@@ -436,6 +476,9 @@ var<private> ddgi_usage_track: u32;
 // ⚠️ 语义上**背向角（wn ≤ 0）不算有可用数据**：末级全失败时 `ddgi_sample` 会把它恢复成
 // 主级那一份严格值（`cov_strict`），正是这个语义让"8 角全在背面"的像素退回常量天光，
 // 而不是掉进"GI=0 且 conf=1 ⇒ 纯黑点"。
+// ⚠️ 分母已修正：**"cell 放不下探针"（全实心 / 窄缝）的角不计入分母**（见 ddgi_sample_lod
+// 结尾的 `cov / max(1 - cov_solid, 0.25)`）。否则 conf 会随"三线性 stencil 有几个角落在
+// 墙体内"跳变 —— 无光室内表现为**同一堵墙相邻两面一边纯黑一边有光影**、边界是硬边。
 var<private> ddgi_dbg_cov: f32;
 // 「与可见性无关」的**本点一侧辐照度场**插值结果 —— Σ wtri·wn·irr 与 Σ wtri·wn，
 // 只累加 `wn_raw > 0`（探针与表面法线**同侧**）且有数据的角，**不**看 wd / 权重阈值 ε /

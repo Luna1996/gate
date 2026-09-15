@@ -2494,7 +2494,7 @@ impl Default for EyeAdaptSettings {
   /// 缺省取**保守**值：+6 档（×64）/ −3 档（÷8）。极暗/极亮场景可以现场往 ±12 档推，
   /// 但上限越大，暗场里的 GI 残噪被同倍放大得越狠。
   fn default() -> Self {
-    Self { enabled: true, ev_max: 6.0, ev_min: -3.0, tau_brighten: 2.0, tau_darken: 1.0, key: 0.18 }
+    Self { enabled: true, ev_max: 3.0, ev_min: -3.0, tau_brighten: 2.0, tau_darken: 1.0, key: 0.18 }
   }
 }
 

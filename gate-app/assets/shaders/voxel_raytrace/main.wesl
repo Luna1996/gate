@@ -2,7 +2,7 @@ import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_IN
 import package::common::{linear_to_srgb, palette_albedo, palette_emissive, sky_rgb, srgb_to_linear};
 import package::ddgi::bake::{ddgi_bake_one};
 import package::ddgi::collect::{ddgi_collect_one};
-import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
+import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
 import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
 import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
@@ -255,7 +255,17 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // **补多少完全由 conf 决定** → 有数据(conf=1)时 amb 恒为 0，**不受 Far amb 影响**。
     let t_edge = smoothstep(0.0, 1.0, ddgi_dbg_edge);
     let amb_far = sky * ddgi_u.misc.w;
-    let amb = mix(amb_far, amb_sky, t_edge) * (1.0 - conf);
+    // ... 但**不能乘到 0**：conf=1 时这一项归零 = 无光室内恒为纯黑，而 auto exposure 对
+    // 恒 0 完全无效（0·s = 0）→ 周围被拉亮后黑区格外突兀。保留 DDGI_AMBIENT_FLOOR 倍
+    // 作为"多次反弹/天光渗透"的常量替身，见该常量处的推导（含"为什么不抹掉室内外亮度差"）。
+    //
+    // ⚠️【mix 的实参顺序**必须**是 (1.0, FLOOR, conf)】语义要和旧的 `(1-conf)` 一致：
+    //   有数据(conf=1) → FLOOR（只留地板）；
+    //   没数据(conf=0) → 1.0（满额兜底，与 DDGI 关闭时的观感一致）。
+    // 写成 `mix(FLOOR, 1.0, conf)` 是**反的**（= `FLOOR + (1-FLOOR)·conf`）：conf=1 时得到
+    // 1.0 —— 满额天光常量，且 FLOOR 取任何值都一样（mix 在 t=1 处返回终值），于是"拖 FLOOR
+    // 到 0 毫无变化 + 无光室内恒定很亮 + 关掉 DDGI 反而全黑(conf=0 → 0)"。别再写反。
+    let amb = mix(amb_far, amb_sky, t_edge) * mix(1.0, DDGI_AMBIENT_FLOOR, conf);
     col = alb * (sun_c * ndl * sun + amb * ao + gi);
     // 自发光体素：radiance 直出（不吃方向、不吃阴影）——「每个体素都能是光源」的着色侧。
     col = col + alb * palette_emissive(best.palette_base, best.pal) * DDGI_EMIT_GAIN;
@@ -575,7 +585,12 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
   let te = ((vec2<f32>(f32(ttx), f32(tty)) + jit) / f32(ndim)) * 2.0 - vec2<f32>(1.0);
   let dir = ddgi_oct_decode(te);
   let sh = world_raycast(make_grid(0u), probe_pos + dir * DDGI_RAY_BIAS, dir, DDGI_T_MAX, world_cfg_full(0.0, 3u));
-  var radiance = sky_rgb();
+  // 【本函数里唯一的非零种子就是这一行的 miss 分支】命中几何的射线回读 `alb·gi/π` 是自反馈：
+  // `DDGI_CAST_FLOOR = 0` ⇒ 命中分支自身不含任何照明量，全靠别处漏进来的天空点亮。
+  // 因此"封闭室内还亮着" ⇔ **有射线没打到几何**（体素化的缝/接缝/未封闭网格）。
+  // `DDGI_SKY_RADIANCE_SCALE` 就是给这条路径准备的 A/B 开关：置 0 = GI 里没有天空贡献，
+  // 若此时封闭室内变黑，就确认亮度的来源是"射线逃逸到天空"。默认 1.0（不变）。
+  var radiance = sky_rgb() * DDGI_SKY_RADIANCE_SCALE;
   var dist = DDGI_T_MAX;
   if (sh.hit) {
     dist = sh.t;
