@@ -106,14 +106,21 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
 
   // ---- 「屏幕使用」记账开关（工作集选择的唯一依据，见 DDGI_USAGE_STICKY）----
-  // 只让 1/(MASK+1)² 的像素记账，且按帧轮转 ⇒ 8 帧覆盖全屏一次：把记账的全局写入量压到
-  // ~10 万次/帧（可忽略）。cast 里的 GI 回读不设这个开关（恒 0）→ 不记账。
+  // 采样像素 = "本帧轮到的那一列" ∪ "本帧轮到的那一行"（两条互相垂直的带）⇒ **每个像素每
+  // MASK+1 帧至少被采到一次**（列、行各轮到一次），全局写入量摊到每帧约 2/(MASK+1) 的像素
+  // （8 → 23%；而 `ddgi_usage_mark` 是满值写入、幂等，绝大多数只是"读一下、不写"）。
+  // 【为什么不能取 AND（旧式）】那样选中的是 `x ≡ y ≡ -frame (mod 8)` 的**对角线像元**：
+  // 它只占全屏的 1/8，其余 7/8 的像素**永远**进不了采样集。于是"屏幕 footprint 只有几个像素、
+  // 且恰好不含对角像元"的探针（薄几何 / 细缝 / 小特征 = "细微处"）**一次也不会被记账** →
+  // 永远进不了工作集 → 年龄冻在离开时的值（12~32）→ `ddgi_age_alpha` 据此给它 1/12~1/32 的
+  // 大增益 → 每次零星刷新（`due` 错峰）就把图集值**跳 3%~8%** ⇒ 那些像素逐帧跳变。
+  // 见 `ddgi_usage_mark` 的完整推导。cast 里的 GI 回读不设这个开关（恒 0）→ 不记账。
   let usage_frame = u32(ddgi_u.params.x);
   ddgi_usage_track = select(
     0u,
     1u,
     ((gid.x + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u
-      && ((gid.y + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u,
+      || ((gid.y + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u,
   );
 
   // ---- 反投影：像素中心 (gid + 0.5) → NDC (u, v) ∈ [-1, 1] ----
@@ -447,6 +454,23 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // ---- age 继承（同 slot 且 world cell 未变 → 续龄；换 cell 时 bake 已清零）----
   var age = ddgi_meta_age(ddgi_meta[slot]);
+  // ---- 世界编辑（脏区）→ 把年龄压回 1：**长窗口不牺牲编辑响应** ----
+  // 稳态用的是 DDGI_ALPHA 的长窗口（≈3000 次更新 ≈ 50s），光靠它跟世界编辑要几十秒才显形。
+  // 而编辑带**精确信号**：`dirty_min.w` 只在"本帧真的上传了世界数据"那一帧为 1（Rust 侧每帧
+  // 覆盖写 `BrickMapDirty`，无脏区时 min == max ⇒ w = 0），所以这里既不会误触发、也不会常驻
+  // 为真（常驻为真会让这些探针每帧走 alpha=1 直写，等于把时域平滑整个关掉）。
+  // 压低 age ⇒ 该探针回到 `ddgi_age_alpha` 的 1/age 等权斜坡（约 30 帧重新收敛），并因
+  // `!converged` 自动进入本帧 worklist（即使它不在"屏幕用到"的工作集里）—— 这正是
+  // DDGI_ALPHA 的注释所依赖的那条快跟随通道（它一度在重构中丢失）。
+  // 判据与 bake 的脏区判定**逐字一致**（"cell 的 voxel AABB 与脏区 AABB 相交"），
+  // 保证"被重烘的 cell"与"被重置 age 的 cell"是同一批。
+  let cell_lo = vec3<f32>(cmin);
+  let cell_hi = cell_lo + f32(cs);
+  if (ddgi_u.dirty_min.w > 0.5
+      && all(cell_hi > ddgi_u.dirty_min.xyz)
+      && all(cell_lo < ddgi_u.dirty_max.xyz)) {
+    age = 1u;
+  }
   // 判活条件严格对齐 Douglas #23：有探针 && (本 cell 或 6 邻接有体素 || 与物体 AABB 相交)。
   // 旧版额外加了「不落在更细一级 LOD 盒内」的排除，用来省重复投线 —— 但它的代价是：
   // 粗级的探针只要落点被细盒包住就永不投线 → 图集恒 0 → 壳边界附近整圈像素采到空数据

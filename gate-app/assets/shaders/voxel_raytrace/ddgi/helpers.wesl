@@ -1,7 +1,7 @@
 import package::bindings::{b_struct, ddgi_cell_slot, ddgi_u, g};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, NODE_FIXED_WORDS};
-import package::ddgi::consts::{DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS, DDGI_USAGE_STICKY};
+import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS, DDGI_USAGE_STICKY};
 import package::world::{world_solid};
 
 fn ddgi_merge_state(a: u32, b: u32) -> u32 {
@@ -330,21 +330,35 @@ fn ddgi_slot(lod: u32, wc: vec3<i32>) -> u32 {
   // 改成 Douglas 的"最大的全空子块"后，格内只要有空体素就一定放得出探针，无需再重定向。）
   return ddgi_slot_own(lod, wc);
 }
-/// 「屏幕使用」漏桶计数：给这个槽位记一次（上限 DDGI_USAGE_STICKY，`ddgi_sort` 每帧 -1）。
+/// 「屏幕使用」粘滞标记：把该槽位置为**满值**（`DDGI_USAGE_STICKY`，`ddgi_sort` 每帧 -1）。
 ///
 /// 由**着色**路径在每个"候选角"上调用（见 `ddgi_sample_lod` 的闸门之后 / 图集取样之前），
 /// 代表"本帧有像素会用这个探针的数据"。工作集选择（sort）就靠它 —— 见 DDGI_USAGE_STICKY 的
 /// 说明：射线的去处**跟着像素走**，而不是按距离猜。
 ///
-/// 【为什么不用原子】并发丢更新无害：判据只关心 >0 与衰减节奏，竞态只会**低估计数**，
-/// 而抽样记账本身每 8 帧就会给同一个可见探针再加一次（上限饱和）。用原子反而把每个角的
-/// 记账变成独占访问 —— 相邻像素共享同几个槽位，会撞在同一个 cache line 上。
+/// 【为什么置满值，而不是 `c + 1`（旧式）】记账是**抽样**的（见 DDGI_USAGE_SCAN_MASK），
+/// 一个探针每帧只可能被"落在它屏幕 footprint 里的那部分采样像素"点到。按 +1 计的话，一次
+/// 记账只换来 1 帧的 `used`（下一帧就被 -1 抹平），于是**footprint 很小的探针**（薄几何 /
+/// 细缝 / 小特征 —— 也就是"细微处"）会在工作集里**进进出出**：它可能每 ~4 帧才被点到一次，
+/// 而覆盖周期（MASK+1）本来就是 8 帧 ⇒ `used` 时而真时而假。后果不是"少投几条线"这么轻：
+/// 它的 `age` 长期停在离开工作集时的值（12~32，见 DDGI_SKIP_AGE），`ddgi_age_alpha` 据此
+/// 给它一个 1/12~1/32 的大增益（设计值的 94~250 倍）⇒ 每次零星刷新（`due` 错峰 / 偶尔被
+/// 采样到）都把图集值**跳 3%~8%** ⇒ 那些像素**逐帧跳变**（Probe 档在这些角上显示
+/// 品红/红/橙/浅绿：主路径从来没能稳定入选，值全靠各级兜底拼出来）。
+/// 置满值才是 DDGI_USAGE_STICKY 注释所写的语义 ——"只要在最近 <本值> 帧里被屏幕采样过，
+/// 就留在工作集里"；记账的**密度**因此不再决定窗口长度，而只决定"多久必须被再点到一次"
+/// （窗口 ≥ 覆盖周期即可，见该常量的取值约束）。
+/// 【为什么不用原子】满值写入是**幂等**的：并发写同一个值，丢更新完全无害。用原子反而把每个
+/// 角的记账变成独占访问 —— 相邻像素共享同几个槽位，会撞在同一个 cache line 上。
 /// 【为什么必须只在着色路径调用】cast 里回读 GI 时也会走 `ddgi_sample`；若那里也记账，
 /// 射线多的探针会给自己加更多射线（正反馈）。
+/// 【在着色路径的哪些调用里记】**所有**可能给出显示值的 `ddgi_sample_lod` 调用（主级 / 同级
+/// 放宽 / 级联混合伙伴 / 逐级退粗兜底），但只记**没被 clamp 过**的角 —— 见 `ddgi_sample_lod`
+/// 的记账注释：只记主级会让"只被兜底路径采样到"的探针永远拿不到射线，这正是逐帧跳变的成因之一。
 fn ddgi_usage_mark(slot: u32) {
-  let c = ddgi_cell_slot[slot];
-  if (c < DDGI_USAGE_STICKY) {
-    ddgi_cell_slot[slot] = c + 1u;
+  // 先读一次只是为了省重复写：满值时不再写（记账点每帧几十万次，读比写便宜）。
+  if (ddgi_cell_slot[slot] != DDGI_USAGE_STICKY) {
+    ddgi_cell_slot[slot] = DDGI_USAGE_STICKY;
   }
 }
 /// 窗口原点（cell 单位）。origin.xyz 已按 cs 对齐，故整除精确。（LOD0 的编址原点在
@@ -481,21 +495,27 @@ fn ddgi_lum(c: vec3<f32>) -> f32 {
 fn ddgi_maxc(c: vec3<f32>) -> f32 {
   return max(c.x, max(c.y, c.z));
 }
-/// 时域混合系数按**探针年龄**给：历史越短越信当帧样本。
+/// 时域混合系数：分**收敛斜坡**与**稳态长窗口**两段，以 `age` 到达上限（`DDGI_AGE_MAX`）分界。
 ///
-/// 为什么需要：老实现是「age ≤ 1 直写一帧原始估计，之后恒用 DDGI_ALPHA(0.015)」。那一帧
-/// 原始估计只有 rpp 条射线（满活跃时 rpp≈4）→ 方差极大；而 0.015 的时间常数 ≈67 帧。
-/// 合起来就是「先糊一帧、再花 1 秒慢慢擦」——刚加载、相机滚动带进新探针的那条带，正好都
-/// 落在新探针上，于是感知到的就是"DDGI 收敛很慢"。
+///   · 斜坡段（`age < DDGI_AGE_MAX`）：`1/age` 的**等权滑动平均** —— `age` 就是"这个探针已经
+///     积累了多少次 collect"，所以 `1/age` 是真·等权平均：误差按 1/√n 下降（统计上的最优
+///     等权平均），前 5 帧就把噪声压掉一半以上。`age ≤ 1` 时 `1/age = 1` → 与原 `snap`
+///     （直写）逐位一致：新烘探针第一帧是精确覆写，换主/编辑时 age 被压到 1~8 → 这几帧快速
+///     跟上新位置（见 bake 的换主说明、sort 的脏区分支）。
+///   · 稳态段（`age` 已到上限 = 探针彻底收敛）：一律 `base`（长窗口，负责压稳态逐帧脉动）。
 ///
-/// 换成 1/age 的**等权滑动平均**后：
-///   · 年龄 n 的样本方差按 1/n 下降（统计上的最优等权平均）→ 前 5 帧就把噪声压掉一半以上，
-///     而感知上的"收敛"恰恰发生在这几帧；
-///   · 年龄 ≥ 1/DDGI_ALPHA（≈67）时自动切回 DDGI_ALPHA → **稳态逐帧脉动完全不变**
-///     （静止画面不会因此变吵）；DDGI_ALPHA 想调也不会和这里打架。
-/// age ≤ 1 时 1/age = 1 → 与原 `snap`（直写）行为逐位一致，所以新烘探针第一帧仍是精确覆写。
+/// 【为什么不能写成 `max(base, 1/age)`（旧式）】`base` 是**稳态**窗口（辐照度取 1/3000），
+/// 而 `1/base` = 3000 **远大于** age 的上限 255（worklist/meta 只给它 8 位）⇒ `max` 永远取
+/// `1/age` ⇒ **`base` 是死代码**："稳态窗口 = 1/base 帧"从未生效，稳态增益被 age 上限钉在
+/// 1/255（是设计值的 12×）→ 静止画面一直有逐帧脉动。所以必须显式分成两段。
+///
+/// 【为什么在"age 到上限"处切，而不是更早】斜坡段的误差 = σ_est/√n，所以切得越早、留下的
+/// **静态**噪声越大（age=32 处切 → 0.18·σ_est，age=255 处切 → 0.06·σ_est）。等到上限再切，
+/// 静态噪声只比"继续用 1/age 往下压"差 1.4×，而**逐帧**抖动能低 3~5× —— 后者才是"静止相机
+/// 也看得见"的那个量。
 fn ddgi_age_alpha(age: u32, base: f32) -> f32 {
-  return max(base, 1.0 / f32(max(age, 1u)));
+  if (age < DDGI_AGE_MAX) { return 1.0 / f32(max(age, 1u)); }
+  return base;
 }
 
 // ddgi_update_texel：历史遗留的旧混合路径，**当前无人调用**（collect 直接用 mix(prev,new,a)）。
