@@ -43,6 +43,33 @@ pub const DDGI_LODS: u32 = 4;
 /// **cell 与 dims 是一对此消彼长的量**：要"覆盖更大 + 间距不变"，只能加大 dims
 /// （或增加级数），代价落在 collect/sort/图集，而不是改 cell。
 pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
+/// DDGI 世界网格相对世界 AABB **向外扩的量**（voxel，六个方向各扩这么多）。只作用于
+/// `DdgiWorldGrid`（LOD1~3 的规则网格与各级的"空间盒"）；**不动** `DdgiChunkGeom`
+/// （LOD0 的 chunk 段仍按真实 AABB 分配）⇒ LOD0 的 chunk 数、槽位段、探针池全部不变。
+///
+/// 【不扩会怎样（实测症状）】各级原点按**自己的 cell**向下对齐（`align_down(min, cell)`），
+/// 级间粒度不同 ⇒ 世界边界面上会出现一圈"只有粗级覆盖"的环。nuke.vox 的 AABB `min.y = 16`：
+/// `align_down(16,16) = 16`，而 `align_down(16,32) = 0` ⇒ 落在 [0,16) 的点被判进 **LOD1 壳**。
+/// 而采样点还会沿法线外推（`dda_main` 的 `n_off ≥ 0.5` 体素）⇒ **世界底面朝下的面**正好掉出
+/// LOD0 盒、被按 LOD1（cell=32）采样 → `Domain` 档显示**黄色**（应为红）。
+///
+/// 更要命的是粗级 cell 的探针位置是**从细级继承**来的（`ddgi_place_probe` 的 `lod > 0` 分支：
+/// 取本 cell 覆盖的 8 个细级 cell 里最近的那个已放置探针）⇒ 它落在世界内部、位于该面的
+/// **上方** ⇒ 对朝下的面 `wn_raw < 0` 全部背向（Probe 档**品红**，且与"窗口外"的橙色角平票）
+/// ⇒ `wsum = 0` → `gi = 0`；而 `cov/conf` 只看"有没有数据"、不看朝向 ⇒ `amb` 被压到
+/// `DDGI_AMBIENT_FLOOR` ⇒ **世界底面的下表面纯黑 + GI≈0 处的阈值锯齿**。
+///
+/// 【扩一格 16 之后】边界面上任意点到 LOD0 盒的 `min` 面至少 **15 体素** ⇒ 稳定落在 LOD0 壳
+/// ⇒ 采样细级；而细级在世界外侧的 cell **本来就有探针**（`lod0_needed_chunks` 规则 ②：
+/// 几何贴 chunk 边界 16 体素以内时，相邻 chunk 也领段）⇒ 朝下的面终于拿到"外侧同侧探针"
+/// （它的下向辐照度就是天空）⇒ 被正确点亮。16 = 一个 LOD0 cell，正好覆盖"外推 ≤ 0.53 体素 +
+/// stencil 半格"所需的余量。
+///
+/// 【代价】LOD1~3 的原点最多再降 16、每轴 dims 至多 +1 ⇒ 总槽位小幅上升（nuke 量级：
+/// 352256(池) + 44640+5760+800 → +约 6300）⇒ `DDGI_ATLAS_LAYERS` 同步 256 → 272（+~10MB）。
+/// 容量/预算不变量由 `ddgi_worklist_pack_covers_atlas_capacity` / `chunk_lod0_atlas_capacity` /
+/// `vram_layout_budget_2gb` 守着。
+pub const DDGI_GRID_MARGIN: i32 = 16;
 // 槽位映射是**世界锚定**的：shader 里 `slot = slot_base + (世界 cell 号 mod dims)`（见
 // `ddgi_slot`）。因此「槽位 ↔ 世界 cell」的身份与相机无关 —— 相机滚动只会让「新进入窗口的
 // 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份，图集不会因相机
@@ -298,6 +325,10 @@ impl DdgiWorldGrid {
   /// 【原点对齐】按 cell 向下对齐，保证 shader 里「世界 cell 号 = (p - origin) / cell」
   /// 精确整除 —— 世界锚定的槽位映射（`slot = base + 世界 cell mod dims`）才成立。
   pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
+    // 先向外扩 DDGI_GRID_MARGIN（原因见该常量的推导）。**只扩网格**：`DdgiChunkGeom` 仍按真实
+    // AABB 算，所以 LOD0 的 chunk 段数量与分配完全不变。
+    let aabb_min = aabb_min - IVec3::splat(DDGI_GRID_MARGIN);
+    let aabb_max = aabb_max + IVec3::splat(DDGI_GRID_MARGIN);
     let mut out = Self::default();
     let mut base = 0u32;
     for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
