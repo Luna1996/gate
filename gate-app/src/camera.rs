@@ -27,21 +27,23 @@ const ROT_SPEED: f32 = 0.005; // rad/px（右键拖拽旋转）
 pub(crate) const ZOOM_LOG_SPEED: f32 = 0.35; // /行（滚轮乘法缩放，各距离档手感一致）
 
 // ---- 幽灵模式（Minecraft spectator 风格：无碰撞自由飞行）----
-// 速度单位 = voxel/s；1 voxel = 2cm（512 voxel = 10.24m）→ 256 v/s ≈ 5.1 m/s。
-/// 默认飞行速度（voxel/s）
-pub(crate) const FLY_SPEED_DEFAULT: f32 = 256.0;
+// 速度单位 = voxel/s；1 voxel = 2cm（512 voxel = 10.24m）→ 128 v/s ≈ 2.6 m/s。
+/// 默认飞行速度（voxel/s；低速档基础速度）
+pub(crate) const FLY_SPEED_DEFAULT: f32 = 128.0;
+/// 高速档倍率：Shift 切到高速时实际速度 = 基础速度 × 此值（低速的 2 倍）
+pub(crate) const FLY_SPEED_FAST_MUL: f32 = 2.0;
 /// 飞行速度滑杆的范围 / 步进（Camera tab 与 clamp 共用；16 v/s ≈ 0.32 m/s，2048 v/s ≈ 41 m/s）
 pub(crate) const FLY_SPEED_MIN: f32 = 16.0;
 pub(crate) const FLY_SPEED_MAX: f32 = 2048.0;
 pub(crate) const FLY_SPEED_STEP: f32 = 16.0;
 
-/// 相机模式（main world Resource）。切换的唯一入口是 DebugView 的 Camera tab 开关。
+/// 相机模式（main world Resource）。切换的唯一入口是 DebugView 的 Camera tab 互斥按钮组。
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CameraMode {
   /// 轨道相机（P2.6）：右键旋转 / 中键平移 / 滚轮缩放
-  #[default]
   Orbit,
-  /// 幽灵飞行：WASD 沿视线平移、Ctrl 升 / Shift 降，**不做碰撞检测**
+  /// 幽灵飞行：WASD 沿视线平移、Space 升 / Ctrl 降，**不做碰撞检测**（默认模式）
+  #[default]
   Fly,
 }
 
@@ -51,8 +53,10 @@ pub enum CameraMode {
 pub struct FlyCamera {
   /// 眼位（voxel）
   pub pos: Vec3,
-  /// 基础飞行速度（voxel/s）
+  /// 基础飞行速度（voxel/s；**低速档**值，滑杆改的就是它）
   pub speed: f32,
+  /// Shift 切换：true = 高速档（实际速度 = `speed` × [`FLY_SPEED_FAST_MUL`]）
+  pub fast: bool,
 }
 
 impl Default for FlyCamera {
@@ -60,6 +64,18 @@ impl Default for FlyCamera {
     Self {
       pos: Vec3::new(700.0, 560.0, 700.0),
       speed: FLY_SPEED_DEFAULT,
+      fast: false,
+    }
+  }
+}
+
+impl FlyCamera {
+  /// 本帧实际飞行速度（低速档 = 基础速度，高速档 = 基础速度 × 倍率）
+  pub fn effective_speed(&self) -> f32 {
+    if self.fast {
+      self.speed * FLY_SPEED_FAST_MUL
+    } else {
+      self.speed
     }
   }
 }
@@ -154,8 +170,9 @@ pub(crate) fn orbit_camera_input(
   }
 }
 
-/// 幽灵模式飞行输入（仅 Fly 模式，**无碰撞**）：WASD 沿视线平移，Space 上升 / Shift 下降（世界 +Y）。
+/// 幽灵模式飞行输入（仅 Fly 模式，**无碰撞**）：WASD 沿视线平移，Space 上升 / Ctrl 下降（世界 +Y）。
 /// 前进/右向取自当前 yaw/pitch，所以「往哪看就往哪飞」；斜向移动归一化，速度与单键一致。
+/// Shift **按下切换**低速/高速档（高速 = 低速 × [`FLY_SPEED_FAST_MUL`]），不是按住加速。
 ///
 /// **不按 UI 指针捕获闸门**：`UiPointerCaptured` 只对鼠标有意义（拖滑杆/点击控件），
 /// 用它挡键盘会导致"鼠标恰好停在 DebugView 面板上时飞不动"。
@@ -168,6 +185,15 @@ pub(crate) fn fly_camera_input(
 ) {
   if *mode != CameraMode::Fly {
     return;
+  }
+  // Control 切换低速/高速档（just_pressed = 按一下切一次，不是按住）
+  if keys.just_pressed(KeyCode::ControlLeft) || keys.just_pressed(KeyCode::ControlRight) {
+    fly.fast = !fly.fast;
+    bevy::log::info!(
+      "FLY SPEED MODE → {} ({:.0} v/s)",
+      if fly.fast { "fast" } else { "slow" },
+      fly.effective_speed(),
+    );
   }
   // dt 上限 0.1s：断点/长卡顿后不会一帧瞬移出去（代价是那种帧里"飞得慢一点"）
   let dt = time.delta_secs().min(0.1);
@@ -193,8 +219,8 @@ pub(crate) fn fly_camera_input(
     dir -= Vec3::Y;
   }
   if let Some(d) = dir.try_normalize() {
-    // 先把速度读出来：`fly.pos += ... fly.speed ...` 会同时要求 fly 的可变与不可变借用
-    let speed = fly.speed;
+    // 先把速度读出来：`fly.pos += ... fly.effective_speed() ...` 会同时要求可变与不可变借用
+    let speed = fly.effective_speed();
     fly.pos += d * speed * dt;
   }
 }

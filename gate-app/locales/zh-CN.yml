@@ -1,0 +1,90 @@
+# gate-app 中文文案表（rust-i18n 编译期 codegen 进二进制）
+#
+# 格式：_version 1 = 每语言一个文件（locales/<locale>.yml），加语言 = 加文件 + 在
+# DebugView 露出切换项（调 rust_i18n::set_locale）。
+#
+# 约定：
+# - 键 = 「模块.控件」语义路径，调用点写 t!("模块.控件")
+# - 占位符 %{name}；**定长对齐的数字由调用点先 format! 好再传入**（%{x} 是原样替换，
+#   不会丢 "{:>7.1}" 这类宽度），所以数字列宽不随语言变化
+# - 只收**可见 UI 文案**。以下保持英文、不进本表：
+#   日志、技术标识符（DDGI / LOD / wsum / Domain / Probe）、单位（v/s、vx）、
+#   材质预设名（EDIT_MATERIALS.name，属于数据层，见 docs 后续）
+_version: 1
+
+# ---------------- 面板 Tab ----------------
+tab.stats: "状态"
+tab.ddgi: "DDGI"
+tab.camera: "相机"
+tab.edit: "编辑"
+tab.eye: "眼睛"
+
+# ---------------- Stats 页 ----------------
+stats.fps_idle: "帧率: 当前 ---, 平均 ---, 最低 ---, 最高 ---"
+stats.fps: "帧率: 当前 %{cur}, 平均 %{avg}, 最低 %{min}, 最高 %{max}"
+stats.cam_idle: "相机: (---,---,---)\n注视点: (---,---,---)"
+stats.camera: "相机: (%{x}, %{y}, %{z})"
+stats.target: "注视点: (%{x}, %{y}, %{z})"
+stats.dir: "朝向(度): yaw %{yaw}, pitch %{pitch}"
+stats.vsync: "垂直同步"
+stats.showcase: "UI 展示窗"
+
+# ---------------- DDGI 页 ----------------
+ddgi.stage.off: "关闭"
+ddgi.stage.active: "激活"
+ddgi.stage.cast: "投射"
+ddgi.stage.full: "完整"
+ddgi.probe_viz: "探针可视化"
+
+# ---------------- Camera 页 ----------------
+camera.mode: "相机模式"
+camera.mode.orbit: "轨道"
+camera.mode.fly: "自由"
+camera.speed: "速度"
+
+# ---------------- Edit 页 ----------------
+edit.shape: "形状"
+edit.shape.sphere: "球体"
+edit.shape.cube: "立方体"
+edit.size: "大小"
+edit.size.value: "%{size} vx (跨度 %{span})"
+edit.material: "材质"
+
+# ---------------- Eye 页 ----------------
+eye.enabled: "自动曝光"
+eye.ev_up: "EV 上限"
+eye.ev_dn: "EV 下限"
+eye.tau_up: "Tau 上限"
+eye.tau_dn: "Tau 下限"
+eye.key: "Key"
+
+# ---------------- 右上角组件展示窗 ----------------
+showcase.tab.widgets: "组件"
+showcase.tab.data: "数据"
+showcase.title: "UI 组件展示"
+showcase.subtitle: "gate-ui 组件陈列"
+showcase.section.buttons: "按钮"
+showcase.button.primary: "主要"
+showcase.button.secondary: "次要"
+showcase.button.ghost: "幽灵"
+showcase.button.danger: "危险 / 破坏性"
+showcase.section.checkbox: "复选框"
+showcase.checkbox.a: "选项 A（默认勾选）"
+showcase.checkbox.b: "选项 B"
+showcase.section.slider: "滑杆（0..100, 步长 5）"
+showcase.section.plot: "折线图（折线 + 纵轴标签）"
+showcase.section.list: "列表 / RingList（事件日志，容量 6）"
+showcase.log.ready: "展示窗就绪"
+showcase.log.try_all: "试试每个组件"
+showcase.section.faint: "faint：仅 lg 18px 大号标签"
+showcase.section.splitter: "分割线"
+showcase.splitter.left: "左"
+showcase.splitter.right: "右"
+showcase.section.grid: "网格（3 列，格线十字连通）"
+showcase.section.scroll: "滚动视图（滚轮滚动）"
+showcase.scroll_row: "滚动行 %{i}"
+showcase.title.data: "数据展示"
+showcase.section.table: "表格（表头 + 斑马纹）"
+showcase.table.name: "名称"
+showcase.table.value: "数值"
+showcase.table.status: "状态"

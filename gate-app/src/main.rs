@@ -38,6 +38,15 @@ use edit::voxel_edit_input;
 use scene::setup;
 use showcase::{showcase_demo_system, spawn_showcase};
 
+// i18n 文案表：编译期把 gate-app/locales/*.yml codegen 进二进制（`t!` 查表零 IO），
+// fallback 设成缺省语言 —— 某语言少一条键时回落到中文，而不是把裸 key 显示到 UI 上。
+// 加语言 = 加 locales/<locale>.yml（+ Cargo.toml 的 available-locales），
+// 运行期切语言 = rust_i18n::set_locale。
+rust_i18n::i18n!("locales", fallback = "zh-CN");
+
+/// 缺省语言（`set_locale` 的入参；新增语言后由 DebugView 的切换项覆写）
+pub const DEFAULT_LOCALE: &str = "zh-CN";
+
 /// 以 crate 目录为锚的 assets 路径，F5 / 终端启动行为一致
 pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
 
@@ -52,6 +61,10 @@ fn main() {
   // zone 被丢弃，不阻塞、不报错。
   #[cfg(feature = "profile")]
   let _tracy_client = tracy_client::Client::start();
+
+  // i18n：把当前语言定成缺省中文。**必须在任何 t! 求值之前**——UI 是启动时一次性
+  // spawn（demo_ui_setup），文本一旦生成就不再重算，晚了就会留一份旧语言的面板。
+  rust_i18n::set_locale(DEFAULT_LOCALE);
 
   // 【诊断】GATE_BENCH=1：静默后台（窗口不可见）+ vsync Fifo
   let bench = std::env::var("GATE_BENCH").as_deref() == Ok("1");

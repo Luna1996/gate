@@ -21,6 +21,8 @@ use gate_ui::{
   },
 };
 
+use rust_i18n::t;
+
 use crate::edit::{BrushShape, EDIT_MATERIALS, EDIT_SIZE_MAX, EDIT_SIZE_MIN, EditSettings};
 use crate::showcase::ShowcaseRoot;
 
@@ -76,9 +78,9 @@ struct DdgiProbeVizLodSlider;
 #[derive(Component)]
 struct DdgiProbeVizLodValueLabel;
 
-/// 「Fly mode」开关标记（观察者写 [`crate::camera::CameraMode`]）
+/// 相机模式按钮（互斥单选；值 = 该按钮代表的模式）
 #[derive(Component)]
-struct CameraModeToggle;
+struct CameraModeBtn(crate::camera::CameraMode);
 
 #[derive(Component)]
 struct CameraSpeedSlider;
@@ -125,7 +127,7 @@ const DDGI_DEBUG_MODES: [&str; 5] = ["Normal", "GI", "wsum", "Domain", "Probe"];
 
 const DDGI_STAGES: [&str; 4] = ["Off", "Active", "Cast", "Full"];
 
-/// 速度显示文本（voxel/s；1 voxel = 2cm）
+/// 速度显示文本（voxel/s；1 voxel = 2cm）。单位 v/s 是量纲，不进文案表
 fn speed_text(v: f32) -> String {
   format!("{} v/s", v.round() as i32)
 }
@@ -135,9 +137,26 @@ fn value_text(v: f32) -> String {
   format!("{v:.2}")
 }
 
-/// 笔触跨度文本：size → (2N-1)³ 的边长（纯 ASCII，避免字体缺字形成方框）
+/// 笔触跨度文本：size → (2N-1)³ 的边长
 fn brush_span_text(size: u32) -> String {
-  format!("{size} vx (span {})", 2 * size.max(1) - 1)
+  t!(
+    "edit.size.value",
+    size = size,
+    span = 2 * size.max(1) - 1
+  )
+  .to_string()
+}
+
+/// DDGI 阶段名的本地化标签（下标与 [`DDGI_STAGES`] 同序）。
+/// [`DDGI_STAGES`] 保持英文原名不动 —— 它同时喂 `info!` 日志，日志不翻译。
+fn ddgi_stage_label(i: usize) -> String {
+  match i {
+    0 => t!("ddgi.stage.off"),
+    1 => t!("ddgi.stage.active"),
+    2 => t!("ddgi.stage.cast"),
+    _ => t!("ddgi.stage.full"),
+  }
+  .into()
 }
 
 /// 材质预览色
@@ -161,7 +180,7 @@ pub(crate) fn fps3(v: f32) -> u32 {
 /// TabView（fit_content 自适应高度模式）五页：
 /// - Stats：FPS 读数 / 相机信息 / VSync / UI Showcase
 /// - DDGI：阶段档 / 调试模式 / Gain / Probe Viz / LOD
-/// - Camera：轨道↔幽灵模式开关 / 飞行速度 / 操作说明
+/// - Camera：相机模式互斥按钮（轨道 / 自由）/ 飞行速度 / 操作说明
 /// - Edit：体素编辑笔触（形状 / 大小 / 材质）
 /// - Eye：眼睛适应（自动曝光）活参数（EV 上下限 / 时间常数 / 目标中灰）
 ///
@@ -181,9 +200,10 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
     .get_resource::<gate_render::ddgi::DdgiDebugSettings>()
     .copied()
     .unwrap_or_default();
-  let cam_fly = world
+  let cam_mode = world
     .get_resource::<crate::camera::CameraMode>()
-    .is_some_and(|m| *m == crate::camera::CameraMode::Fly);
+    .copied()
+    .unwrap_or_default();
   let fly_speed = world
     .get_resource::<crate::camera::FlyCamera>()
     .map_or(crate::camera::FLY_SPEED_DEFAULT, |f| f.speed)
@@ -235,7 +255,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           ctx,
           cell,
           LabelConfig {
-            text: "FPS: CUR ---, AVG ---, MIN ---, MAX ---".into(),
+            text: t!("stats.fps_idle").into(),
             ..default()
           },
         );
@@ -249,11 +269,11 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
         root,
         TabConfig {
           tabs: vec![
-            "Stats".into(),
-            "DDGI".into(),
-            "Camera".into(),
-            "Edit".into(),
-            "Eye".into(),
+            t!("tab.stats").into(),
+            t!("tab.ddgi").into(),
+            t!("tab.camera").into(),
+            t!("tab.edit").into(),
+            t!("tab.eye").into(),
           ],
           active: 0,
           fit_content: true,
@@ -274,7 +294,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ctx,
                 cell,
                 LabelConfig {
-                  text: "CAMERA (---,---,---)\nTARGET (---,---,---)".into(),
+                  text: t!("stats.cam_idle").into(),
                   ..default()
                 },
               );
@@ -294,7 +314,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ctx,
                 cell,
                 ToggleSwitchConfig {
-                  text: Some("VSync".into()),
+                  text: Some(t!("stats.vsync").into()),
                   checked: true, // 默认开，与启动 present_mode=Fifo 同步
                   ..default()
                 },
@@ -308,7 +328,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ctx,
                 cell,
                 ToggleSwitchConfig {
-                  text: Some("UI Showcase".into()),
+                  text: Some(t!("stats.showcase").into()),
                   checked: false, // 默认隐藏 showcase，与 spawn_showcase 初始 Hidden 同步
                   ..default()
                 },
@@ -369,7 +389,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                       text: format!(
                         "{} {}",
                         ddgi_stage,
-                        DDGI_STAGES[(ddgi_stage as usize).min(DDGI_STAGES.len() - 1)]
+                        ddgi_stage_label((ddgi_stage as usize).min(DDGI_STAGES.len() - 1))
                       ),
                       style: LabelStyle::Muted,
                       ..default()
@@ -422,7 +442,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ctx,
                 cell,
                 ToggleSwitchConfig {
-                  text: Some("Probe Viz".into()),
+                  text: Some(t!("ddgi.probe_viz").into()),
                   checked: ddgi_dbg.probe_viz,
                   ..default()
                 },
@@ -484,26 +504,60 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
           });
         });
       strip_last_cell_bottom(root.world_mut(), tv.contents[1]);
-      // ============ Tab 2：Camera（轨道 ↔ 幽灵模式 + 飞行速度）============
+      // ============ Tab 2：Camera（轨道/自由 互斥按钮 + 飞行速度）============
       root
         .world_mut()
         .entity_mut(tv.contents[2])
         .with_children(|page| {
           let g = tab_page_grid(ctx, page);
           page.world_mut().entity_mut(g).with_children(|g| {
-            // 相机模式开关：关 = 轨道（P2.6 原行为），开 = 幽灵飞行。**唯一切换入口**。
+            // 相机模式：互斥按钮组（轨道 / 自由）。**唯一切换入口**。
             let cell = tab_cell(ctx, g);
             g.world_mut().entity_mut(cell).with_children(|cell| {
-              let t = toggle_switch(
-                ctx,
-                cell,
-                ToggleSwitchConfig {
-                  text: Some("Fly mode".into()),
-                  checked: cam_fly,
-                  ..default()
-                },
-              );
-              cell.world_mut().entity_mut(*t).insert(CameraModeToggle);
+              cell
+                .spawn((
+                  Name::new("cam-mode-row"),
+                  Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ctx.theme.metrics.spacing.sm),
+                    align_items: AlignItems::Center,
+                    ..default()
+                  },
+                ))
+                .with_children(|row| {
+                  label(
+                    ctx,
+                    row,
+                    LabelConfig {
+                      text: t!("camera.mode").into(),
+                      style: LabelStyle::Muted,
+                      ..default()
+                    },
+                  );
+                  for (mode, name) in [
+                    (
+                      crate::camera::CameraMode::Orbit,
+                      t!("camera.mode.orbit"),
+                    ),
+                    (crate::camera::CameraMode::Fly, t!("camera.mode.fly")),
+                  ] {
+                    let variant = if mode == cam_mode {
+                      ButtonVariant::Primary
+                    } else {
+                      ButtonVariant::Ghost
+                    };
+                    let b = button(
+                      ctx,
+                      row,
+                      ButtonConfig {
+                        text: name.into(),
+                        variant,
+                        ..default()
+                      },
+                    );
+                    row.world_mut().entity_mut(*b).insert(CameraModeBtn(mode));
+                  }
+                });
             });
             // 飞行速度（voxel/s；只在 Fly 模式下生效，1 voxel = 2cm）
             let cell = tab_cell(ctx, g);
@@ -523,7 +577,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     ctx,
                     row,
                     LabelConfig {
-                      text: "Speed".into(),
+                      text: t!("camera.speed").into(),
                       style: LabelStyle::Muted,
                       ..default()
                     },
@@ -582,14 +636,14 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     ctx,
                     row,
                     LabelConfig {
-                      text: "Shape".into(),
+                      text: t!("edit.shape").into(),
                       style: LabelStyle::Muted,
                       ..default()
                     },
                   );
                   for (shape, name) in [
-                    (BrushShape::Sphere, "Sphere"),
-                    (BrushShape::Cube, "Cube"),
+                    (BrushShape::Sphere, t!("edit.shape.sphere")),
+                    (BrushShape::Cube, t!("edit.shape.cube")),
                   ] {
                     let variant = if shape == edit.shape {
                       ButtonVariant::Primary
@@ -627,7 +681,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     ctx,
                     row,
                     LabelConfig {
-                      text: "Size".into(),
+                      text: t!("edit.size").into(),
                       style: LabelStyle::Muted,
                       ..default()
                     },
@@ -674,7 +728,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                     ctx,
                     row,
                     LabelConfig {
-                      text: "Mat".into(),
+                      text: t!("edit.material").into(),
                       style: LabelStyle::Muted,
                       ..default()
                     },
@@ -735,7 +789,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
                 ctx,
                 cell,
                 ToggleSwitchConfig {
-                  text: Some("Auto exposure".into()),
+                  text: Some(t!("eye.enabled").into()),
                   checked: eye_set.enabled,
                   ..default()
                 },
@@ -744,11 +798,11 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
             });
             // (参数下标, 标签, min, max, step, 初值) —— 下标顺序与 WESL `eye_p(i)` 一致
             for (idx, name, min, max, step, val) in [
-              (0u8, "EV up", 0.0f32, 12.0f32, 0.25f32, eye_set.ev_max),
-              (1, "EV dn", -12.0, 0.0, 0.25, eye_set.ev_min),
-              (2, "Tau up", 0.1, 8.0, 0.1, eye_set.tau_brighten),
-              (3, "Tau dn", 0.1, 8.0, 0.1, eye_set.tau_darken),
-              (4, "Key", 0.02, 0.5, 0.01, eye_set.key),
+              (0u8, t!("eye.ev_up"), 0.0f32, 12.0f32, 0.25f32, eye_set.ev_max),
+              (1, t!("eye.ev_dn"), -12.0, 0.0, 0.25, eye_set.ev_min),
+              (2, t!("eye.tau_up"), 0.1, 8.0, 0.1, eye_set.tau_brighten),
+              (3, t!("eye.tau_dn"), 0.1, 8.0, 0.1, eye_set.tau_darken),
+              (4, t!("eye.key"), 0.02, 0.5, 0.01, eye_set.key),
             ] {
               let cell = tab_cell(ctx, g);
               g.world_mut().entity_mut(cell).with_children(|cell| {
@@ -858,7 +912,7 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
       *ddgi = gate_render::ddgi::DdgiStage::new(v);
       if let Ok(mut t) = q_label.single_mut() {
         let i = (v as usize).min(DDGI_STAGES.len() - 1);
-        t.0 = format!("{} {}", v, DDGI_STAGES[i]);
+        t.0 = format!("{} {}", v, ddgi_stage_label(i));
       }
       info!(
         "DDGI stage → {} ({})",
@@ -973,19 +1027,25 @@ pub(crate) fn spawn_debug_view(world: &mut World, ctx: &UiCtx) {
     },
   );
 
-  // 「Fly mode」开关 → 写 CameraMode（位置对齐由 camera::sync_camera_mode_switch 负责）
+  // 相机模式按钮 → 写 CameraMode + 互斥切换按钮变体（选中=Primary）
+  // （位置对齐由 camera::sync_camera_mode_switch 负责）
   world.add_observer(
-    |ev: On<ToggleSwitchToggled>,
-     q_toggle: Query<(), With<CameraModeToggle>>,
+    |ev: On<UiClick>,
+     q_btn: Query<&CameraModeBtn>,
+     mut q_all: Query<(Entity, &mut ButtonVariant, &CameraModeBtn)>,
      mut mode: ResMut<crate::camera::CameraMode>| {
-      if q_toggle.get(ev.entity).is_err() {
+      let Ok(btn) = q_btn.get(ev.entity) else {
         return;
-      }
-      *mode = if ev.checked {
-        crate::camera::CameraMode::Fly
-      } else {
-        crate::camera::CameraMode::Orbit
       };
+      *mode = btn.0;
+      for (_e, mut var, b) in &mut q_all {
+        *var = if b.0 == btn.0 {
+          ButtonVariant::Primary
+        } else {
+          ButtonVariant::Ghost
+        };
+      }
+      info!("camera mode → {:?}", btn.0);
     },
   );
 
@@ -1202,13 +1262,16 @@ pub(crate) fn fps_line_feed(
   } else {
     0.0
   };
-  let txt = format!(
-    "FPS: CUR {:>3}, AVG {:>3}, MIN {:>3}, MAX {:>3}",
-    fps3(cur),
-    fps3(avg),
-    fps3(min),
-    fps3(max)
-  );
+  // 数字先各自 format! 成定长串，再交给 t! —— %{x} 是原样替换，不会吃掉 "{:>3}" 的
+  // 宽度，所以 FPS/坐标的列宽与语言无关（中文只换前缀，数字对齐不变）。
+  let txt = t!(
+    "stats.fps",
+    cur = format!("{:>3}", fps3(cur)),
+    avg = format!("{:>3}", fps3(avg)),
+    min = format!("{:>3}", fps3(min)),
+    max = format!("{:>3}", fps3(max))
+  )
+  .to_string();
   *acc = 0.0;
   *frames = 0;
   if let Ok(mut t) = q.p0().single_mut()
@@ -1220,24 +1283,37 @@ pub(crate) fn fps_line_feed(
   // （幽灵模式下没有"轨道目标"，继续显示它只会给出误导读数。）
   let (eye, line2) = match *mode {
     crate::camera::CameraMode::Orbit => {
-      let t = orbit.target;
+      let target = orbit.target;
       (
         orbit.eye(),
-        format!("TARGET: ({:>7.1}, {:>7.1}, {:>7.1})", t.x, t.y, t.z),
+        t!(
+          "stats.target",
+          x = format!("{:>7.1}", target.x),
+          y = format!("{:>7.1}", target.y),
+          z = format!("{:>7.1}", target.z)
+        )
+        .to_string(),
       )
     }
     crate::camera::CameraMode::Fly => (
       fly.pos,
-      format!(
-        "DIR(deg): yaw {:>6.1}, pitch {:>5.1}",
-        orbit.yaw.to_degrees(),
-        orbit.pitch.to_degrees()
-      ),
+      t!(
+        "stats.dir",
+        yaw = format!("{:>6.1}", orbit.yaw.to_degrees()),
+        pitch = format!("{:>5.1}", orbit.pitch.to_degrees())
+      )
+      .to_string(),
     ),
   };
   let cam_txt = format!(
-    "CAMERA: ({:>7.1}, {:>7.1}, {:>7.1})\n{}",
-    eye.x, eye.y, eye.z, line2
+    "{}\n{}",
+    t!(
+      "stats.camera",
+      x = format!("{:>7.1}", eye.x),
+      y = format!("{:>7.1}", eye.y),
+      z = format!("{:>7.1}", eye.z)
+    ),
+    line2
   );
   if let Some(mut t) = q.p1().iter_mut().next()
     && t.0 != cam_txt
