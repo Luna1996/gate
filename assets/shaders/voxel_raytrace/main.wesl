@@ -8,7 +8,7 @@ import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_d
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
 import package::lightfield::{light_field_ao, light_field_gather};
 import package::trace::{make_grid, medium_of};
-import package::world::{voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
+import package::world::{WorldHit, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
 
 // ============================================================================
 // DDA compute shader：全屏逐像素层次栈式 mask DDA（Douglas 64-tree）。chunk 间 256³
@@ -88,6 +88,19 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
   if (all(sh.voxel == self_voxel) && sh.obj_id == self_obj) { return 1.0; }
   if (medium_of(sh.palette_base, sh.pal).a >= 1.0) { return 0.0; }   // 不透明实体遮挡
   return through;
+}
+
+/// 主射线"当前段"求交：在介质内用穿透（一路走到出射面或撞上不透明实体），
+/// 在空气侧用正常模式（找入射面 / 实体）。
+///
+/// 做成函数而不是 `var best: WorldHit; if/else 赋值`：后者要**零初始化**一个 9 字段结构体，
+/// 还可能被编译器放进 local memory —— 而 body 里要读它十几次。
+fn trace_primary(in_medium: bool, org: vec3<f32>, dir: vec3<f32>, t_min: f32, max_t: f32,
+                 tint: ptr<function, vec3<f32>>) -> WorldHit {
+  if (in_medium) {
+    return world_trace_medium(make_grid(0u), org, dir, max_t, true, tint);
+  }
+  return world_raycast(make_grid(0u), org, dir, max_t, world_cfg_full(t_min, 3u));
 }
 
 // ============================================================================
@@ -172,13 +185,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var bounce = 0u; bounce < GLASS_MAX_BOUNCE; bounce = bounce + 1u) {
     // 沿途透射色（乘性）：穿透模式下由 DDA 累积；正常模式恒为 1
     var tint = vec3<f32>(1.0);
-    var best: WorldHit;
-    if (in_medium) {
-      // 介质内：一次走完整段（stop_on_air=true ⇒ 停在出射面，或撞上不透明实体）
-      best = world_trace_medium(make_grid(0u), org, dir, frustum_length, true, &tint);
-    } else {
-      best = world_raycast(make_grid(0u), org, dir, frustum_length, world_cfg_full(t_start, 3u));
-    }
+    let best = trace_primary(in_medium, org, dir, t_start, frustum_length, &tint);
     throughput = throughput * tint;
     // 一路走到底：剩余 throughput 落到天空（循环后的 throughput·sky_rgb）
     if (!best.hit) { break; }

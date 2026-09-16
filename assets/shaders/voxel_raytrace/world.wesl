@@ -37,11 +37,11 @@ struct SceneHit {
 // 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
 // g0 = 主世界网格（由 world_raycast 入口提供，避免重复读 grid_descs）。
 fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
-  // 本函数只服务"正常模式"（penetrate=false）：介质穿透不经过它（见 [`world_trace_medium`]），
-  // 所以这里恒传一个关闭的介质上下文 —— 此时 trace_chunk 的行为与改造前逐位一致。
-  var mc_off = MediumRay(false, false, g0.palette_base, 0u, vec3<f32>(1.0));
+  // 本函数只服务"正常模式"：介质穿透不经过它（见 [`world_trace_medium`]），
+  // 所以这里 `penetrate = false` —— trace_chunk/trace_grid 一次都不碰 mc_off。
+  var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0));
   var best_t = 1e+30;
-  var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap, &mc_off), 0u);
+  var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap, false, &mc_off), 0u);
   if (best.uh.hit) {
     best_t = best.uh.t;
     best.palette_base = g0.palette_base;
@@ -49,7 +49,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
   let n = g.grid_count;
   for (var i: u32 = 1u; i < n; i = i + 1u) {
     let gi = make_grid(i);
-    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap, &mc_off);
+    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap, false, &mc_off);
     if (mhi.hit && mhi.t < best_t) {
       best_t = mhi.t;
       best.uh = mhi;
@@ -120,8 +120,8 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
 /// `stop_on_air = false`（阴影射线）：不在出射面停下，一路吃到不透明遮挡或走到底。
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
                       stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
-  var mc = MediumRay(true, stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
-  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, &mc);
+  var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
+  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, &mc);
   *tint = *tint * mc.tint;
   return WorldHit(
     h.hit, h.t, origin + dir * h.t, h.pal, h.n,
