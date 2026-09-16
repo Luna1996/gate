@@ -1,10 +1,10 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_COLL_BASE, DDGI_INDIR_COLL_TOTAL, DDGI_INDIR_COUNT_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RAY_TOTAL, DDGI_INDIR_RPP_BASE, beam_depth, ddgi_args, ddgi_cell, ddgi_indirect, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist, eye_adapt, eye_adapt_ro, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_COLL_BASE, DDGI_INDIR_COLL_TOTAL, DDGI_INDIR_COUNT_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RAY_TOTAL, DDGI_INDIR_RPP_BASE, beam_depth, ddgi_args, ddgi_cell, ddgi_indirect, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist, eye_adapt, eye_adapt_ro, gi_cov_out, gi_cov_tex, gi_out, gi_tex, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, palette_transmission, sky_rgb, srgb_to_linear};
 import package::ddgi::bake::{ddgi_bake_one};
 import package::ddgi::collect::{ddgi_collect_one};
-import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_BAKE_STAGGER, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_NBR_VALID, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
+import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_BAKE_STAGGER, DDGI_CASCADE_FADE_CELLS, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_NBR_VALID, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
 import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_nbr, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
-import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
+import package::ddgi::sample::{ddgi_box_edge_dist, ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
 import package::lightfield::{light_field_ao, light_field_gather};
 import package::trace::{make_grid};
@@ -312,10 +312,30 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let gi_on = ddgi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
-    if (gi_on) {
+    // cov = 「本点周围有没有探针数据」的覆盖度，供 conf 用。内联路径由 `ddgi_sample` 发布到
+    // `ddgi_dbg_cov`；半分辨率路径从 GI 缓冲里带出来（同一个量，只是按 2×2 像素合并过）。
+    var cov = 0.0;
+    // 半分辨率 GI（菜单开关 `flags.y`）：采样已在 `gi_main` 里按 1/2 分辨率算好，这里只双线性取用。
+    // 诊断档（params.y > 0.5）强制走内联路径 —— 那些档要看逐像素的采样细节（wsum/cov/rej/dom）。
+    let gi_half = gi_on && ddgi_u.flags.y > 0.5 && ddgi_u.params.y < 0.5;
+    if (gi_half) {
+      // uv 按**全分辨率**尺寸（`size` = out_tex 尺寸）归一化，**不能**除以 GI 纹理自己的尺寸：
+      // GI 缓冲是 1/2 分辨率，除以它会得到 2× 拉开的坐标 ⇒ GI 相对几何整体错位/偏移。
+      // 双线性取用自动混合本像素所属的 2×2 块（texel 中心落在 (2i+1)/full）。
+      let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+              / vec2<f32>(f32(size.x), f32(size.y));
+      let s = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
+      let sc = textureSampleLevel(gi_cov_tex, light_samp, guv, 0.0);
+      // premultiplied-valid 归一化：无数据（天空/介质）像素 valid = 0，不参与插值，
+      // 否则 2×2 quad 里混进天空会沿几何边缘把 GI 拉黑。
+      let gw = max(s.a, 1e-4);
+      gi = s.rgb / gw;
+      cov = sc.r / gw;
+    } else if (gi_on) {
       // 采样点只沿 n 推到体素表面外侧（n_off），保证离开命中体素；随 cell 尺寸缩放的外推
       // 由 ddgi_sample_lod 内部按该 LOD 的 cs 施加（DDGI_BIAS_CELLS）。
       gi = ddgi_sample(p_voxel + n * n_off, n) * ddgi_u.params.z / DDGI_PI;
+      cov = ddgi_dbg_cov;
     }
     // AO（Douglas #15）只作用于**常量天光**这一项：gi 已自带逐方向遮挡（探针射线自身
     // 就做了可见性判定），再乘一次 16³ 粗粒度填充率的 AO 属重复计算，且会随相机滚动
@@ -326,11 +346,17 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // conf = smoothstep(CONF_LO, CONF_HI, ddgi_dbg_cov)：判据用覆盖度 cov（本点有没有探针数据），
     // 而非 wsum（Σ wtri·wn·wd 另乘了两道照明闸门，会把「本就该黑的凹角」误判成数据不可信）；
     // conf 只补天光常量，不缩放 gi 的幅度。
-    let conf = smoothstep(DDGI_CONF_LO, DDGI_CONF_HI, ddgi_dbg_cov);
+    let conf = smoothstep(DDGI_CONF_LO, DDGI_CONF_HI, cov);
     let amb_sky = sky * DDGI_SKY_AMBIENT;
     // t_edge 是几何量（离盒边界多远），只决定用哪种兜底强度（盒外 amb_far / 盒内 amb_sky）；
     // 补多少完全由 conf 决定 → 有数据时 amb 不受 Far amb 影响。
-    let t_edge = smoothstep(0.0, 1.0, ddgi_dbg_edge);
+    // 它只依赖 p 与最外层 LOD 盒（纯函数），与走哪条 GI 采样路径无关 ⇒ 这里本地重算，
+    // 不再依赖 `ddgi_dbg_edge`（半分辨率档下那个私有量不会被赋值）。与 `ddgi_sample` 内的
+    // 式子逐字一致：clamp(盒外距离 / (cs × 过渡带宽), 0, 1)。
+    let outer_lod = DDGI_LOD_COUNT - 1u;
+    let w_edge = max(f32(ddgi_u.lods[outer_lod].origin.w) * DDGI_CASCADE_FADE_CELLS, 1e-3);
+    let t_edge = smoothstep(0.0, 1.0,
+      clamp(ddgi_box_edge_dist(outer_lod, p_voxel) / w_edge, 0.0, 1.0));
     let amb_far = sky * ddgi_u.misc.w;
     // 下限不取 0：conf=1 时归零会让无光室内恒为纯黑，而 auto exposure 对恒 0 无效（0·s = 0）；
     // DDGI_AMBIENT_FLOOR 是"多次反弹/天光渗透"的常量替身。
@@ -417,6 +443,95 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     col = col * through + refl;
   }
   write_output(coord0, col);
+}
+
+// ============================================================================
+// 半分辨率 GI（菜单开关 `ddgi_u.flags.y`）：把 GI 采样从主 pass 搬到 1/2 分辨率的独立 pass。
+//
+// 为什么可以：GI 是**低频量**（探针间距 = cell 16~128 voxel，主 pass 只是对 8 个探针做三线性
+// 混合 + 逐角精确可见性），而 `ddgi_sample` 的成本（8 角闸门循环 + 逐角线段求交 + 图集取样）
+// 是主 pass 最大的一块。按 2×2 像素合并采样、主 pass 双线性取用 ⇒ 这块成本按 1/4 削减。
+//
+// 精度取舍（关掉开关即回到逐像素精确路径）：
+//   · GI 的可见性/接触阴影分辨率减半（薄结构边缘变软、跨 2 像素的几何缝隙可能被平均掉）；
+//   · 介质（玻璃）像素不产出 GI：`ddgi_sample` 的折射路径不可复现（要走完整玻璃状态机），
+//     这里只对「首命中即不透明」的像素采样 ⇒ 玻璃像素落到缓冲里 valid=0 的位置，
+//     采样侧退回 conf=0 的天光兜底（本场景无透射材质，实际无差异）。
+//
+// 输出（写入侧在 BG5）：
+//   gi_out.rgb = gi·valid、gi_out.a = valid
+//   gi_cov_out.r = cov·valid、gi_cov_out.g = valid
+//   ⇒ 主 pass 双线性后按 valid 归一化：天空/介质像素（valid = 0）不参与插值。
+// ============================================================================
+@compute @workgroup_size(8, 8, 1)
+fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let size = textureDimensions(gi_out);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  // ---- 「屏幕使用」记账开关：与 dda_main 同一套（本 pass 的像素代表 2×2 全分辨率像素，
+  // 列带 ∪ 行带的抽样比例因此不变；见 DDGI_USAGE_SCAN_MASK）----
+  let usage_frame = u32(ddgi_u.params.x);
+  ddgi_usage_track = select(
+    0u,
+    1u,
+    ((gid.x + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u
+      || ((gid.y + usage_frame) & DDGI_USAGE_SCAN_MASK) == 0u,
+  );
+
+  // ---- 反投影：本 pass 像素中心（半分辨率）→ NDC ----
+  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+         / vec2<f32>(f32(size.x), f32(size.y));
+  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
+  let near_ndc = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
+  let far_ndc  = vec4<f32>(uv.x, uv.y, 1.0, 1.0);
+  let near_world_h = view_u.inv_view_proj * near_ndc;
+  let far_world_h  = view_u.inv_view_proj * far_ndc;
+  let near_world = near_world_h.xyz / near_world_h.w;
+  let far_world  = far_world_h.xyz  / far_world_h.w;
+  let diff_world = far_world - near_world;
+  let frustum_length = length(diff_world);
+  let dir_voxel = normalize(diff_world);
+  let origin_voxel = view_u.cam_pos_voxel.xyz;
+
+  // ---- beam 起点跳过空空间 ----
+  // beam 纹理 = 全分辨率 / BEAM_DIV(=4) = 本 pass 的 /2 ⇒ 本 pass 1 个 beam 纹素覆盖 2×2 本 pass
+  // 像素，故下标要再除 (BEAM_DIV/2)。邻域/回退与 `beam_main` 的 d_beam 约定同源（BEAM_BACKOFF）。
+  var t_min = 0.0;
+  if (view_u.lod.z < 0.5) {
+    let beam_size = textureDimensions(beam_depth);
+    let bx = gid.x / (BEAM_DIV / 2u);
+    let by = gid.y / (BEAM_DIV / 2u);
+    t_min = 1e+30;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
+        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
+        t_min = min(t_min, textureLoad(beam_depth, vec2<i32>(sx, sy)).x);
+      }
+    }
+    t_min = max(t_min - BEAM_BACKOFF, 0.0);
+  }
+
+  let h = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
+                        world_cfg_full(t_min, 3u));
+  var gi = vec3<f32>(0.0);
+  var cov = 0.0;
+  var valid = 0.0;
+  // 只处理「首命中即不透明」：着色点/法线/采样点的推导与 `dda_main` 的不透明分支逐字一致。
+  if (h.hit && palette_transmission(h.palette_base, h.pal) <= 0.0) {
+    let gg = make_grid(u32(h.obj_id) + 1u);
+    let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
+    let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
+    let n = voxel_normal(gg, h.voxel, h.n);
+    let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    gi = ddgi_sample(p_voxel + n * n_off, n) * ddgi_u.params.z / DDGI_PI;
+    cov = ddgi_dbg_cov;
+    valid = 1.0;
+  }
+  textureStore(gi_out, coord, vec4<f32>(gi * valid, valid));
+  // storage texture 的 store 值恒为 vec4（rg32f 也不例外，多出的通道被丢弃）
+  textureStore(gi_cov_out, coord, vec4<f32>(cov * valid, valid, 0.0, 0.0));
 }
 
 

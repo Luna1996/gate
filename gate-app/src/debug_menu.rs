@@ -19,7 +19,7 @@ use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
 use gate_ui::{
   DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   WindowState,
-  menu::{color, input, slider, sub_menu, switch_group, text, toggle},
+  menu::{color, input, slider, sub_menu, switch_group, text, toggle, toggle_tip},
   parse_hex_color, spawn_debug_menu,
 };
 
@@ -93,6 +93,13 @@ pub fn default_menu() -> MenuFile {
               toggle("enabled", "menu.render.ddgi.enabled", true),
               switch_group("mode", "menu.render.ddgi.mode", &DDGI_MODE_KEYS, 0),
               switch_group("probe", "menu.render.ddgi.probe", &PROBE_KEYS, 0),
+              // 性能档（用 GI 分辨率精度换帧）：见 DdgiDebugSettings.gi_half_res
+              toggle_tip(
+                "gi_half",
+                "menu.render.ddgi.gi_half",
+                false,
+                "menu.render.ddgi.gi_half.tip",
+              ),
             ],
           ),
           sub_menu(
@@ -214,6 +221,7 @@ pub fn load_menu() -> MenuFile {
     Ok(src) => match MenuFile::from_toml(&src) {
       Ok(mut m) => {
         m.sanitize();
+        merge_defaults(&mut m, &default_menu());
         info!("debug menu loaded from {}", path.display());
         m
       }
@@ -233,8 +241,29 @@ pub fn load_menu() -> MenuFile {
   }
 }
 
+/// 旧存档兼容：把内置默认树里「存档中不存在」的节点补进去（新增菜单项在旧存档里也能出现），
+/// 已存在的节点一律保留存档里的值。递归只在 SubMenu 内做（顶层新增子菜单同样会被补上）。
+/// 不这么做的话，`data/ui/debug_menu.toml` 会遮蔽新加的项 —— 菜单里根本看不到，也不报错。
+fn merge_defaults(loaded: &mut MenuFile, dflt: &MenuFile) {
+  merge_nodes(&mut loaded.items, &dflt.items);
+}
+
+fn merge_nodes(loaded: &mut Vec<MenuNode>, dflt: &[MenuNode]) {
+  for d in dflt {
+    match loaded.iter_mut().find(|n| n.id() == d.id()) {
+      Some(l) => {
+        if let (MenuNode::SubMenu { children: lc, .. }, MenuNode::SubMenu { children: dc, .. }) =
+          (&mut *l, d)
+        {
+          merge_nodes(lc, dc);
+        }
+      }
+      None => loaded.push(d.clone()),
+    }
+  }
+}
+
 /// 把当前菜单状态写回 TOML（退出前调用）。
-///
 /// 写**可写数据目录**（`<安装根>/data/ui/debug_menu.toml`）而不是 `assets/`：安装目录可能只读
 /// （如 Program Files），且源码资源不应被运行期改写。下次启动由 [`load_menu`] 优先读这份存档。
 pub fn save_menu(model: &MenuFile) {
@@ -403,6 +432,8 @@ fn apply_initial_state(world: &mut World) {
     } else {
       (probe - 1) as f32
     };
+    // 性能档（默认关 = 逐像素精确路径）
+    dbg.gi_half_res = get_bool("render/ddgi/gi_half", false);
   }
   // 渲染 / 曝光
   {
@@ -464,10 +495,11 @@ fn apply_initial_state(world: &mut World) {
   }
   info!(
     target: "gate",
-    "debug menu 初值已应用：vsync={} fps={} ddgi={} cam={:?} speed={:.2}m/s shape={:?} size={}",
+    "debug menu 初值已应用：vsync={} fps={} ddgi={} gi_half={} cam={:?} speed={:.2}m/s shape={:?} size={}",
     get_bool("video/vsync", true),
     get_bool("video/fps", false),
     get_bool("render/ddgi/enabled", true),
+    get_bool("render/ddgi/gi_half", false),
     world.resource::<CameraMode>(),
     world.resource::<FlyCamera>().speed / VOXEL_PER_METER,
     world.resource::<EditSettings>().shape,
@@ -538,6 +570,11 @@ fn register_callbacks(world: &mut World) {
           };
           let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
           info!("探针绘制 → {name}");
+        }
+        // ---- 性能档（用 GI 分辨率精度换帧；关掉即回到逐像素精确路径）----
+        ("render/ddgi/gi_half", MenuAction::Toggle(on)) => {
+          ddgi_dbg.gi_half_res = *on;
+          info!("半分辨率 GI → {}", if *on { "on" } else { "off" });
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;

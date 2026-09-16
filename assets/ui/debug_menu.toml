@@ -76,6 +76,13 @@ options = [
 ]
 selected = 0
 
+[[items.children.children]]
+kind = "toggle"
+id = "gi_half"
+label = "menu.render.ddgi.gi_half"
+checked = false
+tooltip = "menu.render.ddgi.gi_half.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "exposure"

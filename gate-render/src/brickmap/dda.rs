@@ -1223,12 +1223,12 @@ use bevy::{
     Render, RenderApp, RenderStartup, RenderSystems,
     render_asset::RenderAssets,
     render_resource::{
-      BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-      CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-      ComputePipelineDescriptor, Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
-      SamplerBindingType, ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension,
-      TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer,
-      VertexState,
+      BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayoutDescriptor,
+      BindGroupLayoutEntries, BindingResource, CachedComputePipelineId, CachedRenderPipelineId,
+      ColorTargetState, ColorWrites, ComputePipelineDescriptor, Extent3d, FragmentState,
+      PipelineCache, RenderPassDescriptor, SamplerBindingType, ShaderStages, StorageTextureAccess,
+      TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+      TextureViewDescriptor, UniformBuffer, VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, texture_3d,
         texture_storage_2d, uniform_buffer,
@@ -1258,19 +1258,47 @@ struct DdaBlitBindGroup(BindGroup);
 
 /// BG3 光池持久 GPU buffer（主题静态：prepare 覆写同 buffer，避免逐帧重分配）
 #[derive(Resource)]
-struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
+pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 
-/// beam depth texture 缓存：低分辨率 r32float，resize 时重建
+/// 辅助纹理缓存（屏幕尺寸相关，resize 时重建）：
+///   · `texture`：beam depth（低分辨率 r32float）——beam 预 pass 写、主 pass 读；
+///   · `gi_*`：半分辨率 GI 缓冲（菜单开关 `DdgiDebugSettings.gi_half_res`）——`gi_main` 写
+///     （写入侧在 BG5），主 pass 双线性采样（BG0 binding 4/5）。存的是 **premultiplied valid**：
+///     rgba16f 的 .rgb = gi·valid、.a = valid；rg32f 的 .r = cov·valid、.g = valid ⇒ 采样侧
+///     按 valid 归一化，天空/介质像素不污染几何边缘。
+///   · `gi_bg0`：GI pass 自己的 @group(0)（view uniform + beam depth，**不含** GI 采样视图 ——
+///     同一 pass 内不能把同一张纹理既绑成采样又绑成存储，故 GI pass 用这份"瘦"版 BG0）。
 #[derive(Resource, Default)]
-struct BeamDepthCache {
+pub(crate) struct AuxTexCache {
   texture: Option<Texture>,
   size: UVec2,
+  gi_tex: Option<Texture>,
+  gi_cov: Option<Texture>,
+  gi_view: Option<TextureView>,
+  gi_cov_view: Option<TextureView>,
+  gi_size: UVec2,
+  gi_bg0: Option<BindGroup>,
+  /// group(5) 的 GI **采样侧** bind group（`dda_main` 用；layout = `DdaPipelines::gi_read_layout`）
+  gi_read_bg: Option<BindGroup>,
+}
+
+impl AuxTexCache {
+  /// 半分辨率 GI 的**写入侧**视图（BG5 的 binding 2/3 用）。
+  /// `None` = 尚未创建（首帧，或本帧 `prepare_dda_bind_groups` 提前返回）⇒ 调用方须用占位纹理。
+  pub(crate) fn gi_write_views(&self) -> Option<(&TextureView, &TextureView)> {
+    Some((self.gi_view.as_ref()?, self.gi_cov_view.as_ref()?))
+  }
 }
 
 #[derive(Resource)]
 #[allow(dead_code)]
 pub(crate) struct DdaPipelines {
   pub(crate) bg0_layout: BindGroupLayoutDescriptor,
+  /// BG0 的"瘦"版：`view uniform + beam depth`（供 `gi_main` 用 —— 该 pass 要**写** GI 纹理，
+  /// 故不能复用含 GI 采样视图的 `bg0_layout`）
+  pub(crate) bg0_gi_layout: BindGroupLayoutDescriptor,
+  /// group(5) 的"GI 采样侧"（`dda_main` 专用）：两张半分辨率 GI 纹理（绑定号 4/5）
+  pub(crate) gi_read_layout: BindGroupLayoutDescriptor,
   pub(crate) bg1_layout: BindGroupLayoutDescriptor,
   pub(crate) bg2_layout: BindGroupLayoutDescriptor,
   pub(crate) bg3_layout: BindGroupLayoutDescriptor,
@@ -1279,6 +1307,8 @@ pub(crate) struct DdaPipelines {
   eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
   pub(crate) beam_pipeline: CachedComputePipelineId,
+  /// 半分辨率 GI（菜单开关）：`gi_main`
+  pub(crate) gi_pipeline: CachedComputePipelineId,
   pub(crate) probe_viz_pipeline: CachedComputePipelineId,
   /// eye_adapt_histogram / eye_adapt_update（各 1 个 WG）
   eye_histogram_pipeline: CachedComputePipelineId,
@@ -1475,6 +1505,66 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
+  // ---- BG5（GI 采样侧，**只**给 `dda_main` 的 pipeline 用）：半分辨率 GI 的两张纹理 ----
+  // 为什么单开一份、而且绑定号是 4/5：DDGI 各 pass 也绑 BG0，而 wgpu 把 bind group 里**所有**
+  // 条目的资源都算进该 pass 的 usage scope ⇒ 采样视图若挂在 BG0，collect（BG5 写同一张纹理）
+  // 就会在同一 pass 内撞 usage 冲突。放在 group(5) 的空闲绑定号（0..3 已被图集/GI 写入侧占）
+  // 且只进 `dda_main` 的 layout，两个 pass 各自只见到一种用法。
+  let gi_read = BindGroupLayoutDescriptor::new(
+    "DdaBg5GiRead",
+    &[
+      BindGroupLayoutEntry {
+        binding: 4,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Float { filterable: true },
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 5,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Float { filterable: true },
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+    ],
+  );
+
+  // ---- BG0（GI pass 专用瘦版）：view uniform + beam depth ----
+  // 绑定号与完整版一致（1/2），只是**不含** out_tex / eye_adapt_ro / GI 采样视图：
+  // `gi_main` 只做「反投影 + beam 起点 + 主 trace + ddgi_sample」，不需要 out_tex 与曝光。
+  let bg0_gi = BindGroupLayoutDescriptor::new(
+    "DdaBg0Gi",
+    &[
+      BindGroupLayoutEntry {
+        binding: 1,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(DdaViewUniform::min_size()),
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 2,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::ReadWrite,
+          format: TextureFormat::R32Float,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
+    ],
+  );
+
   // ---- BG1：struct/leaves/palette 三 storage + globals uniform（Compute，read-only）----
   let bg1 = BindGroupLayoutDescriptor::new(
     "DdaBg1",
@@ -1544,6 +1634,13 @@ pub(crate) fn init_dda_pipelines(
   let dda_shader = dda_shader.0.clone();
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::ddgi::ddgi_bg4_layout()];
+  // `dda_main` 比其它两个入口多一份 group(5)：半分辨率 GI 的采样侧（见 `gi_read`）。
+  // 只加给它 —— beam / probe_viz 用不到，多一份 layout 会让它们也必须绑 group(5)。
+  let dda_layouts = {
+    let mut v = layouts.clone();
+    v.push(gi_read.clone());
+    v
+  };
   // 眼睛适应的两个入口自己的布局：**8 份相同的 eye layout**。
   // 原因：wgpu 要求 bind group 按索引**从 0 开始成前缀地**设置（跳过低索引直接设高索引会报
   // "expects a BindGroup to be set at index 0"）；而这两个入口的绑定在 @group(7)。
@@ -1551,7 +1648,7 @@ pub(crate) fn init_dda_pipelines(
   let eye_layouts = vec![eye.clone(); 8];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
-    layout: layouts.clone(),
+    layout: dda_layouts,
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("dda_main")),
     ..default()
@@ -1562,6 +1659,24 @@ pub(crate) fn init_dda_pipelines(
     layout: layouts.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("beam_main")),
+    ..default()
+  });
+  // 半分辨率 GI（菜单开关 `DdgiDebugSettings.gi_half_res`）：只做「反投影 + beam 起点 + 主 trace
+  // + ddgi_sample」，写两张 1/2 分辨率缓冲。group0 用瘦版（不含 GI 采样视图），并多一个 BG5
+  // （图集写入侧 + GI 写入侧）—— layout 索引必须是 0..=5 的**前缀**（见上面 eye 的说明）。
+  let gi_layouts = vec![
+    bg0_gi.clone(),
+    bg1.clone(),
+    bg2.clone(),
+    bg3.clone(),
+    crate::ddgi::ddgi_bg4_layout(),
+    crate::ddgi::ddgi_bg5_layout(),
+  ];
+  let gi = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_gi")),
+    layout: gi_layouts,
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("gi_main")),
     ..default()
   });
   // 眼睛适应（自动曝光）：直方图统计（1 个 WG）+ 适应更新（1 个线程）。
@@ -1614,6 +1729,8 @@ pub(crate) fn init_dda_pipelines(
 
   commands.insert_resource(DdaPipelines {
     bg0_layout: bg0,
+    bg0_gi_layout: bg0_gi,
+    gi_read_layout: gi_read,
     bg1_layout: bg1,
     bg2_layout: bg2,
     bg3_layout: bg3,
@@ -1621,18 +1738,19 @@ pub(crate) fn init_dda_pipelines(
     eye_layout: eye,
     compute_pipeline: compute,
     beam_pipeline: beam,
+    gi_pipeline: gi,
     probe_viz_pipeline: probe_viz,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
     blit_pipeline,
   });
   commands.insert_resource(LightPoolGpu(UniformBuffer::default()));
-  commands.insert_resource(BeamDepthCache::default());
+  commands.insert_resource(AuxTexCache::default());
   commands.insert_resource(EyeAdaptGpu::default());
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_dda_bind_groups(
+pub(crate) fn prepare_dda_bind_groups(
   mut commands: Commands,
   pipelines: Res<DdaPipelines>,
   gpu_images: Res<RenderAssets<GpuImage>>,
@@ -1648,7 +1766,7 @@ fn prepare_dda_bind_groups(
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
   scale: Res<RenderScale>,
-  mut beam_cache: ResMut<BeamDepthCache>,
+  mut beam_cache: ResMut<AuxTexCache>,
 ) {
   let Some(images) = images else {
     bevy::log::info_once!("DDA prepare: no DdaImages");
@@ -1704,6 +1822,36 @@ fn prepare_dda_bind_groups(
   }
   let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
+
+  // ---- 半分辨率 GI 缓冲（菜单开关 `gi_half_res`）：屏幕 1/2 分辨率，resize 时重建 ----
+  // 存 premultiplied valid（见 AuxTexCache 的说明）：rgba16f = (gi·valid, valid)、
+  // rg32f = (cov·valid, valid)。wgpu 新建纹理自动清零 ⇒ valid 初值 0 = "无数据"，
+  // 采样侧据此退回 conf=0 的天光兜底（不会在第一帧把整屏 GI 拉黑或提亮）。
+  let gi_size = UVec2::new((scale.size.x / 2).max(1), (scale.size.y / 2).max(1));
+  if beam_cache.gi_tex.is_none() || beam_cache.gi_size != gi_size {
+    let make = |label: &str, format: TextureFormat| {
+      render_device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d { width: gi_size.x, height: gi_size.y, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format,
+        // 既要被 gi_main 写（storage），又要被 dda_main 采样（texture binding）
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+      })
+    };
+    let gi_tex = make("gate_gi_half", TextureFormat::Rgba16Float);
+    let gi_cov = make("gate_gi_cov_half", TextureFormat::Rg32Float);
+    beam_cache.gi_view = Some(gi_tex.create_view(&TextureViewDescriptor::default()));
+    beam_cache.gi_cov_view = Some(gi_cov.create_view(&TextureViewDescriptor::default()));
+    beam_cache.gi_tex = Some(gi_tex);
+    beam_cache.gi_cov = Some(gi_cov);
+    beam_cache.gi_size = gi_size;
+  }
+  let gi_view = beam_cache.gi_view.as_ref().expect("gi view not created");
+  let gi_cov_view = beam_cache.gi_cov_view.as_ref().expect("gi cov view not created");
 
   // ---- BG0：out tex write + view uniform + beam depth rw ----
   // ---- 眼睛适应的状态/直方图 buffer（word 布局见 bindings.wesl 的 `eye_adapt`）----
@@ -1766,6 +1914,31 @@ fn prepare_dda_bind_groups(
       eye_buf.as_entire_binding(),
     )),
   );
+  // group(5) 的 GI 采样侧（只进 `dda_main` 的 pipeline layout）：绑定号 4/5，给显式 entry 数组
+  // —— `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 4 开始"。
+  let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
+  let gi_read_bg = render_device.create_bind_group(
+    None,
+    &gi_read_layout,
+    &[
+      BindGroupEntry { binding: 4, resource: BindingResource::TextureView(gi_view) },
+      BindGroupEntry { binding: 5, resource: BindingResource::TextureView(gi_cov_view) },
+    ],
+  );
+  beam_cache.gi_read_bg = Some(gi_read_bg);
+  // GI pass 的 @group(0)（瘦版 layout）：绑定号是 1/2（与完整版对齐），故给显式 entry 数组
+  // —— `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 1 开始"。
+  // 不绑 GI 采样视图是硬性要求：同一个 pass 里同一张纹理不能既作采样又作存储。
+  let bg0_gi_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_gi_layout);
+  let gi_bg0 = render_device.create_bind_group(
+    None,
+    &bg0_gi_layout,
+    &[
+      BindGroupEntry { binding: 1, resource: u.binding().expect("view uniform 已写入") },
+      BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&beam_view) },
+    ],
+  );
+  beam_cache.gi_bg0 = Some(gi_bg0);
   // BG7：眼睛适应（out_tex 采样视图 + 状态/直方图读写）
   let eye_bg = render_device.create_bind_group(
     None,
@@ -1836,9 +2009,11 @@ pub(crate) fn dispatch_dda(
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
   bg4: Option<Res<crate::ddgi::DdgiBg4>>,
+  bg5: Option<Res<crate::ddgi::DdgiBg5>>,
   eye: Option<Res<EyeAdaptGpu>>,
   gpu: Option<Res<crate::ddgi::DdgiGpu>>,
   dbg: Option<Res<crate::ddgi::DdgiDebugSettings>>,
+  aux: Option<Res<AuxTexCache>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   scale: Res<RenderScale>,
@@ -1880,6 +2055,29 @@ pub(crate) fn dispatch_dda(
     });
   }
 
+  // ---- 半分辨率 GI（菜单开关）：排在主 pass 之前（主 pass 采样它的输出）----
+  // 自门控：shader 里 `flags.y < 0.5 || misc.x < 0.5` 直接 return ⇒ 关掉时只付一次空 dispatch。
+  // 诊断配色档（mode > 0.5）主 pass 强制走内联采样 ⇒ 这里也不必跑。
+  if dbg.as_ref().is_some_and(|d| d.gi_half_res && d.mode < 0.5)
+    && let Some(aux) = aux.as_ref()
+    && let Some(gi_bg0) = aux.gi_bg0.as_ref()
+    && let Some(bg5) = bg5.as_ref()
+    && let Some(gi_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_pipeline)
+  {
+    let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
+    let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+    crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_gi", |pass| {
+      pass.set_pipeline(gi_pipe);
+      pass.set_bind_group(0, gi_bg0, &[]);
+      pass.set_bind_group(1, &bg1.0, &[]);
+      pass.set_bind_group(2, &bg2.0, &[]);
+      pass.set_bind_group(3, &bg3.0, &[]);
+      pass.set_bind_group(4, &bg4.0, &[]);
+      pass.set_bind_group(5, &bg5.0, &[]);
+      pass.dispatch_workgroups(gx, gy, 1);
+    });
+  }
+
   // ---- 主 DDA pass：trace + unlit 着色直出 ----
   if let Some(dda_pipe) = dda_pipe {
     crate::profiler::gpu_compute_pass(
@@ -1893,6 +2091,12 @@ pub(crate) fn dispatch_dda(
         pass.set_bind_group(2, &bg2.0, &[]);
         pass.set_bind_group(3, &bg3.0, &[]);
         pass.set_bind_group(4, &bg4.0, &[]);
+        // 半分辨率 GI 的采样侧（layout 里的 group(5)）：没有它 `dda_main` 无法 dispatch。
+        // 纹理未就绪（`prepare_dda_bind_groups` 本帧提前返回）时退化为不绑 —— 此时上面几个
+        // bind group 也必然缺失，主 pass 根本不会走到这里。
+        if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+          pass.set_bind_group(5, gi_read, &[]);
+        }
         pass.dispatch_workgroups(gx, gy, 1);
       },
     );

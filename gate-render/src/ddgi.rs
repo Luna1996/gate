@@ -329,6 +329,10 @@ pub struct DdgiUniform {
   pub dirty_max: Vec4,
   /// LOD0 的 chunk 段编址（仅 lod==0 用；LOD1~3 走 `lods`）。见 `DdgiChunkUniform`。
   pub chunk: DdgiChunkUniform,
+  /// 性能/精度档位（菜单开关，对应 `DdgiDebugSettings.gi_half_res`）：
+  ///   x = 保留（恒 0）；y = 半分辨率 GI（1 = 采样走 1/2 分辨率缓冲，0 = 逐像素内联采样）；
+  ///   zw 保留。
+  pub flags: Vec4,
 }
 
 pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescriptor {
@@ -386,8 +390,14 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
   )
 }
 
-/// BG5（仅 collect 用）：图集的**写入侧**。与 BG4 分离是硬性要求——同一纹理不能在同一
-/// bind group / 同一 pass 内既作采样纹理又作存储纹理；collect 只写图集，其余 pass 只读。
+/// BG5（collect 用 + 半分辨率 GI 用）：图集的**写入侧** + GI 缓冲的写入侧。与 BG4 分离是硬性
+/// 要求——同一纹理不能在同一 bind group / 同一 pass 内既作采样纹理又作存储纹理；collect 只写
+/// 图集，其余 pass 只读。
+///
+/// @binding(2)/(3) 是半分辨率 GI 缓冲（`gi_main` 写；采样侧在 BG0 binding 4/5）：挂这里是因为
+/// wgpu 要求 bind group 按索引从 0 起成前缀地设置，而 0..4 已被「视图/树/栅格/光照/图集采样」
+/// 占满。两个入口各自只用到其中一半条目，未用条目仍须绑定，但不产生使用冲突（图集 ping-pong
+/// 的读写两侧是**不同**纹理）。
 pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -401,6 +411,16 @@ pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
     },
     count: None,
   };
+  let store2d = |binding: u32, format: TextureFormat| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format,
+      view_dimension: TextureViewDimension::D2,
+    },
+    count: None,
+  };
   BindGroupLayoutDescriptor::new(
     "DdgiBg5",
     &[
@@ -408,6 +428,10 @@ pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
       // depth 图集用 Rgba16Float：.x = mean、.y = std（距离标准差），供采样侧做 Chebyshev
       // 软遮挡。R32Float 只有均值，只能做刀锋判定 → 深度一抖就"入选/落选"翻转（亮区边界伸缩）。
       store(1, TextureFormat::Rgba16Float),
+      // 半分辨率 GI：rgb = gi·valid、a = valid
+      store2d(2, TextureFormat::Rgba16Float),
+      // 半分辨率 GI 的覆盖度：r = cov·valid、g = valid
+      store2d(3, TextureFormat::Rg32Float),
     ],
   )
 }
@@ -515,6 +539,48 @@ pub struct DdgiBg5(pub bevy::render::render_resource::BindGroup);
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiBg6(pub bevy::render::render_resource::BindGroup);
 
+/// 半分辨率 GI 写入侧的**占位**纹理（1×1）：`prepare_dda_bind_groups` 尚未产出 GI 缓冲时
+/// （首帧，或那一帧它因资源缺失提前返回）BG5 仍须为 binding 2/3 提供视图 —— bind group
+/// 必须给全条目。占位纹理不会被真正写入（`gi_main` 只在开关打开且有真缓冲时派发）。
+#[derive(bevy::ecs::resource::Resource, Default)]
+struct GiPlaceholder {
+  tex: Option<bevy::render::render_resource::Texture>,
+  cov: Option<bevy::render::render_resource::Texture>,
+  view: Option<bevy::render::render_resource::TextureView>,
+  cov_view: Option<bevy::render::render_resource::TextureView>,
+}
+
+impl GiPlaceholder {
+  fn views(
+    &mut self,
+    device: &bevy::render::renderer::RenderDevice,
+  ) -> (&bevy::render::render_resource::TextureView, &bevy::render::render_resource::TextureView)
+  {
+    use bevy::render::render_resource::*;
+    if self.tex.is_none() {
+      let make = |label: &str, format: TextureFormat| {
+        device.create_texture(&TextureDescriptor {
+          label: Some(label),
+          size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+          mip_level_count: 1,
+          sample_count: 1,
+          dimension: TextureDimension::D2,
+          format,
+          usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+          view_formats: &[],
+        })
+      };
+      let t = make("gate_gi_placeholder", TextureFormat::Rgba16Float);
+      let c = make("gate_gi_cov_placeholder", TextureFormat::Rg32Float);
+      self.view = Some(t.create_view(&TextureViewDescriptor::default()));
+      self.cov_view = Some(c.create_view(&TextureViewDescriptor::default()));
+      self.tex = Some(t);
+      self.cov = Some(c);
+    }
+    (self.view.as_ref().expect("刚创建"), self.cov_view.as_ref().expect("刚创建"))
+  }
+}
+
 /// 本帧是否需要跑探针烘焙（由 prepare_ddgi 写入，dispatch_ddgi 读取）
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Default)]
 pub struct DdgiBakeThisFrame(pub bool);
@@ -594,6 +660,13 @@ pub struct DdgiDebugSettings {
   /// **不能直接用 `DDGI_SKY_AMBIENT` 调大**：它还兼作 DDGI 关闭时的环境光，调大会让
   /// 未开 DDGI 的画面整体提亮。所以覆盖外单独一个系数，运行时滑杆调到与覆盖内衔接为止。
   pub far_ambient: f32,
+  /// 半分辨率 GI（对应 WGSL `flags.y`）：把 `ddgi_sample` 从主 pass 搬到 1/2 分辨率的独立 pass，
+  /// 主 pass 只做双线性取用。GI 是低频量（探针间距 16~128 voxel）⇒ 这是主 pass 最大一块成本的
+  /// 按 4× 削减；代价是 GI 的可见性/接触阴影分辨率减半。
+  ///
+  /// 注：曾有过一个"逐角遮挡求交只测高权角"的档位（省 ~0.7ms），实测弱角漏检会带来黑斑与薄缝
+  /// 漏光，目视不可接受，已移除；WGSL 侧 `flags.x` 因此恒 0（保留位）。
+  pub gi_half_res: bool,
 }
 
 impl Default for DdgiDebugSettings {
@@ -605,6 +678,7 @@ impl Default for DdgiDebugSettings {
       probe_viz_lod: 0.0,
       depth_soft_k: 1.0,
       far_ambient: 0.25,
+      gi_half_res: false,
     }
   }
 }
@@ -633,6 +707,7 @@ impl bevy::app::Plugin for DdgiPlugin {
       .init_resource::<DdgiLod0Chunks>()
       .init_resource::<DdgiDebugSettings>()
       .init_resource::<DdgiBakeThisFrame>()
+      .init_resource::<GiPlaceholder>()
       .add_systems(bevy::render::RenderStartup, init_ddgi_gpu)
       .add_systems(
         bevy::render::RenderStartup,
@@ -643,7 +718,10 @@ impl bevy::app::Plugin for DdgiPlugin {
         bevy::render::Render,
         prepare_ddgi
           .in_set(bevy::render::RenderSystems::PrepareBindGroups)
-          .after(crate::brickmap::upload::prepare),
+          .after(crate::brickmap::upload::prepare)
+          // BG5 的 GI 写入侧要用 `prepare_dda_bind_groups` 建出来的半分辨率 GI 缓冲
+          // （未就绪时会退回 1×1 占位纹理，但同帧就绪才不浪费那一帧）
+          .after(crate::brickmap::dda::prepare_dda_bind_groups),
       )
       .add_systems(
         RenderGraph,
@@ -1108,6 +1186,7 @@ fn extract_ddgi_settings(
     probe_viz_lod: d.probe_viz_lod,
     depth_soft_k: d.depth_soft_k,
     far_ambient: d.far_ambient,
+    gi_half_res: d.gi_half_res,
   });
   commands.insert_resource(dbg);
   commands.insert_resource(
@@ -1128,6 +1207,8 @@ fn prepare_ddgi(
   dbg: bevy::ecs::system::Res<DdgiDebugSettings>,
   world: bevy::ecs::system::Res<DdgiWorldAabb>,
   lod0_chunks: Option<bevy::ecs::system::Res<DdgiLod0Chunks>>,
+  aux: Option<bevy::ecs::system::Res<crate::brickmap::dda::AuxTexCache>>,
+  mut gi_ph: bevy::ecs::system::ResMut<GiPlaceholder>,
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
   // ---- 网格推导 ----
@@ -1291,6 +1372,10 @@ fn prepare_ddgi(
   );
   u.dirty_min = Vec4::new(dirty_min.x as f32, dirty_min.y as f32, dirty_min.z as f32, dirty_valid);
   u.dirty_max = Vec4::new(dirty_max.x as f32, dirty_max.y as f32, dirty_max.z as f32, 0.0);
+  // 性能档位（菜单开关）：x = 保留（恒 0，原"只测高权角"档已因黑斑/漏光移除），
+  // y = 半分辨率 GI（0/1）。半分辨率档只在真正会跑 GI 着色时生效（stage 未到 Full 或 DDGI
+  // 关掉时主 pass 不采样）。
+  u.flags = Vec4::new(0.0, if dbg.gi_half_res && stage.shade_gi() { 1.0 } else { 0.0 }, 0.0, 0.0);
   // LOD0 的 chunk 段编址（只有 lod==0 读它）：原点/维度（chunk 单位）、每 chunk cell 数、
   // 已分配槽数。WGSL 用 `misc.y`(=total_slots) + 这里的维度定位 cell_slot 尾部的两张表。
   u.chunk = DdgiChunkUniform {
@@ -1337,12 +1422,23 @@ fn prepare_ddgi(
   );
   commands.insert_resource(DdgiBg4(bg4));
 
-  // ---- BG5（collect 图集写入侧）----
+  // ---- BG5（collect 图集写入侧 + 半分辨率 GI 写入侧）----
+  // GI 的两个视图来自 `crate::brickmap::dda::AuxTexCache`（由 `prepare_dda_bind_groups` 建纹理，
+  // 系统顺序上排在 prepare_ddgi 之前）；未就绪时用 1×1 占位纹理占位（bind group 必须给全条目）。
   let bg5_layout = pipeline_cache.get_bind_group_layout(&ddgi_bg5_layout());
+  let (gi_view, gi_cov_view) = match aux.as_ref().and_then(|a| a.gi_write_views()) {
+    Some(v) => v,
+    None => gi_ph.views(&device),
+  };
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
-    &BindGroupEntries::sequential((&gpu.irr[1 - p].view, &gpu.depth[1 - p].view)),
+    &BindGroupEntries::sequential((
+      &gpu.irr[1 - p].view,
+      &gpu.depth[1 - p].view,
+      gi_view,
+      gi_cov_view,
+    )),
   );
   commands.insert_resource(DdgiBg5(bg5));
 

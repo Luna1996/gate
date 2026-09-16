@@ -134,6 +134,11 @@ struct DdgiUniform {
   //   origin.xyz = chunk 网格原点（chunk 坐标），origin.w = 每 chunk 每轴 cell 数（16）
   //   dims.xyz   = chunk 网格维度，dims.w = LOD0 已分配槽数（探针池高水位）
   chunk: DdgiChunk,
+  // 性能档位（菜单开关，与 Rust `DdgiUniform.flags` 逐字段镜像）：
+  //   x = 保留（恒 0；曾用于"逐角遮挡求交只测高权角"，因黑斑/漏光已移除）
+  //   y = 半分辨率 GI（0 = 逐像素内联采样，1 = 采样 1/2 分辨率缓冲后双线性取用）
+  //   zw = 保留
+  flags: vec4<f32>,
 };
 @group(4) @binding(0) var<uniform> ddgi_u: DdgiUniform;
 // 图集**采样侧**（cast 回读 GI、着色 ddgi_sample 用）。写入侧在 @group(5)：
@@ -170,6 +175,23 @@ struct DdgiUniform {
 // .z = 本纹素累计更新次数（混色权重的收敛时钟，见 collect 的深度分支 / DDGI_DEPTH_CONV_SAMPLES）。
 // 与采样侧读法一一对应；存 std 而不是 mean² 是为了避免 f16 溢出/掉精度（mean² 可达 8192²）。
 @group(5) @binding(1) var ddgi_depth_out: texture_storage_2d_array<rgba16float, write>;
+// @binding(2)/(3)：半分辨率 GI 缓冲的**写入侧**（`gi_main` 用；采样侧见下面 @binding(4)/(5)）。
+// 与图集写入侧同一个 group：wgpu 要求 bind group 按索引从 0 起成前缀地设置，而 0..4 已被
+// 「视图/树/栅格/光照/图集采样」占满 ⇒ 写入侧只能挂在 5；collect 与本 pass 共用该 layout，
+// 各自只用到其中一半的条目（未用条目仍须绑定，但不产生使用冲突：图集 ping-pong 两侧是**不同**纹理）。
+@group(5) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
+@group(5) @binding(3) var gi_cov_out: texture_storage_2d<rg32float, write>;
+// @binding(4)/(5)：同一对纹理的**采样侧**（只被 `dda_main` 用，走 group(5) 的另一份 layout）。
+// ⚠️ **不能挂在 @group(0)**：DDGI 的 bake/sort/cast/collect 也绑 BG0（见 `set_bgs`），而 wgpu 把
+// bind group 里**所有**条目的资源都算进该 pass 的 usage scope —— 于是"collect 写 GI（BG5 的
+// storage-write）+ BG0 里同一张纹理的采样视图"会在同一 pass 内被判 usage 冲突（实测报
+// `gate_gi_half ... Current usage RESOURCE and new usage STORAGE_WRITE_ONLY`）。放在 group(5)
+// 的空闲绑定号上，主 pass 只绑"采样视图"那一份 layout，两边的 pass 各自只见到一种用法。
+// rgba16f 的 .rgb = gi·valid、.a = valid；rg32f 的 .r = cov·valid、.g = valid（cov = "本点周围
+// 有没有探针数据"的覆盖度，着色侧要用它算 conf）。采样走 BG1 的 `light_samp`（filtering）双线性，
+// 再按 valid 归一化 —— 天空/介质像素 valid = 0，不参与插值，避免几何边缘被"无数据"的 0 拉黑。
+@group(5) @binding(4) var gi_tex: texture_2d<f32>;
+@group(5) @binding(5) var gi_cov_tex: texture_2d<f32>;
 
 // ===== @group(6)：seal 的 dispatch 参数写入侧（只被 ddgi_seal 使用）=====
 // [0..16) cast args ×4 LOD；[16..32) collect args ×4 LOD（每 LOD 4 word：x, y, z, pad，y = lod+1）。
