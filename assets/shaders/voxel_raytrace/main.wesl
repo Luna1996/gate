@@ -1,13 +1,13 @@
 import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_COLL_BASE, DDGI_INDIR_COLL_TOTAL, DDGI_INDIR_COUNT_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RAY_TOTAL, DDGI_INDIR_RPP_BASE, beam_depth, ddgi_args, ddgi_cell, ddgi_indirect, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist, eye_adapt, eye_adapt_ro, light_u, out_tex, out_tex_src, view_u};
-import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, sky_rgb, srgb_to_linear};
+import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, palette_transmission, sky_rgb, srgb_to_linear};
 import package::ddgi::bake::{ddgi_bake_one};
 import package::ddgi::collect::{ddgi_collect_one};
-import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_BAKE_STAGGER, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
-import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
+import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_BAKE_STAGGER, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_NBR_VALID, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
+import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_nbr, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
 import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
 import package::lightfield::{light_field_ao, light_field_gather};
-import package::trace::{make_grid, medium_of};
+import package::trace::{make_grid};
 import package::world::{WorldHit, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
 
 // ============================================================================
@@ -87,14 +87,16 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
   let sh = world_raycast(make_grid(0u), origin, sun_dir, 8192.0, world_cfg_full(0.0, 3u));
   if (!sh.hit) { return 1.0; }
   if (all(sh.voxel == self_voxel) && sh.obj_id == self_obj) { return 1.0; }
-  if (medium_of(sh.palette_base, sh.pal).a >= 1.0) { return 0.0; }   // 不透明实体遮挡
+  // 不透明判定只读 palette word1 的透射字节（`transmission == 0` ⇔ 不透明度 == 1）：
+  // `medium_of` 会多读 word0 并算 mix/染色，而这里只用得到 `.a`。
+  if (palette_transmission(sh.palette_base, sh.pal) <= 0.0) { return 0.0; }   // 不透明实体遮挡
   // 第一段就是玻璃 → 穿透走完（含自命中豁免）
   var tint = vec3<f32>(1.0);
   let h = world_trace_medium(make_grid(0u), origin, sun_dir, 8192.0, false, &tint);
   let through = (tint.r + tint.g + tint.b) / 3.0;   // 只透介质 → 透射色平均亮度作标量衰减
   if (!h.hit) { return through; }
   if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return 1.0; }
-  if (medium_of(h.palette_base, h.pal).a >= 1.0) { return 0.0; }
+  if (palette_transmission(h.palette_base, h.pal) <= 0.0) { return 0.0; }
   return through;
 }
 
@@ -146,8 +148,8 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     tint = tint * seg;
     // 一路走到底 → 剩余 tint 由调用方乘到天空上
     if (!best.hit) { return GlassOut(best, tint, refl, dir); }
-    let m = medium_of(best.palette_base, best.pal);
-    if (m.a >= 1.0) { return GlassOut(best, tint, refl, dir); }   // 不透明实体 → 调用方着色
+    let tau = palette_transmission(best.palette_base, best.pal);
+    if (tau <= 0.0) { return GlassOut(best, tint, refl, dir); }   // 不透明实体 → 调用方着色
     // ---- 玻璃界面 ----
     let p_hit = org + dir * best.t;
     let nn = best.n;                           // 世界空间外向面法线
@@ -270,7 +272,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var dir = dir_voxel;           // 最终照到表面的射线方向（穿过玻璃时已被折射）
   var through = vec3<f32>(1.0);  // 沿途累积的透射色（无玻璃时恒为 1）
   var refl = vec3<f32>(0.0);     // 玻璃界面的反射项
-  if (first.hit && medium_of(first.palette_base, first.pal).a < 1.0) {
+  // 可穿透判定只读 palette word1 的透射字节（`transmission > 0` ⇔ 不透明度 < 1）——这是
+  // 每个命中像素都要过的一步，省掉 `medium_of` 的第二次 palette load 与 mix。
+  if (first.hit && palette_transmission(first.palette_base, first.pal) > 0.0) {
     // 第一次命中就是可穿透介质 → 交给状态机推进到"最终的不透明命中 / 走到底"
     let g = trace_glass(origin_voxel, dir_voxel, t_min, frustum_length, sun_dir, sky, sun_c);
     best = g.ray;
@@ -523,7 +527,9 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   // ---- age 继承（同 slot 且 world cell 未变 → 续龄；换 cell 时 bake 已清零）----
-  var age = ddgi_meta_age(ddgi_meta[slot]);
+  // prev_meta 一次读出复用：下面判"邻接可见性掩码是否已在有效期内"也要它（省一次 buffer load）。
+  let prev_meta = ddgi_meta[slot];
+  var age = ddgi_meta_age(prev_meta);
   // ---- 世界编辑（脏区）→ 把年龄压回 1：长窗口不牺牲编辑响应 ----
   // `dirty_min.w` 只在"本帧真的上传了世界数据"那一帧为 1（无脏区时 min == max ⇒ w = 0），
   // 故不会误触发、也不会常驻为真。压低 age ⇒ 该探针回到 `ddgi_age_alpha` 的 1/age 等权斜坡，
@@ -567,10 +573,28 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   // ---- 邻接可见性掩码（空间混合门控）：只对活跃探针算（非活跃者不投线、图集不更新，
-  // 也不会作为混来源被邻居采用）。非活跃路径不置 NBR_VALID → 消费侧按"未算过"处理（不做门控）。----
+  // 也不会作为混来源被邻居采用）。非活跃路径不置 NBR_VALID → 消费侧按"未算过"处理（不做门控）。
+  //
+  // 【只在本级可能变了时重算】掩码 = f(探针实际位置, 世界几何, cs)，而这三者的变化时机都是已知的：
+  //   · 换主 / LOD0 池重分配 / 网格重建 → bake 重写该槽 meta（丢掉 NBR_VALID）⇒ 这里 !valid 自动触发；
+  //   · 世界编辑 → 该 cell 内探针可能被 `ddgi_place_probe` 搬家（位置变），几何也可能挡住/放通某条轴
+  //     向射线 ⇒ 按脏区 AABB 判。**判据必须把 cell 盒沿各轴外扩 cs**：射线长 cs、起点在 cell 内，
+  //     故线段 AABB ⊆ cell 盒 ⊕ cs；只用 cell 盒会漏掉"贴 chunk 边界的 cell"朝外那一侧
+  //     （那一侧的射线落进相邻 chunk，编辑恰在那里时掩码会陈旧）。
+  // 其余帧直接沿用上一帧掩码 —— 6 条射线 × 每个活跃探针 × 每帧就是 sort 的全部成本
+  // （实测 0.44ms → 0.06ms）。DDGI 网格锚定世界 AABB、不随相机换主，所以相机移动不会误触发重算。
   var meta_word = ddgi_meta_pack(age, true, is_active);
   if (is_active) {
-    meta_word = ddgi_meta_with_nbr(meta_word, ddgi_nbr_vis_mask(probe_pos, f32(cs)));
+    var mask = ddgi_meta_nbr(prev_meta);
+    // 外扩量 = 本级 cell 边长（cs 是 i32，见 `DdgiLod.origin: IVec4` 的 .w）
+    let pad = vec3<f32>(f32(cs));
+    let dirty_here = ddgi_u.dirty_min.w > 0.5
+      && all(cell_hi + pad > ddgi_u.dirty_min.xyz)
+      && all(cell_lo - pad < ddgi_u.dirty_max.xyz);
+    if ((prev_meta & DDGI_META_NBR_VALID) == 0u || dirty_here) {
+      mask = ddgi_nbr_vis_mask(probe_pos, f32(cs));
+    }
+    meta_word = ddgi_meta_with_nbr(meta_word, mask);
   }
   ddgi_meta[slot] = meta_word;
   ddgi_slot_pos[slot] = vec4<f32>(probe_pos, f32(lod));

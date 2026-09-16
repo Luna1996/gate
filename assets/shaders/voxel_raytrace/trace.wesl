@@ -712,20 +712,19 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   var tmax_c = select(vec3<f32>(1e+30), (bnd_c - ro) * grid_inv_rd, grid_axis_on);
   tmax_c = max(tmax_c, vec3<f32>(tl0));
   var t_enter_c = tl0;
-  // entry_face：跨入当前 chunk 的面。首 chunk 用 normalize(-rd) 兜底（相机贴面/UB；
+  // entry_face：跨入当前 chunk 的面 = 逆射线方向的主轴面。首 chunk 用它兜底（相机贴面/UB；
   // 按约定 UB 直接返回该 voxel 颜色，face_id 反推）；后续 chunk 由跨轴 + sign_v 更新。
-  // face_index_from_normal 在此内联（省函数调用）
-  let en = normalize(-rd);
-  let eax = abs(en.x);
-  let eay = abs(en.y);
-  let eaz = abs(en.z);
+  // 主轴由 |rd| 取（归一化不改变分量大小关系、也不改变比较的平局顺序），面的符号位直接复用
+  // DIR_LUT 已解出的 face_x/y/z（它们就是 face_index_from_normal(normalize(-rd)) 的结果）
+  // ⇒ 省掉一次 normalize（sqrt + rcp + 3 乘）与 face_index_from_normal 的整段分支。
   var entry_face: u32 = 4u;
-  if (eax >= max(eay, eaz)) {
-    entry_face = select(0u, 1u, en.x >= 0.0);
-  } else if (eay >= eaz) {
-    entry_face = select(2u, 3u, en.y >= 0.0);
+  let ad = abs(rd);
+  if (ad.x >= max(ad.y, ad.z)) {
+    entry_face = face_x;
+  } else if (ad.y >= ad.z) {
+    entry_face = face_y;
   } else {
-    entry_face = select(4u, 5u, en.z >= 0.0);
+    entry_face = face_z;
   }
   for (var step_c: u32 = 0u; step_c < max_chunk_steps; step_c = step_c + 1u) {
     let t_exit_c = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
