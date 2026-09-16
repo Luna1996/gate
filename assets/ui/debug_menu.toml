@@ -11,6 +11,13 @@ label = "menu.video"
 
 [[items.children]]
 kind = "toggle"
+id = "half_res"
+label = "menu.video.half_res"
+checked = false
+tooltip = "menu.video.half_res.tip"
+
+[[items.children]]
+kind = "toggle"
 id = "fullscreen"
 label = "menu.video.fullscreen"
 checked = false
@@ -26,6 +33,7 @@ kind = "toggle"
 id = "aa"
 label = "menu.video.aa"
 checked = false
+tooltip = "menu.video.aa.tip"
 
 [[items.children]]
 kind = "toggle"

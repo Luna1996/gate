@@ -6,13 +6,16 @@
 //! 3. 统一回调 [`MenuActionEvent`] → 各调试资源的观察者；
 //! 4. 纯文本行（相机位置/角度）与右上角 FPS 覆盖层的刷新。
 //!
-//! 未实现功能的项（全屏、抗锯齿、材质自发光/透明度/光滑度、颜色覆盖）只预留 UI：
-//! 收到动作只记日志，不写任何资源。
+//! 「视频」页三项都已接通：全屏 = 无边框全屏（窗口 ↔ 全屏，非独占）、抗锯齿 = 最终 blit 的
+//! FXAA（`PostFxSettings.fxaa`）、半分辨率 = 渲染目标 ÷2 再放大到窗口（`RenderScale.factor`）。
+//! 其余各页的「未实现项」只预留 UI：收到动作只记日志，不写任何资源。
 
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
-use bevy::window::{PresentMode, PrimaryWindow, Window};
+use bevy::window::{
+  MonitorSelection, PresentMode, PrimaryWindow, Window, WindowMode, WindowPosition,
+};
 use rust_i18n::t;
 
 use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
@@ -76,9 +79,12 @@ pub fn default_menu() -> MenuFile {
         "video",
         "menu.video",
         vec![
+          // 半分辨率渲染（3D 场景 1/2 分辨率 → blit 双线性放大到整窗）；见 RenderScale.factor
+          toggle_tip("half_res", "menu.video.half_res", false, "menu.video.half_res.tip"),
           toggle("fullscreen", "menu.video.fullscreen", false),
           toggle("vsync", "menu.video.vsync", true),
-          toggle("aa", "menu.video.aa", false),
+          // FXAA（最终 blit 的边缘抗锯齿）；见 PostFxSettings.fxaa
+          toggle_tip("aa", "menu.video.aa", false, "menu.video.aa.tip"),
           toggle("fps", "menu.video.fps", false),
         ],
       ),
@@ -249,7 +255,7 @@ fn merge_defaults(loaded: &mut MenuFile, dflt: &MenuFile) {
 }
 
 fn merge_nodes(loaded: &mut Vec<MenuNode>, dflt: &[MenuNode]) {
-  for d in dflt {
+  for (i, d) in dflt.iter().enumerate() {
     match loaded.iter_mut().find(|n| n.id() == d.id()) {
       Some(l) => {
         if let (MenuNode::SubMenu { children: lc, .. }, MenuNode::SubMenu { children: dc, .. }) =
@@ -258,7 +264,9 @@ fn merge_nodes(loaded: &mut Vec<MenuNode>, dflt: &[MenuNode]) {
           merge_nodes(lc, dc);
         }
       }
-      None => loaded.push(d.clone()),
+      // 新项按**默认树里的位置**插入（不是追加到末尾）：否则旧存档里的新项会跑到页面最后，
+      // 而设计位置（比如「视频」页顶部）只有新装用户看得到。
+      None => loaded.insert(i.min(loaded.len()), d.clone()),
     }
   }
 }
@@ -301,6 +309,15 @@ pub(crate) struct FpsOverlayText;
 /// FPS 覆盖层是否显示（`video/fps` 开关）
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct FpsOverlayVisible(pub bool);
+
+/// 半分辨率渲染的降采样倍数（「视频/半分辨率」→ `RenderScale.factor`）
+const HALF_RES_FACTOR: u32 = 2;
+
+/// 进无边框全屏前的窗口尺寸/位置（退出全屏时复原）。`None` = 当前不在全屏。
+///
+/// winit 在多数平台上会自己记住并复原窗口矩形，但**位置**在部分后端会丢，故显式存一份兜底。
+#[derive(Resource, Default)]
+struct WindowedRestore(Option<(UVec2, Option<IVec2>)>);
 
 /// 每帧 delta 的 1s 滚动窗口（FPS 统计）
 #[derive(Resource, Default)]
@@ -403,10 +420,21 @@ fn apply_initial_state(world: &mut World) {
 
   // 视频
   world.resource_mut::<FpsOverlayVisible>().0 = get_bool("video/fps", false);
+  // 抗锯齿（FXAA，最终 blit）/ 半分辨率渲染（RenderScale.factor）：写 main world 资源，
+  // render world 由 ExtractResourcePlugin 跟随。
+  world.resource_mut::<gate_render::PostFxSettings>().fxaa = get_bool("video/aa", false);
+  world.resource_mut::<gate_render::RenderScale>().factor =
+    if get_bool("video/half_res", false) { HALF_RES_FACTOR } else { 1 };
   let mut q_win = world.query_filtered::<&mut Window, With<PrimaryWindow>>();
   if let Some(mut win) = q_win.iter_mut(world).next() {
     win.present_mode =
       if get_bool("video/vsync", true) { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
+    // 全屏：上次退出时若停在无边框全屏，这里按存档进全屏（窗口尺寸/位置由 winit 自己记住）
+    win.mode = if get_bool("video/fullscreen", false) {
+      WindowMode::BorderlessFullscreen(MonitorSelection::Current)
+    } else {
+      WindowMode::Windowed
+    };
   }
   drop(q_win);
 
@@ -495,7 +523,10 @@ fn apply_initial_state(world: &mut World) {
   }
   info!(
     target: "gate",
-    "debug menu 初值已应用：vsync={} fps={} ddgi={} gi_half={} cam={:?} speed={:.2}m/s shape={:?} size={}",
+    "debug menu 初值已应用：fs={} aa={} half_res={} vsync={} fps={} ddgi={} gi_half={} cam={:?} speed={:.2}m/s shape={:?} size={}",
+    get_bool("video/fullscreen", false),
+    get_bool("video/aa", false),
+    get_bool("video/half_res", false),
     get_bool("video/vsync", true),
     get_bool("video/fps", false),
     get_bool("render/ddgi/enabled", true),
@@ -515,11 +546,15 @@ fn split(path: &str) -> Vec<String> {
 // ===================== 回调（统一事件按 path 分派） =====================
 
 fn register_callbacks(world: &mut World) {
+  world.init_resource::<WindowedRestore>();
   // ---- 视频 ----
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut q_win: Query<&mut Window, With<PrimaryWindow>>,
-     mut fps: ResMut<FpsOverlayVisible>| {
+     mut fps: ResMut<FpsOverlayVisible>,
+     mut scale: ResMut<gate_render::RenderScale>,
+     mut post: ResMut<gate_render::PostFxSettings>,
+     mut restore: ResMut<WindowedRestore>| {
       let MenuAction::Toggle(on) = ev.action else { return };
       match ev.path.as_str() {
         "video/vsync" => {
@@ -531,8 +566,43 @@ fn register_callbacks(world: &mut World) {
           fps.0 = on;
           info!("FPS 覆盖层 → {}", if on { "on" } else { "off" });
         }
-        "video/fullscreen" | "video/aa" => {
-          info!(target: "gate", "{} = {}（UI 预留，功能未实现）", ev.path, on);
+        // 全屏：窗口 ↔ **无边框**全屏（不是独占全屏 —— 不动显示模式/刷新率，Alt-Tab 也不黑屏）
+        "video/fullscreen" => {
+          let Ok(mut win) = q_win.single_mut() else { return };
+          if on {
+            restore.0 = Some((
+              win.resolution.physical_size(),
+              match win.position {
+                WindowPosition::At(p) => Some(p),
+                _ => None,
+              },
+            ));
+            win.mode = WindowMode::BorderlessFullscreen(MonitorSelection::Current);
+          } else {
+            win.mode = WindowMode::Windowed;
+            if let Some((size, pos)) = restore.0.take() {
+              win.resolution.set_physical_resolution(size.x, size.y);
+              if let Some(p) = pos {
+                win.position = WindowPosition::At(p);
+              }
+            }
+          }
+          info!("全屏 → {:?}", win.mode);
+        }
+        // 半分辨率渲染：只改降采样倍数，目标纹理由 responsive 系统下一帧按新尺寸原地重建
+        "video/half_res" => {
+          scale.factor = if on { HALF_RES_FACTOR } else { 1 };
+          info!(
+            "半分辨率渲染 → {}（渲染 {}x{} → 放大到窗口）",
+            if on { "on" } else { "off" },
+            scale.size.x,
+            scale.size.y
+          );
+        }
+        // 抗锯齿：FXAA 在最终 blit 里做（换 fragment 入口，见 PostFxSettings）
+        "video/aa" => {
+          post.fxaa = on;
+          info!("抗锯齿（FXAA）→ {}", if on { "on" } else { "off" });
         }
         _ => {}
       }

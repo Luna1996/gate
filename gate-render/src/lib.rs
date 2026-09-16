@@ -18,7 +18,7 @@ pub use brickmap::{
   cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes, cpu_reference_volumes_occluded,
   create_dda_image,
 };
-pub use brickmap::{RenderScale, VIEW_SIZE};
+pub use brickmap::{PostFxSettings, RenderScale, VIEW_SIZE};
 pub use lighting::{
   DirLightCfg, EMISSIVE_EMIT_GAIN, LightDesc, LightGlobals, LightPoolUniform, LightingTheme,
   MAX_LIGHTS, SHADOW_BIAS, SHADOW_DIR_T_MAX, SkyCfg, build_light_pool, parse_lighting_ron,

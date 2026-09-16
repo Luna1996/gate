@@ -31,13 +31,25 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 /// dispatch workgroup 数随它重算，shader 侧自行越界剔除）
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 pub struct RenderScale {
+  /// 渲染目标尺寸 = 窗口物理像素 ÷ `factor`（下采样后由 blit 双线性放大到整窗）
   pub size: UVec2,
+  /// 内部分辨率降采样倍数：1 = 全分辨率，2 = 半分辨率（菜单「视频/半分辨率」）。
+  /// 改它之后 `responsive::resize_render_targets` 下一帧就按新尺寸原地重建目标纹理
+  /// （DDGI/GI 的 1/2 分辨率缓冲都挂在 `size` 上，自动跟随）。
+  pub factor: u32,
 }
 
 impl Default for RenderScale {
   fn default() -> Self {
-    Self { size: VIEW_SIZE }
+    Self { size: VIEW_SIZE, factor: 1 }
   }
+}
+
+/// 后处理开关（main world 由菜单写，提取进 render world；目前只有抗锯齿）
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ExtractResource)]
+pub struct PostFxSettings {
+  /// FXAA：在最终 blit 里做边缘抗锯齿（`blit.wgsl::fs_fxaa`，代价 ≈ 边缘上 9~13 次采样）
+  pub fxaa: bool,
 }
 
 // ============================================================================
@@ -1226,10 +1238,10 @@ use bevy::{
     render_resource::{
       BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayoutDescriptor,
       BindGroupLayoutEntries, BindingResource, CachedComputePipelineId, CachedRenderPipelineId,
-      ColorTargetState, ColorWrites, ComputePipelineDescriptor, Extent3d, FragmentState,
-      PipelineCache, RenderPassDescriptor, SamplerBindingType, ShaderStages, StorageTextureAccess,
-      TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-      TextureViewDescriptor, UniformBuffer, VertexState,
+      ColorTargetState, ColorWrites, ComputePipelineDescriptor, Extent3d, FilterMode,
+      FragmentState, PipelineCache, RenderPassDescriptor, SamplerBindingType, ShaderStages,
+      StorageTextureAccess, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+      TextureUsages, TextureViewDescriptor, UniformBuffer, VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, texture_3d,
         texture_storage_2d, uniform_buffer,
@@ -1315,6 +1327,8 @@ pub(crate) struct DdaPipelines {
   eye_histogram_pipeline: CachedComputePipelineId,
   eye_update_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
+  /// 同 layout / 同 bind group，仅 fragment 入口换成 `fs_fxaa`（抗锯齿开关，见 [`PostFxSettings`]）
+  blit_fxaa_pipeline: CachedRenderPipelineId,
 }
 
 /// 眼睛适应的 GPU 状态（`EYE_WORDS` 字 storage buffer）+ 上一帧时间戳（算 dt）。
@@ -1424,6 +1438,8 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<DdaImages>::default(),
       // RenderScale 提取进 render world（dispatch workgroup 数随 resize 重算）
       bevy::render::extract_resource::ExtractResourcePlugin::<RenderScale>::default(),
+      // 后处理开关（抗锯齿）：只在变化时同步，blit 侧按它选 pipeline
+      bevy::render::extract_resource::ExtractResourcePlugin::<PostFxSettings>::default(),
       // LightingTheme 提取进 render world（BG3 光池数据源）
       bevy::render::extract_resource::ExtractResourcePlugin::<LightingTheme>::default(),
       // 眼睛适应的活参数（debug overlay 的 Eye 页可调；变化才同步 → 稳态零上传）
@@ -1706,27 +1722,34 @@ pub(crate) fn init_dda_pipelines(
   });
 
   // ---- Blit render pipeline：blit.wgsl（全屏三角）----
+  // 两条：`fs_main`（纯 blit）/ `fs_fxaa`（FXAA 抗锯齿）。同 layout、同 bind group，只有
+  // fragment 入口不同 ⇒ 运行时按 `PostFxSettings.fxaa` 选一条；关掉时零代价（不引入分支，
+  // 只是换了条 pipeline）。
   let blit_shader = asset_server.load(BLIT_SHADER_ASSET_PATH);
-  let blit_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-    label: Some(Cow::from("gate_dda_blit")),
-    layout: vec![blit.clone()],
-    vertex: VertexState {
-      shader: blit_shader.clone(),
-      entry_point: Some(Cow::from("vs_main")),
+  let blit_make = |label: &str, entry: &str| {
+    pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+      label: Some(Cow::from(label.to_string())),
+      layout: vec![blit.clone()],
+      vertex: VertexState {
+        shader: blit_shader.clone(),
+        entry_point: Some(Cow::from("vs_main")),
+        ..default()
+      },
+      fragment: Some(FragmentState {
+        shader: blit_shader.clone(),
+        entry_point: Some(Cow::from(entry.to_string())),
+        targets: vec![Some(ColorTargetState {
+          format: TextureFormat::Rgba8UnormSrgb,
+          blend: None,
+          write_mask: ColorWrites::ALL,
+        })],
+        ..default()
+      }),
       ..default()
-    },
-    fragment: Some(FragmentState {
-      shader: blit_shader,
-      entry_point: Some(Cow::from("fs_main")),
-      targets: vec![Some(ColorTargetState {
-        format: TextureFormat::Rgba8UnormSrgb,
-        blend: None,
-        write_mask: ColorWrites::ALL,
-      })],
-      ..default()
-    }),
-    ..default()
-  });
+    })
+  };
+  let blit_pipeline = blit_make("gate_dda_blit", "fs_main");
+  let blit_fxaa_pipeline = blit_make("gate_dda_blit_fxaa", "fs_fxaa");
 
   commands.insert_resource(DdaPipelines {
     bg0_layout: bg0,
@@ -1744,6 +1767,7 @@ pub(crate) fn init_dda_pipelines(
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
     blit_pipeline,
+    blit_fxaa_pipeline,
   });
   commands.insert_resource(LightPoolGpu(UniformBuffer::default()));
   commands.insert_resource(AuxTexCache::default());
@@ -1987,8 +2011,18 @@ pub(crate) fn prepare_dda_bind_groups(
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 
-  // ---- Blit BG：dda tex（filterable）+ linear sampler（半分辨率上采样）----
-  let blit_sampler = render_device.create_sampler(&SamplerDescriptor::default());
+  // ---- Blit BG：dda tex（filterable）+ **linear** sampler ----
+  // ⚠️ 必须是 Linear，`SamplerDescriptor::default()` 是 Nearest：
+  //   ① 半分辨率档（factor=2）的上采样靠它做双线性；
+  //   ② FXAA 的**亚像素偏移**（`fs_fxaa` 末尾那段）也必须线性采样才生效 —— Nearest 会把
+  //      `final_uv` 的亚纹素偏移量化回原纹素 ⇒ 抗锯齿整体空转（现象就是"开了没变化"）。
+  // factor=1 时线性与最近邻等价（采样点恰好落在纹素中心）。
+  let blit_sampler = render_device.create_sampler(&SamplerDescriptor {
+    label: Some("gate_dda_blit_sampler"),
+    mag_filter: FilterMode::Linear,
+    min_filter: FilterMode::Linear,
+    ..default()
+  });
   let blit_bg = render_device.create_bind_group(
     None,
     &blit_layout,
@@ -2166,6 +2200,7 @@ fn blit_dda_view(
   mut ctx: RenderContext,
   views: Query<&ViewTarget>,
   blit_bg: Option<Res<DdaBlitBindGroup>>,
+  post: Option<Res<PostFxSettings>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
@@ -2174,7 +2209,13 @@ fn blit_dda_view(
     bevy::log::debug_once!("DDA blit: bg or ViewTarget missing");
     return;
   };
-  let Some(pipe) = pipeline_cache.get_render_pipeline(pipelines.blit_pipeline) else {
+  // 抗锯齿 = 换一条 fragment 入口（`fs_fxaa`），bind group 完全相同 ⇒ 开关只在这里分支
+  let id = if post.as_ref().is_some_and(|p| p.fxaa) {
+    pipelines.blit_fxaa_pipeline
+  } else {
+    pipelines.blit_pipeline
+  };
+  let Some(pipe) = pipeline_cache.get_render_pipeline(id) else {
     bevy::log::debug_once!("DDA blit: blit pipeline not ready");
     return;
   };

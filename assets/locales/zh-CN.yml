@@ -17,9 +17,12 @@ _version: 1
 # 菜单树的文案字段（label/options/tooltip/text）在 assets/ui/debug_menu.toml 里存的就是 key，
 # 由 gate-ui 的 UiTranslator 解析；切语言后 menu.* 会整体重解析（见 sync_ui_locale）。
 menu.video: "视频"
+menu.video.half_res: "半分辨率"
+menu.video.half_res.tip: "3D 场景按 1/2 分辨率渲染再放大到窗口：省约 3/4 的主射线，代价是边缘变软（配合抗锯齿更明显）。"
 menu.video.fullscreen: "全屏"
 menu.video.vsync: "垂直同步"
 menu.video.aa: "抗锯齿"
+menu.video.aa.tip: "FXAA：单 pass 边缘抗锯齿（约 9~13 次采样）。抹平台阶/锯齿，但治不了运动中的亚像素闪烁。"
 menu.video.fps: "FPS"
 menu.render: "渲染"
 menu.render.ddgi: "DDGI"

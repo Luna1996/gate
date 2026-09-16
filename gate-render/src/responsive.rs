@@ -7,16 +7,17 @@
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 
-use crate::brickmap::dda::{DdaImages, RenderScale};
+use crate::brickmap::dda::{DdaImages, PostFxSettings, RenderScale};
 
 /// 合法窗口尺寸范围：下限防最小化/折叠矩形，上限防超 GPU 纹理上限
 /// （SetWindowPos 收到负高度会按 u16 回绕上报成 65496）。
 const MIN_DIM: u32 = 64;
 const MAX_DIM: u32 = 4096;
 
-/// 渲染分辨率 = 窗口物理像素 ÷ factor。`GATE_RES_SCALE` 默认 1（全分辨率），
+/// 启动时的降采样倍数（`GATE_RES_SCALE`，默认 1 = 全分辨率）。
+/// **只是初值**：运行期以 `RenderScale.factor` 为准（菜单「视频/半分辨率」写它）。
 /// 非数字或 <1 一律按 1 处理。
-fn render_scale_factor() -> u32 {
+fn render_scale_factor_from_env() -> u32 {
   static FACTOR: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
     std::env::var("GATE_RES_SCALE")
       .ok()
@@ -32,8 +33,8 @@ fn size_is_sane(s: UVec2) -> bool {
 }
 
 /// 窗口物理尺寸 → 渲染目标尺寸（每轴 ÷ factor 向下取整，钳到合法下限）
-fn render_size_for_window(full: UVec2) -> UVec2 {
-  let f = render_scale_factor();
+fn render_size_for_window(full: UVec2, factor: u32) -> UVec2 {
+  let f = factor.max(1);
   UVec2::new((full.x / f).max(MIN_DIM), (full.y / f).max(MIN_DIM))
 }
 
@@ -61,17 +62,14 @@ pub fn resize_render_targets(
     return;
   }
   *warned = false;
-  let new_size = render_size_for_window(full);
+  // `scale.factor` 由菜单「视频/半分辨率」写；它一变，这里算出的尺寸就变 ⇒ 下一帧原地重建。
+  let new_size = render_size_for_window(full, scale.factor);
   if new_size == scale.size {
     return;
   }
   info!(
     "render targets resized: {}x{} (window {}x{}, factor {})",
-    new_size.x,
-    new_size.y,
-    full.x,
-    full.y,
-    render_scale_factor()
+    new_size.x, new_size.y, full.x, full.y, scale.factor
   );
   let extent = Extent3d { width: new_size.x, height: new_size.y, depth_or_array_layers: 1 };
   for handle in dda.iter().map(|d| &d.target) {
@@ -86,6 +84,14 @@ pub struct ResponsivePlugin;
 
 impl Plugin for ResponsivePlugin {
   fn build(&self, app: &mut App) {
-    app.init_resource::<RenderScale>().add_systems(Update, resize_render_targets);
+    app
+      .init_resource::<RenderScale>()
+      .init_resource::<PostFxSettings>()
+      .add_systems(Update, resize_render_targets);
+    // 启动档位可由 `GATE_RES_SCALE` 覆盖（默认 1 = 全分辨率）；之后以菜单开关为准。
+    let f = render_scale_factor_from_env();
+    if f > 1 {
+      app.world_mut().resource_mut::<RenderScale>().factor = f;
+    }
   }
 }
