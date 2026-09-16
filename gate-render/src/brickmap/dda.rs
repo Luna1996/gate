@@ -275,7 +275,7 @@ pub mod wgsl_consts {
   // 光照场（AO fill + 「体素即光源」的发光密度 ε 共用一张 3D 纹理）。cell = 16 voxel，
   // dims = 32³ cell → 世界覆盖 = 32×16 = 512 voxel = ±5.12m（相机中心）。
   // 寻址与 DDGI 同构：原点按 cell 向下对齐、槽位 = 世界 cell mod dims（世界锚定）。
-  // 格式 Rgba16Unorm：.rgb = ε、.a = AO fill。
+  // 格式 Rgba16Unorm：.rgb = ε（**线性 RGB**）、.a = AO fill。
   // upload.rs 铺图依赖 LIGHT_FIELD_DIM×8 是 256 的整数倍（行对齐）。
   pub const LIGHT_FIELD_CELL: u32 = 16;
   pub const LIGHT_FIELD_DIM: u32 = 32;

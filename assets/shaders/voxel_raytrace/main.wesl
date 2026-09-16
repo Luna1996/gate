@@ -785,7 +785,9 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
   let si = tid * 2u;
   // 沿程发光聚合：叠加在命中辐亮度之上，累加到几何首命中（无命中 → T_MAX）。这是间接
   // 贡献（发光 cell 摊成的体积密度），与上面 palette_emissive 的自身发射语义不重叠。
-  radiance = radiance + light_field_gather(probe_pos + dir * DDGI_RAY_BIAS, dir, dist);
+  // 相位抖动复用本射线的 `jit.y`（纹素内抖动的一半，同样是 [0,1)、且逐帧变）：
+  // 积分步长 == 格边长时它是唯一的随机源，见 `light_field_gather` 的说明。
+  radiance = radiance + light_field_gather(probe_pos + dir * DDGI_RAY_BIAS, dir, dist, jit.y);
   ddgi_samples[si] = vec4<f32>(dir, dist);
   ddgi_samples[si + 1u] = vec4<f32>(radiance, 1.0);
 }

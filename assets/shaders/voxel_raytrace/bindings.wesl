@@ -57,7 +57,7 @@ struct Globals {
 // @binding(4)/(5)：光照场（AO fill 与发光密度 ε 共用一张纹理）。
 // 16-voxel cell 网格，**相机中心 + 世界锚定槽位**：纹素下标 = 世界 cell mod dims
 // （见 `light_field_uv`），相机滚动只换新进窗口的那条带。
-// Rgba16Unorm：.rgb = 发光密度 ε、.a = AO fill；采样即硬件三线性插值。
+// Rgba16Unorm：.rgb = 发光密度 ε（**线性 RGB**）、.a = AO fill；采样即硬件三线性插值。
 @group(1) @binding(4) var light_tex: texture_3d<f32>;
 @group(1) @binding(5) var light_samp: sampler;
 

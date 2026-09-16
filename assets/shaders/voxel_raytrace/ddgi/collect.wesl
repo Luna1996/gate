@@ -1,6 +1,6 @@
 import package::bindings::{DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RPP_BASE, ddgi_depth, ddgi_depth_out, ddgi_indirect, ddgi_irr, ddgi_irr_out, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist};
-import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_CONV_SAMPLES, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
-import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_meta_nbr, ddgi_nbr_bit_lod0, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
+import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_CONV_SAMPLES, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FAST_ALPHA, DDGI_FAST_BRIGHT_MIN, DDGI_FAST_DEPTH_STEP, DDGI_FAST_STEP, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
+import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_maxc, ddgi_meta_nbr, ddgi_nbr_bit_lod0, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
 
 // ---- 空间混合（RTXGI ProbeBlending 的简化）----
 // 采样端 gi = Σ(irr·w)/Σw，w = wtri·wn·wd。`wn` 剔掉"探针落在背面"的那半边后，归一化会把
@@ -153,7 +153,15 @@ fn ddgi_collect_one(tid: u32) {
       // 更新一次，从 0 慢慢爬会长期停在假黑；覆盖度也因此一写即到 1，成为持久的"有没有数据"判据。
       // .w = 该纹素的覆盖度（每写一次向 1 靠拢，从未写过恒 0），只有它能把"已写入但真黑"与
       // "从未写过"分开（两者值都是 0），见 DDGI_TEXEL_MIN_COVERAGE。
-      let a = select(ddgi_age_alpha(age, DDGI_ALPHA), 1.0, prev.w <= 0.0);
+      var a = select(ddgi_age_alpha(age, DDGI_ALPHA), 1.0, prev.w <= 0.0);
+      // 大变化快速跟随（见 consts 的 DDGI_FAST_*）：长窗 1/3000 会把「发光体被删掉」这件事
+      // 记住几十分钟 —— 脏区重烘只覆盖被编辑的体素，不覆盖被它照亮过的探针。只在"亮量级"
+      // 触发，抬到 1/8 后 ~30 次更新收敛完；暗区不触发，长窗的噪声免疫不变。
+      let dmax = max(abs(irr_s.x - prev.x), max(abs(irr_s.y - prev.y), abs(irr_s.z - prev.z)));
+      if (max(ddgi_maxc(prev.xyz), ddgi_maxc(irr_s)) > DDGI_FAST_BRIGHT_MIN
+          && dmax > DDGI_FAST_STEP) {
+        a = max(a, DDGI_FAST_ALPHA);
+      }
       textureStore(
         ddgi_irr_out,
         idx,
@@ -208,7 +216,13 @@ fn ddgi_collect_one(tid: u32) {
       // alpha 取 age 项与 1/n_upd 的较大者：换主/编辑时 age 被压回 1，计数却是跨换主继承的
       // ⇒ 只有 age 项能在那几帧把 alpha 抬回大值、快速跟上新位置。
       let n_upd = min(prev4.z + 1.0, DDGI_DEPTH_CONV_SAMPLES);
-      let a = max(ddgi_age_alpha(age, DDGI_DEPTH_ALPHA), 1.0 / n_upd);
+      var a = max(ddgi_age_alpha(age, DDGI_DEPTH_ALPHA), 1.0 / n_upd);
+      // 深度侧同款快速跟随（见 consts 的 DDGI_FAST_*）：几何大跳变（编辑 / 移除发光体）会把
+      // "该方向最近表面距离"整体挪走，1/255 的地板会让它滞留很久 ⇒ Chebyshev 可见性过期
+      // （留下的是"假阴影"而不是假亮光）。判据用 2×std 兜住"样本本身就散"的纹素，再加绝对下限。
+      if (abs(mean - prev.x) > max(2.0 * max(prev.y, DDGI_DEPTH_SOFT_MIN), DDGI_FAST_DEPTH_STEP)) {
+        a = max(a, DDGI_FAST_ALPHA);
+      }
       // 存的是「落进本纹素的样本序列 std」而不是本帧 std：绝大多数帧里 cnt ≤ 1 ⇒ 本帧 std 恒 0，
       // 会让 Chebyshev 的过渡宽度塌成固定比例的刀锋。
       // 做法：同时 EMA「距离」与「距离²」，std 由两者反推。pm2 必须由上一帧的 (mean, std) 反推
