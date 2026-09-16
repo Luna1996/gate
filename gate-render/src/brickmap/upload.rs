@@ -197,17 +197,22 @@ pub struct UploadSnapshot {
 }
 
 // ----------------------------------------------------------------------------
-// 光照场（AO fill + 「体素即光源」的发光密度 ε，共用一张 3D 纹理）
+// 光照场（**AO fill**，Douglas #15）
 //
 // 形态：16-voxel cube 网格（cell），相机中心、按 cell 向下对齐、世界锚定槽位
 // （`slot = 世界 cell mod dims`，与 DDGI 的 `ddgi_slot` 同构）→ 可流式：相机滚动只换
 // 新进窗口那条带的世界 cell，其余槽位保持自己的身份；世界编辑只重算脏 chunk。
 //
 // 纹理 Rgba16Unorm，dims = LIGHT_FIELD_DIM³：
-//   .rgb = 发光密度 ε（**线性 RGB**，= Σ albedo·emissive / cell 体积，0..1）
-//          → cast 射线沿程累加 ε·Δs。颜色必须在这里带上：表面路径是 `alb·emissive`，
-//            只存标量强度会让红发光投出**白光**（两条路径的色相就分家了）。
 //   .a   = 实心占比 AO fill（0.5 = 平面不压暗，≈0.75 = 夹角压暗）
+//   .rgb = **恒 0**（用过的"发光密度 ε"已移除，见下）
+//
+// 为什么没有 ε：自发光只走"射线命中即返回该体素自己的颜色"这一条（Douglas #19 的辐射函数
+// 第三分支，即 `main.wesl` 里 cast / dda_main 的 `alb · palette_emissive · DDGI_EMIT_GAIN`）。
+// 曾经把"cell 内的发光"摊成体积密度喂给探针射线，是为了让**小的**发光体也能被采样到；代价是
+// 发光被摊到整个 16 体素 cell（形状方、无颜色、与探针同频打摩尔纹）、且它会被烘焙进探针图集
+// ⇒ 封闭房间里形成"整屋被照亮"的平衡态，且光源删掉后这个平衡态靠墙吸收慢慢衰减、迟迟不恢复。
+// 现在按 Douglas 的方案只保留命中分支（详见改这一点时的对话结论）。
 // CPU 侧按 chunk 缓存 tally（每 chunk = 16³ = 4096 个 cell），见 [`LightChunk`]。
 // ----------------------------------------------------------------------------
 
@@ -219,8 +224,6 @@ use super::dda::wgsl_consts::{LIGHT_FIELD_CELL, LIGHT_FIELD_DIM};
 pub struct LightChunk {
   /// 每 cell 的实心占比 ×255（0..=255）
   pub fill: Box<[u8]>,
-  /// 每 cell 的发光密度 ε（**线性 RGB**，0..1，= Σ albedo·emissive / 4096）
-  pub emit: Box<[[f32; 3]]>,
 }
 
 /// 光照场 CPU 状态（render world）：按 chunk 的 tally 缓存 + 上次铺图的世界原点。
@@ -243,7 +246,7 @@ pub struct LightFieldUpdate {
 /// 光照场窗口原点（cell 单位）：`align_down(cam - dims/2·cell, cell)`。
 ///
 /// 与 WGSL `light_field_origin_voxel` 同一式子（shader 直接从 `view_u.cam_pos_voxel`
-/// 推），两边必须逐字一致，否则 AO/发光会整体错位。
+/// 推），两边必须逐字一致，否则 AO 会整体错位。
 pub fn light_field_origin_cell(cam_voxel: glam::Vec3) -> IVec3 {
   let cell = LIGHT_FIELD_CELL as i32;
   let half = (LIGHT_FIELD_DIM as i32 / 2) * cell;
@@ -251,74 +254,45 @@ pub fn light_field_origin_cell(cam_voxel: glam::Vec3) -> IVec3 {
   IVec3::new(c.x.div_euclid(cell), c.y.div_euclid(cell), c.z.div_euclid(cell))
 }
 
-/// 单个 chunk 的 16³ cell tally：同时产出 AO fill 与发光密度 ε（一次树查询供两者）。
+/// 单个 chunk 的 16³ cell tally：产出 AO fill。
 ///
-/// 代价控制：cell 三态一次查询即得（Solid 直接给出 palette → ε 精确），仅 Mixed 才展开
-/// 64 个 4³ 子块；Mixed 子块按 fill=32（半实心）近似、ε 取 0。发光块通常是 16³ 或 4³ 上
-/// 的 Solid，不受此近似影响。
-fn build_light_chunk(tree: &gate_voxel::ChunkTree, palette: &gate_voxel::Palette) -> LightChunk {
+/// 代价控制：cell 三态一次查询即得，仅 Mixed 才展开 64 个 4³ 子块；Mixed 子块按 fill=32
+/// （半实心）近似。
+fn build_light_chunk(tree: &gate_voxel::ChunkTree) -> LightChunk {
   use gate_voxel::BrickState;
-  // sRGB→linear 查表：palette 的色是 sRGB u8，而 ε 必须在线性空间里累加（表面路径也走
-  // `srgb_to_linear`，两边不同口径会让光照场的光色与发光体自身的色对不上）。
-  let lut: [f32; 256] = std::array::from_fn(|i| srgb_channel_to_linear(i as f32 / 255.0));
-  // 该 palette 的发光色（线性）= albedo × emissive，与 WGSL `alb · palette_emissive` 同式。
-  let emis = |pal: gate_voxel::PaletteId| -> [f32; 3] {
-    let p = palette.get(pal);
-    let e = p.emissive as f32 / 255.0;
-    [lut[p.color[0] as usize] * e, lut[p.color[1] as usize] * e, lut[p.color[2] as usize] * e]
-  };
   let mut fill = vec![0u8; 16 * 16 * 16].into_boxed_slice();
-  let mut emit = vec![[0f32; 3]; 16 * 16 * 16].into_boxed_slice();
   for lz in 0..16i32 {
     for ly in 0..16i32 {
       for lx in 0..16i32 {
         let bx = lx * 16;
         let by = ly * 16;
         let bz = lz * 16;
-        // (实心体素数 0..4096, 发光色之和 0..4096)
-        let (v, e): (u32, [f32; 3]) = match tree.get_brick_state(bx, by, bz, 2) {
-          BrickState::Air => (0, [0.0; 3]),
-          BrickState::Solid(pal) => {
-            let c = emis(pal);
-            (4096, [c[0] * 4096.0, c[1] * 4096.0, c[2] * 4096.0])
-          }
+        // 实心体素数 0..4096
+        let v: u32 = match tree.get_brick_state(bx, by, bz, 2) {
+          BrickState::Air => 0,
+          BrickState::Solid(_) => 4096,
           BrickState::Mixed => {
-            let (mut n, mut es) = (0u32, [0f32; 3]);
+            let mut n = 0u32;
             for kk in 0..4i32 {
               for jj in 0..4i32 {
                 for ii in 0..4i32 {
                   match tree.get_brick_state(bx + ii * 4, by + jj * 4, bz + kk * 4, 3) {
                     BrickState::Air => {}
-                    BrickState::Solid(pal) => {
-                      n += 64;
-                      let c = emis(pal);
-                      es[0] += 64.0 * c[0];
-                      es[1] += 64.0 * c[1];
-                      es[2] += 64.0 * c[2];
-                    }
+                    BrickState::Solid(_) => n += 64,
                     BrickState::Mixed => n += 32,
                   }
                 }
               }
             }
-            (n, es)
+            n
           }
         };
         let i = (lx + ly * 16 + lz * 256) as usize;
         fill[i] = (v * 255 / 4096) as u8;
-        emit[i] = [e[0] / 4096.0, e[1] / 4096.0, e[2] / 4096.0];
       }
     }
   }
-  LightChunk { fill, emit }
-}
-
-/// sRGB → linear 单通道（与 WGSL `common.wesl::srgb_channel_to_linear` 逐字一致）。
-fn srgb_channel_to_linear(c: f32) -> f32 {
-  if c <= 0.04045 {
-    return c / 12.92;
-  }
-  ((c + 0.055) / 1.055).powf(2.4)
+  LightChunk { fill }
 }
 
 /// 上传 CPU 耗时样本（render world 资源，由 prepare 每帧 insert_resource 覆盖）。
@@ -353,7 +327,7 @@ pub struct GpuBrickMap {
   /// 主世界 chunk 窗口（chunk 单位）CPU 副本：DDGI 世界空间探针网格推导用
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
-  /// 光照场（AO fill + 线性 RGB 发光密度 ε）：Rgba16Unorm 3D 纹理 + **硬件三线性过滤**。
+  /// 光照场（AO fill）：Rgba16Unorm 3D 纹理 + **硬件三线性过滤**。只有 `.a` 有意义。
   /// 尺寸 = LIGHT_FIELD_DIM³，纹素 ↔ 一个 16-voxel cell；相机中心 + 世界锚定槽位，
   /// 由 extract 侧铺好后整幅重写（见 [`LightFieldUpdate`]）。
   /// 首次铺好前绑定 1³ 占位（采样恒 0 → AO=1、ε=0）。
@@ -500,7 +474,7 @@ fn extract(
 
   let volumes_ref = &scene.volumes;
   // ---- 光照场（相机中心 + 世界锚定 + 可流式）：窗口移动或脏 chunk 落入窗口才重铺 ----
-  // 必须放在 `!dirty_any` 早退**之前**：相机滚动通常不带世界变化，但 AO/发光场得跟着相机走。
+  // 必须放在 `!dirty_any` 早退**之前**：相机滚动通常不带世界变化，但 AO 场得跟着相机走。
   // 铺图整幅重来（32³ = 256KB）只在相机跨过 16 体素边界或世界编辑时发生；tally 走缓存，
   // 新进窗口的 chunk 才需要读树。
   let dirty_main: Vec<gate_voxel::ChunkCoord> = if need_full {
@@ -588,9 +562,8 @@ fn update_light_field(
     return None;
   }
 
-  // 补齐窗口内缺失的 chunk（世界上不存在的 chunk 不插缓存 → 该区域保持空气：fill 0 / ε 0）
+  // 补齐窗口内缺失的 chunk（世界上不存在的 chunk 不插缓存 → 该区域保持空气：fill 0）
   let grid = volumes.main();
-  let palette = grid.palette();
   let t0 = std::time::Instant::now();
   let mut tallied = 0usize;
   for cz in c_lo.z..=c_hi.z {
@@ -601,7 +574,7 @@ fn update_light_field(
           continue;
         }
         if let Some(tree) = grid.chunk(coord) {
-          lf.cache.insert(coord, build_light_chunk(tree, palette));
+          lf.cache.insert(coord, build_light_chunk(tree));
           tallied += 1;
         }
       }
@@ -627,14 +600,9 @@ fn update_light_field(
           let si = (lx + ly * 16 + lz * 256) as usize;
           let r = wc.rem_euclid(dimv);
           let ti = (r.x + r.y * dim + r.z * dim * dim) as usize;
-          // Rgba16Unorm：.rgb = ε（**线性 RGB**，逐通道，不做任何亮度折叠）、
-          // .a = fill（fill 是 0..255 → ×257 到 0..65535）
-          let e = t.emit[si];
-          let q = |c: f32| (c.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+          // Rgba16Unorm：只有 `.a` = AO fill 有意义（fill 是 0..255 → ×257 到 0..65535）。
+          // `.rgb` 恒 0（发光密度 ε 已移除）：缓冲区是零初始化的，这里不必写。
           let ob = ti * 8;
-          data[ob..ob + 2].copy_from_slice(&q(e[0]).to_le_bytes());
-          data[ob + 2..ob + 4].copy_from_slice(&q(e[1]).to_le_bytes());
-          data[ob + 4..ob + 6].copy_from_slice(&q(e[2]).to_le_bytes());
           data[ob + 6..ob + 8].copy_from_slice(&((t.fill[si] as u32 * 257) as u16).to_le_bytes());
         }
       }

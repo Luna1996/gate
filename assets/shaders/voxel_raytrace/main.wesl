@@ -6,7 +6,7 @@ import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_BAKE_STAGG
 import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_nbr, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
 import package::ddgi::sample::{ddgi_box_edge_dist, ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
-import package::lightfield::{light_field_ao, light_field_gather};
+import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
 import package::world::{WorldHit, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
 
@@ -783,11 +783,6 @@ fn ddgi_cast(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   // 样本下标 = 全局射线编号（tid 本身就是「该 LOD 起始射线号 + 本探针号×rpp + 射线号」）
   let si = tid * 2u;
-  // 沿程发光聚合：叠加在命中辐亮度之上，累加到几何首命中（无命中 → T_MAX）。这是间接
-  // 贡献（发光 cell 摊成的体积密度），与上面 palette_emissive 的自身发射语义不重叠。
-  // 相位抖动复用本射线的 `jit.y`（纹素内抖动的一半，同样是 [0,1)、且逐帧变）：
-  // 积分步长 == 格边长时它是唯一的随机源，见 `light_field_gather` 的说明。
-  radiance = radiance + light_field_gather(probe_pos + dir * DDGI_RAY_BIAS, dir, dist, jit.y);
   ddgi_samples[si] = vec4<f32>(dir, dist);
   ddgi_samples[si + 1u] = vec4<f32>(radiance, 1.0);
 }

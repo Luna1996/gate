@@ -1,7 +1,7 @@
 import package::bindings::{b_struct, ddgi_cell_slot, ddgi_u, g};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, NODE_FIXED_WORDS};
-import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS, DDGI_USAGE_STICKY};
+import package::ddgi::consts::{DDGI_BIG_CHANGE, DDGI_BRIGHTNESS, DDGI_CHANGE_DROP, DDGI_DELTA_CLAMP, DDGI_DEPTH_TEXELS, DDGI_HYSTERESIS, DDGI_IRRAD_GAMMA, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_META_NBR_MASK, DDGI_META_NBR_SHIFT, DDGI_META_NBR_VALID, DDGI_MIN_STEP, DDGI_NO_PROBE, DDGI_PROBES_PER_LAYER, DDGI_PROBES_PER_LAYER_AXIS, DDGI_USAGE_STICKY};
 
 fn ddgi_merge_state(a: u32, b: u32) -> u32 {
   if (a == 3u) { return b; }
@@ -435,20 +435,19 @@ fn ddgi_lum(c: vec3<f32>) -> f32 {
 fn ddgi_maxc(c: vec3<f32>) -> f32 {
   return max(c.x, max(c.y, c.z));
 }
-/// 时域混合系数：分**收敛斜坡**与**稳态长窗口**两段，以 `age` 到达上限（`DDGI_AGE_MAX`）分界。
+/// 时域混合系数：分**收敛斜坡**与**稳态窗口**两段，以 `age` 到达上限（`DDGI_AGE_MAX`）分界。
 ///
-///   · 斜坡段（`age < DDGI_AGE_MAX`）：`1/age` 的等权滑动平均 —— `age` 就是该探针已积累的
-///     collect 次数，故误差按 1/√n 下降。`age ≤ 1` 时为 1.0（精确覆写），换主/编辑时 age 被
-///     压到 1~8 ⇒ 这几帧快速跟上新位置。
-///   · 稳态段（`age` 已到上限）：一律 `base`（长窗口，负责压稳态逐帧脉动）。
+///   · 斜坡段（`age < 1/base`）：`1/age` 的等权滑动平均 —— `age` 就是该探针已积累的 collect
+///     次数，故误差按 1/√n 下降。`age ≤ 1` 时为 1.0（精确覆写），换主/编辑时 age 被压到
+///     1~8 ⇒ 这几帧快速跟上新位置。
+///   · 稳态段（`age ≥ 1/base`）：恒定 `base`（长窗口，负责压稳态逐帧脉动）。
 ///
-/// 不能写成 `max(base, 1/age)`：辐照度 base = 1/3000 ⇒ 1/base = 3000 远大于 age 上限 255
-/// （worklist/meta 只给它 8 位）⇒ max 恒取 1/age，base 永不生效。必须显式分两段。
-/// 切点取在 age 上限：斜坡段误差 = σ_est/√n，切得越早留下的静态噪声越大（age=32 处切
-/// → 0.18·σ_est；age=255 处切 → 0.06·σ_est）。
+/// 写成 `max(base, 1/age)` 而不是两段 if：两者在 `base ≥ 1/DDGI_AGE_MAX` 时等价，但两段 if 在
+/// `1/base < DDGI_AGE_MAX`（辐照度 base = 1/64）时**不单调** —— age 从 1/base 涨到上限期间
+/// alpha 一路掉到 1/255，到 age == DDGI_AGE_MAX 又跳回 base（此处是 4× 跳变）⇒ 每个探针到龄
+/// 那一刻都会突然重新跟随单帧噪声，表现为周期性的闪烁。`max` 形式没有这个跳变。
 fn ddgi_age_alpha(age: u32, base: f32) -> f32 {
-  if (age < DDGI_AGE_MAX) { return 1.0 / f32(max(age, 1u)); }
-  return base;
+  return max(base, 1.0 / f32(max(age, 1u)));
 }
 
 // ddgi_update_texel：未被调用（collect 直接用 mix(prev, new, a)）。

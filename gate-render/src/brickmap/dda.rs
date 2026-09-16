@@ -272,10 +272,11 @@ pub mod wgsl_consts {
   pub const SHADOW_BIAS: f32 = crate::lighting::SHADOW_BIAS;
   pub const SHADOW_DIR_T_MAX: f32 = crate::lighting::SHADOW_DIR_T_MAX;
   pub const EMISSIVE_EMIT_GAIN: f32 = crate::lighting::EMISSIVE_EMIT_GAIN;
-  // 光照场（AO fill + 「体素即光源」的发光密度 ε 共用一张 3D 纹理）。cell = 16 voxel，
+  // 光照场（AO fill；Douglas #15 的 16³ 体素填充率网格）。cell = 16 voxel，
   // dims = 32³ cell → 世界覆盖 = 32×16 = 512 voxel = ±5.12m（相机中心）。
   // 寻址与 DDGI 同构：原点按 cell 向下对齐、槽位 = 世界 cell mod dims（世界锚定）。
-  // 格式 Rgba16Unorm：.rgb = ε（**线性 RGB**）、.a = AO fill。
+  // 格式 Rgba16Unorm：.a = AO fill，.rgb 恒 0（发光密度 ε 已按 Douglas #19 的方案移除，
+  // 自发光只走"射线命中即返回它自己的颜色"）。
   // upload.rs 铺图依赖 LIGHT_FIELD_DIM×8 是 256 的整数倍（行对齐）。
   pub const LIGHT_FIELD_CELL: u32 = 16;
   pub const LIGHT_FIELD_DIM: u32 = 32;
