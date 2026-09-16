@@ -36,20 +36,25 @@ use edit::voxel_edit_input;
 use scene::setup;
 use showcase::{showcase_demo_system, spawn_showcase};
 
-// i18n 文案表：编译期把 gate-app/locales/*.yml codegen 进二进制（`t!` 查表零 IO）。
+// i18n 文案表：编译期把 assets/locales/*.yml codegen 进二进制（`t!` 查表零 IO）。
 // fallback = 缺省语言：某语言缺键时回落中文，不会把裸 key 显示到 UI。
-// 加语言 = locales/<locale>.yml + Cargo.toml 的 available-locales；运行期切语言 = rust_i18n::set_locale。
-rust_i18n::i18n!("locales", fallback = "zh-CN");
+// 加语言 = assets/locales/<locale>.yml + Cargo.toml 的 available-locales；运行期切语言 = rust_i18n::set_locale。
+rust_i18n::i18n!("../assets/locales", fallback = "zh-CN");
 
 /// 缺省语言（`rust_i18n::set_locale` 的入参）
 pub const DEFAULT_LOCALE: &str = "zh-CN";
 
-/// 以 crate 目录为锚的 assets 路径，F5 / 终端启动行为一致
-pub const ASSETS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
+/// 只读资源根（Bevy `AssetPlugin::file_path`）：开发时 = 源码树 `assets/`，
+/// 便携发布时 = exe 同目录 `assets/`（见 [`gate_render::paths`]）
+pub fn assets_dir() -> std::path::PathBuf {
+  gate_render::assets_dir()
+}
 
-/// 日志文件路径：LogPlugin custom_layer 追加的无色文件层在此落盘，
+/// 日志文件路径（可写目录，与资源分离）：<安装根>/logs/latest.log，
 /// 每次启动截断重写；stderr 彩色层不受影响
-pub const LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/latest.log");
+pub fn log_path() -> std::path::PathBuf {
+  gate_render::logs_dir().join("latest.log")
+}
 
 fn main() {
   // profile feature：Tracy 客户端必须在最早期启动 —— wgpu-profiler 的
@@ -84,7 +89,11 @@ fn main() {
         }),
         ..default()
       })
-      .set(AssetPlugin { file_path: ASSETS_PATH.into(), ..default() })
+      .set(AssetPlugin {
+        // 运行期解析（不是编译期常量）：便携发布时指向 exe 同目录的 assets/
+        file_path: assets_dir().to_string_lossy().into_owned(),
+        ..default()
+      })
       .set(LogPlugin {
         // info 基线 + 定向屏蔽：wgpu_hal::vulkan 的 instance / surface 层会打印
         // wgpu 已知 bug 的 VUID 错误（仅首 1-2 帧 swapchain 时序异常，不影响画面正确性）；
@@ -93,13 +102,13 @@ fn main() {
           wgpu_hal::vulkan::instance=off,\
           wgpu_hal::vulkan::surface=off"
           .into(),
-        // 附加层：无色文件层写 logs/latest.log（stderr 彩色层不受影响）；
+        // 附加层：无色文件层写 <安装根>/logs/latest.log（stderr 彩色层不受影响）；
         // profile feature 再叠加 TracyLayer（tracing span → Tracy CPU zone）
         custom_layer: |_app| {
           use bevy::log::BoxedLayer;
-          let path = std::path::Path::new(LOG_PATH);
-          std::fs::create_dir_all(path.parent().expect("LOG_PATH 必有父目录")).ok()?;
-          let file = std::fs::File::create(path).ok()?;
+          let path = log_path();
+          std::fs::create_dir_all(path.parent().expect("log_path 必有父目录")).ok()?;
+          let file = std::fs::File::create(&path).ok()?;
           let (writer, guard) = tracing_appender::non_blocking(file);
           std::mem::forget(guard);
           let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
@@ -178,8 +187,9 @@ fn main() {
         enforce_integer_scale_factor,
       ),
     )
-    // 退出前把 DebugMenu 当前状态写回 TOML（下次启动的初值来源）
-    .add_systems(Last, save_menu_on_exit);
+    // 退出前把 DebugMenu 当前状态写回 TOML（下次启动的初值来源）。
+    // 必须排在 bevy_window 的 ExitSystems 之后：AppExit 由它写入，否则同一帧读不到 → 永不保存
+    .add_systems(Last, save_menu_on_exit.after(bevy::window::ExitSystems));
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);

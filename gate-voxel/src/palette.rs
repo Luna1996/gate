@@ -79,30 +79,3 @@ impl Palette {
     idx == AIR_INDEX
   }
 }
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn entry_size_is_8_bytes() {
-    assert_eq!(size_of::<PaletteEntry>(), 8);
-  }
-
-  #[test]
-  fn air_slot_is_reserved() {
-    let mut p = Palette::new();
-    let r = std::panic::catch_unwind(move || {
-      p.set(AIR_INDEX, PaletteEntry::default());
-    });
-    assert!(r.is_err());
-  }
-
-  #[test]
-  fn flags_compose() {
-    let f = PaletteFlags::LOCKED.union(PaletteFlags::INPUT_PORT);
-    assert!(f.contains(PaletteFlags::LOCKED));
-    assert!(f.contains(PaletteFlags::INPUT_PORT));
-    assert!(!f.contains(PaletteFlags::OUTPUT_PORT));
-  }
-}

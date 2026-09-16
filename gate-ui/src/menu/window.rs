@@ -1,17 +1,16 @@
-//! DebugWindow 容器：标题栏 + 拖拽 + ViewPager 分页动画 + 收起/展开。
+//! DebugWindow 容器：标题栏 + 拖拽 + ViewPager 分页动画 + 收起/展开（高度缓动，时长 [`PAGE_ANIM_SECS`]）。
 //!
 //! 结构：
 //! ```text
 //! root (DebugMenu, 绝对定位)
 //! ├── title_bar (返回 | 路径 | 重置位置 | 收起/展开)
-//! ── viewport (overflow clip, 背景透明)
+//! ── viewport (overflow clip, 背景透明；收起动画期间高度缓动，收起后 Display::None 完全不占布局)
 //!     ── page × 1..2（切换动画期间新旧两页并排滑动）
 //! ```
 //!
 //! [`menu_system`] 是唯一的交互/布局驱动（独占系统）：读控件状态 → 写回模型
 //! （[`MenuFile`] 永远是真源）→ 发 [`MenuActionEvent`] → 刷新视觉 → 推进分页动画。
 
-use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::ui::{Checked, FocusPolicy, Interaction};
 use bevy::window::PrimaryWindow;
@@ -25,8 +24,8 @@ use crate::capture::MouseIntercept;
 use crate::icon::{Icon, IconFont};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::{
-  LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputValue, UiCtx, color_of, label, px,
-  spawn_icon,
+  LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputValue, UiCtx, color_of, dim_color,
+  label, px, spawn_icon,
 };
 
 /// 窗口拖拽的上一帧光标位置（逻辑 px；`None` = 指针不在窗口内）。
@@ -67,6 +66,21 @@ pub struct MenuPager {
   dir: f32,
   /// 进度 0..1
   t: f32,
+  /// 本段动画的公共起点偏移（逻辑 px）：上一段被打断时接续它当前的偏移，否则 0
+  start_off: f32,
+}
+
+/// 收起/展开动画状态（视口高度缓动；时长 [`PAGE_ANIM_SECS`]）
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+struct MenuCollapse {
+  /// 进度 0..=1（1 = 动画结束）
+  t: f32,
+  /// 起始高度（逻辑 px）
+  from: f32,
+  /// 目标高度（逻辑 px；收起 = 0）
+  to: f32,
+  /// 目标态：true = 收起
+  collapsed: bool,
 }
 
 /// 容器各部位实体句柄（menu_system 定位用）
@@ -74,8 +88,12 @@ pub struct MenuPager {
 pub struct MenuParts {
   pub title_bar: Entity,
   pub back_btn: Entity,
+  /// 返回按钮的图标（禁用态置灰用）
+  pub back_icon: Entity,
   pub path_label: Entity,
   pub reset_btn: Entity,
+  /// 重置位置按钮的图标（交互配色用）
+  pub reset_icon: Entity,
   pub collapse_btn: Entity,
   pub collapse_icon: Entity,
   pub viewport: Entity,
@@ -138,8 +156,10 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
   let path = model.window.path.clone();
   let collapsed = model.window.collapsed;
   let (x, y) = (model.window.x, model.window.y);
-  let root_path = clip_path(&model, &path);
+  let root_path = display_path(&model, &path, |k| ctx.text(k));
 
+  // 容器**不绘制**（纯透明、无边框，只做布局与命中）：页面切换时两页高度不同，
+  // 若容器有底色/边框会盖住较矮那页的底边；底色与边框都交给标题栏与各页自己画
   let root = world
     .spawn((
       Name::new("debug-menu"),
@@ -150,17 +170,25 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
         top: px(y),
         width: px(PAGE_W + m.border_width * 2.0),
         flex_direction: FlexDirection::Column,
-        border: UiRect::all(px(m.border_width)),
         ..default()
       },
-      BackgroundColor(color_of(&c.surface_card_hud)),
-      BorderColor::all(color_of(&c.border)),
+      BackgroundColor(Color::NONE),
     ))
     .id();
 
   // ---- 标题栏 ----
   let mut title_bar_e = Entity::PLACEHOLDER;
-  let (mut back_e, mut path_l, mut reset_e, mut collapse_e, mut collapse_icon) = (
+  let (
+    mut back_e,
+    mut back_icon,
+    mut path_l,
+    mut reset_e,
+    mut reset_icon,
+    mut collapse_e,
+    mut collapse_icon,
+  ) = (
+    Entity::PLACEHOLDER,
+    Entity::PLACEHOLDER,
     Entity::PLACEHOLDER,
     Entity::PLACEHOLDER,
     Entity::PLACEHOLDER,
@@ -176,11 +204,23 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
           height: px(TITLE_BAR_H),
           flex_direction: FlexDirection::Row,
           align_items: AlignItems::Center,
-          border: UiRect::bottom(px(m.border_width)),
+          // 左右边框与页面侧边连成整窗竖线，底边框充当标题栏与内容的分隔线（顶边不画，
+          // 否则会吃掉标题栏内容高度，30×30 的图标按钮就放不下）
+          border: UiRect {
+            left: px(m.border_width),
+            right: px(m.border_width),
+            top: px(0.0),
+            bottom: px(m.border_width),
+          },
           ..default()
         },
         BackgroundColor(color_of(&c.surface_elevated)),
-        BorderColor { bottom: color_of(&c.border), ..BorderColor::DEFAULT },
+        BorderColor {
+          top: Color::NONE,
+          right: color_of(&c.border),
+          bottom: color_of(&c.border),
+          left: color_of(&c.border),
+        },
         Interaction::default(),
         // 标题栏空白处可拖动窗口
         FocusPolicy::Block,
@@ -189,26 +229,28 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
       .id();
     title_bar_e = tb;
     r.world_mut().entity_mut(tb).with_children(|bar| {
-      back_e = icon_button(ctx, bar, TitleAction::Back, Icon::ChevronLeft);
-      // 路径标签：占满中间，过长中间省略
+      (back_e, back_icon) = icon_button(ctx, bar, TitleAction::Back, Icon::ChevronLeft);
+      // 路径标签：占满中间，过长中间省略；颜色走 Muted 档（次要灰）不变，
+      // 只把字号单独提到正文档（12 → 14）—— 逐属性覆盖，不再被预设档绑成一档
       path_l = *label(
         ctx,
         bar,
         LabelConfig {
           text: root_path.clone(),
           style: LabelStyle::Muted,
+          size: Some(m.font_size.md),
           overflow: LabelOverflow::MiddleEllipsis,
           ..default()
         },
       );
-      bar.world_mut().entity_mut(path_l).insert(Node { flex_grow: 1.0, ..default() });
-      reset_e = icon_button(ctx, bar, TitleAction::ResetPosition, Icon::UndoAlt);
-      collapse_e = icon_button(ctx, bar, TitleAction::Collapse, Icon::Compress);
-      collapse_icon = bar
-        .world_mut()
-        .get::<Children>(collapse_e)
-        .and_then(|ch| ch.first().copied())
-        .unwrap_or(Entity::PLACEHOLDER);
+      // 占满中间：只补字段，不能整个 Node 覆盖（中间省略依赖 label 自带 Node 的 overflow: clip）；
+      // 左右 margin 让路径与两侧图标按钮之间留出间距（按钮格子是 30×30，图标只占中间 12px）
+      if let Some(mut n) = bar.world_mut().get_mut::<Node>(path_l) {
+        n.flex_grow = 1.0;
+        n.margin = UiRect::horizontal(px(m.spacing.sm));
+      }
+      (reset_e, reset_icon) = icon_button(ctx, bar, TitleAction::ResetPosition, Icon::UndoAlt);
+      (collapse_e, collapse_icon) = icon_button(ctx, bar, TitleAction::Collapse, Icon::AngleUp);
     });
   });
 
@@ -245,13 +287,17 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
       reset_pos: false,
       toggle_collapse: false,
     },
-    MenuPager { current: page, outgoing: None, dir: 1.0, t: 1.0 },
+    MenuPager { current: page, outgoing: None, dir: 1.0, t: 1.0, start_off: 0.0 },
     MenuDrag::default(),
+    // 收起动画静止态起步（收起态由模型带入，首帧直接落成 Display::None）
+    MenuCollapse { t: 1.0, from: 0.0, to: 0.0, collapsed },
     MenuParts {
       title_bar: title_bar_e,
       back_btn: back_e,
+      back_icon,
       path_label: path_l,
       reset_btn: reset_e,
+      reset_icon,
       collapse_btn: collapse_e,
       collapse_icon,
       viewport,
@@ -260,16 +306,22 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
   DebugMenuHandle { root }
 }
 
-/// 标题栏图标按钮（无文字，只有 FontAwesome 字形）
-fn icon_button(ctx: &UiCtx, parent: &mut ChildSpawner, action: TitleAction, icon: Icon) -> Entity {
+/// 标题栏图标按钮（无文字，只有 FontAwesome 字形）；返回 (按钮, 图标)
+fn icon_button(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  action: TitleAction,
+  icon: Icon,
+) -> (Entity, Entity) {
   let c = &ctx.theme.colors;
   let mut ec = parent.spawn((
     Name::new("menu-title-button"),
     action,
     Interaction::default(),
     MenuPressPrev::default(),
+    // 命中区 = 与标题栏同高的正方形（图标本身小一圈，但点击范围铺满整格）
     Node {
-      width: px(TITLE_ICON_W),
+      width: px(TITLE_BAR_H),
       height: px(TITLE_BAR_H),
       align_items: AlignItems::Center,
       justify_content: JustifyContent::Center,
@@ -279,13 +331,17 @@ fn icon_button(ctx: &UiCtx, parent: &mut ChildSpawner, action: TitleAction, icon
     FocusPolicy::Block,
     MouseIntercept,
   ));
+  let mut icon_e = Entity::PLACEHOLDER;
   ec.with_children(|b| {
-    spawn_icon(ctx, b, icon.glyph(), TITLE_ICON_SIZE, color_of(&c.text_body));
+    icon_e = spawn_icon(ctx, b, icon.glyph(), TITLE_ICON_SIZE, color_of(&c.text_body));
   });
-  ec.id()
+  (ec.id(), icon_e)
 }
 
 /// 按模型建一页（节点子树 + 直接挂到 viewport 下）
+///
+/// 页面自带底色与边框（容器不画）：切换时两页各成一块，能看出各自不同的底边。
+/// 上边框不画——与标题栏底边框重叠会变成 2px 粗线，分隔线由标题栏那条充当。
 fn build_page(
   world: &mut World,
   ctx: &UiCtx,
@@ -293,12 +349,31 @@ fn build_page(
   model: &MenuFile,
   path: &[String],
 ) -> Entity {
+  // 页面外框宽度 = 内容宽 + 左右各 1px 边框；内容宽恒为 PAGE_W（页面自带边框，容器不画）
+  let c = &ctx.theme.colors;
+  let m = &ctx.theme.metrics;
   let page = world
     .spawn((
       Name::new("menu-page"),
       MenuPage { path: path.to_vec() },
-      Node { width: px(PAGE_W), flex_direction: FlexDirection::Column, ..default() },
-      BackgroundColor(Color::NONE),
+      Node {
+        width: px(page_outer_w(m.border_width)),
+        flex_direction: FlexDirection::Column,
+        border: UiRect {
+          left: px(m.border_width),
+          right: px(m.border_width),
+          top: px(0.0),
+          bottom: px(m.border_width),
+        },
+        ..default()
+      },
+      BackgroundColor(color_of(&c.surface_card_hud)),
+      BorderColor {
+        top: Color::NONE,
+        right: color_of(&c.border),
+        bottom: color_of(&c.border),
+        left: color_of(&c.border),
+      },
     ))
     .id();
   let path_str = path.join("/");
@@ -312,22 +387,37 @@ fn build_page(
   page
 }
 
-/// 剪掉无效路径段（TOML 被手改后仍能建出 UI）
-pub(crate) fn clip_path(model: &MenuFile, path: &[String]) -> String {
-  let mut ok: Vec<&str> = Vec::new();
+/// 沿 id 路径收集模型里真实存在的节点（无效段处截断）
+fn clip_nodes<'a>(model: &'a MenuFile, path: &'a [String]) -> Vec<&'a MenuNode> {
+  let mut ok: Vec<&MenuNode> = Vec::new();
   let mut cur = model.items.as_slice();
   for seg in path {
     let Some(node) = cur.iter().find(|n| n.id() == seg) else {
       break;
     };
-    ok.push(node.id());
+    ok.push(node);
     cur = node.children();
   }
+  ok
+}
+
+/// 剪掉无效路径段（TOML 被手改后仍能建出 UI）；显示 id 路径（日志用）
+pub(crate) fn clip_path(model: &MenuFile, path: &[String]) -> String {
+  let ok: Vec<&str> = clip_nodes(model, path).iter().map(|n| n.id()).collect();
+  if ok.is_empty() { "/".to_string() } else { format!("/{}", ok.join("/")) }
+}
+
+/// 标题栏路径文本：各段取节点 label 的译文（如 `/渲染/曝光`）；无效段截断；根 = `/`
+fn display_path(model: &MenuFile, path: &[String], translate: impl Fn(&str) -> String) -> String {
+  let ok: Vec<String> = clip_nodes(model, path).iter().map(|n| translate(n.label())).collect();
   if ok.is_empty() { "/".to_string() } else { format!("/{}", ok.join("/")) }
 }
 
 /// 世界 → UiCtx（导航建页时需要；主题/字体/解析器句柄 clone 一次，成本可忽略）
-fn ctx_from_world(world: &World) -> Option<(UiTheme, Option<Handle<Font>>, Option<Handle<Font>>, Option<crate::i18n::TranslatorFn>)> {
+fn ctx_from_world(
+  world: &World,
+) -> Option<(UiTheme, Option<Handle<Font>>, Option<Handle<Font>>, Option<crate::i18n::TranslatorFn>)>
+{
   let theme = world.get_resource::<UiTheme>()?.clone();
   let font = world.get_resource::<ThemeFont>().and_then(|f| f.handle.clone());
   let icon = world.get_resource::<IconFont>().and_then(|f| f.handle.clone());
@@ -343,8 +433,10 @@ pub fn menu_system(world: &mut World) {
   let Some(parts) = world.get::<MenuParts>(root).map(|p| MenuParts {
     title_bar: p.title_bar,
     back_btn: p.back_btn,
+    back_icon: p.back_icon,
     path_label: p.path_label,
     reset_btn: p.reset_btn,
+    reset_icon: p.reset_icon,
     collapse_btn: p.collapse_btn,
     collapse_icon: p.collapse_icon,
     viewport: p.viewport,
@@ -367,12 +459,22 @@ pub fn menu_system(world: &mut World) {
       continue;
     }
     match action {
-      TitleAction::Back => world.get_mut::<DebugMenu>(root).map(|mut m| m.back = true),
+      // 根节点没有上级：返回按钮为禁用态，点击忽略
+      TitleAction::Back => {
+        let at_root = world.get::<DebugMenu>(root).is_some_and(|m| m.path.is_empty());
+        if !at_root && let Some(mut m) = world.get_mut::<DebugMenu>(root) {
+          m.back = true;
+        }
+      }
       TitleAction::ResetPosition => {
-        world.get_mut::<DebugMenu>(root).map(|mut m| m.reset_pos = true)
+        if let Some(mut m) = world.get_mut::<DebugMenu>(root) {
+          m.reset_pos = true;
+        }
       }
       TitleAction::Collapse => {
-        world.get_mut::<DebugMenu>(root).map(|mut m| m.toggle_collapse = true)
+        if let Some(mut m) = world.get_mut::<DebugMenu>(root) {
+          m.toggle_collapse = true;
+        }
       }
     };
   }
@@ -520,10 +622,13 @@ pub fn menu_system(world: &mut World) {
   // ---------- 6. 分页动画 ----------
   advance_pager(world, root, parts.viewport);
 
-  // ---------- 7. 视觉刷新 ----------
+  // ---------- 7. 收起/展开动画（视口高度；覆盖分页给的 Auto） ----------
+  advance_collapse(world, root, parts.viewport);
+
+  // ---------- 8. 视觉刷新 ----------
   refresh_visuals(world, root, &parts);
 
-  // ---------- 8. 窗口拖拽 + 边界约束 ----------
+  // ---------- 9. 窗口拖拽 + 边界约束 ----------
   drag_and_clamp(world, root, &parts);
 }
 
@@ -573,15 +678,32 @@ fn start_navigation(world: &mut World, root: Entity, viewport: Entity, target: &
     if target.len() >= menu.path.len() { 1.0 } else { -1.0 }
   };
   let Some((theme, font, icon, translate)) = ctx_from_world(world) else { return };
-  let ctx = UiCtx::new(&theme, font.as_ref())
-    .with_icon_font(icon.as_ref())
-    .with_translate(translate);
+  let ctx =
+    UiCtx::new(&theme, font.as_ref()).with_icon_font(icon.as_ref()).with_translate(translate);
   let model = world.get::<DebugMenu>(root).expect("DebugMenu 存在").model.clone();
   let new_page = build_page(world, &ctx, viewport, &model, target);
-  let old_page = world.get::<MenuPager>(root).expect("MenuPager 存在").current;
+  let (old_page, stale, from_left) = {
+    let p = world.get::<MenuPager>(root).expect("MenuPager 存在");
+    let old_page = p.current;
+    let from_left = world.get::<Node>(old_page).map_or(0.0, |n| match n.left {
+      Val::Px(v) => v,
+      _ => 0.0,
+    });
+    (old_page, p.outgoing, from_left)
+  };
+  // 上一段动画没播完就被打断：它那个旧页等不到收尾（p.outgoing 将被覆盖），直接销毁，
+  // 否则会永远停在半个身位处，表现为屏幕外侧多出一个页面
+  if let Some(e) = stale
+    && e != old_page
+    && world.get_entity(e).is_ok()
+  {
+    world.despawn(e);
+  }
   // 旧页高度作为动画起始高度（新页布局完成后下一帧再取 max）
   let old_h = logical_height(world, old_page);
-  for (e, left) in [(old_page, 0.0f32), (new_page, dir * PAGE_W)] {
+  let step = page_outer_w(ctx.theme.metrics.border_width);
+  // 被打断时旧页已偏离中线，从它当前偏移接续滑动（否则会瞬移回中间再滑出）
+  for (e, left) in [(old_page, from_left), (new_page, from_left + dir * step)] {
     if let Some(mut n) = world.get_mut::<Node>(e) {
       n.position_type = PositionType::Absolute;
       n.left = px(left);
@@ -601,15 +723,16 @@ fn start_navigation(world: &mut World, root: Entity, viewport: Entity, target: &
     p.outgoing = Some(old_page);
     p.current = new_page;
     p.dir = dir;
+    p.start_off = from_left;
     p.t = 0.0;
   }
 }
 
 /// 推进分页动画：两页并排滑动；窗口内容高度取两者较大者
 fn advance_pager(world: &mut World, root: Entity, viewport: Entity) {
-  let (mut t, dir, current, outgoing) = {
+  let (mut t, dir, current, outgoing, start_off) = {
     let Some(p) = world.get::<MenuPager>(root) else { return };
-    (p.t, p.dir, p.current, p.outgoing)
+    (p.t, p.dir, p.current, p.outgoing, p.start_off)
   };
   if outgoing.is_none() {
     // 静止态：当前页走文档流，视口高度 auto（窗口高度随内容）
@@ -625,12 +748,16 @@ fn advance_pager(world: &mut World, root: Entity, viewport: Entity) {
   let dt = world.resource::<Time>().delta_secs();
   t = (t + dt / PAGE_ANIM_SECS).min(1.0);
   let p = ease_in_out(t);
+  let step =
+    page_outer_w(world.get_resource::<UiTheme>().map_or(0.0, |th| th.metrics.border_width));
+  // 公共起点偏移随进度回零；两页始终保持一个身位间距，t=1 时新页落在 0、旧页完全出窗
+  let off = start_off * (1.0 - p);
   let old = outgoing.expect("outgoing 存在");
   if let Some(mut n) = world.get_mut::<Node>(old) {
-    n.left = px(-dir * p * PAGE_W);
+    n.left = px(off - dir * p * step);
   }
   if let Some(mut n) = world.get_mut::<Node>(current) {
-    n.left = px(dir * (1.0 - p) * PAGE_W);
+    n.left = px(off + dir * (1.0 - p) * step);
   }
   // 内容高度 = 两页较高者（页面为绝对定位，高度取上帧布局结果）
   let h = logical_height(world, old).max(logical_height(world, current));
@@ -660,20 +787,84 @@ fn logical_height(world: &World, e: Entity) -> f32 {
   world.get::<ComputedNode>(e).map(|n| n.size().y * n.inverse_scale_factor).unwrap_or(0.0)
 }
 
+/// 页面外框宽度（内容宽 [`PAGE_W`] + 左右各 1px 边框）。滑动切换时两页紧贴的步距。
+fn page_outer_w(border_width: f32) -> f32 {
+  PAGE_W + border_width * 2.0
+}
+
+/// 页面完整高度：纯行列表、行高固定 [`ITEM_H`]（见 `items::base_row`）+ 页面自身的上下边框
+fn page_height(world: &World, page: Entity) -> f32 {
+  let rows = world.get::<Children>(page).map_or(0.0, |c| c.len() as f32 * ITEM_H);
+  let border = world.get::<Node>(page).map_or(0.0, |n| {
+    let px_of = |v: Val| if let Val::Px(v) = v { v } else { 0.0 };
+    px_of(n.border.top) + px_of(n.border.bottom)
+  });
+  rows + border
+}
+
+/// 收起/展开：视口高度缓动（时长 [`PAGE_ANIM_SECS`]）。
+///
+/// 收起后视口 `Display::None`——完全脱离布局，窗口只剩标题栏（不留空窗口）；
+/// 展开时从 0 涨到页面完整高度，涨完交回 `Val::Auto` 由内容决定。
+fn advance_collapse(world: &mut World, root: Entity, viewport: Entity) {
+  let Some(state) = world.get::<MenuCollapse>(root).copied() else { return };
+  let collapsed = world.get::<DebugMenu>(root).is_some_and(|m| m.collapsed);
+
+  if state.t >= 1.0 && state.collapsed == collapsed {
+    // 静止态：收起 → 内容不参与布局
+    let display = if collapsed { Display::None } else { Display::Flex };
+    if let Some(mut n) = world.get_mut::<Node>(viewport)
+      && n.display != display
+    {
+      n.display = display;
+    }
+    return;
+  }
+  if state.t >= 1.0 {
+    // 目标态翻转 → 起一段新动画：起点 = 视口当前高度（收起态下为 0）
+    let from = if state.collapsed { 0.0 } else { logical_height(world, viewport) };
+    let to = if collapsed {
+      0.0
+    } else {
+      world.get::<MenuPager>(root).map_or(0.0, |p| page_height(world, p.current))
+    };
+    if let Some(mut n) = world.get_mut::<Node>(viewport) {
+      n.display = Display::Flex;
+      n.height = px(from);
+    }
+    if let Some(mut s) = world.get_mut::<MenuCollapse>(root) {
+      *s = MenuCollapse { t: 0.0, from, to, collapsed };
+    }
+    return;
+  }
+  // 推进动画
+  let dt = world.resource::<Time>().delta_secs();
+  let t = (state.t + dt / PAGE_ANIM_SECS).min(1.0);
+  let h = state.from + (state.to - state.from) * ease_in_out(t);
+  if let Some(mut n) = world.get_mut::<Node>(viewport) {
+    n.height = px(h);
+  }
+  if let Some(mut s) = world.get_mut::<MenuCollapse>(root) {
+    s.t = t;
+  }
+}
+
 /// 缓动（ease-in-out cubic）
 fn ease_in_out(t: f32) -> f32 {
   if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
-/// 视觉刷新：路径 / 收起态 / 子菜单与选项高亮 / 滑杆数值 / 色块
+/// 视觉刷新：路径 / 返回按钮禁用态 / 收起图标 / 子菜单与选项高亮 / 滑杆数值 / 色块
 fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
-  let (collapsed, display_path, back_display) = {
+  let (collapsed, path_text, back_disabled) = {
     let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
-    (
-      menu.collapsed,
-      clip_path(&menu.model, &menu.path),
-      if menu.path.is_empty() { Display::None } else { Display::Flex },
-    )
+    let i18n = world.get_resource::<crate::i18n::UiTranslator>();
+    let path_text = match i18n {
+      Some(t) => display_path(&menu.model, &menu.path, |k| t.resolve(k)),
+      None => display_path(&menu.model, &menu.path, |k| k.to_string()),
+    };
+    // 根路径没有上级可返回：按钮置灰（禁用态），位置照常占住（路径文本位置不变）
+    (menu.collapsed, path_text, menu.path.is_empty())
   };
   // 色令牌按需取（避免每帧 clone 整份主题）
   let Some(theme) = world.get_resource::<UiTheme>() else { return };
@@ -689,30 +880,56 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
   let (text_primary, text_body, text_muted) =
     (color_of(&c.text_primary), color_of(&c.text_body), color_of(&c.text_muted));
 
-  // 路径标签（显示 id 路径；根 = "/"）+ 返回图标可见性
-  if let Some(mut n) = world.get_mut::<Node>(parts.back_btn)
-    && n.display != back_display
-  {
-    n.display = back_display;
-  }
+  // 路径标签（显示译文路径；根 = "/"）
   if let Some(mut t) = world.get_mut::<Text>(parts.path_label)
-    && t.0 != display_path
+    && t.0 != path_text
   {
-    t.0 = display_path.clone();
+    t.0 = path_text.clone();
   }
   if let Some(mut el) = world.get_mut::<crate::widgets::EllipsisText>(parts.path_label)
-    && el.full != display_path
+    && el.full != path_text
   {
-    el.full = display_path;
+    el.full = path_text;
   }
-  // 收起/展开：视口显隐 + 图标切换
-  let vis = if collapsed { Visibility::Hidden } else { Visibility::Inherited };
-  if let Some(mut v) = world.get_mut::<Visibility>(parts.viewport)
-    && *v != vis
-  {
-    *v = vis;
+  // 标题栏图标按钮：hover / 按下 配色；根节点的返回按钮为禁用态（置灰 + 交互穿透，标题栏照常可拖）
+  for (btn, icon, disabled) in [
+    (parts.back_btn, parts.back_icon, back_disabled),
+    (parts.reset_btn, parts.reset_icon, false),
+    (parts.collapse_btn, parts.collapse_icon, false),
+  ] {
+    let inter = world.get::<Interaction>(btn).copied().unwrap_or(Interaction::None);
+    let (bg, fg) = if disabled {
+      (Color::NONE, dim_color(text_body))
+    } else {
+      match inter {
+        Interaction::Pressed => (accent_fill, accent_text),
+        Interaction::Hovered => (surface_overlay, text_primary),
+        Interaction::None => (Color::NONE, text_body),
+      }
+    };
+    if let Some(mut b) = world.get_mut::<BackgroundColor>(btn)
+      && b.0 != bg
+    {
+      b.0 = bg;
+    }
+    // 禁用态让指针穿过整格（否则这一格会吃掉标题栏的拖拽）。
+    // 只改按钮自己：图标节点必须保持 Node 默认的 `FocusPolicy::Pass`——一旦给它 Block，
+    // 命中链会在图标（文本行框比字形更高）处截断，按钮拿不到 Interaction，
+    // 表现为图标正上方出现不可交互的死区
+    let focus = if disabled { FocusPolicy::Pass } else { FocusPolicy::Block };
+    if let Some(mut f) = world.get_mut::<FocusPolicy>(btn)
+      && *f != focus
+    {
+      *f = focus;
+    }
+    if let Some(mut t) = world.get_mut::<TextColor>(icon)
+      && t.0 != fg
+    {
+      t.0 = fg;
+    }
   }
-  let glyph = if collapsed { Icon::Expand } else { Icon::Compress }.glyph();
+  // 收起/展开图标：向上 = 收起（内容向上收拢），向下 = 展开
+  let glyph = if collapsed { Icon::AngleDown } else { Icon::AngleUp }.glyph();
   if let Some(mut t) = world.get_mut::<Text>(parts.collapse_icon)
     && t.0 != glyph
   {
@@ -728,11 +945,14 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
     })
     .collect();
   drop(q);
+  // 并排按钮的共享竖边（见本循环后的归属修正）：(父容器, 序号, 按钮, 高亮优先级, 边框色)
+  let mut shared_edges: Vec<(Entity, usize, Entity, u8, Color)> = Vec::new();
   for (e, path, role, inter, children) in rows {
     let hovered = inter != Interaction::None;
-    let (bg, border, fg) = match role {
+    // 末位 = 高亮优先级（0 常态 / 1 悬停 / 2 选中）：只有并排按钮用，决定共享竖边归谁
+    let (bg, border, fg, prio) = match role {
       MenuRole::SubMenu => {
-        (if hovered { surface_elevated } else { Color::NONE }, Color::NONE, text_body)
+        (if hovered { surface_elevated } else { Color::NONE }, Color::NONE, text_body, 0)
       }
       MenuRole::SwitchOption(i) => {
         let selected = {
@@ -740,18 +960,18 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
           matches!(menu.model.node(&split_path(&path)), Some(MenuNode::SwitchGroup { selected, .. }) if *selected == i)
         };
         if selected {
-          (accent_fill, accent_text, text_primary)
+          (accent_fill, accent_text, text_primary, 2)
         } else if hovered {
-          (surface_overlay, border_strong, text_body)
+          (surface_overlay, border_strong, text_body, 1)
         } else {
-          (surface_elevated, border, text_muted)
+          (surface_elevated, border, text_muted, 0)
         }
       }
       MenuRole::Button(_) => {
         if hovered {
-          (surface_overlay, border_strong, text_body)
+          (surface_overlay, border_strong, text_body, 1)
         } else {
-          (surface_elevated, border, text_muted)
+          (surface_elevated, border, text_muted, 0)
         }
       }
       _ => continue,
@@ -775,12 +995,36 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
         *b = target;
       }
     }
+    // 并排按钮全部入表（含首个）：i>0 的项自己没有左边框宽度，它的左边缘那一列像素
+    // 属于**前一项的右边框**；而首个项自己有左边框，但它的**右边框**正是第 2 项的左边缘。
+    // 少收任一侧都会让那条共享竖线漏改（首个项没入表 → 第 2 项选中时左边框还是缺）。
+    if let MenuRole::SwitchOption(i) | MenuRole::Button(i) = role
+      && let Some(group) = world.get::<ChildOf>(e).map(ChildOf::parent)
+    {
+      shared_edges.push((group, i, e, prio, border));
+    }
     for child in children {
       if let Some(mut t) = world.get_mut::<TextColor>(child)
         && t.0 != fg
       {
         t.0 = fg;
       }
+    }
+  }
+  // 共享竖边归「高亮更强者」所有：相邻两项之间只有 1px，那一列由前一项的右边框画出。
+  // 若后一项高亮更强（选中 > 悬停 > 常态），就把前一项的右边框涂成后一项的颜色 ——
+  // 否则后一项的选中框/悬停框会缺左边框（前一项的颜色盖在它左边缘上）。
+  shared_edges.sort_by_key(|(group, i, ..)| (*group, *i));
+  for pair in shared_edges.windows(2) {
+    let (group_a, i_a, btn_a, prio_a, _) = pair[0];
+    let (group_b, i_b, _, prio_b, border_b) = pair[1];
+    if group_a != group_b || i_b != i_a + 1 || prio_b <= prio_a {
+      continue;
+    }
+    if let Some(mut b) = world.get_mut::<BorderColor>(btn_a)
+      && b.right != border_b
+    {
+      b.right = border_b;
     }
   }
 
@@ -893,397 +1137,5 @@ fn drag_and_clamp(world: &mut World, root: Entity, parts: &MenuParts) {
       n.left = px(x);
       n.top = px(y);
     }
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::menu::model::{InputField, WindowState, toggle};
-
-  fn model() -> MenuFile {
-    MenuFile {
-      window: WindowState::default(),
-      items: vec![toggle("fps", "FPS", false), toggle("vsync", "垂直同步", true)],
-    }
-  }
-
-  /// 最小可交互 app：主题 + 时间 + 鼠标/窗口 + widget 状态机 + 菜单主系统
-  fn test_app(theme: &crate::theme::UiTheme) -> App {
-    let mut app = App::new();
-    app.insert_resource(theme.clone());
-    app.insert_resource(Time::<()>::default());
-    app.init_resource::<ButtonInput<MouseButton>>();
-    app.init_resource::<AccumulatedMouseMotion>();
-    app.init_resource::<crate::capture::UiPointerCaptured>();
-    app.init_resource::<crate::capture::MouseIntercepted>();
-    app.init_resource::<crate::widgets::TextInputFocus>();
-    app.init_resource::<crate::widgets::TooltipLayerEntity>();
-    app.init_resource::<bevy::ecs::message::Messages<bevy::input::keyboard::KeyboardInput>>();
-    app.world_mut().spawn((Window::default(), PrimaryWindow));
-    app.add_systems(
-      Update,
-      (
-        crate::widgets::toggle_switch_state_system,
-        crate::widgets::slider_drag_system,
-        crate::widgets::slider_visual_system,
-        crate::widgets::text_input_pointer_system,
-        crate::widgets::text_input_keyboard_system,
-        crate::widgets::text_input_visual_system,
-        crate::widgets::label_ellipsis_system,
-        crate::i18n::i18n_refresh_system,
-        menu_system,
-      ),
-    );
-    app
-  }
-
-  /// 模拟一次「按下 → 释放 → 沉淀一帧」（Interaction 由 bevy_ui 的真实 ui_focus_system 驱动，
-  /// 这里直接写组件模拟同一条边沿；沉淀帧用于让 widget 用 `Commands` 落地的状态（如
-  /// toggle 的 `Checked` 插入）被菜单系统读到）
-  fn click(app: &mut App, e: Entity) {
-    app.world_mut().get_mut::<Interaction>(e).unwrap().set_if_neq(Interaction::Pressed);
-    app.update();
-    app.world_mut().get_mut::<Interaction>(e).unwrap().set_if_neq(Interaction::Hovered);
-    app.update();
-    app.update();
-  }
-
-  fn find_item(app: &mut App, path: &str, role: MenuRole) -> Entity {
-    let mut q = app.world_mut().query::<(Entity, &MenuItem)>();
-    let hits: Vec<(Entity, MenuItem)> = q.iter(app.world()).map(|(e, i)| (e, i.clone())).collect();
-    hits
-      .into_iter()
-      .find(|(_, i)| i.path == path && i.role == role)
-      .map(|(e, _)| e)
-      .unwrap_or_else(|| panic!("找不到菜单项 {path} {role:?}"))
-  }
-
-  /// (模型, 当前路径, 是否收起)
-  fn menu_state(app: &mut App, root: Entity) -> (MenuFile, Vec<String>, bool) {
-    let m = app.world().get::<DebugMenu>(root).expect("DebugMenu");
-    (m.model.clone(), m.path.clone(), m.collapsed)
-  }
-
-  #[test]
-  fn spawn_builds_root_title_and_one_page() {
-    let theme = crate::theme::default_theme();
-    let ctx = UiCtx::new(&theme, None);
-    let mut app = App::new();
-    let h = spawn_debug_menu(app.world_mut(), &ctx, model());
-    let w = app.world_mut();
-    assert!(w.get::<DebugMenu>(h.root).is_some());
-    let menu = w.get::<DebugMenu>(h.root).unwrap();
-    assert!(menu.path.is_empty(), "根节点");
-    let pages: Vec<Entity> = w.query_filtered::<Entity, With<MenuPage>>().iter(w).collect();
-    assert_eq!(pages.len(), 1, "根页只有一页");
-    // 两个开关项
-    let items: Vec<&MenuItem> = w.query::<&MenuItem>().iter(w).collect();
-    assert_eq!(items.len(), 2);
-  }
-
-  #[test]
-  fn toggle_click_flips_model_and_emits_event() {
-    use std::sync::{Arc, Mutex};
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let seen = Arc::new(Mutex::new(Vec::<(String, MenuAction)>::new()));
-    let sink = seen.clone();
-    app.add_observer(move |ev: On<MenuActionEvent>| {
-      sink.lock().unwrap().push((ev.path.clone(), ev.action.clone()));
-    });
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model());
-    let e = find_item(&mut app, "fps", MenuRole::Toggle);
-    assert!(!app.world().get::<Checked>(e).is_some_and(|_| true), "初始为关");
-
-    click(&mut app, e);
-
-    assert!(app.world().get::<Checked>(e).is_some(), "点击后 toggle 变开");
-    let (m, _, _) = menu_state(&mut app, h.root);
-    assert!(
-      matches!(m.node(&split_path("fps")), Some(MenuNode::Toggle { checked, .. }) if *checked),
-      "模型 checked 同步为 true"
-    );
-    let got = seen.lock().unwrap().clone();
-    assert_eq!(got, vec![("fps".to_string(), MenuAction::Toggle(true))], "发出统一事件");
-  }
-
-  #[test]
-  fn submenu_click_navigates_and_back_returns() {
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let model = MenuFile {
-      window: WindowState::default(),
-      items: vec![super::super::model::sub_menu(
-        "video",
-        "视频",
-        vec![toggle("vsync", "垂直同步", true)],
-      )],
-    };
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model);
-    let row = find_item(&mut app, "video", MenuRole::SubMenu);
-
-    click(&mut app, row);
-    // 动画播完（0.22s）
-    for _ in 0..20 {
-      app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(20));
-      app.update();
-    }
-    let (m, path, _) = menu_state(&mut app, h.root);
-    assert_eq!(path, vec!["video".to_string()], "进入子菜单");
-    assert!(m.window.path.is_empty(), "模型里的路径不随导航改（只在保存时写）");
-    // 页面已是子页内容
-    assert!(find_item(&mut app, "video/vsync", MenuRole::Toggle) != Entity::PLACEHOLDER);
-
-    // 返回
-    let back = app.world().get::<MenuParts>(h.root).unwrap().back_btn;
-    click(&mut app, back);
-    for _ in 0..20 {
-      app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(20));
-      app.update();
-    }
-    let (_, path, _) = menu_state(&mut app, h.root);
-    assert!(path.is_empty(), "回到根");
-  }
-
-  #[test]
-  fn collapse_and_reset_position_buttons_work() {
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model());
-    let parts = {
-      let p = app.world().get::<MenuParts>(h.root).unwrap();
-      (p.collapse_btn, p.reset_btn, p.viewport)
-    };
-    click(&mut app, parts.0);
-    app.update();
-    let (_, _, collapsed) = menu_state(&mut app, h.root);
-    assert!(collapsed, "收起");
-    assert_eq!(
-      *app.world().get::<Visibility>(parts.2).unwrap(),
-      Visibility::Hidden,
-      "收起后内容区隐藏"
-    );
-    // 移动窗口后重置位置
-    app.world_mut().get_mut::<DebugMenu>(h.root).unwrap().model.window.x = 300.0;
-    click(&mut app, parts.1);
-    app.update();
-    let (m, _, _) = menu_state(&mut app, h.root);
-    assert_eq!(m.window.x, DEFAULT_WINDOW_POS.x, "重置到默认位置");
-  }
-
-  #[test]
-  fn switch_group_select_updates_model() {
-    use std::sync::{Arc, Mutex};
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let seen = Arc::new(Mutex::new(Vec::<MenuAction>::new()));
-    let sink = seen.clone();
-    app.add_observer(move |ev: On<MenuActionEvent>| sink.lock().unwrap().push(ev.action.clone()));
-    let model = MenuFile {
-      window: WindowState::default(),
-      items: vec![super::super::model::switch_group("mode", "模式", &["轨道", "自由"], 0)],
-    };
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model);
-    let second = find_item(&mut app, "mode", MenuRole::SwitchOption(1));
-    click(&mut app, second);
-    let (m, _, _) = menu_state(&mut app, h.root);
-    assert!(
-      matches!(m.node(&split_path("mode")), Some(MenuNode::SwitchGroup { selected, .. }) if *selected == 1),
-      "选中下标写回模型"
-    );
-    assert_eq!(*seen.lock().unwrap(), vec![MenuAction::Select(1)]);
-    // 选中项的视觉：背景切到强调填充
-    assert_eq!(
-      app.world().get::<BackgroundColor>(second).unwrap().0,
-      color_of(&theme.colors.accent_fill),
-      "选中项高亮"
-    );
-  }
-
-  #[test]
-  fn slider_value_writes_back_to_model() {
-    use std::sync::{Arc, Mutex};
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let seen = Arc::new(Mutex::new(Vec::<MenuAction>::new()));
-    let sink = seen.clone();
-    app.add_observer(move |ev: On<MenuActionEvent>| sink.lock().unwrap().push(ev.action.clone()));
-    let model = MenuFile {
-      window: WindowState::default(),
-      items: vec![super::super::model::slider("gain", "增益", 1.0, 0.0, 4.0, 0.5, 1, None)],
-    };
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model);
-    let e = find_item(&mut app, "gain", MenuRole::Slider);
-    app.world_mut().get_mut::<SliderValue>(e).unwrap().0 = 3.0;
-    app.update();
-    let (m, _, _) = menu_state(&mut app, h.root);
-    assert!(
-      matches!(m.node(&split_path("gain")), Some(MenuNode::Slider { value, .. }) if (*value - 3.0).abs() < 1e-6),
-      "滑杆值写回模型"
-    );
-    assert_eq!(*seen.lock().unwrap(), vec![MenuAction::Value(3.0)]);
-  }
-
-  #[test]
-  fn input_text_writes_back_to_model() {
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let model = MenuFile {
-      window: WindowState::default(),
-      items: vec![super::super::model::input(
-        "size",
-        "大小",
-        vec![InputField::number("", "3", 1.0, 16.0, 1.0, 0)],
-      )],
-    };
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model);
-    let e = find_item(&mut app, "size", MenuRole::Input(0));
-    app.world_mut().get_mut::<TextInputValue>(e).unwrap().0 = "9".into();
-    app.update();
-    let (m, _, _) = menu_state(&mut app, h.root);
-    match m.node(&split_path("size")) {
-      Some(MenuNode::Input { fields, .. }) => assert_eq!(fields[0].text, "9"),
-      other => panic!("{other:?}"),
-    }
-  }
-
-  #[test]
-  fn title_bar_drag_moves_window_within_bounds() {
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    let h = spawn_debug_menu(app.world_mut(), &UiCtx::new(&theme, None), model());
-    let parts = app.world().get::<MenuParts>(h.root).unwrap();
-    let title = parts.title_bar;
-
-    // 光标落在标题栏上
-    let set_cursor = |app: &mut App, p: Option<(f32, f32)>| {
-      let mut q = app.world_mut().query_filtered::<&mut Window, With<PrimaryWindow>>();
-      let mut w = q.single_mut(app.world_mut()).unwrap();
-      w.set_physical_cursor_position(p.map(|(x, y)| bevy::math::DVec2::new(x as f64, y as f64)));
-    };
-    set_cursor(&mut app, Some((100.0, 15.0)));
-    app.update();
-    // 按下（模拟 ui_focus 把标题栏置为 Pressed）
-    app.world_mut().resource_mut::<ButtonInput<MouseButton>>().press(MouseButton::Left);
-    app.world_mut().get_mut::<Interaction>(title).unwrap().set_if_neq(Interaction::Pressed);
-    app.update();
-    // 光标右移 60、下移 40 → 窗口同量跟随
-    set_cursor(&mut app, Some((160.0, 55.0)));
-    app.update();
-    let (m, _, _) = menu_state(&mut app, h.root);
-    assert!(
-      (m.window.x - (DEFAULT_WINDOW_POS.x + 60.0)).abs() < 0.5
-        && (m.window.y - (DEFAULT_WINDOW_POS.y + 40.0)).abs() < 0.5,
-      "窗口跟随光标：{:?}",
-      (m.window.x, m.window.y)
-    );
-    // Node 同步
-    let node = app.world().get::<Node>(h.root).unwrap();
-    assert_eq!(node.left, px(m.window.x));
-    assert_eq!(node.top, px(m.window.y));
-
-    // 往左上拖出界 → 钳在窗口内（不小于 0 + MARGIN）
-    set_cursor(&mut app, Some((-500.0, -500.0)));
-    app.update();
-    let (m, _, _) = menu_state(&mut app, h.root);
-    assert!(m.window.x >= WINDOW_MARGIN && m.window.y >= WINDOW_MARGIN, "不出左/上边界");
-    // 松开 → 停止跟随
-    app.world_mut().resource_mut::<ButtonInput<MouseButton>>().release(MouseButton::Left);
-    app.world_mut().get_mut::<Interaction>(title).unwrap().set_if_neq(Interaction::Hovered);
-    app.update();
-    let before = menu_state(&mut app, h.root).0.window;
-    set_cursor(&mut app, Some((400.0, 300.0)));
-    app.update();
-    let after = menu_state(&mut app, h.root).0.window;
-    assert_eq!((before.x, before.y), (after.x, after.y), "松开后不再跟随");
-  }
-
-  #[test]
-  fn menu_labels_follow_locale_switch() {
-    let theme = crate::theme::default_theme();
-    let mut app = test_app(&theme);
-    app.insert_resource(crate::i18n::UiTranslator::new(|k| match k {
-      "menu.fps" => "帧率".to_string(),
-      "menu.vsync" => "垂直同步".to_string(),
-      other => other.to_string(),
-    }));
-    let model = MenuFile {
-      window: WindowState::default(),
-      items: vec![toggle("fps", "menu.fps", false), toggle("vsync", "menu.vsync", true)],
-    };
-    let translate = app.world().resource::<crate::i18n::UiTranslator>().handle();
-    spawn_debug_menu(
-      app.world_mut(),
-      &UiCtx::new(&theme, None).with_translate(translate),
-      model,
-    );
-    let label_text = |app: &mut App, key: &str| -> String {
-      let mut q = app.world_mut().query::<(&crate::i18n::I18nKey, &Text)>();
-      q.iter(app.world())
-        .find(|(k, _)| k.0 == key)
-        .map(|(_, t)| t.0.clone())
-        .unwrap_or_else(|| panic!("找不到 keyed 文本 {key}"))
-    };
-    assert_eq!(label_text(&mut app, "menu.fps"), "帧率", "spawn 时按 key 解析");
-    assert_eq!(label_text(&mut app, "menu.vsync"), "垂直同步");
-
-    // 切语言：换解析器（内部 bump 版本）→ 菜单文本下帧跟着变
-    app.world_mut().resource_mut::<crate::i18n::UiTranslator>().set(|k| match k {
-      "menu.fps" => "FPS".to_string(),
-      "menu.vsync" => "VSync".to_string(),
-      other => other.to_string(),
-    });
-    app.update();
-    assert_eq!(label_text(&mut app, "menu.fps"), "FPS");
-    assert_eq!(label_text(&mut app, "menu.vsync"), "VSync");
-  }
-
-  #[test]
-  fn ease_is_monotonic_and_bounded() {
-    assert!((ease_in_out(0.0)).abs() < 1e-6);
-    assert!((ease_in_out(1.0) - 1.0).abs() < 1e-6);
-    assert!((ease_in_out(0.5) - 0.5).abs() < 1e-6);
-    assert!(ease_in_out(0.3) < ease_in_out(0.7));
-  }
-
-  #[test]
-  fn clip_path_stops_at_unknown_segment() {
-    let m = MenuFile {
-      window: WindowState::default(),
-      items: vec![super::super::model::sub_menu("a", "A", vec![toggle("b", "B", false)])],
-    };
-    assert_eq!(clip_path(&m, &[]), "/");
-    assert_eq!(clip_path(&m, &["a".into(), "b".into()]), "/a/b");
-    assert_eq!(clip_path(&m, &["a".into(), "zzz".into()]), "/a");
-    assert_eq!(clip_path(&m, &["zzz".into()]), "/");
-  }
-
-  #[test]
-  fn path_split_and_join_roundtrip() {
-    use super::super::items::join_path;
-    assert_eq!(split_path("render/ddgi"), vec!["render".to_string(), "ddgi".to_string()]);
-    assert!(split_path("/").is_empty());
-    assert_eq!(join_path("", "a"), "a");
-    assert_eq!(join_path("a", "b"), "a/b");
-  }
-
-  #[test]
-  fn sub_menu_row_is_clickable_button() {
-    use super::super::items::MenuSubMenuRow;
-    let theme = crate::theme::default_theme();
-    let mut app = App::new();
-    let root = app.world_mut().spawn_empty().id();
-    let node = super::super::model::sub_menu("child", "子菜单", vec![]);
-    app.world_mut().entity_mut(root).with_children(|p| {
-      spawn_item(&UiCtx::new(&theme, None), p, &node, "");
-    });
-    let w = app.world_mut();
-    let e = w.query_filtered::<Entity, With<MenuSubMenuRow>>().iter(w).next().expect("子菜单行");
-    assert_eq!(*w.get::<FocusPolicy>(e).unwrap(), FocusPolicy::Block);
-    assert!(w.get::<MouseIntercept>(e).is_some());
-    let item = w.get::<MenuItem>(e).unwrap();
-    assert_eq!(item.path, "child");
-    assert_eq!(item.role, MenuRole::SubMenu);
   }
 }

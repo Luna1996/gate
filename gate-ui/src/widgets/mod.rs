@@ -34,7 +34,7 @@ pub use checkbox::{
 };
 pub use grid::{GridConfig, GridHandle, UiGrid, grid, grid_cell};
 pub use label::{
-  ELLIPSIS, EllipsisText, LabelConfig, LabelHandle, LabelOverflow, LabelStyle, label,
+  ELLIPSIS, EllipsisText, FontAttrs, LabelConfig, LabelHandle, LabelOverflow, LabelStyle, label,
   label_ellipsis_system, middle_ellipsis,
 };
 pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
@@ -169,16 +169,26 @@ pub fn px(v: f32) -> Val {
   Val::Px(v)
 }
 
-/// 标签 bundle（button/checkbox 文本、list 条目、plot 极值文本共用）
+/// 标签 bundle（button/checkbox 文本、list 条目、plot 极值文本共用；字体属性全默认）
 pub(crate) fn label_bundle(ctx: &UiCtx, text: String, size: f32, color: Color) -> impl Bundle {
-  (
-    Name::new("ui-label"),
-    Label,
-    Text::new(text),
-    TextFont { font: ctx.font_source(), font_size: bevy::text::FontSize::Px(size), ..default() },
-    TextColor(color),
-    TextLayout::default(),
-  )
+  label_bundle_attrs(ctx, text, size, color, label::FontAttrs::default())
+}
+
+/// 标签 bundle（逐属性覆盖版：`attrs` 里为 None 的项保持 `TextFont` 默认值）
+///
+/// `attrs` 按值传入：`impl Bundle` 返回值会捕获签名里的全部生命周期，
+/// 传引用会让「返回的 bundle」被迫和借用同寿（调用方传临时值时编译不过）。
+pub(crate) fn label_bundle_attrs(
+  ctx: &UiCtx,
+  text: String,
+  size: f32,
+  color: Color,
+  attrs: label::FontAttrs,
+) -> impl Bundle {
+  let mut font =
+    TextFont { font: ctx.font_source(), font_size: bevy::text::FontSize::Px(size), ..default() };
+  attrs.apply(&mut font);
+  (Name::new("ui-label"), Label, Text::new(text), font, TextColor(color), TextLayout::default())
 }
 
 /// 图标文本 bundle（FontAwesome 字形；字号单独给，不受 LabelStyle 档位约束）

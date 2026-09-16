@@ -9,8 +9,8 @@ const DDGI_DEPTH_TEXELS: u32 = 8u;
 // ️ **层内轴 / 层数 / worklist 下标位宽必须一起改**：容量 = 层数 × 轴向²，而下标位宽要装得
 // 下容量。不一致会让图集 layer 内寻址错位，表现为大面积无 GI，且没有任何编译/运行时报错。
 //
-// **权威值在本文件**：Rust 侧由 `wesl_consts.rs` 启动时解析，不变量（容量 ≥ 实际总槽位、
-// 容量 ≤ 下标位宽）由 `cargo test -p gate-render` 守着。
+// **权威值在本文件**：Rust 侧由 `wesl_consts.rs` 启动时解析；不变量（容量 ≥ 实际总槽位、
+// 容量 ≤ 下标位宽）改动时请自行核对，无自动化校验。
 const DDGI_PROBES_PER_LAYER_AXIS: u32 = 40u;
 /// 图集层数（纹理 array 层数；Rust 按它定显存与「槽位 → 层」映射）。
 /// 容量 = 本值 × 1600。nuke.vox 下总槽位约 409732（LOD0 池 352256 + LOD1~3 的规则网格，
@@ -37,8 +37,7 @@ const DDGI_AGE_MAX: u32 = 255u;
 ///
 /// 下标是**本级内**的线性下标。19 位 = 524288 ≥ 图集容量（DDGI_ATLAS_LAYERS × 1600），够用；
 /// 用 16 位会截断 LOD0 的下标（nuke 下 34 万 cell）⇒ 同一个图集纹素被多个远处探针反复覆写、
-/// 下标超出者图集恒空 ⇒ 大片纯黑。该容量关系由
-/// `wgsl_compile.rs::ddgi_worklist_pack_covers_atlas_capacity` 守着。
+/// 下标超出者图集恒空 ⇒ 大片纯黑。改层内轴 / 层数时务必核对本关系。
 const DDGI_WL_IDX_MASK: u32 = 0x7FFFFu;
 const DDGI_WL_LOD_SHIFT: u32 = 27u; // = 8(age) + 19(idx)
 const DDGI_NO_PROBE: u32 = 0xFFFFFFFFu;

@@ -22,10 +22,10 @@ pub enum Icon {
   ChevronRight,
   /// 标题栏重置位置
   UndoAlt,
-  /// 标题栏收起
-  Compress,
-  /// 标题栏展开
-  Expand,
+  /// 标题栏收起（内容向上收拢）
+  AngleUp,
+  /// 标题栏展开（内容向下展开）
+  AngleDown,
 }
 
 impl Icon {
@@ -35,8 +35,8 @@ impl Icon {
       Self::ChevronLeft => strs::CHEVRON_LEFT,
       Self::ChevronRight => strs::CHEVRON_RIGHT,
       Self::UndoAlt => strs::UNDO_ALT,
-      Self::Compress => strs::COMPRESS,
-      Self::Expand => strs::EXPAND,
+      Self::AngleUp => strs::ANGLE_UP,
+      Self::AngleDown => strs::ANGLE_DOWN,
     }
   }
 }

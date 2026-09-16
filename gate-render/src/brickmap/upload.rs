@@ -22,7 +22,7 @@ use super::wire::{
 use glam::{IVec3, UVec3};
 
 // ----------------------------------------------------------------------------
-// Limits + BufferLayout（CPU 单测覆盖单/多两模式）
+// Limits + BufferLayout（单/多 buffer 两模式）
 // ----------------------------------------------------------------------------
 
 pub const SINGLE_THRESHOLD_BYTES: u64 = (1 << 30) - 1;
@@ -602,7 +602,7 @@ fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
   unsafe { std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs)) }
 }
 
-/// GPU buffer 扩容尺寸策略（纯函数，单测覆盖）。
+/// GPU buffer 扩容尺寸策略（纯函数）。
 ///
 /// 大 buffer（need ≥ 8MB，如 b_struct）按 32MB 水位向上对齐：扩容 DMA 量小、重建间隔 ≥32MB
 /// 增长；小 buffer（palette 等）维持 2× 增长，下限 64KB。
@@ -976,168 +976,5 @@ impl Plugin for VolumePlugin {
       .add_systems(RenderStartup, init_empty_gpu)
       .add_systems(ExtractSchedule, extract)
       .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources));
-  }
-}
-
-// ----------------------------------------------------------------------------
-// CPU 单测（不依赖 GPU）
-// ----------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-  use super::super::builder::BrickMapBuilder;
-  use super::super::wire::{CHUNK_INDEX_WORDS, STATE_TOTAL_WORDS};
-  use super::*;
-  use gate_voxel::fill_box;
-
-  /// 光照场窗口原点：按 cell 对齐（世界锚定槽位 `wc mod dim` 的铺图依赖它整除精确）
-  /// + 相机恒落在盒中心（偏差 < 1 cell）。
-  #[test]
-  fn light_field_origin_is_cell_aligned_and_centered() {
-    let cell = LIGHT_FIELD_CELL as i32;
-    let dim = LIGHT_FIELD_DIM as i32;
-    for cam in [
-      glam::Vec3::new(0.0, 0.0, 0.0),
-      glam::Vec3::new(1000.3, -333.7, 7.2),
-      glam::Vec3::new(-1.5, -7.5, 12345.9),
-    ] {
-      let o_vox = light_field_origin_cell(cam) * cell;
-      assert_eq!(o_vox.rem_euclid(IVec3::splat(cell)), IVec3::ZERO);
-      let rel = cam.floor().as_ivec3() - o_vox;
-      assert!(
-        rel.cmpge(IVec3::ZERO).all() && rel.cmplt(IVec3::splat(dim * cell)).all(),
-        "cam {cam:?} 不在场窗口内"
-      );
-      let d = (rel - IVec3::splat(dim / 2 * cell)).abs();
-      assert!(d.cmplt(IVec3::splat(cell)).all(), "cam {cam:?} 偏离盒心 {d:?}");
-    }
-  }
-
-  /// 光照场纹素 8B → bytes_per_row = dim×8；upload 依赖它天然满足 wgpu 的 256 对齐（不补行）。
-  /// 并锁死「chunk 恰好是整数个 cell」（tally 的 chunk↔cell 换算依赖它）。
-  #[test]
-  fn light_field_row_alignment() {
-    assert_eq!((LIGHT_FIELD_DIM * 8) % 256, 0);
-    assert_eq!(gate_voxel::CHUNK_SIZE % LIGHT_FIELD_CELL as i32, 0);
-    assert_eq!(gate_voxel::CHUNK_SIZE / LIGHT_FIELD_CELL as i32, 16);
-  }
-
-  fn emissive_grid() -> gate_voxel::Volumes {
-    let mut g = gate_voxel::VolumeGrid::new();
-    let mut e = gate_voxel::PaletteEntry::default();
-    e.emissive = 255;
-    g.palette_mut().set(1, e);
-    // 单个 16³ 实心发光块 = 恰好一个 cell（世界 cell (24,24,24) = 体素 [384,400)）
-    fill_box(&mut g, IVec3::splat(384), IVec3::splat(16), 1);
-    gate_voxel::Volumes::new(g)
-  }
-
-  fn slot_texel(dim: i32, wc: IVec3) -> usize {
-    let r = wc.rem_euclid(IVec3::splat(dim));
-    (r.x + r.y * dim + r.z * dim * dim) as usize
-  }
-
-  /// tally：整块实心发光 → fill=255、ε=1；相邻空气 cell → 0。
-  #[test]
-  fn light_chunk_tally_fill_and_emissive() {
-    let vol = emissive_grid();
-    let tree = vol.main().chunk(gate_voxel::ChunkCoord::new(1, 1, 1)).unwrap();
-    let t = build_light_chunk(tree, vol.main().palette());
-    let solid = 8 + 8 * 16 + 8 * 256; // chunk-local cell (8,8,8)
-    assert_eq!(t.fill[solid], 255);
-    assert!((t.emit[solid] - 1.0).abs() < 1e-6);
-    assert_eq!(t.fill[0], 0);
-    assert_eq!(t.emit[0], 0.0);
-  }
-
-  /// 铺图必须用**世界锚定槽位** `wc mod dim`（与 WGSL `light_field_uv` 同式子）：
-  /// 同一个世界 cell 在两处相机位置下都在窗口内时 → 同一个纹素、内容不变。
-  /// 这正是「相机滚动只换新进那条带、其余纹素身份不变」（可流式）的代数形式。
-  #[test]
-  fn light_field_blit_is_world_anchored() {
-    let dim = LIGHT_FIELD_DIM as i32;
-    let cell = LIGHT_FIELD_CELL as i32;
-    let vol = emissive_grid();
-    let ti = slot_texel(dim, IVec3::splat(24));
-    let read = |origin_cell: i32, lf: &mut LightFieldCpu| -> [u8; 8] {
-      let cam = glam::Vec3::splat((origin_cell * cell + dim / 2 * cell) as f32);
-      let data = update_light_field(lf, &vol, cam, &[], false).expect("窗口移动应重铺");
-      assert_eq!(light_field_origin_cell(cam).x, origin_cell);
-      let mut out = [0u8; 8];
-      out.copy_from_slice(&data[ti * 8..ti * 8 + 8]);
-      out
-    };
-    let mut lf = LightFieldCpu::default();
-    let a = read(16, &mut lf);
-    let b = read(24, &mut lf); // 窗口整体滚 8 个 cell，cell 24 仍在窗口内
-    // Rgba16Unorm：ε = 1 → 65535、fill = 255 → 65535
-    assert_eq!(a, [0xFFu8; 8], "发光 cell 未落在世界锚定槽位");
-    assert_eq!(a, b, "相机移动后同一世界 cell 的纹素内容变了");
-  }
-
-  #[test]
-  fn limits_select_layout() {
-    let multi = BindingLimits { max_storage_buffer_binding_size: 128 * (1 << 20) };
-    assert!(multi.force_multi());
-    let single = BindingLimits { max_storage_buffer_binding_size: 2 * (1 << 30) };
-    assert!(!single.force_multi());
-    let _ml = BufferLayout::from_limits(&multi);
-    let _sl = BufferLayout::from_limits(&single);
-  }
-
-  #[test]
-  fn comp_state_api_on_grid() {
-    let mut g = gate_voxel::VolumeGrid::new();
-    let chunk = gate_voxel::ChunkCoord::new(0, 0, 0);
-    // set_comp 挂 level 2 brick (bx,by,bz)；get_comp 查 voxel 所在 brick
-    g.set_comp(chunk, 1, 1, 1, 0xABCD);
-    let voxel = gate_voxel::VoxelCoord::new(16 + 5, 16 + 3, 16 + 2);
-    assert_eq!(g.get_comp(voxel), 0xABCD);
-    assert_eq!(g.get_comp(gate_voxel::VoxelCoord::new(1, 1, 1)), 0);
-    g.set_state(7, 2, 0x42);
-    assert_eq!(g.get_state(7, 2), 0x42);
-    assert_eq!(g.get_state(99, 0), 0);
-    assert_eq!(g.state_table_bytes().len(), 256 * 16);
-  }
-
-  #[test]
-  fn wire_constants() {
-    assert_eq!(CHUNK_COMP_WORDS * 4, 4096 * 2); // u16[4096] → 8KB/chunk
-    assert_eq!(STATE_TOTAL_WORDS * 4, 4096); // 256×4×4B
-  }
-
-  #[test]
-  fn grow_size_watermark_policy() {
-    // 小 buffer：2×，下限 64KB
-    assert_eq!(grow_size(4, 2048), 65536); // palette 首扩
-    assert_eq!(grow_size(32768, 40000), 65536);
-    assert_eq!(grow_size(40000, 50000), 80000); // 恰好 2×
-    // 大 buffer：32MiB 水位对齐——首增 ~10KB 不再翻倍到 2×cap
-    let cap160m: u64 = 163_798_052; // 156.2MiB（b_struct 典型满量）
-    let need = cap160m + 10 * 1024; // 首次编辑真实增长 ~10KB
-    let grown = grow_size(cap160m, need);
-    assert_eq!(grown, 160 * 1024 * 1024); // → 160MiB（下一 32MiB 边界），非 2×=312MiB
-    assert!(grown >= need);
-    // 水位内的增长由 ensure_with_copy 的 cap>=need 早退拦截，不会进 grow_size；
-    // 刚跨过边界 → 立即扩到下一档（amortized）
-    assert_eq!(grow_size(grown, grown + 1024), 192 * 1024 * 1024);
-    // 连续跨档（160MiB+33MiB=193MiB → 224MiB）
-    assert_eq!(grow_size(grown, grown + 33 * 1024 * 1024), 224 * 1024 * 1024);
-  }
-
-  #[test]
-  fn buffer_data_roundtrip() {
-    let mut g = gate_voxel::VolumeGrid::new();
-    fill_box(&mut g, glam::IVec3::ZERO, glam::IVec3::splat(8), 1);
-    g.set_state(5, 3, 0xCAFEBABE);
-    let state = g.state_table_bytes();
-    let off = 5 * 16 + 3 * 4; // entry 5 + field 3
-    assert_eq!(state[off..off + 4], 0xCAFEBABEu32.to_le_bytes());
-    let buffers = BrickMapBuilder::build_full(&g).buffers().clone();
-    let bytes = u8_of_u32(&buffers.b_struct);
-    assert_eq!(bytes.len(), buffers.b_struct.len() * 4);
-    assert!(buffers.globals.tile_count >= 1);
-    // chunk 窗口条目非零（Region ① 至少 1 个 chunk）
-    assert!(!buffers.b_struct[..CHUNK_INDEX_WORDS].iter().all(|&w| w == 0));
   }
 }

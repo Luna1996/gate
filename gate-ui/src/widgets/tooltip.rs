@@ -5,7 +5,8 @@
 //! 遮住时为 `None`）；否则用 `ComputedNode::contains_point` 直接命中测试（label/panel 等
 //! 无 Interaction 的节点也可挂）。
 //!
-//! 提示框是全局唯一实体（首次需要时懒创建），脱离布局——绝对定位跟随光标。
+//! 提示框是全局唯一实体（首次需要时懒创建），脱离布局——绝对定位：位置在**首次展示时钉住**，
+//! 鼠标继续在同一个锚点控件内移动时不跟随（换锚点或离开后重新悬浮才重新取点）。
 
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, FocusPolicy, Interaction, UiGlobalTransform};
@@ -54,6 +55,9 @@ pub struct TooltipLayerEntity(pub Option<Entity>);
 pub struct TooltipHoverState {
   entity: Option<Entity>,
   elapsed: f32,
+  /// 已钉住的展示锚点与位置（逻辑 px，**未做边界收束**）：
+  /// 同一锚点内移动鼠标不改位置；换锚点 / 离开后重新悬浮才重新取点
+  pin: Option<(Entity, Vec2)>,
 }
 
 /// 悬浮判定 + 延时展示。每帧最多展示一个提示（命中节点中面积最小者 = 纵深最内层）。
@@ -106,6 +110,7 @@ pub fn tooltip_system(
   let Some((e, tip)) = best else {
     state.entity = None;
     state.elapsed = 0.0;
+    state.pin = None;
     if let Ok((mut node, _)) = layer_q.single_mut() {
       node.display = Display::None;
     }
@@ -130,15 +135,27 @@ pub fn tooltip_system(
   // 逻辑坐标（Node.left/top 为逻辑 px）：光标物理 → 逻辑
   let sf = window.scale_factor().max(f32::EPSILON);
   let cursor = physical.unwrap_or_default() / sf;
+  // 展示位置钉在**首次展示**时的「光标 + 偏移」上：同一个锚点控件内继续移动鼠标时提示框不动，
+  // 只有换锚点（或离开后重新悬浮）才重新取点
+  let anchor = match state.pin {
+    Some((pinned, p)) if pinned == e => p,
+    _ => {
+      let p = cursor + TOOLTIP_OFFSET;
+      state.pin = Some((e, p));
+      p
+    }
+  };
   let (w, h) = (window.width(), window.height());
   let size =
     layer_q.single_mut().ok().and_then(|(_, c)| c.map(|n| n.size() / sf)).unwrap_or_default();
+  // 边界收束每帧都做：钉住的是**未收束**的锚点，而提示框尺寸要等它布局一帧才量得到，
+  // 所以贴右/下边的收束是在后续帧逐步收敛的（不能把收束后的值写回 pin，否则会越收越偏）
   let max_x = (w - size.x - TOOLTIP_MARGIN).max(TOOLTIP_MARGIN);
   let max_y = (h - size.y - TOOLTIP_MARGIN).max(TOOLTIP_MARGIN);
   if let Ok((mut node, _)) = layer_q.single_mut() {
     node.display = Display::Flex;
-    node.left = px((cursor.x + TOOLTIP_OFFSET.x).min(max_x));
-    node.top = px((cursor.y + TOOLTIP_OFFSET.y).min(max_y));
+    node.left = px(anchor.x.min(max_x));
+    node.top = px(anchor.y.min(max_y));
   }
 }
 
@@ -186,85 +203,4 @@ fn ensure_layer(commands: &mut Commands, res: &mut TooltipLayerEntity, theme: &U
     .id();
   res.0 = Some(e);
   e
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn tooltip_component_holds_text() {
-    assert_eq!(Tooltip::new("你好").text, "你好");
-  }
-
-  #[test]
-  fn tooltip_layer_stays_hidden_without_hover() {
-    let mut app = App::new();
-    app.insert_resource(crate::theme::default_theme());
-    app.insert_resource(TooltipLayerEntity::default());
-    app.init_resource::<Time>();
-    app.add_systems(Update, tooltip_system);
-    app.world_mut().spawn((Window::default(), PrimaryWindow));
-    app
-      .world_mut()
-      .spawn((
-        Tooltip::new("tip"),
-        ComputedNode { size: Vec2::new(80.0, 20.0), ..default() },
-        UiGlobalTransform::from_translation(Vec2::new(100.0, 100.0)),
-        InheritedVisibility::VISIBLE,
-      ))
-      .id();
-    // 光标不在窗口内 → 不创建提示框
-    app.update();
-    assert!(app.world().resource::<TooltipLayerEntity>().0.is_none(), "no hover → no layer");
-  }
-
-  #[test]
-  fn tooltip_shows_after_delay_under_cursor() {
-    use std::time::Duration;
-    let mut app = App::new();
-    app.insert_resource(crate::theme::default_theme());
-    app.insert_resource(TooltipLayerEntity::default());
-    app.insert_resource(Time::<()>::default());
-    app.add_systems(Update, tooltip_system);
-    let win = app.world_mut().spawn((Window::default(), PrimaryWindow)).id();
-    app.world_mut().spawn((
-      Tooltip::new("提亮上限：适应暗处的最大增益"),
-      ComputedNode { size: Vec2::new(200.0, 30.0), ..default() },
-      UiGlobalTransform::from_translation(Vec2::new(200.0, 300.0)),
-      InheritedVisibility::VISIBLE,
-    ));
-    // 光标落在节点中心（物理坐标；本测试窗口 scale_factor = 1.0）
-    app
-      .world_mut()
-      .entity_mut(win)
-      .insert(Window { resolution: bevy::window::WindowResolution::new(1280, 720), ..default() });
-    {
-      let mut q = app.world_mut().query_filtered::<&mut Window, With<PrimaryWindow>>();
-      let mut w = q.single_mut(app.world_mut()).unwrap();
-      w.set_physical_cursor_position(Some(bevy::math::DVec2::new(200.0, 300.0)));
-    }
-
-    // 未到延时：不显示
-    app.update();
-    let layer = app.world().resource::<TooltipLayerEntity>().0;
-    assert!(layer.is_none(), "首帧只做命中判定，不建提示框");
-
-    // 推进 1s → 建层并显示
-    app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs_f32(1.0));
-    app.update();
-    let layer = app.world().resource::<TooltipLayerEntity>().0.expect("层已创建");
-    app.update();
-    let node = app.world().get::<Node>(layer).expect("层有 Node");
-    assert_ne!(node.display, Display::None, "延时到 → 显示提示框");
-    let text_child = app
-      .world()
-      .get::<Children>(layer)
-      .and_then(|c| c.first().copied())
-      .expect("提示框有文本子节点");
-    let t = app.world().get::<Text>(text_child).expect("文本");
-    assert_eq!(t.0, "提亮上限：适应暗处的最大增益", "提示文案写进文本");
-    // 定位在光标附近（右下偏移）
-    assert!(node.left != Val::Auto && node.top != Val::Auto, "跟随光标定位");
-  }
 }

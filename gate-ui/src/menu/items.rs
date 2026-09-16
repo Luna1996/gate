@@ -1,7 +1,8 @@
 //! 菜单通用组件：DebugWindow 列表里的 8 种列表单项。
 //!
-//! 一行可分成「左|中|右」三部分（左右等宽固定 = [`SIDE_COL_W`]，中间最宽），
-//! 各组件按需取用。所有交互行统一由 `menu_system` 驱动：状态变化写回模型
+//! 一行可分成「左|中|右」三部分（左列 [`LEFT_COL_W`]、右列 [`RIGHT_COL_W`]，两者宽度
+//! 各自固定且不相等，中间占余下最宽部分），各组件按需取用。
+//! 所有交互行统一由 `menu_system` 驱动：状态变化写回模型
 //! （[`super::model::MenuFile`]），对外只发一个 [`super::MenuActionEvent`]。
 //! 本文件只负责建节点与静态文案。
 
@@ -14,8 +15,9 @@ use super::model::{InputField, MenuNode};
 use crate::capture::MouseIntercept;
 use crate::icon::Icon;
 use crate::widgets::{
-  LabelConfig, LabelStyle, SliderConfig, TextInputConfig, TextInputKind, ToggleSwitchConfig,
-  Tooltip, UiCtx, color_of, label, px, slider, spawn_icon, text_input, toggle_switch,
+  LabelConfig, LabelOverflow, LabelStyle, SliderConfig, TextInputConfig, TextInputKind,
+  ToggleSwitchConfig, Tooltip, UiCtx, color_of, label, px, slider, spawn_icon, text_input,
+  toggle_switch,
 };
 
 /// 菜单项在模型里的角色（决定 menu_system 如何读写值）
@@ -60,6 +62,12 @@ pub struct MenuSliderValue {
   pub path: String,
 }
 
+/// 纯文本行的值标签（`path` = 所属文本项的 id 路径；左列名称之外的中间部分由它显示）
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct MenuTextValue {
+  pub path: String,
+}
+
 /// 颜色预览色块（`path` = 所属颜色项的 id 路径）
 #[derive(Component, Clone, Debug, PartialEq)]
 pub struct MenuColorSwatch {
@@ -87,6 +95,9 @@ fn base_row<'a, 'w>(parent: &'a mut ChildSpawner<'w>, name: &str) -> EntityWorld
 }
 
 /// 固定宽度 + 指定对齐的文本（左名称 / 右数值共用）。`key` = i18n key（无解析器 → 原样显示）
+///
+/// 超宽走**中间省略**（label 控件基础能力）：列宽是固定预算，名称更长时截断成 `前…后`，
+/// 不会溢出到相邻列（`label()` 为此挂了 clip Node，故这里只补 `width` 字段，不覆盖 Node）
 fn fixed_label(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -95,12 +106,24 @@ fn fixed_label(
   style: LabelStyle,
   justify: Justify,
 ) -> Entity {
-  let e = *label(ctx, parent, LabelConfig { text: ctx.text(key), style, ..default() });
-  parent.world_mut().entity_mut(e).insert((
+  let e = *label(
+    ctx,
+    parent,
+    LabelConfig {
+      text: ctx.text(key),
+      style,
+      overflow: LabelOverflow::MiddleEllipsis,
+      ..default()
+    },
+  );
+  let mut ec = parent.world_mut().entity_mut(e);
+  ec.insert((
     crate::i18n::I18nKey::new(key),
-    Node { width: px(width), ..default() },
     BevyTextLayout { justify, linebreak: LineBreak::NoWrap },
   ));
+  if let Some(mut n) = ec.get_mut::<Node>() {
+    n.width = px(width);
+  }
   e
 }
 
@@ -112,6 +135,17 @@ fn grow_label(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, style: LabelSty
     .entity_mut(e)
     .insert((crate::i18n::I18nKey::new(key), Node { flex_grow: 1.0, ..default() }));
   e
+}
+
+/// 让建好的控件根节点在行内占满剩余宽度。
+///
+/// **只改 `flex_grow` 字段**：不能用 `Node { flex_grow: .., ..default() }` 覆盖整个组件 ——
+/// 那会连控件自带的 `height`/`padding`/`min_width`/`overflow` 一起抹掉（输入框会变矮、
+/// 滑杆会丢掉 thumb 内缩导致滑块滑出轨道槽两端）。
+fn grow_in_row(world: &mut World, e: Entity) {
+  if let Some(mut n) = world.get_mut::<Node>(e) {
+    n.flex_grow = 1.0;
+  }
 }
 
 /// 一行按钮（切换组选项 / 按钮组按钮）：等高、等宽（flex_grow）、无圆角
@@ -131,7 +165,10 @@ fn option_button(
     Interaction::default(),
     MenuPressPrev::default(),
     Node {
+      // flex_basis 0 + flex_grow：各按钮**等宽**（不设 basis 时余量按文字宽度分配，宽窄不一）
+      flex_basis: px(0.0),
       flex_grow: 1.0,
+      // 高度由按钮组容器（CTRL_H）决定，和行的上下留白由容器在行内居中保证
       height: Val::Percent(100.0),
       align_items: AlignItems::Center,
       justify_content: JustifyContent::Center,
@@ -184,7 +221,9 @@ pub(crate) fn spawn_item(
     MenuNode::Slider { label: key, value, min, max, step, decimals, .. } => {
       slider_row(ctx, parent, key, *value, *min, *max, *step, *decimals, &path)
     }
-    MenuNode::SwitchGroup { label: key, options, .. } => switch_group_row(ctx, parent, key, options, &path),
+    MenuNode::SwitchGroup { label: key, options, .. } => {
+      switch_group_row(ctx, parent, key, options, &path)
+    }
     MenuNode::Toggle { label: key, checked, .. } => toggle_row(ctx, parent, key, *checked, &path),
     MenuNode::Input { label: key, fields, .. } => input_row(ctx, parent, key, fields, &path),
     MenuNode::Color { label: key, hex, .. } => color_row(ctx, parent, key, hex, &path),
@@ -242,11 +281,12 @@ fn buttons_row(
   let row = ec.id();
   ec.with_children(|r| {
     if !key.is_empty() {
-      fixed_label(ctx, r, key, SIDE_COL_W, LabelStyle::Body, Justify::Left);
+      fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     }
     let mut group = r.spawn(Node {
+      // 控件高 = CTRL_H，行的 align_items: Center 让它上下各留 (ITEM_H-CTRL_H)/2
       flex_grow: 1.0,
-      height: Val::Percent(100.0),
+      height: px(CTRL_H),
       flex_direction: FlexDirection::Row,
       column_gap: px(BUTTON_GAP),
       ..default()
@@ -275,7 +315,7 @@ fn slider_row(
   let mut ec = base_row(parent, "menu-slider");
   let row = ec.id();
   ec.with_children(|r| {
-    fixed_label(ctx, r, key, SIDE_COL_W, LabelStyle::Body, Justify::Left);
+    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     let se = *slider(
       ctx,
       r,
@@ -287,9 +327,10 @@ fn slider_row(
         ..default()
       },
     );
-    let mut sec = r.world_mut().entity_mut(se);
-    sec.insert(Node { flex_grow: 1.0, ..default() });
-    sec.insert(MenuItem { path: path.to_string(), role: MenuRole::Slider });
+    grow_in_row(r.world_mut(), se);
+    r.world_mut()
+      .entity_mut(se)
+      .insert(MenuItem { path: path.to_string(), role: MenuRole::Slider });
     let ve = *label(
       ctx,
       r,
@@ -301,8 +342,10 @@ fn slider_row(
     );
     r.world_mut().entity_mut(ve).insert((
       MenuSliderValue { path: path.to_string() },
-      Node { width: px(SIDE_COL_W), ..default() },
-      BevyTextLayout { justify: Justify::Right, linebreak: LineBreak::NoWrap },
+      Node { width: px(RIGHT_COL_W), ..default() },
+      // 不能带 NoWrap：bevy_ui 对 NoWrap 文本用「无界」宽度排版，对齐退化成按最长行宽，
+      // Justify::Right 会失效（值就贴到槽尾而不是右列右缘）
+      BevyTextLayout { justify: Justify::Right, ..default() },
     ));
   });
   row
@@ -320,11 +363,12 @@ fn switch_group_row(
   let row = ec.id();
   ec.with_children(|r| {
     if !key.is_empty() {
-      fixed_label(ctx, r, key, SIDE_COL_W, LabelStyle::Body, Justify::Left);
+      fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     }
     let mut group = r.spawn(Node {
+      // 控件高 = CTRL_H，行的 align_items: Center 让它上下各留 (ITEM_H-CTRL_H)/2
       flex_grow: 1.0,
-      height: Val::Percent(100.0),
+      height: px(CTRL_H),
       flex_direction: FlexDirection::Row,
       column_gap: px(0.0),
       ..default()
@@ -369,7 +413,7 @@ fn input_row(
   let mut ec = base_row(parent, "menu-input");
   let row = ec.id();
   ec.with_children(|r| {
-    fixed_label(ctx, r, key, SIDE_COL_W, LabelStyle::Body, Justify::Left);
+    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     for (i, f) in fields.iter().enumerate() {
       // 字段前缀同样是 i18n key
       if !f.label.is_empty() {
@@ -385,10 +429,10 @@ fn input_row(
         r,
         TextInputConfig { text: f.text.clone(), kind: f.kind(), disabled: false },
       );
-      r.world_mut().entity_mut(ie).insert((
-        MenuItem { path: path.to_string(), role: MenuRole::Input(i) },
-        Node { flex_grow: 1.0, ..default() },
-      ));
+      grow_in_row(r.world_mut(), ie);
+      r.world_mut()
+        .entity_mut(ie)
+        .insert(MenuItem { path: path.to_string(), role: MenuRole::Input(i) });
     }
   });
   row
@@ -400,23 +444,23 @@ fn color_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, hex: &str, path:
   let mut ec = base_row(parent, "menu-color");
   let row = ec.id();
   ec.with_children(|r| {
-    fixed_label(ctx, r, key, SIDE_COL_W, LabelStyle::Body, Justify::Left);
+    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     let ie = *text_input(
       ctx,
       r,
       TextInputConfig { text: hex.to_string(), kind: TextInputKind::Text, disabled: false },
     );
-    r.world_mut().entity_mut(ie).insert((
-      MenuItem { path: path.to_string(), role: MenuRole::Color },
-      Node { flex_grow: 1.0, ..default() },
-    ));
+    grow_in_row(r.world_mut(), ie);
+    r.world_mut().entity_mut(ie).insert(MenuItem { path: path.to_string(), role: MenuRole::Color });
     r.spawn((
       Name::new("menu-color-swatch"),
       MenuColorSwatch { path: path.to_string() },
       Node {
-        width: px(SIDE_COL_W),
+        width: px(RIGHT_COL_W),
         height: px(m.font_size.md),
         border: UiRect::all(px(m.border_width)),
+        // 与左侧 HEX 输入框留出间距
+        margin: UiRect::left(px(m.spacing.sm)),
         ..default()
       },
       BackgroundColor(
@@ -429,13 +473,24 @@ fn color_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, hex: &str, path:
   row
 }
 
-/// 纯文本：整行一段文本（`key` 是初值；调用方可运行时改写，改写后以调用方为准）
+/// 纯文本行：「左|中右」名称 + 值（值与其它行同一套字号/颜色，右侧对齐到行的右缘）
+///
+/// 值由调用方运行期改写（见 [`MenuTextValue`]），初值为空串。
 fn text_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, path: &str) -> Entity {
   let mut ec = base_row(parent, "menu-text");
   let row = ec.id();
   ec.insert(MenuItem { path: path.to_string(), role: MenuRole::Text });
   ec.with_children(|r| {
-    grow_label(ctx, r, key, LabelStyle::Muted);
+    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
+    let ve =
+      *label(ctx, r, LabelConfig { text: String::new(), style: LabelStyle::Body, ..default() });
+    r.world_mut().entity_mut(ve).insert((
+      MenuTextValue { path: path.to_string() },
+      Node { flex_grow: 1.0, ..default() },
+      // 不能带 NoWrap（同滑杆数值标签）：bevy_ui 对 NoWrap 文本用「无界」宽度排版，
+      // 对齐会退化成按最长行宽，Justify::Right 失效
+      BevyTextLayout { justify: Justify::Right, ..default() },
+    ));
   });
   row
 }

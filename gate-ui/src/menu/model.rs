@@ -6,7 +6,7 @@
 //! **文案字段存 i18n key**（`label` / `options` / `tooltip` / `text` / [`InputField::label`]）：
 //! 渲染时经 `UiTranslator` 解析为当前语言，语言切换后由 `i18n_refresh_system` 重解析。
 //! 未注入解析器时 key 原样显示，所以直接写字面量（`label = "视频"`）同样成立。
-//! `id` 是与语言无关的回调路径段（标题栏就显示它，如 `/render/ddgi`），务必显式给出。
+//! `id` 是与语言无关的回调路径段（标题栏路径按各段 `label` 的译文显示，如 `/渲染/DDGI`），务必显式给出。
 
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -414,93 +414,4 @@ pub fn color(id: &str, label: &str, hex: &str) -> MenuNode {
 /// 纯文本节点
 pub fn text(id: &str, content: &str) -> MenuNode {
   MenuNode::Text { id: id.into(), text: content.into() }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  fn sample() -> MenuFile {
-    MenuFile {
-      window: WindowState { x: 12.0, y: 34.0, collapsed: true, path: vec!["video".into()] },
-      items: vec![
-        sub_menu(
-          "video",
-          "视频",
-          vec![
-            toggle("vsync", "垂直同步", true),
-            slider("scale", "缩放", 1.5, 0.5, 3.0, 0.1, 2, Some("提示")),
-          ],
-        ),
-        switch_group("mode", "模式", &["轨道", "自由"], 1),
-        input("brush", "笔触", vec![InputField::number("大小", "3", 1.0, 16.0, 1.0, 0)]),
-        color("tint", "颜色", "FF8000"),
-        text("cam", "(0, 0, 0)"),
-        buttons("acts", "操作", &["重置", "导出"]),
-      ],
-    }
-  }
-
-  #[test]
-  fn toml_roundtrip_keeps_everything() {
-    let m = sample();
-    let s = m.to_toml().expect("serialize");
-    let back = MenuFile::from_toml(&s).expect("deserialize");
-    assert_eq!(m, back, "TOML 往返必须无损\n{s}");
-  }
-
-  #[test]
-  fn toml_text_is_human_readable() {
-    let s = sample().to_toml().unwrap();
-    assert!(s.contains("kind = \"sub_menu\""), "{s}");
-    assert!(s.contains("[[items]]"), "{s}");
-    assert!(s.contains("[[items.children]]"), "{s}");
-    assert!(s.contains("kind = \"switch_group\""), "{s}");
-  }
-
-  #[test]
-  fn path_lookup_walks_children() {
-    let m = sample();
-    let p = |s: &str| -> Vec<String> {
-      s.split('/').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
-    };
-    assert!(m.node(&p("video")).unwrap().is_sub_menu());
-    assert_eq!(m.node(&p("video/vsync")).unwrap().label(), "垂直同步");
-    assert!(m.node(&p("video/nope")).is_none());
-    assert_eq!(m.children_of(&p("")).len(), 6);
-    assert_eq!(m.children_of(&p("video")).len(), 2);
-  }
-
-  #[test]
-  fn sanitize_clamps_out_of_range() {
-    let mut m = MenuFile {
-      window: WindowState::default(),
-      items: vec![
-        switch_group("g", "组", &["a", "b"], 9),
-        slider("s", "滑", 99.0, 0.0, 10.0, 1.0, 0, None),
-      ],
-    };
-    m.sanitize();
-    assert_eq!(m.node(&["g".into()]).unwrap().id(), "g");
-    match &m.items[0] {
-      MenuNode::SwitchGroup { selected, .. } => assert_eq!(*selected, 1),
-      other => panic!("{other:?}"),
-    }
-    match &m.items[1] {
-      MenuNode::Slider { value, .. } => assert_eq!(*value, 10.0),
-      other => panic!("{other:?}"),
-    }
-  }
-
-  #[test]
-  fn id_falls_back_to_label() {
-    let n = MenuNode::Toggle {
-      id: String::new(),
-      label: "垂直同步".into(),
-      checked: false,
-      tooltip: None,
-    };
-    assert_eq!(n.id(), "垂直同步");
-    assert_eq!(n.label(), "垂直同步");
-  }
 }

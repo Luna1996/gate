@@ -10,7 +10,6 @@
 ```powershell
 # 工具链：需要 MSVC Rust 1.82+（见 rust-toolchain.toml）+ Vulkan GPU 驱动
 cargo run -p gate-app                    # 启动渲染 Demo（10×10 大陆 + 天空城 + 雪峰 + 水晶矿簇热点交换）
-cargo test --workspace                   # workspace 全测（当前 100 passed / 0 failed）
 cargo clippy --workspace --all-targets    # lint
 ```
 
@@ -31,7 +30,6 @@ cargo clippy --workspace --all-targets    # lint
 | **相机输入** | ✅ 生产可用 | OrbitCamera：左键旋转 / 中键平移 / 滚轮缩放；取消最远距离上限（原 8000 voxel → 现无上限）；pitch ±89° clamp。|
 | **极简 UI（fps 文本 + 折线）** | ✅ 生产可用 | 自研 gate-ui 组件库（bevy_ui 原生）：Panel / Label / Button / Slider / Checkbox / Plot（折线）/ WorldAnchor（3D 文字）；主题令牌化（暗色实验室风）。字体：MapleMono-NF-CN-Regular.ttf，中文无豆腐块。|
 | **基准极限场景** | ✅ 生产可用 | 10×10×3=300 tile 大陆：正弦高度场 + 4 角雪峰 + 蜿蜒 S 河 + 170 确定性散点树；中央天空之城（10 层倒锥浮空岛底 + 城墙 + 4 金顶角楼 + 正殿 + 高塔 + L2 金顶球 + 4 L4 红飘带）；入口大道 + 11 字 "GATE ENGINE"；3 处 L4 青紫红水晶矿簇；WorldAnchor 4 标签。|
-| **测试集** | ✅ 100 tests green | gate-ui(9) + gate-render(30+28，AABB-skip 300 射线 × 5 相机 × demo scene 4 档 zoom 等价性全过) + gate-voxel(33)。|
 
 ### 已知待做（不阻塞 Demo）
 - L4 水晶矿簇 DDA 命中代价高：建议合胞上抬 L3/L2；
@@ -110,17 +108,23 @@ gate-ui/           自研 bevy_ui 组件库 + 世界标签
                    - capture.rs   测试截图辅助
                    - lib.rs       Plugin 安装
 
-gate-app/          Demo 应用入口
+gate-app/          Demo 应用入口（只有代码）
                    - src/main.rs  Startup / Update / 系统注册 / 极限场景 build_demo_scene（10×10 大陆）
-                                   demo_scene_aabb_zoom_out_headless headless 单测（5 档 zoom diff_hit/pal==0）
-                   - assets/
-                       shaders/    voxel_raytrace/  WESL 包（体素光追 GPU 程序，DDA 抄自 Rust cpu_reference_dda_ray_aabb_skip v3 同构）
-                                           main.wesl=入口点 + import；bindings/common/brickmap/trace/world/
-                                           lightfield + ddgi/*（consts/helpers/bake/sort/sample/collect）
-                                   blit.wgsl（fullscreen triangle bilinear upsample + sRGB cancel）
-                                   gradient.wgsl（背景）
-                       ui/theme.ron   暗色实验室主题配置
-                       fonts/MapleMono-NF-CN-Regular.ttf（CJK 字体）
+
+assets/            运行期资源（只读；与可写 logs//data/ 分离，见 gate-render/src/paths.rs）
+                   - shaders/    voxel_raytrace/  WESL 包（体素光追 GPU 程序，DDA 抄自 Rust cpu_reference_dda_ray_aabb_skip v3 同构）
+                                 main.wesl=入口点 + import；bindings/common/brickmap/trace/world/
+                                 lightfield + ddgi/*（consts/helpers/bake/sort/sample/collect）
+                                 blit.wgsl（fullscreen triangle bilinear upsample + sRGB cancel）
+                   - ui/         theme.ron 暗色实验室主题配置；debug_menu.toml 菜单初始值
+                                 （运行期改动写 <安装根>/data/，不回写这里）
+                   - locales/    zh-CN.yml 文案表（编译期 codegen 进二进制，运行期不读）
+                   - fonts/      MapleMono-NF-CN-Regular.ttf（CJK）+ fa-solid-900.ttf（图标）
+                   - lighting/   day_outdoor.ron（光照主题）
+                   - vox/        nuke.vox（默认场景，gitignore）
+
+logs/  data/       运行期可写目录（gitignore）：logs/latest.log 日志落盘、data/ui/debug_menu.toml 菜单存档
+dist/              打包产物（bash package.sh 生成，gitignore）
 ```
 
 ---
@@ -157,16 +161,17 @@ gate-app/          Demo 应用入口
 
 ---
 
-## 6. 质量门禁（CI / 本地自测 before commit）
+## 6. 质量门禁（本地自测 before commit）
 
 ```powershell
-# 本地跑法（等同于 .github/workflows/ci.yml）
-scripts\ci.ps1           # 顺序执行：fmt/check/test
+# 本地跑法（VS Code → 终端 → 运行任务，或直接敲命令）
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace
 ```
 
 - **`cargo fmt --check`**：代码风格。
 - **`cargo clippy --workspace --all-targets -- -D warnings`**：lint 零警告。
-- **`cargo test --workspace`**：100 tests / 0 fail。
 - **`cargo build -p gate-app`**：dev 构建 0 error（unused 警告允许）。
 
 渲染 Demo 手工验收（跑 `cargo run -p gate-app` 10 秒）：
@@ -174,3 +179,22 @@ scripts\ci.ps1           # 顺序执行：fmt/check/test
 - fps 折线 ≥ 50（RTX 3070 基线 73），无 < 30 波谷；
 - 滚 20 下向外不缺体素；
 - stderr 每 ~2 秒一行 `UPLOAD[incremental]: bytes≤0.3MB tiles=1`，**无 1 秒以上 elapsed 增量上传长耗时**。
+
+---
+
+## 7. 打包发布
+
+```sh
+bash package.sh     # release 构建 → 组装便携目录（不压缩）
+# 产物：dist/gate-<版本>-win64/{gate-app.exe, assets/}
+```
+
+- **产物形态**：`gate-app.exe` 与 `assets/` **同级**，双击即用；整个目录放到任何位置都行。要发 zip/7z 自己压。
+- **路径怎么找**（`gate-render/src/paths.rs`，`install_root()` 一套规则覆盖两种形态）：
+  1. `GATE_ROOT` 环境变量 → 直接当安装根（自定义安装位置 / 测试）；
+  2. exe 同目录存在 `assets/`（便携发布形态）→ 安装根 = exe 所在目录；
+  3. 否则 = 源码树根（`cargo run` / F5 时 exe 在 `target/<profile>/`，走这条）。
+  于是 `assets/`（只读）、`logs/`、`data/`（可写）在开发与发布下都指向同一套相对位置。
+- **必须随包发**：`assets/` 全部内容（字体、`blit.wgsl`、WESL 源码——启动时读盘编译、`ui/theme.ron`、`ui/debug_menu.toml`、`lighting/*.ron`、`vox/nuke.vox`）。
+- **无需随包**：`assets/locales/*.yml`（编译期 codegen 进 exe）、`logs/`、`data/`（首次启动自建）。
+- **不写安装目录**：日志 → `<安装根>/logs/latest.log`；菜单状态 → `<安装根>/data/ui/debug_menu.toml`（启动时优先读它，没有才用 `assets/ui/debug_menu.toml` 初版）。安装到只读目录（如 Program Files）时用 `GATE_ROOT` 把可写数据挪到别处。

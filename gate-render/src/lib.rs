@@ -1,6 +1,7 @@
 pub mod brickmap;
 pub mod ddgi;
 pub mod lighting;
+pub mod paths;
 pub mod profiler;
 mod responsive;
 pub mod shader;
@@ -22,6 +23,7 @@ pub use lighting::{
   DirLightCfg, EMISSIVE_EMIT_GAIN, LightDesc, LightGlobals, LightPoolUniform, LightingTheme,
   MAX_LIGHTS, SHADOW_BIAS, SHADOW_DIR_T_MAX, SkyCfg, build_light_pool, parse_lighting_ron,
 };
+pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
 
 pub struct GateRenderPlugin;

@@ -51,8 +51,6 @@ ron = "0.12"
 glam = "=0.32.1"
 # P2.2 全量构建并行分块（docs/brickmap.md §5）
 rayon = "1"
-# P3.1 WGSL 编译期校验测试（版本锁 bevy_render 传递的 naga，避免双份编译）
-naga = { version = "=29.0.4", features = ["wgsl-in"] }
 # WESL（wgsl 超集，带 import）编译：dda shader 拆包后由 wesl-rs 在运行时编译回 WGSL。
 # 本项目未启用 bevy 的 shader_format_wesl（不使用其 ShaderLoader，见 gate-render/src/shader.rs），
 # 故 bevy_shader 的可选 wesl 依赖不参与构建，不存在同 crate 编译两份的问题。
@@ -80,9 +78,15 @@ opt-level = 3
 # 现象：gate-ui 中文文本每次排版触发 "ICU4X data error: No segmentation model
 # for complex script: Chinese/Japanese"，且整段中文被视为单一不可断行单元。
 # 根因：上游用 new_for_non_complex_scripts 构造分段器（无任何复杂文字载荷），
-# bevy_text 0.19.1 锁定 parley 0.9，上游无 feature 可开。
+# bevy_text 0.19.1 锁定 parley 0.9（^0.9.0，而 0.9.x 只有 0.9.0，无 feature 可开）。
 # 补丁：word/line 分段器改用 new_dictionary（加载 baked 词典，含 cjdict）。
 # 公开 API 未变，bevy_text 无感。不可放入 third_party/（已被 gitignore）。
+#
+# 【迁移提示】上游已在这条线之外解决：parley 0.10.0+ 提供 complex-scripts feature
+# （开启即走 new_dictionary），bevy main（0.20.0-dev）已把 parley 提到 0.11 并新增直通
+# feature complex_script_segmentation = ["parley/complex-scripts"]。
+# 故等 bevy 0.20 正式发布后迁移时，可删掉本 patch 与 vendor/parley，改为开启
+# bevy 的 complex_script_segmentation（不开启则中文报错/不可断行复发）。
 [patch.crates-io]
 parley = { path = "vendor/parley" }
 

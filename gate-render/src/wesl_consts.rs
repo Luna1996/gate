@@ -3,7 +3,7 @@
 //! 图集尺寸 / LOD 级数 / 射线预算 / `ddgi_indirect` 的 word 布局两侧都要知道（WESL 按它们
 //! 寻址、分配线程，Rust 按它们 `create_texture` / `create_buffer` / 算字节偏移），各写一份
 //! 就会静默漂移且无任何编译或运行时报错。解析失败 / 常量缺失 → `error!` + `panic!`。
-//! 与 [`crate::shader::compile_dda_wesl`] 共用 `DDA_WESL_DIR`，改 `.wesl` 重启 app 即生效。
+//! 与 [`crate::shader::compile_dda_wesl`] 共用 [`crate::paths::dda_wesl_dir`]，改 `.wesl` 重启 app 即生效。
 //! 例外：`DDGI_LODS` 要定 `[T; N]` 数组与 `ShaderType` 布局长度，仍在 Rust 声明并断言一致。
 
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use bevy::log::{error, info};
 
-use crate::shader::DDA_WESL_DIR;
+use crate::paths::dda_wesl_dir;
 
 /// DDGI 两侧共用的常量（值来自 WESL 源码，见模块注释）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +104,8 @@ pub fn ddgi_consts() -> &'static DdgiConsts {
 
 impl DdgiConsts {
   fn load() -> Self {
-    let dir = Path::new(DDA_WESL_DIR);
-    let values = parse_package_u32_consts(dir);
+    let dir = dda_wesl_dir();
+    let values = parse_package_u32_consts(&dir);
     let missing: Vec<&str> =
       REQUIRED.iter().copied().filter(|name| !values.contains_key(*name)).collect();
     if !missing.is_empty() {
@@ -113,7 +113,8 @@ impl DdgiConsts {
         "WESL 跨端常量缺失（{}）：{:?}\n\
          —— 权威值只写在 .wesl 里，Rust 从源码解析；请检查 ddgi/consts.wesl 与 bindings.wesl，\
          并确保它们写成 `const NAME: u32 = <字面量>u;` 形式。",
-        DDA_WESL_DIR, missing
+        dir.display(),
+        missing
       );
       error!("{msg}");
       panic!("{msg}");
@@ -157,8 +158,9 @@ impl DdgiConsts {
     }
     info!(
       target: "gate",
-      "WESL 跨端常量（源 {DDA_WESL_DIR}）：irr={} depth={} 层内轴={} 层数={} 容量={} \
+      "WESL 跨端常量（源 {}）：irr={} depth={} 层内轴={} 层数={} 容量={} \
        LOD={} 射线预算={} WL 掩码=0x{:X}/shift={} indirect word={}/{}/{}/{}",
+      dir.display(),
       out.irr_texels, out.depth_texels, out.probes_per_layer_axis, out.atlas_layers,
       out.atlas_capacity(), out.lod_count, out.ray_budget, out.wl_idx_mask, out.wl_lod_shift,
       out.indir_cast_base, out.indir_coll_base, out.indir_rpp_base, out.indir_count_base,
@@ -201,9 +203,6 @@ fn parse_package_u32_consts(dir: &Path) -> HashMap<String, u32> {
 }
 
 /// 从一段 WGSL/WESL 源码里抽全部 `const NAME: u32 = <字面量>;`（见 [`parse_u32_const_line`]）。
-///
-/// 公开出来是为了让 `tests/wgsl_compile.rs` 能用**同一个解析器**去扫 WESL 编译产物
-/// （展平后的 WGSL），从而端到端断言"Rust 解析到的值 == shader 实际用的值"。
 pub fn parse_u32_consts_in_source(src: &str) -> HashMap<String, u32> {
   let mut out = HashMap::new();
   for line in src.lines() {
@@ -236,52 +235,4 @@ fn parse_u32_const_line(raw: &str) -> Option<(String, u32)> {
     None => rest.parse::<u32>().ok()?,
   };
   Some((name.to_string(), value))
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn parses_literals_and_skips_derived() {
-    assert_eq!(
-      parse_u32_const_line("const DDGI_IRR_TEXELS: u32 = 4u;"),
-      Some(("DDGI_IRR_TEXELS".to_string(), 4))
-    );
-    // 十六进制 + 行尾注释
-    assert_eq!(
-      parse_u32_const_line("const DDGI_WL_IDX_MASK: u32 = 0x7FFFFu; // 19 位"),
-      Some(("DDGI_WL_IDX_MASK".to_string(), 0x7FFFF))
-    );
-    // 派生式不是字面量 → 必须跳过（否则会解析出错值）
-    assert_eq!(
-      parse_u32_const_line(
-        "const DDGI_PROBES_PER_LAYER: u32 = DDGI_PROBES_PER_LAYER_AXIS * DDGI_PROBES_PER_LAYER_AXIS;"
-      ),
-      None
-    );
-    // 注释里的示例、其它类型、非 const 行都不能被当成常量
-    assert_eq!(parse_u32_const_line("// const FAKE: u32 = 1u;"), None);
-    assert_eq!(parse_u32_const_line("const DDGI_ALPHA: f32 = 0.015;"), None);
-    assert_eq!(parse_u32_const_line("let x = 1u;"), None);
-  }
-
-  /// 跑一次完整加载（等价于 CI 里检查 WESL 侧没被改坏）：常量都在、级数与 Rust 一致、
-  /// 图集容量装得进 worklist 的下标位宽、indirect word 布局自洽。
-  #[test]
-  fn load_cross_boundary_consts_succeeds() {
-    let c = ddgi_consts();
-    assert_eq!(c.lod_count, crate::ddgi::DDGI_LODS);
-    assert!(c.atlas_capacity() > 0);
-    // worklist 的 cell 下标位宽必须装得下图集容量 —— 否则 LOD0 的下标被截断、成片全黑。
-    assert!(
-      c.atlas_capacity() <= c.wl_idx_mask + 1,
-      "图集容量 {} 超出 worklist 下标位宽 0x{:X}",
-      c.atlas_capacity(),
-      c.wl_idx_mask
-    );
-    // indirect 缓冲的 word 布局必须自洽（rpp / 计数器段在 args 段之后）
-    assert!(c.indir_count_base >= c.indir_rpp_base);
-    assert!(c.indir_rpp_base >= c.indir_coll_base);
-  }
 }

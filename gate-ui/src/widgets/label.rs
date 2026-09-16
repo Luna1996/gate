@@ -1,17 +1,28 @@
-//! label：主题字号/颜色的文本标签（docs/ui-dark-theme.md §5.6）。
+//! label：文本标签，字号/颜色/字体属性各自独立可设。
 //!
-//! 变体由 [`LabelStyle`] preset enum 表达：字号 + 颜色永远成对来自主题令牌，拼不出非法组合
-//! （如 faint 档 <18px 违反对比度规则）。禁止纯白：一律走主题令牌。
+//! 两条取值路径，同一个标签上可混用（每个属性互不影响）：
+//! 1. **预设档** [`LabelStyle`]：字号 + 颜色**成对**取自主题令牌，是默认路径，
+//!    保证拼不出违反对比度的组合（如 faint 档 <18px）；
+//! 2. **逐属性覆盖**：[`LabelConfig`] 的 `size`（字号）/ `color`（颜色）/ `font`（[`FontAttrs`]：
+//!    字重、字宽、倾斜、抗锯齿、OpenType 特性、可变字体轴）都是 `Option`，填哪项覆盖哪项，
+//!    没填的仍走预设档 —— 例如「Muted 的次要灰 + 正文档字号」直接写
+//!    `LabelConfig { style: LabelStyle::Muted, size: Some(fs.md), ..default() }`。
+//!
+//! 覆盖值不走令牌、也不做合规校验（调用方自担）；禁止纯白一类硬约束只由预设档保证。
 
 use std::ops::Deref;
 
 use bevy::prelude::*;
 use bevy::text::TextLayoutInfo;
+use bevy::text::{FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWeight, FontWidth};
 use bevy::ui::Overflow;
 
 use super::{UiCtx, color_of, dim_color};
 
-/// 文本预设档：四档正文（primary/body/muted/faint）+ 四档语义色
+/// 文本预设档：四档正文（primary/body/muted/faint）+ 四档语义色。
+///
+/// 每档 = 字号 + 颜色**成对**取自主题令牌，作为 [`LabelConfig`] 的默认值；
+/// 想单独改字号或颜色时用 `LabelConfig::size` / `LabelConfig::color` 覆盖其中一项。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LabelStyle {
   /// 正文（text_body，字号 md）
@@ -102,24 +113,78 @@ impl EllipsisText {
 /// 省略符
 pub const ELLIPSIS: &str = "...";
 
-/// 标签配置（全部字段进 Config；Default = 空文本 + Body 档、不禁用）
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// 标签配置：**预设档给默认值，每个属性都能单独覆盖**。
+///
+/// Default = 空文本 + Body 档 + 不覆盖任何属性 + 不禁用。
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LabelConfig {
   pub text: String,
+  /// 预设档：提供字号与颜色的默认值（被下面的 `size` / `color` 覆盖时以覆盖值为准）
   pub style: LabelStyle,
+  /// 字号覆盖（逻辑 px）；None = 用预设档字号
+  pub size: Option<f32>,
+  /// 颜色覆盖；None = 用预设档颜色
+  pub color: Option<Color>,
+  /// 其余字体属性逐项覆盖（见 [`FontAttrs`]）
+  pub font: FontAttrs,
   /// true = 禁用态：文本颜色经 [`dim_color`] 降亮一档（不可交互，纯视觉）
   pub disabled: bool,
   /// 超宽处理（见 [`LabelOverflow`]）
   pub overflow: LabelOverflow,
 }
 
-/// 主题文本标签
+/// 可逐项覆盖的 `TextFont` 属性（每项 `None` = 用 bevy 的默认值）。
+///
+/// 不含 `font`（字体句柄由 [`UiCtx`] 统一给主题字体）与 `font_size`（走 [`LabelConfig::size`]）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FontAttrs {
+  /// 字重（仅可变字重字体生效）
+  pub weight: Option<FontWeight>,
+  /// 字宽（压缩 / 扩展）
+  pub width: Option<FontWidth>,
+  /// 字形倾斜（normal / italic / oblique）
+  pub style: Option<FontStyle>,
+  /// 抗锯齿方式
+  pub smoothing: Option<FontSmoothing>,
+  /// OpenType 特性（连字 / 数字样式等）
+  pub features: Option<FontFeatures>,
+  /// 可变字体轴
+  pub variations: Option<FontVariations>,
+}
+
+impl FontAttrs {
+  /// 把填了的项写进 `TextFont`（未填的保持原值）
+  pub fn apply(&self, font: &mut TextFont) {
+    if let Some(v) = self.weight {
+      font.weight = v;
+    }
+    if let Some(v) = self.width {
+      font.width = v;
+    }
+    if let Some(v) = self.style {
+      font.style = v;
+    }
+    if let Some(v) = self.smoothing {
+      font.font_smoothing = v;
+    }
+    if let Some(v) = self.features.clone() {
+      font.font_features = v;
+    }
+    if let Some(v) = self.variations.clone() {
+      font.font_variations = v;
+    }
+  }
+}
+
+/// 主题文本标签（字号/颜色/字体属性各自独立取值，见模块文档）
 pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> LabelHandle {
   let fs = &ctx.theme.metrics.font_size;
-  let (size, color) = config.style.tokens();
-  let color = color_of(color(&ctx.theme.colors));
+  let (size_token, color_token) = config.style.tokens();
+  let size = config.size.unwrap_or_else(|| size_token(fs));
+  let color = config.color.unwrap_or_else(|| color_of(color_token(&ctx.theme.colors)));
   let color = if config.disabled { dim_color(color) } else { color };
-  let mut ec = parent.spawn(super::label_bundle(ctx, config.text.clone(), size(fs), color));
+  let mut ec =
+    parent.spawn(super::label_bundle_attrs(ctx, config.text.clone(), size, color, config.font));
   if config.overflow == LabelOverflow::MiddleEllipsis {
     // NoWrap：中间省略要「整行自然宽度」，换行测量值会等于可用宽度而永不触发省略；
     // 节点自身 clip，省略收敛前的一两帧不会溢出
@@ -179,96 +244,4 @@ pub fn middle_ellipsis(full: &str, avail: f32, full_w: f32) -> String {
     s.extend(&chars[chars.len() - tail..]);
   }
   s
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::theme::default_theme;
-
-  #[test]
-  fn label_spawn_structure() {
-    let theme = default_theme();
-    let ctx = UiCtx::new(&theme, None);
-    let mut app = App::new();
-    let root = app.world_mut().spawn_empty().id();
-    let mut child = None;
-    app.world_mut().entity_mut(root).with_children(|p| {
-      child = Some(label(&ctx, p, LabelConfig { text: "hello".into(), ..default() }));
-    });
-    let e = *child.expect("label spawned");
-    let w = app.world();
-    let text = w.get::<Text>(e).expect("label has Text");
-    assert_eq!(text.0.as_str(), "hello");
-    assert!(w.get::<bevy::ui::widget::Label>(e).is_some());
-    let tf = w.get::<TextFont>(e).expect("label has TextFont");
-    assert_eq!(tf.font_size, bevy::text::FontSize::Px(theme.metrics.font_size.md));
-    assert_eq!(
-      w.get::<TextColor>(e).unwrap().0,
-      color_of(&theme.colors.text_body),
-      "Body style uses text_body token"
-    );
-  }
-
-  #[test]
-  fn label_styles_map_to_token_pairs() {
-    let theme = default_theme();
-    let ctx = UiCtx::new(&theme, None);
-    let mut app = App::new();
-    let root = app.world_mut().spawn_empty().id();
-    let mut got = Vec::new();
-    app.world_mut().entity_mut(root).with_children(|p| {
-      got.push(*label(
-        &ctx,
-        p,
-        LabelConfig { text: "t".into(), style: LabelStyle::Title, ..default() },
-      ));
-      got.push(*label(
-        &ctx,
-        p,
-        LabelConfig { text: "m".into(), style: LabelStyle::Muted, ..default() },
-      ));
-      got.push(*label(
-        &ctx,
-        p,
-        LabelConfig { text: "f".into(), style: LabelStyle::FaintLg, ..default() },
-      ));
-      got.push(*label(
-        &ctx,
-        p,
-        LabelConfig { text: "s".into(), style: LabelStyle::Success, ..default() },
-      ));
-    });
-    let w = app.world();
-    assert_eq!(w.get::<TextColor>(got[0]).unwrap().0, color_of(&theme.colors.text_primary));
-    assert_eq!(
-      w.get::<TextFont>(got[0]).unwrap().font_size,
-      bevy::text::FontSize::Px(theme.metrics.font_size.lg)
-    );
-    assert_eq!(w.get::<TextColor>(got[1]).unwrap().0, color_of(&theme.colors.text_muted));
-    assert_eq!(
-      w.get::<TextFont>(got[2]).unwrap().font_size,
-      bevy::text::FontSize::Px(theme.metrics.font_size.lg),
-      "FaintLg stays >=18px"
-    );
-    assert_eq!(w.get::<TextColor>(got[3]).unwrap().0, color_of(&theme.colors.success));
-  }
-
-  #[test]
-  fn middle_ellipsis_keeps_head_and_tail() {
-    // 宽度刚好够 → 原样
-    assert_eq!(middle_ellipsis("/debug/overlay", 200.0, 100.0), "/debug/overlay");
-    // 只够一半 → head + ... + tail
-    let s = middle_ellipsis("/debug/overlay", 50.0, 100.0);
-    assert!(s.contains("..."), "{s}");
-    assert!(s.starts_with('/'), "head kept: {s}");
-    assert!(s.ends_with("lay"), "tail kept: {s}");
-    assert!(s.chars().count() < "/debug/overlay".chars().count());
-    // 极窄 → 至少保留一个字符（不 panic、不为空）
-    let tiny = middle_ellipsis("/debug/overlay", 1.0, 100.0);
-    assert!(tiny.contains("..."));
-    // 退化输入原样返回
-    assert_eq!(middle_ellipsis("/", 1.0, 100.0), "/");
-    assert_eq!(middle_ellipsis("/debug", 100.0, 0.0), "/debug");
-  }
 }

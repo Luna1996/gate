@@ -3,7 +3,6 @@
 //! `GATE_SCENE=vox`（默认）→ MagicaVoxel nuke.vox（vox_scene 模块）；
 //! `GATE_SCENE=demo` → 程序化极限场景（城堡/大道/森林/水晶矿，见 [`build_demo_scene`]）。
 
-use std::path::Path;
 use std::sync::LazyLock;
 
 use bevy::{image::Image, prelude::*};
@@ -18,7 +17,6 @@ use gate_voxel::{
 };
 
 use crate::{
-  ASSETS_PATH,
   camera::{CAM_FAR, CAM_NEAR, FOV_Y},
   vox_scene,
 };
@@ -27,16 +25,13 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let dda_handle = create_dda_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off));
   // ---- 光照主题 RON 加载（一次性静态配置，同步读即可；缺失/解析失败回退内置默认主题）----
-  let theme = std::fs::read_to_string(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/lighting/day_outdoor.ron"
-  ))
-  .map_err(|e| format!("read: {e}"))
-  .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))
-  .unwrap_or_else(|e| {
-    bevy::log::warn!("lighting/day_outdoor.ron 加载失败（{e}），回退内置默认主题");
-    Default::default()
-  });
+  let theme = std::fs::read_to_string(gate_render::assets_dir().join("lighting/day_outdoor.ron"))
+    .map_err(|e| format!("read: {e}"))
+    .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))
+    .unwrap_or_else(|e| {
+      bevy::log::warn!("lighting/day_outdoor.ron 加载失败（{e}），回退内置默认主题");
+      Default::default()
+    });
   commands.insert_resource(theme);
   commands.insert_resource(DdaImages { target: dda_handle });
   // 3 = unlit（跳过全部光照，albedo 直出）
@@ -59,7 +54,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     }
     _ => {
       let anchor = IVec3::new(*EXT_VOXEL_HALF, 16, *EXT_VOXEL_HALF);
-      let path = Path::new(ASSETS_PATH).join("vox/nuke.vox");
+      let path = gate_render::assets_dir().join("vox/nuke.vox");
       let info = vox_scene::load_vox_scene(&mut grid, &path, anchor).expect("nuke.vox 加载失败");
       cam_eye = Vec3::new(406.5, 339.5, 431.5);
       cam_target = Vec3::new(551.5, 330.5, 359.5);

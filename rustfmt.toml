@@ -8,9 +8,6 @@ edition = "2024"
 # （rustfmt#3119 / #3120），Fuchsia 取 "Max"。
 use_small_heuristics = "Max"
 
-# 统一 LF 行尾。
-newline_style = "Unix"
-
 # import 粒度：Fuchsia 取 "Module"（同一模块合并为一条 use）。该选项 nightly-only，
 # stable rustfmt 会忽略并输出告警，故默认不启用；改用 nightly 时取消下一行注释即可。
 # imports_granularity = "Module"

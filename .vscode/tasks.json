@@ -29,6 +29,19 @@
       "problemMatcher": [
         "$rustc"
       ]
+    },
+    {
+      "label": "package-gate-app",
+      "type": "shell",
+      "command": "package.sh",
+      "presentation": {
+        "echo": true,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": true
+      },
     }
   ]
 }

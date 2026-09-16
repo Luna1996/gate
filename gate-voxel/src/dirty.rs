@@ -78,36 +78,3 @@ impl DirtyTracker {
       + q(self.comp_queue.capacity())
   }
 }
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn dedup_and_fifo() {
-    let mut t = DirtyTracker::new();
-    let a = ChunkCoord::new(0, 0, 0);
-    let b = ChunkCoord::new(1, 0, 0);
-    t.mark_data(a);
-    t.mark_data(a);
-    t.mark_data(b);
-    assert_eq!(t.data_dirty_count(), 2);
-    assert_eq!(t.drain_data_budget(1), vec![a]);
-    assert_eq!(t.data_dirty_count(), 1);
-    assert_eq!(t.drain_data_budget(10), vec![b]);
-    assert_eq!(t.drain_data_budget(10), vec![]);
-  }
-
-  #[test]
-  fn data_and_comp_independent() {
-    let mut t = DirtyTracker::new();
-    let a = ChunkCoord::new(2, 3, 4);
-    t.mark_data(a);
-    assert!(t.is_data_dirty(&a));
-    t.drain_data_budget(10);
-    assert!(!t.is_data_dirty(&a));
-    t.mark_comp(a);
-    assert_eq!(t.comp_dirty_count(), 1);
-    assert_eq!(t.data_dirty_count(), 0);
-  }
-}

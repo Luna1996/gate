@@ -1,4 +1,4 @@
-//! WESL（WGSL 超集，带 import）编译：启动时把 `gate-app/assets/shaders/voxel_raytrace/`
+//! WESL（WGSL 超集，带 import）编译：启动时把 `assets/shaders/voxel_raytrace/`
 //! 下的 WESL 包编译成单份 WGSL，作为普通 `Shader` 资产插入 `Assets<Shader>`，
 //! 之后走 Bevy 常规 WGSL/naga 路径（见 [`build_dda_shader`]）。
 //!
@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 use bevy::shader::Shader;
 
-/// voxel raytrace WESL 包根目录（内含 `main.wesl` 与各子模块）。
-pub const DDA_WESL_DIR: &str =
-  concat!(env!("CARGO_MANIFEST_DIR"), "/../gate-app/assets/shaders/voxel_raytrace");
+use crate::paths::dda_wesl_dir;
 
 /// dda shader 的逻辑资产路径（`Shader::path`，仅用于日志/诊断）。
 pub const DDA_SHADER_PATH: &str = "shaders/voxel_raytrace/main.wesl";
@@ -23,7 +21,7 @@ pub struct DdaShaderHandle(pub Handle<Shader>);
 
 /// 编译 DDA 的 WESL 包，返回展平后的 WGSL。
 pub fn compile_dda_wesl() -> Result<String, wesl::Error> {
-  compile_wesl_entry(Path::new(DDA_WESL_DIR).join("main.wesl"))
+  compile_wesl_entry(&dda_wesl_dir().join("main.wesl"))
 }
 
 /// 编译 `entry` 所在目录的 WESL 包，返回展平后的 WGSL。
@@ -49,13 +47,12 @@ pub fn compile_wesl_entry(entry: impl AsRef<Path>) -> Result<String, wesl::Error
 }
 
 /// 编译 dda WESL 包并作为 `Shader` 资产插入 `Assets<Shader>`，注册 [`DdaShaderHandle`]。
-/// 编译失败 → `error!` 打印 pretty 诊断后 `panic!`（fail fast）；`tests/wgsl_compile.rs`
-/// 在 CI 提前拦截。
+/// 编译失败 → `error!` 打印 pretty 诊断后 `panic!`（fail fast）。
 pub fn build_dda_shader(app: &mut App) {
   let source = match compile_dda_wesl() {
     Ok(source) => source,
     Err(e) => {
-      let msg = format!("DDA WESL 编译失败（{DDA_WESL_DIR}）:\n{e}");
+      let msg = format!("DDA WESL 编译失败（{}）:\n{e}", dda_wesl_dir().display());
       error!("{msg}");
       panic!("{msg}");
     }

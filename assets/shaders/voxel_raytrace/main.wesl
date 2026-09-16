@@ -14,7 +14,7 @@ import package::world::{voxel_normal, world_cfg_full, world_raycast};
 // DDA compute shader：全屏逐像素层次栈式 mask DDA（Douglas 64-tree）。chunk 间 256³
 // A&W（窗口 entry=0 的空 chunk 一次 load 跨越）；chunk 内 4 层栈帧（256→64→16→4→1），mask 一次
 // load，bit=1 分裂才下钻、bit=0 uniform 整格跳过/命中。各 binding 布局见 bindings.wesl。
-// 不变量：顶部常量与 Rust `brickmap::dda::wgsl_consts` 一致（单测 TR-2.1 锁）；寻址链对应
+// 不变量：顶部常量与 Rust `brickmap::dda::wgsl_consts` 一致（改一侧必须同步另一侧）；寻址链对应
 // `brickmap/view.rs::get_voxel`；slot 打包对应 `brickmap/wire.rs::encode_slot`。
 // ============================================================================
 

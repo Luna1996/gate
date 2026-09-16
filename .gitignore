@@ -1,4 +1,9 @@
 /target
+# 打包产物（bash package.sh）
+/dist
+# 运行期可写目录（日志、菜单存档）：与只读资源 assets/ 分离
+/logs
+/data
 *.log
 *.out
 *.err

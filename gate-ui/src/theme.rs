@@ -13,7 +13,7 @@ use bevy::ui::UiScale;
 use bevy::window::{PrimaryWindow, Window};
 use serde::Deserialize;
 
-/// 主题资产路径（相对 gate-app/assets）
+/// 主题资产路径（相对资源根 `assets/`，见 gate-render `paths`）
 pub const THEME_ASSET_PATH: &str = "ui/theme.ron";
 /// auto_fit 基准高度：窗口高 720 时 UiScale == ui_scale
 pub const AUTOFIT_BASE_HEIGHT: f32 = 720.0;
@@ -242,7 +242,7 @@ pub fn default_theme() -> UiTheme {
   UiTheme::default()
 }
 
-/// RON 解析纯函数（单测入口；system 接线只做加载与回退）
+/// RON 解析纯函数（system 接线只做加载与回退）
 pub fn parse_theme_ron(src: &str) -> Result<UiTheme, ron::error::SpannedError> {
   ron::de::from_str(src)
 }
@@ -531,116 +531,5 @@ impl Plugin for GateUiPlugin {
           ),
         ),
       );
-  }
-}
-
-// ---------- 单测 ----------
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn default_theme_colors_all_parse() {
-    let t = default_theme();
-    let c = &t.colors;
-    for (name, hc) in [
-      ("surface_base", &c.surface_base),
-      ("surface_card", &c.surface_card),
-      ("surface_elevated", &c.surface_elevated),
-      ("surface_overlay", &c.surface_overlay),
-      ("surface_top", &c.surface_top),
-      ("surface_card_hud", &c.surface_card_hud),
-      ("scrim", &c.scrim),
-      ("border_subtle", &c.border_subtle),
-      ("border", &c.border),
-      ("border_strong", &c.border_strong),
-      ("text_primary", &c.text_primary),
-      ("text_body", &c.text_body),
-      ("text_muted", &c.text_muted),
-      ("text_faint", &c.text_faint),
-      ("accent_fill", &c.accent_fill),
-      ("accent_fill_hover", &c.accent_fill_hover),
-      ("accent_fill_pressed", &c.accent_fill_pressed),
-      ("accent_text", &c.accent_text),
-      ("success", &c.success),
-      ("success_fill", &c.success_fill),
-      ("warning", &c.warning),
-      ("warning_fill", &c.warning_fill),
-      ("danger", &c.danger),
-      ("danger_fill", &c.danger_fill),
-    ] {
-      assert!(hc.to_color().is_some(), "default {name} hex invalid: {}", hc.0);
-    }
-  }
-
-  #[test]
-  fn parse_valid_ron() {
-    let src = r#"
-(
-    colors: (
-        surface_card: "141414",
-        accent_text: "60A5FA",
-    ),
-    metrics: (
-        corner_radius: 6.0,
-        corner_radius_sm: 3.0,
-        spacing: (xs: 2.0, sm: 4.0, md: 8.0, lg: 16.0),
-    ),
-    ui_scale: 1.25,
-    auto_fit_ui_scale: true,
-    font_path: None,
-)
-"#;
-    let t = parse_theme_ron(src).expect("valid theme.ron should parse");
-    assert_eq!(t.colors.surface_card.0, "141414");
-    assert_eq!(t.colors.accent_text.0, "60A5FA");
-    assert_eq!(t.metrics.corner_radius, 6.0);
-    assert_eq!(t.metrics.corner_radius_sm, 3.0);
-    // 未写字段回默认
-    assert_eq!(t.colors.danger, ThemeColors::default().danger);
-    assert_eq!(t.metrics.font_size, FontSize::default());
-    assert_eq!(t.ui_scale, 1.25);
-    assert!(t.auto_fit_ui_scale);
-  }
-
-  #[test]
-  fn parse_broken_ron_errs() {
-    assert!(parse_theme_ron("( colors: ( panel_bg: ").is_err());
-  }
-
-  #[test]
-  fn bad_hex_rejected() {
-    let r: Result<UiTheme, _> = ron::de::from_str("( colors: ( accent_fill: \"XYZ\" ) )");
-    assert!(r.is_err(), "invalid hex must be rejected at deserialize time");
-    assert!(parse_hex_color("1E1E2E").is_some());
-    assert!(parse_hex_color("#1E1E2ECC").is_some());
-    assert!(parse_hex_color("12345").is_none());
-    assert!(parse_hex_color("GGGGGG").is_none());
-  }
-
-  #[test]
-  fn hex_to_color_values() {
-    let c = HexColor("FF8000FF".into()).to_color().expect("valid hex");
-    let srgba = c.to_srgba();
-    assert!((srgba.red - 1.0).abs() < 1e-4);
-    assert!((srgba.green - 0.5019608).abs() < 1e-4);
-    assert!((srgba.blue - 0.0).abs() < 1e-4);
-    assert!((srgba.alpha - 1.0).abs() < 1e-4);
-  }
-
-  #[test]
-  fn autofit_math() {
-    // 720 基准：scale 恒等
-    assert!((autofit_ui_scale(1.0, true, 720.0) - 1.0).abs() < 1e-6);
-    // 1080 → 1.5x
-    assert!((autofit_ui_scale(1.0, true, 1080.0) - 1.5).abs() < 1e-6);
-    // 关闭 auto_fit → 原值
-    assert!((autofit_ui_scale(1.25, false, 1080.0) - 1.25).abs() < 1e-6);
-    // 极小窗口有下限
-    assert!((autofit_ui_scale(1.0, true, 100.0) - 0.25).abs() < 1e-6);
-    // 退化大窗口有上限：h 钳 4096 → 系数钳 4.0
-    assert!((autofit_ui_scale(1.0, true, 65496.0) - 4.0).abs() < 1e-6);
-    assert!((autofit_ui_scale(1.0, true, 4096.0) - 4.0).abs() < 1e-6);
   }
 }

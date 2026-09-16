@@ -1,6 +1,6 @@
 # gate-app 中文文案表（rust-i18n 编译期 codegen 进二进制）
 #
-# 格式：_version 1 = 每语言一个文件（locales/<locale>.yml），加语言 = 加文件 +
+# 格式：_version 1 = 每语言一个文件（assets/locales/<locale>.yml），加语言 = 加文件 +
 # 调 rust_i18n::set_locale。
 #
 # 约定：
@@ -26,26 +26,26 @@ menu.render.ddgi: "DDGI"
 menu.render.ddgi.enabled: "开启"
 menu.render.ddgi.mode: "诊断模式"
 menu.render.ddgi.mode.normal: "常规"
-menu.render.ddgi.mode.gi: "GI"
-menu.render.ddgi.mode.wsum: "权重和"
-menu.render.ddgi.mode.domain: "域"
+menu.render.ddgi.mode.gi: "纯GI"
+menu.render.ddgi.mode.wsum: "权重"
+menu.render.ddgi.mode.domain: "级域"
 menu.render.ddgi.mode.probe: "探针"
 menu.render.ddgi.probe: "绘制探针"
-menu.render.ddgi.probe.none: "无"
+menu.render.ddgi.probe.none: "无级"
 menu.render.ddgi.probe.lod0: "LOD0"
 menu.render.ddgi.probe.lod1: "LOD1"
 menu.render.ddgi.probe.lod2: "LOD2"
 menu.render.ddgi.probe.lod3: "LOD3"
-menu.render.ddgi.probe.all: "全"
+menu.render.ddgi.probe.all: "全级"
 menu.render.exposure: "曝光"
 menu.render.exposure.enabled: "开启"
 menu.render.exposure.ev_up: "提亮上限"
 menu.render.exposure.ev_up.tip: "适应暗处的最大增益 = 2^EV（档）"
 menu.render.exposure.ev_dn: "压暗上限"
 menu.render.exposure.ev_dn.tip: "适应亮处的最大衰减 = 2^EV（档）"
-menu.render.exposure.tau_up: "变亮时间常数"
+menu.render.exposure.tau_up: "变亮时间"
 menu.render.exposure.tau_up.tip: "往亮处适应的速度（秒）：太小像闪光"
-menu.render.exposure.tau_dn: "变暗时间常数"
+menu.render.exposure.tau_dn: "变暗时间"
 menu.render.exposure.tau_dn.tip: "往暗处适应的速度（秒）：太小像眨眼"
 menu.render.exposure.key: "目标中灰"
 menu.render.exposure.key.tip: "百分位平均亮度被压到的目标值"
@@ -56,7 +56,7 @@ menu.player.camera.dir: "相机角度"
 menu.player.camera.mode: "相机模式"
 menu.player.camera.mode.orbit: "轨道"
 menu.player.camera.mode.fly: "自由"
-menu.player.camera.speed: "自由模式速度 (m/s)"
+menu.player.camera.speed: "飞行速度"
 menu.game: "游戏"
 menu.game.edit: "编辑"
 menu.game.edit.shape: "笔触形状"
@@ -69,8 +69,9 @@ menu.game.edit.alpha: "透明度"
 menu.game.edit.smooth: "光滑度"
 menu.ui: "界面"
 menu.ui.showcase: "UI 展示窗"
-menu.camera.pos.value: "相机位置: %{v}"
-menu.camera.dir.value: "相机角度: yaw %{yaw}°, pitch %{pitch}°"
+# 纯文本行的**值**（左侧名称 `menu.player.camera.pos/dir` 已占左列，这里不再重复名称）
+menu.camera.pos.value: "%{v}"
+menu.camera.dir.value: "yaw %{yaw}°, pitch %{pitch}°"
 
 # ---------------- 右上角组件展示窗 ----------------
 # 注：展示窗文案只在启动时求值（未挂 i18n key），不随运行期切语言重建；调试菜单才是 keyed UI。

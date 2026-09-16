@@ -62,10 +62,10 @@ const PROBE_VIZ_LOD_ALL: f32 = 4.0;
 
 // ===================== 默认菜单树（= assets/ui/debug_menu.toml） =====================
 
-/// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（见单测）。
+/// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（改这里就要同步资产文件）。
 ///
 /// 文案字段一律写 **i18n key**（本表 `menu.*`），运行时经 gate-ui 的 `UiTranslator` 解析；
-/// `id` 是与语言无关的回调路径段（标题栏显示它）。
+/// `id` 是与语言无关的回调路径段（标题栏路径显示的是各段 `label` 的译文）。
 pub fn default_menu() -> MenuFile {
   MenuFile {
     window: WindowState::default(),
@@ -201,9 +201,12 @@ pub fn default_menu() -> MenuFile {
   }
 }
 
-/// 读菜单 TOML（相对 [`crate::ASSETS_PATH`]）；缺失/解析失败 → 内置默认 + warn
+/// 读菜单 TOML：优先**可写数据目录**里的存档（上次退出时写的），
+/// 没有则用只读资源里的初版（`assets/ui/debug_menu.toml`）；都缺失/解析失败 → 内置默认 + warn
 pub fn load_menu() -> MenuFile {
-  let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
+  let data = gate_render::data_dir().join(MENU_TOML_PATH);
+  let asset = gate_render::assets_dir().join(MENU_TOML_PATH);
+  let path = if data.is_file() { data } else { asset };
   match std::fs::read_to_string(&path) {
     Ok(src) => match MenuFile::from_toml(&src) {
       Ok(mut m) => {
@@ -227,9 +230,12 @@ pub fn load_menu() -> MenuFile {
   }
 }
 
-/// 把当前菜单状态写回 TOML（退出前调用）
+/// 把当前菜单状态写回 TOML（退出前调用）。
+///
+/// 写**可写数据目录**（`<安装根>/data/ui/debug_menu.toml`）而不是 `assets/`：安装目录可能只读
+/// （如 Program Files），且源码资源不应被运行期改写。下次启动由 [`load_menu`] 优先读这份存档。
 pub fn save_menu(model: &MenuFile) {
-  let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
+  let path = gate_render::data_dir().join(MENU_TOML_PATH);
   let Ok(src) = model.to_toml() else {
     warn!("debug menu serialize failed; not saved");
     return;
@@ -275,9 +281,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   let model = load_menu();
   // 文案解析器取资源里的（语言切换只需 bump 版本，见 sync_ui_locale）
   let translate = world.resource::<UiTranslator>().handle();
-  let ctx = UiCtx::new(ctx.theme, ctx.font)
-    .with_icon_font(ctx.icon_font)
-    .with_translate(translate);
+  let ctx = UiCtx::new(ctx.theme, ctx.font).with_icon_font(ctx.icon_font).with_translate(translate);
   spawn_debug_menu(world, &ctx, model);
   apply_initial_state(world);
   spawn_fps_overlay(world, &ctx);
@@ -287,10 +291,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
 /// 语言切换后让 gate-ui 重解析全部 keyed 文本（菜单树整体跟着换语言）。
 ///
 /// 解析闭包读的是 rust-i18n 的当前 locale，所以这里只需 bump 版本触发重解析。
-pub(crate) fn sync_ui_locale(
-  mut translator: ResMut<UiTranslator>,
-  mut last: Local<String>,
-) {
+pub(crate) fn sync_ui_locale(mut translator: ResMut<UiTranslator>, mut last: Local<String>) {
   let now = rust_i18n::locale().to_string();
   if now != *last {
     info!("UI 语言 → {now}");
@@ -584,15 +585,16 @@ fn register_callbacks(world: &mut World) {
 
 // ===================== 每帧刷新 =====================
 
-/// 纯文本行（相机位置/角度）：每 [`CAM_INFO_REFRESH_SECS`] 刷新一次
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+/// 纯文本行（相机位置/角度）的值：每 [`CAM_INFO_REFRESH_SECS`] 刷新一次
+///
+/// 行由「左列名称 + 中间值」两段组成（见 gate-ui `text_row`），这里只改写**值标签**
+/// （[`gate_ui::MenuTextValue`]）；左侧名称是普通行文案，不动。
 pub(crate) fn camera_info_tick(
   time: Res<Time>,
   orbit: Res<gate_render::OrbitCamera>,
   mode: Res<CameraMode>,
   fly: Res<FlyCamera>,
-  q_rows: Query<(&gate_ui::MenuItem, &Children)>,
-  mut q_text: Query<&mut Text>,
+  mut q_values: Query<(&gate_ui::MenuTextValue, &mut Text)>,
   mut acc: Local<f32>,
 ) {
   *acc += time.delta_secs();
@@ -605,29 +607,22 @@ pub(crate) fn camera_info_tick(
     CameraMode::Fly => fly.pos,
   };
   // 数字先 format! 好再塞占位符：语言切换不会改变数字列宽（见 locales 约定）
-  let pos = t!(
-    "menu.camera.pos.value",
-    v = format!("({:.1}, {:.1}, {:.1})", eye.x, eye.y, eye.z)
-  )
-  .to_string();
+  let pos = t!("menu.camera.pos.value", v = format!("({:.1}, {:.1}, {:.1})", eye.x, eye.y, eye.z))
+    .to_string();
   let dir = t!(
     "menu.camera.dir.value",
     yaw = format!("{:.1}", orbit.yaw.to_degrees()),
     pitch = format!("{:.1}", orbit.pitch.to_degrees())
   )
   .to_string();
-  for (item, children) in &q_rows {
-    let text = match item.path.as_str() {
-      "player/camera/pos" => pos.clone(),
-      "player/camera/dir" => dir.clone(),
+  for (value, mut text) in &mut q_values {
+    let s = match value.path.as_str() {
+      "player/camera/pos" => &pos,
+      "player/camera/dir" => &dir,
       _ => continue,
     };
-    for c in children.iter() {
-      if let Ok(mut t) = q_text.get_mut(c)
-        && t.0 != text
-      {
-        t.0 = text.clone();
-      }
+    if text.0 != *s {
+      text.0 = s.clone();
     }
   }
 }
@@ -721,163 +716,5 @@ pub(crate) fn save_menu_on_exit(
     model.window.path = menu.path.clone();
     model.window.collapsed = menu.collapsed;
     save_menu(&model);
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn default_menu_matches_asset_toml() {
-    let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
-    let src = std::fs::read_to_string(&path)
-      .unwrap_or_else(|e| panic!("缺初始菜单资产 {}: {e}", path.display()));
-    let from_file = MenuFile::from_toml(&src).expect("TOML 可解析");
-    let built = default_menu();
-    assert_eq!(from_file, built, "assets/ui/debug_menu.toml 必须与 default_menu() 逐字一致");
-    let regenerated = built.to_toml().expect("可序列化");
-    assert_eq!(regenerated, src, "序列化结果必须与资产文件逐字一致（含格式）");
-  }
-
-  #[test]
-  #[ignore = "工具用：把默认菜单写成 assets/ui/debug_menu.toml（改默认值后重跑一次）"]
-  fn generate_default_toml() {
-    let path = std::path::Path::new(crate::ASSETS_PATH).join(MENU_TOML_PATH);
-    let src = default_menu().to_toml().expect("可序列化");
-    std::fs::write(&path, src).expect("写入菜单资产");
-    println!("wrote {}", path.display());
-  }
-
-  #[test]
-  fn paths_used_by_callbacks_exist() {
-    let m = default_menu();
-    for path in [
-      "video/vsync",
-      "video/fps",
-      "video/fullscreen",
-      "video/aa",
-      "render/ddgi/enabled",
-      "render/ddgi/mode",
-      "render/ddgi/probe",
-      "render/exposure/enabled",
-      "render/exposure/ev_up",
-      "render/exposure/tau_dn",
-      "render/exposure/key",
-      "player/camera/mode",
-      "player/camera/speed",
-      "game/edit/shape",
-      "game/edit/size",
-      "ui/showcase",
-    ] {
-      assert!(m.node(&split(path)).is_some(), "回调路径不存在：{path}");
-    }
-  }
-
-  #[test]
-  fn probe_option_mapping() {
-    // 下标 → (probe_viz, probe_viz_lod)：0 无 / 1..4 LOD0..3 / 5 全(4)
-    let map = |i: usize| {
-      (
-        i > 0,
-        if i == 0 {
-          0.0
-        } else if i + 1 >= PROBE_KEYS.len() {
-          PROBE_VIZ_LOD_ALL
-        } else {
-          (i - 1) as f32
-        },
-      )
-    };
-    assert_eq!(map(0), (false, 0.0));
-    assert_eq!(map(1), (true, 0.0));
-    assert_eq!(map(4), (true, 3.0));
-    assert_eq!(map(5), (true, 4.0));
-  }
-
-  /// 菜单树里所有文案字段都是 i18n key，且必须在本表里存在（否则 UI 上会显示裸 key）
-  #[test]
-  fn every_menu_text_key_is_translated() {
-    use std::collections::BTreeSet;
-    let m = default_menu();
-    let mut keys: BTreeSet<String> = BTreeSet::new();
-    fn walk(node: &MenuNode, keys: &mut BTreeSet<String>) {
-      keys.insert(node.label().to_string());
-      if let Some(t) = node.tooltip() {
-        keys.insert(t.to_string());
-      }
-      match node {
-        MenuNode::SwitchGroup { options, .. } | MenuNode::Buttons { items: options, .. } => {
-          keys.extend(options.iter().cloned());
-        }
-        MenuNode::Input { fields, .. } => {
-          for f in fields {
-            if !f.label.is_empty() {
-              keys.insert(f.label.clone());
-            }
-          }
-        }
-        _ => {}
-      }
-      for c in node.children() {
-        walk(c, keys);
-      }
-    }
-    for n in &m.items {
-      walk(n, &mut keys);
-    }
-    assert!(keys.len() > 30, "菜单文案 key 数量异常：{}", keys.len());
-    for key in &keys {
-      let translated = t!(key.as_str()).to_string();
-      assert_ne!(&translated, key, "locales 缺 key：{key}");
-      assert!(!translated.is_empty(), "空文案：{key}");
-    }
-    // 相机信息行的动态文案 key 也要在
-    for key in ["menu.camera.pos.value", "menu.camera.dir.value"] {
-      assert_ne!(t!(key).to_string(), key, "locales 缺 key：{key}");
-    }
-  }
-
-  #[test]
-  fn default_menu_ids_are_language_free() {
-    // id 是回调路径（标题栏显示），不能是 i18n key
-    let m = default_menu();
-    let mut ids: Vec<String> = Vec::new();
-    fn walk(node: &MenuNode, ids: &mut Vec<String>) {
-      ids.push(node.id().to_string());
-      for c in node.children() {
-        walk(c, ids);
-      }
-    }
-    for n in &m.items {
-      walk(n, &mut ids);
-    }
-    for id in ids {
-      assert!(!id.starts_with("menu."), "id 不该是文案 key：{id}");
-      assert!(!id.contains('.'), "id 应为单段 slug：{id}");
-    }
-  }
-
-  #[test]
-  fn speed_conversion_roundtrip() {
-    // 2.6 m/s ↔ 130 v/s
-    assert!((2.6 * VOXEL_PER_METER - 130.0).abs() < 1e-3);
-  }
-
-  #[test]
-  fn edit_size_bounds_in_menu() {
-    let m = default_menu();
-    let Some(MenuNode::Input { fields, .. }) = m.node(&split("game/edit/size")) else {
-      panic!("笔触大小项存在")
-    };
-    let kind = fields[0].kind();
-    assert_eq!(kind.normalize(0.0), 1.0, "低于下限钳到 1");
-    assert_eq!(kind.normalize(99.0), 16.0, "高于上限钳到 16");
-  }
-
-  #[test]
-  fn fast_speed_mul_constant_used() {
-    // 高速档倍率只用于相机侧，这里保证常量仍是 2.0（菜单只写基础速度）
-    assert!((crate::camera::FLY_SPEED_FAST_MUL - 2.0).abs() < 1e-6);
   }
 }

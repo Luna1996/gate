@@ -20,10 +20,3 @@ ron = { workspace = true }
 wgpu-profiler = { workspace = true, optional = true }
 # WESL 运行时编译（dda shader 拆包 → 编译回 WGSL 交给 Bevy 资产系统）
 wesl = { workspace = true }
-
-[dev-dependencies]
-# 集成测试（tests/p29_limits.rs）需要直接构造 TileGrid / 调用 fill_box
-glam = { workspace = true }
-gate-voxel = { workspace = true }
-# P3.1 WGSL 编译期校验（tests/wgsl_compile.rs）：shader 语法错误提前到 CI 抓
-naga = { workspace = true }
