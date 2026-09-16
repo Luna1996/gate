@@ -75,6 +75,19 @@ fn solid(palette: PaletteId) -> Option<PaletteId> {
   if palette.is_air() { None } else { Some(palette) }
 }
 
+/// brick **边长** → 层级（[`LEVEL_EXTENT`] 的下标）。非 brick 粒度即编程错误，直接 panic。
+///
+/// 编辑侧按边长思考（64³ 的整块填充），而树查询接口按 level 索引 —— 这里集中做一次映射，
+/// 免得每个调用方各写一遍 `position()`。
+#[inline]
+pub fn level_of_extent(extent: i32) -> u8 {
+  LEVEL_EXTENT
+    .iter()
+    .position(|&e| e == extent)
+    .unwrap_or_else(|| panic!("extent 必须是 brick 粒度 {LEVEL_EXTENT:?} 之一（got {extent}）"))
+    as u8
+}
+
 /// Douglas Brick Tree 1:1（分裂树，4³=64 分裂因子，u64 mask）
 #[derive(Debug, Clone)]
 pub struct ChunkTree {
@@ -544,8 +557,7 @@ impl ChunkTree {
     // 只读预检查：非零 palette 且 brick 已 uniform 同色 → noop
     //（palette=0 时 get_uniform 的 None 语义与「非 uniform」歧义，跳过预检查）
     if !palette.is_air() {
-      let level =
-        LEVEL_EXTENT.iter().position(|&e| e == extent).expect("LEVEL_EXTENT.contains 已保证") as u8;
+      let level = level_of_extent(extent);
       if self.get_uniform(local[0], local[1], local[2], level) == Some(palette) {
         return false;
       }

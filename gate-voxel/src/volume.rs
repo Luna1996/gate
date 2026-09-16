@@ -301,6 +301,12 @@ impl VolumeGrid {
     tree.get_brick_state(local.x, local.y, local.z, level)
   }
 
+  /// 按 brick **边长**查询三态（`extent` ∈ `LEVEL_EXTENT`，与 [`VolumeGrid::fill_brick`] 同一套粒度）。
+  /// 编辑侧的整块填充据此判断"这一块能不能一次写完"。
+  pub fn get_brick_state_extent(&self, voxel: IVec3, extent: i32) -> crate::chunk_tree::BrickState {
+    self.get_brick_state(VoxelCoord::from_ivec3(voxel), crate::chunk_tree::level_of_extent(extent))
+  }
+
   // =========================================================================
   // 体素编辑
   // =========================================================================

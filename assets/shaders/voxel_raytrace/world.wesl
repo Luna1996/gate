@@ -1,6 +1,6 @@
 import package::bindings::{g};
 import package::brickmap::{Grid, sample_brickmap};
-import package::trace::{UnifiedHit, make_grid, trace_grid};
+import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid};
 
 // 着色法线 = 逐体素（隐式）法线：命中体素 6 邻域占据差分的负梯度，退化时退回面法线。
 //
@@ -37,8 +37,11 @@ struct SceneHit {
 // 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
 // g0 = 主世界网格（由 world_raycast 入口提供，避免重复读 grid_descs）。
 fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
+  // 本函数只服务"正常模式"（penetrate=false）：介质穿透不经过它（见 [`world_trace_medium`]），
+  // 所以这里恒传一个关闭的介质上下文 —— 此时 trace_chunk 的行为与改造前逐位一致。
+  var mc_off = MediumRay(false, false, g0.palette_base, 0u, vec3<f32>(1.0));
   var best_t = 1e+30;
-  var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap), 0u);
+  var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap, &mc_off), 0u);
   if (best.uh.hit) {
     best_t = best.uh.t;
     best.palette_base = g0.palette_base;
@@ -46,7 +49,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
   let n = g.grid_count;
   for (var i: u32 = 1u; i < n; i = i + 1u) {
     let gi = make_grid(i);
-    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap);
+    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap, &mc_off);
     if (mhi.hit && mhi.t < best_t) {
       best_t = mhi.t;
       best.uh = mhi;
@@ -104,4 +107,23 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
   return WorldHit(
     s.uh.hit, s.uh.t, origin + dir * s.uh.t, s.uh.pal, s.uh.n,
     s.uh.face_id, s.uh.voxel, s.uh.obj_id, s.palette_base);
+}
+
+/// 介质穿透入口（模式 1/2）：在**指定 grid** 内把透射材质当作可穿过，一次走完整段介质。
+///
+/// 只在本 grid 内穿透 —— 介质属于某个 volume，不同 volume 之间不存在"介质连续"。
+/// 三种结局，由调用方「当前是否在介质内」区分：
+///   · 撞到不透明实体 → hit + 该实体（`medium_of(pal).a == 1`）
+///   · 走到介质段末端 → hit + **介质材质**（`a < 1`），此处的 t / n 即**出射面**
+///   · 一路走到底     → miss
+/// `tint`（in-out，乘性）沿途累积透射色，三种结局都可能已累积 —— 调用方乘进 throughput。
+/// `stop_on_air = false`（阴影射线）：不在出射面停下，一路吃到不透明遮挡或走到底。
+fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
+                      stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
+  var mc = MediumRay(true, stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
+  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, &mc);
+  *tint = *tint * mc.tint;
+  return WorldHit(
+    h.hit, h.t, origin + dir * h.t, h.pal, h.n,
+    h.face_id, h.voxel, h.obj_id, g.palette_base);
 }

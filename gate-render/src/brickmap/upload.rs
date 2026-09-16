@@ -179,6 +179,8 @@ pub struct BuilderMirror {
   pub pending_data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
   /// 与 `pending_data_chunks` 并行的编辑 AABB（见 [`MainPending::data_aabbs`]）
   pub pending_data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
+  /// 各 volume 调色板上一次同步时的写版本：用来判断"只改材质不改几何"是否也需要上传
+  pub palette_versions: Vec<u64>,
   pub pending_comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
 }
 
@@ -427,7 +429,17 @@ fn extract(
   let _pending_comp: Vec<(usize, gate_voxel::ChunkCoord)> =
     std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
-  let dirty_any = need_full || !pending_data.is_empty() || !_pending_comp.is_empty();
+  // 只改材质参数（菜单滑杆）时几何完全不脏，但调色板槽内容变了 ⇒ 也必须上传，
+  // 否则拖滑杆看不到任何变化。判据：调色板写版本 ≠ 本 mirror 上次同步的版本
+  // （见下方 snapshot 之后的回写）。
+  let palette_dirty = scene
+    .volumes
+    .list
+    .iter()
+    .enumerate()
+    .any(|(i, g)| mirror.palette_versions.get(i).copied() != Some(g.palette().version()));
+  let dirty_any =
+    need_full || !pending_data.is_empty() || !_pending_comp.is_empty() || palette_dirty;
 
   // ---- DDGI 脏区：本帧实际重建的 chunk（仅主世界 volume 0）的合并 AABB ----
   // 全量上传 → full（DDGI 整体重烘）；增量 → 改动 chunk 的包围盒，bake 只跑相交 cell。
@@ -495,7 +507,12 @@ fn extract(
       builder.update_chunk(volumes_ref, vol_idx, c);
     }
   }
+  // 材质参数改动（菜单滑杆）不产生几何脏 chunk，这里补一次调色板同步
+  // （版本门控：无变化时是空操作，不额外传字节）
+  builder.sync_palettes(volumes_ref);
   let snapshot = builder.snapshot();
+  // 回写已同步版本（下一帧据此判断"只改材质"是否还要再传）
+  mirror.palette_versions = scene.volumes.list.iter().map(|g| g.palette().version()).collect();
   // state/comp 只取主世界（物体侧暂无数据）
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();

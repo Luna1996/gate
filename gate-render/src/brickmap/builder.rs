@@ -402,6 +402,19 @@ impl VolumesBuilder {
   }
 
   /// 同步 volume 数量（新增 volume 时追加 builder）+ 更新变换
+  /// 逐 volume 同步调色板（版本门控；无变化时全部空操作）。
+  ///
+  /// 用途：菜单改材质参数（颜色/自发光/透明/光滑）时**几何完全不脏**，但调色板槽内容变了 ——
+  /// 若不在这里补一次同步，拖滑杆就看不到任何变化（调色板的同步点原本只有
+  /// [`BrickMapBuilder::update_chunk`]，而它只在几何脏 chunk 时被调用）。
+  pub fn sync_palettes(&mut self, volumes: &Volumes) {
+    for (i, grid) in volumes.all().iter().enumerate() {
+      if let Some(b) = self.builders.get_mut(i) {
+        b.write_palette(grid);
+      }
+    }
+  }
+
   pub fn sync(&mut self, volumes: &Volumes) {
     while self.builders.len() < volumes.all().len() {
       let idx = self.builders.len();

@@ -20,11 +20,13 @@ use gate_ui::{
   DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   WindowState,
   menu::{color, input, slider, sub_menu, switch_group, text, toggle},
-  spawn_debug_menu,
+  parse_hex_color, spawn_debug_menu,
 };
 
 use crate::camera::{CameraMode, FlyCamera};
-use crate::edit::{BrushShape, EDIT_SIZE_MAX, EDIT_SIZE_MIN, EditSettings};
+use crate::edit::{
+  BrushShape, EDIT_SIZE_MIN, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness,
+};
 use crate::showcase::ShowcaseRoot;
 
 /// 菜单 TOML 相对 assets 目录的路径（初值来源 + 退出时写回）
@@ -187,7 +189,8 @@ pub fn default_menu() -> MenuFile {
             input(
               "size",
               "menu.game.edit.size",
-              vec![InputField::number("", "3", 1.0, 16.0, 1.0, 0)],
+              // 无上限：max 取 f32::MAX（数字输入框仍按 min/step 归一，但不构成实际约束）
+              vec![InputField::number("", "3", 1.0, f32::MAX, 1.0, 0)],
             ),
             color("color", "menu.game.edit.color", "96989E"),
             slider("emissive", "menu.game.edit.emissive", 0.0, 0.0, 255.0, 1.0, 0, None),
@@ -360,6 +363,14 @@ fn apply_initial_state(world: &mut World) {
       _ => None,
     }
   };
+  // 颜色控件是独立节点类型（`color()` → `MenuNode::Color`），**不是** `Input`：
+  // 用 `get_text` 读它恒为 None → 启动时颜色初值丢失，必须手动改一次才生效。
+  let get_color = |path: &str| -> Option<String> {
+    match model.node(&split(path)) {
+      Some(MenuNode::Color { hex, .. }) => Some(hex.clone()),
+      _ => None,
+    }
+  };
 
   // 视频
   world.resource_mut::<FpsOverlayVisible>().0 = get_bool("video/fps", false);
@@ -432,7 +443,23 @@ fn apply_initial_state(world: &mut World) {
     if let Some(t) = get_text("game/edit/size")
       && let Ok(v) = t.trim().parse::<u32>()
     {
-      edit.size = v.clamp(EDIT_SIZE_MIN, EDIT_SIZE_MAX);
+      edit.size = v.max(EDIT_SIZE_MIN);
+    }
+    // 材质四参数（与菜单初值一一对应；hex 非法时保持 `BrushMaterial::default()`）。
+    // 这里只写「当前笔触材质」，不碰调色板：材质 → 槽的分配发生在落笔时（按内容去重）。
+    if let Some(t) = get_color("game/edit/color")
+      && let Some([r, g, b, _]) = parse_hex_color(&t)
+    {
+      edit.mat.color = [r, g, b];
+    }
+    if let Some(v) = get_val("game/edit/emissive") {
+      edit.mat.emissive = v.round().clamp(0.0, 255.0) as u8;
+    }
+    if let Some(v) = get_val("game/edit/alpha") {
+      edit.mat.transmission = opacity_pct_to_transmission(v);
+    }
+    if let Some(v) = get_val("game/edit/smooth") {
+      edit.mat.roughness = smooth_pct_to_roughness(v);
     }
   }
   info!(
@@ -545,6 +572,8 @@ fn register_callbacks(world: &mut World) {
   );
 
   // ---- 游戏（编辑）+ 界面 ----
+  // 四个材质控件只改**当前笔触材质**，不碰调色板：已放置的体素因此不会被改色；
+  // 材质 → 槽的分配发生在落笔时（`edit::material_slot`，按内容去重）。
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut edit: ResMut<EditSettings>,
@@ -556,21 +585,31 @@ fn register_callbacks(world: &mut World) {
         }
         ("game/edit/size", MenuAction::Text(t)) => {
           if let Ok(v) = t.trim().parse::<u32>() {
-            edit.size = v.clamp(EDIT_SIZE_MIN, EDIT_SIZE_MAX);
-            info!("笔触大小 → {} vx（跨度 {}）", edit.size, 2 * edit.size - 1);
+            edit.size = v.max(EDIT_SIZE_MIN);
+            // 跨度 = 2·size-1（size 无上限，saturating 防日志侧溢出）
+            let span = edit.size.saturating_mul(2).saturating_sub(1);
+            info!("笔触大小 → {} vx（跨度 {}）", edit.size, span);
           }
         }
-        ("game/edit/color", MenuAction::Text(t)) => {
-          info!(target: "gate", "笔触颜色 → {t}（UI 预留，功能未实现）");
-        }
+        ("game/edit/color", MenuAction::Text(t)) => match parse_hex_color(t) {
+          Some([r, g, b, _]) => {
+            edit.mat.color = [r, g, b];
+            info!(target: "gate", "笔触颜色 → {}", edit.mat.hex());
+          }
+          // 输入框是自由文本：半截输入（"96"、"#96"）解析失败就忽略，不打断输入
+          None => debug!(target: "gate", "笔触颜色输入未成形 → {t:?}（忽略）"),
+        },
         ("game/edit/emissive", MenuAction::Value(v)) => {
-          info!(target: "gate", "自发光 → {v:.0}（UI 预留，功能未实现）");
+          edit.mat.emissive = v.round().clamp(0.0, 255.0) as u8;
+          info!(target: "gate", "自发光 → {}", edit.mat.emissive);
         }
         ("game/edit/alpha", MenuAction::Value(v)) => {
-          info!(target: "gate", "透明度 → {v:.0}%（UI 预留，功能未实现）");
+          edit.mat.transmission = opacity_pct_to_transmission(*v);
+          info!(target: "gate", "透明度 → {v:.0}%（透射率 {}）", edit.mat.transmission);
         }
         ("game/edit/smooth", MenuAction::Value(v)) => {
-          info!(target: "gate", "光滑度 → {v:.0}%（UI 预留，功能未实现）");
+          edit.mat.roughness = smooth_pct_to_roughness(*v);
+          info!(target: "gate", "光滑度 → {v:.0}%（粗糙度 {}）", edit.mat.roughness);
         }
         ("ui/showcase", MenuAction::Toggle(on)) => {
           if let Ok(mut vis) = q_show.single_mut() {

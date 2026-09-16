@@ -92,6 +92,21 @@ fn palette_emissive(palette_base: u32, pal: u32) -> f32 {
   return f32(b_palette[palette_base + pal * 2u + 1u] & 0xFFu) / 255.0;
 }
 
+/// palette 条目的粗糙度（0 = 镜面 … 1 = 完全粗糙）= word0 **高字节**
+/// （与 `wire.rs::pack_palette_entry` 的 `roughness << 24` 同布局）。
+/// 着色侧用来定高光指数：粗糙度越小高光越窄越亮。
+fn palette_roughness(palette_base: u32, pal: u32) -> f32 {
+  return f32((b_palette[palette_base + pal * 2u] >> 24u) & 0xFFu) / 255.0;
+}
+
+/// palette 条目的透射率（0 = 不透明 … 1 = 全透）= word1 次字节
+/// （与 `wire.rs::pack_palette_entry` 的 `transmission << 8` 同布局）。
+/// 着色侧用来做**透射续行**：primary 射线按 tau 连乘衰减后穿过体素继续走，
+/// 太阳阴影射线同样按 tau 连乘（玻璃背后仍有直射光）。
+fn palette_transmission(palette_base: u32, pal: u32) -> f32 {
+  return f32((b_palette[palette_base + pal * 2u + 1u] >> 8u) & 0xFFu) / 255.0;
+}
+
 // 天空纯色（miss 像素与探针射线 miss 端点共用；Minecraft 白天平原 #78A7FF）。
 // 输入为 sRGB，返回 linear（光照全程 linear，输出经 linear_to_srgb 还原）。
 fn sky_rgb() -> vec3<f32> {

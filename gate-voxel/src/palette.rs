@@ -21,6 +21,12 @@ pub const PALETTE_BITS: u32 = 16;
 /// 最大合法索引
 pub const PALETTE_INDEX_MAX: u16 = (PALETTE_ENTRY_COUNT - 1) as u16;
 
+/// 槽占用位图的字数（每字 64 槽）
+const OCCUPIED_WORDS: usize = PALETTE_ENTRY_COUNT / 64;
+
+// 位图必须刚好覆盖全部槽
+const _: () = assert!(OCCUPIED_WORDS * 64 == PALETTE_ENTRY_COUNT);
+
 // 容量与位宽必须是同一个数（编译期校验，避免两处常量漂移）
 const _: () = assert!(PALETTE_ENTRY_COUNT == 1usize << PALETTE_BITS);
 const _: () = assert!(PALETTE_ENTRY_COUNT == PALETTE_INDEX_MAX as usize + 1);
@@ -103,8 +109,9 @@ impl From<PaletteId> for usize {
 /// 体积对齐：3B color + 1B roughness + 1B emissive + 1B transmission + 1B flags = 7B，
 /// 补 1B padding = 8B/条目，65536 条 = 512KB（可直接进 GPU buffer）。
 ///
-/// GPU 侧当前只解包 `color` 与 `emissive`；`roughness`/`transmission`/`flags` 已随
-/// 条目上传但尚无消费方，留给后续材质扩展（见 `wire.rs::pack_palette_entry`）。
+/// GPU 侧解包：`color`（albedo）、`emissive`（自发光，直出 + GI 注入）、
+/// `roughness`（高光指数）、`transmission`（透射续行 + 太阳光透射）；`flags` 尚无消费方，
+/// 留给后续材质扩展（见 `wire.rs::pack_palette_entry` 与 `common.wesl` 的 `palette_*` 解包）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct PaletteEntry {
@@ -156,6 +163,13 @@ impl PaletteFlags {
 /// 只发生在"新材质首次使用"这类低频路径，开销可忽略。
 pub struct Palette {
   entries: Box<[PaletteEntry; PALETTE_ENTRY_COUNT]>,
+  /// 槽占用位图（bit=1 → 该槽被 [`Palette::set`] 写过），8KB。
+  ///
+  /// **不能拿「条目内容全零」当空槽判据**：编辑笔触完全可以产生一个恰好等于
+  /// [`PaletteEntry::default`] 的材质（纯黑 + 不发光 + 不透明 + 粗糙度 0），
+  /// 那样它既会被当成空槽被别人覆盖，又会让"按内容去重"误匹配到从未使用的槽。
+  /// 占用与否是**状态**，与内容无关，故单独记。
+  used: Box<[u64; OCCUPIED_WORDS]>,
   /// 脏槽闭区间（含两端）；None = 自上次取走以来无变化
   dirty: Mutex<Option<(u16, u16)>>,
   /// 写版本：每次 `set` 自增。消费者记住自己同步过的版本，用来判断是否需要同步
@@ -170,6 +184,7 @@ impl Clone for Palette {
   fn clone(&self) -> Self {
     Self {
       entries: self.entries.clone(),
+      used: self.used.clone(),
       dirty: Mutex::new(Some((0, PALETTE_INDEX_MAX))),
       version: AtomicU64::new(0),
     }
@@ -206,6 +221,7 @@ impl Palette {
   pub fn new() -> Self {
     Self {
       entries: Box::new([PaletteEntry::default(); PALETTE_ENTRY_COUNT]),
+      used: Box::new([0u64; OCCUPIED_WORDS]),
       dirty: Mutex::new(Some((0, PALETTE_INDEX_MAX))),
       version: AtomicU64::new(1),
     }
@@ -220,6 +236,7 @@ impl Palette {
   pub fn set(&mut self, idx: PaletteId, entry: PaletteEntry) {
     assert!(!idx.is_air(), "index 0 is reserved for air");
     self.entries[idx.0 as usize] = entry;
+    self.used[idx.0 as usize / 64] |= 1u64 << (idx.0 % 64);
     self.mark_dirty(idx.0);
     self.version.fetch_add(1, Ordering::Release);
   }
@@ -251,9 +268,15 @@ impl Palette {
     idx.is_air()
   }
 
-  /// 条目全零判据：空槽（编辑材质的槽位分配据此认领）
+  /// 该槽是否已被写过（占用位图；与条目内容无关）
+  #[inline]
+  pub fn occupied(&self, idx: PaletteId) -> bool {
+    !idx.is_air() && (self.used[idx.0 as usize / 64] >> (idx.0 % 64)) & 1 == 1
+  }
+
+  /// 空槽判据：从未被 [`Palette::set`] 写过 —— 新材质认领槽位据此挑选
   #[inline]
   pub fn is_empty_slot(&self, idx: PaletteId) -> bool {
-    !idx.is_air() && self.entries[idx.0 as usize] == PaletteEntry::default()
+    !self.occupied(idx)
   }
 }
