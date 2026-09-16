@@ -81,26 +81,123 @@ const GLASS_REFL_AMBIENT: f32 = 0.15;
 /// `self_voxel`/`self_obj`：起点贴在命中面外侧，斜向可能出现 t≈0 自命中，豁免之
 /// （与旧版 select 里的自命中防护同义）。
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
-  var tint = vec3<f32>(1.0);
-  let sh = world_trace_medium(make_grid(0u), origin, sun_dir, 8192.0, false, &tint);
-  let through = (tint.r + tint.g + tint.b) / 3.0;   // 只透介质 → 用透射色的平均亮度作标量衰减
-  if (!sh.hit) { return through; }
+  // **先用普通模式取第一个命中**：阴影射线是长距离射线（8192），而穿透模式下**每个 chunk
+  // 步进**都要去读介质状态 —— 绝大多数场景根本没有玻璃，那是纯浪费。只有第一段就撞上玻璃
+  // 时才切到穿透模式（[`world_trace_medium`]）走完整段并累积透射色。
+  let sh = world_raycast(make_grid(0u), origin, sun_dir, 8192.0, world_cfg_full(0.0, 3u));
+  if (!sh.hit) { return 1.0; }
   if (all(sh.voxel == self_voxel) && sh.obj_id == self_obj) { return 1.0; }
   if (medium_of(sh.palette_base, sh.pal).a >= 1.0) { return 0.0; }   // 不透明实体遮挡
+  // 第一段就是玻璃 → 穿透走完（含自命中豁免）
+  var tint = vec3<f32>(1.0);
+  let h = world_trace_medium(make_grid(0u), origin, sun_dir, 8192.0, false, &tint);
+  let through = (tint.r + tint.g + tint.b) / 3.0;   // 只透介质 → 透射色平均亮度作标量衰减
+  if (!h.hit) { return through; }
+  if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return 1.0; }
+  if (medium_of(h.palette_base, h.pal).a >= 1.0) { return 0.0; }
   return through;
 }
 
-/// 主射线"当前段"求交：在介质内用穿透（一路走到出射面或撞上不透明实体），
-/// 在空气侧用正常模式（找入射面 / 实体）。
-///
-/// 做成函数而不是 `var best: WorldHit; if/else 赋值`：后者要**零初始化**一个 9 字段结构体，
-/// 还可能被编译器放进 local memory —— 而 body 里要读它十几次。
-fn trace_primary(in_medium: bool, org: vec3<f32>, dir: vec3<f32>, t_min: f32, max_t: f32,
-                 tint: ptr<function, vec3<f32>>) -> WorldHit {
-  if (in_medium) {
-    return world_trace_medium(make_grid(0u), org, dir, max_t, true, tint);
+// ============================================================================
+// 玻璃（介质）状态机 —— **独立函数**
+// ============================================================================
+//
+// 为什么必须独立成函数：状态机要维护 6 个跨轮存活的变量（org / dir / t_start / in_medium /
+// tint / refl）。它们若与着色代码同处 `dda_main` 的函数体，寄存器分配会把两边的活跃区间
+// 叠加 —— 而**不透明像素占绝大多数、根本不进这条路径**。实测：仅把状态机内联在 `dda_main`
+// 里，帧率就从 150 掉到 100 以下，而逻辑上只多了几条指令（瓶颈是 occupancy，不是指令数）。
+// 放进独立函数、并把调用点收进"第一次命中就是介质"的分支后，不透明像素的活变量集合
+// 回到透明功能之前。
+//
+// 每轮处理一个**界面事件**：
+//   · 空气侧命中可穿透介质 → 入射面：Fresnel 分出反射（追一条）与折射（进入介质）
+//   · 介质内命中可穿透介质 → 出射面：折射回空气；全内反射时只改方向、仍在介质内
+//   · 命中不透明实体       → 返回它，交给调用方着色
+// 介质**段内的推进**在 DDA 里一次性完成（[`world_trace_medium`]），不逐格重跑 trace。
+
+/// 状态机产物：最终命中的（不透明）表面 / 沿途累积的透射色 / 累积的反射项 /
+/// 最终那段射线的方向（着色算高光半程向量要用**当前**方向，折射后已不是初始方向）。
+struct GlassOut {
+  ray: WorldHit,
+  tint: vec3<f32>,
+  refl: vec3<f32>,
+  dir: vec3<f32>,
+}
+
+/// 见上方状态机说明。`t_min` 是 beam 预 pass 给出的保守起点，只对第一段有效。
+fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t: f32,
+               sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>) -> GlassOut {
+  var org = origin_voxel;
+  var dir = dir_voxel;
+  var t_start = t_min;
+  var in_medium = false;
+  var tint = vec3<f32>(1.0);   // 沿途透射色（乘性累积）
+  var refl = vec3<f32>(0.0);   // 界面反射项（已按当时的 tint 加权）
+  for (var bounce = 0u; bounce < GLASS_MAX_BOUNCE; bounce = bounce + 1u) {
+    // 本段的透射色（乘性）：穿透模式下由 DDA 累积；正常模式恒为 1
+    var seg = vec3<f32>(1.0);
+    var best: WorldHit;
+    if (in_medium) {
+      // 介质内：一次走完整段（stop_on_air=true ⇒ 停在出射面，或撞上不透明实体）
+      best = world_trace_medium(make_grid(0u), org, dir, max_t, true, &seg);
+    } else {
+      best = world_raycast(make_grid(0u), org, dir, max_t, world_cfg_full(t_start, 3u));
+    }
+    tint = tint * seg;
+    // 一路走到底 → 剩余 tint 由调用方乘到天空上
+    if (!best.hit) { return GlassOut(best, tint, refl, dir); }
+    let m = medium_of(best.palette_base, best.pal);
+    if (m.a >= 1.0) { return GlassOut(best, tint, refl, dir); }   // 不透明实体 → 调用方着色
+    // ---- 玻璃界面 ----
+    let p_hit = org + dir * best.t;
+    let nn = best.n;                           // 世界空间外向面法线
+    let ci = clamp(dot(-dir, nn), 0.0, 1.0);   // 入射余弦
+    if (!in_medium) {
+      // 入射面：Fresnel 分反射/折射
+      let fres = GLASS_F0 + (1.0 - GLASS_F0) * pow(1.0 - ci, 5.0);
+      if (fres > GLASS_REFL_MIN) {
+        // 反射项：只追一条、且反射射线不穿透（遇到玻璃按普通命中处理）→ 每像素至多多一次 trace
+        let rdir = reflect(dir, nn);
+        let rhit = world_raycast(make_grid(0u), p_hit + nn * GLASS_EPS, rdir,
+                                 max_t, world_cfg_full(0.0, 3u));
+        var rc = sky_rgb();
+        if (rhit.hit) {
+          rc = palette_albedo(rhit.palette_base, rhit.pal)
+            * (sun_c * max(dot(rhit.n, sun_dir), 0.0) + sky * GLASS_REFL_AMBIENT);
+        }
+        refl = refl + tint * fres * rc;
+      }
+      // 折射进介质（空气 → 玻璃在物理上不会全反射，k 恒 > 0）
+      let eta = 1.0 / GLASS_IOR;
+      let k = 1.0 - eta * eta * (1.0 - ci * ci);
+      dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
+      in_medium = true;
+    } else {
+      // 出射面：介质 → 空气；k < 0 = 全内反射（没有折射光，方向变但仍在介质内）
+      let eta = GLASS_IOR;
+      let k = 1.0 - eta * eta * (1.0 - ci * ci);
+      if (k < 0.0) {
+        dir = reflect(dir, nn);
+      } else {
+        dir = normalize(eta * dir + (eta * ci - sqrt(k)) * nn);
+        in_medium = false;
+      }
+    }
+    org = p_hit + dir * GLASS_EPS;
+    t_start = 0.0;   // 折射后方向已变 ⇒ beam 预 pass 的 t_min 失效，必须清零
   }
-  return world_raycast(make_grid(0u), org, dir, max_t, world_cfg_full(t_min, 3u));
+  // 界面次数用尽：当作没命中（剩余 tint 落到天空），不做无界追踪
+  return GlassOut(WorldHit(false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), 0, 0u),
+                  tint, refl, dir);
+}
+
+/// 自动曝光 + 编码输出（天空 / 不透明 / 玻璃三条路径共用，避免把这段重复三遍）。
+/// 曝光系数必须在 sRGB 编码**之前**乘 —— 暗场提亮才能用上全部 8bit 动态范围
+/// （编码之后乘会把暗部的量化台阶放大成色带）。
+fn write_output(coord: vec2<i32>, col: vec3<f32>) {
+  let exposure = bitcast<f32>(eye_adapt_ro[0u]);
+  let exposed = col * select(1.0, exposure, exposure > 0.0);
+  textureStore(out_tex, coord, vec4<f32>(linear_to_srgb(exposed), 1.0));
 }
 
 // ============================================================================
@@ -161,77 +258,30 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 不回退会把起点推过真实命中（薄壁/剪影穿墙）。见 BEAM_BACKOFF。
     t_min = max(t_min - BEAM_BACKOFF, 0.0);
   }
-  // ---- 玻璃（介质）状态机：入射 Fresnel(反射+折射) / 出射折射(+全内反射) / 沿途吸收 ----
-  //
-  // 有序光追里"透明"的正确形式是**沿射线的透射率累乘**，关键在**事件粒度**：一个连续的、
-  // 同材质的透明区域只算**一次**事件（Douglas 的 absorptive 语义）。若逐体素衰减，一块
-  // 62cm 厚、每格吸收 70% 的介质会黑成一片 —— 与"透明度 70%"的直觉完全不符（那正是旧版的错）。
-  //
-  // 每轮处理一个**界面事件**：
-  //   · 空气侧命中可穿透介质 → 入射面：Fresnel 分出反射（追一条）与折射（进入介质）
-  //   · 介质内命中可穿透介质 → 出射面：折射回空气；全内反射时只改方向、仍在介质内
-  //   · 命中不透明实体       → 完整着色后收工
-  // 介质**段内的推进**在 DDA 里一次性完成（[`world_trace_medium`]），不逐格重跑 trace。
-  // 不透明内容（绝大多数）恒为 1 轮：首轮 m.a == 1 → 着色后收工，与改造前逐位一致。
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sky = light_u.sky_color.xyz;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-  var acc = vec3<f32>(0.0);
-  var throughput = vec3<f32>(1.0);
-  var org = origin_voxel;
-  var dir = dir_voxel;
-  var t_start = t_min;
-  var in_medium = false;
-  for (var bounce = 0u; bounce < GLASS_MAX_BOUNCE; bounce = bounce + 1u) {
-    // 沿途透射色（乘性）：穿透模式下由 DDA 累积；正常模式恒为 1
-    var tint = vec3<f32>(1.0);
-    let best = trace_primary(in_medium, org, dir, t_start, frustum_length, &tint);
-    throughput = throughput * tint;
-    // 一路走到底：剩余 throughput 落到天空（循环后的 throughput·sky_rgb）
-    if (!best.hit) { break; }
-    let m = medium_of(best.palette_base, best.pal);
-    if (m.a < 1.0) {
-      // ---- 玻璃界面 ----
-      let p_hit = org + dir * best.t;
-      let nn = best.n;                        // 世界空间外向面法线
-      let ci = clamp(dot(-dir, nn), 0.0, 1.0); // 入射余弦
-      if (!in_medium) {
-        // 入射面：Fresnel 分反射/折射
-        let fres = GLASS_F0 + (1.0 - GLASS_F0) * pow(1.0 - ci, 5.0);
-        if (fres > GLASS_REFL_MIN) {
-          // 反射项：只追一条、且反射射线不穿透（遇到玻璃按普通命中处理）→ 每像素至多多一次 trace
-          let rdir = reflect(dir, nn);
-          let rhit = world_raycast(make_grid(0u), p_hit + nn * GLASS_EPS, rdir,
-                                   frustum_length, world_cfg_full(0.0, 3u));
-          var rc = sky_rgb();
-          if (rhit.hit) {
-            rc = palette_albedo(rhit.palette_base, rhit.pal)
-              * (sun_c * max(dot(rhit.n, sun_dir), 0.0) + sky * GLASS_REFL_AMBIENT);
-          }
-          acc = acc + throughput * fres * rc;
-        }
-        // 折射进介质（空气 → 玻璃在物理上不会全反射，k 恒 > 0）
-        let eta = 1.0 / GLASS_IOR;
-        let k = 1.0 - eta * eta * (1.0 - ci * ci);
-        dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
-        in_medium = true;
-      } else {
-        // 出射面：介质 → 空气；k < 0 = 全内反射（没有折射光，方向变但仍在介质内）
-        let eta = GLASS_IOR;
-        let k = 1.0 - eta * eta * (1.0 - ci * ci);
-        if (k < 0.0) {
-          dir = reflect(dir, nn);
-        } else {
-          dir = normalize(eta * dir + (eta * ci - sqrt(k)) * nn);
-          in_medium = false;
-        }
-      }
-      org = p_hit + dir * GLASS_EPS;
-      t_start = 0.0;   // 折射后方向已变 ⇒ beam 预 pass 的 t_min 失效，必须清零
-      continue;
-    }
-    // 本段表面亮度写入下面着色段的 col
-    var col = vec3<f32>(0.0);
+  // ---- 第一条射线 ----
+  // 不透明表面（绝大多数像素）走**短路径**：一次 trace + 着色，不进入玻璃状态机 ——
+  // 状态机那 6 个跨轮变量因此不参与不透明像素的寄存器分配（见 [`trace_glass`]）。
+  let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
+                            world_cfg_full(t_min, 3u));
+  var best = first;
+  var dir = dir_voxel;           // 最终照到表面的射线方向（穿过玻璃时已被折射）
+  var through = vec3<f32>(1.0);  // 沿途累积的透射色（无玻璃时恒为 1）
+  var refl = vec3<f32>(0.0);     // 玻璃界面的反射项
+  if (first.hit && medium_of(first.palette_base, first.pal).a < 1.0) {
+    // 第一次命中就是可穿透介质 → 交给状态机推进到"最终的不透明命中 / 走到底"
+    let g = trace_glass(origin_voxel, dir_voxel, t_min, frustum_length, sun_dir, sky, sun_c);
+    best = g.ray;
+    dir = g.dir;
+    through = g.tint;
+    refl = g.refl;
+  }
+  // ---- 着色：天空 / 不透明表面 ----
+  var col = sky_rgb() * through + refl;
+  if (best.hit) {
+    col = vec3<f32>(0.0);
     // ---- 逐体素着色 + 逐体素法线 ----
     // albedo/采样点/阴影射线按命中体素锚定（同体素同色）；法线取隐式逐体素法线（退化退面法线，
     // 见 voxel_normal）—— 它同时决定太阳 N·L、阴影射线/GI 采样点的外推方向、DDGI 方向采样。
@@ -359,18 +409,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
       }
     }
-    // 不透明实体：完整着色后收工（throughput 归零 ⇒ 天空项不再贡献）
-    acc = acc + throughput * col;
-    throughput = vec3<f32>(0.0);
-    break;
+    // 不透明实体：表面亮度按沿途透射色衰减、叠上玻璃界面反射项后收工
+    col = col * through + refl;
   }
-  // 未被不透明体素截断的剩余穿射率落到天空（未命中即 throughput 保持 1 → 纯天空，同旧版）
-  let col = acc + throughput * sky_rgb();
-  // 自动曝光：曝光系数在 sRGB 编码之前乘 —— 暗场提亮才能用上全部 8bit 动态范围
-  // （编码之后乘会把暗部的量化台阶放大成色带）。
-  let exposure = bitcast<f32>(eye_adapt_ro[0u]);
-  let exposed = col * select(1.0, exposure, exposure > 0.0);
-  textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(exposed), 1.0));
+  write_output(coord0, col);
 }
 
 

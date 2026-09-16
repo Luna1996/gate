@@ -1,6 +1,6 @@
 import package::bindings::{b_leaves, b_palette, b_struct, g, grid_descs, view_u};
 import package::brickmap::{Grid};
-import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, NODE_FIXED_WORDS, face_normal_from_index, palette_transmission, srgb_to_linear};
+import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, NODE_FIXED_WORDS, face_normal_from_index, palette_transmission};
 
 // 层级命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
 //   pre-check 命中（射线起点在固体 leaf 内，相机在体内 UB）时 face_id 由调用方用
@@ -59,7 +59,9 @@ fn medium_of(palette_base: u32, pal: u32) -> vec4<f32> {
   let w0 = b_palette[palette_base + pal * 2u];
   let srgb = vec3<f32>(f32(w0 & 0xFFu), f32((w0 >> 8u) & 0xFFu), f32((w0 >> 16u) & 0xFFu)) / 255.0;
   let a = 1.0 - f32((b_palette[palette_base + pal * 2u + 1u] >> 8u) & 0xFFu) / 255.0;
-  return vec4<f32>(mix(vec3<f32>(1.0), srgb_to_linear(srgb), a), a);
+  // gamma 2.0 近似（x²）代替精确 sRGB→linear：它只是**乘性染色**，而本函数会被内联进
+  // `trace_chunk` 的热路径多处 —— 精确转换（3×pow + 3×select）在这里不值得。
+  return vec4<f32>(mix(vec3<f32>(1.0), srgb * srgb, a), a);
 }
 
 /// 介质穿透：`pal` 是可穿透介质 → 累积透射色（**同一段只染一次**）并返回 true
@@ -88,12 +90,32 @@ fn medium_exit(mc: ptr<function, MediumRay>) -> bool {
 // depth_cap（beam 保守模式）：gate 深度 d=(3-level) 的分裂子块且 d>=depth_cap 时返回子块入口 t
 //   （保守下界）；主/阴影 pass depth_cap=3 恒不触发（d<=2）。
 // split 子节点一律下钻；uniform 子节点由 c_mask==0 快路径以精确 palette 早停。
-// penetrate：是否启用介质穿透（**按值参数**，见 [`MediumRay`]）。false 时本函数一次都不碰 mc，
-// 行为与改造前逐位一致 —— 不透明路径不为透明功能付任何代价。
-fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
-               ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
-               t0: f32, t1: f32, entry_face: u32, depth_cap: u32,
-               penetrate: bool, mc: ptr<function, MediumRay>) -> VoxelHit {
+// ============================================================================
+// trace_chunk 的两份特化（shader 界常见的"用代码量换性能"）
+// ============================================================================
+//
+// **为什么不合并成一个带 `penetrate: bool` 参数的函数**：实测过 —— 只要介质代码存在于这个
+// 函数体里，即便 `penetrate` 全程为 `false`、一次都不执行，编译器也无法常量折叠它，介质分支
+// 的寄存器与代码体积照付。实测把 `penetrate` 换成字面量 `false`（介质代码仍在、逻辑上全短路）
+// 帧率就从 85~120 回到 130~150。这就是"最热函数里多 2 个栈变量、多 7 条表达式"的代价。
+//
+// WESL 没有可用的编译期特化：`generics` 对标量参数是 `todo!("literal generics")`（只能用于
+// 类型参数）；`@if` 只能按模块级常量裁剪，做不到"同一个 pass 里两条特化并存"。故手写两份 ——
+// 两者仅差 **2 处出口判定**，其余 200 行逐字相同。
+//
+//   · [`trace_chunk_opaque`]：不透明路径（主射线 / 阴影 / DDGI cast / beam）—— 与引入介质
+//     之前逐位一致，参数最少、无任何介质痕迹；
+//   · [`trace_chunk`]：穿透路径（[`world_trace_medium`]）—— 把可穿透介质当空气越过并累积透射色。
+
+// 单 chunk 内层级遍历（**不透明版**）。chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 voxel）。
+// 射线段 [t0, t1] 与返回的 t 均为 ro 系绝对 t；entry_face = 进入本 chunk 的面（首 chunk 由
+// 调用方用 normalize(-rd) 兜底，后续 chunk 为跨 chunk 面）；走出 chunk 未命中 → hit=false。
+// depth_cap（beam 保守模式）：gate 深度 d=(3-level) 的分裂子块且 d>=depth_cap 时返回子块入口 t
+//   （保守下界）；主/阴影 pass depth_cap=3 恒不触发（d<=2）。
+// split 子节点一律下钻；uniform 子节点由 c_mask==0 快路径以精确 palette 早停。
+fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
+                      ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
+                      t0: f32, t1: f32, entry_face: u32, depth_cap: u32) -> VoxelHit {
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
   if (t0 >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
   // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
@@ -143,33 +165,15 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         if ((b.mask & (u64(1) << idx)) != u64(0)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           let leaf_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
-          if (leaf_pal != 0u) {
-            // 介质 → 累积透射色后按空气继续（**与出射判定无关**）；不透明 → 实体命中
-            if (penetrate && pass_through_medium(mc, leaf_pal)) { break; }
-            return VoxelHit(true, cur_t, leaf_pal, face, v);
-          }
+          if (leaf_pal != 0u) { return VoxelHit(true, cur_t, leaf_pal, face, v); }
         }
-        // 真空气 leaf：介质段内撞到空气 ⇒ 这里就是出射面
-        if (penetrate) {
-          if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
-          (*mc).last_pal = 0u;
-        }
-        break;
+        break; // 空气 leaf
       }
       let bit = u64(1) << idx;
       if ((b.mask & bit) == u64(0)) {
-        // 统一子块：颜色 = 节点 palette（0=空气）。介质当空气跨过 ——
-        // 这里正是"整块玻璃 O(1) 跨过"的收益点（同材质的大块在树里就是一个 uniform 节点）。
-        if (b.pal != 0u) {
-          if (penetrate && pass_through_medium(mc, b.pal)) { break; }
-          return VoxelHit(true, cur_t, b.pal, face, v);
-        }
-        // 真空气统一子块 ⇒ 出射面
-        if (penetrate) {
-          if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
-          (*mc).last_pal = 0u;
-        }
-        break;
+        // 统一子块：颜色 = 节点 palette（0=空气）
+        if (b.pal != 0u) { return VoxelHit(true, cur_t, b.pal, face, v); }
+        break; // 空气统一子块
       }
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
       let gd = 3u - level;
@@ -186,14 +190,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       // 统一子节点快路径：wire 任意层的分裂位都可能指向 3 字统一节点（mask=0，pal 直决；
       // 叶层统一节点无 inline 16 字，禁读 addr+3 之后）
       if (c_mask == u64(0)) {
-        if (c_pal != 0u) {
-          if (penetrate && pass_through_medium(mc, c_pal)) { break; }
-          return VoxelHit(true, cur_t, c_pal, face, v);
-        }
-        if (penetrate) {
-          if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
-          (*mc).last_pal = 0u;
-        }
+        if (c_pal != 0u) { return VoxelHit(true, cur_t, c_pal, face, v); }
         break;
       }
       level = level - 1u;
@@ -260,28 +257,230 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           let dp = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
-          if (dp != 0u) {
-            if (penetrate && pass_through_medium(mc, dp)) { continue; } // 介质：继续步进
-            return VoxelHit(true, cur_t, dp, face, v);
-          }
+          if (dp != 0u) { return VoxelHit(true, cur_t, dp, face, v); }
         } else if (b.mask == u64(0) && b.pal != 0u) {
           // 防御：uniform 叶（正常下钻快路径已处理）
-          if (penetrate && pass_through_medium(mc, b.pal)) { continue; }
           return VoxelHit(true, cur_t, b.pal, face, v);
         }
       } else {
         let mb = (b.mask & (u64(1) << idx)) != u64(0);
         if (mb) { break; } // 分裂子块 → 回 traverse 下钻
-        if (b.pal != 0u) { // 统一实体
-          if (penetrate && pass_through_medium(mc, b.pal)) { continue; }
-          return VoxelHit(true, cur_t, b.pal, face, v);
+        if (b.pal != 0u) { return VoxelHit(true, cur_t, b.pal, face, v); } // 统一实体
+      }
+      // 空气子块 → 回 loop 顶重选 mn 轴继续
+    }
+    if (changed) {
+      level = level + 1u;
+      if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
+    }
+    // ---- firstTrailingBit 层级自适应跨级跳（Douglas march 尾部）----
+    // 步进轴新坐标的尾随零位 = 对齐 run 长度：正向 comp=对齐基址（tz 直接读），
+    // 负向 comp=区域尾址（基址|~mask，+1 后读 tz）。tz>>1 = 可跨步的最粗 level。
+    let positive = sign_v[step_axis] >= 0;
+    let cur_log2 = level * 2u;
+    let m: u32 = 0xFFFFFFFFu << cur_log2;
+    let not_m = ~m;                              // = (1<<cur_log2)-1，复用于 region_max
+    let vmin_u = u32(v[step_axis]); // i32→u32 位环绕（负值公式自然处理）
+    var comp: u32;
+    if (positive) { comp = vmin_u & m; } else { comp = (vmin_u & m) | not_m; }
+    let tz_i = firstTrailingBit(comp + select(1u, 0u, positive)); // 0 → -1
+    var new_level: u32 = 0xFFFFFFFFu;
+    if (tz_i >= 0) { new_level = u32(tz_i) >> 1u; }
+    level = max(level, new_level);
+    if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); } // 跨出 chunk（tz≥8）
+    // 对齐快照：v 钳到 cur_t 射线点所在的当前 level 区域，步进轴取精确边界整数
+    // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
+    let mi = i32(m);
+    let base = v & vec3<i32>(mi);
+    let p = ro_c + rd * cur_t;
+    let region_max = base + vec3<i32>(i32(not_m));
+    v = clamp(vec3<i32>(floor(p)), base, region_max);
+    v[step_axis] = i32(comp);
+  }
+  return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0));
+}
+
+// 单 chunk 内层级遍历（**介质穿透版**）。调用点恒传字面量穿透语义，故不再有 `penetrate` 开关。
+// 命中 / 穿透 / 出射面判定只在两处 **唯一出口** 做（理由见 [`MediumRay`]：分支里重复判定会被
+// naga 提升成函数级变量，即 GPU 上的 local memory / 栈）。
+// mc：介质穿透上下文（见 [`MediumRay`]）。
+fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
+               ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
+               t0: f32, t1: f32, entry_face: u32, depth_cap: u32,
+               mc: ptr<function, MediumRay>) -> VoxelHit {
+  // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
+  if (t0 >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
+  // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
+  let ro_c = ro - chunk_min;
+  // side 距离/步长增量改用乘法（每外层省 3 个 fdiv）
+  let inv_rd = 1.0 / rd;
+  // 循环不变量预计算（sign_v / rd 在整个 trace_chunk 内不变）
+  let abs_inv_rd = abs(inv_rd);                  // 每轮复用，省 abs()
+  let axis_on = abs(rd) > vec3<f32>(1e-30);      // 该轴是否可步进（rd 分量为 0 时禁用）
+  let oct = select(0u, 1u, sign_v.x >= 0)        // 方向八分体索引（b_leaves 查表用）
+    | (select(0u, 1u, sign_v.y >= 0) << 1u)
+    | (select(0u, 1u, sign_v.z >= 0) << 2u);
+  let dir_side = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0)); // 边界基址偏移
+  let face_base = vec3<u32>(                     // 每轴两个面的 face id 基（0/1、2/3、4/5）
+    select(1u, 0u, sign_v.x >= 0),
+    select(1u, 0u, sign_v.y >= 0),
+    select(1u, 0u, sign_v.z >= 0));
+  var bricks: array<Brick, 4u>;
+  let r_ml = b_struct[chunk_base];
+  let r_mh = b_struct[chunk_base + 1u];
+  let r_pal = b_struct[chunk_base + 2u] & 0xFFFFu;  // 节点字低 16 位 = uniform 色（16 位材质索引）
+  bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal);
+  var level: u32 = 3u;
+  // 当前体素（chunk 局部 voxel 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
+  let p0 = ro_c + rd * t0;
+  var v = clamp(vec3<i32>(floor(p0)), vec3<i32>(0), vec3<i32>(255));
+  var cur_t = t0;
+  var face = entry_face;
+  // 防挂死安全网：迭代上限（真实场景每 chunk 仅几十~几百次）
+  var budget: u32 = 65536u;
+  let lut_disable = view_u.lod.w > 0.5;
+  loop {
+    if (budget == 0u) { break; }
+    budget = budget - 1u;
+    if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
+    // ---- traverse：从当前 level 下钻到 v 处内容（Douglas traverse_bit_set）----
+    // 命中只**记录** pal，不在分支里 return：介质穿透与出射面判定统一放在 traverse 之后的
+    // **唯一出口**做一次。原因见 [`MediumRay`]：判定若在各分支里重复，naga 无法把中间值留在
+    // SSA 里，会把它们提升成函数级变量（GPU 上是 local memory / 栈）—— 实测最热函数
+    // `trace_chunk` 的 local 变量会从 16 涨到 22，帧率掉三分之一。
+    // `hit_pal` 同时服务于下方步进循环（那里只重置、不重复声明），两处共用一个栈槽。
+    var hit_pal = 0u;
+    loop {
+      let b = bricks[level];
+      // WGSL 移位 RHS 必须 u32
+      let sh = vec3<u32>(level * 2u);
+      let cell = vec3<i32>(v >> sh) & vec3<i32>(3); // &3 恒为 0..3
+      let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
+      if (level == 0u) {
+        // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
+        // bit=0 空气体素零 load（mask 在手）。
+        // 每字 2 个体素（16 位索引）：字序号 = idx >> 1u，半字 = (idx & 1u) * 16u。
+        if ((b.mask & (u64(1) << idx)) != u64(0)) {
+          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          hit_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
+        }
+        break;
+      }
+      let bit = u64(1) << idx;
+      if ((b.mask & bit) == u64(0)) {
+        // 统一子块：颜色 = 节点 palette（0=空气）
+        hit_pal = b.pal;
+        break;
+      }
+      // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
+      let gd = 3u - level;
+      if (gd >= depth_cap) { return VoxelHit(true, cur_t, b.pal, face, v); }
+      // 分裂子块 → popcount 定位 child offset
+      let below = b.mask & (bit - u64(1));
+      let pop = countOneBits(u32(below)) + countOneBits(u32(below >> 32u));
+      let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
+      let c_ml = b_struct[child_addr];
+      let c_mh = b_struct[child_addr + 1u];
+      let c_pw = b_struct[child_addr + 2u];
+      let c_pal = c_pw & 0xFFFFu;  // 节点字低 16 位 = uniform 色
+      let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
+      // 统一子节点快路径：wire 任意层的分裂位都可能指向 3 字统一节点（mask=0，pal 直决；
+      // 叶层统一节点无 inline 16 字，禁读 addr+3 之后）
+      if (c_mask == u64(0)) {
+        hit_pal = c_pal;
+        break;
+      }
+      level = level - 1u;
+      bricks[level] = Brick(child_addr, c_mask, c_pal);
+    }
+    // ---- traverse 的唯一出口：命中 / 穿透 / 出射面 ----
+    if (hit_pal != 0u) {
+      // 介质 → 累积透射色后按空气继续（**不做**出射判定）；不透明 → 实体命中
+      if (!pass_through_medium(mc, hit_pal)) {
+        return VoxelHit(true, cur_t, hit_pal, face, v);
+      }
+    } else {
+      // 真空气：介质段内撞到空气 ⇒ 这里就是出射面
+      if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
+      (*mc).last_pal = 0u;
+    }
+    // ---- 整砖 LUT 跳过（Douglas march mask skip；仅 palette==0 节点安全）----
+    // 当前 brick 从当前格/象限无可达分裂子块 → 直接升一层跨步（不重新 traverse：
+    // 父帧当前格就是本砖，重 traverse 会原地再下钻；父层 dda 先跨步出本砖再判位）
+    {
+      let b = bricks[level];
+      if (b.pal == 0u) {
+        let sh = vec3<u32>(level * 2u);
+        let ecell = vec3<i32>(v >> sh) & vec3<i32>(3);
+        let entry_i = u32(ecell.z * 16 + ecell.y * 4 + ecell.x);
+        let lut_base = min(oct * 64u + entry_i, 511u);
+        var reach = b_leaves[lut_base];
+        reach = select(reach, ~u64(0), lut_disable);
+        if ((b.mask & reach) == u64(0)) {
+          level = level + 1u;
+          if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
         }
       }
-      // 空气子块 → 回 loop 顶重选 mn 轴继续；若刚离开介质段，这里就是出射面
-      if (penetrate) {
-        if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
-        (*mc).last_pal = 0u;
+    }
+    // ---- v 处为空气：当前 level brick 内 DDA（Douglas dda）----
+    let log2 = level * 2u;
+    let s = 1i << (level * 2u); // 子块边长 voxel：1/4/16/64
+    let s_mask = ~(s - 1i);    // 对齐掩码（two's complement: ~(s-1) = -s）
+    // side_distance_for_ray：v 对齐到 s 的基址；正向 → 基址+s，负向 → 基址
+    let base_v = v & vec3<i32>(s_mask);
+    let boundary = vec3<f32>(base_v) + dir_side * f32(s);
+    var side = vec3<f32>(1e+30);
+    side = select(side, (boundary - ro_c) * inv_rd, axis_on);
+    side = max(side, vec3<f32>(cur_t));
+    // 每轴步长 t 增量（level 不变则不变）：inner 里 O(1) 加法
+    let step_inc = f32(s) * abs_inv_rd;
+    var step_axis: u32 = 0u;
+    var changed = false;
+    loop {
+      // 选最近边界轴
+      var mn: u32;
+      if (side.x <= side.y && side.x <= side.z) { mn = 0u; }
+      else if (side.y <= side.z) { mn = 1u; }
+      else { mn = 2u; }
+      step_axis = mn;
+      cur_t = side[mn];
+      if (cur_t >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); } // 段内再无子块可入
+      let old_cell = (v[mn] >> log2) & 3;
+      // 沿 mn 轴整子块跨越
+      v[mn] = v[mn] + sign_v[mn] * s;
+      side[mn] = side[mn] + step_inc[mn];
+      face = mn * 2u + face_base[mn];
+      // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
+      let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
+      if (crossed) { changed = true; break; }
+      // 新子块内容：level 0 查 inline palette（仅 mask!=0 的 inline 叶）；
+      // level 1..3 = 分裂位或节点统一实体色。
+      // 与 traverse 一样，命中 / 穿透 / 出射面判定只在**唯一出口**做一次（说明见那里）。
+      let b = bricks[level];
+      let sh2 = vec3<u32>(log2);
+      let cell = vec3<i32>(v >> sh2) & vec3<i32>(3);
+      let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
+      hit_pal = 0u;   // 复用 traverse 的声明（每轮步进重置；少一个函数级变量 = 少一个栈槽）
+      if (level == 0u) {
+        // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
+        if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
+          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          hit_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
+        } else if (b.mask == u64(0)) {
+          // 防御：uniform 叶（正常下钻快路径已处理）
+          hit_pal = b.pal;
+        }
+      } else {
+        if ((b.mask & (u64(1) << idx)) != u64(0)) { break; } // 分裂子块 → 回 traverse 下钻
+        hit_pal = b.pal;                                      // 统一实体
       }
+      if (hit_pal != 0u) {
+        if (pass_through_medium(mc, hit_pal)) { continue; } // 介质：继续步进
+        return VoxelHit(true, cur_t, hit_pal, face, v);
+      }
+      // 空气子块 → 回 loop 顶重选 mn 轴继续；若刚离开介质段，这里就是出射面
+      if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
+      (*mc).last_pal = 0u;
     }
     if (changed) {
       level = level + 1u;
@@ -373,6 +572,19 @@ struct UnifiedHit {
 
 // 统一层次 DDA：slab→chunk 间 A&W→trace_chunk，所有网格（主世界 / 物体 / 任何体素 grid）
 // 走同一条路径、零 kind 分支。g 由 make_grid 构造（grid_descs 只读一次，参数不按值传大结构体）。
+/// chunk 级命中 → grid 级命中：面法线换到世界系、体素坐标补上 chunk 偏移。
+/// 抽成函数是为了让 [`trace_grid`] 里那个二选一分流的两侧都能写成 `let h = ...`——
+/// `var h: VoxelHit` 会变成一个 57 字节的栈变量，而每次 trace 都要跨若干 chunk。
+fn grid_hit(h: VoxelHit, ci: vec3<i32>,
+            col0: vec3<f32>, col1: vec3<f32>, col2: vec3<f32>, obj_id: i32) -> UnifiedHit {
+  // 统一法线计算：trace_chunk 内部已推好 face_id，调用方零分支
+  let n_local = face_normal_from_index(h.face_id);
+  let n_world = normalize(n_local.x * col0 + n_local.y * col1 + n_local.z * col2);
+  // chunk 局部 v → grid 局部体素（ci 为 trace_chunk 命中时所在 chunk，未步进）
+  let voxel = h.voxel + ci * i32(CHUNK_SIZE);
+  return UnifiedHit(true, h.t, h.pal, n_world, h.face_id, voxel, obj_id);
+}
+
 // penetrate：是否启用介质穿透（按值参数；false 时一次都不碰 mc，行为与改造前逐位一致）。
 fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
               penetrate: bool, mc: ptr<function, MediumRay>) -> UnifiedHit {
@@ -532,15 +744,15 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
         let chunk_min = vec3<f32>(ci) * f32(CHUNK_SIZE);
         // chunk 内遍历从 max(chunk 入口, t_min) 开始，跳过 t_min 前的空空间
         let t0c = max(t_enter_c, t_min);
-        let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v,
-                            t0c, t1, entry_face, depth_cap, penetrate, mc);
-        if (h.hit) {
-          // 统一法线计算：trace_chunk 内部已推好 face_id，调用方零分支
-          let n_local = face_normal_from_index(h.face_id);
-          let n_world = normalize(n_local.x * col0 + n_local.y * col1 + n_local.z * col2);
-          // chunk 局部 v → grid 局部体素（ci 为 trace_chunk 命中时所在 chunk，未步进）
-          let voxel = h.voxel + ci * i32(CHUNK_SIZE);
-          return UnifiedHit(true, h.t, h.pal, n_world, h.face_id, voxel, obj_id);
+        // 二选一分流：不透明走无介质的特化版（理由见文件头 [`trace_chunk_opaque`] 的说明）
+        if (penetrate) {
+          let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v,
+                              t0c, t1, entry_face, depth_cap, mc);
+          if (h.hit) { return grid_hit(h, ci, col0, col1, col2, obj_id); }
+        } else {
+          let h = trace_chunk_opaque(chunk_base, chunk_min, ro, rd, sign_v,
+                                     t0c, t1, entry_face, depth_cap);
+          if (h.hit) { return grid_hit(h, ci, col0, col1, col2, obj_id); }
         }
       }
     }
