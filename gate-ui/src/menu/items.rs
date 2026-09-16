@@ -457,7 +457,7 @@ fn color_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, hex: &str, path:
       MenuColorSwatch { path: path.to_string() },
       Node {
         width: px(RIGHT_COL_W),
-        height: px(m.font_size.md),
+        height: px(CTRL_H),
         border: UiRect::all(px(m.border_width)),
         // 与左侧 HEX 输入框留出间距
         margin: UiRect::left(px(m.spacing.sm)),
