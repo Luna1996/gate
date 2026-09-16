@@ -63,12 +63,13 @@ fn medium_of(palette_base: u32, pal: u32) -> vec4<f32> {
 /// `penetrate=false` 时恒 false ⇒ 现有不透明路径逐位不变。
 fn pass_through_medium(mc: ptr<function, MediumRay>, pal: u32) -> bool {
   if (!(*mc).penetrate) { return false; }
+  // 同一介质段（材质没变）→ 直接放行。穿越大块时绝大多数步进走这条，
+  // 省掉每次两步 palette load（`medium_of` 要读 word0 + word1）。
+  if ((*mc).last_pal == pal) { return true; }
   let m = medium_of((*mc).palette_base, pal);
   if (m.a >= 1.0) { return false; }
-  if ((*mc).last_pal != pal) {
-    (*mc).tint = (*mc).tint * m.rgb;
-    (*mc).last_pal = pal;
-  }
+  (*mc).tint = (*mc).tint * m.rgb;
+  (*mc).last_pal = pal;
   return true;
 }
 
