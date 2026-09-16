@@ -25,12 +25,12 @@ fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
 }
 
 /// 读一个节点的 (mask, palette)。`node` 为 b_struct 内绝对字址。
-/// palette word 低字节 = uniform 子块色（高字节 = LOD 子树多数色）
+/// palette word：低 16 位 = uniform 子块色（高 16 位 = LOD 子树多数色，本层不读）
 #[inline]
 fn read_node(b_struct: &[u32], node: usize) -> (u64, u32) {
   let lo = b_struct[node] as u64;
   let hi = b_struct[node + 1] as u64;
-  (hi << 32 | lo, b_struct[node + 2] & 0xFF)
+  (hi << 32 | lo, b_struct[node + 2] & 0xFFFF)
 }
 
 /// 砖块图只读视图：持有与 GPU buffer 字节一致的缓冲区引用
@@ -82,8 +82,8 @@ impl<'a> BrickMapView<'a> {
   }
 
   /// mask DDA 逐层下钻读单个最细格（1³）体素，O(分裂层数) = 最多 4 层
-  /// 叶父层（level 3）inline 4 体素/word，故不存在 level 4 叶节点
-  pub fn get_voxel(&self, voxel: IVec3) -> Option<u8> {
+  /// 叶父层（level 3）inline 2 体素/字（16 位材质索引），故不存在 level 4 叶节点
+  pub fn get_voxel(&self, voxel: IVec3) -> Option<u16> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let base = self.chunk_base(chunk)?;
     let mut local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
@@ -92,7 +92,7 @@ impl<'a> BrickMapView<'a> {
     loop {
       let (mask, pal) = read_node(self.b_struct, node);
       if mask == 0 {
-        return (pal != 0).then_some(pal as u8);
+        return (pal != 0).then_some(pal as u16);
       }
       let child_extent = extent >> 2;
       let ix = local.x / child_extent;
@@ -101,14 +101,14 @@ impl<'a> BrickMapView<'a> {
       let ci = (iz * 16 + iy * 4 + ix) as u64;
       let bit = 1u64 << ci;
       if mask & bit == 0 {
-        return (pal != 0).then_some(pal as u8);
+        return (pal != 0).then_some(pal as u16);
       }
       if child_extent == 1 {
-        // 叶父层 inline 4 体素/word = b_struct[node + 3 + (ci >> 2)]，
-        // palette = 该 word 的第 (ci & 3) 字节
-        let w = self.b_struct[node + 3 + (ci >> 2) as usize];
-        let leaf_pal = (w >> ((ci & 3) as u32 * 8)) & 0xFF;
-        return (leaf_pal != 0).then_some(leaf_pal as u8);
+        // 叶父层 inline 2 体素/字 = b_struct[node + 3 + (ci >> 1)]，
+        // palette = 该 word 的第 (ci & 1) 个 16 位半字
+        let w = self.b_struct[node + 3 + (ci >> 1) as usize];
+        let leaf_pal = (w >> ((ci & 1) as u32 * 16)) & 0xFFFF;
+        return (leaf_pal != 0).then_some(leaf_pal as u16);
       }
       // level 0-2：紧凑 popcount 定位 child offset
       let slot = (mask & (bit - 1)).count_ones() as usize;

@@ -104,6 +104,10 @@ pub struct MainPending {
   pub force_full: bool,
   pub data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
   pub comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  /// 与 `data_chunks` 并行的**编辑 AABB**：`(volume_idx, coord, lo, hi)`，闭开区间（世界 voxel）。
+  /// 只有"由体素编辑标脏"的 chunk 才有条目；渲染侧据此把 DDGI 重烘范围从整个 chunk
+  /// （256³，会一次失效 16³ = 4096 个 LOD0 探针）收紧到实际编辑区域。
+  pub data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
 }
 
 /// 单 chunk 增量重建的预算折中（典型树几十 KB~数 MB；256KB 经验值）
@@ -124,6 +128,7 @@ pub fn poll_pending(
   };
   pending.data_chunks.clear();
   pending.comp_chunks.clear();
+  pending.data_aabbs.clear();
   pending.force_full = false;
   if scene.demo_force_full_rebuild {
     pending.force_full = true;
@@ -148,6 +153,11 @@ pub fn poll_pending(
   for (vol_idx, grid) in scene.volumes.list.iter_mut().enumerate() {
     for c in grid.dirty.drain_data_budget(data_n) {
       pending.data_chunks.push((vol_idx, c));
+      // 编辑记录的实际 voxel 范围随该 chunk 一起上报（取走即清）；无记录 = 非编辑标脏，
+      // 渲染侧回退到 chunk 包围盒（行为与旧版一致）。
+      if let Some((lo, hi)) = grid.take_edit_aabb(c) {
+        pending.data_aabbs.push((vol_idx, c, lo, hi));
+      }
     }
     for c in grid.dirty.drain_comp_budget(comp_n) {
       pending.comp_chunks.push((vol_idx, c));
@@ -167,6 +177,8 @@ pub struct BuilderMirror {
   pub builder: Option<VolumesBuilder>,
   pub pending_full: bool,
   pub pending_data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  /// 与 `pending_data_chunks` 并行的编辑 AABB（见 [`MainPending::data_aabbs`]）
+  pub pending_data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
   pub pending_comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
 }
 
@@ -242,7 +254,7 @@ pub fn light_field_origin_cell(cam_voxel: glam::Vec3) -> IVec3 {
 /// 的 Solid，不受此近似影响。
 fn build_light_chunk(tree: &gate_voxel::ChunkTree, palette: &gate_voxel::Palette) -> LightChunk {
   use gate_voxel::BrickState;
-  let emis = |pal: u8| -> f32 { palette.get(pal).emissive as f32 / 255.0 };
+  let emis = |pal: gate_voxel::PaletteId| -> f32 { palette.get(pal).emissive as f32 / 255.0 };
   let mut fill = vec![0u8; 16 * 16 * 16].into_boxed_slice();
   let mut emit = vec![0f32; 16 * 16 * 16].into_boxed_slice();
   for lz in 0..16i32 {
@@ -403,12 +415,15 @@ fn extract(
     mirror.pending_full = true;
   }
   mirror.pending_data_chunks.extend(main_pending.data_chunks.iter().copied());
+  mirror.pending_data_aabbs.extend(main_pending.data_aabbs.iter().copied());
   mirror.pending_comp_chunks.extend(main_pending.comp_chunks.iter().copied());
 
   let first = mirror.builder.is_none();
   let pending_full = std::mem::take(&mut mirror.pending_full);
   let mut pending_data: Vec<(usize, gate_voxel::ChunkCoord)> =
     std::mem::take(&mut mirror.pending_data_chunks);
+  let pending_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)> =
+    std::mem::take(&mut mirror.pending_data_aabbs);
   let _pending_comp: Vec<(usize, gate_voxel::ChunkCoord)> =
     std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
@@ -427,8 +442,15 @@ fn extract(
         if *vol_idx != 0 {
           continue;
         }
-        let cl = c.0 * gate_voxel::CHUNK_SIZE;
-        let ch = cl + IVec3::splat(gate_voxel::CHUNK_SIZE);
+        // 优先用**实际编辑范围**：单格编辑 → cell 级 AABB，只让 1~2 个 LOD0 探针重烘；
+        // 无记录（批量导入 / 直接标脏）才回退到整个 chunk 的包围盒（256³，旧行为）。
+        let (cl, ch) = match pending_aabbs.iter().find(|(v, cc, ..)| *v == 0 && cc == c) {
+          Some((_, _, alo, ahi)) => (*alo, *ahi),
+          None => {
+            let cl = c.0 * gate_voxel::CHUNK_SIZE;
+            (cl, cl + IVec3::splat(gate_voxel::CHUNK_SIZE))
+          }
+        };
         lo = Some(lo.map_or(cl, |v| v.min(cl)));
         hi = Some(hi.map_or(ch, |v| v.max(ch)));
       }

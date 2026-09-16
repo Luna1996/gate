@@ -7,10 +7,15 @@
 //! mask bit=1 → 子块被分裂（child offset 有效）；bit=0 → uniform 子块，颜色 = 该节点
 //! palette_u32（零额外 load），palette=0 = AIR。
 //!
-//! level 3 叶父层例外：inline 16 word，4 体素/word，读端按 child_idx 低 2 位选字节。
+//! level 3 叶父层例外：inline [`LEAF_INLINE_WORDS`] word，[`LEAF_VOXELS_PER_WORD`] 体素/word，
+//! 读端按 child_idx 低 1 位选 16 位半字。
 //! b_leaves 存放方向可达掩码 LUT（Douglas #18 Bitwise Masking），见 [`march_mask_lut_words`]。
+//!
+//! **材质索引位宽**（[`PALETTE_BITS`] = 16）是这份契约的一等参数：节点头的 palette 半字与
+//! 叶层 inline 的每个半字同宽。改位宽必须同步 shader 的掩码/位移 —— shader 侧按字面量写
+//! （`& 0xFFFFu`、`>> 1u`、`* 16u`），故本文件的常数是唯一权威，见各文件内的同步注释。
 
-use gate_voxel::PaletteEntry;
+use gate_voxel::{PALETTE_BITS, PALETTE_ENTRY_COUNT, PaletteEntry};
 use glam::{IVec3, Mat3, Vec3, Vec4};
 
 // ============ 层级常量（与 gate-voxel coords.rs 一致）============
@@ -35,8 +40,18 @@ pub const TREE_BASE: usize = CHUNK_INDEX_WORDS;
 
 // ============ palette / comp / state ============
 
-/// 调色板字数（256 条 × 2 u32）
-pub const PALETTE_WORDS: usize = 256 * 2;
+/// 调色板字数（2^16 条 × 2 u32 = 512KB/volume）
+pub const PALETTE_WORDS: usize = PALETTE_ENTRY_COUNT * 2;
+/// 叶父层每 u32 字装的体素数（= 32 位 / 材质索引位宽 = 2）
+pub const LEAF_VOXELS_PER_WORD: usize = gate_voxel::LEAF_VOXELS_PER_WORD;
+/// 叶父层（level 3，4³ = 64 体素）inline 字数 = 64 / [`LEAF_VOXELS_PER_WORD`] = 32
+pub const LEAF_INLINE_WORDS: usize = gate_voxel::LEAF_INLINE_WORDS;
+/// 每槽字节数（[`pack_palette_entry`] 输出 2 个 u32）—— 脏槽上传的偏移换算用
+pub const PALETTE_BYTES_PER_ENTRY: usize = 8;
+
+// 位宽一致性（编译期）：叶层每字体素数必须整除 64，否则 inline 字数不成立
+const _: () = assert!(64 % LEAF_VOXELS_PER_WORD == 0);
+const _: () = assert!(32 % PALETTE_BITS == 0);
 /// comp_layer 每 chunk 字数（u16[4096] → 每 2 字打包成 u32 = 2048）
 pub const CHUNK_COMP_WORDS: usize = gate_voxel::COMP_BRICKS_PER_CHUNK / 2;
 /// StateTable 条目的字数（4×u32/条目）

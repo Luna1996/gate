@@ -259,7 +259,11 @@ pub mod wgsl_consts {
   pub const CHUNK_INDEX_WORDS: u32 = 262_144; // 64³
   pub const TREE_BASE: u32 = 262_144;
   // palette / comp / state
-  pub const PALETTE_WORDS: u32 = 512; // 256 条 × 2w
+  /// 调色板字数（2^16 条 × 2w = 512KB/volume）；与 `wire.rs::PALETTE_WORDS` 同源
+  pub const PALETTE_WORDS: u32 = crate::brickmap::wire::PALETTE_WORDS as u32;
+  /// 叶父层 inline 字数与每字体素数（与 `wire.rs` 同源，供 WGSL 顶部 const 对齐）
+  pub const LEAF_INLINE_WORDS: u32 = crate::brickmap::wire::LEAF_INLINE_WORDS as u32;
+  pub const LEAF_VOXELS_PER_WORD: u32 = crate::brickmap::wire::LEAF_VOXELS_PER_WORD as u32;
   pub const CHUNK_COMP_WORDS: u32 = 2048; // u16[4096] → 每 2 字打包 u32
   pub const STATE_ENTRY_COUNT: u32 = 256;
   pub const STATE_WORDS_PER_ENTRY: u32 = 4;
@@ -311,7 +315,7 @@ pub fn cpu_reference_dda_ray(
   dir_voxel: Vec3, // voxel units（归一化），magnitude 任意（delta 按 |dir| 缩放）
   t_max: f32,
   max_steps: u32,
-) -> Option<(f32, u8)> {
+) -> Option<(f32, u16)> {
   let view = BrickMapView::new(buffers);
   let mut t = 0.0f32;
   // init A&W 变量
@@ -393,7 +397,7 @@ pub fn cpu_reference_dda_ray_aabb_skip(
   max_steps: u32,
   aabb_min: Vec3,
   aabb_max: Vec3,
-) -> Option<(f32, u8)> {
+) -> Option<(f32, u16)> {
   // ---- 1) slab 法求射线与 AABB 的 t ∈ [t_enter, t_exit]（都自 origin 量起）----
   let mut t_enter = 0.0f32;
   let mut t_exit = t_global_max;
@@ -509,7 +513,7 @@ fn dda_voxel_scan_cell(
   cc: [i32; 3],    // 粗 cell 坐标（1 单位 = 16 voxel）
   t_lo: f32,
   t_hi: f32,
-) -> Option<(f32, u8, u8)> {
+) -> Option<(f32, u16, u8)> {
   if t_hi <= t_lo {
     return None;
   }
@@ -568,7 +572,7 @@ fn dda_voxel_scan_cell(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DdaHit {
   pub t: f32,
-  pub pal: u8,
+  pub pal: u16,
   pub axis: u8,
 }
 
@@ -667,7 +671,7 @@ pub fn cpu_reference_dda_ray_two_level(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TreeHit {
   pub t: f32,
-  pub pal: u8,
+  pub pal: u16,
   pub face_id: u8,
   pub voxel: IVec3,
 }
@@ -708,7 +712,7 @@ fn face_normal_from_index(f: u8) -> Vec3 {
 struct BrickCpu {
   addr: usize, // 节点绝对字址（b_struct）
   mask: u64,   // 64bit 分裂掩码（bit=1 = 子块分裂；bit=0 = 统一子块，色=pal）
-  pal: u8,     // 节点 palette（统一子块颜色，0=空气）
+  pal: u16,    // 节点 palette（统一子块颜色，0=空气）
 }
 
 /// 镜像 WGSL trace_chunk：单 chunk 内 Douglas 式整数体素层级 DDA
@@ -732,7 +736,7 @@ fn trace_chunk_cpu(
   t0: f32,
   t1: f32,
   entry_face: u8,
-) -> Option<(f32, u8, u8, [i32; 3])> {
+) -> Option<(f32, u16, u8, [i32; 3])> {
   // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
   if t0 >= t1 {
     return None;
@@ -744,7 +748,7 @@ fn trace_chunk_cpu(
   let read_brick = |addr: usize| BrickCpu {
     addr,
     mask: ((b_struct[addr + 1] as u64) << 32) | b_struct[addr] as u64,
-    pal: (b_struct[addr + 2] & 0xFF) as u8,
+    pal: (b_struct[addr + 2] & 0xFFFF) as u16,
   };
   let mut bricks = [BrickCpu { addr: 0, mask: 0, pal: 0 }; 4];
   bricks[3] = read_brick(chunk_base);
@@ -778,8 +782,8 @@ fn trace_chunk_cpu(
         // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
         // bit=0 空气体素零 load（mask 在手）。
         if (b.mask & (1u64 << idx)) != 0 {
-          let w = b_struct[b.addr + 3 + (idx >> 2)];
-          let leaf_pal = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
+          let w = b_struct[b.addr + 3 + (idx >> 1)];
+          let leaf_pal = ((w >> ((idx & 1) * 16)) & 0xFFFF) as u16;
           if leaf_pal != 0 {
             return Some((cur_t, leaf_pal, face, v));
           }
@@ -861,8 +865,8 @@ fn trace_chunk_cpu(
       if level == 0 {
         // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
         if b.mask != 0 && (b.mask & (1u64 << idx)) != 0 {
-          let w = b_struct[b.addr + 3 + (idx >> 2)];
-          let dp = ((w >> ((idx & 3) * 8)) & 0xFF) as u8;
+          let w = b_struct[b.addr + 3 + (idx >> 1)];
+          let dp = ((w >> ((idx & 1) * 16)) & 0xFFFF) as u16;
           if dp != 0 {
             return Some((cur_t, dp, face, v));
           }
@@ -1091,7 +1095,7 @@ use gate_voxel::VolumeTransform;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeHit {
   pub t: f32,
-  pub pal: u8,
+  pub pal: u16,
   pub obj_id: i32,
   pub normal: Vec3,
 }
@@ -1129,7 +1133,7 @@ fn cpu_reference_object_ray_unified(
   origin: Vec3,
   dir: Vec3,
   t_cap: f32,
-) -> Option<(f32, u8, Vec3)> {
+) -> Option<(f32, u16, Vec3)> {
   // ---- 世界 AABB 预剔除 ----
   let (w_mn, w_mx) = tr.world_aabb();
   let (t_enter, t_exit) = slab_box(origin, dir, w_mn, w_mx, 0.0, t_cap);

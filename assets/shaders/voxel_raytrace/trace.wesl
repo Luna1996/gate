@@ -51,7 +51,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
-  let r_pal = b_struct[chunk_base + 2u] & 0xFFu;
+  let r_pal = b_struct[chunk_base + 2u] & 0xFFFFu;  // 节点字低 16 位 = uniform 色（16 位材质索引）
   bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal);
   var level: u32 = 3u;
   // 当前体素（chunk 局部 voxel 整数坐标，0..255；跨出 chunk 的步进瞬态可达 -1/256）
@@ -76,9 +76,10 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       if (level == 0u) {
         // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
         // bit=0 空气体素零 load（mask 在手）。
+        // 每字 2 个体素（16 位索引）：字序号 = idx >> 1u，半字 = (idx & 1u) * 16u。
         if ((b.mask & (u64(1) << idx)) != u64(0)) {
-          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
-          let leaf_pal = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          let leaf_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
           if (leaf_pal != 0u) { return VoxelHit(true, cur_t, leaf_pal, face, v); }
         }
         break; // 空气 leaf
@@ -99,7 +100,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let c_ml = b_struct[child_addr];
       let c_mh = b_struct[child_addr + 1u];
       let c_pw = b_struct[child_addr + 2u];
-      let c_pal = c_pw & 0xFFu;
+      let c_pal = c_pw & 0xFFFFu;  // 节点字低 16 位 = uniform 色
       let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
       // 统一子节点快路径：wire 任意层的分裂位都可能指向 3 字统一节点（mask=0，pal 直决；
       // 叶层统一节点无 inline 16 字，禁读 addr+3 之后）
@@ -169,8 +170,8 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       if (level == 0u) {
         // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
         if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
-          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 2u)];
-          let dp = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          let dp = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
           if (dp != 0u) { return VoxelHit(true, cur_t, dp, face, v); }
         } else if (b.mask == u64(0) && b.pal != 0u) {
           // 防御：uniform 叶（正常下钻快路径已处理）

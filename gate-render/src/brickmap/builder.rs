@@ -11,13 +11,16 @@
 
 use std::collections::HashMap;
 
-use gate_voxel::{ChunkCoord, VolumeGrid, VolumeTransform, Volumes};
+use gate_voxel::{ChunkCoord, PALETTE_INDEX_MAX, PaletteId, VolumeGrid, VolumeTransform, Volumes};
 use glam::{IVec3, Vec4};
 
 use super::wire::{CHUNK_SIZE, GridDesc, pack_palette_entry};
 use rayon::prelude::*;
 
-use super::wire::{BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_WORDS, TREE_BASE};
+use super::wire::{
+  BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_BYTES_PER_ENTRY, PALETTE_WORDS,
+  TREE_BASE,
+};
 
 /// 稠密 chunk 窗口线性位置（stride = CHUNK_INDEX_CAP，与 view.rs 同构）；窗口外 None
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
@@ -71,15 +74,21 @@ pub struct BrickMapBuilder {
   /// 增量更新脏字节区间列表：每项 (lo_byte, hi_byte) 闭开，字对齐。
   /// 每次增量 = 1 个窗口条目字 + 1 段树 append，区间天然分离。
   dirty_struct: Vec<(usize, usize)>,
-  dirty_palette: bool,
+  /// 待上传的调色板脏槽闭区间（同一帧多次 `write_palette` 取并集）；None = 无变动。
+  /// 表本体 512KB，故不再整表重铺（见 [`Self::write_palette`]）。
+  dirty_palette: Option<(u16, u16)>,
+  /// 调色板同步游标：本 builder 上次同步时调色板的写版本；None = 从未同步过。
+  /// 用它而非"脏区间是否为空"来判断，因为同一张表可能有多个消费者（见 [`Self::write_palette`]）。
+  palette_synced_at: Option<u64>,
 }
 
 /// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）。
-/// 空列表 = 对应 buffer 完全未修改，跳过写。palette 2KB 整块写。
+/// 空列表 = 对应 buffer 完全未修改，跳过写。
 #[derive(Debug, Default, Clone)]
 pub struct DirtyRanges {
   pub struct_ranges: Vec<(usize, usize)>,
-  pub palette_changed: bool,
+  /// 调色板脏槽闭区间（槽号，非字节）；None = 本次无槽变动
+  pub palette_range: Option<(u16, u16)>,
 }
 
 impl BrickMapBuilder {
@@ -140,7 +149,8 @@ impl BrickMapBuilder {
       rejected_chunks: rejected as u32,
       garbage_words: 0,
       dirty_struct: Vec::new(),
-      dirty_palette: false,
+      dirty_palette: None,
+      palette_synced_at: None,
     };
     b.write_palette(grid);
     b
@@ -198,21 +208,46 @@ impl BrickMapBuilder {
       }
     };
     self.refresh_globals();
-    // 顺带重铺 palette（256 条 × 2 字 = 2KB）：材质是"用时才写进调色板"的
-    // （见 gate-app/src/edit.rs），故必须与触发它的那次体素编辑**同一帧**上传，
-    // 否则新放的体素会以槽位上一任材质的颜色出现。2KB 可忽略，不做修订号比对。
+    // 顺带铺 palette 的**脏槽**（材质是"用时才写进调色板"的，见 gate-app/src/edit.rs）：
+    // 必须与触发它的那次体素编辑**同一帧**上传，否则新放的体素会以槽位上一任材质的颜色出现。
+    // 表本体 2^16 条 = 512KB，不能像原来 256 条（2KB）那样整表重铺，故只写变动槽区间。
     self.write_palette(grid);
     out
   }
 
-  /// 调色板整表重铺（256 条全量 2KB，无增量必要）
+  /// 调色板增量铺：把 grid 侧"自本 builder 上次同步以来变化"的槽写进 CPU 镜像并累积脏区间。
+  ///
+  /// **多消费者安全**：同一张表可能被多个 builder 消费（渲染世界每 volume 一个，外加
+  /// gate-app 启动期的诊断 builder —— 见 `gate-app/src/scene.rs` 的 `BrickMapBuilder::build_full`）。
+  /// 脏区间只能被取走一次，所以判断"要不要同步"用调色板自己的写版本，而不是脏区间是否为空；
+  /// 且**首次同步必然全量**（镜像初始全零），非首次拿不到脏区间时也退回全量，绝不静默跳过。
+  /// 首次全量铺满 512KB，此后每次材质新增最多几个槽。
   pub fn write_palette(&mut self, grid: &VolumeGrid) {
-    for (i, [a, b]) in self.buffers.b_palette.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-      let [x, y] = pack_palette_entry(grid.palette().get(i as u8));
-      *a = x;
-      *b = y;
+    let version = grid.palette().version();
+    if self.palette_synced_at == Some(version) {
+      return; // 自本 builder 上次同步以来调色板未变
     }
-    self.dirty_palette = true;
+    let range = match self.palette_synced_at {
+      None => {
+        // 首次同步：本镜像全零，必须整表铺；顺手把脏区间消费掉（内容已被整表覆盖）
+        let _ = grid.palette().take_dirty();
+        None
+      }
+      // 非首次：拿到脏区间就只铺那一段；被别人取走（None）则退回全量
+      Some(_) => grid.palette().take_dirty(),
+    };
+    let (lo, hi) = range.unwrap_or((0, PALETTE_INDEX_MAX));
+    for i in lo..=hi {
+      let [a, b] = pack_palette_entry(grid.palette().get(PaletteId(i)));
+      self.buffers.b_palette[i as usize * 2] = a;
+      self.buffers.b_palette[i as usize * 2 + 1] = b;
+    }
+    self.palette_synced_at = Some(version);
+    // 累积进"待上传槽区间"（同一帧多次 update_chunk 取并集）
+    self.dirty_palette = Some(match self.dirty_palette {
+      None => (lo, hi),
+      Some((d0, d1)) => (d0.min(lo), d1.max(hi)),
+    });
   }
 
   pub fn buffers(&self) -> &BrickMapBuffers {
@@ -225,7 +260,7 @@ impl BrickMapBuilder {
   pub fn take_dirty_ranges(&mut self) -> DirtyRanges {
     DirtyRanges {
       struct_ranges: std::mem::take(&mut self.dirty_struct),
-      palette_changed: std::mem::take(&mut self.dirty_palette),
+      palette_range: self.dirty_palette.take(),
     }
   }
 
@@ -492,8 +527,14 @@ impl VolumesBuilder {
           let (lw, hw) = (lo / 4, hi / 4);
           struct_blobs.push((tb * 4 + lo, words_to_bytes(&buffers.b_struct[lw..hw])));
         }
-        if dr.palette_changed {
-          palette_blobs.push((pb * 4, words_to_bytes(&buffers.b_palette)));
+        if let Some((lo, hi)) = dr.palette_range {
+          // 脏槽闭区间 → 统一 palette buffer 内的字节偏移 + 该区间字节（每槽 8B = 2 字）
+          let w0 = lo as usize * 2;
+          let w1 = hi as usize * 2 + 2;
+          palette_blobs.push((
+            pb * 4 + lo as usize * PALETTE_BYTES_PER_ENTRY,
+            words_to_bytes(&buffers.b_palette[w0..w1]),
+          ));
         }
       }
     }

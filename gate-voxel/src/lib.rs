@@ -17,7 +17,7 @@ pub use coords::{
 };
 
 // ============ Brick Tree ============
-pub use chunk_tree::{BrickState, ChunkTree};
+pub use chunk_tree::{BrickState, ChunkTree, LEAF_INLINE_WORDS, LEAF_VOXELS_PER_WORD};
 
 // ============ 脏追踪 ============
 pub use dirty::DirtyTracker;
@@ -28,7 +28,10 @@ pub use volume::{
 };
 
 // ============ 调色板 ============
-pub use palette::{AIR_INDEX, Palette, PaletteEntry, PaletteFlags};
+pub use palette::{
+  PALETTE_BITS, PALETTE_ENTRY_COUNT, PALETTE_INDEX_MAX, Palette, PaletteEntry, PaletteFlags,
+  PaletteId,
+};
 
 // ============ 场景构造 ============
 pub use scene::{draw_text, fill_box, fill_bricks, fill_sphere, text_size};

@@ -13,7 +13,7 @@ use gate_render::{
   VoxelScene, create_dda_image,
 };
 use gate_voxel::{
-  PaletteEntry, VolumeGrid, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
+  PaletteEntry, PaletteId, VolumeGrid, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
 };
 
 use crate::{
@@ -217,7 +217,7 @@ fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
 /// demo 调色板（PaletteEntry._pad 私有 → 跨 crate 用 default + 逐字段赋值）：
 /// 14 色 = 草地 / 山岩 / 雪峰 / 城堡石 / 树叶 / 树干 / 河蓝 / 水晶青紫红 / 塔顶金 / 道路 / 岛底 + LED
 fn paint_demo_palette(grid: &mut VolumeGrid) {
-  let palette: &[(u8, [u8; 3], u8)] = &[
+  let palette: &[(u16, [u8; 3], u8)] = &[
     (1, [86, 160, 70], 220),   // 1 草地（L0 地面平原）
     (2, [140, 108, 76], 200),  // 2 山岩（山体主体）
     (3, [240, 244, 248], 160), // 3 雪峰（y > 山线顶）
@@ -237,14 +237,14 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
     let mut e = PaletteEntry::default();
     e.color = color;
     e.roughness = rough;
-    pal.set(idx, e);
+    pal.set(PaletteId(idx), e);
   }
   // 14 号 LED 灯柱（暖白满档发光）
   let mut led = PaletteEntry::default();
   led.color = [255, 214, 156];
   led.roughness = 128;
   led.emissive = 255;
-  pal.set(14, led);
+  pal.set(PaletteId(14), led);
 }
 
 // 极限场景版图（世界边长 = N tile × 512 voxel，N = GATE_TILES）：

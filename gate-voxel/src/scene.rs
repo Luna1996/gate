@@ -5,12 +5,20 @@
 use glam::IVec3;
 
 use crate::coords::LEVEL_EXTENT;
+use crate::palette::PaletteId;
 use crate::volume::VolumeGrid;
 
 /// 填充与轴对齐包围盒相交的所有体素（1³，确定性）。
 ///
 /// 按 4³ 网格分块：完全含于 box 的整块走 `fill_brick`（O(depth) 树路径写入），边缘块逐体素。
-pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -> usize {
+/// `palette` 用 `impl Into<PaletteId>`：本层是场景作者 API，槽号字面量（`2` / `7`）是常态。
+pub fn fill_box(
+  grid: &mut VolumeGrid,
+  min: IVec3,
+  extent: IVec3,
+  palette: impl Into<PaletteId>,
+) -> usize {
+  let palette = palette.into();
   assert!(extent.cmpgt(IVec3::ZERO).all());
   let max = min + extent;
   let mut count = 0;
@@ -62,7 +70,14 @@ pub fn fill_box(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, palette: u8) -
 ///
 /// extent 各轴必须是 e 的倍数且 min 各轴对齐 e；brick 级树路径写入
 /// （[`VolumeGrid::fill_brick`]），零逐体素分裂开销。返回实际写入的 brick 数。
-pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, palette: u8) -> usize {
+pub fn fill_bricks(
+  grid: &mut VolumeGrid,
+  min: IVec3,
+  extent: IVec3,
+  e: i32,
+  palette: impl Into<PaletteId>,
+) -> usize {
+  let palette = palette.into();
   assert!(LEVEL_EXTENT.contains(&e), "e 必须是 brick 粒度 {LEVEL_EXTENT:?} 之一（got {e}）");
   assert!(
     extent.x % e == 0 && extent.y % e == 0 && extent.z % e == 0,
@@ -93,7 +108,13 @@ pub fn fill_bricks(grid: &mut VolumeGrid, min: IVec3, extent: IVec3, e: i32, pal
 ///
 /// 按 4³ 分块：8 角全在球内的整块走 [`VolumeGrid::fill_brick`]（O(depth) 树路径
 /// 写入），边缘壳逐体素。
-pub fn fill_sphere(grid: &mut VolumeGrid, center: IVec3, radius: i32, palette: u8) -> usize {
+pub fn fill_sphere(
+  grid: &mut VolumeGrid,
+  center: IVec3,
+  radius: i32,
+  palette: impl Into<PaletteId>,
+) -> usize {
+  let palette = palette.into();
   assert!(radius > 0);
   let r2 = radius * radius;
   let lo = center - IVec3::splat(radius);
@@ -206,7 +227,13 @@ pub fn text_size(text: &str) -> IVec3 {
   IVec3::new(cols, 7, 1)
 }
 
-pub fn draw_text(grid: &mut VolumeGrid, origin: IVec3, text: &str, palette: u8) -> usize {
+pub fn draw_text(
+  grid: &mut VolumeGrid,
+  origin: IVec3,
+  text: &str,
+  palette: impl Into<PaletteId>,
+) -> usize {
+  let palette = palette.into();
   let mut count = 0;
   for (gi, ch) in text.bytes().enumerate() {
     let rows = glyph(ch);

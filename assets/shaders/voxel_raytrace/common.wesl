@@ -11,6 +11,13 @@ const CHUNK_INDEX_CAP: u32 = 64u;
 const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
 const TREE_BASE: u32 = 262144u;          // Region ② 起始
 
+// --- 材质索引格式（16 位，与 Rust `gate_voxel::PALETTE_BITS` / `LEAF_*` 同源）---
+// 节点第 3 字：bit0..15 = uniform 子块色，bit16..31 = LOD 子树多数色（shader 暂未读 LOD 半区）。
+// 叶父层 inline：每字装 2 个体素（LEAF_VOXELS_PER_WORD），共 32 字（LEAF_INLINE_WORDS）。
+// 读端：`b_struct[addr + NODE_FIXED_WORDS + (idx >> 1u)]` 的第 (idx & 1u) 个半字（每半字 16 位）。
+// 各读点按既有风格写字面量（`& 0xFFFFu` / `>> 1u` / `(idx & 1u) * 16u`），权威定义在
+// `gate-render/src/brickmap/wire.rs`，改位宽须全量同步这 4 个 .wesl 的读点。
+
 
 // 方向位掩码 LUT：3-bit 掩码（bit0=x>=0, bit1=y>=0, bit2=z>=0，共 8 种）→ side（boundary 计算用）
 // 与三轴步进 face id。打包：bits0-2=side, bits8-15=face_x, bits16-23=face_y, bits24-31=face_z；

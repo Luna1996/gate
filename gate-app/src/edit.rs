@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
 use gate_render::{DdaCameraConfig, VoxelScene};
-use gate_voxel::{PaletteEntry, VolumeGrid, VoxelCoord};
+use gate_voxel::{PALETTE_INDEX_MAX, PaletteEntry, PaletteId, VolumeGrid, VoxelCoord};
 
 use crate::camera::{CameraMode, cursor_ray};
 
@@ -84,7 +84,7 @@ pub struct EditSettings {
   /// 选中材质（[`EDIT_MATERIALS`] 下标）
   pub material: usize,
   /// 材质 → 调色板槽（首次使用时分配，见 [`ensure_material`]）
-  pub slots: [Option<u8>; EDIT_MATERIALS.len()],
+  pub slots: [Option<PaletteId>; EDIT_MATERIALS.len()],
 }
 
 impl Default for EditSettings {
@@ -94,26 +94,27 @@ impl Default for EditSettings {
 }
 
 /// 给指定材质取调色板槽（懒分配，结果缓存在 `settings.slots`）。
-/// 空槽判据 = 条目全零（场景 palette 从索引 1 起占用）；一个空槽都没有 → 回退 255 并 warn。
-fn material_slot(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usize) -> u8 {
+/// 空槽判据 = 条目全零（场景 palette 从索引 1 起占用）；
+/// **一个空槽都没有 → 复用最后一个槽**（`PALETTE_INDEX_MAX`）并 warn（会覆盖该槽原材质）。
+/// 容量 2^16 后线性扫一遍是 512KB 比较，但只在某材质首次使用时发生（≤ 材质数 次，结果被缓存）。
+fn material_slot(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usize) -> PaletteId {
   if let Some(s) = settings.slots[idx] {
     return s;
   }
-  let empty = PaletteEntry::default();
-  let free = (1u16..255).find(|&i| *grid.palette().get(i as u8) == empty).map(|i| i as u8);
+  let free = (1u16..=PALETTE_INDEX_MAX).find(|&i| grid.palette().is_empty_slot(PaletteId(i)));
   let slot = match free {
-    Some(s) => s,
+    Some(s) => PaletteId(s),
     None => {
-      bevy::log::warn!("编辑材质找不到空调色板槽，复用 255（会覆盖该槽原有材质）");
-      255
+      bevy::log::warn!("编辑材质找不到空调色板槽，复用 {PALETTE_INDEX_MAX}（会覆盖该槽原有材质）");
+      PaletteId(PALETTE_INDEX_MAX)
     }
   };
   settings.slots[idx] = Some(slot);
   slot
 }
 
-/// 确保材质已写进它的槽（幂等：内容相同就不写，避免无谓的 palette 重铺）
-fn ensure_material(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usize) -> u8 {
+/// 确保材质已写进它的槽（幂等：内容相同就不写，避免无谓的脏槽标记）
+fn ensure_material(grid: &mut VolumeGrid, settings: &mut EditSettings, idx: usize) -> PaletteId {
   let slot = material_slot(grid, settings, idx);
   let want = EDIT_MATERIALS[idx].entry();
   if *grid.palette().get(slot) != want {
@@ -155,7 +156,7 @@ pub fn raycast_main(
   // 步数上限：三轴各走 max_dist 格的上界，防退化射线空转
   let max_steps = (3.0 * max_dist) as u32 + 3;
   for _ in 0..max_steps {
-    if grid.get_voxel(VoxelCoord::from_ivec3(v)).unwrap_or(0) != 0 {
+    if !grid.get_voxel(VoxelCoord::from_ivec3(v)).unwrap_or(PaletteId::AIR).is_air() {
       return Some((v, face, t));
     }
     let axis = if t_max.x <= t_max.y && t_max.x <= t_max.z {
@@ -189,7 +190,7 @@ pub fn apply_brush(
   center: IVec3,
   shape: BrushShape,
   size: u32,
-  palette: u8,
+  palette: PaletteId,
 ) -> usize {
   let r = size.saturating_sub(1) as i32;
   let mut changed = 0usize;
@@ -200,12 +201,12 @@ pub fn apply_brush(
           continue;
         }
         let p = center + IVec3::new(dx, dy, dz);
-        let cur = grid.get_voxel(VoxelCoord::from_ivec3(p)).unwrap_or(0);
-        if palette == 0 {
-          if cur == 0 {
+        let cur = grid.get_voxel(VoxelCoord::from_ivec3(p)).unwrap_or(PaletteId::AIR);
+        if palette.is_air() {
+          if cur.is_air() {
             continue; // 擦除：本来就是空气
           }
-        } else if cur != 0 {
+        } else if !cur.is_air() {
           continue; // 放置：不覆盖已有几何
         }
         if grid.set_voxel_ivec3(p, palette).is_some() {
@@ -264,7 +265,7 @@ pub(crate) fn voxel_edit_input(
     return;
   };
   let (center, pal) = if erase {
-    (hit, 0u8)
+    (hit, PaletteId::AIR)
   } else {
     // 放置落点 = 命中面外侧一格
     let slot = ensure_material(grid, &mut settings, mat_idx);

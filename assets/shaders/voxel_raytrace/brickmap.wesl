@@ -42,13 +42,13 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   // 统一 buffer 内绝对字基址 = volume 基址 + entry - 1（entry 编码的是本 volume 内相对地址）
   let chunk_base = g.tree_base + entry - 1u;
 
-  // ---- DFS 4 层 mask 遍历（level 3 inline 4 体素/word，level 0-2 紧凑）----
+  // ---- DFS 4 层 mask 遍历（level 3 inline 2 体素/字 = 32 字，level 0-2 紧凑）----
   let local = vec3<u32>(m);  // chunk 内 voxel 坐标 0..255
   var node_addr = chunk_base;
   for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
     let mask_lo = b_struct[node_addr];
     let mask_hi = b_struct[node_addr + 1u];
-    let palette = b_struct[node_addr + 2u] & 0xFFu;
+    let palette = b_struct[node_addr + 2u] & 0xFFFFu;  // 节点字低 16 位 = uniform 色
 
     // 该层 4³ 子块索引：shift = 8 - (level+1)*2（level 0:>>6, 1:>>4, 2:>>2, 3:>>0）
     let shift = 8u - (level + 1u) * 2u;
@@ -70,10 +70,10 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
     }
 
     if (level == 3u) {
-      // level 3 inline palette，4 体素/word = b_struct[node + 3 + (child_idx >> 2)]
-      // palette = 该 word 的第 (child_idx & 3) 字节
-      let w = b_struct[node_addr + NODE_FIXED_WORDS + (child_idx >> 2u)];
-      return (w >> ((child_idx & 3u) * 8u)) & 0xFFu;
+      // level 3 inline palette：每字 2 个体素（16 位索引），共 32 字
+      // = b_struct[node + 3 + (child_idx >> 1)] 的第 (child_idx & 1) 个半字
+      let w = b_struct[node_addr + NODE_FIXED_WORDS + (child_idx >> 1u)];
+      return (w >> ((child_idx & 1u) * 16u)) & 0xFFFFu;
     }
 
     // level 0-2：紧凑 popcount 定位 child offset
@@ -85,5 +85,5 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
     }
     node_addr = chunk_base + b_struct[node_addr + NODE_FIXED_WORDS + popcount_below];
   }
-  return b_struct[node_addr + 2u] & 0xFFu;  // fallback（正常路径不可达）
+  return b_struct[node_addr + 2u] & 0xFFFFu;  // fallback（正常路径不可达）
 }

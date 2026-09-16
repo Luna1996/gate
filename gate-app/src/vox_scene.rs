@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
 
-use gate_voxel::{CHUNK_SIZE, ChunkCoord, ChunkTree, PaletteEntry, VolumeGrid};
+use gate_voxel::{
+  CHUNK_SIZE, ChunkCoord, ChunkTree, PALETTE_INDEX_MAX, PaletteEntry, PaletteId, VolumeGrid,
+};
 use glam::IVec3;
 use rayon::prelude::*;
 
@@ -118,11 +120,12 @@ pub fn load_vox_scene(
       let mut tree = ChunkTree::empty();
       let mut applied = 0u64;
       for &p in &packed {
+        // 打包字高 8 位是 .vox 自身的色号（该格式就是 256 色调色板），转成材质索引
         if tree.set_voxel(
           (p & 0xFF) as i32,
           ((p >> 8) & 0xFF) as i32,
           ((p >> 16) & 0xFF) as i32,
-          (p >> 24) as u8,
+          PaletteId((p >> 24) as u16),
         ) {
           applied += 1;
         }
@@ -167,17 +170,17 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
     e.color = [rgba.r, rgba.g, rgba.b];
     e.roughness = mat.rough.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(200);
     e.emissive = mat.emit.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(0);
-    pal.set(i as u8, e);
+    pal.set(PaletteId(i as u16), e);
     painted += 1;
   }
   // 材质统计（emissive 体素在直接光与 GI 射线端点都会高频贡献亮度）
-  let em: Vec<u8> = (1..=255u8).filter(|&i| pal.get(i).emissive > 0).collect();
+  let em: Vec<u16> = (1..=255u16).filter(|&i| pal.get(PaletteId(i)).emissive > 0).collect();
   bevy::log::info!(
-    "VOX MATERIAL: {} emissive palette indices = {:?}（引用 {} 个色号，空槽 {} 个留给编辑材质）",
+    "VOX MATERIAL: {} emissive palette indices = {:?}（引用 {} 个色号，本 volume 余 {} 个空槽留给编辑材质）",
     em.len(),
     em,
     painted,
-    255 - painted
+    PALETTE_INDEX_MAX as usize - painted
   );
 }
 
@@ -239,7 +242,9 @@ fn transformed_aabb(t: &vox_rs::Transform, sx: u32, sy: u32, sz: u32) -> (IVec3,
   (lo, hi)
 }
 
-/// 单实例体素分桶：chunk → u32 打包（chunk 内 local 0..255 各 8 bit + palette）。
+/// 单实例体素分桶：chunk → u32 打包（chunk 内 local 0..255 各 8 bit + 高 8 位 .vox 色号）。
+/// 注意高 8 位是 **.vox 自身的色号**（该格式就是 256 色调色板），不是本引擎的 16 位材质索引；
+/// 建树时按 `PaletteId(色号)` 直接落在同名槽上。
 /// 并行建树的数据面，chunk 间零共享；x-major 行切片迭代 + last-chunk 缓存，
 /// 连续体素几乎都落同一 chunk，HashMap 只在跨 chunk 时触碰。
 fn bucket_instance(

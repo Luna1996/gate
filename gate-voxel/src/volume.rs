@@ -11,7 +11,7 @@ use glam::{IVec3, Mat3, Vec3};
 use crate::chunk_tree::ChunkTree;
 use crate::coords::{CHUNK_SIZE, ChunkCoord, VoxelCoord};
 use crate::dirty::DirtyTracker;
-use crate::palette::Palette;
+use crate::palette::{Palette, PaletteId};
 
 /// 组件层：level 2 brick = 16³ = 4096 体素 = 一个组件 cell
 /// 每 chunk = (256/16)³ = 16³ = 4096 个 level 2 brick = 4096 个 u16
@@ -40,6 +40,15 @@ pub struct VolumeGrid {
   /// 渲染侧探针烘焙等派生数据据此判断「自上次构建以来世界是否被编辑」→ 触发重烘。
   /// palette 变化不计入（探针位置不变，辐射度由射线更新 EMA 自然收敛）。
   edit_generation: u64,
+  /// 编辑产生的**最小 voxel AABB**（按 chunk 记录，闭开区间 `[lo, hi)`）。
+  ///
+  /// 渲染侧据此把 DDGI 等派生数据的重烘范围收紧到"真正被改到的体素"。粒度很重要：chunk 级
+  /// AABB（256³）会让一次单格编辑失效 16³ = 4096 个 LOD0 探针，它们同帧把 age 压回 1 ⇒
+  /// 整片间接光同帧偏移，即"编辑后 GI 闪一下"。
+  ///
+  /// 上传该 chunk 时由 [`Self::take_edit_aabb`] 取走；未记录者（批量导入、`mount_chunk_tree`）
+  /// 消费方回退到 chunk 包围盒，行为与旧版一致。
+  edit_aabbs: HashMap<ChunkCoord, (IVec3, IVec3)>,
 }
 
 impl Default for VolumeGrid {
@@ -54,6 +63,7 @@ impl Default for VolumeGrid {
       transform: VolumeTransform::IDENTITY,
       obj_id: -1,
       edit_generation: 0,
+      edit_aabbs: HashMap::new(),
     }
   }
 }
@@ -191,6 +201,33 @@ impl VolumeGrid {
     self.edit_generation
   }
 
+  /// 取走某 chunk 的编辑 AABB（闭开区间 `[lo, hi)`，**世界 voxel 坐标**）。
+  ///
+  /// 渲染侧在上传该 chunk 的那一帧调用，用来把 DDGI 重烘范围收紧到实际编辑区域；
+  /// None = 该 chunk 不是由体素编辑标脏的（批量导入等）→ 消费方回退到 chunk 包围盒。
+  pub fn take_edit_aabb(&mut self, chunk: ChunkCoord) -> Option<(IVec3, IVec3)> {
+    self.edit_aabbs.remove(&chunk)
+  }
+
+  /// 记录单格编辑（同 chunk 取并集）
+  fn note_edit(&mut self, chunk: ChunkCoord, voxel: IVec3) {
+    self.note_edit_box(chunk, voxel, voxel + IVec3::ONE);
+  }
+
+  /// 记录一块编辑区域（闭开 `[lo, hi)`，世界 voxel 坐标；同 chunk 取并集）
+  fn note_edit_box(&mut self, chunk: ChunkCoord, lo: IVec3, hi: IVec3) {
+    match self.edit_aabbs.entry(chunk) {
+      std::collections::hash_map::Entry::Vacant(v) => {
+        v.insert((lo, hi));
+      }
+      std::collections::hash_map::Entry::Occupied(mut o) => {
+        let (l, h) = o.get_mut();
+        *l = l.min(lo);
+        *h = h.max(hi);
+      }
+    }
+  }
+
   pub fn palette(&self) -> &Palette {
     &self.palette
   }
@@ -239,7 +276,7 @@ impl VolumeGrid {
   // 体素查询
   // =========================================================================
 
-  pub fn get_voxel(&self, voxel: VoxelCoord) -> Option<u8> {
+  pub fn get_voxel(&self, voxel: VoxelCoord) -> Option<PaletteId> {
     let chunk = voxel.chunk();
     let tree = self.chunks.get(&chunk)?;
     let local = voxel.in_chunk();
@@ -247,7 +284,7 @@ impl VolumeGrid {
   }
 
   /// 查询指定 level 的 brick 是否 uniform 同色
-  pub fn get_uniform(&self, voxel: VoxelCoord, level: u8) -> Option<u8> {
+  pub fn get_uniform(&self, voxel: VoxelCoord, level: u8) -> Option<PaletteId> {
     let chunk = voxel.chunk();
     let tree = self.chunks.get(&chunk)?;
     let local = voxel.in_chunk();
@@ -268,13 +305,14 @@ impl VolumeGrid {
   // 体素编辑
   // =========================================================================
 
-  pub fn set_voxel(&mut self, voxel: VoxelCoord, palette: u8) -> Option<DirtyEdit> {
+  pub fn set_voxel(&mut self, voxel: VoxelCoord, palette: PaletteId) -> Option<DirtyEdit> {
     let chunk = voxel.chunk();
     let local = voxel.in_chunk();
 
     let tree = self.chunks.entry(chunk).or_insert_with(ChunkTree::empty);
     if tree.set_voxel(local.x, local.y, local.z, palette) {
       self.dirty.mark_data(chunk);
+      self.note_edit(chunk, chunk.0 * CHUNK_SIZE + local);
       self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk })
     } else {
@@ -282,7 +320,7 @@ impl VolumeGrid {
     }
   }
 
-  pub fn set_voxel_ivec3(&mut self, pos: IVec3, palette: u8) -> Option<DirtyEdit> {
+  pub fn set_voxel_ivec3(&mut self, pos: IVec3, palette: PaletteId) -> Option<DirtyEdit> {
     self.set_voxel(VoxelCoord::from_ivec3(pos), palette)
   }
 
@@ -290,14 +328,14 @@ impl VolumeGrid {
   ///
   /// 大体积均匀填充专用：O(depth) 树路径，不逐体素分裂（见 [`ChunkTree::fill_brick`]）；
   /// `voxel` 为 brick 最小角的世界 voxel 坐标。
-  pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: u8) -> Option<DirtyEdit> {
+  pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: PaletteId) -> Option<DirtyEdit> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
     let cc = ChunkCoord(chunk);
     let changed = match self.chunks.get_mut(&cc) {
       Some(tree) => tree.fill_brick([local.x, local.y, local.z], extent, palette),
       None => {
-        if palette == 0 {
+        if palette.is_air() {
           return None; // 空 chunk 填空气 = noop，不建 chunk
         }
         let tree = self.chunks.entry(cc).or_insert_with(ChunkTree::empty);
@@ -306,6 +344,7 @@ impl VolumeGrid {
     };
     if changed {
       self.dirty.mark_data(cc);
+      self.note_edit_box(cc, voxel, voxel + IVec3::splat(extent));
       self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk: cc })
     } else {
@@ -323,6 +362,7 @@ impl VolumeGrid {
         self.chunks.remove(&chunk);
       }
       self.dirty.mark_data(chunk);
+      self.note_edit(chunk, chunk.0 * CHUNK_SIZE + local);
       self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk })
     } else {
@@ -330,7 +370,7 @@ impl VolumeGrid {
     }
   }
 
-  pub fn batch_edit(&mut self, ops: impl IntoIterator<Item = (VoxelCoord, u8)>) -> usize {
+  pub fn batch_edit(&mut self, ops: impl IntoIterator<Item = (VoxelCoord, PaletteId)>) -> usize {
     let mut applied = 0;
     for (voxel, palette) in ops {
       if self.set_voxel(voxel, palette).is_some() {

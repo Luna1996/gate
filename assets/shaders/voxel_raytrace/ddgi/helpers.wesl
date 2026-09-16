@@ -33,7 +33,7 @@ fn ddgi_chunk_base(g: Grid, voxel: vec3<i32>) -> u32 {
 fn ddgi_agg4(chunk_base: u32, node: u32) -> u32 {
   let mask_lo = b_struct[node];
   let mask_hi = b_struct[node + 1u];
-  let pal = b_struct[node + 2u] & 0xFFu;
+  let pal = b_struct[node + 2u] & 0xFFFFu;
   var seen: u32 = 3u;
   for (var idx = 0u; idx < 64u; idx = idx + 1u) {
     let in_hi = idx >= 32u;
@@ -41,8 +41,9 @@ fn ddgi_agg4(chunk_base: u32, node: u32) -> u32 {
     let bit_in = select(idx, idx - 32u, in_hi);
     var vp = pal;
     if (((word >> bit_in) & 1u) != 0u) {
-      let w = b_struct[node + NODE_FIXED_WORDS + (idx >> 2u)];
-      vp = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+      // 叶父层 inline：每字 2 体素（16 位索引）
+      let w = b_struct[node + NODE_FIXED_WORDS + (idx >> 1u)];
+      vp = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
     }
     let st = select(1u, 0u, vp == 0u);
     seen = ddgi_merge_state(seen, st);
@@ -54,7 +55,7 @@ fn ddgi_agg4(chunk_base: u32, node: u32) -> u32 {
 fn ddgi_agg16(chunk_base: u32, node: u32) -> u32 {
   let mask_lo = b_struct[node];
   let mask_hi = b_struct[node + 1u];
-  let pal = b_struct[node + 2u] & 0xFFu;
+  let pal = b_struct[node + 2u] & 0xFFFFu;
   var seen: u32 = 3u;
   for (var idx = 0u; idx < 64u; idx = idx + 1u) {
     let in_hi = idx >= 32u;
@@ -76,7 +77,7 @@ fn ddgi_agg16(chunk_base: u32, node: u32) -> u32 {
 fn ddgi_agg64(chunk_base: u32, node: u32) -> u32 {
   let mask_lo = b_struct[node];
   let mask_hi = b_struct[node + 1u];
-  let pal = b_struct[node + 2u] & 0xFFu;
+  let pal = b_struct[node + 2u] & 0xFFFFu;
   var seen: u32 = 3u;
   for (var idx = 0u; idx < 64u; idx = idx + 1u) {
     let in_hi = idx >= 32u;
@@ -104,7 +105,7 @@ fn ddgi_brick_state(g: Grid, origin: vec3<i32>, level: u32) -> u32 {
   for (var cur = 0u; cur < level; cur = cur + 1u) {
     let mask_lo = b_struct[node];
     let mask_hi = b_struct[node + 1u];
-    let pal = b_struct[node + 2u] & 0xFFu;
+    let pal = b_struct[node + 2u] & 0xFFFFu;
     let shift = 8u - (cur + 1u) * 2u;
     let cx = (local.x >> shift) & 3u;
     let cy = (local.y >> shift) & 3u;
@@ -120,7 +121,7 @@ fn ddgi_brick_state(g: Grid, origin: vec3<i32>, level: u32) -> u32 {
     if (cur + 1u == level) {
       // 均匀节点快速路径：mask 全 0 → palette 直决（省 64 次 agg 迭代；空气 16³ 最常见）
       if (b_struct[child] == 0u && b_struct[child + 1u] == 0u) {
-        return select(1u, 0u, (b_struct[child + 2u] & 0xFFu) == 0u);
+        return select(1u, 0u, (b_struct[child + 2u] & 0xFFFFu) == 0u);
       }
       if (level == 1u) { return ddgi_agg64(cb, child); }
       if (level == 2u) { return ddgi_agg16(cb, child); }

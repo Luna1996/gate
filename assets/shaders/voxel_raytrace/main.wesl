@@ -2,7 +2,7 @@ import package::bindings::{BEAM_BACKOFF, BEAM_DIV, DDGI_INDIR_CAST_BASE, DDGI_IN
 import package::common::{linear_to_srgb, palette_albedo, palette_emissive, sky_rgb, srgb_to_linear};
 import package::ddgi::bake::{ddgi_bake_one};
 import package::ddgi::collect::{ddgi_collect_one};
-import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
+import package::ddgi::consts::{DDGI_AGE_MAX, DDGI_AMBIENT_FLOOR, DDGI_BAKE_STAGGER, DDGI_CAST_FLOOR, DDGI_COLLECT_THREADS, DDGI_CONF_HI, DDGI_CONF_LO, DDGI_DEPTH_TEXELS, DDGI_EMIT_GAIN, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_PI, DDGI_RAY_BIAS, DDGI_RAY_BUDGET, DDGI_REFRESH_PERIOD, DDGI_SKIP_AGE, DDGI_SKY_AMBIENT, DDGI_SKY_RADIANCE_SCALE, DDGI_T_MAX, DDGI_USAGE_SCAN_MASK, DDGI_WL_IDX_MASK, DDGI_WL_LOD_SHIFT, SHADOW_SURFACE_EPS};
 import package::ddgi::helpers::{DDGI_REC_ENABLED, DDGI_REC_OCCUPIED, ddgi_lod_slot_base, ddgi_meta_age, ddgi_meta_pack, ddgi_meta_with_nbr, ddgi_oct_decode, ddgi_rand2, ddgi_ray_rand, ddgi_rec_off, ddgi_slot_lod_of, ddgi_slot_world_cell};
 import package::ddgi::sample::{ddgi_dbg_cov, ddgi_dbg_dom, ddgi_dbg_edge, ddgi_dbg_fb, ddgi_dbg_rej_out, ddgi_dbg_wsum, ddgi_dbg_zero, ddgi_sample, ddgi_usage_track};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_nbr_vis_mask, ddgi_neighbor_occupied};
@@ -363,7 +363,11 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (ddgi_u.dirty_min.w > 0.5
       && all(cell_hi > ddgi_u.dirty_min.xyz)
       && all(cell_lo < ddgi_u.dirty_max.xyz)) {
-    age = 1u;
+    // 按槽位号错峰（与 bake 换主路径同一套做法，见 bake.wesl 的 DDGI_BAKE_STAGGER 注释）：
+    // 脏区是一个 chunk 级 AABB，同帧把整片探针的 age 都压到 1，会让它们在下一帧**一起**以
+    // alpha=1/2 换成"单帧高方差估计" ⇒ 一整块间接光同帧偏移，视觉上就是"编辑后闪一下"。
+    // 错开后每帧只有 1/N 的探针发生跳变，打散空间一致性；平均跟随速度不变（age 仍从下往上跑满斜坡）。
+    age = 1u + (slot % DDGI_BAKE_STAGGER);
   }
   // 判活条件：有探针 && (本 cell 或 6 邻接有体素 || 与物体 AABB 相交)。
   let is_active = near;
