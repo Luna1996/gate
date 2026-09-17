@@ -392,8 +392,9 @@ fn ddgi_rec_off(rec: u32) -> vec3<u32> {
 //   ENABLED：烘焙阶段放了探针（有 irr/depth 数据可采样）
 //   ACTIVE ：本 cell 或 6 邻接有体素 / 物体，且未被更细 LOD 覆盖 —— 本帧需要投线
 //   NBR    ：6 邻接可见性掩码（见 DDGI_META_NBR_SHIFT），由 sort 每帧为活跃探针重算
-//   NBR_VALID：掩码是否已算过；bake 与非活跃路径写 0 ⇒ 消费侧不做门控，
-//            避免把"还没算"误当成"全被挡住"而整片关掉混合。
+//   NBR_VALID：掩码是否已算过；bake 与非活跃路径写 0 ⇒ 消费侧按**被挡**处理（保守不混）。
+//            未算 ≠ 可见：这类探针本帧未投线、图集值是陈旧的，混进来会把隔墙（含看到天空的）
+//            辐照度抹进墙内。
 fn ddgi_meta_pack(age: u32, enabled: bool, is_active: bool) -> u32 {
   return (age & 0xFFu)
     | select(0u, DDGI_META_ENABLED, enabled)

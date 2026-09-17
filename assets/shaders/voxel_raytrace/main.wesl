@@ -687,15 +687,16 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  // ---- 邻接可见性掩码（空间混合门控）：只对活跃探针算（非活跃者不投线、图集不更新，
-  // 也不会作为混来源被邻居采用）。非活跃路径不置 NBR_VALID → 消费侧按"未算过"处理（不做门控）。
+  // ---- 邻接可见性掩码（空间混合门控）：只对活跃探针算。活跃探针本帧不投线则图集不更新，
+  // 其值是**陈旧**的（可能来自它还是别的位置/还是活跃时）⇒ 不该作为混来源；消费侧对
+  // `NBR_VALID = 0` 一律按"被挡"处理（保守不混），见 `ddgi_probe_blend_irr`。
   //
   // 【只在本级可能变了时重算】掩码 = f(探针实际位置, 世界几何, cs)，而这三者的变化时机都是已知的：
   //   · 换主 / LOD0 池重分配 / 网格重建 → bake 重写该槽 meta（丢掉 NBR_VALID）⇒ 这里 !valid 自动触发；
   //   · 世界编辑 → 该 cell 内探针可能被 `ddgi_place_probe` 搬家（位置变），几何也可能挡住/放通某条轴
-  //     向射线 ⇒ 按脏区 AABB 判。**判据必须把 cell 盒沿各轴外扩 cs**：射线长 cs、起点在 cell 内，
-  //     故线段 AABB ⊆ cell 盒 ⊕ cs；只用 cell 盒会漏掉"贴 chunk 边界的 cell"朝外那一侧
-  //     （那一侧的射线落进相邻 chunk，编辑恰在那里时掩码会陈旧）。
+  //     向射线 ⇒ 按脏区 AABB 判。**判据必须把 cell 盒沿各轴外扩 cs**：线段从 cell 内的探针起到
+  //     邻居 cell 中心（≤ 1.5·cs），故线段 AABB ⊆ cell 盒 ⊕ cs；只用 cell 盒会漏掉"贴 chunk
+  //     边界的 cell"朝外那一侧（那一侧的射线落进相邻 chunk，编辑恰在那里时掩码会陈旧）。
   // 其余帧直接沿用上一帧掩码 —— 6 条射线 × 每个活跃探针 × 每帧就是 sort 的全部成本
   // （实测 0.44ms → 0.06ms）。DDGI 网格锚定世界 AABB、不随相机换主，所以相机移动不会误触发重算。
   var meta_word = ddgi_meta_pack(age, true, is_active);
@@ -707,7 +708,7 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
       && all(cell_hi + pad > ddgi_u.dirty_min.xyz)
       && all(cell_lo - pad < ddgi_u.dirty_max.xyz);
     if ((prev_meta & DDGI_META_NBR_VALID) == 0u || dirty_here) {
-      mask = ddgi_nbr_vis_mask(probe_pos, f32(cs));
+      mask = ddgi_nbr_vis_mask(probe_pos, vec3<f32>(cmin), f32(cs));
     }
     meta_word = ddgi_meta_with_nbr(meta_word, mask);
   }

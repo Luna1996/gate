@@ -11,7 +11,8 @@ fn ddgi_irr_nbr(id: u32, tx: u32, ty: u32) -> vec4<f32> {
   return textureLoad(ddgi_irr, vec2<i32>(vec2<u32>(c.y, c.z)), i32(c.x), 0);
 }
 /// 6 个轴向邻居的同名纹素按探针**实际间距**加权求和；返回 (加权和, 权重和)。
-/// 只接受同 LOD 网格内、本帧 ENABLED 且**该纹素有数据**的邻居。
+/// 只接受同 LOD 网格内、**邻接可见性掩码已算且双向都不撞几何**、本帧 ENABLED 且**该纹素有
+/// 数据**的邻居（掩码语义见 `ddgi_nbr_vis_mask`；未算 = 按被挡处理，保守不混）。
 /// "有数据"必须按第 4 通道的覆盖度判（DDGI_TEXEL_MIN_COVERAGE）：DDGI_CAST_FLOOR = 0 时
 /// "已写入但真黑"与"从未写过"的值都是 0，按值过滤会把暗邻居整批踢掉 —— 而暗邻居正是稀释
 /// 亮邻居的唯一手段。
@@ -29,7 +30,7 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
     let wc = ddgi_slot_world_cell(0u, pidx);
     let self_meta = ddgi_meta[base + pidx];
     let self_nbr = ddgi_meta_nbr(self_meta);
-    // NBR_VALID 未置位（非活跃探针 / 掩码未算）→ 不做门控。
+    // 本探针掩码是否已算（collect 只跑活跃探针，正常恒为真；未算则整段不混，保守）。
     let self_gate = (self_meta & DDGI_META_NBR_VALID) != 0u;
     for (var a = 0u; a < 6u; a = a + 1u) {
       var off = vec3<i32>(1, 0, 0);
@@ -43,14 +44,15 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
       let nslot = ddgi_slot_own(0u, nwc);
       if (nslot == base + pidx) { continue; }
       // ---- 邻接可见性门控（与 LOD1~3 分支同一套语义，位序映射见 ddgi_nbr_bit_lod0）----
+      // 【保守不混：未知 ≠ 可见】掩码未算的探针本帧未投线、图集值是陈旧的（可能来自别的位置或
+      // 更早的几何）⇒ 一律按"被挡"处理。放宽成"未算就放行"会让隔墙探针（含看到天空的那些）
+      // 把辐照度抹进墙内：1 体素薄壳的封闭内腔整片透光就是这么来的。
       let sbit = ddgi_nbr_bit_lod0(a);
       let nmeta = ddgi_meta[nslot];
-      if (self_gate) {
-        if ((self_nbr & (1u << sbit)) == 0u) { continue; }
-        // 反向也判（邻居掩码已算时才判）：本方向通、反向被挡属薄墙，按被挡处理。
-        if ((nmeta & DDGI_META_NBR_VALID) != 0u
-            && (ddgi_meta_nbr(nmeta) & (1u << (sbit ^ 1u))) == 0u) { continue; }
-      }
+      if (!self_gate || (self_nbr & (1u << sbit)) == 0u) { continue; }
+      // 反向也判（且同样要求对方掩码有效）：本方向通、反向被挡属薄墙，按被挡处理。
+      if ((nmeta & DDGI_META_NBR_VALID) == 0u
+          || (ddgi_meta_nbr(nmeta) & (1u << (sbit ^ 1u))) == 0u) { continue; }
       if ((nmeta & DDGI_META_ENABLED) == 0u) { continue; }
       let v = ddgi_irr_nbr(nslot, tx, ty);
       if (v.w < DDGI_TEXEL_MIN_COVERAGE) { continue; }
@@ -76,16 +78,14 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
       // ---- 邻接可见性门控：本探针向该邻居方向的线段被几何挡住 → 不混 ----
       // 位序 = a*2 + (plus ? 1 : 0)（0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z）。
       // 必须门控：混合本身不看可见性，能看到天空的探针会把天空辐照度抹给隔墙的暗探针
-      // ⇒ 封闭房间凹角整片漏光。反向也判（邻居掩码的 bit^1），避免薄墙造成的单向不对称；
-      // 两侧掩码未算（NBR_VALID=0）时不参与判定，不会误关混合。
+      // ⇒ 封闭房间凹角整片漏光。反向也判（邻居掩码的 bit^1），避免薄墙造成的单向不对称。
+      // 【保守不混：未知 ≠ 可见】掩码未算的探针本帧未投线、图集值是陈旧的 ⇒ 按"被挡"处理。
       let sbit = a * 2u + select(0u, 1u, plus);
       let nslot = base + select(pidx - stride, pidx + stride, plus);
       let nmeta = ddgi_meta[nslot];
-      if (self_gate) {
-        if ((self_nbr & (1u << sbit)) == 0u) { continue; }
-        if ((nmeta & DDGI_META_NBR_VALID) != 0u
-            && (ddgi_meta_nbr(nmeta) & (1u << (sbit ^ 1u))) == 0u) { continue; }
-      }
+      if (!self_gate || (self_nbr & (1u << sbit)) == 0u) { continue; }
+      if ((nmeta & DDGI_META_NBR_VALID) == 0u
+          || (ddgi_meta_nbr(nmeta) & (1u << (sbit ^ 1u))) == 0u) { continue; }
       if ((nmeta & DDGI_META_ENABLED) == 0u) { continue; }
       let v = ddgi_irr_nbr(nslot, tx, ty);
       if (v.w < DDGI_TEXEL_MIN_COVERAGE) { continue; }

@@ -56,18 +56,30 @@ fn ddgi_neighbor_occupied(lod: u32, wc: vec3<i32>) -> bool {
   return (ddgi_cell[ddgi_slot_own(lod, wc)] & DDGI_REC_OCCUPIED) != 0u;
 }
 
-/// 6 邻接可见性掩码：从探针位置沿 6 个轴向各走 1 个 cell（长度 = cs），**不撞几何**则该位为 1。
-/// 空间混合（`ddgi_probe_blend_irr`）用它门控：跨墙的那一位被清掉，墙外探针的天空辐照度不会
-/// 被抹到墙内。
+/// 6 邻接可见性掩码：从探针位置沿 6 个轴向各走一条**到邻居 cell 中心**的线段，**不撞几何**
+/// 则该位为 1。空间混合（`ddgi_probe_blend_irr`）用它门控：跨墙的那一位被清掉，墙外探针的
+/// 天空辐照度不会被抹到墙内。
 /// 起点必须是探针本身（探针由 `ddgi_place_probe` 放在空叶内 ⇒ t>0 的任何命中都是真遮挡；
-/// 沿轴内缩会漏掉紧贴探针的薄墙）。终点取邻居 cell 中心，故长度 = cs —— 实心邻居的射线会在
-/// 其内部命中，该位为 0（被遮挡）。
-fn ddgi_nbr_vis_mask(probe_pos: vec3<f32>, cs: f32) -> u32 {
+/// 沿轴内缩会漏掉紧贴探针的薄墙）。终点取邻居 cell 中心 —— 实心邻居的射线会在其内部命中，
+/// 该位为 0（被遮挡）。
+///
+/// 【长度必须按探针的实际偏移算，不能恒取 cs】`cs` 只在「探针位于自己 cell 中心」时等于
+/// 探针到邻居 cell 中心的距离；而 `ddgi_place_probe` 会把探针搬到 cell 内的最近空叶
+/// （薄壳/薄墙场景里很常见，cell 中心落在几何上时尤其），此时探针整体偏向 cell 一侧 ⇒
+/// 恒长 `cs` 的射线可能**停在墙前**、判成"可见" ⇒ 空间混合把墙外（天空/邻室）辐照度抹进墙内：
+/// 封闭 1 体素薄壳内腔整片透光正是这么来的。故由 `cmin`（本 cell 世界原点，与 `ddgi_sort`/bake
+/// 同一套 cell 对齐）解出邻居 cell 中心，逐方向取真实距离。
+fn ddgi_nbr_vis_mask(probe_pos: vec3<f32>, cmin: vec3<f32>, cs: f32) -> u32 {
   let gw = make_grid(0u);
   let cfg = world_cfg_full(0.0, 3u);
+  let center = cmin + vec3<f32>(cs * 0.5);
   var mask: u32 = 0u;
   for (var a = 0u; a < 6u; a = a + 1u) {
-    let hit = world_raycast(gw, probe_pos, ddgi_nbr_dir(a), cs, cfg);
+    let seg = center + ddgi_nbr_dir(a) * cs - probe_pos;
+    let len = length(seg);
+    // 退化（探针与邻居 cell 中心重合）无方向可言 → 保守不给该位
+    if (len <= 1e-4) { continue; }
+    let hit = world_raycast(gw, probe_pos, seg / len, len, cfg);
     if (!hit.hit) { mask = mask | (1u << a); }
   }
   return mask & DDGI_META_NBR_MASK;

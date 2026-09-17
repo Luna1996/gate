@@ -25,12 +25,14 @@ const DDGI_META_ENABLED: u32 = 256u;
 const DDGI_META_ACTIVE: u32 = 512u;
 /// 邻接可见性掩码在 meta 里的位偏移（占 bit10-15，共 6 位）。
 /// 位序（相邻两位同轴，故「反向」= `bit ^ 1u`）：0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z。
-/// bit=1 = 从本探针沿该轴走 cs 不撞几何。由 `ddgi_sort` 每帧为活跃探针写入（6 条 cs 长射线），
-/// `ddgi_probe_blend_irr` 读来门控空间混合 —— 见 `ddgi_nbr_vis_mask` 的说明。
+/// bit=1 = 从本探针沿该轴走到**邻居 cell 中心**（长度 = 探针到该中心的实际距离，不是恒 cs）
+/// 不撞几何。由 `ddgi_sort` 每帧为活跃探针写入（6 条射线），`ddgi_probe_blend_irr` 读来门控
+/// 空间混合 —— 见 `ddgi_nbr_vis_mask` 的说明。
 const DDGI_META_NBR_SHIFT: u32 = 10u;
 /// 掩码取值域（6 位）。
 const DDGI_META_NBR_MASK: u32 = 0x3Fu;
-/// 「邻接可见性掩码已由本帧 sort 算过」的有效位（bit16）；未置位时消费侧不做门控。
+/// 「邻接可见性掩码已由本帧 sort 算过」的有效位（bit16）；未置位时消费侧按**被挡**处理
+/// （未知 ≠ 可见 —— 那类探针本帧未投线、图集值是陈旧的，混进来即跨墙漏光）。
 const DDGI_META_NBR_VALID: u32 = 65536u;
 const DDGI_AGE_MAX: u32 = 255u;
 /// worklist `.w` 的位段打包：age(低 8 位) | cell 下标(19 位) | lod(2 位)。
