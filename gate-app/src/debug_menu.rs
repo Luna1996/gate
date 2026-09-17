@@ -53,8 +53,6 @@ pub const PROBE_KEYS: [&str; 6] = [
   "menu.render.ddgi.probe.lod3",
   "menu.render.ddgi.probe.all",
 ];
-/// 「全」对应的 `probe_viz_lod`（WESL 里 4 = All）
-const PROBE_VIZ_LOD_ALL: f32 = 4.0;
 
 /// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（改这里就要同步资产文件）。
 /// 文案字段一律写 i18n key（`menu.*`），经 gate-ui `UiTranslator` 解析；`id` 是与语言无关的回调路径段。
@@ -338,10 +336,12 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   // 文案解析器取资源里的（语言切换只需 bump 版本，见 sync_ui_locale）
   let translate = world.resource::<UiTranslator>().handle();
   let ctx = UiCtx::new(ctx.theme, ctx.font).with_icon_font(ctx.icon_font).with_translate(translate);
-  spawn_debug_menu(world, &ctx, model);
-  apply_initial_state(world);
-  spawn_fps_overlay(world, &ctx);
+  let handle = spawn_debug_menu(world, &ctx, model);
+  // 顺序：先挂回调，再把 TOML 初值按节点重放成 `MenuActionEvent`（资源映射只存在于观察者里），
+  // 最后建覆盖层（它读的 `FpsOverlayVisible` 已由初值重放写好）。
   register_callbacks(world);
+  apply_initial_state(world, handle.root);
+  spawn_fps_overlay(world, &ctx);
 }
 
 /// 语言切换后让 gate-ui 重解析全部 keyed 文本；解析闭包读 rust-i18n 当前 locale，故只需 bump 版本。
@@ -384,155 +384,39 @@ fn spawn_fps_overlay(world: &mut World, ctx: &UiCtx) {
   }
 }
 
-/// 用菜单模型初始化各调试资源的初值（TOML = 所有调试常量的初值来源）
-fn apply_initial_state(world: &mut World) {
-  let model = match gate_ui::menu_model(world) {
-    Some(m) => m.clone(),
-    None => return,
-  };
-  let get_bool = |path: &str, dflt: bool| -> bool {
-    match model.node(&split(path)) {
-      Some(MenuNode::Toggle { checked, .. }) => *checked,
-      _ => dflt,
-    }
-  };
-  let get_sel = |path: &str| -> Option<usize> {
-    match model.node(&split(path)) {
-      Some(MenuNode::SwitchGroup { selected, .. }) => Some(*selected),
-      _ => None,
-    }
-  };
-  let get_val = |path: &str| -> Option<f32> {
-    match model.node(&split(path)) {
-      Some(MenuNode::Slider { value, .. }) => Some(*value),
-      _ => None,
-    }
-  };
-  let get_text = |path: &str| -> Option<String> {
-    match model.node(&split(path)) {
-      Some(MenuNode::Input { fields, .. }) => fields.first().map(|f| f.text.clone()),
-      _ => None,
-    }
-  };
-  // 颜色控件是独立节点类型（`color()` → `MenuNode::Color`），不是 `Input`；用 `get_text` 读它恒为 None。
-  let get_color = |path: &str| -> Option<String> {
-    match model.node(&split(path)) {
-      Some(MenuNode::Color { hex, .. }) => Some(hex.clone()),
-      _ => None,
-    }
-  };
+/// 用菜单模型初始化各调试资源：把 TOML 初值按节点重放成 `MenuActionEvent`
+/// （TOML = 所有调试常量的初值来源；「菜单值 → 资源」的映射只在 `register_callbacks` 的观察者里写一次）。
+fn apply_initial_state(world: &mut World, root: Entity) {
+  let Some(model) = gate_ui::menu_model(world).cloned() else { return };
+  let mut actions = Vec::new();
+  collect_actions(&model.items, "", &mut actions);
+  let n = actions.len();
+  for (path, action) in actions {
+    world.trigger(MenuActionEvent { entity: root, path, action });
+  }
+  info!(target: "gate", "debug menu 初值已应用：{n} 项（来源 {MENU_TOML_PATH}）");
+}
 
-  world.resource_mut::<FpsOverlayVisible>().0 = get_bool("video/fps", false);
-  // 抗锯齿（FXAA）/ 半分辨率渲染（RenderScale.factor）写 main world 资源，render world 跟随。
-  world.resource_mut::<gate_render::PostFxSettings>().fxaa = get_bool("video/aa", false);
-  world.resource_mut::<gate_render::RenderScale>().factor =
-    if get_bool("video/half_res", false) { HALF_RES_FACTOR } else { 1 };
-  let mut q_win = world.query_filtered::<&mut Window, With<PrimaryWindow>>();
-  if let Some(mut win) = q_win.iter_mut(world).next() {
-    win.present_mode =
-      if get_bool("video/vsync", true) { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
-    // 全屏：按存档进无边框全屏（窗口尺寸/位置由 winit 记住）
-    win.mode = if get_bool("video/fullscreen", false) {
-      WindowMode::BorderlessFullscreen(MonitorSelection::Current)
-    } else {
-      WindowMode::Windowed
-    };
-  }
-  drop(q_win);
-
-  {
-    let stage = if get_bool("render/ddgi/enabled", true) {
-      gate_render::ddgi::DdgiStage::FULL
-    } else {
-      gate_render::ddgi::DdgiStage::OFF
-    };
-    *world.resource_mut::<gate_render::ddgi::DdgiStage>() =
-      gate_render::ddgi::DdgiStage::new(stage);
-    let mut dbg = world.resource_mut::<gate_render::ddgi::DdgiDebugSettings>();
-    if let Some(m) = get_sel("render/ddgi/mode") {
-      dbg.mode = m as f32;
-    }
-    let probe = get_sel("render/ddgi/probe").unwrap_or(0);
-    dbg.probe_viz = probe > 0;
-    dbg.probe_viz_lod = if probe == 0 {
-      0.0
-    } else if probe + 1 >= PROBE_KEYS.len() {
-      PROBE_VIZ_LOD_ALL
-    } else {
-      (probe - 1) as f32
-    };
-    // 性能档（默认关 = 逐像素精确路径）
-    dbg.gi_half_res = get_bool("render/ddgi/gi_half", false);
-  }
-  {
-    let mut eye = world.resource_mut::<gate_render::EyeAdaptSettings>();
-    eye.enabled = get_bool("render/exposure/enabled", true);
-    if let Some(v) = get_val("render/exposure/ev_up") {
-      eye.ev_max = v;
-    }
-    if let Some(v) = get_val("render/exposure/ev_dn") {
-      eye.ev_min = v;
-    }
-    if let Some(v) = get_val("render/exposure/tau_up") {
-      eye.tau_brighten = v;
-    }
-    if let Some(v) = get_val("render/exposure/tau_dn") {
-      eye.tau_darken = v;
-    }
-    if let Some(v) = get_val("render/exposure/key") {
-      eye.key = v;
+/// 递归收集「带初值」的节点 → (id 路径, 动作)；`SubMenu` 只递归下去，`Buttons` / `Text` 无初值。
+fn collect_actions(nodes: &[MenuNode], prefix: &str, out: &mut Vec<(String, MenuAction)>) {
+  for n in nodes {
+    let path = if prefix.is_empty() { n.id().to_string() } else { format!("{prefix}/{}", n.id()) };
+    match n {
+      MenuNode::SubMenu { .. } => collect_actions(n.children(), &path, out),
+      MenuNode::Toggle { checked, .. } => out.push((path, MenuAction::Toggle(*checked))),
+      MenuNode::SwitchGroup { selected, .. } | MenuNode::Dropdown { selected, .. } => {
+        out.push((path, MenuAction::Select(*selected)));
+      }
+      MenuNode::Slider { value, .. } => out.push((path, MenuAction::Value(*value))),
+      MenuNode::Input { fields, .. } => {
+        if let Some(f) = fields.first() {
+          out.push((path, MenuAction::Text(f.text.clone())));
+        }
+      }
+      MenuNode::Color { hex, .. } => out.push((path, MenuAction::Text(hex.clone()))),
+      MenuNode::Buttons { .. } | MenuNode::Text { .. } => {}
     }
   }
-  {
-    if let Some(i) = get_sel("player/camera/mode") {
-      *world.resource_mut::<CameraMode>() =
-        if i == 0 { CameraMode::Orbit } else { CameraMode::Fly };
-    }
-    if let Some(v) = get_val("player/camera/speed") {
-      world.resource_mut::<FlyCamera>().speed = v * VOXEL_PER_METER;
-    }
-  }
-  {
-    let mut edit = world.resource_mut::<EditSettings>();
-    if let Some(i) = get_sel("game/edit/shape") {
-      edit.shape = if i == 0 { BrushShape::Sphere } else { BrushShape::Cube };
-    }
-    if let Some(t) = get_text("game/edit/size")
-      && let Ok(v) = t.trim().parse::<u32>()
-    {
-      edit.size = v.max(EDIT_SIZE_MIN);
-    }
-    // 材质四参数；只写「当前笔触材质」，不碰调色板（材质 → 槽的分配在落笔时按内容去重）。
-    if let Some(t) = get_color("game/edit/color")
-      && let Some([r, g, b, _]) = parse_hex_color(&t)
-    {
-      edit.mat.color = [r, g, b];
-    }
-    if let Some(v) = get_val("game/edit/emissive") {
-      edit.mat.emissive = v.round().clamp(0.0, 255.0) as u8;
-    }
-    if let Some(v) = get_val("game/edit/alpha") {
-      edit.mat.transmission = opacity_pct_to_transmission(v);
-    }
-    if let Some(v) = get_val("game/edit/smooth") {
-      edit.mat.roughness = smooth_pct_to_roughness(v);
-    }
-  }
-  info!(
-    target: "gate",
-    "debug menu 初值已应用：fs={} aa={} half_res={} vsync={} fps={} ddgi={} gi_half={} cam={:?} speed={:.2}m/s shape={:?} size={}",
-    get_bool("video/fullscreen", false),
-    get_bool("video/aa", false),
-    get_bool("video/half_res", false),
-    get_bool("video/vsync", true),
-    get_bool("video/fps", false),
-    get_bool("render/ddgi/enabled", true),
-    get_bool("render/ddgi/gi_half", false),
-    world.resource::<CameraMode>(),
-    world.resource::<FlyCamera>().speed / VOXEL_PER_METER,
-    world.resource::<EditSettings>().shape,
-    world.resource::<EditSettings>().size,
-  );
 }
 
 /// 路径字符串 → id 段
@@ -625,12 +509,10 @@ fn register_callbacks(world: &mut World) {
         }
         ("render/ddgi/probe", MenuAction::Select(i)) => {
           ddgi_dbg.probe_viz = *i > 0;
-          ddgi_dbg.probe_viz_lod = if *i == 0 {
+          ddgi_dbg.probe_viz_lod = if *i == 5 {
             0.0
-          } else if *i + 1 >= PROBE_KEYS.len() {
-            PROBE_VIZ_LOD_ALL
           } else {
-            (*i - 1) as f32
+            *i as f32
           };
           let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
           info!("探针绘制 → {name}");
