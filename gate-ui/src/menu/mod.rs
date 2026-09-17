@@ -1,4 +1,4 @@
-//! 通用 Menu 模块：DebugWindow 容器 + 可序列化菜单模型 + 8 种列表单项。
+//! 通用 Menu 模块：DebugWindow 容器 + 可序列化菜单模型 + 9 种列表单项。
 //!
 //! 分两层用法：
 //! 1. 本模块（gate-ui 级通用）：容器、通用组件、模型/TOML、交互驱动（[`menu_system`]）；
@@ -22,7 +22,7 @@ pub use items::{
   MenuSubMenuRow, MenuTextValue, join_path,
 };
 pub use model::{
-  InputField, MenuFile, MenuNode, WindowState, buttons, color, input, slider, sub_menu,
+  InputField, MenuFile, MenuNode, WindowState, buttons, color, dropdown, input, slider, sub_menu,
   switch_group, text, toggle, toggle_tip,
 };
 pub use window::{

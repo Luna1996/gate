@@ -24,8 +24,8 @@ use crate::capture::MouseIntercept;
 use crate::icon::{Icon, IconFont};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::{
-  LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputValue, UiCtx, color_of, dim_color,
-  label, px, spawn_icon,
+  DropdownValue, LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputValue, UiCtx,
+  color_of, dim_color, label, px, spawn_icon,
 };
 
 /// 窗口拖拽的上一帧光标位置（逻辑 px；`None` = 指针不在窗口内）。
@@ -123,7 +123,7 @@ pub struct MenuActionEvent {
 pub enum MenuAction {
   /// 按钮组第 i 个按钮被点击
   Button(usize),
-  /// 切换组选中第 i 项
+  /// 切换组选中第 i 项（下拉框选中第 i 项同此）
   Select(usize),
   /// 开关项翻转
   Toggle(bool),
@@ -495,18 +495,30 @@ pub fn menu_system(world: &mut World) {
     }
   }
 
-  // ---------- 3. 控件值同步（滑杆 / 开关 / 输入框 / 颜色） ----------
+  // ---------- 3. 控件值同步（滑杆 / 开关 / 输入框 / 颜色 / 下拉框） ----------
   let mut value_changes: Vec<(String, MenuRole, MenuValue)> = Vec::new();
   {
-    let mut q =
-      world.query::<(&MenuItem, Option<&SliderValue>, Has<Checked>, Option<&TextInputValue>)>();
-    let snapshot: Vec<(String, MenuRole, Option<f32>, Option<bool>, Option<String>)> = q
+    let mut q = world.query::<(
+      &MenuItem,
+      Option<&SliderValue>,
+      Has<Checked>,
+      Option<&TextInputValue>,
+      Option<&DropdownValue>,
+    )>();
+    let snapshot: Vec<ControlSnapshot> = q
       .iter(world)
-      .map(|(item, sv, checked, tv)| {
-        (item.path.clone(), item.role, sv.map(|v| v.0), Some(checked), tv.map(|t| t.0.clone()))
+      .map(|(item, sv, checked, tv, dv)| {
+        (
+          item.path.clone(),
+          item.role,
+          sv.map(|v| v.0),
+          Some(checked),
+          tv.map(|t| t.0.clone()),
+          dv.map(|d| d.0),
+        )
       })
       .collect();
-    for (path, role, sv, checked, tv) in snapshot {
+    for (path, role, sv, checked, tv, dv) in snapshot {
       match role {
         MenuRole::Slider => {
           if let Some(v) = sv {
@@ -521,6 +533,11 @@ pub fn menu_system(world: &mut World) {
         MenuRole::Input(_) | MenuRole::Color => {
           if let Some(t) = tv {
             value_changes.push((path, role, MenuValue::Text(t)));
+          }
+        }
+        MenuRole::Dropdown => {
+          if let Some(i) = dv {
+            value_changes.push((path, role, MenuValue::Index(i)));
           }
         }
         _ => {}
@@ -580,6 +597,10 @@ pub fn menu_system(world: &mut World) {
           events.push(ev(root, &path, MenuAction::Text(t)));
         }
       }
+      (MenuNode::Dropdown { selected, .. }, _, MenuValue::Index(i)) if *selected != i => {
+        *selected = i;
+        events.push(ev(root, &path, MenuAction::Select(i)));
+      }
       _ => {}
     }
   }
@@ -637,7 +658,12 @@ enum MenuValue {
   Value(f32),
   Checked(bool),
   Text(String),
+  /// 下拉框选中的下标
+  Index(usize),
 }
+
+/// 每帧控件值快照行：(path, 角色, 滑杆值, 开关态, 输入文本, 下拉选中下标)
+type ControlSnapshot = (String, MenuRole, Option<f32>, Option<bool>, Option<String>, Option<usize>);
 
 fn ev(root: Entity, path: &str, action: MenuAction) -> MenuActionEvent {
   MenuActionEvent { entity: root, path: path.to_string(), action }

@@ -171,6 +171,14 @@ pub enum MenuNode {
     options: Vec<String>,
     selected: usize,
   },
+  /// 下拉框（左名称 | 中右下拉控件；选中态持久化）
+  Dropdown {
+    #[serde(default)]
+    id: String,
+    label: String,
+    options: Vec<String>,
+    selected: usize,
+  },
   /// 开关项（左文字 | 右 toggle）
   Toggle {
     #[serde(default)]
@@ -219,6 +227,7 @@ impl MenuNode {
       | Self::Buttons { id, label, .. }
       | Self::Slider { id, label, .. }
       | Self::SwitchGroup { id, label, .. }
+      | Self::Dropdown { id, label, .. }
       | Self::Toggle { id, label, .. }
       | Self::Input { id, label, .. }
       | Self::Color { id, label, .. } => pick(id, label),
@@ -226,13 +235,14 @@ impl MenuNode {
     }
   }
 
-  /// 行内显示文案的 i18n key（子菜单/按钮组/滑杆/切换组/开关项/输入框/颜色选择器的左侧文字）
+  /// 行内显示文案的 i18n key（子菜单/按钮组/滑杆/切换组/下拉框/开关项/输入框/颜色选择器的左侧文字）
   pub fn label(&self) -> &str {
     match self {
       Self::SubMenu { label, .. }
       | Self::Buttons { label, .. }
       | Self::Slider { label, .. }
       | Self::SwitchGroup { label, .. }
+      | Self::Dropdown { label, .. }
       | Self::Toggle { label, .. }
       | Self::Input { label, .. }
       | Self::Color { label, .. } => label,
@@ -317,7 +327,9 @@ impl MenuFile {
 
 fn sanitize_node(node: &mut MenuNode) {
   match node {
-    MenuNode::SwitchGroup { options, selected, .. } => {
+    // 切换组 / 下拉框：选中下标越界钳位
+    MenuNode::SwitchGroup { options, selected, .. }
+    | MenuNode::Dropdown { options, selected, .. } => {
       *selected = (*selected).min(options.len().saturating_sub(1));
     }
     MenuNode::Slider { value, min, max, step, .. } => {
@@ -379,6 +391,16 @@ pub fn slider(
 /// 切换组节点
 pub fn switch_group(id: &str, label: &str, options: &[&str], selected: usize) -> MenuNode {
   MenuNode::SwitchGroup {
+    id: id.into(),
+    label: label.into(),
+    options: options.iter().map(|s| (*s).to_string()).collect(),
+    selected,
+  }
+}
+
+/// 下拉框节点
+pub fn dropdown(id: &str, label: &str, options: &[&str], selected: usize) -> MenuNode {
+  MenuNode::Dropdown {
     id: id.into(),
     label: label.into(),
     options: options.iter().map(|s| (*s).to_string()).collect(),

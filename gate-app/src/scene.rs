@@ -1,4 +1,4 @@
-//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ demo 极限场景生成。
+//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 [`reload_world`] + demo 极限场景生成。
 //!
 //! `GATE_SCENE=vox`（默认）→ MagicaVoxel nuke.vox（vox_scene 模块）；
 //! `GATE_SCENE=demo` → 程序化极限场景（城堡/大道/森林/水晶矿，见 [`build_demo_scene`]）。
@@ -212,6 +212,35 @@ fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
   let mut out: Vec<IVec3> = needed.into_iter().collect();
   out.sort_unstable_by_key(|c| (c.x, c.y, c.z));
   out
+}
+
+/// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按 `assets/vox/<name>.vox` 重建主世界。
+///
+/// 与启动路径（[`setup`]）保持同一套不变量：先 `compact_all`，再用**最终**网格算 DDGI 的
+/// LOD0 chunk 集；`demo_force_full_rebuild` 触发全量重建 + 全量 GPU 上传，DDGI 侧
+/// （世界 AABB → 探针网格 / chunk 段池 / 重烘焙）与光照场缓存随之自动更新（见
+/// `gate-render` 的 `poll_pending`/`extract`/`prepare`/`prepare_ddgi`）。
+///
+/// 失败（文件缺失/解析错误）→ 原世界保持不变。相机不动：所有模型都按 AABB 底面中心锚到
+/// 同一 anchor，换模型后视野仍对着场景。
+pub(crate) fn reload_world(
+  scene: &mut VoxelScene,
+  aabb: &mut gate_render::ddgi::DdgiWorldAabb,
+  lod0: &mut gate_render::ddgi::DdgiLod0Chunks,
+  name: &str,
+) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
+  let anchor = IVec3::new(*EXT_VOXEL_HALF, 16, *EXT_VOXEL_HALF);
+  let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
+  let mut grid = VolumeGrid::new();
+  let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)?;
+  grid.compact_all();
+  let chunks = lod0_needed_chunks(&grid);
+  scene.volumes = Volumes::new(grid);
+  scene.demo_force_full_rebuild = true;
+  aabb.min = info.aabb_min;
+  aabb.max = info.aabb_max;
+  lod0.chunks = chunks;
+  Ok(info)
 }
 
 /// demo 调色板（PaletteEntry._pad 私有 → 跨 crate 用 default + 逐字段赋值）：

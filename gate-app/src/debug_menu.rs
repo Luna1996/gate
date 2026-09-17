@@ -8,6 +8,8 @@
 //!
 //! 「视频」页三项都已接通：全屏 = 无边框全屏（窗口 ↔ 全屏，非独占）、抗锯齿 = 最终 blit 的
 //! FXAA（`PostFxSettings.fxaa`）、半分辨率 = 渲染目标 ÷2 再放大到窗口（`RenderScale.factor`）。
+//! 「游戏/世界」页：「模型」下拉（选项 = `assets/vox` 下的 .vox 文件名，见
+//! [`apply_world_model_options`]）+「重载世界」按钮（运行期换世界，见 [`crate::scene::reload_world`]）。
 //! 其余各页的「未实现项」只预留 UI：收到动作只记日志，不写任何资源。
 
 use std::collections::VecDeque;
@@ -22,7 +24,9 @@ use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
 use gate_ui::{
   DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   WindowState,
-  menu::{color, input, slider, sub_menu, switch_group, text, toggle, toggle_tip},
+  menu::{
+    buttons, color, dropdown, input, slider, sub_menu, switch_group, text, toggle, toggle_tip,
+  },
   parse_hex_color, spawn_debug_menu,
 };
 
@@ -34,6 +38,11 @@ use crate::showcase::ShowcaseRoot;
 
 /// 菜单 TOML 相对 assets 目录的路径（初值来源 + 退出时写回）
 pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
+
+/// 「世界」页模型下拉的节点路径（id 路径；选项由 [`apply_world_model_options`] 按磁盘内容填）
+pub const WORLD_MODEL_PATH: &str = "game/world/model";
+/// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
+pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 
 /// 1 m = 50 voxel（1 voxel = 2cm）：菜单里速度用 m/s，资源里用 voxel/s
 pub const VOXEL_PER_METER: f32 = 50.0;
@@ -189,28 +198,40 @@ pub fn default_menu() -> MenuFile {
       sub_menu(
         "game",
         "menu.game",
-        vec![sub_menu(
-          "edit",
-          "menu.game.edit",
-          vec![
-            switch_group(
-              "shape",
-              "menu.game.edit.shape",
-              &["menu.game.edit.shape.sphere", "menu.game.edit.shape.cube"],
-              0,
-            ),
-            input(
-              "size",
-              "menu.game.edit.size",
-              // 无上限：max 取 f32::MAX（数字输入框仍按 min/step 归一，但不构成实际约束）
-              vec![InputField::number("", "3", 1.0, f32::MAX, 1.0, 0)],
-            ),
-            color("color", "menu.game.edit.color", "96989E"),
-            slider("emissive", "menu.game.edit.emissive", 0.0, 0.0, 255.0, 1.0, 0, None),
-            slider("alpha", "menu.game.edit.alpha", 100.0, 0.0, 100.0, 1.0, 0, None),
-            slider("smooth", "menu.game.edit.smooth", 50.0, 0.0, 100.0, 1.0, 0, None),
-          ],
-        )],
+        vec![
+          sub_menu(
+            "edit",
+            "menu.game.edit",
+            vec![
+              switch_group(
+                "shape",
+                "menu.game.edit.shape",
+                &["menu.game.edit.shape.sphere", "menu.game.edit.shape.cube"],
+                0,
+              ),
+              input(
+                "size",
+                "menu.game.edit.size",
+                // 无上限：max 取 f32::MAX（数字输入框仍按 min/step 归一，但不构成实际约束）
+                vec![InputField::number("", "3", 1.0, f32::MAX, 1.0, 0)],
+              ),
+              color("color", "menu.game.edit.color", "96989E"),
+              slider("emissive", "menu.game.edit.emissive", 0.0, 0.0, 255.0, 1.0, 0, None),
+              slider("alpha", "menu.game.edit.alpha", 100.0, 0.0, 100.0, 1.0, 0, None),
+              slider("smooth", "menu.game.edit.smooth", 50.0, 0.0, 100.0, 1.0, 0, None),
+            ],
+          ),
+          // 世界：第一行 = 模型下拉（选项 = assets/vox 下的 .vox 文件名，启动时按磁盘内容重填，
+          // 见 [`apply_world_model_options`]）；第二行 = 重载世界（按当前选择重建主世界）
+          sub_menu(
+            "world",
+            "menu.game.world",
+            vec![
+              dropdown("model", "menu.game.world.model", &["nuke"], 0),
+              buttons("reload", "", &["menu.game.world.reload"]),
+            ],
+          ),
+        ],
       ),
       sub_menu("ui", "menu.ui", vec![toggle("showcase", "menu.ui.showcase", false)]),
     ],
@@ -223,7 +244,7 @@ pub fn load_menu() -> MenuFile {
   let data = gate_render::data_dir().join(MENU_TOML_PATH);
   let asset = gate_render::assets_dir().join(MENU_TOML_PATH);
   let path = if data.is_file() { data } else { asset };
-  match std::fs::read_to_string(&path) {
+  let mut model = match std::fs::read_to_string(&path) {
     Ok(src) => match MenuFile::from_toml(&src) {
       Ok(mut m) => {
         m.sanitize();
@@ -244,7 +265,30 @@ pub fn load_menu() -> MenuFile {
       m.sanitize();
       m
     }
-  }
+  };
+  // 世界模型下拉的选项来自磁盘扫描（不是 TOML 里的静态表），最后统一填一次
+  apply_world_model_options(&mut model);
+  model
+}
+
+/// 把 [`WORLD_MODEL_PATH`] 下拉的选项换成 `assets/vox` 下实际存在的模型（见
+/// [`crate::vox_scene::scan_vox_models`]），选中项按**名字**在旧列表里找回：存档存的是下标，
+/// 而列表随文件夹内容漂移（新增一个排在前面的文件就会让旧下标指向别的模型）。
+/// 名字找不到 → `nuke` → 第一项。
+fn apply_world_model_options(model: &mut MenuFile) {
+  let options = crate::vox_scene::scan_vox_models();
+  let Some(MenuNode::Dropdown { options: opts, selected, .. }) =
+    model.node_mut(&split(WORLD_MODEL_PATH))
+  else {
+    return;
+  };
+  let previous = opts.get(*selected).cloned();
+  *selected = previous
+    .as_ref()
+    .and_then(|p| options.iter().position(|o| o == p))
+    .or_else(|| options.iter().position(|o| o == "nuke"))
+    .unwrap_or(0);
+  *opts = options;
 }
 
 /// 旧存档兼容：把内置默认树里「存档中不存在」的节点补进去（新增菜单项在旧存档里也能出现），
@@ -727,6 +771,55 @@ fn register_callbacks(world: &mut World) {
       }
     },
   );
+
+  // ---- 游戏（世界）：模型下拉 + 重载世界 ----
+  // 下拉只改模型（退出时随菜单存档持久化），真正换世界在「重载世界」按钮：
+  // load_vox_scene 是同步阻塞的（与启动同一条加载路径，vox 量级下可接受），
+  // 失败只 warn、原世界保持不变；成功后全量重建 + GPU 全量上传 + DDGI 重烘焙由
+  // VoxelScene.demo_force_full_rebuild 自动驱动。
+  world.add_observer(
+    |ev: On<MenuActionEvent>,
+     mut scene: ResMut<gate_render::VoxelScene>,
+     mut aabb: ResMut<gate_render::ddgi::DdgiWorldAabb>,
+     mut lod0: ResMut<gate_render::ddgi::DdgiLod0Chunks>,
+     q_menu: Query<&gate_ui::DebugMenu>| {
+      match (ev.path.as_str(), &ev.action) {
+        (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
+          let name = world_model_name(&q_menu).unwrap_or_else(|| "?".to_string());
+          info!("世界模型 → {name}（点「重载世界」生效）");
+        }
+        (WORLD_RELOAD_PATH, MenuAction::Button(_)) => {
+          let Some(name) = world_model_name(&q_menu) else {
+            warn!("重载世界：读不到模型下拉的选择（菜单未就绪），已忽略");
+            return;
+          };
+          let t0 = std::time::Instant::now();
+          match crate::scene::reload_world(&mut scene, &mut aabb, &mut lod0, &name) {
+            Ok(info) => info!(
+              "世界已重载：{name}.vox instances={} written={} dropped={} aabb=[{}]-[{}] ({:?})",
+              info.instances_used,
+              info.voxels_written,
+              info.voxels_dropped,
+              info.aabb_min,
+              info.aabb_max,
+              t0.elapsed(),
+            ),
+            Err(e) => warn!("重载世界失败（{name}.vox）：{e}（保持原世界不变）"),
+          }
+        }
+        _ => {}
+      }
+    },
+  );
+}
+
+/// 读「世界」页下拉当前选中的模型名（无菜单 / 无该节点 / 选项为空 → None）
+fn world_model_name(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
+  let menu = q_menu.single().ok()?;
+  match menu.model.node(&split(WORLD_MODEL_PATH)) {
+    Some(MenuNode::Dropdown { options, selected, .. }) => options.get(*selected).cloned(),
+    _ => None,
+  }
 }
 
 // ===================== 每帧刷新 =====================

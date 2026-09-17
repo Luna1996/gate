@@ -26,6 +26,8 @@ pub enum Icon {
   AngleUp,
   /// 标题栏展开（内容向下展开）
   AngleDown,
+  /// 下拉框右侧「展开列表」指示
+  ChevronDown,
 }
 
 impl Icon {
@@ -37,6 +39,7 @@ impl Icon {
       Self::UndoAlt => strs::UNDO_ALT,
       Self::AngleUp => strs::ANGLE_UP,
       Self::AngleDown => strs::ANGLE_DOWN,
+      Self::ChevronDown => strs::CHEVRON_DOWN,
     }
   }
 }

@@ -23,6 +23,37 @@ pub struct VoxSceneInfo {
   pub voxels_dropped: usize,
 }
 
+/// `assets/vox` 下可选的世界模型名（`.vox` 去扩展名，字典序；目录缺失/为空 → `vec!["nuke"]`）。
+///
+/// 供 DebugMenu 的「游戏/世界/模型」下拉框取选项：加一个 .vox 文件即多一个可选项，
+/// 不改代码。选项是**文件名字面量**，故必须与 [`load_vox_scene`] 的路径拼法一致。
+pub fn scan_vox_models() -> Vec<String> {
+  let dir = gate_render::assets_dir().join("vox");
+  let Ok(entries) = std::fs::read_dir(&dir) else {
+    bevy::log::warn!("vox 目录不可读（{}），模型下拉回退到 nuke", dir.display());
+    return vec!["nuke".to_string()];
+  };
+  let mut names: Vec<String> = entries
+    .filter_map(|e| e.ok())
+    .filter_map(|e| {
+      let path = e.path();
+      let is_vox = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("vox"));
+      if !is_vox {
+        return None;
+      }
+      path.file_stem().map(|s| s.to_string_lossy().into_owned())
+    })
+    .collect();
+  names.sort();
+  names.dedup();
+  if names.is_empty() {
+    // 空目录（新克隆仓库，nuke.vox 被 gitignore 排除）→ 保留默认项，至少让 UI 有名字可选
+    bevy::log::warn!("vox 目录下没有 .vox 文件（{}），模型下拉回退到 nuke", dir.display());
+    return vec!["nuke".to_string()];
+  }
+  names
+}
+
 /// 读 .vox → palette 映射 → 体素写入 grid。
 ///
 /// `anchor` = 场景 AABB 底面中心的落点（x/z 居中，y = 底面高度）。

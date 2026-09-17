@@ -1,4 +1,4 @@
-//! 菜单通用组件：DebugWindow 列表里的 8 种列表单项。
+//! 菜单通用组件：DebugWindow 列表里的 9 种列表单项。
 //!
 //! 一行可分成「左|中|右」三部分（左列 [`LEFT_COL_W`]、右列 [`RIGHT_COL_W`]，两者宽度
 //! 各自固定且不相等，中间占余下最宽部分），各组件按需取用。
@@ -15,9 +15,9 @@ use super::model::{InputField, MenuNode};
 use crate::capture::MouseIntercept;
 use crate::icon::Icon;
 use crate::widgets::{
-  LabelConfig, LabelOverflow, LabelStyle, SliderConfig, TextInputConfig, TextInputKind,
-  ToggleSwitchConfig, Tooltip, UiCtx, color_of, label, px, slider, spawn_icon, text_input,
-  toggle_switch,
+  DropdownConfig, LabelConfig, LabelOverflow, LabelStyle, SliderConfig, TextInputConfig,
+  TextInputKind, ToggleSwitchConfig, Tooltip, UiCtx, color_of, dropdown, label, px, slider,
+  spawn_icon, text_input, toggle_switch,
 };
 
 /// 菜单项在模型里的角色（决定 menu_system 如何读写值）
@@ -31,6 +31,8 @@ pub enum MenuRole {
   Slider,
   /// 切换组第 i 个选项
   SwitchOption(usize),
+  /// 下拉框
+  Dropdown,
   /// 开关项
   Toggle,
   /// 输入框第 i 个字段
@@ -224,6 +226,9 @@ pub(crate) fn spawn_item(
     MenuNode::SwitchGroup { label: key, options, .. } => {
       switch_group_row(ctx, parent, key, options, &path)
     }
+    MenuNode::Dropdown { label: key, options, selected, .. } => {
+      dropdown_row(ctx, parent, key, options, *selected, &path)
+    }
     MenuNode::Toggle { label: key, checked, .. } => toggle_row(ctx, parent, key, *checked, &path),
     MenuNode::Input { label: key, fields, .. } => input_row(ctx, parent, key, fields, &path),
     MenuNode::Color { label: key, hex, .. } => color_row(ctx, parent, key, hex, &path),
@@ -378,6 +383,29 @@ fn switch_group_row(
         option_button(ctx, g, name, path, MenuRole::SwitchOption(i), i == 0);
       }
     });
+  });
+  row
+}
+
+/// 下拉框：「左|中右」名称 + 下拉控件（样式同输入框，框内右侧带展开箭头）
+fn dropdown_row(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  key: &str,
+  options: &[String],
+  selected: usize,
+  path: &str,
+) -> Entity {
+  let mut ec = base_row(parent, "menu-dropdown");
+  let row = ec.id();
+  ec.with_children(|r| {
+    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
+    let de =
+      *dropdown(ctx, r, DropdownConfig { options: options.to_vec(), selected, disabled: false });
+    grow_in_row(r.world_mut(), de);
+    r.world_mut()
+      .entity_mut(de)
+      .insert(MenuItem { path: path.to_string(), role: MenuRole::Dropdown });
   });
   row
 }

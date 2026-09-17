@@ -266,6 +266,24 @@ max = 100.0
 step = 1.0
 decimals = 0
 
+[[items.children]]
+kind = "sub_menu"
+id = "world"
+label = "menu.game.world"
+
+[[items.children.children]]
+kind = "dropdown"
+id = "model"
+label = "menu.game.world.model"
+options = ["nuke"]
+selected = 0
+
+[[items.children.children]]
+kind = "buttons"
+id = "reload"
+label = ""
+items = ["menu.game.world.reload"]
+
 [[items]]
 kind = "sub_menu"
 id = "ui"

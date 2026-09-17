@@ -510,6 +510,8 @@ impl Plugin for GateUiPlugin {
             crate::widgets::plot_redraw_system,
             crate::widgets::scroll_view_system,
             crate::widgets::tab_view_system,
+            // 下拉框：交互（开/选/关）在前，视觉（跟随锚点 + 展开动画）在后
+            (crate::widgets::dropdown_system, crate::widgets::dropdown_visual_system).chain(),
           ),
           // 文本相关（省略号/输入框）+ 悬浮提示
           (
