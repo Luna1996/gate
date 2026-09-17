@@ -1,167 +1,282 @@
 # GATE — GPU-Accelerated Tile Engine
 
-> GPU 稀疏体素砖块图（NanoVDB-style linear brick map）+ 计算着色器 DDA 光追渲染电路模拟器。
-> **当前里程碑：渲染 Demo 完成（P0–P2）。** RTX 3070 1080p 稳定 60+ FPS；300-tile 极限大陆场景 1s 内完整可见。
+> GPU 稀疏体素（Douglas Brick Tree，256³ chunk）+ 计算着色器层次 DDA 光追 + 世界锚定 DDGI 全局光照 + 自研 bevy_ui 工具链。
+> **当前分支 `wip/ddgi-v1`**：DDGI v1 / 光照场（AO）/ 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
 
 ---
 
 ## 0. 快速开始
 
 ```powershell
-# 工具链：需要 MSVC Rust 1.82+（见 rust-toolchain.toml）+ Vulkan GPU 驱动
-cargo run -p gate-app                    # 启动渲染 Demo（10×10 大陆 + 天空城 + 雪峰 + 水晶矿簇热点交换）
-cargo clippy --workspace --all-targets    # lint
+# 工具链：Rust stable（rust-toolchain.toml，MSVC toolchain）+ Vulkan 显卡驱动
+cargo run -p gate-app                     # 默认场景 GATE_SCENE=vox → assets/vox/nuke.vox
+cargo run -p gate-app --features profile  # 性能剖析：Tracy GUI 连接进程（CPU span + GPU pass 同时间线）
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-- 启动后操作：左键拖拽旋转视角 / 中键拖拽平移 / 滚轮缩放；`FPS` 文本 + 实时折线在左上角；`WorldAnchor` 3D 标签贴附关键地标（天空堡金顶 / 雪峰 / 水晶矿区 / 入口大道）。
-- 每 ~2 秒会看到 tile(1,0,0) L4 热点 32³ 方块 **金 ↔ 青** 闪烁一次，对应 stderr 增量上传日志 `UPLOAD[incremental]: bytes≈0.13MB elapsed≈200µs`（演示增量 dirty-range 部分写优化生效）。
+> `assets/vox/nuke.vox` 被 `.gitignore` 排除（体积大），新克隆的仓库里没有它。备选：
+> `$env:GATE_SCENE="demo"` 跑程序化「极限场景」，或自备一份 `.vox` 放进 `assets/vox/`。
+
+**操作（默认「幽灵飞行」模式，无碰撞）**
+
+- `WASD` 平移 / `Space` 升 / `Shift` 降 / `Ctrl` 切低高速档（缺省 128 → 256 voxel/s；低速档基础速度在菜单可调）
+- 右键拖拽 = 转头（两种相机模式共享 yaw/pitch，切换时视线连续）
+- 左键 = 放置笔触；右键**单击**（按下到释放位移 < 4px）= 擦除。形状 / 大小 / 材质在菜单「游戏/编辑」
+- `F3` 开关左上角调试菜单；右上角 FPS 覆盖层与组件展示窗默认隐藏（菜单「视频/FPS」「界面/showcase」）
+
+**相机模式**
+
+- 默认 **Fly**（幽灵飞行）；菜单「玩家/相机/相机模式」切到 **Orbit** 后：
+  中键拖拽平移 / 滚轮对数缩放（`Shift` 细调档）/ 左键拾取重设注视点
+
+**菜单持久化**
+
+- 初始值 `assets/ui/debug_menu.toml`（随包发布）；运行期改动在退出时写回 `<安装根>/data/ui/debug_menu.toml`，
+  下次启动优先读它（读不到才回退 assets 版，新节点由 `merge_defaults` 回填）
 
 ---
 
-## 1. 项目现状（渲染 Demo Milestone）
+## 1. 项目现状
 
-### 已实现
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| **SVO 体素数据结构** | ✅ 生产可用 | `HashMap<TileCoord, Tile>` + 每胞 4 层精化下钻（L0 32cm → L4 2cm）；调色板压缩；CPU/Rust `BrickMapBuffers` 与 GPU storage buffer 字节同构。Tile 跨坐标自动创建。|
-| **GPU 砖块图线性化（upload）** | ✅ 生产可用 | 节点流编码为 `b_struct` + `b_leaves` + `b_palette` 三块 storage buffer；`dirty-range tracking` 增量部分写：3-tile MVP 热点交换 140MB→132KB，278ms→200µs。|
-| **DDA 计算着色器光追** | ✅ 生产可用 | `workgroup 8×8`；AABB slab 三轴射线-砖块图求交跳过空段（empty-ray 0 步），1 voxel 胞 Amanatides&Woo 步进；相对标尺 v3（slab 全局 t → start_v 推进 → 循环变量全相对 start_v），`max_steps=16384` 覆盖 9000 voxel 对角穿越，AABB-skip 与 brute-force full DDA 头 100% 等价。|
-| **GPU 调度集成（Bevy 0.19）** | ✅ 生产可用 | no render nodes；extract/prepare/queue/render/blit 全部系统级显式调度；half-res RenderScale；compute 输出 texture 2D → Core2d PostProcess blit 到 ViewTarget（sRGB 精确匹配）。MSAA 强制关闭（自定义 multisample.count=1 冲突）。|
-| **相机输入** | ✅ 生产可用 | OrbitCamera：左键旋转 / 中键平移 / 滚轮缩放；取消最远距离上限（原 8000 voxel → 现无上限）；pitch ±89° clamp。|
-| **极简 UI（fps 文本 + 折线）** | ✅ 生产可用 | 自研 gate-ui 组件库（bevy_ui 原生）：Panel / Label / Button / Slider / Checkbox / Plot（折线）/ WorldAnchor（3D 文字）；主题令牌化（暗色实验室风）。字体：MapleMono-NF-CN-Regular.ttf，中文无豆腐块。|
-| **基准极限场景** | ✅ 生产可用 | 10×10×3=300 tile 大陆：正弦高度场 + 4 角雪峰 + 蜿蜒 S 河 + 170 确定性散点树；中央天空之城（10 层倒锥浮空岛底 + 城墙 + 4 金顶角楼 + 正殿 + 高塔 + L2 金顶球 + 4 L4 红飘带）；入口大道 + 11 字 "GATE ENGINE"；3 处 L4 青紫红水晶矿簇；WorldAnchor 4 标签。|
+| **体素核心（gate-voxel）** | ✅ 生产可用 | Douglas Brick Tree：`HashMap<ChunkCoord, ChunkTree>`，每 chunk 256³ voxel，分裂因子 4³（256 → 64 → 16 → 4 → 1）；非叶节点 u64 占用掩码 + 紧凑 child 偏移表；`Node::Uniform` 自适应叶；16 位材质索引（65536 槽，8B/条）；三级查询 `get_voxel` / `get_brick_state` / `fill_brick`（O(深度) 整块写）；`try_merge` + `compact()` DFS GC |
+| **多 volume** | ✅ 生产可用 | `Volumes`：`list[0]` = 主世界（`obj_id = -1`），`add_object` 注册物体（`VolumeTransform { pos, rot, scale }`）；同一 dirty → builder → upload 路径；GPU 侧为统一 `GridDesc` 数组（144B/条），shader `trace_scene` 无分支遍历 |
+| **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
+| **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
+| **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass；局部 AABB slab 剔除 |
+| **DDGI** | ✅ 生产可用 | 4 级世界锚定级联（cell 16/32/64/128 voxel，严格嵌套）；LOD0 按 chunk 从探针池领固定 4096 槽段；探针放在「最大全空叶」中心；每探针 4×4 辐照度 + 8×8 深度（均值/方差/更新数）图集，时域 EMA + 6 邻域空间混合 + Chebyshev 软遮挡；活跃探针 worklist + indirect `cast`/`collect`；增量重烘只覆盖 dirty AABB 命中的 cell |
+| **光照场（AO）** | ✅ 生产可用 | 相机中心、世界锚定的 32³ × 16 voxel 网格（`Rgba16Unorm`，硬件三线性），.a = AO fill 直接乘进命中着色；发光走「命中直出自身颜色 + 进 GI」，不再走发光密度通道 |
+| **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
+| **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
+| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除；球 / 立方笔触按 brick 粒度整块写入（整块全在笔触内 → 一次 O(深度) 写，落成 uniform 上级节点）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传 + DDGI 重烘 + 光照场重算；`EDIT[place\|erase]` 日志 |
+| **渲染管线** | ✅ 生产可用 | **无 render node**：extract / prepare / dispatch / blit 全部系统级显式调度；`blit.wgsl` 双入口 `fs_main` / `fs_fxaa`（FXAA 3.11 移植）；半分辨率 `RenderScale` + 线性上采样；MSAA 强制关闭 |
+| **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界**（DDGI AABB / LOD0 chunk 集 / 光照场随之重建） |
+| **世界标签** | ✅ 生产可用 | `WorldAnchor`：世界坐标 → 屏幕像素 UI 标签（距离缩放、CJK 字体延迟解析） |
+| **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本 |
 
-### 已知待做（不阻塞 Demo）
-- L4 水晶矿簇 DDA 命中代价高：建议合胞上抬 L3/L2；
-- WorldAnchor 标签不做体素遮挡判断（现在永远在顶层）；
-- `gate-app/src/main.rs` 中 `build_demo_scene` 函数体 ~540 行，应拆 `demo_scene.rs`；
-- 正式 sim tick / StateTable emissive（当前仅 GPU StateTex 占位心跳值）；
-- wgpu 29.0.4 Vulkan 首帧 VUID 报错（上游 #9213 / #9361），已 LogPlugin filter 静默，等补丁合入。
+### 已知限制 / 待办（不阻塞当前开发）
+
+- **没有自动化测试与 CI**：workspace 0 个 `#[test]`（仅 `vendor/parley` 除外），回归靠手工验收 + 日志。
+- **文档缺口**：代码注释引用的 `docs/brickmap.md`、`docs/decisions.md`（ADR-0001/0002/0005）、`docs/ui-dark-theme.md` 尚未落盘；`docs/` 目前只有 Douglas 开发日志转录（`docs/douglas/`）与 DDGI 截图（`docs/screenshots/`）。
+- **正式 sim tick 未实现**：StateTable 只有数据通路与上传，没有逐帧模拟系统驱动它。
+- **WorldAnchor 不做体素遮挡判断**（永远绘制在最上层）。
+- **`assets/lighting/dark_lab.ron` 暂无代码引用**：当前只加载 `day_outdoor.ron`。
+- **wgpu Vulkan 首帧 VUID 报错**（上游已知问题，仅首 1-2 帧 swapchain 时序）：`LogPlugin` filter 静默 `wgpu_hal::vulkan::instance` 与 `surface` 两层。
 
 ---
 
 ## 2. 技术路线总览
 
 ```
-[Bevy 主 world (Main)]
-   ├─ Startup: VoxelScene (TileGrid) + 构建 300 tile Demo scene
-   ├─ Update:  OrbitCameraInput（鼠标）→ OrbitCamera → DdaCameraConfig → WorldAnchorCameraSync
-   │           edit_tile_every_120_frames（每 2s L4 热点调色板交换 1 tile dirty）
-   │           fps UI feed + Plot 刷新
-   └─ Last: poll_pending（UploadBudget × dirty_tiles → MainPending.data/comp + force_full flag）
-      ↓
-[ExtractSchedule (跨 world 镜像)]
-   └─ extract_brickmap：MainPending → BuilderMirror（render world resource）；need_full = first || pending_full
-      ↓  build_full | update_tile(n dirty tiles) → BrickMapBuffers + DirtyRanges → UploadSnapshot
-[RenderSchedule (render world)]
-   ├─ PrepareResources: prepare_upload（CPU 镜像 → GPU 3 块 storage buffer + globals uniform）
-   │                   prepare_dda_bind_groups（BG0 out_tex+view_uniform / BG1 struct+leaves+pal+globals / blit BG）
-   ├─ Render:          dispatch_dda（compute 8×8, half-res 640×360; AABB-skip DDA）
-   └─ Core2d PostProcess: blit_dda_view（linear → Rgba8UnormSrgb cancel sRGB encode + bilinear upscale → ViewTarget）
+[Bevy 主 world]
+  Startup : scene::setup —— 读 lighting/*.ron、建 VolumeGrid（GATE_SCENE=vox 默认 / demo 程序化）、
+            算 DDGI 世界 AABB + LOD0 chunk 集、初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
+  Update  : 相机链（模式对齐 → 转头 → 各模式输入 → 拾取 → build_camera_config）→ 体素编辑
+            → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
+  Last    : poll_pending —— UploadBudget（4MB/帧）× DirtyTracker → MainPending
+      ↓ ExtractSchedule（main → render world）
+  extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB) + LightFieldUpdate
+  extract_camera : DdaCameraConfig → DdaViewUniform
+  extract_ddgi   : DdgiStage / DdgiDebugSettings / DdgiWorldAabb / DdgiLod0Chunks / 曝光活参数
+      ↓ render world
+  RenderStartup    : init_dda_pipelines / init_empty_gpu / init_ddgi_gpu / queue_ddgi_pipelines
+  PrepareResources : prepare_upload（struct/palette/comp/state/grid_descs + 光照场 3D 纹理 + 扩容）
+  PrepareBindGroups: prepare_dda_bind_groups → prepare_ddgi
+  RenderGraph::Render（dispatch 顺序）:
+      ddgi_bake0..3（细→粗，pass 边界即屏障）→ ddgi_sort → ddgi_seal
+      → ddgi_cast（indirect）→ ddgi_collect（indirect，网格跨越）
+      → beam（1/4 分辨率最近命中断面预 pass）
+      → gi（半分辨率 GI 预 pass，可开关）
+      → dda_main（主可见 pass，trace + 着色 → out_tex）
+      → eye_histogram + eye_update（自动曝光）→ probe_viz（可选）
+  Core2d::PostProcess: blit_dda_view（fs_main | fs_fxaa，线性上采样 + sRGB cancel → ViewTarget）
 ```
 
-### 关键技术要点（为什么 60 FPS）
-1. **AABB slab 空射线 0 步**：远镜头下 99.8% 像素在 AABB slab 判定阶段（18 次浮点除法）直接 miss，return 背景色。不进入 DDA 循环（0 GPU cycle）。
-2. **DDA 命中即 break**：1 voxel³ 最细颗粒命中后立即出循环，平均 ~120 步/射线。
-3. **half-res RenderScale（640×360 compute → 1280×720 blit）**：射线数 4× 减少，bilinear upsample 视觉无明显锯齿（远距大地形自然低通）。
-4. **brickmap 体素量与 GPU 负载无关**：屏幕是固定 921,600 像素射线，大陆从 3 tile 扩大 100× 到 300 tile 后 fps 仍 60+（RTx 3070）。
-5. **增量 dirty-range 上传**：每 2 秒热点调色板交换仅 0.13MB struct 局部写 + 180µs CPU；Startup 批量 211 tile dirty 按 backlog>3×预算 一次性清空不逐帧 2.8s 阻塞 Prepare。
-6. **扩容不丢数据**：`ensure_with_copy` 在 storage buffer 扩容时 2× reserve + 全量写入，后续 partial write 再覆 dirty range，避免了"扩容后 buffer 归零只写 6MB → tile index 表全丢 → 全画面空"的经典 bug。
+### 关键技术要点（为什么快）
+
+1. **层次掩码 DDA**：每个非叶节点一次读入 u64 掩码进寄存器，该节点 4³=64 个子块之间步进**零 load**；
+   `mask bit=0` 的 uniform 子块整格命中或整格跳过；跨 brick 后用 `firstTrailingBit` 一次跳到最粗可行层。
+2. **方向可达掩码 LUT（b_leaves，Douglas #18）**：8 octant × 64 入口格 × 2 字的保守可达集，
+   `occupancy & reach` 在进入子块前剔除；LUT 是真实可达集的**超集**，绝不漏命中。
+3. **beam 预 pass**：1/4 分辨率先求「最近命中 t」，主 pass 从该 t 起步 —— 近场空空间不产生步进。
+4. **世界锚定 DDGI**：探针槽位 = 世界 cell mod dims（LOD1~3）/ chunk 固定段（LOD0），相机移动不换主、不闪烁；
+   编辑只重烘 dirty AABB 命中的 cell。DDGI chunk 段基址**一经分配不再改变**（基址变 = 图集整段错位）。
+5. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
+6. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
+   关掉 FXAA 时只是换一条 fragment 入口，无分支代价。
 
 ---
 
 ## 3. 模块架构（4 个 crate）
 
 ```
-gate-voxel/        纯体素核心：TileCoord / TileGrid / SVO cell+octree+palette / DirtyTracker+state_table+comp_layer
-                   - coords.rs    TILE_SUB=512 voxel, SUB_PER_CELL=16, 分层常量 VoxelPos
-                   - tile.rs      Tile 体：cell_bitmap + SVO chain+palette
-                   - grid.rs      TileGrid(HashMap)：set_voxel / clear_voxel / get_voxel
-                   - dirty.rs     DirtyTracker：按 TileCoord 入 data/comp dirty 双队列；drain_budget(n)
-                   - palette.rs   PaletteFlags + 256 调色板
-                   - scene.rs     几何帮助：fill_box / fill_sphere / draw_text / fill_ball / in_terrain_h
-                   - stress.rs    压测构造函数
+gate-voxel/        纯逻辑核心（零渲染依赖；依赖仅 glam + rayon）
+                   - coords.rs      ChunkCoord / VoxelCoord / BrickCoord + CHUNK_SIZE / BRICK_FACTOR /
+                                    MAX_LEVEL / LEVEL_EXTENT / child_linear_idx
+                   - chunk_tree.rs  ChunkTree（Douglas Brick Tree）：Block 掩码分裂 / 紧凑 child 偏移 /
+                                    Uniform 叶 / try_merge / compact GC / serialize（GPU wire 字数）
+                   - volume.rs      VolumeGrid（chunk HashMap + palette + comp_layer + state_table +
+                                    dirty + 编辑 AABB）+ Volumes 容器 + VolumeTransform
+                   - palette.rs     Palette（65536 槽 × 8B）+ PaletteEntry + 脏槽区间 / 版本号
+                   - dirty.rs       DirtyTracker：data / comp 双通道按 ChunkCoord 的队列与预算 drain
+                   - scene.rs       几何帮助：fill_box / fill_bricks / fill_sphere / draw_text（5×7 点阵）
 
-gate-render/       渲染管线（CPU）侧：构建 BrickMapBuffers + 上传调度 + DDA 参考实现
+gate-render/       渲染与 wire 契约（CPU 侧；GPU 状态全部在 render world 系统里建）
                    - brickmap/
-                       wire.rs     BrickMapGlobals(BrickMapView struct 布局, repr(C) + ShaderType 对齐 WGSL Globals struct)
-                                   BrickMapBuffers{b_struct, b_leaves, b_palette, globals} （Rust/WGSL 字节同构）
-                       view.rs     BrickMapView::get_voxel(IVec3 voxel) 5 步寻址链（WGSL 抄自这里）
-                                   index_pos(origin, dims, tile_coord) = x + y*CAP + z*CAP² (C order, x stride 1)
-                       builder.rs  BrickMapBuilder::build_full(grid) | update_tile(grid, TileCoord) | take_dirty_ranges()
-                                   DIR_REGION / BITMAP_REGION / INDEX_REGION 固定前缀
-                       dda.rs      cpu_reference_dda_ray()（full brute 2M step 参考）
-                                   cpu_reference_dda_ray_aabb_skip()（AABB slab v3 + max_steps 参考）
-                                   OrbitCamera / DdaCameraConfig（from_orbit → inv_view_proj + frustum_length）
-                                   prepare_dda_bind_groups / dispatch_dda / blit_dda_view（Bevy 系统）
-                       upload.rs   poll_pending / extract_brickmap / prepare_upload / init_empty_gpu + prepare_dda_bind_groups
-                                   ensure_with_copy（扩容 2× reserve + 全量写）
-                                   UPLOAD[full|incremental] 日志（tiles/bytes/elapsed）
-                       mod.rs      pub re-export
-                   - gradient.rs   基础渐变渲染背景（与 DDA out_tex 同 blit）
-                   - responsive.rs RenderScale（half-res）+ bevy window resize 响应
+                       wire.rs     字节契约：常量、pack_palette_entry、BrickMapGlobals、GridDesc(144B)、
+                                   方向可达掩码 LUT、BrickMapBuffers（b_struct/b_palette/globals）
+                       view.rs     BrickMapView 纯读端寻址链（get_voxel / cell_occupied / chunk_base）
+                       builder.rs  BrickMapBuilder（单 volume）/ VolumesBuilder（多 volume）+
+                                   DirtyRanges（struct 字区间 + palette 槽区间）+ snapshot（自动降级全量）
+                       upload.rs   poll_pending / extract / prepare / init_empty_gpu；ensure_with_copy 扩容；
+                                   光照场烘焙与上传；UPLOAD[full|incremental] 日志；VolumePlugin
+                       dda.rs      全部 CPU DDA 参考实现（brute / AABB-skip / 两级 cell / 层次栈式 /
+                                   多 volume trace）、OrbitCamera / DdaCameraConfig、RenderScale /
+                                   PostFxSettings / EyeAdaptSettings、全部 BG layout + pipeline +
+                                   prepare_dda_bind_groups / dispatch_dda / blit_dda_view
+                   - ddgi.rs        世界网格 / chunk 段池 / DdgiUniform / bake·sort·seal·cast·collect 调度
+                   - lighting.rs    LightingTheme（RON）+ LightPoolUniform wire 契约（BG3）
+                   - shader.rs      启动时 wesl-rs 编译 WESL 包 → Bevy Shader 资产
+                   - wesl_consts.rs 从 .wesl 源码解析跨语言 u32/f32 常量（DDGI 等的**唯一权威**），启动 fail-fast
+                   - profiler.rs    wgpu-profiler / Tracy 集成（feature = "profile"；非该 feature 为零成本壳）
+                   - responsive.rs  窗口 resize → 渲染目标原地重建 + RenderScale 跟随
+                   - paths.rs       install_root / assets_dir / logs_dir / data_dir
 
-gate-ui/           自研 bevy_ui 组件库 + 世界标签
-                   - widgets/     Panel / Label / Button / Slider / Checkbox / Plot（折线） + 列表滚动
-                   - theme.rs     主题令牌（颜色/圆角/间距/字体/CJK 字体 override）
-                   - world_anchor.rs  WorldAnchorCameraSync：世界坐标→屏幕 clip-space；锚定 3D 文字标签
-                   - capture.rs   测试截图辅助
-                   - lib.rs       Plugin 安装
+gate-ui/           自研 bevy_ui 组件库 + 调试菜单 + 世界标签
+                   - theme.rs       UiTheme（RON 资产 + 内置暗色默认）、令牌（颜色/圆角/间距/字号）、UiScale
+                   - icon.rs        FontAwesome 字形（菜单标题栏按钮与箭头）
+                   - i18n.rs        UiTranslator：key → 文案解析器（切语言后整体重解析）
+                   - capture.rs     UI 指针捕获 / 命中测试（**不是**截图工具）
+                   - world_anchor.rs WorldAnchor：世界坐标 → 屏幕像素标签（距离缩放、延迟文本）
+                   - widgets/       16 个组件：Panel / Label / Button / Slider / Checkbox / ToggleSwitch /
+                                    Dropdown / Plot（折线）/ List（环形日志）/ ScrollView / Splitter /
+                                    Grid / Table / TabView / TextInput / Tooltip
+                   - menu/          TOML 可序列化菜单模型（9 种行控件）+ DebugWindow 容器 +
+                                    menu_system（唯一交互驱动）+ MenuActionEvent
 
-gate-app/          Demo 应用入口（只有代码）
-                   - src/main.rs  Startup / Update / 系统注册 / 极限场景 build_demo_scene（10×10 大陆）
+gate-app/          Demo 应用入口
+                   - main.rs       插件装配、窗口/日志/i18n 初始化、系统注册、环境变量开关
+                   - scene.rs      setup + 程序化极限场景 build_demo_scene + reload_world 换世界 +
+                                   lod0_needed_chunks（DDGI LOD0 段分配集）
+                   - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / cursor_ray / 拾取 recenter
+                   - edit.rs       EditSettings + BrushShape/BrushMaterial + raycast_main + 笔触施加与输入
+                   - vox_scene.rs  MagicaVoxel .vox 导入（vox-rs）+ scan_vox_models 模型发现
+                   - debug_menu.rs 菜单树默认定义 + 状态应用/落盘 + FPS 覆盖层 + 相机信息 + F3 开关
+                   - showcase.rs   右上角组件展示窗（控件画廊 + 交互事件日志）
+                   - tracy_layer.rs tracing span → Tracy CPU zone（feature = "profile"）
 
-assets/            运行期资源（只读；与可写 logs//data/ 分离，见 gate-render/src/paths.rs）
-                   - shaders/    voxel_raytrace/  WESL 包（体素光追 GPU 程序，DDA 抄自 Rust cpu_reference_dda_ray_aabb_skip v3 同构）
-                                 main.wesl=入口点 + import；bindings/common/brickmap/trace/world/
-                                 lightfield + ddgi/*（consts/helpers/bake/sort/sample/collect）
-                                 blit.wgsl（fullscreen triangle bilinear upsample + sRGB cancel）
-                   - ui/         theme.ron 暗色实验室主题配置；debug_menu.toml 菜单初始值
-                                 （运行期改动写 <安装根>/data/，不回写这里）
-                   - locales/    zh-CN.yml 文案表（编译期 codegen 进二进制，运行期不读）
+assets/            运行期只读资源（与可写 logs//data/ 分离，见 gate-render/src/paths.rs）
+                   - shaders/    blit.wgsl + voxel_raytrace/ WESL 包（main.wesl 入口 + bindings /
+                                 common / brickmap / trace / world / lightfield / ddgi/*，
+                                 启动时读盘编译，改 shader 需重启）
+                   - ui/         theme.ron 暗色主题令牌；debug_menu.toml 菜单初始值
+                   - locales/    zh-CN.yml（编译期 codegen 进二进制，运行期不读）
                    - fonts/      MapleMono-NF-CN-Regular.ttf（CJK）+ fa-solid-900.ttf（图标）
-                   - lighting/   day_outdoor.ron（光照主题）
+                   - lighting/   day_outdoor.ron（当前唯一被加载的主题；dark_lab.ron 暂无引用）
                    - vox/        nuke.vox（默认场景，gitignore）
 
-logs/  data/       运行期可写目录（gitignore）：logs/latest.log 日志落盘、data/ui/debug_menu.toml 菜单存档
+logs/  data/       运行期可写目录（gitignore）：logs/latest.log、data/ui/debug_menu.toml
 dist/              打包产物（bash package.sh 生成，gitignore）
 ```
 
 ---
 
-## 4. 常量体系（所有世界坐标 voxel 单位 = 2cm）
+## 4. 常量体系
+
+**坐标系约定**：1 voxel = 2cm。DDA 内所有坐标（ray origin/dir、cell、tmax）、
+`DdaCameraConfig::position_world`、`GridDesc` 的世界 AABB 与 chunk 窗口全部为 **voxel 单位**；
+chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
+
+### 体素 / 树（gate-voxel::coords，渲染侧在 brickmap::wire 同步一份）
 
 | 符号 | 值 | 含义 |
 |---|---|---|
-| `TILE_SUB` | 512 voxel | 每 tile 512 voxel = 10.24m |
-| `SUB_PER_CELL` | 16 voxel | 每粗胞 16 voxel = 32cm（L0 底）|
-| `TILE_CELLS` | 32³ = 32,768 | 每 tile 粗胞数 |
-| `TILE_INDEX_CAP` | 128 | 砖块图 index 表每轴容量 |
-| `PALETTE_WORDS` | 512 | 512 字 × 2 slot/字 packed = 1024 palette 项；实际 0=AIR |
-| `BRICK_SLAB_WORDS` | 1024 | 最细砖 4KB（L4 16×16×16 packed）|
-| `INDEX_WORDS` | 128³ = 2,097,152（≈8MB）| 定长前缀：tile → slot_idx 映射 |
-| `BITMAP_REGION_WORDS` | `TILE_CAP * TILE_BITMAP_WORDS`（1024×128）= 每 tile 4KB 粗胞占用位 |
-| `DIR_REGION_WORDS` | `TILE_CAP * CELL_DIR_WORDS`（32768×128）= 每 tile 128KB 胞节点绝对字偏移 |
+| `CHUNK_SIZE` | 256 voxel（= 5.12m） | chunk 边长；存储 / dirty / DDGI 段分配的共同粒度 |
+| `BRICK_FACTOR` | 4 | 分裂因子：每节点 4³ = 64 子块 |
+| `MAX_LEVEL` / `LEVEL_EXTENT` | 4 / `[256, 64, 16, 4, 1]` | 树层级边长（voxel）；level 2 = 16³ 组件 / DDGI cell 粒度 |
+| `PALETTE_ENTRY_COUNT` / `PALETTE_BITS` | 65536 / 16 | 材质索引位宽（`0 = AIR`），索引上限 65535 |
+| `PaletteEntry` | 8 B | color\[3\] + roughness + emissive + transmission + flags（`#[repr(C)]`，整表 512KB/volume） |
+| `LEAF_INLINE_WORDS` / `LEAF_VOXELS_PER_WORD` | 32 / 2 | level 3 叶父层 inline 存储：32 字，每字 2 个 16 位半字 |
+| `CHUNK_COMP_WORDS` | 2048 | comp_layer 每 chunk 字数（4096 个 u16 组件 ID 打包） |
+| `STATE_ENTRY_COUNT` / `STATE_WORDS_PER_ENTRY` | 256 / 4 | StateTable 条目与每条目字数 |
 
-**DDA 坐标系约定**：DDA 内所有坐标（ray origin/ray dir/cell floor/tmax）、`DdaCameraConfig::position_world`、`BrickMapGlobals::index_origin_* × 512` 全部 **voxel 单位**。perspective_rh + look_at_rh + inv_view_proj unproject 直接操作 voxel 坐标，`frustum_length = length(far_world - near_world)`；无需 tile↔voxel 在 shader 内再次换算。
+### GPU wire（b_struct / b_palette）
+
+| 符号 | 值 | 含义 |
+|---|---|---|
+| `NODE_FIXED_WORDS` | 3 | 每节点 `[mask_lo, mask_hi, palette_u32]` + popcount(mask) 个 child 偏移 |
+| `CHUNK_INDEX_CAP` / `CHUNK_INDEX_WORDS` | 64 / 262144 | 稠密 chunk 窗口（64³ 槽 = 1MB）；窗口外的 chunk 被拒绝并计数 |
+| `TREE_BASE` | 262144 | chunk 树区起始字偏移 |
+| `PALETTE_WORDS` | 131072 | 调色板字数（2^16 × 2 u32）/volume |
+| `MARCH_MASK_*` | 8 octant × 64 入口 × 2 字 = 1024 字 | 方向可达掩码 LUT（b_leaves，4KB） |
+
+### 渲染 / DDGI / 光照场
+
+| 符号 | 值 | 含义 |
+|---|---|---|
+| `VIEW_SIZE` | 1280×720 | 初始渲染分辨率（窗口内部分辨率 = 物理像素 ÷ `RenderScale.factor`） |
+| DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` 工作组边长（须与 WESL 一致） |
+| beam / GI 分辨率 | 1/4 / 1/2 | beam depth 纹理；半分辨率 GI 缓冲（premultiplied valid 格式） |
+| DDGI 级联 | 4 级，cell `[16, 32, 64, 128]` voxel | 世界 AABB 锚定、严格嵌套；网格外扩 `DDGI_GRID_MARGIN = 16` voxel |
+| LOD0 chunk 段 | 4096 槽/chunk | (256/16)³；池高水位定容，段基址分配后不变 |
+| DDGI 图集 | 4×4 irr + 8×8 depth / 探针 | 每层 40² 探针（`DDGI_PROBES_PER_LAYER_AXIS`），272 层 |
+| `DDGI_RAY_BUDGET` | 65536 射线/帧 | 摊给活跃探针（worklist 驱动 indirect dispatch） |
+| 刷新周期 / 跳过年龄 | `(65, 97, 129, 161)` / `(32, 24, 16, 12)` | 逐 LOD 的探针刷新节奏（WESL `ddgi/consts.wesl`） |
+| 光照场 | 32³ cell × 16 voxel | `Rgba16Unorm` 3D 纹理，.a = AO fill；世界覆盖 512 voxel = ±5.12m |
+| `SHADOW_SURFACE_EPS` | 1/32 voxel | 阴影/二次射线起点沿法线外推（防自命中，与 WGSL 同步） |
+
+> **跨语言常量的权威在 WESL 源码**：`gate-render/src/wesl_consts.rs` 启动时解析 `ddgi/consts.wesl` 等文件，
+> Rust 侧不再各留副本（不一致即启动 fail-fast）。改 DDGI 常量请改 `.wesl`。
 
 ---
 
-## 5. 关键 bug 备忘（回归必看）
+## 5. 不变量与踩坑（回归必看）
 
-详见 `project_memory.md` `Key Bugs Closed` 列表，已归档 8 条：
-1. **[CRITICAL] `ensure()` 扩容不拷内容** → `ensure_with_copy`；
-2. **[CRITICAL] `poll_pending` 2.8s 阻塞 Prepare** → backlog 一次性刷新；
-3. **[HIGH] fill_box pal=0** → `clear_voxel` 三重循环替代；
-4. **[HIGH] max_steps=2048 < AABB 厚度** → 升到 16384 + headless 5 zoom 档锁等价；
-5. **[HIGH] Update 内 debug_aabb_report 2B CPU DDA / 0.5s → fps 个位** → 注释出调度；
-6. **[MED] OrbitCamera clamp DIST_MAX 限远** → 删除上限、CAM_FAR 65536；
-7. **[MED] AABB DDA 标尺混用 v1/v2** → 相对标尺 v3（headless 300 射线 + demo scene 5 档 zoom 锁正确）；
-8. **[LOW] wgpu 首帧 VUID 告警** → 上游未修，LogPlugin filter `wgpu_hal::vulkan::instance=off,surface=off` 静默。
+以下每一条都已固化在对应代码注释里，改动相关模块时先核对：
+
+1. **存储 buffer 扩容必须带内容**：`ensure_with_copy` 做 GPU-GPU 前缀拷贝再写尾部；直接重建会把
+   chunk 索引表清零 → 全屏空（经典回归）。
+2. **上传别逐帧硬扛 backlog**：`poll_pending` 在 backlog > 3× 预算时一次性刷新，否则每次 Prepare 被长阻塞。
+3. **树编辑走整块路径**：笔触用 `fill_brick`（O(深度)）而不是逐体素 `set_voxel`（31³ 笔触 = 近 3 万次树下降
+   + 沿途 `try_merge`）。
+4. **DDGI chunk 段基址一经分配不再改变**：基址变 = 该 chunk 全部探针换槽位 → 图集整段错位 → 闪烁；
+   释放走空闲链表 LIFO 复用。
+5. **DDA cell 步进必须整数增量维护**：不得用 `floor(origin + dir·t)` 重算（t 恰在边界时 floor 会取到
+   穿越前/后的胞 → 对角胞漏检，与 brute-force 不等价）。
+6. **bind group 必须从索引 0 起成前缀设置**：自动曝光两个入口的布局因此重复挂 8 份；
+   半分辨率 GI 的**采样视图**必须挂 group(5)（挂 BG0 会与 collect 的存储写入在同一 pass 撞 usage）。
+7. **blit 采样器必须 Linear**：半分辨率上采样与 FXAA 亚像素偏移都依赖它；Nearest 会让 FXAA 整体空转
+   （现象 = "开了没变化"）。
+8. **UI 指针捕获闸门**：相机拖拽 / 滚轮 / 编辑射线都要查 `UiPointerCaptured` + `MouseIntercepted`，
+   否则操作菜单会同时驱动相机；文本输入框编辑态（`TextInputFocus`）还要挡键盘。
+9. **`scale_factor_override = 1.0` 必须每帧重设**：winit 在 resize / 跨显示器时会把 scale factor 刷回
+   OS DPI，导致 UI 1px 边框抗锯齿发虚、文字模糊。
+10. **UI 必须等字体资产加载完成再 spawn**：否则 TextPipeline 会把字形缓存进不含 CJK 的默认 slot →
+    之后即使 override 也是方框。
+11. **发光只走「命中直出 + GI」**：光照场的发光密度通道已移除（`Rgba16Unorm.rgb` 恒 0），别再往 .rgb 塞东西。
 
 ---
 
-## 6. 质量门禁（本地自测 before commit）
+## 6. 环境变量速查
+
+| 变量 | 取值 | 作用 |
+|---|---|---|
+| `GATE_ROOT` | 路径 | 强制安装根（`assets/`、`logs/`、`data/` 的父目录） |
+| `GATE_SCENE` | `vox`（默认）/ `demo` | 默认 `.vox` 场景 / 程序化极限场景 |
+| `GATE_TILES` | 2..10（默认 2） | demo 场景规模（1 tile = 512 voxel） |
+| `GATE_CAM` | `sky` | 相机朝天空（纯 miss 基准） |
+| `GATE_BENCH` | `1` | 失焦后台跑帧（Continuous 更新） |
+| `GATE_ORBIT` | `1` | 相机自动边转边平移（配 `GATE_BENCH` 读移动中逐 pass 帧时） |
+| `GATE_EDIT_SELFTEST` | `1` | 第 60 帧自动刷一次笔触，无鼠标走通编辑链路 |
+| `GATE_RES_SCALE` | ≥1（默认 1） | 渲染内部分辨率降采样倍数（**仅初值**，运行期以菜单为准） |
+| `GATE_DDGI_STAGE` | 0..3（默认 3） | DDGI 阶段停靠：0=Off / 1=Active / 2=Cast / 3=Full（基准对比用） |
+| `GATE_NO_BEAM` / `GATE_NO_LUT` / `GATE_NO_LOD` / `GATE_NO_EYE_ADAPT` | `1` | 关 beam / 关方向掩码剔除 / 关远场 LOD / 关自动曝光 |
+| `GATE_SKYOUT` / `GATE_MAKEGRID_ONLY` / `GATE_SKIP_CHUNKWALK` | `1` | 诊断：只出天空 / 只建 grid 不 trace / 跳过 chunk 步进 |
+
+---
+
+## 7. 质量门禁（本地自测 before commit）
 
 ```powershell
 # 本地跑法（VS Code → 终端 → 运行任务，或直接敲命令）
@@ -170,19 +285,32 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace
 ```
 
-- **`cargo fmt --check`**：代码风格。
+- **`cargo fmt --check`**：代码风格（rustfmt.toml：Google 风，2 空格缩进，edition 2024）。
 - **`cargo clippy --workspace --all-targets -- -D warnings`**：lint 零警告。
-- **`cargo build -p gate-app`**：dev 构建 0 error（unused 警告允许）。
+- **`cargo build --workspace`**：0 error。
 
-渲染 Demo 手工验收（跑 `cargo run -p gate-app` 10 秒）：
-- 画面必须出现：大陆全览 + 4 雪峰 + S 河 + 中央天空堡 + L2 金顶球 + 4 红旗 + 3 处 L4 水晶；
-- fps 折线 ≥ 50（RTX 3070 基线 73），无 < 30 波谷；
-- 滚 20 下向外不缺体素；
-- stderr 每 ~2 秒一行 `UPLOAD[incremental]: bytes≤0.3MB tiles=1`，**无 1 秒以上 elapsed 增量上传长耗时**。
+> 无 CI：以上三条 + 下面的人工验收靠提交前手动跑。
+
+**手工验收（`cargo run -p gate-app`）**
+
+- 默认 `nuke.vox` 场景出画；`WASD` 飞行与右键转头流畅；`F3` 菜单显隐正常。
+- 菜单逐项生效：DDGI 开关 / 诊断模式 / 探针可视化 / 半分辨率 GI；半分辨率 / FXAA / 垂直同步；
+  曝光参数（改完 stderr 有 `eye adapt 参数 → GPU` 一行）。
+- 左键放置、右键单击擦除 → stderr 出现 `EDIT[...]` 与 `UPLOAD[incremental]`（增量部分写：`bytes` 远小于全量上传）。
+- 「游戏/世界/重载世界」换模型后画面整块刷新（DDGI / 光照场跟随重建，无残留旧几何）。
+- 长时间运行无 1 秒以上的增量上传长耗时（`UPLOAD[incremental]` 的 elapsed 应在毫秒级）。
+
+**性能剖析（可选）**
+
+```powershell
+cargo run -p gate-app --features profile   # 启动后用 Tracy GUI 连接进程
+```
+
+逐 pass 的 GPU 均值每 2 秒打印一行；Tracy 时间线上 CPU span（tracing 桥）与 GPU pass 同一帧轴。
 
 ---
 
-## 7. 打包发布
+## 8. 打包发布
 
 ```sh
 bash package.sh     # release 构建 → 组装便携目录（不压缩）
@@ -195,6 +323,10 @@ bash package.sh     # release 构建 → 组装便携目录（不压缩）
   2. exe 同目录存在 `assets/`（便携发布形态）→ 安装根 = exe 所在目录；
   3. 否则 = 源码树根（`cargo run` / F5 时 exe 在 `target/<profile>/`，走这条）。
   于是 `assets/`（只读）、`logs/`、`data/`（可写）在开发与发布下都指向同一套相对位置。
-- **必须随包发**：`assets/` 全部内容（字体、`blit.wgsl`、WESL 源码——启动时读盘编译、`ui/theme.ron`、`ui/debug_menu.toml`、`lighting/*.ron`、`vox/nuke.vox`）。
+- **必须随包发**：`assets/` 全部内容（字体、`blit.wgsl`、WESL 源码——启动时读盘编译、`ui/theme.ron`、
+  `ui/debug_menu.toml`、`lighting/*.ron`、`vox/*.vox`）。
 - **无需随包**：`assets/locales/*.yml`（编译期 codegen 进 exe）、`logs/`、`data/`（首次启动自建）。
-- **不写安装目录**：日志 → `<安装根>/logs/latest.log`；菜单状态 → `<安装根>/data/ui/debug_menu.toml`（启动时优先读它，没有才用 `assets/ui/debug_menu.toml` 初版）。安装到只读目录（如 Program Files）时用 `GATE_ROOT` 把可写数据挪到别处。
+- **不写安装目录**：日志 → `<安装根>/logs/latest.log`；菜单状态 → `<安装根>/data/ui/debug_menu.toml`
+  （启动时优先读它，没有才用 `assets/ui/debug_menu.toml` 初版）。安装到只读目录（如 Program Files）时用
+  `GATE_ROOT` 把可写数据挪到别处。
+- **注意**：`assets/vox/nuke.vox` 被 gitignore，脚本只在缺失时 WARN，不会阻断打包——发布前自备该文件。
