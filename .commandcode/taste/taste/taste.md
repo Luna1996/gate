@@ -9,3 +9,4 @@
 - No speculative APIs: don't add functions/types "for a future need" with no current consumer; pushback such as "what is this knobs() function for, why does it exist?" means delete unused code (including the doc/README references to it) until it is actually needed. Confidence: 0.85
 - For runtime-tunable values, use the Bevy `Resource` + debug_menu node/callback path (resource → `ExtractResource` for render world → `default_menu()` entry → i18n label → callback → `apply_initial_state` for save reload); do not keep `AtomicBool`/`static` interior mutability "just in case" — delete them and leave plain `const` until a menu control actually needs them. Confidence: 0.85
 - Writes in Chinese and expects replies in Chinese. Confidence: 0.8
+- Prefers derived/extracted artifacts (e.g. code transcribed from screenshots) saved as a markdown file in the same directory as the source assets, rather than in a separate location. Confidence: 0.6
