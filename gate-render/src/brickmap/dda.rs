@@ -10,14 +10,9 @@ use bevy::{
   render::{extract_resource::ExtractResource, render_resource::*},
 };
 use std::ops::Mul;
-use std::sync::LazyLock;
 
 /// blit.wgsl 资产路径（全屏三角 blit）
 pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
-/// 初始渲染分辨率（窗口创建尺寸）
-pub const VIEW_SIZE: UVec2 = UVec2::new(1280, 720);
-/// beam pass 的 compute dispatch 工作组边长
-pub const WORKGROUP_SIZE: u32 = 8;
 /// 主 DDA pass 工作组边长：必须与 `shaders/voxel_raytrace/` 中 dda_main 的 `@workgroup_size` 一致。
 pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
@@ -32,7 +27,7 @@ pub struct RenderScale {
 
 impl Default for RenderScale {
   fn default() -> Self {
-    Self { size: VIEW_SIZE, factor: 1 }
+    Self { size: crate::consts::VIEW_SIZE, factor: 1 }
   }
 }
 
@@ -57,7 +52,7 @@ impl DdaCameraConfig {
     let eye = Vec3::new(700.0, 560.0, 700.0);
     let target = Vec3::new(260.0, 120.0, 260.0);
     let up = Vec3::Y;
-    let aspect = VIEW_SIZE.x as f32 / VIEW_SIZE.y as f32;
+    let aspect = crate::consts::VIEW_SIZE.x as f32 / crate::consts::VIEW_SIZE.y as f32;
     let fovy = 60.0_f32.to_radians();
     let near = 1.0;
     let far = 4000.0;
@@ -149,34 +144,20 @@ pub struct DdaViewUniform {
   pub cam_pos_voxel: Vec4, // w=1
   /// x/y = debug 可视化；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
   pub debug_mode: Vec4,
-  /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（GATE_NO_LOD=1 关）
+  /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（`consts::DDA_LOD`）
   pub lod: Vec4,
   pub probe_viz_params: Vec4,
 }
 
-/// `GATE_SKIP_CHUNKWALK=1`：trace_grid 在局部 slab 后直接 miss。
-static SKIP_CHUNKWALK: LazyLock<bool> =
-  LazyLock::new(|| std::env::var("GATE_SKIP_CHUNKWALK").map(|v| v == "1").unwrap_or(false));
-/// `GATE_SKYOUT=1`：dda_main 跳过全部 trace 直接输出天空色。
-static SKY_OUT: LazyLock<bool> =
-  LazyLock::new(|| std::env::var("GATE_SKYOUT").map(|v| v == "1").unwrap_or(false));
-/// `GATE_MAKEGRID_ONLY=1`：dda_main 只做 make_grid 不 trace。
-static MAKEGRID_ONLY: LazyLock<bool> =
-  LazyLock::new(|| std::env::var("GATE_MAKEGRID_ONLY").map(|v| v == "1").unwrap_or(false));
-/// `GATE_NO_LOD=1`：关闭八叉树远场早停。
-static LOD_DISABLED: LazyLock<bool> =
-  LazyLock::new(|| std::env::var("GATE_NO_LOD").map(|v| v == "1").unwrap_or(false));
-/// `GATE_NO_BEAM=1`：关闭 beam 预 pass，主 pass 从 t=0 起步（默认开启 beam）。
-static BEAM_DISABLED: LazyLock<bool> =
-  LazyLock::new(|| std::env::var("GATE_NO_BEAM").map(|v| v == "1").unwrap_or(false));
-/// `GATE_NO_LUT=1`：关闭方向可达掩码剔除（lod.w 传 1 → shader 端旁路 LUT）。
-static LUT_DISABLED: LazyLock<bool> =
-  LazyLock::new(|| std::env::var("GATE_NO_LUT").map(|v| v == "1").unwrap_or(false));
+/// 本文件用到的开关（`consts.rs`）
+use crate::brickmap::consts::{
+  DDA_BEAM, DDA_CHUNKWALK, DDA_DIR_LUT, DDA_LOD, DDA_MAKEGRID_ONLY, DDA_SKY_ONLY, EYE_ADAPT,
+};
 
 impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
-    // 垂直 FOV 60°（镜像 gate-app FOV_Y），均分到 render_h 像素
-    let px_ang = 2.0 * 30.0_f32.to_radians().tan() / render_h.max(1.0);
+    // 垂直 FOV 均分到 render_h 像素（FOV 见 `consts::DDA_FOV_Y`，镜像 gate-app consts）
+    let px_ang = 2.0 * (crate::brickmap::consts::DDA_FOV_Y * 0.5).tan() / render_h.max(1.0);
     Self {
       view_proj: cfg.view_proj,
       inv_view_proj: cfg.inv_view_proj,
@@ -184,10 +165,10 @@ impl DdaViewUniform {
       debug_mode: Vec4::new(
         (debug_mode == 1) as u32 as f32,
         (debug_mode == 2) as u32 as f32,
-        if *SKIP_CHUNKWALK { 2.0 } else { 0.0 },
-        if *SKY_OUT {
+        if DDA_CHUNKWALK { 0.0 } else { 2.0 },
+        if DDA_SKY_ONLY {
           2.0
-        } else if *MAKEGRID_ONLY {
+        } else if DDA_MAKEGRID_ONLY {
           4.0
         } else if debug_mode == 3 {
           1.0
@@ -197,9 +178,9 @@ impl DdaViewUniform {
       ),
       lod: Vec4::new(
         px_ang,
-        (!*LOD_DISABLED) as u32 as f32,
-        *BEAM_DISABLED as u32 as f32,
-        *LUT_DISABLED as u32 as f32,
+        DDA_LOD as u32 as f32,
+        !DDA_BEAM as u32 as f32,
+        !DDA_DIR_LUT as u32 as f32,
       ),
       probe_viz_params: Vec4::ZERO,
     }
@@ -212,11 +193,15 @@ pub struct DdaImages {
   pub target: Handle<Image>,
 }
 
-/// 工厂：DDA 目标纹理（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）。
+/// 工厂：DDA 目标纹理（rgba8unorm `consts::VIEW_SIZE`，STORAGE|TEXTURE + RENDER_WORLD usage）。
 /// `COPY_DST` 必须保留：bevy resize 的 `copy_image_on_resize` 依赖它。
 pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
-  let mut image =
-    Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba8Unorm, None);
+  let mut image = Image::new_target_texture(
+    crate::consts::VIEW_SIZE.x,
+    crate::consts::VIEW_SIZE.y,
+    TextureFormat::Rgba8Unorm,
+    None,
+  );
   image.asset_usage = RenderAssetUsages::RENDER_WORLD;
   image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING
     | TextureUsages::TEXTURE_BINDING
@@ -244,9 +229,9 @@ pub mod wgsl_consts {
   pub const STATE_ENTRY_COUNT: u32 = 256;
   pub const STATE_WORDS_PER_ENTRY: u32 = 4;
   pub const STATE_TOTAL_WORDS: u32 = 1024;
-  pub const SHADOW_BIAS: f32 = crate::lighting::SHADOW_BIAS;
-  pub const SHADOW_DIR_T_MAX: f32 = crate::lighting::SHADOW_DIR_T_MAX;
-  pub const EMISSIVE_EMIT_GAIN: f32 = crate::lighting::EMISSIVE_EMIT_GAIN;
+  pub const SHADOW_BIAS: f32 = crate::consts::SHADOW_BIAS;
+  pub const SHADOW_DIR_T_MAX: f32 = crate::consts::SHADOW_DIR_T_MAX;
+  pub const EMISSIVE_EMIT_GAIN: f32 = crate::consts::EMISSIVE_EMIT_GAIN;
   // 光照场（AO fill）：cell = 16 voxel，dims = 32³ cell → 世界覆盖 512 voxel = ±5.12m（相机中心）。
   // 世界锚定寻址：原点按 cell 向下对齐，槽位 = 世界 cell mod dims。格式 Rgba16Unorm：.a = AO fill，.rgb 恒 0。
   pub const LIGHT_FIELD_CELL: u32 = 16;
@@ -669,8 +654,8 @@ fn trace_chunk_cpu(
   ];
   let mut cur_t = t0;
   let mut face = entry_face;
-  // 防挂死安全网（与 WGSL trace_chunk 同值）
-  let mut budget: u32 = 65536;
+  // 防挂死安全网（与 WGSL trace_chunk 同值，见 `consts::CPU_TRACE_BUDGET`）
+  let mut budget: u32 = crate::brickmap::consts::CPU_TRACE_BUDGET;
   loop {
     if budget == 0 {
       return None;
@@ -1240,7 +1225,7 @@ fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResM
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 pub struct EyeAdaptSettings {
   /// 总开关：关掉 = 两个 eye pass 停发 + 曝光回落 1.0。不占参数区槽位（host 侧开关）。
-  /// 初值受 `GATE_NO_EYE_ADAPT=1` 影响，之后由 Eye 页开关接管。
+  /// 初值见 [`EYE_ADAPT`]（`consts.rs`），之后由 Eye 页开关接管。
   pub enabled: bool,
   /// [0] 提亮上限（档，≥0）：适应暗处的最大增益 = 2^ev_max
   pub ev_max: f32,
@@ -1262,10 +1247,9 @@ impl Default for EyeAdaptSettings {
 }
 
 impl EyeAdaptSettings {
-  /// 缺省 + 环境变量覆盖：`GATE_NO_EYE_ADAPT=1` 只决定初值，之后以面板开关为准。
-  pub fn from_env() -> Self {
-    let off = std::env::var("GATE_NO_EYE_ADAPT").map(|v| v == "1").unwrap_or(false);
-    Self { enabled: !off, ..Self::default() }
+  /// 启动值：初值来自 [`EYE_ADAPT`]（`consts.rs`），之后以面板开关为准。
+  pub fn startup() -> Self {
+    Self { enabled: EYE_ADAPT, ..Self::default() }
   }
 }
 
@@ -1302,7 +1286,7 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       crate::responsive::ResponsivePlugin,
     ));
-    app.insert_resource(EyeAdaptSettings::from_env());
+    app.insert_resource(EyeAdaptSettings::startup());
 
     // main → render 的 ExtractSchedule：把 DdaCameraConfig 从 main world 读
     // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
@@ -1347,7 +1331,7 @@ fn extract_camera_config(
 ) {
   let Some(cfg) = cfg else { return };
   let debug_mode = debug.map(|d| d.0).unwrap_or(0);
-  let render_h = scale.map(|s| s.size.y as f32).unwrap_or(VIEW_SIZE.y as f32);
+  let render_h = scale.map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
   let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, render_h);
   commands.insert_resource(uniform);
 }
@@ -1673,9 +1657,9 @@ pub(crate) fn prepare_dda_bind_groups(
   let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
   let blit_layout = pipeline_cache.get_bind_group_layout(&pipelines.blit_layout);
 
-  // ---- beam depth：低分辨率 r32float（全分辨率 / 4），resize 时重建 ----
-  const BEAM_DIV: u32 = 4;
-  let beam_size = UVec2::new(scale.size.x.div_ceil(BEAM_DIV), scale.size.y.div_ceil(BEAM_DIV));
+  // ---- beam depth：低分辨率 r32float（全分辨率 ÷ BEAM_DIV），resize 时重建 ----
+  let beam_div = crate::brickmap::consts::BEAM_DIV;
+  let beam_size = UVec2::new(scale.size.x.div_ceil(beam_div), scale.size.y.div_ceil(beam_div));
   if beam_cache.texture.is_none() || beam_cache.size != beam_size {
     let tex = render_device.create_texture(&TextureDescriptor {
       label: Some("gate_beam_depth"),
@@ -1912,13 +1896,13 @@ pub(crate) fn dispatch_dda(
   let gx = scale.size.x.div_ceil(DDA_WORKGROUP_SIZE);
   let gy = scale.size.y.div_ceil(DDA_WORKGROUP_SIZE);
   // beam：低分辨率 dispatch = ceil(size / 4) / 8
-  let bx = scale.size.x.div_ceil(4).div_ceil(WORKGROUP_SIZE);
-  let by = scale.size.y.div_ceil(4).div_ceil(WORKGROUP_SIZE);
+  let bx = scale.size.x.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
+  let by = scale.size.y.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
 
   // ---- beam 预 pass：低分辨率 trace 只输出最近命中 t（独立 compute pass，
   // beam 写 beam_depth，主 pass 读同 texture → pass 边界 barrier 保证可见性）----
-  // GATE_NO_BEAM=1：跳过 beam pass，主 pass t_min=0（穿墙定位用）
-  if !*BEAM_DISABLED && let Some(beam_pipe) = beam_pipe {
+  // DDA_BEAM = false：跳过 beam pass，主 pass t_min=0（穿墙定位用）
+  if DDA_BEAM && let Some(beam_pipe) = beam_pipe {
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_beam", |pass| {
       pass.set_pipeline(beam_pipe);
       pass.set_bind_group(0, &bg0.0, &[]);

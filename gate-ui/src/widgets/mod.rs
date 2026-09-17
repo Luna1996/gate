@@ -4,6 +4,7 @@
 
 pub mod button;
 pub mod checkbox;
+pub mod consts;
 pub mod dropdown;
 pub mod grid;
 pub mod label;
@@ -26,20 +27,20 @@ pub use checkbox::{
   CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system,
 };
 pub use dropdown::{
-  DROPDOWN_ANIM_SECS, DropdownArrow, DropdownChanged, DropdownConfig, DropdownHandle,
-  DropdownOption, DropdownOptions, DropdownPopup, DropdownRoot, DropdownState, DropdownText,
-  DropdownValue, dropdown, dropdown_system, dropdown_visual_system,
+  DropdownArrow, DropdownChanged, DropdownConfig, DropdownHandle, DropdownOption, DropdownOptions,
+  DropdownPopup, DropdownRoot, DropdownState, DropdownText, DropdownValue, dropdown,
+  dropdown_system, dropdown_visual_system,
 };
 pub use grid::{GridConfig, GridHandle, UiGrid, grid, grid_cell};
 pub use label::{
-  ELLIPSIS, EllipsisText, FontAttrs, LabelConfig, LabelHandle, LabelOverflow, LabelStyle, label,
+  EllipsisText, FontAttrs, LabelConfig, LabelHandle, LabelOverflow, LabelStyle, label,
   label_ellipsis_system, middle_ellipsis,
 };
 pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
 pub use panel::{PanelConfig, PanelHandle, PanelSurface, panel};
 pub use plot::{
-  PLOT_H, PLOT_W, PlotCanvas, PlotConfig, PlotData, PlotDomain, PlotExtents, PlotHandle,
-  PlotLayout, PlotYAxis, blank_plot_image, plot, plot_redraw_system,
+  PlotCanvas, PlotConfig, PlotData, PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis,
+  blank_plot_image, plot, plot_redraw_system,
 };
 pub use scroll_view::{
   ScrollConfig, ScrollContent, ScrollView, ScrollViewHandle, ScrollViewport, scroll_view,
@@ -55,19 +56,15 @@ pub use tab_view::{
 };
 pub use table::{TableCell, TableConfig, TableHandle, UiTable, table};
 pub use text_input::{
-  CARET_CHAR, DRAG_THRESHOLD_PX, NUMBER_DRAG_PX_PER_STEP, TextInputChanged, TextInputConfig,
-  TextInputFocus, TextInputHandle, TextInputKind, TextInputRoot, TextInputState, TextInputText,
-  TextInputValue, text_input, text_input_keyboard_system, text_input_pointer_system,
-  text_input_visual_system,
+  TextInputChanged, TextInputConfig, TextInputFocus, TextInputHandle, TextInputKind, TextInputRoot,
+  TextInputState, TextInputText, TextInputValue, text_input, text_input_keyboard_system,
+  text_input_pointer_system, text_input_visual_system,
 };
 pub use toggle_switch::{
   ToggleKnob, ToggleSwitch, ToggleSwitchConfig, ToggleSwitchHandle, ToggleSwitchToggled,
   ToggleTrack, toggle_switch, toggle_switch_state_system,
 };
-pub use tooltip::{
-  TOOLTIP_DELAY, TOOLTIP_MARGIN, TOOLTIP_MAX_W, TOOLTIP_OFFSET, Tooltip, TooltipLayer,
-  TooltipLayerEntity, TooltipText, tooltip_system,
-};
+pub use tooltip::{Tooltip, TooltipLayer, TooltipLayerEntity, TooltipText, tooltip_system};
 
 use bevy::log::warn;
 use bevy::prelude::*;
@@ -75,14 +72,12 @@ use bevy::text::FontSource;
 use bevy::ui::widget::Label;
 
 use crate::theme::{HexColor, UiTheme};
+use crate::widgets::consts::DISABLED_DIM;
 
 /// Disabled 态标记组件（挂在 widget 根节点）。状态机检测到它时跳过交互逻辑（不发事件、不翻转状态），
 /// 并把配色经 `dim_color` 降亮。
 #[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UiDisabled;
-
-/// Disabled 态降亮系数：RGB 通道乘以此值，alpha 不变。
-const DISABLED_DIM: f32 = 0.55;
 
 /// 将颜色暗一档（disabled 态通用）：线性空间下 RGB 乘 `DISABLED_DIM`，alpha 不变。
 pub fn dim_color(color: Color) -> Color {

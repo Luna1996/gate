@@ -1,13 +1,10 @@
 //! 运行期路径定位：`assets/`（只读资源）、`logs/`、`data/`（可写）。
-//! 根目录由 [`install_root`] 判定：便携发布 = exe 同目录（存在 `assets/`）；开发 = 源码树根；`GATE_ROOT` 可强制覆盖。
+//! 根目录由 [`install_root`] 判定：便携发布 = exe 同目录（存在 `assets/`）；开发 = 源码树根。
 
 use std::path::PathBuf;
 
 /// 安装根（`assets/`、`logs/`、`data/` 的父目录）
 pub fn install_root() -> PathBuf {
-  if let Ok(root) = std::env::var("GATE_ROOT") {
-    return PathBuf::from(root);
-  }
   if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from))
     && dir.join("assets").is_dir()
   {

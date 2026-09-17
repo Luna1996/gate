@@ -1,27 +1,11 @@
 //! 场景响应式：窗口 resize → 渲染目标纹理原地重建 + RenderScale 跟随。
-//! 渲染内部分辨率 = 窗口物理像素 ÷ factor（`GATE_RES_SCALE`，默认 1 = 全分辨率）。
+//! 渲染内部分辨率 = 窗口物理像素 ÷ factor（渲染降采样倍数见 [`crate::consts::RENDER_SCALE`]）。
 
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 
 use crate::brickmap::dda::{DdaImages, PostFxSettings, RenderScale};
-
-/// 合法窗口尺寸范围（MIN_DIM..=MAX_DIM）。
-const MIN_DIM: u32 = 64;
-const MAX_DIM: u32 = 4096;
-
-/// 启动时的降采样倍数（`GATE_RES_SCALE`，默认 1 = 全分辨率；非数字或 <1 按 1 处理）。
-/// 只是初值：运行期以 `RenderScale.factor` 为准（菜单「视频/半分辨率」写它）。
-fn render_scale_factor_from_env() -> u32 {
-  static FACTOR: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-    std::env::var("GATE_RES_SCALE")
-      .ok()
-      .and_then(|v| v.parse().ok())
-      .filter(|&f| f >= 1)
-      .unwrap_or(1)
-  });
-  *FACTOR
-}
+use crate::consts::{MAX_DIM, MIN_DIM};
 
 fn size_is_sane(s: UVec2) -> bool {
   (MIN_DIM..=MAX_DIM).contains(&s.x) && (MIN_DIM..=MAX_DIM).contains(&s.y)
@@ -82,7 +66,8 @@ impl Plugin for ResponsivePlugin {
       .init_resource::<PostFxSettings>()
       .add_systems(Update, resize_render_targets);
 
-    let f = render_scale_factor_from_env();
+    // 启动降采样倍数：只是初值，运行期以 RenderScale.factor 为准（菜单「视频/半分辨率」写它）
+    let f = crate::consts::RENDER_SCALE;
     if f > 1 {
       app.world_mut().resource_mut::<RenderScale>().factor = f;
     }

@@ -8,14 +8,6 @@ use serde::Deserialize;
 
 /// 光源上限（uniform 数组长度；当前只用 lights[0] = 方向光）
 pub const MAX_LIGHTS: usize = 8;
-/// 阴影射线起点沿法线偏移（voxel），消除自遮挡 acne
-pub const SHADOW_BIAS: f32 = 0.5;
-/// 方向光阴影射线 t_max：须 ≥ 场景 AABB 对角；改世界尺度时按对角线同步放大。
-pub const SHADOW_DIR_T_MAX: f32 = 8192.0;
-/// 发光体素 radiance 直出增益
-pub const EMISSIVE_EMIT_GAIN: f32 = 4.0;
-/// 天空纯色（Minecraft 白天平原天空 #78A7FF；sRGB u8/255 直读，sRGB→linear 在 WGSL `sky_rgb()` 内做）
-pub const MINECRAFT_SKY: [f32; 3] = [120.0 / 255.0, 167.0 / 255.0, 1.0];
 
 /// 光源描述（shader 镜像，48B；uniform 数组 stride 16 的倍数 ✓）
 #[repr(C)]
@@ -97,7 +89,7 @@ impl Default for LightingTheme {
       }),
       ambient: [0.08, 0.09, 0.12],
       exposure: 1.0,
-      sky: Some(SkyCfg { color: MINECRAFT_SKY }),
+      sky: Some(SkyCfg { color: crate::consts::MINECRAFT_SKY }),
     }
   }
 }
@@ -121,7 +113,12 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
     lights: [const {
       LightDesc { kind_pos_dir: Vec4::ZERO, color_intensity: Vec4::ZERO, shape: Vec4::ZERO }
     }; MAX_LIGHTS],
-    sky_color: Vec4::new(MINECRAFT_SKY[0], MINECRAFT_SKY[1], MINECRAFT_SKY[2], 0.0),
+    sky_color: Vec4::new(
+      crate::consts::MINECRAFT_SKY[0],
+      crate::consts::MINECRAFT_SKY[1],
+      crate::consts::MINECRAFT_SKY[2],
+      0.0,
+    ),
   };
   if let Some(sky) = &theme.sky {
     u.sky_color = Vec4::new(sky.color[0], sky.color[1], sky.color[2], 0.0);

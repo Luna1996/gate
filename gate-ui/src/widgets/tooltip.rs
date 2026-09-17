@@ -8,15 +8,8 @@ use bevy::window::PrimaryWindow;
 
 use super::{color_of, px};
 use crate::theme::UiTheme;
+use crate::widgets::consts::{TOOLTIP_DELAY, TOOLTIP_MARGIN, TOOLTIP_MAX_W, TOOLTIP_OFFSET};
 
-/// 悬浮多久后展示（秒）
-pub const TOOLTIP_DELAY: f32 = 0.5;
-/// 提示框相对光标的偏移（逻辑 px；y 为正 = 在光标下方）
-pub const TOOLTIP_OFFSET: Vec2 = Vec2::new(14.0, 18.0);
-/// 提示框与系统窗口边缘的最小留白（逻辑 px）
-pub const TOOLTIP_MARGIN: f32 = 8.0;
-/// 提示框最大宽度（逻辑 px，超出换行）
-pub const TOOLTIP_MAX_W: f32 = 260.0;
 /// 提示框层深（高于一切面板）
 const TOOLTIP_Z: i32 = 1000;
 

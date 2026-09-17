@@ -12,10 +12,10 @@ use bevy::ui::UiScale;
 use bevy::window::{PrimaryWindow, Window};
 use serde::Deserialize;
 
+use crate::consts::AUTOFIT_BASE_HEIGHT;
+
 /// 主题资产路径（相对资源根 `assets/`，见 gate-render `paths`）
 pub const THEME_ASSET_PATH: &str = "ui/theme.ron";
-/// auto_fit 基准高度：窗口高 720 时 UiScale == ui_scale
-pub const AUTOFIT_BASE_HEIGHT: f32 = 720.0;
 
 /// 十六进制颜色："RRGGBB"（alpha=FF）或 "RRGGBBAA"
 #[derive(Clone, Debug, PartialEq)]

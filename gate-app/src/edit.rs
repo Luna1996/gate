@@ -12,7 +12,10 @@ use gate_voxel::{
   VoxelCoord,
 };
 
-use crate::camera::{CameraMode, cursor_ray};
+use crate::{
+  camera::{CameraMode, cursor_ray},
+  consts::{DRAG_PX, EDIT_REACH},
+};
 
 /// 笔触形状
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -22,15 +25,6 @@ pub enum BrushShape {
   Sphere,
   Cube,
 }
-
-/// 笔触大小下界（voxel）：1 = 单格；无上界（写入按 brick 整块进行，见 `apply_brush`）。
-pub const EDIT_SIZE_MIN: u32 = 1;
-
-/// 编辑"手长"（voxel）：射线超过这个距离不算命中（1 voxel = 2cm → 256 ≈ 5.1m）
-pub const EDIT_REACH: f32 = 256.0;
-
-/// 右键「点击 vs 拖拽转头」的累计位移阈值（物理像素）
-const DRAG_PX: f32 = 4.0;
 
 /// 笔触材质参数：菜单「游戏/编辑」的四个控件（颜色 / 自发光 / 透明度 / 光滑度）直接写这里，
 /// 由 `material_slot` 落进调色板槽；字段与 `PaletteEntry` 一一对应，数值域按 UI 收窄。
@@ -372,7 +366,7 @@ pub(crate) fn voxel_edit_input(
   }
 }
 
-/// `GATE_EDIT_SELFTEST=1`：第 60 帧朝初始注视点刷一次笔触，走通编辑 → 增量上传链路。
+/// 第 60 帧朝初始注视点刷一次笔触，走通编辑 → 增量上传链路；由 `consts::EDIT_SELFTEST` 决定是否注册。
 /// 只在设了该变量时注册（见 main.rs）。
 pub(crate) fn edit_selftest(
   scene: Option<ResMut<VoxelScene>>,

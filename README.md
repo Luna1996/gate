@@ -9,13 +9,13 @@
 
 ```powershell
 # 工具链：Rust stable（rust-toolchain.toml，MSVC toolchain）+ Vulkan 显卡驱动
-cargo run -p gate-app                     # 默认场景 GATE_SCENE=vox → assets/vox/nuke.vox
+cargo run -p gate-app                     # 默认场景 = assets/vox/nuke.vox（启动场景/规模见 gate-app/src/consts.rs）
 cargo run -p gate-app --features profile  # 性能剖析：Tracy GUI 连接进程（CPU span + GPU pass 同时间线）
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 > `assets/vox/nuke.vox` 被 `.gitignore` 排除（体积大），新克隆的仓库里没有它。备选：
-> `$env:GATE_SCENE="demo"` 跑程序化「极限场景」，或自备一份 `.vox` 放进 `assets/vox/`。
+> 把 `gate-app/src/consts.rs` 的 `STARTUP_DEMO_SCENE` 改成 `true` 跑程序化「极限场景」，或自备一份 `.vox` 放进 `assets/vox/`。
 
 **操作（默认「幽灵飞行」模式，无碰撞）**
 
@@ -70,7 +70,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ```
 [Bevy 主 world]
-  Startup : scene::setup —— 读 lighting/*.ron、建 VolumeGrid（GATE_SCENE=vox 默认 / demo 程序化）、
+  Startup : scene::setup —— 读 lighting/*.ron、建 VolumeGrid（默认 vox / demo 程序化，见 consts）、
             算 DDGI 世界 AABB + LOD0 chunk 集、初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
   Update  : 相机链（模式对齐 → 转头 → 各模式输入 → 拾取 → build_camera_config）→ 体素编辑
             → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
@@ -258,21 +258,21 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 
 ---
 
-## 6. 环境变量速查
+## 6. 可调常量（旋钮）
 
-| 变量 | 取值 | 作用 |
-|---|---|---|
-| `GATE_ROOT` | 路径 | 强制安装根（`assets/`、`logs/`、`data/` 的父目录） |
-| `GATE_SCENE` | `vox`（默认）/ `demo` | 默认 `.vox` 场景 / 程序化极限场景 |
-| `GATE_TILES` | 2..10（默认 2） | demo 场景规模（1 tile = 512 voxel） |
-| `GATE_CAM` | `sky` | 相机朝天空（纯 miss 基准） |
-| `GATE_BENCH` | `1` | 失焦后台跑帧（Continuous 更新） |
-| `GATE_ORBIT` | `1` | 相机自动边转边平移（配 `GATE_BENCH` 读移动中逐 pass 帧时） |
-| `GATE_EDIT_SELFTEST` | `1` | 第 60 帧自动刷一次笔触，无鼠标走通编辑链路 |
-| `GATE_RES_SCALE` | ≥1（默认 1） | 渲染内部分辨率降采样倍数（**仅初值**，运行期以菜单为准） |
-| `GATE_DDGI_STAGE` | 0..3（默认 3） | DDGI 阶段停靠：0=Off / 1=Active / 2=Cast / 3=Full（基准对比用） |
-| `GATE_NO_BEAM` / `GATE_NO_LUT` / `GATE_NO_LOD` / `GATE_NO_EYE_ADAPT` | `1` | 关 beam / 关方向掩码剔除 / 关远场 LOD / 关自动曝光 |
-| `GATE_SKYOUT` / `GATE_MAKEGRID_ONLY` / `GATE_SKIP_CHUNKWALK` | `1` | 诊断：只出天空 / 只建 grid 不 trace / 跳过 chunk 步进 |
+没有环境变量开关：所有可调项都是编译期常量，每个目录一个 `consts.rs`（贴着使用方）。
+
+| 文件 | 内容 |
+|---|---|
+| `gate-app/src/consts.rs` | 启动场景 / demo 规模 / 相机（FOV、裁剪面、灵敏度、飞行速度）/ 编辑笔触 / 菜单与展示窗 |
+| `gate-render/src/consts.rs` | 光照增益 / 响应式尺寸 / profiler 周期 / DDGI（阶段、遮挡、网格外扩） |
+| `gate-render/src/brickmap/consts.rs` | DDA（分辨率、beam、FOV、诊断开关）/ 上传预算与缓冲策略 |
+| `gate-ui/src/consts.rs` | `UiScale` 自适应基准 |
+| `gate-ui/src/menu/consts.rs` | 菜单容器布局与动画 |
+| `gate-ui/src/widgets/consts.rs` | widget 尺寸与手感 |
+
+- 取值：`const` 直接读（改值后重新编译）。要让某项运行期可调，把它挪进 Bevy 资源（`RenderScale` / `EyeAdaptSettings` / `DdgiDebugSettings` 是现成例子），再由 debug_menu 的节点 + 回调写它。
+- WESL 侧常量仍是 shader 的权威值（`wesl_consts.rs` 启动时解析同一份源码），不在 Rust `consts.rs` 里重复。
 
 ---
 
@@ -319,14 +319,12 @@ bash package.sh     # release 构建 → 组装便携目录（不压缩）
 
 - **产物形态**：`gate-app.exe` 与 `assets/` **同级**，双击即用；整个目录放到任何位置都行。要发 zip/7z 自己压。
 - **路径怎么找**（`gate-render/src/paths.rs`，`install_root()` 一套规则覆盖两种形态）：
-  1. `GATE_ROOT` 环境变量 → 直接当安装根（自定义安装位置 / 测试）；
-  2. exe 同目录存在 `assets/`（便携发布形态）→ 安装根 = exe 所在目录；
-  3. 否则 = 源码树根（`cargo run` / F5 时 exe 在 `target/<profile>/`，走这条）。
+  1. exe 同目录存在 `assets/`（便携发布形态）→ 安装根 = exe 所在目录；
+  2. 否则 = 源码树根（`cargo run` / F5 时 exe 在 `target/<profile>/`，走这条）。
   于是 `assets/`（只读）、`logs/`、`data/`（可写）在开发与发布下都指向同一套相对位置。
 - **必须随包发**：`assets/` 全部内容（字体、`blit.wgsl`、WESL 源码——启动时读盘编译、`ui/theme.ron`、
   `ui/debug_menu.toml`、`lighting/*.ron`、`vox/*.vox`）。
 - **无需随包**：`assets/locales/*.yml`（编译期 codegen 进 exe）、`logs/`、`data/`（首次启动自建）。
 - **不写安装目录**：日志 → `<安装根>/logs/latest.log`；菜单状态 → `<安装根>/data/ui/debug_menu.toml`
-  （启动时优先读它，没有才用 `assets/ui/debug_menu.toml` 初版）。安装到只读目录（如 Program Files）时用
-  `GATE_ROOT` 把可写数据挪到别处。
+  （启动时优先读它，没有才用 `assets/ui/debug_menu.toml` 初版）。
 - **注意**：`assets/vox/nuke.vox` 被 gitignore，脚本只在缺失时 WARN，不会阻断打包——发布前自备该文件。

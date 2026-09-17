@@ -10,6 +10,7 @@ use bevy::ui::{FocusPolicy, Interaction};
 use super::button::InteractionPrev;
 use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
+use crate::widgets::consts::{TRACK_H, TRACK_W};
 use bevy::ui::Checked;
 
 /// 开关根节点标记
@@ -23,10 +24,6 @@ pub struct ToggleTrack;
 /// 滑块标记
 #[derive(Component, Debug, Default)]
 pub struct ToggleKnob;
-
-/// 轨道尺寸（px）；滑块边长 = TRACK_H - 2×border_width
-const TRACK_W: f32 = 32.0;
-const TRACK_H: f32 = 16.0;
 
 /// 开关句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

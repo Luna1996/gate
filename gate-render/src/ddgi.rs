@@ -4,18 +4,13 @@
 
 use bevy::render::render_resource::{CachedComputePipelineId, ShaderType};
 use glam::{IVec3, IVec4, UVec3, UVec4, Vec4};
-use std::sync::LazyLock;
 
+use crate::consts::{DDGI_GRID_MARGIN, DDGI_LOD_CELL_SIZES};
 use crate::wesl_consts::ddgi_consts;
 
 // 图集纹素数（irr / depth）与每帧射线预算（`DDGI_RAY_BUDGET`）的权威值都在 WESL
 // （`ddgi/consts.wesl`），Rust 侧经 `wesl_consts::ddgi_consts()` 解析同一份源码得到。
 pub const DDGI_LODS: u32 = 4;
-/// 4 级 LOD cell 边长（voxel），等比 ×2。
-pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
-/// DDGI 世界网格相对世界 AABB 向外扩的量（voxel，六方向）。只作用于 `DdgiWorldGrid`，
-/// 不动 `DdgiChunkGeom`；`DDGI_ATLAS_LAYERS` 容量必须 ≥ 实际总槽位。
-pub const DDGI_GRID_MARGIN: i32 = 16;
 // 槽位映射是世界锚定的：`slot = slot_base + (世界 cell 号 mod dims)`（见 WGSL `ddgi_slot`）。
 // 前提：原点必须是 cell 整数倍。
 
@@ -505,14 +500,9 @@ impl DdgiStage {
   pub fn new(v: u8) -> Self {
     Self(v.min(Self::FULL))
   }
-  /// `GATE_DDGI_STAGE=0..3` 覆盖启动阶段；缺省 = FULL(3)。
-  fn from_env() -> Self {
-    Self::new(
-      std::env::var("GATE_DDGI_STAGE")
-        .ok()
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(Self::FULL),
-    )
+  /// 启动阶段取自 [`crate::consts::DDGI_STAGE`]（0=Off 1=Active 2=Cast 3=Full）。
+  pub fn startup() -> Self {
+    Self::new(crate::consts::DDGI_STAGE)
   }
   pub fn run_active(&self) -> bool {
     self.0 >= Self::ACTIVE
@@ -576,10 +566,10 @@ impl bevy::app::Plugin for DdgiPlugin {
   fn build(&self, app: &mut bevy::app::App) {
     use bevy::ecs::schedule::IntoScheduleConfigs;
     use bevy::prelude::RenderGraph;
-    let stage = DdgiStage::from_env();
+    let stage = DdgiStage::startup();
     bevy::log::info!(
       target: "gate",
-      "DDGI stage = {} ({}) —— 缺省 Full；GATE_DDGI_STAGE=0..3 可覆盖",
+      "DDGI stage = {} ({}) —— 见 consts.rs 的 DDGI_STAGE",
       stage.0,
       ["Off", "Active", "Cast", "Full"][stage.0.min(3) as usize],
     );
@@ -1058,16 +1048,6 @@ fn extract_ddgi_settings(
   commands.insert_resource(lod0_chunks.map_or_else(DdgiLod0Chunks::default, |c| c.clone()));
 }
 
-/// 【诊断】`GATE_NO_OCCL=1`：跳过 DDGI 采样侧的逐角几何求交（8 角一律按"未遮挡"处理，
-/// 经 `ddgi_u.flags.x` 传给 shader）；打开后画面必然漏光。
-static OCCL_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-  let on = std::env::var("GATE_NO_OCCL").map(|v| v == "1").unwrap_or(false);
-  if on {
-    bevy::log::warn!("GATE_NO_OCCL=1：已跳过 DDGI 逐角几何求交（仅量测 GPU 成本用，画面会漏光）");
-  }
-  on
-});
-
 #[allow(clippy::too_many_arguments)]
 fn prepare_ddgi(
   mut commands: bevy::ecs::system::Commands,
@@ -1233,10 +1213,10 @@ fn prepare_ddgi(
   );
   u.dirty_min = Vec4::new(dirty_min.x as f32, dirty_min.y as f32, dirty_min.z as f32, dirty_valid);
   u.dirty_max = Vec4::new(dirty_max.x as f32, dirty_max.y as f32, dirty_max.z as f32, 0.0);
-  // x = 【诊断】跳过逐角几何求交（`GATE_NO_OCCL=1`）；
+  // x = 1 时跳过逐角几何求交（`consts::DDGI_OCCLUSION` = false，量测 GPU 成本用，画面会漏光）；
   // y = 半分辨率 GI 仅在会跑 GI 着色时生效。
   u.flags = Vec4::new(
-    if *OCCL_DISABLED { 1.0 } else { 0.0 },
+    if crate::consts::DDGI_OCCLUSION { 0.0 } else { 1.0 },
     if dbg.gi_half_res && stage.shade_gi() { 1.0 } else { 0.0 },
     0.0,
     0.0,

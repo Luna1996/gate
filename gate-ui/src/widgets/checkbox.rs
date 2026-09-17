@@ -10,13 +10,11 @@ use bevy::ui::{Checkable, Checked, FocusPolicy, Interaction};
 use super::button::InteractionPrev;
 use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
+use crate::widgets::consts::BOX_SIZE;
 
 /// 勾选框视觉方块子实体标记
 #[derive(Component, Debug, Default)]
 pub struct CheckboxBox;
-
-/// 盒子边长（px）
-const BOX_SIZE: f32 = 16.0;
 
 /// 勾选框句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

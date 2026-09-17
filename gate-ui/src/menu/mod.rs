@@ -7,10 +7,6 @@ pub mod items;
 pub mod model;
 pub mod window;
 
-pub use consts::{
-  BUTTON_GAP, CTRL_H, DEFAULT_WINDOW_POS, ITEM_H, ITEM_PAD, LEFT_COL_W, PAGE_ANIM_SECS, PAGE_W,
-  RIGHT_COL_W, TITLE_BAR_H, TITLE_ICON_SIZE, WINDOW_MARGIN,
-};
 pub use items::{
   MenuColorSwatch, MenuItem, MenuOptionButton, MenuPressPrev, MenuRole, MenuSliderValue,
   MenuSubMenuRow, MenuTextValue, join_path,

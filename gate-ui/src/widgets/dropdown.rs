@@ -16,11 +16,8 @@ use super::{
 use crate::capture::MouseIntercept;
 use crate::icon::{Icon, IconFont};
 use crate::theme::{ThemeFont, UiTheme};
+use crate::widgets::consts::{DROPDOWN_ANIM_SECS, DROPDOWN_ARROW_SIZE};
 
-/// 展开/收起动画时长（秒）
-pub const DROPDOWN_ANIM_SECS: f32 = 0.2;
-/// 下拉箭头字号（px）
-const DROPDOWN_ARROW_SIZE: f32 = 12.0;
 /// 浮层层深：高于所有面板/菜单，低于 tooltip（1000）
 const DROPDOWN_Z: i32 = 900;
 

@@ -1,8 +1,5 @@
 //! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 `reload_world` + demo 极限场景生成。
-//! `GATE_SCENE=vox`（默认）→ MagicaVoxel nuke.vox（vox_scene 模块）；
-//! `GATE_SCENE=demo` → 程序化极限场景（城堡/大道/森林/水晶矿，见 `build_demo_scene`）。
-
-use std::sync::LazyLock;
+//! 启动场景与规模见 `consts`（`STARTUP_DEMO_SCENE` / `DEMO_TILES`）。
 
 use bevy::{image::Image, prelude::*};
 use glam::{IVec3, Vec3};
@@ -16,7 +13,10 @@ use gate_voxel::{
 };
 
 use crate::{
-  camera::{CAM_FAR, CAM_NEAR, FOV_Y},
+  consts::{
+    CAM_FAR, CAM_NEAR, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y, START_CAMERA_SKY,
+    STARTUP_DEMO_SCENE,
+  },
   vox_scene,
 };
 
@@ -36,37 +36,33 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // 3 = unlit（跳过全部光照，albedo 直出）
   commands.insert_resource(DebugNormals(3));
 
-  // GATE_SCENE=vox（默认）→ nuke.vox；=demo → 程序化极限场景
   let t0 = std::time::Instant::now();
   let mut grid = VolumeGrid::new();
   // DDGI 四级网格的锚点：世界 AABB（与相机无关；demo 场景无 AABB 时用默认值）。
   let mut ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb::default();
   let mut cam_eye = Vec3::new(1., 0., 0.);
   let mut cam_target = Vec3::new(0., 0., 0.);
-  match std::env::var("GATE_SCENE").as_deref() {
-    Ok("demo") => {
-      paint_demo_palette(&mut grid);
-      bevy::log::info!("STEP 1: palette done ({:?})", t0.elapsed());
-      build_demo_scene(&mut grid);
-      bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
-    }
-    _ => {
-      let anchor = IVec3::new(*EXT_VOXEL_HALF, 16, *EXT_VOXEL_HALF);
-      let path = gate_render::assets_dir().join("vox/nuke.vox");
-      let info = vox_scene::load_vox_scene(&mut grid, &path, anchor).expect("nuke.vox 加载失败");
-      cam_eye = Vec3::new(406.5, 339.5, 431.5);
-      cam_target = Vec3::new(551.5, 330.5, 359.5);
-      bevy::log::info!(
-        "VOX SCENE: instances={} written={} dropped={} aabb=[{}]-[{}]",
-        info.instances_used,
-        info.voxels_written,
-        info.voxels_dropped,
-        info.aabb_min,
-        info.aabb_max,
-      );
-      bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
-      ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb { min: info.aabb_min, max: info.aabb_max };
-    }
+  if STARTUP_DEMO_SCENE {
+    paint_demo_palette(&mut grid);
+    bevy::log::info!("STEP 1: palette done ({:?})", t0.elapsed());
+    build_demo_scene(&mut grid);
+    bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
+  } else {
+    let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
+    let path = gate_render::assets_dir().join("vox/nuke.vox");
+    let info = vox_scene::load_vox_scene(&mut grid, &path, anchor).expect("nuke.vox 加载失败");
+    cam_eye = Vec3::new(406.5, 339.5, 431.5);
+    cam_target = Vec3::new(551.5, 330.5, 359.5);
+    bevy::log::info!(
+      "VOX SCENE: instances={} written={} dropped={} aabb=[{}]-[{}]",
+      info.instances_used,
+      info.voxels_written,
+      info.voxels_dropped,
+      info.aabb_min,
+      info.aabb_max,
+    );
+    bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
+    ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb { min: info.aabb_min, max: info.aabb_max };
   }
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
   bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
@@ -76,8 +72,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let ddgi_lod0_chunks = gate_render::ddgi::DdgiLod0Chunks { chunks: lod0_needed_chunks(&grid) };
 
   // 轨道相机为唯一相机状态源，DdaCameraConfig 由 `from_orbit` 生成（初始机位 = 场景中心俯视）。
-  // GATE_CAM=sky：相机朝天空（纯 miss 场景）。
-  let orbit = if std::env::var("GATE_CAM").as_deref() == Ok("sky") {
+  let orbit = if START_CAMERA_SKY {
     OrbitCamera::from_eye(
       Vec3::new(cam_target.x, 320.0, cam_target.z),
       Vec3::new(cam_target.x, 5000.0, cam_target.z),
@@ -100,7 +95,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   commands.insert_resource(crate::camera::CameraMode::default());
   commands.insert_resource(crate::camera::FlyCamera {
     pos: orbit.eye(),
-    speed: crate::camera::FLY_SPEED_DEFAULT,
+    speed: crate::consts::FLY_SPEED_DEFAULT,
     fast: false, // 缺省低速档
   });
 
@@ -214,7 +209,7 @@ pub(crate) fn reload_world(
   lod0: &mut gate_render::ddgi::DdgiLod0Chunks,
   name: &str,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
-  let anchor = IVec3::new(*EXT_VOXEL_HALF, 16, *EXT_VOXEL_HALF);
+  let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
   let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
   let mut grid = VolumeGrid::new();
   let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)?;
@@ -260,14 +255,7 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
   pal.set(PaletteId(14), led);
 }
 
-// 极限场景规模：世界边长 = N tile × 512 voxel，N = GATE_TILES（env 可调，clamp 2..=10，默认 2）；
-// brickmap compute_window dims = (N+2, 5, N+2)；结构性坐标（城堡/大道/河）均以 EXT_VOXEL_HALF 为锚。
-static EXT_N_TILES: LazyLock<i32> = LazyLock::new(|| {
-  std::env::var("GATE_TILES").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2).clamp(2, 10)
-});
-static EXT_VOXEL_X: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
-static EXT_VOXEL_Z: LazyLock<i32> = LazyLock::new(|| *EXT_N_TILES * 512);
-static EXT_VOXEL_HALF: LazyLock<i32> = LazyLock::new(|| *EXT_VOXEL_X / 2);
+// 极限场景规模见 `consts`（世界边长 = tile 数 × 512 voxel；brickmap compute_window dims = (N+2, 5, N+2)）。
 
 /// 正弦高度场（确定性，不用 rand）：
 /// h(x,z) = 16 + A·sin(x·k1)·cos(z·k2) + 山体距 4 角的反比隆起
@@ -284,9 +272,9 @@ fn terrain_h(x: i32, z: i32) -> i32 {
     (600.0 / d).min(1.0) * 780.0 // 山顶 ~800
   };
   let sn = corner_snow(0, 0)
-    + corner_snow(*EXT_VOXEL_X - 1, 0)
-    + corner_snow(0, *EXT_VOXEL_Z - 1)
-    + corner_snow(*EXT_VOXEL_X - 1, *EXT_VOXEL_Z - 1);
+    + corner_snow(EXT_VOXEL_X - 1, 0)
+    + corner_snow(0, EXT_VOXEL_Z - 1)
+    + corner_snow(EXT_VOXEL_X - 1, EXT_VOXEL_Z - 1);
   let hf = 16.0 + s1 * 80.0 + s2 * 120.0 + sn;
   // 4 对齐：高度层取整到 4³ 块（未对齐会退化为逐体素边缘）；阶梯化 4 级。
   ((hf as i32).clamp(16, 1020)) & !3
@@ -294,15 +282,15 @@ fn terrain_h(x: i32, z: i32) -> i32 {
 
 /// 离中央堡（世界中心）的距离
 fn dist_to_castle(x: i32, z: i32) -> i32 {
-  let dx = x - *EXT_VOXEL_HALF;
-  let dz = z - *EXT_VOXEL_HALF;
+  let dx = x - EXT_VOXEL_HALF;
+  let dz = z - EXT_VOXEL_HALF;
   ((dx * dx + dz * dz) as f32).sqrt() as i32
 }
 
 /// 中央峡谷蜿蜒河（x,z 在河道走廊内返回 true）
 fn in_river(x: i32, z: i32) -> bool {
-  let t = z as f32 / *EXT_VOXEL_Z as f32; // 0..1
-  let river_center = *EXT_VOXEL_HALF as f32 // 世界中线
+  let t = z as f32 / EXT_VOXEL_Z as f32; // 0..1
+  let river_center = EXT_VOXEL_HALF as f32 // 世界中线
     + (t * std::f32::consts::TAU).sin() * 700.0 // 正弦摆 ±700
     + ((t * 12.566).cos() * 180.0); // 次级摆幅
   let dx = (x as f32) - river_center;
@@ -318,9 +306,9 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
   // (1) 基础地形：按 16 voxel (L0) 步长采样高度场 → fill_box 铺柱（y=16..h 用 pal 2，h>560 顶部改 pal 3）
   let mut z = 0i32;
-  while z < *EXT_VOXEL_Z {
+  while z < EXT_VOXEL_Z {
     let mut x = 0i32;
-    while x < *EXT_VOXEL_X {
+    while x < EXT_VOXEL_X {
       let h = terrain_h(x, z);
       let dc = dist_to_castle(x, z);
       // 中央堡区 (radius<700) 不开地形，后面由城堡结构接管
@@ -364,19 +352,19 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
   mark!("(1) terrain columns");
   // 全地图 L0 基础地板（y=0..16，pal 1 草地）
-  fill_bricks(grid, IVec3::new(0, 0, 0), IVec3::new(*EXT_VOXEL_X, 16, *EXT_VOXEL_Z), 16, 1);
+  fill_bricks(grid, IVec3::new(0, 0, 0), IVec3::new(EXT_VOXEL_X, 16, EXT_VOXEL_Z), 16, 1);
   mark!("(1b) floor");
 
   // (2) 中央大道 + 入口大标语 "GATE ENGINE"
   // 中央大道（X 向，中线 ±32 宽）深灰铺路
-  fill_box(grid, IVec3::new(0, 16, *EXT_VOXEL_HALF - 32), IVec3::new(*EXT_VOXEL_X, 8, 32), 12);
+  fill_box(grid, IVec3::new(0, 16, EXT_VOXEL_HALF - 32), IVec3::new(EXT_VOXEL_X, 8, 32), 12);
   // 大标语（L1，每像素 8³）
   draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 8);
   mark!("(2) road+text");
 
   // (3) 中央天空之城（以世界中心为锚）：浮空岛底 → 城墙/角楼 → 正殿 → 高塔 → 旗帜
-  let cx = *EXT_VOXEL_HALF;
-  let cz = *EXT_VOXEL_HALF;
+  let cx = EXT_VOXEL_HALF;
+  let cz = EXT_VOXEL_HALF;
   // 浮空岛底（倒锥：按 y 降低半径收窄）——L0 级 16 步扫描
   let island_base_y = 128i32; // 岛底尖
   let island_top_y = 240i32; // 岛顶面（城墙在此升起）
@@ -450,14 +438,14 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     let mut i = 0i32;
     while n_planted < 170 && i < 2000 {
       // 确定性 2 互素线性同余 → (x,z) 伪散点
-      let x = (i * 211 + 83) % *EXT_VOXEL_X;
-      let z = ((i * 977 + 419) ^ 0xA53) % *EXT_VOXEL_Z;
+      let x = (i * 211 + 83) % EXT_VOXEL_X;
+      let z = ((i * 977 + 419) ^ 0xA53) % EXT_VOXEL_Z;
       let x = x.abs();
       let z = z.abs();
       let h = terrain_h(x, z);
       let ok = dist_to_castle(x, z) > 900
         && !in_river(x, z)
-        && !((*EXT_VOXEL_HALF - 32)..=(*EXT_VOXEL_HALF + 32)).contains(&z) // 中央大道
+        && !((EXT_VOXEL_HALF - 32)..=(EXT_VOXEL_HALF + 32)).contains(&z) // 中央大道
         && h < 360;
       if ok {
         // 树干（L1）
@@ -479,7 +467,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     (768, 4352, 70, 9, 10, 223), // 左下 水晶紫/红
   ];
   for &(cx_, cz_, cnt, pa, pb, seed) in crystal_clusters.iter() {
-    if cx_ >= *EXT_VOXEL_X || cz_ >= *EXT_VOXEL_Z {
+    if cx_ >= EXT_VOXEL_X || cz_ >= EXT_VOXEL_Z {
       continue; // 簇中心在世界外时跳过（避免 t 无限增长溢出）
     }
     let h = terrain_h(cx_, cz_);
@@ -493,7 +481,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
       let pal = if (t & 1) == 0 { pa } else { pb };
       let px_ = cx_ + sx;
       let pz_ = cz_ + sz;
-      if px_ >= 0 && pz_ >= 0 && px_ < *EXT_VOXEL_X && pz_ < *EXT_VOXEL_Z {
+      if px_ >= 0 && pz_ >= 0 && px_ < EXT_VOXEL_X && pz_ < EXT_VOXEL_Z {
         fill_box(grid, IVec3::new(px_, h + hy, pz_), IVec3::new(1, 1, 1), pal);
         placed += 1;
       }
@@ -504,7 +492,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
 
   // (6) 静态 L4 32³ 精度热点：tile(1,0,0) 金色 + tile(2,0,0) 蓝
   fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 11);
-  if 1264 + 32 <= *EXT_VOXEL_X {
+  if 1264 + 32 <= EXT_VOXEL_X {
     fill_box(grid, IVec3::new(1264, 240, 240), IVec3::new(32, 32, 32), 7);
   }
   let t0 = gate_voxel::ChunkCoord::new(0, 0, 0);

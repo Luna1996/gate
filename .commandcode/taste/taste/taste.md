@@ -1,0 +1,11 @@
+# Taste
+- Code comments must contain only "final facts": what an item is/does and how to use it (units, ranges, defaults, invariants, call order). Strip rationale ("why", trade-offs, alternatives), history/migration notes, examples/tutorial prose, bold emphasis markers, and external references (PR/ADR/issue numbers, paper citations). Confidence: 0.9
+- Never use environment variables as gates/flags; use compile-time constants instead (e.g. swap env-based switches for `bool` constants / `AtomicBool`). Confidence: 0.9
+- Extract tunable "knob" constants out of the code that consumes them into dedicated `consts.rs` files. Confidence: 0.9
+- Place `consts.rs` files next to their consumers (e.g. `gate-ui/src/menu/consts.rs`), not all in the crate root. Confidence: 0.9
+- At most one `consts.rs` per directory level — a crate may have several, but not two in the same folder. Confidence: 0.85
+- Strong DRY: never duplicate a type or registry definition across modules; repeat verbatim definitions is unacceptable. Confidence: 0.9
+- Do not introduce new crates/workspace members for shared infrastructure; put files directly in the existing crate (`gate-app/src/consts.rs`-style) instead of a new `gate-knobs` crate. Confidence: 0.85
+- No speculative APIs: don't add functions/types "for a future need" with no current consumer; pushback such as "what is this knobs() function for, why does it exist?" means delete unused code (including the doc/README references to it) until it is actually needed. Confidence: 0.85
+- For runtime-tunable values, use the Bevy `Resource` + debug_menu node/callback path (resource → `ExtractResource` for render world → `default_menu()` entry → i18n label → callback → `apply_initial_state` for save reload); do not keep `AtomicBool`/`static` interior mutability "just in case" — delete them and leave plain `const` until a menu control actually needs them. Confidence: 0.85
+- Writes in Chinese and expects replies in Chinese. Confidence: 0.8

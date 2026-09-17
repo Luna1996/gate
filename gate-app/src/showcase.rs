@@ -17,6 +17,8 @@ use gate_ui::{
 
 use rust_i18n::t;
 
+use crate::consts::{SHOWCASE_PLOT_CAP, SHOWCASE_PLOT_H, SHOWCASE_PLOT_W};
+
 /// 按钮标识（写进事件日志；日志不翻译，用英文标识符）
 #[derive(Component)]
 struct ShowcaseButton(&'static str);
@@ -34,12 +36,6 @@ pub(crate) struct ShowcasePlot;
 
 #[derive(Component)]
 struct ShowcaseLog;
-
-/// 展示窗折线画布尺寸（透明纹理，面板底色透出）
-const SHOWCASE_PLOT_W: u32 = 216;
-const SHOWCASE_PLOT_H: u32 = 48;
-/// 展示窗折线容量（0.1s 喂一个样本，约 12s 窗口）
-const SHOWCASE_PLOT_CAP: usize = 128;
 
 /// 右上角展示面板根标记（debug overlay toggle 以此定位整体显隐）
 #[derive(Component)]

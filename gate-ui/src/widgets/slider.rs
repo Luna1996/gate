@@ -8,6 +8,7 @@ use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, Interaction, RelativeCursorPosition};
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px};
+use crate::widgets::consts::{THUMB_INSET, THUMB_SIZE, THUMB_SIZE_DRAG, TRACK_HEIGHT};
 
 /// 滑杆根节点标记
 #[derive(Component, Debug, Default)]
@@ -88,14 +89,6 @@ pub struct SliderValueChanged {
   pub entity: Entity,
   pub value: f32,
 }
-
-const THUMB_SIZE: f32 = 16.0;
-/// 拖拽中滑块放大尺寸
-const THUMB_SIZE_DRAG: f32 = 18.0;
-/// 根节点水平内边距 = 半 thumb 宽：thumb 行程首尾完全在根命中矩形内
-const THUMB_INSET: f32 = THUMB_SIZE / 2.0;
-/// 轨道槽厚度（px）
-const TRACK_HEIGHT: f32 = 6.0;
 
 /// clamp + step 归一（纯函数）
 pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {

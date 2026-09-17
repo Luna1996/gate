@@ -18,8 +18,6 @@ use super::wire::{
 };
 use glam::{IVec3, UVec3};
 
-pub const SINGLE_THRESHOLD_BYTES: u64 = (1 << 30) - 1;
-
 #[derive(Debug, Clone, Copy)]
 pub struct BindingLimits {
   pub max_storage_buffer_binding_size: u64,
@@ -29,7 +27,7 @@ impl BindingLimits {
     Self { max_storage_buffer_binding_size: device.limits().max_storage_buffer_binding_size }
   }
   pub fn force_multi(&self) -> bool {
-    self.max_storage_buffer_binding_size < SINGLE_THRESHOLD_BYTES
+    self.max_storage_buffer_binding_size < crate::brickmap::consts::SINGLE_THRESHOLD_BYTES
   }
 }
 
@@ -41,8 +39,11 @@ pub enum BufferLayout {
 impl BufferLayout {
   pub fn from_limits(limits: &BindingLimits) -> Self {
     if limits.force_multi() {
-      let per = 64u64 << 20;
-      let left = limits.max_storage_buffer_binding_size.min(per).max(4 << 20);
+      let per = crate::brickmap::consts::BUFFER_SLICE_TARGET;
+      let left = limits
+        .max_storage_buffer_binding_size
+        .min(per)
+        .max(crate::brickmap::consts::BUFFER_SLICE_MIN);
       let node_slices = ((TREE_BASE as u64).saturating_add(per) / left) as usize;
       Self::Multi { node_slices: node_slices.max(1) }
     } else {
@@ -64,7 +65,7 @@ pub struct UploadBudget {
 }
 impl Default for UploadBudget {
   fn default() -> Self {
-    Self { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true }
+    Self { max_bytes_per_frame: crate::brickmap::consts::UPLOAD_BYTES_PER_FRAME, incremental: true }
   }
 }
 
@@ -93,9 +94,6 @@ pub struct MainPending {
   pub data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
 }
 
-/// 单 chunk 增量重建的字节预算。
-const PER_CHUNK_BYTES: usize = 256 * 1024;
-
 /// 在主 world `Last` 阶段按预算 drain dirty → `MainPending`，遍历所有 volume 附带 `volume_idx`。
 /// 进入时清空 `data_chunks` / `comp_chunks` / `data_aabbs`；`force_full` 处理一帧后复位。
 pub fn poll_pending(
@@ -114,7 +112,8 @@ pub fn poll_pending(
     pending.force_full = true;
     scene.demo_force_full_rebuild = false;
   }
-  let budget_n = (budget.max_bytes_per_frame / PER_CHUNK_BYTES).clamp(1, 64);
+  let budget_n =
+    (budget.max_bytes_per_frame / crate::brickmap::consts::PER_CHUNK_BYTES).clamp(1, 64);
 
   let mut total_data_backlog = 0usize;
   let mut total_comp_backlog = 0usize;
@@ -538,11 +537,11 @@ fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
   unsafe { std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs)) }
 }
 
-/// GPU buffer 扩容尺寸策略（纯函数）：need ≥ 8MB → 32MB 对齐；need < 8MB → 2× 增长（下限 64KB）。
+/// GPU buffer 扩容尺寸策略（纯函数）：need ≥ 扩容阈值 → 32MB 对齐；否则 2× 增长（下限 64KB）。
 fn grow_size(cap: u64, need: u64) -> u64 {
-  const BIG: u64 = 8 << 20;
-  const RESERVE: u64 = 32 << 20;
-  if need >= BIG { need.div_ceil(RESERVE) * RESERVE } else { need.max(cap * 2).max(65536) }
+  let big = crate::brickmap::consts::BUFFER_GROW_BIG;
+  let reserve = crate::brickmap::consts::BUFFER_GROW_RESERVE;
+  if need >= big { need.div_ceil(reserve) * reserve } else { need.max(cap * 2).max(65536) }
 }
 
 /// 保证 buffer 能容纳 `bytes`，扩容时保留旧内容。
@@ -836,7 +835,7 @@ pub(crate) fn prepare(
     + gpu.comp.size()
     + gpu.state.size()
     + gpu.grid_descs_buf.size();
-  if vram > 2u64 << 30 {
+  if vram > crate::brickmap::consts::VRAM_WARN_BYTES {
     bevy::log::warn!("GPU VRAM 超过旧预算线（仅提示）: {vram} bytes");
   }
   if !limits.force_multi() {

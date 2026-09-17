@@ -21,9 +21,10 @@ use gate_ui::{
 };
 
 use crate::camera::{CameraMode, FlyCamera};
-use crate::edit::{
-  BrushShape, EDIT_SIZE_MIN, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness,
+use crate::consts::{
+  CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, HALF_RES_FACTOR, VOXEL_PER_METER,
 };
+use crate::edit::{BrushShape, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness};
 use crate::showcase::ShowcaseRoot;
 
 /// 菜单 TOML 相对 assets 目录的路径（初值来源 + 退出时写回）
@@ -33,15 +34,6 @@ pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
 pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
-
-/// 1 m = 50 voxel（1 voxel = 2cm）：菜单速度用 m/s，资源用 voxel/s
-pub const VOXEL_PER_METER: f32 = 50.0;
-
-/// 相机信息纯文本行的刷新间隔（秒）
-pub const CAM_INFO_REFRESH_SECS: f32 = 0.25;
-
-/// FPS 统计窗口（秒）：当前 / 平均 / 最低 / 最高都在这个窗口内算
-pub const FPS_WINDOW_SECS: f32 = 1.0;
 
 /// DDGI 诊断模式选项的 i18n key（下标 = `DdgiDebugSettings.mode`，顺序与 WESL 一致）
 pub const DDGI_MODE_KEYS: [&str; 5] = [
@@ -330,9 +322,6 @@ pub(crate) struct FpsOverlayText;
 /// FPS 覆盖层是否显示（`video/fps` 开关）
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct FpsOverlayVisible(pub bool);
-
-/// 半分辨率渲染的降采样倍数（「视频/半分辨率」→ `RenderScale.factor`）
-const HALF_RES_FACTOR: u32 = 2;
 
 /// 进无边框全屏前的窗口尺寸/位置（退出全屏时复原）；`None` = 当前不在全屏。
 /// winit 多数平台会自己复原窗口，但位置在部分后端会丢，故显式存一份兜底。

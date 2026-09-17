@@ -28,7 +28,7 @@ cp -r assets "$dist/assets"
 
 # nuke.vox 被 .gitignore 排除，新克隆的仓库里可能没有 → 只提示，不阻断
 if [ ! -f "${dist}/assets/vox/nuke.vox" ]; then
-  echo "WARN: assets/vox/nuke.vox 缺失（GATE_SCENE=vox 默认场景需要它）"
+  echo "WARN: assets/vox/nuke.vox 缺失（默认场景需要它；或把 consts.rs 的 STARTUP_DEMO_SCENE 改成 true）"
 fi
 
 echo "OK: $dist"

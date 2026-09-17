@@ -10,10 +10,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use super::{UiCtx, color_of, label_bundle, px};
-
-/// 画布默认尺寸（固定）
-pub const PLOT_W: u32 = 256;
-pub const PLOT_H: u32 = 64;
+use crate::widgets::consts::{PLOT_H, PLOT_W};
 
 /// Y 轴值域：Fixed(min, max) 或 Auto（按当前样本 min/max 推导）
 #[derive(Clone, Copy, Debug, PartialEq)]

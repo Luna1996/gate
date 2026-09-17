@@ -10,6 +10,7 @@ use bevy::text::{FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWei
 use bevy::ui::Overflow;
 
 use super::{UiCtx, color_of, dim_color};
+use crate::widgets::consts::ELLIPSIS;
 
 /// 文本预设档：四档正文（primary/body/muted/faint）+ 四档语义色。
 /// 每档 = 字号 + 颜色成对取自主题令牌，作为 `LabelConfig` 的默认值。
@@ -96,9 +97,6 @@ impl EllipsisText {
     Self { full: full.into(), last_avail: 0.0 }
   }
 }
-
-/// 省略符
-pub const ELLIPSIS: &str = "...";
 
 /// 标签配置：预设档给默认值，每个属性都能单独覆盖。
 /// Default = 空文本 + Body 档 + 不覆盖任何属性 + 不禁用。

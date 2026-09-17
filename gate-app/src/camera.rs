@@ -13,19 +13,9 @@ use gate_render::{
 };
 use gate_voxel::VolumeTransform;
 
-// CAM_FAR = 透视投影 far 面；shaders/voxel_raytrace/ 内 DDA 射线 t_max 同步到此量级。
-pub(crate) const FOV_Y: f32 = 60.0_f32.to_radians();
-pub(crate) const CAM_NEAR: f32 = 1.0;
-pub(crate) const CAM_FAR: f32 = 65536.0;
-// 输入灵敏度（手感调整只改这里）
-const ROT_SPEED: f32 = 0.005; // rad/px（右键拖拽旋转）
-pub(crate) const ZOOM_LOG_SPEED: f32 = 0.35; // /行（滚轮乘法缩放，各距离档手感一致）
-
-// 速度单位 = voxel/s；1 voxel = 2cm。
-/// 默认飞行速度（voxel/s，低速档基础速度）；运行期由 DebugMenu 覆盖，此处为资源缺省值。
-pub(crate) const FLY_SPEED_DEFAULT: f32 = 128.0;
-/// 高速档倍率：高速档实际速度 = 基础速度 × 此值
-pub(crate) const FLY_SPEED_FAST_MUL: f32 = 2.0;
+use crate::consts::{
+  CAM_FAR, CAM_NEAR, FLY_SPEED_DEFAULT, FLY_SPEED_FAST_MUL, FOV_Y, ROT_SPEED, ZOOM_LOG_SPEED,
+};
 
 /// 相机模式（main world Resource）。切换的唯一入口是 DebugMenu 的「玩家/相机/相机模式」切换组。
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -70,7 +60,7 @@ pub(crate) fn look_forward(yaw: f32, pitch: f32) -> Vec3 {
   Vec3::new(-sin_yaw * cos_pitch, -sin_pitch, -cos_yaw * cos_pitch)
 }
 
-/// GATE_ORBIT=1：相机每帧边转（yaw 0.35 rad/s）边沿圆轨迹平移（500 voxel/s）。
+/// 相机每帧边转（yaw 0.35 rad/s）边沿圆轨迹平移（500 voxel/s）；由 `consts::AUTO_ORBIT` 决定是否注册。
 /// 必须带平移：纯旋转不改变所在 world cell / chunk，"移动中"才触发的路径不会跑。
 pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>) {
   let dt = time.delta_secs();

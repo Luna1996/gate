@@ -18,7 +18,7 @@ pub(crate) struct GpuProfilerRes {
   report: PassReport,
 }
 
-/// 逐 pass GPU 耗时聚合器：按 label 累计，每 [`REPORT_PERIOD_SECS`] 秒落一行平均耗时日志。
+/// 逐 pass GPU 耗时聚合器：按 label 累计，每 [`crate::consts::REPORT_PERIOD_SECS`] 秒落一行平均耗时日志。
 #[cfg(feature = "profile")]
 #[derive(Default)]
 struct PassReport {
@@ -27,9 +27,6 @@ struct PassReport {
   frames: u32,
   last: Option<std::time::Instant>,
 }
-
-#[cfg(feature = "profile")]
-const REPORT_PERIOD_SECS: f32 = 2.0;
 
 #[cfg(feature = "profile")]
 impl PassReport {
@@ -43,7 +40,7 @@ impl PassReport {
     let now = std::time::Instant::now();
     let start = *self.last.get_or_insert(now);
     let dt = now.duration_since(start).as_secs_f32();
-    if dt < REPORT_PERIOD_SECS || self.frames == 0 {
+    if dt < crate::consts::REPORT_PERIOD_SECS || self.frames == 0 {
       return;
     }
     let n = self.frames as f64;

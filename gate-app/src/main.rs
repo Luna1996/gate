@@ -3,6 +3,7 @@
 //! `showcase` 右上角组件展示窗 / `vox_scene` MagicaVoxel .vox 导入。
 
 mod camera;
+mod consts;
 mod debug_menu;
 mod edit;
 mod scene;
@@ -62,8 +63,8 @@ fn main() {
   // i18n：把当前语言定成缺省中文；必须在任何 `t!` 求值之前（UI 文本只生成一次，之后不重算）。
   rust_i18n::set_locale(DEFAULT_LOCALE);
 
-  // GATE_BENCH=1：失焦后台跑帧（配合窗口 focused=false 与 Fifo）
-  let bench = std::env::var("GATE_BENCH").as_deref() == Ok("1");
+  // 失焦后台跑帧开关见 `consts::BENCH_UNFOCUSED`
+  let bench = consts::BENCH_UNFOCUSED;
   let mut app = App::new();
   app.add_plugins(
     DefaultPlugins
@@ -133,7 +134,7 @@ fn main() {
     .init_resource::<FpsWindow>()
     // UI 文案解析器：菜单树存 i18n key，gate-ui 经它解析（切语言后 sync_ui_locale 触发重解析）
     .insert_resource(gate_ui::UiTranslator::new(|key| t!(key).to_string()))
-    // GATE_BENCH=1：失焦窗口也用 Continuous 更新（默认失焦为 reactive_low_power 60Hz）
+    // 失焦窗口也用 Continuous 更新（默认失焦为 reactive_low_power 60Hz）
     .insert_resource(bevy::winit::WinitSettings {
       focused_mode: bevy::winit::UpdateMode::Continuous,
       unfocused_mode: if bench {
@@ -176,12 +177,12 @@ fn main() {
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
-  // GATE_EDIT_SELFTEST=1：无鼠标输入地走通一次"编辑 → 增量上传"链路
-  if std::env::var("GATE_EDIT_SELFTEST").as_deref() == Ok("1") {
+  // 无鼠标输入地走通一次"编辑 → 增量上传"链路
+  if consts::EDIT_SELFTEST {
     app.add_systems(Update, edit::edit_selftest);
   }
-  // GATE_ORBIT=1：相机自动绕目标旋转并平移（配 GATE_BENCH=1 读逐 pass 帧时）
-  if std::env::var("GATE_ORBIT").as_deref() == Ok("1") {
+  // 相机自动绕目标旋转并平移（配 BENCH_UNFOCUSED 读逐 pass 帧时）
+  if consts::AUTO_ORBIT {
     app.add_systems(Update, camera::auto_orbit_system);
   }
   app.run();

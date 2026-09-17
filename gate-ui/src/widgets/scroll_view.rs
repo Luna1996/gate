@@ -10,6 +10,7 @@ use bevy::prelude::*;
 use bevy::ui::{ComputedNode, FocusPolicy, Interaction, Overflow};
 
 use super::{UiCtx, color_of, px};
+use crate::widgets::consts::SCROLL_SPEED;
 
 /// 滚动视图状态（挂在 viewport 节点上）
 #[derive(Component, Debug, Default)]
@@ -25,9 +26,6 @@ pub struct ScrollViewport;
 /// content 节点标记（调用方在此实体上添加子节点）
 #[derive(Component, Debug, Default)]
 pub struct ScrollContent;
-
-/// 每格滚轮滚动像素数
-const SCROLL_SPEED: f32 = 24.0;
 
 /// 滚动视图句柄：viewport 根实体 + content 实体（调用方在 content 上添加子节点）。
 /// Deref 到 viewport 实体。

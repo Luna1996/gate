@@ -10,6 +10,7 @@ use bevy::ui::{FocusPolicy, Interaction, UiTransform};
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
+use crate::widgets::consts::PRESSED_SCALE;
 
 /// 按钮点击事件（EntityEvent，target = 按钮实体）。
 /// 用法：`entity_mut(btn).observe(|_: On<UiClick>| ...)` 或 `app.add_observer(...)`。
@@ -31,9 +32,6 @@ pub enum ButtonVariant {
   Ghost,
   Danger,
 }
-
-/// 按下时绕节点中心缩放到 98%
-const PRESSED_SCALE: f32 = 0.98;
 
 /// 按钮句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

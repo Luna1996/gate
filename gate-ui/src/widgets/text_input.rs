@@ -11,13 +11,7 @@ use bevy::ui::{FocusPolicy, Interaction};
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px};
 use crate::theme::UiTheme;
-
-/// 数字模式拖拽灵敏度：每 N 逻辑 px = 1 个 step
-pub const NUMBER_DRAG_PX_PER_STEP: f32 = 4.0;
-/// 「点击」与「拖拽」的位移判定阈值（逻辑 px）
-pub const DRAG_THRESHOLD_PX: f32 = 3.0;
-/// 编辑态光标字符（仅显示态插入，不写进值）
-pub const CARET_CHAR: char = '|';
+use crate::widgets::consts::{CARET_CHAR, DRAG_THRESHOLD_PX, NUMBER_DRAG_PX_PER_STEP};
 
 /// 输入框根标记
 #[derive(Component, Debug, Default)]

@@ -1,4 +1,5 @@
 pub mod brickmap;
+pub mod consts;
 pub mod ddgi;
 pub mod lighting;
 pub mod paths;
@@ -18,10 +19,11 @@ pub use brickmap::{
   cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes, cpu_reference_volumes_occluded,
   create_dda_image,
 };
-pub use brickmap::{PostFxSettings, RenderScale, VIEW_SIZE};
+pub use brickmap::{PostFxSettings, RenderScale};
+pub use consts::VIEW_SIZE;
 pub use lighting::{
-  DirLightCfg, EMISSIVE_EMIT_GAIN, LightDesc, LightGlobals, LightPoolUniform, LightingTheme,
-  MAX_LIGHTS, SHADOW_BIAS, SHADOW_DIR_T_MAX, SkyCfg, build_light_pool, parse_lighting_ron,
+  DirLightCfg, LightDesc, LightGlobals, LightPoolUniform, LightingTheme, MAX_LIGHTS, SkyCfg,
+  build_light_pool, parse_lighting_ron,
 };
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
