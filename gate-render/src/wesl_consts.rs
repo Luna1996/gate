@@ -1,9 +1,5 @@
-//! WESL **跨端常量**的单一来源：权威值只写在 `.wesl` 里，Rust 启动时解析同一份源码。
-//!
-//! 图集尺寸 / LOD 级数 / 射线预算 / `ddgi_indirect` 的 word 布局两侧都要知道（WESL 按它们
-//! 寻址、分配线程，Rust 按它们 `create_texture` / `create_buffer` / 算字节偏移），各写一份
-//! 就会静默漂移且无任何编译或运行时报错。解析失败 / 常量缺失 → `error!` + `panic!`。
-//! 与 [`crate::shader::compile_dda_wesl`] 共用 [`crate::paths::dda_wesl_dir`]，改 `.wesl` 重启 app 即生效。
+//! WESL 跨端常量的单一来源：权威值只写在 `.wesl` 里，Rust 启动时解析同一份源码。
+//! 解析失败 / 常量缺失 → `error!` + `panic!`；改 `.wesl` 重启 app 即生效。
 //! 例外：`DDGI_LODS` 要定 `[T; N]` 数组与 `ShaderType` 布局长度，仍在 Rust 声明并断言一致。
 
 use std::collections::HashMap;
@@ -14,7 +10,7 @@ use bevy::log::{error, info};
 
 use crate::paths::dda_wesl_dir;
 
-/// DDGI 两侧共用的常量（值来自 WESL 源码，见模块注释）。
+/// DDGI 两侧共用的常量（值来自 WESL 源码）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DdgiConsts {
   /// 每探针 irradiance 图边长的纹素数（`DDGI_IRR_TEXELS`）
@@ -47,7 +43,7 @@ impl DdgiConsts {
   pub fn atlas_capacity(&self) -> u32 {
     self.atlas_layers * self.probes_per_layer_axis * self.probes_per_layer_axis
   }
-  /// `ddgi_args`（独立 buffer，BG6）里 cast / collect indirect args 的**字节**偏移。
+  /// `ddgi_args`（独立 buffer，BG6）里 cast / collect indirect args 的字节偏移。
   #[inline]
   pub fn args_cast_offset(&self) -> u64 {
     self.indir_cast_base as u64 * 4
@@ -70,15 +66,14 @@ impl DdgiConsts {
   pub fn counter_clear_bytes(&self) -> u64 {
     self.lod_count as u64 * 4
   }
-  /// 射线样本缓冲的字节数。**不是** `ray_budget × 32`：seal 的 `rpp` 有下限 1，
-  /// 活跃探针数超过预算时 `total_ray = total_active`，上界是总槽位数（见 WESL seal 注释）。
+  /// 射线样本缓冲的字节数：上界为 `ray_budget` 与总槽位数取大（`ray_budget × 32` 不是上界）。
   #[inline]
   pub fn sample_bytes(&self, total_slots: u32) -> u64 {
     self.ray_budget.max(total_slots) as u64 * 32
   }
 }
 
-/// 需要的全部常量名（缺一个就 fail fast；一次报全，便于排查）。
+/// 需要的全部常量名（缺一即 fail fast）。
 const REQUIRED: &[&str] = &[
   "DDGI_IRR_TEXELS",
   "DDGI_DEPTH_TEXELS",
@@ -94,8 +89,7 @@ const REQUIRED: &[&str] = &[
   "DDGI_INDIR_COUNT_BASE",
 ];
 
-/// 解析 WESL 包里的跨端常量。首次调用读盘，之后走 `OnceLock`（每帧只多一次原子读）。
-///
+/// 解析 WESL 包里的跨端常量（首次读盘，之后走 `OnceLock`）。
 /// 失败（文件读不到 / 常量缺失 / 不是字面量）→ `error!` + `panic!`。
 pub fn ddgi_consts() -> &'static DdgiConsts {
   static CONSTS: OnceLock<DdgiConsts> = OnceLock::new();
@@ -134,8 +128,7 @@ impl DdgiConsts {
       indir_rpp_base: get("DDGI_INDIR_RPP_BASE"),
       indir_count_base: get("DDGI_INDIR_COUNT_BASE"),
     };
-    // LOD 级数在 Rust 侧要定 `[T; DDGI_LODS]` 数组与 `ShaderType` 布局的长度（编译期常量，
-    // 拿不到运行期解析结果）→ 这里做一次 fail-fast 断言，保证两侧一致。
+
     if out.lod_count != crate::ddgi::DDGI_LODS {
       let msg = format!(
         "WESL DDGI_LOD_COUNT = {} 与 Rust ddgi::DDGI_LODS = {} 不一致：\
@@ -184,11 +177,11 @@ fn collect_wesl_files(dir: &Path, out: &mut Vec<PathBuf>) {
   }
 }
 
-/// 解析整个包的全部 `const NAME: u32 = <字面量>;`（同名以**先遇到的**为准，包内不应重名）。
+/// 解析整个包的全部 `const NAME: u32 = <字面量>;`（同名以先遇到的为准，包内不应重名）。
 fn parse_package_u32_consts(dir: &Path) -> HashMap<String, u32> {
   let mut files = Vec::new();
   collect_wesl_files(dir, &mut files);
-  files.sort(); // 目录遍历顺序不保证稳定 → 排序后同名冲突的取用顺序也是确定的
+  files.sort();
   let mut out = HashMap::new();
   for path in files {
     let Ok(src) = std::fs::read_to_string(&path) else {
@@ -202,7 +195,7 @@ fn parse_package_u32_consts(dir: &Path) -> HashMap<String, u32> {
   out
 }
 
-/// 从一段 WGSL/WESL 源码里抽全部 `const NAME: u32 = <字面量>;`（见 [`parse_u32_const_line`]）。
+/// 从一段 WGSL/WESL 源码里抽全部 `const NAME: u32 = <字面量>;`。
 pub fn parse_u32_consts_in_source(src: &str) -> HashMap<String, u32> {
   let mut out = HashMap::new();
   for line in src.lines() {
@@ -214,10 +207,7 @@ pub fn parse_u32_consts_in_source(src: &str) -> HashMap<String, u32> {
 }
 
 /// 抽一行 `const NAME: u32 = <字面量>;`。
-///
-/// 只认**字面量**（十进制 / `0x` 十六进制，可带 `u` 后缀）——派生式（如
-/// `const DDGI_PROBES_PER_LAYER: u32 = A * A;`）返回 `None`：Rust 不需要它们（能从已解析的
-/// 基础量自己算），而误当字面量解析会得到错值。行尾 `//` 注释会被先剥掉。
+/// 只认字面量（十进制 / `0x` 十六进制，可带 `u` 后缀）；派生式返回 `None`，行尾 `//` 注释先剥掉。
 fn parse_u32_const_line(raw: &str) -> Option<(String, u32)> {
   let line = raw.trim().trim_start_matches('\u{feff}').split("//").next()?.trim();
   let rest = line.strip_prefix("const ")?.trim_start();
@@ -228,7 +218,7 @@ fn parse_u32_const_line(raw: &str) -> Option<(String, u32)> {
   }
   let rest = rest.trim_start().strip_prefix("u32")?.trim_start();
   let rest = rest.strip_prefix('=')?.trim();
-  let rest = rest.strip_suffix(';')?.trim(); // 必须以分号结尾：杜绝"跨行声明"被误读
+  let rest = rest.strip_suffix(';')?.trim();
   let rest = rest.strip_suffix('u').unwrap_or(rest).trim();
   let value = match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
     Some(hex) => u32::from_str_radix(hex, 16).ok()?,

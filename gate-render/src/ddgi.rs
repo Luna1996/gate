@@ -1,83 +1,39 @@
 //! DDGI（Dynamic Diffuse Global Illumination）：世界空间探针烘焙 + 活跃探针筛选 + cast/collect。
-//!
-//! 4 级嵌套级联 LOD，各级以世界 AABB 锚定铺 16³ cell 网格（cell 边长 16/32/64/128 voxel，覆盖
-//! 逐级 ×2 且严格嵌套）；LOD0 额外按 chunk 从探针池领固定 4096 槽的段。烘焙 `ddgi_bake0..3`
-//! 逐 cell 沿 4³ 分裂树 BFS 找「最大的全空叶」并把探针放其中心，结果写 `ddgi_cell`（按 LOD 拆
-//! 4 个 pass，细→粗：粗级继承本帧细级的放置结果，pass 边界才是内存屏障）。`ddgi_sort` 每帧按
-//! 「本 cell 或 6 邻接 cell 有体素」判定活跃并 atomicAdd 进 per-LOD worklist，同时刷新
-//! age / slot_pos / meta；`seal` 把固定射线预算摊给活跃探针，写 cast/collect 的 indirect args。
+//! 4 级嵌套级联 LOD：LOD1~3 锚定世界 AABB 铺 cell 网格，LOD0 按 chunk 从探针池领固定 4096 槽的段；
+//! 流程 `ddgi_bake0..3` → `ddgi_sort` → `seal` → `cast` → `collect`。
 
 use bevy::render::render_resource::{CachedComputePipelineId, ShaderType};
 use glam::{IVec3, IVec4, UVec3, UVec4, Vec4};
+use std::sync::LazyLock;
 
 use crate::wesl_consts::ddgi_consts;
 
-// 图集纹素数（irr / depth）与每帧射线预算（`DDGI_RAY_BUDGET`）的**权威值都在 WESL**
-// （`ddgi/consts.wesl`），Rust 侧由 `wesl_consts::ddgi_consts()` 启动时解析**同一份源码**得到，
-// 不再各留一份副本。为什么取 4×4 / 8×8、动预算的代价是什么，见 WESL 那三条常量各自的注释。
+// 图集纹素数（irr / depth）与每帧射线预算（`DDGI_RAY_BUDGET`）的权威值都在 WESL
+// （`ddgi/consts.wesl`），Rust 侧经 `wesl_consts::ddgi_consts()` 解析同一份源码得到。
 pub const DDGI_LODS: u32 = 4;
 /// 4 级 LOD cell 边长（voxel），等比 ×2。
-///
-/// 上限受 `ddgi_cell_state_sized` 支持（16/32/64/128/256）约束。取 [16,32,64,128]：探针数 /
-/// 射线预算 / 显存全不变（dims 不变），只是把同样的探针铺在**更小的体积**上 —— 近场探针间距
-/// 64cm→32cm，缓解"探针晶格"伪影（GI 场的空间变化比探针网格更细时，三线性插值把每个探针
-/// 自己的值暴露成 0.64m 周期的亮斑）。
-///
-/// **cell 与 dims 是一对此消彼长的量**：把最粗级放大到 256 会把探针间距等比放大到 5.12m，
-/// 8 角探针跨到墙背面/屋面之上/地面之下 → 该面被 `wn ≤ 0` 全剔 → GI 黑区。要"覆盖更大 +
-/// 间距不变"只能加大 dims（或增加级数），代价落在 collect/sort/图集，而不是改 cell。
 pub const DDGI_LOD_CELL_SIZES: [i32; DDGI_LODS as usize] = [16, 32, 64, 128];
-/// DDGI 世界网格相对世界 AABB **向外扩的量**（voxel，六个方向各扩这么多）。只作用于
-/// `DdgiWorldGrid`（LOD1~3 的规则网格与各级的"空间盒"）；**不动** `DdgiChunkGeom`
-/// （LOD0 的 chunk 段仍按真实 AABB 分配）⇒ LOD0 的 chunk 数、槽位段、探针池全部不变。
-///
-/// 必须 ≥ 一个 LOD0 cell：各级原点按**自己的 cell** 向下对齐（`align_down(min, cell)`），级间
-/// 粒度不同 ⇒ 世界边界面上会出现一圈"只有粗级覆盖"的环（如 AABB `min.y = 16` 时
-/// `align_down(16,16)=16` 而 `align_down(16,32)=0` ⇒ 落在 [0,16) 的点被判进 LOD1 壳）。采样点
-/// 还会沿法线外推（`dda_main` 的 `n_off ≥ 0.5` 体素）⇒ 世界底面朝下的面会掉出 LOD0 盒、被按
-/// LOD1（cell=32）采样，而粗级探针位置是从细级继承的、落在世界内部（该面的上方）⇒ 该面
-/// `wn_raw < 0` 全部背向 → `wsum = 0` → GI≈0。
-/// 外扩 16 后，边界面上任意点到 LOD0 盒的 `min` 面至少 15 体素 ⇒ 稳定落在 LOD0 壳采样细级，
-/// 而细级在世界外侧的 cell 本来就有探针（`lod0_needed_chunks` 规则 ②：几何贴 chunk 边界
-/// 16 体素以内时相邻 chunk 也领段）。
-///
-/// 代价：LOD1~3 的原点最多再降 16、每轴 dims 至多 +1 ⇒ 总槽位小幅上升，`DDGI_ATLAS_LAYERS`
-/// 需同步放大（容量 = 层数 × 轴向²，必须 ≥ 实际总槽位）。
+/// DDGI 世界网格相对世界 AABB 向外扩的量（voxel，六方向）。只作用于 `DdgiWorldGrid`，
+/// 不动 `DdgiChunkGeom`；`DDGI_ATLAS_LAYERS` 容量必须 ≥ 实际总槽位。
 pub const DDGI_GRID_MARGIN: i32 = 16;
-// 槽位映射是**世界锚定**的：shader 里 `slot = slot_base + (世界 cell 号 mod dims)`（见
-// `ddgi_slot`）。因此「槽位 ↔ 世界 cell」的身份与相机无关 —— 相机滚动只会让「新进入窗口的
-// 那条带」换掉世界 cell（旧数据本来就该丢），其余槽位保持自己的世界身份，图集不会因相机
-// 移动而整体失效。前提：原点必须是 cell 整数倍。
+// 槽位映射是世界锚定的：`slot = slot_base + (世界 cell 号 mod dims)`（见 WGSL `ddgi_slot`）。
+// 前提：原点必须是 cell 整数倍。
 
-// ---- LOD0 的 chunk 锚定（其它 LOD 保持上面的世界 AABB 规则网格）----
-//
-// LOD0 不铺「一整个世界 AABB 的规则网格」，而是**按 chunk 拥有**：世界体素卷按
-// `DDGI_CHUNK_VOXELS`(256³) 切成 chunk，每个「需要探针」的 chunk 从探针池里领一段**固定
-// 大小**的 LOD0 槽位（4096 = (256/16)³），chunk 内的 cell 编址为 chunk 局部：
-//     slot = chunk_base[chunk] + local_cell_linear（局部 cell 索引，见 `DDGI_CHUNK_LOD0_AXIS`）
-// 探针世界位置 = chunk 世界原点 + 局部 cell 中心 —— **相对世界固定**，故「相机移动不闪」不受影响。
-//
-// 边界与不变量（务必与 WGSL 的 `ddgi_slot_own`/`ddgi_slot_world_cell` 对照）：
-//   · **只服务 LOD0**。LOD1~3 仍由 `DdgiWorldGrid::from_world` 的规则网格提供，槽位基址排在
-//     LOD0 段之后。
-//   · chunk 段的基址**一旦分配就不再改变**（只有 chunk 被释放才归还进空闲链表）。基址一变，
-//     该 chunk 全部探针就会换槽位 → 图集整段错位 → 闪烁。
-//   · 池是**高水位**定容的：`lod0_slots = next_base`，空闲段的空洞同样占槽位。
+// ---- LOD0 的 chunk 锚定（其它 LOD 保持世界 AABB 规则网格）----
+// LOD0 按 chunk 拥有：需要探针的 chunk 从探针池领一段固定 4096 槽（= (256/16)³）的槽位，
+// `slot = chunk_base[chunk] + 局部 cell 索引`；只有 LOD0 走这条路径，段基址一旦分配即固定不变。
 /// chunk 边长（voxel）：世界体素卷按它切块（= 引擎自己的 brick chunk 粒度）。
 pub const DDGI_CHUNK_VOXELS: i32 = 256;
-/// 每 chunk 每轴含多少个 LOD0 cell：256 / 16 = 16。
+/// 每 chunk 每轴含多少个 LOD0 cell：16。
 pub const DDGI_CHUNK_LOD0_AXIS: i32 = DDGI_CHUNK_VOXELS / DDGI_LOD_CELL_SIZES[0];
-/// 每 chunk 的 LOD0 段大小 = (256/16)³ = 4096。
+/// 每 chunk 的 LOD0 段大小：4096 槽。
 pub const DDGI_CHUNK_LOD0_SLOTS: u32 =
   (DDGI_CHUNK_LOD0_AXIS as u32) * (DDGI_CHUNK_LOD0_AXIS as u32) * (DDGI_CHUNK_LOD0_AXIS as u32);
 /// 探针池里「该 chunk 未分配段」的哨兵基址。
 pub const DDGI_CHUNK_NO_BASE: u32 = u32::MAX;
 
-/// LOD0 的 chunk 网格几何（chunk 单位）。
-///
-/// 原点 = 世界 AABB 向下对齐到 256 后再**向外扩 1 chunk**，维度 = 覆盖 AABB 所需 chunk 数
-/// **+2**。多这一圈是为了给「贴着 AABB 边界、需要在邻 chunk 放探针」的 chunk 留出编址空间；
-/// 未分配段的 chunk 由 `DDGI_CHUNK_NO_BASE` 标记。
+/// LOD0 的 chunk 网格几何（chunk 单位）：原点 = 世界 AABB 向下对齐到 256 再向外扩 1 chunk，
+/// 维度 = 覆盖所需 chunk 数 +2；未分配的 chunk 由 `DDGI_CHUNK_NO_BASE` 标记。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DdgiChunkGeom {
   pub origin: IVec3,
@@ -111,7 +67,7 @@ impl DdgiChunkGeom {
     self.dims.x * self.dims.y * self.dims.z
   }
 
-  /// 空网格（dims 全零）：`from_world` 保证每轴 ≥2，实际不会出现，仅补全 lint 契约。
+  /// 空网格（dims 全零）：`from_world` 保证每轴 ≥2，实际不会出现。
   #[inline]
   pub fn is_empty(&self) -> bool {
     self.dims.x == 0 || self.dims.y == 0 || self.dims.z == 0
@@ -142,12 +98,7 @@ impl DdgiChunkGeom {
 }
 
 /// LOD0 探针池：chunk → 段基址（段大小恒为 `DDGI_CHUNK_LOD0_SLOTS`），配一个空闲链表。
-///
-/// 只有「有几何」（或紧邻几何）的 chunk 才领段，空 chunk 不占 LOD0 槽位；池 + 空闲链表也是
-/// 将来接 chunk 流式加载（卸载时归还段）的接口。
-///
-/// `sync` 只做「新 chunk 领段、消失的 chunk 归还」，**已有 chunk 的基址保持不变** —— 这是
-/// 「移动/编辑不闪」的前提（基址变了 = 该 chunk 全部探针换槽位，图集里还是旧位置的值）。
+/// 只有有几何（或紧邻几何）的 chunk 才领段；`sync` 只领段/归还，已有 chunk 的基址保持不变。
 #[derive(Clone, Debug, Default)]
 pub struct DdgiChunkPool {
   pub geom: DdgiChunkGeom,
@@ -216,27 +167,23 @@ pub struct DdgiChunkUniform {
   pub dims: UVec4,
 }
 
-/// 主世界算出的「LOD0 需要探针段的 chunk」集合（chunk 坐标，由主世界体素内容决定）。
-///
-/// 判定规则：chunk 自己有几何，**或**它的邻域（cell 粒度）内有几何 —— 后者保证「贴着几何
-/// 表面的采样者，其 8 个插值角格能拿到探针」：采样者的角格最多跨到相邻 cell，而相邻 cell 若
-/// 落在邻 chunk，就必须给那个 chunk 也分配段，否则那 4 个角会凭空缺失（chunk 边界留接缝）。
+/// 主世界算出的「LOD0 需要探针段的 chunk」集合（chunk 坐标）。
+/// 判定规则：chunk 自己有几何，或其邻域（cell 粒度）内有几何。
 #[derive(bevy::ecs::resource::Resource, Clone, Debug, Default, PartialEq)]
 pub struct DdgiLod0Chunks {
   /// 需要 LOD0 段的 chunk 坐标（世界体素坐标 / 256）。
   pub chunks: Vec<IVec3>,
 }
 
-// indirect args / 计数器合一 buffer 的 word 布局（cast args / collect args / rpp / 活跃计数器）
-// **权威值在 WESL**：`bindings.wesl` 的 `DDGI_INDIR_*_BASE`。Rust 只按解析出的 word 偏移算
-// 字节偏移与清零区间（见 `wesl_consts::DdgiConsts::indirect_bytes` 等）—— 布局改动只需改 WESL。
+// indirect args / 计数器合一 buffer 的 word 布局权威值在 WESL（`bindings.wesl` 的 `DDGI_INDIR_*_BASE`），
+// Rust 只按解析出的 word 偏移算字节偏移与清零区间。
 
 #[inline]
 fn align_down(v: i32, a: i32) -> i32 {
   v.div_euclid(a) * a
 }
 
-/// 世界空间探针网格（4 级嵌套级联，各自独立原点，以相机为中心）。
+/// 世界空间探针网格（4 级嵌套级联，各级独立原点）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DdgiWorldGrid {
   /// 各 LOD 的世界原点（voxel，按该级 cell 边长对齐）。
@@ -260,20 +207,9 @@ impl DdgiWorldGrid {
     DDGI_LOD_CELL_SIZES[lod]
   }
 
-  /// 由**世界 AABB** 推导 4 级嵌套级联 —— 四级**全部锚定世界**，相机完全不参与（相机移动不
-  /// 改变任何一级的原点 → 结构上不存在"槽位换主"，也就没有移动时的 GI 闪烁）。
-  ///
-  /// dims = ceil(世界跨度 / cell)：cell 逐级 ×2、AABB 相同 ⇒ dims 逐级减半 ⇒ LOD(l-1) 盒严格
-  /// 包含于 LOD(l) 盒内（嵌套不变式）。
-  ///
-  /// 细级按世界算有 ~33 万个 cell（cell=16），但绝大多数是纯空气 → `near` 判定为假 → 不进
-  /// worklist → **不参与 cast/collect**。代价只在图集容量和 `sort`（每帧扫全槽位）。
-  ///
-  /// 原点按 cell 向下对齐，保证 shader 里「世界 cell 号 = (p - origin) / cell」精确整除 ——
-  /// 世界锚定的槽位映射（`slot = base + 世界 cell mod dims`）才成立。
+  /// 由世界 AABB 推导 4 级嵌套级联：原点按该级 cell 边长向下对齐，dims = ceil(跨度 / cell)，
+  /// 各级严格嵌套。原点必须是 cell 整数倍，世界锚定的槽位映射才成立。
   pub fn from_world(aabb_min: IVec3, aabb_max: IVec3) -> Self {
-    // 先向外扩 DDGI_GRID_MARGIN（原因见该常量的推导）。**只扩网格**：`DdgiChunkGeom` 仍按真实
-    // AABB 算，所以 LOD0 的 chunk 段数量与分配完全不变。
     let aabb_min = aabb_min - IVec3::splat(DDGI_GRID_MARGIN);
     let aabb_max = aabb_max + IVec3::splat(DDGI_GRID_MARGIN);
     let mut out = Self::default();
@@ -329,9 +265,7 @@ pub struct DdgiUniform {
   pub dirty_max: Vec4,
   /// LOD0 的 chunk 段编址（仅 lod==0 用；LOD1~3 走 `lods`）。见 `DdgiChunkUniform`。
   pub chunk: DdgiChunkUniform,
-  /// 性能/精度档位（菜单开关，对应 `DdgiDebugSettings.gi_half_res`）：
-  ///   x = 保留（恒 0）；y = 半分辨率 GI（1 = 采样走 1/2 分辨率缓冲，0 = 逐像素内联采样）；
-  ///   zw 保留。
+  /// 档位：x = 保留（恒 0）；y = 半分辨率 GI（1 = 走 1/2 分辨率缓冲）；zw 保留。
   pub flags: Vec4,
 }
 
@@ -371,13 +305,11 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
         },
         count: None,
       },
-      // 1/2：irradiance / depth 图集（采样侧；cast 回读 GI、着色 ddgi_sample 用）
+      // 1/2：irradiance / depth 图集（采样侧）
       tex(1, TextureSampleType::Float { filterable: true }),
       tex(2, TextureSampleType::Float { filterable: false }),
-      // 3：烘焙输出（bake 写 / sort 读）4：age/flags（读写）5：indirect/counter（读写）
-      // 6：worklist（读写）7：slot_pos（读写）8：cell_id（读写，滚动增量）
-      // 9：cast 射线样本（cast 写 / collect 读）
-      // 10：LOD0 的两张 chunk 表 + 使用计数前缀（读写；见 `DdgiGpu::cell_slot`）。
+      // 3：烘焙输出；4：age/flags；5：indirect/counter；6：worklist；7：slot_pos；8：cell_id；
+      // 9：cast 射线样本；10：LOD0 chunk 表 + 使用计数前缀（读写）。
       buf(3, false),
       buf(4, false),
       buf(5, false),
@@ -390,14 +322,7 @@ pub fn ddgi_bg4_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
   )
 }
 
-/// BG5（collect 用 + 半分辨率 GI 用）：图集的**写入侧** + GI 缓冲的写入侧。与 BG4 分离是硬性
-/// 要求——同一纹理不能在同一 bind group / 同一 pass 内既作采样纹理又作存储纹理；collect 只写
-/// 图集，其余 pass 只读。
-///
-/// @binding(2)/(3) 是半分辨率 GI 缓冲（`gi_main` 写；采样侧在 BG0 binding 4/5）：挂这里是因为
-/// wgpu 要求 bind group 按索引从 0 起成前缀地设置，而 0..4 已被「视图/树/栅格/光照/图集采样」
-/// 占满。两个入口各自只用到其中一半条目，未用条目仍须绑定，但不产生使用冲突（图集 ping-pong
-/// 的读写两侧是**不同**纹理）。
+/// BG5（collect + 半分辨率 GI 写入侧）：图集的写入侧 + GI 缓冲的写入侧；必须与 BG4 分离。
 pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -425,8 +350,7 @@ pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
     "DdgiBg5",
     &[
       store(0, TextureFormat::Rgba16Float),
-      // depth 图集用 Rgba16Float：.x = mean、.y = std（距离标准差），供采样侧做 Chebyshev
-      // 软遮挡。R32Float 只有均值，只能做刀锋判定 → 深度一抖就"入选/落选"翻转（亮区边界伸缩）。
+      // depth 图集用 Rgba16Float：.x = mean、.y = std（距离标准差），供采样侧做 Chebyshev 软遮挡。
       store(1, TextureFormat::Rgba16Float),
       // 半分辨率 GI：rgb = gi·valid、a = valid
       store2d(2, TextureFormat::Rgba16Float),
@@ -436,9 +360,8 @@ pub fn ddgi_bg5_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
   )
 }
 
-/// BG6（仅 seal 用）：dispatch 参数 buffer 的**写入侧**。
-/// 与 BG4 分离是硬性要求：该 buffer 在 cast/collect pass 里要作 indirect 参数源，
-/// 若同时被绑成 storage 会被 wgpu 判为 usage 冲突。
+/// BG6（仅 seal 用）：dispatch 参数 buffer 的写入侧；必须与 BG4 分离。
+/// 该 buffer 在 cast/collect 作 indirect 参数源。
 pub fn ddgi_bg6_layout() -> bevy::render::render_resource::BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -459,9 +382,7 @@ pub fn ddgi_bg6_layout() -> bevy::render::render_resource::BindGroupLayoutDescri
 
 #[derive(Debug, Clone, Copy)]
 pub struct DdgiPipelines {
-  /// per-LOD 烘焙入口（lod 0..DDGI_LODS，细→粗）。**必须逐级拆成独立 pass**：
-  /// 粗级的探针放置要读本帧细级的 bake 输出，而同一 pass 内没有顺序保证，
-  /// 只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
+  /// per-LOD 烘焙入口（lod 0..DDGI_LODS，细→粗）；必须逐级拆成独立 pass（pass 边界即内存屏障）。
   pub bake: [CachedComputePipelineId; DDGI_LODS as usize],
   pub sort: CachedComputePipelineId,
   pub seal: CachedComputePipelineId,
@@ -479,20 +400,12 @@ pub struct DdgiAtlas {
 pub struct DdgiGpu {
   pub uniform: bevy::render::render_resource::UniformBuffer<DdgiUniform>,
   pub indirect: bevy::render::render_resource::Buffer,
-  /// dispatch 参数（`INDIRECT`）。**必须与 `ddgi_indirect` 分开**：同一 pass 内一个 buffer 若
-  /// 既作 storage 绑定又作 indirect 参数源，wgpu 会判定 usage 冲突（`STORAGE_READ_WRITE` 是独占用法）。
-  /// 它只在 seal pass 里以 storage 绑定（BG6）；cast/collect 只把它当 indirect 源，不绑定。
+  /// dispatch 参数（`INDIRECT`）；必须与 `ddgi_indirect` 分开，只在 seal pass 以 storage 绑定（BG6）。
   pub args: bevy::render::render_resource::Buffer,
   pub worklist: bevy::render::render_resource::Buffer,
   pub slot_pos: bevy::render::render_resource::Buffer,
-  /// LOD0 chunk 段的两张表（复用一张 u32 数组，见 WGSL binding(10) 注释）。
-  ///
-  /// 【buffer 布局】BG4 的 storage binding 已经用满 8 个（WebGPU/WGSL 下限），所以尾部复用：
-  ///   [0, total_slots)                          —— 使用计数（每 slot 的屏幕使用漏桶，着色侧 +1、
-  ///                                                `ddgi_sort` 每帧 -1）
-  ///   [total_slots, +num_chunks)                —— chunk_base：chunk 线性下标 → LOD0 段基址
-  ///   [total_slots+num_chunks, +lod0_slots)     —— slot_chunk：LOD0 局部槽位 → 所属 chunk 线性下标
-  /// 三个区间的偏移在 WGSL 里由 `misc.y`(=total_slots) 与 chunk 维度算出。
+  /// LOD0 chunk 段的两张表，与使用计数前缀复用同一 u32 数组：
+  /// [0, total_slots) 使用计数；[total_slots, +num_chunks) chunk_base；其后 slot_chunk。
   pub cell_slot: bevy::render::render_resource::Buffer,
   /// LOD0 探针池（chunk → 段基址，见 `DdgiChunkPool`）。
   pub pool: DdgiChunkPool,
@@ -506,9 +419,8 @@ pub struct DdgiGpu {
   pub cell_id: bevy::render::render_resource::Buffer,
   /// 每帧 age / enabled
   pub meta: bevy::render::render_resource::Buffer,
-  /// 图集 ping-pong：BG4 绑「当前」（上一帧 collect 写入的，供 cast 回读 + 着色采样），
-  /// BG5 绑「目标」（本帧 collect 写入）。读写必须落在不同纹理 + 不同 bind group：
-  /// wgpu 禁止同一 pass 内把同一纹理既当可写存储又当采样纹理。
+  /// 图集 ping-pong：BG4 绑「当前」（上一帧 collect 写入），BG5 绑「目标」（本帧 collect 写入）；
+  /// 读写必须落在不同纹理 + 不同 bind group。
   pub irr: [DdgiAtlas; 2],
   pub depth: [DdgiAtlas; 2],
   /// 采样侧索引（0/1）；dispatch_ddgi 在 collect 跑完后翻转
@@ -520,10 +432,7 @@ pub struct DdgiGpu {
   pub total_slots: u32,
   /// 已消费的世界修订号（变化 → 需要重烘焙）
   pub last_revision: u64,
-  /// 有一次烘焙请求已发出但**还没真正派发**（pipeline 未编译好 / 绑定组未就绪时
-  /// `dispatch_ddgi` 会提前返回）。`prepare_ddgi` 一旦推进了 `grid`/`last_revision`，
-  /// 这次请求就不会再被 `grid_changed || rev_changed` 重新检出 —— 必须靠这个标志把它
-  /// 留到真正派发的那一帧，否则「启动时就打开 DDGI」会一次也不烘焙，整级图集恒空。
+  /// 有一次烘焙请求已发出但还没真正派发（pipeline/绑定组未就绪）；必须留到真正派发的那一帧。
   pub bake_pending: bool,
   pub pipelines: Option<DdgiPipelines>,
 }
@@ -539,9 +448,8 @@ pub struct DdgiBg5(pub bevy::render::render_resource::BindGroup);
 #[derive(bevy::ecs::resource::Resource)]
 pub struct DdgiBg6(pub bevy::render::render_resource::BindGroup);
 
-/// 半分辨率 GI 写入侧的**占位**纹理（1×1）：`prepare_dda_bind_groups` 尚未产出 GI 缓冲时
-/// （首帧，或那一帧它因资源缺失提前返回）BG5 仍须为 binding 2/3 提供视图 —— bind group
-/// 必须给全条目。占位纹理不会被真正写入（`gi_main` 只在开关打开且有真缓冲时派发）。
+/// 半分辨率 GI 写入侧的占位纹理（1×1）：GI 缓冲未就绪时 BG5 仍须为 binding 2/3 提供视图。
+/// 占位纹理不会被真正写入。
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
   tex: Option<bevy::render::render_resource::Texture>,
@@ -597,9 +505,7 @@ impl DdgiStage {
   pub fn new(v: u8) -> Self {
     Self(v.min(Self::FULL))
   }
-  /// `GATE_DDGI_STAGE=0..3` 覆盖启动阶段。
-  ///
-  /// **缺省 = FULL(3)**（DDGI 默认开启）；需要基准对比「DDGI=Off」时显式 `GATE_DDGI_STAGE=0`。
+  /// `GATE_DDGI_STAGE=0..3` 覆盖启动阶段；缺省 = FULL(3)。
   fn from_env() -> Self {
     Self::new(
       std::env::var("GATE_DDGI_STAGE")
@@ -620,13 +526,8 @@ impl DdgiStage {
   }
 }
 
-/// 已加载世界的 AABB（voxel 坐标，闭区间）。
-///
-/// DDGI 的 4 级网格**全部锚定到它**（见 `DdgiWorldGrid::from_world`）—— 相机移动时任何一级的
-/// 原点都**不变**，从根上消除"槽位换主"导致的 GI 闪烁。
-///
-/// 由主世界算出（`vox_scene` 的 AABB）并 extract 到 render world；未设置时取单位盒
-/// （退化为 1×1×1 格，不会 panic）。
+/// 已加载世界的 AABB（voxel 坐标，闭区间）；由主世界算出并 extract 到 render world，
+/// 未设置时取单位盒。DDGI 的各级网格锚定到它。
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DdgiWorldAabb {
   pub min: IVec3,
@@ -645,27 +546,13 @@ pub struct DdgiDebugSettings {
   pub gain: f32,
   pub probe_viz: bool,
   pub probe_viz_lod: f32,
-  /// Chebyshev 里 **std 项的信任系数**，对应 WGSL `misc.z`（0..1，默认 1 = 正常使用 std）。
-  ///
-  /// 拖到 0 = 完全忽略 std，`soft` 退回固定下限 `DDGI_DEPTH_SOFT_MIN`（硬判定：更能压漏光，
-  /// 但过渡带变窄、动态时更易闪）。保留作诊断用。
-  ///
-  /// 前提：射线方向已**绑定到深度纹素**（见 shaders/voxel_raytrace/ 的 cast）—— 此时 `std`
-  /// 度量的是「20° 锥内几何起伏」而非「每帧全球随机方向的噪声」。
+  /// Chebyshev 里 std 项的信任系数，对应 WGSL `misc.z`（0..1，默认 1 = 正常使用 std）。
+  /// 拖到 0 = 完全忽略 std，`soft` 退回固定下限（保留作诊断用）。
   pub depth_soft_k: f32,
-  /// 级联覆盖**之外**的天光兜底强度，对应 WGSL `misc.w`（0..1，默认 0.25）。
-  ///
-  /// 覆盖内的环境光由 DDGI 算出，覆盖外只能靠常量兜底 —— 两者强度不匹配时，级联盒边界
-  /// 就是一条"亮 ↔ 暗"的硬边（相机拉远必然出现"有 GI / 无 GI 同屏"）。
-  /// **不能直接用 `DDGI_SKY_AMBIENT` 调大**：它还兼作 DDGI 关闭时的环境光，调大会让
-  /// 未开 DDGI 的画面整体提亮。所以覆盖外单独一个系数，运行时滑杆调到与覆盖内衔接为止。
+  /// 级联覆盖之外的天光兜底强度，对应 WGSL `misc.w`（0..1，默认 0.25）；独立于 `DDGI_SKY_AMBIENT`。
   pub far_ambient: f32,
-  /// 半分辨率 GI（对应 WGSL `flags.y`）：把 `ddgi_sample` 从主 pass 搬到 1/2 分辨率的独立 pass，
-  /// 主 pass 只做双线性取用。GI 是低频量（探针间距 16~128 voxel）⇒ 这是主 pass 最大一块成本的
-  /// 按 4× 削减；代价是 GI 的可见性/接触阴影分辨率减半。
-  ///
-  /// 注：曾有过一个"逐角遮挡求交只测高权角"的档位（省 ~0.7ms），实测弱角漏检会带来黑斑与薄缝
-  /// 漏光，目视不可接受，已移除；WGSL 侧 `flags.x` 因此恒 0（保留位）。
+  /// 半分辨率 GI（对应 WGSL `flags.y`）：`ddgi_sample` 搬到 1/2 分辨率的独立 pass，主 pass 只做
+  /// 双线性取用。
   pub gi_half_res: bool,
 }
 
@@ -719,8 +606,6 @@ impl bevy::app::Plugin for DdgiPlugin {
         prepare_ddgi
           .in_set(bevy::render::RenderSystems::PrepareBindGroups)
           .after(crate::brickmap::upload::prepare)
-          // BG5 的 GI 写入侧要用 `prepare_dda_bind_groups` 建出来的半分辨率 GI 缓冲
-          // （未就绪时会退回 1×1 占位纹理，但同帧就绪才不浪费那一帧）
           .after(crate::brickmap::dda::prepare_dda_bind_groups),
       )
       .add_systems(
@@ -757,7 +642,7 @@ fn zero_storage_buffer(
   buf
 }
 
-/// 容量不足时重建（并清零）。base 网格变化 = 世界窗口变化，低频。
+/// 容量不足时重建（并清零）。
 fn ensure_storage_buffer(
   device: &bevy::render::renderer::RenderDevice,
   queue: &bevy::render::renderer::RenderQueue,
@@ -774,8 +659,8 @@ fn ensure_storage_buffer(
   *buf = new;
 }
 
-/// dispatch 参数 / 计数器 buffer：既要作为 storage（atomic）被 sort/seal 读写，
-/// 又要（仅 args）作为 indirect dispatch 的参数源。两者必须是不同 buffer，见 `DdgiGpu::args`。
+/// dispatch 参数 / 计数器 buffer：作为 storage 被 sort/seal 读写，args 还作 indirect 参数源。
+/// 两者必须是不同 buffer（见 `DdgiGpu::args`）。
 fn ddgi_indirect_buffer(
   device: &bevy::render::renderer::RenderDevice,
   queue: &bevy::render::renderer::RenderQueue,
@@ -807,22 +692,8 @@ fn ddgi_array_view(
   })
 }
 
-/// 图集容量（可寻址探针槽位上限）与射线样本缓冲的说明。
-///
-/// 【容量从哪来】`DDGI_ATLAS_LAYERS × DDGI_PROBES_PER_LAYER_AXIS²` —— 两个量都是 WESL 侧的
-/// 权威值（见 `consts.wesl`），这里只经 `wesl_consts::ddgi_consts()` 读取。当前 409600 槽，
-/// nuke.vox 下 total_slots = 403456，余量只剩 6144，世界再大一点或 LOD0 多领几个 chunk 段
-/// 就会越界。
-///
-/// 池 / `from_world` **都不做钳制**：超出容量会静默越界写图集。约束靠改参数时自行核对：
-/// 实际场景的 total_slots 必须 ≤ 容量（容量 = 层数 × 轴向²），且容量要装得进 worklist 的
-/// cell 下标位宽。
-///
-/// 【样本缓冲容量】每样本 2×vec4 = (方向.xyz, 命中距离) + (辐亮度.xyz, 1)，下标 = 全局射线
-/// 编号（`ddgi_cast` 的 `si = tid * 2`）。容量**不是** `ray_budget`：seal 的
-/// `rpp = max(1, BUDGET / total_active)` 有下限 1，活跃探针数超过预算时
-/// `total_ray = total_active`，上界是**总槽位数**；越界写被 wgpu 静默丢弃 → 那些探针恒 0
-/// → 成片无 GI。故取 `max(预算, 总槽位)`，见 `wesl_consts::DdgiConsts::sample_bytes`。
+/// 图集容量 = `DDGI_ATLAS_LAYERS × DDGI_PROBES_PER_LAYER_AXIS²`（均为 WESL 权威值）；池与
+/// `from_world` 都不做钳制，实际 `total_slots` 必须 ≤ 容量。
 
 fn ddgi_array_tex(
   device: &bevy::render::renderer::RenderDevice,
@@ -853,8 +724,7 @@ fn ddgi_array_tex(
 }
 
 /// 图集清零。Rgba16Float 的 0.0 是全 0 字节，直接写零块。
-/// 必须清零：probe 一 enabled 就可能被采样，但它的图集纹素要等第一次 collect 才有效，
-/// 否则会读到未初始化显存（NaN/垃圾污染 GI）。
+/// 必须清零（探针 enabled 后即可能被采样）。
 fn zero_array_tex(
   queue: &bevy::render::renderer::RenderQueue,
   label: &str,
@@ -896,7 +766,7 @@ fn init_ddgi_gpu(
   let dep_axis = c.probes_per_layer_axis * c.depth_texels;
   let mk_atlas = |label: &str, format: TextureFormat, size: (u32, u32), bpt: u32| {
     let tex = ddgi_array_tex(&device, label, format, size);
-    // 两侧都要清零：首帧 BG4 采样 a、collect 写 b；翻转后 a 才被写，不清零会读到未初始化显存。
+    // 两侧都要清零：首帧 BG4 采样 a、collect 写 b，翻转后 a 才被写。
     zero_array_tex(&queue, label, &tex, size, bpt);
     let view = ddgi_array_view(&tex);
     DdgiAtlas { tex, view }
@@ -915,8 +785,8 @@ fn init_ddgi_gpu(
   let cell = zero_storage_buffer(&device, &queue, "ddgi_cell", 4096 * 4);
   let cell_id = zero_storage_buffer(&device, &queue, "ddgi_cell_id", 4096 * 16);
   let meta = zero_storage_buffer(&device, &queue, "ddgi_meta", 4096 * 4);
-  // LOD0 chunk 段表 + 保留前缀（同一 buffer，见 `DdgiGpu::cell_slot` 注释）。
-  // 内容尺寸随世界 AABB / LOD0 chunk 集变化 → 这里只放占位，`prepare_ddgi` 按构建键重建。
+  // LOD0 chunk 段表 + 保留前缀（同一 buffer，见 `DdgiGpu::cell_slot`）；这里只放占位，
+  // 内容尺寸随世界 AABB / LOD0 chunk 集变化，`prepare_ddgi` 按构建键重建。
   let cell_slot = zero_storage_buffer(&device, &queue, "ddgi_cell_slot", 4);
   let samples = zero_storage_buffer(&device, &queue, "ddgi_samples", c.sample_bytes(0));
   let indirect = ddgi_indirect_buffer(&device, &queue, "ddgi_indirect");
@@ -971,10 +841,8 @@ fn queue_ddgi_pipelines(
     dda.bg3_layout.clone(),
     ddgi_bg4_layout(),
   ];
-  // collect 额外挂 BG5（图集写入侧）；seal 额外挂 BG6（dispatch 参数写入侧）。
-  // 注意：layout 的**位置**就是 bind group 索引。base 已占 0..4，collect 的 BG5 正好落在 5；
-  // seal 的参数侧在 @group(6)，而 @group(5) 已被 collect 占用（同一 WGSL 模块里同一个
-  // group/binding 槽只能有一个变量），所以 seal 的 layout 在 5 号位留一个空的 layout。
+  // collect 额外挂 BG5、seal 额外挂 BG6；layout 的位置就是 bind group 索引，seal 的 @group(5)
+  // 已被 collect 占用，5 号位留空 layout。
   let mut collect_layout = base.clone();
   collect_layout.push(ddgi_bg5_layout());
   let mut seal_layout = base.clone();
@@ -1056,14 +924,10 @@ fn dispatch_ddgi(
   // 1D dispatch：WG=64，各 pass 覆盖 total_slots（bake 仅在修订号变化时跑）
   let wg_slots = gpu.total_slots.div_ceil(64).min(65535);
 
-  // 烘焙：世界数据变化时重算探针位置（BFS 最大空叶）。
-  // **按 LOD 逐级派发 4 个独立 pass（细→粗）**：粗级的放置要继承本帧细级的 bake 输出，
-  // 同一 pass 内没有顺序保证，只有 pass 边界才是内存屏障（见 WGSL `ddgi_bake_one`）。
+  // 烘焙：世界数据变化时重算探针位置。按 LOD 逐级派发 4 个独立 pass（细→粗），pass 边界即内存屏障。
   if bake.is_some_and(|b| b.0) {
     let n_lods = DDGI_LODS as usize;
-    // 每级的 dispatch 大小按**该级实际槽数**算 —— LOD0 的槽数是探针池高水位（chunk 段之和，
-    // 不等于空间盒 dims 乘积），LOD1~3 是 dims 乘积。写死/用 dims 乘积都会让烘焙只覆盖一部分
-    // cell，症状是"大部分区域无 GI"（且无报错）。
+    // 每级 dispatch 大小按该级实际槽数算（LOD0 = 池高水位，LOD1~3 = dims 乘积）。
     let lod0_slots = gpu.grid.lod_slot_base[1];
     let wg_per_lod: [u32; DDGI_LODS as usize] = std::array::from_fn(|lod| {
       let n = if lod == 0 {
@@ -1076,7 +940,7 @@ fn dispatch_ddgi(
     });
     const LABELS: [&str; DDGI_LODS as usize] =
       ["gate_ddgi_bake0", "gate_ddgi_bake1", "gate_ddgi_bake2", "gate_ddgi_bake3"];
-    // 4 个入口必须**全部**就绪才开跑：否则会出现"细级烘了、粗级没烘"的半帧状态。
+    // 4 个入口必须全部就绪才开跑。
     let mut p_bake: [Option<&bevy::render::render_resource::ComputePipeline>; DDGI_LODS as usize] =
       [None; DDGI_LODS as usize];
     let mut ready = true;
@@ -1100,11 +964,11 @@ fn dispatch_ddgi(
           },
         );
       }
-      // 真正派发过了才撤销挂起标志（否则保留它，等下一帧管线就绪再烘）
+      // 真正派发过了才撤销挂起标志。
       gpu.bake_pending = false;
     }
   }
-  // sort：读烘焙结果做活跃判定 + worklist 压缩 + age/slot_pos/meta 刷新（probe_viz 依赖其新鲜度）
+  // sort：读烘焙结果做活跃判定 + worklist 压缩 + age/slot_pos/meta 刷新。
   crate::profiler::gpu_compute_pass(
     &mut profiler,
     ctx.command_encoder(),
@@ -1131,8 +995,7 @@ fn dispatch_ddgi(
       },
     );
   }
-  // 阶段二 cast / 阶段三 collect：seal 已备好 per-LOD indirect args
-  // （byte 0 = cast×4 LOD，byte 64 = collect×4 LOD）与 rpp（byte 128）。
+  // 阶段二 cast / 阶段三 collect：seal 已备好 per-LOD indirect args 与 rpp。
   if stage.run_cast()
     && let (Some(p_cast), Some(p_coll), Some(bg5)) = (
       pipeline_cache.get_compute_pipeline(pipes.cast),
@@ -1140,8 +1003,8 @@ fn dispatch_ddgi(
       bg5.as_ref(),
     )
   {
-    // cast / collect 各一次间接 dispatch（覆盖全部 LOD；LOD 由 shader 用 seal 写的前缀和还原）。
-    // 两个 args 段的字节偏移取自 WESL 的 `DDGI_INDIR_CAST_BASE` / `DDGI_INDIR_COLL_BASE`。
+    // cast / collect 各一次间接 dispatch（覆盖全部 LOD）；args 段字节偏移取自 WESL 的
+    // `DDGI_INDIR_CAST_BASE` / `DDGI_INDIR_COLL_BASE`。
     let c = ddgi_consts();
     let (cast_off, coll_off) = (c.args_cast_offset(), c.args_coll_offset());
     crate::profiler::gpu_compute_pass(
@@ -1165,7 +1028,7 @@ fn dispatch_ddgi(
         pass.dispatch_workgroups_indirect(&gpu.args, coll_off);
       },
     );
-    // 本帧写过图集 → 下一帧采样侧翻到刚写完的那一半
+    // 本帧写过图集 → 下一帧采样侧翻转。
     gpu.parity ^= 1;
   }
 }
@@ -1195,6 +1058,16 @@ fn extract_ddgi_settings(
   commands.insert_resource(lod0_chunks.map_or_else(DdgiLod0Chunks::default, |c| c.clone()));
 }
 
+/// 【诊断】`GATE_NO_OCCL=1`：跳过 DDGI 采样侧的逐角几何求交（8 角一律按"未遮挡"处理，
+/// 经 `ddgi_u.flags.x` 传给 shader）；打开后画面必然漏光。
+static OCCL_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+  let on = std::env::var("GATE_NO_OCCL").map(|v| v == "1").unwrap_or(false);
+  if on {
+    bevy::log::warn!("GATE_NO_OCCL=1：已跳过 DDGI 逐角几何求交（仅量测 GPU 成本用，画面会漏光）");
+  }
+  on
+});
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_ddgi(
   mut commands: bevy::ecs::system::Commands,
@@ -1212,15 +1085,13 @@ fn prepare_ddgi(
   mut gpu: bevy::ecs::system::ResMut<DdgiGpu>,
 ) {
   // ---- 网格推导 ----
-  // LOD1~3 **全部锚定世界 AABB**（相机移动不改变原点 → 不换主 → 不闪）。
-  // LOD0 换成 **chunk 锚定**：由 `DdgiChunkPool` 从探针池给「需要探针的 chunk」分配固定
-  // 4096 槽的段（内容驱动）。槽位段顺序恒为 LOD0（池）→ LOD1 → LOD2 → LOD3。
+  // LOD1~3 锚定世界 AABB，LOD0 按 chunk 由 `DdgiChunkPool` 领固定 4096 槽的段；
+  // 槽位段顺序恒为 LOD0 → LOD1 → LOD2 → LOD3。
   let base_grid = DdgiWorldGrid::from_world(world.min, world.max);
   let chunk_geom = DdgiChunkGeom::from_world(world.min, world.max);
   let lod0_chunks = lod0_chunks.map_or_else(Vec::new, |c| c.chunks.clone());
 
-  // 探针池同步：只在「chunk 集变化」或「chunk 网格几何变化」时真正做事。已有 chunk 的段基址
-  // **保持不变**（见 `DdgiChunkPool::sync`）—— 基址一变即等价于该 chunk 换槽位。
+  // 探针池同步：只在 chunk 集或网格几何变化时做事；已有 chunk 的段基址保持不变（见 `DdgiChunkPool::sync`）。
   let chunks_changed = gpu.last_chunks != lod0_chunks;
   let geom_changed = gpu.pool.geom != chunk_geom;
   let pool_changed = if chunks_changed || geom_changed {
@@ -1245,7 +1116,6 @@ fn prepare_ddgi(
   let num_chunks = chunk_geom.len();
 
   // ---- 推进网格/修订号状态（仅在本帧会跑 pass 时）----
-  // 否则「关闭期间世界已更新/相机已移动」会被吞掉 → 之后打开时不会补烘。
   let rev = revision.map_or(0, |r| r.0);
   let will_run = stage.run_active() || dbg.probe_viz;
   let rev_changed = rev != gpu.last_revision;
@@ -1253,8 +1123,7 @@ fn prepare_ddgi(
     gpu.grid = grid;
     gpu.total_slots = total;
     if grid_changed {
-      // 网格变了就打一次实际数值：LOD0 的 dims 字段仍是**空间盒**（级联包含 / 混合带用它），
-      // 槽位数不再等于 dims 乘积，而是池高水位 —— 出问题时第一件事就是核对它们。
+      // 网格变了就打一次实际数值：LOD0 的 dims 字段仍是空间盒，槽位数是池高水位。
       for (lod, &cell) in DDGI_LOD_CELL_SIZES.iter().enumerate() {
         let o = grid.lod_origins[lod];
         let d = grid.lod_dims[lod];
@@ -1284,40 +1153,32 @@ fn prepare_ddgi(
     }
     gpu.last_revision = rev;
   }
-  // 相机滚动（grid 变化）/ 池变化 → 按「世界 cell 键」增量补烘；世界编辑 → 只失效脏区内的 cell
-  // （bake 用 uniform 里的脏区 AABB 跳过 cell_id 键检查，不再整块清缓存）。
-  // `gpu.bake_pending` 让请求**黏住**：本帧若因 pipeline 未编译好而没真正派发（见
-  // dispatch_ddgi 的提前返回），下一帧仍会重试，而不是被「已推进的 grid/last_revision」
-  // 悄悄吞掉（症状：启动时就打开 DDGI → 一次也不烘焙 → 整级图集恒空）。
+  // 相机滚动（grid 变化）/ 池变化 → 按「世界 cell 键」增量补烘；世界编辑 → 只失效脏区内的 cell。
+  // `gpu.bake_pending` 让请求黏住到真正派发的那一帧。
   let need_bake = (grid_changed || rev_changed || gpu.bake_pending) && total > 0 && will_run;
   gpu.bake_pending = need_bake;
 
-  // ---- 脏区：本帧上传实际改动的世界 voxel AABB（max 不含）----
-  // 全量上传 → ±1e9（等价于全部 cell 失效）；增量 → 改动 chunk 的合并包围盒。
+  // ---- 脏区：本帧上传的世界 voxel AABB（max 不含）----
   let (dirty_min, dirty_max, dirty_valid) = match dirty.as_ref() {
     Some(d) if d.full => (IVec3::splat(-1_000_000_000), IVec3::splat(1_000_000_000), 1.0f32),
     Some(d) if d.min_voxel != d.max_voxel => (d.min_voxel, d.max_voxel, 1.0f32),
     _ => (IVec3::ZERO, IVec3::ZERO, 0.0f32),
   };
 
-  // ---- 缓冲容量（槽数固定：4 LOD × 16³）----
+  // ---- 缓冲容量 ----
   let s = total as u64;
   ensure_storage_buffer(&device, &queue, &mut gpu.cell, "ddgi_cell", s * 4);
   ensure_storage_buffer(&device, &queue, &mut gpu.meta, "ddgi_meta", s * 4);
   ensure_storage_buffer(&device, &queue, &mut gpu.slot_pos, "ddgi_slot_pos", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.worklist, "ddgi_worklist", s * 16);
   ensure_storage_buffer(&device, &queue, &mut gpu.cell_id, "ddgi_cell_id", s * 16);
-  // `cell_slot`：使用计数前缀 + LOD0 的两张 chunk 表（见 `DdgiGpu::cell_slot` 注释）。
-  //   [0, total_slots)                        使用计数（着色侧 +1 / `ddgi_sort` 每帧 -1）
-  //   [total_slots, +num_chunks)              chunk_base（未分配 = DDGI_CHUNK_NO_BASE 哨兵）
-  //   [total_slots+num_chunks, +lod0_slots)   slot_chunk（LOD0 局部槽 → chunk 线性下标）
-  // 构建键（total / chunk 数 / LOD0 槽数 / 池 serial）变了才重建 —— 内容尺寸变化、或池发生了
-  // 「领段/归还」都要重铺。
+  // `cell_slot`：使用计数前缀 + LOD0 的两张 chunk 表（布局见 `DdgiGpu::cell_slot`）；
+  // 构建键（total / chunk 数 / LOD0 槽数 / 池 serial）变了才重建。
   let key = (total, num_chunks, lod0_slots, gpu.pool.serial);
   if gpu.cell_slot_key != Some(key) {
     let words = (total + num_chunks + lod0_slots) as usize;
     let mut buf: Vec<u8> = Vec::with_capacity(words * 4);
-    // 计数前缀必须归零（非零值会让工作集立刻退化回"全体活跃探针"，等于没优化）。
+    // 计数前缀必须归零。
     buf.resize(total as usize * 4, 0);
     for l in 0..num_chunks {
       let b = gpu.pool.bases[l as usize];
@@ -1360,7 +1221,7 @@ fn prepare_ddgi(
       dims: UVec4::new(d.x, d.y, d.z, gpu.grid.lod_slot_base[lod]),
     };
   }
-  // params: x=frame, y=debug mode, z=gain, w=保留通道，恒 0
+
   u.params = Vec4::new(gpu.frame as f32, dbg.mode, dbg.gain, 0.0);
   u.misc = Vec4::new(
     if stage.shade_gi() { 1.0 } else { 0.0 },
@@ -1372,12 +1233,15 @@ fn prepare_ddgi(
   );
   u.dirty_min = Vec4::new(dirty_min.x as f32, dirty_min.y as f32, dirty_min.z as f32, dirty_valid);
   u.dirty_max = Vec4::new(dirty_max.x as f32, dirty_max.y as f32, dirty_max.z as f32, 0.0);
-  // 性能档位（菜单开关）：x = 保留（恒 0，原"只测高权角"档已因黑斑/漏光移除），
-  // y = 半分辨率 GI（0/1）。半分辨率档只在真正会跑 GI 着色时生效（stage 未到 Full 或 DDGI
-  // 关掉时主 pass 不采样）。
-  u.flags = Vec4::new(0.0, if dbg.gi_half_res && stage.shade_gi() { 1.0 } else { 0.0 }, 0.0, 0.0);
-  // LOD0 的 chunk 段编址（只有 lod==0 读它）：原点/维度（chunk 单位）、每 chunk cell 数、
-  // 已分配槽数。WGSL 用 `misc.y`(=total_slots) + 这里的维度定位 cell_slot 尾部的两张表。
+  // x = 【诊断】跳过逐角几何求交（`GATE_NO_OCCL=1`）；
+  // y = 半分辨率 GI 仅在会跑 GI 着色时生效。
+  u.flags = Vec4::new(
+    if *OCCL_DISABLED { 1.0 } else { 0.0 },
+    if dbg.gi_half_res && stage.shade_gi() { 1.0 } else { 0.0 },
+    0.0,
+    0.0,
+  );
+  // LOD0 的 chunk 段编址（只有 lod==0 读它）；WGSL 用 `misc.y` + 这里的维度定位 cell_slot 尾部两张表。
   u.chunk = DdgiChunkUniform {
     origin: IVec4::new(
       chunk_geom.origin.x,
@@ -1398,8 +1262,7 @@ fn prepare_ddgi(
   );
 
   // ---- BG4（图集采样侧 + 各 pass 共用缓冲）----
-  // p = 采样侧：上一帧 collect 写入的那一半（cast 回读 + 着色采样都读它）。
-  // 写入侧 1-p 只给 collect（BG5）。
+  // `p` = 采样侧（上一帧 collect 写入的那一半）；写入侧 `1-p` 只给 collect（BG5）。
   use bevy::render::render_resource::BindGroupEntries;
   let p = gpu.parity & 1;
   let bg4_layout = pipeline_cache.get_bind_group_layout(&ddgi_bg4_layout());
@@ -1423,8 +1286,7 @@ fn prepare_ddgi(
   commands.insert_resource(DdgiBg4(bg4));
 
   // ---- BG5（collect 图集写入侧 + 半分辨率 GI 写入侧）----
-  // GI 的两个视图来自 `crate::brickmap::dda::AuxTexCache`（由 `prepare_dda_bind_groups` 建纹理，
-  // 系统顺序上排在 prepare_ddgi 之前）；未就绪时用 1×1 占位纹理占位（bind group 必须给全条目）。
+  // GI 视图来自 `crate::brickmap::dda::AuxTexCache`；未就绪时用 1×1 占位纹理（bind group 必须给全条目）。
   let bg5_layout = pipeline_cache.get_bind_group_layout(&ddgi_bg5_layout());
   let (gi_view, gi_cov_view) = match aux.as_ref().and_then(|a| a.gi_write_views()) {
     Some(v) => v,

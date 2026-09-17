@@ -1,8 +1,6 @@
-//! MagicaVoxel .vox 场景加载（vox-rs → VolumeGrid）：vox-rs 默认 ReadOptions 把场景图烘焙成
-//! flat instances（transform 已组合父级链），逐实例经 4×4 矩阵（90° 旋转 + 整数平移）写入主世界。
-//! 翻转轴补偿：映射系数为负的轴上 voxel 立方体实际区间是 [q−1, q]，须注册 min 角，否则实例沿该轴
-//! 偏移 +1 voxel、与邻接模块重叠。palette：vox 色号 1..=255 → gate palette 同号（0 = AIR），
-//! MATL 的 rough/emit 线性映射到 PaletteEntry.roughness/emissive。
+//! MagicaVoxel .vox 场景加载（vox-rs → VolumeGrid）：vox-rs 默认把场景图烘焙成 flat instances，
+//! 逐实例经 4×4 矩阵（90° 旋转 + 整数平移）写入主世界。翻转轴须注册 min 角。
+//! palette：vox 色号 1..=255 → gate palette 同号（0 = AIR），MATL 的 rough/emit 映射到 roughness/emissive。
 
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -24,9 +22,7 @@ pub struct VoxSceneInfo {
 }
 
 /// `assets/vox` 下可选的世界模型名（`.vox` 去扩展名，字典序；目录缺失/为空 → `vec!["nuke"]`）。
-///
-/// 供 DebugMenu 的「游戏/世界/模型」下拉框取选项：加一个 .vox 文件即多一个可选项，
-/// 不改代码。选项是**文件名字面量**，故必须与 [`load_vox_scene`] 的路径拼法一致。
+/// 供 DebugMenu 模型下拉取选项；选项是文件名字面量，必须与 `load_vox_scene` 的路径拼法一致。
 pub fn scan_vox_models() -> Vec<String> {
   let dir = gate_render::assets_dir().join("vox");
   let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -47,7 +43,7 @@ pub fn scan_vox_models() -> Vec<String> {
   names.sort();
   names.dedup();
   if names.is_empty() {
-    // 空目录（新克隆仓库，nuke.vox 被 gitignore 排除）→ 保留默认项，至少让 UI 有名字可选
+    // 空目录 → 保留默认项，让 UI 有名字可选
     bevy::log::warn!("vox 目录下没有 .vox 文件（{}），模型下拉回退到 nuke", dir.display());
     return vec!["nuke".to_string()];
   }
@@ -55,7 +51,6 @@ pub fn scan_vox_models() -> Vec<String> {
 }
 
 /// 读 .vox → palette 映射 → 体素写入 grid。
-///
 /// `anchor` = 场景 AABB 底面中心的落点（x/z 居中，y = 底面高度）。
 pub fn load_vox_scene(
   grid: &mut VolumeGrid,
@@ -75,7 +70,7 @@ pub fn load_vox_scene(
     t0.elapsed(),
   );
 
-  // ---- 首遍：实例 AABB（gate 坐标，xform 已含 Z-up→Y-up）----
+  // 首遍：实例 AABB（gate 坐标，xform 已含 Z-up→Y-up）
   let mut lo = IVec3::splat(i32::MAX);
   let mut hi = IVec3::splat(i32::MIN);
   let mut instances_used = 0usize;
@@ -95,7 +90,6 @@ pub fn load_vox_scene(
   // 重定基：AABB 底面中心 → anchor
   let offset = anchor - IVec3::new((lo.x + hi.x) / 2, lo.y, (lo.z + hi.z) / 2);
 
-  // ---- 次遍：并行分桶 → 并行建树 → 挂载 ----
   // 按 chunk 分桶后 rayon 并行建树（chunk 间零共享）。写入序确定：collect 保序 →
   // 文件序实例 → 实例内 x-major，故同 voxel 异色的 last-writer-wins 结果确定。
   let t1 = std::time::Instant::now();
@@ -109,9 +103,8 @@ pub fn load_vox_scene(
       Some(bucket_instance(inst, &scene.models, offset))
     })
     .collect();
-  // ---- 几何实际引用的色号集（u32 打包：palette 在高 8 位）----
-  // .vox 常声明满 255 个材质而几何只用一部分；未被引用的槽保持全零，留给编辑材质
-  // 按"条目全零"认领（见 gate-app/src/edit.rs）。
+  // 几何实际引用的色号集（u32 打包：palette 在高 8 位）；未引用的槽保持全零，
+  // 留给编辑材质按"条目全零"认领（见 gate-app/src/edit.rs）。
   let used_pal: [bool; 256] = per_instance
     .par_iter()
     .fold(
@@ -151,7 +144,7 @@ pub fn load_vox_scene(
       let mut tree = ChunkTree::empty();
       let mut applied = 0u64;
       for &p in &packed {
-        // 打包字高 8 位是 .vox 自身的色号（该格式就是 256 色调色板），转成材质索引
+        // 打包字高 8 位是 .vox 自身色号（256 色调色板），转成材质索引
         if tree.set_voxel(
           (p & 0xFF) as i32,
           ((p >> 8) & 0xFF) as i32,
@@ -184,10 +177,8 @@ pub fn load_vox_scene(
   })
 }
 
-/// vox RGBA + MATL → gate palette（色号 1..=255，0 = AIR 不映射）
-///
-/// 只铺几何真正引用的色号（`used_pal`），其余槽保持全零 —— 空槽即编辑材质的可用槽
-/// （`gate-app/src/edit.rs::material_slot` 按"条目全零"认领）。
+/// vox RGBA + MATL → gate palette（色号 1..=255，0 = AIR 不映射）。
+/// 只铺 `used_pal` 引用的色号，其余槽保持全零（编辑材质按"条目全零"认领）。
 fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[bool; 256]) {
   let pal = grid.palette_mut();
   let mut painted = 0usize;
@@ -204,7 +195,7 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
     pal.set(PaletteId(i as u16), e);
     painted += 1;
   }
-  // 材质统计（emissive 体素在直接光与 GI 射线端点都会高频贡献亮度）
+  // 材质统计
   let em: Vec<u16> = (1..=255u16).filter(|&i| pal.get(PaletteId(i)).emissive > 0).collect();
   bevy::log::info!(
     "VOX MATERIAL: {} emissive palette indices = {:?}（引用 {} 个色号，本 volume 余 {} 个空槽留给编辑材质）",
@@ -215,15 +206,8 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
   );
 }
 
-/// vox-rs Transform（与 ogt_vox 矩阵字段逐一同构）：平移在 m30..m32，行向量约定 p' = p·M，
-/// 即 wx = m00·x + m10·y + m20·z + m30（wy/wz 同理）。
-///
-/// pivot 约定（ogt_vox "EXPLANATION OF MODEL PIVOTS"）：模型中心 pivot = floor(size/2)（整数格点），
-/// nTRN 平移 t 是 pivot 的世界坐标，world = R·(local − pivot) + t —— 切勿把 pivot 加回去。
-/// 父级 group 链已由 vox-rs 默认 ReadOptions flatten 烘焙进 transform。
-///
-/// 坐标系适配：vox (X 右, Y 远, Z 上) → gate (X 右, Y 上, Z 近)，须取反 gate Z = −vox Y 保持手性；
-/// R 元素 ∈ {0, ±1}、t 与 pivot 为整数 → 纯整数运算无舍入误差。
+/// vox-rs Transform（与 ogt_vox 矩阵逐一同构）：行向量约定 p' = p·M，平移在 m30..m32。
+/// pivot = floor(size/2)，world = R·(local − pivot) + t（勿加回 pivot）；坐标映射取 gate Z = −vox Y。
 #[inline]
 fn xform(
   t: &vox_rs::Transform,
@@ -244,8 +228,8 @@ fn xform(
   (wx, wz, -wy)
 }
 
-/// 翻转轴补偿（vox 轴系）：映射系数 m_ij 为 −1 时，voxel 立方体 [p, p+1) 变换后落在 [q−1, q]，
-/// 注册格点须取 min 角 q−1（系数非负则取 max 角，即点变换本身）。逐实例常量，identity 全 0。
+/// 翻转轴补偿（vox 轴系）：映射系数为 −1 时 voxel [p, p+1) 变换后落在 [q−1, q]，须注册 min 角；
+/// 系数非负则取 max 角。逐实例常量，identity 全 0。
 #[inline]
 fn instance_flip(t: &vox_rs::Transform) -> IVec3 {
   IVec3::new(
@@ -256,8 +240,7 @@ fn instance_flip(t: &vox_rs::Transform) -> IVec3 {
 }
 
 /// 模型盒 8 角（格点 0 与 size）经变换后的整数 AABB。
-/// pivot = floor(size/2) 时模型体素恰好覆盖 [−pivot, size−pivot]，
-/// 故角点取 0/size 即模型几何边界（90° 旋转 + 整数平移，无误差）。
+/// pivot = floor(size/2) 时体素覆盖 [−pivot, size−pivot]，角点取 0/size 即几何边界。
 fn transformed_aabb(t: &vox_rs::Transform, sx: u32, sy: u32, sz: u32) -> (IVec3, IVec3) {
   let mut lo = IVec3::splat(i32::MAX);
   let mut hi = IVec3::splat(i32::MIN);
@@ -273,11 +256,8 @@ fn transformed_aabb(t: &vox_rs::Transform, sx: u32, sy: u32, sz: u32) -> (IVec3,
   (lo, hi)
 }
 
-/// 单实例体素分桶：chunk → u32 打包（chunk 内 local 0..255 各 8 bit + 高 8 位 .vox 色号）。
-/// 注意高 8 位是 **.vox 自身的色号**（该格式就是 256 色调色板），不是本引擎的 16 位材质索引；
-/// 建树时按 `PaletteId(色号)` 直接落在同名槽上。
-/// 并行建树的数据面，chunk 间零共享；x-major 行切片迭代 + last-chunk 缓存，
-/// 连续体素几乎都落同一 chunk，HashMap 只在跨 chunk 时触碰。
+/// 单实例体素分桶：chunk → u32 打包（local 各 8 bit + 高 8 位 .vox 色号）；高 8 位是 .vox
+/// 自身色号（256 色调色板），建树时按 `PaletteId(色号)` 落同名槽。chunk 间零共享。
 fn bucket_instance(
   inst: &vox_rs::Instance,
   models: &[vox_rs::Model],
@@ -286,7 +266,7 @@ fn bucket_instance(
   bucket_model(&models[inst.model_index], &inst.transform, instance_flip(&inst.transform), offset)
 }
 
-/// 单模型体素分桶核心（测试复用）：`flip` 为 vox 轴系翻转补偿（见 `instance_flip`），
+/// 单模型体素分桶核心（测试复用）：`flip` = vox 轴系翻转补偿（见 `instance_flip`），
 /// 非零轴注册 min 角；传 ZERO 即不补偿。
 fn bucket_model(
   m: &vox_rs::Model,

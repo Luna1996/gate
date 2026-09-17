@@ -1,13 +1,6 @@
 //! text_input：单行文本输入框（纯文本模式 / 数字模式）。
-//!
-//! - **纯文本模式**：点击进入编辑态，键盘输入字符、Backspace/Delete 删除、左右键移光标，
-//!   Enter/Escape/失焦提交。编辑态由 [`TextInputFocus`] 资源对外广播（3D 场景输入据此屏蔽键盘）。
-//! - **数字模式**：在框内按住左键水平拖拽直接调值（每 [`NUMBER_DRAG_PX_PER_STEP`] 逻辑 px 一个
-//!   step，超过 [`DRAG_THRESHOLD_PX`] 才算拖拽）；同样可点击进入编辑态手输，提交时按
-//!   `min/max/step/decimals` 归一。
-//!
-//! 真源 = [`TextInputValue`] 组件（显示文本）；事件 [`TextInputChanged`] 只在**提交**（回车/失焦）
-//! 或**拖拽调值**时发出，避免打字中途把半成品值推给调用方。
+//! 纯文本：点击进编辑态（字符输入 / Backspace·Delete / 左右键移光标，Enter·Escape·失焦提交），编辑态由 `TextInputFocus` 广播。
+//! 数字：按住左键水平拖拽调值（`DRAG_THRESHOLD_PX` 起判），提交按 `min/max/step/decimals` 归一；真源 `TextInputValue`。
 
 use std::ops::Deref;
 
@@ -139,9 +132,7 @@ pub struct TextInputChanged {
   pub text: String,
 }
 
-/// 当前处于编辑态的输入框（None = 无）。
-///
-/// 3D 场景的键盘输入（飞行/档位切换）必须检查本资源：否则打字会同时驱动相机。
+/// 当前处于编辑态的输入框（None = 无）；3D 场景键盘输入须检查本资源。
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextInputFocus(pub Option<Entity>);
 

@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-# 纯逻辑，零渲染依赖；glam 是 workspace 依赖链既有成员
+# 纯逻辑，零渲染依赖
 glam = { workspace = true }
-# chunk 级并行（compact_all / 批量导入）；bevy 已传递引入，非新增编译
+# chunk 级并行（compact_all / 批量导入）
 rayon = { workspace = true }

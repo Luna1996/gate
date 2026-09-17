@@ -1,14 +1,6 @@
 //! 基础 widget 层：retained spawn API（token 驱动），三件套统一约定。
-//!
-//! 1. **`XxxConfig`**：全部参数进 Config（含必填如 text），`..default()` 补齐可选字段；
-//!    布局字段（宽高/边距）不进 Config——调用方拿到 Handle 后自行改 `Node`。
-//! 2. **`XxxHandle`**：spawn 返回类型，Deref 到根实体 `Entity`；多实体 widget 用具名字段
-//!    （`ScrollViewHandle { entity, content }`）。
-//! 3. **事件**：仅交互型 widget（button/slider/checkbox/tab_view）发事件，展示型不发；组件永远
-//!    是真源，事件只是通知。命名：动作用名词（`UiClick`）、变化用 -ed（`SliderValueChanged`）。
-//!
-//! 豁免：`splitter` 无配置项，不设 Config；`row`/`column`/`spacer` 等布局容器直接用原生 `Node`。
-//! 响应式布局：容器级尺寸/边距优先 `Val::Percent` / `Val::Vw/Vh`，控件本体允许固定像素。
+//! `XxxConfig` 收全部参数（布局字段除外，调用方拿 Handle 后自行改 `Node`）；`XxxHandle` Deref 到根实体 `Entity`。
+//! 仅交互型 widget 发名词/-ed 事件（组件为真源）；`splitter` 无 Config；容器尺寸优先 `Val::Percent`/`Val::Vw/Vh`。
 
 pub mod button;
 pub mod checkbox;
@@ -84,20 +76,15 @@ use bevy::ui::widget::Label;
 
 use crate::theme::{HexColor, UiTheme};
 
-/// Disabled 态标记组件。挂在 widget 根节点上表示该控件不可交互、视觉暗一档。
-///
-/// 各 widget 状态机统一约定：检测到 `UiDisabled` 时跳过交互逻辑（不发事件、
-/// 不翻转状态），并把当前配色经 [`dim_color`] 降亮后输出。
+/// Disabled 态标记组件（挂在 widget 根节点）。状态机检测到它时跳过交互逻辑（不发事件、不翻转状态），
+/// 并把配色经 `dim_color` 降亮。
 #[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UiDisabled;
 
-/// Disabled 态降亮系数：RGB 通道乘以此值，保持 alpha。
-/// 0.55 给出清晰的"灰化"观感，与主题 5 层表面的亮度差相当（约暗一档）。
+/// Disabled 态降亮系数：RGB 通道乘以此值，alpha 不变。
 const DISABLED_DIM: f32 = 0.55;
 
-/// 将颜色暗一档（disabled 态通用）：线性空间下 RGB 乘 [`DISABLED_DIM`]，alpha 不变。
-///
-/// 用线性空间而非 sRGB 直接相乘，保证感知亮度均匀下降（sRGB 直接乘会偏暗）。
+/// 将颜色暗一档（disabled 态通用）：线性空间下 RGB 乘 `DISABLED_DIM`，alpha 不变。
 pub fn dim_color(color: Color) -> Color {
   let lin = color.to_linear();
   let mut v = lin.to_vec4();
@@ -111,7 +98,7 @@ pub fn dim_color(color: Color) -> Color {
 pub struct UiCtx<'a> {
   pub theme: &'a UiTheme,
   pub font: Option<&'a Handle<Font>>,
-  /// 图标字体（FontAwesome Free Solid）；None → 图标回退 [`Self::font`]
+  /// 图标字体（FontAwesome Free Solid）；None → 图标回退 `Self::font`
   pub icon_font: Option<&'a Handle<Font>>,
   /// 文案解析器（key → 当前语言文案）；None → key 原样当文案
   pub translate: Option<crate::i18n::TranslatorFn>,
@@ -128,8 +115,7 @@ impl<'a> UiCtx<'a> {
     self
   }
 
-  /// 补上文案解析器（取 [`UiTranslator::handle`](crate::i18n::UiTranslator::handle)）；
-  /// 控件文案字段写 key 时经 [`Self::text`] 解析
+  /// 补上文案解析器（取 `crate::i18n::UiTranslator::handle`）；控件文案字段写 key 时经 `Self::text` 解析
   pub fn with_translate(mut self, translate: Option<crate::i18n::TranslatorFn>) -> Self {
     self.translate = translate;
     self
@@ -143,9 +129,8 @@ impl<'a> UiCtx<'a> {
     }
   }
 
-  /// TextFont.font 来源：显式 ThemeFont → 自定义字体（含 CJK 的 TTF）；否则 →
-  /// `FontSource::default()`（= `AssetId::<Font>::default()` slot，由 GateUiPlugin 在
-  /// 主题字体加载后覆盖，否则命中 Bevy 内置 FiraMono）。所有 gate-ui 文本统一走主题字体。
+  /// TextFont.font 来源：显式 ThemeFont → 自定义字体；否则 `FontSource::default()`（`AssetId::<Font>::default()`
+  /// slot，GateUiPlugin 加载主题字体后覆盖）。所有 gate-ui 文本统一走主题字体。
   pub fn font_source(&self) -> FontSource {
     match self.font {
       Some(h) => FontSource::from(h),
@@ -180,10 +165,7 @@ pub(crate) fn label_bundle(ctx: &UiCtx, text: String, size: f32, color: Color) -
   label_bundle_attrs(ctx, text, size, color, label::FontAttrs::default())
 }
 
-/// 标签 bundle（逐属性覆盖版：`attrs` 里为 None 的项保持 `TextFont` 默认值）
-///
-/// `attrs` 按值传入：`impl Bundle` 返回值会捕获签名里的全部生命周期，
-/// 传引用会让「返回的 bundle」被迫和借用同寿（调用方传临时值时编译不过）。
+/// 标签 bundle（逐属性覆盖版：`attrs` 里 None 的项保持 `TextFont` 默认值）。`attrs` 须按值传入。
 pub(crate) fn label_bundle_attrs(
   ctx: &UiCtx,
   text: String,

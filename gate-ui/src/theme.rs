@@ -1,6 +1,5 @@
 //! 主题令牌：`UiTheme` RON 数据资产 + 内置暗色默认 + 加载/回退接线。
-//!
-//! 改 RON 换肤，不改代码；加载失败/缺失 → 内置暗色默认 + `warn!`（不 panic，不静默）。
+//! 改 RON 换肤不改代码；加载失败/缺失 → 内置暗色默认 + `warn!`（不 panic，不静默）。
 
 use bevy::app::{Plugin, PreStartup, Update};
 use bevy::asset::io::Reader;
@@ -17,8 +16,6 @@ use serde::Deserialize;
 pub const THEME_ASSET_PATH: &str = "ui/theme.ron";
 /// auto_fit 基准高度：窗口高 720 时 UiScale == ui_scale
 pub const AUTOFIT_BASE_HEIGHT: f32 = 720.0;
-
-// ---------- 颜色令牌 ----------
 
 /// 十六进制颜色："RRGGBB"（alpha=FF）或 "RRGGBBAA"
 #[derive(Clone, Debug, PartialEq)]
@@ -43,7 +40,7 @@ pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
 }
 
 impl HexColor {
-  /// 转 bevy Color（sRGB）；非法 hex → None（仅运行时构造的 HexColor 可能非法）
+  /// 转 bevy Color（sRGB）；非法 hex → None（仅运行时构造的可能非法）
   pub fn to_color(&self) -> Option<Color> {
     parse_hex_color(&self.0).map(|[r, g, b, a]| Color::srgba_u8(r, g, b, a))
   }
@@ -63,10 +60,7 @@ impl<'de> Deserialize<'de> for HexColor {
   }
 }
 
-// ---------- 主题结构 ----------
-
-/// 颜色组（docs/ui-dark-theme.md §2）。全部带 alpha。
-///
+/// 颜色组；全部带 alpha。
 /// 暗色令牌：5 层表面（亮度即海拔）+ HUD 变体 + 3 档边框 + 4 档文字 + 全灰度强调/语义色。
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -91,16 +85,16 @@ pub struct ThemeColors {
   pub text_muted: HexColor,
   /// 仅限 ≥18px 大号弱化标签
   pub text_faint: HexColor,
-  // ---- 强调色（全灰度：主操作靠亮度差区分，无任何彩色）----
-  /// 主按钮填充（最亮表面，靠亮度突出主操作）
+  // ---- 强调色（全灰度，靠亮度差区分）----
+  /// 主按钮填充（最亮表面）
   pub accent_fill: HexColor,
   /// 主按钮 hover 填充（提亮一档）
   pub accent_fill_hover: HexColor,
   /// 主按钮按压填充（压暗）
   pub accent_fill_pressed: HexColor,
-  /// 强调文字/图标/折线（主文本色，最高对比）
+  /// 强调文字/图标/折线（最高对比）
   pub accent_text: HexColor,
-  // ---- 语义色（全灰度：仅靠亮度差区分，无彩色）----
+  // ---- 语义色（全灰度，靠亮度差区分）----
   /// success 文字 = 正文灰
   pub success: HexColor,
   /// success 填充 = 抬升表面
@@ -111,7 +105,7 @@ pub struct ThemeColors {
   pub warning_fill: HexColor,
   /// danger 文字 = 主文本色
   pub danger: HexColor,
-  /// danger 填充 = 强边框灰（最深灰表示危险态）
+  /// danger 填充 = 强边框灰（最深灰）
   pub danger_fill: HexColor,
 }
 
@@ -123,7 +117,7 @@ impl Default for ThemeColors {
       surface_elevated: HexColor("1A1A20".into()),
       surface_overlay: HexColor("222228".into()),
       surface_top: HexColor("2A2A31".into()),
-      // HUD 面板不透明（与卡片同色，靠边框与场景分隔）
+      // HUD 面板不透明，与卡片同色
       surface_card_hud: HexColor("131316".into()),
       scrim: HexColor("09090B".into()),
       border_subtle: HexColor("232329".into()),
@@ -133,12 +127,10 @@ impl Default for ThemeColors {
       text_body: HexColor("D4D4D8".into()),
       text_muted: HexColor("A1A1AA".into()),
       text_faint: HexColor("71717A".into()),
-      // 强调全灰度：主操作靠最亮表面突出
       accent_fill: HexColor("2A2A31".into()),
       accent_fill_hover: HexColor("3F3F46".into()),
       accent_fill_pressed: HexColor("1A1A20".into()),
       accent_text: HexColor("FAFAFA".into()),
-      // 语义全灰度
       success: HexColor("D4D4D8".into()),
       success_fill: HexColor("1A1A20".into()),
       warning: HexColor("A1A1AA".into()),
@@ -149,11 +141,11 @@ impl Default for ThemeColors {
   }
 }
 
-/// 度量组（docs/ui-dark-theme.md §3）
+/// 度量组
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeMetrics {
-  /// 容器圆角：面板、按钮、弹窗（rounded-lg）
+  /// 容器圆角：面板、按钮、弹窗
   pub corner_radius: f32,
   /// 小控件圆角：checkbox、slider thumb、标签 chip
   pub corner_radius_sm: f32,
@@ -165,7 +157,6 @@ pub struct ThemeMetrics {
 impl Default for ThemeMetrics {
   fn default() -> Self {
     Self {
-      // 无圆角：硬边界面，靠 1px 边框与亮度差分层级
       corner_radius: 0.0,
       corner_radius_sm: 0.0,
       border_width: 1.0,
@@ -206,9 +197,8 @@ impl Default for FontSize {
   }
 }
 
-/// 主题令牌资产（RON）。字段缺失回退内置默认；整份解析失败整体回退。
-///
-/// 运行时应用后以 Resource 形式存在（`Res<UiTheme>`），同时是 Asset 供 AssetServer 管理。
+/// 主题令牌资产（RON）；字段缺失回退内置默认，整份解析失败整体回退。
+/// 运行时以 Resource 形式存在（`Res<UiTheme>`），同时是 Asset 供 AssetServer 管理。
 #[derive(Asset, Resource, TypePath, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct UiTheme {
@@ -237,7 +227,7 @@ impl Default for UiTheme {
   }
 }
 
-/// 内置暗色默认主题（Modern UI 参照）
+/// 内置暗色默认主题
 pub fn default_theme() -> UiTheme {
   UiTheme::default()
 }
@@ -247,8 +237,7 @@ pub fn parse_theme_ron(src: &str) -> Result<UiTheme, ron::error::SpannedError> {
   ron::de::from_str(src)
 }
 
-/// UiScale 推导：auto_fit 时按窗口高度缩放。
-/// 窗口高上限钳 4096（平台可能上报退化矩形），缩放系数再钳 [0.25, 4.0] 防极端。
+/// UiScale 推导：auto_fit 时按窗口高度缩放；窗口高钳 4096，缩放系数钳 [0.25, 4.0] 防极端。
 pub fn autofit_ui_scale(ui_scale: f32, auto_fit: bool, window_height: f32) -> f32 {
   if auto_fit {
     let h = window_height.min(4096.0);
@@ -257,8 +246,6 @@ pub fn autofit_ui_scale(ui_scale: f32, auto_fit: bool, window_height: f32) -> f3
     ui_scale
   }
 }
-
-// ---------- RON 资产加载器（bevy 0.19 无内置 RonAssetPlugin，自写） ----------
 
 /// RON 加载错误（IO 读取 + RON 解析）
 #[derive(Debug)]
@@ -322,8 +309,6 @@ impl AssetLoader for RonThemeLoader {
   }
 }
 
-// ---------- Bevy 接线 ----------
-
 /// 主题资产句柄（PreStartup 请求加载后插入）
 #[derive(Resource)]
 pub struct UiThemeHandle(pub Handle<UiTheme>);
@@ -354,7 +339,7 @@ fn ui_theme_resolve(
     return;
   };
   let hid = handle.0.id();
-  // 成功路径：LoadedWithDependencies → 插入运行时主题
+  // 成功：LoadedWithDependencies → 插入运行时主题
   for ev in evr.read() {
     if let AssetEvent::LoadedWithDependencies { id } = ev
       && id == &hid
@@ -366,7 +351,7 @@ fn ui_theme_resolve(
       info!("ui theme loaded from {THEME_ASSET_PATH}");
     }
   }
-  // 失败路径：load_state Failed（文件缺失 / RON 解析失败 / hex 非法都汇于此）
+  // 失败：load_state Failed（文件缺失 / RON 解析失败 / hex 非法）
   if !state.applied
     && !state.fell_back
     && let LoadState::Failed(err) = server.load_state(hid)
@@ -420,11 +405,8 @@ fn ui_theme_font_load(
   info!("ui theme font loading: {path}");
 }
 
-/// 主题字体资产加载成功后，clone 到 `AssetId::<Font>::default()` 的 storage slot。
-///
-/// 使所有不显式指定字体的文本（`FontSource::default()` / `TextFont::default()` /
-/// `FontSource::Handle(Handle::default())`）都用主题字体，而非 Bevy 内置 FiraMono-subset
-/// （该字体不含 CJK 字形 → 中文方框）。只执行一次；headless 无 AssetServer 时跳过。
+/// 主题字体加载成功后 clone 到 `AssetId::<Font>::default()` slot，使隐式字体的文本都用主题字体。
+/// Bevy 内置 FiraMono 不含 CJK（中文方框）。只执行一次；headless 无 AssetServer 时跳过。
 fn ui_theme_font_install_default(
   server: Option<Res<AssetServer>>,
   font: Res<ThemeFont>,
@@ -490,7 +472,6 @@ impl Plugin for GateUiPlugin {
       .add_systems(
         Update,
         (
-          // 主题/字体/缩放接线
           (
             ui_theme_resolve,
             ui_theme_font_load,
@@ -499,7 +480,6 @@ impl Plugin for GateUiPlugin {
             crate::icon::icon_font_report.after(crate::icon::icon_font_load),
             ui_scale_autofit,
           ),
-          // 各 widget 状态机
           (
             crate::widgets::button_state_system,
             crate::widgets::checkbox_state_system,
@@ -510,10 +490,9 @@ impl Plugin for GateUiPlugin {
             crate::widgets::plot_redraw_system,
             crate::widgets::scroll_view_system,
             crate::widgets::tab_view_system,
-            // 下拉框：交互（开/选/关）在前，视觉（跟随锚点 + 展开动画）在后
+            // 下拉框：交互（开/选/关）在前，视觉（跟随锚点+展开）在后
             (crate::widgets::dropdown_system, crate::widgets::dropdown_visual_system).chain(),
           ),
-          // 文本相关（省略号/输入框）+ 悬浮提示
           (
             crate::widgets::label_ellipsis_system,
             crate::widgets::text_input_pointer_system,
@@ -521,7 +500,6 @@ impl Plugin for GateUiPlugin {
             crate::widgets::text_input_visual_system,
             crate::widgets::tooltip_system,
           ),
-          // 语言切换后重解析 keyed 文本 + 输入门控 + 菜单容器/分页动画
           (
             crate::i18n::i18n_refresh_system,
             crate::capture::ui_pointer_capture_system,

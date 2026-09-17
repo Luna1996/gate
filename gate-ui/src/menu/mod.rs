@@ -1,12 +1,6 @@
 //! 通用 Menu 模块：DebugWindow 容器 + 可序列化菜单模型 + 9 种列表单项。
-//!
-//! 分两层用法：
-//! 1. 本模块（gate-ui 级通用）：容器、通用组件、模型/TOML、交互驱动（[`menu_system`]）；
-//! 2. 业务侧（如 gate-app）：给出 [`MenuFile`] 初始值（TOML 加载或代码构造），
-//!    spawn 后用 [`menu_model`] 读回状态、用 [`MenuActionEvent`] 挂回调。
-//!
-//! 回调接口：所有交互汇总成 [`MenuActionEvent`]（`path` = 节点 id 路径 + [`MenuAction`]），
-//! 调用方一个观察者按 path 分派即可——UI 重建不需要重挂回调。
+//! 用法：业务侧给 `MenuFile` 初始值并 spawn，用 `menu_model` 读回状态、`MenuActionEvent` 挂回调；交互驱动为 `menu_system`。
+//! 所有交互汇总成一个 `MenuActionEvent`（`path` = 节点 id 路径 + `MenuAction`），调用方按 path 分派，UI 重建无需重挂回调。
 
 pub mod consts;
 pub mod items;

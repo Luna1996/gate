@@ -1,12 +1,6 @@
-//! tooltip：任意控件可挂的悬浮提示（鼠标停留超过延时后显示）。
-//!
-//! 用法：`world.entity_mut(*handle).insert(Tooltip::new("文案"))` —— 不改变控件自身结构。
-//! 命中判定二选一：控件带 `Interaction` 时用其状态（沿用 bevy_ui 的 Block 链，被上层控件
-//! 遮住时为 `None`）；否则用 `ComputedNode::contains_point` 直接命中测试（label/panel 等
-//! 无 Interaction 的节点也可挂）。
-//!
-//! 提示框是全局唯一实体（首次需要时懒创建），脱离布局——绝对定位：位置在**首次展示时钉住**，
-//! 鼠标继续在同一个锚点控件内移动时不跟随（换锚点或离开后重新悬浮才重新取点）。
+//! tooltip：任意控件可挂的悬浮提示（停留超时后显示）。用法：`entity_mut(*handle).insert(Tooltip::new("文案"))`。
+//! 命中判定：控件带 `Interaction` 用其状态（被上层遮挡时为 `None`），否则用 `ComputedNode::contains_point`。
+//! 提示框全局唯一（懒创建）、绝对定位，位置在首次展示时钉住（同锚点内移动不跟随）。
 
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, FocusPolicy, Interaction, UiGlobalTransform};
@@ -55,13 +49,12 @@ pub struct TooltipLayerEntity(pub Option<Entity>);
 pub struct TooltipHoverState {
   entity: Option<Entity>,
   elapsed: f32,
-  /// 已钉住的展示锚点与位置（逻辑 px，**未做边界收束**）：
-  /// 同一锚点内移动鼠标不改位置；换锚点 / 离开后重新悬浮才重新取点
+  /// 已钉住的展示锚点与位置（逻辑 px，未做边界收束）；同锚点内移动不改位置，换锚点才重新取点
   pin: Option<(Entity, Vec2)>,
 }
 
 /// 悬浮判定 + 延时展示。每帧最多展示一个提示（命中节点中面积最小者 = 纵深最内层）。
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub fn tooltip_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -84,7 +77,6 @@ pub fn tooltip_system(
   let Ok(window) = windows.single() else { return };
   let physical = window.physical_cursor_position();
 
-  // ---- 命中判定：面积最小的命中节点即最内层 ----
   let mut best: Option<(Entity, &Tooltip)> = None;
   let mut best_area = f32::MAX;
   if let Some(cursor) = physical {
@@ -125,18 +117,16 @@ pub fn tooltip_system(
     return;
   }
   let text = tip.text.clone();
-  // 首次需要时创建提示框实体（本帧查不到，下一帧起可写入文本与位置）
+  // 首次需要时创建（本帧查不到，下一帧起可写文本与位置）
   ensure_layer(&mut commands, &mut layer_res, &theme);
   if let Ok(mut t) = text_q.single_mut()
     && t.0 != text
   {
     t.0 = text;
   }
-  // 逻辑坐标（Node.left/top 为逻辑 px）：光标物理 → 逻辑
+  // 光标物理坐标 → 逻辑（Node.left/top 为逻辑 px）
   let sf = window.scale_factor().max(f32::EPSILON);
   let cursor = physical.unwrap_or_default() / sf;
-  // 展示位置钉在**首次展示**时的「光标 + 偏移」上：同一个锚点控件内继续移动鼠标时提示框不动，
-  // 只有换锚点（或离开后重新悬浮）才重新取点
   let anchor = match state.pin {
     Some((pinned, p)) if pinned == e => p,
     _ => {
@@ -148,8 +138,7 @@ pub fn tooltip_system(
   let (w, h) = (window.width(), window.height());
   let size =
     layer_q.single_mut().ok().and_then(|(_, c)| c.map(|n| n.size() / sf)).unwrap_or_default();
-  // 边界收束每帧都做：钉住的是**未收束**的锚点，而提示框尺寸要等它布局一帧才量得到，
-  // 所以贴右/下边的收束是在后续帧逐步收敛的（不能把收束后的值写回 pin，否则会越收越偏）
+  // 边界收束每帧都做：钉住的是未收束锚点，提示框尺寸要等布局一帧才量得到（勿把收束值写回 pin）
   let max_x = (w - size.x - TOOLTIP_MARGIN).max(TOOLTIP_MARGIN);
   let max_y = (h - size.y - TOOLTIP_MARGIN).max(TOOLTIP_MARGIN);
   if let Ok((mut node, _)) = layer_q.single_mut() {

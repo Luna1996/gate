@@ -1,32 +1,32 @@
-// gate-ui 主题令牌 —— 暗色设计规格（docs/ui-dark-theme.md）
-// 颜色格式："RRGGBB"（alpha=FF）或 "RRGGBBAA"；字段缺失回退内置默认
-// 全灰度：无任何彩色，强调/语义色均靠亮度差区分。彩色由调用方手动传入。
+// gate-ui 主题令牌（暗色设计规格见 docs/ui-dark-theme.md）
+// 颜色格式 "RRGGBB"（alpha=FF）或 "RRGGBBAA"；字段缺失回退内置默认
+// 全灰度：强调/语义色仅靠亮度差区分，彩色由调用方手动传入
 (
   colors: (
-    // 表面 5 层（亮度即海拔，每层亮约 3-4%，1px 边框分隔，永不用纯黑）
+    // 表面 5 层，亮度即海拔
     surface_base:      "09090B",
     surface_card:      "131316",
     surface_elevated:  "1A1A20",
     surface_overlay:   "222228",
     surface_top:       "2A2A31",
-    // HUD 面板不透明（与卡片同色，靠边框与场景分隔）
+    // 与卡片同色的不透明 HUD 面板
     surface_card_hud:  "131316",
     scrim:             "09090B",
     // 边框 3 档
     border_subtle:     "232329",
     border:            "2A2A31",
     border_strong:     "3F3F46",
-    // 文字 4 档（禁纯白；text_faint 仅限 ≥18px 大号标签）
+    // 文字 4 档；text_faint 仅限 ≥18px
     text_primary:      "FAFAFA",
     text_body:         "D4D4D8",
     text_muted:        "A1A1AA",
     text_faint:        "71717A",
-    // 强调色（全灰度：主操作靠最亮表面突出）
+    // 强调色
     accent_fill:         "2A2A31",
     accent_fill_hover:   "3F3F46",
     accent_fill_pressed: "1A1A20",
     accent_text:         "FAFAFA",
-    // 语义色（全灰度：仅靠亮度差区分）
+    // 语义色
     success:           "D4D4D8",
     success_fill:      "1A1A20",
     warning:           "A1A1AA",
@@ -35,7 +35,7 @@
     danger_fill:       "3F3F46",
   ),
   metrics: (
-    // 无圆角：硬边界面，靠 1px 边框与亮度差分层级
+    // 无圆角，靠 1px 边框与亮度差分层级
     corner_radius: 0.0,
     corner_radius_sm: 0.0,
     border_width: 1.0,
@@ -45,6 +45,6 @@
   ui_scale: 1.0,
   auto_fit_ui_scale: false,
   font_path: Some("fonts/MapleMono-NF-CN-Regular.ttf"),
-  // FontAwesome Free Solid（FA 5.15.4），码点常量来自 font-awesome crate
+  // FontAwesome Free Solid 5.15.4，码点常量来自 font-awesome crate
   icon_font_path: Some("fonts/fa-solid-900.ttf"),
 )

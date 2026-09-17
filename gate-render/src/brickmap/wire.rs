@@ -1,35 +1,17 @@
-//! Brick Tree wire 格式：常量、编码函数、全局参数。本模块是 CPU 构建器（builder.rs）与 GPU
-//! shader 之间的字节契约，纯数据变换、零渲染依赖。
-//!
-//! b_struct：`[0 .. CHUNK_INDEX_WORDS)` 为稠密 chunk 窗口（CHUNK_INDEX_CAP³），
-//! entry = chunk DFS 树绝对字基址 + 1（0 = 无此 chunk）；其后为各 chunk 的 DFS 序列化树，
-//! 节点 = [mask_lo, mask_hi, palette_u32] + popcount(mask) 个 child offset（chunk 内相对字址）。
-//! mask bit=1 → 子块被分裂（child offset 有效）；bit=0 → uniform 子块，颜色 = 该节点
-//! palette_u32（零额外 load），palette=0 = AIR。
-//!
-//! level 3 叶父层例外：inline [`LEAF_INLINE_WORDS`] word，[`LEAF_VOXELS_PER_WORD`] 体素/word，
-//! 读端按 child_idx 低 1 位选 16 位半字。
-//! b_leaves 存放方向可达掩码 LUT（Douglas #18 Bitwise Masking），见 [`march_mask_lut_words`]。
-//!
-//! **材质索引位宽**（[`PALETTE_BITS`] = 16）是这份契约的一等参数：节点头的 palette 半字与
-//! 叶层 inline 的每个半字同宽。改位宽必须同步 shader 的掩码/位移 —— shader 侧按字面量写
-//! （`& 0xFFFFu`、`>> 1u`、`* 16u`），故本文件的常数是唯一权威，见各文件内的同步注释。
+//! Brick Tree wire 格式：常量、编码函数、全局参数；CPU 构建器与 GPU shader 之间的字节契约。
+//! b_struct = Region ① 稠密 chunk 窗口 + Region ② 各 chunk 的 DFS 树；`PALETTE_BITS`=16 同宽约束两侧一致。
 
 use gate_voxel::{PALETTE_BITS, PALETTE_ENTRY_COUNT, PaletteEntry};
 use glam::{IVec3, Mat3, Vec3, Vec4};
 
-// ============ 层级常量（与 gate-voxel coords.rs 一致）============
-
 /// chunk 边长（voxel 单位）：256³
 pub const CHUNK_SIZE: i32 = 256;
-/// 分裂因子（4³ = 64 子块）
+/// 分裂因子（每轴 4，共 64 子块）
 pub const BRICK_FACTOR: i32 = 4;
 /// 最大分裂深度：256 → 64 → 16 → 4 → 1
 pub const MAX_LEVEL: u32 = 4;
 /// 每 chunk 64 子块的节点 fixed 字数（mask_lo + mask_hi + palette）
 pub const NODE_FIXED_WORDS: usize = 3;
-
-// ============ b_struct Region ①：稠密 chunk 窗口 ============
 
 /// 稠密 chunk 窗口每轴上限（64 chunk × 256 = 16384 voxel 覆盖半径）
 pub const CHUNK_INDEX_CAP: usize = 64;
@@ -38,21 +20,19 @@ pub const CHUNK_INDEX_WORDS: usize = CHUNK_INDEX_CAP * CHUNK_INDEX_CAP * CHUNK_I
 /// Region ②（chunk 树区）起始字偏移
 pub const TREE_BASE: usize = CHUNK_INDEX_WORDS;
 
-// ============ palette / comp / state ============
-
 /// 调色板字数（2^16 条 × 2 u32 = 512KB/volume）
 pub const PALETTE_WORDS: usize = PALETTE_ENTRY_COUNT * 2;
-/// 叶父层每 u32 字装的体素数（= 32 位 / 材质索引位宽 = 2）
+/// 叶父层每 u32 字装的体素数（= 2）
 pub const LEAF_VOXELS_PER_WORD: usize = gate_voxel::LEAF_VOXELS_PER_WORD;
-/// 叶父层（level 3，4³ = 64 体素）inline 字数 = 64 / [`LEAF_VOXELS_PER_WORD`] = 32
+/// 叶父层（level 3，64 体素）inline 字数 = 32
 pub const LEAF_INLINE_WORDS: usize = gate_voxel::LEAF_INLINE_WORDS;
-/// 每槽字节数（[`pack_palette_entry`] 输出 2 个 u32）—— 脏槽上传的偏移换算用
+/// 每槽字节数（8B；[`pack_palette_entry`] 输出 2 个 u32）
 pub const PALETTE_BYTES_PER_ENTRY: usize = 8;
 
-// 位宽一致性（编译期）：叶层每字体素数必须整除 64，否则 inline 字数不成立
+// 位宽一致性（编译期）：叶层每字体素数必须整除 64
 const _: () = assert!(64 % LEAF_VOXELS_PER_WORD == 0);
 const _: () = assert!(32 % PALETTE_BITS == 0);
-/// comp_layer 每 chunk 字数（u16[4096] → 每 2 字打包成 u32 = 2048）
+/// comp_layer 每 chunk 字数（4096 个 u16 打包为 2048 个 u32）
 pub const CHUNK_COMP_WORDS: usize = gate_voxel::COMP_BRICKS_PER_CHUNK / 2;
 /// StateTable 条目的字数（4×u32/条目）
 pub const STATE_WORDS_PER_ENTRY: usize = 4;
@@ -60,8 +40,6 @@ pub const STATE_WORDS_PER_ENTRY: usize = 4;
 pub const STATE_ENTRY_COUNT: usize = 256;
 /// StateTable 总字数（256×4 = 1024 = 4KB）
 pub const STATE_TOTAL_WORDS: usize = STATE_ENTRY_COUNT * STATE_WORDS_PER_ENTRY;
-
-// ============ PaletteEntry 打包 ============
 
 /// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）
 pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
@@ -74,14 +52,10 @@ pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
   ]
 }
 
-// ============ GPU 全局参数 ============
-//
 // 字段名与整体布局须与 shaders/voxel_raytrace/ 的 Globals struct 字节兼容；
 // index_origin/dims 与 tile_count 均为 chunk 语义（×256 voxel）。
 
-/// 三轴字段全部拆成具名 scalar（x/y/z/w）、尾部填充同理：encase 0.12.1 在 uniform 模式下对
-/// Rust fixed-size `[i32/u32; N]` 断言 "array stride must be a multiple of 16"。
-/// 整体字节数 = 16+16+(7×4)+(5×4) = 32+28+20 = 80B（std140 允许末尾非 16 对齐）。
+/// GPU 全局 uniform；整体 80B。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]
 pub struct BrickMapGlobals {
@@ -114,39 +88,24 @@ pub struct BrickMapGlobals {
   pub _pad4: u32,
 }
 
-// ============ GridDesc（主世界与物体统一描述符，144B）============
-//
-// 主世界与物体走同一 GridDesc 数组，shader `trace_scene` 遍历数组无 kind 分支。
-//
-// 字段语义：
-// - pos_scale/rot0/rot1/rot2：`world = pos + rot · (local · scale)`，
-//   rot 列向量与 glam Mat3 一致（x_axis/y_axis/z_axis = 列）；主世界 = identity。
-// - aabb_min/max：局部 [0,256]³·scale 经变换后的世界外包盒（CPU 预算，剔除用）。
-// - tree_base：本 volume 的 b_struct 在 struct_buf 内的字基址（含 chunk 窗口段）。
-// - tree_depth：最大分裂深度 = 4（256→64→16→4→1）。
-// - chunk_count：本 volume 的 chunk 数（主世界可能 N，物体 = 1）。
-// - palette_base：本 volume 的 palette 在 palette_buf 内的字基址。
-// - index_origin/dims：本 volume 的稠密 chunk 窗口（chunk 单位）；物体 dims=(1,1,1)。
-//
-// std140 布局：6×Vec4(96B) + 4×u32(16B) + 4×i32(16B) + 4×u32(16B) = 144B
-// storage buffer array stride = 144B（16B 对齐 ✓）。
+// 主世界与物体统一描述符：`world = pos + rot · (local · scale)`（rot 为 glam Mat3 列；主世界 = identity）。
+// std140：6×Vec4 + 12×u32 = 144B，storage array stride 144B（16B 对齐）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, bevy::render::render_resource::ShaderType)]
 pub struct GridDesc {
-  // ---- 变换（64B）----
   pub pos_scale: Vec4,
   pub rot0: Vec4,
   pub rot1: Vec4,
   pub rot2: Vec4,
-  // ---- 世界 AABB（32B）----
+
   pub aabb_min: Vec4,
   pub aabb_max: Vec4,
-  // ---- Brick Tree 数据基址（16B）----
+
   pub tree_base: u32,
   pub tree_depth: u32,
   pub chunk_count: u32,
   pub palette_base: u32,
-  // ---- chunk 窗口（32B；物体 dims=(1,1,1) origin=(0,0,0)）----
+
   pub index_origin_x: i32,
   pub index_origin_y: i32,
   pub index_origin_z: i32,
@@ -181,7 +140,7 @@ impl GridDesc {
   };
 
   /// 从 VolumeTransform + tree/palette 基址构造
-  #[allow(clippy::too_many_arguments)] // 逐字段展开，语义即参数名（wire 契约）
+  #[allow(clippy::too_many_arguments)]
   pub fn from_transform(
     pos: Vec3,
     rot: Mat3,
@@ -192,7 +151,6 @@ impl GridDesc {
     origin: IVec3,
     dims: IVec3,
   ) -> Self {
-    // 局部 [0,256]³·scale 经旋转平移后的世界 AABB 外包
     let (mn, mx) = transform_aabb(pos, rot, scale);
     Self {
       pos_scale: pos.extend(scale),
@@ -217,13 +175,10 @@ impl GridDesc {
   }
 }
 
-// ============ 方向可达掩码 LUT（Douglas #18 Bitwise Masking）============
-
-/// LUT octant 数：射线方向符号组合。编码与 shaders/voxel_raytrace/ `dir_mask` 一致：
-/// bit0 = x 正方向、bit1 = y 正、bit2 = z 正（正 = 1，零分量按正处理 = 保守）。
+/// LUT octant 数：射线方向符号组合。编码同 shaders/voxel_raytrace/ `dir_mask`：
+/// bit0/1/2 = x/y/z 正（零分量按正处理 = 保守）。
 pub const MARCH_MASK_OCTANTS: usize = 8;
-/// LUT 入口格数：4³ brick 内的 DDA 起始格。编码与 shaders/voxel_raytrace/ `child_idx` 一致：
-/// `z*16 + y*4 + x`。
+/// LUT 入口格数：4³ brick 内的 DDA 起始格。编码同 shaders/voxel_raytrace/ `child_idx`：`z*16 + y*4 + x`。
 pub const MARCH_MASK_ENTRIES: usize = 64;
 /// 每入口格掩码字数（64-bit 子块占用 → 2×u32）
 pub const MARCH_MASK_WORDS_PER_ENTRY: usize = 2;
@@ -231,18 +186,8 @@ pub const MARCH_MASK_WORDS_PER_ENTRY: usize = 2;
 pub const MARCH_MASK_WORDS: usize =
   MARCH_MASK_OCTANTS * MARCH_MASK_ENTRIES * MARCH_MASK_WORDS_PER_ENTRY;
 
-/// 生成方向可达掩码 LUT（与 octo-release `march_masks` 同构，低 64 bit 有效）。
-///
-/// `lut[octant][entry]` = 从 brick 内入口格 `entry` 出发、方向符号 = `octant` 的
-/// 射线**可能经过**的子块集合（64-bit，bit i = 子块 `x + y*4 + z*16`）。
-///
-/// 条件：octant 分量正 → `p_i ≥ e_i − 1`，负 → `p_i ≤ e_i + 1`（±1 是浮点边界裕量，
-/// 使掩码恒为真实可达集的**保守超集**）。故 shader 端 `occupancy & reach` 剔除绝不漏真实
-/// 命中（不穿墙）。
-///
-/// 子块是否含实体的判定归 shader（本 LUT 只答"几何上能否经过"）：mask bit=1 = 分裂 ≠ 实体，
-/// uniform 子块色 = 节点 palette，只有 palette==0（空气）节点才可用 `mask & reach` 剔除
-/// （见 shaders/voxel_raytrace/ trace_chunk）。
+/// 生成方向可达掩码 LUT（低 64 bit 有效）。
+/// `lut[octant][entry]` = 从入口格 `entry` 出发、方向符号 `octant` 的射线可能经过的子块集合（保守超集）。
 pub fn march_mask_lut_words() -> Vec<u32> {
   let mut out = vec![0u32; MARCH_MASK_WORDS];
   for oct in 0..MARCH_MASK_OCTANTS {

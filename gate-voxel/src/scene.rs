@@ -1,5 +1,4 @@
 //! 测试场景构造器：方块 / 球 / 文字的体素化工具，供单元测试与基准场景库使用。
-//!
 //! 统一用 1³ 体素写，Brick Tree 自适应合并 uniform leaf。
 
 use glam::IVec3;
@@ -8,10 +7,7 @@ use crate::coords::LEVEL_EXTENT;
 use crate::palette::PaletteId;
 use crate::volume::VolumeGrid;
 
-/// 填充与轴对齐包围盒相交的所有体素（1³，确定性）。
-///
-/// 按 4³ 网格分块：完全含于 box 的整块走 `fill_brick`（O(depth) 树路径写入），边缘块逐体素。
-/// `palette` 用 `impl Into<PaletteId>`：本层是场景作者 API，槽号字面量（`2` / `7`）是常态。
+/// 填充与轴对齐包围盒相交的所有体素（1³）；`palette` 用 `impl Into<PaletteId>`，便于槽号字面量（`2` / `7`）。
 pub fn fill_box(
   grid: &mut VolumeGrid,
   min: IVec3,
@@ -23,7 +19,6 @@ pub fn fill_box(
   let max = min + extent;
   let mut count = 0;
 
-  // 4³ 网格遍历：块起点 = min 向下对齐 4，块终点 = max 向上对齐 4
   let blk_lo = IVec3::new(min.x & !3, min.y & !3, min.z & !3);
   let blk_hi = IVec3::new((max.x + 3) & !3, (max.y + 3) & !3, (max.z + 3) & !3);
   let mut bz = blk_lo.z;
@@ -35,12 +30,10 @@ pub fn fill_box(
         let b_lo = IVec3::new(bx, by, bz);
         let b_hi = b_lo + IVec3::splat(4);
         if b_lo.cmpge(min).all() && b_hi.cmple(max).all() {
-          // 整块在 box 内 → fill_brick 树路径（64 体素 1 次调用）
           if grid.fill_brick(b_lo, 4, palette).is_some() {
             count += 64;
           }
         } else {
-          // 边缘块：逐体素
           let mut z = b_lo.z.max(min.z);
           while z < b_hi.z.min(max.z) {
             let mut y = b_lo.y.max(min.y);
@@ -66,10 +59,8 @@ pub fn fill_box(
   count
 }
 
-/// 用 e³ 对齐 brick 填充 [min, min+extent) 盒（大体积均匀填充专用）。
-///
-/// extent 各轴必须是 e 的倍数且 min 各轴对齐 e；brick 级树路径写入
-/// （[`VolumeGrid::fill_brick`]），零逐体素分裂开销。返回实际写入的 brick 数。
+/// 用 e³ 对齐 brick 填充 [min, min+extent) 盒，返回写入的 brick 数。
+/// extent 各轴须为 e 的倍数，min 各轴须对齐 e。
 pub fn fill_bricks(
   grid: &mut VolumeGrid,
   min: IVec3,
@@ -104,10 +95,7 @@ pub fn fill_bricks(
   count
 }
 
-/// 填充球体（体素中心到球心距离 ≤ 半径）。
-///
-/// 按 4³ 分块：8 角全在球内的整块走 [`VolumeGrid::fill_brick`]（O(depth) 树路径
-/// 写入），边缘壳逐体素。
+/// 填充球体（体素中心到球心距离 ≤ 半径），返回写入体素数。
 pub fn fill_sphere(
   grid: &mut VolumeGrid,
   center: IVec3,
@@ -120,7 +108,7 @@ pub fn fill_sphere(
   let lo = center - IVec3::splat(radius);
   let hi = center + IVec3::splat(radius);
   let mut count = 0usize;
-  // 4³ 网格分块遍历
+
   let blk_lo = IVec3::new(lo.x & !3, lo.y & !3, lo.z & !3);
   let blk_hi = IVec3::new((hi.x + 3) & !3, (hi.y + 3) & !3, (hi.z + 3) & !3);
   let mut bz = blk_lo.z;
@@ -129,7 +117,6 @@ pub fn fill_sphere(
     while by <= blk_hi.y {
       let mut bx = blk_lo.x;
       while bx <= blk_hi.x {
-        // 8 角最大距离平方 ≤ r² → 整块在球内
         let mut max_d2 = 0i64;
         for cz in [0i32, 4] {
           for cy in [0, 4] {
@@ -145,7 +132,6 @@ pub fn fill_sphere(
             count += 64;
           }
         } else {
-          // 边缘壳：逐体素
           let x_end = (bx + 4).min(hi.x + 1);
           let y_end = (by + 4).min(hi.y + 1);
           let z_end = (bz + 4).min(hi.z + 1);

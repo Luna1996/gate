@@ -1,16 +1,6 @@
 //! DebugMenu：gate-app 的调试菜单（gate-ui 通用 menu 模块的第一个使用者）。
-//!
-//! 两层分工：gate-ui 提供容器/通用组件/模型与交互驱动；本文件提供
-//! 1. 默认菜单树 [`default_menu`]（同时是 `assets/ui/debug_menu.toml` 的内容，测试保证一致）；
-//! 2. 启动时读 TOML 作为**全部调试常量的初值来源**，退出时把当前状态写回；
-//! 3. 统一回调 [`MenuActionEvent`] → 各调试资源的观察者；
-//! 4. 纯文本行（相机位置/角度）与右上角 FPS 覆盖层的刷新。
-//!
-//! 「视频」页三项都已接通：全屏 = 无边框全屏（窗口 ↔ 全屏，非独占）、抗锯齿 = 最终 blit 的
-//! FXAA（`PostFxSettings.fxaa`）、半分辨率 = 渲染目标 ÷2 再放大到窗口（`RenderScale.factor`）。
-//! 「游戏/世界」页：「模型」下拉（选项 = `assets/vox` 下的 .vox 文件名，见
-//! [`apply_world_model_options`]）+「重载世界」按钮（运行期换世界，见 [`crate::scene::reload_world`]）。
-//! 其余各页的「未实现项」只预留 UI：收到动作只记日志，不写任何资源。
+//! 本文件提供 `default_menu` 默认菜单树（= `assets/ui/debug_menu.toml`）、TOML 初值读写、
+//! `MenuActionEvent` → 各调试资源观察者、相机信息与 FPS 覆盖层刷新。
 
 use std::collections::VecDeque;
 
@@ -39,12 +29,12 @@ use crate::showcase::ShowcaseRoot;
 /// 菜单 TOML 相对 assets 目录的路径（初值来源 + 退出时写回）
 pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
 
-/// 「世界」页模型下拉的节点路径（id 路径；选项由 [`apply_world_model_options`] 按磁盘内容填）
+/// 「世界」页模型下拉的节点路径（选项由 `apply_world_model_options` 按磁盘内容填）
 pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 
-/// 1 m = 50 voxel（1 voxel = 2cm）：菜单里速度用 m/s，资源里用 voxel/s
+/// 1 m = 50 voxel（1 voxel = 2cm）：菜单速度用 m/s，资源用 voxel/s
 pub const VOXEL_PER_METER: f32 = 50.0;
 
 /// 相机信息纯文本行的刷新间隔（秒）
@@ -74,12 +64,8 @@ pub const PROBE_KEYS: [&str; 6] = [
 /// 「全」对应的 `probe_viz_lod`（WESL 里 4 = All）
 const PROBE_VIZ_LOD_ALL: f32 = 4.0;
 
-// ===================== 默认菜单树（= assets/ui/debug_menu.toml） =====================
-
 /// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（改这里就要同步资产文件）。
-///
-/// 文案字段一律写 **i18n key**（本表 `menu.*`），运行时经 gate-ui 的 `UiTranslator` 解析；
-/// `id` 是与语言无关的回调路径段（标题栏路径显示的是各段 `label` 的译文）。
+/// 文案字段一律写 i18n key（`menu.*`），经 gate-ui `UiTranslator` 解析；`id` 是与语言无关的回调路径段。
 pub fn default_menu() -> MenuFile {
   MenuFile {
     window: WindowState::default(),
@@ -88,7 +74,7 @@ pub fn default_menu() -> MenuFile {
         "video",
         "menu.video",
         vec![
-          // 半分辨率渲染（3D 场景 1/2 分辨率 → blit 双线性放大到整窗）；见 RenderScale.factor
+          // 半分辨率渲染（3D 场景 1/2 分辨率 → blit 放大到整窗）；见 RenderScale.factor
           toggle_tip("half_res", "menu.video.half_res", false, "menu.video.half_res.tip"),
           toggle("fullscreen", "menu.video.fullscreen", false),
           toggle("vsync", "menu.video.vsync", true),
@@ -108,7 +94,7 @@ pub fn default_menu() -> MenuFile {
               toggle("enabled", "menu.render.ddgi.enabled", true),
               switch_group("mode", "menu.render.ddgi.mode", &DDGI_MODE_KEYS, 0),
               switch_group("probe", "menu.render.ddgi.probe", &PROBE_KEYS, 0),
-              // 性能档（用 GI 分辨率精度换帧）：见 DdgiDebugSettings.gi_half_res
+              // 性能档：见 DdgiDebugSettings.gi_half_res
               toggle_tip(
                 "gi_half",
                 "menu.render.ddgi.gi_half",
@@ -212,7 +198,7 @@ pub fn default_menu() -> MenuFile {
               input(
                 "size",
                 "menu.game.edit.size",
-                // 无上限：max 取 f32::MAX（数字输入框仍按 min/step 归一，但不构成实际约束）
+                // 无上限：max 取 f32::MAX（仍按 min/step 归一）
                 vec![InputField::number("", "3", 1.0, f32::MAX, 1.0, 0)],
               ),
               color("color", "menu.game.edit.color", "96989E"),
@@ -221,8 +207,7 @@ pub fn default_menu() -> MenuFile {
               slider("smooth", "menu.game.edit.smooth", 50.0, 0.0, 100.0, 1.0, 0, None),
             ],
           ),
-          // 世界：第一行 = 模型下拉（选项 = assets/vox 下的 .vox 文件名，启动时按磁盘内容重填，
-          // 见 [`apply_world_model_options`]）；第二行 = 重载世界（按当前选择重建主世界）
+          // 世界：第一行 = 模型下拉（选项 = assets/vox 下 .vox 文件名，启动时按磁盘内容重填）；第二行 = 重载世界
           sub_menu(
             "world",
             "menu.game.world",
@@ -238,8 +223,8 @@ pub fn default_menu() -> MenuFile {
   }
 }
 
-/// 读菜单 TOML：优先**可写数据目录**里的存档（上次退出时写的），
-/// 没有则用只读资源里的初版（`assets/ui/debug_menu.toml`）；都缺失/解析失败 → 内置默认 + warn
+/// 读菜单 TOML：优先可写数据目录里的存档，其次只读资源的初版（`assets/ui/debug_menu.toml`）；
+/// 都缺失 / 解析失败 → 内置默认 + warn。
 pub fn load_menu() -> MenuFile {
   let data = gate_render::data_dir().join(MENU_TOML_PATH);
   let asset = gate_render::assets_dir().join(MENU_TOML_PATH);
@@ -266,15 +251,13 @@ pub fn load_menu() -> MenuFile {
       m
     }
   };
-  // 世界模型下拉的选项来自磁盘扫描（不是 TOML 里的静态表），最后统一填一次
+  // 世界模型下拉选项来自磁盘扫描，最后统一填一次
   apply_world_model_options(&mut model);
   model
 }
 
-/// 把 [`WORLD_MODEL_PATH`] 下拉的选项换成 `assets/vox` 下实际存在的模型（见
-/// [`crate::vox_scene::scan_vox_models`]），选中项按**名字**在旧列表里找回：存档存的是下标，
-/// 而列表随文件夹内容漂移（新增一个排在前面的文件就会让旧下标指向别的模型）。
-/// 名字找不到 → `nuke` → 第一项。
+/// 把 `WORLD_MODEL_PATH` 下拉的选项换成 `assets/vox` 下实际存在的模型（见
+/// `crate::vox_scene::scan_vox_models`）；选中项按名字找回，找不到 → `nuke` → 第一项。
 fn apply_world_model_options(model: &mut MenuFile) {
   let options = crate::vox_scene::scan_vox_models();
   let Some(MenuNode::Dropdown { options: opts, selected, .. }) =
@@ -291,9 +274,7 @@ fn apply_world_model_options(model: &mut MenuFile) {
   *opts = options;
 }
 
-/// 旧存档兼容：把内置默认树里「存档中不存在」的节点补进去（新增菜单项在旧存档里也能出现），
-/// 已存在的节点一律保留存档里的值。递归只在 SubMenu 内做（顶层新增子菜单同样会被补上）。
-/// 不这么做的话，`data/ui/debug_menu.toml` 会遮蔽新加的项 —— 菜单里根本看不到，也不报错。
+/// 旧存档兼容：把默认树里「存档中不存在」的节点补进去，已存在的保留存档值；递归只在 SubMenu 内做。
 fn merge_defaults(loaded: &mut MenuFile, dflt: &MenuFile) {
   merge_nodes(&mut loaded.items, &dflt.items);
 }
@@ -308,16 +289,14 @@ fn merge_nodes(loaded: &mut Vec<MenuNode>, dflt: &[MenuNode]) {
           merge_nodes(lc, dc);
         }
       }
-      // 新项按**默认树里的位置**插入（不是追加到末尾）：否则旧存档里的新项会跑到页面最后，
-      // 而设计位置（比如「视频」页顶部）只有新装用户看得到。
+      // 新项按默认树里的位置插入（不是追加到末尾）
       None => loaded.insert(i.min(loaded.len()), d.clone()),
     }
   }
 }
 
-/// 把当前菜单状态写回 TOML（退出前调用）。
-/// 写**可写数据目录**（`<安装根>/data/ui/debug_menu.toml`）而不是 `assets/`：安装目录可能只读
-/// （如 Program Files），且源码资源不应被运行期改写。下次启动由 [`load_menu`] 优先读这份存档。
+/// 把当前菜单状态写回 TOML（退出前调用）；写可写数据目录（`<安装根>/data/ui/debug_menu.toml`）
+/// 而非 `assets/`。下次启动由 `load_menu` 优先读这份存档。
 pub fn save_menu(model: &MenuFile) {
   let path = gate_render::data_dir().join(MENU_TOML_PATH);
   let Ok(src) = model.to_toml() else {
@@ -335,8 +314,6 @@ pub fn save_menu(model: &MenuFile) {
     Err(e) => warn!("debug menu save failed ({e})"),
   }
 }
-
-// ===================== 组件/资源 =====================
 
 /// UI 已生成的守卫标记（debug_menu_setup 的存在性守卫）
 #[derive(Component)]
@@ -357,9 +334,8 @@ pub struct FpsOverlayVisible(pub bool);
 /// 半分辨率渲染的降采样倍数（「视频/半分辨率」→ `RenderScale.factor`）
 const HALF_RES_FACTOR: u32 = 2;
 
-/// 进无边框全屏前的窗口尺寸/位置（退出全屏时复原）。`None` = 当前不在全屏。
-///
-/// winit 在多数平台上会自己记住并复原窗口矩形，但**位置**在部分后端会丢，故显式存一份兜底。
+/// 进无边框全屏前的窗口尺寸/位置（退出全屏时复原）；`None` = 当前不在全屏。
+/// winit 多数平台会自己复原窗口，但位置在部分后端会丢，故显式存一份兜底。
 #[derive(Resource, Default)]
 struct WindowedRestore(Option<(UVec2, Option<IVec2>)>);
 
@@ -367,9 +343,7 @@ struct WindowedRestore(Option<(UVec2, Option<IVec2>)>);
 #[derive(Resource, Default)]
 pub struct FpsWindow(VecDeque<f32>);
 
-// ===================== 生成 =====================
-
-/// 建 DebugMenu + FPS 覆盖层 + 回调观察者。主题/字体就绪后由 [`crate::debug_ui_setup`] 调用一次。
+/// 建 DebugMenu + FPS 覆盖层 + 回调观察者；主题/字体就绪后由 `crate::debug_ui_setup` 调用一次。
 pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   let model = load_menu();
   // 文案解析器取资源里的（语言切换只需 bump 版本，见 sync_ui_locale）
@@ -381,9 +355,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   register_callbacks(world);
 }
 
-/// 语言切换后让 gate-ui 重解析全部 keyed 文本（菜单树整体跟着换语言）。
-///
-/// 解析闭包读的是 rust-i18n 的当前 locale，所以这里只需 bump 版本触发重解析。
+/// 语言切换后让 gate-ui 重解析全部 keyed 文本；解析闭包读 rust-i18n 当前 locale，故只需 bump 版本。
 pub(crate) fn sync_ui_locale(mut translator: ResMut<UiTranslator>, mut last: Local<String>) {
   let now = rust_i18n::locale().to_string();
   if now != *last {
@@ -453,8 +425,7 @@ fn apply_initial_state(world: &mut World) {
       _ => None,
     }
   };
-  // 颜色控件是独立节点类型（`color()` → `MenuNode::Color`），**不是** `Input`：
-  // 用 `get_text` 读它恒为 None → 启动时颜色初值丢失，必须手动改一次才生效。
+  // 颜色控件是独立节点类型（`color()` → `MenuNode::Color`），不是 `Input`；用 `get_text` 读它恒为 None。
   let get_color = |path: &str| -> Option<String> {
     match model.node(&split(path)) {
       Some(MenuNode::Color { hex, .. }) => Some(hex.clone()),
@@ -462,10 +433,8 @@ fn apply_initial_state(world: &mut World) {
     }
   };
 
-  // 视频
   world.resource_mut::<FpsOverlayVisible>().0 = get_bool("video/fps", false);
-  // 抗锯齿（FXAA，最终 blit）/ 半分辨率渲染（RenderScale.factor）：写 main world 资源，
-  // render world 由 ExtractResourcePlugin 跟随。
+  // 抗锯齿（FXAA）/ 半分辨率渲染（RenderScale.factor）写 main world 资源，render world 跟随。
   world.resource_mut::<gate_render::PostFxSettings>().fxaa = get_bool("video/aa", false);
   world.resource_mut::<gate_render::RenderScale>().factor =
     if get_bool("video/half_res", false) { HALF_RES_FACTOR } else { 1 };
@@ -473,7 +442,7 @@ fn apply_initial_state(world: &mut World) {
   if let Some(mut win) = q_win.iter_mut(world).next() {
     win.present_mode =
       if get_bool("video/vsync", true) { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
-    // 全屏：上次退出时若停在无边框全屏，这里按存档进全屏（窗口尺寸/位置由 winit 自己记住）
+    // 全屏：按存档进无边框全屏（窗口尺寸/位置由 winit 记住）
     win.mode = if get_bool("video/fullscreen", false) {
       WindowMode::BorderlessFullscreen(MonitorSelection::Current)
     } else {
@@ -482,7 +451,6 @@ fn apply_initial_state(world: &mut World) {
   }
   drop(q_win);
 
-  // 渲染 / DDGI
   {
     let stage = if get_bool("render/ddgi/enabled", true) {
       gate_render::ddgi::DdgiStage::FULL
@@ -507,7 +475,6 @@ fn apply_initial_state(world: &mut World) {
     // 性能档（默认关 = 逐像素精确路径）
     dbg.gi_half_res = get_bool("render/ddgi/gi_half", false);
   }
-  // 渲染 / 曝光
   {
     let mut eye = world.resource_mut::<gate_render::EyeAdaptSettings>();
     eye.enabled = get_bool("render/exposure/enabled", true);
@@ -527,7 +494,6 @@ fn apply_initial_state(world: &mut World) {
       eye.key = v;
     }
   }
-  // 玩家 / 相机
   {
     if let Some(i) = get_sel("player/camera/mode") {
       *world.resource_mut::<CameraMode>() =
@@ -537,7 +503,6 @@ fn apply_initial_state(world: &mut World) {
       world.resource_mut::<FlyCamera>().speed = v * VOXEL_PER_METER;
     }
   }
-  // 游戏 / 编辑
   {
     let mut edit = world.resource_mut::<EditSettings>();
     if let Some(i) = get_sel("game/edit/shape") {
@@ -548,8 +513,7 @@ fn apply_initial_state(world: &mut World) {
     {
       edit.size = v.max(EDIT_SIZE_MIN);
     }
-    // 材质四参数（与菜单初值一一对应；hex 非法时保持 `BrushMaterial::default()`）。
-    // 这里只写「当前笔触材质」，不碰调色板：材质 → 槽的分配发生在落笔时（按内容去重）。
+    // 材质四参数；只写「当前笔触材质」，不碰调色板（材质 → 槽的分配在落笔时按内容去重）。
     if let Some(t) = get_color("game/edit/color")
       && let Some([r, g, b, _]) = parse_hex_color(&t)
     {
@@ -587,11 +551,9 @@ fn split(path: &str) -> Vec<String> {
   path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
 
-// ===================== 回调（统一事件按 path 分派） =====================
-
+// 统一事件按 path 分派
 fn register_callbacks(world: &mut World) {
   world.init_resource::<WindowedRestore>();
-  // ---- 视频 ----
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut q_win: Query<&mut Window, With<PrimaryWindow>>,
@@ -610,7 +572,7 @@ fn register_callbacks(world: &mut World) {
           fps.0 = on;
           info!("FPS 覆盖层 → {}", if on { "on" } else { "off" });
         }
-        // 全屏：窗口 ↔ **无边框**全屏（不是独占全屏 —— 不动显示模式/刷新率，Alt-Tab 也不黑屏）
+        // 全屏：窗口 ↔ 无边框全屏（非独占，不动显示模式/刷新率）
         "video/fullscreen" => {
           let Ok(mut win) = q_win.single_mut() else { return };
           if on {
@@ -633,7 +595,7 @@ fn register_callbacks(world: &mut World) {
           }
           info!("全屏 → {:?}", win.mode);
         }
-        // 半分辨率渲染：只改降采样倍数，目标纹理由 responsive 系统下一帧按新尺寸原地重建
+        // 半分辨率渲染：只改降采样倍数，目标纹理由 responsive 系统下一帧重建
         "video/half_res" => {
           scale.factor = if on { HALF_RES_FACTOR } else { 1 };
           info!(
@@ -653,7 +615,6 @@ fn register_callbacks(world: &mut World) {
     },
   );
 
-  // ---- 渲染（DDGI / 曝光）----
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut ddgi_stage: ResMut<gate_render::ddgi::DdgiStage>,
@@ -685,7 +646,7 @@ fn register_callbacks(world: &mut World) {
           let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
           info!("探针绘制 → {name}");
         }
-        // ---- 性能档（用 GI 分辨率精度换帧；关掉即回到逐像素精确路径）----
+        // 性能档（关掉即回到逐像素精确路径）
         ("render/ddgi/gi_half", MenuAction::Toggle(on)) => {
           ddgi_dbg.gi_half_res = *on;
           info!("半分辨率 GI → {}", if *on { "on" } else { "off" });
@@ -704,7 +665,6 @@ fn register_callbacks(world: &mut World) {
     },
   );
 
-  // ---- 玩家（相机）----
   world.add_observer(
     |ev: On<MenuActionEvent>, mut mode: ResMut<CameraMode>, mut fly: ResMut<FlyCamera>| match (
       ev.path.as_str(),
@@ -722,9 +682,7 @@ fn register_callbacks(world: &mut World) {
     },
   );
 
-  // ---- 游戏（编辑）+ 界面 ----
-  // 四个材质控件只改**当前笔触材质**，不碰调色板：已放置的体素因此不会被改色；
-  // 材质 → 槽的分配发生在落笔时（`edit::material_slot`，按内容去重）。
+  // 材质控件只改当前笔触材质，不碰调色板；材质 → 槽的分配在落笔时（`edit::material_slot`）。
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut edit: ResMut<EditSettings>,
@@ -737,7 +695,7 @@ fn register_callbacks(world: &mut World) {
         ("game/edit/size", MenuAction::Text(t)) => {
           if let Ok(v) = t.trim().parse::<u32>() {
             edit.size = v.max(EDIT_SIZE_MIN);
-            // 跨度 = 2·size-1（size 无上限，saturating 防日志侧溢出）
+            // 跨度 = 2·size-1（saturating 防日志侧溢出）
             let span = edit.size.saturating_mul(2).saturating_sub(1);
             info!("笔触大小 → {} vx（跨度 {}）", edit.size, span);
           }
@@ -747,7 +705,7 @@ fn register_callbacks(world: &mut World) {
             edit.mat.color = [r, g, b];
             info!(target: "gate", "笔触颜色 → {}", edit.mat.hex());
           }
-          // 输入框是自由文本：半截输入（"96"、"#96"）解析失败就忽略，不打断输入
+          // 输入框是自由文本：解析失败（半截输入）就忽略，不打断输入
           None => debug!(target: "gate", "笔触颜色输入未成形 → {t:?}（忽略）"),
         },
         ("game/edit/emissive", MenuAction::Value(v)) => {
@@ -772,11 +730,8 @@ fn register_callbacks(world: &mut World) {
     },
   );
 
-  // ---- 游戏（世界）：模型下拉 + 重载世界 ----
-  // 下拉只改模型（退出时随菜单存档持久化），真正换世界在「重载世界」按钮：
-  // load_vox_scene 是同步阻塞的（与启动同一条加载路径，vox 量级下可接受），
-  // 失败只 warn、原世界保持不变；成功后全量重建 + GPU 全量上传 + DDGI 重烘焙由
-  // VoxelScene.demo_force_full_rebuild 自动驱动。
+  // 下拉只改模型（退出时随存档持久化）；「重载世界」按钮才真正换世界（同步阻塞），失败只 warn、
+  // 原世界不变；成功后全量重建 + GPU 上传 + DDGI 重烘焙由 VoxelScene.demo_force_full_rebuild 驱动。
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut scene: ResMut<gate_render::VoxelScene>,
@@ -822,12 +777,8 @@ fn world_model_name(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
   }
 }
 
-// ===================== 每帧刷新 =====================
-
-/// 纯文本行（相机位置/角度）的值：每 [`CAM_INFO_REFRESH_SECS`] 刷新一次
-///
-/// 行由「左列名称 + 中间值」两段组成（见 gate-ui `text_row`），这里只改写**值标签**
-/// （[`gate_ui::MenuTextValue`]）；左侧名称是普通行文案，不动。
+/// 纯文本行（相机位置/角度）的值：每 `CAM_INFO_REFRESH_SECS` 刷新一次。
+/// 只改写值标签（`gate_ui::MenuTextValue`），左侧名称不动。
 pub(crate) fn camera_info_tick(
   time: Res<Time>,
   orbit: Res<gate_render::OrbitCamera>,
@@ -845,7 +796,7 @@ pub(crate) fn camera_info_tick(
     CameraMode::Orbit => orbit.eye(),
     CameraMode::Fly => fly.pos,
   };
-  // 数字先 format! 好再塞占位符：语言切换不会改变数字列宽（见 locales 约定）
+  // 数字先 format! 好再塞占位符：语言切换不改变数字列宽
   let pos = t!("menu.camera.pos.value", v = format!("({:.1}, {:.1}, {:.1})", eye.x, eye.y, eye.z))
     .to_string();
   let dir = t!(
@@ -867,7 +818,7 @@ pub(crate) fn camera_info_tick(
 }
 
 /// 右上角 FPS：1s 窗口内统计 当前/平均/最低/最高，每帧更新
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub(crate) fn fps_overlay_tick(
   time: Res<Time>,
   visible: Res<FpsOverlayVisible>,
@@ -915,7 +866,7 @@ pub(crate) fn fps_overlay_tick(
   }
 }
 
-/// fps → 3 位宽显示值（上限 999，防 4 位数抖动）
+/// fps → 3 位宽显示值（上限 999）
 fn fps3(v: f32) -> u32 {
   (v.round() as u32).min(999)
 }

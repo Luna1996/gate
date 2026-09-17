@@ -1,19 +1,13 @@
-//! 菜单模型：层级 + 控件状态的**可序列化**表示（TOML 持久化）。
-//!
-//! 单靠一份 [`MenuFile`] 就能完整重建菜单 UI（层级、文案、值、选中态、窗口位置/收起/停留路径），
-//! 唯一的例外是控件回调——UI 重建完成后由调用方按节点 id 路径挂上（见 `MenuActionEvent`）。
-//!
-//! **文案字段存 i18n key**（`label` / `options` / `tooltip` / `text` / [`InputField::label`]）：
-//! 渲染时经 `UiTranslator` 解析为当前语言，语言切换后由 `i18n_refresh_system` 重解析。
-//! 未注入解析器时 key 原样显示，所以直接写字面量（`label = "视频"`）同样成立。
-//! `id` 是与语言无关的回调路径段（标题栏路径按各段 `label` 的译文显示，如 `/渲染/DDGI`），务必显式给出。
+//! 菜单模型：层级 + 控件状态的可序列化表示（TOML 持久化）。
+//! 单靠一份 `MenuFile` 即可完整重建菜单 UI；唯一例外是控件回调，由调用方按节点 id 路径挂上（见 `MenuActionEvent`）。
+//! 文案字段存 i18n key，渲染经 `UiTranslator` 解析；`id` 是与语言无关的回调路径段，须显式给出。
 
 use serde::{Deserialize, Serialize, Serializer};
 
 use super::consts::DEFAULT_WINDOW_POS;
 use crate::widgets::TextInputKind;
 
-/// 写盘用的浮点包装：f32 → 6 位小数的 f64（消除 f32→f64 的二进制尾巴）
+/// 写盘用的浮点包装：f32 → 6 位小数的 f64
 struct Rounded(f32);
 
 impl Serialize for Rounded {
@@ -235,7 +229,7 @@ impl MenuNode {
     }
   }
 
-  /// 行内显示文案的 i18n key（子菜单/按钮组/滑杆/切换组/下拉框/开关项/输入框/颜色选择器的左侧文字）
+  /// 行内显示文案的 i18n key（各控件左侧文字；纯文本项为正文）
   pub fn label(&self) -> &str {
     match self {
       Self::SubMenu { label, .. }
@@ -306,8 +300,7 @@ impl MenuFile {
     if path.is_empty() { &self.items } else { self.node(path).map(|n| n.children()).unwrap_or(&[]) }
   }
 
-  /// 序列化为 TOML（持久化写盘用）。f32 字段经 [`Rounded`] 输出 6 位小数，
-  /// 否则 f32 → f64 会写出 `0.10000000149011612` 这类二进制噪声值。
+  /// 序列化为 TOML（持久化写盘用）；f32 字段经 `Rounded` 输出 6 位小数。
   pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
     toml::to_string_pretty(self)
   }
@@ -348,8 +341,6 @@ fn sanitize_node(node: &mut MenuNode) {
     _ => {}
   }
 }
-
-// ---------- 节点构造助手（写默认菜单树用，省去手填 id/字段名） ----------
 
 /// 子菜单节点
 pub fn sub_menu(id: &str, label: &str, children: Vec<MenuNode>) -> MenuNode {

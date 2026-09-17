@@ -4,19 +4,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# rust-i18n CLI（cargo i18n，可选安装）的配置，只影响该工具；locales 路径要与
-# main.rs 里 rust_i18n::i18n!("../assets/locales") 传的路径一致，否则抽取对不上
-# （两者都相对本 package 的 CARGO_MANIFEST_DIR 解析；资产在仓库根 assets/，故要 ../）
+# rust-i18n CLI 配置；load-path 须与 main.rs 的 rust_i18n::i18n!("../assets/locales") 一致
 [package.metadata.i18n]
-# 已接入的语言：加语言时这里 + assets/locales/<locale>.yml 一起加
+# 加语言：这里 + assets/locales/<locale>.yml 一起加
 available-locales = ["zh-CN"]
 default-locale = "zh-CN"
 load-path = "../assets/locales"
 
 [features]
-# 性能剖析：Tracy CPU zones（bevy trace feature 让所有 system 成 span +
-# 手写 TracyLayer）+ gate-render 的 wgpu-profiler GPU zones。
-# 用法：cargo run -p gate-app --features profile，Tracy GUI 连接进程。
+# 性能剖析：Tracy CPU zones + gate-render 的 wgpu-profiler GPU zones
+# 用法：cargo run -p gate-app --features profile
 profile = [
   "gate-render/profile",
   "bevy/trace",
@@ -29,19 +26,16 @@ glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }
 gate-ui = { workspace = true }
-# 方案 3 日志落盘：版本对齐 bevy_log 0.19.1 内部用法（subcriber 需含默认 fmt/ansi features）
-# "time" feature：OffsetTime 本地时区时间戳（latest.log 此前是 UTC，跨机器核对日志误导）
+# 日志落盘（版本对齐 bevy_log 0.19.1 的 subscriber）；"time" = 本地时区时间戳
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["time"] }
 tracing-appender = "0.2"
 # CPU 帧剖析（feature = "profile"）：Tracy 客户端
 tracy-client = { workspace = true, optional = true }
-# formatting = Rfc3339 格式化；local-offset = current_local_offset()（Windows 安全，main 早期单线程）
+# formatting = Rfc3339；local-offset = current_local_offset()
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 vox-rs = "0.2.0"
-# vox 场景并行分桶/建树（gate-voxel mount_chunk_tree 批量导入路径）
+# vox 场景并行分桶/建树
 rayon = { workspace = true }
-# i18n：文案表在编译期 codegen 进二进制（assets/locales/*.yml），运行期只有
-# t! 查表 + set_locale 切换当前语言两条路，YAML 解析依赖不进产物。
-# log-miss-tr（缺键告警）暂不开：它走 log crate，与项目 tracing 栈要额外架桥
+# i18n：文案表编译期 codegen 进二进制，运行期只有 t! 查表 + set_locale 切换两条路
 rust-i18n = "4.2"

@@ -1,14 +1,5 @@
-//! 运行期路径定位：`assets/`（只读资源）、`logs/`、`data/`（可写）分别放哪。
-//!
-//! 一套代码覆盖两种形态，由 [`install_root`] 统一判定：
-//! - **便携发布**：exe 同目录存在 `assets/` → 根 = exe 所在目录（解压即用，日志/存档写同级）；
-//! - **开发**（cargo run / F5，exe 在 `target/<profile>/` 下，同级没有 `assets/`）→
-//!   根 = 源码树根（workspace 根）；
-//! - `GATE_ROOT` 环境变量可强制覆盖（自定义安装位置 / 自动化测试）。
-//!
-//! 约定：本 crate 与 gate-app 都是 workspace 根的直接子目录，故源码树根 = `<CARGO_MANIFEST_DIR>/..`。
-//! 资源与可写数据分离：安装目录可能只读（如 Program Files），所以日志与菜单存档一律落
-//! [`logs_dir`] / [`data_dir`]，绝不写回 `assets/`。
+//! 运行期路径定位：`assets/`（只读资源）、`logs/`、`data/`（可写）。
+//! 根目录由 [`install_root`] 判定：便携发布 = exe 同目录（存在 `assets/`）；开发 = 源码树根；`GATE_ROOT` 可强制覆盖。
 
 use std::path::PathBuf;
 

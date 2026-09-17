@@ -1,8 +1,6 @@
 //! Volume + Volumes：主世界 / 独立物体的统一容器。
-//!
-//! `VolumeGrid` = 单个体素 volume（主世界 = identity transform + 无界 chunk HashMap，
-//! 物体 = 任意 transform + 通常 1~少数 chunk）；`Volumes` = `Vec<VolumeGrid>`，
-//! list[0] 恒为主世界（obj_id = -1），list[1..N] 为物体（obj_id = 0..N-1）。
+//! `VolumeGrid` = 单个体素 volume（主世界 = identity transform + 无界 chunk HashMap；物体 = 任意 transform）。
+//! `Volumes` = `Vec<VolumeGrid>`，list[0] 恒为主世界（obj_id = -1），list[1..N] 为物体。
 
 use std::collections::HashMap;
 
@@ -13,16 +11,12 @@ use crate::coords::{CHUNK_SIZE, ChunkCoord, VoxelCoord};
 use crate::dirty::DirtyTracker;
 use crate::palette::{Palette, PaletteId};
 
-/// 组件层：level 2 brick = 16³ = 4096 体素 = 一个组件 cell
-/// 每 chunk = (256/16)³ = 16³ = 4096 个 level 2 brick = 4096 个 u16
+/// 组件层：level 2 brick = 16³ = 一个组件 cell；每 chunk = 16³ = 4096 个。
 pub const COMP_BRICKS_PER_CHUNK: usize = 16 * 16 * 16;
 pub const COMP_BRICK_EXTENT: i32 = 16;
 
 /// 主世界 / 独立物体的统一容器。
-///
-/// 主世界 = identity transform + 无界 chunk HashMap（obj_id = -1）；物体 = 任意
-/// transform + 通常 1~少数 chunk（obj_id = 0..N-1），与主世界走相同的
-/// `DirtyTracker` → `BrickMapBuilder::update_chunk` → `UploadSnapshot` 增量上传路径。
+/// 主世界 = identity transform + 无界 chunk（obj_id = -1）；物体 = 任意 transform（obj_id = 0..N-1）。
 #[derive(Debug, Clone)]
 pub struct VolumeGrid {
   chunks: HashMap<ChunkCoord, ChunkTree>,
@@ -31,23 +25,14 @@ pub struct VolumeGrid {
   comp_layer: HashMap<ChunkCoord, Box<[u16; COMP_BRICKS_PER_CHUNK]>>,
   state_table: Vec<[u32; 4]>,
   pub state_dirty: bool,
-  /// 物体变换（主世界 = identity：pos=0/rot=identity/scale=1）。
-  /// 渲染时通过 GridDesc（§2.6）传到 shader，DDA 局部变换 + 世界 AABB 由它推导。
+  /// 物体变换（主世界 = identity）；渲染侧据此推导 DDA 局部变换与世界 AABB。
   pub transform: VolumeTransform,
   /// 渲染器分配的 obj_id（主世界 = -1；物体 = 0..N-1，对应 `Volumes.list[1..]` 索引）。
   pub obj_id: i32,
-  /// 体素编辑单调代数（每次实际改变体素的 set/clear/fill +1；noop 同色重复写不递增）。
-  /// 渲染侧探针烘焙等派生数据据此判断「自上次构建以来世界是否被编辑」→ 触发重烘。
-  /// palette 变化不计入（探针位置不变，辐射度由射线更新 EMA 自然收敛）。
+  /// 体素编辑单调代数（每次实际改变体素 +1；noop 同色重复写不递增，palette 变化不计入）；渲染侧派生数据（如探针烘焙）据此判断是否需重烘。
   edit_generation: u64,
-  /// 编辑产生的**最小 voxel AABB**（按 chunk 记录，闭开区间 `[lo, hi)`）。
-  ///
-  /// 渲染侧据此把 DDGI 等派生数据的重烘范围收紧到"真正被改到的体素"。粒度很重要：chunk 级
-  /// AABB（256³）会让一次单格编辑失效 16³ = 4096 个 LOD0 探针，它们同帧把 age 压回 1 ⇒
-  /// 整片间接光同帧偏移，即"编辑后 GI 闪一下"。
-  ///
-  /// 上传该 chunk 时由 [`Self::take_edit_aabb`] 取走；未记录者（批量导入、`mount_chunk_tree`）
-  /// 消费方回退到 chunk 包围盒，行为与旧版一致。
+  /// 编辑产生的最小 voxel AABB（按 chunk 记录，闭开区间 `[lo, hi)`，世界 voxel 坐标）。
+  /// 上传该 chunk 时由 `take_edit_aabb` 取走；未记录者消费方回退到 chunk 包围盒。
   edit_aabbs: HashMap<ChunkCoord, (IVec3, IVec3)>,
 }
 
@@ -68,9 +53,8 @@ impl Default for VolumeGrid {
   }
 }
 
-/// 物体变换：`world = pos + rot · (local · scale)`。
-/// 主世界 = identity（pos=0、rot=identity、scale=1），与 GridDesc 对齐。
-/// rot 列向量约定与 glam Mat3 一致（x_axis/y_axis/z_axis 即列）。
+/// 物体变换：`world = pos + rot · (local · scale)`；主世界 = identity。
+/// `rot` 列向量约定与 glam `Mat3` 一致（x/y/z_axis 即列）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeTransform {
   pub pos: Vec3,
@@ -109,9 +93,8 @@ impl VolumeTransform {
   }
 }
 
-/// 全场景容器：`Vec<VolumeGrid>`，list[0] = 主世界（obj_id=-1），list[1..N] = 物体。
-///
-/// 渲染器遍历 `list` 生成 GridDesc 数组，shader `trace_scene` 无 kind 分支。
+/// 全场景容器：`Vec<VolumeGrid>`，list[0] = 主世界（obj_id = -1），list[1..N] = 物体。
+/// 渲染器遍历 `list` 生成 GridDesc 数组。
 #[derive(Debug, Default)]
 pub struct Volumes {
   pub list: Vec<VolumeGrid>,
@@ -201,10 +184,8 @@ impl VolumeGrid {
     self.edit_generation
   }
 
-  /// 取走某 chunk 的编辑 AABB（闭开区间 `[lo, hi)`，**世界 voxel 坐标**）。
-  ///
-  /// 渲染侧在上传该 chunk 的那一帧调用，用来把 DDGI 重烘范围收紧到实际编辑区域；
-  /// None = 该 chunk 不是由体素编辑标脏的（批量导入等）→ 消费方回退到 chunk 包围盒。
+  /// 取走某 chunk 的编辑 AABB（闭开区间 `[lo, hi)`，世界 voxel 坐标）。
+  /// None = 非体素编辑标脏（如批量导入）→ 消费方回退到 chunk 包围盒。
   pub fn take_edit_aabb(&mut self, chunk: ChunkCoord) -> Option<(IVec3, IVec3)> {
     self.edit_aabbs.remove(&chunk)
   }
@@ -252,29 +233,20 @@ impl VolumeGrid {
     self.chunks.len()
   }
 
-  /// GC 所有 chunk：回收编辑过程中累积的废弃节点（见 [`ChunkTree::compact`]）。
-  ///
-  /// chunk 间零共享 → rayon 并行。
+  /// GC 所有 chunk，回收累积的废弃节点（见 `ChunkTree::compact`）；chunk 间零共享，rayon 并行。
   pub fn compact_all(&mut self) {
     use rayon::prelude::*;
     self.chunks.par_iter_mut().for_each(|(_, tree)| tree.compact());
   }
 
-  /// 挂载外部预构建的 chunk 树（大体积批量导入专用）。
-  ///
-  /// # 调用契约
-  /// `tree` 整体替换 `cc` 上的树并标脏，`applied_edits` 累加到编辑代数；同 coord
-  /// 已有树会被整体覆盖（导入方保证 fresh grid 或接受覆盖），空树由调用方跳过。
+  /// 挂载外部预构建的 chunk 树（大体积批量导入用）。
+  /// 调用契约：`tree` 整体替换 `cc` 上的树并标脏，`applied_edits` 累加到编辑代数；空树由调用方跳过。
   pub fn mount_chunk_tree(&mut self, cc: ChunkCoord, tree: ChunkTree, applied_edits: u64) {
     debug_assert!(!tree.is_empty(), "mount_chunk_tree 不接受空树");
     self.chunks.insert(cc, tree);
     self.dirty.mark_data(cc);
     self.edit_generation = self.edit_generation.wrapping_add(applied_edits);
   }
-
-  // =========================================================================
-  // 体素查询
-  // =========================================================================
 
   pub fn get_voxel(&self, voxel: VoxelCoord) -> Option<PaletteId> {
     let chunk = voxel.chunk();
@@ -301,15 +273,10 @@ impl VolumeGrid {
     tree.get_brick_state(local.x, local.y, local.z, level)
   }
 
-  /// 按 brick **边长**查询三态（`extent` ∈ `LEVEL_EXTENT`，与 [`VolumeGrid::fill_brick`] 同一套粒度）。
-  /// 编辑侧的整块填充据此判断"这一块能不能一次写完"。
+  /// 按 brick 边长查询三态（`extent` ∈ `LEVEL_EXTENT`，与 `fill_brick` 同一套粒度）。
   pub fn get_brick_state_extent(&self, voxel: IVec3, extent: i32) -> crate::chunk_tree::BrickState {
     self.get_brick_state(VoxelCoord::from_ivec3(voxel), crate::chunk_tree::level_of_extent(extent))
   }
-
-  // =========================================================================
-  // 体素编辑
-  // =========================================================================
 
   pub fn set_voxel(&mut self, voxel: VoxelCoord, palette: PaletteId) -> Option<DirtyEdit> {
     let chunk = voxel.chunk();
@@ -330,10 +297,7 @@ impl VolumeGrid {
     self.set_voxel(VoxelCoord::from_ivec3(pos), palette)
   }
 
-  /// 填充对齐 brick（extent ∈ {256,64,16,4,1}）。
-  ///
-  /// 大体积均匀填充专用：O(depth) 树路径，不逐体素分裂（见 [`ChunkTree::fill_brick`]）；
-  /// `voxel` 为 brick 最小角的世界 voxel 坐标。
+  /// 填充对齐 brick（extent ∈ {256,64,16,4,1}）；`voxel` 为 brick 最小角的世界 voxel 坐标。
   pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: PaletteId) -> Option<DirtyEdit> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
@@ -342,7 +306,7 @@ impl VolumeGrid {
       Some(tree) => tree.fill_brick([local.x, local.y, local.z], extent, palette),
       None => {
         if palette.is_air() {
-          return None; // 空 chunk 填空气 = noop，不建 chunk
+          return None;
         }
         let tree = self.chunks.entry(cc).or_insert_with(ChunkTree::empty);
         tree.fill_brick([local.x, local.y, local.z], extent, palette)
@@ -363,7 +327,6 @@ impl VolumeGrid {
     let local = voxel.in_chunk();
     let tree = self.chunks.get_mut(&chunk)?;
     if tree.clear_voxel(local.x, local.y, local.z) {
-      // 全空 chunk 不留表内
       if tree.is_empty() {
         self.chunks.remove(&chunk);
       }
@@ -385,10 +348,6 @@ impl VolumeGrid {
     }
     applied
   }
-
-  // =========================================================================
-  // 组件层（level 2 brick = 16³ per cell）
-  // =========================================================================
 
   /// 写指定 ChunkCoord 下 level 2 brick (bx, by, bz) 的组件 ID
   pub fn set_comp(&mut self, chunk: ChunkCoord, bx: u32, by: u32, bz: u32, comp_id: u16) {
@@ -422,10 +381,6 @@ impl VolumeGrid {
   pub fn comp_layer(&self) -> &HashMap<ChunkCoord, Box<[u16; COMP_BRICKS_PER_CHUNK]>> {
     &self.comp_layer
   }
-
-  // =========================================================================
-  // StateTable
-  // =========================================================================
 
   pub fn set_state(&mut self, id: u8, word: usize, value: u32) {
     debug_assert!(word < 4);

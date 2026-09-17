@@ -1,12 +1,6 @@
 //! scroll_view：可滚动视图（overflow 裁剪 + 鼠标滚轮纵向滚动）。
-//!
-//! bevy_ui 0.19 无内置滚动容器，自实现：
-//! - viewport：`Overflow::clip()` 裁剪超出子节点，固定高度
-//! - content：绝对定位，`top = -scroll_y` 实现纵向偏移
-//! - 滚动量钳制在 `[-(content_h - viewport_h), 0]`
-//!
-//! 只响应光标悬停（Interaction::Hovered/Pressed）的 viewport。bevy 0.19 中 MouseWheel 是
-//! `Message`（非 Event），用 `MessageReader` 读取。
+//! viewport：`Overflow::clip()` 裁剪 + 固定高度；content：绝对定位，`top = -scroll_y`；滚动量钳制在
+//! `[-(content_h - viewport_h), 0]`。仅响应悬停的 viewport；MouseWheel 是 `Message`（用 `MessageReader`）。
 
 use std::ops::Deref;
 
@@ -62,9 +56,7 @@ impl Default for ScrollConfig {
   }
 }
 
-/// 创建可滚动视图。
-///
-/// `height`：viewport 高度（Val，可传 px/vh/percent）。
+/// 创建可滚动视图。`height`：viewport 高度（Val，可传 px/vh/percent）。
 pub fn scroll_view(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -119,8 +111,7 @@ pub fn scroll_view_system(
   mut q_vp: Query<(&mut ScrollView, &Interaction, &Children, &ComputedNode), With<ScrollViewport>>,
   mut q_content: Query<(&mut Node, &ComputedNode), With<ScrollContent>>,
 ) {
-  // 滚轮 y：正值 = 向上滚（winit/Windows 传统鼠标滚轮正向），scroll_y 增大（趋向 0）。
-  // Pixel 单位（触控板）按典型行高 16px 折算成行。
+  // 滚轮 y 正值 = 向上滚，scroll_y 增大（趋向 0）；Pixel 单位（触控板）按 16px 行高折算成行。
   let mut lines = 0.0;
   for ev in scroll_reader.read() {
     match ev.unit {
@@ -133,7 +124,6 @@ pub fn scroll_view_system(
   }
   let delta = lines * SCROLL_SPEED; // 滚轮上 → scroll_y 增大（内容下移）
   for (mut sv, inter, children, vp_computed) in &mut q_vp {
-    // 只滚动光标悬停中的 viewport
     if *inter == Interaction::None {
       continue;
     }

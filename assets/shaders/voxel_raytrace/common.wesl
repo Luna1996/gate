@@ -1,36 +1,31 @@
 import package::bindings::{b_palette, g, light_u};
 
 // --- 常量区（与 Rust wgsl_consts mod 字节对齐）---
-// Douglas Brick Tree：256³ chunk，4³ 分裂因子，4 层（256→64→16→4→1）
+// Brick Tree：256³ chunk，4³ 分裂因子，4 层（256→64→16→4→1）
 const CHUNK_SIZE: u32 = 256u;
 const BRICK_FACTOR: u32 = 4u;
 const MAX_LEVEL: u32 = 4u;
 const NODE_FIXED_WORDS: u32 = 3u;    // mask_lo + mask_hi + palette
-// b_struct Region ①：稠密 chunk 窗口（64³ = 262144 字 = 1MB）
+// b_struct Region ①：稠密 chunk 窗口。
 const CHUNK_INDEX_CAP: u32 = 64u;
 const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
 const TREE_BASE: u32 = 262144u;          // Region ② 起始
 
 // --- 材质索引格式（16 位，与 Rust `gate_voxel::PALETTE_BITS` / `LEAF_*` 同源）---
-// 节点第 3 字：bit0..15 = uniform 子块色，bit16..31 = LOD 子树多数色（shader 暂未读 LOD 半区）。
-// 叶父层 inline：每字装 2 个体素（LEAF_VOXELS_PER_WORD），共 32 字（LEAF_INLINE_WORDS）。
-// 读端：`b_struct[addr + NODE_FIXED_WORDS + (idx >> 1u)]` 的第 (idx & 1u) 个半字（每半字 16 位）。
-// 各读点按既有风格写字面量（`& 0xFFFFu` / `>> 1u` / `(idx & 1u) * 16u`），权威定义在
-// `gate-render/src/brickmap/wire.rs`，改位宽须全量同步这 4 个 .wesl 的读点。
+// 节点第 3 字：bit0..15 = uniform 子块色，bit16..31 = LOD 子树多数色；叶父层 inline 每字装 2 个体素（LEAF_VOXELS_PER_WORD）。
+// 权威定义在 `wire.rs`，改位宽须同步全部读点。
 
-
-// 方向位掩码 LUT：3-bit 掩码（bit0=x>=0, bit1=y>=0, bit2=z>=0，共 8 种）→ side（boundary 计算用）
-// 与三轴步进 face id。打包：bits0-2=side, bits8-15=face_x, bits16-23=face_y, bits24-31=face_z；
-// face 规则：sign<0 穿对面（x→1, y→3, z→5）。
+// 方向位掩码 LUT：3-bit 方向掩码（bit0=x>=0, bit1=y>=0, bit2=z>=0，共 8 种）→ side 与三轴步进 face id。
+// 打包：bits0-2=side, bits8-15=face_x, bits16-23=face_y, bits24-31=face_z；face 规则 sign<0 穿对面。
 const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
-  0x05030100u, // dir=0 (-,-,-): side=(0,0,0), face=(1,3,5)
-  0x05030001u, // dir=1 (+,-,-): side=(1,0,0), face=(0,3,5)
-  0x05020102u, // dir=2 (-,+,-): side=(0,1,0), face=(1,2,5)
-  0x05020003u, // dir=3 (+,+,-): side=(1,1,0), face=(0,2,5)
-  0x04030104u, // dir=4 (-,-,+): side=(0,0,1), face=(1,3,4)
-  0x04030005u, // dir=5 (+,-,+): side=(1,0,1), face=(0,3,4)
-  0x04020106u, // dir=6 (-,+,+): side=(0,1,1), face=(1,2,4)
-  0x04020007u, // dir=7 (+,+,+): side=(1,1,1), face=(0,2,4)
+  0x05030100u,
+  0x05030001u,
+  0x05020102u,
+  0x05020003u,
+  0x04030104u,
+  0x04030005u,
+  0x04020106u,
+  0x04020007u,
 );
 
 // ---- face 索引（0..5 = -x,+x,-y,+y,-z,+z）与法线/诊断色的转换 ----
@@ -86,29 +81,26 @@ fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
   return srgb_to_linear(srgb);
 }
 
-/// palette 条目的自发光强度（0..1），= word1 低字节（wire.rs `pack_palette_entry` 同布局）。
+/// palette 条目的自发光强度（0..1），= word1 低字节（与 `pack_palette_entry` 同布局）。
 /// 发光体素是光源本体：着色时 radiance 直出，不吃方向/阴影。
 fn palette_emissive(palette_base: u32, pal: u32) -> f32 {
   return f32(b_palette[palette_base + pal * 2u + 1u] & 0xFFu) / 255.0;
 }
 
-/// palette 条目的粗糙度（0 = 镜面 … 1 = 完全粗糙）= word0 **高字节**
-/// （与 `wire.rs::pack_palette_entry` 的 `roughness << 24` 同布局）。
+/// palette 条目的粗糙度（0 = 镜面 … 1 = 完全粗糙），= word0 高字节（`roughness << 24` 同布局）。
 /// 着色侧用来定高光指数：粗糙度越小高光越窄越亮。
 fn palette_roughness(palette_base: u32, pal: u32) -> f32 {
   return f32((b_palette[palette_base + pal * 2u] >> 24u) & 0xFFu) / 255.0;
 }
 
-/// palette 条目的透射率（0 = 不透明 … 1 = 全透）= word1 次字节
-/// （与 `wire.rs::pack_palette_entry` 的 `transmission << 8` 同布局）。
-/// 着色侧用来做**透射续行**：primary 射线按 tau 连乘衰减后穿过体素继续走，
-/// 太阳阴影射线同样按 tau 连乘（玻璃背后仍有直射光）。
+/// palette 条目的透射率（0 = 不透明 … 1 = 全透），= word1 次字节（`transmission << 8` 同布局）。
+/// 着色侧用来做透射续行：primary 射线按 tau 连乘衰减后穿过体素继续走，太阳阴影射线同样按 tau 连乘。
 fn palette_transmission(palette_base: u32, pal: u32) -> f32 {
   return f32((b_palette[palette_base + pal * 2u + 1u] >> 8u) & 0xFFu) / 255.0;
 }
 
-// 天空纯色（miss 像素与探针射线 miss 端点共用；Minecraft 白天平原 #78A7FF）。
-// 输入为 sRGB，返回 linear（光照全程 linear，输出经 linear_to_srgb 还原）。
+// 天空纯色（miss 像素与探针射线 miss 端点共用）。
+// 输入 sRGB，返回 linear。
 fn sky_rgb() -> vec3<f32> {
   return srgb_to_linear(light_u.sky_color.xyz);
 }

@@ -1,13 +1,6 @@
-//! CPU 砖块图构建器：`VolumeGrid` → wire 格式（wire.rs §b_struct 契约）。
-//!
-//! [`BrickMapBuilder`]（单 volume）：全量构建按 ChunkCoord 排序 + Rayon 并行
-//! `ChunkTree::serialize()` + 顺序 append（字节级确定性）；增量
-//! [`BrickMapBuilder::update_chunk`] 重序列化 append + 窗口条目改指新基址，旧树字节作废计入
-//! `globals.node_free_words`（全量重建归零）——append-only，无原地修改。
-//!
-//! [`VolumesBuilder`]（多 volume）：持有 `Vec<BrickMapBuilder>`，各 volume 的 b_struct 顺序拼接，
-//! `GridDesc.tree_base` 指向统一 buffer 内的绝对字基址；增量脏区间按 `tree_base` 偏移后传给 GPU
-//! partial write，任一前置 volume 增长导致后续 tree_base 漂移 → 自动降级全量。
+//! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
+//! [`BrickMapBuilder`]（单 volume）：全量按 ChunkCoord 排序并行 `serialize()` 顺序 append；增量重序列化
+//! append，旧树字节计入 `globals.node_free_words`；[`VolumesBuilder`] 拼接各 b_struct 后按 `tree_base` 偏移上传。
 
 use std::collections::HashMap;
 
@@ -35,12 +28,12 @@ fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   )
 }
 
-/// ChunkCoord 确定性排序键（IVec3 无 Ord，展开为分量元组）
+/// ChunkCoord 确定性排序键（展开为分量元组）。
 fn coord_key(c: ChunkCoord) -> (i32, i32, i32) {
   (c.0.x, c.0.y, c.0.z)
 }
 
-/// chunk 是否有可渲染内容（HashMap 里可能残留空树，防御性排除）
+/// chunk 是否有可渲染内容（排除残留空树）。
 fn chunk_has_content(grid: &VolumeGrid, c: ChunkCoord) -> bool {
   grid.chunk(c).is_some_and(|t| !t.is_empty())
 }
@@ -58,10 +51,8 @@ pub enum ChunkUpdate {
   OutsideWindow,
 }
 
-/// 砖块图构建器：持有与 GPU buffer 字节一致的持久状态
-///
-/// chunk 窗口（origin/dims，chunk 单位）构造时一次性确定；此后出现的窗口外
-/// 新 chunk 不渲染（[`ChunkUpdate::OutsideWindow`]），全量重建可扩窗。
+/// 砖块图构建器：持有与 GPU buffer 字节一致的持久状态。
+/// chunk 窗口（origin/dims，chunk 单位）构造时确定；窗口外新 chunk 不渲染，全量重建可扩窗。
 pub struct BrickMapBuilder {
   buffers: BrickMapBuffers,
   /// 已渲染 chunk → (树区绝对字基址, 树字数)
@@ -69,21 +60,17 @@ pub struct BrickMapBuilder {
   origin: IVec3,
   dims: IVec3,
   rejected_chunks: u32,
-  /// 作废树字节累计（增量 append 后旧树；全量重建归零）
+  /// 作废树字节累计（增量 append 的旧树；全量重建归零）。
   garbage_words: usize,
-  /// 增量更新脏字节区间列表：每项 (lo_byte, hi_byte) 闭开，字对齐。
-  /// 每次增量 = 1 个窗口条目字 + 1 段树 append，区间天然分离。
+  /// 增量更新脏字节区间列表：每项 `(lo_byte, hi_byte)` 闭开，字对齐。
   dirty_struct: Vec<(usize, usize)>,
   /// 待上传的调色板脏槽闭区间（同一帧多次 `write_palette` 取并集）；None = 无变动。
-  /// 表本体 512KB，故不再整表重铺（见 [`Self::write_palette`]）。
   dirty_palette: Option<(u16, u16)>,
   /// 调色板同步游标：本 builder 上次同步时调色板的写版本；None = 从未同步过。
-  /// 用它而非"脏区间是否为空"来判断，因为同一张表可能有多个消费者（见 [`Self::write_palette`]）。
   palette_synced_at: Option<u64>,
 }
 
-/// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）。
-/// 空列表 = 对应 buffer 完全未修改，跳过写。
+/// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）；空 = 未修改。
 #[derive(Debug, Default, Clone)]
 pub struct DirtyRanges {
   pub struct_ranges: Vec<(usize, usize)>,
@@ -92,7 +79,6 @@ pub struct DirtyRanges {
 }
 
 impl BrickMapBuilder {
-  // --- Dirty range tracking：记录被写的字节范围（闭开 [lo, hi)），字对齐 ---
   #[inline]
   fn mark_struct_words(&mut self, start_word: usize, count_words: usize) {
     if count_words == 0 {
@@ -111,14 +97,12 @@ impl BrickMapBuilder {
     self.dirty_struct.push((lo, hi));
   }
 
-  /// 由 grid 包围盒确定 chunk 窗口（min - 1 起，跨度 +3 封顶 64³），不序列化内容
-  ///
-  /// 随后可逐 [`Self::update_chunk`] 累积内容（渐进式初载；等价性测试亦走此路径）。
+  /// 由 grid 包围盒确定 chunk 窗口（min - 1 起，跨度 +3 封顶 64³），不序列化内容。
+  /// 随后可逐 [`Self::update_chunk`] 累积内容（渐进式初载）。
   pub fn new_unbuilt(grid: &VolumeGrid) -> Self {
     let (origin, dims, rejected) = compute_window(grid);
     let mut b = Self {
       buffers: BrickMapBuffers {
-        // Region ① 稠密 chunk 窗口（1MB）+ 空树区
         b_struct: vec![0; TREE_BASE],
         b_palette: vec![0; PALETTE_WORDS],
         globals: BrickMapGlobals {
@@ -156,9 +140,8 @@ impl BrickMapBuilder {
     b
   }
 
-  /// 全量构建（初始化/兜底）：确定性 + Rayon 并行序列化
-  ///
-  /// chunk 按 ChunkCoord 升序 append；并行仅化序列化（纯函数），append 顺序不变。
+  /// 全量构建（初始化 / 兜底）：确定性 + Rayon 并行序列化。
+  /// chunk 按 ChunkCoord 升序 append；仅序列化并行，append 顺序不变。
   pub fn build_full(grid: &VolumeGrid) -> Self {
     let mut b = Self::new_unbuilt(grid);
     let mut coords: Vec<ChunkCoord> = grid
@@ -175,15 +158,12 @@ impl BrickMapBuilder {
       b.append_chunk(*c, &words);
     }
     b.refresh_globals();
-    // build_full 的调用方以整块写消费产物（mode_tag="full"），不消费脏区间；
-    // 若不丢弃，append 累积的全场景 mark 会留存到后续增量路径，
-    // 第一次 take_dirty_ranges 会带出全场景假区间。
+
     let _ = b.take_dirty_ranges();
     b
   }
 
-  /// 逐 chunk 增量重建（DirtyTracker 吐出的每个 coord 调一次）：
-  /// 重序列化 append + 窗口条目改指；旧树字节作废计入 node_free_words
+  /// 逐 chunk 增量重建：重序列化 append + 窗口条目改指；旧树字节计入 `node_free_words`。
   pub fn update_chunk(&mut self, grid: &VolumeGrid, coord: ChunkCoord) -> ChunkUpdate {
     if chunk_index_pos(self.origin, self.dims, coord.0).is_none() {
       return ChunkUpdate::OutsideWindow;
@@ -208,32 +188,25 @@ impl BrickMapBuilder {
       }
     };
     self.refresh_globals();
-    // 顺带铺 palette 的**脏槽**（材质是"用时才写进调色板"的，见 gate-app/src/edit.rs）：
-    // 必须与触发它的那次体素编辑**同一帧**上传，否则新放的体素会以槽位上一任材质的颜色出现。
-    // 表本体 2^16 条 = 512KB，不能像原来 256 条（2KB）那样整表重铺，故只写变动槽区间。
+
+    // palette 脏槽必须与触发它的那次体素编辑同一帧上传。
     self.write_palette(grid);
     out
   }
 
-  /// 调色板增量铺：把 grid 侧"自本 builder 上次同步以来变化"的槽写进 CPU 镜像并累积脏区间。
-  ///
-  /// **多消费者安全**：同一张表可能被多个 builder 消费（渲染世界每 volume 一个，外加
-  /// gate-app 启动期的诊断 builder —— 见 `gate-app/src/scene.rs` 的 `BrickMapBuilder::build_full`）。
-  /// 脏区间只能被取走一次，所以判断"要不要同步"用调色板自己的写版本，而不是脏区间是否为空；
-  /// 且**首次同步必然全量**（镜像初始全零），非首次拿不到脏区间时也退回全量，绝不静默跳过。
-  /// 首次全量铺满 512KB，此后每次材质新增最多几个槽。
+  /// 调色板增量铺：把自上次同步以来变化的槽写进 CPU 镜像并累积脏区间。
+  /// 多消费者安全：用调色板写版本判断是否同步；首次同步必然全量，非首次拿不到脏区间也退回全量。
   pub fn write_palette(&mut self, grid: &VolumeGrid) {
     let version = grid.palette().version();
     if self.palette_synced_at == Some(version) {
-      return; // 自本 builder 上次同步以来调色板未变
+      return;
     }
     let range = match self.palette_synced_at {
       None => {
-        // 首次同步：本镜像全零，必须整表铺；顺手把脏区间消费掉（内容已被整表覆盖）
         let _ = grid.palette().take_dirty();
         None
       }
-      // 非首次：拿到脏区间就只铺那一段；被别人取走（None）则退回全量
+
       Some(_) => grid.palette().take_dirty(),
     };
     let (lo, hi) = range.unwrap_or((0, PALETTE_INDEX_MAX));
@@ -243,7 +216,7 @@ impl BrickMapBuilder {
       self.buffers.b_palette[i as usize * 2 + 1] = b;
     }
     self.palette_synced_at = Some(version);
-    // 累积进"待上传槽区间"（同一帧多次 update_chunk 取并集）
+
     self.dirty_palette = Some(match self.dirty_palette {
       None => (lo, hi),
       Some((d0, d1)) => (d0.min(lo), d1.max(hi)),
@@ -255,8 +228,6 @@ impl BrickMapBuilder {
   }
 
   /// 取走累积的增量脏字节区间列表（并重置）。
-  ///
-  /// 全量构建路径 (`build_full`) 不需要它：调用方应以 mode_tag=full 整块上传。
   pub fn take_dirty_ranges(&mut self) -> DirtyRanges {
     DirtyRanges {
       struct_ranges: std::mem::take(&mut self.dirty_struct),
@@ -276,8 +247,6 @@ impl BrickMapBuilder {
   pub fn dims(&self) -> IVec3 {
     self.dims
   }
-
-  // ---- 内部：append / release ----
 
   /// append 一个 chunk 的序列化树 + 写窗口条目（幂等覆盖同 chunk 旧条目）
   fn append_chunk(&mut self, coord: ChunkCoord, words: &[u32]) {
@@ -312,11 +281,7 @@ impl BrickMapBuilder {
   }
 }
 
-// ============================================================================
-// VolumesBuilder：多 volume 统一构建器
-// ============================================================================
-
-/// u32 字切片 → 本机字节序 u8 Vec（wire 按小端直存，x86/ARM 均 LE；同 u8_of_u32 约定）
+/// u32 字切片 → 本机字节序 u8 `Vec`（wire 按小端直存）。
 fn words_to_bytes(words: &[u32]) -> Vec<u8> {
   let mut v = Vec::with_capacity(words.len() * 4);
   // SAFETY: &[u32] → &[u8] 等长重解释，仅用于立即拷贝进 v
@@ -349,11 +314,8 @@ pub struct VolumesSnapshot {
   pub dirty_chunks: usize,
 }
 
-/// 多 volume 统一构建器：持有 `Vec<BrickMapBuilder>`，输出统一 buffer + GridDesc 数组
-///
-/// 各 volume 的 `BrickMapBuilder` 独立维护 dirty 跟踪和增量 append。
-/// `snapshot()` 顺序拼接各 volume 的 b_struct/b_palette，生成 GridDesc 数组。
-/// 增量路径：若任一前置 volume 增长导致后续 tree_base 漂移，自动降级为全量。
+/// 多 volume 统一构建器：持有 `Vec<BrickMapBuilder>`，输出统一 buffer + GridDesc 数组。
+/// 各 volume 独立维护 dirty 跟踪；增量下任一前置 volume 增长使 tree_base 漂移则自动降级全量。
 pub struct VolumesBuilder {
   builders: Vec<BrickMapBuilder>,
   /// 每 volume 的变换（缓存自 Volumes，用于 GridDesc 生成）
@@ -401,12 +363,8 @@ impl VolumesBuilder {
     }
   }
 
-  /// 同步 volume 数量（新增 volume 时追加 builder）+ 更新变换
   /// 逐 volume 同步调色板（版本门控；无变化时全部空操作）。
-  ///
-  /// 用途：菜单改材质参数（颜色/自发光/透明/光滑）时**几何完全不脏**，但调色板槽内容变了 ——
-  /// 若不在这里补一次同步，拖滑杆就看不到任何变化（调色板的同步点原本只有
-  /// [`BrickMapBuilder::update_chunk`]，而它只在几何脏 chunk 时被调用）。
+  /// 用途：菜单改材质参数时几何不脏但调色板槽内容变了，须在此补一次同步。
   pub fn sync_palettes(&mut self, volumes: &Volumes) {
     for (i, grid) in volumes.all().iter().enumerate() {
       if let Some(b) = self.builders.get_mut(i) {
@@ -444,17 +402,12 @@ impl VolumesBuilder {
   }
 
   /// 取走统一快照：拼接所有 volume 的 b_struct/b_palette + 生成 GridDesc 数组。
-  ///
-  /// 布局策略：物体 (1..N) 先放、主世界 (0) 后放，使主世界 b_struct 增长不漂移任何前置
-  /// volume 的 tree_base（→ 可走增量上传）；GridDesc 数组仍按 volume 索引顺序
-  /// [0, 1, 2, ...]（主世界 = 0），tree_base 指向统一 buffer 内的实际位置。
+  /// 布局：物体 (1..N) 先放、主世界 (0) 后放（主世界增长不漂移前置 tree_base）；GridDesc 按 volume 索引序。
   pub fn snapshot(&mut self) -> VolumesSnapshot {
     let n = self.builders.len();
-    // b_struct 布局序：物体 1..N 先，主世界 0 后（主世界编辑不漂移物体）
+
     let layout_order: Vec<usize> = (1..n).chain(std::iter::once(0)).collect();
 
-    // tree_bases[i] / palette_bases[i] = volume i 在统一 buffer 内的字基址。
-    // 只累加字数，不拼接字节。
     let mut tree_bases = vec![0u32; n];
     let mut palette_bases = vec![0u32; n];
     let mut struct_total_words = 0usize;
@@ -467,7 +420,6 @@ impl VolumesBuilder {
       palette_total_words += buffers.b_palette.len();
     }
 
-    // GridDesc 数组按 volume 索引顺序（0=主世界，1..N=物体）
     let mut grid_descs = Vec::with_capacity(n);
     for i in 0..n {
       let buffers = self.builders[i].buffers();
@@ -486,9 +438,6 @@ impl VolumesBuilder {
         dims,
       );
       if i == 0 {
-        // 主世界（identity：局部=世界）：AABB = chunk 窗口范围（voxel 单位）。
-        // from_transform 默认给 [0,256]³·scale——窗口 origin 可为负且 dims 巨大，
-        // 默认盒会把窗口绝大部分 slab 剔除 → 全屏只渲染 chunk(0,0,0) 附近一小块。
         desc.aabb_min = Vec4::new(
           (origin.x * CHUNK_SIZE) as f32,
           (origin.y * CHUNK_SIZE) as f32,
@@ -505,7 +454,6 @@ impl VolumesBuilder {
       grid_descs.push(desc);
     }
 
-    // 漂移检测：volume 数变化 / 任一 tree_base 或 palette_base 变化 → 全量
     let bases_shifted = self.prev_tree_bases.len() != tree_bases.len()
       || self.prev_tree_bases.iter().zip(tree_bases.iter()).any(|(p, c)| p != c)
       || self.prev_palette_bases.iter().zip(palette_bases.iter()).any(|(p, c)| p != c);
@@ -519,7 +467,6 @@ impl VolumesBuilder {
     let mut palette_blobs = Vec::new();
 
     if need_full {
-      // 全量路径：丢弃各 builder 的脏区间（整块写覆盖），拼接完整字节
       for b in &mut self.builders {
         let _ = b.take_dirty_ranges();
       }
@@ -529,8 +476,6 @@ impl VolumesBuilder {
         b_palette.extend_from_slice(&buffers.b_palette);
       }
     } else {
-      // 增量路径：只把各 builder 的脏区间内容拷贝成独立字节块（KB~MB 级），
-      // 偏移按 tree_base/palette_base 平移到统一 buffer。prepare 逐块 write_buffer。
       for i in 0..n {
         let dr = self.builders[i].take_dirty_ranges();
         let tb = tree_bases[i] as usize;
@@ -541,7 +486,6 @@ impl VolumesBuilder {
           struct_blobs.push((tb * 4 + lo, words_to_bytes(&buffers.b_struct[lw..hw])));
         }
         if let Some((lo, hi)) = dr.palette_range {
-          // 脏槽闭区间 → 统一 palette buffer 内的字节偏移 + 该区间字节（每槽 8B = 2 字）
           let w0 = lo as usize * 2;
           let w1 = hi as usize * 2 + 2;
           palette_blobs.push((
@@ -583,8 +527,7 @@ impl VolumesBuilder {
   }
 }
 
-/// 窗口计算：原点 = 最小非空 chunk - 1（±1 chunk 余量），跨度 = max - min + 3，
-/// 封顶 64³（CHUNK_INDEX_CAP）
+/// 窗口计算：原点 = 最小非空 chunk - 1（±1 chunk 余量），跨度 = max - min + 3，封顶 64³（CHUNK_INDEX_CAP）。
 fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
   let mut min = IVec3::splat(i32::MAX);
   let mut max = IVec3::splat(i32::MIN);

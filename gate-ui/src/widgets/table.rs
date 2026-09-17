@@ -1,6 +1,5 @@
 //! table：简易数据表格（表头 + 斑马纹行，每列 flex_grow 等宽）。
-//!
-//! 无排序/选择/虚拟滚动；展示用。行高靠 padding，列宽靠 flex_grow:1 均分。
+//! 展示用，无排序/选择/虚拟滚动；行高靠 padding，列宽靠 flex_grow:1 均分。
 
 use std::ops::Deref;
 
@@ -42,7 +41,7 @@ pub struct TableConfig {
   pub rows: Vec<Vec<String>>,
 }
 
-/// 创建表格。`headers` 为表头列名，`rows` 为数据行（每行列数应与 headers 一致）。
+/// 创建表格。
 pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> TableHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -60,7 +59,6 @@ pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> Tab
       BorderColor::all(color_of(&c.border)),
     ))
     .with_children(|root| {
-      // ---- 表头行 ----
       root
         .spawn((
           Name::new("ui-table-header"),
@@ -82,7 +80,6 @@ pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> Tab
             ));
           }
         });
-      // ---- 数据行（斑马纹）----
       for (i, row_data) in config.rows.iter().enumerate() {
         let bg = if i % 2 == 0 { color_of(&c.surface_card) } else { color_of(&c.surface_base) };
         root
@@ -105,7 +102,7 @@ pub fn table(ctx: &UiCtx, parent: &mut ChildSpawner, config: TableConfig) -> Tab
                 label_bundle(ctx, cell.clone(), m.font_size.sm, color_of(&c.text_body)),
               ));
             }
-            // 列数不足时填空单元格，保持列对齐
+            // 列数不足时补空单元格以保持对齐
             for _ in row_data.len()..ncols {
               row.spawn((
                 TableCell,

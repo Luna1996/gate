@@ -1,9 +1,6 @@
 //! button：四变体 + Interaction 状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
-//!
-//! 变体（docs/ui-dark-theme.md §5.2）：Primary（强调填充，主操作）/ Danger（破坏性操作）/
-//! Secondary（抬升表面 + 边框）/ Ghost（透明底，工具栏等低调操作）。
-//!
-//! 统一反馈：hover 提亮一档；pressed 填充压深 + [`UiTransform`] scale 0.98（绕节点中心）。
+//! 变体：Primary（强调填充）/ Danger（破坏性）/ Secondary（抬升表面+边框）/
+//! Ghost（透明底）。反馈：hover 提亮一档；pressed 填充压深 + `UiTransform` scale 0.98（绕节点中心）。
 
 use std::ops::Deref;
 
@@ -15,8 +12,7 @@ use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
 use crate::theme::UiTheme;
 
 /// 按钮点击事件（EntityEvent，target = 按钮实体）。
-/// 用法：`app.world_mut().entity_mut(btn).observe(|_: On<UiClick>| { ... })`
-/// 或全局：`app.add_observer(|_: On<UiClick>| { ... })`
+/// 用法：`entity_mut(btn).observe(|_: On<UiClick>| ...)` 或 `app.add_observer(...)`。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct UiClick {
   pub entity: Entity,
@@ -36,7 +32,7 @@ pub enum ButtonVariant {
   Danger,
 }
 
-/// 按压触觉反馈：pressed 时绕节点中心缩放到 98%
+/// 按下时绕节点中心缩放到 98%
 const PRESSED_SCALE: f32 = 0.98;
 
 /// 按钮句柄（Deref 到根实体 Entity）
@@ -65,7 +61,7 @@ pub struct ButtonConfig {
   pub disabled: bool,
 }
 
-/// 主题按钮（文本子标签；变体由 [`ButtonConfig::variant`] 决定）
+/// 主题按钮（文本子标签；变体由 `ButtonConfig::variant` 决定）
 pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, config: ButtonConfig) -> ButtonHandle {
   let m = &ctx.theme.metrics;
   let (bg, border, text_color) = variant_colors(ctx.theme, config.variant, Interaction::None);
@@ -126,7 +122,7 @@ fn variant_colors(
       (bg, bg, color_of(&c.text_primary))
     }
     ButtonVariant::Danger => {
-      // danger 只有一档填充；hover 靠 scale 之外的边框提亮区分
+      // danger 仅一档填充，hover 靠边框提亮区分
       let bg = color_of(&c.danger_fill);
       let border = match inter {
         Interaction::Hovered => color_of(&c.danger),
@@ -174,12 +170,8 @@ type ButtonQuery = (
   Has<UiDisabled>,
 );
 
-/// 按钮状态机：hover/pressed 视觉 + 按压缩放 + 释放触发 UiClick（每帧重算）
-///
-/// Disabled 态：跳过 click、忽略 Interaction（配色恒为 None 态并降亮）、不缩放。
-///
-/// 注意必须 With<Button>：0.19 中 Node require BackgroundColor，所有 UI 节点都带
-/// 该组件；无过滤会把 checkbox 行等带 Interaction 的节点也刷成按钮配色。
+/// 按钮状态机：hover/pressed 视觉 + 按压缩放 + 释放触发 UiClick（每帧重算）；Disabled 态跳过
+/// click、配色恒 None 态并降亮、不缩放。查询须带 `With<Button>`。
 pub fn button_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -189,7 +181,6 @@ pub fn button_state_system(
   let Some(theme) = theme else { return };
   for (e, inter, mut prev, mut bg, mut border, mut ui_t, variant, children, disabled) in &mut q {
     if disabled {
-      // Disabled：恒为 None 态配色 + 降亮；不发 click、不缩放
       let (target_bg, target_border, target_text) =
         variant_colors(&theme, *variant, Interaction::None);
       let target_bg = dim_color(target_bg);
@@ -216,7 +207,7 @@ pub fn button_state_system(
       prev.0 = Interaction::None;
       continue;
     }
-    // click = 在按钮上按下并释放（拖出后释放视为取消）
+    // click = 按下后在按钮上释放（拖出释放视为取消）
     if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
       commands.trigger(UiClick { entity: e });
     }
@@ -229,7 +220,7 @@ pub fn button_state_system(
     if *border != target_border {
       *border = target_border;
     }
-    // 按压缩放（绕节点中心，bevy_ui 布局以节点中心为变换原点）
+    // 按压缩放（绕节点中心，bevy_ui 变换原点即节点中心）
     let target_scale = if *inter == Interaction::Pressed { PRESSED_SCALE } else { 1.0 };
     if (ui_t.scale.x - target_scale).abs() > f32::EPSILON {
       ui_t.scale = Vec2::splat(target_scale);

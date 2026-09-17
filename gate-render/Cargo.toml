@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [features]
-# 性能剖析：启用 wgpu-profiler GPU scope（数据进 Tracy，需配套 gate-app/profile）
+# 性能剖析：wgpu-profiler GPU scope（数据进 Tracy，需配套 gate-app/profile）
 profile = ["dep:wgpu-profiler"]
 
 [dependencies]
@@ -13,10 +13,10 @@ bevy = { workspace = true }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 rayon = { workspace = true }
-# P3.1 光照主题 RON 解析（版本随 workspace，避免双份编译）
+# 光照主题 RON 解析（版本随 workspace，避免双份编译）
 serde = { workspace = true }
 ron = { workspace = true }
 # GPU 帧剖析（feature = "profile"）：compute/render pass 时间戳 → Tracy
 wgpu-profiler = { workspace = true, optional = true }
-# WESL 运行时编译（dda shader 拆包 → 编译回 WGSL 交给 Bevy 资产系统）
+# WESL 运行时编译（dda shader 拆包 → WGSL 交给 Bevy 资产系统）
 wesl = { workspace = true }

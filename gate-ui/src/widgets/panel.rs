@@ -1,9 +1,6 @@
-//! panel：面板容器（暗色表面令牌，docs/ui-dark-theme.md §5.1）。
-//!
-//! 层级靠表面色与 1px 边框表达，不用阴影；表面档由 [`PanelSurface`] 选定（Card/Hud/Elevated）。
-//!
-//! 响应式约定：面板定位由调用方设置（PositionType::Absolute + Percent 边距锚定边缘），
-//! 本函数只给视觉令牌与 flex 纵向布局。
+//! panel：面板容器（暗色表面令牌）。
+//! 层级靠表面色 + 1px 边框表达，无阴影；表面档由 `PanelSurface` 选定（Card/Hud/Elevated）。
+//! 定位由调用方设置（PositionType::Absolute + Percent 边距锚边），本函数只给视觉令牌与 flex 纵向布局。
 
 use std::ops::Deref;
 
@@ -12,7 +9,7 @@ use bevy::ui::FocusPolicy;
 
 use super::{UiCtx, color_of, px};
 
-/// 面板表面档（层级靠表面色与 1px 边框表达，不用阴影）
+/// 面板表面档（决定背景与边框令牌）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PanelSurface {
   /// L1 不透明卡片（菜单/设置/模态本体）

@@ -1,9 +1,6 @@
 //! 坐标系与层级常量（Douglas Brick Tree 对齐）。
-//!
-//! VoxelCoord = 最细格（1³，i32³ 世界坐标，无边界）；ChunkCoord = 256³ chunk 的
-//! 分层 HashMap key；BrickCoord = 树内 brick（256³ / 4^level 体素）。
-//! 层级 256 → 64 → 16 → 4 → 1；Level 2（16³）= 组件粒度 = DDGI probe cell = gate cell，
-//! Level 4（1³）= 编辑最细粒度（voxel，2cm）。
+//! VoxelCoord = 最细格（1³，i32³ 世界坐标）；ChunkCoord = 256³ chunk 的分层 HashMap key；BrickCoord = 树内 brick。
+//! 层级 256 → 64 → 16 → 4 → 1；Level 2（16³）= 组件粒度 = DDGI probe cell，Level 4（1³）= 编辑最细粒度。
 
 use glam::IVec3;
 
@@ -13,7 +10,7 @@ pub const CHUNK_SIZE: i32 = 256;
 /// 分裂因子（4³ = 64 子块）
 pub const BRICK_FACTOR: i32 = 4;
 
-/// 最大分裂深度：ceil(log₄(256)) = 4
+/// 最大分裂深度
 pub const MAX_LEVEL: u8 = 4;
 
 /// 每层级 brick 边长（体素）：[256, 64, 16, 4, 1]
@@ -71,13 +68,13 @@ impl VoxelCoord {
     IVec3::new(self.x, self.y, self.z)
   }
 
-  /// 对应的 chunk 坐标（欧氏除法保证负坐标落到邻接 chunk）
+  /// 对应的 chunk 坐标（欧氏除法）。
   pub fn chunk(&self) -> ChunkCoord {
     let v = IVec3::new(self.x, self.y, self.z);
     ChunkCoord(v.div_euclid(IVec3::splat(CHUNK_SIZE)))
   }
 
-  /// 在所在 chunk 内的本地坐标（0..255 每分量，负坐标正确）
+  /// 在所在 chunk 内的本地坐标（各分量 0..255）。
   pub fn in_chunk(&self) -> IVec3 {
     let v = IVec3::new(self.x, self.y, self.z);
     v.rem_euclid(IVec3::splat(CHUNK_SIZE))

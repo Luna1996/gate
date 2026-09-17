@@ -1,9 +1,6 @@
-//! toggle_switch：滑动开关（docs/ui-dark-theme.md §5.3 选中态语义）。
-//!
-//! 复用 `Checked` presence 语义（与 checkbox 一致）：有 `Checked` = 开，无 = 关。
-//!
-//! 视觉：32×16 轨道（圆角 sm）+ 方形滑块（absolute，左 = 关 / 右 = 开）：关 = 抬升表面 +
-//! 边框（hover 边框提亮）+ 说明文字灰滑块；开 = 强调填充 + 主文本色滑块。
+//! toggle_switch：滑动开关。
+//! 复用 `Checked` presence 语义（有 = 开，无 = 关）。视觉：32×16 轨道（圆角 sm）+ 方形滑块
+//! （absolute，左 = 关 / 右 = 开）：关 = 抬升表面+边框（hover 提亮）+ 灰滑块；开 = 强调填充+主色滑块。
 
 use std::ops::Deref;
 
@@ -58,7 +55,7 @@ pub struct ToggleSwitchConfig {
 }
 
 /// 开关状态变化事件（用户点击翻转时触发；EntityEvent，target = 根实体）。
-/// `Checked` 组件仍是真源，事件只是通知，主动读状态可 Query/Has。
+/// `Checked` 组件仍是真源，事件仅通知；主动读状态用 Query/Has。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct ToggleSwitchToggled {
   pub entity: Entity,
@@ -147,10 +144,8 @@ type TrackFilter = (With<ToggleTrack>, Without<ToggleSwitch>);
 type KnobData = (&'static mut Node, &'static mut BackgroundColor);
 type KnobFilter = (With<ToggleKnob>, Without<ToggleTrack>);
 
-/// 开关状态机：释放时翻转 `Checked` 并触发 [`ToggleSwitchToggled`]；
-/// 轨道/滑块配色与滑块位置跟随状态（每帧重算）
-///
-/// Disabled 态：跳过翻转逻辑，配色降亮一档，滑块位置仍按当前 checked 状态。
+/// 开关状态机：释放时翻转 `Checked` 并触发 `ToggleSwitchToggled`；轨道/滑块配色与位置跟随状态（每帧重算）。
+/// Disabled：跳过翻转、配色降亮一档，滑块位置仍按当前 checked。
 pub fn toggle_switch_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -169,7 +164,7 @@ pub fn toggle_switch_state_system(
   let left_on = px(TRACK_W - TRACK_H);
   for (e, inter, mut prev, checked, children, disabled) in &mut q {
     if !disabled {
-      // click = 按下并释放（与 button/checkbox 判定一致）
+      // click = 按下并释放（与 button/checkbox 一致）
       if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
         if checked {
           commands.entity(e).remove::<Checked>();
@@ -181,7 +176,7 @@ pub fn toggle_switch_state_system(
     }
     prev.0 = *inter;
     let hovered = !disabled && *inter == Interaction::Hovered;
-    // 视觉：开 → 强调填充轨道 + 主色滑块；关 → 抬升轨道 + 灰滑块（hover 边框提亮）
+    // 开 → 强调填充轨道 + 主色滑块；关 → 抬升轨道 + 灰滑块（hover 边框提亮）
     let (target_bg, target_border) = if checked {
       (accent, accent)
     } else if hovered {

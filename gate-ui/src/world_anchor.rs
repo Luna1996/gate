@@ -1,9 +1,6 @@
 //! world_anchor：世界空间 UI 投影锚定。
-//!
-//! 每帧把锚点世界坐标经 view_proj 投影到屏幕像素，写入 UI 节点绝对定位（left/top）；
-//! NDC 越界 / 在相机背后 → `Visibility::Hidden`。可选距离缩放（作用于本实体 TextFont）。
-//! 依赖边界：gate-ui 不依赖 gate-render——投影矩阵经通用资源 [`AnchorCamera`] 由 app 侧同步，
-//! 投影数学只依赖 Mat4。遮挡检测（CPU DDA）需体素网格跨 crate 访问，暂不实现。
+//! 每帧把锚点世界坐标经 view_proj 投影为屏幕像素，写入 UI 节点绝对定位（left/top）；越界 / 相机背后 → `Visibility::Hidden`。
+//! 可选距离缩放作用于本实体 TextFont；投影矩阵经 `AnchorCamera` 由 app 侧同步（gate-ui 不依赖 gate-render）。
 
 use crate::theme::ThemeFont;
 use bevy::asset::{AssetServer, LoadState};
@@ -43,10 +40,7 @@ pub struct WorldAnchor {
 pub struct AnchorBaseFont(FontSize);
 
 /// `world_anchor_label()` 生成的待应用文本（文本 + 颜色）。
-///
-/// 延迟插入 Text/TextFont：spawn 常发生在主题字体异步加载完成前，此时 Assets<Font> 的
-/// default slot 仍是 Bevy 内置 FiraMono（CJK 字形缺失 → 方框）。`world_anchor_apply_text`
-/// 在 ThemeFont Loaded 后把文本组件真正插入实体，保证首帧栅格即用主题字体渲染 CJK。
+/// Text/TextFont 延迟到主题字体就绪后由 `world_anchor_apply_text` 补插，避免 CJK 方框。
 #[derive(Component, Clone, Debug)]
 pub struct PendingAnchorText {
   pub text: String,
@@ -121,7 +115,7 @@ pub fn world_anchor_system(
       *vis = vis_of(show);
     }
 
-    // 可选距离缩放：作用于本实体 TextFont（无 TextFont 的节点静默跳过）
+    // 可选距离缩放：无 TextFont 的节点跳过
     if anchor.scale_with_distance
       && let Some(mut tf) = tf
     {
@@ -149,10 +143,7 @@ fn vis_of(v: bool) -> Visibility {
 }
 
 /// 快捷 spawn：世界空间文本标注（绝对定位由系统每帧写入）。
-///
-/// 字体走 `FontSource::default()` slot；为保证 CJK 字形不变成方框，本函数**不会立即插入
-/// Text/TextFont 组件**，而是写入 [`PendingAnchorText`]，由 `world_anchor_apply_text`
-/// 在主题字体 `LoadState::Loaded` + default slot 被覆盖之后补插文本组件。
+/// 不立即插入 Text/TextFont，而是写入 `PendingAnchorText`，由 `world_anchor_apply_text` 字体就绪后补插。
 pub fn world_anchor_label(
   commands: &mut Commands,
   text: &str,
@@ -170,23 +161,20 @@ pub fn world_anchor_label(
         reference_distance: 760.0,
       },
       Node::default(),
-      // 文本延迟到字体就绪后再插入（见 world_anchor_apply_text）
+      // 文本延迟到字体就绪后插入（见 world_anchor_apply_text）
       PendingAnchorText { text: text.to_string(), color, font_size: FontSize::Px(14.0) },
     ))
     .id()
 }
 
-/// 将 [`PendingAnchorText`] 转换为 `Text + TextFont + TextColor` 组件。
-///
-/// ThemeFont.handle 存在且 `LoadState::Loaded` → 直接用主题字体 Handle；ThemeFont 不存在
-/// 或 `font_path = None` → fallback 到 `FontSource::default()`；未就绪则下一帧重试。
+/// 将 `PendingAnchorText` 转换为 `Text + TextFont + TextColor` 组件。
+/// ThemeFont 已 Loaded → 用主题字体 Handle；不存在 / `font_path = None` → `FontSource::default()`；未就绪下一帧重试。
 pub fn world_anchor_apply_text(
   mut commands: Commands,
   server: Option<Res<AssetServer>>,
   font: Option<Res<ThemeFont>>,
   mut pending: Query<(Entity, &PendingAnchorText), Without<Text>>,
 ) {
-  // 1) 判断字体就绪态
   let ready_handle: Option<FontSource> = match (server, font) {
     (Some(srv), Some(f)) => match &f.handle {
       Some(h) if matches!(srv.load_state(h.id()), LoadState::Loaded) => {
@@ -200,7 +188,6 @@ pub fn world_anchor_apply_text(
   let Some(font_source) = ready_handle else {
     return;
   };
-  // 2) 对所有尚未应用文本（Without<Text>）的 Pending 实体插入组件
   let mut count = 0usize;
   for (e, p) in &mut pending {
     commands

@@ -1,21 +1,15 @@
 # gate-app 中文文案表（rust-i18n 编译期 codegen 进二进制）
-#
-# 格式：_version 1 = 每语言一个文件（assets/locales/<locale>.yml），加语言 = 加文件 +
-# 调 rust_i18n::set_locale。
+# _version 1 = 每语言一个文件（assets/locales/<locale>.yml）；加语言 = 加文件 + 调 rust_i18n::set_locale
 #
 # 约定：
 # - 键 = 「模块.控件」语义路径，调用点写 t!("模块.控件")
-# - 占位符 %{name}；**定长对齐的数字由调用点先 format! 好再传入**（%{x} 是原样替换，
-#   不会丢 "{:>7.1}" 这类宽度），所以数字列宽不随语言变化
-# - 只收**可见 UI 文案**。以下保持英文、不进本表：
-#   日志、技术标识符（DDGI / LOD / DDA）、单位（v/s、vx）、材质预设名（EDIT_MATERIALS.name）
-# - **DebugMenu 的文案 key 在本表 menu.\* 段**：菜单树存 key（assets/ui/debug_menu.toml），
-#   渲染时解析；切语言后整棵树重解析（gate-app 的 sync_ui_locale → gate-ui UiTranslator）
+# - 占位符 %{name} 原样替换；定长对齐的数字由调用点先 format! 好再传入
+# - 只收可见 UI 文案；日志、技术标识符（DDGI / LOD / DDA）、单位（v/s、vx）、材质预设名保持英文
+# - DebugMenu 的文案 key 在本表 menu.* 段：菜单树（assets/ui/debug_menu.toml）存 key，
+#   由 gate-ui 的 UiTranslator 解析，切语言后整棵树重解析（gate-app 的 sync_ui_locale）
 _version: 1
 
 # ---------------- DebugMenu（左上角调试菜单）----------------
-# 菜单树的文案字段（label/options/tooltip/text）在 assets/ui/debug_menu.toml 里存的就是 key，
-# 由 gate-ui 的 UiTranslator 解析；切语言后 menu.* 会整体重解析（见 sync_ui_locale）。
 menu.video: "视频"
 menu.video.half_res: "半分辨率"
 menu.video.half_res.tip: "3D 场景按 1/2 分辨率渲染再放大到窗口：省约 3/4 的主射线，代价是边缘变软（配合抗锯齿更明显）。"
@@ -77,12 +71,12 @@ menu.game.world.model: "模型"
 menu.game.world.reload: "重载世界"
 menu.ui: "界面"
 menu.ui.showcase: "UI 展示窗"
-# 纯文本行的**值**（左侧名称 `menu.player.camera.pos/dir` 已占左列，这里不再重复名称）
+# 纯文本行的值
 menu.camera.pos.value: "%{v}"
 menu.camera.dir.value: "yaw %{yaw}°, pitch %{pitch}°"
 
 # ---------------- 右上角组件展示窗 ----------------
-# 注：展示窗文案只在启动时求值（未挂 i18n key），不随运行期切语言重建；调试菜单才是 keyed UI。
+# 展示窗文案只在启动时求值（未挂 i18n key），不随切语言重建
 showcase.tab.widgets: "组件"
 showcase.tab.data: "数据"
 showcase.title: "UI 组件展示"

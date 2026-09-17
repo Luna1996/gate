@@ -1,7 +1,5 @@
-//! DebugWindow 容器与菜单组件的可调常量（集中在此，改数值不用翻实现）。
-//!
-//! 这些是**布局/动画**常量（尺寸、时长），不是运行时可调状态——后者一律进
-//! [`super::model::MenuFile`]（TOML 持久化）。
+//! DebugWindow 容器与菜单组件的可调常量。
+//! 布局/动画常量（尺寸、时长），非运行时可调状态——后者进 `super::model::MenuFile`（TOML 持久化）。
 
 use bevy::prelude::*;
 
@@ -13,14 +11,13 @@ pub const PAGE_W: f32 = 360.0;
 pub const PAGE_ANIM_SECS: f32 = 0.2;
 /// 默认列表项高度（px）
 pub const ITEM_H: f32 = 30.0;
-/// 「左|中|右」三分行的**左**列固定宽度（px；放名称，容得下 6 个中文字 ≈ 104px，
-/// 更长的名称由 label 中间省略兜住；比右列宽）
+/// 「左|中|右」三分行的左列固定宽度（px；放名称，容得下 6 个中文字 ≈ 104px，更长由中间省略兜住；比右列宽）
 pub const LEFT_COL_W: f32 = 80.0;
-/// 「左|中|右」三分行的**右**列固定宽度（px；放数值 / 色块，比左列窄）
+/// 「左|中|右」三分行的右列固定宽度（px；放数值 / 色块，比左列窄）
 pub const RIGHT_COL_W: f32 = 50.0;
 /// 列表项左右内边距（px）
 pub const ITEM_PAD: f32 = 6.0;
-/// 行内控件高度（px；需容身于 [`ITEM_H`]）
+/// 行内控件高度（px；需容身于 `ITEM_H`）
 pub const CTRL_H: f32 = 24.0;
 /// 按钮组相邻按钮间距（px；切换组为 0 = 无空隙并排）
 pub const BUTTON_GAP: f32 = 2.0;

@@ -8,8 +8,7 @@ license.workspace = true
 bevy = { workspace = true }
 serde = { workspace = true }
 ron = { workspace = true }
-# FontAwesome 图标码点常量（chars::* / strs::*），字体文件见 assets/fonts/fa-solid-900.ttf
-# （FA 5.15.4 Free Solid，码点与 crate 常量逐一对齐）
+# FontAwesome 图标码点常量（chars::* / strs::*）；字体文件 assets/fonts/fa-solid-900.ttf（5.15.4）
 font-awesome = "0.2"
-# 菜单层级/控件状态的持久化格式（与 bevy 传递依赖同版本，避免双份编译）
+# 菜单层级/控件状态的持久化格式（版本与 bevy 传递依赖一致，避免双份编译）
 toml = "0.8"

@@ -1,10 +1,5 @@
-//! 光源 wire 契约 + 数据驱动主题：方向光硬阴影（命中点向太阳投 1 条射线，不通即阴影）+ sky
-//! 纯色环境光（Minecraft 白天天空蓝 #78A7FF）+ 发光体素 radiance 直出（albedo × emissive，
-//! 无方向性、不受阴影）；无点光源、无 Phong 高光、无软阴影锥采样。光照数学全部在 GPU
-//! （shaders/voxel_raytrace/），CPU 侧只做数据打包，不做任何光照计算。
-//!
-//! Uniform 布局（WGSL `LightPool` 逐字段镜像）：LightGlobals(48B) + 8×LightDesc(384B) +
-//! sky_color(16B) = 448B；当前只填 lights[0] = 方向光，其余槽保留为 0。
+//! 光源 wire 契约 + 数据驱动主题（方向光硬阴影 / sky 纯色环境光 / 发光体素直出）；CPU 侧只做数据打包。
+//! Uniform 布局（WGSL `LightPool` 逐字段镜像）：LightGlobals(48B) + 8×LightDesc(384B) + sky_color(16B)。
 
 use bevy::ecs::resource::Resource;
 use bevy::render::render_resource::ShaderType;
@@ -15,13 +10,11 @@ use serde::Deserialize;
 pub const MAX_LIGHTS: usize = 8;
 /// 阴影射线起点沿法线偏移（voxel），消除自遮挡 acne
 pub const SHADOW_BIAS: f32 = 0.5;
-/// 方向光阴影射线 t_max：需 ≥ 场景 AABB 对角（当前 ≈3118，[-256,-512,-256]~[1536,1536,1280]），
-/// 表面点沿任意方向的遮挡必在其内。改世界尺度（GATE_TILES）时按对角线同步放大。
+/// 方向光阴影射线 t_max：须 ≥ 场景 AABB 对角；改世界尺度时按对角线同步放大。
 pub const SHADOW_DIR_T_MAX: f32 = 8192.0;
 /// 发光体素 radiance 直出增益
 pub const EMISSIVE_EMIT_GAIN: f32 = 4.0;
-/// 天空纯色（Minecraft 白天平原天空 #78A7FF；sRGB u8/255 直读——
-/// sRGB→linear 转换在 WGSL sky_rgb() 内做，CPU 侧不碰光照数学）
+/// 天空纯色（Minecraft 白天平原天空 #78A7FF；sRGB u8/255 直读，sRGB→linear 在 WGSL `sky_rgb()` 内做）
 pub const MINECRAFT_SKY: [f32; 3] = [120.0 / 255.0, 167.0 / 255.0, 1.0];
 
 /// 光源描述（shader 镜像，48B；uniform 数组 stride 16 的倍数 ✓）
@@ -59,10 +52,6 @@ pub struct LightPoolUniform {
   /// 天空纯色（miss 背景与 sky 环境光共用）
   pub sky_color: Vec4,
 }
-
-// ============================================================================
-// 数据驱动主题
-// ============================================================================
 
 /// 方向光配置（主题资产）
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -119,7 +108,6 @@ pub fn parse_lighting_ron(src: &str) -> Result<LightingTheme, ron::error::Spanne
 }
 
 /// 构建光池 uniform：方向光（lights[0]）+ 天空 + 环境 + 曝光
-/// 当前只处理方向光，不做点光源 / 发光体素 NEE。
 pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
   let mut u = LightPoolUniform {
     g: LightGlobals {

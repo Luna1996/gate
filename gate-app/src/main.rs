@@ -1,8 +1,6 @@
-//! gate 演示应用入口：插件装配 + 系统注册。
-//!
-//! 模块：[`scene`] 场景搭建 / [`camera`] 相机与输入 / [`debug_menu`] 左上角调试菜单（gate-ui menu 容器）/
-//! [`showcase`] 右上角组件展示窗 / [`vox_scene`] MagicaVoxel .vox 导入。
-//! 性能剖析：`--features profile` 启动后用 Tracy GUI 连接（CPU 与 wgpu-profiler GPU zone 同时间线）。
+//! gate 演示应用入口：插件装配 + 系统注册；`--features profile` 用 Tracy GUI 剖析（CPU 与 GPU zone 同时间线）。
+//! 模块：`scene` 场景搭建 / `camera` 相机与输入 / `debug_menu` 左上角调试菜单（gate-ui menu 容器）/
+//! `showcase` 右上角组件展示窗 / `vox_scene` MagicaVoxel .vox 导入。
 
 mod camera;
 mod debug_menu;
@@ -37,15 +35,14 @@ use scene::setup;
 use showcase::{showcase_demo_system, spawn_showcase};
 
 // i18n 文案表：编译期把 assets/locales/*.yml codegen 进二进制（`t!` 查表零 IO）。
-// fallback = 缺省语言：某语言缺键时回落中文，不会把裸 key 显示到 UI。
-// 加语言 = assets/locales/<locale>.yml + Cargo.toml 的 available-locales；运行期切语言 = rust_i18n::set_locale。
+// fallback = 缺省语言（缺键回落中文）；加语言 = assets/locales/<locale>.yml + Cargo.toml available-locales。
 rust_i18n::i18n!("../assets/locales", fallback = "zh-CN");
 
 /// 缺省语言（`rust_i18n::set_locale` 的入参）
 pub const DEFAULT_LOCALE: &str = "zh-CN";
 
 /// 只读资源根（Bevy `AssetPlugin::file_path`）：开发时 = 源码树 `assets/`，
-/// 便携发布时 = exe 同目录 `assets/`（见 [`gate_render::paths`]）
+/// 便携发布时 = exe 同目录 `assets/`（见 `gate_render::paths`）
 pub fn assets_dir() -> std::path::PathBuf {
   gate_render::assets_dir()
 }
@@ -57,14 +54,12 @@ pub fn log_path() -> std::path::PathBuf {
 }
 
 fn main() {
-  // profile feature：Tracy 客户端必须在最早期启动 —— wgpu-profiler 的
-  // new_with_tracy_client（RenderStartup）与 TracyLayer 都要求 Client 已 running；
+  // profile feature：Tracy 客户端必须在最早期启动，new_with_tracy_client 与 TracyLayer 都要求已 running；
   // guard 保活到 main 结束（drop 时 flush 残留 zone）。
   #[cfg(feature = "profile")]
   let _tracy_client = tracy_client::Client::start();
 
-  // i18n：把当前语言定成缺省中文。必须在任何 `t!` 求值之前 —— UI 由 debug_ui_setup
-  // 启动时一次性 spawn，文本生成后不再重算。
+  // i18n：把当前语言定成缺省中文；必须在任何 `t!` 求值之前（UI 文本只生成一次，之后不重算）。
   rust_i18n::set_locale(DEFAULT_LOCALE);
 
   // GATE_BENCH=1：失焦后台跑帧（配合窗口 focused=false 与 Fifo）
@@ -74,30 +69,24 @@ fn main() {
     DefaultPlugins
       .set(WindowPlugin {
         primary_window: Some(Window {
-          // scale_factor_override=1.0：强制 1 逻辑像素 = 1 物理像素，避免 OS 显示缩放
-          // （125%/150%）下 UI 1px 边框抗锯齿成 2px、文字模糊；3D 不受影响
-          // （DDA 目标固定 VIEW_SIZE，再 blit 到窗口）。
+          // scale_factor_override=1.0：强制 1 逻辑像素 = 1 物理像素。
           resolution: WindowResolution::new(VIEW_SIZE.x, VIEW_SIZE.y)
             .with_scale_factor_override(1.0),
-          // Fifo 硬垂直同步（与 DebugMenu「视频/垂直同步」开关默认开一致）；关闭 → AutoNoVsync
-          // 不封顶测裸 GPU 吞吐，bevy_render 检测 present_mode 变化后重配 swapchain。
-          // focused=false：启动不抢前台焦点。
+          // Fifo 硬垂直同步（与 DebugMenu「视频/垂直同步」默认一致）；focused=false 启动不抢前台焦点。
           focused: false,
           present_mode: PresentMode::Fifo,
-          resizable: true, // resize 后渲染目标与 aspect 由响应式系统跟随
+          resizable: true, // resize 后渲染目标/aspect 由响应式系统跟随
           ..default()
         }),
         ..default()
       })
       .set(AssetPlugin {
-        // 运行期解析（不是编译期常量）：便携发布时指向 exe 同目录的 assets/
+        // 运行期解析（非编译期常量）：便携发布时指向 exe 同目录的 assets/
         file_path: assets_dir().to_string_lossy().into_owned(),
         ..default()
       })
       .set(LogPlugin {
-        // info 基线 + 定向屏蔽：wgpu_hal::vulkan 的 instance / surface 层会打印
-        // wgpu 已知 bug 的 VUID 错误（仅首 1-2 帧 swapchain 时序异常，不影响画面正确性）；
-        // 其余 wgpu/winit/bevy_render 错误照常打印。
+        // info 基线 + 定向屏蔽 wgpu_hal::vulkan 的 instance/surface 层 VUID 报错
         filter: "info,wgpu=debug,wgpu_core=debug,\
           wgpu_hal::vulkan::instance=off,\
           wgpu_hal::vulkan::surface=off"
@@ -130,23 +119,21 @@ fn main() {
         },
         ..default()
       })
-      // profile feature：WgpuSettings 开 wgpu timestamp 特性（wgpu-profiler 的
-      // GPU zone 必需，DX12/Vulkan 均支持，缺特性时 scope 静默空转）。
-      // Bevy 0.19 的 WgpuSettings 不再是 Resource，须经 RenderPlugin.render_creation 注入。
+      // profile feature：经 RenderPlugin.render_creation 注入 WgpuSettings，开 wgpu timestamp 特性
+      // （wgpu-profiler GPU zone 必需）。
       .set(bevy::render::RenderPlugin { render_creation: profile_render_creation(), ..default() }),
   );
   app
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
-    // 体素编辑设置（形状/大小/材质/材质→调色板槽缓存）；DebugMenu 的「游戏/编辑」是它的视图
+    // 体素编辑设置（形状/大小/材质）；DebugMenu 的「游戏/编辑」是它的视图
     .init_resource::<edit::EditSettings>()
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()
     // UI 文案解析器：菜单树存 i18n key，gate-ui 经它解析（切语言后 sync_ui_locale 触发重解析）
     .insert_resource(gate_ui::UiTranslator::new(|key| t!(key).to_string()))
-    // GATE_BENCH=1：失焦窗口也用 Continuous 更新（Bevy 默认失焦切 reactive_low_power
-    // 60Hz，后台跑帧时 fps 会被封顶到 60）
+    // GATE_BENCH=1：失焦窗口也用 Continuous 更新（默认失焦为 reactive_low_power 60Hz）
     .insert_resource(bevy::winit::WinitSettings {
       focused_mode: bevy::winit::UpdateMode::Continuous,
       unfocused_mode: if bench {
@@ -159,10 +146,8 @@ fn main() {
     .add_systems(
       Update,
       (
-        // 相机链：模式切换对齐 → 转头（两模式共享）→ 各自输入 → 左键拾取 →
-        // 矩阵构造（build_camera_config）→ 体素编辑。
-        // 必须严格串行：都读写 OrbitCamera/FlyCamera/DdaCameraConfig，且 build_camera_config
-        // 需要同帧的输入结果；体素编辑读本帧 cfg，故排在矩阵构造之后。
+        // 相机链顺序固定：模式切换对齐 → 转头 → 各自输入 → 左键拾取 → build_camera_config → 体素编辑。
+        // 必须严格串行：都读写 OrbitCamera/FlyCamera/DdaCameraConfig；体素编辑读本帧 cfg，故在矩阵构造之后。
         (
           sync_camera_mode_switch,
           camera_look_input,
@@ -182,13 +167,11 @@ fn main() {
         showcase_demo_system,
         // F3 切换 DebugMenu 显隐（默认显示）
         debug_menu_toggle,
-        // 每帧强制 scale_factor=1.0：resize/换显示器时 winit 会重设 OS DPI 值并覆盖
-        // override，重设保证 UI 恒为 1 物理像素/逻辑像素
+        // 每帧强制 scale_factor=1.0：winit 在 resize/换显示器时会重设 OS DPI 值并覆盖 override
         enforce_integer_scale_factor,
       ),
     )
-    // 退出前把 DebugMenu 当前状态写回 TOML（下次启动的初值来源）。
-    // 必须排在 bevy_window 的 ExitSystems 之后：AppExit 由它写入，否则同一帧读不到 → 永不保存
+    // 退出前把 DebugMenu 当前状态写回 TOML；须排在 bevy_window 的 ExitSystems 之后（AppExit 由它写入）
     .add_systems(Last, save_menu_on_exit.after(bevy::window::ExitSystems));
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
@@ -228,11 +211,7 @@ fn tracy_frame_mark() {
   }
 }
 
-/// 每帧强制主窗口 scale_factor_override = 1.0。
-///
-/// winit 在 resize / 跨显示器移动时会触发 `ScaleFactorChanged`，把
-/// `Window.scale_factor` 刷成 OS DPI 值（125%/150% → 1.25/1.5）；重设 override
-/// 保证 1 逻辑像素 = 1 物理像素。
+/// 每帧强制主窗口 scale_factor_override = 1.0（winit 在 resize/跨显示器时会用 OS DPI 值覆盖它）。
 fn enforce_integer_scale_factor(mut q: Query<&mut Window, With<PrimaryWindow>>) {
   let Ok(mut w) = q.single_mut() else {
     return;
@@ -242,14 +221,8 @@ fn enforce_integer_scale_factor(mut q: Query<&mut Window, With<PrimaryWindow>>) 
   }
 }
 
-/// 主题就绪后 spawn 一次（RON 成功或回退默认都会插入 UiTheme 资源）。
-///
-/// one-shot = 存在性守卫：spawn 的根节点挂 [`DebugUiRoot`]，查到即跳过；命令 apply
-/// 后 marker 当帧生效，守卫最迟下一帧命中。
-///
-/// 等待条件：`theme.font_path` 非 None 时字体资产须已 `LoadState::Loaded`，否则
-/// TextPipeline 会在不含 CJK 的默认 slot 上生成字形缓存，之后即使 override default
-/// slot，已缓存的 atlas 条目光栅化仍是方框。图标字体同理（菜单标题栏/箭头）。
+/// 主题就绪后 spawn 一次（`UiTheme` 存在即跳过，根节点挂 `DebugUiRoot` 作守卫）。
+/// 字体资产须已 `LoadState::Loaded` 才 spawn；图标字体同理。
 fn debug_ui_setup(
   theme: Option<Res<UiTheme>>,
   font: Option<Res<ThemeFont>>,

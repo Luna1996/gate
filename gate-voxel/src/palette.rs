@@ -1,21 +1,14 @@
 //! 调色板：u16 索引 × 65536 条目，材质参数 + 视觉/语义标志位。
-//!
-//! 特殊体素走「调色板视觉变体 / CPU 校验标志 / 侧表数据」三级分流，不摊平进体素数据。
-//!
-//! **容量**：索引 16 位 → 单个 volume 最多 65536 种材质（0 保留给空气）。容量与体素
-//! 载荷宽度是同一件事的两个端面：树里"整块同色"存在节点上、逐体素色存在叶层 inline，
-//! 两处都是 16 位，故节点与体素必须同宽（见 `chunk_tree.rs` 的 `pack_pal_lod`）。
-//! 表本体 65536 × 8B = 512KB/volume，与体素数量无关；多 volume 共享同一张表由
-//! 渲染侧的 `palette_base` 指针天然支持。
+//! 索引 0 保留给空气，最多 65535 种材质；表本体 65536 × 8B = 512KB/volume，与体素数量无关。
+//! 节点 uniform 色与叶层逐体素色同宽（16 位，见 `chunk_tree.rs` 的 `pack_pal_lod`）。
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 调色板条目数（索引 0 保留为空气，故可用材质数 = 本值 - 1）
+/// 调色板条目数（索引 0 保留为空气，可用材质数 = 本值 - 1）
 pub const PALETTE_ENTRY_COUNT: usize = 65_536;
 
-/// 材质索引位宽。**这是 wire 格式的一等参数**：节点 uniform 色（3 字头的第 3 字低半区）
-/// 与叶父层逐体素色都按本宽度打包，改这里必须同步 shader 的解包掩码/位移。
+/// 材质索引位宽（wire 格式一等参数）。改这里必须同步 shader 的解包掩码/位移。
 pub const PALETTE_BITS: u32 = 16;
 
 /// 最大合法索引
@@ -24,22 +17,18 @@ pub const PALETTE_INDEX_MAX: u16 = (PALETTE_ENTRY_COUNT - 1) as u16;
 /// 槽占用位图的字数（每字 64 槽）
 const OCCUPIED_WORDS: usize = PALETTE_ENTRY_COUNT / 64;
 
-// 位图必须刚好覆盖全部槽
 const _: () = assert!(OCCUPIED_WORDS * 64 == PALETTE_ENTRY_COUNT);
 
-// 容量与位宽必须是同一个数（编译期校验，避免两处常量漂移）
 const _: () = assert!(PALETTE_ENTRY_COUNT == 1usize << PALETTE_BITS);
 const _: () = assert!(PALETTE_ENTRY_COUNT == PALETTE_INDEX_MAX as usize + 1);
 
-/// 调色板索引（新类型：把"材质索引"与裸 `u16` 区分开，避免位宽再变时的静默截断）
-///
-/// 语义上只用 0..=2^16-1，其中 0 = 空气（见 [`PaletteId::AIR`]）。
+/// 调色板索引（新类型，区别于裸 `u16`）；取值 0..=2^16-1，其中 0 = 空气。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct PaletteId(pub u16);
 
 impl PaletteId {
-  /// 空气（体素数据里的 0 天然表示未占用）
+  /// 空气（体素数据 0）。
   pub const AIR: Self = Self(0);
 
   #[inline]
@@ -60,15 +49,14 @@ impl From<u16> for PaletteId {
   }
 }
 
-/// 场景作者便利：`fill_box(..., 2)` 这类小槽号字面量默认推断为 `u8`
+/// 场景作者便利：小槽号字面量（如 `2`）默认推断为 `u8`。
 impl From<u8> for PaletteId {
   fn from(v: u8) -> Self {
     Self(v as u16)
   }
 }
 
-/// 场景作者便利：无类型约束的整数字面量会回落 `i32`，故也收它（越界直接 panic，
-/// 不做静默截断 —— 槽号写错属于编程错误，应在构造场景时就炸出来）
+/// 场景作者便利：无类型约束的整数字面量回落 `i32`；越界 panic。
 impl From<i32> for PaletteId {
   fn from(v: i32) -> Self {
     assert!(
@@ -104,14 +92,8 @@ impl From<PaletteId> for usize {
   }
 }
 
-/// 调色板条目：RGB 颜色 + PBR 简化参数 + 标志位
-///
-/// 体积对齐：3B color + 1B roughness + 1B emissive + 1B transmission + 1B flags = 7B，
-/// 补 1B padding = 8B/条目，65536 条 = 512KB（可直接进 GPU buffer）。
-///
-/// GPU 侧解包：`color`（albedo）、`emissive`（自发光，直出 + GI 注入）、
-/// `roughness`（高光指数）、`transmission`（透射续行 + 太阳光透射）；`flags` 尚无消费方，
-/// 留给后续材质扩展（见 `wire.rs::pack_palette_entry` 与 `common.wesl` 的 `palette_*` 解包）。
+/// 调色板条目：RGB 颜色 + PBR 简化参数 + 标志位（8B/条目，65536 条 = 512KB，可直接进 GPU buffer）。
+/// GPU 侧解包：`color`/`emissive`/`roughness`/`transmission`/`flags`（见 `wire.rs::pack_palette_entry`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct PaletteEntry {
@@ -147,39 +129,19 @@ impl PaletteFlags {
   }
 }
 
-/// 调色板：固定 65536 槽，索引 0 保留为「空/空气」语义
-///
-/// **脏槽追踪**：表本体 512KB 无法像原来 2KB 那样每次编辑整表重铺，故记录"自上次
-/// 取走以来被写过的槽区间"。渲染侧上传后调 [`Palette::take_dirty`] 取走并清零。
-/// 只提供 [`Palette::set`] 一条写路径（不暴露 `get_mut`），保证任何写入都会标脏。
-///
-/// **多消费者**：同一张表可能被多个 builder 消费（渲染世界每 volume 一个 + gate-app
-/// 启动期的诊断 builder）。脏区间只能被取走一次，故额外维护单调递增的 [`Palette::version`]
-/// 供消费者自行对齐"我需要同步吗"；拿不到脏区间的消费者退回全量铺（见 builder
-/// `write_palette`），不会静默丢数据。
-///
-/// 脏标记用 `Mutex` 而非 `Cell`：`Palette` 内含于 `VolumeGrid`，而 `VoxelScene` 是 Bevy
-/// `Resource`（要求 `Sync`），`Cell` 不满足。锁只在校验/取走时短暂持有，且调色板写入
-/// 只发生在"新材质首次使用"这类低频路径，开销可忽略。
+/// 调色板：固定 65536 槽，索引 0 保留为空/空气。
+/// 写入只经 `set` 并标脏；`take_dirty` 取走脏槽区间（只能取一次），拿不到者退回全量铺。
 pub struct Palette {
   entries: Box<[PaletteEntry; PALETTE_ENTRY_COUNT]>,
-  /// 槽占用位图（bit=1 → 该槽被 [`Palette::set`] 写过），8KB。
-  ///
-  /// **不能拿「条目内容全零」当空槽判据**：编辑笔触完全可以产生一个恰好等于
-  /// [`PaletteEntry::default`] 的材质（纯黑 + 不发光 + 不透明 + 粗糙度 0），
-  /// 那样它既会被当成空槽被别人覆盖，又会让"按内容去重"误匹配到从未使用的槽。
-  /// 占用与否是**状态**，与内容无关，故单独记。
+  /// 槽占用位图（bit=1 = 该槽被 `set` 写过），8KB；占用与条目内容无关。
   used: Box<[u64; OCCUPIED_WORDS]>,
   /// 脏槽闭区间（含两端）；None = 自上次取走以来无变化
   dirty: Mutex<Option<(u16, u16)>>,
-  /// 写版本：每次 `set` 自增。消费者记住自己同步过的版本，用来判断是否需要同步
-  /// （不依赖脏区间是否被别人取走）。`new()` 从 **1** 起，故 **0 = 克隆出来的新副本**
-  /// （任何消费者都不可能已经同步过它，见 `Clone`）。
+  /// 写版本：每次 `set` 自增，消费者据此判断是否需同步；`new()` 从 1 起，0 = 克隆出的新副本（视为全表待上传）。
   version: AtomicU64,
 }
 
-/// 克隆出的副本一律视为**全表待上传**：副本若被挂到别的 volume 上，其 GPU 侧尚无内容。
-/// 版本给 **0**（合法版本 ≥ 1），保证任何已同步过的消费者都会重新全量铺一次，不会被跳过。
+/// 克隆出的副本一律视为全表待上传（`version` = 0）。
 impl Clone for Palette {
   fn clone(&self) -> Self {
     Self {
@@ -217,7 +179,7 @@ impl Default for Palette {
 }
 
 impl Palette {
-  /// 新建全空表（全表标脏：首次上传必须把 512KB 完整送上去）
+  /// 新建全空表（全表标脏，首次须完整上传）。
   pub fn new() -> Self {
     Self {
       entries: Box::new([PaletteEntry::default(); PALETTE_ENTRY_COUNT]),
@@ -241,7 +203,7 @@ impl Palette {
     self.version.fetch_add(1, Ordering::Release);
   }
 
-  /// 当前写版本（供消费者对齐"我同步过了吗"）
+  /// 当前写版本（供消费者判断是否已同步）。
   #[inline]
   pub fn version(&self) -> u64 {
     self.version.load(Ordering::Acquire)
@@ -256,9 +218,7 @@ impl Palette {
     });
   }
 
-  /// 取走脏槽区间（闭区间；None = 无变化）并清零。
-  ///
-  /// **只能被一个消费者拿到**：拿不到的消费者应退回全量铺（别静默跳过）。
+  /// 取走脏槽闭区间（None = 无变化）并清零；只能被一个消费者拿到，拿不到者应退回全量铺。
   pub fn take_dirty(&self) -> Option<(u16, u16)> {
     self.dirty.lock().unwrap_or_else(|e| e.into_inner()).take()
   }
@@ -274,7 +234,7 @@ impl Palette {
     !idx.is_air() && (self.used[idx.0 as usize / 64] >> (idx.0 % 64)) & 1 == 1
   }
 
-  /// 空槽判据：从未被 [`Palette::set`] 写过 —— 新材质认领槽位据此挑选
+  /// 空槽判据：从未被 `set` 写过（新材质认领槽位据此挑选）。
   #[inline]
   pub fn is_empty_slot(&self, idx: PaletteId) -> bool {
     !self.occupied(idx)

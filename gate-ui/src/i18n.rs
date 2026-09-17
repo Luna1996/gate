@@ -1,12 +1,6 @@
-//! i18n 接线：gate-ui **不依赖任何 i18n 库**，只保存「key → 当前语言文案」的解析闭包。
-//!
-//! 分工：
-//! 1. 调用方启动时插入 [`UiTranslator`]（例如 gate-app 注入 `|k| t!(k).to_string()`），
-//!    spawn 时经 [`UiCtx::with_translate`](crate::widgets::UiCtx::with_translate) 传给控件；
-//! 2. 切换语言后调用 [`UiTranslator::bump`]；
-//! 3. [`i18n_refresh_system`] 检测到版本变化，就重解析所有带 [`I18nKey`] 的文本。
-//!
-//! 未注入解析器时 key 原样当文案 —— TOML 里直接写字面量（如 `label = "视频"`）也完全成立。
+//! i18n 接线：gate-ui 不依赖任何 i18n 库，只保存「key → 当前语言文案」的解析闭包。
+//! 用法：调用方插入 `UiTranslator`（spawn 时经 `UiCtx::with_translate` 传给控件），切换语言后调 `bump`，
+//! `i18n_refresh_system` 按版本变化重解析带 `I18nKey` 的文本；未注入解析器时 key 原样当文案。
 
 use std::sync::Arc;
 
@@ -14,10 +8,7 @@ use bevy::prelude::*;
 
 use crate::widgets::Tooltip;
 
-/// 文案解析器句柄（[`UiTranslator`] → `UiCtx` 的传递形式）。
-///
-/// 用 `Arc` 而非借用：spawn 菜单页时 `UiCtx` 要跨 `&mut World` 存活，借用资源会和
-/// 可变世界相冲。
+/// 文案解析器句柄（`UiTranslator` → `UiCtx` 的传递形式）；用 `Arc` 以便跨 `&mut World` 存活。
 pub type TranslatorFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// key → 文案的解析器资源（版本号用于驱动语言切换后的重解析）
@@ -63,9 +54,7 @@ impl UiTranslator {
   }
 }
 
-/// 可翻译文本标记：挂在文本来源是 i18n key 的实体上（`Text` / [`Tooltip`]）。
-///
-/// 语言切换（[`UiTranslator::bump`]）后由 [`i18n_refresh_system`] 重解析。
+/// 可翻译文本标记：挂在文本来源是 i18n key 的实体上（`Text` / `Tooltip`）；语言切换后由 `i18n_refresh_system` 重解析。
 #[derive(Component, Clone, Debug, PartialEq, Eq)]
 pub struct I18nKey(pub String);
 

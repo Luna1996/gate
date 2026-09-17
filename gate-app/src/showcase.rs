@@ -1,8 +1,6 @@
 //! 右上角 gate-ui 组件展示窗：全部 widget 的功能演示面板。
-//!
-//! [`spawn_showcase`] 在主题/字体就绪后由 `debug_ui_setup` 一次性调用；
-//! 交互（button/checkbox/slider）经观察者写入事件日志，[`showcase_demo_system`]
-//! 每帧给演示折线喂正弦样本。
+//! `spawn_showcase` 在主题/字体就绪后由 `debug_ui_setup` 一次调用；交互经观察者写事件日志，
+//! `showcase_demo_system` 每帧给演示折线喂正弦样本。
 
 use bevy::prelude::*;
 
@@ -19,9 +17,7 @@ use gate_ui::{
 
 use rust_i18n::t;
 
-// ---- 展示窗交互标记 ----
-
-/// 按钮标识（写进事件日志：日志不翻译，故用英文标识符而非显示文案）
+/// 按钮标识（写进事件日志；日志不翻译，用英文标识符）
 #[derive(Component)]
 struct ShowcaseButton(&'static str);
 
@@ -42,15 +38,14 @@ struct ShowcaseLog;
 /// 展示窗折线画布尺寸（透明纹理，面板底色透出）
 const SHOWCASE_PLOT_W: u32 = 216;
 const SHOWCASE_PLOT_H: u32 = 48;
-/// 展示窗折线容量（60fps 下约 12s 窗口，0.1s 喂一个样本）
+/// 展示窗折线容量（0.1s 喂一个样本，约 12s 窗口）
 const SHOWCASE_PLOT_CAP: usize = 128;
 
-/// 右上角展示面板根标记（debug overlay 的 toggle 以此定位整体显隐）
+/// 右上角展示面板根标记（debug overlay toggle 以此定位整体显隐）
 #[derive(Component)]
 pub(crate) struct ShowcaseRoot;
 
-/// 右上角 hud-showcase-panel：TabView 组件/数据两页，每页包 scrollview；
-/// 在 commands.queue 闭包内调用（直接操作 World）
+/// 右上角 hud-showcase-panel：TabView 组件/数据两页，每页包 scrollview；直接操作 World（commands.queue 内调用）。
 pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -65,7 +60,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
         right: px(8.0),
         top: px(8.0),
         width: px(280.0),
-        // 限制高度，内容超出靠内部 scroll view 滚动
+        // 内容超出靠内部 scroll view 滚动
         height: Val::Vh(88.0),
         flex_direction: FlexDirection::Column,
         border: UiRect::all(px(m.border_width)),
@@ -73,11 +68,10 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
       },
       BackgroundColor(color_of(&c.surface_card_hud)),
       BorderColor::all(color_of(&c.border)),
-      // 默认隐藏（与 toggle 初始未勾选一致；观察者按 ToggleSwitchToggled 翻转）
+      // 默认隐藏（与 toggle 初始未勾选一致）
       Visibility::Hidden,
     ))
     .with_children(|root| {
-      // 最外层 tabview：组件 / 数据 两个标签页，每页内容包在 scrollview 里
       let tv = tab_view(
         ctx,
         root,
@@ -88,7 +82,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
           ..default()
         },
       );
-      // ---- tab 0：组件展示 ----
       root.world_mut().entity_mut(tv.contents[0]).with_children(|p| {
         let sv = scroll_view(ctx, p, ScrollConfig { height: Val::Percent(100.0) });
         p.world_mut().entity_mut(sv.content).with_children(|root| {
@@ -111,7 +104,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
             },
           );
 
-          // ---- buttons：primary / secondary / ghost ----
           label(
             ctx,
             root,
@@ -154,7 +146,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               );
               row.world_mut().entity_mut(*b3).insert(ShowcaseButton("ghost"));
             });
-          // ---- danger button（破坏性操作） ----
           let b4 = button(
             ctx,
             root,
@@ -166,7 +157,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
           );
           root.world_mut().entity_mut(*b4).insert(ShowcaseButton("danger"));
 
-          // ---- checkbox ----
           label(
             ctx,
             root,
@@ -197,7 +187,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
           );
           root.world_mut().entity_mut(*cb2).insert(ShowcaseCheckbox { label: "B" });
 
-          // ---- slider：滑杆 + 实时值 ----
           label(
             ctx,
             root,
@@ -228,7 +217,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               row.world_mut().entity_mut(*v).insert(ShowcaseSliderValue);
             });
 
-          // ---- plot：演示折线（正弦波喂入） ----
           label(
             ctx,
             root,
@@ -255,7 +243,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
           );
           root.world_mut().entity_mut(*p).insert(ShowcasePlot);
 
-          // ---- RingList：事件日志（L2 抬升嵌块内） ----
           label(
             ctx,
             root,
@@ -270,14 +257,13 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
             let l = list(ctx, inner, ListConfig { capacity: 6 });
             let w = inner.world_mut();
             w.entity_mut(*l).insert(ShowcaseLog);
-            // 种子日志在 spawn 处写入（组件真源初始化）
+            // 种子日志在 spawn 处写入
             if let Some(mut ring) = w.get_mut::<RingList>(*l) {
               ring.push(t!("showcase.log.ready"));
               ring.push(t!("showcase.log.try_all"));
             }
           });
 
-          // ---- 语义色文字 ----
           root
             .spawn((
               Name::new("showcase-semantic-row"),
@@ -306,7 +292,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               );
             });
 
-          // ---- faint 档（仅 ≥18px 大号标签使用） ----
           label(
             ctx,
             root,
@@ -317,7 +302,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
             },
           );
 
-          // ---- splitter：分割线（按父容器方向自动横/竖） ----
           label(
             ctx,
             root,
@@ -349,7 +333,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               );
             });
 
-          // ---- grid：格线连通（gap 填色 trick，border-collapse 等效） ----
           label(
             ctx,
             root,
@@ -370,7 +353,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
             }
           });
 
-          // ---- scroll view 演示（固定高度，内容超出可滚轮滚动） ----
           label(
             ctx,
             root,
@@ -393,7 +375,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
         });
       });
 
-      // ---- tab 1：数据展示（table） ----
       root.world_mut().entity_mut(tv.contents[1]).with_children(|p| {
         let sv = scroll_view(ctx, p, ScrollConfig { height: Val::Percent(100.0) });
         p.world_mut().entity_mut(sv.content).with_children(|root| {
@@ -439,7 +420,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
       });
     });
 
-  // 按钮点击 → 写事件日志（UiClick 观察者）。日志首条由 spawn 处播种。
+  // 按钮点击 → 写事件日志（UiClick 观察者）
   world.add_observer(
     |click: On<UiClick>,
      q_btn: Query<&ShowcaseButton>,
@@ -485,7 +466,7 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
   );
 }
 
-/// 展示窗动态行为：正弦波喂演示折线（button/checkbox/slider 交互由观察者写日志）
+/// 展示窗动态行为：正弦波喂演示折线（其它交互由观察者写日志）。
 pub(crate) fn showcase_demo_system(
   time: Res<Time>,
   mut q_plot: Query<&mut PlotData, bevy::prelude::With<ShowcasePlot>>,

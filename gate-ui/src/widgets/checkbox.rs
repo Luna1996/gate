@@ -1,7 +1,6 @@
-//! checkbox：勾选切换 + 勾选视觉（docs/ui-dark-theme.md §5.3）。
-//!
-//! 复用 bevy_ui `Checked` / `Checkable`（presence 语义，自带 a11y 联动）：有 `Checked` = 勾选。
-//! 视觉：16×16 盒子；未选中 = 抬升表面 + 边框（hover 边框提亮），选中 = 强调填充 + 对勾标记。
+//! checkbox：勾选切换 + 勾选视觉。
+//! 复用 bevy_ui `Checked`/`Checkable`（presence 语义）：有 `Checked` = 勾选。视觉：16×16 盒子；
+//! 未选中 = 抬升表面+边框（hover 提亮），选中 = 强调填充 + 对勾标记。
 
 use std::ops::Deref;
 
@@ -46,7 +45,7 @@ pub struct CheckboxConfig {
 }
 
 /// 勾选状态变化事件（用户点击翻转时触发；EntityEvent，target = 根实体）。
-/// `Checked` 组件仍是真源，事件只是通知，主动读状态可 Query/Has。
+/// `Checked` 组件仍是真源，事件仅通知；主动读状态用 Query/Has。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct CheckboxToggled {
   pub entity: Entity,
@@ -91,7 +90,7 @@ pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) 
         box_node.spawn((
           Name::new("ui-checkbox-mark"),
           Node { width: px(BOX_SIZE * 0.5), height: px(BOX_SIZE * 0.5), ..default() },
-          // 对勾标记 = 主文本色（强调填充上的最高对比）
+          // 对勾标记 = 主文本色
           BackgroundColor(color_of(&c.text_primary)),
           Visibility::Hidden,
         ));
@@ -121,10 +120,8 @@ type CheckboxQuery = (
   Has<UiDisabled>,
 );
 
-/// 勾选状态机：释放时翻转 Checked 并触发 [`CheckboxToggled`]；
-/// 盒子背景/边框/勾选标记跟随状态（每帧重算）
-///
-/// Disabled 态：跳过翻转逻辑，配色降亮一档，勾选标记仍按当前 checked 状态显示。
+/// 勾选状态机：释放时翻转 `Checked` 并触发 `CheckboxToggled`；盒子背景/边框/勾选标记跟随状态（每帧重算）。
+/// Disabled：跳过翻转、配色降亮一档，勾选标记仍按当前 checked 显示。
 pub fn checkbox_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -140,7 +137,7 @@ pub fn checkbox_state_system(
   let border_strong = color_of(&c.border_strong);
   for (e, inter, mut prev, checked, children, disabled) in &mut q {
     if !disabled {
-      // click = 按下并释放（与 button 判定一致）
+      // click = 按下并释放（与 button 一致）
       if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
         if checked {
           commands.entity(e).remove::<Checked>();
@@ -152,7 +149,7 @@ pub fn checkbox_state_system(
     }
     prev.0 = *inter;
     let hovered = !disabled && *inter == Interaction::Hovered;
-    // 视觉：选中 → 强调填充；未选中 → 抬升表面（hover 边框提亮）
+    // 选中 → 强调填充；未选中 → 抬升表面（hover 边框提亮）
     let (target_bg, target_border) = if checked {
       (accent, accent)
     } else if hovered {
@@ -175,8 +172,7 @@ pub fn checkbox_state_system(
         }
         for mark in box_children.iter() {
           if let Ok(mut vis) = marks.get_mut(mark) {
-            // 选中 = Inherited（跟随祖先显隐）；显式 Visible 会无视祖先
-            // Hidden 强制可见 → 面板整体隐藏时勾选标记单独悬浮
+            // 选中 = Inherited（跟随祖先显隐；显式 Visible/Hidden 会无视祖先）
             let target_vis = if checked { Visibility::Inherited } else { Visibility::Hidden };
             if *vis != target_vis {
               *vis = target_vis;

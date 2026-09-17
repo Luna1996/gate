@@ -1,16 +1,6 @@
-//! tab_view：标签页切换（tab bar + 内容区，选中态全灰度靠亮度差区分）。
-//!
-//! 结构：
-//! ```text
-//! root (TabView)
-//! ├── tab_bar (横向 flex，每个 tab 带 TabButton{index})
-//! └── content_container
-//!     └── content N (TabContent{index:N})  ← 调用方在此加子节点
-//! ```
-//!
-//! `tab_view_system` 驱动切换（点击 tab，Pressed→Hovered，更新 `TabView.active`）：选中 tab
-//! = surface_elevated 背景 + 2px 底边框 + text_primary 文字，未选中 = 透明底 + text_muted；
-//! 选中 content = Inherited（跟随祖先显隐），其余 Hidden。
+//! tab_view：标签页切换（tab bar + 内容区，选中态靠亮度差区分）。
+//! 结构：root(TabView) → tab_bar(TabButton{index}) + content_container → content(TabContent{index})。
+//! `tab_view_system` 驱动；选中 tab = surface_elevated 底 + 2px 底边框 + text_primary，其余透明 + text_muted。
 
 use std::ops::Deref;
 
@@ -43,8 +33,7 @@ pub struct TabContent {
   pub index: usize,
 }
 
-/// 标签页切换事件（用户点击 tab 切换时触发；EntityEvent，target = root 实体）。
-/// `TabView.active` 组件仍是真源，事件只是通知。
+/// 标签页切换事件（用户点击 tab 切换时触发；EntityEvent，target = root 实体；`TabView.active` 仍是真源）。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct TabChanged {
   pub entity: Entity,
@@ -52,8 +41,7 @@ pub struct TabChanged {
   pub index: usize,
 }
 
-/// 标签页句柄：root 实体 + 各 tab 内容容器实体。
-/// Deref 到 root 实体；调用方在 `contents[i]` 上添加该 tab 的子节点。
+/// 标签页句柄：root 实体 + 各 tab 内容容器实体；Deref 到 root，调用方在 `contents[i]` 上添加该 tab 的子节点。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabViewHandle {
   pub entity: Entity,
@@ -74,21 +62,16 @@ pub struct TabConfig {
   pub tabs: Vec<String>,
   /// 初始选中下标（越界自动钳到最后一个）
   pub active: usize,
-  /// 高度模式：
-  /// - false（默认）= 填充模式：root `flex_grow:1` 撑满宿主剩余高度，页面绝对定位
-  ///   100% 高叠放（宿主必须有确定高度，页内用 scroll_view 滚动）；
-  /// - true = 自适应高度：root/容器高度 auto，活动页 Relative 流入布局撑开容器，
-  ///   隐藏页 Absolute 脱流不占位——切页时面板高度随活动页内容变化。
-  ///   页内不可放 Percent(100%) 高的 scroll_view（auto 高度下解析为 0）
+  /// 高度模式：false（默认）= 填充模式，root `flex_grow:1` 撑满宿主剩余高度，页面绝对定位 100% 高叠放
+  /// （宿主须有确定高度）；true = 自适应高度，活动页 Relative 流入撑开容器，隐藏页 Absolute 脱流不占位
+  /// （页内不可放 Percent(100%) 高的 scroll_view，auto 高度下解析为 0）。
   pub fit_content: bool,
   /// 禁用的 tab 下标列表：这些 tab 不可点击切换、配色暗一档。
   /// 若当前 active 恰在禁用列表中，仍显示其内容（禁用只阻止切换，不强制切走）。
   pub disabled_tabs: Vec<usize>,
 }
 
-/// 创建标签页。
-///
-/// 调用方在返回的 [`TabViewHandle::contents`]`[i]` 上添加该 tab 的子节点。
+/// 创建标签页；调用方在返回的 `TabViewHandle::contents[i]` 上添加该 tab 的子节点。
 pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> TabViewHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -103,16 +86,13 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
       Node {
         flex_direction: FlexDirection::Column,
         width: Val::Percent(100.0),
-        // 填充模式：撑满宿主剩余高度——flex 后尺寸视为 definite，子级 Val::Percent
-        // 高度才能解析（否则 root 高度 auto → content 容器塌缩 → 内部
-        // scroll_view(Percent(100%)) 高 0，Overflow::clip 裁掉全部内容）。
-        // 自适应模式：不 grow，高度 auto 随活动页内容收缩。
+        // 填充模式 flex_grow=1：flex 后尺寸视为 definite，子级 Percent 高度才能解析；
+        // 自适应模式不 grow，高度 auto 随活动页内容收缩。
         flex_grow: if config.fit_content { 0.0 } else { 1.0 },
         ..default()
       },
     ))
     .with_children(|root| {
-      // ---- tab bar ----
       root
         .spawn((
           Name::new("ui-tab-bar"),
@@ -167,7 +147,6 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
             });
           }
         });
-      // ---- content container ----
       root
         .spawn((
           Name::new("ui-tab-content-container"),
@@ -184,10 +163,8 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
         .with_children(|container| {
           for i in 0..count {
             let is_active = i == active;
-            // 填充模式：全部页面绝对定位叠放（同位重叠、脱离流布局，隐藏页不
-            // 占位，切页内容位置不漂移），高度 100% 吃满容器。
-            // 自适应模式：活动页 Relative 流入布局撑开容器高度；隐藏页 Absolute
-            // 脱流不占位（无显式高度，随自身内容但不可见）。
+            // 填充模式：全部页面绝对定位叠放（脱流、隐藏页不占位），高度 100% 吃满容器。
+            // 自适应模式：活动页 Relative 流入布局撑开容器高度，隐藏页 Absolute 脱流不占位。
             let in_flow = config.fit_content && is_active;
             let e = container
               .spawn((
@@ -207,9 +184,7 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
                   ..default()
                 },
                 if is_active {
-                  // Inherited（非 Visible！）：Visible 会无视祖先强制可见，
-                  // 面板被整体隐藏时页面会单独悬浮（propagate_recursive 遇
-                  // Visible 直接置 true，覆盖父级 Hidden）
+                  // Inherited（非 Visible）：Visible 会无视祖先强制可见（propagate_recursive 遇 Visible 直接置 true）
                   Visibility::Inherited
                 } else {
                   Visibility::Hidden
@@ -225,10 +200,8 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
   TabViewHandle { entity: root, contents: content_entities }
 }
 
-/// 标签页状态机：点击 tab 切换 active（触发 [`TabChanged`]）+ tab 视觉 + content 可见性
-///
-/// Disabled tab（带 [`UiDisabled`]）：跳过点击切换、配色降亮一档；若 active 恰为
-/// 禁用 tab，仍显示其内容（禁用只阻止切换，不强制切走）。
+/// 标签页状态机：点击 tab 切换 active（触发 `TabChanged`）+ tab 视觉 + content 可见性。
+/// Disabled tab（带 `UiDisabled`）：跳过点击切换、配色降亮；active 恰为禁用 tab 时仍显示其内容。
 #[allow(clippy::too_many_arguments)] // Bevy system：各 Query 逐一注入
 pub fn tab_view_system(
   mut commands: Commands,
@@ -256,7 +229,7 @@ pub fn tab_view_system(
       continue;
     };
 
-    // 阶段 1：检测点击，更新 active（需要 mut InteractionPrev）
+    // 阶段 1：检测点击更新 active（需 mut InteractionPrev）
     for tab_e in bar_children.iter() {
       let Ok((tab_btn, inter, mut prev, disabled)) = q_tab.get_mut(tab_e) else {
         continue;
@@ -272,7 +245,7 @@ pub fn tab_view_system(
       prev.0 = *inter;
     }
 
-    // 阶段 2：更新 tab 视觉（只读 InteractionPrev，写 BackgroundColor/BorderColor/TextColor）
+    // 阶段 2：更新 tab 视觉（只读 InteractionPrev）
     for tab_e in bar_children.iter() {
       let Ok((tab_btn, inter, _, _)) = q_tab.get(tab_e) else {
         continue;
@@ -321,11 +294,9 @@ pub fn tab_view_system(
     for content_e in cc_children.iter() {
       if let Ok((tc, mut vis, mut node)) = q_content.get_mut(content_e) {
         let is_active = tc.index == view.active;
-        // 选中页 = Inherited（跟随祖先，面板整体隐藏时页面跟着隐藏）；
-        // 显式 Visible 会无视祖先强制可见 → 页面单独悬浮
+        // 选中页 = Inherited（跟随祖先）；显式 Visible 会无视祖先强制可见
         *vis = if is_active { Visibility::Inherited } else { Visibility::Hidden };
-        // 自适应模式：活动页必须流入布局（Relative）才能撑开容器高度；
-        // 隐藏页脱流（Absolute）不占位。填充模式全部 Absolute，不动。
+        // 自适应模式：活动页 Relative 流入布局撑开容器，隐藏页 Absolute 脱流；填充模式全 Absolute。
         if view.fit_content {
           node.position_type =
             if is_active { PositionType::Relative } else { PositionType::Absolute };

@@ -1,7 +1,5 @@
 //! gate-ui：bevy_ui 之上的自研组件库基座。
-//!
-//! 三层结构：主题令牌（theme）→ widget 层（widgets）→ 输入门控（capture）。
-//! 只依赖 bevy + serde/ron，不引入第三方 UI 框架。
+//! 三层结构：主题令牌（theme）→ widget 层（widgets）→ 输入门控（capture）；只依赖 bevy + serde/ron。
 
 pub mod capture;
 pub mod i18n;

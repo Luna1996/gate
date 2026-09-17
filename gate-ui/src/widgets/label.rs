@@ -1,14 +1,6 @@
 //! label：文本标签，字号/颜色/字体属性各自独立可设。
-//!
-//! 两条取值路径，同一个标签上可混用（每个属性互不影响）：
-//! 1. **预设档** [`LabelStyle`]：字号 + 颜色**成对**取自主题令牌，是默认路径，
-//!    保证拼不出违反对比度的组合（如 faint 档 <18px）；
-//! 2. **逐属性覆盖**：[`LabelConfig`] 的 `size`（字号）/ `color`（颜色）/ `font`（[`FontAttrs`]：
-//!    字重、字宽、倾斜、抗锯齿、OpenType 特性、可变字体轴）都是 `Option`，填哪项覆盖哪项，
-//!    没填的仍走预设档 —— 例如「Muted 的次要灰 + 正文档字号」直接写
-//!    `LabelConfig { style: LabelStyle::Muted, size: Some(fs.md), ..default() }`。
-//!
-//! 覆盖值不走令牌、也不做合规校验（调用方自担）；禁止纯白一类硬约束只由预设档保证。
+//! 预设档 `LabelStyle` 给字号 + 颜色成对的默认值；`LabelConfig` 的 `size`/`color`/`font`
+//! 逐项覆盖，未填的仍走预设档。覆盖值不走令牌、不做合规校验（调用方自担）。
 
 use std::ops::Deref;
 
@@ -20,9 +12,7 @@ use bevy::ui::Overflow;
 use super::{UiCtx, color_of, dim_color};
 
 /// 文本预设档：四档正文（primary/body/muted/faint）+ 四档语义色。
-///
-/// 每档 = 字号 + 颜色**成对**取自主题令牌，作为 [`LabelConfig`] 的默认值；
-/// 想单独改字号或颜色时用 `LabelConfig::size` / `LabelConfig::color` 覆盖其中一项。
+/// 每档 = 字号 + 颜色成对取自主题令牌，作为 `LabelConfig` 的默认值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LabelStyle {
   /// 正文（text_body，字号 md）
@@ -81,21 +71,18 @@ impl From<LabelHandle> for Entity {
   }
 }
 
-/// 超宽文本的处理方式（label 基础能力）
+/// 超宽文本的处理方式
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LabelOverflow {
   /// 截断在节点矩形内（默认；配合调用方自行设置的 `Overflow::clip`）
   #[default]
   Clip,
-  /// 中间省略：`head...tail`，宽度由节点实际排布宽度决定（见 [`EllipsisText`]）
+  /// 中间省略：`head...tail`，宽度由节点实际排布宽度决定（见 `EllipsisText`）
   MiddleEllipsis,
 }
 
-/// 中间省略状态（挂在文本实体上；`full` 是完整原文，`Text` 里放截断结果）。
-///
-/// 测量用 bevy_text 布局结果（`TextLayoutInfo.size`）与节点实际宽度
-/// （`ComputedNode.size`）比较，两者同为「缩放后物理 px」；本工程把窗口
-/// `scale_factor` 固定为 1.0（见 gate-app `enforce_integer_scale_factor`），故与逻辑 px 等值。
+/// 中间省略状态（挂在文本实体上；`full` = 完整原文，`Text` 放截断结果）。
+/// 测量比较 `TextLayoutInfo.size` 与 `ComputedNode.size`（同为缩放后物理 px；窗口 `scale_factor` 固定 1.0）。
 #[derive(Component, Clone, Debug)]
 pub struct EllipsisText {
   /// 完整原文（截断永远从这里重算，不叠加）
@@ -113,29 +100,27 @@ impl EllipsisText {
 /// 省略符
 pub const ELLIPSIS: &str = "...";
 
-/// 标签配置：**预设档给默认值，每个属性都能单独覆盖**。
-///
+/// 标签配置：预设档给默认值，每个属性都能单独覆盖。
 /// Default = 空文本 + Body 档 + 不覆盖任何属性 + 不禁用。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LabelConfig {
   pub text: String,
-  /// 预设档：提供字号与颜色的默认值（被下面的 `size` / `color` 覆盖时以覆盖值为准）
+  /// 预设档：提供字号与颜色的默认值（被 `size` / `color` 覆盖时以覆盖值为准）
   pub style: LabelStyle,
   /// 字号覆盖（逻辑 px）；None = 用预设档字号
   pub size: Option<f32>,
   /// 颜色覆盖；None = 用预设档颜色
   pub color: Option<Color>,
-  /// 其余字体属性逐项覆盖（见 [`FontAttrs`]）
+  /// 其余字体属性逐项覆盖（见 `FontAttrs`）
   pub font: FontAttrs,
-  /// true = 禁用态：文本颜色经 [`dim_color`] 降亮一档（不可交互，纯视觉）
+  /// true = 禁用态：文本颜色经 `dim_color` 降亮一档（不可交互，纯视觉）
   pub disabled: bool,
-  /// 超宽处理（见 [`LabelOverflow`]）
+  /// 超宽处理（见 `LabelOverflow`）
   pub overflow: LabelOverflow,
 }
 
 /// 可逐项覆盖的 `TextFont` 属性（每项 `None` = 用 bevy 的默认值）。
-///
-/// 不含 `font`（字体句柄由 [`UiCtx`] 统一给主题字体）与 `font_size`（走 [`LabelConfig::size`]）。
+/// 不含 `font`（由 `UiCtx` 统一给主题字体）与 `font_size`（走 `LabelConfig::size`）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FontAttrs {
   /// 字重（仅可变字重字体生效）
@@ -186,8 +171,7 @@ pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> Lab
   let mut ec =
     parent.spawn(super::label_bundle_attrs(ctx, config.text.clone(), size, color, config.font));
   if config.overflow == LabelOverflow::MiddleEllipsis {
-    // NoWrap：中间省略要「整行自然宽度」，换行测量值会等于可用宽度而永不触发省略；
-    // 节点自身 clip，省略收敛前的一两帧不会溢出
+    // NoWrap：中间省略须用整行自然宽度，换行测量值会等于可用宽度而永不触发省略
     ec.insert((
       EllipsisText::new(config.text),
       bevy::text::TextLayout::no_wrap(),
@@ -198,8 +182,7 @@ pub fn label(ctx: &UiCtx, parent: &mut ChildSpawner, config: LabelConfig) -> Lab
 }
 
 /// 中间省略：可用宽度放不下时改成 `head...tail`；宽度变化时用原文重排。
-///
-/// 截断永远从 [`EllipsisText::full`] 重算，故「窗口变宽 → 恢复原文」也成立。
+/// 截断永远从 `EllipsisText::full` 重算（窗口变宽可恢复原文）。
 pub fn label_ellipsis_system(
   mut q: Query<(&mut Text, &mut EllipsisText, &ComputedNode, &TextLayoutInfo)>,
 ) {

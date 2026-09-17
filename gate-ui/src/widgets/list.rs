@@ -1,6 +1,5 @@
 //! list：固定容量环形列表（新条目顶替最旧条目）。
-//!
-//! 不做滚动裁剪：容量固定 + 同步重建子标签；渲染同步用 change 检测，只在脏时重建。
+//! 不做滚动裁剪；子标签同步重建，用 change 检测、只在脏时重建。
 
 use std::collections::VecDeque;
 use std::ops::Deref;

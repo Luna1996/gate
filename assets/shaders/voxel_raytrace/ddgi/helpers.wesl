@@ -119,7 +119,7 @@ fn ddgi_brick_state(g: Grid, origin: vec3<i32>, level: u32) -> u32 {
     }
     let child = cb + b_struct[node + NODE_FIXED_WORDS + ddgi_pop_below(cidx, mask_lo, mask_hi)];
     if (cur + 1u == level) {
-      // 均匀节点快速路径：mask 全 0 → palette 直决（省 64 次 agg 迭代；空气 16³ 最常见）
+      // 均匀节点快速路径：mask 全 0 → palette 直决
       if (b_struct[child] == 0u && b_struct[child + 1u] == 0u) {
         return select(1u, 0u, (b_struct[child + 2u] & 0xFFFFu) == 0u);
       }
@@ -132,12 +132,10 @@ fn ddgi_brick_state(g: Grid, origin: vec3<i32>, level: u32) -> u32 {
   return 0u;
 }
 
-
 fn ddgi_cell_state_sized(g: Grid, cmin: vec3<i32>, size: i32) -> u32 {
   if (size == 16) { return ddgi_brick_state(g, cmin, 2u); }
   if (size == 64) { return ddgi_brick_state(g, cmin, 1u); }
-  // 按 16³（size 32）或 64³（size 128/256）子块聚合：
-  // size 32 → 2³ 个 16³（hlevel 2）；128 → 2³ 个 64³；256 → 4³ 个 64³。
+  // 按 16³ / 64³ 子块聚合（size ≥64 走 64³）。
   let use64 = size >= 64;
   let sub_size = select(16i, 64i, use64);
   let hlevel = select(2u, 1u, use64);
@@ -154,9 +152,6 @@ fn ddgi_cell_state_sized(g: Grid, cmin: vec3<i32>, size: i32) -> u32 {
   }
   return seen;
 }
-
-
-// ============================================================================
 
 fn ddgi_pcg(v: u32) -> u32 {
   let state = v * 747796405u + 2891336453u;
@@ -201,8 +196,7 @@ fn ddgi_lod_cell_size(lod: u32) -> i32 {
   return ddgi_u.lods[lod].origin.w;
 }
 fn ddgi_lod_count(lod: u32) -> u32 {
-  // LOD0 的槽数是**探针池高水位**（chunk 段之和），不等于空间盒 dims 乘积 —— 后者仍是
-  // 级联包含/混合带用的空间盒。LOD1~3 仍是规则网格 → 等于 dims 乘积。
+  // LOD0 的槽数是探针池高水位（chunk 段之和），不是空间盒 dims 乘积；LOD1~3 等于 dims 乘积。
   if (lod == 0u) { return ddgi_u.chunk.dims.w; }
   let d = ddgi_u.lods[lod].dims;
   return d.x * d.y * d.z;
@@ -211,11 +205,7 @@ fn ddgi_lod_slot_base(lod: u32) -> u32 {
   return ddgi_u.lods[lod].dims.w;
 }
 // ---- LOD0 的 chunk 段编址 ----
-// 【与 LOD1~3 的边界】LOD0 **只**用下面这套 chunk 公式；lod>=1 一律走「世界锚定的环面映射」
-// （见 ddgi_slot_own 的后半段）。两套编址互不干扰，唯一交汇点是槽位段顺序：
-//   [0, lod0_slots) 属 LOD0（池分配），之后依次是 LOD1/2/3 的规则网格段。
-//
-// cell_slot buffer 尾部打包了两张 LOD0 表（见 Rust `DdgiGpu::cell_slot`）：
+// cell_slot buffer 尾部打包两张 LOD0 表：
 //   [total_slots, +num_chunks)               chunk_base：chunk 线性下标 → 段基址
 //   [total_slots+num_chunks, +lod0_slots)    slot_chunk：LOD0 局部槽 → chunk 线性下标
 fn ddgi_chunk_axis() -> i32 { return ddgi_u.chunk.origin.w; }
@@ -225,7 +215,7 @@ fn ddgi_chunk_count() -> u32 {
 }
 fn ddgi_chunk_base_off() -> u32 { return u32(ddgi_u.misc.y); }
 fn ddgi_slot_chunk_off() -> u32 { return u32(ddgi_u.misc.y) + ddgi_chunk_count(); }
-/// 向下取整除法（WGSL 的 `/` 对 i32 是**截断**，负数会算错 → chunk 坐标必须用它）
+/// 向下取整除法（WGSL 的 i32 `/` 向零截断）；chunk 坐标必须用它。
 fn ddgi_floor_div(a: i32, b: i32) -> i32 {
   return select(a / b, (a - b + 1) / b, a < 0);
 }
@@ -263,12 +253,8 @@ fn ddgi_lod0_local_linear(wc: vec3<i32>) -> u32 {
 }
 
 // ---- 槽位映射（按 lod 分派：lod==0 → chunk 局部；lod>=1 → 世界锚定环面）----
-// 槽位与世界 cell 的身份绑定与相机无关：相机滚动只让新进入窗口的那条带换掉世界 cell
-// （旧数据本就该丢），其余槽位保持自己的身份 ⇒ 图集不因相机移动而整体失效。
-/// 世界 cell → 槽位的**纯算术**映射。读"某个世界 cell **自己**的烘焙记录/探针位置"的地方
-/// （判定邻接占用、粗级继承细级探针位置）必须用它。
-/// ⚠️ lod==0 且该 chunk 没领段 / 越界时返回 0（不是一个有意义的槽位，只保证不越界读）：
-/// 调用方**必须**先用 `ddgi_cell_in_window` 过滤。
+/// 世界 cell → 槽位的纯算术映射；读某个世界 cell 自己的烘焙记录/探针位置时必须用它。
+/// lod==0 且该 chunk 没领段 / 越界时返回 0，调用方必须先过 `ddgi_cell_in_window`。
 fn ddgi_slot_own(lod: u32, wc: vec3<i32>) -> u32 {
   if (lod == 0u) {
     let cc = ddgi_wc_to_chunk(wc);
@@ -285,34 +271,20 @@ fn ddgi_slot_own(lod: u32, wc: vec3<i32>) -> u32 {
 fn ddgi_slot(lod: u32, wc: vec3<i32>) -> u32 {
   return ddgi_slot_own(lod, wc);
 }
-/// 「屏幕使用」粘滞标记：把该槽位置为**满值**（`DDGI_USAGE_STICKY`，`ddgi_sort` 每帧 -1）。
-///
-/// 由**着色**路径在每个"候选角"上调用（见 `ddgi_sample_lod` 的闸门之后 / 图集取样之前），
-/// 代表"本帧有像素会用这个探针的数据"。工作集选择（sort）就靠它 —— 见 DDGI_USAGE_STICKY：
-/// 射线的去处跟着像素走，而不是按距离猜。
-/// 置满值（而非 +1）才能让记账的密度不决定窗口长度：footprint 很小的探针每 ~4 帧才被点到一次，
-/// 按 +1 计会被逐帧抹平 ⇒ 它进进出出工作集、`age` 长期停在 12~32 ⇒ 大增益 ⇒ 逐帧跳变。
-/// 满值写入是幂等的，故不必用原子（原子反而把记账变成独占访问，相邻像素会撞同一个 cache line）。
-/// 必须只在**着色**路径调用：cast 回读 GI 也走 `ddgi_sample`，那里记账会形成"射线多的探针拿到
-/// 更多射线"的正反馈。所有可能给出显示值的 `ddgi_sample_lod` 调用都要记（否则只被兜底路径采样
-/// 到的探针永远拿不到射线）。
+/// 「屏幕使用」粘滞标记：把该槽位置为满值（`DDGI_USAGE_STICKY`，`ddgi_sort` 每帧 -1）。
+/// 必须只在着色路径调用。
 fn ddgi_usage_mark(slot: u32) {
-  // 先读一次只是为了省重复写：满值时不再写（记账点每帧几十万次，读比写便宜）。
   if (ddgi_cell_slot[slot] != DDGI_USAGE_STICKY) {
     ddgi_cell_slot[slot] = DDGI_USAGE_STICKY;
   }
 }
-/// 窗口原点（cell 单位）。origin.xyz 已按 cs 对齐，故整除精确。（LOD0 的编址原点在
-/// `ddgi_u.chunk`，不在这里；本函数只服务 lod>=1 与 LOD0 的**空间盒**包含判定。）
+/// 窗口原点（cell 单位）：origin.xyz 按 cs 对齐，整除精确；只服务 lod>=1 与 LOD0 空间盒判定。
 fn ddgi_origin_cell(lod: u32) -> vec3<i32> {
   return ddgi_u.lods[lod].origin.xyz / ddgi_u.lods[lod].origin.w;
 }
-/// 槽位在本级内的下标 → 该槽位**当前**覆盖的世界 cell
+/// 槽位在本级内的下标 → 该槽位当前覆盖的世界 cell
 fn ddgi_slot_world_cell(lod: u32, idx: u32) -> vec3<i32> {
   if (lod == 0u) {
-    // LOD0：反查表给出该槽所属 chunk，再解 chunk 内局部 cell。
-    // （槽位池没有空洞时 idx∈[0,lod0_slots) 全部有主；有空洞时这里是"指向 chunk 0"的
-    //   无效解 —— 但空洞槽位不会被任何 cell 的 ddgi_slot_own 引用，bake 对其多写一次无害。）
     let cl = ddgi_cell_slot[ddgi_slot_chunk_off() + idx];
     let base = ddgi_cell_slot[ddgi_chunk_base_off() + cl];
     let l = idx - base;
@@ -327,13 +299,10 @@ fn ddgi_slot_world_cell(lod: u32, idx: u32) -> vec3<i32> {
   let r = vec3<i32>(ddgi_slot_cell(lod, idx));
   return o + ((r - o) % di + di) % di;
 }
-/// 世界 cell 是否在本级**可编址**窗口内。LOD0 = 该 cell 所属 chunk **领了段**（内容驱动：
-/// 空 chunk 的 cell 没有探针，采样侧必须把它们当"窗口外"剔除，否则会读到槽位 0 的数据）。
+/// 世界 cell 是否在本级可编址窗口内；LOD0 = 该 cell 所属 chunk 领了段。
 fn ddgi_cell_in_window(lod: u32, wc: vec3<i32>) -> bool {
   if (lod == 0u) {
     // LOD0 = 世界 AABB 对齐的空间盒 ∩ 该 cell 所属 chunk 已领段（两层都要判）。
-    // 只判"chunk 已领段"不够：chunk 锚定后编址域按 256 对齐放大，AABB 之外那一圈会落在已领段
-    // chunk 的 padding 里而被当成窗口内 ⇒ 叠上空间盒后结果只会更少、不会更多。
     let c = wc - ddgi_origin_cell(0u);
     if (!(all(c >= vec3<i32>(0)) && all(c < vec3<i32>(ddgi_u.lods[0].dims.xyz)))) { return false; }
     let cc = ddgi_wc_to_chunk(wc);
@@ -389,12 +358,8 @@ fn ddgi_rec_off(rec: u32) -> vec3<u32> {
   return vec3<u32>((rec >> 8u) & 0xFFu, (rec >> 16u) & 0xFFu, (rec >> 24u) & 0xFFu);
 }
 // meta word = age(低 8bit) | ENABLED | ACTIVE | 邻接可见性掩码(bit10-15) | NBR_VALID(bit16)
-//   ENABLED：烘焙阶段放了探针（有 irr/depth 数据可采样）
-//   ACTIVE ：本 cell 或 6 邻接有体素 / 物体，且未被更细 LOD 覆盖 —— 本帧需要投线
-//   NBR    ：6 邻接可见性掩码（见 DDGI_META_NBR_SHIFT），由 sort 每帧为活跃探针重算
-//   NBR_VALID：掩码是否已算过；bake 与非活跃路径写 0 ⇒ 消费侧按**被挡**处理（保守不混）。
-//            未算 ≠ 可见：这类探针本帧未投线、图集值是陈旧的，混进来会把隔墙（含看到天空的）
-//            辐照度抹进墙内。
+//   ENABLED：烘焙放了探针；ACTIVE：本 cell 或 6 邻接有体素/物体且未被更细 LOD 覆盖。
+//   NBR/NBR_VALID：6 邻接可见性掩码及其「已算过」位（未置位时消费侧按被挡处理）。
 fn ddgi_meta_pack(age: u32, enabled: bool, is_active: bool) -> u32 {
   return (age & 0xFFu)
     | select(0u, DDGI_META_ENABLED, enabled)
@@ -409,12 +374,11 @@ fn ddgi_meta_with_nbr(p: u32, nbr_mask: u32) -> u32 {
 fn ddgi_meta_age(p: u32) -> u32 {
   return p & 0xFFu;
 }
-/// 读回邻接可见性掩码（`ddgi_probe_blend_irr` 的空间混合门控用）。
+/// 读回邻接可见性掩码（空间混合门控用）。
 fn ddgi_meta_nbr(p: u32) -> u32 {
   return (p >> DDGI_META_NBR_SHIFT) & DDGI_META_NBR_MASK;
 }
-/// 6 邻接方向单位向量，位序与 `DDGI_META_NBR_SHIFT` 一致：0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z。
-/// 同轴两位相邻 ⇒ 反向 = `bit ^ 1u`。
+/// 6 邻接方向单位向量，位序：0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z。
 fn ddgi_nbr_dir(a: u32) -> vec3<f32> {
   if (a == 0u) { return vec3<f32>(-1.0, 0.0, 0.0); }
   if (a == 1u) { return vec3<f32>(1.0, 0.0, 0.0); }
@@ -423,9 +387,7 @@ fn ddgi_nbr_dir(a: u32) -> vec3<f32> {
   if (a == 4u) { return vec3<f32>(0.0, 0.0, -1.0); }
   return vec3<f32>(0.0, 0.0, 1.0);
 }
-/// `ddgi_probe_blend_irr` 的 **LOD0 分支**邻居循环下标（+X,-X,+Y,-Y,+Z,-Z）→ 掩码位。
-/// LOD1~3 分支用 `a * 2 + (plus ? 1 : 0)`（两分支的循环结构不同，故各有一个映射）。
-/// 注意分号写法：`(a >> 1u) * 2u + (1u - (a & 1u))` —— +X→1, -X→0, +Y→3, -Y→2, +Z→5, -Z→4。
+/// LOD0 分支邻居循环下标（+X,-X,+Y,-Y,+Z,-Z）→ 掩码位：+X→1, -X→0, +Y→3, -Y→2, +Z→5, -Z→4。
 fn ddgi_nbr_bit_lod0(a: u32) -> u32 {
   return (a >> 1u) * 2u + (1u - (a & 1u));
 }
@@ -436,22 +398,11 @@ fn ddgi_lum(c: vec3<f32>) -> f32 {
 fn ddgi_maxc(c: vec3<f32>) -> f32 {
   return max(c.x, max(c.y, c.z));
 }
-/// 时域混合系数：分**收敛斜坡**与**稳态窗口**两段，以 `age` 到达上限（`DDGI_AGE_MAX`）分界。
-///
-///   · 斜坡段（`age < 1/base`）：`1/age` 的等权滑动平均 —— `age` 就是该探针已积累的 collect
-///     次数，故误差按 1/√n 下降。`age ≤ 1` 时为 1.0（精确覆写），换主/编辑时 age 被压到
-///     1~8 ⇒ 这几帧快速跟上新位置。
-///   · 稳态段（`age ≥ 1/base`）：恒定 `base`（长窗口，负责压稳态逐帧脉动）。
-///
-/// 写成 `max(base, 1/age)` 而不是两段 if：两者在 `base ≥ 1/DDGI_AGE_MAX` 时等价，但两段 if 在
-/// `1/base < DDGI_AGE_MAX`（辐照度 base = 1/64）时**不单调** —— age 从 1/base 涨到上限期间
-/// alpha 一路掉到 1/255，到 age == DDGI_AGE_MAX 又跳回 base（此处是 4× 跳变）⇒ 每个探针到龄
-/// 那一刻都会突然重新跟随单帧噪声，表现为周期性的闪烁。`max` 形式没有这个跳变。
+/// 时域混合系数：分收敛斜坡（`1/age`）与稳态窗口（`base`）两段，以 `age` 到达上限分界。
 fn ddgi_age_alpha(age: u32, base: f32) -> f32 {
   return max(base, 1.0 / f32(max(age, 1u)));
 }
 
-// ddgi_update_texel：未被调用（collect 直接用 mix(prev, new, a)）。
 fn ddgi_update_texel(prev: vec3<f32>, proj: vec3<f32>) -> vec3<f32> {
   let new_t = pow(proj, vec3<f32>(1.0 / DDGI_IRRAD_GAMMA));
   var h = select(DDGI_HYSTERESIS, 0.0, all(prev == vec3<f32>(0.0)));

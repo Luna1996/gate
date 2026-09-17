@@ -1,8 +1,7 @@
-//! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit
-//!
-//! - BG0：storage tex + 相机 uniform + beam depth + 眼睛适应状态（只读）
-//! - BG1：b_struct + b_leaves + palette + globals uniform + 光照场 3D 纹理
-//! - WGSL 源 = WESL 包 `shaders/voxel_raytrace/`（入口 `main.wesl`，见 `crate::shader`）
+//! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
+//! BG0 = storage tex / 相机 uniform / beam depth / 眼睛适应状态（只读）；
+//! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理。
+//! WGSL 源 = WESL 包 `shaders/voxel_raytrace/`（入口 `main.wesl`）。
 
 use bevy::{
   asset::RenderAssetUsages,
@@ -13,29 +12,21 @@ use bevy::{
 use std::ops::Mul;
 use std::sync::LazyLock;
 
-// ============================================================================
-// 渲染目标共享基础设施
-// ============================================================================
-
 /// blit.wgsl 资产路径（全屏三角 blit）
 pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
-/// 初始渲染分辨率（窗口创建尺寸；resize 后由 RenderScale 资源接管，FR-5）
+/// 初始渲染分辨率（窗口创建尺寸）
 pub const VIEW_SIZE: UVec2 = UVec2::new(1280, 720);
 /// beam pass 的 compute dispatch 工作组边长
 pub const WORKGROUP_SIZE: u32 = 8;
-/// 主 DDA pass 工作组边长：必须与 shaders/voxel_raytrace/ 中 dda_main 的 @workgroup_size
-/// 严格一致，否则 dispatch 覆盖不足漏 trace 像素。
+/// 主 DDA pass 工作组边长：必须与 `shaders/voxel_raytrace/` 中 dda_main 的 `@workgroup_size` 一致。
 pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
-/// 当前渲染分辨率（main world `resize_render_targets` 更新，提取进 render world；
-/// dispatch workgroup 数随它重算，shader 侧自行越界剔除）
+/// 当前渲染分辨率（main world `resize_render_targets` 更新，提取进 render world）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 pub struct RenderScale {
-  /// 渲染目标尺寸 = 窗口物理像素 ÷ `factor`（下采样后由 blit 双线性放大到整窗）
+  /// 渲染目标尺寸 = 窗口物理像素 ÷ `factor`。
   pub size: UVec2,
-  /// 内部分辨率降采样倍数：1 = 全分辨率，2 = 半分辨率（菜单「视频/半分辨率」）。
-  /// 改它之后 `responsive::resize_render_targets` 下一帧就按新尺寸原地重建目标纹理
-  /// （DDGI/GI 的 1/2 分辨率缓冲都挂在 `size` 上，自动跟随）。
+  /// 分辨率降采样倍数：1 = 全分辨率，2 = 半分辨率。
   pub factor: u32,
 }
 
@@ -45,22 +36,14 @@ impl Default for RenderScale {
   }
 }
 
-/// 后处理开关（main world 由菜单写，提取进 render world；目前只有抗锯齿）
+/// 后处理开关（main world 由菜单写，提取进 render world）。
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ExtractResource)]
 pub struct PostFxSettings {
-  /// FXAA：在最终 blit 里做边缘抗锯齿（`blit.wgsl::fs_fxaa`，代价 ≈ 边缘上 9~13 次采样）
+  /// FXAA：在最终 blit 里做边缘抗锯齿（`blit.wgsl::fs_fxaa`）。
   pub fxaa: bool,
 }
 
-// ============================================================================
-// 视图资源 + 图像资源
-// ============================================================================
-
-/// 主 world 注入的静态视图配置（矩阵来自 [`Self::build_static`] 的手算参数）。
-///
-/// 手算 perspective_rh(fovy=60°, aspect=1280/720) × look_at_rh：
-/// - eye voxel (700, 560, 700)，target voxel (260, 120, 260)，距离 ~762
-/// - up = Vec3::Y，far 4000（DDA 用 inv_view_proj 反投影方向，far 只影响精度）
+/// 主 world 注入的静态视图配置（矩阵来自 [`Self::build_static`]）。
 #[derive(Resource, Clone, Copy)]
 pub struct DdaCameraConfig {
   pub view_proj: Mat4,
@@ -76,10 +59,8 @@ impl DdaCameraConfig {
     let up = Vec3::Y;
     let aspect = VIEW_SIZE.x as f32 / VIEW_SIZE.y as f32;
     let fovy = 60.0_f32.to_radians();
-    // near 取 1.0：near/far 比过大会让 inv_view_proj 条件数变差、反投影方向失真
     let near = 1.0;
     let far = 4000.0;
-    // Bevy Mat4：perspective_rh 右手系 +y 上 -z 前；look_at_rh 朝 -z
     let proj = Mat4::perspective_rh(fovy, aspect, near, far);
     let view = Mat4::look_at_rh(eye, target, up);
     let view_proj = proj.mul(view);
@@ -94,14 +75,12 @@ impl DdaCameraConfig {
 pub struct DebugNormals(pub u32);
 
 /// 相机约束常量（pub 供 gate-app 输入 system 与测试断言）
-pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians(); // ±89° 防万向节锁（up 与 view 共线）
-pub const DIST_MIN: f32 = 32.0; // 最近 32 voxel（8cm，不穿进体素内部失稳）
-// distance 只有下界、无上限 clamp；滚轮异常操作产生的 NaN 由下界兜底，远景可见性由透视 far 面负责。
+pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians();
+pub const DIST_MIN: f32 = 32.0;
 
-/// 轨道相机参数（main world 资源，gate-app 输入 system 操作）
-///
-/// 字段语义：target = 注视点（voxel）、distance = 相机到 target 距离（voxel）、
-/// yaw = 绕 +Y 方位角（rad，atan2(x, z)）、pitch = 仰角（rad，+ 为上仰）。
+/// 轨道相机参数（main world 资源，gate-app 输入 system 操作）。
+/// `target` = 注视点（voxel）、`distance` = 相机到 target 距离（voxel）、`yaw` = 绕 +Y 方位角（rad）、
+/// `pitch` = 仰角（rad，+ 为上仰）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
   pub target: Vec3,
@@ -111,24 +90,23 @@ pub struct OrbitCamera {
 }
 
 impl OrbitCamera {
-  /// 从眼位和目标点构造轨道参数（FR-1：offset → distance / pitch / yaw）
+  /// 从眼位和目标点构造轨道参数。
   pub fn from_eye(eye: Vec3, target: Vec3) -> Self {
     let offset = eye - target;
     let distance = offset.length();
-    // atan2(y, |xz|) 等价 asin(y/len) 但 distance→0 时不出 NaN
     let pitch = offset.y.atan2(offset.xz().length());
     let yaw = offset.x.atan2(offset.z);
     Self { target, distance, yaw, pitch }
   }
 
-  /// 轨道参数重建眼位（FR-1 公式：eye = target + distance·(sin_yaw·cos_pitch, sin_pitch, cos_yaw·cos_pitch)）
+  /// 轨道参数重建眼位。
   pub fn eye(&self) -> Vec3 {
     let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
     let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
     self.target + self.distance * Vec3::new(sin_yaw * cos_pitch, sin_pitch, cos_yaw * cos_pitch)
   }
 
-  /// 应用约束（pitch ±89°、distance ≥ DIST_MIN；yaw 自由旋转不 clamp，distance 无上限）
+  /// 应用约束（pitch ±89°、distance ≥ DIST_MIN；yaw 无限制）。
   pub fn clamp(&mut self) {
     self.pitch = self.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
     self.distance = self.distance.max(DIST_MIN);
@@ -137,10 +115,7 @@ impl OrbitCamera {
 
 impl DdaCameraConfig {
   /// 眼位 + 视线方向构造（幽灵/飞行相机用；轨道相机走 [`Self::from_orbit`]）。
-  ///
-  /// `forward` 必须是朝向场景的单位向量（调用方从 yaw/pitch 取，且 pitch 已 clamp 到 ±89°，
-  /// 所以它与 +Y 不共线 → look_at_rh 的 up 基准不会退化）。与
-  /// `look_at_rh(eye, eye + forward, +Y)` 逐字等价。
+  /// `forward` 必须是朝向场景的单位向量，且与 +Y 不共线。
   pub fn from_eye_forward(
     eye: Vec3,
     forward: Vec3,
@@ -156,10 +131,7 @@ impl DdaCameraConfig {
     Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
   }
 
-  /// 唯一矩阵构造点（spec FR-2）：orbit 参数 → perspective_rh × look_at_rh。
-  ///
-  /// fov/aspect/near/far 为显式参数（app 传 60° / 1280:720 / 1.0 / 4000），
-  /// 不写死在 orbit 里——性能面板改 fov、多分辨率改 aspect 时复用同一入口。
+  /// orbit 参数 → `perspective_rh` × `look_at_rh`（fov/aspect/near/far 为显式参数）。
   pub fn from_orbit(orbit: &OrbitCamera, fov_y: f32, aspect: f32, near: f32, far: f32) -> Self {
     let eye = orbit.eye();
     let view = Mat4::look_at_rh(eye, orbit.target, Vec3::Y);
@@ -169,57 +141,56 @@ impl DdaCameraConfig {
   }
 }
 
-/// Render-world 着色器绑定的 camera uniform
-/// WGSL `DdaViewUniform` 逐字对齐（2×mat4x4 + 4×vec4 = 128+64 = 192B）
+/// Render-world 着色器绑定的 camera uniform，与 WGSL `DdaViewUniform` 逐字对齐。
 #[derive(Resource, Clone, Copy, ShaderType)]
 pub struct DdaViewUniform {
   pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
   pub cam_pos_voxel: Vec4, // w=1
-  /// x/y = debug 可视化（保留）；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
+  /// x/y = debug 可视化；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
   pub debug_mode: Vec4,
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（GATE_NO_LOD=1 关）
   pub lod: Vec4,
   pub probe_viz_params: Vec4,
 }
 
-/// 【诊断】GATE_SKIP_CHUNKWALK=1：trace_grid 在局部 slab 后直接 miss
+/// `GATE_SKIP_CHUNKWALK=1`：trace_grid 在局部 slab 后直接 miss。
 static SKIP_CHUNKWALK: LazyLock<bool> =
   LazyLock::new(|| std::env::var("GATE_SKIP_CHUNKWALK").map(|v| v == "1").unwrap_or(false));
-/// 【诊断】GATE_SKYOUT=1：dda_main 跳过全部 trace 直接输出天空色
+/// `GATE_SKYOUT=1`：dda_main 跳过全部 trace 直接输出天空色。
 static SKY_OUT: LazyLock<bool> =
   LazyLock::new(|| std::env::var("GATE_SKYOUT").map(|v| v == "1").unwrap_or(false));
-/// 【诊断】GATE_MAKEGRID_ONLY=1：dda_main 只做 make_grid 不 trace
+/// `GATE_MAKEGRID_ONLY=1`：dda_main 只做 make_grid 不 trace。
 static MAKEGRID_ONLY: LazyLock<bool> =
   LazyLock::new(|| std::env::var("GATE_MAKEGRID_ONLY").map(|v| v == "1").unwrap_or(false));
-/// 【诊断】GATE_NO_LOD=1：关闭八叉树远场早停
+/// `GATE_NO_LOD=1`：关闭八叉树远场早停。
 static LOD_DISABLED: LazyLock<bool> =
   LazyLock::new(|| std::env::var("GATE_NO_LOD").map(|v| v == "1").unwrap_or(false));
-/// 【诊断】GATE_NO_BEAM=1：关闭 beam 预 pass，主 pass 从 t=0 起步。默认开启 beam。
+/// `GATE_NO_BEAM=1`：关闭 beam 预 pass，主 pass 从 t=0 起步（默认开启 beam）。
 static BEAM_DISABLED: LazyLock<bool> =
   LazyLock::new(|| std::env::var("GATE_NO_BEAM").map(|v| v == "1").unwrap_or(false));
-/// 【诊断】GATE_NO_LUT=1：关闭方向可达掩码剔除（lod.w 传 1 → shader 端 eff = mask 旁路 LUT）。
+/// `GATE_NO_LUT=1`：关闭方向可达掩码剔除（lod.w 传 1 → shader 端旁路 LUT）。
 static LUT_DISABLED: LazyLock<bool> =
   LazyLock::new(|| std::env::var("GATE_NO_LUT").map(|v| v == "1").unwrap_or(false));
 
 impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
-    // 像素角大小：垂直 FOV 60°（gate-app FOV_Y 镜像）均分到 render_h 像素
+    // 垂直 FOV 60°（镜像 gate-app FOV_Y），均分到 render_h 像素
     let px_ang = 2.0 * 30.0_f32.to_radians().tan() / render_h.max(1.0);
     Self {
       view_proj: cfg.view_proj,
       inv_view_proj: cfg.inv_view_proj,
       cam_pos_voxel: cfg.position_world.extend(1.0),
       debug_mode: Vec4::new(
-        (debug_mode == 1) as u32 as f32,         // x = 法向可视化
-        (debug_mode == 2) as u32 as f32,         // y = face 6 色诊断
-        if *SKIP_CHUNKWALK { 2.0 } else { 0.0 }, // z = 2 跳过 chunk 步进
+        (debug_mode == 1) as u32 as f32,
+        (debug_mode == 2) as u32 as f32,
+        if *SKIP_CHUNKWALK { 2.0 } else { 0.0 },
         if *SKY_OUT {
           2.0
         } else if *MAKEGRID_ONLY {
           4.0
         } else if debug_mode == 3 {
-          1.0 // unlit 诊断：跳过全部光照 albedo 直出（测纯 trace 帧率）
+          1.0
         } else {
           0.0
         },
@@ -228,7 +199,7 @@ impl DdaViewUniform {
         px_ang,
         (!*LOD_DISABLED) as u32 as f32,
         *BEAM_DISABLED as u32 as f32,
-        *LUT_DISABLED as u32 as f32, // w = 1 → shader 旁路方向掩码剔除
+        *LUT_DISABLED as u32 as f32,
       ),
       probe_viz_params: Vec4::ZERO,
     }
@@ -241,8 +212,8 @@ pub struct DdaImages {
   pub target: Handle<Image>,
 }
 
-/// 工厂：DDA 目标纹理（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）
-/// COPY_DST：bevy resize 路径 copy_image_on_resize 会向新纹理拷贝旧内容，缺 COPY_DST 即验证崩溃
+/// 工厂：DDA 目标纹理（rgba8unorm VIEW_SIZE，STORAGE|TEXTURE + RENDER_WORLD usage）。
+/// `COPY_DST` 必须保留：bevy resize 的 `copy_image_on_resize` 依赖它。
 pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
   let mut image =
     Image::new_target_texture(VIEW_SIZE.x, VIEW_SIZE.y, TextureFormat::Rgba8Unorm, None);
@@ -254,84 +225,57 @@ pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
   images.add(image)
 }
 
-// ============================================================================
-// WGSL 常量 Rust 镜像（改 WGSL 顶部 const 时必须同步，无自动化校验）
-// ============================================================================
-
-/// WGSL 着色器顶部 `const` 的 Rust 镜像副本（改 WGSL 时必须一起改）
+/// WGSL 着色器顶部 `const` 的 Rust 镜像副本（改 WGSL 时必须一起改）。
 pub mod wgsl_consts {
-  // 分裂树层级（Douglas Brick Tree：256 → 64 → 16 → 4 → 1）
   pub const CHUNK_SIZE: u32 = 256;
   pub const BRICK_FACTOR: u32 = 4;
   pub const MAX_LEVEL: u32 = 4;
   /// 每节点 fixed 字数（mask_lo + mask_hi + palette_u32）
   pub const NODE_FIXED_WORDS: u32 = 3;
-  // b_struct Region ①：稠密 chunk 窗口
   pub const CHUNK_INDEX_CAP: u32 = 64;
-  pub const CHUNK_INDEX_WORDS: u32 = 262_144; // 64³
+  pub const CHUNK_INDEX_WORDS: u32 = 262_144;
   pub const TREE_BASE: u32 = 262_144;
-  // palette / comp / state
-  /// 调色板字数（2^16 条 × 2w = 512KB/volume）；与 `wire.rs::PALETTE_WORDS` 同源
+  /// 调色板字数（2^16 条 × 2w）；与 `wire.rs::PALETTE_WORDS` 同源
   pub const PALETTE_WORDS: u32 = crate::brickmap::wire::PALETTE_WORDS as u32;
-  /// 叶父层 inline 字数与每字体素数（与 `wire.rs` 同源，供 WGSL 顶部 const 对齐）
+  /// 叶父层 inline 字数与每字体素数，与 `wire.rs` 同源
   pub const LEAF_INLINE_WORDS: u32 = crate::brickmap::wire::LEAF_INLINE_WORDS as u32;
   pub const LEAF_VOXELS_PER_WORD: u32 = crate::brickmap::wire::LEAF_VOXELS_PER_WORD as u32;
   pub const CHUNK_COMP_WORDS: u32 = 2048; // u16[4096] → 每 2 字打包 u32
   pub const STATE_ENTRY_COUNT: u32 = 256;
   pub const STATE_WORDS_PER_ENTRY: u32 = 4;
-  pub const STATE_TOTAL_WORDS: u32 = 1024; // 256 × 4
-  // 直光层（镜像 lighting.rs 常量；WGSL const 同步，改时一起改）
+  pub const STATE_TOTAL_WORDS: u32 = 1024;
   pub const SHADOW_BIAS: f32 = crate::lighting::SHADOW_BIAS;
   pub const SHADOW_DIR_T_MAX: f32 = crate::lighting::SHADOW_DIR_T_MAX;
   pub const EMISSIVE_EMIT_GAIN: f32 = crate::lighting::EMISSIVE_EMIT_GAIN;
-  // 光照场（AO fill；Douglas #15 的 16³ 体素填充率网格）。cell = 16 voxel，
-  // dims = 32³ cell → 世界覆盖 = 32×16 = 512 voxel = ±5.12m（相机中心）。
-  // 寻址与 DDGI 同构：原点按 cell 向下对齐、槽位 = 世界 cell mod dims（世界锚定）。
-  // 格式 Rgba16Unorm：.a = AO fill，.rgb 恒 0（发光密度 ε 已按 Douglas #19 的方案移除，
-  // 自发光只走"射线命中即返回它自己的颜色"）。
-  // upload.rs 铺图依赖 LIGHT_FIELD_DIM×8 是 256 的整数倍（行对齐）。
+  // 光照场（AO fill）：cell = 16 voxel，dims = 32³ cell → 世界覆盖 512 voxel = ±5.12m（相机中心）。
+  // 世界锚定寻址：原点按 cell 向下对齐，槽位 = 世界 cell mod dims。格式 Rgba16Unorm：.a = AO fill，.rgb 恒 0。
   pub const LIGHT_FIELD_CELL: u32 = 16;
   pub const LIGHT_FIELD_DIM: u32 = 32;
-  /// 起点从体素表面再外推的量（体素）。着色点锚在**体素中心**，`+ n×0.5` 恰好落在面平面
-  /// 上；对 -X/-Y/-Z 面这个坐标是整数 → DDA 的 `floor` 落回**体素自己** → 自命中，而
-  /// dda_main 的自命中防护把「命中自己」当**无遮挡**。外推 1/32 体素（≈0.6mm）把起点推过
-  /// 边界，且足够小、不会漏掉紧贴表面的薄遮挡物。
-  /// 必须与 WGSL `SHADOW_SURFACE_EPS` 一致。
+  /// 射线起点沿法线自体素表面再外推的量（体素）；必须与 WGSL `SHADOW_SURFACE_EPS` 一致。
   pub const SHADOW_SURFACE_EPS: f32 = 0.03125;
 }
 
-/// 与 WGSL `popcount(mask & (bit - 1u64))` 等价：mask bit=1 子块在 child offset
-/// 表中的槽位（紧凑 child offset 只存 bit=1 的子块）
+/// 与 WGSL `popcount(mask & (bit - 1u64))` 等价：mask bit=1 子块在紧凑 child offset 表中的槽位。
 #[inline]
 pub fn wgsl_child_slot_index(mask: u64, child_idx: u32) -> u32 {
   debug_assert!(child_idx < 64);
   (mask & ((1u64 << child_idx) - 1)).count_ones()
 }
 
-// ============================================================================
-// CPU DDA 参考实现（独立 A&W step，仅复用 BrickMapView::get_voxel 读 palette）
-// ============================================================================
-
 use crate::brickmap::{BrickMapBuffers, BrickMapView};
 
-/// A&W 细格步进 DDA 参考实现（CPU）。
-///
-/// 仅调用 `BrickMapView::get_voxel(voxel: IVec3)` 查询 palette。返回
-/// `Some((hit_t, palette))` 或 `None`（t >= t_max 前未命中 / 超步）
-///
-/// 关键正确性约定：cell 坐标用整数增量维护（floor(origin) 起步，每次穿越 +sign），
-/// **不得**用 `floor(origin + dir*t)` 重算——t 恰好是边界穿越时刻时 pos 分量正好落在
-/// 整数边界上，floor 会随机取到穿越前/后的胞，导致对角胞漏检（DDA vs brute 不等价）。
+/// A&W 细格步进 DDA 参考实现（CPU），仅用 `BrickMapView::get_voxel` 查 palette，
+/// 返回 `Some((hit_t, palette))` 或 `None`。
+/// cell 坐标必须用整数增量维护（`floor(origin)` 起步，每次穿越 `+sign`），不得用 `floor(origin + dir*t)` 重算。
 pub fn cpu_reference_dda_ray(
   buffers: &BrickMapBuffers,
   origin_voxel: Vec3,
-  dir_voxel: Vec3, // voxel units（归一化），magnitude 任意（delta 按 |dir| 缩放）
+  dir_voxel: Vec3, // voxel 单位，magnitude 任意
   t_max: f32,
   max_steps: u32,
 ) -> Option<(f32, u16)> {
   let view = BrickMapView::new(buffers);
   let mut t = 0.0f32;
-  // init A&W 变量
   let sign = [
     if dir_voxel.x >= 0.0 { 1 } else { -1 },
     if dir_voxel.y >= 0.0 { 1 } else { -1 },
@@ -344,10 +288,7 @@ pub fn cpu_reference_dda_ray(
   ];
   let mut cell =
     [origin_voxel.x.floor() as i32, origin_voxel.y.floor() as i32, origin_voxel.z.floor() as i32];
-  let next_boundary = |c: i32, s: i32| -> f32 {
-    // s=1 -> 下一个上界 (c+1).0; s=-1 -> 当前下界 c.0（负数 floor 刚好也是下一个朝向的边界）
-    (if s >= 0 { c + 1 } else { c }) as f32
-  };
+  let next_boundary = |c: i32, s: i32| -> f32 { (if s >= 0 { c + 1 } else { c }) as f32 };
   let tmax_x = if dir_voxel.x.abs() <= 1e-30 {
     f32::INFINITY
   } else {
@@ -365,7 +306,6 @@ pub fn cpu_reference_dda_ray(
   };
   let mut tmax = [tmax_x, tmax_y, tmax_z];
 
-  // 初始胞采样（整数 cell，精确）
   if let Some(pal) = view.get_voxel(IVec3::from_array(cell)) {
     return Some((t, pal));
   }
@@ -373,7 +313,6 @@ pub fn cpu_reference_dda_ray(
     if t >= t_max {
       return None;
     }
-    // 走最小分量；cell 整数增量步进（边界精确，无浮点 floor 漏检）
     if tmax[0] <= tmax[1] && tmax[0] <= tmax[2] {
       t = tmax[0];
       tmax[0] += delta[0];
@@ -394,24 +333,17 @@ pub fn cpu_reference_dda_ray(
   None
 }
 
-/// 带 AABB 跳步的参考 DDA：先求射线 (origin + t·dir, t∈[0, t_max]) 与给定 AABB
-/// [aabb_min, aabb_max] 的相交段，若不相交直接 None；否则把 DDA 起点推进到
-/// AABB 入口再开始走（跳过 origin→AABB 之间的空胞）。
-///
-/// 标尺约定：所有 t/tmax 都自"新起点 start = origin + dir·t_enter"量起，不混用自 origin
-/// 的全局 t；返回的 hit_t 已加回 t_enter，为自 origin 量起的全局距离。
-///
-/// 与 cpu_reference_dda_ray 逐射线命中等价（AABB-skip 与 brute-force 两条路径同一套标尺）。
+/// 带 AABB 跳步的参考 DDA：先求射线与 AABB 的相交段；不相交返回 `None`，相交则把起点推进到 AABB 入口。
+/// 标尺：t 自 `start = origin + dir·t_enter` 量起，返回的 `hit_t` 已加回 `t_enter`（自 origin 的全局距离）。
 pub fn cpu_reference_dda_ray_aabb_skip(
   buffers: &BrickMapBuffers,
   origin: Vec3,
-  dir: Vec3,         // 归一化（AABB 求交不要求归一化，但这里统一用归一与原函数对齐）
-  t_global_max: f32, // 自 origin 量起的全局上限（= frustum_length）
+  dir: Vec3,         // 归一化
+  t_global_max: f32, // 自 origin 量起的全局上限
   max_steps: u32,
   aabb_min: Vec3,
   aabb_max: Vec3,
 ) -> Option<(f32, u16)> {
-  // ---- 1) slab 法求射线与 AABB 的 t ∈ [t_enter, t_exit]（都自 origin 量起）----
   let mut t_enter = 0.0f32;
   let mut t_exit = t_global_max;
   let mut miss = false;
@@ -421,7 +353,6 @@ pub fn cpu_reference_dda_ray_aabb_skip(
     let mn = [aabb_min.x, aabb_min.y, aabb_min.z][axis];
     let mx = [aabb_max.x, aabb_max.y, aabb_max.z][axis];
     if d.abs() < 1e-30 {
-      // 轴平行：origin 分量必须 ∈ [mn, mx]（闭区间）才算通过
       if o < mn || o > mx {
         miss = true;
       }
@@ -435,18 +366,15 @@ pub fn cpu_reference_dda_ray_aabb_skip(
     }
   }
   if miss || t_exit < t_enter.max(0.0) {
-    return None; // 与 AABB 完全不相交（含视锥段内不相交）
+    return None;
   }
-  // 约束到视锥有效段
   let t_enter = t_enter.max(0.0);
   let t_exit = t_exit.min(t_global_max);
   if t_exit <= t_enter {
-    return None; // 厚度为 0（擦边）或完全在视锥外
+    return None;
   }
 
-  // ---- 2) 起点推进到 start = origin + dir·t_enter；后续全用「相对标尺」----
   let start = origin + dir * t_enter;
-  // 相对 max t：从 start 到 t_exit（自 origin）的剩余长度
   let t_rel_max = t_exit - t_enter;
 
   let view = BrickMapView::new(buffers);
@@ -462,7 +390,6 @@ pub fn cpu_reference_dda_ray_aabb_skip(
   ];
   let next_boundary = |c: i32, s: i32| -> f32 { (if s >= 0 { c + 1 } else { c }) as f32 };
   let mut cell = [start.x.floor() as i32, start.y.floor() as i32, start.z.floor() as i32];
-  // tmax 分量：相对 start 的距离
   let tmax_x = if dir.x.abs() <= 1e-30 {
     f32::INFINITY
   } else {
@@ -480,9 +407,8 @@ pub fn cpu_reference_dda_ray_aabb_skip(
   };
   let mut tmax = [tmax_x, tmax_y, tmax_z];
 
-  // 初始胞采样（start 对应的胞；floor 过）
   if let Some(pal) = view.get_voxel(IVec3::from_array(cell)) {
-    return Some((t_enter, pal)); // 全局 t = t_enter + 0（相对）
+    return Some((t_enter, pal));
   }
   let mut t_rel = 0.0f32;
   for _ in 0..max_steps {
@@ -509,14 +435,9 @@ pub fn cpu_reference_dda_ray_aabb_skip(
   None
 }
 
-/// 细级：单个粗 cell（16³ voxel）内的有界 voxel DDA。
-/// 射线段限制在 [t_lo, t_hi]（该 cell 的入出区间，自 origin 全局标尺）。
-///
-/// 入口 voxel 胞用「解析 + clamp」确定：p = origin + dir·t_lo 落在 cell 入口面上时，
-/// floor(p) 可能因浮点误差取到邻胞——clamp 到 [base, base+15] 保证起点一定在本 cell 内。
-/// clamp 不会漏检：入口面外侧的最后一个 voxel 胞属于前一个粗 cell，其细扫已覆盖。
-/// 采样序列与 full DDA 在同区间的序列逐胞一致（voxel 边界与粗边界 16 对齐）。
-#[allow(clippy::too_many_arguments)] // cell 局部细扫的固有参数面（view+射线+cell 窗口）
+/// 细级：单个粗 cell（16³ voxel）内的有界 voxel DDA，射线段限制在 `[t_lo, t_hi]`（自 origin 全局标尺）。
+/// 入口胞用解析 + clamp 到 `[base, base+15]` 确定，保证起点必在本 cell 内（入口面外侧胞由前一粗 cell 覆盖）。
+#[allow(clippy::too_many_arguments)]
 fn dda_voxel_scan_cell(
   view: &BrickMapView,
   origin: Vec3,
@@ -537,7 +458,7 @@ fn dda_voxel_scan_cell(
   for i in 0..3 {
     fc[i] = (pc[i].floor() as i32).clamp(base[i], base[i] + 15);
   }
-  // voxel tmax：相对 t_lo 的距离（自 cell 入口重算，非累加——与 full 的 ulp 差异见主函数注释）
+  // voxel tmax：相对 t_lo 的距离（自 cell 入口重算，非累加）
   let mut tmax_f = [f32::INFINITY; 3];
   for i in 0..3 {
     if dir[i].abs() > 1e-30 {
@@ -590,18 +511,7 @@ pub struct DdaHit {
 }
 
 /// 两级 DDA 参考实现（cell 粗步 + cell 内细步）。
-///
-/// 语义与 `cpu_reference_dda_ray` 完全一致：射线 (origin, dir, t∈[0,t_max]) 上
-/// 首个非空 voxel 体素，返回命中记录或 None。
-///
-/// 结构（WGSL dda_main 逐字对应的源）：
-///   1. 粗级 A&W：cell 粒度（16 voxel）步进，delta_c = delta × 16（f32 乘 2 的幂，精确）；
-///      每步先做 `BrickMapView::cell_occupied`（①+②，2 次 load），空 cell 整段跳过。
-///   2. 细级：占用 cell 内 `dda_voxel_scan_cell`，区间 [t_in, min(t_out, t_max)]。
-///   3. 退出条件：t_out ≥ t_max（cell 出口越过上限）或粗步数耗尽。
-///
-/// 与 full 版的数值差异：粗级按 delta_c 累加、细级自 cell 入口重算，长路径 ulp 漂移可达
-/// ~0.1 voxel，只影响返回 t 值，不影响命中胞序。
+/// 语义同 `cpu_reference_dda_ray`：射线 (origin, dir, t∈[0,t_max]) 上首个非空 voxel 体素，返回命中记录或 None。
 pub fn cpu_reference_dda_ray_two_level(
   buffers: &BrickMapBuffers,
   origin_voxel: Vec3,
@@ -638,7 +548,7 @@ pub fn cpu_reference_dda_ray_two_level(
   let mut t_in = 0.0f32; // 当前粗 cell 的入口 t（初始 cell = 0）
   for _ in 0..max_steps {
     let t_out = tmax_c[0].min(tmax_c[1]).min(tmax_c[2]);
-    // 占用查询先行：空 cell 不做任何 voxel 采样（性能核心）
+    // 占用查询先行：空 cell 不做任何 voxel 采样
     if view.cell_occupied(IVec3::from_array(cc))
       && let Some((t, pal, axis)) =
         dda_voxel_scan_cell(&view, origin_voxel, dir_voxel, sign, delta, cc, t_in, t_out.min(t_max))
@@ -667,20 +577,13 @@ pub fn cpu_reference_dda_ray_two_level(
 }
 
 // ============================================================================
-// 层次栈式 mask DDA（WGSL shaders/voxel_raytrace/ TraceFrame/init_tree_frame/trace_chunk/
-// trace_grid chunk 间循环的 CPU 逐字镜像）
-//
-// 节点 mask 一次读进寄存器，该节点 4³=64 子块间步进只查 bit（零 load）；bit=1 分裂才压栈
-// 下钻，bit=0 uniform 子块整格跳过/整格命中。
-//
-// 结构与 WGSL 严格一一对应：TreeFrameCpu ↔ TreeFrame，init_tree_frame_cpu ↔ init_tree_frame，
-// trace_chunk_cpu ↔ trace_chunk（单 chunk 内 4 层栈帧），trace_volume_tree ↔ trace_grid 的
-// 局部 slab + chunk 间 256³ A&W 段。
+// 层次栈式 mask DDA：WGSL shaders/voxel_raytrace/ 中 TraceFrame/init_tree_frame/trace_chunk/
+// trace_grid 的 CPU 逐字镜像。节点 mask 一次读进寄存器，4³=64 子块间步进只查 bit（零 load）；
+// bit=1 分裂才压栈下钻，bit=0 uniform 子块整格跳过/整格命中。
 // ============================================================================
 
 /// 层次遍历命中记录（镜像 WGSL VoxelHit/UnifiedHit）：face_id 0..5 = ±xyz 六面。
-/// voxel = 命中固体体素 grid 局部 voxel 整数坐标——DDA 整数步进精确产出，
-/// 着色（per-voxel normal/GI key）直接消费，禁用「命中点 ± 法线半步」启发式重建。
+/// voxel = 命中固体体素 grid 局部 voxel 整数坐标（DDA 整数步进产出）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TreeHit {
   pub t: f32,
@@ -719,8 +622,7 @@ fn face_normal_from_index(f: u8) -> Vec3 {
 }
 
 /// brick 缓存（镜像 WGSL Brick）：一层分裂节点的掩码常驻，跨级跳时零加载复用。
-/// level 编号与 Douglas octo_march_core 一致：3 = 根（256³，子块 64³）、
-/// 2（64³，子块 16³）、1（16³，子块 4³）、0（4³，inline 1³ 叶）。
+/// level 编号：3 = 根（256³，子块 64³）、2（64³，子块 16³）、1（16³，子块 4³）、0（4³，inline 1³ 叶）。
 #[derive(Clone, Copy)]
 struct BrickCpu {
   addr: usize, // 节点绝对字址（b_struct）
@@ -728,16 +630,8 @@ struct BrickCpu {
   pal: u16,    // 节点 palette（统一子块颜色，0=空气）
 }
 
-/// 镜像 WGSL trace_chunk：单 chunk 内 Douglas 式整数体素层级 DDA
-/// （octo_march_core：integer voxel + brick mask 栈 + firstTrailingBit 跨级跳）。
-///
-/// 状态只有整数体素坐标 v + bricks[4]（下钻载入、跳层复用）；边界距离按整数对齐每次重算
-/// （side_distance_for_ray）；跨 brick 后用 firstTrailingBit 一次跳到最粗可行层
-/// （尾随零位 = 对齐 run 长度）。
-///
-/// chunk_base = 根节点绝对字址；chunk_min = chunk 原点（局部 voxel）；
-/// 射线段 [t0, t1]（ro 系绝对 t）；entry_face = 进入本 chunk 的面。
-/// 返回 (t, pal, face_id, chunk 局部命中体素 v) 或 None（走出 chunk 未命中 / budget 耗尽）。
+/// 镜像 WGSL trace_chunk：单 chunk 内整数体素层级 DDA（integer voxel + brick mask 栈 + firstTrailingBit 跨级跳）。
+/// chunk_base/chunk_min = chunk 根字址/原点（局部 voxel）；射线段 [t0, t1]（ro 系绝对 t）；返回 (t, pal, face_id, 局部 v)。
 #[allow(clippy::too_many_arguments)]
 fn trace_chunk_cpu(
   b_struct: &[u32],
@@ -750,13 +644,13 @@ fn trace_chunk_cpu(
   t1: f32,
   entry_face: u8,
 ) -> Option<(f32, u16, u8, [i32; 3])> {
-  // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 无体素内部可穿过，直接 miss
+  // 擦边退化（t0>=t1：射线只蹭到 chunk 边界）→ 直接 miss
   if t0 >= t1 {
     return None;
   }
   // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = [ro[0] - chunk_min[0], ro[1] - chunk_min[1], ro[2] - chunk_min[2]];
-  // 预算倒数：side 距离/步长增量改乘法（每外层省 3 个 fdiv；与 WGSL inv_rd 镜像）
+  // 预算倒数：side 距离/步长增量改乘法；与 WGSL inv_rd 镜像
   let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
   let read_brick = |addr: usize| BrickCpu {
     addr,
@@ -785,7 +679,7 @@ fn trace_chunk_cpu(
     if level > 3 {
       return None;
     }
-    // ---- traverse：从当前 level 下钻到 v 处内容（Douglas traverse_bit_set）----
+    // ---- traverse：从当前 level 下钻到 v 处内容 ----
     loop {
       let b = bricks[level as usize];
       let log2 = level * 2;
@@ -826,7 +720,7 @@ fn trace_chunk_cpu(
       level -= 1;
       bricks[level as usize] = cb;
     }
-    // ---- v 处为空气：当前 level brick 内 DDA（Douglas dda）----
+    // ---- v 处为空气：当前 level brick 内 DDA ----
     let log2 = level * 2;
     let s = 1i32 << log2; // 子块边长 voxel：1/4/16/64
     let mut side = [1e30f32; 3];
@@ -838,7 +732,7 @@ fn trace_chunk_cpu(
         side[i] = ((boundary as f32 - ro_c[i]) * inv_rd[i]).max(cur_t);
       }
     }
-    // 每轴步长 t 增量（level 不变则不变）：inner 里 O(1) 加法
+    // 每轴步长 t 增量（level 不变则不变）
     let step_inc =
       [s as f32 * inv_rd[0].abs(), s as f32 * inv_rd[1].abs(), s as f32 * inv_rd[2].abs()];
     let mut step_axis: usize;
@@ -868,10 +762,8 @@ fn trace_chunk_cpu(
         changed = true;
         break;
       }
-      // 新子块内容：level 0 查 inline palette（mask!=0 inline 叶才有）；
-      // level 1..3 = 分裂位或节点统一实体色。
-      // 命中直接返回（cur_t=进入距离、face=进入面）——省一整轮外层
-      // （traverse 节点 load + side 重算）；仅「分裂子块」回 traverse 下钻。
+      // 新子块内容：level 0 查 inline palette（mask!=0 inline 叶才有）；level 1..3 = 分裂位或节点统一实体色。
+      // 命中直接返回（cur_t=进入距离、face=进入面）；仅「分裂子块」回 traverse 下钻。
       let b = bricks[level as usize];
       let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
       let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
@@ -904,9 +796,8 @@ fn trace_chunk_cpu(
         return None;
       }
     }
-    // ---- firstTrailingBit 层级自适应跨级跳（Douglas march 尾部）----
-    // 步进轴新坐标的尾随零位 = 对齐 run 长度：正向 comp=对齐基址（tz 直接读），
-    // 负向 comp=区域尾址+1（基址|~mask 后 +1）。tz>>1 = 可跨步的最粗 level。
+    // ---- firstTrailingBit 层级自适应跨级跳 ----
+    // 步进轴新坐标的尾随零位 = 对齐 run 长度：正向 comp=对齐基址，负向 comp=区域尾址+1；tz>>1 = 可跨步的最粗 level。
     let positive = sign[step_axis] >= 0;
     let cur_log2 = level * 2;
     let m: u32 = 0xFFFF_FFFFu32.wrapping_shl(cur_log2);
@@ -918,8 +809,7 @@ fn trace_chunk_cpu(
     if level > 3 {
       return None; // 跨出 chunk（tz≥8）
     }
-    // 对齐快照：v 钳到 cur_t 射线点所在的当前 level 区域，步进轴取精确边界整数
-    // （其余轴按射线实际位置吸附，消除只沿单轴步进的漂移）
+    // 对齐快照：v 钳到 cur_t 射线点所在的当前 level 区域，步进轴取精确边界整数（其余轴按射线实际位置吸附）。
     let mi = m as i32;
     let base = [v[0] & mi, v[1] & mi, v[2] & mi];
     let p = [ro_c[0] + rd[0] * cur_t, ro_c[1] + rd[1] * cur_t, ro_c[2] + rd[2] * cur_t];
@@ -932,10 +822,7 @@ fn trace_chunk_cpu(
 }
 
 /// 镜像 WGSL trace_grid 的「局部 AABB slab + chunk 间 256³ A&W + trace_chunk」段。
-///
-/// ro/rd 为局部 voxel 坐标（rd 含 1/scale；t 为射线参数，主世界/物体同一标尺）；
-/// 局部 AABB [l_min, l_max]（voxel）；view 携带 chunk 窗口与 b_struct。
-/// chunk 步数上限与 WGSL make_grid 一致：(dims.x+dims.y+dims.z)*3 + 16。
+/// ro/rd 为局部 voxel 坐标（rd 含 1/scale）；chunk 步数上限 = (dims.x+dims.y+dims.z)*3 + 16，与 WGSL make_grid 一致。
 fn trace_volume_tree(
   view: &BrickMapView,
   ro: Vec3,
@@ -1032,9 +919,7 @@ fn trace_volume_tree(
   None
 }
 
-/// 主世界层次 DDA（identity 变换）：局部 AABB = chunk 窗口范围（与 WGSL
-/// make_grid idx=0 的 is_world 分支一致）。
-///
+/// 主世界层次 DDA（identity 变换）：局部 AABB = chunk 窗口范围（与 WGSL make_grid idx=0 的 is_world 分支一致）。
 /// 语义同 `cpu_reference_dda_ray`：射线 (origin, dir, t∈[0,t_max]) 上首个非空体素。
 pub fn cpu_reference_dda_ray_tree(
   buffers: &BrickMapBuffers,
@@ -1055,8 +940,6 @@ pub fn cpu_reference_dda_ray_tree(
 }
 
 /// 对固定场景 & 静态 DdaCameraConfig，按 32x32 网格渲染 ASCII 画。
-///
-/// 返回 `Vec<char>`（32×32，row-major 32 字符换行）。
 /// 字符规则：palette=1 → 'X', 2 → 'o', 3 → '#', 4 → '*', 其他非 0 → '+', 空 → '.'
 pub fn cpu_dda_ascii_grid_32x32(cfg: &DdaCameraConfig, buffers: &BrickMapBuffers) -> Vec<char> {
   let w = 32usize;
@@ -1090,21 +973,14 @@ pub fn cpu_dda_ascii_grid_32x32(cfg: &DdaCameraConfig, buffers: &BrickMapBuffers
 }
 
 // ============================================================================
-// 多 volume CPU 参考 trace
-//
-// 入口 = `cpu_reference_trace_volumes` / `cpu_reference_volumes_occluded`，
-// 遍历 `vols: &[(&BrickMapBuffers, VolumeTransform)]`：
-// - idx 0 = 主世界（identity transform、无界 chunk HashMap）→ 直接层次 DDA
-// - idx 1..N = 物体（任意 transform、单 chunk）→ AABB 预剔除 + 局部变换 + 局部
-//   tile 盒 slab + 层次 DDA → 局部法线经 rot → 世界法线
+// 多 volume CPU 参考 trace：入口 = `cpu_reference_trace_volumes` / `cpu_reference_volumes_occluded`。
+// idx 0 = 主世界（identity transform、无界 chunk HashMap）；idx 1..N = 物体（任意 transform、单 chunk）。
 // ============================================================================
 
 use gate_voxel::VolumeTransform;
 
 /// 统一 volume 命中记录。
-///
-/// `obj_id` 约定与 `Volumes` 一致：-1 = 主世界，0..N-1 = 物体索引
-/// （对应 `Volumes.list[1..]` 的 0-based 索引）。
+/// `obj_id` 约定与 `Volumes` 一致：-1 = 主世界，0..N-1 = 物体索引（`Volumes.list[1..]` 的 0-based 索引）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeHit {
   pub t: f32,
@@ -1138,8 +1014,7 @@ fn slab_box(ro: Vec3, rd: Vec3, mn: Vec3, mx: Vec3, t0: f32, t1: f32) -> (f32, f
 }
 
 /// 单物体 ray：世界 AABB 预剔除 + 局部变换 + 局部 [0,256]³ slab + 层次栈式 DDA。
-/// 返回 (全局 t, palette, **局部**面法线) 或 None。t 标尺全局（rd 含 1/scale，
-/// 局部射线参数 = 世界射线参数，与 WGSL trace_grid 同一标尺）。
+/// 返回 (全局 t, palette, 局部面法线) 或 None；t 标尺全局（rd 含 1/scale，与 WGSL trace_grid 同一标尺）。
 fn cpu_reference_object_ray_unified(
   bufs: &BrickMapBuffers,
   tr: VolumeTransform,
@@ -1171,12 +1046,7 @@ fn cpu_reference_object_ray_unified(
 }
 
 /// `trace_volumes()` CPU 参考：遍历所有 volume 取最近命中（层次栈式 mask DDA）。
-///
-/// - idx 0 = 主世界：identity transform → `cpu_reference_dda_ray_tree`
-///   （局部 AABB = chunk 窗口范围，镜像 WGSL make_grid idx=0）
-/// - idx 1..N = 物体：`cpu_reference_object_ray_unified`（世界 AABB + 局部 DDA）
-///
-/// 命中按 t 升序排序取最近；任一前置 volume 命中即压缩后续 volume 的 t_cap。
+/// idx 0 = 主世界（identity transform）；idx 1..N = 物体；命中后收紧其余 volume 的 t_cap。
 pub fn cpu_reference_trace_volumes(
   vols: &[(&BrickMapBuffers, VolumeTransform)],
   origin: Vec3,
@@ -1203,8 +1073,7 @@ pub fn cpu_reference_trace_volumes(
   best
 }
 
-/// `trace_volumes()` 遮挡快路径：t_max 内**任一**命中即 true。
-/// 不做最近比较；阴影射线占比大时（每像素 × 光源 × 采样），此路径省去逐 volume t 排序。
+/// `trace_volumes()` 遮挡快路径：t_max 内任一命中即 true（不做最近比较）。
 pub fn cpu_reference_volumes_occluded(
   vols: &[(&BrickMapBuffers, VolumeTransform)],
   origin: Vec3,
@@ -1269,18 +1138,15 @@ pub(crate) struct DdaBg3BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
-/// BG3 光池持久 GPU buffer（主题静态：prepare 覆写同 buffer，避免逐帧重分配）
+/// BG3 光池持久 GPU buffer（prepare 每帧覆写同 buffer）。
 #[derive(Resource)]
 pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 
 /// 辅助纹理缓存（屏幕尺寸相关，resize 时重建）：
-///   · `texture`：beam depth（低分辨率 r32float）——beam 预 pass 写、主 pass 读；
-///   · `gi_*`：半分辨率 GI 缓冲（菜单开关 `DdgiDebugSettings.gi_half_res`）——`gi_main` 写
-///     （写入侧在 BG5），主 pass 双线性采样（BG0 binding 4/5）。存的是 **premultiplied valid**：
-///     rgba16f 的 .rgb = gi·valid、.a = valid；rg32f 的 .r = cov·valid、.g = valid ⇒ 采样侧
-///     按 valid 归一化，天空/介质像素不污染几何边缘。
-///   · `gi_bg0`：GI pass 自己的 @group(0)（view uniform + beam depth，**不含** GI 采样视图 ——
-///     同一 pass 内不能把同一张纹理既绑成采样又绑成存储，故 GI pass 用这份"瘦"版 BG0）。
+///   · `texture`：beam depth（低分辨率 r32float），beam 预 pass 写、主 pass 读；
+///   · `gi_*`：半分辨率 GI 缓冲（`DdgiDebugSettings.gi_half_res`），`gi_main` 写、主 pass 采样（BG0 4/5）；
+///     存 premultiplied valid：rgba16f = (gi·valid, valid)、rg32f = (cov·valid, valid)，采样侧按 valid 归一化；
+///   · `gi_bg0`：GI pass 自己的 @group(0)（view uniform + beam depth，不含 GI 采样视图）。
 #[derive(Resource, Default)]
 pub(crate) struct AuxTexCache {
   texture: Option<Texture>,
@@ -1291,12 +1157,12 @@ pub(crate) struct AuxTexCache {
   gi_cov_view: Option<TextureView>,
   gi_size: UVec2,
   gi_bg0: Option<BindGroup>,
-  /// group(5) 的 GI **采样侧** bind group（`dda_main` 用；layout = `DdaPipelines::gi_read_layout`）
+  /// group(5) 的 GI 采样侧 bind group（`dda_main` 用；layout = `DdaPipelines::gi_read_layout`）
   gi_read_bg: Option<BindGroup>,
 }
 
 impl AuxTexCache {
-  /// 半分辨率 GI 的**写入侧**视图（BG5 的 binding 2/3 用）。
+  /// 半分辨率 GI 的写入侧视图（BG5 的 binding 2/3 用）。
   /// `None` = 尚未创建（首帧，或本帧 `prepare_dda_bind_groups` 提前返回）⇒ 调用方须用占位纹理。
   pub(crate) fn gi_write_views(&self) -> Option<(&TextureView, &TextureView)> {
     Some((self.gi_view.as_ref()?, self.gi_cov_view.as_ref()?))
@@ -1307,8 +1173,7 @@ impl AuxTexCache {
 #[allow(dead_code)]
 pub(crate) struct DdaPipelines {
   pub(crate) bg0_layout: BindGroupLayoutDescriptor,
-  /// BG0 的"瘦"版：`view uniform + beam depth`（供 `gi_main` 用 —— 该 pass 要**写** GI 纹理，
-  /// 故不能复用含 GI 采样视图的 `bg0_layout`）
+  /// BG0 的"瘦"版：`view uniform + beam depth`（供 `gi_main` 用，该 pass 要写 GI 纹理）。
   pub(crate) bg0_gi_layout: BindGroupLayoutDescriptor,
   /// group(5) 的"GI 采样侧"（`dda_main` 专用）：两张半分辨率 GI 纹理（绑定号 4/5）
   pub(crate) gi_read_layout: BindGroupLayoutDescriptor,
@@ -1336,11 +1201,10 @@ pub(crate) struct DdaPipelines {
 #[derive(bevy::ecs::resource::Resource)]
 pub struct EyeAdaptGpu {
   pub buf: Option<Buffer>,
-  /// 渲染侧墙钟（与 profiler 同源）：适应速度因此与帧率无关
+  /// 渲染侧墙钟（与 profiler 同源）：适应速度与帧率无关
   pub last: Option<std::time::Instant>,
   pub bg: Option<BindGroup>,
-  /// 活参数（UI 可调）。挂在 GPU 资源上而不是单独一个 system param ——
-  /// `prepare_dda_bind_groups` 已经是 Bevy 的 16 参数上限，再加一个会失去 SystemParamFunction。
+  /// 活参数（UI 可调）。
   pub settings: EyeAdaptSettings,
   /// 参数区需要重传（`sync_eye_adapt_settings` 置位，prepare 消费；初值 true 保证首帧上传缺省）
   pub settings_dirty: bool,
@@ -1358,9 +1222,8 @@ impl Default for EyeAdaptGpu {
   }
 }
 
-/// 把 main world 的活参数搬进 [`EyeAdaptGpu`]（**只做搬运**，真正上传在
-/// `prepare_dda_bind_groups` 里做，那里才有 queue 和 buffer 句柄）。
-/// `Res::is_changed` 由 `ExtractResourcePlugin` 在同步时标记 ⇒ 只有 UI 真改过才为真。
+/// 把 main world 的活参数搬进 [`EyeAdaptGpu`]（只做搬运，真正上传在 `prepare_dda_bind_groups`）。
+/// `Res::is_changed` 由 `ExtractResourcePlugin` 在同步时标记。
 fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResMut<EyeAdaptGpu>) {
   let Some(s) = eye_set else {
     return;
@@ -1372,48 +1235,41 @@ fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResM
   eye.settings_dirty = true;
 }
 
-/// 眼睛适应（自动曝光）的**活参数**：由 debug overlay 的「Eye」页实时调，改完下一帧生效。
-///
-/// 传输链路：本资源（main world）→ `ExtractResourcePlugin`（只在变化时才同步进 render world，
-/// 并标记 changed）→ `prepare_dda_bind_groups` 检测 `is_changed()` 后写 buffer 参数区 20B
-/// → 下一帧 WESL 的 `eye_p(i)` 读到新值。**稳态零写入**。
-///
+/// 眼睛适应（自动曝光）的活参数：由 debug overlay 的「Eye」页实时调，改完下一帧生效。
 /// 下标顺序即语义，与 WESL 侧 `eye_p(i)` 一一对应（改这里必须同步 `main.wesl`）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 pub struct EyeAdaptSettings {
-  /// **总开关**：关掉 = 两个 eye pass 停发 + 曝光回落 1.0（= 关闭自动曝光）。
-  /// 不占参数区槽位（host 侧开关，shader 不需要读到它）。初值受 `GATE_NO_EYE_ADAPT=1`
-  /// 影响，之后由 debug overlay 的 Eye 页开关接管。
+  /// 总开关：关掉 = 两个 eye pass 停发 + 曝光回落 1.0。不占参数区槽位（host 侧开关）。
+  /// 初值受 `GATE_NO_EYE_ADAPT=1` 影响，之后由 Eye 页开关接管。
   pub enabled: bool,
   /// [0] 提亮上限（档，≥0）：适应暗处的最大增益 = 2^ev_max
   pub ev_max: f32,
   /// [1] 压暗上限（档，≤0）：适应亮处的最大衰减 = 2^ev_min
   pub ev_min: f32,
-  /// [2] 变亮时间常数（秒）：往亮处适应多快（太小像"闪光"）
+  /// [2] 变亮时间常数（秒）：往亮处适应速度
   pub tau_brighten: f32,
-  /// [3] 变暗时间常数（秒）：往暗处适应多快（太小像"眨眼"）
+  /// [3] 变暗时间常数（秒）：往暗处适应速度
   pub tau_darken: f32,
   /// [4] 目标中灰：百分位平均亮度被压到这个值
   pub key: f32,
 }
 
 impl Default for EyeAdaptSettings {
-  /// 缺省取**保守**值（EV ±3）。上限越大，暗场里的 GI 残噪被同倍放大得越狠。
+  /// 缺省值（EV ±3）。
   fn default() -> Self {
     Self { enabled: true, ev_max: 3.0, ev_min: -3.0, tau_brighten: 2.0, tau_darken: 1.0, key: 0.18 }
   }
 }
 
 impl EyeAdaptSettings {
-  /// 缺省 + 环境变量覆盖：`GATE_NO_EYE_ADAPT=1` 只决定**初值**，之后以面板开关为准
-  /// （无 UI 的自动化运行也能一行命令切）。
+  /// 缺省 + 环境变量覆盖：`GATE_NO_EYE_ADAPT=1` 只决定初值，之后以面板开关为准。
   pub fn from_env() -> Self {
     let off = std::env::var("GATE_NO_EYE_ADAPT").map(|v| v == "1").unwrap_or(false);
     Self { enabled: !off, ..Self::default() }
   }
 }
 
-/// `eye_adapt` buffer 里**参数区**的起始字（= 状态/调试区 8 + 直方图 64）
+/// `eye_adapt` buffer 里参数区的起始字（= 状态/调试区 8 + 直方图 64）
 const EYE_PARAM_WORD: u64 = 72;
 /// 参数区字节偏移（同 `EYE_PARAM_WORD`）
 const EYE_PARAM_OFFSET: u64 = EYE_PARAM_WORD * 4;
@@ -1469,12 +1325,10 @@ impl Plugin for BrickMapDdaPlugin {
         prepare_dda_bind_groups
           .in_set(RenderSystems::PrepareBindGroups)
           .after(sync_eye_adapt_settings)
-          // prepare_dda_bind_groups 在 prepare (upload.rs) 之后运行：先 upload 写
-          // grid_descs_buf 再绑 DDA BG2（同帧最稳，避免差一帧的旧 GridDesc 绑定）。
+          // prepare_dda_bind_groups 在 prepare (upload.rs) 之后运行：先 upload 写 grid_descs_buf 再绑 BG2。
           .after(super::upload::prepare),
       )
-      // 必须挂 RenderGraph::Render set（而非 Render schedule）：Render schedule 整体在
-      // RenderGraph 之前 → begin_diagnostics_frame（Begin set）前执行，诊断 span 会被清空
+      // 必须挂 RenderGraph::Render set（而非 Render schedule）。
       .add_systems(
         RenderGraph,
         dispatch_dda
@@ -1515,18 +1369,15 @@ pub(crate) fn init_dda_pipelines(
         uniform_buffer::<DdaViewUniform>(false),
         // @binding(2) beam_depth：低分辨率 r32float，beam pass 写最近命中 t，主 pass 读
         texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
-        // @binding(3) 眼睛适应的状态/直方图（**只读**视图；`dda_main` 只取曝光系数）。
-        // 同一 buffer 在 BG7 以 read_write 被 eye_adapt_* 两个入口读写（不同 pass，屏障保证顺序）。
+        // @binding(3) 眼睛适应的状态/直方图（只读视图；`dda_main` 只取曝光系数）。
+        // 同一 buffer 在 BG7 以 read_write 被 eye_adapt_* 两个入口读写（不同 pass）。
         storage_buffer_read_only_sized(false, None),
       ),
     ),
   );
 
-  // ---- BG5（GI 采样侧，**只**给 `dda_main` 的 pipeline 用）：半分辨率 GI 的两张纹理 ----
-  // 为什么单开一份、而且绑定号是 4/5：DDGI 各 pass 也绑 BG0，而 wgpu 把 bind group 里**所有**
-  // 条目的资源都算进该 pass 的 usage scope ⇒ 采样视图若挂在 BG0，collect（BG5 写同一张纹理）
-  // 就会在同一 pass 内撞 usage 冲突。放在 group(5) 的空闲绑定号（0..3 已被图集/GI 写入侧占）
-  // 且只进 `dda_main` 的 layout，两个 pass 各自只见到一种用法。
+  // ---- BG5（GI 采样侧，只给 `dda_main` 的 pipeline 用）：半分辨率 GI 的两张纹理 ----
+  // 绑定号 4/5（group(5) 空闲号，0..3 已被图集/GI 写入侧占），只进 `dda_main` 的 layout。
   let gi_read = BindGroupLayoutDescriptor::new(
     "DdaBg5GiRead",
     &[
@@ -1554,8 +1405,7 @@ pub(crate) fn init_dda_pipelines(
   );
 
   // ---- BG0（GI pass 专用瘦版）：view uniform + beam depth ----
-  // 绑定号与完整版一致（1/2），只是**不含** out_tex / eye_adapt_ro / GI 采样视图：
-  // `gi_main` 只做「反投影 + beam 起点 + 主 trace + ddgi_sample」，不需要 out_tex 与曝光。
+  // 绑定号与完整版一致（1/2），不含 out_tex / eye_adapt_ro / GI 采样视图。
   let bg0_gi = BindGroupLayoutDescriptor::new(
     "DdaBg0Gi",
     &[
@@ -1603,7 +1453,8 @@ pub(crate) fn init_dda_pipelines(
 
   // ---- BG2：GridDesc 数组（主世界 + 物体同描述符）----
   // shader `trace_grid` 遍历 grid_descs[0..count]，无 kind 分支。
-  // GridDesc 144B/entry：pos_scale/rot0/rot1/rot2 + aabb_min/max + tree_base/tree_depth/chunk_count/palette_base + index_origin/dims。
+  // GridDesc 144B/entry：pos_scale/rot0/rot1/rot2 + aabb_min/max +
+  // tree_base/tree_depth/chunk_count/palette_base + index_origin/dims。
   let bg2 = BindGroupLayoutDescriptor::new(
     "DdaBg2",
     &BindGroupLayoutEntries::sequential(
@@ -1647,21 +1498,18 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  // ---- Compute pipeline：shaders/voxel_raytrace/ 两个入口（dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
+  // ---- Compute pipeline：shaders/voxel_raytrace/ 两个入口
+  // （dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
   let dda_shader = dda_shader.0.clone();
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::ddgi::ddgi_bg4_layout()];
-  // `dda_main` 比其它两个入口多一份 group(5)：半分辨率 GI 的采样侧（见 `gi_read`）。
-  // 只加给它 —— beam / probe_viz 用不到，多一份 layout 会让它们也必须绑 group(5)。
+  // `dda_main` 比其它两个入口多一份 group(5)：半分辨率 GI 的采样侧（见 `gi_read`），只加给它。
   let dda_layouts = {
     let mut v = layouts.clone();
     v.push(gi_read.clone());
     v
   };
-  // 眼睛适应的两个入口自己的布局：**8 份相同的 eye layout**。
-  // 原因：wgpu 要求 bind group 按索引**从 0 开始成前缀地**设置（跳过低索引直接设高索引会报
-  // "expects a BindGroup to be set at index 0"）；而这两个入口的绑定在 @group(7)。
-  // 于是把同一个 eye BG 依次设到 0~7 —— 每个索引的 layout 必须一致，故这里重复 8 份。
+  // 眼睛适应的两个入口：8 份相同 eye layout（wgpu 要求 bind group 从 0 起按索引前缀设置，两入口绑定在 @group(7)）。
   let eye_layouts = vec![eye.clone(); 8];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
@@ -1678,9 +1526,9 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
-  // 半分辨率 GI（菜单开关 `DdgiDebugSettings.gi_half_res`）：只做「反投影 + beam 起点 + 主 trace
-  // + ddgi_sample」，写两张 1/2 分辨率缓冲。group0 用瘦版（不含 GI 采样视图），并多一个 BG5
-  // （图集写入侧 + GI 写入侧）—— layout 索引必须是 0..=5 的**前缀**（见上面 eye 的说明）。
+  // 半分辨率 GI（菜单开关 `DdgiDebugSettings.gi_half_res`）：
+  // 反投影 + beam 起点 + 主 trace + ddgi_sample，写两张 1/2 分辨率缓冲。
+  // group0 用瘦版（不含 GI 采样视图），并多一个 BG5；layout 索引必须是 0..=5 的前缀。
   let gi_layouts = vec![
     bg0_gi.clone(),
     bg1.clone(),
@@ -1697,8 +1545,7 @@ pub(crate) fn init_dda_pipelines(
     ..default()
   });
   // 眼睛适应（自动曝光）：直方图统计（1 个 WG）+ 适应更新（1 个线程）。
-  // 结构对齐 UE EyeAdaptation：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 →
-  // 反馈 + 分方向时间平滑 → 曝光系数（下一帧 dda_main 读 BG0 binding(3)）。
+  // 1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 时间平滑 → 曝光系数（下一帧 dda_main 读 BG0 binding(3)）。
   let eye_histogram = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_eye_histogram")),
     layout: eye_layouts.clone(),
@@ -1722,9 +1569,7 @@ pub(crate) fn init_dda_pipelines(
   });
 
   // ---- Blit render pipeline：blit.wgsl（全屏三角）----
-  // 两条：`fs_main`（纯 blit）/ `fs_fxaa`（FXAA 抗锯齿）。同 layout、同 bind group，只有
-  // fragment 入口不同 ⇒ 运行时按 `PostFxSettings.fxaa` 选一条；关掉时零代价（不引入分支，
-  // 只是换了条 pipeline）。
+  // 两条：`fs_main`（纯 blit）/ `fs_fxaa`（FXAA 抗锯齿）；同 layout、同 bind group，运行时按 `PostFxSettings.fxaa` 选一条。
   let blit_shader = asset_server.load(BLIT_SHADER_ASSET_PATH);
   let blit_make = |label: &str, entry: &str| {
     pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
@@ -1812,7 +1657,7 @@ pub(crate) fn prepare_dda_bind_groups(
 
   let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
   // probe 可视化参数：x = 世界空间探针总槽数（4 LOD 世界网格）；y = 方块边长 3px；
-  // z = 层级选择（0=全部，1..=4=LOD0..3）；w 不再使用
+  // z = 层级选择（0=全部，1..=4=LOD0..3）；w = 0
   if let Some(g) = ddgi_gpu.as_ref() {
     let total = g.total_slots;
     let sel = dbg.map_or(0.0, |d| d.probe_viz_lod).clamp(0.0, 4.0);
@@ -1850,8 +1695,8 @@ pub(crate) fn prepare_dda_bind_groups(
 
   // ---- 半分辨率 GI 缓冲（菜单开关 `gi_half_res`）：屏幕 1/2 分辨率，resize 时重建 ----
   // 存 premultiplied valid（见 AuxTexCache 的说明）：rgba16f = (gi·valid, valid)、
-  // rg32f = (cov·valid, valid)。wgpu 新建纹理自动清零 ⇒ valid 初值 0 = "无数据"，
-  // 采样侧据此退回 conf=0 的天光兜底（不会在第一帧把整屏 GI 拉黑或提亮）。
+  // rg32f = (cov·valid, valid)。
+  // wgpu 新建纹理自动清零 ⇒ valid 初值 0 = "无数据"，采样侧退回 conf=0 的天光兜底。
   let gi_size = UVec2::new((scale.size.x / 2).max(1), (scale.size.y / 2).max(1));
   if beam_cache.gi_tex.is_none() || beam_cache.gi_size != gi_size {
     let make = |label: &str, format: TextureFormat| {
@@ -1879,9 +1724,8 @@ pub(crate) fn prepare_dda_bind_groups(
   let gi_cov_view = beam_cache.gi_cov_view.as_ref().expect("gi cov view not created");
 
   // ---- BG0：out tex write + view uniform + beam depth rw ----
-  // ---- 眼睛适应的状态/直方图 buffer（word 布局见 bindings.wesl 的 `eye_adapt`）----
-  // 同一 buffer 两处绑定：BG0 binding(3) 只读（`dda_main` 取曝光）+ BG7 binding(1) 读写
-  // （`eye_adapt_*` 写状态/累加直方图）。首帧把曝光初始化为 1.0（否则第一帧全黑）。
+  // 眼睛适应状态/直方图 buffer（word 布局见 bindings.wesl 的 `eye_adapt`）：同一 buffer 两处绑定 ——
+  // BG0 binding(3) 只读（`dda_main` 取曝光）+ BG7 binding(1) 读写；首帧曝光初始化为 1.0。
   const EYE_WORDS: u64 = 80;
   if eye.buf.is_none() {
     let b = render_device.create_buffer(&BufferDescriptor {
@@ -1893,30 +1737,29 @@ pub(crate) fn prepare_dda_bind_groups(
     let mut init = [0u8; (EYE_WORDS * 4) as usize];
     init[..4].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
     queue.write_buffer(&b, 0, &init);
-    // 参数区初值（首帧 settings_dirty 也会再写一次，这里是保险）
+    // 参数区初值。
     queue.write_buffer(&b, EYE_PARAM_OFFSET, &eye_param_bytes(eye.settings));
     eye.buf = Some(b);
   }
-  // clone 一份句柄（Buffer 内部是 Arc）：后面还要改 eye.last/eye.bg，避免借用冲突
+  // clone 一份句柄（Buffer 内部是 Arc）。
   let eye_buf = eye.buf.clone().expect("刚插入");
-  // dt 只在开启眼睛适应时才上传（关闭时这条路径**完全不碰**任何每帧写入 ⇒ 零开销）。
-  // 注意：CPU 写这张 buffer，GPU 的 eye_adapt_* 也写同一张（buffer 粒度的写-写冲突）。
+  // dt 只在开启眼睛适应时才上传（关闭时零每帧写入）。
+  // CPU 与 GPU 的 eye_adapt_* 都写同一张 buffer（buffer 粒度写-写冲突）。
   let now = std::time::Instant::now();
   if eye.settings.enabled {
     let dt = eye.last.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32());
     queue.write_buffer(&eye_buf, 12, &dt.clamp(0.0, 0.25).to_bits().to_le_bytes());
   }
   eye.last = Some(now);
-  // 活参数：只在设置变化时上传 20B（稳态零写入，也不去每帧碰这张 GPU 也在写的 buffer）
+  // 活参数：只在设置变化时上传 20B（稳态零写入）。
   if std::mem::take(&mut eye.settings_dirty) {
     let s = eye.settings;
     queue.write_buffer(&eye_buf, EYE_PARAM_OFFSET, &eye_param_bytes(s));
-    // 关掉总开关的瞬间把曝光回落到 1.0：两个 eye pass 同时停发 ⇒ 之后没人再改 word[0]，
-    // 否则画面会"冻结"在关掉那一刻的曝光上（看着像渲染卡住了）。
+    // 关掉总开关时把曝光回落到 1.0。
     if !s.enabled {
       queue.write_buffer(&eye_buf, 0, &1.0f32.to_bits().to_le_bytes());
     }
-    // 每次真正推送都记一行，便于确认参数已到 GPU
+    // 每次真正推送记一行日志。
     bevy::log::info!(
       target: "gate",
       "eye adapt 参数 → GPU：{} EV+ {:.2} / EV- {:.2} / tau+ {:.2}s / tau- {:.2}s / key {:.3}",
@@ -1951,9 +1794,9 @@ pub(crate) fn prepare_dda_bind_groups(
     ],
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
-  // GI pass 的 @group(0)（瘦版 layout）：绑定号是 1/2（与完整版对齐），故给显式 entry 数组
-  // —— `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 1 开始"。
-  // 不绑 GI 采样视图是硬性要求：同一个 pass 里同一张纹理不能既作采样又作存储。
+  // GI pass 的 @group(0)（瘦版 layout）：绑定号是 1/2（与完整版对齐），给显式 entry 数组。
+  // `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 1 开始"。
+  // 不绑 GI 采样视图是硬性要求：同一 pass 内同一张纹理不能既作采样又作存储。
   let bg0_gi_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_gi_layout);
   let gi_bg0 = render_device.create_bind_group(
     None,
@@ -2011,12 +1854,9 @@ pub(crate) fn prepare_dda_bind_groups(
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 
-  // ---- Blit BG：dda tex（filterable）+ **linear** sampler ----
-  // ⚠️ 必须是 Linear，`SamplerDescriptor::default()` 是 Nearest：
-  //   ① 半分辨率档（factor=2）的上采样靠它做双线性；
-  //   ② FXAA 的**亚像素偏移**（`fs_fxaa` 末尾那段）也必须线性采样才生效 —— Nearest 会把
-  //      `final_uv` 的亚纹素偏移量化回原纹素 ⇒ 抗锯齿整体空转（现象就是"开了没变化"）。
-  // factor=1 时线性与最近邻等价（采样点恰好落在纹素中心）。
+  // ---- Blit BG：dda tex（filterable）+ linear sampler ----
+  // 必须是 Linear：半分辨率档（factor=2）上采样与 FXAA 亚像素偏移都依赖线性采样；
+  // factor=1 时线性与最近邻等价（采样点落在纹素中心）。
   let blit_sampler = render_device.create_sampler(&SamplerDescriptor {
     label: Some("gate_dda_blit_sampler"),
     mag_filter: FilterMode::Linear,
@@ -2055,7 +1895,7 @@ pub(crate) fn dispatch_dda(
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
   // 主 pass trace 命中后直接 unlit 着色直出 out_tex
-  // （逐体素法线 + 天空渐变 + 太阳方向光项），无后续 direct/gi/denoise pass。
+  // （逐体素法线 + 天空渐变 + 太阳方向光项），无其余 direct/gi/denoise pass。
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
     (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref(), bg4.as_ref())
   else {
@@ -2127,8 +1967,7 @@ pub(crate) fn dispatch_dda(
         pass.set_bind_group(3, &bg3.0, &[]);
         pass.set_bind_group(4, &bg4.0, &[]);
         // 半分辨率 GI 的采样侧（layout 里的 group(5)）：没有它 `dda_main` 无法 dispatch。
-        // 纹理未就绪（`prepare_dda_bind_groups` 本帧提前返回）时退化为不绑 —— 此时上面几个
-        // bind group 也必然缺失，主 pass 根本不会走到这里。
+        // 纹理未就绪（`prepare_dda_bind_groups` 本帧提前返回）时退化为不绑。
         if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
           pass.set_bind_group(5, gi_read, &[]);
         }

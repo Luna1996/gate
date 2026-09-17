@@ -1,8 +1,6 @@
-// WGSL: 全屏三角 blit，storage texture → ViewTarget（P0.3 阶段 B）
-// 渲染分辨率可低于窗口（Douglas #17 降分辨率策略）：uv 双线性采样上采样
-//
+// WGSL: 全屏三角 blit，storage texture → ViewTarget（可降分辨率，uv 双线性上采样）。
 // 两个 fragment 入口：`fs_main`（纯 blit）/ `fs_fxaa`（FXAA 抗锯齿，菜单「视频/抗锯齿」）。
-// Rust 侧建两条 pipeline（同 layout、同 bind group），按开关选一条（见 dda.rs::blit_dda_view）。
+// Rust 侧建两条 pipeline（同 layout、同 bind group），按开关选一条。
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_sampler: sampler;
@@ -14,7 +12,6 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
-  // 全屏三角形：vi 0/1/2 → 覆盖 [-1,3] NDC
   let x = f32((vi << 1u) & 2u);
   let y = f32(vi & 2u);
   var out: VsOut;
@@ -26,8 +23,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   let c = textureSample(src_tex, src_sampler, in.uv).rgb;
-  // view target 是 sRGB：硬件会把输出做 linear→sRGB 编码。
-  // 先做 sRGB→linear 转换，两次抵消 → 屏幕像素 = storage texture 字节（渐变不被 gamma 提升）
+  // view target 是 sRGB：先做 sRGB→linear。
   return vec4<f32>(srgb_to_linear(c), 1.0);
 }
 
@@ -40,30 +36,23 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 }
 
 // ============================================================================
-// FXAA（NVIDIA FXAA 3.11 清理版；本文件按 bevy_anti_alias::fxaa 的 WGSL 移植）
-//
-// 为什么选它（性价比）：单 pass、边缘上约 9~13 次采样、需要零额外资源（不需要历史缓冲/
-// 速度场/jitter）。对比：TAA 要历史 + 重投影 + 速度，MSAA 与 compute 光追管线不兼容
-// （我们整个 3D 是 compute 写 storage texture），超采样要 4× 主射线（`gate_dda_trace` 直接 ×4）。
-// 代价是它只是**边缘模糊**滤波器：台阶/锯齿被抹平，但运动中的亚像素闪烁治不了。
-//
-// 取值空间：输入是 sRGB 编码后的 LDR 缓冲（`dda_main` 的 `linear_to_srgb` 结果），正是 FXAA
-// 阈值假设的那个空间；`fxaa_luma` 用 FXAA 原版的非线性亮度（sqrt(加权和)）。
+// FXAA（NVIDIA FXAA 3.11）。
+// 取值空间：输入为 sRGB 编码后的 LDR 缓冲（`dda_main` 的 `linear_to_srgb` 结果）。
 // ============================================================================
-/// 绝对下限：局部对比度低于它 → 判定"不在边缘"（暗部不处理，避免噪声被放大成脏边）
+/// 绝对下限：局部对比度低于它 → 判定不在边缘。
 const FXAA_EDGE_MIN: f32 = 0.0312;
-/// 相对阈值：局部对比度 / 邻域亮度峰值。越小处理越多边缘（也更容易糊掉细节）
+/// 相对阈值：局部对比度 / 邻域亮度峰值（越小处理越多边缘）。
 const FXAA_EDGE_REL: f32 = 0.125;
-/// 沿边缘搜索端点的迭代上限（每步跨度见 fxaa_quality）
+/// 沿边缘搜索端点的迭代上限。
 const FXAA_ITER: i32 = 12;
-/// 亚像素偏移强度（0 = 关闭亚像素修正，1 = 全强度）
+/// 亚像素偏移强度（0 = 关闭，1 = 全强度）。
 const FXAA_SUBPIX: f32 = 0.75;
 
 fn fxaa_luma(c: vec3<f32>) -> f32 {
   return sqrt(dot(c, vec3<f32>(0.299, 0.587, 0.114)));
 }
 
-/// 第 i 步的搜索跨度：边缘越长步子越大（FXAA 原版 QUALITY 表）
+/// 第 i 步的搜索跨度。
 fn fxaa_quality(q: i32) -> f32 {
   switch (q) {
     case 5: { return 1.5; }
@@ -74,7 +63,7 @@ fn fxaa_quality(q: i32) -> f32 {
   }
 }
 
-/// 取 `uv + off`（off 以**源纹素**为单位）
+/// 取 `uv + off`（off 以源纹素为单位）。
 fn fxaa_at(uv: vec2<f32>, off: vec2<f32>, texel: vec2<f32>) -> vec3<f32> {
   return textureSample(src_tex, src_sampler, uv + off * texel).rgb;
 }
@@ -90,7 +79,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
   let luma_w = fxaa_luma(fxaa_at(uv, vec2<f32>(-1.0, 0.0), texel));
   let luma_e = fxaa_luma(fxaa_at(uv, vec2<f32>(1.0, 0.0), texel));
 
-  // ---- 1) 早退：局部对比度不够 → 不在边缘上，原样输出（平坦区只花 5 次采样，这是 FXAA 便宜的关键）
+  // ---- 1) 早退：局部对比度不够 → 不在边缘，原样输出 ----
   let luma_min = min(luma_m, min(min(luma_n, luma_s), min(luma_w, luma_e)));
   let luma_max = max(luma_m, max(max(luma_n, luma_s), max(luma_w, luma_e)));
   let luma_range = luma_max - luma_min;
@@ -109,7 +98,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
   let luma_right_corners = luma_dr + luma_ur;
   let luma_down_corners = luma_dl + luma_dr;
   let luma_up_corners = luma_ul + luma_ur;
-  // 水平/竖直方向的二阶梯度（绝对值之和）：谁大说明边缘沿哪个方向走
+  // 水平/竖直方向的二阶梯度（绝对值之和）。
   let edge_horz = abs(-2.0 * luma_w + luma_left_corners)
     + abs(-2.0 * luma_m + luma_ns) * 2.0
     + abs(-2.0 * luma_e + luma_right_corners);
@@ -117,7 +106,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     + abs(-2.0 * luma_m + luma_we) * 2.0
     + abs(-2.0 * luma_s + luma_down_corners);
   let is_horizontal = edge_horz >= edge_vert;
-  // 边缘水平 → 沿竖直方向找端点，反之亦然
+  // 边缘水平 → 沿竖直方向找端点，反之亦然。
   var step_len = select(texel.x, texel.y, is_horizontal);
   let luma_1 = select(luma_w, luma_s, is_horizontal);
   let luma_2 = select(luma_e, luma_n, is_horizontal);
@@ -135,7 +124,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     luma_local_avg = 0.5 * (luma_2 + luma_m);
   }
 
-  // ---- 4) 沿边缘方向两侧探索，直到亮度偏离"局部均值"超过局部梯度（= 走到边缘端点了）----
+  // ---- 4) 沿边缘两侧探索直到亮度偏离局部均值超过局部梯度（= 到端点）。 ----
   var cur_uv = uv;
   var off = vec2<f32>(0.0, 0.0);
   if (is_horizontal) {
@@ -190,7 +179,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
   let pixel_offset = -distance_final / edge_thickness + 0.5;
   var final_offset = select(0.0, pixel_offset, correct);
 
-  // ---- 6) 亚像素修正：中心亮度偏离 3×3 均值越多，越需要补一点 ----
+  // ---- 6) 亚像素修正：中心亮度偏离 3×3 均值越多补得越多。 ----
   let luma_avg = (1.0 / 12.0)
     * (2.0 * (luma_ns + luma_we) + luma_left_corners + luma_right_corners);
   let sub1 = clamp(abs(luma_avg - luma_m) / luma_range, 0.0, 1.0);

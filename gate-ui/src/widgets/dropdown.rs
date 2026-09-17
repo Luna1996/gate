@@ -1,17 +1,6 @@
-//! dropdown：单行下拉框（点击展开列表；选中项与控件原位重合，其余选项自上方/下方缓动展开）。
-//!
-//! - **控件盒**与 `text_input` 同款（底/边框/高度/内距/字号一致），框内右侧多一个箭头图标。
-//! - **展开浮层是顶层实体**（无父节点 + [`GlobalZIndex`]），**不放进调用方的 UI 树**：
-//!   列表要盖住相邻行、还可能超出滚动/裁剪容器，放树内会被祖先的 `Overflow::clip()` 切掉
-//!   （做法同 tooltip）。位置每帧从控件锚点的 `ComputedNode + UiGlobalTransform` 重算，
-//!   容器/窗口移动时浮层跟随。
-//! - **展开动画**：第 i 个选项 `top = (i - selected) · h · ease(t)`（[`DROPDOWN_ANIM_SECS`]）。
-//!   选中项恒为 `top = 0` → 与关闭态控件矩形逐像素重合（文本完全重叠）；选中项 `ZIndex`
-//!   最高，其余选项**从它背后滑出**；`t = 0` 时全部叠在锚点矩形上 → 展开瞬间不闪。
-//! - **关闭**：鼠标移出列表（或指针离开窗口）立即关闭 = 取消选择；点选项 = 选中 + 关闭。
-//!
-//! 真源 = [`DropdownValue`] 组件（选中下标）；事件 [`DropdownChanged`] 只在**用户选中**时发出
-//! （程序改组件不触发），与其它 widget 的「组件是真源、事件只是通知」约定一致。
+//! dropdown：单行下拉框（点击展开；选中项与控件原位重合，其余选项自上方/下方缓动展开）。
+//! 框体与 `text_input` 同款（底/边框/高度/内距/字号），右侧多一个箭头图标。
+//! 展开浮层是顶层实体（无父节点 + `GlobalZIndex`，不进调用方 UI 树），位置每帧从控件锚点重算。
 
 use std::ops::Deref;
 
@@ -199,9 +188,7 @@ fn ease_in_out(t: f32) -> f32 {
   if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
-/// 锚点矩形（逻辑 px 左上角 + 尺寸）。`ComputedNode`/`UiGlobalTransform` 是物理 px，
-/// 而 `Node.left/top` 是逻辑 px，故按 `scale_factor` 折算（菜单把 scale_factor 钉成 1，
-/// 但这里不能假设调用方也这么做）。
+/// 锚点矩形（逻辑 px 左上角 + 尺寸）；`ComputedNode`/`UiGlobalTransform` 是物理 px，按 `scale_factor` 折算为逻辑 px。
 fn anchor_rect(node: &ComputedNode, xform: &UiGlobalTransform, scale_factor: f32) -> (Vec2, Vec2) {
   let sf = scale_factor.max(f32::EPSILON);
   let size = node.size() / sf;
@@ -223,10 +210,8 @@ fn ctx_of<'a>(
   )
 }
 
-/// 建展开浮层：容器 = 锚点控件矩形；选项绝对定位（动画由 [`dropdown_visual_system`] 推进）。
-///
-/// 选项与控件**同高/同内距/同字号**：`t = 1` 时选中项与关闭态控件逐像素重合（文本完全重叠）。
-/// 选中项 `ZIndex` 最高 → 其余选项从它背后滑出，动画全程选中项文本不被盖住。
+/// 建展开浮层：容器 = 锚点控件矩形；选项绝对定位（动画由 `dropdown_visual_system` 推进）。
+/// 选项与控件同高/同内距/同字号：`t = 1` 时选中项与关闭态控件逐像素重合；选中项 `ZIndex` 最高。
 fn spawn_popup(
   commands: &mut Commands,
   ctx: &UiCtx,
@@ -239,8 +224,7 @@ fn spawn_popup(
   let c = &ctx.theme.colors;
   let (pos, size) = rect;
   let selected = selected.min(options.0.len().saturating_sub(1));
-  // 命令上下文里用显式 `ChildOf` 组装（同 `spawn_label_cmd`）：commands 版 spawner 拿不到
-  // world 版 `ChildSpawner`，`label()`/`spawn_icon()` 那套 API 在这里用不了
+  // 命令上下文用显式 `ChildOf` 组装：commands 版 spawner 拿不到 world 版 `ChildSpawner`
   let popup = commands
     .spawn((
       Name::new("ui-dropdown-popup"),
@@ -293,7 +277,7 @@ fn spawn_popup(
         MouseIntercept,
       ))
       .id();
-    // 选项文本：与控件文本同字号/同内距 → 选中项与关闭态控件文本完全重叠
+    // 选项文本与控件同字号/同内距 → 选中项与关闭态控件文本完全重叠
     let text = commands
       .spawn((
         label_bundle_attrs(
@@ -311,7 +295,7 @@ fn spawn_popup(
       TextLayout { linebreak: LineBreak::NoWrap, ..default() },
       Node { flex_grow: 1.0, ..default() },
     ));
-    // 选中项 = 控件的展开态：连箭头都一致，展开瞬间视觉无跳变
+    // 选中项也画箭头图标（与控件展开态一致）
     if i == selected {
       commands.spawn((
         icon_bundle(ctx, Icon::ChevronDown.glyph(), DROPDOWN_ARROW_SIZE, color_of(&c.text_muted)),
@@ -337,10 +321,8 @@ fn close_popup(
   state.open = false;
 }
 
-/// 指针交互：点控件展开 / 点选项选中 / 鼠标移出列表取消（关闭）。
-///
-/// 展开态的「鼠标在列表内」= 落在任一选项矩形内（相邻选项间距 ≤ 高度 → 并集连续，
-/// 且选中项恒覆盖锚点矩形），指针离开窗口（`cursor_position() == None`）同样视为移出。
+/// 指针交互：点控件展开 / 点选项选中 / 鼠标移出列表取消。
+/// 「鼠标在列表内」= 落在任一选项矩形内（相邻选项间距 ≤ 高度 → 并集连续）；指针离开窗口同样视为移出。
 #[allow(clippy::type_complexity, clippy::too_many_arguments)] // Bevy system：多组件查询/入参签名固有
 pub fn dropdown_system(
   mut commands: Commands,
@@ -424,7 +406,7 @@ pub fn dropdown_system(
       close_popup(&mut commands, e, &q_popups, &mut state);
     }
   }
-  // 锚点控件已销毁（菜单翻页/重建）→ 浮层立即回收，不留孤儿
+  // 锚点控件已销毁 → 浮层立即回收，不留孤儿
   for (popup, p) in &q_popups {
     if q_roots.get(p.owner).is_err() {
       commands.entity(popup).despawn();
@@ -477,7 +459,7 @@ pub fn dropdown_visual_system(
   let text_body = color_of(&c.text_body);
   let text_muted = color_of(&c.text_muted);
 
-  // ---------- 1. 控件：关闭态文本（跟随选中项）+ 配色（展开/hover/禁用） ----------
+  // ---------- 1. 控件：关闭态文本 + 配色（展开/hover/禁用） ----------
   for (value, options, inter, state, children, mut bg, mut border_c, disabled) in &mut q_roots {
     let selected = value.0.min(options.0.len().saturating_sub(1));
     let key = options.0.get(selected).cloned().unwrap_or_default();
@@ -561,7 +543,7 @@ pub fn dropdown_visual_system(
       if opt_node.height != px(size.y) {
         opt_node.height = px(size.y);
       }
-      // 配色：hover 提亮；选中项与**关闭态控件**同款（底/边框/主文本色）→ 展开瞬间无跳变
+      // 配色：hover 提亮；选中项与关闭态控件同款（底/边框/主文本色）
       let hovered = *inter != Interaction::None;
       let (target_bg, target_border, target_text) = if hovered {
         (surface_overlay, border_strong, text_primary)

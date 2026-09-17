@@ -1,8 +1,6 @@
 //! 体素编辑：幽灵模式下左键放置 / 右键擦除，笔触 = 形状（球/立方）× 大小（voxel）× 材质。
-//! 目标选取：光标 → 世界射线（[`crate::camera::cursor_ray`]）→ 主世界体素 DDA（[`raycast_main`]）；
-//! 放置落点取命中面外侧一格（Minecraft 惯例），擦除取命中格自身，笔触以该格为中心展开。
-//! `set_voxel` 内部 `mark_data(chunk)` 驱动增量上传（`poll_pending` → `update_chunk` → GPU），
-//! 同一 dirty AABB 同时驱动 DDGI 重烘与光照场重算；非幽灵模式不生效（左键仍是 recenter）。
+//! 目标选取：光标 → 世界射线（`crate::camera::cursor_ray`）→ 主世界体素 DDA（`raycast_main`）；
+//! 放置落点 = 命中面外侧一格（擦除取命中格自身），写经 `set_voxel` → `mark_data(chunk)` 驱动增量上传。
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
@@ -16,22 +14,16 @@ use gate_voxel::{
 
 use crate::camera::{CameraMode, cursor_ray};
 
-// ============================================================================
-// 笔触
-// ============================================================================
-
 /// 笔触形状
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum BrushShape {
   /// 球（size = 1 时退化为单格）
   #[default]
   Sphere,
-  /// 正方体
   Cube,
 }
 
-/// 笔触大小下界（voxel）：1 = 单格，N = (2N-1) 的跨度。
-/// **无上界**：写入按 brick 整块进行（见 [`apply_brush`]），实际可用规模由写入体量与内存决定。
+/// 笔触大小下界（voxel）：1 = 单格；无上界（写入按 brick 整块进行，见 `apply_brush`）。
 pub const EDIT_SIZE_MIN: u32 = 1;
 
 /// 编辑"手长"（voxel）：射线超过这个距离不算命中（1 voxel = 2cm → 256 ≈ 5.1m）
@@ -40,16 +32,8 @@ pub const EDIT_REACH: f32 = 256.0;
 /// 右键「点击 vs 拖拽转头」的累计位移阈值（物理像素）
 const DRAG_PX: f32 = 4.0;
 
-// ============================================================================
-// 笔触材质
-// ============================================================================
-
 /// 笔触材质参数：菜单「游戏/编辑」的四个控件（颜色 / 自发光 / 透明度 / 光滑度）直接写这里，
-/// 由 [`ensure_material`] 落进调色板槽。字段与 `PaletteEntry` 一一对应，数值域按 UI 友好度收窄。
-///
-/// 说明：之前这里是 6 个写死的预设（`EDIT_MATERIALS`）+ 一个「选中材质」索引，但那个索引
-/// **从未被 UI 写过**（永远是 0 = Grey），所以预设实际只有 Grey 可达；颜色也改不了。
-/// 现在改为直接由菜单驱动一份材质参数。
+/// 由 `material_slot` 落进调色板槽；字段与 `PaletteEntry` 一一对应，数值域按 UI 收窄。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrushMaterial {
   /// sRGB [r, g, b]
@@ -63,15 +47,14 @@ pub struct BrushMaterial {
 }
 
 impl Default for BrushMaterial {
-  /// 与 `assets/ui/debug_menu.toml` 的初值保持一致（中灰 / 不发光 / 不透明 / 半粗糙），
-  /// 这样 TOML 缺失时观感不变。
+  /// 与 `assets/ui/debug_menu.toml` 初值一致（中灰 / 不发光 / 不透明 / 半粗糙）。
   fn default() -> Self {
     Self { color: [0x96, 0x98, 0x9E], emissive: 0, transmission: 0, roughness: 128 }
   }
 }
 
 impl BrushMaterial {
-  /// 落进调色板的条目（`flags` 留给后续语义位，暂不消费）
+  /// 落进调色板的条目（不设 `flags`）。
   pub fn entry(&self) -> PaletteEntry {
     let mut e = PaletteEntry::default();
     e.color = self.color;
@@ -87,10 +70,7 @@ impl BrushMaterial {
   }
 }
 
-/// 菜单「透明度」滑杆 0..100 → `PaletteEntry.transmission`。
-///
-/// 约定 **100 = 完全不透明**、0 = 全透。取这个方向是因为菜单初值就是 100，
-/// 若把 100 当"全透"则默认笔触一放下去就是看不见的。
+/// 菜单「透明度」滑杆 0..100 → `PaletteEntry.transmission`（100 = 完全不透明，0 = 全透）。
 pub fn opacity_pct_to_transmission(pct: f32) -> u8 {
   (((100.0 - pct.clamp(0.0, 100.0)) / 100.0) * 255.0).round() as u8
 }
@@ -99,10 +79,6 @@ pub fn opacity_pct_to_transmission(pct: f32) -> u8 {
 pub fn smooth_pct_to_roughness(pct: f32) -> u8 {
   (((100.0 - pct.clamp(0.0, 100.0)) / 100.0) * 255.0).round() as u8
 }
-
-// ============================================================================
-// 设置资源（UI 是它的视图）
-// ============================================================================
 
 /// 编辑设置（main world Resource）
 #[derive(Resource, Clone, Copy, Debug)]
@@ -120,18 +96,9 @@ impl Default for EditSettings {
   }
 }
 
-/// 取当前笔触材质的调色板槽：**按内容去重** —— 已有同内容的槽就复用，否则认领一个新空槽。
-///
-/// 这就是"每次落笔时判断需不需要建新的 palette 值"的语义。反过来（把唯一一个槽的内容
-/// 反复改写）会让**此前用同一槽放下的体素跟着变色**：改一次颜色，整片旧体素一起变，
-/// 那不是编辑器的行为。
-///
-/// 顺序：先在**已占用**槽里找内容一致的（去重），再挑一个空槽写入；一个空槽都没有 →
-/// 复用 `PALETTE_INDEX_MAX` 并 warn（会覆盖该槽原有材质）。空槽判据见 `Palette::is_empty_slot`
-/// （占用位图，与内容无关）。
-///
-/// 代价：每次落笔线性扫一遍 65536 槽（同一趟里顺便找空槽，两者都找到即提前退出）。
-/// 落笔是手动点击级频率，且"材质 → 槽"的缓存会随场景重建失效、需要额外失效逻辑，故不做缓存。
+/// 取当前笔触材质的调色板槽：按内容去重 —— 已有同内容的槽复用，否则认领一个新空槽
+/// （空槽判据见 `Palette::is_empty_slot`）；一个空槽都没有则复用 `PALETTE_INDEX_MAX` 并 warn
+/// （会覆盖该槽原有材质）。单次调用线性扫全部 65536 槽。
 fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   let want = mat.entry();
   let mut existing = None;
@@ -166,14 +133,8 @@ fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   slot
 }
 
-// ============================================================================
-// 射线 × 体素 DDA
-// ============================================================================
-
-/// 世界空间射线 × 体素的 Amanatides-Woo 步进。返回 `(命中体素, 入面法线, 命中 t)`。
-///
-/// 入面法线指向射线来向（朝外），故 `命中体素 + 法线` 即前方那格空气 —— 放置落点。
-/// `dir` 分量可以为 0（`1.0/0.0 = inf`，该轴不会被选中）；仅主世界（identity 变换）。
+/// 世界空间射线 × 体素的 Amanatides-Woo 步进。返回 `(命中体素, 入面法线, 命中 t)`；
+/// 法线指向射线来向（朝外），故 `命中体素 + 法线` 即前方那格空气。`dir` 分量可为 0（该轴不被选中）；仅主世界。
 pub fn raycast_main(
   grid: &VolumeGrid,
   origin: Vec3,
@@ -221,10 +182,6 @@ pub fn raycast_main(
   None
 }
 
-// ============================================================================
-// 笔触施加
-// ============================================================================
-
 /// 单格是否落在笔触区域内（`d` = 该格相对中心的有符号偏移）。
 fn brush_contains(shape: BrushShape, d: IVec3, r: i32) -> bool {
   match shape {
@@ -234,16 +191,14 @@ fn brush_contains(shape: BrushShape, d: IVec3, r: i32) -> bool {
   }
 }
 
-/// 对齐块 `[lo, lo+extent)` 是否**完全不在**笔触区域内（可整块剪枝）。
-///
-/// 笔触区域是凸的（立方体 / 球），且"盒到中心的最小距离点"都是把中心 clamp 进盒
-/// （切比雪夫度量 / 欧氏度量各自成立）→ 最近点已在区域外 ⇒ 整块在区域外。
+/// 对齐块 `[lo, lo+extent)` 是否完全不在笔触区域内（可整块剪枝）。
+/// 依据：笔触区域凸，且盒到中心的最小距离点 = 把中心 clamp 进盒 → 最近点在区域外即整块在区域外。
 fn brush_box_disjoint(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent: i32) -> bool {
   let hi = lo + IVec3::splat(extent - 1);
   !brush_contains(shape, center.clamp(lo, hi) - center, r)
 }
 
-/// 对齐块是否**完全在**笔触区域内（凸区域包含一个盒 ⟺ 包含它的 8 个角）
+/// 对齐块是否完全在笔触区域内（凸区域包含盒 ⟺ 包含它的 8 个角）
 fn brush_box_inside(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent: i32) -> bool {
   let e = extent - 1;
   for i in 0..8 {
@@ -259,14 +214,9 @@ fn brush_box_inside(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent:
   true
 }
 
-/// 笔触的层级填充（`lo` = 对齐到 `extent` 的块最小角）。
-///
-/// **整块落在笔触内**的块一次写掉（[`VolumeGrid::fill_brick`]：O(深度) 树路径，且直接产出
-/// uniform 的上级节点）；只有边界上「部分覆盖」的块才下钻一级，最小到 1³ 才逐体素。
-/// 对照逐体素 `set_voxel`：每一格都要走一次完整树下降 + 沿途 `try_merge`（每次扫 64 个子块、
-/// 紧凑表 memmove），31³ 笔触近 3 万次；而整块写一次顶 4³/16³/64³ 格。
-///
-/// `palette` 为 AIR 即擦除；语义与逐体素版一致（放置只填空气、擦除只挖实体）。
+/// 笔触的层级填充（`lo` = 对齐到 `extent` 的块最小角）：整块落在笔触内的走一次
+/// `VolumeGrid::fill_brick`（O(深度)，直接产出 uniform 上级节点），部分覆盖的才下钻，最小到 1³。
+/// `palette` 为 AIR 即擦除；放置只填空气、擦除只挖实体。
 fn fill_brush_level(
   grid: &mut VolumeGrid,
   shape: BrushShape,
@@ -282,10 +232,8 @@ fn fill_brush_level(
   }
   let erase = palette.is_air();
   if extent > 1 && brush_box_inside(shape, center, r, lo, extent) {
-    // 整块都在笔触内 → 按 brick 三态决定能否一次写完：
-    //   空气 + 放置 / 同色实体 + 擦除 → 整块写（一次 O(深度)，落成 uniform 上级节点）
-    //   空气 + 擦除、实体 + 放置 → 本块无需改动（不啃掉已有几何）
-    //   内容不一致 → 下钻
+    // 整块都在笔触内 → 按 brick 三态：空气+放置 / 实体+擦除 → 整块写；空气+擦除 / 实体+放置
+    // → 不改动（不啃掉已有几何）；Mixed → 下钻。
     match grid.get_brick_state_extent(lo, extent) {
       BrickState::Air => {
         if !erase {
@@ -305,7 +253,7 @@ fn fill_brush_level(
     }
   }
   if extent == 1 {
-    // 收尾单格：extent==1 的「部分覆盖」就是完全覆盖，故这里不再查 brick 三态
+    // 收尾单格：extent==1 时「部分覆盖」即完全覆盖，无需查 brick 三态
     if brush_contains(shape, lo - center, r) {
       let cur = grid.get_voxel(VoxelCoord::from_ivec3(lo)).unwrap_or(PaletteId::AIR);
       if cur.is_air() != erase && grid.set_voxel_ivec3(lo, palette).is_some() {
@@ -326,11 +274,8 @@ fn fill_brush_level(
 }
 
 /// 以 `center` 为中心施加一次笔触，返回实际改变的体素数。
-/// `palette == 0` → 擦除（挖空）；否则只填充空气格（Minecraft 惯例：不啃掉已有几何）。
-/// 球判据 `d² ≤ r² + r`（r = size-1）：r=0 → 仅中心格；r=1 → 3³ 去掉 8 个角。
-///
-/// 写入自顶向下按 brick 粒度进行（见 [`fill_brush_level`]）：能整块写的绝不逐体素，
-/// 且整块写直接落成 uniform 上级节点，不依赖事后合并。
+/// `palette == 0` → 擦除；否则只填充空气格（不啃掉已有几何）。写入自顶向下按 brick 粒度进行，
+/// 整块写直接落成 uniform 上级节点（见 `fill_brush_level`）。
 pub fn apply_brush(
   grid: &mut VolumeGrid,
   center: IVec3,
@@ -341,12 +286,10 @@ pub fn apply_brush(
   // size 无上限（菜单可输入任意值），这里只做「不溢出 i32」的类型收敛
   let r = size.saturating_sub(1).min(i32::MAX as u32) as i32;
   let mut changed = 0usize;
-  // 起始层级：整块要能装进笔触（extent ≤ 跨度 2r+1），取满足的最大 brick 粒度。
-  // 小笔触因此直接落到 4³/1³，不会做无谓的粗层下钻。
+  // 起始层级：取 extent ≤ 跨度 2r+1 的最大 brick 粒度（小笔触直接落到 4³/1³）。
   let span = r.saturating_mul(2).saturating_add(1);
   let start = LEVEL_EXTENT.iter().copied().find(|&e| e <= span).unwrap_or(1);
-  // 覆盖笔触 AABB 的全部对齐块。世界对齐 ⇒ 块必然整个落在单个 chunk 内
-  // （chunk 边长 256 是各 brick 粒度的整数倍），满足 fill_brick 的对齐与边界约束。
+  // 覆盖笔触 AABB 的全部对齐块；世界对齐 ⇒ 块必落在单个 chunk 内（256 是各 brick 粒度的整数倍）。
   let s = IVec3::splat(start);
   let b_lo = center.saturating_sub(IVec3::splat(r)).div_euclid(s) * s;
   let b_hi = center.saturating_add(IVec3::splat(r)).div_euclid(s) * s;
@@ -366,13 +309,8 @@ pub fn apply_brush(
   changed
 }
 
-// ============================================================================
-// 输入系统
-// ============================================================================
-
-/// 体素编辑输入（仅幽灵模式；轨道模式左键仍是 recenter）。
-/// - 左键 = 放置（当前形状/大小/材质）
-/// - 右键 = 擦除；按下到释放累计位移 > [`DRAG_PX`] 视为「拖拽转头」，不编辑
+/// 体素编辑输入（仅幽灵模式；轨道模式左键仍是 recenter）：左键 = 放置，右键 = 擦除；
+/// 按下到释放累计位移 > `DRAG_PX` 视为「拖拽转头」，不编辑。
 #[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
 pub(crate) fn voxel_edit_input(
   mouse: Res<ButtonInput<MouseButton>>,
@@ -414,7 +352,7 @@ pub(crate) fn voxel_edit_input(
   let (center, pal) = if erase {
     (hit, PaletteId::AIR)
   } else {
-    // 放置落点 = 命中面外侧一格；槽位按当前材质**内容**取/建（参数变了就是新材质，旧体素不受影响）
+    // 放置落点 = 命中面外侧一格；槽位按材质内容取/建（参数变了即新材质，旧体素不受影响）
     let slot = material_slot(grid, settings.mat);
     (hit + face, slot)
   };
@@ -434,9 +372,8 @@ pub(crate) fn voxel_edit_input(
   }
 }
 
-/// `GATE_EDIT_SELFTEST=1`：第 60 帧朝初始注视点刷一次笔触，在没有鼠标输入的情况下走通整条
-/// 编辑链路（`set_voxel` → `mark_data` → 增量上传 → DDGI 重烘 / 光照场重算）。
-/// 只在设了该变量时才注册（见 main.rs），正常运行零开销。
+/// `GATE_EDIT_SELFTEST=1`：第 60 帧朝初始注视点刷一次笔触，走通编辑 → 增量上传链路。
+/// 只在设了该变量时注册（见 main.rs）。
 pub(crate) fn edit_selftest(
   scene: Option<ResMut<VoxelScene>>,
   orbit: Res<gate_render::OrbitCamera>,

@@ -1,9 +1,6 @@
-//! WESL（WGSL 超集，带 import）编译：启动时把 `assets/shaders/voxel_raytrace/`
-//! 下的 WESL 包编译成单份 WGSL，作为普通 `Shader` 资产插入 `Assets<Shader>`，
-//! 之后走 Bevy 常规 WGSL/naga 路径（见 [`build_dda_shader`]）。
-//!
-//! 不走自定义 `AssetLoader`：Bevy 的 `ShaderLoader::extensions()` 无条件包含 `"wesl"`，
-//! 同扩展名再注册会触发 "Duplicate AssetLoader" 告警。改 `.wesl` 后重启 app 即生效。
+//! WESL（WGSL 超集，带 import）编译：启动时把 `assets/shaders/voxel_raytrace/` 下的 WESL 包
+//! 编译成单份 WGSL 插入 `Assets<Shader>`，之后走 Bevy 常规 WGSL/naga 路径。
+//! 改 `.wesl` 后重启 app 即生效。
 
 use std::path::{Path, PathBuf};
 
@@ -25,14 +22,12 @@ pub fn compile_dda_wesl() -> Result<String, wesl::Error> {
 }
 
 /// 编译 `entry` 所在目录的 WESL 包，返回展平后的 WGSL。
-///
-/// 入口文件 `<stem>.wesl` 对应模块 `package::<stem>`。走 `compile_module(包目录, 模块路径)`
-/// 而非 `compile(文件路径)`：后者的「文件路径 → 模块路径」推断对根模块有歧义。
+/// 入口文件 `<stem>.wesl` 对应模块 `package::<stem>`（走 `compile_module(包目录, 模块路径)`）。
 pub fn compile_wesl_entry(entry: impl AsRef<Path>) -> Result<String, wesl::Error> {
   let entry = entry.as_ref();
   let dir: PathBuf = entry.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
   let stem = entry.file_stem().and_then(|s| s.to_str()).unwrap_or("package");
-  // 入口模块：包根目录下 `<stem>.wesl`（`main.wesl` → `package::main`）。
+
   let module_path =
     if stem == "package" { "package".to_string() } else { format!("package::{stem}") };
 
@@ -57,7 +52,7 @@ pub fn build_dda_shader(app: &mut App) {
       panic!("{msg}");
     }
   };
-  // 跨端常量（图集尺寸 / 射线预算 / indirect word 布局）在此处一并解析一次，失败即 panic。
+
   crate::wesl_consts::ddgi_consts();
   let handle = app
     .world_mut()

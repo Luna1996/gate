@@ -1,9 +1,6 @@
 //! 图标：FontAwesome 字形码点 + 主题图标字体接线。
-//!
-//! 码点常量来自 `font-awesome` crate（FA 5 Free Solid 手抄表），字体文件由主题
-//! [`UiTheme::icon_font_path`](crate::theme::UiTheme) 指定（仓库内为
-//! `assets/fonts/fa-solid-900.ttf`，FA 5.15.4 Free Solid）。两者版本必须一致，
-//! 否则字形错位（常量对而字体里没有该码点 → 显示方框）。
+//! 码点常量来自 `font-awesome` crate（FA 5 Free Solid），字体文件由 `UiTheme::icon_font_path` 指定。
+//! 仓库内字体 `assets/fonts/fa-solid-900.ttf`；码点须与字体版本一致。
 
 use bevy::asset::LoadState;
 use bevy::log::{info, warn};

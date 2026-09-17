@@ -1,10 +1,6 @@
 //! 菜单通用组件：DebugWindow 列表里的 9 种列表单项。
-//!
-//! 一行可分成「左|中|右」三部分（左列 [`LEFT_COL_W`]、右列 [`RIGHT_COL_W`]，两者宽度
-//! 各自固定且不相等，中间占余下最宽部分），各组件按需取用。
-//! 所有交互行统一由 `menu_system` 驱动：状态变化写回模型
-//! （[`super::model::MenuFile`]），对外只发一个 [`super::MenuActionEvent`]。
-//! 本文件只负责建节点与静态文案。
+//! 一行分「左|中|右」三部分（左列 `LEFT_COL_W`、右列 `RIGHT_COL_W` 固定且不相等，中间占余下）。
+//! 交互行由 `menu_system` 驱动：写回 `super::model::MenuFile` 并对外发 `super::MenuActionEvent`，本文件只建节点与静态文案。
 
 use bevy::prelude::*;
 use bevy::text::{Justify, LineBreak, TextLayout as BevyTextLayout};
@@ -80,7 +76,7 @@ pub struct MenuColorSwatch {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct MenuPressPrev(pub Interaction);
 
-/// 一行的通用外壳（宽 100%、高 [`ITEM_H`]、横向排列、无分割线）
+/// 一行的通用外壳（宽 100%、高 `ITEM_H`、横向排列、无分割线）
 fn base_row<'a, 'w>(parent: &'a mut ChildSpawner<'w>, name: &str) -> EntityWorldMut<'a> {
   parent.spawn((
     Name::new(name.to_string()),
@@ -96,10 +92,8 @@ fn base_row<'a, 'w>(parent: &'a mut ChildSpawner<'w>, name: &str) -> EntityWorld
   ))
 }
 
-/// 固定宽度 + 指定对齐的文本（左名称 / 右数值共用）。`key` = i18n key（无解析器 → 原样显示）
-///
-/// 超宽走**中间省略**（label 控件基础能力）：列宽是固定预算，名称更长时截断成 `前…后`，
-/// 不会溢出到相邻列（`label()` 为此挂了 clip Node，故这里只补 `width` 字段，不覆盖 Node）
+/// 固定宽度 + 指定对齐的文本（左名称 / 右数值共用）；`key` = i18n key（无解析器 → 原样显示）。
+/// 超宽走中间省略；`label()` 已挂 clip Node，故这里只补 `width` 字段，不覆盖 Node。
 fn fixed_label(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -140,10 +134,7 @@ fn grow_label(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, style: LabelSty
 }
 
 /// 让建好的控件根节点在行内占满剩余宽度。
-///
-/// **只改 `flex_grow` 字段**：不能用 `Node { flex_grow: .., ..default() }` 覆盖整个组件 ——
-/// 那会连控件自带的 `height`/`padding`/`min_width`/`overflow` 一起抹掉（输入框会变矮、
-/// 滑杆会丢掉 thumb 内缩导致滑块滑出轨道槽两端）。
+/// 只改 `flex_grow` 字段——整体覆盖 `Node` 会连自带的 `height`/`padding`/`min_width`/`overflow` 一起抹掉。
 fn grow_in_row(world: &mut World, e: Entity) {
   if let Some(mut n) = world.get_mut::<Node>(e) {
     n.flex_grow = 1.0;
@@ -167,14 +158,14 @@ fn option_button(
     Interaction::default(),
     MenuPressPrev::default(),
     Node {
-      // flex_basis 0 + flex_grow：各按钮**等宽**（不设 basis 时余量按文字宽度分配，宽窄不一）
+      // flex_basis 0 + flex_grow：各按钮等宽（不设 basis 则按文字宽度分配）
       flex_basis: px(0.0),
       flex_grow: 1.0,
-      // 高度由按钮组容器（CTRL_H）决定，和行的上下留白由容器在行内居中保证
+      // 高度由按钮组容器（CTRL_H）决定，上下留白由容器在行内居中保证
       height: Val::Percent(100.0),
       align_items: AlignItems::Center,
       justify_content: JustifyContent::Center,
-      // 首项画左边框，其余靠前一项的右边框，相邻项合成 1px（无空隙并排）
+      // 首项画左边框，其余靠前一项右边框，相邻合成 1px
       border: UiRect {
         left: px(if first { m.border_width } else { 0.0 }),
         right: px(m.border_width),
@@ -206,10 +197,8 @@ fn option_button(
   ec.id()
 }
 
-/// 建一个菜单项（返回行的根实体）
-///
-/// 提示（[`MenuNode::tooltip`]）统一挂在**整行**上：悬停行的任意位置（含左侧名称）都出提示，
-/// 不必精确命中行内控件。
+/// 建一个菜单项（返回行的根实体）。
+/// 提示（`MenuNode::tooltip`）挂在整行上，悬停行内任意位置都出提示。
 pub(crate) fn spawn_item(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -234,7 +223,7 @@ pub(crate) fn spawn_item(
     MenuNode::Color { label: key, hex, .. } => color_row(ctx, parent, key, hex, &path),
     MenuNode::Text { text: key, .. } => text_row(ctx, parent, key, &path),
   };
-  // 提示同样是 i18n key：解析后挂整行，并保留 key 供语言切换后重解析
+  // 提示也是 i18n key：解析后挂整行，保留 key 供语言切换重解析
   if let Some(key) = node.tooltip() {
     parent
       .world_mut()
@@ -348,8 +337,7 @@ fn slider_row(
     r.world_mut().entity_mut(ve).insert((
       MenuSliderValue { path: path.to_string() },
       Node { width: px(RIGHT_COL_W), ..default() },
-      // 不能带 NoWrap：bevy_ui 对 NoWrap 文本用「无界」宽度排版，对齐退化成按最长行宽，
-      // Justify::Right 会失效（值就贴到槽尾而不是右列右缘）
+      // 不能带 NoWrap：bevy_ui 对 NoWrap 用无界宽度排版，Justify::Right 会失效
       BevyTextLayout { justify: Justify::Right, ..default() },
     ));
   });
@@ -501,9 +489,7 @@ fn color_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, hex: &str, path:
   row
 }
 
-/// 纯文本行：「左|中右」名称 + 值（值与其它行同一套字号/颜色，右侧对齐到行的右缘）
-///
-/// 值由调用方运行期改写（见 [`MenuTextValue`]），初值为空串。
+/// 纯文本行：「左|中右」名称 + 值（右侧对齐到行右缘）；值由调用方运行期改写（见 `MenuTextValue`），初值为空串。
 fn text_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, path: &str) -> Entity {
   let mut ec = base_row(parent, "menu-text");
   let row = ec.id();
@@ -515,8 +501,7 @@ fn text_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, path: &str) -> En
     r.world_mut().entity_mut(ve).insert((
       MenuTextValue { path: path.to_string() },
       Node { flex_grow: 1.0, ..default() },
-      // 不能带 NoWrap（同滑杆数值标签）：bevy_ui 对 NoWrap 文本用「无界」宽度排版，
-      // 对齐会退化成按最长行宽，Justify::Right 失效
+      // 不能带 NoWrap（同滑杆数值标签）：bevy_ui 对 NoWrap 用无界宽度排版，Justify::Right 失效
       BevyTextLayout { justify: Justify::Right, ..default() },
     ));
   });

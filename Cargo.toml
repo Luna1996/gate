@@ -1,8 +1,6 @@
 [workspace]
 members = ["gate-app", "gate-voxel", "gate-render", "gate-ui"]
-# third_party/wgpu 是独立 workspace（wgpu PR#9361 补丁），必须显式排除：
-# 否则 cargo 把它的成员吸收进本 workspace，继承 [workspace.package] 时报错（cargo#12154）
-# vendor/parley 同理：本地补丁包（见 [patch.crates-io]）
+# third_party / vendor 是独立 workspace（本地补丁包），必须排除，否则其成员被吸收进本 workspace
 exclude = ["third_party", "vendor"]
 resolver = "3"
 
@@ -11,7 +9,7 @@ edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 
-# P0.2: Bevy 版本精确锁定（render graph API 随版本破坏性变更频繁）
+# Bevy 精确锁定版本（render graph API 破坏性变更频繁）
 [workspace.dependencies]
 bevy = { version = "=0.19.1", default-features = false, features = [
   "bevy_winit",
@@ -25,7 +23,7 @@ bevy = { version = "=0.19.1", default-features = false, features = [
   "bevy_asset",
   "bevy_log",
   "bevy_state",
-  # 2.7a：FontSource::SystemUi 需要（未启用时 bevy_text 报错且文本不渲染）
+  # FontSource::SystemUi 所需（不启用时 bevy_text 报错且文本不渲染）
   "system_font_discovery",
   "multi_threaded",
   "std",
@@ -33,35 +31,26 @@ bevy = { version = "=0.19.1", default-features = false, features = [
   "reflect_auto_register",
   "async_executor",
 ] }
-# 注：bevy "trace" feature 不在这里常开——由 gate-app/gate-render 的 profile
-# feature 按需开启（bevy/trace），非剖析构建零 span 开销。
-# GPU 帧剖析（feature = "profile" 启用）：0.27 对齐 wgpu 29；tracy feature
-# 让 GPU zone 直接进 Tracy 时间线（与 tracy-client 0.18 配套）
+# bevy "trace" 由 profile feature 按需开启，非剖析构建零 span 开销
+# GPU 帧剖析（profile feature）：tracy feature 把 GPU zone 送进 Tracy 时间线
 wgpu-profiler = { version = "0.27", features = ["tracy"] }
-# CPU 帧剖析（feature = "profile" 启用）：Tracy 客户端；手写 tracing-subscriber
-# Layer 桥接（tracing-tracy 与本 workspace 依赖版本错配，不可用）
+# CPU 帧剖析（profile feature）：Tracy 客户端，配手写 tracing-subscriber Layer
 tracy-client = "0.18"
 gate-voxel = { path = "gate-voxel" }
 gate-render = { path = "gate-render" }
 gate-ui = { path = "gate-ui" }
-# 2.7a 主题令牌 RON 反序列化（ron 版本随 bevy 0.19 内部用法，避免双份编译）
+# 主题令牌 RON 反序列化（版本随 bevy，避免双份编译）
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
-# ADR-0001 对齐表版本；gate-voxel 唯一外部依赖（bevy/wgpu 已传递引入，非新增）
+# 对齐表版本；gate-voxel 唯一外部依赖
 glam = "=0.32.1"
-# P2.2 全量构建并行分块（docs/brickmap.md §5）
+# 全量构建并行分块
 rayon = "1"
-# WESL（wgsl 超集，带 import）编译：dda shader 拆包后由 wesl-rs 在运行时编译回 WGSL。
-# 本项目未启用 bevy 的 shader_format_wesl（不使用其 ShaderLoader，见 gate-render/src/shader.rs），
-# 故 bevy_shader 的可选 wesl 依赖不参与构建，不存在同 crate 编译两份的问题。
-# naga-ext：WESL 自带校验器默认不认识 u64/i64/f16 等 Naga 扩展类型
-# （b_leaves: array<u64> 会报 "cannot find declaration of `u64`"）。
+# WESL（wgsl 超集）运行时编译为 WGSL；本项目不使用 bevy 的 shader_format_wesl
+# naga-ext：校验器识别 u64/i64/f16 等 Naga 扩展类型
 wesl = { version = "0.5", features = ["naga-ext"] }
 
-# Bevy 官方推荐：依赖全优化，本项目代码保持可调试
-# 没有它 debug build 慢 10-50 倍（窗口卡死/无响应的根因之一）
-# incremental = false：沙箱拦截 target/debug/incremental 写入（os error 5）导致
-# rustc 假 ICE（pre-lto-bitcode 写入失败 panic），项目小关闭增量无感
+# 依赖全优化、本项目代码保持可调试；incremental 关闭（沙箱拦截 target/debug/incremental 写入）
 [profile.dev]
 opt-level = 1
 incremental = false
@@ -69,24 +58,7 @@ incremental = false
 [profile.dev.package."*"]
 opt-level = 3
 
-# 注：曾实验将 wgpu patch 到上游修复 PR#9361（third_party/wgpu），因 API breaking
-# （SurfaceTexture::present 移至 Queue、NoopBackendOptions/RequestAdapterOptions 加字段）
-# bevy_render 0.19.1 无法编译，已撤销。详见 docs/decisions.md ADR-0002。
-# third_party/ 目录残留可删，.gitignore 已排除。
-
-# ADR-0005：parley 0.9.0 本地补丁（vendor/parley）——修复 CJK 文本分段
-# 现象：gate-ui 中文文本每次排版触发 "ICU4X data error: No segmentation model
-# for complex script: Chinese/Japanese"，且整段中文被视为单一不可断行单元。
-# 根因：上游用 new_for_non_complex_scripts 构造分段器（无任何复杂文字载荷），
-# bevy_text 0.19.1 锁定 parley 0.9（^0.9.0，而 0.9.x 只有 0.9.0，无 feature 可开）。
-# 补丁：word/line 分段器改用 new_dictionary（加载 baked 词典，含 cjdict）。
-# 公开 API 未变，bevy_text 无感。不可放入 third_party/（已被 gitignore）。
-#
-# 【迁移提示】上游已在这条线之外解决：parley 0.10.0+ 提供 complex-scripts feature
-# （开启即走 new_dictionary），bevy main（0.20.0-dev）已把 parley 提到 0.11 并新增直通
-# feature complex_script_segmentation = ["parley/complex-scripts"]。
-# 故等 bevy 0.20 正式发布后迁移时，可删掉本 patch 与 vendor/parley，改为开启
-# bevy 的 complex_script_segmentation（不开启则中文报错/不可断行复发）。
+# parley 本地补丁（vendor/parley）：补上 CJK 文本分段（上游 0.9 构造分段器时无复杂文字载荷）
 [patch.crates-io]
 parley = { path = "vendor/parley" }
 

@@ -1,7 +1,6 @@
-//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 [`reload_world`] + demo 极限场景生成。
-//!
+//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 `reload_world` + demo 极限场景生成。
 //! `GATE_SCENE=vox`（默认）→ MagicaVoxel nuke.vox（vox_scene 模块）；
-//! `GATE_SCENE=demo` → 程序化极限场景（城堡/大道/森林/水晶矿，见 [`build_demo_scene`]）。
+//! `GATE_SCENE=demo` → 程序化极限场景（城堡/大道/森林/水晶矿，见 `build_demo_scene`）。
 
 use std::sync::LazyLock;
 
@@ -24,7 +23,7 @@ use crate::{
 pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let dda_handle = create_dda_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off));
-  // ---- 光照主题 RON 加载（一次性静态配置，同步读即可；缺失/解析失败回退内置默认主题）----
+  // 光照主题 RON：一次性静态配置，同步读即可；缺失/解析失败回退内置默认主题
   let theme = std::fs::read_to_string(gate_render::assets_dir().join("lighting/day_outdoor.ron"))
     .map_err(|e| format!("read: {e}"))
     .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))
@@ -37,11 +36,10 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   // 3 = unlit（跳过全部光照，albedo 直出）
   commands.insert_resource(DebugNormals(3));
 
-  // ---- 场景：GATE_SCENE=vox（默认）→ MagicaVoxel nuke.vox；=demo → 程序化极限场景 ----
+  // GATE_SCENE=vox（默认）→ nuke.vox；=demo → 程序化极限场景
   let t0 = std::time::Instant::now();
   let mut grid = VolumeGrid::new();
-  // DDGI 四级网格的锚点：世界 AABB。相机移动时任何一级的原点都不变 → 与相机无关，
-  // 不存在"槽位换主"；demo 场景无 AABB 时用默认值。
+  // DDGI 四级网格的锚点：世界 AABB（与相机无关；demo 场景无 AABB 时用默认值）。
   let mut ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb::default();
   let mut cam_eye = Vec3::new(1., 0., 0.);
   let mut cam_target = Vec3::new(0., 0., 0.);
@@ -73,13 +71,12 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
   bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
 
-  // ---- DDGI LOD0 的 chunk 探针段分配集（内容驱动）----
-  // 判定见 `lod0_needed_chunks`：只有「有几何」或「几何贴着 chunk 边界（16 体素内）」的 chunk
-  // 才领一段固定 4096 槽的 LOD0 探针段，空 chunk 不占槽位；与 `DdgiWorldAabb` 一样只依赖世界内容。
+  // DDGI LOD0 的 chunk 探针段分配集（内容驱动，见 `lod0_needed_chunks`）：只有有几何或几何贴着
+  // chunk 边界（16 体素内）的 chunk 才领固定 4096 槽的段，空 chunk 不占槽位。
   let ddgi_lod0_chunks = gate_render::ddgi::DdgiLod0Chunks { chunks: lod0_needed_chunks(&grid) };
 
-  // 轨道相机为唯一相机状态源，DdaCameraConfig 由 from_orbit 生成（初始机位 = 场景中心俯视）。
-  // GATE_CAM=sky：改为相机朝天空（纯 miss 场景）。
+  // 轨道相机为唯一相机状态源，DdaCameraConfig 由 `from_orbit` 生成（初始机位 = 场景中心俯视）。
+  // GATE_CAM=sky：相机朝天空（纯 miss 场景）。
   let orbit = if std::env::var("GATE_CAM").as_deref() == Ok("sky") {
     OrbitCamera::from_eye(
       Vec3::new(cam_target.x, 320.0, cam_target.z),
@@ -90,7 +87,6 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   };
   commands.insert_resource(orbit);
   commands.insert_resource(ddgi_world_aabb);
-  // LOD0 的 chunk 探针段分配集（见 `lod0_needed_chunks`）
   commands.insert_resource(ddgi_lod0_chunks);
   commands.insert_resource(DdaCameraConfig::from_orbit(
     &orbit,
@@ -99,8 +95,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     CAM_NEAR,
     CAM_FAR,
   ));
-  // 幽灵飞行相机（CameraMode 缺省 = Fly）：起点 = 轨道眼位，切换到轨道模式时视野原地不动
-  // （见 camera::sync_camera_mode_switch）；首帧该系统的 is_changed() 分支因此是幂等的。
+  // 幽灵飞行相机（CameraMode 缺省 = Fly）：起点 = 轨道眼位，切模式时视野原地不动
+  // （见 camera::sync_camera_mode_switch）。
   commands.insert_resource(crate::camera::CameraMode::default());
   commands.insert_resource(crate::camera::FlyCamera {
     pos: orbit.eye(),
@@ -144,9 +140,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     );
   }
 
-  // ---- 物体作为 Volumes.list[1..N] 加入容器 ----
-  // 物体 = 普通 VolumeGrid，通过 Volumes.add_object() 注册变换，走与主世界相同的
-  // dirty → builder → upload 路径。
+  // 物体 = 普通 VolumeGrid，经 `Volumes.add_object()` 注册变换，走与主世界相同的 dirty → builder → upload 路径。
   let volumes = Volumes::new(grid);
 
   commands.insert_resource(VoxelScene { volumes, demo_force_full_rebuild: true });
@@ -155,10 +149,7 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 }
 
 /// DDGI LOD0 需要探针段的 chunk 集合（chunk 坐标 = 世界 voxel / 256，见 `DdgiLod0Chunks`）。
-///
-/// 规则：① 自己有几何的 chunk 领一段；② 几何贴着 chunk 边界（最外一层 16³ brick 非空）时，
-/// 相邻 chunk 也要领一段 —— 否则贴着边界的采样者缺 4 个插值角，chunk 边界会留下可见接缝。
-/// 判定只扫最外一层 16³ brick（`ChunkTree::get_brick_state` level 2）。
+/// 规则：① 自己有几何的 chunk 领一段；② 最外一层 16³ brick 非空时相邻 chunk 也领。
 fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
   use gate_voxel::BrickState;
   use std::collections::HashSet;
@@ -215,14 +206,8 @@ fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
 }
 
 /// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按 `assets/vox/<name>.vox` 重建主世界。
-///
-/// 与启动路径（[`setup`]）保持同一套不变量：先 `compact_all`，再用**最终**网格算 DDGI 的
-/// LOD0 chunk 集；`demo_force_full_rebuild` 触发全量重建 + 全量 GPU 上传，DDGI 侧
-/// （世界 AABB → 探针网格 / chunk 段池 / 重烘焙）与光照场缓存随之自动更新（见
-/// `gate-render` 的 `poll_pending`/`extract`/`prepare`/`prepare_ddgi`）。
-///
-/// 失败（文件缺失/解析错误）→ 原世界保持不变。相机不动：所有模型都按 AABB 底面中心锚到
-/// 同一 anchor，换模型后视野仍对着场景。
+/// 与 `setup` 同一套不变量：先 `compact_all` 再算 LOD0 chunk 集；`demo_force_full_rebuild` 触发全量
+/// 重建 + 全量 GPU 上传。失败 → 原世界保持不变；相机不动（所有模型锚到同一 anchor）。
 pub(crate) fn reload_world(
   scene: &mut VoxelScene,
   aabb: &mut gate_render::ddgi::DdgiWorldAabb,
@@ -243,8 +228,7 @@ pub(crate) fn reload_world(
   Ok(info)
 }
 
-/// demo 调色板（PaletteEntry._pad 私有 → 跨 crate 用 default + 逐字段赋值）：
-/// 14 色 = 草地 / 山岩 / 雪峰 / 城堡石 / 树叶 / 树干 / 河蓝 / 水晶青紫红 / 塔顶金 / 道路 / 岛底 + LED
+/// demo 调色板：1..=13 地形/建筑色 + 14 号 LED 灯柱（`PaletteEntry::default` + 逐字段赋值）。
 fn paint_demo_palette(grid: &mut VolumeGrid) {
   let palette: &[(u16, [u8; 3], u8)] = &[
     (1, [86, 160, 70], 220),   // 1 草地（L0 地面平原）
@@ -276,19 +260,8 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
   pal.set(PaletteId(14), led);
 }
 
-// 极限场景版图（世界边长 = N tile × 512 voxel，N = GATE_TILES）：
-// ─────────────────────────────────────────────────────────────────────
-// 世界：tiles x∈[0..N) z∈[0..N) y∈[0..2]，brickmap compute_window dims=(N+2, 5, N+2)，
-//       voxel AABB ≈ (-512,-512,-512)..(N·512, 2048, N·512)，对角穿越 ≈9000 voxel。
-// 内容分布：
-//   · 基础 L0 地面（全地图高 16）+ 正弦高度场山体
-//   · 4 座雪峰（四角，y 到 800）· 中部峡谷蜿蜒河流 L2
-//   · ~160 棵散点树（L2）在非山非河格 · 入口大道大标语 "GATE ENGINE"
-//   · 正中央 "天空堡"：L1 岛底倒锥 + 城墙 + 4 座角楼 + L2 高塔 + L3 金顶
-//   · 3 处水晶矿簇（L4 多色）
-// ─────────────────────────────────────────────────────────────────────
-// 世界规模（tile 数，1 tile = 512 voxel）：env `GATE_TILES` 可调，clamp 2..=10，默认 2。
-// 场景内所有结构性坐标（城堡/大道/河）均以 EXT_VOXEL_HALF 为锚，随规模等比成立。
+// 极限场景规模：世界边长 = N tile × 512 voxel，N = GATE_TILES（env 可调，clamp 2..=10，默认 2）；
+// brickmap compute_window dims = (N+2, 5, N+2)；结构性坐标（城堡/大道/河）均以 EXT_VOXEL_HALF 为锚。
 static EXT_N_TILES: LazyLock<i32> = LazyLock::new(|| {
   std::env::var("GATE_TILES").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2).clamp(2, 10)
 });
@@ -315,7 +288,7 @@ fn terrain_h(x: i32, z: i32) -> i32 {
     + corner_snow(0, *EXT_VOXEL_Z - 1)
     + corner_snow(*EXT_VOXEL_X - 1, *EXT_VOXEL_Z - 1);
   let hf = 16.0 + s1 * 80.0 + s2 * 120.0 + sn;
-  // 4 对齐：高度层取整到 4³ 块（非对齐会退化为逐体素边缘 → 树碎片化膨胀）；阶梯化 4 级。
+  // 4 对齐：高度层取整到 4³ 块（未对齐会退化为逐体素边缘）；阶梯化 4 级。
   ((hf as i32).clamp(16, 1020)) & !3
 }
 
@@ -343,10 +316,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
       bevy::log::info!("SCENE {}: {:?} chunks={}", $name, t0.elapsed(), grid.chunk_count())
     };
   }
-  // ================================================================
-  //  (1) 基础地形：按 16 voxel (L0) 步长采样高度场 → fill_box 铺柱
-  //      y=16..h 用 palette 2 山岩；h>560 时顶部一层改 palette 3 雪
-  // ================================================================
+  // (1) 基础地形：按 16 voxel (L0) 步长采样高度场 → fill_box 铺柱（y=16..h 用 pal 2，h>560 顶部改 pal 3）
   let mut z = 0i32;
   while z < *EXT_VOXEL_Z {
     let mut x = 0i32;
@@ -358,7 +328,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
       // 河道：y=16..24 填 palette 7，不叠加山岩
       let in_r = in_river(x, z);
       if !in_castle_plate {
-        // 先铺 L0 地面（所有格子 y=0..16 统一由稍后 L0 全地图填，这里只填 16..h 山体）
+        // 只填 16..h 山体（y=0..16 地面稍后全地图统一填）
         let top = h;
         let snow_line = top - 40; // 4 对齐（top 已对齐 4）
         if in_r {
@@ -397,20 +367,14 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   fill_bricks(grid, IVec3::new(0, 0, 0), IVec3::new(*EXT_VOXEL_X, 16, *EXT_VOXEL_Z), 16, 1);
   mark!("(1b) floor");
 
-  // ================================================================
-  //  (2) 中央大道 + 入口大标语 "GATE ENGINE"
-  // ================================================================
+  // (2) 中央大道 + 入口大标语 "GATE ENGINE"
   // 中央大道（X 向，中线 ±32 宽）深灰铺路
   fill_box(grid, IVec3::new(0, 16, *EXT_VOXEL_HALF - 32), IVec3::new(*EXT_VOXEL_X, 8, 32), 12);
   // 大标语（L1，每像素 8³）
   draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 8);
   mark!("(2) road+text");
 
-  // ================================================================
-  //  (3) 中央天空之城（世界中心，尺寸以世界中心为锚）
-  //     浮空岛底倒锥（L0）→ 城墙平台 → 四面城墙 → 四角角楼（+ 金顶）→ 正殿
-  //     → 高塔 + 金顶球 → 四角旗帜（L4 红飘带）
-  // ================================================================
+  // (3) 中央天空之城（以世界中心为锚）：浮空岛底 → 城墙/角楼 → 正殿 → 高塔 → 旗帜
   let cx = *EXT_VOXEL_HALF;
   let cz = *EXT_VOXEL_HALF;
   // 浮空岛底（倒锥：按 y 降低半径收窄）——L0 级 16 步扫描
@@ -479,11 +443,8 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     }
   }
 
-  // ================================================================
-  //  (4) 森林：~160 棵确定性散点树（双素数线性同余，不用 rand）
-  //     每棵 = 树干（L1）+ 叶球（L2，r=80）
-  //     不在城堡半径内、不在河道上、不在大道上、高度 h<360（只种平原）
-  // ================================================================
+  // (4) 森林：~160 棵确定性散点树（双素数线性同余，不用 rand）= 树干（L1）+ 叶球（L2，r=80）；
+  // 选址：城堡半径外、非河道、非大道、h<360。
   {
     let mut n_planted = 0usize;
     let mut i = 0i32;
@@ -510,9 +471,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
   mark!("(4) forest");
 
-  // ================================================================
-  //  (5) 3 处 L4 水晶矿簇（每处 60~100 个 1³ 彩色小立方体，密集堆叠）
-  // ================================================================
+  // (5) 3 处 L4 水晶矿簇（每处 60~100 个 1³ 彩色小立方体，密集堆叠）
   let crystal_clusters: &[(i32, i32, i32, u8, u8, i32)] = &[
     // (cx, cz, count, pal_a, pal_b, seed)
     (480, 480, 90, 8, 9, 131),   // 左上 水晶青/紫
@@ -521,7 +480,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   ];
   for &(cx_, cz_, cnt, pa, pb, seed) in crystal_clusters.iter() {
     if cx_ >= *EXT_VOXEL_X || cz_ >= *EXT_VOXEL_Z {
-      continue; // 簇中心在世界外（N 缩小时）跳过，避免 t 无限增长溢出
+      continue; // 簇中心在世界外时跳过（避免 t 无限增长溢出）
     }
     let h = terrain_h(cx_, cz_);
     let mut t = 0i32;
@@ -543,9 +502,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
   mark!("(5) crystals");
 
-  // ================================================================
-  //  (6) 静态 L4 32³ 精度热点：tile(1,0,0) 金色 32³ + tile(2,0,0) 蓝 32³
-  // ================================================================
+  // (6) 静态 L4 32³ 精度热点：tile(1,0,0) 金色 + tile(2,0,0) 蓝
   fill_box(grid, IVec3::new(656, 64, 64), IVec3::new(32, 32, 32), 11);
   if 1264 + 32 <= *EXT_VOXEL_X {
     fill_box(grid, IVec3::new(1264, 240, 240), IVec3::new(32, 32, 32), 7);
