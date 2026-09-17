@@ -49,12 +49,16 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
   } else {
     let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
-    let path = gate_render::assets_dir().join("vox/nuke.vox");
-    let info = vox_scene::load_vox_scene(&mut grid, &path, anchor).expect("nuke.vox 加载失败");
+    // 启动世界 = 「游戏/世界」页模型下拉的存档选中项（菜单退出时写盘；读不到 / 无该节点 → nuke）
+    let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu())
+      .unwrap_or_else(|| "nuke".to_string());
+    let path = gate_render::assets_dir().join(format!("vox/{name}.vox"));
+    let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
+      .unwrap_or_else(|e| panic!("{name}.vox 加载失败: {e}"));
     cam_eye = Vec3::new(406.5, 339.5, 431.5);
     cam_target = Vec3::new(551.5, 330.5, 359.5);
     bevy::log::info!(
-      "VOX SCENE: instances={} written={} dropped={} aabb=[{}]-[{}]",
+      "VOX SCENE {name}: instances={} written={} dropped={} aabb=[{}]-[{}]",
       info.instances_used,
       info.voxels_written,
       info.voxels_dropped,

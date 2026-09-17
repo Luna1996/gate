@@ -1,9 +1,22 @@
 import package::bindings::{ddgi_cell, ddgi_cell_id, ddgi_meta, ddgi_u, g};
 import package::brickmap::{Grid};
-import package::ddgi::consts::{DDGI_BAKE_STAGGER};
+import package::ddgi::consts::{DDGI_BAKE_STAGGER, DDGI_PROBE_MIN_BLOCK};
 import package::ddgi::helpers::{DDGI_REC_ENABLED, ddgi_brick_state, ddgi_cell_in_window, ddgi_cell_state_sized, ddgi_lod_cell_size, ddgi_lod_count, ddgi_lod_slot_base, ddgi_meta_pack, ddgi_rec_off, ddgi_rec_pack, ddgi_slot_own, ddgi_slot_world_cell};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_push_out_of_objects};
 import package::trace::{make_grid};
+import package::world::{world_solid};
+
+/// 体素粒度的 `sz³` 全空块（不要求对齐 4 voxel 网格）；探针放置的最后一档。
+fn ddgi_block_empty(g: Grid, o: vec3<i32>, sz: i32) -> bool {
+  for (var k = 0; k < sz; k = k + 1) {
+    for (var j = 0; j < sz; j = j + 1) {
+      for (var i = 0; i < sz; i = i + 1) {
+        if (world_solid(g, o + vec3<i32>(i, j, k))) { return false; }
+      }
+    }
+  }
+  return true;
+}
 
 /// 对齐的 8³ 子块是否完全空。
 fn ddgi_block8_empty(g: Grid, o: vec3<i32>) -> bool {
@@ -17,7 +30,49 @@ fn ddgi_block8_empty(g: Grid, o: vec3<i32>) -> bool {
   return true;
 }
 
-/// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ 找靠 cell 中心的空叶，返回 (探针位置, found)，全找不到则 found=false。
+/// 体素粒度的最后一档：在 [cmin, cmin+cs) 内找离 `center` 最近的 `DDGI_PROBE_MIN_BLOCK³` 全空块，
+/// 返回 (位置, found)。窄过道截面对齐不上 4 voxel 网格，只靠这一档。
+fn ddgi_place_fine(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec4<f32> {
+  let msz = DDGI_PROBE_MIN_BLOCK;
+  let n16 = max(cs / 16, 1);
+  let step2 = max(cs / 16, 1);
+  // 快速路径：`center` 自身所在的块（clamp 进 cell 内）—— 绝大多数调用就是它，省掉整轮扫描。
+  let base = clamp(
+    vec3<i32>(floor(center)) - vec3<i32>(msz / 2),
+    cmin,
+    cmin + vec3<i32>(cs - msz),
+  );
+  if (ddgi_block_empty(g, base, msz)) {
+    return vec4<f32>(vec3<f32>(base) + vec3<f32>(f32(msz) * 0.5), 1.0);
+  }
+  var bm_d2 = 1e30;
+  var bm_p = vec3<f32>(0.0);
+  var fm = false;
+  for (var k = 0; k < n16; k = k + 1) {
+    for (var j = 0; j < n16; j = j + 1) {
+      for (var i = 0; i < n16; i = i + 1) {
+        let sub16 = cmin + vec3<i32>(i, j, k) * 16;
+        if (ddgi_cell_state_sized(g, sub16, 16) != 2u) { continue; }
+        for (var kk = 0; kk + msz <= 16; kk = kk + step2) {
+          for (var jj = 0; jj + msz <= 16; jj = jj + step2) {
+            for (var ii = 0; ii + msz <= 16; ii = ii + step2) {
+              let sub = sub16 + vec3<i32>(ii, jj, kk);
+              // 中心体素先测：缝/洞里的候选一次淘汰。
+              if (world_solid(g, sub + vec3<i32>(msz / 2))) { continue; }
+              if (!ddgi_block_empty(g, sub, msz)) { continue; }
+              let p = vec3<f32>(sub) + vec3<f32>(f32(msz) * 0.5);
+              let d2 = dot(p - center, p - center);
+              if (d2 < bm_d2) { bm_d2 = d2; bm_p = p; fm = true; }
+            }
+          }
+        }
+      }
+    }
+  }
+  return vec4<f32>(select(vec3<f32>(0.0), bm_p, fm), select(0.0, 1.0, fm));
+}
+
+/// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ → DDGI_PROBE_MIN_BLOCK³ 找靠 `center` 的空块，返回 (探针位置, found)，全找不到则 found=false。
 /// 调用前提：调用方已挡住全满 cell；lod 必须由调用方传入，不可从 cs 反推。
 fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u32) -> vec4<f32> {
   let n16 = max(cs / 16, 1);
@@ -130,8 +185,9 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
     }
   }
   if (f4) { return vec4<f32>(b4_p, 1.0); }
-  // 三级都没找到全空子块 → 返回 w = 0，该 cell ENABLED = 0。
-  return vec4<f32>(vec3<f32>(0.0), 0.0);
+  // 轮 4（体素粒度）：4³ 要求块对齐 4 voxel 网格，窄过道截面对齐不上 → 交给 `ddgi_place_fine`。
+  // 都没找到 → w = 0，该 cell ENABLED = 0（比 DDGI_PROBE_MIN_BLOCK 更窄的缝不放探针）。
+  return ddgi_place_fine(g, cmin, cs, center);
 }
 
 /// 单级烘焙：lod 由派发该 pass 时确定，idx = 该级内的槽位下标。
@@ -156,7 +212,7 @@ fn ddgi_bake_one(lod: u32, idx: u32) {
   ddgi_cell_id[slot] = vec4<i32>(wcell, 1);
   // 换主与编辑都保留图集历史（age / meta）。
   // 换主时 age = 1 + slot % DDGI_BAKE_STAGGER（∈ [1, N]）；enabled/active 置真。
-  if (!same_cell) {
+  if (!same_cell || dirty) {
     ddgi_meta[slot] = ddgi_meta_pack(1u + (slot % DDGI_BAKE_STAGGER), true, true);
   }
   let g = make_grid(0u);

@@ -33,6 +33,9 @@ const DDGI_DEPTH_ALPHA: f32 = 1.0 / 255.0;
 const DDGI_DEPTH_CONV_SAMPLES: f32 = 255.0;
 /// 末级兜底 r4（"本点一侧的探针场插值"）启用的最小同侧余弦权重和 Σ wtri·wn。
 const DDGI_FIELD_MIN_W: f32 = 0.05;
+/// 探针放置的最后一档块边长（voxel）：4³ 档要求对齐 4 voxel 网格，3 voxel 宽的过道只有这一档放得下。
+/// 取 3 是下限——更窄的缝（1~2 voxel）不放探针，否则探针会把缝两侧的照明互相渗过去（漏光）。
+const DDGI_PROBE_MIN_BLOCK: i32 = 3;
 /// Chebyshev 软遮挡里 std 的绝对下限（体素）。
 const DDGI_DEPTH_SOFT_MIN: f32 = 0.5;
 /// 空间混合（探针间去噪）里"自身"的权重参照。
@@ -43,11 +46,16 @@ const DDGI_TEXEL_MIN_COVERAGE: f32 = 0.5;
 const DDGI_NORMAL_BIAS: f32 = 1.0;
 /// 采样点沿法线的外推量 = 该 LOD 的 cell 边长 × 此系数（normal_bias 语义）。
 const DDGI_BIAS_CELLS: f32 = 0.1;
+/// 上面那个外推量的绝对上限（voxel）：窄缝里 `cs × DDGI_BIAS_CELLS`（LOD0 = 1.6）会把采样点推进对面
+/// 几何内部，使逐角可见性求交对全部 8 角都判被挡。
+const DDGI_BIAS_MAX_VOXELS: f32 = 0.5;
 // ============================================================================
 // 逐角几何遮挡（真·线段求交）参数：线段 = 采样点 cell 的 8 角 → 采样点，长度 ≤ cs·√3。
 // ============================================================================
 /// 线段终点偏置（体素）：从 `max_t = 线段长` 里扣除，停在采样点前。
-const DDGI_OCCL_END_BIAS: f32 = 1.0;
+/// 必须 < 采样点到表面的距离（着色侧 n_off ≥ 0.5 + 本文件的 DDGI_BIAS_MAX_VOXELS ≥ 0，即 ≥ 0.5），
+/// 否则探针背后的薄板/墙面会落在被扣掉的那一段里、被判成"可见"（漏光）。
+const DDGI_OCCL_END_BIAS: f32 = 0.25;
 /// 逐角遮挡的权重阈值 ε：角权重 w = wtri·wn_w·wd < ε 时丢弃。
 const DDGI_OCCL_W_MIN: f32 = 0.005;
 const DDGI_T_MAX: f32 = 8192.0;

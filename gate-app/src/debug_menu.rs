@@ -510,9 +510,9 @@ fn register_callbacks(world: &mut World) {
         ("render/ddgi/probe", MenuAction::Select(i)) => {
           ddgi_dbg.probe_viz = *i > 0;
           ddgi_dbg.probe_viz_lod = if *i == 5 {
-            0.0
+            4.0
           } else {
-            *i as f32
+            (*i - 1) as f32
           };
           let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
           info!("探针绘制 → {name}");
@@ -611,11 +611,11 @@ fn register_callbacks(world: &mut World) {
      q_menu: Query<&gate_ui::DebugMenu>| {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
-          let name = world_model_name(&q_menu).unwrap_or_else(|| "?".to_string());
+          let name = menu_world_model(&q_menu).unwrap_or_else(|| "?".to_string());
           info!("世界模型 → {name}（点「重载世界」生效）");
         }
         (WORLD_RELOAD_PATH, MenuAction::Button(_)) => {
-          let Some(name) = world_model_name(&q_menu) else {
+          let Some(name) = menu_world_model(&q_menu) else {
             warn!("重载世界：读不到模型下拉的选择（菜单未就绪），已忽略");
             return;
           };
@@ -639,13 +639,18 @@ fn register_callbacks(world: &mut World) {
   );
 }
 
-/// 读「世界」页下拉当前选中的模型名（无菜单 / 无该节点 / 选项为空 → None）
-fn world_model_name(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
-  let menu = q_menu.single().ok()?;
-  match menu.model.node(&split(WORLD_MODEL_PATH)) {
+/// 读「世界」页下拉当前选中的模型名（无该节点 / 选项为空 → None）；
+/// 启动时由 `scene::setup` 用 `load_menu()` 的模型读同一个值。
+pub(crate) fn world_model_name(model: &MenuFile) -> Option<String> {
+  match model.node(&split(WORLD_MODEL_PATH)) {
     Some(MenuNode::Dropdown { options, selected, .. }) => options.get(*selected).cloned(),
     _ => None,
   }
+}
+
+/// 从菜单组件里读选中的模型名（无菜单 → None）
+fn menu_world_model(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
+  world_model_name(&q_menu.single().ok()?.model)
 }
 
 /// 纯文本行（相机位置/角度）的值：每 `CAM_INFO_REFRESH_SECS` 刷新一次。

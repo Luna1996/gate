@@ -1,8 +1,8 @@
 import package::bindings::{ddgi_cell, ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u};
-import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FIELD_MIN_W, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
+import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_BIAS_MAX_VOXELS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FIELD_MIN_W, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
 import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
 import package::trace::{make_grid};
-import package::world::{world_cfg_full, world_raycast};
+import package::world::{world_cfg_full, world_raycast, world_solid};
 
 /// 辐照度图集纹素：`.w` = 覆盖度（被 collect 写过就向 1 靠拢，用于区分「探针活过」与「从未投线」）。
 fn ddgi_irr_fetch(id: u32, tx: i32, ty: i32) -> vec4<f32> {
@@ -111,8 +111,9 @@ fn ddgi_sample_lod(
   // 逐角几何遮挡配置（完整层次 DDA）：t_min = 0 从探针位置起测；max_t 由调用点按「线段长 − DDGI_OCCL_END_BIAS」传入。
   let occl_cfg = world_cfg_full(0.0, 3u);
   // 探针标称位置在 cell 中心 → cell 坐标先平移半格再 floor（三线性基）。
-  // 采样点沿法线再外推 cs·DDGI_BIAS_CELLS。
-  let ps = p + n * (cs * DDGI_BIAS_CELLS);
+  // 采样点沿法线外推 min(cs × DDGI_BIAS_CELLS, DDGI_BIAS_MAX_VOXELS)；仍落在实体体素内则退回 p。
+  var ps = p + n * min(cs * DDGI_BIAS_CELLS, DDGI_BIAS_MAX_VOXELS);
+  if (world_solid(gw, vec3<i32>(floor(ps)))) { ps = p; }
   // 用世界 cell 号（槽位 = 世界 cell 对网格维度取模），与烘焙/判活侧同一套世界身份。
   let wc_f = ps / cs - vec3<f32>(0.5);
   let wc0 = vec3<i32>(floor(wc_f));
@@ -176,7 +177,7 @@ fn ddgi_sample_lod(
         let dist = length(to);
         let dir = to / max(dist, 1e-4);
         // ===== 「这个角的数据」是否可用 =====
-        // `wn ≤ 0`（背面）与 `wd` 小（被挡）是「照明无效」而非「没有数据」，只影响 total/wsum，不影响 cov。
+        // `wn ≤ 0`（背面）与 `wd` 小（被挡）是「本角照明无效」：本角既不进 total/wsum，也不进 cov。
         let dtex = ddgi_depth_sample(slot, dir);
         // 本点方向辐照度；`.w` = 该纹素的覆盖度（判断探针是否活）。
         let irr4 = ddgi_irr_sample(slot, irr_taps);
@@ -186,7 +187,7 @@ fn ddgi_sample_lod(
           ddgi_dbg_rej.w = ddgi_dbg_rej.w + 1u;
           continue;
         }
-        // `cov` 必须在所有照明闸门（wn / wd / ε / 求交）之前累加。
+        // `cov` 必须在所有照明闸门（wn / wd / ε / 求交）之前累加：它衡量的是「这片探针有没有数据」。
         cov = cov + wtri;
         // ===== 「照明是否可用」判定 =====
         // 背向闸门用未 clamp 的 `wn_raw`；除 `allow_backface`（r3'）外一律剔除。

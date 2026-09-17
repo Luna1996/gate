@@ -432,7 +432,7 @@ fn ddgi_seal(@builtin(local_invocation_id) lid: vec3<u32>) {
   }
 }
 
-// 阶段一 烘焙：逐 cell 沿 4³ 分裂树 BFS 找最大的全空叶、探针放其中心（同级取更靠近 cell 中心的空叶）；
+// 阶段一 烘焙：逐 cell 沿 4³ 分裂树找最大全空块（16³ → 8³ → 4³ → DDGI_PROBE_MIN_BLOCK³）、探针放其中心（同级取更靠近 cell 中心的块）；
 // 全空 cell → 居中，全满 cell → 无探针。输出 ddgi_cell[slot] = flags(bit0 探针存在 / bit1 cell 有体素) | cell 内归一化偏移。
 // 增量：ddgi_cell_id[slot] 记录已烘焙的世界 cell 键，键未变的槽位跳过。
 
@@ -486,12 +486,12 @@ fn ddgi_sort(@builtin(global_invocation_id) gid: vec3<u32>) {
   // age 继承：同 slot 且 world cell 未变 → 续龄（换 cell 时 bake 已清零）。
   let prev_meta = ddgi_meta[slot];
   var age = ddgi_meta_age(prev_meta);
-  // 世界编辑（脏区）命中本 cell → 把年龄压回 1（判据与 bake 的脏区判定一致）。
+  // 世界编辑（脏区）命中本 cell → 把年龄压回 1（图集数据来自编辑前的世界）。
   let cell_lo = vec3<f32>(cmin);
   let cell_hi = cell_lo + f32(cs);
   if (ddgi_u.dirty_min.w > 0.5
-      && all(cell_hi > ddgi_u.dirty_min.xyz)
-      && all(cell_lo < ddgi_u.dirty_max.xyz)) {
+    && all(cell_hi > ddgi_u.dirty_min.xyz)
+    && all(cell_lo < ddgi_u.dirty_max.xyz)) {
     // 按槽位号错峰：age = 1 + slot % DDGI_BAKE_STAGGER。
     age = 1u + (slot % DDGI_BAKE_STAGGER);
   }
@@ -612,14 +612,16 @@ fn probe_viz_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
   let lod = ddgi_slot_lod_of(id);
+  // `probe_viz_params.z` = 要画的 LOD 下标（0..DDGI_LOD_COUNT-1）；≥ DDGI_LOD_COUNT = 全画。
   let sel = u32(view_u.probe_viz_params.z);
-  if (sel != 0u && lod != sel - 1u) {
+  if (sel < DDGI_LOD_COUNT && lod != sel) {
     return;
   }
   // 只可视化活跃探针（DDGI_META_ACTIVE）。
   if ((ddgi_meta[id] & DDGI_META_ACTIVE) == 0u) {
     return;
   }
+  // 黄点画在探针实际位置。
   let pos = ddgi_slot_pos[id];
   let dot_col = vec4<f32>(1.0, 0.85, 0.0, 1.0);
   let clip = view_u.view_proj * vec4<f32>(pos.xyz, 1.0);
