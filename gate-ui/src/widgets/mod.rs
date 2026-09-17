@@ -27,9 +27,9 @@ pub use checkbox::{
   CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system,
 };
 pub use dropdown::{
-  DropdownArrow, DropdownChanged, DropdownConfig, DropdownHandle, DropdownOption, DropdownOptions,
-  DropdownPopup, DropdownRoot, DropdownState, DropdownText, DropdownValue, dropdown,
-  dropdown_system, dropdown_visual_system,
+  DropdownArrow, DropdownBackdrop, DropdownChanged, DropdownConfig, DropdownHandle, DropdownOption,
+  DropdownOptions, DropdownPopup, DropdownRoot, DropdownState, DropdownText, DropdownValue,
+  dropdown, dropdown_system, dropdown_visual_system,
 };
 pub use grid::{GridConfig, GridHandle, UiGrid, grid, grid_cell};
 pub use label::{

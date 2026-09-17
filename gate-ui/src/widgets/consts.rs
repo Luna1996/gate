@@ -14,6 +14,8 @@ pub const BOX_SIZE: f32 = 16.0;
 pub const DROPDOWN_ANIM_SECS: f32 = 0.2;
 /// 下拉框箭头图标字号（px）
 pub const DROPDOWN_ARROW_SIZE: f32 = 12.0;
+/// 下拉框滚轮滚动速度（每秒移动的选项数）
+pub const DROPDOWN_SCROLL_SPEED: f32 = 5.0;
 /// 折线画布默认宽度（px）
 pub const PLOT_W: u32 = 256;
 /// 折线画布默认高度（px）
