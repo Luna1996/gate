@@ -509,7 +509,7 @@ fn register_callbacks(world: &mut World) {
         }
         ("render/ddgi/probe", MenuAction::Select(i)) => {
           ddgi_dbg.probe_viz = *i > 0;
-          ddgi_dbg.probe_viz_lod = if *i == 5 {
+          ddgi_dbg.probe_viz_lod = if *i == 5 || *i == 0 {
             4.0
           } else {
             (*i - 1) as f32
