@@ -1,6 +1,6 @@
 //! 坐标系与层级常量（Douglas Brick Tree 对齐）。
 //! VoxelCoord = 最细格（1³，i32³ 世界坐标）；ChunkCoord = 256³ chunk 的分层 HashMap key；BrickCoord = 树内 brick。
-//! 层级 256 → 64 → 16 → 4 → 1；Level 2（16³）= 组件粒度 = DDGI probe cell，Level 4（1³）= 编辑最细粒度。
+//! 层级 256 → 64 → 16 → 4 → 1；Level 2（16³）= 组件粒度，Level 4（1³）= 编辑最细粒度。
 
 use glam::IVec3;
 

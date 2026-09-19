@@ -101,7 +101,7 @@ pub struct MenuPage {
 #[derive(EntityEvent, Clone, Debug, PartialEq)]
 pub struct MenuActionEvent {
   pub entity: Entity,
-  /// 节点 id 路径（如 "render/ddgi/probe_viz"）
+  /// 节点 id 路径（如 "render/gi/gi_half"）
   pub path: String,
   pub action: MenuAction,
 }

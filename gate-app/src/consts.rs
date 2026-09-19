@@ -1,7 +1,7 @@
 //! gate-app 的可调旋钮（本 crate 的模块都在 `src/` 下，故集中在本文件）：改这里即改默认值。
 //!
 //! 全是编译期常量：改值后重新编译。要给某项加 debug_menu 控件时，把它挪进 Bevy 资源再按
-//! 菜单连线（做法见 `debug_menu.rs` 里的 `RenderScale` / `EyeAdaptSettings` / `DdgiDebugSettings`）。
+//! 菜单连线（做法见 `debug_menu.rs` 里的 `RenderScale` / `EyeAdaptSettings` / `GiSettings`）。
 
 /// 启动场景：true = 程序化 demo 场景；false = assets/vox/nuke.vox
 pub const STARTUP_DEMO_SCENE: bool = false;
@@ -35,9 +35,6 @@ pub const FLY_SPEED_FAST_MUL: f32 = 2.0;
 pub const EDIT_SIZE_MIN: u32 = 1;
 /// 编辑射线射程（体素）
 pub const EDIT_REACH: f32 = 256.0;
-/// 采样调试（`probe_dbg`）的拾取射程（体素）：纯诊断用，要比笔触射程远得多，
-/// 否则「看远处那片区域」时拾取直接落空、调试视图什么都不画。
-pub const PROBE_DBG_REACH: f32 = 4096.0;
 /// 左键点击与拖拽转向的判定阈值（像素）
 pub const DRAG_PX: f32 = 4.0;
 

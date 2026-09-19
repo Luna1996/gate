@@ -38,8 +38,6 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 
   let t0 = std::time::Instant::now();
   let mut grid = VolumeGrid::new();
-  // DDGI 四级网格的锚点：世界 AABB（与相机无关；demo 场景无 AABB 时用默认值）。
-  let mut ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb::default();
   let mut cam_eye = Vec3::new(1., 0., 0.);
   let mut cam_target = Vec3::new(0., 0., 0.);
   if STARTUP_DEMO_SCENE {
@@ -66,14 +64,9 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
       info.aabb_max,
     );
     bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
-    ddgi_world_aabb = gate_render::ddgi::DdgiWorldAabb { min: info.aabb_min, max: info.aabb_max };
   }
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
   bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
-
-  // DDGI chunk 级（LOD1）的探针段分配集（内容驱动，见 `chunk_needed_chunks`）：只有有几何或几何贴着
-  // chunk 边界（16 体素内）的 chunk 才领固定段，空 chunk 不占槽位。
-  let ddgi_chunk_set = gate_render::ddgi::DdgiChunkSet { chunks: chunk_needed_chunks(&grid) };
 
   // 轨道相机为唯一相机状态源，DdaCameraConfig 由 `from_orbit` 生成（初始机位 = 场景中心俯视）。
   let orbit = if START_CAMERA_SKY {
@@ -88,8 +81,6 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   let saved = crate::camera::CameraPose::load();
   let orbit = saved.as_ref().map_or(orbit, |p| p.to_orbit());
   commands.insert_resource(orbit);
-  commands.insert_resource(ddgi_world_aabb);
-  commands.insert_resource(ddgi_chunk_set);
   commands.insert_resource(DdaCameraConfig::from_orbit(
     &orbit,
     FOV_Y,
@@ -150,70 +141,11 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
 }
 
-/// DDGI chunk 级需要探针段的 chunk 集合（chunk 坐标 = 世界 voxel / 256，见 `DdgiChunkSet`）。
-/// 规则：① 自己有几何的 chunk 领一段；② 最外一层 16³ brick 非空时相邻 chunk 也领。
-fn chunk_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
-  use gate_voxel::BrickState;
-  use std::collections::HashSet;
-  // 每轴 16 个 16³ brick（256 / 16）；边界层 = 坐标 0 或 15
-  const BRICKS: i32 = 16;
-  let axis_offsets = |b: i32| -> [i32; 2] {
-    if b == 0 {
-      [-1, 0]
-    } else if b == BRICKS - 1 {
-      [1, 0]
-    } else {
-      [0, 0]
-    }
-  };
-  let mut needed: HashSet<IVec3> = HashSet::new();
-  for c in grid.chunk_coords() {
-    let Some(tree) = grid.chunk(c) else { continue };
-    if tree.is_empty() {
-      continue;
-    }
-    needed.insert(c.0);
-    for bx in 0..BRICKS {
-      for by in 0..BRICKS {
-        for bz in 0..BRICKS {
-          if bx != 0
-            && bx != BRICKS - 1
-            && by != 0
-            && by != BRICKS - 1
-            && bz != 0
-            && bz != BRICKS - 1
-          {
-            continue;
-          }
-          if tree.get_brick_state(bx * 16, by * 16, bz * 16, 2) == BrickState::Air {
-            continue;
-          }
-          for dx in axis_offsets(bx) {
-            for dy in axis_offsets(by) {
-              for dz in axis_offsets(bz) {
-                if dx == 0 && dy == 0 && dz == 0 {
-                  continue;
-                }
-                needed.insert(c.0 + IVec3::new(dx, dy, dz));
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  let mut out: Vec<IVec3> = needed.into_iter().collect();
-  out.sort_unstable_by_key(|c| (c.x, c.y, c.z));
-  out
-}
-
 /// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按 `assets/vox/<name>.vox` 重建主世界。
-/// 与 `setup` 同一套不变量：先 `compact_all` 再算 chunk 段集；`demo_force_full_rebuild` 触发全量
-/// 重建 + 全量 GPU 上传。失败 → 原世界保持不变；相机不动（所有模型锚到同一 anchor）。
+/// 与 `setup` 同一套不变量：先 `compact_all`；`demo_force_full_rebuild` 触发全量重建 + 全量 GPU 上传。
+/// 失败 → 原世界保持不变；相机不动（所有模型锚到同一 anchor）。
 pub(crate) fn reload_world(
   scene: &mut VoxelScene,
-  aabb: &mut gate_render::ddgi::DdgiWorldAabb,
-  chunk_set: &mut gate_render::ddgi::DdgiChunkSet,
   name: &str,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
@@ -221,12 +153,8 @@ pub(crate) fn reload_world(
   let mut grid = VolumeGrid::new();
   let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)?;
   grid.compact_all();
-  let chunks = chunk_needed_chunks(&grid);
   scene.volumes = Volumes::new(grid);
   scene.demo_force_full_rebuild = true;
-  aabb.min = info.aabb_min;
-  aabb.max = info.aabb_max;
-  chunk_set.chunks = chunks;
   Ok(info)
 }
 

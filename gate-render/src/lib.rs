@@ -1,6 +1,6 @@
 pub mod brickmap;
 pub mod consts;
-pub mod ddgi;
+pub mod gi;
 pub mod lighting;
 pub mod paths;
 pub mod profiler;
@@ -14,7 +14,7 @@ pub use brickmap::{
   BindingLimits, BrickMapBuffers, BrickMapBuilder, BrickMapGlobals, BrickMapView, BufferLayout,
   BuilderMirror, ChunkUpdate, DdaCameraConfig, DdaImages, DdaViewUniform, DebugNormals,
   DirtyRanges, EyeAdaptSettings, GpuBrickMap, GridDesc, OrbitCamera, UploadBudget, UploadCpuSample,
-  UploadCpuSampleChannel, UploadSnapshot, ViewProbeDbgPick, VolumeHit, VolumesBuilder,
+  UploadCpuSampleChannel, UploadSnapshot, VolumeHit, VolumesBuilder,
   VolumesSnapshot, VoxelScene,
   cpu_dda_ascii_grid_32x32, cpu_reference_dda_ray, cpu_reference_dda_ray_aabb_skip,
   cpu_reference_dda_ray_two_level, cpu_reference_trace_volumes, cpu_reference_volumes_occluded,
@@ -36,7 +36,7 @@ impl Plugin for GateRenderPlugin {
     app.add_plugins((
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
-      ddgi::DdgiPlugin,
+      gi::GiPlugin,
       profiler::GateProfilerPlugin,
     ));
   }

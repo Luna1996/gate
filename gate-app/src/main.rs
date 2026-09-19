@@ -129,8 +129,6 @@ fn main() {
     .add_plugins(gate_ui::GateUiPlugin)
     // 体素编辑设置（形状/大小/材质）；DebugMenu 的「游戏/编辑」是它的视图
     .init_resource::<edit::EditSettings>()
-    // 「采样调试」的拾取目标（鼠标下体素 + 面法线）：每帧由 `edit::probe_dbg_pick` 写入
-    .init_resource::<gate_render::ViewProbeDbgPick>()
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()
@@ -159,8 +157,6 @@ fn main() {
           left_click_pick_recenter,
           build_camera_config,
           voxel_edit_input,
-          // 采样调试的鼠标拾取：读本帧 cfg（故在矩阵构造之后）
-          edit::probe_dbg_pick,
         )
           .chain(),
         debug_ui_setup,
@@ -189,12 +185,13 @@ fn main() {
   if consts::EDIT_SELFTEST {
     app.add_systems(Update, edit::edit_selftest);
   }
-  // 相机自动绕目标旋转并平移（配 BENCH_UNFOCUSED 读逐 pass 帧时）
+  // 相机自动绕目标旋转并平移（配 BENCH_UNFOCUSED 读移动中的逐 pass 帧时）
   if consts::AUTO_ORBIT {
     app.add_systems(Update, camera::auto_orbit_system);
   }
   app.run();
 }
+
 
 /// profile 构建：WgpuSettings 开 wgpu timestamp 特性（wgpu-profiler GPU zone 必需），
 /// 包进 RenderCreation 供 RenderPlugin 使用。

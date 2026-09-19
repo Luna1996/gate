@@ -361,7 +361,7 @@ fn ndc_ray(cfg: &DdaCameraConfig, u: f32, v: f32) -> Option<(Vec3, Vec3)> {
 }
 
 /// 屏幕光标 → 世界射线 `(origin, dir)`。
-/// 轨道 recenter / 幽灵编辑 / 采样调试共用；指针不在窗口内 / 矩阵退化 → None。
+/// 轨道 recenter / 幽灵编辑共用；指针不在窗口内 / 矩阵退化 → None。
 pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
   let cursor = window.cursor_position()?;
   let sf = window.scale_factor();
@@ -376,11 +376,6 @@ pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3
   let u = (phys.x / pw) * 2.0 - 1.0; // [-1, 1]
   let v = 1.0 - (phys.y / ph) * 2.0; // [-1, 1]，翻转 y（NDC +y 朝上）
   ndc_ray(cfg, u, v)
-}
-
-/// 屏幕中心射线：指针不在窗口内时的回退（采样调试等诊断视图不依赖光标也能用）。
-pub(crate) fn center_ray(cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
-  ndc_ray(cfg, 0.0, 0.0)
 }
 
 /// 左键拾取 recenter（仅 Orbit 模式）：射线命中体素表面 → 轨道 target 移到命中点（沿入面

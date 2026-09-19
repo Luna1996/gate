@@ -70,17 +70,80 @@ impl Default for UploadBudget {
 }
 
 /// 体素世界修订号（render world）：每完成一次真实上传（prepare 消费到 snapshot）自增。
-/// 供依赖体素数据的下游 GPU pass（如 DDGI 探针烘焙）判定「世界是否变了」。
+/// 供依赖体素数据的下游 GPU pass 判定「世界是否变了」。
 #[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrickMapRevision(pub u64);
 
-/// DDGI 脏区（render world）：本帧上传实际改动的世界 voxel AABB（`max_voxel` 不含）。
-/// `full = true` = 全量上传（DDGI 整体重烘）；`full = false` 时 [min, max) 为改动 chunk 合并包围盒。
-#[derive(Resource, Default, Clone, Copy, Debug)]
+/// 本帧上传改动产生的**世界 voxel 脏盒**（闭开 `[lo, hi)`）＋失效余量（voxel）。
+/// 余量按产生它的 volume 的 scale 放大（`max(基准, 基准 × scale)`）：同样的「局部 2 格」在
+/// scale = 2 的物体里对应 2 格世界空间的两倍。主世界（identity、scale = 1）= 基准余量。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirtyBox {
+  pub lo: IVec3,
+  pub hi: IVec3,
+  pub margin: f32,
+}
+
+impl DirtyBox {
+  /// 两盒是否重叠（含各自余量）—— 重叠就并成一盒，避免盒数被同一片区域的多次编辑撑爆。
+  pub fn overlaps(&self, other: &Self) -> bool {
+    let m = self.margin.max(other.margin);
+    let lo = self.lo.as_vec3() - glam::Vec3::splat(m);
+    let hi = self.hi.as_vec3() + glam::Vec3::splat(m);
+    let olo = other.lo.as_vec3() - glam::Vec3::splat(m);
+    let ohi = other.hi.as_vec3() + glam::Vec3::splat(m);
+    // 闭开区间 + 余量 ⇒ 用闭区间判重叠（并集只会更大 ⇒ 只会多失效，不会漏失效）。
+    lo.cmple(ohi).all() && olo.cmple(hi).all()
+  }
+
+  /// 并入另一盒（取并集；余量取大者）。
+  pub fn union_with(&mut self, other: &Self) {
+    self.lo = self.lo.min(other.lo);
+    self.hi = self.hi.max(other.hi);
+    self.margin = self.margin.max(other.margin);
+  }
+}
+
+/// 本帧上传实际改动的世界 voxel 范围（render world）。
+/// `full = true` = 全量上传；否则 `boxes` 为逐 volume（主世界 + 物体）的改动盒，可能为空。
+#[derive(Resource, Default, Clone, Debug)]
 pub struct BrickMapDirty {
   pub full: bool,
-  pub min_voxel: IVec3,
-  pub max_voxel: IVec3,
+  /// 本帧调色板版本发生变化（只改材质的编辑：换色 / 改粗糙度等）。
+  /// palette 是共享的，改一个色号无法廉价定位受影响体素 ⇒ GI 侧走「自增世代」的全量失效。
+  pub palette_changed: bool,
+  pub boxes: Vec<DirtyBox>,
+}
+
+/// volume **局部** voxel AABB（闭开 `[lo, hi)`）→ 世界 voxel 脏盒 ＋ 失效余量。
+/// 世界变换与 shader 一致：`world = pos + rot · (local · scale)`；取局部 AABB 八个角点的世界外包
+/// ⇒ 旋转 / 缩放都保守（只会多失效，不会漏失效）。主世界（identity、scale = 1）恒等于 `lo/hi`，
+/// 余量 = 基准值 ⇒ 与旧版单盒行为逐字等价。
+/// 余量 = `max(基准, 基准 × scale)`：同样的「局部 2 格影响范围」在 scale 倍的物体里对应 scale 倍的世界空间。
+pub fn world_dirty_box(
+  t: gate_voxel::VolumeTransform,
+  lo: IVec3,
+  hi: IVec3,
+) -> DirtyBox {
+  let s = if t.scale.is_finite() && t.scale > 0.0 { t.scale } else { 1.0 };
+  let mut mn = glam::Vec3::splat(f32::MAX);
+  let mut mx = glam::Vec3::splat(f32::MIN);
+  for &x in &[lo.x, hi.x] {
+    for &y in &[lo.y, hi.y] {
+      for &z in &[lo.z, hi.z] {
+        let w = t.pos + t.rot * (glam::Vec3::new(x as f32, y as f32, z as f32) * s);
+        mn = mn.min(w);
+        mx = mx.max(w);
+      }
+    }
+  }
+  // 基准值权威在 WESL `gi/consts.wesl`（`GI_CACHE_DIRTY_MARGIN_VOXELS`），Rust 侧解析后消费。
+  let base = crate::wesl_consts::gi_consts().gi_cache_dirty_margin_voxels as f32;
+  DirtyBox {
+    lo: IVec3::new(mn.x.floor() as i32, mn.y.floor() as i32, mn.z.floor() as i32),
+    hi: IVec3::new(mx.x.ceil() as i32, mx.y.ceil() as i32, mx.z.ceil() as i32),
+    margin: base.max(base * s),
+  }
 }
 
 /// 主世界 Pending 资源：在主 world `Last` schedule 按预算 drain dirty，供只读提取。
@@ -267,7 +330,7 @@ pub struct GpuBrickMap {
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
   pub globals: UniformBuffer<BrickMapGlobals>,
-  /// 主世界 chunk 窗口（chunk 单位）CPU 副本：DDGI 世界空间探针网格推导用
+  /// 主世界 chunk 窗口（chunk 单位）CPU 副本
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
   /// 光照场（AO fill）：Rgba16Unorm 3D 纹理，硬件三线性过滤，仅 `.a` 有意义（尺寸 LIGHT_FIELD_DIM³）。
@@ -370,34 +433,41 @@ fn extract(
   let dirty_any =
     need_full || !pending_data.is_empty() || !_pending_comp.is_empty() || palette_dirty;
 
-  let mut ddgi_dirty = BrickMapDirty::default();
+  // 本帧上传改动范围（世界 voxel 脏盒）：全量上传 = full，增量 = 逐 volume（主世界 + 物体）一个盒。
+  // 主世界与物体走同一路径：物体的局部 AABB 经 transform 转成世界 AABB，余量按 scale 放大（见 `world_dirty_box`）。
+  // 只改材质（palette 版本变化）时没有有意义的 AABB，走 `palette_changed`。
+  let mut dirty_aabb = BrickMapDirty { palette_changed: palette_dirty, ..Default::default() };
   if dirty_any {
     if need_full {
-      ddgi_dirty.full = true;
+      dirty_aabb.full = true;
     } else {
-      let (mut lo, mut hi): (Option<IVec3>, Option<IVec3>) = (None, None);
+      // 逐 volume 先并集局部 AABB（同一 volume 的多个脏 chunk 合成一盒 ⇒ 主世界与旧版单盒等价）。
+      let mut acc: Vec<(usize, IVec3, IVec3)> = Vec::new();
       for (vol_idx, c) in pending_data.iter().chain(_pending_comp.iter()) {
-        if *vol_idx != 0 {
-          continue;
-        }
-
-        let (cl, ch) = match pending_aabbs.iter().find(|(v, cc, ..)| *v == 0 && cc == c) {
+        let (cl, ch) = match pending_aabbs.iter().find(|(v, cc, ..)| v == vol_idx && cc == c) {
           Some((_, _, alo, ahi)) => (*alo, *ahi),
           None => {
             let cl = c.0 * gate_voxel::CHUNK_SIZE;
             (cl, cl + IVec3::splat(gate_voxel::CHUNK_SIZE))
           }
         };
-        lo = Some(lo.map_or(cl, |v| v.min(cl)));
-        hi = Some(hi.map_or(ch, |v| v.max(ch)));
+        match acc.iter_mut().find(|(v, ..)| *v == *vol_idx) {
+          Some((_, lo, hi)) => {
+            *lo = (*lo).min(cl);
+            *hi = (*hi).max(ch);
+          }
+          None => acc.push((*vol_idx, cl, ch)),
+        }
       }
-      if let (Some(lo), Some(hi)) = (lo, hi) {
-        ddgi_dirty.min_voxel = lo;
-        ddgi_dirty.max_voxel = hi;
-      }
+      dirty_aabb.boxes = acc
+        .into_iter()
+        .filter_map(|(vol_idx, lo, hi)| {
+          scene.volumes.list.get(vol_idx).map(|g| world_dirty_box(g.transform(), lo, hi))
+        })
+        .collect();
     }
   }
-  commands.insert_resource(ddgi_dirty);
+  commands.insert_resource(dirty_aabb);
 
   let volumes_ref = &scene.volumes;
 

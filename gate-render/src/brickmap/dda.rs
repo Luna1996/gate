@@ -136,17 +136,6 @@ impl DdaCameraConfig {
   }
 }
 
-/// 「采样调试」（`probe_dbg_main`）的拾取目标：main world 每帧写，render world 提取进 view uniform。
-/// `valid = false` → 不画（开关关、指针不在窗口内、或射线未命中）。
-#[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, Default)]
-pub struct ViewProbeDbgPick {
-  /// 鼠标命中的体素（voxel 坐标）。
-  pub voxel: IVec3,
-  /// 入面法线（轴对齐、指向体素外侧）：采样点沿它外推，与着色路径同一套。
-  pub normal: IVec3,
-  pub valid: bool,
-}
-
 /// Render-world 着色器绑定的 camera uniform，与 WGSL `DdaViewUniform` 逐字对齐。
 #[derive(Resource, Clone, Copy, ShaderType)]
 pub struct DdaViewUniform {
@@ -157,11 +146,6 @@ pub struct DdaViewUniform {
   pub debug_mode: Vec4,
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（`consts::DDA_LOD`）
   pub lod: Vec4,
-  pub probe_viz_params: Vec4,
-  /// xyz = 鼠标命中的体素（voxel 坐标），w = 1 开启「采样调试」（见 `probe_dbg_main`）。
-  pub probe_dbg: Vec4,
-  /// xyz = 该体素的入面法线（轴对齐）。
-  pub probe_dbg_n: Vec4,
 }
 
 /// 本文件用到的开关（`consts.rs`）
@@ -197,9 +181,6 @@ impl DdaViewUniform {
         !DDA_BEAM as u32 as f32,
         !DDA_DIR_LUT as u32 as f32,
       ),
-      probe_viz_params: Vec4::ZERO,
-      probe_dbg: Vec4::ZERO,
-      probe_dbg_n: Vec4::ZERO,
     }
   }
 }
@@ -1146,8 +1127,12 @@ pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 
 /// 辅助纹理缓存（屏幕尺寸相关，resize 时重建）：
 ///   · `texture`：beam depth（低分辨率 r32float），beam 预 pass 写、主 pass 读；
-///   · `gi_*`：半分辨率 GI 缓冲（`DdgiDebugSettings.gi_half_res`），`gi_main` 写、主 pass 采样（BG0 4/5）；
+///   · `gi_*`：半分辨率 GI 缓冲（`GiSettings.half_res`），`gi_main` 写、主 pass 采样（BG0 4/5）；
 ///     存 premultiplied valid：rgba16f = (gi·valid, valid)、rg32f = (cov·valid, valid)，采样侧按 valid 归一化；
+///   · `gi_res_a`/`gi_res_b`：**屏幕空间逐面 ReSTIR** 的 reservoir 双缓冲（BG4 binding 20/21，
+///     每半分辨率像素 `GI_RES_WORDS` 个 word；布局见 `gi/screen.wesl`）。两块随 GI 分辨率一起
+///     重建（wgpu 新建 buffer 恒为零 ⇒ 新尺寸下 `M = 0` = 无历史）；`prepare_gi` 每帧换绑
+///     （20 = 本帧写、21 = 上帧读）。
 ///   · `gi_bg0`：GI pass 自己的 @group(0)（view uniform + beam depth，不含 GI 采样视图）。
 #[derive(Resource, Default)]
 pub(crate) struct AuxTexCache {
@@ -1158,16 +1143,59 @@ pub(crate) struct AuxTexCache {
   gi_view: Option<TextureView>,
   gi_cov_view: Option<TextureView>,
   gi_size: UVec2,
+  gi_res_a: Option<Buffer>,
+  gi_res_b: Option<Buffer>,
   gi_bg0: Option<BindGroup>,
   /// group(5) 的 GI 采样侧 bind group（`dda_main` 用；layout = `DdaPipelines::gi_read_layout`）
   gi_read_bg: Option<BindGroup>,
+  // ---- GI 降噪（`gi_denoise_temporal` + `gi_denoise_atrous1/2/4`，见 `gi/denoise.wesl`）----
+  /// 导引 buffer（`gi_main` 写、两段降噪读）：每半分辨率像素 `GI_DEN_GUIDE_WORDS` 个 u32。
+  gi_guide: Option<Buffer>,
+  /// 时域历史双缓冲（每像素 `GI_DEN_HIST_WORDS` 个 u32）：`den_flip` 决定哪块是「上帧读」。
+  gi_hist: [Option<Buffer>; 2],
+  /// 每像素亮度 range 权重尺度 φ（f32，时域写 / atrous 读）。
+  gi_phi: Option<Buffer>,
+  /// atrous 链的 4 张半分辨率 rgba16f：`[0]` = 时域输出、`[1]`/`[2]` = ping-pong、
+  /// `[3]` = 最终结果（`dda_main` 的 group(5) binding 4 绑它）。
+  gi_dn: [Option<Texture>; 4],
+  /// `gi_dn` 的采样视图：`[0..3)` 给 atrous 的输入，`[3]` 给 `dda_main`。
+  gi_dn_src: [Option<TextureView>; 4],
+  /// `gi_dn` 的存储视图：时域写 `[0]`，atrous 写 `[1]`/`[2]`/`[3]`。
+  gi_dn_dst: [Option<TextureView>; 4],
+  /// 降噪 bind group：`[0]` = 时域；`[1..6]` = atrous 的 5 种 src→dst 组合（见 `DEN_ATROUS_CHAINS`）。
+  den_bg: [Option<BindGroup>; 6],
+  /// 历史双缓冲 + atrous 轮次的换绑状态（每次真正跑降噪时翻转一次）。
+  den_flip: bool,
 }
+/// atrous 的 src→dst 组合表（下标 = `AuxTexCache::den_bg` 的 1..6）。
+/// 链的选取只取决于 `GI_DEN_ATROUS_ITER`（1 轮 ⇒ 直接写最终；2 轮 ⇒ 中间过 `[1]`；3 轮全用）：
+///   · 3 轮：tmp→a、a→b、b→den
+///   · 2 轮：tmp→a、a→den
+///   · 1 轮：tmp→den
+const DEN_ATROUS_CHAINS: [[usize; 2]; 5] = [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3]];
+/// `den_bg` 里「第 `i` 轮（0 起）该用哪个 src→dst 组合」的查表（按 `GI_DEN_ATROUS_ITER` 取前 n 项）。
+const DEN_ATROUS_ROUNDS: [[usize; 3]; 3] = [
+  [3, 0, 0], // 1 轮：tmp→den
+  [0, 4, 0], // 2 轮：tmp→a、a→den
+  [0, 1, 2], // 3 轮：tmp→a、a→b、b→den
+];
 
 impl AuxTexCache {
   /// 半分辨率 GI 的写入侧视图（BG5 的 binding 2/3 用）。
   /// `None` = 尚未创建（首帧，或本帧 `prepare_dda_bind_groups` 提前返回）⇒ 调用方须用占位纹理。
   pub(crate) fn gi_write_views(&self) -> Option<(&TextureView, &TextureView)> {
     Some((self.gi_view.as_ref()?, self.gi_cov_view.as_ref()?))
+  }
+
+  /// 屏幕空间 reservoir 的双缓冲（BG4 binding 20/21 用；`prepare_gi` 决定哪块是「本帧写」）。
+  /// `None` = 尚未创建（首帧 / prepare 提前返回）⇒ 调用方须用占位 buffer。
+  pub(crate) fn gi_res_buffers(&self) -> Option<(&Buffer, &Buffer)> {
+    Some((self.gi_res_a.as_ref()?, self.gi_res_b.as_ref()?))
+  }
+
+  /// 降噪导引 buffer（BG5 binding 6 用）。
+  pub(crate) fn gi_guide_buffer(&self) -> Option<&Buffer> {
+    self.gi_guide.as_ref()
   }
 }
 
@@ -1189,9 +1217,6 @@ pub(crate) struct DdaPipelines {
   pub(crate) beam_pipeline: CachedComputePipelineId,
   /// 半分辨率 GI（菜单开关）：`gi_main`
   pub(crate) gi_pipeline: CachedComputePipelineId,
-  pub(crate) probe_viz_pipeline: CachedComputePipelineId,
-  /// 采样调试（debug_menu 开关）：`probe_dbg_main`（鼠标下体素的 8 个采样 probe + 连线）
-  pub(crate) probe_dbg_pipeline: CachedComputePipelineId,
   /// eye_adapt_histogram / eye_adapt_update（各 1 个 WG）
   eye_histogram_pipeline: CachedComputePipelineId,
   eye_update_pipeline: CachedComputePipelineId,
@@ -1347,18 +1372,11 @@ fn extract_camera_config(
   cfg: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DdaCameraConfig>>>,
   debug: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DebugNormals>>>,
   scale: Option<bevy::render::Extract<bevy::ecs::system::Res<RenderScale>>>,
-  pick: Option<bevy::render::Extract<bevy::ecs::system::Res<ViewProbeDbgPick>>>,
 ) {
   let Some(cfg) = cfg else { return };
   let debug_mode = debug.map(|d| d.0).unwrap_or(0);
   let render_h = scale.map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
-  let mut uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, render_h);
-  // 采样调试的拾取目标（体素 + 入面法线）；未命中或未开启时 w = 0。
-  if let Some(p) = pick.filter(|p| p.valid) {
-    uniform.probe_dbg = Vec4::new(p.voxel.x as f32, p.voxel.y as f32, p.voxel.z as f32, 1.0);
-    uniform.probe_dbg_n =
-      Vec4::new(p.normal.x as f32, p.normal.y as f32, p.normal.z as f32, 0.0);
-  }
+  let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, render_h);
   commands.insert_resource(uniform);
 }
 
@@ -1512,7 +1530,7 @@ pub(crate) fn init_dda_pipelines(
   // （dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
   let dda_shader = dda_shader.0.clone();
   let layouts =
-    vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::ddgi::ddgi_bg4_layout()];
+    vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::gi::gi_bg4_layout()];
   // `dda_main` 比其它两个入口多一份 group(5)：半分辨率 GI 的采样侧（见 `gi_read`），只加给它。
   let dda_layouts = {
     let mut v = layouts.clone();
@@ -1536,16 +1554,16 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
-  // 半分辨率 GI（菜单开关 `DdgiDebugSettings.gi_half_res`）：
-  // 反投影 + beam 起点 + 主 trace + ddgi_sample，写两张 1/2 分辨率缓冲。
+  // 半分辨率 GI（菜单开关 `GiSettings.half_res`）：
+  // 反投影 + beam 起点 + 主 trace + 读 GI 缓存，写两张 1/2 分辨率缓冲。
   // group0 用瘦版（不含 GI 采样视图），并多一个 BG5；layout 索引必须是 0..=5 的前缀。
   let gi_layouts = vec![
     bg0_gi.clone(),
     bg1.clone(),
     bg2.clone(),
     bg3.clone(),
-    crate::ddgi::ddgi_bg4_layout(),
-    crate::ddgi::ddgi_bg5_layout(),
+    crate::gi::gi_bg4_layout(),
+    crate::gi::gi_bg5_layout(),
   ];
   let gi = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_gi")),
@@ -1568,20 +1586,6 @@ pub(crate) fn init_dda_pipelines(
     layout: eye_layouts.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("eye_adapt_update")),
-    ..default()
-  });
-  let probe_viz = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_probe_viz")),
-    layout: layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("probe_viz_main")),
-    ..default()
-  });
-  let probe_dbg = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_probe_dbg")),
-    layout: layouts,
-    shader: dda_shader,
-    entry_point: Some(Cow::from("probe_dbg_main")),
     ..default()
   });
 
@@ -1625,8 +1629,6 @@ pub(crate) fn init_dda_pipelines(
     compute_pipeline: compute,
     beam_pipeline: beam,
     gi_pipeline: gi,
-    probe_viz_pipeline: probe_viz,
-    probe_dbg_pipeline: probe_dbg,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
     blit_pipeline,
@@ -1646,14 +1648,13 @@ pub(crate) fn prepare_dda_bind_groups(
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
-  ddgi_gpu: Option<Res<crate::ddgi::DdgiGpu>>,
-  dbg: Option<Res<crate::ddgi::DdgiDebugSettings>>,
   lighting: Option<Res<LightingTheme>>,
   light_gpu: Option<ResMut<LightPoolGpu>>,
   render_device: Res<RenderDevice>,
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
   scale: Res<RenderScale>,
+  gi_settings: Option<Res<crate::gi::GiSettings>>,
   mut beam_cache: ResMut<AuxTexCache>,
 ) {
   let Some(images) = images else {
@@ -1673,17 +1674,7 @@ pub(crate) fn prepare_dda_bind_groups(
     return;
   };
 
-  let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
-  // probe 可视化参数：x = 世界空间探针总槽数（全部 LOD 的探针网格）；y = 方块边长 3px；
-  // z = 要画的 LOD 下标（0..DDGI_LODS-1）；≥ DDGI_LODS = 全画；w = 0
-  if let Some(g) = ddgi_gpu.as_ref() {
-    let total = g.total_slots;
-    let sel = dbg
-      .map_or(0.0, |d| d.probe_viz_lod)
-      .clamp(0.0, crate::ddgi::DDGI_LODS as f32);
-    view.probe_viz_params = Vec4::new(total as f32, 3.0, sel, 0.0);
-  }
-  let mut u = UniformBuffer::from(view);
+  let mut u = UniformBuffer::from(*view_uniform);
   u.write_buffer(&render_device, &queue);
 
   let bg0_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_layout);
@@ -1739,9 +1730,50 @@ pub(crate) fn prepare_dda_bind_groups(
     beam_cache.gi_tex = Some(gi_tex);
     beam_cache.gi_cov = Some(gi_cov);
     beam_cache.gi_size = gi_size;
+    // 屏幕空间路径的 reservoir 双缓冲（每像素 `GI_RES_WORDS` 个 u32）：随分辨率重建，
+    // 新 buffer 由 wgpu 清零 ⇒ `M = 0`（无历史）⇒ 换分辨率后第一帧只走新鲜路径。
+    let res_bytes = gi_size.x as u64 * gi_size.y as u64
+      * crate::wesl_consts::gi_consts().gi_res_words as u64
+      * 4;
+    let make_res = |label: &str| {
+      render_device.create_buffer(&BufferDescriptor {
+        label: Some(label),
+        size: res_bytes.max(4),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+      })
+    };
+    beam_cache.gi_res_a = Some(make_res("gate_gi_res_a"));
+    beam_cache.gi_res_b = Some(make_res("gate_gi_res_b"));
+    // ---- 降噪资源（随 GI 分辨率一起重建；新建 buffer/纹理由 wgpu 清零 ⇒ 历史 M = 0 = 无历史）----
+    let c = crate::wesl_consts::gi_consts();
+    let px = gi_size.x as u64 * gi_size.y as u64;
+    let make_buf = |label: &str, bytes: u64| {
+      render_device.create_buffer(&BufferDescriptor {
+        label: Some(label),
+        size: bytes.max(4),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+      })
+    };
+    beam_cache.gi_guide = Some(make_buf("gate_gi_guide", px * c.gi_den_guide_words as u64 * 4));
+    beam_cache.gi_hist = [
+      Some(make_buf("gate_gi_hist_a", px * c.gi_den_hist_words as u64 * 4)),
+      Some(make_buf("gate_gi_hist_b", px * c.gi_den_hist_words as u64 * 4)),
+    ];
+    beam_cache.gi_phi = Some(make_buf("gate_gi_den_phi", px * 4));
+    for (i, label) in
+      ["gate_gi_dn_tmp", "gate_gi_dn_a", "gate_gi_dn_b", "gate_gi_den"].iter().enumerate()
+    {
+      let t = make(label, TextureFormat::Rgba16Float);
+      beam_cache.gi_dn_src[i] = Some(t.create_view(&TextureViewDescriptor::default()));
+      beam_cache.gi_dn_dst[i] = Some(t.create_view(&TextureViewDescriptor::default()));
+      beam_cache.gi_dn[i] = Some(t);
+    }
   }
-  let gi_view = beam_cache.gi_view.as_ref().expect("gi view not created");
-  let gi_cov_view = beam_cache.gi_cov_view.as_ref().expect("gi cov view not created");
+  // clone 成句柄（`TextureView` 内部是 Arc）：之后还要可变借 `beam_cache` 写入 bind group 字段。
+  let gi_view = beam_cache.gi_view.as_ref().expect("gi view not created").clone();
+  let gi_cov_view = beam_cache.gi_cov_view.as_ref().expect("gi cov view not created").clone();
 
   // ---- BG0：out tex write + view uniform + beam depth rw ----
   // 眼睛适应状态/直方图 buffer（word 布局见 bindings.wesl 的 `eye_adapt`）：同一 buffer 两处绑定 ——
@@ -1804,16 +1836,66 @@ pub(crate) fn prepare_dda_bind_groups(
   );
   // group(5) 的 GI 采样侧（只进 `dda_main` 的 pipeline layout）：绑定号 4/5，给显式 entry 数组
   // —— `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 4 开始"。
+  // binding 4 绑的是**降噪后**的那张（atrous 链的最终输出，`gi_dn[3]`），语义与原始 `gi_out` 完全
+  // 一致（rgb = gi·valid、a = valid）；原始 `gi_out` 仍在（`gi_main` 写、时域读），保留作对照。
+  // binding 5 仍是 `gi_cov_out` 原样（cov 是 0/1 覆盖度，不参与降噪）。
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
+  let gi_den_view = beam_cache.gi_dn_src[3].as_ref().expect("降噪输出视图未创建").clone();
   let gi_read_bg = render_device.create_bind_group(
     None,
     &gi_read_layout,
     &[
-      BindGroupEntry { binding: 4, resource: BindingResource::TextureView(gi_view) },
-      BindGroupEntry { binding: 5, resource: BindingResource::TextureView(gi_cov_view) },
+      BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
+      BindGroupEntry { binding: 5, resource: BindingResource::TextureView(&gi_cov_view) },
     ],
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
+
+  // ---- GI 降噪的 bind group：时域 1 个 + atrous 5 个（src→dst 组合，见 `DEN_ATROUS_CHAINS`）----
+  // 每帧重建（纹理/buffer 都是持久句柄，只是换绑）；`den_flip` 决定历史哪块是「上帧读」。
+  // 只在真正会跑降噪时翻转 `den_flip`（与 `res_flip` 同一套语义）。
+  let den_runs = gi_settings.as_ref().is_some_and(|g| g.enabled && g.half_res);
+  let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
+  {
+    let guide = beam_cache.gi_guide.as_ref().expect("导引 buffer 未创建").clone();
+    let phi = beam_cache.gi_phi.as_ref().expect("φ buffer 未创建").clone();
+    let hist_prev = beam_cache.gi_hist[prev_i].as_ref().expect("历史 buffer 未创建").clone();
+    let hist_cur = beam_cache.gi_hist[cur_i].as_ref().expect("历史 buffer 未创建").clone();
+    let dn_src: Vec<TextureView> =
+      beam_cache.gi_dn_src.iter().map(|v| v.as_ref().expect("降噪纹理未创建").clone()).collect();
+    let dn_dst: Vec<TextureView> =
+      beam_cache.gi_dn_dst.iter().map(|v| v.as_ref().expect("降噪纹理未创建").clone()).collect();
+    let temporal_layout =
+      pipeline_cache.get_bind_group_layout(&crate::gi::gi_den_temporal_layout());
+    let atrous_layout = pipeline_cache.get_bind_group_layout(&crate::gi::gi_den_atrous_layout());
+    beam_cache.den_bg[0] = Some(render_device.create_bind_group(
+      None,
+      &temporal_layout,
+      &[
+        BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
+        BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&gi_view) },
+        BindGroupEntry { binding: 12, resource: hist_prev.as_entire_binding() },
+        BindGroupEntry { binding: 13, resource: hist_cur.as_entire_binding() },
+        BindGroupEntry { binding: 16, resource: BindingResource::TextureView(&dn_dst[0]) },
+        BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },
+      ],
+    ));
+    for (k, [s, d]) in DEN_ATROUS_CHAINS.iter().enumerate() {
+      beam_cache.den_bg[k + 1] = Some(render_device.create_bind_group(
+        None,
+        &atrous_layout,
+        &[
+          BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
+          BindGroupEntry { binding: 14, resource: BindingResource::TextureView(&dn_src[*s]) },
+          BindGroupEntry { binding: 15, resource: BindingResource::TextureView(&dn_dst[*d]) },
+          BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },
+        ],
+      ));
+    }
+  }
+  if den_runs {
+    beam_cache.den_flip = !beam_cache.den_flip;
+  }
   // GI pass 的 @group(0)（瘦版 layout）：绑定号是 1/2（与完整版对齐），给显式 entry 数组。
   // `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 1 开始"。
   // 不绑 GI 采样视图是硬性要求：同一 pass 内同一张纹理不能既作采样又作存储。
@@ -1903,11 +1985,11 @@ pub(crate) fn dispatch_dda(
   bg1: Option<Res<DdaBg1BindGroup>>,
   bg2: Option<Res<DdaBg2BindGroup>>,
   bg3: Option<Res<DdaBg3BindGroup>>,
-  bg4: Option<Res<crate::ddgi::DdgiBg4>>,
-  bg5: Option<Res<crate::ddgi::DdgiBg5>>,
+  bg4: Option<Res<crate::gi::GiBg4>>,
+  bg5: Option<Res<crate::gi::GiBg5>>,
   eye: Option<Res<EyeAdaptGpu>>,
-  gpu: Option<Res<crate::ddgi::DdgiGpu>>,
-  dbg: Option<Res<crate::ddgi::DdgiDebugSettings>>,
+  gi: Option<Res<crate::gi::GiSettings>>,
+  gi_gpu: Option<Res<crate::gi::GiGpu>>,
   aux: Option<Res<AuxTexCache>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
@@ -1950,10 +2032,8 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-  // ---- 半分辨率 GI（菜单开关）：排在主 pass 之前（主 pass 采样它的输出）----
-  // 自门控：shader 里 `flags.y < 0.5 || misc.x < 0.5` 直接 return ⇒ 关掉时只付一次空 dispatch。
-  // 诊断配色档（mode > 0.5）主 pass 强制走内联采样 ⇒ 这里也不必跑。
-  if dbg.as_ref().is_some_and(|d| d.gi_half_res && d.mode < 0.5)
+  // ---- 半分辨率 GI（菜单开关 `GiSettings.half_res`）：排在主 pass 之前（主 pass 采样它的输出）----
+  if gi.as_ref().is_some_and(|g| g.enabled && g.half_res)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_bg0) = aux.gi_bg0.as_ref()
     && let Some(bg5) = bg5.as_ref()
@@ -1971,6 +2051,50 @@ pub(crate) fn dispatch_dda(
       pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     });
+  }
+
+  // ---- GI 降噪（时域 → 迭代 atrous）：必须紧跟 `gi_main`、排在主 pass 之前 ----
+  // `dda_main` 的 group(5) binding 4 绑的就是这条链的最终输出（`gi_dn[3]`）。
+  if gi.as_ref().is_some_and(|g| g.enabled && g.half_res)
+    && let Some(aux) = aux.as_ref()
+    && let Some(gi_gpu) = gi_gpu.as_ref()
+  {
+    let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
+    let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+    let n = crate::wesl_consts::gi_consts().gi_den_atrous_iter.clamp(1, 3) as usize;
+    let rounds = &DEN_ATROUS_ROUNDS[n - 1];
+    if let Some(bg) = aux.den_bg[0].as_ref()
+      && let Some(pipe) =
+        gi_gpu.den_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+    {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_gi_denoise_temporal",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(0, bg, &[]);
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
+    for i in 0..n {
+      let Some(bg) = aux.den_bg[rounds[i] + 1].as_ref() else {
+        continue;
+      };
+      let Some(pipe) =
+        gi_gpu.den_pipelines[i + 1].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      else {
+        continue;
+      };
+      let label =
+        ["gate_gi_denoise_atrous1", "gate_gi_denoise_atrous2", "gate_gi_denoise_atrous4"][i];
+      crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), label, |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+      });
+    }
   }
 
   // ---- 主 DDA pass：trace + unlit 着色直出 ----
@@ -2026,48 +2150,6 @@ pub(crate) fn dispatch_dda(
         for i in 0..8u32 {
           pass.set_bind_group(i, eye_bg, &[]);
         }
-        pass.dispatch_workgroups(1, 1, 1);
-      },
-    );
-  }
-
-  if dbg.as_ref().is_some_and(|d| d.probe_viz)
-    && let Some(ddgi) = gpu.as_ref()
-    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline)
-  {
-    let probe_count = ddgi.total_slots;
-    crate::profiler::gpu_compute_pass(
-      &mut profiler,
-      ctx.command_encoder(),
-      "gate_probe_viz",
-      |pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &bg0.0, &[]);
-        pass.set_bind_group(1, &bg1.0, &[]);
-        pass.set_bind_group(2, &bg2.0, &[]);
-        pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, &bg4.0, &[]);
-        let wg = probe_count.div_ceil(64);
-        pass.dispatch_workgroups(wg, 1, 1);
-      },
-    );
-  }
-
-  // ---- 采样调试：鼠标下体素的 8 个采样 probe + 到采样点的连线（单线程 pass）----
-  if dbg.as_ref().is_some_and(|d| d.probe_dbg)
-    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_dbg_pipeline)
-  {
-    crate::profiler::gpu_compute_pass(
-      &mut profiler,
-      ctx.command_encoder(),
-      "gate_probe_dbg",
-      |pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &bg0.0, &[]);
-        pass.set_bind_group(1, &bg1.0, &[]);
-        pass.set_bind_group(2, &bg2.0, &[]);
-        pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, &bg4.0, &[]);
         pass.dispatch_workgroups(1, 1, 1);
       },
     );

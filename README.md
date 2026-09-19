@@ -1,7 +1,7 @@
 # GATE — GPU-Accelerated Tile Engine
 
-> GPU 稀疏体素（Douglas Brick Tree，256³ chunk）+ 计算着色器层次 DDA 光追 + 世界锚定 DDGI 全局光照 + 自研 bevy_ui 工具链。
-> **当前分支 `wip/ddgi-v1`**：DDGI v1 / 光照场（AO）/ 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
+> GPU 稀疏体素（Douglas Brick Tree，256³ chunk）+ 计算着色器层次 DDA 光追 + 世界空间 GI（逐 (体素,面) 辐照度缓存）+ 自研 bevy_ui 工具链。
+> **当前分支 `restir-gi`**：GI 缓存 / 光照场（AO）/ 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
 
 ---
 
@@ -45,20 +45,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
 | **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
 | **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass；局部 AABB slab 剔除 |
-| **DDGI** | ✅ 生产可用 | 5 级嵌套级联（cell 4/16/32/64/128 voxel）：LOD0（最细）只覆盖「细结构」命中的 16³ 砖、按砖领 64 槽段；LOD1 按 chunk 从探针池领固定段，LOD2~4 锚定世界 AABB；探针放在「最大全空叶」中心；每探针 4×4 辐照度 + 8×8 深度（均值/方差/更新数）图集，时域 EMA + 6 邻域空间混合 + Chebyshev 软遮挡；活跃探针 worklist + indirect `cast`/`collect`；增量重烘只覆盖 dirty AABB 命中的 cell |
+| **GI（逐 (体素,面) 辐照度缓存）** | ✅ 生产可用 | 世界空间、相机无关的间接光存储：键 = (体素坐标, 面, 物体)，**面**在键里 ⇒ 薄板两侧天然是两个条目、不跨面插值 ⇒ 不漏光；取值 = 命中体素**自己**的条目（不插值）⇒ 没有级联接缝。存储 = 哈希网格 + 开放寻址按需创建（1M 条目 / 8M 桶），无 atlas / 段池 / 认领位图 / LOD。更新 = `gi_cache_update` 每帧整表轮转 64K 条目，每条目发余弦加权真实光路 + 二次顶点 NEE（回读 + 直射太阳），运行时平均（`E ← E + (c−E)/(n+1)`）⇒ 收敛后确定、无屏幕噪声；新条目从同面同平面 4 邻播种。 |
 | **光照场（AO）** | ✅ 生产可用 | 相机中心、世界锚定的 32³ × 16 voxel 网格（`Rgba16Unorm`，硬件三线性），.a = AO fill 直接乘进命中着色；发光走「命中直出自身颜色 + 进 GI」，不再走发光密度通道 |
 | **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
 | **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
-| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除；球 / 立方笔触按 brick 粒度整块写入（整块全在笔触内 → 一次 O(深度) 写，落成 uniform 上级节点）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传 + DDGI 重烘 + 光照场重算；`EDIT[place\|erase]` 日志 |
+| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除；球 / 立方笔触按 brick 粒度整块写入（整块全在笔触内 → 一次 O(深度) 写，落成 uniform 上级节点）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传 + 光照场重算；`EDIT[place\|erase]` 日志 |
 | **渲染管线** | ✅ 生产可用 | **无 render node**：extract / prepare / dispatch / blit 全部系统级显式调度；`blit.wgsl` 双入口 `fs_main` / `fs_fxaa`（FXAA 3.11 移植）；半分辨率 `RenderScale` + 线性上采样；MSAA 强制关闭 |
-| **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界**（DDGI AABB / LOD0 chunk 集 / 光照场随之重建） |
+| **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界**（光照场随之重建） |
 | **世界标签** | ✅ 生产可用 | `WorldAnchor`：世界坐标 → 屏幕像素 UI 标签（距离缩放、CJK 字体延迟解析） |
 | **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本 |
 
 ### 已知限制 / 待办（不阻塞当前开发）
 
 - **没有自动化测试与 CI**：workspace 0 个 `#[test]`（仅 `vendor/parley` 除外），回归靠手工验收 + 日志。
-- **文档缺口**：代码注释引用的 `docs/brickmap.md`、`docs/decisions.md`（ADR-0001/0002/0005）、`docs/ui-dark-theme.md` 尚未落盘；`docs/` 目前只有 Douglas 开发日志转录（`docs/douglas/`）与 DDGI 截图（`docs/screenshots/`）。
+- **文档缺口**：代码注释引用的 `docs/brickmap.md`、`docs/decisions.md`（ADR-0001/0002/0005）、`docs/ui-dark-theme.md` 尚未落盘；`docs/` 目前只有 Douglas 开发日志转录（`docs/douglas/`）与早期光照截图（`docs/screenshots/`）。
 - **正式 sim tick 未实现**：StateTable 只有数据通路与上传，没有逐帧模拟系统驱动它。
 - **WorldAnchor 不做体素遮挡判断**（永远绘制在最上层）。
 - **`assets/lighting/dark_lab.ron` 暂无代码引用**：当前只加载 `day_outdoor.ron`。
@@ -71,25 +71,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 [Bevy 主 world]
   Startup : scene::setup —— 读 lighting/*.ron、建 VolumeGrid（默认 vox / demo 程序化，见 consts）、
-            算 DDGI 世界 AABB + chunk 段集、初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
+            初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
   Update  : 相机链（模式对齐 → 转头 → 各模式输入 → 拾取 → build_camera_config）→ 体素编辑
             → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
   Last    : poll_pending —— UploadBudget（4MB/帧）× DirtyTracker → MainPending
       ↓ ExtractSchedule（main → render world）
   extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB) + LightFieldUpdate
   extract_camera : DdaCameraConfig → DdaViewUniform
-  extract_ddgi   : DdgiStage / DdgiDebugSettings / DdgiWorldAabb / DdgiChunkSet / 曝光活参数
+  extract_gi     : GiSettings（GI 开关 / 半分辨率）+ 曝光活参数
       ↓ render world
-  RenderStartup    : init_dda_pipelines / init_empty_gpu / init_ddgi_gpu / queue_ddgi_pipelines
+  RenderStartup    : init_dda_pipelines / init_empty_gpu / init_gi_gpu / queue_gi_pipelines
   PrepareResources : prepare_upload（struct/palette/comp/state/grid_descs + 光照场 3D 纹理 + 扩容）
-  PrepareBindGroups: prepare_dda_bind_groups → prepare_ddgi
+  PrepareBindGroups: prepare_dda_bind_groups → prepare_gi
   RenderGraph::Render（dispatch 顺序）:
-      ddgi_bake0..3（细→粗，pass 边界即屏障）→ ddgi_sort → ddgi_seal
-      → ddgi_cast（indirect）→ ddgi_collect（indirect，网格跨越）
+      gi_cache_update（可见优先 + 整表轮转：真实光路 + 二次顶点 NEE + 运行时平均）
       → beam（1/4 分辨率最近命中断面预 pass）
       → gi（半分辨率 GI 预 pass，可开关）
       → dda_main（主可见 pass，trace + 着色 → out_tex）
-      → eye_histogram + eye_update（自动曝光）→ probe_viz（可选）
+      → eye_histogram + eye_update（自动曝光）
   Core2d::PostProcess: blit_dda_view（fs_main | fs_fxaa，线性上采样 + sRGB cancel → ViewTarget）
 ```
 
@@ -100,8 +99,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 2. **方向可达掩码 LUT（b_leaves，Douglas #18）**：8 octant × 64 入口格 × 2 字的保守可达集，
    `occupancy & reach` 在进入子块前剔除；LUT 是真实可达集的**超集**，绝不漏命中。
 3. **beam 预 pass**：1/4 分辨率先求「最近命中 t」，主 pass 从该 t 起步 —— 近场空空间不产生步进。
-4. **世界锚定 DDGI**：探针槽位 = 世界 cell mod dims（LOD2~4）/ chunk 固定段（LOD1）/ 16³ 砖固定段（LOD0），
-   相机移动不换主、不闪烁；编辑只重烘 dirty AABB 命中的 cell。DDGI 段基址**一经分配不再改变**（基址变 = 图集整段错位）。
+4. **世界空间 GI 缓存**：条目键 = (体素坐标, 面, 物体)，世界锚定 ⇒ 相机移动不换主、不闪烁；
+   取值 = 命中体素自己的条目、不插值 ⇒ 没有级联接缝；面在键里 ⇒ 薄板/墙缝不漏光。
+   更新 = 可见优先（着色侧 `atomicExchange` 精确 claim + append 紧凑列表，数量超线程数时取轮换窗口）
+   ＋ 按帧号整表轮转（`GI_CACHE_SLOTS / 预算` 帧扫完一遍）⇒ 无跨帧游标、无竞态、丢帧不漏更新；
+   变化失效 = 世代号（太阳/天光/palette/世界全量）＋ N 个世界 voxel 脏盒（主世界 + 物体 volume）。
 5. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
 6. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
    关掉 FXAA 时只是换一条 fragment 入口，无分支代价。
@@ -135,10 +137,12 @@ gate-render/       渲染与 wire 契约（CPU 侧；GPU 状态全部在 render 
                                    多 volume trace）、OrbitCamera / DdaCameraConfig、RenderScale /
                                    PostFxSettings / EyeAdaptSettings、全部 BG layout + pipeline +
                                    prepare_dda_bind_groups / dispatch_dda / blit_dda_view
-                   - ddgi.rs        世界网格 / chunk 段池 / DdgiUniform / bake·sort·seal·cast·collect 调度
+                   - gi.rs          GI 缓存（GiUniform / GiSettings / GiGpu / BG4·BG5 布局 /
+                                   prepare_gi / dispatch_gi：世代 + 脏盒失效、可见 claim、
+                                   整表轮转更新 pass 的调度）
                    - lighting.rs    LightingTheme（RON）+ LightPoolUniform wire 契约（BG3）
                    - shader.rs      启动时 wesl-rs 编译 WESL 包 → Bevy Shader 资产
-                   - wesl_consts.rs 从 .wesl 源码解析跨语言 u32/f32 常量（DDGI 等的**唯一权威**），启动 fail-fast
+                   - wesl_consts.rs 从 .wesl 源码解析跨语言 u32 常量（GI 缓存容量等的**唯一权威**），启动 fail-fast
                    - profiler.rs    wgpu-profiler / Tracy 集成（feature = "profile"；非该 feature 为零成本壳）
                    - responsive.rs  窗口 resize → 渲染目标原地重建 + RenderScale 跟随
                    - paths.rs       install_root / assets_dir / logs_dir / data_dir
@@ -157,8 +161,7 @@ gate-ui/           自研 bevy_ui 组件库 + 调试菜单 + 世界标签
 
 gate-app/          Demo 应用入口
                    - main.rs       插件装配、窗口/日志/i18n 初始化、系统注册、环境变量开关
-                   - scene.rs      setup + 程序化极限场景 build_demo_scene + reload_world 换世界 +
-                                   chunk_needed_chunks（DDGI chunk 级段分配集）
+                   - scene.rs      setup + 程序化极限场景 build_demo_scene + reload_world 换世界
                    - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / cursor_ray / 拾取 recenter
                    - edit.rs       EditSettings + BrushShape/BrushMaterial + raycast_main + 笔触施加与输入
                    - vox_scene.rs  MagicaVoxel .vox 导入（vox-rs）+ scan_vox_models 模型发现
@@ -168,7 +171,7 @@ gate-app/          Demo 应用入口
 
 assets/            运行期只读资源（与可写 logs//data/ 分离，见 gate-render/src/paths.rs）
                    - shaders/    blit.wgsl + voxel_raytrace/ WESL 包（main.wesl 入口 + bindings /
-                                 common / brickmap / trace / world / lightfield / ddgi/*，
+                                 common / brickmap / trace / world / lightfield / gi/*，
                                  启动时读盘编译，改 shader 需重启）
                    - ui/         theme.ron 暗色主题令牌；debug_menu.toml 菜单初始值
                    - locales/    zh-CN.yml（编译期 codegen 进二进制，运行期不读）
@@ -192,9 +195,9 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 
 | 符号 | 值 | 含义 |
 |---|---|---|
-| `CHUNK_SIZE` | 256 voxel（= 5.12m） | chunk 边长；存储 / dirty / DDGI 段分配的共同粒度 |
+| `CHUNK_SIZE` | 256 voxel（= 5.12m） | chunk 边长；存储 / dirty 的共同粒度 |
 | `BRICK_FACTOR` | 4 | 分裂因子：每节点 4³ = 64 子块 |
-| `MAX_LEVEL` / `LEVEL_EXTENT` | 4 / `[256, 64, 16, 4, 1]` | 树层级边长（voxel）；level 2 = 16³ 组件 / DDGI cell 粒度 |
+| `MAX_LEVEL` / `LEVEL_EXTENT` | 4 / `[256, 64, 16, 4, 1]` | 树层级边长（voxel）；level 2 = 16³ 组件粒度 |
 | `PALETTE_ENTRY_COUNT` / `PALETTE_BITS` | 65536 / 16 | 材质索引位宽（`0 = AIR`），索引上限 65535 |
 | `PaletteEntry` | 8 B | color\[3\] + roughness + emissive + transmission + flags（`#[repr(C)]`，整表 512KB/volume） |
 | `LEAF_INLINE_WORDS` / `LEAF_VOXELS_PER_WORD` | 32 / 2 | level 3 叶父层 inline 存储：32 字，每字 2 个 16 位半字 |
@@ -211,45 +214,57 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | `PALETTE_WORDS` | 131072 | 调色板字数（2^16 × 2 u32）/volume |
 | `MARCH_MASK_*` | 8 octant × 64 入口 × 2 字 = 1024 字 | 方向可达掩码 LUT（b_leaves，4KB） |
 
-### 渲染 / DDGI / 光照场
+### 渲染 / GI / 光照场
 
 | 符号 | 值 | 含义 |
 |---|---|---|
 | `VIEW_SIZE` | 1280×720 | 初始渲染分辨率（窗口内部分辨率 = 物理像素 ÷ `RenderScale.factor`） |
-| DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` 工作组边长（须与 WESL 一致） |
+| DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` 工作组边长（须与 WESL 一致）；`gi_cache_update` 为 64 |
 | beam / GI 分辨率 | 1/4 / 1/2 | beam depth 纹理；半分辨率 GI 缓冲（premultiplied valid 格式） |
-| DDGI 级联 | 5 级，cell `[4, 16, 32, 64, 128]` voxel | 严格嵌套（LOD0 例外：逐砖覆盖、不参与扣洞）；世界 AABB 外扩 `DDGI_GRID_MARGIN = 16` voxel |
-| LOD0 瓦片段 | 8 槽/瓦片（8³ voxel） | 段在运行时认领：着色时各级都拿不到有效样点 → 认领该点所在瓦片（`helpers.wesl::ddgi_lod0_claim`）；Rust 只按容量预留槽位并建瓦片表。`ddgi_bake0` **每帧都派发**（认领只改段表、动不到网格/修订号，「变化才烘」捞不到新领的段） |
-| chunk 段 | 4096 槽/chunk（LOD1） | `(256/16)³`；池高水位定容，段基址分配后不变 |
-| DDGI 图集 | 4×4 irr + 8×8 depth / 探针 | 每层 40² 探针（`DDGI_PROBES_PER_LAYER_AXIS`），296 层 |
-| `DDGI_RAY_BUDGET` | 65536 射线/帧 | 摊给活跃探针（worklist 驱动 indirect dispatch） |
-| 刷新周期 / 跳过年龄 | `(65, 97, 129, 161)` / `(32, 24, 16, 12)` | 逐 LOD 的探针刷新节奏（WESL `ddgi/consts.wesl`）；下标 = `ddgi_lod_param_idx(lod)`，LOD0 与 LOD1 同档 |
+| `GI_CACHE_SLOTS` | 1,048,576 条目 | 条目表容量（每条 `GI_CACHE_ENTRY_WORDS` × 4B = 72B ⇒ 72MB）；满则不再新建条目 |
+| `GI_CACHE_BUCKETS` | 8,388,608 桶 | 哈希网格桶数（2 的幂，×4B = 32MB）；桶内存「条目下标 + 1」，0 = 空 |
+| `GI_CACHE_ENTRY_WORDS` | 18 | 条目布局：`[0,1]` 键、`[2,4]` 世界位置、`[5]` 世界法线（八面体 f16x2）、`[6,8]` E、`[9]` 已累积样本数、`[10]` 最近**处理**（更新/轮转，同帧去重用）的帧、`[11]` 世代号、`[12]` reservoir 方向、`[13,15]` reservoir 样本的 L、`[16]` reservoir `w_sum`、`[17]` reservoir 候选数 M |
+| `GI_CACHE_RAYS` | 2 | 每条目每帧发射的**新鲜**余弦加权半球射线数 |
+| `GI_CACHE_REUSE` | 2 | 每条目每帧额外的**借用**射线数（RIS 复用：借同平面邻条目 reservoir 的方向，从本条目重发） |
+| `GI_CACHE_M_CAP` | 32 | RIS 候选数上限 M：超过则把 `w_sum` 与 M 同比例缩回（`w_sum / M` 不变），抑制历史对抽样的支配 |
+| `GI_CACHE_UPDATE_BUDGET` | 65536 条目/帧 | 更新 pass 线程数（可见段 + 轮转段的总预算） |
+| `GI_CACHE_VISIBLE_CAPACITY` | 1,048,576 项 | 可见条目紧凑列表容量（×4B = 4MB）；着色侧 claim 后 append、更新 pass 消费，溢出即丢弃 |
+| `GI_CACHE_DIRTY_BOXES` | 8 | 单帧生效的脏盒数上限（主世界 + 各物体 volume 的编辑各一盒）；超出退化为「自增世代」全量失效 |
+| `GI_CACHE_PROBE` | 8 | 开放寻址最大探测步数 |
+| `GI_CACHE_RAY_BIAS` | 0.5 voxel | 更新射线起点沿条目法线的外推（防第一步撞自己） |
 | 光照场 | 32³ cell × 16 voxel | `Rgba16Unorm` 3D 纹理，.a = AO fill；世界覆盖 512 voxel = ±5.12m |
 | `SHADOW_SURFACE_EPS` | 1/32 voxel | 阴影/二次射线起点沿法线外推（防自命中，与 WGSL 同步） |
 
-### 4.1 LOD0 认领与"黑点"相关的可调项（都在 `ddgi/consts.wesl`）
+### 4.1 GI 着色 / 光路旋钮（都在 `gi/consts.wesl`）
 
 | 符号 | 值 | 含义 |
 |---|---|---|
-| `DDGI_CLAIM_CAVITY` | 16 | **认领主触发（几何）**：法线之外的两个轴上，至少一个方向的空腔宽度落在 `[3, 本值]` ⇒ 认领该点瓦片。16 = 一个 chunk cell（粗级格子表达不了比自己更窄的空腔）；开阔地形/大厅不认领，1~2 voxel 缝也不认领。0 = 关闭认领 |
-| `DDGI_CLAIM_SCAN_MASK` | 1023 | 认领的**稀疏扫描**：几何判定只对 `1/(本值+1)` 的像素做（空间哈希 ^ 帧号，逐帧轮转），认领本身按瓦片幂等。调大可省算力、调小可更快铺满 |
-| `DDGI_CLAIM_WARMUP_FRAMES` | 90 | 启动预热期：brickmap 还没建起来 + 探针没投线，几何判据此刻不可靠。**不改变任何地点是否有资格认领** |
-| `DDGI_CLAIM_RADIUS` | 192 | 只认相机半径内的瓦片（细级只对近处可见细节有意义）；0 = 不限 |
-| `DDGI_DARK_FLOOR` / `_COV` | 0.01 / 0.5 | "被几何完全包住"（`cov ≥ _COV` 且 `wsum ≈ 0`）时的极暗地板，把纯黑抬成极暗灰；采样成功但值就是 0 的无光室内**不受影响** |
-| `DDGI_LOD0_SEAM_COV` | 1.0 | LOD0→chunk 级接缝混合带：按 LOD0 严格采样的覆盖度朝 chunk 级混合 |
-| `DDGI_CAST_SUN` | 1.0 | 探针射线命中面的**直射太阳**项（GI 唯一的直射光源）；0 = 整段折掉、连阴影射线都不发 |
+| `GI_PI` | 3.14159265 | 辐照度 ↔ 辐亮度换算（缓存存 `E`，着色侧乘增益后除 π） |
+| `GI_T_MAX` | 8192 voxel | 更新射线 / 阴影射线的 t 上限 |
+| `GI_SKY_RADIANCE_SCALE` | 1.0 | 更新射线 miss（逃逸到天空）时注入的天空辐亮度系数 |
+| `GI_SUN_BOUNCE` | 1.0 | 更新射线命中面的**直射太阳**项增益（GI 唯一的直射光源）；0 = 整段折掉、连阴影射线都不发 |
+| `GI_EMIT_GAIN` | 1.0 | 命中自发光体素时的辐亮度增益 |
+| `GI_SKY_AMBIENT` | 0.05 | 天光环境项：缓存没有数据（`cov = 0`）时的兜底强度 |
+| `GI_AMBIENT_FLOOR` | 0.01 | 天光地板：`cov = 1`（有数据）时保留 k 倍 —— `amb = sky · GI_SKY_AMBIENT · mix(1.0, k, cov)` |
+| `GI_CACHE_VISIBLE_SHARE` | 50（%） | 更新预算里「可见优先」占比（50 = 1/2）：先处理着色侧上一帧 claim + append 的可见条目（数量超过可见段线程数时取轮换窗口：起点 `(frame × vis_threads) % cnt`）；置 0 关闭（全部走轮转） |
+| `GI_CACHE_CONVERGED_N` | 64 | 「已收敛」阈值（`n ≥ 本值`）：**可见段与轮转段**都每 4 帧才更新一次；旧世代/脏区条目 `n` 被重置 ⇒ 永远优先且不降频 |
+| `GI_CACHE_DIRTY_MARGIN_VOXELS` | 2 voxel | 脏盒失效余量基准：盒 0（主世界，scale = 1）用它；物体 volume 的盒按 `max(本值, 本值 × scale)` 放大（权威值在 `gi/consts.wesl`，Rust 经 `wesl_consts.rs` 解析） |
 
-三条硬约束：
+两条硬约束：
 
-1. **GI 的直射光源只有两项**：`ddgi_cast` 的太阳项 + 射线逃逸到天空。命中面的 `DDGI_CAST_FLOOR` 必须为 0
-   （否则无光室内再也黑不下来）。删掉太阳项 ⇒ 任何看不到天空的表面（草根、过道内墙）只能自洽维持全黑。
+1. **GI 的直射光源只有两项**：更新射线命中面的太阳项 + 射线逃逸到天空。命中面的入射项与直射项都必须带 1/π
+   （否则"太阳反弹"会比"缓存多弹跳"亮 π 倍，能量不自洽）。删掉太阳项 ⇒ 任何看不到天空的表面
+   （草根、过道内墙）只能自洽维持全黑。
 2. **太阳阴影射线的起点必须跟着色侧同一套外推**（半个 voxel + `SHADOW_SURFACE_EPS`）：只退 1 个 eps 会从
    **命中体素内部**出发，第一步就自命中 ⇒ 该项恒为 0，白耗一根射线。
-3. **极暗地板只在着色路径（`dda_main` / `gi_main`）生效，绝不进 `ddgi_cast`**：否则地板随 GI 递归传播到
-   室内。它也不能用"记账扫描带"（`usage_track`）当标志——那是逐帧轮转的 1/8 像素，会把地板变成条纹。
 
-> **跨语言常量的权威在 WESL 源码**：`gate-render/src/wesl_consts.rs` 启动时解析 `ddgi/consts.wesl` 等文件，
-> Rust 侧不再各留副本（不一致即启动 fail-fast）。改 DDGI 常量请改 `.wesl`。
+> **跨语言常量的权威在 WESL 源码**：`gate-render/src/wesl_consts.rs` 启动时解析 WESL 包 `gi/`
+> （`cache.wesl` 的容量/布局 + `consts.wesl` 的旋钮），Rust 侧不再各留副本（不一致即启动 fail-fast）。
+> 改缓存容量 / 调度比例 / 脏区余量基准请改 `.wesl`。
+
+> **帧号是精确 u32**：`GiUniform.seq.x`（`vec4<u32>`）承载自增帧号，所有整数帧逻辑（轮转起点、
+> 条目 `[10]`「本帧已处理」去重、可见 claim、RNG 种子混入）都只用它 —— 帧号曾以 f32 存在
+> `params.x`，超过 2^24 后 f32 不能表示连续整数，上述判断会偶发失效。`params.x` 保留为恒 0 占位。
 
 ---
 
@@ -262,12 +277,12 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 2. **上传别逐帧硬扛 backlog**：`poll_pending` 在 backlog > 3× 预算时一次性刷新，否则每次 Prepare 被长阻塞。
 3. **树编辑走整块路径**：笔触用 `fill_brick`（O(深度)）而不是逐体素 `set_voxel`（31³ 笔触 = 近 3 万次树下降
    + 沿途 `try_merge`）。
-4. **DDGI chunk 段基址一经分配不再改变**：基址变 = 该 chunk 全部探针换槽位 → 图集整段错位 → 闪烁；
-   释放走空闲链表 LIFO 复用。
+4. **GI 缓存条目容量满即停止新建**：`gi_alloc` 里 `atomicAdd` 出的游标 ≥ `GI_CACHE_SLOTS` 就返回失败
+   （当作"没有条目"），不会越界写。桶是「键先写、桶后 CAS」⇒ 抢输的孤儿条目只会短暂命中不到，不会读错。
 5. **DDA cell 步进必须整数增量维护**：不得用 `floor(origin + dir·t)` 重算（t 恰在边界时 floor 会取到
    穿越前/后的胞 → 对角胞漏检，与 brute-force 不等价）。
 6. **bind group 必须从索引 0 起成前缀设置**：自动曝光两个入口的布局因此重复挂 8 份；
-   半分辨率 GI 的**采样视图**必须挂 group(5)（挂 BG0 会与 collect 的存储写入在同一 pass 撞 usage）。
+   半分辨率 GI 的**采样视图**必须挂 group(5)（同一 pass 内同一张纹理不能既采样又作存储写入）。
 7. **blit 采样器必须 Linear**：半分辨率上采样与 FXAA 亚像素偏移都依赖它；Nearest 会让 FXAA 整体空转
    （现象 = "开了没变化"）。
 8. **UI 指针捕获闸门**：相机拖拽 / 滚轮 / 编辑射线都要查 `UiPointerCaptured` + `MouseIntercepted`，
@@ -287,13 +302,13 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | 文件 | 内容 |
 |---|---|
 | `gate-app/src/consts.rs` | 启动场景 / demo 规模 / 相机（FOV、裁剪面、灵敏度、飞行速度）/ 编辑笔触 / 菜单与展示窗 |
-| `gate-render/src/consts.rs` | 光照增益 / 响应式尺寸 / profiler 周期 / DDGI（阶段、遮挡、网格外扩） |
+| `gate-render/src/consts.rs` | 光照增益 / 响应式尺寸 / profiler 周期 / GI 增益 |
 | `gate-render/src/brickmap/consts.rs` | DDA（分辨率、beam、FOV、诊断开关）/ 上传预算与缓冲策略 |
 | `gate-ui/src/consts.rs` | `UiScale` 自适应基准 |
 | `gate-ui/src/menu/consts.rs` | 菜单容器布局与动画 |
 | `gate-ui/src/widgets/consts.rs` | widget 尺寸与手感 |
 
-- 取值：`const` 直接读（改值后重新编译）。要让某项运行期可调，把它挪进 Bevy 资源（`RenderScale` / `EyeAdaptSettings` / `DdgiDebugSettings` 是现成例子），再由 debug_menu 的节点 + 回调写它。
+- 取值：`const` 直接读（改值后重新编译）。要让某项运行期可调，把它挪进 Bevy 资源（`RenderScale` / `EyeAdaptSettings` / `GiSettings` 是现成例子），再由 debug_menu 的节点 + 回调写它。
 - WESL 侧常量仍是 shader 的权威值（`wesl_consts.rs` 启动时解析同一份源码），不在 Rust `consts.rs` 里重复。
 
 ---
@@ -316,10 +331,10 @@ cargo build --workspace
 **手工验收（`cargo run -p gate-app`）**
 
 - 默认 `nuke.vox` 场景出画；`WASD` 飞行与右键转头流畅；`F3` 菜单显隐正常。
-- 菜单逐项生效：DDGI 开关 / 诊断模式 / 探针可视化 / 半分辨率 GI；半分辨率 / FXAA / 垂直同步；
+- 菜单逐项生效：GI 开关 / 半分辨率 GI；半分辨率 / FXAA / 垂直同步；
   曝光参数（改完 stderr 有 `eye adapt 参数 → GPU` 一行）。
 - 左键放置、右键单击擦除 → stderr 出现 `EDIT[...]` 与 `UPLOAD[incremental]`（增量部分写：`bytes` 远小于全量上传）。
-- 「游戏/世界/重载世界」换模型后画面整块刷新（DDGI / 光照场跟随重建，无残留旧几何）。
+- 「游戏/世界/重载世界」换模型后画面整块刷新（光照场跟随重建，无残留旧几何）。
 - 长时间运行无 1 秒以上的增量上传长耗时（`UPLOAD[incremental]` 的 elapsed 应在毫秒级）。
 
 **性能剖析（可选）**

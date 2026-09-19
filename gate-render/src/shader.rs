@@ -53,7 +53,7 @@ pub fn build_dda_shader(app: &mut App) {
     }
   };
 
-  crate::wesl_consts::ddgi_consts();
+  crate::wesl_consts::gi_consts();
   let handle = app
     .world_mut()
     .resource_mut::<Assets<Shader>>()

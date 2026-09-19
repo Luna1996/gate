@@ -48,49 +48,21 @@ label = "menu.render"
 
 [[items.children]]
 kind = "sub_menu"
-id = "ddgi"
-label = "menu.render.ddgi"
+id = "gi"
+label = "menu.render.gi"
 
 [[items.children.children]]
 kind = "toggle"
 id = "enabled"
-label = "menu.render.ddgi.enabled"
+label = "menu.render.gi.enabled"
 checked = true
-
-[[items.children.children]]
-kind = "switch_group"
-id = "mode"
-label = "menu.render.ddgi.mode"
-options = [
-    "menu.render.ddgi.mode.normal",
-    "menu.render.ddgi.mode.gi",
-    "menu.render.ddgi.mode.wsum",
-    "menu.render.ddgi.mode.domain",
-    "menu.render.ddgi.mode.probe",
-]
-selected = 0
-
-[[items.children.children]]
-kind = "switch_group"
-id = "probe"
-label = "menu.render.ddgi.probe"
-options = [
-    "menu.render.ddgi.probe.none",
-    "menu.render.ddgi.probe.lod0",
-    "menu.render.ddgi.probe.lod1",
-    "menu.render.ddgi.probe.lod2",
-    "menu.render.ddgi.probe.lod3",
-    "menu.render.ddgi.probe.lod4",
-    "menu.render.ddgi.probe.all",
-]
-selected = 0
 
 [[items.children.children]]
 kind = "toggle"
 id = "gi_half"
-label = "menu.render.ddgi.gi_half"
+label = "menu.render.gi.gi_half"
 checked = false
-tooltip = "menu.render.ddgi.gi_half.tip"
+tooltip = "menu.render.gi.gi_half.tip"
 
 [[items.children]]
 kind = "sub_menu"

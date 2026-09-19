@@ -4,7 +4,7 @@
 # 约定：
 # - 键 = 「模块.控件」语义路径，调用点写 t!("模块.控件")
 # - 占位符 %{name} 原样替换；定长对齐的数字由调用点先 format! 好再传入
-# - 只收可见 UI 文案；日志、技术标识符（DDGI / LOD / DDA）、单位（v/s、vx）、材质预设名保持英文
+# - 只收可见 UI 文案；日志、技术标识符（LOD / DDA）、单位（v/s、vx）、材质预设名保持英文
 # - DebugMenu 的文案 key 在本表 menu.* 段：菜单树（assets/ui/debug_menu.toml）存 key，
 #   由 gate-ui 的 UiTranslator 解析，切语言后整棵树重解析（gate-app 的 sync_ui_locale）
 _version: 1
@@ -19,26 +19,10 @@ menu.video.aa: "抗锯齿"
 menu.video.aa.tip: "FXAA：单 pass 边缘抗锯齿（约 9~13 次采样）。抹平台阶/锯齿，但治不了运动中的亚像素闪烁。"
 menu.video.fps: "FPS"
 menu.render: "渲染"
-menu.render.ddgi: "DDGI"
-menu.render.ddgi.enabled: "开启"
-menu.render.ddgi.mode: "诊断模式"
-menu.render.ddgi.mode.normal: "常规"
-menu.render.ddgi.mode.gi: "纯GI"
-menu.render.ddgi.mode.wsum: "权重"
-menu.render.ddgi.mode.domain: "级域"
-menu.render.ddgi.mode.probe: "探针"
-menu.render.ddgi.probe: "绘制探针"
-menu.render.ddgi.probe.none: "无级"
-menu.render.ddgi.probe.lod0: "LOD0"
-menu.render.ddgi.probe.lod1: "LOD1"
-menu.render.ddgi.probe.lod2: "LOD2"
-menu.render.ddgi.probe.lod3: "LOD3"
-menu.render.ddgi.probe.lod4: "LOD4"
-menu.render.ddgi.probe.all: "全级"
-menu.render.ddgi.gi_half: "半分辨率GI"
-menu.render.ddgi.gi_half.tip: "间接光改到 1/2 分辨率采样再双线性取用：省约 1.5-2ms，代价是接触阴影/薄结构边缘变软。"
-menu.render.ddgi.probe_dbg: "探针采样调试"
-menu.render.ddgi.probe_dbg.tip: "画出光标下体素本来会采样的那 8 个探针、它们到采样点的连线，以及采样点本身（白）。绿 = 该角有效；红 = 该角被剔（线被实体挡住，或该点被相机遮挡）；蓝 = 该角没有探针。连线逐段做深度剔除。"
+menu.render.gi: "GI"
+menu.render.gi.enabled: "开启"
+menu.render.gi.gi_half: "半分辨率GI"
+menu.render.gi.gi_half.tip: "间接光改到 1/2 分辨率采样再双线性取用：省约 1.5-2ms，代价是接触阴影/薄结构边缘变软。"
 menu.render.exposure: "曝光"
 menu.render.exposure.enabled: "开启"
 menu.render.exposure.ev_up: "提亮上限"

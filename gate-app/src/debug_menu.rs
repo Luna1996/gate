@@ -35,26 +35,6 @@ pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 
-/// DDGI 诊断模式选项的 i18n key（下标 = `DdgiDebugSettings.mode`，顺序与 WESL 一致）
-pub const DDGI_MODE_KEYS: [&str; 5] = [
-  "menu.render.ddgi.mode.normal",
-  "menu.render.ddgi.mode.gi",
-  "menu.render.ddgi.mode.wsum",
-  "menu.render.ddgi.mode.domain",
-  "menu.render.ddgi.mode.probe",
-];
-
-/// 探针绘制选项的 i18n key：无 / LOD0..4 / 全（下标 0 = 不绘制）
-pub const PROBE_KEYS: [&str; 7] = [
-  "menu.render.ddgi.probe.none",
-  "menu.render.ddgi.probe.lod0",
-  "menu.render.ddgi.probe.lod1",
-  "menu.render.ddgi.probe.lod2",
-  "menu.render.ddgi.probe.lod3",
-  "menu.render.ddgi.probe.lod4",
-  "menu.render.ddgi.probe.all",
-];
-
 /// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（改这里就要同步资产文件）。
 /// 文案字段一律写 i18n key（`menu.*`），经 gate-ui `UiTranslator` 解析；`id` 是与语言无关的回调路径段。
 pub fn default_menu() -> MenuFile {
@@ -79,25 +59,16 @@ pub fn default_menu() -> MenuFile {
         "menu.render",
         vec![
           sub_menu(
-            "ddgi",
-            "menu.render.ddgi",
+            "gi",
+            "menu.render.gi",
             vec![
-              toggle("enabled", "menu.render.ddgi.enabled", true),
-              switch_group("mode", "menu.render.ddgi.mode", &DDGI_MODE_KEYS, 0),
-              switch_group("probe", "menu.render.ddgi.probe", &PROBE_KEYS, 0),
-              // 采样调试：鼠标下体素的 8 个采样 probe + 连线（见 DdgiDebugSettings.probe_dbg）
-              toggle_tip(
-                "probe_dbg",
-                "menu.render.ddgi.probe_dbg",
-                false,
-                "menu.render.ddgi.probe_dbg.tip",
-              ),
-              // 性能档：见 DdgiDebugSettings.gi_half_res
+              toggle("enabled", "menu.render.gi.enabled", true),
+              // 性能档：见 GiSettings.half_res
               toggle_tip(
                 "gi_half",
-                "menu.render.ddgi.gi_half",
+                "menu.render.gi.gi_half",
                 false,
-                "menu.render.ddgi.gi_half.tip",
+                "menu.render.gi.gi_half.tip",
               ),
             ],
           ),
@@ -498,42 +469,16 @@ fn register_callbacks(world: &mut World) {
 
   world.add_observer(
     |ev: On<MenuActionEvent>,
-     mut ddgi_stage: ResMut<gate_render::ddgi::DdgiStage>,
-     mut ddgi_dbg: ResMut<gate_render::ddgi::DdgiDebugSettings>,
+     mut gi: ResMut<gate_render::gi::GiSettings>,
      mut eye: ResMut<gate_render::EyeAdaptSettings>| {
       match (ev.path.as_str(), &ev.action) {
-        ("render/ddgi/enabled", MenuAction::Toggle(on)) => {
-          *ddgi_stage = gate_render::ddgi::DdgiStage::new(if *on {
-            gate_render::ddgi::DdgiStage::FULL
-          } else {
-            gate_render::ddgi::DdgiStage::OFF
-          });
-          info!("DDGI → stage {}", ddgi_stage.0);
-        }
-        ("render/ddgi/mode", MenuAction::Select(i)) => {
-          ddgi_dbg.mode = *i as f32;
-          let name = DDGI_MODE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
-          info!("DDGI 诊断模式 → {name}");
-        }
-        ("render/ddgi/probe", MenuAction::Select(i)) => {
-          ddgi_dbg.probe_viz = *i > 0;
-          // 「全」用 ≥ DDGI_LODS 的哨兵值表示（WGSL 侧同判据）；下标 1..=DDGI_LODS 就是 LOD 号。
-          ddgi_dbg.probe_viz_lod = if *i == PROBE_KEYS.len() - 1 {
-            gate_render::ddgi::DDGI_LODS as f32
-          } else {
-            i.saturating_sub(1) as f32
-          };
-          let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
-          info!("探针绘制 → {name}");
-        }
-        // 采样调试：鼠标下体素会采样的 8 个 probe + 到采样点的连线
-        ("render/ddgi/probe_dbg", MenuAction::Toggle(on)) => {
-          ddgi_dbg.probe_dbg = *on;
-          info!("探针采样调试 → {}", if *on { "on" } else { "off" });
+        ("render/gi/enabled", MenuAction::Toggle(on)) => {
+          gi.enabled = *on;
+          info!("GI → {}", if *on { "on" } else { "off" });
         }
         // 性能档（关掉即回到逐像素精确路径）
-        ("render/ddgi/gi_half", MenuAction::Toggle(on)) => {
-          ddgi_dbg.gi_half_res = *on;
+        ("render/gi/gi_half", MenuAction::Toggle(on)) => {
+          gi.half_res = *on;
           info!("半分辨率 GI → {}", if *on { "on" } else { "off" });
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
@@ -616,12 +561,10 @@ fn register_callbacks(world: &mut World) {
   );
 
   // 下拉只改模型（退出时随存档持久化）；「重载世界」按钮才真正换世界（同步阻塞），失败只 warn、
-  // 原世界不变；成功后全量重建 + GPU 上传 + DDGI 重烘焙由 VoxelScene.demo_force_full_rebuild 驱动。
+  // 原世界不变；成功后全量重建 + GPU 上传由 VoxelScene.demo_force_full_rebuild 驱动。
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut scene: ResMut<gate_render::VoxelScene>,
-     mut aabb: ResMut<gate_render::ddgi::DdgiWorldAabb>,
-     mut chunk_set: ResMut<gate_render::ddgi::DdgiChunkSet>,
      q_menu: Query<&gate_ui::DebugMenu>| {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
@@ -634,7 +577,7 @@ fn register_callbacks(world: &mut World) {
             return;
           };
           let t0 = std::time::Instant::now();
-          match crate::scene::reload_world(&mut scene, &mut aabb, &mut chunk_set, &name) {
+          match crate::scene::reload_world(&mut scene, &name) {
             Ok(info) => info!(
               "世界已重载：{name}.vox instances={} written={} dropped={} aabb=[{}]-[{}] ({:?})",
               info.instances_used,
