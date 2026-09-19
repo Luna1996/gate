@@ -3,6 +3,7 @@
 //! `showcase` 右上角组件展示窗 / `vox_scene` MagicaVoxel .vox 导入。
 
 mod camera;
+mod config;
 mod consts;
 mod debug_menu;
 mod edit;
@@ -27,9 +28,10 @@ use camera::{
   build_camera_config, camera_look_input, fly_camera_input, left_click_pick_recenter,
   orbit_camera_input, sync_camera_mode_switch,
 };
+use config::{Config, save_config_on_exit};
 use debug_menu::{
   DebugUiRoot, FpsOverlayVisible, FpsWindow, camera_info_tick, debug_menu_toggle, fps_overlay_tick,
-  save_menu_on_exit, spawn_debug_menu_ui, sync_ui_locale,
+  spawn_debug_menu_ui, sync_ui_locale,
 };
 use edit::voxel_edit_input;
 use scene::setup;
@@ -132,6 +134,8 @@ fn main() {
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()
+    // 跨启动配置（<安装根>/data/config.toml）：菜单窗口/控件值 + 相机姿态；读一次供各处共享
+    .insert_resource(Config::load())
     // UI 文案解析器：菜单树存 i18n key，gate-ui 经它解析（切语言后 sync_ui_locale 触发重解析）
     .insert_resource(gate_ui::UiTranslator::new(|key| t!(key).to_string()))
     // 失焦窗口也用 Continuous 更新（默认失焦为 reactive_low_power 60Hz）
@@ -172,12 +176,9 @@ fn main() {
         enforce_integer_scale_factor,
       ),
     )
-    // 退出前落盘：DebugMenu 状态（TOML）+ 相机姿态（RON）；须排在 bevy_window 的 ExitSystems
-    // 之后（AppExit 由它写入）。
-    .add_systems(
-      Last,
-      (save_menu_on_exit, camera::save_camera_on_exit).after(bevy::window::ExitSystems),
-    );
+    // 退出前落盘：全部持久化设置写进 <安装根>/data/config.toml（菜单窗口/控件值 + 相机姿态）；
+    // 须排在 bevy_window 的 ExitSystems 之后（AppExit 由它写入）。
+    .add_systems(Last, save_config_on_exit.after(bevy::window::ExitSystems));
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);

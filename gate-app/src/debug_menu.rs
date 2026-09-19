@@ -1,6 +1,7 @@
 //! DebugMenu：gate-app 的调试菜单（gate-ui 通用 menu 模块的第一个使用者）。
-//! 本文件提供 `default_menu` 默认菜单树（= `assets/ui/debug_menu.toml`）、TOML 初值读写、
-//! `MenuActionEvent` → 各调试资源观察者、相机信息与 FPS 覆盖层刷新。
+//! UI 结构与控件缺省值每次启动都从只读资源 `assets/ui/debug_menu.toml` 读；运行期改动过的值
+//! 则来自 `data/config.toml`（见 `crate::config`），由本文件的 `load_menu` 合并。
+//! 另含 `MenuActionEvent` → 各调试资源观察者、相机信息与 FPS 覆盖层刷新。
 
 use std::collections::VecDeque;
 
@@ -12,22 +13,19 @@ use rust_i18n::t;
 
 use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
 use gate_ui::{
-  DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
-  WindowState,
-  menu::{
-    buttons, color, dropdown, input, slider, sub_menu, switch_group, text, toggle, toggle_tip,
-  },
+  DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   parse_hex_color, spawn_debug_menu,
 };
 
 use crate::camera::{CameraMode, FlyCamera};
+use crate::config::Config;
 use crate::consts::{
   CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, HALF_RES_FACTOR, VOXEL_PER_METER,
 };
 use crate::edit::{BrushShape, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness};
 use crate::showcase::ShowcaseRoot;
 
-/// 菜单 TOML 相对 assets 目录的路径（初值来源 + 退出时写回）
+/// 菜单 TOML 相对 assets 目录的路径（UI 结构与控件缺省值的唯一来源）
 pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
 
 /// 「世界」页模型下拉的节点路径（选项由 `apply_world_model_options` 按磁盘内容填）
@@ -35,193 +33,34 @@ pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 
-/// 内置默认菜单树；与 `assets/ui/debug_menu.toml` 逐字一致（改这里就要同步资产文件）。
-/// 文案字段一律写 i18n key（`menu.*`），经 gate-ui `UiTranslator` 解析；`id` 是与语言无关的回调路径段。
-pub fn default_menu() -> MenuFile {
-  MenuFile {
-    window: WindowState::default(),
-    items: vec![
-      sub_menu(
-        "video",
-        "menu.video",
-        vec![
-          // 半分辨率渲染（3D 场景 1/2 分辨率 → blit 放大到整窗）；见 RenderScale.factor
-          toggle_tip("half_res", "menu.video.half_res", false, "menu.video.half_res.tip"),
-          toggle("fullscreen", "menu.video.fullscreen", false),
-          toggle("vsync", "menu.video.vsync", true),
-          // FXAA（最终 blit 的边缘抗锯齿）；见 PostFxSettings.fxaa
-          toggle_tip("aa", "menu.video.aa", false, "menu.video.aa.tip"),
-          toggle("fps", "menu.video.fps", false),
-        ],
-      ),
-      sub_menu(
-        "render",
-        "menu.render",
-        vec![
-          sub_menu(
-            "gi",
-            "menu.render.gi",
-            vec![
-              toggle("enabled", "menu.render.gi.enabled", true),
-              // 性能档：见 GiSettings.half_res
-              toggle_tip(
-                "gi_half",
-                "menu.render.gi.gi_half",
-                false,
-                "menu.render.gi.gi_half.tip",
-              ),
-            ],
-          ),
-          sub_menu(
-            "exposure",
-            "menu.render.exposure",
-            vec![
-              toggle("enabled", "menu.render.exposure.enabled", true),
-              slider(
-                "ev_up",
-                "menu.render.exposure.ev_up",
-                3.0,
-                0.0,
-                12.0,
-                0.25,
-                2,
-                Some("menu.render.exposure.ev_up.tip"),
-              ),
-              slider(
-                "ev_dn",
-                "menu.render.exposure.ev_dn",
-                -3.0,
-                -12.0,
-                0.0,
-                0.25,
-                2,
-                Some("menu.render.exposure.ev_dn.tip"),
-              ),
-              slider(
-                "tau_up",
-                "menu.render.exposure.tau_up",
-                2.0,
-                0.1,
-                8.0,
-                0.1,
-                2,
-                Some("menu.render.exposure.tau_up.tip"),
-              ),
-              slider(
-                "tau_dn",
-                "menu.render.exposure.tau_dn",
-                1.0,
-                0.1,
-                8.0,
-                0.1,
-                2,
-                Some("menu.render.exposure.tau_dn.tip"),
-              ),
-              slider(
-                "key",
-                "menu.render.exposure.key",
-                0.18,
-                0.02,
-                0.5,
-                0.01,
-                3,
-                Some("menu.render.exposure.key.tip"),
-              ),
-            ],
-          ),
-        ],
-      ),
-      sub_menu(
-        "player",
-        "menu.player",
-        vec![sub_menu(
-          "camera",
-          "menu.player.camera",
-          vec![
-            text("pos", "menu.player.camera.pos"),
-            text("dir", "menu.player.camera.dir"),
-            switch_group(
-              "mode",
-              "menu.player.camera.mode",
-              &["menu.player.camera.mode.orbit", "menu.player.camera.mode.fly"],
-              1,
-            ),
-            slider("speed", "menu.player.camera.speed", 2.6, 0.32, 40.0, 0.1, 1, None),
-          ],
-        )],
-      ),
-      sub_menu(
-        "game",
-        "menu.game",
-        vec![
-          sub_menu(
-            "edit",
-            "menu.game.edit",
-            vec![
-              switch_group(
-                "shape",
-                "menu.game.edit.shape",
-                &["menu.game.edit.shape.sphere", "menu.game.edit.shape.cube"],
-                0,
-              ),
-              input(
-                "size",
-                "menu.game.edit.size",
-                // 无上限：max 取 f32::MAX（仍按 min/step 归一）
-                vec![InputField::number("", "3", 1.0, f32::MAX, 1.0, 0)],
-              ),
-              color("color", "menu.game.edit.color", "96989E"),
-              slider("emissive", "menu.game.edit.emissive", 0.0, 0.0, 255.0, 1.0, 0, None),
-              slider("alpha", "menu.game.edit.alpha", 100.0, 0.0, 100.0, 1.0, 0, None),
-              slider("smooth", "menu.game.edit.smooth", 50.0, 0.0, 100.0, 1.0, 0, None),
-            ],
-          ),
-          // 世界：第一行 = 模型下拉（选项 = assets/vox 下 .vox 文件名，启动时按磁盘内容重填）；第二行 = 重载世界
-          sub_menu(
-            "world",
-            "menu.game.world",
-            vec![
-              dropdown("model", "menu.game.world.model", &["nuke"], 0),
-              buttons("reload", "", &["menu.game.world.reload"]),
-            ],
-          ),
-        ],
-      ),
-      sub_menu("ui", "menu.ui", vec![toggle("showcase", "menu.ui.showcase", false)]),
-    ],
-  }
-}
-
-/// 读菜单 TOML：优先可写数据目录里的存档，其次只读资源的初版（`assets/ui/debug_menu.toml`）；
-/// 都缺失 / 解析失败 → 内置默认 + warn。
-pub fn load_menu() -> MenuFile {
-  let data = gate_render::data_dir().join(MENU_TOML_PATH);
-  let asset = gate_render::assets_dir().join(MENU_TOML_PATH);
-  let path = if data.is_file() { data } else { asset };
+/// 读 UI 结构与控件缺省值：每次都读只读资源 `assets/ui/debug_menu.toml`（结构与缺省值的唯一
+/// 来源），再把 `data/config.toml` 里的值覆盖上去 —— 配置里没有的控件保留缺省值，
+/// 配置里有而结构里没有的路径（控件被删了）直接忽略；随后按磁盘内容重填世界模型下拉的选项。
+pub fn load_menu(config: &Config) -> MenuFile {
+  let path = gate_render::assets_dir().join(MENU_TOML_PATH);
   let mut model = match std::fs::read_to_string(&path) {
     Ok(src) => match MenuFile::from_toml(&src) {
-      Ok(mut m) => {
-        m.sanitize();
-        merge_defaults(&mut m, &default_menu());
-        info!("debug menu loaded from {}", path.display());
+      Ok(m) => {
+        info!("debug menu layout loaded from {}", path.display());
         m
       }
       Err(e) => {
-        warn!("debug menu TOML parse failed ({e}); using built-in defaults");
-        let mut m = default_menu();
-        m.sanitize();
-        m
+        warn!("debug menu TOML 解析失败（{e}）；菜单为空");
+        MenuFile::default()
       }
     },
     Err(e) => {
-      warn!("debug menu TOML missing ({e}); using built-in defaults");
-      let mut m = default_menu();
-      m.sanitize();
-      m
+      warn!("debug menu TOML 缺失（{e}）；菜单为空");
+      MenuFile::default()
     }
   };
-  // 世界模型下拉选项来自磁盘扫描，最后统一填一次
+  // 下拉选项取自磁盘扫描，必须先于配置值套用（配置里的选中项按名字找回）
   apply_world_model_options(&mut model);
+  let applied = model.apply_values(&config.menu);
+  // 窗口位置 / 收起 / 停留路径只存在配置里
+  model.window = config.window.clone();
+  model.sanitize();
+  info!("debug menu 控件值：config 命中 {applied} / {} 项", config.menu.len());
   model
 }
 
@@ -241,47 +80,6 @@ fn apply_world_model_options(model: &mut MenuFile) {
     .or_else(|| options.iter().position(|o| o == "nuke"))
     .unwrap_or(0);
   *opts = options;
-}
-
-/// 旧存档兼容：把默认树里「存档中不存在」的节点补进去，已存在的保留存档值；递归只在 SubMenu 内做。
-fn merge_defaults(loaded: &mut MenuFile, dflt: &MenuFile) {
-  merge_nodes(&mut loaded.items, &dflt.items);
-}
-
-fn merge_nodes(loaded: &mut Vec<MenuNode>, dflt: &[MenuNode]) {
-  for (i, d) in dflt.iter().enumerate() {
-    match loaded.iter_mut().find(|n| n.id() == d.id()) {
-      Some(l) => {
-        if let (MenuNode::SubMenu { children: lc, .. }, MenuNode::SubMenu { children: dc, .. }) =
-          (&mut *l, d)
-        {
-          merge_nodes(lc, dc);
-        }
-      }
-      // 新项按默认树里的位置插入（不是追加到末尾）
-      None => loaded.insert(i.min(loaded.len()), d.clone()),
-    }
-  }
-}
-
-/// 把当前菜单状态写回 TOML（退出前调用）；写可写数据目录（`<安装根>/data/ui/debug_menu.toml`）
-/// 而非 `assets/`。下次启动由 `load_menu` 优先读这份存档。
-pub fn save_menu(model: &MenuFile) {
-  let path = gate_render::data_dir().join(MENU_TOML_PATH);
-  let Ok(src) = model.to_toml() else {
-    warn!("debug menu serialize failed; not saved");
-    return;
-  };
-  if let Some(dir) = path.parent()
-    && let Err(e) = std::fs::create_dir_all(dir)
-  {
-    warn!("debug menu dir create failed ({e})");
-    return;
-  }
-  match std::fs::write(&path, src) {
-    Ok(()) => info!("debug menu saved to {}", path.display()),
-    Err(e) => warn!("debug menu save failed ({e})"),
-  }
 }
 
 /// UI 已生成的守卫标记（debug_menu_setup 的存在性守卫）
@@ -311,12 +109,15 @@ pub struct FpsWindow(VecDeque<f32>);
 
 /// 建 DebugMenu + FPS 覆盖层 + 回调观察者；主题/字体就绪后由 `crate::debug_ui_setup` 调用一次。
 pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
-  let model = load_menu();
+  let model = {
+    let config = world.resource::<Config>();
+    load_menu(config)
+  };
   // 文案解析器取资源里的（语言切换只需 bump 版本，见 sync_ui_locale）
   let translate = world.resource::<UiTranslator>().handle();
   let ctx = UiCtx::new(ctx.theme, ctx.font).with_icon_font(ctx.icon_font).with_translate(translate);
   let handle = spawn_debug_menu(world, &ctx, model);
-  // 顺序：先挂回调，再把 TOML 初值按节点重放成 `MenuActionEvent`（资源映射只存在于观察者里），
+  // 顺序：先挂回调，再把最终控件值按节点重放成 `MenuActionEvent`（资源映射只存在于观察者里），
   // 最后建覆盖层（它读的 `FpsOverlayVisible` 已由初值重放写好）。
   register_callbacks(world);
   apply_initial_state(world, handle.root);
@@ -363,8 +164,8 @@ fn spawn_fps_overlay(world: &mut World, ctx: &UiCtx) {
   }
 }
 
-/// 用菜单模型初始化各调试资源：把 TOML 初值按节点重放成 `MenuActionEvent`
-/// （TOML = 所有调试常量的初值来源；「菜单值 → 资源」的映射只在 `register_callbacks` 的观察者里写一次）。
+/// 用菜单模型的**最终控件值**初始化各调试资源：按节点重放成 `MenuActionEvent`
+/// （「菜单值 → 资源」的映射只在 `register_callbacks` 的观察者里写一次）。
 fn apply_initial_state(world: &mut World, root: Entity) {
   let Some(model) = gate_ui::menu_model(world).cloned() else { return };
   let mut actions = Vec::new();
@@ -373,7 +174,7 @@ fn apply_initial_state(world: &mut World, root: Entity) {
   for (path, action) in actions {
     world.trigger(MenuActionEvent { entity: root, path, action });
   }
-  info!(target: "gate", "debug menu 初值已应用：{n} 项（来源 {MENU_TOML_PATH}）");
+  info!(target: "gate", "debug menu 初值已应用：{n} 项");
 }
 
 /// 递归收集「带初值」的节点 → (id 路径, 动作)；`SubMenu` 只递归下去，`Buttons` / `Text` 无初值。
@@ -597,7 +398,7 @@ fn register_callbacks(world: &mut World) {
 }
 
 /// 读「世界」页下拉当前选中的模型名（无该节点 / 选项为空 → None）；
-/// 启动时由 `scene::setup` 用 `load_menu()` 的模型读同一个值。
+/// 启动时由 `scene::setup` 用 `load_menu` 的模型读同一个值。
 pub(crate) fn world_model_name(model: &MenuFile) -> Option<String> {
   match model.node(&split(WORLD_MODEL_PATH)) {
     Some(MenuNode::Dropdown { options, selected, .. }) => options.get(*selected).cloned(),
@@ -713,31 +514,5 @@ pub(crate) fn debug_menu_toggle(
     for mut vis in &mut q {
       *vis = if *vis == Visibility::Hidden { Visibility::Visible } else { Visibility::Hidden };
     }
-  }
-}
-
-/// 退出前把当前菜单状态写回 TOML（AppExit 那一帧执行一次）
-pub(crate) fn save_menu_on_exit(
-  mut exit: MessageReader<AppExit>,
-  q_menu: Query<&gate_ui::DebugMenu>,
-  mut saved: Local<bool>,
-) {
-  if *saved {
-    return;
-  }
-  let mut quitting = false;
-  for _ in exit.read() {
-    quitting = true;
-  }
-  if !quitting {
-    return;
-  }
-  *saved = true;
-  if let Ok(menu) = q_menu.single() {
-    // 当前停留路径也一并持久化
-    let mut model = menu.model.clone();
-    model.window.path = menu.path.clone();
-    model.window.collapsed = menu.collapsed;
-    save_menu(&model);
   }
 }

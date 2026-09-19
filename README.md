@@ -31,8 +31,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 **菜单持久化**
 
-- 初始值 `assets/ui/debug_menu.toml`（随包发布）；运行期改动在退出时写回 `<安装根>/data/ui/debug_menu.toml`，
-  下次启动优先读它（读不到才回退 assets 版，新节点由 `merge_defaults` 回填）
+- UI 结构与控件缺省值固定在 `assets/ui/debug_menu.toml`（随包发布，每次启动都读）；
+  运行期改动过的控件值 + 窗口位置/收起/停留路径 + 相机姿态在退出时写回 `<安装根>/data/config.toml`，
+  下次启动读它覆盖缺省值（配置里没有的控件用缺省，结构里没有的路径忽略）
 
 ---
 
@@ -165,7 +166,8 @@ gate-app/          Demo 应用入口
                    - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / cursor_ray / 拾取 recenter
                    - edit.rs       EditSettings + BrushShape/BrushMaterial + raycast_main + 笔触施加与输入
                    - vox_scene.rs  MagicaVoxel .vox 导入（vox-rs）+ scan_vox_models 模型发现
-                   - debug_menu.rs 菜单树默认定义 + 状态应用/落盘 + FPS 覆盖层 + 相机信息 + F3 开关
+                   - debug_menu.rs 菜单结构/缺省值加载 + 配置值合并 + 状态应用 + FPS 覆盖层 + 相机信息 + F3 开关
+                   - config.rs     <安装根>/data/config.toml 读写（菜单窗口/控件值 + 相机姿态）+ 退出落盘
                    - showcase.rs   右上角组件展示窗（控件画廊 + 交互事件日志）
                    - tracy_layer.rs tracing span → Tracy CPU zone（feature = "profile"）
 
@@ -173,13 +175,13 @@ assets/            运行期只读资源（与可写 logs//data/ 分离，见 ga
                    - shaders/    blit.wgsl + voxel_raytrace/ WESL 包（main.wesl 入口 + bindings /
                                  common / brickmap / trace / world / lightfield / gi/*，
                                  启动时读盘编译，改 shader 需重启）
-                   - ui/         theme.ron 暗色主题令牌；debug_menu.toml 菜单初始值
+                   - ui/         theme.ron 暗色主题令牌；debug_menu.toml 菜单结构与控件缺省值
                    - locales/    zh-CN.yml（编译期 codegen 进二进制，运行期不读）
                    - fonts/      MapleMono-NF-CN-Regular.ttf（CJK）+ fa-solid-900.ttf（图标）
                    - lighting/   day_outdoor.ron（当前唯一被加载的主题；dark_lab.ron 暂无引用）
                    - vox/        nuke.vox（默认场景，gitignore）
 
-logs/  data/       运行期可写目录（gitignore）：logs/latest.log、data/ui/debug_menu.toml
+logs/  data/       运行期可写目录（gitignore）：logs/latest.log、data/config.toml
 dist/              打包产物（bash package.sh 生成，gitignore）
 ```
 
@@ -362,6 +364,6 @@ bash package.sh     # release 构建 → 组装便携目录（不压缩）
 - **必须随包发**：`assets/` 全部内容（字体、`blit.wgsl`、WESL 源码——启动时读盘编译、`ui/theme.ron`、
   `ui/debug_menu.toml`、`lighting/*.ron`、`vox/*.vox`）。
 - **无需随包**：`assets/locales/*.yml`（编译期 codegen 进 exe）、`logs/`、`data/`（首次启动自建）。
-- **不写安装目录**：日志 → `<安装根>/logs/latest.log`；菜单状态 → `<安装根>/data/ui/debug_menu.toml`
-  （启动时优先读它，没有才用 `assets/ui/debug_menu.toml` 初版）。
+- **不写安装目录**：日志 → `<安装根>/logs/latest.log`；持久化配置（菜单控件值/窗口 + 相机姿态）→
+  `<安装根>/data/config.toml`（菜单结构与缺省值每次从 `assets/ui/debug_menu.toml` 读）。
 - **注意**：`assets/vox/nuke.vox` 被 gitignore，脚本只在缺失时 WARN，不会阻断打包——发布前自备该文件。

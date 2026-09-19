@@ -2,6 +2,8 @@
 //! 单靠一份 `MenuFile` 即可完整重建菜单 UI；唯一例外是控件回调，由调用方按节点 id 路径挂上（见 `MenuActionEvent`）。
 //! 文案字段存 i18n key，渲染经 `UiTranslator` 解析；`id` 是与语言无关的回调路径段，须显式给出。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize, Serializer};
 
 use super::consts::DEFAULT_WINDOW_POS;
@@ -40,8 +42,9 @@ pub struct MenuFile {
   pub items: Vec<MenuNode>,
 }
 
-/// 窗口状态
+/// 窗口状态（缺字段回落 `Default`，便于手改配置文件）
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct WindowState {
   #[serde(serialize_with = "ser_f32")]
   pub x: f32,
@@ -116,6 +119,16 @@ impl InputField {
       None => TextInputKind::Text,
     }
   }
+}
+
+/// 控件值的持久化表示（外部配置文件里 `[menu]` 表的值；无状态控件不产出）。
+/// 选中态存**选项名**而非下标：切换组 = i18n key、下拉框 = 模型名，选项重排/增删后仍能找回。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum MenuValue {
+  Bool(bool),
+  Number(f64),
+  Text(String),
 }
 
 /// 菜单节点（层级 + 控件状态）
@@ -272,6 +285,57 @@ impl MenuNode {
       _ => None,
     }
   }
+
+  /// 控件当前值（无状态控件 `SubMenu` / `Buttons` / `Text` → None）
+  pub fn value(&self) -> Option<MenuValue> {
+    match self {
+      Self::Toggle { checked, .. } => Some(MenuValue::Bool(*checked)),
+      Self::Slider { value, .. } => Some(MenuValue::Number(f64::from(*value))),
+      Self::SwitchGroup { options, selected, .. } | Self::Dropdown { options, selected, .. } => {
+        options.get(*selected).cloned().map(MenuValue::Text)
+      }
+      Self::Input { fields, .. } => fields.first().map(|f| MenuValue::Text(f.text.clone())),
+      Self::Color { hex, .. } => Some(MenuValue::Text(hex.clone())),
+      Self::SubMenu { .. } | Self::Buttons { .. } | Self::Text { .. } => None,
+    }
+  }
+
+  /// 用外部值覆盖控件状态：类型不符 / 选项不存在 → 忽略并返回 false。
+  /// 滑杆只赋值不钳位，调用方随后 `MenuFile::sanitize` 归一化。
+  pub fn apply_value(&mut self, v: &MenuValue) -> bool {
+    match (self, v) {
+      (Self::Toggle { checked, .. }, MenuValue::Bool(b)) => {
+        *checked = *b;
+        true
+      }
+      (Self::Slider { value, .. }, MenuValue::Number(n)) => {
+        *value = *n as f32;
+        true
+      }
+      (
+        Self::SwitchGroup { options, selected, .. } | Self::Dropdown { options, selected, .. },
+        MenuValue::Text(t),
+      ) => match options.iter().position(|o| o == t) {
+        Some(i) => {
+          *selected = i;
+          true
+        }
+        None => false,
+      },
+      (Self::Input { fields, .. }, MenuValue::Text(t)) => match fields.first_mut() {
+        Some(f) => {
+          f.text.clone_from(t);
+          true
+        }
+        None => false,
+      },
+      (Self::Color { hex, .. }, MenuValue::Text(t)) => {
+        hex.clone_from(t);
+        true
+      }
+      _ => false,
+    }
+  }
 }
 
 impl MenuFile {
@@ -310,6 +374,21 @@ impl MenuFile {
     toml::from_str(src)
   }
 
+  /// 全树「id 路径 → 控件值」（持久化用；无状态控件不产出）
+  pub fn values(&self) -> BTreeMap<String, MenuValue> {
+    let mut out = BTreeMap::new();
+    walk_values(&self.items, "", &mut out);
+    out
+  }
+
+  /// 按 id 路径把外部值写回控件；配置里有、而这里没有的路径（控件已删）与类型不符的值一律忽略。
+  /// 返回成功应用的条数；调用方随后 `sanitize` 归一化（滑杆钳位等）。
+  pub fn apply_values(&mut self, values: &BTreeMap<String, MenuValue>) -> usize {
+    let mut applied = 0;
+    write_values(&mut self.items, "", values, &mut applied);
+    applied
+  }
+
   /// 校验/纠偏：选中下标越界钳位（TOML 被手改后不至于 panic）
   pub fn sanitize(&mut self) {
     for node in &mut self.items {
@@ -339,6 +418,48 @@ fn sanitize_node(node: &mut MenuNode) {
       }
     }
     _ => {}
+  }
+}
+
+/// 节点 id 路径段拼接（根 = ""）
+fn id_path(prefix: &str, id: &str) -> String {
+  if prefix.is_empty() { id.to_string() } else { format!("{prefix}/{id}") }
+}
+
+/// 深度优先收集控件值（仅含带状态控件）
+fn walk_values(nodes: &[MenuNode], prefix: &str, out: &mut BTreeMap<String, MenuValue>) {
+  for node in nodes {
+    let path = id_path(prefix, node.id());
+    match node {
+      MenuNode::SubMenu { children, .. } => walk_values(children, &path, out),
+      _ => {
+        if let Some(v) = node.value() {
+          out.insert(path, v);
+        }
+      }
+    }
+  }
+}
+
+/// 深度优先套用外部值（子菜单只递归；节点自身的值由 `MenuNode::apply_value` 判定）
+fn write_values(
+  nodes: &mut [MenuNode],
+  prefix: &str,
+  values: &BTreeMap<String, MenuValue>,
+  applied: &mut usize,
+) {
+  for node in nodes.iter_mut() {
+    let path = id_path(prefix, node.id());
+    match node {
+      MenuNode::SubMenu { children, .. } => write_values(children, &path, values, applied),
+      _ => {
+        if let Some(v) = values.get(&path)
+          && node.apply_value(v)
+        {
+          *applied += 1;
+        }
+      }
+    }
   }
 }
 

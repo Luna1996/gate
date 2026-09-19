@@ -20,7 +20,11 @@ use crate::{
   vox_scene,
 };
 
-pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+pub(crate) fn setup(
+  mut commands: Commands,
+  mut images: ResMut<Assets<Image>>,
+  config: Res<crate::config::Config>,
+) {
   let dda_handle = create_dda_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off));
   // 光照主题 RON：一次性静态配置，同步读即可；缺失/解析失败回退内置默认主题
@@ -47,8 +51,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
   } else {
     let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
-    // 启动世界 = 「游戏/世界」页模型下拉的存档选中项（菜单退出时写盘；读不到 / 无该节点 → nuke）
-    let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu())
+    // 启动世界 = 「游戏/世界」页模型下拉的最终选中项（结构来自资产、选中项来自配置；读不到 → nuke）
+    let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu(&config))
       .unwrap_or_else(|| "nuke".to_string());
     let path = gate_render::assets_dir().join(format!("vox/{name}.vox"));
     let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
@@ -77,8 +81,8 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   } else {
     OrbitCamera::from_eye(cam_eye, cam_target)
   };
-  // 上次退出时的姿态优先（`data/ui/camera.ron`）；首启 / 存档坏了 → 场景默认机位。
-  let saved = crate::camera::CameraPose::load();
+  // 上次退出时的姿态优先（`data/config.toml` 的 `[camera]` 节）；首启 / 缺该节 → 场景默认机位。
+  let saved = config.camera;
   let orbit = saved.as_ref().map_or(orbit, |p| p.to_orbit());
   commands.insert_resource(orbit);
   commands.insert_resource(DdaCameraConfig::from_orbit(

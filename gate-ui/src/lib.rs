@@ -15,8 +15,8 @@ pub use i18n::{I18nKey, UiTranslator, i18n_refresh_system};
 pub use icon::{Icon, IconFont};
 pub use menu::{
   DebugMenu, DebugMenuHandle, DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile,
-  MenuItem, MenuNode, MenuRole, MenuTextValue, WindowState, menu_model, menu_selected, menu_system,
-  menu_text, menu_toggle, menu_value, spawn_debug_menu,
+  MenuItem, MenuNode, MenuRole, MenuTextValue, MenuValue, WindowState, menu_model, menu_selected,
+  menu_system, menu_text, menu_toggle, menu_value, spawn_debug_menu,
 };
 pub use world_anchor::{
   AnchorBaseFont, AnchorCamera, WorldAnchor, anchor_distance_scale, project_to_screen,

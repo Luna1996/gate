@@ -3,7 +3,6 @@
 //! 朝向 yaw/pitch 两模式共享，切换模式时视线方向连续。
 
 use bevy::{
-  app::AppExit,
   input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
   prelude::*,
 };
@@ -18,9 +17,6 @@ use gate_voxel::VolumeTransform;
 use crate::consts::{
   CAM_FAR, CAM_NEAR, FLY_SPEED_DEFAULT, FLY_SPEED_FAST_MUL, FOV_Y, ROT_SPEED, ZOOM_LOG_SPEED,
 };
-
-/// 相机姿态存档（相对 `data_dir`）：退出时写、启动时读，恢复上次的机位与朝向。
-const CAMERA_POSE_PATH: &str = "ui/camera.ron";
 
 /// 相机模式（main world Resource）。切换的唯一入口是 DebugMenu 的「玩家/相机/相机模式」切换组。
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -57,7 +53,8 @@ impl FlyCamera {
   }
 }
 
-/// 跨启动保留的相机姿态。只存两模式共有的量：眼位 + yaw/pitch（朝向共享）。
+/// 跨启动保留的相机姿态（持久化在 `<安装根>/data/config.toml` 的 `[camera]` 节）。
+/// 只存两模式共有的量：眼位 + yaw/pitch（朝向共享）。
 /// 轨道参数由 eye/yaw/pitch/distance 反推 —— 保证 `orbit.eye() == eye`，
 /// 首帧 `sync_camera_mode_switch` 才幂等（否则它会用 `orbit.eye()` 覆盖眼位）。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -98,61 +95,6 @@ impl CameraPose {
     o.clamp();
     o
   }
-
-  /// 读 `data/ui/camera.ron`；无存档 / 读失败 / 解析失败 → None（沿用场景默认机位）。
-  pub fn load() -> Option<Self> {
-    let path = gate_render::data_dir().join(CAMERA_POSE_PATH);
-    let src = match std::fs::read_to_string(&path) {
-      Ok(s) => s,
-      Err(_) => return None,
-    };
-    match ron::de::from_str::<Self>(&src) {
-      Ok(p) => {
-        info!("camera pose restored from {}", path.display());
-        Some(p)
-      }
-      Err(e) => {
-        warn!("camera pose parse failed ({e}); using scene default");
-        None
-      }
-    }
-  }
-
-  /// 写 `data/ui/camera.ron`（目录不存在则创建）。
-  pub fn save(&self) {
-    let path = gate_render::data_dir().join(CAMERA_POSE_PATH);
-    if let Some(dir) = path.parent()
-      && let Err(e) = std::fs::create_dir_all(dir)
-    {
-      warn!("camera pose dir create failed ({e}); not saved");
-      return;
-    }
-    match ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default()) {
-      Ok(src) => match std::fs::write(&path, src) {
-        Ok(()) => info!("camera pose saved to {}", path.display()),
-        Err(e) => warn!("camera pose write failed ({e})"),
-      },
-      Err(e) => warn!("camera pose serialize failed ({e}); not saved"),
-    }
-  }
-}
-
-/// 退出前把相机姿态写盘（AppExit 那一帧执行一次）。
-pub(crate) fn save_camera_on_exit(
-  mut exit: MessageReader<AppExit>,
-  mode: Res<CameraMode>,
-  orbit: Res<OrbitCamera>,
-  fly: Res<FlyCamera>,
-  mut saved: Local<bool>,
-) {
-  if *saved {
-    return;
-  }
-  if exit.read().count() == 0 {
-    return;
-  }
-  *saved = true;
-  CameraPose::capture(*mode, &orbit, &fly).save();
 }
 
 /// yaw/pitch → 视线单位向量（eye→target 方向，即 `OrbitCamera::eye()` 偏移方向取反）；
