@@ -1,4 +1,4 @@
-//! gate-app 的可调旋钮（本 crate 的模块都在 `src/` 下，故集中在本文件）：改这里即改默认值。
+﻿//! gate-app 的可调旋钮（本 crate 的模块都在 `src/` 下，故集中在本文件）：改这里即改默认值。
 //!
 //! 全是编译期常量：改值后重新编译。要给某项加 debug_menu 控件时，把它挪进 Bevy 资源再按
 //! 菜单连线（做法见 `debug_menu.rs` 里的 `RenderScale` / `EyeAdaptSettings` / `GiSettings`）。

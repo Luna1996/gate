@@ -107,7 +107,9 @@ struct GiUniform {
   // x = GI 开关、yzw = 保留（恒 0）
   misc: vec4<f32>,
   // x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率，2 = 半分辨率；整数值的 f32，只被
-  // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、zw = 保留
+  // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
+  // z = 世界几何相对「写入上一帧 reservoir 的那一帧」是否**逐位未变**（1 = 未变）⇒ 屏幕空间路径
+  // 可跳过时域二次顶点键验证射线（见 `gi/screen.wesl` ② 与 `prepare_gi` 的 `world_rev`）、w = 保留
   flags: vec4<f32>,
   // xyz = 脏盒 0（主世界编辑）的世界 voxel AABB min、w = 本帧脏盒数（0 = 无脏区）
   dirty_min: vec4<f32>,

@@ -289,6 +289,14 @@ pub struct GiGpu {
   pub res_flip: bool,
   /// 当前世代号（uniform `params.w`）：太阳/天光变化、palette 变化、世界全量重建或脏盒超量时自增。
   pub generation: u32,
+  /// 世界几何修订号：**只在世界真的可能变了的那一帧**自增（世代自增或收到脏盒）。
+  /// 与 `generation` 分开是因为 `world_rev_gi` 要问的问题更窄：「自上次跑 `gi_main` 起，
+  /// 射线求交的输入（体素占据）是否逐个字节没变」。太阳/天光变化不改变几何 ⇒ 单看 `generation`
+  /// 会把「只改了光照」的帧误判成几何变化，白白多发一轮验证射线（只是慢，不会错）。
+  pub world_rev: u32,
+  /// 上一次真正跑 `gi_main` 的那一帧的 `world_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
+  /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 存的二次顶点键在本帧仍然逐位成立。
+  pub world_rev_gi: u32,
   /// 上一帧的太阳/天光状态哈希（与 `generation` 比较判断「变没变」）。
   pub light_hash: u64,
   /// 脏盒（世界 voxel AABB，`[min, max)` ＋逐盒余量）的跨帧保留：`BrickMapDirty` 只在当帧有效，
@@ -480,6 +488,10 @@ fn init_gi_gpu(
     prev_inv_view_proj: Mat4::IDENTITY,
     res_flip: false,
     generation: 0,
+    // 两者都从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`skip_verify` 会是真；那时 reservoir 两块
+    // 都是零（M = 0 ⇒ 一律判无效），跳过与否都不会接受任何历史 ⇒ 安全（见 `res_flip` 上方注释）。
+    world_rev: 0,
+    world_rev_gi: 0,
     light_hash: 0,
     dirty_boxes: Vec::new(),
     dirty_ttl: 0,
@@ -707,6 +719,30 @@ fn prepare_gi(
       box_cap,
     );
   }
+
+  // ---- 世界几何修订号（uniform `flags.z`）----
+  // `skip_verify` 回答的是：「上帧 reservoir 里存的二次顶点键，在本帧是否仍然逐位成立」。
+  // 成立的条件比「几何没变」更弱也更容易判：世界几何自**上次真正跑 `gi_main`** 起没变过。
+  // 此时沿 `hist.dir` 重发的射线与当初写入 `hist.sk` 的那条**输入完全相同** —— 方向取自
+  // reservoir 本身，原点由已校验逐位相等的主键唯一决定（同一体素同一面同一物体 ⇒ 同一
+  // `p_voxel` / 同一逐体素法线 / 同一外推量）⇒ 光路求交结果必然逐位相同 ⇒ 那条**验证射线可以
+  // 整条省掉**（`gi/screen.wesl` ②）。世界变过（世代自增 / 收到脏盒）就照旧发那条射线验证，
+  // 判定与今天逐字一致 ⇒ 画面零改动。
+  //
+  // 前提（改动这里前先读）：`world_rev` 必须覆盖**一切可能改变 `world_raycast` 结果的输入**。
+  // 今天覆盖 = 太阳/天光（世代）、palette、世界全量上传、脏盒溢出、以及任何脏盒（= 一切增量体素
+  // 编辑）。运行时不存在别的几何变化源：物体变换只在建世界时设定，LOD / beam 只改遍历起点、不改
+  // 最近命中。若将来加了「物体动画 / 运行时改变换」，必须让那条路径也自增 `world_rev`。
+  if !why.is_empty() || fresh_boxes {
+    gpu.world_rev = gpu.world_rev.wrapping_add(1);
+  }
+  let skip_verify = gpu.world_rev == gpu.world_rev_gi;
+  // TEMP(A/B 测量脚手架，测完删除)：GI_TAP_OLD 位掩码（bit0 = tap 中心退回本像素、
+  // bit1 = 时域退回体素中心重投影）—— 两位都置 ⇒ 完全等于改造前。
+  let tap_old: f32 = std::env::var("GI_TAP_OLD")
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok())
+    .unwrap_or(0) as f32;
   // 盒 1.. 的字节：每盒 2 个 vec4（min.xyz + 余量 / max.xyz + 0）。盒数 < 2 时不必写（shader 不读）。
   if box_n >= 2 {
     let mut words = vec![0f32; box_cap * 8];
@@ -729,7 +765,12 @@ fn prepare_gi(
   let mut u = GiUniform::default();
   u.params = Vec4::new(0.0, 0.0, crate::consts::GI_GAIN, gpu.generation as f32);
   u.misc = Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
-  u.flags = Vec4::new(0.0, settings.div() as f32, 0.0, 0.0);
+  u.flags = Vec4::new(
+    tap_old,
+    settings.div() as f32,
+    if skip_verify { 1.0 } else { 0.0 },
+    0.0,
+  );
   u.dirty_min = dirty_min;
   u.dirty_max = dirty_max;
   // 整数帧号走 u32 通道（`seq.x`）：`gpu.frame` 本就是 u32，不再经 `params.x` 的 f32 截断。
@@ -746,6 +787,8 @@ fn prepare_gi(
   if gi_runs && let Some(v) = view.as_ref() {
     gpu.prev_view_proj = v.view_proj;
     gpu.prev_inv_view_proj = v.inv_view_proj;
+    // 本帧的 reservoir 就是在当前 `world_rev` 下写出的 ⇒ 记下来，供下一帧判 `skip_verify`。
+    gpu.world_rev_gi = gpu.world_rev;
   }
 
   // ---- BG4：uniform + 缓存 buffer（绑定号 0/13…21，必须显式给 entry）----
