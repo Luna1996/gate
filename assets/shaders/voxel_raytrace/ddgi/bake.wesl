@@ -1,7 +1,7 @@
 import package::bindings::{ddgi_cell, ddgi_cell_id, ddgi_meta, ddgi_u, g};
 import package::brickmap::{Grid};
-import package::ddgi::consts::{DDGI_BAKE_STAGGER, DDGI_PROBE_MIN_BLOCK};
-import package::ddgi::helpers::{DDGI_REC_ENABLED, ddgi_brick_state, ddgi_cell_in_window, ddgi_cell_state_sized, ddgi_lod_cell_size, ddgi_lod_count, ddgi_lod_slot_base, ddgi_meta_pack, ddgi_rec_off, ddgi_rec_pack, ddgi_slot_own, ddgi_slot_world_cell};
+import package::ddgi::consts::{DDGI_BAKE_STAGGER, DDGI_CHUNK_LOD, DDGI_PROBE_MIN_BLOCK};
+import package::ddgi::helpers::{DDGI_REC_ENABLED, ddgi_air_cross, ddgi_brick_state, ddgi_cell_in_window, ddgi_cell_state_sized, ddgi_lod0_next, ddgi_lod_cell_size, ddgi_lod_count, ddgi_lod_slot_base, ddgi_meta_pack, ddgi_rec_off, ddgi_rec_pack, ddgi_slot_own, ddgi_slot_world_cell};
 import package::ddgi::sort::{ddgi_box_hits_object, ddgi_push_out_of_objects};
 import package::trace::{make_grid};
 import package::world::{world_solid};
@@ -31,11 +31,9 @@ fn ddgi_block8_empty(g: Grid, o: vec3<i32>) -> bool {
 }
 
 /// 体素粒度的最后一档：在 [cmin, cmin+cs) 内找离 `center` 最近的 `DDGI_PROBE_MIN_BLOCK³` 全空块，
-/// 返回 (位置, found)。窄过道截面对齐不上 4 voxel 网格，只靠这一档。
+/// 返回 (位置, found)。窄过道/小空间截面对齐不上 4 voxel 网格时只靠这一档。
 fn ddgi_place_fine(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec4<f32> {
   let msz = DDGI_PROBE_MIN_BLOCK;
-  let n16 = max(cs / 16, 1);
-  let step2 = max(cs / 16, 1);
   // 快速路径：`center` 自身所在的块（clamp 进 cell 内）—— 绝大多数调用就是它，省掉整轮扫描。
   let base = clamp(
     vec3<i32>(floor(center)) - vec3<i32>(msz / 2),
@@ -48,36 +46,62 @@ fn ddgi_place_fine(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec4
   var bm_d2 = 1e30;
   var bm_p = vec3<f32>(0.0);
   var fm = false;
-  for (var k = 0; k < n16; k = k + 1) {
-    for (var j = 0; j < n16; j = j + 1) {
-      for (var i = 0; i < n16; i = i + 1) {
-        let sub16 = cmin + vec3<i32>(i, j, k) * 16;
-        if (ddgi_cell_state_sized(g, sub16, 16) != 2u) { continue; }
-        for (var kk = 0; kk + msz <= 16; kk = kk + step2) {
-          for (var jj = 0; jj + msz <= 16; jj = jj + step2) {
-            for (var ii = 0; ii + msz <= 16; ii = ii + step2) {
-              let sub = sub16 + vec3<i32>(ii, jj, kk);
-              // 中心体素先测：缝/洞里的候选一次淘汰。
-              if (world_solid(g, sub + vec3<i32>(msz / 2))) { continue; }
-              if (!ddgi_block_empty(g, sub, msz)) { continue; }
-              let p = vec3<f32>(sub) + vec3<f32>(f32(msz) * 0.5);
-              let d2 = dot(p - center, p - center);
-              if (d2 < bm_d2) { bm_d2 = d2; bm_p = p; fm = true; }
-            }
-          }
-        }
+  let hi = cs - msz;
+  for (var k = 0; k <= hi; k = k + 1) {
+    for (var j = 0; j <= hi; j = j + 1) {
+      for (var i = 0; i <= hi; i = i + 1) {
+        let sub = cmin + vec3<i32>(i, j, k);
+        // 中心体素先测：缝/洞里的候选一次淘汰。
+        if (world_solid(g, sub + vec3<i32>(msz / 2))) { continue; }
+        if (!ddgi_block_empty(g, sub, msz)) { continue; }
+        let p = vec3<f32>(sub) + vec3<f32>(f32(msz) * 0.5);
+        let d2 = dot(p - center, p - center);
+        if (d2 < bm_d2) { bm_d2 = d2; bm_p = p; fm = true; }
       }
     }
   }
   return vec4<f32>(select(vec3<f32>(0.0), bm_p, fm), select(0.0, 1.0, fm));
 }
 
-/// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ → DDGI_PROBE_MIN_BLOCK³ 找靠 `center` 的空块，返回 (探针位置, found)，全找不到则 found=false。
+/// 最细级的放置：在 [cmin, cmin+cs) 内取离 `center` 最近的「三格厚」位置。
+fn ddgi_place_cross(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>) -> vec4<f32> {
+  var best_d2 = 1e30;
+  var best_p = vec3<f32>(0.0);
+  var found = false;
+  for (var k = 0; k < cs; k = k + 1) {
+    for (var j = 0; j < cs; j = j + 1) {
+      for (var i = 0; i < cs; i = i + 1) {
+        let v = cmin + vec3<i32>(i, j, k);
+        if (!ddgi_air_cross(g, v)) { continue; }
+        let p = vec3<f32>(v) + vec3<f32>(0.5);
+        let d2 = dot(p - center, p - center);
+        if (d2 < best_d2) {
+          best_d2 = d2;
+          best_p = p;
+          found = true;
+        }
+      }
+    }
+  }
+  return vec4<f32>(select(vec3<f32>(0.0), best_p, found), select(0.0, 1.0, found));
+}
+
+/// 在 [cmin, cmin+cs) 内按 16³ → 8³ → 4³ → 体素粒度找靠 `center` 的空块，返回 (探针位置, found)，全找不到则 found=false。
 /// 调用前提：调用方已挡住全满 cell；lod 必须由调用方传入，不可从 cs 反推。
 fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u32) -> vec4<f32> {
   let n16 = max(cs / 16, 1);
+  // ---- 最细级（cell = 4）：整块就是一个 4³ 块 ----
+  // 全空 → 放 cell 中心；否则退到「三格厚」位置档。凑不出三格厚（1~2 voxel 的缝）⇒ 该 cell 不放探针，
+  // 保住"更窄的缝不过光"这条物理不变量。
+  if (cs <= 4) {
+    if (ddgi_brick_state(g, cmin, 3u) == 0u) {
+      return vec4<f32>(vec3<f32>(cmin) + vec3<f32>(f32(cs) * 0.5), 1.0);
+    }
+    return ddgi_place_cross(g, cmin, cs, center);
+  }
   // ---- Step 2：粗级 LOD 优先继承细级探针的位置 ----
-  if (lod > 0u) {
+  // 只对「规则 2× 嵌套的级」做：LOD0 是逐砖覆盖的特化级，chunk 级不继承它。
+  if (lod > DDGI_CHUNK_LOD) {
     let flod = lod - 1u;
     let fcs = ddgi_lod_cell_size(flod);
     let wc = vec3<i32>(floor(center / f32(cs)));
@@ -194,6 +218,8 @@ fn ddgi_place_probe(g: Grid, cmin: vec3<i32>, cs: i32, center: vec3<f32>, lod: u
 /// 按细→粗拆成 4 个 pass（同一 pass 内无顺序保证，只有 pass 边界是内存屏障）。
 fn ddgi_bake_one(lod: u32, idx: u32) {
   if (idx >= ddgi_lod_count(lod)) { return; }
+  // LOD0 的段是运行时按需领的：游标之外的槽位没人领，反向表是空的 → 跳过。
+  if (lod == 0u && idx >= ddgi_lod0_next()) { return; }
   let slot = ddgi_lod_slot_base(lod) + idx;
   let cs = ddgi_u.lods[lod].origin.w;
   let wc = ddgi_slot_world_cell(lod, idx);

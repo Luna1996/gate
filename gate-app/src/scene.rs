@@ -71,9 +71,9 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
   bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
 
-  // DDGI LOD0 的 chunk 探针段分配集（内容驱动，见 `lod0_needed_chunks`）：只有有几何或几何贴着
-  // chunk 边界（16 体素内）的 chunk 才领固定 4096 槽的段，空 chunk 不占槽位。
-  let ddgi_lod0_chunks = gate_render::ddgi::DdgiLod0Chunks { chunks: lod0_needed_chunks(&grid) };
+  // DDGI chunk 级（LOD1）的探针段分配集（内容驱动，见 `chunk_needed_chunks`）：只有有几何或几何贴着
+  // chunk 边界（16 体素内）的 chunk 才领固定段，空 chunk 不占槽位。
+  let ddgi_chunk_set = gate_render::ddgi::DdgiChunkSet { chunks: chunk_needed_chunks(&grid) };
 
   // 轨道相机为唯一相机状态源，DdaCameraConfig 由 `from_orbit` 生成（初始机位 = 场景中心俯视）。
   let orbit = if START_CAMERA_SKY {
@@ -84,9 +84,12 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
   } else {
     OrbitCamera::from_eye(cam_eye, cam_target)
   };
+  // 上次退出时的姿态优先（`data/ui/camera.ron`）；首启 / 存档坏了 → 场景默认机位。
+  let saved = crate::camera::CameraPose::load();
+  let orbit = saved.as_ref().map_or(orbit, |p| p.to_orbit());
   commands.insert_resource(orbit);
   commands.insert_resource(ddgi_world_aabb);
-  commands.insert_resource(ddgi_lod0_chunks);
+  commands.insert_resource(ddgi_chunk_set);
   commands.insert_resource(DdaCameraConfig::from_orbit(
     &orbit,
     FOV_Y,
@@ -94,9 +97,9 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     CAM_NEAR,
     CAM_FAR,
   ));
-  // 幽灵飞行相机（CameraMode 缺省 = Fly）：起点 = 轨道眼位，切模式时视野原地不动
-  // （见 camera::sync_camera_mode_switch）。
-  commands.insert_resource(crate::camera::CameraMode::default());
+  // 幽灵飞行相机：起点 = 轨道眼位，切模式时视野原地不动（见 camera::sync_camera_mode_switch）。
+  // 两种情况都必须与 `orbit.eye()` 一致，否则首帧的 `sync_camera_mode_switch` 会把眼位拽回去。
+  commands.insert_resource(saved.map_or(crate::camera::CameraMode::default(), |p| p.mode));
   commands.insert_resource(crate::camera::FlyCamera {
     pos: orbit.eye(),
     speed: crate::consts::FLY_SPEED_DEFAULT,
@@ -147,9 +150,9 @@ pub(crate) fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
 }
 
-/// DDGI LOD0 需要探针段的 chunk 集合（chunk 坐标 = 世界 voxel / 256，见 `DdgiLod0Chunks`）。
+/// DDGI chunk 级需要探针段的 chunk 集合（chunk 坐标 = 世界 voxel / 256，见 `DdgiChunkSet`）。
 /// 规则：① 自己有几何的 chunk 领一段；② 最外一层 16³ brick 非空时相邻 chunk 也领。
-fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
+fn chunk_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
   use gate_voxel::BrickState;
   use std::collections::HashSet;
   // 每轴 16 个 16³ brick（256 / 16）；边界层 = 坐标 0 或 15
@@ -205,12 +208,12 @@ fn lod0_needed_chunks(grid: &VolumeGrid) -> Vec<IVec3> {
 }
 
 /// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按 `assets/vox/<name>.vox` 重建主世界。
-/// 与 `setup` 同一套不变量：先 `compact_all` 再算 LOD0 chunk 集；`demo_force_full_rebuild` 触发全量
+/// 与 `setup` 同一套不变量：先 `compact_all` 再算 chunk 段集；`demo_force_full_rebuild` 触发全量
 /// 重建 + 全量 GPU 上传。失败 → 原世界保持不变；相机不动（所有模型锚到同一 anchor）。
 pub(crate) fn reload_world(
   scene: &mut VoxelScene,
   aabb: &mut gate_render::ddgi::DdgiWorldAabb,
-  lod0: &mut gate_render::ddgi::DdgiLod0Chunks,
+  chunk_set: &mut gate_render::ddgi::DdgiChunkSet,
   name: &str,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
@@ -218,12 +221,12 @@ pub(crate) fn reload_world(
   let mut grid = VolumeGrid::new();
   let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)?;
   grid.compact_all();
-  let chunks = lod0_needed_chunks(&grid);
+  let chunks = chunk_needed_chunks(&grid);
   scene.volumes = Volumes::new(grid);
   scene.demo_force_full_rebuild = true;
   aabb.min = info.aabb_min;
   aabb.max = info.aabb_max;
-  lod0.chunks = chunks;
+  chunk_set.chunks = chunks;
   Ok(info)
 }
 

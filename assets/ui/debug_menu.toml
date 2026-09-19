@@ -80,6 +80,7 @@ options = [
     "menu.render.ddgi.probe.lod1",
     "menu.render.ddgi.probe.lod2",
     "menu.render.ddgi.probe.lod3",
+    "menu.render.ddgi.probe.lod4",
     "menu.render.ddgi.probe.all",
 ]
 selected = 0

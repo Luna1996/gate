@@ -6,7 +6,7 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
-use gate_render::{DdaCameraConfig, VoxelScene};
+use gate_render::{DdaCameraConfig, ViewProbeDbgPick, VoxelScene};
 use gate_voxel::{
   BRICK_FACTOR, BrickState, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry, PaletteId, VolumeGrid,
   VoxelCoord,
@@ -14,7 +14,7 @@ use gate_voxel::{
 
 use crate::{
   camera::{CameraMode, cursor_ray},
-  consts::{DRAG_PX, EDIT_REACH},
+  consts::{DRAG_PX, EDIT_REACH, PROBE_DBG_REACH},
 };
 
 /// 笔触形状
@@ -125,6 +125,36 @@ fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   };
   grid.palette_mut().set(slot, want);
   slot
+}
+
+/// 「采样调试」（`main.wesl::probe_dbg_main`）的每帧拾取：把光标下的体素 + 入面法线写进
+/// `ViewProbeDbgPick`（只主世界）。开关关 / 未命中 → `valid = false`（着色器据此不画）。
+/// 指针不在窗口内（在别的显示器上）时退回屏幕中心射线：诊断视图不该依赖光标位置。
+pub(crate) fn probe_dbg_pick(
+  dbg: Res<gate_render::ddgi::DdgiDebugSettings>,
+  windows: Query<&Window>,
+  cfg: Res<DdaCameraConfig>,
+  scene: Option<Res<VoxelScene>>,
+  mut pick: ResMut<ViewProbeDbgPick>,
+) {
+  pick.valid = false;
+  if !dbg.probe_dbg {
+    return;
+  }
+  let (Ok(window), Some(scene)) = (windows.single(), scene) else { return };
+  let Some((origin, dir)) =
+    cursor_ray(window, &cfg).or_else(|| crate::camera::center_ray(&cfg))
+  else {
+    return;
+  };
+  let Some((voxel, face, _t)) = raycast_main(scene.volumes.main(), origin, dir, PROBE_DBG_REACH)
+  else {
+    return;
+  };
+  pick.voxel = voxel;
+  // 射线起点嵌在实体里时 `face` 无定义（零向量）：用 +Y 兜底，采样点仍落在体素旁。
+  pick.normal = if face == IVec3::ZERO { IVec3::Y } else { face };
+  pick.valid = true;
 }
 
 /// 世界空间射线 × 体素的 Amanatides-Woo 步进。返回 `(命中体素, 入面法线, 命中 t)`；

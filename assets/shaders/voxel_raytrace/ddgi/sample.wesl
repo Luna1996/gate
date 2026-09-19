@@ -1,6 +1,7 @@
-import package::bindings::{ddgi_cell, ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u};
-import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_BIAS_MAX_VOXELS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FIELD_MIN_W, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
-import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
+import package::bindings::{ddgi_cell, ddgi_depth, ddgi_irr, ddgi_meta, ddgi_slot_pos, ddgi_u, view_u};
+import package::common::{sky_rgb};
+import package::ddgi::consts::{DDGI_BIAS_CELLS, DDGI_BIAS_MAX_VOXELS, DDGI_CASCADE_BLEND, DDGI_CASCADE_FADE_CELLS, DDGI_CHUNK_LOD, DDGI_CLAIM_RADIUS, DDGI_CLAIM_SCAN_MASK, DDGI_CLAIM_WARMUP_FRAMES, DDGI_DARK_FLOOR, DDGI_DARK_FLOOR_COV, DDGI_DEPTH_SOFT_MIN, DDGI_DEPTH_TEXELS, DDGI_FIELD_MIN_W, DDGI_IRR_TEXELS, DDGI_LOD0_SEAM_COV, DDGI_LOD_COUNT, DDGI_META_ACTIVE, DDGI_META_ENABLED, DDGI_MIN_SAMPLE_AGE, DDGI_NORMAL_BIAS, DDGI_NO_PROBE, DDGI_OCCL_END_BIAS, DDGI_OCCL_W_MIN, DDGI_TEXEL_MIN_COVERAGE};
+import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cavity_narrow, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod0_claim, ddgi_lod0_seg_of, ddgi_meta_age, ddgi_oct_encode, ddgi_origin_cell, ddgi_slot, ddgi_usage_mark};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast, world_solid};
 
@@ -81,13 +82,20 @@ fn ddgi_box_edge_dist(lod: u32, p: vec3<f32>) -> f32 {
     min(p.z - lo.z, hi.z - p.z),
   );
 }
-// p 是否落在 LOD(lod) 的「壳」内：在 lod 盒内、且不在更细一级 lod-1 盒内。
+// p 是否落在 LOD(lod) 的「壳」内：LOD0 = 落在已领段的 16³ 砖里；其余级 = 在 lod 盒内、且不在更细一级盒内。
 fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
+  if (lod == 0u) {
+    // LOD0（最细级）不是空间盒，而是「细结构命中的砖」集合：查砖段表。
+    let cs = f32(ddgi_u.lods[0u].origin.w);
+    return ddgi_lod0_seg_of(vec3<i32>(floor(p / cs))) != DDGI_NO_PROBE;
+  }
   let L = ddgi_u.lods[lod];
   let o = vec3<f32>(L.origin.xyz);
   let ext = vec3<f32>(L.dims.xyz) * f32(L.origin.w);
   if (!(all(p >= o) && all(p < o + ext))) { return false; }
-  if (lod == 0u) { return true; }
+  // chunk 级不扣 LOD0：LOD0 是逐砖覆盖、不是嵌套盒，扣了会留下"谁也服务不到"的死区
+  // （LOD0 先试，拿不到数据时 `ddgi_sample` 会继续往下找）。
+  if (lod == DDGI_CHUNK_LOD) { return true; }
   let Lo = ddgi_u.lods[lod - 1u];
   let lo_f = vec3<f32>(Lo.origin.xyz);
   let hi_f = lo_f + vec3<f32>(Lo.dims.xyz) * f32(Lo.origin.w);
@@ -96,6 +104,7 @@ fn ddgi_lod_contains(lod: u32, p: vec3<f32>) -> bool {
 
 /// 采样 LOD(lod) 的 8 角三线性，返回 vec4(辐照度.xyz, 权重和)。
 /// 三个开关：`clamp_cells` 越界 cell 号 clamp 进本级窗口；`relax_normal` 下限抬到 0.25；`allow_backface` 放开 wn 符号闸门。
+/// `usage_track != 0` = 本次 invoke 是着色（要把命中的槽位记进「屏幕使用」粘滞计数；`ddgi_cast` 传 0）。
 fn ddgi_sample_lod(
   p: vec3<f32>,
   n: vec3<f32>,
@@ -103,6 +112,7 @@ fn ddgi_sample_lod(
   clamp_cells: bool,
   relax_normal: bool,
   allow_backface: bool,
+  usage_track: u32,
 ) -> vec4<f32> {
   let L = ddgi_u.lods[lod];
   let cs = f32(L.origin.w);
@@ -171,7 +181,7 @@ fn ddgi_sample_lod(
         if (wtri <= 1e-6) { continue; }
         // ---- 记账：候选角（有数据、判活、年龄够、权重非零）即算「本帧被屏幕用到」，不要求过可见性闸门。 ----
         // 只记紧贴本像素的角（与基础角格差 ≤ 2 格）。
-        if (ddgi_usage_track != 0u && all(abs(wc - wc0) <= vec3<i32>(2))) { ddgi_usage_mark(slot); }
+        if (usage_track != 0u && all(abs(wc - wc0) <= vec3<i32>(2))) { ddgi_usage_mark(slot); }
         let probe = ddgi_slot_pos[slot].xyz;
         let to = ps - probe;
         let dist = length(to);
@@ -246,8 +256,6 @@ fn ddgi_sample_lod(
   return vec4<f32>(select(vec3<f32>(0.0), total / wsum, ok), wsum);
 }
 var<private> ddgi_dbg_wsum: f32;
-/// 1 = 本次 invoke 是着色（`dda_main`），0 = cast 的 GI 回读（`ddgi_cast`），由调用方在入口设置。
-var<private> ddgi_usage_track: u32;
 /// 「有可用数据」的角的名义权重覆盖度 Σ wtri（不含 wn/wd 照明闸门），天光兜底的唯一判据。
 /// 分母已扣 cov_solid（下限 0.25）；着色侧用它决定是否退回常量天光。
 var<private> ddgi_dbg_cov: f32;
@@ -289,7 +297,7 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
   if (lod > 0u) {
     let d = -ddgi_box_edge_dist(lod - 1u, p);
     if (d >= 0.0 && d < W) {
-      let rf = ddgi_sample_lod(p, n, lod - 1u, true, false, false);
+      let rf = ddgi_sample_lod(p, n, lod - 1u, true, false, false, 0u);
       if (rf.w >= 1e-4) {
         out = mix(main_c, rf.xyz, 0.5 * (1.0 - d / W));
       }
@@ -298,7 +306,7 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
   if (lod + 1u < DDGI_LOD_COUNT) {
     let d = ddgi_box_edge_dist(lod, p);
     if (d >= 0.0 && d < W) {
-      let rc = ddgi_sample_lod(p, n, lod + 1u, false, false, false);
+      let rc = ddgi_sample_lod(p, n, lod + 1u, false, false, false, 0u);
       if (rc.w >= 1e-4) {
         out = mix(main_c, rc.xyz, 0.5 * (1.0 - d / W));
       }
@@ -314,7 +322,53 @@ fn ddgi_cascade_blend(p: vec3<f32>, n: vec3<f32>, lod: u32, main_c: vec3<f32>) -
   return out;
 }
 
-fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+/// 采样入口（着色侧唯一入口）：先跑 5 级阶梯，再按**几何判据**决定要不要认领细级瓦片。
+/// 认领触发（只有一条，见 `ddgi_cavity_narrow`）：本点处在"粗级格子表达不了"的窄腔里（窄过道/夹层）。
+/// 不用"GI 值黑"当判据：① 稳态下窄过道常被更粗一级垫出高于阈值的值 ⇒ 永远不认领；
+/// ② 启动、编辑后探针重烘时会到处都黑 ⇒ 一口气领掉一大片（"放太多"就是这么来的）。
+/// `usage_track`：非 0 = 本 invoke 参与「屏幕使用」记账与细级认领（着色侧按扫描带逐帧轮转）。
+/// `shade`：本 invoke 是不是**着色**（`dda_main` / `gi_main`）—— 只有着色才补极暗地板；
+/// `ddgi_cast` 的 GI 回读绝不能吃地板，否则地板会随 GI 递归传播，"无光室内保持纯黑"就不成立。
+/// 必须走**参数**而不是模块级变量：模块级 `var<private>` 由 main 模块赋值、sample 模块读取时不可靠。
+fn ddgi_sample(p: vec3<f32>, n: vec3<f32>, usage_track: u32, shade: bool) -> vec3<f32> {
+  var c = ddgi_sample_ladder(p, n, usage_track);
+  // 「探针有数据（cov 高）但一个角都看不到（wsum ≈ 0）」= 被几何完全包住（草根、极窄缝）。
+  // 那里的 0 是二值可见性的产物，堆探针也解不了；补一个极暗常量（见 DDGI_DARK_FLOOR）。
+  // 无光暗室是「采样成功、辐照度本来就是 0」（wsum > 0）⇒ 不在此列，仍是纯黑。
+  if (shade
+    && DDGI_DARK_FLOOR > 0.0
+    && ddgi_dbg_cov >= DDGI_DARK_FLOOR_COV
+    && ddgi_dbg_wsum < 1e-4) {
+    c = c + sky_rgb() * DDGI_DARK_FLOOR;
+  }
+  if (shade && ddgi_claim_ready(p) && ddgi_claim_scan_hit(p)
+    && ddgi_cavity_narrow(make_grid(0u), p)) {
+    ddgi_lod0_claim(p, n);
+  }
+  return c;
+}
+
+/// 认领的稀疏扫描命中（空间哈希 ^ 帧号）：几何判定只在极少数像素上跑，逐帧轮转，
+/// 几帧内覆盖到所有可见瓦片。认领本身是按瓦片幂等的，不需要每像素都试。
+fn ddgi_claim_scan_hit(p: vec3<f32>) -> bool {
+  let h = (bitcast<u32>(p.x) * 73856093u)
+    ^ (bitcast<u32>(p.y) * 19349663u)
+    ^ (bitcast<u32>(p.z) * 83492791u)
+    ^ u32(ddgi_u.params.x);
+  return (h & DDGI_CLAIM_SCAN_MASK) == 0u;
+}
+
+/// 该点是否有资格认领细级：只用来压掉启动瞬间的爆发（那时整屏都黑，且探针还没投够线），
+/// 以及把认领限制在**相机看得见的那片半径**内（细级只对近处细节有意义，远处领了白占池子）。
+/// 注意它不改变"某个地点该不该认领"的判据本身，也不动已有探针。
+fn ddgi_claim_ready(p: vec3<f32>) -> bool {
+  if (u32(ddgi_u.params.x) < DDGI_CLAIM_WARMUP_FRAMES) { return false; }
+  if (DDGI_CLAIM_RADIUS <= 0.0) { return true; }
+  let d = p - view_u.cam_pos_voxel.xyz;
+  return dot(d, d) <= DDGI_CLAIM_RADIUS * DDGI_CLAIM_RADIUS;
+}
+
+fn ddgi_sample_ladder(p: vec3<f32>, n: vec3<f32>, usage_track: u32) -> vec3<f32> {
   let outer = DDGI_LOD_COUNT - 1u;
   let w_edge = f32(ddgi_u.lods[outer].origin.w) * DDGI_CASCADE_FADE_CELLS;
   ddgi_dbg_edge = clamp(ddgi_box_edge_dist(outer, p) / max(w_edge, 1e-3), 0.0, 1.0);
@@ -327,7 +381,7 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   for (var lod = 0u; lod < DDGI_LOD_COUNT; lod = lod + 1u) {
     if (ddgi_lod_contains(lod, p)) {
       in_cascade = true;
-      let r = ddgi_sample_lod(p, n, lod, false, false, false);
+      let r = ddgi_sample_lod(p, n, lod, false, false, false, usage_track);
       ddgi_dbg_rej_out = ddgi_dbg_rej;
       ddgi_dbg_occl_out = ddgi_dbg_occl;
       ddgi_dbg_wsum = r.w;
@@ -337,19 +391,40 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       field_irr_shell = ddgi_field;
       field_w_shell = ddgi_field_w;
       if (r.w >= 1e-4) {
-        return ddgi_cascade_blend(p, n, lod, r.xyz);
+        // ---- LOD0 → chunk 级的接缝混合带 ----
+        // LOD0 是逐砖覆盖的：像素贴着已认领瓦片边界时，8 个角只有一部分落在砖里，直接取用会在
+        // 边界上出现明显接缝。按 LOD0 严格采样的覆盖度做过渡：覆盖不满就朝 chunk 级（LOD1）拉。
+        var c_main = r.xyz;
+        var cov_main = cov_strict_shell;
+        if (lod == 0u) {
+          let t0 = clamp(cov_strict_shell / DDGI_LOD0_SEAM_COV, 0.0, 1.0);
+          if (t0 < 1.0) {
+            let dbg_rej0 = ddgi_dbg_rej;
+            let dbg_occl0 = ddgi_dbg_occl;
+            let rc = ddgi_sample_lod(p, n, DDGI_CHUNK_LOD, false, false, false, usage_track);
+            let cov_c = ddgi_dbg_cov;
+            ddgi_dbg_rej = dbg_rej0;
+            ddgi_dbg_occl = dbg_occl0;
+            if (rc.w >= 1e-4) {
+              c_main = mix(rc.xyz, c_main, t0);
+              cov_main = mix(cov_c, cov_strict_shell, t0);
+            }
+          }
+        }
+        ddgi_dbg_cov = cov_main;
+        return ddgi_cascade_blend(p, n, lod, c_main);
       }
       // r2 = 同一级放宽 wn（下限 0.25）重试（不 clamp、不换级）。
       let rej_shell = ddgi_dbg_rej;
       let occl_shell = ddgi_dbg_occl;
-      let r2 = ddgi_sample_lod(p, n, lod, false, true, false);
+      let r2 = ddgi_sample_lod(p, n, lod, false, true, false, usage_track);
       if (r2.w >= 1e-4) {
         ddgi_dbg_wsum = r2.w;
         ddgi_dbg_fb = 3.0;
         return ddgi_cascade_blend(p, n, lod, r2.xyz);
       }
       // ---- 末级兜底 r3'：放开 wn 符号闸门，只保留 Chebyshev wd + 逐角线段求交两个精确判据 ----
-      let r3 = ddgi_sample_lod(p, n, lod, false, true, true);
+      let r3 = ddgi_sample_lod(p, n, lod, false, true, true, usage_track);
       if (r3.w >= 1e-4) {
         ddgi_dbg_wsum = r3.w;
         ddgi_dbg_fb = 4.0;
@@ -359,7 +434,9 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
       ddgi_dbg_cov = cov_strict_shell;
       ddgi_dbg_rej = rej_shell;
       ddgi_dbg_occl = occl_shell;
-      // 嵌套级联下 p 至多落在一级壳内。
+      // LOD0 的覆盖是逐砖的、砖内 cell 未必都放了探针：本级没数据时继续找更粗的级（回落到 chunk 级）。
+      if (lod == 0u) { continue; }
+      // 其余级是严格嵌套盒，p 至多落在一级壳内。
       break;
     }
   }
@@ -373,6 +450,8 @@ fn ddgi_sample(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   }
   // ---- 末级兜底 r4：用「本点一侧的探针场插值」（只按同侧余弦权重），并把 cov 置 1。 ----
   // 触发：主级壳内 r1/r2/r3' 全失败，但 `field_w_shell ≥ DDGI_FIELD_MIN_W`。
+  // r4 只是"垫一层颜色"（不分方向、不看遮挡），不是真 GI；认领细级由 `ddgi_sample` 按**几何**判据做
+  // （这里不认领：进 r4 只说明"这一级的逐探针数据不可用"，在启动/编辑的重烘瞬态里到处都是这种情况）。
   if (field_w_shell >= DDGI_FIELD_MIN_W) {
     ddgi_dbg_fb = 5.0;
     ddgi_dbg_wsum = field_w_shell;

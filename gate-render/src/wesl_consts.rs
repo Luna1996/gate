@@ -23,6 +23,8 @@ pub struct DdgiConsts {
   pub atlas_layers: u32,
   /// LOD 级数（`DDGI_LOD_COUNT`）；必须等于 `crate::ddgi::DDGI_LODS`
   pub lod_count: u32,
+  /// 按 chunk 领段的那一级（`DDGI_CHUNK_LOD`）；必须等于 `crate::ddgi::DDGI_CHUNK_LOD`
+  pub chunk_lod: u32,
   /// 每帧射线总预算（`DDGI_RAY_BUDGET`），seal 用它算 rpp
   pub ray_budget: u32,
   /// worklist 打包的 cell 下标位宽（`DDGI_WL_IDX_MASK`）
@@ -80,6 +82,7 @@ const REQUIRED: &[&str] = &[
   "DDGI_PROBES_PER_LAYER_AXIS",
   "DDGI_ATLAS_LAYERS",
   "DDGI_LOD_COUNT",
+  "DDGI_CHUNK_LOD",
   "DDGI_RAY_BUDGET",
   "DDGI_WL_IDX_MASK",
   "DDGI_WL_LOD_SHIFT",
@@ -87,6 +90,9 @@ const REQUIRED: &[&str] = &[
   "DDGI_INDIR_COLL_BASE",
   "DDGI_INDIR_RPP_BASE",
   "DDGI_INDIR_COUNT_BASE",
+  "DDGI_INDIR_RAYBASE_BASE",
+  "DDGI_INDIR_COLLBASE_BASE",
+  "DDGI_INDIR_RAY_TOTAL",
 ];
 
 /// 解析 WESL 包里的跨端常量（首次读盘，之后走 `OnceLock`）。
@@ -120,6 +126,7 @@ impl DdgiConsts {
       probes_per_layer_axis: get("DDGI_PROBES_PER_LAYER_AXIS"),
       atlas_layers: get("DDGI_ATLAS_LAYERS"),
       lod_count: get("DDGI_LOD_COUNT"),
+      chunk_lod: get("DDGI_CHUNK_LOD"),
       ray_budget: get("DDGI_RAY_BUDGET"),
       wl_idx_mask: get("DDGI_WL_IDX_MASK"),
       wl_lod_shift: get("DDGI_WL_LOD_SHIFT"),
@@ -139,6 +146,34 @@ impl DdgiConsts {
       );
       error!("{msg}");
       panic!("{msg}");
+    }
+    if out.chunk_lod as usize != crate::ddgi::DDGI_CHUNK_LOD {
+      let msg = format!(
+        "WESL DDGI_CHUNK_LOD = {} 与 Rust ddgi::DDGI_CHUNK_LOD = {} 不一致：\
+         它决定哪一级走 chunk 段池寻址，错位会让所有探针都读不到自己的记录。",
+        out.chunk_lod,
+        crate::ddgi::DDGI_CHUNK_LOD
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    // `ddgi_indirect` 的各段都是按「每段预留 8 个 LOD」摆的字面量基址；级数变化时要重新核对，
+    // 重叠会让 `ddgi_seal` 里多个线程并发写同一个 word（读到谁的值是随机的）→ cast/collect 全线错位。
+    {
+      let n = out.lod_count;
+      let (rb, cb) = (values["DDGI_INDIR_RAYBASE_BASE"], values["DDGI_INDIR_COLLBASE_BASE"]);
+      let (rt, rpp) = (values["DDGI_INDIR_RAY_TOTAL"], out.indir_rpp_base);
+      let ok = rb + n <= cb && cb + n <= rt && rt + 2 <= rpp && rpp + n <= out.indir_count_base;
+      if !ok {
+        let msg = format!(
+          "WESL ddgi_indirect 的 word 段重叠（LOD 数 = {n}）：ray_base={rb}、coll_base={cb}、\
+           ray_total={rt}、rpp={rpp}、count={}。改级数（或改段基址）时必须保证 \
+           ray_base+级数 ≤ coll_base、coll_base+级数 ≤ ray_total、rpp+级数 ≤ count。",
+          out.indir_count_base
+        );
+        error!("{msg}");
+        panic!("{msg}");
+      }
     }
     if out.atlas_layers == 0
       || out.probes_per_layer_axis == 0

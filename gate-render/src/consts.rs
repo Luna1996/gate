@@ -34,8 +34,9 @@ pub const DDGI_OCCLUSION: bool = true;
 pub const VIEW_SIZE: UVec2 =
   UVec2::new(crate::brickmap::consts::VIEW_W, crate::brickmap::consts::VIEW_H);
 
-/// DDGI 四级 LOD 的 cell 边长（voxel，逐级 ×2；长度 = `ddgi::DDGI_LODS`）
-pub const DDGI_LOD_CELL_SIZES: [i32; 4] = [16, 32, 64, 128];
+/// DDGI 五级 LOD 的 cell 边长（voxel，逐级 ×2；长度 = `ddgi::DDGI_LODS`）。
+/// LOD0（cell 4）不铺满：逐 16³ 砖在运行时认领；其余级按世界 AABB 铺满；`DDGI_CHUNK_LOD` 那级按 chunk 领段。
+pub const DDGI_LOD_CELL_SIZES: [i32; 5] = [4, 16, 32, 64, 128];
 
 /// 默认天空色（Minecraft 白天平原，线性空间 rgb）
 pub const MINECRAFT_SKY: [f32; 3] = [120.0 / 255.0, 167.0 / 255.0, 1.0];

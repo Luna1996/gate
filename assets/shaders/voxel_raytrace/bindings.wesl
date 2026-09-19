@@ -17,7 +17,9 @@ struct DdaViewUniform {
   cam_pos_voxel: vec4<f32>,      // 16B，w=1
   debug_mode: vec4<f32>,        // 16B：x = 法向可视化，y = face 6 色诊断
   lod: vec4<f32>,               // 16B：x = 像素角大小(rad)，y = LOD 早停开关
-  probe_viz_params: vec4<f32>,  // 16B：x = 总探针数，y = 方块边长(px)
+  probe_viz_params: vec4<f32>,  // 16B：x = 总探针数，y = 方块边长(px)，z = 只画该 LOD（≥ LOD 数 = 全画）
+  probe_dbg: vec4<f32>,         // 16B：xyz = 鼠标命中的体素（voxel 坐标），w = 1 开启采样调试
+  probe_dbg_n: vec4<f32>,       // 16B：xyz = 该体素的入面法线（轴对齐）
 }
 @group(0) @binding(1) var<uniform> view_u: DdaViewUniform;
 
@@ -101,17 +103,19 @@ struct LightPool {
 
 // 世界空间探针网格（每 LOD）：origin.xyz = 世界原点（voxel）、origin.w = cell 边长；
 // dims.xyz = cell 维度、dims.w = 该 LOD 在全局 slot 数组中的起始下标。
+// 级号越大 cell 越粗。LOD0（最细）与 chunk 级（`DDGI_CHUNK_LOD`）不按空间盒满铺、定位走段表，
+// 它们的 dims.xyz 只用于局部规则网格的假设（LOD0 = 每砖每轴 cell 数、chunk 级 = 自己的空间盒）。
 struct DdgiLod {
   origin: vec4<i32>,
   dims: vec4<u32>,
 };
-// LOD0 的 chunk 段编址。
+// chunk 级段编址。
 struct DdgiChunk {
   origin: vec4<i32>,
   dims: vec4<u32>,
 };
 struct DdgiUniform {
-  lods: array<DdgiLod, 4>,
+  lods: array<DdgiLod, 5>,
   // x=帧计数, y=调试模式(0..4), z=GI 增益, w=保留（恒 0）
   params: vec4<f32>,
   // x=GI 开关, y=总槽位数, z=Chebyshev std 信任系数（0..1）, w=级联覆盖之外的天光兜底强度
@@ -119,8 +123,8 @@ struct DdgiUniform {
   // 脏区（世界 voxel AABB）：dirty_min.xyz = min、w = 1 表示有效；dirty_max.xyz = max（不含）
   dirty_min: vec4<f32>,
   dirty_max: vec4<f32>,
-  // LOD0 chunk 段编址（仅 lod==0 读）：origin.xyz = chunk 网格原点、origin.w = 每 chunk 每轴 cell 数（16）。
-  // dims.xyz = chunk 网格维度、dims.w = LOD0 已分配槽数（探针池高水位）。
+  // chunk 级段编址（仅 chunk 级读）：origin.xyz = chunk 网格原点、origin.w = 每 chunk 每轴 cell 数（16）。
+  // dims.xyz = chunk 网格维度、dims.w = chunk 级已分配槽数（探针池高水位）。
   chunk: DdgiChunk,
   // 性能档位（菜单开关，与 Rust `DdgiUniform.flags` 逐字段镜像）：
   // x = 保留（恒 0）、y = 半分辨率 GI（0 = 逐像素内联采样，1 = 1/2 分辨率缓冲双线性取用）、zw = 保留。
@@ -133,8 +137,8 @@ struct DdgiUniform {
 // 3：烘焙输出（bake 写 / sort 读）；4：age/enabled（读写）
 @group(4) @binding(3) var<storage, read_write> ddgi_cell: array<u32>;
 @group(4) @binding(4) var<storage, read_write> ddgi_meta: array<u32>;
-// BG4 binding 5：indirect args / 计数器合一（array<atomic<u32>> 的 word 布局）：[0..16) cast args ×4 LOD、
-// [16..32) collect args ×4 LOD、[32..36) rpp ×4 LOD、[36..40) 活跃探针计数（CPU 清零、sort atomicAdd、seal 读）。
+// BG4 binding 5：`ddgi_indirect` = 前缀和映射表 + 每帧计数器（word 基址见下面的 `DDGI_INDIR_*`）。
+// 另有独立的 `ddgi_args`（BG6）承载 indirect dispatch 参数。
 @group(4) @binding(5) var<storage, read_write> ddgi_indirect: array<atomic<u32>>;
 // worklist item = vec4(probe_pos_voxel.xyz, bitcast<f32>(age | lod<<24))；每 LOD 段起于 slot_base[lod]
 @group(4) @binding(6) var<storage, read_write> ddgi_worklist: array<vec4<f32>>;
@@ -143,10 +147,23 @@ struct DdgiUniform {
 @group(4) @binding(8) var<storage, read_write> ddgi_cell_id: array<vec4<i32>>;
 // 9：阶段二 cast 输出的射线样本：每样本 2 个 vec4 = (方向.xyz, 命中距离) / (辐亮度.xyz, 1)
 @group(4) @binding(9) var<storage, read_write> ddgi_samples: array<vec4<f32>>;
-/// LOD0 的 chunk 段表 + 每槽位「屏幕使用」漏桶计数共用本 buffer（偏移由 `misc.y` 与 chunk 维度算出）：
+/// chunk 级段表 + 每槽位「屏幕使用」漏桶计数共用本 buffer（偏移由 `misc.y` 与 chunk 维度算出）：
 /// [0, total_slots) = 使用计数（着色侧标记、`ddgi_sort` 衰减；Rust 重建本 buffer 时填 0）、
-/// [total_slots, +num_chunks) = chunk_base、之后到 +lod0_slots = slot_chunk。
+/// [total_slots, +num_chunks) = chunk_base、之后到 +chunk_slots = slot_chunk。
 @group(4) @binding(10) var<storage, read_write> ddgi_cell_slot: array<u32>;
+
+/// LOD0（细级）的段表。布局（word 偏移，`N` = chunk 数、`S` = LOD0 预留槽数，两者都由 WGSL 从
+/// `ddgi_u` 推出，不需要额外 uniform 字段）：
+/// - `[0, N)`：chunk 线性下标 → 该 chunk 的砖表在下面的起始 word（`DDGI_NO_PROBE` = 该 chunk 无砖表）
+/// - `[N, N+S)`：LOD0 槽（级内下标）→ 全局砖线性号（`chunk 线性 × 砖数/chunk + chunk 内砖线性`）；
+///   只有下标 < 分配游标（`ddgi_lod0_next`）的槽位被领过，其余是空位
+/// - `[N+S, …)`：per-chunk 的砖表，每张 `DDGI_LOD0_BRICKS_PER_AXIS³` 项，砖 → 段基址（`DDGI_NO_PROBE` = 未领段）
+/// 段基址的领取与写入全在 GPU 侧（`helpers.wesl::ddgi_lod0_claim`），Rust 只建表并把砖表填成 `DDGI_NO_PROBE`。
+@group(4) @binding(11) var<storage, read_write> ddgi_lod0: array<u32>;
+
+/// LOD0 的运行时认领状态（布局见 `consts.wesl` 的 `DDGI_LOD0_STATE_*`）：段分配游标 + 每 chunk 的
+/// 认领位图。Rust 只按 chunk 网格开好 buffer 并清零。
+@group(4) @binding(12) var<storage, read_write> ddgi_lod0_state: array<atomic<u32>>;
 
 // ===== @group(5)：collect 的图集写入侧（只被 ddgi_collect 使用）=====
 // 只放两个存储纹理，其它缓冲（worklist / samples / indirect / uniform）复用 BG4 的绑定。
@@ -162,19 +179,21 @@ struct DdgiUniform {
 @group(5) @binding(5) var gi_cov_tex: texture_2d<f32>;
 
 // ===== @group(6)：seal 的 dispatch 参数写入侧（只被 ddgi_seal 使用）=====
-// [0..16) cast args ×4 LOD；[16..32) collect args ×4 LOD（每 LOD 4 word：x, y, z, pad，y = lod+1）。
-// 必须与 `ddgi_indirect` 分开绑定。
+// `ddgi_args`：cast 参数在 [0,3]、collect 参数在 [16,19]（全局各一次间接派发，不按级分开）。
+// 候选必须在 `ddgi_indirect` 之外单独绑定。
 @group(6) @binding(0) var<storage, read_write> ddgi_args: array<atomic<u32>>;
 
+// `ddgi_args` 的 word 基址。
 const DDGI_INDIR_CAST_BASE: u32 = 0u;
 const DDGI_INDIR_COLL_BASE: u32 = 16u;
-const DDGI_INDIR_RPP_BASE: u32 = 32u;
-const DDGI_INDIR_COUNT_BASE: u32 = 36u;
-// ddgi_indirect 另用 [0..10)：全 LOD 连续线程空间映射表（seal 写前缀和，cast/collect 二分还原 (lod, probe, ray)）。
-const DDGI_INDIR_RAYBASE_BASE: u32 = 0u;  // ray_base[lod]：该级首线程在全局空间的位置
-const DDGI_INDIR_COLLBASE_BASE: u32 = 4u; // coll_base[lod]
-const DDGI_INDIR_RAY_TOTAL: u32 = 8u;     // 全局 cast 线程总数
-const DDGI_INDIR_COLL_TOTAL: u32 = 9u;    // 全局 collect 线程总数
+// `ddgi_indirect` 的 word 基址。每段按 8 个 LOD 预留：段起址必须落在 8 的倍数上，
+// 且 `RPP_BASE + 8 <= COUNT_BASE`；改级数（≤8）不必重算这些字面量（Rust 侧启动时断言不重叠）。
+const DDGI_INDIR_RAYBASE_BASE: u32 = 0u;  // [0,8)   ray_base[lod]：该级首线程在全局 cast 空间的位置
+const DDGI_INDIR_COLLBASE_BASE: u32 = 8u; // [8,16)  coll_base[lod]
+const DDGI_INDIR_RAY_TOTAL: u32 = 16u;    // 全局 cast 线程总数
+const DDGI_INDIR_COLL_TOTAL: u32 = 17u;   // 全局 collect 线程总数
+const DDGI_INDIR_RPP_BASE: u32 = 24u;     // [24,32) rpp[lod]（预算均分给本帧工作集）
+const DDGI_INDIR_COUNT_BASE: u32 = 36u;   // [36,44) 活跃探针计数（CPU 清零、sort atomicAdd、seal 读）
 
 // ===== @group(7)：眼睛适应（自动曝光）——被 `dda_main`（读曝光）与 eye_adapt_* 两个入口使用 =====
 /// `out_tex` 的采样视图（同一张图），统计曝光已应用之后的颜色。

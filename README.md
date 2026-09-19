@@ -45,7 +45,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
 | **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
 | **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass；局部 AABB slab 剔除 |
-| **DDGI** | ✅ 生产可用 | 4 级世界锚定级联（cell 16/32/64/128 voxel，严格嵌套）；LOD0 按 chunk 从探针池领固定 4096 槽段；探针放在「最大全空叶」中心；每探针 4×4 辐照度 + 8×8 深度（均值/方差/更新数）图集，时域 EMA + 6 邻域空间混合 + Chebyshev 软遮挡；活跃探针 worklist + indirect `cast`/`collect`；增量重烘只覆盖 dirty AABB 命中的 cell |
+| **DDGI** | ✅ 生产可用 | 5 级嵌套级联（cell 4/16/32/64/128 voxel）：LOD0（最细）只覆盖「细结构」命中的 16³ 砖、按砖领 64 槽段；LOD1 按 chunk 从探针池领固定段，LOD2~4 锚定世界 AABB；探针放在「最大全空叶」中心；每探针 4×4 辐照度 + 8×8 深度（均值/方差/更新数）图集，时域 EMA + 6 邻域空间混合 + Chebyshev 软遮挡；活跃探针 worklist + indirect `cast`/`collect`；增量重烘只覆盖 dirty AABB 命中的 cell |
 | **光照场（AO）** | ✅ 生产可用 | 相机中心、世界锚定的 32³ × 16 voxel 网格（`Rgba16Unorm`，硬件三线性），.a = AO fill 直接乘进命中着色；发光走「命中直出自身颜色 + 进 GI」，不再走发光密度通道 |
 | **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
 | **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
@@ -71,14 +71,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 [Bevy 主 world]
   Startup : scene::setup —— 读 lighting/*.ron、建 VolumeGrid（默认 vox / demo 程序化，见 consts）、
-            算 DDGI 世界 AABB + LOD0 chunk 集、初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
+            算 DDGI 世界 AABB + chunk 段集、初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
   Update  : 相机链（模式对齐 → 转头 → 各模式输入 → 拾取 → build_camera_config）→ 体素编辑
             → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
   Last    : poll_pending —— UploadBudget（4MB/帧）× DirtyTracker → MainPending
       ↓ ExtractSchedule（main → render world）
   extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB) + LightFieldUpdate
   extract_camera : DdaCameraConfig → DdaViewUniform
-  extract_ddgi   : DdgiStage / DdgiDebugSettings / DdgiWorldAabb / DdgiLod0Chunks / 曝光活参数
+  extract_ddgi   : DdgiStage / DdgiDebugSettings / DdgiWorldAabb / DdgiChunkSet / 曝光活参数
       ↓ render world
   RenderStartup    : init_dda_pipelines / init_empty_gpu / init_ddgi_gpu / queue_ddgi_pipelines
   PrepareResources : prepare_upload（struct/palette/comp/state/grid_descs + 光照场 3D 纹理 + 扩容）
@@ -100,8 +100,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 2. **方向可达掩码 LUT（b_leaves，Douglas #18）**：8 octant × 64 入口格 × 2 字的保守可达集，
    `occupancy & reach` 在进入子块前剔除；LUT 是真实可达集的**超集**，绝不漏命中。
 3. **beam 预 pass**：1/4 分辨率先求「最近命中 t」，主 pass 从该 t 起步 —— 近场空空间不产生步进。
-4. **世界锚定 DDGI**：探针槽位 = 世界 cell mod dims（LOD1~3）/ chunk 固定段（LOD0），相机移动不换主、不闪烁；
-   编辑只重烘 dirty AABB 命中的 cell。DDGI chunk 段基址**一经分配不再改变**（基址变 = 图集整段错位）。
+4. **世界锚定 DDGI**：探针槽位 = 世界 cell mod dims（LOD2~4）/ chunk 固定段（LOD1）/ 16³ 砖固定段（LOD0），
+   相机移动不换主、不闪烁；编辑只重烘 dirty AABB 命中的 cell。DDGI 段基址**一经分配不再改变**（基址变 = 图集整段错位）。
 5. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
 6. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
    关掉 FXAA 时只是换一条 fragment 入口，无分支代价。
@@ -158,7 +158,7 @@ gate-ui/           自研 bevy_ui 组件库 + 调试菜单 + 世界标签
 gate-app/          Demo 应用入口
                    - main.rs       插件装配、窗口/日志/i18n 初始化、系统注册、环境变量开关
                    - scene.rs      setup + 程序化极限场景 build_demo_scene + reload_world 换世界 +
-                                   lod0_needed_chunks（DDGI LOD0 段分配集）
+                                   chunk_needed_chunks（DDGI chunk 级段分配集）
                    - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / cursor_ray / 拾取 recenter
                    - edit.rs       EditSettings + BrushShape/BrushMaterial + raycast_main + 笔触施加与输入
                    - vox_scene.rs  MagicaVoxel .vox 导入（vox-rs）+ scan_vox_models 模型发现
@@ -218,13 +218,35 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | `VIEW_SIZE` | 1280×720 | 初始渲染分辨率（窗口内部分辨率 = 物理像素 ÷ `RenderScale.factor`） |
 | DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` 工作组边长（须与 WESL 一致） |
 | beam / GI 分辨率 | 1/4 / 1/2 | beam depth 纹理；半分辨率 GI 缓冲（premultiplied valid 格式） |
-| DDGI 级联 | 4 级，cell `[16, 32, 64, 128]` voxel | 世界 AABB 锚定、严格嵌套；网格外扩 `DDGI_GRID_MARGIN = 16` voxel |
-| LOD0 chunk 段 | 4096 槽/chunk | (256/16)³；池高水位定容，段基址分配后不变 |
-| DDGI 图集 | 4×4 irr + 8×8 depth / 探针 | 每层 40² 探针（`DDGI_PROBES_PER_LAYER_AXIS`），272 层 |
+| DDGI 级联 | 5 级，cell `[4, 16, 32, 64, 128]` voxel | 严格嵌套（LOD0 例外：逐砖覆盖、不参与扣洞）；世界 AABB 外扩 `DDGI_GRID_MARGIN = 16` voxel |
+| LOD0 瓦片段 | 8 槽/瓦片（8³ voxel） | 段在运行时认领：着色时各级都拿不到有效样点 → 认领该点所在瓦片（`helpers.wesl::ddgi_lod0_claim`）；Rust 只按容量预留槽位并建瓦片表。`ddgi_bake0` **每帧都派发**（认领只改段表、动不到网格/修订号，「变化才烘」捞不到新领的段） |
+| chunk 段 | 4096 槽/chunk（LOD1） | `(256/16)³`；池高水位定容，段基址分配后不变 |
+| DDGI 图集 | 4×4 irr + 8×8 depth / 探针 | 每层 40² 探针（`DDGI_PROBES_PER_LAYER_AXIS`），296 层 |
 | `DDGI_RAY_BUDGET` | 65536 射线/帧 | 摊给活跃探针（worklist 驱动 indirect dispatch） |
-| 刷新周期 / 跳过年龄 | `(65, 97, 129, 161)` / `(32, 24, 16, 12)` | 逐 LOD 的探针刷新节奏（WESL `ddgi/consts.wesl`） |
+| 刷新周期 / 跳过年龄 | `(65, 97, 129, 161)` / `(32, 24, 16, 12)` | 逐 LOD 的探针刷新节奏（WESL `ddgi/consts.wesl`）；下标 = `ddgi_lod_param_idx(lod)`，LOD0 与 LOD1 同档 |
 | 光照场 | 32³ cell × 16 voxel | `Rgba16Unorm` 3D 纹理，.a = AO fill；世界覆盖 512 voxel = ±5.12m |
 | `SHADOW_SURFACE_EPS` | 1/32 voxel | 阴影/二次射线起点沿法线外推（防自命中，与 WGSL 同步） |
+
+### 4.1 LOD0 认领与"黑点"相关的可调项（都在 `ddgi/consts.wesl`）
+
+| 符号 | 值 | 含义 |
+|---|---|---|
+| `DDGI_CLAIM_CAVITY` | 16 | **认领主触发（几何）**：法线之外的两个轴上，至少一个方向的空腔宽度落在 `[3, 本值]` ⇒ 认领该点瓦片。16 = 一个 chunk cell（粗级格子表达不了比自己更窄的空腔）；开阔地形/大厅不认领，1~2 voxel 缝也不认领。0 = 关闭认领 |
+| `DDGI_CLAIM_SCAN_MASK` | 1023 | 认领的**稀疏扫描**：几何判定只对 `1/(本值+1)` 的像素做（空间哈希 ^ 帧号，逐帧轮转），认领本身按瓦片幂等。调大可省算力、调小可更快铺满 |
+| `DDGI_CLAIM_WARMUP_FRAMES` | 90 | 启动预热期：brickmap 还没建起来 + 探针没投线，几何判据此刻不可靠。**不改变任何地点是否有资格认领** |
+| `DDGI_CLAIM_RADIUS` | 192 | 只认相机半径内的瓦片（细级只对近处可见细节有意义）；0 = 不限 |
+| `DDGI_DARK_FLOOR` / `_COV` | 0.01 / 0.5 | "被几何完全包住"（`cov ≥ _COV` 且 `wsum ≈ 0`）时的极暗地板，把纯黑抬成极暗灰；采样成功但值就是 0 的无光室内**不受影响** |
+| `DDGI_LOD0_SEAM_COV` | 1.0 | LOD0→chunk 级接缝混合带：按 LOD0 严格采样的覆盖度朝 chunk 级混合 |
+| `DDGI_CAST_SUN` | 1.0 | 探针射线命中面的**直射太阳**项（GI 唯一的直射光源）；0 = 整段折掉、连阴影射线都不发 |
+
+三条硬约束：
+
+1. **GI 的直射光源只有两项**：`ddgi_cast` 的太阳项 + 射线逃逸到天空。命中面的 `DDGI_CAST_FLOOR` 必须为 0
+   （否则无光室内再也黑不下来）。删掉太阳项 ⇒ 任何看不到天空的表面（草根、过道内墙）只能自洽维持全黑。
+2. **太阳阴影射线的起点必须跟着色侧同一套外推**（半个 voxel + `SHADOW_SURFACE_EPS`）：只退 1 个 eps 会从
+   **命中体素内部**出发，第一步就自命中 ⇒ 该项恒为 0，白耗一根射线。
+3. **极暗地板只在着色路径（`dda_main` / `gi_main`）生效，绝不进 `ddgi_cast`**：否则地板随 GI 递归传播到
+   室内。它也不能用"记账扫描带"（`usage_track`）当标志——那是逐帧轮转的 1/8 像素，会把地板变成条纹。
 
 > **跨语言常量的权威在 WESL 源码**：`gate-render/src/wesl_consts.rs` 启动时解析 `ddgi/consts.wesl` 等文件，
 > Rust 侧不再各留副本（不一致即启动 fail-fast）。改 DDGI 常量请改 `.wesl`。

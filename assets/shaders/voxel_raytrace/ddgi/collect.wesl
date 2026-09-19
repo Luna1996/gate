@@ -1,6 +1,6 @@
 import package::bindings::{DDGI_INDIR_COLLBASE_BASE, DDGI_INDIR_RAYBASE_BASE, DDGI_INDIR_RPP_BASE, ddgi_depth, ddgi_depth_out, ddgi_indirect, ddgi_irr, ddgi_irr_out, ddgi_meta, ddgi_samples, ddgi_slot_pos, ddgi_u, ddgi_worklist};
-import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_CONV_SAMPLES, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
-import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_meta_nbr, ddgi_nbr_bit_lod0, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
+import package::ddgi::consts::{DDGI_ALPHA, DDGI_BLEND_SELF, DDGI_CHUNK_LOD, DDGI_COLLECT_THREADS, DDGI_DEPTH_ALPHA, DDGI_DEPTH_CONV_SAMPLES, DDGI_DEPTH_TEXELS, DDGI_IRR_TEXELS, DDGI_LOD_COUNT, DDGI_META_ENABLED, DDGI_META_NBR_VALID, DDGI_PI, DDGI_TEXEL_MIN_COVERAGE, DDGI_T_MAX, DDGI_WL_IDX_MASK};
+import package::ddgi::helpers::{ddgi_age_alpha, ddgi_cell_in_window, ddgi_depth_coord, ddgi_irr_coord, ddgi_lod_slot_base, ddgi_meta_nbr, ddgi_nbr_bit_chunk, ddgi_oct_texel_dir, ddgi_slot_cell, ddgi_slot_own, ddgi_slot_world_cell};
 
 // ---- 空间混合：把 6 个网格邻居的同名纹素混进来。 ----
 fn ddgi_irr_nbr(id: u32, tx: u32, ty: u32) -> vec4<f32> {
@@ -16,9 +16,9 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
   let self_pos = ddgi_slot_pos[base + pidx].xyz;
   var acc = vec3<f32>(0.0);
   var wacc = 0.0;
-  if (lod == 0u) {
-    // LOD0 是 chunk 段编址：在世界 cell 空间取 6 个面邻居。
-    let wc = ddgi_slot_world_cell(0u, pidx);
+  if (lod == DDGI_CHUNK_LOD) {
+    // chunk 级是 chunk 段编址：在世界 cell 空间取 6 个面邻居。
+    let wc = ddgi_slot_world_cell(DDGI_CHUNK_LOD, pidx);
     let self_meta = ddgi_meta[base + pidx];
     let self_nbr = ddgi_meta_nbr(self_meta);
     // 本探针掩码是否已算；未算则整段不混。
@@ -31,11 +31,11 @@ fn ddgi_probe_blend_irr(lod: u32, pidx: u32, tx: u32, ty: u32) -> vec4<f32> {
       else if (a == 4u) { off = vec3<i32>(0, 0, 1); }
       else if (a == 5u) { off = vec3<i32>(0, 0, -1); }
       let nwc = wc + off;
-      if (!ddgi_cell_in_window(0u, nwc)) { continue; }
-      let nslot = ddgi_slot_own(0u, nwc);
+      if (!ddgi_cell_in_window(DDGI_CHUNK_LOD, nwc)) { continue; }
+      let nslot = ddgi_slot_own(DDGI_CHUNK_LOD, nwc);
       if (nslot == base + pidx) { continue; }
       // 邻接可见性门控：掩码未算的探针按「被挡」处理。
-      let sbit = ddgi_nbr_bit_lod0(a);
+      let sbit = ddgi_nbr_bit_chunk(a);
       let nmeta = ddgi_meta[nslot];
       if (!self_gate || (self_nbr & (1u << sbit)) == 0u) { continue; }
       if ((nmeta & DDGI_META_NBR_VALID) == 0u

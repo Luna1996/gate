@@ -35,6 +35,9 @@ pub const FLY_SPEED_FAST_MUL: f32 = 2.0;
 pub const EDIT_SIZE_MIN: u32 = 1;
 /// 编辑射线射程（体素）
 pub const EDIT_REACH: f32 = 256.0;
+/// 采样调试（`probe_dbg`）的拾取射程（体素）：纯诊断用，要比笔触射程远得多，
+/// 否则「看远处那片区域」时拾取直接落空、调试视图什么都不画。
+pub const PROBE_DBG_REACH: f32 = 4096.0;
 /// 左键点击与拖拽转向的判定阈值（像素）
 pub const DRAG_PX: f32 = 4.0;
 

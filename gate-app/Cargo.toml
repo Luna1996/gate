@@ -39,3 +39,6 @@ vox-rs = "0.2.0"
 rayon = { workspace = true }
 # i18n：文案表编译期 codegen 进二进制，运行期只有 t! 查表 + set_locale 切换两条路
 rust-i18n = "4.2"
+# 相机姿态存档（`data/ui/camera.ron`）序列化
+serde = { workspace = true }
+ron = { workspace = true }

@@ -44,13 +44,14 @@ pub const DDGI_MODE_KEYS: [&str; 5] = [
   "menu.render.ddgi.mode.probe",
 ];
 
-/// 探针绘制选项的 i18n key：无 / LOD0..3 / 全（下标 0 = 不绘制）
-pub const PROBE_KEYS: [&str; 6] = [
+/// 探针绘制选项的 i18n key：无 / LOD0..4 / 全（下标 0 = 不绘制）
+pub const PROBE_KEYS: [&str; 7] = [
   "menu.render.ddgi.probe.none",
   "menu.render.ddgi.probe.lod0",
   "menu.render.ddgi.probe.lod1",
   "menu.render.ddgi.probe.lod2",
   "menu.render.ddgi.probe.lod3",
+  "menu.render.ddgi.probe.lod4",
   "menu.render.ddgi.probe.all",
 ];
 
@@ -84,6 +85,13 @@ pub fn default_menu() -> MenuFile {
               toggle("enabled", "menu.render.ddgi.enabled", true),
               switch_group("mode", "menu.render.ddgi.mode", &DDGI_MODE_KEYS, 0),
               switch_group("probe", "menu.render.ddgi.probe", &PROBE_KEYS, 0),
+              // 采样调试：鼠标下体素的 8 个采样 probe + 连线（见 DdgiDebugSettings.probe_dbg）
+              toggle_tip(
+                "probe_dbg",
+                "menu.render.ddgi.probe_dbg",
+                false,
+                "menu.render.ddgi.probe_dbg.tip",
+              ),
               // 性能档：见 DdgiDebugSettings.gi_half_res
               toggle_tip(
                 "gi_half",
@@ -509,13 +517,19 @@ fn register_callbacks(world: &mut World) {
         }
         ("render/ddgi/probe", MenuAction::Select(i)) => {
           ddgi_dbg.probe_viz = *i > 0;
-          ddgi_dbg.probe_viz_lod = if *i == 5 || *i == 0 {
-            4.0
+          // 「全」用 ≥ DDGI_LODS 的哨兵值表示（WGSL 侧同判据）；下标 1..=DDGI_LODS 就是 LOD 号。
+          ddgi_dbg.probe_viz_lod = if *i == PROBE_KEYS.len() - 1 {
+            gate_render::ddgi::DDGI_LODS as f32
           } else {
-            (*i - 1) as f32
+            i.saturating_sub(1) as f32
           };
           let name = PROBE_KEYS.get(*i).map(|k| t!(*k).to_string()).unwrap_or_default();
           info!("探针绘制 → {name}");
+        }
+        // 采样调试：鼠标下体素会采样的 8 个 probe + 到采样点的连线
+        ("render/ddgi/probe_dbg", MenuAction::Toggle(on)) => {
+          ddgi_dbg.probe_dbg = *on;
+          info!("探针采样调试 → {}", if *on { "on" } else { "off" });
         }
         // 性能档（关掉即回到逐像素精确路径）
         ("render/ddgi/gi_half", MenuAction::Toggle(on)) => {
@@ -607,7 +621,7 @@ fn register_callbacks(world: &mut World) {
     |ev: On<MenuActionEvent>,
      mut scene: ResMut<gate_render::VoxelScene>,
      mut aabb: ResMut<gate_render::ddgi::DdgiWorldAabb>,
-     mut lod0: ResMut<gate_render::ddgi::DdgiLod0Chunks>,
+     mut chunk_set: ResMut<gate_render::ddgi::DdgiChunkSet>,
      q_menu: Query<&gate_ui::DebugMenu>| {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
@@ -620,7 +634,7 @@ fn register_callbacks(world: &mut World) {
             return;
           };
           let t0 = std::time::Instant::now();
-          match crate::scene::reload_world(&mut scene, &mut aabb, &mut lod0, &name) {
+          match crate::scene::reload_world(&mut scene, &mut aabb, &mut chunk_set, &name) {
             Ok(info) => info!(
               "世界已重载：{name}.vox instances={} written={} dropped={} aabb=[{}]-[{}] ({:?})",
               info.instances_used,

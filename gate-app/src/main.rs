@@ -129,6 +129,8 @@ fn main() {
     .add_plugins(gate_ui::GateUiPlugin)
     // 体素编辑设置（形状/大小/材质）；DebugMenu 的「游戏/编辑」是它的视图
     .init_resource::<edit::EditSettings>()
+    // 「采样调试」的拾取目标（鼠标下体素 + 面法线）：每帧由 `edit::probe_dbg_pick` 写入
+    .init_resource::<gate_render::ViewProbeDbgPick>()
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()
@@ -157,6 +159,8 @@ fn main() {
           left_click_pick_recenter,
           build_camera_config,
           voxel_edit_input,
+          // 采样调试的鼠标拾取：读本帧 cfg（故在矩阵构造之后）
+          edit::probe_dbg_pick,
         )
           .chain(),
         debug_ui_setup,
@@ -172,8 +176,12 @@ fn main() {
         enforce_integer_scale_factor,
       ),
     )
-    // 退出前把 DebugMenu 当前状态写回 TOML；须排在 bevy_window 的 ExitSystems 之后（AppExit 由它写入）
-    .add_systems(Last, save_menu_on_exit.after(bevy::window::ExitSystems));
+    // 退出前落盘：DebugMenu 状态（TOML）+ 相机姿态（RON）；须排在 bevy_window 的 ExitSystems
+    // 之后（AppExit 由它写入）。
+    .add_systems(
+      Last,
+      (save_menu_on_exit, camera::save_camera_on_exit).after(bevy::window::ExitSystems),
+    );
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);

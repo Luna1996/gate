@@ -3,9 +3,11 @@
 //! 朝向 yaw/pitch 两模式共享，切换模式时视线方向连续。
 
 use bevy::{
+  app::AppExit,
   input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
   prelude::*,
 };
+use serde::{Deserialize, Serialize};
 
 use gate_render::{
   BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, OrbitCamera, VIEW_SIZE, VoxelScene,
@@ -17,8 +19,11 @@ use crate::consts::{
   CAM_FAR, CAM_NEAR, FLY_SPEED_DEFAULT, FLY_SPEED_FAST_MUL, FOV_Y, ROT_SPEED, ZOOM_LOG_SPEED,
 };
 
+/// 相机姿态存档（相对 `data_dir`）：退出时写、启动时读，恢复上次的机位与朝向。
+const CAMERA_POSE_PATH: &str = "ui/camera.ron";
+
 /// 相机模式（main world Resource）。切换的唯一入口是 DebugMenu 的「玩家/相机/相机模式」切换组。
-#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum CameraMode {
   /// 轨道相机：右键旋转 / 中键平移 / 滚轮缩放
   Orbit,
@@ -50,6 +55,104 @@ impl FlyCamera {
   pub fn effective_speed(&self) -> f32 {
     if self.fast { self.speed * FLY_SPEED_FAST_MUL } else { self.speed }
   }
+}
+
+/// 跨启动保留的相机姿态。只存两模式共有的量：眼位 + yaw/pitch（朝向共享）。
+/// 轨道参数由 eye/yaw/pitch/distance 反推 —— 保证 `orbit.eye() == eye`，
+/// 首帧 `sync_camera_mode_switch` 才幂等（否则它会用 `orbit.eye()` 覆盖眼位）。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CameraPose {
+  pub mode: CameraMode,
+  pub eye: [f32; 3],
+  pub yaw: f32,
+  pub pitch: f32,
+  /// 轨道半径（仅 Orbit 模式有意义）
+  pub distance: f32,
+}
+
+impl CameraPose {
+  /// 记录本帧相机状态（退出时调用）。
+  pub fn capture(mode: CameraMode, orbit: &OrbitCamera, fly: &FlyCamera) -> Self {
+    // 眼位取当前模式自己的那个：Orbit 用 `orbit.eye()`，Fly 用 `fly.pos`。
+    let eye = match mode {
+      CameraMode::Orbit => orbit.eye(),
+      CameraMode::Fly => fly.pos,
+    };
+    Self { mode, eye: eye.to_array(), yaw: orbit.yaw, pitch: orbit.pitch, distance: orbit.distance }
+  }
+
+  /// 眼位的世界坐标（voxel）。
+  fn eye_vec(&self) -> Vec3 {
+    Vec3::from_array(self.eye)
+  }
+
+  /// 还原轨道参数：`target = eye − distance·dir`，与 `OrbitCamera::eye()` 互为逆运算。
+  pub fn to_orbit(&self) -> OrbitCamera {
+    let dir = look_forward(self.yaw, self.pitch) * -1.0;
+    let mut o = OrbitCamera {
+      target: self.eye_vec() - dir * self.distance,
+      distance: self.distance,
+      yaw: self.yaw,
+      pitch: self.pitch,
+    };
+    o.clamp();
+    o
+  }
+
+  /// 读 `data/ui/camera.ron`；无存档 / 读失败 / 解析失败 → None（沿用场景默认机位）。
+  pub fn load() -> Option<Self> {
+    let path = gate_render::data_dir().join(CAMERA_POSE_PATH);
+    let src = match std::fs::read_to_string(&path) {
+      Ok(s) => s,
+      Err(_) => return None,
+    };
+    match ron::de::from_str::<Self>(&src) {
+      Ok(p) => {
+        info!("camera pose restored from {}", path.display());
+        Some(p)
+      }
+      Err(e) => {
+        warn!("camera pose parse failed ({e}); using scene default");
+        None
+      }
+    }
+  }
+
+  /// 写 `data/ui/camera.ron`（目录不存在则创建）。
+  pub fn save(&self) {
+    let path = gate_render::data_dir().join(CAMERA_POSE_PATH);
+    if let Some(dir) = path.parent()
+      && let Err(e) = std::fs::create_dir_all(dir)
+    {
+      warn!("camera pose dir create failed ({e}); not saved");
+      return;
+    }
+    match ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default()) {
+      Ok(src) => match std::fs::write(&path, src) {
+        Ok(()) => info!("camera pose saved to {}", path.display()),
+        Err(e) => warn!("camera pose write failed ({e})"),
+      },
+      Err(e) => warn!("camera pose serialize failed ({e}); not saved"),
+    }
+  }
+}
+
+/// 退出前把相机姿态写盘（AppExit 那一帧执行一次）。
+pub(crate) fn save_camera_on_exit(
+  mut exit: MessageReader<AppExit>,
+  mode: Res<CameraMode>,
+  orbit: Res<OrbitCamera>,
+  fly: Res<FlyCamera>,
+  mut saved: Local<bool>,
+) {
+  if *saved {
+    return;
+  }
+  if exit.read().count() == 0 {
+    return;
+  }
+  *saved = true;
+  CameraPose::capture(*mode, &orbit, &fly).save();
 }
 
 /// yaw/pitch → 视线单位向量（eye→target 方向，即 `OrbitCamera::eye()` 偏移方向取反）；
@@ -244,16 +347,8 @@ fn window_height(windows: &Query<&Window>) -> f32 {
   windows.single().map(|w| w.physical_height().max(1) as f32).unwrap_or(VIEW_SIZE.y as f32)
 }
 
-/// 屏幕光标 → 世界射线 `(origin, dir)`（voxel 空间；origin = 相机眼位）。
-/// 轨道 recenter 与幽灵编辑共用；指针不在窗口内 / 矩阵退化 → None。
-pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
-  let cursor = window.cursor_position()?;
-  let sf = window.scale_factor();
-  let phys = cursor * sf; // 物理像素（左上原点，y 向下）
-  let pw = window.physical_width().max(1) as f32;
-  let ph = window.physical_height().max(1) as f32;
-  let u = (phys.x / pw) * 2.0 - 1.0; // [-1, 1]
-  let v = 1.0 - (phys.y / ph) * 2.0; // [-1, 1]，翻转 y（NDC +y 朝上）
+/// NDC `(u, v)` → 世界射线 `(origin, dir)`（voxel 空间；origin = 相机眼位）；矩阵退化 → None。
+fn ndc_ray(cfg: &DdaCameraConfig, u: f32, v: f32) -> Option<(Vec3, Vec3)> {
   let near = cfg.inv_view_proj * Vec4::new(u, v, 0.0, 1.0);
   let far = cfg.inv_view_proj * Vec4::new(u, v, 1.0, 1.0);
   let near = near.truncate() / near.w;
@@ -263,6 +358,29 @@ pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3
     return None;
   }
   Some((cfg.position_world, dir))
+}
+
+/// 屏幕光标 → 世界射线 `(origin, dir)`。
+/// 轨道 recenter / 幽灵编辑 / 采样调试共用；指针不在窗口内 / 矩阵退化 → None。
+pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
+  let cursor = window.cursor_position()?;
+  let sf = window.scale_factor();
+  let phys = cursor * sf; // 物理像素（左上原点，y 向下）
+  let pw = window.physical_width().max(1) as f32;
+  let ph = window.physical_height().max(1) as f32;
+  // 指针在别的显示器上时 winit 仍可能给出窗口外的坐标 ⇒ 直接当"没有指针"，
+  // 否则会拿一条越界的 NDC 射线去拾取（诊断视图会莫名其妙什么都不画）。
+  if !(0.0..pw).contains(&phys.x) || !(0.0..ph).contains(&phys.y) {
+    return None;
+  }
+  let u = (phys.x / pw) * 2.0 - 1.0; // [-1, 1]
+  let v = 1.0 - (phys.y / ph) * 2.0; // [-1, 1]，翻转 y（NDC +y 朝上）
+  ndc_ray(cfg, u, v)
+}
+
+/// 屏幕中心射线：指针不在窗口内时的回退（采样调试等诊断视图不依赖光标也能用）。
+pub(crate) fn center_ray(cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
+  ndc_ray(cfg, 0.0, 0.0)
 }
 
 /// 左键拾取 recenter（仅 Orbit 模式）：射线命中体素表面 → 轨道 target 移到命中点（沿入面

@@ -136,6 +136,17 @@ impl DdaCameraConfig {
   }
 }
 
+/// 「采样调试」（`probe_dbg_main`）的拾取目标：main world 每帧写，render world 提取进 view uniform。
+/// `valid = false` → 不画（开关关、指针不在窗口内、或射线未命中）。
+#[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, Default)]
+pub struct ViewProbeDbgPick {
+  /// 鼠标命中的体素（voxel 坐标）。
+  pub voxel: IVec3,
+  /// 入面法线（轴对齐、指向体素外侧）：采样点沿它外推，与着色路径同一套。
+  pub normal: IVec3,
+  pub valid: bool,
+}
+
 /// Render-world 着色器绑定的 camera uniform，与 WGSL `DdaViewUniform` 逐字对齐。
 #[derive(Resource, Clone, Copy, ShaderType)]
 pub struct DdaViewUniform {
@@ -147,6 +158,10 @@ pub struct DdaViewUniform {
   /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（`consts::DDA_LOD`）
   pub lod: Vec4,
   pub probe_viz_params: Vec4,
+  /// xyz = 鼠标命中的体素（voxel 坐标），w = 1 开启「采样调试」（见 `probe_dbg_main`）。
+  pub probe_dbg: Vec4,
+  /// xyz = 该体素的入面法线（轴对齐）。
+  pub probe_dbg_n: Vec4,
 }
 
 /// 本文件用到的开关（`consts.rs`）
@@ -183,6 +198,8 @@ impl DdaViewUniform {
         !DDA_DIR_LUT as u32 as f32,
       ),
       probe_viz_params: Vec4::ZERO,
+      probe_dbg: Vec4::ZERO,
+      probe_dbg_n: Vec4::ZERO,
     }
   }
 }
@@ -1173,6 +1190,8 @@ pub(crate) struct DdaPipelines {
   /// 半分辨率 GI（菜单开关）：`gi_main`
   pub(crate) gi_pipeline: CachedComputePipelineId,
   pub(crate) probe_viz_pipeline: CachedComputePipelineId,
+  /// 采样调试（debug_menu 开关）：`probe_dbg_main`（鼠标下体素的 8 个采样 probe + 连线）
+  pub(crate) probe_dbg_pipeline: CachedComputePipelineId,
   /// eye_adapt_histogram / eye_adapt_update（各 1 个 WG）
   eye_histogram_pipeline: CachedComputePipelineId,
   eye_update_pipeline: CachedComputePipelineId,
@@ -1328,11 +1347,18 @@ fn extract_camera_config(
   cfg: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DdaCameraConfig>>>,
   debug: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DebugNormals>>>,
   scale: Option<bevy::render::Extract<bevy::ecs::system::Res<RenderScale>>>,
+  pick: Option<bevy::render::Extract<bevy::ecs::system::Res<ViewProbeDbgPick>>>,
 ) {
   let Some(cfg) = cfg else { return };
   let debug_mode = debug.map(|d| d.0).unwrap_or(0);
   let render_h = scale.map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
-  let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, render_h);
+  let mut uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, render_h);
+  // 采样调试的拾取目标（体素 + 入面法线）；未命中或未开启时 w = 0。
+  if let Some(p) = pick.filter(|p| p.valid) {
+    uniform.probe_dbg = Vec4::new(p.voxel.x as f32, p.voxel.y as f32, p.voxel.z as f32, 1.0);
+    uniform.probe_dbg_n =
+      Vec4::new(p.normal.x as f32, p.normal.y as f32, p.normal.z as f32, 0.0);
+  }
   commands.insert_resource(uniform);
 }
 
@@ -1546,9 +1572,16 @@ pub(crate) fn init_dda_pipelines(
   });
   let probe_viz = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_probe_viz")),
+    layout: layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("probe_viz_main")),
+    ..default()
+  });
+  let probe_dbg = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_probe_dbg")),
     layout: layouts,
     shader: dda_shader,
-    entry_point: Some(Cow::from("probe_viz_main")),
+    entry_point: Some(Cow::from("probe_dbg_main")),
     ..default()
   });
 
@@ -1593,6 +1626,7 @@ pub(crate) fn init_dda_pipelines(
     beam_pipeline: beam,
     gi_pipeline: gi,
     probe_viz_pipeline: probe_viz,
+    probe_dbg_pipeline: probe_dbg,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
     blit_pipeline,
@@ -1640,11 +1674,13 @@ pub(crate) fn prepare_dda_bind_groups(
   };
 
   let mut view = *view_uniform; // Copy：解引用取出，便于覆写 probe_viz_params
-  // probe 可视化参数：x = 世界空间探针总槽数（4 LOD 世界网格）；y = 方块边长 3px；
-  // z = 层级选择（0=全部，1..=4=LOD0..3）；w = 0
+  // probe 可视化参数：x = 世界空间探针总槽数（全部 LOD 的探针网格）；y = 方块边长 3px；
+  // z = 要画的 LOD 下标（0..DDGI_LODS-1）；≥ DDGI_LODS = 全画；w = 0
   if let Some(g) = ddgi_gpu.as_ref() {
     let total = g.total_slots;
-    let sel = dbg.map_or(0.0, |d| d.probe_viz_lod).clamp(0.0, 4.0);
+    let sel = dbg
+      .map_or(0.0, |d| d.probe_viz_lod)
+      .clamp(0.0, crate::ddgi::DDGI_LODS as f32);
     view.probe_viz_params = Vec4::new(total as f32, 3.0, sel, 0.0);
   }
   let mut u = UniformBuffer::from(view);
@@ -1995,7 +2031,7 @@ pub(crate) fn dispatch_dda(
     );
   }
 
-  if dbg.is_some_and(|d| d.probe_viz)
+  if dbg.as_ref().is_some_and(|d| d.probe_viz)
     && let Some(ddgi) = gpu.as_ref()
     && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_viz_pipeline)
   {
@@ -2013,6 +2049,26 @@ pub(crate) fn dispatch_dda(
         pass.set_bind_group(4, &bg4.0, &[]);
         let wg = probe_count.div_ceil(64);
         pass.dispatch_workgroups(wg, 1, 1);
+      },
+    );
+  }
+
+  // ---- 采样调试：鼠标下体素的 8 个采样 probe + 到采样点的连线（单线程 pass）----
+  if dbg.as_ref().is_some_and(|d| d.probe_dbg)
+    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.probe_dbg_pipeline)
+  {
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_probe_dbg",
+      |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bg0.0, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
       },
     );
   }

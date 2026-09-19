@@ -1,6 +1,6 @@
-import package::bindings::{ddgi_cell, g, grid_descs};
+import package::bindings::{ddgi_cell, ddgi_u, g, grid_descs};
 import package::ddgi::consts::{DDGI_META_NBR_MASK};
-import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_nbr_dir, ddgi_slot_own};
+import package::ddgi::helpers::{DDGI_REC_OCCUPIED, ddgi_cell_in_window, ddgi_cell_state_sized, ddgi_nbr_dir, ddgi_slot_own};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast};
 
@@ -42,10 +42,18 @@ fn ddgi_push_out_of_objects(p0: vec3<f32>) -> vec3<f32> {
   return p;
 }
 
-/// 邻接 cell 是否有体素（cell 用世界 cell 号；不在本级窗口内视为无）
+/// 邻接 cell 是否有体素（cell 用世界 cell 号）。
+/// 规则网格级：查邻接槽位的 OCCUPIED 位（那些级铺满，邻接 cell 一定有槽位）。
+/// LOD0 是逐砖认领的：过道 cell 的邻接（墙）常常落在**没认领**的砖里，槽位查不到 ⇒ 必须兜底直接
+/// 查世界几何，否则纯空气的过道 cell 永远判不活（表现 = 有探针但不发线、GI 全黑）。
 fn ddgi_neighbor_occupied(lod: u32, wc: vec3<i32>) -> bool {
-  if (!ddgi_cell_in_window(lod, wc)) { return false; }
-  return (ddgi_cell[ddgi_slot_own(lod, wc)] & DDGI_REC_OCCUPIED) != 0u;
+  if (ddgi_cell_in_window(lod, wc))
+    && (ddgi_cell[ddgi_slot_own(lod, wc)] & DDGI_REC_OCCUPIED) != 0u {
+    return true;
+  }
+  if (lod != 0u) { return false; }
+  let cs = ddgi_u.lods[0u].origin.w;
+  return ddgi_cell_state_sized(make_grid(0u), wc * cs, cs) != 0u;
 }
 
 /// 6 邻接可见性掩码：从探针位置沿 6 轴向各走向邻居 cell 中心，不撞几何则该位为 1。
