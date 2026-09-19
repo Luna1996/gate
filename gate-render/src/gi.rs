@@ -7,7 +7,7 @@
 use bevy::render::render_resource::{
   BindGroupLayoutDescriptor, CachedComputePipelineId, ShaderType,
 };
-use glam::{Mat4, UVec4, Vec4};
+use glam::{Mat4, UVec2, UVec4, Vec4};
 
 use crate::wesl_consts::gi_consts;
 
@@ -20,7 +20,8 @@ pub struct GiUniform {
   pub params: Vec4,
   /// x = GI 开关（0/1）、yzw = 保留（恒 0）
   pub misc: Vec4,
-  /// x = 保留（恒 0）、y = 半分辨率 GI（0/1）、zw = 保留（恒 0）
+  /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率；**整数值的 f32**，
+  /// 只被 `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、zw = 保留（恒 0）
   pub flags: Vec4,
   /// xyz = 脏盒 0（主世界编辑）的世界 voxel AABB min、w = 本帧脏盒数（0 = 无脏区）。
   /// 盒 1..N-1 在 BG4 binding 18（`gi_dirty_boxes`）；盒 0 留在 uniform ⇒ 主世界单盒路径
@@ -40,18 +41,32 @@ pub struct GiUniform {
   pub prev_inv_view_proj: Mat4,
 }
 
-/// GI 档位（菜单「渲染/GI」）：`enabled` → uniform `misc.x`；`half_res` → uniform `flags.y`。
+/// GI 档位（菜单「渲染/GI」）：`enabled` → uniform `misc.x`；`gi_div` → uniform `flags.y`。
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
 pub struct GiSettings {
-  /// GI 开关（主 pass 是否读缓存；关掉由天光兜底）。
+  /// GI 开关（关掉 = 整条 GI 链不派发，主 pass 只有太阳直射 + 天光兜底）。
   pub enabled: bool,
-  /// 半分辨率 GI：采样在 1/2 分辨率缓冲里做，主 pass 双线性取用。
-  pub half_res: bool,
+  /// GI **分辨率除数**：1 = 全分辨率、2 = 半分辨率（GI 网格边长 = 渲染分辨率 ÷ 本值）。
+  /// 不是开关：1 与 2 **都跑 GI**，只是网格疏密与代价不同。
+  pub gi_div: u32,
+}
+
+impl GiSettings {
+  /// 生效的分辨率除数（只实现了 1 / 2 两档，越界值钳回来）。
+  pub fn div(&self) -> u32 {
+    self.gi_div.clamp(1, 2)
+  }
+
+  /// GI 网格尺寸 = 渲染分辨率 ÷ `div()`（逐轴向下取整，至少 1×1）。
+  pub fn gi_size(&self, render_size: UVec2) -> UVec2 {
+    let d = self.div();
+    UVec2::new((render_size.x / d).max(1), (render_size.y / d).max(1))
+  }
 }
 
 impl Default for GiSettings {
   fn default() -> Self {
-    Self { enabled: true, half_res: false }
+    Self { enabled: true, gi_div: 2 }
   }
 }
 
@@ -99,7 +114,8 @@ pub fn gi_bg4_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
-/// BG5 写入侧布局：半分辨率 GI 的两张输出纹理（2 = gi、3 = cov）+ 降噪导引 buffer（6）。
+/// BG5 写入侧布局：GI 的两张输出纹理（2 = gi、3 = cov）+ 降噪导引 buffer（6）。
+/// 纹理尺寸 = GI 网格（渲染分辨率 ÷ `GiSettings.gi_div`），与全分辨率无关。
 /// 采样侧（binding 4/5）在 `brickmap::dda` 里单独一份 layout，只给 `dda_main`。
 pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
@@ -117,9 +133,9 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   BindGroupLayoutDescriptor::new(
     "GiBg5",
     &[
-      // 半分辨率 GI：rgb = gi·valid、a = valid
+      // GI 网格分辨率下的 GI：rgb = gi·valid、a = valid
       store(2, TextureFormat::Rgba16Float),
-      // 半分辨率 GI 的覆盖度：r = cov·valid、g = valid
+      // GI 网格分辨率下的覆盖度：r = cov·valid、g = valid
       store(3, TextureFormat::Rg32Float),
       // 降噪导引（`gi_main` 写、两段降噪读；布局见 WESL `gi/consts.wesl`）
       BindGroupLayoutEntry {
@@ -291,11 +307,11 @@ pub struct GiGpu {
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiBg4(pub bevy::render::render_resource::BindGroup);
 
-/// 半分辨率 GI 写入侧 bind group（`gi_main` 用）
+/// GI 写入侧 bind group（`gi_main` 用）
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
 
-/// 半分辨率 GI 写入侧的占位纹理（1×1）：GI 缓冲未就绪时 BG5 仍须为 binding 2/3 提供视图。
+/// GI 写入侧的占位纹理（1×1）：GI 缓冲未就绪时 BG5 仍须为 binding 2/3 提供视图。
 /// 占位纹理不会被真正写入。
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
@@ -539,7 +555,7 @@ fn extract_gi_settings(
 ) {
   commands.insert_resource(
     settings.map_or_else(GiSettings::default, |s| {
-      GiSettings { enabled: s.enabled, half_res: s.half_res }
+      GiSettings { enabled: s.enabled, gi_div: s.div() }
     }),
   );
 }
@@ -713,7 +729,7 @@ fn prepare_gi(
   let mut u = GiUniform::default();
   u.params = Vec4::new(0.0, 0.0, crate::consts::GI_GAIN, gpu.generation as f32);
   u.misc = Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
-  u.flags = Vec4::new(0.0, if settings.half_res { 1.0 } else { 0.0 }, 0.0, 0.0);
+  u.flags = Vec4::new(0.0, settings.div() as f32, 0.0, 0.0);
   u.dirty_min = dirty_min;
   u.dirty_max = dirty_max;
   // 整数帧号走 u32 通道（`seq.x`）：`gpu.frame` 本就是 u32，不再经 `params.x` 的 f32 截断。
@@ -725,7 +741,8 @@ fn prepare_gi(
   gpu.uniform.write_buffer(&device, &queue);
   // 只在真正会跑 `gi_main` 的帧更新「上一帧」⇒ 与上帧写 reservoir 时用的矩阵逐位一致
   // （GI 关掉一段时间再打开时，历史 reservoir 与 prev 矩阵都停留在最后一帧 GI，重投影仍自洽）。
-  let gi_runs = settings.enabled && settings.half_res;
+  // 注意：**分辨率的任意取值都跑 GI** —— 这里只跟 `enabled` 走。
+  let gi_runs = settings.enabled;
   if gi_runs && let Some(v) = view.as_ref() {
     gpu.prev_view_proj = v.view_proj;
     gpu.prev_inv_view_proj = v.inv_view_proj;
@@ -766,7 +783,7 @@ fn prepare_gi(
     gpu.res_flip = !gpu.res_flip;
   }
 
-  // ---- BG5：半分辨率 GI 的写入侧（绑定号 2/3/6）----
+  // ---- BG5：GI 的写入侧（绑定号 2/3/6）----
   // GI 视图来自 `crate::brickmap::dda::AuxTexCache`；未就绪时用 1×1 占位纹理（bind group 必须给全条目）。
   // 视图/ buffer 都先 clone 成句柄（`TextureView`/`Buffer` 都是 Arc 包装）⇒ 之后还能再借一次 `gi_ph`。
   let bg5_layout = pipeline_cache.get_bind_group_layout(&gi_bg5_layout());

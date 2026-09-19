@@ -277,10 +277,10 @@ fn register_callbacks(world: &mut World) {
           gi.enabled = *on;
           info!("GI → {}", if *on { "on" } else { "off" });
         }
-        // 性能档（关掉即回到逐像素精确路径）
-        ("render/gi/gi_half", MenuAction::Toggle(on)) => {
-          gi.half_res = *on;
-          info!("半分辨率 GI → {}", if *on { "on" } else { "off" });
+        // 半分辨率开关：勾选 = 半分辨率、取消 = 全分辨率（**两档都跑 GI**，关掉不等于关 GI）
+        ("render/gi/half", MenuAction::Toggle(on)) => {
+          gi.gi_div = if *on { 2 } else { 1 };
+          info!("GI 分辨率 → {}（网格边长 = 渲染分辨率 / {}）", if *on { "半分辨率" } else { "全分辨率" }, gi.gi_div);
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;

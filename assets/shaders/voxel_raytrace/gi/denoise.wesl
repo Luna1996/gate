@@ -6,7 +6,7 @@ import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DE
 // GI 降噪（SVGF 家族两段）：**时域累积**（`gi_den_temporal`）+ **迭代 atrous 空间滤波**
 // （`gi_den_atrous`，步长 1/2/4 各跑一次）。
 //
-// 输入 / 输出（半分辨率网格，尺寸 = 全分辨率 / 2）：
+// 输入 / 输出（GI 网格，尺寸 = 渲染分辨率 / gi_div：全分辨率或 1/2）：
 //   · `gi_raw_tex`（= `gi_out` 的采样视图）：本帧原始 GI，rgb = gi·valid、a = valid；
 //   · 导引 `gi_guide_out`/`gi_guide`：`gi_main` 写，面键（2 word，bit15 = 有效位）、命中体素中心
 //     世界位置（3）、法线（八面体 f16x2）、**上帧重投影像素坐标**（1，`gi_u.prev_view_proj` 投出来
@@ -87,7 +87,7 @@ fn gi_den_guide_store(
   gi_guide_out[b + GI_DEN_G_POS + 1u] = bitcast<u32>(pos.y);
   gi_guide_out[b + GI_DEN_G_POS + 2u] = bitcast<u32>(pos.z);
   gi_guide_out[b + GI_DEN_G_NRM] = gi_pack_dir(n);
-  // 上帧像素坐标（半分辨率网格，u16 足够：上半分辨率上限 2048）：x | y<<16；无 = 0xFFFFFFFF。
+  // 上帧像素坐标（GI 网格，u16 足够：渲染上限 4096）：x | y<<16；无 = 0xFFFFFFFF。
   var code = 0xFFFFFFFFu;
   if (prev_ok) { code = u32(prev_px.x) | (u32(prev_px.y) << 16u); }
   gi_guide_out[b + GI_DEN_G_PREV] = code;
@@ -102,7 +102,7 @@ fn gi_den_plane_ok(p_c: vec3<f32>, n_c: vec3<f32>, p_n: vec3<f32>, tol: f32) -> 
   return abs(dot(p_n - p_c, n_c)) < tol;
 }
 
-/// 时域累积（每半分辨率像素一次）。步骤：
+/// 时域累积（每 GI 像素一次）。步骤：
 /// ① 本帧 3×3 邻域两套统计（**必须分开**，见下）：
 ///    · **同面键** tap（同一个体素同一个面）→ 亮度一阶/二阶矩 → σ_n = **纯噪声**；
 ///    · **共面** tap（法线相似 + 平面检验通过，可跨体素）→ 颜色 mean/std → AABB 钳制范围；
@@ -167,7 +167,7 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
     }
   }
   let mu3 = m3 / max(n3, 1.0);
-  // 面内样本 < 2（半分辨率下体素面只占 1 个像素）⇒ σ = 0 = 纯累积（面内本来就没有空间信息可丢）。
+  // 面内样本 < 2（半分辨率下体素面常只占 1 个像素）⇒ σ = 0 = 纯累积（面内本来就没有空间信息可丢）。
   let sigma = select(0.0, sqrt(max(q3 / max(n3, 1.0) - mu3 * mu3, 0.0)), n3 > 1.5);
   let cmean = csum / max(cnt, 1.0);
   let cstd = sqrt(max(csum2 / max(cnt, 1.0) - cmean * cmean, vec3<f32>(0.0)));

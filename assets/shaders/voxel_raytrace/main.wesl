@@ -197,10 +197,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gi_on = gi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     var cov = 0.0;
-    // 半分辨率 GI 开关 = `gi_u.flags.y`（0 = 逐像素内联采样）。
-    let gi_half = gi_on && gi_u.flags.y > 0.5;
-    if (gi_half) {
-      // uv 必须按全分辨率尺寸（`size`）归一化，不能除以 GI 纹理自身尺寸。
+    // GI 一律走缓冲通道（`gi_main` + 降噪写在 1/gi_div 分辨率的 GI 网格上，见 `gi/`）：
+    // 这里只做一次双线性取值。uv 必须按**全分辨率尺寸**（`size`）归一化，不能除以 GI 纹理
+    // 自身尺寸 —— 1:1（gi_div = 1）与 2:1（gi_div = 2）上采样都靠这条。
+    // `gi_on = false` 时 gi/cov 恒 0 ⇒ 只有太阳直射 + 天光兜底。
+    if (gi_on) {
       let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
               / vec2<f32>(f32(size.x), f32(size.y));
       let s = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
@@ -209,10 +210,6 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let gw = max(s.a, 1e-4);
       gi = s.rgb / gw;
       cov = sc.r / gw;
-    } else if (gi_on) {
-      let gs = gi_supply(best.voxel, best.face_id, best.obj_id, p_voxel + n * n_off, n);
-      gi = gs.xyz;
-      cov = gs.w;
     }
     // AO 只乘到常量天光项（gi 已自带逐方向遮挡）。
     let ao = light_field_ao(p_voxel, best.obj_id);
@@ -236,7 +233,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   write_output(coord0, col);
 }
 
-// 半分辨率 GI（菜单开关 `gi_u.flags.y`）：GI 采样在 1/2 分辨率的独立 pass 完成，主 pass 双线性取用。
+// GI（菜单「渲染/GI」的分辨率档 `gi_u.flags.y` = 1 全分辨率 / 2 半分辨率）：GI 采样在本 pass 里
+// 按该分辨率的网格完成，主 pass 按全分辨率 uv 双线性取用。
 // 输出：gi_out.rgb = gi·valid、gi_out.a = valid；gi_cov_out.r = cov·valid、.g = valid；
 // 主 pass 按 valid 归一化，天空/介质像素（valid = 0）不参与插值。
 @compute @workgroup_size(8, 8, 1)
@@ -259,12 +257,14 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir_voxel = normalize(diff_world);
   let origin_voxel = view_u.cam_pos_voxel.xyz;
 
-  // beam 纹理 = 本 pass 分辨率的 2×：beam 下标除 (BEAM_DIV/2)。
+  // beam 纹理 = 全分辨率 / BEAM_DIV；本 pass 网格 = 全分辨率 / gi_div ⇒ 下标除 (BEAM_DIV / gi_div)。
+  // gi_div = 1（全分辨率）→ 除 BEAM_DIV；gi_div = 2（半分辨率）→ 除 BEAM_DIV/2（= 旧版行为）。
+  let gi_div = max(u32(gi_u.flags.y), 1u);
   var t_min = 0.0;
   if (view_u.lod.z < 0.5) {
     let beam_size = textureDimensions(beam_depth);
-    let bx = gid.x / (BEAM_DIV / 2u);
-    let by = gid.y / (BEAM_DIV / 2u);
+    let bx = gid.x / max(BEAM_DIV / gi_div, 1u);
+    let by = gid.y / max(BEAM_DIV / gi_div, 1u);
     t_min = 1e+30;
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
       for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
@@ -316,7 +316,8 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ============================================================================
-// GI 降噪（`gi/denoise.wesl`）：**时域累积** + **迭代 atrous** 两段，都跑在半分辨率网格上。
+// GI 降噪（`gi/denoise.wesl`）：**时域累积** + **迭代 atrous** 两段，都跑在 GI 网格
+// （= 渲染分辨率 / gi_div）上。
 // 顺序（Rust `dispatch_dda`）：`gi_main` → `gi_denoise_temporal` → `gi_denoise_atrous1/2/4`
 // （步长 1/2/4，次数 = `GI_DEN_ATROUS_ITER`）。最终结果落在 `gi_den`（`dda_main` 采样它，
 // 原始 `gi_out` 保留作对照；`gi_cov_out` 全链不动）。

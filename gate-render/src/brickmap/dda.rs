@@ -1127,13 +1127,16 @@ pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 
 /// 辅助纹理缓存（屏幕尺寸相关，resize 时重建）：
 ///   · `texture`：beam depth（低分辨率 r32float），beam 预 pass 写、主 pass 读；
-///   · `gi_*`：半分辨率 GI 缓冲（`GiSettings.half_res`），`gi_main` 写、主 pass 采样（BG0 4/5）；
+///   · `gi_*`：GI 缓冲（网格尺寸 = 渲染分辨率 ÷ `GiSettings.gi_div`，1 或 2），`gi_main` 写、
+///     主 pass 采样（BG0 4/5）；
 ///     存 premultiplied valid：rgba16f = (gi·valid, valid)、rg32f = (cov·valid, valid)，采样侧按 valid 归一化；
 ///   · `gi_res_a`/`gi_res_b`：**屏幕空间逐面 ReSTIR** 的 reservoir 双缓冲（BG4 binding 20/21，
-///     每半分辨率像素 `GI_RES_WORDS` 个 word；布局见 `gi/screen.wesl`）。两块随 GI 分辨率一起
+///     每 GI 像素 `GI_RES_WORDS` 个 word；布局见 `gi/screen.wesl`）。两块随 GI 网格尺寸一起
 ///     重建（wgpu 新建 buffer 恒为零 ⇒ 新尺寸下 `M = 0` = 无历史）；`prepare_gi` 每帧换绑
 ///     （20 = 本帧写、21 = 上帧读）。
 ///   · `gi_bg0`：GI pass 自己的 @group(0)（view uniform + beam depth，不含 GI 采样视图）。
+/// 换分辨率（`gi_div` 1↔2）与换窗口尺寸走的是同一条重建路径 ⇒ 所有 GI 派生资源（reservoir、
+/// 导引、历史、φ、中间靶、降噪输出）尺寸恒等于 `gi_size`，不存在「只重建一部分」的状态。
 #[derive(Resource, Default)]
 pub(crate) struct AuxTexCache {
   texture: Option<Texture>,
@@ -1149,13 +1152,13 @@ pub(crate) struct AuxTexCache {
   /// group(5) 的 GI 采样侧 bind group（`dda_main` 用；layout = `DdaPipelines::gi_read_layout`）
   gi_read_bg: Option<BindGroup>,
   // ---- GI 降噪（`gi_denoise_temporal` + `gi_denoise_atrous1/2/4`，见 `gi/denoise.wesl`）----
-  /// 导引 buffer（`gi_main` 写、两段降噪读）：每半分辨率像素 `GI_DEN_GUIDE_WORDS` 个 u32。
+  /// 导引 buffer（`gi_main` 写、两段降噪读）：每 GI 像素 `GI_DEN_GUIDE_WORDS` 个 u32。
   gi_guide: Option<Buffer>,
   /// 时域历史双缓冲（每像素 `GI_DEN_HIST_WORDS` 个 u32）：`den_flip` 决定哪块是「上帧读」。
   gi_hist: [Option<Buffer>; 2],
   /// 每像素亮度 range 权重尺度 φ（f32，时域写 / atrous 读）。
   gi_phi: Option<Buffer>,
-  /// atrous 链的 4 张半分辨率 rgba16f：`[0]` = 时域输出、`[1]`/`[2]` = ping-pong、
+  /// atrous 链的 4 张 GI 网格尺寸 rgba16f：`[0]` = 时域输出、`[1]`/`[2]` = ping-pong、
   /// `[3]` = 最终结果（`dda_main` 的 group(5) binding 4 绑它）。
   gi_dn: [Option<Texture>; 4],
   /// `gi_dn` 的采样视图：`[0..3)` 给 atrous 的输入，`[3]` 给 `dda_main`。
@@ -1181,7 +1184,7 @@ const DEN_ATROUS_ROUNDS: [[usize; 3]; 3] = [
 ];
 
 impl AuxTexCache {
-  /// 半分辨率 GI 的写入侧视图（BG5 的 binding 2/3 用）。
+  /// GI 写入侧视图（BG5 的 binding 2/3 用）。
   /// `None` = 尚未创建（首帧，或本帧 `prepare_dda_bind_groups` 提前返回）⇒ 调用方须用占位纹理。
   pub(crate) fn gi_write_views(&self) -> Option<(&TextureView, &TextureView)> {
     Some((self.gi_view.as_ref()?, self.gi_cov_view.as_ref()?))
@@ -1205,7 +1208,7 @@ pub(crate) struct DdaPipelines {
   pub(crate) bg0_layout: BindGroupLayoutDescriptor,
   /// BG0 的"瘦"版：`view uniform + beam depth`（供 `gi_main` 用，该 pass 要写 GI 纹理）。
   pub(crate) bg0_gi_layout: BindGroupLayoutDescriptor,
-  /// group(5) 的"GI 采样侧"（`dda_main` 专用）：两张半分辨率 GI 纹理（绑定号 4/5）
+  /// group(5) 的"GI 采样侧"（`dda_main` 专用）：两张 GI 网格尺寸的纹理（绑定号 4/5）
   pub(crate) gi_read_layout: BindGroupLayoutDescriptor,
   pub(crate) bg1_layout: BindGroupLayoutDescriptor,
   pub(crate) bg2_layout: BindGroupLayoutDescriptor,
@@ -1215,7 +1218,7 @@ pub(crate) struct DdaPipelines {
   eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
   pub(crate) beam_pipeline: CachedComputePipelineId,
-  /// 半分辨率 GI（菜单开关）：`gi_main`
+  /// GI（菜单「渲染/GI」开关 + 分辨率档）：`gi_main`
   pub(crate) gi_pipeline: CachedComputePipelineId,
   /// eye_adapt_histogram / eye_adapt_update（各 1 个 WG）
   eye_histogram_pipeline: CachedComputePipelineId,
@@ -1404,7 +1407,7 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  // ---- BG5（GI 采样侧，只给 `dda_main` 的 pipeline 用）：半分辨率 GI 的两张纹理 ----
+  // ---- BG5（GI 采样侧，只给 `dda_main` 的 pipeline 用）：两张 GI 网格尺寸的纹理 ----
   // 绑定号 4/5（group(5) 空闲号，0..3 已被图集/GI 写入侧占），只进 `dda_main` 的 layout。
   let gi_read = BindGroupLayoutDescriptor::new(
     "DdaBg5GiRead",
@@ -1531,7 +1534,7 @@ pub(crate) fn init_dda_pipelines(
   let dda_shader = dda_shader.0.clone();
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::gi::gi_bg4_layout()];
-  // `dda_main` 比其它两个入口多一份 group(5)：半分辨率 GI 的采样侧（见 `gi_read`），只加给它。
+  // `dda_main` 比其它两个入口多一份 group(5)：GI 的采样侧（见 `gi_read`），只加给它。
   let dda_layouts = {
     let mut v = layouts.clone();
     v.push(gi_read.clone());
@@ -1554,8 +1557,8 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
-  // 半分辨率 GI（菜单开关 `GiSettings.half_res`）：
-  // 反投影 + beam 起点 + 主 trace + 读 GI 缓存，写两张 1/2 分辨率缓冲。
+  // GI（`GiSettings.gi_div` = 1 全分辨率 / 2 半分辨率；**两档都跑这条链**）：
+  // 反投影 + beam 起点 + 主 trace + 屏幕空间 ReSTIR，写两张 GI 网格尺寸的缓冲。
   // group0 用瘦版（不含 GI 采样视图），并多一个 BG5；layout 索引必须是 0..=5 的前缀。
   let gi_layouts = vec![
     bg0_gi.clone(),
@@ -1704,11 +1707,12 @@ pub(crate) fn prepare_dda_bind_groups(
   let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
 
-  // ---- 半分辨率 GI 缓冲（菜单开关 `gi_half_res`）：屏幕 1/2 分辨率，resize 时重建 ----
+  // ---- GI 缓冲（菜单「渲染/GI/分辨率」= 全分辨率 / 半分辨率）：网格 = 渲染分辨率 ÷ gi_div ----
+  // 换分辨率（gi_div 1↔2）与换窗口尺寸都走这条重建路径（条件只看 gi_size 变没变）。
   // 存 premultiplied valid（见 AuxTexCache 的说明）：rgba16f = (gi·valid, valid)、
   // rg32f = (cov·valid, valid)。
   // wgpu 新建纹理自动清零 ⇒ valid 初值 0 = "无数据"，采样侧退回 conf=0 的天光兜底。
-  let gi_size = UVec2::new((scale.size.x / 2).max(1), (scale.size.y / 2).max(1));
+  let gi_size = gi_settings.as_deref().copied().unwrap_or_default().gi_size(scale.size);
   if beam_cache.gi_tex.is_none() || beam_cache.gi_size != gi_size {
     let make = |label: &str, format: TextureFormat| {
       render_device.create_texture(&TextureDescriptor {
@@ -1723,8 +1727,8 @@ pub(crate) fn prepare_dda_bind_groups(
         view_formats: &[],
       })
     };
-    let gi_tex = make("gate_gi_half", TextureFormat::Rgba16Float);
-    let gi_cov = make("gate_gi_cov_half", TextureFormat::Rg32Float);
+    let gi_tex = make("gate_gi", TextureFormat::Rgba16Float);
+    let gi_cov = make("gate_gi_cov", TextureFormat::Rg32Float);
     beam_cache.gi_view = Some(gi_tex.create_view(&TextureViewDescriptor::default()));
     beam_cache.gi_cov_view = Some(gi_cov.create_view(&TextureViewDescriptor::default()));
     beam_cache.gi_tex = Some(gi_tex);
@@ -1854,7 +1858,7 @@ pub(crate) fn prepare_dda_bind_groups(
   // ---- GI 降噪的 bind group：时域 1 个 + atrous 5 个（src→dst 组合，见 `DEN_ATROUS_CHAINS`）----
   // 每帧重建（纹理/buffer 都是持久句柄，只是换绑）；`den_flip` 决定历史哪块是「上帧读」。
   // 只在真正会跑降噪时翻转 `den_flip`（与 `res_flip` 同一套语义）。
-  let den_runs = gi_settings.as_ref().is_some_and(|g| g.enabled && g.half_res);
+  let den_runs = gi_settings.as_ref().is_some_and(|g| g.enabled);
   let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
   {
     let guide = beam_cache.gi_guide.as_ref().expect("导引 buffer 未创建").clone();
@@ -2032,8 +2036,9 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-  // ---- 半分辨率 GI（菜单开关 `GiSettings.half_res`）：排在主 pass 之前（主 pass 采样它的输出）----
-  if gi.as_ref().is_some_and(|g| g.enabled && g.half_res)
+  // ---- GI（菜单「渲染/GI」开关；分辨率 = `GiSettings.gi_div`）：排在主 pass 之前（主 pass 采样输出）----
+  // 派发规模 = `aux.gi_size`（= 渲染分辨率 ÷ gi_div）⇒ 全分辨率/半分辨率只差这里与资源尺寸。
+  if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_bg0) = aux.gi_bg0.as_ref()
     && let Some(bg5) = bg5.as_ref()
@@ -2055,7 +2060,7 @@ pub(crate) fn dispatch_dda(
 
   // ---- GI 降噪（时域 → 迭代 atrous）：必须紧跟 `gi_main`、排在主 pass 之前 ----
   // `dda_main` 的 group(5) binding 4 绑的就是这条链的最终输出（`gi_dn[3]`）。
-  if gi.as_ref().is_some_and(|g| g.enabled && g.half_res)
+  if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
   {
@@ -2110,7 +2115,7 @@ pub(crate) fn dispatch_dda(
         pass.set_bind_group(2, &bg2.0, &[]);
         pass.set_bind_group(3, &bg3.0, &[]);
         pass.set_bind_group(4, &bg4.0, &[]);
-        // 半分辨率 GI 的采样侧（layout 里的 group(5)）：没有它 `dda_main` 无法 dispatch。
+        // GI 的采样侧（layout 里的 group(5)）：没有它 `dda_main` 无法 dispatch。
         // 纹理未就绪（`prepare_dda_bind_groups` 本帧提前返回）时退化为不绑。
         if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
           pass.set_bind_group(5, gi_read, &[]);

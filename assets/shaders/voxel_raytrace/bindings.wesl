@@ -106,7 +106,8 @@ struct GiUniform {
   params: vec4<f32>,
   // x = GI 开关、yzw = 保留（恒 0）
   misc: vec4<f32>,
-  // x = 保留（恒 0）、y = 半分辨率 GI（0 = 逐像素内联采样，1 = 1/2 分辨率缓冲双线性取用）、zw = 保留
+  // x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率，2 = 半分辨率；整数值的 f32，只被
+  // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、zw = 保留
   flags: vec4<f32>,
   // xyz = 脏盒 0（主世界编辑）的世界 voxel AABB min、w = 本帧脏盒数（0 = 无脏区）
   dirty_min: vec4<f32>,
@@ -145,21 +146,21 @@ struct GiUniform {
 /// 「每条目每帧只 append 一次」。frame = `gi_u.seq.x`，从 1 起（Rust 每帧自增后才写 uniform），0 = 未 claim。
 @group(4) @binding(19) var<storage, read_write> gi_seen_claim: array<atomic<u32>>;
 /// 20/21：**屏幕空间逐面 ReSTIR** 的 reservoir 双缓冲（`GI_CACHE_ON = false` 时的主路径）。
-/// 每半分辨率像素一个 reservoir（`GI_RES_WORDS` 个 word，布局见 `gi/screen.wesl`）；
+/// 每 GI 像素一个 reservoir（`GI_RES_WORDS` 个 word，布局见 `gi/screen.wesl`）；
 /// 20 = **本帧写入**（目标）、21 = **上一帧读出**（时域重投影 + 空间同键复用源）。
 /// Rust 侧每帧 ping-pong 换绑同一对 buffer ⇒ 20 与 21 恒是不同块。
 @group(4) @binding(20) var<storage, read_write> gi_res_cur: array<u32>;
 @group(4) @binding(21) var<storage, read_write> gi_res_prev: array<u32>;
 
-// ===== @group(5)：半分辨率 GI =====
-// @binding(2)/(3)：半分辨率 GI 缓冲的写入侧（`gi_main` 用）；采样侧见 `@binding(4)/(5)`。
+// ===== @group(5)：GI（网格 = 渲染分辨率 / gi_div）=====
+// @binding(2)/(3)：GI 缓冲的写入侧（`gi_main` 用）；采样侧见 `@binding(4)/(5)`。
 @group(5) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
 @group(5) @binding(3) var gi_cov_out: texture_storage_2d<rg32float, write>;
 // @binding(4)/(5)：同一对纹理的采样侧（只被 `dda_main` 用）。
 // rgba16f：rgb = gi·valid、a = valid；rg32f：r = cov·valid、g = valid。采样走 `light_samp` 双线性、按 valid 归一化。
 @group(5) @binding(4) var gi_tex: texture_2d<f32>;
 @group(5) @binding(5) var gi_cov_tex: texture_2d<f32>;
-/// @binding(6)：**降噪导引**（`gi_main` 写、降噪两段读）。每半分辨率像素 `GI_DEN_GUIDE_WORDS`
+/// @binding(6)：**降噪导引**（`gi_main` 写、降噪两段读）。每 GI 像素 `GI_DEN_GUIDE_WORDS`
 /// 个 word，布局见 `gi/consts.wesl`：面键 2 + 命中体素中心世界位置 3 + 法线 1 + 上帧重投影像素 1。
 @group(5) @binding(6) var<storage, read_write> gi_guide_out: array<u32>;
 

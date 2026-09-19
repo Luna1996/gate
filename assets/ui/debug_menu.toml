@@ -59,10 +59,10 @@ checked = true
 
 [[items.children.children]]
 kind = "toggle"
-id = "gi_half"
-label = "menu.render.gi.gi_half"
-checked = false
-tooltip = "menu.render.gi.gi_half.tip"
+id = "half"
+label = "menu.render.gi.half"
+checked = true
+tooltip = "menu.render.gi.half.tip"
 
 [[items.children]]
 kind = "sub_menu"

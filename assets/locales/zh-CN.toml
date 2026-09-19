@@ -1,0 +1,97 @@
+# gate-app 中文文案表（rust-i18n 编译期 codegen 进二进制）
+# _version 1 = 每语言一个文件（assets/locales/<locale>.toml）；加语言 = 加文件 + 调 rust_i18n::set_locale
+#
+# 约定：
+# - 键 = 「模块.控件」语义路径，调用点写 t!("模块.控件"）
+# - **键必须带引号**：TOML 里裸点号会被解释成嵌套表，与扁平 key 语义不同
+# - 占位符 %{name} 原样替换；定长对齐的数字由调用点先 format! 好再传入
+# - 只收可见 UI 文案；日志、技术标识符（LOD / DDA）、单位（v/s、vx）、材质预设名保持英文
+# - DebugMenu 的文案 key 在本表 menu.* 段：菜单树（assets/ui/debug_menu.toml）存 key，
+#   由 gate-ui 的 UiTranslator 解析，切语言后整棵树重解析（gate-app 的 sync_ui_locale）
+# - 改本文件需**重新编译**（proc macro 编译期内联）；gate-app/build.rs 已登记 rerun-if-changed
+_version = 1
+
+# ---------------- DebugMenu（左上角调试菜单）----------------
+"menu.video" = "视频"
+"menu.video.half_res" = "半分辨率"
+"menu.video.half_res.tip" = "3D 场景按 1/2 分辨率渲染再放大到窗口：省约 3/4 的主射线，代价是边缘变软（配合抗锯齿更明显）。"
+"menu.video.fullscreen" = "全屏"
+"menu.video.vsync" = "垂直同步"
+"menu.video.aa" = "抗锯齿"
+"menu.video.aa.tip" = "FXAA：单 pass 边缘抗锯齿（约 9~13 次采样）。抹平台阶/锯齿，但治不了运动中的亚像素闪烁。"
+"menu.video.fps" = "FPS"
+"menu.render" = "渲染"
+"menu.render.gi" = "ReSTIR GI"
+"menu.render.gi.enabled" = "开启"
+"menu.render.gi.half" = "半分辨率"
+"menu.render.gi.half.tip" = "勾选 = GI 按半分辨率计算（更快）；取消 = 全分辨率（更清晰，像素数 ×4）"
+"menu.render.exposure" = "曝光"
+"menu.render.exposure.enabled" = "开启"
+"menu.render.exposure.ev_up" = "提亮上限"
+"menu.render.exposure.ev_up.tip" = "适应暗处的最大增益 = 2^EV（档）"
+"menu.render.exposure.ev_dn" = "压暗上限"
+"menu.render.exposure.ev_dn.tip" = "适应亮处的最大衰减 = 2^EV（档）"
+"menu.render.exposure.tau_up" = "变亮时间"
+"menu.render.exposure.tau_up.tip" = "往亮处适应的速度（秒）：太小像闪光"
+"menu.render.exposure.tau_dn" = "变暗时间"
+"menu.render.exposure.tau_dn.tip" = "往暗处适应的速度（秒）：太小像眨眼"
+"menu.render.exposure.key" = "目标中灰"
+"menu.render.exposure.key.tip" = "百分位平均亮度被压到的目标值"
+"menu.player" = "玩家"
+"menu.player.camera" = "相机"
+"menu.player.camera.pos" = "相机位置"
+"menu.player.camera.dir" = "相机角度"
+"menu.player.camera.mode" = "相机模式"
+"menu.player.camera.mode.orbit" = "轨道"
+"menu.player.camera.mode.fly" = "自由"
+"menu.player.camera.speed" = "飞行速度"
+"menu.game" = "游戏"
+"menu.game.edit" = "编辑"
+"menu.game.edit.shape" = "笔触形状"
+"menu.game.edit.shape.sphere" = "球体"
+"menu.game.edit.shape.cube" = "正方体"
+"menu.game.edit.size" = "笔触大小"
+"menu.game.edit.color" = "颜色"
+"menu.game.edit.emissive" = "自发光"
+"menu.game.edit.alpha" = "透明度"
+"menu.game.edit.smooth" = "光滑度"
+"menu.game.world" = "世界"
+"menu.game.world.model" = "模型"
+"menu.game.world.reload" = "重载世界"
+"menu.ui" = "界面"
+"menu.ui.showcase" = "UI 展示窗"
+# 纯文本行的值
+"menu.camera.pos.value" = "%{v}"
+"menu.camera.dir.value" = "yaw %{yaw}°, pitch %{pitch}°"
+
+# ---------------- 右上角组件展示窗 ----------------
+# 展示窗文案只在启动时求值（未挂 i18n key），不随切语言重建
+"showcase.tab.widgets" = "组件"
+"showcase.tab.data" = "数据"
+"showcase.title" = "UI 组件展示"
+"showcase.subtitle" = "gate-ui 组件陈列"
+"showcase.section.buttons" = "按钮"
+"showcase.button.primary" = "主要"
+"showcase.button.secondary" = "次要"
+"showcase.button.ghost" = "幽灵"
+"showcase.button.danger" = "危险 / 破坏性"
+"showcase.section.checkbox" = "复选框"
+"showcase.checkbox.a" = "选项 A（默认勾选）"
+"showcase.checkbox.b" = "选项 B"
+"showcase.section.slider" = "滑杆（0..100, 步长 5）"
+"showcase.section.plot" = "折线图（折线 + 纵轴标签）"
+"showcase.section.list" = "列表 / RingList（事件日志，容量 6）"
+"showcase.log.ready" = "展示窗就绪"
+"showcase.log.try_all" = "试试每个组件"
+"showcase.section.faint" = "faint：仅 lg 18px 大号标签"
+"showcase.section.splitter" = "分割线"
+"showcase.splitter.left" = "左"
+"showcase.splitter.right" = "右"
+"showcase.section.grid" = "网格（3 列，格线十字连通）"
+"showcase.section.scroll" = "滚动视图（滚轮滚动）"
+"showcase.scroll_row" = "滚动行 %{i}"
+"showcase.title.data" = "数据展示"
+"showcase.section.table" = "表格（表头 + 斑马纹）"
+"showcase.table.name" = "名称"
+"showcase.table.value" = "数值"
+"showcase.table.status" = "状态"
