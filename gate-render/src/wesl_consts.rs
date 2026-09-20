@@ -18,7 +18,7 @@ pub struct GiConsts {
   pub gi_den_guide_words: u32,
   /// 降噪历史每像素 word 数（`GI_DEN_HIST_WORDS`）：Rust 按它开历史 ping-pong 两块 buffer。
   pub gi_den_hist_words: u32,
-  /// atrous 迭代次数（`GI_DEN_ATROUS_ITER`，1..=3）：Rust 按它决定派发几轮 / 每轮的 src→dst。
+  /// atrous 迭代次数（`GI_DEN_ATROUS_ITER`，1..=5）：Rust 按它决定派发几轮 / 每轮的 src→dst。
   pub gi_den_atrous_iter: u32,
 }
 
@@ -71,9 +71,9 @@ impl GiConsts {
       error!("{msg}");
       panic!("{msg}");
     }
-    if !(1..=3).contains(&out.gi_den_atrous_iter) {
+    if !(1..=5).contains(&out.gi_den_atrous_iter) {
       let msg = format!(
-        "GI_DEN_ATROUS_ITER = {} 越界：只实现了步长 1/2/4 三轮（Rust 侧的派发链表就 3 项）：{out:?}",
+        "GI_DEN_ATROUS_ITER = {} 越界：只实现了步长 1/2/4/8/16 五轮（Rust 侧的派发链表就 5 项）：{out:?}",
         out.gi_den_atrous_iter
       );
       error!("{msg}");

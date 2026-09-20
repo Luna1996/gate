@@ -284,6 +284,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let pk0 = gi_key0(h.voxel);
   let pk1 = gi_key1(h.voxel, h.face_id, h.obj_id);
   let pk_ok = gi_key_ok(h.voxel);
+  // 平面检验容差（同平面判定的两处共用：时域 ① 与空间 ③）。
+  let tol = GI_DEN_PLANE_K * gg.scale;
 
   let frame = gi_u.seq.x;
   let seed = gi_ss_seed(coord, frame);
@@ -298,29 +300,37 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
                      prev_pc);
 
   // ---- ① 时域复用：先判「有没有可用历史」，它决定本帧的新鲜候选数（去遮挡 boost）----
-  // 判据是**精确键**（不是启发式）：主命中面键（体素,面,物体）必须完全一致；
-  // 再接一条重连接射线（本帧唯一的那条，≤1）沿历史方向重发，用它的二次顶点键与历史存的那个做
-  // **逐位相等**比较 —— 不一致就丢掉历史累计量（世界变了 / 不是同一个面）；一致就接过来。
-  // 重连接射线只求键（裸 `world_raycast`，不带 NEE）、**不进 RIS**（见下方 ② 处注释）。
+  // 接受判据 = **主命中面键逐位相等** 或 **同平面**（法线相似 + 平面检验，与空间复用/降噪同一套）。
+  // 为什么不能只要求「键逐位相等」：一个体素面**比一个像素还小**时（远处大面就是这么回事），
+  // 相机一动像素命中的体素逐帧都在换 ⇒ 键几乎帧帧不等 ⇒ 历史被无谓丢掉、M 永远是 1
+  // （现象：静止干净、一运动远处大面就起雪花）。同平面判定与距离无关、且**与像素足迹相称**：
+  // 不可分辨的相邻面本来就属于同一个平面、同一个积分；而**薄板 / 墙缝仍然被精确拒掉**
+  // （另一侧法线相反、平面距离整整一格 > 0.5 格容差）⇒ 「不漏光」这条硬约束不破。
+  // 判据放宽后仍接一条重连接射线（≤1）做二次顶点键验证：它校验的是「这个样本描述的光路还在不在」。
   // **世界几何自写入历史那一帧起逐位未变时（uniform `flags.z`）这条验证射线整条省掉** ——
   // 输入完全相同 ⇒ 结果必然逐位相同，这是静态 / 纯相机运动下最大的一笔省。
   var hist = gi_res_none();
   var hist_ok = false;
   if (pk_ok && prev_ok) {
     let cand = gi_res_load_prev(u32(prev_pc.y) * size.x + u32(prev_pc.x));
-    if ((cand.flags & (GI_RES_VALID | GI_RES_PK_OK)) == (GI_RES_VALID | GI_RES_PK_OK)
-        && cand.pk0 == pk0 && cand.pk1 == pk1) {
-      var same_sk = false;
-      if (gi_u.flags.z > 0.5) {
-        same_sk = (cand.flags & GI_RES_SK_OK) != 0u;
-      } else {
-        let s_r = gi_ray_secondary_key(org, cand.dir);
-        same_sk = s_r.sk_hit == ((cand.flags & GI_RES_SK_HIT) != 0u)
-          && s_r.sk_ok && s_r.sk0 == cand.sk0 && s_r.sk1 == cand.sk1;
+    if ((cand.flags & (GI_RES_VALID | GI_RES_PK_OK)) == (GI_RES_VALID | GI_RES_PK_OK)) {
+      var accept = cand.pk0 == pk0 && cand.pk1 == pk1;
+      if (!accept) {
+        accept = gi_ss_coplanar(p_voxel, n, tol, GiTapGeom(cand.nrm, cand.pos));
       }
-      if (same_sk) {
-        hist = cand;
-        hist_ok = true;
+      if (accept) {
+        var same_sk = false;
+        if (gi_u.flags.z > 0.5) {
+          same_sk = (cand.flags & GI_RES_SK_OK) != 0u;
+        } else {
+          let s_r = gi_ray_secondary_key(org, cand.dir);
+          same_sk = s_r.sk_hit == ((cand.flags & GI_RES_SK_HIT) != 0u)
+            && s_r.sk_ok && s_r.sk0 == cand.sk0 && s_r.sk1 == cand.sk1;
+        }
+        if (same_sk) {
+          hist = cand;
+          hist_ok = true;
+        }
       }
     }
   }
@@ -371,7 +381,6 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   //     起点差一格 ⇒ 目标函数差一个一阶小量；这是「相邻面的台阶」被抹平、网格亮斑消失的原因。
   //     1 体素薄板的另一侧过不了平面检验 ⇒ 不跨薄板、不漏光。
   let tb = select(coord, prev_pc, prev_ok);
-  let tol = GI_DEN_PLANE_K * gg.scale;
   var sk_sum = vec3<f32>(0.0);
   var sk_m = 0.0;
   for (var t = 0u; t < GI_SS_REUSE_TAPS; t = t + 1u) {

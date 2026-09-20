@@ -1,10 +1,19 @@
 import package::bindings::{gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_tmp, gi_guide, gi_guide_out, gi_hist_cur, gi_hist_prev, gi_raw_tex};
 import package::gi::common::{gi_pack_dir, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_POS, GI_DEN_G_PREV, GI_DEN_G_TOL, GI_DEN_G_VALID, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_HIST_WORDS, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_W_HIST_MIN, GI_LUMA};
+import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_POS, GI_DEN_G_PREV, GI_DEN_G_TOL, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_W_HIST_MIN, GI_LUMA};
 
 // ============================================================================
 // GI 降噪（SVGF 家族两段）：**时域累积**（`gi_den_temporal`）+ **迭代 atrous 空间滤波**
-// （`gi_den_atrous`，步长 1/2/4 各跑一次）。
+// （`gi_den_atrous`，步长 1/2/4/8/16 = NRD/RELAX 的 5 轮；实际轮数 = `GI_DEN_ATROUS_ITER`）。
+//
+// 与 NRD/RELAX 的差距（知道还缺什么，才不会以为已经到顶）：
+//   · ❌ **没有独立的 pre-blur pass**：NRD 的第一步是进时域之前的纯空间离群抑制；这里改成
+//        在时域 pass 内对输入做一次「共面邻域 mean ± K·σ」钳制（省一趟 dispatch）。
+//   · ✅ **累积矩**（NRD 的 m1/m2）：历史里存的是**按与色相同权重累积**的亮度一/二阶矩，
+//        `σ_hist = sqrt(M2 − M1²)` 给出时间上平滑的噪声水平，与本帧观测 σ 取 max 后用于
+//        时域权重与 φ ⇒ 权重不再逐帧抖。
+//   · ❌ **没有 fast history / history-fix**：NRD 为去遮挡准备了一条「短历史」；这里靠
+//        「不同平面 ⇒ M = 1 本帧重建」硬重置（代价是去遮挡后头几帧更噪，但**不拖影**）。
 //
 // 输入 / 输出（GI 网格，尺寸 = 渲染分辨率 / gi_div：全分辨率或 1/2）：
 //   · `gi_raw_tex`（= `gi_out` 的采样视图）：本帧原始 GI，rgb = gi·valid、a = valid；
@@ -18,19 +27,22 @@ import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DE
 //     ⇒ 一个入口跑任意轮数（见 `bindings.wesl` 的 14/15）。
 //
 // 三条硬约束怎么保证：
-//  ① **不引入 ramp**：历史失效（重投影出屏 / 面键不等 / 上帧 M = 0）时**不**退回 0 也不沿用旧值，
+//  ① **不引入 ramp**：历史失效（重投影出屏 / 不同平面 / 上帧 M = 0）时**不**退回 0 也不沿用旧值，
 //     而是直接用本帧原始估计（`M = 1`）。本帧原始估计与稳态估计是同一个积分的无偏估计
 //     ⇒ 亮度不随时间爬升，第 1 帧 ≈ 稳态（差别只有噪声，靠空间段压）。
-//  ② **不跨薄板 / 墙缝**：判据是**精确面键逐位相等**（体素,面,物体；薄板两侧是两个键），
-//     加上法线相似 + 平面深度检验（世界位置取的是命中**体素中心** ⇒ 同一平面上相邻体素的内积
-//     恰好为 0，而 1 体素薄板另一侧 = 1 个体素边长 > 容差）。
+//  ② **不跨薄板 / 墙缝**：历史与邻域接受判据是**同平面**（`gi_den_same_plane`：面号 + 物体相等、
+//     沿面法线轴的体素坐标相等；「键逐位相等」是它的特例），空间段再加**平面深度检验**
+//     （世界位置取命中**体素中心** ⇒ 同一平面上相邻体素的内积恰好为 0，1 体素薄板另一侧 =
+//     1 个体素边长 > 容差）。薄板两侧面号不同 / 法线轴坐标差 1 ⇒ 精确拒掉，且与缩放无关。
 //  ③ **逐体素平坦风味**：atrous 里**同一面键的 tap 给满权重 1**（同面内被强拉平），
 //     跨面才走几何 × 亮度权重 ⇒ 同一个面里的像素趋于同值，而不是被大核糊成渐变。
 // ============================================================================
 
 /// 导引 [word 址]：本像素是否有效（首命中不透明体素）。
+/// 判据 = **键非零** —— 切**不要**改成「读某个有效位」：`GI_DEN_G_KEY1` 里 face 占 13..15
+/// 三个 bit，`face = 4 (-z)` 的 0x8000 会与 bit15 撞车（见 `gi/consts.wesl` 的说明）。
 fn gi_den_valid_b(b: u32) -> bool {
-  return (gi_guide[b + GI_DEN_G_KEY1] & GI_DEN_G_VALID) != 0u;
+  return (gi_guide[b + GI_DEN_G_KEY0] | gi_guide[b + GI_DEN_G_KEY1]) != 0u;
 }
 
 /// 导引 [word 址] → 面键 word0。
@@ -38,9 +50,9 @@ fn gi_den_key0_b(b: u32) -> u32 {
   return gi_guide[b + GI_DEN_G_KEY0];
 }
 
-/// 导引 [word 址] → 面键 word1（剥掉有效位 ⇒ 与 `gi_key1` 的输出可直接逐位比较）。
+/// 导引 [word 址] → 面键 word1（**原样**返回，不抹任何位 ⇒ 与 `gi_key1` 的输出可直接逐位比较）。
 fn gi_den_key1_b(b: u32) -> u32 {
-  return gi_guide[b + GI_DEN_G_KEY1] & 0xFFFF7FFFu;
+  return gi_guide[b + GI_DEN_G_KEY1];
 }
 
 /// 导引 [word 址] → 命中体素中心的世界位置。
@@ -82,7 +94,7 @@ fn gi_den_guide_store(
     return;
   }
   gi_guide_out[b + GI_DEN_G_KEY0] = k0;
-  gi_guide_out[b + GI_DEN_G_KEY1] = k1 | GI_DEN_G_VALID;
+  gi_guide_out[b + GI_DEN_G_KEY1] = k1;
   gi_guide_out[b + GI_DEN_G_POS] = bitcast<u32>(pos.x);
   gi_guide_out[b + GI_DEN_G_POS + 1u] = bitcast<u32>(pos.y);
   gi_guide_out[b + GI_DEN_G_POS + 2u] = bitcast<u32>(pos.z);
@@ -102,14 +114,38 @@ fn gi_den_plane_ok(p_c: vec3<f32>, n_c: vec3<f32>, p_n: vec3<f32>, tol: f32) -> 
   return abs(dot(p_n - p_c, n_c)) < tol;
 }
 
+/// **同平面判定（体素空间版）** —— 降噪器历史（以及 σ/钳制邻域）的接受判据：
+/// 面（法线方向）与物体相等，且**沿面法线轴的体素坐标相等** ⇒ 两个面处在同一个平面上。
+/// 轴对齐体素网格下这等价于世界空间的「法线相似 + 平面距离 = 0」，但**与 volume 缩放无关、
+/// 不需要读几何**（降噪 pass 的 layout 里没有 `grid_descs`，这是刻意的）。
+/// 安全性：相邻的同面体素只在**面内两轴**上不同 ⇒ 通过；1 体素薄板的另一侧面号不同
+/// （+x 对 −x）或法线轴坐标差 1 ⇒ 精确拒掉 ⇒ **不跨薄板、不漏光**。
+/// 为什么要放宽到同平面：体素面**比一个像素还小**时（远处大面），相机一动像素命中的体素
+/// 逐帧都在换 ⇒ 只认「键逐位相等」会让降噪历史帧帧作废（`M` 恒为 1），那段区域只剩大核在撑
+/// ⇒ 残留细密高频颗粒。放宽后远处运动画面也能拿到完整的时域累积，而颜色仍被
+/// `clamp(hcol, cmean ± K·cstd)` 钉在当前帧的共面邻域统计里 ⇒ 不会沿平面拖出长尾。
+/// `hk0/hk1` = 历史像素的键，`k0/k1` = 本像素的键。
+fn gi_den_same_plane(hk0: u32, hk1: u32, k0: u32, k1: u32) -> bool {
+  let face = (k1 >> 13u) & 7u;
+  if (face != ((hk1 >> 13u) & 7u)) { return false; }
+  if ((k1 >> 16u) != (hk1 >> 16u)) { return false; }
+  let axis = face >> 1u;
+  if (axis == 0u) { return (k0 & 0x1FFFu) == (hk0 & 0x1FFFu); }
+  if (axis == 1u) { return ((k0 >> 13u) & 0x1FFFu) == ((hk0 >> 13u) & 0x1FFFu); }
+  return (k1 & 0x1FFFu) == (hk1 & 0x1FFFu);
+}
+
 /// 时域累积（每 GI 像素一次）。步骤：
 /// ① 本帧 3×3 邻域两套统计（**必须分开**，见下）：
-///    · **同面键** tap（同一个体素同一个面）→ 亮度一阶/二阶矩 → σ_n = **纯噪声**；
+///    · **同面键** tap（同一个体素同一个面）→ 亮度一阶/二阶矩 → σ_n = **纯噪声**
+///      （同时这两个矩会按与色相同的权重**累积**进历史，供下一帧给出平滑的 σ，见 ⑤）；
 ///    · **共面** tap（法线相似 + 平面检验通过，可跨体素）→ 颜色 mean/std → AABB 钳制范围；
-/// ② 历史校验 = 导引里的上帧像素坐标 → 取那条历史的**面键**与本帧**逐位相等**且 `M > 0`；
-/// ③ 历史权重 `w = min(clamp(σ_α/σ_n, W_MIN, 1), (M−1)/M)`；
+/// ② 历史校验 = 导引里的上帧像素坐标 → 取那条历史的键，与本帧**同平面**（`gi_den_same_plane`）
+///    且 `M > 0`；
+/// ③ 噪声尺度 `σ_use = max(本帧 σ_n, 累积矩 σ_hist)`；历史权重
+///    `w = min(clamp(σ_α/σ_use, W_MIN, 1), (M−1)/M)`；
 /// ④ 历史色先钳到共面邻域的 `mean ± K·std`（anti-ghosting）；
-/// ⑤ 写回本帧色 + 本帧矩 + 本帧键 + M（历史双缓冲 ping-pong，Rust 每帧换绑）。
+/// ⑤ 写回本帧色 + **累积矩**（`mix(hist, 本帧观测, 1−w)`）+ 本帧键 + M（历史双缓冲，Rust 每帧换绑）。
 ///
 /// 为什么 σ 必须取**同面键**那一套：同一个面内的像素是同一个积分，**差异只可能是噪声**；
 /// 而共面邻域跨体素，差异里混着真实信号（逐体素风味）。用后者算 σ 会把「本来就很干净的面」
@@ -167,11 +203,18 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
     }
   }
   let mu3 = m3 / max(n3, 1.0);
+  let mo2 = q3 / max(n3, 1.0); // 同面键邻域的亮度二阶矩（与 `mu3` 配对，见下面的累积矩）
   // 面内样本 < 2（半分辨率下体素面常只占 1 个像素）⇒ σ = 0 = 纯累积（面内本来就没有空间信息可丢）。
-  let sigma = select(0.0, sqrt(max(q3 / max(n3, 1.0) - mu3 * mu3, 0.0)), n3 > 1.5);
+  let sigma = select(0.0, sqrt(max(mo2 - mu3 * mu3, 0.0)), n3 > 1.5);
   let cmean = csum / max(cnt, 1.0);
   let cstd = sqrt(max(csum2 / max(cnt, 1.0) - cmean * cmean, vec3<f32>(0.0)));
-  gi_den_phi[idx] = GI_DEN_LUMA_K * max(sigma, 1e-5);
+  // 参考亮度取「共面邻域均值」与「同面均值」的较大者（共面 tap 为 0 时退化成本像素自己的亮度）。
+  let l_ref = max(dot(cmean, GI_LUMA), mu3);
+  // 本帧观测的矩（未与历史融合；融合在 ② 里做，因为要用到实际的历史权重）。
+  var m1_acc = mu3;
+  var m2_acc = mo2;
+  // 权重与 φ 实际用的噪声尺度（默认 = 本帧观测 σ；拿到历史后会被**累积矩**抬起来，见 `sigma_use`）。
+  var sigma_use = sigma;
   // ③ 本帧输入 = **同面键邻域的均值**（同一个面内的像素是同一个积分 ⇒ 先面内平均再进时域累积）。
   // 单像素面（n3 = 1）退化成中心像素本身 ⇒ 不改变旧行为。
   var c_in = select(c_raw, c3 / max(n3, 1.0), n3 > 1.5);
@@ -194,10 +237,12 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
     if (px < i32(size.x) && py < i32(size.y)) {
       let hpb = (u32(py) * size.x + u32(px)) * GI_DEN_HIST_WORDS;
       let h_m = bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_M]);
-      // 面键逐位相等（体素 + 面 + 物体）：薄板两侧 / 墙缝两侧是两个键 ⇒ 一律不接历史。
-      // 不等 ⇒ `M = 1` 且色 = 本帧的面均值（**本帧重建**：不拖影、不糊，也不回退到 0 / 旧值）。
-      if (h_m > 0.0 && gi_hist_prev[hpb + GI_DEN_H_KEY0] == k0
-          && gi_hist_prev[hpb + GI_DEN_H_KEY1] == k1) {
+      // 历史校验 = **同平面**（体素空间：面号 + 物体相等 + 法线轴坐标相等，见 `gi_den_same_plane`）。
+      // 不通过 ⇒ `M = 1` 且色 = 本帧的面均值（**本帧重建**：不拖影、不糊，也不回退到 0 / 旧值）。
+      // 薄板两侧 / 墙缝两侧面号不同 ⇒ 一律不接历史。
+      let hk0 = gi_hist_prev[hpb + GI_DEN_H_KEY0];
+      let hk1 = gi_hist_prev[hpb + GI_DEN_H_KEY1];
+      if (h_m > 0.0 && gi_den_same_plane(hk0, hk1, k0, k1)) {
         m = min(h_m + 1.0, f32(GI_DEN_M_MAX));
         let hcol = vec3<f32>(
           bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_COL]),
@@ -208,20 +253,35 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
         if (cnt > 1.5) {
           clamped = clamp(hcol, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
         }
-        let w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
+        // σ 取**累积矩**与本帧观测的较大者：累积矩把多帧的观测平均掉 ⇒ σ 不再逐帧抖
+        // （逐帧抖会让下面的历史权重跟着抖，表现为持续的细颗粒闪动）；
+        // 取 max 保证「噪声突然变大」（去遮挡、光照阶跃）时仍然按本帧的观测走，不迟钝。
+        let h_m1 = bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_M1]);
+        let h_m2 = bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_M2]);
+        let sigma_hist = sqrt(max(h_m2 - h_m1 * h_m1, 0.0));
+        sigma_use = max(sigma, sigma_hist);
+        let w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
         // 历史上限：M 帧以来最多信 (M−1)/M ⇒ 稳态也保留 1/M 的新信息（不无限累积）。
         let w = min(w_var, (m - 1.0) / m);
         color = mix(c_in, clamped, w);
+        // 矩按**与色完全相同的权重**累积（历史权重 = w ⇒ 本帧观测权重 = 1 − w）⇒
+        // `M2 − M1²` 就是「本像素输入在累积窗口内的波动」，量纲与 `σ_α` 可比。
+        m1_acc = mix(h_m1, mu3, 1.0 - w);
+        m2_acc = mix(h_m2, mo2, 1.0 - w);
       }
     }
   }
 
-  // ---- ⑤ 写历史（本帧**累积后**的色 + 本帧矩 + 本帧键 + M）与输出 ----
+  // φ = `GI_DEN_LUMA_K` × max(噪声尺度, **相对下限**)：下限见 `GI_DEN_LUMA_FLOOR_REL`；
+  // 噪声尺度用上面定下的 `sigma_use`（含累积矩）⇒ atrous 的亮度 range 权重也稳定了。
+  gi_den_phi[idx] = GI_DEN_LUMA_K * max(max(sigma_use, GI_DEN_LUMA_FLOOR_REL * l_ref), 1e-5);
+
+  // ---- ⑤ 写历史（本帧**累积后**的色 + 累积矩 + 本帧键 + M）与输出 ----
   gi_hist_cur[hb + GI_DEN_H_COL] = bitcast<u32>(color.x);
   gi_hist_cur[hb + GI_DEN_H_COL + 1u] = bitcast<u32>(color.y);
   gi_hist_cur[hb + GI_DEN_H_COL + 2u] = bitcast<u32>(color.z);
-  gi_hist_cur[hb + GI_DEN_H_M1] = bitcast<u32>(mu3);
-  gi_hist_cur[hb + GI_DEN_H_M2] = bitcast<u32>(q3 / max(n3, 1.0));
+  gi_hist_cur[hb + GI_DEN_H_M1] = bitcast<u32>(m1_acc);
+  gi_hist_cur[hb + GI_DEN_H_M2] = bitcast<u32>(m2_acc);
   gi_hist_cur[hb + GI_DEN_H_M] = bitcast<u32>(m);
   gi_hist_cur[hb + GI_DEN_H_KEY0] = k0;
   gi_hist_cur[hb + GI_DEN_H_KEY1] = k1;

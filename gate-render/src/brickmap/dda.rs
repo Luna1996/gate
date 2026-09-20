@@ -1165,23 +1165,25 @@ pub(crate) struct AuxTexCache {
   gi_dn_src: [Option<TextureView>; 4],
   /// `gi_dn` 的存储视图：时域写 `[0]`，atrous 写 `[1]`/`[2]`/`[3]`。
   gi_dn_dst: [Option<TextureView>; 4],
-  /// 降噪 bind group：`[0]` = 时域；`[1..6]` = atrous 的 5 种 src→dst 组合（见 `DEN_ATROUS_CHAINS`）。
-  den_bg: [Option<BindGroup>; 6],
+  /// 降噪 bind group：`[0]` = 时域；`[1..7]` = atrous 的 6 种 src→dst 组合（见 `DEN_ATROUS_CHAINS`）。
+  den_bg: [Option<BindGroup>; 7],
   /// 历史双缓冲 + atrous 轮次的换绑状态（每次真正跑降噪时翻转一次）。
   den_flip: bool,
 }
-/// atrous 的 src→dst 组合表（下标 = `AuxTexCache::den_bg` 的 1..6）。
-/// 链的选取只取决于 `GI_DEN_ATROUS_ITER`（1 轮 ⇒ 直接写最终；2 轮 ⇒ 中间过 `[1]`；3 轮全用）：
-///   · 3 轮：tmp→a、a→b、b→den
-///   · 2 轮：tmp→a、a→den
-///   · 1 轮：tmp→den
-const DEN_ATROUS_CHAINS: [[usize; 2]; 5] = [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3]];
+/// atrous 的 src→dst 组合表（下标 = `AuxTexCache::den_bg` 的 1..7）。
+/// 链的选取只取决于 `GI_DEN_ATROUS_ITER`（见 `DEN_ATROUS_ROUNDS`）。
+/// 5 轮时 b→a 与 a→b 交替出现（只有 4 张中间靶，靠 ping-pong 撑起任意轮数），
+/// 所以这里按「用到的组合」去重列，而不是按轮次列。
+const DEN_ATROUS_CHAINS: [[usize; 2]; 6] = [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3], [2, 1]];
 /// `den_bg` 里「第 `i` 轮（0 起）该用哪个 src→dst 组合」的查表（按 `GI_DEN_ATROUS_ITER` 取前 n 项）。
-const DEN_ATROUS_ROUNDS: [[usize; 3]; 3] = [
-  [3, 0, 0], // 1 轮：tmp→den
-  [0, 4, 0], // 2 轮：tmp→a、a→den
-  [0, 1, 2], // 3 轮：tmp→a、a→b、b→den
-];
+/// 步长依次 1/2/4/8/16（= NRD/RELAX 的 5 轮 a-trous），足迹半径 = 16 个 GI 像素。
+///   1 轮：tmp→den                        （步长 1）
+///   2 轮：tmp→a、a→den                   （1、2）
+///   3 轮：tmp→a、a→b、b→den              （1、2、4）
+///   4 轮：tmp→a、a→b、b→a、a→den         （1、2、4、8）
+///   5 轮：tmp→a、a→b、b→a、a→b、b→den    （1、2、4、8、16）
+const DEN_ATROUS_ROUNDS: [[usize; 5]; 5] =
+  [[3, 0, 0, 0, 0], [0, 4, 0, 0, 0], [0, 1, 2, 0, 0], [0, 1, 5, 4, 0], [0, 1, 5, 1, 2]];
 
 impl AuxTexCache {
   /// GI 写入侧视图（BG5 的 binding 2/3 用）。
@@ -1408,7 +1410,10 @@ pub(crate) fn init_dda_pipelines(
   );
 
   // ---- BG5（GI 采样侧，只给 `dda_main` 的 pipeline 用）：两张 GI 网格尺寸的纹理 ----
-  // 绑定号 4/5（group(5) 空闲号，0..3 已被图集/GI 写入侧占），只进 `dda_main` 的 layout。
+  // 绑定号 4/5/6（group(5) 空闲号，0..3 已被图集/GI 写入侧占），只进 `dda_main` 的 layout。
+  // 4/5 = GI（降噪后）与覆盖度；6 = **降噪导引**（`dda_main` 做几何感知上采样时按「同平面」筛 tap）。
+  // 6 的访问类型必须是 read_write：同一份 shader 模块里这个 var 在 `gi_main` 的 pipeline 里被写
+  // （见 `gi::gi_bg5_layout`），WGSL 的声明类型是全局唯一的，两边 layout 不一致会被 wgpu 拒掉。
   let gi_read = BindGroupLayoutDescriptor::new(
     "DdaBg5GiRead",
     &[
@@ -1429,6 +1434,16 @@ pub(crate) fn init_dda_pipelines(
           sample_type: TextureSampleType::Float { filterable: true },
           view_dimension: TextureViewDimension::D2,
           multisampled: false,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 6,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
         },
         count: None,
       },
@@ -1837,19 +1852,23 @@ pub(crate) fn prepare_dda_bind_groups(
       eye_buf.as_entire_binding(),
     )),
   );
-  // group(5) 的 GI 采样侧（只进 `dda_main` 的 pipeline layout）：绑定号 4/5，给显式 entry 数组
+  // group(5) 的 GI 采样侧（只进 `dda_main` 的 pipeline layout）：绑定号 4/5/6，给显式 entry 数组
   // —— `BindGroupEntries::sequential` 是按位置 = 绑定号，无法表达"从 4 开始"。
   // binding 4 绑的是**降噪后**的那张（atrous 链的最终输出，`gi_dn[3]`），语义与原始 `gi_out` 完全
   // 一致（rgb = gi·valid、a = valid）；原始 `gi_out` 仍在（`gi_main` 写、时域读），保留作对照。
   // binding 5 仍是 `gi_cov_out` 原样（cov 是 0/1 覆盖度，不参与降噪）。
+  // binding 6 = 降噪导引（与 gi_main 写的是同一块 buffer）⇒ `dda_main` 能做**几何感知上采样**：
+  // 只接受与命中面同平面的 GI texel，棱边/墙角不渗色。
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
   let gi_den_view = beam_cache.gi_dn_src[3].as_ref().expect("降噪输出视图未创建").clone();
+  let gi_guide = beam_cache.gi_guide.as_ref().expect("降噪导引 buffer 未创建").clone();
   let gi_read_bg = render_device.create_bind_group(
     None,
     &gi_read_layout,
     &[
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
       BindGroupEntry { binding: 5, resource: BindingResource::TextureView(&gi_cov_view) },
+      BindGroupEntry { binding: 6, resource: gi_guide.as_entire_binding() },
     ],
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
@@ -2065,7 +2084,7 @@ pub(crate) fn dispatch_dda(
   {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
-    let n = crate::wesl_consts::gi_consts().gi_den_atrous_iter.clamp(1, 3) as usize;
+    let n = crate::wesl_consts::gi_consts().gi_den_atrous_iter.clamp(1, 5) as usize;
     let rounds = &DEN_ATROUS_ROUNDS[n - 1];
     if let Some(bg) = aux.den_bg[0].as_ref()
       && let Some(pipe) =
@@ -2091,8 +2110,13 @@ pub(crate) fn dispatch_dda(
       else {
         continue;
       };
-      let label =
-        ["gate_gi_denoise_atrous1", "gate_gi_denoise_atrous2", "gate_gi_denoise_atrous4"][i];
+      let label = [
+        "gate_gi_denoise_atrous1",
+        "gate_gi_denoise_atrous2",
+        "gate_gi_denoise_atrous4",
+        "gate_gi_denoise_atrous8",
+        "gate_gi_denoise_atrous16",
+      ][i];
       crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), label, |pass| {
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, bg, &[]);

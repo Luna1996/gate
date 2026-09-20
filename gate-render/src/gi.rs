@@ -267,9 +267,10 @@ pub struct GiGpu {
   /// 上一次真正跑 `gi_main` 的那一帧的 `world_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
   /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 存的二次顶点键在本帧仍然逐位成立。
   pub world_rev_gi: u32,
-  /// 降噪 pipeline：`[0]` = 时域、`[1..4]` = atrous 第 1/2/3 轮（步长 1/2/4）。
-  /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）。
-  pub den_pipelines: [Option<CachedComputePipelineId>; 4],
+  /// 降噪 pipeline：`[0]` = 时域、`[1..6]` = atrous 第 1..5 轮（步长 1/2/4/8/16）。
+  /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）；
+  /// 实际跑几轮由 `GI_DEN_ATROUS_ITER` 决定（1..=5，Rust 按它选 src→dst 链）。
+  pub den_pipelines: [Option<CachedComputePipelineId>; 6],
 }
 
 #[derive(bevy::ecs::resource::Resource)]
@@ -387,7 +388,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     // 都是零（M = 0 ⇒ 一律判无效），跳过与否都不会接受任何历史 ⇒ 安全。
     world_rev: 0,
     world_rev_gi: 0,
-    den_pipelines: [None; 4],
+    den_pipelines: [None; 6],
   });
 }
 
@@ -409,10 +410,18 @@ fn queue_gi_pipelines(
     "gate_gi_denoise_atrous1",
     "gate_gi_denoise_atrous2",
     "gate_gi_denoise_atrous4",
+    "gate_gi_denoise_atrous8",
+    "gate_gi_denoise_atrous16",
   ];
-  let entry =
-    ["gi_denoise_temporal", "gi_denoise_atrous1", "gi_denoise_atrous2", "gi_denoise_atrous4"];
-  for i in 0..4 {
+  let entry = [
+    "gi_denoise_temporal",
+    "gi_denoise_atrous1",
+    "gi_denoise_atrous2",
+    "gi_denoise_atrous4",
+    "gi_denoise_atrous8",
+    "gi_denoise_atrous16",
+  ];
+  for i in 0..6 {
     let layout =
       if i == 0 { vec![den_temporal_layout.clone()] } else { vec![den_atrous_layout.clone()] };
     gpu.den_pipelines[i] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {

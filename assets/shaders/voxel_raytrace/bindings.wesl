@@ -138,8 +138,13 @@ struct GiUniform {
 // rgba16f：rgb = gi·valid、a = valid；rg32f：r = cov·valid、g = valid。采样走 `light_samp` 双线性、按 valid 归一化。
 @group(5) @binding(4) var gi_tex: texture_2d<f32>;
 @group(5) @binding(5) var gi_cov_tex: texture_2d<f32>;
-/// @binding(6)：**降噪导引**（`gi_main` 写、降噪两段读）。每 GI 像素 `GI_DEN_GUIDE_WORDS`
-/// 个 word，布局见 `gi/consts.wesl`：面键 2 + 命中体素中心世界位置 3 + 法线 1 + 上帧重投影像素 1。
+/// @binding(6)：**降噪导引**（`gi_main` 写；降噪两段 + `dda_main` 的几何感知上采样读）。
+/// 每 GI 像素 `GI_DEN_GUIDE_WORDS` 个 word，布局见 `gi/consts.wesl`：
+/// 面键 2（有效 = 键非零，**没有**独立有效位）+ 命中体素中心世界位置 3 + 法线 1
+/// + 上帧重投影像素 1 + 平面检验容差 1。
+/// 声明为 `read_write`：同一份 shader 模块里这个 var 在 `gi_main` 的 pipeline 里被写
+/// （layout 也是 read_write），在 `dda_main` 的 pipeline 里只被读 —— **两边的 layout 都必须
+/// 给 read_only = false**，否则与这里的声明不符（wgpu 会报绑定类型不匹配）。
 @group(5) @binding(6) var<storage, read_write> gi_guide_out: array<u32>;
 
 // ===== @group(0) @binding(10..)：GI 降噪（两个新 pass，见 `gi/denoise.wesl`）=====
