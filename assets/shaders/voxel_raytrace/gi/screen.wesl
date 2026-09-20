@@ -1,5 +1,4 @@
 import package::bindings::{gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::common::{FLAGS_TRANSMISSIVE, palette_flags};
 import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
@@ -40,6 +39,8 @@ import package::world::{WorldHit, voxel_normal};
 // 薄板 / 墙缝安全：判据是唯一的 `gi_den_same_plane`（面号 + 物体 + 沿面法线轴的体素坐标），
 // 时域与空间都走它；1 格薄板的另一侧面号相反 / 法线轴坐标差一整格 ⇒ 精确拒掉。
 // **不用着色法线**：`voxel_normal` 在凸棱上给的是斜向梯度法线（见 `gi/denoise.wesl` 的说明）。
+// **MT5-1 放行介质像素后这条判据一字未改**：放行改变的只是「哪些像素写 valid」，键的定义、
+// 键的写入与键的比较都没有任何变化 ⇒ 玻璃薄板两侧同样被精确拒掉（见 `gi_ss_main` 的说明）。
 // ============================================================================
 
 /// reservoir 字数（Rust 侧从本文件解析同名字面量开 buffer）。
@@ -84,7 +85,7 @@ struct GiRes {
   nrm: vec3<f32>,
 }
 
-/// 空 reservoir（天空 / 介质像素）：`M = 0` ⇒ 下一帧任何时域/空间复用都判为无效，不会读到脏值。
+/// 空 reservoir（天空 / 未命中像素）：`M = 0` ⇒ 下一帧任何时域/空间复用都判为无效，不会读到脏值。
 fn gi_res_none() -> GiRes {
   return GiRes(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0u, 0u, 0u, 0u, 0u,
                vec3<f32>(0.0, 0.0, 1.0));
@@ -220,7 +221,30 @@ fn gi_ss_tap_offset(s: u32) -> vec2<i32> {
 }
 
 /// 屏幕空间 ReSTIR 的本像素入口（`gi_main` 调用）。
-/// 只处理「首命中即不透明」；天空 / 介质像素写 valid = 0（与 `dda_main` 的玻璃分支一致）。
+/// 只处理「命中实体体素」的像素；**天空（miss）像素写 valid = 0**（与 `dda_main` 的 miss 分支一致）。
+///
+/// **MT5-1 · transmissive（玻璃）表面照常产出 GI**：介质像素不再整格判废，而是与不透明表面走
+/// **同一条**路径 —— 同一个 `fetch_material` + 同一个 `brdf_reflected`（经 `gi_ray_radiance`）、
+/// 同一套导引键（`gi_key0/gi_key1`）。此前判废是为了"介质像素的 GI 无处消费"（`dda_main` 的玻璃
+/// 像素着色的是玻璃**后面**的那张不透明面，键对不上），代价是 GI 场在玻璃处留一个洞：那里既没有
+/// 自己的值、也没有可借的同面邻居（`gi_cov` 也是 0 ⇒ 玻璃后面的东西按"无 GI 数据"兜天光）。
+/// 现在玻璃面自己就是一个合法着色点：它的 `valid`/键/值会被 `dda_main` 的预乘归一化与上采样兜底
+/// （`gi_upsample_joint` 的"最近 texel"档）以及降噪的空间 tap 读到，而不是一个洞。
+///
+/// ⚠️ **显式写明的近似（有意为之，不是"物理正确"）**：玻璃表面的 GI 目前按 **albedo 漫反射** 算
+/// —— `brdf_reflected` 里**没有透射项**（没有 BTDF、没有按 IOR 偏折的透射方向、没有介质内的
+/// 多次散射）。物理上玻璃的 GI 主要应由**透射**贡献（`main.wesl` 的玻璃像素走的正是
+/// `trace_glass` 折射状态机）。本版的取舍：把"透射方向 + 折射后的二次顶点"接进 RIS 需要一整套
+/// 新的样本口径（会动到硬约束 2 的键定义），**留待后续**；因此玻璃的 GI 会偏亮（它按
+/// `kD·albedo` 漫反射出射），这是本版**有意保留的简化**。
+///
+/// **复用判据未动**（硬约束 2）：本函数只改「哪些像素有效」，键仍是精确几何面键
+/// （命中体素 + 面号 + 物体，且不含任何位置/法线启发式）⇒ 薄板/墙缝不漏光的根本不变。
+///
+/// **已知的边界行为（既有判据 × MT5-1 的组合，不是漏光）**：`gi_same_surface` 只要求
+/// 「**同一平面** + 着色法线相似」⇒ **同一平面内相邻的**玻璃体素与不透明体素会被当作同一个面
+/// 互相借样本（与"相邻同平面的不透明体素"是**同一条既有设计**）。它不跨面、不跨格、不跨薄板，
+/// 所以不是漏光；代价是"玻璃与不透明墙并排"处会有轻微串色。
 fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let idx = u32(coord.y) * size.x + u32(coord.x);
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
@@ -228,10 +252,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 二次顶点太阳反弹（菜单「渲染/RESTIR GI/太阳反弹」）：0 = 连 NEE 阴影射线都不发。
   let sun_bounce = gi_u.params.x;
 
-  // 「命中 && 非介质」才有效（布尔取反顺序别写错）：介质判定读 `FLAGS_TRANSMISSIVE` 位而非 transmission
-  // 字节 —— PBR 变体里那个字节属于 `asset`（`docs/PLAN.md` D1）。平凡变体下两者等价（写入侧
-  // `wire.rs::pack_palette_entry` 维护该位），故行为不变。
-  if (!(h.hit && (palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u)) {
+  // 只有天空（miss）无效：MT5-1 前这里还要求"首命中非介质"，那条判废已删除（见函数头）。
+  if (!h.hit) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
     gi_res_store_cur(idx, gi_res_none());
     // 降噪导引同步清零：整格清零 ⇒ 键为零 ⇒ 降噪与上采样都当作无效跳过。

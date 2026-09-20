@@ -51,6 +51,9 @@ struct Globals {
 // @binding(4)/(5)：光照场（AO fill，Rgba16Unorm，仅 `.a` 有效、`.rgb` 恒 0，采样走硬件三线性）。
 // 16-voxel cell 网格，相机中心 + 世界锚定槽位：纹素下标 = 世界 cell mod dims。
 @group(1) @binding(4) var light_tex: texture_3d<f32>;
+// **只给光照场用**（Rust 侧 desc：ClampToEdge ×3 + mipmap_filter = Nearest，该纹理无 mip 链）。
+// PBR 贴图**不要复用它**（MT2-3 起）：triplanar 要 Repeat 平铺、要 Linear mipmap filter，
+// 而光照场是"有界网格 + 世界锚定环绕"⇒ 改成 Repeat 会让越界查询绕回网格另一侧。
 @group(1) @binding(5) var light_samp: sampler;
 
 // --- BG1 追加（MT2-2，从 binding 6 起，不动 0..5）：全局材质资产表 + PBR 贴图集 ---
@@ -76,6 +79,13 @@ struct MaterialAsset {
 // `srgb_to_linear()` 是**完全同一口径** ⇒ 平凡材质与 PBR 材质能共用同一个 BRDF 入口。
 @group(1) @binding(7) var pbr_albedo_rough: texture_2d_array<f32>;  // Rgba8Unorm: rgb=albedo(sRGB 编码字节)、a=roughness
 @group(1) @binding(8) var pbr_metal: texture_2d_array<f32>;         // R8Unorm: r=metalness
+// @binding(9)：**PBR 贴图专用采样器**（MT2-3）。与 `light_samp` 分开是必须的 ——
+// ① triplanar 要**三轴 Repeat**（光照场是 ClampToEdge 的有界网格）；
+// ② 要 **Linear mag/min/mipmap**（光照场 mipmap_filter = Nearest、纹理本身无 mip 链）。
+// 权威 desc 在 Rust `pbr_texture.rs::create_pbr_sampler`：Repeat×3 / Linear(mag,min,mipmap) /
+// anisotropy_clamp ≤ 8（设备不支持 `SAMPLER_ANISOTROPY` 时退化 1）/ lod_max_clamp = mip 链底层。
+// 改那边的状态必须同改这里（占位与真身共用同一个 sampler 实例，见 `upload.rs::init_empty_gpu`）。
+@group(1) @binding(9) var pbr_samp: sampler;
 
 // --- BG2：GridDesc 数组（144B/entry，与 Rust GridDesc 字节一致）---
 struct GridDesc {

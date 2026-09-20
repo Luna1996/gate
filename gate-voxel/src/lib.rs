@@ -24,7 +24,11 @@ pub use volume::{
 
 pub use palette::{
   PALETTE_BITS, PALETTE_ENTRY_COUNT, PALETTE_INDEX_MAX, Palette, PaletteEntry, PaletteFlags,
-  PaletteId,
+  PaletteId, PbrOverrides, inverted_pct_to_override, ior_slider_to_x100, override_byte,
+  override_value, slider_to_override,
 };
 
-pub use scene::{draw_text, fill_box, fill_bricks, fill_sphere, text_size};
+pub use scene::{
+  Displace, DisplaceFn, FillStats, draw_text, fill_box, fill_box_displaced, fill_bricks,
+  fill_bricks_displaced, fill_sphere, fill_sphere_displaced, text_size,
+};

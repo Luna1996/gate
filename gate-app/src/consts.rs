@@ -1,4 +1,4 @@
-﻿//! gate-app 的可调旋钮（本 crate 的模块都在 `src/` 下，故集中在本文件）：改这里即改默认值。
+//! gate-app 的可调旋钮（本 crate 的模块都在 `src/` 下，故集中在本文件）：改这里即改默认值。
 //!
 //! 全是编译期常量：改值后重新编译。要给某项加 debug_menu 控件时，把它挪进 Bevy 资源再按
 //! 菜单连线（做法见 `debug_menu.rs` 里的 `RenderScale` / `EyeAdaptSettings` / `GiSettings`）。
@@ -60,3 +60,24 @@ pub const EXT_VOXEL_X: i32 = DEMO_TILES * 512;
 pub const EXT_VOXEL_Z: i32 = DEMO_TILES * 512;
 /// demo 场景世界中心（voxel）
 pub const EXT_VOXEL_HALF: i32 = EXT_VOXEL_X / 2;
+
+// ---------------------------------------------------------------------------
+// MT6 · 材质位移 → 真实体素几何（只在 `STARTUP_DEMO_SCENE = true` 的 demo 场景里生效）
+// ---------------------------------------------------------------------------
+
+/// demo 场景是否生成「材质位移」样例：一对同尺寸同材质的石台（一座 = 普通 CSG、一座 = 高度图位移）。
+/// 位置/尺寸/写入体素数/建议机位见启动日志的 `MT6 位移样例:` 两行（**只认日志，不猜坐标**）。
+pub const DEMO_DISPLACE_SAMPLE: bool = true;
+/// 位移样例用的材质高度图 id（磁盘侧 `assets/textures/pbr/<id>/<id>_height.png`）。
+/// 只解码这一个材质（MT6-2 的"按需"）：16 个全解没必要。
+pub const DEMO_DISPLACE_HEIGHT_MAP: &str = "stone_wall_04";
+/// **位移幅度**（MT6-1）：峰-峰**体素数**（偏置 0.5 ⇒ 上下各 4 格）。
+///
+/// 上界约束：`gate_voxel::Displace::bound`（= 幅度/2）应 ≤ 块粒度（`fill_box` = 4）
+/// —— 这样只有表面一层 4³ 块退化为逐体素，内部仍整块写（`docs/PLAN.md` §5 R7）。
+/// 调大（如 16）会让壳层变厚、体素数/树规模上涨，MT6-6 有实测对比。
+pub const DEMO_DISPLACE_AMPLITUDE: f32 = 8.0;
+/// **采样缩放**（MT6-1）：一张高度图铺多少**体素**（100 体素 ≈ 2m @50 voxel/m）。
+/// 与 MT3 的 `MATERIAL_TEX_WORLD_SCALE`(= 2.0m) 同源 ⇒ 凹凸与 albedo 贴图图案同相。
+/// 与 `height_field::HEIGHT_DOWNSAMPLE` 一起决定 texel/体素（= 128/100 ≈ 1.28，≥1 才不出毛刺）。
+pub const DEMO_DISPLACE_TEX_SCALE: f32 = 100.0;

@@ -1,6 +1,7 @@
 //! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
 //! BG0 = storage tex / 相机 uniform / beam depth / 眼睛适应状态（只读）；
-//! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理 / 材质资产表 / PBR 贴图数组。
+//! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理 + 采样器 / 材质资产表 /
+//! PBR 贴图数组 / **PBR 专用采样器**（MT2-3）。
 //! WGSL 源 = WESL 包 `shaders/voxel_raytrace/`（入口 `main.wesl`）。
 
 use bevy::{
@@ -1480,8 +1481,9 @@ pub(crate) fn init_dda_pipelines(
   );
 
   // ---- BG1：struct/leaves/palette 三 storage + globals uniform（Compute，read-only）----
-  // 6/7/8 = MT2-2 的全局材质资产表 + PBR 贴图数组（**BG1 被 dda / beam / gi 三个 pass 共用**，
-  // 这三条只在这一份 layout 里加；`dda.rs` 是 BG1 layout 的唯一出处，`gi` 侧 no-op）。
+  // 6/7/8/9 = MT2-2 / MT2-3 的全局材质资产表 + PBR 贴图数组 + **PBR 专用采样器**
+  // （**BG1 被 dda / beam / gi 三个 pass 共用**，这几条只在这一份 layout 里加；
+  // `dda.rs` 是 BG1 layout 的唯一出处，`gi` 侧 no-op）。
   let bg1 = BindGroupLayoutDescriptor::new(
     "DdaBg1",
     &BindGroupLayoutEntries::sequential(
@@ -1495,7 +1497,7 @@ pub(crate) fn init_dda_pipelines(
         // @binding(4)/(5)：光照场（AO fill + 发光密度 ε）——每 16³ 块
         // 实心占比的 3D 纹理 + 线性过滤采样器。
         texture_3d(TextureSampleType::Float { filterable: true }),
-        // @binding(5) 的 sampler 同时给 7/8 两张数组图采样用（都是可过滤的 Unorm 格式）。
+        // @binding(5) 的 sampler **只给光照场**（ClampToEdge、无 mip）；PBR 贴图走 @binding(9)。
         sampler(SamplerBindingType::Filtering),
         // @binding(6)：全局材质资产表（`array<MaterialAsset>`，32B/条 = 32KB）
         storage_buffer_read_only_sized(false, None),
@@ -1503,6 +1505,11 @@ pub(crate) fn init_dda_pipelines(
         // 视图维度必须是 `D2Array`（`texture_2d_array()` 已按此生成 layout entry）。
         texture_2d_array(TextureSampleType::Float { filterable: true }),
         texture_2d_array(TextureSampleType::Float { filterable: true }),
+        // @binding(9)：PBR 贴图**专用采样器**（MT2-3）——三轴 Repeat（triplanar 平铺）+
+        // Linear mag/min/**mipmap**（贴图集带完整 mip 链）。**不能与 5 合并**：光照场是
+        // ClampToEdge 的有界网格且无 mip，两者状态要求相反。desc 权威在
+        // `pbr_texture::create_pbr_sampler`（占位与真身共用 `GpuBrickMap.pbr_sampler`）。
+        sampler(SamplerBindingType::Filtering),
       ),
     ),
   );
@@ -2025,6 +2032,9 @@ pub(crate) fn prepare_dda_bind_groups(
       // @binding(7)/(8)：PBR 贴图数组（贴图集 / `GpuImage` 未就绪时是 1×1×1 占位视图）
       &pbr_albedo_view,
       &pbr_metal_view,
+      // @binding(9)：PBR 专用采样器（MT2-3）——`init_empty_gpu` 建一次、占位与真身共用同一个实例，
+      // 不存在"资源未就绪"的状态（采样器与它所采样的纹理无关）。
+      &gpu.pbr_sampler,
     )),
   );
 

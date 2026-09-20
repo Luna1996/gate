@@ -9,14 +9,17 @@ use gate_render::{
   VoxelScene, create_dda_image,
 };
 use gate_voxel::{
-  PaletteEntry, PaletteId, VolumeGrid, Volumes, draw_text, fill_box, fill_bricks, fill_sphere,
+  Displace, PaletteEntry, PaletteId, VolumeGrid, Volumes, draw_text, fill_box, fill_box_displaced,
+  fill_bricks, fill_sphere,
 };
 
 use crate::{
   consts::{
-    CAM_FAR, CAM_NEAR, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y, START_CAMERA_SKY,
+    CAM_FAR, CAM_NEAR, DEMO_DISPLACE_AMPLITUDE, DEMO_DISPLACE_HEIGHT_MAP, DEMO_DISPLACE_SAMPLE,
+    DEMO_DISPLACE_TEX_SCALE, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y, START_CAMERA_SKY,
     STARTUP_DEMO_SCENE,
   },
+  height_field::{self, HeightField},
   vox_scene,
 };
 
@@ -163,22 +166,22 @@ pub(crate) fn reload_world(
   Ok(info)
 }
 
-/// demo 调色板：1..=13 地形/建筑色 + 14 号 LED 灯柱（`PaletteEntry::default` + 逐字段赋值）。
+/// demo 调色板：1..=12 地形/岩石色 + 14 号 LED 灯柱（`PaletteEntry::default` + 逐字段赋值）。
+/// （原 13 号「浮空岛岛底」随浮空岛一起删除；槽 13 现在是空的默认色。）
 fn paint_demo_palette(grid: &mut VolumeGrid) {
   let palette: &[(u16, [u8; 3], u8)] = &[
     (1, [86, 160, 70], 220),   // 1 草地（L0 地面平原）
     (2, [140, 108, 76], 200),  // 2 山岩（山体主体）
     (3, [240, 244, 248], 160), // 3 雪峰（y > 山线顶）
-    (4, [172, 176, 190], 210), // 4 城堡石（墙/塔）
+    (4, [172, 176, 190], 210), // 4 石材（MT6 位移样例的石台）
     (5, [52, 168, 72], 210),   // 5 树叶（球冠）
     (6, [112, 72, 40], 200),   // 6 树干（细柱）
     (7, [64, 140, 232], 170),  // 7 河流蓝（L2 缠绕）
     (8, [68, 230, 220], 150),  // 8 水晶青（L4 高亮）
     (9, [200, 120, 240], 150), // 9 水晶紫（L4 高亮）
-    (10, [238, 76, 90], 160),  // 10 水晶红 / 旗帜（L4 高亮）
-    (11, [248, 210, 72], 160), // 11 塔顶金
+    (10, [238, 76, 90], 160),  // 10 水晶红（L4 高亮）
+    (11, [248, 210, 72], 160), // 11 塔顶金（L4 高亮）
     (12, [30, 32, 44], 220),   // 12 道路/桥面（深灰）
-    (13, [92, 118, 240], 180), // 13 浮空岛岛底
   ];
   let pal = grid.palette_mut();
   for &(idx, color, rough) in palette {
@@ -215,8 +218,8 @@ fn terrain_h(x: i32, z: i32) -> i32 {
   ((hf as i32).clamp(16, 1020)) & !3
 }
 
-/// 离中央堡（世界中心）的距离
-fn dist_to_castle(x: i32, z: i32) -> i32 {
+/// 离世界中心（= 中央广场圆心）的距离
+fn dist_to_center(x: i32, z: i32) -> i32 {
   let dx = x - EXT_VOXEL_HALF;
   let dz = z - EXT_VOXEL_HALF;
   ((dx * dx + dz * dz) as f32).sqrt() as i32
@@ -245,12 +248,13 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
     let mut x = 0i32;
     while x < EXT_VOXEL_X {
       let h = terrain_h(x, z);
-      let dc = dist_to_castle(x, z);
-      // 中央堡区 (radius<700) 不开地形，后面由城堡结构接管
-      let in_castle_plate = dc < 700;
+      let dc = dist_to_center(x, z);
+      // 中央广场 (radius<700) 不开地形：只留全地图 L0 草地地板（y=0..16）⇒ 一片平坦广场。
+      // （这里以前是「城堡基座，由 (3) 的天空之城接管」；浮空岛删除后它就是一个空广场。）
+      let in_central_plaza = dc < 700;
       // 河道：y=16..24 填 palette 7，不叠加山岩
       let in_r = in_river(x, z);
-      if !in_castle_plate {
+      if !in_central_plaza {
         // 只填 16..h 山体（y=0..16 地面稍后全地图统一填）
         let top = h;
         let snow_line = top - 40; // 4 对齐（top 已对齐 4）
@@ -279,7 +283,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
           }
         }
       } else {
-        // 城堡基座：y=0..16 草地平铺（稍后全局 L0 统一填），山体不叠加
+        // 中央广场：不铺山体，只靠稍后的全局 L0 草地地板（y=0..16）
       }
       x += 16;
     }
@@ -297,77 +301,15 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   draw_text(grid, IVec3::new(96, 32, 256), "GATE ENGINE", 8);
   mark!("(2) road+text");
 
-  // (3) 中央天空之城（以世界中心为锚）：浮空岛底 → 城墙/角楼 → 正殿 → 高塔 → 旗帜
-  let cx = EXT_VOXEL_HALF;
-  let cz = EXT_VOXEL_HALF;
-  // 浮空岛底（倒锥：按 y 降低半径收窄）——L0 级 16 步扫描
-  let island_base_y = 128i32; // 岛底尖
-  let island_top_y = 240i32; // 岛顶面（城墙在此升起）
-  let top_r = 560i32; // 顶面岛半径
-  let mut y = island_base_y;
-  while y < island_top_y {
-    let t = (y - island_base_y) as f32 / (island_top_y - island_base_y) as f32;
-    let r = (t * t.sqrt() * top_r as f32) as i32 + 16;
-    fill_sphere(grid, IVec3::new(cx, y, cz), r, 13);
-    y += 16;
-  }
-  mark!("(3a) floating island");
-  // 城墙平台（y=240..272）
-  fill_bricks(grid, IVec3::new(cx - 512, 240, cz - 512), IVec3::new(1024, 32, 1024), 16, 4);
-  // 四面城墙（y=272..336 = 64 高）
-  // 北 Z=cz-512, 南 Z=cz+512-8
-  fill_box(grid, IVec3::new(cx - 512, 272, cz - 512), IVec3::new(1024, 64, 8), 4);
-  fill_box(grid, IVec3::new(cx - 512, 272, cz + 512 - 8), IVec3::new(1024, 64, 8), 4);
-  fill_box(grid, IVec3::new(cx - 512, 272, cz - 512), IVec3::new(8, 64, 1024), 4);
-  fill_box(grid, IVec3::new(cx + 512 - 8, 272, cz - 512), IVec3::new(8, 64, 1024), 4);
-  // 四角角楼 96×96×160（从 y=272 起比城墙多高 96）
-  for &(ox, oz) in &[(-512, -512), (512 - 96, -512), (-512, 512 - 96), (512 - 96, 512 - 96)] {
-    let tx = cx + ox;
-    let tz = cz + oz;
-    fill_bricks(grid, IVec3::new(tx, 272, tz), IVec3::new(96, 160, 96), 16, 4);
-    // 角楼顶金色 16
-    fill_box(grid, IVec3::new(tx, 272 + 160, tz), IVec3::new(96, 16, 96), 11);
-  }
-  // 正殿（中心，y=336..464 = 128 高）
-  fill_bricks(grid, IVec3::new(cx - 256, 336, cz - 256), IVec3::new(512, 128, 512), 16, 4);
-  // 正殿正门（Z- 方向，挖一矩形门洞：clear_voxel）
-  {
-    // L1 每步 = 8 voxel；宽 96 → 12 步 × 高 96 → 12 步 × 深 8 → 1 步
-    let e = 8i32; // L1 边长
-    let mn = IVec3::new(cx - 48, 336, cz - 264);
-    let ex = mn + IVec3::new(96, 96, 8);
-    let mut z = mn.z.div_euclid(e) * e;
-    while z < ex.z {
-      let mut y = mn.y.div_euclid(e) * e;
-      while y < ex.y {
-        let mut x = mn.x.div_euclid(e) * e;
-        while x < ex.x {
-          grid.clear_voxel(gate_voxel::VoxelCoord::from_ivec3(IVec3::new(x, y, z)));
-          x += e;
-        }
-        y += e;
-      }
-      z += e;
-    }
-  }
-  // 高塔（y=464..720 = 256 高，底 96×96 上收顶）
-  fill_bricks(grid, IVec3::new(cx - 48, 464, cz - 48), IVec3::new(96, 256, 96), 16, 4);
-  // 塔顶平台 128×128×16
-  fill_box(grid, IVec3::new(cx - 64, 720, cz - 64), IVec3::new(128, 16, 128), 11);
-  // 金顶球（L2 r=64，塔顶 y=720+80=800）
-  fill_sphere(grid, IVec3::new(cx, 800, cz), 64, 11);
-  mark!("(3b) castle walls+towers");
-  // 四角旗帜（L4 红飘带：从角楼顶 4 角斜向上拉出小立方体串）
-  for &(ox, oz) in &[(-512, -512), (512 - 16, -512), (-512, 512 - 16), (512 - 16, 512 - 16)] {
-    let fx = cx + ox + 4;
-    let fz = cz + oz + 4;
-    for s in 0..16i32 {
-      fill_box(grid, IVec3::new(fx + s, 448 + s * 4, fz), IVec3::new(8, 8, 8), 10);
-    }
-  }
+  // (3) 【已删除】原「中央天空之城」：浮空岛倒锥 + 城墙/角楼/正殿/高塔/旗帜。
+  //     删除原因：**浮空岛已过时** —— 场景现在从 `.vox` 读取（`vox_scene::load_vox_scene`），
+  //     这座程序化天空之城只是早期的规模/精度展台，且它的岛底是半径最大 560 的**实心球**，
+  //     会把中庭连默认机位一起包在固体里（`EDIT SELFTEST` 实测射线 t=0 命中相机自身）。
+  //     ⇒ 下面是空出来的**中央广场**：`(1)` 里 `dc < 700` 不铺山体，只留全地图 L0 草地地板（y=0..16）。
+  //     **编号保持不重排**，以对齐既有的 `SCENE (n) ...` 日志与本文件/计划里的引用。
 
   // (4) 森林：~160 棵确定性散点树（双素数线性同余，不用 rand）= 树干（L1）+ 叶球（L2，r=80）；
-  // 选址：城堡半径外、非河道、非大道、h<360。
+  // 选址：中央广场外、非河道、非大道、h<360。
   {
     let mut n_planted = 0usize;
     let mut i = 0i32;
@@ -378,7 +320,8 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
       let x = x.abs();
       let z = z.abs();
       let h = terrain_h(x, z);
-      let ok = dist_to_castle(x, z) > 900
+      // 广场保持空旷：MT6 的位移样例就摆在广场地面上，需要前方无遮挡
+      let ok = dist_to_center(x, z) > 900
         && !in_river(x, z)
         && !((EXT_VOXEL_HALF - 32)..=(EXT_VOXEL_HALF + 32)).contains(&z) // 中央大道
         && h < 360;
@@ -436,4 +379,110 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   grid.set_comp(t0, 0, 0, 0, 0x1122);
   grid.set_comp(t0, 1, 0, 0, 0x3344);
   mark!("(6) hotspots+state");
+
+  // (7) MT6-4 · 材质位移样例（开关见 `consts::DEMO_DISPLACE_SAMPLE`）
+  if DEMO_DISPLACE_SAMPLE {
+    build_displace_sample(grid);
+    mark!("(7) MT6 displacement sample");
+  }
+}
+
+/// MT6-4 · **材质位移样例**：一对同尺寸同材质的石台 —— 一座走既有 CSG（位移关闭）、
+/// 一座按 `consts::DEMO_DISPLACE_HEIGHT_MAP` 的高度图位移出**真实体素**凹凸，一眼可对照。
+///
+/// **位置**：中央广场地面（y=16 起）—— 浮空岛删除后广场是空的，这里一览无遗，
+/// 不再需要"爬到塔帽顶、再换机位绕开实体"。
+/// （历史：样例原先挂在西北角楼的塔帽顶，因为当时浮空岛倒锥是半径最大 560 的实心球、
+/// 把中庭连默认机位一起包住；浮空岛删除后这个约束随之消失。）
+///
+/// **材质**：demo 调色板 4（石材，纯色）—— 凹凸**全部来自几何**，不靠任何贴图着色
+/// （`docs/PLAN.md` §3 D2：不 bake 法线、不用法线贴图造假凹凸；凹槽的暗部由真实几何的 GI 遮蔽给出）。
+///
+/// **MT6-5 · 编辑语义（一次性产物）**：位移在这里一次性做完，产物就是普通体素（palette 4）——
+/// 之后 `edit.rs` 的笔触按 `set_voxel` 覆盖它们（`EDIT[place]` = 普通体素、`EDIT[erase]` = 普通空格），
+/// **不存在**"这块是位移出来的"这种状态，也就不存在"位移重算 / 位移与编辑打架"的路径。
+/// （本工程也没有任何运行期重跑 CSG 的地方：`build_demo_scene` 只在 Startup 跑一次，
+/// 「游戏/世界/重载世界」走的是 `vox_scene::load_vox_scene` 的另一条路径。）
+fn build_displace_sample(grid: &mut VolumeGrid) {
+  // 中央广场地面上，两座台子沿 Z 并排、留 8 体素间隙；避开中央大道（z∈[480,544]）与标语（z∈[256,304]）。
+  let extent = IVec3::new(64, 48, 32);
+  let plain = IVec3::new(480, 16, 380);
+  let bumped = IVec3::new(480, 16, 420);
+
+  // 基准台（位移关闭）：既有 CSG 快路径 —— 作为"位移前"的对照（同尺寸同材质，差别只有位移）
+  let base_voxels = fill_box(grid, plain, extent, 4);
+
+  // 高度图：同步解码**只这一个**材质（MT6-2 的"按需"；AssetServer 是异步的，而场景构造在 Startup）
+  let path = crate::assets_dir()
+    .join("textures")
+    .join("pbr")
+    .join(DEMO_DISPLACE_HEIGHT_MAP)
+    .join(format!("{DEMO_DISPLACE_HEIGHT_MAP}_height.png"));
+  let hf = match HeightField::load_png(&path) {
+    Ok(hf) => hf,
+    Err(e) => {
+      // 缺素材不该让引擎起不来：右台退化成普通 CSG，日志说清（其余场景一字不动）
+      let n = fill_box(grid, bumped, extent, 4);
+      bevy::log::warn!(
+        target: "gate",
+        "MT6 位移样例：高度图不可用（{e}）⇒ 右台退化为普通 CSG（写入 {n} 体素）；\
+         放回 assets/textures/pbr/{DEMO_DISPLACE_HEIGHT_MAP}/{DEMO_DISPLACE_HEIGHT_MAP}_height.png 即恢复"
+      );
+      return;
+    }
+  };
+  // MT6-1 的语义表在 `height_field::HeightField::displace_fn`：切空间 UV / Repeat 平铺
+  // 双线性采样 / 偏置 0.5（双向，外推 + 内缩）。这里只给"幅度"与"一张图铺多少体素"。
+  let f = hf.displace_fn(DEMO_DISPLACE_AMPLITUDE, DEMO_DISPLACE_TEX_SCALE);
+  let bound = height_field::displace_bound(DEMO_DISPLACE_AMPLITUDE);
+  let t0 = std::time::Instant::now();
+  let st = fill_box_displaced(grid, bumped, extent, 4, Some(Displace { f: &f, bound }));
+  let (lo, hi) = hf.range();
+  let size = hf.size();
+  bevy::log::info!(
+    target: "gate",
+    "MT6 位移样例: 基准台 @{plain} +{extent}（普通 CSG，写入 {base_voxels} 体素）| \
+     位移台 @{bumped} +{extent}（高度图 {DEMO_DISPLACE_HEIGHT_MAP} {w}×{h} texel，取值 {lo:.3}..{hi:.3}；\
+     幅度 {DEMO_DISPLACE_AMPLITUDE} 体素（峰-峰，偏置双向 ±{bound}）、一张铺 {DEMO_DISPLACE_TEX_SCALE} 体素）\
+     ⇒ 写入 {} 体素（其中整块写 {} 块 = {} 体素，壳层逐体素 {} 格），耗时 {:?}；\
+     关掉这个样例：consts::DEMO_DISPLACE_SAMPLE",
+    st.voxels,
+    st.whole_bricks,
+    st.whole_bricks * 64,
+    st.shell_voxels,
+    t0.elapsed(),
+    w = size.x,
+    h = size.y,
+  );
+  log_sample_camera(plain, extent);
+}
+
+/// 打印**建议机位**：把 `data/config.toml` 的 `[camera]` 节换成日志里这一组即可正对位移样例。
+/// 为什么需要它：样例躺在**地面**上（y=16 起），而默认机位是低俯角平视（eye y≈310、pitch≈0.29），
+/// 不一定正对它们 —— 给一组俯视机位比"自己找"省事。**不再是"必须换机位"**（浮空岛删除后
+/// 广场上是空的，任何从上方看过去的机位都能看到，不存在被实体包住的问题）。
+fn log_sample_camera(plain: IVec3, extent: IVec3) {
+  let target = (plain + extent / 2).as_vec3();
+  // 从样例的东南上方俯视（广场是平的草地，视线无遮挡）
+  let eye = target + Vec3::new(150.0, 90.0, 150.0);
+  let orbit = OrbitCamera::from_eye(eye, target);
+  bevy::log::info!(
+    target: "gate",
+    "MT6 位移样例机位（粘进 data/config.toml 的 [camera] 节）: \
+     mode = \"Fly\", eye = [{:.1}, {:.1}, {:.1}], yaw = {:.4}, pitch = {:.4}, distance = {:.1}；\
+     画面里的两座石台：@[{}, {}, {}] +{extent} = **普通 CSG**（位移关闭），\
+     @[{}, {}, {}] +{extent} = **位移版**（关注凹凸是否一格一格错开、凹槽是否被 GI 照暗）",
+    eye.x,
+    eye.y,
+    eye.z,
+    orbit.yaw,
+    orbit.pitch,
+    orbit.distance,
+    plain.x,
+    plain.y,
+    plain.z,
+    plain.x,
+    plain.y,
+    plain.z + extent.z + 8,
+  );
 }

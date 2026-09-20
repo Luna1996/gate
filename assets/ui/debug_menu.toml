@@ -243,6 +243,7 @@ min = 0.0
 max = 255.0
 step = 1.0
 decimals = 0
+tooltip = "menu.game.edit.emissive.tip"
 
 [[items.children.children]]
 kind = "slider"
@@ -253,6 +254,7 @@ min = 0.0
 max = 100.0
 step = 1.0
 decimals = 0
+tooltip = "menu.game.edit.alpha.tip"
 
 [[items.children.children]]
 kind = "slider"
@@ -263,6 +265,74 @@ min = 0.0
 max = 100.0
 step = 1.0
 decimals = 0
+tooltip = "menu.game.edit.smooth.tip"
+
+# ---- MT7-1 · 材质编写（PBR 变体）----
+# 选项 = assets/textures/pbr/ 的目录名（字典序 = texture_2d_array 层号 = 资产表槽号，
+# 与 pbr_texture.rs 的层号契约一致）；选中项按 id 查 PbrTextureSet 的真实槽号。
+[[items.children.children]]
+kind = "toggle"
+id = "pbr"
+label = "menu.game.edit.pbr"
+checked = false
+tooltip = "menu.game.edit.pbr.tip"
+
+[[items.children.children]]
+kind = "dropdown"
+id = "pbr_asset"
+label = "menu.game.edit.pbr_asset"
+options = [
+    "brick_wall_001",
+    "broken_brick_wall",
+    "coated_pine",
+    "cobblestone_01",
+    "dirt",
+    "floor_tiles_06",
+    "herringbone_parquet",
+    "lacquered_cherry_wood",
+    "laminate_floor_02",
+    "marble_cliff_03",
+    "metal_plate",
+    "painted_plaster_wall",
+    "rocky_terrain_02",
+    "square_tiles_03",
+    "stone_wall_04",
+    "wooden_floor_01",
+]
+selected = 0
+
+[[items.children.children]]
+kind = "slider"
+id = "metal"
+label = "menu.game.edit.metal"
+value = 0.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.edit.metal.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "ior"
+label = "menu.game.edit.ior"
+value = 150.0
+min = 100.0
+max = 300.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.edit.ior.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "spec"
+label = "menu.game.edit.spec"
+value = 0.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.edit.spec.tip"
 
 [[items.children]]
 kind = "sub_menu"

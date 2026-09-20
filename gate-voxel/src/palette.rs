@@ -96,10 +96,35 @@ impl From<PaletteId> for usize {
 /// **这 8B 按 [`PaletteFlags::IS_PBR`] 复用为两种变体**（`docs/PLAN.md` D1 tagged union）：
 /// - 平凡变体（`IS_PBR = 0`）：本结构体字段就是全部 payload（`color` + `roughness` + `emissive` +
 ///   `transmission` + `metallic`），字节布局与改动前**逐位相同**（只有原 `_pad` 变成有语义的 `metallic`）；
-/// - PBR 变体（`IS_PBR = 1`）：这 8B 被解释为 `asset: u16` + 5 个标量覆盖，本结构体字段不再被读
-///   （打包入口是 `gate-render/src/brickmap/wire.rs::pack_palette_entry_pbr`）。
+/// - PBR 变体（`IS_PBR = 1`）：这 8B 被解释为 `asset: u16` + 5 个标量覆盖
+///   （构造入口是 [`PaletteEntry::pbr`]）。
 ///
 /// 布局的写侧权威见 `wire.rs::pack_palette_entry`，读侧见 `common.wesl` 的 `palette_*`。
+///
+/// ## PBR 变体下的字段对应表（**关键**：字段名只是 8B 的"位置标签"，语义随变体变）
+///
+/// PBR 变体的字节位置完全自由（D1：平凡变体的位置被向后兼容钉死，PBR 变体按最省的方式排），
+/// 于是同一个 8B 结构体在 PBR 变体下**每个字段都另有含义**：
+///
+/// | 字段（`PaletteEntry` 的 8B 视图） | 所属 word / bits | PBR 变体下的含义 |
+/// |---|---|---|
+/// | `color[0]` | word0 bits 0..7 | `roughness` 覆盖 |
+/// | `color[1]` | word0 bits 8..15 | `metallic` 覆盖 |
+/// | `color[2]` | word0 bits 16..23 | `emissive` 覆盖 |
+/// | `roughness` | word0 bits 24..31 | `transmission` 覆盖 |
+/// | `emissive` | word1 bits 0..7 | `asset: u16` 的**低**字节 |
+/// | `transmission` | word1 bits 8..15 | `asset: u16` 的**高**字节 |
+/// | `flags` | word1 bits 16..23 | flags（含 `IS_PBR` 变体位） |
+/// | `metallic` | word1 bits 24..31 | `specular` 覆盖（语义同 glTF `KHR_materials_specular`） |
+///
+/// 覆盖的编码见 [`PbrOverrides`]（`0` = 不覆盖）；`asset` 是 `MaterialAsset` 全局表的槽号，
+/// 分工是「资产级给物理基值、槽级只给调节量」（见 D1「F0 的唯一来源规则」）。
+/// **读侧（shader / 本仓任何按字段读的地方）不得对 PBR 变体套用平凡语义**：变体判定只认
+/// `flags` 的 `IS_PBR` 位（`common.wesl::fetch_material` 就是这么分派的）。
+///
+/// `PartialEq`（内容去重的判据，见 `gate-app/src/edit.rs::material_slot`）在**两个变体上都与
+/// `pack_palette_entry` 的输出一一对应**：打包是单射（每个字段都落在固定的 bit 段里、无重叠、
+/// 无被丢弃的字段）⇒ 等字段 ⟺ 等 8B payload。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct PaletteEntry {
@@ -119,6 +144,112 @@ pub struct PaletteEntry {
   pub metallic: u8,
 }
 
+impl PaletteEntry {
+  /// 构造 **PBR 变体**条目：**只填字段、不打包**（打包只有一处 —— `wire.rs::pack_palette_entry`
+  /// 按 `IS_PBR` 分派；本函数与它严格互逆，字段对应表见类型文档）。
+  ///
+  /// - `asset` 是 `MaterialAsset` 全局表的槽号（`u16` ⇒ 最多 65536 个资产，D1）；本函数把它**拆成
+  ///   `emissive`（低字节）/ `transmission`（高字节）两个"位置标签"**——这两个字段在平凡变体里
+  ///   是发光/透射，在 PBR 变体里只是 `asset` 的两个字节，**不要**按平凡语义去读它们；
+  /// - `IS_PBR` 由本函数保证置上（`pack_palette_entry` 据此分派）；
+  /// - `TRANSMISSIVE` 由**调用方**决定（D1：只有调用方知道所选资产是不是透射材质）；
+  ///   平凡变体那条"`transmission > 0` ⇒ 介质"的自动推断规则**不适用于** PBR 变体。
+  pub fn pbr(asset: u16, ov: PbrOverrides, flags: PaletteFlags) -> Self {
+    Self {
+      color: [ov.roughness, ov.metallic, ov.emissive],
+      roughness: ov.transmission,
+      emissive: (asset & 0xFF) as u8,
+      transmission: (asset >> 8) as u8,
+      flags: flags.union(PaletteFlags::IS_PBR),
+      metallic: ov.specular,
+    }
+  }
+
+  /// PBR 变体的 `asset`（把 `emissive` / `transmission` 两个字节拼回）；[`Self::pbr`] 的逆。
+  /// 平凡变体下无意义（那两个字段是发光/透射）。
+  #[inline]
+  pub fn pbr_asset(&self) -> u16 {
+    (self.emissive as u16) | ((self.transmission as u16) << 8)
+  }
+
+  /// PBR 变体的 5 个槽级覆盖；[`Self::pbr`] 的逆（平凡变体下无意义）。
+  #[inline]
+  pub fn pbr_overrides(&self) -> PbrOverrides {
+    PbrOverrides {
+      roughness: self.color[0],
+      metallic: self.color[1],
+      emissive: self.color[2],
+      transmission: self.roughness,
+      specular: self.metallic,
+    }
+  }
+}
+
+/// PBR 变体的逐实例标量覆盖（`docs/PLAN.md` D1）。
+/// - `0` = **不覆盖**（用材质资产的值）；
+/// - `1..=255` = 覆盖为 `(v − 1) / 254`（`1` 因此能表达"完全镜面"这种 0 值，而不与"不覆盖"撞码）。
+///
+/// 定义在本 crate（而不是 `gate-render`）的理由：它是这 8B 的**语义**、不是打包细节 ——
+/// `PaletteEntry::pbr` 要吃它，而 `gate-voxel` 是纯逻辑层、不能被 `gate-render` 反向依赖（硬约束 8）。
+/// 编码的读写镜像在 `wire.rs::pack_palette_entry` 与 `common.wesl::override_value`（三处一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PbrOverrides {
+  pub roughness: u8,
+  pub metallic: u8,
+  pub emissive: u8,
+  pub transmission: u8,
+  /// 语义同 glTF `KHR_materials_specular`：只调制**电介质**的 F0，对金属无效（D1「F0 的唯一来源规则」）。
+  pub specular: u8,
+}
+
+// ============================================================================
+// 槽级覆盖的编码 ↔ UI 滑杆的映射（MT7-1 的纯函数，带单元测试）
+// 这些是"编码"本身的一部分（与 `PbrOverrides` 同一层），故放在本 crate：
+// gate-app 的菜单动作只做「滑杆值 → 覆盖字节」，不另立第二套编码。
+// ============================================================================
+
+/// 参数值 `value ∈ [0, 1]` → 覆盖字节：`1 + round(value × 254)` ∈ `1..=255`。
+/// `1..=255` 解码回 `(v−1)/254` ⇒ `1` 精确表达 0（完全镜面 / 完全不透明），`255` 表达 1。
+pub fn override_byte(value: f32) -> u8 {
+  (1.0 + (value.clamp(0.0, 1.0) * 254.0).round()) as u8
+}
+
+/// 覆盖字节的逆解码：`0` → `None`（不覆盖），`1..=255` → `Some((v−1)/254)`。
+/// 与 `common.wesl::override_value`（返回 −1 哨兵）同义，只是 Rust 侧用 `Option` 表达。
+pub fn override_value(byte: u8) -> Option<f32> {
+  if byte == 0 { None } else { Some(f32::from(byte - 1) / 254.0) }
+}
+
+/// 「滑杆值越大 ⇒ 参数越大」的控件（metallic / specular / 自发光）→ 覆盖字节。
+/// **最低档（`value <= min`）= 不覆盖**（用资产的值）——所以滑杆的行程被"让"出一档来给
+/// "不覆盖"，这也是唯一能在单个滑杆上表达三态（不覆盖 / 覆盖为 0 / 覆盖为 1）的做法。
+pub fn slider_to_override(value: f32, min: f32, max: f32) -> u8 {
+  let span = max - min;
+  if span <= 0.0 || value <= min {
+    return 0;
+  }
+  override_byte((value - min) / span)
+}
+
+/// 「滑杆值越大 ⇒ 参数越小」的控件（光滑度 = 100 − roughness、透明度 = 100 − transmission）
+/// → 覆盖字节：参数值 = `(100 − pct) / 100`。最低档（`pct <= 0`）同上 = **不覆盖**。
+///
+/// 单测 `inverted_slider_keeps_direction_and_reaches_zero` 钉住这一档落差：
+/// `pct = 0` 是"不覆盖"（不是"参数 = 1"），`pct = 100` 给出字节 `1` = 参数精确 0（完全镜面 / 全透）。
+pub fn inverted_pct_to_override(pct: f32) -> u8 {
+  if pct <= 0.0 {
+    return 0;
+  }
+  override_byte((100.0 - pct.clamp(0.0, 100.0)) / 100.0)
+}
+
+/// 「折射率」滑杆（`100..=300` = IOR ×100，默认 150 = 1.50）→ 资产 IOR ×100。
+/// **不是覆盖**：D1 规定 IOR 是**资产级**物理基值（同时服务玻璃折射与电介质 F0），
+/// 槽级只有 `specular` 覆盖（只调制电介质 F0）⇒ 本函数产出的值属于"资产参数"那一侧。
+pub fn ior_slider_to_x100(value: f32) -> u16 {
+  value.round().clamp(100.0, 300.0) as u16
+}
+
 /// 标志位：手写 bit 常量（不引 bitflags crate）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaletteFlags(pub u8);
@@ -129,13 +260,14 @@ impl PaletteFlags {
   pub const OUTPUT_PORT: Self = Self(1 << 2); // 输出端口
   pub const HOLOGRAM: Self = Self(1 << 3); // 全息渲染变体
   /// 变体位（D1）：置 1 ⇒ 这 8B payload 按 **PBR 变体**（`asset: u16` + 标量覆盖）解释。
-  /// 写入侧由 `wire.rs::pack_palette_entry_pbr` 保证置上（`pack_palette_entry` 恒不置）。
+  /// 写入侧由 [`PaletteEntry::pbr`] 保证置上；`wire.rs::pack_palette_entry` 按这一位**分派**
+  /// （置上则按 PBR 布局打包，否则走平凡路径、逐位不变）。
   pub const IS_PBR: Self = Self(1 << 4);
   /// DDA 热路径位：置 1 = 该槽是**可穿透介质**。`trace.wesl::medium_of` 在 DDA 内逐体素调用，
   /// 只读这一位（与 transmission 同在 word1 ⇒ 零额外读取）—— PBR 变体里 transmission 所在字节
   /// 属于 `asset`，不能再按字节判介质。
-  /// **由写入侧维护**：平凡变体 = `transmission > 0`（见 `wire.rs::pack_palette_entry`）；
-  /// PBR 变体由调用方决定（只有它知道资产是不是透射材质）。
+  /// **由写入侧维护**：平凡变体 = `transmission > 0`（`wire.rs::pack_palette_entry` 自动推断）；
+  /// PBR 变体由调用方决定、打包函数**原样透传**（只有调用方知道资产是不是透射材质）。
   /// 改动前 bit5 空闲且恒 0 ⇒ 旧条目的介质行为不变。
   pub const TRANSMISSIVE: Self = Self(1 << 5);
 
@@ -257,5 +389,87 @@ impl Palette {
   #[inline]
   pub fn is_empty_slot(&self, idx: PaletteId) -> bool {
     !self.occupied(idx)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// MT7-1 的映射函数必须与 `PbrOverrides` 的编码逐点一致（`0` = 不覆盖 / `1..=255` = `(v−1)/254`）。
+  #[test]
+  fn override_byte_matches_d1_encoding() {
+    assert_eq!(override_byte(0.0), 1, "参数 0 必须编码成字节 1（而不是 0 = 不覆盖）");
+    assert_eq!(override_byte(1.0), 255);
+    assert_eq!(override_byte(0.5), 128);
+    assert_eq!(override_value(override_byte(0.5)), Some(127.0 / 254.0));
+    // 越界钳位：滑杆理论上给不出 > 1，但钳位是语义的一部分（不 panic、不环绕）
+    assert_eq!(override_byte(-1.0), 1);
+    assert_eq!(override_byte(9.0), 255);
+  }
+
+  /// 覆盖编码的逆：`0` = 不覆盖（`None`），其余给出 `(v−1)/254`。
+  #[test]
+  fn override_value_is_inverse_of_byte() {
+    assert_eq!(override_value(0), None);
+    assert_eq!(override_value(1), Some(0.0));
+    assert_eq!(override_value(255), Some(1.0));
+    for b in 0..=255u8 {
+      match override_value(b) {
+        None => assert_eq!(b, 0),
+        Some(v) => assert_eq!(override_byte(v), b, "字节 {b} 往返不一致"),
+      }
+    }
+  }
+
+  /// 「不覆盖」必须在**最低档**就能到达（MT7-1 的验收之一：滑杆要能表达"不覆盖"）。
+  #[test]
+  fn lowest_notch_means_no_override() {
+    assert_eq!(slider_to_override(0.0, 0.0, 100.0), 0, "metallic 滑杆最低档 = 不覆盖");
+    assert_eq!(slider_to_override(0.0, 0.0, 255.0), 0, "自发光滑杆 0 = 不覆盖");
+    assert_eq!(inverted_pct_to_override(0.0), 0, "光滑度/透明度最低档 = 不覆盖");
+    // 最低档之外的行程仍覆盖满 0..1（除去为"不覆盖"让出的那一档）
+    assert_eq!(slider_to_override(100.0, 0.0, 100.0), 255);
+    assert_eq!(inverted_pct_to_override(100.0), 1, "光滑度 100% ⇒ roughness 覆盖为精确 0（镜面）");
+  }
+
+  /// 反向滑杆（光滑度 / 透明度）必须保持平凡变体的方向：pct 越大 ⇒ 参数越小。
+  #[test]
+  fn inverted_slider_keeps_direction_and_reaches_zero() {
+    let rough = |pct: f32| override_value(inverted_pct_to_override(pct));
+    let g50 = rough(50.0).unwrap();
+    let g100 = rough(100.0).unwrap();
+    let g1 = rough(1.0).unwrap();
+    assert_eq!(g100, 0.0);
+    assert!(g1 > g50 && g50 > g100, "粗糙度必须随「光滑度」单调不增：{g1} > {g50} > {g100}");
+    // 50% 约等于旧的 `smooth_pct_to_roughness(50) = 128` 归一化值（128/255 ≈ 0.502）
+    assert!((g50 - 0.502).abs() < 0.01);
+  }
+
+  /// IOR 滑杆是 ×100 单位域（100..=300 ⇒ 1.00..3.00），默认 150 = 1.50（D1 的资产级物理基值）。
+  #[test]
+  fn ior_slider_is_x100() {
+    assert_eq!(ior_slider_to_x100(150.0), 150);
+    assert_eq!(ior_slider_to_x100(100.0), 100);
+    assert_eq!(ior_slider_to_x100(300.0), 300);
+    assert_eq!(ior_slider_to_x100(149.6), 150, "四舍五入到整数 ×100");
+    assert_eq!(ior_slider_to_x100(0.0), 100, "越界钳到 1.00");
+    assert_eq!(ior_slider_to_x100(1e6), 300, "越界钳到 3.00");
+  }
+
+  /// `PaletteEntry::pbr` 的字段落位必须与 D1 的字节布局表一致（`pbr_asset` / `pbr_overrides` 是它的逆）。
+  #[test]
+  fn pbr_constructor_field_layout() {
+    let ov = PbrOverrides { roughness: 1, metallic: 2, emissive: 3, transmission: 4, specular: 5 };
+    let e = PaletteEntry::pbr(0xBEEF, ov, PaletteFlags::TRANSMISSIVE);
+    assert_eq!(e.color, [1, 2, 3], "color[0..3] = roughness / metallic / emissive 覆盖");
+    assert_eq!(e.roughness, 4, "roughness 字段 = transmission 覆盖");
+    assert_eq!(e.metallic, 5, "metallic 字段 = specular 覆盖");
+    assert_eq!(e.emissive, 0xEF, "emissive 字段 = asset 低字节");
+    assert_eq!(e.transmission, 0xBE, "transmission 字段 = asset 高字节");
+    assert_eq!(e.pbr_asset(), 0xBEEF);
+    assert_eq!(e.pbr_overrides(), ov);
+    assert!(e.flags.contains(PaletteFlags::IS_PBR), "IS_PBR 由构造器保证置上");
+    assert!(e.flags.contains(PaletteFlags::TRANSMISSIVE), "其余位原样保留");
   }
 }

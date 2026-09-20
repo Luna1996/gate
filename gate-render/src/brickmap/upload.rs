@@ -339,6 +339,11 @@ pub struct GpuBrickMap {
   pub pbr_albedo_rough_view: TextureView,
   pub pbr_metal_tex: Texture,
   pub pbr_metal_view: TextureView,
+  /// **PBR 贴图专用采样器**（BG1 binding 9，MT2-3）：权威 desc 在
+  /// [`crate::pbr_texture::create_pbr_sampler`]（Repeat×3 / Linear mag,min,mipmap / anisotropy ≤ 8 /
+  /// lod_max 覆盖到 mip 链底）。**与 `light_sampler` 分开**：光照场是 ClampToEdge 的有界网格、无 mip，
+  /// 共用会连带改掉光照场的行为。占位与真身共用这**一个**实例（采样器与纹理无关）。
+  pub pbr_sampler: Sampler,
 }
 
 fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
@@ -415,6 +420,24 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   let (pbr_metal_tex, pbr_metal_view) =
     make_pbr_placeholder("gate_pbr_metal_placeholder", TextureFormat::R8Unorm);
 
+  // ---- MT2-3：PBR 贴图专用采样器（BG1 binding 9）----
+  // desc 的权威在 `pbr_texture::create_pbr_sampler`（占位与真身共用这一个实例）。
+  // 这里顺手把**采样策略 + mip 层数**打进启动日志：验收项"远处不闪 / 近处不糊"只能人工看，
+  // 但"mip 链存在、采样器吃到 mip"这件事必须有据可查。
+  // anisotropy = 8 不会 panic：wgpu 30 的 anisotropy 不再是 `Features`（已移到 DownlevelFlags，
+  // 不支持时 wgpu-core 静默钳到 1），唯一的硬校验是 `>= 1`。
+  let pbr_sampler = crate::pbr_texture::create_pbr_sampler(&device);
+  info!(
+    target: "gate",
+    "PBR 采样器（MT2-3，BG1 binding 9）: Repeat×3 / Linear(mag,min,mipmap) / anisotropy_clamp = {} \
+     / lod_max_clamp = {}（覆盖 mip 链底）；mip 链 = {} 层（GPU_TEX_SIZE = {} → 1×1，CPU 盒式平均）。\
+     与 light_samp（ClampToEdge / mipmap Nearest / 无 mip）**分属两个 sampler**",
+    crate::pbr_texture::PBR_ANISOTROPY_CLAMP,
+    (crate::pbr_texture::PBR_MIP_LEVELS_MAX - 1) as f32,
+    crate::pbr_texture::PBR_MIP_LEVELS_MAX,
+    crate::pbr_texture::GPU_TEX_SIZE,
+  );
+
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     leaves: make("gate_leaves"),
@@ -435,6 +458,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     pbr_albedo_rough_view,
     pbr_metal_tex,
     pbr_metal_view,
+    pbr_sampler,
   });
 }
 
@@ -809,7 +833,7 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
      palette 的 PBR 变体里 asset:u16 是全局下标）。槽 0..{layers}: albedo_slot = roughmetal_slot = i、\
      emissive/transmission/height 三个槽位 = MATERIAL_SLOT_NONE；其余槽位: 五个 *_slot 全 MATERIAL_SLOT_NONE\
      （无贴图 ⇒ 走标量回退值）。标量回退 = 中性灰 albedo(sRGB 128) + roughness 0.5 + metallic 0 \
-     + specular 0.5(中性) + emissive/transmission 0 + IOR 1.50（= 默认电介质，与今天平凡材质的默认观感一致）",
+     + specular 1.0(中性 = 不调制电介质 F0) + emissive/transmission 0 + IOR 1.50（= 默认电介质，与今天平凡材质的默认观感一致）",
     table.len(),
     table.len() as f64 * asset_bytes as f64 / 1024.0,
   );
@@ -817,7 +841,8 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
     Some(i) => info!(
       target: "gate",
       "材质资产表: 槽 {i}（{METAL_DEMO_ID}）的 metallic = 255 —— 临时 demo 默认值\
-       （MT3 的 metallic / roughness BRDF 验收需要一个金属可用），真正的材质编写属 MT7",
+       （MT3 的 metallic / roughness BRDF 验收需要一个金属可用）。MT7 已提供材质编写 UI，\
+       但「资产表编辑」尚未做 ⇒ 这条默认值仍在负责「表里有个金属」",
     ),
     None => warn!(
       target: "gate",
@@ -827,7 +852,8 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
   }
   info!(
     target: "gate",
-    "材质资产表: 增量路径未做 —— 本表是静态默认集、当前无写入方，一次全量写完即可；待 MT7 有材质编辑时再加",
+    "材质资产表: 增量路径未做 —— 本表当前是启动时构建的静态默认集（MT7 提供的材质编写 UI 只写 palette 槽，\
+     不改这张表）⇒ 一次全量写完即可；等「资产表编辑」落地时再加增量",
   );
 }
 

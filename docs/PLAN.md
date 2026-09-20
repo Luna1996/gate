@@ -281,7 +281,7 @@ graph LR
 
 ### MT2 · 纹理基础设施
 
-**MT2-1 / MT2-1c / MT2-2 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`。**MT2-1b、MT2-3 未完成**（MT2-1b 只差"按引用加载"，属 MT7）。
+**MT2-1 / MT2-1c / MT2-2 / MT2-3 / MT2-4 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`。**仅剩 MT2-1b 的"按引用加载"**（依赖材质引用真的存在，属 MT7）。
 
 **验收标准**：一张调试贴图能按 **triplanar** 出现在命中面上（先不做 BRDF）；资产表上传有日志可查。
 
@@ -291,14 +291,16 @@ graph LR
 | MT2-1b | **（已完成 2026-09-20）** 贴图集来源与分辨率策略：**Poly Haven**（CC0，免费 API 无需 key）+ 仓内脚本 `fetch_pbr_textures.py` 批量拉取。材质集 = **16 个 @1k**，落 `assets/textures/pbr/<id>/`，共 **43.3 MB**（48 文件）。**其中 `metal_plate` 是唯一的金属**（验收 metallic / roughness BRDF 与镜面反射靠它）。已核实：重跑全部 md5 命中跳过（幂等）；无 `.part` 残留 | 有明确的显存估算记录；30 材质时 GPU 占用 ≤ 100MB | P1 | MT2-1 |
 | MT2-1c | **（① 已完成 2026-09-20；② 按触发条件推迟）** 显存预算处置：① **通道打包**（`albedo.rgb + roughness.a` → 一层 `Rgba8Unorm` 4MiB；metalness → `R8Unorm` 1MiB）⇒ **8MiB → 5MiB/材质**，实测 16 材质 **128 → 80 MiB**；加 `GPU_TEX_SIZE` 常量（默认 1024，设 512 再降 4×）。② **BC7/BC4 压缩**（约 1.2MiB/材质）**未做** —— 需要离线 KTX2 工具链或新编码器依赖，触发条件 = 材质数逼近 30（1024 打包后 ≈ 150MiB > 100MB 预算）；届时优先试 `GPU_TEX_SIZE = 512`（≈ 38MiB，texel 密度仍够、零依赖） | ① 16 材质实测 80MiB ✅；② 推迟（触发条件已写明） | P0 | MT2-1 |
 | MT2-2 | **（已完成 2026-09-20）** 材质资产表的 CPU 构建 + GPU 上传 + 绑定到 `@group(1)`：`bindings.wesl` 新增 `@binding(6) material_assets` / `(7) pbr_albedo_rough` / `(8) pbr_metal`（复用 `(5) light_samp`）+ 镜像 `struct MaterialAsset`；**全局一张表** 1024 × 32B = 32KB，一次全量上传；BG1 只有一份 layout（beam/gi/dda 共用），占位 1×1×1 数组 + 零初始化资产表 ⇒ 资源缺失不 panic | ✅ 资源在 prepare 里可见（有日志）；启动无 wgpu validation error；占位路径实测不 panic | P0 | MT1 |
-| MT2-3 | 采样器与 mip 策略（Linear + mipmap + anisotropy 上限），复用现有 `light_samp` 或另建 | 远处贴图无摩尔纹闪烁；近处无过度模糊 | P1 | MT2-1 |
-| MT2-4 | 调试开关：用一次 flat 采样把贴图色替换 albedo 直出 | 菜单开关（或 shader 常量）打开后，命中面显示贴图而非纯色 | P0 | MT2-2 |
+| MT2-3 | **（已完成 2026-09-20）** 采样器与 mip：**新建独立 `pbr_samp`**（`@group(1) @binding(9)`），**不动 `light_samp`**（它服务光照场那张 3D 图）。参数 = 三轴 `Repeat` / `Linear` mag+min+**mipmap** / `anisotropy_clamp = 8` / `lod_max_clamp` 覆盖到链底。mip 链在 CPU 侧盒式生成（1024 → 1×1 = **11 层**） | 结构性可验：日志打出 mip 层数与采样器参数 ✅；**摩尔纹/模糊的观感只能人工看** | P1 | MT2-1 |
+| MT2-4 | **（已完成 2026-09-20）** 调试「贴图直出」：WESL 常量 `PBR_DEBUG_ASSET`（`0xFFFFFFFF` = 关；设槽号则**所有不透明表面**用该贴图集）+ `PBR_DEBUG_TEX_WORLD_SCALE`（米/张贴图，MT3 转正）。采样走**主轴投影**（不做三轴混合，那是 MT3-1），LOD 用解析式自算 + `textureSampleLevel`（compute 无隐式 LOD）。Rust 侧解析同一常量并打日志 | ✅ 开启态实跑：WESL 编译通过、无 wgpu validation error、无 panic；**"画面真的显示贴图"待人工**（一行改值即可开，最终状态 = 关闭） | P0 | MT2-2 |
 
 > **风险点**：`@group(1)` 被 beam / gi / dda 三个 pass 共用，新增 binding 要同时更新三处 bind group layout（见 `dda.rs` / `gi.rs` 的 layout 定义）。
 
 ---
 
 ### MT3 · triplanar 采样 + PBR 着色模型
+
+**MT3-1 ~ MT3-8 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`（含 `dda_main` 与 `gi/ray.wesl` 的逐项口径对照表）。**观感验收待人工**。
 
 **验收标准**：metallic-roughness 着色生效；GI 画面与直射画面口径一致（同一材质在阴影区与直射区无色彩突变）；README §7 手工验收全过。
 
@@ -317,11 +319,13 @@ graph LR
 
 ### MT4 · 反光度（镜面反射）
 
+**MT4-1 ~ MT4-4 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`。**代价：主 pass +167%**（见 R10）。
+
 **验收标准**：光滑金属块能看到环境/场景反射；开/关反射对 GI 无影响（GI 复用判据不被破坏）。
 
 | ID | sub-task | 验收标准 | 优先级 | 依赖 |
 |---|---|---|---|---|
-| MT4-1 | 主 pass 反射射线：`roughness` 低到阈值时追加一条反射射线；近似辐亮度复用 `trace_glass` 的现成做法 | 镜面球可见环境反射；关掉开关画面回到 MT3 状态 | P0 | MT3 |
+| MT4-1 | 主 pass 反射射线：`roughness` 低到阈值时追加一条反射射线；近似辐亮度复用 `trace_glass` 的现成做法。**必须一并处理**：`trace_glass` 里那条 `palette_albedo * (阳光直照 + 常量天光)` 的**第三处着色表达式**（既存近似，MT3 已标为遗留）—— 它对 PBR 变体条目会**按字节误读 word0**，且没有走 `fetch_material` / `brdf_reflected`；要么把它接进统一入口，要么在注释里写清"仅平凡变体有效"并加断言式判据 | 镜面球可见环境反射；关掉开关画面回到 MT3 状态；玻璃反射对 PBR 条目不再误读 | P0 | MT3 |
 | MT4-2 | 明确边界：反射样本**不进 ReSTIR**（避免破坏"键逐位相等"判据），并写进代码注释 | 注释写明理由；开反射后 GI 画面与 MT3 一致（无渗色/闪烁回归） | P0 | MT4-1 |
 | MT4-3 | 粗糙反射的采样策略（GGX 重要性采样或高光近似），与 MT3 的 BRDF 高光项去重 | 无"高光算两遍"导致的能量翻倍（对比粗糙度扫描的亮度单调性） | P1 | MT4-1 |
 | MT4-4 | 性能量化：反射射线对帧时的影响 | profile 构建下 `gate_dda_trace` 的 GPU 时间增量有记录 | P1 | MT4-1 |
@@ -330,7 +334,7 @@ graph LR
 
 ### MT5 · 半透明收尾（吸收式透明）· **可独立开工**
 
-**MT5-0 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`；MT1 的交接项已关闭。**MT5-1 ~ MT5-4 未开始**（MT5-1 的前置条件已满足）。
+**MT5-0 ~ MT5-4 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`；MT1 的交接项已关闭。
 
 **验收标准**：玻璃既**被 GI 照明**、也**产生 GI**；有色玻璃呈现吸收色而非纯乘性暗化。
 
@@ -348,6 +352,8 @@ graph LR
 
 ### MT6 · 材质位移 → 真实体素几何
 
+**MT6-1 ~ MT6-6 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`。⚠️ **MT6-1 的落地方式与原计划不同**：位移参数**没有**进 `wire.rs`/WESL 常量，而是落在 `gate-app` 的 CPU 侧常量 + 注释（位移是 CPU 一次性产物，GPU 根本不需要 —— 理由见 `§8`）。
+
 **验收标准**：按材质高度图位移出的石块呈现**真实体素凹凸**（对齐 Douglas #22 截图 —— 凹凸是一格一格错开的体素，不是着色出来的假凹凸）；位移后的几何能被 DDA 命中、能投影阴影、能被 GI 正确遮蔽。
 
 | ID | sub-task | 验收标准 | 优先级 | 依赖 |
@@ -362,6 +368,10 @@ graph LR
 ---
 
 ### MT7 · 编辑 / UI / 导入收尾
+
+**MT7-1 ~ MT7-3 状态：已完成（2026-09-20）** —— 见 `§8 实施记录`。
+⚠️ **一处已知未落地**：`折射率` 滑杆只记录、**不改画面** —— D1 规定 IOR 属**资产级**（`MaterialAsset::transmission_ior`），palette 槽里没有它的位置；要即时生效需要"资产表编辑 + 增量上传"（MT2-2 明记增量路径未做）。**没有绕路引入第二套 F0**（硬约束 9），槽级可用的旋钮是**高光度**。补法已登记为后续项。
+⚠️ **MT2-1b 的"按引用加载"仍未做**：现在有写入方了，但它需要"扫描场景引用的资产"这条链路，属后续。
 
 **验收标准**：菜单可调材质并即时生效；`.vox` 导入的材质映射正确。
 
@@ -386,6 +396,8 @@ graph LR
 | R7 | 位移让体素数膨胀（每个表面体素可能外推数格） | 树节点数/显存/上传字节数上涨，可能拖慢编辑与上传 | MT6-6 量化；位移幅度设上限；必要时限制位移只作用于"材质标记为可位移"的块 |
 | R8 | 位移发生在 `gate-voxel`（纯逻辑 crate），高度场必须是 CPU 数据 | 若图省事把 GPU 纹理类型带进去，会破坏零渲染依赖约束 | 硬约束 8 + MT6-2 验收项 |
 | R9 | 位移与 GI 面键的交互（新体素改变面归属） | 编辑/生成后 GI 需当场重建而非复用旧历史 | 面键判据本身是精确的 ⇒ 几何变化当场重建（已有机制，无需新增；MT6-4 验证） |
+| **R10** | **MT4 的反射射线让主 pass +167%**（1.26 → 3.37ms；全帧 +33%），且默认场景材质 `roughness ≈ 0.098` ⇒ 几乎每像素都发线 | 帧时吃紧；粗糙面上是**静态图案**（无时域累积，观感像噪点） | 三条减压路径已登记：① 反射放在 GI 分辨率上（低频+上采样）；② SSR 优先、miss 才发线；③ 每帧射线预算。**若要关掉**：`main.wesl` 的 `PBR_REFLECTION_ENABLED = 0u` |
+| **R11** | MT3 的 F0 唯一来源规则带来**两处有意的观感变化**（电介质高光从 albedo 量级降到 F0=4% 量级、天光/GI 约 +4%），以及 MT4 的**环境镜面项最坏算两遍**（电介质 +4%、金属最坏 2×） | 与 MT3 之前的画面不是逐位一致 | 都是**有意取舍**（写进注释）：不引入 `1/π`、不做"替换式"相减（会在 GI 强的面上把镜面项减成负值） |
 
 ---
 
@@ -396,6 +408,15 @@ cargo fmt --all -- --check
 cargo clippy --release --workspace --all-targets -- -D warnings
 cargo build --release --workspace
 ```
+
+> **`--release` 不是可选项**：`gate-app/build.rs::forbid_debug_build` 在 dev profile 下**直接 panic**
+> （`PROFILE == "debug"` ⇒ exit 101，无逃生开关）。
+>
+> 📌 **这个约束是本计划实施期间新加的**：用户提交 `741687d`（"feat: 新增 PBR 材质系统与相关资源"，2026-09-21 00:00）
+> 新增了 `gate-app/build.rs` 的 21 行校验，**并在同一提交里把 `README` 的命令统一成了 `--release`**。
+> ⇒ 本计划早期那批 `cargo build --workspace` / `cargo run -p gate-app` 的验证跑在**约束生效之前**，
+> 在当时的规范下是合法的（不是"假通过"，也不存在 README 过时的问题）；
+> **但从该提交起，所有 cargo 命令必须带 `--release`。**
 
 手工验收：`cargo run --release -p gate-app`，对照 [README §7](../README.md) 的验收清单 +
 本计划各 milestone 的验收标准。
@@ -519,3 +540,335 @@ cargo build --release --workspace
 - **待人工**：画面与改动前无可见差异（MT5-0 与本批都不动着色公式，PBR 采样路径 MT3 才接）。
 - **`metal_plate` 的 metallic 默认值观感**要等 MT3 的 BRDF 才能看。
 - **MT2-3 未做**（mip / anisotropy）：现在是 bevy 默认采样器参数（nearest + clamp），接 triplanar 前要处理。
+
+### 2026-09-20 · MT2-3 + MT2-4（采样器/mip + 调试贴图直出）
+
+| 文件 | 内容 |
+|---|---|
+| `bindings.wesl` | 新增 `@group(1) @binding(9) var pbr_samp: sampler;`；`light_samp`(5) **一字未动**（只服务光照场 3D 图） |
+| `pbr_texture.rs` | 新增 `create_pbr_sampler`（**权威 desc**）+ `build_mip_chain` / `halve_layer`（CPU 盒式 2×2 平均 → 1×1，**11 层**）；`bytes()` 改为含 mip（1.333×） |
+| `upload.rs` | `init_empty_gpu` 建一个 `pbr_sampler`（采样器与纹理无关 ⇒ 不存在"未就绪"回退） |
+| `dda.rs` | BG1 layout 第 10 项 + `prepare_dda_bind_groups` 绑定 |
+| `main.wesl` | `PBR_DEBUG_ASSET` / `PBR_DEBUG_TEX_WORLD_SCALE` / `PBR_DEBUG_VOXEL_PER_METER` 三个常量 + `pbr_debug_albedo()`（主轴投影），插在 `dda_main` 不透明分支的着色法线解析之后 |
+
+**三个值得记的技术点**：
+
+1. **wgpu 30 的 anisotropy 不需要 feature**：`Features::SAMPLER_ANISOTROPY` 已不存在（变成 `DownlevelFlags::ANISOTROPIC_FILTERING`），`wgpu-core` 对 `anisotropy_clamp` 的唯一硬校验是 `>= 1`，不支持时**静默钳成 1** ⇒ 写 8 在任何后端都不会 panic，故没有退化成 1。
+2. **不能用 `Image::new` 建带 mip 的图**：`bevy_image` 的 `debug_assert` 里 `pixel_count` **不含 mip**，而 wgpu 的 `create_texture_with_data` 会**逐 mip 切片**读取、**必须**拿到整条链 ⇒ 两者契约冲突。改用 `Image::new_uninit` + 手工写 `mip_level_count` 与 `data`（并加了每层字节数自检）。**这是本次最容易炸的点**（dev 构建下会真 panic）。
+3. **compute 里没有隐式 LOD**（导数版 `textureSample` 只存在于 fragment）⇒ 调试通道**必须**用自算 LOD + `textureSampleLevel`；给 `0.0` 会永远只采 mip0、远处必闪摩尔纹 —— 那正是 MT2-3 要消灭的现象。
+
+**显存变化**：16 材质 **80 MiB → 106.7 MiB**（mip 链代价 1.333×，MT2-3 必需）。512 / BC7 两条退路不变。
+
+**一键开/关调试通道**：`main.wesl` 顶部 `const PBR_DEBUG_ASSET: u32 = 0xFFFFFFFFu;` → 改成槽号（如 `0u` = `brick_wall_001`、`10u` = `metal_plate`）**重启即生效**（WESL 是运行期读盘编译，无需 rebuild）。**当前提交状态 = 关闭**。开启态已实跑验证：WESL 编译通过、无 wgpu validation error、无 panic。
+
+#### ⚠️ 本次暴露的一个仓库级变化（已写进 `§6`）
+
+`gate-app/build.rs::forbid_debug_build` 在 dev profile 下 **panic（exit 101）** —— 从此所有 cargo 命令必须加 `--release`。
+它是**用户提交 `741687d`（本计划实施期间）新加的**，同一提交也把 `README` 统一成了 `--release`。
+（⇒ 本计划更早那批 dev 验证在当时的规范下合法；**不是**"缓存假通过"，README 也**不是**过时。）
+
+另外提醒后续实施者：**不要用 `git checkout -- <file>` 还原临时改动** —— 本仓库在实施期间有未提交的工作，
+那条命令会一并丢掉（本次 MT5 的实施者用它还原临时玻璃测试代码，所幸目标文件当时已在 `741687d` 里提交，没有损失）。
+
+#### 待人工
+
+- 开 `PBR_DEBUG_ASSET = 0u` 后**贴图真的贴上去了**（单轴投影在斜面会方向不一致 —— V1 有意为之，三轴混合属 MT3-1）。
+- **远处不闪摩尔纹、近处不过度模糊**（MT2-3 的验收本体）。
+- 关闭态画面与改动前无可见差异；光照场（`light_samp` 未改，但 binding 9 与它同 layout）无回归。
+
+### 2026-09-20 · MT3-1 ~ MT3-8（triplanar + metallic-roughness 着色）
+
+**只改了 3 个 WESL 文件**（`common.wesl` 为主，`main.wesl` / `gi/ray.wesl` 接入）。Rust 侧只顺手修了 2 处遗留（见下）。
+
+#### 唯一取值入口 + 唯一 BRDF
+
+| 符号 | 位置 | 要点 |
+|---|---|---|
+| `struct MaterialParams` | `common.wesl` | `{albedo, roughness, metallic, emissive, transmission, ior, specular}` |
+| `fetch_material(base, pal, p_world, n, debug_asset)` | `common.wesl` | **唯一取值入口**。三条出口返回同一个结构：调试强制资产 / `IS_PBR=1`（资产表 + 槽级覆盖）/ 平凡（参数内联，`ior=1.5`、`specular=1.0`） |
+| `triplanar_sample` | `common.wesl` | 按 `pow(\|n\|, k)` 三轴加权混合；UV 用**命中点世界位置**（主 pass `best.point` / GI `hit_p`，都是连续点） |
+| `pbr_mip_lod` | `common.wesl` | MT2-4 的 LOD 公式**抽成的唯一一份**（自算 LOD + `textureSampleLevel`） |
+| `brdf_reflected(m, n, v, SurfaceLight)` | `common.wesl` | **唯一 BRDF**：`(kD·albedo + F0)·(amb+gi) + sun_c·(kD·albedo + F·D_peak)·ndl·vis`，`kD = 1 − metallic` |
+| `ggx_peak` | `common.wesl` | **峰值归一**的 GGX（峰值 1）⇒ 高光有界 ≤ `sun_c·F0`，不会在 rgba16f 里出火点 |
+| `dielectric_f0` / `f0_of` / `material_ior` / `emissive_radiance` | `common.wesl` | F0 唯一来源；自发光只有这一句 |
+
+新增常量：`MATERIAL_TEX_WORLD_SCALE`（= MT2-4 的 `PBR_DEBUG_*` **转正**，引用 §7 texel 密度核算）、`MATERIAL_VOXEL_PER_METER`、`MATERIAL_TRIPLANAR_SHARPNESS = 4.0`、`MATERIAL_MIN_ROUGHNESS = 0.05`（防 0/0 NaN + 防亚像素闪烁）、`MATERIAL_DEFAULT_IOR = 1.5`、`MATERIAL_SLOT_NONE`（WESL 侧原先缺这个哨兵）。
+
+#### 口径对照（MT3-4 的证据）
+
+| 项 | `dda_main` | `gi/ray.wesl` | 一致？ |
+|---|---|---|---|
+| 材质取值 / 着色法线 / BRDF / 自发光 | `fetch_material` + `brdf_reflected` + `emissive_radiance` | **同一组函数** | ✅ |
+| 太阳直射 | `sun_c·(kD·albedo + F·D_peak)·ndl·sun` | 同式，`sun_vis = sun·sun_bounce` | ✅ |
+| 天光 | `amb·ao` | 同一套系数、无 `cov` 地板 | 差异②（该不同） |
+| GI 项 | 几何感知上采样后的 `gi` | **无**（二次顶点只算一次弹射） | 差异③（该不同） |
+| `/π` | 不除 | **只除反射项**（沿用 `GI_PI` 旧口径） | 差异④（辐亮度约定） |
+
+⇒ 只有三个"物理上该不同"的差异，着色数学**逐项同源**。
+
+#### F0 唯一来源（硬约束 9）
+
+`dielectric_f0(ior, specular)` 是全仓唯一的 F0 编码；两个调用点：`f0_of`（`mix(电介质, albedo, metallic)`）与 `trace_glass` 的 Fresnel（`specular` 传 1.0 = 不调制）。`material_ior(base, pal)`：平凡 = 1.5、PBR = 资产 `ior_x100/100`。
+**grep 证据**：`GLASS_F0|GLASS_IOR` 在**代码与着色器里零命中**（只剩本文档）。`GLASS_EPS` / `GLASS_MAX_BOUNCE` / `GLASS_REFL_MIN` / `GLASS_REFL_AMBIENT` 保留（它们不是 IOR/F0）。
+**精度**：`((1.5−1)/(1.5+1))²` 与旧字面量 `0.04` 差 ≤1 ulp ⇒ 玻璃观感等价。
+
+#### 能量约定（有意取舍，已写进注释）
+
+**全程不引入 `1/π`** —— 现有直射着色就没有它，擅自引入会把整场景压暗 π 倍（本次没被要求的大跳变）。
+漫反射在非金属下与改动前**逐项相同**（`kD = 1`）。**代价**（关闭态下与改动前的预期差异，就这两处）：
+1. 电介质高光从"albedo 量级"降到"F0 = 4% 量级"，形状由 Blinn-Phong 换 GGX；
+2. 天光 / GI 项多了 `F0·(amb+gi)`（≈ +4%）。
+这两条是 F0 唯一来源规则的直接后果，不是 bug。
+
+#### 顺手修的 2 处遗留（父任务裁定）
+
+| 文件 | 问题 | 处置 |
+|---|---|---|
+| `pbr_texture.rs` | `DEFAULT_SPECULAR = 128` 的注释自称"中性、不改 F0"，但 MT3 把 specular 实现为**纯乘性调制**（1.0 = 不调制）⇒ 128 会把电介质 F0 **砍半**（0.04 → 0.02），自相矛盾（把 `specularFactor` 当成"0.5 即中性"了） | 改为 **255**（`(255-1)/254 = 1.0` = 中性，对齐 glTF 默认语义），并写明这个坑 |
+| `pbr_texture.rs` | 调试通道的日志文案还写着"albedo 直出"、引用已删除的 `pbr_debug_albedo` | 改为"改用资产 N 的**整份材质**（triplanar + PBR 着色）"，并补一句"调试视图下自发光一并被替换 ⇒ 发光体会熄灭，属预期" |
+
+#### 实跑与门禁
+
+三条 release 门禁全绿；`cargo run --release -p gate-app` 跑了 4 次（关闭态 / `PBR_DEBUG_ASSET=0u` / `=10u` / 复原后），**每次都无 WARN / ERROR / wgpu validation error / panic**，日志 98 行。
+（`=0u` 与 `=10u` 两次是"triplanar 贴图观感"与"金属 BRDF 观感"的**唯一可见入口**。）
+
+#### 待人工
+
+1. **triplanar 贴图观感**：`main.wesl` 顶部 `PBR_DEBUG_ASSET` 改 `0u` → 重启。看平铺、**体素面上无接缝/无拉伸**、凸棱过渡带连续。嫌糊调 `MATERIAL_TEX_WORLD_SCALE`、嫌缝调 `MATERIAL_TRIPLANAR_SHARPNESS`。
+2. **金属 BRDF**：改 `10u` → 重启。应见**漫反射消失 + 贴图色高光 + 高光随 roughness 贴图变宽**，无火点、无死黑。
+3. **粗糙度扫描**（需 MT7 的 UI，或临时改资产表覆盖值）：高光宽度单调变化；`metallic ∈ (0,1)` 过渡无突变。
+4. **关闭态回归**：与改动前比对，**预期差异只有上面那两处**（电介质高光变暗+改形状、天光/GI +4%）；albedo / 自发光 / 玻璃折射与介质色应逐位一致。
+5. **玻璃**：折射 / 反射 / 介质续行与改动前一致（IOR 走默认 1.5）。
+
+#### 遗留（已登记，不在本次范围）
+
+- `trace_glass` 里 `palette_albedo * (阳光直照 + 常量天光)` 是**第三处着色表达式**（既存近似），对 PBR 变体条目会**按字节误读 word0**，且没走 `fetch_material` / `brdf_reflected` ⇒ 已加进 **MT4-1 的必做项**（当前无 PBR 条目，故暂无实际影响）。
+
+### 2026-09-20 · MT5-1 ~ MT5-4（半透明收尾）
+
+只改 8 个 `.wesl`，零 Rust 改动、零新依赖。
+
+| sub-task | 文件 | 关键改动 |
+|---|---|---|
+| MT5-1 | `gi/screen.wesl` | 判废条件收敛为「**只天空无效**」：`!(h.hit && 非介质)` → `!h.hit`。**只改"哪些像素写 valid"**，键/导引/RIS 流程一字未动 |
+| MT5-2 | `gi/ray.wesl` | `gi_ray_radiance` 与 `gi_ray_secondary_key` 的 `world_raycast` → **`world_trace_medium(stop_on_air=false, tint)`** ⇒ GI 射线**穿过玻璃**打到后面的真实表面，辐亮度乘沿途 `tint`；**两个函数必须同源改**（否则时域二次顶点键验证恒判不等） |
+| MT5-3 | `trace.wesl`（+`world.wesl` 构造点） | 见下 |
+| MT5-4 | 无代码改动 | 判据级论证 + 实跑 |
+
+**MT5-3 的吸收公式：从"按段"改成"按格"（这才是 Beer–Lambert）**
+
+| | 改动前 | 改动后 |
+|---|---|---|
+| `medium_of` | `rgb = mix(white, srgb², a)`，`a = 1 − transmission/255` | 返回**单格（1 体素）透过率** `tiny = mix(1, srgb², a)`，`a` 语义不变 |
+| `pass_through_medium` | `last_pal` **去重** ⇒ 一段只染一次 | 去掉去重，`last_pal` 由"去重键"变为"**记忆键**"（同材质省两次 palette load）；`tint *= tiny^cells` |
+| 效果 | 任意厚度的玻璃 = 一个因子 ⇒ **厚玻璃不比薄玻璃暗** | `Π tiny^(4^level)` = 均匀介质下的 `tiny^n` ⇒ σ = −ln tiny，**指数 = 穿过的体素数** |
+
+- DDA 的步长是层次自适应的整格（`1<<(2*level)` ∈ {1,4,16,64}）⇒ 把该格折成体素数 `cells` 后逐格连乘。
+- **成本红线（已避开 `pow`/`exp`）**：`cells` 恒是 4 的幂 ⇒ 用**重复平方**（最多 6 次 `vec3` 乘）精确求 `tiny^cells`，没有 `exp2` 的精度误差。同材质格 **0 次 palette load**。不透明格成本不变（仍是一次 `medium_of` → `a=1` → false）。
+- **有意近似（已写进注释）**：取整格而非逐体素遍历（不动 DDA 步进），斜射时格内真实穿行距离 ∈ `[4^level, √3·4^level]` ⇒ 低估最多 **1.7×**（略偏亮）。
+- `transmission = 0` 时行为不变：写侧不会置 `TRANSMISSIVE` 位；即便置了也走 `a >= 1.0 → false`。
+
+**MT5-1 的显式近似（写进代码注释）**：玻璃表面的 GI 目前按 **albedo 漫反射**算（`brdf_reflected` 无透射项/BTDF/折射方向）。物理上玻璃的 GI 应由**透射**贡献，但把透射方向接进 RIS 会动硬约束 2 的键定义 ⇒ **本版有意延后**。
+**MT5-2 的 PBR 变体介质吸收色仍未做**（PBR 变体在 `medium_of` 里返回中性白）：逐格多一次资产表 load，且当前**无写入方能产出 `IS_PBR + TRANSMISSIVE` 条目** ⇒ 有意延后。
+
+**MT5-4 凭什么不漏光**：判据三处（`gi_key0`/`gi_key1` 的编码、`gi_den_same_plane`、写入/比较）**逐字未改**；1 格薄板两侧 face 号相反 ⇒ 精确拒掉，隔一格的平行面坐标差 1 ⇒ 精确拒掉。MT5-1 只把"介质像素写 valid=0"换成"照常写"。
+
+**实跑**：3 次 release（默认 castle 无透射材质 ×2、**临时造玻璃** ×1 —— 让 25% 色号 `transmission=235` 以覆盖介质路径），**98 行日志、0 命中 `WARN|ERROR|panic|validation`**。临时改动已精确还原（且该文件当时已在 `741687d` 提交，故无损失）。
+
+#### 待人工
+
+1. 薄板玻璃两侧 GI 不互相渗透（判据级论证已给，剩观感）。
+2. **厚/薄玻璃明暗对比**：`transmission=235` + 中灰时，1 格 ≈ 0.94、16 格 ≈ 0.38、64 格 ≈ 0.02（改前三者都是 0.94）。
+3. 彩色玻璃的吸收色（逐分量 `tiny^(·)`）。
+4. 无玻璃场景 `tint ≡ 1` ⇒ 着色逐位同改前；**玻璃场景变暗/出色是 MT5-3 的目的，不是回归**。
+5. 玻璃表面 GI **偏亮**（MT5-1 的有意近似）；**同平面玻璃与不透明墙并排处有轻微串色**（既有判据 × MT5-1 的已知代价）。
+
+### 2026-09-20 · MT4-1 ~ MT4-4（反光度：镜面反射）
+
+只改 2 个 `.wesl`（`common.wesl`、`main.wesl`），零 Rust 改动。
+
+| sub-task | 做法 |
+|---|---|
+| MT4-1 | `dda_main` 不透明分支追加**一条**反射射线。触发 = `f0_luma ≥ PBR_REFL_MIN_F0(0.03)` **且** `roughness ≤ PBR_REFL_MAX_ROUGH(0.5)`（不是无条件发）；方向 = `reflect(dir,n)` + 按 `roughness` 抖动锥（**面积均匀**，随机数复用现有 `gi_rand2`/`gi_mix`，种子**不含帧号**）；权重 = `fresnel_schlick × fade(roughness)`，阈值处**连续归零**。新增 `fresnel_schlick` 并让 `brdf_reflected` 改用它（同一表达式 ⇒ **不构成第二套 Fresnel 公式**） |
+| MT4-1 必做项 | **已完全接进统一入口**：`trace_glass` 的 `palette_albedo * (阳光直照 + 常量天光)` 换成 `fetch_material` + `brdf_reflected` + `emissive_radiance` ⇒ 全工程着色点共 **3 个**（主 pass / GI 二次顶点 / 反射命中点）**全走同两个函数，不存在第四条着色表达式**；`palette_albedo` 在 `main.wesl` 已无调用点 |
+| MT4-2 | 反射结果**只加进 `col`**，不写任何 GI 资源（`gi_out`/reservoir/导引/历史），不参与 `gi_ray_radiance`；理由（判据是精确几何面键 + 二次顶点键逐位相等，反射方向是按 F0/roughness 加权抽的）写进注释 |
+| MT4-3 | 去重 = **反射射线不做 NEE**（`sun_c = 0` ⇒ 只取环境项），**直射高光归 MT3 的 BRDF** ⇒ 不可能叠两遍 |
+| MT4-4 | `PBR_REFLECTION_ENABLED` 开关 + profile 实测（见下） |
+
+#### 去重论证
+
+`brdf_reflected` 的太阳项（含 GGX 高光）只在**本着色点**算一次。反射射线两侧都避开了重复：
+① 本着色点：反射只加"环境/间接镜面"，其 `sun_c = 0` ⇒ 不含本像素的直射高光；
+② 反射命中点：传 `sun_c = 0` 且 `sun_vis = 0` ⇒ 返回的恰是 `(kD·albedo + F0)·(amb+gi)` 纯环境项（命中点自己的直射高光**有意省略** —— 不做 NEE 就拿不到可见性，"宁可不追"好过"漏一片光"）。
+**已知不完美（如实写进注释）**：MT3 环境项里的 `F0·(amb+gi)` 与本反射项是同一个量的近似 ⇒ 用**加法**时**镜面环境项最坏算两遍**（电介质 F0=0.04 ⇒ +4%；金属最坏 2×）。**有意不做**"替换式"写法（`col − f0·(amb+gi) + …`）：两者量纲口径不同（本点辐照度猜测 vs 反射点出射辐亮度），相减会在 GI 强的面上把镜面项**减成负值**。
+
+#### MT4-4 实测（`--features profile`，castle.vox / RTX 3070 / 1280×720 / GI 1/2）
+
+| 配置 | `gate_dda_trace` 均值 | 全帧 |
+|---|---|---|
+| 关（`0u`） | **1.26 ms** | 6.30 ms |
+| 开（`1u`，最终状态） | **3.37 ms**（+2.11ms / **+167%**） | 8.41 ms（+33%） |
+
+**拆账**（临时把 `MIN_F0` 设 2.0 ⇒ 代码在、判据恒不成立）：`1.51ms` ⇒ **+0.25ms 是代码体积/寄存器压力，+1.85ms 是真的把射线发出去了**。
+**为什么几乎每像素都发线**：`castle.vox` 的 256 个 MATL 条目 `_rough` **全是 `"0.1"`**（解 .vox 二进制核实）⇒ `roughness ≈ 0.098`、`fade ≈ 0.80`。是场景材质决定的，不是判据失效。
+
+#### ⚠️ 已知代价与后续（**新增风险 R10**）
+
+- **反射成本 +167% 主 pass**（+33% 全帧）：当前是**每像素最多一条反射射线 + 一次反射点着色**。若后续要压：
+  ① 在 GI 分辨率上做反射（低频、再上采样）；② 屏幕空间反射（SSR）优先、miss 才发线；③ 加"每帧射线预算"。
+- **反射抖动种子不含帧号** ⇒ 粗糙面上是**静止图案**（不是逐帧闪），但也**没有时域累积** ⇒ 观感上像静态噪点；需要时域累积属后续工作。
+- 玻璃里的反射现在更亮更"实"（走正经 BRDF、能看到自发光命中）—— MT4-1 必做项的直接后果。
+
+#### 待人工
+
+1. 默认 castle 材质 `roughness ≈ 0.098` ⇒ 一开就该**整片城堡带镜面反射**；看不到或镜像错位要查 `refl_cone_dir` / 起点外推。
+2. `0u` vs `1u` 画面差异应**只在光滑面的环境镜面分量**；**GI 场的颜色分布不应有可见变化**（MT4-2 的自检）。
+3. 粗糙度扫描（笔刷 5 档）亮度**单调不增**、阈值处无台阶。
+4. 玻璃反射的观感变化是否可接受。
+
+### 2026-09-20 · MT6-1 ~ MT6-6（材质位移 → 真实体素几何）
+
+| 文件 | 内容 |
+|---|---|
+| **新增** `gate-app/src/height_field.rs` | `HeightField::load_png`：`std::fs::read` + `bevy_image::Image::from_buffer`（`is_srgb=false`、`MAIN_WORLD`、**从不注册成资产**）同步解码；**盒式 ÷8 降采样**（1024 → 128）；`sample(u,v)` 双线性 + Repeat；`displace_fn(amplitude, tex_scale)` 产出 `gate-voxel` 要的闭包；`displace_bound()` 做幅度→bound 换算。**按需只解 1 个材质** |
+| `gate-voxel/src/scene.rs` | 新增 `DisplaceFn` / `Displace` / `FillStats` + `fill_box_displaced` / `fill_sphere_displaced` / `fill_bricks_displaced`。**既有 `fill_box` 等一字未改**（新函数是独立栅格化器）⇒ 零回归 + 硬约束 8（输入只有 CPU 闭包）保住 |
+| `gate-app/src/scene.rs` | demo 场景加**并排两座同尺寸石台**：普通 CSG vs 位移版（`stone_wall_04` 高度图，64×48×32） |
+| `gate-voxel/src/scene.rs::tests` | **新增 3 个 `#[test]`**（本 workspace 的第一批测试）：`zero_displace_matches_base_fill`（恒定 0 偏移与基础版**写入集合逐格相同**）、`constant_offset_shrinks_and_grows`、`only_surface_shell_is_per_voxel` |
+
+#### 位移语义表（MT6-1）
+
+| 项 | 取值 | 理由 |
+|---|---|---|
+| 幅度 | `8.0` 体素（**峰-峰**，偏置 0.5 ⇒ 上下各 4） | `bound = 幅度/2 = 4` **≤ 块粒度** ⇒ 只有最外层 4³ 块退化为逐体素，内部仍整块写 |
+| 采样缩放 | `100` 体素/张贴图（≈2m @50 voxel/m） | 与 MT3 的 `MATERIAL_TEX_WORLD_SCALE = 2.0m` **同源** ⇒ 凹凸与 albedo 的 triplanar 图案**同相** |
+| texel 密度 | `HEIGHT_DOWNSAMPLE = 8` ⇒ 128 texel/张贴图 ⇒ **1.28 texel/体素** | 用 1k 原图 = 10.24 texel/体素，比体素还细的频率会被点采样混叠成"逐体素随机噪声"（毛刺而非石头）——与 MT2-3 做 mip 同一动机 |
+| 方向 | **双向**：`d = (h−0.5)×幅度`，`>0` 外推、`<0` 内缩（= 该格不写，**不误删**既有几何） | 体积基本守恒，凸起与凹槽都在（对齐 Douglas #22 截图） |
+| 可位移材质 | 与材质无关：**调用点显式传闭包才位移**；只有 `_displaced` 函数会位移 | 零回归；"哪些材质可位移"由调用方决定（MT7 的材质表接管） |
+
+**快路径证据（可复算）**：样例台 64×48×32、`bound = 4` ⇒ 扫描盒 18×14×10 = 2520 块，其中 **840 块走 `fill_brick`**（整块写，= 53760 体素），其余 1680 块（107520 格）逐体素。单测断言：24³ 盒 + `bound=4` ⇒ `whole_bricks == 64`、`shell_voxels == 448×64`。
+
+#### MT6-6 实测（demo 场景，只改幅度）
+
+| 指标 | 位移关闭 | 位移开启（幅度 8） | 差值 |
+|---|---|---|---|
+| 位移台写入体素 | 98 304 | **108 974** | **+10.9%** |
+| 位移台 CSG 耗时 | 276 µs | **26.2 ms** | 一次性（启动期） |
+| 高度图解码 + 降采样 | — | — | ≈22 ms（一次性） |
+| 树规模 `TREE SIZE` | `total=32MB` | `total=32MB` | **MB 粒度下无变化**（位移块自重 <1MB） |
+| `UPLOAD[full]` | 33.59MB | 33.74MB | **+0.15MB** |
+| 增量上传（笔触打在位移面） | — | `bytes=0.59MB elapsed=244.6µs` | **毫秒级** ✅ |
+| 既有路径回归（castle.vox） | `written=22347285`、`total=87MB` | **逐位相同** | 0 |
+
+**幅度上限建议**：`bound ≤ 块粒度(4)` ⇒ **幅度 ≤ 8**。幅度翻倍 ⇒ 逐体素代价与耗时近似翻倍；幅度 16 时 ±8 格的凹槽能在 32 厚的块上打穿，观感也开始"烂"。
+
+#### 报备与发现
+
+- **新增依赖**：`gate-app/Cargo.toml` 开 bevy **`png`** feature（`Cargo.lock` +81 行传递依赖）。理由：PNG 解码不可能零解码器，且 `ImageFormat::Png` 与 `AssetServer` 的 `.png` 注册都在 `#[cfg(feature="png")]` 后面 ⇒ **`AssetServer` 路线同样省不掉**（与 MT2 给 jpg 开 feature 同一手法）。
+- **偏差**：位移参数**没有**塞进 GPU 的 `MaterialAsset`（32B 已排满；位移是 CPU 侧一次性产物，GPU 根本不需要）⇒ 全部落在 `gate-app` 的 consts + 注释里，`MaterialAsset::height_slot` 保持保留语义。**这是有意的**（§MT6-1 的验收描述已按此更新）。
+- **发现（已在后续处置）**：demo 场景的"浮空岛倒锥"是**半径最高 560 的实心球**，把中庭/正殿连默认机位一起包在固体里（`EDIT SELFTEST` 实测射线 `t=0.0` 命中相机自身）。MT6 当时只把样例挪到塔帽顶空腔并给了建议机位，**没有动 demo 场景本身** ⇒ **已于同日晚删除浮空岛**（见下面的处置记录）。
+
+#### 待人工（怎么一键看到）
+
+1. `gate-app/src/consts.rs`：`STARTUP_DEMO_SCENE = true`（`DEMO_DISPLACE_SAMPLE` 已默认开）。
+2. 样例在**中央广场地面**（`@[480,16,380]` / `@[480,16,420]`）—— 浮空岛删除后广场是空的，从上方任何机位都能看到。启动日志里仍给了一组**建议机位**（`MT6 位移样例机位`），粘进 `data/config.toml` 的 `[camera]` 节最省事，但**不再是必须的**（原先必须换机位是因为机位被浮空岛实体包住）。
+3. 看中央广场上并排两座石台：`@[480,16,380]` = 普通 CSG、`@[480,16,420]` = 位移版。
+4. 重点看：① 凹凸是否**真的一格一格错开**（不是假凹凸）；② 凹槽暗部是否由 **GI 自然给出**（关 GI 应同时变平 ⇒ 来自几何遮蔽而非 AO）；③ 凸起是否**投影阴影**；④ 两台是否同尺寸同材质；⑤ 薄板不漏光无回归；⑥ 想连贴图看：`PBR_DEBUG_ASSET = 14u`（`stone_wall_04`）⇒ 图案应与凹凸**同相**。
+5. 关掉样例：`DEMO_DISPLACE_SAMPLE = false` 或 `STARTUP_DEMO_SCENE = false`（回 castle.vox）。
+
+### 2026-09-20 · MT7-1 ~ MT7-3（材质编写 UI / 导入 / 去重）
+
+8 个文件，+902 / −70。**`.wesl` 一个字节未改。**
+
+#### 先解决的地基问题：palette 根本没有"存 PBR 条目"的路径
+
+`Palette` 存的是 `PaletteEntry`（平凡变体的 8B 视图），而 builder 只调 `pack_palette_entry` ⇒ **PBR 变体原先无落地途径**（MT1 只做了打包函数）。
+
+**做法（最小改动、与 D1 的"8B 按变体复用"一致）**：
+1. `pack_palette_entry` **按 `flags::IS_PBR` 分派**：清 0 → 原平凡路径**逐字未动**；置上 → 按 PBR 布局打包。`pack_palette_entry_pbr` 收成薄包装（`pack_palette_entry(&PaletteEntry::pbr(..))`）⇒ **实现只有一份**。
+2. **`PaletteEntry` 在 PBR 变体下就是那 8B 的原始视图**，字段对应表已写进类型文档：
+
+| 字段 | PBR 变体下的含义 |
+|---|---|
+| `color[0] / [1] / [2]` | `roughness` / `metallic` / `emissive` 覆盖 |
+| `roughness` | `transmission` 覆盖 |
+| `emissive` / `transmission` | `asset: u16` 的低 / 高字节 |
+| `metallic` | `specular` 覆盖 |
+
+3. **分层修正**：`PbrOverrides` 从 `gate-render` **挪到 `gate-voxel`**（`PaletteEntry::pbr` 要吃它，而 `gate-voxel` 不能被 `gate-render` 反向依赖），`gate-render` 复用 ⇒ `builder.rs::write_palette` **一字未改**即获得 PBR 能力（它是唯一调用点）。
+
+#### 三个 sub-task
+
+| sub-task | 内容 |
+|---|---|
+| MT7-1 | 「游戏/编辑」页新增：`PBR 变体` 开关 + `PBR 资产` 下拉（16 项，按 `PbrTextureSet::slot_of` 解析真实槽号）+ `金属度` / `折射率`(100..300) / `高光度` 滑杆；四个老滑杆在 PBR 模式变成**槽级覆盖**、**最低档 = 不覆盖**。4 个纯映射函数（带单测）落在 `gate-voxel/src/palette.rs`。i18n 补 12 键（实际文件名是 `zh-CN.toml` 不是 `.yml`）。日志 `材质 → …` |
+| MT7-2 | `vox_scene.rs` 抽出纯函数 `matl_to_entry(color, mat)`（带 3 个单测）；新增 `_metal → metallic` 映射；新增显式旋钮 `VOX_PBR_ASSET: Option<u16> = None`（`Some` 时导入材质走 PBR 变体） |
+| MT7-3 | `material_slot` 的去重判据从"字段相等"改成**逐字节比较 `pack_palette_entry` 的输出**（= 真正上传的 8B payload）；PBR 走**同一条**路径，未新开去重逻辑 |
+
+#### 平凡变体逐位不变的取证
+
+1. **测试级**：`plain_variant_packing_is_bit_for_bit_unchanged` 用 `§8 MT1` 回归表的三个字面量钉死（纯色 / 玻璃 / 发光玻璃）；另有 `plain_variant_ignores_pbr_payload`、`plain_variant_maintains_transmissive_bit`。
+2. **"构造 → 打包 → 期望 u32"** 对照（`wire.rs::tests`，与 `common.wesl::fetch_material_asset` 的读侧逐项对齐）：
+   `::pbr(10, {rough=1, metal=255, spec=255})` → `[0x0000FF01, 0xFF10000A]`；加 `TRANSMISSIVE` → `[0x0000FF01, 0xFF30000A]`（**介质位原样透传**，PBR 变体不推断）；`::pbr(0x0ABC, ...)` 与手写解包**严格互逆**。
+3. **三处同步（硬约束 6）本次只改写侧，读侧不用改**：`flags`/`asset`/4 个覆盖的位置**正是 MT1/MT3/MT5-0 已实现好的读侧布局**，本次补的是"写侧从来没写过的另一半"，没有移动任何 bit。
+
+#### 菜单怎么操作（已验证 vs 未验证，明确区分）
+
+**操作**：`F3` → 「游戏/编辑」→ `PBR 变体` 开关 → `PBR 资产` 下拉 → `金属度`/`折射率`/`高光度`；切换后**下次落笔**生效。
+
+**已验证（headless）**：菜单 TOML 解析成功（`初值已应用：30 项`，原 25）；**9 个材质动作全部触发并打出 `材质 → …`**，含 `材质 → PBR 资产槽 0 = brick_wall_001（按 PbrTextureSet 解析）`（同时证明下拉 16 项与磁盘 16 个目录**字典序一致**）；**22 个单测**覆盖变体分派 / 打包 / 去重（`pbr_material_dedups_by_payload`、`material_change_does_not_touch_old_voxels` 就是 MT7-3 的验收本体）。
+**未验证（如实声明）**：菜单的**实际点击/拖拽/16 项下拉展开**未经自动化验证（覆盖的是"动作处理函数被调用后的行为"）；**"切到 PBR 变体后画面随之改变"**需要落笔 + 上画面。
+
+#### `.vox` 映射的结论
+
+**格式里没有"选哪个贴图集"的线索**（`MATL` 只有标量，无贴图路径/资产名）⇒ **默认保持平凡变体**（`VOX_PBR_ASSET = None`），并实现了可选映射。本次唯一实打实的映射是 `_metal → metallic`（同名同义、量纲 0..1，且该字节自 MT1 起有语义 ⇒ 零回归）。
+**有意不映射**（不编造）：`_ior`/`_spec` 在平凡变体里**没有字段**（D1：IOR 属资产级）；`_trans`/`_alpha` 的**方向**在仓内可查的说明里**没有权威定义**，猜错会让玻璃变实体 ⇒ 保持 `transmission = 0`。
+
+#### 遗留（已登记）
+
+- **`折射率` 滑杆只记录、不改画面**（见 `§4 MT7` 的状态说明）。
+- `pbr_texture.rs` / `trace.wesl` 里有几处文案已过时（"增量路径未做""当前无 PBR 材质被引用""`pack_palette_entry_pbr` 尚无调用点"）—— 现在**有**写入方了；这两处当时在禁改清单内，故只在报告里标为过时。
+
+### 2026-09-21 · demo 场景删除浮空岛（用户要求）+ 顺带揪出 PBR 贴图集的两个加载 bug
+
+#### 一、删除浮空岛（`gate-app/src/scene.rs`）
+
+用户：*"demo场景的浮空岛可以完全删除，现在从vox读取场景。浮空岛已过时"*。删掉 **`build_demo_scene` 的第 (3) 段**（浮空岛倒锥 + 建在其上的天空之城：城墙/角楼/正殿/高塔/金顶/旗帜），保留其余段落。
+
+| 连带处置 | 说明 |
+|---|---|
+| **保留地形挖空区，改称「中央广场」** | 中心 `dc < 700` 本来就不铺山体（原"城堡基座，由 (3) 接管"）。**必须保留**：`terrain_h` 的四角雪峰项在中心叠加到 1020 ⇒ 一铺山体就会把中央大道与"GATE ENGINE"标语埋掉 |
+| **MT6 位移样例挪到广场地面** | 原挂在西北角楼塔帽顶（`@[16,448,16]`），塔一删样例就会浮在空中 ⇒ 改到 `@[480,16,380]` / `@[480,16,420]`（避开大道 `z∈[480,544]` 与标语 `z∈[256,304]`）。**顺带解决了"必须换机位"那个坑** —— 原先机位被浮空岛实心球包住 |
+| **调色板 13「浮空岛岛底」删除** | 槽 13 现在是空默认色；4 号注释由"城堡石"改为"石材（MT6 石台）" |
+| `dist_to_castle` → `dist_to_center` | 它现在只服务广场挖空与森林避让，与"城堡"无关了 |
+| **(3) 编号不重排** | 保留 1/2/4/5/6/7 的编号（留着 `(3) 【已删除】…` 的说明），以对齐既有 `SCENE (n) …` 日志与计划引用 |
+
+实跑验证（`STARTUP_DEMO_SCENE = true`，跑完已改回 `false`）：`SCENE (1)/(1b)/(2)/(4)/(5)/(6)/(7)` 齐全、无 `(3)`；`chunks=35`、`TREE SIZE total=0MB`（浮空岛原本是这座场景的大头）；**0 条 WARN/ERROR**。
+
+#### 二、PBR 贴图集的两个加载 bug（**都是真 bug，本次才暴露**）
+
+改 demo 场景后实跑，冒出 `WARN: 贴图集里没有 metal_plate`，且贴图集只有 **5** 个材质（应为 16）。查出两个由 MT2 引入、一直潜伏的时序 bug：
+
+**BUG-1（静默丢数据，无任何 warn）** — `finish_pbr_textures` 里 `ready` 是**局部变量**：
+
+```rust
+let mut ready: Vec<PendingMaterial> = Vec::new();   // ← 局部
+for m in load.pending.drain(..) { if 就绪 { ready.push(m) } ... }
+load.pending = still;
+if !load.pending.is_empty() { return; }             // ← ready 随 return 一起被丢弃
+```
+
+加载是**逐帧收敛**的：某一帧只有一部分材质就绪时，那一帧会 `return` 等下一帧，而**本帧已就绪的材质被丢掉了**；等最后一批到齐时，`ready` 里只剩下最后一批 ⇒ **只构建最后到齐的那几个材质**。
+- 为什么之前没发现：只要 32 张 jpg 在**同一帧内**全部就绪，`ready` 就正好是全量（≥16）。这是**时序相关的运气** —— 之前几次实跑都是"一次到位"，本次 demo 场景改变了 Startup 时序才暴露。
+- 修法：`ready` 挪进 `PbrLoad` 资源（跨帧累积），用 `let PbrLoad { pending, ready, .. } = &mut *load;` 解构拿两个不相交的可变借用。
+
+**BUG-2（槽号会随时序漂移）** — 修完 BUG-1 后立刻显形：`ready` 变成**按加载完成顺序**追加 ⇒ 槽号表不再按字典序（实测出现 `6=lacquered_cherry_wood 7=metal_plate 8=stone_wall_04 …`）。
+而"**槽号 = 目录名字典序下标**"是写进契约的（`scan_material_dirs` 的 `ids.sort()`、`common.wesl` 的注释、本文档 §8 各处），shader 的资产表 / 编辑器下拉 / 日志全靠它稳定。
+- 修法：`build_texture_arrays` 开头 `ready.sort_by(|a, b| a.id.cmp(&b.id))`（让它自己拥有"槽号怎么定"这件事）。
+- 复测：槽位表回到 `0=brick_wall_001 … 10=metal_plate … 15=wooden_floor_01`，16 个材质，WARN 消失。
+
+> 两个 bug 的共同特征：**都不崩溃、多数时候看不出**，只在"加载分帧"时静默给出错误结果。MT2 阶段的验收（"日志打出层数与尺寸"）恰好是**全量一次到位**才看得到 16——所以它掩盖了这两个 bug。**教训**：`texture_2d_array` 这种"等所有分片就绪再合成"的加载，验收必须覆盖"分多帧就绪"的路径（本次是靠改 demo 场景偶然撞上的）。
+
+#### 待人工
+
+- `STARTUP_DEMO_SCENE = true` 看：中央广场是否空旷无遮挡；两座石台（普通 CSG vs 位移版）同尺寸同材质、凹凸一格一格错开、凹槽暗部由 GI 给出、凸起投影阴影。
+- 其余人工项（triplanar / 金属 / 反射 / 玻璃厚度吸收 / 编辑 UI）见上文各里程碑的"待人工"。

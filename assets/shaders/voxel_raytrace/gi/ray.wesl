@@ -1,16 +1,17 @@
 import package::bindings::{light_u};
-import package::common::{palette_albedo, palette_emissive, sky_rgb};
+import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
-import package::world::{world_cfg_full, world_raycast, world_trace_medium, voxel_normal};
+import package::world::{world_trace_medium, voxel_normal};
 
 // ============================================================================
 // 单条 GI 射线的辐射求值（**唯一口径**：新鲜候选、借用候选、时域/空间复用全部走这里）。
 //
-// 一次求值 = 1 条真实光路（`world_raycast`）＋ 命中时最多 1 条太阳 NEE 阴影射线。
-// `sun_bounce = 0`（菜单「渲染/RESTIR GI/太阳反弹」关）时连那条阴影射线都不发，二次顶点只剩天光项。
+// 一次求值 = 1 条真实光路（`world_trace_medium`，**穿过透射介质续行**）＋ 命中时最多 1 条太阳
+// NEE 阴影射线。`sun_bounce = 0`（菜单「渲染/RESTIR GI/太阳反弹」关）时连那条阴影射线都不发，
+// 二次顶点只剩天光项。
 //
 // **辐亮度只算一次弹射**：命中面按「直射太阳 + 天光 × AO」着色后除以 π 得到它的出射辐亮度，
 // 没有更深的弹射。多重弹射曾经靠世界空间缓存的回读实现（`gi_cache_peek`），那条路是个
@@ -19,9 +20,13 @@ import package::world::{world_cfg_full, world_raycast, world_trace_medium, voxel
 // 只依赖几何与光照，是**逐帧确定**的：没有可累积的中间量，也就没有「收敛」这件事。
 // 代价是丢掉二次以上的弹射（多面互反射），这是刻意的取舍。
 //
-// 出射辐亮度约定（与 `dda_main` 的不透明分支逐项对齐，只是除以 π 转成 radiance）：
-//   `L_o = albedo · (太阳直射项 + 天光项) / π + albedo · emissive`
-// 其中天光项在二次顶点乘 `light_field_ao`（与主着色点同一套 AO，口径不分叉）。
+// 出射辐亮度约定（**与 `dda_main` 的不透明分支逐项对齐**，硬约束 3 / `docs/PLAN.md` MT3-4）：
+//   `L_o = BRDF(材质, 二次顶点, 光源项) / π + albedo · emissive`
+// 其中 `BRDF(...)` = `common.wesl::brdf_reflected` —— **与主 pass 同一个求值函数**
+// （MT3-7 的"变体统一"落到 GI 侧就是这件事），材质也走同一个 `fetch_material` 入口。
+// `/π` 只作用在**反射项**上（把"辐照度量纲"的出射亮度折成 radiance）；自发光本来就是辐亮度、
+// **不除**（`emissive_radiance` 单独成函数就是为了这条）。天光项在二次顶点乘 `light_field_ao`
+// （与主着色点同一套 AO，口径不分叉）。
 //
 // 逃逸到天空 ⇒ `sky_rgb()`（唯一的 miss 辐亮度口径）。
 // ============================================================================
@@ -60,13 +65,26 @@ struct GiRaySample {
 
 /// 一条 GI 射线的入射辐亮度：真实光路 + 二次顶点「太阳 NEE + 天光 × AO」，逃逸取天光。
 /// 不含 cos 因子与 π —— RIS 的权重是 `p̂ / p`，系数在调用方给（余弦候选给 π）。
+///
+/// **MT5-2 · 二次射线穿介质续行**：光路用 `world_trace_medium`（`stop_on_air = false`）而不是
+/// `world_raycast` —— 撞到**透射**体素不停、沿途按格累积乘性吸收 `tint`，于是一条从玻璃前面出发的
+/// GI 射线会**穿过玻璃**打到它后面的真实表面。旧写法用 `world_raycast`（`penetrate = false`，
+/// 撞到任何实体体素都停）⇒ 二次顶点落在**玻璃面本身**上：玻璃后面的表面拿不到 GI，
+/// 而且玻璃面被当成"不透明表面"着色。
+/// 与 `sun_transmittance`（同样 `world_trace_medium` + `stop_on_air = false`）是**同一套写法与口径**：
+///   · **停点/键不变**（硬约束 2）：只有不透明体素才停 ⇒ `sk0/sk1` 仍取最终命中的那个不透明面，
+///     `gi_key0/gi_key1` 的口径**一字未改** ⇒ 复用判据（键逐位相等）不受影响；
+///   · **吸收口径**：`tint` 乘在**整个** `l` 上（BRDF 项与自发光项都乘）—— 与主 pass 的
+///     `col = col * through + refl` 是同一个"乘性吸收"结构（硬约束 3：口径不分叉）。
+/// 与旧写法的唯一范围差别：只遍历**主世界网格**（与 `sun_transmittance` 一致 —— 物体网格没有
+/// 介质续行；而当前 `Volumes::add_object` 在应用里也没有调用点 ⇒ 无实际行为差异）。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32) -> GiRaySample {
-  let sh = world_raycast(make_grid(0u), org, dir, GI_T_MAX, world_cfg_full(0.0, 3u));
-  // 逃逸 → 天光辐亮度。
-  var l = sky_rgb() * GI_SKY_RADIANCE_SCALE;
+  var tint = vec3<f32>(1.0);
+  let sh = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
+  // 逃逸 → 天光辐亮度（穿过介质看到的天空同样按 `tint` 吸收：`tint` 无介质时恒为 1.0）。
+  var l = sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   if (sh.hit) {
-    let alb = palette_albedo(sh.palette_base, sh.pal);
     let hit_p = org + dir * sh.t;
     let hn = voxel_normal(make_grid(u32(sh.obj_id) + 1u), sh.voxel, sh.face_id, sh.n);
     let ndl = max(dot(hn, sun_dir), 0.0);
@@ -78,8 +96,19 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
     }
     // 二次顶点的天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
     let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hit_p, sh.obj_id);
-    l = alb * (sun_c * ndl * sun * sun_bounce + amb) / GI_PI
-      + alb * palette_emissive(sh.palette_base, sh.pal) * GI_EMIT_GAIN;
+    // ---- MT3-4 · 与 `dda_main` **同一个** BRDF 与同一个材质入口（硬约束 3）----
+    // 只有三处不同（`dda_main` 那边的同一张表在 `main.wesl` 的注释里），都是物理上该不同的：
+    //   ① 太阳项乘 `sun_bounce`（菜单「渲染/RESTIR GI/太阳反弹」：关掉时二次顶点不做太阳 NEE）；
+    //   ② **没有 GI 项**（二次顶点只算一次弹射）⇒ `SurfaceLight.gi` 传 0；
+    //   ③ 反射项 `/π` 转辐亮度（自发光不除，见文件头）。
+    // `v = -dir`：出射方向就是"回到上一个顶点"的方向（与主 pass 的 `-dir` 同一个构造方式）。
+    // 材质取值走同一入口 `fetch_material`；`MATERIAL_DEBUG_NONE` = 调试通道**不作用于 GI**
+    // （与 MT2-4 一致：那条通道只是主 pass 的调试视图）。
+    let m = fetch_material(sh.palette_base, sh.pal, hit_p, hn, MATERIAL_DEBUG_NONE);
+    // MT5-2：二次顶点的辐亮度整体乘 `tint`（BRDF 项与自发光项都乘）—— 它就是"这个二次顶点发出的
+    // 光，穿过玻璃到达本着色点"的乘性吸收；无介质时 `tint == 1.0` ⇒ 逐位等于改动前。
+    l = (brdf_reflected(m, hn, -dir, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0))) / GI_PI
+      + emissive_radiance(m, GI_EMIT_GAIN)) * tint;
   }
   return GiRaySample(
     l,
@@ -91,10 +120,13 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
 }
 
 /// 只求**二次顶点键**的轻量射线（时域复用的二次顶点验证专用）：键的口径与 `gi_ray_radiance`
-/// 逐字一致（同一次 `world_raycast`、同一套 `gi_key0/gi_key1`），但**不做**二次顶点 NEE、
-/// 不取 albedo ⇒ 少发一条阴影射线。`l` 恒为 0（调用方只用键）。
+/// **逐字一致**（同一次 `world_trace_medium` + `stop_on_air = false`、同一套 `gi_key0/gi_key1`
+/// —— MT5-2 后两侧都必须穿介质续行，否则"玻璃后面的那个面"这条键在两次求值间会不一致，
+/// 时域验证会恒判不等、白白丢掉历史），但**不做**二次顶点 NEE、不取 albedo ⇒ 少发一条阴影射线。
+/// `l` 恒为 0（调用方只用键），`tint` 也只为满足接口、无消费者。
 fn gi_ray_secondary_key(org: vec3<f32>, dir: vec3<f32>) -> GiRaySample {
-  let sh = world_raycast(make_grid(0u), org, dir, GI_T_MAX, world_cfg_full(0.0, 3u));
+  var tint = vec3<f32>(1.0);
+  let sh = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
   return GiRaySample(
     vec3<f32>(0.0),
     gi_key0(sh.voxel),

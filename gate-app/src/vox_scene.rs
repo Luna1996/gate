@@ -7,7 +7,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use gate_voxel::{
-  CHUNK_SIZE, ChunkCoord, ChunkTree, PALETTE_INDEX_MAX, PaletteEntry, PaletteId, VolumeGrid,
+  CHUNK_SIZE, ChunkCoord, ChunkTree, PALETTE_INDEX_MAX, PaletteEntry, PaletteFlags, PaletteId,
+  PbrOverrides, VolumeGrid, override_byte,
 };
 use glam::IVec3;
 use rayon::prelude::*;
@@ -187,13 +188,7 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
       continue;
     }
     let rgba = scene.palette.colors[i];
-    let mat = &scene.materials[i];
-    let e = PaletteEntry {
-      color: [rgba.r, rgba.g, rgba.b],
-      roughness: mat.rough.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(200),
-      emissive: mat.emit.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(0),
-      ..Default::default()
-    };
+    let e = matl_to_entry([rgba.r, rgba.g, rgba.b], &scene.materials[i]);
     pal.set(PaletteId(i as u16), e);
     painted += 1;
   }
@@ -206,6 +201,64 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
     painted,
     PALETTE_INDEX_MAX as usize - painted
   );
+  bevy::log::info!(
+    "VOX MATERIAL 映射（MT7-2）：MATL 的 `_rough` → roughness、`_emit` → emissive、`_metal` → metallic\
+     （`_ior` / `_spec` 在平凡变体里无字段、`_trans` / `_alpha` 的方向在格式里无权威定义 ⇒ 都**不映射**）；\
+     可选 PBR 资产映射 VOX_PBR_ASSET = {VOX_PBR_ASSET:?}（None = 保持平凡变体：`.vox` 里没有贴图/资产线索）"
+  );
+}
+
+/// **`.vox` 导入的可选 PBR 资产映射（MT7-2 的明确默认策略）**：`Some(asset)` 时，
+/// 导入的每个材质都改为引用该资产槽的 **PBR 变体**（`docs/PLAN.md` D1），MATL 的标量线索
+/// （`_rough` / `_metal` / `_emit`）转为**槽级覆盖**；`None`（默认）时全部保持**平凡变体**。
+///
+/// **为什么默认 `None`**：`.vox` 的 `MATL` 只有标量（`_rough` / `_spec` / `_ior` / `_emit` / `_trans` …），
+/// **没有任何贴图 / 资产 id / 资产名**的线索 ⇒ 无法从文件内容推出该用哪个贴图集，只能由调用方手工指定。
+/// 把 16 个资产里的某一个强加给整场景属于"编造映射"，而平凡变体完整表达了文件真正携带的信息
+/// （这也是 PLAN MT7-2 允许的"最保守默认"）。
+pub const VOX_PBR_ASSET: Option<u16> = None;
+
+/// `.vox` 的 `MATL` → [`PaletteEntry`]：**导入材质映射的唯一一点**（MT7-2）。
+/// 抽成纯函数以便单测钉住映射规则（见本文件的 `tests`）。
+///
+/// 映射表（只取 `.vox` 真正携带、且语义无歧义的线索；缺省值沿用改动前）：
+///
+/// | `.vox` `MATL` | 目标 | 缺省 |
+/// |---|---|---|
+/// | 调色板 RGBA | `color`（alpha 不进 palette）| — |
+/// | `_rough` | `roughness` | `200` |
+/// | `_emit` | `emissive` | `0` |
+/// | `_metal` | **`metallic`**（MT7-2 新增；与 MT1 起就有语义的 `_pad` 字节同名同义，量纲同为 0..1）| `0` |
+///
+/// **有意不映射**：`_ior` / `_spec` 在**平凡变体里根本没有字段**（D1：IOR 属资产级、specular 只有 PBR
+/// 变体有槽级覆盖）；`_trans` / `_alpha` 的方向（越大越透 vs 越大越不透）在本仓可查的格式说明里
+/// **没有权威定义**，猜错会让玻璃变成实体 ⇒ 按"不编造映射"处理（保持 `transmission = 0`）。
+pub fn matl_to_entry(color: [u8; 3], mat: &vox_rs::Material) -> PaletteEntry {
+  // 0..1 的标量 → 字节（`.vox` 的 MATL 标量都是 0..1，钳位防手改文件给出越界值）
+  let byte =
+    |v: Option<f32>, default: u8| v.map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(default);
+  match VOX_PBR_ASSET {
+    None => PaletteEntry {
+      color,
+      roughness: byte(mat.rough, 200),
+      emissive: byte(mat.emit, 0),
+      metallic: byte(mat.metal, 0),
+      ..Default::default()
+    },
+    // 手工指定资产：MATL 的标量转成**槽级覆盖**（`None` = 不覆盖 ⇒ 用资产的值），
+    // TRANSMISSIVE **不置**：默认资产集的标量透射率全 0，且 `.vox` 的透射线索未映射（见上）。
+    Some(asset) => PaletteEntry::pbr(
+      asset,
+      PbrOverrides {
+        roughness: mat.rough.map(|v| override_byte(v.clamp(0.0, 1.0))).unwrap_or(0),
+        metallic: mat.metal.map(|v| override_byte(v.clamp(0.0, 1.0))).unwrap_or(0),
+        emissive: mat.emit.map(|v| override_byte(v.clamp(0.0, 1.0))).unwrap_or(0),
+        transmission: 0,
+        specular: 0,
+      },
+      PaletteFlags::default(),
+    ),
+  }
 }
 
 /// vox-rs Transform（与 ogt_vox 矩阵逐一同构）：行向量约定 p' = p·M，平移在 m30..m32。
@@ -310,4 +363,64 @@ fn bucket_model(
     map.entry(k).or_default().append(&mut cur_buf);
   }
   map
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use gate_render::brickmap::wire::pack_palette_entry;
+
+  /// 造一个只带三个标量线索的 MATL（其余字段缺省 = 不涉及）
+  fn mat(rough: Option<f32>, emit: Option<f32>, metal: Option<f32>) -> vox_rs::Material {
+    vox_rs::Material { rough, emit, metal, ..Default::default() }
+  }
+
+  /// MT7-2 的映射规则 + **默认策略 = 平凡变体**（`VOX_PBR_ASSET = None`）：
+  /// `_rough` / `_emit` / `_metal` → `roughness` / `emissive` / `metallic`，缺省值沿用改动前。
+  #[test]
+  fn matl_maps_rough_emit_metal_into_plain_variant() {
+    let e = matl_to_entry([10, 20, 30], &mat(Some(0.5), Some(1.0), Some(1.0)));
+    assert_eq!(e.color, [10, 20, 30]);
+    assert_eq!(e.roughness, 127, "0.5 × 255 截断到 127（与改动前同一算法）");
+    assert_eq!(e.emissive, 255);
+    assert_eq!(e.metallic, 255, "MT7-2 新增：`_metal` → metallic（原 `_pad` 字节）");
+    // 默认策略 = 平凡变体 ⇒ 打包结果里没有 IS_PBR，也没有 TRANSMISSIVE
+    assert_eq!(pack_palette_entry(&e), [0x7F1E140A, 0xFF00_00FF]);
+    assert_eq!(e.flags.0, 0);
+  }
+
+  /// 缺省值必须与改动前逐位相同（`_rough` 缺省 200、其余 0），且**不**触碰 `transmission`。
+  #[test]
+  fn matl_defaults_and_untouched_fields() {
+    let e = matl_to_entry([1, 2, 3], &mat(None, None, None));
+    assert_eq!(e.roughness, 200, "缺省粗糙度 200（改动前的默认）");
+    assert_eq!(e.emissive, 0);
+    assert_eq!(e.metallic, 0, "缺省 0 = 非金属 = 零回归");
+    assert_eq!(e.transmission, 0, "`_trans` 无权威语义 ⇒ 不映射，恒 0");
+    // 平凡变体 + transmission = 0 ⇒ 介质位不置（导入模型的行为与改动前一致）
+    assert_eq!(pack_palette_entry(&e)[1] & 0x0020_0000, 0);
+  }
+
+  /// 显式指定资产时（`VOX_PBR_ASSET = Some(...)` 那条分支）语义固定为：MATL 标量 → **槽级覆盖**，
+  /// 线索缺失 = **不覆盖**（0），透射保持不覆盖。这里直接构造同一条路径验证（常量默认是 `None`，
+  /// 故用 `PaletteEntry::pbr` 复现该分支的 payload）。
+  #[test]
+  fn optional_pbr_asset_branch_payload() {
+    let asset: u16 = 10;
+    let e = PaletteEntry::pbr(
+      asset,
+      PbrOverrides {
+        roughness: override_byte(0.5),
+        metallic: override_byte(1.0),
+        emissive: 0,
+        transmission: 0,
+        specular: 0,
+      },
+      PaletteFlags::default(),
+    );
+    assert_eq!(e.flags.0, PaletteFlags::IS_PBR.0, "只有 IS_PBR，没有介质位");
+    assert_eq!(e.pbr_asset(), asset);
+    assert_eq!(e.pbr_overrides().roughness, 128, "0.5 → 覆盖字节 128 ⇒ (128−1)/254 ≈ 0.5");
+    assert_eq!(e.pbr_overrides().emissive, 0, "缺失线索 = 不覆盖 = 用资产的值");
+  }
 }

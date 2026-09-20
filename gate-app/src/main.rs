@@ -7,6 +7,7 @@ mod config;
 mod consts;
 mod debug_menu;
 mod edit;
+mod height_field;
 mod scene;
 mod showcase;
 #[cfg(feature = "profile")]

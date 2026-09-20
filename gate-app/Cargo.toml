@@ -21,7 +21,10 @@ profile = [
 ]
 
 [dependencies]
-bevy = { workspace = true }
+# png feature = bevy_image 的 `.png` 解码器：MT6-2 的高度图（`assets/textures/pbr/<id>/<id>_height.png`）
+# 在 CPU 侧同步解码（`height_field.rs`）。缺它 `bevy_image` 连 `ImageFormat::Png` 都不存在
+# ⇒ 与 MT2 给 jpg 开 feature 同一手法：不动依赖树里的 crate，只打开已有 `image` 依赖的编码器。
+bevy = { workspace = true, features = ["png"] }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }

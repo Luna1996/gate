@@ -4,6 +4,11 @@
 use gate_voxel::{PALETTE_BITS, PALETTE_ENTRY_COUNT, PaletteEntry, PaletteFlags};
 use glam::{IVec3, Mat3, Vec3, Vec4};
 
+/// PBR 变体的逐实例标量覆盖 —— **定义在 `gate-voxel`**（`PaletteEntry::pbr` 要吃它，而
+/// `gate-voxel` 是纯逻辑层、不能被本 crate 反向依赖），这里只做**转发**以保持既有导入路径可用
+/// （`wire::PbrOverrides`；编码与语义见 `gate_voxel::PbrOverrides` 的文档）。
+pub use gate_voxel::PbrOverrides;
+
 /// chunk 边长（voxel 单位）：256³
 pub const CHUNK_SIZE: i32 = 256;
 /// 分裂因子（每轴 4，共 64 子块）
@@ -41,14 +46,41 @@ pub const STATE_ENTRY_COUNT: usize = 256;
 /// StateTable 总字数（256×4 = 1024 = 4KB）
 pub const STATE_TOTAL_WORDS: usize = STATE_ENTRY_COUNT * STATE_WORDS_PER_ENTRY;
 
-/// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）—— **平凡变体**（`flags::IS_PBR = 0`）。
-/// 逐位布局（`docs/PLAN.md` D1；写侧权威，读侧见 `common.wesl` 的 `palette_*`、介质读见 `trace.wesl::medium_of`）：
+/// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）—— **唯一的 palette 打包点**，
+/// 按 `flags::IS_PBR` 分派两种变体（`docs/PLAN.md` D1 tagged union；写侧权威）。
+///
+/// **平凡变体（`IS_PBR = 0`）—— 逐位布局**（读侧见 `common.wesl` 的 `palette_*`、
+/// 介质读见 `trace.wesl::medium_of`）：
 /// ```text
 /// word0 = color.r | color.g<<8 | color.b<<16 | roughness<<24
 /// word1 = emissive | transmission<<8 | flags<<16 | metallic<<24
 /// ```
-/// `metallic` 落在原先恒 0 的 `_pad` 字节上、默认 0 ⇒ **与改动前逐位相同**。`TRANSMISSIVE` 位由本函数维护。
+/// `metallic` 落在原先恒 0 的 `_pad` 字节上、默认 0 ⇒ **与改动前逐位相同**。`TRANSMISSIVE` 位由本分支维护。
+///
+/// **PBR 变体（`IS_PBR = 1`）—— 逐位布局**（构造入口 `gate_voxel::PaletteEntry::pbr`，
+/// 字段对应表见该类型文档；平凡变体的字节位置被向后兼容钉死，PBR 变体的位置完全自由）：
+/// ```text
+/// word0 = roughness覆盖 | metallic覆盖<<8 | emissive覆盖<<16 | transmission覆盖<<24
+/// word1 = asset:u16 | flags<<16 | specular覆盖<<24
+/// ```
+/// 本分支**不做任何推断**：`TRANSMISSIVE` 由调用方置/不置（只有它知道所选资产是不是透射材质），
+/// `IS_PBR` 由 `PaletteEntry::pbr` 保证置上（否则分派不到这里）。
+/// 覆盖的编码（`0` = 不覆盖 / `1..=255` = `(v−1)/254`）见 `gate_voxel::PbrOverrides`。
 pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
+  if e.flags.contains(PaletteFlags::IS_PBR) {
+    // PBR 变体：8B 的每一字节都只是"位置标签"（`PaletteEntry` 的字段名在此变体下另有含义）。
+    // 这里逐字节搬运、不重排 —— 顺序即 D1 的 PBR 布局表；与 `PaletteEntry::pbr` 严格互逆。
+    return [
+      e.color[0] as u32
+        | (e.color[1] as u32) << 8
+        | (e.color[2] as u32) << 16
+        | (e.roughness as u32) << 24,
+      e.emissive as u32
+        | (e.transmission as u32) << 8
+        | (e.flags.0 as u32) << 16
+        | (e.metallic as u32) << 24,
+    ];
+  }
   let mut flags = e.flags.0;
   if e.transmission > 0 {
     // 介质位由**写入侧**维护（D1）：`medium_of` 在 DDA 内逐体素调用，改读本字节的 bit5
@@ -68,36 +100,11 @@ pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
   ]
 }
 
-/// PBR 变体的逐实例标量覆盖。`0` = 不覆盖（用材质资产的值）；`1..=255` = 覆盖为 `(v-1)/254`
-/// （`1` 因此能表达"完全镜面"这种 0 值，而不与"不覆盖"撞码）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PbrOverrides {
-  pub roughness: u8,
-  pub metallic: u8,
-  pub emissive: u8,
-  pub transmission: u8,
-  /// 语义同 glTF `KHR_materials_specular`：只调制**电介质**的 F0，对金属无效（D1「F0 的唯一来源规则」）。
-  pub specular: u8,
-}
-
-/// PBR 变体（`flags::IS_PBR = 1`）的 8B 打包。布局（`docs/PLAN.md` D1；平凡变体的字节位置被向后兼容钉死，
-/// PBR 变体的位置完全自由，故按最省的方式排）：
-/// ```text
-/// word0 = roughness 覆盖 | metallic 覆盖<<8 | emissive 覆盖<<16 | transmission 覆盖<<24
-/// word1 = asset:u16 | flags<<16 | specular 覆盖<<24
-/// ```
-/// `flags` 里的 `TRANSMISSIVE` 由**调用方**决定 —— 只有调用方知道该资产是不是透射材质
-/// （可能来自资产的 transmission 贴图/标量），本函数不推断。`IS_PBR` 则由本函数保证置上。
+/// PBR 变体（`flags::IS_PBR = 1`）的 8B 打包 —— [`pack_palette_entry`] 的**薄包装**
+/// （实现只有一份：构造 `PaletteEntry::pbr` 后走同一个分派点，避免两份打包逻辑漂移）。
+/// `flags` 里的 `TRANSMISSIVE` 由**调用方**决定，本函数不推断（见 `pack_palette_entry`）。
 pub fn pack_palette_entry_pbr(asset: u16, ov: PbrOverrides, flags: PaletteFlags) -> [u32; 2] {
-  [
-    ov.roughness as u32
-      | (ov.metallic as u32) << 8
-      | (ov.emissive as u32) << 16
-      | (ov.transmission as u32) << 24,
-    asset as u32
-      | ((flags.union(PaletteFlags::IS_PBR).0 as u32) << 16)
-      | (ov.specular as u32) << 24,
-  ]
+  pack_palette_entry(&PaletteEntry::pbr(asset, ov, flags))
 }
 
 /// `MaterialAsset` 各 `*_slot` 的「无贴图」哨兵：该通道退回 `albedo_rough` / `emissive_metal` /
@@ -324,4 +331,114 @@ pub struct BrickMapBuffers {
   pub b_struct: Vec<u32>,
   pub b_palette: Vec<u32>,
   pub globals: BrickMapGlobals,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// 平凡变体的**逐位向后兼容**取证：三个字面量取自 `docs/PLAN.md §8`（MT1 的回归表），
+  /// 它们是在 MT1 改动**之后**实测到的值 —— 本测试把"打包逐位不变"钉死在回归测试里。
+  #[test]
+  fn plain_variant_packing_is_bit_for_bit_unchanged() {
+    // 纯色不透明：flags = LOCKED；metallic 默认 0（原 `_pad`）⇒ 与改动前完全一致
+    let opaque = PaletteEntry {
+      color: [0xC8, 0x64, 0x32],
+      roughness: 0x80,
+      flags: PaletteFlags::LOCKED,
+      ..Default::default()
+    };
+    assert_eq!(pack_palette_entry(&opaque), [0x803264C8, 0x00010000]);
+
+    // 玻璃 transmission = 200：唯一差异是 bit21（word1 的 flags 字节 bit5 = TRANSMISSIVE 0→1）
+    let glass = PaletteEntry { color: [0x0A, 0x14, 0x1E], transmission: 200, ..Default::default() };
+    assert_eq!(pack_palette_entry(&glass), [0x001E140A, 0x0020C800]);
+
+    // 发光玻璃（HOLOGRAM + transmission = 7）：同上，只有介质位是"新"的
+    let hologram = PaletteEntry {
+      color: [0xFF, 0x80, 0x00],
+      roughness: 0x28,
+      emissive: 0x5A,
+      transmission: 7,
+      flags: PaletteFlags::HOLOGRAM,
+      ..Default::default()
+    };
+    assert_eq!(pack_palette_entry(&hologram), [0x280080FF, 0x0028075A]);
+  }
+
+  /// 平凡变体的介质位维护规则：`transmission > 0 ⟺ TRANSMISSIVE = 1`（D1 / MT5-0 的写侧保证）。
+  #[test]
+  fn plain_variant_maintains_transmissive_bit() {
+    let mut e = PaletteEntry { transmission: 1, ..Default::default() };
+    assert_ne!(pack_palette_entry(&e)[1] & 0x0020_0000, 0);
+    e.transmission = 0;
+    assert_eq!(pack_palette_entry(&e)[1] & 0x0020_0000, 0);
+    // 调用方显式置位但 transmission = 0：本分支**不**清除它（只做或运算，与改动前一致）
+    e.flags = PaletteFlags::TRANSMISSIVE;
+    assert_ne!(pack_palette_entry(&e)[1] & 0x0020_0000, 0);
+  }
+
+  /// `IS_PBR = 0` 时**不**看 PBR 字段：即便字段长得像 PBR payload，也一律按平凡布局打包。
+  #[test]
+  fn plain_variant_ignores_pbr_payload() {
+    let e = PaletteEntry {
+      color: [1, 2, 3],
+      roughness: 4,
+      emissive: 5,
+      transmission: 6,
+      flags: PaletteFlags::LOCKED,
+      metallic: 7,
+    };
+    assert_eq!(pack_palette_entry(&e), [0x04030201, 0x07210605]);
+  }
+
+  /// PBR 变体：「构造 → 打包 → 期望 u32」的对照取证（D1 的 PBR 字节布局表）。
+  #[test]
+  fn pbr_variant_packing_matches_d1_layout() {
+    // 覆盖 = {一档全满的 roughness、完全金属、不覆盖 emissive、不覆盖 transmission、不调制 specular}
+    let ov =
+      PbrOverrides { roughness: 1, metallic: 255, emissive: 0, transmission: 0, specular: 255 };
+    // asset = 10（`metal_plate`）；flags 只带 IS_PBR（0x10）⇒ 不是介质
+    let e = PaletteEntry::pbr(10, ov, PaletteFlags::default());
+    assert_eq!(e.flags.0, 0x10, "构造器置上 IS_PBR");
+    // word0 = 1 | 255<<8 | 0<<16 | 0<<24 = 0x0000FF01
+    // word1 = 10 | (0x10)<<16 | 255<<24 = 0xFF10000A
+    assert_eq!(pack_palette_entry(&e), [0x0000_FF01, 0xFF10_000A]);
+    // 薄包装走的是同一条实现（不再有第二份打包逻辑）
+    assert_eq!(pack_palette_entry_pbr(10, ov, PaletteFlags::default()), [0x0000_FF01, 0xFF10_000A]);
+
+    // `TRANSMISSIVE` 在 PBR 变体里是**调用方**的决定，打包原样透传（0x20 ⇒ word1 的 flags 字节 0x30）
+    let e_trans = PaletteEntry::pbr(10, ov, PaletteFlags::TRANSMISSIVE);
+    assert_eq!(pack_palette_entry(&e_trans), [0x0000_FF01, 0xFF30_000A]);
+  }
+
+  /// PBR 变体的严格互逆：打包出的两个 word 按 D1 的布局手写解包，必须逐字段还原出
+  /// `PaletteEntry::pbr` 的入参（= 报告里那张"构造 → 打包 → 期望 u32"表的可执行版本）。
+  #[test]
+  fn pbr_variant_pack_unpack_round_trip() {
+    let ov =
+      PbrOverrides { roughness: 1, metallic: 128, emissive: 7, transmission: 200, specular: 64 };
+    let flags = PaletteFlags::LOCKED;
+    let asset: u16 = 0x0ABC;
+    let src = PaletteEntry::pbr(asset, ov, flags);
+    let [w0, w1] = pack_palette_entry(&src);
+
+    // 手写解包（顺序照 D1：word0 = roughness/metallic/emissive/transmission 覆盖）
+    let unpacked = PbrOverrides {
+      roughness: (w0 & 0xFF) as u8,
+      metallic: ((w0 >> 8) & 0xFF) as u8,
+      emissive: ((w0 >> 16) & 0xFF) as u8,
+      transmission: ((w0 >> 24) & 0xFF) as u8,
+      specular: ((w1 >> 24) & 0xFF) as u8,
+    };
+    let unpacked_flags = ((w1 >> 16) & 0xFF) as u8;
+    let unpacked_asset = (w1 & 0xFFFF) as u16;
+
+    assert_eq!(unpacked, ov);
+    assert_eq!(unpacked_asset, asset);
+    assert_eq!(unpacked_flags, flags.union(PaletteFlags::IS_PBR).0);
+    // 结构的 `pbr_asset` / `pbr_overrides` 与手写解包一致（两条读回路径不得分叉）
+    assert_eq!(src.pbr_asset(), asset);
+    assert_eq!(src.pbr_overrides(), ov);
+  }
 }

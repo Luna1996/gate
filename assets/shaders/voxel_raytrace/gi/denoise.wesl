@@ -63,7 +63,7 @@ fn gi_den_nrm_b(b: u32) -> vec3<f32> {
 }
 
 /// 写导引（`gi_ss_main` 调用）。
-/// `valid = false` ⇒ 整格清零（天空 / 介质像素：两段降噪 + `dda_main` 的上采样都跳过）。
+/// `valid = false` ⇒ 整格清零（天空像素：两段降噪 + `dda_main` 的上采样都跳过）。
 /// `n` = **着色法线**（`voxel_normal` 的结果）—— 在 `gi_main` 里算一次存下来，后面所有判据都读它，
 /// **不再重算**（那个梯度要探 6 个邻域体素）。
 /// `prev_px` / `prev_ok` = **真实命中点**（`h.point`）用 `gi_u.prev_view_proj` 投到**上帧** GI 网格的

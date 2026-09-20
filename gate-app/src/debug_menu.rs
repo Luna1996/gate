@@ -16,13 +16,16 @@ use gate_ui::{
   DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   parse_hex_color, spawn_debug_menu,
 };
+use gate_voxel::{inverted_pct_to_override, ior_slider_to_x100, slider_to_override};
 
 use crate::camera::{CameraMode, FlyCamera};
 use crate::config::Config;
 use crate::consts::{
   CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, HALF_RES_FACTOR, VOXEL_PER_METER,
 };
-use crate::edit::{BrushShape, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness};
+use crate::edit::{
+  BrushMaterial, BrushShape, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness,
+};
 use crate::showcase::ShowcaseRoot;
 
 /// 菜单 TOML 相对 assets 目录的路径（UI 结构与控件缺省值的唯一来源）
@@ -32,6 +35,8 @@ pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
 pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
+/// 「编辑」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
+pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/pbr_asset";
 
 /// 读 UI 结构与控件缺省值：每次都读只读资源 `assets/ui/debug_menu.toml`（结构与缺省值的唯一
 /// 来源），再把 `data/config.toml` 里的值覆盖上去 —— 配置里没有的控件保留缺省值，
@@ -345,9 +350,13 @@ fn register_callbacks(world: &mut World) {
   );
 
   // 材质控件只改当前笔触材质，不碰调色板；材质 → 槽的分配在落笔时（`edit::material_slot`）。
+  // MT7-1：PBR 变体开关 / 资产槽 / metallic / IOR / specular 也走这里；每次改动都打一行
+  // `材质 → …`（含两种变体的完整参数，见 `BrushMaterial::summary`）。
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut edit: ResMut<EditSettings>,
+     q_menu: Query<&gate_ui::DebugMenu>,
+     pbr_set: Option<Res<gate_render::PbrTextureSet>>,
      mut q_show: Query<&mut Visibility, With<ShowcaseRoot>>| {
       match (ev.path.as_str(), &ev.action) {
         ("game/edit/shape", MenuAction::Select(i)) => {
@@ -365,22 +374,65 @@ fn register_callbacks(world: &mut World) {
         ("game/edit/color", MenuAction::Text(t)) => match parse_hex_color(t) {
           Some([r, g, b, _]) => {
             edit.mat.color = [r, g, b];
-            info!(target: "gate", "笔触颜色 → {}", edit.mat.hex());
+            log_material(&edit.mat);
           }
           // 输入框是自由文本：解析失败（半截输入）就忽略，不打断输入
           None => debug!(target: "gate", "笔触颜色输入未成形 → {t:?}（忽略）"),
         },
         ("game/edit/emissive", MenuAction::Value(v)) => {
+          // 平凡变体直接用这个字节；PBR 变体把它当**槽级覆盖**（最低档 = 不覆盖），
+          // 两个编码同时维护 ⇒ 切变体不需要重算（编码见 gate_voxel::palette 的映射函数）。
           edit.mat.emissive = v.round().clamp(0.0, 255.0) as u8;
-          info!(target: "gate", "自发光 → {}", edit.mat.emissive);
+          edit.mat.emissive_ov = slider_to_override(*v, 0.0, 255.0);
+          log_material(&edit.mat);
         }
         ("game/edit/alpha", MenuAction::Value(v)) => {
           edit.mat.transmission = opacity_pct_to_transmission(*v);
-          info!(target: "gate", "透明度 → {v:.0}%（透射率 {}）", edit.mat.transmission);
+          edit.mat.transmission_ov = inverted_pct_to_override(*v);
+          log_material(&edit.mat);
         }
         ("game/edit/smooth", MenuAction::Value(v)) => {
           edit.mat.roughness = smooth_pct_to_roughness(*v);
-          info!(target: "gate", "光滑度 → {v:.0}%（粗糙度 {}）", edit.mat.roughness);
+          edit.mat.roughness_ov = inverted_pct_to_override(*v);
+          log_material(&edit.mat);
+        }
+        ("game/edit/pbr", MenuAction::Toggle(on)) => {
+          edit.mat.pbr = *on;
+          info!(
+            target: "gate",
+            "材质 → 变体切到 {}（IS_PBR）；{}",
+            if *on { "PBR（资产贴图 + 槽级覆盖）" } else { "平凡（逐槽独立参数）" },
+            edit.mat.summary(),
+          );
+        }
+        ("game/edit/pbr_asset", MenuAction::Select(i)) => {
+          // 下拉选项是**资产 id 文本**（不是 i18n key），选项顺序 = 目录字典序 = 槽号顺序。
+          // 有 `PbrTextureSet` 就按 id 查**真实层号**（缺素材的目录会被跳过 ⇒ 层号顺延），
+          // 资源还没就绪（贴图集是异步构建的）则回落选项下标 —— 两者在素材齐全时一致。
+          let name = menu_pbr_asset(&q_menu).unwrap_or_else(|| "?".to_string());
+          let (slot, how) = match pbr_set.as_deref().and_then(|s| s.slot_of(&name)) {
+            Some(slot) => (slot, "按 PbrTextureSet 解析"),
+            None => (*i as u32, "贴图集未就绪/未收录，回落选项下标"),
+          };
+          edit.mat.asset_slot = slot;
+          info!(
+            target: "gate",
+            "材质 → PBR 资产槽 {slot} = {name}（{how}）；{}",
+            edit.mat.summary(),
+          );
+        }
+        ("game/edit/metal", MenuAction::Value(v)) => {
+          edit.mat.metallic_ov = slider_to_override(*v, 0.0, 100.0);
+          log_material(&edit.mat);
+        }
+        ("game/edit/ior", MenuAction::Value(v)) => {
+          // IOR 是**资产级**物理基值（D1）：palette 槽里没有它，故只记录下来。
+          edit.mat.ior_x100 = ior_slider_to_x100(*v);
+          log_material(&edit.mat);
+        }
+        ("game/edit/spec", MenuAction::Value(v)) => {
+          edit.mat.specular_ov = slider_to_override(*v, 0.0, 100.0);
+          log_material(&edit.mat);
         }
         ("ui/showcase", MenuAction::Toggle(on)) => {
           if let Ok(mut vis) = q_show.single_mut() {
@@ -440,6 +492,21 @@ pub(crate) fn world_model_name(model: &MenuFile) -> Option<String> {
 /// 从菜单组件里读选中的模型名（无菜单 → None）
 fn menu_world_model(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
   world_model_name(&q_menu.single().ok()?.model)
+}
+
+/// 从菜单组件里读「编辑」页 PBR 资产下拉的选中项（= `assets/textures/pbr/` 的目录名，无菜单 → None）。
+/// 下拉的选项是**纯文本 id**（不是 i18n key）⇒ 选中项本身就是资产 id，可直接交给
+/// `PbrTextureSet::slot_of` 解析成真实槽号。
+fn menu_pbr_asset(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
+  match q_menu.single().ok()?.model.node(&split(EDIT_PBR_ASSET_PATH)) {
+    Some(MenuNode::Dropdown { options, selected, .. }) => options.get(*selected).cloned(),
+    _ => None,
+  }
+}
+
+/// 材质控件的统一日志（MT7-1 的验收：每次改动日志有 `材质 → …` 一行）。
+fn log_material(mat: &BrushMaterial) {
+  info!(target: "gate", "材质 → {}", mat.summary());
 }
 
 /// 纯文本行（相机位置/角度）的值：每 `CAM_INFO_REFRESH_SECS` 刷新一次。

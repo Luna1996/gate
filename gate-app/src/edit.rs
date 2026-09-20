@@ -6,10 +6,11 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
+use gate_render::brickmap::wire::pack_palette_entry;
 use gate_render::{DdaCameraConfig, VoxelScene};
 use gate_voxel::{
-  BRICK_FACTOR, BrickState, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry, PaletteId, VolumeGrid,
-  VoxelCoord,
+  BRICK_FACTOR, BrickState, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry, PaletteFlags, PaletteId,
+  PbrOverrides, VolumeGrid, VoxelCoord, override_value,
 };
 
 use crate::{
@@ -26,30 +27,77 @@ pub enum BrushShape {
   Cube,
 }
 
-/// 笔触材质参数：菜单「游戏/编辑」的四个控件（颜色 / 自发光 / 透明度 / 光滑度）直接写这里，
-/// 由 `material_slot` 落进调色板槽；字段与 `PaletteEntry` 一一对应，数值域按 UI 收窄。
+/// 笔触材质参数：菜单「游戏/编辑」的控件直接写这里，由 `material_slot` 落进调色板槽。
+///
+/// **两个变体（PLAN D1 的 8B 变体复用）**，与 `PaletteEntry` 一一对应：
+/// - `pbr = false`（默认）：`color` / `emissive` / `transmission` / `roughness` 就是平凡 payload
+///   （字节布局与改动前逐位相同）；
+/// - `pbr = true`：8B 被解释为 `asset_slot` + 5 个槽级覆盖 ⇒ 那四个滑杆改驱动 `*_ov` 字段
+///   （`color` 不参与：D1 明确 PBR 变体不做逐实例染色，albedo 来自资产贴图）。
+///
+/// **`ior_x100` 是例外**：D1 规定 IOR 是**资产级**物理基值（`MaterialAsset::transmission_ior`
+/// 的高 16 位），槽级只有 `specular` 覆盖 ⇒ 这 8B 里**没有** IOR 的位置，本字段只是菜单值的记录
+/// （见 `summary()` 的说明），不参与 `entry()`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrushMaterial {
-  /// sRGB [r, g, b]
+  /// sRGB [r, g, b]（**仅平凡变体**）
   pub color: [u8; 3],
-  /// 自发光强度 0..255（0 = 不发光；发光体素着色直出并经 GI 传播）
+  /// 自发光强度 0..255（平凡变体直接就是这个字节；发光体素着色直出并经 GI 传播）
   pub emissive: u8,
-  /// 透射率 0..255（0 = 不透明，255 = 全透）
+  /// 透射率 0..255（0 = 不透明，255 = 全透；平凡变体直接就是这个字节）
   pub transmission: u8,
-  /// 粗糙度 0..255（0 = 镜面，255 = 完全粗糙）
+  /// 粗糙度 0..255（0 = 镜面，255 = 完全粗糙；平凡变体直接就是这个字节）
   pub roughness: u8,
+  /// `IS_PBR` 变体开关（菜单「PBR 变体」）
+  pub pbr: bool,
+  /// PBR 变体引用的材质资产槽号（= `PbrTextureSet` 的层号 = 全局资产表下标）
+  pub asset_slot: u32,
+  /// PBR 变体：roughness 覆盖（0 = 不覆盖；由「光滑度」滑杆驱动）
+  pub roughness_ov: u8,
+  /// PBR 变体：metallic 覆盖（0 = 不覆盖；由「金属度」滑杆驱动）
+  pub metallic_ov: u8,
+  /// PBR 变体：emissive 覆盖（0 = 不覆盖；由「自发光」滑杆驱动）
+  pub emissive_ov: u8,
+  /// PBR 变体：transmission 覆盖（0 = 不覆盖；由「透明度」滑杆驱动）
+  pub transmission_ov: u8,
+  /// PBR 变体：specular 覆盖（0 = 不覆盖；语义同 glTF `KHR_materials_specular`，只调制电介质 F0）
+  pub specular_ov: u8,
+  /// 「折射率」滑杆值（IOR ×100）：100..=300 对应 1.00..3.00，默认 150 = 1.50。
+  /// **属资产级参数**（见类型注释），当前只记录/回显。
+  pub ior_x100: u16,
 }
 
 impl Default for BrushMaterial {
-  /// 与 `assets/ui/debug_menu.toml` 初值一致（中灰 / 不发光 / 不透明 / 半粗糙）。
+  /// 与 `assets/ui/debug_menu.toml` 初值一致
+  /// （中灰 / 不发光 / 不透明 / 半粗糙 / 平凡变体 / 槽 0 / 全部覆盖"不覆盖" / IOR 1.50）。
   fn default() -> Self {
-    Self { color: [0x96, 0x98, 0x9E], emissive: 0, transmission: 0, roughness: 128 }
+    Self {
+      color: [0x96, 0x98, 0x9E],
+      emissive: 0,
+      transmission: 0,
+      roughness: 128,
+      pbr: false,
+      asset_slot: 0,
+      roughness_ov: 0,
+      metallic_ov: 0,
+      emissive_ov: 0,
+      transmission_ov: 0,
+      specular_ov: 0,
+      ior_x100: 150,
+    }
   }
 }
 
 impl BrushMaterial {
-  /// 落进调色板的条目（不设 `flags`）。
+  /// 落进调色板的条目：按 `pbr` 开关产出**两种变体之一**（D1）。平凡路径与改动前完全一致
+  /// （不设 `flags`）；PBR 路径走 `PaletteEntry::pbr`（构造），打包由 `wire.rs::pack_palette_entry`
+  /// 按 `IS_PBR` 分派 —— 本函数**不打包**。
   pub fn entry(&self) -> PaletteEntry {
+    if self.pbr { self.pbr_entry() } else { self.plain_entry() }
+  }
+
+  /// 平凡变体条目（现状语义，逐位不变）
+  fn plain_entry(&self) -> PaletteEntry {
     PaletteEntry {
       color: self.color,
       roughness: self.roughness,
@@ -59,9 +107,65 @@ impl BrushMaterial {
     }
   }
 
-  /// 日志用的 `#RRGGBB`
+  /// PBR 变体条目：`asset` + 5 个槽级覆盖。
+  ///
+  /// `TRANSMISSIVE` 位（D1：**由调用方决定**，打包函数不推断）按槽级透射覆盖判定：
+  /// 覆盖字节 `>= 2` ⇔ 覆盖值 `> 0`（字节 `1` 是"覆盖为精确 0"，不是介质）——与平凡变体那条
+  /// "`transmission > 0` ⇒ 介质"同义。**只看覆盖、不看资产**：当前默认资产集的标量透射率全 0
+  /// （`gate-render/src/pbr_texture.rs::build_material_asset_table`），且这里读不到资产表；
+  /// 将来资产真的带透射时，这里要一并看资产（登记为后续项）。
+  fn pbr_entry(&self) -> PaletteEntry {
+    let flags =
+      if self.transmission_ov >= 2 { PaletteFlags::TRANSMISSIVE } else { PaletteFlags::default() };
+    PaletteEntry::pbr(
+      self.asset_slot.min(u16::MAX as u32) as u16,
+      PbrOverrides {
+        roughness: self.roughness_ov,
+        metallic: self.metallic_ov,
+        emissive: self.emissive_ov,
+        transmission: self.transmission_ov,
+        specular: self.specular_ov,
+      },
+      flags,
+    )
+  }
+
+  /// 日志用的 `#RRGGBB`（只对平凡变体有意义 —— PBR 变体不做逐实例染色）
   pub fn hex(&self) -> String {
     format!("#{:02X}{:02X}{:02X}", self.color[0], self.color[1], self.color[2])
+  }
+
+  /// 日志用的一行摘要（菜单每次改动都打 `材质 → {summary}`，MT7-1 的验收之一）。
+  /// 覆盖字节按 D1 的编码解回参数值（`0` = 不覆盖），避免把编码字节直接当数值给人看。
+  pub fn summary(&self) -> String {
+    if !self.pbr {
+      return format!(
+        "平凡 {} 自发光={} 透射率={} 粗糙度={}",
+        self.hex(),
+        self.emissive,
+        self.transmission,
+        self.roughness
+      );
+    }
+    format!(
+      "PBR 变体 asset={} 覆盖[粗糙度={} 金属度={} 自发光={} 透射率={} 高光度={}] IOR={:.2}\
+       （IOR 是资产级参数，本槽不携带；起作用的槽级旋钮是「高光度」）",
+      self.asset_slot,
+      ov_text(self.roughness_ov),
+      ov_text(self.metallic_ov),
+      ov_text(self.emissive_ov),
+      ov_text(self.transmission_ov),
+      ov_text(self.specular_ov),
+      self.ior_x100 as f32 / 100.0,
+    )
+  }
+}
+
+/// 覆盖字节 → 日志文本：`0` = 不覆盖，其余显示参数值（`(v−1)/254`）。
+fn ov_text(byte: u8) -> String {
+  match override_value(byte) {
+    None => "不覆盖".to_string(),
+    Some(v) => format!("{v:.3}"),
   }
 }
 
@@ -94,8 +198,13 @@ impl Default for EditSettings {
 /// 取当前笔触材质的调色板槽：按内容去重 —— 已有同内容的槽复用，否则认领一个新空槽
 /// （空槽判据见 `Palette::is_empty_slot`）；一个空槽都没有则复用 `PALETTE_INDEX_MAX` 并 warn
 /// （会覆盖该槽原有材质）。单次调用线性扫全部 65536 槽。
+///
+/// **去重判据 = 8B payload**（`pack_palette_entry` 的输出，也就是真正上传到 GPU 的东西），
+/// 不是"字段看起来一样"：它在**两个变体上都是单射**（每个字节落在固定 bit 段、无重叠、无丢弃字段，
+/// 见 `PaletteEntry` 的文档）⇒ 判据等价，但把"内容"定义在字节层更硬。**PBR 变体走的是同一条
+/// 去重路径**（内容 = `asset` + 5 个覆盖 + flags），不另开一条（MT7-3）。
 fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
-  let want = mat.entry();
+  let want = pack_palette_entry(&mat.entry());
   let mut existing = None;
   let mut free = None;
   {
@@ -103,7 +212,7 @@ fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
     for i in 1u16..=PALETTE_INDEX_MAX {
       let id = PaletteId(i);
       if pal.occupied(id) {
-        if existing.is_none() && *pal.get(id) == want {
+        if existing.is_none() && pack_palette_entry(pal.get(id)) == want {
           existing = Some(id);
         }
       } else if free.is_none() {
@@ -124,7 +233,7 @@ fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
       PaletteId(PALETTE_INDEX_MAX)
     }
   };
-  grid.palette_mut().set(slot, want);
+  grid.palette_mut().set(slot, mat.entry());
   slot
 }
 
@@ -355,7 +464,7 @@ pub(crate) fn voxel_edit_input(
   let changed = apply_brush(grid, center, shape, size, pal);
   if changed > 0 {
     bevy::log::info!(
-      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} material={}",
+      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} slot={} material={}",
       if erase { "erase" } else { "place" },
       changed,
       center.x,
@@ -363,7 +472,8 @@ pub(crate) fn voxel_edit_input(
       center.z,
       shape,
       size,
-      if erase { "-".to_string() } else { settings.mat.hex() },
+      pal,
+      if erase { "-".to_string() } else { settings.mat.summary() },
     );
   }
 }
@@ -396,7 +506,7 @@ pub(crate) fn edit_selftest(
   let center = hit + face;
   let n = apply_brush(grid, center, shape, size, slot);
   bevy::log::info!(
-    "EDIT SELFTEST: hit=({},{},{}) t={t:.1} → placed {n} voxel(s) @ ({},{},{}) shape={:?} size={size} slot={slot}",
+    "EDIT SELFTEST: hit=({},{},{}) t={t:.1} → placed {n} voxel(s) @ ({},{},{}) shape={:?} size={size} slot={slot} material={}",
     hit.x,
     hit.y,
     hit.z,
@@ -404,5 +514,99 @@ pub(crate) fn edit_selftest(
     center.y,
     center.z,
     shape,
+    settings.mat.summary(),
   );
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// 平凡变体的落盘路径与改动前完全一致（`flags` 全 0 + 两个字的期望值）。
+  #[test]
+  fn plain_entry_packing_unchanged() {
+    let plain = BrushMaterial {
+      color: [10, 20, 30],
+      roughness: 200,
+      emissive: 7,
+      transmission: 9,
+      ..Default::default()
+    };
+    assert_eq!(plain.entry().flags.0, 0, "平凡变体不设任何 flags");
+    // word0 = 0x0A | 0x14<<8 | 0x1E<<16 | 0xC8<<24；word1 = 0x07 | 0x09<<8 | TRANSMISSIVE<<16
+    assert_eq!(pack_palette_entry(&plain.entry()), [0xC81E140A, 0x00200907]);
+  }
+
+  /// MT7-1：PBR 变体的 `entry()` 走 `PaletteEntry::pbr`（构造）+ 变体分派打包，
+  /// 且 `TRANSMISSIVE` 由**槽级透射覆盖**决定（字节 1 = 覆盖为精确 0 ⇒ 不是介质）。
+  #[test]
+  fn pbr_entry_packing_and_medium_flag() {
+    let pbr = BrushMaterial {
+      pbr: true,
+      asset_slot: 0x0102,
+      roughness_ov: 1,
+      metallic_ov: 255,
+      specular_ov: 255,
+      ..Default::default()
+    };
+    // word0 = roughness覆盖(1) | metallic覆盖(255)<<8；word1 = asset(0x0102) | IS_PBR(0x10)<<16 | specular(255)<<24
+    assert_eq!(pack_palette_entry(&pbr.entry()), [0x0000_FF01, 0xFF10_0102]);
+    assert_eq!(pbr.entry().pbr_asset(), 0x0102);
+
+    let medium = BrushMaterial { transmission_ov: 2, ..pbr };
+    assert_ne!(
+      pack_palette_entry(&medium.entry())[1] & 0x0020_0000,
+      0,
+      "透射覆盖值 > 0 ⇒ 标 TRANSMISSIVE（D1：PBR 变体的介质位由调用方决定）"
+    );
+    let zero = BrushMaterial { transmission_ov: 1, ..pbr };
+    assert_eq!(
+      pack_palette_entry(&zero.entry())[1] & 0x0020_0000,
+      0,
+      "字节 1 是「覆盖为精确 0」⇒ 不是介质（与平凡变体的 transmission > 0 同义）"
+    );
+  }
+
+  /// MT7-3：PBR 变体也按**内容（8B payload）**去重 —— 同内容复用同一槽，内容变了才认领新槽，
+  /// 且落进槽的确实是 PBR 变体的打包结果。
+  #[test]
+  fn pbr_material_dedups_by_payload() {
+    let mut grid = VolumeGrid::new();
+    let a = BrushMaterial { pbr: true, asset_slot: 10, metallic_ov: 255, ..Default::default() };
+    let s1 = material_slot(&mut grid, a);
+    assert_eq!(pack_palette_entry(grid.palette().get(s1)), [0x0000_FF00, 0x0010_000A]);
+    assert_eq!(material_slot(&mut grid, a), s1, "同 8B payload ⇒ 复用同一槽");
+    // 覆盖值不同、资产槽不同 ⇒ 各自认领新槽
+    let b = BrushMaterial { metallic_ov: 128, ..a };
+    let c = BrushMaterial { asset_slot: 11, ..a };
+    assert_ne!(material_slot(&mut grid, b), s1);
+    assert_ne!(material_slot(&mut grid, c), s1);
+    assert_eq!(*grid.palette().get(s1), a.entry(), "旧槽内容不得被改写");
+  }
+
+  /// MT7-3 的验收本体：**改材质不影响旧体素**（旧体素指着旧槽，旧槽内容不变）。
+  #[test]
+  fn material_change_does_not_touch_old_voxels() {
+    let mut grid = VolumeGrid::new();
+    let a = BrushMaterial { pbr: true, asset_slot: 3, ..Default::default() };
+    let s1 = material_slot(&mut grid, a);
+    let coord = IVec3::new(4, 5, 6);
+    grid.set_voxel_ivec3(coord, s1);
+    let s2 = material_slot(&mut grid, BrushMaterial { asset_slot: 4, ..a });
+    assert_ne!(s1, s2);
+    let v = grid.get_voxel(VoxelCoord::from_ivec3(coord)).unwrap_or(PaletteId::AIR);
+    assert_eq!(v, s1, "旧体素仍指向旧槽");
+    assert_eq!(*grid.palette().get(v), a.entry(), "旧槽内容 = 最初的材质");
+  }
+
+  /// 平凡变体的去重行为与改动前一致（同内容复用 / 不同内容新槽）。
+  #[test]
+  fn plain_material_dedup_unchanged() {
+    let mut grid = VolumeGrid::new();
+    let a = BrushMaterial::default();
+    let s1 = material_slot(&mut grid, a);
+    assert_eq!(material_slot(&mut grid, a), s1);
+    let b = BrushMaterial { color: [1, 2, 3], ..a };
+    assert_ne!(material_slot(&mut grid, b), s1);
+  }
 }
