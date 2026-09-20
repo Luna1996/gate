@@ -3,25 +3,34 @@ import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid};
 
 // 着色法线 = 逐体素（隐式）法线 = 可见面法线 + 该面**切平面内**的邻域倾斜。
-// 倾斜量取命中体素 6 邻域占据度的负梯度（palette 0 = 非占据），但只保留与 `face_n` 垂直的那部分
+// 倾斜量取命中体素邻域占据度（主世界 4 个面邻居 / 物体 6 个，见下面的成本说明）的负梯度，
+// 但只保留与 `face_n` 垂直的那部分
 // ⇒ 法线恒落在以可见面为轴的锥内（最大 54.7°），**永远不会与所见的面垂直**。
 // 为什么必须这样：可见面是整数 DDA 精确给出的权威，梯度只配在它内部做倾斜。旧的「梯度直出 +
 // 零梯度时 select 退回 face_n」在 1 体素薄板的切向边缘给出纯切向法线（与面内点积 = 0）⇒ 被
 // GI 的 `GI_DEN_N_DOT` 判成不同面（`gi/denoise.wesl`）⇒ 丢历史 / atrous 硬切 / 上采样拒绝。
 // 退化情形全部自然收敛且不需要分支：薄板内部（梯度 = 0）与介质出射面（梯度 = -face_n）都得到
 // `face_n`；厚块凸棱与薄板边缘得到同一个 45° 斜法线（取值集与 `gi/consts.wesl` 的容差推导一致）。
-// 成本与旧实现同阶：仍是 6 次 world_solid，省掉 length()，多 3 条 mat-vec。
-fn voxel_normal(g: Grid, voxel: vec3<i32>, face_n: vec3<f32>) -> vec3<f32> {
+// 成本：主世界（identity 变换）**4 次** world_solid，物体（任意旋转）6 次。
+//   · 主世界（`obj_id < 0`，`make_grid` 保证 rot=I / scale=1 / pos=0）⇒ `face_n` 恰是 ±e_a
+//     （a = face_id>>1）、`dw` 逐位等于 `d`；而下面的投影 `t = dw - face_n·dot(dw,face_n)`
+//     把 d 沿 a 的那个分量**整项抵消成 0** ⇒ 沿 a 的那一对点查询对结果零贡献，整对省掉。
+//     `face_id` 必须来自 DDA 的面（本工程全部调用点都如此）—— 换非轴对齐的法线会改变结果。
+//   · 物体（`obj_id ≥ 0`）三列旋转任意、`face_n` 不是轴对齐 ⇒ 分量一个都不能省，照旧 6 次。
+fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> vec3<f32> {
   let x = vec3<i32>(1, 0, 0);
   let y = vec3<i32>(0, 1, 0);
   let z = vec3<i32>(0, 0, 1);
-  let d = vec3<f32>(
-    f32(world_solid(g, voxel - x)) - f32(world_solid(g, voxel + x)),
-    f32(world_solid(g, voxel - y)) - f32(world_solid(g, voxel + y)),
-    f32(world_solid(g, voxel - z)) - f32(world_solid(g, voxel + z)),
-  );
+  // skip = 3 ⇒ 三个分量都要（物体）；0/1/2 ⇒ 该轴那一对点查询整对跳过（主世界）
+  let skip = select(3u, face_id >> 1u, g.obj_id < 0);
+  var d = vec3<f32>(0.0);
+  if (skip != 0u) { d.x = f32(world_solid(g, voxel - x)) - f32(world_solid(g, voxel + x)); }
+  if (skip != 1u) { d.y = f32(world_solid(g, voxel - y)) - f32(world_solid(g, voxel + y)); }
+  if (skip != 2u) { d.z = f32(world_solid(g, voxel - z)) - f32(world_solid(g, voxel + z)); }
   // 梯度在 grid 局部系；`face_n` 已是世界系（`grid_hit` 已乘 col0..col2）—— 先统一坐标系。
-  let dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2;
+  // 主世界三列 = 单位阵 ⇒ 局部系就是世界系，mat-vec 也一并省掉（逐位等价：d 分量恒为 -1/0/1）。
+  var dw = d;
+  if (skip == 3u) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
   // 投影掉沿可见面的分量，只留切向倾斜。|face_n| = 1 且 t ⊥ face_n ⇒ 长度恒 >= 1，无退化点。
   let t = dw - face_n * dot(dw, face_n);
   return normalize(face_n + t);

@@ -661,12 +661,28 @@ fn make_grid(idx: u32) -> Grid {
   let is_world = idx == 0u;
   let l_mn = select(vec3<f32>(0.0), d.aabb_min.xyz, is_world);
   let l_mx = select(vec3<f32>(f32(CHUNK_SIZE)), d.aabb_max.xyz, is_world);
+  // 变换段：主世界是 identity（Rust `VolumeTransform::IDENTITY`；`trace_grid` 的 `obj_id < 0` 分支
+  // 早已依赖这条 —— 它把局部坐标直取世界坐标）⇒ 不读 `rot0..2` / `pos_scale` 这 4 个 vec4，
+  // 直接给常量。这样下游的 `obj_id < 0` 分支（ro/rd 直取、`voxel_normal` 的 mat-vec 短路）
+  // 也能整段常量折叠掉。
+  var col0 = vec3<f32>(1.0, 0.0, 0.0);
+  var col1 = vec3<f32>(0.0, 1.0, 0.0);
+  var col2 = vec3<f32>(0.0, 0.0, 1.0);
+  var pos = vec3<f32>(0.0);
+  var scale = 1.0;
+  if (!is_world) {
+    col0 = d.rot0.xyz;      // 旋转矩阵列
+    col1 = d.rot1.xyz;
+    col2 = d.rot2.xyz;
+    pos = d.pos_scale.xyz;  // 物体位置
+    scale = d.pos_scale.w;
+  }
   return Grid(
     d.aabb_min.xyz, d.aabb_max.xyz,       // 世界 AABB
     l_mn, l_mx,                            // 局部 AABB
     chunk_budget,
-    d.rot0.xyz, d.rot1.xyz, d.rot2.xyz,    // 旋转矩阵列
-    d.pos_scale.xyz, d.pos_scale.w,        // pos + scale
+    col0, col1, col2,                      // 旋转矩阵列
+    pos, scale,                            // pos + scale
     d.tree_base, d.palette_base,           // 数据源基址
     origin, vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z),
     // obj_id 约定（镜像 Rust）：idx=0 主世界 → -1；idx≥1 物体 → idx-1。

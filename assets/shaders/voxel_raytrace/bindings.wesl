@@ -135,13 +135,13 @@ struct GiUniform {
 @group(4) @binding(21) var<storage, read_write> gi_res_prev: array<u32>;
 
 // ===== @group(5)：GI（网格 = 渲染分辨率 / gi_div）=====
-// @binding(2)/(3)：GI 缓冲的写入侧（`gi_main` 用）；采样侧见 `@binding(4)/(5)`。
+// @binding(2)：GI 缓冲的写入侧（`gi_main` 用）；采样侧见 `@binding(4)`。
 @group(5) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
-@group(5) @binding(3) var gi_cov_out: texture_storage_2d<rg32float, write>;
-// @binding(4)/(5)：同一对纹理的采样侧（只被 `dda_main` 用）。
-// rgba16f：rgb = gi·valid、a = valid；rg32f：r = cov·valid、g = valid。采样走 `light_samp` 双线性、按 valid 归一化。
+// @binding(4)：同一张纹理的采样侧（只被 `dda_main` 用）。
+// rgba16f：rgb = gi·valid、a = valid。采样走 `light_samp` 双线性、按 valid 归一化。
+// **覆盖度 cov 不再单独占一张纹理**：`gi_ss_main` 往 `gi_cov_out` 写的恒是「valid ? 1 : 0」，
+// 于是 `cov` 与 `gi_tex.a` 是同一个场（`cov = s.a / max(s.a, 1e-4)` 恒为 0 或 1）。
 @group(5) @binding(4) var gi_tex: texture_2d<f32>;
-@group(5) @binding(5) var gi_cov_tex: texture_2d<f32>;
 /// @binding(6)：**降噪导引**（`gi_main` 写；降噪两段 + `dda_main` 的几何感知上采样读，
 /// 另外 `dda_main` 在 `gi_div = 1` 时也读它拿**着色法线**、省掉一次 `voxel_normal`）。
 /// 每 GI 像素 `GI_DEN_GUIDE_WORDS` 个 word，布局见 `gi/consts.wesl`：**面键 2**

@@ -1,4 +1,4 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_cov_out, gi_cov_tex, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, palette_transmission, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_key0, gi_key1, gi_unpack_dir};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
@@ -239,7 +239,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
     let k0 = gi_key0(best.voxel);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
-    // 着色法线（`voxel_normal`，要探 6 个邻域体素）：**先试导引复用，键相等就用它、不再自己算**。
+    // 着色法线（`voxel_normal`，主世界要探 4 个 / 物体 6 个邻域体素）：**先试导引复用，键相等就用它、不再自己算**。
     // 复用合法性由键给出：键逐位编码了精确体素 + 面号 + 物体，而 `voxel_normal` 是
     // `(命中体素, 可见面)` 的纯函数 ⇒ 键逐位相等 ⇒ 法线必然逐位相等。
     // 只在 gi_div = 1 时尝试：此时 GI 射线与本像素**逐位相同**，导引那格必然命中同一体素面，
@@ -258,7 +258,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
       }
     }
-    if (!n_reused) { n = voxel_normal(gg, best.voxel, best.n); }
+    if (!n_reused) { n = voxel_normal(gg, best.voxel, best.face_id, best.n); }
     // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS，使起点离开命中体素。
     let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
     let ndl = max(dot(n, sun_dir), 0.0);
@@ -277,14 +277,15 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
               / vec2<f32>(f32(size.x), f32(size.y));
       let s = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
-      let sc = textureSampleLevel(gi_cov_tex, light_samp, guv, 0.0);
       // premultiplied-valid 归一化：valid = 0（天空/介质）像素不参与插值。
       let gw = max(s.a, 1e-4);
+      // 覆盖度 cov 直接取自 `a`：`gi_out.a = valid`，而独立的 cov 通道写的恒是「valid ? 1 : 0」
+      // ⇒ `cov = valid / max(valid, 1e-4)` 与旧的 `sc.r / gw` 是同一个表达式（不再单开一张纹理）。
       // GI 值走**几何感知上采样**（纯双线性作 fallback）：不接受与本像素不同「面」的 texel
       // ⇒ 棱边 / 墙角不渗色、不糊（相似度那一条用本像素的着色法线 `n`）。cov 不参与
       // （它是 0/1 覆盖度，双线性归一化即可）。
       gi = gi_upsample_joint(guv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n, s.rgb / gw);
-      cov = sc.r / gw;
+      cov = s.a / gw;
     }
     // AO 只乘到常量天光项（gi 已自带逐方向遮挡）。
     let ao = light_field_ao(p_voxel, best.obj_id);
@@ -311,7 +312,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // GI（**唯一路径 = 屏幕空间逐面 ReSTIR**，见 `gi/screen.wesl`）。
 // 本 pass 只负责：反投影 + beam 起点 + 主 trace（= G-Buffer），随后整条 GI 都交给 `gi_ss_main`
 // （新鲜候选 → 时域复用 → 空间复用 → 着色）并写降噪导引。
-// 输出：gi_out.rgb = gi·valid、gi_out.a = valid；gi_cov_out.r = cov·valid、.g = valid；
+// 输出：gi_out.rgb = gi·valid、gi_out.a = valid（覆盖度 cov 从 `a` 导出，见 `dda_main`）；
 // 主 pass 按 valid 归一化，天空/介质像素（valid = 0）不参与插值。
 @compute @workgroup_size(8, 8, 1)
 fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -364,7 +365,7 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // 顺序（Rust `dispatch_dda`）：`gi_main` → `gi_denoise_temporal` → `gi_denoise_atrous1/2/4/8/16`
 // （步长 1/2/4/8/16 = NRD/RELAX 的 5 轮 a-trous；实际跑几轮 = `GI_DEN_ATROUS_ITER`，
 // 中间靶只有 4 张 ⇒ 后面几轮靠 a↔b ping-pong）。最终结果落在 `gi_den`（`dda_main` 采样它，
-// 原始 `gi_out` 保留作对照；`gi_cov_out` 全链不动）。
+// 原始 `gi_out` 保留作对照）。
 // ============================================================================
 
 /// 时域累积：读本帧原始 GI + 导引 + 上帧历史 → 写累积色/矩/历史长度（双缓冲）+ φ。

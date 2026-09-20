@@ -184,9 +184,10 @@ pub fn gi_bg4_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
-/// BG5 写入侧布局：GI 的两张输出纹理（2 = gi、3 = cov）+ 降噪导引 buffer（6）。
+/// BG5 写入侧布局：GI 输出纹理（2）+ 降噪导引 buffer（6）。
 /// 纹理尺寸 = GI 网格（渲染分辨率 ÷ `GiSettings.gi_div`），与全分辨率无关。
-/// 采样侧（binding 4/5）在 `brickmap::dda` 里单独一份 layout，只给 `dda_main`。
+/// 采样侧（binding 4/6）在 `brickmap::dda` 里单独一份 layout，只给 `dda_main`。
+/// 覆盖度 cov 不占绑定（它是「valid ? 1 : 0」，与 `gi_out.a` 同一个场）。
 pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -205,8 +206,6 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
     &[
       // GI 网格分辨率下的 GI：rgb = gi·valid、a = valid
       store(2, TextureFormat::Rgba16Float),
-      // GI 网格分辨率下的覆盖度：r = cov·valid、g = valid
-      store(3, TextureFormat::Rg32Float),
       // 降噪导引（`gi_main` 写、两段降噪读；布局见 WESL `gi/consts.wesl`）
       BindGroupLayoutEntry {
         binding: 6,
@@ -372,46 +371,37 @@ pub struct GiBg4(pub bevy::render::render_resource::BindGroup);
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
 
-/// GI 写入侧的占位纹理（1×1）：GI 缓冲未就绪时 BG5 仍须为 binding 2/3 提供视图。
+/// GI 写入侧的占位纹理（1×1）：GI 缓冲未就绪时 BG5 仍须为 binding 2 提供视图。
 /// 占位纹理不会被真正写入。
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
   tex: Option<bevy::render::render_resource::Texture>,
-  cov: Option<bevy::render::render_resource::Texture>,
   view: Option<bevy::render::render_resource::TextureView>,
-  cov_view: Option<bevy::render::render_resource::TextureView>,
   /// BG4 binding 20/21 的占位（GI 缓冲未就绪时用；1 个 word，足够绑定，不会被读写）。
   res: Option<bevy::render::render_resource::Buffer>,
 }
 
 impl GiPlaceholder {
-  fn views(
+  fn view(
     &mut self,
     device: &bevy::render::renderer::RenderDevice,
-  ) -> (&bevy::render::render_resource::TextureView, &bevy::render::render_resource::TextureView)
-  {
+  ) -> &bevy::render::render_resource::TextureView {
     use bevy::render::render_resource::*;
     if self.tex.is_none() {
-      let make = |label: &str, format: TextureFormat| {
-        device.create_texture(&TextureDescriptor {
-          label: Some(label),
-          size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-          mip_level_count: 1,
-          sample_count: 1,
-          dimension: TextureDimension::D2,
-          format,
-          usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-          view_formats: &[],
-        })
-      };
-      let t = make("gate_gi_placeholder", TextureFormat::Rgba16Float);
-      let c = make("gate_gi_cov_placeholder", TextureFormat::Rg32Float);
+      let t = device.create_texture(&TextureDescriptor {
+        label: Some("gate_gi_placeholder"),
+        size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+      });
       self.view = Some(t.create_view(&TextureViewDescriptor::default()));
-      self.cov_view = Some(c.create_view(&TextureViewDescriptor::default()));
       self.tex = Some(t);
-      self.cov = Some(c);
     }
-    (self.view.as_ref().expect("刚创建"), self.cov_view.as_ref().expect("刚创建"))
+    self.view.as_ref().expect("刚创建")
   }
 
   /// BG4 binding 20/21 的占位 buffer（4 B）。
@@ -632,16 +622,13 @@ fn prepare_gi(
     gpu.res_flip = !gpu.res_flip;
   }
 
-  // ---- BG5：GI 的写入侧（绑定号 2/3/6）----
+  // ---- BG5：GI 的写入侧（绑定号 2/6）----
   // GI 视图来自 `crate::brickmap::dda::AuxTexCache`；未就绪时用 1×1 占位纹理（bind group 必须给全条目）。
   // 视图/ buffer 都先 clone 成句柄（`TextureView`/`Buffer` 都是 Arc 包装）⇒ 之后还能再借一次 `gi_ph`。
   let bg5_layout = pipeline_cache.get_bind_group_layout(&gi_bg5_layout());
-  let (gi_view, gi_cov_view) = match aux.as_ref().and_then(|a| a.gi_write_views()) {
-    Some((a, b)) => (a.clone(), b.clone()),
-    None => {
-      let (a, b) = gi_ph.views(&device);
-      (a.clone(), b.clone())
-    }
+  let gi_view = match aux.as_ref().and_then(|a| a.gi_write_view()) {
+    Some(v) => v.clone(),
+    None => gi_ph.view(&device).clone(),
   };
   // binding 6 = 降噪导引（`gi_main` 写）；未就绪时用 4 B 占位（该帧不会派发 `gi_main`）。
   let guide = aux
@@ -654,7 +641,6 @@ fn prepare_gi(
     &bg5_layout,
     &[
       BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&gi_view) },
-      BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&gi_cov_view) },
       BindGroupEntry { binding: 6, resource: guide.as_entire_binding() },
     ],
   );

@@ -1,5 +1,5 @@
 import package::bindings::{light_u};
-import package::common::{palette_albedo, palette_emissive, palette_transmission, sky_rgb};
+import package::common::{palette_albedo, palette_emissive, sky_rgb};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
@@ -26,20 +26,22 @@ import package::world::{world_cfg_full, world_raycast, world_trace_medium, voxel
 // 逃逸到天空 ⇒ `sky_rgb()`（唯一的 miss 辐亮度口径）。
 // ============================================================================
 
-/// 太阳方向的直光透过率（1 = 无遮挡，0 = 被不透明体素全挡），一次穿透 trace 走完整段介质。
+/// 太阳方向的直光透过率（1 = 无遮挡，0 = 被不透明体素全挡），**一次 `world_trace_medium` 走完**。
+/// `stop_on_air = false` ⇒ 空气与透射体素都不停、只在不透明体素上停 ⇒ 命中即「被挡住」，
+/// 沿途穿过的透射介质累积进 `tint`（旧写法是「先探一次不透明首命中；若它是透射材质，
+/// 再把已经走过的那一段整段丢掉、从同一 origin 重走一遍介质」—— 两条路等价，
+/// 但玻璃场景下旧写法要打**两段**遍历，本写法只有一段）。
 /// `self_voxel`/`self_obj`：起点贴命中面外侧，豁免 t≈0 自命中。
+/// 与旧写法的唯一差别在「起点落在**透射**的命中体素内部」这种 UB 情形：旧写法按自命中返回 1.0，
+/// 本写法按它后面的不透明遮挡给值 —— 起点已沿法线外推半个体素 + eps，正常路径不会走到那里。
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
-  let sh = world_raycast(make_grid(0u), origin, sun_dir, 8192.0, world_cfg_full(0.0, 3u));
-  if (!sh.hit) { return 1.0; }
-  if (all(sh.voxel == self_voxel) && sh.obj_id == self_obj) { return 1.0; }
-  if (palette_transmission(sh.palette_base, sh.pal) <= 0.0) { return 0.0; }
   var tint = vec3<f32>(1.0);
   let h = world_trace_medium(make_grid(0u), origin, sun_dir, 8192.0, false, &tint);
   let through = (tint.r + tint.g + tint.b) / 3.0;
+  // 段内没有不透明遮挡 ⇒ 只有介质的乘性透过（无介质时恒 1.0）。
   if (!h.hit) { return through; }
   if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return 1.0; }
-  if (palette_transmission(h.palette_base, h.pal) <= 0.0) { return 0.0; }
-  return through;
+  return 0.0;
 }
 
 /// 一条 GI 射线的求值结果。
@@ -66,7 +68,7 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
   if (sh.hit) {
     let alb = palette_albedo(sh.palette_base, sh.pal);
     let hit_p = org + dir * sh.t;
-    let hn = voxel_normal(make_grid(u32(sh.obj_id) + 1u), sh.voxel, sh.n);
+    let hn = voxel_normal(make_grid(u32(sh.obj_id) + 1u), sh.voxel, sh.face_id, sh.n);
     let ndl = max(dot(hn, sun_dir), 0.0);
     var sun = 0.0;
     // `sun_bounce` 来自 uniform（一次派发内恒定 ⇒ 分支不发散）：关掉时整条阴影射线都不发。

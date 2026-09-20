@@ -1,4 +1,4 @@
-import package::bindings::{gi_cov_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
+import package::bindings::{gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::common::{palette_transmission};
 import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
@@ -230,7 +230,6 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
 
   if (!(h.hit && palette_transmission(h.palette_base, h.pal) <= 0.0)) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
-    textureStore(gi_cov_out, coord, vec4<f32>(0.0));
     gi_res_store_cur(idx, gi_res_none());
     // 降噪导引同步清零：整格清零 ⇒ 键为零 ⇒ 降噪与上采样都当作无效跳过。
     gi_den_guide_store(coord, size, false, 0u, 0u, vec3<f32>(0.0, 0.0, 1.0), false, vec2<i32>(0));
@@ -240,7 +239,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let gg = make_grid(u32(h.obj_id) + 1u);
   let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
   let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
-  let n = voxel_normal(gg, h.voxel, h.n);
+  let n = voxel_normal(gg, h.voxel, h.face_id, h.n);
   // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS：与 `dda_main` 同一套外推（起点离开命中体素）。
   let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
   let org = p_voxel + n * n_off;
@@ -391,7 +390,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   }
   let gi = est * (gi_u.params.z / GI_PI);
   // valid = 1（供 `dda_main` 的天光兜底权重使用）：GI 有数据 ⇒ 天光只占 `GI_AMBIENT_FLOOR` 倍。
+  // 覆盖度 cov 与 valid 是同一个场（旧实现单开一张 `gi_cov_out` 写的恒是「valid ? 1 : 0」），
+  // 所以这里只写这一张、`dda_main` 从 `a` 自取。
   textureStore(gi_out, coord, vec4<f32>(gi, 1.0));
-  // storage texture 的 store 值恒为 vec4（rg32f 也不例外，多出的通道被丢弃）：r = cov、g = valid。
-  textureStore(gi_cov_out, coord, vec4<f32>(1.0, 1.0, 0.0, 0.0));
 }
