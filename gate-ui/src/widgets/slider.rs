@@ -4,10 +4,12 @@
 
 use std::ops::Deref;
 
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{FocusPolicy, Interaction, RelativeCursorPosition};
+use bevy::ui::{Pressed, RelativeCursorPosition};
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px};
+use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::widgets::consts::{THUMB_INSET, THUMB_SIZE, THUMB_SIZE_DRAG, TRACK_HEIGHT};
 
 /// 滑杆根节点标记
@@ -120,13 +122,12 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
   let mut ec = parent.spawn((
     Name::new("ui-slider"),
     UiSlider,
-    Interaction::default(),
+    UiInteractBundle::default(),
     RelativeCursorPosition::default(),
     SliderRange { min: config.min, max: config.max },
     SliderStep(config.step),
     SliderValue(v),
     Node { min_width: px(120.0), height: px(24.0), align_items: AlignItems::Center, ..default() },
-    FocusPolicy::Block,
   ));
   ec.with_children(|root| {
     // flex_grow 撑满内容盒（根宽 - 2*THUMB_INSET）；fill 与 thumb 均以其为包含块
@@ -207,7 +208,8 @@ pub fn slider_drag_system(
   mut commands: Commands,
   mut q: Query<(
     Entity,
-    &Interaction,
+    &Hovered,
+    Has<Pressed>,
     &RelativeCursorPosition,
     &ComputedNode,
     &SliderRange,
@@ -216,8 +218,9 @@ pub fn slider_drag_system(
     Has<UiDisabled>,
   )>,
 ) {
-  for (e, inter, rcp, node, range, step, mut val, disabled) in &mut q {
-    if disabled || *inter != Interaction::Pressed {
+  for (e, hovered, pressed, rcp, node, range, step, mut val, disabled) in &mut q {
+    let inter = UiInteract::of(hovered, pressed);
+    if disabled || inter != UiInteract::Pressed {
       continue;
     }
     let Some(n) = rcp.normalized else { continue };
@@ -248,7 +251,7 @@ pub fn slider_drag_system(
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_visual_system(
   mut q_root: Query<
-    (&SliderValue, &SliderRange, &Interaction, &Children, Has<UiDisabled>),
+    (&SliderValue, &SliderRange, &Hovered, Has<Pressed>, &Children, Has<UiDisabled>),
     With<UiSlider>,
   >,
   mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
@@ -256,10 +259,11 @@ pub fn slider_visual_system(
   q_track_children: Query<&Children, Without<UiSlider>>,
   q_slot_children: Query<&Children, With<SliderThumbSlot>>,
 ) {
-  for (val, range, inter, children, disabled) in &mut q_root {
+  for (val, range, hovered, pressed, children, disabled) in &mut q_root {
+    let inter = UiInteract::of(hovered, pressed);
     let pct = normalize(val.0, range.min, range.max) * 100.0;
     let thumb_size =
-      if !disabled && *inter == Interaction::Pressed { THUMB_SIZE_DRAG } else { THUMB_SIZE };
+      if !disabled && inter == UiInteract::Pressed { THUMB_SIZE_DRAG } else { THUMB_SIZE };
     for child in children.iter() {
       // fill 是 track 的子节点；thumb 在 track 里的行程槽下（再下一层）
       if let Ok(tc) = q_track_children.get(child) {

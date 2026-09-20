@@ -4,12 +4,12 @@
 
 use bevy::prelude::*;
 use bevy::text::{Justify, LineBreak, TextLayout as BevyTextLayout};
-use bevy::ui::{FocusPolicy, Interaction};
 
 use super::consts::*;
 use super::model::{InputField, MenuNode};
 use crate::capture::MouseIntercept;
 use crate::icon::Icon;
+use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::widgets::{
   DropdownConfig, LabelConfig, LabelOverflow, LabelStyle, SliderConfig, TextInputConfig,
   TextInputKind, ToggleSwitchConfig, Tooltip, UiCtx, color_of, dropdown, label, px, slider,
@@ -72,9 +72,9 @@ pub struct MenuColorSwatch {
   pub path: String,
 }
 
-/// 菜单行的按压状态（menu_system 独占；与 button widget 的 `InteractionPrev` 不共享）
+/// 菜单行的按压状态（menu_system 独占；与 button widget 的 `UiInteractPrev` 不共享）
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct MenuPressPrev(pub Interaction);
+pub struct MenuPressPrev(pub UiInteract);
 
 /// 一行的通用外壳（宽 100%、高 `ITEM_H`、横向排列、无分割线）
 fn base_row<'a, 'w>(parent: &'a mut ChildSpawner<'w>, name: &str) -> EntityWorldMut<'a> {
@@ -155,7 +155,7 @@ fn option_button(
     Name::new("menu-option-button"),
     MenuOptionButton,
     MenuItem { path: path.to_string(), role },
-    Interaction::default(),
+    UiInteractBundle::default(),
     MenuPressPrev::default(),
     Node {
       // flex_basis 0 + flex_grow：各按钮等宽（不设 basis 则按文字宽度分配）
@@ -176,7 +176,6 @@ fn option_button(
     },
     BackgroundColor(color_of(&ctx.theme.colors.surface_elevated)),
     BorderColor::all(color_of(&ctx.theme.colors.border)),
-    FocusPolicy::Block,
     MouseIntercept,
   ));
   ec.with_children(|b| {
@@ -209,9 +208,21 @@ pub(crate) fn spawn_item(
   let row = match node {
     MenuNode::SubMenu { label: key, .. } => sub_menu_row(ctx, parent, key, &path),
     MenuNode::Buttons { label: key, items, .. } => buttons_row(ctx, parent, key, items, &path),
-    MenuNode::Slider { label: key, value, min, max, step, decimals, .. } => {
-      slider_row(ctx, parent, key, *value, *min, *max, *step, *decimals, &path)
-    }
+    MenuNode::Slider { label: key, value, min, max, step, decimals, .. } => slider_row(
+      ctx,
+      parent,
+      key,
+      // step <= 0 = 连续（菜单模型用 0 表达「无档位」）
+      SliderConfig {
+        min: *min,
+        max: *max,
+        value: *value,
+        step: (*step > 0.0).then_some(*step),
+        ..default()
+      },
+      *decimals,
+      &path,
+    ),
     MenuNode::SwitchGroup { label: key, options, .. } => {
       switch_group_row(ctx, parent, key, options, &path)
     }
@@ -245,9 +256,8 @@ fn sub_menu_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, path: &str) -
   ec.insert((
     MenuItem { path: path.to_string(), role: MenuRole::SubMenu },
     MenuSubMenuRow,
-    Interaction::default(),
+    UiInteractBundle::default(),
     MenuPressPrev::default(),
-    FocusPolicy::Block,
     MouseIntercept,
   ));
   ec.with_children(|r| {
@@ -299,28 +309,16 @@ fn slider_row(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
   key: &str,
-  value: f32,
-  min: f32,
-  max: f32,
-  step: f32,
+  config: SliderConfig,
   decimals: u32,
   path: &str,
 ) -> Entity {
+  let value = config.value;
   let mut ec = base_row(parent, "menu-slider");
   let row = ec.id();
   ec.with_children(|r| {
     fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
-    let se = *slider(
-      ctx,
-      r,
-      SliderConfig {
-        min,
-        max,
-        value,
-        step: if step > 0.0 { Some(step) } else { None },
-        ..default()
-      },
-    );
+    let se = *slider(ctx, r, config);
     grow_in_row(r.world_mut(), se);
     r.world_mut()
       .entity_mut(se)

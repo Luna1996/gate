@@ -2,8 +2,10 @@
 //! 结构：root（`DebugMenu`，绝对定位）→ title_bar + viewport（overflow clip，收起后 `Display::None`）→ page × 1..2。
 //! `menu_system` 是唯一的交互/布局驱动（独占系统）：读控件状态 → 写回模型 → 发 `MenuActionEvent` → 刷新视觉 → 推进分页动画。
 
+use bevy::picking::Pickable;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{Checked, FocusPolicy, Interaction};
+use bevy::ui::{Checked, Pressed};
 use bevy::window::PrimaryWindow;
 
 use super::consts::*;
@@ -13,6 +15,7 @@ use super::items::{
 use super::model::{MenuFile, MenuNode};
 use crate::capture::MouseIntercept;
 use crate::icon::{Icon, IconFont};
+use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::{
   DropdownValue, LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputValue, UiCtx,
@@ -206,9 +209,8 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
           bottom: color_of(&c.border),
           left: color_of(&c.border),
         },
-        Interaction::default(),
+        UiInteractBundle::default(),
         // 标题栏空白处可拖动窗口
-        FocusPolicy::Block,
         MouseIntercept,
       ))
       .id();
@@ -248,8 +250,7 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
         ..default()
       },
       BackgroundColor(Color::NONE),
-      Interaction::default(),
-      FocusPolicy::Block,
+      UiInteractBundle::default(),
       MouseIntercept,
     ))
     .id();
@@ -298,7 +299,7 @@ fn icon_button(
   let mut ec = parent.spawn((
     Name::new("menu-title-button"),
     action,
-    Interaction::default(),
+    UiInteractBundle::default(),
     MenuPressPrev::default(),
     // 命中区 = 与标题栏同高的正方形（点击范围铺满整格）
     Node {
@@ -309,7 +310,6 @@ fn icon_button(
       ..default()
     },
     BackgroundColor(Color::NONE),
-    FocusPolicy::Block,
     MouseIntercept,
   ));
   let mut icon_e = Entity::PLACEHOLDER;
@@ -392,11 +392,12 @@ fn display_path(model: &MenuFile, path: &[String], translate: impl Fn(&str) -> S
   if ok.is_empty() { "/".to_string() } else { format!("/{}", ok.join("/")) }
 }
 
+/// `ctx_from_world` 返回的四件套：主题 / 正文字体 / 图标字体 / 文案解析器
+type CtxParts =
+  (UiTheme, Option<Handle<Font>>, Option<Handle<Font>>, Option<crate::i18n::TranslatorFn>);
+
 /// 世界 → UiCtx（导航建页时需要；主题/字体/解析器句柄 clone）
-fn ctx_from_world(
-  world: &World,
-) -> Option<(UiTheme, Option<Handle<Font>>, Option<Handle<Font>>, Option<crate::i18n::TranslatorFn>)>
-{
+fn ctx_from_world(world: &World) -> Option<CtxParts> {
   let theme = world.get_resource::<UiTheme>()?.clone();
   let font = world.get_resource::<ThemeFont>().and_then(|f| f.handle.clone());
   let icon = world.get_resource::<IconFont>().and_then(|f| f.handle.clone());
@@ -459,11 +460,11 @@ pub fn menu_system(world: &mut World) {
 
   let mut clicks: Vec<(String, MenuRole)> = Vec::new();
   {
-    let mut q = world.query::<(Entity, &MenuItem, &Interaction)>();
+    let mut q = world.query::<(Entity, &MenuItem, &Hovered, Has<Pressed>)>();
     let hits: Vec<(Entity, String, MenuRole)> = q
       .iter(world)
-      .filter(|(_, _, inter)| matches!(inter, Interaction::Hovered | Interaction::Pressed))
-      .map(|(e, item, _)| (e, item.path.clone(), item.role))
+      .filter(|(_, _, hovered, pressed)| UiInteract::of(hovered, *pressed).is_active())
+      .map(|(e, item, _, _)| (e, item.path.clone(), item.role))
       .collect();
     for (e, path, role) in hits {
       if poll_click(world, e) {
@@ -596,7 +597,6 @@ pub fn menu_system(world: &mut World) {
       menu.go = Some(p);
     }
   }
-  drop(menu);
 
   for e in events {
     world.trigger(e);
@@ -654,14 +654,16 @@ fn clip_path_segments(world: &mut World, root: Entity, path: &[String]) -> Vec<S
   ok
 }
 
-/// 读 Interaction 并把 prev 推进一帧；返回是否「按下后在同节点上释放」（= 点击）
+/// 读交互态并把 prev 推进一帧；返回是否「按下后在同节点上释放」（= 点击）
 fn poll_click(world: &mut World, e: Entity) -> bool {
-  let inter = world.get::<Interaction>(e).copied().unwrap_or(Interaction::None);
+  let hovered = world.get::<Hovered>(e).copied().unwrap_or_default();
+  let pressed = world.get::<Pressed>(e).is_some();
+  let inter = UiInteract::of(&hovered, pressed);
   let prev = world.get::<MenuPressPrev>(e).copied().unwrap_or_default().0;
   if let Some(mut p) = world.get_mut::<MenuPressPrev>(e) {
     p.0 = inter;
   }
-  prev == Interaction::Pressed && inter == Interaction::Hovered
+  prev == UiInteract::Pressed && inter == UiInteract::Hovered
 }
 
 /// 开始一次页面切换：建新页、旧页脱流、启动动画
@@ -885,14 +887,16 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
     (parts.reset_btn, parts.reset_icon, false),
     (parts.collapse_btn, parts.collapse_icon, false),
   ] {
-    let inter = world.get::<Interaction>(btn).copied().unwrap_or(Interaction::None);
+    let hovered = world.get::<Hovered>(btn).copied().unwrap_or_default();
+    let pressed = world.get::<Pressed>(btn).is_some();
+    let inter = UiInteract::of(&hovered, pressed);
     let (bg, fg) = if disabled {
       (Color::NONE, dim_color(text_body))
     } else {
       match inter {
-        Interaction::Pressed => (accent_fill, accent_text),
-        Interaction::Hovered => (surface_overlay, text_primary),
-        Interaction::None => (Color::NONE, text_body),
+        UiInteract::Pressed => (accent_fill, accent_text),
+        UiInteract::Hovered => (surface_overlay, text_primary),
+        UiInteract::None => (Color::NONE, text_body),
       }
     };
     if let Some(mut b) = world.get_mut::<BackgroundColor>(btn)
@@ -900,12 +904,10 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
     {
       b.0 = bg;
     }
-    // 禁用态让指针穿过整格；图标节点须保持 Node 默认 `FocusPolicy::Pass`
-    let focus = if disabled { FocusPolicy::Pass } else { FocusPolicy::Block };
-    if let Some(mut f) = world.get_mut::<FocusPolicy>(btn)
-      && *f != focus
-    {
-      *f = focus;
+    // 禁用态让指针穿过整格（`Pickable::IGNORE`）；恢复态 = `Pickable::default()`（默认阻挡命中）
+    let pickable = if disabled { Pickable::IGNORE } else { Pickable::default() };
+    if world.get::<Pickable>(btn) != Some(&pickable) {
+      world.entity_mut(btn).insert(pickable);
     }
     if let Some(mut t) = world.get_mut::<TextColor>(icon)
       && t.0 != fg
@@ -922,18 +924,24 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
   }
 
   // 选项按钮 / 子菜单行：选中态 + hover 高亮
-  let mut q = world.query::<(Entity, &MenuItem, &Interaction, Option<&Children>)>();
-  let rows: Vec<(Entity, String, MenuRole, Interaction, Vec<Entity>)> = q
+  let mut q = world.query::<(Entity, &MenuItem, &Hovered, Has<Pressed>, Option<&Children>)>();
+  let rows: Vec<(Entity, String, MenuRole, UiInteract, Vec<Entity>)> = q
     .iter(world)
-    .map(|(e, item, inter, ch)| {
-      (e, item.path.clone(), item.role, *inter, ch.map(|c| c.iter().collect()).unwrap_or_default())
+    .map(|(e, item, hovered, pressed, ch)| {
+      (
+        e,
+        item.path.clone(),
+        item.role,
+        UiInteract::of(hovered, pressed),
+        ch.map(|c| c.iter().collect()).unwrap_or_default(),
+      )
     })
     .collect();
   drop(q);
   // 并排按钮的共享竖边（见本循环后的归属修正）：(父容器, 序号, 按钮, 高亮优先级, 边框色)
   let mut shared_edges: Vec<(Entity, usize, Entity, u8, Color)> = Vec::new();
   for (e, path, role, inter, children) in rows {
-    let hovered = inter != Interaction::None;
+    let hovered = inter.is_active();
     // 末位 = 高亮优先级（0 常态 / 1 悬停 / 2 选中）：只有并排按钮用，决定共享竖边归谁
     let (bg, border, fg, prio) = match role {
       MenuRole::SubMenu => {
@@ -1065,10 +1073,12 @@ fn drag_and_clamp(world: &mut World, root: Entity, parts: &MenuParts) {
     q.iter(world).next().and_then(|w| w.cursor_position())
   };
   if just_pressed {
-    let on_title =
-      world.get::<Interaction>(parts.title_bar).is_some_and(|i| *i == Interaction::Pressed);
-    let on_blank =
-      world.get::<Interaction>(parts.viewport).is_some_and(|i| *i == Interaction::Pressed);
+    let inter_of = |e: Entity| {
+      let hovered = world.get::<Hovered>(e).copied().unwrap_or_default();
+      UiInteract::of(&hovered, world.get::<Pressed>(e).is_some())
+    };
+    let on_title = inter_of(parts.title_bar) == UiInteract::Pressed;
+    let on_blank = inter_of(parts.viewport) == UiInteract::Pressed;
     if (on_title || on_blank)
       && let Some(mut m) = world.get_mut::<DebugMenu>(root)
     {
@@ -1113,7 +1123,6 @@ fn drag_and_clamp(world: &mut World, root: Entity, parts: &MenuParts) {
     m.model.window.x = m.model.window.x.clamp(WINDOW_MARGIN, max_x);
     m.model.window.y = m.model.window.y.clamp(WINDOW_MARGIN, max_y);
     let (x, y) = (m.model.window.x, m.model.window.y);
-    drop(m);
     if let Some(mut n) = world.get_mut::<Node>(root) {
       n.left = px(x);
       n.top = px(y);

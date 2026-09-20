@@ -9,18 +9,21 @@ use std::ops::Deref;
 
 use bevy::ecs::message::MessageReader;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::picking::Pickable;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::text::LineBreak;
-use bevy::ui::{ComputedNode, FocusPolicy, Interaction, UiGlobalTransform};
+use bevy::ui::{ComputedNode, Pressed, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
 
 use super::{
-  FontAttrs, InteractionPrev, LabelConfig, LabelStyle, UiCtx, UiDisabled, color_of, dim_color,
-  label, label_bundle_attrs, px, spawn_icon,
+  FontAttrs, LabelConfig, LabelStyle, UiCtx, UiDisabled, color_of, dim_color, label,
+  label_bundle_attrs, px, spawn_icon,
 };
 use crate::capture::MouseIntercept;
 use crate::icon::{Icon, IconFont};
 use crate::menu::consts::WINDOW_MARGIN;
+use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::consts::{DROPDOWN_ANIM_SECS, DROPDOWN_ARROW_SIZE, DROPDOWN_SCROLL_SPEED};
 
@@ -121,7 +124,7 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
   let m = &ctx.theme.metrics;
   let selected = config.selected.min(config.options.len().saturating_sub(1));
   let key = config.options.get(selected).cloned().unwrap_or_default();
-  let (bg, border, text_color) = dropdown_colors(ctx.theme, false, Interaction::None);
+  let (bg, border, text_color) = dropdown_colors(ctx.theme, false, UiInteract::None);
   let (bg, border, text_color) = if config.disabled {
     (dim_color(bg), dim_color(border), dim_color(text_color))
   } else {
@@ -133,8 +136,7 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
     DropdownState::default(),
     DropdownValue(selected),
     DropdownOptions(config.options.clone()),
-    Interaction::default(),
-    InteractionPrev::default(),
+    UiInteractBundle::default(),
     Node {
       min_width: px(56.0),
       // 与输入框同高（文字高 + 上下内距 + 上下边框）
@@ -149,7 +151,6 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
     BackgroundColor(bg),
     BorderColor::all(border),
     // 控件吞掉鼠标事件（点击展开 / 悬停不穿透到菜单行与 3D 场景）
-    FocusPolicy::Block,
     MouseIntercept,
   ));
   if config.disabled {
@@ -187,11 +188,11 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
 }
 
 /// (背景, 边框, 文字) 配色：与输入框同档；展开态 = 输入框编辑态（强调边框），hover 提亮一档
-fn dropdown_colors(theme: &UiTheme, open: bool, inter: Interaction) -> (Color, Color, Color) {
+fn dropdown_colors(theme: &UiTheme, open: bool, inter: UiInteract) -> (Color, Color, Color) {
   let c = &theme.colors;
   let border = if open {
     color_of(&c.accent_text)
-  } else if inter != Interaction::None {
+  } else if inter.is_active() {
     color_of(&c.border_strong)
   } else {
     color_of(&c.border)
@@ -257,10 +258,8 @@ fn spawn_popup(
       BackgroundColor(Color::NONE),
       // 压在所有面板/菜单之上、浮层之下
       GlobalZIndex(DROPDOWN_Z - 1),
-      FocusPolicy::Block,
       MouseIntercept,
-      Interaction::default(),
-      InteractionPrev::default(),
+      UiInteractBundle::default(),
     ))
     .id();
   let popup = commands
@@ -277,7 +276,7 @@ fn spawn_popup(
       },
       BackgroundColor(Color::NONE),
       // 容器只有控件那么大，自身不吃命中（选项各自 Block）
-      FocusPolicy::Pass,
+      Pickable::IGNORE,
       GlobalZIndex(DROPDOWN_Z),
     ))
     .id();
@@ -287,8 +286,7 @@ fn spawn_popup(
         Name::new("ui-dropdown-option"),
         ChildOf(popup),
         DropdownOption { owner, index: i },
-        Interaction::default(),
-        InteractionPrev::default(),
+        UiInteractBundle::default(),
         Node {
           position_type: PositionType::Absolute,
           // 动画每帧写 top = (i - sel) · h · ease(t)；t = 0 时全部叠在锚点矩形上
@@ -311,7 +309,6 @@ fn spawn_popup(
         BackgroundColor(color_of(&c.surface_elevated)),
         BorderColor::all(color_of(&c.border)),
         ZIndex(if i == selected { 2 } else { 1 }),
-        FocusPolicy::Block,
         MouseIntercept,
       ))
       .id();
@@ -366,8 +363,9 @@ pub fn dropdown_system(
   mut q_roots: Query<
     (
       Entity,
-      &Interaction,
-      &mut InteractionPrev,
+      &Hovered,
+      Has<Pressed>,
+      &mut UiInteractPrev,
       &mut DropdownState,
       &DropdownOptions,
       &mut DropdownValue,
@@ -379,11 +377,11 @@ pub fn dropdown_system(
     (With<DropdownRoot>, Without<DropdownOption>),
   >,
   mut q_options: Query<
-    (&Interaction, &mut InteractionPrev, &DropdownOption),
+    (&Hovered, Has<Pressed>, &mut UiInteractPrev, &DropdownOption),
     (Without<DropdownRoot>, Without<DropdownPopup>),
   >,
   mut q_backdrops: Query<
-    (Entity, &Interaction, &mut InteractionPrev, &DropdownBackdrop),
+    (Entity, &Hovered, Has<Pressed>, &mut UiInteractPrev, &DropdownBackdrop),
     (Without<DropdownRoot>, Without<DropdownOption>),
   >,
   q_popups: Query<(Entity, &DropdownPopup)>,
@@ -401,28 +399,42 @@ pub fn dropdown_system(
 
   // ---------- 1. 选项：点击判定 ----------
   let mut clicked: Option<(Entity, usize)> = None;
-  for (inter, mut prev, opt) in &mut q_options {
-    if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
+  for (hovered, pressed, mut prev, opt) in &mut q_options {
+    let inter = UiInteract::of(hovered, pressed);
+    if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
       clicked = Some((opt.owner, opt.index));
     }
-    prev.0 = *inter;
+    prev.0 = inter;
   }
 
   // ---------- 2. 遮罩：点击列表外 ----------
   let mut clicked_outside: Option<Entity> = None;
-  for (_, inter, mut prev, bd) in &mut q_backdrops {
-    if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
+  for (_, hovered, pressed, mut prev, bd) in &mut q_backdrops {
+    let inter = UiInteract::of(hovered, pressed);
+    if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
       clicked_outside = Some(bd.owner);
     }
-    prev.0 = *inter;
+    prev.0 = inter;
   }
 
   // ---------- 3. 控件：选项选中 / 展开 / 收起 / 滚轮改选 ----------
-  for (e, inter, mut prev, mut state, options, mut value, node, xform, visible, disabled) in
-    &mut q_roots
+  for (
+    e,
+    hovered,
+    pressed,
+    mut prev,
+    mut state,
+    options,
+    mut value,
+    node,
+    xform,
+    visible,
+    disabled,
+  ) in &mut q_roots
   {
-    let clicked_self = prev.0 == Interaction::Pressed && *inter == Interaction::Hovered;
-    prev.0 = *inter;
+    let inter = UiInteract::of(hovered, pressed);
+    let clicked_self = prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered;
+    prev.0 = inter;
     if disabled {
       continue;
     }
@@ -443,7 +455,7 @@ pub fn dropdown_system(
       continue;
     }
     // 滚轮改选（满一格动一项，余数留到下一帧）
-    if lines != 0.0 && (state.open || *inter != Interaction::None) {
+    if lines != 0.0 && (state.open || inter.is_active()) {
       state.wheel += lines;
       let steps = state.wheel.trunc();
       if steps != 0.0 {
@@ -491,7 +503,8 @@ pub fn dropdown_visual_system(
     (
       &DropdownValue,
       &DropdownOptions,
-      &Interaction,
+      &Hovered,
+      Has<Pressed>,
       &DropdownState,
       &Children,
       &mut BackgroundColor,
@@ -509,7 +522,15 @@ pub fn dropdown_visual_system(
   mut q_colors: Query<&mut TextColor>,
   mut q_popups: Query<(&mut DropdownPopup, &mut Node), Without<DropdownOption>>,
   mut q_options: Query<
-    (&DropdownOption, &Interaction, &mut Node, &mut BackgroundColor, &mut BorderColor, &Children),
+    (
+      &DropdownOption,
+      &Hovered,
+      Has<Pressed>,
+      &mut Node,
+      &mut BackgroundColor,
+      &mut BorderColor,
+      &Children,
+    ),
     Without<DropdownPopup>,
   >,
 ) {
@@ -529,14 +550,17 @@ pub fn dropdown_visual_system(
   let text_muted = color_of(&c.text_muted);
 
   // ---------- 1. 控件：关闭态文本 + 配色（展开/hover/禁用） ----------
-  for (value, options, inter, state, children, mut bg, mut border_c, disabled) in &mut q_roots {
+  for (value, options, hovered, pressed, state, children, mut bg, mut border_c, disabled) in
+    &mut q_roots
+  {
+    let inter = UiInteract::of(hovered, pressed);
     let selected = value.0.min(options.0.len().saturating_sub(1));
     let key = options.0.get(selected).cloned().unwrap_or_default();
     let shown = match i18n.as_ref() {
       Some(t) => t.resolve(&key),
       None => key.clone(),
     };
-    let (target_bg, target_border, target_text) = dropdown_colors(&theme, state.open, *inter);
+    let (target_bg, target_border, target_text) = dropdown_colors(&theme, state.open, inter);
     let (target_bg, target_border, target_text, arrow_text) = if disabled {
       (
         dim_color(target_bg),
@@ -617,7 +641,10 @@ pub fn dropdown_visual_system(
       let step = DROPDOWN_SCROLL_SPEED * dt;
       popup.sel = if step >= d.abs() { target } else { popup.sel + d.signum() * step };
     }
-    for (opt, inter, mut opt_node, mut opt_bg, mut opt_border, children) in &mut q_options {
+    for (opt, hovered, pressed, mut opt_node, mut opt_bg, mut opt_border, children) in
+      &mut q_options
+    {
+      let inter = UiInteract::of(hovered, pressed);
       if opt.owner != popup.owner {
         continue;
       }
@@ -630,7 +657,7 @@ pub fn dropdown_visual_system(
         opt_node.height = px(size.y);
       }
       // 配色：hover 提亮；选中项与关闭态控件同款（底/边框/主文本色）
-      let hovered = *inter != Interaction::None;
+      let hovered = inter.is_active();
       let (target_bg, target_border, target_text) = if hovered {
         (surface_overlay, border_strong, text_primary)
       } else if opt.index == selected {

@@ -211,6 +211,7 @@ fn brush_box_inside(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent:
 /// 笔触的层级填充（`lo` = 对齐到 `extent` 的块最小角）：整块落在笔触内的走一次
 /// `VolumeGrid::fill_brick`（O(深度)，直接产出 uniform 上级节点），部分覆盖的才下钻，最小到 1³。
 /// `palette` 为 AIR 即擦除；放置只填空气、擦除只挖实体。
+#[allow(clippy::too_many_arguments)] // 递归下钻：参数即递归状态（笔触 + 当前块 + 输出），打包成结构体反而每层重建
 fn fill_brush_level(
   grid: &mut VolumeGrid,
   shape: BrushShape,

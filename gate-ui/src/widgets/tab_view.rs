@@ -4,11 +4,12 @@
 
 use std::ops::Deref;
 
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{FocusPolicy, Interaction};
+use bevy::ui::Pressed;
 
-use super::button::InteractionPrev;
 use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
+use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::UiTheme;
 
 /// 标签页状态（挂在 root 节点上）
@@ -111,8 +112,7 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
             let mut tab_ec = bar.spawn((
               Name::new(format!("ui-tab-{i}")),
               TabButton { index: i },
-              Interaction::default(),
-              InteractionPrev::default(),
+              UiInteractBundle::default(),
               Node {
                 padding: UiRect {
                   left: px(m.spacing.md),
@@ -125,7 +125,6 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
               },
               BackgroundColor(if is_active { color_of(&c.surface_elevated) } else { Color::NONE }),
               BorderColor::all(if is_active { color_of(&c.text_primary) } else { Color::NONE }),
-              FocusPolicy::Block,
             ));
             if is_disabled {
               tab_ec.insert(UiDisabled);
@@ -202,11 +201,11 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
 
 /// 标签页状态机：点击 tab 切换 active（触发 `TabChanged`）+ tab 视觉 + content 可见性。
 /// Disabled tab（带 `UiDisabled`）：跳过点击切换、配色降亮；active 恰为禁用 tab 时仍显示其内容。
-#[allow(clippy::too_many_arguments)] // Bevy system：各 Query 逐一注入
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // Bevy system：各 Query 逐一注入
 pub fn tab_view_system(
   mut commands: Commands,
   mut q_views: Query<(Entity, &mut TabView, &Children)>,
-  mut q_tab: Query<(&TabButton, &Interaction, &mut InteractionPrev, Has<UiDisabled>)>,
+  mut q_tab: Query<(&TabButton, &Hovered, Has<Pressed>, &mut UiInteractPrev, Has<UiDisabled>)>,
   mut q_tab_node: Query<(&mut BackgroundColor, &mut BorderColor, &Children, Has<UiDisabled>)>,
   mut q_tab_text: Query<&mut TextColor>,
   q_children: Query<&Children>,
@@ -229,32 +228,34 @@ pub fn tab_view_system(
       continue;
     };
 
-    // 阶段 1：检测点击更新 active（需 mut InteractionPrev）
+    // 阶段 1：检测点击更新 active（需 mut UiInteractPrev）
     for tab_e in bar_children.iter() {
-      let Ok((tab_btn, inter, mut prev, disabled)) = q_tab.get_mut(tab_e) else {
+      let Ok((tab_btn, hovered, pressed, mut prev, disabled)) = q_tab.get_mut(tab_e) else {
         continue;
       };
+      let inter = UiInteract::of(hovered, pressed);
       if !disabled
-        && prev.0 == Interaction::Pressed
-        && *inter == Interaction::Hovered
+        && prev.0 == UiInteract::Pressed
+        && inter == UiInteract::Hovered
         && view.active != tab_btn.index
       {
         view.active = tab_btn.index;
         commands.trigger(TabChanged { entity: view_e, index: tab_btn.index });
       }
-      prev.0 = *inter;
+      prev.0 = inter;
     }
 
-    // 阶段 2：更新 tab 视觉（只读 InteractionPrev）
+    // 阶段 2：更新 tab 视觉（只读 UiInteractPrev）
     for tab_e in bar_children.iter() {
-      let Ok((tab_btn, inter, _, _)) = q_tab.get(tab_e) else {
+      let Ok((tab_btn, hovered, pressed, _, _)) = q_tab.get(tab_e) else {
         continue;
       };
+      let inter = UiInteract::of(hovered, pressed);
       let is_active = tab_btn.index == view.active;
       let Ok((mut bg, mut bc, tab_children, disabled)) = q_tab_node.get_mut(tab_e) else {
         continue;
       };
-      let hovered = !disabled && *inter != Interaction::None;
+      let hovered = !disabled && inter.is_active();
       let target_bg = if is_active {
         color_of(&c.surface_elevated)
       } else if hovered {

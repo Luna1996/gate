@@ -1,7 +1,7 @@
 [workspace]
 members = ["gate-app", "gate-voxel", "gate-render", "gate-ui"]
-# third_party / vendor 是独立 workspace（本地补丁包），必须排除，否则其成员被吸收进本 workspace
-exclude = ["third_party", "vendor"]
+# third_party 是独立 workspace（本地补丁包），必须排除，否则其成员被吸收进本 workspace
+exclude = ["third_party"]
 resolver = "3"
 
 [workspace.package]
@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 
 # Bevy 精确锁定版本（render graph API 破坏性变更频繁）
 [workspace.dependencies]
-bevy = { version = "=0.19.1", default-features = false, features = [
+bevy = { version = "=0.20.0-rc.1", default-features = false, features = [
   "bevy_winit",
   "bevy_render",
   "bevy_core_pipeline",
@@ -25,6 +25,12 @@ bevy = { version = "=0.19.1", default-features = false, features = [
   "bevy_state",
   # FontSource::SystemUi 所需（不启用时 bevy_text 报错且文本不渲染）
   "system_font_discovery",
+  # CJK 文本分段：bevy_text 透传 parley 的 `complex-scripts`，启用后 icu_segmenter
+  # 载入字典（CJK 断行/断词正确）。缺它则中文整体退化成一个不可断的词
+  "complex_script_segmentation",
+  # UI 指针交互：`Hovered` / `PointerPress|Release|Click` / `Pickable`（0.20 起 `Interaction`
+  # 已 crate 私有化，hover/press 必须走 picking）
+  "ui_picking",
   "multi_threaded",
   "std",
   "default_font",
@@ -33,7 +39,8 @@ bevy = { version = "=0.19.1", default-features = false, features = [
 ] }
 # bevy "trace" 由 profile feature 按需开启，非剖析构建零 span 开销
 # GPU 帧剖析（profile feature）：tracy feature 把 GPU zone 送进 Tracy 时间线
-wgpu-profiler = { version = "0.27", features = ["tracy"] }
+# 版本必须与 bevy 的 wgpu 主版本对齐（0.28 ↔ wgpu 30，即 bevy 0.20）
+wgpu-profiler = { version = "0.28", features = ["tracy"] }
 # CPU 帧剖析（profile feature）：Tracy 客户端，配手写 tracing-subscriber Layer
 tracy-client = "0.18"
 gate-voxel = { path = "gate-voxel" }
@@ -42,8 +49,8 @@ gate-ui = { path = "gate-ui" }
 # 主题令牌 RON 反序列化（版本随 bevy，避免双份编译）
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
-# 对齐表版本；gate-voxel 唯一外部依赖
-glam = "=0.32.1"
+# 对齐表版本（随 bevy 0.20 的 bevy_math，避免双份 glam 编译）
+glam = "=0.33.2"
 # 全量构建并行分块
 rayon = "1"
 # WESL（wgsl 超集）运行时编译为 WGSL；本项目不使用 bevy 的 shader_format_wesl
@@ -57,8 +64,4 @@ incremental = false
 
 [profile.dev.package."*"]
 opt-level = 3
-
-# parley 本地补丁（vendor/parley）：补上 CJK 文本分段（上游 0.9 构造分段器时无复杂文字载荷）
-[patch.crates-io]
-parley = { path = "vendor/parley" }
 

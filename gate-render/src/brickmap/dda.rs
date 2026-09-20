@@ -9,6 +9,7 @@ use bevy::{
   prelude::*,
   render::{extract_resource::ExtractResource, render_resource::*},
 };
+use glam::camera::{rh::proj, rh::view};
 use std::ops::Mul;
 
 /// blit.wgsl 资产路径（全屏三角 blit）
@@ -18,6 +19,7 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
 /// 当前渲染分辨率（main world `resize_render_targets` 更新，提取进 render world）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
 pub struct RenderScale {
   /// 渲染目标尺寸 = 窗口物理像素 ÷ `factor`。
   pub size: UVec2,
@@ -33,6 +35,7 @@ impl Default for RenderScale {
 
 /// 后处理开关（main world 由菜单写，提取进 render world）。
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
 pub struct PostFxSettings {
   /// FXAA：在最终 blit 里做边缘抗锯齿（`blit.wgsl::fs_fxaa`）。
   pub fxaa: bool,
@@ -56,8 +59,8 @@ impl DdaCameraConfig {
     let fovy = 60.0_f32.to_radians();
     let near = 1.0;
     let far = 4000.0;
-    let proj = Mat4::perspective_rh(fovy, aspect, near, far);
-    let view = Mat4::look_at_rh(eye, target, up);
+    let proj = proj::directx::perspective(fovy, aspect, near, far);
+    let view = view::look_at_mat4(eye, target, up);
     let view_proj = proj.mul(view);
     let inv_view_proj = view_proj.inverse();
     Self { view_proj, inv_view_proj, position_world: eye }
@@ -67,6 +70,7 @@ impl DdaCameraConfig {
 /// 调试视图模式（main world Resource，按 N 键循环 0→1→2→0）：
 /// 0 = 正常画面；1 = 法向向量可视化；2 = G-buffer 状态图（sky=品红、face 6 色）
 #[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
 pub struct DebugNormals(pub u32);
 
 /// 相机约束常量（pub 供 gate-app 输入 system 与测试断言）
@@ -120,17 +124,17 @@ impl DdaCameraConfig {
     far: f32,
   ) -> Self {
     let f = forward.normalize();
-    let view = Mat4::look_at_rh(eye, eye + f, Vec3::Y);
-    let proj = Mat4::perspective_rh(fov_y, aspect, near, far);
+    let view = view::look_at_mat4(eye, eye + f, Vec3::Y);
+    let proj = proj::directx::perspective(fov_y, aspect, near, far);
     let view_proj = proj.mul(view);
     Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
   }
 
-  /// orbit 参数 → `perspective_rh` × `look_at_rh`（fov/aspect/near/far 为显式参数）。
+  /// orbit 参数 → `proj::directx::perspective` × `view::look_at_mat4`（fov/aspect/near/far 为显式参数）。
   pub fn from_orbit(orbit: &OrbitCamera, fov_y: f32, aspect: f32, near: f32, far: f32) -> Self {
     let eye = orbit.eye();
-    let view = Mat4::look_at_rh(eye, orbit.target, Vec3::Y);
-    let proj = Mat4::perspective_rh(fov_y, aspect, near, far);
+    let view = view::look_at_mat4(eye, orbit.target, Vec3::Y);
+    let proj = proj::directx::perspective(fov_y, aspect, near, far);
     let view_proj = proj.mul(view);
     Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
   }
@@ -187,6 +191,7 @@ impl DdaViewUniform {
 
 /// DDA 着色器的纹理（main world 创建，提取进 render world）
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
 pub struct DdaImages {
   pub target: Handle<Image>,
 }
@@ -1276,6 +1281,7 @@ fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResM
 /// 眼睛适应（自动曝光）的活参数：由 debug overlay 的「Eye」页实时调，改完下一帧生效。
 /// 下标顺序即语义，与 WESL 侧 `eye_p(i)` 一一对应（改这里必须同步 `main.wesl`）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
 pub struct EyeAdaptSettings {
   /// 总开关：关掉 = 两个 eye pass 停发 + 曝光回落 1.0。不占参数区槽位（host 侧开关）。
   /// 初值见 [`EYE_ADAPT`]（`consts.rs`），之后由 Eye 页开关接管。

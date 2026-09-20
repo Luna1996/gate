@@ -21,9 +21,7 @@ pub mod text_input;
 pub mod toggle_switch;
 pub mod tooltip;
 
-pub use button::{
-  ButtonConfig, ButtonHandle, ButtonVariant, InteractionPrev, UiClick, button, button_state_system,
-};
+pub use button::{ButtonConfig, ButtonHandle, ButtonVariant, UiClick, button, button_state_system};
 pub use checkbox::{
   CheckboxBox, CheckboxConfig, CheckboxHandle, CheckboxToggled, checkbox, checkbox_state_system,
 };
@@ -38,9 +36,7 @@ pub use label::{
   label_ellipsis_system, middle_ellipsis,
 };
 pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
-pub use markdown::{
-  MarkdownConfig, MarkdownHandle, MarkdownView, markdown, markdown_set_text,
-};
+pub use markdown::{MarkdownConfig, MarkdownHandle, MarkdownView, markdown, markdown_set_text};
 pub use panel::{PanelConfig, PanelHandle, PanelSurface, panel};
 pub use plot::{
   PlotCanvas, PlotConfig, PlotData, PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis,

@@ -4,14 +4,14 @@
 
 use std::ops::Deref;
 
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{FocusPolicy, Interaction};
+use bevy::ui::{Checked, Pressed};
 
-use super::button::InteractionPrev;
 use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
+use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::UiTheme;
 use crate::widgets::consts::{TRACK_H, TRACK_W};
-use bevy::ui::Checked;
 
 /// 开关根节点标记
 #[derive(Component, Debug, Default)]
@@ -79,10 +79,8 @@ pub fn toggle_switch(
   let mut ec = parent.spawn((
     Name::new("ui-toggle-switch"),
     ToggleSwitch,
-    Interaction::default(),
-    InteractionPrev::default(),
+    UiInteractBundle::default(),
     Node { align_items: AlignItems::Center, column_gap: px(m.spacing.sm), ..default() },
-    FocusPolicy::Block,
   ));
   ec.with_children(|root| {
     root
@@ -130,8 +128,9 @@ pub fn toggle_switch(
 /// 开关状态机查询集（type alias 满足 clippy::type_complexity）
 type ToggleQuery = (
   Entity,
-  &'static Interaction,
-  &'static mut InteractionPrev,
+  &'static Hovered,
+  Has<Pressed>,
+  &'static mut UiInteractPrev,
   Has<Checked>,
   &'static Children,
   Has<UiDisabled>,
@@ -159,10 +158,11 @@ pub fn toggle_switch_state_system(
   let knob_off = color_of(&c.text_muted);
   let knob_on = color_of(&c.text_primary);
   let left_on = px(TRACK_W - TRACK_H);
-  for (e, inter, mut prev, checked, children, disabled) in &mut q {
+  for (e, hovered, pressed, mut prev, checked, children, disabled) in &mut q {
+    let inter = UiInteract::of(hovered, pressed);
     if !disabled {
       // click = 按下并释放（与 button/checkbox 一致）
-      if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
+      if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
         if checked {
           commands.entity(e).remove::<Checked>();
         } else {
@@ -171,8 +171,8 @@ pub fn toggle_switch_state_system(
         commands.trigger(ToggleSwitchToggled { entity: e, checked: !checked });
       }
     }
-    prev.0 = *inter;
-    let hovered = !disabled && *inter == Interaction::Hovered;
+    prev.0 = inter;
+    let hovered = !disabled && inter == UiInteract::Hovered;
     // 开 → 强调填充轨道 + 主色滑块；关 → 抬升轨道 + 灰滑块（hover 边框提亮）
     let (target_bg, target_border) = if checked {
       (accent, accent)

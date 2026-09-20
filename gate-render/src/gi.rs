@@ -563,25 +563,26 @@ fn prepare_gi(
   let skip_verify = gpu.world_rev == gpu.world_rev_gi;
 
   // ---- uniform（字段与 WESL `GiUniform` 逐字段镜像）----
-  let mut u = GiUniform::default();
-  u.params = Vec4::new(
-    if settings.sun_bounce { 1.0 } else { 0.0 },
-    0.0,
-    crate::consts::GI_GAIN,
-    0.0,
-  );
-  u.misc = Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
-  u.flags = Vec4::new(
-    0.0,
-    settings.div() as f32,
-    if skip_verify { 1.0 } else { 0.0 },
-    // w = 降噪质量档位（0..=3）：`gi_ss_main` 按它取候选数与记忆窗（只有最高档不同）。
-    settings.tier() as f32,
-  );
-  // 整数帧号走 u32 通道（`seq.x`）：`gpu.frame` 本就是 u32，不再经 `params.x` 的 f32 截断。
-  u.seq = UVec4::new(gpu.frame, 0, 0, 0);
-  // 上一帧相机矩阵（时域重投影）：写「上帧真正用过的那一份」，再把本帧存下来。
-  u.prev_view_proj = gpu.prev_view_proj;
+  let u = GiUniform {
+    params: Vec4::new(
+      if settings.sun_bounce { 1.0 } else { 0.0 },
+      0.0,
+      crate::consts::GI_GAIN,
+      0.0,
+    ),
+    misc: Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
+    flags: Vec4::new(
+      0.0,
+      settings.div() as f32,
+      if skip_verify { 1.0 } else { 0.0 },
+      // w = 降噪质量档位（0..=3）：`gi_ss_main` 按它取候选数与记忆窗（只有最高档不同）。
+      settings.tier() as f32,
+    ),
+    // 整数帧号走 u32 通道（`seq.x`）：`gpu.frame` 本就是 u32，不再经 `params.x` 的 f32 截断。
+    seq: UVec4::new(gpu.frame, 0, 0, 0),
+    // 上一帧相机矩阵（时域重投影）：写「上帧真正用过的那一份」，再把本帧存下来。
+    prev_view_proj: gpu.prev_view_proj,
+  };
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
   // 只在真正会跑 `gi_main` 的帧更新「上一帧」⇒ 与上帧写 reservoir 时用的矩阵逐位一致

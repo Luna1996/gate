@@ -284,7 +284,7 @@ impl From<ron::error::SpannedError> for RonLoadError {
   }
 }
 
-/// UiTheme 的 RON 资产加载器（bevy 0.19 无内置 RonAssetPlugin；具体类型避免泛型 TypePath 边界）
+/// UiTheme 的 RON 资产加载器（bevy 上游无内置 RonAssetPlugin；具体类型避免泛型 TypePath 边界）
 #[derive(TypePath)]
 pub struct RonThemeLoader;
 
@@ -468,6 +468,14 @@ impl Plugin for GateUiPlugin {
       .init_resource::<crate::i18n::UiTranslator>()
       .init_resource::<crate::world_anchor::AnchorCamera>()
       .register_asset_loader(RonThemeLoader)
+      // UI 拾取只认显式挂 `Pickable` 的节点：装饰节点（标签/图标/容器）对 picking 不可见，
+      // 等价旧模型里「只有 `FocusPolicy::Block` 才拦命中」（见 pointer 模块）
+      .insert_resource(bevy::ui::picking_backend::UiPickingSettings { require_markers: true })
+      // 指针交互：picking 事件 → 控件根 `Pressed`（见 pointer 模块）
+      .add_observer(crate::pointer::ui_pointer_press)
+      .add_observer(crate::pointer::ui_pointer_release)
+      .add_observer(crate::pointer::ui_pointer_drag_end)
+      .add_observer(crate::pointer::ui_pointer_cancel)
       .add_systems(PreStartup, ui_theme_request)
       .add_systems(
         Update,

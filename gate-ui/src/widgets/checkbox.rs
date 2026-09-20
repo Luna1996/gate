@@ -4,11 +4,12 @@
 
 use std::ops::Deref;
 
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{Checkable, Checked, FocusPolicy, Interaction};
+use bevy::ui::{Checkable, Checked, Pressed};
 
-use super::button::InteractionPrev;
 use super::{UiCtx, UiDisabled, color_of, dim_color, px, spawn_label};
+use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::UiTheme;
 use crate::widgets::consts::BOX_SIZE;
 
@@ -61,11 +62,9 @@ pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) 
     if config.disabled { (dim_color(box_bg), dim_color(box_border)) } else { (box_bg, box_border) };
   let mut ec = parent.spawn((
     Name::new("ui-checkbox"),
-    Interaction::default(),
-    InteractionPrev::default(),
+    UiInteractBundle::default(),
     Checkable,
     Node { align_items: AlignItems::Center, column_gap: px(m.spacing.sm), ..default() },
-    FocusPolicy::Block,
   ));
   ec.with_children(|root| {
     root
@@ -111,8 +110,9 @@ pub fn checkbox(ctx: &UiCtx, parent: &mut ChildSpawner, config: CheckboxConfig) 
 /// 勾选状态机查询集（type alias 满足 clippy::type_complexity）
 type CheckboxQuery = (
   Entity,
-  &'static Interaction,
-  &'static mut InteractionPrev,
+  &'static Hovered,
+  Has<Pressed>,
+  &'static mut UiInteractPrev,
   Has<Checked>,
   &'static Children,
   Has<UiDisabled>,
@@ -133,10 +133,11 @@ pub fn checkbox_state_system(
   let elevated = color_of(&c.surface_elevated);
   let border = color_of(&c.border);
   let border_strong = color_of(&c.border_strong);
-  for (e, inter, mut prev, checked, children, disabled) in &mut q {
+  for (e, hovered, pressed, mut prev, checked, children, disabled) in &mut q {
+    let inter = UiInteract::of(hovered, pressed);
     if !disabled {
       // click = 按下并释放（与 button 一致）
-      if prev.0 == Interaction::Pressed && *inter == Interaction::Hovered {
+      if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
         if checked {
           commands.entity(e).remove::<Checked>();
         } else {
@@ -145,8 +146,8 @@ pub fn checkbox_state_system(
         commands.trigger(CheckboxToggled { entity: e, checked: !checked });
       }
     }
-    prev.0 = *inter;
-    let hovered = !disabled && *inter == Interaction::Hovered;
+    prev.0 = inter;
+    let hovered = !disabled && inter == UiInteract::Hovered;
     // 选中 → 强调填充；未选中 → 抬升表面（hover 边框提亮）
     let (target_bg, target_border) = if checked {
       (accent, accent)

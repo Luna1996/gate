@@ -482,6 +482,7 @@ pub fn buttons(id: &str, label: &str, items: &[&str]) -> MenuNode {
 }
 
 /// 滑动条节点
+#[allow(clippy::too_many_arguments)] // 模型构造器：逐字段镜像 `MenuNode::Slider`，调用点按字段顺序可读
 pub fn slider(
   id: &str,
   label: &str,

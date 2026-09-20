@@ -26,7 +26,8 @@ pub(crate) fn setup(
   config: Res<crate::config::Config>,
 ) {
   let dda_handle = create_dda_image(&mut images);
-  commands.spawn((Camera2d, Msaa::Off));
+  // `UiPickingCamera`：UI 拾取（hover/press）只认挂了它的相机（见 gate_ui::pointer 的 `require_markers` 契约）
+  commands.spawn((Camera2d, Msaa::Off, UiPickingCamera));
   // 光照主题 RON：一次性静态配置，同步读即可；缺失/解析失败回退内置默认主题
   let theme = std::fs::read_to_string(gate_render::assets_dir().join("lighting/day_outdoor.ron"))
     .map_err(|e| format!("read: {e}"))

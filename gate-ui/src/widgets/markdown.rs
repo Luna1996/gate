@@ -328,11 +328,8 @@ impl Renderer<'_> {
   /// 列表：marker 槽定宽（同列表取最长 marker，等宽字体下正文左对齐）+ 内容列
   fn list(&self, parent: &mut ChildSpawner, node: MdNode<'_>, list: NodeList) {
     let size = self.ctx.theme.metrics.font_size.md;
-    let items: Vec<(MdNode<'_>, String)> = node
-      .children()
-      .enumerate()
-      .map(|(i, item)| (item, marker_text(item, list, i)))
-      .collect();
+    let items: Vec<(MdNode<'_>, String)> =
+      node.children().enumerate().map(|(i, item)| (item, marker_text(item, list, i))).collect();
     let max_marker = items.iter().map(|(_, m)| m.chars().count()).max().unwrap_or(1).max(1);
     let gutter = max_marker as f32 * MD_MONO_ADVANCE_EM * size;
     for (item, marker) in items {
@@ -616,7 +613,10 @@ mod tests {
     );
     // 标题字号取 lg 档
     let fs = UiTheme::default().metrics.font_size;
-    assert_eq!(world.get::<TextFont>(blocks[0]).unwrap().font_size, bevy::text::FontSize::Px(fs.lg));
+    assert_eq!(
+      world.get::<TextFont>(blocks[0]).unwrap().font_size,
+      bevy::text::FontSize::Px(fs.lg)
+    );
     // 引用块内只有一个段落
     assert_eq!(children(&world, blocks[4]).len(), 1);
     // 代码块文本不换行

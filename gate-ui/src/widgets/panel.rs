@@ -4,8 +4,8 @@
 
 use std::ops::Deref;
 
+use bevy::picking::Pickable;
 use bevy::prelude::*;
-use bevy::ui::FocusPolicy;
 
 use super::{UiCtx, color_of, px};
 
@@ -70,7 +70,8 @@ pub fn panel(ctx: &UiCtx, parent: &mut ChildSpawner, config: PanelConfig) -> Pan
       },
       BackgroundColor(bg),
       BorderColor::all(border),
-      FocusPolicy::Block,
+      // 面板表面拦下命中（旧 `FocusPolicy::Block`）：指针落在面板上即被 UI 捕获
+      Pickable::default(),
     ))
     .id();
   PanelHandle(e)

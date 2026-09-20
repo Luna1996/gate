@@ -6,10 +6,12 @@ use std::ops::Deref;
 
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{FocusPolicy, Interaction};
+use bevy::ui::Pressed;
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px};
+use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::theme::UiTheme;
 use crate::widgets::consts::{CARET_CHAR, DRAG_THRESHOLD_PX, NUMBER_DRAG_PX_PER_STEP};
 
@@ -137,7 +139,7 @@ pub fn text_input(
   config: TextInputConfig,
 ) -> TextInputHandle {
   let m = &ctx.theme.metrics;
-  let (bg, border, text_color) = input_colors(ctx.theme, false, Interaction::None);
+  let (bg, border, text_color) = input_colors(ctx.theme, false, UiInteract::None);
   let (bg, border, text_color) = if config.disabled {
     (dim_color(bg), dim_color(border), dim_color(text_color))
   } else {
@@ -146,7 +148,7 @@ pub fn text_input(
   let mut ec = parent.spawn((
     Name::new("ui-text-input"),
     TextInputRoot,
-    Interaction::default(),
+    UiInteractBundle::default(),
     TextInputState::default(),
     TextInputValue(config.text.clone()),
     config.kind,
@@ -163,7 +165,6 @@ pub fn text_input(
     BackgroundColor(bg),
     BorderColor::all(border),
     // 输入框吞掉鼠标事件（拖拽调值 / 点击聚焦都不外泄到 3D 场景）
-    FocusPolicy::Block,
     crate::capture::MouseIntercept,
   ));
   if config.disabled {
@@ -187,12 +188,12 @@ pub fn text_input(
 }
 
 /// (背景, 边框, 文字) 配色：编辑态 → 强调边框；hover → 强边框；否则普通边框
-fn input_colors(theme: &UiTheme, editing: bool, inter: Interaction) -> (Color, Color, Color) {
+fn input_colors(theme: &UiTheme, editing: bool, inter: UiInteract) -> (Color, Color, Color) {
   let c = &theme.colors;
   let bg = color_of(&c.surface_elevated);
   let border = if editing {
     color_of(&c.accent_text)
-  } else if inter != Interaction::None {
+  } else if inter.is_active() {
     color_of(&c.border_strong)
   } else {
     color_of(&c.border)
@@ -209,7 +210,8 @@ pub fn text_input_pointer_system(
   mut focus: ResMut<TextInputFocus>,
   mut q: Query<(
     Entity,
-    &Interaction,
+    &Hovered,
+    Has<Pressed>,
     &TextInputKind,
     &mut TextInputValue,
     &mut TextInputState,
@@ -222,12 +224,13 @@ pub fn text_input_pointer_system(
   if !pressed && !held && !released {
     return;
   }
-  for (e, inter, kind, mut value, mut st, disabled) in &mut q {
+  for (e, hovered, is_pressed, kind, mut value, mut st, disabled) in &mut q {
+    let inter = UiInteract::of(hovered, is_pressed);
     if disabled {
       continue;
     }
     // 落在别的控件上的按下 → 提交并退出编辑态
-    if pressed && *inter == Interaction::None && st.editing {
+    if pressed && inter == UiInteract::None && st.editing {
       st.editing = false;
       if focus.0 == Some(e) {
         focus.0 = None;
@@ -236,7 +239,7 @@ pub fn text_input_pointer_system(
       continue;
     }
     if pressed {
-      st.armed = *inter != Interaction::None;
+      st.armed = inter.is_active();
       st.accum = 0.0;
       st.dragging = false;
       st.start_value = kind.parse(&value.0).unwrap_or_else(|| kind.min());
@@ -359,7 +362,8 @@ pub fn text_input_visual_system(
     &TextInputValue,
     &TextInputState,
     &TextInputKind,
-    &Interaction,
+    &Hovered,
+    Has<Pressed>,
     &mut BackgroundColor,
     &mut BorderColor,
     &Children,
@@ -368,8 +372,9 @@ pub fn text_input_visual_system(
   mut q_text: Query<(&mut Text, &mut TextColor)>,
 ) {
   let Some(theme) = theme else { return };
-  for (value, st, kind, inter, mut bg, mut border, children, disabled) in &mut q {
-    let (target_bg, target_border, target_text) = input_colors(&theme, st.editing, *inter);
+  for (value, st, kind, hovered, pressed, mut bg, mut border, children, disabled) in &mut q {
+    let inter = UiInteract::of(hovered, pressed);
+    let (target_bg, target_border, target_text) = input_colors(&theme, st.editing, inter);
     let (target_bg, target_border, target_text) = if disabled {
       (dim_color(target_bg), dim_color(target_border), dim_color(target_text))
     } else {

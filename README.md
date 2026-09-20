@@ -58,7 +58,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### 已知限制 / 待办（不阻塞当前开发）
 
-- **没有自动化测试与 CI**：workspace 0 个 `#[test]`（仅 `vendor/parley` 除外），回归靠手工验收 + 日志。
+- **没有自动化测试与 CI**：workspace 0 个 `#[test]`，回归靠手工验收 + 日志。
 - **文档缺口**：代码注释引用的 `docs/brickmap.md`、`docs/decisions.md`（ADR-0001/0002/0005）、`docs/ui-dark-theme.md` 尚未落盘；`docs/` 目前只有 Douglas 开发日志转录（`docs/douglas/`）与早期光照截图（`docs/screenshots/`）。
 - **正式 sim tick 未实现**：StateTable 只有数据通路与上传，没有逐帧模拟系统驱动它。
 - **WorldAnchor 不做体素遮挡判断**（永远绘制在最上层）。
@@ -162,7 +162,12 @@ gate-ui/           自研 bevy_ui 组件库 + 调试菜单 + 世界标签
                    - theme.rs       UiTheme（RON 资产 + 内置暗色默认）、令牌（颜色/圆角/间距/字号）、UiScale
                    - icon.rs        FontAwesome 字形（菜单标题栏按钮与箭头）
                    - i18n.rs        UiTranslator：key → 文案解析器（切语言后整体重解析）
-                   - capture.rs     UI 指针捕获 / 命中测试（**不是**截图工具）
+                   - capture.rs     UI 指针门控（**不是**截图工具）：`UiPointerCaptured` 由 picking
+                                    悬停映射得出、`MouseIntercepted` 由 `MouseIntercept` 节点的
+                                    悬停态得出（半透明遮罩等「吞掉鼠标」语义挂 `MouseIntercept`）
+                   - pointer.rs     指针交互基座：picking 的 `Hovered`（悬停）+ 观察者维护的
+                                    `Pressed`（按住）→ 控件侧 `UiInteract`（None/Hovered/Pressed）；
+                                    `UiInteractBundle` 是交互控件根三件套（含 `Pickable` 命中标记）
                    - world_anchor.rs WorldAnchor：世界坐标 → 屏幕像素标签（距离缩放、延迟文本）
                    - widgets/       16 个组件：Panel / Label / Button / Slider / Checkbox / ToggleSwitch /
                                     Dropdown / Plot（折线）/ List（环形日志）/ ScrollView / Splitter /
@@ -310,6 +315,9 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
    （现象 = "开了没变化"）。
 8. **UI 指针捕获闸门**：相机拖拽 / 滚轮 / 编辑射线都要查 `UiPointerCaptured` + `MouseIntercepted`，
    否则操作菜单会同时驱动相机；文本输入框编辑态（`TextInputFocus`）还要挡键盘。
+   两者的判定在 `gate-ui/src/capture.rs`：UI picking 开了 `UiPickingSettings::require_markers`
+   （GateUiPlugin 里），要求**相机挂 `UiPickingCamera`、节点挂 `Pickable`** 才参与命中
+   ⇒ 装饰节点对命中不可见，与旧 `FocusPolicy`（只有 `Block` 才拦命中）等价。
 9. **`scale_factor_override = 1.0` 必须每帧重设**：winit 在 resize / 跨显示器时会把 scale factor 刷回
    OS DPI，导致 UI 1px 边框抗锯齿发虚、文字模糊。
 10. **UI 必须等字体资产加载完成再 spawn**：否则 TextPipeline 会把字形缓存进不含 CJK 的默认 slot →

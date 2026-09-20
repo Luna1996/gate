@@ -18,7 +18,7 @@ pub struct DdaShaderHandle(pub Handle<Shader>);
 
 /// 编译 DDA 的 WESL 包，返回展平后的 WGSL。
 pub fn compile_dda_wesl() -> Result<String, wesl::Error> {
-  compile_wesl_entry(&dda_wesl_dir().join("main.wesl"))
+  compile_wesl_entry(dda_wesl_dir().join("main.wesl"))
 }
 
 /// 编译 `entry` 所在目录的 WESL 包，返回展平后的 WGSL。

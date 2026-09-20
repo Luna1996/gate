@@ -84,7 +84,7 @@ impl CameraPose {
   }
 
   /// 还原轨道参数：`target = eye − distance·dir`，与 `OrbitCamera::eye()` 互为逆运算。
-  pub fn to_orbit(&self) -> OrbitCamera {
+  pub fn to_orbit(self) -> OrbitCamera {
     let dir = look_forward(self.yaw, self.pitch) * -1.0;
     let mut o = OrbitCamera {
       target: self.eye_vec() - dir * self.distance,

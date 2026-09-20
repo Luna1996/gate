@@ -1,11 +1,13 @@
 //! gate-ui：bevy_ui 之上的自研组件库基座。
-//! 三层结构：主题令牌（theme）→ widget 层（widgets）→ 输入门控（capture）；只依赖 bevy + serde/ron。
+//! 三层结构：主题令牌（theme）→ widget 层（widgets）→ 交互基座（pointer）/ 输入门控（capture）；
+//! 只依赖 bevy + serde/ron。
 
 pub mod capture;
 pub mod consts;
 pub mod i18n;
 pub mod icon;
 pub mod menu;
+pub mod pointer;
 pub mod theme;
 pub mod widgets;
 pub mod world_anchor;
@@ -18,6 +20,7 @@ pub use menu::{
   MenuItem, MenuNode, MenuRole, MenuTextValue, MenuValue, WindowState, menu_model, menu_selected,
   menu_system, menu_text, menu_toggle, menu_value, spawn_debug_menu,
 };
+pub use pointer::{UiInteract, UiInteractBundle, UiInteractPrev, UiInteractable};
 pub use world_anchor::{
   AnchorBaseFont, AnchorCamera, WorldAnchor, anchor_distance_scale, project_to_screen,
   world_anchor_label, world_anchor_system,
@@ -32,10 +35,10 @@ pub use widgets::{
   ButtonConfig, ButtonHandle, ButtonVariant, CheckboxBox, CheckboxConfig, CheckboxHandle,
   CheckboxToggled, DropdownArrow, DropdownBackdrop, DropdownChanged, DropdownConfig,
   DropdownHandle, DropdownOption, DropdownOptions, DropdownPopup, DropdownRoot, DropdownState,
-  DropdownText, DropdownValue, EllipsisText, FontAttrs, GridConfig, GridHandle, InteractionPrev,
-  LabelConfig, LabelHandle, LabelOverflow, LabelStyle, ListConfig, ListHandle, MarkdownConfig,
-  MarkdownHandle, MarkdownView, PanelConfig, PanelHandle, PanelSurface, PlotCanvas, PlotConfig,
-  PlotData, PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis, RingList, ScrollConfig,
+  DropdownText, DropdownValue, EllipsisText, FontAttrs, GridConfig, GridHandle, LabelConfig,
+  LabelHandle, LabelOverflow, LabelStyle, ListConfig, ListHandle, MarkdownConfig, MarkdownHandle,
+  MarkdownView, PanelConfig, PanelHandle, PanelSurface, PlotCanvas, PlotConfig, PlotData,
+  PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis, RingList, ScrollConfig,
   ScrollContent, ScrollView, ScrollViewHandle, ScrollViewport, SliderConfig, SliderHandle,
   SliderRange, SliderStep, SliderThumb, SliderValue, SliderValueChanged, TabButton, TabChanged,
   TabConfig, TabContent, TabView, TabViewHandle, TableCell, TableConfig, TableHandle,

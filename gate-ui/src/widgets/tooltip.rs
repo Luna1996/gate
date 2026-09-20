@@ -1,10 +1,12 @@
 //! tooltip：任意控件可挂的悬浮提示（停留超时后显示）。用法：`entity_mut(*handle).insert(Tooltip::new("文案"))`。
 //! 提示文案按 Markdown 渲染（见 `markdown`），内容变化才重建。
-//! 命中判定：控件带 `Interaction` 用其状态（被上层遮挡时为 `None`），否则用 `ComputedNode::contains_point`。
+//! 命中判定：控件带 `Hovered` 用其状态（被上层遮挡时为 `false`），否则用 `ComputedNode::contains_point`。
 //! 提示框全局唯一（懒创建）、绝对定位，位置在首次展示时钉住（同锚点内移动不跟随）。
 
+use bevy::picking::Pickable;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{ComputedNode, FocusPolicy, Interaction, UiGlobalTransform};
+use bevy::ui::{ComputedNode, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
 
 use super::markdown::{MarkdownConfig, MarkdownView, markdown_root, markdown_set_text};
@@ -49,7 +51,7 @@ pub struct TooltipHoverState {
 }
 
 /// 悬浮判定 + 延时展示。每帧最多展示一个提示（命中节点中面积最小者 = 纵深最内层）。
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)] // Bevy system：各 Query/Res 逐一注入
 pub fn tooltip_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -62,7 +64,7 @@ pub fn tooltip_system(
   owners: Query<(
     Entity,
     &Tooltip,
-    Option<&Interaction>,
+    Option<&Hovered>,
     &ComputedNode,
     &UiGlobalTransform,
     Option<&InheritedVisibility>,
@@ -75,12 +77,12 @@ pub fn tooltip_system(
   let mut best: Option<(Entity, &Tooltip)> = None;
   let mut best_area = f32::MAX;
   if let Some(cursor) = physical {
-    for (e, tip, inter, node, transform, vis) in &owners {
+    for (e, tip, hover, node, transform, vis) in &owners {
       if !vis.is_some_and(|v| v.get()) || node.size() == Vec2::ZERO {
         continue;
       }
-      let hovered = match inter {
-        Some(i) => *i != Interaction::None,
+      let hovered = match hover {
+        Some(h) => h.get(),
         None => node.contains_point(*transform, cursor),
       };
       if !hovered {
@@ -173,7 +175,7 @@ fn ensure_layer(commands: &mut Commands, res: &mut TooltipLayerEntity, theme: &U
       BackgroundColor(color_of(&c.surface_overlay)),
       BorderColor::all(color_of(&c.border_strong)),
       // 提示框自身不参与命中：不吃 hover、不挡下层
-      FocusPolicy::Pass,
+      Pickable::IGNORE,
       GlobalZIndex(TOOLTIP_Z),
     ))
     .with_children(|p| {
@@ -181,10 +183,7 @@ fn ensure_layer(commands: &mut Commands, res: &mut TooltipLayerEntity, theme: &U
       p.spawn((
         Name::new("ui-tooltip-text"),
         TooltipText,
-        markdown_root(
-          theme,
-          &MarkdownConfig { text: String::new(), dense: true, max_width: None },
-        ),
+        markdown_root(theme, &MarkdownConfig { text: String::new(), dense: true, max_width: None }),
       ));
     })
     .id();

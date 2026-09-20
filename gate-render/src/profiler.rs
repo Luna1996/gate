@@ -167,7 +167,8 @@ fn resolve_profiler_queries(
       label: Some("wgpu_profiler_resolve"),
     });
   profiler.resolve_queries(&mut encoder);
-  pending.push_encoder(encoder);
+  // 第二参数是 bevy 0.20 新增的 encoder label（只在 `trace` feature 下消费）
+  pending.push_encoder(encoder, "wgpu_profiler_resolve");
 }
 
 /// Finish 集（submit 已完成）：结束本帧并处理已就绪帧（tracy 模式自动上报）。

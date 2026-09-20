@@ -71,6 +71,7 @@ pub struct SkyCfg {
 #[derive(
   Debug, Clone, PartialEq, Resource, Deserialize, bevy::render::extract_resource::ExtractResource,
 )]
+#[extract_app(bevy::render::RenderApp)]
 pub struct LightingTheme {
   pub sun: Option<DirLightCfg>,
   pub ambient: [f32; 3],

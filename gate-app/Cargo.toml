@@ -26,7 +26,7 @@ glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }
 gate-ui = { workspace = true }
-# 日志落盘（版本对齐 bevy_log 0.19.1 的 subscriber）；"time" = 本地时区时间戳
+# 日志落盘（版本对齐 bevy_log 0.20 的 subscriber）；"time" = 本地时区时间戳
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["time"] }
 tracing-appender = "0.2"

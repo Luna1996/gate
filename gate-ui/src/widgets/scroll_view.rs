@@ -6,10 +6,12 @@ use std::ops::Deref;
 
 use bevy::ecs::message::MessageReader;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{ComputedNode, FocusPolicy, Interaction, Overflow};
+use bevy::ui::{ComputedNode, Overflow, Pressed};
 
 use super::{UiCtx, color_of, px};
+use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::widgets::consts::SCROLL_SPEED;
 
 /// 滚动视图状态（挂在 viewport 节点上）
@@ -68,7 +70,7 @@ pub fn scroll_view(
       Name::new("ui-scroll-view"),
       ScrollView::default(),
       ScrollViewport,
-      Interaction::default(),
+      UiInteractBundle::default(),
       Node {
         width: Val::Percent(100.0),
         height: config.height,
@@ -78,7 +80,6 @@ pub fn scroll_view(
       },
       BackgroundColor(Color::NONE),
       BorderColor::all(color_of(&c.border)),
-      FocusPolicy::Block,
     ))
     .with_children(|vp| {
       content_e = Some(
@@ -104,9 +105,13 @@ pub fn scroll_view(
 }
 
 /// 滚轮滚动系统：累加本帧 MouseWheel.y，更新悬停中 viewport 的 scroll_y
+#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn scroll_view_system(
   mut scroll_reader: MessageReader<MouseWheel>,
-  mut q_vp: Query<(&mut ScrollView, &Interaction, &Children, &ComputedNode), With<ScrollViewport>>,
+  mut q_vp: Query<
+    (&mut ScrollView, &Hovered, Has<Pressed>, &Children, &ComputedNode),
+    With<ScrollViewport>,
+  >,
   mut q_content: Query<(&mut Node, &ComputedNode), With<ScrollContent>>,
 ) {
   // 滚轮 y 正值 = 向上滚，scroll_y 增大（趋向 0）；Pixel 单位（触控板）按 16px 行高折算成行。
@@ -121,8 +126,9 @@ pub fn scroll_view_system(
     return;
   }
   let delta = lines * SCROLL_SPEED; // 滚轮上 → scroll_y 增大（内容下移）
-  for (mut sv, inter, children, vp_computed) in &mut q_vp {
-    if *inter == Interaction::None {
+  for (mut sv, hovered, pressed, children, vp_computed) in &mut q_vp {
+    let inter = UiInteract::of(hovered, pressed);
+    if !inter.is_active() {
       continue;
     }
     let vp_h = vp_computed.size.y;
