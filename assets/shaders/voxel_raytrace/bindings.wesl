@@ -98,59 +98,35 @@ struct LightPool {
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
 
-// ===== 逐 (体素,面) 辐照度缓存（GI 路径）=====
+// ===== GI（屏幕空间逐面 ReSTIR）=====
 // uniform 与 Rust `GiUniform` 逐字段镜像（字节一致）。
 struct GiUniform {
-  // x = 保留（恒 0，帧计数器已迁到 `seq.x`：帧号必须是精确 u32，见下）、
-  // y = 保留（恒 0）、z = GI 增益、w = 当前世代号（变化失效：太阳/天光/世界全量变化时 Rust 自增）
+  // x = 保留（恒 0）、y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
   params: vec4<f32>,
   // x = GI 开关、yzw = 保留（恒 0）
   misc: vec4<f32>,
   // x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率，2 = 半分辨率；整数值的 f32，只被
   // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
-  // z = 世界几何相对「写入上一帧 reservoir 的那一帧」是否**逐位未变**（1 = 未变）⇒ 屏幕空间路径
-  // 可跳过时域二次顶点键验证射线（见 `gi/screen.wesl` ② 与 `prepare_gi` 的 `world_rev`）、w = 保留
+  // z = 世界几何相对「写入上一帧 reservoir 的那一帧」是否**逐位未变**（1 = 未变）⇒
+  // 屏幕空间路径可跳过时域二次顶点键验证射线（见 `gi/screen.wesl` ① 与 `prepare_gi` 的 `world_rev`）、
+  // w = 保留（恒 0）
   flags: vec4<f32>,
-  // xyz = 脏盒 0（主世界编辑）的世界 voxel AABB min、w = 本帧脏盒数（0 = 无脏区）
-  dirty_min: vec4<f32>,
-  // xyz = 同上 AABB max（开区间）、w = 盒 0 的失效余量（voxel，按 volume scale 放大）
-  dirty_max: vec4<f32>,
   // x = 自增帧号（精确 u32；yzw = 保留，恒 0）。
-  // **所有整数帧逻辑只用本字段**：轮转起点、条目 `[10]`「本帧已处理」去重、可见 claim、
-  // RNG 种子混入。帧号曾经以 f32 存在 `params.x` —— 超过 2^24 后 f32 无法表示连续整数，
-  // 上述判断会偶发失效（同一帧被处理两次 / 轮转分片错位 / claim 误判）。
-  // 无符号回绕（约 4.29e9 帧 ≈ 2.3 年连续 60fps）后 claim 的「frame == 已 claim」可能误判一次
-  // （该条目本帧不 append），属可忽略；回绕后轮转分片与去重仍自洽。
+  // **所有整数帧逻辑只用本字段**（本帧的 RNG 种子混入、像素 hash）。帧号曾经以 f32 存在
+  // `params.x` —— 超过 2^24 后 f32 无法表示连续整数，种子会偶发重复；`gpu.frame` 本就是 u32，
+  // 这里逐字镜像、不再经 f32。
   seq: vec4<u32>,
-  // 上一帧的相机矩阵（**屏幕空间 GI 的时域复用**用：把本帧主命中点重投影到上帧的 GI 网格）。
+  // 上一帧的相机矩阵（时域复用：把本帧主命中点重投影到上帧的 GI 网格）。
   // Rust `prepare_gi` 每帧把当前矩阵存下、把上一帧的写进这里 ⇒ 与上帧 `gi_main` 实际用的逐位一致。
-  // 只用到 `prev_view_proj`（重投影三维点不需要逆矩阵；`prev_inv_view_proj` 留给后续步骤）。
+  // 只用到 `prev_view_proj`（重投影三维点不需要逆矩阵）。
   prev_view_proj: mat4x4<f32>,
-  prev_inv_view_proj: mat4x4<f32>,
 };
 @group(4) @binding(0) var<uniform> gi_u: GiUniform;
-/// 13：条目表（每条目 `GI_CACHE_ENTRY_WORDS` 个 word，布局见 `gi/cache.wesl` 头部）
-@group(4) @binding(13) var<storage, read_write> gi_cache: array<u32>;
-/// 14：哈希桶 → 「条目下标 + 1」（0 = 空）。键先写、桶后 CAS ⇒ 读到桶就能读到完整条目。
-@group(4) @binding(14) var<storage, read_write> gi_cache_hash: array<atomic<u32>>;
-/// 15：`[0]` = 条目分配游标（原子自增）；`[1]` = 回收扫描游标（分配游标耗尽时从它起找一个可复用槽位）。
-/// 回收（`gi/cache.wesl` 的 `gi_cache_evict` / `gi_reclaim_slot`）把久未露面的条目就地腾出，
-/// 由新条目复用 ⇒ 缓存是有界工作集，不是「满了就永远建不出条目」。
-@group(4) @binding(15) var<storage, read_write> gi_cache_state: array<atomic<u32>>;
-/// 16：可见条目紧凑列表（容量 `GI_CACHE_VISIBLE_CAPACITY`）：着色侧 claim 后 append 条目下标，更新 pass 可见段消费。
-@group(4) @binding(16) var<storage, read_write> gi_vis_list: array<u32>;
-/// 17：`[0]` = 本帧可见列表长度（着色侧原子自增；Rust 每帧在更新 pass 之前清零）。
-@group(4) @binding(17) var<storage, read_write> gi_vis_count: array<atomic<u32>>;
-/// 18：脏盒 1..`GI_CACHE_DIRTY_BOXES`-1（`GI_CACHE_DIRTY_BOXES` × 2 个 vec4）：盒 `k` =
-/// `[2k]` (min.xyz, 余量)、`[2k+1]` (max.xyz, 0)。盒 0 在 `gi_u.dirty_min/dirty_max`。见 `gi_dirty_hit`。
-@group(4) @binding(18) var<storage, read_write> gi_dirty_boxes: array<vec4<f32>>;
-/// 19：单帧可见 claim（`GI_CACHE_SLOTS` 个 atomic）：`atomicExchange(claim[idx], frame)` 精确保证
-/// 「每条目每帧只 append 一次」。frame = `gi_u.seq.x`，从 1 起（Rust 每帧自增后才写 uniform），0 = 未 claim。
-@group(4) @binding(19) var<storage, read_write> gi_seen_claim: array<atomic<u32>>;
-/// 20/21：**屏幕空间逐面 ReSTIR** 的 reservoir 双缓冲（`GI_CACHE_ON = false` 时的主路径）。
+/// 20/21：**屏幕空间逐面 ReSTIR** 的 reservoir 双缓冲。
 /// 每 GI 像素一个 reservoir（`GI_RES_WORDS` 个 word，布局见 `gi/screen.wesl`）；
-/// 20 = **本帧写入**（目标）、21 = **上一帧读出**（时域重投影 + 空间同键复用源）。
+/// 20 = **本帧写入**（目标）、21 = **上一帧读出**（时域重投影 + 空间复用源）。
 /// Rust 侧每帧 ping-pong 换绑同一对 buffer ⇒ 20 与 21 恒是不同块。
+/// 20 里**只**有「新鲜 + 时域」的结果：空间复用的合并量绝不回写（见 `gi/screen.wesl` 文件头 ②）。
 @group(4) @binding(20) var<storage, read_write> gi_res_cur: array<u32>;
 @group(4) @binding(21) var<storage, read_write> gi_res_prev: array<u32>;
 

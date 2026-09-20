@@ -1736,9 +1736,8 @@ pub(crate) fn prepare_dda_bind_groups(
     beam_cache.gi_size = gi_size;
     // 屏幕空间路径的 reservoir 双缓冲（每像素 `GI_RES_WORDS` 个 u32）：随分辨率重建，
     // 新 buffer 由 wgpu 清零 ⇒ `M = 0`（无历史）⇒ 换分辨率后第一帧只走新鲜路径。
-    let res_bytes = gi_size.x as u64 * gi_size.y as u64
-      * crate::wesl_consts::gi_consts().gi_res_words as u64
-      * 4;
+    let res_bytes =
+      gi_size.x as u64 * gi_size.y as u64 * crate::wesl_consts::gi_consts().gi_res_words as u64 * 4;
     let make_res = |label: &str| {
       render_device.create_buffer(&BufferDescriptor {
         label: Some(label),

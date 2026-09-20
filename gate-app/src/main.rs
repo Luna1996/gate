@@ -193,7 +193,6 @@ fn main() {
   app.run();
 }
 
-
 /// profile 构建：WgpuSettings 开 wgpu timestamp 特性（wgpu-profiler GPU zone 必需），
 /// 包进 RenderCreation 供 RenderPlugin 使用。
 #[cfg(feature = "profile")]

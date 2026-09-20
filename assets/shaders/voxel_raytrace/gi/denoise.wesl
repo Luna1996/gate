@@ -1,5 +1,5 @@
 import package::bindings::{gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_tmp, gi_guide, gi_guide_out, gi_hist_cur, gi_hist_prev, gi_raw_tex};
-import package::gi::cache::{gi_pack_dir, gi_unpack_dir};
+import package::gi::common::{gi_pack_dir, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_POS, GI_DEN_G_PREV, GI_DEN_G_TOL, GI_DEN_G_VALID, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_HIST_WORDS, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_W_HIST_MIN, GI_LUMA};
 
 // ============================================================================
@@ -174,7 +174,15 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   gi_den_phi[idx] = GI_DEN_LUMA_K * max(sigma, 1e-5);
   // ③ 本帧输入 = **同面键邻域的均值**（同一个面内的像素是同一个积分 ⇒ 先面内平均再进时域累积）。
   // 单像素面（n3 = 1）退化成中心像素本身 ⇒ 不改变旧行为。
-  let c_in = select(c_raw, c3 / max(n3, 1.0), n3 > 1.5);
+  var c_in = select(c_raw, c3 / max(n3, 1.0), n3 > 1.5);
+  // ③′ **离群抑制**（NRD pre-blur 的角色，热插在本 pass 里而不是单开一趟）：
+  // GI 的原始估计是重尾分布（4 条候选里偶尔有一条打到强光面 ⇒ 离群亮点）。不压掉的话
+  // 它会在时域里被反复加权、再被 atrous 摊成一片，表现为「偶发亮斑 + 逐帧闪烁」。
+  // 用**共面邻域**的均值 ± K × 标准差做一次钳制即可；同面键均值（`c_in` 的来源）本身
+  // 已经是面内平均，两者叠加后离群值进不了累积。
+  if (cnt > 1.5) {
+    c_in = clamp(c_in, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
+  }
 
   // ---- ② 历史校验（精确面键，逐位相等）+ ④ AABB 钳制 + ③ 历史权重 ----
   var color = c_in;

@@ -1,18 +1,28 @@
+import package::bindings::{light_u};
 import package::common::{palette_albedo, palette_emissive, palette_transmission, sky_rgb};
-import package::gi::cache::{gi_cache_peek, gi_key0, gi_key1, gi_key_ok};
-import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_RADIANCE_SCALE, GI_SUN_BOUNCE, GI_T_MAX, SHADOW_SURFACE_EPS};
+import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
+import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_SUN_BOUNCE, GI_T_MAX, SHADOW_SURFACE_EPS};
+import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast, world_trace_medium, voxel_normal};
 
 // ============================================================================
-// 单条 GI 射线的辐射求值（**唯一口径**，两条路径共用）。
+// 单条 GI 射线的辐射求值（**唯一口径**：新鲜候选、借用候选、时域/空间复用全部走这里）。
 //
-// 旧路径（世界空间缓存 `gi_cache_update`）与本步新增的屏幕空间路径（`gi/screen.wesl`）
-// 都必须走这里，否则两侧的亮度口径（`E_store` 语义、二次顶点回读、除 π）会分叉、画面会跳变。
+// 一次求值 = 1 条真实光路（`world_raycast`）＋ 命中时最多 1 条太阳 NEE 阴影射线。
 //
-// 一次求值 = 1 条真实光路（`world_raycast`）＋ 命中时最多 1 条太阳 NEE 阴影射线；
-// 命中面读「同体素同面」的旧缓存条目（只查不建 ⇒ 缓存规模跟着可见性走），
-// 没有条目就只吃天光；逃逸取 `sky_rgb()`。
+// **辐亮度只算一次弹射**：命中面按「直射太阳 + 天光 × AO」着色后除以 π 得到它的出射辐亮度，
+// 没有更深的弹射。多重弹射曾经靠世界空间缓存的回读实现（`gi_cache_peek`），那条路是个
+// **跨帧反馈环**（缓存值进射线、射线值又进缓存，且缓存用 `1/n` 运行平均收敛）——
+// 表现就是「像拿刷子一层层刷、稳态要等二十秒、有无 GI 的异常区」。删除后 GI 的输入
+// 只依赖几何与光照，是**逐帧确定**的：没有可累积的中间量，也就没有「收敛」这件事。
+// 代价是丢掉二次以上的弹射（多面互反射），这是刻意的取舍。
+//
+// 出射辐亮度约定（与 `dda_main` 的不透明分支逐项对齐，只是除以 π 转成 radiance）：
+//   `L_o = albedo · (太阳直射项 + 天光项) / π + albedo · emissive`
+// 其中天光项在二次顶点乘 `light_field_ao`（与主着色点同一套 AO，口径不分叉）。
+//
+// 逃逸到天空 ⇒ `sky_rgb()`（唯一的 miss 辐亮度口径）。
 // ============================================================================
 
 /// 太阳方向的直光透过率（1 = 无遮挡，0 = 被不透明体素全挡），一次穿透 trace 走完整段介质。
@@ -32,10 +42,10 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
 }
 
 /// 一条 GI 射线的求值结果。
-/// * `l` = 入射辐亮度（**不含** cos 因子与 π；两种复用候选的系数由调用方按各自 pdf 给）。
+/// * `l` = 入射辐亮度（**不含** cos 因子与 π；复用候选的系数由调用方按各自 pdf 给）。
 /// * `sk0`/`sk1` = 二次顶点的**精确键**（`gi_key0`/`gi_key1` 口径：命中体素 + 面 + 物体）。
 ///   `sk_hit = false` = 射线逃逸到天空（键取 (0,0)，同向天空两次求值必然相等）。
-/// * `sk_ok` = 键可编码且可比较。屏幕空间复用**只在 `sk_ok` 为真时接受历史样本**
+/// * `sk_ok` = 键可编码且可比较。复用**只在 `sk_ok` 为真时接受历史样本**
 ///   （键编码范围外无法做精确比较 ⇒ 宁可不复用，也不用启发式）。
 struct GiRaySample {
   l: vec3<f32>,
@@ -45,8 +55,8 @@ struct GiRaySample {
   sk_ok: bool,
 }
 
-/// 一条 GI 射线的入射辐亮度（被积函数的 L 部分）：真实光路 + 二次顶点 NEE，逃逸取天光。
-/// 不含 cos 因子与 π —— RIS 的权重是 `p̂ / p`，两种候选的系数在调用方给。
+/// 一条 GI 射线的入射辐亮度：真实光路 + 二次顶点「太阳 NEE + 天光 × AO」，逃逸取天光。
+/// 不含 cos 因子与 π —— RIS 的权重是 `p̂ / p`，系数在调用方给（余弦候选给 π）。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> GiRaySample {
   let sh = world_raycast(make_grid(0u), org, dir, GI_T_MAX, world_cfg_full(0.0, 3u));
   // 逃逸 → 天光辐亮度。
@@ -55,18 +65,15 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
     let alb = palette_albedo(sh.palette_base, sh.pal);
     let hit_p = org + dir * sh.t;
     let hn = voxel_normal(make_grid(u32(sh.obj_id) + 1u), sh.voxel, sh.n);
-    // 二次顶点回读**同体素同面**的条目（不插值 ⇒ 跨薄板/墙缝不漏光）；没有条目就只吃天光。
-    // 条目创建权留给屏幕（屏幕驱动缓存边界），这里只查不建 ⇒ 缓存规模跟着可见性走。
-    let e_hit = gi_cache_peek(sh.voxel, sh.face_id, sh.obj_id);
     let ndl = max(dot(hn, sun_dir), 0.0);
     var sun = 0.0;
     if (ndl > 0.0) {
       let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
       sun = sun_transmittance(hit_p + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
     }
-    // 出射辐亮度约定：入射项带 1/π，直射项同样带 1/π（不含 GI 增益 —— 增益是给屏幕看的，
-    // 进光输运会变成 gain² 反馈）。
-    l = alb * (e_hit / GI_PI + sun_c * ndl * sun * GI_SUN_BOUNCE / GI_PI)
+    // 二次顶点的天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
+    let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hit_p, sh.obj_id);
+    l = alb * (sun_c * ndl * sun * GI_SUN_BOUNCE + amb) / GI_PI
       + alb * palette_emissive(sh.palette_base, sh.pal) * GI_EMIT_GAIN;
   }
   return GiRaySample(
@@ -78,9 +85,9 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
   );
 }
 
-/// 只求**二次顶点键**的轻量射线（屏幕空间复用的时域验证专用）：键的口径与 `gi_ray_radiance`
+/// 只求**二次顶点键**的轻量射线（时域复用的二次顶点验证专用）：键的口径与 `gi_ray_radiance`
 /// 逐字一致（同一次 `world_raycast`、同一套 `gi_key0/gi_key1`），但**不做**二次顶点 NEE、
-/// 不读缓存、不取 albedo ⇒ 少发一条阴影射线。`l` 恒为 0（调用方只用键）。
+/// 不取 albedo ⇒ 少发一条阴影射线。`l` 恒为 0（调用方只用键）。
 fn gi_ray_secondary_key(org: vec3<f32>, dir: vec3<f32>) -> GiRaySample {
   let sh = world_raycast(make_grid(0u), org, dir, GI_T_MAX, world_cfg_full(0.0, 3u));
   return GiRaySample(

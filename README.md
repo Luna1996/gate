@@ -1,7 +1,7 @@
 # GATE — GPU-Accelerated Tile Engine
 
-> GPU 稀疏体素（Douglas Brick Tree，256³ chunk）+ 计算着色器层次 DDA 光追 + 世界空间 GI（逐 (体素,面) 辐照度缓存）+ 自研 bevy_ui 工具链。
-> **当前分支 `restir-gi`**：GI 缓存 / 光照场（AO）/ 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
+> GPU 稀疏体素（Douglas Brick Tree，256³ chunk）+ 计算着色器层次 DDA 光追 + 屏幕空间 ReSTIR GI + 自研 bevy_ui 工具链。
+> **当前分支 `restir-gi`**：ReSTIR GI / 光照场（AO）/ 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
 
 ---
 
@@ -46,7 +46,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
 | **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
 | **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass；局部 AABB slab 剔除 |
-| **GI（逐 (体素,面) 辐照度缓存）** | ✅ 生产可用 | 世界空间、相机无关的间接光存储：键 = (体素坐标, 面, 物体)，**面**在键里 ⇒ 薄板两侧天然是两个条目、不跨面插值 ⇒ 不漏光；取值 = 命中体素**自己**的条目（不插值）⇒ 没有级联接缝。存储 = 哈希网格 + 开放寻址按需创建（1M 条目 / 8M 桶），无 atlas / 段池 / 认领位图 / LOD。更新 = `gi_cache_update` 每帧整表轮转 64K 条目，每条目发余弦加权真实光路 + 二次顶点 NEE（回读 + 直射太阳），运行时平均（`E ← E + (c−E)/(n+1)`）⇒ 收敛后确定、无屏幕噪声；新条目从同面同平面 4 邻播种。 |
+| **GI（屏幕空间 ReSTIR）** | ✅ 生产可用 | 逐像素一个 reservoir（每 GI 像素 `GI_RES_WORDS` 个 word × 2 块 ping-pong），`gi_main` 一次派发完成「新鲜候选（4 条余弦，去遮挡时 8 条）→ 时域复用 → 空间复用 → 着色」。复用判据 = **精确几何面键**（体素 + 面 + 物体）＋ 二次顶点键逐位相等 ⇒ 面在键里，薄板/墙缝不漏光；跨体素共面邻居走「借方向 + 从本像素重发」的近似档（辐亮度恒由本像素自求）。**空间复用只作用在本帧估计，不回写时域历史**。辐亮度 = 单次弹射（命中面按「太阳直射 + 天光×AO」着色后除 π，miss 取天光）⇒ 输入只依赖几何与光照、逐帧确定，第 1 帧即稳态。降噪 = 时域累积（方差驱动历史权重 + AABB 钳制 + 离群抑制，上限 96 帧）→ 3 轮 atrous（同面键满权重、跨面走几何 × 亮度权重）。菜单「渲染/ReSTIR GI」开关 + 分辨率除数（1 / 2）。 |
 | **光照场（AO）** | ✅ 生产可用 | 相机中心、世界锚定的 32³ × 16 voxel 网格（`Rgba16Unorm`，硬件三线性），.a = AO fill 直接乘进命中着色；发光走「命中直出自身颜色 + 进 GI」，不再走发光密度通道 |
 | **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
 | **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
@@ -79,15 +79,15 @@ cargo clippy --workspace --all-targets -- -D warnings
       ↓ ExtractSchedule（main → render world）
   extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB) + LightFieldUpdate
   extract_camera : DdaCameraConfig → DdaViewUniform
-  extract_gi     : GiSettings（GI 开关 / 半分辨率）+ 曝光活参数
+  extract_gi     : GiSettings（GI 开关 / 分辨率除数）+ 曝光活参数
       ↓ render world
   RenderStartup    : init_dda_pipelines / init_empty_gpu / init_gi_gpu / queue_gi_pipelines
   PrepareResources : prepare_upload（struct/palette/comp/state/grid_descs + 光照场 3D 纹理 + 扩容）
   PrepareBindGroups: prepare_dda_bind_groups → prepare_gi
   RenderGraph::Render（dispatch 顺序）:
-      gi_cache_update（可见优先 + 整表轮转：真实光路 + 二次顶点 NEE + 运行时平均）
-      → beam（1/4 分辨率最近命中断面预 pass）
-      → gi（半分辨率 GI 预 pass，可开关）
+      beam（1/4 分辨率最近命中断面预 pass）
+      → gi（GI 预 pass：反投影 + G-Buffer + ReSTIR 取样，可开关）
+      → gi_denoise_temporal → gi_denoise_atrous1/2/4（时域累积 + 迭代 atrous）
       → dda_main（主可见 pass，trace + 着色 → out_tex）
       → eye_histogram + eye_update（自动曝光）
   Core2d::PostProcess: blit_dda_view（fs_main | fs_fxaa，线性上采样 + sRGB cancel → ViewTarget）
@@ -100,11 +100,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 2. **方向可达掩码 LUT（b_leaves，Douglas #18）**：8 octant × 64 入口格 × 2 字的保守可达集，
    `occupancy & reach` 在进入子块前剔除；LUT 是真实可达集的**超集**，绝不漏命中。
 3. **beam 预 pass**：1/4 分辨率先求「最近命中 t」，主 pass 从该 t 起步 —— 近场空空间不产生步进。
-4. **世界空间 GI 缓存**：条目键 = (体素坐标, 面, 物体)，世界锚定 ⇒ 相机移动不换主、不闪烁；
-   取值 = 命中体素自己的条目、不插值 ⇒ 没有级联接缝；面在键里 ⇒ 薄板/墙缝不漏光。
-   更新 = 可见优先（着色侧 `atomicExchange` 精确 claim + append 紧凑列表，数量超线程数时取轮换窗口）
-   ＋ 按帧号整表轮转（`GI_CACHE_SLOTS / 预算` 帧扫完一遍）⇒ 无跨帧游标、无竞态、丢帧不漏更新；
-   变化失效 = 世代号（太阳/天光/palette/世界全量）＋ N 个世界 voxel 脏盒（主世界 + 物体 volume）。
+4. **屏幕空间 ReSTIR GI**：逐像素一个 reservoir，每帧「新鲜候选 → 时域复用 → 空间复用 → 着色」，
+   再走「时域累积 + 迭代 atrous」降噪。复用判据是**精确几何面键**（体素 + 面 + 物体）＋
+   二次顶点键逐位相等 —— 面在键里 ⇒ 薄板 / 墙缝不漏光；同键 ⇒ 目标函数逐字相同 ⇒ 合并无偏。
+   **GI 的输入只依赖几何与光照**（单次弹射，辐亮度不含任何跨帧累积量）⇒ 第 1 帧就是稳态，
+   没有「收敛」这件事，也没有相机运动相关的延迟。代价是丢掉二次以上的弹射。
 5. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
 6. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
    关掉 FXAA 时只是换一条 fragment 入口，无分支代价。
@@ -138,12 +138,11 @@ gate-render/       渲染与 wire 契约（CPU 侧；GPU 状态全部在 render 
                                    多 volume trace）、OrbitCamera / DdaCameraConfig、RenderScale /
                                    PostFxSettings / EyeAdaptSettings、全部 BG layout + pipeline +
                                    prepare_dda_bind_groups / dispatch_dda / blit_dda_view
-                   - gi.rs          GI 缓存（GiUniform / GiSettings / GiGpu / BG4·BG5 布局 /
-                                   prepare_gi / dispatch_gi：世代 + 脏盒失效、可见 claim、
-                                   整表轮转更新 pass 的调度）
+                   - gi.rs          GI（GiUniform / GiSettings / GiGpu / BG4·BG5 布局 /
+                                   prepare_gi：reservoir 双缓冲换绑 + uniform 上传 + 几何修订号）
                    - lighting.rs    LightingTheme（RON）+ LightPoolUniform wire 契约（BG3）
                    - shader.rs      启动时 wesl-rs 编译 WESL 包 → Bevy Shader 资产
-                   - wesl_consts.rs 从 .wesl 源码解析跨语言 u32 常量（GI 缓存容量等的**唯一权威**），启动 fail-fast
+                   - wesl_consts.rs 从 .wesl 源码解析跨语言 u32 常量（buffer 布局的**唯一权威**），启动 fail-fast
                    - profiler.rs    wgpu-profiler / Tracy 集成（feature = "profile"；非该 feature 为零成本壳）
                    - responsive.rs  窗口 resize → 渲染目标原地重建 + RenderScale 跟随
                    - paths.rs       install_root / assets_dir / logs_dir / data_dir
@@ -221,19 +220,9 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | 符号 | 值 | 含义 |
 |---|---|---|
 | `VIEW_SIZE` | 1280×720 | 初始渲染分辨率（窗口内部分辨率 = 物理像素 ÷ `RenderScale.factor`） |
-| DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` 工作组边长（须与 WESL 一致）；`gi_cache_update` 为 64 |
-| beam / GI 分辨率 | 1/4 / 1/2 | beam depth 纹理；半分辨率 GI 缓冲（premultiplied valid 格式） |
-| `GI_CACHE_SLOTS` | 1,048,576 条目 | 条目表容量（每条 `GI_CACHE_ENTRY_WORDS` × 4B = 72B ⇒ 72MB）；满则不再新建条目 |
-| `GI_CACHE_BUCKETS` | 8,388,608 桶 | 哈希网格桶数（2 的幂，×4B = 32MB）；桶内存「条目下标 + 1」，0 = 空 |
-| `GI_CACHE_ENTRY_WORDS` | 18 | 条目布局：`[0,1]` 键、`[2,4]` 世界位置、`[5]` 世界法线（八面体 f16x2）、`[6,8]` E、`[9]` 已累积样本数、`[10]` 最近**处理**（更新/轮转，同帧去重用）的帧、`[11]` 世代号、`[12]` reservoir 方向、`[13,15]` reservoir 样本的 L、`[16]` reservoir `w_sum`、`[17]` reservoir 候选数 M |
-| `GI_CACHE_RAYS` | 2 | 每条目每帧发射的**新鲜**余弦加权半球射线数 |
-| `GI_CACHE_REUSE` | 2 | 每条目每帧额外的**借用**射线数（RIS 复用：借同平面邻条目 reservoir 的方向，从本条目重发） |
-| `GI_CACHE_M_CAP` | 32 | RIS 候选数上限 M：超过则把 `w_sum` 与 M 同比例缩回（`w_sum / M` 不变），抑制历史对抽样的支配 |
-| `GI_CACHE_UPDATE_BUDGET` | 65536 条目/帧 | 更新 pass 线程数（可见段 + 轮转段的总预算） |
-| `GI_CACHE_VISIBLE_CAPACITY` | 1,048,576 项 | 可见条目紧凑列表容量（×4B = 4MB）；着色侧 claim 后 append、更新 pass 消费，溢出即丢弃 |
-| `GI_CACHE_DIRTY_BOXES` | 8 | 单帧生效的脏盒数上限（主世界 + 各物体 volume 的编辑各一盒）；超出退化为「自增世代」全量失效 |
-| `GI_CACHE_PROBE` | 8 | 开放寻址最大探测步数 |
-| `GI_CACHE_RAY_BIAS` | 0.5 voxel | 更新射线起点沿条目法线的外推（防第一步撞自己） |
+| DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` / 降噪 4 个入口的工作组边长（须与 WESL 一致） |
+| beam / GI 分辨率 | 1/4 / 1/2 | beam depth 纹理（1/4 全分辨率）；GI 缓冲默认半分辨率（`GiSettings.gi_div`，premultiplied valid 格式） |
+| `GI_RES_WORDS` | 17 | 每 GI 像素的 reservoir 字数（布局见 `gi/screen.wesl` 头部）；Rust 按它开 ping-pong 两块 buffer |
 | 光照场 | 32³ cell × 16 voxel | `Rgba16Unorm` 3D 纹理，.a = AO fill；世界覆盖 512 voxel = ±5.12m |
 | `SHADOW_SURFACE_EPS` | 1/32 voxel | 阴影/二次射线起点沿法线外推（防自命中，与 WGSL 同步） |
 
@@ -241,32 +230,37 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 
 | 符号 | 值 | 含义 |
 |---|---|---|
-| `GI_PI` | 3.14159265 | 辐照度 ↔ 辐亮度换算（缓存存 `E`，着色侧乘增益后除 π） |
-| `GI_T_MAX` | 8192 voxel | 更新射线 / 阴影射线的 t 上限 |
-| `GI_SKY_RADIANCE_SCALE` | 1.0 | 更新射线 miss（逃逸到天空）时注入的天空辐亮度系数 |
-| `GI_SUN_BOUNCE` | 1.0 | 更新射线命中面的**直射太阳**项增益（GI 唯一的直射光源）；0 = 整段折掉、连阴影射线都不发 |
+| `GI_PI` | 3.14159265 | 辐照度 ↔ 辐亮度换算（reservoir 存 π·L，着色侧乘增益后除 π） |
+| `GI_T_MAX` | 8192 voxel | GI 射线 / 阴影射线的 t 上限 |
+| `GI_SKY_RADIANCE_SCALE` | 1.0 | GI 射线 miss（逃逸到天空）时注入的天空辐亮度系数 |
+| `GI_SUN_BOUNCE` | 1.0 | 二次顶点命中面的**直射太阳**项增益（GI 的直射光源）；0 = 该项折掉、连阴影射线都不发 |
 | `GI_EMIT_GAIN` | 1.0 | 命中自发光体素时的辐亮度增益 |
-| `GI_SKY_AMBIENT` | 0.05 | 天光环境项：缓存没有数据（`cov = 0`）时的兜底强度 |
-| `GI_AMBIENT_FLOOR` | 0.01 | 天光地板：`cov = 1`（有数据）时保留 k 倍 —— `amb = sky · GI_SKY_AMBIENT · mix(1.0, k, cov)` |
-| `GI_CACHE_VISIBLE_SHARE` | 50（%） | 更新预算里「可见优先」占比（50 = 1/2）：先处理着色侧上一帧 claim + append 的可见条目（数量超过可见段线程数时取轮换窗口：起点 `(frame × vis_threads) % cnt`）；置 0 关闭（全部走轮转） |
-| `GI_CACHE_CONVERGED_N` | 64 | 「已收敛」阈值（`n ≥ 本值`）：**可见段与轮转段**都每 4 帧才更新一次；旧世代/脏区条目 `n` 被重置 ⇒ 永远优先且不降频 |
-| `GI_CACHE_DIRTY_MARGIN_VOXELS` | 2 voxel | 脏盒失效余量基准：盒 0（主世界，scale = 1）用它；物体 volume 的盒按 `max(本值, 本值 × scale)` 放大（权威值在 `gi/consts.wesl`，Rust 经 `wesl_consts.rs` 解析） |
+| `GI_SKY_AMBIENT` | 0.05 | 天光环境项：GI 无数据（`cov = 0`）时的兜底强度；也是二次顶点唯一的天空项入口 |
+| `GI_AMBIENT_FLOOR` | 0.01 | 天光地板：`cov = 1`（GI 有数据）时保留 k 倍 —— `amb = sky · GI_SKY_AMBIENT · mix(1.0, k, cov)` |
+| `GI_SS_CAND_N` | 2 | 每像素每帧的**新鲜**余弦候选数（每条含 ≤1 条太阳 NEE 阴影射线）；GI 的代价几乎全在这里 |
+| `GI_SS_CAND_BOOST` | 4 | **去遮挡 boost**：本帧没有可用时域历史（新露出屏幕 / 转过墙角）时的候选数 |
+| `GI_SS_M_CAP_K` | 20 | reservoir 候选数上限 = 本值 × 本帧新鲜候选数（超过则同比例缩回，`w_sum / M` 不变）⇒ 滑动窗口 = 本值帧 |
+| `GI_SS_REUSE_TAPS` | 8 | 空间复用 tap 数（3×3 环；同键 or 同平面 ⇒ **只并累计量，零射线**） |
+| `GI_DEN_M_MAX` | 96 | 时域累积的历史长度上限 M（帧）⇒ 稳态历史权重上限 95/96 |
+| `GI_DEN_ATROUS_ITER` | 3 | 迭代 atrous 轮数（步长 1/2/4，足迹 = 7 像素半径） |
+| `GI_DEN_CLAMP_K` | 2.5 | AABB 钳制系数（本帧输入 = NRD pre-blur 的离群抑制；历史色 = anti-ghosting） |
+| `GI_DEN_N_DOT` / `GI_DEN_PLANE_K` | 0.9 / 0.5 | 法线相似阈值 / 平面深度检验容差系数（薄板、墙缝在这里被硬拒） |
 
 两条硬约束：
 
-1. **GI 的直射光源只有两项**：更新射线命中面的太阳项 + 射线逃逸到天空。命中面的入射项与直射项都必须带 1/π
-   （否则"太阳反弹"会比"缓存多弹跳"亮 π 倍，能量不自洽）。删掉太阳项 ⇒ 任何看不到天空的表面
-   （草根、过道内墙）只能自洽维持全黑。
+1. **GI 的入射辐亮度只有两项**：二次顶点命中面的太阳项 + 射线逃逸到天空（外加自发光）。
+   命中面的入射项与直射项都必须带 1/π（与 `dda_main` 的口径一致，能量才自洽）。
+   删掉太阳项 ⇒ 任何看不到天空的表面（草根、过道内墙）只能自洽维持全黑。
 2. **太阳阴影射线的起点必须跟着色侧同一套外推**（半个 voxel + `SHADOW_SURFACE_EPS`）：只退 1 个 eps 会从
    **命中体素内部**出发，第一步就自命中 ⇒ 该项恒为 0，白耗一根射线。
 
 > **跨语言常量的权威在 WESL 源码**：`gate-render/src/wesl_consts.rs` 启动时解析 WESL 包 `gi/`
-> （`cache.wesl` 的容量/布局 + `consts.wesl` 的旋钮），Rust 侧不再各留副本（不一致即启动 fail-fast）。
-> 改缓存容量 / 调度比例 / 脏区余量基准请改 `.wesl`。
+> （`screen.wesl` 的 `GI_RES_WORDS` + `consts.wesl` 的 buffer 布局与轮数），Rust 侧不再各留副本
+> （不一致即启动 fail-fast）。改 reservoir 布局 / atrous 轮数请改 `.wesl`。
 
-> **帧号是精确 u32**：`GiUniform.seq.x`（`vec4<u32>`）承载自增帧号，所有整数帧逻辑（轮转起点、
-> 条目 `[10]`「本帧已处理」去重、可见 claim、RNG 种子混入）都只用它 —— 帧号曾以 f32 存在
-> `params.x`，超过 2^24 后 f32 不能表示连续整数，上述判断会偶发失效。`params.x` 保留为恒 0 占位。
+> **帧号是精确 u32**：`GiUniform.seq.x`（`vec4<u32>`）承载自增帧号，整数帧逻辑（RNG 种子混入、
+> 像素 hash）只用它 —— 帧号曾以 f32 存在 `params.x`，超过 2^24 后 f32 不能表示连续整数，
+> 种子会偶发重复。`params.x` 保留为恒 0 占位。
 
 ---
 
@@ -279,8 +273,10 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 2. **上传别逐帧硬扛 backlog**：`poll_pending` 在 backlog > 3× 预算时一次性刷新，否则每次 Prepare 被长阻塞。
 3. **树编辑走整块路径**：笔触用 `fill_brick`（O(深度)）而不是逐体素 `set_voxel`（31³ 笔触 = 近 3 万次树下降
    + 沿途 `try_merge`）。
-4. **GI 缓存条目容量满即停止新建**：`gi_alloc` 里 `atomicAdd` 出的游标 ≥ `GI_CACHE_SLOTS` 就返回失败
-   （当作"没有条目"），不会越界写。桶是「键先写、桶后 CAS」⇒ 抢输的孤儿条目只会短暂命中不到，不会读错。
+4. **空间复用的结果绝不回写时域历史**（`gi/screen.wesl` 文件头 ②）：空间复用读的是**上一帧**邻居的
+   reservoir；把「新鲜 + 时域 + 空间」一起存回去，下一帧的历史里就混进了邻居的历史 ⇒ 时域链被横向
+   污染（相关性、拖影、移动物体「前沿带」）。正确写法是：存回 reservoir 的只有「新鲜 + 时域」，
+   空间合并只作用在本帧的着色估计上。
 5. **DDA cell 步进必须整数增量维护**：不得用 `floor(origin + dir·t)` 重算（t 恰在边界时 floor 会取到
    穿越前/后的胞 → 对角胞漏检，与 brute-force 不等价）。
 6. **bind group 必须从索引 0 起成前缀设置**：自动曝光两个入口的布局因此重复挂 8 份；

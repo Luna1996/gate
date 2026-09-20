@@ -1,10 +1,9 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_cov_out, gi_cov_tex, gi_dn_dst, gi_dn_tmp, gi_out, gi_tex, gi_u, gi_vis_count, gi_vis_list, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_cov_out, gi_cov_tex, gi_dn_dst, gi_dn_tmp, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, palette_transmission, sky_rgb, srgb_to_linear};
-import package::gi::cache::{GI_CACHE_M_CAP, GI_CACHE_ON, GI_CACHE_RAYS, GI_CACHE_RAY_BIAS, GI_CACHE_REUSE, GI_CACHE_SLOTS, GI_CACHE_UPDATE_BUDGET, GI_CACHE_VISIBLE_CAPACITY, gi_accumulate, gi_cache_evict, gi_cache_peek, gi_cache_read, gi_cos_hemisphere, gi_current_generation, gi_dirty_hit, gi_entry_count, gi_entry_face, gi_entry_frame, gi_entry_generation, gi_entry_invalidate, gi_entry_m, gi_entry_nrm, gi_entry_obj, gi_entry_pos, gi_entry_reservoir_dir, gi_entry_reservoir_l, gi_entry_store_reservoir, gi_entry_valid, gi_entry_voxel, gi_entry_w_sum, gi_key0, gi_key1, gi_mix, gi_neighbor_entry, gi_rand2, gi_should_evict};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_CACHE_CONVERGED_N, GI_CACHE_VISIBLE_SHARE, GI_DEN_PLANE_K, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
-import package::gi::denoise::{gi_den_atrous, gi_den_guide_store, gi_den_temporal};
-import package::gi::ray::{gi_ray_radiance, sun_transmittance};
-import package::gi::screen::{gi_ss_main, gi_ss_reproject};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
+import package::gi::denoise::{gi_den_atrous, gi_den_temporal};
+import package::gi::ray::{sun_transmittance};
+import package::gi::screen::{gi_ss_main};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
 import package::world::{WorldHit, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
@@ -233,8 +232,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   write_output(coord0, col);
 }
 
-// GI（菜单「渲染/GI」的分辨率档 `gi_u.flags.y` = 1 全分辨率 / 2 半分辨率）：GI 采样在本 pass 里
-// 按该分辨率的网格完成，主 pass 按全分辨率 uv 双线性取用。
+// GI（**唯一路径 = 屏幕空间逐面 ReSTIR**，见 `gi/screen.wesl`）。
+// 本 pass 只负责：反投影 + beam 起点 + 主 trace（= G-Buffer），随后整条 GI 都交给 `gi_ss_main`
+// （新鲜候选 → 时域复用 → 空间复用 → 着色）并写降噪导引。
 // 输出：gi_out.rgb = gi·valid、gi_out.a = valid；gi_cov_out.r = cov·valid、.g = valid；
 // 主 pass 按 valid 归一化，天空/介质像素（valid = 0）不参与插值。
 @compute @workgroup_size(8, 8, 1)
@@ -278,41 +278,8 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let h = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
                         world_cfg_full(t_min, 3u));
-  // ---- 两条路径二选一（`GI_CACHE_ON`，权威值在 `gi/cache.wesl`）----
-  // false = **屏幕空间逐面 ReSTIR**（本步主路径，每帧完整估计 ⇒ 新露出像素当帧就有值）；
-  // true  = 旧的世界空间逐 (体素,面) 缓存（A/B 对照，退役在第③步）。
-  if (!GI_CACHE_ON) {
-    gi_ss_main(coord, size, h);
-    return;
-  }
-  var gi = vec3<f32>(0.0);
-  var cov = 0.0;
-  var valid = 0.0;
-  // 只处理「首命中即不透明」；着色点/法线/采样点与 `dda_main` 的不透明分支一致。
-  if (h.hit && palette_transmission(h.palette_base, h.pal) <= 0.0) {
-    let gg = make_grid(u32(h.obj_id) + 1u);
-    let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
-    let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
-    let n = voxel_normal(gg, h.voxel, h.n);
-    let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
-    let gs = gi_supply(h.voxel, h.face_id, h.obj_id, p_voxel + n * n_off, n);
-    gi = gs.xyz;
-    cov = gs.w;
-    valid = 1.0;
-    // 降噪导引（这条分支当前休眠 —— `GI_CACHE_ON = false` 时 `gi_main` 走 `gi_ss_main` 早返回；
-    // 这里同步写一份，保证把开关翻回 true 时两段降噪读到的导引仍然自洽）。
-    // 重投影用真实命中点（见 `gi/screen.wesl` 里同一处的说明）。
-    var prev_ok = false;
-    let pc = gi_ss_reproject(h.point, size, &prev_ok);
-    gi_den_guide_store(coord, size, true, gi_key0(h.voxel), gi_key1(h.voxel, h.face_id, h.obj_id),
-                       p_voxel, n, GI_DEN_PLANE_K * gg.scale, prev_ok, pc);
-  } else {
-    gi_den_guide_store(coord, size, false, 0u, 0u, vec3<f32>(0.0), vec3<f32>(0.0), 0.0, false,
-                       vec2<i32>(0));
-  }
-  textureStore(gi_out, coord, vec4<f32>(gi * valid, valid));
-  // storage texture 的 store 值恒为 vec4（rg32f 也不例外，多出的通道被丢弃）
-  textureStore(gi_cov_out, coord, vec4<f32>(cov * valid, valid, 0.0, 0.0));
+  // 天空 / 介质像素（首命中不是不透明体素）由 `gi_ss_main` 写 valid = 0 后早返回。
+  gi_ss_main(coord, size, h);
 }
 
 // ============================================================================
@@ -353,161 +320,6 @@ fn gi_denoise_atrous4(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 4);
-}
-
-// ============================================================================
-// GI 路径（逐 (体素,面) 辐照度缓存，见 `gi/cache.wesl`）
-// ============================================================================
-
-/// 着色侧的 GI 取值：**只读缓存**（逐 (体素,面) 辐照度缓存）。
-/// 条目未建 / 还没数据 → 返回 0，由着色侧既有的 `amb·ao`（天光常量 × AO）兜底。
-/// 未建条目时缓存内部会顺手建条目并给出邻面播种值，所以大平面上第一帧就是平滑的。
-fn gi_supply(
-  voxel: vec3<i32>,
-  face: u32,
-  obj: i32,
-  p_sample: vec3<f32>,
-  n: vec3<f32>,
-) -> vec4<f32> {
-  if (!GI_CACHE_ON || gi_u.misc.x <= 0.5) { return vec4<f32>(0.0); }
-  let c = gi_cache_read(voxel, face, obj, p_sample, n);
-  return vec4<f32>(c.xyz * gi_u.params.z / GI_PI, c.w);
-}
-
-/// 缓存的更新 pass：**可见优先 + 收敛度优先**，每帧处理 `GI_CACHE_UPDATE_BUDGET` 个条目。
-/// 预算切成两段（比例 = `GI_CACHE_VISIBLE_SHARE` %）：
-///   · **可见段**消费着色侧上一帧 claim + append 的紧凑列表（`gi_vis_list`，即上一帧被看到的条目；
-///     更新 pass 排在着色之前 ⇒ 有一帧延迟）；列表比可见段线程数长时取一个**轮换窗口**
-///     （起点 `(frame × vis_threads) % cnt`，多帧内覆盖全部可见条目）；
-///   · **轮转段**按帧号分片扫整表，覆盖远处 / 不可见条目（不饿死）；
-///     两段里已收敛条目（`n ≥ GI_CACHE_CONVERGED_N`）都降频（`(idx + frame) % 4 != 0` 直接跳过），
-///     把机会让给未收敛 / 新世代 / 脏区条目 —— 失效判定排在降频之前且重置后 `n = 0`，
-///     所以世代过期与脏区条目永远优先且不降频。
-/// 每个被选中的条目发 `GI_CACHE_RAYS` 条余弦加权半球射线（新鲜候选）+ `GI_CACHE_REUSE` 条**借用**射线
-/// （取同平面邻条目 reservoir 里的方向，从本条目重发 = 重连接射线），按 RIS 合并成本帧估计
-/// `Σ w / 候选数`（w = p̂/p）后喂给运行时累积（`gi_accumulate`）。借用让相邻条目的估计互相关联
-/// ⇒ 大平面上的逐体素斑块被抹平；累积层保留 ⇒ 任何情况下都没有屏幕噪声。
-/// 轮转起点由帧号推出 ⇒ 无跨帧游标、无竞态、丢帧不漏更新。
-/// 两段都按 `[10]`（最近处理帧）去重：同一条目同帧只更新一次，不会累积两次。
-/// 更新前先做「变化失效」判定：世代不符（太阳/天光/palette/世界全量变化）→ 就地重置；位置落在任一
-/// 脏盒内（编辑体素，主世界 + 物体 volume，见 `gi_dirty_hit`）→ 就地重置。重置会连 reservoir 一起清空
-/// （旧世代的方向/权重不可用）。
-@compute @workgroup_size(64)
-fn gi_cache_update(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= GI_CACHE_UPDATE_BUDGET) { return; }
-  // 帧号取 `gi_u.seq.x`（精确 u32）：轮转起点、分片、去重、RNG 种子都必须是整数语义。
-  let frame = gi_u.seq.x;
-
-  // ---- 调度：预算切两段（可见优先 + 整表轮转）----
-  let vis_threads = GI_CACHE_UPDATE_BUDGET * GI_CACHE_VISIBLE_SHARE / 100u;
-  let rot_threads = GI_CACHE_UPDATE_BUDGET - vis_threads;
-  var idx = 0u;
-  // 本线程是否来自轮转段：只有轮转段做回收（可见段碰到的条目正要被看到，不该回收）。
-  var from_rotation = false;
-  if (i < vis_threads) {
-    // 可见段：列表由着色 pass claim + append、Rust 每帧清零计数器 ⇒ 这里消费的是**上一帧**被看到的条目。
-    let cnt = min(atomicLoad(&gi_vis_count[0u]), GI_CACHE_VISIBLE_CAPACITY);
-    if (i >= cnt) { return; }
-    // 轮换窗口：可见条目数可能远大于可见段线程数 ⇒ 起点随帧号推进（每帧前进 vis_threads 项，
-    // cnt 帧内覆盖全部可见条目），而不是永远取前缀（那样列表尾部永远拿不到预算）。
-    // cnt ≤ vis_threads 时 `(start + i) % cnt` 是 0..cnt-1 的一个排列，仍是一条不重复地覆盖全部。
-    let start = (frame * vis_threads) % max(cnt, 1u);
-    idx = gi_vis_list[(start + i) % max(cnt, 1u)];
-  } else {
-    // 轮转段：帧号分片（rot_threads × sweeps = GI_CACHE_SLOTS），覆盖远处 / 不可见条目。
-    let sweeps = max(GI_CACHE_SLOTS / max(rot_threads, 1u), 1u);
-    idx = ((frame % sweeps) * rot_threads + (i - vis_threads)) % GI_CACHE_SLOTS;
-    from_rotation = true;
-  }
-  if (!gi_entry_valid(idx)) { return; }
-  // 同帧去重：另一个分支已经处理过（`[10]` 已写成当前帧）就跳过。
-  if (gi_entry_frame(idx) == frame) { return; }
-
-  let gen = gi_current_generation();
-  let pos = gi_entry_pos(idx);
-  var invalid = gi_entry_generation(idx) != gen;
-  if (!invalid) { invalid = gi_dirty_hit(pos); }
-  if (invalid) { gi_entry_invalidate(idx, gen); }
-  // 条目回收（只做在轮转段，见 `gi_should_evict`）：游标过水位后，把「久未露面」的条目清成空槽
-  // —— 不回收的话游标只增不减，飞行十几屏新地形就耗光容量，新面永远建不出条目。
-  // 分配游标耗尽时着色侧还能自己现场夺取一个可回收槽位（`gi_reclaim_slot`），这条只是提前腾地方。
-  // 失效（世代过期 / 脏区）条目刚被就地重置、正要重收敛，**不回收**；已收敛但还年轻的条目也不回收。
-  else if (from_rotation && gi_should_evict(idx, frame)) {
-    gi_cache_evict(idx);
-    return;
-  }
-  // 收敛降频：**两段都降频** —— 已收敛的可见条目每 4 帧才更新一次，否则预算被反复花在它们身上
-  // （旧版可见段不降频时，「可见优先」实测反而比全轮转更慢，就是这个原因）；未收敛条目仍每帧更新。
-  // 失效条目刚被重置成 `n = 0`，不会落进这里（世代过期 / 脏区永远优先且不降频）。
-  if (gi_entry_count(idx) >= f32(GI_CACHE_CONVERGED_N)) {
-    if ((idx + frame) % 4u != 0u) { return; }
-  }
-
-  let n = gi_entry_nrm(idx);
-  let v = gi_entry_voxel(idx);
-  let face = gi_entry_face(idx);
-  let obj = gi_entry_obj(idx);
-  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
-  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-  let org = pos + n * GI_CACHE_RAY_BIAS;
-
-  // ---- RIS reservoir 的跨帧状态（失效 / 新建 = 0）----
-  // w_sum / M：候选竞争的累计量，M 封顶后同比例缩回；邻居反读 `w_sum / M`（≈ 本条目的目标函数
-  // 积分 Z）来算复用权重。sel_dir / sel_l：当前保留的样本（邻居只借方向，L 供邻居算源 pdf）。
-  var w_sum = gi_entry_w_sum(idx);
-  var m = gi_entry_m(idx);
-  var sel_dir = gi_entry_reservoir_dir(idx);
-  var sel_l = gi_entry_reservoir_l(idx);
-
-  var acc = vec3<f32>(0.0);
-  var cand = 0.0;
-  for (var c = 0u; c < GI_CACHE_RAYS + GI_CACHE_REUSE; c = c + 1u) {
-    var dir = vec3<f32>(0.0);
-    // 权重系数 k：`w = p̂ / p = k · L`，由候选的**源 pdf** 决定（见两个分支）。
-    var k = 1.0;
-    if (c < GI_CACHE_RAYS) {
-      // 新鲜候选：余弦加权方向 p = cosθ/π、p̂ = L·cosθ ⇒ w = π·L。
-      // 随机数与旧版逐位一致（同 (条目, 帧, 序) 恒定 ⇒ 可复现、不逐帧抖动）。
-      let seed = gi_mix(idx * 73856093u + frame * 19349663u + c * 83492791u + 1u);
-      dir = gi_cos_hemisphere(n, gi_rand2(seed));
-      k = GI_PI;
-    } else {
-      // 借用候选：邻条目 reservoir 的方向。邻位按条目下标轮转（`& 3u`），避免总是偏向同一侧；
-      // 邻居没数据（未建 / 没样本 / 旧世代）就跳过这个候选。
-      let nb = gi_neighbor_entry(v, face, obj, (c - GI_CACHE_RAYS + idx) & 3u);
-      if (nb == 0xFFFFFFFFu) { continue; }
-      // 源 pdf 取邻居 reservoir 的目标函数 p_nb(ω) ≈ lum(L_nb(ω))·cosθ / Z_nb：同一面 ⇒ cosθ 相同、
-      // 约掉 ⇒ w = L·Z_nb / lum(L_nb(ω))。邻居样本恰好代表它自己的均值时退化为 π·L；样本偏亮时
-      // （RIS 抽样的必然结果）这里会把它压回来，所以不会系统性过亮。只取「下压」侧（≤ 1）：
-      // 邻居样本异常小时源 pdf 退化，否则权重会爆。
-      let z_nb = gi_entry_w_sum(nb) / max(gi_entry_m(nb), 1.0);
-      k = GI_PI * clamp(z_nb / max(GI_PI * dot(gi_entry_reservoir_l(nb), GI_LUMA), 1e-6), 0.0, 1.0);
-      dir = gi_entry_reservoir_dir(nb);
-    }
-    // 单条射线的求值走**共用 helper**（`gi/ray.wesl`）：与屏幕空间新路径逐字同口径
-    // （`E_store` 语义、除 π、二次顶点回读、太阳 NEE、自发光、逃逸天光）。
-    let l = gi_ray_radiance(org, dir, sun_dir, sun_c).l;
-    let w = l * k;
-    let lum_w = dot(w, GI_LUMA);
-    // 本帧估计 = Σ w / 候选数（RIS 的无偏写法：E[w] = ∫p̂ = π·⟨L⟩ = E_store）。
-    acc = acc + w;
-    cand = cand + 1.0;
-    // 加权蓄水池抽样：候选 c 以「自己的权重 / 至今累计权重」成为 reservoir 样本。
-    w_sum = w_sum + lum_w;
-    m = m + 1.0;
-    let u = gi_rand2(gi_mix(idx * 2654435761u + frame * 40503u + c * 2246822519u + 7u)).x;
-    if (u * w_sum < lum_w) { sel_dir = dir; sel_l = l; }
-  }
-  // M 上限：w_sum 与 M 同比例缩回 ⇒ w_sum / M 不变（邻居看到的 Z 不变），只抑制历史对抽样的支配。
-  if (m > f32(GI_CACHE_M_CAP)) {
-    let shrink = f32(GI_CACHE_M_CAP) / m;
-    w_sum = w_sum * shrink;
-    m = f32(GI_CACHE_M_CAP);
-  }
-  gi_entry_store_reservoir(idx, sel_dir, sel_l, w_sum, m);
-  // 一个候选都没有时（新鲜射线数为 0 才会发生）给 0，避免 0/0。
-  gi_accumulate(idx, acc / max(cand, 1.0));
 }
 
 // 自动曝光：pass1 `eye_adapt_histogram` 抽样 → log2 亮度 → 64 桶直方图；

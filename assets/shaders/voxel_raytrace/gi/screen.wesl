@@ -1,56 +1,44 @@
 import package::bindings::{gi_cov_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::common::{palette_transmission};
-import package::gi::cache::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_N_DOT, GI_DEN_PLANE_K, GI_PI, GI_SS_M_CAP, GI_SS_REUSE_RAYS, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
+import package::gi::consts::{GI_DEN_N_DOT, GI_DEN_PLANE_K, GI_LUMA, GI_PI, GI_SS_CAND_BOOST, GI_SS_CAND_N, GI_SS_M_CAP_K, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store};
 import package::gi::ray::{gi_ray_radiance, gi_ray_secondary_key};
 import package::trace::{make_grid};
 import package::world::{WorldHit, voxel_normal};
 
 // ============================================================================
-// 屏幕空间逐面 ReSTIR 路径 —— 每帧完整估计（`GI_CACHE_ON = false` 时接管 gi_main）。
+// 屏幕空间 ReSTIR GI —— **GI 的唯一路径**（逐像素 reservoir，每帧完整估计）。
 //
-// 目标：**同帧收敛**。新进入视野的像素当帧就拿到估计，不允许「等 N 帧才有值」。
-// 因此这里没有世界空间条目、没有运行时平均，只有「本帧候选 + 上帧/邻居的 reservoir」。
-// 代价是**画面必然有噪声**（降噪是下一步）。
+// 业界形态（Ouyang 2021 / UE5.2+ Hardware Lumen）：逐像素一个 reservoir，
+// 「新鲜候选 → 时域复用 → 空间复用 → 着色 → 降噪」。本文件的四条关键取舍：
 //
-// 每个 GI 像素每帧：
-//   ① 新鲜：1 条余弦加权半球方向 ⇒ `gi_ray_radiance`（1 条 GI 射线，命中时含 1 条太阳 NEE 阴影射线）；
-//   ② 时域：用**上一帧**的相机矩阵把本像素的主命中点重投影到上帧的 GI 网格，读上帧 reservoir；
-//      判据是**精确键**（不是启发式）：主命中面键 (体素,面,物体) 必须完全一致；
-//      再接一条重连接射线（本帧唯一的那条，≤1）沿历史方向重发，用它的二次顶点键与历史存的那个做
-//      **逐位相等**比较 —— 不一致就丢掉历史累计量（世界变了 / 不是同一个面）；一致就把历史累计量
-//      `w_sum`/`M` 接过来。重连接射线只求键（裸 `world_raycast`，不带 NEE）、**不进 RIS**
-//      （见 ② 处注释：会把估计「锁定」到某个方向而系统性偏亮）。
-//      **世界几何自写入历史那一帧起逐位未变时（uniform `flags.z`）这条验证射线整条省掉** ——
-//      输入完全相同 ⇒ 结果必然逐位相同（见 ② 处注释），这是静态/纯相机运动下最大的一笔省。
-//      ⇒ 每像素射线数：新鲜 1 条（含 ≤1 条 NEE 阴影）+ 重连接 ≤1 条（裸射线，稳态通常 0）= 1~3 条。
-//   ③ 空间：上帧 **本面所在位置**（= 本帧命中点上帧的重投影，静止相机下就是这个像素自身）周围
-//      3×3 环上的 8 个 tap（起点按像素哈希轮转；`GI_SS_REUSE_RAYS = 0` 时只用
-//      4 个轴邻 = 改造前的行为）。两档：
-//      a) **主命中面键完全一致**（同一个体素同一个面 ⇒ 目标函数逐字相同）⇒ 直接并累计量
-//         （零射线、零偏差，与改造前同一条快路）；
-//      b) **主键不同但过相似性判定**（法线 `dot ≥ GI_DEN_N_DOT` + 平面检验
-//         `|(p_nbr − p_c)·n_c| < GI_DEN_PLANE_K × 体素边长`，与降噪侧**同一套**判据；位置取命中
-//         体素中心）⇒ **借它的方向、从本像素重发一条射线**（≤`GI_SS_REUSE_RAYS` 条/像素），
-//         把得到的那条 L 作为本帧候选。
-//         借的只是「方向」：reservoir 存的方向恒是该像素**最近一次新鲜余弦采样**（`gi_res_adopt`
-//         只并累计量、不换样本方向）⇒ 源 pdf 就是（邻居法线下的）余弦分布，权重与新鲜候选同口径
-//         `π·L`，**偏差只落在估计权重上**（邻居法线与自己的法线差 ≤ 25° + f16 八面体量化 < 1°，
-//         一阶小量），几何/可见性**零偏差**：射线从本像素重发、遮挡由真实几何决定
-//         ⇒ 不会把邻居的光带过来、不跨薄板、不跨墙缝（这正是 ReSTIR 空间复用「只借方向」的取舍）。
-//      ⇒ 每像素主射线：新鲜 1 + 时域键验证 ≤1 + 借用 ≤`GI_SS_REUSE_RAYS` = 2 ~ 4 条。
-//   ④ RIS 合并：余弦候选 w = π·L（余弦 pdf 下 f/p = L·cosθ·π/cosθ）；**本帧的「新鲜 + 借用」
-//      先做帧内等权平均，再作为一个候选计入 M**（M 的单位 = 帧候选 = 记忆帧数，见下），
-//      `w_sum += Σw`、`M += 候选数`，`M` 触及 `GI_SS_M_CAP` 时把 w_sum 与 M 同比例缩回。
-//      估计 = `w_sum / M` = π·⟨L⟩（与旧缓存 `E_store` 同语义）⇒ 写进 `gi_out` 前再乘增益、除 π。
-//      为什么借用射线**不各自占一个 M 增量**：M 封顶时每帧多插 k 个候选等价于把记忆帧数从 M 缩到
-//      M/k ⇒ 逐帧闪烁 ∝ √k 变差（k = 3 时实测/推导都是 +1.7×），静态空间 σ 基本不变；改成帧内
-//      等权平均后，k 条射线共享一个 M 增量 ⇒ 记忆帧数不变，而逐帧闪烁与静态 σ 同时按 1/√k 下降。
+//  ① **样本等价 = 精确几何面键**，不是位置/法线启发式。
+//     主命中面键（体素 + 面 + 物体）逐位相等 ⇒ 目标函数逐字相同 ⇒ 合并累计量是精确的 RIS 合并，
+//     零偏差、零额外射线。面在键里 ⇒ 薄板两侧天然是两个键 ⇒ 不漏光。
+//  ② **空间复用零射线**：跨体素的同平面邻居只**并累计量**，不借方向、不重发射线。
+//     旧版让邻居「借代表性方向 + 从本像素重发」并把这个候选并入 RIS 竞争，有两个后果：
+//     · 它只在「tap 键不同」时触发 ⇒ 只发生在体素面交界处 ⇒ 交界处被塞进偏亮的候选成一个亮斑；
+//     · 代表性样本是按亮度加权抽出来的（不是余弦样本）⇒ 源 pdf 与权重 `π·L` 不匹配 ⇒
+//       系统性偏亮，而且这个偏亮的方向会被邻像素逐帧重新选中、在屏幕上漂移
+//       （表现为「沿体素边缘的网格亮斑 + 水下光斑式浮动」）。
+//     现在代表样本恒来自**本像素的新鲜余弦采样**（源 pdf 恒为余弦，`π·L` 才是正确权重），
+//     跨体素平滑完全交给「并累计量」——同键（目标函数逐字相同）与同平面（法线相似 + 平面检验
+//     通过 ⇒ 法线相同、平面相同 ⇒ cosθ 相同，只有射线起点差一格）两种都并。
+//  ③ **空间复用的结果绝不回写时域历史**。
+//     空间复用读的是**上一帧**邻居的 reservoir；把合并结果存回本像素，下一帧的历史里就混进了
+//     邻居的历史 ⇒ 时域链被横向污染（相关性、拖影、移动物体「前沿带」）。
+//     所以 `gi_res_store_cur` 只写**新鲜 + 时域**的 `r`，空间合并只作用在本帧的着色估计上。
+//  ④ **逐体素平坦不被破坏**：同一个面的所有像素并的是同一组邻居 ⇒ 面内仍是一个值（不产生面内
+//     梯度）；被平滑掉的是**相邻面之间**的台阶，这正是「网格亮斑」的来源。
 //
-// 薄板/墙缝安全：主键里的**面**（`gi_key1` 的 3 bit）使薄板两侧是两个不同的键；时域与空间两路都
-// 要求精确键相等或（借用档）法线 + 平面检验通过（另一侧法线相反 / 平面距离 = 1 个体素边长）；
-// 且**所有辐亮度都由本像素自己的射线求得** ⇒ 任何一档都不可能把邻居的光搬过来。
+// 每像素每帧的射线预算（`GI_SS_*`，权威值在 `gi/consts.wesl`）：
+//   `GI_SS_CAND_N` 条新鲜余弦候选（去遮挡像素改用 `GI_SS_CAND_BOOST`）
+//   + ≤1 条时域二次顶点验证射线（世界几何逐位未变时整条省掉）
+//   其中命中几何的射线各带 ≤1 条太阳 NEE 阴影射线。**没有任何空间复用射线**。
+//
+// 薄板 / 墙缝安全：主键与二次顶点键都带「面」；时域要求键逐位相等，空间要求键相等或
+// 「法线相似 + 平面检验」通过（1 格薄板的另一侧法线相反 / 平面距离一整格 ⇒ 精确拒掉）。
 // ============================================================================
 
 /// reservoir 字数（Rust 侧从本文件解析同名字面量开 buffer）。
@@ -64,7 +52,7 @@ const GI_RES_W_PK: u32 = 8u; // 主命中面键（gi_key0 / gi_key1）
 const GI_RES_W_SK: u32 = 10u; // 选中样本的二次顶点键（gi_key0 / gi_key1）
 const GI_RES_W_FLAGS: u32 = 12u; // 状态位（见下）
 /// 主命中面的**逐体素法线**（八面体 f16x2；与降噪导引同一个 `gi_pack_dir` 口径）。
-/// 空间借用档的相似性判定要用它：它描述的是「上一个方向是从哪个半球里采出来的」。
+/// 空间复用的同平面判定用它：它描述「样本方向是从哪个半球里采出来的」。
 const GI_RES_W_NRM: u32 = 13u;
 /// 主命中**体素中心**的世界位置（3 word；与降噪导引同一口径 ⇒ 平面检验同义）。
 const GI_RES_W_POS: u32 = 14u;
@@ -77,13 +65,13 @@ const GI_RES_SK_HIT: u32 = 4u;
 /// 二次顶点键可比较（`gi_key_ok` 或天空）⇒ 只有它置位才允许做二次顶点键的相等判定。
 const GI_RES_SK_OK: u32 = 8u;
 
-/// 单个 GI 像素（网格 = 渲染分辨率 / gi_div）的 reservoir。
-/// `w_sum` / `M` 是**跨帧累计量**（RIS 的 M 上限抑制历史支配）；`dir`/`rad`/`sk*` 是被选中
-/// 的那个样本（供下游借用方重连接用；本像素自己的估计只用 `w_sum / M`）。
-/// `nrm`/`pos` = 主命中面的逐体素法线与命中体素中心世界位置（**空间借用档的相似性判定用**：
+/// 单个 GI 像素的 reservoir。
+/// `w_sum` / `M` 是**跨帧累计量**（`M` 上限 = `GI_SS_M_CAP_K` × 本帧新鲜候选数）；
+/// `dir`/`rad`/`sk*` 是被选中的那个样本（本像素最近一次的新鲜余弦采样，供降噪/诊断用；
+/// 估计只用 `w_sum / M`，所以代表样本抽得偏亮**不会**让估计偏亮）。
+/// `nrm`/`pos` = 主命中面的逐体素法线与命中体素中心世界位置（空间复用的同平面判定用）：
 /// 两者都是本像素自己的几何，和 `pk0/pk1` 一样随 reservoir 一起跨帧存 —— 这样邻居读到的
-/// 几何与它读到的方向/键**必然来自同一帧**，不需要再去读导引（那份是单缓冲、同一 pass 内
-/// 会被本帧其他线程改写 ⇒ 读到的是本帧/上帧的混合，非确定）。
+/// 几何与它读到的键**必然来自同一帧**（导引是单缓冲、同一 pass 内会被其他线程改写）。
 struct GiRes {
   dir: vec3<f32>,
   rad: vec3<f32>,
@@ -98,24 +86,19 @@ struct GiRes {
   pos: vec3<f32>,
 }
 
-/// 空 reservoir（天空 / 介质像素）：`M = 0` ⇒ 下一帧任何时序/空间复用都判为无效，不会读到脏值。
+/// 上一帧 reservoir 里**空间复用真正要读**的那几个字（几何 + 法线）。
+struct GiTapGeom {
+  n: vec3<f32>,
+  p: vec3<f32>,
+}
+
+/// 空 reservoir（天空 / 介质像素）：`M = 0` ⇒ 下一帧任何时域/空间复用都判为无效，不会读到脏值。
 fn gi_res_none() -> GiRes {
   return GiRes(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0u, 0u, 0u, 0u, 0u,
                vec3<f32>(0.0), vec3<f32>(0.0));
 }
 
-/// 首个候选（新鲜射线）建 reservoir。`nrm`/`pos` = 主命中面的逐体素法线与命中体素中心世界位置
-/// （空间借用档的相似性判定的两端之一；存进 reservoir ⇒ 与 `pk0/pk1`、`dir` 同帧同源）。
-fn gi_res_new(pk0: u32, pk1: u32, pk_ok: bool, dir: vec3<f32>, rad: vec3<f32>, sk0: u32,
-               sk1: u32, sk_hit: bool, sk_ok: bool, nrm: vec3<f32>, pos: vec3<f32>) -> GiRes {
-  var flags = GI_RES_VALID;
-  if (pk_ok) { flags = flags | GI_RES_PK_OK; }
-  if (sk_hit) { flags = flags | GI_RES_SK_HIT; }
-  if (sk_ok) { flags = flags | GI_RES_SK_OK; }
-  return GiRes(dir, rad, rad * GI_PI, 1.0, pk0, pk1, sk0, sk1, flags, nrm, pos);
-}
-
-/// 读**上一帧**的 reservoir（`gi_res_prev`）。
+/// 读**上一帧**的 reservoir（`gi_res_prev`）。只给**时域复用**用（每像素一次，需要 dir/sk）。
 fn gi_res_load_prev(idx: u32) -> GiRes {
   let b = idx * GI_RES_WORDS;
   return GiRes(
@@ -145,7 +128,37 @@ fn gi_res_load_prev(idx: u32) -> GiRes {
   );
 }
 
+/// 空间复用读 tap 的第一级：`(flags, pk0, pk1)` 三个字。绝大多数 tap 在这里就被判掉
+/// （空 / 天空像素 / 键不可编码），不必读整条 17 字 —— 每像素 8 个 tap，少读的字数直接是带宽。
+fn gi_tap_head(idx: u32) -> vec3<u32> {
+  let b = idx * GI_RES_WORDS;
+  return vec3<u32>(gi_res_prev[b + GI_RES_W_FLAGS], gi_res_prev[b + GI_RES_W_PK],
+                   gi_res_prev[b + GI_RES_W_PK + 1u]);
+}
+
+/// 空间复用读 tap 的第二级（只在通过第一级、且**键不同**时才需要）：逐体素法线 + 命中体素中心。
+fn gi_tap_geom(idx: u32) -> GiTapGeom {
+  let b = idx * GI_RES_WORDS;
+  return GiTapGeom(gi_unpack_dir(gi_res_prev[b + GI_RES_W_NRM]), vec3<f32>(
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_POS]),
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_POS + 1u]),
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_POS + 2u]),
+  ));
+}
+
+/// 空间复用读 tap 的第三级（只在并入时）：累计量（rgb = `w_sum`、a = `M`）。4 个字。
+fn gi_tap_merge(idx: u32) -> vec4<f32> {
+  let b = idx * GI_RES_WORDS;
+  return vec4<f32>(
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_WSUM]),
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_WSUM + 1u]),
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_WSUM + 2u]),
+    bitcast<f32>(gi_res_prev[b + GI_RES_W_M]),
+  );
+}
+
 /// 写**本帧**的 reservoir（`gi_res_cur`；两块 buffer 每帧在 Rust 侧 ping-pong 换绑）。
+/// **只允许写「新鲜 + 时域」的结果**（见文件头 ③）：空间复用的合并量绝不经过这里。
 fn gi_res_store_cur(idx: u32, r: GiRes) {
   let b = idx * GI_RES_WORDS;
   gi_res_cur[b + GI_RES_W_DIR] = gi_pack_dir(r.dir);
@@ -167,10 +180,8 @@ fn gi_res_store_cur(idx: u32, r: GiRes) {
   gi_res_cur[b + GI_RES_W_POS + 2u] = bitcast<u32>(r.pos.z);
 }
 
-/// 并入另一个 reservoir 的**累计量**（`w_sum += w_sum`、`M += M`）。
-/// 只允许在「目标函数逐字相同」时调用 ⇒ 主命中面键完全一致（调用方先判）。
-/// 这样做无偏：两者都是同一个积分的估计量，取加权平均仍是该积分的无偏估计。
-/// 选中样本保持**本帧新鲜候选**（它只作为「代表样本」被下游借用方重连接，不参与估计）。
+/// 并入另一个 reservoir 的**累计量**（`w_sum += w_sum`、`M += M`）。只给时域复用用
+/// （调用方先判「主命中面键逐位相等」）⇒ 目标函数逐字相同 ⇒ 合并无偏。
 fn gi_res_adopt(r: GiRes, h: GiRes) -> GiRes {
   var out = r;
   out.w_sum = r.w_sum + h.w_sum;
@@ -178,13 +189,16 @@ fn gi_res_adopt(r: GiRes, h: GiRes) -> GiRes {
   return out;
 }
 
-/// M 上限：超过就同比例缩回（`w_sum / M` 不变，只抑制历史对抽样的支配）。
-fn gi_res_cap(r: GiRes) -> GiRes {
-  if (r.m <= f32(GI_SS_M_CAP)) { return r; }
-  let shrink = f32(GI_SS_M_CAP) / r.m;
+/// M 上限（业界：M ≤ 20 × M_new）：超过就同比例缩回 —— `w_sum / M` 不变（估计不变），
+/// 只抑制历史对代表样本抽样的支配。以**本帧新鲜候选数**为基准是必须的：
+/// 去遮挡帧的候选数翻倍 ⇒ 上限跟着翻倍，否则 boost 打进去的候选会被立刻压掉、boost 等于白做。
+fn gi_res_cap(r: GiRes, cand_n: u32) -> GiRes {
+  let cap = f32(GI_SS_M_CAP_K * cand_n);
+  if (r.m <= cap) { return r; }
+  let shrink = cap / r.m;
   var out = r;
   out.w_sum = r.w_sum * shrink;
-  out.m = f32(GI_SS_M_CAP);
+  out.m = cap;
   return out;
 }
 
@@ -194,7 +208,7 @@ fn gi_ss_seed(coord: vec2<i32>, frame: u32) -> u32 {
   return gi_mix(ph + gi_mix(frame * 0x9E3779B9u + 0x27D4EB2Fu));
 }
 
-/// 世界点 → **上一帧**的 GI 像素坐标（用 `gi_u.prev_view_proj`；落在视锥/屏幕外则 `ok = false`）。
+/// 世界点 → **上一帧**的 GI 像素坐标（用 `gi_u.prev_view_proj`；落在视锥 / 屏幕外则 `ok = false`）。
 /// 只重投影三维点（不重投影深度）⇒ 不需要上一帧的逆矩阵。
 fn gi_ss_reproject(p_world: vec3<f32>, size: vec2<u32>, ok: ptr<function, bool>) -> vec2<i32> {
   let clip = gi_u.prev_view_proj * vec4<f32>(p_world, 1.0);
@@ -217,9 +231,7 @@ fn gi_ss_reproject(p_world: vec3<f32>, size: vec2<u32>, ok: ptr<function, bool>)
   return c;
 }
 
-/// 空间复用的候选 tap 偏移（上帧同屏的 3×3 环）。
-/// **前 4 个恒是 4 个轴邻、顺序与改造前的空间复用逐字一致** —— `GI_SS_REUSE_RAYS = 0`
-/// （A/B 的对照档）时只用这 4 个 ⇒ 那条路径与改造前完全相同。
+/// 空间复用的候选 tap 偏移（上帧本面所在位置的 3×3 环）。
 fn gi_ss_tap_offset(s: u32) -> vec2<i32> {
   if (s == 0u) { return vec2<i32>(1, 0); }
   if (s == 1u) { return vec2<i32>(-1, 0); }
@@ -231,20 +243,20 @@ fn gi_ss_tap_offset(s: u32) -> vec2<i32> {
   return vec2<i32>(-1, -1);
 }
 
-/// 空间借用档的相似性判定（决定「能不能借邻居的方向」）—— 与降噪侧**同一套**判据：
-///  ① 法线相似 `dot(n_nbr, n_c) ≥ GI_DEN_N_DOT`：邻居存的法线是**逐体素法线**（不是面法线）⇒
+/// 同平面判定（决定「能不能并邻居的累计量」）—— 与降噪侧**同一套**判据：
+///  ① 法线相似 `dot(n_nbr, n_c) ≥ GI_DEN_N_DOT`：两端都是**逐体素法线**（不是面法线）⇒
 ///     1 体素薄板的另一侧法线相反、拐角处法线斜着 ⇒ 都直接拒；
 ///  ② 平面检验 `|(p_nbr − p_c)·n_c| < tol`：两端都取命中**体素中心** ⇒ 同一平面上相邻体素
 ///     该内积**恰好为 0**，而薄板另一侧 = 1 个体素世界边长 > tol（= 0.5 × 边长）⇒ 精确拒掉，
 ///     且与距离无关（远景薄板也不会因为像素足迹变大而漏）。
 /// 只用几何（法线 / 位置），没有任何「颜色相近」的启发式。
 /// `tol` 由调用方给（= `GI_DEN_PLANE_K` × 本像素命中体素的世界边长）。
-fn gi_ss_similar(p_c: vec3<f32>, n_c: vec3<f32>, tol: f32, nb: GiRes) -> bool {
-  return dot(nb.nrm, n_c) >= GI_DEN_N_DOT && abs(dot(nb.pos - p_c, n_c)) < tol;
+fn gi_ss_coplanar(p_c: vec3<f32>, n_c: vec3<f32>, tol: f32, nb: GiTapGeom) -> bool {
+  return dot(nb.n, n_c) >= GI_DEN_N_DOT && abs(dot(nb.p - p_c, n_c)) < tol;
 }
 
-/// 屏幕空间逐面 ReSTIR 的本像素入口（由 `gi_main` 在 `GI_CACHE_ON = false` 时调用）。
-/// 只处理「首命中即不透明」；天空 / 介质像素写 valid = 0（与旧路径、`dda_main` 的玻璃分支一致）。
+/// 屏幕空间 ReSTIR 的本像素入口（`gi_main` 调用）。
+/// 只处理「首命中即不透明」；天空 / 介质像素写 valid = 0（与 `dda_main` 的玻璃分支一致）。
 fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let idx = u32(coord.y) * size.x + u32(coord.x);
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
@@ -264,7 +276,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
   let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
   let n = voxel_normal(gg, h.voxel, h.n);
-  // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS：与 `dda_main` / 旧缓存射线起点同一套外推。
+  // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS：与 `dda_main` 同一套外推（起点离开命中体素）。
   let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
   let org = p_voxel + n * n_off;
 
@@ -280,122 +292,131 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 重投影用**真实命中点** `h.point`（不是体素中心）：静止相机下它正好映回本像素
   // ⇒ 上帧历史就是本像素自己的（M 才能一路累加）。用体素中心会偏 1~2 像素，导致约 1/3 的像素
   // 每帧都因为「上帧那个像素不是同一个面」而丢掉历史（实测接受率只有 68%）。
-  var den_prev_ok = false;
-  let den_pc = gi_ss_reproject(h.point, size, &den_prev_ok);
-  gi_den_guide_store(coord, size, true, pk0, pk1, p_voxel, n, GI_DEN_PLANE_K * gg.scale, den_prev_ok,
-                     den_pc);
+  var prev_ok = false;
+  let prev_pc = gi_ss_reproject(h.point, size, &prev_ok);
+  gi_den_guide_store(coord, size, true, pk0, pk1, p_voxel, n, GI_DEN_PLANE_K * gg.scale, prev_ok,
+                     prev_pc);
 
-  // ---- ① 新鲜路径：1 条余弦加权半球方向（GI 射线；命中时 helper 内含 1 条太阳 NEE 阴影射线）----
-  let dir_f = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + 1u)));
-  let s_f = gi_ray_radiance(org, dir_f, sun_dir, sun_c);
-  var r = gi_res_new(pk0, pk1, pk_ok, dir_f, s_f.l, s_f.sk0, s_f.sk1, s_f.sk_hit, s_f.sk_ok,
-                     n, p_voxel);
-
-  if (pk_ok) {
-    // ---- ② 时域复用：重投影 + 精确键筛（主键 + 二次顶点键）----
-    // 重投影用**真实命中点**（`den_pc`，与降噪导引、空间 tap 共用同一份）：静止相机下它正好映回
-    // 本像素 ⇒ 上帧历史就是本像素自己的。改用体素中心会偏 1~2 像素，约 1/3 的像素每帧都因为
-    // 「上帧那个像素不是同一个面」丢掉历史（实测接受率只有 68%）。
-    // **重投影只负责提名候选，接不接受由下面两个精确键判据决定** ⇒ 提名变准只会提高接受率，
-    // 不可能放进一个错的候选（跨薄板/墙缝的判定完全不依赖重投影）。
-    // TEMP(A/B)：flags.x 的 bit1 ⇒ 退回体素中心重投影（= 改造前行为）
-    var prev_ok = den_prev_ok;
-    var pc = den_pc;
-    if ((u32(gi_u.flags.x) & 2u) != 0u) {
-      pc = gi_ss_reproject(p_voxel, size, &prev_ok);
-    }
-    if (prev_ok) {
-      let hist = gi_res_load_prev(u32(pc.y) * size.x + u32(pc.x));
-      // 主键必须完全一致：不同体素 / 不同面 / 不同物体一律不接（薄板两侧是两个键）。
-      if ((hist.flags & GI_RES_VALID) != 0u && (hist.flags & GI_RES_PK_OK) != 0u
-          && hist.pk0 == pk0 && hist.pk1 == pk1) {
-        // 重连接射线（本帧唯一的 ≤1 预算）：沿历史方向重发，用它的二次顶点键验证历史样本。
-        // 它**只用于验证**、不并进 RIS：同一个方向每帧被重加，会让 `w_sum / M` 逐渐「锁定」到
-        // 那个方向的 L —— 抽样是按亮度加权的，被锁定的必然偏亮 ⇒ 估计系统性偏亮（实测 ~+25%）。
-        // 只需要键 ⇒ 走轻量版（不做 NEE / 不读缓存），这条射线的开销就是一条裸 `world_raycast`。
-        //
-        // **整条省掉的条件**（uniform `flags.z`，Rust `prepare_gi` 的 `skip_verify`）：世界几何自
-        // 「写入 `hist` 的那一帧」起逐位未变 ⇒ 这条射线与当初写入 `hist.sk` 的那条输入完全相同
-        // （方向取自 `hist.dir`，原点由已校验逐位相等的主键唯一决定）⇒ 结果必然逐位相同 ⇒
-        // 判定退化成「历史那个键当时可比较吗」，一个位测试就够。世界变过就照旧发射线。
-        var same_sk = false;
-        if (gi_u.flags.z > 0.5) {
-          same_sk = (hist.flags & GI_RES_SK_OK) != 0u;
-        } else {
-          let s_r = gi_ray_secondary_key(org, hist.dir);
-          same_sk = s_r.sk_hit == ((hist.flags & GI_RES_SK_HIT) != 0u)
-            && s_r.sk_ok && s_r.sk0 == hist.sk0 && s_r.sk1 == hist.sk1;
-        }
-        if (same_sk) {
-          // 二次顶点键逐位一致 ⇒ 历史样本就是「本面看到的同一个方向的同一段光路」⇒ 累计量有效。
-          // 累计量是**独立余弦样本权重的运行平均**（每帧只进 1 个新鲜候选）⇒ 无偏，且随时间降噪。
-          r = gi_res_adopt(r, hist);
-        }
+  // ---- ① 时域复用：先判「有没有可用历史」，它决定本帧的新鲜候选数（去遮挡 boost）----
+  // 判据是**精确键**（不是启发式）：主命中面键（体素,面,物体）必须完全一致；
+  // 再接一条重连接射线（本帧唯一的那条，≤1）沿历史方向重发，用它的二次顶点键与历史存的那个做
+  // **逐位相等**比较 —— 不一致就丢掉历史累计量（世界变了 / 不是同一个面）；一致就接过来。
+  // 重连接射线只求键（裸 `world_raycast`，不带 NEE）、**不进 RIS**（见下方 ② 处注释）。
+  // **世界几何自写入历史那一帧起逐位未变时（uniform `flags.z`）这条验证射线整条省掉** ——
+  // 输入完全相同 ⇒ 结果必然逐位相同，这是静态 / 纯相机运动下最大的一笔省。
+  var hist = gi_res_none();
+  var hist_ok = false;
+  if (pk_ok && prev_ok) {
+    let cand = gi_res_load_prev(u32(prev_pc.y) * size.x + u32(prev_pc.x));
+    if ((cand.flags & (GI_RES_VALID | GI_RES_PK_OK)) == (GI_RES_VALID | GI_RES_PK_OK)
+        && cand.pk0 == pk0 && cand.pk1 == pk1) {
+      var same_sk = false;
+      if (gi_u.flags.z > 0.5) {
+        same_sk = (cand.flags & GI_RES_SK_OK) != 0u;
+      } else {
+        let s_r = gi_ray_secondary_key(org, cand.dir);
+        same_sk = s_r.sk_hit == ((cand.flags & GI_RES_SK_HIT) != 0u)
+          && s_r.sk_ok && s_r.sk0 == cand.sk0 && s_r.sk1 == cand.sk1;
       }
-    }
-
-    // ---- ③ 空间复用：上帧 3×3 环上的 8 个 tap（起点按像素哈希轮转 ⇒ 各像素借的邻居不同）----
-    // `GI_SS_REUSE_RAYS = 0` 时退化成「只用 4 个轴邻 + 只做同键直并」＝ 改造前的空间复用（A/B 对照档）。
-    //
-    // **tap 的中心 = 本帧命中点上帧的重投影位置（`den_pc`），不是本像素**。这一条是空间复用能不能
-    // 扛住相机运动的分水岭：像素 `coord + offset` 上帧看到的是「上帧恰好落在那里的那个面」，它只在
-    // 相机静止（或纯旋转且表面正面朝向相机）时才与本面共面 —— 相机一平移，上帧那个像素看到的是
-    // 完全不同的面 ⇒ 同键率掉到 0（实测平移段 0.000/像素）、相似性通过率掉到 ~5%，8 个 tap 全白读。
-    // 把中心放到「上帧本面所在的屏幕位置」上，读到的才是**本面上帧的邻居**（同键 ⇒ 零射线直并）
-    // 与它们的世界共面邻面（借用档）。
-    // 静止相机下 `den_pc` 恒等于本像素（命中点沿同一条相机射线投回同一像素）⇒ **与改造前逐位一致**；
-    // 重投影失败（上帧本面不在视锥/屏幕内）时退回本像素 = 改造前行为（此时没有任何可复用的世界对应）。
-    // TEMP(A/B)：flags.x > 0.5 ⇒ tap 中心退回本像素（= 改造前行为）
-    let tb = select(select(coord, den_pc, den_prev_ok), coord, gi_u.flags.x > 0.5);
-    let taps = select(GI_SS_REUSE_TAPS, 4u, GI_SS_REUSE_RAYS == 0u);
-    let rot = select(gi_ss_seed(coord, frame + 0x51u) % taps, 0u, GI_SS_REUSE_RAYS == 0u);
-    let tol = GI_DEN_PLANE_K * gg.scale;
-    var borrow_n = 0.0; // 本帧借到的候选数（= 真正发出去的借用射线数）
-    var borrow_l = vec3<f32>(0.0);
-    for (var t = 0u; t < taps; t = t + 1u) {
-      let nc = tb + gi_ss_tap_offset((t + rot) % taps);
-      if (nc.x < 0 || nc.y < 0 || nc.x >= i32(size.x) || nc.y >= i32(size.y)) { continue; }
-      let nb = gi_res_load_prev(u32(nc.y) * size.x + u32(nc.x));
-      if ((nb.flags & (GI_RES_VALID | GI_RES_PK_OK)) != (GI_RES_VALID | GI_RES_PK_OK)) { continue; }
-      // a) 同键快路：同一个体素同一个面 ⇒ 目标函数逐字相同 ⇒ 直接并累计量（零射线、零偏差）。
-      if (nb.pk0 == pk0 && nb.pk1 == pk1) {
-        r = gi_res_adopt(r, nb);
-        continue;
+      if (same_sk) {
+        hist = cand;
+        hist_ok = true;
       }
-      // b) 借用档：主键不同 ⇒ 过相似性判定（法线 + 平面检验，见 `gi_ss_similar`）才借它的方向，
-      //    从**本像素**重发一条射线。借的只是方向、辐亮度由本像素自己求 ⇒ 不会把邻居的光带过来、
-      //    不跨薄板/墙缝（遮挡由真实几何决定，与邻居是谁无关）。
-      if (borrow_n >= f32(GI_SS_REUSE_RAYS)) { continue; }
-      if (!gi_ss_similar(p_voxel, n, tol, nb)) { continue; }
-      let d_b = nb.dir;
-      // 方向必须落在本像素自己的半球内（邻居法线与自己最多差 25°，余弦半球的边缘上会有少数方向
-      // 落到本面之下）：那条射线只会立刻自交、白费预算 ⇒ 直接跳过。丢弃只取决于几何、与亮度无关
-      // ⇒ 不引入偏差。
-      if (dot(d_b, n) <= 1e-3) { continue; }
-      // 与新鲜候选**同一条求值口径**（`gi_ray_radiance`：命中时含二次顶点的太阳 NEE）。
-      // 不能用只求键的轻量版：那会让借用候选丢掉二次顶点的太阳项 ⇒ 借用比例一高就系统性偏暗。
-      let s_b = gi_ray_radiance(org, d_b, sun_dir, sun_c);
-      borrow_l = borrow_l + s_b.l;
-      borrow_n = borrow_n + 1.0;
-    }
-    // 借用射线与新鲜射线做**帧内等权平均**，再作为一个候选计入 M（见文件头 ④ 的推导：每条借用
-    // 射线各占一个 M 增量 = 把记忆帧数从 M 缩到 M/k ⇒ 闪烁 ∝ √k 变差；共享一个 M 增量 ⇒ 反而 ↓√k）。
-    // 做法：从 w_sum 里扣掉「未平均的新鲜项」（= `gi_res_new` 放进去的 `rad·π`），再加回
-    // 「新鲜 + 借用的等权平均」—— 只碰本帧的新鲜候选，不动时域历史 / 同键直并的累计量。
-    if (borrow_n > 0.0) {
-      let inv = GI_PI / (1.0 + borrow_n);
-      r.w_sum = r.w_sum - r.rad * GI_PI + (r.rad + borrow_l) * inv;
     }
   }
 
-  // ---- ④ RIS 合并 + 写输出 ----
-  r = gi_res_cap(r);
-  // 估计 = w_sum / M = π·⟨L⟩（= 旧缓存 `E_store`）⇒ 乘增益、除 π 后与 `gi_supply` 逐字同口径。
-  let est = r.w_sum / max(r.m, 1e-6);
-  // 选中样本的方向/亮度也留在 reservoir 里供下一帧借用方重连接（估计只用累计量）。
+  // ---- ② 新鲜候选：`cand_n` 条余弦加权半球方向（无历史 = 去遮挡 ⇒ 用 boost 档）----
+  // 每条走 `gi_ray_radiance`（1 条 GI 射线，命中时含 1 条太阳 NEE 阴影射线）。
+  // RIS：累计量 `w_sum = Σ π·L`、`M = cand_n`（估计 = w_sum / M = π·⟨L⟩）。
+  // 代表样本 = **只在这一组余弦候选里**做加权蓄水池抽样（源 pdf 恒是余弦 ⇒ 权重 `π·L` 才自洽；
+  // 见文件头 ②：绝不让空间复用进来的方向参与这个竞争）。
+  let cand_n = select(GI_SS_CAND_N, GI_SS_CAND_BOOST, !hist_ok);
+  var sel_cum = 0.0;
+  var sel_have = false;
+  var sel_dir = vec3<f32>(1.0, 0.0, 0.0);
+  var sel_l = vec3<f32>(0.0);
+  var sel_sk0 = 0u;
+  var sel_sk1 = 0u;
+  var sel_hit = false;
+  var sel_ok = false;
+  var r = gi_res_none();
+  for (var k = 0u; k < cand_n; k = k + 1u) {
+    let dir = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + k * 0x9E3779B9u + 1u)));
+    let s = gi_ray_radiance(org, dir, sun_dir, sun_c);
+    let w = s.l * GI_PI;
+    let lum = max(dot(w, GI_LUMA), 0.0);
+    r.w_sum = r.w_sum + w;
+    r.m = r.m + 1.0;
+    sel_cum = sel_cum + lum;
+    let u = gi_rand2(gi_mix(seed + k * 0x85EBCA77u + 7u)).x;
+    if (!sel_have || u * sel_cum < lum) {
+      sel_have = true;
+      sel_dir = dir;
+      sel_l = s.l;
+      sel_sk0 = s.sk0;
+      sel_sk1 = s.sk1;
+      sel_hit = s.sk_hit;
+      sel_ok = s.sk_ok;
+    }
+  }
+
+  // ---- ③ 空间复用：读**上一帧**邻居的 reservoir 只并累计量（零射线），只影响本帧估计（见 ④）----
+  // tap 的中心 = 本帧命中点上帧的重投影位置（`prev_pc`），不是本像素：读上帧 reservoir 时
+  // 像素 `coord + offset` 上帧看到的是「上帧恰好落在那里的那个面」，相机一平移就完全不是同一个面
+  // ⇒ 命中率掉到 0。把中心放到「上帧本面所在的屏幕位置」，读到的才是**本面上帧的邻居**。
+  // 静止相机下 `prev_pc` 恒等于本像素 ⇒ 与朴素做法逐位一致；重投影失败时退回本像素。
+  // 两种 tap 都并累计量（`w_sum` / `M`）：
+  //  a) **同键**：主命中面键逐位相等 ⇒ 目标函数逐字相同 ⇒ 合并是纯降噪、零偏差；
+  //  b) **同平面**（键不同但过 `gi_ss_coplanar`）：法线相同、平面相同 ⇒ cosθ 相同，只有射线
+  //     起点差一格 ⇒ 目标函数差一个一阶小量；这是「相邻面的台阶」被抹平、网格亮斑消失的原因。
+  //     1 体素薄板的另一侧过不了平面检验 ⇒ 不跨薄板、不漏光。
+  let tb = select(coord, prev_pc, prev_ok);
+  let tol = GI_DEN_PLANE_K * gg.scale;
+  var sk_sum = vec3<f32>(0.0);
+  var sk_m = 0.0;
+  for (var t = 0u; t < GI_SS_REUSE_TAPS; t = t + 1u) {
+    let nc = tb + gi_ss_tap_offset(t);
+    if (nc.x < 0 || nc.y < 0 || nc.x >= i32(size.x) || nc.y >= i32(size.y)) { continue; }
+    let nidx = u32(nc.y) * size.x + u32(nc.x);
+    let head = gi_tap_head(nidx);
+    if ((head.x & (GI_RES_VALID | GI_RES_PK_OK)) != (GI_RES_VALID | GI_RES_PK_OK)) { continue; }
+    // a) 同键：直接并。
+    var ok = head.y == pk0 && head.z == pk1;
+    if (!ok) {
+      // b) 同平面：要读几何（法线 + 体素中心）做平面检验。
+      ok = gi_ss_coplanar(p_voxel, n, tol, gi_tap_geom(nidx));
+    }
+    if (!ok) { continue; }
+    let wm = gi_tap_merge(nidx);
+    // `M` 是有效位的正数（上面已判 VALID）⇒ 直接并；`w_sum` 与 `M` 同步缩放过的累计量，
+    // 比值恒是「该面 π·⟨L⟩ 的滑动平均」⇒ 并进来只是加权平均，不改变估计的量纲。
+    sk_sum = sk_sum + wm.xyz;
+    sk_m = sk_m + wm.w;
+  }
+  r.dir = sel_dir;
+  r.rad = sel_l;
+  r.pk0 = pk0;
+  r.pk1 = pk1;
+  r.sk0 = sel_sk0;
+  r.sk1 = sel_sk1;
+  r.flags = GI_RES_VALID | select(0u, GI_RES_PK_OK, pk_ok)
+          | select(0u, GI_RES_SK_HIT, sel_hit) | select(0u, GI_RES_SK_OK, sel_ok);
+  r.nrm = n;
+  r.pos = p_voxel;
+
+  // ---- ④ 时域合并 + 写**时域** reservoir（空间复用的合并量绝不写回，见文件头 ③）----
+  if (hist_ok) { r = gi_res_adopt(r, hist); }
+  r = gi_res_cap(r, cand_n);
   gi_res_store_cur(idx, r);
+
+  // ---- ⑤ 着色：估计 = w_sum / M = π·⟨L⟩ ⇒ 乘增益、除 π；空间复用只加在这一步 ----
+  var est = r.w_sum / max(r.m, 1e-6);
+  if (sk_m > 0.0) {
+    est = (r.w_sum + sk_sum) / max(r.m + sk_m, 1e-6);
+  }
   let gi = est * (gi_u.params.z / GI_PI);
-  // 有数据 = 1（与旧路径 `gi_supply` 的 w 语义一致）：供 `dda_main` 的天光兜底权重使用。
+  // valid = 1（供 `dda_main` 的天光兜底权重使用）：GI 有数据 ⇒ 天光只占 `GI_AMBIENT_FLOOR` 倍。
   textureStore(gi_out, coord, vec4<f32>(gi, 1.0));
+  // storage texture 的 store 值恒为 vec4（rg32f 也不例外，多出的通道被丢弃）：r = cov、g = valid。
   textureStore(gi_cov_out, coord, vec4<f32>(1.0, 1.0, 0.0, 0.0));
 }

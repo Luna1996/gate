@@ -74,33 +74,27 @@ impl Default for UploadBudget {
 #[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrickMapRevision(pub u64);
 
-/// 本帧上传改动产生的**世界 voxel 脏盒**（闭开 `[lo, hi)`）＋失效余量（voxel）。
-/// 余量按产生它的 volume 的 scale 放大（`max(基准, 基准 × scale)`）：同样的「局部 2 格」在
-/// scale = 2 的物体里对应 2 格世界空间的两倍。主世界（identity、scale = 1）= 基准余量。
+/// 本帧上传改动产生的**世界 voxel 脏盒**（闭开 `[lo, hi)`）。
+/// 唯一消费者是 `gi::prepare_gi` 的「世界几何修订号」——它只需要回答「本帧世界变没变」，
+/// 因此盒用世界 AABB 就够（旧版还带一个「失效余量」供世界空间 GI 缓存条目失效判定，
+/// 那条缓存已整条删除，余量与它一起移除）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DirtyBox {
   pub lo: IVec3,
   pub hi: IVec3,
-  pub margin: f32,
 }
 
 impl DirtyBox {
-  /// 两盒是否重叠（含各自余量）—— 重叠就并成一盒，避免盒数被同一片区域的多次编辑撑爆。
+  /// 两盒是否重叠 —— 重叠就并成一盒，避免盒数被同一片区域的多次编辑撑爆。
   pub fn overlaps(&self, other: &Self) -> bool {
-    let m = self.margin.max(other.margin);
-    let lo = self.lo.as_vec3() - glam::Vec3::splat(m);
-    let hi = self.hi.as_vec3() + glam::Vec3::splat(m);
-    let olo = other.lo.as_vec3() - glam::Vec3::splat(m);
-    let ohi = other.hi.as_vec3() + glam::Vec3::splat(m);
-    // 闭开区间 + 余量 ⇒ 用闭区间判重叠（并集只会更大 ⇒ 只会多失效，不会漏失效）。
-    lo.cmple(ohi).all() && olo.cmple(hi).all()
+    // 闭开区间 ⇒ 用闭区间判重叠（并集只会更大 ⇒ 只会多报变化，不会漏报）。
+    self.lo.cmple(other.hi).all() && other.lo.cmple(self.hi).all()
   }
 
-  /// 并入另一盒（取并集；余量取大者）。
+  /// 并入另一盒（取并集）。
   pub fn union_with(&mut self, other: &Self) {
     self.lo = self.lo.min(other.lo);
     self.hi = self.hi.max(other.hi);
-    self.margin = self.margin.max(other.margin);
   }
 }
 
@@ -110,21 +104,15 @@ impl DirtyBox {
 pub struct BrickMapDirty {
   pub full: bool,
   /// 本帧调色板版本发生变化（只改材质的编辑：换色 / 改粗糙度等）。
-  /// palette 是共享的，改一个色号无法廉价定位受影响体素 ⇒ GI 侧走「自增世代」的全量失效。
+  /// palette 是共享的，改一个色号无法廉价定位受影响体素 ⇒ 当作「世界整体变了」上报。
   pub palette_changed: bool,
   pub boxes: Vec<DirtyBox>,
 }
 
-/// volume **局部** voxel AABB（闭开 `[lo, hi)`）→ 世界 voxel 脏盒 ＋ 失效余量。
+/// volume **局部** voxel AABB（闭开 `[lo, hi)`）→ 世界 voxel AABB。
 /// 世界变换与 shader 一致：`world = pos + rot · (local · scale)`；取局部 AABB 八个角点的世界外包
-/// ⇒ 旋转 / 缩放都保守（只会多失效，不会漏失效）。主世界（identity、scale = 1）恒等于 `lo/hi`，
-/// 余量 = 基准值 ⇒ 与旧版单盒行为逐字等价。
-/// 余量 = `max(基准, 基准 × scale)`：同样的「局部 2 格影响范围」在 scale 倍的物体里对应 scale 倍的世界空间。
-pub fn world_dirty_box(
-  t: gate_voxel::VolumeTransform,
-  lo: IVec3,
-  hi: IVec3,
-) -> DirtyBox {
+/// ⇒ 旋转 / 缩放都保守（只会多报变化，不会漏报）。主世界（identity、scale = 1）恒等于 `lo/hi`。
+pub fn world_dirty_box(t: gate_voxel::VolumeTransform, lo: IVec3, hi: IVec3) -> DirtyBox {
   let s = if t.scale.is_finite() && t.scale > 0.0 { t.scale } else { 1.0 };
   let mut mn = glam::Vec3::splat(f32::MAX);
   let mut mx = glam::Vec3::splat(f32::MIN);
@@ -137,12 +125,9 @@ pub fn world_dirty_box(
       }
     }
   }
-  // 基准值权威在 WESL `gi/consts.wesl`（`GI_CACHE_DIRTY_MARGIN_VOXELS`），Rust 侧解析后消费。
-  let base = crate::wesl_consts::gi_consts().gi_cache_dirty_margin_voxels as f32;
   DirtyBox {
     lo: IVec3::new(mn.x.floor() as i32, mn.y.floor() as i32, mn.z.floor() as i32),
     hi: IVec3::new(mx.x.ceil() as i32, mx.y.ceil() as i32, mx.z.ceil() as i32),
-    margin: base.max(base * s),
   }
 }
 
