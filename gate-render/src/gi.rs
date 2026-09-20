@@ -26,10 +26,13 @@ pub struct GiUniform {
   pub params: Vec4,
   /// x = GI 开关（0/1）、yzw = 保留（恒 0）
   pub misc: Vec4,
-  /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率；**整数值的 f32**，
+  /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率、4 = 四分之一；**整数值的 f32**，
   /// 只被 `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
   /// z = 世界几何自「写入上一帧 reservoir 的那一帧」起是否**逐位未变**（1 = 未变）⇒
-  /// 跳过时域二次顶点键验证射线、w = 保留（恒 0）
+  /// 跳过时域二次顶点键验证射线、w = **降噪质量档位**（0 = 关 / 1 = 低 / 2 = 中 / 3 = 高；
+  /// 菜单「渲染/RESTIR GI/降噪质量」）：`gi_ss_main` 按它取 1/4 档的新鲜候选数
+  /// （`GI_SS_CAND_N` vs `..._HQ`）与记忆窗（`GI_SS_M_CAP_K` vs `..._HQ`）——**这两项与分辨率档无关**。
+  /// 时域/atrous 的派发与核半径不在本 pass 里，由 Rust 的 `denoise_plan` 决定。
   pub flags: Vec4,
   /// x = 自增帧号（精确 u32；yzw 恒 0）。所有整数帧逻辑（本帧的 RNG 种子混入、像素 hash）都用它：
   /// 帧号曾经以 f32 存在 `params.x`，超过 2^24 后无法表示连续整数 ⇒ 种子会偶发重复。
@@ -45,15 +48,76 @@ pub struct GiUniform {
 pub struct GiSettings {
   /// GI 开关（关掉 = 整条 GI 链不派发，主 pass 只有太阳直射 + 天光兜底）。
   pub enabled: bool,
-  /// GI **分辨率除数**：1 = 全分辨率、2 = 半分辨率（GI 网格边长 = 渲染分辨率 ÷ 本值）。
-  /// 不是开关：1 与 2 **都跑 GI**，只是网格疏密与代价不同。
+  /// GI **分辨率除数**：1 = 全分辨率、2 = 半分辨率、4 = 四分之一（GI 网格边长 = 渲染分辨率 ÷ 本值）。
+  /// 不是开关：**每一档都跑 GI**，只是网格疏密与代价不同。
+  /// 代价按 **GI 像素数**涨：射线、降噪（时域 + 5 轮 atrous）、reservoir/历史带宽全都 ∝ 1/除数²
+  /// ⇒ 1/2 约是全分辨率的 1/4 时间、1/4 再降 4 倍。画质上 GI 是低频信号，1/4 几乎无差
+  /// （回全分辨率由几何感知上采样兜住几何边界，见 `main.wesl` 的 `gi_upsample_joint`）。
   pub gi_div: u32,
+  /// **降噪质量档**（菜单「渲染/RESTIR GI/降噪质量」）：把降噪链按成本分档，方便直接 A/B。
+  /// 每档只比上一档多一件事，成本单调递增（数值的权威在 `gi/consts.wesl`，Rust 只决定派发与取值）；
+  /// **与「分辨率」档正交**：下面这些项目对所有分辨率档一视同仁。
+  ///
+  /// | 档 | 时域累积 | atrous | 每像素候选数 | 记忆窗 | 比上一档多花什么 |
+  /// |---|---|---|---|---|---|
+  /// | 0 关 | ✗ | ✗ | 4 | 20 | —（基线：原始 GI + 几何感知上采样） |
+  /// | 1 低 | ✓ | 5 轮 · 3×3（8 tap） | 4 | 20 | +1 时域 pass + 5 个 atrous pass |
+  /// | 2 中 | ✓ | 5 轮 · 5×5（24 tap） | 4 | 20 | atrous 每轮 tap 8→24 |
+  /// | 3 高 | ✓ | 5 轮 · 5×5 | 8 | 32 | **候选数翻倍 = GI 射线翻倍**（全链最贵的一项） |
+  ///
+  /// 档 0 时 `dda_main` 直接采样原始 GI（`gi_out`）——**完全不降噪**，也没有时域/atrous pass。
+  /// 「候选数」与「记忆窗」只区分最高档（`screen.wesl` 读 `gi_u.flags.w`）；
+  /// 「atrous 核半径」区分 0..=1 / 2..=3（写进降噪的小配置 buffer，见 `AuxTexCache::den_cfg`）；
+  /// 「时域/atrous 是否派发、几轮」由 `denoise_plan` 决定（档 0 = 0 轮）。
+  /// 「几何感知上采样」不属于降噪（那是把 GI 在几何边界上正确重建），所有档都保留。
+  ///
+  /// 与业界 NRD/RELAX 的对照见 README 的技术要点第 4 条：本链 = 时域累积（方差驱动权重 + 累积矩 +
+  /// AABB 钳制）+ 5 轮迭代 atrous；**没有**独立的前滤 pass（等价物是时域内的共面邻域 mean ± K·σ
+  /// 离群钳制）与 fast-history/history-fix。
+  pub denoise: u32,
+}
+
+/// 「降噪质量」档的派发计划（`(是否跑降噪, atrous 轮数, atrous 核半径)`）。
+/// 核半径的权威值在 `gi/consts.wesl`；轮数取 `GI_DEN_ATROUS_ITER`（档 0 = 0 轮 = 完全不跑）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenoisePlan {
+  /// 是否派发时域 + atrous（档 0 = false ⇒ `dda_main` 直接采样原始 GI）。
+  pub on: bool,
+  /// atrous 派发几轮（0 到 `GI_DEN_ATROUS_ITER`）。
+  pub rounds: u32,
+  /// atrous 单轮核半径（1 = 3×3，2 = 5×5）。
+  pub radius: u32,
 }
 
 impl GiSettings {
-  /// 生效的分辨率除数（只实现了 1 / 2 两档，越界值钳回来）。
+  /// 菜单「渲染/GI/分辨率」的三个档位（网格除数）；**下标 = `switch_group` 的选中序号**。
+  /// 菜单侧只认下标 ⇒ 档位增删必须改这里（`debug_menu.rs` 的观察者用同一份）。
+  pub const DIV_CHOICES: [u32; 3] = [1, 2, 4];
+
+  /// 菜单「渲染/GI/降噪质量」的档位数（0 = 关 ..= 3 = 高）；**下标 = 档位本身**。
+  pub const DENOISE_TIERS: u32 = 4;
+
+  /// 生效的分辨率除数（越界值钳回来）。
   pub fn div(&self) -> u32 {
-    self.gi_div.clamp(1, 2)
+    self.gi_div.clamp(1, 4)
+  }
+
+  /// 生效的降噪档位（越界值钳回来）。
+  pub fn tier(&self) -> u32 {
+    self.denoise.min(Self::DENOISE_TIERS - 1)
+  }
+
+  /// 本档的降噪派发计划（见 `DenoisePlan`；`gi/consts.wesl` 的 `GI_DEN_ATROUS_R*` / `_ITER` 是参数源）。
+  pub fn denoise_plan(&self) -> DenoisePlan {
+    let c = gi_consts();
+    match self.tier() {
+      // 关：一条降噪 pass 都不跑（`dda_main` 直接采样原始 GI）。
+      0 => DenoisePlan { on: false, rounds: 0, radius: c.gi_den_atrous_r_fast },
+      // 低：时域累积 + 5 轮 3×3（8 tap）atrous。
+      1 => DenoisePlan { on: true, rounds: c.gi_den_atrous_iter, radius: c.gi_den_atrous_r_fast },
+      // 中/高：atrous 换 5×5（24 tap）；高 额外动候选数与记忆窗（在 `screen.wesl` 里按档取）。
+      _ => DenoisePlan { on: true, rounds: c.gi_den_atrous_iter, radius: c.gi_den_atrous_r },
+    }
   }
 
   /// GI 网格尺寸 = 渲染分辨率 ÷ `div()`（逐轴向下取整，至少 1×1）。
@@ -65,7 +129,9 @@ impl GiSettings {
 
 impl Default for GiSettings {
   fn default() -> Self {
-    Self { enabled: true, gi_div: 2 }
+    // 默认 1/4 档 + 「低」降噪档：与实测最划算的组合一致（时域 + 3×3 的 5 轮 atrous），
+    // 想要更干净就往「中/高」拨，想量原始噪声与上限帧率就拨到「关」。
+    Self { enabled: true, gi_div: 4, denoise: 1 }
   }
 }
 
@@ -195,6 +261,7 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
         count: None,
       },
       rw(17), // φ（每像素亮度 range 尺度）
+      ro(20), // 降噪小配置（`[0]` = atrous 核半径；降噪 pass 够不到 @group(4) 的 `gi_u`）
     ],
   )
 }
@@ -242,6 +309,16 @@ pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
         visibility: C,
         ty: BindingType::Buffer {
           ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 20,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: true },
           has_dynamic_offset: false,
           min_binding_size: None,
         },
@@ -438,10 +515,11 @@ fn extract_gi_settings(
   mut commands: bevy::ecs::system::Commands,
   settings: Option<bevy::render::Extract<bevy::ecs::system::Res<GiSettings>>>,
 ) {
-  commands.insert_resource(
-    settings
-      .map_or_else(GiSettings::default, |s| GiSettings { enabled: s.enabled, gi_div: s.div() }),
-  );
+  commands.insert_resource(settings.map_or_else(GiSettings::default, |s| GiSettings {
+    enabled: s.enabled,
+    gi_div: s.div(),
+    denoise: s.tier(),
+  }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -482,7 +560,13 @@ fn prepare_gi(
   let mut u = GiUniform::default();
   u.params = Vec4::new(0.0, 0.0, crate::consts::GI_GAIN, 0.0);
   u.misc = Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
-  u.flags = Vec4::new(0.0, settings.div() as f32, if skip_verify { 1.0 } else { 0.0 }, 0.0);
+  u.flags = Vec4::new(
+    0.0,
+    settings.div() as f32,
+    if skip_verify { 1.0 } else { 0.0 },
+    // w = 降噪质量档位（0..=3）：`gi_ss_main` 按它取候选数与记忆窗（只有最高档不同）。
+    settings.tier() as f32,
+  );
   // 整数帧号走 u32 通道（`seq.x`）：`gpu.frame` 本就是 u32，不再经 `params.x` 的 f32 截断。
   u.seq = UVec4::new(gpu.frame, 0, 0, 0);
   // 上一帧相机矩阵（时域重投影）：写「上帧真正用过的那一份」，再把本帧存下来。

@@ -20,11 +20,34 @@ pub struct GiConsts {
   pub gi_den_hist_words: u32,
   /// atrous 迭代次数（`GI_DEN_ATROUS_ITER`，1..=5）：Rust 按它决定派发几轮 / 每轮的 src→dst。
   pub gi_den_atrous_iter: u32,
+  /// atrous 单轮核半径 · **中/高 档**（`GI_DEN_ATROUS_R`）：Rust 按菜单写进降噪的小配置 buffer。
+  pub gi_den_atrous_r: u32,
+  /// atrous 单轮核半径 · **关/低 档**（`GI_DEN_ATROUS_R_FAST`）。
+  pub gi_den_atrous_r_fast: u32,
+  /// 每 texel 新鲜候选数 · **关/低/中 档**（`GI_SS_CAND_N`，所有分辨率档共用；菜单日志要用真实值，
+  /// 所以这几个也跟着解析（避免 Rust 侧另抄一份、与 `.wesl` 漂移）。
+  pub gi_ss_cand_n: u32,
+  /// 每 texel 新鲜候选数 · **高 档**（`GI_SS_CAND_N_HQ`，所有分辨率档共用）。
+  pub gi_ss_cand_n_hq: u32,
+  /// reservoir 记忆窗（帧）· **关/低/中 档**（`GI_SS_M_CAP_K`）。
+  pub gi_ss_m_cap_k: u32,
+  /// reservoir 记忆窗（帧）· **高 档**（`GI_SS_M_CAP_K_HQ`）。
+  pub gi_ss_m_cap_k_hq: u32,
 }
 
 /// 需要的全部常量名（缺一即 fail fast）。
-const REQUIRED: &[&str] =
-  &["GI_RES_WORDS", "GI_DEN_GUIDE_WORDS", "GI_DEN_HIST_WORDS", "GI_DEN_ATROUS_ITER"];
+const REQUIRED: &[&str] = &[
+  "GI_RES_WORDS",
+  "GI_DEN_GUIDE_WORDS",
+  "GI_DEN_HIST_WORDS",
+  "GI_DEN_ATROUS_ITER",
+  "GI_DEN_ATROUS_R",
+  "GI_DEN_ATROUS_R_FAST",
+  "GI_SS_CAND_N",
+  "GI_SS_CAND_N_HQ",
+  "GI_SS_M_CAP_K",
+  "GI_SS_M_CAP_K_HQ",
+];
 
 /// 解析 WESL 包里的跨端常量（首次读盘，之后走 `OnceLock`）。
 /// 失败（文件读不到 / 常量缺失 / 不是字面量）→ `error!` + `panic!`。
@@ -56,6 +79,12 @@ impl GiConsts {
       gi_den_guide_words: get("GI_DEN_GUIDE_WORDS"),
       gi_den_hist_words: get("GI_DEN_HIST_WORDS"),
       gi_den_atrous_iter: get("GI_DEN_ATROUS_ITER"),
+      gi_den_atrous_r: get("GI_DEN_ATROUS_R"),
+      gi_den_atrous_r_fast: get("GI_DEN_ATROUS_R_FAST"),
+      gi_ss_cand_n: get("GI_SS_CAND_N"),
+      gi_ss_cand_n_hq: get("GI_SS_CAND_N_HQ"),
+      gi_ss_m_cap_k: get("GI_SS_M_CAP_K"),
+      gi_ss_m_cap_k_hq: get("GI_SS_M_CAP_K_HQ"),
     };
 
     if out.gi_res_words < 2 {
@@ -79,15 +108,33 @@ impl GiConsts {
       error!("{msg}");
       panic!("{msg}");
     }
+    if !(1..=4).contains(&out.gi_den_atrous_r) || !(1..=4).contains(&out.gi_den_atrous_r_fast) {
+      let msg =
+        format!("atrous 核半径越界（1..=4；tap 数按 (2R+1)²-1 涨，越界会造成性能悬崖）：{out:?}");
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if out.gi_ss_cand_n < 1
+      || out.gi_ss_cand_n_hq < out.gi_ss_cand_n
+      || out.gi_ss_m_cap_k < 1
+      || out.gi_ss_m_cap_k_hq < out.gi_ss_m_cap_k
+    {
+      let msg =
+        format!("「降噪质量」档的采样/记忆窗常量不自洽（高档应 ≥ 基础档、且都 ≥ 1）：{out:?}");
+      error!("{msg}");
+      panic!("{msg}");
+    }
     info!(
       target: "gate",
       "WESL 跨端常量（源 {}）：屏幕空间 reservoir {} word/像素；\
-       降噪：导引 {} word/像素、历史 {} word/像素（双缓冲）、atrous 迭代 {} 轮",
+       降噪：导引 {} word/像素、历史 {} word/像素（双缓冲）、atrous 迭代 {} 轮（核半径：质量档 {} / 快速档 {}）",
       dir.display(),
       out.gi_res_words,
       out.gi_den_guide_words,
       out.gi_den_hist_words,
       out.gi_den_atrous_iter,
+      out.gi_den_atrous_r,
+      out.gi_den_atrous_r_fast,
     );
     out
   }

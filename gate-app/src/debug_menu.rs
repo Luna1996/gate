@@ -277,13 +277,36 @@ fn register_callbacks(world: &mut World) {
           gi.enabled = *on;
           info!("GI → {}", if *on { "on" } else { "off" });
         }
-        // 半分辨率开关：勾选 = 半分辨率、取消 = 全分辨率（**两档都跑 GI**，关掉不等于关 GI）
-        ("render/gi/half", MenuAction::Toggle(on)) => {
-          gi.gi_div = if *on { 2 } else { 1 };
+        // GI 分辨率档（**每一档都跑 GI**，不是开关）：网格边长 = 渲染分辨率 / 除数。
+        // 代价按 GI 像素数计 ⇒ 1/2 约是全分辨率的 1/4，1/4 再降 4 倍（GI 是低频信号，画质几乎无差）。
+        ("render/gi/res", MenuAction::Select(i)) => {
+          gi.gi_div = gate_render::gi::GiSettings::DIV_CHOICES[(*i).min(2)];
           info!(
-            "GI 分辨率 → {}（网格边长 = 渲染分辨率 / {}）",
-            if *on { "半分辨率" } else { "全分辨率" },
-            gi.gi_div
+            "GI 分辨率 → 渲染分辨率的 1/{}（GI 像素数为全分辨率的 1/{}）",
+            gi.gi_div,
+            gi.gi_div * gi.gi_div
+          );
+        }
+        // 「降噪质量」档（**与分辨率档正交**：下面这些项目对所有分辨率档一视同仁）。
+        // 每档只比上一档多一件事，成本单调递增。权威值都在 `gi/consts.wesl`，这里只选档；
+        // 日志里的数值从 `gi_consts()` 取（不另抄一份，避免与 `.wesl` 漂移）：
+        //   0 关：一条降噪 pass 都不跑（`dda_main` 直接采样原始 GI）；
+        //   1 低（默认）：时域累积 + 5 轮 3×3（8 tap）atrous；
+        //   2 中：atrous 换 5×5（24 tap）；
+        //   3 高：再把每像素候选数翻倍（= GI 射线翻倍，全链最贵的一项）+ 记忆窗 20→32 帧。
+        ("render/gi/denoise", MenuAction::Select(i)) => {
+          let c = gate_render::wesl_consts::gi_consts();
+          let t = (*i).min((gate_render::gi::GiSettings::DENOISE_TIERS - 1) as usize) as u32;
+          gi.denoise = t;
+          let (name, cand, k, r) = match t {
+            0 => ("关", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r_fast),
+            1 => ("低", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r_fast),
+            2 => ("中", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r),
+            _ => ("高", c.gi_ss_cand_n_hq, c.gi_ss_m_cap_k_hq, c.gi_den_atrous_r),
+          };
+          info!(
+            "GI 降噪质量 → {}（每像素候选 {} 条、记忆窗 {} 帧、atrous 核半径 {}；与分辨率档正交）",
+            name, cand, k, r
           );
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {

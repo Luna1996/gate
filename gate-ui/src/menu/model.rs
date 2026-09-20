@@ -177,6 +177,8 @@ pub enum MenuNode {
     label: String,
     options: Vec<String>,
     selected: usize,
+    #[serde(default)]
+    tooltip: Option<String>,
   },
   /// 下拉框（左名称 | 中右下拉控件；选中态持久化）
   Dropdown {
@@ -281,7 +283,9 @@ impl MenuNode {
   /// 悬浮提示文案（没有则 None）
   pub fn tooltip(&self) -> Option<&str> {
     match self {
-      Self::Slider { tooltip, .. } | Self::Toggle { tooltip, .. } => tooltip.as_deref(),
+      Self::Slider { tooltip, .. }
+      | Self::Toggle { tooltip, .. }
+      | Self::SwitchGroup { tooltip, .. } => tooltip.as_deref(),
       _ => None,
     }
   }
@@ -501,12 +505,19 @@ pub fn slider(
 }
 
 /// 切换组节点
-pub fn switch_group(id: &str, label: &str, options: &[&str], selected: usize) -> MenuNode {
+pub fn switch_group(
+  id: &str,
+  label: &str,
+  options: &[&str],
+  selected: usize,
+  tooltip: Option<&str>,
+) -> MenuNode {
   MenuNode::SwitchGroup {
     id: id.into(),
     label: label.into(),
     options: options.iter().map(|s| (*s).to_string()).collect(),
     selected,
+    tooltip: tooltip.map(|s| s.to_string()),
   }
 }
 

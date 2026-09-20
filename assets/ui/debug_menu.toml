@@ -58,11 +58,29 @@ label = "menu.render.gi.enabled"
 checked = true
 
 [[items.children.children]]
-kind = "toggle"
-id = "half"
-label = "menu.render.gi.half"
-checked = true
-tooltip = "menu.render.gi.half.tip"
+kind = "switch_group"
+id = "res"
+label = "menu.render.gi.res"
+options = [
+    "menu.render.gi.res.full",
+    "menu.render.gi.res.half",
+    "menu.render.gi.res.quarter",
+]
+selected = 1
+tooltip = "menu.render.gi.res.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "denoise"
+label = "menu.render.gi.denoise"
+options = [
+    "menu.render.gi.denoise.off",
+    "menu.render.gi.denoise.low",
+    "menu.render.gi.denoise.mid",
+    "menu.render.gi.denoise.high",
+]
+selected = 1
+tooltip = "menu.render.gi.denoise.tip"
 
 [[items.children]]
 kind = "sub_menu"

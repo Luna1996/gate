@@ -109,7 +109,9 @@ struct GiUniform {
   // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
   // z = 世界几何相对「写入上一帧 reservoir 的那一帧」是否**逐位未变**（1 = 未变）⇒
   // 屏幕空间路径可跳过时域二次顶点键验证射线（见 `gi/screen.wesl` ① 与 `prepare_gi` 的 `world_rev`）、
-  // w = 保留（恒 0）
+  // w = **降噪质量档**（0 = 关 / 1 = 低 / 2 = 中 / 3 = 高；菜单「渲染/RESTIR GI/降噪质量」）：
+  // 本 pass 只用它区分「高」档（1/4 档新鲜候选数与 reservoir 记忆窗按它取，见 `gi/consts.wesl`）；
+  // 档位影响的 pass 派发（时域/atrous 开关、核半径）由 Rust 决定。
   flags: vec4<f32>,
   // x = 自增帧号（精确 u32；yzw = 保留，恒 0）。
   // **所有整数帧逻辑只用本字段**（本帧的 RNG 种子混入、像素 hash）。帧号曾经以 f32 存在
@@ -138,10 +140,11 @@ struct GiUniform {
 // rgba16f：rgb = gi·valid、a = valid；rg32f：r = cov·valid、g = valid。采样走 `light_samp` 双线性、按 valid 归一化。
 @group(5) @binding(4) var gi_tex: texture_2d<f32>;
 @group(5) @binding(5) var gi_cov_tex: texture_2d<f32>;
-/// @binding(6)：**降噪导引**（`gi_main` 写；降噪两段 + `dda_main` 的几何感知上采样读）。
-/// 每 GI 像素 `GI_DEN_GUIDE_WORDS` 个 word，布局见 `gi/consts.wesl`：
-/// 面键 2（有效 = 键非零，**没有**独立有效位）+ 命中体素中心世界位置 3 + 法线 1
-/// + 上帧重投影像素 1 + 平面检验容差 1。
+/// @binding(6)：**降噪导引**（`gi_main` 写；降噪两段 + `dda_main` 的几何感知上采样读，
+/// 另外 `dda_main` 在 `gi_div = 1` 时也读它拿**着色法线**、省掉一次 `voxel_normal`）。
+/// 每 GI 像素 `GI_DEN_GUIDE_WORDS` 个 word，布局见 `gi/consts.wesl`：**面键 2**
+/// （有效 = 键非零，**没有**独立有效位）+ **着色法线 1**（八面体 f16x2）+ **上帧重投影像素 1**。
+/// 「是不是同一个面」= 键（平面归属）+ 着色法线（相似度），两者都不需要世界位置 / 平面容差。
 /// 声明为 `read_write`：同一份 shader 模块里这个 var 在 `gi_main` 的 pipeline 里被写
 /// （layout 也是 read_write），在 `dda_main` 的 pipeline 里只被读 —— **两边的 layout 都必须
 /// 给 read_only = false**，否则与这里的声明不符（wgpu 会报绑定类型不匹配）。
@@ -165,6 +168,12 @@ struct GiUniform {
 /// 17：每像素亮度 range 权重的 φ（= `GI_DEN_LUMA_K` × 本帧噪声 σ）。时域写、atrous 读。
 /// 必须来自**本帧原始**噪声（不是滤波后的），否则迭代几次后 φ 退化成 0、跨面就开始糊。
 @group(0) @binding(17) var<storage, read_write> gi_den_phi: array<f32>;
+/// 20：降噪 pass 的**小配置**（每帧由 Rust 按菜单「高质量降噪」写入）：
+/// `[0]` = atrous 单轮核半径（`GI_DEN_ATROUS_R` 或 `GI_DEN_ATROUS_R_FAST`）。
+/// 为什么另开一个小 buffer 而不是读 @group(4) 的 `gi_u`：降噪两个 pass 的 layout **只有 group(0)**
+/// 一份（刻意 —— 不拉进 brickmap / 相机矩阵），而「bind group 必须从索引 0 起成前缀设置」
+/// ⇒ 它们够不到 group(4)。加一个 4 字节 storage 是最省的接法。
+@group(0) @binding(20) var<storage, read> gi_den_cfg: array<u32>;
 
 // ===== @group(7)：眼睛适应（自动曝光）——被 `dda_main`（读曝光）与 eye_adapt_* 两个入口使用 =====
 /// `out_tex` 的采样视图（同一张图），统计曝光已应用之后的颜色。

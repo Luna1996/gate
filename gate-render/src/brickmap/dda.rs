@@ -1127,7 +1127,7 @@ pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 
 /// 辅助纹理缓存（屏幕尺寸相关，resize 时重建）：
 ///   · `texture`：beam depth（低分辨率 r32float），beam 预 pass 写、主 pass 读；
-///   · `gi_*`：GI 缓冲（网格尺寸 = 渲染分辨率 ÷ `GiSettings.gi_div`，1 或 2），`gi_main` 写、
+///   · `gi_*`：GI 缓冲（网格尺寸 = 渲染分辨率 ÷ `GiSettings.gi_div`，1 / 2 / 4），`gi_main` 写、
 ///     主 pass 采样（BG0 4/5）；
 ///     存 premultiplied valid：rgba16f = (gi·valid, valid)、rg32f = (cov·valid, valid)，采样侧按 valid 归一化；
 ///   · `gi_res_a`/`gi_res_b`：**屏幕空间逐面 ReSTIR** 的 reservoir 双缓冲（BG4 binding 20/21，
@@ -1135,7 +1135,7 @@ pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
 ///     重建（wgpu 新建 buffer 恒为零 ⇒ 新尺寸下 `M = 0` = 无历史）；`prepare_gi` 每帧换绑
 ///     （20 = 本帧写、21 = 上帧读）。
 ///   · `gi_bg0`：GI pass 自己的 @group(0)（view uniform + beam depth，不含 GI 采样视图）。
-/// 换分辨率（`gi_div` 1↔2）与换窗口尺寸走的是同一条重建路径 ⇒ 所有 GI 派生资源（reservoir、
+/// 换分辨率（`gi_div` 1↔2↔4）与换窗口尺寸走的是同一条重建路径 ⇒ 所有 GI 派生资源（reservoir、
 /// 导引、历史、φ、中间靶、降噪输出）尺寸恒等于 `gi_size`，不存在「只重建一部分」的状态。
 #[derive(Resource, Default)]
 pub(crate) struct AuxTexCache {
@@ -1167,6 +1167,11 @@ pub(crate) struct AuxTexCache {
   gi_dn_dst: [Option<TextureView>; 4],
   /// 降噪 bind group：`[0]` = 时域；`[1..7]` = atrous 的 6 种 src→dst 组合（见 `DEN_ATROUS_CHAINS`）。
   den_bg: [Option<BindGroup>; 7],
+  /// 降噪 pass 的小配置 buffer（`@group(0) @binding(20)`，1 个 word = atrous 核半径）。
+  /// 降噪 pass 的 layout 只有 group(0) 一份（刻意），够不到 `@group(4)` 的 `gi_u` ⇒ 单独给一个。
+  /// `den_cfg_r` = 已写入的值（只在档位变化时重写 + 打日志）。
+  den_cfg: Option<Buffer>,
+  den_cfg_r: u32,
   /// 历史双缓冲 + atrous 轮次的换绑状态（每次真正跑降噪时翻转一次）。
   den_flip: bool,
 }
@@ -1572,7 +1577,7 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
-  // GI（`GiSettings.gi_div` = 1 全分辨率 / 2 半分辨率；**两档都跑这条链**）：
+  // GI（`GiSettings.gi_div` = 1 / 2 / 4；**每一档都跑这条链**）：
   // 反投影 + beam 起点 + 主 trace + 屏幕空间 ReSTIR，写两张 GI 网格尺寸的缓冲。
   // group0 用瘦版（不含 GI 采样视图），并多一个 BG5；layout 索引必须是 0..=5 的前缀。
   let gi_layouts = vec![
@@ -1722,8 +1727,8 @@ pub(crate) fn prepare_dda_bind_groups(
   let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
 
-  // ---- GI 缓冲（菜单「渲染/GI/分辨率」= 全分辨率 / 半分辨率）：网格 = 渲染分辨率 ÷ gi_div ----
-  // 换分辨率（gi_div 1↔2）与换窗口尺寸都走这条重建路径（条件只看 gi_size 变没变）。
+  // ---- GI 缓冲（菜单「渲染/GI/分辨率」= 1/2/4）：网格 = 渲染分辨率 ÷ gi_div ----
+  // 换分辨率（gi_div 档位切换）与换窗口尺寸都走这条重建路径（条件只看 gi_size 变没变）。
   // 存 premultiplied valid（见 AuxTexCache 的说明）：rgba16f = (gi·valid, valid)、
   // rg32f = (cov·valid, valid)。
   // wgpu 新建纹理自动清零 ⇒ valid 初值 0 = "无数据"，采样侧退回 conf=0 的天光兜底。
@@ -1860,7 +1865,18 @@ pub(crate) fn prepare_dda_bind_groups(
   // binding 6 = 降噪导引（与 gi_main 写的是同一块 buffer）⇒ `dda_main` 能做**几何感知上采样**：
   // 只接受与命中面同平面的 GI texel，棱边/墙角不渗色。
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
-  let gi_den_view = beam_cache.gi_dn_src[3].as_ref().expect("降噪输出视图未创建").clone();
+  // binding 4 绑哪张，取决于「降噪质量」档（`DenoisePlan.on`）：
+  //   · 档 0（完全不降噪）⇒ 直接绑**原始** `gi_out`（没有任何降噪 pass 会写 `gi_dn`，绑它会读到上一帧的陈旧值）；
+  //   · 其余档 ⇒ 绑 atrous 链的最终输出 `gi_dn[3]`（语义与 `gi_out` 完全一致：rgb = gi·valid、a = valid）。
+  let den_plan = match gi_settings.as_ref() {
+    Some(g) => g.denoise_plan(),
+    None => crate::gi::GiSettings::default().denoise_plan(),
+  };
+  let gi_den_view = if den_plan.on {
+    beam_cache.gi_dn_src[3].as_ref().expect("降噪输出视图未创建").clone()
+  } else {
+    gi_view.clone()
+  };
   let gi_guide = beam_cache.gi_guide.as_ref().expect("降噪导引 buffer 未创建").clone();
   let gi_read_bg = render_device.create_bind_group(
     None,
@@ -1872,6 +1888,38 @@ pub(crate) fn prepare_dda_bind_groups(
     ],
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
+
+  // ---- 降噪的小配置（`@group(0) @binding(20)`，1 个 word = atrous 核半径）----
+  // 降噪两个 pass 的 layout 只有 group(0)（刻意：不拉进 brickmap / 相机矩阵），而 bind group
+  // 必须从索引 0 起成前缀设置 ⇒ 它们够不到 `@group(4)` 的 `gi_u`，只能用这个 4 字节的小 buffer。
+  // 数值按菜单「渲染/RESTIR GI/降噪质量」的档位给（`DenoisePlan::radius`）：关/低 = 3×3（8 tap）、
+  // 中/高 = 5×5（24 tap）；权威值在 WESL（`GI_DEN_ATROUS_R` / `_FAST`），Rust 只决定取哪一档。
+  let den_r = den_plan.radius;
+  if beam_cache.den_cfg.is_none() {
+    beam_cache.den_cfg = Some(render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_gi_den_cfg"),
+      size: 16,
+      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    }));
+  }
+  if beam_cache.den_cfg_r != den_r {
+    beam_cache.den_cfg_r = den_r;
+    let cfg = beam_cache.den_cfg.as_ref().expect("刚创建");
+    queue.write_buffer(cfg, 0, &den_r.to_le_bytes());
+    bevy::log::info!(
+      target: "gate",
+      "GI 降噪档位 → {}（atrous 核半径 {}，每轮 {} 个 tap；菜单「渲染/RESTIR GI/降噪质量」）",
+      if den_plan.on {
+        format!("{} 轮 atrous", den_plan.rounds)
+      } else {
+        "关（不跑降噪 pass，直接采样原始 GI）".to_string()
+      },
+      den_r,
+      (2 * den_r + 1) * (2 * den_r + 1) - 1,
+    );
+  }
+  let den_cfg = beam_cache.den_cfg.as_ref().expect("刚创建").clone();
 
   // ---- GI 降噪的 bind group：时域 1 个 + atrous 5 个（src→dst 组合，见 `DEN_ATROUS_CHAINS`）----
   // 每帧重建（纹理/buffer 都是持久句柄，只是换绑）；`den_flip` 决定历史哪块是「上帧读」。
@@ -1900,6 +1948,7 @@ pub(crate) fn prepare_dda_bind_groups(
         BindGroupEntry { binding: 13, resource: hist_cur.as_entire_binding() },
         BindGroupEntry { binding: 16, resource: BindingResource::TextureView(&dn_dst[0]) },
         BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },
+        BindGroupEntry { binding: 20, resource: den_cfg.as_entire_binding() },
       ],
     ));
     for (k, [s, d]) in DEN_ATROUS_CHAINS.iter().enumerate() {
@@ -1911,6 +1960,7 @@ pub(crate) fn prepare_dda_bind_groups(
           BindGroupEntry { binding: 14, resource: BindingResource::TextureView(&dn_src[*s]) },
           BindGroupEntry { binding: 15, resource: BindingResource::TextureView(&dn_dst[*d]) },
           BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },
+          BindGroupEntry { binding: 20, resource: den_cfg.as_entire_binding() },
         ],
       ));
     }
@@ -2055,7 +2105,7 @@ pub(crate) fn dispatch_dda(
   }
 
   // ---- GI（菜单「渲染/GI」开关；分辨率 = `GiSettings.gi_div`）：排在主 pass 之前（主 pass 采样输出）----
-  // 派发规模 = `aux.gi_size`（= 渲染分辨率 ÷ gi_div）⇒ 全分辨率/半分辨率只差这里与资源尺寸。
+  // 派发规模 = `aux.gi_size`（= 渲染分辨率 ÷ gi_div）⇒ 分辨率档只差这里与资源尺寸。
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_bg0) = aux.gi_bg0.as_ref()
@@ -2078,50 +2128,55 @@ pub(crate) fn dispatch_dda(
 
   // ---- GI 降噪（时域 → 迭代 atrous）：必须紧跟 `gi_main`、排在主 pass 之前 ----
   // `dda_main` 的 group(5) binding 4 绑的就是这条链的最终输出（`gi_dn[3]`）。
-  if gi.as_ref().is_some_and(|g| g.enabled)
+  // 「降噪质量」档 0（关）⇒ 一轮都不派发：`dda_main` 那边绑的是原始 `gi_out`（见上面 `den_plan`）。
+  if let Some(cur) = gi.as_ref()
+    && cur.enabled
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
   {
-    let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
-    let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
-    let n = crate::wesl_consts::gi_consts().gi_den_atrous_iter.clamp(1, 5) as usize;
-    let rounds = &DEN_ATROUS_ROUNDS[n - 1];
-    if let Some(bg) = aux.den_bg[0].as_ref()
-      && let Some(pipe) =
-        gi_gpu.den_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
-    {
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_gi_denoise_temporal",
-        |pass| {
+    let plan = cur.denoise_plan();
+    let n = plan.rounds.clamp(0, 5) as usize;
+    if n > 0 {
+      let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
+      let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+      let rounds = &DEN_ATROUS_ROUNDS[n - 1];
+      if let Some(bg) = aux.den_bg[0].as_ref()
+        && let Some(pipe) =
+          gi_gpu.den_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_denoise_temporal",
+          |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+          },
+        );
+      }
+      for i in 0..n {
+        let Some(bg) = aux.den_bg[rounds[i] + 1].as_ref() else {
+          continue;
+        };
+        let Some(pipe) =
+          gi_gpu.den_pipelines[i + 1].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+        else {
+          continue;
+        };
+        let label = [
+          "gate_gi_denoise_atrous1",
+          "gate_gi_denoise_atrous2",
+          "gate_gi_denoise_atrous4",
+          "gate_gi_denoise_atrous8",
+          "gate_gi_denoise_atrous16",
+        ][i];
+        crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), label, |pass| {
           pass.set_pipeline(pipe);
           pass.set_bind_group(0, bg, &[]);
           pass.dispatch_workgroups(gx, gy, 1);
-        },
-      );
-    }
-    for i in 0..n {
-      let Some(bg) = aux.den_bg[rounds[i] + 1].as_ref() else {
-        continue;
-      };
-      let Some(pipe) =
-        gi_gpu.den_pipelines[i + 1].and_then(|id| pipeline_cache.get_compute_pipeline(id))
-      else {
-        continue;
-      };
-      let label = [
-        "gate_gi_denoise_atrous1",
-        "gate_gi_denoise_atrous2",
-        "gate_gi_denoise_atrous4",
-        "gate_gi_denoise_atrous8",
-        "gate_gi_denoise_atrous16",
-      ][i];
-      crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), label, |pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, bg, &[]);
-        pass.dispatch_workgroups(gx, gy, 1);
-      });
+        });
+      }
     }
   }
 

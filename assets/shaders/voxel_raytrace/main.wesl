@@ -1,8 +1,8 @@
 import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_cov_out, gi_cov_tex, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, palette_transmission, sky_rgb, srgb_to_linear};
-import package::gi::common::{gi_key0, gi_key1};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
-import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal};
+import package::gi::common::{gi_key0, gi_key1, gi_unpack_dir};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
+import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::lightfield::{light_field_ao};
@@ -127,21 +127,24 @@ fn write_output(coord: vec2<i32>, col: vec3<f32>) {
 }
 
 /// **几何感知上采样**（joint bilateral）—— `dda_main` 取 GI 的唯一入口。
-/// GI 跑在半分辨率网格上（`GiSettings.gi_div`），纯双线性会把**几何边界两侧**的值混在一起
-/// （棱边/墙角一侧的亮 GI 渗到另一侧），而这正是「GI 只有半分辨率」唯一真正丢掉的信息。
-/// 做法：取 GI 网格上最近的 2×2 texel，**只接受与本像素命中面同平面**的 texel
-/// （`gi_den_same_plane`：面号 + 物体相等 + 沿面法线轴的体素坐标相等 —— 与降噪侧同一套判据，
-/// 所以「薄板另一侧 / 墙缝另一侧」不可能被接受，同一平面内沿切线方向的相邻体素则正常接受），
+/// GI 跑在低于全分辨率的网格上（`GiSettings.gi_div` = 1 / 2 / 4），纯双线性会把**几何边界
+/// 两侧**的值混在一起（棱边/墙角一侧的亮 GI 渗到另一侧），而这正是「GI 低于全分辨率」唯一
+/// 真正丢掉的信息。档位越低（1/4）这一层越要紧：一个 GI texel 覆盖 4×4 个全分辨率像素。
+/// 做法：取 GI 网格上最近的 2×2 texel，**只接受与本像素同一个面**的 texel
+/// （`gi_same_surface`：平面归属靠键 ⇒ 薄板另一侧 / 隔一格的平行面不可能被接受；
+/// 相似度靠**存的着色法线** ⇒ 凸棱上那一段倾斜的法线与本像素比仍在容差内 ⇒ 与着色一致地连起来），
 /// 按双线性权重加权平均。退化顺序：一个都没接受 ⇒ **最近的 texel**（它至少在几何上覆盖本像素，
 /// 比双线性更不容易渗色）⇒ 最近 texel 无有效数据 ⇒ 传进来的纯双线性结果。
 /// 有效性判据 = 导引的「键非零」（与降噪侧一致）；最近 texel 那一档直接用纹理的 `a`（那里不插值，
 /// `a` 恒是 0/1）。
-/// 代价：每全分辨率像素 4 次导引读（每次 2 word），**不加任何射线、不加 pass**。
+/// `n` = 本像素的着色法线（`dda_main` 自己那条）—— 相似度那一条用它。
+/// 代价：每全分辨率像素 4 次导引读（每次 3 word），**不加任何射线、不加 pass**。
 fn gi_upsample_joint(
   guv: vec2<f32>,
   gsize: vec2<u32>,
   k0: u32,
   k1: u32,
+  n: vec3<f32>,
   fallback: vec3<f32>,
 ) -> vec3<f32> {
   let g = guv * vec2<f32>(f32(gsize.x), f32(gsize.y));
@@ -159,14 +162,14 @@ fn gi_upsample_joint(
       let gk0 = gi_guide_out[tb + GI_DEN_G_KEY0];
       let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
       if ((gk0 | gk1) == 0u) { continue; }
-      if (!gi_den_same_plane(gk0, gk1, k0, k1)) { continue; }
+      if (!gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)) { continue; }
       // 有效 texel 的 a 恒为 1（`gi_out` 与降噪链都写 `vec4(v, 1.0)`）⇒ `rgb` 就是 gi 本身。
       acc = acc + textureLoad(gi_tex, c, 0).rgb * bw;
       wsum = wsum + bw;
     }
   }
   if (wsum > 0.0) { return acc / wsum; }
-  // 一个同平面 texel 都没有（凸角 / 贴天空的轮廓）：退回最近的 texel。
+  // 一个同面的 texel 都没有（凸角 / 贴天空的轮廓）：退回最近的 texel。
   let nc = clamp(base + vec2<f32>(select(0.0, 1.0, f.x >= 0.5), select(0.0, 1.0, f.y >= 0.5)),
                  vec2<f32>(0.0), vec2<f32>(f32(gsize.x) - 1.0, f32(gsize.y) - 1.0));
   let sn = textureLoad(gi_tex, vec2<i32>(nc), 0);
@@ -234,7 +237,23 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gg = make_grid(u32(best.obj_id) + 1u);
     let vc = vec3<f32>(best.voxel) + vec3<f32>(0.5);
     let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
-    let n = voxel_normal(gg, best.voxel, best.n);
+    let k0 = gi_key0(best.voxel);
+    let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
+    // 着色法线（`voxel_normal` 的隐式梯度，要探 6 个邻域体素）—— **不要算两次**：
+    // gi_div = 1 时 GI pass 的射线与本像素**逐位相同**（同一套矩阵 / 同一套 beam t_min），
+    // 导引里那格就是本像素的同一条命中 ⇒ 直接读它存下来的法线；gi_div > 1 时导引那格是
+    // **另一条射线**（更粗的网格，射向格中心）⇒ 它的法线不能拿来给本像素着色，只能自己算。
+    var n = voxel_normal(gg, best.voxel, best.n);
+    if (u32(gi_u.flags.y) == 1u) {
+      let gi_size = vec2<u32>(textureDimensions(gi_tex));
+      if (gid.x < gi_size.x && gid.y < gi_size.y) {
+        let gb = (gid.y * gi_size.x + gid.x) * GI_DEN_GUIDE_WORDS;
+        // 键逐位相等才敢用（证明导引那格确实是本像素的同一条命中，而不是同一像素的另一条射线）。
+        if (gi_guide_out[gb + GI_DEN_G_KEY0] == k0 && gi_guide_out[gb + GI_DEN_G_KEY1] == k1) {
+          n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
+        }
+      }
+    }
     // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS，使起点离开命中体素。
     let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
     let ndl = max(dot(n, sun_dir), 0.0);
@@ -246,8 +265,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var gi = vec3<f32>(0.0);
     var cov = 0.0;
     // GI 一律走缓冲通道（`gi_main` + 降噪写在 1/gi_div 分辨率的 GI 网格上，见 `gi/`）：
-    // 这里只做一次双线性取值。uv 必须按**全分辨率尺寸**（`size`）归一化，不能除以 GI 纹理
-    // 自身尺寸 —— 1:1（gi_div = 1）与 2:1（gi_div = 2）上采样都靠这条。
+    // 这里只做一次几何感知上采样（内部用 2×2 texel）。uv 必须按**全分辨率尺寸**（`size`）
+    // 归一化，不能除以 GI 纹理自身尺寸 —— 1:1 / 2:1 / 4:1 上采样都靠这条。
     // `gi_on = false` 时 gi/cov 恒 0 ⇒ 只有太阳直射 + 天光兜底。
     if (gi_on) {
       let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
@@ -256,11 +275,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let sc = textureSampleLevel(gi_cov_tex, light_samp, guv, 0.0);
       // premultiplied-valid 归一化：valid = 0（天空/介质）像素不参与插值。
       let gw = max(s.a, 1e-4);
-      // GI 值走**几何感知上采样**（纯双线性作 fallback）：不接受与本像素不同平面的 texel
-      // ⇒ 棱边 / 墙角不渗色、不糊。cov 不参与（它是 0/1 覆盖度，双线性归一化即可）。
-      gi = gi_upsample_joint(guv, vec2<u32>(textureDimensions(gi_tex)),
-                             gi_key0(best.voxel), gi_key1(best.voxel, best.face_id, best.obj_id),
-                             s.rgb / gw);
+      // GI 值走**几何感知上采样**（纯双线性作 fallback）：不接受与本像素不同「面」的 texel
+      // ⇒ 棱边 / 墙角不渗色、不糊（相似度那一条用本像素的着色法线 `n`）。cov 不参与
+      // （它是 0/1 覆盖度，双线性归一化即可）。
+      gi = gi_upsample_joint(guv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n, s.rgb / gw);
       cov = sc.r / gw;
     }
     // AO 只乘到常量天光项（gi 已自带逐方向遮挡）。
@@ -311,7 +329,7 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let origin_voxel = view_u.cam_pos_voxel.xyz;
 
   // beam 纹理 = 全分辨率 / BEAM_DIV；本 pass 网格 = 全分辨率 / gi_div ⇒ 下标除 (BEAM_DIV / gi_div)。
-  // gi_div = 1（全分辨率）→ 除 BEAM_DIV；gi_div = 2（半分辨率）→ 除 BEAM_DIV/2（= 旧版行为）。
+  // gi_div = 1 → 除 BEAM_DIV；gi_div = 2 → 除 BEAM_DIV/2；gi_div = 4 → 1:1（一个 GI 像素正好一个 beam 纹素）。
   let gi_div = max(u32(gi_u.flags.y), 1u);
   var t_min = 0.0;
   if (view_u.lod.z < 0.5) {
@@ -377,7 +395,7 @@ fn gi_denoise_atrous4(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 /// atrous 第 4 轮（步长 8）。GI 是低频信号，大半径才不会伤到细节；
-/// 硬拒判据（同面键满权重 / 跨面必须过法线 + 平面检验）与半径无关 ⇒ 大核也不会跨几何糊。
+/// 硬拒判据（不是同一个面就 cut）与半径无关 ⇒ 大核也不会跨几何糊。
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous8(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
@@ -385,7 +403,7 @@ fn gi_denoise_atrous8(@builtin(global_invocation_id) gid: vec3<u32>) {
   gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 8);
 }
 
-/// atrous 第 5 轮（步长 16）：足迹半径 = 16 个 GI 像素（半分辨率下 = 32 个全分辨率像素）。
+/// atrous 第 5 轮（步长 16）：足迹半径 = `GI_DEN_ATROUS_R` × 16 个 GI 像素。
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous16(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
