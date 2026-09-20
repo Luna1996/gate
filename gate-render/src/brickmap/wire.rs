@@ -1,7 +1,7 @@
 //! Brick Tree wire 格式：常量、编码函数、全局参数；CPU 构建器与 GPU shader 之间的字节契约。
 //! b_struct = Region ① 稠密 chunk 窗口 + Region ② 各 chunk 的 DFS 树；`PALETTE_BITS`=16 同宽约束两侧一致。
 
-use gate_voxel::{PALETTE_BITS, PALETTE_ENTRY_COUNT, PaletteEntry};
+use gate_voxel::{PALETTE_BITS, PALETTE_ENTRY_COUNT, PaletteEntry, PaletteFlags};
 use glam::{IVec3, Mat3, Vec3, Vec4};
 
 /// chunk 边长（voxel 单位）：256³
@@ -41,16 +41,104 @@ pub const STATE_ENTRY_COUNT: usize = 256;
 /// StateTable 总字数（256×4 = 1024 = 4KB）
 pub const STATE_TOTAL_WORDS: usize = STATE_ENTRY_COUNT * STATE_WORDS_PER_ENTRY;
 
-/// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）
+/// PaletteEntry（8B，repr(C)）→ 2 个 u32（小端字节序打包）—— **平凡变体**（`flags::IS_PBR = 0`）。
+/// 逐位布局（`docs/PLAN.md` D1；写侧权威，读侧见 `common.wesl` 的 `palette_*`、介质读见 `trace.wesl::medium_of`）：
+/// ```text
+/// word0 = color.r | color.g<<8 | color.b<<16 | roughness<<24
+/// word1 = emissive | transmission<<8 | flags<<16 | metallic<<24
+/// ```
+/// `metallic` 落在原先恒 0 的 `_pad` 字节上、默认 0 ⇒ **与改动前逐位相同**。`TRANSMISSIVE` 位由本函数维护。
 pub fn pack_palette_entry(e: &PaletteEntry) -> [u32; 2] {
+  let mut flags = e.flags.0;
+  if e.transmission > 0 {
+    // 介质位由**写入侧**维护（D1）：`medium_of` 在 DDA 内逐体素调用，改读本字节的 bit5
+    // （与 transmission 同在 word1 ⇒ 零额外读取），不再读 transmission 字节 ——
+    // PBR 变体里那个字节属于 `asset`。改动前 bit5 空闲且恒 0，故旧条目行为不变。
+    flags |= PaletteFlags::TRANSMISSIVE.0;
+  }
   [
     e.color[0] as u32
       | (e.color[1] as u32) << 8
       | (e.color[2] as u32) << 16
       | (e.roughness as u32) << 24,
-    e.emissive as u32 | (e.transmission as u32) << 8 | (e.flags.0 as u32) << 16,
+    e.emissive as u32
+      | (e.transmission as u32) << 8
+      | (flags as u32) << 16
+      | (e.metallic as u32) << 24,
   ]
 }
+
+/// PBR 变体的逐实例标量覆盖。`0` = 不覆盖（用材质资产的值）；`1..=255` = 覆盖为 `(v-1)/254`
+/// （`1` 因此能表达"完全镜面"这种 0 值，而不与"不覆盖"撞码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PbrOverrides {
+  pub roughness: u8,
+  pub metallic: u8,
+  pub emissive: u8,
+  pub transmission: u8,
+  /// 语义同 glTF `KHR_materials_specular`：只调制**电介质**的 F0，对金属无效（D1「F0 的唯一来源规则」）。
+  pub specular: u8,
+}
+
+/// PBR 变体（`flags::IS_PBR = 1`）的 8B 打包。布局（`docs/PLAN.md` D1；平凡变体的字节位置被向后兼容钉死，
+/// PBR 变体的位置完全自由，故按最省的方式排）：
+/// ```text
+/// word0 = roughness 覆盖 | metallic 覆盖<<8 | emissive 覆盖<<16 | transmission 覆盖<<24
+/// word1 = asset:u16 | flags<<16 | specular 覆盖<<24
+/// ```
+/// `flags` 里的 `TRANSMISSIVE` 由**调用方**决定 —— 只有调用方知道该资产是不是透射材质
+/// （可能来自资产的 transmission 贴图/标量），本函数不推断。`IS_PBR` 则由本函数保证置上。
+pub fn pack_palette_entry_pbr(asset: u16, ov: PbrOverrides, flags: PaletteFlags) -> [u32; 2] {
+  [
+    ov.roughness as u32
+      | (ov.metallic as u32) << 8
+      | (ov.emissive as u32) << 16
+      | (ov.transmission as u32) << 24,
+    asset as u32
+      | ((flags.union(PaletteFlags::IS_PBR).0 as u32) << 16)
+      | (ov.specular as u32) << 24,
+  ]
+}
+
+/// `MaterialAsset` 各 `*_slot` 的「无贴图」哨兵：该通道退回 `albedo_rough` / `emissive_metal` /
+/// `transmission_ior` 里的标量值。**0 不是哨兵**（层 0 可以被真实贴图占用）——判据是 `u32::MAX`。
+pub const MATERIAL_SLOT_NONE: u32 = 0xFFFF_FFFF;
+
+/// 材质资产条目：PBR 变体的 palette 槽按 `asset: u16` 索引本表。
+/// **全局一张表**（所有 volume 共用，不是 per-volume；`asset` 是全局下标），大小 `MATERIAL_ASSET_SLOTS` 项。
+/// 一个条目 = 「一组 PBR 贴图集槽位 + 无贴图时的标量回退值」；贴图形态是 2D 贴图集 + triplanar（D3），
+/// 槽位指向 `texture_2d_array` 的层（层数上限 `MATERIAL_TEX_SLOTS`）。
+///
+/// 全 `u32` 字段（不用 `u8`/`u16`）+ `repr(C)` ⇒ 无对齐填充坑，storage array stride = 32B。
+/// **无 normal 层**：法线是几何的函数（由 `voxel_normal` 隐式给出），凹凸走 MT6 的真实体素几何（D2）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]
+pub struct MaterialAsset {
+  /// albedo 贴图槽（sRGB，采样后转 linear）；`MATERIAL_SLOT_NONE` ⇒ 取 `albedo_rough` 的颜色
+  pub albedo_slot: u32,
+  /// rough-metal 贴图槽，**glTF ORM 布局：G = Roughness、B = Metalness**（Poly Haven 的 `arm` 就是它）；
+  /// `MATERIAL_SLOT_NONE` ⇒ roughness 取 `albedo_rough`、metallic 取 `emissive_metal`
+  pub roughmetal_slot: u32,
+  /// emissive 贴图槽（乘 `emissive_metal` 的 emissive 强度）；`MATERIAL_SLOT_NONE` ⇒ 只用标量强度
+  pub emissive_slot: u32,
+  /// transmission 贴图槽（可选）；`MATERIAL_SLOT_NONE` ⇒ 只用 `transmission_ior` 的标量透射率
+  pub transmission_slot: u32,
+  /// 高度（位移）贴图槽 —— **仅 CPU 侧读**：MT6 的 CSG 位移在体素化那一刻采样一次，
+  /// 由 `gate-app` 解码成普通 CPU 高度场（`gate-voxel` 零渲染依赖，硬约束 8）；
+  /// **shader 不读本项**（位移产物就是普通体素，凹凸靠真实几何，不做法线贴图混合）。
+  pub height_slot: u32,
+  /// 标量回退值：`color.rgb(sRGB) | roughness<<24`，布局同平凡变体 word0 ⇒ 无贴图时逐位等价于平凡材质
+  pub albedo_rough: u32,
+  /// 标量回退值：`emissive | metallic<<8 | specular<<16 | 保留<<24`（specular 语义同 glTF
+  /// `KHR_materials_specular`，只调制电介质 F0；无 specular 贴图时它就是槽级覆盖之外的资产基值）
+  pub emissive_metal: u32,
+  /// `transmission | ior_x100<<16`：透射率 + IOR ×100（u16 ⇒ IOR 0..655.35，玻璃 1.5 → 150）。
+  /// IOR 是**资产级的物理基值**，同时服务玻璃折射与电介质 F0 = ((IOR−1)/(IOR+1))²
+  /// （硬约束 9：F0 只有一个来源；逐槽调节走 PBR 变体的 `specular` 覆盖）。
+  pub transmission_ior: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MaterialAsset>() == 32);
 
 // 字段名与整体布局须与 shaders/voxel_raytrace/ 的 Globals struct 字节兼容；
 // index_origin/dims 与 tile_count 均为 chunk 语义（×256 voxel）。

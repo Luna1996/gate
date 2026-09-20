@@ -53,6 +53,30 @@ struct Globals {
 @group(1) @binding(4) var light_tex: texture_3d<f32>;
 @group(1) @binding(5) var light_samp: sampler;
 
+// --- BG1 追加（MT2-2，从 binding 6 起，不动 0..5）：全局材质资产表 + PBR 贴图集 ---
+// 资产条目：与 Rust `wire.rs::MaterialAsset` **逐字段镜像**（8 × u32 = 32B，字段名与顺序都必须一致；
+// storage array 的 stride 由 WGSL 对齐规则给出 = 4B 对齐 × 8 字段 = 32B，与 Rust 的 `repr(C)` 相同）。
+// 语义（权威注释在 `wire.rs`）：`*_slot` = `texture_2d_array` 的层号，`0xFFFFFFFF`
+// （= Rust `MATERIAL_SLOT_NONE`）表示"无贴图 ⇒ 走标量回退值"；其余 3 个字是标量回退值。
+struct MaterialAsset {
+  albedo_slot: u32,        // albedo 贴图层号；NONE ⇒ 取 albedo_rough 的颜色
+  roughmetal_slot: u32,    // rough-metal 贴图层号（glTF ORM：G = Roughness、B = Metalness）；NONE ⇒ 取标量
+  emissive_slot: u32,      // emissive 贴图层号（可选）；NONE ⇒ 只用标量强度
+  transmission_slot: u32,  // transmission 贴图层号（可选）；NONE ⇒ 只用标量透射率
+  height_slot: u32,        // 高度（位移）贴图层号 —— **仅 CPU 侧读**（MT6 的 CSG 位移），shader 不读
+  albedo_rough: u32,       // 标量回退：color.rgb(sRGB) | roughness<<24（布局同平凡变体 word0）
+  emissive_metal: u32,     // 标量回退：emissive | metallic<<8 | specular<<16 | 保留<<24
+  transmission_ior: u32,   // transmission | ior_x100<<16（IOR 是资产级物理基值，同时服务折射与 F0）
+};
+// 全局资产表：**所有 volume 共用一张**（不是 per-volume）—— palette 的 PBR 变体里 `asset: u16`
+// 就是这张表的**全局下标**。表大小 = `MATERIAL_ASSET_SLOTS`（WESL 权威常量在 `common.wesl`）。
+@group(1) @binding(6) var<storage, read> material_assets: array<MaterialAsset>;
+// 采样 `pbr_albedo_rough` 的 rgb 后**必须**走 `srgb_to_linear()`：两张数组图都是 `Unorm` 格式、
+// 采样不做 sRGB 转换（rgb 是 sRGB 编码的原始字节），与 `palette_albedo` 读 palette 字节后同样
+// `srgb_to_linear()` 是**完全同一口径** ⇒ 平凡材质与 PBR 材质能共用同一个 BRDF 入口。
+@group(1) @binding(7) var pbr_albedo_rough: texture_2d_array<f32>;  // Rgba8Unorm: rgb=albedo(sRGB 编码字节)、a=roughness
+@group(1) @binding(8) var pbr_metal: texture_2d_array<f32>;         // R8Unorm: r=metalness
+
 // --- BG2：GridDesc 数组（144B/entry，与 Rust GridDesc 字节一致）---
 struct GridDesc {
   pos_scale: vec4<f32>,   // xyz = 位置，w = scale

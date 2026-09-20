@@ -92,8 +92,14 @@ impl From<PaletteId> for usize {
   }
 }
 
-/// 调色板条目：RGB 颜色 + PBR 简化参数 + 标志位（8B/条目，65536 条 = 512KB，可直接进 GPU buffer）。
-/// GPU 侧解包：`color`/`emissive`/`roughness`/`transmission`/`flags`（见 `wire.rs::pack_palette_entry`）。
+/// 调色板条目：8B/条目，65536 条 = 512KB，可直接进 GPU buffer。
+/// **这 8B 按 [`PaletteFlags::IS_PBR`] 复用为两种变体**（`docs/PLAN.md` D1 tagged union）：
+/// - 平凡变体（`IS_PBR = 0`）：本结构体字段就是全部 payload（`color` + `roughness` + `emissive` +
+///   `transmission` + `metallic`），字节布局与改动前**逐位相同**（只有原 `_pad` 变成有语义的 `metallic`）；
+/// - PBR 变体（`IS_PBR = 1`）：这 8B 被解释为 `asset: u16` + 5 个标量覆盖，本结构体字段不再被读
+///   （打包入口是 `gate-render/src/brickmap/wire.rs::pack_palette_entry_pbr`）。
+///
+/// 布局的写侧权威见 `wire.rs::pack_palette_entry`，读侧见 `common.wesl` 的 `palette_*`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct PaletteEntry {
@@ -107,7 +113,10 @@ pub struct PaletteEntry {
   pub transmission: u8,
   /// 视觉变体 + 语义标志（见 [`PaletteFlags`]）
   pub flags: PaletteFlags,
-  _pad: u8,
+  /// 金属度 0（非金属/电介质）..255（金属）；默认 0。
+  /// 原先这个字节是废弃的 `_pad`（恒 0）⇒ 默认值下打包结果与改动前**逐位相同**。
+  /// 贴图驱动时它是 rough-metal 贴图的 B 通道（8 bit 连续量），本字节是**无贴图时的回退值**。
+  pub metallic: u8,
 }
 
 /// 标志位：手写 bit 常量（不引 bitflags crate）
@@ -119,6 +128,16 @@ impl PaletteFlags {
   pub const INPUT_PORT: Self = Self(1 << 1); // 输入端口（电路边界条件）
   pub const OUTPUT_PORT: Self = Self(1 << 2); // 输出端口
   pub const HOLOGRAM: Self = Self(1 << 3); // 全息渲染变体
+  /// 变体位（D1）：置 1 ⇒ 这 8B payload 按 **PBR 变体**（`asset: u16` + 标量覆盖）解释。
+  /// 写入侧由 `wire.rs::pack_palette_entry_pbr` 保证置上（`pack_palette_entry` 恒不置）。
+  pub const IS_PBR: Self = Self(1 << 4);
+  /// DDA 热路径位：置 1 = 该槽是**可穿透介质**。`trace.wesl::medium_of` 在 DDA 内逐体素调用，
+  /// 只读这一位（与 transmission 同在 word1 ⇒ 零额外读取）—— PBR 变体里 transmission 所在字节
+  /// 属于 `asset`，不能再按字节判介质。
+  /// **由写入侧维护**：平凡变体 = `transmission > 0`（见 `wire.rs::pack_palette_entry`）；
+  /// PBR 变体由调用方决定（只有它知道资产是不是透射材质）。
+  /// 改动前 bit5 空闲且恒 0 ⇒ 旧条目的介质行为不变。
+  pub const TRANSMISSIVE: Self = Self(1 << 5);
 
   pub fn contains(self, other: Self) -> bool {
     self.0 & other.0 == other.0

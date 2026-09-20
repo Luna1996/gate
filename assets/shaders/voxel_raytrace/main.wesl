@@ -1,5 +1,5 @@
 import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
-import package::common::{linear_to_srgb, palette_albedo, palette_emissive, palette_roughness, palette_transmission, sky_rgb, srgb_to_linear};
+import package::common::{FLAGS_TRANSMISSIVE, linear_to_srgb, palette_albedo, palette_emissive, palette_flags, palette_roughness, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_key0, gi_key1, gi_unpack_dir};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
@@ -79,8 +79,12 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     }
     tint = tint * seg;
     if (!best.hit) { return GlassOut(best, tint, refl, dir); }
-    let tau = palette_transmission(best.palette_base, best.pal);
-    if (tau <= 0.0) { return GlassOut(best, tint, refl, dir); }
+    // 界面事件的判据是「这个材质是不是介质」，只当布尔用（不参与颜色计算，透射色来自 `world_trace_medium`
+    // 的 `seg`）⇒ 一律读 `FLAGS_TRANSMISSIVE` 位。PBR 变体里 transmission 字节属于 `asset`
+    // （`docs/PLAN.md` D1），按字节读会得到随机值把不透明材质误判成玻璃。
+    if ((palette_flags(best.palette_base, best.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+      return GlassOut(best, tint, refl, dir);
+    }
     let p_hit = org + dir * best.t;
     let nn = best.n;
     let ci = clamp(dot(-dir, nn), 0.0, 1.0);
@@ -223,7 +227,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var dir = dir_voxel;
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
-  if (first.hit && palette_transmission(first.palette_base, first.pal) > 0.0) {
+  // 首命中是不是玻璃（走 `trace_glass` 状态机）看 `FLAGS_TRANSMISSIVE` 位，不读 transmission 字节：
+  // PBR 变体里那个字节属于 `asset`（`docs/PLAN.md` D1），按字节读会把不透明材质误判成玻璃。
+  // 平凡变体下该位恒等于 `transmission > 0`（由写入侧 `wire.rs::pack_palette_entry` 维护）⇒ 行为不变。
+  if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let g = trace_glass(origin_voxel, dir_voxel, t_min, frustum_length, sun_dir, sky, sun_c);
     best = g.ray;
     dir = g.dir;

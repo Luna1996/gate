@@ -1,5 +1,5 @@
 import package::bindings::{gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::common::{palette_transmission};
+import package::common::{FLAGS_TRANSMISSIVE, palette_flags};
 import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
@@ -228,7 +228,10 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 二次顶点太阳反弹（菜单「渲染/RESTIR GI/太阳反弹」）：0 = 连 NEE 阴影射线都不发。
   let sun_bounce = gi_u.params.x;
 
-  if (!(h.hit && palette_transmission(h.palette_base, h.pal) <= 0.0)) {
+  // 「命中 && 非介质」才有效（布尔取反顺序别写错）：介质判定读 `FLAGS_TRANSMISSIVE` 位而非 transmission
+  // 字节 —— PBR 变体里那个字节属于 `asset`（`docs/PLAN.md` D1）。平凡变体下两者等价（写入侧
+  // `wire.rs::pack_palette_entry` 维护该位），故行为不变。
+  if (!(h.hit && (palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u)) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
     gi_res_store_cur(idx, gi_res_none());
     // 降噪导引同步清零：整格清零 ⇒ 键为零 ⇒ 降噪与上采样都当作无效跳过。

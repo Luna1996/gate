@@ -14,8 +14,10 @@ use bevy::{
 
 use super::builder::{VolumesBuilder, VolumesSnapshot};
 use super::wire::{
-  BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, TREE_BASE, march_mask_lut_words,
+  BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, MaterialAsset, TREE_BASE,
+  march_mask_lut_words,
 };
+use crate::pbr_texture::{METAL_DEMO_ID, PbrTextureSet, build_material_asset_table};
 use glam::{IVec3, UVec3};
 
 #[derive(Debug, Clone, Copy)]
@@ -305,6 +307,7 @@ pub struct UploadCpuSampleChannel(pub std::sync::Arc<std::sync::Mutex<Option<Upl
 
 /// GPU 资源（render world）：统一 struct/leaves/palette/comp/state + grid_descs + globals。
 /// `leaves` 存方向可达掩码 LUT（BG1 binding(1) 占位）；`grid_descs_count` 为有效条目数。
+/// 另含 MT2-2 的两项**全局**（非 per-volume）资源：材质资产表 buffer 与 PBR 贴图数组的占位视图。
 #[derive(Resource)]
 pub struct GpuBrickMap {
   pub struct_buf: Buffer,
@@ -322,6 +325,20 @@ pub struct GpuBrickMap {
   pub light_tex: Texture,
   pub light_view: TextureView,
   pub light_sampler: Sampler,
+  /// **全局材质资产表**（BG1 binding 6）：storage buffer，`MATERIAL_ASSET_SLOTS × 32B`（当前 = 32KB）。
+  /// **所有 volume 共用一张**（palette 的 PBR 变体里 `asset: u16` 是全局下标）。尺寸在
+  /// [`init_empty_gpu`] 就按 WESL 常量定死（占位即最终尺寸，不需要扩容逻辑），
+  /// 内容由 [`prepare`] 全量写一次（静态默认集，没有任何写入方 ⇒ 不需要增量路径）。
+  pub material_assets: Buffer,
+  /// 资产表内容是否已上传（一次性）：`false` = 仍是零初始化占位（贴图集还没就绪）。
+  pub material_assets_uploaded: bool,
+  /// PBR 贴图数组的**占位**（1×1×1 层，视图显式声明 `D2Array`）：贴图集 / `GpuImage` 未就绪时
+  /// BG1 binding 7/8 绑它们 ⇒ **任何时刻都可绑定，绝不 panic**。
+  /// 视图必须声明 `D2Array`：默认视图是单层 `D2`，拿去绑 `texture_2d_array` 会被 wgpu 拒（MT2-1 的坑）。
+  pub pbr_albedo_rough_tex: Texture,
+  pub pbr_albedo_rough_view: TextureView,
+  pub pbr_metal_tex: Texture,
+  pub pbr_metal_view: TextureView,
 }
 
 fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
@@ -360,6 +377,44 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     dimension: Some(TextureViewDimension::D3),
     ..Default::default()
   });
+
+  // ---- MT2-2：全局材质资产表（占位即最终尺寸）+ PBR 贴图数组的占位视图 ----
+  // 资产表：`MATERIAL_ASSET_SLOTS × 32B`（当前 = 1024 × 32B = 32KB）。表是**静态默认集**，
+  // 尺寸由 WESL 权威常量定死 ⇒ 一开始就按满尺寸开，prepare 只需 `write_buffer` 写一次内容，
+  // 期间（贴图集还没就绪）这份零初始化 buffer 就是合法占位（长度已够）。
+  let asset_slots = crate::wesl_consts::material_consts().material_asset_slots;
+  let material_assets = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_material_assets"),
+    size: asset_slots as u64 * std::mem::size_of::<MaterialAsset>() as u64,
+    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+    mapped_at_creation: false,
+  });
+  // 贴图数组占位（1×1×1 层）：`depth_or_array_layers = 1` + 视图 `D2Array` —— 两者缺一不可
+  // （MT2-1/MT2-1c 的坑：默认视图是单层 `D2`，绑 `texture_2d_array` 会被 wgpu 拒）。
+  let make_pbr_placeholder = |label: &str, format: TextureFormat| -> (Texture, TextureView) {
+    let tex = device.create_texture(&TextureDescriptor {
+      label: Some(label),
+      size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D2,
+      format,
+      usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+      view_formats: &[],
+    });
+    let view = tex.create_view(&TextureViewDescriptor {
+      label: Some(label),
+      dimension: Some(TextureViewDimension::D2Array),
+      ..Default::default()
+    });
+    (tex, view)
+  };
+  // 格式与真身一致（`Rgba8Unorm` / `R8Unorm`）⇒ 占位与真身的采样类型都是可过滤 float，layout 通用。
+  let (pbr_albedo_rough_tex, pbr_albedo_rough_view) =
+    make_pbr_placeholder("gate_pbr_albedo_rough_placeholder", TextureFormat::Rgba8Unorm);
+  let (pbr_metal_tex, pbr_metal_view) =
+    make_pbr_placeholder("gate_pbr_metal_placeholder", TextureFormat::R8Unorm);
+
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     leaves: make("gate_leaves"),
@@ -374,6 +429,12 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     light_tex,
     light_view,
     light_sampler,
+    material_assets,
+    material_assets_uploaded: false,
+    pbr_albedo_rough_tex,
+    pbr_albedo_rough_view,
+    pbr_metal_tex,
+    pbr_metal_view,
   });
 }
 
@@ -592,6 +653,11 @@ fn u8_of_grid_descs(descs: &[GridDesc]) -> &[u8] {
   unsafe { std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs)) }
 }
 
+/// MaterialAsset 数组 → u8 字节视图（`#[repr(C)]`、8 × u32 = 32B/条，可直接 cast）
+fn u8_of_material_assets(assets: &[MaterialAsset]) -> &[u8] {
+  unsafe { std::slice::from_raw_parts(assets.as_ptr() as *const u8, std::mem::size_of_val(assets)) }
+}
+
 /// GPU buffer 扩容尺寸策略（纯函数）：need ≥ 扩容阈值 → 32MB 对齐；否则 2× 增长（下限 64KB）。
 fn grow_size(cap: u64, need: u64) -> u64 {
   let big = crate::brickmap::consts::BUFFER_GROW_BIG;
@@ -716,11 +782,61 @@ fn upload_light_field(
   );
 }
 
+/// 全局材质资产表：**静态默认集**，一次全量上传（MT2-2）。
+///
+/// **为什么不需要增量路径**：本表当前**没有任何写入方** —— 没有 UI / 编辑能改它（palette 的
+/// `IS_PBR` 变体也还没有写侧），内容只是「贴图集槽位 + 中性电介质默认值」的一次性快照。
+/// 增量（只写被改的那几条）要等 **MT7** 有真实材质编辑时才存在"改了一条"这回事。
+///
+/// 贴图集还没提取进 render world 时不写：buffer 保持 [`init_empty_gpu`] 的零初始化占位
+/// （长度已够 `MATERIAL_ASSET_SLOTS × 32B`），BG1 照样绑得上 ⇒ 不 panic。
+fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu: &mut GpuBrickMap) {
+  if gpu.material_assets_uploaded {
+    return;
+  }
+  let Some(set) = set else {
+    return; // 贴图集未就绪：等它（绑定侧的占位回退由 `dda.rs` 提示一条 info_once）
+  };
+  let table = build_material_asset_table(set);
+  queue.write_buffer(&gpu.material_assets, 0, u8_of_material_assets(&table));
+  gpu.material_assets_uploaded = true;
+
+  let layers = set.layers();
+  let asset_bytes = std::mem::size_of::<MaterialAsset>();
+  info!(
+    target: "gate",
+    "材质资产表: 全量上传 {} 槽 × {asset_bytes}B = {:.0}KB（全局一张表，所有 volume 共用；\
+     palette 的 PBR 变体里 asset:u16 是全局下标）。槽 0..{layers}: albedo_slot = roughmetal_slot = i、\
+     emissive/transmission/height 三个槽位 = MATERIAL_SLOT_NONE；其余槽位: 五个 *_slot 全 MATERIAL_SLOT_NONE\
+     （无贴图 ⇒ 走标量回退值）。标量回退 = 中性灰 albedo(sRGB 128) + roughness 0.5 + metallic 0 \
+     + specular 0.5(中性) + emissive/transmission 0 + IOR 1.50（= 默认电介质，与今天平凡材质的默认观感一致）",
+    table.len(),
+    table.len() as f64 * asset_bytes as f64 / 1024.0,
+  );
+  match set.slot_of(METAL_DEMO_ID) {
+    Some(i) => info!(
+      target: "gate",
+      "材质资产表: 槽 {i}（{METAL_DEMO_ID}）的 metallic = 255 —— 临时 demo 默认值\
+       （MT3 的 metallic / roughness BRDF 验收需要一个金属可用），真正的材质编写属 MT7",
+    ),
+    None => warn!(
+      target: "gate",
+      "材质资产表: 贴图集里没有 `{METAL_DEMO_ID}` ⇒ 表里没有任何金属槽位\
+       （MT3 验收会缺一个现成的金属；请确认 assets/textures/pbr/{METAL_DEMO_ID}/ 存在）",
+    ),
+  }
+  info!(
+    target: "gate",
+    "材质资产表: 增量路径未做 —— 本表是静态默认集、当前无写入方，一次全量写完即可；待 MT7 有材质编辑时再加",
+  );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare(
   mut commands: Commands,
   snapshot: Option<ResMut<UploadSnapshot>>,
   light: Option<ResMut<LightFieldUpdate>>,
+  pbr_set: Option<Res<PbrTextureSet>>,
   mut gpu: ResMut<GpuBrickMap>,
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
@@ -731,6 +847,7 @@ pub(crate) fn prepare(
     upload_light_field(&device, &queue, &mut gpu, &u.data);
     commands.remove_resource::<LightFieldUpdate>();
   }
+  upload_material_assets(&queue, pbr_set.as_deref(), &mut gpu);
   let Some(snap) = snapshot else { return };
   let t0 = std::time::Instant::now();
 

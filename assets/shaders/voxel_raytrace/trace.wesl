@@ -1,6 +1,6 @@
 import package::bindings::{b_leaves, b_palette, b_struct, g, grid_descs, view_u};
 import package::brickmap::{Grid};
-import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, NODE_FIXED_WORDS, face_normal_from_index, palette_transmission};
+import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, NODE_FIXED_WORDS, face_normal_from_index};
 
 // 层级命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
 // voxel = 命中固体体素 chunk 局部整数坐标，着色阶段直接消费，不要用「命中点 ± 法线半步」重建。
@@ -31,10 +31,22 @@ struct Brick {
 
 /// 读 palette 槽的介质属性：`rgb` = 透射色（乘性），`a` = 不透明度（a == 1 = 不透明，非介质）。
 /// 布局与 `wire.rs::pack_palette_entry` 一致（一次读两个 word）。
+/// **介质判定读 `flags` 的 `TRANSMISSIVE` 位**（bit5）而不是 `transmission` 字节：本函数在 DDA 内
+/// **逐体素**调用，且 PBR 变体里 bit8..15 已是 `asset` 的一部分（读它得不到透射率）。
+/// flags 与 transmission 同在 word1 ⇒ 零额外读取；该位由写入侧维护（见 `wire.rs::pack_palette_entry`）。
 fn medium_of(palette_base: u32, pal: u32) -> vec4<f32> {
+  let w1 = b_palette[palette_base + pal * 2u + 1u];
+  // 非介质：改动前的 `a = 1 − transmission/255` 在 transmission == 0 时恒等于 1.0，且调用方只用
+  // `a >= 1.0` 判"不透明"（rgb 那条路径不消费）⇒ 这里直接给 a = 1.0，行为与改动前逐行等价。
+  if ((w1 & FLAGS_TRANSMISSIVE) == 0u) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
+  if ((w1 & FLAGS_IS_PBR) != 0u) {
+    // PBR 变体：w1 低 16 位是 `asset`，读不出透射率 ⇒ 只按 TRANSMISSIVE 位判"是介质"，
+    // 吸收色取中性（白 = 不染色，非乘性暗化）。**PBR 变体的介质吸收色走材质资产，属 MT3/MT5**。
+    return vec4<f32>(1.0, 1.0, 1.0, 0.0);
+  }
   let w0 = b_palette[palette_base + pal * 2u];
   let srgb = vec3<f32>(f32(w0 & 0xFFu), f32((w0 >> 8u) & 0xFFu), f32((w0 >> 16u) & 0xFFu)) / 255.0;
-  let a = 1.0 - f32((b_palette[palette_base + pal * 2u + 1u] >> 8u) & 0xFFu) / 255.0;
+  let a = 1.0 - f32((w1 >> 8u) & 0xFFu) / 255.0;
   return vec4<f32>(mix(vec3<f32>(1.0), srgb * srgb, a), a);
 }
 

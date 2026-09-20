@@ -188,10 +188,12 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
     }
     let rgba = scene.palette.colors[i];
     let mat = &scene.materials[i];
-    let mut e = PaletteEntry::default();
-    e.color = [rgba.r, rgba.g, rgba.b];
-    e.roughness = mat.rough.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(200);
-    e.emissive = mat.emit.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(0);
+    let e = PaletteEntry {
+      color: [rgba.r, rgba.g, rgba.b],
+      roughness: mat.rough.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(200),
+      emissive: mat.emit.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).unwrap_or(0),
+      ..Default::default()
+    };
     pal.set(PaletteId(i as u16), e);
     painted += 1;
   }

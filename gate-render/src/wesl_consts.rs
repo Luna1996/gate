@@ -49,11 +49,32 @@ const REQUIRED: &[&str] = &[
   "GI_SS_M_CAP_K_HQ",
 ];
 
+/// 材质资产两侧共用的常量（权威值在 WESL `common.wesl`）。
+/// **独立于 [`GiConsts`]**：GI 常量与材质常量各自的解析互不牵连（一个缺失只 fail 自己那一侧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterialConsts {
+  /// 材质资产槽数上限（`MATERIAL_ASSET_SLOTS`）：Rust 按它开资产表 buffer 并钳制 `asset` 索引。
+  /// **全局一张表**（所有 volume 共用，`asset: u16` 是全局下标），不是 per-volume。
+  pub material_asset_slots: u32,
+  /// 贴图槽位（`texture_2d_array` 层）数目上限（`MATERIAL_TEX_SLOTS`）：Rust 按它校验/分配层数。
+  pub material_tex_slots: u32,
+}
+
+/// [`MaterialConsts`] 需要的常量名（缺一即 fail fast）。
+const MATERIAL_REQUIRED: &[&str] = &["MATERIAL_ASSET_SLOTS", "MATERIAL_TEX_SLOTS"];
+
 /// 解析 WESL 包里的跨端常量（首次读盘，之后走 `OnceLock`）。
 /// 失败（文件读不到 / 常量缺失 / 不是字面量）→ `error!` + `panic!`。
 pub fn gi_consts() -> &'static GiConsts {
   static CONSTS: OnceLock<GiConsts> = OnceLock::new();
   CONSTS.get_or_init(GiConsts::load)
+}
+
+/// 解析 WESL 包里的材质资产常量（首次读盘，之后走 `OnceLock`）。
+/// 失败（文件读不到 / 常量缺失 / 不是字面量）→ `error!` + `panic!`；与 [`gi_consts`] 相互独立。
+pub fn material_consts() -> &'static MaterialConsts {
+  static CONSTS: OnceLock<MaterialConsts> = OnceLock::new();
+  CONSTS.get_or_init(MaterialConsts::load)
 }
 
 impl GiConsts {
@@ -135,6 +156,55 @@ impl GiConsts {
       out.gi_den_atrous_iter,
       out.gi_den_atrous_r,
       out.gi_den_atrous_r_fast,
+    );
+    out
+  }
+}
+
+impl MaterialConsts {
+  fn load() -> Self {
+    let dir = dda_wesl_dir();
+    let values = parse_package_u32_consts(&dir);
+    let missing: Vec<&str> =
+      MATERIAL_REQUIRED.iter().copied().filter(|name| !values.contains_key(*name)).collect();
+    if !missing.is_empty() {
+      let msg = format!(
+        "WESL 材质跨端常量缺失（{}）：{:?}\n\
+         —— 权威值只写在 .wesl 里，Rust 从源码解析；请检查 common.wesl 的材质资产常量段，\
+         并确保它们写成 `const NAME: u32 = <字面量>u;` 形式。",
+        dir.display(),
+        missing
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    let get = |name: &str| -> u32 { values[name] };
+    let out = MaterialConsts {
+      material_asset_slots: get("MATERIAL_ASSET_SLOTS"),
+      material_tex_slots: get("MATERIAL_TEX_SLOTS"),
+    };
+
+    // asset 索引是 u16（PBR 变体 word1 低 16 位）⇒ 表最多 2^16 项；0 则任何资产都索引不到。
+    if out.material_asset_slots < 1 || out.material_asset_slots > 65_536 {
+      let msg = format!("材质资产槽数越界（1..=65536，asset 索引是 u16）：{out:?}");
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if out.material_tex_slots < 1 {
+      let msg = format!("贴图槽位上限为 0 ⇒ 任何贴图都放不下（至少 1）：{out:?}");
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    let asset_bytes = std::mem::size_of::<crate::brickmap::wire::MaterialAsset>() as u32;
+    info!(
+      target: "gate",
+      "WESL 跨端常量（源 {}）：材质资产表 {} 槽（全局一张表，所有 volume 共用；{} B/槽 = {} KB）；\
+       贴图槽位上限 {} 层",
+      dir.display(),
+      out.material_asset_slots,
+      asset_bytes,
+      (out.material_asset_slots as u64 * asset_bytes as u64) / 1024,
+      out.material_tex_slots,
     );
     out
   }

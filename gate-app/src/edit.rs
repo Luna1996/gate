@@ -50,12 +50,13 @@ impl Default for BrushMaterial {
 impl BrushMaterial {
   /// 落进调色板的条目（不设 `flags`）。
   pub fn entry(&self) -> PaletteEntry {
-    let mut e = PaletteEntry::default();
-    e.color = self.color;
-    e.roughness = self.roughness;
-    e.emissive = self.emissive;
-    e.transmission = self.transmission;
-    e
+    PaletteEntry {
+      color: self.color,
+      roughness: self.roughness,
+      emissive: self.emissive,
+      transmission: self.transmission,
+      ..Default::default()
+    }
   }
 
   /// 日志用的 `#RRGGBB`

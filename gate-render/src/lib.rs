@@ -3,6 +3,7 @@ pub mod consts;
 pub mod gi;
 pub mod lighting;
 pub mod paths;
+pub mod pbr_texture;
 pub mod profiler;
 mod responsive;
 pub mod shader;
@@ -26,6 +27,7 @@ pub use lighting::{
   build_light_pool, parse_lighting_ron,
 };
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
+pub use pbr_texture::{PBR_TEXTURE_DIR, PbrTextureSet, PbrTexturesPlugin};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
 
 pub struct GateRenderPlugin;
@@ -37,6 +39,8 @@ impl Plugin for GateRenderPlugin {
       brickmap::dda::BrickMapDdaPlugin,
       gi::GiPlugin,
       profiler::GateProfilerPlugin,
+      // PBR 贴图集（MT2-1）：扫描 assets/textures/pbr/ → 两张 texture_2d_array（只加载，不绑定）
+      pbr_texture::PbrTexturesPlugin,
     ));
   }
 }

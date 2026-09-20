@@ -9,7 +9,9 @@ license.workspace = true
 profile = ["dep:wgpu-profiler"]
 
 [dependencies]
-bevy = { workspace = true }
+# jpeg feature = bevy_image 的 `.jpg` 解码器（PBR 贴图集是 Poly Haven 的 jpg）。
+# 缺它 `AssetServer` 根本没有注册 jpg 扩展名 ⇒ 全部贴图加载失败（不是回落纯色，是 Failed）。
+bevy = { workspace = true, features = ["jpeg"] }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 rayon = { workspace = true }

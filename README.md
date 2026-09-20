@@ -9,9 +9,10 @@
 
 ```powershell
 # 工具链：Rust stable（rust-toolchain.toml，MSVC toolchain）+ Vulkan 显卡驱动
-cargo run -p gate-app                     # 默认场景 = assets/vox/nuke.vox（启动场景/规模见 gate-app/src/consts.rs）
-cargo run -p gate-app --features profile  # 性能剖析：Tracy GUI 连接进程（CPU span + GPU pass 同时间线）
-cargo clippy --workspace --all-targets -- -D warnings
+# gate-app 禁止 debug 构建（gate-app/build.rs）：所有 cargo 命令一律加 --release
+cargo run --release -p gate-app                     # 默认场景 = assets/vox/nuke.vox（启动场景/规模见 gate-app/src/consts.rs）
+cargo run --release -p gate-app --features profile  # 性能剖析：Tracy GUI 连接进程（CPU span + GPU pass 同时间线）
+cargo clippy --release --workspace --all-targets -- -D warnings
 ```
 
 > `assets/vox/nuke.vox` 被 `.gitignore` 排除（体积大），新克隆的仓库里没有它。备选：
@@ -349,17 +350,18 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 ```powershell
 # 本地跑法（VS Code → 终端 → 运行任务，或直接敲命令）
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
+cargo clippy --release --workspace --all-targets -- -D warnings
+cargo build --release --workspace
 ```
 
+- **全部加 `--release`**：`gate-app/build.rs` 禁止 debug 构建，dev profile 下 `build` / `run` / `check` / `clippy` / `test` 一律直接失败（无逃生开关）。
 - **`cargo fmt --check`**：代码风格（rustfmt.toml：Google 风，2 空格缩进，edition 2024）。
-- **`cargo clippy --workspace --all-targets -- -D warnings`**：lint 零警告。
-- **`cargo build --workspace`**：0 error。
+- **`cargo clippy --release --workspace --all-targets -- -D warnings`**：lint 零警告。
+- **`cargo build --release --workspace`**：0 error。
 
 > 无 CI：以上三条 + 下面的人工验收靠提交前手动跑。
 
-**手工验收（`cargo run -p gate-app`）**
+**手工验收（`cargo run --release -p gate-app`）**
 
 - 默认 `nuke.vox` 场景出画；`WASD` 飞行与右键转头流畅；`F3` 菜单显隐正常。
 - 菜单逐项生效：GI 开关 / GI 分辨率档（1/1、1/2、1/4）/ **降噪质量档（关、低、中、高；与分辨率档正交）**
@@ -372,7 +374,7 @@ cargo build --workspace
 **性能剖析（可选）**
 
 ```powershell
-cargo run -p gate-app --features profile   # 启动后用 Tracy GUI 连接进程
+cargo run --release -p gate-app --features profile   # 启动后用 Tracy GUI 连接进程
 ```
 
 逐 pass 的 GPU 均值每 2 秒打印一行；Tracy 时间线上 CPU span（tracing 桥）与 GPU pass 同一帧轴。

@@ -1,6 +1,6 @@
 //! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
 //! BG0 = storage tex / 相机 uniform / beam depth / 眼睛适应状态（只读）；
-//! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理。
+//! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理 / 材质资产表 / PBR 贴图数组。
 //! WGSL 源 = WESL 包 `shaders/voxel_raytrace/`（入口 `main.wesl`）。
 
 use bevy::{
@@ -1100,8 +1100,8 @@ use bevy::{
       StorageTextureAccess, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
       TextureUsages, TextureViewDescriptor, UniformBuffer, VertexState,
       binding_types::{
-        sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, texture_3d,
-        texture_storage_2d, uniform_buffer,
+        sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
+        texture_2d_array, texture_3d, texture_storage_2d, uniform_buffer,
       },
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -1480,6 +1480,8 @@ pub(crate) fn init_dda_pipelines(
   );
 
   // ---- BG1：struct/leaves/palette 三 storage + globals uniform（Compute，read-only）----
+  // 6/7/8 = MT2-2 的全局材质资产表 + PBR 贴图数组（**BG1 被 dda / beam / gi 三个 pass 共用**，
+  // 这三条只在这一份 layout 里加；`dda.rs` 是 BG1 layout 的唯一出处，`gi` 侧 no-op）。
   let bg1 = BindGroupLayoutDescriptor::new(
     "DdaBg1",
     &BindGroupLayoutEntries::sequential(
@@ -1493,7 +1495,14 @@ pub(crate) fn init_dda_pipelines(
         // @binding(4)/(5)：光照场（AO fill + 发光密度 ε）——每 16³ 块
         // 实心占比的 3D 纹理 + 线性过滤采样器。
         texture_3d(TextureSampleType::Float { filterable: true }),
+        // @binding(5) 的 sampler 同时给 7/8 两张数组图采样用（都是可过滤的 Unorm 格式）。
         sampler(SamplerBindingType::Filtering),
+        // @binding(6)：全局材质资产表（`array<MaterialAsset>`，32B/条 = 32KB）
+        storage_buffer_read_only_sized(false, None),
+        // @binding(7)/(8)：PBR 贴图数组（`texture_2d_array`，层 = 材质槽号）——
+        // 视图维度必须是 `D2Array`（`texture_2d_array()` 已按此生成 layout entry）。
+        texture_2d_array(TextureSampleType::Float { filterable: true }),
+        texture_2d_array(TextureSampleType::Float { filterable: true }),
       ),
     ),
   );
@@ -1667,6 +1676,7 @@ pub(crate) fn prepare_dda_bind_groups(
   images: Option<Res<DdaImages>>,
   view_uniform: Option<Res<DdaViewUniform>>,
   gpu_brickmap: Option<Res<GpuBrickMap>>,
+  pbr_set: Option<Res<crate::pbr_texture::PbrTextureSet>>,
   lighting: Option<Res<LightingTheme>>,
   light_gpu: Option<ResMut<LightPoolGpu>>,
   render_device: Res<RenderDevice>,
@@ -1984,6 +1994,22 @@ pub(crate) fn prepare_dda_bind_groups(
   let globals_bind = gpu.globals.binding().expect(
     "GpuBrickMap.globals uniform buffer 未初始化（RenderStartup init_empty_gpu 应默认构造）",
   );
+  // MT2-2：binding 7/8 = PBR 贴图数组。`PbrTextureSet` 是 main world 资源（`ExtractResourcePlugin`
+  // 拷进 render world），它的两张图要等 `GpuImage` 就绪；**任一环节缺失都退化为占位视图**（1×1×1 的
+  // `texture_2d_array`）⇒ 绑定永远成立、不 panic（贴图缺失时画面只是纯色回退）。
+  let pbr_albedo = pbr_set.as_deref().and_then(|s| gpu_images.get(s.albedo_rough()));
+  let pbr_metal = pbr_set.as_deref().and_then(|s| gpu_images.get(s.metal()));
+  if pbr_albedo.is_none() || pbr_metal.is_none() {
+    bevy::log::info_once!(
+      target: "gate",
+      "DDA prepare: PBR 贴图数组未就绪（贴图集或 GpuImage）⇒ BG1 binding 7/8 先绑 1×1×1 占位\
+       （资产表 binding 6 若也未上传就是零初始化占位，长度已够）；不 panic"
+    );
+  }
+  let pbr_albedo_view =
+    pbr_albedo.map_or_else(|| gpu.pbr_albedo_rough_view.clone(), |i| i.texture_view.clone());
+  let pbr_metal_view =
+    pbr_metal.map_or_else(|| gpu.pbr_metal_view.clone(), |i| i.texture_view.clone());
   let bg1 = render_device.create_bind_group(
     None,
     &bg1_layout,
@@ -1994,6 +2020,11 @@ pub(crate) fn prepare_dda_bind_groups(
       globals_bind,
       &gpu.light_view,
       &gpu.light_sampler,
+      // @binding(6)：全局材质资产表（内容由 `prepare` 全量写一次）
+      gpu.material_assets.as_entire_binding(),
+      // @binding(7)/(8)：PBR 贴图数组（贴图集 / `GpuImage` 未就绪时是 1×1×1 占位视图）
+      &pbr_albedo_view,
+      &pbr_metal_view,
     )),
   );
 

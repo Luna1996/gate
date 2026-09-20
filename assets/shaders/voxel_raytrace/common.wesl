@@ -15,6 +15,23 @@ const TREE_BASE: u32 = 262144u;          // Region ② 起始
 // 节点第 3 字：bit0..15 = uniform 子块色，bit16..31 = LOD 子树多数色；叶父层 inline 每字装 2 个体素（LEAF_VOXELS_PER_WORD）。
 // 权威定义在 `wire.rs`，改位宽须同步全部读点。
 
+// --- palette flags 位（与 Rust `gate_voxel::PaletteFlags` 同源；权威定义在 palette.rs）---
+// bit0..3 = LOCKED / INPUT_PORT / OUTPUT_PORT / HOLOGRAM（着色不读），
+// bit4 = IS_PBR（变体位）、bit5 = TRANSMISSIVE（DDA 热路径位，**写入侧维护**）、bit6..7 保留。
+const FLAGS_IS_PBR: u32 = 1u << 4u;
+const FLAGS_TRANSMISSIVE: u32 = 1u << 5u;
+
+// --- 材质资产（PBR 变体的 `asset: u16` 所指的表）跨端常量 ---
+// 权威值只写在这里：Rust 经 `wesl_consts.rs::material_consts` 解析同一份源码，缺一即启动 fail-fast。
+// 只放 Rust 也需要知道的 `u32` 字面量；纯 shader 的常量（triplanar 采样尺度、混合锐度这类 f32）
+// 留在用它的文件里即可（解析器只认 `u32` 字面量）。
+/// 材质资产表的槽数上限：**全局一张表、所有 volume 共用**（`asset` 是全局下标，不是 per-volume 偏移），
+/// 表大小 = 本值 × 32B/条目。PBR 变体的 `asset` 索引落在本表内。
+const MATERIAL_ASSET_SLOTS: u32 = 1024u;
+/// 贴图槽位（`texture_2d_array` 层）数目上限：`MaterialAsset` 的 `*_slot` 指向其中之一，
+/// `0xFFFFFFFF`（`MATERIAL_SLOT_NONE`）表示"无贴图 ⇒ 走标量回退值"。
+const MATERIAL_TEX_SLOTS: u32 = 64u;
+
 // 方向位掩码 LUT：3-bit 方向掩码（bit0=x>=0, bit1=y>=0, bit2=z>=0，共 8 种）→ side 与三轴步进 face id。
 // 打包：bits0-2=side, bits8-15=face_x, bits16-23=face_y, bits24-31=face_z；face 规则 sign<0 穿对面。
 const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
@@ -93,10 +110,11 @@ fn palette_roughness(palette_base: u32, pal: u32) -> f32 {
   return f32((b_palette[palette_base + pal * 2u] >> 24u) & 0xFFu) / 255.0;
 }
 
-/// palette 条目的透射率（0 = 不透明 … 1 = 全透），= word1 次字节（`transmission << 8` 同布局）。
-/// 着色侧用来做透射续行：primary 射线按 tau 连乘衰减后穿过体素继续走，太阳阴影射线同样按 tau 连乘。
-fn palette_transmission(palette_base: u32, pal: u32) -> f32 {
-  return f32((b_palette[palette_base + pal * 2u + 1u] >> 8u) & 0xFFu) / 255.0;
+/// palette 条目的 flags 字节（word1 bit16..23，`flags << 16` 同布局）。
+/// 变体位与介质位都从这里读，与 transmission 同在 word1 ⇒ DDA 内读它不额外 load 一个字
+/// （`medium_of` 逐体素调用，成本敏感）。位的权威定义在 `gate_voxel::PaletteFlags`。
+fn palette_flags(palette_base: u32, pal: u32) -> u32 {
+  return (b_palette[palette_base + pal * 2u + 1u] >> 16u) & 0xFFu;
 }
 
 // 天空纯色（miss 像素与探针射线 miss 端点共用）。

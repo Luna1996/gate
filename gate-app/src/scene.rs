@@ -182,16 +182,11 @@ fn paint_demo_palette(grid: &mut VolumeGrid) {
   ];
   let pal = grid.palette_mut();
   for &(idx, color, rough) in palette {
-    let mut e = PaletteEntry::default();
-    e.color = color;
-    e.roughness = rough;
-    pal.set(PaletteId(idx), e);
+    pal.set(PaletteId(idx), PaletteEntry { color, roughness: rough, ..Default::default() });
   }
   // 14 号 LED 灯柱（暖白满档发光）
-  let mut led = PaletteEntry::default();
-  led.color = [255, 214, 156];
-  led.roughness = 128;
-  led.emissive = 255;
+  let led =
+    PaletteEntry { color: [255, 214, 156], roughness: 128, emissive: 255, ..Default::default() };
   pal.set(PaletteId(14), led);
 }
 
