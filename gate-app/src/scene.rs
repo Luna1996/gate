@@ -15,11 +15,11 @@ use gate_voxel::{
 
 use crate::{
   consts::{
-    CAM_FAR, CAM_NEAR, DEMO_DISPLACE_AMPLITUDE, DEMO_DISPLACE_HEIGHT_MAP, DEMO_DISPLACE_SAMPLE,
-    DEMO_DISPLACE_TEX_SCALE, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y, START_CAMERA_SKY,
-    STARTUP_DEMO_SCENE,
+    CAM_FAR, CAM_NEAR, DEMO_DISPLACE_AMPLITUDE_OVERRIDE, DEMO_DISPLACE_HEIGHT_MAP,
+    DEMO_DISPLACE_SAMPLE, DEMO_DISPLACE_TEX_SCALE, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y,
+    START_CAMERA_SKY, STARTUP_DEMO_SCENE,
   },
-  height_field::{self, HeightField},
+  height_field::MaterialDisplace,
   vox_scene,
 };
 
@@ -387,8 +387,16 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   }
 }
 
-/// MT6-4 · **材质位移样例**：一对同尺寸同材质的石台 —— 一座走既有 CSG（位移关闭）、
-/// 一座按 `consts::DEMO_DISPLACE_HEIGHT_MAP` 的高度图位移出**真实体素**凹凸，一眼可对照。
+/// MT6-4 + **MT8-5** · **材质位移样例**：一对同尺寸同材质的石台 —— 一座走既有 CSG（位移关闭）、
+/// 一座**按材质资产里的位移幅度** + `consts::DEMO_DISPLACE_HEIGHT_MAP` 的高度图位移出**真实体素**凹凸，
+/// 一眼可对照。
+///
+/// **MT8-5 的变化（决策 B = 甲）**：幅度**不再来自** `consts::DEMO_DISPLACE_AMPLITUDE`，
+/// 而是由 [`MaterialDisplace::load`] 按材质 id 从**资产**里读（`MaterialAsset::emissive_metal`
+/// 的 bits 24..31，`gate-render/src/pbr_texture.rs::DISPLACE_DEMO_AMPLITUDE`）⇒
+/// **改资产里的幅度即改凹凸**；`consts::DEMO_DISPLACE_AMPLITUDE_OVERRIDE` 只剩"实验时压过资产"的
+/// 地位（默认 `None` = 完全由资产决定）。**左台（对照）与位移语义都没动**：
+/// 左台仍走普通 `fill_box`，右台仍是同一个 `fill_box_displaced` + 同一套高度图语义。
 ///
 /// **位置**：中央广场地面（y=16 起）—— 浮空岛删除后广场是空的，这里一览无遗，
 /// 不再需要"爬到塔帽顶、再换机位绕开实体"。
@@ -412,40 +420,54 @@ fn build_displace_sample(grid: &mut VolumeGrid) {
   // 基准台（位移关闭）：既有 CSG 快路径 —— 作为"位移前"的对照（同尺寸同材质，差别只有位移）
   let base_voxels = fill_box(grid, plain, extent, 4);
 
-  // 高度图：同步解码**只这一个**材质（MT6-2 的"按需"；AssetServer 是异步的，而场景构造在 Startup）
-  let path = crate::assets_dir()
-    .join("textures")
-    .join("pbr")
-    .join(DEMO_DISPLACE_HEIGHT_MAP)
-    .join(format!("{DEMO_DISPLACE_HEIGHT_MAP}_height.png"));
-  let hf = match HeightField::load_png(&path) {
-    Ok(hf) => hf,
-    Err(e) => {
-      // 缺素材不该让引擎起不来：右台退化成普通 CSG，日志说清（其余场景一字不动）
+  // 位移源：**由材质资产驱动**（MT8-5）—— 按 id 读幅度，0 = 不位移；高度图同步解码
+  // **只这一个**材质（MT6-2 的"按需"；AssetServer 是异步的，而场景构造在 Startup）。
+  let sample = match MaterialDisplace::load(
+    DEMO_DISPLACE_HEIGHT_MAP,
+    DEMO_DISPLACE_TEX_SCALE,
+    DEMO_DISPLACE_AMPLITUDE_OVERRIDE,
+  ) {
+    Ok(Some(s)) => s,
+    // 幅度 = 0（资产值）或 id 不在材质目录集里 ⇒ 本材质这次不位移：右台退化成普通 CSG，
+    // 其余场景一字不动（"位移只发生在有幅度的材质上"正是 MT8-5 的语义）。
+    Ok(None) => {
       let n = fill_box(grid, bumped, extent, 4);
       bevy::log::warn!(
         target: "gate",
-        "MT6 位移样例：高度图不可用（{e}）⇒ 右台退化为普通 CSG（写入 {n} 体素）；\
-         放回 assets/textures/pbr/{DEMO_DISPLACE_HEIGHT_MAP}/{DEMO_DISPLACE_HEIGHT_MAP}_height.png 即恢复"
+        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 的位移幅度 = 0 ⇒ 右台**不位移**\
+         （退化为普通 CSG，写入 {n} 体素）；要出凹凸就把 gate-render/src/pbr_texture.rs 的 \
+         `DISPLACE_DEMO_AMPLITUDE`（该材质的资产默认值）改成非 0"
+      );
+      return;
+    }
+    Err(e) => {
+      // 缺素材不该让引擎起不来：右台退化成普通 CSG，日志说清
+      let n = fill_box(grid, bumped, extent, 4);
+      bevy::log::warn!(
+        target: "gate",
+        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 的高度图不可用（{e}）⇒ 右台退化为普通 CSG\
+         （写入 {n} 体素）；放回 assets/textures/pbr/{DEMO_DISPLACE_HEIGHT_MAP}/\
+         {DEMO_DISPLACE_HEIGHT_MAP}_height.png 即恢复"
       );
       return;
     }
   };
   // MT6-1 的语义表在 `height_field::HeightField::displace_fn`：切空间 UV / Repeat 平铺
-  // 双线性采样 / 偏置 0.5（双向，外推 + 内缩）。这里只给"幅度"与"一张图铺多少体素"。
-  let f = hf.displace_fn(DEMO_DISPLACE_AMPLITUDE, DEMO_DISPLACE_TEX_SCALE);
-  let bound = height_field::displace_bound(DEMO_DISPLACE_AMPLITUDE);
+  // 双线性采样 / 偏置 0.5（双向，外推 + 内缩）。幅度来自资产（见上面 `MaterialDisplace::load` 的日志）。
+  let f = sample.displace_fn();
+  let bound = sample.bound();
   let t0 = std::time::Instant::now();
   let st = fill_box_displaced(grid, bumped, extent, 4, Some(Displace { f: &f, bound }));
-  let (lo, hi) = hf.range();
-  let size = hf.size();
+  let (lo, hi) = sample.field().range();
+  let size = sample.field().size();
   bevy::log::info!(
     target: "gate",
-    "MT6 位移样例: 基准台 @{plain} +{extent}（普通 CSG，写入 {base_voxels} 体素）| \
+    "MT6/MT8-5 位移样例: 基准台 @{plain} +{extent}（普通 CSG，写入 {base_voxels} 体素）| \
      位移台 @{bumped} +{extent}（高度图 {DEMO_DISPLACE_HEIGHT_MAP} {w}×{h} texel，取值 {lo:.3}..{hi:.3}；\
-     幅度 {DEMO_DISPLACE_AMPLITUDE} 体素（峰-峰，偏置双向 ±{bound}）、一张铺 {DEMO_DISPLACE_TEX_SCALE} 体素）\
+     幅度 {} 体素（**来自材质资产**，峰-峰，偏置双向 ±{bound}）、一张铺 {DEMO_DISPLACE_TEX_SCALE} 体素）\
      ⇒ 写入 {} 体素（其中整块写 {} 块 = {} 体素，壳层逐体素 {} 格），耗时 {:?}；\
      关掉这个样例：consts::DEMO_DISPLACE_SAMPLE",
+    sample.amplitude(),
     st.voxels,
     st.whole_bricks,
     st.whole_bricks * 64,

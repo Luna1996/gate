@@ -132,6 +132,8 @@ fn main() {
     .add_plugins(gate_ui::GateUiPlugin)
     // 体素编辑设置（形状/大小/材质）；DebugMenu 的「游戏/编辑」是它的视图
     .init_resource::<edit::EditSettings>()
+    // MT8-5：笔触位移按材质 id 缓存的高度场（首次落笔解码 ≈22ms，之后解码耗时 0）
+    .init_resource::<height_field::MaterialDisplaceCache>()
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()

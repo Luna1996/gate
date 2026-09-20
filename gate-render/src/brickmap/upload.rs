@@ -438,6 +438,10 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     crate::pbr_texture::GPU_TEX_SIZE,
   );
 
+  // ---- MT8-3：反射缓存的乒乓双缓冲（BG1 binding 10/11）已随反射缓存一起删除 ----
+  // 那两块 buffer（`REFL_CACHE_SLOTS × 32B` = 合计 8 MiB）与 `refl_consts()` / `ReflEntry`
+  // 都不再存在（用户实测判为负优化）。BG1 的 binding 号现在到 9 为止。
+
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     leaves: make("gate_leaves"),

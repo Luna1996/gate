@@ -1484,6 +1484,8 @@ pub(crate) fn init_dda_pipelines(
   // 6/7/8/9 = MT2-2 / MT2-3 的全局材质资产表 + PBR 贴图数组 + **PBR 专用采样器**
   // （**BG1 被 dda / beam / gi 三个 pass 共用**，这几条只在这一份 layout 里加；
   // `dda.rs` 是 BG1 layout 的唯一出处，`gi` 侧 no-op）。
+  // **binding 号到 9 为止**：MT8-3 曾在 10/11 加一对反射缓存 buffer（`array<ReflEntry>`），
+  // 已随反射缓存整体删除（实测负优化，见 `assets/shaders/voxel_raytrace/main.wesl` 文件头）。
   let bg1 = BindGroupLayoutDescriptor::new(
     "DdaBg1",
     &BindGroupLayoutEntries::sequential(

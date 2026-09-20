@@ -1,21 +1,33 @@
 //! 体素编辑：幽灵模式下左键放置 / 右键擦除，笔触 = 形状（球/立方）× 大小（voxel）× 材质。
 //! 目标选取：光标 → 世界射线（`crate::camera::cursor_ray`）→ 主世界体素 DDA（`raycast_main`）；
 //! 放置落点 = 命中面外侧一格（擦除取命中格自身），写经 `set_voxel` → `mark_data(chunk)` 驱动增量上传。
+//!
+//! **MT8-5 的笔触接线（本文件）**：落笔时按**笔触材质的资产**判断要不要位移 ——
+//! PBR 变体槽 + 该资产 `displacement_amplitude > 0` ⇒ 走 `gate_voxel::fill_*_displaced`
+//! （高度图在 `height_field::MaterialDisplaceCache` 里按材质 id 缓存，解码只付一次），
+//! 否则（平凡变体 / 幅度 0 / 无高度图 / 超尺寸上限）走**原有** `apply_brush`，行为逐位不变。
+//! 位移语义与 MT6 的样例（`scene.rs::build_displace_sample`）**完全同一套**：
+//! 它是"同一张高度图 + 同一套切空间 / Repeat / 双线性 / 偏置 0.5"的采样（`docs/PLAN.md` §3 D2）。
+//! 每笔的 `EDIT[...]` 日志都带"按材质 X 位移，幅度 N 体素 / 未位移（原因）"⇒ 有没有位移有据可查。
+
+use std::time::Instant;
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
 use gate_render::brickmap::wire::pack_palette_entry;
-use gate_render::{DdaCameraConfig, VoxelScene};
+use gate_render::{DdaCameraConfig, PbrTextureSet, VoxelScene};
 use gate_voxel::{
-  BRICK_FACTOR, BrickState, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry, PaletteFlags, PaletteId,
-  PbrOverrides, VolumeGrid, VoxelCoord, override_value,
+  BRICK_FACTOR, BrickState, Displace, FillStats, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry,
+  PaletteFlags, PaletteId, PbrOverrides, VolumeGrid, VoxelCoord, fill_box_displaced,
+  fill_sphere_displaced, override_value,
 };
 
 use crate::{
   camera::{CameraMode, cursor_ray},
-  consts::{DRAG_PX, EDIT_REACH},
+  consts::{DEMO_DISPLACE_TEX_SCALE, DRAG_PX, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH},
+  height_field::{MaterialDisplace, MaterialDisplaceCache},
 };
 
 /// 笔触形状
@@ -58,7 +70,7 @@ pub struct BrushMaterial {
   pub metallic_ov: u8,
   /// PBR 变体：emissive 覆盖（0 = 不覆盖；由「自发光」滑杆驱动）
   pub emissive_ov: u8,
-  /// PBR 变体：transmission 覆盖（0 = 不覆盖；由「透明度」滑杆驱动）
+  /// PBR 变体：transmission 覆盖（0 = 不覆盖；由「不透明度」滑杆驱动）
   pub transmission_ov: u8,
   /// PBR 变体：specular 覆盖（0 = 不覆盖；语义同 glTF `KHR_materials_specular`，只调制电介质 F0）
   pub specular_ov: u8,
@@ -169,7 +181,13 @@ fn ov_text(byte: u8) -> String {
   }
 }
 
-/// 菜单「透明度」滑杆 0..100 → `PaletteEntry.transmission`（100 = 完全不透明，0 = 全透）。
+/// 菜单「不透明度」滑杆 0..100 → `PaletteEntry.transmission`（**100 = 完全不透明**，0 = 全透）。
+///
+/// ⚠️ **这是"不透明度"，不是"透明度"**（滑杆值越大 = 越不透明）。该控件原先的标签写的是「透明度」，
+/// 与映射方向**相反** ⇒ 用户按字面理解把 100 当"全透明"，实际得到的是"完全不透明的镜面"，
+/// 会以为是渲染 bug（2026-09-21 实测踩到）。标签已改为「不透明度」（`zh-CN.toml` 的
+/// `menu.game.edit.alpha`），**映射方向保持不变**（与「光滑度」共用 `inverted_pct_to_override` 的
+/// "值越大 ⇒ 参数越小"方向，改动它会影响 PBR 变体的覆盖编码）。
 pub fn opacity_pct_to_transmission(pct: f32) -> u8 {
   (((100.0 - pct.clamp(0.0, 100.0)) / 100.0) * 255.0).round() as u8
 }
@@ -414,6 +432,177 @@ pub fn apply_brush(
   changed
 }
 
+// ============================================================================
+// MT8-5 · 笔触 → 材质位移（本任务接的最后一环）
+// ============================================================================
+
+/// 一次落笔的结果（`EDIT[...]` 日志要的东西；耗时由调用方测，因为它还含槽位分配等）。
+struct BrushRun {
+  /// 普通路径 = 真正改变的体素数（`apply_brush` 的口径）；
+  /// 位移路径 = 位移后落在实心区内的体素数（`FillStats::voxels` 的口径，见它的文档）
+  voxels: usize,
+  /// 位移路径的整块写 / 壳层逐体素统计（普通路径 = `None`）
+  stats: Option<FillStats>,
+  /// 位移说明（直接进 `EDIT[...]` 日志）：位移了 = 按哪个材质、幅度多少；没位移 = **原因**
+  displace: String,
+}
+
+/// **落笔的唯一入口**：按笔触材质决定走位移填充还是原有填充。
+///
+/// 位移可走（PBR 变体 + 资产幅度 > 0 + 尺寸在限内 + 贴图集就绪）⇒ `fill_*_displaced`；
+/// 否则 ⇒ 原 `apply_brush`（**逐位不变**：平凡笔触、`amplitude = 0` 的材质、擦除、超尺寸全都落在这条路）。
+///
+/// 材质 id 的解析走**槽 → `asset` → id**（`PbrTextureSet` 是"层号 ↔ id"的唯一权威，见 `pbr_texture.rs`）：
+/// 放置槽由 [`material_slot`] 按内容去重产出 ⇒ 它与 `settings.mat.entry()` 的 8B payload 逐字节相同，
+/// 但"读槽"更贴着**真正写下去的东西**（将来别的调用方只拿得到槽也能复用）。
+///
+/// ⚠️ **位移路径与普通路径的一处语义差异（如实记录，本次不改 `gate-voxel`）**：`fill_shape` 对
+/// "落在形状内的格子"是**无条件写入**，而普通笔触只填空气、整块实心处整块跳过（`fill_brush_level`
+/// 的 brick 三态判定）。落点在命中面外侧 ⇒ 球/立方必然压住一层既有体素 ⇒ 位移笔触会把压在里面的
+/// 那些体素改成**本笔触材质**（只是着色变了：实心/空气格局只会更实，**不会挖掉**既有几何）。
+/// 这与"不做'对既有体素表面做位移'"（用户决策 B）不冲突：既有表面的凹凸不会被重算。
+fn run_brush(
+  grid: &mut VolumeGrid,
+  center: IVec3,
+  shape: BrushShape,
+  size: u32,
+  palette: PaletteId,
+  pbr_set: Option<&PbrTextureSet>,
+  cache: Option<&mut MaterialDisplaceCache>,
+) -> BrushRun {
+  let plain = |grid: &mut VolumeGrid, displace: String| BrushRun {
+    voxels: apply_brush(grid, center, shape, size, palette),
+    stats: None,
+    displace,
+  };
+  // 擦除（AIR 槽）不位移：位移只产出"实心体素"，与"挖空"无关（D2：位移发生在 CSG 体素化那一刻）
+  if palette.is_air() {
+    return plain(grid, "未位移（擦除路径）".to_string());
+  }
+  let entry = *grid.palette().get(palette);
+  let (source, reason) = brush_displace_source(entry, size, pbr_set, cache);
+  let Some((md, id)) = source else {
+    return plain(grid, reason);
+  };
+  // 组装 `Displace`（与 `scene.rs::build_displace_sample` 同一写法：闭包借用 `md`，
+  // 必须在**同一作用域**里取闭包再组装 —— `Displace` 里装的是闭包的引用）
+  let f = md.displace_fn();
+  let bound = md.bound();
+  let Some(st) =
+    fill_brush_displaced(grid, center, shape, size, palette, Displace { f: &f, bound })
+  else {
+    // 球 size=1（半径 0）：`fill_sphere_displaced` 要求 radius > 0 ⇒ 退回普通填充（单格无凹凸可言）
+    return plain(grid, "未位移（球 size=1：半径为 0，位移球要求 radius > 0）".to_string());
+  };
+  BrushRun {
+    voxels: st.voxels,
+    stats: Some(st),
+    // 幅度/来源都来自**材质资产**（MT8-5：改资产即改凹凸，`consts` 不再是入口）
+    displace: format!(
+      "已按材质 `{id}` 位移，幅度 {} 体素（峰-峰，偏置双向 ±{bound}，一张高度图铺 {DEMO_DISPLACE_TEX_SCALE} 体素）",
+      md.amplitude()
+    ),
+  }
+}
+
+/// 笔触的**位移源解析**（`docs/PLAN.md` §4b MT8-5 / §3 D2）：返回 `((位移源, 材质 id), 未位移的原因)`，
+/// 两个分支互斥。四个前置条件（缺一即"不位移"，且**原因进日志**，不只说"没位移"）：
+/// 1. **PBR 变体**（`IS_PBR`）：只有这种槽里才有 `asset: u16`（D1 的 8B 变体复用）；
+///    平凡变体没有资产 ⇒ 没有高度图 ⇒ 不可能位移；
+/// 2. **尺寸 ≤ [`EDIT_DISPLACE_SIZE_MAX`]**：位移壳层是逐体素的，代价 ≈ O(size²)（见该常量的实测说明）；
+/// 3. **贴图集就绪**：槽号 → id 必须过 `PbrTextureSet::ids()`（它按 id 字典序定层号、缺素材会顺延）；
+/// 4. **资产幅度 > 0 且高度图可用**：由 [`MaterialDisplaceCache`] 按 id 解析（首次 ≈22ms，之后解码耗时 0）。
+fn brush_displace_source<'a>(
+  entry: PaletteEntry,
+  size: u32,
+  pbr_set: Option<&'a PbrTextureSet>,
+  cache: Option<&'a mut MaterialDisplaceCache>,
+) -> (Option<(&'a MaterialDisplace, &'a str)>, String) {
+  if !entry.flags.contains(PaletteFlags::IS_PBR) {
+    return (None, "未位移（平凡变体：槽里没有资产 ⇒ 没有高度图）".to_string());
+  }
+  if size > EDIT_DISPLACE_SIZE_MAX {
+    bevy::log::warn!(
+      "笔触位移跳过：size={size} 超过上限 {EDIT_DISPLACE_SIZE_MAX} vx（位移壳层逐体素、代价 ≈ O(size²)，\
+       大笔触同步落笔会卡界面）⇒ 本笔触按**普通填充**落下（无凹凸）；要凹凸请把 size 调到 ≤ \
+       {EDIT_DISPLACE_SIZE_MAX}（上限见 consts::EDIT_DISPLACE_SIZE_MAX）"
+    );
+    return (None, format!("未位移（size {size} > 上限 {EDIT_DISPLACE_SIZE_MAX}）"));
+  }
+  let Some(set) = pbr_set else {
+    // 贴图集是异步就绪的资源（`finish_pbr_textures` 插入）：启动后头几帧落笔会落在这里
+    return (None, format!("未位移（PBR 贴图集未就绪：读不到资产槽 {} → id）", entry.pbr_asset()));
+  };
+  let Some(id) = entry_asset_id(&entry, set) else {
+    return (None, format!("未位移（资产槽 {} 不在贴图集里）", entry.pbr_asset()));
+  };
+  let Some(cache) = cache else {
+    return (None, "未位移（位移缓存资源缺失）".to_string());
+  };
+  match cache.get_or_load(id, DEMO_DISPLACE_TEX_SCALE) {
+    Some(md) => (Some((md, id)), String::new()),
+    // 幅度 = 0（资产值）/ id 不在材质目录集 / 高度图缺文件 —— 三种都由缓存那行日志说清了原因
+    None => {
+      (None, format!("未位移（材质 `{id}` 的资产幅度 = 0 或高度图不可用，见上面的缓存日志）"))
+    }
+  }
+}
+
+/// 槽里的 `asset: u16` → 材质 id（`assets/textures/pbr/<id>/` 的目录名）。
+/// **非 PBR 变体不查**（那两个字节在平凡变体里是 emissive / transmission，不是资产槽）。
+fn entry_asset_id<'a>(entry: &PaletteEntry, set: &'a PbrTextureSet) -> Option<&'a str> {
+  (entry.flags.contains(PaletteFlags::IS_PBR))
+    .then(|| set.ids().get(entry.pbr_asset() as usize).map(String::as_str))
+    .flatten()
+}
+
+/// 位移笔触的填充：把笔触形状映射到 `gate-voxel` 的位移填充器（MT6-3 的现成 API，本次一字不改）。
+///
+/// | 笔触形状 | 位移填充器 | 写入集合是否与普通笔触一致 |
+/// |---|---|---|
+/// | `Cube` | [`fill_box_displaced`]（`min = center − r`、`extent = (2r+1)³`） | **逐格一致**（球盒判据同为 `L∞`/`\|d\| ≤ r`）|
+/// | `Sphere` | [`fill_sphere_displaced`]（`radius = r = size − 1`） | 略小：位移球判据是**欧氏距离 ≤ r**，而球笔触是 `d² ≤ r² + r` |
+///
+/// 球那一行是**有意**的差异（本次不改 `gate-voxel`）：`d² ≤ r² + r` 是为了让 `r = 1` 正好等于
+/// "3³ 去 8 角"，而在欧氏距离上多出半个格子的半径（`√(r²+r) − r`，r=15 时 ≈0.49 格）无法用
+/// "整数半径"表达 ⇒ 位移球比普通球的外壳小不到一格（外表面整体内缩 <1 格）。
+/// 半径 0（`size = 1`）无位移可言 ⇒ 返回 `None`（调用方退回普通填充）。
+fn fill_brush_displaced(
+  grid: &mut VolumeGrid,
+  center: IVec3,
+  shape: BrushShape,
+  size: u32,
+  palette: PaletteId,
+  disp: Displace<'_>,
+) -> Option<FillStats> {
+  // 与 `apply_brush` 同口径：size 无上限（菜单可输入任意值），只做"不溢出 i32"的类型收敛
+  let r = size.saturating_sub(1).min(i32::MAX as u32) as i32;
+  match shape {
+    BrushShape::Cube => {
+      let extent = IVec3::splat(r.saturating_mul(2).saturating_add(1));
+      Some(fill_box_displaced(grid, center - IVec3::splat(r), extent, palette, Some(disp)))
+    }
+    BrushShape::Sphere => {
+      (r > 0).then(|| fill_sphere_displaced(grid, center, r, palette, Some(disp)))
+    }
+  }
+}
+
+/// `FillStats` → 日志尾巴（位移路径专用；普通路径没有这些数字）。
+/// `whole_bricks` 是"走 `fill_brick` 整块写"的块数，位移填充器（`fill_box_displaced` /
+/// `fill_sphere_displaced`）的块粒度恒为 4 ⇒ 一块 = 64 体素。
+fn stats_suffix(stats: Option<&FillStats>) -> String {
+  match stats {
+    Some(st) => format!(
+      "（整块写 {} 块 = {} 体素 + 壳层逐体素 {} 格）",
+      st.whole_bricks,
+      st.whole_bricks * 64,
+      st.shell_voxels
+    ),
+    None => String::new(),
+  }
+}
+
 /// 体素编辑输入（仅幽灵模式；轨道模式左键仍是 recenter）：左键 = 放置，右键 = 擦除；
 /// 按下到释放累计位移 > `DRAG_PX` 视为「拖拽转头」，不编辑。
 #[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
@@ -426,6 +615,9 @@ pub(crate) fn voxel_edit_input(
   cfg: Res<DdaCameraConfig>,
   mode: Res<CameraMode>,
   settings: Res<EditSettings>,
+  // MT8-5：位移源（槽 → 资产 id）要过贴图集 + 按 id 缓存的高度场（首次解码 ≈22ms，之后 0）
+  pbr_set: Option<Res<PbrTextureSet>>,
+  mut displace_cache: ResMut<MaterialDisplaceCache>,
   scene: Option<ResMut<VoxelScene>>,
   mut right_drag_px: Local<f32>,
 ) {
@@ -461,12 +653,17 @@ pub(crate) fn voxel_edit_input(
     let slot = material_slot(grid, settings.mat);
     (hit + face, slot)
   };
-  let changed = apply_brush(grid, center, shape, size, pal);
-  if changed > 0 {
+  // MT8-5：落笔走位移还是普通填充由**笔触材质的资产**决定（`run_brush` 里解析）；
+  // 计时含"槽位分配 + 位移填充/普通填充"全程 ⇒ 日志里的耗时就是这一笔的实付代价
+  let t0 = Instant::now();
+  let run =
+    run_brush(grid, center, shape, size, pal, pbr_set.as_deref(), Some(&mut displace_cache));
+  let elapsed = t0.elapsed();
+  if run.voxels > 0 {
     bevy::log::info!(
-      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} slot={} material={}",
+      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} slot={} material={} | displacement: {}{} | 耗时 {:?}",
       if erase { "erase" } else { "place" },
-      changed,
+      run.voxels,
       center.x,
       center.y,
       center.z,
@@ -474,22 +671,30 @@ pub(crate) fn voxel_edit_input(
       size,
       pal,
       if erase { "-".to_string() } else { settings.mat.summary() },
+      run.displace,
+      stats_suffix(run.stats.as_ref()),
+      elapsed,
     );
   }
 }
 
-/// 第 60 帧朝初始注视点刷一次笔触，走通编辑 → 增量上传链路；由 `consts::EDIT_SELFTEST` 决定是否注册。
-/// 只在设了该变量时注册（见 main.rs）。
+/// 第 60 / 70 帧各朝初始注视点刷一次笔触（**同参数连落两笔**：第 1 笔付高度图解码、第 2 笔
+/// 命中 `MaterialDisplaceCache` ⇒ 日志里能看到"解码耗时 0"与命中计数），走通编辑 → 增量上传链路；
+/// 由 `consts::EDIT_SELFTEST` 决定是否注册。只在设了该变量时注册（见 main.rs）。
 pub(crate) fn edit_selftest(
   scene: Option<ResMut<VoxelScene>>,
   orbit: Res<gate_render::OrbitCamera>,
   settings: Res<EditSettings>,
+  pbr_set: Option<Res<PbrTextureSet>>,
+  mut displace_cache: ResMut<MaterialDisplaceCache>,
   mut frame: Local<u32>,
 ) {
   *frame += 1;
-  if *frame != 60 {
-    return;
-  }
+  let nth = match *frame {
+    60 => 1,
+    70 => 2,
+    _ => return,
+  };
   let Some(mut scene) = scene else { return };
   let dir = (orbit.target - orbit.eye()).normalize_or_zero();
   if dir.length_squared() < 1e-12 {
@@ -504,23 +709,48 @@ pub(crate) fn edit_selftest(
   };
   let slot = material_slot(grid, settings.mat);
   let center = hit + face;
-  let n = apply_brush(grid, center, shape, size, slot);
+  let t0 = Instant::now();
+  let run =
+    run_brush(grid, center, shape, size, slot, pbr_set.as_deref(), Some(&mut displace_cache));
+  let elapsed = t0.elapsed();
   bevy::log::info!(
-    "EDIT SELFTEST: hit=({},{},{}) t={t:.1} → placed {n} voxel(s) @ ({},{},{}) shape={:?} size={size} slot={slot} material={}",
+    "EDIT SELFTEST（第 {nth} 笔）: hit=({},{},{}) t={t:.1} → {} voxel(s) @ ({},{},{}) shape={:?} size={size} slot={slot} material={} | displacement: {}{} | 耗时 {:?}",
     hit.x,
     hit.y,
     hit.z,
+    run.voxels,
     center.x,
     center.y,
     center.z,
     shape,
     settings.mat.summary(),
+    run.displace,
+    stats_suffix(run.stats.as_ref()),
+    elapsed,
   );
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// 逐格导出 `[lo, hi)` 的"实心/空气"位串（比对两次填充的写入集合用，与 `gate-voxel` 的单测同一手法）
+  fn dump(grid: &VolumeGrid, lo: IVec3, hi: IVec3) -> Vec<bool> {
+    let mut out = Vec::new();
+    for z in lo.z..hi.z {
+      for y in lo.y..hi.y {
+        for x in lo.x..hi.x {
+          out.push(
+            !grid
+              .get_voxel(VoxelCoord::from_ivec3(IVec3::new(x, y, z)))
+              .unwrap_or(PaletteId::AIR)
+              .is_air(),
+          );
+        }
+      }
+    }
+    out
+  }
 
   /// 平凡变体的落盘路径与改动前完全一致（`flags` 全 0 + 两个字的期望值）。
   #[test]
@@ -535,6 +765,107 @@ mod tests {
     assert_eq!(plain.entry().flags.0, 0, "平凡变体不设任何 flags");
     // word0 = 0x0A | 0x14<<8 | 0x1E<<16 | 0xC8<<24；word1 = 0x07 | 0x09<<8 | TRANSMISSIVE<<16
     assert_eq!(pack_palette_entry(&plain.entry()), [0xC81E140A, 0x00200907]);
+  }
+
+  /// 零回归护栏（本任务 ①）：**没位移就必有一条原因**，且四种"不位移"能各自区分 ——
+  /// 平凡变体（槽里没有资产）/ 超尺寸上限 / 贴图集未就绪 / 资产槽越界。
+  /// 前三种不需要 `PbrTextureSet`（判定顺序在它之前）⇒ 单测可覆盖。
+  #[test]
+  fn no_displace_always_reports_a_reason() {
+    let plain = BrushMaterial::default().entry();
+    let (src, why) = brush_displace_source(plain, 4, None, None);
+    assert!(src.is_none());
+    assert!(why.contains("平凡变体"), "{why}");
+
+    let pbr = BrushMaterial { pbr: true, asset_slot: 7, ..Default::default() }.entry();
+    assert!(pbr.flags.contains(PaletteFlags::IS_PBR));
+
+    let (src, why) = brush_displace_source(pbr, EDIT_DISPLACE_SIZE_MAX, None, None);
+    assert!(src.is_none());
+    assert!(why.contains("贴图集未就绪"), "{why}");
+
+    let (src, why) = brush_displace_source(pbr, EDIT_DISPLACE_SIZE_MAX + 1, None, None);
+    assert!(src.is_none());
+    assert!(why.contains("上限"), "{why}");
+  }
+
+  /// 位移笔触的形状映射（本任务 ① 的"逐格可复算"）：**Cube 笔触就是
+  /// `fill_box_displaced(center − r, (2r+1)³)`** —— 位移关闭（恒 0 偏移、bound 0）时与
+  /// `apply_brush` 的 Cube **逐格相同**。含 size=1（r=0，单格）与负坐标。
+  #[test]
+  fn displaced_cube_matches_plain_brush() {
+    let zero = |_p: Vec3, _n: Vec3| 0.0f32;
+    for (size, center) in
+      [(1u32, IVec3::new(0, 0, 0)), (5, IVec3::new(7, -3, 11)), (16, IVec3::new(-9, 40, 3))]
+    {
+      let r = size as i32 - 1;
+      let mut plain = VolumeGrid::new();
+      apply_brush(&mut plain, center, BrushShape::Cube, size, PaletteId(3));
+      let mut displaced = VolumeGrid::new();
+      let st = fill_brush_displaced(
+        &mut displaced,
+        center,
+        BrushShape::Cube,
+        size,
+        PaletteId(3),
+        Displace { f: &zero, bound: 0.0 },
+      )
+      .expect("Cube 恒有位移实现");
+      let span = (2 * r + 1) as usize;
+      assert_eq!(st.voxels, span * span * span, "位移关闭时整盒都被写入");
+      let lo = center - IVec3::splat(r + 2);
+      let hi = center + IVec3::splat(r + 3);
+      assert_eq!(dump(&plain, lo, hi), dump(&displaced, lo, hi), "size={size} center={center}");
+    }
+  }
+
+  /// **交互性能量化**（`#[ignore]`：size 512 单笔数百毫秒，不进常规门禁）：
+  /// 位移笔触 vs 同尺寸普通笔触的"一笔"耗时 —— 这是 `consts::EDIT_DISPLACE_SIZE_MAX` 的取值依据
+  /// （数字写在那个常量的文档里）。跑法：
+  /// `cargo test --release -p gate-app -- --ignored --nocapture displace_brush_cost_by_size`
+  #[test]
+  #[ignore = "性能量化：size 512 单笔数百毫秒，常规门禁不跑"]
+  fn displace_brush_cost_by_size() {
+    let mut cache = MaterialDisplaceCache::default();
+    let id = crate::consts::DEMO_DISPLACE_HEIGHT_MAP;
+    let Some(md) = cache.get_or_load(id, DEMO_DISPLACE_TEX_SCALE) else {
+      panic!("`{id}` 的高度图不可用（本量化需要该素材）");
+    };
+    let f = md.displace_fn();
+    let bound = md.bound();
+    println!(
+      "位移源: 材质 `{id}` 幅度 {} 体素（bound {bound}）—— 空网格上**一笔**的耗时：",
+      md.amplitude()
+    );
+    for size in [16u32, 32, 64, 128, 512] {
+      for shape in [BrushShape::Cube, BrushShape::Sphere] {
+        let center = IVec3::new(4096, 4096, 4096);
+        let mut g = VolumeGrid::new();
+        let t0 = Instant::now();
+        let n = apply_brush(&mut g, center, shape, size, PaletteId(4));
+        let plain = t0.elapsed();
+        let mut g2 = VolumeGrid::new();
+        let t0 = Instant::now();
+        let st = fill_brush_displaced(
+          &mut g2,
+          center,
+          shape,
+          size,
+          PaletteId(4),
+          Displace { f: &f, bound },
+        )
+        .expect("Cube/Sphere(size>1) 恒有位移实现");
+        let displaced = t0.elapsed();
+        println!(
+          "size={size:>3} {shape:?}: 不位移 {plain:?}（{n} 体素）| 位移 {displaced:?}\
+           （{} 体素 = 整块 {} 块 + 壳层 {} 格）= {:.0}×",
+          st.voxels,
+          st.whole_bricks,
+          st.shell_voxels,
+          displaced.as_secs_f64() / plain.as_secs_f64().max(1e-9),
+        );
+      }
+    }
   }
 
   /// MT7-1：PBR 变体的 `entry()` 走 `PaletteEntry::pbr`（构造）+ 变体分派打包，

@@ -231,7 +231,7 @@ pub fn slider_to_override(value: f32, min: f32, max: f32) -> u8 {
   override_byte((value - min) / span)
 }
 
-/// 「滑杆值越大 ⇒ 参数越小」的控件（光滑度 = 100 − roughness、透明度 = 100 − transmission）
+/// 「滑杆值越大 ⇒ 参数越小」的控件（光滑度 = 100 − roughness、不透明度 = 100 − transmission）
 /// → 覆盖字节：参数值 = `(100 − pct) / 100`。最低档（`pct <= 0`）同上 = **不覆盖**。
 ///
 /// 单测 `inverted_slider_keeps_direction_and_reaches_zero` 钉住这一档落差：

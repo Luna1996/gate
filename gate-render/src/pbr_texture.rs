@@ -9,20 +9,22 @@
 //! 微观 AO 在体素粒度无意义，凹槽遮蔽由真实几何 + GI 提供）⇒ 直接丢弃，把它省下的宽度用来
 //! 把 4 个有效通道挤进 1.25 张纹理：
 //!
-//! | 数组 | 格式 | 通道语义 | 单层 @1k |
+//! | 数组 | 格式 | 通道语义 | 单层 @128 |
 //! |---|---|---|---|
-//! | `albedo_rough` | `Rgba8Unorm` | rgb = albedo（**保持 sRGB 编码的原始字节**）、a = roughness（arm 的 G） | 4 MiB |
-//! | `metal` | `R8Unorm` | r = metalness（arm 的 B） | 1 MiB |
+//! | `albedo_rough` | `Rgba8Unorm` | rgb = albedo（**保持 sRGB 编码的原始字节**）、a = roughness（arm 的 G） | 64 KiB |
+//! | `metal` | `R8Unorm` | r = metalness（arm 的 B） | 16 KiB |
 //!
-//! ⇒ **5 MiB/材质 @1k**（MT2-1 的 `Rgba8UnormSrgb` + `Rgba8Unorm` 两张 4B/texel 数组是 8 MiB/材质），
-//! 并随 [`GPU_TEX_SIZE`] 平方缩放。
+//! ⇒ **80 KiB/材质 @128**（MT2-1 的 `Rgba8UnormSrgb` + `Rgba8Unorm` 两张 4B/texel 数组是 128 KiB/材质），
+//! 并随 [`GPU_TEX_SIZE`] 平方缩放；含 mip 链 ≈ 1.333× ⇒ **≈ 0.104 MiB/材质**（16 材质 ≈ 1.7 MiB）。
 //!
 //! **本文件负责"加载 + 打包 + mip 链 + 采样器 + 资产表内容"**：`texture_2d_array` 的占位资源与
 //! 上传时机在 brickmap 侧 —— `upload.rs::init_empty_gpu` 建占位 buffer/纹理与采样器、`prepare`
 //! 全量写一次资产表、`dda.rs` 把四者绑到 BG1 的 binding 6/7/8/9（MT2-2 / MT2-3）。
-//! **mip 链与采样策略（MT2-3）就在本模块**：CPU 侧盒式平均生成完整链（base → 1×1），
+//! **mip 链与采样策略（MT2-3）就在本模块**：CPU 侧盒式平均生成完整链（base → 1×1，128 ⇒ 8 层），
 //! 采样器见 [`create_pbr_sampler`]；`Image::data` 承载的是**全链数据**（见 `build_texture_arrays` 的说明）。
-//! **不做 BC7/BC4 压缩**：需要离线 KTX2 工具链或新的编码器依赖，留到真正接近 30 个材质时再议（见 [`GPU_TEX_SIZE`] 的说明）。
+//! **不做 BC7/BC4 压缩**：MT8-4 把 [`GPU_TEX_SIZE`] 定成 128（= 体素格密度）后**预算问题消失** ——
+//! 30 材质 ≈ 3 MiB，压缩（4:1）省下的 2 MiB 不值得引入离线 KTX2 工具链或新编码器依赖
+//! ⇒ MT2-1c 留的那条 BC7 分支**取消**（见该常量的说明）。
 //!
 //! **height.png 完全不加载**：它只在 CPU 侧供 MT6 的 CSG 位移采样一次，位移产物就是普通体素 ⇒
 //! 不进 GPU、不进本模块（见 PLAN D2 与硬约束 8）。
@@ -57,6 +59,11 @@ const ALBEDO_SUFFIX: &str = "_albedo.jpg";
 /// 粗糙度 + 金属度贴图后缀（Poly Haven `arm`，glTF ORM 布局：R=AO / G=Roughness / B=Metalness）。
 /// 打包时 **G → `albedo_rough` 的 a**、**B → `metal` 的 r**，R（AO）丢弃（见 PLAN D1 属性清单）。
 const ROUGHMETAL_SUFFIX: &str = "_roughmetal.jpg";
+/// 高度图后缀（MT8-6 起这里**只用它来判断"这个材质有没有高度图"**，以定默认位移幅度）。
+/// 高度图本身仍**不进 GPU、不进本模块的数组图**（见模块头与硬约束 8）：它只在 `gate-app` 侧被
+/// CSG 位移采样一次。这里查它是为了兑现"**没有高度图的材质不给非 0 位移幅度**"—— 否则 `gate-app`
+/// 会去解一张不存在的图、白刷一条 `warn!`（见 [`has_height_map`]）。
+const HEIGHT_SUFFIX: &str = "_height.png";
 /// 槽号 ↔ 目录名日志每行条数（16 条一行太长，按行切）
 const SLOT_LOG_PER_LINE: usize = 8;
 
@@ -65,36 +72,49 @@ const SLOT_LOG_PER_LINE: usize = 8;
 const PBR_DEBUG_ASSET_CONST: &str = "PBR_DEBUG_ASSET";
 /// `PBR_DEBUG_ASSET` 的"关闭"哨兵值（`u32::MAX`）——与 WESL 里那个字面量必须一致。
 const PBR_DEBUG_ASSET_OFF: u32 = u32::MAX;
+/// MT8-1 的"甲/乙"美学开关名（权威定义在 `common.wesl`：`MATERIAL_FLAT_SHADING`）——
+/// 与上面同一个手法：Rust 只按名字去 WESL 源码读，不复刻它的值（见 [`log_flat_shading_switch`]）。
+const MATERIAL_FLAT_SHADING_CONST: &str = "MATERIAL_FLAT_SHADING";
 
-/// GPU 侧数组图**单层边长**（texel）——本模块唯一的显存预算旋钮，默认 **1024**。
+/// GPU 侧数组图**单层边长**（texel）——本模块唯一的显存预算旋钮，默认 **128**（MT8-4 定档）。
 ///
-/// **为什么默认 1024**：源图就是 Poly Haven 的最低档 1k，尺寸相同 ⇒ 直接拷贝、零重采样损失；
-/// 16 材质下打包后 ≈ 80MiB（4B + 1B per texel ×16），是 MT2-1 的 128MiB 的 5/8。
+/// **为什么是 128（而不是原来的 1024）**：显存/带宽该由**真实采样密度**决定，而 MT8-1 之后
+/// 一个体素面只取 **1 个**采样点（`MATERIAL_FLAT_SHADING = 1`，见 `common.wesl::material_sample_pos`）：
+///   · 一张贴图铺 `MATERIAL_TEX_WORLD_SCALE = 2m`，而 `MATERIAL_VOXEL_PER_METER = 50` ⇒ **100 体素/张**；
+///   · 128 / 100 = **1.28 texel/体素 ≥ 1** ⇒ 贴图分辨率与体素格**同量级**（再高的 texel 密度只是
+///     "每体素面只取 1 次"时被丢掉的过采样）。1024 是 **8× 过采样**（每轴），纯浪费。
+///   · 与 MT6 的高度图路径**恰好对齐**：`height_field::HEIGHT_DOWNSAMPLE = 8` 把 1k 高度图降到
+///     **128 texel** 供位移采样（`gate-app/src/consts.rs`）⇒ 本次之后 albedo 贴图与高度场是
+///     **同一张 texel 网格**（1:1），"凹凸与图案同相"这件事有了同一个分辨率基础。
 ///
-/// **什么时候该调成 512**：显存按边长平方缩放 ⇒ 512 再降 4×（16 材质 ≈ 20MiB）。代价是贴图变软。
-/// 依据 `docs/PLAN.md §7 决策记录`（2026-09-20「贴图分辨率档」）的 texel 密度核算：
-/// 2cm 体素、1080p、1~2m 视距时**每个体素面约 5~11 屏幕像素**，而 512 铺 1m ≈ 每体素面 10 texel
-/// ⇒ 密度仍然匹配、有余量。
+/// **1k 素材不动、也不冲突（R13）**：磁盘上仍是 Poly Haven 的 1k（`assets/textures/pbr/<id>/`），
+/// 加载时盒式降采样 `1024 → 128`（整除 8，`box_factor` 直接可用）后才上传 GPU
+/// ⇒ **1k 是磁盘档位、128 是显存档位**；将来要换更高档素材（2k/4k：整除 8 不成立）需回头改
+/// `box_factor` 的策略（例如改成 2048 → 128 的 16× 盒，同样整除）。
+///
+/// **30 个材质时的账（MT8-4 的正面收益）**：128 下 **≈ 0.104 MiB/材质**（含完整 mip 链）
+/// ⇒ 16 材质 ≈ **1.7 MiB**、**30 材质 ≈ 3 MiB** ⇒ 远在 PLAN §MT2-1b 的 100MB 预算线之下
+/// ⇒ **MT2-1c 当初留的"512 或 BC7 二选一"不再需要**：512 没必要（128 已够密度）、
+/// **BC7/BC4 压缩取消**（省下的 ~2 MiB 不值得引入离线 KTX2 工具链或新编码器依赖，
+/// 而且压缩会让"一个体素面一个平色"多一次解码误差 —— 降分辨率是更干净的那条路）。
 ///
 /// **与 MT3 的世界尺度耦合**：一张贴图铺多大世界范围是 **MT3 的常量**（triplanar 走世界坐标，
-/// 与体素尺寸解耦），两个常量一起决定 texel 密度 ⇒ **改一个必须回头看另一个**（这里调小 = 密度变低，
-/// 要靠 MT3 把铺贴范围也调小来补）。
+/// 与体素尺寸解耦），两个常量一起决定 texel 密度 ⇒ **改一个必须回头看另一个**（这里调小 =
+/// 密度变低，要靠 MT3 把铺贴范围也调小来补）。
 ///
 /// **只支持"相同或整数倍缩小"**：实现只做 `src % dst == 0` 的**盒式（box）降采样**（纯 CPU、无新依赖）。
-/// 放大或非整数比（如 1000 → 512）会 `warn!` 后跳过该材质——不 panic，也不做会改变色彩/能量分布的重采样。
-///
-/// **30 个材质时的账**：1024 下 ≈ 150MiB，仍超 PLAN §MT2-1b 的 100MB 预算线 ⇒ 那时才需要 A/B 两条路：
-/// ① `GPU_TEX_SIZE` 调 512（≈ 37.5MiB，回到预算内）或 ② **BC7 / BC4 压缩**（4:1 ⇒ 约 1.25MiB/材质，
-/// 30 材质 ≈ 38MiB）。压缩需要离线 KTX2 工具链或新的编码器依赖，**本次明确不做**（见模块头注释）。
-pub const GPU_TEX_SIZE: u32 = 1024;
+/// 放大或非整数比（如 1000 → 128）会 `warn!` 后跳过该材质——不 panic，也不做会改变色彩/能量分布的重采样。
+pub const GPU_TEX_SIZE: u32 = 128;
 
 // ============================================================================
 // MT2-3 · 采样器与 mip 策略
 // ============================================================================
 
-/// mip 链的**最大层数**（含 base 层）：`ilog2(1024) + 1 = 11`（1024 → 512 → … → 1）。
+/// mip 链的**最大层数**（含 base 层）：`ilog2(128) + 1 = 8`（128 → 64 → … → 1）。
 /// 实际链长由 [`build_mip_chain`] 从实际尺寸算出（`GPU_TEX_SIZE` 改成非 2 的幂时链会更短），
-/// 本常量只用来给采样器的 `lod_max_clamp` 定上界 —— 写大了无害（采样器只会钳到链底那一层）。
+/// 本常量只用来给采样器的 `lod_max_clamp` 定上界 —— **它随 `GPU_TEX_SIZE` 自动派生**
+/// ⇒ MT8-4 把尺寸改成 128 后，钳位值同步从 10.0 变成 **7.0**，仍然**恰好覆盖到链底**
+/// （mip 层下标 0..7，链底 = 7；写大了也无害，采样器只会钳到链底那一层）。
 pub const PBR_MIP_LEVELS_MAX: u32 = GPU_TEX_SIZE.ilog2() + 1;
 
 /// 采样器的各向异性上限（MT2-3 的"anisotropy 上限"，PLAN §5 R4）。
@@ -116,7 +136,7 @@ pub const PBR_ANISOTROPY_CLAMP: u16 = 8;
 /// | mag / min filter | `Linear` | 近处不块状 |
 /// | mipmap filter | `Linear` | 层间线性插值，避免 mip 边界出现硬跳 |
 /// | `lod_min_clamp` | `0.0` | 允许采 base 层 |
-/// | `lod_max_clamp` | [`PBR_MIP_LEVELS_MAX`] − 1 | **覆盖到 mip 链底**（1024 → 10.0），远处不会停在中间层 |
+/// | `lod_max_clamp` | [`PBR_MIP_LEVELS_MAX`] − 1 | **覆盖到 mip 链底**（128 → 7.0，MT8-4 后自动派生），远处不会停在中间层 |
 /// | `anisotropy_clamp` | [`PBR_ANISOTROPY_CLAMP`] | 斜面（尤其地面）上的摩尔纹主要来自各向异性足迹 |
 ///
 /// **为什么不复用 `light_samp`**（`upload.rs::init_empty_gpu` 给光照场的那个）：光照场是
@@ -159,7 +179,7 @@ pub fn create_pbr_sampler(device: &RenderDevice) -> Sampler {
 /// `upload.rs::prepare` 构建资产表、`dda.rs` 取 `GpuImage` 的视图绑 BG1 binding 7/8。
 /// 句柄只是 Arc 计数 ⇒ 拷贝很便宜（`ids` 也才几十条）。
 ///
-/// **mip（MT2-3）**：两张数组图各自带**完整 mip 链**（[`Self::mip_levels`]，1024 时 11 层），
+/// **mip（MT2-3）**：两张数组图各自带**完整 mip 链**（[`Self::mip_levels`]，128 时 8 层），
 /// 采样走 `@group(1) @binding(9) pbr_samp`（[`create_pbr_sampler`]）。
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
@@ -209,7 +229,7 @@ impl PbrTextureSet {
     self.layers
   }
 
-  /// mip 链层数（含 base 层；1024 见方 ⇒ 11 层 = 1024…1）。
+  /// mip 链层数（含 base 层；128 见方 ⇒ 8 层 = 128…1）。
   pub fn mip_levels(&self) -> u32 {
     self.mip_levels
   }
@@ -231,6 +251,86 @@ impl PbrTextureSet {
 /// **这不是隐蔽的魔法**：日志会打印它落在哪个槽号；真正的材质编写（资产 → 槽位映射、逐材质参数）
 /// 属 **MT7**，届时这条默认值应当被真实的材质表取代。
 pub const METAL_DEMO_ID: &str = "metal_plate";
+
+/// **临时 demo 默认值**（MT8-5，与 [`METAL_DEMO_ID`] 同一手法、同一措辞）：唯一"**自带高度图 ⇒ CSG
+/// 表面自动出凹凸**"的材质目录 id —— 就是 MT6 位移样例用的那张高度图
+/// （磁盘侧 `assets/textures/pbr/<id>/<id>_height.png`）。
+/// **这不是隐蔽的魔法**：启动日志会打印"这次的幅度是从材质资产读到的（值 = N）"，
+/// 让人能一眼确认"改资产就改凹凸"；真正的材质编写（资产 → 幅度映射、逐材质参数）属 **MT7**，
+/// 届时这条默认值应当被真实的材质表取代。背景见 `docs/PLAN.md` §4b MT8-5（决策 B = 甲）。
+pub const DISPLACE_DEMO_ID: &str = "stone_wall_04";
+
+/// **临时 demo 默认值**：[`DISPLACE_DEMO_ID`] 的位移幅度（**体素**，峰-峰；`0` = 不位移）。
+/// `8` = MT6 实测的那一档（偏置 0.5 ⇒ 上下各 ±4）。
+/// 上界约束：`bound = 幅度/2` 应 ≤ 块粒度（`fill_box` 的 4），否则逐体素壳层变厚、
+/// 体素数 / 树规模上涨（`docs/PLAN.md` §5 R7、§8 MT6-6 的幅度上限建议）。
+/// ⚠️ **别改它**：`gate-app::consts::DEMO_DISPLACE_HEIGHT_MAP` 与 MT6 / MT8-5 既有的一批对照记录
+/// 都钉着 8（改了会破坏对照）。其余材质的幅度见 [`DISPLACE_TEX_DEMO_AMPLITUDE`]。
+pub const DISPLACE_DEMO_AMPLITUDE: u8 = 8;
+
+/// **临时 demo 默认值（MT8-6）**：除 [`DISPLACE_DEMO_ID`] 之外、**其余所有磁盘上有 `_height.png`
+/// 的材质**的位移幅度（**体素**，峰-峰；`0` = 不位移）。`4` = 峰-峰 4 体素（偏置 0.5 ⇒ 上下各 ±2）。
+/// 与 [`DISPLACE_DEMO_AMPLITUDE`] 同一手法、同一措辞：**临时 demo 默认值**，真正的材质编写
+/// （逐材质的幅度）属 **MT7 的「资产表编辑」**，届时这条默认值应当被真实的材质表取代。
+///
+/// **为什么需要它（用户实测）**：反馈是"使用正方体、球体放置时，表面仍然没有材质凹凸"。
+/// 笔触接线（MT8-5）本身是通的，卡点是**默认幅度只给了 `stone_wall_04` 一个材质**
+/// ⇒ 用户随手选别的 PBR 资产（例如 `marble_cliff_03`）时幅度是 0，怎么写都没有凹凸。
+/// `4`（±2）< 块粒度 4 ⇒ 只有表面一层 4³ 块退化为逐体素，体素数 / 树规模的代价最小；
+/// 取它是"**随手选哪个带高度图的材质都能看出凹凸**"的一档（观感上仍是石头，不是毛刺）。
+pub const DISPLACE_TEX_DEMO_AMPLITUDE: u8 = 4;
+
+/// 位移幅度的**默认值规则**（MT8-5 的唯一来源；MT8-6 起 = "**有高度图就给非 0**"）：
+/// 按材质 id 给出要写进 [`MaterialAsset::with_displacement_amplitude`] 的值。
+/// 资产表（[`build_material_asset_table`]）与跨 crate 只读接口（[`displacement_amplitude_of`]）
+/// **都调这一个函数** ⇒ "资产里存的值"与"`gate-app` 读到的值"不可能分叉。
+///
+/// - **没有高度图 ⇒ 恒 0**（哪怕 id 就是 [`DISPLACE_DEMO_ID`]）：幅度非 0 而高度图缺失时，
+///   `gate-app` 侧会去解一张不存在的图 ⇒ `warn!` + 退回普通填充（不 panic，但每个这样的材质都
+///   白刷一条告警）；"有没有高度图"是**磁盘事实**（`assets/textures/pbr/<id>/<id>_height.png`），
+///   所以这里先查一次盘（[`has_height_map`]：纯 `is_file()`，两个调用点各查一次，代价可忽略）；
+/// - **有高度图**：[`DISPLACE_DEMO_ID`] = [`DISPLACE_DEMO_AMPLITUDE`]（8，样例值**不动**）、
+///   其余一律 [`DISPLACE_TEX_DEMO_AMPLITUDE`]（4）⇒ 用户随手选任何带高度图的材质都能出凹凸。
+fn default_displacement_amplitude(id: &str) -> u8 {
+  if !has_height_map(id) {
+    return 0;
+  }
+  if id == DISPLACE_DEMO_ID { DISPLACE_DEMO_AMPLITUDE } else { DISPLACE_TEX_DEMO_AMPLITUDE }
+}
+
+/// `assets/textures/pbr/<id>/<id>{HEIGHT_SUFFIX}` 是否存在（**磁盘事实**，不缓存、不 panic）。
+/// 路径口径与 `gate-app/src/height_field.rs::MaterialDisplace::load` 里那条**逐字相同**
+/// （同一个 id、同一个后缀、同一个 `assets/` 根）⇒ 这里判"有"和那边真去解码的是同一个文件。
+fn has_height_map(id: &str) -> bool {
+  crate::paths::assets_dir()
+    .join("textures")
+    .join("pbr")
+    .join(id)
+    .join(format!("{id}{HEIGHT_SUFFIX}"))
+    .is_file()
+}
+
+/// **只读接口（MT8-5 ③）**：按**材质 id** 查该材质的位移幅度（单位**体素**，`0` = 不位移）。
+/// `gate-app` 在**场景构造**（`Startup` 的 CSG 体素化）里就要用它，见下面两条理由。
+///
+/// **为什么是按 id 的自由函数，而不是 `PbrTextureSet::displacement_amplitude(&self, slot: u32)`**：
+/// 1. **时序**：`PbrTextureSet` 是贴图加载完成后（`Update` 里的 `finish_pbr_textures`）才插入的资源，
+///    而位移必须在 `Startup` 发生（D2：位移是 CSG 体素化那一刻的产物）⇒ 那时资源还不存在，
+///    按 `slot` 取**根本拿不到值**；
+/// 2. **按 id 才是稳定口径**：槽位 = 目录名字典序下标，而"某个材质加载失败会让后续槽号顺延"
+///    （见 `finish_pbr_textures` 的跳过逻辑）⇒ 下标不是稳定标识，id 才是（与 MT7 的材质下拉同口径）。
+///
+/// ⇒ 本函数内部用**与槽号定义完全同一套扫描 + 排序**（[`scan_material_dirs`]）把 id 映射到槽位，
+/// 再给出"那一行会写进资产的值"。**不暴露整张资产表**（调用方只该按 id 问一个字节）。
+///
+/// 返回 `None` = 这个 id **不在材质目录集里**（未知材质 ⇒ 调用方不该位移，也不该拿它当"允许位移"的凭据；
+/// 扫描失败同样收敛成 `None`，不 panic）；返回 `Some(0)` = 已收录但**不位移**（MT8-6 起 = 该材质磁盘上
+/// **没有** `_height.png`；有高度图的材质恒为非 0，见 [`default_displacement_amplitude`]）。
+pub fn displacement_amplitude_of(id: &str) -> Option<u8> {
+  let root = crate::paths::assets_dir().join("textures").join("pbr");
+  let ids = scan_material_dirs(&root).ok()?;
+  ids.iter().any(|x| x == id).then(|| default_displacement_amplitude(id))
+}
 
 /// 默认资产的中性 albedo（sRGB 编码字节）——灰 128 与今天平凡材质的中性观感一致。
 const DEFAULT_ALBEDO_SRGB: u8 = 128;
@@ -257,7 +357,13 @@ const METAL_DEMO_METALLIC: u8 = 255;
 /// - **标量回退值**（无贴图 / 未覆盖时用）：中性灰 albedo（sRGB 128）、roughness 0.5、metallic 0、
 ///   specular 0.5（中性）、emissive 0、transmission 0、IOR 1.50 ⇒ 默认**电介质**，与今天的观感一致
 ///   （平凡变体默认本就是这套值）。
-/// - **例外**：[`METAL_DEMO_ID`] 那一条的 metallic = 255（临时 demo 默认值，见该常量的说明）。
+/// - **例外**：[`METAL_DEMO_ID`] 那一条的 metallic = 255（临时 demo 默认值，见该常量的说明）；
+///   位移幅度（`emissive_metal` 的最高字节）**逐行按 [`default_displacement_amplitude`] 给**：
+///   磁盘上有 `<id>_height.png` 的材质分别是 [`DISPLACE_DEMO_AMPLITUDE`]（`stone_wall_04`，样例值）
+///   或 [`DISPLACE_TEX_DEMO_AMPLITUDE`]（其余），**没有高度图的恒 0 = 不位移**
+///   —— 同样是**临时 demo 默认值**（MT8-6：让"随手选任何带高度图的材质"都能出凹凸），
+///   见那几个常量的说明。**为何不在这里另做磁盘判断**：规则本身就在那个函数里，两处共用一条口径
+///   （放在这里会让"资产表"与 `displacement_amplitude_of` 各判一次、可能分叉）。
 pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
   let slots = crate::wesl_consts::material_consts().material_asset_slots as usize;
   let metal_demo = set.slot_of(METAL_DEMO_ID);
@@ -271,6 +377,11 @@ pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
       let i = i as u32;
       let textured = i < set.layers();
       let metallic = if metal_demo == Some(i) { METAL_DEMO_METALLIC as u32 } else { 0 };
+      // MT8-5：位移幅度走 `default_displacement_amplitude(id)`（与 `displacement_amplitude_of`
+      // 同一处规则）—— 不按 `slot_of` 比较，这样"目录集里的材质"与"资产表里的行"恒给同一个值，
+      // 而且槽号顺延/加载失败都不会让两者分叉。写进去只用 `with_displacement_amplitude`，不手写移位。
+      // MT8-6：该函数内部会查一次盘（有 `<id>_height.png` 才给非 0）⇒ 这里的值 = "磁盘上真有高度图"。
+      let amplitude = set.ids().get(i as usize).map_or(0, |id| default_displacement_amplitude(id));
       MaterialAsset {
         albedo_slot: if textured { i } else { MATERIAL_SLOT_NONE },
         roughmetal_slot: if textured { i } else { MATERIAL_SLOT_NONE },
@@ -278,11 +389,12 @@ pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
         transmission_slot: MATERIAL_SLOT_NONE,
         height_slot: MATERIAL_SLOT_NONE,
         albedo_rough,
-        // `emissive(0) | metallic<<8 | specular<<16 | 保留<<24`
+        // `emissive(0) | metallic<<8 | specular<<16`（最高字节留给位移幅度，见下面的链式调用）
         emissive_metal: metallic << 8 | (DEFAULT_SPECULAR as u32) << 16,
         // `transmission(0) | ior_x100<<16`
         transmission_ior: (DEFAULT_IOR_X100 as u32) << 16,
       }
+      .with_displacement_amplitude(amplitude)
     })
     .collect()
 }
@@ -394,6 +506,9 @@ fn start_pbr_texture_load(asset_server: Res<AssetServer>, mut load: ResMut<PbrLo
   // MT2-4 的调试通道提示：放在**加载请求发出后、贴图集构建前** —— 即使后面构建失败（GpuImage 缺失等），
   // "调试开关是开着的"这一行也仍然在日志里（那种情况下它最该被看见）。槽号映射用这里的 `ids`。
   log_pbr_debug_channel(&ids);
+  // MT8-1 的"甲/乙"开关同理由：它是 WESL 编译期常量，只能从画面上看效果 ⇒ 日志里留一行，
+  // 人工验收（对照 Douglas 截图）时不会搞错自己在看哪一种美学。
+  log_flat_shading_switch();
 }
 
 /// 扫描 `<pbr>/*/`：只收录**同时**含 albedo 与 roughmetal 的目录，按目录名字典序排序（= 槽号顺序）。
@@ -587,7 +702,7 @@ fn build_texture_arrays(
   // `layer0[mip0..mipN], layer1[mip0..mipN], …`（与上面对每个材质"先补链、再整体拼接"完全一致）。
   // wgpu `create_texture_with_data` 就是按这个顺序逐层逐 mip `&data[a..b]` 切片上传的
   // ⇒ **顺序或长度错了会直接越界切片 panic**（不会静默出错图）。
-  // asset_usage = RENDER_WORLD：只给 GPU 用，提取后主世界副本自动释放（≈107MiB 不必在 host 留双份）。
+  // asset_usage = RENDER_WORLD：只给 GPU 用，提取后主世界副本自动释放（≈1.7MiB 不必在 host 留双份）。
   //
   // **为什么是 `Rgba8Unorm` 而不是 `Rgba8UnormSrgb`**（这一步很容易写错，务必理解）：
   // albedo 的字节是 jpg 里的 **sRGB 编码值**，而 `Rgba8Unorm` 采样**不做任何转换**
@@ -637,7 +752,7 @@ fn build_texture_arrays(
   })
 }
 
-/// 一张（单层）纹理**含完整 mip 链**的 texel 数（1024 见方 ⇒ 1398101 ≈ 1.333 × 1024²）。
+/// 一张（单层）纹理**含完整 mip 链**的 texel 数（128 见方 ⇒ 21845 ≈ 1.333 × 128²）。
 /// 与 [`build_mip_chain`] 用同一套"逐级减半、遇 1 或奇数即停"的规则（改一处必须同改另一处）。
 fn mip_px_total(mut size: u32) -> u64 {
   let mut px = 0u64;
@@ -824,9 +939,10 @@ fn log_texture_set(set: &PbrTextureSet) {
   info!(
     target: "gate",
     "PBR 贴图集: {n} 个材质 → albedo_rough[{w}×{h}×{n}] Rgba8Unorm（rgb=albedo/sRGB 编码字节 + a=roughness）\
-     ≈ {:.1}MiB + metal[{w}×{h}×{n}] R8Unorm（r=metalness）≈ {:.1}MiB = 合计 ≈ {:.1}MiB\
+     ≈ {:.2}MiB + metal[{w}×{h}×{n}] R8Unorm（r=metalness）≈ {:.2}MiB = 合计 ≈ {:.2}MiB\
      （**mip_level_count = {mips}**（{w} → 1×1，CPU 盒式 2×2 平均；含 mip 的显存 ≈ 1.333× base），\
-     GPU_TEX_SIZE = {}，通道打包 = MT2-1c；BC7/BC4 压缩未做）",
+     GPU_TEX_SIZE = {}（MT8-4：= 体素格密度，见该常量的说明），通道打包 = MT2-1c；\
+     BC7/BC4 压缩 **不需要**（MT8-4 后 30 材质 ≈ 3MiB ⇒ 预算问题消失 ⇒ 取消该分支））",
     mib(ar_bytes),
     mib(m_bytes),
     mib(ar_bytes + m_bytes),
@@ -840,22 +956,22 @@ fn log_texture_set(set: &PbrTextureSet) {
     PBR_ANISOTROPY_CLAMP,
     (PBR_MIP_LEVELS_MAX - 1) as f32,
   );
-  // 每材质的显存（打包后 **含 mip** = 6.67MiB @1024），用它把 30 材质 / 512 / 压缩三条账一次算清。
+  // 每材质的显存（打包后 **含 mip** ≈ 0.104MiB @128），用它把"30 材质"的账一次算清（MT8-4 的正面收益）。
   let per_mat = (ar_bytes + m_bytes) / n as u64;
   info!(
     target: "gate",
-    "PBR 显存提醒: 打包后 {:.1}MiB/材质 @{w}（4B + 1B per texel **含完整 mip 链**，当前 {n} 材质 = {:.1}MiB）；\
-     MT2-1c 不带 mip 时是 5.0MiB/材质（80MiB）⇒ 本次 +{:.1}MiB 是 mip 链的代价（1.333×，MT2-3 必需）；\
-     30 材质时 ≈ {:.0}MiB —— 1024 下仍超 PLAN §MT2-1b 的 100MB 预算线 ⇒ 届时二选一：\
-     ① GPU_TEX_SIZE 调 512（≈ {:.0}MiB，texel 密度仍够，见该常量的注释）；\
-     ② 上 BC7/BC4 压缩（4:1 ⇒ 约 {:.1}MiB/材质，需要离线 KTX2 工具链或新编码器依赖 —— **本次明确不做**，\
-     等材质数真正逼近 30 个时再议）",
+    "PBR 显存提醒（MT8-4）: 打包后 {:.3}MiB/材质 @{w}（4B + 1B per texel **含完整 mip 链**，\
+     当前 {n} 材质 = {:.2}MiB；不带 mip 时 ≈ {:.3}MiB/材质）；\
+     30 材质时 ≈ {:.1}MiB —— **远低于 PLAN §MT2-1b 的 100MB 预算线** ⇒ MT2-1c 留的「512 或 BC7 二选一」\
+     **取消**：{w} 已满足「≥1 texel/体素」（MT8-1 之后一个体素面只取 1 个采样点）⇒ 不必再降也不必修，\
+     BC7/BC4 省下的约 {:.1}MiB（30 材质）不值得引入离线 KTX2 工具链或新编码器依赖；\
+     texel 密度由 GPU_TEX_SIZE 与 `common.wesl::MATERIAL_TEX_WORLD_SCALE`（权威在 WESL）共同决定，\
+     改任一个都要回头看另一个",
     mib(per_mat),
     mib(ar_bytes + m_bytes),
-    mib(ar_bytes + m_bytes) - 80.0,
+    mib(per_mat) / (4.0 / 3.0),
     mib(per_mat * 30),
-    mib(per_mat * 30 / 4),
-    mib(per_mat / 4),
+    mib(per_mat * 30) * 3.0 / 4.0,
   );
   info!(
     target: "gate",
@@ -865,6 +981,40 @@ fn log_texture_set(set: &PbrTextureSet) {
   );
   // MT2-4 的调试通道提示不在这里打：它在 `start_pbr_texture_load`（加载请求发出后）就打过了 ——
   // 那一处即使后面贴图集构建失败也仍然留在日志里。
+  // MT8-5 / MT8-6：位移幅度（资产里的那个字节）在这里报一次 —— 它是"凹凸幅度"的唯一来源，按**槽位表
+  // 同一口径**（id → 字典序槽号）打印 ⇒ 改规则 / 改常量后从这一行就能看出变化；同时它直接回答
+  // "**该选哪个材质才有凹凸**"（用户实测反馈：选到 `marble_cliff_03` 之类幅度为 0 的材质怎么放都没凹凸）。
+  let displaced: Vec<String> = set
+    .ids()
+    .iter()
+    .enumerate()
+    .map(|(slot, id)| (slot, id, default_displacement_amplitude(id)))
+    .filter(|(_, _, amp)| *amp > 0)
+    .map(|(slot, id, amp)| format!("{slot}={id}({amp})"))
+    .collect();
+  if displaced.is_empty() {
+    warn!(
+      target: "gate",
+      "位移幅度（MT8-5/MT8-6）: 资产表里**没有任何非 0 位移幅度** —— 这 {n} 个材质目录下都找不到 \
+       `<id>_height.png`（幅度按**磁盘事实**给值）⇒ 笔触与 CSG 都**不会**位移；\
+       把高度图放回 assets/textures/pbr/<id>/ 即恢复"
+    );
+  } else {
+    info!(
+      target: "gate",
+      "位移幅度（MT8-5/MT8-6）: 资产表里**非 0** 的槽位（格式 `槽=id(幅度体素，峰-峰；偏置 0.5 ⇒ \
+       上下各 ±幅度/2)`）= {} —— `{DISPLACE_DEMO_ID}` 是 {} 体素（MT6 / MT8-5 的样例值，\
+       `gate-app::consts::DEMO_DISPLACE_HEIGHT_MAP` 钉着它，**别改**），其余一律 {} 体素\
+       （`DISPLACE_TEX_DEMO_AMPLITUDE`）；**没有高度图的材质恒 0**（上面已按磁盘事实筛过 ⇒ 这一行就是\
+       「该选哪个材质才有凹凸」的答案）。CPU 侧的 CSG 位移读的就是这个字节\
+       （`MaterialAsset::emissive_metal` bits 24..31，shader 不读）⇒ **改这里即改凹凸**\
+       （改 `gate-render/src/pbr_texture.rs::default_displacement_amplitude` 或那两个 `DISPLACE_*` 常量）；\
+       逐材质的幅度属 MT7 的「资产表编辑」，这两条都是**临时 demo 默认值**",
+      displaced.join("  "),
+      DISPLACE_DEMO_AMPLITUDE,
+      DISPLACE_TEX_DEMO_AMPLITUDE,
+    );
+  }
   // 槽号 ↔ 目录名：一行太长 ⇒ 每行 `SLOT_LOG_PER_LINE` 条。
   for (row, chunk) in set.ids().chunks(SLOT_LOG_PER_LINE).enumerate() {
     let line = chunk
@@ -919,5 +1069,35 @@ fn log_pbr_debug_channel(ids: &[String]) {
        关掉就把那一行改回 `0xFFFFFFFFu`（详见该常量的注释）。\
        注意：调试视图下自发光一并被替换 ⇒ 发光体会熄灭，这是预期",
     );
+  }
+}
+
+/// MT8-1「逐体素材质采样」开关（`common.wesl::MATERIAL_FLAT_SHADING`）的启动提示。
+/// 手法与 [`log_pbr_debug_channel`] 完全一致（读 WESL 源码、绝不影响启动），理由也一样：
+/// 它是**编译期常量**、效果只体现在画面上，日志里留一行能让"我现在看的是甲还是乙"有据可查
+/// （MT8 的验收就是人工对照 Douglas #22 的截图）。
+fn log_flat_shading_switch() {
+  let path = crate::paths::dda_wesl_dir().join("common.wesl");
+  let value = std::fs::read_to_string(&path).ok().and_then(|src| {
+    crate::wesl_consts::parse_u32_consts_in_source(&src).get(MATERIAL_FLAT_SHADING_CONST).copied()
+  });
+  match value {
+    None => info!(
+      target: "gate",
+      "逐体素材质采样（MT8-1）: 读不到 {} 的 {MATERIAL_FLAT_SHADING_CONST} ⇒ 无法确认开关状态\
+       （不影响渲染，按 `common.wesl` 里的值执行）",
+      path.display(),
+    ),
+    Some(0) => info!(
+      target: "gate",
+      "逐体素材质采样（MT8-1）**关闭**（MATERIAL_FLAT_SHADING = 0）= 美学「乙」：\
+       纹理按**逐屏幕像素**连续采样（MT3 口径，亚体素贴图细节保留）—— 这是 A/B 对照组",
+    ),
+    Some(v) => info!(
+      target: "gate",
+      "逐体素材质采样（MT8-1）**开启**（MATERIAL_FLAT_SHADING = {v}）= 美学「甲」：\
+       triplanar 采样点量化到**体素中心** ⇒ 一个体素面一个平色（色块边界与几何台阶对齐，\
+       见 `common.wesl::material_sample_pos`）；远处闪烁由 `pbr_mip_lod` 的解析 LOD 抑制（R12）",
+    ),
   }
 }

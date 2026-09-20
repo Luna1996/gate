@@ -63,6 +63,10 @@ pub struct MaterialConsts {
 /// [`MaterialConsts`] 需要的常量名（缺一即 fail fast）。
 const MATERIAL_REQUIRED: &[&str] = &["MATERIAL_ASSET_SLOTS", "MATERIAL_TEX_SLOTS"];
 
+// MT8-3 的 `ReflConsts` / `refl_consts()` / `REFL_ENTRY_BYTES` 已随反射缓存一起删除（实测负优化）。
+// 这里只保留**通用**解析器（`parse_package_u32_consts` / `parse_u32_consts_in_source`），
+// GI 与材质两组常量仍在用；`pbr_texture.rs` 也直接用后者抽 `.wesl` 里的字面量。
+
 /// 解析 WESL 包里的跨端常量（首次读盘，之后走 `OnceLock`）。
 /// 失败（文件读不到 / 常量缺失 / 不是字面量）→ `error!` + `panic!`。
 pub fn gi_consts() -> &'static GiConsts {

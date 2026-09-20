@@ -36,6 +36,26 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> v
   return normalize(face_n + t);
 }
 
+/// 命中体素的**世界空间中心**（`voxel + 0.5` 经该 grid 的变换）—— 它是"这个体素在世界里的锚点"，
+/// 主 pass 用它当 AO 采样点 / 阴影与反射射线的起点（`main.wesl::dda_main` 的 `p_voxel`）。
+///
+/// 表达式与 `main.wesl::dda_main` 里原有那行 `p_voxel` **逐位相同**（同一个 `dot` 形式 ⇒ 取值口径不变；
+/// 主世界 identity 下就是 `voxel + 0.5`，物体下随变换走 —— 物体路径当前没有调用点，
+/// `Volumes::add_object` 在应用里未被调用）。
+///
+/// ⚠️ **它不再是视向量的来源**（历史记录）：MT8-2 曾拿本函数的结果当 `face_view_dir` 的第二个实参
+/// （"面中心视向量"），**已被用户实测推翻并回退** —— 量化到面中心会让掠射面整面变亮（白边），
+/// 并让反射方向逐面恒定（镜面图像在原理上不可能出现）。现在四个着色点走逐像素的
+/// `common.wesl::view_dir_to`（传**命中点**，不传体素中心）。
+///
+/// **为什么求中心要用 DDA 给的整数 `voxel`、而不是"命中点 + `floor`"**：DDA 给的 `voxel` 是**整数**
+/// （权威），而命中点的法线轴分量恰好落在整数面平面上 ⇒ 浮点误差会让 `floor(命中点)` 取到相邻
+/// （通常是空气）体素，同一面内逐像素翻转。
+fn voxel_center_world(g: Grid, voxel: vec3<i32>) -> vec3<f32> {
+  let vc = vec3<f32>(voxel) + vec3<f32>(0.5);
+  return g.pos + vec3<f32>(dot(vc, g.col0), dot(vc, g.col1), dot(vc, g.col2)) * g.scale;
+}
+
 // 场景级命中：`UnifiedHit` + 命中 volume 的 palette 基址（取 albedo 用）。
 struct SceneHit {
   uh: UnifiedHit,
@@ -107,8 +127,10 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
 
 /// 介质穿透入口（模式 1/2）：在指定 grid 内把透射材质当作可穿过，一次走完整段介质。
 /// 结局：撞实体 → hit 实体；到段末端 → hit 介质材质（t/n = 出射面）；走到底 → miss；
-/// `tint`（乘性）累积透射色 —— **按穿过的格数累积**（MT5-3 的 Beer-Lambert 近似，见
-/// `trace.wesl::pass_through_medium`；同一段介质越厚越暗）。
+/// `tint`（乘性）累积透射色 —— **按实测路径距离累积**（MT5-3 的 Beer-Lambert 近似，见
+/// `trace.wesl::pass_through_medium` 与 `medium_dist_tint`；同一段介质越厚越暗）。
+/// 注：2026-09-21 从"按穿过的**格数**（整数）"改成"按**实测距离**（连续）"—— 前者会让吸收值
+/// 随像素的离散跳变产生**等高线条带**（折射长路径上尤其明显）。
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
                       stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
   var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0), vec3<f32>(1.0));

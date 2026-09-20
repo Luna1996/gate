@@ -20,11 +20,16 @@ struct VoxelHit {
 // **注意 `last_pal` 不再是"同段只染一次"的去重键**：MT5-3 前它兼任去重，那会让 `tint` 按**段**
 // 染一次而**与厚度无关**（厚玻璃不比薄玻璃暗，不是 Beer-Lambert）—— 见 `pass_through_medium`。
 // `penetrate` 是按值参数、不在本结构里。
+//
+// **距离记账不在本结构里**：`tint` 的累乘点只有一个（`medium_flush`），距离 = 相邻两次介质调用之间的
+// **实测 t 跨度 × |rd|**，由 `trace_chunk` 用局部变量 `t_prev` 逐格喂进来 —— 所以本结构只保存
+// "当前段的材质 + 该材质的单格透过率"，不需要再存"上一格的入口 t"（也就不会多一个需要跨文件同步的字段：
+// 本结构由 `world.wesl` 按位置构造，字段数一变就得同时改那边）。
 struct MediumRay {
   stop_on_air: bool,
   palette_base: u32,
   last_pal: u32,
-  last_tiny: vec3<f32>,  // `last_pal` 材质的**单格（1 体素）**透过率（未按格数取幂）
+  last_tiny: vec3<f32>,  // `last_pal` 材质的**单格（1 体素）**透过率（未按距离取幂）
   tint: vec3<f32>,
 }
 
@@ -67,44 +72,101 @@ fn medium_of(palette_base: u32, pal: u32) -> vec4<f32> {
   return vec4<f32>(mix(vec3<f32>(1.0), srgb * srgb, a), a);
 }
 
-/// 单格透过率 → **`cells` 格**的透过率（`tiny^cells`）。
-/// **为什么不用 `pow` / `exp`**（成本红线：本函数在 DDA 热循环里逐格调用）：
-///   ① `pow`/`exp` 走特殊函数单元、每分量多次乘加，比这里整条路径（含 `medium_of` 的 palette load）
-///      都贵，而收益只是省几次乘；
-///   ② 不需要 —— DDA 每步跨过的格边长恒是 `1 << (2*level)`（`trace_chunk` 的 `s`），
-///      level ≤ 3 ⇒ **cells ∈ {1, 4, 16, 64}，是 4 的幂** ⇒ 用**重复平方**（每个分支两次平方
-///      把指数 ×4，最多 6 次 vec3 乘）就得到精确的 `tiny^cells`，没有 `exp2(cells·log2(tiny))` 的误差。
-fn medium_cells_tint(tiny: vec3<f32>, cells: u32) -> vec3<f32> {
-  var t = tiny;                                        // 4^0 格
-  if (cells >= 4u) { t = t * t; t = t * t; }            // → 4^1 格
-  if (cells >= 16u) { t = t * t; t = t * t; }           // → 4^2 格
-  if (cells >= 64u) { t = t * t; t = t * t; }           // → 4^3 格
-  return t;
+/// **诊断开关（临时 A/B 用，默认必须 0u）**：`1u` ⇒ 介质吸收**整体关闭**（吸收因子恒为白）。
+/// 它把两个候选成因**一刀切开**（人工验证配方）：
+///   · 置 `1u` 后图案**消失** ⇒ 图案来自**吸收**（就是本次要修的东西：MT5-3 的"按格整数"指数
+///     ⇒ `tint` 随格数跳变 ⇒ 等高层条纹）；
+///   · 置 `1u` 后图案**仍在** ⇒ 图案与吸收无关，去查几何侧：`main.wesl::GLASS_MAX_BOUNCE`
+///     （玻璃状态机的多界面/全反射路径）与 `main.wesl::PBR_REFLECTION_ENABLED`（MT4 反射射线）。
+/// 编译期常量 ⇒ `0u` 时整个分支被折叠掉，正常路径零开销（WESL 运行期读盘编译：改这一行 + 重启即生效）。
+const DIAG_DISABLE_MEDIUM_TINT: u32 = 0u;
+
+/// 吸收因子：`tiny^dist`（`dist` = 该段介质的**实际穿行距离**，单位 = 体素、允许分数）。
+///
+/// **为什么不再用"按格整数"**（MT5-3 的 `tiny^cells`，`cells = 1 << (2*level)`）：DDA 的格是
+/// **整数**体素块，而射线在格内的真实距离是**分数**（斜射时一格内可达 `4^level·√3`）。拿整数格数
+/// 当指数有两个后果：
+///   ① **阶梯**：`tint` 每穿一格跳一个 `tiny` 因子，而路径长度是连续增长的 ⇒ `tint` 呈**等高层**，
+///      视觉上就是贴着几何的条带（用户报告的"同心方框状条纹"的候选成因之一）。
+///      **可证伪点**：环的间距应 ≈ **一个 DDA 格**的路径长度（level 0 ⇒ 1 体素）；改变物体尺寸/视角
+///      时环数应随之变化，而不是固定不变。
+///   ② **量纲错**：格数 ≈ L1（曼哈顿）路径长度 —— 斜射时最多偏 `√3`（偏暗），与"穿行体素数"不是一回事。
+/// 改用实测距离后，`tint` 是路径长度的**连续**函数（台阶消失）。
+///
+/// **为什么不用 `pow` / `exp`**（成本红线：本函数在 DDA 热循环里逐格调用，见 MT5-3 的注释）：
+///   ① **精度上不需要**：距离拆成"整数体素（**精确**二进制幂）+ 分数余量（线性化）"后，线性化只作用在
+///      **一个体素以内**（小数部分 `f < 1`）：`mix(1, tiny, f)` 与 `tiny^f` 之差 ≈ `(f·ln tiny)²/2`，
+///      即 ≤ `(ln tiny)²/2`（`tiny = 0.9` ⇒ 0.5%；`tiny = 0.5` ⇒ 24%，而那里已是深暗区）；
+///      整数部分走二进制幂是**精确**的（不是 `exp2(e·log2 tiny)` 那种超函数近似）。
+///   ② **鲁棒性**：`exp`/`log2` 路线要多存一个 `ln tiny`，且 `tiny = 0`（纯黑 + 全不透）时
+///      `log2(0) = -inf` 会在 `dist = 0` 处给出 `0 · -inf = NaN` 并扩散到整幅画面；本结构没有这个坏点。
+///   ③ **成本**：常见情形（level 0、`dist ≈ 1`）只走 1 轮循环（1 次 `vec3` 乘）+ 1 次 `mix`；
+///      最坏情形（level 3、`dist ≤ 64·√3 ≈ 110.9`）走 7 轮（≤6 次平方 + ≤6 次乘）——
+///      而那一格覆盖 **64³ 个体素**，这点 ALU 与 DDA 自身的位运算/palette 读相比可忽略。
+///      对照：MT5-3 的 `medium_cells_tint` 在最坏情形是 6 次 `vec3` 乘，两者同量级。
+///
+/// **与 MT5-3 的差异（有意，写明）**：**整数距离处逐位相同** —— 轴对齐射线走整数格时 `f = 0`
+/// （`mix = 1`）且整数幂精确，结果与 MT5-3 的 `tiny^cells` 完全一致；差异只出现在
+/// **斜射 / 分数格 / 实测距离 ≠ 格边长** 的情形 —— 那正是本次要修掉的量化台阶。
+fn medium_dist_tint(tiny: vec3<f32>, dist: f32) -> vec3<f32> {
+  if (DIAG_DISABLE_MEDIUM_TINT != 0u) { return vec3<f32>(1.0); }
+  // 整数体素部分：二进制幂（精确）。上界 127 的论证：DDA 单格最大边长 64 体素（level 3），
+  // 斜射时格内真实距离 ≤ 64·√3 ≈ 110.9 < 128 ⇒ 7 bit 足够（`clamp` 兼作负值/异常防御）。
+  let fl = floor(dist);
+  var n = u32(clamp(fl, 0.0, 127.0));
+  var acc = vec3<f32>(1.0);
+  var b = tiny;
+  loop {
+    if ((n & 1u) != 0u) { acc = acc * b; }
+    n = n >> 1u;
+    if (n == 0u) { break; }
+    b = b * b;
+  }
+  // 分数部分（< 1 体素）：线性化 —— `mix(1, tiny, f)` = `tiny^f + O(f²·(ln tiny)²/2)`。
+  return acc * mix(vec3<f32>(1.0), tiny, max(dist - fl, 0.0));
 }
 
-/// 可穿透介质 → 按**穿过的格数**累积吸收色（MT5-3）并返回 true（调用方按空气继续步进）；
-/// 不可穿透（`a >= 1`，含 `transmission == 0`）返回 false。
-/// 只在 `penetrate = true` 时被调用。`cells` = 本次步进跨过的格边长（voxel = `1 << (2*level)`）。
+/// **唯一的 `tint` 累乘点**：结算 `(t_prev, t_now]` 这一段距离的吸收。
 ///
-/// **厚度相关（这就是 Beer-Lambert 的廉价形式）**：每**一格**都乘一次单格透过率
-/// （`tiny^cells`，`cells` = 该步跨过的体素数）⇒ `tint = Π tiny^cells`，
-/// 即按**穿过的体素数**指数衰减（跨越 n 格的均匀介质 ⇒ `tint = tiny^n`）。
-/// 改动前是"同段（同一材质）只染一次" ⇒ `tint = tiny`（与厚度**无关**，厚玻璃不比薄玻璃暗）。
-/// **格粒度说明**：DDA 的步长是层次自适应的一整格（`trace_chunk` 里 `s = 1 << (2*level)`），
-/// 所以这里按"格"计而不是按"体素"逐个来访；`cells` 把"一格 = 4^level 个体素"折回体素尺度。
-/// 斜射时一格内真实穿行距离最长可达 `4^level·√3`（本写法**低估最多 1.7×** ⇒ 略偏亮）——
-/// 这是为了不动 DDA 步进、换取"零 pow/exp"这条成本红线的**有意近似**。
-fn pass_through_medium(mc: ptr<function, MediumRay>, pal: u32, cells: u32) -> bool {
-  // 材质不变 ⇒ 直接用记忆的单格透过率（省两次 palette load）；变了才重算。
-  var tiny = (*mc).last_tiny;
+/// 距离 = `(t_now − t_prev) · |rd|`（体素）。**为什么用实测 t 跨度而不是格边长**：DDA 只在跨格边界时
+/// 更新 t（见 `trace_chunk` 的步进），于是相邻两次介质调用之间的 t 跨度**就是**射线在该格内实际走过的
+/// 距离（自动含斜射的 `1/|d_axis|` 因子与分数格）⇒ `tint` 对路径长度连续，也不再拿 L1 格数当欧氏距离。
+///
+/// **滞后一格的约定（有界近似，写明）**：结算发生在**下一次**介质调用处 —— 只有到那时才知道上一格的出口 t。
+/// 于是每次结算用的是"上一格的材质"（`last_pal` / `last_tiny`）：**同一材质段内精确**（玻璃物体的绝大多数
+/// 情形），材质交界处至多把一格的间隔记到相邻材质上（误差有界，且 ≤ 一格自身的吸收量）。
+/// `last_pal == 0`（不在介质内：空气段）不结算 —— 那段距离不该吸收。
+///
+/// **跨 chunk 不丢距离**：`trace_chunk` 在"越过本 chunk 的 t1"时先用 `t1` 收尾（见那里的注释），
+/// 下一个 chunk 的 `t_prev` 从 `t0 = t1` 起步 ⇒ 两段拼起来仍等于整段距离（不重不漏）。
+fn medium_flush(mc: ptr<function, MediumRay>, t_now: f32, t_prev: f32, t_scale: f32) {
+  if ((*mc).last_pal != 0u) {
+    let dist = max(t_now - t_prev, 0.0) * t_scale;
+    (*mc).tint = (*mc).tint * medium_dist_tint((*mc).last_tiny, dist);
+  }
+}
+
+/// 可穿透介质 → 返回 true（调用方按介质继续步进）；不可穿透（`a >= 1`，含 `transmission == 0`）返回 false。
+/// 只在 `penetrate = true` 时被调用 —— 而 `penetrate = true` 只有一条入口链
+/// （`trace_glass`（主 pass 的玻璃状态机）与 `gi/ray.wesl` 的 `sun_transmittance` / 二次射线
+/// 都经 `world_trace_medium` → `trace_grid` → 本函数）⇒ 硬约束 3「口径不分叉」由**只有这一份实现**保证。
+///
+/// 本函数**不再自己累乘 `tint`**：吸收由 `medium_flush` 按实测距离结算（见那里的注释），这里只做两件事：
+///   ① 结算上一格；② 判本格是不是介质、并把它的单格透过率记进 `last_tiny`。
+/// 距离相关（Beer-Lambert）的性质因此**只落在 `medium_dist_tint` 一个函数里**，没有第二处口径。
+/// `t_prev`/`t_now`/`t_scale` 由调用方（`trace_chunk`）给：`t_now` = 本格的入口 t、`t_prev` = 上一格的入口 t、
+/// `t_scale` = `|rd|`（⇒ `(t_now − t_prev)·t_scale` = 上一格内的实际穿行距离）。
+fn pass_through_medium(mc: ptr<function, MediumRay>, pal: u32,
+                       t_now: f32, t_prev: f32, t_scale: f32) -> bool {
+  // ① 结算上一格：距离 = 本格入口 t − 上格入口 t（= 上一格内的实际穿行距离）。
+  medium_flush(mc, t_now, t_prev, t_scale);
+  // ② 材质不变 ⇒ 直接用记忆的单格透过率（省两次 palette load）；变了才重算。
   if ((*mc).last_pal != pal) {
     let m = medium_of((*mc).palette_base, pal);
     if (m.a >= 1.0) { return false; }
-    tiny = m.rgb;
     (*mc).last_pal = pal;
-    (*mc).last_tiny = tiny;
+    (*mc).last_tiny = m.rgb;
   }
-  (*mc).tint = (*mc).tint * medium_cells_tint(tiny, cells);
   return true;
 }
 
@@ -283,11 +345,24 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
 
 // 单 chunk 内层级遍历（介质穿透版）：调用点恒传穿透语义，无 `penetrate` 开关；mc = 介质穿透上下文。
 // 命中 / 穿透 / 出射面判定只在两处唯一出口做。
+// **介质吸收的距离记账**（`tint` 的唯一累乘点 = `medium_flush`）：本函数把"上一格的入口 t"记在 `t_prev`，
+// 每次介质调用传 `(cur_t, t_prev, t_scale)` ⇒ 结算区间 = `(t_prev, cur_t]`，距离 = 该跨度 × |rd|。
+// 三件事保证**不重不漏**（每段距离恰好结算一次）：
+//   ① 每次跨格前 `t_prev = cur_t`（见内层 DDA 的第一步）；
+//   ② 越过本 chunk 的 t1 时先用 `t1` 收尾（下半段由下一个 chunk 用它的 t0 = t1 起步接着算）；
+//   ③ 段首（`last_pal == 0`）不结算 —— 那段在空气里。
 fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
                ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
                t0: f32, t1: f32, entry_face: u32, depth_cap: u32,
                mc: ptr<function, MediumRay>) -> VoxelHit {
   if (t0 >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
+  // 介质距离记账的两个局部量（函数作用域：要跨外层 loop 的迭代保持）：
+  //   · `t_scale` = |rd| ⇒ `t` 跨度 × 它 = 该格内的**真实距离**（体素）。主世界 rd 是单位向量（= 1）；
+  //     物体上 rd 已被变换（|rd| = 1/scale）⇒ 两种情形都得到"本 grid 体素"为单位的距离。
+  //   · `t_prev` = **上一格的入口 t**（每次跨格前更新）⇒ 结算区间 = `(t_prev, cur_t]`（见 `medium_flush`）。
+  //     从 `t0` 起步：跨 chunk 调用时 t0 就是上一个 chunk 的 t1 ⇒ 距离不重不漏。
+  let t_scale = length(rd);
+  var t_prev = t0;
   // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = ro - chunk_min;
   let inv_rd = 1.0 / rd;
@@ -361,12 +436,14 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       bricks[level] = Brick(child_addr, c_mask, c_pal);
     }
     // ---- traverse 唯一出口：命中 / 穿透 / 出射面 ----
-    // `cells` = 本格边长（voxel）：level 处的一格 = `1 << (2*level)` 个体素（见 `pass_through_medium`）。
+    // 距离记账：`pass_through_medium` 在开头用 `(cur_t − t_prev)` 结算**上一格**（见 `medium_flush`）。
     if (hit_pal != 0u) {
-      if (!pass_through_medium(mc, hit_pal, 1u << (level * 2u))) {
+      if (!pass_through_medium(mc, hit_pal, cur_t, t_prev, t_scale)) {
         return VoxelHit(true, cur_t, hit_pal, face, v);
       }
     } else {
+      // 空气格 = 本段介质的终点：先结算上一格的吸收，再判"是否到了出射面"。
+      medium_flush(mc, cur_t, t_prev, t_scale);
       if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
       (*mc).last_pal = 0u;
     }
@@ -405,8 +482,15 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       else if (side.y <= side.z) { mn = 1u; }
       else { mn = 2u; }
       step_axis = mn;
+      // 跨格前记下"上一格的入口 t"：上一格的实际穿行距离 = (新的 cur_t − t_prev)·|rd|（见 medium_flush）。
+      t_prev = cur_t;
       cur_t = side[mn];
-      if (cur_t >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
+      if (cur_t >= t1) {
+        // 越出本 chunk：把上一格到边界的距离先结算掉（`t_prev → t1`），其余部分由下一个 chunk 接着算
+        // （它的 t0 就是本 chunk 的 t1，见函数头注释）⇒ 距离不重不漏、也不会把边界外的距离算进来。
+        medium_flush(mc, t1, t_prev, t_scale);
+        return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0));
+      }
       let old_cell = (v[mn] >> log2) & 3;
       v[mn] = v[mn] + sign_v[mn] * s;
       side[mn] = side[mn] + step_inc[mn];
@@ -430,10 +514,11 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         hit_pal = b.pal;
       }
       if (hit_pal != 0u) {
-        // `log2 = level * 2` ⇒ 本格边长 = `1 << log2` 个体素（同上）。
-        if (pass_through_medium(mc, hit_pal, 1u << log2)) { continue; }
+        if (pass_through_medium(mc, hit_pal, cur_t, t_prev, t_scale)) { continue; }
         return VoxelHit(true, cur_t, hit_pal, face, v);
       }
+      // 空气格：与 traverse 出口同一处理 —— 先结算上一格（本段介质到此结束），再判出射面。
+      medium_flush(mc, cur_t, t_prev, t_scale);
       if (medium_exit(mc)) { return VoxelHit(true, cur_t, (*mc).last_pal, face, v); }
       (*mc).last_pal = 0u;
     }

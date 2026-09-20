@@ -1,5 +1,5 @@
 import package::bindings::{light_u};
-import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
+import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb, view_dir_to};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
@@ -86,7 +86,8 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
   var l = sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   if (sh.hit) {
     let hit_p = org + dir * sh.t;
-    let hn = voxel_normal(make_grid(u32(sh.obj_id) + 1u), sh.voxel, sh.face_id, sh.n);
+    let hg = make_grid(u32(sh.obj_id) + 1u);
+    let hn = voxel_normal(hg, sh.voxel, sh.face_id, sh.n);
     let ndl = max(dot(hn, sun_dir), 0.0);
     var sun = 0.0;
     // `sun_bounce` 来自 uniform（一次派发内恒定 ⇒ 分支不发散）：关掉时整条阴影射线都不发。
@@ -101,13 +102,19 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
     //   ① 太阳项乘 `sun_bounce`（菜单「渲染/RESTIR GI/太阳反弹」：关掉时二次顶点不做太阳 NEE）；
     //   ② **没有 GI 项**（二次顶点只算一次弹射）⇒ `SurfaceLight.gi` 传 0；
     //   ③ 反射项 `/π` 转辐亮度（自发光不除，见文件头）。
-    // `v = -dir`：出射方向就是"回到上一个顶点"的方向（与主 pass 的 `-dir` 同一个构造方式）。
     // 材质取值走同一入口 `fetch_material`；`MATERIAL_DEBUG_NONE` = 调试通道**不作用于 GI**
     // （与 MT2-4 一致：那条通道只是主 pass 的调试视图）。
+    // ---- 视向量：**逐像素**（硬约束 3：与 `dda_main` 共用 `view_dir_to` 那一份实现）----
+    // `ray_origin` = **这条 GI 射线自己的起点 `org`**（不是相机眼位：二次顶点的"回到观察者"方向
+    // 就是回到上一个顶点 = 射线起点）；`hit_point` = 本次命中点 `hit_p` ⇒ 恒等于 `-dir`，逐像素。
+    // MT8-2 曾把它换成"命中体素中心"（求得"同一二次顶点同值"）—— **已实测推翻并回退**：那会让
+    // 掠射面整面变亮（白边）、反射/高光方向逐面恒定（镜面图像消失）。依赖它的 MT8-3 已整体删除。
+    let v = view_dir_to(org, hit_p);
+    // `v` 就是改动前的 `-dir`：由着色点指向观察者 = 回到上一个顶点（构造口径与主 pass 一致）。
     let m = fetch_material(sh.palette_base, sh.pal, hit_p, hn, MATERIAL_DEBUG_NONE);
     // MT5-2：二次顶点的辐亮度整体乘 `tint`（BRDF 项与自发光项都乘）—— 它就是"这个二次顶点发出的
     // 光，穿过玻璃到达本着色点"的乘性吸收；无介质时 `tint == 1.0` ⇒ 逐位等于改动前。
-    l = (brdf_reflected(m, hn, -dir, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0))) / GI_PI
+    l = (brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0))) / GI_PI
       + emissive_radiance(m, GI_EMIT_GAIN)) * tint;
   }
   return GiRaySample(

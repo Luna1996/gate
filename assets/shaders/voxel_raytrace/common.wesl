@@ -144,14 +144,47 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 // MT4-1 起多了一个**调用点**（不是新公式）：主 pass 的**镜面反射命中点**也用这两个函数着色
 // （`main.wesl` 的 `dda_main`，以及 `trace_glass` 里原先那条独立近似 —— 它已按 MT4-1 的必做项
 // 接进本入口）；三个着色点的差异只在 `SurfaceLight` 的字段（那是物理上该不同的部分）。
+//
+// MT8（`docs/PLAN.md §4b`：逐体素材质采样）在本入口上加了两个**输入量化器**（不是第二条取值路径）：
+//   · `material_sample_pos`：纹理采样点 + 解析 LOD 量化到**体素格** ⇒ 一个体素面一个平色（MT8-1）；
+//   · 原 `face_view_dir`：视向量量化到**体素中心** ⇒ N·V / Fresnel / GGX 高光 / 反射方向逐面恒定
+//     （MT8-2，**已回退**，见下面的 ⚠️）。
+// `material_sample_pos` 只有**一份**实现、且被四个着色点共用（硬约束 3：口径不分叉）。
+//
+// ⚠️ **MT8-2 已被用户实测推翻并回退**（本次改动）：视向量量化到体素中心 ⇒ ① 掠射面的 Fresnel
+// 整面均匀变亮（画面里就是"几乎所有物体的轮廓都有一条白边"）；② 反射方向逐面恒定 ⇒ 一个面只剩
+// 一个反射值 ⇒ **镜面图像在原理上不可能出现**（用户实测：光滑度拉到 100 也看不到镜面）。
+// 现在四个着色点用的是**逐像素**的 `view_dir_to`（同一份实现，硬约束 3），MT8-2 的量化代码已删除。
+// MT8-1（`material_sample_pos`）**不受影响、一行未动** —— 用户已确认"现在材质是按逐体素着色的"。
 // ============================================================================
+
+/// **MT8-1 的"甲/乙"美学开关**（`docs/PLAN.md §4b` MT8-1 / §5 R14）。
+/// `1u` = **甲**（严格 1 采样/体素：纹理采样点量化到体素中心 ⇒ 一个体素面一个平色，色块边界与几何
+/// 台阶对齐）、`0u` = **乙**（退回 MT3 的逐屏幕像素连续采样，亚体素贴图细节保留）。
+/// **默认取"甲"**：用户 2026-09-21 的决策（`§4b` 决策行"A = 甲"）—— 逐体素着色风格是体素引擎的身份，
+/// 逐像素采样会把 2cm 体素面铺满 ~10 倍于它的贴图细节，观感退化成"贴了高分辨率贴图的网格模型"。
+/// 这个选择的两个代价都在计划里登记了：
+///   · **R12** 量化后远处（1 体素 < 1 像素）色块会逐帧闪烁 ⇒ 靠 `pbr_mip_lod` 的解析 LOD 把采样格
+///     随像素足迹**一起变粗**（量级论证写在 `pbr_mip_lod` 的注释里）；
+///   · **R14** 高光/反射随视点**逐面跳变** ⇒ "甲"的预期代价，不是 bug。
+/// 编译期常量 ⇒ `0u` 时 `material_sample_pos` 里的 `select` 折成恒取连续点，整支零开销
+/// （WESL 是运行期读盘编译：改这一行 + 重启即生效，不用 rebuild）。
+///
+/// **作用范围（别误解）**：只切 MT8-1 的**采样点**量化。MT8-2 的视向量量化（原 `face_view_dir`）
+/// 曾与它并列、在四个着色点恒生效，**已被实测推翻并回退**（白边 + 镜面图像消失，见文件头那段），
+/// 现在是逐像素的 `view_dir_to`；依赖它的 MT8-3（按可见体素面复用反射）也随之整体删除。
+/// **本常量（MT8-1）不受那两次回退影响**：它只管"贴图采样点取在体素中心"这一件事。
+/// **只影响有贴图的 PBR 变体**：平凡变体（palette 纯色）根本不调 `triplanar_sample` ⇒ 逐位不变
+/// （取证见 `material_sample_pos` 的注释）。
+const MATERIAL_FLAT_SHADING: u32 = 1u;
 
 /// 一张贴图铺多大世界范围（米/张贴图）—— **MT3 的旋钮**（MT2-4 的 `PBR_DEBUG_TEX_WORLD_SCALE` 转正）。
 /// triplanar 走**世界坐标**（与体素尺寸解耦）⇒ 本值与 `pbr_texture.rs::GPU_TEX_SIZE` 一起决定 texel 密度：
-/// `texel/体素面 = GPU_TEX_SIZE / (本值 × MATERIAL_VOXEL_PER_METER)`（默认 1024 / (2 × 50) ≈ 10）。
-/// 依据 `docs/PLAN.md §7 决策记录`（2026-09-20「贴图分辨率档」）的核算：2cm 体素 / 1k 贴图 / 铺 1~2.5m
-/// ⇒ 每体素面 10~20 texel，与 1080p 下 1~2m 视距时每体素面 5~11 屏幕像素匹配且有余量。
-/// 默认 2.0 = 那份核算的上沿（"偏软但绝不产生摩尔纹"）；嫌糊就调小（1.0 ⇒ 每体素面 20 texel）。
+/// `texel/体素面 = GPU_TEX_SIZE / (本值 × MATERIAL_VOXEL_PER_METER)` = 128 / (2 × 50) = **1.28**（MT8-4 后）。
+/// 依据 `docs/PLAN.md §7 决策记录`（2026-09-20「贴图分辨率档」）的核算：2cm 体素、1080p 下每体素面
+/// 约 5~11 屏幕像素 ⇒ **每体素面 1.28 texel 已够**（MT8-1 之后一个体素面只取 1 个采样点，
+/// 再多的 texel 也只是被丢掉的亚体素细节）。
+/// 默认 2.0 = 那份核算的上沿（"偏软但绝不产生摩尔纹"）；嫌糊就调小（1.0 ⇒ 每体素面 2.56 texel）。
 const MATERIAL_TEX_WORLD_SCALE: f32 = 2.0;
 /// 1 米 = 多少体素（本工程**世界单位 = 体素**）—— 与 Rust `gate_app::consts::VOXEL_PER_METER` 同源。
 const MATERIAL_VOXEL_PER_METER: f32 = 50.0;
@@ -190,14 +223,67 @@ struct MaterialParams {
   specular: f32,       // 槽级调制：**只乘性调制电介质 F0**（1.0 = 不调制），对金属无效（D1）
 }
 
+/// **MT8-1 · 采样点量化到体素格**（`docs/PLAN.md §4b` MT8-1）：把命中点的连续世界坐标换成**该体素
+/// 中心**（`floor(p) + 0.5`）⇒ 同一体素面内所有像素取到**同一个**纹素 ⇒ albedo / roughness /
+/// metallic / transmission 一个体素面一个平色，色块边界与几何台阶对齐（用户决策"A = 甲"）。
+///
+/// **为什么它"就是 1 采样/体素"**（量级，别凭感觉）：本工程**世界单位 = 体素**
+/// （`MATERIAL_VOXEL_PER_METER = 50` ⇒ 2cm 体素）⇒ 世界空间里"整数面"**就是**体素边界，
+/// `floor(p) + 0.5` 就是体素中心；而一张贴图铺 `MATERIAL_TEX_WORLD_SCALE = 2m = 100 体素`、
+/// 贴图边长 `GPU_TEX_SIZE = 128`（MT8-4）⇒ 128/100 = **1.28 texel/体素**：一个体素面只落 1 个采样点，
+/// 贴图分辨率与体素格**同量级** ⇒ 亚体素的贴图细节被有意丢弃（这就是"甲"的定义，不是精度损失）。
+///
+/// **坐标系前提（必须写明）**：量化在**世界空间**做，所以"世界整数 = 体素边界"只在该 volume 的变换为
+/// identity 时成立 —— 这恰好是自洽的选择：triplanar 的 UV 本来就是世界坐标，量化格因而与世界 UV 格
+/// 对齐。带 `VolumeTransform`（旋转/缩放/偏移）的物体上，量化格对齐的是**世界格**、不是物体格
+/// （面内仍是平色，只是色块边界与物体自己的体素台阶错开）。当前 demo / castle 场景全是 identity
+/// （`Volumes::add_object` 在应用里没有调用点）⇒ 无实际影响。
+///
+/// **法线轴分量**：三个轴一起 `floor + 0.5`。UV 只用两个切向轴（见 `triplanar_sample`），
+/// 被丢掉的那个分量量化与否都不进 UV ⇒ 与"只量化两个切向轴"逐位等价（任务口径里的"法线轴不用管"）。
+///
+/// **平凡变体逐位不变（取证）**：本函数的两个调用点（`triplanar_sample` / `pbr_mip_lod`）都只在
+/// `fetch_material_asset` 的"有贴图"分支里（`fused != MATERIAL_SLOT_NONE`）被调用；
+/// 平凡变体在 `fetch_material` 里走**参数内联**那条 `return`，从不触碰贴图路径 ⇒ 它的 `MaterialParams`
+/// 与本次改动前逐位相同（`material_ior` 同样不采样贴图）。
+fn material_sample_pos(p_world: vec3<f32>) -> vec3<f32> {
+  // 编译期常量 ⇒ `MATERIAL_FLAT_SHADING = 0` 时 select 折成恒取 `p_world`（零开销，退回逐像素）。
+  return select(p_world, floor(p_world) + vec3<f32>(0.5), MATERIAL_FLAT_SHADING != 0u);
+}
+
 /// 解析式 LOD（MT2-4 建立、MT3-1 抽成公共函数 —— **只有这一份**）。
 /// compute pass 里**没有隐式 LOD**（`textureSample` 的导数版本只存在于 fragment stage）
 /// ⇒ 只能用 `textureSampleLevel` + 自算 LOD。取"本像素在命中面处覆盖的贴图 texel 数"的 log2：
 ///   `dist(体素) × px_ang(rad) = 世界尺度(体素) → /50 = 米 → /WORLD_SCALE = 贴图数 → ×texel 边长 = texel 数`
 /// 这是 triplanar 的标准解析 LOD 近似（与硬件在 fragment 里用屏幕导数算的同一量）。
 /// **不给 0.0**（那样永远只采 mip0 ⇒ 远处必闪摩尔纹，正是 MT2-3 要消灭的现象）。
+///
+/// **MT8-1 起 `p_world` 先经 `material_sample_pos`**：这样同一体素面内的 LOD 也**恒定** ⇒
+/// "逐面平色"是精确的而不是近似的（否则 mip 混合权重会随像素在面内微动，"平色"退化成"几乎平色"）。
+/// 量化只把距离挪 ≤ 0.87 体素（体素中心 ↔ 面上命中点的最大距离），远小于 LOD 随距离的变化尺度
+/// （`dLOD/ddist = 1/(dist·ln2)`）⇒ 对远处的 mip 选择没有可观察影响。
+///
+/// ---- **R12 核对（MT8-4，必读）：公式够不够抹平远处体素差异** ----
+/// 量化到体素格后，远处"1 体素 < 1 像素"时相邻像素落到不同体素中心 ⇒ 若贴图还带亚体素细节就会
+/// **逐帧色块闪烁**。本公式挡得住，量级论证（`GPU_TEX_SIZE = 128`、100 体素/张贴图 ⇒ 1.28 texel/体素）：
+///   · 令 `texels` = 像素足迹的 texel 数，本函数取 `LOD = log2(texels)` ⇒ `2^LOD = texels`，
+///     即 **mip 纹素的世界边长恰好 = 该像素的世界足迹**（教科书 LOD 的定义）；
+///   · "体素投影 < 1 像素" ⇔ 足迹 > 1 体素 ⇔ `texels > 1.28` ⇔ **`LOD > log2(1.28) = 0.36`**
+///     ⇒ 此刻 mip 纹素已 **≥ 1 体素**（`1.28 > 1` 正是这件事的意义：mip0 的纹素已 ≈ 0.78 体素，
+///     mip1 的 2×2 盒 = 1.56 体素 > 1 体素）⇒ 相邻两个体素中心的采样落进同一个/相邻的 mip 纹素，
+///     二者之差是"以体素为单位的盒式平均"之后的量 ⇒ **体素间的亚体素差异被抹掉**；
+///   · 更远处的残余差异 ≤ `1 体素 / 足迹` × mip 级对比度（足迹 2 体素时 ~50%、16 体素时 ~6%），
+///     单调衰减 + Linear mipmap 平滑 ⇒ 不会出现逐帧跳变的摩尔纹；剩下的"体素级色块抖动"就是"甲"
+///     本身的分辨率（1 体素 < 1 像素时图像本来就是欠采样的），不是贴图混叠。
+///   ⇒ **公式不用改**（MT2-4 建立、MT3 抽成唯一一份），MT8-4 只把贴图 1024 → 128：
+///     `texels` 里的 `textureDimensions()` 自动跟随尺寸 ⇒ LOD 整体降 3（log2 8）。这不是"变糊了"，
+///     而是"贴图不再 8× 过采样"（一个体素面本来就只取 1 个采样点）。
+/// 已知的**既有**近似（MT2-4 就有，本次不改）：足迹只按**距离**算，没有按掠射角 `1/cosθ` 把足迹
+/// 拉长（斜面上足迹是各向异性的）⇒ 掠射面略偏锐；缓解是采样器的 `anisotropy_clamp = 8`（MT2-3）。
 fn pbr_mip_lod(p_world: vec3<f32>) -> f32 {
-  let dist_voxel = length(p_world - view_u.cam_pos_voxel.xyz);
+  // MT8-1：距离从**体素中心**量（同一个量化器 ⇒ 面内 LOD 恒定，见上面的说明）。
+  let p = material_sample_pos(p_world);
+  let dist_voxel = length(p - view_u.cam_pos_voxel.xyz);
   let footprint_m = dist_voxel / MATERIAL_VOXEL_PER_METER * max(view_u.lod.x, 1e-6);
   let texels = footprint_m / MATERIAL_TEX_WORLD_SCALE * f32(textureDimensions(pbr_albedo_rough).x);
   return max(log2(max(texels, 1.0)), 0.0);
@@ -220,15 +306,22 @@ fn triplanar_axis(slot: u32, uv: vec2<f32>, lod: f32) -> TriplanarSample {
 }
 
 /// triplanar 采样（MT3-1 / D3 = B）：按 `|n|` 三轴投影**加权混合**（不是 MT2-4 那个"只取主轴"的简化版）。
-/// `p_world` = **命中点的世界位置**（连续点，不是体素中心）：否则同一条边上每格采样点间隔 1 体素
-/// （= 10 texel），图案会退化成"逐体素色块"。
+/// `p_world` = **命中点的世界位置**（连续点）—— **MT8-1 起先经 `material_sample_pos` 量化到体素中心**
+/// 再取 UV（`MATERIAL_FLAT_SHADING = 1` 时）：
+///   · 量化后同一体素面内 UV 恒定 ⇒ 三轴取样点、混合权重（权重只由 `n` 决定，本来就逐面恒定）、
+///     LOD（见 `pbr_mip_lod`）全都逐面恒定 ⇒ **albedo/roughness/metallic 一个体素面一个平色**；
+///   · `MATERIAL_FLAT_SHADING = 0` 时退回 MT3 那条逐屏幕像素的连续采样（UV 用连续命中点，
+///     亚体素细节保留、但一个体素面上会铺 1.28 texel/体素的细节 ⇒ MT3 的观感）。
+/// 量化为什么等价于"只量化两个切向轴"、坐标系前提、平凡变体不受影响：见 `material_sample_pos`。
 /// 三轴共用同一个世界尺度 ⇒ 贴图在三个方向上的 texel 密度一致（不会出现某一轴被拉伸）。
 fn triplanar_sample(slot: u32, p_world: vec3<f32>, n: vec3<f32>, lod: f32) -> TriplanarSample {
   let w = pow(abs(n), vec3<f32>(MATERIAL_TRIPLANAR_SHARPNESS));
   let uv_scale = 1.0 / (MATERIAL_TEX_WORLD_SCALE * MATERIAL_VOXEL_PER_METER);
-  let sx = triplanar_axis(slot, p_world.zy * uv_scale, lod);
-  let sy = triplanar_axis(slot, p_world.xz * uv_scale, lod);
-  let sz = triplanar_axis(slot, p_world.xy * uv_scale, lod);
+  // MT8-1：纹素取值位置的**唯一**量化点（LOD 那边用的是同一个量化器，两面口径一致）。
+  let p = material_sample_pos(p_world);
+  let sx = triplanar_axis(slot, p.zy * uv_scale, lod);
+  let sy = triplanar_axis(slot, p.xz * uv_scale, lod);
+  let sz = triplanar_axis(slot, p.xy * uv_scale, lod);
   let inv = 1.0 / max(w.x + w.y + w.z, 1e-6);
   return TriplanarSample(
     (sx.albedo * w.x + sy.albedo * w.y + sz.albedo * w.z) * inv,
@@ -378,6 +471,39 @@ fn ggx_peak(n: vec3<f32>, h: vec3<f32>, roughness: f32) -> f32 {
 /// `pow(clamp(1 − dot(h,v), 0, 1), 5)`）或 `dot(v, n)`（镜面反射的权重）。
 fn fresnel_schlick(f0: vec3<f32>, cos_theta: f32) -> vec3<f32> {
   return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// ============================================================================
+// 视向量：**逐像素**（MT8-2 的"面中心视向量"已在本次改动中回退 —— 实测推翻，不是遗漏）
+// ============================================================================
+
+/// **逐像素视向量**：由命中点指向**该着色点自己那条射线的起点**。
+/// 四个着色点共用这**一份**实现（硬约束 3：口径不分叉），各自传自己那条射线的起点与命中点：
+/// * 主 pass（`dda_main`）：相机眼位 → `best.point`（不透明首命中时与改动前的 `-dir` 恒等）；
+/// * MT4 反射命中：反射射线的起点 `r_org` → 反射命中点（恒等于 `-rdir`）；
+/// * `trace_glass`：① 界面事件的 Fresnel/反射方向用"当前段射线起点 `org` → 界面命中点 `p_hit`"，
+///   ② 玻璃反射命中点的着色用"反射射线起点 `r_org` → 反射命中点"；
+/// * GI 二次顶点（`gi/ray.wesl`）：GI 射线起点 `org` → 命中点（恒等于 `-dir`）。
+///
+/// **历史记录 · 为什么不能再用"体素中心"（MT8-2，已实测推翻）**：
+/// MT8-2 曾把入参从"命中点"换成"命中体素中心"（`world.wesl::voxel_center_world`），动机是让同一个
+/// 体素面的 N·V / Fresnel / GGX 高光 / 反射方向**逐面恒定**，从而给 MT8-3（按可见体素面缓存并复用
+/// 反射射线）提供"逐位精确复用"的前提。**用户实测否掉了这条路**：
+///   · 掠射面的 Fresnel 整面均匀变亮 ⇒ 画面里**几乎所有物体的轮廓**都出现亮白/淡蓝边（"白边"）；
+///   · 反射方向 `reflect(-v, n)` 逐面恒定 ⇒ 一个面只剩一个反射值 ⇒ **镜面图像在原理上不可能出现**
+///     （镜面恰恰需要逐像素变化；用户实测：光滑度拉到 100（roughness→0）也看不到镜面）。
+/// MT8-3 本身也被实测判为负优化并整体删除 ⇒ 那个"逐面恒定"的前提不再有任何消费者。
+///
+/// ⚠️ **别改回"用中心点代替命中点"**：命中点的法线轴分量正好落在整数面平面上，`floor(命中点)`
+/// 会因浮点误差取到相邻（空气）体素 ⇒ 同一面内逐像素翻转。这条曾经是"必须用体素中心"的理由，
+/// 现在反过来是"**必须用命中点**"的理由：逐像素视向量才是物理上该有的量（掠射角下命中点与
+/// 体素中心可以差半个体素）。
+///
+/// 退化兜底：起点与命中点重合（相机恰好落在命中点上、GI 起点与命中点重合）时用 `max(length, 1e-5)`
+/// 避免 NaN 扩散到整幅画面（与 `brdf_reflected` 里 `h` 的归一化同一手法）。
+fn view_dir_to(ray_origin: vec3<f32>, hit_point: vec3<f32>) -> vec3<f32> {
+  let d = ray_origin - hit_point;
+  return d / max(length(d), 1e-5);
 }
 
 /// 单点着色的光源项（主 pass 与 GI 二次顶点**同一套字段** —— 口径不分叉的前提）。

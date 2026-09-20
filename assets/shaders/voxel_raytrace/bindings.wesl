@@ -68,7 +68,12 @@ struct MaterialAsset {
   transmission_slot: u32,  // transmission 贴图层号（可选）；NONE ⇒ 只用标量透射率
   height_slot: u32,        // 高度（位移）贴图层号 —— **仅 CPU 侧读**（MT6 的 CSG 位移），shader 不读
   albedo_rough: u32,       // 标量回退：color.rgb(sRGB) | roughness<<24（布局同平凡变体 word0）
-  emissive_metal: u32,     // 标量回退：emissive | metallic<<8 | specular<<16 | 保留<<24
+  // 标量回退：emissive | metallic<<8 | specular<<16 | **displacement_amplitude<<24**。
+  // 最高字节（bits 24..31 = D1 预留的"保留"字节）自 MT8-5 起有语义 = 位移幅度（**体素**，0 = 不位移）。
+  // ⚠️ **CPU 侧专用**：位移发生在体素化那一刻（`gate-app` 解码高度图 → 普通 CPU 高度场 + 闭包 →
+  // `gate_voxel`），产物就是普通体素 ⇒ **shader 不读这个字节**（本文件下面只解低三字节；
+  // 权威注释与读写助手在 `wire.rs::MaterialAsset::displacement_amplitude`）。
+  emissive_metal: u32,
   transmission_ior: u32,   // transmission | ior_x100<<16（IOR 是资产级物理基值，同时服务折射与 F0）
 };
 // 全局资产表：**所有 volume 共用一张**（不是 per-volume）—— palette 的 PBR 变体里 `asset: u16`
@@ -86,6 +91,10 @@ struct MaterialAsset {
 // anisotropy_clamp ≤ 8（设备不支持 `SAMPLER_ANISOTROPY` 时退化 1）/ lod_max_clamp = mip 链底层。
 // 改那边的状态必须同改这里（占位与真身共用同一个 sampler 实例，见 `upload.rs::init_empty_gpu`）。
 @group(1) @binding(9) var pbr_samp: sampler;
+
+// **BG1 的 binding 号到此为止（0..9）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，
+// 已按实测整体删除（负优化：用户判定"删除后画面不变、反而更快"）—— 见 `main.wesl` 文件头的
+// MT4 注释块。**别再往 10 起加东西**以为这里是预留空位：那两块 buffer 与 `ReflEntry` 都已不存在。
 
 // --- BG2：GridDesc 数组（144B/entry，与 Rust GridDesc 字节一致）---
 struct GridDesc {

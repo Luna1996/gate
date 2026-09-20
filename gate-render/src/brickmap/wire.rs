@@ -136,8 +136,16 @@ pub struct MaterialAsset {
   pub height_slot: u32,
   /// 标量回退值：`color.rgb(sRGB) | roughness<<24`，布局同平凡变体 word0 ⇒ 无贴图时逐位等价于平凡材质
   pub albedo_rough: u32,
-  /// 标量回退值：`emissive | metallic<<8 | specular<<16 | 保留<<24`（specular 语义同 glTF
-  /// `KHR_materials_specular`，只调制电介质 F0；无 specular 贴图时它就是槽级覆盖之外的资产基值）
+  /// 标量回退值：`emissive | metallic<<8 | specular<<16 | displacement_amplitude<<24`（specular 语义同 glTF
+  /// `KHR_materials_specular`，只调制电介质 F0；无 specular 贴图时它就是槽级覆盖之外的资产基值）。
+  ///
+  /// ⚠️ **bits 24..31（D1 里预留的"保留"字节）自 MT8-5 起有语义 = 位移幅度**（单位 **体素**，
+  /// 0 = 不位移，8 = **峰-峰** 8 体素 ⇒ 偏置 0.5 下上下各 ±4；语义表见 `docs/PLAN.md` §3 D2 与
+  /// `gate-app/src/height_field.rs::HeightField::displace_fn`）。读写走
+  /// [`Self::displacement_amplitude`] / [`Self::with_displacement_amplitude`]，**不要手写移位**。
+  /// **只被 CPU 读**：位移发生在体素化那一刻（`gate-app` 把高度图解码成普通 CPU 高度场 +
+  /// 闭包交给 `gate_voxel`，硬约束 8），产物就是普通体素 ⇒ **shader 不读本字节**
+  /// （`common.wesl` 只解 emissive/metallic/specular 三个低字节）。
   pub emissive_metal: u32,
   /// `transmission | ior_x100<<16`：透射率 + IOR ×100（u16 ⇒ IOR 0..655.35，玻璃 1.5 → 150）。
   /// IOR 是**资产级的物理基值**，同时服务玻璃折射与电介质 F0 = ((IOR−1)/(IOR+1))²
@@ -146,6 +154,39 @@ pub struct MaterialAsset {
 }
 
 const _: () = assert!(std::mem::size_of::<MaterialAsset>() == 32);
+
+/// [`MaterialAsset::emissive_metal`] 里**位移幅度**字节的位偏移（MT8-5）—— 就是 D1 预留的
+/// "保留"字节（bits 24..31），**布局一个字都没动**（本条与下面那条编译期断言就是取证）。
+pub const MATERIAL_DISPLACE_AMPLITUDE_SHIFT: u32 = 24;
+/// 位移幅度字节的掩码（8 bit ⇒ 0..=255 **体素**；0 = 不位移）。
+pub const MATERIAL_DISPLACE_AMPLITUDE_MASK: u32 = 0xFF;
+
+// 位域自检（编译期）：位移幅度必须是 `emissive_metal` 的**最高一个字节**（24..31），
+// 且不越出 32B 条目的字段边界 —— 改布局时这里先炸，不会静默串到别的字段上。
+const _: () = assert!(MATERIAL_DISPLACE_AMPLITUDE_SHIFT + 8 == 32);
+const _: () =
+  assert!(MATERIAL_DISPLACE_AMPLITUDE_MASK << MATERIAL_DISPLACE_AMPLITUDE_SHIFT == 0xFF00_0000);
+
+impl MaterialAsset {
+  /// 该材质的**位移幅度**（**体素**，峰-峰；`0` = 不位移）—— MT8-5 的读出侧。
+  ///
+  /// 语义："材质自带高度图 ⇒ CSG 表面按材质自动出凹凸"（决策 B = 甲，`docs/PLAN.md` §4b MT8-5）：
+  /// 体素化之前读这一个字节决定"要不要位移 / 位移多少"（8 ⇒ 偏置 0.5 下上下各 ±4）。
+  /// 消费方见 `gate-app/src/height_field.rs::MaterialDisplace`。
+  pub fn displacement_amplitude(&self) -> u8 {
+    ((self.emissive_metal >> MATERIAL_DISPLACE_AMPLITUDE_SHIFT) & MATERIAL_DISPLACE_AMPLITUDE_MASK)
+      as u8
+  }
+
+  /// 链式设置位移幅度（只动那一个字节，其余 31B 逐位保留）。
+  /// 与 [`Self::displacement_amplitude`] 严格互逆：`a.with_displacement_amplitude(n).displacement_amplitude() == n`。
+  pub fn with_displacement_amplitude(mut self, amplitude: u8) -> Self {
+    self.emissive_metal = (self.emissive_metal
+      & !(MATERIAL_DISPLACE_AMPLITUDE_MASK << MATERIAL_DISPLACE_AMPLITUDE_SHIFT))
+      | ((amplitude as u32) << MATERIAL_DISPLACE_AMPLITUDE_SHIFT);
+    self
+  }
+}
 
 // 字段名与整体布局须与 shaders/voxel_raytrace/ 的 Globals struct 字节兼容；
 // index_origin/dims 与 tile_count 均为 chunk 语义（×256 voxel）。
@@ -336,6 +377,24 @@ pub struct BrickMapBuffers {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// MT8-5 的位域取证：位移幅度 = `emissive_metal` 的 bits 24..31（D1 预留的"保留"字节），
+  /// 读写助手严格互逆、**不动其余 31B**，且 `MaterialAsset` 仍是 32B（布局未变）。
+  #[test]
+  fn displacement_amplitude_lives_in_the_reserved_byte() {
+    assert_eq!(std::mem::size_of::<MaterialAsset>(), 32, "MT8-5 不改 32B 布局");
+    // 默认资产（未设幅度）= 0；把它放在 D1 的位置上（`emissive | metallic<<8 | specular<<16`）
+    let a = MaterialAsset { emissive_metal: 0x11 | 0x22 << 8 | 0x33 << 16, ..Default::default() };
+    assert_eq!(a.displacement_amplitude(), 0);
+    // 8 体素落进最高字节、低三字节逐位不变（可换算的字面量：0x08332211）
+    let b = a.with_displacement_amplitude(8);
+    assert_eq!(b.emissive_metal, 0x0833_2211);
+    assert_eq!(b.displacement_amplitude(), 8);
+    // 覆盖已有值（只改那一个字节）
+    assert_eq!(b.with_displacement_amplitude(4).emissive_metal, 0x0433_2211);
+    // 上界 255 不越界到别的字段（条目的字节数不变）
+    assert_eq!(b.with_displacement_amplitude(255).displacement_amplitude(), 255);
+  }
 
   /// 平凡变体的**逐位向后兼容**取证：三个字面量取自 `docs/PLAN.md §8`（MT1 的回归表），
   /// 它们是在 MT1 改动**之后**实测到的值 —— 本测试把"打包逐位不变"钉死在回归测试里。
