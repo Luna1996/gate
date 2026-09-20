@@ -6,6 +6,8 @@
 # - **键必须带引号**：TOML 里裸点号会被解释成嵌套表，与扁平 key 语义不同
 # - 占位符 %{name} 原样替换；定长对齐的数字由调用点先 format! 好再传入
 # - 只收可见 UI 文案；日志、技术标识符（LOD / DDA）、单位（v/s、vx）、材质预设名保持英文
+# - `*.tip` 的值是 Markdown（经 gate-ui tooltip 渲染）：多行 / 列表 / 引用用 """…""" 写，
+#   续行顶格（缩进 4 空格会被当成代码块）；行内 `code` 标标识符与数字，**粗体** 标关键结论
 # - DebugMenu 的文案 key 在本表 menu.* 段：菜单树（assets/ui/debug_menu.toml）存 key，
 #   由 gate-ui 的 UiTranslator 解析，切语言后整棵树重解析（gate-app 的 sync_ui_locale）
 # - 改本文件需**重新编译**（proc macro 编译期内联）；gate-app/build.rs 已登记 rerun-if-changed
@@ -14,11 +16,18 @@ _version = 1
 # ---------------- DebugMenu（左上角调试菜单）----------------
 "menu.video" = "视频"
 "menu.video.half_res" = "半分辨率"
-"menu.video.half_res.tip" = "3D 场景按 1/2 分辨率渲染再放大到窗口：省约 3/4 的主射线，代价是边缘变软（配合抗锯齿更明显）。"
+"menu.video.half_res.tip" = """
+**3D 场景**按 `1/2` 分辨率渲染再放大到窗口。
+
+- 省约 `3/4` 的主射线
+- 代价：边缘变软（配合抗锯齿更明显）"""
 "menu.video.fullscreen" = "全屏"
 "menu.video.vsync" = "垂直同步"
 "menu.video.aa" = "抗锯齿"
-"menu.video.aa.tip" = "FXAA：单 pass 边缘抗锯齿（约 9~13 次采样）。抹平台阶/锯齿，但治不了运动中的亚像素闪烁。"
+"menu.video.aa.tip" = """
+**FXAA**：单 pass 边缘抗锯齿（约 `9~13` 次采样）。
+
+抹平台阶/锯齿，但治不了运动中的**亚像素闪烁**。"""
 "menu.video.fps" = "FPS"
 "menu.render" = "渲染"
 "menu.render.gi" = "ReSTIR GI"
@@ -27,25 +36,41 @@ _version = 1
 "menu.render.gi.res.full" = "1/1"
 "menu.render.gi.res.half" = "1/2"
 "menu.render.gi.res.quarter" = "1/4"
-"menu.render.gi.res.tip" = "GI 网格边长 = 渲染分辨率 ÷ 档位（每一档都跑 GI，不是开关）。代价按 GI 像素数计：1/2 ≈ 全分辨率的 1/4，1/4 再降 4 倍。GI 是低频信号，档位对画质影响很小（几何边界由几何感知上采样兜住）。"
+"menu.render.gi.res.tip" = """
+GI 网格边长 = 渲染分辨率 ÷ 档位（每一档都跑 GI，不是开关）。
+
+代价按 GI 像素数计：
+
+- `1/2` ≈ 全分辨率的 `1/4`
+- `1/4` 再降 4 倍
+
+GI 是低频信号，档位对画质影响很小（几何边界由几何感知上采样兜住）。"""
 "menu.render.gi.denoise" = "降噪质量"
 "menu.render.gi.denoise.off" = "关"
 "menu.render.gi.denoise.low" = "低"
 "menu.render.gi.denoise.mid" = "中"
 "menu.render.gi.denoise.high" = "高"
-"menu.render.gi.denoise.tip" = "降噪链按成本分档，与 GI 分辨率档正交（对所有分辨率档一视同仁）。关 = 一条降噪 pass 都不跑，直接看原始 GI + 几何感知上采样（量原始噪声与上限帧率用）；低（默认）= 时域累积 + 5 轮 3×3（8 tap）atrous；中 = atrous 换 5×5（24 tap）；高 = 再把每像素候选数翻倍（GI 射线翻倍，全链最贵的一项）+ 记忆窗 20→32 帧。本链 = 时域累积（方差驱动权重 + 累积矩 + AABB 钳制）+ 5 轮迭代 atrous，属 SVGF 家族（NRD 的 Pre-Blur 角色由时域内的共面邻域 mean ± K·σ 离群钳制承担）。"
+"menu.render.gi.denoise.tip" = """
+降噪链按成本分档，与 GI 分辨率档正交（对所有分辨率档一视同仁）。
+
+- **关**：一条降噪 pass 都不跑，直接看原始 GI + 几何感知上采样（量原始噪声与上限帧率用）
+- **低**（默认）：时域累积 + 5 轮 `3×3`（`8 tap`）atrous
+- **中**：atrous 换 `5×5`（`24 tap`）
+- **高**：每像素候选数翻倍（GI 射线翻倍，全链最贵的一项）+ 记忆窗 `20→32` 帧
+
+> 本链 = 时域累积（方差驱动权重 + 累积矩 + AABB 钳制）+ 5 轮迭代 atrous，属 **SVGF** 家族（NRD 的 Pre-Blur 角色由时域内的共面邻域 `mean ± K·σ` 离群钳制承担）。"""
 "menu.render.exposure" = "曝光"
 "menu.render.exposure.enabled" = "开启"
 "menu.render.exposure.ev_up" = "提亮上限"
-"menu.render.exposure.ev_up.tip" = "适应暗处的最大增益 = 2^EV（档）"
+"menu.render.exposure.ev_up.tip" = "适应暗处的最大增益 = `2^EV`（档）"
 "menu.render.exposure.ev_dn" = "压暗上限"
-"menu.render.exposure.ev_dn.tip" = "适应亮处的最大衰减 = 2^EV（档）"
+"menu.render.exposure.ev_dn.tip" = "适应亮处的最大衰减 = `2^EV`（档）"
 "menu.render.exposure.tau_up" = "变亮时间"
-"menu.render.exposure.tau_up.tip" = "往亮处适应的速度（秒）：太小像闪光"
+"menu.render.exposure.tau_up.tip" = "往亮处适应的速度（秒）：太小像**闪光**"
 "menu.render.exposure.tau_dn" = "变暗时间"
-"menu.render.exposure.tau_dn.tip" = "往暗处适应的速度（秒）：太小像眨眼"
+"menu.render.exposure.tau_dn.tip" = "往暗处适应的速度（秒）：太小像**眨眼**"
 "menu.render.exposure.key" = "目标中灰"
-"menu.render.exposure.key.tip" = "百分位平均亮度被压到的目标值"
+"menu.render.exposure.key.tip" = "百分位平均亮度被压到的**目标值**"
 "menu.player" = "玩家"
 "menu.player.camera" = "相机"
 "menu.player.camera.pos" = "相机位置"

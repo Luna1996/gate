@@ -9,6 +9,7 @@ pub mod dropdown;
 pub mod grid;
 pub mod label;
 pub mod list;
+pub mod markdown;
 pub mod panel;
 pub mod plot;
 pub mod scroll_view;
@@ -37,6 +38,9 @@ pub use label::{
   label_ellipsis_system, middle_ellipsis,
 };
 pub use list::{ListConfig, ListHandle, RingList, list, ring_list_sync_system};
+pub use markdown::{
+  MarkdownConfig, MarkdownHandle, MarkdownView, markdown, markdown_set_text,
+};
 pub use panel::{PanelConfig, PanelHandle, PanelSurface, panel};
 pub use plot::{
   PlotCanvas, PlotConfig, PlotData, PlotDomain, PlotExtents, PlotHandle, PlotLayout, PlotYAxis,

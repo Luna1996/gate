@@ -12,3 +12,5 @@ ron = { workspace = true }
 font-awesome = "0.2"
 # 菜单层级/控件状态的持久化格式（版本与 bevy 传递依赖一致，避免双份编译）
 toml = "0.8"
+# Markdown 解析（CommonMark/GFM AST，零拷贝借源串）。default features 会拖入 clap + syntect-onig（C 依赖），必须关掉
+comrak = { version = "0.55", default-features = false }

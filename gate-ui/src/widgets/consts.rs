@@ -46,6 +46,12 @@ pub const TOOLTIP_OFFSET_X: f32 = 14.0;
 pub const TOOLTIP_OFFSET_Y: f32 = 18.0;
 /// 提示框与屏幕边缘的最小留白（px）
 pub const TOOLTIP_MARGIN: f32 = 8.0;
+/// markdown marker 槽宽系数（等宽字体单字符前进宽 ≈ 0.6 em）
+pub const MD_MONO_ADVANCE_EM: f32 = 0.6;
+/// markdown 引用块左侧竖条宽（px）
+pub const MD_QUOTE_BAR_W: f32 = 2.0;
+/// markdown 分割线高度（px）
+pub const MD_RULE_H: f32 = 1.0;
 
 /// 滑块内缩 = 半径（轨道行程与命中范围按它对齐）
 pub const THUMB_INSET: f32 = THUMB_SIZE / 2.0;
