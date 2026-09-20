@@ -225,6 +225,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let idx = u32(coord.y) * size.x + u32(coord.x);
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+  // 二次顶点太阳反弹（菜单「渲染/RESTIR GI/太阳反弹」）：0 = 连 NEE 阴影射线都不发。
+  let sun_bounce = gi_u.params.x;
 
   if (!(h.hit && palette_transmission(h.palette_base, h.pal) <= 0.0)) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
@@ -319,7 +321,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   var r = gi_res_none();
   for (var k = 0u; k < cand_n; k = k + 1u) {
     let dir = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + k * 0x9E3779B9u + 1u)));
-    let s = gi_ray_radiance(org, dir, sun_dir, sun_c);
+    let s = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce);
     let w = s.l * GI_PI;
     let lum = max(dot(w, GI_LUMA), 0.0);
     r.w_sum = r.w_sum + w;

@@ -101,7 +101,9 @@ struct LightPool {
 // ===== GI（屏幕空间逐面 ReSTIR）=====
 // uniform 与 Rust `GiUniform` 逐字段镜像（字节一致）。
 struct GiUniform {
-  // x = 保留（恒 0）、y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
+  // x = **二次顶点太阳反弹**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/太阳反弹」：
+  // 关掉则二次顶点不做太阳 NEE，`sun_transmittance` 那条阴影射线整条不发）、
+  // y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
   params: vec4<f32>,
   // x = GI 开关、yzw = 保留（恒 0）
   misc: vec4<f32>,

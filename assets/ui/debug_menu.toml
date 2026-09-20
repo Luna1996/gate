@@ -82,6 +82,13 @@ options = [
 selected = 1
 tooltip = "menu.render.gi.denoise.tip"
 
+[[items.children.children]]
+kind = "toggle"
+id = "sun_bounce"
+label = "menu.render.gi.sun_bounce"
+checked = false
+tooltip = "menu.render.gi.sun_bounce.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "exposure"

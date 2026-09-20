@@ -22,7 +22,8 @@ use crate::wesl_consts::gi_consts;
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, ShaderType)]
 pub struct GiUniform {
-  /// x = 保留（恒 0）、y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
+  /// x = **二次顶点太阳反弹**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/太阳反弹」）、
+  /// y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
   pub params: Vec4,
   /// x = GI 开关（0/1）、yzw = 保留（恒 0）
   pub misc: Vec4,
@@ -75,6 +76,19 @@ pub struct GiSettings {
   /// AABB 钳制）+ 5 轮迭代 atrous；**没有**独立的前滤 pass（等价物是时域内的共面邻域 mean ± K·σ
   /// 离群钳制）与 fast-history/history-fix。
   pub denoise: u32,
+  /// **二次顶点的太阳反弹**（菜单「渲染/RESTIR GI/太阳反弹」）：**默认关**。
+  /// GI 射线命中点（二次顶点）是否做一次太阳 NEE —— 朝太阳发一条阴影射线，把「被阳光照亮的
+  /// 表面」这一路能量算进间接光。
+  ///
+  /// 关掉 ⇒ 二次顶点只剩天光项（`albedo · 天光 · AO / π`），**整条阴影射线都不发**。
+  /// 实测 2K + 1/4 档：`gate_gi` 27.1 → 16.1ms（占该 pass 的 41%），全帧 31.6 → 20.4ms。
+  /// 代价是阴影区/背光面失去「阳光经一次弹射照进来」的贡献 ⇒ 变暗变平；这是**能量层面的取舍**
+  /// （不是采样层面的噪声取舍），降噪救不回来。静态场景实测画面差异很小。
+  ///
+  /// 为什么用"砍掉"而不是"缓存/查表"：那 11ms 里 90% 花在「>32 voxel 的长程遍历」上
+  /// （短程只值 1.1ms），而太阳方向在昼夜循环下每帧变化 ⇒ 世界空间的太阳可见性缓存不成立
+  /// （流式大世界更不成立）。
+  pub sun_bounce: bool,
 }
 
 /// 「降噪质量」档的派发计划（`(是否跑降噪, atrous 轮数, atrous 核半径)`）。
@@ -131,7 +145,8 @@ impl Default for GiSettings {
   fn default() -> Self {
     // 默认 1/4 档 + 「低」降噪档：与实测最划算的组合一致（时域 + 3×3 的 5 轮 atrous），
     // 想要更干净就往「中/高」拨，想量原始噪声与上限帧率就拨到「关」。
-    Self { enabled: true, gi_div: 4, denoise: 1 }
+    // 太阳反弹默认关：实测画面差异细微（静态场景几乎看不出），代价却是 `gate_gi` 的 41%。
+    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false }
   }
 }
 
@@ -519,6 +534,7 @@ fn extract_gi_settings(
     enabled: s.enabled,
     gi_div: s.div(),
     denoise: s.tier(),
+    sun_bounce: s.sun_bounce,
   }));
 }
 
@@ -558,7 +574,12 @@ fn prepare_gi(
 
   // ---- uniform（字段与 WESL `GiUniform` 逐字段镜像）----
   let mut u = GiUniform::default();
-  u.params = Vec4::new(0.0, 0.0, crate::consts::GI_GAIN, 0.0);
+  u.params = Vec4::new(
+    if settings.sun_bounce { 1.0 } else { 0.0 },
+    0.0,
+    crate::consts::GI_GAIN,
+    0.0,
+  );
   u.misc = Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
   u.flags = Vec4::new(
     0.0,

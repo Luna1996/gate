@@ -9,10 +9,6 @@ const GI_T_MAX: f32 = 8192.0;
 /// GI 射线没打到几何时注入的天空辐亮度系数（`gi_ray_radiance` 的 miss 分支）；
 /// 1.0 = `sky_rgb()` 原样注入。这是 GI 的主要能量来源（天空经一次弹射照进阴影区）。
 const GI_SKY_RADIANCE_SCALE: f32 = 1.0;
-/// 二次顶点命中面的**直射太阳**项增益（`gi_ray_radiance`：`alb · sun_c · ndl · sun · 本值 / π`）。
-/// GI 的两条能量来源之一（另一条是天光）；没有它，任何看不到天空的表面（草丛根部、过道内墙）
-/// 都只能自洽地维持全黑。
-const GI_SUN_BOUNCE: f32 = 1.0;
 /// 命中自发光体素时的辐亮度增益（albedo · emissive · 本值）；1.0 = 不额外放大。
 const GI_EMIT_GAIN: f32 = 1.0;
 const GI_PI: f32 = 3.14159265;

@@ -239,21 +239,26 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
     let k0 = gi_key0(best.voxel);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
-    // 着色法线（`voxel_normal` 的隐式梯度，要探 6 个邻域体素）—— **不要算两次**：
-    // gi_div = 1 时 GI pass 的射线与本像素**逐位相同**（同一套矩阵 / 同一套 beam t_min），
-    // 导引里那格就是本像素的同一条命中 ⇒ 直接读它存下来的法线；gi_div > 1 时导引那格是
-    // **另一条射线**（更粗的网格，射向格中心）⇒ 它的法线不能拿来给本像素着色，只能自己算。
-    var n = voxel_normal(gg, best.voxel, best.n);
+    // 着色法线（`voxel_normal`，要探 6 个邻域体素）：**先试导引复用，键相等就用它、不再自己算**。
+    // 复用合法性由键给出：键逐位编码了精确体素 + 面号 + 物体，而 `voxel_normal` 是
+    // `(命中体素, 可见面)` 的纯函数 ⇒ 键逐位相等 ⇒ 法线必然逐位相等。
+    // 只在 gi_div = 1 时尝试：此时 GI 射线与本像素**逐位相同**，导引那格必然命中同一体素面，
+    // 于是这里的复用替代掉整条法线。gi_div > 1 时导引那格来自另一条射线（更粗的网格、射向格中心），
+    // 它命中的**体素**在多数像素上都与本像素不同（1/4 档实测复用率 ≈ 0，主 pass 时间无变化）
+    // ⇒ 不做尝试，连那次必然失败的键读取都省掉。
+    var n = best.n;
+    var n_reused = false;
     if (u32(gi_u.flags.y) == 1u) {
       let gi_size = vec2<u32>(textureDimensions(gi_tex));
       if (gid.x < gi_size.x && gid.y < gi_size.y) {
         let gb = (gid.y * gi_size.x + gid.x) * GI_DEN_GUIDE_WORDS;
-        // 键逐位相等才敢用（证明导引那格确实是本像素的同一条命中，而不是同一像素的另一条射线）。
         if (gi_guide_out[gb + GI_DEN_G_KEY0] == k0 && gi_guide_out[gb + GI_DEN_G_KEY1] == k1) {
           n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
+          n_reused = true;
         }
       }
     }
+    if (!n_reused) { n = voxel_normal(gg, best.voxel, best.n); }
     // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS，使起点离开命中体素。
     let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
     let ndl = max(dot(n, sun_dir), 0.0);

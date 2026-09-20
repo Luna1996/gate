@@ -309,6 +309,10 @@ fn register_callbacks(world: &mut World) {
             name, cand, k, r
           );
         }
+        ("render/gi/sun_bounce", MenuAction::Toggle(on)) => {
+          gi.sun_bounce = *on;
+          info!("GI 二次顶点太阳反弹 → {}", if *on { "on" } else { "off" });
+        }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;
           info!(target: "gate", "自动曝光 → {}", if *on { "on" } else { "off" });

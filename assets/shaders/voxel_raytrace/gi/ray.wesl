@@ -1,7 +1,7 @@
 import package::bindings::{light_u};
 import package::common::{palette_albedo, palette_emissive, palette_transmission, sky_rgb};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
-import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_SUN_BOUNCE, GI_T_MAX, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast, world_trace_medium, voxel_normal};
@@ -10,6 +10,7 @@ import package::world::{world_cfg_full, world_raycast, world_trace_medium, voxel
 // 单条 GI 射线的辐射求值（**唯一口径**：新鲜候选、借用候选、时域/空间复用全部走这里）。
 //
 // 一次求值 = 1 条真实光路（`world_raycast`）＋ 命中时最多 1 条太阳 NEE 阴影射线。
+// `sun_bounce = 0`（菜单「渲染/RESTIR GI/太阳反弹」关）时连那条阴影射线都不发，二次顶点只剩天光项。
 //
 // **辐亮度只算一次弹射**：命中面按「直射太阳 + 天光 × AO」着色后除以 π 得到它的出射辐亮度，
 // 没有更深的弹射。多重弹射曾经靠世界空间缓存的回读实现（`gi_cache_peek`），那条路是个
@@ -57,7 +58,8 @@ struct GiRaySample {
 
 /// 一条 GI 射线的入射辐亮度：真实光路 + 二次顶点「太阳 NEE + 天光 × AO」，逃逸取天光。
 /// 不含 cos 因子与 π —— RIS 的权重是 `p̂ / p`，系数在调用方给（余弦候选给 π）。
-fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> GiRaySample {
+fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
+                    sun_bounce: f32) -> GiRaySample {
   let sh = world_raycast(make_grid(0u), org, dir, GI_T_MAX, world_cfg_full(0.0, 3u));
   // 逃逸 → 天光辐亮度。
   var l = sky_rgb() * GI_SKY_RADIANCE_SCALE;
@@ -67,13 +69,14 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
     let hn = voxel_normal(make_grid(u32(sh.obj_id) + 1u), sh.voxel, sh.n);
     let ndl = max(dot(hn, sun_dir), 0.0);
     var sun = 0.0;
-    if (ndl > 0.0) {
+    // `sun_bounce` 来自 uniform（一次派发内恒定 ⇒ 分支不发散）：关掉时整条阴影射线都不发。
+    if (sun_bounce > 0.0 && ndl > 0.0) {
       let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
       sun = sun_transmittance(hit_p + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
     }
     // 二次顶点的天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
     let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hit_p, sh.obj_id);
-    l = alb * (sun_c * ndl * sun * GI_SUN_BOUNCE + amb) / GI_PI
+    l = alb * (sun_c * ndl * sun * sun_bounce + amb) / GI_PI
       + alb * palette_emissive(sh.palette_base, sh.pal) * GI_EMIT_GAIN;
   }
   return GiRaySample(
