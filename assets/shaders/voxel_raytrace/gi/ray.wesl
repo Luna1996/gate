@@ -1,10 +1,10 @@
 import package::bindings::{light_u};
-import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb, view_dir_to};
+import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, face_view_dir, fetch_material, sky_rgb};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
-import package::world::{world_trace_medium, voxel_normal};
+import package::world::{voxel_center_world, voxel_normal, world_trace_medium};
 
 // ============================================================================
 // 单条 GI 射线的辐射求值（**唯一口径**：新鲜候选、借用候选、时域/空间复用全部走这里）。
@@ -104,13 +104,14 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
     //   ③ 反射项 `/π` 转辐亮度（自发光不除，见文件头）。
     // 材质取值走同一入口 `fetch_material`；`MATERIAL_DEBUG_NONE` = 调试通道**不作用于 GI**
     // （与 MT2-4 一致：那条通道只是主 pass 的调试视图）。
-    // ---- 视向量：**逐像素**（硬约束 3：与 `dda_main` 共用 `view_dir_to` 那一份实现）----
+    // ---- 视向量：**逐面**（硬约束 3：与 `dda_main` 共用 `face_view_dir` 那一份契约）----
     // `ray_origin` = **这条 GI 射线自己的起点 `org`**（不是相机眼位：二次顶点的"回到观察者"方向
-    // 就是回到上一个顶点 = 射线起点）；`hit_point` = 本次命中点 `hit_p` ⇒ 恒等于 `-dir`，逐像素。
-    // MT8-2 曾把它换成"命中体素中心"（求得"同一二次顶点同值"）—— **已实测推翻并回退**：那会让
-    // 掠射面整面变亮（白边）、反射/高光方向逐面恒定（镜面图像消失）。依赖它的 MT8-3 已整体删除。
-    let v = view_dir_to(org, hit_p);
-    // `v` 就是改动前的 `-dir`：由着色点指向观察者 = 回到上一个顶点（构造口径与主 pass 一致）。
+    // 就是回到上一个顶点 = 射线起点）；锚点 = 命中体素中心 ⇒ 同一个体素面同值。
+    // 它只喂二次顶点的反光/高光（`brdf_reflected` 的 GGX 那一支）—— `v` 在本工程没有别的消费者。
+    // 按面 ⇒ GI 里烘进去的二次顶点高光也是"一个体素面一个值"，不再是一条跨体素的连续亮带
+    // （这是 2026-09-21 用户复查"还有不是逐体素着色的部分，重点调查反光、高光"的收口之一）。
+    let v = face_view_dir(org, voxel_center_world(hg, sh.voxel));
+    // `v` 的含义与改动前一致（由着色点指向观察者 = 回到上一个顶点）；只是锚点按面量化，它不再精确等于 `-dir`。
     let m = fetch_material(sh.palette_base, sh.pal, hit_p, hn, MATERIAL_DEBUG_NONE);
     // MT5-2：二次顶点的辐亮度整体乘 `tint`（BRDF 项与自发光项都乘）—— 它就是"这个二次顶点发出的
     // 光，穿过玻璃到达本着色点"的乘性吸收；无介质时 `tint == 1.0` ⇒ 逐位等于改动前。

@@ -1,5 +1,5 @@
 import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
-import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear, view_dir_to};
+import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_key0, gi_key1, gi_mix, gi_rand2, gi_unpack_dir};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
@@ -196,20 +196,19 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     // 平凡变体没有 IOR 字段 ⇒ `material_ior` 给默认 1.5、F0 = ((1.5−1)/(1.5+1))² = 0.04
     // ⇒ 折射与 Fresnel 与改动前玻璃那两份硬编码（IOR 1.5 / F0 0.04）一致（本条验收）。
     let ior = material_ior(best.palette_base, best.pal);
-    // ---- 视向量（**这条界面事件的着色量**）：逐像素 ----
-    // `v` = "由本界面命中点指向本段射线的起点 `org`" ⇒ 就是本段入射方向的反向（`-dir`），逐像素变化。
-    // MT8-2 曾把它换成"`org` + 本界面所属体素的中心"，好让同一玻璃面的 Fresnel/反射方向**逐面恒定**
-    // —— **已被实测推翻并回退**（掠射面整面变亮 = 白边；反射方向逐面恒定 ⇒ 镜面图像不可能出现）。
-    // 那个"逐面恒定"原本的消费者 MT8-3（按体素面复用反射）也已整体删除 ⇒ 前提不再需要。
+    // ---- 视向量（**这条界面事件的着色量**）：**逐面** ----
+    // `v` = "由本界面的体素中心指向本段射线的起点 `org`" ⇒ 同一玻璃面内所有像素同值。
+    // 它喂两件事，都是反光：① 界面 Fresnel（`fres`）；② 反射方向 `reflect(-v, nn)`。
+    // 为什么按面、代价是什么：`common.wesl::face_view_dir`（本工程所有吃 `v` 的量都是反光/高光）。
     // 注意 `ci`（几何量：折射/全内反射的判据）一直用**精确方向** —— 那是光路几何、不是着色（未动）。
-    let v = view_dir_to(org, p_hit);
+    let v = face_view_dir(org, voxel_center_world(make_grid(0u), best.voxel));
     if (!in_medium) {
       // 玻璃走的是折射状态机（不是 BRDF）：Fresnel 用**物理 IOR 导出的 F0**、不加槽级 specular 调制
       // （那条调制是给不透明 BRDF 的观感旋钮；`specular = 1.0` = 不调制 = 物理基值）。
       let f0 = dielectric_f0(ior, 1.0);
       let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, nn), 0.0, 1.0), 5.0);
       if (fres > GLASS_REFL_MIN) {
-        // 反射方向由 `v` 给出（`reflect` 要的是入射方向 ⇒ 传 `-v`）⇒ 逐像素。
+        // 反射方向由 `v` 给出（`reflect` 要的是入射方向 ⇒ 传 `-v`）⇒ 逐面（一个玻璃面一条反射方向）。
         let rdir = reflect(-v, nn);
         let r_org = p_hit + nn * GLASS_EPS;
         let rhit = world_raycast(make_grid(0u), r_org, rdir,
@@ -233,10 +232,9 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
           let rgg = make_grid(u32(rhit.obj_id) + 1u);
           let rn = voxel_normal(rgg, rhit.voxel, rhit.face_id, rhit.n);
           let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
-          // 反射命中点的视向量：用它**自己那条射线**（起点 `r_org`、命中点 `rhit.point`）⇒ 逐像素
-          // （硬约束 3：四个着色点共用 `view_dir_to` 那一份实现，口径不分叉）。
-          // MT8-2 曾量化到命中体素中心（"同面恒定"）—— 已实测推翻并回退。
-          rc = brdf_reflected(mr, rn, view_dir_to(r_org, rhit.point),
+          // 反射命中点的视向量：用它**自己那条射线**（起点 `r_org` → 命中体素中心）⇒ **逐面**
+          // （硬约束 3：所有着色点共用 `face_view_dir` 同一份契约）。
+          rc = brdf_reflected(mr, rn, face_view_dir(r_org, voxel_center_world(rgg, rhit.voxel)),
                               SurfaceLight(sun_dir, sun_c, 1.0, sky * GLASS_REFL_AMBIENT, vec3<f32>(0.0)))
             + emissive_radiance(mr, GI_EMIT_GAIN);
         }
@@ -384,9 +382,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 材质参数（albedo / roughness / metallic / emissive / transmission / ior / specular）由下面那次
     // `fetch_material` 一次拿全 —— 这里不再单独取 albedo（避免出现"第二处取值口径"）。
     let gg = make_grid(u32(best.obj_id) + 1u);
-    // 命中体素的世界中心：AO 采样点 / 阴影与反射射线的起点都取它（同一个助手给出 ⇒ 不会出现
-    // "两处各自算一遍中心"的口径分叉）。
-    // ⚠️ **它不再是视向量的来源**：MT8-2 曾拿它当"面中心视向量"（已实测推翻并回退，见 `common.wesl::view_dir_to`）。
+    // 命中体素的世界中心：AO 采样点 / 阴影与反射射线的起点 / **视向量的锚点**（`face_view_dir`）
+    // 都取它（同一个助手给出 ⇒ 不会出现"两处各自算一遍中心"的口径分叉）。
     let p_voxel = voxel_center_world(gg, best.voxel);
     let k0 = gi_key0(best.voxel);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
@@ -419,11 +416,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 平凡变体（`IS_PBR = 0`）与 PBR 变体在这里产出**同一个** `MaterialParams`
     // ⇒ 下面的着色代码对两者完全一致（D1 约束 1 / MT3-7）。
     let m = fetch_material(best.palette_base, best.pal, best.point, n, PBR_DEBUG_ASSET);
-    // ---- 视向量（**四个着色点共用的唯一构造** `view_dir_to`）：逐像素 ----
-    // 主 pass 这条射线的起点 = 相机眼位 `origin_voxel`，命中点 = `best.point`
-    // ⇒ 不透明首命中时与 MT4 的 `-dir` 恒等（逐像素）。
-    // MT8-2 曾用"相机眼位 + 命中体素中心"以求得逐面恒定 —— 已实测推翻并回退（白边 + 镜面消失）。
-    let v = view_dir_to(origin_voxel, best.point);
+    // ---- 视向量（**唯一构造** `face_view_dir`）：**按体素面** ----
+    // 起点 = 相机眼位 `origin_voxel`，锚点 = 命中体素中心 `p_voxel` ⇒ 同一个体素面内所有像素同值。
+    // 为什么按面、代价是什么、历史两次实测结论：见 `common.wesl::face_view_dir`（**改这里前必读**）。
+    // 它只喂反光/高光三项（GGX 高光、`mirror`、反射权重）—— 本工程没有别的地方读 `v`。
+    let v = face_view_dir(origin_voxel, p_voxel);
     // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS，使起点离开命中体素。
     let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
     let ndl = max(dot(n, sun_dir), 0.0);
@@ -463,9 +460,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     //   ① 本处有 GI 项（`gi`）；二次顶点只算一次弹射 ⇒ `SurfaceLight.gi` 恒 0；
     //   ② 本处的天光含 `cov` 地板；二次顶点没有 GI 缓冲 ⇒ 只有 AO；
     //   ③ 本处不除 π（二次顶点要除 π 转辐亮度）—— 能量约定见 `brdf_reflected` 的文档注释。
-    // ---- 视向量（**四个着色点共用的唯一构造** `view_dir_to`）：逐像素 ----
-    // `v` = `view_dir_to(相机眼位, best.point)`：与 `gi/ray.wesl` 的二次顶点**同一个助手、同一口径**
-    // （硬约束 3）。MT8-2 的"面中心视向量"已实测推翻并回退（见 `common.wesl::view_dir_to` 的注释）。
+    // 视向量 `v`（上方已构造，**逐面**）在这里被消费：与 `gi/ray.wesl` 的二次顶点**同一个助手、
+    // 同一口径**（硬约束 3：两边都走 `face_view_dir`，不分叉）。
     col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c, sun, amb * ao, gi))
         + emissive_radiance(m, GI_EMIT_GAIN);
     // ---- MT4-1 · 环境镜面反射（**本里程碑唯一的新增射线**）----
@@ -518,10 +514,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           + gi_mix(u32(best.voxel.y) * 0x85EBCA77u
           + gi_mix(u32(best.voxel.z) * 0xC2B2AE3Du
           + gi_mix(rkey * 0x27D4EB2Fu + 0x165667B1u))));
-        // 镜面方向由**逐像素**视向量 `v` 给出（`reflect` 要入射方向 ⇒ 传 `-v`）⇒ 镜面图像逐像素变化
-        // （MT8-2 曾让这一步逐面恒定，那正是"光滑度拉满也看不到镜面"的原因 —— 已回退）。
-        // 注意：`mirror` 仍逐像素（`view_dir_to` 是 MT8-2 实测后回退的口径，**不许动**），但同一体素面
-        // 只有 1 体素宽（2cm），面内 `mirror` 的变化量远小于锥角（≈5.6°）⇒ "逐体素"由按面种子主导。
+        // 镜面方向由**逐面**视向量 `v` 给出（`reflect` 要入射方向 ⇒ 传 `-v`）⇒ 一个体素面一条方向、
+        // 一个反射值 = "反射逐体素"。它与上面那个按面种子（MT8-6）现在是**同一粒度** ⇒ 同面内逐位相同。
+        // 代价：反射是**块状镜面**（按面采样），不再是逐像素的清晰镜面 —— 本档的预期，见
+        // `common.wesl::face_view_dir` 里"已知代价"那一段与两次实测的历史。
         let mirror = reflect(-v, n);
         var rdir = refl_cone_dir(mirror, gi_rand2(rseed), PBR_REFL_CONE_K * m.roughness);
         // 抖动后的方向若掉到面下方（掠射 + 大锥角）会立刻自命中所在体素 ⇒ 退回完美镜面方向。
@@ -549,10 +545,12 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           //   · **有意写明的代价**：反射点自己的太阳直照（它可能是个被阳光照亮的镜面）在这一次反射里
           //     看不到 —— 因为不做 NEE 就拿不到它的阴影可见性，"宁可不追"比"漏一片光"好。
           let ramb = sky * GI_SKY_AMBIENT * light_field_ao(rh.point, rh.obj_id);
-          // 反射命中点的视向量：用它**自己那条射线**（起点 `r_org` → 命中点 `rh.point`）⇒ 逐像素
-          // （硬约束 3：四个着色点共用 `view_dir_to` 同一份实现）。MT8-2 曾量化到命中体素中心
-          // 以求得"同面恒定"—— 已实测推翻并回退。
-          refl_env = brdf_reflected(mr, rn, view_dir_to(r_org, rh.point),
+          // 反射命中点的视向量：用它**自己那条射线**（起点 `r_org` → 命中体素中心）⇒ **逐面**
+          // （硬约束 3：所有着色点共用 `face_view_dir` 同一份契约）。
+          // ⚠️ 这一处**没有行为变化**：`sun_c = 0` 且 `sun_vis = 0` ⇒ `brdf_reflected` 里吃 `v` 的
+          // 那一支根本不进（返回的只有 `(kD·albedo + F0)·amb`）⇒ 按面与逐像素在这里逐位相同。
+          // 按面写只是为了让"全工程锚点口径"只有一个（读者不必再逐点判断"这处是哪种"）。
+          refl_env = brdf_reflected(mr, rn, face_view_dir(r_org, voxel_center_world(rgg, rh.voxel)),
                                     SurfaceLight(sun_dir, vec3<f32>(0.0), 0.0, ramb, vec3<f32>(0.0)));
         }
         // 权重 = Schlick Fresnel（同一个 `fresnel_schlick`：完美镜面下 h ≈ n ⇒ 余弦取 `v·n`）
@@ -570,9 +568,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // 权重**不进任何缓存**（MT8-3 的缓存已删除）：它只由本像素的 `m`（材质）与 `v·n` 决定，
         // 逐像素算一次即可，缓存里本来也只该放"那条射线看到了什么"（辐亮度）。
         let fade = clamp(1.0 - m.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
-        // 镜面反射的菲涅耳余弦取 `v·n`（逐像素视向量）—— 与 `brdf_reflected` 里
-        // "完美镜面 h ≈ n ⇒ 余弦取 v·n" 那条口径**逐字相同**（硬约束 3）。MT8-2 曾把它量化到
-        // 面中心（同一体素面内恒定），已实测推翻并回退。
+        // 镜面反射的菲涅耳余弦取 `v·n`（**逐面**视向量）—— 与 `brdf_reflected` 里
+        // "完美镜面 h ≈ n ⇒ 余弦取 v·n" 那条口径**逐字相同**（硬约束 3）。
+        // 逐面 ⇒ 掠射角的权重从"跨体素边界连续渐亮"变成一个面一个值（成块变亮是本档的预期代价）。
         col = col + fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade * refl_env;
       }
     }

@@ -1,3 +1,6 @@
 {
-  "wgsl-analyzer.diagnostics.typeErrors": false
+  "wgsl-analyzer.diagnostics.typeErrors": false,
+  "rust-analyzer.cargo.extraArgs": [
+    "--release"
+  ]
 }
