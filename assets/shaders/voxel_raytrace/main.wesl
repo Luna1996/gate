@@ -737,43 +737,88 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   write_output(coord0, col);
 }
 
+/// 工作组数组：8×8 = 64 lane 的**归并缓冲**（槽下标 + 定点值）。
+const FACE_ACC_WG: u32 = 64u;
+/// "本 lane 不参与"的哨兵（槽下标最大远小于它）
+const FACE_ACC_NONE: u32 = 0xFFFFFFFFu;
+
+var<workgroup> fa_slot: array<u32, FACE_ACC_WG>;
+var<workgroup> fa_val: array<vec3<u32>, FACE_ACC_WG>;
+
 /// **逐面 GI 累加 pass**（`GiInput.use_face` 的数据源）：派发规模 = GI 网格；每个有面键的 texel
 /// 把自己的 GI 值（**降噪后**）定点累加到该面的槽里，并预留一个计数位。
 /// 为什么不放在 `gi_ss_main` 里累加（那样连 pass 都不用加）：同一个 dispatch 内读不到别的线程刚写的
 /// 键（认领是 CAS），参与集合会随线程调度变 —— 那正是要去掉的"每帧不一样"。放在这里
 /// （GI 降噪之后、`dda_face_main` 之前）⇒ 参与集合 = 该面的全部 texel，逐帧稳定。
+///
+/// **工作组内先归并**：一个面的 texel 在屏幕上连续 ⇒ 8×8 的工作组通常只落在少数几个面上。
+/// 先在**共享内存**里按槽下标分组求和，再由每组**一个** lane 发全局原子 ⇒ 全局原子次数从
+/// 「每 texel 7 次」降到「每 (工作组, 面) 7 次」：整屏一个面时 `230k×7 → 3.6k×7`（≈64×），
+/// 也就是**面越大收益越大** —— 逐面缓存本来要的就是这个方向。许多小面散布时退化成接近原来的
+/// 次数，代价只是共享内存里一次 `O(64²)` 扫描（微秒量级）。
+/// 全局侧仍用"CAS 预留计数"保证和不超过 `GI_ACC_MAX_N`，只是预留单位从 texel 变成**整组**：
+/// 一组塞不进就整组不进（参与集合的细节因此与逐 texel 版略有差异，上限本身不变）。
 @compute @workgroup_size(8, 8, 1)
-fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+  // 本 lane 的 (槽, 定点值)。**不能提前 return**：下面有 workgroupBarrier，要求统一控制流。
+  var slot = FACE_ACC_NONE;
+  var val = vec3<u32>(0u);
   let gsize = textureDimensions(gi_tex);
-  if (gid.x >= gsize.x || gid.y >= gsize.y) { return; }
-  let texel = gid.y * gsize.x + gid.x;
-  let gb = texel * GI_DEN_GUIDE_WORDS;
-  let k0 = gi_guide_out[gb + GI_DEN_G_KEY0];
-  let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
-  if ((k0 | k1) == 0u) { return; }
-  var ok = false;
-  let slot = face_slot_of(k0, k1, &ok);
-  if (!ok) { return; }
+  if (gid.x < gsize.x && gid.y < gsize.y) {
+    let texel = gid.y * gsize.x + gid.x;
+    let gb = texel * GI_DEN_GUIDE_WORDS;
+    let k0 = gi_guide_out[gb + GI_DEN_G_KEY0];
+    let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
+    if ((k0 | k1) != 0u) {
+      var ok = false;
+      let s = face_slot_of(k0, k1, &ok);
+      if (ok) {
+        let fe = s * FACE_WORDS;
+        if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != 0u
+            && atomicLoad(&face_slots[fe + FACE_W_K0]) == k0
+            && atomicLoad(&face_slots[fe + FACE_W_K1]) == k1) {
+          let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+                  / vec2<f32>(f32(gsize.x), f32(gsize.y));
+          let smp = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
+          if (smp.a > 0.0) {   // 无效（天空）texel 不参与
+            // 归一化（premultiplied：rgb = gi·valid、a = valid），再定点取整（进位到最近，避免系统性偏暗）。
+            let q = clamp(smp.rgb / max(smp.a, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+            val = vec3<u32>(round(q * GI_ACC_SCALE));
+            slot = s;
+          }
+        }
+      }
+    }
+  }
+  fa_slot[lid] = slot;
+  fa_val[lid] = val;
+  workgroupBarrier();
+  if (slot == FACE_ACC_NONE) { return; }
+  // **组代表** = 同槽 lane 中下标最小者：只有它发全局原子。
+  for (var j = 0u; j < lid; j = j + 1u) {
+    if (fa_slot[j] == slot) { return; }
+  }
+  // 代表把本组同槽的贡献先求和（含自己）⇒ 一次预留、三次原子加。
+  var sum = vec3<u32>(0u);
+  var cnt = 0u;
+  for (var j = 0u; j < FACE_ACC_WG; j = j + 1u) {
+    if (fa_slot[j] == slot) {
+      sum = sum + fa_val[j];
+      cnt = cnt + 1u;
+    }
+  }
   let fe = slot * FACE_WORDS;
-  if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) == 0u
-      || atomicLoad(&face_slots[fe + FACE_W_K0]) != k0
-      || atomicLoad(&face_slots[fe + FACE_W_K1]) != k1) { return; }
-  let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
-          / vec2<f32>(f32(gsize.x), f32(gsize.y));
-  let s = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
-  if (s.a <= 0.0) { return; }   // 无效（天空）texel 不参与
   // 计数用 CAS **预留**：保证"加和"与"加计数"一一对应，且总量不超过 `GI_ACC_MAX_N`
   // （直接 `atomicAdd(count)` 后再判断会让并发冲过上限 ⇒ 和溢出）。
   loop {
     let c = atomicLoad(&face_slots[fe + FACE_W_GI_N]);
-    if (c >= GI_ACC_MAX_N) { return; }
-    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_GI_N], c, c + 1u).exchanged) { break; }
+    if (c + cnt > GI_ACC_MAX_N) { return; }
+    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_GI_N], c, c + cnt).exchanged) { break; }
   }
-  // 归一化（premultiplied：rgb = gi·valid、a = valid），再定点取整（进位到最近，避免系统性偏暗）。
-  let q = clamp(s.rgb / max(s.a, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
-  atomicAdd(&face_slots[fe + FACE_W_GI], u32(round(q.x * GI_ACC_SCALE)));
-  atomicAdd(&face_slots[fe + FACE_W_GI + 1u], u32(round(q.y * GI_ACC_SCALE)));
-  atomicAdd(&face_slots[fe + FACE_W_GI + 2u], u32(round(q.z * GI_ACC_SCALE)));
+  atomicAdd(&face_slots[fe + FACE_W_GI], sum.x);
+  atomicAdd(&face_slots[fe + FACE_W_GI + 1u], sum.y);
+  atomicAdd(&face_slots[fe + FACE_W_GI + 2u], sum.z);
 }
 
 /// **逐面着色 pass**：派发规模 = GI 网格，只有**认领者**（`FACE_W_TEXEL` == 自己的 texel 下标）干活

@@ -76,8 +76,9 @@ fn main() {
           // scale_factor_override=1.0：强制 1 逻辑像素 = 1 物理像素。
           resolution: WindowResolution::new(VIEW_SIZE.x, VIEW_SIZE.y)
             .with_scale_factor_override(1.0),
-          // Fifo 硬垂直同步（与 DebugMenu「视频/垂直同步」默认一致）；focused=false 启动不抢前台焦点。
-          focused: false,
+          // 启动即聚焦：未聚焦走下面的 `reactive_low_power(1/60)` ⇒ 整个 app 被帽在 60Hz
+          // （看性能数据必须保持聚焦）。
+          focused: true,
           present_mode: PresentMode::Fifo,
           resizable: true, // resize 后渲染目标/aspect 由响应式系统跟随
           ..default()

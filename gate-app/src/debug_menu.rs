@@ -21,12 +21,14 @@ use gate_voxel::{inverted_pct_to_override, ior_slider_to_x100, slider_to_overrid
 use crate::camera::{CameraMode, FlyCamera};
 use crate::config::Config;
 use crate::consts::{
-  CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, VOXEL_PER_METER,
+  CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_MAX_FRAMES_PER_TICK, FPS_UPDATE_SECS,
+  FPS_WINDOW_SECS, VOXEL_PER_METER,
 };
 use crate::edit::{
   BrushMaterial, BrushShape, EditSettings, smooth_pct_to_roughness, transparency_pct_to_transmission,
 };
 use crate::showcase::ShowcaseRoot;
+use std::sync::atomic::Ordering;
 
 /// 菜单 TOML 相对 assets 目录的路径（UI 结构与控件缺省值的唯一来源）
 pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
@@ -108,9 +110,16 @@ pub struct FpsOverlayVisible(pub bool);
 #[derive(Resource, Default)]
 struct WindowedRestore(Option<(UVec2, Option<IVec2>)>);
 
-/// 每帧 delta 的 1s 滚动窗口（FPS 统计）
+/// **呈现帧**间隔的 1s 滚动窗口（FPS 统计）。
+/// 存的是"每个被提交呈现的帧"的间隔，**不是**主循环的 delta —— 后者在 pipelined rendering 下
+/// 会被显示成锯齿（主循环比渲染快得多，见 `gate_render::profiler::FramePace` 的说明）。
 #[derive(Resource, Default)]
-pub struct FpsWindow(VecDeque<f32>);
+pub struct FpsWindow {
+  /// 逐呈现帧的间隔（秒）
+  intervals: VecDeque<f32>,
+  /// 上次采样：墙钟秒数 + 呈现帧计数
+  last: Option<(f32, u64)>,
+}
 
 /// 建 DebugMenu + FPS 覆盖层 + 回调观察者；主题/字体就绪后由 `crate::debug_ui_setup` 调用一次。
 pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
@@ -621,12 +630,20 @@ pub(crate) fn camera_info_tick(
   }
 }
 
-/// 右上角 FPS：1s 窗口内统计 当前/平均/最低/最高，每帧更新
+/// 右上角 FPS：`(当前, 平均, 最低, 最高)`，每 `FPS_UPDATE_SECS` 刷新一次。
+/// - 当前 = **最新这一帧**的帧率（1 ÷ 该帧间隔）
+/// - 平均 = 近 `FPS_WINDOW_SECS` 的帧数 ÷ 该窗口时长
+/// - 最低 / 最高 = 近 `FPS_WINDOW_SECS` 内**逐帧**帧率的最小 / 最大值
+///
+/// 间隔口径是**提交呈现的帧**（`gate_render::profiler::FramePace`），不是主循环的 delta ——
+/// 本工程是 pipelined rendering，主循环可以比渲染快好几倍（见 `FramePace` 的说明）。
 #[allow(clippy::type_complexity)]
 pub(crate) fn fps_overlay_tick(
   time: Res<Time>,
   visible: Res<FpsOverlayVisible>,
+  pace: Res<gate_render::profiler::FramePace>,
   mut window: ResMut<FpsWindow>,
+  mut since_update: Local<f32>,
   mut q_root: Query<&mut Visibility, With<FpsOverlay>>,
   mut q_text: Query<&mut Text, With<FpsOverlayText>>,
 ) {
@@ -639,35 +656,52 @@ pub(crate) fn fps_overlay_tick(
   if !visible.0 {
     return;
   }
-  let dt = time.delta_secs();
-  if dt > 0.0 {
-    window.0.push_back(dt);
+  let now = time.elapsed_secs();
+  let presented = pace.presented.load(Ordering::Relaxed);
+  // 只有**呈现帧数变了**才记一次；一次采样跨了多帧（主循环比渲染慢）就按帧均摊成多份 ——
+  // 窗口里的统计口径始终是"每帧间隔"。上限 `FPS_MAX_FRAMES_PER_TICK` 防止（窗口拖动、
+  // 菜单重载之类的）一次性长停顿把窗口灌满同一份间隔。
+  if let Some((t0, c0)) = window.last {
+    let dt = now - t0;
+    let dc = presented.saturating_sub(c0);
+    if dc > 0 && dt > 0.0 {
+      let per = dt / dc as f32;
+      for _ in 0..dc.min(FPS_MAX_FRAMES_PER_TICK as u64) {
+        window.intervals.push_back(per);
+      }
+      window.last = Some((now, presented));
+    }
+  } else {
+    window.last = Some((now, presented));
   }
-  let mut sum = 0.0f32;
-  for &d in window.0.iter() {
-    sum += d;
-  }
-  while sum > FPS_WINDOW_SECS
-    && let Some(old) = window.0.pop_front()
-  {
+  let mut sum: f32 = window.intervals.iter().sum();
+  while sum > FPS_WINDOW_SECS && window.intervals.len() > 1 {
+    let old = window.intervals.pop_front().unwrap_or(0.0);
     sum -= old;
   }
-  let mut min_dt = f32::MAX;
-  let mut max_dt = 0.0f32;
-  for &d in window.0.iter() {
-    min_dt = min_dt.min(d);
-    max_dt = max_dt.max(d);
+  // 四个值每 `FPS_UPDATE_SECS` 刷一次（`window` 仍然逐帧采样，见上）
+  *since_update += time.delta_secs();
+  if *since_update < FPS_UPDATE_SECS {
+    return;
   }
-  let cur = if dt > 0.0 { 1.0 / dt } else { 0.0 };
-  let avg = if sum > 0.0 { window.0.len() as f32 / sum } else { 0.0 };
-  let min = if max_dt > 0.0 { 1.0 / max_dt } else { 0.0 };
-  let max = if min_dt < f32::MAX && min_dt > 0.0 { 1.0 / min_dt } else { 0.0 };
+  *since_update = 0.0;
+  let cur = window.intervals.back().copied().map_or(0.0, rate_of);
+  let avg = if sum > 0.0 { window.intervals.len() as f32 / sum } else { 0.0 };
+  let min_dt = window.intervals.iter().cloned().fold(0.0f32, f32::max); // 最大间隔 ⇒ 最低帧率
+  let max_dt = window.intervals.iter().cloned().fold(f32::MAX, f32::min); // 最小间隔 ⇒ 最高帧率
+  let min = rate_of(min_dt);
+  let max = if max_dt < f32::MAX { rate_of(max_dt) } else { 0.0 };
   let text = format!("({:>3}, {:>3}, {:>3}, {:>3})", fps3(cur), fps3(avg), fps3(min), fps3(max));
   if let Ok(mut t) = q_text.single_mut()
     && t.0 != text
   {
     t.0 = text;
   }
+}
+
+/// 帧间隔（秒）→ 帧率；间隔非正时记 0
+fn rate_of(dt: f32) -> f32 {
+  if dt > 0.0 { 1.0 / dt } else { 0.0 }
 }
 
 /// fps → 3 位宽显示值（上限 999）

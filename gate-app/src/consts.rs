@@ -43,6 +43,11 @@ pub const VOXEL_PER_METER: f32 = 50.0;
 pub const CAM_INFO_REFRESH_SECS: f32 = 0.25;
 /// FPS 滚动窗口长度（秒）
 pub const FPS_WINDOW_SECS: f32 = 1.0;
+/// 一次 FPS 采样最多折算成几个呈现帧（主循环比渲染慢时的一次长停顿按帧均摊；
+/// 上限防止窗口被同一份间隔灌满 —— 见 `debug_menu::fps_overlay_tick`）
+pub const FPS_MAX_FRAMES_PER_TICK: u32 = 8;
+/// FPS 四值的刷新间隔（秒）：不是每帧刷新 —— 高帧率下每帧刷数字既看不清也没意义
+pub const FPS_UPDATE_SECS: f32 = 0.2;
 
 /// 展示窗折线图画布宽度（像素）
 pub const SHOWCASE_PLOT_W: u32 = 216;
