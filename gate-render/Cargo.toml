@@ -22,3 +22,8 @@ ron = { workspace = true }
 wgpu-profiler = { workspace = true, optional = true }
 # WESL 运行时编译（dda shader 拆包 → WGSL 交给 Bevy 资产系统）
 wesl = { workspace = true }
+
+[dev-dependencies]
+# `tests/wesl_package.rs`：把 WESL 包编译成 WGSL 后用 naga 校验（着色器的错误否则只在运行期暴露）。
+# 版本跟着 wgpu/bevy（naga 是 wgpu 的内部依赖，这里只是把它显式引进来做校验）。
+naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }

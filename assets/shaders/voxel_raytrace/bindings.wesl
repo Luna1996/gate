@@ -177,6 +177,43 @@ struct GiUniform {
 @group(4) @binding(20) var<storage, read_write> gi_res_cur: array<u32>;
 @group(4) @binding(21) var<storage, read_write> gi_res_prev: array<u32>;
 
+// ===== @group(4) @binding(1..3)：体积散射（godray）的**写侧**（只给 `fog_main` 的 pipeline）=====
+// 为什么挂在 group(4)：它的组生命周期与雾 pass 一致（每帧重建、不跨 pass），而 1/2/3 是这一组
+// **空着的号**（0 = `gi_u`、20/21 = reservoir）⇒ 沿用「binding 号在模块内唯一」的约定，不新开 group。
+// 雾自己的 pass 用不到 `gi_u`（它要的相机矩阵/帧号在自己的 uniform 里，见 `FogUniform`）。
+/// 雾的参数 uniform（与 Rust `volumetric::FogUniform` 逐字段镜像，字节一致）。
+/// `prev_view_proj` 必须与 GI 的 `gi_u.prev_view_proj` **同一条契约**（上一帧真正跑过本 pass 的那一份），
+/// 但**各自独立**：GI 关掉时它的 `prev_view_proj` 会停在最后一次跑 GI 的帧，雾不能借用。
+struct FogUniform {
+  /// x = `σ_t`（消光系数，1/voxel：`1/σ_t` = 一个 e-folding 的距离）、
+  /// y = **地面雾的高度衰减** `h`（1/voxel：密度沿视线 `exp(−h·dir.y·t)`，相机高度处 ρ = 1；
+  /// `0` = 均匀介质）、z = Henyey-Greenstein 各向异性 `g`（前向 = 正）、
+  /// w = 天光环境散射的系数（乘 `sky_color`）。
+  params: vec4<f32>,
+  /// x = 雾网格的分辨率除数（整数 f32，只被 `fog_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
+  /// y = 太阳锥的角半径（rad，见 `fog_cone_dir`）、z = 阴影射线的距离上限（voxel，唯一的成本闸门）、
+  /// w = 每帧每像素的采样数 `S`（1..`FOG_SAMPLE_MAX`）。
+  misc: vec4<f32>,
+  /// x = **光柱增益**（乘在太阳的散射项上）、y = **雾距**（积分的距离上限，voxel）、
+  /// z = **太阳角径**（rad：同时是太阳盘的半径与阴影射线的锥角 —— 两者在物理上是同一个量）、
+  /// w = **日晕强度**（太阳盘外那圈拖尾的系数）。
+  /// y（雾距）是「不要变成起雾」的关键：没有它，一条到远平面的射线（天空）会积到 `e^{-σt·∞}=0`
+  /// ⇒ 天空与远景被雾色 **100% 替换**（整幅画面像起大雾）。截断之后透射率不再下降 ⇒
+  /// 远处仍是它自己的颜色，只有雾距内的那一段贡献散射。
+  misc2: vec4<f32>,
+  /// x = 自增帧号（精确 u32；yzw 恒 0）：抖动的每帧独立样本靠它。
+  seq: vec4<u32>,
+  /// 上一帧的相机矩阵（与 GI 同一套时域重投影契约）。
+  prev_view_proj: mat4x4<f32>,
+}
+@group(4) @binding(1) var<uniform> fog_u: FogUniform;
+/// 雾的写入侧：rgba16f，rgb = 线性散射辐亮度、a 恒 1（**没有「无效像素」**，与 GI 的
+/// premultiplied-valid 不同 ⇒ 采样侧不做 valid 归一化）。
+@group(4) @binding(2) var fog_out: texture_storage_2d<rgba16float, write>;
+/// 雾的降噪导引写侧（@group(0) @binding(21) / @group(6) @binding(3) 是同一块 buffer 的另外两个号）。
+@group(4) @binding(3) var<storage, read_write> fog_guide_w: array<u32>;
+
+
 // ===== @group(5)：GI（网格 = 渲染分辨率 / gi_div）=====
 // @binding(2)：GI 缓冲的写入侧（`gi_main` 用）；采样侧见 `@binding(4)`。
 @group(5) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
@@ -210,6 +247,21 @@ struct GiUniform {
 /// （Rust 每帧在 `gi_main` 之前整块清空）；它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
 @group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
 
+// ===== @group(6)：体积散射（godray）的**读侧**（只给 `dda_main` 的 pipeline，见 `volumetric.wesl::fog_upsample_joint`）=====
+// 为什么单开一组而不是塞进 group(5)：group(5) 是「GI 网格」的号段，而雾的网格尺寸、资源、生命周期
+// 都与 GI 无关（分辨率档各自独立）⇒ 混在一组里会让两个模块的绑定互相牵制。这一组只有 `dda_main` 用，
+// 逐面 pass / beam / GI 三个入口都不引用它（未用的绑定会被 naga 剪掉，layout 里不必为它们留号）。
+// 绑定号取 0/1/3，是为了让「同一块 buffer 的多个号」在两侧都读得出来：
+//   0 = 雾的参数（**与 @group(4) @binding(1) 是同一块 buffer**：`dda_main` 的天空要用它取太阳盘/日晕的
+//       参数，而那条路径只有 group(6)。同一 buffer 两个声明、两个访问类型，与 `gi_guide_out`/`gi_guide_t`
+//       的先例一致）
+//   1 = 雾的采样视图（最终结果：降噪链的输出，或关降噪时的原始 `fog_out`）
+//   3 = 雾的降噪导引（**只读**：上采样要按面键筛 2×2 texel）
+// 关掉雾时 Rust 绑 1×1 的零纹理 + 4 字节占位 buffer（参数 uniform 照绑：太阳盘与雾的开关无关）。
+@group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
+@group(6) @binding(1) var fog_tex: texture_2d<f32>;
+@group(6) @binding(3) var<storage, read> fog_guide_r: array<u32>;
+
 // ===== @group(0) @binding(10..)：GI 降噪（两个新 pass，见 `gi/denoise.wesl`）=====
 // 降噪 pass 的 bound group 只有 group(0) 一份（`bindings.wesl` 的 binding 号在**同一个模块里唯一**
 // ⇒ 不改动既有 0..3 的号段，另起 10..）。Rust 侧 `gi_den_*_layout` 与之逐号对应。
@@ -234,6 +286,26 @@ struct GiUniform {
 /// 一份（刻意 —— 不拉进 brickmap / 相机矩阵），而「bind group 必须从索引 0 起成前缀设置」
 /// ⇒ 它们够不到 group(4)。加一个 4 字节 storage 是最省的接法。
 @group(0) @binding(20) var<storage, read> gi_den_cfg: array<u32>;
+
+// ===== @group(0) @binding(21..)：体积散射（godray）的**时域累积**（`volumetric.wesl::fog_den_temporal`）=====
+// 与 GI 降噪同一套做法（同一个 group、同样的"另起号段"理由：这个 pass 的 bind group 也只有 group(0)）。
+// **雾的空间段（迭代 atrous）不在这里** —— 它直接复用 GI 的 `gi_den_atrous*` 入口与 layout
+// （binding 10/14/15/17/20），Rust 只把雾的资源绑到那几个号上（见 `gate-render/src/volumetric.rs`）。
+/// 21：**雾的降噪导引**的读侧（`fog_main` 通过 @group(4) @binding(3) 写同一块 buffer，
+/// `dda_main` 通过 @group(6) @binding(3) 读同一块 —— 三个号三个访问类型，与 `gi_guide_out` 的先例一致）。
+/// word 布局与 GI 的导引**逐字同构**（`GI_DEN_G_*`）：键 2 + 面法线 1 + 上帧重投影像素 1
+/// —— 复用 `gi_den_same_plane` 判据与 atrous 入口的前提就是这套布局。
+@group(0) @binding(21) var<storage, read> fog_guide_t: array<u32>;
+/// 22：本帧原始雾（`fog_out` 的采样视图）。rgb = 线性散射辐亮度，a 恒 1（每个像素都有雾）。
+@group(0) @binding(22) var fog_raw_in: texture_2d<f32>;
+/// 23/24：雾的时域历史双缓冲（每像素 `FOG_DEN_HIST_WORDS` 个 word，布局见 `volumetric.wesl`）。
+@group(0) @binding(23) var<storage, read> fog_hist_in: array<u32>;
+@group(0) @binding(24) var<storage, read_write> fog_hist_out: array<u32>;
+/// 25：时域累积的输出（atrous 第一轮的输入，`fog_dn[0]`）。
+@group(0) @binding(25) var fog_tmp_out: texture_storage_2d<rgba16float, write>;
+/// 26：每像素亮度 range 权重的 φ。雾自己写（语义与 GI 的 `gi_den_phi` 相同：供 `gi_den_atrous` 读），
+/// 但**口径不同**：雾用「帧间差」而不是「同面邻域的亮度标准差」（见 `volumetric.wesl` 的说明）。
+@group(0) @binding(26) var<storage, read_write> fog_phi_w: array<f32>;
 
 // ===== @group(7)：眼睛适应（自动曝光）——被 `dda_main`（读曝光）与 eye_adapt_* 两个入口使用 =====
 /// `out_tex` 的采样视图（同一张图），统计曝光已应用之后的颜色。

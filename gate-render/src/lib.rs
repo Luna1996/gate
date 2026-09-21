@@ -7,6 +7,7 @@ pub mod pbr_texture;
 pub mod profiler;
 mod responsive;
 pub mod shader;
+pub mod volumetric;
 pub mod wesl_consts;
 
 use bevy::prelude::*;
@@ -29,6 +30,7 @@ pub use lighting::{
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use pbr_texture::{PBR_TEXTURE_DIR, PbrTextureSet, PbrTexturesPlugin};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
+pub use volumetric::{FogPlugin, FogSettings};
 
 pub struct GateRenderPlugin;
 
@@ -38,6 +40,8 @@ impl Plugin for GateRenderPlugin {
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
       gi::GiPlugin,
+      // 体积散射（godray）：体积散射的 pass / 资源 / 档位（菜单「渲染/太阳」）
+      volumetric::FogPlugin,
       profiler::GateProfilerPlugin,
       // PBR 贴图集（MT2-1）：扫描 assets/textures/pbr/ → 两张 texture_2d_array（只加载，不绑定）
       pbr_texture::PbrTexturesPlugin,

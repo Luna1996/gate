@@ -64,6 +64,13 @@ label = "menu.render.gi.enabled"
 checked = true
 
 [[items.children.children]]
+kind = "toggle"
+id = "sun_bounce"
+label = "menu.render.gi.sun_bounce"
+checked = false
+tooltip = "menu.render.gi.sun_bounce.tip"
+
+[[items.children.children]]
 kind = "switch_group"
 id = "res"
 label = "menu.render.gi.res"
@@ -77,26 +84,6 @@ tooltip = "menu.render.gi.res.tip"
 
 [[items.children.children]]
 kind = "switch_group"
-id = "denoise"
-label = "menu.render.gi.denoise"
-options = [
-    "menu.render.gi.denoise.off",
-    "menu.render.gi.denoise.low",
-    "menu.render.gi.denoise.mid",
-    "menu.render.gi.denoise.high",
-]
-selected = 1
-tooltip = "menu.render.gi.denoise.tip"
-
-[[items.children.children]]
-kind = "toggle"
-id = "sun_bounce"
-label = "menu.render.gi.sun_bounce"
-checked = false
-tooltip = "menu.render.gi.sun_bounce.tip"
-
-[[items.children.children]]
-kind = "switch_group"
 id = "interval"
 label = "menu.render.gi.interval"
 options = [
@@ -107,6 +94,19 @@ options = [
 ]
 selected = 1
 tooltip = "menu.render.gi.interval.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "denoise"
+label = "menu.render.gi.denoise"
+options = [
+    "menu.render.gi.denoise.off",
+    "menu.render.gi.denoise.low",
+    "menu.render.gi.denoise.mid",
+    "menu.render.gi.denoise.high",
+]
+selected = 1
+tooltip = "menu.render.gi.denoise.tip"
 
 [[items.children.children]]
 kind = "switch_group"
@@ -186,6 +186,142 @@ max = 0.5
 step = 0.01
 decimals = 3
 tooltip = "menu.render.exposure.key.tip"
+
+# ---- 太阳：体积散射（godray）----
+# 算法、成本模型与档位含义见 `gate-render/src/volumetric.rs` 与
+# `assets/shaders/voxel_raytrace/volumetric.wesl`（本段只给「档位 → 数值」的映射）。
+[[items.children]]
+kind = "sub_menu"
+id = "sun"
+label = "menu.render.sun"
+
+[[items.children.children]]
+kind = "toggle"
+id = "vol"
+label = "menu.render.sun.vol"
+checked = true
+tooltip = "menu.render.sun.vol.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "vol_res"
+label = "menu.render.sun.vol_res"
+options = [
+    "menu.render.sun.vol_res.full",
+    "menu.render.sun.vol_res.half",
+    "menu.render.sun.vol_res.quarter",
+]
+selected = 2
+tooltip = "menu.render.sun.vol_res.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "vol_quality"
+label = "menu.render.sun.vol_quality"
+options = [
+    "menu.render.sun.vol_quality.low",
+    "menu.render.sun.vol_quality.mid",
+    "menu.render.sun.vol_quality.high",
+    "menu.render.sun.vol_quality.ultra",
+]
+selected = 1
+tooltip = "menu.render.sun.vol_quality.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "vol_shadow"
+label = "menu.render.sun.vol_shadow"
+options = ["64", "128", "256", "512"]
+selected = 1
+tooltip = "menu.render.sun.vol_shadow.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_density"
+label = "menu.render.sun.vol_density"
+value = 0.005
+min = 0.0
+max = 0.02
+step = 0.0002
+decimals = 4
+tooltip = "menu.render.sun.vol_density.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_ground"
+label = "menu.render.sun.vol_ground"
+value = 0.01
+min = 0.0
+max = 0.02
+step = 0.001
+decimals = 3
+tooltip = "menu.render.sun.vol_ground.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_dist"
+label = "menu.render.sun.vol_dist"
+value = 2048.0
+min = 128.0
+max = 4096.0
+step = 64.0
+decimals = 0
+tooltip = "menu.render.sun.vol_dist.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_gain"
+label = "menu.render.sun.vol_gain"
+value = 8.0
+min = 0.0
+max = 20.0
+step = 0.5
+decimals = 1
+tooltip = "menu.render.sun.vol_gain.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_aniso"
+label = "menu.render.sun.vol_aniso"
+value = 0.55
+min = -0.9
+max = 0.9
+step = 0.05
+decimals = 2
+tooltip = "menu.render.sun.vol_aniso.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_ambient"
+label = "menu.render.sun.vol_ambient"
+value = 0.02
+min = 0.0
+max = 1.0
+step = 0.01
+decimals = 2
+tooltip = "menu.render.sun.vol_ambient.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_soft"
+label = "menu.render.sun.vol_soft"
+value = 0.9
+min = 0.0
+max = 3.5
+step = 0.1
+decimals = 1
+tooltip = "menu.render.sun.vol_soft.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "vol_halo"
+label = "menu.render.sun.vol_halo"
+value = 1.2
+min = 0.0
+max = 4.0
+step = 0.1
+decimals = 1
+tooltip = "menu.render.sun.vol_halo.tip"
 
 [[items]]
 kind = "sub_menu"

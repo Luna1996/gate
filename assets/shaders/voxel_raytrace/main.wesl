@@ -1,4 +1,4 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
@@ -7,6 +7,7 @@ import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
+import package::volumetric::{FOG_SKY_K0, FOG_SKY_K1, fog_pass_scatter, fog_pass_temporal, fog_upsample_joint, sky_primary};
 import package::world::{WorldHit, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
@@ -351,8 +352,11 @@ struct GiInput {
 /// 输入 = 一个**可见体素面**（`first`）+ 本面射线的远平面距离 + GI 输入（见 `GiInput`）。
 /// 除 GI 外的全部输入都只由这个面决定（材质量化到体素中心 / 着色法线 / 视向量锚点 /
 /// 阴影与反射射线的起点与种子 / 玻璃状态机的入射点与方向），这就是它可以按面缓存的前提。
-fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, frustum_length: f32, gi_in: GiInput,
-              sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
+/// ⚠️ `ray_dir` 是唯一一个**逐像素**的实参，且**只被天空背景那一行消费**（`sky_primary` 要用它定太阳盘）。
+/// 命中面（含逐面缓存那条路径）根本不会走到那一行 ⇒ 那里的实参不被消费，但必须是合法值
+/// （不能是零向量：`sky_primary` 里对方向做了点积）。
+fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frustum_length: f32,
+              gi_in: GiInput, sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
   var best = first;
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
@@ -431,7 +435,12 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, frustum_length: f32, gi_
                 + emissive_radiance(fm, GI_EMIT_GAIN);
     }
   }
-  var col = sky_rgb() * through + refl;
+  // ---- 天空背景（**只在这里用 `sky_primary`**）：常量天光 + 太阳盘 + 日晕 ----
+  // `through` = 沿途介质的乘性吸收（玻璃染色），`refl` = 玻璃那条状态机累积的反射项。
+  // 命中时下面立刻把 `col` 覆盖掉 ⇒ 这一行的开销只落在天空像素上（几个 ALU）。
+  // ⚠️ 除了这一行，全工程的天空口径仍是 `sky_rgb()`（GI 的 miss / 玻璃与镜面反射的逃逸）——
+  // 太阳作为**光源**已经由各处的 NEE 负责，那些地方再画一次太阳盘就是重复计能量（见 `sky_primary`）。
+  var col = sky_primary(ray_dir, sun_dir, sun_c) * through + refl;
   if (best.hit) {
     col = vec3<f32>(0.0);
     // 材质参数（albedo / roughness / metallic / emissive / transmission / ior / specular）由下面那次
@@ -711,9 +720,24 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   if (!cached) {
-    col = shade_face(first, origin_voxel, frustum_length,
+    col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                      GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c);
   }
+  // ---- 体积散射（godray，`volumetric.wesl`）：**线性 HDR 相加，必须在 `write_output` 的曝光之前** ----
+  // 为什么加在**查表之后**而不是 `shade_face` 里面：雾是**逐像素**的量（沿视线积到本像素的命中距离），
+  // 而 `shade_face` 的结果会被逐面去重表按**面**缓存（`dda_face_main` 写进 `FACE_W_COL` 的那份不含雾）。
+  // 加在里面就会把「一个面一个雾值」缓存下来；加在这里则两条路径（查表命中 / 内联着色）各加一次，
+  // 逐面去重的缓存内容**逐位不变**。
+  // 键口径 = `fog_main` 写进导引的那一套（主命中体素 + 面 + 物体；天空用哨兵键），
+  // 由 `fog_upsample_joint` 按 `gi_den_same_plane` 筛掉不同平面的 texel（轮廓处不渗色）。
+  // 关掉雾时 Rust 在 group(6) 绑 1×1 零纹理 ⇒ 这一行恒 `+0`。
+  var fog_k0 = FOG_SKY_K0;
+  var fog_k1 = FOG_SKY_K1;
+  if (first.hit) {
+    fog_k0 = gi_key0(first.voxel);
+    fog_k1 = gi_key1(first.voxel, first.face_id, first.obj_id);
+  }
+  col = col + fog_upsample_joint(px, vec2<u32>(textureDimensions(fog_tex)), fog_k0, fog_k1);
   write_output(coord0, col);
 }
 
@@ -813,7 +837,9 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       f32(atomicLoad(&face_slots[fe + FACE_W_GI + 1u])),
       f32(atomicLoad(&face_slots[fe + FACE_W_GI + 2u]))) * inv;
   }
-  let col = shade_face(first, view_u.cam_pos_voxel.xyz, frustum_length,
+  // `ray_dir` 传该面的世界法线：逐面路径**只处理命中面**（天空在那里不渲染）⇒ 这个实参不会被消费，
+  // 但必须是合法单位向量（`shade_face` 的注释里写了理由）。
+  let col = shade_face(first, view_u.cam_pos_voxel.xyz, face_normal_world(gg, face_id), frustum_length,
                        GiInput(true, gi_avg, select(0.0, 1.0, gi_n > 0u), gi_uv),
                        sun_dir, sky, sun_c);
   atomicStore(&face_slots[fe + FACE_W_COL], bitcast<u32>(col.x));
@@ -929,6 +955,26 @@ fn gi_denoise_atrous16(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 16);
+}
+
+// ============================================================================
+// 体积散射（godray）：**薄入口**，实现全在 `volumetric.wesl`
+// ============================================================================
+// 为什么入口留在本文件：WESL 只把「从根模块（`main.wesl`）可达」的东西写进编译产物 ——
+// 子模块里没有任何调用点的 `@compute` 会被整条剪掉（pipeline 按名字找入口时会直接失败）。
+// 与 GI 降噪同一形态（`gi_denoise_temporal` 包 `gi_den_atrous(size, coord, …)`）。
+// 两个入口的算法、成本模型、与 GI 的分工都在 `volumetric.wesl` 的文件头。
+/// 生产 pass：每像素 1 条主射线（只为 t_end）+ S 条阴影射线（自由飞行采样）⇒ 写 `fog_out` + 导引。
+@compute @workgroup_size(8, 8, 1)
+fn fog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  fog_pass_scatter(gid);
+}
+
+/// 时域累积（+ 写 φ）。空间段**不在这里**：那几个 `gi_denoise_atrous1..16` 入口直接被雾复用
+/// （Rust 侧把雾的导引 / 中间靶 / φ 绑到同一份 layout 的号上，见 `gate-render/src/volumetric.rs`）。
+@compute @workgroup_size(8, 8, 1)
+fn fog_den_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
+  fog_pass_temporal(gid);
 }
 
 // 自动曝光：pass1 `eye_adapt_histogram` 抽样 → log2 亮度 → 64 桶直方图；
