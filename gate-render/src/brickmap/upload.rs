@@ -217,6 +217,8 @@ pub struct UploadSnapshot {
 
 // 光照场（AO fill）：16-voxel cell 网格，相机中心 + 世界锚定槽位，可流式。
 // 纹理 Rgba16Unorm，dims = LIGHT_FIELD_DIM³：`.a` = 实心占比 AO fill，`.rgb` 恒 0。
+// ⚠️ 语义上是"**实心占比**"而不是"**天空遮挡**"：cell 越实心 ⇒ `.a` 越大 ⇒ shader 侧 ao 越小，
+// 与"上方天空是否被挡"无关（`lightfield.wesl` 的那条公式直接反映这一点）。
 
 use super::dda::wgsl_consts::{LIGHT_FIELD_CELL, LIGHT_FIELD_DIM};
 

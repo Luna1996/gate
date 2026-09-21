@@ -24,7 +24,7 @@ use crate::consts::{
   CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, HALF_RES_FACTOR, VOXEL_PER_METER,
 };
 use crate::edit::{
-  BrushMaterial, BrushShape, EditSettings, opacity_pct_to_transmission, smooth_pct_to_roughness,
+  BrushMaterial, BrushShape, EditSettings, smooth_pct_to_roughness, transparency_pct_to_transmission,
 };
 use crate::showcase::ShowcaseRoot;
 
@@ -387,8 +387,10 @@ fn register_callbacks(world: &mut World) {
           log_material(&edit.mat);
         }
         ("game/edit/alpha", MenuAction::Value(v)) => {
-          edit.mat.transmission = opacity_pct_to_transmission(*v);
-          edit.mat.transmission_ov = inverted_pct_to_override(*v);
+          // 「透明度」= 滑杆值越大越透明（见 `transparency_pct_to_transmission`）。
+          // PBR 变体那一侧走 `slider_to_override`（**不是** `inverted_*`）：最低档 = 不覆盖，其余 1..100% 覆盖为 0.004..1.0
+          edit.mat.transmission = transparency_pct_to_transmission(*v);
+          edit.mat.transmission_ov = slider_to_override(*v, 0.0, 100.0);
           log_material(&edit.mat);
         }
         ("game/edit/smooth", MenuAction::Value(v)) => {

@@ -181,15 +181,13 @@ fn ov_text(byte: u8) -> String {
   }
 }
 
-/// 菜单「不透明度」滑杆 0..100 → `PaletteEntry.transmission`（**100 = 完全不透明**，0 = 全透）。
+/// 菜单「透明度」滑杆 0..100 → `PaletteEntry.transmission`（**100 = 全透**，`0` = 完全不透明）。
 ///
-/// ⚠️ **这是"不透明度"，不是"透明度"**（滑杆值越大 = 越不透明）。该控件原先的标签写的是「透明度」，
-/// 与映射方向**相反** ⇒ 用户按字面理解把 100 当"全透明"，实际得到的是"完全不透明的镜面"，
-/// 会以为是渲染 bug（2026-09-21 实测踩到）。标签已改为「不透明度」（`zh-CN.toml` 的
-/// `menu.game.edit.alpha`），**映射方向保持不变**（与「光滑度」共用 `inverted_pct_to_override` 的
-/// "值越大 ⇒ 参数越小"方向，改动它会影响 PBR 变体的覆盖编码）。
-pub fn opacity_pct_to_transmission(pct: f32) -> u8 {
-  (((100.0 - pct.clamp(0.0, 100.0)) / 100.0) * 255.0).round() as u8
+/// 映射与标签**同向**：滑杆值 = 透射率百分比（「光滑度」仍是 `inverted_*`：光滑度越大 ⇒ 粗糙度越小，
+/// 两者各用各的映射）。输出 `> 0` 会被写入侧（`wire.rs::pack_palette_entry`）标成可穿透介质；
+/// `debug_menu.toml` 的出厂初值 = `0`（新笔触默认**不透明**）。
+pub fn transparency_pct_to_transmission(pct: f32) -> u8 {
+  ((pct.clamp(0.0, 100.0) / 100.0) * 255.0).round() as u8
 }
 
 /// 菜单「光滑度」滑杆 0..100 → `PaletteEntry.roughness`（0 = 镜面、255 = 完全粗糙）。

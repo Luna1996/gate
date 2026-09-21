@@ -20,6 +20,9 @@ const TREE_BASE: u32 = 262144u;          // Region ② 起始
 // bit4 = IS_PBR（变体位）、bit5 = TRANSMISSIVE（DDA 热路径位，**写入侧维护**）、bit6..7 保留。
 const FLAGS_IS_PBR: u32 = 1u << 4u;
 const FLAGS_TRANSMISSIVE: u32 = 1u << 5u;
+// ⚠️ **这两个是字节级掩码**（flags 字节 = `word1 >> 16 & 0xFF`）：只能与 `palette_flags(...)`
+// 的结果、或自己先取出的 flags 字节相与。**直接与 palette 整字（`b_palette[i]`）相与会测到别的位**
+// —— 平凡变体里那是 `emissive`/`transmission` 的位、PBR 变体里那是 `asset` 的位。
 
 // --- 材质资产（PBR 变体的 `asset: u16` 所指的表）跨端常量 ---
 // 权威值只写在这里：Rust 经 `wesl_consts.rs::material_consts` 解析同一份源码，缺一即启动 fail-fast。

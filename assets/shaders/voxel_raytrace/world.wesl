@@ -64,7 +64,7 @@ struct SceneHit {
 // 主世界先跑 + 逐物体收缩 t_cap 取最近命中；g0 = 主世界网格（由 world_raycast 提供）。
 // 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
 fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
-  var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0), vec3<f32>(1.0));
+  var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0));
   var best_t = 1e+30;
   var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap, false, &mc_off), 0u);
   if (best.uh.hit) {
@@ -126,13 +126,11 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
 
 /// 介质穿透入口（模式 1/2）：在指定 grid 内把透射材质当作可穿过，一次走完整段介质。
 /// 结局：撞实体 → hit 实体；到段末端 → hit 介质材质（t/n = 出射面）；走到底 → miss；
-/// `tint`（乘性）累积透射色 —— **按实测路径距离累积**（MT5-3 的 Beer-Lambert 近似，见
-/// `trace.wesl::pass_through_medium` 与 `medium_dist_tint`；同一段介质越厚越暗）。
-/// 注：2026-09-21 从"按穿过的**格数**（整数）"改成"按**实测距离**（连续）"—— 前者会让吸收值
-/// 随像素的离散跳变产生**等高线条带**（折射长路径上尤其明显）。
+/// `tint`（乘性）累积透射色 —— **按"介质段"一次**：每进入**一段连续的同一材质**乘一次该材质的
+/// 透过率，**与厚度/格数/距离无关**（见 `trace.wesl::pass_through_medium` 与 `MediumRay` 的头注释）。
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
                       stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
-  var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0), vec3<f32>(1.0));
+  var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
   let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, &mc);
   *tint = *tint * mc.tint;
   return WorldHit(

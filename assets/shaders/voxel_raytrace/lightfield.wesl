@@ -2,6 +2,8 @@ import package::bindings::{light_samp, light_tex, view_u};
 
 // 光照场：16³ cell 填充率网格（dims = 32³），世界锚定（纹素下标 = 世界 cell mod dims）；纹理只 `.a`（AO fill）有意义，rgb 恒 0。
 // 窗口原点 = 相机中心对齐 cell，与 Rust `light_field_origin_cell` 必须逐字一致。
+// ⚠️ 这个 fill 是"**实心占比**"，不是"天空遮挡"：cell 越实心 ⇒ ao 越小（全实心 ⇒ ao = 0），
+// 与"上方天空是否被挡"无关（来源见 `gate-render/src/brickmap/upload.rs` 的 `build_light_chunk`）。
 const LIGHT_FIELD_CELL: f32 = 16.0;
 const LIGHT_FIELD_DIM: i32 = 32;
 /// 场窗口原点（世界 voxel，按 cell 对齐；相机恒在盒中心）。

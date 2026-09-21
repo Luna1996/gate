@@ -98,20 +98,27 @@ const GLASS_REFL_AMBIENT: f32 = 0.15;
 const PBR_REFLECTION_ENABLED: u32 = 1u;
 
 /// 触发判据 ①：`F0` 的**亮度投影**低于本值不发线 —— 镜面反射率本身太低时，那条射线的视觉贡献
-/// 还不如它的噪声与成本，不值得追。取 0.03：默认平凡材质是电介质（`specular = 1.0`）
-/// ⇒ `F0 = ((1.5−1)/(1.5+1))² = 0.04` 恰在门槛之上（追）；把 PBR 变体的 `specular` 槽级覆盖调到
+/// 还不如它的噪声与成本，不值得追。
+/// 取 0.03：默认平凡材质是电介质（`specular = 1.0`）⇒ `F0 = ((1.5−1)/(1.5+1))² = 0.04` 恰在门槛之上
+/// （**要保留这条**：否则"光滑度拉满 ⇒ 镜面"整个消失）；把 PBR 变体的 `specular` 槽级覆盖调到
 /// ≤ 0.5（`F0 ≤ 0.02 < 0.03`）即整类不追 —— 这就是"用 F0 判"的可操作旋钮（MT7 的 UI 接上即可）。
 const PBR_REFL_MIN_F0: f32 = 0.03;
-/// 触发判据 ②：`roughness` 高于本值不发线（**成本控制的主闸门**）。
+/// 触发判据 ②：`roughness` 高于本值不发线（**成本控制的主闸门**，也是「光滑度」滑杆的落点）。
 /// 理由：一条方向射线只代表得了"足够窄"的那一瓣镜面（MT4-1 的成本红线就是"只有一条"）；
-/// `roughness` 大时 GGX 瓣宽远超一个方向能代表的尺度 ⇒ 那条射线既是坏估计（噪声大），
-/// 又与 MT3 已经加过的 `F0·(amb+gi)` 环境项重复（见 `brdf_reflected` 的环境项）⇒ 不如不追。
-/// 取 0.5：与业界"单射线反射只用于中低粗糙度"的做法一致。
-/// **本场景（castle.vox）的实际影响面很大**：该 .vox 的 256 个 MATL 条目 `_rough` 全是 `"0.1"`
-/// ⇒ 每个材质的 `roughness ≈ 0.098`、`fade ≈ 0.8` ⇒ **几乎每个不透明像素都会发一条反射射线**
-/// （MT4-4 实测：`gate_dda_trace` 1.26ms → ≈3.4ms）。这是场景材质决定的，不是判据失效；
-/// 把某块涂成 `roughness > 0.5`（「游戏/编辑」光滑度滑杆 < 50%）即可看到它不再发线。
-const PBR_REFL_MAX_ROUGH: f32 = 0.5;
+/// `roughness` 大时 GGX 瓣宽远超一个方向能代表的尺度 ⇒ 那条射线既代表不了那一瓣（**方差巨大**），
+/// 又与 MT3 已经加过的 `F0·(amb+gi)` 环境项重复 ⇒ 不如不追。
+///
+/// **取 0.05**：反射值本身是**双峰**的（命中几何 = `sky·0.05·ao`、逃逸天空 = **整个 sky**，差 20 倍，
+/// 见 `gi/consts.wesl::GI_SKY_AMBIENT`）；而着色按面量化（MT8-6 + `face_view_dir`）⇒ 一个面只有
+/// **一个**样本，这 20 倍不会再被面内像素的抖动平均掉 ⇒ 瓣宽大于面就是"成片的纯天空亮块 = 打蜡"。
+/// **瓣半角 ≈ atan(roughness) ⇒ roughness ≤ 0.05（瓣 ≤ 2.9°）**才值得一条射线。
+///
+/// **落到「光滑度」滑杆**（`smooth_pct_to_roughness`，线性）：roughness ≤ 0.05 ⇔ **光滑度 ≥ 96%**
+/// （100% ⇒ roughness 0 = 完全镜面）；96% 以下按 `fade`（`dda_main`）连续淡出到 0 ⇒ 扫滑杆时
+/// 亮度单调、门限处不出现台阶。⇒ **要镜面就把某块涂成光滑度拉满**。
+/// 城堡场景 256 个 MATL 的 `_rough` 全是 `"0.1"` ⇒ roughness ≈ 0.098 > 0.05 ⇒ **默认场景整片不发线**
+/// （`gate_dda_trace` ≈ 1.4ms 量级）。数据上偏光的材质被挡在门外是**有意**的：按面单样本下宽瓣只会带来蜡感。
+const PBR_REFL_MAX_ROUGH: f32 = 0.05;
 /// 抖动锥的张角系数：锥半角 ≈ `atan(本值 × roughness)`（rad）。粗糙度越大瓣越宽 ⇒ 取样方向越散，
 /// 同时权重按 `dda_main` 里的 `fade` 连续淡出到 0（⇒ 粗糙度扫描下总亮度单调、无跳变）。
 const PBR_REFL_CONE_K: f32 = 1.0;
@@ -196,12 +203,16 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     // 平凡变体没有 IOR 字段 ⇒ `material_ior` 给默认 1.5、F0 = ((1.5−1)/(1.5+1))² = 0.04
     // ⇒ 折射与 Fresnel 与改动前玻璃那两份硬编码（IOR 1.5 / F0 0.04）一致（本条验收）。
     let ior = material_ior(best.palette_base, best.pal);
-    // ---- 视向量（**这条界面事件的着色量**）：**逐面** ----
-    // `v` = "由本界面的体素中心指向本段射线的起点 `org`" ⇒ 同一玻璃面内所有像素同值。
-    // 它喂两件事，都是反光：① 界面 Fresnel（`fres`）；② 反射方向 `reflect(-v, nn)`。
-    // 为什么按面、代价是什么：`common.wesl::face_view_dir`（本工程所有吃 `v` 的量都是反光/高光）。
-    // 注意 `ci`（几何量：折射/全内反射的判据）一直用**精确方向** —— 那是光路几何、不是着色（未动）。
-    let v = face_view_dir(org, voxel_center_world(make_grid(0u), best.voxel));
+    // ---- 视向量（**这条界面事件的着色量**）：**逐面、且以相机为锚** ----
+    // `v` = "由本界面的体素中心指向**相机**" ⇒ 同一玻璃面内所有像素同值（逐面），且随视角变化。
+    // 它喂两件事，都是反光：① 界面 Fresnel（`fres`，含掠射增益）；② 反射方向 `reflect(-v, nn)`。
+    // ⚠️ **锚点必须是相机（观察者），不能是本段射线的起点 `org`**：本函数的入射点就是命中面中心
+    // （`center + nn·(0.5+ε)`）⇒ 拿 `org` 当锚会让 `v` 恒等于 `nn` ⇒ `fres` 恒为 `F0`（无掠射增益）、
+    // `reflect(-v, nn) ≡ +nn`（反射线垂直射出该面、与视角无关）。
+    // 对**首个**界面本式恰好等于 `dda_main` 传进来的 `fv`（同一把尺子 `face_view_dir`），
+    // 对内部界面则是"相机看那个体素"的方向 ⇒ 仍然逐面恒定。
+    // `ci`（几何量：折射/全内反射的判据）用**本段射线的精确方向** —— 那是光路几何、不是着色。
+    let v = face_view_dir(view_u.cam_pos_voxel.xyz, voxel_center_world(make_grid(0u), best.voxel));
     if (!in_medium) {
       // 玻璃走的是折射状态机（不是 BRDF）：Fresnel 用**物理 IOR 导出的 F0**、不加槽级 specular 调制
       // （那条调制是给不透明 BRDF 的观感旋钮；`specular = 1.0` = 不调制 = 物理基值）。
@@ -369,12 +380,77 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 首命中是不是玻璃（走 `trace_glass` 状态机）看 `FLAGS_TRANSMISSIVE` 位，不读 transmission 字节：
   // PBR 变体里那个字节属于 `asset`（`docs/PLAN.md` D1），按字节读会把不透明材质误判成玻璃。
   // 平凡变体下该位恒等于 `transmission > 0`（由写入侧 `wire.rs::pack_palette_entry` 维护）⇒ 行为不变。
+  //
+  // ---- MT8-7 · 玻璃的**整条光路按体素量化** ----
+  // 喂给状态机的起点与方向都**只由命中体素决定** ⇒ 折射/全反射/介质吸收/背景采样**全部**只依赖
+  // （命中体素 + 它被看见的那个面）⇒ 跑遍整个状态机，一个面上所有像素得到**完全相同**的结果：
+  //   · 入射方向 = 该**体素中心**的视向量的反向（`-face_view_dir(相机, 体素中心)`）—— 与反光/高光
+  //     同一把尺子（`face_view_dir` 的锚点就是体素中心）；
+  //   · 入射点 = 该**命中面的中心**（`p_voxel + n·(0.5/|n| + eps)`）—— 与阴影/反射射线的起点
+  //     **同一个构造**（`n_off`），不另立第二套外推。
+  // ⇒ **一个玻璃面 = 一个平色**（含透过它看到的那一格背景），与材质色、高光、反射**同一粒度**。
+  // 成本**不变**（同样的循环、同样的射线数）。`t_min` 传 0 —— beam 预 pass 的 `t_min` 是沿
+  // **相机那条射线**量的，换到这个起点后没有意义（而从这里到玻璃另一侧的距离本来就很短）。
+  // ⚠️ 折射是**光路几何**、必须知道面法线 ⇒ 粒度天然是"体素 + 面"（本引擎里"面"就是着色量子：
+  // 材质色/高光/反射也都是逐面）。
+  // 玻璃自身的不透明外观（in-scatter 的"另一端"）：非玻璃像素恒 0 ⇒ 下方整支被折掉、零开销。
+  var glass_col = vec3<f32>(0.0);
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
-    let g = trace_glass(origin_voxel, dir_voxel, t_min, frustum_length, sun_dir, sky, sun_c);
+    let fg = make_grid(u32(first.obj_id) + 1u);
+    let fp = voxel_center_world(fg, first.voxel);
+    let fnn = voxel_normal(fg, first.voxel, first.face_id, first.n);
+    let f_off = 0.5 / max(max(abs(fnn.x), abs(fnn.y)), max(abs(fnn.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    let fv = face_view_dir(origin_voxel, fp);
+    let g = trace_glass(fp + fnn * f_off, -fv, 0.0, frustum_length, sun_dir, sky, sun_c);
     best = g.ray;
     dir = g.dir;
     through = g.tint;
     refl = g.refl;
+    // ---- MT8-9 · in-scatter（与不透明路径**逐项同一套**光源项）----
+    // `col` 里只有 `背景 × through` ⇒ 必须有 `玻璃自身的不透明外观 × (1 − through)` 补上来，
+    // 否则中间档发黑；且 `透明度 = 0%`（`transmission = 0` ⇒ **不是介质** ⇒ 走真正的不透明路径）
+    // 与中间档之间会出现模型跳变。物理上 `T → 0` **必须连续收敛**到不透明外观 ⇒ 这里用与不透明路径
+    // **同一套**着色（硬约束 1：`fetch_material` + `brdf_reflected`，多一个**调用点**、不是新公式），
+    // `SurfaceLight` 与不透明路径**逐字段同构**（太阳 + 阴影 + 环境 + GI）：
+    //   · 太阳项必须经 `sun_transmittance` 那条**真阴影射线** —— `sun_vis` 恒 1 会让玻璃无条件吃到
+    //     满太阳（深室内白得发光）；
+    //   · GI 项必须接（与不透明路径同一个 `gi_upsample_joint` + 同一套键 + 同一个 `cov` 地板）——
+    //     背光/阴影面那一侧 `ndl = 0` 且 `amb = sky·0.05·ao` 被 AO 压到 ≈ 0（实心大块的 cell 自身
+    //     fill 高 ⇒ `light_field_ao` 接近 0），不透明面在同一处靠 GI 兜底。
+    // 成本（只对"非全透"的玻璃像素付，且有下面的早退）：**+1 条阴影射线 + 4 次导引读 + 1 次 GI 采样**
+    // （≈ 每玻璃像素一条射线；MT4 实测全屏一条射线 = 1.85 ms ⇒ 覆盖率 5% ≈ 0.09 ms）。
+    // **早退**：`through ≈ 1`（透明度 100% = 全透）时整段跳过。
+    let f_alpha = vec3<f32>(1.0) - through;
+    if (max(max(f_alpha.x, f_alpha.y), f_alpha.z) > 1.0 / 255.0) {
+      let fm = fetch_material(first.palette_base, first.pal, first.point, fnn, PBR_DEBUG_ASSET);
+      // ---- 阴影（与不透明路径同一个构造：同一条 `sun_transmittance`、同一个起点外推 `n_off`）----
+      let f_ndl = max(dot(fnn, sun_dir), 0.0);
+      var f_sun = 0.0;
+      if (f_ndl > 0.0) {
+        f_sun = sun_transmittance(fp + fnn * f_off, sun_dir, first.voxel, first.obj_id);
+      }
+      // ---- 环境 + GI（与不透明路径逐字段同构：同一个 `gi_upsample_joint`、同一套键、同一个 cov 地板）
+      // 键必须取**玻璃那个体素/面**的（不是 `best` 的）：GI 缓冲在本像素上存的就是"主射线命中的那个面"
+      // 的 GI，而主射线命中的正是这个玻璃面（`gi/screen.wesl` MT5-1：介质像素照常产出 GI）⇒ 键对得上。
+      let fk0 = gi_key0(first.voxel);
+      let fk1 = gi_key1(first.voxel, first.face_id, first.obj_id);
+      var f_gi = vec3<f32>(0.0);
+      var f_cov = 0.0;
+      if (gi_u.misc.x > 0.5) {
+        let fguv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+                 / vec2<f32>(f32(size.x), f32(size.y));
+        let fs = textureSampleLevel(gi_tex, light_samp, fguv, 0.0);
+        let fgw = max(fs.a, 1e-4);
+        f_gi = gi_upsample_joint(fguv, vec2<u32>(textureDimensions(gi_tex)), fk0, fk1, fnn,
+                                 fs.rgb / fgw);
+        f_cov = fs.a / fgw;
+      }
+      let f_amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, f_cov)
+                * light_field_ao(fp, first.obj_id);
+      glass_col = brdf_reflected(fm, fnn, fv,
+                                 SurfaceLight(sun_dir, sun_c, f_sun, f_amb, f_gi))
+                + emissive_radiance(fm, GI_EMIT_GAIN);
+    }
   }
   var col = sky_rgb() * through + refl;
   if (best.hit) {
@@ -576,6 +652,14 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     col = col * through + refl;
   }
+  // ---- MT8-9 · 透明度的 in-scatter 混入（`col` 此刻 = 背景×through + refl）----
+  // 「透明度」= **混合比**（标准 alpha 合成，`through` 是逐段 alpha，与厚度无关见 `trace.wesl::MediumRay`）：
+  //   透明度 100%（`through = 1`）⇒ 纯背景（上方已早退、不花额外成本）；
+  //   中间档 ⇒ 背景与"这块玻璃**按不透明材质着色**的样子"按 `(1 − through)` 线性混合 ⇒ **单调、不发黑**；
+  //   透明度 0%（`transmission = 0`）⇒ 不是介质 ⇒ 走上面的不透明分支；因为 `glass_col` 与那条分支
+  //     用的是**同一套着色** ⇒ 那一档**连续收敛**。
+  // `glass_col` 只有首命中是介质时才非 0 ⇒ 非玻璃像素这一行是 `+ 0`（零成本）。
+  col = col + glass_col * (vec3<f32>(1.0) - through);
   write_output(coord0, col);
 }
 
