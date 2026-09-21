@@ -1,5 +1,6 @@
 {
   "wgsl-analyzer.diagnostics.typeErrors": false,
+  "wgsl-analyzer.diagnostics.nagaParsingErrors": false,
   "rust-analyzer.cargo.extraArgs": [
     "--release"
   ]
