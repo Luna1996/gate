@@ -36,6 +36,9 @@ pub struct GiConsts {
   /// **帧内逐面去重表**每槽 word 数（`FACE_WORDS`，权威值在 `gi/common.wesl`）：
   /// Rust 按它开表 buffer（槽数 = GI 网格像素数 × 2，向上取 2 的幂）。
   pub face_words: u32,
+  /// **二次顶点按面缓存**每槽 word 数（`GI_SEC_WORDS`，权威值在 `gi/common.wesl`）：
+  /// 同一套槽数规则（GI 网格像素数 × 2 向上取 2 的幂）。
+  pub gi_sec_words: u32,
 }
 
 /// 需要的全部常量名（缺一即 fail fast）。
@@ -51,6 +54,7 @@ const REQUIRED: &[&str] = &[
   "GI_SS_M_CAP_K",
   "GI_SS_M_CAP_K_HQ",
   "FACE_WORDS",
+  "GI_SEC_WORDS",
 ];
 
 /// 材质资产两侧共用的常量（权威值在 WESL `common.wesl`）。
@@ -115,6 +119,7 @@ impl GiConsts {
       gi_ss_m_cap_k: get("GI_SS_M_CAP_K"),
       gi_ss_m_cap_k_hq: get("GI_SS_M_CAP_K_HQ"),
       face_words: get("FACE_WORDS"),
+      gi_sec_words: get("GI_SEC_WORDS"),
     };
 
     if out.gi_res_words < 2 {
@@ -134,6 +139,14 @@ impl GiConsts {
       let msg = format!(
         "FACE_WORDS = {} 太小：逐面去重表每槽至少要放「标志 + 键 2 + 认领者 texel + palette + 颜色 3」= 8 字：{out:?}",
         out.face_words
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if out.gi_sec_words < 5 {
+      let msg = format!(
+        "GI_SEC_WORDS = {} 太小：二次顶点缓存每槽至少要放「键 2 + 辐亮度 3」= 5 字：{out:?}",
+        out.gi_sec_words
       );
       error!("{msg}");
       panic!("{msg}");

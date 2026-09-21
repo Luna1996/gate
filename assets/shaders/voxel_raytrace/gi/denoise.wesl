@@ -188,11 +188,13 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let ty = y + dy;
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
       let tb = (u32(ty) * size.x + u32(tx)) * GI_DEN_GUIDE_WORDS;
-      if (!gi_den_valid_b(tb)) { continue; }
-      let tk0 = gi_den_key0_b(tb);
-      let tk1 = gi_den_key1_b(tb);
-      // 法线用的也是**存的**着色法线（`gi_main` 算一次），这里不解包第二遍。
-      if (!gi_same_surface(tk0, tk1, gi_guide[tb + GI_DEN_G_NRM], k0, k1, n_c)) { continue; }
+      // 与 atrous 同一套两级读：平面归属只用键（`gi_same_surface` 的两半，判据一字不改）。
+      let tk0 = gi_guide[tb + GI_DEN_G_KEY0];
+      let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
+      if ((tk0 | tk1) == 0u) { continue; }
+      if (!gi_den_same_plane(tk0, tk1, k0, k1)) { continue; }
+      // 法线用的也是**存的**着色法线（`gi_main` 算一次），只在平面归属通过后才解包。
+      if (dot(gi_den_nrm_b(tb), n_c) < GI_DEN_N_DOT) { continue; }
       let c = textureLoad(gi_raw_tex, vec2<i32>(tx, ty), 0).rgb;
       if (tk0 == k0 && tk1 == k1) {
         let l = dot(c, GI_LUMA);
@@ -343,12 +345,15 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
       let ty = y + dy * step;
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
       let tb = (u32(ty) * size.x + u32(tx)) * GI_DEN_GUIDE_WORDS;
-      if (!gi_den_valid_b(tb)) { continue; }
-      let tk0 = gi_den_key0_b(tb);
-      let tk1 = gi_den_key1_b(tb);
+      // 导引**两级读**：平面归属只用两个键字（被它拒掉的 tap 不再读法线那个字）。大核的多数 tap
+      // 都在这一步退出（薄板另一侧、隔一格的平行面、天空都被 `gi_den_same_plane` 精确拒掉）⇒
+      // 每帧省下这部分 tap 的 1/3 导引流量，且不改变任何判据（`gi_same_surface_n` = 同一判据的两半）。
+      let tk0 = gi_guide[tb + GI_DEN_G_KEY0];
+      let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
+      if ((tk0 | tk1) == 0u) { continue; }
+      if (!gi_den_same_plane(tk0, tk1, k0, k1)) { continue; }
       let tn = gi_den_nrm_b(tb);
-      // 不是同一个面 ⇒ 硬拒（cut，不是把权重压小）：大核模糊永远不该跨过一条真实的几何边界。
-      if (!gi_same_surface_n(tk0, tk1, tn, k0, k1, n_c)) { continue; }
+      if (dot(tn, n_c) < GI_DEN_N_DOT) { continue; }
       let s = textureLoad(gi_dn_src, vec2<i32>(tx, ty), 0).rgb;
       // 同面键 ⇒ 满权重 1（同一面内的差异只可能是噪声，见文件头 ③）；
       // 同一个面但不是同键（切向偏移 / 法线倾斜度不同）⇒ 法线点积 × 亮度 range 权重：

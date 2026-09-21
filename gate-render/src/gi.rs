@@ -201,8 +201,8 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
     },
     count: None,
   };
-  let buf8 = || BindGroupLayoutEntry {
-    binding: 8,
+  let buf = |binding: u32| BindGroupLayoutEntry {
+    binding,
     visibility: C,
     ty: BindingType::Buffer {
       ty: BufferBindingType::Storage { read_only: false },
@@ -230,7 +230,9 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
       // 帧内逐面去重表（`voxel_raytrace/gi/common.wesl` 的 `FACE_*`；槽数按 GI 网格给）。
       // `read_only = false` 必须与 WESL 侧 `array<atomic<u32>>` 的声明一致：`gi_main` 认领（CAS）、
       // `dda_face_main` 写着色、`dda_main` 查表 —— 三条 pipeline 用的是同一份声明。
-      buf8(),
+      buf(8),
+      // 二次顶点按面缓存（`gi/common.wesl` 的 `GI_SEC_*`）：只有 `gi_main` 用（GI 射线的命中着色）。
+      buf(9),
     ],
   )
 }
@@ -658,6 +660,13 @@ fn prepare_gi(
     .and_then(|a| a.face_slots_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
+  // binding 9 = 二次顶点按面缓存（GI 射线命中着色用）；未就绪时同样退化成 4 B 占位
+  // （`gi_sec_slot_of` 会因 `arrayLength` 不足而返回 ok = false ⇒ 走内联着色）。
+  let gi_sec_slots = aux
+    .as_ref()
+    .and_then(|a| a.gi_sec_slots_buffer())
+    .cloned()
+    .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
@@ -665,6 +674,7 @@ fn prepare_gi(
       BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&gi_view) },
       BindGroupEntry { binding: 6, resource: guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
+      BindGroupEntry { binding: 9, resource: gi_sec_slots.as_entire_binding() },
     ],
   );
   commands.insert_resource(GiBg5(bg5));

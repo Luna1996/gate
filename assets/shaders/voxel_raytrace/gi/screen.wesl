@@ -1,6 +1,6 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance, gi_ray_secondary_key};
 import package::trace::{make_grid};
@@ -363,24 +363,43 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   var sel_hit = false;
   var sel_ok = false;
   var r = gi_res_none();
-  for (var k = 0u; k < cand_n; k = k + 1u) {
-    let dir = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + k * 0x9E3779B9u + 1u)));
-    let s = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce);
-    let w = s.l * GI_PI;
-    let lum = max(dot(w, GI_LUMA), 0.0);
-    r.w_sum = r.w_sum + w;
-    r.m = r.m + 1.0;
-    sel_cum = sel_cum + lum;
-    let u = gi_rand2(gi_mix(seed + k * 0x85EBCA77u + 7u)).x;
-    if (!sel_have || u * sel_cum < lum) {
-      sel_have = true;
-      sel_dir = dir;
-      sel_l = s.l;
-      sel_sk0 = s.sk0;
-      sel_sk1 = s.sk1;
-      sel_hit = s.sk_hit;
-      sel_ok = s.sk_ok;
+  // **ILP 批量**：批内 `GI_SS_RAY_BATCH` 条射线只差方向、互相独立 ⇒ 先把它们全发出去（多条层次
+  // DDA 的依赖 load 同时在飞），再按原本的 `k` 顺序做累计与蓄水池更新。方向序列、样本与比较顺序
+  // 都与逐条写法完全一致 ⇒ 结果**逐位相同**（`gi_ray_radiance` 无副作用：它对 `gi_sec_slots` 的
+  // 填充是写同值的幂等操作，只影响性能不影响值）。`cand_n` 恒是批大小的整数倍（4/8/8/16）。
+  // 批大小取 1 即退化成逐条。
+  var k = 0u;
+  loop {
+    if (k >= cand_n) { break; }
+    var b_dir: array<vec3<f32>, GI_SS_RAY_BATCH>;
+    var b_s: array<GiRaySample, GI_SS_RAY_BATCH>;
+    for (var i = 0u; i < GI_SS_RAY_BATCH; i = i + 1u) {
+      let kk = k + i;
+      let dir = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + kk * 0x9E3779B9u + 1u)));
+      b_dir[i] = dir;
+      b_s[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce);
     }
+    for (var i = 0u; i < GI_SS_RAY_BATCH; i = i + 1u) {
+      let kk = k + i;
+      let dir = b_dir[i];
+      let s = b_s[i];
+      let w = s.l * GI_PI;
+      let lum = max(dot(w, GI_LUMA), 0.0);
+      r.w_sum = r.w_sum + w;
+      r.m = r.m + 1.0;
+      sel_cum = sel_cum + lum;
+      let u = gi_rand2(gi_mix(seed + kk * 0x85EBCA77u + 7u)).x;
+      if (!sel_have || u * sel_cum < lum) {
+        sel_have = true;
+        sel_dir = dir;
+        sel_l = s.l;
+        sel_sk0 = s.sk0;
+        sel_sk1 = s.sk1;
+        sel_hit = s.sk_hit;
+        sel_ok = s.sk_ok;
+      }
+    }
+    k = k + GI_SS_RAY_BATCH;
   }
 
   // ---- ③ 空间复用：读**上一帧**邻居的 reservoir 只并累计量（零射线），只影响本帧估计（见 ④）----

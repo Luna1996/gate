@@ -204,6 +204,12 @@ struct GiUniform {
 /// （relaxed ⇒ 与普通访存同价）。槽数由 Rust 按 GI 网格像素数给（`arrayLength` 读得到）。
 @group(5) @binding(8) var<storage, read_write> face_slots: array<atomic<u32>>;
 
+/// @binding(9)：**二次顶点按面缓存**（槽布局 = `gi/common.wesl` 的 `GI_SEC_*`）。
+/// 键口径与 `face_slots` 相同（`gi_key0`/`gi_key1`），但填充者是 GI 射线自己（惰性、写同值 ⇒ 竞态
+/// 幂等）：同一个面被成千上万条射线打到时只算一次二次顶点着色。生命周期同样只有一帧
+/// （Rust 每帧在 `gi_main` 之前整块清空）；它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
+@group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
+
 // ===== @group(0) @binding(10..)：GI 降噪（两个新 pass，见 `gi/denoise.wesl`）=====
 // 降噪 pass 的 bound group 只有 group(0) 一份（`bindings.wesl` 的 binding 号在**同一个模块里唯一**
 // ⇒ 不改动既有 0..3 的号段，另起 10..）。Rust 侧 `gi_den_*_layout` 与之逐号对应。

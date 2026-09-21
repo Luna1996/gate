@@ -1162,6 +1162,9 @@ pub(crate) struct AuxTexCache {
   /// **帧内逐面去重表**（`face_slots`，@group(5) @binding(8)）：每槽 `FACE_WORDS` 个 u32，
   /// 槽数 = GI 网格像素数 × 2（2 的幂）。每帧在 `gi_main` 之前整块清空（`clear_buffer`）。
   face_slots: Option<Buffer>,
+  /// **二次顶点按面缓存**（`gi_sec_slots`，@group(5) @binding(9)）：每槽 `GI_SEC_WORDS` 个 u32，
+  /// 槽数规则同 `face_slots`；由 GI 射线自己惰性填充 ⇒ 同样每帧整块清空。
+  gi_sec_slots: Option<Buffer>,
   /// 时域历史双缓冲（每像素 `GI_DEN_HIST_WORDS` 个 u32）：`den_flip` 决定哪块是「上帧读」。
   gi_hist: [Option<Buffer>; 2],
   /// 每像素亮度 range 权重尺度 φ（f32，时域写 / atrous 读）。
@@ -1219,6 +1222,11 @@ impl AuxTexCache {
   /// 帧内逐面去重表（BG5 binding 8 用；`gi_main` 认领、`dda_face_main` 写着色、`dda_main` 查表）。
   pub(crate) fn face_slots_buffer(&self) -> Option<&Buffer> {
     self.face_slots.as_ref()
+  }
+
+  /// 二次顶点按面缓存（BG5 binding 9 用；只被 `gi_main` 里 GI 射线的命中着色使用）。
+  pub(crate) fn gi_sec_slots_buffer(&self) -> Option<&Buffer> {
+    self.gi_sec_slots.as_ref()
   }
 }
 
@@ -1845,6 +1853,9 @@ pub(crate) fn prepare_dda_bind_groups(
     let face_slots_n = (px * 2).next_power_of_two().clamp(256, 1u64 << 21);
     beam_cache.face_slots =
       Some(make_buf("gate_face_slots", face_slots_n * c.face_words as u64 * 4));
+    // 二次顶点按面缓存：同一套槽数规则（被 GI 射线打到的面的数量与可见面同量级）。
+    beam_cache.gi_sec_slots =
+      Some(make_buf("gate_gi_sec_slots", face_slots_n * c.gi_sec_words as u64 * 4));
     beam_cache.gi_hist = [
       Some(make_buf("gate_gi_hist_a", px * c.gi_den_hist_words as u64 * 4)),
       Some(make_buf("gate_gi_hist_b", px * c.gi_den_hist_words as u64 * 4)),
@@ -2206,8 +2217,12 @@ pub(crate) fn dispatch_dda(
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
     // 逐面去重表**每帧整块清空**（`FACE_W_FLAG == 0` = 空槽）：清空必须排在 `gi_main` 之前，
     // 否则上一帧的认领会把本轮同槽的新键挡在门外（撞键只会少赚，但残留表会让收益归零）。
+    // 二次顶点缓存同样整块清空：它的值依赖太阳与光照，跨帧留用会拿到过期光照。
     if let Some(fs) = aux.face_slots_buffer() {
       ctx.command_encoder().clear_buffer(fs, 0, None);
+    }
+    if let Some(ss) = aux.gi_sec_slots_buffer() {
+      ctx.command_encoder().clear_buffer(ss, 0, None);
     }
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_gi", |pass| {
       pass.set_pipeline(gi_pipe);

@@ -1,10 +1,10 @@
-import package::bindings::{light_u};
+import package::bindings::{gi_sec_slots, light_u};
 import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, face_view_dir, fetch_material, sky_rgb};
-import package::gi::common::{gi_key0, gi_key1, gi_key_ok};
+import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_key0, gi_key1, gi_key_ok, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
-import package::world::{voxel_center_world, voxel_normal, world_trace_medium};
+import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_medium};
 
 // ============================================================================
 // 单条 GI 射线的辐射求值（**唯一口径**：新鲜候选、借用候选、时域/空间复用全部走这里）。
@@ -63,68 +63,99 @@ struct GiRaySample {
   sk_ok: bool,
 }
 
+/// **二次顶点着色（唯一实现）**：`gi_ray_radiance` 的命中分支，也是 `gi_sec_slots` 缓存的内容。
+/// 返回**不含**射线自身介质透过率 `tint` 的入射辐亮度（`tint` 由调用方逐射线乘）。
+///
+/// 全部输入都只由"命中的那个可见体素面"决定 ⇒ 可以按面缓存：
+///   · 采样点一律取**体素中心**（`voxel_center_world`），与主 pass 的 `p_voxel` 同口径。它同时是
+///     材质取值的点（`fetch_material` 内部本就量化到体素中心，传体素中心让 mip LOD 的距离也逐面
+///     确定）、太阳 NEE 起点的基准（沿面法线外推半体素 + eps）、AO 的采样点；
+///   · 视向量锚点 = 同一个体素中心（`face_view_dir` 那份契约）；
+///   · 着色法线是 (voxel, face) 的纯函数。
+///
+/// 出射辐亮度约定与 `dda_main` 的不透明分支逐项对齐（硬约束 3）：`BRDF(...) / π + albedo·emissive`
+/// —— 同一个 `brdf_reflected`、同一个 `fetch_material`；`/π` 只作用于反射项（自发光本就是 radiance）。
+/// 与主 pass 的差异只有两条、都是物理上该不同的：① 太阳项乘 `sun_bounce`（菜单「太阳反弹」关掉时
+/// 二次顶点不做 NEE）；② 没有 GI 项（二次顶点只算一次弹射）⇒ `SurfaceLight.gi` 传 0。
+fn gi_secondary_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
+                      sun_bounce: f32) -> vec3<f32> {
+  let hg = make_grid(u32(sh.obj_id) + 1u);
+  let hp = voxel_center_world(hg, sh.voxel);
+  let hn = voxel_normal(hg, sh.voxel, sh.face_id, sh.n);
+  let ndl = max(dot(hn, sun_dir), 0.0);
+  var sun = 0.0;
+  // `sun_bounce` 来自 uniform（一次派发内恒定 ⇒ 分支不发散）：关掉时整条阴影射线都不发。
+  if (sun_bounce > 0.0 && ndl > 0.0) {
+    let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    sun = sun_transmittance(hp + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
+  }
+  // 天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
+  let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hp, sh.obj_id);
+  // 视向量：**逐面**（与 `dda_main` 共用 `face_view_dir`）。`org` = 这条 GI 射线自己的起点（不是
+  // 相机眼位：二次顶点"回到观察者"的方向就是回到上一个顶点）；锚点按面量化 ⇒ 它不再精确等于 -dir。
+  let v = face_view_dir(org, hp);
+  let m = fetch_material(sh.palette_base, sh.pal, hp, hn, MATERIAL_DEBUG_NONE);
+  return brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0)))
+         / GI_PI
+       + emissive_radiance(m, GI_EMIT_GAIN);
+}
+
 /// 一条 GI 射线的入射辐亮度：真实光路 + 二次顶点「太阳 NEE + 天光 × AO」，逃逸取天光。
 /// 不含 cos 因子与 π —— RIS 的权重是 `p̂ / p`，系数在调用方给（余弦候选给 π）。
 ///
-/// **MT5-2 · 二次射线穿介质续行**：光路用 `world_trace_medium`（`stop_on_air = false`）而不是
-/// `world_raycast` —— 撞到**透射**体素不停、沿途按格累积乘性吸收 `tint`，于是一条从玻璃前面出发的
-/// GI 射线会**穿过玻璃**打到它后面的真实表面。旧写法用 `world_raycast`（`penetrate = false`，
-/// 撞到任何实体体素都停）⇒ 二次顶点落在**玻璃面本身**上：玻璃后面的表面拿不到 GI，
-/// 而且玻璃面被当成"不透明表面"着色。
-/// 与 `sun_transmittance`（同样 `world_trace_medium` + `stop_on_air = false`）是**同一套写法与口径**：
-///   · **停点/键不变**（硬约束 2）：只有不透明体素才停 ⇒ `sk0/sk1` 仍取最终命中的那个不透明面，
-///     `gi_key0/gi_key1` 的口径**一字未改** ⇒ 复用判据（键逐位相等）不受影响；
-///   · **吸收口径**：`tint` 乘在**整个** `l` 上（BRDF 项与自发光项都乘）—— 与主 pass 的
-///     `col = col * through + refl` 是同一个"乘性吸收"结构（硬约束 3：口径不分叉）。
-/// 与旧写法的唯一范围差别：只遍历**主世界网格**（与 `sun_transmittance` 一致 —— 物体网格没有
-/// 介质续行；而当前 `Volumes::add_object` 在应用里也没有调用点 ⇒ 无实际行为差异）。
+/// 光路用 `world_trace_medium`（`stop_on_air = false`）：撞到**透射**体素不停、沿途按格累积乘性吸收
+/// `tint` ⇒ 从玻璃前面出发的射线会**穿过玻璃**打到它后面的真实表面。`tint` 乘在**整个** `l` 上
+/// （BRDF 项与自发光项都乘）—— 与主 pass 的 `col = col * through + refl` 是同一个"乘性吸收"结构
+/// （硬约束 3：口径不分叉）。只有不透明体素才停 ⇒ 停点与 `sk0/sk1` 的口径不变（硬约束 2）。
+/// 与 `sun_transmittance` 同一套写法；只遍历**主世界网格**（物体网格没有介质续行，且
+/// `Volumes::add_object` 在应用里没有调用点 ⇒ 无实际行为差异）。
+/// 命中分支的着色走 `gi_secondary_shade`，但先查 `gi_sec_slots`：同一个面被多条射线打到时只算一次。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32) -> GiRaySample {
   var tint = vec3<f32>(1.0);
   let sh = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
-  // 逃逸 → 天光辐亮度（穿过介质看到的天空同样按 `tint` 吸收：`tint` 无介质时恒为 1.0）。
-  var l = sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
-  if (sh.hit) {
-    let hit_p = org + dir * sh.t;
-    let hg = make_grid(u32(sh.obj_id) + 1u);
-    let hn = voxel_normal(hg, sh.voxel, sh.face_id, sh.n);
-    let ndl = max(dot(hn, sun_dir), 0.0);
-    var sun = 0.0;
-    // `sun_bounce` 来自 uniform（一次派发内恒定 ⇒ 分支不发散）：关掉时整条阴影射线都不发。
-    if (sun_bounce > 0.0 && ndl > 0.0) {
-      let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
-      sun = sun_transmittance(hit_p + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
-    }
-    // 二次顶点的天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
-    let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hit_p, sh.obj_id);
-    // ---- MT3-4 · 与 `dda_main` **同一个** BRDF 与同一个材质入口（硬约束 3）----
-    // 只有三处不同（`dda_main` 那边的同一张表在 `main.wesl` 的注释里），都是物理上该不同的：
-    //   ① 太阳项乘 `sun_bounce`（菜单「渲染/RESTIR GI/太阳反弹」：关掉时二次顶点不做太阳 NEE）；
-    //   ② **没有 GI 项**（二次顶点只算一次弹射）⇒ `SurfaceLight.gi` 传 0；
-    //   ③ 反射项 `/π` 转辐亮度（自发光不除，见文件头）。
-    // 材质取值走同一入口 `fetch_material`；`MATERIAL_DEBUG_NONE` = 调试通道**不作用于 GI**
-    // （与 MT2-4 一致：那条通道只是主 pass 的调试视图）。
-    // ---- 视向量：**逐面**（硬约束 3：与 `dda_main` 共用 `face_view_dir` 那一份契约）----
-    // `ray_origin` = **这条 GI 射线自己的起点 `org`**（不是相机眼位：二次顶点的"回到观察者"方向
-    // 就是回到上一个顶点 = 射线起点）；锚点 = 命中体素中心 ⇒ 同一个体素面同值。
-    // 它只喂二次顶点的反光/高光（`brdf_reflected` 的 GGX 那一支）—— `v` 在本工程没有别的消费者。
-    // 按面 ⇒ GI 里烘进去的二次顶点高光也是"一个体素面一个值"，不再是一条跨体素的连续亮带
-    // （这是 2026-09-21 用户复查"还有不是逐体素着色的部分，重点调查反光、高光"的收口之一）。
-    let v = face_view_dir(org, voxel_center_world(hg, sh.voxel));
-    // `v` 的含义与改动前一致（由着色点指向观察者 = 回到上一个顶点）；只是锚点按面量化，它不再精确等于 `-dir`。
-    let m = fetch_material(sh.palette_base, sh.pal, hit_p, hn, MATERIAL_DEBUG_NONE);
-    // MT5-2：二次顶点的辐亮度整体乘 `tint`（BRDF 项与自发光项都乘）—— 它就是"这个二次顶点发出的
-    // 光，穿过玻璃到达本着色点"的乘性吸收；无介质时 `tint == 1.0` ⇒ 逐位等于改动前。
-    l = (brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0))) / GI_PI
-      + emissive_radiance(m, GI_EMIT_GAIN)) * tint;
+  // 逃逸 → 天光辐亮度（穿过介质看到的天空同样按 `tint` 吸收）；天空没有面 ⇒ 不进缓存。
+  if (!sh.hit) {
+    return GiRaySample(sky_rgb() * GI_SKY_RADIANCE_SCALE * tint, 0u, 0u, false, true);
   }
-  return GiRaySample(
-    l,
-    gi_key0(sh.voxel),
-    gi_key1(sh.voxel, sh.face_id, sh.obj_id),
-    sh.hit,
-    !sh.hit || gi_key_ok(sh.voxel),
-  );
+  let k0 = gi_key0(sh.voxel);
+  let k1 = gi_key1(sh.voxel, sh.face_id, sh.obj_id);
+  let key_ok = gi_key_ok(sh.voxel);
+  // ---- 二次顶点按面缓存（`gi_sec_slots`：惰性填充、写同值 ⇒ 竞态幂等，见 `gi/common.wesl`）----
+  var l = vec3<f32>(0.0);
+  var cached = false;
+  var slot_ok = false;
+  var sb = 0u;
+  if (key_ok) {
+    let slot = gi_sec_slot_of(k0, k1, &slot_ok);
+    if (slot_ok) {
+      sb = slot * GI_SEC_WORDS;
+      if (atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]) == k0
+          && atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]) == k1) {
+        l = vec3<f32>(
+          bitcast<f32>(atomicLoad(&gi_sec_slots[sb + GI_SEC_W_RAD])),
+          bitcast<f32>(atomicLoad(&gi_sec_slots[sb + GI_SEC_W_RAD + 1u])),
+          bitcast<f32>(atomicLoad(&gi_sec_slots[sb + GI_SEC_W_RAD + 2u])));
+        cached = true;
+      }
+    }
+  }
+  if (!cached) {
+    l = gi_secondary_shade(sh, org, sun_dir, sun_c, sun_bounce);
+    // 只写"空槽或本面自己的槽"（撞键的别的面不动它）⇒ 槽里的键与辐亮度永远同源。
+    if (slot_ok) {
+      let c0 = atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]);
+      let c1 = atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]);
+      if ((c0 | c1) == 0u || (c0 == k0 && c1 == k1)) {
+        atomicStore(&gi_sec_slots[sb + GI_SEC_W_RAD], bitcast<u32>(l.x));
+        atomicStore(&gi_sec_slots[sb + GI_SEC_W_RAD + 1u], bitcast<u32>(l.y));
+        atomicStore(&gi_sec_slots[sb + GI_SEC_W_RAD + 2u], bitcast<u32>(l.z));
+        atomicStore(&gi_sec_slots[sb + GI_SEC_W_K0], k0);
+        atomicStore(&gi_sec_slots[sb + GI_SEC_W_K1], k1);
+      }
+    }
+  }
+  return GiRaySample(l * tint, k0, k1, true, key_ok);
 }
 
 /// 只求**二次顶点键**的轻量射线（时域复用的二次顶点验证专用）：键的口径与 `gi_ray_radiance`

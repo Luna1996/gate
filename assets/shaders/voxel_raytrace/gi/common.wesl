@@ -5,7 +5,7 @@
 //   · `gi/ray.wesl`     —— 射线命中后算键（时域验证与复用都吃它）；
 //   · `gi/denoise.wesl` —— 降噪导引的键与法线打包（与复用判据必须是同一套编码）。
 
-import package::bindings::{face_slots};
+import package::bindings::{face_slots, gi_sec_slots};
 
 /// 键合法范围：13 bit 有符号偏移（voxel 坐标绝对值 < 4096）。
 fn gi_key_ok(v: vec3<i32>) -> bool {
@@ -123,11 +123,42 @@ fn face_slot_count() -> u32 {
   return arrayLength(&face_slots) / FACE_WORDS;
 }
 
-/// 面键 → 槽下标。`ok = false` = 表未就绪（占位缓冲 / 首帧）⇒ 调用方一律走内联着色。
+/// 面键 → 槽下标。`ok = false` = 表未就绪（占位缓冲）/ 首帧 ⇒ 调用方一律走内联着色。
 fn face_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   let n = face_slot_count();
   *ok = n >= 1u;
   if (!*ok) { return 0u; }
   // 槽数是 2 的幂 ⇒ 用位与取模（`gi_mix` 是本工程唯一的哈希，见文件头）。
+  return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
+}
+
+// ============================================================================
+// 二次顶点按面缓存（`gi_sec_slots`）—— 只服务 GI 射线的命中着色（`gi/ray.wesl`）
+// ============================================================================
+// 为什么能按面缓存：二次顶点着色里**除射线自身的介质透过率 `tint` 以外**的全部输入都只由"命中的
+// 那个可见体素面"决定 —— 材质取值（`fetch_material` 内部把采样点与 mip LOD 距离都量化到体素中心）、
+// 着色法线（`voxel_normal` 是 (voxel, face) 的纯函数）、视向量（锚点 = 体素中心）、太阳 NEE 的起点
+// （体素中心沿面法线外推）与 AO 采样点（体素中心）—— 后两者与主 pass 的 `p_voxel` 是同口径。
+// 于是一条面被成千上万条 GI 射线打到时，着色只算一次；`tint` 留在调用方按**逐射线**乘。
+//
+// 与 `face_slots` 的分工：那张表按"**被看见的**面"由 `gi_main` 认领，存主 pass 的最终颜色与逐面
+// GI 均值；这张表按"**被 GI 射线打到的**面"惰性填充（同一个面可能完全不可见），存二次顶点的入射
+// 辐亮度。两者键口径相同（`gi_key0`/`gi_key1`），用途不重叠。
+//
+// **为什么不需要认领 / 两相**：填充者算出的值逐位相同 ⇒ 写同值 ⇒ 竞态幂等（不像主 pass 的查表那样
+// 要求"先写后读"的可见性）。唯一风险窗口是"键已可见、辐亮度字尚未落地"（WGSL 没有全局 fence，
+// 只有 workgroup 级的 `storageBarrier`）：那一条射线读到 0，等于少一个二次顶点样本 —— 属于随机
+// 估计里的一次异常样本（每 texel 每帧 4~8 个样本，还有时域累积与降噪），不可见也不逐帧相干。
+// 写入顺序刻意是「辐亮度 → 键」，配合"键不符 ⇒ 重算"的回退。
+const GI_SEC_WORDS: u32 = 5u;
+const GI_SEC_W_K0: u32 = 0u;
+const GI_SEC_W_K1: u32 = 1u;
+const GI_SEC_W_RAD: u32 = 2u;
+
+/// 面键 → 二次顶点缓存的槽下标。`ok = false` = 表未就绪 ⇒ 该射线走内联着色。
+fn gi_sec_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+  let n = arrayLength(&gi_sec_slots) / GI_SEC_WORDS;
+  *ok = n >= 1u;
+  if (!*ok) { return 0u; }
   return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
 }
