@@ -1,4 +1,4 @@
-//! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
+﻿//! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
 //! BG0 = storage tex / 相机 uniform / beam depth / 眼睛适应状态（只读）；
 //! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理 + 采样器 / 材质资产表 /
 //! PBR 贴图数组 / **PBR 专用采样器**（MT2-3）。
@@ -1195,8 +1195,6 @@ pub(crate) struct AuxTexCache {
 /// 链的选取只取决于 `GI_DEN_ATROUS_ITER`（见 `DEN_ATROUS_ROUNDS`）。
 /// 5 轮时 b→a 与 a→b 交替出现（只有 4 张中间靶，靠 ping-pong 撑起任意轮数），
 /// 所以这里按「用到的组合」去重列，而不是按轮次列。
-/// **体积散射（`volumetric.rs`）复用同一张表**：它的空间段跑的是同一批 `gi_denoise_atrous*` 入口，
-/// 只是把雾自己的导引 / 中间靶 / φ 绑到同一份 layout 的号上。
 pub(crate) const DEN_ATROUS_CHAINS: [[usize; 2]; 6] =
   [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3], [2, 1]];
 /// `den_bg` 里「第 `i` 轮（0 起）该用哪个 src→dst 组合」的查表（按 `GI_DEN_ATROUS_ITER` 取前 n 项）。
@@ -1238,8 +1236,8 @@ impl AuxTexCache {
   }
 
   /// GI pass 的 @group(0)（view uniform + beam depth）。
-  /// **体积散射复用同一份**（两者要的绑定逐字相同，见 `volumetric::dispatch_fog`）——
-  /// 这一份不由 GI 的开关控制（`prepare_dda_bind_groups` 无条件建），所以 GI 关掉时雾照常能跑。
+  /// **光柱的掩码 pass 复用同一份**（两者要的绑定逐字相同，见 `volumetric::dispatch_fog`）——
+  /// 这一份不由 GI 的开关控制（`prepare_dda_bind_groups` 无条件建），所以 GI 关掉时光柱照常能跑。
   pub(crate) fn gi_bg0(&self) -> Option<&BindGroup> {
     self.gi_bg0.as_ref()
   }
@@ -1617,7 +1615,7 @@ pub(crate) fn init_dda_pipelines(
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::gi::gi_bg4_layout()];
   // `dda_main` 比其它两个入口多两份 group：group(5) = GI 的采样侧（见 `gi_read`）、
-  // group(6) = 体积散射（godray）的采样侧（见 `crate::volumetric::fog_read_layout`），只加给它。
+  // group(6) = 光柱（godray）的采样侧（见 `crate::volumetric::fog_read_layout`），只加给它。
   // 逐面两个 pass 与主 pass 共用同一份 layout（下面 `dda_layouts_face`）—— 它们不引用 group(6)，
   // 派发时也不需要设它（未用的绑定会被剪掉）。
   let dda_layouts = {
@@ -2204,7 +2202,7 @@ pub(crate) fn dispatch_dda(
   });
   let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
 
-  // 体积散射（godray）的采样侧（group(6)）：**恒有** —— `prepare_fog` 每帧都建这一组
+  // 光柱（godray）的采样侧（group(6)）：**恒有** —— `prepare_fog` 每帧都建这一组
   // （关掉雾时绑的是 1×1 零纹理 ⇒ 主 pass 那一项恒 +0）。
   // 主 pass 的 layout 里有 group(6)，而逐面两个 pass 与它共用同一份 layout（`dda_layouts_face`）
   // ⇒ 三个 dispatch 都得设这一组（那两个入口不引用它，但 layout 里有 ⇒ 不设会被 wgpu 判成缺绑定）。
@@ -2371,16 +2369,15 @@ pub(crate) fn dispatch_dda(
     }
   }
 
-  // ---- 体积散射（godray，`volumetric.rs`）：必须排在主 pass **之前**（主 pass 采样它的结果）----
-  // 依赖只有 beam 预 pass（t_min 的来源，已在最前跑过）；与 GI / 逐面两条链**互不依赖**
-  // （各自的网格、资源、开关）。关掉时（`FogSettings.enabled = false`）整条链一条 dispatch 都不发。
+  // ---- 光柱（godray，`volumetric.rs`）：必须排在主 pass **之前**（主 pass 采样它的结果）----
+  // 依赖只有 beam 预 pass（掩码那条主射线的 t_min 来源，已在最前跑过）；与 GI / 逐面两条链
+  // **互不依赖**（各自的网格、资源、开关）。关掉时（`FogSettings.enabled = false`）一条 dispatch 都不发。
   // group(0) 复用 GI 那份 `gi_bg0`（view uniform + beam depth）、group(1..3) 复用主 pass 的绑定。
   crate::volumetric::dispatch_fog(
     &mut profiler,
     ctx.command_encoder(),
     fog.gpu.as_deref(),
     fog.settings.as_deref(),
-    gi_gpu.as_deref(),
     &pipeline_cache,
     aux.as_ref().and_then(|a| a.gi_bg0()),
     Some(&bg1.0),
@@ -2389,9 +2386,9 @@ pub(crate) fn dispatch_dda(
   );
 
   // ---- 主 DDA pass：trace + unlit 着色直出 ----
-  // group(6)（体积散射的读侧）在上面就取好了；缺它只可能是首帧（`prepare_fog` 还没跑）⇒ 跳过主 pass。
+  // group(6)（光柱的读侧）在上面就取好了；缺它只可能是首帧（`prepare_fog` 还没跑）⇒ 跳过主 pass。
   if fog_read.is_none() {
-    bevy::log::debug_once!("DDA dispatch: 体积散射 group(6) 未就绪（本帧跳过主 pass）");
+    bevy::log::debug_once!("DDA dispatch: 光柱 group(6) 未就绪（本帧跳过主 pass）");
     return;
   }
   if let Some(dda_pipe) = dda_pipe {
@@ -2411,7 +2408,7 @@ pub(crate) fn dispatch_dda(
         if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
           pass.set_bind_group(5, gi_read, &[]);
         }
-        // 体积散射的采样侧（group(6)）：`dda_main` 在曝光之前把它加到颜色上。
+        // 光柱的采样侧（group(6)）：`dda_main` 在曝光之前把它加到颜色上。
         if let Some(fog_read) = fog_read {
           pass.set_bind_group(6, fog_read, &[]);
         }

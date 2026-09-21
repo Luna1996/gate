@@ -358,7 +358,7 @@ fn register_callbacks(world: &mut World) {
     },
   );
 
-  // 体积散射（godray，菜单「渲染/太阳」）：算法、成本模型、与 GI 的分工全部写在
+  // 光柱（godray，菜单「渲染/太阳」）：算法、成本模型、取舍全部写在
   // `gate-render/src/volumetric.rs` 与 `assets/shaders/voxel_raytrace/volumetric.wesl`；
   // 这里只做「档位 → 数值」的映射与一行日志（数值含义不在这里重复）。
   world.add_observer(
@@ -368,76 +368,35 @@ fn register_callbacks(world: &mut World) {
     ) {
       ("render/sun/vol", MenuAction::Toggle(on)) => {
         fog.enabled = *on;
-        info!("体积散射（godray）→ {}", if *on { "on" } else { "off" });
+        info!("光柱（godray）→ {}", if *on { "on" } else { "off" });
       }
-      // 分辨率档（**每一档都跑**，不是开关）：代价按雾像素数计 ⇒ 1/2 约是全分辨率的 1/4。
-      ("render/sun/vol_res", MenuAction::Select(i)) => {
-        fog.div = gate_render::FogSettings::DIV_CHOICES[(*i).min(2)];
+      ("render/sun/vol_strength", MenuAction::Value(v)) => {
+        fog.strength = v.max(0.0);
+        info!("光柱强度 → {v:.2}（这是「光柱有多亮」的主旋钮）");
+      }
+      ("render/sun/vol_decay", MenuAction::Value(v)) => {
+        fog.decay = v.clamp(0.05, 1.0);
         info!(
-          "体积散射分辨率 → 渲染分辨率的 1/{}（雾像素数为全分辨率的 1/{}）",
-          fog.div,
-          fog.div * fog.div
+          "光柱衰减 → {:.2}（模糊每步的权重：越接近 1 ⇒ 光柱拖得越长；越小 ⇒ 越贴紧太阳）",
+          fog.decay
         );
       }
-      // 质量档（与分辨率档**正交**）：每帧采样数 + 空间段（空间段复用 GI 的 atrous 入口）。
-      ("render/sun/vol_quality", MenuAction::Select(i)) => {
-        fog.quality = (*i).min((gate_render::FogSettings::QUALITY_TIERS - 1) as usize) as u32;
-        let p = fog.plan();
-        let name = ["低", "中", "高", "极高"][fog.tier() as usize];
+      ("render/sun/vol_focus", MenuAction::Value(v)) => {
+        fog.focus = v.clamp(1.0, 64.0);
         info!(
-          "体积散射质量 → {}（每帧每像素采样 {} 条；空间段 {}）",
-          name,
-          fog.samples(),
-          if p.on {
-            format!("{} 轮 atrous（核半径 {}）", p.rounds, p.radius)
-          } else {
-            "关（只有时域累积 + 几何感知上采样）".to_string()
-          }
+          "光柱集中度 → {:.0}（太阳方向权重的指数：越大越集中在太阳附近；1 = 整个天空都发光）",
+          fog.focus
         );
-      }
-      ("render/sun/vol_shadow", MenuAction::Select(i)) => {
-        fog.shadow_dist = gate_render::FogSettings::SHADOW_CHOICES[(*i).min(3)];
-        info!("体积散射阴影距离 → {} voxel（这个效果唯一的成本闸门）", fog.shadow_dist as u32);
-      }
-      ("render/sun/vol_density", MenuAction::Value(v)) => {
-        fog.density = *v;
-        let efold =
-          if *v > 0.0 { format!("{:.0}", 1.0 / v) } else { "∞".to_string() };
-        info!("体积散射消光 σt → {v:.4}/voxel（一个 e-folding ≈ {efold} voxel；这是「雾有多厚」）");
-      }
-      ("render/sun/vol_ground", MenuAction::Value(v)) => {
-        fog.ground_fog = *v;
-        let half =
-          if *v > 0.0 { format!("{:.0}", 0.693 / v) } else { "∞".to_string() };
-        info!(
-          "体积散射地面雾 → {v:.3}/voxel（密度每 {half} voxel 减半；0 = 均匀介质 ⇒ 室外会像雾霾天）"
-        );
-      }
-      ("render/sun/vol_dist", MenuAction::Value(v)) => {
-        fog.fog_dist = *v;
-        info!("体积散射雾距 → {v:.0} voxel（积分距离上限；调小 ⇒ 只有近处的雾，远景保色）");
-      }
-      ("render/sun/vol_gain", MenuAction::Value(v)) => {
-        fog.beam_gain = *v;
-        info!("体积散射光柱增益 → {v:.1}（补的是多重散射丢掉的那部分能量；这是「光柱有多亮」）");
-      }
-      ("render/sun/vol_aniso", MenuAction::Value(v)) => {
-        fog.anisotropy = *v;
-        info!("体积散射前向散射 g → {v:.2}（正值 = 朝着太阳看最亮）");
-      }
-      ("render/sun/vol_ambient", MenuAction::Value(v)) => {
-        fog.ambient = *v;
-        info!("体积散射环境散射 → {v:.2} × sky_color（调大 ⇒ 整幅画面变成乳白蒙版 = 起雾）");
       }
       // 菜单给**度**、引擎吃弧度：全工程只有这一处换算，集中在这里。
-      // 这一个量同时喂两处：雾的阴影锥角，与天空里太阳盘的半径（见 `volumetric.wesl::sky_primary`）。
+      // 这一个量只影响天空里那个太阳盘的半径（`volumetric.wesl::sky_primary`）。
       ("render/sun/vol_soft", MenuAction::Value(v)) => {
         fog.sun_cone = v.to_radians();
-        info!("体积散射太阳角径 → {v:.2}°（同时是光柱边缘的软度与太阳盘的半径）");
+        info!("光柱：太阳角径 → {v:.2}°（天空里那颗太阳盘的半径；0 = 只有一个点）");
       }
       ("render/sun/vol_halo", MenuAction::Value(v)) => {
         fog.halo = *v;
-        info!("体积散射日晕 → {v:.1}（太阳盘外那圈解析拖尾的强度）");
+        info!("光柱：日晕 → {v:.1}（太阳盘外那圈解析拖尾的强度）");
       }
       _ => {}
     },

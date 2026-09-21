@@ -1,4 +1,4 @@
-pub mod brickmap;
+﻿pub mod brickmap;
 pub mod consts;
 pub mod gi;
 pub mod lighting;
@@ -40,7 +40,7 @@ impl Plugin for GateRenderPlugin {
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
       gi::GiPlugin,
-      // 体积散射（godray）：体积散射的 pass / 资源 / 档位（菜单「渲染/太阳」）
+      // 光柱（godray）：屏幕空间径向模糊的 pass / 资源 / 档位（菜单「渲染/太阳」）
       volumetric::FogPlugin,
       profiler::GateProfilerPlugin,
       // PBR 贴图集（MT2-1）：扫描 assets/textures/pbr/ → 两张 texture_2d_array（只加载，不绑定）
