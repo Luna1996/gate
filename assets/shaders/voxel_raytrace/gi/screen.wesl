@@ -351,9 +351,18 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 否则「关」档连原始 GI 都没有）。
   let hq = u32(gi_u.flags.w) >= 3u;
   let base_n = select(GI_SS_CAND_N, GI_SS_CAND_N_HQ, hq);
-  let cand_n = select(base_n, base_n * 2u, !hist_ok);
-  // 记忆窗上限（= 帧数）也跟最高档走：本项零性能成本，但窗越长光照响应越钝。
-  let m_cap_k = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq);
+  let cand_n0 = select(base_n, base_n * 2u, !hist_ok);
+  // ---- 每帧采样预算分摊（菜单「渲染/RESTIR GI/分帧」，`gi_u.misc.y`）----
+  // `share = N`：把 N 帧的采样预算摊成每帧一份 ⇒ 帧时间恒定（不开分帧 = 1，就是原行为）。
+  // **窗内样本总数不变**：候选数 ÷N 与记忆窗 ×N 相乘抵消（`gi_res_cap` 的 `cap = m_cap_k × cand_n`）
+  // ⇒ 稳态噪声不变，只有响应时间 ×N。每帧至少 1 条（整数条数）⇒ 基准 4 条（低/中档）时 N=8 实际
+  // 退化成 N=4；真正 8 倍摊薄需要「降噪质量 = 高」（基准 8 条 ⇒ 1 条/帧）。
+  // 方向不重复：种子含逐帧自增的帧号（`gi_ss_seed(coord, gi_u.seq.x)`）⇒ 每帧的候选都是新的独立样本。
+  let share = max(u32(gi_u.misc.y), 1u);
+  let cand_n = max(cand_n0 / share, 1u);
+  // 记忆窗上限：按"每帧实际候选数相对基准缩小了几倍"放大，保持窗内样本数 = 基准值。
+  // （本项零性能成本，但窗越长光照响应越钝 ⇒ 这就是分摊的代价。）
+  let m_cap_k = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq) * max(cand_n0 / cand_n, 1u);
   var sel_cum = 0.0;
   var sel_have = false;
   var sel_dir = vec3<f32>(1.0, 0.0, 0.0);
@@ -366,20 +375,21 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // **ILP 批量**：批内 `GI_SS_RAY_BATCH` 条射线只差方向、互相独立 ⇒ 先把它们全发出去（多条层次
   // DDA 的依赖 load 同时在飞），再按原本的 `k` 顺序做累计与蓄水池更新。方向序列、样本与比较顺序
   // 都与逐条写法完全一致 ⇒ 结果**逐位相同**（`gi_ray_radiance` 无副作用：它对 `gi_sec_slots` 的
-  // 填充是写同值的幂等操作，只影响性能不影响值）。`cand_n` 恒是批大小的整数倍（4/8/8/16）。
-  // 批大小取 1 即退化成逐条。
+  // 填充是写同值的幂等操作，只影响性能不影响值）。
+  // 批大小取 1 即退化成逐条；分帧把 `cand_n` 降到 1~2 时最后一批不满（`nb`），按实际条数跑。
   var k = 0u;
   loop {
     if (k >= cand_n) { break; }
+    let nb = min(GI_SS_RAY_BATCH, cand_n - k);
     var b_dir: array<vec3<f32>, GI_SS_RAY_BATCH>;
     var b_s: array<GiRaySample, GI_SS_RAY_BATCH>;
-    for (var i = 0u; i < GI_SS_RAY_BATCH; i = i + 1u) {
+    for (var i = 0u; i < nb; i = i + 1u) {
       let kk = k + i;
       let dir = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + kk * 0x9E3779B9u + 1u)));
       b_dir[i] = dir;
       b_s[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce);
     }
-    for (var i = 0u; i < GI_SS_RAY_BATCH; i = i + 1u) {
+    for (var i = 0u; i < nb; i = i + 1u) {
       let kk = k + i;
       let dir = b_dir[i];
       let s = b_s[i];
@@ -399,7 +409,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
         sel_ok = s.sk_ok;
       }
     }
-    k = k + GI_SS_RAY_BATCH;
+    k = k + nb;
   }
 
   // ---- ③ 空间复用：读**上一帧**邻居的 reservoir 只并累计量（零射线），只影响本帧估计（见 ④）----

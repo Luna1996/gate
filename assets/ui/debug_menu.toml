@@ -89,6 +89,19 @@ label = "menu.render.gi.sun_bounce"
 checked = false
 tooltip = "menu.render.gi.sun_bounce.tip"
 
+[[items.children.children]]
+kind = "switch_group"
+id = "interval"
+label = "menu.render.gi.interval"
+options = [
+    "menu.render.gi.interval.1",
+    "menu.render.gi.interval.2",
+    "menu.render.gi.interval.4",
+    "menu.render.gi.interval.8",
+]
+selected = 1
+tooltip = "menu.render.gi.interval.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "exposure"

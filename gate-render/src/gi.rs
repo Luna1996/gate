@@ -25,7 +25,7 @@ pub struct GiUniform {
   /// x = **二次顶点太阳反弹**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/太阳反弹」）、
   /// y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
   pub params: Vec4,
-  /// x = GI 开关（0/1）、yzw = 保留（恒 0）
+  /// x = GI 开关（0/1）、y = **每帧采样预算分摊 N**（见 `GiSettings::share`）、zw = 保留（恒 0）
   pub misc: Vec4,
   /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率、4 = 四分之一；**整数值的 f32**，
   /// 只被 `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
@@ -89,6 +89,18 @@ pub struct GiSettings {
   /// （短程只值 1.1ms），而太阳方向在昼夜循环下每帧变化 ⇒ 世界空间的太阳可见性缓存不成立
   /// （流式大世界更不成立）。
   pub sun_bounce: bool,
+  /// **每帧采样预算分摊 N**（菜单「渲染/RESTIR GI/分帧」）：把 GI 的采样预算摊到 N 帧上 ——
+  /// 每帧只发 `基准候选数 ÷ N` 条射线（至少 1 条），记忆窗同步 ×N。
+  ///
+  /// **帧时间是平的**（不开分帧 = 1 那条；见 `screen.wesl` 的 `share`）—— 这是它与"跳帧"方案的根本差别：
+  /// 跳帧会把同样多的活集中到某一帧（帧时间尖峰），本方案把它均摊到每帧。
+  /// 窗内样本总数不变（候选数 ÷N 与记忆窗 ×N 相乘抵消，`gi_res_cap` 的 `cap = m_cap_k × cand_n`）
+  /// ⇒ **稳态噪声不变**，只有**响应时间 ×N**（`GI_SS_M_CAP_K` 帧 ≈ 0.53s@60fps ⇒ N=4 时 ≈ 2.1s）。
+  /// 方向不重复：种子含逐帧自增的帧号（`gi_ss_seed`）⇒ 每帧的候选方向都是新的独立样本。
+  ///
+  /// 整数条数约束：基准候选数 4（降噪质量 低/中）时 N 只能到 4（每帧至少 1 条，N=8 会退化成 4）；
+  /// 想要真正 8 倍摊薄需要「降噪质量 = 高」（基准 8 条 ⇒ 1 条/帧）。
+  pub share: u32,
 }
 
 /// 「降噪质量」档的派发计划（`(是否跑降噪, atrous 轮数, atrous 核半径)`）。
@@ -110,6 +122,14 @@ impl GiSettings {
 
   /// 菜单「渲染/GI/降噪质量」的档位数（0 = 关 ..= 3 = 高）；**下标 = 档位本身**。
   pub const DENOISE_TIERS: u32 = 4;
+
+  /// 菜单「渲染/RESTIR GI/分帧」的四个档位（每帧采样预算分摊 N）；**下标 = 选中序号**。
+  pub const SHARE_CHOICES: [u32; 4] = [1, 2, 4, 8];
+
+  /// 生效的预算分摊份数（越界值钳回来）。
+  pub fn share(&self) -> u32 {
+    self.share.clamp(1, 8)
+  }
 
   /// 生效的分辨率除数（越界值钳回来）。
   pub fn div(&self) -> u32 {
@@ -146,7 +166,7 @@ impl Default for GiSettings {
     // 默认 1/4 档 + 「低」降噪档：与实测最划算的组合一致（时域 + 3×3 的 5 轮 atrous），
     // 想要更干净就往「中/高」拨，想量原始噪声与上限帧率就拨到「关」。
     // 太阳反弹默认关：实测画面差异细微（静态场景几乎看不出），代价却是 `gate_gi` 的 41%。
-    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false }
+    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false, share: 2 }
   }
 }
 
@@ -541,6 +561,7 @@ fn extract_gi_settings(
     gi_div: s.div(),
     denoise: s.tier(),
     sun_bounce: s.sun_bounce,
+    share: s.share(),
   }));
 }
 
@@ -586,7 +607,7 @@ fn prepare_gi(
       crate::consts::GI_GAIN,
       0.0,
     ),
-    misc: Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
+    misc: Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, settings.share() as f32, 0.0, 0.0),
     flags: Vec4::new(
       0.0,
       settings.div() as f32,
@@ -604,6 +625,8 @@ fn prepare_gi(
   // 只在真正会跑 `gi_main` 的帧更新「上一帧」⇒ 与上帧写 reservoir 时用的矩阵逐位一致
   // （GI 关掉一段时间再打开时，历史 reservoir 与 prev 矩阵都停留在最后一帧 GI，重投影仍自洽）。
   // 注意：**分辨率的任意取值都跑 GI** —— 这里只跟 `enabled` 走。
+  // 「分帧」不在这里：它是"**每帧**少发几条射线、记忆窗同步拉长"（`screen.wesl` 的 `share`，
+  // 见 `GiSettings::share`），GI 链本身仍然每帧都跑 ⇒ 帧时间是平的，没有跳帧。
   let gi_runs = settings.enabled;
   if gi_runs && let Some(v) = view.as_ref() {
     gpu.prev_view_proj = v.view_proj;

@@ -318,6 +318,21 @@ fn register_callbacks(world: &mut World) {
           gi.sun_bounce = *on;
           info!("GI 二次顶点太阳反弹 → {}", if *on { "on" } else { "off" });
         }
+        // 「分帧」档（1/2/4/8）：把 GI 的采样预算摊到 N 帧上 —— 每帧只发 `基准候选数 ÷ N` 条射线，
+        // 记忆窗同步 ×N。**帧时间是平的**（不是"集中到某一帧"）；窗内样本总数不变 ⇒ 稳态噪声不变，
+        // 只有响应时间 ×N（`GI_SS_M_CAP_K` 帧 ≈ 0.53s ⇒ N=4 时 ≈ 2.1s）。
+        // 整数条数约束：基准 4 条（降噪质量 低/中）时 N 只能到 4；真正 8 倍需要「降噪质量 = 高」。
+        ("render/gi/interval", MenuAction::Select(i)) => {
+          gi.share = gate_render::gi::GiSettings::SHARE_CHOICES[(*i).min(3)];
+          let c = gate_render::wesl_consts::gi_consts();
+          let base = if gi.tier() >= 3 { c.gi_ss_cand_n_hq } else { c.gi_ss_cand_n };
+          info!(
+            "GI 分帧 → 每帧预算 ÷{}（基准候选 {} 条 ⇒ 实际每帧 {} 条，窗内样本数为基准值；帧时间恒定）",
+            gi.share,
+            base,
+            (base / gi.share).max(1)
+          );
+        }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;
           info!(target: "gate", "自动曝光 → {}", if *on { "on" } else { "off" });
