@@ -102,6 +102,19 @@ options = [
 selected = 1
 tooltip = "menu.render.gi.interval.tip"
 
+[[items.children.children]]
+kind = "switch_group"
+id = "realloc"
+label = "menu.render.gi.realloc"
+options = [
+    "menu.render.gi.realloc.off",
+    "menu.render.gi.realloc.mild",
+    "menu.render.gi.realloc.mid",
+    "menu.render.gi.realloc.strong",
+]
+selected = 0
+tooltip = "menu.render.gi.realloc.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "exposure"

@@ -333,6 +333,20 @@ fn register_callbacks(world: &mut World) {
             (base / gi.share).max(1)
           );
         }
+        // 「采样重分配」档（关/温和/中/强）：按"这个像素已经有多干净"（上一帧 reservoir 的 M）
+        // 把每帧射线预算挪过去 —— 收敛的少发、刚脏的多发；记忆窗同步放大 ⇒ 窗内样本数不变
+        // （噪声不变、只有响应时间随像素变）⇒ 不会出现分配振荡。
+        ("render/gi/realloc", MenuAction::Select(i)) => {
+          let t = (*i).min((gate_render::gi::GiSettings::REALLOC_TIERS - 1) as usize) as u32;
+          gi.realloc = t;
+          let (name, lo, hi) = match t {
+            0 => ("关", 1.0, 1.0),
+            1 => ("温和", 0.70, 1.40),
+            2 => ("中", 0.50, 2.00),
+            _ => ("强", 0.25, 4.00),
+          };
+          info!("GI 采样重分配 → {}（收敛像素 ×{}、刚脏像素 ×{}）", name, lo, hi);
+        }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;
           info!(target: "gate", "自动曝光 → {}", if *on { "on" } else { "off" });

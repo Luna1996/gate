@@ -1,6 +1,6 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_ERR_M_REF, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance, gi_ray_secondary_key};
 import package::trace::{make_grid};
@@ -359,9 +359,26 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 退化成 N=4；真正 8 倍摊薄需要「降噪质量 = 高」（基准 8 条 ⇒ 1 条/帧）。
   // 方向不重复：种子含逐帧自增的帧号（`gi_ss_seed(coord, gi_u.seq.x)`）⇒ 每帧的候选都是新的独立样本。
   let share = max(u32(gi_u.misc.y), 1u);
-  let cand_n = max(cand_n0 / share, 1u);
+  // ---- 误差驱动重分配（菜单「渲染/RESTIR GI/采样重分配」，`gi_u.misc.z`）----
+  // 代理量 = **上一帧 reservoir 的样本数 M**（`gi_res_prev`，已绑定，零新通道）：它是"这个像素
+  // 已经有多干净"的直接度量 —— 与场景尺度无关（计数不是辐亮度）、天然时间平滑（它就是累积量）、
+  // 且去遮挡/键变化时会被 `gi_ss_reproject` 的判据重置 ⇒ 自动"哪里脏补哪里"。
+  // 收敛的像素（M 大）少发新射线、刚变脏的（M 小）多发；`m_cap_k` 仍按 `cand_n0 / cand_n` 同步放大
+  // ⇒ **窗内样本数不变**：噪声不变，只有响应时间随"干不干净"变（收敛的变慢、刚脏的变快），
+  // 因此不会出现"少采样→更脏→要更多采样"的分配振荡。
+  // 抖动 = `floor(want + dither)`：整数条数会把预算差变成同心环，用逐帧抖动的分数部分摊成噪声。
+  let err_tier = u32(gi_u.misc.z);
+  var b_err = 1.0;
+  if (err_tier > 0u) {
+    let m_prev = bitcast<f32>(gi_res_prev[idx * GI_RES_WORDS + GI_RES_W_M]);
+    let lo = select(select(0.70, 0.50, err_tier >= 2u), 0.25, err_tier >= 3u);
+    let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
+    b_err = clamp(sqrt(GI_SS_ERR_M_REF / max(m_prev, 1.0)), lo, hi);
+  }
+  let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
+  let cand_n = max(1u, u32(floor(f32(cand_n0) * b_err / f32(share) + dither)));
   // 记忆窗上限：按"每帧实际候选数相对基准缩小了几倍"放大，保持窗内样本数 = 基准值。
-  // （本项零性能成本，但窗越长光照响应越钝 ⇒ 这就是分摊的代价。）
+  // （本项零性能成本，但窗越长光照响应越钝 ⇒ 这就是分摊/重分配的代价。）
   let m_cap_k = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq) * max(cand_n0 / cand_n, 1u);
   var sel_cum = 0.0;
   var sel_have = false;

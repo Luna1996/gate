@@ -101,6 +101,14 @@ pub struct GiSettings {
   /// 整数条数约束：基准候选数 4（降噪质量 低/中）时 N 只能到 4（每帧至少 1 条，N=8 会退化成 4）；
   /// 想要真正 8 倍摊薄需要「降噪质量 = 高」（基准 8 条 ⇒ 1 条/帧）。
   pub share: u32,
+  /// **误差驱动重分配档**（菜单「渲染/RESTIR GI/采样重分配」；0 = 关，1/2/3 = 温和/中/强）。
+  /// 按"这个像素已经有多干净"把每帧的射线预算挪过去：代理量 = **上一帧 reservoir 的样本数 M**
+  /// （`screen.wesl` 的 `b_err`；`GI_SS_ERR_M_REF` 是"够干净"的参考样本数）。
+  /// 收敛的像素少发新射线（档位给 `lo` = 0.70 / 0.50 / 0.25 倍），刚变脏的（去遮挡、键刚变）多发
+  /// （`hi` = 1.4 / 2.0 / 4.0 倍）；记忆窗仍按 `cand_n0 / cand_n` 同步放大
+  /// ⇒ **窗内样本数不变**（噪声不变，只有响应时间随像素变）⇒ 不会出现"少采样→更脏→要更多采样"的振荡。
+  /// 省下来的钱正是"已经收敛的像素"（静态区域通常占画面大多数），花在阴影边缘/去遮挡/几何细节上。
+  pub realloc: u32,
 }
 
 /// 「降噪质量」档的派发计划（`(是否跑降噪, atrous 轮数, atrous 核半径)`）。
@@ -129,6 +137,14 @@ impl GiSettings {
   /// 生效的预算分摊份数（越界值钳回来）。
   pub fn share(&self) -> u32 {
     self.share.clamp(1, 8)
+  }
+
+  /// 菜单「渲染/RESTIR GI/采样重分配」的档位数（0 = 关 ..= 3 = 强）；**下标 = 档位本身**。
+  pub const REALLOC_TIERS: u32 = 4;
+
+  /// 生效的重分配档位（越界值钳回来）。
+  pub fn realloc_tier(&self) -> u32 {
+    self.realloc.min(Self::REALLOC_TIERS - 1)
   }
 
   /// 生效的分辨率除数（越界值钳回来）。
@@ -166,7 +182,7 @@ impl Default for GiSettings {
     // 默认 1/4 档 + 「低」降噪档：与实测最划算的组合一致（时域 + 3×3 的 5 轮 atrous），
     // 想要更干净就往「中/高」拨，想量原始噪声与上限帧率就拨到「关」。
     // 太阳反弹默认关：实测画面差异细微（静态场景几乎看不出），代价却是 `gate_gi` 的 41%。
-    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false, share: 2 }
+    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false, share: 2, realloc: 0 }
   }
 }
 
@@ -562,6 +578,7 @@ fn extract_gi_settings(
     denoise: s.tier(),
     sun_bounce: s.sun_bounce,
     share: s.share(),
+    realloc: s.realloc_tier(),
   }));
 }
 
@@ -607,7 +624,12 @@ fn prepare_gi(
       crate::consts::GI_GAIN,
       0.0,
     ),
-    misc: Vec4::new(if settings.enabled { 1.0 } else { 0.0 }, settings.share() as f32, 0.0, 0.0),
+    misc: Vec4::new(
+      if settings.enabled { 1.0 } else { 0.0 },
+      settings.share() as f32,
+      settings.realloc_tier() as f32,
+      0.0,
+    ),
     flags: Vec4::new(
       0.0,
       settings.div() as f32,
