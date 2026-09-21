@@ -20,6 +20,8 @@ alwaysApply: true
 
 调用时必须显式传 `project = "C-code-repo.rust-gate"`。
 
-索引是快照，不随代码改动自动更新。大量新增文件后先重新索引：`index_repository(repo_path="c:\\code\\repo.rust\\gate", mode="full", persistence=true)`。
+索引由 [.trae/hooks.json](../hooks.json) 在会话开始与每轮问答结束时自动重建，无需手动重新索引。判断索引是否新鲜可看 `.codebase-memory/artifact.json` 的 `commit` / `indexed_at`。
+
+`assets/shaders/**/*.wesl` 不在图谱覆盖范围内，查询着色器代码请直接读文件。
 
 本规则只约束「如何检索与定位代码」；读取和修改文件仍使用 Read / Edit / Write。

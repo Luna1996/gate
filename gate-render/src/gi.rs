@@ -201,6 +201,16 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
     },
     count: None,
   };
+  let buf8 = || BindGroupLayoutEntry {
+    binding: 8,
+    visibility: C,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  };
   BindGroupLayoutDescriptor::new(
     "GiBg5",
     &[
@@ -217,6 +227,10 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
+      // 帧内逐面去重表（`voxel_raytrace/gi/common.wesl` 的 `FACE_*`；槽数按 GI 网格给）。
+      // `read_only = false` 必须与 WESL 侧 `array<atomic<u32>>` 的声明一致：`gi_main` 认领（CAS）、
+      // `dda_face_main` 写着色、`dda_main` 查表 —— 三条 pipeline 用的是同一份声明。
+      buf8(),
     ],
   )
 }
@@ -637,12 +651,20 @@ fn prepare_gi(
     .and_then(|a| a.gi_guide_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
+  // binding 8 = 帧内逐面去重表（`gi_main` 认领）；未就绪时用 4 B 占位 —— 此时该帧不会派发
+  // `gi_main`（`prepare_dda_bind_groups` 提前返回），且 `face_slot_of` 会因 `arrayLength` 不足而跳过。
+  let face_slots = aux
+    .as_ref()
+    .and_then(|a| a.face_slots_buffer())
+    .cloned()
+    .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
     &[
       BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&gi_view) },
       BindGroupEntry { binding: 6, resource: guide.as_entire_binding() },
+      BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
     ],
   );
   commands.insert_resource(GiBg5(bg5));

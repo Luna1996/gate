@@ -1,5 +1,5 @@
-import package::bindings::{gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
+import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance, gi_ray_secondary_key};
@@ -286,6 +286,26 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   var prev_ok = false;
   let prev_pc = gi_ss_reproject(h.point, size, &prev_ok);
   gi_den_guide_store(coord, size, true, pk0, pk1, n, prev_ok, prev_pc);
+
+  // ---- 帧内逐面去重：认领本面（`face_slots`，见 `gi/common.wesl` 的表头注释）----
+  // 每个 GI texel 用**自己命中的那个面键**去抢一个槽：抢到的成为该面的"认领者"，负责在
+  // `dda_face_main` 里把这一面的着色算一次（结果写回同一槽）；抢不到（槽被别的键占）⇒ 该面
+  // 退回逐像素内联着色 —— 撞键只损失收益、不会出错。
+  // 判据用 `pk_ok`（键可编码），与查表侧 `dda_main` 的条件一致：越界键会与远处的面撞键。
+  // 位置必须在 `gi_den_guide_store` 之后（认领者要被 `dda_face_main` 用 texel 下标找回）。
+  if (pk_ok) {
+    var face_ok = false;
+    let fslot = face_slot_of(pk0, pk1, &face_ok);
+    if (face_ok) {
+      let fe = fslot * FACE_WORDS;
+      if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged) {
+        atomicStore(&face_slots[fe + FACE_W_K0], pk0);
+        atomicStore(&face_slots[fe + FACE_W_K1], pk1);
+        atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
+        atomicStore(&face_slots[fe + FACE_W_PAL], h.pal);
+      }
+    }
+  }
 
   // ---- ① 时域复用：先判「有没有可用历史」，它决定本帧的新鲜候选数（去遮挡 boost）----
   // 接受判据 = **同一个面**（`gi_den_same_plane` 平面归属 + 着色法线相似，见 `gi/denoise.wesl`）。

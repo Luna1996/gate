@@ -1,5 +1,6 @@
 import package::bindings::{g};
 import package::brickmap::{Grid, sample_brickmap};
+import package::common::{face_normal_from_index};
 import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid};
 
 // 着色法线 = 逐体素（隐式）法线 = 可见面法线 + 该面**切平面内**的邻域倾斜。
@@ -53,6 +54,15 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> v
 fn voxel_center_world(g: Grid, voxel: vec3<i32>) -> vec3<f32> {
   let vc = vec3<f32>(voxel) + vec3<f32>(0.5);
   return g.pos + vec3<f32>(dot(vc, g.col0), dot(vc, g.col1), dot(vc, g.col2)) * g.scale;
+}
+
+/// 面号 → **世界空间面法线**（= `trace.wesl::grid_hit` 里那两行的提取，表达式逐位相同）。
+/// 它是 `voxel_normal` 的第一个实参，也是**逐面着色量子**里唯一带面号的那一项：
+/// 材质/AO/视向量都只锚在体素中心，只有它区分同一个体素的不同可见面（同一个面的像素才同色）。
+/// 逐面 pass（`dda_face_main`）从面键重建命中时用它 —— 主世界 identity ⇒ 就是轴单位向量。
+fn face_normal_world(g: Grid, face_id: u32) -> vec3<f32> {
+  let nl = face_normal_from_index(face_id);
+  return normalize(nl.x * g.col0 + nl.y * g.col1 + nl.z * g.col2);
 }
 
 // 场景级命中：`UnifiedHit` + 命中 volume 的 palette 基址（取 albedo 用）。

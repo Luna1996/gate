@@ -5,8 +5,10 @@
 //! 这里把它显式登记成构建依赖：改任一文案表（或增删语言文件）都会让本 crate 重编，进而重跑宏。
 //! 目录项只覆盖增删文件；**内容变更必须逐个文件声明**，因为 cargo 对目录只比 mtime。
 //!
-//! 另外本文件**禁止 debug 构建**（见 `forbid_debug_build`）：`build` / `run` / `check` /
+//! 另外本 crate **禁止 debug 构建**（见 `forbid_debug_build`）：`build` / `run` / `check` /
 //! `clippy` / `test` 一律加 `--release`，与 .vscode/tasks.json 的构建任务一致。
+//! 同一份判据在 gate-voxel / gate-render / gate-ui 的 build.rs 里各内联一份
+//! （不共享文件的原因见那里）。
 
 fn main() {
   forbid_debug_build();

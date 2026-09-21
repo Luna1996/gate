@@ -9,7 +9,7 @@
 
 ```powershell
 # 工具链：Rust stable（rust-toolchain.toml，MSVC toolchain）+ Vulkan 显卡驱动
-# gate-app 禁止 debug 构建（gate-app/build.rs）：所有 cargo 命令一律加 --release
+# 全 workspace 禁止 debug 构建（各 crate 的 build.rs 各内联同一份判据）：所有 cargo 命令一律加 --release
 cargo run --release -p gate-app                     # 默认场景 = assets/vox/nuke.vox（启动场景/规模见 gate-app/src/consts.rs）
 cargo run --release -p gate-app --features profile  # 性能剖析：Tracy GUI 连接进程（CPU span + GPU pass 同时间线）
 cargo clippy --release --workspace --all-targets -- -D warnings

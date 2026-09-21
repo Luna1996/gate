@@ -33,6 +33,9 @@ pub struct GiConsts {
   pub gi_ss_m_cap_k: u32,
   /// reservoir 记忆窗（帧）· **高 档**（`GI_SS_M_CAP_K_HQ`）。
   pub gi_ss_m_cap_k_hq: u32,
+  /// **帧内逐面去重表**每槽 word 数（`FACE_WORDS`，权威值在 `gi/common.wesl`）：
+  /// Rust 按它开表 buffer（槽数 = GI 网格像素数 × 2，向上取 2 的幂）。
+  pub face_words: u32,
 }
 
 /// 需要的全部常量名（缺一即 fail fast）。
@@ -47,6 +50,7 @@ const REQUIRED: &[&str] = &[
   "GI_SS_CAND_N_HQ",
   "GI_SS_M_CAP_K",
   "GI_SS_M_CAP_K_HQ",
+  "FACE_WORDS",
 ];
 
 /// 材质资产两侧共用的常量（权威值在 WESL `common.wesl`）。
@@ -110,6 +114,7 @@ impl GiConsts {
       gi_ss_cand_n_hq: get("GI_SS_CAND_N_HQ"),
       gi_ss_m_cap_k: get("GI_SS_M_CAP_K"),
       gi_ss_m_cap_k_hq: get("GI_SS_M_CAP_K_HQ"),
+      face_words: get("FACE_WORDS"),
     };
 
     if out.gi_res_words < 2 {
@@ -122,6 +127,14 @@ impl GiConsts {
     }
     if out.gi_den_guide_words < 4 || out.gi_den_hist_words < 4 {
       let msg = format!("降噪 buffer 布局常量太小（导引 ≥ 4 字、历史 ≥ 4 字）：{out:?}");
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if out.face_words < 8 {
+      let msg = format!(
+        "FACE_WORDS = {} 太小：逐面去重表每槽至少要放「标志 + 键 2 + 认领者 texel + palette + 颜色 3」= 8 字：{out:?}",
+        out.face_words
+      );
       error!("{msg}");
       panic!("{msg}");
     }

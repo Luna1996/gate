@@ -1159,6 +1159,9 @@ pub(crate) struct AuxTexCache {
   // ---- GI 降噪（`gi_denoise_temporal` + `gi_denoise_atrous1/2/4`，见 `gi/denoise.wesl`）----
   /// 导引 buffer（`gi_main` 写、两段降噪读）：每 GI 像素 `GI_DEN_GUIDE_WORDS` 个 u32。
   gi_guide: Option<Buffer>,
+  /// **帧内逐面去重表**（`face_slots`，@group(5) @binding(8)）：每槽 `FACE_WORDS` 个 u32，
+  /// 槽数 = GI 网格像素数 × 2（2 的幂）。每帧在 `gi_main` 之前整块清空（`clear_buffer`）。
+  face_slots: Option<Buffer>,
   /// 时域历史双缓冲（每像素 `GI_DEN_HIST_WORDS` 个 u32）：`den_flip` 决定哪块是「上帧读」。
   gi_hist: [Option<Buffer>; 2],
   /// 每像素亮度 range 权重尺度 φ（f32，时域写 / atrous 读）。
@@ -1212,6 +1215,11 @@ impl AuxTexCache {
   pub(crate) fn gi_guide_buffer(&self) -> Option<&Buffer> {
     self.gi_guide.as_ref()
   }
+
+  /// 帧内逐面去重表（BG5 binding 8 用；`gi_main` 认领、`dda_face_main` 写着色、`dda_main` 查表）。
+  pub(crate) fn face_slots_buffer(&self) -> Option<&Buffer> {
+    self.face_slots.as_ref()
+  }
 }
 
 #[derive(Resource)]
@@ -1229,6 +1237,10 @@ pub(crate) struct DdaPipelines {
   /// BG7：眼睛适应（out_tex 采样视图 + 状态/直方图 storage）
   eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
+  /// 逐面着色 pass（`dda_face_main`）：layout / bind group 与主 pass **完全相同**，只是入口不同。
+  pub(crate) face_pipeline: CachedComputePipelineId,
+  /// 逐面 GI 累加 pass（`dda_face_accum`）：`dda_face_main` 的前一站，layout / bind group 同上。
+  pub(crate) face_accum_pipeline: CachedComputePipelineId,
   pub(crate) beam_pipeline: CachedComputePipelineId,
   /// GI（菜单「渲染/GI」开关 + 分辨率档）：`gi_main`
   pub(crate) gi_pipeline: CachedComputePipelineId,
@@ -1449,6 +1461,19 @@ pub(crate) fn init_dda_pipelines(
         },
         count: None,
       },
+      // 8 = 帧内逐面去重表（`dda_main` 只读、`dda_face_main` 写着色）。同 6：虽然这两个入口只读，
+      // 但 WGSL 里 `face_slots` 是 `array<atomic<u32>>`（`gi_main` 要 CAS）⇒ 声明与 layout 都必须是
+      // read-write，否则 wgpu 报绑定类型不匹配。
+      BindGroupLayoutEntry {
+        binding: 8,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
     ],
   );
 
@@ -1574,6 +1599,9 @@ pub(crate) fn init_dda_pipelines(
     v.push(gi_read.clone());
     v
   };
+  // 逐面 pass 与主 pass 用同一份 layout（clone 一份，因为 `queue_compute_pipeline` 会取走）。
+  let dda_layouts_face = dda_layouts.clone();
+  let dda_layouts_accum = dda_layouts.clone();
   // 眼睛适应的两个入口：8 份相同 eye layout（wgpu 要求 bind group 从 0 起按索引前缀设置，两入口绑定在 @group(7)）。
   let eye_layouts = vec![eye.clone(); 8];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -1581,6 +1609,24 @@ pub(crate) fn init_dda_pipelines(
     layout: dda_layouts,
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("dda_main")),
+    ..default()
+  });
+  // 逐面着色 pass（`dda_face_main`）：layout 与 `dda_main` **逐项相同**（group 0..5）⇒ 派发时
+  // 直接复用主 pass 的 bind group，不额外建绑定；只是入口不同。
+  let face = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_face")),
+    layout: dda_layouts_face,
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_face_main")),
+    ..default()
+  });
+  // 逐面 GI 累加 pass（`dda_face_accum`）：同样复用主 pass 的 layout / bind group，只换入口。
+  // 它是 `dda_face_main` 的**前一站**（见 `main.wesl`：同一个面的全部 texel 先累加进槽，再逐面着色）。
+  let face_accum = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_face_accum")),
+    layout: dda_layouts_accum,
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_face_accum")),
     ..default()
   });
   // beam 预 pass：低分辨率输出最近命中 t，主 pass 取邻域 min t 跳过空空间
@@ -1664,6 +1710,8 @@ pub(crate) fn init_dda_pipelines(
     blit_layout: blit,
     eye_layout: eye,
     compute_pipeline: compute,
+    face_pipeline: face,
+    face_accum_pipeline: face_accum,
     beam_pipeline: beam,
     gi_pipeline: gi,
     eye_histogram_pipeline: eye_histogram,
@@ -1791,6 +1839,12 @@ pub(crate) fn prepare_dda_bind_groups(
       })
     };
     beam_cache.gi_guide = Some(make_buf("gate_gi_guide", px * c.gi_den_guide_words as u64 * 4));
+    // ---- 帧内逐面去重表（`face_slots`）：槽数 = GI 像素数 × 2（向上取 2 的幂，哈希才用得上位与），
+    // 上限 2^21。参照：2K + 1/4 档 = 51.8 万 GI 像素 ⇒ 2^20 槽 = 32 MB。
+    // 槽位不够只会抬高撞键率，而撞键 = 该面退回逐像素内联着色（正确性不变，只少赚）。
+    let face_slots_n = (px * 2).next_power_of_two().clamp(256, 1u64 << 21);
+    beam_cache.face_slots =
+      Some(make_buf("gate_face_slots", face_slots_n * c.face_words as u64 * 4));
     beam_cache.gi_hist = [
       Some(make_buf("gate_gi_hist_a", px * c.gi_den_hist_words as u64 * 4)),
       Some(make_buf("gate_gi_hist_b", px * c.gi_den_hist_words as u64 * 4)),
@@ -1888,12 +1942,15 @@ pub(crate) fn prepare_dda_bind_groups(
     gi_view.clone()
   };
   let gi_guide = beam_cache.gi_guide.as_ref().expect("降噪导引 buffer 未创建").clone();
+  // binding 8 = 帧内逐面去重表（`dda_main` 查表 / `dda_face_main` 写着色）；与本函数上方的 GI 资源同帧创建。
+  let face_slots = beam_cache.face_slots.as_ref().expect("逐面去重表 buffer 未创建").clone();
   let gi_read_bg = render_device.create_bind_group(
     None,
     &gi_read_layout,
     &[
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
       BindGroupEntry { binding: 6, resource: gi_guide.as_entire_binding() },
+      BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
     ],
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
@@ -2147,6 +2204,11 @@ pub(crate) fn dispatch_dda(
   {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+    // 逐面去重表**每帧整块清空**（`FACE_W_FLAG == 0` = 空槽）：清空必须排在 `gi_main` 之前，
+    // 否则上一帧的认领会把本轮同槽的新键挡在门外（撞键只会少赚，但残留表会让收益归零）。
+    if let Some(fs) = aux.face_slots_buffer() {
+      ctx.command_encoder().clear_buffer(fs, 0, None);
+    }
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_gi", |pass| {
       pass.set_pipeline(gi_pipe);
       pass.set_bind_group(0, gi_bg0, &[]);
@@ -2210,6 +2272,55 @@ pub(crate) fn dispatch_dda(
           pass.dispatch_workgroups(gx, gy, 1);
         });
       }
+    }
+  }
+
+  // ---- 逐面 pass 两段：`dda_face_accum`（把每个面的全部 texel 的 GI 累加进槽）→
+  //      `dda_face_main`（逐面算一次着色并写回槽）----
+  // 位置：GI 之后（认领发生在 `gi_main`；两段都读降噪后的 GI）、主 pass 之前（主 pass 查表）。
+  // 两段的 bind group 与主 pass 逐项相同（同一份 layout）⇒ 复用同一组对象，不额外建绑定。
+  if gi.as_ref().is_some_and(|g| g.enabled)
+    && let Some(aux) = aux.as_ref()
+  {
+    let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
+    let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+    if let Some(accum_pipe) = pipeline_cache.get_compute_pipeline(pipelines.face_accum_pipeline) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_face_accum",
+        |pass| {
+          pass.set_pipeline(accum_pipe);
+          pass.set_bind_group(0, &bg0.0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          if let Some(gi_read) = aux.gi_read_bg.as_ref() {
+            pass.set_bind_group(5, gi_read, &[]);
+          }
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
+    if let Some(face_pipe) = pipeline_cache.get_compute_pipeline(pipelines.face_pipeline) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_face",
+        |pass| {
+          pass.set_pipeline(face_pipe);
+          pass.set_bind_group(0, &bg0.0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          if let Some(gi_read) = aux.gi_read_bg.as_ref() {
+            pass.set_bind_group(5, gi_read, &[]);
+          }
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
     }
   }
 

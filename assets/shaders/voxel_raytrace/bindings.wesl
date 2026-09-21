@@ -195,6 +195,15 @@ struct GiUniform {
 /// 给 read_only = false**，否则与这里的声明不符（wgpu 会报绑定类型不匹配）。
 @group(5) @binding(6) var<storage, read_write> gi_guide_out: array<u32>;
 
+/// @binding(8)：**帧内逐面去重表**（槽布局 = `gi/common.wesl` 的 `FACE_*`）。
+/// 粒度 = **一个可见体素面**（体素 + 它朝向相机的那个面）⇒ 键 = `gi_key0`/`gi_key1`（体素 + 面 + 物体）。
+/// 生命周期只有一帧：Rust 每帧在 `gi_main` 之前整块清空 ⇒ `FACE_W_FLAG == 0` = 空槽。
+/// 三个消费者跨三个 dispatch（认领在 `gi_main`、逐面着色在 `dda_face_main`、查表在 `dda_main`）
+/// ⇒ **dispatch 边界就是可见性边界**，不需要任何屏障 / 内存序 / 撕裂保护。
+/// 声明成 atomic：认领走 `atomicCompareExchangeWeak`，其余读写走 `atomicLoad`/`atomicStore`
+/// （relaxed ⇒ 与普通访存同价）。槽数由 Rust 按 GI 网格像素数给（`arrayLength` 读得到）。
+@group(5) @binding(8) var<storage, read_write> face_slots: array<atomic<u32>>;
+
 // ===== @group(0) @binding(10..)：GI 降噪（两个新 pass，见 `gi/denoise.wesl`）=====
 // 降噪 pass 的 bound group 只有 group(0) 一份（`bindings.wesl` 的 binding 号在**同一个模块里唯一**
 // ⇒ 不改动既有 0..3 的号段，另起 10..）。Rust 侧 `gi_den_*_layout` 与之逐号对应。

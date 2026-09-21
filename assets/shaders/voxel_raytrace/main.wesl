@@ -1,13 +1,13 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
-import package::gi::common::{gi_key0, gi_key1, gi_mix, gi_rand2, gi_unpack_dir};
+import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
-import package::world::{WorldHit, voxel_center_world, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
+import package::world::{WorldHit, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
 // 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`view.rs::get_voxel`、`wire.rs::encode_slot` 一致。
@@ -331,50 +331,29 @@ fn gi_upsample_joint(
   return fallback;
 }
 
-// DDA 主入口：命中 → 直光着色（硬阴影 + sky 环境 + emissive），miss → 纯色天空
-@compute @workgroup_size(8, 8, 1)
-fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let size = textureDimensions(out_tex);
-  if (gid.x >= size.x || gid.y >= size.y) { return; }
-  let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
+/// 本面的 GI 输入。
+/// `use_face = true` ⇒ 走**逐面均值**（认领路径：`dda_face_accum` 已把该面所有 GI texel 的值累加进
+/// 槽里）。它同时做两件事：面内 GI 恒定（= 1/4 档的边缘锐利、无 4px 台阶），以及**无偏降噪** ——
+/// 同一个面的所有 texel 的 GI 射线起点都是该体素中心（`gi_ss_main` 的 `org`）⇒ 它们是对**同一个
+/// 积分**的独立估计 ⇒ 取均值的方差是单个 texel 的 1/K。只取某一个 texel（认领者）时，它的降噪
+/// 残差会被整面一起放大成**相干闪烁**（原来逐像素各自独立、被眼睛平均掉），面越大越明显。
+/// `use_face = false` ⇒ 按 `uv` 逐像素采样（未认领 / 撞键的面，与去重前的口径一致）。
+struct GiInput {
+  use_face: bool,
+  face_avg: vec3<f32>,   // 已含增益，与 `gi_tex.rgb` 同一量纲
+  face_cov: f32,
+  uv: vec2<f32>,         // 逐像素路径的采样位置（全分辨率归一化）
+}
 
-  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
-  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
-  let near_ndc = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
-  let far_ndc  = vec4<f32>(uv.x, uv.y, 1.0, 1.0);
-  let near_world_h = view_u.inv_view_proj * near_ndc;
-  let far_world_h  = view_u.inv_view_proj * far_ndc;
-  let near_world = near_world_h.xyz / near_world_h.w;
-  let far_world  = far_world_h.xyz  / far_world_h.w;
-  let diff_world = far_world - near_world;
-  let frustum_length = length(diff_world);
-  let dir_voxel = normalize(diff_world);
-  let origin_voxel = view_u.cam_pos_voxel.xyz;
-
-  // lod.z > 0.5（`GATE_NO_BEAM=1`）关闭 beam，t_min = 0。
-  var t_min = 0.0;
-  if (view_u.lod.z < 0.5) {
-    let beam_size = textureDimensions(beam_depth);
-    let bx = gid.x / BEAM_DIV;
-    let by = gid.y / BEAM_DIV;
-    t_min = 1e+30;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
-        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
-        let bt = textureLoad(beam_depth, vec2<i32>(sx, sy)).x;
-        t_min = min(t_min, bt);
-      }
-    }
-    t_min = max(t_min - BEAM_BACKOFF, 0.0);
-  }
-  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
-  let sky = light_u.sky_color.xyz;
-  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-  let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
-                            world_cfg_full(t_min, 3u));
+/// **逐面着色（唯一实现）**：`dda_main`（未认领 / 撞键的面，逐像素）与 `dda_face_main`
+/// （被认领的面，逐面算一次）共用同一份代码 ⇒ 去重不改变任何像素的结果。
+///
+/// 输入 = 一个**可见体素面**（`first`）+ 本面射线的远平面距离 + GI 输入（见 `GiInput`）。
+/// 除 GI 外的全部输入都只由这个面决定（材质量化到体素中心 / 着色法线 / 视向量锚点 /
+/// 阴影与反射射线的起点与种子 / 玻璃状态机的入射点与方向），这就是它可以按面缓存的前提。
+fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, frustum_length: f32, gi_in: GiInput,
+              sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
   var best = first;
-  var dir = dir_voxel;
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
   // 首命中是不是玻璃（走 `trace_glass` 状态机）看 `FLAGS_TRANSMISSIVE` 位，不读 transmission 字节：
@@ -403,7 +382,6 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fv = face_view_dir(origin_voxel, fp);
     let g = trace_glass(fp + fnn * f_off, -fv, 0.0, frustum_length, sun_dir, sky, sun_c);
     best = g.ray;
-    dir = g.dir;
     through = g.tint;
     refl = g.refl;
     // ---- MT8-9 · in-scatter（与不透明路径**逐项同一套**光源项）----
@@ -436,12 +414,13 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let fk1 = gi_key1(first.voxel, first.face_id, first.obj_id);
       var f_gi = vec3<f32>(0.0);
       var f_cov = 0.0;
-      if (gi_u.misc.x > 0.5) {
-        let fguv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
-                 / vec2<f32>(f32(size.x), f32(size.y));
-        let fs = textureSampleLevel(gi_tex, light_samp, fguv, 0.0);
+      if (gi_in.use_face) {
+        f_gi = gi_in.face_avg;
+        f_cov = gi_in.face_cov;
+      } else if (gi_u.misc.x > 0.5) {
+        let fs = textureSampleLevel(gi_tex, light_samp, gi_in.uv, 0.0);
         let fgw = max(fs.a, 1e-4);
-        f_gi = gi_upsample_joint(fguv, vec2<u32>(textureDimensions(gi_tex)), fk0, fk1, fnn,
+        f_gi = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), fk0, fk1, fnn,
                                  fs.rgb / fgw);
         f_cov = fs.a / fgw;
       }
@@ -474,8 +453,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var n_reused = false;
     if (u32(gi_u.flags.y) == 1u) {
       let gi_size = vec2<u32>(textureDimensions(gi_tex));
-      if (gid.x < gi_size.x && gid.y < gi_size.y) {
-        let gb = (gid.y * gi_size.x + gid.x) * GI_DEN_GUIDE_WORDS;
+      // texel 下标由采样 uv 反推（全分辨率档下 `gi_in.uv` 恰是本像素中心 ⇒ 逐位等于 `gid`）。
+      let tp = vec2<i32>(floor(gi_in.uv * vec2<f32>(f32(gi_size.x), f32(gi_size.y))));
+      if (tp.x >= 0 && tp.y >= 0 && tp.x < i32(gi_size.x) && tp.y < i32(gi_size.y)) {
+        let gb = (u32(tp.y) * gi_size.x + u32(tp.x)) * GI_DEN_GUIDE_WORDS;
         if (gi_guide_out[gb + GI_DEN_G_KEY0] == k0 && gi_guide_out[gb + GI_DEN_G_KEY1] == k1) {
           n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
           n_reused = true;
@@ -507,22 +488,22 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gi_on = gi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     var cov = 0.0;
-    // GI 一律走缓冲通道（`gi_main` + 降噪写在 1/gi_div 分辨率的 GI 网格上，见 `gi/`）：
-    // 这里只做一次几何感知上采样（内部用 2×2 texel）。uv 必须按**全分辨率尺寸**（`size`）
-    // 归一化，不能除以 GI 纹理自身尺寸 —— 1:1 / 2:1 / 4:1 上采样都靠这条。
-    // `gi_on = false` 时 gi/cov 恒 0 ⇒ 只有太阳直射 + 天光兜底。
-    if (gi_on) {
-      let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
-              / vec2<f32>(f32(size.x), f32(size.y));
-      let s = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
+    // GI 一律走缓冲通道（`gi_main` + 降噪写在 1/gi_div 分辨率的 GI 网格上，见 `gi/`）。两条路径
+    // （见 `GiInput`）：认领面用**逐面均值**（无偏降噪 + 面内平色）、未认领面按 `gi_in.uv` 逐像素
+    // 做一次几何感知上采样（内部 2×2 texel）。`gi_on = false` 时两者都留 0 ⇒ 只有太阳直射 + 天光兜底。
+    if (gi_in.use_face) {
+      gi = gi_in.face_avg;
+      cov = gi_in.face_cov;
+    } else if (gi_on) {
+      let s = textureSampleLevel(gi_tex, light_samp, gi_in.uv, 0.0);
       // premultiplied-valid 归一化：valid = 0（天空）像素不参与插值。
       let gw = max(s.a, 1e-4);
       // 覆盖度 cov 直接取自 `a`：`gi_out.a = valid`，而独立的 cov 通道写的恒是「valid ? 1 : 0」
       // ⇒ `cov = valid / max(valid, 1e-4)` 与旧的 `sc.r / gw` 是同一个表达式（不再单开一张纹理）。
-      // GI 值走**几何感知上采样**（纯双线性作 fallback）：不接受与本像素不同「面」的 texel
-      // ⇒ 棱边 / 墙角不渗色、不糊（相似度那一条用本像素的着色法线 `n`）。cov 不参与
+      // GI 值走**几何感知上采样**（纯双线性作 fallback）：不接受与采样点不同「面」的 texel
+      // ⇒ 棱边 / 墙角不渗色、不糊（相似度那一条用采样点的着色法线 `n`）。cov 不参与
       // （它是 0/1 覆盖度，双线性归一化即可）。
-      gi = gi_upsample_joint(guv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n, s.rgb / gw);
+      gi = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n, s.rgb / gw);
       cov = s.a / gw;
     }
     // AO 只乘到常量天光项（gi 已自带逐方向遮挡）。
@@ -660,7 +641,184 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   //     用的是**同一套着色** ⇒ 那一档**连续收敛**。
   // `glass_col` 只有首命中是介质时才非 0 ⇒ 非玻璃像素这一行是 `+ 0`（零成本）。
   col = col + glass_col * (vec3<f32>(1.0) - through);
+  return col;
+}
+
+// DDA 主入口：命中 → **逐面去重查表**（命中即直出）；未认领 / 撞键 / miss → 内联 `shade_face`。
+@compute @workgroup_size(8, 8, 1)
+fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let size = textureDimensions(out_tex);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
+  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
+  let near_ndc = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
+  let far_ndc  = vec4<f32>(uv.x, uv.y, 1.0, 1.0);
+  let near_world_h = view_u.inv_view_proj * near_ndc;
+  let far_world_h  = view_u.inv_view_proj * far_ndc;
+  let near_world = near_world_h.xyz / near_world_h.w;
+  let far_world  = far_world_h.xyz  / far_world_h.w;
+  let diff_world = far_world - near_world;
+  let frustum_length = length(diff_world);
+  let dir_voxel = normalize(diff_world);
+  let origin_voxel = view_u.cam_pos_voxel.xyz;
+
+  // lod.z > 0.5（`GATE_NO_BEAM=1`）关闭 beam，t_min = 0。
+  var t_min = 0.0;
+  if (view_u.lod.z < 0.5) {
+    let beam_size = textureDimensions(beam_depth);
+    let bx = gid.x / BEAM_DIV;
+    let by = gid.y / BEAM_DIV;
+    t_min = 1e+30;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
+        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
+        let bt = textureLoad(beam_depth, vec2<i32>(sx, sy)).x;
+        t_min = min(t_min, bt);
+      }
+    }
+    t_min = max(t_min - BEAM_BACKOFF, 0.0);
+  }
+  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
+  let sky = light_u.sky_color.xyz;
+  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+  let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
+                            world_cfg_full(t_min, 3u));
+
+  // ---- 逐面去重查表（`face_slots`：认领在 `gi/screen.wesl`、计算在 `dda_face_main`）----
+  // 命中条件 = 认领标志置位 + **两个键 word 逐位相等**（同一体素 + 同一个面 + 同一物体）。
+  // 查不到（未认领 / 撞键 / GI 关 / 键越界）⇒ 内联 `shade_face`，结果与认领者**逐位相同**。
+  var col = vec3<f32>(0.0);
+  var cached = false;
+  if (first.hit && gi_u.misc.x > 0.5 && gi_key_ok(first.voxel)) {
+    let k0 = gi_key0(first.voxel);
+    let k1 = gi_key1(first.voxel, first.face_id, first.obj_id);
+    var ok = false;
+    let slot = face_slot_of(k0, k1, &ok);
+    if (ok) {
+      let fe = slot * FACE_WORDS;
+      if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != 0u
+          && atomicLoad(&face_slots[fe + FACE_W_K0]) == k0
+          && atomicLoad(&face_slots[fe + FACE_W_K1]) == k1) {
+        col = vec3<f32>(
+          bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_COL])),
+          bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_COL + 1u])),
+          bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_COL + 2u])));
+        cached = true;
+      }
+    }
+  }
+  if (!cached) {
+    col = shade_face(first, origin_voxel, frustum_length,
+                     GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c);
+  }
   write_output(coord0, col);
+}
+
+/// **逐面 GI 累加 pass**（`GiInput.use_face` 的数据源）：派发规模 = GI 网格；每个有面键的 texel
+/// 把自己的 GI 值（**降噪后**）定点累加到该面的槽里，并预留一个计数位。
+/// 为什么不放在 `gi_ss_main` 里累加（那样连 pass 都不用加）：同一个 dispatch 内读不到别的线程刚写的
+/// 键（认领是 CAS），参与集合会随线程调度变 —— 那正是要去掉的"每帧不一样"。放在这里
+/// （GI 降噪之后、`dda_face_main` 之前）⇒ 参与集合 = 该面的全部 texel，逐帧稳定。
+@compute @workgroup_size(8, 8, 1)
+fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let gsize = textureDimensions(gi_tex);
+  if (gid.x >= gsize.x || gid.y >= gsize.y) { return; }
+  let texel = gid.y * gsize.x + gid.x;
+  let gb = texel * GI_DEN_GUIDE_WORDS;
+  let k0 = gi_guide_out[gb + GI_DEN_G_KEY0];
+  let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
+  if ((k0 | k1) == 0u) { return; }
+  var ok = false;
+  let slot = face_slot_of(k0, k1, &ok);
+  if (!ok) { return; }
+  let fe = slot * FACE_WORDS;
+  if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) == 0u
+      || atomicLoad(&face_slots[fe + FACE_W_K0]) != k0
+      || atomicLoad(&face_slots[fe + FACE_W_K1]) != k1) { return; }
+  let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+          / vec2<f32>(f32(gsize.x), f32(gsize.y));
+  let s = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
+  if (s.a <= 0.0) { return; }   // 无效（天空）texel 不参与
+  // 计数用 CAS **预留**：保证"加和"与"加计数"一一对应，且总量不超过 `GI_ACC_MAX_N`
+  // （直接 `atomicAdd(count)` 后再判断会让并发冲过上限 ⇒ 和溢出）。
+  loop {
+    let c = atomicLoad(&face_slots[fe + FACE_W_GI_N]);
+    if (c >= GI_ACC_MAX_N) { return; }
+    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_GI_N], c, c + 1u).exchanged) { break; }
+  }
+  // 归一化（premultiplied：rgb = gi·valid、a = valid），再定点取整（进位到最近，避免系统性偏暗）。
+  let q = clamp(s.rgb / max(s.a, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+  atomicAdd(&face_slots[fe + FACE_W_GI], u32(round(q.x * GI_ACC_SCALE)));
+  atomicAdd(&face_slots[fe + FACE_W_GI + 1u], u32(round(q.y * GI_ACC_SCALE)));
+  atomicAdd(&face_slots[fe + FACE_W_GI + 2u], u32(round(q.z * GI_ACC_SCALE)));
+}
+
+/// **逐面着色 pass**：派发规模 = GI 网格，只有**认领者**（`FACE_W_TEXEL` == 自己的 texel 下标）干活
+/// ⇒ 活跃线程数 = 被认领的面数，其余线程几条指令退出。位置：GI 降噪之后（要读降噪后的 GI）、
+/// `dda_main` 之前（它要查表）。
+/// 认领者 texel 的中心同时是两个东西：GI 采样位置（逐面一个采样点）与"本面在屏幕上的代表点"
+/// （算射线长度，替代逐像素的 `frustum_length`）。
+@compute @workgroup_size(8, 8, 1)
+fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let gsize = textureDimensions(gi_tex);
+  if (gid.x >= gsize.x || gid.y >= gsize.y) { return; }
+  let texel = gid.y * gsize.x + gid.x;
+  // 本 texel 的主命中面键 = 降噪导引里的键（`gi_ss_main` 已写；天空像素整格清零）。
+  let gb = texel * GI_DEN_GUIDE_WORDS;
+  let k0 = gi_guide_out[gb + GI_DEN_G_KEY0];
+  let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
+  if ((k0 | k1) == 0u) { return; }
+  var ok = false;
+  let slot = face_slot_of(k0, k1, &ok);
+  if (!ok) { return; }
+  let fe = slot * FACE_WORDS;
+  if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) == 0u
+      || atomicLoad(&face_slots[fe + FACE_W_K0]) != k0
+      || atomicLoad(&face_slots[fe + FACE_W_K1]) != k1) { return; }
+  if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
+
+  // ---- 从面键重建命中（位布局见 `gi/common.wesl` 的 `gi_key0`/`gi_key1`）----
+  let voxel = vec3<i32>(i32(k0 & 0x1FFFu) - 4096, i32((k0 >> 13u) & 0x1FFFu) - 4096,
+                        i32(k1 & 0x1FFFu) - 4096);
+  let face_id = (k1 >> 13u) & 7u;
+  let obj_id = i32((k1 >> 16u) & 0xFFFFu) - 1;
+  let gg = make_grid(u32(obj_id) + 1u);
+  let p_voxel = voxel_center_world(gg, voxel);
+  // `point` 传**体素中心**：`fetch_material` 内部本来就量化到体素中心（UV 逐位相同）；唯一差别是
+  // mip LOD 的距离输入从"连续命中点"换成"体素中心"（量级 ≤ 0.87 体素，而逐像素版本的那个距离
+  // 本来就因 `floor` 在法线轴的 ±1 抖动而不定）。
+  let first = WorldHit(true, 0.0, p_voxel, atomicLoad(&face_slots[fe + FACE_W_PAL]),
+                       face_normal_world(gg, face_id), face_id, voxel, obj_id, gg.palette_base);
+  let gi_uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+            / vec2<f32>(f32(gsize.x), f32(gsize.y));
+  let ndc = vec2<f32>(gi_uv.x * 2.0 - 1.0, 1.0 - gi_uv.y * 2.0);
+  let nw_h = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
+  let fw_h = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
+  let frustum_length = length(fw_h.xyz / fw_h.w - nw_h.xyz / nw_h.w);
+  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
+  let sky = light_u.sky_color.xyz;
+  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+  // ---- 逐面 GI 均值（`dda_face_accum` 已把该面所有 texel 的值定点累加进来）----
+  // `GI_ACC_MAX_N` 之外的 texel 不参与 ⇒ 大面也稳定；`gi_n == 0`（无非天空 texel）时 cov = 0，
+  // 走"无 GI 数据"的天光兜底（与逐像素路径同口径）。
+  let gi_n = atomicLoad(&face_slots[fe + FACE_W_GI_N]);
+  var gi_avg = vec3<f32>(0.0);
+  if (gi_n > 0u) {
+    let inv = 1.0 / (f32(gi_n) * GI_ACC_SCALE);
+    gi_avg = vec3<f32>(
+      f32(atomicLoad(&face_slots[fe + FACE_W_GI])),
+      f32(atomicLoad(&face_slots[fe + FACE_W_GI + 1u])),
+      f32(atomicLoad(&face_slots[fe + FACE_W_GI + 2u]))) * inv;
+  }
+  let col = shade_face(first, view_u.cam_pos_voxel.xyz, frustum_length,
+                       GiInput(true, gi_avg, select(0.0, 1.0, gi_n > 0u), gi_uv),
+                       sun_dir, sky, sun_c);
+  atomicStore(&face_slots[fe + FACE_W_COL], bitcast<u32>(col.x));
+  atomicStore(&face_slots[fe + FACE_W_COL + 1u], bitcast<u32>(col.y));
+  atomicStore(&face_slots[fe + FACE_W_COL + 2u], bitcast<u32>(col.z));
 }
 
 // GI（**唯一路径 = 屏幕空间逐面 ReSTIR**，见 `gi/screen.wesl`）。
