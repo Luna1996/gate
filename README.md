@@ -399,3 +399,8 @@ bash package.sh     # release 构建 → 组装便携目录（不压缩）
 - **不写安装目录**：日志 → `<安装根>/logs/latest.log`；持久化配置（菜单控件值/窗口 + 相机姿态）→
   `<安装根>/data/config.toml`（菜单结构与缺省值每次从 `assets/ui/debug_menu.toml` 读）。
 - **注意**：`assets/vox/nuke.vox` 被 gitignore，脚本只在缺失时 WARN，不会阻断打包——发布前自备该文件。
+
+## 9. 其他
+
+### 行数统计
+```cloc --include-lang=Rust,WGSL --force-lang=WGSL,wesl ./assets/shaders ./gate-app ./gate-render ./gate-ui ./gate-voxel```
