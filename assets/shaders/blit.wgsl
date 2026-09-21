@@ -20,9 +20,16 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
   return out;
 }
 
+/// 像素完美的整数块上采样：每个目标像素取**最近的源像素**，不做任何插值
+/// （`uv` 在目标像素中心 = `(px+0.5)/dst_dim` ⇒ `floor(uv × src_dim)` 就是整数块映射：
+/// `factor = 3` 时一个源像素正好铺 3×3 个目标像素；非整除的尺寸也只差最后一列/行的 1 像素）。
+/// 走 `textureLoad` 而不是 sampler ⇒ 与滤波模式无关，降分辨率时永远不糊。
+/// `factor = 1` 时逐位等于 1:1 拷贝。
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-  let c = textureSample(src_tex, src_sampler, in.uv).rgb;
+  let dim = textureDimensions(src_tex);
+  let s = min(vec2<u32>(floor(in.uv * vec2<f32>(dim))), dim - vec2<u32>(1u));
+  let c = textureLoad(src_tex, vec2<i32>(s), 0).rgb;
   // view target 是 sRGB：先做 sRGB→linear。
   return vec4<f32>(srgb_to_linear(c), 1.0);
 }

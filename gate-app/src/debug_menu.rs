@@ -21,7 +21,7 @@ use gate_voxel::{inverted_pct_to_override, ior_slider_to_x100, slider_to_overrid
 use crate::camera::{CameraMode, FlyCamera};
 use crate::config::Config;
 use crate::consts::{
-  CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, HALF_RES_FACTOR, VOXEL_PER_METER,
+  CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_WINDOW_SECS, VOXEL_PER_METER,
 };
 use crate::edit::{
   BrushMaterial, BrushShape, EditSettings, smooth_pct_to_roughness, transparency_pct_to_transmission,
@@ -219,6 +219,13 @@ fn register_callbacks(world: &mut World) {
      mut scale: ResMut<gate_render::RenderScale>,
      mut post: ResMut<gate_render::PostFxSettings>,
      mut restore: ResMut<WindowedRestore>| {
+      // 「渲染分辨率」是 switch_group（`Select`），其余视频项是 `Toggle` ⇒ 先处理它再走开关。
+      // 只改除数，目标纹理由 responsive 系统下一帧重建；上采样在 blit 里做整数块复制（不插值）。
+      if let ("video/scale", MenuAction::Select(i)) = (ev.path.as_str(), &ev.action) {
+        scale.factor = gate_render::RenderScale::SCALE_CHOICES[(*i).min(3)];
+        info!("渲染分辨率 → 1/{}（渲染尺寸按窗口 ÷{} 取整分块，blit 整数块复制、不插值）", scale.factor, scale.factor);
+        return;
+      }
       let MenuAction::Toggle(on) = ev.action else { return };
       match ev.path.as_str() {
         "video/vsync" => {
@@ -252,16 +259,6 @@ fn register_callbacks(world: &mut World) {
             }
           }
           info!("全屏 → {:?}", win.mode);
-        }
-        // 半分辨率渲染：只改降采样倍数，目标纹理由 responsive 系统下一帧重建
-        "video/half_res" => {
-          scale.factor = if on { HALF_RES_FACTOR } else { 1 };
-          info!(
-            "半分辨率渲染 → {}（渲染 {}x{} → 放大到窗口）",
-            if on { "on" } else { "off" },
-            scale.size.x,
-            scale.size.y
-          );
         }
         // 抗锯齿：FXAA 在最终 blit 里做（换 fragment 入口，见 PostFxSettings）
         "video/aa" => {

@@ -2,7 +2,6 @@
 //!
 //! 全是编译期常量：改值后重新编译。要给某项加 debug_menu 控件时，把它挪进 Bevy 资源再按
 //! 菜单连线（做法见 `debug_menu.rs` 里的 `RenderScale` / `EyeAdaptSettings` / `GiSettings`）。
-
 /// 启动场景：true = 程序化 demo 场景；false = assets/vox/nuke.vox
 pub const STARTUP_DEMO_SCENE: bool = false;
 /// 启动相机朝天空（纯 miss 基准）
@@ -44,8 +43,6 @@ pub const VOXEL_PER_METER: f32 = 50.0;
 pub const CAM_INFO_REFRESH_SECS: f32 = 0.25;
 /// FPS 滚动窗口长度（秒）
 pub const FPS_WINDOW_SECS: f32 = 1.0;
-/// 半分辨率渲染倍数
-pub const HALF_RES_FACTOR: u32 = 2;
 
 /// 展示窗折线图画布宽度（像素）
 pub const SHOWCASE_PLOT_W: u32 = 216;

@@ -10,11 +10,17 @@ id = "video"
 label = "menu.video"
 
 [[items.children]]
-kind = "toggle"
-id = "half_res"
-label = "menu.video.half_res"
-checked = false
-tooltip = "menu.video.half_res.tip"
+kind = "switch_group"
+id = "scale"
+label = "menu.video.scale"
+options = [
+    "menu.video.scale.full",
+    "menu.video.scale.half",
+    "menu.video.scale.third",
+    "menu.video.scale.quarter",
+]
+selected = 0
+tooltip = "menu.video.scale.tip"
 
 [[items.children]]
 kind = "toggle"

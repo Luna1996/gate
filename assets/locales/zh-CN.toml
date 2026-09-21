@@ -17,9 +17,17 @@ _version = 1
 
 # ---------------- DebugMenu（左上角调试菜单）----------------
 "menu.video" = "视频"
-"menu.video.half_res" = "半分辨率"
-"menu.video.half_res.tip" = """
-**3D 场景**按 `1/2` 分辨率渲染再放大：省约 `3/4` 主射线，边缘变软。"""
+"menu.video.scale" = "分辨率比"
+"menu.video.scale.full" = "1/1"
+"menu.video.scale.half" = "1/2"
+"menu.video.scale.third" = "1/3"
+"menu.video.scale.quarter" = "1/4"
+"menu.video.scale.tip" = """
+3D 场景按 `1/N` 分辨率渲染，再**整数块复制**放大到窗口（最近邻，不做任何插值）⇒ 大粒像素不糊、边界锐利。
+
+代价分两档：`1/2` 省约 `3/4` 的主射线与降噪，`1/4` 再降 `4` 倍（GI 与主 pass 一起）。
+
+⚠️ 若同时开「抗锯齿」，FXAA 会把块边缘抹一刀（那是它的本职工作）—— 想要纯粹的像素块就别开。"""
 "menu.video.fullscreen" = "全屏"
 "menu.video.vsync" = "垂直同步"
 "menu.video.aa" = "抗锯齿"

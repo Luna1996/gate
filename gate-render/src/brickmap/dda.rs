@@ -22,10 +22,15 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct RenderScale {
-  /// 渲染目标尺寸 = 窗口物理像素 ÷ `factor`。
+  /// 渲染目标尺寸 = 窗口物理像素 ÷ `factor`（向下取整；blit 用整数块复制映射回窗口）。
   pub size: UVec2,
-  /// 分辨率降采样倍数：1 = 全分辨率，2 = 半分辨率。
+  /// 分辨率降采样除数：1 = 全分辨率、2/3/4 = 降到 1/2、1/3、1/4。
   pub factor: u32,
+}
+
+impl RenderScale {
+  /// 菜单「视频/渲染分辨率」的四个档位（**下标 = 选中序号**）；上采样恒为整数块复制（不插值）。
+  pub const SCALE_CHOICES: [u32; 4] = [1, 2, 3, 4];
 }
 
 impl Default for RenderScale {
