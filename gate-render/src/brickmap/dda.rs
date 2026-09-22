@@ -1,4 +1,4 @@
-﻿//! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
+//! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
 //! BG0 = storage tex / 相机 uniform / beam depth / 眼睛适应状态（只读）；
 //! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理 + 采样器 / 材质资产表 /
 //! PBR 贴图数组 / **PBR 专用采样器**（MT2-3）。

@@ -1,4 +1,4 @@
-﻿//! WESL 包的**编译期**守门：把 `assets/shaders/voxel_raytrace/` 编译成 WGSL 并用 naga 校验。
+//! WESL 包的**编译期**守门：把 `assets/shaders/voxel_raytrace/` 编译成 WGSL 并用 naga 校验。
 //!
 //! 为什么需要它：着色器只在**运行期**（app 启动读盘编译 + wgpu 建 pipeline）才暴露问题，
 //! 而两类错误在 Rust 侧完全看不见：

@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "6d4d6ba82f52bcacc77ce92364644e853249f8b0",
-    "indexed_at": "2026-09-22T07:18:46Z",
+    "commit": "fe87e21bcd478a0da75999f7acf907b68cfb2c3a",
+    "indexed_at": "2026-09-22T07:25:43Z",
     "project": "C-code-repo.rust-gate",
-    "nodes": 2612,
-    "edges": 10660,
+    "nodes": 2613,
+    "edges": 10662,
     "original_size": 8323072,
-    "compressed_size": 1771442,
+    "compressed_size": 1771418,
     "compression_level": 9
 }
