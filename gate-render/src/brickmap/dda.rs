@@ -1375,11 +1375,17 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<PostFxSettings>::default(),
       // LightingTheme 提取进 render world（BG3 光池数据源）
       bevy::render::extract_resource::ExtractResourcePlugin::<LightingTheme>::default(),
+      // 镜面档位（菜单「渲染/反射」）：main world 是菜单的写入目标，render world 供
+      // `prepare_dda_bind_groups` 写进 BG3 光池 uniform 的 `refl_tier` / `refl_nest`。
+      bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::ReflectionSettings>::default(),
       // 眼睛适应的活参数（debug overlay 的 Eye 页可调；变化才同步 → 稳态零上传）
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       crate::responsive::ResponsivePlugin,
     ));
     app.insert_resource(EyeAdaptSettings::startup());
+    // main world 侧先给出默认档位（菜单观察者按路径写它）；render world 那份由
+    // `ExtractResourcePlugin::<ReflectionSettings>` 拷过去。
+    app.init_resource::<crate::lighting::ReflectionSettings>();
 
     // main → render 的 ExtractSchedule：把 DdaCameraConfig 从 main world 读
     // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
@@ -1749,6 +1755,17 @@ pub(crate) fn init_dda_pipelines(
   commands.insert_resource(EyeAdaptGpu::default());
 }
 
+/// `prepare_dda_bind_groups` 的两个**档位资源**打包成一个 `SystemParam`：
+/// Bevy 的系统函数最多 16 个参数，本系统正好卡在边界上（见 `volumetric.rs::FogRes` 同一个先例）。
+/// 两项都是只读、都只在"建 BG/纹理尺寸"时用几次。
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct DdaTune<'w> {
+  /// GI 档位（分辨率除数 / 降噪质量）—— 决定 GI 纹理尺寸与绑哪张降噪输出。
+  pub gi: Option<Res<'w, crate::gi::GiSettings>>,
+  /// 镜面档位（菜单「渲染/反射」）—— 写进 BG3 光池 uniform 的 `refl_tier` / `refl_nest`。
+  pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_dda_bind_groups(
   mut commands: Commands,
@@ -1765,7 +1782,7 @@ pub(crate) fn prepare_dda_bind_groups(
   pipeline_cache: Res<PipelineCache>,
   queue: Res<RenderQueue>,
   scale: Res<RenderScale>,
-  gi_settings: Option<Res<crate::gi::GiSettings>>,
+  tune: DdaTune,
   mut beam_cache: ResMut<AuxTexCache>,
 ) {
   let Some(images) = images else {
@@ -1819,7 +1836,7 @@ pub(crate) fn prepare_dda_bind_groups(
   // 换分辨率（gi_div 档位切换）与换窗口尺寸都走这条重建路径（条件只看 gi_size 变没变）。
   // 存 premultiplied valid（见 AuxTexCache 的说明）：rgba16f = (gi·valid, valid)。
   // wgpu 新建纹理自动清零 ⇒ valid 初值 0 = "无数据"，采样侧退回 conf=0 的天光兜底。
-  let gi_size = gi_settings.as_deref().copied().unwrap_or_default().gi_size(scale.size);
+  let gi_size = tune.gi.as_deref().copied().unwrap_or_default().gi_size(scale.size);
   if beam_cache.gi_tex.is_none() || beam_cache.gi_size != gi_size {
     let make = |label: &str, format: TextureFormat| {
       render_device.create_texture(&TextureDescriptor {
@@ -1960,7 +1977,7 @@ pub(crate) fn prepare_dda_bind_groups(
   // binding 4 绑哪张，取决于「降噪质量」档（`DenoisePlan.on`）：
   //   · 档 0（完全不降噪）⇒ 直接绑**原始** `gi_out`（没有任何降噪 pass 会写 `gi_dn`，绑它会读到上一帧的陈旧值）；
   //   · 其余档 ⇒ 绑 atrous 链的最终输出 `gi_dn[3]`（语义与 `gi_out` 完全一致：rgb = gi·valid、a = valid）。
-  let den_plan = match gi_settings.as_ref() {
+  let den_plan = match tune.gi.as_ref() {
     Some(g) => g.denoise_plan(),
     None => crate::gi::GiSettings::default().denoise_plan(),
   };
@@ -2018,7 +2035,7 @@ pub(crate) fn prepare_dda_bind_groups(
   // ---- GI 降噪的 bind group：时域 1 个 + atrous 5 个（src→dst 组合，见 `DEN_ATROUS_CHAINS`）----
   // 每帧重建（纹理/buffer 都是持久句柄，只是换绑）；`den_flip` 决定历史哪块是「上帧读」。
   // 只在真正会跑降噪时翻转 `den_flip`（与 `res_flip` 同一套语义）。
-  let den_runs = gi_settings.as_ref().is_some_and(|g| g.enabled);
+  let den_runs = tune.gi.as_ref().is_some_and(|g| g.enabled);
   let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
   {
     let guide = beam_cache.gi_guide.as_ref().expect("导引 buffer 未创建").clone();
@@ -2143,6 +2160,10 @@ pub(crate) fn prepare_dda_bind_groups(
     return;
   };
   *lp.0.get_mut() = build_light_pool(&lighting);
+  // 镜面档位 + 嵌套层级（菜单「渲染/反射」）：`build_light_pool` 只认主题资产、把这两格留 0，
+  // 真正的值在这里从菜单资源覆写（与 `LightGlobals` 那两格的文档一致）。
+  lp.0.get_mut().g.refl_tier = tune.refl.as_ref().map_or(0, |r| r.tier());
+  lp.0.get_mut().g.refl_nest = tune.refl.as_ref().map_or(0, |r| r.nest());
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 
@@ -2459,6 +2480,7 @@ fn blit_dda_view(
   views: Query<&ViewTarget>,
   blit_bg: Option<Res<DdaBlitBindGroup>>,
   post: Option<Res<PostFxSettings>>,
+  scale: Option<Res<RenderScale>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
@@ -2467,8 +2489,14 @@ fn blit_dda_view(
     bevy::log::debug_once!("DDA blit: bg or ViewTarget missing");
     return;
   };
-  // 抗锯齿 = 换一条 fragment 入口（`fs_fxaa`），bind group 完全相同 ⇒ 开关只在这里分支
-  let id = if post.as_ref().is_some_and(|p| p.fxaa) {
+  // 抗锯齿 = 换一条 fragment 入口（`fs_fxaa`），bind group 完全相同 ⇒ 开关只在这里分支。
+  // **只在像素大小 = 1 时生效**（`RenderScale.factor == 1`）：降采样档本身就是"大粒像素"的观感，
+  // FXAA 会把整数块边界抹糊，与那些档位的意图相反 ⇒ 一律走纯 blit。
+  // 菜单上「抗锯齿」那一行此时是**禁用态**（`debug_menu.rs::sync_video_menu`），但**开关值原样保留**
+  // —— 它记的是"像素大小 = 1 时要不要抗锯齿"，切回 `1` 就立刻生效。
+  // `RenderScale` 缺失（正常不该发生）⇒ 退回只看开关的旧行为，不静默关掉抗锯齿。
+  let downscaled = scale.as_ref().is_some_and(|s| s.factor != 1);
+  let id = if post.as_ref().is_some_and(|p| p.fxaa) && !downscaled {
     pipelines.blit_fxaa_pipeline
   } else {
     pipelines.blit_pipeline

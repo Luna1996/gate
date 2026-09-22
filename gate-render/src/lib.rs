@@ -25,8 +25,8 @@ pub use brickmap::{
 pub use brickmap::{PostFxSettings, RenderScale};
 pub use consts::VIEW_SIZE;
 pub use lighting::{
-  DirLightCfg, LightDesc, LightGlobals, LightPoolUniform, LightingTheme, MAX_LIGHTS, SkyCfg,
-  build_light_pool, parse_lighting_ron,
+  DirLightCfg, LightDesc, LightGlobals, LightPoolUniform, LightingTheme, MAX_LIGHTS,
+  ReflectionSettings, SkyCfg, build_light_pool, parse_lighting_ron,
 };
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use pbr_texture::{PBR_TEXTURE_DIR, PbrTextureSet, PbrTexturesPlugin};

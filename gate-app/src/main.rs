@@ -32,7 +32,7 @@ use camera::{
 use config::{Config, save_config_on_exit};
 use debug_menu::{
   DebugUiRoot, FpsOverlayVisible, FpsWindow, camera_info_tick, debug_menu_toggle, fps_overlay_tick,
-  spawn_debug_menu_ui, sync_sky_menu, sync_ui_locale,
+  spawn_debug_menu_ui, sync_edit_menu, sync_sky_menu, sync_ui_locale, sync_video_menu,
 };
 use edit::voxel_edit_input;
 use scene::setup;
@@ -172,6 +172,10 @@ fn main() {
         (fps_overlay_tick, camera_info_tick),
         // 「天空」页：自动流逝推进的时刻回写进菜单（面板显示的就是画面里的时刻）
         sync_sky_menu,
+        // 「编辑」页：PBR 变体开着时把材质控件整行置灰（参数全由资产/贴图决定）
+        sync_edit_menu,
+        // 「视频」页：像素大小 ≠ 1 时把「抗锯齿」整行置灰（那些档位下不启用 FXAA，开关值保留）
+        sync_video_menu,
         // 语言切换 → 菜单/UI 文案整体重解析
         sync_ui_locale,
         // 右上角组件展示窗：交互事件日志 / slider 实时值 / 演示折线喂数

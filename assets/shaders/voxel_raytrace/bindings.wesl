@@ -129,8 +129,14 @@ struct LightDesc {
 }
 struct LightGlobals {
   count: u32,
-  _pad0: u32,
-  _pad1: u32,
+  // **镜面档位**（`REFL_TIER_*`，见 `main.wesl` 的 MT4 段）：0 = 关、1 = 太阳直射 + 自发光、
+  // 2 = +逃逸天空走 `sky_primary`（镜像里有太阳盘）、3 = +反射命中点补阴影射线。
+  // 原来是废弃的 `_pad0`（恒 0）⇒ 复用空闲填充，布局与字节数都不变（Rust 侧 `LightGlobals`
+  // 同名字段，写侧在 `prepare_dda_bind_groups`）。
+  refl_tier: u32,
+  // **镜面嵌套层级**（0 / 1 / 2 / 4）：镜子里的镜子最多再反射几级（见 `main.wesl` 的 MT4-5 段）。
+  // 同样复用废弃填充 `_pad1`。写侧 = `prepare_dda_bind_groups`（Rust `ReflectionSettings::nest`）。
+  refl_nest: u32,
   _pad2: u32,
   ambient: vec4<f32>,     // rgb = 环境色（线性）
   exposure_pad: vec4<f32>, // x = 曝光系数

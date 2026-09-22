@@ -21,7 +21,7 @@ use gate_render::{DdaCameraConfig, PbrTextureSet, VoxelScene};
 use gate_voxel::{
   BRICK_FACTOR, BrickState, Displace, FillStats, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry,
   PaletteFlags, PaletteId, PbrOverrides, VolumeGrid, VoxelCoord, fill_box_displaced,
-  fill_sphere_displaced, override_value,
+  fill_sphere_displaced,
 };
 
 use crate::{
@@ -42,14 +42,20 @@ pub enum BrushShape {
 /// 笔触材质参数：菜单「游戏/编辑」的控件直接写这里，由 `material_slot` 落进调色板槽。
 ///
 /// **两个变体（PLAN D1 的 8B 变体复用）**，与 `PaletteEntry` 一一对应：
-/// - `pbr = false`（默认）：`color` / `emissive` / `transmission` / `roughness` 就是平凡 payload
-///   （字节布局与改动前逐位相同）；
-/// - `pbr = true`：8B 被解释为 `asset_slot` + 5 个槽级覆盖 ⇒ 那四个滑杆改驱动 `*_ov` 字段
-///   （`color` 不参与：D1 明确 PBR 变体不做逐实例染色，albedo 来自资产贴图）。
+/// - `pbr = false`（默认）：`color` / `emissive` / `transmission` / `roughness` / `metallic`
+///   就是平凡 payload（`metallic` 原本是废弃 `_pad`，默认 `0` ⇒ 打包结果与改动前逐位相同）；
+/// - `pbr = true`：8B 被解释为 `asset_slot` + `flags`，**参数全部来自材质资产与它的贴图**
+///   （albedo / roughness / metallic / emissive / specular / IOR 都是资产级的）⇒ 菜单上那七个
+///   材质控件在 PBR 模式下**整行置灰、不生效**（见 `debug_menu.rs::sync_edit_menu`），这里也就
+///   没有 `*_ov` 这种字段。
 ///
-/// **`ior_x100` 是例外**：D1 规定 IOR 是**资产级**物理基值（`MaterialAsset::transmission_ior`
-/// 的高 16 位），槽级只有 `specular` 覆盖 ⇒ 这 8B 里**没有** IOR 的位置，本字段只是菜单值的记录
-/// （见 `summary()` 的说明），不参与 `entry()`。
+/// 槽级覆盖（`PbrOverrides`）这条能力**只留给场景资产**：`.vox` 的 MATL 元数据
+/// （`_rough` / `_metal` / `_emit`）由 `vox_scene.rs::matl_to_entry` 落进那 5 个覆盖字节。
+/// 编辑器画笔**不写**覆盖 —— 一刀切：用 PBR 就用资产那一份。
+///
+/// **IOR 不在本结构里**：它是**资产级**物理基值（`MaterialAsset::transmission_ior` 的高 16 位，同时服务
+/// 玻璃折射与电介质 F0），这 8B 里没有它的位置 ⇒ 菜单上也没有这个控件（曾经有过一个只记录、
+/// 不改画面的滑杆，已删除）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrushMaterial {
   /// sRGB [r, g, b]（**仅平凡变体**）
@@ -60,42 +66,36 @@ pub struct BrushMaterial {
   pub transmission: u8,
   /// 粗糙度 0..255（0 = 镜面，255 = 完全粗糙；平凡变体直接就是这个字节）
   pub roughness: u8,
+  /// 金属度（**二值**：`0` = 电介质、`255` = 完全金属；平凡变体直接就是这个字节，菜单上是开关）。
+  ///
+  /// **为什么是二值**：metallic 取连续值的唯一理由是**让贴图表达过渡**（锈蚀 / 磨损 / 掉漆的边缘），
+  /// 物理上"是不是金属"没有中间态。平凡变体没有贴图可承载过渡 ⇒ 开关就是它的全部语义。
+  /// （PBR 那边的连续量来自 roughmetal 贴图的 B 通道，与本字段无关。）
+  ///
+  /// **镜面的关键旋钮**：金属的 `F0 = albedo`（D1「F0 的唯一来源规则」，见 `common.wesl::f0_of`）
+  /// ⇒ 「颜色 = 白 + 光滑度 100 + 金属度开」就是一个 `F0 = 1` 的镜面；
+  /// 电介质的 `F0` 只有 `((IOR−1)/(IOR+1))² · specular = 0.04` ⇒ 正视下反射项只有 4%、看不出镜面。
+  /// 开关同时给出 `kD = 1 − metallic = 0`（漫反射清零）—— 少了它，那 96% 的漫反射会把镜面盖住。
+  /// **PBR 变体下本字段不参与**（参数来自资产的 roughmetal 贴图）—— 那份 8B 里也没有槽级旋钮。
+  pub metallic: u8,
   /// `IS_PBR` 变体开关（菜单「PBR 变体」）
   pub pbr: bool,
   /// PBR 变体引用的材质资产槽号（= `PbrTextureSet` 的层号 = 全局资产表下标）
   pub asset_slot: u32,
-  /// PBR 变体：roughness 覆盖（0 = 不覆盖；由「光滑度」滑杆驱动）
-  pub roughness_ov: u8,
-  /// PBR 变体：metallic 覆盖（0 = 不覆盖；由「金属度」滑杆驱动）
-  pub metallic_ov: u8,
-  /// PBR 变体：emissive 覆盖（0 = 不覆盖；由「自发光」滑杆驱动）
-  pub emissive_ov: u8,
-  /// PBR 变体：transmission 覆盖（0 = 不覆盖；由「不透明度」滑杆驱动）
-  pub transmission_ov: u8,
-  /// PBR 变体：specular 覆盖（0 = 不覆盖；语义同 glTF `KHR_materials_specular`，只调制电介质 F0）
-  pub specular_ov: u8,
-  /// 「折射率」滑杆值（IOR ×100）：100..=300 对应 1.00..3.00，默认 150 = 1.50。
-  /// **属资产级参数**（见类型注释），当前只记录/回显。
-  pub ior_x100: u16,
 }
 
 impl Default for BrushMaterial {
   /// 与 `assets/ui/debug_menu.toml` 初值一致
-  /// （中灰 / 不发光 / 不透明 / 半粗糙 / 平凡变体 / 槽 0 / 全部覆盖"不覆盖" / IOR 1.50）。
+  /// （中灰 / 不发光 / 不透明 / 半粗糙 / 平凡变体 / 槽 0）。
   fn default() -> Self {
     Self {
       color: [0x96, 0x98, 0x9E],
       emissive: 0,
       transmission: 0,
       roughness: 128,
+      metallic: 0,
       pbr: false,
       asset_slot: 0,
-      roughness_ov: 0,
-      metallic_ov: 0,
-      emissive_ov: 0,
-      transmission_ov: 0,
-      specular_ov: 0,
-      ior_x100: 150,
     }
   }
 }
@@ -108,37 +108,30 @@ impl BrushMaterial {
     if self.pbr { self.pbr_entry() } else { self.plain_entry() }
   }
 
-  /// 平凡变体条目（现状语义，逐位不变）
+  /// 平凡变体条目：`color` / `roughness` / `metallic` / `emissive` / `transmission` 逐字节直落
+  /// （默认 `metallic = 0` ⇒ 与引入该字段前**逐位相同**）
   fn plain_entry(&self) -> PaletteEntry {
     PaletteEntry {
       color: self.color,
       roughness: self.roughness,
+      metallic: self.metallic,
       emissive: self.emissive,
       transmission: self.transmission,
       ..Default::default()
     }
   }
 
-  /// PBR 变体条目：`asset` + 5 个槽级覆盖。
+  /// PBR 变体条目：**只有 `asset`**（槽级覆盖全"不覆盖"）—— 参数由资产与它的贴图决定。
   ///
-  /// `TRANSMISSIVE` 位（D1：**由调用方决定**，打包函数不推断）按槽级透射覆盖判定：
-  /// 覆盖字节 `>= 2` ⇔ 覆盖值 `> 0`（字节 `1` 是"覆盖为精确 0"，不是介质）——与平凡变体那条
-  /// "`transmission > 0` ⇒ 介质"同义。**只看覆盖、不看资产**：当前默认资产集的标量透射率全 0
-  /// （`gate-render/src/pbr_texture.rs::build_material_asset_table`），且这里读不到资产表；
-  /// 将来资产真的带透射时，这里要一并看资产（登记为后续项）。
+  /// `TRANSMISSIVE` 位（D1：**由调用方决定**，打包函数不推断）在编辑器这条路上**恒不置**：
+  /// 默认资产集的标量透射率全 0（`gate-render/src/pbr_texture.rs::build_material_asset_table`），
+  /// 且槽级覆盖已不再由菜单写 ⇒ 画不出 PBR 玻璃（要玻璃用平凡变体的「透明度」）。
+  /// 将来资产真的带透射时，这里要改成看资产（登记为后续项）。
   fn pbr_entry(&self) -> PaletteEntry {
-    let flags =
-      if self.transmission_ov >= 2 { PaletteFlags::TRANSMISSIVE } else { PaletteFlags::default() };
     PaletteEntry::pbr(
       self.asset_slot.min(u16::MAX as u32) as u16,
-      PbrOverrides {
-        roughness: self.roughness_ov,
-        metallic: self.metallic_ov,
-        emissive: self.emissive_ov,
-        transmission: self.transmission_ov,
-        specular: self.specular_ov,
-      },
-      flags,
+      PbrOverrides::default(),
+      PaletteFlags::default(),
     )
   }
 
@@ -148,36 +141,18 @@ impl BrushMaterial {
   }
 
   /// 日志用的一行摘要（菜单每次改动都打 `材质 → {summary}`，MT7-1 的验收之一）。
-  /// 覆盖字节按 D1 的编码解回参数值（`0` = 不覆盖），避免把编码字节直接当数值给人看。
   pub fn summary(&self) -> String {
     if !self.pbr {
       return format!(
-        "平凡 {} 自发光={} 透射率={} 粗糙度={}",
+        "平凡 {} 自发光={} 透射率={} 粗糙度={} 金属度={}",
         self.hex(),
         self.emissive,
         self.transmission,
-        self.roughness
+        self.roughness,
+        self.metallic
       );
     }
-    format!(
-      "PBR 变体 asset={} 覆盖[粗糙度={} 金属度={} 自发光={} 透射率={} 高光度={}] IOR={:.2}\
-       （IOR 是资产级参数，本槽不携带；起作用的槽级旋钮是「高光度」）",
-      self.asset_slot,
-      ov_text(self.roughness_ov),
-      ov_text(self.metallic_ov),
-      ov_text(self.emissive_ov),
-      ov_text(self.transmission_ov),
-      ov_text(self.specular_ov),
-      self.ior_x100 as f32 / 100.0,
-    )
-  }
-}
-
-/// 覆盖字节 → 日志文本：`0` = 不覆盖，其余显示参数值（`(v−1)/254`）。
-fn ov_text(byte: u8) -> String {
-  match override_value(byte) {
-    None => "不覆盖".to_string(),
-    Some(v) => format!("{v:.3}"),
+    format!("PBR 变体 asset={}（参数全部来自资产与贴图，无槽级覆盖）", self.asset_slot)
   }
 }
 
@@ -195,19 +170,36 @@ pub fn smooth_pct_to_roughness(pct: f32) -> u8 {
   (((100.0 - pct.clamp(0.0, 100.0)) / 100.0) * 255.0).round() as u8
 }
 
+/// 菜单「金属度」开关 → `PaletteEntry.metallic` 字节（`0` = 电介质、`255` = 完全金属）。
+/// 二值 ⇒ 只给两个端点：着色侧读 `f32(byte)/255.0` ⇒ 精确 `0.0` / `1.0`，无中间态。
+pub fn metal_toggle_to_metallic(on: bool) -> u8 {
+  if on { 255 } else { 0 }
+}
+
 /// 编辑设置（main world Resource）
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct EditSettings {
   pub shape: BrushShape,
   /// 笔触大小（voxel）
   pub size: u32,
-  /// 当前笔触材质参数（由菜单「游戏/编辑」的四个控件驱动）
+  /// **偏移距离**（voxel，菜单「游戏/编辑/笔触/偏移距离」）：笔触几何中心相对**点击选中的体素**
+  /// 沿命中面法线方向的偏移。
+  ///
+  /// - **放置**：中心 = 命中体素 `+ face · round(offset)`（往**外**推）；
+  /// - **摧毁**：中心 = 命中体素 `− face · round(offset)`（往**内**挖）—— 同一个值取反方向。
+  ///
+  /// `face` 是 DDA 给的入面法线（指向射线来向）⇒ 正偏移对放置是"离开表面"、对摧毁是"深入表面"。
+  /// 笔触中心必须是**整数体素格** ⇒ 落笔时四舍五入到格（`1.5 ⇒ 2`；`offset = 1` 恰好等于旧的
+  /// "贴面外一格"）。菜单里可自由输入；**改「笔触大小」时自动置为 `size / 2`**（`default` 与之一致）。
+  pub offset: f32,
+  /// 当前笔触材质参数（由菜单「游戏/编辑/材质」的控件驱动）
   pub mat: BrushMaterial,
 }
 
 impl Default for EditSettings {
   fn default() -> Self {
-    Self { shape: BrushShape::Sphere, size: 3, mat: BrushMaterial::default() }
+    // offset = size / 2 = 1.5：与"改大小就自动跟着走"那条规则一致（size 默认 3，与菜单初值同）
+    Self { shape: BrushShape::Sphere, size: 3, offset: 1.5, mat: BrushMaterial::default() }
   }
 }
 
@@ -644,12 +636,16 @@ pub(crate) fn voxel_edit_input(
   let Some((hit, face, _t)) = raycast_main(grid, origin, dir, EDIT_REACH) else {
     return;
   };
+  // 笔触几何中心 = 命中体素沿**入面法线**偏移 `round(offset)` 格（见 `EditSettings::offset`）：
+  // 放置往**外**推、摧毁往**内**挖 —— 同一个值取反方向。中心必须是整数体素格 ⇒ 四舍五入。
+  let off = settings.offset.max(0.0).round() as i32;
   let (center, pal) = if erase {
-    (hit, PaletteId::AIR)
+    (hit - face * off, PaletteId::AIR)
   } else {
-    // 放置落点 = 命中面外侧一格；槽位按材质内容取/建（参数变了即新材质，旧体素不受影响）
+    // 放置落点 = 命中体素沿法线外推 `off` 格（`off = 1` 即旧的"贴面外一格"）；
+    // 槽位按材质内容取/建（参数变了即新材质，旧体素不受影响）
     let slot = material_slot(grid, settings.mat);
-    (hit + face, slot)
+    (hit + face * off, slot)
   };
   // MT8-5：落笔走位移还是普通填充由**笔触材质的资产**决定（`run_brush` 里解析）；
   // 计时含"槽位分配 + 位移填充/普通填充"全程 ⇒ 日志里的耗时就是这一笔的实付代价
@@ -659,7 +655,7 @@ pub(crate) fn voxel_edit_input(
   let elapsed = t0.elapsed();
   if run.voxels > 0 {
     bevy::log::info!(
-      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} slot={} material={} | displacement: {}{} | 耗时 {:?}",
+      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} offset={} slot={} material={} | displacement: {}{} | 耗时 {:?}",
       if erase { "erase" } else { "place" },
       run.voxels,
       center.x,
@@ -667,6 +663,7 @@ pub(crate) fn voxel_edit_input(
       center.z,
       shape,
       size,
+      off,
       pal,
       if erase { "-".to_string() } else { settings.mat.summary() },
       run.displace,
@@ -706,7 +703,8 @@ pub(crate) fn edit_selftest(
     return;
   };
   let slot = material_slot(grid, settings.mat);
-  let center = hit + face;
+  // 与 `voxel_edit_input` 的**放置路径同一条中心公式**（偏移四舍五入到格，见 `EditSettings::offset`）
+  let center = hit + face * settings.offset.max(0.0).round() as i32;
   let t0 = Instant::now();
   let run =
     run_brush(grid, center, shape, size, slot, pbr_set.as_deref(), Some(&mut displace_cache));
@@ -866,49 +864,37 @@ mod tests {
     }
   }
 
-  /// MT7-1：PBR 变体的 `entry()` 走 `PaletteEntry::pbr`（构造）+ 变体分派打包，
-  /// 且 `TRANSMISSIVE` 由**槽级透射覆盖**决定（字节 1 = 覆盖为精确 0 ⇒ 不是介质）。
+  /// MT7-1 + **一刀切**：PBR 变体的 `entry()` 只带 `asset`（5 个覆盖字节全 0 = 不覆盖），
+  /// 且编辑器**不再产介质**（`TRANSMISSIVE` 恒不置 —— 要玻璃用平凡变体的「透明度」）。
   #[test]
-  fn pbr_entry_packing_and_medium_flag() {
-    let pbr = BrushMaterial {
-      pbr: true,
-      asset_slot: 0x0102,
-      roughness_ov: 1,
-      metallic_ov: 255,
-      specular_ov: 255,
-      ..Default::default()
-    };
-    // word0 = roughness覆盖(1) | metallic覆盖(255)<<8；word1 = asset(0x0102) | IS_PBR(0x10)<<16 | specular(255)<<24
-    assert_eq!(pack_palette_entry(&pbr.entry()), [0x0000_FF01, 0xFF10_0102]);
+  fn pbr_entry_carries_asset_only() {
+    let pbr = BrushMaterial { pbr: true, asset_slot: 0x0102, ..Default::default() };
+    // word0 = 0（5 个覆盖字节全 0）；word1 = asset(0x0102) | IS_PBR(0x10)<<16
+    assert_eq!(pack_palette_entry(&pbr.entry()), [0x0000_0000, 0x0010_0102]);
     assert_eq!(pbr.entry().pbr_asset(), 0x0102);
-
-    let medium = BrushMaterial { transmission_ov: 2, ..pbr };
-    assert_ne!(
-      pack_palette_entry(&medium.entry())[1] & 0x0020_0000,
-      0,
-      "透射覆盖值 > 0 ⇒ 标 TRANSMISSIVE（D1：PBR 变体的介质位由调用方决定）"
-    );
-    let zero = BrushMaterial { transmission_ov: 1, ..pbr };
     assert_eq!(
-      pack_palette_entry(&zero.entry())[1] & 0x0020_0000,
+      pack_palette_entry(&pbr.entry())[1] & 0x0020_0000,
       0,
-      "字节 1 是「覆盖为精确 0」⇒ 不是介质（与平凡变体的 transmission > 0 同义）"
+      "编辑器不产介质位（PBR 玻璃只能靠资产，当前资产集不透射）"
     );
+    // 平凡参数不参与 PBR payload ⇒ 在 PBR 模式下改它们（控件已置灰）不改变落盘结果
+    let noisy = BrushMaterial { color: [9, 9, 9], roughness: 7, metallic: 200, ..pbr };
+    assert_eq!(pack_palette_entry(&noisy.entry()), pack_palette_entry(&pbr.entry()));
   }
 
-  /// MT7-3：PBR 变体也按**内容（8B payload）**去重 —— 同内容复用同一槽，内容变了才认领新槽，
-  /// 且落进槽的确实是 PBR 变体的打包结果。
+  /// MT7-3：PBR 变体也按**内容（8B payload）**去重 —— 同内容复用同一槽，内容变了才认领新槽。
+  /// 一刀切后 PBR 的内容 = **资产槽号**（+ flags）⇒ 只有换资产才会认领新槽。
   #[test]
   fn pbr_material_dedups_by_payload() {
     let mut grid = VolumeGrid::new();
-    let a = BrushMaterial { pbr: true, asset_slot: 10, metallic_ov: 255, ..Default::default() };
+    let a = BrushMaterial { pbr: true, asset_slot: 10, ..Default::default() };
     let s1 = material_slot(&mut grid, a);
-    assert_eq!(pack_palette_entry(grid.palette().get(s1)), [0x0000_FF00, 0x0010_000A]);
+    assert_eq!(pack_palette_entry(grid.palette().get(s1)), [0x0000_0000, 0x0010_000A]);
     assert_eq!(material_slot(&mut grid, a), s1, "同 8B payload ⇒ 复用同一槽");
-    // 覆盖值不同、资产槽不同 ⇒ 各自认领新槽
-    let b = BrushMaterial { metallic_ov: 128, ..a };
+    // 平凡参数变化**不进** PBR payload ⇒ 仍是同一槽
+    assert_eq!(material_slot(&mut grid, BrushMaterial { color: [1, 2, 3], roughness: 42, ..a }), s1);
+    // 换资产 ⇒ 认领新槽
     let c = BrushMaterial { asset_slot: 11, ..a };
-    assert_ne!(material_slot(&mut grid, b), s1);
     assert_ne!(material_slot(&mut grid, c), s1);
     assert_eq!(*grid.palette().get(s1), a.entry(), "旧槽内容不得被改写");
   }

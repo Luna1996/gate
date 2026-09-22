@@ -20,7 +20,6 @@ options = [
     "menu.video.scale.quarter",
 ]
 selected = 0
-tooltip = "menu.video.scale.tip"
 
 [[items.children]]
 kind = "toggle"
@@ -39,7 +38,6 @@ kind = "toggle"
 id = "aa"
 label = "menu.video.aa"
 checked = false
-tooltip = "menu.video.aa.tip"
 
 [[items.children]]
 kind = "toggle"
@@ -120,6 +118,44 @@ options = [
 ]
 selected = 0
 tooltip = "menu.render.gi.realloc.tip"
+
+[[items.children]]
+kind = "sub_menu"
+id = "refl"
+label = "menu.render.refl"
+
+# 镜面档位：只改**反射内容的着色口径**，不改逐面量化的粒度（镜面恒为一个体素面一个反射值）。
+# 档 0/1/2 都不发额外射线，只有最后一档在反射命中点补太阳 NEE（每个触发像素 +1 次 DDA）。
+# 默认 `selected = 2` 与 Rust 侧 `ReflectionSettings::default()` 一致。
+[[items.children.children]]
+kind = "switch_group"
+id = "tier"
+label = "menu.render.refl.tier"
+options = [
+    "menu.render.refl.tier.off",
+    "menu.render.refl.tier.sun",
+    "menu.render.refl.tier.sky",
+    "menu.render.refl.tier.shadow",
+]
+selected = 2
+tooltip = "menu.render.refl.tier.tip"
+
+# 镜面嵌套层级：镜子里的镜子最多再反射几级（`0 / 1 / 2 / 4`）。
+# **只在"上一级命中的面本身也是镜面"时才继续发线** ⇒ 墙 / 地形在第一级就断链，
+# 日常场景下这几个档的画面与成本完全一样。最坏 `层级 + 1` 条反射射线。
+# 默认 `selected = 0` 与 Rust 侧 `ReflectionSettings::default()` 一致（= 不嵌套）。
+[[items.children.children]]
+kind = "switch_group"
+id = "nest"
+label = "menu.render.refl.nest"
+options = [
+    "menu.render.refl.nest.0",
+    "menu.render.refl.nest.1",
+    "menu.render.refl.nest.2",
+    "menu.render.refl.nest.4",
+]
+selected = 0
+tooltip = "menu.render.refl.nest.tip"
 
 [[items.children]]
 kind = "sub_menu"
@@ -424,7 +460,13 @@ kind = "sub_menu"
 id = "edit"
 label = "menu.game.edit"
 
+# ---- 「笔触」：笔触几何（形状 / 大小 / 偏移距离）----
 [[items.children.children]]
+kind = "sub_menu"
+id = "brush"
+label = "menu.game.edit.brush"
+
+[[items.children.children.children]]
 kind = "switch_group"
 id = "shape"
 label = "menu.game.edit.shape"
@@ -434,12 +476,12 @@ options = [
 ]
 selected = 0
 
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "input"
 id = "size"
 label = "menu.game.edit.size"
 
-[[items.children.children.fields]]
+[[items.children.children.children.fields]]
 label = ""
 text = "3"
 min = 1.0
@@ -447,56 +489,39 @@ max = inf
 step = 1.0
 decimals = 0
 
-[[items.children.children]]
-kind = "color"
-id = "color"
-label = "menu.game.edit.color"
-hex = "96989E"
+# 偏移距离：笔触几何中心相对**点击选中的体素**沿命中面法线方向的偏移（体素）。
+# 放置取 `+offset`、摧毁取 `-offset`（反方向）；中心必须是整数体素格 ⇒ 落笔时四舍五入到格。
+# 改「笔触大小」时自动置为 `大小 / 2`（仍可自由输入）——初值 `1.5` = 大小 `3` 的一半。
+[[items.children.children.children]]
+kind = "input"
+id = "offset"
+label = "menu.game.edit.offset"
 
-[[items.children.children]]
-kind = "slider"
-id = "emissive"
-label = "menu.game.edit.emissive"
-value = 0.0
+[[items.children.children.children.fields]]
+label = ""
+text = "1.5"
 min = 0.0
-max = 255.0
-step = 1.0
-decimals = 0
-tooltip = "menu.game.edit.emissive.tip"
+max = inf
+step = 0.5
+decimals = 1
 
+# ---- 「材质」：笔触材质（平凡参数 / PBR 资产）----
 [[items.children.children]]
-kind = "slider"
-id = "alpha"
-label = "menu.game.edit.alpha"
-value = 0.0
-min = 0.0
-max = 100.0
-step = 1.0
-decimals = 0
-tooltip = "menu.game.edit.alpha.tip"
-
-[[items.children.children]]
-kind = "slider"
-id = "smooth"
-label = "menu.game.edit.smooth"
-value = 50.0
-min = 0.0
-max = 100.0
-step = 1.0
-decimals = 0
-tooltip = "menu.game.edit.smooth.tip"
+kind = "sub_menu"
+id = "mat"
+label = "menu.game.edit.mat"
 
 # ---- MT7-1 · 材质编写（PBR 变体）----
 # 选项 = assets/textures/pbr/ 的目录名（字典序 = texture_2d_array 层号 = 资产表槽号，
 # 与 pbr_texture.rs 的层号契约一致）；选中项按 id 查 PbrTextureSet 的真实槽号。
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "toggle"
 id = "pbr"
 label = "menu.game.edit.pbr"
 checked = false
 tooltip = "menu.game.edit.pbr.tip"
 
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "dropdown"
 id = "pbr_asset"
 label = "menu.game.edit.pbr_asset"
@@ -520,38 +545,53 @@ options = [
 ]
 selected = 0
 
-[[items.children.children]]
+[[items.children.children.children]]
+kind = "color"
+id = "color"
+label = "menu.game.edit.color"
+hex = "96989E"
+
+[[items.children.children.children]]
 kind = "slider"
+id = "emissive"
+label = "menu.game.edit.emissive"
+value = 0.0
+min = 0.0
+max = 255.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.edit.emissive.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "alpha"
+label = "menu.game.edit.alpha"
+value = 0.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.edit.alpha.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "smooth"
+label = "menu.game.edit.smooth"
+value = 50.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.edit.smooth.tip"
+
+# 金属度是**二值**（电介质 / 金属），所以是开关不是滑杆：写材质的 0 / 255 两个字节。
+# 打开时同时给出 `F0 = albedo`（反射）与 `kD = 0`（漫反射清零）⇒ 配上"颜色 = 白 + 光滑度 100"就是镜面。
+[[items.children.children.children]]
+kind = "toggle"
 id = "metal"
 label = "menu.game.edit.metal"
-value = 0.0
-min = 0.0
-max = 100.0
-step = 1.0
-decimals = 0
+checked = false
 tooltip = "menu.game.edit.metal.tip"
-
-[[items.children.children]]
-kind = "slider"
-id = "ior"
-label = "menu.game.edit.ior"
-value = 150.0
-min = 100.0
-max = 300.0
-step = 1.0
-decimals = 0
-tooltip = "menu.game.edit.ior.tip"
-
-[[items.children.children]]
-kind = "slider"
-id = "spec"
-label = "menu.game.edit.spec"
-value = 0.0
-min = 0.0
-max = 100.0
-step = 1.0
-decimals = 0
-tooltip = "menu.game.edit.spec.tip"
 
 [[items.children]]
 kind = "sub_menu"

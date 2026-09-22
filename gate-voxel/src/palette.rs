@@ -119,6 +119,11 @@ impl From<PaletteId> for usize {
 ///
 /// 覆盖的编码见 [`PbrOverrides`]（`0` = 不覆盖）；`asset` 是 `MaterialAsset` 全局表的槽号，
 /// 分工是「资产级给物理基值、槽级只给调节量」（见 D1「F0 的唯一来源规则」）。
+///
+/// **谁来写这 5 个覆盖字节：只有场景资产** —— `.vox` 的 MATL 元数据（`_rough` / `_metal` / `_emit`）
+/// 由 `gate-app/src/vox_scene.rs::matl_to_entry` 落进来。**编辑器画笔一律全 0**（"一刀切"：
+/// 用 PBR 就用资产与贴图那一份，菜单控件整行置灰，见 `gate-app/src/edit.rs::BrushMaterial`）。
+///
 /// **读侧（shader / 本仓任何按字段读的地方）不得对 PBR 变体套用平凡语义**：变体判定只认
 /// `flags` 的 `IS_PBR` 位（`common.wesl::fetch_material` 就是这么分派的）。
 ///
@@ -241,13 +246,6 @@ pub fn inverted_pct_to_override(pct: f32) -> u8 {
     return 0;
   }
   override_byte((100.0 - pct.clamp(0.0, 100.0)) / 100.0)
-}
-
-/// 「折射率」滑杆（`100..=300` = IOR ×100，默认 150 = 1.50）→ 资产 IOR ×100。
-/// **不是覆盖**：D1 规定 IOR 是**资产级**物理基值（同时服务玻璃折射与电介质 F0），
-/// 槽级只有 `specular` 覆盖（只调制电介质 F0）⇒ 本函数产出的值属于"资产参数"那一侧。
-pub fn ior_slider_to_x100(value: f32) -> u16 {
-  value.round().clamp(100.0, 300.0) as u16
 }
 
 /// 标志位：手写 bit 常量（不引 bitflags crate）
@@ -444,17 +442,6 @@ mod tests {
     assert!(g1 > g50 && g50 > g100, "粗糙度必须随「光滑度」单调不增：{g1} > {g50} > {g100}");
     // 50% 约等于旧的 `smooth_pct_to_roughness(50) = 128` 归一化值（128/255 ≈ 0.502）
     assert!((g50 - 0.502).abs() < 0.01);
-  }
-
-  /// IOR 滑杆是 ×100 单位域（100..=300 ⇒ 1.00..3.00），默认 150 = 1.50（D1 的资产级物理基值）。
-  #[test]
-  fn ior_slider_is_x100() {
-    assert_eq!(ior_slider_to_x100(150.0), 150);
-    assert_eq!(ior_slider_to_x100(100.0), 100);
-    assert_eq!(ior_slider_to_x100(300.0), 300);
-    assert_eq!(ior_slider_to_x100(149.6), 150, "四舍五入到整数 ×100");
-    assert_eq!(ior_slider_to_x100(0.0), 100, "越界钳到 1.00");
-    assert_eq!(ior_slider_to_x100(1e6), 300, "越界钳到 3.00");
   }
 
   /// `PaletteEntry::pbr` 的字段落位必须与 D1 的字节布局表一致（`pbr_asset` / `pbr_overrides` 是它的逆）。

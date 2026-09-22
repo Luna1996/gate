@@ -24,8 +24,8 @@ pub use volume::{
 
 pub use palette::{
   PALETTE_BITS, PALETTE_ENTRY_COUNT, PALETTE_INDEX_MAX, Palette, PaletteEntry, PaletteFlags,
-  PaletteId, PbrOverrides, inverted_pct_to_override, ior_slider_to_x100, override_byte,
-  override_value, slider_to_override,
+  PaletteId, PbrOverrides, inverted_pct_to_override, override_byte, override_value,
+  slider_to_override,
 };
 
 pub use scene::{

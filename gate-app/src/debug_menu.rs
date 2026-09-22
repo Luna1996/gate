@@ -16,8 +16,6 @@ use gate_ui::{
   DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   parse_hex_color, spawn_debug_menu,
 };
-use gate_voxel::{inverted_pct_to_override, ior_slider_to_x100, slider_to_override};
-
 use crate::camera::{CameraMode, FlyCamera};
 use crate::config::Config;
 use crate::consts::{
@@ -25,7 +23,8 @@ use crate::consts::{
   FPS_WINDOW_SECS, VOXEL_PER_METER,
 };
 use crate::edit::{
-  BrushMaterial, BrushShape, EditSettings, smooth_pct_to_roughness, transparency_pct_to_transmission,
+  BrushMaterial, BrushShape, EditSettings, metal_toggle_to_metallic, smooth_pct_to_roughness,
+  transparency_pct_to_transmission,
 };
 use crate::showcase::ShowcaseRoot;
 use std::sync::atomic::Ordering;
@@ -37,8 +36,25 @@ pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
 pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
-/// 「编辑」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
-pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/pbr_asset";
+/// 「编辑/材质」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
+pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/mat/pbr_asset";
+/// 「编辑/笔触」页「偏移距离」输入框的节点路径：改「笔触大小」时要把自动值写回这个控件
+/// （见 `write_brush_offset`）。与 `EditSettings::offset` 是同一个量的两面。
+const EDIT_OFFSET_PATH: &str = "game/edit/brush/offset";
+/// 「视频」页「抗锯齿」的节点路径：像素大小 ≠ 1 时整行置灰（`sync_video_menu` 按路径置禁用）。
+const VIDEO_AA_PATH: &str = "video/aa";
+
+/// 「编辑/材质」页受 **PBR 变体**影响的五个材质控件路径：PBR 模式下整行置灰
+/// （`sync_edit_menu` 要按路径置禁用；观察者用字面量匹配）。逐一对照 `debug_menu.toml` 的 `edit/mat` 页。
+/// ⚠️ 「编辑」页自己的控件（形状 / 大小 / 偏移距离）**不在**这张表里 —— 它们是笔触几何、与材质无关。
+const EDIT_MATERIAL_PATHS: [&str; 5] = [
+  "game/edit/mat/color",
+  "game/edit/mat/emissive",
+  "game/edit/mat/alpha",
+  "game/edit/mat/smooth",
+  "game/edit/mat/metal",
+];
+
 /// 「渲染/天空」各控件的节点路径：`sync_sky_menu` 要按路径查值，故集中在这里（观察者用字面量匹配）。
 const SKY_HOUR_PATH: &str = "render/sky/time/hour";
 const BLUR_STRENGTH_PATH: &str = "render/sky/blur/strength";
@@ -295,7 +311,8 @@ fn register_callbacks(world: &mut World) {
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut gi: ResMut<gate_render::gi::GiSettings>,
-     mut eye: ResMut<gate_render::EyeAdaptSettings>| {
+     mut eye: ResMut<gate_render::EyeAdaptSettings>,
+     mut refl: ResMut<gate_render::ReflectionSettings>| {
       match (ev.path.as_str(), &ev.action) {
         ("render/gi/enabled", MenuAction::Toggle(on)) => {
           gi.enabled = *on;
@@ -365,6 +382,33 @@ fn register_callbacks(world: &mut World) {
             _ => ("强", 0.25, 4.00),
           };
           info!("GI 采样重分配 → {}（收敛像素 ×{}、刚脏像素 ×{}）", name, lo, hi);
+        }
+        // 镜面档位（菜单「渲染/反射」）：**只改反射内容的着色口径**，不改逐面量化的粒度。
+        // 档 0/1/2 都**不发额外射线**（1/2 只是把反射命中点按完整着色点算、逃逸天空改走 `sky_primary`）；
+        // 只有档 3 在反射命中点补一条太阳 NEE 阴影射线（每个触发像素 +1 次 DDA 遍历）。
+        // 档位 → uniform `LightGlobals::refl_tier`：菜单不直接写 uniform，写资源、由
+        // `prepare_dda_bind_groups` 每帧搬（见 `gate-render/src/lighting.rs::ReflectionSettings`）。
+        ("render/refl/tier", MenuAction::Select(i)) => {
+          let t = (*i).min((gate_render::ReflectionSettings::TIERS - 1) as usize) as u32;
+          refl.tier = t;
+          let (name, cost) = match t {
+            0 => ("关", "不发反射射线（只有 F0·(amb+gi) 近似）"),
+            1 => ("直射", "0 条额外射线：反射命中点带太阳直射 + 自发光"),
+            2 => ("直射+天空", "0 条额外射线：镜像里再带上太阳盘 / 光晕"),
+            _ => ("直射+天空+阴影", "每个触发像素 +1 次 DDA：反射命中点补太阳 NEE"),
+          };
+          info!("镜面档位 → {t} {name}（{cost}）");
+        }
+        // 镜面嵌套层级（菜单「渲染/反射」）：允不允许"镜子里的镜子"再反射。
+        // 取值是**枚举值**（`0 / 1 / 2 / 4`，不是档位号）⇒ 与 `GiSettings::DIV_CHOICES` 同一个手法。
+        // 成本只在真的"镜子对着镜子"时才付：链条遇到非镜面（墙 / 地形）立刻断（见 `main.wesl` 的 MT4-5）。
+        ("render/refl/nest", MenuAction::Select(i)) => {
+          let n = gate_render::ReflectionSettings::NEST_CHOICES[(*i).min(3)];
+          refl.nest = n;
+          info!(
+            "镜面嵌套 → {n} 层（最多 {} 条反射射线；遇到非镜面的面立刻断链）",
+            n + 1
+          );
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;
@@ -536,22 +580,35 @@ fn register_callbacks(world: &mut World) {
     |ev: On<MenuActionEvent>,
      mut edit: ResMut<EditSettings>,
      q_menu: Query<&gate_ui::DebugMenu>,
+     mut q_offsets: Query<(&gate_ui::menu::MenuItem, &mut gate_ui::TextInputValue)>,
      pbr_set: Option<Res<gate_render::PbrTextureSet>>,
      mut q_show: Query<&mut Visibility, With<ShowcaseRoot>>| {
       match (ev.path.as_str(), &ev.action) {
-        ("game/edit/shape", MenuAction::Select(i)) => {
+        ("game/edit/brush/shape", MenuAction::Select(i)) => {
           edit.shape = if *i == 0 { BrushShape::Sphere } else { BrushShape::Cube };
           info!("笔触形状 → {:?}", edit.shape);
         }
-        ("game/edit/size", MenuAction::Text(t)) => {
+        ("game/edit/brush/size", MenuAction::Text(t)) => {
           if let Ok(v) = t.trim().parse::<u32>() {
             edit.size = v.max(EDIT_SIZE_MIN);
+            // **大小变了 ⇒ 偏移距离自动跟到"大小的一半"**（仍可自由输入，见 `write_brush_offset`）
+            let auto = edit.size as f32;
+            write_brush_offset(&mut edit, auto, &mut q_offsets);
             // 跨度 = 2·size-1（saturating 防日志侧溢出）
             let span = edit.size.saturating_mul(2).saturating_sub(1);
-            info!("笔触大小 → {} vx（跨度 {}）", edit.size, span);
+            info!("笔触大小 → {} vx（跨度 {}；偏移距离自动 → {:.1}）", edit.size, span, auto);
           }
         }
-        ("game/edit/color", MenuAction::Text(t)) => match parse_hex_color(t) {
+        // 偏移距离：笔触几何中心相对命中体素的法线方向偏移（放置 `+`、摧毁 `−`）。
+        // 自由输入 ⇒ **不回写控件**（半截输入会被下一帧重写、打断输入）；解析失败就忽略。
+        ("game/edit/brush/offset", MenuAction::Text(t)) => match t.trim().parse::<f32>() {
+          Ok(v) => {
+            edit.offset = v.max(0.0);
+            info!("笔触偏移距离 → {:.1} vx（放置沿法线外推、摧毁沿法线内挖）", edit.offset);
+          }
+          Err(_) => debug!(target: "gate", "偏移距离输入未成形 → {t:?}（忽略）"),
+        },
+        ("game/edit/mat/color", MenuAction::Text(t)) => match parse_hex_color(t) {
           Some([r, g, b, _]) => {
             edit.mat.color = [r, g, b];
             log_material(&edit.mat);
@@ -559,35 +616,31 @@ fn register_callbacks(world: &mut World) {
           // 输入框是自由文本：解析失败（半截输入）就忽略，不打断输入
           None => debug!(target: "gate", "笔触颜色输入未成形 → {t:?}（忽略）"),
         },
-        ("game/edit/emissive", MenuAction::Value(v)) => {
-          // 平凡变体直接用这个字节；PBR 变体把它当**槽级覆盖**（最低档 = 不覆盖），
-          // 两个编码同时维护 ⇒ 切变体不需要重算（编码见 gate_voxel::palette 的映射函数）。
+        // 下面这七个材质控件只在**平凡变体**下生效：PBR 变体一开就整行置灰、不写进材质
+        // （见 `sync_edit_menu`）。它们改的是笔触的平凡参数，切回平凡变体时原样还在。
+        ("game/edit/mat/emissive", MenuAction::Value(v)) => {
           edit.mat.emissive = v.round().clamp(0.0, 255.0) as u8;
-          edit.mat.emissive_ov = slider_to_override(*v, 0.0, 255.0);
           log_material(&edit.mat);
         }
-        ("game/edit/alpha", MenuAction::Value(v)) => {
+        ("game/edit/mat/alpha", MenuAction::Value(v)) => {
           // 「透明度」= 滑杆值越大越透明（见 `transparency_pct_to_transmission`）。
-          // PBR 变体那一侧走 `slider_to_override`（**不是** `inverted_*`）：最低档 = 不覆盖，其余 1..100% 覆盖为 0.004..1.0
           edit.mat.transmission = transparency_pct_to_transmission(*v);
-          edit.mat.transmission_ov = slider_to_override(*v, 0.0, 100.0);
           log_material(&edit.mat);
         }
-        ("game/edit/smooth", MenuAction::Value(v)) => {
+        ("game/edit/mat/smooth", MenuAction::Value(v)) => {
           edit.mat.roughness = smooth_pct_to_roughness(*v);
-          edit.mat.roughness_ov = inverted_pct_to_override(*v);
           log_material(&edit.mat);
         }
-        ("game/edit/pbr", MenuAction::Toggle(on)) => {
+        ("game/edit/mat/pbr", MenuAction::Toggle(on)) => {
           edit.mat.pbr = *on;
           info!(
             target: "gate",
             "材质 → 变体切到 {}（IS_PBR）；{}",
-            if *on { "PBR（资产贴图 + 槽级覆盖）" } else { "平凡（逐槽独立参数）" },
+            if *on { "PBR（参数全由资产/贴图决定，材质控件置灰）" } else { "平凡（逐槽独立参数）" },
             edit.mat.summary(),
           );
         }
-        ("game/edit/pbr_asset", MenuAction::Select(i)) => {
+        ("game/edit/mat/pbr_asset", MenuAction::Select(i)) => {
           // 下拉选项是**资产 id 文本**（不是 i18n key），选项顺序 = 目录字典序 = 槽号顺序。
           // 有 `PbrTextureSet` 就按 id 查**真实层号**（缺素材的目录会被跳过 ⇒ 层号顺延），
           // 资源还没就绪（贴图集是异步构建的）则回落选项下标 —— 两者在素材齐全时一致。
@@ -603,17 +656,10 @@ fn register_callbacks(world: &mut World) {
             edit.mat.summary(),
           );
         }
-        ("game/edit/metal", MenuAction::Value(v)) => {
-          edit.mat.metallic_ov = slider_to_override(*v, 0.0, 100.0);
-          log_material(&edit.mat);
-        }
-        ("game/edit/ior", MenuAction::Value(v)) => {
-          // IOR 是**资产级**物理基值（D1）：palette 槽里没有它，故只记录下来。
-          edit.mat.ior_x100 = ior_slider_to_x100(*v);
-          log_material(&edit.mat);
-        }
-        ("game/edit/spec", MenuAction::Value(v)) => {
-          edit.mat.specular_ov = slider_to_override(*v, 0.0, 100.0);
+        ("game/edit/mat/metal", MenuAction::Toggle(on)) => {
+          // 金属度是**二值**（见 `BrushMaterial::metallic`）⇒ 开关写 0 / 255。
+          // 金属的 `F0 = albedo` 且 `kD = 0` ⇒ 这是平凡变体下"做镜面"的旋钮。
+          edit.mat.metallic = metal_toggle_to_metallic(*on);
           log_material(&edit.mat);
         }
         ("ui/showcase", MenuAction::Toggle(on)) => {
@@ -802,6 +848,81 @@ pub(crate) fn sync_sky_menu(
   ] {
     if let Some(node) = menu.model.node_mut(&split(path)) {
       relayout |= node.set_disabled(disabled);
+    }
+  }
+  if relayout {
+    commands.queue(|world: &mut World| gate_ui::rebuild_menu_page(world));
+  }
+}
+
+/// 把「偏移距离」写进两处：`EditSettings.offset`（**落笔真源**）+ 菜单里那个输入框的
+/// `TextInputValue`（**界面真源** —— widget 每帧按它渲染，`menu_system` 再把控件值反向同步进模型
+/// ⇒ 不需要重建页、也不打断正在输入的框）。
+///
+/// 调用点只有一处：**改「笔触大小」时自动置为 `size / 2`**。平时的自由输入走
+/// `game/edit/brush/offset` 那条观察者分支（它只写资源、**不回写控件** —— 否则半截输入会被重写、
+/// 打字被打断）。
+fn write_brush_offset(
+  edit: &mut EditSettings,
+  offset: f32,
+  q: &mut Query<(&gate_ui::menu::MenuItem, &mut gate_ui::TextInputValue)>,
+) {
+  edit.offset = offset.max(0.0);
+  // 与 `debug_menu.toml` 里那个字段的 `decimals = 1` 对齐（`1.5` / `2.0`）
+  let text = format!("{:.1}", edit.offset);
+  for (item, mut tv) in q.iter_mut() {
+    if item.path == EDIT_OFFSET_PATH && tv.0 != text {
+      tv.0 = text.clone();
+    }
+  }
+}
+
+/// 「视频」页的「抗锯齿」在**像素大小 ≠ 1** 时整行置灰（不可交互、配色降亮）。
+///
+/// 理由：降采样档本身就是"大粒像素"的观感，FXAA 会把整数块边界抹糊，与那些档位的意图相反
+/// ⇒ 那些档位下**一律不启用抗锯齿**（判据只有一处：`dda.rs::blit_dda_view`）。
+///
+/// **只置灰、不改值**：这个开关记的是"像素大小 = 1 时要不要抗锯齿"，切回 `1` 时它的状态立刻生效
+/// —— 界面上的勾选态、落盘值都不动（与 `sync_sky_menu` 的"覆写关着时禁用整行"同一个语义）。
+///
+/// 与 `sync_sky_menu` / `sync_edit_menu` 同一套手法：禁用态一变就**重建当前页**（配色是 spawn 时算的）。
+pub(crate) fn sync_video_menu(
+  scale: Res<gate_render::RenderScale>,
+  mut commands: Commands,
+  mut q_menu: Query<&mut gate_ui::DebugMenu>,
+) {
+  let Ok(mut menu) = q_menu.single_mut() else { return };
+  let mut relayout = false;
+  if let Some(node) = menu.model.node_mut(&split(VIDEO_AA_PATH)) {
+    relayout |= node.set_disabled(scale.factor != 1);
+  }
+  if relayout {
+    commands.queue(|world: &mut World| gate_ui::rebuild_menu_page(world));
+  }
+}
+
+/// 「编辑」页的材质控件在 **PBR 变体**下整行置灰（不可交互、配色降亮）。
+///
+/// 理由（**一刀切**）：PBR 的参数**全部来自材质资产与它的贴图** —— albedo / roughness / metallic
+/// 来自 albedo + roughmetal 贴图，emissive / specular / IOR 是资产的标量 ⇒ 槽级一个旋钮都没有。
+/// 因此包括「颜色」在内**五个控件一律置灰不生效**（PBR 的底色来自 albedo 贴图，不做 tint）：
+/// 颜色 / 自发光 / 透明度 / 光滑度 / 金属度（见 [`EDIT_MATERIAL_PATHS`]）。
+///
+/// 不置灰的只有「笔触形状 / 笔触大小」（笔触几何，与材质无关）与「PBR 变体 / PBR 资产」本身。
+/// 置灰不改值：切回平凡变体时，之前调好的平凡参数原样还在。
+///
+/// 与 `sync_sky_menu` 同一套手法：禁用态一变就**重建当前页**（`rebuild_menu_page`，不带动画）——
+/// widget 的配色（禁用态降亮）是 spawn 时算的。
+pub(crate) fn sync_edit_menu(
+  edit: Res<EditSettings>,
+  mut commands: Commands,
+  mut q_menu: Query<&mut gate_ui::DebugMenu>,
+) {
+  let Ok(mut menu) = q_menu.single_mut() else { return };
+  let mut relayout = false;
+  for path in EDIT_MATERIAL_PATHS {
+    if let Some(node) = menu.model.node_mut(&split(path)) {
+      relayout |= node.set_disabled(edit.mat.pbr);
     }
   }
   if relayout {

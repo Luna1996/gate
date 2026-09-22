@@ -55,8 +55,22 @@ const GLASS_REFL_AMBIENT: f32 = 0.15;
 // MT4 · 反光度（镜面反射）—— `docs/PLAN.md` §4 MT4-1 ~ MT4-4
 //
 // 本里程碑只加**一条**射线：主 pass 的不透明表面在"值得追"时追加一条**反射射线**，把反射点的
-// 环境光照当作**环境/间接镜面项**加到着色上（`dda_main`）。GI 链一字未动 —— 反射样本不进 ReSTIR，
-// 理由写在 `dda_main` 里那段注释（MT4-2）。
+// **出射亮度**当作镜面项**替换**掉 `F0·(amb+gi)` 那个环境近似（`dda_main` 的反射段，MT4-3）。
+// GI 链一字未动 —— 反射样本不进 ReSTIR，理由写在 `dda_main` 里那段注释（MT4-2）。
+//
+// ⚠️ **镜面是逐体素面的块状镜面**（视向量 / 种子 / 法线全按面取，见 MT8-6 与
+// `common.wesl::face_view_dir`）：一个体素面 = 一个反射值。**单个镜面方块只有 1 个面 ⇒ 只有 1 个
+// 颜色**；要看到"成像"必须涂一整片镜面（面数 = 镜像的分辨率）。
+//
+// ---- MT4-4（运行期档位）----
+// "反射内容着色到哪一档"由 uniform `light_u.g.refl_tier` 给（菜单「渲染/反射」，0 = 关 ..= 3），
+// 四档的定义与成本见 `gate-render/src/lighting.rs::ReflectionSettings`；档位只改**着色口径**，
+// 不改上面那条逐面量化的粒度。
+//
+// ---- MT4-5（反射链：镜子里的镜子）----
+// `light_u.g.refl_nest`（菜单「渲染/反射/嵌套层级」，0 / 1 / 2 / 4）= 最多再嵌几级。实现是
+// `dda_main` 里那个 `for (lvl = 0; lvl <= nest; ++lvl)` 循环，成本闸门与画风约束写在循环上方那段注释里。
+// **`0` 就是本文件此前唯一的行为**（反射命中点只做完整着色、不再反射）。
 //
 // ---- MT8-3（反射缓存）已按实测**整体删除**（历史记录，别再捡回来）----
 // MT8-3（`§4b`）曾把这条射线的粒度从"每像素"改成"每个可见体素面"：在 BG1 加一对乒乓 buffer
@@ -82,9 +96,10 @@ const GLASS_REFL_AMBIENT: f32 = 0.15;
 // ⚠️ **这不是缓存**：射线仍然**每个触发像素各发一条**（成本不变），唯一效果是"同一个面的抖动样本一致"。
 // ============================================================================
 
-/// **总开关（MT4-4 的 A/B 用）**：`1u` = 开（仓库默认 = 功能本体）、`0u` = 关。
+/// **总开关（A/B 自检用）**：`1u` = 开（仓库默认 = 功能本体）、`0u` = 关。
 /// 与 MT2-4 的 `PBR_DEBUG_ASSET` 同一个先例：**WESL 编译期常量**（改一行、重启即生效；WESL 是
-/// 运行期读盘编译，不用 rebuild），不做运行时 uniform —— 菜单开关属 MT7，本次不做。
+/// 运行期读盘编译，不用 rebuild）。**运行期档位**是另一件事：`light_u.g.refl_tier`（菜单「渲染/反射」，
+/// 见 MT4-4 段）只在总开关为 `1u` 时起作用。
 /// `0u` 时 `dda_main` 里整段反射代码被常量折叠掉：
 ///   · 画面**逐位回到 MT3 状态**（不发射线、不加反射项）；
 ///   · 这同时就是 MT4-2 要的"关掉反射后 GI 画面与 MT3 一致"的**自检手段**（GI 侧从未读过反射量，
@@ -109,10 +124,11 @@ const PBR_REFL_MIN_F0: f32 = 0.03;
 /// `roughness` 大时 GGX 瓣宽远超一个方向能代表的尺度 ⇒ 那条射线既代表不了那一瓣（**方差巨大**），
 /// 又与 MT3 已经加过的 `F0·(amb+gi)` 环境项重复 ⇒ 不如不追。
 ///
-/// **取 0.05**：反射值本身是**双峰**的（命中几何 = `sky·0.05·ao`、逃逸天空 = **整个 sky**，差 20 倍，
-/// 见 `gi/consts.wesl::GI_SKY_AMBIENT`）；而着色按面量化（MT8-6 + `face_view_dir`）⇒ 一个面只有
-/// **一个**样本，这 20 倍不会再被面内像素的抖动平均掉 ⇒ 瓣宽大于面就是"成片的纯天空亮块 = 打蜡"。
-/// **瓣半角 ≈ atan(roughness) ⇒ roughness ≤ 0.05（瓣 ≤ 2.9°）**才值得一条射线。
+/// **取 0.05**：着色按面量化（MT8-6 + `face_view_dir`）⇒ 一个面只有**一个**样本，瓣宽一旦大于面，
+/// 一个面就被好几个不同方向的内容"糊"成一个值 —— 那既不是镜面也不是逐面平色。
+/// **瓣半角 ≈ atan(roughness) ⇒ roughness ≤ 0.05（瓣 ≤ 2.9°）**才值得一条射线；
+/// 0.05 以上由 `fade`（反射段的替换式权重）连续收敛回 `F0·(amb+gi)` 近似口径。
+/// 本值同时是「光滑度」滑杆的门限：**≥ 96% 才是镜面**（见下）。
 ///
 /// **落到「光滑度」滑杆**（`smooth_pct_to_roughness`，线性）：roughness ≤ 0.05 ⇔ **光滑度 ≥ 96%**
 /// （100% ⇒ roughness 0 = 完全镜面）；96% 以下按 `fade`（`dda_main`）连续淡出到 0 ⇒ 扫滑杆时
@@ -551,11 +567,19 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // 这里曾经是"读上一帧缓存 → 命中且不刷新就复用 → 否则发线并着色 → 写回"的乒乓缓存三段式
     // （面键/槽哈希 + 每帧旋转刷新 K=16）。**用户实测判为负优化**（删掉后逐像素发线的成本
     // ≈1.5~1.6ms，收益对不上复杂度）⇒ 键/槽/刷新/写回全部删除，本段回到 MT4 的逐像素形态。
-    if (PBR_REFLECTION_ENABLED != 0u) {
+    // ---- MT4-4 · **运行期档位**（`light_u.g.refl_tier`，菜单「渲染/反射」，0 = 关 ..= 3）----
+    // 档位只改**反射内容的着色口径**（命中点要不要太阳直射/自发光、逃逸天空走哪个口径、要不要补
+    // 阴影射线），不改逐面量化的粒度（见下面 MT8-6 段）。
+    // 与编译期总开关 `PBR_REFLECTION_ENABLED` 的分工：那条是 A/B 自检用的（关掉整段被折掉、
+    // 零寄存器压力），本条是运行期旋钮 ⇒ 只要总开关打开，**档位为 0 时代码仍然在**（这是菜单开关的
+    // 固有代价，登记在 `PBR_REFLECTION_ENABLED` 的成本拆账里：代码在、判据不成立 ≈ +0.25ms）。
+    if (PBR_REFLECTION_ENABLED != 0u && light_u.g.refl_tier > 0u) {
+      let tier = light_u.g.refl_tier;
       let f0r = f0_of(m);
       let f0_luma = dot(f0r, vec3<f32>(0.2126, 0.7152, 0.0722));
       if (f0_luma >= PBR_REFL_MIN_F0 && m.roughness <= PBR_REFL_MAX_ROUGH) {
-        var refl_env = sky_rgb();  // 逃逸到天空 ⇒ 与 GI 的 miss 口径一致（全工程唯一的 miss 辐亮度）
+        // `refl_env`（反射内容）在下面射线落地处初始化：它 = 反射命中点的出射亮度，或"逃逸到天空"
+        // 时取的那份天空。
         // ---- MT8-6 · 抖动种子**按体素面**取（键 = grid 局部体素坐标 + 面号 + obj_id）----
         // 改之前它是**按屏幕像素**的（`hash(coord0.xy)`，MT4 的写法）。
         // 为什么必须按面（两条都是用户实测结论，原文见文件头的 MT8-6 段）：
@@ -591,33 +615,93 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         // 起点 = 与阴影射线**同一个构造**（`p_voxel + n * n_off`：命中体素中心沿 n 推 `0.5/|n| + eps`
         // ⇒ 恰在表面外侧），口径一致、不另立第二套外推。它同时是下面那次着色里"本条射线的起点"。
         let r_org = p_voxel + n * n_off;
-        let rh = world_raycast(make_grid(0u), r_org, rdir,
-                               frustum_length, world_cfg_full(0.0, 3u));
-        if (rh.hit) {
-          // 反射命中点**必须**经 `fetch_material` + `brdf_reflected`（硬约束 1：不许手写第二套近似
+        // ============================================================================
+        // MT4-5 · **反射链**（`nest` = 最多再嵌几级，见 `LightGlobals::refl_nest`）
+        //
+        // 一次反射的内容 = 命中点自己的出射亮度 **+** 它自己的反射（前提是它**也**是镜面）。串起来：
+        //   `refl_env = local(0) + w(0)·[ local(1) + w(1)·[ … ] ]`
+        // `w(k)` = 第 k 级命中面的 `fresnel_schlick(f0, v·n) × 粗糙度淡出`，`chain_w` 是累积的 Π w。
+        // `refl_env` 累积的是**不含主表面那一次 Fresnel** 的反射内容 —— 那一次在循环外乘（见底下
+        // 「替换式」那段），与嵌套层级无关。
+        //
+        // **成本闸门**：只有"上一级命中的面**本身也是镜面**"（与主表面同一个 `PBR_REFL_*` 判据）
+        // 才继续 —— 墙 / 地形 / 普通方块在**第一级就断链** ⇒ 日常场景下 `nest` 拨到几都一样，
+        // 多出来的只是一次判据。钱只花在真的把镜子对着镜子摆的地方：最坏 `nest + 1` 条反射射线
+        // （档 3 时每条再 +1 条阴影射线）。
+        //
+        // **画风不变**：每一级的方向都取自**逐面**视向量与按面种子（MT8-6）⇒ 嵌套的镜像仍是
+        // 块状镜面，一个体素面一个反射值。
+        // ============================================================================
+        let nest = light_u.g.refl_nest;
+        var refl_env = vec3<f32>(0.0);
+        var chain_w = vec3<f32>(1.0);
+        var chain_org = r_org;
+        var chain_dir = rdir;
+        for (var lvl = 0u; lvl <= nest; lvl = lvl + 1u) {
+          let h = world_raycast(make_grid(0u), chain_org, chain_dir,
+                                frustum_length, world_cfg_full(0.0, 3u));
+          if (!h.hit) {
+            // 逃逸到天空 ⇒ 反射内容就是天空，链条结束。**档 ≥2** 走 `sky_primary`（方向性天空 +
+            // 太阳盘/光晕：镜子里看得见太阳，与主 pass 的 miss 同一个口径）；**档 1** 走 `sky_rgb()`
+            // （纯色天光，全工程唯一的 miss 辐亮度）。两侧都只算 ALU、不发线。
+            refl_env = refl_env
+                     + chain_w * select(sky_rgb(), sky_primary(chain_dir, sun_dir, sun_c), tier >= 2u);
+            break;
+          }
+          // 命中点**必须**经 `fetch_material` + `brdf_reflected`（硬约束 1：不许手写第二套近似
           // 着色 —— 那正是 MT4-1 刚从 `trace_glass` 里清掉的那类第四处表达式）。
-          let rgg = make_grid(u32(rh.obj_id) + 1u);
-          let rn = voxel_normal(rgg, rh.voxel, rh.face_id, rh.n);
-          let mr = fetch_material(rh.palette_base, rh.pal, rh.point, rn, PBR_DEBUG_ASSET);
-          // 只取 `brdf_reflected` 的**环境项**：`sun_c = 0` 且 `sun_vis = 0` ⇒ 函数里那段太阳直射
-          // 被整个跳过（判据 `ndl > 0 && sun_vis > 0` 为假），返回的恰是 `(kD·albedo + F0)·(amb + gi)`
-          // —— 也就是"反射点自己的环境光照"，不含它的直射高光。
-          //   · **这就是 MT4-3 的去重**（§4 MT4-3 / §5 R1）：直射高光（GGX 那一项）**只由 MT3 的 BRDF
-          //     在本着色点算一次**；反射射线不做 NEE ⇒ 高光不可能被算两遍（若这里带上 `sun_c`，
-          //     本像素的直射高光就会被"环境反射"再叠一遍 ⇒ 能量翻倍）。
-          //   · 天光口径与 GI 二次顶点**逐字相同**（`gi/ray.wesl`：`sky · GI_SKY_AMBIENT · ao`，
-          //     没有 `cov` 地板 —— 反射点没有 GI 缓冲，与二次顶点是同一条约定，硬约束 3 不分叉）；
-          //     `gi` 传 0：那是本像素**屏空间**的缓冲，反射点常常不在屏幕上，借过来就是错的。
-          //   · **有意写明的代价**：反射点自己的太阳直照（它可能是个被阳光照亮的镜面）在这一次反射里
-          //     看不到 —— 因为不做 NEE 就拿不到它的阴影可见性，"宁可不追"比"漏一片光"好。
-          let ramb = sky * GI_SKY_AMBIENT * light_field_ao(rh.point, rh.obj_id);
-          // 反射命中点的视向量：用它**自己那条射线**（起点 `r_org` → 命中体素中心）⇒ **逐面**
+          let hgg = make_grid(u32(h.obj_id) + 1u);
+          let hn = voxel_normal(hgg, h.voxel, h.face_id, h.n);
+          let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
+          // 命中点 = 一个**完整的着色点**：材质与着色都走全工程同一组函数（`fetch_material` +
+          // `brdf_reflected` + `emissive_radiance`，硬约束 1/3 不分叉），差异只有两条，都是写明的：
+          //   · `gi = 0`：那是本像素**屏空间**的缓冲，反射点常常不在屏幕上，借过来就是错的；
+          //   · `sun_vis`：**档 3** 走真实 NEE；**档 1/2** 取 1.0（无遮挡近似 —— 与 `trace_glass` 的
+          //     玻璃反射同一条有意约定：不给反射再加一条阴影射线）。天光 `amb` 取
+          //     `sky · GI_SKY_AMBIENT · ao`（与 GI 二次顶点逐字相同，反射点没有 GI 缓冲 ⇒ 没有 `cov` 地板）。
+          // `emissive_radiance` 与玻璃反射同一句 ⇒ 发光体素在镜子里发光。
+          let hamb = sky * GI_SKY_AMBIENT * light_field_ao(h.point, h.obj_id);
+          // 命中点的视向量：用它**自己那条射线**（起点 `chain_org` → 命中体素中心）⇒ **逐面**
           // （硬约束 3：所有着色点共用 `face_view_dir` 同一份契约）。
-          // ⚠️ 这一处**没有行为变化**：`sun_c = 0` 且 `sun_vis = 0` ⇒ `brdf_reflected` 里吃 `v` 的
-          // 那一支根本不进（返回的只有 `(kD·albedo + F0)·amb`）⇒ 按面与逐像素在这里逐位相同。
-          // 按面写只是为了让"全工程锚点口径"只有一个（读者不必再逐点判断"这处是哪种"）。
-          refl_env = brdf_reflected(mr, rn, face_view_dir(r_org, voxel_center_world(rgg, rh.voxel)),
-                                    SurfaceLight(sun_dir, vec3<f32>(0.0), 0.0, ramb, vec3<f32>(0.0)));
+          let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
+          // 命中点沿自己的着色法线外推半个体素 + eps —— 与主路径的阴影射线**同一个构造**。
+          // 它同时是阴影射线的起点与（若继续）下一级反射射线的起点，口径一致、只有一份公式。
+          let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3))
+                    + SHADOW_SURFACE_EPS;
+          let h_start = h.point + hn * h_off;
+          var h_vis = 1.0;
+          if (tier >= 3u) { h_vis = sun_transmittance(h_start, sun_dir, h.voxel, h.obj_id); }
+          // 「本级也值得追，**并且**还允许再追一级」——前半句与主表面**同一个判据**
+          // （F0 亮度门 × 粗糙度淡出 > 0）；后半句是 `lvl < nest`。
+          // 两件事必须分开判：**扣掉本级那条近似，前提是下一级真的会去取代它** ——
+          // 末级（`lvl == nest`）命中镜面时没有下一级，扣了就是白丢一份能量（回归到"旧口径"而非更好）。
+          let hf0 = f0_of(hm);
+          let h_fade = clamp(1.0 - hm.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
+          let h_continue =
+            lvl < nest && h_fade > 0.0
+            && dot(hf0, vec3<f32>(0.2126, 0.7152, 0.0722)) >= PBR_REFL_MIN_F0;
+          var h_local = brdf_reflected(hm, hn, hv,
+                                       SurfaceLight(sun_dir, sun_c, h_vis, hamb, vec3<f32>(0.0)))
+                      + emissive_radiance(hm, GI_EMIT_GAIN);
+          if (h_continue) {
+            // 「替换式」（与主表面同一条口径）：本级既然是镜面，它**自身**那条 `F0·(amb+gi)` 近似
+            // 由下一级的真实反射取代 ⇒ 先扣掉，否则镜面环境项又被算一遍。
+            h_local = h_local - hf0 * hamb;
+          }
+          refl_env = refl_env + chain_w * h_local;
+          if (!h_continue) { break; }
+          // ---- 沿本级继续反射：方向 / 种子 / 起点 ----
+          // 方向与主表面**同一个构造**（`reflect(-v, n)`，`v` 逐面）。抖动种子把**层级**混进按面种子里
+          // （`gi_mix` 是 GI 侧现成的哈希；本工程 WESL 解析器不接受 `^`，故按加-混写）。
+          let h_mirror_dir = reflect(-hv, hn);
+          var h_dir = refl_cone_dir(h_mirror_dir, gi_rand2(gi_mix(rseed + lvl * 0x9E3779B1u)),
+                                    PBR_REFL_CONE_K * hm.roughness);
+          // 抖动后掉到面下方（掠射 + 大锥角）会立刻自命中所在体素 ⇒ 退回完美镜面方向。
+          if (dot(h_dir, hn) <= 0.0) { h_dir = h_mirror_dir; }
+          chain_org = h_start;
+          chain_dir = h_dir;
+          // 下一级的贡献要乘上本级的 Fresnel × 粗糙度淡出（`h_fade > 0` 已由 `h_mirror` 保证）。
+          chain_w = chain_w * fresnel_schlick(hf0, max(dot(hv, hn), 0.0)) * h_fade;
         }
         // 权重 = Schlick Fresnel（同一个 `fresnel_schlick`：完美镜面下 h ≈ n ⇒ 余弦取 `v·n`）
         //        × 粗糙度淡出（`roughness → PBR_REFL_MAX_ROUGH` 时权重**连续**归零 ⇒ 粗糙度扫描下
@@ -626,18 +710,20 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         // （「光滑度」滑杆 100% / 90% / 75% / 50% / 40% ⇒ roughness 0 / 0.098 / 0.255 / 0.5 / 0.6），
         // 亮度应随 roughness **单调不增**、且在 50%（= 阈值）处**连续**（不出现台阶），开/关反射
         // 各看一次即可确认没有"高光算两遍"的能量翻倍。
-        // 注意这里**只有加法**：MT3 环境项里的 `F0·(amb+gi)` 是"环境为常数"时同一个量的近似，
-        // 严格做法是"用方向性估计替换它"，但两者量纲口径不同（一个是本点的辐照度猜测、一个是反射
-        // 点的出射辐亮度）⇒ 直接相减会在 GI 强的面上把镜面反射**减成负值**（比轻微偏亮更难接受）。
-        // 本版**有意保留加法**，代价上限是"镜面环境项最多算两遍"（电介质 F0 = 0.04 ⇒ 天光/GI 那部分
-        // 最多 +4%；金属最坏 2×），登记在 MT4-3 的报告里，替换式写法留待后续。
-        // 权重**不进任何缓存**（MT8-3 的缓存已删除）：它只由本像素的 `m`（材质）与 `v·n` 决定，
-        // 逐像素算一次即可，缓存里本来也只该放"那条射线看到了什么"（辐亮度）。
+        // ---- MT4-3 · **替换式**能量口径（不是叠加）----
+        // `brdf_reflected` 的环境项是 `(kD·albedo + F0)·(amb + gi)`，其中 `F0·(amb+gi)` 就是
+        // "环境为常数"时**同一个镜面量**的粗糙近似。真追到的 `refl_env` 是反射点的**出射辐亮度**
+        // ⇒ 两者量纲口径不同，必须**替换**：按 `fade` 扣掉那项近似、换成真值。
+        // 保留加法会让镜面环境项算两遍（电介质 F0 = 0.04 ⇒ 天光/GI 约 +4%；金属最坏 2× ⇒ 镜面发白）。
+        // `fade` 同时乘在"扣"与"加"两侧 ⇒ 粗糙度扫到阈值处**连续**收敛回近似口径，总亮度单调、
+        // 不出现台阶（电介质那 4% 的差也在同一个 `fade` 下一起归零）。
+        // 权重**不进任何缓存**（MT8-3 的缓存已删除）：它只由本像素的 `m`（材质）与 `v·n` 决定。
         let fade = clamp(1.0 - m.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
         // 镜面反射的菲涅耳余弦取 `v·n`（**逐面**视向量）—— 与 `brdf_reflected` 里
         // "完美镜面 h ≈ n ⇒ 余弦取 v·n" 那条口径**逐字相同**（硬约束 3）。
         // 逐面 ⇒ 掠射角的权重从"跨体素边界连续渐亮"变成一个面一个值（成块变亮是本档的预期代价）。
-        col = col + fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade * refl_env;
+        col = col - fade * f0r * (amb * ao + gi)
+            + fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade * refl_env;
       }
     }
     col = col * through + refl;
