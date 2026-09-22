@@ -17,7 +17,9 @@ pub struct LightDesc {
   pub kind_pos_dir: Vec4,
   /// rgb = 线性色，w = 强度
   pub color_intensity: Vec4,
-  /// x = 方向光盘角半径（rad）；yzw reserved
+  /// **天体盘**的外观（只被 `volumetric.wesl::sky_primary` 读，见 `gate-render/src/sky.rs`）：
+  /// x = 盘的亮度倍数（乘 WESL `SUN_DISK_GAIN`；太阳 `1`、月亮 `0.6`，见 `sky.rs` 的 `MOON_DISK_SCALE`）；
+  /// yzw reserved（恒 0）—— **光晕**不在这里，它是大气散射，走光柱 uniform 的「光晕」。
   pub shape: Vec4,
 }
 
@@ -45,7 +47,7 @@ pub struct LightPoolUniform {
   pub sky_color: Vec4,
 }
 
-/// 方向光配置（主题资产）
+/// 方向光配置（主题资产 = 静态；时间驱动时由 `sky::apply_sky` 每帧覆写）
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DirLightCfg {
   /// 光传播方向（指向场景）；打包时翻转为 L（指向光）
@@ -55,9 +57,18 @@ pub struct DirLightCfg {
   pub angular_radius_deg: f32,
   pub color: [f32; 3],
   pub intensity: f32,
+  /// **天体盘**的亮度倍数（乘 WESL `SUN_DISK_GAIN`）：`1` = 太阳那个盘；
+  /// 月亮用远小于 1 的值 ⇒ 亮而不白（见 `sky.rs` 的 `MOON_DISK_SCALE`）。
+  /// 盘**外面**那圈光晕不在这里 —— 它是大气散射，走光柱 uniform 的「光晕」（随时间变）。
+  #[serde(default = "one")]
+  pub disk_scale: f32,
 }
 fn default_angular_radius() -> f32 {
   0.0
+}
+/// 新增可选项的缺省：`1` = 不改变既有观感（`assets/lighting/*.ron` 不写这两个字段也是原样）。
+fn one() -> f32 {
+  1.0
 }
 
 /// 天空颜色配置（纯色）
@@ -87,6 +98,7 @@ impl Default for LightingTheme {
         angular_radius_deg: 0.0,
         color: [1.0, 0.96, 0.88],
         intensity: 0.8,
+        disk_scale: 1.0,
       }),
       ambient: [0.08, 0.09, 0.12],
       exposure: 1.0,
@@ -129,7 +141,8 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
     u.lights[0] = LightDesc {
       kind_pos_dir: Vec4::new(0.0, l.x, l.y, l.z),
       color_intensity: Vec4::new(sun.color[0], sun.color[1], sun.color[2], sun.intensity),
-      shape: Vec4::new(0.0, 0.0, 0.0, 0.0), // 硬阴影：角半径 = 0
+      // 天体盘的外观（盘亮度倍数）：`sky_primary` 靠它区分太阳盘与月亮盘（负值当 0）。
+      shape: Vec4::new(sun.disk_scale.max(0.0), 0.0, 0.0, 0.0),
     };
     u.g.count = 1;
   }

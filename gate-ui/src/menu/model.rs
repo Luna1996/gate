@@ -169,6 +169,11 @@ pub enum MenuNode {
     decimals: u32,
     #[serde(default)]
     tooltip: Option<String>,
+    /// **禁用态**：整行不可交互（配色降亮）。用于"值由别处决定、这里只是个显示/覆写值"的控件
+    /// —— 例：天空页三组「覆写」关着时，下面那些滑杆就不是它说了算（见 `MenuNode::set_disabled`）。
+    /// 只在 spawn 时生效（widget 配色是 spawn 时算的）⇒ 改它要重建那一页（`rebuild_menu_page`）。
+    #[serde(default)]
+    disabled: bool,
   },
   /// 切换组（无空隙并排，选中态持久化）
   SwitchGroup {
@@ -210,6 +215,9 @@ pub enum MenuNode {
     id: String,
     label: String,
     hex: String,
+    /// **禁用态**：同 `Slider::disabled`（天空页「颜色」组的覆写关着时，三个拾色器不可改）
+    #[serde(default)]
+    disabled: bool,
   },
   /// 纯文本（内容可由调用方运行时改写）
   Text {
@@ -302,6 +310,26 @@ impl MenuNode {
       Self::Color { hex, .. } => Some(MenuValue::Text(hex.clone())),
       Self::SubMenu { .. } | Self::Buttons { .. } | Self::Text { .. } => None,
     }
+  }
+
+  /// 本行是否处于**禁用态**（不可交互）。目前只有 `Slider` / `Color` 支持（其余节点恒 `false`）。
+  pub fn disabled(&self) -> bool {
+    match self {
+      Self::Slider { disabled, .. } | Self::Color { disabled, .. } => *disabled,
+      _ => false,
+    }
+  }
+
+  /// 设置本行的禁用态；返回**是否发生了变化**（调用方据此决定要不要重建页面，
+  /// 因为 widget 的配色是 spawn 时算的，光改模型不会重画）。
+  pub fn set_disabled(&mut self, v: bool) -> bool {
+    let slot = match self {
+      Self::Slider { disabled, .. } | Self::Color { disabled, .. } => disabled,
+      _ => return false,
+    };
+    let changed = *slot != v;
+    *slot = v;
+    changed
   }
 
   /// 用外部值覆盖控件状态：类型不符 / 选项不存在 → 忽略并返回 false。
@@ -502,6 +530,7 @@ pub fn slider(
     step,
     decimals,
     tooltip: tooltip.map(|s| s.to_string()),
+    disabled: false,
   }
 }
 
@@ -554,7 +583,7 @@ pub fn input(id: &str, label: &str, fields: Vec<InputField>) -> MenuNode {
 
 /// 颜色选择器节点
 pub fn color(id: &str, label: &str, hex: &str) -> MenuNode {
-  MenuNode::Color { id: id.into(), label: label.into(), hex: hex.into() }
+  MenuNode::Color { id: id.into(), label: label.into(), hex: hex.into(), disabled: false }
 }
 
 /// 纯文本节点

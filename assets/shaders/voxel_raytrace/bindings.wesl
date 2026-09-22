@@ -124,7 +124,8 @@ struct GridDesc {
 struct LightDesc {
   kind_pos_dir: vec4<f32>,    // x = kind（0=方向光）；yzw = L 轴（指向光，已归一）
   color_intensity: vec4<f32>, // rgb = 线性色，w = 强度
-  shape: vec4<f32>,           // reserved（硬阴影：角半径 = 0）
+  // 天体盘的外观（只被 `volumetric.wesl::sky_primary` 读；日月共用 lights[0] 这一个槽位，见 sky.rs）：
+  shape: vec4<f32>,           // x = 盘的亮度倍数（乘 SUN_DISK_GAIN）；yzw reserved（恒 0）
 }
 struct LightGlobals {
   count: u32,
@@ -184,16 +185,17 @@ struct GiUniform {
 // 1..5 是 group(4) **空着的号**（0 = `gi_u`、20/21 = GI 的 reservoir）。
 /// 光柱的参数 uniform（与 Rust `volumetric::FogUniform` 逐字段镜像，字节一致）。
 struct FogUniform {
-  /// x = **衰减**（模糊每步的权重乘它：`< 1` ⇒ 光柱离太阳越远越淡）、yzw 保留（恒 0）。
+  /// x = **衰减**（模糊每步的权重乘它：`< 1` ⇒ 光柱离主体越远越淡）、yzw 保留（恒 0）。
   params: vec4<f32>,
   /// x = 保留（恒 0：网格分辨率除数已固定为 `volumetric.wesl::FOG_DIV`，不再是档位）、
-  /// y = **集中度**（太阳方向权重的指数：越大越集中在太阳附近，见 `volumetric.wesl`）、
-  /// z = **强度**（乘在光柱上）、w = **朝向因子**（太阳在画面背后 ⇒ 0，平滑淡出）。
+  /// y = **集中度**（主体方向权重的指数：越大越集中在该天体附近，见 `volumetric.wesl`）、
+  /// z = **强度**（乘在光柱上）、w = **朝向因子**（主体在画面背后 ⇒ 0，平滑淡出）。
   misc: vec4<f32>,
-  /// x/y 保留（恒 0）、z = **太阳角径**（rad：天空里那个太阳盘的半径）、w = **日晕强度**
-  /// （太阳盘外那圈拖尾的系数）。两项都只被 `sky_primary` 用（天空背景）。
+  /// x/y 保留（恒 0）、z = **天体盘角径**（rad：天空里那个盘的半径，日月共用；它同时决定盘的
+  /// 软边缘与光晕的尺度）、w = **光晕强度**（盘外那圈拖尾的系数，随角径一起缩放）。
+  /// 两项都只被 `sky_primary` 用（天空背景）；面板在「渲染/天空/天体盘」。
   misc2: vec4<f32>,
-  /// xy = **太阳的屏幕坐标**（0..1；可能落在画面外 —— 模糊的取样方向就是它）、zw 保留（恒 0）。
+  /// xy = **天体的屏幕坐标**（0..1；可能落在画面外 —— 模糊的取样方向就是它）、zw 保留（恒 0）。
   misc3: vec4<f32>,
 }
 @group(4) @binding(1) var<uniform> fog_u: FogUniform;

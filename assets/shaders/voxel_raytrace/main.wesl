@@ -435,7 +435,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
                 + emissive_radiance(fm, GI_EMIT_GAIN);
     }
   }
-  // ---- 天空背景（**只在这里用 `sky_primary`**）：常量天光 + 太阳盘 + 日晕 ----
+  // ---- 天空背景（**只在这里用 `sky_primary`**）：常量天光 + 天体盘 + 光晕 ----
   // `through` = 沿途介质的乘性吸收（玻璃染色），`refl` = 玻璃那条状态机累积的反射项。
   // 命中时下面立刻把 `col` 覆盖掉 ⇒ 这一行的开销只落在天空像素上（几个 ALU）。
   // ⚠️ 除了这一行，全工程的天空口径仍是 `sky_rgb()`（GI 的 miss / 玻璃与镜面反射的逃逸）——

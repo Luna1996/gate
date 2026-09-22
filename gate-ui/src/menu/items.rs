@@ -208,7 +208,7 @@ pub(crate) fn spawn_item(
   let row = match node {
     MenuNode::SubMenu { label: key, .. } => sub_menu_row(ctx, parent, key, &path),
     MenuNode::Buttons { label: key, items, .. } => buttons_row(ctx, parent, key, items, &path),
-    MenuNode::Slider { label: key, value, min, max, step, decimals, .. } => slider_row(
+    MenuNode::Slider { label: key, value, min, max, step, decimals, disabled, .. } => slider_row(
       ctx,
       parent,
       key,
@@ -218,7 +218,7 @@ pub(crate) fn spawn_item(
         max: *max,
         value: *value,
         step: (*step > 0.0).then_some(*step),
-        ..default()
+        disabled: *disabled,
       },
       *decimals,
       &path,
@@ -231,7 +231,9 @@ pub(crate) fn spawn_item(
     }
     MenuNode::Toggle { label: key, checked, .. } => toggle_row(ctx, parent, key, *checked, &path),
     MenuNode::Input { label: key, fields, .. } => input_row(ctx, parent, key, fields, &path),
-    MenuNode::Color { label: key, hex, .. } => color_row(ctx, parent, key, hex, &path),
+    MenuNode::Color { label: key, hex, disabled, .. } => {
+      color_row(ctx, parent, key, hex, &path, *disabled)
+    }
     MenuNode::Text { text: key, .. } => text_row(ctx, parent, key, &path),
   };
   // 提示也是 i18n key：解析后挂整行，保留 key 供语言切换重解析
@@ -314,10 +316,11 @@ fn slider_row(
   path: &str,
 ) -> Entity {
   let value = config.value;
+  let disabled = config.disabled;
   let mut ec = base_row(parent, "menu-slider");
   let row = ec.id();
   ec.with_children(|r| {
-    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
+    let name = fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     let se = *slider(ctx, r, config);
     grow_in_row(r.world_mut(), se);
     r.world_mut()
@@ -338,8 +341,21 @@ fn slider_row(
       // 不能带 NoWrap：bevy_ui 对 NoWrap 用无界宽度排版，Justify::Right 会失效
       BevyTextLayout { justify: Justify::Right, ..default() },
     ));
+    // 禁用行：两段文字也降亮（控件自身的配色由 widget 在 spawn 时按 `disabled` 处理）
+    if disabled {
+      for e in [name, ve] {
+        dim_text(r.world_mut(), e);
+      }
+    }
   });
   row
+}
+
+/// 文本降亮（禁用行用）：读现值 → `dim_color` → 写回。
+fn dim_text(world: &mut World, e: Entity) {
+  if let Some(mut c) = world.get_mut::<TextColor>(e) {
+    c.0 = crate::widgets::dim_color(c.0);
+  }
 }
 
 /// 切换组：无空隙并排按钮（有名称时 左|中右）
@@ -453,16 +469,23 @@ fn input_row(
 }
 
 /// 颜色选择器：「左|中|右」名称 / HEX 输入框 / 色块
-fn color_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, hex: &str, path: &str) -> Entity {
+fn color_row(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  key: &str,
+  hex: &str,
+  path: &str,
+  disabled: bool,
+) -> Entity {
   let m = &ctx.theme.metrics;
   let mut ec = base_row(parent, "menu-color");
   let row = ec.id();
   ec.with_children(|r| {
-    fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
+    let name = fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
     let ie = *text_input(
       ctx,
       r,
-      TextInputConfig { text: hex.to_string(), kind: TextInputKind::Text, disabled: false },
+      TextInputConfig { text: hex.to_string(), kind: TextInputKind::Text, disabled },
     );
     grow_in_row(r.world_mut(), ie);
     r.world_mut().entity_mut(ie).insert(MenuItem { path: path.to_string(), role: MenuRole::Color });
@@ -483,6 +506,10 @@ fn color_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, hex: &str, path:
       ),
       BorderColor::all(color_of(&ctx.theme.colors.border)),
     ));
+    // 禁用行：名称降亮（色块每帧由 `refresh_visuals` 按模型重写 ⇒ 那里也按禁用态降亮）
+    if disabled {
+      dim_text(r.world_mut(), name);
+    }
   });
   row
 }

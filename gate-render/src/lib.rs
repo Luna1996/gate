@@ -1,4 +1,4 @@
-﻿pub mod brickmap;
+pub mod brickmap;
 pub mod consts;
 pub mod gi;
 pub mod lighting;
@@ -7,6 +7,7 @@ pub mod pbr_texture;
 pub mod profiler;
 mod responsive;
 pub mod shader;
+pub mod sky;
 pub mod volumetric;
 pub mod wesl_consts;
 
@@ -30,6 +31,7 @@ pub use lighting::{
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use pbr_texture::{PBR_TEXTURE_DIR, PbrTextureSet, PbrTexturesPlugin};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
+pub use sky::{SkyPlugin, SkySettings, sun_altitude_deg};
 pub use volumetric::{FogPlugin, FogSettings};
 
 pub struct GateRenderPlugin;
@@ -40,8 +42,10 @@ impl Plugin for GateRenderPlugin {
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
       gi::GiPlugin,
-      // 光柱（godray）：屏幕空间径向模糊的 pass / 资源 / 档位（菜单「渲染/太阳」）
+      // 径向模糊（光柱）：屏幕空间径向模糊的 pass / 资源 / 档位（菜单「渲染/天空/径向模糊」）
       volumetric::FogPlugin,
+      // 天象（时间 → 太阳 / 月亮 / 天空色）：每帧把推导结果写进 `LightingTheme`（菜单「渲染/天空」）
+      sky::SkyPlugin,
       profiler::GateProfilerPlugin,
       // PBR 贴图集（MT2-1）：扫描 assets/textures/pbr/ → 两张 texture_2d_array（只加载，不绑定）
       pbr_texture::PbrTexturesPlugin,

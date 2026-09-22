@@ -187,75 +187,192 @@ step = 0.01
 decimals = 3
 tooltip = "menu.render.exposure.key.tip"
 
-# ---- 太阳：光柱（godray）----
-# 算法、成本模型与取舍见 `gate-render/src/volumetric.rs` 与
+# ---- 天空：时间（天象）+ 径向模糊（光柱）+ 天体盘 + 颜色 ----
+# 推导与取舍见 `gate-render/src/sky.rs`（时间控件的缺省必须与 `SkySettings::default()` 一致）；
+# 光柱的算法、成本模型与取舍见 `gate-render/src/volumetric.rs` 与
 # `assets/shaders/voxel_raytrace/volumetric.wesl`（本段只给「档位 → 数值」的映射）。
+# 「径向模糊」「天体盘」「颜色」三组各有一个「覆写」开关：关（默认）⇒ 该组随时刻变化、
+# 下面的滑杆实时显示当前值；开 ⇒ 用下面的值（拖动任一项会自动打开覆写）。
 [[items.children]]
 kind = "sub_menu"
-id = "sun"
-label = "menu.render.sun"
+id = "sky"
+label = "menu.render.sky"
 
+# 时间：时刻 / 年积日 / 纬度 → 太阳与月亮的位置
 [[items.children.children]]
-kind = "toggle"
-id = "vol"
-label = "menu.render.sun.vol"
-checked = true
-tooltip = "menu.render.sun.vol.tip"
+kind = "sub_menu"
+id = "time"
+label = "menu.render.sky.time"
 
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "slider"
-id = "vol_strength"
-label = "menu.render.sun.vol_strength"
+id = "hour"
+label = "menu.render.sky.time.hour"
+value = 12.0
+min = 0.0
+max = 24.0
+step = 0.05
+decimals = 2
+tooltip = "menu.render.sky.time.hour.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "date"
+label = "menu.render.sky.time.date"
+value = 81.0
+min = 1.0
+max = 365.0
+step = 1.0
+decimals = 0
+tooltip = "menu.render.sky.time.date.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "lat"
+label = "menu.render.sky.time.lat"
+value = 45.0
+min = -90.0
+max = 90.0
+step = 1.0
+decimals = 0
+tooltip = "menu.render.sky.time.lat.tip"
+
+[[items.children.children.children]]
+kind = "toggle"
+id = "auto"
+label = "menu.render.sky.time.auto"
+checked = false
+tooltip = "menu.render.sky.time.auto.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "speed"
+label = "menu.render.sky.time.speed"
+value = 0.1
+min = 0.0
+max = 0.5
+step = 0.01
+decimals = 2
+tooltip = "menu.render.sky.time.speed.tip"
+
+# 径向模糊（光柱那条链：掩码 + 两趟屏幕空间径向模糊）
+[[items.children.children]]
+kind = "sub_menu"
+id = "blur"
+label = "menu.render.sky.blur"
+
+[[items.children.children.children]]
+kind = "toggle"
+id = "enabled"
+label = "menu.render.sky.blur.enabled"
+checked = true
+tooltip = "menu.render.sky.blur.enabled.tip"
+
+[[items.children.children.children]]
+kind = "toggle"
+id = "override"
+label = "menu.render.sky.blur.override"
+checked = false
+tooltip = "menu.render.sky.blur.override.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "strength"
+label = "menu.render.sky.blur.strength"
 value = 0.5
 min = 0.0
 max = 6.0
 step = 0.05
 decimals = 2
-tooltip = "menu.render.sun.vol_strength.tip"
+tooltip = "menu.render.sky.blur.strength.tip"
 
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "slider"
-id = "vol_decay"
-label = "menu.render.sun.vol_decay"
+id = "decay"
+label = "menu.render.sky.blur.decay"
 value = 0.6
 min = 0.5
 max = 1.0
 step = 0.01
 decimals = 2
-tooltip = "menu.render.sun.vol_decay.tip"
+tooltip = "menu.render.sky.blur.decay.tip"
 
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "slider"
-id = "vol_focus"
-label = "menu.render.sun.vol_focus"
+id = "focus"
+label = "menu.render.sky.blur.focus"
 value = 20.0
 min = 1.0
 max = 64.0
 step = 1.0
 decimals = 0
-tooltip = "menu.render.sun.vol_focus.tip"
+tooltip = "menu.render.sky.blur.focus.tip"
 
+# 天体盘（天空里那个盘的形状；日月共用同一组值，角径同时决定光晕的尺度）
 [[items.children.children]]
+kind = "sub_menu"
+id = "disk"
+label = "menu.render.sky.disk"
+
+[[items.children.children.children]]
+kind = "toggle"
+id = "override"
+label = "menu.render.sky.disk.override"
+checked = false
+tooltip = "menu.render.sky.disk.override.tip"
+
+[[items.children.children.children]]
 kind = "slider"
-id = "vol_soft"
-label = "menu.render.sun.vol_soft"
-value = 0.0
+id = "radius"
+label = "menu.render.sky.disk.radius"
+value = 1.2
 min = 0.0
 max = 3.5
 step = 0.1
 decimals = 1
-tooltip = "menu.render.sun.vol_soft.tip"
+tooltip = "menu.render.sky.disk.radius.tip"
 
-[[items.children.children]]
+[[items.children.children.children]]
 kind = "slider"
-id = "vol_halo"
-label = "menu.render.sun.vol_halo"
+id = "halo"
+label = "menu.render.sky.disk.halo"
 value = 0.5
 min = 0.0
 max = 4.0
 step = 0.1
 decimals = 1
-tooltip = "menu.render.sun.vol_halo.tip"
+tooltip = "menu.render.sky.disk.halo.tip"
+
+# 颜色（覆写开着时用下面三个色代替时间算出来的颜色；强度仍由时间给）
+[[items.children.children]]
+kind = "sub_menu"
+id = "color"
+label = "menu.render.sky.color"
+
+[[items.children.children.children]]
+kind = "toggle"
+id = "override"
+label = "menu.render.sky.color.override"
+checked = false
+tooltip = "menu.render.sky.color.override.tip"
+
+[[items.children.children.children]]
+kind = "color"
+id = "sun"
+label = "menu.render.sky.color.sun"
+hex = "FFF5E6"
+
+[[items.children.children.children]]
+kind = "color"
+id = "moon"
+label = "menu.render.sky.color.moon"
+hex = "C8D4FF"
+
+[[items.children.children.children]]
+kind = "color"
+id = "sky"
+label = "menu.render.sky.color.sky"
+hex = "78A7FF"
 
 [[items]]
 kind = "sub_menu"

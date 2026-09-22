@@ -31,7 +31,8 @@ pub(crate) fn setup(
   let dda_handle = create_dda_image(&mut images);
   // `UiPickingCamera`：UI 拾取（hover/press）只认挂了它的相机（见 gate_ui::pointer 的 `require_markers` 契约）
   commands.spawn((Camera2d, Msaa::Off, UiPickingCamera));
-  // 光照主题 RON：一次性静态配置，同步读即可；缺失/解析失败回退内置默认主题
+  // 光照主题 RON：同步读即可，缺失/解析失败回退内置默认主题。**它只提供首帧初值** ——
+  // 之后每帧被 `gate_render::sky::apply_sky` 按时刻/年积日/纬度覆写（天上只有时间驱动这一条路）。
   let theme = std::fs::read_to_string(gate_render::assets_dir().join("lighting/day_outdoor.ron"))
     .map_err(|e| format!("read: {e}"))
     .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))

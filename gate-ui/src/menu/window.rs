@@ -666,6 +666,36 @@ fn poll_click(world: &mut World, e: Entity) -> bool {
   prev == UiInteract::Pressed && inter == UiInteract::Hovered
 }
 
+/// **原地重建当前页**（不带动画）：模型里"结构性"的东西变了时用 —— 目前只有**禁用态**
+/// （`MenuNode::set_disabled`）：widget 的配色是 spawn 时按 `disabled` 算的，光改模型不会重画，
+/// 而 `refresh_visuals` 只管数值/高亮那几项。调用方（如天空页的「覆写」开关）改完模型后调它。
+pub fn rebuild_menu_page(world: &mut World) {
+  let mut q = world.query_filtered::<Entity, With<DebugMenu>>();
+  let Ok(root) = q.single(world) else { return };
+  let Some(viewport) = world.get::<MenuParts>(root).map(|p| p.viewport) else { return };
+  let Some(path) = world.get::<DebugMenu>(root).map(|m| m.path.clone()) else { return };
+  let Some((theme, font, icon, translate)) = ctx_from_world(world) else { return };
+  let ctx =
+    UiCtx::new(&theme, font.as_ref()).with_icon_font(icon.as_ref()).with_translate(translate);
+  let model = world.get::<DebugMenu>(root).expect("DebugMenu 存在").model.clone();
+  let new_page = build_page(world, &ctx, viewport, &model, &path);
+  // 先换掉分页状态（借用只在这个块里），再销毁旧页 —— 否则 `world` 会被借两次
+  let (old, stale) = {
+    let Some(mut p) = world.get_mut::<MenuPager>(root) else { return };
+    let (old, stale) = (p.current, p.outgoing.take());
+    p.current = new_page;
+    // 静态态（无切换动画）：下一帧 `advance_pager` 会把它摆回文档流（left = 0、视口高度 auto）
+    p.outgoing = None;
+    p.t = 1.0;
+    (old, stale)
+  };
+  for e in stale.into_iter().chain(std::iter::once(old)) {
+    if e != new_page && world.get_entity(e).is_ok() {
+      world.despawn(e);
+    }
+  }
+}
+
 /// 开始一次页面切换：建新页、旧页脱流、启动动画
 fn start_navigation(world: &mut World, root: Entity, viewport: Entity, target: &[String]) {
   let dir = {
@@ -1036,19 +1066,23 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
     }
   }
 
-  // 颜色色块（跟随模型 hex；非法 hex → 透明）
+  // 颜色色块（跟随模型 hex；非法 hex → 透明；禁用行降亮）
   let mut q = world.query::<(Entity, &MenuColorSwatch)>();
   let swatches: Vec<(Entity, String)> = q.iter(world).map(|(e, v)| (e, v.path.clone())).collect();
   drop(q);
   for (e, path) in swatches {
-    let color = {
+    let (color, disabled) = {
       let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
       match menu.model.node(&split_path(&path)) {
-        Some(MenuNode::Color { hex, .. }) => crate::parse_hex_color(hex)
-          .map_or(Color::NONE, |[r, g, b, a]| Color::srgba_u8(r, g, b, a)),
+        Some(MenuNode::Color { hex, disabled, .. }) => (
+          crate::parse_hex_color(hex)
+            .map_or(Color::NONE, |[r, g, b, a]| Color::srgba_u8(r, g, b, a)),
+          *disabled,
+        ),
         _ => continue,
       }
     };
+    let color = if disabled { crate::widgets::dim_color(color) } else { color };
     if let Some(mut b) = world.get_mut::<BackgroundColor>(e)
       && b.0 != color
     {

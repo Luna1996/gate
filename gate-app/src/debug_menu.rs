@@ -39,6 +39,19 @@ pub const WORLD_MODEL_PATH: &str = "game/world/model";
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 /// 「编辑」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
 pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/pbr_asset";
+/// 「渲染/天空」各控件的节点路径：`sync_sky_menu` 要按路径查值，故集中在这里（观察者用字面量匹配）。
+const SKY_HOUR_PATH: &str = "render/sky/time/hour";
+const BLUR_STRENGTH_PATH: &str = "render/sky/blur/strength";
+const BLUR_DECAY_PATH: &str = "render/sky/blur/decay";
+const BLUR_FOCUS_PATH: &str = "render/sky/blur/focus";
+const BLUR_OVERRIDE_PATH: &str = "render/sky/blur/override";
+const DISK_RADIUS_PATH: &str = "render/sky/disk/radius";
+const DISK_HALO_PATH: &str = "render/sky/disk/halo";
+const DISK_OVERRIDE_PATH: &str = "render/sky/disk/override";
+const COLOR_OVERRIDE_PATH: &str = "render/sky/color/override";
+const COLOR_SUN_PATH: &str = "render/sky/color/sun";
+const COLOR_MOON_PATH: &str = "render/sky/color/moon";
+const COLOR_SKY_PATH: &str = "render/sky/color/sky";
 
 /// 读 UI 结构与控件缺省值：每次都读只读资源 `assets/ui/debug_menu.toml`（结构与缺省值的唯一
 /// 来源），再把 `data/config.toml` 里的值覆盖上去 —— 配置里没有的控件保留缺省值，
@@ -367,47 +380,135 @@ fn register_callbacks(world: &mut World) {
     },
   );
 
-  // 光柱（godray，菜单「渲染/太阳」）：算法、成本模型、取舍全部写在
-  // `gate-render/src/volumetric.rs` 与 `assets/shaders/voxel_raytrace/volumetric.wesl`；
-  // 这里只做「档位 → 数值」的映射与一行日志（数值含义不在这里重复）。
+  // 径向模糊（光柱）+ 天体盘（菜单「渲染/天空/径向模糊」「渲染/天空/天体盘」）：
+  // 算法、成本模型、取舍全部写在 `gate-render/src/volumetric.rs` 与
+  // `assets/shaders/voxel_raytrace/volumetric.wesl`；这里只做「档位 → 数值」的映射与一行日志。
+  // **这两组的五个滑杆默认随时刻变化**（`sky.rs` 的关键帧表每帧写它们）：覆写**关**着时整行禁用
+  // （不可交互、只实时显示时间算出来的值，见 `sync_sky_menu`）⇒ 想自己定值就先打开该组「覆写」。
   world.add_observer(
-    |ev: On<MenuActionEvent>, mut fog: ResMut<gate_render::FogSettings>| match (
-      ev.path.as_str(),
-      &ev.action,
-    ) {
-      ("render/sun/vol", MenuAction::Toggle(on)) => {
-        fog.enabled = *on;
-        info!("光柱（godray）→ {}", if *on { "on" } else { "off" });
+    |ev: On<MenuActionEvent>,
+     mut fog: ResMut<gate_render::FogSettings>,
+     mut sky: ResMut<gate_render::SkySettings>| {
+      match (ev.path.as_str(), &ev.action) {
+        ("render/sky/blur/enabled", MenuAction::Toggle(on)) => {
+          fog.enabled = *on;
+          info!("光柱（godray）→ {}", if *on { "on" } else { "off" });
+        }
+        ("render/sky/blur/override", MenuAction::Toggle(on)) => {
+          sky.override_blur = *on;
+          info!(
+            "径向模糊：覆写 → {}（{}）",
+            if *on { "on" } else { "off" },
+            if *on { "用面板值固定住" } else { "下面的滑杆转成只读（随时刻变化）" }
+          );
+        }
+        ("render/sky/blur/strength", MenuAction::Value(v)) => {
+          fog.strength = v.max(0.0);
+          info!("光柱强度 → {v:.2}（这是「光柱有多亮」的主旋钮）");
+        }
+        ("render/sky/blur/decay", MenuAction::Value(v)) => {
+          fog.decay = v.clamp(0.05, 1.0);
+          info!(
+            "光柱衰减 → {:.2}（模糊每步的权重：越接近 1 ⇒ 光柱拖得越长；越小 ⇒ 越贴紧太阳）",
+            fog.decay
+          );
+        }
+        ("render/sky/blur/focus", MenuAction::Value(v)) => {
+          fog.focus = v.clamp(1.0, 64.0);
+          info!(
+            "光柱集中度 → {:.0}（太阳方向权重的指数：越大越集中在太阳附近；1 = 整个天空都发光）",
+            fog.focus
+          );
+        }
+        ("render/sky/disk/override", MenuAction::Toggle(on)) => {
+          sky.override_disk = *on;
+          info!(
+            "天体盘：覆写 → {}（{}）",
+            if *on { "on" } else { "off" },
+            if *on { "用面板值固定住" } else { "下面的滑杆转成只读（随时刻变化）" }
+          );
+        }
+        // 菜单给**度**、引擎吃弧度：全工程只有这一处换算，集中在这里。
+        // 这一个量只影响天空里那个天体盘的半径（`volumetric.wesl::sky_primary`），日月共用；
+        // 它同时决定盘外光晕的尺度（晕铺到角径的 10 倍）。
+        ("render/sky/disk/radius", MenuAction::Value(v)) => {
+          fog.sun_cone = v.to_radians();
+          info!("天体盘：角径 → {v:.2}°（天空里那个盘的半径，日月共用；0 = 只有一个点）");
+        }
+        ("render/sky/disk/halo", MenuAction::Value(v)) => {
+          fog.halo = *v;
+          info!("天体盘：光晕 → {v:.1}（盘外那圈解析拖尾的强度；随角径一起缩放）");
+        }
+        _ => {}
       }
-      ("render/sun/vol_strength", MenuAction::Value(v)) => {
-        fog.strength = v.max(0.0);
-        info!("光柱强度 → {v:.2}（这是「光柱有多亮」的主旋钮）");
+    },
+  );
+
+  // 时间（菜单「渲染/天空/时间」）：时刻 / 年积日 / 纬度 → 太阳与月亮的位置。
+  // 推导、关键帧色板与全部取舍写在 `gate-render/src/sky.rs`；这里只把面板值写进资源，
+  // 并顺手打一行**推导结果**（高度角 + 当前主天体）—— 推导本身每帧在 `sky::apply_sky` 里做。
+  world.add_observer(|ev: On<MenuActionEvent>, mut sky: ResMut<gate_render::SkySettings>| {
+    match (ev.path.as_str(), &ev.action) {
+      ("render/sky/time/hour", MenuAction::Value(v)) => {
+        sky.hour = v.rem_euclid(24.0);
+        info!("天象：时刻 → {:.2}h（{}）", sky.hour, sky_report(&sky));
       }
-      ("render/sun/vol_decay", MenuAction::Value(v)) => {
-        fog.decay = v.clamp(0.05, 1.0);
-        info!(
-          "光柱衰减 → {:.2}（模糊每步的权重：越接近 1 ⇒ 光柱拖得越长；越小 ⇒ 越贴紧太阳）",
-          fog.decay
-        );
+      ("render/sky/time/date", MenuAction::Value(v)) => {
+        sky.day_of_year = *v;
+        info!("天象：年积日 → {:.0}（{}）", sky.day_of_year, sky_report(&sky));
       }
-      ("render/sun/vol_focus", MenuAction::Value(v)) => {
-        fog.focus = v.clamp(1.0, 64.0);
-        info!(
-          "光柱集中度 → {:.0}（太阳方向权重的指数：越大越集中在太阳附近；1 = 整个天空都发光）",
-          fog.focus
-        );
+      ("render/sky/time/lat", MenuAction::Value(v)) => {
+        sky.latitude_deg = v.clamp(-90.0, 90.0);
+        info!("天象：纬度 → {:.1}°（{}）", sky.latitude_deg, sky_report(&sky));
       }
-      // 菜单给**度**、引擎吃弧度：全工程只有这一处换算，集中在这里。
-      // 这一个量只影响天空里那个太阳盘的半径（`volumetric.wesl::sky_primary`）。
-      ("render/sun/vol_soft", MenuAction::Value(v)) => {
-        fog.sun_cone = v.to_radians();
-        info!("光柱：太阳角径 → {v:.2}°（天空里那颗太阳盘的半径；0 = 只有一个点）");
+      ("render/sky/time/auto", MenuAction::Toggle(on)) => {
+        sky.auto = *on;
+        info!("自动流逝 → {}（{}）", if *on { "on" } else { "off" }, day_cycle(sky.hours_per_sec));
       }
-      ("render/sun/vol_halo", MenuAction::Value(v)) => {
-        fog.halo = *v;
-        info!("光柱：日晕 → {v:.1}（太阳盘外那圈解析拖尾的强度）");
+      ("render/sky/time/speed", MenuAction::Value(v)) => {
+        sky.hours_per_sec = v.max(0.0);
+        info!("流逝速度 → {v:.2} 游戏小时/秒（{}）", day_cycle(sky.hours_per_sec));
       }
       _ => {}
+    }
+  });
+
+  // 颜色（菜单「渲染/天空/颜色」）：太阳 / 月亮 / 天空三个色 + 覆写。
+  // 覆写开着时用它们代替时间算出来的颜色 —— **强度**仍由时间给（`sky.rs` 只换色）。
+  // 覆写关着时三个拾色器整行禁用（见 `sync_sky_menu`）；拾色器是自由文本输入（半截输入会中途
+  // 失败）⇒ 解析失败就忽略，不打断输入。
+  world.add_observer(
+    |ev: On<MenuActionEvent>, mut sky: ResMut<gate_render::SkySettings>| {
+      if let ("render/sky/color/override", MenuAction::Toggle(on)) = (ev.path.as_str(), &ev.action) {
+        sky.override_colors = *on;
+        info!(
+          "颜色：覆写 → {}（{}）",
+          if *on { "on" } else { "off" },
+          if *on { "用面板的太阳/月亮/天空色" } else { "三个色转成只读（随时刻变化）" }
+        );
+        return;
+      }
+      let MenuAction::Text(hex) = &ev.action else { return };
+      let Some(c) = hex_srgb01(hex) else {
+        debug!(target: "gate", "天象颜色输入未成形 → {hex:?}（忽略）");
+        return;
+      };
+      let name = match ev.path.as_str() {
+        "render/sky/color/sun" => {
+          sky.sun_color = c;
+          "太阳"
+        }
+        "render/sky/color/moon" => {
+          sky.moon_color = c;
+          "月亮"
+        }
+        "render/sky/color/sky" => {
+          sky.sky_color = c;
+          "天空"
+        }
+        _ => return,
+      };
+      info!("{name}色 → #{hex}");
     },
   );
 
@@ -588,6 +689,124 @@ fn menu_pbr_asset(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
 /// 材质控件的统一日志（MT7-1 的验收：每次改动日志有 `材质 → …` 一行）。
 fn log_material(mat: &BrushMaterial) {
   info!(target: "gate", "材质 → {}", mat.summary());
+}
+
+/// 「天象」那一行日志的推导部分：三个时间控件（时刻 / 年积日 / 纬度）都会改变主天体，
+/// 于是统一用这一行汇报推导结果（色与强度由 `sky.rs` 的关键帧表给，日志里不重复抄）。
+fn sky_report(sky: &gate_render::SkySettings) -> String {
+  let alt = gate_render::sun_altitude_deg(sky.hour, sky.day_of_year, sky.latitude_deg);
+  format!(
+    "时刻 {:.2}h、年积日 {:.0}、纬度 {:.1}° ⇒ 太阳高度角 {alt:.1}°、主光 = {}",
+    sky.hour,
+    sky.day_of_year,
+    sky.latitude_deg,
+    if alt >= 0.0 { "太阳" } else { "反日点的月亮" }
+  )
+}
+
+/// 「一昼夜多久」（流逝速度 = 游戏小时 / 实时秒）；速度 0 ⇒ 时刻不动。
+fn day_cycle(hours_per_sec: f32) -> String {
+  if hours_per_sec <= 0.0 {
+    "速度为 0 ⇒ 时刻不动".to_string()
+  } else {
+    format!("一昼夜 {:.1} 分钟", 24.0 / hours_per_sec / 60.0)
+  }
+}
+
+/// HEX 文本 → sRGB（0..1）。解析失败 = 半截输入 ⇒ `None`（调用方忽略，见颜色观察者）。
+fn hex_srgb01(hex: &str) -> Option<[f32; 3]> {
+  let [r, g, b, _] = parse_hex_color(hex)?;
+  Some([f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0])
+}
+
+/// 引擎 → 菜单（每帧）：把"引擎会自己改的那些控件"同步过去。
+///   · **时刻**：自动流逝会推进它（不写回 ⇒ 面板停在拖动那一刻，而画面里的时间早已走远）；
+///   · 「径向模糊」「天体盘」两组的**滑杆**：覆写关着时它们显示的就是时间算出来的值；
+///   · 三个**「覆写」开关**的勾选态（真源是 `SkySettings` 的三个标志）；
+///   · **禁用态**：覆写关着的那组，下面所有行都禁用（不可交互、配色降亮）—— 值不是它说了算。
+///     widget 的配色是 spawn 时算的 ⇒ 禁用态一变就**重建当前页**（`rebuild_menu_page`，不带动画）。
+/// 「颜色」那三个拾色器不回写（它们永远是你的色，覆写只决定生不生效）。
+///
+/// 写两处（都在这一帧内被消费）：模型值 —— `refresh_visuals` 每帧按它刷新滑杆右侧的数值文本；
+/// 滑杆组件的 `SliderValue` —— `slider_visual_system` 按它画 fill/thumb 的位置。
+pub(crate) fn sync_sky_menu(
+  sky: Res<gate_render::SkySettings>,
+  fog: Res<gate_render::FogSettings>,
+  mut commands: Commands,
+  mut q_menu: Query<&mut gate_ui::DebugMenu>,
+  mut q_sliders: Query<(&gate_ui::menu::MenuItem, &mut gate_ui::SliderValue)>,
+  q_toggles: Query<(Entity, &gate_ui::menu::MenuItem, Has<bevy::ui::Checked>)>,
+) {
+  // (控件路径, 引擎当前值)：只列"引擎会自己改"的那些
+  let mut want: Vec<(&str, f32)> = Vec::with_capacity(6);
+  want.push((SKY_HOUR_PATH, sky.hour));
+  if !sky.override_blur {
+    want.push((BLUR_STRENGTH_PATH, fog.strength()));
+    want.push((BLUR_DECAY_PATH, fog.decay()));
+    want.push((BLUR_FOCUS_PATH, fog.focus()));
+  }
+  if !sky.override_disk {
+    want.push((DISK_RADIUS_PATH, fog.sun_cone.max(0.0).to_degrees()));
+    want.push((DISK_HALO_PATH, fog.halo.max(0.0)));
+  }
+  for (item, mut v) in &mut q_sliders {
+    if let Some((_, value)) = want.iter().find(|(path, _)| *path == item.path)
+      && v.0 != *value
+    {
+      v.0 = *value;
+    }
+  }
+
+  // 覆写开关的勾选态（真源：`SkySettings` 的三个标志）
+  let overrides = [
+    (BLUR_OVERRIDE_PATH, sky.override_blur),
+    (DISK_OVERRIDE_PATH, sky.override_disk),
+    (COLOR_OVERRIDE_PATH, sky.override_colors),
+  ];
+  for (e, item, checked) in &q_toggles {
+    if let Some((_, on)) = overrides.iter().find(|(path, _)| *path == item.path)
+      && *on != checked
+    {
+      if *on {
+        commands.entity(e).insert(bevy::ui::Checked);
+      } else {
+        commands.entity(e).remove::<bevy::ui::Checked>();
+      }
+    }
+  }
+
+  let Ok(mut menu) = q_menu.single_mut() else { return };
+  for (path, value) in &want {
+    if let Some(MenuNode::Slider { value: cur, .. }) = menu.model.node_mut(&split(path)) {
+      *cur = *value;
+    }
+  }
+  for (path, on) in overrides {
+    if let Some(MenuNode::Toggle { checked, .. }) = menu.model.node_mut(&split(path)) {
+      *checked = on;
+    }
+  }
+
+  // 覆写**关**着的组：下面那些控件不是它说了算 ⇒ 整行禁用（不可交互、配色降亮）。
+  // 配色是 spawn 时算的 ⇒ 禁用态一变就得**重建当前页**（`rebuild_menu_page`，不带动画）。
+  let mut relayout = false;
+  for (path, disabled) in [
+    (BLUR_STRENGTH_PATH, !sky.override_blur),
+    (BLUR_DECAY_PATH, !sky.override_blur),
+    (BLUR_FOCUS_PATH, !sky.override_blur),
+    (DISK_RADIUS_PATH, !sky.override_disk),
+    (DISK_HALO_PATH, !sky.override_disk),
+    (COLOR_SUN_PATH, !sky.override_colors),
+    (COLOR_MOON_PATH, !sky.override_colors),
+    (COLOR_SKY_PATH, !sky.override_colors),
+  ] {
+    if let Some(node) = menu.model.node_mut(&split(path)) {
+      relayout |= node.set_disabled(disabled);
+    }
+  }
+  if relayout {
+    commands.queue(|world: &mut World| gate_ui::rebuild_menu_page(world));
+  }
 }
 
 /// 纯文本行（相机位置/角度）的值：每 `CAM_INFO_REFRESH_SECS` 刷新一次。

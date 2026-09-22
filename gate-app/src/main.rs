@@ -32,7 +32,7 @@ use camera::{
 use config::{Config, save_config_on_exit};
 use debug_menu::{
   DebugUiRoot, FpsOverlayVisible, FpsWindow, camera_info_tick, debug_menu_toggle, fps_overlay_tick,
-  spawn_debug_menu_ui, sync_ui_locale,
+  spawn_debug_menu_ui, sync_sky_menu, sync_ui_locale,
 };
 use edit::voxel_edit_input;
 use scene::setup;
@@ -170,6 +170,8 @@ fn main() {
         debug_ui_setup,
         // 右上角 FPS 覆盖层（开关打开时每帧刷新）+ 纯文本行的相机信息
         (fps_overlay_tick, camera_info_tick),
+        // 「天空」页：自动流逝推进的时刻回写进菜单（面板显示的就是画面里的时刻）
+        sync_sky_menu,
         // 语言切换 → 菜单/UI 文案整体重解析
         sync_ui_locale,
         // 右上角组件展示窗：交互事件日志 / slider 实时值 / 演示折线喂数

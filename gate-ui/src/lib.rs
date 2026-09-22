@@ -18,7 +18,7 @@ pub use icon::{Icon, IconFont};
 pub use menu::{
   DebugMenu, DebugMenuHandle, DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile,
   MenuItem, MenuNode, MenuRole, MenuTextValue, MenuValue, WindowState, menu_model, menu_selected,
-  menu_system, menu_text, menu_toggle, menu_value, spawn_debug_menu,
+  menu_system, menu_text, menu_toggle, menu_value, rebuild_menu_page, spawn_debug_menu,
 };
 pub use pointer::{UiInteract, UiInteractBundle, UiInteractPrev, UiInteractable};
 pub use world_anchor::{

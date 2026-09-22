@@ -85,38 +85,78 @@ GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 "menu.render.exposure.tau_dn.tip" = "往暗处适应的速度（秒）：太小像**眨眼**"
 "menu.render.exposure.key" = "目标中灰"
 "menu.render.exposure.key.tip" = "百分位平均亮度被压到的**目标值**"
-"menu.render.sun" = "太阳"
-"menu.render.sun.vol" = "光柱"
-"menu.render.sun.vol.tip" = """
+"menu.render.sky" = "天空"
+"menu.render.sky.time" = "时间"
+"menu.render.sky.time.hour" = "时刻"
+"menu.render.sky.time.hour.tip" = """
+`0..24` 时（`12` = 正午）。拖动它 ⇒ 太阳/月亮的位置、颜色、光柱与天体盘一起变。"""
+"menu.render.sky.time.date" = "年积日"
+"menu.render.sky.time.date.tip" = """
+`1..365`：决定太阳**赤纬** ⇒ 昼夜长短与正午高度角。
+
+`81` = 春分（赤纬 `0` ⇒ 昼夜等长、正午高度角 = `90° − 纬度`）。"""
+"menu.render.sky.time.lat" = "纬度"
+"menu.render.sky.time.lat.tip" = """
+北纬为正。纬度越高 ⇒ 夏季白天越长、正午太阳越低。"""
+"menu.render.sky.time.auto" = "自动流逝"
+"menu.render.sky.time.auto.tip" = """
+让时刻自己走（速度见下一项）。"""
+"menu.render.sky.time.speed" = "流逝速度"
+"menu.render.sky.time.speed.tip" = """
+游戏小时 / 实时秒：`0.1` ⇒ 一昼夜 `4` 分钟。"""
+"menu.render.sky.blur" = "径向模糊"
+"menu.render.sky.blur.enabled" = "开启"
+"menu.render.sky.blur.enabled.tip" = """
 **光柱**（god ray）= 从太阳方向射出来的那些光带。
 
 - 太阳在**画面里**或**画面侧方**时才有；转到背后就没有了（屏幕空间效果的固有边界）；
 - 合成是**纯加法**：光柱只是叠上去，背景的亮度与对比不受影响。
 
-关掉 ⇒ 光柱不再绘制（**太阳盘与日晕照常**，它们属于天空背景）。"""
-"menu.render.sun.vol_strength" = "强度"
-"menu.render.sun.vol_strength.tip" = """
+关掉 ⇒ 光柱不再绘制（**天体盘与光晕照常**，它们在「天体盘」页里）。"""
+"menu.render.sky.blur.override" = "覆写"
+"menu.render.sky.blur.override.tip" = """
+**关**（默认）：强度/衰减/集中度随时刻变化，下面三条滑杆**只读**（实时显示当前值）。
+
+**开**：改用下面的值 —— 打开那一刻就是当时的三个值，之后随便调。"""
+"menu.render.sky.blur.strength" = "强度"
+"menu.render.sky.blur.strength.tip" = """
 乘在光柱上的强度 —— **"光柱有多亮"的主旋钮**。`0` = 没有光柱。"""
-"menu.render.sun.vol_decay" = "衰减"
-"menu.render.sun.vol_decay.tip" = """
+"menu.render.sky.blur.decay" = "衰减"
+"menu.render.sky.blur.decay.tip" = """
 模糊每一步的权重 —— 它决定光柱**从太阳往外拖多长**：
 
 - 大（`0.95+`）：拖到整屏；
 - 中（`0.8~0.9`）：拖到画面中部；
 - 小（`0.6`）：短、紧贴太阳（像镜头眩光）。"""
-"menu.render.sun.vol_focus" = "集中度"
-"menu.render.sun.vol_focus.tip" = """
+"menu.render.sky.blur.focus" = "集中度"
+"menu.render.sky.blur.focus.tip" = """
 太阳方向权重的指数 —— 它决定**光柱从多大一片天空射出来**：
 
 - 大（`20+`）：只在太阳附近十几度内（尖锐、像激光束）；
 - 小（`1`）：**整个天空**都在发光 ⇒ 更像一层方向性眩光，不像光柱。"""
-"menu.render.sun.vol_soft" = "太阳角径"
-"menu.render.sun.vol_soft.tip" = """
-**天空里那颗太阳盘的半径**（度）。`0` = 太阳只是一个点；它不影响光柱本身。"""
-"menu.render.sun.vol_halo" = "日晕"
-"menu.render.sun.vol_halo.tip" = """
-太阳盘外那圈**解析拖尾**的强度。它不溢出到几何上（那是 bloom 的活）；
-调 `0` 就只剩「太阳角径」那个盘。"""
+"menu.render.sky.disk" = "天体盘"
+"menu.render.sky.disk.override" = "覆写"
+"menu.render.sky.disk.override.tip" = """
+**关**（默认）：角径与光晕随时刻变化（越接近地平线盘越大、晕越强），下面两条滑杆**只读**（实时显示当前值）。
+
+**开**：改用下面的值 —— 打开那一刻就是当时的两个值，之后随便调。"""
+"menu.render.sky.disk.radius" = "角径"
+"menu.render.sky.disk.radius.tip" = """
+天空里那个盘的半径（度）—— 太阳与月亮**共用**这一个值（真实太阳只有 `0.27°`，这里用夸张值）。
+
+它同时决定盘外光晕的**尺度**：晕铺到角径的 `10` 倍处。`0` = 只是一个点。"""
+"menu.render.sky.disk.halo" = "光晕"
+"menu.render.sky.disk.halo.tip" = """
+天体盘外那圈**解析拖尾**的强度。它不溢出到几何上（那是 bloom 的活）；调 `0` 就只剩那个盘。"""
+"menu.render.sky.color" = "颜色"
+"menu.render.sky.color.override" = "覆写"
+"menu.render.sky.color.override.tip" = """
+**关**（默认）：太阳/月亮/天空色随时刻变化，下面三个色**只读**。
+
+**开**：用下面三个色代替时间算出来的颜色（**强度**仍由时间给）。"""
+"menu.render.sky.color.sun" = "太阳"
+"menu.render.sky.color.moon" = "月亮"
+"menu.render.sky.color.sky" = "天空"
 "menu.player" = "玩家"
 "menu.player.camera" = "相机"
 "menu.player.camera.pos" = "相机位置"
