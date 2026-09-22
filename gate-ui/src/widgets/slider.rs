@@ -10,7 +10,9 @@ use bevy::ui::{Pressed, RelativeCursorPosition};
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px};
 use crate::pointer::{UiInteract, UiInteractBundle};
-use crate::widgets::consts::{THUMB_INSET, THUMB_SIZE, THUMB_SIZE_DRAG, TRACK_HEIGHT};
+use crate::widgets::consts::{
+  SLIDER_FINE_SCALE, THUMB_INSET, THUMB_SIZE, THUMB_SIZE_DRAG, TRACK_HEIGHT,
+};
 
 /// 滑杆根节点标记
 #[derive(Component, Debug, Default)]
@@ -49,6 +51,17 @@ pub struct SliderThumb;
 /// 滑块放在它里面 → `left: norm%` 的行程端点让滑块整块落在轨道槽两端之内
 #[derive(Component, Debug, Default)]
 pub struct SliderThumbSlot;
+
+/// 拖拽状态（精细档的锚点；只在拖动期间有意义）
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct SliderDrag {
+  /// 当前处于精细档（拖动中按住 Shift）：值由光标位移增量给出，而非光标绝对位置
+  fine: bool,
+  /// 进入精细档那一刻的光标 x（物理 px，与拖动映射同坐标系）
+  anchor_cursor_x: f32,
+  /// 进入精细档那一刻的值
+  anchor_value: f32,
+}
 
 /// 滑杆句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -124,6 +137,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
     UiSlider,
     UiInteractBundle::default(),
     RelativeCursorPosition::default(),
+    SliderDrag::default(),
     SliderRange { min: config.min, max: config.max },
     SliderStep(config.step),
     SliderValue(v),
@@ -203,9 +217,13 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
 
 /// 拖动：按下时把光标位置映射为值（每帧重算）；值变化时触发 `SliderValueChanged`（仅用户拖动）。
 /// 映射基准 = 行程槽（根内容盒再各内缩半 thumb 宽）；光标落在槽外即吸附 min/max；有 step 时经 `clamp_step` 逐档吸附。
+/// **精细档**：按住 Shift 时改为按光标位移增量给值（灵敏度 ×`SLIDER_FINE_SCALE`），锚点是按下 Shift 那一刻的
+/// 「光标 + 值」⇒ 进出精细档都不跳变；Shift 被占用的事实写进 `UiShiftCaptured`，场景输入据此忽略它。
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_drag_system(
   mut commands: Commands,
+  keys: Res<ButtonInput<KeyCode>>,
+  mut shift_captured: ResMut<crate::capture::UiShiftCaptured>,
   mut q: Query<(
     Entity,
     &Hovered,
@@ -215,14 +233,20 @@ pub fn slider_drag_system(
     &SliderRange,
     &SliderStep,
     &mut SliderValue,
+    &mut SliderDrag,
     Has<UiDisabled>,
   )>,
 ) {
-  for (e, hovered, pressed, rcp, node, range, step, mut val, disabled) in &mut q {
+  let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+  let mut fine_drag = false;
+  for (e, hovered, pressed, rcp, node, range, step, mut val, mut drag, disabled) in &mut q {
     let inter = UiInteract::of(hovered, pressed);
     if disabled || inter != UiInteract::Pressed {
+      drag.fine = false;
       continue;
     }
+    // Shift 在这一格上被占用：光标拖出节点也照样占着（否则拖出后同一个 Shift 会去把相机往下降）
+    fine_drag = shift;
     let Some(n) = rcp.normalized else { continue };
     // normalized 以节点中心为原点（-0.5..0.5）；size 与 padding（min_inset.x=左、max_inset.x=右）同为物理 px，比值单位自洽
     let root_w = node.size().x;
@@ -231,18 +255,30 @@ pub fn slider_drag_system(
     let pad_r = node.padding.max_inset.x;
     // 行程槽 = 根内容盒再各内缩半 thumb 宽（与 visual 里 thumb 的行程一致）
     let travel_w = root_w - pad_l - pad_r - THUMB_SIZE;
-    let norm = if travel_w > 0.0 {
-      ((cursor_x - pad_l - THUMB_SIZE / 2.0) / travel_w).clamp(0.0, 1.0)
+    let span = range.max - range.min;
+    let target = if travel_w <= 0.0 {
+      range.min
+    } else if shift {
+      // 精细档：锚点只在「进入精细档」那帧写一次，之后按位移增量走 1/10 灵敏度
+      if !drag.fine {
+        drag.fine = true;
+        drag.anchor_cursor_x = cursor_x;
+        drag.anchor_value = val.0;
+      }
+      drag.anchor_value + (cursor_x - drag.anchor_cursor_x) / travel_w * span * SLIDER_FINE_SCALE
     } else {
-      0.0
+      // 绝对档：光标位置直接映射到值；松开 Shift 立即回到绝对映射（由光标决定，不受精细档残值影响）
+      drag.fine = false;
+      let norm = ((cursor_x - pad_l - THUMB_SIZE / 2.0) / travel_w).clamp(0.0, 1.0);
+      range.min + norm * span
     };
-    let target = range.min + norm * (range.max - range.min);
     let v = clamp_step(target, range.min, range.max, step.0);
     if (val.0 - v).abs() > f32::EPSILON {
       val.0 = v;
       commands.trigger(SliderValueChanged { entity: e, value: v });
     }
   }
+  shift_captured.set_if_neq(crate::capture::UiShiftCaptured(fine_drag));
 }
 
 /// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px。

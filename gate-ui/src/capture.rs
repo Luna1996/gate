@@ -23,6 +23,11 @@ pub struct MouseIntercept;
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
 pub struct MouseIntercepted(pub bool);
 
+/// Shift 是否被 UI 占用（滑杆拖动中按住 Shift = 精细调值，见 `widgets::slider`）。
+/// 场景输入须忽略 Shift：否则同一个按键会把相机往下降。
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiShiftCaptured(pub bool);
+
 /// 指针门控（每帧重算）。`set_if_neq` 仅在翻转时触发 change 检测。
 pub fn ui_pointer_capture_system(
   hover_map: Res<HoverMap>,

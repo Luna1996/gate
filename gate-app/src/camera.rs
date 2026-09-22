@@ -183,11 +183,13 @@ pub(crate) fn orbit_camera_input(
 }
 
 /// 幽灵模式飞行输入（仅 Fly 模式，无碰撞）：WASD 沿视线平移，Space 升 / Shift 降（世界 +Y），
-/// 斜向归一化；不受 `UiPointerCaptured` 拦截，但文本输入焦点（`gate_ui::TextInputFocus`）会挡键盘。
+/// 斜向归一化；不受 `UiPointerCaptured` 拦截，但文本输入焦点（`gate_ui::TextInputFocus`）会挡键盘，
+/// 滑杆精细拖动占用的 Shift（`gate_ui::UiShiftCaptured`）也不算下降。
 pub(crate) fn fly_camera_input(
   keys: Res<ButtonInput<KeyCode>>,
   time: Res<Time>,
   focus: Res<gate_ui::TextInputFocus>,
+  shift_captured: Res<gate_ui::UiShiftCaptured>,
   mode: Res<CameraMode>,
   orbit: Res<OrbitCamera>,
   mut fly: ResMut<FlyCamera>,
@@ -224,7 +226,10 @@ pub(crate) fn fly_camera_input(
   if keys.pressed(KeyCode::Space) {
     dir += Vec3::Y;
   }
-  if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+  // Shift 被滑杆精细拖动占用时不下降（同一个按键按一次只能有一个语义）
+  if !shift_captured.0
+    && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight))
+  {
     dir -= Vec3::Y;
   }
   if let Some(d) = dir.try_normalize() {

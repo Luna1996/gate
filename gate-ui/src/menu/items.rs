@@ -2,9 +2,12 @@
 //! 一行分「左|中|右」三部分（左列 `LEFT_COL_W`、右列 `RIGHT_COL_W` 固定且不相等，中间占余下）。
 //! 交互行由 `menu_system` 驱动：写回 `super::model::MenuFile` 并对外发 `super::MenuActionEvent`，本文件只建节点与静态文案。
 
+use bevy::picking::Pickable;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::text::{Justify, LineBreak, TextLayout as BevyTextLayout};
 
+use super::color_picker::ColorPickerOpen;
 use super::consts::*;
 use super::model::{InputField, MenuNode};
 use crate::capture::MouseIntercept;
@@ -12,8 +15,8 @@ use crate::icon::Icon;
 use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::widgets::{
   DropdownConfig, LabelConfig, LabelOverflow, LabelStyle, SliderConfig, TextInputConfig,
-  TextInputKind, ToggleSwitchConfig, Tooltip, UiCtx, color_of, dropdown, label, px, slider,
-  spawn_icon, text_input, toggle_switch,
+  TextInputKind, ToggleSwitchConfig, Tooltip, UiCtx, UiDisabled, color_of, dropdown, label, px,
+  slider, spawn_icon, text_input, toggle_switch,
 };
 
 /// 菜单项在模型里的角色（决定 menu_system 如何读写值）
@@ -76,7 +79,10 @@ pub struct MenuColorSwatch {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct MenuPressPrev(pub UiInteract);
 
-/// 一行的通用外壳（宽 100%、高 `ITEM_H`、横向排列、无分割线）
+/// 一行的通用外壳（宽 100%、高 `ITEM_H`、横向排列、无分割线）。
+/// 行自身参与拾取（`Pickable` + `Hovered`）：悬停判定因而覆盖整行 —— 行上的 tooltip 才能
+/// 「悬停行内任意位置都出提示」，同时被上层浮窗（下拉列表 / 调色板）盖住时 `Hovered` 为 false，
+/// 提示不会隔着浮窗透出来（没有 `Hovered` 的节点会走几何判定，那条路看不见遮挡）。
 fn base_row<'a, 'w>(parent: &'a mut ChildSpawner<'w>, name: &str) -> EntityWorldMut<'a> {
   parent.spawn((
     Name::new(name.to_string()),
@@ -89,6 +95,8 @@ fn base_row<'a, 'w>(parent: &'a mut ChildSpawner<'w>, name: &str) -> EntityWorld
       ..default()
     },
     BackgroundColor(Color::NONE),
+    Hovered::default(),
+    Pickable::default(),
   ))
 }
 
@@ -489,26 +497,34 @@ fn color_row(
     );
     grow_in_row(r.world_mut(), ie);
     r.world_mut().entity_mut(ie).insert(MenuItem { path: path.to_string(), role: MenuRole::Color });
-    r.spawn((
-      Name::new("menu-color-swatch"),
-      MenuColorSwatch { path: path.to_string() },
-      Node {
-        width: px(RIGHT_COL_W),
-        height: px(CTRL_H),
-        border: UiRect::all(px(m.border_width)),
-        // 与左侧 HEX 输入框留出间距
-        margin: UiRect::left(px(m.spacing.sm)),
-        ..default()
-      },
-      BackgroundColor(
-        crate::parse_hex_color(hex)
-          .map_or(Color::NONE, |[r_, g, b, a]| Color::srgba_u8(r_, g, b, a)),
-      ),
-      BorderColor::all(color_of(&ctx.theme.colors.border)),
-    ));
-    // 禁用行：名称降亮（色块每帧由 `refresh_visuals` 按模型重写 ⇒ 那里也按禁用态降亮）
+    // 色块 = 调色板浮窗的锚点与开关（点击展开色板，选中格子写回上面的 HEX 输入框）
+    let swatch = r
+      .spawn((
+        Name::new("menu-color-swatch"),
+        MenuColorSwatch { path: path.to_string() },
+        ColorPickerOpen::default(),
+        UiInteractBundle::default(),
+        Node {
+          width: px(RIGHT_COL_W),
+          height: px(CTRL_H),
+          border: UiRect::all(px(m.border_width)),
+          // 与左侧 HEX 输入框留出间距
+          margin: UiRect::left(px(m.spacing.sm)),
+          ..default()
+        },
+        BackgroundColor(
+          crate::parse_hex_color(hex)
+            .map_or(Color::NONE, |[r_, g, b, a]| Color::srgba_u8(r_, g, b, a)),
+        ),
+        BorderColor::all(color_of(&ctx.theme.colors.border)),
+        MouseIntercept,
+      ))
+      .id();
+    // 禁用行：名称降亮（色块每帧由 `refresh_visuals` 按模型重写 ⇒ 那里也按禁用态降亮），
+    // 且不可展开色板
     if disabled {
       dim_text(r.world_mut(), name);
+      r.world_mut().entity_mut(swatch).insert(UiDisabled);
     }
   });
   row

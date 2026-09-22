@@ -2,11 +2,16 @@
 //! 用法：业务侧给 `MenuFile` 初始值并 spawn，用 `menu_model` 读回状态、`MenuActionEvent` 挂回调；交互驱动为 `menu_system`。
 //! 所有交互汇总成一个 `MenuActionEvent`（`path` = 节点 id 路径 + `MenuAction`），调用方按 path 分派，UI 重建无需重挂回调。
 
+pub mod color_picker;
 pub mod consts;
 pub mod items;
 pub mod model;
 pub mod window;
 
+pub use color_picker::{
+  ColorPickerBackdrop, ColorPickerCell, ColorPickerOpen, ColorPickerPopup, color_picker_system,
+  color_picker_visual_system, palette_color,
+};
 pub use items::{
   MenuColorSwatch, MenuItem, MenuOptionButton, MenuPressPrev, MenuRole, MenuSliderValue,
   MenuSubMenuRow, MenuTextValue, join_path,

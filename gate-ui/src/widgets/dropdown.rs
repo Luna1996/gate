@@ -206,7 +206,12 @@ fn ease_in_out(t: f32) -> f32 {
 }
 
 /// 锚点矩形（逻辑 px 左上角 + 尺寸）；`ComputedNode`/`UiGlobalTransform` 是物理 px，按 `scale_factor` 折算为逻辑 px。
-fn anchor_rect(node: &ComputedNode, xform: &UiGlobalTransform, scale_factor: f32) -> (Vec2, Vec2) {
+/// 浮层定位共用（下拉浮层 / 调色板浮窗）。
+pub(crate) fn anchor_rect(
+  node: &ComputedNode,
+  xform: &UiGlobalTransform,
+  scale_factor: f32,
+) -> (Vec2, Vec2) {
   let sf = scale_factor.max(f32::EPSILON);
   let size = node.size() / sf;
   (xform.translation / sf - size * 0.5, size)

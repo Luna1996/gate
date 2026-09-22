@@ -47,7 +47,7 @@ pub use scroll_view::{
   scroll_view_system,
 };
 pub use slider::{
-  SliderConfig, SliderHandle, SliderRange, SliderStep, SliderThumb, SliderValue,
+  SliderConfig, SliderDrag, SliderHandle, SliderRange, SliderStep, SliderThumb, SliderValue,
   SliderValueChanged, UiSlider, clamp_step, slider, slider_drag_system, slider_visual_system,
 };
 pub use splitter::{Splitter, splitter};

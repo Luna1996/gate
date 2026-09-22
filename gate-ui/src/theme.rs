@@ -463,6 +463,7 @@ impl Plugin for GateUiPlugin {
       .init_resource::<crate::icon::IconFont>()
       .init_resource::<crate::capture::UiPointerCaptured>()
       .init_resource::<crate::capture::MouseIntercepted>()
+      .init_resource::<crate::capture::UiShiftCaptured>()
       .init_resource::<crate::widgets::TextInputFocus>()
       .init_resource::<crate::widgets::TooltipLayerEntity>()
       .init_resource::<crate::i18n::UiTranslator>()
@@ -509,9 +510,19 @@ impl Plugin for GateUiPlugin {
             crate::widgets::tooltip_system,
           ),
           (
-            crate::i18n::i18n_refresh_system,
-            crate::capture::ui_pointer_capture_system,
-            crate::menu::menu_system,
+            // 调色板浮窗：交互（开/选/关）在前，视觉（跟随色块+选中框）在后；
+            // 必须早于 `menu_system`（选中的色是写进 HEX 输入框，由它那条链路落到模型并通知调用方）
+            (
+              crate::menu::color_picker_system,
+              crate::menu::color_picker_visual_system,
+            )
+              .chain()
+              .before(crate::menu::menu_system),
+            (
+              crate::i18n::i18n_refresh_system,
+              crate::capture::ui_pointer_capture_system,
+              crate::menu::menu_system,
+            ),
           ),
           (
             crate::world_anchor::world_anchor_apply_text.after(ui_theme_font_install_default),

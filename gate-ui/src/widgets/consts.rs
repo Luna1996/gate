@@ -28,6 +28,8 @@ pub const THUMB_SIZE: f32 = 16.0;
 pub const THUMB_SIZE_DRAG: f32 = 18.0;
 /// 滑杆轨道厚度（px）
 pub const TRACK_HEIGHT: f32 = 6.0;
+/// 滑杆精细档倍率（拖动中按住 Shift：光标位移对值的换算缩为它）
+pub const SLIDER_FINE_SCALE: f32 = 0.1;
 /// 开关轨道宽（px）
 pub const TRACK_W: f32 = 32.0;
 /// 开关轨道高（px）

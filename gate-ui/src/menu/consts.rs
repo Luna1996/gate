@@ -26,6 +26,12 @@ pub const BUTTON_GAP: f32 = 2.0;
 pub const TITLE_ICON_SIZE: f32 = 12.0;
 /// 窗口与屏幕边缘的最小距离（逻辑 px）
 pub const WINDOW_MARGIN: f32 = 8.0;
+/// 调色板方阵边长（格数；第 0 行灰阶，其余每行一个色相）
+pub const PALETTE_EDGE: usize = 16;
+/// 调色板格子边长（px，正方形）
+pub const PALETTE_CELL: f32 = 16.0;
+/// 调色板格子选中框 / 悬停框宽（px）
+pub const PALETTE_MARK_BORDER: f32 = 2.0;
 
 /// 窗口默认位置（逻辑 px，左上角锚定）
 pub const DEFAULT_WINDOW_POS: Vec2 = Vec2::new(8.0, 8.0);

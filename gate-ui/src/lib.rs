@@ -12,13 +12,17 @@ pub mod theme;
 pub mod widgets;
 pub mod world_anchor;
 
-pub use capture::{MouseIntercept, MouseIntercepted, UiPointerCaptured, ui_pointer_capture_system};
+pub use capture::{
+  MouseIntercept, MouseIntercepted, UiPointerCaptured, UiShiftCaptured, ui_pointer_capture_system,
+};
 pub use i18n::{I18nKey, UiTranslator, i18n_refresh_system};
 pub use icon::{Icon, IconFont};
 pub use menu::{
-  DebugMenu, DebugMenuHandle, DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile,
-  MenuItem, MenuNode, MenuRole, MenuTextValue, MenuValue, WindowState, menu_model, menu_selected,
-  menu_system, menu_text, menu_toggle, menu_value, rebuild_menu_page, spawn_debug_menu,
+  ColorPickerBackdrop, ColorPickerCell, ColorPickerOpen, ColorPickerPopup, DebugMenu,
+  DebugMenuHandle, DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuItem,
+  MenuNode, MenuRole, MenuTextValue, MenuValue, WindowState, color_picker_system,
+  color_picker_visual_system, menu_model, menu_selected, menu_system, menu_text, menu_toggle,
+  menu_value, palette_color, rebuild_menu_page, spawn_debug_menu,
 };
 pub use pointer::{UiInteract, UiInteractBundle, UiInteractPrev, UiInteractable};
 pub use world_anchor::{
