@@ -145,7 +145,7 @@ impl<'a> UiCtx<'a> {
 /// HexColor → Color（运行时构造的非法 hex 回退白色并 warn，不 panic）
 pub fn color_of(hc: &HexColor) -> Color {
   hc.to_color().unwrap_or_else(|| {
-    warn!("invalid hex color {:?} in runtime value, fallback white", hc.0);
+    warn!("invalid hex {:?} in runtime value → white", hc.0);
     Color::WHITE
   })
 }

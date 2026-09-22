@@ -3,7 +3,7 @@
 //! 仓库内字体 `assets/fonts/fa-solid-900.ttf`；码点须与字体版本一致。
 
 use bevy::asset::LoadState;
-use bevy::log::{info, warn};
+use bevy::log::{debug, warn};
 use bevy::prelude::*;
 use bevy::text::FontSource;
 use font_awesome::strs;
@@ -78,7 +78,7 @@ pub(crate) fn icon_font_load(
   }
   font.path = Some(path.clone());
   font.handle = Some(server.load::<Font>(path));
-  info!("ui icon font loading: {path}");
+  debug!("icon font → {path}");
 }
 
 /// 图标字体加载失败告警（一次）；成功则静默
@@ -95,6 +95,6 @@ pub(crate) fn icon_font_report(
   };
   if let LoadState::Failed(e) = server.load_state(handle.id()) {
     *reported = true;
-    warn!("ui icon font {:?} failed to load ({e}); icons will not render", font.path);
+    warn!("icon font {:?} load failed ({e}) → icons not rendered", font.path);
   }
 }

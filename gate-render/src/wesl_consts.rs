@@ -177,8 +177,8 @@ impl GiConsts {
     }
     info!(
       target: "gate",
-      "WESL 跨端常量（源 {}）：屏幕空间 reservoir {} word/像素；\
-       降噪：导引 {} word/像素、历史 {} word/像素（双缓冲）、atrous 迭代 {} 轮（核半径：质量档 {} / 快速档 {}）",
+      "WESL 跨端常量（源 {}）：屏幕空间 reservoir {} word/像素；降噪：导引 {} / 历史 {} word/像素（双缓冲）、\
+       atrous {} 轮（核半径 质量档 {} / 快速档 {}）",
       dir.display(),
       out.gi_res_words,
       out.gi_den_guide_words,
@@ -228,11 +228,10 @@ impl MaterialConsts {
     let asset_bytes = std::mem::size_of::<crate::brickmap::wire::MaterialAsset>() as u32;
     info!(
       target: "gate",
-      "WESL 跨端常量（源 {}）：材质资产表 {} 槽（全局一张表，所有 volume 共用；{} B/槽 = {} KB）；\
+      "WESL 跨端常量（源 {}）：材质资产表 {} 槽 × {asset_bytes}B = {} KB（全局一张表，所有 volume 共用）；\
        贴图槽位上限 {} 层",
       dir.display(),
       out.material_asset_slots,
-      asset_bytes,
       (out.material_asset_slots as u64 * asset_bytes as u64) / 1024,
       out.material_tex_slots,
     );

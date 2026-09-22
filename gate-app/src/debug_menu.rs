@@ -77,16 +77,16 @@ pub fn load_menu(config: &Config) -> MenuFile {
   let mut model = match std::fs::read_to_string(&path) {
     Ok(src) => match MenuFile::from_toml(&src) {
       Ok(m) => {
-        info!("debug menu layout loaded from {}", path.display());
+        debug!("debug menu ← {}", path.display());
         m
       }
       Err(e) => {
-        warn!("debug menu TOML 解析失败（{e}）；菜单为空");
+        warn!("debug menu TOML 解析失败 {e} → 菜单为空");
         MenuFile::default()
       }
     },
     Err(e) => {
-      warn!("debug menu TOML 缺失（{e}）；菜单为空");
+      warn!("debug menu TOML 缺失 {e} → 菜单为空");
       MenuFile::default()
     }
   };
@@ -96,7 +96,7 @@ pub fn load_menu(config: &Config) -> MenuFile {
   // 窗口位置 / 收起 / 停留路径只存在配置里
   model.window = config.window.clone();
   model.sanitize();
-  info!("debug menu 控件值：config 命中 {applied} / {} 项", config.menu.len());
+  info!("debug menu config 命中 {applied}/{}", config.menu.len());
   model
 }
 
@@ -171,7 +171,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
 pub(crate) fn sync_ui_locale(mut translator: ResMut<UiTranslator>, mut last: Local<String>) {
   let now = rust_i18n::locale().to_string();
   if now != *last {
-    info!("UI 语言 → {now}");
+    debug!("UI 语言 → {now}");
     *last = now;
     translator.bump();
   }
@@ -217,7 +217,7 @@ fn apply_initial_state(world: &mut World, root: Entity) {
   for (path, action) in actions {
     world.trigger(MenuActionEvent { entity: root, path, action });
   }
-  info!(target: "gate", "debug menu 初值已应用：{n} 项");
+  info!(target: "gate", "debug menu 初值 {n} 项");
 }
 
 /// 递归收集「带初值」的节点 → (id 路径, 动作)；`SubMenu` 只递归下去，`Buttons` / `Text` 无初值。
@@ -261,7 +261,7 @@ fn register_callbacks(world: &mut World) {
       // 只改除数，目标纹理由 responsive 系统下一帧重建；上采样在 blit 里做整数块复制（不插值）。
       if let ("video/scale", MenuAction::Select(i)) = (ev.path.as_str(), &ev.action) {
         scale.factor = gate_render::RenderScale::SCALE_CHOICES[(*i).min(3)];
-        info!("渲染分辨率 → 1/{}（渲染尺寸按窗口 ÷{} 取整分块，blit 整数块复制、不插值）", scale.factor, scale.factor);
+        info!("渲染分辨率 → 1/{}", scale.factor);
         return;
       }
       let MenuAction::Toggle(on) = ev.action else { return };
@@ -269,7 +269,7 @@ fn register_callbacks(world: &mut World) {
         "video/vsync" => {
           let Ok(mut win) = q_win.single_mut() else { return };
           win.present_mode = if on { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
-          info!("VSync {} → present_mode {:?}", if on { "on" } else { "off" }, win.present_mode);
+          info!("VSync → {:?}", win.present_mode);
         }
         "video/fps" => {
           fps.0 = on;
@@ -301,7 +301,7 @@ fn register_callbacks(world: &mut World) {
         // 抗锯齿：FXAA 在最终 blit 里做（换 fragment 入口，见 PostFxSettings）
         "video/aa" => {
           post.fxaa = on;
-          info!("抗锯齿（FXAA）→ {}", if on { "on" } else { "off" });
+          info!("抗锯齿 → {}", if on { "on" } else { "off" });
         }
         _ => {}
       }
@@ -322,11 +322,7 @@ fn register_callbacks(world: &mut World) {
         // 代价按 GI 像素数计 ⇒ 1/2 约是全分辨率的 1/4，1/4 再降 4 倍（GI 是低频信号，画质几乎无差）。
         ("render/gi/res", MenuAction::Select(i)) => {
           gi.gi_div = gate_render::gi::GiSettings::DIV_CHOICES[(*i).min(2)];
-          info!(
-            "GI 分辨率 → 渲染分辨率的 1/{}（GI 像素数为全分辨率的 1/{}）",
-            gi.gi_div,
-            gi.gi_div * gi.gi_div
-          );
+          info!("GI 分辨率 → 1/{}", gi.gi_div);
         }
         // 「降噪质量」档（**与分辨率档正交**：下面这些项目对所有分辨率档一视同仁）。
         // 每档只比上一档多一件事，成本单调递增。权威值都在 `gi/consts.wesl`，这里只选档；
@@ -345,10 +341,7 @@ fn register_callbacks(world: &mut World) {
             2 => ("中", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r),
             _ => ("高", c.gi_ss_cand_n_hq, c.gi_ss_m_cap_k_hq, c.gi_den_atrous_r),
           };
-          info!(
-            "GI 降噪质量 → {}（每像素候选 {} 条、记忆窗 {} 帧、atrous 核半径 {}；与分辨率档正交）",
-            name, cand, k, r
-          );
+          info!("GI 降噪质量 → {name} cand={cand} win={k} atrous_r={r}");
         }
         ("render/gi/sun_bounce", MenuAction::Toggle(on)) => {
           gi.sun_bounce = *on;
@@ -363,7 +356,7 @@ fn register_callbacks(world: &mut World) {
           let c = gate_render::wesl_consts::gi_consts();
           let base = if gi.tier() >= 3 { c.gi_ss_cand_n_hq } else { c.gi_ss_cand_n };
           info!(
-            "GI 分帧 → 每帧预算 ÷{}（基准候选 {} 条 ⇒ 实际每帧 {} 条，窗内样本数为基准值；帧时间恒定）",
+            "GI 分帧 → ÷{}（基准候选 {} ⇒ 每帧 {}）",
             gi.share,
             base,
             (base / gi.share).max(1)
@@ -381,7 +374,7 @@ fn register_callbacks(world: &mut World) {
             2 => ("中", 0.50, 2.00),
             _ => ("强", 0.25, 4.00),
           };
-          info!("GI 采样重分配 → {}（收敛像素 ×{}、刚脏像素 ×{}）", name, lo, hi);
+          info!("GI 采样重分配 → {name} 收敛×{lo} 脏×{hi}");
         }
         // 镜面档位（菜单「渲染/反射」）：**只改反射内容的着色口径**，不改逐面量化的粒度。
         // 档 0/1/2 都**不发额外射线**（1/2 只是把反射命中点按完整着色点算、逃逸天空改走 `sky_primary`）；
@@ -391,13 +384,13 @@ fn register_callbacks(world: &mut World) {
         ("render/refl/tier", MenuAction::Select(i)) => {
           let t = (*i).min((gate_render::ReflectionSettings::TIERS - 1) as usize) as u32;
           refl.tier = t;
-          let (name, cost) = match t {
+          let (name, _cost) = match t {
             0 => ("关", "不发反射射线（只有 F0·(amb+gi) 近似）"),
             1 => ("直射", "0 条额外射线：反射命中点带太阳直射 + 自发光"),
             2 => ("直射+天空", "0 条额外射线：镜像里再带上太阳盘 / 光晕"),
             _ => ("直射+天空+阴影", "每个触发像素 +1 次 DDA：反射命中点补太阳 NEE"),
           };
-          info!("镜面档位 → {t} {name}（{cost}）");
+          info!("镜面档位 → {t} {name}");
         }
         // 镜面嵌套层级（菜单「渲染/反射」）：允不允许"镜子里的镜子"再反射。
         // 取值是**枚举值**（`0 / 1 / 2 / 4`，不是档位号）⇒ 与 `GiSettings::DIV_CHOICES` 同一个手法。
@@ -405,10 +398,7 @@ fn register_callbacks(world: &mut World) {
         ("render/refl/nest", MenuAction::Select(i)) => {
           let n = gate_render::ReflectionSettings::NEST_CHOICES[(*i).min(3)];
           refl.nest = n;
-          info!(
-            "镜面嵌套 → {n} 层（最多 {} 条反射射线；遇到非镜面的面立刻断链）",
-            n + 1
-          );
+          info!("镜面嵌套 → {n} 层");
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;
@@ -436,52 +426,38 @@ fn register_callbacks(world: &mut World) {
       match (ev.path.as_str(), &ev.action) {
         ("render/sky/blur/enabled", MenuAction::Toggle(on)) => {
           fog.enabled = *on;
-          info!("光柱（godray）→ {}", if *on { "on" } else { "off" });
+          info!("光柱 → {}", if *on { "on" } else { "off" });
         }
         ("render/sky/blur/override", MenuAction::Toggle(on)) => {
           sky.override_blur = *on;
-          info!(
-            "径向模糊：覆写 → {}（{}）",
-            if *on { "on" } else { "off" },
-            if *on { "用面板值固定住" } else { "下面的滑杆转成只读（随时刻变化）" }
-          );
+          info!("径向模糊：覆写 → {}", if *on { "on" } else { "off" });
         }
         ("render/sky/blur/strength", MenuAction::Value(v)) => {
           fog.strength = v.max(0.0);
-          info!("光柱强度 → {v:.2}（这是「光柱有多亮」的主旋钮）");
+          info!("光柱强度 → {v:.2}");
         }
         ("render/sky/blur/decay", MenuAction::Value(v)) => {
           fog.decay = v.clamp(0.05, 1.0);
-          info!(
-            "光柱衰减 → {:.2}（模糊每步的权重：越接近 1 ⇒ 光柱拖得越长；越小 ⇒ 越贴紧太阳）",
-            fog.decay
-          );
+          info!("光柱衰减 → {:.2}", fog.decay);
         }
         ("render/sky/blur/focus", MenuAction::Value(v)) => {
           fog.focus = v.clamp(1.0, 64.0);
-          info!(
-            "光柱集中度 → {:.0}（太阳方向权重的指数：越大越集中在太阳附近；1 = 整个天空都发光）",
-            fog.focus
-          );
+          info!("光柱集中度 → {:.0}", fog.focus);
         }
         ("render/sky/disk/override", MenuAction::Toggle(on)) => {
           sky.override_disk = *on;
-          info!(
-            "天体盘：覆写 → {}（{}）",
-            if *on { "on" } else { "off" },
-            if *on { "用面板值固定住" } else { "下面的滑杆转成只读（随时刻变化）" }
-          );
+          info!("天体盘：覆写 → {}", if *on { "on" } else { "off" });
         }
         // 菜单给**度**、引擎吃弧度：全工程只有这一处换算，集中在这里。
         // 这一个量只影响天空里那个天体盘的半径（`volumetric.wesl::sky_primary`），日月共用；
         // 它同时决定盘外光晕的尺度（晕铺到角径的 10 倍）。
         ("render/sky/disk/radius", MenuAction::Value(v)) => {
           fog.sun_cone = v.to_radians();
-          info!("天体盘：角径 → {v:.2}°（天空里那个盘的半径，日月共用；0 = 只有一个点）");
+          info!("天体盘：角径 → {v:.2}°");
         }
         ("render/sky/disk/halo", MenuAction::Value(v)) => {
           fog.halo = *v;
-          info!("天体盘：光晕 → {v:.1}（盘外那圈解析拖尾的强度；随角径一起缩放）");
+          info!("天体盘：光晕 → {v:.1}");
         }
         _ => {}
       }
@@ -495,23 +471,23 @@ fn register_callbacks(world: &mut World) {
     match (ev.path.as_str(), &ev.action) {
       ("render/sky/time/hour", MenuAction::Value(v)) => {
         sky.hour = v.rem_euclid(24.0);
-        info!("天象：时刻 → {:.2}h（{}）", sky.hour, sky_report(&sky));
+        info!("天象：时刻 → {:.2}h {}", sky.hour, sky_report(&sky));
       }
       ("render/sky/time/date", MenuAction::Value(v)) => {
         sky.day_of_year = *v;
-        info!("天象：年积日 → {:.0}（{}）", sky.day_of_year, sky_report(&sky));
+        info!("天象：年积日 → {:.0} {}", sky.day_of_year, sky_report(&sky));
       }
       ("render/sky/time/lat", MenuAction::Value(v)) => {
         sky.latitude_deg = v.clamp(-90.0, 90.0);
-        info!("天象：纬度 → {:.1}°（{}）", sky.latitude_deg, sky_report(&sky));
+        info!("天象：纬度 → {:.1}° {}", sky.latitude_deg, sky_report(&sky));
       }
       ("render/sky/time/auto", MenuAction::Toggle(on)) => {
         sky.auto = *on;
-        info!("自动流逝 → {}（{}）", if *on { "on" } else { "off" }, day_cycle(sky.hours_per_sec));
+        info!("自动流逝 → {} {}", if *on { "on" } else { "off" }, day_cycle(sky.hours_per_sec));
       }
       ("render/sky/time/speed", MenuAction::Value(v)) => {
         sky.hours_per_sec = v.max(0.0);
-        info!("流逝速度 → {v:.2} 游戏小时/秒（{}）", day_cycle(sky.hours_per_sec));
+        info!("流逝速度 → {v:.2} 游戏小时/秒 {}", day_cycle(sky.hours_per_sec));
       }
       _ => {}
     }
@@ -525,16 +501,12 @@ fn register_callbacks(world: &mut World) {
     |ev: On<MenuActionEvent>, mut sky: ResMut<gate_render::SkySettings>| {
       if let ("render/sky/color/override", MenuAction::Toggle(on)) = (ev.path.as_str(), &ev.action) {
         sky.override_colors = *on;
-        info!(
-          "颜色：覆写 → {}（{}）",
-          if *on { "on" } else { "off" },
-          if *on { "用面板的太阳/月亮/天空色" } else { "三个色转成只读（随时刻变化）" }
-        );
+        info!("颜色：覆写 → {}", if *on { "on" } else { "off" });
         return;
       }
       let MenuAction::Text(hex) = &ev.action else { return };
       let Some(c) = hex_srgb01(hex) else {
-        debug!(target: "gate", "天象颜色输入未成形 → {hex:?}（忽略）");
+        debug!(target: "gate", "颜色输入未成形 {hex:?} → 忽略");
         return;
       };
       let name = match ev.path.as_str() {
@@ -563,11 +535,10 @@ fn register_callbacks(world: &mut World) {
     ) {
       ("player/camera/mode", MenuAction::Select(i)) => {
         *mode = if *i == 0 { CameraMode::Orbit } else { CameraMode::Fly };
-        info!("相机模式 → {:?}", *mode);
       }
       ("player/camera/speed", MenuAction::Value(v)) => {
         fly.speed = *v * VOXEL_PER_METER;
-        info!("飞行速度 → {:.2} m/s（{:.0} v/s）", v, fly.speed);
+        info!("飞行速度 → {:.2} m/s {:.0} v/s", v, fly.speed);
       }
       _ => {}
     },
@@ -594,9 +565,7 @@ fn register_callbacks(world: &mut World) {
             // **大小变了 ⇒ 偏移距离自动跟到"大小的一半"**（仍可自由输入，见 `write_brush_offset`）
             let auto = edit.size as f32;
             write_brush_offset(&mut edit, auto, &mut q_offsets);
-            // 跨度 = 2·size-1（saturating 防日志侧溢出）
-            let span = edit.size.saturating_mul(2).saturating_sub(1);
-            info!("笔触大小 → {} vx（跨度 {}；偏移距离自动 → {:.1}）", edit.size, span, auto);
+            info!("笔触大小 → {} vx；偏移距离自动 → {:.1}", edit.size, auto);
           }
         }
         // 偏移距离：笔触几何中心相对命中体素的法线方向偏移（放置 `+`、摧毁 `−`）。
@@ -604,9 +573,9 @@ fn register_callbacks(world: &mut World) {
         ("game/edit/brush/offset", MenuAction::Text(t)) => match t.trim().parse::<f32>() {
           Ok(v) => {
             edit.offset = v.max(0.0);
-            info!("笔触偏移距离 → {:.1} vx（放置沿法线外推、摧毁沿法线内挖）", edit.offset);
+            info!("笔触偏移距离 → {:.1} vx", edit.offset);
           }
-          Err(_) => debug!(target: "gate", "偏移距离输入未成形 → {t:?}（忽略）"),
+          Err(_) => debug!(target: "gate", "偏移距离未成形 {t:?} → 忽略"),
         },
         ("game/edit/mat/color", MenuAction::Text(t)) => match parse_hex_color(t) {
           Some([r, g, b, _]) => {
@@ -614,7 +583,7 @@ fn register_callbacks(world: &mut World) {
             log_material(&edit.mat);
           }
           // 输入框是自由文本：解析失败（半截输入）就忽略，不打断输入
-          None => debug!(target: "gate", "笔触颜色输入未成形 → {t:?}（忽略）"),
+          None => debug!(target: "gate", "笔触颜色未成形 {t:?} → 忽略"),
         },
         // 下面这七个材质控件只在**平凡变体**下生效：PBR 变体一开就整行置灰、不写进材质
         // （见 `sync_edit_menu`）。它们改的是笔触的平凡参数，切回平凡变体时原样还在。
@@ -635,8 +604,8 @@ fn register_callbacks(world: &mut World) {
           edit.mat.pbr = *on;
           info!(
             target: "gate",
-            "材质 → 变体切到 {}（IS_PBR）；{}",
-            if *on { "PBR（参数全由资产/贴图决定，材质控件置灰）" } else { "平凡（逐槽独立参数）" },
+            "材质变体 → {}；{}",
+            if *on { "PBR" } else { "平凡" },
             edit.mat.summary(),
           );
         }
@@ -652,7 +621,7 @@ fn register_callbacks(world: &mut World) {
           edit.mat.asset_slot = slot;
           info!(
             target: "gate",
-            "材质 → PBR 资产槽 {slot} = {name}（{how}）；{}",
+            "材质 → PBR 资产槽 {slot}={name} {how}；{}",
             edit.mat.summary(),
           );
         }
@@ -681,25 +650,17 @@ fn register_callbacks(world: &mut World) {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
           let name = menu_world_model(&q_menu).unwrap_or_else(|| "?".to_string());
-          info!("世界模型 → {name}（点「重载世界」生效）");
+          info!("世界模型 → {name}");
         }
         (WORLD_RELOAD_PATH, MenuAction::Button(_)) => {
           let Some(name) = menu_world_model(&q_menu) else {
-            warn!("重载世界：读不到模型下拉的选择（菜单未就绪），已忽略");
+            warn!("重载世界：读不到模型选择（菜单未就绪）→ 忽略");
             return;
           };
           let t0 = std::time::Instant::now();
           match crate::scene::reload_world(&mut scene, &name) {
-            Ok(info) => info!(
-              "世界已重载：{name}.vox instances={} written={} dropped={} aabb=[{}]-[{}] ({:?})",
-              info.instances_used,
-              info.voxels_written,
-              info.voxels_dropped,
-              info.aabb_min,
-              info.aabb_max,
-              t0.elapsed(),
-            ),
-            Err(e) => warn!("重载世界失败（{name}.vox）：{e}（保持原世界不变）"),
+            Ok(_info) => info!("世界重载 → {name}.vox {:?}", t0.elapsed()),
+            Err(e) => warn!("重载世界失败 {name}.vox：{e} → 原世界不变"),
           }
         }
         _ => {}
@@ -742,10 +703,7 @@ fn log_material(mat: &BrushMaterial) {
 fn sky_report(sky: &gate_render::SkySettings) -> String {
   let alt = gate_render::sun_altitude_deg(sky.hour, sky.day_of_year, sky.latitude_deg);
   format!(
-    "时刻 {:.2}h、年积日 {:.0}、纬度 {:.1}° ⇒ 太阳高度角 {alt:.1}°、主光 = {}",
-    sky.hour,
-    sky.day_of_year,
-    sky.latitude_deg,
+    "太阳高度角 {alt:.1}°、主光 = {}",
     if alt >= 0.0 { "太阳" } else { "反日点的月亮" }
   )
 }

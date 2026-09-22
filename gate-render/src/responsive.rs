@@ -31,7 +31,7 @@ pub fn resize_render_targets(
   if !size_is_sane(full) {
     if !*warned {
       warn!(
-        "degenerate window size {}x{}, resize skipped (keep {}x{})",
+        "degenerate window size {}x{} ⇒ resize skipped (keep {}x{})",
         full.x, full.y, scale.size.x, scale.size.y
       );
       *warned = true;
@@ -44,7 +44,7 @@ pub fn resize_render_targets(
   if new_size == scale.size {
     return;
   }
-  info!(
+  debug!(
     "render targets resized: {}x{} (window {}x{}, factor {})",
     new_size.x, new_size.y, full.x, full.y, scale.factor
   );

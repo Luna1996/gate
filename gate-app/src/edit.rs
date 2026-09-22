@@ -152,7 +152,7 @@ impl BrushMaterial {
         self.metallic
       );
     }
-    format!("PBR 变体 asset={}（参数全部来自资产与贴图，无槽级覆盖）", self.asset_slot)
+    format!("PBR 变体 asset={}", self.asset_slot)
   }
 }
 
@@ -237,7 +237,7 @@ fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   let slot = match free {
     Some(s) => s,
     None => {
-      bevy::log::warn!("编辑材质找不到空调色板槽，复用 {PALETTE_INDEX_MAX}（会覆盖该槽原有材质）");
+      bevy::log::warn!("编辑材质无空调色板槽 → 复用 {PALETTE_INDEX_MAX}（覆盖该槽原材质）");
       PaletteId(PALETTE_INDEX_MAX)
     }
   };
@@ -513,9 +513,8 @@ fn brush_displace_source<'a>(
   }
   if size > EDIT_DISPLACE_SIZE_MAX {
     bevy::log::warn!(
-      "笔触位移跳过：size={size} 超过上限 {EDIT_DISPLACE_SIZE_MAX} vx（位移壳层逐体素、代价 ≈ O(size²)，\
-       大笔触同步落笔会卡界面）⇒ 本笔触按**普通填充**落下（无凹凸）；要凹凸请把 size 调到 ≤ \
-       {EDIT_DISPLACE_SIZE_MAX}（上限见 consts::EDIT_DISPLACE_SIZE_MAX）"
+      "笔触位移跳过：size={size} > 上限 {EDIT_DISPLACE_SIZE_MAX} vx（位移壳层逐体素 ≈ O(size²)）\
+       ⇒ 普通填充，无凹凸"
     );
     return (None, format!("未位移（size {size} > 上限 {EDIT_DISPLACE_SIZE_MAX}）"));
   }
@@ -655,7 +654,7 @@ pub(crate) fn voxel_edit_input(
   let elapsed = t0.elapsed();
   if run.voxels > 0 {
     bevy::log::info!(
-      "EDIT[{}]: {} voxel(s) @ ({},{},{}) shape={:?} size={} offset={} slot={} material={} | displacement: {}{} | 耗时 {:?}",
+      "EDIT[{}] {}vx @({},{},{}) shape={:?} size={} offset={} slot={} material={} | {}{} | {:?}",
       if erase { "erase" } else { "place" },
       run.voxels,
       center.x,
@@ -693,13 +692,13 @@ pub(crate) fn edit_selftest(
   let Some(mut scene) = scene else { return };
   let dir = (orbit.target - orbit.eye()).normalize_or_zero();
   if dir.length_squared() < 1e-12 {
-    bevy::log::warn!("EDIT SELFTEST: 相机朝向退化，跳过");
+    bevy::log::warn!("EDIT SELFTEST: 相机朝向退化 → 跳过");
     return;
   }
   let (shape, size) = (settings.shape, settings.size);
   let grid = scene.volumes.main_mut();
   let Some((hit, face, t)) = raycast_main(grid, orbit.eye(), dir, EDIT_REACH) else {
-    bevy::log::warn!("EDIT SELFTEST: 射线未命中（{EDIT_REACH} 内无体素），跳过");
+    bevy::log::warn!("EDIT SELFTEST: 射线未命中（{EDIT_REACH} 内无体素）→ 跳过");
     return;
   };
   let slot = material_slot(grid, settings.mat);
@@ -710,7 +709,7 @@ pub(crate) fn edit_selftest(
     run_brush(grid, center, shape, size, slot, pbr_set.as_deref(), Some(&mut displace_cache));
   let elapsed = t0.elapsed();
   bevy::log::info!(
-    "EDIT SELFTEST（第 {nth} 笔）: hit=({},{},{}) t={t:.1} → {} voxel(s) @ ({},{},{}) shape={:?} size={size} slot={slot} material={} | displacement: {}{} | 耗时 {:?}",
+    "EDIT SELFTEST 第{nth}笔 hit=({},{},{}) t={t:.1} → {}vx @({},{},{}) shape={:?} size={size} slot={slot} material={} | {}{} | {:?}",
     hit.x,
     hit.y,
     hit.z,

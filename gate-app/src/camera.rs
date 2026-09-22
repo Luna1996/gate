@@ -200,8 +200,8 @@ pub(crate) fn fly_camera_input(
   // Control 切换低速/高速档（just_pressed = 按一下切一次）
   if keys.just_pressed(KeyCode::ControlLeft) || keys.just_pressed(KeyCode::ControlRight) {
     fly.fast = !fly.fast;
-    bevy::log::info!(
-      "FLY SPEED MODE → {} ({:.0} v/s)",
+    bevy::log::debug!(
+      "FLY 速度档 → {} {:.0} v/s",
       if fly.fast { "fast" } else { "slow" },
       fly.effective_speed(),
     );
@@ -255,7 +255,7 @@ pub(crate) fn sync_camera_mode_switch(
     }
   }
   bevy::log::info!(
-    "CAMERA MODE → {:?} (eye=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2})",
+    "相机模式 → {:?} eye=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2}",
     *mode,
     fly.pos.x,
     fly.pos.y,
@@ -368,8 +368,8 @@ pub(crate) fn left_click_pick_recenter(
     let half = 0.5;
     p += hit.normal * half; // 沿入面法线推进命中体素内 0.5 voxel
     orbit.target = p;
-    bevy::log::info!(
-      "PICK → target=({:.1},{:.1},{:.1})  t={:.1}  pal={}  obj_id={}",
+    bevy::log::debug!(
+      "PICK → target=({:.1},{:.1},{:.1}) t={:.1} pal={} obj_id={}",
       p.x,
       p.y,
       p.z,

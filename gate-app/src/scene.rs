@@ -37,7 +37,7 @@ pub(crate) fn setup(
     .map_err(|e| format!("read: {e}"))
     .and_then(|s| gate_render::parse_lighting_ron(&s).map_err(|e| format!("ron: {e}")))
     .unwrap_or_else(|e| {
-      bevy::log::warn!("lighting/day_outdoor.ron 加载失败（{e}），回退内置默认主题");
+      bevy::log::warn!("lighting/day_outdoor.ron 加载失败 {e} → 回退内置默认主题");
       Default::default()
     });
   commands.insert_resource(theme);
@@ -51,9 +51,9 @@ pub(crate) fn setup(
   let mut cam_target = Vec3::new(0., 0., 0.);
   if STARTUP_DEMO_SCENE {
     paint_demo_palette(&mut grid);
-    bevy::log::info!("STEP 1: palette done ({:?})", t0.elapsed());
+    bevy::log::info!("STEP 1 palette {:?}", t0.elapsed());
     build_demo_scene(&mut grid);
-    bevy::log::info!("STEP 2: build_demo_scene done ({:?})", t0.elapsed());
+    bevy::log::info!("STEP 2 build_demo_scene {:?}", t0.elapsed());
   } else {
     let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
     // 启动世界 = 「游戏/世界」页模型下拉的最终选中项（结构来自资产、选中项来自配置；读不到 → nuke）
@@ -65,17 +65,17 @@ pub(crate) fn setup(
     cam_eye = Vec3::new(406.5, 339.5, 431.5);
     cam_target = Vec3::new(551.5, 330.5, 359.5);
     bevy::log::info!(
-      "VOX SCENE {name}: instances={} written={} dropped={} aabb=[{}]-[{}]",
+      "STEP 2 vox scene {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
       info.instances_used,
       info.voxels_written,
       info.voxels_dropped,
       info.aabb_min,
       info.aabb_max,
+      t0.elapsed(),
     );
-    bevy::log::info!("STEP 2: vox scene done ({:?})", t0.elapsed());
   }
   grid.compact_all(); // GC：回收编辑过程累积的废弃节点
-  bevy::log::info!("STEP 3: compact_all done ({:?})", t0.elapsed());
+  bevy::log::info!("STEP 3 compact_all {:?}", t0.elapsed());
 
   // 轨道相机为唯一相机状态源，DdaCameraConfig 由 `from_orbit` 生成（初始机位 = 场景中心俯视）。
   let orbit = if START_CAMERA_SKY {
@@ -115,17 +115,17 @@ pub(crate) fn setup(
     let total_words: usize = words_per_chunk.iter().map(|(w, _)| *w).sum();
     words_per_chunk.sort_unstable_by_key(|(w, _)| std::cmp::Reverse(*w));
     bevy::log::info!(
-      "TREE SIZE: total={}MB chunks={} top3={:?}",
+      "TREE {}MB chunks={} top3={:?}",
       total_words * 4 / 1024 / 1024,
       words_per_chunk.len(),
       &words_per_chunk[..3.min(words_per_chunk.len())],
     );
     let bufs = BrickMapBuilder::build_full(&grid).buffers().clone();
-    bevy::log::info!("STEP 4: diag build_full done ({:?})", t1.elapsed());
+    bevy::log::info!("STEP 4 diag build_full {:?}", t1.elapsed());
     let g = &bufs.globals;
     let n_chunks = grid.chunk_coords().count();
     bevy::log::info!(
-      "BRICKMAP DIAG: chunks={} origin=({},{},{}) dims=({},{},{})  AABB=[{},{},{}]-[{},{},{}]",
+      "BRICKMAP chunks={} origin=({},{},{}) dims=({},{},{}) AABB=[{},{},{}]-[{},{},{}]",
       n_chunks,
       g.index_origin_x,
       g.index_origin_y,
@@ -240,7 +240,7 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
   let t0 = std::time::Instant::now();
   macro_rules! mark {
     ($name:expr) => {
-      bevy::log::info!("SCENE {}: {:?} chunks={}", $name, t0.elapsed(), grid.chunk_count())
+      bevy::log::info!("SCENE {} {:?} chunks={}", $name, t0.elapsed(), grid.chunk_count())
     };
   }
   // (1) 基础地形：按 16 voxel (L0) 步长采样高度场 → fill_box 铺柱（y=16..h 用 pal 2，h>560 顶部改 pal 3）
@@ -435,9 +435,8 @@ fn build_displace_sample(grid: &mut VolumeGrid) {
       let n = fill_box(grid, bumped, extent, 4);
       bevy::log::warn!(
         target: "gate",
-        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 的位移幅度 = 0 ⇒ 右台**不位移**\
-         （退化为普通 CSG，写入 {n} 体素）；要出凹凸就把 gate-render/src/pbr_texture.rs 的 \
-         `DISPLACE_DEMO_AMPLITUDE`（该材质的资产默认值）改成非 0"
+        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 幅度 = 0（资产值）⇒ 右台不位移\
+         （普通 CSG，写入 {n} 体素）"
       );
       return;
     }
@@ -446,7 +445,7 @@ fn build_displace_sample(grid: &mut VolumeGrid) {
       let n = fill_box(grid, bumped, extent, 4);
       bevy::log::warn!(
         target: "gate",
-        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 的高度图不可用（{e}）⇒ 右台退化为普通 CSG\
+        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 高度图不可用（{e}）⇒ 右台普通 CSG\
          （写入 {n} 体素）；放回 assets/textures/pbr/{DEMO_DISPLACE_HEIGHT_MAP}/\
          {DEMO_DISPLACE_HEIGHT_MAP}_height.png 即恢复"
       );
@@ -463,11 +462,9 @@ fn build_displace_sample(grid: &mut VolumeGrid) {
   let size = sample.field().size();
   bevy::log::info!(
     target: "gate",
-    "MT6/MT8-5 位移样例: 基准台 @{plain} +{extent}（普通 CSG，写入 {base_voxels} 体素）| \
-     位移台 @{bumped} +{extent}（高度图 {DEMO_DISPLACE_HEIGHT_MAP} {w}×{h} texel，取值 {lo:.3}..{hi:.3}；\
-     幅度 {} 体素（**来自材质资产**，峰-峰，偏置双向 ±{bound}）、一张铺 {DEMO_DISPLACE_TEX_SCALE} 体素）\
-     ⇒ 写入 {} 体素（其中整块写 {} 块 = {} 体素，壳层逐体素 {} 格），耗时 {:?}；\
-     关掉这个样例：consts::DEMO_DISPLACE_SAMPLE",
+    "MT6/MT8-5 位移样例 基准台 @{plain}+{extent} 普通 CSG {base_voxels} 体素 | \
+     位移台 @{bumped}+{extent} 高度图 {DEMO_DISPLACE_HEIGHT_MAP} {w}×{h} texel {lo:.3}..{hi:.3} \
+     幅度 {} 体素 ±{bound} 铺 {DEMO_DISPLACE_TEX_SCALE} 体素 ⇒ {} 体素 整块 {}={} 壳层 {} {:?}",
     sample.amplitude(),
     st.voxels,
     st.whole_bricks,
@@ -491,10 +488,8 @@ fn log_sample_camera(plain: IVec3, extent: IVec3) {
   let orbit = OrbitCamera::from_eye(eye, target);
   bevy::log::info!(
     target: "gate",
-    "MT6 位移样例机位（粘进 data/config.toml 的 [camera] 节）: \
-     mode = \"Fly\", eye = [{:.1}, {:.1}, {:.1}], yaw = {:.4}, pitch = {:.4}, distance = {:.1}；\
-     画面里的两座石台：@[{}, {}, {}] +{extent} = **普通 CSG**（位移关闭），\
-     @[{}, {}, {}] +{extent} = **位移版**（关注凹凸是否一格一格错开、凹槽是否被 GI 照暗）",
+    "MT6 样例机位：mode=\"Fly\" eye=[{:.1},{:.1},{:.1}] yaw={:.4} pitch={:.4} distance={:.1}；\
+     普通 CSG @[{},{},{}]+{extent}，位移版 @[{},{},{}]+{extent}",
     eye.x,
     eye.y,
     eye.z,

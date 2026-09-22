@@ -39,21 +39,21 @@ impl Config {
     let src = match std::fs::read_to_string(&path) {
       Ok(s) => s,
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-        info!("config 不存在（{}），使用缺省", path.display());
+        info!("config 无 {} → 缺省", path.display());
         return Self::default();
       }
       Err(e) => {
-        warn!("config 读取失败（{e}）；使用缺省");
+        warn!("config 读取失败 {e} → 缺省");
         return Self::default();
       }
     };
     match toml::from_str::<Self>(&src) {
       Ok(c) => {
-        info!("config loaded from {}", path.display());
+        debug!("config ← {}", path.display());
         c
       }
       Err(e) => {
-        warn!("config 解析失败（{e}）；使用缺省");
+        warn!("config 解析失败 {e} → 缺省");
         Self::default()
       }
     }
@@ -63,18 +63,18 @@ impl Config {
   pub fn save(&self) {
     let path = path();
     let Ok(src) = toml::to_string_pretty(self) else {
-      warn!("config 序列化失败；未保存");
+      warn!("config 序列化失败 → 未保存");
       return;
     };
     if let Some(dir) = path.parent()
       && let Err(e) = std::fs::create_dir_all(dir)
     {
-      warn!("config 目录创建失败（{e}）；未保存");
+      warn!("config 目录创建失败 {e} → 未保存");
       return;
     }
     match std::fs::write(&path, src) {
-      Ok(()) => info!("config saved to {}", path.display()),
-      Err(e) => warn!("config 写入失败（{e}）"),
+      Ok(()) => debug!("config → {}", path.display()),
+      Err(e) => warn!("config 写入失败 {e}"),
     }
   }
 }

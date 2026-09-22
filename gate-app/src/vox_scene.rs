@@ -27,7 +27,7 @@ pub struct VoxSceneInfo {
 pub fn scan_vox_models() -> Vec<String> {
   let dir = gate_render::assets_dir().join("vox");
   let Ok(entries) = std::fs::read_dir(&dir) else {
-    bevy::log::warn!("vox 目录不可读（{}），模型下拉回退到 nuke", dir.display());
+    bevy::log::warn!("vox 目录不可读（{}）→ 模型下拉回退 nuke", dir.display());
     return vec!["nuke".to_string()];
   };
   let mut names: Vec<String> = entries
@@ -45,7 +45,7 @@ pub fn scan_vox_models() -> Vec<String> {
   names.dedup();
   if names.is_empty() {
     // 空目录 → 保留默认项，让 UI 有名字可选
-    bevy::log::warn!("vox 目录下没有 .vox 文件（{}），模型下拉回退到 nuke", dir.display());
+    bevy::log::warn!("vox 目录无 .vox 文件（{}）→ 模型下拉回退 nuke", dir.display());
     return vec!["nuke".to_string()];
   }
   names
@@ -63,7 +63,7 @@ pub fn load_vox_scene(
   let mut reader = BufReader::new(file);
   let scene = vox_rs::Scene::read(&mut reader)?;
   bevy::log::info!(
-    "VOX LOAD: {} ver={} models={} instances={} ({:?})",
+    "VOX LOAD {} ver={} models={} instances={} {:?}",
     path.display(),
     scene.file_version,
     scene.models.len(),
@@ -164,7 +164,7 @@ pub fn load_vox_scene(
     grid.mount_chunk_tree(cc, tree, applied);
   }
   bevy::log::info!(
-    "VOX BUILD: written={written} dropped={dropped} aabb=[{}]-[{}] ({:?})",
+    "VOX BUILD written={written} dropped={dropped} aabb=[{}]-[{}] {:?}",
     lo + offset,
     hi + offset,
     t1.elapsed(),
@@ -195,17 +195,13 @@ fn paint_vox_palette(grid: &mut VolumeGrid, scene: &vox_rs::Scene, used_pal: &[b
   // 材质统计
   let em: Vec<u16> = (1..=255u16).filter(|&i| pal.get(PaletteId(i)).emissive > 0).collect();
   bevy::log::info!(
-    "VOX MATERIAL: {} emissive palette indices = {:?}（引用 {} 个色号，本 volume 余 {} 个空槽留给编辑材质）",
+    "VOX MATERIAL emissive={} {:?} 引用色号={} 空槽={}",
     em.len(),
     em,
     painted,
     PALETTE_INDEX_MAX as usize - painted
   );
-  bevy::log::info!(
-    "VOX MATERIAL 映射（MT7-2）：MATL 的 `_rough` → roughness、`_emit` → emissive、`_metal` → metallic\
-     （`_ior` / `_spec` 在平凡变体里无字段、`_trans` / `_alpha` 的方向在格式里无权威定义 ⇒ 都**不映射**）；\
-     可选 PBR 资产映射 VOX_PBR_ASSET = {VOX_PBR_ASSET:?}（None = 保持平凡变体：`.vox` 里没有贴图/资产线索）"
-  );
+  bevy::log::info!("VOX MATL 映射 _rough→roughness _emit→emissive _metal→metallic PBR_ASSET={VOX_PBR_ASSET:?}");
 }
 
 /// **`.vox` 导入的可选 PBR 资产映射（MT7-2 的明确默认策略）**：`Some(asset)` 时，

@@ -4,7 +4,7 @@
 
 use crate::theme::ThemeFont;
 use bevy::asset::{AssetServer, LoadState};
-use bevy::log::info;
+use bevy::log::debug;
 use bevy::prelude::*;
 use bevy::text::{FontSize, FontSource, TextColor};
 use bevy::ui::widget::Label;
@@ -201,6 +201,6 @@ pub fn world_anchor_apply_text(
     count += 1;
   }
   if count > 0 {
-    info!("world_anchor: applied text for {count} anchors (font_source ready)");
+    debug!("world_anchor text → {count}");
   }
 }

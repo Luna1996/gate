@@ -463,14 +463,14 @@ fn start_pbr_texture_load(asset_server: Res<AssetServer>, mut load: ResMut<PbrLo
     Err(e) => {
       warn!(
         target: "gate",
-        "PBR 贴图集: 扫描 {} 失败（{e}）⇒ 不加载任何材质，材质回落纯色（不 panic）",
+        "PBR 贴图集! 扫描 {} 失败（{e}）⇒ 不加载，材质回落纯色",
         root.display()
       );
       return;
     }
   };
   if ids.is_empty() {
-    warn!(target: "gate", "PBR 贴图集: {} 下没有可用的材质目录 ⇒ 不加载，材质回落纯色", root.display());
+    warn!(target: "gate", "PBR 贴图集! {} 无材质目录 ⇒ 不加载，材质回落纯色", root.display());
     return;
   }
   // 层数上限来自 WESL（`MATERIAL_TEX_SLOTS`）：超了就按字典序截断并 warn（截断是整表一致的，
@@ -478,8 +478,8 @@ fn start_pbr_texture_load(asset_server: Res<AssetServer>, mut load: ResMut<PbrLo
   let ids: Vec<String> = if ids.len() as u32 > tex_slots {
     warn!(
       target: "gate",
-      "PBR 贴图集: 目录里有 {} 个材质，超过 WESL 的 MATERIAL_TEX_SLOTS = {tex_slots}（texture_2d_array 层数上限）\
-       ⇒ 只加载按字典序的前 {tex_slots} 个；要全都加载请上调 common.wesl 的 MATERIAL_TEX_SLOTS",
+      "PBR 贴图集! {} 个材质 > MATERIAL_TEX_SLOTS = {tex_slots}（texture_2d_array 层数上限）\
+       ⇒ 只取字典序前 {tex_slots} 个；全量需上调 common.wesl 的 MATERIAL_TEX_SLOTS",
       ids.len()
     );
     ids.into_iter().take(tex_slots as usize).collect()
@@ -497,12 +497,6 @@ fn start_pbr_texture_load(asset_server: Res<AssetServer>, mut load: ResMut<PbrLo
       roughmetal: load_jpg(&asset_server, &roughmetal_path, false),
     });
   }
-  info!(
-    target: "gate",
-    "PBR 贴图集: 发出 {} 个材质的加载请求（{} 张 jpg），等就绪后打包成 texture_2d_array",
-    ids.len(),
-    ids.len() * 2,
-  );
   // MT2-4 的调试通道提示：放在**加载请求发出后、贴图集构建前** —— 即使后面构建失败（GpuImage 缺失等），
   // "调试开关是开着的"这一行也仍然在日志里（那种情况下它最该被看见）。槽号映射用这里的 `ids`。
   log_pbr_debug_channel(&ids);
@@ -522,7 +516,7 @@ fn scan_material_dirs(root: &Path) -> std::io::Result<Vec<String>> {
     }
     // 非 UTF-8 目录名无法进 id 表（槽号契约以目录名标识），跳过。
     let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-      warn!(target: "gate", "PBR 贴图集: 目录 {:?} 名不是 UTF-8 ⇒ 跳过", entry.file_name());
+      warn!(target: "gate", "PBR 贴图集! 目录 {:?} 名非 UTF-8 ⇒ 跳过", entry.file_name());
       continue;
     };
     let albedo = entry.path().join(format!("{id}{ALBEDO_SUFFIX}"));
@@ -530,7 +524,7 @@ fn scan_material_dirs(root: &Path) -> std::io::Result<Vec<String>> {
     if !albedo.is_file() || !roughmetal.is_file() {
       warn!(
         target: "gate",
-        "PBR 贴图集: 材质 `{id}` 缺文件（{} 或 {}）⇒ 跳过该材质，后续材质槽号顺延",
+        "PBR 贴图集! 材质 `{id}` 缺文件（{} 或 {}）⇒ 跳过，后续槽号顺延",
         albedo.display(),
         roughmetal.display(),
       );
@@ -588,7 +582,7 @@ fn finish_pbr_textures(
       } else if a.is_failed() || r.is_failed() {
         warn!(
           target: "gate",
-          "PBR 贴图集: 材质 `{}` 加载失败（albedo={a:?} / roughmetal={r:?}）⇒ 跳过该材质，后续槽号顺延",
+          "PBR 贴图集! 材质 `{}` 加载失败（albedo={a:?} / roughmetal={r:?}）⇒ 跳过，后续槽号顺延",
           m.id,
         );
       } else {
@@ -605,7 +599,7 @@ fn finish_pbr_textures(
   let Some(set) = build_texture_arrays(&mut images, &mut load.ready) else {
     warn!(
       target: "gate",
-      "PBR 贴图集: 没有可用的材质（{} 个候选全部被跳过）⇒ 不建立数组图，材质回落纯色",
+      "PBR 贴图集! 无可用材质（{} 候选全跳过）⇒ 不建数组图，材质回落纯色",
       load.ready.len(),
     );
     return;
@@ -649,7 +643,7 @@ fn build_texture_arrays(
     let (Some(a), Some(r)) = (images.get(&m.albedo), images.get(&m.roughmetal)) else {
       warn!(
         target: "gate",
-        "PBR 贴图集: 材质 `{}` 的就绪图取不到 CPU 数据（可能已被提取）⇒ 跳过，后续槽号顺延",
+        "PBR 贴图集! 材质 `{}` 就绪图无 CPU 数据（已被提取？）⇒ 跳过，后续槽号顺延",
         m.id,
       );
       continue;
@@ -658,7 +652,7 @@ fn build_texture_arrays(
     if a_size.width != r_size.width || a_size.height != r_size.height {
       warn!(
         target: "gate",
-        "PBR 贴图集: 材质 `{}` 的 albedo({}×{}) 与 roughmetal({}×{}) 尺寸不一致 ⇒ 跳过，后续槽号顺延",
+        "PBR 贴图集! 材质 `{}` albedo({}×{}) 与 roughmetal({}×{}) 尺寸不一致 ⇒ 跳过，后续槽号顺延",
         m.id, a_size.width, a_size.height, r_size.width, r_size.height,
       );
       continue;
@@ -667,8 +661,8 @@ fn build_texture_arrays(
     let (Some(fx), Some(fy)) = (box_factor(src.x, dst), box_factor(src.y, dst)) else {
       warn!(
         target: "gate",
-        "PBR 贴图集: 材质 `{}` 的源尺寸 {}×{} 与 GPU_TEX_SIZE = {dst} 不是「相同或整数倍缩小」关系 ⇒ 跳过\
-         （只做盒式降采样，不放大、不做非整数重采样），后续槽号顺延",
+        "PBR 贴图集! 材质 `{}` 源尺寸 {}×{} 与 GPU_TEX_SIZE = {dst} 非「相同或整数倍缩小」⇒ 跳过\
+         （只做盒式降采样，不放大），后续槽号顺延",
         m.id, src.x, src.y,
       );
       continue;
@@ -897,13 +891,13 @@ fn rgba8_pixels(image: &Image, id: &str) -> Option<Vec<u8>> {
   if extent.depth_or_array_layers != 1 {
     warn!(
       target: "gate",
-      "PBR 贴图集: 材质 `{id}` 的中间张不是单层（layers = {}）⇒ 跳过",
+      "PBR 贴图集! 材质 `{id}` 中间张非单层（layers = {}）⇒ 跳过",
       extent.depth_or_array_layers,
     );
     return None;
   }
   let Some(data) = image.data.as_deref() else {
-    warn!(target: "gate", "PBR 贴图集: 材质 `{id}` 的中间张没有 CPU 数据（已被提取？）⇒ 跳过");
+    warn!(target: "gate", "PBR 贴图集! 材质 `{id}` 中间张无 CPU 数据（已被提取？）⇒ 跳过");
     return None;
   };
   let px = (extent.width * extent.height) as usize;
@@ -912,7 +906,7 @@ fn rgba8_pixels(image: &Image, id: &str) -> Option<Vec<u8>> {
       if data.len() != px * 4 {
         warn!(
           target: "gate",
-          "PBR 贴图集: 材质 `{id}` 的中间张字节数 {} ≠ {}×{}×4 ⇒ 跳过",
+          "PBR 贴图集! 材质 `{id}` 中间张字节 {} ≠ {}×{}×4 ⇒ 跳过",
           data.len(), extent.width, extent.height,
         );
         return None;
@@ -922,7 +916,7 @@ fn rgba8_pixels(image: &Image, id: &str) -> Option<Vec<u8>> {
     f => {
       warn!(
         target: "gate",
-        "PBR 贴图集: 材质 `{id}` 的中间张格式 {f:?} 不是 Rgba8（只收 8bit 无压缩 RGBA）⇒ 跳过",
+        "PBR 贴图集! 材质 `{id}` 中间张格式 {f:?} 非 Rgba8（只收 8bit 无压缩 RGBA）⇒ 跳过",
       );
       None
     }
@@ -938,46 +932,21 @@ fn log_texture_set(set: &PbrTextureSet) {
   let mips = set.mip_levels();
   info!(
     target: "gate",
-    "PBR 贴图集: {n} 个材质 → albedo_rough[{w}×{h}×{n}] Rgba8Unorm（rgb=albedo/sRGB 编码字节 + a=roughness）\
-     ≈ {:.2}MiB + metal[{w}×{h}×{n}] R8Unorm（r=metalness）≈ {:.2}MiB = 合计 ≈ {:.2}MiB\
-     （**mip_level_count = {mips}**（{w} → 1×1，CPU 盒式 2×2 平均；含 mip 的显存 ≈ 1.333× base），\
-     GPU_TEX_SIZE = {}（MT8-4：= 体素格密度，见该常量的说明），通道打包 = MT2-1c；\
-     BC7/BC4 压缩 **不需要**（MT8-4 后 30 材质 ≈ 3MiB ⇒ 预算问题消失 ⇒ 取消该分支））",
+    "PBR 贴图集: {n} 材质 → albedo_rough[{w}×{h}×{n}] Rgba8Unorm ≈ {:.2}MiB + metal[{w}×{h}×{n}] \
+     R8Unorm ≈ {:.2}MiB = {:.2}MiB；mip_level_count = {mips}、GPU_TEX_SIZE = {}",
     mib(ar_bytes),
     mib(m_bytes),
     mib(ar_bytes + m_bytes),
     GPU_TEX_SIZE,
   );
-  // 采样策略（MT2-3）：与 mip 层数同一行量级的信息，放在一起方便"远处为什么不再闪"有据可查。
-  info!(
-    target: "gate",
-    "PBR 采样策略（MT2-3）：sampler = Repeat×3 / Linear mag,min,mipmap / anisotropy_clamp = {} \
-     / lod_max_clamp = {}（覆盖到 mip 链底；绑定在 @group(1) @binding(9)，与 light_samp 分开）",
-    PBR_ANISOTROPY_CLAMP,
-    (PBR_MIP_LEVELS_MAX - 1) as f32,
-  );
   // 每材质的显存（打包后 **含 mip** ≈ 0.104MiB @128），用它把"30 材质"的账一次算清（MT8-4 的正面收益）。
   let per_mat = (ar_bytes + m_bytes) / n as u64;
-  info!(
+  bevy::log::debug!(
     target: "gate",
-    "PBR 显存提醒（MT8-4）: 打包后 {:.3}MiB/材质 @{w}（4B + 1B per texel **含完整 mip 链**，\
-     当前 {n} 材质 = {:.2}MiB；不带 mip 时 ≈ {:.3}MiB/材质）；\
-     30 材质时 ≈ {:.1}MiB —— **远低于 PLAN §MT2-1b 的 100MB 预算线** ⇒ MT2-1c 留的「512 或 BC7 二选一」\
-     **取消**：{w} 已满足「≥1 texel/体素」（MT8-1 之后一个体素面只取 1 个采样点）⇒ 不必再降也不必修，\
-     BC7/BC4 省下的约 {:.1}MiB（30 材质）不值得引入离线 KTX2 工具链或新编码器依赖；\
-     texel 密度由 GPU_TEX_SIZE 与 `common.wesl::MATERIAL_TEX_WORLD_SCALE`（权威在 WESL）共同决定，\
-     改任一个都要回头看另一个",
+    "PBR 显存: {:.3}MiB/材质（含完整 mip 链）@{w}；当前 {n} 材质 = {:.2}MiB，30 材质 ≈ {:.1}MiB",
     mib(per_mat),
     mib(ar_bytes + m_bytes),
-    mib(per_mat) / (4.0 / 3.0),
     mib(per_mat * 30),
-    mib(per_mat * 30) * 3.0 / 4.0,
-  );
-  info!(
-    target: "gate",
-    "PBR 引用情况: 本次全量加载 {n} 个材质。\
-     注：MT7 之后 palette 的 IS_PBR 位**已有写入方**（编辑器笔触的 PBR 变体），\
-     但\"按引用加载\"需要先能扫描\"场景引用了哪些资产\"这条链路（当前没有）⇒ 仍全量加载，属待做项",
   );
   // MT2-4 的调试通道提示不在这里打：它在 `start_pbr_texture_load`（加载请求发出后）就打过了 ——
   // 那一处即使后面贴图集构建失败也仍然留在日志里。
@@ -995,21 +964,14 @@ fn log_texture_set(set: &PbrTextureSet) {
   if displaced.is_empty() {
     warn!(
       target: "gate",
-      "位移幅度（MT8-5/MT8-6）: 资产表里**没有任何非 0 位移幅度** —— 这 {n} 个材质目录下都找不到 \
-       `<id>_height.png`（幅度按**磁盘事实**给值）⇒ 笔触与 CSG 都**不会**位移；\
-       把高度图放回 assets/textures/pbr/<id>/ 即恢复"
+      "位移幅度: 资产表无任何非 0 幅度（这 {n} 个材质目录都无 `<id>_height.png`）⇒ 笔触与 CSG 不位移；\
+       放回 assets/textures/pbr/<id>/ 即恢复"
     );
   } else {
     info!(
       target: "gate",
-      "位移幅度（MT8-5/MT8-6）: 资产表里**非 0** 的槽位（格式 `槽=id(幅度体素，峰-峰；偏置 0.5 ⇒ \
-       上下各 ±幅度/2)`）= {} —— `{DISPLACE_DEMO_ID}` 是 {} 体素（MT6 / MT8-5 的样例值，\
-       `gate-app::consts::DEMO_DISPLACE_HEIGHT_MAP` 钉着它，**别改**），其余一律 {} 体素\
-       （`DISPLACE_TEX_DEMO_AMPLITUDE`）；**没有高度图的材质恒 0**（上面已按磁盘事实筛过 ⇒ 这一行就是\
-       「该选哪个材质才有凹凸」的答案）。CPU 侧的 CSG 位移读的就是这个字节\
-       （`MaterialAsset::emissive_metal` bits 24..31，shader 不读）⇒ **改这里即改凹凸**\
-       （改 `gate-render/src/pbr_texture.rs::default_displacement_amplitude` 或那两个 `DISPLACE_*` 常量）；\
-       逐材质的幅度属 MT7 的「资产表编辑」，这两条都是**临时 demo 默认值**",
+      "位移幅度: 非 0 槽位（`槽=id(幅度体素，峰-峰；偏置 0.5)`）= {} —— `{DISPLACE_DEMO_ID}` 是 {} 体素、\
+       其余 {} 体素（`DISPLACE_TEX_DEMO_AMPLITUDE`）；无高度图者恒 0",
       displaced.join("  "),
       DISPLACE_DEMO_AMPLITUDE,
       DISPLACE_TEX_DEMO_AMPLITUDE,
@@ -1025,7 +987,7 @@ fn log_texture_set(set: &PbrTextureSet) {
       .join("  ");
     info!(
       target: "gate",
-      "PBR 槽位（字典序 = texture_2d_array 层号，albedo_rough / metal 同层同材质）: {line}",
+      "PBR 槽位（字典序 = texture_2d_array 层号，albedo_rough / metal 同层）: {line}",
     );
   }
 }
@@ -1047,7 +1009,7 @@ fn log_pbr_debug_channel(ids: &[String]) {
   let Some(v) = value else {
     info!(
       target: "gate",
-      "PBR 调试通道（MT2-4）: 读不到 {} 的 {PBR_DEBUG_ASSET_CONST} ⇒ 按关闭处理（不影响渲染）",
+      "PBR 调试通道: 读不到 {} 的 {PBR_DEBUG_ASSET_CONST} ⇒ 按关闭（不影响渲染）",
       path.display(),
     );
     return;
@@ -1055,19 +1017,15 @@ fn log_pbr_debug_channel(ids: &[String]) {
   if v == PBR_DEBUG_ASSET_OFF {
     info!(
       target: "gate",
-      "PBR 调试通道（MT2-4）**关闭**（PBR_DEBUG_ASSET = 0xFFFFFFFF）⇒ 不透明表面仍走 palette 纯色\
-       （`palette_albedo`）。要一键看贴图：把 main.wesl 顶部那行 \
-       `const PBR_DEBUG_ASSET: u32 = 0xFFFFFFFFu;` 的值改成槽号再重启（0 = 字典序第一个材质，\
-       槽号表见上面几行）",
+      "PBR 调试通道: 关闭（PBR_DEBUG_ASSET = 0xFFFFFFFF）⇒ 不透明面走 palette 纯色（`palette_albedo`）；\
+       要一键看贴图：把 main.wesl 顶部 `const PBR_DEBUG_ASSET: u32` 改成槽号再重启（0 = 字典序第一个）",
     );
   } else {
     let id = ids.get(v as usize).map_or("**超出已加载槽位数（会采到越界层）**", String::as_str);
     info!(
       target: "gate",
-      "PBR 调试通道（MT2-4）**已开启**：PBR_DEBUG_ASSET = {v} ⇒ **所有不透明表面**都改用资产 {v}（`{id}`）\
-       的**整份材质**（triplanar 采样 + PBR 着色，见 MT3 的 `fetch_material`）；\
-       关掉就把那一行改回 `0xFFFFFFFFu`（详见该常量的注释）。\
-       注意：调试视图下自发光一并被替换 ⇒ 发光体会熄灭，这是预期",
+      "PBR 调试通道: 开启 PBR_DEBUG_ASSET = {v} → `{id}` ⇒ 所有不透明面改用该资产的整份材质\
+       （triplanar 采样 + PBR 着色）；注意调试视图下自发光一并被替换（发光体熄灭，预期）",
     );
   }
 }
@@ -1084,20 +1042,17 @@ fn log_flat_shading_switch() {
   match value {
     None => info!(
       target: "gate",
-      "逐体素材质采样（MT8-1）: 读不到 {} 的 {MATERIAL_FLAT_SHADING_CONST} ⇒ 无法确认开关状态\
-       （不影响渲染，按 `common.wesl` 里的值执行）",
+      "逐体素材质采样: 读不到 {} 的 {MATERIAL_FLAT_SHADING_CONST} ⇒ 按 `common.wesl` 的值执行（不影响渲染）",
       path.display(),
     ),
     Some(0) => info!(
       target: "gate",
-      "逐体素材质采样（MT8-1）**关闭**（MATERIAL_FLAT_SHADING = 0）= 美学「乙」：\
-       纹理按**逐屏幕像素**连续采样（MT3 口径，亚体素贴图细节保留）—— 这是 A/B 对照组",
+      "逐体素材质采样: 关闭（MATERIAL_FLAT_SHADING = 0）= 美学「乙」：纹理按逐屏幕像素连续采样",
     ),
     Some(v) => info!(
       target: "gate",
-      "逐体素材质采样（MT8-1）**开启**（MATERIAL_FLAT_SHADING = {v}）= 美学「甲」：\
-       triplanar 采样点量化到**体素中心** ⇒ 一个体素面一个平色（色块边界与几何台阶对齐，\
-       见 `common.wesl::material_sample_pos`）；远处闪烁由 `pbr_mip_lod` 的解析 LOD 抑制（R12）",
+      "逐体素材质采样: 开启（MATERIAL_FLAT_SHADING = {v}）= 美学「甲」：triplanar 采样点量化到体素中心\
+       （一个体素面一个平色）；远处闪烁由 `pbr_mip_lod` 的解析 LOD 抑制",
     ),
   }
 }

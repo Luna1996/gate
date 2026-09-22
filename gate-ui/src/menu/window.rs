@@ -742,7 +742,7 @@ fn start_navigation(world: &mut World, root: Entity, viewport: Entity, target: &
     menu.path = target.to_vec();
     menu.go = None;
   }
-  info!("菜单导航 → {}", clip_path(&model, target));
+  debug!("菜单导航 → {}", clip_path(&model, target));
   if let Some(mut p) = world.get_mut::<MenuPager>(root) {
     p.outgoing = Some(old_page);
     p.current = new_page;

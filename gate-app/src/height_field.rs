@@ -118,8 +118,7 @@ impl HeightField {
     let (lo, hi) = field.range();
     info!(
       target: "gate",
-      "高度场（MT6-2）: {} → {}×{} texel（源 {}×{} {format:?}，盒式降采样 ÷{HEIGHT_DOWNSAMPLE}）；\
-       取值范围 {lo:.3}..{hi:.3}",
+      "高度场 {} → {}×{} texel 源 {}×{} {format:?} ÷{HEIGHT_DOWNSAMPLE} 取值 {lo:.3}..{hi:.3}",
       path.display(),
       size.x,
       size.y,
@@ -231,8 +230,7 @@ impl MaterialDisplace {
     let Some(asset_amplitude) = gate_render::pbr_texture::displacement_amplitude_of(id) else {
       info!(
         target: "gate",
-        "MT8-5 位移源: 材质 `{id}` 不在 PBR 材质目录集里（`assets/textures/pbr/` 下无此目录）\
-         ⇒ **不位移**（按普通 CSG 处理）",
+        "位移源 材质 `{id}` 不在 PBR 材质目录集 → 不位移（普通 CSG）",
       );
       return Ok(None);
     };
@@ -245,8 +243,7 @@ impl MaterialDisplace {
     if amplitude == 0.0 {
       info!(
         target: "gate",
-        "MT8-5 位移源: 材质 `{id}` 的位移幅度 = 0（资产值，`MaterialAsset::emissive_metal` 的最高字节）\
-         ⇒ **不位移**（按普通 CSG 处理）",
+        "位移源 材质 `{id}` 幅度 = 0（资产值）→ 不位移（普通 CSG）",
       );
       return Ok(None);
     }
@@ -259,16 +256,14 @@ impl MaterialDisplace {
     let (lo, hi) = field.range();
     let size = field.size();
     let source = if from_asset {
-      format!("**来自材质资产**（按 id=`{id}` 读 `MaterialAsset` 的 `emissive_metal` bits 24..31）")
+      format!("幅度来自资产 id=`{id}`")
     } else {
-      "来自 `consts::DEMO_DISPLACE_AMPLITUDE_OVERRIDE`（**临时实验旋钮**：资产才是唯一真源）"
-        .to_string()
+      "幅度来自 consts::DEMO_DISPLACE_AMPLITUDE_OVERRIDE（实验旋钮）".to_string()
     };
     info!(
       target: "gate",
-      "MT8-5 位移源: 材质 `{id}` 的位移幅度 = {amplitude} 体素（峰-峰，偏置双向 ±{bound}）—— {source}；\
-       高度图 {path} → {w}×{h} texel，取值 {lo:.3}..{hi:.3}；一张铺 {tex_scale_voxels} 体素；\
-       **改这一档只动 `gate-render/src/pbr_texture.rs::DISPLACE_DEMO_AMPLITUDE`（改资产即改凹凸）**",
+      "位移源 材质 `{id}` 幅度 = {amplitude} 体素（峰-峰，±{bound}）{source}；\
+       高度图 {path} {w}×{h} texel {lo:.3}..{hi:.3}；铺 {tex_scale_voxels} 体素",
       path = path.display(),
       w = size.x,
       h = size.y,
@@ -344,8 +339,7 @@ impl MaterialDisplaceCache {
       let found = self.entries.get(id).and_then(Option::as_ref);
       info!(
         target: "gate",
-        "MT8-5 位移缓存: 材质 `{id}` **命中**（第 {hits} 次命中，累计解码 {decodes} 次）\
-         ⇒ 本次**解码耗时 0**（只查表 {looked_up:?}，未读盘 / 未解码）"
+        "位移缓存 材质 `{id}` 命中 #{hits}（累计解码 {decodes}）解码耗时 0，查表 {looked_up:?}"
       );
       return found;
     }
@@ -356,8 +350,8 @@ impl MaterialDisplaceCache {
       Err(e) => {
         warn!(
           target: "gate",
-          "MT8-5 位移缓存: 材质 `{id}` 的位移源不可用（{e}）⇒ 本次及其后笔触按**普通填充**处理\
-           （不位移）；放回 assets/textures/pbr/{id}/{id}_height.png 即恢复"
+          "位移缓存 材质 `{id}` 位移源不可用（{e}）⇒ 笔触按普通填充处理（不位移）；\
+           放回 assets/textures/pbr/{id}/{id}_height.png 即恢复"
         );
         None
       }
@@ -367,15 +361,14 @@ impl MaterialDisplaceCache {
     match &loaded {
       Some(md) => info!(
         target: "gate",
-        "MT8-5 位移缓存: 材质 `{id}` **首次解码**（第 {} 次解码）耗时 {elapsed:?}\
-         （幅度 {} 体素、一张铺 {tex_scale_voxels} 体素）⇒ 此后每次落笔命中该缓存、解码耗时 0",
+        "位移缓存 材质 `{id}` 首次解码 #{} 耗时 {elapsed:?} 幅度 {} 体素、铺 {tex_scale_voxels} 体素\
+         ⇒ 此后落笔命中缓存、解码耗时 0",
         self.decodes,
         md.amplitude(),
       ),
       None => info!(
         target: "gate",
-        "MT8-5 位移缓存: 材质 `{id}` **不位移**（第 {} 次解码，耗时 {elapsed:?}）⇒ 记入缓存，\
-         此后落笔直接走普通填充、不再解析这个 id",
+        "位移缓存 材质 `{id}` 不位移 #{} 耗时 {elapsed:?} ⇒ 记入缓存，此后落笔走普通填充",
         self.decodes,
       ),
     }
@@ -418,7 +411,7 @@ fn downsample(src: Vec<f32>, size: UVec2, factor: u32) -> (Vec<f32>, UVec2) {
   if factor <= 1 || !size.x.is_multiple_of(factor) || !size.y.is_multiple_of(factor) {
     warn!(
       target: "gate",
-      "高度场：尺寸 {}×{} 与降采样因子 {factor} 不整除 ⇒ 跳过降采样（直接用原图，可能出逐体素毛刺）",
+      "高度场 {}×{} 与降采样因子 {factor} 不整除 ⇒ 跳过降采样（用原图，可能出逐体素毛刺）",
       size.x,
       size.y,
     );

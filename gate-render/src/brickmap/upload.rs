@@ -431,9 +431,9 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   let pbr_sampler = crate::pbr_texture::create_pbr_sampler(&device);
   info!(
     target: "gate",
-    "PBR 采样器（MT2-3，BG1 binding 9）: Repeat×3 / Linear(mag,min,mipmap) / anisotropy_clamp = {} \
-     / lod_max_clamp = {}（覆盖 mip 链底）；mip 链 = {} 层（GPU_TEX_SIZE = {} → 1×1，CPU 盒式平均）。\
-     与 light_samp（ClampToEdge / mipmap Nearest / 无 mip）**分属两个 sampler**",
+    "PBR 采样器（BG1 binding 9）: Repeat×3 / Linear(mag,min,mipmap) / anisotropy_clamp = {} \
+     / lod_max_clamp = {}；mip 链 = {} 层（GPU_TEX_SIZE = {} → 1×1，CPU 盒式平均）；\
+     与 light_samp（ClampToEdge / mipmap Nearest / 无 mip）分属两个 sampler",
     crate::pbr_texture::PBR_ANISOTROPY_CLAMP,
     (crate::pbr_texture::PBR_MIP_LEVELS_MAX - 1) as f32,
     crate::pbr_texture::PBR_MIP_LEVELS_MAX,
@@ -832,35 +832,22 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
   gpu.material_assets_uploaded = true;
 
   let layers = set.layers();
-  let asset_bytes = std::mem::size_of::<MaterialAsset>();
   info!(
     target: "gate",
-    "材质资产表: 全量上传 {} 槽 × {asset_bytes}B = {:.0}KB（全局一张表，所有 volume 共用；\
-     palette 的 PBR 变体里 asset:u16 是全局下标）。槽 0..{layers}: albedo_slot = roughmetal_slot = i、\
-     emissive/transmission/height 三个槽位 = MATERIAL_SLOT_NONE；其余槽位: 五个 *_slot 全 MATERIAL_SLOT_NONE\
-     （无贴图 ⇒ 走标量回退值）。标量回退 = 中性灰 albedo(sRGB 128) + roughness 0.5 + metallic 0 \
-     + specular 1.0(中性 = 不调制电介质 F0) + emissive/transmission 0 + IOR 1.50（= 默认电介质，与今天平凡材质的默认观感一致）",
-    table.len(),
-    table.len() as f64 * asset_bytes as f64 / 1024.0,
+    "材质资产表: 槽 0..{layers}: albedo_slot = roughmetal_slot = i、emissive/transmission/height \
+     = MATERIAL_SLOT_NONE；其余槽位五个 *_slot 全 NONE（标量回退 = 中性灰 albedo(sRGB 128) + roughness 0.5 \
+     + metallic 0 + specular 1.0(不调制电介质 F0) + emissive/transmission 0 + IOR 1.50）",
   );
   match set.slot_of(METAL_DEMO_ID) {
     Some(i) => info!(
       target: "gate",
-      "材质资产表: 槽 {i}（{METAL_DEMO_ID}）的 metallic = 255 —— 临时 demo 默认值\
-       （MT3 的 metallic / roughness BRDF 验收需要一个金属可用）。MT7 已提供材质编写 UI，\
-       但「资产表编辑」尚未做 ⇒ 这条默认值仍在负责「表里有个金属」",
+      "材质资产表: 槽 {i}（{METAL_DEMO_ID}）metallic = 255（临时 demo 默认值）",
     ),
     None => warn!(
       target: "gate",
-      "材质资产表: 贴图集里没有 `{METAL_DEMO_ID}` ⇒ 表里没有任何金属槽位\
-       （MT3 验收会缺一个现成的金属；请确认 assets/textures/pbr/{METAL_DEMO_ID}/ 存在）",
+      "材质资产表: 贴图集里没有 `{METAL_DEMO_ID}` ⇒ 表里无金属槽；确认 assets/textures/pbr/{METAL_DEMO_ID}/ 存在",
     ),
   }
-  info!(
-    target: "gate",
-    "材质资产表: 增量路径未做 —— 本表当前是启动时构建的静态默认集（MT7 提供的材质编写 UI 只写 palette 槽，\
-     不改这张表）⇒ 一次全量写完即可；等「资产表编辑」落地时再加增量",
-  );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -894,7 +881,7 @@ pub(crate) fn prepare(
     );
     if limits.force_multi() {
       warn!(target: "gate",
-        "GPU storage binding < 1GB，退化到全量上传（单 tile 170MB 会跨帧）——P2.3 多 buffer 切片代码保留，需要时接入"
+        "GPU storage binding < 1GB ⇒ 退化到全量上传（单 tile 170MB 跨帧）"
       );
     }
   }
@@ -1040,7 +1027,7 @@ pub(crate) fn prepare(
     + gpu.state.size()
     + gpu.grid_descs_buf.size();
   if vram > crate::brickmap::consts::VRAM_WARN_BYTES {
-    bevy::log::warn!("GPU VRAM 超过旧预算线（仅提示）: {vram} bytes");
+    bevy::log::warn!("GPU VRAM {vram}B 超旧预算线（仅提示）");
   }
   if !limits.force_multi() {
     debug_assert!(

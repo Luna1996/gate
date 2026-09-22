@@ -502,16 +502,6 @@ impl bevy::app::Plugin for GiPlugin {
 }
 
 fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
-  let c = gi_consts();
-  bevy::log::info!(
-    target: "gate",
-    "GI：屏幕空间逐面 ReSTIR（reservoir {} word/像素 × 2 块 ping-pong）；\
-     降噪导引 {} word/像素、历史 {} word/像素（双缓冲）、atrous 迭代 {} 轮",
-    c.gi_res_words,
-    c.gi_den_guide_words,
-    c.gi_den_hist_words,
-    c.gi_den_atrous_iter,
-  );
   commands.insert_resource(GiGpu {
     uniform: bevy::render::render_resource::UniformBuffer::default(),
     frame: 0,

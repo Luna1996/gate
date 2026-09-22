@@ -6,7 +6,7 @@ use bevy::asset::io::Reader;
 use bevy::asset::{
   Asset, AssetApp, AssetEvent, AssetId, AssetLoader, Assets, Handle, LoadContext, LoadState,
 };
-use bevy::log::{info, warn};
+use bevy::log::{debug, warn};
 use bevy::prelude::*;
 use bevy::ui::UiScale;
 use bevy::window::{PrimaryWindow, Window};
@@ -348,7 +348,7 @@ fn ui_theme_resolve(
     {
       commands.insert_resource(theme.clone());
       state.applied = true;
-      info!("ui theme loaded from {THEME_ASSET_PATH}");
+      debug!("theme → {THEME_ASSET_PATH}");
     }
   }
   // 失败：load_state Failed（文件缺失 / RON 解析失败 / hex 非法）
@@ -358,7 +358,7 @@ fn ui_theme_resolve(
   {
     commands.insert_resource(default_theme());
     state.fell_back = true;
-    warn!("ui theme load failed ({err}), falling back to built-in dark default");
+    warn!("theme load failed ({err}) → built-in dark default");
   }
 }
 
@@ -372,7 +372,7 @@ fn ui_scale_autofit(
   let target = autofit_ui_scale(theme.ui_scale, theme.auto_fit_ui_scale, w.height());
   if (ui_scale.0 - target).abs() > f32::EPSILON {
     ui_scale.0 = target;
-    info!("UiScale -> {target:.3} (window h = {})", w.height());
+    debug!("ui_scale → {target:.3} [window h {}]", w.height());
   }
 }
 
@@ -402,7 +402,7 @@ fn ui_theme_font_load(
   }
   font.path = Some(path.clone());
   font.handle = Some(server.load::<Font>(path));
-  info!("ui theme font loading: {path}");
+  debug!("theme font → {path}");
 }
 
 /// 主题字体加载成功后 clone 到 `AssetId::<Font>::default()` slot，使隐式字体的文本都用主题字体。
@@ -426,7 +426,7 @@ fn ui_theme_font_install_default(
     LoadState::Loaded => {}
     LoadState::Failed(_) => {
       warn!(
-        "theme font {:?} failed to load; default font slot not overridden (CJK will be boxes)",
+        "theme font {:?} load failed → default slot not overridden (CJK boxes)",
         font.path
       );
       *done = true;
@@ -439,13 +439,10 @@ fn ui_theme_font_install_default(
   };
   match fonts.insert(AssetId::<Font>::default(), font_asset) {
     Ok(()) => {
-      info!(
-        "default font overridden with theme font {:?} — all implicit TextFont now use CJK font",
-        font.path
-      );
+      debug!("default font → {:?}", font.path);
       *done = true;
     }
-    Err(e) => warn!("default font override insert failed ({e:?}); retrying next frame"),
+    Err(e) => warn!("default font override insert failed ({e:?}) → retry next frame"),
   }
 }
 

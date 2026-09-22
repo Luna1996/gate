@@ -23,8 +23,8 @@ selected = 0
 
 [[items.children]]
 kind = "toggle"
-id = "fullscreen"
-label = "menu.video.fullscreen"
+id = "aa"
+label = "menu.video.aa"
 checked = false
 
 [[items.children]]
@@ -35,14 +35,14 @@ checked = true
 
 [[items.children]]
 kind = "toggle"
-id = "aa"
-label = "menu.video.aa"
+id = "fps"
+label = "menu.video.fps"
 checked = false
 
 [[items.children]]
 kind = "toggle"
-id = "fps"
-label = "menu.video.fps"
+id = "fullscreen"
+label = "menu.video.fullscreen"
 checked = false
 
 [[items]]

@@ -340,8 +340,7 @@ fn init_fog_gpu(mut commands: bevy::ecs::system::Commands) {
   let d = FogSettings::default();
   bevy::log::info!(
     target: "gate",
-    "光柱（godray）：默认 {} / 1÷{} 网格（固定）/ 强度 {} / 衰减 {} / 集中度 {} / 天体盘角径 {}° / 光晕 {}；\
-     屏幕空间径向模糊（掩码 1 条主射线 + 两趟模糊）：确定性取值 ⇒ 无噪声、无滞后",
+    "光柱（godray）：默认 {} / 1÷{} 网格（固定）/ 强度 {} / 衰减 {} / 集中度 {} / 天体盘角径 {}° / 光晕 {}",
     if d.enabled { "开" } else { "关" },
     FOG_DIV,
     d.strength(),
@@ -476,7 +475,7 @@ fn prepare_fog(
     gpu.b_dst = Some(b.create_view(&TextureViewDescriptor::default()));
     gpu.tex_b = Some(b);
     gpu.size = grid;
-    bevy::log::info!(
+    bevy::log::debug!(
       target: "gate",
       "光柱资源 → {}×{}（渲染 {}÷{}）；两张中间靶 rgba16f",
       grid.x,

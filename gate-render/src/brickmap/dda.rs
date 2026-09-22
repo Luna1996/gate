@@ -1943,10 +1943,10 @@ pub(crate) fn prepare_dda_bind_groups(
     if !s.enabled {
       queue.write_buffer(&eye_buf, 0, &1.0f32.to_bits().to_le_bytes());
     }
-    // 每次真正推送记一行日志。
-    bevy::log::info!(
+    // 每次真正推送记一行日志（settings 变化时才走这里）。
+    bevy::log::debug!(
       target: "gate",
-      "eye adapt 参数 → GPU：{} EV+ {:.2} / EV- {:.2} / tau+ {:.2}s / tau- {:.2}s / key {:.3}",
+      "eye adapt → GPU: {} EV+ {:.2} / EV- {:.2} / tau+ {:.2}s / tau- {:.2}s / key {:.3}",
       if s.enabled { "on" } else { "off" },
       s.ev_max,
       s.ev_min,
@@ -2018,13 +2018,13 @@ pub(crate) fn prepare_dda_bind_groups(
     beam_cache.den_cfg_r = den_r;
     let cfg = beam_cache.den_cfg.as_ref().expect("刚创建");
     queue.write_buffer(cfg, 0, &den_r.to_le_bytes());
-    bevy::log::info!(
+    bevy::log::debug!(
       target: "gate",
-      "GI 降噪档位 → {}（atrous 核半径 {}，每轮 {} 个 tap；菜单「渲染/RESTIR GI/降噪质量」）",
+      "GI 降噪档位 → {}（atrous 核半径 {}，每轮 {} tap）",
       if den_plan.on {
         format!("{} 轮 atrous", den_plan.rounds)
       } else {
-        "关（不跑降噪 pass，直接采样原始 GI）".to_string()
+        "关（直接采样原始 GI）".to_string()
       },
       den_r,
       (2 * den_r + 1) * (2 * den_r + 1) - 1,
