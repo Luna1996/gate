@@ -50,6 +50,29 @@ kind = "sub_menu"
 id = "render"
 label = "menu.render"
 
+# ---- 「基础」：把着色链里两件"基础"的事关掉（A/B 观感与成本）----
+# 置位/勾选 = **算**；默认两个都开 = 引入开关前的行为。
+[[items.children]]
+kind = "sub_menu"
+id = "base"
+label = "menu.render.base"
+
+# 隐式法相：关掉 ⇒ 不算邻域梯度法线，并且原色直出（看材质本色的调试视图，全链最省）
+[[items.children.children]]
+kind = "toggle"
+id = "normal"
+label = "menu.render.base.normal"
+checked = true
+tooltip = "menu.render.base.normal.tip"
+
+# 直光阴影：关掉 ⇒ 不发射阴影射线（省每像素 1 条 DDA），太阳照旧直射、只是没有明暗遮挡
+[[items.children.children]]
+kind = "toggle"
+id = "shadow"
+label = "menu.render.base.shadow"
+checked = true
+tooltip = "menu.render.base.shadow.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "gi"
@@ -241,6 +264,24 @@ id = "time"
 label = "menu.render.sky.time"
 
 [[items.children.children.children]]
+kind = "toggle"
+id = "auto"
+label = "menu.render.sky.time.auto"
+checked = false
+tooltip = "menu.render.sky.time.auto.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "speed"
+label = "menu.render.sky.time.speed"
+value = 0.1
+min = 0.0
+max = 0.5
+step = 0.01
+decimals = 2
+tooltip = "menu.render.sky.time.speed.tip"
+
+[[items.children.children.children]]
 kind = "slider"
 id = "hour"
 label = "menu.render.sky.time.hour"
@@ -272,24 +313,6 @@ max = 90.0
 step = 1.0
 decimals = 0
 tooltip = "menu.render.sky.time.lat.tip"
-
-[[items.children.children.children]]
-kind = "toggle"
-id = "auto"
-label = "menu.render.sky.time.auto"
-checked = false
-tooltip = "menu.render.sky.time.auto.tip"
-
-[[items.children.children.children]]
-kind = "slider"
-id = "speed"
-label = "menu.render.sky.time.speed"
-value = 0.1
-min = 0.0
-max = 0.5
-step = 0.01
-decimals = 2
-tooltip = "menu.render.sky.time.speed.tip"
 
 # 径向模糊（光柱那条链：掩码 + 两趟屏幕空间径向模糊）
 [[items.children.children]]
@@ -350,6 +373,15 @@ kind = "sub_menu"
 id = "disk"
 label = "menu.render.sky.disk"
 
+# 日月外观开关（最上面）：关掉 ⇒ 天空不画日月（那颗盘 + 它那圈光晕），只剩天光基色。
+# 与下面「覆写」正交：它决定"画不画"，覆写决定"角径/光晕由谁给"。
+[[items.children.children.children]]
+kind = "toggle"
+id = "enabled"
+label = "menu.render.sky.disk.enabled"
+checked = true
+tooltip = "menu.render.sky.disk.enabled.tip"
+
 [[items.children.children.children]]
 kind = "toggle"
 id = "override"
@@ -361,7 +393,7 @@ tooltip = "menu.render.sky.disk.override.tip"
 kind = "slider"
 id = "radius"
 label = "menu.render.sky.disk.radius"
-value = 1.2
+value = 2.4
 min = 0.0
 max = 3.5
 step = 0.1

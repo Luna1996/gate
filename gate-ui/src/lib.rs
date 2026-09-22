@@ -22,7 +22,7 @@ pub use menu::{
   DebugMenuHandle, DebugMenuRoot, InputField, MenuAction, MenuActionEvent, MenuFile, MenuItem,
   MenuNode, MenuRole, MenuTextValue, MenuValue, WindowState, color_picker_system,
   color_picker_visual_system, menu_model, menu_selected, menu_system, menu_text, menu_toggle,
-  menu_value, palette_color, rebuild_menu_page, spawn_debug_menu,
+  menu_value, palette_color, spawn_debug_menu,
 };
 pub use pointer::{UiInteract, UiInteractBundle, UiInteractPrev, UiInteractable};
 pub use world_anchor::{

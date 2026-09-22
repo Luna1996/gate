@@ -1378,6 +1378,8 @@ impl Plugin for BrickMapDdaPlugin {
       // 镜面档位（菜单「渲染/反射」）：main world 是菜单的写入目标，render world 供
       // `prepare_dda_bind_groups` 写进 BG3 光池 uniform 的 `refl_tier` / `refl_nest`。
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::ReflectionSettings>::default(),
+      // 「基础」开关（菜单「渲染/基础」）：同上，写进 `base_flags`。
+      bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::BaseSettings>::default(),
       // 眼睛适应的活参数（debug overlay 的 Eye 页可调；变化才同步 → 稳态零上传）
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       crate::responsive::ResponsivePlugin,
@@ -1386,6 +1388,8 @@ impl Plugin for BrickMapDdaPlugin {
     // main world 侧先给出默认档位（菜单观察者按路径写它）；render world 那份由
     // `ExtractResourcePlugin::<ReflectionSettings>` 拷过去。
     app.init_resource::<crate::lighting::ReflectionSettings>();
+    // 同上：「基础」开关（菜单「渲染/基础」）。
+    app.init_resource::<crate::lighting::BaseSettings>();
 
     // main → render 的 ExtractSchedule：把 DdaCameraConfig 从 main world 读
     // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
@@ -1764,6 +1768,8 @@ pub(crate) struct DdaTune<'w> {
   pub gi: Option<Res<'w, crate::gi::GiSettings>>,
   /// 镜面档位（菜单「渲染/反射」）—— 写进 BG3 光池 uniform 的 `refl_tier` / `refl_nest`。
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
+  /// 「基础」开关（菜单「渲染/基础」）—— 写进 BG3 光池 uniform 的 `base_flags`。
+  pub base: Option<Res<'w, crate::lighting::BaseSettings>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2164,6 +2170,10 @@ pub(crate) fn prepare_dda_bind_groups(
   // 真正的值在这里从菜单资源覆写（与 `LightGlobals` 那两格的文档一致）。
   lp.0.get_mut().g.refl_tier = tune.refl.as_ref().map_or(0, |r| r.tier());
   lp.0.get_mut().g.refl_nest = tune.refl.as_ref().map_or(0, |r| r.nest());
+  // 「基础」开关位（菜单「渲染/基础」）：同上，`build_light_pool` 只负责留 0。
+  // 资源缺失时给"两个都开"的缺省位（= 不改变观感），**不能给 0** —— 0 会静默关掉阴影与原色直出。
+  lp.0.get_mut().g.base_flags =
+    tune.base.as_ref().map_or(crate::lighting::BaseSettings::default().flags(), |b| b.flags());
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 

@@ -22,7 +22,7 @@ pub use model::{
 };
 pub use window::{
   DebugMenu, DebugMenuHandle, DebugMenuRoot, MenuAction, MenuActionEvent, MenuDrag, MenuPage,
-  MenuPager, MenuParts, menu_system, rebuild_menu_page, spawn_debug_menu,
+  MenuPager, MenuParts, menu_system, spawn_debug_menu,
 };
 
 use bevy::prelude::*;

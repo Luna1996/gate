@@ -10,6 +10,7 @@ use bevy::ui::{Pressed, RelativeCursorPosition};
 
 use super::{UiCtx, UiDisabled, color_of, dim_color, px};
 use crate::pointer::{UiInteract, UiInteractBundle};
+use crate::theme::UiTheme;
 use crate::widgets::consts::{
   SLIDER_FINE_SCALE, THUMB_INSET, THUMB_SIZE, THUMB_SIZE_DRAG, TRACK_HEIGHT,
 };
@@ -42,6 +43,10 @@ pub struct SliderValue(pub f32);
 /// 填充条子实体标记
 #[derive(Component, Debug, Default)]
 pub struct SliderFill;
+
+/// 轨道槽子实体标记（配色每帧重算的查询目标）
+#[derive(Component, Debug, Default)]
+pub struct SliderTrack;
 
 /// 滑块子实体标记
 #[derive(Component, Debug, Default)]
@@ -148,6 +153,7 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
     root
       .spawn((
         Name::new("ui-slider-track"),
+        SliderTrack,
         Node { flex_grow: 1.0, height: px(TRACK_HEIGHT), ..default() },
         BackgroundColor(track_bg),
       ))
@@ -281,35 +287,62 @@ pub fn slider_drag_system(
   shift_captured.set_if_neq(crate::capture::UiShiftCaptured(fine_drag));
 }
 
-/// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px。
-/// Disabled：滑块恒为 16px（配色由 spawn 时降亮）。
+/// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px；轨道 / 填充 / 滑块配色每帧重算。
+/// Disabled：滑块恒为 16px，配色按 `UiDisabled` 降亮。
 /// 结构 root → track → (fill | thumb_slot → thumb)；thumb 的 `top:50%` + 负半高 margin 垂直居中也在此同步。
+///
+/// 配色**每帧从主题令牌（未降亮的基色）重算**：禁用态靠装/摘 `UiDisabled` 动态切换，不必重建页面；
+/// 不能读组件当前值 —— `dim_color(dim_color(x)) != dim_color(x)`，那样会逐帧叠加降亮。
 #[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
 pub fn slider_visual_system(
+  theme: Option<Res<UiTheme>>,
   mut q_root: Query<
     (&SliderValue, &SliderRange, &Hovered, Has<Pressed>, &Children, Has<UiDisabled>),
     With<UiSlider>,
   >,
-  mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
-  mut thumbs: Query<&mut Node, With<SliderThumb>>,
+  mut q_track: Query<
+    &mut BackgroundColor,
+    (With<SliderTrack>, Without<SliderFill>, Without<SliderThumb>),
+  >,
+  mut fills: Query<(&mut Node, &mut BackgroundColor), (With<SliderFill>, Without<SliderThumb>)>,
+  mut thumbs: Query<(&mut Node, &mut BackgroundColor, &mut BorderColor), With<SliderThumb>>,
   q_track_children: Query<&Children, Without<UiSlider>>,
   q_slot_children: Query<&Children, With<SliderThumbSlot>>,
 ) {
+  let Some(theme) = theme else { return };
+  let c = &theme.colors;
+  let track_bg = color_of(&c.surface_overlay);
+  let fill_bg = color_of(&c.accent_fill_hover);
+  let thumb_bg = color_of(&c.surface_top);
+  let thumb_border = color_of(&c.border_strong);
   for (val, range, hovered, pressed, children, disabled) in &mut q_root {
     let inter = UiInteract::of(hovered, pressed);
     let pct = normalize(val.0, range.min, range.max) * 100.0;
     let thumb_size =
       if !disabled && inter == UiInteract::Pressed { THUMB_SIZE_DRAG } else { THUMB_SIZE };
+    let (track_bg, fill_bg, thumb_bg, thumb_border) = if disabled {
+      (dim_color(track_bg), dim_color(fill_bg), dim_color(thumb_bg), dim_color(thumb_border))
+    } else {
+      (track_bg, fill_bg, thumb_bg, thumb_border)
+    };
     for child in children.iter() {
       // fill 是 track 的子节点；thumb 在 track 里的行程槽下（再下一层）
       if let Ok(tc) = q_track_children.get(child) {
+        if let Ok(mut bg) = q_track.get_mut(child)
+          && bg.0 != track_bg
+        {
+          bg.0 = track_bg;
+        }
         for sub in tc.iter() {
-          if let Ok(mut node) = fills.get_mut(sub) {
+          if let Ok((mut node, mut bg)) = fills.get_mut(sub) {
             node.width = Val::Percent(pct);
+            if bg.0 != fill_bg {
+              bg.0 = fill_bg;
+            }
           }
           let Ok(sc) = q_slot_children.get(sub) else { continue };
           for thumb in sc.iter() {
-            if let Ok(mut node) = thumbs.get_mut(thumb) {
+            if let Ok((mut node, mut bg, mut bc)) = thumbs.get_mut(thumb) {
               node.left = Val::Percent(pct);
               // margin 负半高把中心钉在 track 中心线；拖拽放大时尺寸与负 margin 同步
               node.top = Val::Percent(50.0);
@@ -317,6 +350,13 @@ pub fn slider_visual_system(
               node.height = px(thumb_size);
               node.margin =
                 UiRect { left: px(-thumb_size / 2.0), top: px(-thumb_size / 2.0), ..default() };
+              let border = BorderColor::all(thumb_border);
+              if bg.0 != thumb_bg {
+                bg.0 = thumb_bg;
+              }
+              if *bc != border {
+                *bc = border;
+              }
             }
           }
         }

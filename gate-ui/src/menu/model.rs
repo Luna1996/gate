@@ -171,7 +171,7 @@ pub enum MenuNode {
     tooltip: Option<String>,
     /// **禁用态**：整行不可交互（配色降亮）。用于"值由别处决定、这里只是个显示/覆写值"的控件
     /// —— 例：天空页三组「覆写」关着时，下面那些滑杆就不是它说了算（见 `MenuNode::set_disabled`）。
-    /// 只在 spawn 时生效（widget 配色是 spawn 时算的）⇒ 改它要重建那一页（`rebuild_menu_page`）。
+    /// spawn 时按它建控件；运行期改它还要同步装/摘 widget 上的 `UiDisabled`（降亮配色每帧按它重算）。
     #[serde(default)]
     disabled: bool,
   },
@@ -201,6 +201,10 @@ pub enum MenuNode {
     checked: bool,
     #[serde(default)]
     tooltip: Option<String>,
+    /// **禁用态**：同 `Slider::disabled`（不可交互、配色降亮，勾选态仍可见）。
+    /// 例：「视频/抗锯齿」在像素大小 ≠ 1 时由 `sync_video_menu` 置起来。
+    #[serde(default)]
+    disabled: bool,
   },
   /// 输入框（一个或多个等宽输入框）
   Input {
@@ -312,19 +316,23 @@ impl MenuNode {
     }
   }
 
-  /// 本行是否处于**禁用态**（不可交互）。目前只有 `Slider` / `Color` 支持（其余节点恒 `false`）。
+  /// 本行是否处于**禁用态**（不可交互）。支持 `Slider` / `Color` / `Toggle`（其余节点恒 `false`）。
   pub fn disabled(&self) -> bool {
     match self {
-      Self::Slider { disabled, .. } | Self::Color { disabled, .. } => *disabled,
+      Self::Slider { disabled, .. }
+      | Self::Color { disabled, .. }
+      | Self::Toggle { disabled, .. } => *disabled,
       _ => false,
     }
   }
 
-  /// 设置本行的禁用态；返回**是否发生了变化**（调用方据此决定要不要重建页面，
-  /// 因为 widget 的配色是 spawn 时算的，光改模型不会重画）。
+  /// 设置本行的禁用态；返回**是否发生了变化**。
+  /// 运行期改它时调用方还要同步装/摘 widget 上的 `UiDisabled`（降亮配色每帧按它重算，不重建页）。
   pub fn set_disabled(&mut self, v: bool) -> bool {
     let slot = match self {
-      Self::Slider { disabled, .. } | Self::Color { disabled, .. } => disabled,
+      Self::Slider { disabled, .. }
+      | Self::Color { disabled, .. }
+      | Self::Toggle { disabled, .. } => disabled,
       _ => return false,
     };
     let changed = *slot != v;
@@ -561,9 +569,9 @@ pub fn dropdown(id: &str, label: &str, options: &[&str], selected: usize) -> Men
   }
 }
 
-/// 开关项节点
+/// 开关项节点（禁用态由调用方随后用 `set_disabled` 置，不在构造时给）
 pub fn toggle(id: &str, label: &str, checked: bool) -> MenuNode {
-  MenuNode::Toggle { id: id.into(), label: label.into(), checked, tooltip: None }
+  MenuNode::Toggle { id: id.into(), label: label.into(), checked, tooltip: None, disabled: false }
 }
 
 /// 带提示的开关项节点
@@ -573,6 +581,7 @@ pub fn toggle_tip(id: &str, label: &str, checked: bool, tooltip: &str) -> MenuNo
     label: label.into(),
     checked,
     tooltip: Some(tooltip.to_string()),
+    disabled: false,
   }
 }
 

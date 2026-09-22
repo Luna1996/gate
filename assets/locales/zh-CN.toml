@@ -16,6 +16,19 @@ _version = 1
 "menu.video.aa" = "抗锯齿"
 "menu.video.fps" = "显示帧率"
 "menu.render" = "渲染"
+"menu.render.base" = "基础"
+"menu.render.base.shadow" = "直光阴影"
+"menu.render.base.shadow.tip" = """
+**关** ⇒ 不发射阴影射线（省每像素 `1` 条 DDA），太阳照旧直射、只是没有明暗遮挡。
+
+用来把"阴影的成本与观感"单独摘出来看。⚠️ 玻璃的 `in-scatter` 那条阴影射线**不受本开关管**（那条置 `1` 会让玻璃无条件吃满太阳）。
+"""
+"menu.render.base.normal" = "隐式法相"
+"menu.render.base.normal.tip" = """
+**关** ⇒ 不算邻域梯度法线，并且**原色直出**：取到材质就直接输出 `albedo`，后面的 AO / GI / 太阳 / 阴影 / 反射链全部不算。
+
+这是"看材质本色"的调试视图（PBR 下能直接看 albedo 贴图的走向），也是全链最省的一档。
+"""
 "menu.render.gi" = "光照"
 "menu.render.gi.enabled" = "开启"
 "menu.render.gi.res" = "GI分辨率"
@@ -155,6 +168,11 @@ GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 - 大（`20+`）：只在太阳附近十几度内（尖锐、像激光束）；
 - 小（`1`）：**整个天空**都在发光 ⇒ 更像一层方向性眩光，不像光柱。"""
 "menu.render.sky.disk" = "日月"
+"menu.render.sky.disk.enabled" = "开启"
+"menu.render.sky.disk.enabled.tip" = """
+**关** ⇒ 天空里不画日月（**盘与它那圈光晕一起消失**），那一片天区只剩天光基色。
+
+它与「覆写」正交：这个决定"画不画"，覆写决定"角径 / 光晕由谁给"。"""
 "menu.render.sky.disk.override" = "覆写"
 "menu.render.sky.disk.override.tip" = """
 **关**（默认）：角径与光晕随时刻变化（越接近地平线盘越大、晕越强），下面两条滑杆**只读**（实时显示当前值）。

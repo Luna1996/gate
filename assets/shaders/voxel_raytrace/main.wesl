@@ -140,6 +140,13 @@ const PBR_REFL_MAX_ROUGH: f32 = 0.05;
 /// 同时权重按 `dda_main` 里的 `fade` 连续淡出到 0（⇒ 粗糙度扫描下总亮度单调、无跳变）。
 const PBR_REFL_CONE_K: f32 = 1.0;
 
+// ---- 基础开关（`light_u.g.base_flags`，菜单「渲染/基础」；**置位 = 算**）----
+// 位编码必须与 Rust `BaseSettings::FLAG_*` 一致（`gate-render/src/lighting.rs`）。
+/// bit0 **直光阴影**：置位 ⇒ 发射阴影射线（`sun_transmittance`）；清零 ⇒ 太阳照旧直射、只是没有遮挡。
+const BASE_FLAG_SHADOW: u32 = 1u;
+/// bit1 **隐式法相**：置位 ⇒ 算邻域梯度法线；清零 ⇒ **不算它**，并且**原色直出**（见 `shade_face` 的早退）。
+const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
+
 // ---- MT8-3（反射缓存）代码已删除（历史记录）----
 // 这里曾经是 `REFL_CACHE_SLOTS` / `REFL_REFRESH_K` / `refl_key_of` / `refl_slot_of` / `refl_seed`
 // 五个符号：反射缓存的槽数、旋转刷新周期、面键、键→槽哈希、按面取的抖动种子。
@@ -465,6 +472,14 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // 命中体素的世界中心：AO 采样点 / 阴影与反射射线的起点 / **视向量的锚点**（`face_view_dir`）
     // 都取它（同一个助手给出 ⇒ 不会出现"两处各自算一遍中心"的口径分叉）。
     let p_voxel = voxel_center_world(gg, best.voxel);
+    // ---- 基础开关「隐式法相」清零 ⇒ **原色直出**（菜单「渲染/基础」）----
+    // 不算邻域梯度法线（省 `voxel_normal` 的 4 次点查询）；材质取值的 triplanar 权重需要**一个**法线
+    // ⇒ 用 DDA 权威的可见面法线 `best.n`（不查邻域）。取到材质就直接返回 `albedo`：
+    // 后面的 AO / GI / 太阳 / 阴影射线 / 反射链 / 玻璃 in-scatter 全部不算 —— 这是"看材质本色"的
+    // 调试视图，也是全链最省的一档。**天空（未命中）不走这里**：那上面没有材质可直出。
+    if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
+      return fetch_material(best.palette_base, best.pal, best.point, best.n, PBR_DEBUG_ASSET).albedo;
+    }
     let k0 = gi_key0(best.voxel);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
     // 着色法线（`voxel_normal`，主世界要探 4 个 / 物体 6 个邻域体素）：**先试导引复用，键相等就用它、不再自己算**。
@@ -508,7 +523,12 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = 0.0;
     if (ndl > 0.0) {
-      sun = sun_transmittance(p_voxel + n * n_off, sun_dir, best.voxel, best.obj_id);
+      // 「基础/直光阴影」清零 ⇒ **不发射阴影射线**（省每像素 1 条 DDA），`sun = 1` = 太阳照旧直射、
+      // 只是没有明暗遮挡。**必须用真分支**：`select` 会把两侧都算了（射线照发，白花钱）。
+      sun = 1.0;
+      if ((light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
+        sun = sun_transmittance(p_voxel + n * n_off, sun_dir, best.voxel, best.obj_id);
+      }
     }
     let gi_on = gi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
@@ -670,7 +690,10 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
                     + SHADOW_SURFACE_EPS;
           let h_start = h.point + hn * h_off;
           var h_vis = 1.0;
-          if (tier >= 3u) { h_vis = sun_transmittance(h_start, sun_dir, h.voxel, h.obj_id); }
+          // 反射链的太阳 NEE 与不透明路径**同一个「直光阴影」开关**（关掉就是全场景不做遮挡）
+          if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
+            h_vis = sun_transmittance(h_start, sun_dir, h.voxel, h.obj_id);
+          }
           // 「本级也值得追，**并且**还允许再追一级」——前半句与主表面**同一个判据**
           // （F0 亮度门 × 粗糙度淡出 > 0）；后半句是 `lvl < nest`。
           // 两件事必须分开判：**扣掉本级那条近似，前提是下一级真的会去取代它** ——

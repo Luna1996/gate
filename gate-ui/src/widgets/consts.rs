@@ -4,8 +4,9 @@
 
 use bevy::prelude::*;
 
-/// Disabled 态降亮系数（RGB 乘以它，alpha 不变）
-pub const DISABLED_DIM: f32 = 0.55;
+/// Disabled 态降亮系数（线性 RGB 乘以它，alpha 不变）。全局唯一一处 —— 所有 widget 的禁用观感
+/// 都由它定（接线见 `widgets::dim_color`）。取 `0.35`：`0.55` 那档与正常态区分度不够。
+pub const DISABLED_DIM: f32 = 0.35;
 /// 按下反馈缩放（绕节点中心）
 pub const PRESSED_SCALE: f32 = 0.98;
 /// 勾选框边长（px）

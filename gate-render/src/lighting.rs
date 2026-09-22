@@ -35,7 +35,9 @@ pub struct LightGlobals {
   /// **镜面嵌套层级**（[`ReflectionSettings::nest`]，取值 0 / 1 / 2 / 4）：允许"镜子里的镜子"
   /// 再反射几级。同样复用废弃填充 `_pad1`。写侧 = `prepare_dda_bind_groups`。
   pub refl_nest: u32,
-  pub _pad2: u32,
+  /// **「基础」开关位**（[`BaseSettings`]，置位 = 算）：bit0 = 直光阴影、bit1 = 隐式法相。
+  /// 复用废弃填充 `_pad2`。写侧 = `prepare_dda_bind_groups`。
+  pub base_flags: u32,
   /// rgb = 环境色（线性），w reserved
   pub ambient: Vec4,
   /// x = 曝光系数；yzw reserved
@@ -121,6 +123,45 @@ impl Default for ReflectionSettings {
   }
 }
 
+/// **「基础」子菜单的两个开关**（菜单「渲染/基础」）：把着色链里两件"基础"的事关掉，
+/// 用来 A/B 观感与成本。**置位 = 算**（默认两个都置位 = 今天的行为）。
+///
+/// - [`Self::shadow`] **直光阴影**：关掉 ⇒ **不发射阴影射线**（`sun_transmittance`），
+///   太阳照旧直射、只是没有明暗遮挡 ⇒ 省**每像素 1 条 DDA**。落点在 `dda_main` 的不透明路径
+///   与反射链的太阳 NEE 两处；**玻璃的 in-scatter 那条有意不受它管**（那条 `sun_vis = 1` 会让玻璃
+///   无条件吃满太阳、深室内白得发光，理由写在那个调用点）。
+/// - [`Self::implicit_normal`] **隐式法相**：关掉 ⇒ **不算邻域梯度法线**（`voxel_normal` 的 4 次点查询），
+///   并且**原色直出** —— `shade_face` 取到材质后直接返回 `albedo`，后面的 AO / GI / 阴影 /
+///   反射链 / 玻璃 in-scatter 全部不算。这是"看材质本色"的调试视图，也是全链最省的一档。
+///
+/// 位编码写在 [`Self::flags`]；`main.wesl` 侧的名字是 `BASE_FLAG_*`（两处必须同步）。
+#[derive(Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
+pub struct BaseSettings {
+  pub shadow: bool,
+  pub implicit_normal: bool,
+}
+
+impl BaseSettings {
+  /// 位 0：直光阴影（`main.wesl::BASE_FLAG_SHADOW`）。
+  pub const FLAG_SHADOW: u32 = 1 << 0;
+  /// 位 1：隐式法相（`main.wesl::BASE_FLAG_IMPLICIT_NORMAL`）。
+  pub const FLAG_IMPLICIT_NORMAL: u32 = 1 << 1;
+
+  /// 打包成 uniform `LightGlobals::base_flags`（置位 = 算）。
+  pub fn flags(&self) -> u32 {
+    (if self.shadow { Self::FLAG_SHADOW } else { 0 })
+      | (if self.implicit_normal { Self::FLAG_IMPLICIT_NORMAL } else { 0 })
+  }
+}
+
+impl Default for BaseSettings {
+  /// 两个都开 = 与引入本开关前**逐位相同**。
+  fn default() -> Self {
+    Self { shadow: true, implicit_normal: true }
+  }
+}
+
 /// 方向光配置（主题资产 = 静态；时间驱动时由 `sky::apply_sky` 每帧覆写）
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DirLightCfg {
@@ -191,11 +232,11 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
   let mut u = LightPoolUniform {
     g: LightGlobals {
       count: 0,
-      // 这两格恒 0：真正的值由 `prepare_dda_bind_groups` 从 `ReflectionSettings` 覆写
-      // （本函数只认主题资产，反射档位不是资产属性）。
+      // 这三格恒 0：真正的值由 `prepare_dda_bind_groups` 从菜单资源（`ReflectionSettings` /
+      // `BaseSettings`）覆写 —— 本函数只认主题资产，档位与开关都不是资产属性。
       refl_tier: 0,
       refl_nest: 0,
-      _pad2: 0,
+      base_flags: 0,
       ambient: Vec4::new(theme.ambient[0], theme.ambient[1], theme.ambient[2], 0.0),
       exposure_pad: Vec4::new(theme.exposure, 0.0, 0.0, 0.0),
     },

@@ -237,7 +237,9 @@ pub(crate) fn spawn_item(
     MenuNode::Dropdown { label: key, options, selected, .. } => {
       dropdown_row(ctx, parent, key, options, *selected, &path)
     }
-    MenuNode::Toggle { label: key, checked, .. } => toggle_row(ctx, parent, key, *checked, &path),
+    MenuNode::Toggle { label: key, checked, disabled, .. } => {
+      toggle_row(ctx, parent, key, *checked, *disabled, &path)
+    }
     MenuNode::Input { label: key, fields, .. } => input_row(ctx, parent, key, fields, &path),
     MenuNode::Color { label: key, hex, disabled, .. } => {
       color_row(ctx, parent, key, hex, &path, *disabled)
@@ -349,7 +351,8 @@ fn slider_row(
       // 不能带 NoWrap：bevy_ui 对 NoWrap 用无界宽度排版，Justify::Right 会失效
       BevyTextLayout { justify: Justify::Right, ..default() },
     ));
-    // 禁用行：两段文字也降亮（控件自身的配色由 widget 在 spawn 时按 `disabled` 处理）
+    // 禁用行：两段文字也降亮（控件自身的配色由 widget 每帧按 `UiDisabled` 重算；
+    // 这里的降亮由 `refresh_visuals` 每帧按模型重做，spawn 时先落一份免一帧闪烁）
     if disabled {
       for e in [name, ve] {
         dim_text(r.world_mut(), e);
@@ -426,16 +429,22 @@ fn toggle_row(
   parent: &mut ChildSpawner,
   key: &str,
   checked: bool,
+  disabled: bool,
   path: &str,
 ) -> Entity {
   let mut ec = base_row(parent, "menu-toggle");
   let row = ec.id();
   ec.with_children(|r| {
-    grow_label(ctx, r, key, LabelStyle::Body);
-    let te = *toggle_switch(ctx, r, ToggleSwitchConfig { text: None, checked, disabled: false });
+    let name = grow_label(ctx, r, key, LabelStyle::Body);
+    let te = *toggle_switch(ctx, r, ToggleSwitchConfig { text: None, checked, disabled });
     r.world_mut()
       .entity_mut(te)
       .insert(MenuItem { path: path.to_string(), role: MenuRole::Toggle });
+    // 禁用行：名称降亮（开关本体的配色由 `toggle_switch_state_system` 每帧按 `UiDisabled` 重算；
+    // 这里的降亮由 `refresh_visuals` 每帧按模型重做，spawn 时先落一份免一帧闪烁）
+    if disabled {
+      dim_text(r.world_mut(), name);
+    }
   });
   row
 }

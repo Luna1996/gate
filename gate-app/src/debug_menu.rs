@@ -312,8 +312,18 @@ fn register_callbacks(world: &mut World) {
     |ev: On<MenuActionEvent>,
      mut gi: ResMut<gate_render::gi::GiSettings>,
      mut eye: ResMut<gate_render::EyeAdaptSettings>,
-     mut refl: ResMut<gate_render::ReflectionSettings>| {
+     mut refl: ResMut<gate_render::ReflectionSettings>,
+     mut base: ResMut<gate_render::BaseSettings>| {
       match (ev.path.as_str(), &ev.action) {
+        // 「基础」两个开关（菜单「渲染/基础」，勾选 = **算**）：只改 uniform `base_flags`
+        ("render/base/shadow", MenuAction::Toggle(on)) => {
+          base.shadow = *on;
+          info!("直光阴影 → {}", if *on { "on" } else { "off" });
+        }
+        ("render/base/normal", MenuAction::Toggle(on)) => {
+          base.implicit_normal = *on;
+          info!("隐式法相 → {}", if *on { "on" } else { "off（原色直出）" });
+        }
         ("render/gi/enabled", MenuAction::Toggle(on)) => {
           gi.enabled = *on;
           info!("GI → {}", if *on { "on" } else { "off" });
@@ -443,6 +453,13 @@ fn register_callbacks(world: &mut World) {
         ("render/sky/blur/focus", MenuAction::Value(v)) => {
           fog.focus = v.clamp(1.0, 64.0);
           info!("光柱集中度 → {:.0}", fog.focus);
+        }
+        // 日月**外观**开关（与下面的「覆写」正交：这个决定画不画，覆写决定角径/光晕由谁给）。
+        // 关掉 ⇒ 盘与光晕一起消失。**不受时间驱动** ⇒ `sky.rs::apply_sky` 不会覆写它
+        //（它只写 sun_cone / halo）。
+        ("render/sky/disk/enabled", MenuAction::Toggle(on)) => {
+          fog.body = *on;
+          info!("日月外观 → {}", if *on { "on" } else { "off" });
         }
         ("render/sky/disk/override", MenuAction::Toggle(on)) => {
           sky.override_disk = *on;
@@ -724,26 +741,38 @@ fn hex_srgb01(hex: &str) -> Option<[f32; 3]> {
 }
 
 /// 引擎 → 菜单（每帧）：把"引擎会自己改的那些控件"同步过去。
-///   · **时刻**：自动流逝会推进它（不写回 ⇒ 面板停在拖动那一刻，而画面里的时间早已走远）；
-///   · 「径向模糊」「天体盘」两组的**滑杆**：覆写关着时它们显示的就是时间算出来的值；
+///   · **时刻**：**仅自动流逝时**回写（那一刻引擎在推进它）；自动关着时用户是唯一作者，
+///     回写会把拖动结果当帧抹掉 —— 表现为"拖动后回弹"。与下面两组同理：引擎说了算的控件
+///     不该同时可拖（那两组干脆是禁用的）；
+///   · 「圣光」「日月」两组的**滑杆**：覆写关着时它们显示的就是时间算出来的值；
 ///   · 三个**「覆写」开关**的勾选态（真源是 `SkySettings` 的三个标志）；
-///   · **禁用态**：覆写关着的那组，下面所有行都禁用（不可交互、配色降亮）—— 值不是它说了算。
-///     widget 的配色是 spawn 时算的 ⇒ 禁用态一变就**重建当前页**（`rebuild_menu_page`，不带动画）。
-/// 「颜色」那三个拾色器不回写（它们永远是你的色，覆写只决定生不生效）。
+///   · **禁用态**：覆写关着的那组滑杆 + 自动流逝开着时的「时刻」—— 值不是它说了算的
+///     （控件不可交互、配色降亮；滑杆行还要连带降亮左侧名称）。
 ///
-/// 写两处（都在这一帧内被消费）：模型值 —— `refresh_visuals` 每帧按它刷新滑杆右侧的数值文本；
-/// 滑杆组件的 `SliderValue` —— `slider_visual_system` 按它画 fill/thumb 的位置。
+/// 写两处（都在这一帧内被消费）：模型值 —— `refresh_visuals` 每帧按它刷新滑杆右侧的数值文本，
+/// 并据此重算行内文字/色块的降亮；控件侧 —— 只装/摘 `UiDisabled`，widget 的降亮配色每帧按它重算。
+/// 「颜色」那三个拾色器不回写（它们永远是你的色，覆写只决定生不生效）。
 pub(crate) fn sync_sky_menu(
   sky: Res<gate_render::SkySettings>,
   fog: Res<gate_render::FogSettings>,
   mut commands: Commands,
   mut q_menu: Query<&mut gate_ui::DebugMenu>,
   mut q_sliders: Query<(&gate_ui::menu::MenuItem, &mut gate_ui::SliderValue)>,
-  q_toggles: Query<(Entity, &gate_ui::menu::MenuItem, Has<bevy::ui::Checked>)>,
+  q_controls: Query<(
+    Entity,
+    &gate_ui::menu::MenuItem,
+    Has<bevy::ui::Checked>,
+    Has<gate_ui::widgets::UiDisabled>,
+  )>,
+  q_swatches: Query<(Entity, &gate_ui::menu::MenuColorSwatch, Has<gate_ui::widgets::UiDisabled>)>,
 ) {
   // (控件路径, 引擎当前值)：只列"引擎会自己改"的那些
   let mut want: Vec<(&str, f32)> = Vec::with_capacity(6);
-  want.push((SKY_HOUR_PATH, sky.hour));
+  // 「时刻」只在**自动流逝**时由引擎推进（`sky.rs::apply_sky`）⇒ 仅那时回写。
+  // 自动关着时 `sky.hour` 只由用户拖动改变，再回写就等于每帧撤销拖动（回弹）。
+  if sky.auto {
+    want.push((SKY_HOUR_PATH, sky.hour));
+  }
   if !sky.override_blur {
     want.push((BLUR_STRENGTH_PATH, fog.strength()));
     want.push((BLUR_DECAY_PATH, fog.decay()));
@@ -767,7 +796,25 @@ pub(crate) fn sync_sky_menu(
     (DISK_OVERRIDE_PATH, sky.override_disk),
     (COLOR_OVERRIDE_PATH, sky.override_colors),
   ];
-  for (e, item, checked) in &q_toggles {
+  // 引擎说了算的控件 ⇒ 整行禁用（不可交互、配色降亮）。两种情形：
+  //   · 覆写**关**着的组的滑杆：显示的是时间算出来的值，不是它能定的；
+  //   · **自动流逝开着时的「时刻」**：`apply_sky` 每帧在推进它、`want` 每帧回写
+  //     ⇒ 同样不许拖（拖了也当帧被覆盖）。自动关着时它由用户唯一拥有，故那时不禁用。
+  let disable = [
+    (BLUR_STRENGTH_PATH, !sky.override_blur),
+    (BLUR_DECAY_PATH, !sky.override_blur),
+    (BLUR_FOCUS_PATH, !sky.override_blur),
+    (DISK_RADIUS_PATH, !sky.override_disk),
+    (DISK_HALO_PATH, !sky.override_disk),
+    (COLOR_SUN_PATH, !sky.override_colors),
+    (COLOR_MOON_PATH, !sky.override_colors),
+    (COLOR_SKY_PATH, !sky.override_colors),
+    (SKY_HOUR_PATH, sky.auto),
+  ];
+  // 界面侧**不重建页**：widget 的降亮配色本来就是**每帧**按 `Has<UiDisabled>` 从主题令牌重算的
+  // ⇒ 装上/摘下这个组件就够了。重建会让整页重新 spawn，而滑杆值 / `Checked` 是延迟写入的
+  // ⇒ 新控件有几帧呈"旧值"的样子（开关旋钮先跳到左边再弹回来）。
+  for (e, item, checked, disabled) in &q_controls {
     if let Some((_, on)) = overrides.iter().find(|(path, _)| *path == item.path)
       && *on != checked
     {
@@ -775,6 +822,27 @@ pub(crate) fn sync_sky_menu(
         commands.entity(e).insert(bevy::ui::Checked);
       } else {
         commands.entity(e).remove::<bevy::ui::Checked>();
+      }
+    }
+    if let Some((_, off)) = disable.iter().find(|(path, _)| *path == item.path)
+      && disabled != *off
+    {
+      if *off {
+        commands.entity(e).insert(gate_ui::widgets::UiDisabled);
+      } else {
+        commands.entity(e).remove::<gate_ui::widgets::UiDisabled>();
+      }
+    }
+  }
+  // 颜色行的**色块**自己也带禁用态：调色板能不能展开只看它（`color_picker_system` 读 `UiDisabled`）
+  for (e, swatch, disabled) in &q_swatches {
+    if let Some((_, off)) = disable.iter().find(|(path, _)| *path == swatch.path)
+      && disabled != *off
+    {
+      if *off {
+        commands.entity(e).insert(gate_ui::widgets::UiDisabled);
+      } else {
+        commands.entity(e).remove::<gate_ui::widgets::UiDisabled>();
       }
     }
   }
@@ -790,26 +858,11 @@ pub(crate) fn sync_sky_menu(
       *checked = on;
     }
   }
-
-  // 覆写**关**着的组：下面那些控件不是它说了算 ⇒ 整行禁用（不可交互、配色降亮）。
-  // 配色是 spawn 时算的 ⇒ 禁用态一变就得**重建当前页**（`rebuild_menu_page`，不带动画）。
-  let mut relayout = false;
-  for (path, disabled) in [
-    (BLUR_STRENGTH_PATH, !sky.override_blur),
-    (BLUR_DECAY_PATH, !sky.override_blur),
-    (BLUR_FOCUS_PATH, !sky.override_blur),
-    (DISK_RADIUS_PATH, !sky.override_disk),
-    (DISK_HALO_PATH, !sky.override_disk),
-    (COLOR_SUN_PATH, !sky.override_colors),
-    (COLOR_MOON_PATH, !sky.override_colors),
-    (COLOR_SKY_PATH, !sky.override_colors),
-  ] {
+  // 模型侧照写：它是"整页重新 spawn"（导航进出那一页）时的渲染依据，必须与控件一致
+  for (path, disabled) in disable {
     if let Some(node) = menu.model.node_mut(&split(path)) {
-      relayout |= node.set_disabled(disabled);
+      node.set_disabled(disabled);
     }
-  }
-  if relayout {
-    commands.queue(|world: &mut World| gate_ui::rebuild_menu_page(world));
   }
 }
 
@@ -843,19 +896,32 @@ fn write_brush_offset(
 /// **只置灰、不改值**：这个开关记的是"像素大小 = 1 时要不要抗锯齿"，切回 `1` 时它的状态立刻生效
 /// —— 界面上的勾选态、落盘值都不动（与 `sync_sky_menu` 的"覆写关着时禁用整行"同一个语义）。
 ///
-/// 与 `sync_sky_menu` / `sync_edit_menu` 同一套手法：禁用态一变就**重建当前页**（配色是 spawn 时算的）。
+/// 与其他 sync 不同的地方：**不重建页**。开关的禁用配色是每帧算的 ⇒ 只装/摘 `UiDisabled`
+/// （重建会让整页重新 spawn，而 `Checked` 延迟插入 ⇒ 开关旋钮会先跳到左边再弹回来）。
 pub(crate) fn sync_video_menu(
   scale: Res<gate_render::RenderScale>,
   mut commands: Commands,
   mut q_menu: Query<&mut gate_ui::DebugMenu>,
+  q_aa: Query<(Entity, &gate_ui::menu::MenuItem, Has<gate_ui::widgets::UiDisabled>)>,
 ) {
+  let want = scale.factor != 1;
+  // 模型侧照写：它是"整页重建"（导航进出那一页）时的渲染依据，必须与控件一致
   let Ok(mut menu) = q_menu.single_mut() else { return };
-  let mut relayout = false;
   if let Some(node) = menu.model.node_mut(&split(VIDEO_AA_PATH)) {
-    relayout |= node.set_disabled(scale.factor != 1);
+    node.set_disabled(want);
   }
-  if relayout {
-    commands.queue(|world: &mut World| gate_ui::rebuild_menu_page(world));
+  // 界面侧**不重建页**：开关的禁用态本来就是**每帧**算的（`toggle_switch_state_system` 读
+  // `Has<UiDisabled>` 重算轨道/滑块配色，滑块位置仍按 `Checked`）⇒ 装上/摘下这个组件就够了。
+  // 重建会让整页重新 spawn，而 `Checked` 是**延迟**插入的 ⇒ 新开关有几帧呈"关"的样子（旋钮跳到左边）。
+  for (e, item, disabled) in &q_aa {
+    if item.path != VIDEO_AA_PATH || disabled == want {
+      continue;
+    }
+    if want {
+      commands.entity(e).insert(gate_ui::widgets::UiDisabled);
+    } else {
+      commands.entity(e).remove::<gate_ui::widgets::UiDisabled>();
+    }
   }
 }
 
@@ -869,22 +935,44 @@ pub(crate) fn sync_video_menu(
 /// 不置灰的只有「笔触形状 / 笔触大小」（笔触几何，与材质无关）与「PBR 变体 / PBR 资产」本身。
 /// 置灰不改值：切回平凡变体时，之前调好的平凡参数原样还在。
 ///
-/// 与 `sync_sky_menu` 同一套手法：禁用态一变就**重建当前页**（`rebuild_menu_page`，不带动画）——
-/// widget 的配色（禁用态降亮）是 spawn 时算的。
+/// 与 `sync_sky_menu` 同一套手法：界面侧**不重建页**，只按路径装/摘 `UiDisabled` ——
+/// widget 的降亮配色每帧按它重算；模型侧照写，供"整页重新 spawn"（导航进出那一页）时用。
 pub(crate) fn sync_edit_menu(
   edit: Res<EditSettings>,
   mut commands: Commands,
   mut q_menu: Query<&mut gate_ui::DebugMenu>,
+  q_controls: Query<(Entity, &gate_ui::menu::MenuItem, Has<gate_ui::widgets::UiDisabled>)>,
+  q_swatches: Query<(Entity, &gate_ui::menu::MenuColorSwatch, Has<gate_ui::widgets::UiDisabled>)>,
 ) {
+  let want = edit.mat.pbr;
+  // 模型侧照写：它是"整页重新 spawn"（导航进出那一页）时的渲染依据，必须与控件一致
   let Ok(mut menu) = q_menu.single_mut() else { return };
-  let mut relayout = false;
   for path in EDIT_MATERIAL_PATHS {
     if let Some(node) = menu.model.node_mut(&split(path)) {
-      relayout |= node.set_disabled(edit.mat.pbr);
+      node.set_disabled(want);
     }
   }
-  if relayout {
-    commands.queue(|world: &mut World| gate_ui::rebuild_menu_page(world));
+  // 界面侧只装/摘 `UiDisabled`：滑杆 / 输入框 / 开关的配色都由各自的系统每帧重算
+  for (e, item, disabled) in &q_controls {
+    if !EDIT_MATERIAL_PATHS.contains(&item.path.as_str()) || disabled == want {
+      continue;
+    }
+    if want {
+      commands.entity(e).insert(gate_ui::widgets::UiDisabled);
+    } else {
+      commands.entity(e).remove::<gate_ui::widgets::UiDisabled>();
+    }
+  }
+  // 「颜色」那行的**色块**自己也带禁用态（调色板能不能展开只看它，见 `color_picker_system`）
+  for (e, swatch, disabled) in &q_swatches {
+    if !EDIT_MATERIAL_PATHS.contains(&swatch.path.as_str()) || disabled == want {
+      continue;
+    }
+    if want {
+      commands.entity(e).insert(gate_ui::widgets::UiDisabled);
+    } else {
+      commands.entity(e).remove::<gate_ui::widgets::UiDisabled>();
+    }
   }
 }
 

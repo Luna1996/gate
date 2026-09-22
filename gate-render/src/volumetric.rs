@@ -29,23 +29,31 @@ pub struct FogUniform {
   /// x = 保留（恒 0：网格分辨率除数已固定为 [`FOG_DIV`]，不再是档位）、
   /// y = **集中度**（太阳方向权重的指数）、z = **强度**、w = **朝向因子**。
   pub misc: Vec4,
-  /// x/y 保留（恒 0）、z = **天体盘角径**（rad）、w = **光晕强度**（两项都只喂 `sky_primary`，
-  /// 面板在「渲染/天空/天体盘」，见 [`FogSettings::sun_cone`] / [`FogSettings::halo`]）。
+  /// x = **日月外观开关**（1 = 画、0 = 不画；见 [`FogSettings::body`]）、y 保留（恒 0）、
+  /// z = **天体盘角径**（rad）、w = **光晕强度**（z/w 都只喂 `sky_primary`，
+  /// 面板在「渲染/天空/日月」，见 [`FogSettings::sun_cone`] / [`FogSettings::halo`]）。
   pub misc2: Vec4,
   /// xy = **天体的屏幕坐标**（0..1；可能落在画面外 —— 模糊的取样方向就是它）、zw 保留（恒 0）。
   pub misc3: Vec4,
 }
 
-/// 径向模糊（光柱）的档位（菜单「渲染/天空/径向模糊」+「渲染/天空/天体盘」）。
+/// 光柱（godray）与**日月本体**的档位（菜单「渲染/天空/圣光」+「渲染/天空/日月」）。
 ///
-/// **这五个量默认由时间曲线给**（`gate-render/src/sky.rs` 的关键帧表每帧写进来）；
+/// **五个量默认由时间曲线给**（`gate-render/src/sky.rs` 的关键帧表每帧写进来）；
 /// 面板上每组各有一个「覆写」开关：打开后本资源的值不再被覆写、由面板滑杆直接决定。
 /// 于是本结构既是"时间算出来的当前值"，也是"覆写值"（覆写开着时它才是真值）。
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
 pub struct FogSettings {
-  /// 总开关（面板上的「开启」）：关掉 ⇒ 三个 pass 一个都不派发，`dda_main` 的 group(6) 绑
+  /// 光柱总开关（面板上的「开启」）：关掉 ⇒ 三个 pass 一个都不派发，`dda_main` 的 group(6) 绑
   /// 1×1 零纹理（零成本）。**不受时间驱动**（它是"画不画光柱"，不是光柱的参数）。
   pub enabled: bool,
+  /// **日月外观开关**（面板「渲染/天空/日月/开启」）：关掉 ⇒ `sky_primary` 那一片天区只剩天光**基色**
+  /// —— **盘与它那圈光晕一起消失**（两者是同一个天体的外观，见 `sky_primary`）。
+  ///
+  /// **不受时间驱动**（同 [`Self::enabled`]：它决定"画不画"，不是外观参数）。
+  /// 它只作用于**看得见的那颗天体**（主射线 miss 的天空，以及镜面反射看到的天空）——
+  /// `sky_rgb()`（GI 的 miss、玻璃反射的逃逸）本来就不含天体外观，不受影响。
+  pub body: bool,
   /// **强度**：乘在光柱上。它是最主要的旋钮（"光柱有多亮"）。
   pub strength: f32,
   /// **衰减**：径向模糊每步的权重乘它（`< 1`）。越接近 1 ⇒ 光柱拖得越长（几乎不衰减、能到整屏）、
@@ -107,12 +115,15 @@ impl Default for FogSettings {
   fn default() -> Self {
     Self {
       enabled: true,
+      // 日月外观默认**画**（关掉是调试/取景用的：想看纯天光背景时用它）
+      body: true,
       strength: 0.5,
       decay: 0.6,
       focus: 20.0,
       // 角径取"夸张尺寸"（真实太阳只有 0.27°）：`0.27°` 在 1080p 下约 5 像素，
       // 盘的软边缘与光晕几乎没有像素可用（见 `sky.rs` 文件头的取舍）。
-      sun_cone: 1.2_f32.to_radians(),
+      // `2.4°` ≈ 时间曲线（2.0~3.2°）的中段 ⇒ 打开「覆写」时盘的大小不会突然跳一档。
+      sun_cone: 2.4_f32.to_radians(),
       halo: 0.5,
     }
   }
@@ -444,8 +455,14 @@ fn prepare_fog(
       settings.strength(),
       facing,
     ),
-    // z 与 WESL `SUN_CONE_MAX` 的关系：只在 `sky_primary` 里用于太阳盘半径（会硬夹）。
-    misc2: Vec4::new(0.0, 0.0, settings.sun_cone.max(0.0), settings.halo.max(0.0)),
+    // x = 日月外观开关（0/1），z 与 WESL `SUN_CONE_MAX` 的关系：只在 `sky_primary` 里
+    // 用于太阳盘半径（会硬夹）。
+    misc2: Vec4::new(
+      if settings.body { 1.0 } else { 0.0 },
+      0.0,
+      settings.sun_cone.max(0.0),
+      settings.halo.max(0.0),
+    ),
     misc3: Vec4::new(sun_uv.x, sun_uv.y, 0.0, 0.0),
   };
   gpu.uniform.write_buffer(&device, &queue);
