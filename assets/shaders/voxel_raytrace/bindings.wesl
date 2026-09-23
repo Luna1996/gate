@@ -125,7 +125,8 @@ struct LightDesc {
   kind_pos_dir: vec4<f32>,    // x = kind（0=方向光）；yzw = L 轴（指向光，已归一）
   color_intensity: vec4<f32>, // rgb = 线性色，w = 强度
   // 天体盘的外观（只被 `volumetric.wesl::sky_primary` 读；日月共用 lights[0] 这一个槽位，见 sky.rs）：
-  shape: vec4<f32>,           // x = 盘的亮度倍数（乘 SUN_DISK_GAIN）；yzw reserved（恒 0）
+  // x = 盘的亮度倍数（乘 SUN_DISK_GAIN）；yzw reserved（恒 0）—— **光晕**不在这里，它是大气散射，走光柱 uniform 的「光晕」。
+  shape: vec4<f32>,
 }
 struct LightGlobals {
   count: u32,
@@ -158,7 +159,10 @@ struct GiUniform {
   // 关掉则二次顶点不做太阳 NEE，`sun_transmittance` 那条阴影射线整条不发）、
   // y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
   params: vec4<f32>,
-  // x = GI 开关、yzw = 保留（恒 0）
+  // x = GI 开关、y = 每帧采样预算分摊 N、z = 误差驱动重分配档位、
+  // w = **第二条弹射的倍数**（菜单「渲染/光照/二次弹射」）：0 = 关；1 = 每个候选都带；
+  //     > 1 = 弹射分裂（每个候选以 `1/本值` 的概率带上、带上时乘本值 ⇒ 期望无偏，只有方差变大）。
+  //     落点在 `gi/screen.wesl` 的候选循环（抽签）与 `gi/ray.wesl::gi_bounce2`（乘积）。
   misc: vec4<f32>,
   // x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率，2 = 半分辨率；整数值的 f32，只被
   // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
@@ -168,8 +172,10 @@ struct GiUniform {
   // 本 pass 只用它区分「高」档（1/4 档新鲜候选数与 reservoir 记忆窗按它取，见 `gi/consts.wesl`）；
   // 档位影响的 pass 派发（时域/atrous 开关、核半径）由 Rust 决定。
   flags: vec4<f32>,
-  // x = 自增帧号（精确 u32；yzw = 保留，恒 0）。
-  // **所有整数帧逻辑只用本字段**（本帧的 RNG 种子混入、像素 hash）。帧号曾经以 f32 存在
+  // x = 自增帧号（精确 u32）、y = **二次顶点缓存的 epoch**（光照 / 几何 / 光照场窗口的修订号；
+  // Rust `prepare_gi` 逐项比对、变了才自增 ⇒ 参与 `gi_sec_slots` 槽里键的掩码，见 `gi/common.wesl`
+  // 的「跨帧持久」段）、zw = 保留（恒 0）。
+  // **所有整数帧逻辑只用 x**（本帧的 RNG 种子混入、像素 hash）。帧号曾经以 f32 存在
   // `params.x` —— 超过 2^24 后 f32 无法表示连续整数，种子会偶发重复；`gpu.frame` 本就是 u32，
   // 这里逐字镜像、不再经 f32。
   seq: vec4<u32>,
@@ -255,8 +261,10 @@ struct FogUniform {
 
 /// @binding(9)：**二次顶点按面缓存**（槽布局 = `gi/common.wesl` 的 `GI_SEC_*`）。
 /// 键口径与 `face_slots` 相同（`gi_key0`/`gi_key1`），但填充者是 GI 射线自己（惰性、写同值 ⇒ 竞态
-/// 幂等）：同一个面被成千上万条射线打到时只算一次二次顶点着色。生命周期同样只有一帧
-/// （Rust 每帧在 `gi_main` 之前整块清空）；它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
+/// 幂等）：同一个面被成千上万条射线打到时只算一次二次顶点着色（含它那条太阳 NEE 阴影射线）。
+/// **跨帧持久**（与 `face_slots` 不同）：不需要认领、**没有每帧清空**，槽里的键带 epoch 掩码
+/// （uniform `gi_u.seq.y`）⇒ 光照 / 几何 / 光照场窗口一变整张表自失效。算法与代价、撕裂窗口的
+/// 处理都在 `gi/common.wesl` 的那两段说明里；这里只声明它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
 @group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
 
 // ===== @group(6)：光柱（godray）的**读侧**（只给 `dda_main` 的 pipeline）=====
@@ -297,6 +305,16 @@ struct FogUniform {
 /// 一份（刻意 —— 不拉进 brickmap / 相机矩阵），而「bind group 必须从索引 0 起成前缀设置」
 /// ⇒ 它们够不到 group(4)。加一个 4 字节 storage 是最省的接法。
 @group(0) @binding(20) var<storage, read> gi_den_cfg: array<u32>;
+
+/// 18/19：**① 逐面合并**（`main.wesl::gi_face_flatten`）的 group(0) 声明 —— 那个 pass 不拉整套
+/// group(0..5)，只挂三件东西：导引（用上面的 binding 10）+ 逐面去重表（18，与 `@group(5) @binding(8)`
+/// 是同一块 buffer）+ GI 写入侧（19，与 `@group(5) @binding(2)` 是同一张纹理）。
+/// **同一资源在两个 group 各声明一次**是本工程既有手法（先例：`gi_guide_out`/`gi_guide`、
+/// `fog_u`/`fog_u_blur`）；group(0) 的 18/19 在现有各 layout 里都空着。
+/// ⚠️ 这两个名字与 group(5) 的两份是**两块绑定的同一资源**，查槽请用 `face_slot_of_flat`
+/// （`face_slot_of` 读的是 group(5) 的声明，会把 group(5) 拖进这个只有瘦 group(0) 的 pass）。
+@group(0) @binding(18) var<storage, read_write> face_slots_flat: array<atomic<u32>>;
+@group(0) @binding(19) var gi_out_flat: texture_storage_2d<rgba16float, write>;
 
 // ===== @group(7)：眼睛适应（自动曝光）——被 `dda_main`（读曝光）与 eye_adapt_* 两个入口使用 =====
 /// `out_tex` 的采样视图（同一张图），统计曝光已应用之后的颜色。

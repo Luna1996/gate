@@ -1,6 +1,6 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
-import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
+import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_of, face_slot_of_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
@@ -365,6 +365,135 @@ struct GiInput {
   uv: vec2<f32>,         // 逐像素路径的采样位置（全分辨率归一化）
 }
 
+/// 反射抖动种子：**按面**取（MT8-6 —— 一个可见体素面 = 一条反射方向 = 一个反射值，与材质色同格）。
+/// 键 = grid 局部体素坐标 + 面号 + obj_id：`voxel` 是 **grid 局部**坐标 ⇒ 同一世界坐标上主世界与
+/// 物体可能各有一个体素，带上 obj_id 才不会让两者共用种子。
+/// `gi_mix` 是 GI 侧现成的哈希（`gi/common.wesl`；本工程 WESL 解析器不接受 `^`，故按乘-加-移位写）。
+fn refl_seed(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> u32 {
+  let rkey = face_id | ((u32(obj_id) + 1u) << 3u);
+  return gi_mix(
+    u32(voxel.x) * 0x9E3779B1u
+    + gi_mix(u32(voxel.y) * 0x85EBCA77u
+    + gi_mix(u32(voxel.z) * 0xC2B2AE3Du
+    + gi_mix(rkey * 0x27D4EB2Fu + 0x165667B1u))));
+}
+
+/// **镜面反射的内容（唯一实现）**：从一个可见面出发追反射链，返回累积的反射辐亮度 `refl_env`。
+/// **不含**主表面那一次 Fresnel 与粗糙度淡出、也不含"替换式"那一扣 —— 那三项在消费侧按同一个
+/// `fade` 一起算（见 `shade_face` 的反射段）。
+/// 光源项从 uniform 自取（与 `shade_face` 的调用方传进来的那三份**逐字同源**：同一个
+/// `light_u.lights[0]` / `sky_color`）⇒ 两边不会因为"谁传了什么"而分叉。
+fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m: MaterialParams,
+                  frustum_length: f32) -> vec3<f32> {
+  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
+  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+  let sky = light_u.sky_color.xyz;
+  // 起点 = 与阴影射线**同一个构造**（命中体素中心沿 n 推 `0.5/|n| + eps` ⇒ 恰在表面外侧），
+  // 口径一致、不另立第二套外推。它同时是下面那次着色里"本条射线的起点"。
+  let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
+  // 镜面方向由**逐面**视向量 `v` 给出（`reflect` 要入射方向 ⇒ 传 `-v`）⇒ 一个体素面一条方向、
+  // 一个反射值 = "反射逐体素"。代价：反射是**块状镜面**（按面采样），不再是逐像素的清晰镜面 ——
+  // 本档的预期，见 `common.wesl::face_view_dir` 里"已知代价"那一段与两次实测的历史。
+  let mirror = reflect(-v, n);
+  var rdir = refl_cone_dir(mirror, gi_rand2(rseed), PBR_REFL_CONE_K * m.roughness);
+  // 抖动后的方向若掉到面下方（掠射 + 大锥角）会立刻自命中所在体素 ⇒ 退回完美镜面方向。
+  if (dot(rdir, n) <= 0.0) { rdir = mirror; }
+  let r_org = p_voxel + n * n_off;
+  // ============================================================================
+  // MT4-5 · **反射链**（`nest` = 最多再嵌几级，见 `LightGlobals::refl_nest`）
+  //
+  // 一次反射的内容 = 命中点自己的出射亮度 **+** 它自己的反射（前提是它**也**是镜面）。串起来：
+  //   `refl_env = local(0) + w(0)·[ local(1) + w(1)·[ … ] ]`
+  // `w(k)` = 第 k 级命中面的 `fresnel_schlick(f0, v·n) × 粗糙度淡出`，`chain_w` 是累积的 Π w。
+  // `refl_env` 累积的是**不含主表面那一次 Fresnel** 的反射内容 —— 那一次在循环外乘（见
+  // `shade_face` 的「替换式」那段），与嵌套层级无关。
+  //
+  // **成本闸门**：只有"上一级命中的面**本身也是镜面**"（与主表面同一个 `PBR_REFL_*` 判据）
+  // 才继续 —— 墙 / 地形 / 普通方块在**第一级就断链** ⇒ 日常场景下 `nest` 拨到几都一样，
+  // 多出来的只是一次判据。钱只花在真的把镜子对着镜子摆的地方：最坏 `nest + 1` 条反射射线
+  // （档 3 时每条再 +1 条阴影射线）。
+  //
+  // **画风不变**：每一级的方向都取自**逐面**视向量与按面种子（MT8-6）⇒ 嵌套的镜像仍是
+  // 块状镜面，一个体素面一个反射值。
+  // ============================================================================
+  let tier = light_u.g.refl_tier;
+  let nest = light_u.g.refl_nest;
+  var refl_env = vec3<f32>(0.0);
+  var chain_w = vec3<f32>(1.0);
+  var chain_org = r_org;
+  var chain_dir = rdir;
+  for (var lvl = 0u; lvl <= nest; lvl = lvl + 1u) {
+    let h = world_raycast(make_grid(0u), chain_org, chain_dir,
+                          frustum_length, world_cfg_full(0.0, 3u));
+    if (!h.hit) {
+      // 逃逸到天空 ⇒ 反射内容就是天空，链条结束。**档 ≥2** 走 `sky_primary`（方向性天空 +
+      // 太阳盘/光晕：镜子里看得见太阳，与主 pass 的 miss 同一个口径）；**档 1** 走 `sky_rgb()`
+      // （纯色天光，全工程唯一的 miss 辐亮度）。两侧都只算 ALU、不发线。
+      refl_env = refl_env
+               + chain_w * select(sky_rgb(), sky_primary(chain_dir, sun_dir, sun_c), tier >= 2u);
+      break;
+    }
+    // 命中点**必须**经 `fetch_material` + `brdf_reflected`（硬约束 1：不许手写第二套近似
+    // 着色 —— 那正是 MT4-1 刚从 `trace_glass` 里清掉的那类第四处表达式）。
+    let hgg = make_grid(u32(h.obj_id) + 1u);
+    let hn = voxel_normal(hgg, h.voxel, h.face_id, h.n);
+    let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
+    // 命中点 = 一个**完整的着色点**：材质与着色都走全工程同一组函数（`fetch_material` +
+    // `brdf_reflected` + `emissive_radiance`，硬约束 1/3 不分叉），差异只有两条，都是写明的：
+    //   · `gi = 0`：那是本像素**屏空间**的缓冲，反射点常常不在屏幕上，借过来就是错的；
+    //   · `sun_vis`：**档 3** 走真实 NEE；**档 1/2** 取 1.0（无遮挡近似 —— 与 `trace_glass` 的
+    //     玻璃反射同一条有意约定：不给反射再加一条阴影射线）。天光 `amb` 取
+    //     `sky · GI_SKY_AMBIENT · ao`（与 GI 二次顶点逐字相同，反射点没有 GI 缓冲 ⇒ 没有 `cov` 地板）。
+    // `emissive_radiance` 与玻璃反射同一句 ⇒ 发光体素在镜子里发光。
+    let hamb = sky * GI_SKY_AMBIENT * light_field_ao(h.point, h.obj_id);
+    // 命中点的视向量：用它**自己那条射线**（起点 `chain_org` → 命中体素中心）⇒ **逐面**
+    // （硬约束 3：所有着色点共用 `face_view_dir` 同一份契约）。
+    let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
+    // 命中点沿自己的着色法线外推半个体素 + eps —— 与主路径的阴影射线**同一个构造**。
+    // 它同时是阴影射线的起点与（若继续）下一级反射射线的起点，口径一致、只有一份公式。
+    let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3))
+              + SHADOW_SURFACE_EPS;
+    let h_start = h.point + hn * h_off;
+    var h_vis = 1.0;
+    // 反射链的太阳 NEE 与不透明路径**同一个「直光阴影」开关**（关掉就是全场景不做遮挡）
+    if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
+      h_vis = sun_transmittance(h_start, sun_dir, h.voxel, h.obj_id);
+    }
+    // 「本级也值得追，**并且**还允许再追一级」——前半句与主表面**同一个判据**
+    // （F0 亮度门 × 粗糙度淡出 > 0）；后半句是 `lvl < nest`。
+    // 两件事必须分开判：**扣掉本级那条近似，前提是下一级真的会去取代它** ——
+    // 末级（`lvl == nest`）命中镜面时没有下一级，扣了就是白丢一份能量（回归到"旧口径"而非更好）。
+    let hf0 = f0_of(hm);
+    let h_fade = clamp(1.0 - hm.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
+    let h_continue =
+      lvl < nest && h_fade > 0.0
+      && dot(hf0, GI_LUMA) >= PBR_REFL_MIN_F0;
+    var h_local = brdf_reflected(hm, hn, hv,
+                                 SurfaceLight(sun_dir, sun_c, h_vis, hamb, vec3<f32>(0.0)))
+                + emissive_radiance(hm, GI_EMIT_GAIN);
+    if (h_continue) {
+      // 「替换式」（与主表面同一条口径）：本级既然是镜面，它**自身**那条 `F0·(amb+gi)` 近似
+      // 由下一级的真实反射取代 ⇒ 先扣掉，否则镜面环境项又被算一遍。
+      h_local = h_local - hf0 * hamb;
+    }
+    refl_env = refl_env + chain_w * h_local;
+    if (!h_continue) { break; }
+    // ---- 沿本级继续反射：方向 / 种子 / 起点 ----
+    // 方向与主表面**同一个构造**（`reflect(-v, n)`，`v` 逐面）。抖动种子把**层级**混进按面种子里
+    // （`gi_mix` 是 GI 侧现成的哈希；本工程 WESL 解析器不接受 `^`，故按加-混写）。
+    let h_mirror_dir = reflect(-hv, hn);
+    var h_dir = refl_cone_dir(h_mirror_dir, gi_rand2(gi_mix(rseed + lvl * 0x9E3779B1u)),
+                              PBR_REFL_CONE_K * hm.roughness);
+    // 抖动后掉到面下方（掠射 + 大锥角）会立刻自命中所在体素 ⇒ 退回完美镜面方向。
+    if (dot(h_dir, hn) <= 0.0) { h_dir = h_mirror_dir; }
+    chain_org = h_start;
+    chain_dir = h_dir;
+    // 下一级的贡献要乘上本级的 Fresnel × 粗糙度淡出（`h_fade > 0` 已由 `h_mirror` 保证）。
+    chain_w = chain_w * fresnel_schlick(hf0, max(dot(hv, hn), 0.0)) * h_fade;
+  }
+  return refl_env;
+}
+
 /// **逐面着色（唯一实现）**：`dda_main`（未认领 / 撞键的面，逐像素）与 `dda_face_main`
 /// （被认领的面，逐面算一次）共用同一份代码 ⇒ 去重不改变任何像素的结果。
 ///
@@ -595,131 +724,16 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         // `refl_env`（反射内容）在下面射线落地处初始化：它 = 反射命中点的出射亮度，或"逃逸到天空"
         // 时取的那份天空。
         // ---- MT8-6 · 抖动种子**按体素面**取（键 = grid 局部体素坐标 + 面号 + obj_id）----
-        // 改之前它是**按屏幕像素**的（`hash(coord0.xy)`，MT4 的写法）。
-        // 为什么必须按面（两条都是用户实测结论，原文见文件头的 MT8-6 段）：
-        //   ① 反射"逐体素还是连续模糊"由种子决定：同一个键给出**同一个抖动量** ⇒ 一个体素面上的所有
-        //      像素采到**同一条**反射射线 ⇒ 一个体素面一个反射值，反射于是与材质色一样"一格一格"；
-        //      按像素取时同面内每个像素各采锥内一个不同样本，锥角（≈5.6°）把方向抹开 ⇒ 树影/屋顶
-        //      边缘平滑模糊（用户的第一张截图）。
-        //   ② 同面内逐像素随机 + **无时域累积**（MT4 有意不做，见上面 MT4-2 边界）= 单像素一次随机
-        //      采样 ⇒ **颗粒感**且永不收敛（用户的第二张截图）。同面同种子后，锥内一个面只采样一次
-        //      ⇒ 噪声从"逐像素椒盐"退化成"逐体素小块"（与几何台阶同尺度，视觉上不再是颗粒）。
-        // ⚠️ **这不是缓存**：下面照样**每个触发像素各发一条射线**（成本与改前完全一致），唯一的区别是
-        //    同一个体素面的那条射线用同一个抖动样本。MT8-3 的反射缓存已按实测删除、**不要复活**。
-        // 种子**不含帧号**：MT4 有意不做时域累积 ⇒ 混入帧号只会让每个面逐帧换方向 = 静止画面上的闪烁。
-        // `gi_mix` 是 GI 侧现成的哈希（`gi/common.wesl`；本工程 WESL 解析器不接受 `^`，故按
-        // 乘-加-移位写）—— **不另造哈希 / RNG**。
-        // 面号与 obj_id 一起进键（`face | (obj+1)<<3`，与 MT8-3 当时的手法一致）：`best.voxel` 是
-        // **grid 局部**坐标 ⇒ 同一世界坐标上主世界与物体可能各有一个体素，带上 obj_id 才不会让两者
-        // 共用种子（当前场景全是主世界，带上更稳，代价是几行）。
-        let rkey = best.face_id | ((u32(best.obj_id) + 1u) << 3u);
-        let rseed = gi_mix(
-          u32(best.voxel.x) * 0x9E3779B1u
-          + gi_mix(u32(best.voxel.y) * 0x85EBCA77u
-          + gi_mix(u32(best.voxel.z) * 0xC2B2AE3Du
-          + gi_mix(rkey * 0x27D4EB2Fu + 0x165667B1u))));
-        // 镜面方向由**逐面**视向量 `v` 给出（`reflect` 要入射方向 ⇒ 传 `-v`）⇒ 一个体素面一条方向、
-        // 一个反射值 = "反射逐体素"。它与上面那个按面种子（MT8-6）现在是**同一粒度** ⇒ 同面内逐位相同。
-        // 代价：反射是**块状镜面**（按面采样），不再是逐像素的清晰镜面 —— 本档的预期，见
-        // `common.wesl::face_view_dir` 里"已知代价"那一段与两次实测的历史。
-        let mirror = reflect(-v, n);
-        var rdir = refl_cone_dir(mirror, gi_rand2(rseed), PBR_REFL_CONE_K * m.roughness);
-        // 抖动后的方向若掉到面下方（掠射 + 大锥角）会立刻自命中所在体素 ⇒ 退回完美镜面方向。
-        if (dot(rdir, n) <= 0.0) { rdir = mirror; }
-        // 起点 = 与阴影射线**同一个构造**（`p_voxel + n * n_off`：命中体素中心沿 n 推 `0.5/|n| + eps`
-        // ⇒ 恰在表面外侧），口径一致、不另立第二套外推。它同时是下面那次着色里"本条射线的起点"。
-        let r_org = p_voxel + n * n_off;
-        // ============================================================================
-        // MT4-5 · **反射链**（`nest` = 最多再嵌几级，见 `LightGlobals::refl_nest`）
-        //
-        // 一次反射的内容 = 命中点自己的出射亮度 **+** 它自己的反射（前提是它**也**是镜面）。串起来：
-        //   `refl_env = local(0) + w(0)·[ local(1) + w(1)·[ … ] ]`
-        // `w(k)` = 第 k 级命中面的 `fresnel_schlick(f0, v·n) × 粗糙度淡出`，`chain_w` 是累积的 Π w。
-        // `refl_env` 累积的是**不含主表面那一次 Fresnel** 的反射内容 —— 那一次在循环外乘（见底下
-        // 「替换式」那段），与嵌套层级无关。
-        //
-        // **成本闸门**：只有"上一级命中的面**本身也是镜面**"（与主表面同一个 `PBR_REFL_*` 判据）
-        // 才继续 —— 墙 / 地形 / 普通方块在**第一级就断链** ⇒ 日常场景下 `nest` 拨到几都一样，
-        // 多出来的只是一次判据。钱只花在真的把镜子对着镜子摆的地方：最坏 `nest + 1` 条反射射线
-        // （档 3 时每条再 +1 条阴影射线）。
-        //
-        // **画风不变**：每一级的方向都取自**逐面**视向量与按面种子（MT8-6）⇒ 嵌套的镜像仍是
-        // 块状镜面，一个体素面一个反射值。
-        // ============================================================================
-        let nest = light_u.g.refl_nest;
-        var refl_env = vec3<f32>(0.0);
-        var chain_w = vec3<f32>(1.0);
-        var chain_org = r_org;
-        var chain_dir = rdir;
-        for (var lvl = 0u; lvl <= nest; lvl = lvl + 1u) {
-          let h = world_raycast(make_grid(0u), chain_org, chain_dir,
-                                frustum_length, world_cfg_full(0.0, 3u));
-          if (!h.hit) {
-            // 逃逸到天空 ⇒ 反射内容就是天空，链条结束。**档 ≥2** 走 `sky_primary`（方向性天空 +
-            // 太阳盘/光晕：镜子里看得见太阳，与主 pass 的 miss 同一个口径）；**档 1** 走 `sky_rgb()`
-            // （纯色天光，全工程唯一的 miss 辐亮度）。两侧都只算 ALU、不发线。
-            refl_env = refl_env
-                     + chain_w * select(sky_rgb(), sky_primary(chain_dir, sun_dir, sun_c), tier >= 2u);
-            break;
-          }
-          // 命中点**必须**经 `fetch_material` + `brdf_reflected`（硬约束 1：不许手写第二套近似
-          // 着色 —— 那正是 MT4-1 刚从 `trace_glass` 里清掉的那类第四处表达式）。
-          let hgg = make_grid(u32(h.obj_id) + 1u);
-          let hn = voxel_normal(hgg, h.voxel, h.face_id, h.n);
-          let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
-          // 命中点 = 一个**完整的着色点**：材质与着色都走全工程同一组函数（`fetch_material` +
-          // `brdf_reflected` + `emissive_radiance`，硬约束 1/3 不分叉），差异只有两条，都是写明的：
-          //   · `gi = 0`：那是本像素**屏空间**的缓冲，反射点常常不在屏幕上，借过来就是错的；
-          //   · `sun_vis`：**档 3** 走真实 NEE；**档 1/2** 取 1.0（无遮挡近似 —— 与 `trace_glass` 的
-          //     玻璃反射同一条有意约定：不给反射再加一条阴影射线）。天光 `amb` 取
-          //     `sky · GI_SKY_AMBIENT · ao`（与 GI 二次顶点逐字相同，反射点没有 GI 缓冲 ⇒ 没有 `cov` 地板）。
-          // `emissive_radiance` 与玻璃反射同一句 ⇒ 发光体素在镜子里发光。
-          let hamb = sky * GI_SKY_AMBIENT * light_field_ao(h.point, h.obj_id);
-          // 命中点的视向量：用它**自己那条射线**（起点 `chain_org` → 命中体素中心）⇒ **逐面**
-          // （硬约束 3：所有着色点共用 `face_view_dir` 同一份契约）。
-          let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
-          // 命中点沿自己的着色法线外推半个体素 + eps —— 与主路径的阴影射线**同一个构造**。
-          // 它同时是阴影射线的起点与（若继续）下一级反射射线的起点，口径一致、只有一份公式。
-          let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3))
-                    + SHADOW_SURFACE_EPS;
-          let h_start = h.point + hn * h_off;
-          var h_vis = 1.0;
-          // 反射链的太阳 NEE 与不透明路径**同一个「直光阴影」开关**（关掉就是全场景不做遮挡）
-          if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
-            h_vis = sun_transmittance(h_start, sun_dir, h.voxel, h.obj_id);
-          }
-          // 「本级也值得追，**并且**还允许再追一级」——前半句与主表面**同一个判据**
-          // （F0 亮度门 × 粗糙度淡出 > 0）；后半句是 `lvl < nest`。
-          // 两件事必须分开判：**扣掉本级那条近似，前提是下一级真的会去取代它** ——
-          // 末级（`lvl == nest`）命中镜面时没有下一级，扣了就是白丢一份能量（回归到"旧口径"而非更好）。
-          let hf0 = f0_of(hm);
-          let h_fade = clamp(1.0 - hm.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
-          let h_continue =
-            lvl < nest && h_fade > 0.0
-            && dot(hf0, GI_LUMA) >= PBR_REFL_MIN_F0;
-          var h_local = brdf_reflected(hm, hn, hv,
-                                       SurfaceLight(sun_dir, sun_c, h_vis, hamb, vec3<f32>(0.0)))
-                      + emissive_radiance(hm, GI_EMIT_GAIN);
-          if (h_continue) {
-            // 「替换式」（与主表面同一条口径）：本级既然是镜面，它**自身**那条 `F0·(amb+gi)` 近似
-            // 由下一级的真实反射取代 ⇒ 先扣掉，否则镜面环境项又被算一遍。
-            h_local = h_local - hf0 * hamb;
-          }
-          refl_env = refl_env + chain_w * h_local;
-          if (!h_continue) { break; }
-          // ---- 沿本级继续反射：方向 / 种子 / 起点 ----
-          // 方向与主表面**同一个构造**（`reflect(-v, n)`，`v` 逐面）。抖动种子把**层级**混进按面种子里
-          // （`gi_mix` 是 GI 侧现成的哈希；本工程 WESL 解析器不接受 `^`，故按加-混写）。
-          let h_mirror_dir = reflect(-hv, hn);
-          var h_dir = refl_cone_dir(h_mirror_dir, gi_rand2(gi_mix(rseed + lvl * 0x9E3779B1u)),
-                                    PBR_REFL_CONE_K * hm.roughness);
-          // 抖动后掉到面下方（掠射 + 大锥角）会立刻自命中所在体素 ⇒ 退回完美镜面方向。
-          if (dot(h_dir, hn) <= 0.0) { h_dir = h_mirror_dir; }
-          chain_org = h_start;
-          chain_dir = h_dir;
-          // 下一级的贡献要乘上本级的 Fresnel × 粗糙度淡出（`h_fade > 0` 已由 `h_mirror` 保证）。
-          chain_w = chain_w * fresnel_schlick(hf0, max(dot(hv, hn), 0.0)) * h_fade;
-        }
+        // 一个体素面 = 一条反射方向 = 一个反射值（与材质色同格）；按像素取时同面内每个像素各采锥内
+        // 一个不同样本、锥角（≈5.6°）把方向抹开 ⇒ 树影/屋顶边缘变成连续模糊，且**没有时域累积**时
+        // 噪声永不收敛（颗粒感）。详细的三条实测结论在文件头的 MT8-6 段，种子的构造在 `refl_seed`。
+        // ⚠️ **这不是缓存**：下面照样**每个触发像素各发一条射线**（成本与改前完全一致）。
+        // MT8-3 的反射缓存已按实测删除、**不要复活**。
+        // 种子**不含帧号**：这条路径不做时域累积 ⇒ 混入帧号只会让每个面逐帧换方向 = 静止画面上的闪烁。
+        // 反射内容（含 MT4-5 的嵌套链）由 `refl_env_chain` 算，种子由 `refl_seed` 按面给出。
+        let refl_env = refl_env_chain(p_voxel, n, v,
+                                      refl_seed(best.voxel, best.face_id, best.obj_id),
+                                      m, frustum_length);
         // 权重 = Schlick Fresnel（同一个 `fresnel_schlick`：完美镜面下 h ≈ n ⇒ 余弦取 `v·n`）
         //        × 粗糙度淡出（`roughness → PBR_REFL_MAX_ROUGH` 时权重**连续**归零 ⇒ 粗糙度扫描下
         //        总亮度单调、阈值处不出现亮度台阶；这也是 MT4-3 的能量自检要看的量）。
@@ -944,6 +958,9 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
   if ((k0 | k1) == 0u) { return; }
   var ok = false;
+  // 逐面两个 pass 的 group(5) 里就有 `face_slots`（`dda_layouts`）⇒ 这里用 `face_slot_of`（读的是
+  // `@group(5) @binding(8)` 那份声明）。**新入口**（`gi_face_flatten`）的 layout 里没有 group(5)，
+  // 它必须用 `face_slot_of_flat`（见那个函数的说明）。
   let slot = face_slot_of(k0, k1, &ok);
   if (!ok) { return; }
   let fe = slot * FACE_WORDS;
@@ -1051,11 +1068,49 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ============================================================================
 // GI 降噪（`gi/denoise.wesl`）：**时域累积** + **迭代 atrous** 两段，都跑在 GI 网格
 // （= 渲染分辨率 / gi_div）上。
-// 顺序（Rust `dispatch_dda`）：`gi_main` → `gi_denoise_temporal` → `gi_denoise_atrous1/2/4/8/16`
-// （步长 1/2/4/8/16 = NRD/RELAX 的 5 轮 a-trous；实际跑几轮 = `GI_DEN_ATROUS_ITER`，
-// 中间靶只有 4 张 ⇒ 后面几轮靠 a↔b ping-pong）。最终结果落在 `gi_den`（`dda_main` 采样它，
-// 原始 `gi_out` 保留作对照）。
+// 顺序（Rust `dispatch_dda`）：`gi_main` → `gi_face_flatten` → `gi_denoise_temporal`
+// → `gi_denoise_atrous1/2/4/8/16`（步长 1/2/4/8/16 = NRD/RELAX 的 5 轮 a-trous；实际跑几轮
+// = `GI_DEN_ATROUS_ITER`，中间靶只有 4 张 ⇒ 后面几轮靠 a↔b ping-pong）。最终结果落在 `gi_den`
+// （`dda_main` 采样它，原始 `gi_out` 保留作对照）。
 // ============================================================================
+
+/// ① **逐面合并的落地 pass**：把每个 GI texel 的估计换成"它所在那个面"的均值。
+/// 位置：紧跟 `gi_main`（定点累加在那一步做完了）、排在降噪链**之前** —— 于是时域累积与 atrous
+/// 拿到的是"整个面一个值"的输入（面内不再有逐 texel 的独立噪声）。
+/// 派发规模 = GI 网格；只有"槽已被本面认领、且两个键 word 逐位相等"的 texel 会被改写，
+/// 撞键 / 未认领的面保持 `gi_main` 写下的逐 texel 值（只损失收益，不损失正确性）。
+///
+/// 与 `dda_face_accum` 是两件事：那个求的是**降噪之后**的逐面均值（供 `dda_face_main` 逐面着色，
+/// 因为时域/atrous 之后面内仍可能有细微差异），本 pass 求的是**降噪之前**的逐面均值（为了降噪）。
+/// 定点参数与 CAS 预留计数的溢出账共用 `GI_ACC_*`（见 `gi/common.wesl`）。
+@compute @workgroup_size(8, 8, 1)
+fn gi_face_flatten(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let size = textureDimensions(gi_out_flat);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let idx = gid.y * size.x + gid.x;
+  let gb = idx * GI_DEN_GUIDE_WORDS;
+  let k0 = gi_guide[gb + GI_DEN_G_KEY0];
+  let k1 = gi_guide[gb + GI_DEN_G_KEY1];
+  // 天空 texel：`gi_out` 已是 0（`gi_ss_main` 的 miss 分支），不动。
+  if ((k0 | k1) == 0u) { return; }
+  var ok = false;
+  // 查槽走 `face_slot_of_flat`（读 `@group(0) @binding(18)` 那份声明）：本 pass 的 layout 只有
+  // group(0)，调 `face_slot_of` 会把 group(5) 拖进来 ⇒ pipeline 创建直接失败（见那个函数的说明）。
+  let slot = face_slot_of_flat(k0, k1, &ok);
+  if (!ok) { return; }
+  let fe = slot * FACE_WORDS;
+  if (atomicLoad(&face_slots_flat[fe + FACE_W_FLAG]) == 0u
+      || atomicLoad(&face_slots_flat[fe + FACE_W_K0]) != k0
+      || atomicLoad(&face_slots_flat[fe + FACE_W_K1]) != k1) { return; }
+  let n = atomicLoad(&face_slots_flat[fe + FACE_W_RAW_N]);
+  if (n == 0u) { return; }
+  let inv = 1.0 / (f32(n) * GI_ACC_SCALE);
+  let flat = vec3<f32>(
+    f32(atomicLoad(&face_slots_flat[fe + FACE_W_RAW])),
+    f32(atomicLoad(&face_slots_flat[fe + FACE_W_RAW + 1u])),
+    f32(atomicLoad(&face_slots_flat[fe + FACE_W_RAW + 2u]))) * inv;
+  textureStore(gi_out_flat, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(flat, 1.0));
+}
 
 /// 时域累积：读本帧原始 GI + 导引 + 上帧历史 → 写累积色/矩/历史长度（双缓冲）+ φ。
 @compute @workgroup_size(8, 8, 1)

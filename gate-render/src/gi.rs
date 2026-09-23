@@ -25,7 +25,9 @@ pub struct GiUniform {
   /// x = **二次顶点太阳反弹**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/太阳反弹」）、
   /// y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
   pub params: Vec4,
-  /// x = GI 开关（0/1）、y = **每帧采样预算分摊 N**（见 `GiSettings::share`）、zw = 保留（恒 0）
+  /// x = GI 开关（0/1）、y = **每帧采样预算分摊 N**（见 `GiSettings::share`）、
+  /// z = 误差驱动重分配档位、w = **第二条弹射的倍数**（`GiSettings::bounce2_mult`：0 = 关 /
+  /// 4 = 稀疏 / 1 = 全；菜单「渲染/光照/二次弹射」）。
   pub misc: Vec4,
   /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率、4 = 四分之一；**整数值的 f32**，
   /// 只被 `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
@@ -35,13 +37,63 @@ pub struct GiUniform {
   /// （`GI_SS_CAND_N` vs `..._HQ`）与记忆窗（`GI_SS_M_CAP_K` vs `..._HQ`）——**这两项与分辨率档无关**。
   /// 时域/atrous 的派发与核半径不在本 pass 里，由 Rust 的 `denoise_plan` 决定。
   pub flags: Vec4,
-  /// x = 自增帧号（精确 u32；yzw 恒 0）。所有整数帧逻辑（本帧的 RNG 种子混入、像素 hash）都用它：
+  /// x = 自增帧号（精确 u32）、**y = 二次顶点缓存的 epoch**（见 [`GiGpu::epoch`]；
+  /// 光照 / 几何 / 光照场窗口的修订号 ⇒ `gi_sec_slots` 槽里键的掩码，跨帧持久的前提）、
+  /// zw = 保留（恒 0）。所有整数帧逻辑（本帧的 RNG 种子混入、像素 hash）都用 x：
   /// 帧号曾经以 f32 存在 `params.x`，超过 2^24 后无法表示连续整数 ⇒ 种子会偶发重复。
   pub seq: UVec4,
   /// 上一帧的相机矩阵（时域复用：把本帧主命中点重投影到上帧 GI 网格）。
   /// `prepare_gi` 每帧把上帧实际用过的那一份写进 uniform，再把当前帧的存下来 ⇒ 与上帧逐位一致。
   /// 只被 `prev_view_proj` 消费（重投影三维点不需要逆矩阵）。
   pub prev_view_proj: Mat4,
+}
+
+/// ② **二次顶点缓存的 epoch 输入**：`gi_secondary_shade` 的全部输入（逐项比对，任一变化即自增）。
+/// 只比位、不比语义（f32 一律比 `to_bits()`）—— 目的只是"变了就失效"，比"算不算真的变了"更保守才对。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GiEpochKey {
+  /// 世界几何修订号（`GiGpu::world_rev`）：几何一变，命中面与遮挡都可能变。
+  world_rev: u32,
+  /// 太阳方向（世界系，指向光）与色 × 强度。
+  sun_dir: [u32; 3],
+  sun_c: [u32; 3],
+  /// 天光色（sRGB 编码，与 `sky_rgb()` 的输入同一个）。
+  sky: [u32; 3],
+  /// 「二次顶点太阳反弹」开关：关掉时二次顶点不做 NEE ⇒ 值是另一个数。
+  sun_bounce: bool,
+  /// **光照场窗口原点**（cell）：`gi_secondary_shade` 的 AO 项读它，而它随相机按 16 体素步进、
+  /// 窗口外的点 `light_field_ao` 恒返回 1.0 ⇒ 原点一变，值就可能不同。
+  lf_origin_cell: [i32; 3],
+}
+
+impl GiEpochKey {
+  fn of(
+    world_rev: u32,
+    sun_bounce: bool,
+    theme: Option<&crate::lighting::LightingTheme>,
+    cam_voxel: glam::Vec3,
+  ) -> Self {
+    let bits3 = |v: [f32; 3]| v.map(f32::to_bits);
+    let (sun_dir, sun_c, sky) = match theme {
+      Some(t) => {
+        let (dir, c) = match &t.sun {
+          Some(s) => {
+            let l = -glam::Vec3::from(s.dir).normalize_or_zero();
+            (
+              [l.x, l.y, l.z],
+              [s.color[0] * s.intensity, s.color[1] * s.intensity, s.color[2] * s.intensity],
+            )
+          }
+          None => ([0.0; 3], [0.0; 3]),
+        };
+        let sky = t.sky.as_ref().map_or(crate::consts::MINECRAFT_SKY, |s| s.color);
+        (bits3(dir), bits3(c), bits3(sky))
+      }
+      None => (bits3([0.0; 3]), bits3([0.0; 3]), bits3(crate::consts::MINECRAFT_SKY)),
+    };
+    let c = crate::brickmap::upload::light_field_origin_cell(cam_voxel);
+    Self { world_rev, sun_dir, sun_c, sky, sun_bounce, lf_origin_cell: [c.x, c.y, c.z] }
+  }
 }
 
 /// GI 档位（菜单「渲染/GI」）：`enabled` → uniform `misc.x`；`gi_div` → uniform `flags.y`。
@@ -109,6 +161,19 @@ pub struct GiSettings {
   /// ⇒ **窗内样本数不变**（噪声不变，只有响应时间随像素变）⇒ 不会出现"少采样→更脏→要更多采样"的振荡。
   /// 省下来的钱正是"已经收敛的像素"（静态区域通常占画面大多数），花在阴影边缘/去遮挡/几何细节上。
   pub realloc: u32,
+  /// **第二条弹射档位**（菜单「渲染/光照/二次弹射」；0 = 关 / 1 = 稀疏 / 2 = 全）。
+  ///
+  /// GI 原本只算**一次弹射**（二次顶点按「太阳 NEE + 天光 × AO」着色，见 `gi/ray.wesl`）⇒ 丢掉
+  /// 二次以上的弹射（多面互反射 / 彩色渗色）。本档在**二次顶点上再发一条余弦射线**，把它的入射
+  /// 辐亮度按 `kD·albedo·L2` 叠回二次顶点的出射辐亮度 —— 即"多一跳"，物理上就是缺少的那一项。
+  ///
+  /// 成本与做法（落点 `gi/screen.wesl` 的候选循环 + `gi/ray.wesl::gi_bounce2`）：
+  ///   · 档 1「稀疏」= 每个候选**以 1/4 的概率**带上这一项、带上时乘 4 ⇒ 期望无偏、只有方差变大，
+  ///     而**额外射线数 = 候选数的 1/4**（每候选 4 条时正好 +1 条，即 +25% 的 GI 射线）；
+  ///   · 档 2「全」= 每个候选都带（额外射线数 = 候选数，即 GI 射线 ×2）—— 极限画质的对照点。
+  ///   · 第三条顶点的着色（含它那条太阳 NEE）**走同一个二次顶点缓存** ⇒ 不随候选数增长。
+  /// 方向逐候选随机（含帧号）⇒ 这一项不是"冻住的逐面常数"，降噪链的时域累积能把它平均掉。
+  pub depth: u32,
 }
 
 /// 「降噪质量」档的派发计划（`(是否跑降噪, atrous 轮数, atrous 核半径)`）。
@@ -141,6 +206,25 @@ impl GiSettings {
 
   /// 菜单「渲染/RESTIR GI/采样重分配」的档位数（0 = 关 ..= 3 = 强）；**下标 = 档位本身**。
   pub const REALLOC_TIERS: u32 = 4;
+
+  /// 菜单「渲染/光照/二次弹射」的档位数（0 = 关 / 1 = 稀疏 / 2 = 全）。
+  pub const BOUNCE2_TIERS: u32 = 3;
+
+  /// 生效的弹射档位（越界值钳回来）。
+  pub fn depth_tier(&self) -> u32 {
+    self.depth.min(Self::BOUNCE2_TIERS - 1)
+  }
+
+  /// 本档的**第二条弹射倍数**（uniform `gi_u.misc.w`）：0 = 关、4 = 稀疏、1 = 全。
+  /// uniform 里传的是"倍数"：WESL 侧的抽签概率是它的倒数（`1.0 / max(倍, 1.0)`），
+  /// 命中时把这一项乘上倍数补齐期望 —— 两者必须成对，改一处就要改另一处。
+  pub fn bounce2_mult(&self) -> f32 {
+    match self.depth_tier() {
+      0 => 0.0,
+      1 => 4.0,
+      _ => 1.0,
+    }
+  }
 
   /// 生效的重分配档位（越界值钳回来）。
   pub fn realloc_tier(&self) -> u32 {
@@ -182,7 +266,8 @@ impl Default for GiSettings {
     // 默认 1/4 档 + 「低」降噪档：与实测最划算的组合一致（时域 + 3×3 的 5 轮 atrous），
     // 想要更干净就往「中/高」拨，想量原始噪声与上限帧率就拨到「关」。
     // 太阳反弹默认关：实测画面差异细微（静态场景几乎看不出），代价却是 `gate_gi` 的 41%。
-    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false, share: 2, realloc: 0 }
+    // 二次弹射默认关（= 与引入前逐位一致）：它改的是**能量**（多一跳的间接光），要开就拨「稀疏」。
+    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false, share: 2, realloc: 0, depth: 0 }
   }
 }
 
@@ -394,6 +479,52 @@ pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
+/// ① 逐面合并的落地 pass（`gi_face_flatten`）的布局：**只有 group(0)**，三件东西 ——
+/// 导引（10，只读）、逐面去重表（18，读写：`gi_main` 认领 + 累加、本 pass 读平均值）、
+/// GI 写入侧（19，`gi_out` 的存储视图：本 pass 把面均值写回）。
+/// 为什么另起一份而不复用主 pass 的 group(5)：本 pass 只读导引 + 写 GI，**绝不采样 GI 纹理**
+/// （同一 pass 内同一张纹理既采样又写入是 wgpu 的硬错），也不碰 brickmap / 相机矩阵 ⇒
+/// 一个瘦布局最省，且与 `gi_den_*` 的两个布局是同一个先例。
+pub fn gi_flatten_layout() -> BindGroupLayoutDescriptor {
+  use bevy::render::render_resource::*;
+  const C: ShaderStages = ShaderStages::COMPUTE;
+  BindGroupLayoutDescriptor::new(
+    "GiFlatten",
+    &[
+      BindGroupLayoutEntry {
+        binding: 10,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 18,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 19,
+        visibility: C,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::WriteOnly,
+          format: TextureFormat::Rgba16Float,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
+    ],
+  )
+}
+
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiGpu {
   pub uniform: bevy::render::render_resource::UniformBuffer<GiUniform>,
@@ -414,6 +545,15 @@ pub struct GiGpu {
   /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）；
   /// 实际跑几轮由 `GI_DEN_ATROUS_ITER` 决定（1..=5，Rust 按它选 src→dst 链）。
   pub den_pipelines: [Option<CachedComputePipelineId>; 6],
+  /// ① 逐面合并的落地 pass（`gi_face_flatten`）：layout 只有 group(0)（见 [`gi_flatten_layout`]），
+  /// 派发在 `gi_main` 之后、降噪链之前。
+  pub flatten_pipeline: Option<CachedComputePipelineId>,
+  /// ② **二次顶点缓存的 epoch**（uniform `seq.y`）：光照 / 几何 / 光照场窗口的任一输入变化就自增。
+  /// 它参与 `gi_sec_slots` 槽里键的掩码 ⇒ 一变整张表自失效。表**不清空**（省掉每帧的 `clear_buffer`），
+  /// 所以 epoch 必须覆盖 `gi_secondary_shade` 的**全部**输入（见 [`GiEpochKey`]）。
+  pub epoch: u32,
+  /// 上一帧用过的 epoch 输入（`None` = 还没比过 ⇒ 首帧自增一次，无妨）。
+  epoch_key: Option<GiEpochKey>,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
@@ -513,6 +653,9 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     world_rev: 0,
     world_rev_gi: 0,
     den_pipelines: [None; 6],
+    flatten_pipeline: None,
+    epoch: 0,
+    epoch_key: None,
   });
 }
 
@@ -556,6 +699,15 @@ fn queue_gi_pipelines(
       ..Default::default()
     }));
   }
+  // ① 逐面合并的落地 pass：layout 只有 group(0)（导引 / 逐面去重表 / GI 写入侧，见 `gi_flatten_layout`）。
+  // 它不依赖 `DdaPipelines`（那份 layout 里有 brickmap 与相机矩阵），所以与降噪那几个排在同一处。
+  gpu.flatten_pipeline = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_gi_face_flatten")),
+    layout: vec![gi_flatten_layout()],
+    shader: dda_shader.0.clone(),
+    entry_point: Some(Cow::from("gi_face_flatten")),
+    ..Default::default()
+  }));
 }
 
 fn extract_gi_settings(
@@ -569,6 +721,7 @@ fn extract_gi_settings(
     sun_bounce: s.sun_bounce,
     share: s.share(),
     realloc: s.realloc_tier(),
+    depth: s.depth_tier(),
   }));
 }
 
@@ -580,6 +733,7 @@ fn prepare_gi(
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
   settings: bevy::ecs::system::Res<GiSettings>,
   view: Option<bevy::ecs::system::Res<crate::brickmap::dda::DdaViewUniform>>,
+  lighting: Option<bevy::ecs::system::Res<crate::lighting::LightingTheme>>,
   aux: Option<bevy::ecs::system::Res<crate::brickmap::dda::AuxTexCache>>,
   dirty: Option<bevy::ecs::system::Res<crate::brickmap::upload::BrickMapDirty>>,
   mut gi_ph: bevy::ecs::system::ResMut<GiPlaceholder>,
@@ -606,6 +760,20 @@ fn prepare_gi(
   }
   let skip_verify = gpu.world_rev == gpu.world_rev_gi;
 
+  // ---- ② 二次顶点缓存的 epoch ----
+  // 输入 = `gi_secondary_shade` 的全部输入（几何修订号、太阳方向/色×强度、天光色、「太阳反弹」、
+  // 光照场窗口原点）。**逐项比对、变了才自增**（不做哈希：哈希只是把"变没变"变得更难查）。
+  // 只比位（f32 比 `to_bits`）⇒ 值改了但位没变（不可能）与位变了值没变（保守失效）都安全。
+  let cam_voxel = view.as_ref().map_or(glam::Vec3::ZERO, |v| v.cam_pos_voxel.truncate());
+  let epoch_key =
+    GiEpochKey::of(gpu.world_rev, settings.sun_bounce, lighting.as_deref(), cam_voxel);
+  if gpu.epoch_key != Some(epoch_key) {
+    gpu.epoch_key = Some(epoch_key);
+    gpu.epoch = gpu.epoch.wrapping_add(1);
+    // 逐帧都可能翻（相机每移动 16 体素就换光照场窗口）⇒ debug 级，INFO 只服务排查当前这一次运行。
+    bevy::log::debug!(target: "gate", "GI 二次顶点缓存 epoch → {}", gpu.epoch);
+  }
+
   // ---- uniform（字段与 WESL `GiUniform` 逐字段镜像）----
   let u = GiUniform {
     params: Vec4::new(
@@ -618,7 +786,8 @@ fn prepare_gi(
       if settings.enabled { 1.0 } else { 0.0 },
       settings.share() as f32,
       settings.realloc_tier() as f32,
-      0.0,
+      // ④ 第二条弹射的倍数（0 = 关 / 4 = 稀疏 / 1 = 全；WESL 侧按它的倒数抽签）。
+      settings.bounce2_mult(),
     ),
     flags: Vec4::new(
       0.0,
@@ -628,7 +797,9 @@ fn prepare_gi(
       settings.tier() as f32,
     ),
     // 整数帧号走 u32 通道（`seq.x`）：`gpu.frame` 本就是 u32，不再经 `params.x` 的 f32 截断。
-    seq: UVec4::new(gpu.frame, 0, 0, 0),
+    // `seq.y` = 二次顶点缓存的 epoch（见上面的比对块）—— 它必须与本次写入的 `gi_sec_slots` 一致，
+    // 所以同一次 uniform 写入里一起下发。
+    seq: UVec4::new(gpu.frame, gpu.epoch, 0, 0),
     // 上一帧相机矩阵（时域重投影）：写「上帧真正用过的那一份」，再把本帧存下来。
     prev_view_proj: gpu.prev_view_proj,
   };

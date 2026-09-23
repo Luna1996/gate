@@ -365,6 +365,20 @@ fn register_callbacks(world: &mut World) {
           gi.sun_bounce = *on;
           info!("GI 二次顶点太阳反弹 → {}", if *on { "on" } else { "off" });
         }
+        // 「二次弹射」档（菜单「渲染/光照/二次弹射」）：在二次顶点上再发**一条**余弦射线，把"多一跳"
+        // 的间接光（互反射 / 彩色渗色）叠回去 —— 关掉时 GI 只算一次弹射。
+        // 档位 → uniform `gi_u.misc.w` 里的**倍数**（0 = 关、4 = 稀疏、1 = 全）：WESL 侧按它的**倒数**
+        // 抽签、命中时乘它补齐期望 ⇒ 期望无偏、只有方差变大（见 `gi/screen.wesl` 的候选循环）。
+        ("render/gi/depth", MenuAction::Select(i)) => {
+          let t = (*i).min((gate_render::gi::GiSettings::BOUNCE2_TIERS - 1) as usize) as u32;
+          gi.depth = t;
+          let (name, mult) = match t {
+            0 => ("关", 0.0),
+            1 => ("稀疏", 4.0),
+            _ => ("全", 1.0),
+          };
+          info!("GI 二次弹射 → {name} mult={mult}");
+        }
         // 「分帧」档（1/2/4/8）：把 GI 的采样预算摊到 N 帧上 —— 每帧只发 `基准候选数 ÷ N` 条射线，
         // 记忆窗同步 ×N。**帧时间是平的**（不是"集中到某一帧"）；窗内样本总数不变 ⇒ 稳态噪声不变，
         // 只有响应时间 ×N（`GI_SS_M_CAP_K` 帧 ≈ 0.53s ⇒ N=4 时 ≈ 2.1s）。

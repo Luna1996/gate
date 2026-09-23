@@ -1,5 +1,5 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_N_DOT, GI_LUMA, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_ERR_M_REF, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance, gi_ray_secondary_key};
@@ -251,6 +251,12 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
   // 二次顶点太阳反弹（菜单「渲染/RESTIR GI/太阳反弹」）：0 = 连 NEE 阴影射线都不发。
   let sun_bounce = gi_u.params.x;
+  // ② 二次顶点缓存的 epoch（`gi_u.seq.y`）：光照/几何/光照场窗口变了才自增 ⇒ 槽里的键掩码跟着变、
+  // 整张表自失效（跨帧持久，见 `gi/common.wesl`）。
+  let epoch = gi_u.seq.y;
+  // ④ 第二条弹射的**倍数**（菜单「渲染/光照/二次弹射」，`gi_u.misc.w`）：0 = 关；
+  // 1 = 每个候选都带；> 1 = 弹射分裂（每个候选以 `1/本值` 的概率带上、带上时乘本值 ⇒ 期望无偏）。
+  let b2_mult = gi_u.misc.w;
 
   // 只有天空（miss）无效：MT5-1 前这里还要求"首命中非介质"，那条判废已删除（见函数头）。
   if (!h.hit) {
@@ -402,9 +408,16 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     var b_s: array<GiRaySample, GI_SS_RAY_BATCH>;
     for (var i = 0u; i < nb; i = i + 1u) {
       let kk = k + i;
-      let dir = gi_cos_hemisphere(n, gi_rand2(gi_mix(seed + kk * 0x9E3779B9u + 1u)));
+      let cseed = gi_mix(seed + kk * 0x9E3779B9u + 1u);
+      let dir = gi_cos_hemisphere(n, gi_rand2(cseed));
       b_dir[i] = dir;
-      b_s[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce);
+      // ④ **弹射分裂的抽签**：每个候选独立地以 `1/b2_mult` 的概率带上第二条弹射，带上时把它乘
+      // `b2_mult` ⇒ 期望值不变（无偏），只有方差变大。**必须逐候选随机**（不能用 `kk % mult` 这种
+      // 确定性规则）：分帧档下 `cand_n` 可能只有 1 条，那时确定性规则会让每一帧的唯一候选都命中
+      // ⇒ 时域累积到的是一个恒为 `mult ×` 的值，直接变成系统性偏差。
+      // 抽签用同一批哈希（`gi_rand2` 的第二个分量），不另造随机源；种子含帧号 ⇒ 逐帧独立。
+      let b2 = select(0.0, b2_mult, gi_rand2(gi_mix(cseed + 0x27D4EB2Fu)).y < 1.0 / max(b2_mult, 1.0));
+      b_s[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce, epoch, b2, cseed);
     }
     for (var i = 0u; i < nb; i = i + 1u) {
       let kk = k + i;
@@ -484,4 +497,38 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 覆盖度 cov 与 valid 是同一个场（旧实现单开一张 `gi_cov_out` 写的恒是「valid ? 1 : 0」），
   // 所以这里只写这一张、`dda_main` 从 `a` 自取。
   textureStore(gi_out, coord, vec4<f32>(gi, 1.0));
+
+  // ---- ① 逐面合并：把本 texel 的估计定点累加到该面的槽（`gi_face_flatten` 事后取面均值）----
+  // 同一个面的所有 texel 的估计是**同一个积分**的独立估计 ⇒ 面内平均是纯降噪（方差 ÷ texel 数）。
+  // 只有"槽已被本面认领、且两个键 word 逐位相等"才并：撞键 / 抢在认领之前到达的 texel 一律跳过
+  // （那条路退化成逐 texel，只损失收益、不会污染别的面）。
+  // 定点 + CAS 预留计数的手法与 `dda_face_accum` 逐字一致（`GI_ACC_*` 的溢出账也共用）。
+  if (pk_ok) {
+    var fok = false;
+    let fslot = face_slot_of(pk0, pk1, &fok);
+    if (fok) {
+      let fe = fslot * FACE_WORDS;
+      if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != 0u
+          && atomicLoad(&face_slots[fe + FACE_W_K0]) == pk0
+          && atomicLoad(&face_slots[fe + FACE_W_K1]) == pk1) {
+        // 归一化 + 定点取整（进位到最近，避免系统性偏暗）—— 与 `dda_face_accum` 同一句。
+        let q = clamp(gi, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+        let qv = vec3<u32>(round(q * GI_ACC_SCALE));
+        var reserved = false;
+        loop {
+          let c = atomicLoad(&face_slots[fe + FACE_W_RAW_N]);
+          if (c + 1u > GI_ACC_MAX_N) { break; }
+          if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_RAW_N], c, c + 1u).exchanged) {
+            reserved = true;
+            break;
+          }
+        }
+        if (reserved) {
+          atomicAdd(&face_slots[fe + FACE_W_RAW], qv.x);
+          atomicAdd(&face_slots[fe + FACE_W_RAW + 1u], qv.y);
+          atomicAdd(&face_slots[fe + FACE_W_RAW + 2u], qv.z);
+        }
+      }
+    }
+  }
 }

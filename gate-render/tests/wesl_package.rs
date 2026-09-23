@@ -20,6 +20,7 @@ fn wesl_package_compiles_and_validates() {
     "dda_face_accum",
     "beam_main",
     "gi_main",
+    "gi_face_flatten",
     "gi_denoise_temporal",
     "gi_denoise_atrous1",
     "gi_denoise_atrous16",

@@ -5,7 +5,7 @@
 //   · `gi/ray.wesl`     —— 射线命中后算键（时域验证与复用都吃它）；
 //   · `gi/denoise.wesl` —— 降噪导引的键与法线打包（与复用判据必须是同一套编码）。
 
-import package::bindings::{face_slots, gi_sec_slots};
+import package::bindings::{face_slots, face_slots_flat, gi_sec_slots};
 
 /// 键合法范围：13 bit 有符号偏移（voxel 坐标绝对值 < 4096）。
 fn gi_key_ok(v: vec3<i32>) -> bool {
@@ -93,10 +93,24 @@ fn gi_cos_hemisphere(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
 //   ③ 相机落在体素格线上沿轴看时，整列体素中心的投影**逐位重合**（引擎相机以体素为单位，这是常态）。
 //   ⇒ 任何"用屏幕像素当存储位置"的方案都缺一个"不同量子 → 不同位置"的前提；哈希表只做
 //      "键 → 槽"，撞键（槽被别的键占）退化成**该面逐像素内联着色** ⇒ 只损失收益、绝不损失正确性。
+// ---- ① 逐面合并（本表同时承担"面级 reservoir"的角色）----
+// 同一个可见体素面的**全部 texel 的 GI 射线起点/法线与外推量完全相同**（`gi_ss_main` 的 `org`），
+// 只有种子不同 ⇒ 它们的候选是**同一个积分的 i.i.d. 样本** ⇒ 把它们各自的估计先按面平均，
+// 方差 ÷ texel 数（这就是"面越大越干净"的来源，也是下面 `FACE_W_RAW*` 那对字段存在的理由）。
+// 链路三段：
+//   ① `gi_ss_main` 末尾把本 texel 的估计**定点累加**进 `FACE_W_RAW*`（与认领同一张表、同一个键）；
+//   ② 新 pass `gi_face_flatten`（`main.wesl`）把该面的均值写回 `gi_out` —— 只有"被认领、且键逐位相等"
+//      的 texel 会被改写，撞键 / 未认领的面照旧逐 texel（只损失收益，不损失正确性）；
+//   ③ 降噪链拿到的输入因此是"整个面一个值"，时域累积的方差驱动权重与 atrous 的 range 权重都作用在
+//      更干净的信号上（面内不再有逐 texel 的独立噪声）。
+// 与 `FACE_W_GI*` 的分工：那对装**降噪之后**的值（`dda_face_accum` 写，供 `dda_face_main` 取逐面均值，
+// 因为时域/atrous 之后面内仍可能有细微差异），这对装**降噪之前**的估计 ⇒ 两对互不覆盖。
+
 /// 每槽字数。0 = 认领标志（CAS 目标）、1/2 = 面键、3 = 认领者 texel 下标、4 = palette 条目号、
 /// 5..7 = **着色结果**（线性 rgb，曝光前；`dda_main` 与 `dda_face_main` 共用 `shade_face`）、
-/// 8 = GI 累加计数、9..11 = GI 累加和（**定点**，见 `GI_ACC_*`）。
-const FACE_WORDS: u32 = 12u;
+/// 8 = GI 累加计数、9..11 = GI 累加和（**降噪后**的值，定点，见 `GI_ACC_*`；`dda_face_accum` 写）、
+/// 12 = 本帧**合并计数**、13..15 = 本帧合并和（**降噪前**的原始估计，定点）—— 见下面 ① 那段。
+const FACE_WORDS: u32 = 16u;
 const FACE_W_FLAG: u32 = 0u;
 const FACE_W_K0: u32 = 1u;
 const FACE_W_K1: u32 = 2u;
@@ -105,6 +119,13 @@ const FACE_W_PAL: u32 = 4u;
 const FACE_W_COL: u32 = 5u;
 const FACE_W_GI_N: u32 = 8u;
 const FACE_W_GI: u32 = 9u;
+/// ① **逐面合并**的两个字段（同一张表的另一对累加器，语义与上面那对**不重叠**）：
+/// `12` = 本帧把估计并进来的 texel 数、`13..15` = 它们的估计和（定点）。
+/// 为什么要有第二对：`FACE_W_GI*` 装的是**降噪之后**的值（供 `dda_face_main` 取逐面均值），
+/// 而这里装的是**降噪之前**的原始估计 —— 它要在降噪链**之前**按面合并（`gi_face_flatten`），
+/// 好让时域/atrous 的输入从一开始就是"整个面一个值"。
+const FACE_W_RAW_N: u32 = 12u;
+const FACE_W_RAW: u32 = 13u;
 
 /// **逐面 GI 均值**的定点参数（WGSL 默认没有 float 原子 ⇒ 只能加整数）。
 /// 每个 GI texel 把自己的 GI 值（`gi_tex.rgb`，已含增益）加上去，面着色时除以计数取平均。
@@ -121,6 +142,8 @@ const FACE_W_GI: u32 = 9u;
 /// **上限由溢出定**：单条贡献 ≤ `CLAMP × SCALE`、参与数封顶 `MAX_N = 1024`
 /// ⇒ 4096 × 255 × 1024 = 1.07e9（占 u32 的 25%；再翻一档 16384 就是 4.28e9，会溢出）。
 /// 计数用 CAS 预留 ⇒ 和不会被并发冲过（见 `dda_face_accum`）。
+/// ** ① 的原始估计合并（`FACE_W_RAW*`）用同一组参数**：它加的是"已经乘好增益、除好 π"的
+/// `gi` 值（与 `gi_out.rgb` 同量纲），量级同样被 `CLAMP` 之外的部分钳住、参与数同样封顶 ⇒ 同一份溢出账。
 const GI_ACC_SCALE: f32 = 4096.0;
 const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;
@@ -157,15 +180,55 @@ fn face_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
 // 只有 workgroup 级的 `storageBarrier`）：那一条射线读到 0，等于少一个二次顶点样本 —— 属于随机
 // 估计里的一次异常样本（每 texel 每帧 4~8 个样本，还有时域累积与降噪），不可见也不逐帧相干。
 // 写入顺序刻意是「辐亮度 → 键」，配合"键不符 ⇒ 重算"的回退。
+//
+// ---- 跨帧持久（epoch 掩码键）：**这张表不再每帧清空** ----
+// 槽里的键写成 `键 + mask(epoch)`（见 `gi_sec_key_masked`），读侧用**同一个** epoch 重算掩码再逐位比。
+// epoch 一变，旧槽的掩码值与新期望恒不相等 ⇒ 整张表**自失效**（不需要任何清表，省掉每帧的
+// `clear_buffer`，2K + 1/4 档那张表约 42MB/帧）。epoch 的构成 = `gi_secondary_shade` 的**全部输入**
+// （Rust 侧 `prepare_gi` 逐项比对、变了才自增，经 uniform `gi_u.seq.y` 下发）：
+//   · 世界几何修订号（几何变了 ⇒ 命中面/遮挡都可能变）；
+//   · 太阳方向 / 颜色 / 强度、天光色、「太阳反弹」开关（`sun_bounce`）；
+//   · **光照场窗口原点**（`light_field_ao` 的输入：它随相机按 16 体素步进，窗口外的点恒返回 1.0）。
+// 为什么可以跨帧留用：槽里的值是 `(命中的可见体素面, 上面那些光照量)` 的**纯函数** —— 它不含任何
+// 逐像素 / 逐帧随机量（`gi_secondary_shade` 的采样点、法线、视向量、NEE 起点全部只由那个面决定），
+// 所以同一 epoch 内任何时刻重算都逐位相同。
+// 代价：撞键（两个面哈希到同一槽）从"只损失收益"变成"每帧互相覆写"（仍然只损失收益：都 miss）；
+// 以及"不同面同时覆写同一槽"的撕裂窗口比原来大（原来只在首触帧可能发生）—— 读侧用**两次键校验**
+// （键 → 辐亮度 → 键）把窗口收到几十个周期的量级，剩下的归入上面那类"一次异常样本"。
 const GI_SEC_WORDS: u32 = 5u;
 const GI_SEC_W_K0: u32 = 0u;
 const GI_SEC_W_K1: u32 = 1u;
 const GI_SEC_W_RAD: u32 = 2u;
 
+/// **面键 → 槽下标**，与下面 `face_slot_of` **同一个哈希、同一张表**，但槽数取自 `@group(0)` 的
+/// `face_slots_flat` 声明 —— 给 `gi_face_flatten` 这个"只有瘦 group(0)"的入口用。
+///
+/// ⚠️ **两个声明必须绑同一块 buffer**（Rust 侧就是这么绑的）：否则槽数不同 ⇒ 哈希取模不同 ⇒ 查到
+/// 别的槽。**不要**把它换成 `face_slot_of`：那个函数读的是 `@group(5) @binding(8)` 的声明，
+/// 会把 group(5) 拖进这个 pass 的 pipeline layout（实测会直接 fail：
+/// `ResourceBinding { group: 5, binding: 8 } is not available in the pipeline layout`）。
+fn face_slot_of_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+  let n = arrayLength(&face_slots_flat) / FACE_WORDS;
+  *ok = n >= 1u;
+  if (!*ok) { return 0u; }
+  return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
+}
+
 /// 面键 → 二次顶点缓存的槽下标。`ok = false` = 表未就绪 ⇒ 该射线走内联着色。
+/// 哈希只用**明文键**（与 epoch 无关）：同一面在同一槽里跨 epoch 复用，只是槽里的键要重新盖掩码。
 fn gi_sec_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   let n = arrayLength(&gi_sec_slots) / GI_SEC_WORDS;
   *ok = n >= 1u;
   if (!*ok) { return 0u; }
   return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
+}
+
+/// 槽里键的 **epoch 掩码**：`存储值 = 明文键 + 本函数`，读侧用同一个 epoch 重算掩码再逐位比 ⇒
+/// epoch 一变，旧槽恒不相等（整表自失效，不需要清表）。两个 word 用**不同的**混合式，避免
+/// "两半同步平移"让别的键偶然对齐；`gi_mix` 是本文件现成的哈希（不另造）。
+fn gi_sec_key_masked(k0: u32, k1: u32, epoch: u32) -> vec2<u32> {
+  return vec2<u32>(
+    k0 + gi_mix(epoch * 0x9E3779B1u + 0x165667B1u),
+    k1 + gi_mix(gi_mix(epoch + 0x85EBCA77u) + 0x27D4EB2Fu),
+  );
 }

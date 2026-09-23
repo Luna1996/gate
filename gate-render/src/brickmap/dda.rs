@@ -1201,6 +1201,10 @@ pub(crate) struct AuxTexCache {
   den_cfg_r: u32,
   /// 历史双缓冲 + atrous 轮次的换绑状态（每次真正跑降噪时翻转一次）。
   den_flip: bool,
+  /// ① **逐面合并**的落地 pass（`gi_face_flatten`）的 bind group：只有 group(0) 三个绑定
+  /// （10 = 导引、18 = 逐面去重表、19 = GI 写入侧），布局见 `crate::gi::gi_flatten_layout`。
+  /// 与 GI 分辨率同帧重建（三件资源都是）。
+  gi_flatten_bg: Option<BindGroup>,
 }
 /// atrous 的 src→dst 组合表（下标 = `AuxTexCache::den_bg` 的 1..7）。
 /// 链的选取只取决于 `GI_DEN_ATROUS_ITER`（见 `DEN_ATROUS_ROUNDS`）。
@@ -2017,6 +2021,22 @@ pub(crate) fn prepare_dda_bind_groups(
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
 
+  // ---- ① 逐面合并的 bind group（`gi_face_flatten`，layout 只有 group(0) 三个绑定）----
+  // 10 = 导引（读键与法线）、18 = 逐面去重表（读 `gi_main` 累加进去的那对字段）、
+  // 19 = GI 写入侧（把面均值写回）。**不绑 GI 的采样视图**：本 pass 不采样它
+  // （同一 pass 内同一张纹理既采样又写入是 wgpu 的硬错）。
+  let gi_flatten_layout = pipeline_cache.get_bind_group_layout(&crate::gi::gi_flatten_layout());
+  let gi_flatten_bg = render_device.create_bind_group(
+    None,
+    &gi_flatten_layout,
+    &[
+      BindGroupEntry { binding: 10, resource: gi_guide.as_entire_binding() },
+      BindGroupEntry { binding: 18, resource: face_slots.as_entire_binding() },
+      BindGroupEntry { binding: 19, resource: BindingResource::TextureView(&gi_view) },
+    ],
+  );
+  beam_cache.gi_flatten_bg = Some(gi_flatten_bg);
+
   // ---- 降噪的小配置（`@group(0) @binding(20)`，1 个 word = atrous 核半径）----
   // 降噪两个 pass 的 layout 只有 group(0)（刻意：不拉进 brickmap / 相机矩阵），而 bind group
   // 必须从索引 0 起成前缀设置 ⇒ 它们够不到 `@group(4)` 的 `gi_u`，只能用这个 4 字节的小 buffer。
@@ -2283,12 +2303,11 @@ pub(crate) fn dispatch_dda(
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
     // 逐面去重表**每帧整块清空**（`FACE_W_FLAG == 0` = 空槽）：清空必须排在 `gi_main` 之前，
     // 否则上一帧的认领会把本轮同槽的新键挡在门外（撞键只会少赚，但残留表会让收益归零）。
-    // 二次顶点缓存同样整块清空：它的值依赖太阳与光照，跨帧留用会拿到过期光照。
+    // 二次顶点缓存（`gi_sec_slots`）**不清空**：它靠槽里键的 epoch 掩码自失效（uniform `gi_u.seq.y`，
+    // 由 `prepare_gi` 逐项比对光照/几何/光照场窗口的输入后自增）⇒ 省掉每帧那份 clear 带宽
+    // （2K + 1/4 档那张表约 42MB/帧），见 `gi/common.wesl` 的「跨帧持久」段。
     if let Some(fs) = aux.face_slots_buffer() {
       ctx.command_encoder().clear_buffer(fs, 0, None);
-    }
-    if let Some(ss) = aux.gi_sec_slots_buffer() {
-      ctx.command_encoder().clear_buffer(ss, 0, None);
     }
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_gi", |pass| {
       pass.set_pipeline(gi_pipe);
@@ -2300,6 +2319,31 @@ pub(crate) fn dispatch_dda(
       pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     });
+  }
+
+  // ---- ① 逐面合并的落地 pass（`gi_face_flatten`）----
+  // 位置：`gi_main` 之后、降噪链**之前**（时域/atrous 的输入因此是"整个面一个值"）。
+  // **与「降噪质量」档无关**：档 0 也跑（它改的是 GI 自身的输入，不属于降噪链）。
+  // 它只读导引与逐面表、写 GI 纹理（不采样 GI）⇒ 单独一个只有 group(0) 的 layout。
+  if gi.as_ref().is_some_and(|g| g.enabled)
+    && let Some(aux) = aux.as_ref()
+    && let Some(gi_gpu) = gi_gpu.as_ref()
+    && let Some(bg) = aux.gi_flatten_bg.as_ref()
+    && let Some(pipe) =
+      gi_gpu.flatten_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
+  {
+    let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
+    let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_gi_face_flatten",
+      |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+      },
+    );
   }
 
   // ---- GI 降噪（时域 → 迭代 atrous）：必须紧跟 `gi_main`、排在主 pass 之前 ----

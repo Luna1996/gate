@@ -91,6 +91,19 @@ label = "menu.render.gi.sun_bounce"
 checked = false
 tooltip = "menu.render.gi.sun_bounce.tip"
 
+# 二次弹射：二次顶点上再发一条余弦射线，叠回"多一跳"的间接光（默认关 = 只算一次弹射）
+[[items.children.children]]
+kind = "switch_group"
+id = "depth"
+label = "menu.render.gi.depth"
+options = [
+    "menu.render.gi.depth.off",
+    "menu.render.gi.depth.sparse",
+    "menu.render.gi.depth.full",
+]
+selected = 0
+tooltip = "menu.render.gi.depth.tip"
+
 [[items.children.children]]
 kind = "switch_group"
 id = "res"
