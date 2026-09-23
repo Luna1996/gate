@@ -50,8 +50,8 @@ kind = "sub_menu"
 id = "render"
 label = "menu.render"
 
-# ---- 「基础」：把着色链里两件"基础"的事关掉（A/B 观感与成本）----
-# 置位/勾选 = **算**；默认两个都开 = 引入开关前的行为。
+# ---- 「基础」：把着色链里几件"基础"的事关掉（A/B 观感与成本）----
+# 置位/勾选 = **算**；默认全开 = 引入这些开关前的行为。
 [[items.children]]
 kind = "sub_menu"
 id = "base"
@@ -72,6 +72,14 @@ id = "shadow"
 label = "menu.render.base.shadow"
 checked = true
 tooltip = "menu.render.base.shadow.tip"
+
+# 环境遮蔽：光照场 AO。关掉 ⇒ 间接项/天光项不乘它，且光照场的 CPU 重铺与上传整条停掉
+[[items.children.children]]
+kind = "toggle"
+id = "ao"
+label = "menu.render.base.ao"
+checked = true
+tooltip = "menu.render.base.ao.tip"
 
 [[items.children]]
 kind = "sub_menu"

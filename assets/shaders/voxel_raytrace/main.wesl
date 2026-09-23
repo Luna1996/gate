@@ -1,4 +1,4 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BASE_FLAG_AO, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_of, face_slot_of_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
@@ -140,12 +140,9 @@ const PBR_REFL_MAX_ROUGH: f32 = 0.05;
 /// 同时权重按 `dda_main` 里的 `fade` 连续淡出到 0（⇒ 粗糙度扫描下总亮度单调、无跳变）。
 const PBR_REFL_CONE_K: f32 = 1.0;
 
-// ---- 基础开关（`light_u.g.base_flags`，菜单「渲染/基础」；**置位 = 算**）----
-// 位编码必须与 Rust `BaseSettings::FLAG_*` 一致（`gate-render/src/lighting.rs`）。
-/// bit0 **直光阴影**：置位 ⇒ 发射阴影射线（`sun_transmittance`）；清零 ⇒ 太阳照旧直射、只是没有遮挡。
-const BASE_FLAG_SHADOW: u32 = 1u;
-/// bit1 **隐式法相**：置位 ⇒ 算邻域梯度法线；清零 ⇒ **不算它**，并且**原色直出**（见 `shade_face` 的早退）。
-const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
+// ---- 「基础」开关位（`light_u.g.base_flags`，菜单「渲染/基础」；**置位 = 算**）----
+// `BASE_FLAG_*` 三个常量定义在 `bindings.wesl`（紧挨 uniform 声明）—— 因为 `lightfield.wesl`
+// 也要读 bit2（AO），而它不能 import 本文件（会成环）。位编码与 Rust `BaseSettings::FLAG_*` 同步。
 
 // ---- MT8-3（反射缓存）代码已删除（历史记录）----
 // 这里曾经是 `REFL_CACHE_SLOTS` / `REFL_REFRESH_K` / `refl_key_of` / `refl_slot_of` / `refl_seed`
@@ -695,14 +692,15 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // `PBR_REFL_*` 三个常量（**不是无条件每像素发射线**）。
     //
     // ---- MT4-2 · 边界：反射样本**不进 ReSTIR**（只在本函数里加到 `col`）----
-    // ReSTIR 的样本等价判据是「**精确几何面键 + 二次顶点键逐位相等**」（硬约束 2 / `gi/consts.wesl`
+    // ReSTIR 的样本等价判据是「**精确几何面键 + 着色法线相似**」（硬约束 2 / `gi/consts.wesl`
     // 文件头），这是薄板/墙缝不漏光的根本。反射方向是**按 F0 与 roughness 加权抽出来的**一条方向、
-    // 且抖动锥与 MT3 的余弦候选完全不是同一族分布 ⇒ 它既不描述"同一条光路"，也不满足"逐位相等"。
-    // 一旦把它并进 reservoir / 导引 / 历史（或让 `gi_ray_radiance` 返回它），判据就会把"方向不同的
-    // 两个样本"判成等价 —— 那正是 §5 R1 点名的失效形态：薄板漏光、屏幕漂移的光斑。
-    // 所以本射线**不写任何 GI 资源**：不进 `gi_out`、不进 `gi_res_cur/prev`、不进导引与历史，
-    // 也不参与 `gi_ray_radiance`；结果只出现在 `col` 上，且 `col * through + refl` 那一步之后
-    // 也就离开本 pass（GI 链读的是它自己的缓冲，读不到这里）。
+    // 且抖动锥与 MT3 的余弦候选完全不是同一族分布 ⇒ 它既不描述"同一条光路"，也不满足"同一个面上、
+    // 同一族源 pdf 的样本"。
+    // 一旦把它并进 reservoir / 导引 / 历史，判据就会把"方向不同的两个样本"判成等价 —— 那正是
+    // §5 R1 点名的失效形态：薄板漏光、屏幕漂移的光斑。
+    // 所以本射线**不写任何 GI 资源**：不进 `gi_out`、不进 `gi_res_cur/prev`、不进导引与历史；
+    // 结果只出现在 `col` 上，且 `col * through + refl` 那一步之后也就离开本 pass（GI 链读的是它
+    // 自己的缓冲，读不到这里）。
     // 玻璃路径下这一项与其余着色一样被 `through`（沿途介质吸收）乘一次 —— 反射光同样要"穿过"
     // 那段玻璃回到观察者，与 `col` 其余部分同一条口径（不额外单开一条乘性吸收）。
     // 自检：`PBR_REFLECTION_ENABLED = 0u` 重启 ⇒ 本段被整段折掉，GI 画面与 MT3 逐位一致。

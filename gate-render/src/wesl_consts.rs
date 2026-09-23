@@ -122,9 +122,9 @@ impl GiConsts {
       gi_sec_words: get("GI_SEC_WORDS"),
     };
 
-    if out.gi_res_words < 2 {
+    if out.gi_res_words < 8 {
       let msg = format!(
-        "GI_RES_WORDS = {} 太小（reservoir 至少要有方向与累计量）：{out:?}",
+        "GI_RES_WORDS = {} 太小（reservoir = 状态位 + 面键 2 + 着色法线 + 累计量 rgb + M = 8）：{out:?}",
         out.gi_res_words
       );
       error!("{msg}");

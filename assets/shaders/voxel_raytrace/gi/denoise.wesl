@@ -1,19 +1,34 @@
 import package::bindings::{gi_den_cfg, gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_tmp, gi_guide, gi_guide_out, gi_hist_cur, gi_hist_prev, gi_raw_tex};
-import package::gi::common::{gi_pack_dir, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_W_HIST_MIN, GI_LUMA};
+import package::gi::common::{gi_hist_search_offset, gi_pack_dir, gi_unpack_dir};
+import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_W_HIST_MIN, GI_HIST_SEARCH_TAPS, GI_LUMA};
 
 // ============================================================================
 // GI 降噪（SVGF 家族两段）：**时域累积**（`gi_den_temporal`）+ **迭代 atrous 空间滤波**
 // （`gi_den_atrous`，步长 1/2/4/8/16 = NRD/RELAX 的 5 轮；实际轮数 = `GI_DEN_ATROUS_ITER`）。
 //
-// 与 NRD/RELAX 的差距（知道还缺什么，才不会以为已经到顶）：
-//   · ❌ **没有独立的 pre-blur pass**：NRD 的第一步是进时域之前的纯空间离群抑制；这里改成
-//        在时域 pass 内对输入做一次「共面邻域 mean ± K·σ」钳制（省一趟 dispatch）。
+// 与 NRD/RELAX/FidelityFX 的对照（每一项都对着行业里成熟的处方）：
+//   · ✅ **离群抑制**（NRD 的 pre-blur pass）：不单开一趟，并进时域 pass —— 对输入做一次
+//        「同面邻域 mean ± K·σ」钳制（见 ③′）。缺 pre-blur 的代价只是省了一趟 dispatch。
 //   · ✅ **累积矩**（NRD 的 m1/m2）：历史里存的是**按与色相同权重累积**的亮度一/二阶矩，
 //        `σ_hist = sqrt(M2 − M1²)` 给出时间上平滑的噪声水平，与本帧观测 σ 取 max 后用于
 //        时域权重与 φ ⇒ 权重不再逐帧抖。
-//   · ❌ **没有 fast history / history-fix**：NRD 为去遮挡准备了一条「短历史」；这里靠
-//        「不同平面 ⇒ M = 1 本帧重建」硬重置（代价是去遮挡后头几帧更噪，但**不拖影**）。
+//   · ✅ **history-fix**（`GI_HIST_SEARCH_TAPS`）：NRD 在重投影落点邻域里找一条可用的历史；
+//        这里做的是同一件事 —— 判据（面键 + 着色法线）**不变**，只是落点不通过时继续在它的
+//        3×3 邻域里按同一套判据找。为什么必须有：判据不通过 ⇒ `M = 1`、历史权重 0 ⇒ 本帧原始估计
+//        直接上屏，而"落点那个 texel 采到了相邻台阶"在斜面上是常态（一个体素面常常只占一个 texel）。
+//   · ✅ **短历史用模糊兜**（`GI_DEN_STAB_FRAMES` / `GI_DEN_STAB_MAX`）：NRD 的 `blurRadiusScale`
+//        / FidelityFX 的「低时域样本数 ⇒ 加大空间滤波」—— `M` 小的像素把 atrous 步长放大，
+//        用宽模糊代替生噪点（NRD 原话："If history gets discarded we see blur instead of noise"）。
+//        **接受与否仍是二值的**，代价由此项补偿，而不是靠一段被信过的短历史。
+//   · ✅ **限制历史长度**（`GI_DEN_M_MAX` = 32 帧，NRD `maxAccumulatedFrameNum` 量级）：
+//        τ 就是「光照 / 远处几何渐变」的响应时间。
+//   · ✅ **变化即重置**（NRD 的 `accumulation speed = 1.0 if a disocclusion is detected`）：
+//        由 **reservoir 侧**承担（`gi/screen.wesl` 文件头 ⑥ —— 世界一变就整帧不复用历史，
+//        因为那里的判据只能证明"上帧那个面还在"）。**降噪侧不重置**：它的 ⑤ AABB 钳制会把历史
+//        拉回本帧邻域的范围，重置只会让编辑帧露出未平滑的输入、并让短历史稳定化整屏生效一帧
+//        （症状：放置体素时 GI 闪一下）。
+//   · ✅ **宽核统计**（`GI_DEN_NBR_R` = 2 ⇒ 5×5）：钳制与本帧输入都要求邻域非空，
+//        而斜面上邻域常常只剩它自己；FidelityFX 为此用 17×17（可分离两趟）取矩。
 //
 // 输入 / 输出（GI 网格，尺寸 = 渲染分辨率 / gi_div：1/1、1/2 或 1/4）：
 //   · `gi_raw_tex`（= `gi_out` 的采样视图）：本帧原始 GI，rgb = gi·valid、a = valid；
@@ -136,13 +151,15 @@ fn gi_same_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: vec3<f32>) 
 }
 
 /// 时域累积（每 GI 像素一次）。步骤：
-/// ① 本帧 3×3 邻域两套统计（**必须分开**，见下）：
+/// ① 本帧邻域（半径 `GI_DEN_NBR_R`）两套统计（**必须分开**，见下）：
 ///    · **同面键** tap（同一个体素同一个面）→ 亮度一阶/二阶矩 → σ_n = **纯噪声**（只用于算 σ）；
 ///    · **同一个面** tap（`gi_same_surface` 通过，可跨体素）→ 颜色 mean/std → 本帧输入 + 钳制范围；
 /// ② 输入 `c_in`：面跨多个 texel（n3 ≥ 2）取同面键均值，否则（面不跨 texel）取**同一面均值**，
 ///    再过一次 `mean ± K·std` 的离群钳制；
 /// ③ 历史校验 = 导引里的上帧像素坐标 → 取那条历史的键与法线，与本帧**同一个面**
-///    （`gi_same_surface`）且 `M > 0`；
+///    （`gi_same_surface`）且 `M > 0`。**这里不检测「世界变了吗」**：光照 / 几何一变，⑤ 的 AABB
+///    钳制会把历史色拉回**本帧邻域**的范围 ⇒ 响应足够快；而"当帧重置"反而会让编辑帧露出未平滑的
+///    输入、并让 atrous 的短历史稳定化（`GI_DEN_STAB_*`）整屏生效一帧（症状：放置体素时 GI 闪一下）。
 /// ④ 噪声尺度 `σ_use = max(本帧同面键 σ_n, 累积矩 σ_hist)`；历史权重
 ///    `w = min(clamp(σ_α/σ_use, W_MIN, 1), (M−1)/M)`；
 /// ⑤ 历史色先钳到同一面邻域的 `mean ± K·std`（anti-ghosting）；
@@ -174,7 +191,9 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   let n_c = gi_den_nrm_b(gb);
   let c_raw = textureLoad(gi_raw_tex, coord, 0).rgb;
 
-  // ---- ① 两套邻域统计（两个集合都靠 `gi_same_surface` 判，**同面键是它的特例**）----
+  // ---- ① 两套邻域统计（半径 `GI_DEN_NBR_R`；两个集合都靠 `gi_same_surface` 判，
+  // **同面键是它的特例**。邻域必须够大：斜面上「一个体素面 ≈ 一个 texel」⇒ 半径 1 时 `cnt`
+  // 常常停在 1 ⇒ ③′ 钳制与 ③″ 全都不触发，历史色没护栏、输入退回单 texel 原始噪声）----
   var n3 = 0.0; // 同面键 tap 数（同一个体素同一个面：`σ` 只用这一套）
   var m3 = 0.0;
   var q3 = 0.0;
@@ -182,8 +201,9 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   var cnt = 0.0; // 同一个面的 tap 数（含切向偏移的相邻体素面、法线倾斜相近的凸棱体素）
   var csum = vec3<f32>(0.0);
   var csum2 = vec3<f32>(0.0);
-  for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+  let nr = i32(GI_DEN_NBR_R);
+  for (var dy: i32 = -nr; dy <= nr; dy = dy + 1) {
+    for (var dx: i32 = -nr; dx <= nr; dx = dx + 1) {
       let tx = x + dx;
       let ty = y + dy;
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
@@ -247,45 +267,60 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   var m = 1.0;
   let code = gi_guide[gb + GI_DEN_G_PREV];
   if (code != 0xFFFFFFFFu) {
-    let px = i32(code & 0xFFFFu);
-    let py = i32((code >> 16u) & 0xFFFFu);
-    if (px < i32(size.x) && py < i32(size.y)) {
-      let hpb = (u32(py) * size.x + u32(px)) * GI_DEN_HIST_WORDS;
-      let h_m = bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_M]);
-      // 历史校验 = **同一个面**（`gi_same_surface`：平面归属靠键 + 着色法线相似，
-      // 历史里的法线是上帧那个像素自己的 —— 导引是单缓冲，读不到上帧的法线）。
-      // 不通过 ⇒ `M = 1` 且色 = 本帧的同面均值（**本帧重建**：不拖影、不糊，也不回退到 0 / 旧值）。
-      // 薄板两侧 / 墙缝两侧面号不同 ⇒ 一律不接历史。
-      let hk0 = gi_hist_prev[hpb + GI_DEN_H_KEY0];
-      let hk1 = gi_hist_prev[hpb + GI_DEN_H_KEY1];
-      let hn = gi_hist_prev[hpb + GI_DEN_H_NRM];
-      if (h_m > 0.0 && gi_same_surface(hk0, hk1, hn, k0, k1, n_c)) {
-        m = min(h_m + 1.0, f32(GI_DEN_M_MAX));
-        let hcol = vec3<f32>(
-          bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_COL]),
-          bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_COL + 1u]),
-          bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_COL + 2u]),
-        );
-        var clamped = hcol;
-        if (cnt > 1.5) {
-          clamped = clamp(hcol, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
-        }
-        // σ 取**累积矩**与本帧观测的较大者：累积矩把多帧的观测平均掉 ⇒ σ 不再逐帧抖
-        // （逐帧抖会让下面的历史权重跟着抖，表现为持续的细颗粒闪动）；
-        // 取 max 保证「噪声突然变大」（去遮挡、光照阶跃）时仍然按本帧的观测走，不迟钝。
-        let h_m1 = bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_M1]);
-        let h_m2 = bitcast<f32>(gi_hist_prev[hpb + GI_DEN_H_M2]);
-        let sigma_hist = sqrt(max(h_m2 - h_m1 * h_m1, 0.0));
-        sigma_use = max(sigma, sigma_hist);
-        let w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
-        // 历史上限：M 帧以来最多信 (M−1)/M ⇒ 稳态也保留 1/M 的新信息（不无限累积）。
-        let w = min(w_var, (m - 1.0) / m);
-        color = mix(c_in, clamped, w);
-        // 矩按**与色完全相同的权重**累积（历史权重 = w ⇒ 本帧观测权重 = 1 − w）⇒
-        // `M2 − M1²` 就是「本像素输入在累积窗口内的波动」，量纲与 `σ_α` 可比。
-        m1_acc = mix(h_m1, l_in, 1.0 - w);
-        m2_acc = mix(h_m2, l_in * l_in, 1.0 - w);
+    let prev_px = vec2<i32>(i32(code & 0xFFFFu), i32((code >> 16u) & 0xFFFFu));
+    // 历史校验 = **同一个面**（`gi_same_surface`：平面归属靠键 + 着色法线相似，
+    // 历史里的法线是上帧那个像素自己的 —— 导引是单缓冲，读不到上帧的法线）。
+    // 不通过 ⇒ `M = 1` 且色 = 本帧的同面均值（**本帧重建**：不拖影、不糊，也不回退到 0 / 旧值）。
+    // 薄板两侧 / 墙缝两侧面号不同 ⇒ 一律不接历史。
+    //
+    // **历史搜索**（`GI_HIST_SEARCH_TAPS`，与 reservoir 侧同一张偏移表、同一个顺序）：判据不变，改的
+    // 只是"去哪个像素找"。重投影落点那个上帧 texel 可能采到**相邻台阶**（斜面上一个体素面常常只占
+    // 一个 texel）⇒ 判据不通过；而本面在上一帧确实有人采过，就在落点旁边。正中恒排第一 ⇒ 静止相机
+    // 下行为与"只认落点"逐位一致。接不上时 `M = 1`、历史权重为 0 ⇒ 本帧原始估计直接上屏。
+    var hb = 0u;
+    var h_m = 0.0;
+    var found = false;
+    for (var s = 0u; s <= GI_HIST_SEARCH_TAPS; s = s + 1u) {
+      let px = prev_px.x + gi_hist_search_offset(s).x;
+      let py = prev_px.y + gi_hist_search_offset(s).y;
+      if (px < 0 || py < 0 || px >= i32(size.x) || py >= i32(size.y)) { continue; }
+      let cand_b = (u32(py) * size.x + u32(px)) * GI_DEN_HIST_WORDS;
+      let cand_m = bitcast<f32>(gi_hist_prev[cand_b + GI_DEN_H_M]);
+      if (cand_m <= 0.0) { continue; }
+      if (!gi_same_surface(gi_hist_prev[cand_b + GI_DEN_H_KEY0],
+                           gi_hist_prev[cand_b + GI_DEN_H_KEY1],
+                           gi_hist_prev[cand_b + GI_DEN_H_NRM], k0, k1, n_c)) { continue; }
+      hb = cand_b;
+      h_m = cand_m;
+      found = true;
+      break;
+    }
+    if (found) {
+      m = min(h_m + 1.0, f32(GI_DEN_M_MAX));
+      let hcol = vec3<f32>(
+        bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_COL]),
+        bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_COL + 1u]),
+        bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_COL + 2u]),
+      );
+      var clamped = hcol;
+      if (cnt > 1.5) {
+        clamped = clamp(hcol, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
       }
+      // σ 取**累积矩**与本帧观测的较大者：累积矩把多帧的观测平均掉 ⇒ σ 不再逐帧抖
+      // （逐帧抖会让下面的历史权重跟着抖，表现为持续的细颗粒闪动）；
+      // 取 max 保证「噪声突然变大」（去遮挡、光照阶跃）时仍然按本帧的观测走，不迟钝。
+      let h_m1 = bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_M1]);
+      let h_m2 = bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_M2]);
+      let sigma_hist = sqrt(max(h_m2 - h_m1 * h_m1, 0.0));
+      sigma_use = max(sigma, sigma_hist);
+      let w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
+      // 历史上限：M 帧以来最多信 (M−1)/M ⇒ 稳态也保留 1/M 的新信息（不无限累积）。
+      let w = min(w_var, (m - 1.0) / m);
+      color = mix(c_in, clamped, w);
+      // 矩按**与色完全相同的权重**累积（历史权重 = w ⇒ 本帧观测权重 = 1 − w）⇒
+      // `M2 − M1²` 就是「本像素输入在累积窗口内的波动」，量纲与 `σ_α` 可比。
+      m1_acc = mix(h_m1, l_in, 1.0 - w);
+      m2_acc = mix(h_m2, l_in * l_in, 1.0 - w);
     }
   }
 
@@ -319,6 +354,8 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
 ///     被墙挡住的一段），所以留一个亮度门；而「同一个面」保证了几何上是同一个积分。
 /// 核是 `(2R+1)²-1` 个 tap（R 由 Rust 按菜单「高质量降噪」写进 `gi_den_cfg[0]`：
 /// 2 ⇒ 5×5 的 24 tap、1 ⇒ 3×3 的 8 tap）：同一足迹下采样越密 ⇒ 残余噪声越低。
+/// 4. **短历史的像素把步长放大**（`GI_DEN_STAB_FRAMES` / `GI_DEN_STAB_MAX`）：`M` 小 ⇒ 同一批 tap
+///     落得更远 ⇒ 用模糊代替生噪点（NRD 的 `blurRadiusScale`）；`M` 大了倍率回到 1 ⇒ 稳态不变。
 fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
   let x = i32(coord.x);
   let y = i32(coord.y);
@@ -330,6 +367,13 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
   }
   // 核半径来自降噪自己的小配置 buffer（降噪 pass 只有 group(0)，够不到 `gi_u`，见 `bindings.wesl`）。
   let r = i32(gi_den_cfg[0u]);
+  // **短历史稳定化**（`GI_DEN_STAB_FRAMES` / `GI_DEN_STAB_MAX`）：本帧的历史长度由时域 pass 写进
+  // `gi_hist_cur`（两个降噪 pass 共用同一份 group(0) ⇒ 这里读得到）。`M` 小 ⇒ 步长放大 ⇒
+  // 用**更宽的模糊**代替生噪点；`M ≥ GI_DEN_STAB_FRAMES` ⇒ 倍率 1 ⇒ 与稳定像素的路径逐位相同。
+  let hb = idx * GI_DEN_HIST_WORDS;
+  let m_hist = bitcast<f32>(gi_hist_cur[hb + GI_DEN_H_M]);
+  let stab = clamp(GI_DEN_STAB_FRAMES / max(m_hist, 1.0), 1.0, GI_DEN_STAB_MAX);
+  let st = max(1, i32(round(f32(step) * stab)));
   let k0 = gi_den_key0_b(gb);
   let k1 = gi_den_key1_b(gb);
   let n_c = gi_den_nrm_b(gb);
@@ -341,8 +385,8 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
   for (var dy: i32 = -r; dy <= r; dy = dy + 1) {
     for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
       if (dx == 0 && dy == 0) { continue; }
-      let tx = x + dx * step;
-      let ty = y + dy * step;
+      let tx = x + dx * st;
+      let ty = y + dy * st;
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
       let tb = (u32(ty) * size.x + u32(tx)) * GI_DEN_GUIDE_WORDS;
       // 导引**两级读**：平面归属只用两个键字（被它拒掉的 tap 不再读法线那个字）。大核的多数 tap

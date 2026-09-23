@@ -31,8 +31,9 @@ pub struct GiUniform {
   pub misc: Vec4,
   /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率、4 = 四分之一；**整数值的 f32**，
   /// 只被 `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
-  /// z = 世界几何自「写入上一帧 reservoir 的那一帧」起是否**逐位未变**（1 = 未变）⇒
-  /// 跳过时域二次顶点键验证射线、w = **降噪质量档位**（0 = 关 / 1 = 低 / 2 = 中 / 3 = 高；
+  /// z = 世界的体素占据自「写入上一帧 reservoir 的那一帧」起是否**逐位未变**（1 = 未变）⇒
+  /// **本帧允许复用历史**（时域 + 空间两条；变过就整帧不复用，见 `gi/screen.wesl` 文件头 ⑥）、
+  /// w = **降噪质量档位**（0 = 关 / 1 = 低 / 2 = 中 / 3 = 高；
   /// 菜单「渲染/RESTIR GI/降噪质量」）：`gi_ss_main` 按它取 1/4 档的新鲜候选数
   /// （`GI_SS_CAND_N` vs `..._HQ`）与记忆窗（`GI_SS_M_CAP_K` vs `..._HQ`）——**这两项与分辨率档无关**。
   /// 时域/atrous 的派发与核半径不在本 pass 里，由 Rust 的 `denoise_plan` 决定。
@@ -153,13 +154,15 @@ pub struct GiSettings {
   /// 整数条数约束：基准候选数 4（降噪质量 低/中）时 N 只能到 4（每帧至少 1 条，N=8 会退化成 4）；
   /// 想要真正 8 倍摊薄需要「降噪质量 = 高」（基准 8 条 ⇒ 1 条/帧）。
   pub share: u32,
-  /// **误差驱动重分配档**（菜单「渲染/RESTIR GI/采样重分配」；0 = 关，1/2/3 = 温和/中/强）。
-  /// 按"这个像素已经有多干净"把每帧的射线预算挪过去：代理量 = **上一帧 reservoir 的样本数 M**
-  /// （`screen.wesl` 的 `b_err`；`GI_SS_ERR_M_REF` 是"够干净"的参考样本数）。
-  /// 收敛的像素少发新射线（档位给 `lo` = 0.70 / 0.50 / 0.25 倍），刚变脏的（去遮挡、键刚变）多发
-  /// （`hi` = 1.4 / 2.0 / 4.0 倍）；记忆窗仍按 `cand_n0 / cand_n` 同步放大
-  /// ⇒ **窗内样本数不变**（噪声不变，只有响应时间随像素变）⇒ 不会出现"少采样→更脏→要更多采样"的振荡。
-  /// 省下来的钱正是"已经收敛的像素"（静态区域通常占画面大多数），花在阴影边缘/去遮挡/几何细节上。
+  /// **预算重分配档**（菜单「渲染/RESTIR GI/重分配」；0 = 关，1/2/3 = 弱/中/强）。
+  /// 按"这个像素的**时域累积还在不在工作**"把每帧的射线预算挪过去：代理量 = 本帧是否拿到了
+  /// 可用历史（`screen.wesl` 的 `b_err`）—— 它与候选数**脱钩**，所以档位表里的倍率真正生效、
+  /// 也不会有"少采样→更脏→要更多采样"的分配振荡。
+  /// 接到了历史的像素少发新射线（档位给 `lo` = 0.70 / 0.50 / 0.25 倍）；没接到的多发
+  /// （`hi` = 1.4 / 2.0 / 4.0 倍）—— 后者每帧都是全新估计（`M = 1`），只能靠候选数压方差。
+  /// 记忆窗仍按 `cand_n0 / cand_n` 同步放大：减发一侧窗内样本数不变（响应变慢、稳态噪声不变），
+  /// 增发一侧窗内样本数随之变大。省下来的钱正是"已经收敛的像素"（静态区域通常占画面大多数），
+  /// 花在去遮挡与斜面上的小面上。
   pub realloc: u32,
   /// **第二条弹射档位**（菜单「渲染/光照/二次弹射」；0 = 关 / 1 = 稀疏 / 2 = 全）。
   ///
@@ -204,7 +207,7 @@ impl GiSettings {
     self.share.clamp(1, 8)
   }
 
-  /// 菜单「渲染/RESTIR GI/采样重分配」的档位数（0 = 关 ..= 3 = 强）；**下标 = 档位本身**。
+  /// 菜单「渲染/RESTIR GI/重分配」的档位数（0 = 关 ..= 3 = 强）；**下标 = 档位本身**。
   pub const REALLOC_TIERS: u32 = 4;
 
   /// 菜单「渲染/光照/二次弹射」的档位数（0 = 关 / 1 = 稀疏 / 2 = 全）。
@@ -417,7 +420,8 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
-/// 降噪空间段（迭代 atrous）的布局：group(0)，binding 14 = 采样输入、15 = 存储输出、10 = 导引、17 = φ。
+/// 降噪空间段（迭代 atrous）的布局：group(0)，binding 14 = 采样输入、15 = 存储输出、10 = 导引、
+/// 13 = 本帧历史（**只读 M**：短历史稳定化要按本像素的 M 缩放步长）、17 = φ。
 /// Rust 每轮换绑 14/15（同一份 layout、同一个入口，见 `AuxTexCache::den_bg`）。
 pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
@@ -430,6 +434,18 @@ pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
         visibility: C,
         ty: BindingType::Buffer {
           ty: BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      // 13 = 本帧历史：shader 里声明成 `read_write`（时域 pass 要写它）⇒ 这里必须是同一档
+      // （`read_only: false`），否则 wgpu 在 `create_compute_pipeline` 直接报「binding 不可用」。
+      BindGroupLayoutEntry {
+        binding: 13,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
           has_dynamic_offset: false,
           min_binding_size: None,
         },
@@ -535,11 +551,12 @@ pub struct GiGpu {
   /// reservoir 双缓冲的换绑状态：true ⇒ 本帧 `binding 20 = b`、`21 = a`（见 `prepare_gi`）。
   pub res_flip: bool,
   /// 世界几何修订号：**只在世界真的可能变了的那一帧**自增（全量上传 / palette 变化 / 收到脏盒）。
-  /// `world_rev_gi` 要问的问题比「世界变了吗」更窄：「自上次跑 `gi_main` 起，射线求交的输入
-  /// （体素占据）是否逐个字节没变」——只有那时才能确定上帧 reservoir 里的二次顶点键本帧仍逐位成立。
+  /// 「变过」的判据取的是最粗也最可靠的一种（体素占据逐个字节没变）—— 键只能证明"上帧那个面还在"，
+  /// 证明不了"上帧累计进来的那些光路还成立"，所以世界一变就整帧不复用历史（见 `gi/screen.wesl` ⑥）。
   pub world_rev: u32,
   /// 上一次真正跑 `gi_main` 的那一帧的 `world_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
-  /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 存的二次顶点键在本帧仍然逐位成立。
+  /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 里的累计量在本帧仍然成立 ⇒ **允许复用历史**
+  /// （uniform `flags.z`）。
   pub world_rev_gi: u32,
   /// 降噪 pipeline：`[0]` = 时域、`[1..6]` = atrous 第 1..5 轮（步长 1/2/4/8/16）。
   /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）；
@@ -648,7 +665,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     // 首帧没有「上一帧」⇒ 恒等矩阵；此时 reservoir 两块都是零（M = 0）⇒ 复用一律判无效。
     prev_view_proj: Mat4::IDENTITY,
     res_flip: false,
-    // 两者都从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`skip_verify` 会是真；那时 reservoir 两块
+    // 两者都从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`world_same` 会是真；那时 reservoir 两块
     // 都是零（M = 0 ⇒ 一律判无效），跳过与否都不会接受任何历史 ⇒ 安全。
     world_rev: 0,
     world_rev_gi: 0,
@@ -741,13 +758,11 @@ fn prepare_gi(
 ) {
   gpu.frame = gpu.frame.wrapping_add(1);
 
-  // ---- 世界几何修订号（uniform `flags.z`）----
-  // `skip_verify` 回答的是：「上帧 reservoir 里存的二次顶点键，在本帧是否仍然逐位成立」。
-  // 成立的条件比「几何没变」更弱也更容易判：世界几何自**上次真正跑 `gi_main`** 起没变过。
-  // 此时沿 `hist.dir` 重发的射线与当初写入 `hist.sk` 的那条**输入完全相同** —— 方向取自
-  // reservoir 本身，原点由已校验逐位相等的主键唯一决定（同一体素同一面同一物体 ⇒ 同一
-  // `p_voxel` / 同一逐体素法线 / 同一外推量）⇒ 光路求交结果必然逐位相同 ⇒ 那条**验证射线可以
-  // 整条省掉**（`gi/screen.wesl` ①）。世界变过就照旧发那条射线验证。
+  // ---- 世界几何修订号（uniform `flags.z` = **本帧允不允许复用历史**）----
+  // 键只能证明"上帧那个面还在"，证明不了"上帧累计进来的那些光路还成立"：reservoir 里存的是
+  // `w_sum` / `M` 这条**累加量**（`gi/screen.wesl` 文件头 ⑥）。所以「变过」判据取最粗也最可靠的
+  // 一种 —— 世界的体素占据自**上次真正跑 `gi_main`** 起是否逐个字节没变：那时上帧的累计量逐位
+  // 成立，复用免费且正确；变过就整帧不复用（时域 + 空间两侧同一个门）。
   //
   // 前提（改动这里前先读）：`world_rev` 必须覆盖**一切可能改变 `world_raycast` 结果的输入**。
   // 今天覆盖 = 世界全量上传、palette 变化、以及任何脏盒（= 一切增量体素编辑）。运行时不存在别的
@@ -758,7 +773,7 @@ fn prepare_gi(
   if world_changed {
     gpu.world_rev = gpu.world_rev.wrapping_add(1);
   }
-  let skip_verify = gpu.world_rev == gpu.world_rev_gi;
+  let world_same = gpu.world_rev == gpu.world_rev_gi;
 
   // ---- ② 二次顶点缓存的 epoch ----
   // 输入 = `gi_secondary_shade` 的全部输入（几何修订号、太阳方向/色×强度、天光色、「太阳反弹」、
@@ -792,7 +807,7 @@ fn prepare_gi(
     flags: Vec4::new(
       0.0,
       settings.div() as f32,
-      if skip_verify { 1.0 } else { 0.0 },
+      if world_same { 1.0 } else { 0.0 },
       // w = 降噪质量档位（0..=3）：`gi_ss_main` 按它取候选数与记忆窗（只有最高档不同）。
       settings.tier() as f32,
     ),
@@ -813,7 +828,7 @@ fn prepare_gi(
   let gi_runs = settings.enabled;
   if gi_runs && let Some(v) = view.as_ref() {
     gpu.prev_view_proj = v.view_proj;
-    // 本帧的 reservoir 就是在当前 `world_rev` 下写出的 ⇒ 记下来，供下一帧判 `skip_verify`。
+    // 本帧的 reservoir 就是在当前 `world_rev` 下写出的 ⇒ 记下来，供下一帧判 `world_same`。
     gpu.world_rev_gi = gpu.world_rev;
   }
 

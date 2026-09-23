@@ -1774,9 +1774,9 @@ pub(crate) fn init_dda_pipelines(
   commands.insert_resource(EyeAdaptGpu::default());
 }
 
-/// `prepare_dda_bind_groups` 的两个**档位资源**打包成一个 `SystemParam`：
+/// `prepare_dda_bind_groups` 的**档位资源**打包成一个 `SystemParam`：
 /// Bevy 的系统函数最多 16 个参数，本系统正好卡在边界上（见 `volumetric.rs::FogRes` 同一个先例）。
-/// 两项都是只读、都只在"建 BG/纹理尺寸"时用几次。
+/// 各项都是只读、都只在"建 BG/纹理尺寸"时用几次。
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct DdaTune<'w> {
   /// GI 档位（分辨率除数 / 降噪质量）—— 决定 GI 纹理尺寸与绑哪张降噪输出。
@@ -2105,6 +2105,9 @@ pub(crate) fn prepare_dda_bind_groups(
         &atrous_layout,
         &[
           BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
+          // 13 = 本帧历史：atrous 只读其中的 M（短历史稳定化按 M 缩放步长）。必须挂**本帧**
+          // 那份（时域 pass 刚写的），下一帧才轮到它变成 `hist_prev`。
+          BindGroupEntry { binding: 13, resource: hist_cur.as_entire_binding() },
           BindGroupEntry { binding: 14, resource: BindingResource::TextureView(&dn_src[*s]) },
           BindGroupEntry { binding: 15, resource: BindingResource::TextureView(&dn_dst[*d]) },
           BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },

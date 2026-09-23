@@ -1,5 +1,5 @@
 import package::bindings::{gi_sec_slots, light_u};
-import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, face_view_dir, fetch_material, sky_rgb};
+import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
 import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::lightfield::{light_field_ao};
@@ -49,20 +49,6 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
   return 0.0;
 }
 
-/// 一条 GI 射线的求值结果。
-/// * `l` = 入射辐亮度（**不含** cos 因子与 π；复用候选的系数由调用方按各自 pdf 给）。
-/// * `sk0`/`sk1` = 二次顶点的**精确键**（`gi_key0`/`gi_key1` 口径：命中体素 + 面 + 物体）。
-///   `sk_hit = false` = 射线逃逸到天空（键取 (0,0)，同向天空两次求值必然相等）。
-/// * `sk_ok` = 键可编码且可比较。复用**只在 `sk_ok` 为真时接受历史样本**
-///   （键编码范围外无法做精确比较 ⇒ 宁可不复用，也不用启发式）。
-struct GiRaySample {
-  l: vec3<f32>,
-  sk0: u32,
-  sk1: u32,
-  sk_hit: bool,
-  sk_ok: bool,
-}
-
 /// **二次顶点着色（唯一实现）**：命中面的出射辐亮度（**不含**射线自身的介质透过率 `tint`，
 /// `tint` 由调用方逐射线乘）。
 ///
@@ -94,9 +80,17 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
   }
   // 天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
   let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hp, sh.obj_id);
-  // 视向量：**逐面**（与 `dda_main` 共用 `face_view_dir`）。`org` = 这条 GI 射线自己的起点（不是
-  // 相机眼位：二次顶点"回到观察者"的方向就是回到上一个顶点）；锚点按面量化 ⇒ 它不再精确等于 -dir。
-  let v = face_view_dir(org, hp);
+  // 视向量：本函数的结果**按面缓存**（`gi_sec_slots`，跨帧持久），而缓存的前提是"值只由那个可见
+  // 体素面决定"（见 `gi/common.wesl` 的「跨帧持久」段）—— 它必须是**与射线无关**的量。
+  // 曾经传 `org`（= 这条 GI 射线自己的起点，即上一个顶点）：同一个面的值于是取决于"**哪条射线先
+  // 填的槽**"；而 epoch 只要光照场窗口原点变（相机每移动 16 体素）就自增 ⇒ 整表重填、填的值换了
+  // 一个 ⇒ 移动时每隔一段"重新布一次光"（静止稳、一动就不稳，且对曝光 / 反射 / 降噪 / 复用权重
+  // **全部免疫** —— 诊断实测正是如此）。
+  // 取**面法线**（正入射）⇒ 值与射线无关，缓存前提成立、重填得同值。这也是主 pass 的口径
+  // （`dda_face_main` 给整面着色时同样用一个与像素无关的量），符合「口径不分叉」。
+  // 已知代价（可接受）：二次顶点的 Fresnel 取正入射值 `F0`，少了掠射增亮 —— 这条路径以漫反射贡献
+  // 为主。要对照，把本行换回 `face_view_dir(org, hp)` 即可。
+  let v = hn;
   let m = fetch_material(sh.palette_base, sh.pal, hp, hn, MATERIAL_DEBUG_NONE);
   return brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0)))
          / GI_PI
@@ -201,7 +195,7 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
 /// 光路用 `world_trace_medium`（`stop_on_air = false`）：撞到**透射**体素不停、沿途按格累积乘性吸收
 /// `tint` ⇒ 从玻璃前面出发的射线会**穿过玻璃**打到它后面的真实表面。`tint` 乘在**整个** `l` 上
 /// （BRDF 项与自发光项都乘）—— 与主 pass 的 `col = col * through + refl` 是同一个"乘性吸收"结构
-/// （硬约束 3：口径不分叉）。只有不透明体素才停 ⇒ 停点与 `sk0/sk1` 的口径不变（硬约束 2）。
+/// （硬约束 3：口径不分叉）。只有不透明体素才停 ⇒ 停点与硬约束 2 的口径不变。
 /// 与 `sun_transmittance` 同一套写法；只遍历**主世界网格**（物体网格没有介质续行，且
 /// `Volumes::add_object` 在应用里没有调用点 ⇒ 无实际行为差异）。
 /// 命中分支的着色走 `gi_face_shade_cached`（按面缓存：同一个面被多条射线打到时只算一次），
@@ -209,12 +203,12 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
 /// `epoch`（uniform `gi_u.seq.y`）= 光照/几何/光照场窗口的修订号，参与槽里键的掩码 ⇒ 它一变整张表
 /// 自失效（跨帧持久，见 `gi/common.wesl` 的「跨帧持久」段）。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
-                    sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> GiRaySample {
+                    sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> vec3<f32> {
   var tint = vec3<f32>(1.0);
   let sh = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
   // 逃逸 → 天光辐亮度（穿过介质看到的天空同样按 `tint` 吸收）；天空没有面 ⇒ 不进缓存。
   if (!sh.hit) {
-    return GiRaySample(sky_rgb() * GI_SKY_RADIANCE_SCALE * tint, 0u, 0u, false, true);
+    return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }
   let k0 = gi_key0(sh.voxel);
   let k1 = gi_key1(sh.voxel, sh.face_id, sh.obj_id);
@@ -223,22 +217,5 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
   if (bounce2 > 0.0) {
     l = l + gi_bounce2(sh, org, sun_dir, sun_c, sun_bounce, epoch, seed, bounce2);
   }
-  return GiRaySample(l * tint, k0, k1, true, key_ok);
-}
-
-/// 只求**二次顶点键**的轻量射线（时域复用的二次顶点验证专用）：键的口径与 `gi_ray_radiance`
-/// **逐字一致**（同一次 `world_trace_medium` + `stop_on_air = false`、同一套 `gi_key0/gi_key1`
-/// —— MT5-2 后两侧都必须穿介质续行，否则"玻璃后面的那个面"这条键在两次求值间会不一致，
-/// 时域验证会恒判不等、白白丢掉历史），但**不做**二次顶点 NEE、不取 albedo ⇒ 少发一条阴影射线。
-/// `l` 恒为 0（调用方只用键），`tint` 也只为满足接口、无消费者。
-fn gi_ray_secondary_key(org: vec3<f32>, dir: vec3<f32>) -> GiRaySample {
-  var tint = vec3<f32>(1.0);
-  let sh = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
-  return GiRaySample(
-    vec3<f32>(0.0),
-    gi_key0(sh.voxel),
-    gi_key1(sh.voxel, sh.face_id, sh.obj_id),
-    sh.hit,
-    !sh.hit || gi_key_ok(sh.voxel),
-  );
+  return l * tint;
 }

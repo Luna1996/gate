@@ -332,6 +332,10 @@ fn register_callbacks(world: &mut World) {
           base.implicit_normal = *on;
           info!("隐式法相 → {}", if *on { "on" } else { "off（原色直出）" });
         }
+        ("render/base/ao", MenuAction::Toggle(on)) => {
+          base.ao = *on;
+          info!("环境遮蔽 → {}", if *on { "on" } else { "off（光照场停铺）" });
+        }
         ("render/gi/enabled", MenuAction::Toggle(on)) => {
           gi.enabled = *on;
           info!("GI → {}", if *on { "on" } else { "off" });
@@ -394,19 +398,19 @@ fn register_callbacks(world: &mut World) {
             (base / gi.share).max(1)
           );
         }
-        // 「采样重分配」档（关/温和/中/强）：按"这个像素已经有多干净"（上一帧 reservoir 的 M）
-        // 把每帧射线预算挪过去 —— 收敛的少发、刚脏的多发；记忆窗同步放大 ⇒ 窗内样本数不变
-        // （噪声不变、只有响应时间随像素变）⇒ 不会出现分配振荡。
+        // 「重分配」档（关/弱/中/强）：按"这个像素的时域累积还在不在工作"（本帧有没有接到历史）
+        // 把每帧射线预算挪过去 —— 接到的少发、没接到的多发；记忆窗同步放大 ⇒ 减发一侧窗内样本数不变
+        // （响应变慢、稳态噪声不变）。代理量与候选数脱钩 ⇒ 不会出现分配振荡。
         ("render/gi/realloc", MenuAction::Select(i)) => {
           let t = (*i).min((gate_render::gi::GiSettings::REALLOC_TIERS - 1) as usize) as u32;
           gi.realloc = t;
           let (name, lo, hi) = match t {
             0 => ("关", 1.0, 1.0),
-            1 => ("温和", 0.70, 1.40),
+            1 => ("弱", 0.70, 1.40),
             2 => ("中", 0.50, 2.00),
             _ => ("强", 0.25, 4.00),
           };
-          info!("GI 采样重分配 → {name} 收敛×{lo} 脏×{hi}");
+          info!("GI 重分配 → {name} 有历史×{lo} 无历史×{hi}");
         }
         // 镜面档位（菜单「渲染/反射」）：**只改反射内容的着色口径**，不改逐面量化的粒度。
         // 档 0/1/2 都**不发额外射线**（1/2 只是把反射命中点按完整着色点算、逃逸天空改走 `sky_primary`）；

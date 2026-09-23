@@ -35,8 +35,8 @@ pub struct LightGlobals {
   /// **镜面嵌套层级**（[`ReflectionSettings::nest`]，取值 0 / 1 / 2 / 4）：允许"镜子里的镜子"
   /// 再反射几级。同样复用废弃填充 `_pad1`。写侧 = `prepare_dda_bind_groups`。
   pub refl_nest: u32,
-  /// **「基础」开关位**（[`BaseSettings`]，置位 = 算）：bit0 = 直光阴影、bit1 = 隐式法相。
-  /// 复用废弃填充 `_pad2`。写侧 = `prepare_dda_bind_groups`。
+  /// **「基础」开关位**（[`BaseSettings`]，置位 = 算）：bit0 = 直光阴影、bit1 = 隐式法相、
+  /// bit2 = 环境遮蔽（光照场 AO）。复用废弃填充 `_pad2`。写侧 = `prepare_dda_bind_groups`。
   pub base_flags: u32,
   /// rgb = 环境色（线性），w reserved
   pub ambient: Vec4,
@@ -123,8 +123,8 @@ impl Default for ReflectionSettings {
   }
 }
 
-/// **「基础」子菜单的两个开关**（菜单「渲染/基础」）：把着色链里两件"基础"的事关掉，
-/// 用来 A/B 观感与成本。**置位 = 算**（默认两个都置位 = 今天的行为）。
+/// **「基础」子菜单的三个开关**（菜单「渲染/基础」）：把着色链里几件"基础"的事关掉，
+/// 用来 A/B 观感与成本。**置位 = 算**（默认全开 = 今天的行为）。
 ///
 /// - [`Self::shadow`] **直光阴影**：关掉 ⇒ **不发射阴影射线**（`sun_transmittance`），
 ///   太阳照旧直射、只是没有明暗遮挡 ⇒ 省**每像素 1 条 DDA**。落点在 `dda_main` 的不透明路径
@@ -133,32 +133,39 @@ impl Default for ReflectionSettings {
 /// - [`Self::implicit_normal`] **隐式法相**：关掉 ⇒ **不算邻域梯度法线**（`voxel_normal` 的 4 次点查询），
 ///   并且**原色直出** —— `shade_face` 取到材质后直接返回 `albedo`，后面的 AO / GI / 阴影 /
 ///   反射链 / 玻璃 in-scatter 全部不算。这是"看材质本色"的调试视图，也是全链最省的一档。
+/// - [`Self::ao`] **环境遮蔽**：关掉 ⇒ `light_field_ao` 一律返回 `1.0`（间接项与天光项不乘光照场的
+///   遮挡），并且**整条光照场的 CPU 重铺与上传都停掉** —— 那个场除了 AO 没有别的消费者
+///   （`.rgb` 恒 0，见 README 的不变量 11）。重新打开时强制全量重铺。
 ///
-/// 位编码写在 [`Self::flags`]；`main.wesl` 侧的名字是 `BASE_FLAG_*`（两处必须同步）。
+/// 位编码写在 [`Self::flags`]；WESL 侧的名字是 `BASE_FLAG_*`（`bindings.wesl`，两处必须同步）。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct BaseSettings {
   pub shadow: bool,
   pub implicit_normal: bool,
+  pub ao: bool,
 }
 
 impl BaseSettings {
-  /// 位 0：直光阴影（`main.wesl::BASE_FLAG_SHADOW`）。
+  /// 位 0：直光阴影（`bindings.wesl::BASE_FLAG_SHADOW`）。
   pub const FLAG_SHADOW: u32 = 1 << 0;
-  /// 位 1：隐式法相（`main.wesl::BASE_FLAG_IMPLICIT_NORMAL`）。
+  /// 位 1：隐式法相（`bindings.wesl::BASE_FLAG_IMPLICIT_NORMAL`）。
   pub const FLAG_IMPLICIT_NORMAL: u32 = 1 << 1;
+  /// 位 2：环境遮蔽（`bindings.wesl::BASE_FLAG_AO`）。
+  pub const FLAG_AO: u32 = 1 << 2;
 
   /// 打包成 uniform `LightGlobals::base_flags`（置位 = 算）。
   pub fn flags(&self) -> u32 {
     (if self.shadow { Self::FLAG_SHADOW } else { 0 })
       | (if self.implicit_normal { Self::FLAG_IMPLICIT_NORMAL } else { 0 })
+      | (if self.ao { Self::FLAG_AO } else { 0 })
   }
 }
 
 impl Default for BaseSettings {
-  /// 两个都开 = 与引入本开关前**逐位相同**。
+  /// 全开 = 与引入这些开关前**逐位相同**。
   fn default() -> Self {
-    Self { shadow: true, implicit_normal: true }
+    Self { shadow: true, implicit_normal: true, ao: true }
   }
 }
 

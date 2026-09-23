@@ -503,12 +503,14 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 // ExtractSchedule（render sub-app）：只读访问主 world 资源，CPU 构建 snapshot。
 // `Extract<T>` 的 T 必须 ReadOnlySystemParam，全部用 `Res<T>`。
 
+#[allow(clippy::too_many_arguments)]
 fn extract(
   mut commands: Commands,
   scene: Option<Extract<Res<VoxelScene>>>,
   budget: Option<Extract<Res<UploadBudget>>>,
   main_pending: Option<Extract<Res<MainPending>>>,
   camera: Option<Extract<Res<super::dda::DdaCameraConfig>>>,
+  base: Option<Extract<Res<crate::lighting::BaseSettings>>>,
   mut mirror: ResMut<BuilderMirror>,
   mut light_field: ResMut<LightFieldCpu>,
 ) {
@@ -585,7 +587,13 @@ fn extract(
     pending_data.iter().filter(|(v, _)| *v == 0).map(|(_, c)| *c).collect()
   };
   let cam_voxel = camera.as_ref().map(|c| c.position_world).unwrap_or(glam::Vec3::ZERO);
-  if let Some(data) =
+  // AO 关掉（菜单「渲染/基础/AO」）⇒ 着色侧 `light_field_ao` 恒返回 1.0、这张纹理没有消费者 ⇒
+  // 整条 CPU 重铺与上传都跳过。`valid = false` 是为了**重新打开时必定全量重铺**：缓存里留的是
+  // "那些 chunk 曾经算过"的 tally，而窗口原点在这段时间里已经漂走了。
+  let ao_off = base.as_ref().is_some_and(|b| !b.ao);
+  if ao_off {
+    light_field.valid = false;
+  } else if let Some(data) =
     update_light_field(&mut light_field, volumes_ref, cam_voxel, &dirty_main, need_full)
   {
     commands.insert_resource(LightFieldUpdate { data });

@@ -138,8 +138,8 @@ struct LightGlobals {
   // **镜面嵌套层级**（0 / 1 / 2 / 4）：镜子里的镜子最多再反射几级（见 `main.wesl` 的 MT4-5 段）。
   // 同样复用废弃填充 `_pad1`。写侧 = `prepare_dda_bind_groups`（Rust `ReflectionSettings::nest`）。
   refl_nest: u32,
-  // **「基础」开关位**（菜单「渲染/基础」，见 `main.wesl` 的 `BASE_FLAG_*`）：置位 = **算**。
-  // bit0 = 直光阴影、bit1 = 隐式法相。同样复用废弃填充 `_pad2`。
+  // **「基础」开关位**（菜单「渲染/基础」，位编码 = 下面紧跟的 `BASE_FLAG_*`）：置位 = **算**。
+  // bit0 = 直光阴影、bit1 = 隐式法相、bit2 = 环境遮蔽。同样复用废弃填充 `_pad2`。
   // 写侧 = `prepare_dda_bind_groups`（Rust `BaseSettings::flags`）。
   base_flags: u32,
   ambient: vec4<f32>,     // rgb = 环境色（线性）
@@ -151,6 +151,15 @@ struct LightPool {
   sky_color: vec4<f32>,   // 天空纯色（miss 背景 + sky 环境光共用）
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
+
+// ---- 「基础」开关的位编码（权威在这里：它描述的是上面 `base_flags` 的布局）----
+// 必须与 Rust `BaseSettings::FLAG_*`（`gate-render/src/lighting.rs`）一致。
+/// bit0 **直光阴影**：置位 ⇒ 发射阴影射线（`sun_transmittance`）。
+const BASE_FLAG_SHADOW: u32 = 1u;
+/// bit1 **隐式法相**：置位 ⇒ 算邻域梯度法线；清零 ⇒ 不算它，并且**原色直出**。
+const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
+/// bit2 **环境遮蔽**：置位 ⇒ 间接项/天光项乘光照场 AO（`light_field_ao`）；清零 ⇒ 该函数恒返回 `1.0`。
+const BASE_FLAG_AO: u32 = 4u;
 
 // ===== GI（屏幕空间逐面 ReSTIR）=====
 // uniform 与 Rust `GiUniform` 逐字段镜像（字节一致）。
@@ -166,8 +175,9 @@ struct GiUniform {
   misc: vec4<f32>,
   // x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率，2 = 半分辨率；整数值的 f32，只被
   // `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
-  // z = 世界几何相对「写入上一帧 reservoir 的那一帧」是否**逐位未变**（1 = 未变）⇒
-  // 屏幕空间路径可跳过时域二次顶点键验证射线（见 `gi/screen.wesl` ① 与 `prepare_gi` 的 `world_rev`）、
+  // z = 世界的体素占据相对「写入上一帧 reservoir 的那一帧」是否**逐位未变**（1 = 未变）⇒
+  // **本帧允许复用历史**（时域 + 空间两条；变过就整帧不复用，见 `gi/screen.wesl` 文件头 ⑥ 与
+  // `prepare_gi` 的 `world_rev`）、
   // w = **降噪质量档**（0 = 关 / 1 = 低 / 2 = 中 / 3 = 高；菜单「渲染/RESTIR GI/降噪质量」）：
   // 本 pass 只用它区分「高」档（1/4 档新鲜候选数与 reservoir 记忆窗按它取，见 `gi/consts.wesl`）；
   // 档位影响的 pass 派发（时域/atrous 开关、核半径）由 Rust 决定。
