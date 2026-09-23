@@ -22,7 +22,7 @@ struct DdaViewUniform {
 
 // --- BG1：brick map 全部数据 + globals ---
 @group(1) @binding(0) var<storage, read> b_struct: array<u32>;
-@group(1) @binding(1) var<storage, read> b_leaves: array<u64>;
+@group(1) @binding(1) var<storage, read> b_leaves: array<u64>;  // 方向可达掩码 LUT（Rust 侧按 2 个 u32/项写入）
 @group(1) @binding(2) var<storage, read> b_palette: array<u32>;
 
 // BrickMapGlobals 标量镜像（字段顺序须与 Rust 一致）。

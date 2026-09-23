@@ -518,6 +518,12 @@ impl VolumesBuilder {
     self.builders[volume_idx].chunk_base(coord)
   }
 
+  /// 逐 volume 的 wire 字节状态（按 volume 索引序，非拼接序）：供调试转储（`upload::dump_voxel_buffers`）
+  /// 把"CPU 认为该上传什么"整份取出；内容与 `snapshot()` 上传的字节同源。
+  pub fn volume_buffers(&self) -> Vec<&BrickMapBuffers> {
+    self.builders.iter().map(|b| b.buffers()).collect()
+  }
+
   pub fn len(&self) -> usize {
     self.builders.len()
   }

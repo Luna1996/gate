@@ -643,6 +643,13 @@ id = "reload"
 label = ""
 items = ["menu.game.world.reload"]
 
+# 数据转储：把 CPU 侧 wire 状态与 GPU 实际字节各写一份 .bin 到 logs/（对照查 mask 用）
+[[items.children.children]]
+kind = "buttons"
+id = "dump"
+label = ""
+items = ["menu.game.world.dump"]
+
 [[items]]
 kind = "sub_menu"
 id = "ui"

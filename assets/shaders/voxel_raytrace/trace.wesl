@@ -32,11 +32,23 @@ struct MediumRay {
   tint: vec3<f32>,
 }
 
-// brick 缓存槽：一层分裂节点常驻（镜像 CPU `BrickCpu`）。
+// brick 缓存槽：一层分裂节点常驻（镜像 CPU `BrickCpu`）。`mask` = 64 位分裂掩码，与 wire 的
+// `mask_lo | mask_hi << 32`、点查询 `sample_brickmap` 的语义逐位相同。
 struct Brick {
   addr: u32,  // 节点绝对字址（b_struct）
-  mask: u64,  // 64bit 分裂掩码（bit=1 = 子块分裂；bit=0 = 统一子块，色 = pal）
+  mask: u64,  // 分裂掩码（bit=1 = 子块分裂；bit=0 = 统一子块，色 = pal）
   pal: u32,   // 节点 palette（统一子块颜色，0 = 空气）
+}
+
+/// 子块 `idx`（0..63）是否分裂。
+fn mask_bit(mask: u64, idx: u32) -> bool {
+  return (mask & (u64(1) << idx)) != u64(0);
+}
+
+/// `idx` 之前（不含 idx）置位的分裂位个数 = 该子块的槽下标（与 `sample_brickmap` 同式）。
+fn mask_pop_below(mask: u64, idx: u32) -> u32 {
+  let below = mask & ((u64(1) << idx) - u64(1));
+  return u32(countOneBits(below));
 }
 
 /// 读 palette 槽的介质属性：`rgb` = **该材质的"一段"透过率**（乘性；一段 = 连续的同一材质，
@@ -158,16 +170,18 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       let cell = vec3<i32>(v >> sh) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
-        // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；每字 2 个体素（16 位索引）。
-        if ((b.mask & (u64(1) << idx)) != u64(0)) {
+        // 叶节点：bit=1 的体素取 inline 半字；bit=0 的体素 = 本节点 uniform 色（0 = 空气）——
+        // 「bit=0 ⇔ 空气」不成立，口径与 `sample_brickmap` / `get_voxel` 一致。
+        if (mask_bit(b.mask, idx)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           let leaf_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
           if (leaf_pal != 0u) { return VoxelHit(true, cur_t, leaf_pal, face, v); }
+        } else if (b.pal != 0u) {
+          return VoxelHit(true, cur_t, b.pal, face, v);
         }
         break;
       }
-      let bit = u64(1) << idx;
-      if ((b.mask & bit) == u64(0)) {
+      if (!mask_bit(b.mask, idx)) {
         // 统一子块：色 = 节点 palette（0 = 空气）
         if (b.pal != 0u) { return VoxelHit(true, cur_t, b.pal, face, v); }
         break;
@@ -175,8 +189,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
       let gd = 3u - level;
       if (gd >= depth_cap) { return VoxelHit(true, cur_t, b.pal, face, v); }
-      let below = b.mask & (bit - u64(1));
-      let pop = countOneBits(u32(below)) + countOneBits(u32(below >> 32u));
+      let pop = mask_pop_below(b.mask, idx);
       let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
       let c_ml = b_struct[child_addr];
       let c_mh = b_struct[child_addr + 1u];
@@ -199,6 +212,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
         let ecell = vec3<i32>(v >> sh) & vec3<i32>(3);
         let entry_i = u32(ecell.z * 16 + ecell.y * 4 + ecell.x);
         let lut_base = min(oct * 64u + entry_i, 511u);
+        // `b_leaves` 每项 1 个 u64（Rust 侧按 2 个 u32 写入，低字在前）
         var reach = b_leaves[lut_base];
         reach = select(reach, ~u64(0), lut_disable);
         if ((b.mask & reach) == u64(0)) {
@@ -229,7 +243,12 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       cur_t = side[mn];
       if (cur_t >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
       let old_cell = (v[mn] >> log2) & 3;
-      v[mn] = v[mn] + sign_v[mn] * s;
+      // ---- 步进即对齐：v 恒 = `cur_t` 处的真实体素（本循环内命中直接 return，不走外层「对齐快照」）----
+      // 格基址每步从 v 重算（循环外的 `base_v` 只对第一步成立）；步进轴取新格边界（正向 = 首格 /
+      // 负向 = 末格），其余轴按射线位置钳在本格内。
+      let cell_min = v & vec3<i32>(s_mask);
+      v = clamp(vec3<i32>(floor(ro_c + rd * cur_t)), cell_min, cell_min + vec3<i32>(s - 1));
+      v[mn] = select(cell_min[mn] + s, cell_min[mn] - 1i, sign_v[mn] < 0);
       side[mn] = side[mn] + step_inc[mn];
       face = mn * 2u + face_base[mn];
       let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
@@ -239,15 +258,16 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       let cell = vec3<i32>(v >> sh2) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
-        if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
+        // 叶层同上：bit=1 取 inline；否则（含 mask==0 的整节点 uniform）= 本节点色。
+        if (mask_bit(b.mask, idx)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           let dp = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
           if (dp != 0u) { return VoxelHit(true, cur_t, dp, face, v); }
-        } else if (b.mask == u64(0) && b.pal != 0u) {
+        } else if (b.pal != 0u) {
           return VoxelHit(true, cur_t, b.pal, face, v);
         }
       } else {
-        let mb = (b.mask & (u64(1) << idx)) != u64(0);
+        let mb = mask_bit(b.mask, idx);
         if (mb) { break; }
         if (b.pal != 0u) { return VoxelHit(true, cur_t, b.pal, face, v); }
       }
@@ -257,7 +277,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
     }
     // ---- firstTrailingBit 层级自适应跨级跳 ----
-    // 步进轴新坐标的尾随零位 = 对齐 run 长度，tz>>1 = 可跨步的最粗 level。
+    // 步进轴新坐标的尾随零位 = 对齐 run 长度，tz >> 1 = 可跨步的最粗 level。
     let positive = sign_v[step_axis] >= 0;
     let cur_log2 = level * 2u;
     let m: u32 = 0xFFFFFFFFu << cur_log2;
@@ -265,9 +285,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
     let vmin_u = u32(v[step_axis]);
     var comp: u32;
     if (positive) { comp = vmin_u & m; } else { comp = (vmin_u & m) | not_m; }
-    let tz_i = firstTrailingBit(comp + select(1u, 0u, positive));
-    var new_level: u32 = 0xFFFFFFFFu;
-    if (tz_i >= 0) { new_level = u32(tz_i) >> 1u; }
+    let new_level = firstTrailingBit(comp + select(1u, 0u, positive)) >> 1u;
     level = max(level, new_level);
     if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
     // 对齐快照：v 钳到 cur_t 处当前 level 区域，步进轴取精确边界整数。
@@ -330,15 +348,16 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let cell = vec3<i32>(v >> sh) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
-        // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；每字 2 个体素（16 位索引）。
-        if ((b.mask & (u64(1) << idx)) != u64(0)) {
+        // 叶节点：bit=1 取 inline 半字；bit=0 的体素 = 本节点色（口径见 `trace_chunk_opaque` 的叶层注释）。
+        if (mask_bit(b.mask, idx)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           hit_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
+        } else {
+          hit_pal = b.pal;
         }
         break;
       }
-      let bit = u64(1) << idx;
-      if ((b.mask & bit) == u64(0)) {
+      if (!mask_bit(b.mask, idx)) {
         // 统一子块：色 = 节点 palette（0 = 空气）
         hit_pal = b.pal;
         break;
@@ -346,8 +365,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
       let gd = 3u - level;
       if (gd >= depth_cap) { return VoxelHit(true, cur_t, b.pal, face, v); }
-      let below = b.mask & (bit - u64(1));
-      let pop = countOneBits(u32(below)) + countOneBits(u32(below >> 32u));
+      let pop = mask_pop_below(b.mask, idx);
       let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
       let c_ml = b_struct[child_addr];
       let c_mh = b_struct[child_addr + 1u];
@@ -381,6 +399,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         let ecell = vec3<i32>(v >> sh) & vec3<i32>(3);
         let entry_i = u32(ecell.z * 16 + ecell.y * 4 + ecell.x);
         let lut_base = min(oct * 64u + entry_i, 511u);
+        // LUT 读法同 `trace_chunk_opaque`
         var reach = b_leaves[lut_base];
         reach = select(reach, ~u64(0), lut_disable);
         if ((b.mask & reach) == u64(0)) {
@@ -416,7 +435,10 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0));
       }
       let old_cell = (v[mn] >> log2) & 3;
-      v[mn] = v[mn] + sign_v[mn] * s;
+      // 步进即对齐（同 `trace_chunk_opaque`）。
+      let cell_min = v & vec3<i32>(s_mask);
+      v = clamp(vec3<i32>(floor(ro_c + rd * cur_t)), cell_min, cell_min + vec3<i32>(s - 1));
+      v[mn] = select(cell_min[mn] + s, cell_min[mn] - 1i, sign_v[mn] < 0);
       side[mn] = side[mn] + step_inc[mn];
       face = mn * 2u + face_base[mn];
       let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
@@ -427,14 +449,14 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       hit_pal = 0u;
       if (level == 0u) {
-        if (b.mask != u64(0) && (b.mask & (u64(1) << idx)) != u64(0)) {
+        if (mask_bit(b.mask, idx)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           hit_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
-        } else if (b.mask == u64(0)) {
-          hit_pal = b.pal;
+        } else {
+          hit_pal = b.pal;  // 未分裂体素（含整节点 uniform）= 本节点色
         }
       } else {
-        if ((b.mask & (u64(1) << idx)) != u64(0)) { break; }
+        if (mask_bit(b.mask, idx)) { break; }
         hit_pal = b.pal;
       }
       if (hit_pal != 0u) {
@@ -458,9 +480,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     let vmin_u = u32(v[step_axis]);
     var comp: u32;
     if (positive) { comp = vmin_u & m; } else { comp = (vmin_u & m) | not_m; }
-    let tz_i = firstTrailingBit(comp + select(1u, 0u, positive));
-    var new_level: u32 = 0xFFFFFFFFu;
-    if (tz_i >= 0) { new_level = u32(tz_i) >> 1u; }
+    let new_level = firstTrailingBit(comp + select(1u, 0u, positive)) >> 1u;
     level = max(level, new_level);
     if (level > 3u) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
     // 对齐快照：v 钳到 cur_t 处当前 level 区域，步进轴取精确边界整数。

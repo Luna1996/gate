@@ -192,6 +192,38 @@ pub fn poll_pending(
   }
 }
 
+/// 主 world `Last`：递减转储请求。必须与 `poll_pending` 同阶段（都在同帧 ExtractSchedule 之前跑），
+/// 这样"置位 → 自减 → 提取 → 转储"的先后在同帧内是确定的。
+fn tick_voxel_dump_request(mut req: ResMut<VoxelDumpRequest>) {
+  req.pending = req.pending.saturating_sub(1);
+}
+
+/// **数据转储请求**（菜单「游戏/世界/数据转储」）：主 world 置位 → 提取进 render world →
+/// render 侧把 CPU 与 GPU 两份体素数据写进 `logs/`（见 [`dump_voxel_buffers`]）。
+///
+/// 为什么是**帧计数**而不是 bool：`ExtractResourcePlugin` 只在主 world 资源"有变化"时拷贝，
+/// 而置位（菜单观察者，Update）与提取（帧尾 ExtractSchedule）之间还隔着 `Last` 的自减
+/// ⇒ 用 [`Self::ARMED_FRAMES`] 帧的窗口保证 render 侧至少看见一次非零，随后自动归零
+/// （点一次按钮 = 恰好转储一次）。
+#[derive(
+  Resource, Default, Clone, Copy, Debug, bevy::render::extract_resource::ExtractResource,
+)]
+#[extract_app(bevy::render::RenderApp)]
+pub struct VoxelDumpRequest {
+  /// 剩余待转储帧数（0 = 不转储）
+  pub pending: u8,
+}
+
+impl VoxelDumpRequest {
+  /// 置位后的存活帧数（≥ 2：跨一次 `Last` 自减后提取仍能看到非零）
+  const ARMED_FRAMES: u8 = 2;
+
+  /// 请求一次转储（菜单按钮的唯一入口）。
+  pub fn arm(&mut self) {
+    self.pending = Self::ARMED_FRAMES;
+  }
+}
+
 /// ExtractSchedule 用的 CPU builder / pending 状态（render world resource）
 /// `builder: Option<VolumesBuilder>` 持有 `Vec<BrickMapBuilder>`；pending chunks 带 volume_idx。
 #[derive(Resource, Default)]
@@ -1047,13 +1079,269 @@ pub(crate) fn prepare(
   commands.remove_resource::<UploadSnapshot>();
 }
 
+/// 转储文件魔数（小端写盘 ⇒ 文件头 4 字节读出来是 `VOXD`）
+const DUMP_MAGIC: u32 = 0x4458_4F56;
+/// 转储布局版本（布局一改就 +1）
+const DUMP_LAYOUT_VERSION: u32 = 1;
+/// 转储头字数（随后是 `volume_count × 16` 的逐 volume 表）
+const DUMP_HEADER_WORDS: usize = 16;
+/// 逐 volume 表每条字数
+const DUMP_VOLUME_WORDS: usize = 16;
+
+/// **数据转储**（菜单「游戏/世界/数据转储」）：把 **CPU 侧 wire 状态**与 **GPU 上实际字节**各写一份
+/// `.bin` 到 `logs/`。两份文件的**布局逐字节相同** ⇒ 健康时应当逐字节相等，**首个不等的字/字节
+/// 就是"从 CPU 数据到 GPU 视线"的变形点**（mask / inline leaf / 调色板都在这两份里）。
+///
+/// 文件布局（小端；两份文件唯一差别是"段内容取自哪一侧"）：
+/// ```text
+/// 偏移            长度                  内容
+/// 0               64B                   头 16 字：magic / 版本 / 各段总字数 / 主世界窗口与全局计数
+/// 64B             64B × N               逐 volume 表 16 字 × N：tree_base / palette_base / 各段字数 /
+///                                       窗口 origin+dims / chunk_count / node_words / node_free_words / rejected
+/// 64+64N          struct_words × 4B     struct 段：chunk 窗口 + DFS 树（mask_lo/hi + node palette + leaf inline）
+/// …               palette_words × 4B    palette 段：8B 材质条目（2 字/条）
+/// …               leaves_words × 4B     leaves 段：方向可达掩码 LUT（2 字/u64 对）
+/// ```
+/// **段内顺序 = [`VolumesBuilder::snapshot`] 的拼接序**（物体在前、主世界在后）⇒ 表里的
+/// `tree_base` / `palette_base` 与 shader 的寻址（`tree_base + rel`）逐字一致，可直接用它们定位任一 chunk。
+///
+/// 定位与解码（与 `wire.rs` / `brickmap.wesl` 的契约一致）：
+/// - chunk 窗口字址 = `tree_base + rel.x + rel.y×64 + rel.z×64²`，`rel = chunk − 窗口 origin`
+///   （`CHUNK_INDEX_CAP = 64`）；该字是 `entry`，`entry != 0` ⇒ 树基址 = `tree_base + entry − 1`
+///   （= shader 的 `chunk_base`）；
+/// - 每个节点 3 字 fixed：`mask_lo` / `mask_hi` /（低 16 位 = 统一色，0 = AIR；高 16 位 = LOD 代表色），
+///   随后**按 mask 位序密集**放"该位置 1"的子块偏移（值 = 相对本 chunk 树基址的字偏移）；`mask = 0`
+///   的节点到此为止（整个 4^level 子块同色）；叶父层换成 32 字 inline（每字 2 个体素 × 16 位索引，
+///   0 = AIR）。
+///
+/// CPU 侧取 `BuilderMirror.builder`（与上传同源的那份状态）；GPU 侧走**真实 readback**
+/// （copy → staging → map），因此能验到"上传有没有写坏/写漏"。
+/// 刻意不含 `comp` / `state`：那是元件/状态表，没有 mask 语义。
+fn dump_voxel_buffers(
+  request: Option<Res<VoxelDumpRequest>>,
+  mirror: Option<Res<BuilderMirror>>,
+  gpu: Option<Res<GpuBrickMap>>,
+  device: Res<RenderDevice>,
+  queue: Res<RenderQueue>,
+) {
+  if request.is_none_or(|r| r.pending == 0) {
+    return;
+  }
+  let (Some(mirror), Some(gpu)) = (mirror, gpu) else {
+    warn!("数据转储：render 侧资源未就绪 → 忽略");
+    return;
+  };
+  let Some(builder) = mirror.builder.as_ref() else {
+    warn!("数据转储：CPU builder 尚未建立（还没有过一次上传）→ 忽略");
+    return;
+  };
+  let buffers = builder.volume_buffers();
+  let n = buffers.len();
+  if n == 0 {
+    warn!("数据转储：没有 volume → 忽略");
+    return;
+  }
+
+  // ---- 布局：与 `VolumesBuilder::snapshot` 的拼接序一致（物体在前、主世界在后）----
+  let layout_order: Vec<usize> = (1..n).chain(std::iter::once(0)).collect();
+  let mut tree_base = vec![0u32; n];
+  let mut palette_base = vec![0u32; n];
+  let (mut struct_words, mut palette_words) = (0usize, 0usize);
+  for &i in &layout_order {
+    tree_base[i] = struct_words as u32;
+    palette_base[i] = palette_words as u32;
+    struct_words += buffers[i].b_struct.len();
+    palette_words += buffers[i].b_palette.len();
+  }
+  let leaves_words = MARCH_MASK_WORDS;
+
+  // ---- 头 + 逐 volume 表（两份文件逐字相同的部分，都从 CPU 侧取）----
+  let mut head: Vec<u32> = Vec::with_capacity(DUMP_HEADER_WORDS + DUMP_VOLUME_WORDS * n);
+  {
+    let m = &buffers[0].globals;
+    head.extend([
+      DUMP_MAGIC,
+      DUMP_LAYOUT_VERSION,
+      n as u32,
+      struct_words as u32,
+      palette_words as u32,
+      leaves_words as u32,
+      m.index_origin_x as u32,
+      m.index_origin_y as u32,
+      m.index_origin_z as u32,
+      m.index_dims_x,
+      m.index_dims_y,
+      m.index_dims_z,
+      m.tile_count,
+      m.node_words,
+      m.node_free_words,
+      m.rejected_tiles,
+    ]);
+  }
+  for i in 0..n {
+    let g = &buffers[i].globals;
+    head.extend([
+      tree_base[i],
+      palette_base[i],
+      buffers[i].b_struct.len() as u32,
+      buffers[i].b_palette.len() as u32,
+      g.index_origin_x as u32,
+      g.index_origin_y as u32,
+      g.index_origin_z as u32,
+      g.index_dims_x,
+      g.index_dims_y,
+      g.index_dims_z,
+      g.tile_count,
+      g.node_words,
+      g.node_free_words,
+      g.rejected_tiles,
+      0,
+      0,
+    ]);
+  }
+
+  // ---- CPU 侧字节：builder 的 wire 状态（与上传同源）+ 静态 LUT ----
+  let lut = march_mask_lut_words();
+  let head_bytes = head.len() * 4;
+  let struct_bytes = struct_words * 4;
+  let palette_bytes = palette_words * 4;
+  let leaves_bytes = leaves_words * 4;
+  let total = head_bytes + struct_bytes + palette_bytes + leaves_bytes;
+  let mut cpu: Vec<u8> = Vec::with_capacity(total);
+  cpu.extend_from_slice(u8_of_u32(&head));
+  for &i in &layout_order {
+    cpu.extend_from_slice(u8_of_u32(&buffers[i].b_struct));
+  }
+  for &i in &layout_order {
+    cpu.extend_from_slice(u8_of_u32(&buffers[i].b_palette));
+  }
+  cpu.extend_from_slice(u8_of_u32(&lut));
+
+  // ---- GPU 侧字节：三块 buffer 的实际内容（readback）----
+  // 先尺寸守卫：小于 CPU 布局说明两侧不同步，此时绝不发 copy（wgpu 校验失败会毒化 device）。
+  let gpu_sizes = [
+    ("struct", gpu.struct_buf.size(), struct_bytes as u64),
+    ("palette", gpu.palette.size(), palette_bytes as u64),
+    ("leaves", gpu.leaves.size(), leaves_bytes as u64),
+  ];
+  if let Some((label, have, need)) = gpu_sizes.iter().find(|(_, have, need)| have < need) {
+    warn!(
+      "数据转储：GPU {label} buffer 只有 {have}B < 布局 {need}B → 本次放弃（先看上传是否掉队）"
+    );
+    return;
+  }
+  // staging 只装**三个段**（不含头区）：头区是纯元数据，直接取 CPU 那份即可 ⇒ 不必让 GPU 侧
+  // 也写一遍（`MAP_READ` buffer 上的 `write_buffer` 也能省掉），最终文件 = CPU 头 + GPU 段。
+  let payload_bytes = total - head_bytes;
+  let staging = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_voxel_dump_staging"),
+    size: payload_bytes as u64,
+    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+    mapped_at_creation: false,
+  });
+  let mut enc = device
+    .create_command_encoder(&CommandEncoderDescriptor { label: Some("gate_voxel_dump_readback") });
+  enc.copy_buffer_to_buffer(&gpu.struct_buf, 0, &staging, 0, struct_bytes as u64);
+  enc.copy_buffer_to_buffer(&gpu.palette, 0, &staging, struct_bytes as u64, palette_bytes as u64);
+  enc.copy_buffer_to_buffer(
+    &gpu.leaves,
+    0,
+    &staging,
+    (struct_bytes + palette_bytes) as u64,
+    leaves_bytes as u64,
+  );
+  // 本次 submit 顺带把本帧 `prepare` 里那些 `write_buffer` 落进 buffer ⇒ 转储内容是"当前帧的 GPU 状态"。
+  queue.submit([enc.finish()]);
+
+  let slice = staging.slice(..);
+  let (tx, rx) = std::sync::mpsc::channel();
+  device.map_buffer(&slice, MapMode::Read, move |r| {
+    let _ = tx.send(r);
+  });
+  // 阻塞等这一轮 copy 完成：转储是离散的用户动作，**同步拿结果**比跨帧状态机简单得多。
+  // 带上限（设备挂起时不至于把 app 冻死）。
+  if let Err(e) = device.poll(PollType::wait_indefinitely()) {
+    warn!("数据转储：等待 readback 失败 {e} → 本次放弃");
+    staging.unmap();
+    return;
+  }
+  match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+    Ok(Ok(())) => {}
+    Ok(Err(e)) => {
+      warn!("数据转储：readback 映射失败 {e} → 本次放弃");
+      staging.unmap();
+      return;
+    }
+    Err(e) => {
+      warn!("数据转储：readback 超时/断线 {e} → 本次放弃");
+      staging.unmap();
+      return;
+    }
+  }
+  // GPU 侧文件 = CPU 头区 + 刚 readback 的三个段（头区两文件逐字节相同 ⇒ 整份文件可直接对比）
+  let mut gpu_bytes: Vec<u8> = Vec::with_capacity(total);
+  gpu_bytes.extend_from_slice(&cpu[..head_bytes]);
+  match slice.get_mapped_range() {
+    Ok(view) => gpu_bytes.extend_from_slice(&view),
+    Err(e) => {
+      warn!("数据转储：读取映射区间失败 {e:?} → 本次放弃");
+      staging.unmap();
+      return;
+    }
+  }
+  staging.unmap();
+
+  // ---- 落盘 + 首异点 ----
+  let dir = crate::paths::logs_dir();
+  if let Err(e) = std::fs::create_dir_all(&dir) {
+    warn!("数据转储：建目录失败 {}：{e}", dir.display());
+    return;
+  }
+  let cpu_path = dir.join("voxel_dump_cpu.bin");
+  let gpu_path = dir.join("voxel_dump_gpu.bin");
+  if let Err(e) = std::fs::write(&cpu_path, &cpu) {
+    warn!("数据转储：写 {} 失败 {e}", cpu_path.display());
+    return;
+  }
+  if let Err(e) = std::fs::write(&gpu_path, &gpu_bytes) {
+    warn!("数据转储：写 {} 失败 {e}", gpu_path.display());
+    return;
+  }
+  info!(
+    "数据转储 → {} / {}（各 {}KB = 头 {}B + struct {}KB + palette {}KB + leaves {}KB；volume={n}）",
+    cpu_path.display(),
+    gpu_path.display(),
+    total / 1024,
+    head_bytes,
+    struct_bytes / 1024,
+    palette_bytes / 1024,
+    leaves_bytes / 1024,
+  );
+  match cpu.iter().zip(gpu_bytes.iter()).position(|(a, b)| a != b) {
+    None if cpu.len() == gpu_bytes.len() => info!("数据转储 CPU/GPU 逐字节一致"),
+    Some(i) => {
+      warn!("数据转储 CPU/GPU 首异字节 @{i}：cpu={:#04x} gpu={:#04x}", cpu[i], gpu_bytes[i])
+    }
+    // 两侧长度由同一份布局决定，长度不等只可能是写入被截断
+    None => warn!("数据转储 CPU/GPU 长度不等：{}B vs {}B", cpu.len(), gpu_bytes.len()),
+  }
+}
+
 /// 统一体素渲染上传插件：主世界与物体同一路径。
 /// 物体是 `Volumes.list[1..N]` 的普通 `VolumeGrid`，走相同的 dirty → VolumesBuilder → UploadSnapshot 路径。
 pub struct VolumePlugin;
 impl Plugin for VolumePlugin {
   fn build(&self, app: &mut App) {
     let ch = UploadCpuSampleChannel::default();
-    app.insert_resource(ch.clone()).init_resource::<MainPending>().add_systems(Last, poll_pending);
+    app
+      .insert_resource(ch.clone())
+      .init_resource::<MainPending>()
+      .init_resource::<VoxelDumpRequest>()
+      .add_plugins(
+        // 「数据转储」请求（菜单「游戏/世界」）：主 world 置位 → render world 读取
+        bevy::render::extract_resource::ExtractResourcePlugin::<VoxelDumpRequest>::default(),
+      )
+      .add_systems(Last, (poll_pending, tick_voxel_dump_request));
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
@@ -1064,6 +1352,8 @@ impl Plugin for VolumePlugin {
       .insert_resource(BuilderMirror { pending_full: true, ..Default::default() })
       .add_systems(RenderStartup, init_empty_gpu)
       .add_systems(ExtractSchedule, extract)
-      .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources));
+      .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources))
+      // 转储必须在 prepare 之后：先写完本帧上传，再 readback（同一帧的 GPU 状态）
+      .add_systems(Render, dump_voxel_buffers.after(prepare));
   }
 }

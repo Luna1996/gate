@@ -680,14 +680,15 @@ fn trace_chunk_cpu(
       let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
       let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
       if level == 0 {
-        // 叶节点 inline palette：bit=1（非空体素）才 load inline word 取色；
-        // bit=0 空气体素零 load（mask 在手）。
+        // 叶节点：bit=1 的体素取 inline 半字；bit=0 的体素 = 本节点 uniform 色（0 = 空气）
         if (b.mask & (1u64 << idx)) != 0 {
           let w = b_struct[b.addr + 3 + (idx >> 1)];
           let leaf_pal = ((w >> ((idx & 1) * 16)) & 0xFFFF) as u16;
           if leaf_pal != 0 {
             return Some((cur_t, leaf_pal, face, v));
           }
+        } else if b.pal != 0 {
+          return Some((cur_t, b.pal, face, v));
         }
         break; // 空气 leaf
       }
@@ -746,8 +747,19 @@ fn trace_chunk_cpu(
         return None; // 段内再无子块可入
       }
       let old_cell = (v[min] >> log2) & 3;
-      // 沿 min 轴整子块跨越
-      v[min] += sign[min] * s;
+      // 步进即对齐（镜像 WGSL 同一句）：v 恒 = `cur_t` 处的真实体素。格基址每步从 v 重算
+      // （循环外的 `base` 只对第一步成立）；步进轴取新格边界，其余轴按射线位置钳在本格内。
+      let cell_min = [v[0] & !(s - 1), v[1] & !(s - 1), v[2] & !(s - 1)];
+      let p_step = [
+        ro_c[0] + rd[0] * cur_t,
+        ro_c[1] + rd[1] * cur_t,
+        ro_c[2] + rd[2] * cur_t,
+      ];
+      for i in 0..3 {
+        let pf = p_step[i].floor() as i32;
+        v[i] = pf.clamp(cell_min[i], cell_min[i] + (s - 1));
+      }
+      v[min] = if sign[min] < 0 { cell_min[min] - 1 } else { cell_min[min] + s };
       side[min] += step_inc[min];
       face = (min * 2) as u8 + if sign[min] < 0 { 1 } else { 0 };
       // 跨出 brick（4 子块）？正向往 3→外、负向往 0→外
@@ -762,15 +774,14 @@ fn trace_chunk_cpu(
       let cell = [(v[0] >> log2) & 3, (v[1] >> log2) & 3, (v[2] >> log2) & 3];
       let idx = (cell[2] * 16 + cell[1] * 4 + cell[0]) as usize;
       if level == 0 {
-        // bit=1（非空体素）才 load inline word；bit=0 空气体素零 load
+        // 叶层同上：bit=1 取 inline；否则（含 mask==0 的整节点 uniform）= 本节点色
         if b.mask != 0 && (b.mask & (1u64 << idx)) != 0 {
           let w = b_struct[b.addr + 3 + (idx >> 1)];
           let dp = ((w >> ((idx & 1) * 16)) & 0xFFFF) as u16;
           if dp != 0 {
             return Some((cur_t, dp, face, v));
           }
-        } else if b.mask == 0 && b.pal != 0 {
-          // 防御：uniform 叶（正常下钻快路径已处理）
+        } else if b.pal != 0 {
           return Some((cur_t, b.pal, face, v));
         }
       } else {

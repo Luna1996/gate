@@ -23,6 +23,10 @@ use crate::{
   vox_scene,
 };
 
+/// 程序化调试场景名（**不来自磁盘**，见 `build_cube_in_void`）：与 `assets/vox/*.vox` 的名字同列在
+/// 「世界」页的模型下拉里，由 [`build_world`] 按名分发。
+pub(crate) const CUBE_IN_VOID: &str = "cube_in_void";
+
 pub(crate) fn setup(
   mut commands: Commands,
   mut images: ResMut<Assets<Image>>,
@@ -55,17 +59,18 @@ pub(crate) fn setup(
     build_demo_scene(&mut grid);
     bevy::log::info!("STEP 2 build_demo_scene {:?}", t0.elapsed());
   } else {
-    let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
     // 启动世界 = 「游戏/世界」页模型下拉的最终选中项（结构来自资产、选中项来自配置；读不到 → nuke）
     let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu(&config))
       .unwrap_or_else(|| "nuke".to_string());
-    let path = gate_render::assets_dir().join(format!("vox/{name}.vox"));
-    let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)
-      .unwrap_or_else(|e| panic!("{name}.vox 加载失败: {e}"));
-    cam_eye = Vec3::new(406.5, 339.5, 431.5);
-    cam_target = Vec3::new(551.5, 330.5, 359.5);
+    let info = build_world(&mut grid, &name).unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
+    // 默认机位：`cube_in_void` 的立方体（原点、边长 64）从斜上方看；其余 .vox 沿用既有读数
+    (cam_eye, cam_target) = if name == CUBE_IN_VOID {
+      (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO)
+    } else {
+      (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5))
+    };
     bevy::log::info!(
-      "STEP 2 vox scene {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
+      "STEP 2 world {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
       info.instances_used,
       info.voxels_written,
       info.voxels_dropped,
@@ -150,21 +155,53 @@ pub(crate) fn setup(
     .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
 }
 
-/// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按 `assets/vox/<name>.vox` 重建主世界。
+/// 按名字把主世界体素写进 `grid`（`setup` 与 `reload_world` 的唯一分发点）：
+/// `cube_in_void` = 程序化调试场景（[`build_cube_in_void`]）；其余 = `assets/vox/<name>.vox`。
+/// 不做 `compact_all` —— GC 时机由调用方定（`setup` 在场景构建后统一做一次）。
+fn build_world(
+  grid: &mut VolumeGrid,
+  name: &str,
+) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
+  if name == CUBE_IN_VOID {
+    return Ok(build_cube_in_void(grid));
+  }
+  let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
+  let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
+  vox_scene::load_vox_scene(grid, &path, anchor)
+}
+
+/// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按名字重建主世界（`cube_in_void` 见
+/// [`build_cube_in_void`]，其余走 `assets/vox/<name>.vox`）。
 /// 与 `setup` 同一套不变量：先 `compact_all`；`demo_force_full_rebuild` 触发全量重建 + 全量 GPU 上传。
 /// 失败 → 原世界保持不变；相机不动（所有模型锚到同一 anchor）。
 pub(crate) fn reload_world(
   scene: &mut VoxelScene,
   name: &str,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
-  let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
-  let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
   let mut grid = VolumeGrid::new();
-  let info = vox_scene::load_vox_scene(&mut grid, &path, anchor)?;
+  let info = build_world(&mut grid, name)?;
   grid.compact_all();
   scene.volumes = Volumes::new(grid);
   scene.demo_force_full_rebuild = true;
   Ok(info)
+}
+
+/// 程序化调试场景（「世界」页模型下拉里的 `cube_in_void`）：**空场景** + 原点处的 64³ 实心立方体，
+/// 槽 1 = `ffffff` 平凡材质。世界里除这一个立方体外没有任何东西，供"在简单场景里复现 bug"用。
+/// 立方体居中于原点（占据 `[-32, 32)³`，边长 64 voxel = 1.28m @50 voxel/m）。
+fn build_cube_in_void(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
+  const EDGE: i32 = 64;
+  // 槽 1：颜色 ffffff 的平凡变体（`PaletteEntry::default` 的其余字段：不发光 / 不透射 / 非金属 / 非 PBR）
+  grid.palette_mut().set(PaletteId(1), PaletteEntry { color: [255, 255, 255], ..Default::default() });
+  let min = IVec3::splat(-EDGE / 2);
+  let voxels_written = fill_box(grid, min, IVec3::splat(EDGE), 1);
+  vox_scene::VoxSceneInfo {
+    aabb_min: min,
+    aabb_max: min + IVec3::splat(EDGE),
+    instances_used: 1,
+    voxels_written,
+    voxels_dropped: 0,
+  }
 }
 
 /// demo 调色板：1..=12 地形/岩石色 + 14 号 LED 灯柱（`PaletteEntry::default` + 逐字段赋值）。

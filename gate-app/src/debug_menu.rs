@@ -32,10 +32,13 @@ use std::sync::atomic::Ordering;
 /// 菜单 TOML 相对 assets 目录的路径（UI 结构与控件缺省值的唯一来源）
 pub const MENU_TOML_PATH: &str = "ui/debug_menu.toml";
 
-/// 「世界」页模型下拉的节点路径（选项由 `apply_world_model_options` 按磁盘内容填）
+/// 「世界」页模型下拉的节点路径（选项由 `apply_world_model_options` 填：磁盘扫描 + 程序化场景）
 pub const WORLD_MODEL_PATH: &str = "game/world/model";
 /// 「世界」页「重载世界」按钮的节点路径（空 label 的按钮组 = 整行按钮）
 pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
+/// 「世界」页「数据转储」按钮的节点路径（把 CPU/GPU 两份体素数据写进 `logs/`，见
+/// `gate_render::VoxelDumpRequest`）
+pub const WORLD_DUMP_PATH: &str = "game/world/dump";
 /// 「编辑/材质」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
 pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/mat/pbr_asset";
 /// 「编辑/笔触」页「偏移距离」输入框的节点路径：改「笔触大小」时要把自动值写回这个控件
@@ -100,10 +103,15 @@ pub fn load_menu(config: &Config) -> MenuFile {
   model
 }
 
-/// 把 `WORLD_MODEL_PATH` 下拉的选项换成 `assets/vox` 下实际存在的模型（见
-/// `crate::vox_scene::scan_vox_models`）；选中项按名字找回，找不到 → `nuke` → 第一项。
+/// 把 `WORLD_MODEL_PATH` 下拉的选项换成「`assets/vox` 下实际存在的模型（见
+/// `crate::vox_scene::scan_vox_models`）+ 程序化调试场景 `crate::scene::CUBE_IN_VOID`」；
+/// 选中项按名字找回，找不到 → `nuke` → 第一项。
 fn apply_world_model_options(model: &mut MenuFile) {
-  let options = crate::vox_scene::scan_vox_models();
+  let mut options = crate::vox_scene::scan_vox_models();
+  // 程序化场景不来自磁盘（见 `scene::build_cube_in_void`），与 .vox 名字同列在一个下拉里
+  options.push(crate::scene::CUBE_IN_VOID.to_string());
+  options.sort();
+  options.dedup();
   let Some(MenuNode::Dropdown { options: opts, selected, .. }) =
     model.node_mut(&split(WORLD_MODEL_PATH))
   else {
@@ -660,9 +668,11 @@ fn register_callbacks(world: &mut World) {
 
   // 下拉只改模型（退出时随存档持久化）；「重载世界」按钮才真正换世界（同步阻塞），失败只 warn、
   // 原世界不变；成功后全量重建 + GPU 上传由 VoxelScene.demo_force_full_rebuild 驱动。
+  // 「数据转储」按钮与上面两个无关：它只置位一个请求位，转储在 render 侧下一帧做。
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut scene: ResMut<gate_render::VoxelScene>,
+     mut dump: ResMut<gate_render::VoxelDumpRequest>,
      q_menu: Query<&gate_ui::DebugMenu>| {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
@@ -676,9 +686,15 @@ fn register_callbacks(world: &mut World) {
           };
           let t0 = std::time::Instant::now();
           match crate::scene::reload_world(&mut scene, &name) {
-            Ok(_info) => info!("世界重载 → {name}.vox {:?}", t0.elapsed()),
-            Err(e) => warn!("重载世界失败 {name}.vox：{e} → 原世界不变"),
+            Ok(_info) => info!("世界重载 → {name} {:?}", t0.elapsed()),
+            Err(e) => warn!("重载世界失败 {name}：{e} → 原世界不变"),
           }
+        }
+        // 数据转储：只置位请求，真正的转储（含 GPU readback 与落盘）在 render 侧下一帧做
+        // （见 `gate_render::VoxelDumpRequest` 与 `upload::dump_voxel_buffers`）。
+        (WORLD_DUMP_PATH, MenuAction::Button(_)) => {
+          dump.arm();
+          info!("数据转储 → 请求");
         }
         _ => {}
       }

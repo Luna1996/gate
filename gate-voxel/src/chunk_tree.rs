@@ -128,7 +128,7 @@ impl ChunkTree {
 
     if child_extent == 1 {
       // 叶父层（level 3）：inline 32 word，2 体素/word；读端 b_struct[node + 3 + (child_idx >> 1)]
-      // 的第 (child_idx & 1) 个半字，bit=0 体素 = 0（AIR）。
+      // 的第 (child_idx & 1) 个半字。bit=0 的体素不写 inline（恒 0），其色 = 本节点 uniform 色。
       let inline_start = out.len();
       out.resize(out.len() + LEAF_INLINE_WORDS, 0);
       for i in 0u32..64 {

@@ -33,7 +33,7 @@ fn wesl_package_compiles_and_validates() {
   }
   let module = naga::front::wgsl::parse_str(&src).expect("WESL 产物不是合法 WGSL");
   naga::valid::Validator::new(
-    // `b_leaves` 是 `array<u64>` ⇒ 需要 SHADER_INT64（与 app 启用的 wgpu feature 一致）。
+    // 能力给满：校验口径不窄于运行期设备（产物无 64 位整数，不额外要求特性）。
     naga::valid::ValidationFlags::all(),
     naga::valid::Capabilities::all(),
   )

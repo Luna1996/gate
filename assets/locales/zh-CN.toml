@@ -257,6 +257,7 @@ GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 "menu.game.world" = "世界"
 "menu.game.world.model" = "模型"
 "menu.game.world.reload" = "重载世界"
+"menu.game.world.dump" = "数据转储"
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
 # 纯文本行的值

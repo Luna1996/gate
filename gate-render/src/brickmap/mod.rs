@@ -17,7 +17,8 @@ pub use dda::{
 };
 pub use upload::{
   BindingLimits, BrickMapRevision, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,
-  UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelScene,
+  UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelDumpRequest,
+  VoxelScene,
 };
 pub use view::BrickMapView;
 pub use wire::{BrickMapBuffers, BrickMapGlobals, GridDesc};
