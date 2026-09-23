@@ -96,7 +96,7 @@ fn gi_res_none() -> GiRes {
 }
 
 /// 读**上一帧**的 reservoir（`gi_res_prev`）：累计量 + 判据，**整条 8 字**。
-/// 只给**时域复用**用（每像素一次）；空间 tap 走 `gi_tap_head` / `gi_tap_merge`（只为它要的那几个字）。
+/// 只给**时域复用**用（每像素一次）；空间 tap 走 `gi_tap_head` / `gi_tap_merge`。
 fn gi_res_load_prev(idx: u32) -> GiRes {
   let b = idx * GI_RES_WORDS;
   return GiRes(
@@ -242,7 +242,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
   // 二次顶点太阳反弹（菜单「渲染/RESTIR GI/太阳反弹」）：0 = 连 NEE 阴影射线都不发。
   let sun_bounce = gi_u.params.x;
-  // ② 二次顶点缓存的 epoch（`gi_u.seq.y`）：光照/几何/光照场窗口变了才自增 ⇒ 槽里的键掩码跟着变、
+  // ② 二次顶点缓存的 epoch（`gi_u.seq.y`）：光照/几何变了才自增 ⇒ 槽里的键掩码跟着变、
   // 整张表自失效（跨帧持久，见 `gi/common.wesl`）。
   let epoch = gi_u.seq.y;
   // ④ 第二条弹射的**倍数**（菜单「渲染/光照/二次弹射」，`gi_u.misc.w`）：0 = 关；
@@ -398,7 +398,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   loop {
     if (k >= cand_n) { break; }
     let nb = min(GI_SS_RAY_BATCH, cand_n - k);
-    var b_l: array<vec3<f32>, GI_SS_RAY_BATCH>;
+    var b_s: array<vec3<f32>, GI_SS_RAY_BATCH>;
     for (var i = 0u; i < nb; i = i + 1u) {
       let kk = k + i;
       let cseed = gi_mix(seed + kk * 0x9E3779B9u + 1u);
@@ -409,12 +409,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
       // ⇒ 时域累积到的是一个恒为 `mult ×` 的值，直接变成系统性偏差。
       // 抽签用同一批哈希（`gi_rand2` 的第二个分量），不另造随机源；种子含帧号 ⇒ 逐帧独立。
       let b2 = select(0.0, b2_mult, gi_rand2(gi_mix(cseed + 0x27D4EB2Fu)).y < 1.0 / max(b2_mult, 1.0));
-      b_l[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce, epoch, b2, cseed);
+      b_s[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce, epoch, b2, cseed);
     }
     for (var i = 0u; i < nb; i = i + 1u) {
-      // 累计量就是全部：估计 = `w_sum / M`，所以这里只累 `π·L` 与计数。
-      let w = b_l[i] * GI_PI;
-      r.w_sum = r.w_sum + w;
+      // 累计量就是全部：辐亮度估计 = `w_sum / M`。
+      r.w_sum = r.w_sum + b_s[i] * GI_PI;
       r.m = r.m + 1.0;
     }
     k = k + nb;
@@ -472,7 +471,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     // 淹没，画面被"上一帧 + 屏幕偏移一格"的值支配（诊断实测：只接受逐位相同的键时拖影基本消失）。
     // `sk_sum` / `sk_m` 同比例缩 ⇒ 邻居的估计值不变，只压它的权重。
     let keep = min(1.0, GI_SS_REUSE_M_K * r.m / max(sk_m, 1e-6));
-    est = (r.w_sum + sk_sum * keep) / max(r.m + sk_m * keep, 1e-6);
+    let denom = max(r.m + sk_m * keep, 1e-6);
+    est = (r.w_sum + sk_sum * keep) / denom;
   }
   let gi = est * (gi_u.params.z / GI_PI);
   // valid = 1（供 `dda_main` 的天光兜底权重使用）：GI 有数据 ⇒ 天光只占 `GI_AMBIENT_FLOOR` 倍。

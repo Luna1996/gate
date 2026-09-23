@@ -1,7 +1,7 @@
 # GATE — GPU-Accelerated Tile Engine
 
 > GPU 稀疏体素（Douglas Brick Tree，256³ chunk）+ 计算着色器层次 DDA 光追 + 屏幕空间 ReSTIR GI + 自研 bevy_ui 工具链。
-> **当前分支 `restir-gi`**：ReSTIR GI / 光照场（AO）/ 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
+> **当前分支 `restir-gi`**：ReSTIR GI / 自动曝光 / 体素编辑 / 可持久化调试菜单均已落地；默认场景为 MagicaVoxel `nuke.vox`。
 
 ---
 
@@ -47,13 +47,12 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
 | **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
 | **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass；局部 AABB slab 剔除 |
-| **GI（屏幕空间 ReSTIR）** | ✅ 生产可用 | 逐像素一个 reservoir（每 GI 像素 `GI_RES_WORDS` 个 word × 2 块 ping-pong），`gi_main` 一次派发完成「新鲜候选（4 条余弦；「高」档 8 条；去遮挡再翻倍）→ 时域复用 → 空间复用 → 着色」。复用判据 = **同一个面**（平面归属靠面键，相似度靠**着色法线** `dot ≥ GI_DEN_N_DOT`）⇒ 薄板/墙缝不漏光，而凸棱上被梯度法线平均过的那一段仍与相邻同面体素连成一片。**空间复用零射线**（8 tap 只并上一帧邻居的累计量），且**只作用在本帧估计、不回写时域历史**。辐亮度 = 单次弹射（命中面按「太阳直射 + 天光×AO」着色后除 π，miss 取天光）⇒ 输入只依赖几何与光照、逐帧确定，第 1 帧即稳态。降噪 = 时域累积（输入在「面不跨 texel」时取**同一面邻域均值**做预平均 + 方差驱动历史权重 + 累积矩给出的平滑噪声尺度 + AABB 钳制 + 离群抑制，上限 96 帧）→ 5 轮 atrous（同面键满权重、其他走法线点积 × 亮度权重）；回全分辨率用**几何感知上采样**。菜单「渲染/ReSTIR GI」开关 + 分辨率档（1/1、1/2、1/4；每档都跑 GI，只是网格疏密不同）+「降噪质量」档（关/低/中/高，**与分辨率档正交**：关 = 一条降噪 pass 都不跑、直接采样原始 GI；低 = 时域 + 5 轮 3×3；中 = atrous 换 5×5；高 = 再把每像素候选数翻倍即 GI 射线翻倍 + 记忆窗 20→32 帧）。此外：**① 逐面合并**（同一个可见体素面的全部 texel 的候选是**同一个积分**的 i.i.d. 样本 ⇒ `gi_main` 定点累加、`gi_face_flatten` 在**降噪之前**把整面换成均值，方差 ÷ texel 数）；**② 二次顶点缓存跨帧持久**（槽里的键带 epoch 掩码：几何 / 太阳 / 天光 / 光照场窗口任一变化即整表自失效 ⇒ 不再每帧 `clear_buffer`）；**④ 二次弹射**（菜单「光照/二次弹射」：二次顶点再加一跳的间接光，稀疏档按 `1/4` 概率带上并乘 `4` 补齐期望 ⇒ 无偏）。 |
-| **光照场（AO）** | ✅ 生产可用 | 相机中心、世界锚定的 32³ × 16 voxel 网格（`Rgba16Unorm`，硬件三线性），.a = AO fill 直接乘进命中着色（间接项 / 天光项共 4 个调用点，唯一出口是 `light_field_ao`）；**菜单「渲染/基础/AO」可整条关掉**（系数恒 1.0，且 CPU 重铺与上传一并停掉）；发光走「命中直出自身颜色 + 进 GI」，不再走发光密度通道 |
+| **GI（屏幕空间 ReSTIR）** | ✅ 生产可用 | 逐像素一个 reservoir（每 GI 像素 `GI_RES_WORDS` 个 word × 2 块 ping-pong），`gi_main` 一次派发完成「新鲜候选（4 条余弦；「高」档 8 条；去遮挡再翻倍）→ 时域复用 → 空间复用 → 着色」。复用判据 = **同一个面**（平面归属靠面键，相似度靠**着色法线** `dot ≥ GI_DEN_N_DOT`）⇒ 薄板/墙缝不漏光，而凸棱上被梯度法线平均过的那一段仍与相邻同面体素连成一片。**空间复用零射线**（8 tap 只并上一帧邻居的累计量），且**只作用在本帧估计、不回写时域历史**。辐亮度 = 单次弹射（命中面按「太阳直射 + 天光」着色后除 π，miss 取天光）⇒ 输入只依赖几何与光照、逐帧确定，第 1 帧即稳态。降噪 = 时域累积（输入在「面不跨 texel」时取**同一面邻域均值**做预平均 + 方差驱动历史权重 + 累积矩给出的平滑噪声尺度 + AABB 钳制 + 离群抑制，上限 96 帧）→ 5 轮 atrous（同面键满权重、其他走法线点积 × 亮度权重）；回全分辨率用**几何感知上采样**。菜单「渲染/ReSTIR GI」开关 + 分辨率档（1/1、1/2、1/4；每档都跑 GI，只是网格疏密不同）+「降噪质量」档（关/低/中/高，**与分辨率档正交**：关 = 一条降噪 pass 都不跑、直接采样原始 GI；低 = 时域 + 5 轮 3×3；中 = atrous 换 5×5；高 = 再把每像素候选数翻倍即 GI 射线翻倍 + 记忆窗 20→32 帧）。此外：**① 逐面合并**（同一个可见体素面的全部 texel 的候选是**同一个积分**的 i.i.d. 样本 ⇒ `gi_main` 定点累加、`gi_face_flatten` 在**降噪之前**把整面换成均值，方差 ÷ texel 数）；**② 二次顶点缓存跨帧持久**（槽里的键带 epoch 掩码：几何 / 太阳 / 天光任一变化即整表自失效 ⇒ 不再每帧 `clear_buffer`）；**④ 二次弹射**（菜单「光照/二次弹射」：二次顶点再加一跳的间接光，稀疏档按 `1/4` 概率带上并乘 `4` 补齐期望 ⇒ 无偏）。 |
 | **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
 | **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
-| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除；球 / 立方笔触按 brick 粒度整块写入（整块全在笔触内 → 一次 O(深度) 写，落成 uniform 上级节点）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传 + 光照场重算；`EDIT[place\|erase]` 日志 |
+| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除；球 / 立方笔触按 brick 粒度整块写入（整块全在笔触内 → 一次 O(深度) 写，落成 uniform 上级节点）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传；`EDIT[place\|erase]` 日志 |
 | **渲染管线** | ✅ 生产可用 | **无 render node**：extract / prepare / dispatch / blit 全部系统级显式调度；`blit.wgsl` 双入口 `fs_main` / `fs_fxaa`（FXAA 3.11 移植）；半分辨率 `RenderScale` + 线性上采样；MSAA 强制关闭 |
-| **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界**（光照场随之重建） |
+| **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界** |
 | **世界标签** | ✅ 生产可用 | `WorldAnchor`：世界坐标 → 屏幕像素 UI 标签（距离缩放、CJK 字体延迟解析） |
 | **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本 |
 
@@ -78,12 +77,12 @@ cargo clippy --release --workspace --all-targets -- -D warnings
             → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
   Last    : poll_pending —— UploadBudget（4MB/帧）× DirtyTracker → MainPending
       ↓ ExtractSchedule（main → render world）
-  extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB) + LightFieldUpdate
+  extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB)
   extract_camera : DdaCameraConfig → DdaViewUniform
   extract_gi     : GiSettings（GI 开关 / 分辨率除数）+ 曝光活参数
       ↓ render world
   RenderStartup    : init_dda_pipelines / init_empty_gpu / init_gi_gpu / queue_gi_pipelines
-  PrepareResources : prepare_upload（struct/palette/comp/state/grid_descs + 光照场 3D 纹理 + 扩容）
+  PrepareResources : prepare_upload（struct/palette/comp/state/grid_descs + 扩容）
   PrepareBindGroups: prepare_dda_bind_groups → prepare_gi
   RenderGraph::Render（dispatch 顺序）:
       beam（1/4 分辨率最近命中断面预 pass）
@@ -156,7 +155,7 @@ gate-render/       渲染与 wire 契约（CPU 侧；GPU 状态全部在 render 
                        builder.rs  BrickMapBuilder（单 volume）/ VolumesBuilder（多 volume）+
                                    DirtyRanges（struct 字区间 + palette 槽区间）+ snapshot（自动降级全量）
                        upload.rs   poll_pending / extract / prepare / init_empty_gpu；ensure_with_copy 扩容；
-                                   光照场烘焙与上传；UPLOAD[full|incremental] 日志；VolumePlugin
+                                   UPLOAD[full|incremental] 日志；VolumePlugin
                        dda.rs      全部 CPU DDA 参考实现（brute / AABB-skip / 两级 cell / 层次栈式 /
                                    多 volume trace）、OrbitCamera / DdaCameraConfig、RenderScale /
                                    PostFxSettings / EyeAdaptSettings、全部 BG layout + pipeline +
@@ -243,7 +242,7 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | `PALETTE_WORDS` | 131072 | 调色板字数（2^16 × 2 u32）/volume |
 | `MARCH_MASK_*` | 8 octant × 64 入口 × 2 字 = 1024 字 | 方向可达掩码 LUT（b_leaves，4KB） |
 
-### 渲染 / GI / 光照场
+### 渲染 / GI
 
 | 符号 | 值 | 含义 |
 |---|---|---|
@@ -251,7 +250,6 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | DDA workgroup | 8×8 | `dda_main` / `beam_main` / `gi_main` / 降噪 4 个入口的工作组边长（须与 WESL 一致） |
 | beam / GI 分辨率 | 1/4 / 1/2 | beam depth 纹理（1/4 全分辨率）；GI 缓冲档位 `GiSettings.gi_div` = 1 / 2 / 4（菜单「渲染/GI/分辨率」，默认 1/2；premultiplied valid 格式） |
 | `GI_RES_WORDS` | 8 | 每 GI 像素的 reservoir 字数（布局见 `gi/screen.wesl`：状态位 + 面键 2 + **着色法线** + 累计量 rgb + `M`）。**只有累计量与判据** —— 曾经的"代表样本"（方向 / 辐亮度 / 二次顶点键）随逐样本校验一起删掉了，见 5j |
-| 光照场 | 32³ cell × 16 voxel | `Rgba16Unorm` 3D 纹理，.a = AO fill；世界覆盖 512 voxel = ±5.12m。**菜单「渲染/基础/AO」清零 `base_flags` 的 bit2 即整条关掉**（`light_field_ao` 恒返回 1.0，CPU 重铺与上传也跳过） |
 | `SHADOW_SURFACE_EPS` | 1/32 voxel | 阴影/二次射线起点沿法线外推（防自命中，与 WGSL 同步） |
 
 ### 4.1 GI 着色 / 光路旋钮（都在 `gi/consts.wesl`）
@@ -269,7 +267,7 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 | `GI_SS_CAND_N_HQ` | 8 | 每像素新鲜候选数 · 「降噪质量」**档 3（高）**：射线翻倍（全链最贵的一项）。**与分辨率档无关**（1/1 档也翻倍——那是极限画质的对照点）。1/4 + 8 = 0.5 条/屏幕像素（仍是 1/2 档的一半），每 texel 噪声 σ/2.83 |
 | `GI_SS_M_CAP_K` / `_HQ` | 20 / 32 | reservoir 候选数上限 = 本值 × 本帧新鲜候选数（超过则同比例缩回，`w_sum / M` 不变）⇒ **滑动窗口 = 本值帧**（与候选数、去遮挡 boost 都无关）。几何变化不吃这个窗（判据精确），只对**光照**变化滞后（32 帧 ≈ 0.5s@60fps）。本项**零性能成本**；`_HQ` 属「降噪质量」档 3 |
 | `GI_SS_REUSE_TAPS` | 8 | 空间复用 tap 数（3×3 环；同一个面 ⇒ **只并累计量，零射线**） |
-| `GI_HIST_SEARCH_TAPS` | 8 | **历史搜索**的候选 tap 数（0 = 关，8 = 落点周围满 3×3；正中恒为第一个候选）：重投影落点不接受时，按**同一套判据**在邻域里继续找。静止 / 纯相机运动下**零额外射线**（世界几何逐位未变 ⇒ 验证射线整条省掉） |
+| `GI_HIST_SEARCH_TAPS` | 8 | **历史搜索**的候选 tap 数（0 = 关，8 = 落点周围满 3×3；正中恒为第一个候选）：重投影落点不接受时，按**同一套判据**在邻域里继续找。**零额外射线**（判据只看键与法线；世界几何变过的那一帧整帧不复用历史 ⇒ 搜索也不跑） |
 | `GI_DEN_M_MAX` | 32 | 时域累积的历史长度上限 M（帧）⇒ 稳态历史权重上限 31/32，τ ≈ 0.53s@60fps，而 τ 就是「光照 / 远处几何**渐变**」的响应时间。**这是「拖影 ↔ 静态闪烁」的主旋钮**：本工程曾取 96（τ ≈ 1.6s、残余闪烁 ≈ 9.3%），现取 32（≈16.2%）对齐 NRD / RTX Remix 的量级（见 5i） |
 | `GI_DEN_NBR_R` | 2 | 时域统计的**邻域半径**（`(2R+1)²` tap，含中心）：`2` = 5×5（25 tap）/ `1` = 3×3（9 tap）。钳制、σ、本帧输入**全都要求邻域非空**，而斜面上「一个体素面 ≈ 一个 texel」⇒ 取 1 时 `cnt` 停在 1、钳制整段不执行 ⇒ 历史色没有护栏（拖影）。FidelityFX 为此用 17×17 取矩 |
 | `GI_DEN_STAB_FRAMES` / `_MAX` | 8.0 / 3.0 | **短历史稳定化**：atrous 有效步长 × `clamp(8/M, 1, 3)` ⇒ `M = 1` 的像素步长 ×3、用宽模糊代替生噪点（NRD 的 `blurRadiusScale`）；`M ≥ 8` ⇒ ×1 ⇒ **稳态画面逐位不变**。零额外 tap |
@@ -286,7 +284,7 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
    链路：`gi_ss_main` 末尾把本 texel 的估计**定点累加**进逐面表 → 新 pass `gi_face_flatten` 把该面均值
    写回 `gi_out`（只改写"被本面认领且两键逐位相等"的 texel）→ 降噪链拿到的是"整个面一个值"的输入。
 2. **② 二次顶点缓存跨帧持久**：`gi_sec_slots` 槽里的键带 **epoch 掩码**（`gi_sec_key_masked`），
-   epoch = 几何修订号 + 太阳方向/色×强度 + 天光色 + 「太阳反弹」开关 + **光照场窗口原点**
+   epoch = 几何修订号 + 太阳方向/色×强度 + 天光色 + 「太阳反弹」开关
    （= `gi_secondary_shade` 的全部输入，`GiGpu::epoch` 逐项比对后自增）⇒ 任一项变了整张表自失效，
    **不再每帧 `clear_buffer`**（2K + 1/4 档约省 42MB/帧的写带宽），静态场景下那个面的着色
    （含它那条太阳 NEE）只在 epoch 变化时重算。
@@ -348,7 +346,7 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 5e. **① 只"多赚"，不改对错**：`gi_face_flatten` 只改写"槽被本面认领、两键逐位相等"的 texel；
    撞键 / 未认领的那条路一律退化成逐 texel，**只损失收益**。
 5f. **② 的 epoch 必须覆盖 `gi_secondary_shade` 的全部输入**：那张表**已经不清空**了 ⇒ 漏一项就会把
-   过期光照当成本帧的值。新增任何"被二次顶点读取的光源 / 几何 / 光照场量"时，先把 `GiEpochKey`（`gi.rs`）
+   过期光照当成本帧的值。新增任何"被二次顶点读取的光源 / 几何量"时，先把 `GiEpochKey`（`gi.rs`）
    补上；**不要**改成哈希（逐项比对才看得出是哪一项变了）。
 5g. **历史搜索只改「去哪儿找」，不改判据**：`GI_HIST_SEARCH_TAPS` 的每个候选一律仍走
    `gi_same_surface`（面键 + 着色法线，同 5c），且**正中必须排第一**（静止相机下要与"只认落点"
@@ -377,6 +375,10 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
    **降噪侧不要跟着重置**：它的 ⑤ AABB 钳制会把历史色拉回本帧邻域的范围 ⇒ 响应足够快；重置反而会让
    编辑帧露出未平滑的输入、并让 atrous 的短历史稳定化（`GI_DEN_STAB_*`）整屏生效一帧
    （症状：放置体素时 GI 闪一下）。
+5k. **天光只由 GI 的射线带回**：常量天光项（`amb = sky · GI_SKY_AMBIENT · mix(1, FLOOR, cov)`）
+   `cov = 1` 时被压到 1% ⇒ 天光的可见度完全由候选射线自己给出（逃逸样本带回 `sky_rgb()`，
+   命中样本带回该面的出射辐亮度）。**不要再给它乘第二层可见度系数**：同一个遮挡算两遍
+   （暗两遍）不是更准，而是把 GI 已经解出来的逐方向可见度又乘了一次低阶近似。
 6. **bind group 必须从索引 0 起成前缀设置**：自动曝光两个入口的布局因此重复挂 8 份；
    半分辨率 GI 的**采样视图**必须挂 group(5)（同一 pass 内同一张纹理不能既采样又作存储写入）。
 7. **blit 采样器必须 Linear**：半分辨率上采样与 FXAA 亚像素偏移都依赖它；Nearest 会让 FXAA 整体空转
@@ -390,7 +392,8 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
    OS DPI，导致 UI 1px 边框抗锯齿发虚、文字模糊。
 10. **UI 必须等字体资产加载完成再 spawn**：否则 TextPipeline 会把字形缓存进不含 CJK 的默认 slot →
     之后即使 override 也是方框。
-11. **发光只走「命中直出 + GI」**：光照场的发光密度通道已移除（`Rgba16Unorm.rgb` 恒 0），别再往 .rgb 塞东西。
+11. **发光只走「命中直出 + GI」**：没有第二条发光通路（发光体素在命中点直接给出自身颜色，
+    再经 GI 的一次弹射传播），别往任何缓存里塞发光密度。
 
 ---
 
@@ -437,7 +440,7 @@ cargo build --release --workspace
   半分辨率 / FXAA / 垂直同步；
   曝光参数（改完 stderr 有 `eye adapt 参数 → GPU` 一行）。
 - 左键放置、右键单击擦除 → stderr 出现 `EDIT[...]` 与 `UPLOAD[incremental]`（增量部分写：`bytes` 远小于全量上传）。
-- 「游戏/世界/重载世界」换模型后画面整块刷新（光照场跟随重建，无残留旧几何）。
+- 「游戏/世界/重载世界」换模型后画面整块刷新（无残留旧几何）。
 - 长时间运行无 1 秒以上的增量上传长耗时（`UPLOAD[incremental]` 的 elapsed 应在毫秒级）。
 
 **性能剖析（可选）**

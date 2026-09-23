@@ -1,11 +1,10 @@
-import package::bindings::{BASE_FLAG_AO, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_of, face_slot_of_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
-import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{WorldHit, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
@@ -141,8 +140,8 @@ const PBR_REFL_MAX_ROUGH: f32 = 0.05;
 const PBR_REFL_CONE_K: f32 = 1.0;
 
 // ---- 「基础」开关位（`light_u.g.base_flags`，菜单「渲染/基础」；**置位 = 算**）----
-// `BASE_FLAG_*` 三个常量定义在 `bindings.wesl`（紧挨 uniform 声明）—— 因为 `lightfield.wesl`
-// 也要读 bit2（AO），而它不能 import 本文件（会成环）。位编码与 Rust `BaseSettings::FLAG_*` 同步。
+// `BASE_FLAG_*` 两个常量定义在 `bindings.wesl`（紧挨 uniform 声明）。位编码与 Rust
+// `BaseSettings::FLAG_*` 同步。
 
 // ---- MT8-3（反射缓存）代码已删除（历史记录）----
 // 这里曾经是 `REFL_CACHE_SLOTS` / `REFL_REFRESH_K` / `refl_key_of` / `refl_slot_of` / `refl_seed`
@@ -440,9 +439,9 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
     //   · `gi = 0`：那是本像素**屏空间**的缓冲，反射点常常不在屏幕上，借过来就是错的；
     //   · `sun_vis`：**档 3** 走真实 NEE；**档 1/2** 取 1.0（无遮挡近似 —— 与 `trace_glass` 的
     //     玻璃反射同一条有意约定：不给反射再加一条阴影射线）。天光 `amb` 取
-    //     `sky · GI_SKY_AMBIENT · ao`（与 GI 二次顶点逐字相同，反射点没有 GI 缓冲 ⇒ 没有 `cov` 地板）。
+    //     `sky · GI_SKY_AMBIENT`（与 GI 二次顶点逐字相同，反射点没有 GI 缓冲 ⇒ 没有 `cov` 地板）。
     // `emissive_radiance` 与玻璃反射同一句 ⇒ 发光体素在镜子里发光。
-    let hamb = sky * GI_SKY_AMBIENT * light_field_ao(h.point, h.obj_id);
+    let hamb = sky * GI_SKY_AMBIENT;
     // 命中点的视向量：用它**自己那条射线**（起点 `chain_org` → 命中体素中心）⇒ **逐面**
     // （硬约束 3：所有着色点共用 `face_view_dir` 同一份契约）。
     let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
@@ -542,8 +541,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     //   · 太阳项必须经 `sun_transmittance` 那条**真阴影射线** —— `sun_vis` 恒 1 会让玻璃无条件吃到
     //     满太阳（深室内白得发光）；
     //   · GI 项必须接（与不透明路径同一个 `gi_upsample_joint` + 同一套键 + 同一个 `cov` 地板）——
-    //     背光/阴影面那一侧 `ndl = 0` 且 `amb = sky·0.05·ao` 被 AO 压到 ≈ 0（实心大块的 cell 自身
-    //     fill 高 ⇒ `light_field_ao` 接近 0），不透明面在同一处靠 GI 兜底。
+    //     背光/阴影面那一侧 `ndl = 0` 且 `amb` 被 `cov` 地板压到最低，不透明面在同一处靠 GI 兜底。
     // 成本（只对"非全透"的玻璃像素付，且有下面的早退）：**+1 条阴影射线 + 4 次导引读 + 1 次 GI 采样**
     // （≈ 每玻璃像素一条射线；MT4 实测全屏一条射线 = 1.85 ms ⇒ 覆盖率 5% ≈ 0.09 ms）。
     // **早退**：`through ≈ 1`（透明度 100% = 全透）时整段跳过。
@@ -573,8 +571,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
                                  fs.rgb / fgw);
         f_cov = fs.a / fgw;
       }
-      let f_amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, f_cov)
-                * light_field_ao(fp, first.obj_id);
+      let f_amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, f_cov);
       glass_col = brdf_reflected(fm, fnn, fv,
                                  SurfaceLight(sun_dir, sun_c, f_sun, f_amb, f_gi))
                 + emissive_radiance(fm, GI_EMIT_GAIN);
@@ -589,13 +586,13 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // 材质参数（albedo / roughness / metallic / emissive / transmission / ior / specular）由下面那次
     // `fetch_material` 一次拿全 —— 这里不再单独取 albedo（避免出现"第二处取值口径"）。
     let gg = make_grid(u32(best.obj_id) + 1u);
-    // 命中体素的世界中心：AO 采样点 / 阴影与反射射线的起点 / **视向量的锚点**（`face_view_dir`）
+    // 命中体素的世界中心：阴影与反射射线的起点 / **视向量的锚点**（`face_view_dir`）
     // 都取它（同一个助手给出 ⇒ 不会出现"两处各自算一遍中心"的口径分叉）。
     let p_voxel = voxel_center_world(gg, best.voxel);
     // ---- 基础开关「隐式法相」清零 ⇒ **原色直出**（菜单「渲染/基础」）----
     // 不算邻域梯度法线（省 `voxel_normal` 的 4 次点查询）；材质取值的 triplanar 权重需要**一个**法线
     // ⇒ 用 DDA 权威的可见面法线 `best.n`（不查邻域）。取到材质就直接返回 `albedo`：
-    // 后面的 AO / GI / 太阳 / 阴影射线 / 反射链 / 玻璃 in-scatter 全部不算 —— 这是"看材质本色"的
+    // 后面的 GI / 太阳 / 阴影射线 / 反射链 / 玻璃 in-scatter 全部不算 —— 这是"看材质本色"的
     // 调试视图，也是全链最省的一档。**天空（未命中）不走这里**：那上面没有材质可直出。
     if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
       return fetch_material(best.palette_base, best.pal, best.point, best.n, PBR_DEBUG_ASSET).albedo;
@@ -671,8 +668,6 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       gi = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n, s.rgb / gw);
       cov = s.a / gw;
     }
-    // AO 只乘到常量天光项（gi 已自带逐方向遮挡）。
-    let ao = light_field_ao(p_voxel, best.obj_id);
     // cov 由缓存给出（命中 = 1、没有数据 = 0）：有数据处天光只占少量、无数据处天光兜底。
     // mix 实参顺序必须是 `mix(1.0, GI_AMBIENT_FLOOR, cov)`（cov = 1 → FLOOR）。
     let amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, cov);
@@ -680,11 +675,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // 与 `gi/ray.wesl` 的二次顶点逐项对齐（硬约束 3 / `docs/PLAN.md` MT3-4）：两侧都只是把各自的
     // 光源项交给同一个 `brdf_reflected`。差异只有三处，且都是物理上该不同的：
     //   ① 本处有 GI 项（`gi`）；二次顶点只算一次弹射 ⇒ `SurfaceLight.gi` 恒 0；
-    //   ② 本处的天光含 `cov` 地板；二次顶点没有 GI 缓冲 ⇒ 只有 AO；
+    //   ② 本处的天光含 `cov` 地板；二次顶点没有 GI 缓冲 ⇒ 天光全额。
     //   ③ 本处不除 π（二次顶点要除 π 转辐亮度）—— 能量约定见 `brdf_reflected` 的文档注释。
     // 视向量 `v`（上方已构造，**逐面**）在这里被消费：与 `gi/ray.wesl` 的二次顶点**同一个助手、
     // 同一口径**（硬约束 3：两边都走 `face_view_dir`，不分叉）。
-    col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c, sun, amb * ao, gi))
+    col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c, sun, amb, gi))
         + emissive_radiance(m, GI_EMIT_GAIN);
     // ---- MT4-1 · 环境镜面反射（**本里程碑唯一的新增射线**）----
     // 设计（`docs/PLAN.md` §4 MT4-1）：该表面的镜面反射"值得追"时**追加一条**反射射线，
@@ -751,7 +746,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         // 镜面反射的菲涅耳余弦取 `v·n`（**逐面**视向量）—— 与 `brdf_reflected` 里
         // "完美镜面 h ≈ n ⇒ 余弦取 v·n" 那条口径**逐字相同**（硬约束 3）。
         // 逐面 ⇒ 掠射角的权重从"跨体素边界连续渐亮"变成一个面一个值（成块变亮是本档的预期代价）。
-        col = col - fade * f0r * (amb * ao + gi)
+        col = col - fade * f0r * (amb + gi)
             + fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade * refl_env;
       }
     }

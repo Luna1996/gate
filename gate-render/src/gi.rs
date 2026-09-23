@@ -39,7 +39,7 @@ pub struct GiUniform {
   /// 时域/atrous 的派发与核半径不在本 pass 里，由 Rust 的 `denoise_plan` 决定。
   pub flags: Vec4,
   /// x = 自增帧号（精确 u32）、**y = 二次顶点缓存的 epoch**（见 [`GiGpu::epoch`]；
-  /// 光照 / 几何 / 光照场窗口的修订号 ⇒ `gi_sec_slots` 槽里键的掩码，跨帧持久的前提）、
+  /// 光照 / 几何的修订号 ⇒ `gi_sec_slots` 槽里键的掩码，跨帧持久的前提）、
   /// zw = 保留（恒 0）。所有整数帧逻辑（本帧的 RNG 种子混入、像素 hash）都用 x：
   /// 帧号曾经以 f32 存在 `params.x`，超过 2^24 后无法表示连续整数 ⇒ 种子会偶发重复。
   pub seq: UVec4,
@@ -62,9 +62,6 @@ struct GiEpochKey {
   sky: [u32; 3],
   /// 「二次顶点太阳反弹」开关：关掉时二次顶点不做 NEE ⇒ 值是另一个数。
   sun_bounce: bool,
-  /// **光照场窗口原点**（cell）：`gi_secondary_shade` 的 AO 项读它，而它随相机按 16 体素步进、
-  /// 窗口外的点 `light_field_ao` 恒返回 1.0 ⇒ 原点一变，值就可能不同。
-  lf_origin_cell: [i32; 3],
 }
 
 impl GiEpochKey {
@@ -72,7 +69,6 @@ impl GiEpochKey {
     world_rev: u32,
     sun_bounce: bool,
     theme: Option<&crate::lighting::LightingTheme>,
-    cam_voxel: glam::Vec3,
   ) -> Self {
     let bits3 = |v: [f32; 3]| v.map(f32::to_bits);
     let (sun_dir, sun_c, sky) = match theme {
@@ -92,8 +88,7 @@ impl GiEpochKey {
       }
       None => (bits3([0.0; 3]), bits3([0.0; 3]), bits3(crate::consts::MINECRAFT_SKY)),
     };
-    let c = crate::brickmap::upload::light_field_origin_cell(cam_voxel);
-    Self { world_rev, sun_dir, sun_c, sky, sun_bounce, lf_origin_cell: [c.x, c.y, c.z] }
+    Self { world_rev, sun_dir, sun_c, sky, sun_bounce }
   }
 }
 
@@ -400,10 +395,10 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
   BindGroupLayoutDescriptor::new(
     "GiDenTemporal",
     &[
-      ro(10),  // 导引
+      ro(10), // 导引
       tex(11), // 本帧原始 GI（gi_out 的采样视图）
-      ro(12),  // 历史（上帧）
-      rw(13),  // 历史（本帧）
+      ro(12), // 历史（上帧）
+      rw(13), // 历史（本帧）
       BindGroupLayoutEntry {
         binding: 16, // 时域输出
         visibility: C,
@@ -565,7 +560,7 @@ pub struct GiGpu {
   /// ① 逐面合并的落地 pass（`gi_face_flatten`）：layout 只有 group(0)（见 [`gi_flatten_layout`]），
   /// 派发在 `gi_main` 之后、降噪链之前。
   pub flatten_pipeline: Option<CachedComputePipelineId>,
-  /// ② **二次顶点缓存的 epoch**（uniform `seq.y`）：光照 / 几何 / 光照场窗口的任一输入变化就自增。
+  /// ② **二次顶点缓存的 epoch**（uniform `seq.y`）：光照 / 几何的任一输入变化就自增。
   /// 它参与 `gi_sec_slots` 槽里键的掩码 ⇒ 一变整张表自失效。表**不清空**（省掉每帧的 `clear_buffer`），
   /// 所以 epoch 必须覆盖 `gi_secondary_shade` 的**全部**输入（见 [`GiEpochKey`]）。
   pub epoch: u32,
@@ -776,16 +771,13 @@ fn prepare_gi(
   let world_same = gpu.world_rev == gpu.world_rev_gi;
 
   // ---- ② 二次顶点缓存的 epoch ----
-  // 输入 = `gi_secondary_shade` 的全部输入（几何修订号、太阳方向/色×强度、天光色、「太阳反弹」、
-  // 光照场窗口原点）。**逐项比对、变了才自增**（不做哈希：哈希只是把"变没变"变得更难查）。
+  // 输入 = `gi_secondary_shade` 的全部输入（几何修订号、太阳方向/色×强度、天光色、「太阳反弹」）。
+  // **逐项比对、变了才自增**（不做哈希：哈希只是把"变没变"变得更难查）。
   // 只比位（f32 比 `to_bits`）⇒ 值改了但位没变（不可能）与位变了值没变（保守失效）都安全。
-  let cam_voxel = view.as_ref().map_or(glam::Vec3::ZERO, |v| v.cam_pos_voxel.truncate());
-  let epoch_key =
-    GiEpochKey::of(gpu.world_rev, settings.sun_bounce, lighting.as_deref(), cam_voxel);
+  let epoch_key = GiEpochKey::of(gpu.world_rev, settings.sun_bounce, lighting.as_deref());
   if gpu.epoch_key != Some(epoch_key) {
     gpu.epoch_key = Some(epoch_key);
     gpu.epoch = gpu.epoch.wrapping_add(1);
-    // 逐帧都可能翻（相机每移动 16 体素就换光照场窗口）⇒ debug 级，INFO 只服务排查当前这一次运行。
     bevy::log::debug!(target: "gate", "GI 二次顶点缓存 epoch → {}", gpu.epoch);
   }
 

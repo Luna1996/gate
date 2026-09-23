@@ -19,7 +19,7 @@
 //!
 //! **本文件负责"加载 + 打包 + mip 链 + 采样器 + 资产表内容"**：`texture_2d_array` 的占位资源与
 //! 上传时机在 brickmap 侧 —— `upload.rs::init_empty_gpu` 建占位 buffer/纹理与采样器、`prepare`
-//! 全量写一次资产表、`dda.rs` 把四者绑到 BG1 的 binding 6/7/8/9（MT2-2 / MT2-3）。
+//! 全量写一次资产表、`dda.rs` 把四者绑到 BG1 的 binding 5/6/7/8（MT2-2 / MT2-3）。
 //! **mip 链与采样策略（MT2-3）就在本模块**：CPU 侧盒式平均生成完整链（base → 1×1，128 ⇒ 8 层），
 //! 采样器见 [`create_pbr_sampler`]；`Image::data` 承载的是**全链数据**（见 `build_texture_arrays` 的说明）。
 //! **不做 BC7/BC4 压缩**：MT8-4 把 [`GPU_TEX_SIZE`] 定成 128（= 体素格密度）后**预算问题消失** ——
@@ -139,10 +139,10 @@ pub const PBR_ANISOTROPY_CLAMP: u16 = 8;
 /// | `lod_max_clamp` | [`PBR_MIP_LEVELS_MAX`] − 1 | **覆盖到 mip 链底**（128 → 7.0，MT8-4 后自动派生），远处不会停在中间层 |
 /// | `anisotropy_clamp` | [`PBR_ANISOTROPY_CLAMP`] | 斜面（尤其地面）上的摩尔纹主要来自各向异性足迹 |
 ///
-/// **为什么不复用 `light_samp`**（`upload.rs::init_empty_gpu` 给光照场的那个）：光照场是
-/// ClampToEdge 的**有界** 3D 网格（越界查询要收敛在网格内）、且**无 mip 链**
-/// （`mipmap_filter = Nearest`）；改它的状态会连带改变光照场的行为 ⇒ 另建一个。
-/// 这个 desc 是**权威**：`bindings.wesl` 的 `@binding(9) pbr_samp` 注释指向这里，改一处必须同改另一处。
+/// **为什么不复用 `light_samp`**（`upload.rs::init_empty_gpu` 给 GI 缓冲的那个）：那一份是
+/// ClampToEdge 且 `mipmap_filter = Nearest`（GI 缓冲没有 mip 链）；改它的状态会连带改变
+/// GI 的采样行为 ⇒ 另建一个。
+/// 这个 desc 是**权威**：`bindings.wesl` 的 `@binding(8) pbr_samp` 注释指向这里，改一处必须同改另一处。
 pub fn create_pbr_sampler(device: &RenderDevice) -> Sampler {
   device.create_sampler(&SamplerDescriptor {
     label: Some("gate_pbr_sampler"),
@@ -176,11 +176,11 @@ pub fn create_pbr_sampler(device: &RenderDevice) -> Sampler {
 /// 这样平凡材质与 PBR 材质能共用同一个 BRDF 入口，见 PLAN D1 约束 1）。详见 `build_texture_arrays` 的注释。
 ///
 /// **提取进 render world**（MT2-2）：整份资源随 `ExtractResourcePlugin` 拷进 render world，供
-/// `upload.rs::prepare` 构建资产表、`dda.rs` 取 `GpuImage` 的视图绑 BG1 binding 7/8。
+/// `upload.rs::prepare` 构建资产表、`dda.rs` 取 `GpuImage` 的视图绑 BG1 binding 6/7。
 /// 句柄只是 Arc 计数 ⇒ 拷贝很便宜（`ids` 也才几十条）。
 ///
 /// **mip（MT2-3）**：两张数组图各自带**完整 mip 链**（[`Self::mip_levels`]，128 时 8 层），
-/// 采样走 `@group(1) @binding(9) pbr_samp`（[`create_pbr_sampler`]）。
+/// 采样走 `@group(1) @binding(8) pbr_samp`（[`create_pbr_sampler`]）。
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct PbrTextureSet {
@@ -427,7 +427,7 @@ struct PbrLoad {
 
 /// PBR 贴图集插件：负责扫描 `assets/textures/pbr/`、把每个材质的 albedo / roughmetal 打包成
 /// `albedo_rough` + `metal` 两张 `texture_2d_array`，并在构建完成时打一条含层数 / 尺寸 / 显存估算 / 槽位表的日志。
-/// 另外把 [`PbrTextureSet`] 提取进 render world（MT2-2：资产表与 BG1 binding 7/8 都在那边消费）。
+/// 另外把 [`PbrTextureSet`] 提取进 render world（MT2-2：资产表与 BG1 binding 6/7 都在那边消费）。
 pub struct PbrTexturesPlugin;
 
 impl Plugin for PbrTexturesPlugin {

@@ -1,6 +1,6 @@
 //! DDA 主可见性 pass：WGSL compute + Core2d PostProcess blit。
 //! BG0 = storage tex / 相机 uniform / beam depth / 眼睛适应状态（只读）；
-//! BG1 = b_struct / b_leaves / palette / globals uniform / 光照场 3D 纹理 + 采样器 / 材质资产表 /
+//! BG1 = b_struct / b_leaves / palette / globals uniform / 线性采样器 / 材质资产表 /
 //! PBR 贴图数组 / **PBR 专用采样器**（MT2-3）。
 //! WGSL 源 = WESL 包 `shaders/voxel_raytrace/`（入口 `main.wesl`）。
 
@@ -241,10 +241,6 @@ pub mod wgsl_consts {
   pub const SHADOW_BIAS: f32 = crate::consts::SHADOW_BIAS;
   pub const SHADOW_DIR_T_MAX: f32 = crate::consts::SHADOW_DIR_T_MAX;
   pub const EMISSIVE_EMIT_GAIN: f32 = crate::consts::EMISSIVE_EMIT_GAIN;
-  // 光照场（AO fill）：cell = 16 voxel，dims = 32³ cell → 世界覆盖 512 voxel = ±5.12m（相机中心）。
-  // 世界锚定寻址：原点按 cell 向下对齐，槽位 = 世界 cell mod dims。格式 Rgba16Unorm：.a = AO fill，.rgb 恒 0。
-  pub const LIGHT_FIELD_CELL: u32 = 16;
-  pub const LIGHT_FIELD_DIM: u32 = 32;
   /// 射线起点沿法线自体素表面再外推的量（体素）；必须与 WGSL `SHADOW_SURFACE_EPS` 一致。
   pub const SHADOW_SURFACE_EPS: f32 = 0.03125;
 }
@@ -1118,7 +1114,7 @@ use bevy::{
       TextureUsages, TextureViewDescriptor, UniformBuffer, VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
-        texture_2d_array, texture_3d, texture_storage_2d, uniform_buffer,
+        texture_2d_array, texture_storage_2d, uniform_buffer,
       },
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -1567,20 +1563,18 @@ pub(crate) fn init_dda_pipelines(
         storage_buffer_read_only_sized(false, None), // @binding(1) b_leaves（存放方向可达掩码 LUT）
         storage_buffer_read_only_sized(false, None), // @binding(2) b_palette
         uniform_buffer::<super::wire::BrickMapGlobals>(false), // @binding(3) globals
-        // @binding(4)/(5)：光照场（AO fill + 发光密度 ε）——每 16³ 块
-        // 实心占比的 3D 纹理 + 线性过滤采样器。
-        texture_3d(TextureSampleType::Float { filterable: true }),
-        // @binding(5) 的 sampler **只给光照场**（ClampToEdge、无 mip）；PBR 贴图走 @binding(9)。
+        // @binding(4)：GI 缓冲（`gi_tex`）的采样器 —— ClampToEdge ×3、mipmap_filter = Nearest。
+        // PBR 贴图走 @binding(8)（那一份要 Repeat + Linear mipmap，状态要求相反）。
         sampler(SamplerBindingType::Filtering),
-        // @binding(6)：全局材质资产表（`array<MaterialAsset>`，32B/条 = 32KB）
+        // @binding(5)：全局材质资产表（`array<MaterialAsset>`，32B/条 = 32KB）
         storage_buffer_read_only_sized(false, None),
-        // @binding(7)/(8)：PBR 贴图数组（`texture_2d_array`，层 = 材质槽号）——
+        // @binding(6)/(7)：PBR 贴图数组（`texture_2d_array`，层 = 材质槽号）——
         // 视图维度必须是 `D2Array`（`texture_2d_array()` 已按此生成 layout entry）。
         texture_2d_array(TextureSampleType::Float { filterable: true }),
         texture_2d_array(TextureSampleType::Float { filterable: true }),
-        // @binding(9)：PBR 贴图**专用采样器**（MT2-3）——三轴 Repeat（triplanar 平铺）+
-        // Linear mag/min/**mipmap**（贴图集带完整 mip 链）。**不能与 5 合并**：光照场是
-        // ClampToEdge 的有界网格且无 mip，两者状态要求相反。desc 权威在
+        // @binding(8)：PBR 贴图**专用采样器**（MT2-3）——三轴 Repeat（triplanar 平铺）+
+        // Linear mag/min/**mipmap**（贴图集带完整 mip 链）。**不能与 4 合并**：GI 缓冲那个是
+        // ClampToEdge 且无 mip，两者状态要求相反。desc 权威在
         // `pbr_texture::create_pbr_sampler`（占位与真身共用 `GpuBrickMap.pbr_sampler`）。
         sampler(SamplerBindingType::Filtering),
       ),
@@ -2145,7 +2139,7 @@ pub(crate) fn prepare_dda_bind_groups(
   let globals_bind = gpu.globals.binding().expect(
     "GpuBrickMap.globals uniform buffer 未初始化（RenderStartup init_empty_gpu 应默认构造）",
   );
-  // MT2-2：binding 7/8 = PBR 贴图数组。`PbrTextureSet` 是 main world 资源（`ExtractResourcePlugin`
+  // MT2-2：binding 6/7 = PBR 贴图数组。`PbrTextureSet` 是 main world 资源（`ExtractResourcePlugin`
   // 拷进 render world），它的两张图要等 `GpuImage` 就绪；**任一环节缺失都退化为占位视图**（1×1×1 的
   // `texture_2d_array`）⇒ 绑定永远成立、不 panic（贴图缺失时画面只是纯色回退）。
   let pbr_albedo = pbr_set.as_deref().and_then(|s| gpu_images.get(s.albedo_rough()));
@@ -2153,8 +2147,8 @@ pub(crate) fn prepare_dda_bind_groups(
   if pbr_albedo.is_none() || pbr_metal.is_none() {
     bevy::log::info_once!(
       target: "gate",
-      "DDA prepare: PBR 贴图数组未就绪（贴图集或 GpuImage）⇒ BG1 binding 7/8 先绑 1×1×1 占位\
-       （资产表 binding 6 若也未上传就是零初始化占位，长度已够）；不 panic"
+      "DDA prepare: PBR 贴图数组未就绪（贴图集或 GpuImage）⇒ BG1 binding 6/7 先绑 1×1×1 占位\
+       （资产表 binding 5 若也未上传就是零初始化占位，长度已够）；不 panic"
     );
   }
   let pbr_albedo_view =
@@ -2169,14 +2163,13 @@ pub(crate) fn prepare_dda_bind_groups(
       gpu.leaves.as_entire_binding(),
       gpu.palette.as_entire_binding(),
       globals_bind,
-      &gpu.light_view,
       &gpu.light_sampler,
-      // @binding(6)：全局材质资产表（内容由 `prepare` 全量写一次）
+      // @binding(5)：全局材质资产表（内容由 `prepare` 全量写一次）
       gpu.material_assets.as_entire_binding(),
-      // @binding(7)/(8)：PBR 贴图数组（贴图集 / `GpuImage` 未就绪时是 1×1×1 占位视图）
+      // @binding(6)/(7)：PBR 贴图数组（贴图集 / `GpuImage` 未就绪时是 1×1×1 占位视图）
       &pbr_albedo_view,
       &pbr_metal_view,
-      // @binding(9)：PBR 专用采样器（MT2-3）——`init_empty_gpu` 建一次、占位与真身共用同一个实例，
+      // @binding(8)：PBR 专用采样器（MT2-3）——`init_empty_gpu` 建一次、占位与真身共用同一个实例，
       // 不存在"资源未就绪"的状态（采样器与它所采样的纹理无关）。
       &gpu.pbr_sampler,
     )),
@@ -2307,7 +2300,7 @@ pub(crate) fn dispatch_dda(
     // 逐面去重表**每帧整块清空**（`FACE_W_FLAG == 0` = 空槽）：清空必须排在 `gi_main` 之前，
     // 否则上一帧的认领会把本轮同槽的新键挡在门外（撞键只会少赚，但残留表会让收益归零）。
     // 二次顶点缓存（`gi_sec_slots`）**不清空**：它靠槽里键的 epoch 掩码自失效（uniform `gi_u.seq.y`，
-    // 由 `prepare_gi` 逐项比对光照/几何/光照场窗口的输入后自增）⇒ 省掉每帧那份 clear 带宽
+    // 由 `prepare_gi` 逐项比对光照/几何的输入后自增）⇒ 省掉每帧那份 clear 带宽
     // （2K + 1/4 档那张表约 42MB/帧），见 `gi/common.wesl` 的「跨帧持久」段。
     if let Some(fs) = aux.face_slots_buffer() {
       ctx.command_encoder().clear_buffer(fs, 0, None);

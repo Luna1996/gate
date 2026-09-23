@@ -332,10 +332,6 @@ fn register_callbacks(world: &mut World) {
           base.implicit_normal = *on;
           info!("隐式法相 → {}", if *on { "on" } else { "off（原色直出）" });
         }
-        ("render/base/ao", MenuAction::Toggle(on)) => {
-          base.ao = *on;
-          info!("环境遮蔽 → {}", if *on { "on" } else { "off（光照场停铺）" });
-        }
         ("render/gi/enabled", MenuAction::Toggle(on)) => {
           gi.enabled = *on;
           info!("GI → {}", if *on { "on" } else { "off" });

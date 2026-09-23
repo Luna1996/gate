@@ -48,15 +48,12 @@ struct Globals {
   _pad4: u32,
 }
 @group(1) @binding(3) var<uniform> g: Globals;
-// @binding(4)/(5)：光照场（AO fill，Rgba16Unorm，仅 `.a` 有效、`.rgb` 恒 0，采样走硬件三线性）。
-// 16-voxel cell 网格，相机中心 + 世界锚定槽位：纹素下标 = 世界 cell mod dims。
-@group(1) @binding(4) var light_tex: texture_3d<f32>;
-// **只给光照场用**（Rust 侧 desc：ClampToEdge ×3 + mipmap_filter = Nearest，该纹理无 mip 链）。
-// PBR 贴图**不要复用它**（MT2-3 起）：triplanar 要 Repeat 平铺、要 Linear mipmap filter，
-// 而光照场是"有界网格 + 世界锚定环绕"⇒ 改成 Repeat 会让越界查询绕回网格另一侧。
-@group(1) @binding(5) var light_samp: sampler;
+// @binding(4)：**线性采样器**（Rust 侧 desc：ClampToEdge ×3 + mipmap_filter = Nearest）。
+// 唯一消费者是 GI 缓冲的采样侧（`gi_tex`，见 main.wesl 的几何感知上采样与玻璃的 GI 项）。
+// PBR 贴图**不要复用它**（MT2-3 起）：triplanar 要 Repeat 平铺、要 Linear mipmap filter。
+@group(1) @binding(4) var light_samp: sampler;
 
-// --- BG1 追加（MT2-2，从 binding 6 起，不动 0..5）：全局材质资产表 + PBR 贴图集 ---
+// --- BG1 追加（MT2-2，从 binding 5 起，不动 0..4）：全局材质资产表 + PBR 贴图集 ---
 // 资产条目：与 Rust `wire.rs::MaterialAsset` **逐字段镜像**（8 × u32 = 32B，字段名与顺序都必须一致；
 // storage array 的 stride 由 WGSL 对齐规则给出 = 4B 对齐 × 8 字段 = 32B，与 Rust 的 `repr(C)` 相同）。
 // 语义（权威注释在 `wire.rs`）：`*_slot` = `texture_2d_array` 的层号，`0xFFFFFFFF`
@@ -78,21 +75,21 @@ struct MaterialAsset {
 };
 // 全局资产表：**所有 volume 共用一张**（不是 per-volume）—— palette 的 PBR 变体里 `asset: u16`
 // 就是这张表的**全局下标**。表大小 = `MATERIAL_ASSET_SLOTS`（WESL 权威常量在 `common.wesl`）。
-@group(1) @binding(6) var<storage, read> material_assets: array<MaterialAsset>;
+@group(1) @binding(5) var<storage, read> material_assets: array<MaterialAsset>;
 // 采样 `pbr_albedo_rough` 的 rgb 后**必须**走 `srgb_to_linear()`：两张数组图都是 `Unorm` 格式、
 // 采样不做 sRGB 转换（rgb 是 sRGB 编码的原始字节），与 `srgb_word_to_linear` 读 palette 字节后同样
 // `srgb_to_linear()` 是**完全同一口径** ⇒ 平凡材质与 PBR 材质能共用同一个 BRDF 入口。
-@group(1) @binding(7) var pbr_albedo_rough: texture_2d_array<f32>;  // Rgba8Unorm: rgb=albedo(sRGB 编码字节)、a=roughness
-@group(1) @binding(8) var pbr_metal: texture_2d_array<f32>;         // R8Unorm: r=metalness
-// @binding(9)：**PBR 贴图专用采样器**（MT2-3）。与 `light_samp` 分开是必须的 ——
-// ① triplanar 要**三轴 Repeat**（光照场是 ClampToEdge 的有界网格）；
-// ② 要 **Linear mag/min/mipmap**（光照场 mipmap_filter = Nearest、纹理本身无 mip 链）。
+@group(1) @binding(6) var pbr_albedo_rough: texture_2d_array<f32>;  // Rgba8Unorm: rgb=albedo(sRGB 编码字节)、a=roughness
+@group(1) @binding(7) var pbr_metal: texture_2d_array<f32>;         // R8Unorm: r=metalness
+// @binding(8)：**PBR 贴图专用采样器**（MT2-3）。与 `light_samp` 分开是必须的 ——
+// ① triplanar 要**三轴 Repeat**（GI 缓冲的采样器是 ClampToEdge，采样越界要钳住而不是绕回）；
+// ② 要 **Linear mag/min/mipmap**（`light_samp` 的 mipmap_filter = Nearest，它没有 mip 链）。
 // 权威 desc 在 Rust `pbr_texture.rs::create_pbr_sampler`：Repeat×3 / Linear(mag,min,mipmap) /
 // anisotropy_clamp ≤ 8（设备不支持 `SAMPLER_ANISOTROPY` 时退化 1）/ lod_max_clamp = mip 链底层。
 // 改那边的状态必须同改这里（占位与真身共用同一个 sampler 实例，见 `upload.rs::init_empty_gpu`）。
-@group(1) @binding(9) var pbr_samp: sampler;
+@group(1) @binding(8) var pbr_samp: sampler;
 
-// **BG1 的 binding 号到此为止（0..9）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，
+// **BG1 的 binding 号到此为止（0..8）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，
 // 已按实测整体删除（负优化：用户判定"删除后画面不变、反而更快"）—— 见 `main.wesl` 文件头的
 // MT4 注释块。**别再往 10 起加东西**以为这里是预留空位：那两块 buffer 与 `ReflEntry` 都已不存在。
 
@@ -139,7 +136,7 @@ struct LightGlobals {
   // 同样复用废弃填充 `_pad1`。写侧 = `prepare_dda_bind_groups`（Rust `ReflectionSettings::nest`）。
   refl_nest: u32,
   // **「基础」开关位**（菜单「渲染/基础」，位编码 = 下面紧跟的 `BASE_FLAG_*`）：置位 = **算**。
-  // bit0 = 直光阴影、bit1 = 隐式法相、bit2 = 环境遮蔽。同样复用废弃填充 `_pad2`。
+  // bit0 = 直光阴影、bit1 = 隐式法相。同样复用废弃填充 `_pad2`。
   // 写侧 = `prepare_dda_bind_groups`（Rust `BaseSettings::flags`）。
   base_flags: u32,
   ambient: vec4<f32>,     // rgb = 环境色（线性）
@@ -158,8 +155,6 @@ struct LightPool {
 const BASE_FLAG_SHADOW: u32 = 1u;
 /// bit1 **隐式法相**：置位 ⇒ 算邻域梯度法线；清零 ⇒ 不算它，并且**原色直出**。
 const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
-/// bit2 **环境遮蔽**：置位 ⇒ 间接项/天光项乘光照场 AO（`light_field_ao`）；清零 ⇒ 该函数恒返回 `1.0`。
-const BASE_FLAG_AO: u32 = 4u;
 
 // ===== GI（屏幕空间逐面 ReSTIR）=====
 // uniform 与 Rust `GiUniform` 逐字段镜像（字节一致）。
@@ -182,7 +177,7 @@ struct GiUniform {
   // 本 pass 只用它区分「高」档（1/4 档新鲜候选数与 reservoir 记忆窗按它取，见 `gi/consts.wesl`）；
   // 档位影响的 pass 派发（时域/atrous 开关、核半径）由 Rust 决定。
   flags: vec4<f32>,
-  // x = 自增帧号（精确 u32）、y = **二次顶点缓存的 epoch**（光照 / 几何 / 光照场窗口的修订号；
+  // x = 自增帧号（精确 u32）、y = **二次顶点缓存的 epoch**（光照 / 几何的修订号；
   // Rust `prepare_gi` 逐项比对、变了才自增 ⇒ 参与 `gi_sec_slots` 槽里键的掩码，见 `gi/common.wesl`
   // 的「跨帧持久」段）、zw = 保留（恒 0）。
   // **所有整数帧逻辑只用 x**（本帧的 RNG 种子混入、像素 hash）。帧号曾经以 f32 存在
@@ -273,7 +268,7 @@ struct FogUniform {
 /// 键口径与 `face_slots` 相同（`gi_key0`/`gi_key1`），但填充者是 GI 射线自己（惰性、写同值 ⇒ 竞态
 /// 幂等）：同一个面被成千上万条射线打到时只算一次二次顶点着色（含它那条太阳 NEE 阴影射线）。
 /// **跨帧持久**（与 `face_slots` 不同）：不需要认领、**没有每帧清空**，槽里的键带 epoch 掩码
-/// （uniform `gi_u.seq.y`）⇒ 光照 / 几何 / 光照场窗口一变整张表自失效。算法与代价、撕裂窗口的
+/// （uniform `gi_u.seq.y`）⇒ 光照 / 几何一变整张表自失效。算法与代价、撕裂窗口的
 /// 处理都在 `gi/common.wesl` 的那两段说明里；这里只声明它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
 @group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
 

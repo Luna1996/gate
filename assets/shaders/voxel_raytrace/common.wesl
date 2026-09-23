@@ -514,8 +514,8 @@ struct SurfaceLight {
   sun_dir: vec3<f32>,   // 归一化，指向光源
   sun_c: vec3<f32>,     // 太阳色 × 强度（线性）
   sun_vis: f32,         // 沿 sun_dir 的透过率（0 = 全遮 … 1 = 无遮）；调用方决定要不要发阴影射线
-  /// 常量天光项（按各自的 `cov` / AO 折算：主 pass 含 `mix(1, GI_AMBIENT_FLOOR, cov) · ao`，
-  /// GI 二次顶点只有 `ao` —— 二次顶点没有 GI 缓冲，这是**唯一**的项差异）。
+  /// 常量天光项（按各自的 `cov` 折算：主 pass 含 `mix(1, GI_AMBIENT_FLOOR, cov)`，
+  /// GI 二次顶点拿全额 —— 二次顶点没有 GI 缓冲，这是**唯一**的项差异）。
   amb: vec3<f32>,
   gi: vec3<f32>,        // GI 辐照度（主 pass 有；二次顶点恒 0 —— 只算一次弹射）
 }

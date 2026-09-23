@@ -247,85 +247,6 @@ pub struct UploadSnapshot {
   pub comp_chunks: usize,
 }
 
-// 光照场（AO fill）：16-voxel cell 网格，相机中心 + 世界锚定槽位，可流式。
-// 纹理 Rgba16Unorm，dims = LIGHT_FIELD_DIM³：`.a` = 实心占比 AO fill，`.rgb` 恒 0。
-// ⚠️ 语义上是"**实心占比**"而不是"**天空遮挡**"：cell 越实心 ⇒ `.a` 越大 ⇒ shader 侧 ao 越小，
-// 与"上方天空是否被挡"无关（`lightfield.wesl` 的那条公式直接反映这一点）。
-
-use super::dda::wgsl_consts::{LIGHT_FIELD_CELL, LIGHT_FIELD_DIM};
-
-/// 光照场单个 chunk 的 CPU tally：16³ = 4096 个 16-voxel cell。
-/// 本地序 `lx + ly*16 + lz*256`（lx/ly/lz 是 chunk 内的 cell 号，×16 即体素局部坐标）。
-#[derive(Clone, Debug)]
-pub struct LightChunk {
-  /// 每 cell 的实心占比 ×255（0..=255）
-  pub fill: Box<[u8]>,
-}
-
-/// 光照场 CPU 状态（render world）：按 chunk 的 tally 缓存 + 上次铺图的世界原点。
-#[derive(Resource, Default)]
-pub struct LightFieldCpu {
-  pub cache: std::collections::HashMap<gate_voxel::ChunkCoord, LightChunk>,
-  /// 上次铺图的世界原点（cell 单位，已按 cell 对齐）
-  pub origin_cell: IVec3,
-  /// 是否已铺过一次（首帧之前 cache 为空、origin 无意义）
-  pub valid: bool,
-}
-
-/// extract → prepare：本帧整幅重铺的光照场纹素字节（Rgba16Unorm，dims³ × 8B，行主序 x 最快）。
-#[derive(Resource, Clone)]
-pub struct LightFieldUpdate {
-  pub data: Vec<u8>,
-}
-
-/// 光照场窗口原点（cell 单位）：`align_down(cam - dims/2·cell, cell)`。
-/// 必须与 WGSL `light_field_origin_voxel` 逐字一致（shader 由 `view_u.cam_pos_voxel` 推）。
-pub fn light_field_origin_cell(cam_voxel: glam::Vec3) -> IVec3 {
-  let cell = LIGHT_FIELD_CELL as i32;
-  let half = (LIGHT_FIELD_DIM as i32 / 2) * cell;
-  let c = cam_voxel.floor().as_ivec3() - IVec3::splat(half);
-  IVec3::new(c.x.div_euclid(cell), c.y.div_euclid(cell), c.z.div_euclid(cell))
-}
-
-/// 单个 chunk 的 16³ cell tally：产出 AO fill。
-/// 仅 Mixed 展开 4³ 子块；Mixed 子块按半实心（fill=32）近似。
-fn build_light_chunk(tree: &gate_voxel::ChunkTree) -> LightChunk {
-  use gate_voxel::BrickState;
-  let mut fill = vec![0u8; 16 * 16 * 16].into_boxed_slice();
-  for lz in 0..16i32 {
-    for ly in 0..16i32 {
-      for lx in 0..16i32 {
-        let bx = lx * 16;
-        let by = ly * 16;
-        let bz = lz * 16;
-
-        let v: u32 = match tree.get_brick_state(bx, by, bz, 2) {
-          BrickState::Air => 0,
-          BrickState::Solid(_) => 4096,
-          BrickState::Mixed => {
-            let mut n = 0u32;
-            for kk in 0..4i32 {
-              for jj in 0..4i32 {
-                for ii in 0..4i32 {
-                  match tree.get_brick_state(bx + ii * 4, by + jj * 4, bz + kk * 4, 3) {
-                    BrickState::Air => {}
-                    BrickState::Solid(_) => n += 64,
-                    BrickState::Mixed => n += 32,
-                  }
-                }
-              }
-            }
-            n
-          }
-        };
-        let i = (lx + ly * 16 + lz * 256) as usize;
-        fill[i] = (v * 255 / 4096) as u8;
-      }
-    }
-  }
-  LightChunk { fill }
-}
-
 /// 上传 CPU 耗时样本（render world 资源，由 prepare 每帧覆盖）。
 /// render→main 同步走 [`UploadCpuSampleChannel`]；GPU 拷贝发生在 submit 时，不计入此值。
 #[derive(Resource, Clone, Copy, Debug, Default)]
@@ -355,11 +276,9 @@ pub struct GpuBrickMap {
   /// 主世界 chunk 窗口（chunk 单位）CPU 副本
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
-  /// 光照场（AO fill）：Rgba16Unorm 3D 纹理，硬件三线性过滤，仅 `.a` 有意义（尺寸 LIGHT_FIELD_DIM³）。
-  pub light_tex: Texture,
-  pub light_view: TextureView,
+  /// GI 缓冲（`gi_tex`）的**线性采样器**（BG1 binding 4，ClampToEdge ×3 + mipmap_filter = Nearest）。
   pub light_sampler: Sampler,
-  /// **全局材质资产表**（BG1 binding 6）：storage buffer，`MATERIAL_ASSET_SLOTS × 32B`（当前 = 32KB）。
+  /// **全局材质资产表**（BG1 binding 5）：storage buffer，`MATERIAL_ASSET_SLOTS × 32B`（当前 = 32KB）。
   /// **所有 volume 共用一张**（palette 的 PBR 变体里 `asset: u16` 是全局下标）。尺寸在
   /// [`init_empty_gpu`] 就按 WESL 常量定死（占位即最终尺寸，不需要扩容逻辑），
   /// 内容由 [`prepare`] 全量写一次（静态默认集，没有任何写入方 ⇒ 不需要增量路径）。
@@ -367,16 +286,16 @@ pub struct GpuBrickMap {
   /// 资产表内容是否已上传（一次性）：`false` = 仍是零初始化占位（贴图集还没就绪）。
   pub material_assets_uploaded: bool,
   /// PBR 贴图数组的**占位**（1×1×1 层，视图显式声明 `D2Array`）：贴图集 / `GpuImage` 未就绪时
-  /// BG1 binding 7/8 绑它们 ⇒ **任何时刻都可绑定，绝不 panic**。
+  /// BG1 binding 6/7 绑它们 ⇒ **任何时刻都可绑定，绝不 panic**。
   /// 视图必须声明 `D2Array`：默认视图是单层 `D2`，拿去绑 `texture_2d_array` 会被 wgpu 拒（MT2-1 的坑）。
   pub pbr_albedo_rough_tex: Texture,
   pub pbr_albedo_rough_view: TextureView,
   pub pbr_metal_tex: Texture,
   pub pbr_metal_view: TextureView,
-  /// **PBR 贴图专用采样器**（BG1 binding 9，MT2-3）：权威 desc 在
+  /// **PBR 贴图专用采样器**（BG1 binding 8，MT2-3）：权威 desc 在
   /// [`crate::pbr_texture::create_pbr_sampler`]（Repeat×3 / Linear mag,min,mipmap / anisotropy ≤ 8 /
-  /// lod_max 覆盖到 mip 链底）。**与 `light_sampler` 分开**：光照场是 ClampToEdge 的有界网格、无 mip，
-  /// 共用会连带改掉光照场的行为。占位与真身共用这**一个**实例（采样器与纹理无关）。
+  /// lod_max 覆盖到 mip 链底）。**与 `light_sampler` 分开**：那一份是 ClampToEdge、mipmap_filter 为
+  /// Nearest（GI 缓冲没有 mip 链），共用会连带改掉 GI 的采样行为。占位与真身共用这**一个**实例。
   pub pbr_sampler: Sampler,
 }
 
@@ -392,28 +311,15 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   };
   let globals = UniformBuffer::<BrickMapGlobals>::default();
 
+  // GI 缓冲（`gi_tex`）的采样器：ClampToEdge ×3 + mipmap_filter = Nearest（那张纹理没有 mip 链）。
   let light_sampler = device.create_sampler(&SamplerDescriptor {
-    label: Some("gate_light_field_sampler"),
+    label: Some("gate_light_sampler"),
     address_mode_u: AddressMode::ClampToEdge,
     address_mode_v: AddressMode::ClampToEdge,
     address_mode_w: AddressMode::ClampToEdge,
     mag_filter: FilterMode::Linear,
     min_filter: FilterMode::Linear,
     mipmap_filter: MipmapFilterMode::Nearest,
-    ..Default::default()
-  });
-  let light_tex = device.create_texture(&TextureDescriptor {
-    label: Some("gate_light_field"),
-    size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-    mip_level_count: 1,
-    sample_count: 1,
-    dimension: TextureDimension::D3,
-    format: TextureFormat::Rgba16Unorm,
-    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-    view_formats: &[],
-  });
-  let light_view = light_tex.create_view(&TextureViewDescriptor {
-    dimension: Some(TextureViewDimension::D3),
     ..Default::default()
   });
 
@@ -454,7 +360,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   let (pbr_metal_tex, pbr_metal_view) =
     make_pbr_placeholder("gate_pbr_metal_placeholder", TextureFormat::R8Unorm);
 
-  // ---- MT2-3：PBR 贴图专用采样器（BG1 binding 9）----
+  // ---- MT2-3：PBR 贴图专用采样器（BG1 binding 8）----
   // desc 的权威在 `pbr_texture::create_pbr_sampler`（占位与真身共用这一个实例）。
   // 这里顺手把**采样策略 + mip 层数**打进启动日志：验收项"远处不闪 / 近处不糊"只能人工看，
   // 但"mip 链存在、采样器吃到 mip"这件事必须有据可查。
@@ -463,7 +369,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   let pbr_sampler = crate::pbr_texture::create_pbr_sampler(&device);
   info!(
     target: "gate",
-    "PBR 采样器（BG1 binding 9）: Repeat×3 / Linear(mag,min,mipmap) / anisotropy_clamp = {} \
+    "PBR 采样器（BG1 binding 8）: Repeat×3 / Linear(mag,min,mipmap) / anisotropy_clamp = {} \
      / lod_max_clamp = {}；mip 链 = {} 层（GPU_TEX_SIZE = {} → 1×1，CPU 盒式平均）；\
      与 light_samp（ClampToEdge / mipmap Nearest / 无 mip）分属两个 sampler",
     crate::pbr_texture::PBR_ANISOTROPY_CLAMP,
@@ -474,7 +380,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 
   // ---- MT8-3：反射缓存的乒乓双缓冲（BG1 binding 10/11）已随反射缓存一起删除 ----
   // 那两块 buffer（`REFL_CACHE_SLOTS × 32B` = 合计 8 MiB）与 `refl_consts()` / `ReflEntry`
-  // 都不再存在（用户实测判为负优化）。BG1 的 binding 号现在到 9 为止。
+  // 都不再存在（用户实测判为负优化）。BG1 的 binding 号现在到 8 为止。
 
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
@@ -487,8 +393,6 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     globals,
     main_window_origin: IVec3::ZERO,
     main_window_dims: UVec3::ZERO,
-    light_tex,
-    light_view,
     light_sampler,
     material_assets,
     material_assets_uploaded: false,
@@ -509,10 +413,7 @@ fn extract(
   scene: Option<Extract<Res<VoxelScene>>>,
   budget: Option<Extract<Res<UploadBudget>>>,
   main_pending: Option<Extract<Res<MainPending>>>,
-  camera: Option<Extract<Res<super::dda::DdaCameraConfig>>>,
-  base: Option<Extract<Res<crate::lighting::BaseSettings>>>,
   mut mirror: ResMut<BuilderMirror>,
-  mut light_field: ResMut<LightFieldCpu>,
 ) {
   let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
     return;
@@ -581,24 +482,6 @@ fn extract(
 
   let volumes_ref = &scene.volumes;
 
-  let dirty_main: Vec<gate_voxel::ChunkCoord> = if need_full {
-    Vec::new()
-  } else {
-    pending_data.iter().filter(|(v, _)| *v == 0).map(|(_, c)| *c).collect()
-  };
-  let cam_voxel = camera.as_ref().map(|c| c.position_world).unwrap_or(glam::Vec3::ZERO);
-  // AO 关掉（菜单「渲染/基础/AO」）⇒ 着色侧 `light_field_ao` 恒返回 1.0、这张纹理没有消费者 ⇒
-  // 整条 CPU 重铺与上传都跳过。`valid = false` 是为了**重新打开时必定全量重铺**：缓存里留的是
-  // "那些 chunk 曾经算过"的 tally，而窗口原点在这段时间里已经漂走了。
-  let ao_off = base.as_ref().is_some_and(|b| !b.ao);
-  if ao_off {
-    light_field.valid = false;
-  } else if let Some(data) =
-    update_light_field(&mut light_field, volumes_ref, cam_voxel, &dirty_main, need_full)
-  {
-    commands.insert_resource(LightFieldUpdate { data });
-  }
-
   if !dirty_any {
     return;
   }
@@ -621,97 +504,6 @@ fn extract(
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();
   commands.insert_resource(UploadSnapshot { volumes: snapshot, state_bytes, comp_chunks });
-}
-
-/// 光照场增量更新（extract 侧）：窗口移动或脏 chunk 落入窗口时才整幅重铺；返回 `None` = 无需重铺。
-/// 输出 dims³ 纹素，行主序 x 最快，Rgba16Unorm 8B/纹素（bytes_per_row = dims×8 天然 256 对齐）。
-fn update_light_field(
-  lf: &mut LightFieldCpu,
-  volumes: &gate_voxel::Volumes,
-  cam_voxel: glam::Vec3,
-  dirty_main: &[gate_voxel::ChunkCoord],
-  force_full: bool,
-) -> Option<Vec<u8>> {
-  let dim = LIGHT_FIELD_DIM as i32;
-  let cs = LIGHT_FIELD_CELL as i32;
-  let origin_cell = light_field_origin_cell(cam_voxel);
-
-  let win_lo = origin_cell * cs;
-  let win_hi = win_lo + IVec3::splat(dim * cs);
-
-  let csz = IVec3::splat(gate_voxel::CHUNK_SIZE);
-  let c_lo = win_lo.div_euclid(csz);
-  let c_hi = (win_hi - IVec3::ONE).div_euclid(csz);
-
-  if force_full {
-    lf.cache.clear();
-  }
-  let moved = !lf.valid || origin_cell != lf.origin_cell;
-
-  let mut edited = false;
-  for c in dirty_main {
-    if c.0.cmpge(c_lo).all() && c.0.cmple(c_hi).all() {
-      lf.cache.remove(c);
-      edited = true;
-    }
-  }
-  if !moved && !edited {
-    return None;
-  }
-
-  let grid = volumes.main();
-  let t0 = std::time::Instant::now();
-  let mut tallied = 0usize;
-  for cz in c_lo.z..=c_hi.z {
-    for cy in c_lo.y..=c_hi.y {
-      for cx in c_lo.x..=c_hi.x {
-        let coord = gate_voxel::ChunkCoord::new(cx, cy, cz);
-        if lf.cache.contains_key(&coord) {
-          continue;
-        }
-        if let Some(tree) = grid.chunk(coord) {
-          lf.cache.insert(coord, build_light_chunk(tree));
-          tallied += 1;
-        }
-      }
-    }
-  }
-
-  lf.cache.retain(|c, _| c.0.cmpge(c_lo).all() && c.0.cmple(c_hi).all());
-
-  // 纹素下标 = 世界锚定槽位 `((wc mod dim) + dim) mod dim`，必须与 WGSL `light_field_uv` 一致。
-  let dimv = IVec3::splat(dim);
-  let mut data = vec![0u8; (dim * dim * dim) as usize * 8];
-  for (coord, t) in lf.cache.iter() {
-    for lz in 0..16i32 {
-      for ly in 0..16i32 {
-        for lx in 0..16i32 {
-          let wc = coord.0 * 16 + IVec3::new(lx, ly, lz);
-          let rel = wc - origin_cell;
-          if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dimv).any() {
-            continue;
-          }
-          let si = (lx + ly * 16 + lz * 256) as usize;
-          let r = wc.rem_euclid(dimv);
-          let ti = (r.x + r.y * dim + r.z * dim * dim) as usize;
-          // Rgba16Unorm：`.rgb` 恒 0（零初始化）；`.a` = AO fill（0..255 → ×257）。
-          let ob = ti * 8;
-          data[ob + 6..ob + 8].copy_from_slice(&((t.fill[si] as u32 * 257) as u16).to_le_bytes());
-        }
-      }
-    }
-  }
-  lf.origin_cell = origin_cell;
-  lf.valid = true;
-  bevy::log::debug!(
-    target: "gate",
-    "LIGHT FIELD: origin_cell={:?} tallied={} cached={} elapsed={:?}",
-    origin_cell,
-    tallied,
-    lf.cache.len(),
-    t0.elapsed()
-  );
-  Some(data)
 }
 
 fn u8_of_u32(w: &[u32]) -> &[u8] {
@@ -810,48 +602,6 @@ fn ensure_capacity(
   *cur = new_buf;
 }
 
-/// 光照场整幅重铺：dims³ 纹素（Rgba16Unorm 8B/纹素）；纹理尺寸不符时重建，尺寸相同则只 write_texture。
-fn upload_light_field(
-  device: &RenderDevice,
-  queue: &RenderQueue,
-  gpu: &mut GpuBrickMap,
-  data: &[u8],
-) {
-  let dim = LIGHT_FIELD_DIM;
-  let want = Extent3d { width: dim, height: dim, depth_or_array_layers: dim };
-  let cur = gpu.light_tex.size();
-  if cur.width != dim || cur.height != dim || cur.depth_or_array_layers != dim {
-    gpu.light_tex = device.create_texture(&TextureDescriptor {
-      label: Some("gate_light_field"),
-      size: want,
-      mip_level_count: 1,
-      sample_count: 1,
-      dimension: TextureDimension::D3,
-      format: TextureFormat::Rgba16Unorm,
-      usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-      view_formats: &[],
-    });
-    gpu.light_view = gpu.light_tex.create_view(&TextureViewDescriptor {
-      dimension: Some(TextureViewDimension::D3),
-      ..Default::default()
-    });
-  }
-
-  // bytes_per_row = dim×8 = 256，满足 wgpu 256 对齐，无需补行。
-  debug_assert_eq!(data.len(), (dim as usize).pow(3) * 8);
-  queue.write_texture(
-    TexelCopyTextureInfo {
-      texture: &gpu.light_tex,
-      mip_level: 0,
-      origin: Origin3d::ZERO,
-      aspect: TextureAspect::All,
-    },
-    data,
-    TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dim * 8), rows_per_image: Some(dim) },
-    want,
-  );
-}
-
 /// 全局材质资产表：**静态默认集**，一次全量上传（MT2-2）。
 ///
 /// **为什么不需要增量路径**：本表当前**没有任何写入方** —— 没有 UI / 编辑能改它（palette 的
@@ -894,7 +644,6 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
 pub(crate) fn prepare(
   mut commands: Commands,
   snapshot: Option<ResMut<UploadSnapshot>>,
-  light: Option<ResMut<LightFieldUpdate>>,
   pbr_set: Option<Res<PbrTextureSet>>,
   mut gpu: ResMut<GpuBrickMap>,
   device: Res<RenderDevice>,
@@ -902,10 +651,6 @@ pub(crate) fn prepare(
   sample_channel: Option<Res<UploadCpuSampleChannel>>,
   mut revision: ResMut<BrickMapRevision>,
 ) {
-  if let Some(u) = light.as_ref() {
-    upload_light_field(&device, &queue, &mut gpu, &u.data);
-    commands.remove_resource::<LightFieldUpdate>();
-  }
   upload_material_assets(&queue, pbr_set.as_deref(), &mut gpu);
   let Some(snap) = snapshot else { return };
   let t0 = std::time::Instant::now();
@@ -1356,7 +1101,6 @@ impl Plugin for VolumePlugin {
     render_app
       .insert_resource(ch)
       .init_resource::<BrickMapRevision>()
-      .init_resource::<LightFieldCpu>()
       .insert_resource(BuilderMirror { pending_full: true, ..Default::default() })
       .add_systems(RenderStartup, init_empty_gpu)
       .add_systems(ExtractSchedule, extract)

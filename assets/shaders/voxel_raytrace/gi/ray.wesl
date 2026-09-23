@@ -2,7 +2,6 @@ import package::bindings::{gi_sec_slots, light_u};
 import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
 import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
-import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
 import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_medium};
 
@@ -13,7 +12,7 @@ import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_
 // NEE 阴影射线。`sun_bounce = 0`（菜单「渲染/RESTIR GI/太阳反弹」关）时连那条阴影射线都不发，
 // 二次顶点只剩天光项。
 //
-// **辐亮度只算一次弹射**：命中面按「直射太阳 + 天光 × AO」着色后除以 π 得到它的出射辐亮度，
+// **辐亮度只算一次弹射**：命中面按「直射太阳 + 天光」着色后除以 π 得到它的出射辐亮度，
 // 没有更深的弹射。多重弹射曾经靠世界空间缓存的回读实现（`gi_cache_peek`），那条路是个
 // **跨帧反馈环**（缓存值进射线、射线值又进缓存，且缓存用 `1/n` 运行平均收敛）——
 // 表现就是「像拿刷子一层层刷、稳态要等二十秒、有无 GI 的异常区」。删除后 GI 的输入
@@ -25,8 +24,7 @@ import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_
 // 其中 `BRDF(...)` = `common.wesl::brdf_reflected` —— **与主 pass 同一个求值函数**
 // （MT3-7 的"变体统一"落到 GI 侧就是这件事），材质也走同一个 `fetch_material` 入口。
 // `/π` 只作用在**反射项**上（把"辐照度量纲"的出射亮度折成 radiance）；自发光本来就是辐亮度、
-// **不除**（`emissive_radiance` 单独成函数就是为了这条）。天光项在二次顶点乘 `light_field_ao`
-// （与主着色点同一套 AO，口径不分叉）。
+// **不除**（`emissive_radiance` 单独成函数就是为了这条）。
 //
 // 逃逸到天空 ⇒ `sky_rgb()`（唯一的 miss 辐亮度口径）。
 // ============================================================================
@@ -55,7 +53,7 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
 /// 全部输入都只由"命中的那个可见体素面"决定 ⇒ 可以按面缓存：
 ///   · 采样点一律取**体素中心**（`voxel_center_world`），与主 pass 的 `p_voxel` 同口径。它同时是
 ///     材质取值的点（`fetch_material` 内部本就量化到体素中心，传体素中心让 mip LOD 的距离也逐面
-///     确定）、太阳 NEE 起点的基准（沿面法线外推半体素 + eps）、AO 的采样点；
+///     确定）、太阳 NEE 起点的基准（沿面法线外推半体素 + eps）；
 ///   · 视向量锚点 = 同一个体素中心（`face_view_dir` 那份契约）；
 ///   · 着色法线是 (voxel, face) 的纯函数。
 ///
@@ -78,14 +76,13 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
     let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
     sun = sun_transmittance(hp + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
   }
-  // 天光项：与主着色点同一套系数 × 同一套 AO（口径不分叉）。
-  let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT * light_field_ao(hp, sh.obj_id);
+  // 天光项：与主着色点同一套系数（口径不分叉）。
+  let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT;
   // 视向量：本函数的结果**按面缓存**（`gi_sec_slots`，跨帧持久），而缓存的前提是"值只由那个可见
   // 体素面决定"（见 `gi/common.wesl` 的「跨帧持久」段）—— 它必须是**与射线无关**的量。
   // 曾经传 `org`（= 这条 GI 射线自己的起点，即上一个顶点）：同一个面的值于是取决于"**哪条射线先
-  // 填的槽**"；而 epoch 只要光照场窗口原点变（相机每移动 16 体素）就自增 ⇒ 整表重填、填的值换了
-  // 一个 ⇒ 移动时每隔一段"重新布一次光"（静止稳、一动就不稳，且对曝光 / 反射 / 降噪 / 复用权重
-  // **全部免疫** —— 诊断实测正是如此）。
+  // 填的槽**"；表又是跨帧持久的 ⇒ 填的值换了之后会一直挂着（静止稳、一动就不稳，且对曝光 /
+  // 反射 / 降噪 / 复用权重**全部免疫** —— 诊断实测正是如此）。
   // 取**面法线**（正入射）⇒ 值与射线无关，缓存前提成立、重填得同值。这也是主 pass 的口径
   // （`dda_face_main` 给整面着色时同样用一个与像素无关的量），符合「口径不分叉」。
   // 已知代价（可接受）：二次顶点的 Fresnel 取正入射值 `F0`，少了掠射增亮 —— 这条路径以漫反射贡献
@@ -189,7 +186,7 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
   return (1.0 - m.metallic) * m.albedo * l2 * mult;
 }
 
-/// 一条 GI 射线的入射辐亮度：真实光路 + 二次顶点「太阳 NEE + 天光 × AO」，逃逸取天光。
+/// 一条 GI 射线的入射辐亮度：真实光路 + 二次顶点「太阳 NEE + 天光」，逃逸取天光。
 /// 不含 cos 因子与 π —— RIS 的权重是 `p̂ / p`，系数在调用方给（余弦候选给 π）。
 ///
 /// 光路用 `world_trace_medium`（`stop_on_air = false`）：撞到**透射**体素不停、沿途按格累积乘性吸收
@@ -200,7 +197,7 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
 /// `Volumes::add_object` 在应用里没有调用点 ⇒ 无实际行为差异）。
 /// 命中分支的着色走 `gi_face_shade_cached`（按面缓存：同一个面被多条射线打到时只算一次），
 /// 命中面的**二次弹射**由 `gi_bounce2` 在缓存之外叠加（`bounce2` = 倍数，0 = 关；`seed` 是候选种子）。
-/// `epoch`（uniform `gi_u.seq.y`）= 光照/几何/光照场窗口的修订号，参与槽里键的掩码 ⇒ 它一变整张表
+/// `epoch`（uniform `gi_u.seq.y`）= 光照/几何的修订号，参与槽里键的掩码 ⇒ 它一变整张表
 /// 自失效（跨帧持久，见 `gi/common.wesl` 的「跨帧持久」段）。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> vec3<f32> {

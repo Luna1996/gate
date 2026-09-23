@@ -214,7 +214,7 @@ const GI_DEN_LUMA_K: f32 = 1.0;
 /// 调大 ⇒ 更平更糊（跨面注入更强）；调小 ⇒ 保留更多细节、雪花回潮。
 const GI_DEN_LUMA_FLOOR_REL: f32 = 0.05;
 
-/// 天光环境项系数：**常量天光**按 `sky · 本值 · mix(1, FLOOR, cov) · ao` 加在着色点上。
+/// 天光环境项系数：**常量天光**按 `sky · 本值 · mix(1, FLOOR, cov)` 加在着色点上。
 /// `cov = 0`（GI 无数据）时它就是巨量的兜底；顺便也是二次顶点唯一的天空项入口（见 `gi/ray.wesl`）。
 const GI_SKY_AMBIENT: f32 = 0.05;
 /// 天光常量的地板：`cov = 1`（GI 有数据）时保留 k 倍这一项。
