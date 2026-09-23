@@ -159,16 +159,16 @@ fn godray_pass_mask(gid: vec3<u32>) {
 
 /// 一张 `texture_2d<f32>` 的**双线性**取值：与 `main.wesl::fog_upsample_joint` 同一套手写
 /// 2×2 权重（模糊那两个 pass 的 layout 里没有采样器可绑）。
-fn godray_sample_bilinear(tex: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
-  let size = textureDimensions(tex);
-  let g = uv * vec2<f32>(f32(size.x), f32(size.y)) - vec2<f32>(0.5);
+/// `size` 由调用方给（同一张图在一趟里取 `GODRAY_TAPS` 次 ⇒ 不必每次重查 `textureDimensions`）。
+fn godray_sample_bilinear(tex: texture_2d<f32>, size: vec2<f32>, uv: vec2<f32>) -> vec3<f32> {
+  let g = uv * size - vec2<f32>(0.5);
   let base = floor(g);
   let f = g - base;
+  let hi = vec2<i32>(size) - vec2<i32>(1);
   var acc = vec3<f32>(0.0);
   for (var j: i32 = 0; j < 2; j = j + 1) {
     for (var i: i32 = 0; i < 2; i = i + 1) {
-      let c = clamp(vec2<i32>(base) + vec2<i32>(i, j), vec2<i32>(0),
-                    vec2<i32>(i32(size.x) - 1, i32(size.y) - 1));
+      let c = clamp(vec2<i32>(base) + vec2<i32>(i, j), vec2<i32>(0), hi);
       let bw = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
       acc = acc + textureLoad(tex, c, 0).rgb * bw;
     }
@@ -190,13 +190,14 @@ fn godray_blur_accum(
 ) -> vec3<f32> {
   let to_sun = (u.xy - uv) * step;
   let decay = clamp(u.z, 0.05, 1.0);
+  let src_size = vec2<f32>(textureDimensions(src));
   var acc = vec3<f32>(0.0);
   var wsum = 0.0;
   var w = 1.0;
   for (var i = 1u; i <= GODRAY_TAPS; i = i + 1u) {
     // 从本像素朝太阳的方向取样（i 越大越靠近太阳）：累加是确定性的（同序、同权重）。
     let p = uv + to_sun * (f32(i) / f32(GODRAY_TAPS));
-    acc = acc + godray_sample_bilinear(src, p) * w;
+    acc = acc + godray_sample_bilinear(src, src_size, p) * w;
     wsum = wsum + w;
     w = w * decay;
   }

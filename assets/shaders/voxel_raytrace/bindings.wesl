@@ -80,7 +80,7 @@ struct MaterialAsset {
 // 就是这张表的**全局下标**。表大小 = `MATERIAL_ASSET_SLOTS`（WESL 权威常量在 `common.wesl`）。
 @group(1) @binding(6) var<storage, read> material_assets: array<MaterialAsset>;
 // 采样 `pbr_albedo_rough` 的 rgb 后**必须**走 `srgb_to_linear()`：两张数组图都是 `Unorm` 格式、
-// 采样不做 sRGB 转换（rgb 是 sRGB 编码的原始字节），与 `palette_albedo` 读 palette 字节后同样
+// 采样不做 sRGB 转换（rgb 是 sRGB 编码的原始字节），与 `srgb_word_to_linear` 读 palette 字节后同样
 // `srgb_to_linear()` 是**完全同一口径** ⇒ 平凡材质与 PBR 材质能共用同一个 BRDF 入口。
 @group(1) @binding(7) var pbr_albedo_rough: texture_2d_array<f32>;  // Rgba8Unorm: rgb=albedo(sRGB 编码字节)、a=roughness
 @group(1) @binding(8) var pbr_metal: texture_2d_array<f32>;         // R8Unorm: r=metalness

@@ -1,13 +1,13 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, fog_tex, fog_u_read, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide_out, gi_out, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_TEXEL, face_slot_of, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::lightfield::{light_field_ao};
 import package::trace::{make_grid};
-import package::volumetric::{GODRAY_STEP_A, GODRAY_STEP_B, godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
+import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{WorldHit, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
@@ -250,20 +250,16 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
                                  max_t, world_cfg_full(0.0, 3u));
         var rc = sky_rgb();
         if (rhit.hit) {
-          // ---- MT4-1 · **这条第三处着色表达式已接进统一入口** ----
-          // 改动前这里是 `palette_albedo(rhit.pal) * (sun_c·N·L + sky·GLASS_REFL_AMBIENT)`，两个毛病：
-          //   ① 它对 **PBR 变体条目按字节误读 word0**（那里按 D1 是 roughness/metallic/emissive/
-          //      transmission 四个覆盖字节，不是 rgb）⇒ 把覆盖字节当颜色用，颜色是垃圾；
-          //   ② 它是全工程**第四处着色代码路径**（硬约束 1 / 3 都不许）。
-          // 现在与主 pass、GI 二次顶点走**同一组函数**：`fetch_material` 取材质 + `brdf_reflected` 求值；
+          // ---- MT4-1 · 这条第三处着色表达式已接进统一入口 ----
+          // 与主 pass、GI 二次顶点走**同一组函数**：`fetch_material` 取材质 + `brdf_reflected` 求值；
           // 着色法线也同样是 `voxel_normal` 的隐式邻域梯度（与主 pass 一致）。
           // `SurfaceLight` 刻意与 `gi/ray.wesl` 的二次顶点**逐字对齐**（硬约束 3 不分叉），差异只有两条：
           //   · `sun_vis = 1.0`（**不做 NEE**：不给玻璃的反射再加一条阴影射线，沿用本条既有的"无遮挡"
           //     近似 —— 有意为之，不是漏了）；
           //   · 天光 = `sky · GLASS_REFL_AMBIENT`（玻璃反射沿用自己那个更暗的常量天光，与旧式同源）；
           //     `gi = 0`（反射点没有 GI 缓冲，与二次顶点同一条约定）。
-          // 有意的一处观感变化（统一入口的直接后果）：反射命中自发光表面时**会**看到它的自发光
-          // （`emissive_radiance` 与主 pass / 二次顶点同一句），旧式那条近似看不到。
+          // （统一入口的直接后果）反射命中自发光表面时会看到它的自发光（`emissive_radiance`
+          // 与主 pass / 二次顶点同一句）。
           let rgg = make_grid(u32(rhit.obj_id) + 1u);
           let rn = voxel_normal(rgg, rhit.voxel, rhit.face_id, rhit.n);
           let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
@@ -460,12 +456,10 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   }
   // ---- 天空背景（**只在这里用 `sky_primary`**）：常量天光 + 天体盘 + 光晕 ----
   // `through` = 沿途介质的乘性吸收（玻璃染色），`refl` = 玻璃那条状态机累积的反射项。
-  // 命中时下面立刻把 `col` 覆盖掉 ⇒ 这一行的开销只落在天空像素上（几个 ALU）。
   // ⚠️ 除了这一行，全工程的天空口径仍是 `sky_rgb()`（GI 的 miss / 玻璃与镜面反射的逃逸）——
   // 太阳作为**光源**已经由各处的 NEE 负责，那些地方再画一次太阳盘就是重复计能量（见 `sky_primary`）。
-  var col = sky_primary(ray_dir, sun_dir, sun_c) * through + refl;
+  var col = vec3<f32>(0.0);
   if (best.hit) {
-    col = vec3<f32>(0.0);
     // 材质参数（albedo / roughness / metallic / emissive / transmission / ior / specular）由下面那次
     // `fetch_material` 一次拿全 —— 这里不再单独取 albedo（避免出现"第二处取值口径"）。
     let gg = make_grid(u32(best.obj_id) + 1u);
@@ -596,7 +590,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if (PBR_REFLECTION_ENABLED != 0u && light_u.g.refl_tier > 0u) {
       let tier = light_u.g.refl_tier;
       let f0r = f0_of(m);
-      let f0_luma = dot(f0r, vec3<f32>(0.2126, 0.7152, 0.0722));
+      let f0_luma = dot(f0r, GI_LUMA);
       if (f0_luma >= PBR_REFL_MIN_F0 && m.roughness <= PBR_REFL_MAX_ROUGH) {
         // `refl_env`（反射内容）在下面射线落地处初始化：它 = 反射命中点的出射亮度，或"逃逸到天空"
         // 时取的那份天空。
@@ -702,7 +696,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
           let h_fade = clamp(1.0 - hm.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
           let h_continue =
             lvl < nest && h_fade > 0.0
-            && dot(hf0, vec3<f32>(0.2126, 0.7152, 0.0722)) >= PBR_REFL_MIN_F0;
+            && dot(hf0, GI_LUMA) >= PBR_REFL_MIN_F0;
           var h_local = brdf_reflected(hm, hn, hv,
                                        SurfaceLight(sun_dir, sun_c, h_vis, hamb, vec3<f32>(0.0)))
                       + emissive_radiance(hm, GI_EMIT_GAIN);
@@ -750,6 +744,10 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       }
     }
     col = col * through + refl;
+  } else {
+    // 天空像素：常量天光 + 天体盘 + 光晕。`glass_col` 此时恒 0（无命中即无玻璃首命中）
+    // ⇒ 省掉末尾那次 in-scatter 混入（那一项是 `+ 0`）。
+    return sky_primary(ray_dir, sun_dir, sun_c) * through + refl;
   }
   // ---- MT8-9 · 透明度的 in-scatter 混入（`col` 此刻 = 背景×through + refl）----
   // 「透明度」= **混合比**（标准 alpha 合成，`through` 是逐段 alpha，与厚度无关见 `trace.wesl::MediumRay`）：
@@ -842,7 +840,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 采样用**手写双线性**（`godray_sample_bilinear`）：光柱网格是渲染分辨率 ÷ `div`，
   // 而它的内容是低频的（模糊过）⇒ 双线性足够，且不需要给本 pipeline 拉一个采样器进来。
   // 关掉光柱时 Rust 在 group(6) 绑 1×1 零纹理 ⇒ 这一行恒 `+0`。
-  col = col + godray_sample_bilinear(fog_tex, px);
+  col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
   write_output(coord0, col);
 }
 
@@ -964,8 +962,9 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // `point` 传**体素中心**：`fetch_material` 内部本来就量化到体素中心（UV 逐位相同）；唯一差别是
   // mip LOD 的距离输入从"连续命中点"换成"体素中心"（量级 ≤ 0.87 体素，而逐像素版本的那个距离
   // 本来就因 `floor` 在法线轴的 ±1 抖动而不定）。
+  let fnw = face_normal_world(gg, face_id);
   let first = WorldHit(true, 0.0, p_voxel, atomicLoad(&face_slots[fe + FACE_W_PAL]),
-                       face_normal_world(gg, face_id), face_id, voxel, obj_id, gg.palette_base);
+                       fnw, face_id, voxel, obj_id, gg.palette_base);
   let gi_uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
             / vec2<f32>(f32(gsize.x), f32(gsize.y));
   let ndc = vec2<f32>(gi_uv.x * 2.0 - 1.0, 1.0 - gi_uv.y * 2.0);
@@ -989,7 +988,7 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   // `ray_dir` 传该面的世界法线：逐面路径**只处理命中面**（天空在那里不渲染）⇒ 这个实参不会被消费，
   // 但必须是合法单位向量（`shade_face` 的注释里写了理由）。
-  let col = shade_face(first, view_u.cam_pos_voxel.xyz, face_normal_world(gg, face_id), frustum_length,
+  let col = shade_face(first, view_u.cam_pos_voxel.xyz, fnw, frustum_length,
                        GiInput(true, gi_avg, select(0.0, 1.0, gi_n > 0u), gi_uv),
                        sun_dir, sky, sun_c);
   atomicStore(&face_slots[fe + FACE_W_COL], bitcast<u32>(col.x));
@@ -1136,17 +1135,19 @@ fn godray_blur_b(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// log2 亮度桶覆盖 [-12, +12]：24 档 / 64 桶 = 0.375 档每桶。
 const EYE_LUM_MIN_LOG2: f32 = -12.0;
 const EYE_LUM_RANGE_LOG2: f32 = 24.0;
+/// 状态/调试区字数（曝光系数、已适应 EV、手动偏移、帧间隔、百分位均值、目标 EV…）—— 直方图区紧随其后。
+const EYE_HIST_BASE: u32 = 8u;
 const EYE_HIST_BINS: u32 = 64u;
-/// 活参数区起始字（= 状态/调试区 8 + 直方图 64），由 Rust `EyeAdaptSettings` 上传。
+/// 活参数区起始字 = 状态/调试区 + 直方图区，由 Rust `EyeAdaptSettings` 上传。
 /// 下标 = `eye_p(i)` 的实参，顺序即语义（改 Rust 结构体必须同步）：0 ev_max 1 ev_min 2 tau_brighten 3 tau_darken 4 key。
-const EYE_PARAM_BASE: u32 = 8u + EYE_HIST_BINS;
+const EYE_PARAM_BASE: u32 = EYE_HIST_BASE + EYE_HIST_BINS;
 
 fn eye_p(i: u32) -> f32 {
   return bitcast<f32>(atomicLoad(&eye_adapt[EYE_PARAM_BASE + i]));
 }
 
 /// WG 内共享直方图（原子类型只能位于 workgroup 地址空间）。
-var<workgroup> eye_hist: array<atomic<u32>, 64>;
+var<workgroup> eye_hist: array<atomic<u32>, EYE_HIST_BINS>;
 
 @compute @workgroup_size(256)
 fn eye_adapt_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1162,21 +1163,21 @@ fn eye_adapt_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sy = i32((k / axis) * stride + stride / 2u);
     if (sx >= dims.x || sy >= dims.y) { continue; }
     let c = textureLoad(out_tex_src, vec2<i32>(sx, sy), 0).rgb;
-    let luma = dot(srgb_to_linear(c), vec3<f32>(0.2126, 0.7152, 0.0722));
+    let luma = dot(srgb_to_linear(c), GI_LUMA);
     let b = u32(clamp((log2(max(luma, 1e-5)) - EYE_LUM_MIN_LOG2) / bin_w, 0.0, f32(EYE_HIST_BINS - 1u)));
     atomicAdd(&eye_hist[b], 1u);
   }
   workgroupBarrier();
   for (var i = gid.x; i < EYE_HIST_BINS; i = i + 256u) {
     let v = atomicLoad(&eye_hist[i]);
-    if (v > 0u) { atomicAdd(&eye_adapt[8u + i], v); }
+    if (v > 0u) { atomicAdd(&eye_adapt[EYE_HIST_BASE + i], v); }
   }
 }
 
 @compute @workgroup_size(1)
 fn eye_adapt_update() {
   var total = 0.0;
-  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { total = total + f32(atomicLoad(&eye_adapt[8u + i])); }
+  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { total = total + f32(atomicLoad(&eye_adapt[EYE_HIST_BASE + i])); }
   if (total > 0.0) {
     let lo = total * 0.05;
     let hi = total * 0.95;
@@ -1185,7 +1186,7 @@ fn eye_adapt_update() {
     var acc = 0.0;
     var wsum = 0.0;
     for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) {
-      let n = f32(atomicLoad(&eye_adapt[8u + i]));
+      let n = f32(atomicLoad(&eye_adapt[EYE_HIST_BASE + i]));
       let c0 = cum;
       cum = cum + n;
       let w = max(0.0, min(cum, hi) - max(c0, lo));
@@ -1209,5 +1210,5 @@ fn eye_adapt_update() {
       atomicStore(&eye_adapt[0u], bitcast<u32>(exp_val));
     }
   }
-  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { atomicStore(&eye_adapt[8u + i], 0u); }
+  for (var i = 0u; i < EYE_HIST_BINS; i = i + 1u) { atomicStore(&eye_adapt[EYE_HIST_BASE + i], 0u); }
 }

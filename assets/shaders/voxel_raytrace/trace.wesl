@@ -1,9 +1,9 @@
-import package::bindings::{b_leaves, b_palette, b_struct, g, grid_descs, view_u};
+import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, view_u};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, NODE_FIXED_WORDS, face_normal_from_index};
 
 // 层级命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
-// voxel = 命中固体体素 chunk 局部整数坐标，着色阶段直接消费，不要用「命中点 ± 法线半步」重建。
+// voxel = 命中固体体素 chunk 局部整数坐标，着色阶段直接消费。
 struct VoxelHit {
   hit: bool,
   t: f32,
@@ -23,8 +23,7 @@ struct VoxelHit {
 // `last_pal` = 当前介质段材质（0 = 不在介质内）：既是"是否在介质段内"的判据（`medium_exit`），
 // 也是"**这一段是否已经染过**"的记忆键 —— 同材质仍在继续 ⇒ 不重复衰减（见 `pass_through_medium`）；
 // 离开介质（撞空气）时调用方清 0 ⇒ 之后再遇到同材质算**新的一段**（两块玻璃各染一次）。
-// 因此本结构**不需要**任何距离/入口 t 的记账字段（字段数一变仍需同步 `world.wesl` 的构造点）。
-// `penetrate` 是按值参数、不在本结构里。
+// 字段一改需同步 `world.wesl` 的构造点。
 struct MediumRay {
   stop_on_air: bool,
   palette_base: u32,
@@ -32,8 +31,8 @@ struct MediumRay {
   tint: vec3<f32>,
 }
 
-// brick 缓存槽：一层分裂节点常驻（镜像 CPU `BrickCpu`）。`mask` = 64 位分裂掩码，与 wire 的
-// `mask_lo | mask_hi << 32`、点查询 `sample_brickmap` 的语义逐位相同。
+// brick 缓存槽：一层分裂节点常驻（镜像 CPU `BrickCpu`）。`mask` = 64 位分裂掩码（wire 的两个
+// word 拼成），语义同 `sample_brickmap`。
 struct Brick {
   addr: u32,  // 节点绝对字址（b_struct）
   mask: u64,  // 分裂掩码（bit=1 = 子块分裂；bit=0 = 统一子块，色 = pal）
@@ -41,6 +40,7 @@ struct Brick {
 }
 
 /// 子块 `idx`（0..63）是否分裂。
+/// 与下一函数一起**保持函数形式**：内联进调用点会算错（槽下标错 ⇒ 下钻到错的子节点）。
 fn mask_bit(mask: u64, idx: u32) -> bool {
   return (mask & (u64(1) << idx)) != u64(0);
 }
@@ -65,31 +65,24 @@ fn mask_pop_below(mask: u64, idx: u32) -> u32 {
 /// 这里取的是**介质透过率**（DDA 的物理量），不是着色 —— 着色仍然只有 `brdf_reflected` 一条路径。
 fn medium_of(palette_base: u32, pal: u32) -> vec4<f32> {
   let w1 = b_palette[palette_base + pal * 2u + 1u];
-  // ⚠️ **`FLAGS_*` 是字节级掩码**（与 `common.wesl::palette_flags` 的 `>> 16` 配套），而 flags 字节落在
-  // word1 的 **bit16..23** ⇒ 必须先把字节取出来再比。`w1 & FLAGS_TRANSMISSIVE` 测到的是 **bit5**
-  // （平凡变体的 `emissive` / PBR 变体的 `asset`）⇒ 会把透射条目判成非介质、把发光体素判成介质。
+  // `FLAGS_*` 是**字节级掩码**（配 `common.wesl::palette_flags` 的 `>> 16`）：flags 落在 word1 的
+  // bit16..23 ⇒ 先取出字节再比。
   let flags = (w1 >> 16u) & 0xFFu;
-  // 非介质：改动前的 `a = 1 − transmission/255` 在 transmission == 0 时恒等于 1.0，且调用方只用
-  // `a >= 1.0` 判"不透明"（rgb 那条路径不消费）⇒ 这里直接给 a = 1.0，行为与改动前逐行等价。
+  // 非介质：调用方只消费 `a >= 1.0` 这一判据 ⇒ 直接给 a = 1.0。
   if ((flags & FLAGS_TRANSMISSIVE) == 0u) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
   if ((flags & FLAGS_IS_PBR) != 0u) {
     // PBR 变体：w1 低 16 位是 `asset`，读不出透射率 ⇒ 只按 TRANSMISSIVE 位判"是介质"，
-    // 单格透过率取中性（白 = 不吸收）。**PBR 变体的介质吸收色应当走材质资产** —— 这里**未做**：
-    // 读资产要额外一次资产表 load（逐格调用，成本敏感）。
-    // 注：MT7 之后**已有**写入方能产出 `IS_PBR + TRANSMISSIVE` 条目（编辑器笔触），
-    // 所以这条现在是"**有真实用例但尚缺**"，属待补项，不是"无人使用所以延后"。
+    // 单格透过率取中性（白 = 不吸收）。吸收色待补：走材质资产要多一次资产表 load，逐格不合算。
     return vec4<f32>(1.0, 1.0, 1.0, 0.0);
   }
   let w0 = b_palette[palette_base + pal * 2u];
   let srgb = vec3<f32>(f32(w0 & 0xFFu), f32((w0 >> 8u) & 0xFFu), f32((w0 >> 16u) & 0xFFu)) / 255.0;
   let a = 1.0 - f32((w1 >> 8u) & 0xFFu) / 255.0;
   // 一段透过率 = **消色差密度衰减 × 颜色吸收**：
-  //   · `1 − a` = 密度衰减（"不透明度"的本体）：白/浅色材质（`srgb ≈ 白`）靠它变不透 ——
-  //     只留颜色吸收的话 `mix(白, srgb², a)` 对白材质恒等于白、滑杆整段是空的；
-  //   · `mix(白, srgb², a)` = 颜色吸收（彩色玻璃随不透明度加深而更出色），**乘上 `1 − a`**
-  //     ⇒ 暗色材质在"不透明度 = 0"时不发黑。
+  //   · `1 − a` = 密度衰减（"不透明度"的本体）：白/浅色材质（`srgb ≈ 白`）靠它变不透；
+  //   · `mix(白, srgb², a)` = 颜色吸收（彩色玻璃随不透明度加深而更出色），乘上 `1 − a`
+  //     ⇒ 暗色材质在"不透明度 = 0"时不发黑；
   //   · `srgb²` = palette 色是 sRGB 编码字节，平方是廉价 γ≈2 线性化（`material_ior` 那条同源近似）。
-  // `a` 一路是"密度/不透明度"，调用方只用 `a >= 1.0` 判"不是介质"，语义未变。
   return vec4<f32>((1.0 - a) * mix(vec3<f32>(1.0), srgb * srgb, a), a);
 }
 
@@ -170,8 +163,8 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       let cell = vec3<i32>(v >> sh) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
-        // 叶节点：bit=1 的体素取 inline 半字；bit=0 的体素 = 本节点 uniform 色（0 = 空气）——
-        // 「bit=0 ⇔ 空气」不成立，口径与 `sample_brickmap` / `get_voxel` 一致。
+        // 叶节点：bit=1 的体素取 inline 半字；bit=0 的体素 = 本节点 uniform 色（0 = 空气）。
+        // 口径同 `sample_brickmap` / `get_voxel`。
         if (mask_bit(b.mask, idx)) {
           let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
           let leaf_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
@@ -234,6 +227,11 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
     let step_inc = f32(s) * abs_inv_rd;
     var step_axis: u32 = 0u;
     var changed = false;
+    // 内层步进的循环不变量（数组读 + 三个向量化转换）提到循环外
+    let b = bricks[level];
+    let sh2 = vec3<u32>(log2);
+    let sm_mask = vec3<i32>(s_mask);
+    let sm1 = vec3<i32>(s - 1);
     loop {
       var mn: u32;
       if (side.x <= side.y && side.x <= side.z) { mn = 0u; }
@@ -243,18 +241,15 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       cur_t = side[mn];
       if (cur_t >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
       let old_cell = (v[mn] >> log2) & 3;
-      // ---- 步进即对齐：v 恒 = `cur_t` 处的真实体素（本循环内命中直接 return，不走外层「对齐快照」）----
-      // 格基址每步从 v 重算（循环外的 `base_v` 只对第一步成立）；步进轴取新格边界（正向 = 首格 /
-      // 负向 = 末格），其余轴按射线位置钳在本格内。
-      let cell_min = v & vec3<i32>(s_mask);
-      v = clamp(vec3<i32>(floor(ro_c + rd * cur_t)), cell_min, cell_min + vec3<i32>(s - 1));
+      // 步进即对齐：v 恒 = `cur_t` 处的真实体素（本循环内的命中直接上报它）。格基址每步从 v 重算；
+      // 步进轴取新格边界，其余轴按射线位置钳在本格内。
+      let cell_min = v & sm_mask;
+      v = clamp(vec3<i32>(floor(ro_c + rd * cur_t)), cell_min, cell_min + sm1);
       v[mn] = select(cell_min[mn] + s, cell_min[mn] - 1i, sign_v[mn] < 0);
       side[mn] = side[mn] + step_inc[mn];
       face = mn * 2u + face_base[mn];
       let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
       if (crossed) { changed = true; break; }
-      let b = bricks[level];
-      let sh2 = vec3<u32>(log2);
       let cell = vec3<i32>(v >> sh2) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
@@ -421,6 +416,11 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
     let step_inc = f32(s) * abs_inv_rd;
     var step_axis: u32 = 0u;
     var changed = false;
+    // 内层步进的循环不变量（数组读 + 三个向量化转换）提到循环外
+    let b = bricks[level];
+    let sh2 = vec3<u32>(log2);
+    let sm_mask = vec3<i32>(s_mask);
+    let sm1 = vec3<i32>(s - 1);
     loop {
       var mn: u32;
       if (side.x <= side.y && side.x <= side.z) { mn = 0u; }
@@ -429,22 +429,19 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       step_axis = mn;
       cur_t = side[mn];
       if (cur_t >= t1) {
-        // 越出本 chunk：吸收与距离无关 ⇒ 这里没有"到边界收尾"，直接返回 miss；
-        // 下一个 chunk 从它的 t0 = 本 chunk 的 t1 起步继续，`last_pal` 一直留着 ⇒
-        // 同材质跨 chunk 仍是同一段（不重复衰减）。
+        // 越出本 chunk ⇒ miss（吸收与距离无关，无需边界收尾）。`last_pal` 留着 ⇒
+        // 下一个 chunk 接着走时，同材质跨 chunk 仍是同一段（不重复衰减）。
         return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0));
       }
       let old_cell = (v[mn] >> log2) & 3;
       // 步进即对齐（同 `trace_chunk_opaque`）。
-      let cell_min = v & vec3<i32>(s_mask);
-      v = clamp(vec3<i32>(floor(ro_c + rd * cur_t)), cell_min, cell_min + vec3<i32>(s - 1));
+      let cell_min = v & sm_mask;
+      v = clamp(vec3<i32>(floor(ro_c + rd * cur_t)), cell_min, cell_min + sm1);
       v[mn] = select(cell_min[mn] + s, cell_min[mn] - 1i, sign_v[mn] < 0);
       side[mn] = side[mn] + step_inc[mn];
       face = mn * 2u + face_base[mn];
       let crossed = select(old_cell == 0, old_cell == 3, sign_v[mn] >= 0);
       if (crossed) { changed = true; break; }
-      let b = bricks[level];
-      let sh2 = vec3<u32>(log2);
       let cell = vec3<i32>(v >> sh2) & vec3<i32>(3);
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       hit_pal = 0u;
@@ -494,40 +491,8 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0));
 }
 
-// 统一 DDA：主网格与逐物体 OBJ 共用一条管线，严格镜像 Rust `brickmap/dda.rs` CPU 参考实现。
-
-// slab 法射线-AABB 求交，返回 (t_enter, t_exit)；平行且在外 → (1.0, 0.0) miss 哨兵。
-fn slab_box(ro: vec3<f32>, rd: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>, t0: f32, t1: f32) -> vec2<f32> {
-  var t_enter = t0;
-  var t_exit = t1;
-  if (abs(rd.x) < 1e-30) {
-    if (ro.x < mn.x || ro.x > mx.x) { return vec2<f32>(1.0, 0.0); }
-  } else {
-    let ta = (mn.x - ro.x) / rd.x;
-    let tb = (mx.x - ro.x) / rd.x;
-    t_enter = max(t_enter, min(ta, tb));
-    t_exit = min(t_exit, max(ta, tb));
-  }
-  if (abs(rd.y) < 1e-30) {
-    if (ro.y < mn.y || ro.y > mx.y) { return vec2<f32>(1.0, 0.0); }
-  } else {
-    let ta = (mn.y - ro.y) / rd.y;
-    let tb = (mx.y - ro.y) / rd.y;
-    t_enter = max(t_enter, min(ta, tb));
-    t_exit = min(t_exit, max(ta, tb));
-  }
-  if (abs(rd.z) < 1e-30) {
-    if (ro.z < mn.z || ro.z > mx.z) { return vec2<f32>(1.0, 0.0); }
-  } else {
-    let ta = (mn.z - ro.z) / rd.z;
-    let tb = (mx.z - ro.z) / rd.z;
-    t_enter = max(t_enter, min(ta, tb));
-    t_exit = min(t_exit, max(ta, tb));
-  }
-  return vec2<f32>(t_enter, t_exit);
-}
-
-// 统一 DDA 核心：主世界与物体走同一条 slab→chunk 间 A&W→trace_chunk 流程，差异由 `Grid` 参数化。
+// 统一 DDA：主网格与逐物体共用一条管线（严格镜像 Rust `brickmap/dda.rs`）：slab→chunk 间 A&W→
+// trace_chunk，差异由 `Grid` 参数化。
 
 // 统一命中结构：hit / t / pal / n（世界空间法线）/ face_id（0..5）/ obj_id（-1 = 主世界，>=0 = 物体）。
 // voxel 为命中固体体素 grid 局部整数坐标（主世界 = 世界坐标），由 DDA 整数步进精确产出。
@@ -536,7 +501,7 @@ struct UnifiedHit {
   t: f32,
   pal: u32,
   n: vec3<f32>,        // 世界空间法线（光影用）
-  face_id: u32,        // 命中面 0..5（与 face_index_from_normal 对齐）
+  face_id: u32,        // 命中面 0..5（编码见 `face_normal_from_index`）
   voxel: vec3<i32>,    // grid 局部命中体素坐标
   obj_id: i32,         // -1 = 主世界, >=0 = 物体索引
 }
@@ -781,10 +746,8 @@ fn make_grid(idx: u32) -> Grid {
   let is_world = idx == 0u;
   let l_mn = select(vec3<f32>(0.0), d.aabb_min.xyz, is_world);
   let l_mx = select(vec3<f32>(f32(CHUNK_SIZE)), d.aabb_max.xyz, is_world);
-  // 变换段：主世界是 identity（Rust `VolumeTransform::IDENTITY`；`trace_grid` 的 `obj_id < 0` 分支
-  // 早已依赖这条 —— 它把局部坐标直取世界坐标）⇒ 不读 `rot0..2` / `pos_scale` 这 4 个 vec4，
-  // 直接给常量。这样下游的 `obj_id < 0` 分支（ro/rd 直取、`voxel_normal` 的 mat-vec 短路）
-  // 也能整段常量折叠掉。
+  // 变换段：主世界是 identity（Rust `VolumeTransform::IDENTITY`）⇒ 不读 `rot0..2` / `pos_scale`，
+  // 直接给常量；下游 `obj_id < 0` 分支（ro/rd 直取、`voxel_normal` 的 mat-vec 短路）随之常量折叠。
   var col0 = vec3<f32>(1.0, 0.0, 0.0);
   var col1 = vec3<f32>(0.0, 1.0, 0.0);
   var col2 = vec3<f32>(0.0, 0.0, 1.0);

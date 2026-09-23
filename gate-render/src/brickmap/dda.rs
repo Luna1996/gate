@@ -586,7 +586,7 @@ pub struct TreeHit {
   pub voxel: IVec3,
 }
 
-/// 镜像 WGSL face_index_from_normal：取最大分量轴，法向分量 ≥0 → 正面索引。
+/// 面号：取法线最大分量轴，分量 ≥0 → 正面（与 WGSL `face_normal_from_index` 互逆）。
 fn face_index_from_normal(n: Vec3) -> u8 {
   let ax = n.x.abs();
   let ay = n.y.abs();

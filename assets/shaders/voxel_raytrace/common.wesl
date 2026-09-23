@@ -1,15 +1,12 @@
-import package::bindings::{b_palette, g, light_u, material_assets, pbr_albedo_rough, pbr_metal, pbr_samp, view_u};
+import package::bindings::{b_palette, light_u, material_assets, pbr_albedo_rough, pbr_metal, pbr_samp, view_u};
 
 // --- 常量区（与 Rust wgsl_consts mod 字节对齐）---
 // Brick Tree：256³ chunk，4³ 分裂因子，4 层（256→64→16→4→1）
 const CHUNK_SIZE: u32 = 256u;
-const BRICK_FACTOR: u32 = 4u;
 const MAX_LEVEL: u32 = 4u;
 const NODE_FIXED_WORDS: u32 = 3u;    // mask_lo + mask_hi + palette
 // b_struct Region ①：稠密 chunk 窗口。
 const CHUNK_INDEX_CAP: u32 = 64u;
-const CHUNK_INDEX_WORDS: u32 = 262144u;  // 64³
-const TREE_BASE: u32 = 262144u;          // Region ② 起始
 
 // --- 材质索引格式（16 位，与 Rust `gate_voxel::PALETTE_BITS` / `LEAF_*` 同源）---
 // 节点第 3 字：bit0..15 = uniform 子块色，bit16..31 = LOD 子树多数色；叶父层 inline 每字装 2 个体素（LEAF_VOXELS_PER_WORD）。
@@ -52,13 +49,7 @@ const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
   0x04020007u,
 );
 
-// ---- face 索引（0..5 = -x,+x,-y,+y,-z,+z）与法线/诊断色的转换 ----
-fn face_index_from_normal(n: vec3<f32>) -> u32 {
-  let ax = abs(n.x); let ay = abs(n.y); let az = abs(n.z);
-  if (ax >= max(ay, az)) { return select(0u, 1u, n.x >= 0.0); }
-  if (ay >= az)          { return select(2u, 3u, n.y >= 0.0); }
-  return select(4u, 5u, n.z >= 0.0);
-}
+// ---- face 索引（0..5 = -x,+x,-y,+y,-z,+z）与法线的转换 ----
 fn face_normal_from_index(f: u32) -> vec3<f32> {
   if (f == 0u) { return vec3<f32>(-1.0, 0.0, 0.0); }
   if (f == 1u) { return vec3<f32>( 1.0, 0.0, 0.0); }
@@ -67,15 +58,6 @@ fn face_normal_from_index(f: u32) -> vec3<f32> {
   if (f == 4u) { return vec3<f32>(0.0, 0.0, -1.0); }
   if (f == 5u) { return vec3<f32>(0.0, 0.0,  1.0); }
   return vec3<f32>(0.0);
-}
-fn face_color_from_index(f: u32) -> vec3<f32> {
-  if (f == 0u) { return vec3<f32>(1.0, 0.2, 0.2); }
-  if (f == 1u) { return vec3<f32>(0.2, 1.0, 0.2); }
-  if (f == 2u) { return vec3<f32>(0.2, 0.2, 1.0); }
-  if (f == 3u) { return vec3<f32>(1.0, 1.0, 0.2); }
-  if (f == 4u) { return vec3<f32>(0.2, 1.0, 1.0); }
-  if (f == 5u) { return vec3<f32>(1.0, 0.2, 1.0); }
-  return vec3<f32>(1.0);
 }
 
 // ---- sRGB → linear 转换（palette/sky 均以 sRGB u8/255 存储，光照前必须转 linear） ----
@@ -106,10 +88,6 @@ fn srgb_word_to_linear(w: u32) -> vec3<f32> {
     f32((w >> 16u) & 0xFFu),
   ) / 255.0;
   return srgb_to_linear(srgb);
-}
-
-fn palette_albedo(palette_base: u32, pal: u32) -> vec3<f32> {
-  return srgb_word_to_linear(b_palette[palette_base + pal * 2u]);
 }
 
 /// palette 条目的 flags 字节（word1 bit16..23，`flags << 16` 同布局）。
@@ -247,10 +225,9 @@ struct MaterialParams {
 /// **法线轴分量**：三个轴一起 `floor + 0.5`。UV 只用两个切向轴（见 `triplanar_sample`），
 /// 被丢掉的那个分量量化与否都不进 UV ⇒ 与"只量化两个切向轴"逐位等价（任务口径里的"法线轴不用管"）。
 ///
-/// **平凡变体逐位不变（取证）**：本函数的两个调用点（`triplanar_sample` / `pbr_mip_lod`）都只在
-/// `fetch_material_asset` 的"有贴图"分支里（`fused != MATERIAL_SLOT_NONE`）被调用；
-/// 平凡变体在 `fetch_material` 里走**参数内联**那条 `return`，从不触碰贴图路径 ⇒ 它的 `MaterialParams`
-/// 与本次改动前逐位相同（`material_ior` 同样不采样贴图）。
+/// **平凡变体不经过这里**：调用点只有 `fetch_material_asset` 的"有贴图"分支（`fused != MATERIAL_SLOT_NONE`）
+/// —— 量化一次、结果同时喂给 `triplanar_sample` 与 `pbr_mip_lod`（两侧口径一致）；
+/// 平凡变体在 `fetch_material` 里走**参数内联**那条 `return`，从不触碰贴图路径（`material_ior` 同）。
 fn material_sample_pos(p_world: vec3<f32>) -> vec3<f32> {
   // 编译期常量 ⇒ `MATERIAL_FLAT_SHADING = 0` 时 select 折成恒取 `p_world`（零开销，退回逐像素）。
   return select(p_world, floor(p_world) + vec3<f32>(0.5), MATERIAL_FLAT_SHADING != 0u);
@@ -285,9 +262,9 @@ fn material_sample_pos(p_world: vec3<f32>) -> vec3<f32> {
 ///     而是"贴图不再 8× 过采样"（一个体素面本来就只取 1 个采样点）。
 /// 已知的**既有**近似（MT2-4 就有，本次不改）：足迹只按**距离**算，没有按掠射角 `1/cosθ` 把足迹
 /// 拉长（斜面上足迹是各向异性的）⇒ 掠射面略偏锐；缓解是采样器的 `anisotropy_clamp = 8`（MT2-3）。
-fn pbr_mip_lod(p_world: vec3<f32>) -> f32 {
-  // MT8-1：距离从**体素中心**量（同一个量化器 ⇒ 面内 LOD 恒定，见上面的说明）。
-  let p = material_sample_pos(p_world);
+/// `p` = **已量化的采样点**（= `material_sample_pos(p_world)`，与 `triplanar_sample` 共用同一个点）。
+fn pbr_mip_lod(p: vec3<f32>) -> f32 {
+  // MT8-1：距离从**体素中心**量 ⇒ 同一体素面内 LOD 恒定。
   let dist_voxel = length(p - view_u.cam_pos_voxel.xyz);
   let footprint_m = dist_voxel / MATERIAL_VOXEL_PER_METER * max(view_u.lod.x, 1e-6);
   let texels = footprint_m / MATERIAL_TEX_WORLD_SCALE * f32(textureDimensions(pbr_albedo_rough).x);
@@ -311,19 +288,16 @@ fn triplanar_axis(slot: u32, uv: vec2<f32>, lod: f32) -> TriplanarSample {
 }
 
 /// triplanar 采样（MT3-1 / D3 = B）：按 `|n|` 三轴投影**加权混合**（不是 MT2-4 那个"只取主轴"的简化版）。
-/// `p_world` = **命中点的世界位置**（连续点）—— **MT8-1 起先经 `material_sample_pos` 量化到体素中心**
-/// 再取 UV（`MATERIAL_FLAT_SHADING = 1` 时）：
-///   · 量化后同一体素面内 UV 恒定 ⇒ 三轴取样点、混合权重（权重只由 `n` 决定，本来就逐面恒定）、
-///     LOD（见 `pbr_mip_lod`）全都逐面恒定 ⇒ **albedo/roughness/metallic 一个体素面一个平色**；
-///   · `MATERIAL_FLAT_SHADING = 0` 时退回 MT3 那条逐屏幕像素的连续采样（UV 用连续命中点，
-///     亚体素细节保留、但一个体素面上会铺 1.28 texel/体素的细节 ⇒ MT3 的观感）。
+/// `p` = **已量化的采样点**（= `material_sample_pos(p_world)`）—— 因为量化后同一体素面内 UV 恒定：
+///   · 三轴取样点、混合权重（权重只由 `n` 决定，本来就逐面恒定）、LOD（见 `pbr_mip_lod`）全都逐面恒定
+///     ⇒ **albedo/roughness/metallic 一个体素面一个平色**；
+///   · `MATERIAL_FLAT_SHADING = 0` 时 `material_sample_pos` 折成恒取连续命中点 ⇒ 退回 MT3 那条逐屏幕
+///     像素的连续采样（亚体素细节保留、但一个体素面上会铺 1.28 texel/体素的细节 ⇒ MT3 的观感）。
 /// 量化为什么等价于"只量化两个切向轴"、坐标系前提、平凡变体不受影响：见 `material_sample_pos`。
 /// 三轴共用同一个世界尺度 ⇒ 贴图在三个方向上的 texel 密度一致（不会出现某一轴被拉伸）。
-fn triplanar_sample(slot: u32, p_world: vec3<f32>, n: vec3<f32>, lod: f32) -> TriplanarSample {
+fn triplanar_sample(slot: u32, p: vec3<f32>, n: vec3<f32>, lod: f32) -> TriplanarSample {
   let w = pow(abs(n), vec3<f32>(MATERIAL_TRIPLANAR_SHARPNESS));
   let uv_scale = 1.0 / (MATERIAL_TEX_WORLD_SCALE * MATERIAL_VOXEL_PER_METER);
-  // MT8-1：纹素取值位置的**唯一**量化点（LOD 那边用的是同一个量化器，两面口径一致）。
-  let p = material_sample_pos(p_world);
   let sx = triplanar_axis(slot, p.zy * uv_scale, lod);
   let sy = triplanar_axis(slot, p.xz * uv_scale, lod);
   let sz = triplanar_axis(slot, p.xy * uv_scale, lod);
@@ -373,7 +347,9 @@ fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: v
   var roughness = sc_roughness;
   var metallic = sc_metallic;
   if (fused != MATERIAL_SLOT_NONE) {
-    let ts = triplanar_sample(fused, p_world, n, pbr_mip_lod(p_world));
+    // 采样点只量化一次：`triplanar_sample` 取 UV、`pbr_mip_lod` 量距离，两者共用同一个体素中心。
+    let p = material_sample_pos(p_world);
+    let ts = triplanar_sample(fused, p, n, pbr_mip_lod(p));
     albedo = ts.albedo;
     roughness = ts.roughness;
     metallic = ts.metallic;
@@ -410,7 +386,8 @@ fn fetch_material(palette_base: u32, pal: u32, p_world: vec3<f32>, n: vec3<f32>,
   }
   let w0 = b_palette[palette_base + pal * 2u];
   let w1 = b_palette[palette_base + pal * 2u + 1u];
-  if ((palette_flags(palette_base, pal) & FLAGS_IS_PBR) != 0u) {
+  // flags 字节就在 `w1` 里（bit16..23）⇒ 直接取，不再多读一次 palette（同 `palette_flags`）
+  if (((w1 >> 16u) & 0xFFu & FLAGS_IS_PBR) != 0u) {
     return fetch_material_asset(w1 & 0xFFFFu, w0, w1, p_world, n);
   }
   return MaterialParams(

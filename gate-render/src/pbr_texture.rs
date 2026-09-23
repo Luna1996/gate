@@ -172,7 +172,7 @@ pub fn create_pbr_sampler(device: &RenderDevice) -> Sampler {
 /// | `metal` | `R8Unorm` | r = metalness（线性标量） |
 ///
 /// ⚠️ `albedo_rough` 是 **`Rgba8Unorm` 而不是 `Rgba8UnormSrgb`** ⇒ 采样拿到的 rgb 就是 sRGB 编码值，
-/// **着色侧必须自己 `srgb_to_linear()`**（与 `palette_albedo` 读字节 → `srgb_to_linear` 同一口径，
+/// **着色侧必须自己 `srgb_to_linear()`**（与 `srgb_word_to_linear` 读 palette 字节 → `srgb_to_linear` 同一口径，
 /// 这样平凡材质与 PBR 材质能共用同一个 BRDF 入口，见 PLAN D1 约束 1）。详见 `build_texture_arrays` 的注释。
 ///
 /// **提取进 render world**（MT2-2）：整份资源随 `ExtractResourcePlugin` 拷进 render world，供
@@ -701,7 +701,7 @@ fn build_texture_arrays(
   // **为什么是 `Rgba8Unorm` 而不是 `Rgba8UnormSrgb`**（这一步很容易写错，务必理解）：
   // albedo 的字节是 jpg 里的 **sRGB 编码值**，而 `Rgba8Unorm` 采样**不做任何转换**
   // ⇒ 着色侧拿到的 rgb 就是 sRGB 编码值，再由 shader 里的 `srgb_to_linear()` 转 linear。
-  // 这与 `palette_albedo`（palette 里的 color 也是 sRGB 字节 → 同样 `srgb_to_linear`）**完全同一口径**
+  // 这与 `srgb_word_to_linear`（palette 里的 color 也是 sRGB 字节 → 同样 `srgb_to_linear`）**完全同一口径**
   // ⇒ 平凡材质与 PBR 材质能共用同一个 BRDF 入口（PLAN D1 约束 1：着色公式唯一）。
   // **不在 CPU 侧把 albedo 转成 linear 再存**：8 bit 存 linear 会在暗部起色带（linear 的 8bit 量化
   // 在暗端步长过大），而存 sRGB 编码字节则暗部精度是充足的。
@@ -1017,7 +1017,7 @@ fn log_pbr_debug_channel(ids: &[String]) {
   if v == PBR_DEBUG_ASSET_OFF {
     info!(
       target: "gate",
-      "PBR 调试通道: 关闭（PBR_DEBUG_ASSET = 0xFFFFFFFF）⇒ 不透明面走 palette 纯色（`palette_albedo`）；\
+      "PBR 调试通道: 关闭（PBR_DEBUG_ASSET = 0xFFFFFFFF）⇒ 不透明面走 palette 纯色（`srgb_word_to_linear`）；\
        要一键看贴图：把 main.wesl 顶部 `const PBR_DEBUG_ASSET: u32` 改成槽号再重启（0 = 字典序第一个）",
     );
   } else {

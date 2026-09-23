@@ -41,7 +41,7 @@ import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_
 /// 本写法按它后面的不透明遮挡给值 —— 起点已沿法线外推半个体素 + eps，正常路径不会走到那里。
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
   var tint = vec3<f32>(1.0);
-  let h = world_trace_medium(make_grid(0u), origin, sun_dir, 8192.0, false, &tint);
+  let h = world_trace_medium(make_grid(0u), origin, sun_dir, GI_T_MAX, false, &tint);
   let through = (tint.r + tint.g + tint.b) / 3.0;
   // 段内没有不透明遮挡 ⇒ 只有介质的乘性透过（无介质时恒 1.0）。
   if (!h.hit) { return through; }
