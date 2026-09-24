@@ -68,7 +68,7 @@ const GLASS_REFL_AMBIENT: f32 = 0.15;
 //
 // ---- MT4-5（反射链：镜子里的镜子）----
 // `light_u.g.refl_nest`（菜单「渲染/反射/嵌套层级」，0 / 1 / 2 / 4）= 最多再嵌几级。实现是
-// `dda_main` 里那个 `for (lvl = 0; lvl <= nest; ++lvl)` 循环，成本闸门与画风约束写在循环上方那段注释里。
+// `refl_env_chain` 里那个 `for (lvl = 0; lvl <= nest; ++lvl)` 循环，成本闸门与画风约束写在循环上方那段注释里。
 // **`0` 就是本文件此前唯一的行为**（反射命中点只做完整着色、不再反射）。
 //
 // ---- MT8-3（反射缓存）已按实测**整体删除**（历史记录，别再捡回来）----
@@ -419,14 +419,22 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
   var chain_org = r_org;
   var chain_dir = rdir;
   for (var lvl = 0u; lvl <= nest; lvl = lvl + 1u) {
-    let h = world_raycast(make_grid(0u), chain_org, chain_dir,
-                          frustum_length, world_cfg_full(0.0, 3u));
+    // WHY: 反射射线必须**穿透介质**（`stop_on_air = false`）—— 用不透明 DDA 时玻璃在镜中是一块
+    // 平色不透明面（既不透明也不染色），而"隔着一层玻璃看镜子"时镜面自己的反射射线会被前方玻璃
+    // 当成墙体挡住 ⇒ 镜子照出一片玻璃的平色。两种摆法都因此看不到效果。
+    // 逐级累积的 `r_tint` = 这条反射射线沿途介质段的乘性吸收（与主 pass `col * through + refl`
+    // 同一个结构）；每级独立起算，不跨级复用。
+    // 已知简化：玻璃**表面自身**的界面反射与 in-scatter 不进镜像（这一级只取"透过它看到的东西"）。
+    var r_tint = vec3<f32>(1.0);
+    let h = world_trace_medium(make_grid(0u), chain_org, chain_dir,
+                               frustum_length, false, &r_tint);
     if (!h.hit) {
       // 逃逸到天空 ⇒ 反射内容就是天空，链条结束。**档 ≥2** 走 `sky_primary`（方向性天空 +
       // 太阳盘/光晕：镜子里看得见太阳，与主 pass 的 miss 同一个口径）；**档 1** 走 `sky_rgb()`
       // （纯色天光，全工程唯一的 miss 辐亮度）。两侧都只算 ALU、不发线。
       refl_env = refl_env
-               + chain_w * select(sky_rgb(), sky_primary(chain_dir, sun_dir, sun_c), tier >= 2u);
+               + chain_w * r_tint
+                 * select(sky_rgb(), sky_primary(chain_dir, sun_dir, sun_c), tier >= 2u);
       break;
     }
     // 命中点**必须**经 `fetch_material` + `brdf_reflected`（硬约束 1：不许手写第二套近似
@@ -472,7 +480,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
       // 由下一级的真实反射取代 ⇒ 先扣掉，否则镜面环境项又被算一遍。
       h_local = h_local - hf0 * hamb;
     }
-    refl_env = refl_env + chain_w * h_local;
+    refl_env = refl_env + chain_w * r_tint * h_local;
     if (!h_continue) { break; }
     // ---- 沿本级继续反射：方向 / 种子 / 起点 ----
     // 方向与主表面**同一个构造**（`reflect(-v, n)`，`v` 逐面）。抖动种子把**层级**混进按面种子里
