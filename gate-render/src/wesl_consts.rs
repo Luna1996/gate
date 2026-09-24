@@ -71,6 +71,26 @@ pub struct MaterialConsts {
 /// [`MaterialConsts`] 需要的常量名（缺一即 fail fast）。
 const MATERIAL_REQUIRED: &[&str] = &["MATERIAL_ASSET_SLOTS", "MATERIAL_TEX_SLOTS"];
 
+/// trace.wesl 两侧共用的开关 / 节流常量（权威值在 WESL `trace.wesl`）。
+/// **独立于 [`GiConsts`] / [`MaterialConsts`]**：各自的解析互不牵连。
+///
+/// 这类常量**只能有单一来源**：Rust 侧不再各抄一份 `bool`（那种"两侧须同时改"的约定一旦漏改，
+/// 一侧静默失效）；开关的权威值就在 shader 里，Rust 读它来决定要不要注册回读。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceConsts {
+  /// 叶级 LOD 诊断计数开关（`LOD_DIAG`）：非 0 ⇒ Rust 注册 `report_lod_diag` 回读。
+  pub lod_diag: u32,
+  /// M4 请求通道开关（`REQ_ENABLE`）：非 0 ⇒ Rust 注册 `report_lod_requests` 回读。
+  pub req_enable: u32,
+  /// 请求采样率倒数（`REQ_SAMPLE`）：约每这么多条射线发一条请求。
+  pub req_sample: u32,
+  /// 每条射线最多记几条请求（`REQ_PER_RAY_MAX`）。
+  pub req_per_ray_max: u32,
+}
+
+/// [`TraceConsts`] 需要的常量名（缺一即 fail fast）。
+const TRACE_REQUIRED: &[&str] = &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX"];
+
 // MT8-3 的 `ReflConsts` / `refl_consts()` / `REFL_ENTRY_BYTES` 已随反射缓存一起删除（实测负优化）。
 // 这里只保留**通用**解析器（`parse_package_u32_consts` / `parse_u32_consts_in_source`），
 // GI 与材质两组常量仍在用；`pbr_texture.rs` 也直接用后者抽 `.wesl` 里的字面量。
@@ -87,6 +107,13 @@ pub fn gi_consts() -> &'static GiConsts {
 pub fn material_consts() -> &'static MaterialConsts {
   static CONSTS: OnceLock<MaterialConsts> = OnceLock::new();
   CONSTS.get_or_init(MaterialConsts::load)
+}
+
+/// 解析 WESL 包里的 trace 开关 / 节流常量（首次读盘，之后走 `OnceLock`）。
+/// 失败（文件读不到 / 常量缺失 / 不是字面量）→ `error!` + `panic!`；与 [`gi_consts`] / [`material_consts`] 相互独立。
+pub fn trace_consts() -> &'static TraceConsts {
+  static CONSTS: OnceLock<TraceConsts> = OnceLock::new();
+  CONSTS.get_or_init(TraceConsts::load)
 }
 
 impl GiConsts {
@@ -234,6 +261,50 @@ impl MaterialConsts {
       out.material_asset_slots,
       (out.material_asset_slots as u64 * asset_bytes as u64) / 1024,
       out.material_tex_slots,
+    );
+    out
+  }
+}
+
+impl TraceConsts {
+  fn load() -> Self {
+    let dir = dda_wesl_dir();
+    let values = parse_package_u32_consts(&dir);
+    let missing: Vec<&str> =
+      TRACE_REQUIRED.iter().copied().filter(|name| !values.contains_key(*name)).collect();
+    if !missing.is_empty() {
+      let msg = format!(
+        "WESL trace 跨端常量缺失（{}）：{:?}\n\
+         —— 权威值只写在 .wesl 里，Rust 从源码解析；请检查 voxel_raytrace/trace.wesl，\
+         并确保它们写成 `const NAME: u32 = <字面量>u;` 形式。",
+        dir.display(),
+        missing
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    let get = |name: &str| -> u32 { values[name] };
+    let out = TraceConsts {
+      lod_diag: get("LOD_DIAG"),
+      req_enable: get("REQ_ENABLE"),
+      req_sample: get("REQ_SAMPLE"),
+      req_per_ray_max: get("REQ_PER_RAY_MAX"),
+    };
+
+    // 采样率是素数/取模的分母、每条射线上限是条目数上限：两者为 0 会让请求通道静默失效。
+    if out.req_sample < 1 || out.req_per_ray_max < 1 {
+      let msg = format!("请求通道节流常量非法（`%REQ_SAMPLE` 与 `<REQ_PER_RAY_MAX` 都要 ≥ 1）：{out:?}");
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    info!(
+      target: "gate",
+      "WESL 跨端常量（源 {}）：LOD 诊断 {}；ray-guided 请求 {}（采样 1/{}/条射线、每条 ≤ {} 条）",
+      dir.display(),
+      if out.lod_diag != 0 { "开" } else { "关" },
+      if out.req_enable != 0 { "开" } else { "关" },
+      out.req_sample,
+      out.req_per_ray_max,
     );
     out
   }

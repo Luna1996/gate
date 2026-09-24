@@ -39,6 +39,14 @@ pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 /// 「世界」页「数据转储」按钮的节点路径（把 CPU/GPU 两份体素数据写进 `logs/`，见
 /// `gate_render::VoxelDumpRequest`）
 pub const WORLD_DUMP_PATH: &str = "game/world/dump";
+/// 「世界」页**流式加载**控件的节点路径（只对流式世界有效，写 `crate::infinite_cubes::Streaming`）
+const WORLD_STREAM_PAUSE_PATH: &str = "game/world/stream_pause";
+const WORLD_LOAD_RADIUS_PATH: &str = "game/world/load_radius";
+const WORLD_UNLOAD_RADIUS_PATH: &str = "game/world/unload_radius";
+const WORLD_COARSE_RADIUS_PATH: &str = "game/world/coarse_radius";
+const WORLD_COARSE_HEIGHT_PATH: &str = "game/world/coarse_height";
+const WORLD_MOUNT_WORDS_PATH: &str = "game/world/mount_words";
+const WORLD_MOUNT_COUNT_PATH: &str = "game/world/mount_count";
 /// 「编辑/材质」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
 pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/mat/pbr_asset";
 /// 「编辑/笔触」页「偏移距离」输入框的节点路径：改「笔触大小」时要把自动值写回这个控件
@@ -689,6 +697,7 @@ fn register_callbacks(world: &mut World) {
     |ev: On<MenuActionEvent>,
      mut scene: ResMut<gate_render::VoxelScene>,
      mut dump: ResMut<gate_render::VoxelDumpRequest>,
+     mut stream: ResMut<crate::infinite_cubes::Streaming>,
      pbr: Option<Res<gate_render::PbrTextureSet>>,
      cam: Option<Res<gate_render::DdaCameraConfig>>,
      q_menu: Query<&gate_ui::DebugMenu>| {
@@ -718,6 +727,23 @@ fn register_callbacks(world: &mut World) {
         (WORLD_DUMP_PATH, MenuAction::Button(_)) => {
           dump.arm();
           info!("数据转储 → 请求");
+        }
+        // 流式加载（`crate::infinite_cubes::Streaming`）：直接写资源，下一帧 `stream_chunks` 就用新值。
+        // 暂停 = 冻结整个流式环（连窗口都不跟）⇒ 相机可以飞出去看加载边界。
+        (WORLD_STREAM_PAUSE_PATH, MenuAction::Toggle(on)) => {
+          stream.paused = *on;
+          info!("流式加载 → {}", if *on { "暂停" } else { "继续" });
+        }
+        (WORLD_LOAD_RADIUS_PATH, MenuAction::Value(v)) => stream.load_radius = v.round() as i32,
+        (WORLD_UNLOAD_RADIUS_PATH, MenuAction::Value(v)) => stream.unload_radius = v.round() as i32,
+        (WORLD_COARSE_RADIUS_PATH, MenuAction::Value(v)) => stream.coarse_radius = v.round() as i32,
+        (WORLD_COARSE_HEIGHT_PATH, MenuAction::Value(v)) => stream.coarse_height = v.round() as i32,
+        // 滑杆单位是千字/帧（见 `debug_menu.toml`），资源里存字数
+        (WORLD_MOUNT_WORDS_PATH, MenuAction::Value(v)) => {
+          stream.mount_words = (v.round().max(0.0) as usize) * 1024;
+        }
+        (WORLD_MOUNT_COUNT_PATH, MenuAction::Value(v)) => {
+          stream.mount_count = v.round().max(1.0) as usize;
         }
         _ => {}
       }

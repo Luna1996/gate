@@ -28,22 +28,20 @@ pub const DDA_SKY_ONLY: bool = false;
 pub const DDA_MAKEGRID_ONLY: bool = false;
 /// 八叉树远场早停（LOD）
 pub const DDA_LOD: bool = true;
-/// 叶级 LOD 诊断（M0）：读回 `trace.wesl::LOD_DIAG` 写的计数器，每 `REPORT_PERIOD_SECS` 落一行
-/// `DIAG[...]` 日志（见 `crate::profiler::report_lod_diag`）。
-/// CONSTRAINT: **须与 `assets/shaders/voxel_raytrace/trace.wesl::LOD_DIAG` 同步改** ——
-/// 只开一侧会得到"一片空转"（shader 不写）或"永远 0"（没人读）。
-pub const LOD_DIAG: bool = false;
-/// 诊断计数器字数（`lod_diag`）：叶入口 / 叶级早停 / 非法早停。须与 `trace.wesl::DIAG_*` 对齐。
+/// 叶级 LOD 诊断计数器的字数（`lod_diag`：叶入口 / 叶级早停 / 非法早停）。须与
+/// `trace.wesl::DIAG_*` 的槽位对齐。
+///
+/// 开关不在这里：权威值是 `trace.wesl::LOD_DIAG`，Rust 经 [`crate::wesl_consts::trace_consts`]
+/// 解析同一份源码（单一来源，见该函数的说明）。
 pub const LOD_DIAG_WORDS: usize = 3;
 /// **M4 ray-guided 请求通道**（`docs/editable-gigavoxel.md` §4 M4）：shader 把"射线想要细节、而那个
 /// chunk 在 GPU 上没有树块"记成一条请求（chunk 相对窗口下标 + 所需档位 + 射线类型），Rust 侧按
 /// `REPORT_PERIOD_SECS` 回读 + 合并排序后驱动流式加载。
 ///
-/// CONSTRAINT: **须与 `assets/shaders/voxel_raytrace/trace.wesl::REQ_ENABLE` 同步改**（与 `LOD_DIAG`
-/// 同款两侧约定）：只开一侧会得到"一片空转"或"永远 0"。关闭时 shader 整段被折叠（零开销），
-/// 读回侧也不注册。
-pub const RAY_GUIDED_REQUESTS: bool = true;
-/// 请求环缓冲槽数：新的覆盖旧的 ⇒ 回读只看到最近 [`REQ_CAP`] 条（溢出另有计数）。
+/// 请求环缓冲槽数：新的覆盖旧的 ⇒ 回读只看到最近这么多条（溢出另有计数）。
+/// **shader 侧不写死容量**：`trace.wesl::req_push` 用 `arrayLength(&lod_req)` 取绑定的实际长度 ⇒
+/// 这里就是唯一来源。开关同样不在这里（权威值是 `trace.wesl::REQ_ENABLE`，经
+/// [`crate::wesl_consts::trace_consts`] 解析）。
 pub const REQ_CAP: usize = 1024;
 /// 请求缓冲字数：`[0]` = 累计条数（只增，CPU 读差值配对 `REQ_CAP` 取模）、`[1]` = 溢出计数、
 /// 其后 [`REQ_CAP`] 个请求字。

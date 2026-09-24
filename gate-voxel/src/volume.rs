@@ -263,6 +263,14 @@ impl VolumeGrid {
     self.chunks.remove(&cc).is_some()
   }
 
+  /// 取走一个 chunk 的树（同 [`Self::unmount_chunk`] 的清理，但把树**还给调用方**）。
+  /// M5 的生产管线用它把 worker 线程的产出搬出来：整棵树 clone 一遍不值当，直接搬所有权。
+  pub fn take_chunk(&mut self, cc: ChunkCoord) -> Option<ChunkTree> {
+    self.edit_aabbs.remove(&cc);
+    self.comp_layer.remove(&cc);
+    self.chunks.remove(&cc)
+  }
+
   /// 设置/清除**流式窗口提示**（chunk 原点 + 各轴跨度）：流式世界用它把窗口钉在相机周围，
   /// 否则 `compute_window` 只会按"当前已加载内容"算 ⇒ 一飞就出窗口（见 `docs/editable-gigavoxel.md` §9）。
   pub fn set_stream_window(&mut self, window: Option<(IVec3, IVec3)>) {

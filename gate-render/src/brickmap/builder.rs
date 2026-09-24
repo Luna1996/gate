@@ -1,4 +1,4 @@
-//! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
+﻿//! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
 //! [`BrickMapBuilder`]（单 volume）：**每个 chunk 一个树块**（块首 = 根节点地址），块内是节点
 //! arena —— 全量构建按 ChunkCoord 排序并行 `serialize_with_layout()` 后顺序安装；增量更新按
 //! [`TreeDirty`] **只重写动过的节点**（字节没变就不写不标脏），节点在块内原地增删。
@@ -22,7 +22,11 @@ use super::wire::{
   TREE_BASE,
 };
 
-/// 稠密 chunk 窗口线性位置（stride = CHUNK_INDEX_CAP，与 WGSL `trace.wesl` 的窗口寻址同构）；窗口外 None
+/// 稠密 chunk 窗口线性位置（stride = `CHUNK_INDEX_CAP`，与 WGSL `trace.wesl` 的窗口寻址同构）；窗口外 None。
+///
+/// **M6**：窗口是**跟着相机走**的（`infinite_cubes` 每帧把它钉在相机为中心的 64³ chunk 上），
+/// 移动时靠 [`BrickMapBuilder::set_window`] **平移索引区**（条目存的是块相对地址、与相位无关 ⇒ 只是搬家）
+/// —— 于是"走得再远"也不需要丢掉 CPU chunk / 重传树块。
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   let rel = chunk - origin;
   if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dims).any() {
@@ -461,6 +465,55 @@ impl BrickMapBuilder {
     chunk_index_pos(self.origin, self.dims, coord.0).expect("窗口内 chunk")
   }
 
+  /// 本 volume 当前的窗口（供"窗口是否移动了"的判断，见 [`VolumesBuilder::sync_windows`]）
+  pub fn window(&self) -> (IVec3, IVec3) {
+    (self.origin, self.dims)
+  }
+
+  /// **M6 · 窗口平移**：把窗口钉到 `(origin, dims)`（流式世界每帧钉在相机中心）。相位一变，
+  /// 所有 chunk 的槽位跟着变，但**窗口条目存的是块相对地址**（`base + 1`，与相位无关）⇒ 只需把
+  /// 条目**搬家**：不重传任何树块、不动 CPU 侧内容、不重新序列化。
+  ///
+  /// 代价 = 索引区（64³ chunk = 1 MB）整体标脏重写 —— 这就是"走得再远也不会整块重定"的实现。
+  fn set_window(&mut self, origin: IVec3, dims: IVec3) {
+    if self.origin == origin && self.dims == dims {
+      return;
+    }
+    let old = (self.origin, self.dims);
+    // **两阶段**：先把所有条目读出来（掉出窗口的丢弃），再把旧索引区整体清零，最后按新槽位写回。
+    // CONSTRAINT: **不能边读边搬** —— 平移是**循环位移**，某个 chunk 的新槽位可能正是另一个 chunk 的
+    // 旧槽位；边搬会互相覆盖（表现为画面里出现"别处 chunk 的几何"这种错位巨块）。
+    let mut keep: Vec<(usize, u32)> = Vec::with_capacity(self.chunks.len());
+    let mut dropped = 0usize;
+    for c in self.chunks.keys().copied().collect::<Vec<_>>() {
+      let Some(a) = chunk_index_pos(old.0, old.1, c.0) else { continue };
+      let entry = self.buffers.b_struct[a];
+      match chunk_index_pos(origin, dims, c.0) {
+        Some(b) => keep.push((b, entry)),
+        None => dropped += 1,
+      }
+    }
+    // 索引区是**定长**的 `TREE_BASE` 字（64³ 槽，与窗口大小无关；窗口只是它被使用的子盒）
+    self.buffers.b_struct[..TREE_BASE].fill(0);
+    for (b, entry) in keep {
+      self.buffers.b_struct[b] = entry;
+    }
+    self.origin = origin;
+    self.dims = dims;
+    {
+      let g = &mut self.buffers.globals;
+      g.index_origin_x = origin.x;
+      g.index_origin_y = origin.y;
+      g.index_origin_z = origin.z;
+      g.index_dims_x = dims.x as u32;
+      g.index_dims_y = dims.y as u32;
+      g.index_dims_z = dims.z as u32;
+    }
+    // 整个索引区都要重传（旧的要让 GPU 忘掉、新的要写上）
+    self.mark_struct_words(0, TREE_BASE);
+    bevy::log::debug!("WINDOW 平移 {} → {origin} dims {dims}（掉了 {dropped} 个出门的）", old.0);
+  }
+
   /// 从全局空闲段取一个 ≥`cap` 字的块（找不到就追加到高水位）。
   fn alloc_block(&mut self, cap: usize) -> usize {
     match self.free.alloc(cap) {
@@ -817,6 +870,21 @@ impl VolumesBuilder {
     self.builders[volume_idx].update_chunk(&volumes.all()[volume_idx], coord, dirty, allow_compact)
   }
 
+  /// 某个 volume 当前的窗口（`None` = 该 volume 还没建起来）
+  pub fn window_of(&self, volume_idx: usize) -> Option<(IVec3, IVec3)> {
+    self.builders.get(volume_idx).map(BrickMapBuilder::window)
+  }
+
+  /// **M6**：把每个 volume 的窗口对齐到 `grid.stream_window()`（流式世界每帧钉在相机中心）。
+  /// 相位变了就**平移索引区**（[`BrickMapBuilder::set_window`]）—— 只搬条目，不重传树块。
+  pub fn sync_windows(&mut self, volumes: &Volumes) {
+    for (i, g) in volumes.all().iter().enumerate() {
+      if let Some((o, d)) = g.stream_window() {
+        self.builders[i].set_window(o, d);
+      }
+    }
+  }
+
   /// 标记全量重建（下帧 snapshot 走 full 路径）
   pub fn force_full(&mut self) {
     self.force_full = true;
@@ -993,12 +1061,14 @@ impl VolumesBuilder {
 
 /// 窗口计算：原点 = 最小非空 chunk - 1（±1 chunk 余量），跨度 = max - min + 3，封顶 64³（CHUNK_INDEX_CAP）。
 fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
-  // 流式世界的窗口由 `VolumeGrid::set_stream_window` 钉住：只按"当前已加载内容"算的话，
-  // 相机一飞出已加载区就无法再装新 chunk（窗口是 `b_struct` 索引区的定义域）。
-  let (mut min, mut max, mut any) = match grid.stream_window() {
-    Some((o, d)) => (o, o + d - IVec3::ONE, true),
-    None => (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN), false),
-  };
+  // 流式世界（`infinite_cubes`）：窗口由 `VolumeGrid::set_stream_window` **钉死** —— 它由
+  // `infinite_cubes::stream_chunks` 每帧钉在"相机为中心"上（M6：走得再远也只是平移索引区，见
+  // `BrickMapBuilder::set_window`）。常驻集是相机周围的环（半径 ≪ 半窗宽）⇒ 内容一律在窗口内，
+  // **不按内容扩张**（扩张会让 origin 随内容漂移，平移就无从谈起）。
+  if let Some((o, d)) = grid.stream_window() {
+    return (o, d, 0);
+  }
+  let (mut min, mut max, mut any) = (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN), false);
   for c in grid.chunk_coords() {
     if chunk_has_content(grid, c) {
       any = true;
@@ -1021,6 +1091,48 @@ fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// **M6**：窗口平移 —— 条目跟着 chunk **搬家**、树块**原地不动**（"走得再远也不整块重定"的实现）。
+  ///
+  /// 关键用例：两个**相邻** chunk + 窗口**反向**平移 ⇒ 甲的"新槽位"正是乙的"旧槽位"（循环位移）。
+  /// 边读边搬会互相覆盖（画面上出现"别处 chunk 的几何"这种错位巨块）⇒ 必须两阶段。
+  #[test]
+  fn set_window_translates_index_entries() {
+    let mut grid = VolumeGrid::new();
+    let (c, c2) = (ChunkCoord(IVec3::new(4, 0, 0)), ChunkCoord(IVec3::new(5, 0, 0)));
+    for x in 0..8 {
+      for y in 0..8 {
+        grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
+        grid.set_voxel_ivec3(c2.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(2));
+      }
+    }
+    let mut b = build_and_drain(&mut grid);
+    let (o0, d0) = b.window();
+    let pos0 = b.window_word(c);
+    let (entry0, entry1) = (b.buffers().b_struct[pos0], b.buffers().b_struct[pos0 + 1]);
+    assert!(entry0 != 0 && entry1 != 0, "两个 chunk 都该装进窗口");
+    let base = entry0 as usize - 1;
+    let block = b.buffers().b_struct[base..base + 8].to_vec();
+
+    // **反向**平移 1 chunk：甲的新槽位 = 乙的旧槽位（循环位移，naive 边搬必坏）
+    let o1 = o0 - IVec3::new(1, 0, 0);
+    b.set_window(o1, d0);
+    assert_eq!(b.window(), (o1, d0));
+    let pos1 = b.window_word(c);
+    assert_eq!(pos1, pos0 + 1, "前提：正好撞上乙的旧槽位");
+    assert_eq!(b.buffers().b_struct[pos1], entry0, "甲的条目搬到（原乙的）新槽位");
+    assert_eq!(b.buffers().b_struct[pos1 + 1], entry1, "乙的条目也搬对了（没被甲覆盖）");
+    assert_eq!(b.buffers().b_struct[pos0], 0, "腾出来的槽位清零");
+    assert_eq!(&b.buffers().b_struct[base..base + 8], &block[..], "树块原地不动");
+
+    // 再平移 3 chunk ⇒ 甲掉出窗口：只清条目（GPU 视作空气），**CPU 侧内容保留**
+    let o2 = o1 + IVec3::new(3, 0, 0);
+    assert!(chunk_index_pos(o2, d0, c.0).is_none(), "前提：甲已在窗口外");
+    b.set_window(o2, d0);
+    assert_eq!(b.buffers().b_struct[pos1], 0, "掉出窗口的条目清空");
+    assert!(grid.chunk(c).is_some(), "CPU 侧 chunk 不受窗口平移影响");
+    assert_ne!(b.window_word(c2), 0, "仍在窗口内的 chunk 条目照旧跟着走");
+  }
 
   /// 空闲段：first-fit、相邻合并（前向 / 后向 / 双向）、跨洞不合并
   #[test]

@@ -53,7 +53,9 @@ pub fn build_dda_shader(app: &mut App) {
     }
   };
 
+  // 跨端常量 fail fast：编译通过但解析不到常量（写成派生式 / 改名）在启动时就该炸，而不是运行期静默失效
   crate::wesl_consts::gi_consts();
+  crate::wesl_consts::trace_consts();
   let handle = app
     .world_mut()
     .resource_mut::<Assets<Shader>>()

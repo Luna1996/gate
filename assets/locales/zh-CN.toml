@@ -272,6 +272,48 @@ GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 "menu.game.world.model" = "模型"
 "menu.game.world.reload" = "重载世界"
 "menu.game.world.dump" = "数据转储"
+"menu.game.world.stream_pause" = "暂停流式"
+"menu.game.world.stream_pause.tip" = """
+**开** ⇒ 流式那一整套不跑：不跟窗、不派发、不挂载、不卸载。
+
+已加载的那一圈**冻结在原地** ⇒ 相机可以直接飞出去看"世界到此为止"的加载边界；关掉即从当前相机位置重新开始加载。
+"""
+"menu.game.world.load_radius" = "加载半径"
+"menu.game.world.load_radius.tip" = """
+全分辨率（`4³` = `8cm`）的加载半径，切比雪夫距离，单位 chunk（`5.12m`）。
+
+全分辨率树约 `278KB`/chunk ⇒ 半径是**内存的硬杠杆**：`2` ≈ `35MB`、`3` ≈ `95MB`。
+"""
+"menu.game.world.unload_radius" = "卸载半径"
+"menu.game.world.unload_radius.tip" = """
+全分辨率的卸载半径（切比雪夫），**须 > 加载半径**：差值就是迟滞带。
+
+差 `1` 够用，且能把常驻集真正限住；差 `2` 会在相机身后留下更大的尾迹。
+"""
+"menu.game.world.coarse_radius" = "粗档半径"
+"menu.game.world.coarse_radius.tip" = """
+粗档（`16³` = `32cm` 量化）的加载半径：**xz 平面**上的切比雪夫距离。
+
+粗档树约 `12KB`/chunk，比全分辨率便宜约 `24` 倍 ⇒ 这一圈是视距的杠杆。
+"""
+"menu.game.world.coarse_height" = "粗档半高"
+"menu.game.world.coarse_height.tip" = """
+粗档的**竖向**半高（chunk）：粗档环在 `xz` 上是圆柱、在 `y` 上是薄板。
+
+头顶与脚下几十米基本没人看 ⇒ 同样的内存换成 `xz` 半径更值。
+"""
+"menu.game.world.mount_words" = "挂载预算"
+"menu.game.world.mount_words.tip" = """
+每帧挂载的字数预算，单位千字/帧（序列化后的字数）。
+
+挂载要主线程装树 + 标脏，后面还排队序列化上传 ⇒ 这是"多快看到新块"的闸门：`256` 千字 ≈ `1MB`/帧 ≈ `0.5ms`/帧。
+"""
+"menu.game.world.mount_count" = "挂载条数"
+"menu.game.world.mount_count.tip" = """
+每帧挂载的**条数**上限：防一大堆极小的树把单帧的记账开销顶爆。
+
+字数预算没花完也最多挂这么多条。
+"""
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
 # 纯文本行的值

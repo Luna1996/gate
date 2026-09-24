@@ -53,6 +53,9 @@ pub struct DdaCameraConfig {
   pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
   pub position_world: Vec3,
+  /// 视线方向（单位向量，含俯仰）。流式加载用它排"视野优先"（M5：需求要按相机真在看的方向排，
+  /// 否则半径启发式会把帧额平均撒到相机身后）。
+  pub forward: Vec3,
 }
 
 impl DdaCameraConfig {
@@ -69,7 +72,7 @@ impl DdaCameraConfig {
     let view = view::look_at_mat4(eye, target, up);
     let view_proj = proj.mul(view);
     let inv_view_proj = view_proj.inverse();
-    Self { view_proj, inv_view_proj, position_world: eye }
+    Self { view_proj, inv_view_proj, position_world: eye, forward: (target - eye).normalize() }
   }
 }
 
@@ -133,7 +136,7 @@ impl DdaCameraConfig {
     let view = view::look_at_mat4(eye, eye + f, Vec3::Y);
     let proj = proj::directx::perspective(fov_y, aspect, near, far);
     let view_proj = proj.mul(view);
-    Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
+    Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye, forward: f }
   }
 
   /// orbit 参数 → `proj::directx::perspective` × `view::look_at_mat4`（fov/aspect/near/far 为显式参数）。
@@ -142,7 +145,12 @@ impl DdaCameraConfig {
     let view = view::look_at_mat4(eye, orbit.target, Vec3::Y);
     let proj = proj::directx::perspective(fov_y, aspect, near, far);
     let view_proj = proj.mul(view);
-    Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye }
+    Self {
+      view_proj,
+      inv_view_proj: view_proj.inverse(),
+      position_world: eye,
+      forward: (orbit.target - eye).normalize_or_zero(),
+    }
   }
 }
 
@@ -736,12 +744,12 @@ pub(crate) fn init_dda_pipelines(
         // ClampToEdge 且无 mip，两者状态要求相反。desc 权威在
         // `pbr_texture::create_pbr_sampler`（占位与真身共用 `GpuBrickMap.pbr_sampler`）。
         sampler(SamplerBindingType::Filtering),
-        // @binding(9)：叶级 LOD 诊断计数器（M0；`consts::LOD_DIAG` 打开时才有写入，其余时候恒 0）。
+        // @binding(9)：叶级 LOD 诊断计数器（M0；`trace.wesl::LOD_DIAG` 打开时才有写入，其余时候恒 0）。
         // 放 BG1 而不是 BG0：BG1 是 dda / beam / gi / 光柱掩码四个**会调 trace** 的 pass 共用的那一份，
         // 而 BG0 有两份（完整版 + GI 瘦版）⇒ 挂这里只需改这一处 layout 与下面那一处 BG1 bind group。
         storage_buffer_sized(false, None),
         // @binding(10)：**M4 ray-guided 请求环缓冲**（read_write —— shader 侧原子追加，
-        // 见 `consts::RAY_GUIDED_REQUESTS` 与 `trace.wesl::req_push`）。
+        // 见 `trace.wesl::{REQ_ENABLE, req_push}`）。
         storage_buffer_sized(false, None),
       ),
     ),
@@ -1338,10 +1346,10 @@ pub(crate) fn prepare_dda_bind_groups(
       // @binding(8)：PBR 专用采样器（MT2-3）——`init_empty_gpu` 建一次、占位与真身共用同一个实例，
       // 不存在"资源未就绪"的状态（采样器与它所采样的纹理无关）。
       &gpu.pbr_sampler,
-      // @binding(9)：叶级 LOD 诊断计数器（M0）：固定 3 字的 buffer，`LOD_DIAG` 关闭时无人写
-      // （shader 侧整段被折叠）⇒ 恒 0，读回侧也整个不注册。
+      // @binding(9)：叶级 LOD 诊断计数器（M0）：固定 3 字的 buffer，`trace.wesl::LOD_DIAG` 关闭时
+      // 无人写（shader 侧整段被折叠）⇒ 恒 0，读回侧也整个不注册。
       gpu.lod_diag.as_entire_binding(),
-      // @binding(10)：M4 请求环缓冲：`RAY_GUIDED_REQUESTS` 关闭时无人写（shader 整段折叠）。
+      // @binding(10)：M4 请求环缓冲：`trace.wesl::REQ_ENABLE` 关闭时无人写（shader 整段折叠）。
       gpu.lod_req.as_entire_binding(),
     )),
   );

@@ -150,16 +150,17 @@ impl Plugin for GateProfilerPlugin {
       bevy::render::renderer::RenderGraph,
       tick_frame_pace.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
     );
-    // 叶级 LOD 诊断读回（M0）：只在 `consts::LOD_DIAG` 打开时注册 ⇒ 关闭时零成本、零日志
-    // （须与 `trace.wesl::LOD_DIAG` 同时打开才有数，见该常量的说明）。
-    if crate::brickmap::consts::LOD_DIAG {
+    // 叶级 LOD 诊断读回（M0）：只在 `trace.wesl::LOD_DIAG` 打开时注册 ⇒ 关闭时零成本、零日志。
+    // 开关从 `.wesl` 源码解析（单一来源），Rust 侧不另抄一份。
+    let trace = crate::wesl_consts::trace_consts();
+    if trace.lod_diag != 0 {
       render_app.add_systems(
         bevy::render::renderer::RenderGraph,
         report_lod_diag.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
     }
-    // M4 ray-guided 请求读回：同样只在开关打开时注册（须与 `trace.wesl::REQ_ENABLE` 同时打开）。
-    if crate::brickmap::consts::RAY_GUIDED_REQUESTS {
+    // M4 ray-guided 请求读回：同样只看 `trace.wesl::REQ_ENABLE` 这一个开关。
+    if trace.req_enable != 0 {
       render_app.add_systems(
         bevy::render::renderer::RenderGraph,
         report_lod_requests.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
@@ -342,7 +343,7 @@ pub struct LodRequest {
 /// 跨世界手法与 [`crate::brickmap::upload::UploadCpuSampleChannel`] 同一套：`ExtractResource` 只搬
 /// "变化过的资源"，而这条通道每 `REPORT_PERIOD_SECS` 换一批 ⇒ 用 `Arc<Mutex<..>>` 两个世界共享同一份。
 ///
-/// 空表 = 没有需求（`consts::RAY_GUIDED_REQUESTS` 关着，或这一窗口没人看缺块）⇒ 消费端退回纯半径启发式。
+/// 空表 = 没有需求（`trace.wesl::REQ_ENABLE` 关着，或这一窗口没人看缺块）⇒ 消费端退回纯半径启发式。
 #[derive(Resource, Clone, Default)]
 pub struct LodRequestFeed(pub Arc<std::sync::Mutex<Vec<LodRequest>>>);
 
@@ -356,7 +357,7 @@ fn req_rel(key: u32) -> IVec3 {
 /// chunk 数 → 最热的几个 → 溢出计数）。
 ///
 /// 与 [`report_lod_diag`] 同一取舍（自建 encoder + `map_buffer` + `poll` 等待）与同一注册条件
-/// （`consts::RAY_GUIDED_REQUESTS`；须与 shader 侧 `trace.wesl::REQ_ENABLE` 同步开，否则永远没有请求）。
+/// （`trace.wesl::REQ_ENABLE` 非 0；Rust 经 [`crate::wesl_consts::trace_consts`] 读同一份源码）。
 ///
 /// 与诊断计数器的差别：那是累积量（只加不清）⇒ 读差值；这里是**环缓冲** ⇒ 差值只用来算"本窗口新增
 /// 了几条"，字面值本身要解码（见 `trace.wesl::req_push`），且只解释**最近**那批（跨窗口累积超过容量
@@ -459,5 +460,9 @@ fn report_lod_requests(
     .map(|r| format!("({},{},{})l{}×{}", r.chunk.x, r.chunk.y, r.chunk.z, r.level, r.votes))
     .collect();
   set_feed(merged);
-  info!("REQ[新 {new_reqs} 条 → {} chunk；最热 {}；溢出 {new_over}]", top.len(), shown.join(" "));
+  info!(
+    "REQ[{} chunk（最热 {}）；本窗口 {new_reqs} 条、环满溢出 {new_over}]",
+    top.len(),
+    shown.join(" ")
+  );
 }

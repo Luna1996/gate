@@ -41,3 +41,11 @@ fn wesl_package_compiles_and_validates() {
   .validate(&module)
   .expect("WGSL 校验失败");
 }
+
+/// 跨端常量（`wesl_consts`）能从**同一份源码**解析出来：Rust 侧不留副本，解析不到即启动 panic
+/// ⇒ 在测试里先炸，别等到运行期。覆盖 `gi/` 与 `trace.wesl` 两组（缺一个即 panic）。
+#[test]
+fn cross_language_consts_parse_from_wesl() {
+  gate_render::wesl_consts::gi_consts();
+  gate_render::wesl_consts::trace_consts();
+}

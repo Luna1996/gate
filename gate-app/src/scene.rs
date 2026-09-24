@@ -254,13 +254,18 @@ fn build_infinite_cubes(
   /// 窗口 = 64³ chunk（`CHUNK_INDEX_CAP` 的上限），钉在起始位置 ⇒ 可飞约 ±150m。
   /// 更远需要 M6 的环形窗口（那时 shader 寻址做模运算，索引区跟着相机转）。
   const WINDOW_CHUNKS: i32 = 32;
-  // 槽 1：柱体的纯白（`PaletteEntry::default` 其余字段 = 不发光 / 不透射 / 非金属 / 非 PBR）
-  grid.palette_mut().set(PaletteId(1), PaletteEntry { color: [255, 255, 255], ..Default::default() });
+  // 槽号方案（M5）：把**全部**可能的材质一次装进调色板 —— 后台 worker 只引用槽号、不再写调色板
+  // （详见 `infinite_cubes::{slot_of, material_slots}`）。
+  let n_pbr = pbr_ids.len();
+  for (id, entry) in infinite_cubes::material_slots(n_pbr) {
+    grid.palette_mut().set(id, entry);
+  }
   let origin = center.div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE)) - IVec3::splat(WINDOW_CHUNKS);
   grid.set_stream_window(Some((origin, IVec3::splat(WINDOW_CHUNKS * 2))));
   // 起始只铺相机脚下那一块（**整 chunk**，见 `initial_box`），其余由 `stream_chunks` 按需生成
   let (lo, hi) = infinite_cubes::initial_box(center);
-  let voxels_written = infinite_cubes::build_region(grid, lo, hi, pbr_ids) as usize;
+  let voxels_written =
+    infinite_cubes::build_region(grid, lo, hi, n_pbr, gate_voxel::Detail::Full) as usize;
   vox_scene::VoxSceneInfo {
     aabb_min: lo,
     aabb_max: hi,

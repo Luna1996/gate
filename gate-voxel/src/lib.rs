@@ -6,6 +6,7 @@ pub mod chunk_tree;
 pub mod coords;
 pub mod dirty;
 pub mod palette;
+pub mod produce;
 pub mod scene;
 pub mod volume;
 
@@ -20,6 +21,8 @@ pub use chunk_tree::{
 };
 
 pub use dirty::DirtyTracker;
+
+pub use produce::{ChunkProducer, ChunkSource, Detail};
 
 pub use volume::{
   COMP_BRICK_EXTENT, COMP_BRICKS_PER_CHUNK, DirtyEdit, VolumeGrid, VolumeTransform, Volumes,

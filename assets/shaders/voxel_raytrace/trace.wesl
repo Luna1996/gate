@@ -72,7 +72,8 @@ const LEAF_LOD_SCAN_CAP: u32 = 8u;
 
 /// **诊断开关（M0）**：置 `1u` ⇒ 统计叶级 LOD 的覆盖与颜色契约违规，写进 `bindings::lod_diag`。
 /// 编译期常量 ⇒ 置 0 时整段被折叠掉，正常路径零开销（与 `DIAG_DISABLE_MEDIUM_TINT` 同款）。
-/// **必须与 Rust 侧 `consts::LOD_DIAG`（读回开关）同步改**，否则计数器加了没人读、或读了永远是 0。
+/// 这里是**唯一来源**：Rust 侧经 `wesl_consts::trace_consts` 解析同一份源码，按它决定要不要注册回读
+/// （不再各抄一份 `bool`，也就没有"两侧须同时改"的约定）。
 /// 采样闸门 = 叶节点地址 `& 63`：只统计 1/64 的叶入口（全量计数会有 ~10M/帧 的单地址原子加，
 /// 把收益本身吃掉）；分子分母用**同一个**闸门 ⇒ 比值无偏。
 const LOD_DIAG: u32 = 0u;
@@ -92,22 +93,29 @@ fn diag_sampled(addr: u32) -> bool {
 
 /// 请求通道开关：置 `1u` ⇒ 射线撞上"**窗口里有槽位、GPU 上还没有树块**"的 chunk 时记一条请求
 /// （`bindings::lod_req`），Rust 侧回读 + 合并排序后驱动流式加载。
-/// **必须与 Rust 侧 `consts::RAY_GUIDED_REQUESTS` 同步改**（与 `LOD_DIAG` 同款两侧约定）。
+/// 这里是**唯一来源**：Rust 侧经 `wesl_consts::trace_consts` 解析同一份源码，按它决定要不要注册回读。
 /// 编译期常量 ⇒ 置 0 时 `req_push` 整段被折叠，正常路径零开销，也不需要那条 binding 有内容。
 ///
 /// CONSTRAINT（**主射线优先**）：只有主射线会发请求 —— 请求闸门由 `WorldRayQuery::req` 给，
 /// 主 pass 用 `world_cfg_primary`，阴影 / 反射 / GI / 光柱一律用 `world_cfg_full`（req=0）。
 const REQ_ENABLE: u32 = 1u;
-/// 请求环缓冲槽数（= Rust `consts::REQ_CAP`）：满了就覆盖最旧的，另抬 [`REQ_OVERFLOW`]。
-const REQ_CAP: u32 = 1024u;
-/// 缓冲字下标（= Rust `consts::LOD_REQ_WORDS` 的布局）
+/// 请求**采样率倒数**：约每 `REQ_SAMPLE` 条射线只有 1 条发请求。
+/// 请求是"需求的采样"，不是逐像素民意调查 —— 全量会变成每秒数亿次原子写（实测 4.8 亿/窗口），
+/// GPU 全耗在 `lod_req[0]` 这一个字上，帧率崩到个位数 ⇒ 表现为"加载停了"。
+const REQ_SAMPLE: u32 = 16u;
+/// 每条射线最多记几条（一条射线连续穿过很多缺失 chunk 时只记最前面的几条）
+const REQ_PER_RAY_MAX: u32 = 2u;
+/// 缓冲字下标（`[0]` 条数、`[1]` 溢出计数、其后是环）。
+/// **容量不在这里写死**：`req_push` 用 `arrayLength(&lod_req)` 取绑定的实际长度 ⇒ 与 Rust 的
+/// `consts::LOD_REQ_WORDS` **同源**，不会出现两边常量不一致（那会导致越界写 + 解包全垃圾）。
 const REQ_COUNT: u32 = 0u;
 const REQ_OVERFLOW: u32 = 1u;
 const REQ_BASE: u32 = 2u;
 /// 请求字里 chunk 相对窗口下标的每轴位数（窗口 = 64³ chunk ⇒ 6 位）
 const REQ_REL_BITS: u32 = 6u;
-/// 请求字里的"整 chunk 档"（最粗）：这个档位连一个平色都够 ⇒ **不发请求**（缺了也看不见）。
-const REQ_LEVEL_COARSEST: u32 = 3u;
+/// 只报"需要 ≤ 这个档位"的请求（0 = 全分辨率 4³、1 = 16³）：更远的（64³ / 整 chunk 档）连一个平色
+/// 都够 ⇒ 不值得为它加载。
+const REQ_LEVEL_KEEP: u32 = 1u;
 
 /// 该距离"够用的档位"下标：0 = 全分辨率（4³）、1 = 16³、2 = 64³、3 = 整 chunk（256³）。
 /// 阶梯与 Rust `residency::want_level` **同一口径**（`fp ≥ 4/16/64` ⇒ 16³/64³/整 chunk）——
@@ -119,21 +127,31 @@ fn req_level(fp: f32) -> u32 {
   return 0u;
 }
 
+/// 采样判定：拿射线本身做哈希（同一条射线稳定命中同一结论，不闪烁）⇒ 约 `1/REQ_SAMPLE` 的射线发请求。
+/// 用射线而不是像素下标：`trace_grid` 没有像素 id（GI / 光柱 / 玻璃状态机都走它）。
+fn req_sampled(origin: vec3<f32>, dir: vec3<f32>) -> bool {
+  let h = u32(bitcast<i32>(origin.x * 64.0)) ^ (u32(bitcast<i32>(origin.y * 64.0)) << 11u)
+    ^ (u32(bitcast<i32>(origin.z * 64.0)) << 21u) ^ u32(bitcast<i32>(dir.z * 4096.0));
+  return (h % REQ_SAMPLE) == 0u;
+}
+
 /// 记一条请求。`rel` = chunk 相对窗口下标，`level` = [`req_level`] 的下标，`kind` = 0 主射线 / 1 次级
 /// （位留给消费端排序；当前只有主射线会走到这里）。
 ///
-/// 环缓冲追加：`n = atomicAdd([0])` ⇒ 写 `[REQ_BASE + n % REQ_CAP]`；`n ≥ REQ_CAP` 时同时抬
-/// `[1]`（= 这一窗口里"被覆盖过"的条数，读回侧用它判容量够不够）。**不去重、不排序**：那是消费端的事。
+/// 环缓冲追加：`n = atomicAdd([0])` ⇒ 写 `[REQ_BASE + n % cap]`；`n ≥ cap` 时同时抬 `[1]`
+/// （= 被覆盖掉的条数，读回侧用它判容量够不够）。**容量取自绑定的实际长度**（见 `REQ_COUNT` 的说明）。
+/// **不去重、不排序**：那是消费端的事。
 fn req_push(rel: vec3<u32>, level: u32, kind: u32) {
   if (REQ_ENABLE == 0u) { return; }
+  let cap = arrayLength(&lod_req) - REQ_BASE;
   let n = atomicAdd(&lod_req[REQ_COUNT], 1u);
-  if (n >= REQ_CAP) { atomicAdd(&lod_req[REQ_OVERFLOW], 1u); }
+  if (n >= cap) { atomicAdd(&lod_req[REQ_OVERFLOW], 1u); }
   let w = (rel.x & 63u)
     | ((rel.y & 63u) << REQ_REL_BITS)
     | ((rel.z & 63u) << (REQ_REL_BITS * 2u))
     | ((level & 3u) << 18u)
     | ((kind & 1u) << 20u);
-  atomicStore(&lod_req[REQ_BASE + (n % REQ_CAP)], w);
+  atomicStore(&lod_req[REQ_BASE + (n % cap)], w);
 }
 
 /// 叶级 LOD 代表色（M2）：节点 palette word 高 16 位存的就是它 —— 写侧算的是**块内按体素数加权的
@@ -697,6 +715,8 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   let col2 = g.col2;
   let obj_id = g.obj_id;
   let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), obj_id);
+  // M4：本条射线已发出的请求数（见 `REQ_PER_RAY_MAX`）
+  var req_sent: u32 = 0u;
   // ---- 世界 AABB 预剔除（slab 内联）----
   var bx_enter = 0.0;
   var bx_exit = t_cap;
@@ -827,11 +847,15 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
         + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
       let entry = b_struct[index_addr];
       // M4：槽位在窗口里、GPU 上却没有树块 ⇒ 射线本来要的细节缺了（`entry == 0` 在 shader 里与
-      // "这块是空气"同形，故消费端要自己过滤"其实已经加载完的 chunk"）。只报"这个距离还需要细节"的：
-      // 整 chunk 档连一个平色都够 ⇒ 不发（见 `REQ_LEVEL_COARSEST`）。
-      if (entry == 0u && req != 0u) {
+      // "这块是空气"同形，故消费端要自己过滤"其实已经加载完的 chunk"）。
+      // **三道闸门**（不加节流会变成每秒数亿次原子写，GPU 全耗在 `lod_req[0]` 上）：
+      // ① 只要 16³ 或更细的（`REQ_LEVEL_KEEP`）② 采样 `1/REQ_SAMPLE` ③ 每条射线 ≤ `REQ_PER_RAY_MAX`。
+      if (entry == 0u && req != 0u && req_sent < REQ_PER_RAY_MAX && req_sampled(origin, dir)) {
         let lv = req_level(t_enter_c * view_u.lod.x);
-        if (lv < REQ_LEVEL_COARSEST) { req_push(rel_u, lv, 0u); }
+        if (lv <= REQ_LEVEL_KEEP) {
+          req_push(rel_u, lv, 0u);
+          req_sent += 1u;
+        }
       }
       if (entry != 0u) {
         air_chunk = false;

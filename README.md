@@ -54,7 +54,7 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 | **渲染管线** | ✅ 生产可用 | **无 render node**：extract / prepare / dispatch / blit 全部系统级显式调度；`blit.wgsl` 双入口 `fs_main` / `fs_fxaa`（FXAA 3.11 移植）；半分辨率 `RenderScale` + 线性上采样；MSAA 强制关闭 |
 | **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界** |
 | **世界标签** | ✅ 生产可用 | `WorldAnchor`：世界坐标 → 屏幕像素 UI 标签（距离缩放、CJK 字体延迟解析） |
-| **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本。另有**叶级 LOD 诊断计数**（`brickmap::consts::LOD_DIAG`，须与 `trace.wesl::LOD_DIAG` 同开）：每 2 s 一行 `DIAG[leaf_in … lod_stop … % illegal …]` |
+| **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本。另有**叶级 LOD 诊断计数**（开关 = `trace.wesl::LOD_DIAG`，Rust 经 `wesl_consts::trace_consts` 解析同一份源码）：每 2 s 一行 `DIAG[leaf_in … lod_stop … % illegal …]` |
 
 ### 已知限制 / 待办（不阻塞当前开发）
 
@@ -318,8 +318,9 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
    **命中体素内部**出发，第一步就自命中 ⇒ 该项恒为 0，白耗一根射线。
 
 > **跨语言常量的权威在 WESL 源码**：`gate-render/src/wesl_consts.rs` 启动时解析 WESL 包 `gi/`
-> （`screen.wesl` 的 `GI_RES_WORDS` + `consts.wesl` 的 buffer 布局与轮数），Rust 侧不再各留副本
-> （不一致即启动 fail-fast）。改 reservoir 布局 / atrous 轮数请改 `.wesl`。
+> （`screen.wesl` 的 `GI_RES_WORDS` + `consts.wesl` 的 buffer 布局与轮数）与 `trace.wesl` 的开关 /
+> 节流常量（`LOD_DIAG` / `REQ_ENABLE` / `REQ_SAMPLE` / `REQ_PER_RAY_MAX`），Rust 侧不再各留副本
+> （不一致即启动 fail-fast）。改 reservoir 布局 / atrous 轮数 / 请求节流请改 `.wesl`。
 
 > **帧号是精确 u32**：`GiUniform.seq.x`（`vec4<u32>`）承载自增帧号，整数帧逻辑（RNG 种子混入、
 > 像素 hash）只用它 —— 帧号曾以 f32 存在 `params.x`，超过 2^24 后 f32 不能表示连续整数，

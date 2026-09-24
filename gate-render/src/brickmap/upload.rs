@@ -554,7 +554,17 @@ fn extract(
 
   let volumes_ref = &scene.volumes;
 
-  if !dirty_any {
+  // M6：**窗口跟着相机** ⇒ "窗口平移"本身也是一次必须处理的改动（它要重写索引区那 1 MB）。
+  // 它是唯一"没有脏 chunk 也要跑 builder"的理由，故并进提前返回条件。
+  let window_moved = mirror.builder.as_ref().is_some_and(|b| {
+    volumes_ref
+      .all()
+      .iter()
+      .enumerate()
+      .any(|(i, g)| g.stream_window().is_some_and(|(o, d)| b.window_of(i) != Some((o, d))))
+  });
+
+  if !dirty_any && !window_moved {
     return;
   }
   let builder = mirror.builder.get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref));
@@ -571,6 +581,7 @@ fn extract(
         .iter()
         .all(|g| g.dirty.data_dirty_count() == 0 && g.dirty.comp_dirty_count() == 0);
     builder.sync(volumes_ref);
+    builder.sync_windows(volumes_ref);
     for (vol_idx, c, dirty) in pending_data.drain(..) {
       builder.update_chunk(volumes_ref, vol_idx, c, &dirty, quiet);
     }

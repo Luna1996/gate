@@ -663,6 +663,84 @@ id = "dump"
 label = ""
 items = ["menu.game.world.dump"]
 
+# 流式加载参数（`crate::infinite_cubes::Streaming`）：只对流式世界（infinite_cubes）有效，换世界不影响。
+# 开关停下整套流式（不跟窗 / 不派发 / 不挂载 / 不卸载）⇒ 可以飞到加载边界看"世界到此为止"。
+[[items.children.children]]
+kind = "toggle"
+id = "stream_pause"
+label = "menu.game.world.stream_pause"
+checked = false
+tooltip = "menu.game.world.stream_pause.tip"
+
+# 半径单位 = chunk（5.12m）：全分辨率 ≈ 278KB/chunk、粗档 ≈ 12KB/chunk ⇒ 全分辨率半径是内存的硬杠杆
+[[items.children.children]]
+kind = "slider"
+id = "load_radius"
+label = "menu.game.world.load_radius"
+value = 2.0
+min = 0.0
+max = 8.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.world.load_radius.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "unload_radius"
+label = "menu.game.world.unload_radius"
+value = 3.0
+min = 1.0
+max = 12.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.world.unload_radius.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "coarse_radius"
+label = "menu.game.world.coarse_radius"
+value = 8.0
+min = 0.0
+max = 32.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.world.coarse_radius.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "coarse_height"
+label = "menu.game.world.coarse_height"
+value = 6.0
+min = 0.0
+max = 16.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.world.coarse_height.tip"
+
+# 挂载预算：每帧允许挂载的序列化字数（千字/帧）。挂载要主线程装树 + 标脏 ⇒ 它是"多快能看到新块"的闸门
+[[items.children.children]]
+kind = "slider"
+id = "mount_words"
+label = "menu.game.world.mount_words"
+value = 256.0
+min = 16.0
+max = 2048.0
+step = 16.0
+decimals = 0
+tooltip = "menu.game.world.mount_words.tip"
+
+# 每帧挂载条数上限：防"一堆极小树"把单帧的记账开销顶爆
+[[items.children.children]]
+kind = "slider"
+id = "mount_count"
+label = "menu.game.world.mount_count"
+value = 48.0
+min = 1.0
+max = 256.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.world.mount_count.tip"
+
 [[items]]
 kind = "sub_menu"
 id = "ui"
