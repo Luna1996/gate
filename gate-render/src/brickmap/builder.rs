@@ -1233,7 +1233,6 @@ mod tests {
   fn chunk_becomes_empty_then_rebuilds() {
     let (mut grid, _, c1) = two_chunk_grid();
     let mut b = build_and_drain(&mut grid);
-    let hw0 = b.buffers().b_struct.len();
     let origin = c1.0 * CHUNK_SIZE;
     for x in 0..8 {
       for y in 0..8 {
@@ -1242,10 +1241,11 @@ mod tests {
         }
       }
     }
+    // `allow_compact = false`：这里要看"块有没有归还到全局空闲段"，压实会把它清空
     let dirty = take_dirty_of(&mut grid, c1);
-    assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Released);
+    assert_eq!(b.update_chunk(&grid, c1, &dirty, false), ChunkUpdate::Released);
     assert_eq!(b.chunk_base(c1), None, "擦空后窗口条目应清零");
-    assert!(b.buffers().b_struct.len() < hw0, "块应被归还（高水位下降）");
+    assert!(b.buffers().globals.node_free_words > 0, "块应被归还到全局空闲段");
 
     for x in 0..8 {
       for y in 0..8 {

@@ -357,8 +357,8 @@ struct BrushJob {
 
 /// 普通笔触的**分帧执行状态**：显式栈 + 累计统计，可跨帧续做。
 ///
-/// 分帧原因：size=61 的球一笔 ≈33ms（castle.vox 实测），整帧做完整帧必掉。这里把"哪些块还没
-/// 处理"存下来，[`Self::step`] 在给定预算内尽量推进，其余留到下一帧（不丢笔、不阻塞帧）。
+/// 分帧原因：`size=61` 的球一笔在 castle.vox 上实测 ≈4.2ms（`size=121` ≈23ms），单帧做完整帧必掉。
+/// 这里把"哪些块还没处理"存下来，[`Self::step`] 在给定预算内尽量推进，其余留到下一帧（不丢笔、不阻塞帧）。
 /// 结果与"一次做完"逐位相同：块之间互不相交，且每块的写入只依赖该块自身当前内容。
 pub(crate) struct PlainBrush {
   shape: BrushShape,
@@ -472,7 +472,7 @@ impl PlainBrush {
     }
     if extent == BRICK_FACTOR {
       // 4³ 砖：**一次写完**（一次下钻 + 一次向上合并 + 一次脏标记）—— 逐格写要付 64 次。
-      // 壳层（球面边界）就是这一档：它是笔触的主要代价来源。
+      // 壳层（球面边界）就是这一档：它是笔触的主要代价来源（实测占一笔 CPU 的 ≈55%）。
       let mut inside = 0u64;
       for i in 0..(BRICK_FACTOR * BRICK_FACTOR * BRICK_FACTOR) {
         let d = IVec3::new(
@@ -1355,12 +1355,15 @@ mod tests {
     }
   }
 
-  /// 性能记录（忽略型，常规门禁不跑）：castle.vox 上"一笔"的固定成本。
+  /// 性能记录（忽略型，常规门禁不跑）：castle.vox 上"一笔"的成本。
   ///
-  /// - 笔触本身：4³ 批量写之前（逐格写）`size=61 place 33.17ms / erase 20.34ms`，现在 ≈5ms；
-  /// - 序列化（**只在全量安装 / 整棵重建时付**）：59 chunk 合计 173–208ms（均值 ≈2.9ms / 最大 ≈8.3ms）；
-  /// - 增量上传（节点级重写，**每笔都付**）：单格 356B / 13.7µs，size=4 → 1.6KB / 4.4µs，
-  ///   size=9 → 10KB / 17.9µs，size=17 → 39KB / 51.7µs（旧实现：每笔整棵 chunk 树 ≈2MB + 2.9ms）。
+  /// - 笔触（4³ 批量写 + 值块化之后）：`size=17` ≈0.14–0.24ms / `size=33` ≈0.6–1.0ms /
+  ///   `size=61` ≈3.0ms / `size=121` ≈15.5ms（值块化之前：0.3 / 1.2 / 4.3 / 23.5ms；逐格写时代 33ms）；
+  /// - 序列化（**只在全量安装 / 整棵重建时付**）：59 chunk 合计 ≈56ms（均值 ≈0.9ms / 最大 ≈2.0ms）—— 值块化
+  ///   之前是 173–208ms（值块的 inline 与 wire 逐位同构 ⇒ 序列化退化成一次拷贝）；
+  /// - 树规模：59 chunk 合计 77 万节点（值块化之前 ≈1200 万）⇒ CPU 侧树内存 ≈4× 小；
+  /// - 增量上传（节点级重写，**每笔都付**）：单格 356B / 20µs，size=4 → 1.6KB / 3.6µs，
+  ///   size=9 → 10KB / 17µs，size=17 → 39KB / 38µs（旧实现：每笔整棵 chunk 树 ≈2MB + 2.9ms）。
   ///
   /// 跑法：`cargo test --release -p gate-app brush_cost_on_castle -- --ignored --nocapture`
   #[test]
@@ -1395,14 +1398,23 @@ mod tests {
       let t1 = Instant::now();
       let m = apply_brush(volumes.main_mut(), c, BrushShape::Sphere, size, PaletteId::AIR);
       let erase = t1.elapsed();
-      println!("size={size:4} place {place:>10.2?} ({n}vx) / erase {erase:>10.2?} ({m}vx)");
+      // 笔触 AABB 覆盖的 chunk 跨度（并行只能按 chunk 切 ⇒ 这个数字就是并行度的上界）
+      let r = brush_radius(size);
+      let lo_c = (c - IVec3::splat(r)).div_euclid(IVec3::splat(256));
+      let hi_c = (c + IVec3::splat(r)).div_euclid(IVec3::splat(256));
+      let span = (hi_c - lo_c + IVec3::ONE).to_array();
+      println!(
+        "size={size:4} place {place:>10.2?} ({n}vx) / erase {erase:>10.2?} ({m}vx) / chunk 跨度 {span:?}"
+      );
     }
-    // 序列化成本（增量路径每笔对"碰到的那个 chunk"做一次）
+    // 序列化成本 + 树规模（全量安装 / 整棵重建时才付；节点数决定 CPU 侧树的内存与遍历常数）
+    let mut nodes_total = 0usize;
     let mut times: Vec<(usize, std::time::Duration)> = volumes
       .main()
       .chunk_coords()
       .filter_map(|cc| volumes.main().chunk(cc))
       .map(|tree| {
+        nodes_total += tree.node_count();
         let t = Instant::now();
         let words = tree.serialize().len();
         (words, t.elapsed())
@@ -1412,12 +1424,13 @@ mod tests {
     let total: std::time::Duration = times.iter().map(|(_, d)| *d).sum();
     let max = times.first().copied().unwrap_or_default();
     println!(
-      "序列化 chunks={} 总计={:?} 均值={:?} 最大={:?}（{}字）",
+      "序列化 chunks={} 总计={:?} 均值={:?} 最大={:?}（{}字）/ 树节点合计 {}",
       times.len(),
       total,
       total / times.len().max(1) as u32,
       max.1,
-      max.0
+      max.0,
+      nodes_total,
     );
 
     // 增量上传：节点级重写后**实际写进 GPU 的 struct 字节**（旧实现=整棵 chunk 树 ≈1.4MB/笔）。

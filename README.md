@@ -42,7 +42,7 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| **体素核心（gate-voxel）** | ✅ 生产可用 | Douglas Brick Tree：`HashMap<ChunkCoord, ChunkTree>`，每 chunk 256³ voxel，分裂因子 4³（256 → 64 → 16 → 4 → 1）；非叶节点 u64 占用掩码 + 紧凑 child 偏移表；`Node::Uniform` 自适应叶；16 位材质索引（65536 槽，8B/条）；三级查询 `get_voxel` / `get_brick_state` / `fill_brick`（O(深度) 整块写）；`try_merge` + `compact()` DFS GC |
+| **体素核心（gate-voxel）** | ✅ 生产可用 | Douglas Brick Tree：`HashMap<ChunkCoord, ChunkTree>`，每 chunk 256³ voxel，分裂因子 4³（256 → 64 → 16 → 4 → 1）；层 0-2 = 拓扑节点（u64 子块掩码 + tile 色 + 紧凑 child 表），**层 3 = 定长密集值块**（64 格 inline 值表 + 活跃掩码，形态同 VDB 的 `LeafNode`/GVDB 的 brick）⇒ 一次 4³ 批量写 = 一次 140B 写、零分配、零节点 churn；`Node::Uniform` 表示等值 tile（各层通用）；16 位材质索引（65536 槽，8B/条）；三级查询 `get_voxel` / `get_brick_state` / `fill_brick`（O(深度) 整块写）；`try_merge` 回合并 + `compact()` DFS GC（castle.vox 实测树节点 77 万，值块化之前 ≈1200 万） |
 | **多 volume** | ✅ 生产可用 | `Volumes`：`list[0]` = 主世界（`obj_id = -1`），`add_object` 注册物体（`VolumeTransform { pos, rot, scale }`）；同一 dirty → builder → upload 路径；GPU 侧为统一 `GridDesc` 数组（144B/条），shader `trace_scene` 无分支遍历 |
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
 | **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk **树块**）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；**节点级增量**：block 首 = 根节点地址，块内是节点 arena，编辑只重写路径上动过的那几个节点（单格编辑 ≈ 百字节）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
