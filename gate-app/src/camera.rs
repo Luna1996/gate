@@ -142,8 +142,15 @@ pub(crate) fn camera_look_input(
 /// 自由模式的鼠标锁定（Q 切换，`toggle_mouse_lock`）：锁定 = 隐藏系统光标、光标钉在窗口中心、
 /// 鼠标相对位移直接转头（`free_look_input`），准星落在屏幕中心（`Crosshair`）。
 /// 只在 Fly 模式生效；切到轨道模式自动解锁（`apply_mouse_lock`）。
-#[derive(Resource, Default, Clone, Copy, Debug)]
+#[derive(Resource, Clone, Copy, Debug)]
 pub struct MouseLock(pub bool);
+
+impl Default for MouseLock {
+  /// 缺省锁定：启动即"鼠标交给相机"（要用菜单先按 `Q` 解锁）
+  fn default() -> Self {
+    Self(true)
+  }
+}
 
 /// Q 切换鼠标锁定（仅 Fly 模式）：文本输入焦点在控件上时不响应，否则打字里的 q 会误切。
 pub(crate) fn toggle_mouse_lock(
