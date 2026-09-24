@@ -1,6 +1,6 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_M_K, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
 import package::trace::{make_grid};
@@ -423,18 +423,28 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // tap 的中心 = 本帧命中点上帧的重投影位置（`prev_pc`），不是本像素：读上帧 reservoir 时
   // 像素 `coord + offset` 上帧看到的是「上帧恰好落在那里的那个面」，相机一平移就完全不是同一个面
   // ⇒ 命中率掉到 0。把中心放到「上帧本面所在的屏幕位置」，读到的才是**本面上帧的邻居**。
-  // 静止相机下 `prev_pc` 恒等于本像素 ⇒ 与朴素做法逐位一致；重投影失败时退回本像素。
+  // 静止相机下 `prev_pc` 恒等于本像素 ⇒ 与朴素做法逐位一致。
   // 两种 tap 都并累计量（`w_sum` / `M`），判据是唯一的 `gi_same_surface`：
   //  a) **同键**：主命中面键逐位相等 ⇒ 目标函数逐字相同 ⇒ 合并是纯降噪、零偏差；
   //  b) **同一个面**（面号/物体/法线轴坐标相等 + 着色法线相似）：cosθ 几乎相同、平面相同，
   //     只有射线起点差一格 ⇒ 目标函数差一个一阶小量；这是「相邻面的台阶」「凸棱上倾斜的那一段」
   //     被抹平、网格亮斑与棱边噪声消失的原因。薄板另一侧 / 隔一格的平行面仍被精确拒掉。
-  let tb = select(coord, prev_pc, prev_ok);
+  //
+  // **重投影失败（`prev_ok = false`）⇒ 本帧不做空间复用**：这时手里没有"本面上帧在屏幕上的位置"
+  // 这个锚（`prev_pc` 无意义），退回**本像素坐标**读邻居等于借一个**完全无关的世界点**的上帧累加量。
+  // 而"重投影失败"恰恰是相机前进/后退时大批出现的一类像素（命中点被推到视锥外 / 落进相机背后，
+  // 新入屏的轮廓像素也是这一类）⇒ 那条回退是"靠近 / 远离时画面被上帧的屏幕内容拖住"的一个直接来源。
+  // 关掉它只损失这一小撮像素的空间平滑（它们本来也在由时域与 atrous 兜），**没有射线代价**
+  // （`hist_ok` 不受影响 ⇒ 不会触发去遮挡候选翻倍）。
+  let tb = prev_pc;
   var sk_sum = vec3<f32>(0.0);
   var sk_m = 0.0;
   // **世界几何变了 ⇒ 本帧不复用空间邻域**（文件头 ⑥）：tap 读的是**上一帧**邻居的 reservoir，
   // 那些累加量同样可能已经失效（同一个理由：代表样本验证不了它）。
-  let reuse_taps = select(GI_SS_REUSE_TAPS, 0u, gi_u.flags.z <= 0.5);
+  let reuse_taps = select(GI_SS_REUSE_TAPS, 0u, !prev_ok || gi_u.flags.z <= 0.5);
+  // 借来的值要锚在「本像素当帧自己的估计」附近（`GI_SS_REUSE_CLAMP_*`）：本帧新鲜候选的
+  // `w_sum / M`，**不含**历史与借来的量 ⇒ 它就是"我这个位置"的当帧证据，也是唯一的锚。
+  let est_self = r.w_sum / max(r.m, 1e-6);
   for (var t = 0u; t < reuse_taps; t = t + 1u) {
     let nc = tb + gi_ring_offset(t);
     if (nc.x < 0 || nc.y < 0 || nc.x >= i32(size.x) || nc.y >= i32(size.y)) { continue; }
@@ -449,7 +459,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     let wm = gi_tap_merge(nidx);
     // `M` 是有效位的正数（上面已判 VALID）⇒ 直接并；`w_sum` 与 `M` 同步缩放过的累计量，
     // 比值恒是「该面 π·⟨L⟩ 的滑动平均」⇒ 并进来只是加权平均，不改变估计的量纲。
-    sk_sum = sk_sum + wm.xyz;
+    // **值先钳到本像素估计的 `[LO, HI]` 倍内**（`GI_SS_REUSE_CLAMP_*` 的说明）：判据只证明"同一个面"、
+    // 不证明"同一个位置"，钳制把"借来的位置差异"切掉，只保留"借来的证据量"。
+    let v = wm.xyz / max(wm.w, 1e-6);
+    let vc = clamp(v, est_self * GI_SS_REUSE_CLAMP_LO, est_self * GI_SS_REUSE_CLAMP_HI);
+    sk_sum = sk_sum + vc * wm.w;
     sk_m = sk_m + wm.w;
   }
   r.pk0 = pk0;
@@ -463,7 +477,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   gi_res_store_cur(idx, r);
 
   // ---- ⑤ 着色：估计 = w_sum / M = π·⟨L⟩ ⇒ 乘增益、除 π；空间复用只加在这一步 ----
-  var est = r.w_sum / max(r.m, 1e-6);
+  // 与 ③ 的钳制锚 `est_self` 是同一个量（`w_sum / M`）：钳制就是把借来的值拉回它附近。
+  var est = est_self;
   if (sk_m > 0.0) {
     // **借来的权重不超过我们自己的**（`GI_SS_REUSE_M_K`，默认 `1.0` ⇒ 最多各占一半）。
     // 空间复用的目的是"抹平相邻面之间的台阶"，**不是**用邻居的长历史替换本像素的估计：

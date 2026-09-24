@@ -161,7 +161,8 @@ fn gi_same_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: vec3<f32>) 
 ///    钳制会把历史色拉回**本帧邻域**的范围 ⇒ 响应足够快；而"当帧重置"反而会让编辑帧露出未平滑的
 ///    输入、并让 atrous 的短历史稳定化（`GI_DEN_STAB_*`）整屏生效一帧（症状：放置体素时 GI 闪一下）。
 /// ④ 噪声尺度 `σ_use = max(本帧同面键 σ_n, 累积矩 σ_hist)`；历史权重
-///    `w = min(clamp(σ_α/σ_use, W_MIN, 1), (M−1)/M)`；
+///    `w = min(clamp(σ_α/σ_use, W_MIN, 1), (M−1)/M, 1/(1+mo))`，末项 `mo` = 本像素命中点在上帧的
+///    落点与本像素的屏幕距离（运动自适应：位移越大，这条历史越可能来自面上另一个位置）；
 /// ⑤ 历史色先钳到同一面邻域的 `mean ± K·std`（anti-ghosting）；
 /// ⑥ 写回本帧色 + **累积矩**（`mix(hist, 本帧输入, 1−w)`）+ 本帧键 + 法线 + M（历史双缓冲，
 ///    Rust 每帧换绑）。
@@ -314,8 +315,16 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let sigma_hist = sqrt(max(h_m2 - h_m1 * h_m1, 0.0));
       sigma_use = max(sigma, sigma_hist);
       let w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
+      // WHY: 接受判据只证明「同一个面」、不证明「同一个位置」（面键的切向坐标不进判据），
+      // 其近似误差随屏幕位移放大 —— 位移越大，这条历史越可能来自面上另一个位置（拖影来源）。
+      // mo = 本像素命中点在上帧的落点（`prev_px`）与本像素的屏幕距离 ⇒ 上限 1/(1+mo)：
+      // 记忆窗 ≈ 1+mo 帧。相机静止 ⇒ prev_px == coord ⇒ mo = 0 ⇒ 因子为 1（静止画面的
+      // 累积长度与噪声不变）。
+      let dx = f32(prev_px.x - x);
+      let dy = f32(prev_px.y - y);
+      let mo = sqrt(dx * dx + dy * dy);
       // 历史上限：M 帧以来最多信 (M−1)/M ⇒ 稳态也保留 1/M 的新信息（不无限累积）。
-      let w = min(w_var, (m - 1.0) / m);
+      let w = min(min(w_var, (m - 1.0) / m), 1.0 / (1.0 + mo));
       color = mix(c_in, clamped, w);
       // 矩按**与色完全相同的权重**累积（历史权重 = w ⇒ 本帧观测权重 = 1 − w）⇒
       // `M2 − M1²` 就是「本像素输入在累积窗口内的波动」，量纲与 `σ_α` 可比。
