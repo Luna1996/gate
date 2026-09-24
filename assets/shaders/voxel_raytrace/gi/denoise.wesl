@@ -333,9 +333,16 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
     }
   }
 
-  // φ = `GI_DEN_LUMA_K` × max(噪声尺度, **相对下限**)：下限见 `GI_DEN_LUMA_FLOOR_REL`；
-  // 噪声尺度用上面定下的 `sigma_use`（含累积矩）⇒ atrous 的亮度 range 权重也稳定了。
-  gi_den_phi[idx] = GI_DEN_LUMA_K * max(max(sigma_use, GI_DEN_LUMA_FLOOR_REL * l_ref), 1e-5);
+  // φ = `GI_DEN_LUMA_K` × max(噪声尺度, **相对下限**)：下限见 `GI_DEN_LUMA_FLOOR_REL`。
+  // WHY: 噪声尺度取「同面键 σ / 累积矩」；**同面键邻域退化时（`n3 ≤ 1.5`：面比一个 texel 还小，
+  // 低分辨率档的斜面与小面几乎全是这种）改用共面邻域逐通道 std 的亮度投影 `dot(cstd, GI_LUMA)`**。
+  // 那条相对下限只是最后一道地板，不能当主尺度：它是"参考亮度的固定百分比"，而 GI 的**相对**波动
+  // 随场景变暗而变大（暗处逃逸到天空的射线的辐亮度远高于任何被照到的面）⇒ 亮处 `|Δluma|` 尚在
+  // 下限之内、暗处早已远超 ⇒ range 权重 `exp(-|Δluma|/φ)` 塌到 0、五轮 atrous 空转、raw 噪声直通。
+  // 用实测离散度当尺度 ⇒ 与"这一帧实际有多大差异"同量纲，与场景明暗无关。
+  // 只影响本像素自己的 atrous 权重：时域的历史权重仍走 `sigma_use`（`σ_α/σ_use`），不受本行影响。
+  let sigma_phi = select(dot(cstd, GI_LUMA), sigma_use, n3 > 1.5);
+  gi_den_phi[idx] = GI_DEN_LUMA_K * max(max(sigma_phi, GI_DEN_LUMA_FLOOR_REL * l_ref), 1e-5);
 
   // ---- ⑥ 写历史（本帧**累积后**的色 + 累积矩 + 本帧键 + 法线 + M）与输出 ----
   gi_hist_cur[hb + GI_DEN_H_COL] = bitcast<u32>(color.x);
@@ -358,9 +365,11 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
 ///     体素与相邻的同面体素只差 0.707 ⇒ 仍在容差内 ⇒ 那一段画面连成一片，与着色一致）；
 ///  2. **同面键 ⇒ 满权重 1**（`w = 1`，连亮度权重都不看：同一个面内的差异只可能是噪声）
 ///     —— 这是「逐体素平坦风味」的来源（同面像素被强拉平）；
-///  3. 同一个面但不是同键（切向偏移 / 两侧倾斜度不同）⇒ `dot(n) × exp(-|Δluma| / φ)`，
-///     φ = `GI_DEN_LUMA_K` × max(σ_use, 相对下限)：那里的差异可能是真实信号（比如同一地板上
-///     被墙挡住的一段），所以留一个亮度门；而「同一个面」保证了几何上是同一个积分。
+/// 3. 同一个面但不是同键（切向偏移 / 两侧倾斜度不同）⇒ `dot(n) × exp(-|Δluma| / φ)`，
+///     φ = `GI_DEN_LUMA_K` × 本像素的噪声尺度（时域 pass 写进 `gi_den_phi`：同面键 σ / 累积矩；
+///     同面键邻域退化时取共面邻域实测离散度，见 `gi_den_temporal` 的 ④ 段说明）：那里的差异可能是
+///     真实信号（比如同一地板上被墙挡住的一段），所以留一个亮度门；而「同一个面」保证了几何上是
+///     同一个积分。
 /// 核是 `(2R+1)²-1` 个 tap（R 由 Rust 按菜单「高质量降噪」写进 `gi_den_cfg[0]`：
 /// 2 ⇒ 5×5 的 24 tap、1 ⇒ 3×3 的 8 tap）：同一足迹下采样越密 ⇒ 残余噪声越低。
 /// 4. **短历史的像素把步长放大**（`GI_DEN_STAB_FRAMES` / `GI_DEN_STAB_MAX`）：`M` 小 ⇒ 同一批 tap

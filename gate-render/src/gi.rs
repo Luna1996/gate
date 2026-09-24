@@ -92,6 +92,32 @@ impl GiEpochKey {
   }
 }
 
+/// 主光方向项生效所需的最小光量（色 × 强度的模）。低于它就当作"这一侧没有光"：方向跳变不携带
+/// 辐射量（`sky.rs` 的日月交接帧两侧强度都趋 0）。参考量级：天象表强度 0（地平线）~ 0.82（正午）。
+const LIGHT_DIR_MIN_MAG: f32 = 0.02;
+/// **光照阶跃**阈值（相对变化 / `1 − cosθ`）：主光或天光一帧内变化超过本值，或主光方向一帧内转过
+/// 60° 以上 ⇒ 判定为阶跃（`flags.z = 0`，该帧整帧不复用历史，见 `prepare_gi`）。
+/// 常规的逐帧变化都在其下：自动流逝 0.5 游戏小时/秒 ≈ 0.125°/帧；拖动「时刻」滑杆的常规步长同理。
+const LIGHT_STEP_MAX: f32 = 0.5;
+
+/// **光照阶跃**判据：当前 key 相对上一帧 key 的"最大相对变化"（0 = 没变）。三项取 max：
+///   · 主光色 × 强度的相对变化（分母取两侧较大者 ⇒ "从 0 亮起"不会被除零放大）；
+///   · 天光色的相对变化（同上）；
+///   · 主光方向变化 `1 − cosθ`，只在两侧光量都超过 [`LIGHT_DIR_MIN_MAG`] 时才计。
+fn light_jump(prev: &GiEpochKey, now: &GiEpochKey) -> f32 {
+  let vec3 = |v: [u32; 3]| glam::Vec3::from(v.map(f32::from_bits));
+  let rel = |a: [u32; 3], b: [u32; 3]| -> f32 {
+    let (a, b) = (vec3(a), vec3(b));
+    (a - b).length() / a.length().max(b.length()).max(1e-4)
+  };
+  let dir = if vec3(prev.sun_dir).length().min(vec3(now.sun_dir).length()) > LIGHT_DIR_MIN_MAG {
+    1.0 - vec3(prev.sun_dir).normalize_or_zero().dot(vec3(now.sun_dir).normalize_or_zero())
+  } else {
+    0.0
+  };
+  rel(prev.sun_c, now.sun_c).max(rel(prev.sky, now.sky)).max(dir)
+}
+
 /// GI 档位（菜单「渲染/GI」）：`enabled` → uniform `misc.x`；`gi_div` → uniform `flags.y`。
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
 pub struct GiSettings {
@@ -550,8 +576,9 @@ pub struct GiGpu {
   /// 证明不了"上帧累计进来的那些光路还成立"，所以世界一变就整帧不复用历史（见 `gi/screen.wesl` ⑥）。
   pub world_rev: u32,
   /// 上一次真正跑 `gi_main` 的那一帧的 `world_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
-  /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 里的累计量在本帧仍然成立 ⇒ **允许复用历史**
-  /// （uniform `flags.z`）。
+  /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 里的累计量在本帧仍然成立。
+  /// 它与「本帧是不是光照阶跃」合起来决定 uniform `flags.z`（**允许复用历史**）：
+  /// 几何变了、或光照一帧内跳过了 [`LIGHT_STEP_MAX`]，都整帧不复用（见 `prepare_gi`）。
   pub world_rev_gi: u32,
   /// 降噪 pipeline：`[0]` = 时域、`[1..6]` = atrous 第 1..5 轮（步长 1/2/4/8/16）。
   /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）；
@@ -770,15 +797,26 @@ fn prepare_gi(
   }
   let world_same = gpu.world_rev == gpu.world_rev_gi;
 
-  // ---- ② 二次顶点缓存的 epoch ----
+  // ---- ② 二次顶点缓存的 epoch（同一次比对给出「光照阶跃」）----
   // 输入 = `gi_secondary_shade` 的全部输入（几何修订号、太阳方向/色×强度、天光色、「太阳反弹」）。
   // **逐项比对、变了才自增**（不做哈希：哈希只是把"变没变"变得更难查）。
   // 只比位（f32 比 `to_bits`）⇒ 值改了但位没变（不可能）与位变了值没变（保守失效）都安全。
+  //
+  // `light_step` = 光照量在**一帧内**跳过了 [`LIGHT_STEP_MAX`]（见 [`light_jump`]）。它与"世界几何
+  // 变过"同口径：该帧整帧不复用历史（`flags.z = 0`）。理由是两侧证据的时间基准已经劈开 ——
+  // 二次顶点缓存被 epoch 作废 ⇒ 本帧的新鲜候选算的是**新光照**，而 reservoir 里存的 `w_sum` / `M`
+  // 是**旧光照**下攒出来的。不劈开就只能靠记忆窗淡出：整屏一起滞后（每个像素的窗口相位不同，
+  // 于是暗下来的先后也不同步），相机一动重投影滑到邻近 texel 还会借到旧值 ⇒ 大片鬼影。
+  // 逐帧的小变化（自动流逝 / 拖动「时刻」滑杆）不触发：那种变化每个窗口帧只有一小步，历史跟着走
+  // 正是想要的行为。
   let epoch_key = GiEpochKey::of(gpu.world_rev, settings.sun_bounce, lighting.as_deref());
+  let mut light_step = false;
   if gpu.epoch_key != Some(epoch_key) {
+    light_step = gpu.epoch_key.as_ref().is_some_and(|p| light_jump(p, &epoch_key) > LIGHT_STEP_MAX);
     gpu.epoch_key = Some(epoch_key);
     gpu.epoch = gpu.epoch.wrapping_add(1);
-    bevy::log::debug!(target: "gate", "GI 二次顶点缓存 epoch → {}", gpu.epoch);
+    bevy::log::debug!(target: "gate", "GI 二次顶点缓存 epoch → {}{}", gpu.epoch,
+                      if light_step { " [光照阶跃 ⇒ 本帧不复用历史]" } else { "" });
   }
 
   // ---- uniform（字段与 WESL `GiUniform` 逐字段镜像）----
@@ -799,7 +837,8 @@ fn prepare_gi(
     flags: Vec4::new(
       0.0,
       settings.div() as f32,
-      if world_same { 1.0 } else { 0.0 },
+      // z = 「本帧允许复用历史」（WESL `gi_u.flags.z`）：几何没变 **且** 这一帧不是光照阶跃。
+      if world_same && !light_step { 1.0 } else { 0.0 },
       // w = 降噪质量档位（0..=3）：`gi_ss_main` 按它取候选数与记忆窗（只有最高档不同）。
       settings.tier() as f32,
     ),
