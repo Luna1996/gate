@@ -215,7 +215,11 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
       return GlassOut(best, tint, refl, dir);
     }
     let p_hit = org + dir * best.t;
-    let nn = best.n;
+    // 界面法线取**逐体素法线**（`voxel_normal`：可见面 + 邻域梯度倾斜，与不透明路径 / GI 二次顶点
+    // 同一个函数、同一口径）—— 玻璃的几何量（起点外推与这里的折射 / 全反射）都按它算，
+    // 描述的才是体素场那个平滑面。它与起点外推用的是同一个法线 ⇒ 入射角与真实界面自洽。
+    // 掠射（法线倾斜 + 视线很斜）时 `dot(-dir, nn)` 可能为负 ⇒ 被下面的 clamp 成 0 = 掠射入射。
+    let nn = voxel_normal(make_grid(0u), best.voxel, best.face_id, best.n);
     let ci = clamp(dot(-dir, nn), 0.0, 1.0);
     // MT3-8：折射率与 F0 都从**材质**取，不再有本文件里的硬编码常量（硬约束 9：F0 只有一个来源）。
     // 每轮界面各取一次：进出的是**同一个介质**，而 `best.pal` 就是该介质的材质（`world_trace_medium`
@@ -519,15 +523,14 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   // ---- MT8-7 · 玻璃的**整条光路按体素量化** ----
   // 喂给状态机的起点与方向都**只由命中体素决定** ⇒ 折射/全反射/介质吸收/背景采样**全部**只依赖
   // （命中体素 + 它被看见的那个面）⇒ 跑遍整个状态机，一个面上所有像素得到**完全相同**的结果：
+  //   · 入射点 = 该**命中面的中心**沿**逐体素法线**外推半格（`fp + fnn·(0.5/|fnn| + eps)`）——
+  //     与阴影/反射射线的起点**同一个构造**（`n_off`），不另立第二套外推；`fnn` 也是 `trace_glass`
+  //     内部做折射 / 全反射的同一个法线 ⇒ 界面点与界面朝向自洽（描述的是那个平滑面，不是单张台阶面）。
   //   · 入射方向 = 该**体素中心**的视向量的反向（`-face_view_dir(相机, 体素中心)`）—— 与反光/高光
-  //     同一把尺子（`face_view_dir` 的锚点就是体素中心）；
-  //   · 入射点 = 该**命中面的中心**（`p_voxel + n·(0.5/|n| + eps)`）—— 与阴影/反射射线的起点
-  //     **同一个构造**（`n_off`），不另立第二套外推。
+  //     同一把尺子（`face_view_dir` 的锚点就是体素中心）。
   // ⇒ **一个玻璃面 = 一个平色**（含透过它看到的那一格背景），与材质色、高光、反射**同一粒度**。
   // 成本**不变**（同样的循环、同样的射线数）。`t_min` 传 0 —— beam 预 pass 的 `t_min` 是沿
   // **相机那条射线**量的，换到这个起点后没有意义（而从这里到玻璃另一侧的距离本来就很短）。
-  // ⚠️ 折射是**光路几何**、必须知道面法线 ⇒ 粒度天然是"体素 + 面"（本引擎里"面"就是着色量子：
-  // 材质色/高光/反射也都是逐面）。
   // 玻璃自身的不透明外观（in-scatter 的"另一端"）：非玻璃像素恒 0 ⇒ 下方整支被折掉、零开销。
   var glass_col = vec3<f32>(0.0);
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
@@ -535,8 +538,10 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let fp = voxel_center_world(fg, first.voxel);
     let fnn = voxel_normal(fg, first.voxel, first.face_id, first.n);
     let f_off = 0.5 / max(max(abs(fnn.x), abs(fnn.y)), max(abs(fnn.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    // 玻璃**界面点**：光路起点与 in-scatter 的阴影射线起点共用它，不另立第二套外推。
+    let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let g = trace_glass(fp + fnn * f_off, -fv, 0.0, frustum_length, sun_dir, sky, sun_c);
+    let g = trace_glass(f_face, -fv, 0.0, frustum_length, sun_dir, sky, sun_c);
     best = g.ray;
     through = g.tint;
     refl = g.refl;
@@ -556,11 +561,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let f_alpha = vec3<f32>(1.0) - through;
     if (max(max(f_alpha.x, f_alpha.y), f_alpha.z) > 1.0 / 255.0) {
       let fm = fetch_material(first.palette_base, first.pal, first.point, fnn, PBR_DEBUG_ASSET);
-      // ---- 阴影（与不透明路径同一个构造：同一条 `sun_transmittance`、同一个起点外推 `n_off`）----
+      // ---- 阴影（与不透明路径同一个构造：同一条 `sun_transmittance`、同一个界面点 `f_face`）----
       let f_ndl = max(dot(fnn, sun_dir), 0.0);
       var f_sun = 0.0;
       if (f_ndl > 0.0) {
-        f_sun = sun_transmittance(fp + fnn * f_off, sun_dir, first.voxel, first.obj_id);
+        f_sun = sun_transmittance(f_face, sun_dir, first.voxel, first.obj_id);
       }
       // ---- 环境 + GI（与不透明路径逐字段同构：同一个 `gi_upsample_joint`、同一套键、同一个 cov 地板）
       // 键必须取**玻璃那个体素/面**的（不是 `best` 的）：GI 缓冲在本像素上存的就是"主射线命中的那个面"
