@@ -130,7 +130,7 @@ impl From<PaletteId> for usize {
 /// `PartialEq`（内容去重的判据，见 `gate-app/src/edit.rs::material_slot`）在**两个变体上都与
 /// `pack_palette_entry` 的输出一一对应**：打包是单射（每个字段都落在固定的 bit 段里、无重叠、
 /// 无被丢弃的字段）⇒ 等字段 ⟺ 等 8B payload。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct PaletteEntry {
   /// sRGB 颜色（管线在 shader 侧转 linear）
@@ -147,6 +147,19 @@ pub struct PaletteEntry {
   /// 原先这个字节是废弃的 `_pad`（恒 0）⇒ 默认值下打包结果与改动前**逐位相同**。
   /// 贴图驱动时它是 rough-metal 贴图的 B 通道（8 bit 连续量），本字节是**无贴图时的回退值**。
   pub metallic: u8,
+}
+
+impl Default for PaletteEntry {
+  fn default() -> Self {
+    Self {
+      color: [0, 0, 0],
+      roughness: 255,
+      emissive: 0,
+      transmission: 0,
+      flags: PaletteFlags::default(),
+      metallic: 0,
+    }
+  }
 }
 
 impl PaletteEntry {

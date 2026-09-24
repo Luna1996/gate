@@ -332,6 +332,20 @@ pub fn displacement_amplitude_of(id: &str) -> Option<u8> {
   ids.iter().any(|x| x == id).then(|| default_displacement_amplitude(id))
 }
 
+/// **只读接口**：当前会被收录成材质的 id 列表（**与槽号同口径**：目录名字典序下标）。
+///
+/// 给"资源还没插入就要按材质槽号写内容"的调用方用：`PbrTextureSet` 是 `Update` 里
+/// （[`finish_pbr_textures`]）才插入的资源，而 `gate-app` 在 `Startup` 生成 `infinite_cubes`
+/// 的起始块时就要给 PBR 档写资产槽号（`docs/infinite_cubes.md` 规则 5）。
+///
+/// 运行期请优先用 `PbrTextureSet::ids()`：那一份**跳过了加载失败的材质**，与 shader 里的
+/// 资产表严格同序；本函数只看磁盘目录，是"贴图集还没就绪"时的口径。扫描失败 ⇒ 空表
+/// （调用方按"没有 PBR 资产"处理），不 panic。
+pub fn material_ids() -> Vec<String> {
+  let root = crate::paths::assets_dir().join(PBR_TEXTURE_DIR);
+  scan_material_dirs(&root).unwrap_or_default()
+}
+
 /// 默认资产的中性 albedo（sRGB 编码字节）——灰 128 与今天平凡材质的中性观感一致。
 const DEFAULT_ALBEDO_SRGB: u8 = 128;
 /// 默认资产的 roughness（0.5 = 中性）。

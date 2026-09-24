@@ -689,6 +689,8 @@ fn register_callbacks(world: &mut World) {
     |ev: On<MenuActionEvent>,
      mut scene: ResMut<gate_render::VoxelScene>,
      mut dump: ResMut<gate_render::VoxelDumpRequest>,
+     pbr: Option<Res<gate_render::PbrTextureSet>>,
+     cam: Option<Res<gate_render::DdaCameraConfig>>,
      q_menu: Query<&gate_ui::DebugMenu>| {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
@@ -701,7 +703,12 @@ fn register_callbacks(world: &mut World) {
             return;
           };
           let t0 = std::time::Instant::now();
-          match crate::scene::reload_world(&mut scene, &name) {
+          match crate::scene::reload_world(
+            &mut scene,
+            &name,
+            &crate::scene::pbr_asset_ids(pbr.as_deref()),
+            cam.map(|c| c.position_world.as_ivec3()),
+          ) {
             Ok(_info) => info!("世界重载 → {name} {:?}", t0.elapsed()),
             Err(e) => warn!("重载世界失败 {name}：{e} → 原世界不变"),
           }

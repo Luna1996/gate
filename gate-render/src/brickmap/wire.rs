@@ -421,8 +421,14 @@ mod tests {
     };
     assert_eq!(pack_palette_entry(&opaque), [0x803264C8, 0x00010000]);
 
-    // 玻璃 transmission = 200：唯一差异是 bit21（word1 的 flags 字节 bit5 = TRANSMISSIVE 0→1）
-    let glass = PaletteEntry { color: [0x0A, 0x14, 0x1E], transmission: 200, ..Default::default() };
+    // 玻璃 transmission = 200：唯一差异是 bit21（word1 的 flags 字节 bit5 = TRANSMISSIVE 0→1）。
+    // 粗糙度必须显式写 0（条目的缺省是 255）—— 字面量取自回归表，写缺省会换成另一个值。
+    let glass = PaletteEntry {
+      color: [0x0A, 0x14, 0x1E],
+      roughness: 0,
+      transmission: 200,
+      ..Default::default()
+    };
     assert_eq!(pack_palette_entry(&glass), [0x001E140A, 0x0020C800]);
 
     // 发光玻璃（HOLOGRAM + transmission = 7）：同上，只有介质位是"新"的

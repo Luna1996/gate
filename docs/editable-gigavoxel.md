@@ -345,8 +345,8 @@ wire 的**节点字高 16 位**（`pack_node_palette` 的 bit16..31）原本就�
   重传，一次性卡顿）。根治 = M6 环形窗口。
 - `Streaming::{load_radius, unload_radius, per_frame}` 现值 **2 / 3 / 1**；卸载半径只比加载大 1（迟滞够用
   且把常驻集真正限住；差 2 会留下 9³ 的尾迹 ≈ 700 MB）。
-- `infinite_cubes` 的 PBR 档位传 `&[]` ⇒ PBR room 退化成普通色（`TODO(streaming)`：把
-  `PbrTextureSet::ids()` 传进 `build_infinite_cubes` / `stream_chunks`）。
+- `infinite_cubes` 的 PBR 档位已接真资产槽：运行期用 `PbrTextureSet::ids()`、`Startup` 那一块用
+  `gate_render::material_ids()`（贴图集是 `Update` 里才插入的资源，见该函数的时序说明）。
 - **卸载即丢本地修改**（无覆盖层落盘）—— `infinite_cubes` 的既定语义；要保留就得做 M3 规则 3 的覆盖层。
 
 ### 10.4 下一步（建议顺序）

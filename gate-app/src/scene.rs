@@ -34,6 +34,7 @@ pub(crate) fn setup(
   mut commands: Commands,
   mut images: ResMut<Assets<Image>>,
   config: Res<crate::config::Config>,
+  pbr: Option<Res<gate_render::PbrTextureSet>>,
 ) {
   let dda_handle = create_dda_image(&mut images);
   // `UiPickingCamera`：UI 拾取（hover/press）只认挂了它的相机（见 gate_ui::pointer 的 `require_markers` 契约）
@@ -65,13 +66,17 @@ pub(crate) fn setup(
     // 启动世界 = 「游戏/世界」页模型下拉的最终选中项（结构来自资产、选中项来自配置；读不到 → nuke）
     let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu(&config))
       .unwrap_or_else(|| "nuke".to_string());
-    let info = build_world(&mut grid, &name).unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
     // 默认机位：`cube_in_void` 的立方体（原点、边长 64）从斜上方看；其余 .vox 沿用既有读数
     (cam_eye, cam_target) = if name == CUBE_IN_VOID {
       (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO)
     } else {
       (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5))
     };
+    // 相机最终会落在哪（存档姿态优先，口径与下面的 `orbit` 完全一致）：`infinite_cubes` 是
+    // **相机驱动**的世界 ⇒ 起始块要铺在它脚下，否则开局那一块得等流式一帧一个 chunk 补出来。
+    let start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
+    let info = build_world(&mut grid, &name, &pbr_asset_ids(pbr.as_deref()), start_eye.as_ivec3())
+      .unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
     bevy::log::info!(
       "STEP 2 world {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
       info.instances_used,
@@ -166,31 +171,48 @@ pub(crate) fn setup(
 /// 按名字把主世界体素写进 `grid`（`setup` 与 `reload_world` 的唯一分发点）：
 /// `cube_in_void` = 程序化调试场景（[`build_cube_in_void`]）；其余 = `assets/vox/<name>.vox`。
 /// 不做 `compact_all` —— GC 时机由调用方定（`setup` 在场景构建后统一做一次）。
+///
+/// `cam_eye` = 相机眼位（体素）：`infinite_cubes` 是相机驱动的世界，起始块铺在它所在的 chunk 上；
+/// 其余世界锚在 `EXT_VOXEL_HALF`，忽略这一项。
 fn build_world(
   grid: &mut VolumeGrid,
   name: &str,
+  pbr_ids: &[String],
+  cam_eye: IVec3,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   if name == CUBE_IN_VOID {
     return Ok(build_cube_in_void(grid));
   }
   if name == INFINITE_CUBES {
-    return Ok(build_infinite_cubes(grid));
+    return Ok(build_infinite_cubes(grid, pbr_ids, cam_eye));
   }
   let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
   let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
   vox_scene::load_vox_scene(grid, &path, anchor)
 }
 
+/// PBR 资产槽列表，给 `infinite_cubes` 的 PBR 档用（`docs/infinite_cubes.md` 规则 5：
+/// "生成 PBR 材质 ID"）。贴图集已就绪 → 用它的（**与 shader 里那张资产表严格同序**，
+/// 且会跳过加载失败的材质）；还没就绪（`Startup` 早于贴图加载完成）→ 退回
+/// [`gate_render::material_ids`] 的磁盘扫描口径，免得那一档退化成普通色。
+pub(crate) fn pbr_asset_ids(pbr: Option<&gate_render::PbrTextureSet>) -> Vec<String> {
+  pbr.map_or_else(gate_render::material_ids, |s| s.ids().to_vec())
+}
+
 /// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按名字重建主世界（`cube_in_void` 见
 /// [`build_cube_in_void`]，其余走 `assets/vox/<name>.vox`）。
 /// 与 `setup` 同一套不变量：先 `compact_all`；`demo_force_full_rebuild` 触发全量重建 + 全量 GPU 上传。
-/// 失败 → 原世界保持不变；相机不动（所有模型锚到同一 anchor）。
+/// 失败 → 原世界保持不变；相机不动（`infinite_cubes` 的起始块按相机铺，几何本身是世界坐标的函数
+/// ⇒ 换锚不移动任何东西）。
 pub(crate) fn reload_world(
   scene: &mut VoxelScene,
   name: &str,
+  pbr_ids: &[String],
+  cam_eye: Option<IVec3>,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   let mut grid = VolumeGrid::new();
-  let info = build_world(&mut grid, name)?;
+  let eye = cam_eye.unwrap_or(IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF));
+  let info = build_world(&mut grid, name, pbr_ids, eye)?;
   grid.compact_all();
   scene.volumes = Volumes::new(grid);
   scene.demo_force_full_rebuild = true;
@@ -218,25 +240,27 @@ fn build_cube_in_void(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
 /// 程序化**无限**场景（「世界」页模型下拉里的 `infinite_cubes`，规则见 `docs/infinite_cubes.md`）：
 /// 向六个方向无限生长的 room 网格 —— 每条棱是纯白柱体、每个 room 中心一个随机材质的 cube。
 ///
-/// 本次只铺**起始视野**那一块（半径 `infinite_cubes::START_CHUNKS` 个 chunk，brick 对齐）：把这套
-/// 生成函数接进真流式（按相机加载 / 卸载、卸载即丢修改）是下一步 —— 那时"读系统文件"那一步换成调用
-/// `infinite_cubes::build_region`，其余（挂载 / 常驻 / 换出）全走既有流水线。
-fn build_infinite_cubes(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
+/// 本次只铺**起始视野**那一块（[`infinite_cubes::initial_box`]：相机所在 chunk 为中心、半径
+/// `START_CHUNKS` 个 chunk、**整 chunk 对齐**），其余由 `stream_chunks` 按需生成。生成 / 挂载 /
+/// 常驻 / 换出全走既有流水线，"读系统文件"那一步就是这里的 `build_region`。
+/// `center` = 相机眼位所在的 chunk（世界周期性 ⇒ 锚在哪都一样，但铺在脚下才不用等流式补块）；
+/// `pbr_ids` = PBR 档的资产槽列表（见 [`pbr_asset_ids`]）。
+fn build_infinite_cubes(
+  grid: &mut VolumeGrid,
+  pbr_ids: &[String],
+  center: IVec3,
+) -> vox_scene::VoxSceneInfo {
   use crate::infinite_cubes;
   /// 窗口 = 64³ chunk（`CHUNK_INDEX_CAP` 的上限），钉在起始位置 ⇒ 可飞约 ±150m。
   /// 更远需要 M6 的环形窗口（那时 shader 寻址做模运算，索引区跟着相机转）。
   const WINDOW_CHUNKS: i32 = 32;
-  // 与 .vox 世界同一个锚（相机初始就在这附近），世界本身是周期性的 ⇒ 锚在哪都一样
-  let center = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
   // 槽 1：柱体的纯白（`PaletteEntry::default` 其余字段 = 不发光 / 不透射 / 非金属 / 非 PBR）
   grid.palette_mut().set(PaletteId(1), PaletteEntry { color: [255, 255, 255], ..Default::default() });
   let origin = center.div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE)) - IVec3::splat(WINDOW_CHUNKS);
   grid.set_stream_window(Some((origin, IVec3::splat(WINDOW_CHUNKS * 2))));
-  // 起始只铺相机附近那一块，其余由 `infinite_cubes::stream_chunks` 按需生成
-  let r = infinite_cubes::START_CHUNKS * gate_voxel::CHUNK_SIZE;
-  let lo = ((center - IVec3::splat(r)) / 4) * 4;
-  let hi = ((center + IVec3::splat(r)) / 4 + 1) * 4;
-  let voxels_written = infinite_cubes::build_region(grid, lo, hi, &[]) as usize;
+  // 起始只铺相机脚下那一块（**整 chunk**，见 `initial_box`），其余由 `stream_chunks` 按需生成
+  let (lo, hi) = infinite_cubes::initial_box(center);
+  let voxels_written = infinite_cubes::build_region(grid, lo, hi, pbr_ids) as usize;
   vox_scene::VoxSceneInfo {
     aabb_min: lo,
     aabb_max: hi,
