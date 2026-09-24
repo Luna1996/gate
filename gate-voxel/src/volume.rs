@@ -241,8 +241,10 @@ impl VolumeGrid {
 
   /// 挂载外部预构建的 chunk 树（大体积批量导入用）。
   /// 调用契约：`tree` 整体替换 `cc` 上的树并标脏，`applied_edits` 累加到编辑代数；空树由调用方跳过。
-  pub fn mount_chunk_tree(&mut self, cc: ChunkCoord, tree: ChunkTree, applied_edits: u64) {
+  pub fn mount_chunk_tree(&mut self, cc: ChunkCoord, mut tree: ChunkTree, applied_edits: u64) {
     debug_assert!(!tree.is_empty(), "mount_chunk_tree 不接受空树");
+    // 外部整体替换：节点身份空间与上一个树无关 ⇒ 让 wire 层丢掉旧映射全量重建
+    tree.mark_replaced();
     self.chunks.insert(cc, tree);
     self.dirty.mark_data(cc);
     self.edit_generation = self.edit_generation.wrapping_add(applied_edits);
@@ -295,6 +297,33 @@ impl VolumeGrid {
 
   pub fn set_voxel_ivec3(&mut self, pos: IVec3, palette: PaletteId) -> Option<DirtyEdit> {
     self.set_voxel(VoxelCoord::from_ivec3(pos), palette)
+  }
+
+  /// 按 **4³ brick** 批量写体素：`voxel` = brick 最小角（世界 voxel 坐标，对齐 4），
+  /// `inside` 的 bit `i = z*16 + y*4 + x` 标出"落在笔触形状内"的体素（见 [`ChunkTree::set_brick_voxels`]）。
+  /// 一次调用只标一次脏、只记一个编辑 AABB —— 逐格 `set_voxel` 是每格各标一次。
+  /// 返回实际改变的体素数（0 = 无改动，此时不标脏）。
+  pub fn set_brick_voxels(&mut self, voxel: IVec3, inside: u64, palette: PaletteId) -> u32 {
+    const EXT: i32 = crate::coords::BRICK_FACTOR;
+    let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
+    let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
+    let cc = ChunkCoord(chunk);
+    let changed = match self.chunks.get_mut(&cc) {
+      Some(tree) => tree.set_brick_voxels([local.x, local.y, local.z], inside, palette),
+      None => {
+        if palette.is_air() {
+          return 0;
+        }
+        let tree = self.chunks.entry(cc).or_insert_with(ChunkTree::empty);
+        tree.set_brick_voxels([local.x, local.y, local.z], inside, palette)
+      }
+    };
+    if changed > 0 {
+      self.dirty.mark_data(cc);
+      self.note_edit_box(cc, voxel, voxel + IVec3::splat(EXT));
+      self.edit_generation = self.edit_generation.wrapping_add(1);
+    }
+    changed
   }
 
   /// 填充对齐 brick（extent ∈ {256,64,16,4,1}）；`voxel` 为 brick 最小角的世界 voxel 坐标。

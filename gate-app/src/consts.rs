@@ -42,6 +42,14 @@ pub const EDIT_SIZE_MIN: u32 = 1;
 /// 编辑射线射程（体素）：无界（`∞`）⇒ 只要射线能打到就有笔触。
 /// 实际步进由 `gate_render::raycast` 截在各 volume 的占用窗口 AABB 内（世界之外恒为空气），故不会空转。
 pub const EDIT_REACH: f32 = f32::INFINITY;
+/// 按住左键（放置）/ 右键（擦除）的连发间隔（秒）：按下当帧先落一笔，之后按住每 `EDIT_REPEAT_SECS` 再落一笔。
+/// 触发频率与帧率无关（余数结转）；`0` = 每帧触发（不节流），调大 = 更慢的连续笔触。
+pub const EDIT_REPEAT_SECS: f32 = 0.1;
+/// 普通笔触的单帧 CPU 预算（毫秒）：预算内做完就本帧出全形，做不完的块留到下一帧续做。
+/// 调大 = 大笔触更快出形但单帧更重（更容易掉帧）；调小 = 更平滑但要更多帧 —— 但**每帧还有固定的
+/// 尾成本**（chunk 重序列化 + 上传 + GI 失效），所以不要设得过小：分帧越多，尾成本付得越多次。
+/// 实测 castle.vox 球 `size=61` 一笔 ≈4.9ms（4³ 批量写之前 33ms；`size=121` 7M 体素 ≈43ms）。
+pub const EDIT_BUDGET_MS: f32 = 4.0;
 
 /// 显示用换算：1 米 = 多少体素
 pub const VOXEL_PER_METER: f32 = 50.0;

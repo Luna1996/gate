@@ -150,7 +150,12 @@ pub(crate) fn setup(
   // 物体 = 普通 VolumeGrid，经 `Volumes.add_object()` 注册变换，走与主世界相同的 dirty → builder → upload 路径。
   let volumes = Volumes::new(grid);
 
-  commands.insert_resource(VoxelScene { volumes, demo_force_full_rebuild: true });
+  commands.insert_resource(VoxelScene {
+    volumes,
+    demo_force_full_rebuild: true,
+    interior_only_edit: false,
+    edit_in_flight: false,
+  });
   commands
     .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
 }

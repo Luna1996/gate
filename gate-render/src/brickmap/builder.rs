@@ -1,13 +1,20 @@
 //! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
-//! [`BrickMapBuilder`]（单 volume）：全量按 ChunkCoord 排序并行 `serialize()` 顺序 append；增量重序列化
-//! append，旧树字节计入 `globals.node_free_words`；[`VolumesBuilder`] 拼接各 b_struct 后按 `tree_base` 偏移上传。
+//! [`BrickMapBuilder`]（单 volume）：**每个 chunk 一个树块**（块首 = 根节点地址），块内是节点
+//! arena —— 全量构建按 ChunkCoord 排序并行 `serialize_with_layout()` 后顺序安装；增量更新按
+//! [`TreeDirty`] **只重写动过的节点**（字节没变就不写不标脏），节点在块内原地增删。
+//! 一次编辑的上传量由此从"整棵 chunk 树"降到"路径上的几个节点"（几十~几百字节）。
+//! 块级空闲段（[`FreeRuns`]）复用被释放的树块，空闲过半时压实（搬块、只改窗口条目）。
+//! [`VolumesBuilder`] 拼接各 b_struct 后按 `tree_base` 偏移上传。
 
 use std::collections::HashMap;
 
-use gate_voxel::{ChunkCoord, PALETTE_INDEX_MAX, PaletteId, VolumeGrid, VolumeTransform, Volumes};
+use gate_voxel::{
+  ChunkCoord, ChunkTree, NODE_OFFSET_NONE, NodeLayout, NodeView, PALETTE_INDEX_MAX, PaletteId,
+  ROOT_WIRE_WORDS, TreeDirty, VolumeGrid, VolumeTransform, Volumes,
+};
 use glam::{IVec3, Vec4};
 
-use super::wire::{CHUNK_SIZE, GridDesc, pack_palette_entry};
+use super::wire::{CHUNK_SIZE, GridDesc, LEAF_INLINE_WORDS, NODE_FIXED_WORDS, pack_palette_entry};
 use rayon::prelude::*;
 
 use super::wire::{
@@ -33,6 +40,73 @@ fn coord_key(c: ChunkCoord) -> (i32, i32, i32) {
   (c.0.x, c.0.y, c.0.z)
 }
 
+/// 空闲段表：按起点升序、相邻自动合并，单位 = 字。
+///
+/// 两个使用者：① 全局（[`BrickMapBuilder::free`]）分配 / 回收**整块 chunk 树**；
+/// ② 块内（[`ChunkSlot::free`]，偏移相对块首）分配 / 回收**单个节点块**。
+///
+/// 存在意义：增量更新若只靠追加，高水位会单调上升（空闲字节从不复用）⇒ buffer 周期性扩容并
+/// 整份拷贝旧内容。first-fit 复用后高水位稳定在"并发存活总量"附近。
+#[derive(Default, Debug)]
+struct FreeRuns {
+  runs: Vec<(usize, usize)>,
+}
+
+impl FreeRuns {
+  /// first-fit 取一段 ≥ `n` 的空闲，返回段首（从段首切走 `n` 字）。
+  fn alloc(&mut self, n: usize) -> Option<usize> {
+    let i = self.runs.iter().position(|&(_, len)| len >= n)?;
+    let (start, len) = self.runs[i];
+    if len == n {
+      self.runs.remove(i);
+    } else {
+      self.runs[i] = (start + n, len - n);
+    }
+    Some(start)
+  }
+
+  /// 若 `[start, start+len)` 完全落在某段空闲内则切走它（原地扩容用），否则不动并返回 false。
+  fn take_range(&mut self, start: usize, len: usize) -> bool {
+    if len == 0 {
+      return true;
+    }
+    let Some(i) = self.runs.iter().position(|&(s, l)| s <= start && start + len <= s + l) else {
+      return false;
+    };
+    let (s, l) = self.runs.remove(i);
+    self.free(s, start - s);
+    self.free(start + len, s + l - start - len);
+    true
+  }
+
+  /// 归还 `[start, start+len)`（与前后相邻段合并）。
+  fn free(&mut self, start: usize, len: usize) {
+    if len == 0 {
+      return;
+    }
+    let i = self.runs.partition_point(|&(s, _)| s < start);
+    if i > 0 && self.runs[i - 1].0 + self.runs[i - 1].1 == start {
+      self.runs[i - 1].1 += len;
+      if i < self.runs.len() && self.runs[i - 1].0 + self.runs[i - 1].1 == self.runs[i].0 {
+        let (_, l2) = self.runs.remove(i);
+        self.runs[i - 1].1 += l2;
+      }
+      return;
+    }
+    if i < self.runs.len() && start + len == self.runs[i].0 {
+      self.runs[i].0 = start;
+      self.runs[i].1 += len;
+      return;
+    }
+    self.runs.insert(i, (start, len));
+  }
+
+  /// 空闲总字数
+  fn words(&self) -> usize {
+    self.runs.iter().map(|&(_, l)| l).sum()
+  }
+}
+
 /// chunk 是否有可渲染内容（排除残留空树）。
 fn chunk_has_content(grid: &VolumeGrid, c: ChunkCoord) -> bool {
   grid.chunk(c).is_some_and(|t| !t.is_empty())
@@ -51,17 +125,76 @@ pub enum ChunkUpdate {
   OutsideWindow,
 }
 
+/// 节点槽未分配的哨兵
+const NODE_NONE: u32 = u32::MAX;
+
+/// 节点槽（索引 = 树节点 id）：节点在**块内**的字偏移 + 当前占用字数。
+/// 不存 wire 层 —— 层号由调用方给（`TreeDirty` 的层 / 递归深度），节点 id 与层的对应关系恒定。
+#[derive(Debug, Clone, Copy)]
+struct NodeSlot {
+  off: u32,
+  words: u16,
+}
+
+impl NodeSlot {
+  const UNASSIGNED: Self = Self { off: NODE_NONE, words: 0 };
+}
+
+/// 单 chunk 的树块：块首（= 根节点地址）+ 块内节点 arena。
+///
+/// 为什么是「块 + 块内 arena」而不是全局节点池：wire 的子块指针以**根地址**为基准
+/// （shader 的 `chunk_base`），一个 chunk 的节点只能整体搬 —— 块内偏移全不变 ⇒ 搬块只需改
+/// 窗口条目 1 个字，节点内容一字不动。块首由全局 [`FreeRuns`] 分配，块内节点由 `free` 分配。
+#[derive(Debug)]
+struct ChunkSlot {
+  /// 块首（`b_struct` 内字址），恒等于根节点地址
+  base: usize,
+  /// 块容量（字；含末尾余量，见 [`BrickMapBuilder::install_blob`]）
+  cap: usize,
+  /// 块内空闲段（偏移相对 `base`）
+  free: FreeRuns,
+  /// 节点槽表（索引 = 节点 id）
+  nodes: Vec<NodeSlot>,
+}
+
+impl ChunkSlot {
+  /// 已占用字数（含根节点的固定预留区）
+  fn used(&self) -> usize {
+    self.cap - self.free.words()
+  }
+}
+
+/// 节点在块内占用的字数（wire 形态）：根固定 [`ROOT_WIRE_WORDS`]（掩码增减不改根的字数 ⇒ 根永不搬迁）。
+#[inline]
+fn wire_words_of(id: u32, level: u8, mask: u64) -> usize {
+  if id == 0 {
+    ROOT_WIRE_WORDS
+  } else if mask == 0 {
+    NODE_FIXED_WORDS
+  } else if level == 3 {
+    NODE_FIXED_WORDS + LEAF_INLINE_WORDS
+  } else {
+    NODE_FIXED_WORDS + mask.count_ones() as usize
+  }
+}
+
+/// 读 `b_struct` 里某节点的 64 位掩码
+#[inline]
+fn read_mask(buf: &[u32], at: usize) -> u64 {
+  (buf[at + 1] as u64) << 32 | buf[at] as u64
+}
+
 /// 砖块图构建器：持有与 GPU buffer 字节一致的持久状态。
 /// chunk 窗口（origin/dims，chunk 单位）构造时确定；窗口外新 chunk 不渲染，全量重建可扩窗。
 pub struct BrickMapBuilder {
   buffers: BrickMapBuffers,
-  /// 已渲染 chunk → (树区绝对字基址, 树字数)
-  base_of: HashMap<ChunkCoord, (usize, usize)>,
+  /// 已渲染 chunk → 树块
+  chunks: HashMap<ChunkCoord, ChunkSlot>,
   origin: IVec3,
   dims: IVec3,
   rejected_chunks: u32,
-  /// 作废树字节累计（增量 append 的旧树；全量重建归零）。
-  garbage_words: usize,
+  /// 全局块级空闲段（字，`b_struct` 内绝对地址）
+  free: FreeRuns,
   /// 增量更新脏字节区间列表：每项 `(lo_byte, hi_byte)` 闭开，字对齐。
   dirty_struct: Vec<(usize, usize)>,
   /// 待上传的调色板脏槽闭区间（同一帧多次 `write_palette` 取并集）；None = 无变动。
@@ -127,11 +260,11 @@ impl BrickMapBuilder {
           _pad4: 0,
         },
       },
-      base_of: HashMap::new(),
+      chunks: HashMap::new(),
       origin,
       dims,
       rejected_chunks: rejected as u32,
-      garbage_words: 0,
+      free: FreeRuns::default(),
       dirty_struct: Vec::new(),
       dirty_palette: None,
       palette_synced_at: None,
@@ -141,7 +274,7 @@ impl BrickMapBuilder {
   }
 
   /// 全量构建（初始化 / 兜底）：确定性 + Rayon 并行序列化。
-  /// chunk 按 ChunkCoord 升序 append；仅序列化并行，append 顺序不变。
+  /// chunk 按 ChunkCoord 升序安装；序列化并行，安装顺序不变（块地址按安装序递增）。
   pub fn build_full(grid: &VolumeGrid) -> Self {
     let mut b = Self::new_unbuilt(grid);
     let mut coords: Vec<ChunkCoord> = grid
@@ -150,12 +283,12 @@ impl BrickMapBuilder {
       .collect();
     coords.sort_by_key(|&c| coord_key(c));
 
-    let blobs: Vec<Vec<u32>> = coords
+    let blobs: Vec<(Vec<u32>, NodeLayout)> = coords
       .par_iter()
-      .map(|&c| grid.chunk(c).expect("chunk_has_content 已过滤").serialize())
+      .map(|&c| grid.chunk(c).expect("chunk_has_content 已过滤").serialize_with_layout())
       .collect();
-    for (c, words) in coords.iter().zip(blobs) {
-      b.append_chunk(*c, &words);
+    for (c, (blob, layout)) in coords.iter().zip(blobs) {
+      b.install_blob(*c, blob, layout);
     }
     b.refresh_globals();
 
@@ -163,30 +296,44 @@ impl BrickMapBuilder {
     b
   }
 
-  /// 逐 chunk 增量重建：重序列化 append + 窗口条目改指；旧树字节计入 `node_free_words`。
-  pub fn update_chunk(&mut self, grid: &VolumeGrid, coord: ChunkCoord) -> ChunkUpdate {
+  /// 逐 chunk 增量更新。
+  ///
+  /// `dirty` = 该 chunk 自上次上传以来的**节点级**改动（主 world 在 `Last` 阶段与脏 chunk 一起取走）。
+  /// `reset`（身份空间换过）或本来没有块 ⇒ 释放旧块后全量重装；否则只重写 `dirty.nodes` 里的节点。
+  /// `allow_compact` = 现在是不是"安静时刻"（见 [`Self::compact`]）；由调用方（`extract`）判定。
+  pub fn update_chunk(
+    &mut self,
+    grid: &VolumeGrid,
+    coord: ChunkCoord,
+    dirty: &TreeDirty,
+    allow_compact: bool,
+  ) -> ChunkUpdate {
     if chunk_index_pos(self.origin, self.dims, coord.0).is_none() {
       return ChunkUpdate::OutsideWindow;
     }
-    let has = chunk_has_content(grid, coord);
-    let out = match self.base_of.get(&coord).copied() {
-      None if !has => ChunkUpdate::Unchanged,
-      None => {
-        let words = grid.chunk(coord).expect("chunk_has_content").serialize();
-        self.append_chunk(coord, &words);
-        ChunkUpdate::Rebuilt
-      }
-      Some((_, old_words)) if !has => {
-        self.release_chunk(coord, old_words);
+    let out = if !chunk_has_content(grid, coord) {
+      if self.chunks.contains_key(&coord) {
+        self.release_chunk(coord);
         ChunkUpdate::Released
+      } else {
+        ChunkUpdate::Unchanged
       }
-      Some((_, old_words)) => {
-        let words = grid.chunk(coord).expect("chunk_has_content").serialize();
-        self.garbage_words += old_words;
-        self.append_chunk(coord, &words);
-        ChunkUpdate::Rebuilt
+    } else {
+      let tree = grid.chunk(coord).expect("chunk_has_content");
+      if self.chunks.contains_key(&coord) && !dirty.reset {
+        self.apply_node_dirty(coord, tree, dirty);
+      } else {
+        // 新 chunk / 身份空间作废：旧块（若有）归还，整棵重装
+        self.release_chunk(coord);
+        self.install_chunk(coord, tree);
       }
+      ChunkUpdate::Rebuilt
     };
+    // 树区过半是空闲段 ⇒ 压实：否则碎片会累积到"没有足够大的连续段"从而只能追加，高水位长期膨胀。
+    // 只在安静时刻做（见 `allow_compact` 的说明）。
+    if allow_compact && self.free.words() * 2 > self.buffers.b_struct.len() - TREE_BASE {
+      self.compact();
+    }
     self.refresh_globals();
 
     // palette 脏槽必须与触发它的那次体素编辑同一帧上传。
@@ -237,7 +384,7 @@ impl BrickMapBuilder {
 
   /// chunk 当前树基址（b_struct 内绝对字址；None = 未渲染）
   pub fn chunk_base(&self, coord: ChunkCoord) -> Option<usize> {
-    self.base_of.get(&coord).map(|&(b, _)| b)
+    self.chunks.get(&coord).map(|s| s.base)
   }
 
   pub fn origin(&self) -> IVec3 {
@@ -248,33 +395,244 @@ impl BrickMapBuilder {
     self.dims
   }
 
-  /// append 一个 chunk 的序列化树 + 写窗口条目（幂等覆盖同 chunk 旧条目）
-  fn append_chunk(&mut self, coord: ChunkCoord, words: &[u32]) {
-    let base = self.buffers.b_struct.len();
-    let ip =
-      chunk_index_pos(self.origin, self.dims, coord.0).expect("append_chunk 只接受窗口内 chunk");
-    self.buffers.b_struct[ip] = base as u32 + 1;
-    self.buffers.b_struct.extend_from_slice(words);
-    self.base_of.insert(coord, (base, words.len()));
-    self.mark_struct_words(ip, 1);
-    self.mark_struct_words(base, words.len());
+  /// 窗口条目字址（调用方保证 coord 在窗口内）
+  #[inline]
+  fn window_word(&self, coord: ChunkCoord) -> usize {
+    chunk_index_pos(self.origin, self.dims, coord.0).expect("窗口内 chunk")
   }
 
-  /// chunk 变空：条目清零 + 旧树作废
-  fn release_chunk(&mut self, coord: ChunkCoord, old_words: usize) {
-    let ip =
-      chunk_index_pos(self.origin, self.dims, coord.0).expect("release_chunk 只接受窗口内 chunk");
-    self.garbage_words += old_words;
-    self.buffers.b_struct[ip] = 0;
-    self.base_of.remove(&coord);
+  /// 从全局空闲段取一个 ≥`cap` 字的块（找不到就追加到高水位）。
+  fn alloc_block(&mut self, cap: usize) -> usize {
+    match self.free.alloc(cap) {
+      Some(start) => start,
+      None => {
+        let start = self.buffers.b_struct.len();
+        self.buffers.b_struct.resize(start + cap, 0);
+        start
+      }
+    }
+  }
+
+  /// 全量安装一个 chunk 的树（新块 + 窗口条目 + 节点槽表）
+  fn install_chunk(&mut self, coord: ChunkCoord, tree: &ChunkTree) {
+    let (blob, layout) = tree.serialize_with_layout();
+    self.install_blob(coord, blob, layout);
+  }
+
+  fn install_blob(&mut self, coord: ChunkCoord, blob: Vec<u32>, layout: NodeLayout) {
+    let need = blob.len();
+    // 块留 25% 余量（且至少容得下一个最大节点）：后续编辑的字数变化优先在块内解决，
+    // 免得动不动搬整块（搬块 = 整棵 chunk 重传）。
+    let cap = need + need / 4 + ROOT_WIRE_WORDS + 16;
+    let base = self.alloc_block(cap);
+    self.buffers.b_struct[base..base + need].copy_from_slice(&blob);
+    let mut free = FreeRuns::default();
+    free.free(need, cap - need);
+    // 节点槽表同样留 25% 余量：树每编辑一次就可能多几个节点，槽表若刚好卡在长度上，
+    // 头一次增长要 realloc + 填满整表（几十万槽 = 毫秒级）。
+    let mut nodes: Vec<NodeSlot> = Vec::with_capacity(layout.len() + layout.len() / 4 + 64);
+    nodes.extend(layout.iter().enumerate().map(|(id, &(off, level))| {
+      if off == NODE_OFFSET_NONE {
+        NodeSlot::UNASSIGNED
+      } else {
+        NodeSlot {
+          off,
+          words: wire_words_of(id as u32, level, read_mask(&blob, off as usize)) as u16,
+        }
+      }
+    }));
+    let ip = self.window_word(coord);
+    self.buffers.b_struct[ip] = base as u32 + 1;
+    self.chunks.insert(coord, ChunkSlot { base, cap, free, nodes });
     self.mark_struct_words(ip, 1);
+    self.mark_struct_words(base, need);
+  }
+
+  /// chunk 变空 / 身份空间作废：块归还全局空闲段 + 窗口条目清零（无块时无操作）
+  fn release_chunk(&mut self, coord: ChunkCoord) {
+    let Some(slot) = self.chunks.remove(&coord) else { return };
+    self.free.free(slot.base, slot.cap);
+    let ip = self.window_word(coord);
+    self.buffers.b_struct[ip] = 0;
+    self.mark_struct_words(ip, 1);
+  }
+
+  /// 增量重写一个 chunk 里动过的节点（[`TreeDirty`] 保证按层降序 = 自底向上：
+  /// 子节点先定址，父节点的指针表才写得对）。
+  fn apply_node_dirty(&mut self, coord: ChunkCoord, tree: &ChunkTree, dirty: &TreeDirty) {
+    let mut slot = self.chunks.remove(&coord).expect("调用方保证有块");
+    if slot.nodes.len() < tree.node_capacity() {
+      slot.nodes.resize(tree.node_capacity(), NodeSlot::UNASSIGNED);
+    }
+    for &(level, id) in &dirty.nodes {
+      let Some(view) = tree.node_view(id) else {
+        // 协议外的情形（身份空间失效却没带 reset）⇒ 退回全量重装，不做静默跳过
+        self.chunks.insert(coord, slot);
+        self.release_chunk(coord);
+        self.install_chunk(coord, tree);
+        return;
+      };
+      self.rewrite_node(coord, &mut slot, tree, level, id, view);
+    }
+    self.chunks.insert(coord, slot);
+  }
+
+  /// 重编码一个节点并就地更新：**字节完全相同就不写、不标脏**（[`TreeDirty`] 会把路径节点全报上来，
+  /// 靠这一步把"报多了"过滤掉）。字数变了优先原地（缩 → 尾部归还；增 → 紧跟其后正好空闲才扩），
+  /// 否则在块内搬一个位置（父节点必然也在 dirty 表里，会随之改指针）。
+  fn rewrite_node(
+    &mut self,
+    coord: ChunkCoord,
+    slot: &mut ChunkSlot,
+    tree: &ChunkTree,
+    level: u8,
+    id: u32,
+    view: NodeView<'_>,
+  ) {
+    let new_words = wire_words_of(id, level, view.mask);
+    let old = slot.nodes[id as usize];
+
+    // ---- 新字节：子块指针 = 子节点**当前**块内偏移 ----
+    let mut out: Vec<u32> = Vec::with_capacity(new_words);
+    out.push(view.mask as u32);
+    out.push((view.mask >> 32) as u32);
+    out.push(view.palette.get() as u32);
+    if view.mask != 0 {
+      if level == 3 {
+        out.extend_from_slice(&tree.node_inline_words(id).expect("level 3 分裂节点有 inline"));
+      } else {
+        for &c in view.children {
+          out.push(slot.nodes[c as usize].off);
+        }
+      }
+    }
+    // 根块的预留区（[`ROOT_WIRE_WORDS`]）大于实际内容（3 + popcount）：定址按预留区算、
+    // 写只写内容长度 —— 这样掩码增减不会动根的位置（见 `wire_words_of`）。
+    let content = out.len();
+    debug_assert!(content == new_words || id == 0, "节点 {id} 的编码字数与定址口径不符");
+
+    // ---- 变 uniform（掩码清零）⇒ 旧子块整棵释放 ----
+    //
+    // CONSTRAINT: 只在这个状态下释放。掩码只增不减（`child_or_create` 只置位，缩位只发生在整节点
+    // 变 uniform 时），而"变 uniform 的节点其子块必然也已是 uniform"、uniform 节点恒 3 字且
+    // 原地留驻 ⇒ 老 blob 里的子块偏移此刻仍然有效（换成"按偏移差集释放"就会把已搬走的活子块
+    // 的旧地址当成死块释放 —— 那个地址可能已分给别人）。
+    if old.off != NODE_NONE && level < 3 && view.mask == 0 {
+      let old_at = slot.base + old.off as usize;
+      let old_mask = read_mask(&self.buffers.b_struct, old_at);
+      for slot_i in 0..old_mask.count_ones() as usize {
+        let c = self.buffers.b_struct[old_at + NODE_FIXED_WORDS + slot_i];
+        Self::free_subtree(&self.buffers.b_struct, slot, c, level + 1);
+      }
+    }
+
+    // ---- 定址 ----
+    // 缩小（含字数不变）：原地留驻，**尾部必须归还**空闲段 —— 紧挨着的空闲段合到一起，下一次
+    // 增长才能原地扩回来（同一个 4³ brick 反复"合并 → 再分裂"是高频场景：level 3 在 3 ↔ 35 字之间
+    // 摆动，不还尾部就会攒出一堆填不上的洞，把高水位一路顶上去）。
+    let off = if old.off == NODE_NONE {
+      self.alloc_node(coord, slot, new_words)
+    } else if new_words <= old.words as usize {
+      slot.free.free(old.off as usize + new_words, old.words as usize - new_words);
+      old.off
+    } else if slot
+      .free
+      .take_range(old.off as usize + old.words as usize, new_words - old.words as usize)
+    {
+      old.off // 原地扩容：紧跟其后正好是空闲段
+    } else {
+      slot.free.free(old.off as usize, old.words as usize);
+      self.alloc_node(coord, slot, new_words)
+    };
+
+    // ---- 写 ----
+    let at = slot.base + off as usize;
+    if off != old.off || self.buffers.b_struct[at..at + content] != out[..] {
+      self.buffers.b_struct[at..at + content].copy_from_slice(&out);
+      self.mark_struct_words(at, content);
+    }
+    slot.nodes[id as usize] = NodeSlot { off, words: new_words as u16 };
+  }
+
+  /// 释放一个节点块**及其全部后代**（子块关系读**旧 blob**，与缓存无关；根不在此路径上，
+  /// 故字数口径不必特判 id = 0）。字数 = 内容字数（与 [`Self::rewrite_node`] 的归还口径一致）。
+  fn free_subtree(buf: &[u32], slot: &mut ChunkSlot, off: u32, level: u8) {
+    let at = slot.base + off as usize;
+    let mask = read_mask(buf, at);
+    if mask != 0 && level < 3 {
+      for i in 0..mask.count_ones() as usize {
+        Self::free_subtree(buf, slot, buf[at + NODE_FIXED_WORDS + i], level + 1);
+      }
+    }
+    slot.free.free(off as usize, wire_words_of(1, level, mask));
+  }
+
+  /// 块内分配一个字数为 `words` 的节点；块内没有足够连续空闲时先把块换大。
+  fn alloc_node(&mut self, coord: ChunkCoord, slot: &mut ChunkSlot, words: usize) -> u32 {
+    if let Some(off) = slot.free.alloc(words) {
+      return off as u32;
+    }
+    self.grow_block(coord, slot);
+    slot.free.alloc(words).expect("块扩容量恒 ≥ 单个节点最大字数") as u32
+  }
+
+  /// 块内空间不足：换一个更大的块（整块搬过去；块内偏移不变 ⇒ 节点内容一字不动），旧块归还全局空闲段。
+  /// 整块字节都换了位置 ⇒ **必须整块重传** —— 只在块的几何增长时发生。
+  fn grow_block(&mut self, coord: ChunkCoord, slot: &mut ChunkSlot) {
+    let old_cap = slot.cap;
+    let new_cap = old_cap + old_cap / 2 + ROOT_WIRE_WORDS + 1;
+    let new_base = self.alloc_block(new_cap);
+    self.buffers.b_struct.copy_within(slot.base..slot.base + old_cap, new_base);
+    self.free.free(slot.base, old_cap);
+    let used = slot.used();
+    slot.base = new_base;
+    slot.cap = new_cap;
+    slot.free.free(old_cap, new_cap - old_cap);
+    let ip = self.window_word(coord);
+    self.buffers.b_struct[ip] = new_base as u32 + 1;
+    self.mark_struct_words(ip, 1);
+    self.mark_struct_words(new_base, used);
+  }
+
+  /// 压实树区：把存活块紧排到 `TREE_BASE` 之后、丢掉全部空闲段、窗口条目重指。
+  /// 块内节点存的是**相对块首**的偏移 ⇒ 搬块不需要重写块内容，只改窗口条目与块首。
+  /// 只在空闲过半、且处于安静时刻时调用（见 [`Self::update_chunk`]）；**只标"搬动过的块"的目标段**
+  /// （没动的块在 GPU 上本来就是对的），相邻段由 `mark_struct_words` 自动并成 1~2 段。
+  fn compact(&mut self) {
+    let mut items: Vec<(ChunkCoord, usize, usize)> =
+      self.chunks.iter().map(|(&c, s)| (c, s.base, s.cap)).collect();
+    // CONSTRAINT: 必须按**旧基址**升序搬（不是按坐标）—— 压实只会前移，升序搬运才能保证"目标段"
+    // 永不覆盖尚未搬运的段（旧布局是分配序，与坐标序不一致）。
+    items.sort_by_key(|&(_, old_base, _)| old_base);
+    let mut cursor = TREE_BASE;
+    let mut moved = 0usize;
+    for (coord, old_base, cap) in items {
+      if old_base != cursor {
+        self.buffers.b_struct.copy_within(old_base..old_base + cap, cursor);
+        let ip = self.window_word(coord);
+        self.chunks.get_mut(&coord).expect("窗口内 chunk").base = cursor;
+        self.buffers.b_struct[ip] = cursor as u32 + 1;
+        self.mark_struct_words(ip, 1);
+        self.mark_struct_words(cursor, cap);
+        moved += cap;
+      }
+      cursor += cap;
+    }
+    self.buffers.b_struct.truncate(cursor);
+    self.free = FreeRuns::default();
+    bevy::log::debug!(
+      "COMPACT 树区 长{}字 → {}字（搬 {moved} 字 / {} 块）",
+      self.buffers.globals.node_words,
+      cursor - TREE_BASE,
+      self.chunks.len()
+    );
   }
 
   fn refresh_globals(&mut self) {
     let g = &mut self.buffers.globals;
-    g.tile_count = self.base_of.len() as u32;
+    g.tile_count = self.chunks.len() as u32;
     g.node_words = (self.buffers.b_struct.len() - TREE_BASE) as u32;
-    g.node_free_words = self.garbage_words as u32;
+    g.node_free_words = self.free.words() as u32;
     g.brick_slabs = 0;
     g.brick_free = 0;
     g.rejected_tiles = self.rejected_chunks;
@@ -386,14 +744,16 @@ impl VolumesBuilder {
     }
   }
 
-  /// 逐 chunk 增量更新指定 volume
+  /// 逐 chunk 增量更新指定 volume（`dirty` / `allow_compact` 见 [`BrickMapBuilder::update_chunk`]）
   pub fn update_chunk(
     &mut self,
     volumes: &Volumes,
     volume_idx: usize,
     coord: ChunkCoord,
+    dirty: &TreeDirty,
+    allow_compact: bool,
   ) -> ChunkUpdate {
-    self.builders[volume_idx].update_chunk(&volumes.all()[volume_idx], coord)
+    self.builders[volume_idx].update_chunk(&volumes.all()[volume_idx], coord, dirty, allow_compact)
   }
 
   /// 标记全量重建（下帧 snapshot 走 full 路径）
@@ -555,4 +915,348 @@ fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
     .filter(|&c| chunk_has_content(grid, c) && chunk_index_pos(origin, dims, c.0).is_none())
     .count();
   (origin, dims, rejected)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// 空闲段：first-fit、相邻合并（前向 / 后向 / 双向）、跨洞不合并
+  #[test]
+  fn free_runs_first_fit_and_coalesce() {
+    let mut f = FreeRuns::default();
+    assert_eq!(f.alloc(4), None, "空表无段可分配");
+    f.free(100, 8);
+    f.free(200, 8);
+    f.free(108, 4); // 与 100..108 前向相邻 ⇒ 合并成 100..112
+    assert_eq!(f.words(), 20);
+    assert_eq!(f.alloc(12), Some(100), "first-fit 命中第一段够大的");
+    assert_eq!(f.words(), 8);
+    assert_eq!(f.alloc(9), None, "剩 8 字凑不出 9");
+    f.free(300, 4);
+    f.free(304, 4); // 与 300..304 后向相邻 ⇒ 合并成 300..308
+    assert_eq!(f.alloc(8), Some(200), "更靠前的段够 8 字");
+    assert_eq!(f.alloc(4), Some(300));
+    assert_eq!(f.alloc(4), Some(304), "切走 4 字后剩余段从 304 起");
+    assert_eq!(f.words(), 0);
+    // 中间有洞则各自独立，凑不出连续 8 字
+    f.free(500, 4);
+    f.free(510, 4);
+    assert_eq!(f.alloc(8), None);
+    // take_range：只在完全落在某段空闲内时切走（原地扩容用），并把两侧余量归还
+    assert!(!f.take_range(506, 4), "跨在两段之间 ⇒ 拒绝");
+    f.free(600, 10);
+    assert!(!f.take_range(606, 8), "跨出段尾 ⇒ 拒绝");
+    assert!(f.take_range(604, 4), "完全落在段内 ⇒ 切走");
+    assert_eq!(f.words(), 4 + 4 + 4 + 2, "500..504 / 510..514 / 600..604 / 608..610");
+    assert!(f.take_range(604, 0), "空请求恒成功");
+  }
+
+  /// 铺一块 16³ 实体（树里有 Split 层）+ 一个 8³ 方块到相邻 chunk
+  fn two_chunk_grid() -> (VolumeGrid, ChunkCoord, ChunkCoord) {
+    let mut grid = VolumeGrid::new();
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
+        }
+      }
+    }
+    let c1 = ChunkCoord(IVec3::new(1, 0, 0));
+    for x in 0..8 {
+      for y in 0..8 {
+        for z in 0..8 {
+          grid.set_voxel_ivec3(c1.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(2));
+        }
+      }
+    }
+    (grid, ChunkCoord(IVec3::ZERO), c1)
+  }
+
+  /// 取走一个 chunk 的节点级改动（与主 world `poll_pending` 同一口径）
+  fn take_dirty_of(grid: &mut VolumeGrid, c: ChunkCoord) -> TreeDirty {
+    grid.chunk_mut(c).map(|t| t.take_dirty()).unwrap_or_default()
+  }
+
+  /// 建场景时的标记由首帧安装消费（生产路径：`poll_pending` 的首次 drain 带上 `reset`）。
+  /// 测试里等价地先 drain 一遍，让后续断言只看得见新编辑。
+  fn build_and_drain(grid: &mut VolumeGrid) -> BrickMapBuilder {
+    let b = BrickMapBuilder::build_full(grid);
+    let coords: Vec<ChunkCoord> = grid.chunk_coords().collect();
+    for c in coords {
+      let _ = take_dirty_of(grid, c);
+    }
+    b
+  }
+
+  /// wire 子树 ↔ `ChunkTree` 子树**逐节点**精确比对（掩码 / uniform 色 / inline / 子块指针），
+  /// 返回比对的节点数。读的就是 shader 会读的那些字节 ⇒ 不用抽样、也不会漏掉坏节点。
+  fn assert_wire_node(
+    buf: &[u32],
+    base: usize,
+    off: usize,
+    tree: &ChunkTree,
+    id: u32,
+    level: u8,
+  ) -> usize {
+    let view = tree.node_view(id).expect("grid 侧节点必 live");
+    let at = base + off;
+    assert_eq!(read_mask(buf, at), view.mask, "节点 {id}（层 {level}）掩码不符");
+    assert_eq!((buf[at + 2] & 0xFFFF) as u16, view.palette.get(), "节点 {id} 的 uniform 色不符");
+    if view.mask == 0 {
+      return 1;
+    }
+    if level == 3 {
+      let inline = tree.node_inline_words(id).expect("level 3 分裂节点有 inline");
+      assert_eq!(
+        &buf[at + NODE_FIXED_WORDS..at + NODE_FIXED_WORDS + LEAF_INLINE_WORDS],
+        &inline[..],
+        "节点 {id} 的 inline 字不符"
+      );
+      return 1;
+    }
+    let mut n = 1;
+    for (slot, &child) in view.children.iter().enumerate() {
+      let child_off = buf[at + NODE_FIXED_WORDS + slot] as usize;
+      n += assert_wire_node(buf, base, child_off, tree, child, level + 1);
+    }
+    n
+  }
+
+  /// 每个有内容的 chunk：wire 字节解出来的树必须与 grid 的权威树**逐节点相同**
+  ///（复用 / 原地增删 / 压实搬运 / 块扩容之后都成立）
+  fn assert_wire_matches_grid(b: &BrickMapBuilder, grid: &VolumeGrid, what: &str) {
+    let mut nodes = 0usize;
+    for c in grid.chunk_coords().filter(|&c| chunk_has_content(grid, c)) {
+      let tree = grid.chunk(c).expect("chunk_has_content");
+      let base = b.chunk_base(c).unwrap_or_else(|| panic!("{what}：{c:?} 有内容但窗口无块"));
+      assert_eq!(
+        b.buffers().b_struct[b.window_word(c)] as usize,
+        base + 1,
+        "{what}：{c:?} 的窗口条目未指向块首"
+      );
+      if tree.is_uniform_root() {
+        assert_eq!(read_mask(&b.buffers().b_struct, base), 0, "{what}：{c:?} 单色根掩码应为 0");
+        assert_eq!(
+          (b.buffers().b_struct[base + 2] & 0xFFFF) as u16,
+          tree.root_palette().get(),
+          "{what}：{c:?} 单色根色不符"
+        );
+        nodes += 1;
+      } else {
+        nodes += assert_wire_node(&b.buffers().b_struct, base, 0, tree, 0, 0);
+      }
+    }
+    assert!(nodes > 0, "{what}：没有可比对的节点");
+  }
+
+  /// 反复编辑同一个 chunk：节点字数在"分裂 / 合回"间摆动 ⇒ 块内空闲段原地复用，高水位不动
+  ///（没有块内 arena 时，每次编辑都要追加一整棵新树 ⇒ 高水位线性增长）。
+  #[test]
+  fn repeated_edits_reuse_freed_space_in_block() {
+    let (mut grid, c0, _) = two_chunk_grid();
+    let mut b = build_and_drain(&mut grid);
+    let hw0 = b.buffers().b_struct.len();
+    // 改 / 改回同一个格：块在 Uniform 与 Split 间切换（节点字数摆动）
+    let p = IVec3::new(3, 3, 3);
+    let mut hw_seq = Vec::new();
+    for i in 0..20 {
+      grid.set_voxel_ivec3(p, if i % 2 == 0 { PaletteId(2) } else { PaletteId(1) });
+      let dirty = take_dirty_of(&mut grid, c0);
+      assert_eq!(b.update_chunk(&grid, c0, &dirty, true), ChunkUpdate::Rebuilt);
+      assert_wire_matches_grid(&b, &grid, &format!("第 {i} 次编辑"));
+      hw_seq.push(b.buffers().b_struct.len());
+    }
+    let tail = &hw_seq[5..];
+    assert!(
+      tail.iter().all(|&h| h == tail[0]),
+      "高水位应在头几次编辑后稳定在块内解决，实际序列 {hw_seq:?}"
+    );
+    assert!(
+      hw_seq[19] <= hw0 + ROOT_WIRE_WORDS,
+      "20 次编辑最多只该用掉初始余量：{hw0} → {}",
+      hw_seq[19]
+    );
+  }
+
+  /// chunk 清空后空闲段占满树区 ⇒ 触发压实：高水位回落，存活 chunk 的树跟着前移且内容不变
+  #[test]
+  fn compaction_shrinks_tree_region() {
+    let mut grid = VolumeGrid::new();
+    let (c0, c1) = (ChunkCoord(IVec3::ZERO), ChunkCoord(IVec3::new(1, 0, 0)));
+    // c0：16³ 棋盘格 —— 每个 4³ brick 都是 Mixed，树远大于 c1（实体块会被合并成 uniform）
+    let checker = |x: i32, y: i32, z: i32| (x + y + z) % 2 == 0;
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          if checker(x, y, z) {
+            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
+          }
+        }
+      }
+    }
+    // c1：8³ 实心块
+    for x in 0..8 {
+      for y in 0..8 {
+        for z in 0..8 {
+          grid.set_voxel_ivec3(c1.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(2));
+        }
+      }
+    }
+    let mut b = build_and_drain(&mut grid);
+    let hw0 = b.buffers().b_struct.len();
+    let c1_base_before = b.chunk_base(c1).expect("窗口内");
+    assert!(
+      grid.chunk(c0).expect("chunk").serialize().len()
+        > grid.chunk(c1).expect("chunk").serialize().len(),
+      "前提：待清空的 c0 树更大（否则空闲占不到一半，不该压实）"
+    );
+    // 擦空 c0（棋盘格逐格擦 ⇒ 每层向上合并，最终整 chunk 空）
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          if checker(x, y, z) {
+            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId::AIR);
+          }
+        }
+      }
+    }
+    let dirty = take_dirty_of(&mut grid, c0);
+    assert_eq!(b.update_chunk(&grid, c0, &dirty, true), ChunkUpdate::Released);
+    assert_eq!(b.chunk_base(c0), None, "清空后窗口条目应清零");
+    assert!(
+      b.buffers().b_struct.len() < hw0,
+      "压实后树区应变短（{hw0} → {}）",
+      b.buffers().b_struct.len()
+    );
+    assert_eq!(b.chunk_base(c1), Some(TREE_BASE), "存活 chunk 应被前移到树区起点");
+    assert_ne!(b.chunk_base(c1), Some(c1_base_before));
+    assert_wire_matches_grid(&b, &grid, "压实后");
+    assert_eq!(b.buffers().globals.node_free_words, 0, "压实后不应残留空闲段");
+  }
+
+  /// 笔触进行中（`allow_compact = false`）**不压实**：同一场景下先不压（树区不缩），安静后再压（缩）。
+  #[test]
+  fn compaction_deferred_while_editing() {
+    let mut grid = VolumeGrid::new();
+    let (c0, c1) = (ChunkCoord(IVec3::ZERO), ChunkCoord(IVec3::new(1, 0, 0)));
+    let checker = |x: i32, y: i32, z: i32| (x + y + z) % 2 == 0;
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          if checker(x, y, z) {
+            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
+          }
+        }
+      }
+    }
+    for x in 0..8 {
+      for y in 0..8 {
+        for z in 0..8 {
+          grid.set_voxel_ivec3(c1.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(2));
+        }
+      }
+    }
+    let mut b = build_and_drain(&mut grid);
+    let hw0 = b.buffers().b_struct.len();
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          if checker(x, y, z) {
+            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId::AIR);
+          }
+        }
+      }
+    }
+    // 笔触进行中：空闲已过半但不压 ⇒ 树区长度不变
+    let dirty = take_dirty_of(&mut grid, c0);
+    assert_eq!(b.update_chunk(&grid, c0, &dirty, false), ChunkUpdate::Released);
+    assert_eq!(b.buffers().b_struct.len(), hw0, "笔触进行中不该压实");
+    assert_wire_matches_grid(&b, &grid, "延迟压实后（未压）");
+    // 安静了：下一次更新顺手压实 ⇒ 树区变短、存活 chunk 前移
+    let dirty = take_dirty_of(&mut grid, c1);
+    assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Rebuilt);
+    assert!(b.buffers().b_struct.len() < hw0, "安静时应压实");
+    assert_eq!(b.chunk_base(c1), Some(TREE_BASE), "存活 chunk 应被前移到树区起点");
+    assert_wire_matches_grid(&b, &grid, "延迟压实后（已压）");
+    assert_eq!(b.buffers().globals.node_free_words, 0);
+  }
+
+  /// 压力：随机切换体素（含清空 / 重建）200 步，每步逐节点核对 wire 字节
+  #[test]
+  fn incremental_layout_survives_random_edits() {
+    let (mut grid, c0, c1) = two_chunk_grid();
+    let mut b = build_and_drain(&mut grid);
+    let mut seed = 0x1234_5678u32;
+    let mut rnd = move || {
+      seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      (seed >> 8) as usize
+    };
+    for step in 0..200 {
+      let coord = if rnd() % 2 == 0 { c0 } else { c1 };
+      let off = IVec3::new((rnd() % 24) as i32, (rnd() % 24) as i32, (rnd() % 24) as i32);
+      let p = coord.0 * CHUNK_SIZE + off;
+      let v = if rnd() % 3 == 0 { PaletteId::AIR } else { PaletteId((rnd() % 3) as u16 + 1) };
+      grid.set_voxel_ivec3(p, v);
+      let dirty = take_dirty_of(&mut grid, coord);
+      b.update_chunk(&grid, coord, &dirty, true);
+      assert_wire_matches_grid(&b, &grid, &format!("随机第 {step} 步"));
+    }
+  }
+
+  /// **本改动的验收指标**：一次单格编辑的上传量 = 路径上的几个节点（几十~几百字节），
+  /// 而不是整棵 chunk 树（旧实现是 ~1.4MB/笔）。
+  #[test]
+  fn single_voxel_edit_uploads_only_the_path() {
+    let (mut grid, c0, _) = two_chunk_grid();
+    let mut b = build_and_drain(&mut grid);
+    let _ = b.take_dirty_ranges();
+
+    grid.set_voxel_ivec3(IVec3::new(5, 5, 5), PaletteId(3));
+    let dirty = take_dirty_of(&mut grid, c0);
+    assert!(!dirty.reset, "单格编辑不该重置身份空间");
+    assert!(dirty.nodes.len() <= 8, "dirty 表应只有路径节点，实际 {:?}", dirty.nodes);
+    assert_eq!(b.update_chunk(&grid, c0, &dirty, true), ChunkUpdate::Rebuilt);
+
+    let dr = b.take_dirty_ranges();
+    let bytes: usize = dr.struct_ranges.iter().map(|(lo, hi)| hi - lo).sum();
+    assert!(
+      bytes <= 512,
+      "单格编辑应只重写路径节点（≤512B），实际 {bytes}B：{:?}",
+      dr.struct_ranges
+    );
+    assert_wire_matches_grid(&b, &grid, "单格编辑后");
+  }
+
+  /// 整 chunk 擦空再重建：Released（块归还）→ Rebuilt（重新安装），全程 wire 与 grid 一致
+  #[test]
+  fn chunk_becomes_empty_then_rebuilds() {
+    let (mut grid, _, c1) = two_chunk_grid();
+    let mut b = build_and_drain(&mut grid);
+    let hw0 = b.buffers().b_struct.len();
+    let origin = c1.0 * CHUNK_SIZE;
+    for x in 0..8 {
+      for y in 0..8 {
+        for z in 0..8 {
+          grid.set_voxel_ivec3(origin + IVec3::new(x, y, z), PaletteId::AIR);
+        }
+      }
+    }
+    let dirty = take_dirty_of(&mut grid, c1);
+    assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Released);
+    assert_eq!(b.chunk_base(c1), None, "擦空后窗口条目应清零");
+    assert!(b.buffers().b_struct.len() < hw0, "块应被归还（高水位下降）");
+
+    for x in 0..8 {
+      for y in 0..8 {
+        for z in 0..8 {
+          grid.set_voxel_ivec3(origin + IVec3::new(x, y, z), PaletteId(2));
+        }
+      }
+    }
+    // 512 格一次重填会撞上"节点表上限 ⇒ 改用整棵重建"，这正是设计意图
+    let dirty = take_dirty_of(&mut grid, c1);
+    assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Rebuilt);
+    assert_wire_matches_grid(&b, &grid, "重建后");
+  }
 }

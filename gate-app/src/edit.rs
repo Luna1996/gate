@@ -26,7 +26,9 @@ use gate_voxel::{
 
 use crate::{
   camera::{CameraMode, MouseLock, cursor_ray},
-  consts::{DEMO_DISPLACE_TEX_SCALE, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH},
+  consts::{
+    DEMO_DISPLACE_TEX_SCALE, EDIT_BUDGET_MS, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH, EDIT_REPEAT_SECS,
+  },
   height_field::{MaterialDisplace, MaterialDisplaceCache},
 };
 
@@ -277,69 +279,229 @@ fn brush_box_inside(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent:
   true
 }
 
-/// 笔触的层级填充（`lo` = 对齐到 `extent` 的块最小角）：整块落在笔触内的走一次
-/// `VolumeGrid::fill_brick`（O(深度)，直接产出 uniform 上级节点），部分覆盖的才下钻，最小到 1³。
-/// `palette` 为 AIR 即擦除；放置只填空气、擦除只挖实体。
-#[allow(clippy::too_many_arguments)] // 递归下钻：参数即递归状态（笔触 + 当前块 + 输出），打包成结构体反而每层重建
-fn fill_brush_level(
-  grid: &mut VolumeGrid,
+/// 笔触半径（格）= `size - 1`；只做「不溢出 i32」的类型收敛（菜单 size 无上限）
+fn brush_radius(size: u32) -> i32 {
+  size.saturating_sub(1).min(i32::MAX as u32) as i32
+}
+
+/// 4³ 块 `[blo, blo+extent)` 到 `center` 的度量区间：球 = `d²`（各轴求和），立方 = `L∞`（最大轴距）。
+fn block_metric_range(shape: BrushShape, center: IVec3, blo: IVec3, extent: i32) -> (f32, f32) {
+  let (mut dmin, mut dmax) = (0.0f32, 0.0f32);
+  for a in 0..3 {
+    let lo = (blo[a] - center[a]) as f32;
+    let hi = lo + (extent - 1) as f32;
+    // 该轴上块到 0 的距离区间（块含 0 ⇒ near = 0）
+    let near = if lo <= 0.0 && hi >= 0.0 { 0.0 } else { lo.abs().min(hi.abs()) };
+    let far = lo.abs().max(hi.abs());
+    match shape {
+      BrushShape::Cube => {
+        dmin = dmin.max(near);
+        dmax = dmax.max(far);
+      }
+      BrushShape::Sphere => {
+        dmin += near * near;
+        dmax += far * far;
+      }
+    }
+  }
+  (dmin, dmax)
+}
+
+/// 笔触是否**只动了被实体完全包围的区域**（⇒ 可见几何不变，GI 历史可继续复用）。
+///
+/// 判据：笔触区域外一层全是实体 ⇒ 任何从外部进入的射线都会先命中外壳，而外壳不被笔触修改
+/// ⇒ 新出现的实体/空气界面看不见（山体内部挖洞、封在内部的空腔都属于这种）。
+/// 按 4³ 块粒度求外壳、**要求整块实心**（比逐体素更严）⇒ 只会多报"可见"，不会漏报。
+/// 位移笔触不适用（位移会写到区域外 ≤ 幅度格，外壳要再厚一档才安全），调用方按"可见"处理。
+fn stroke_hidden(grid: &VolumeGrid, shape: BrushShape, center: IVec3, r: i32) -> bool {
+  // 外壳的度量区间：立方 `L∞ ∈ (r, r+1]`；球 `d² ∈ (r²+r, (r+1)²+r]`
+  let (d_lo, d_hi) = match shape {
+    BrushShape::Cube => (r as f32, (r + 1) as f32),
+    BrushShape::Sphere => {
+      let rf = r as f32;
+      (rf * rf + rf, (rf + 1.0) * (rf + 1.0) + rf)
+    }
+  };
+  const EXT: i32 = 4;
+  let reach = r.saturating_add(8); // 含"块最小角可能在区域外一格再对齐下取"的余量
+  let lo0 = center.saturating_sub(IVec3::splat(reach)).div_euclid(IVec3::splat(EXT)) * EXT;
+  let hi0 = center.saturating_add(IVec3::splat(reach));
+  let mut x = lo0.x;
+  while x <= hi0.x {
+    let mut y = lo0.y;
+    while y <= hi0.y {
+      let mut z = lo0.z;
+      while z <= hi0.z {
+        let blo = IVec3::new(x, y, z);
+        let (dmin, dmax) = block_metric_range(shape, center, blo, EXT);
+        if dmin <= d_hi
+          && dmax > d_lo
+          && !matches!(grid.get_brick_state_extent(blo, EXT), BrickState::Solid(_))
+        {
+          return false;
+        }
+        z += EXT;
+      }
+      y += EXT;
+    }
+    x += EXT;
+  }
+  true
+}
+
+/// 普通笔触的待处理块（显式 DFS 栈的一项）：`lo` = 对齐到 `extent` 的块最小角。
+struct BrushJob {
+  lo: IVec3,
+  extent: i32,
+}
+
+/// 普通笔触的**分帧执行状态**：显式栈 + 累计统计，可跨帧续做。
+///
+/// 分帧原因：size=61 的球一笔 ≈33ms（castle.vox 实测），整帧做完整帧必掉。这里把"哪些块还没
+/// 处理"存下来，[`Self::step`] 在给定预算内尽量推进，其余留到下一帧（不丢笔、不阻塞帧）。
+/// 结果与"一次做完"逐位相同：块之间互不相交，且每块的写入只依赖该块自身当前内容。
+pub(crate) struct PlainBrush {
   shape: BrushShape,
   center: IVec3,
   r: i32,
-  lo: IVec3,
-  extent: i32,
   palette: PaletteId,
-  changed: &mut usize,
-) {
-  if brush_box_disjoint(shape, center, r, lo, extent) {
-    return;
-  }
-  let erase = palette.is_air();
-  if extent > 1 && brush_box_inside(shape, center, r, lo, extent) {
-    // 整块都在笔触内 → 按 brick 三态：空气+放置 / 实体+擦除 → 整块写；空气+擦除 / 实体+放置
-    // → 不改动（不啃掉已有几何）；Mixed → 下钻。
-    match grid.get_brick_state_extent(lo, extent) {
-      BrickState::Air => {
-        if !erase {
-          grid.fill_brick(lo, extent, palette);
-          *changed += (extent as usize).pow(3);
+  erase: bool,
+  stack: Vec<BrushJob>,
+  /// 累计实际改变的体素数（整块写按 `extent³` 计；与 [`apply_brush`] 同口径）
+  pub(crate) changed: usize,
+  /// 累计 CPU 时间（只含 `step` 内的推进）
+  pub(crate) cpu: std::time::Duration,
+  /// 已推进的帧数（>1 即真的跨帧了）
+  pub(crate) frames: u32,
+}
+
+impl PlainBrush {
+  pub(crate) fn new(center: IVec3, shape: BrushShape, size: u32, palette: PaletteId) -> Self {
+    let r = brush_radius(size);
+    // 起始层级：取 extent ≤ 跨度 2r+1 的最大 brick 粒度（小笔触直接落到 4³/1³）。
+    let span = r.saturating_mul(2).saturating_add(1);
+    let start = LEVEL_EXTENT.iter().copied().find(|&e| e <= span).unwrap_or(1);
+    // 覆盖笔触 AABB 的全部对齐块；世界对齐 ⇒ 块必落在单个 chunk 内（256 是各 brick 粒度的整数倍）。
+    let s = IVec3::splat(start);
+    let b_lo = center.saturating_sub(IVec3::splat(r)).div_euclid(s) * s;
+    let b_hi = center.saturating_add(IVec3::splat(r)).div_euclid(s) * s;
+    let mut stack = Vec::new();
+    let mut x = b_lo.x;
+    while x <= b_hi.x {
+      let mut y = b_lo.y;
+      while y <= b_hi.y {
+        let mut z = b_lo.z;
+        while z <= b_hi.z {
+          stack.push(BrushJob { lo: IVec3::new(x, y, z), extent: start });
+          z += start;
         }
-        return;
+        y += start;
       }
-      BrickState::Solid(_) => {
-        if erase {
-          grid.fill_brick(lo, extent, palette);
-          *changed += (extent as usize).pow(3);
-        }
-        return;
-      }
-      BrickState::Mixed => {}
+      x += start;
+    }
+    // LIFO 弹出 ⇒ 反序入栈，处理顺序与旧递归的 x→y→z 升序一致（几何结果与顺序无关，此处只为可复现）
+    stack.reverse();
+    Self {
+      shape,
+      center,
+      r,
+      palette,
+      erase: palette.is_air(),
+      stack,
+      changed: 0,
+      cpu: std::time::Duration::ZERO,
+      frames: 0,
     }
   }
-  if extent == 1 {
-    // 收尾单格：extent==1 时「部分覆盖」即完全覆盖，无需查 brick 三态
-    if brush_contains(shape, lo - center, r) {
-      let cur = grid.get_voxel(VoxelCoord::from_ivec3(lo)).unwrap_or(PaletteId::AIR);
-      if cur.is_air() != erase && grid.set_voxel_ivec3(lo, palette).is_some() {
-        *changed += 1;
+
+  /// 在 `budget` 内推进；`true` = 已完成（栈空）。预算按"每处理一个块检查一次"计 ⇒ 超支 ≤ 单块代价。
+  pub(crate) fn step(&mut self, grid: &mut VolumeGrid, budget: std::time::Duration) -> bool {
+    let t0 = Instant::now();
+    self.frames += 1;
+    while let Some(job) = self.stack.pop() {
+      self.one(grid, job);
+      if t0.elapsed() >= budget {
+        break;
       }
     }
-    return;
+    self.cpu += t0.elapsed();
+    self.stack.is_empty()
   }
-  let sub = extent / BRICK_FACTOR;
-  for i in 0..BRICK_FACTOR * BRICK_FACTOR * BRICK_FACTOR {
-    let d = IVec3::new(
-      i % BRICK_FACTOR,
-      (i / BRICK_FACTOR) % BRICK_FACTOR,
-      i / (BRICK_FACTOR * BRICK_FACTOR),
-    );
-    fill_brush_level(grid, shape, center, r, lo + d * sub, sub, palette, changed);
+
+  /// 是否擦除（日志用）
+  pub(crate) fn is_erase(&self) -> bool {
+    self.erase
+  }
+
+  /// 处理一个块：能剪枝/整块写就不下钻，否则展开 4³ 子块入栈（等价于旧的递归下钻）。
+  fn one(&mut self, grid: &mut VolumeGrid, job: BrushJob) {
+    let (lo, extent) = (job.lo, job.extent);
+    if brush_box_disjoint(self.shape, self.center, self.r, lo, extent) {
+      return;
+    }
+    if extent > 1 && brush_box_inside(self.shape, self.center, self.r, lo, extent) {
+      // 整块都在笔触内 → 按 brick 三态：空气+放置 / 实体+擦除 → 整块写；空气+擦除 / 实体+放置
+      // → 不改动（不啃掉已有几何）；Mixed → 下钻。
+      match grid.get_brick_state_extent(lo, extent) {
+        BrickState::Air => {
+          if !self.erase {
+            grid.fill_brick(lo, extent, self.palette);
+            self.changed += (extent as usize).pow(3);
+          }
+          return;
+        }
+        BrickState::Solid(_) => {
+          if self.erase {
+            grid.fill_brick(lo, extent, self.palette);
+            self.changed += (extent as usize).pow(3);
+          }
+          return;
+        }
+        BrickState::Mixed => {}
+      }
+    }
+    if extent == 1 {
+      // 收尾单格（只在 `start == 1` 的极小笔触出现）：extent==1 时「部分覆盖」即完全覆盖，无需查三态
+      if brush_contains(self.shape, lo - self.center, self.r) {
+        let cur = grid.get_voxel(VoxelCoord::from_ivec3(lo)).unwrap_or(PaletteId::AIR);
+        if cur.is_air() != self.erase && grid.set_voxel_ivec3(lo, self.palette).is_some() {
+          self.changed += 1;
+        }
+      }
+      return;
+    }
+    if extent == BRICK_FACTOR {
+      // 4³ 砖：**一次写完**（一次下钻 + 一次向上合并 + 一次脏标记）—— 逐格写要付 64 次。
+      // 壳层（球面边界）就是这一档：它是笔触的主要代价来源。
+      let mut inside = 0u64;
+      for i in 0..(BRICK_FACTOR * BRICK_FACTOR * BRICK_FACTOR) {
+        let d = IVec3::new(
+          i % BRICK_FACTOR,
+          (i / BRICK_FACTOR) % BRICK_FACTOR,
+          i / (BRICK_FACTOR * BRICK_FACTOR),
+        );
+        if brush_contains(self.shape, lo + d - self.center, self.r) {
+          inside |= 1u64 << i;
+        }
+      }
+      self.changed += grid.set_brick_voxels(lo, inside, self.palette) as usize;
+      return;
+    }
+    let sub = extent / BRICK_FACTOR;
+    for i in (0..BRICK_FACTOR * BRICK_FACTOR * BRICK_FACTOR).rev() {
+      let d = IVec3::new(
+        i % BRICK_FACTOR,
+        (i / BRICK_FACTOR) % BRICK_FACTOR,
+        i / (BRICK_FACTOR * BRICK_FACTOR),
+      );
+      self.stack.push(BrushJob { lo: lo + d * sub, extent: sub });
+    }
   }
 }
 
-/// 以 `center` 为中心施加一次笔触，返回实际改变的体素数。
-/// `palette == 0` → 擦除；否则只填充空气格（不啃掉已有几何）。写入自顶向下按 brick 粒度进行，
-/// 整块写直接落成 uniform 上级节点（见 `fill_brush_level`）。
+/// 以 `center` 为中心施加一次笔触（**一次做完**），返回实际改变的体素数。
+/// 写入自顶向下按 brick 粒度进行，整块写直接落成 uniform 上级节点（见 [`PlainBrush::one`]）。
+/// 分帧版本见 [`PlainBrush`]（`voxel_edit_input` 用），两者结果逐位相同。
 pub fn apply_brush(
   grid: &mut VolumeGrid,
   center: IVec3,
@@ -347,30 +509,9 @@ pub fn apply_brush(
   size: u32,
   palette: PaletteId,
 ) -> usize {
-  // size 无上限（菜单可输入任意值），这里只做「不溢出 i32」的类型收敛
-  let r = size.saturating_sub(1).min(i32::MAX as u32) as i32;
-  let mut changed = 0usize;
-  // 起始层级：取 extent ≤ 跨度 2r+1 的最大 brick 粒度（小笔触直接落到 4³/1³）。
-  let span = r.saturating_mul(2).saturating_add(1);
-  let start = LEVEL_EXTENT.iter().copied().find(|&e| e <= span).unwrap_or(1);
-  // 覆盖笔触 AABB 的全部对齐块；世界对齐 ⇒ 块必落在单个 chunk 内（256 是各 brick 粒度的整数倍）。
-  let s = IVec3::splat(start);
-  let b_lo = center.saturating_sub(IVec3::splat(r)).div_euclid(s) * s;
-  let b_hi = center.saturating_add(IVec3::splat(r)).div_euclid(s) * s;
-  let mut x = b_lo.x;
-  while x <= b_hi.x {
-    let mut y = b_lo.y;
-    while y <= b_hi.y {
-      let mut z = b_lo.z;
-      while z <= b_hi.z {
-        fill_brush_level(grid, shape, center, r, IVec3::new(x, y, z), start, palette, &mut changed);
-        z += start;
-      }
-      y += start;
-    }
-    x += start;
-  }
-  changed
+  let mut b = PlainBrush::new(center, shape, size, palette);
+  let _ = b.step(grid, std::time::Duration::MAX);
+  b.changed
 }
 
 // ============================================================================
@@ -398,7 +539,7 @@ struct BrushRun {
 /// 但"读槽"更贴着**真正写下去的东西**（将来别的调用方只拿得到槽也能复用）。
 ///
 /// ⚠️ **位移路径与普通路径的一处语义差异（如实记录，本次不改 `gate-voxel`）**：`fill_shape` 对
-/// "落在形状内的格子"是**无条件写入**，而普通笔触只填空气、整块实心处整块跳过（`fill_brush_level`
+/// "落在形状内的格子"是**无条件写入**，而普通笔触只填空气、整块实心处整块跳过（[`PlainBrush::one`]
 /// 的 brick 三态判定）。落点在命中面外侧 ⇒ 球/立方必然压住一层既有体素 ⇒ 位移笔触会把压在里面的
 /// 那些体素改成**本笔触材质**（只是着色变了：实心/空气格局只会更实，**不会挖掉**既有几何）。
 /// 这与"不做'对既有体素表面做位移'"（用户决策 B）不冲突：既有表面的凹凸不会被重算。
@@ -543,11 +684,144 @@ fn stats_suffix(stats: Option<&FillStats>) -> String {
   }
 }
 
+/// 按住键连发的计时器（左键 = 放置、右键 = 擦除各一个，互不干扰）
+#[derive(Default)]
+pub(crate) struct HoldRepeat {
+  place: f32,
+  erase: f32,
+}
+
+/// 推进一个按钮的连发计时，返回本帧是否落一笔。按下当帧**立即**触发，之后按住每
+/// `EDIT_REPEAT_SECS` 触发一次；松开清零（下次按下重新立即触发）。
+/// 扣的是整间隔、余数留到下一帧 ⇒ 触发频率与帧率无关（高帧率下不漂移）。
+fn hold_repeat(just_pressed: bool, held: bool, acc: &mut f32, dt: f32) -> bool {
+  if !held {
+    *acc = 0.0;
+    return false;
+  }
+  if just_pressed {
+    *acc = 0.0;
+    return true;
+  }
+  *acc += dt;
+  if *acc < EDIT_REPEAT_SECS {
+    return false;
+  }
+  *acc -= EDIT_REPEAT_SECS;
+  true
+}
+
+/// 一条 `EDIT[...]` 日志的全部字段（普通路径分帧完成后由 [`ActiveStroke`] 填，位移路径当帧填）
+struct StrokeLog {
+  erase: bool,
+  voxels: usize,
+  center: IVec3,
+  shape: BrushShape,
+  size: u32,
+  off: i32,
+  pal: PaletteId,
+  /// 材质摘要（放置）/ `-`（擦除）
+  material: String,
+  /// 位移说明或未位移的**原因**
+  reason: String,
+  stats: Option<FillStats>,
+  /// 该笔的实际 CPU 时间（普通路径 = 各帧 `step` 累计）
+  cpu: std::time::Duration,
+  /// 跨了几帧（>1 才在日志里体现）
+  frames: u32,
+  /// 本笔是"按下"（true）还是"连发"（false）
+  fresh: bool,
+}
+
+impl StrokeLog {
+  fn emit(&self) {
+    if self.voxels == 0 {
+      return;
+    }
+    let cost = if self.frames > 1 {
+      format!("{:?} 跨{}帧", self.cpu, self.frames)
+    } else {
+      format!("{:?}", self.cpu)
+    };
+    let line = format!(
+      "EDIT[{}] {}vx @({},{},{}) shape={:?} size={} offset={} slot={} material={} | {}{} | {cost}",
+      if self.erase { "erase" } else { "place" },
+      self.voxels,
+      self.center.x,
+      self.center.y,
+      self.center.z,
+      self.shape,
+      self.size,
+      self.off,
+      self.pal,
+      self.material,
+      self.reason,
+      stats_suffix(self.stats.as_ref()),
+    );
+    // 连发只记 debug：按住不放按 `EDIT_REPEAT_SECS` 的频率刷 info 会淹掉真正离散的动作
+    if self.fresh {
+      bevy::log::info!("{line}");
+    } else {
+      bevy::log::debug!("{line}");
+    }
+  }
+}
+
+/// 进行中的普通笔触 = 分帧状态 + **落笔那一帧**的日志上下文（分帧会跨帧，日志在完成那帧才打）
+pub(crate) struct ActiveStroke {
+  brush: PlainBrush,
+  size: u32,
+  off: i32,
+  fresh: bool,
+  material: String,
+  reason: String,
+}
+
+impl ActiveStroke {
+  fn to_log(&self) -> StrokeLog {
+    StrokeLog {
+      erase: self.brush.is_erase(),
+      voxels: self.brush.changed,
+      center: self.brush.center,
+      shape: self.brush.shape,
+      size: self.size,
+      off: self.off,
+      pal: self.brush.palette,
+      material: self.material.clone(),
+      reason: self.reason.clone(),
+      stats: None,
+      cpu: self.brush.cpu,
+      frames: self.brush.frames,
+      fresh: self.fresh,
+    }
+  }
+}
+
+/// 普通笔触的单帧预算（见 `consts::EDIT_BUDGET_MS`）
+fn brush_budget() -> std::time::Duration {
+  std::time::Duration::from_secs_f32(EDIT_BUDGET_MS * 0.001)
+}
+
+/// 这一笔会不会走位移（只判定、不执行）：分帧调度要知道哪条路是原子的（位移路径原子）。
+fn brush_displaced(
+  entry: PaletteEntry,
+  size: u32,
+  pbr_set: Option<&PbrTextureSet>,
+  cache: Option<&mut MaterialDisplaceCache>,
+) -> (bool, String) {
+  let (source, reason) = brush_displace_source(entry, size, pbr_set, cache);
+  (source.is_some(), reason)
+}
+
 /// 体素编辑输入（仅幽灵模式；轨道模式左键仍是 recenter）：左键 = 放置，右键 = 擦除；
-/// 锁定鼠标时射线取屏幕中心（准星），否则取光标。
+/// 按住不放持续落笔（间隔见 `consts::EDIT_REPEAT_SECS`）；锁定鼠标时射线取屏幕中心（准星），否则取光标。
+///
+/// 普通笔触按 `consts::EDIT_BUDGET_MS` **分帧推进**：同一时刻只跑一笔，做完了才接新的按下
+/// （不排队、不丢笔）；跨帧期间新的按下被忽略 —— 定位与材质在按下那一帧就固定了。
 #[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
 pub(crate) fn voxel_edit_input(
   mouse: Res<ButtonInput<MouseButton>>,
+  time: Res<Time>,
   captured: Res<gate_ui::UiPointerCaptured>,
   intercepted: Res<gate_ui::MouseIntercepted>,
   windows: Query<&Window>,
@@ -559,16 +833,53 @@ pub(crate) fn voxel_edit_input(
   pbr_set: Option<Res<PbrTextureSet>>,
   mut displace_cache: ResMut<MaterialDisplaceCache>,
   scene: Option<ResMut<VoxelScene>>,
+  mut active: Local<Option<ActiveStroke>>,
+  mut hold: Local<HoldRepeat>,
 ) {
-  if *mode != CameraMode::Fly || captured.0 || intercepted.0 {
+  let Some(mut scene) = scene else { return };
+  // 换模式 / 世界重载 ⇒ 丢弃未做完的笔触：它记的块坐标属于那一刻的世界
+  if *mode != CameraMode::Fly || scene.demo_force_full_rebuild {
+    *active = None;
     return;
   }
-  let place = mouse.just_pressed(MouseButton::Left);
-  let erase = mouse.just_released(MouseButton::Right);
+  // 有笔触还在跨帧推进 ⇒ 本帧不压实树区（压实会重传搬动过的树段，塞进笔触中途 = 一次卡顿）
+  scene.edit_in_flight = active.is_some();
+  // 先把上一帧没做完的推进一个预算；没做完就本帧不再接新输入
+  if active.is_some() {
+    let done = {
+      let st = active.as_mut().expect("is_some 已判定");
+      st.brush.step(scene.volumes.main_mut(), brush_budget())
+    };
+    if !done {
+      return;
+    }
+    if let Some(st) = active.take() {
+      st.to_log().emit();
+    }
+  }
+  // UI 指针捕获期间不落笔，也不推进计时 ⇒ 指针一离开 UI 立即续上按住的那一笔
+  if captured.0 || intercepted.0 {
+    return;
+  }
+  let dt = time.delta_secs();
+  let place = hold_repeat(
+    mouse.just_pressed(MouseButton::Left),
+    mouse.pressed(MouseButton::Left),
+    &mut hold.place,
+    dt,
+  );
+  let erase = hold_repeat(
+    mouse.just_pressed(MouseButton::Right),
+    mouse.pressed(MouseButton::Right),
+    &mut hold.erase,
+    dt,
+  );
   if !place && !erase {
     return;
   }
-  let Some(mut scene) = scene else { return };
+  // 本帧这一笔是"按下"还是"连发"：日志分级用（连发只记 debug）
+  let fresh = (place && mouse.just_pressed(MouseButton::Left))
+    || (erase && mouse.just_pressed(MouseButton::Right));
   let Ok(window) = windows.single() else { return };
   let Some((origin, dir)) = cursor_ray(window, &cfg, lock.0) else {
     return;
@@ -582,41 +893,71 @@ pub(crate) fn voxel_edit_input(
     return;
   }
   let (hit, face) = (hit.voxel, hit.face);
-  let grid = scene.volumes.main_mut();
   // 笔触几何中心 = 命中体素沿**入面法线**偏移 `round(offset)` 格（见 `EditSettings::offset`）：
   // 放置往**外**推、摧毁往**内**挖 —— 同一个值取反方向。中心必须是整数体素格 ⇒ 四舍五入。
   let off = settings.offset.max(0.0).round() as i32;
-  let (center, pal) = if erase {
-    (hit - face * off, PaletteId::AIR)
+  let pal = if erase {
+    PaletteId::AIR
   } else {
     // 放置落点 = 命中体素沿法线外推 `off` 格（`off = 1` 即旧的"贴面外一格"）；
     // 槽位按材质内容取/建（参数变了即新材质，旧体素不受影响）
-    let slot = material_slot(grid, settings.mat);
-    (hit + face * off, slot)
+    material_slot(scene.volumes.main_mut(), settings.mat)
   };
-  // MT8-5：落笔走位移还是普通填充由**笔触材质的资产**决定（`run_brush` 里解析）；
-  // 计时含"槽位分配 + 位移填充/普通填充"全程 ⇒ 日志里的耗时就是这一笔的实付代价
-  let t0 = Instant::now();
-  let run =
-    run_brush(grid, center, shape, size, pal, pbr_set.as_deref(), Some(&mut displace_cache));
-  let elapsed = t0.elapsed();
-  if run.voxels > 0 {
-    bevy::log::info!(
-      "EDIT[{}] {}vx @({},{},{}) shape={:?} size={} offset={} slot={} material={} | {}{} | {:?}",
-      if erase { "erase" } else { "place" },
-      run.voxels,
-      center.x,
-      center.y,
-      center.z,
+  let center = if erase { hit - face * off } else { hit + face * off };
+  let material = if erase { "-".to_string() } else { settings.mat.summary() };
+  // MT8-5：走位移还是普通填充由**笔触材质的资产**决定（`run_brush` 里解析）
+  let entry = *scene.volumes.main().palette().get(pal);
+  let (displaced, reason) =
+    brush_displaced(entry, size, pbr_set.as_deref(), Some(&mut displace_cache));
+  // 这一笔会不会改动**可见**几何（判定必须在写入**前**做：外壳块可能与笔触区域重叠，前态才代表"外面那层"）。
+  // 位移笔触会写到区域外 ≤ 幅度格 ⇒ 一律按"可见"，见 `stroke_hidden`。
+  //
+  // 再加一道前提：只有"这一笔就是本帧全部待上传改动"时才敢声明不可见 —— 否则上一帧可见编辑的积压会被
+  // 连同这一笔一起按"不可见"上报（GI 该丢的历史没丢）。积压时退回"可见"（保守但正确）。
+  let hidden = !displaced && stroke_hidden(scene.volumes.main(), shape, center, brush_radius(size));
+  let no_backlog = scene
+    .volumes
+    .list
+    .iter()
+    .all(|g| g.dirty.data_dirty_count() == 0 && g.dirty.comp_dirty_count() == 0);
+  scene.interior_only_edit = hidden && no_backlog;
+  let grid = scene.volumes.main_mut();
+  if displaced {
+    // 位移路径：原子执行。位移壳层逐体素（≈O(size²)）但尺寸被 `EDIT_DISPLACE_SIZE_MAX` 限住 ⇒ 代价有界
+    let t0 = Instant::now();
+    let run =
+      run_brush(grid, center, shape, size, pal, pbr_set.as_deref(), Some(&mut displace_cache));
+    StrokeLog {
+      erase,
+      voxels: run.voxels,
+      center,
       shape,
       size,
       off,
       pal,
-      if erase { "-".to_string() } else { settings.mat.summary() },
-      run.displace,
-      stats_suffix(run.stats.as_ref()),
-      elapsed,
-    );
+      material,
+      reason: run.displace,
+      stats: run.stats,
+      cpu: t0.elapsed(),
+      frames: 1,
+      fresh,
+    }
+    .emit();
+    return;
+  }
+  // 普通路径：分帧推进（本帧先跑一个预算；小笔触当帧就完，不额外增延迟）
+  let mut st = ActiveStroke {
+    brush: PlainBrush::new(center, shape, size, pal),
+    size,
+    off,
+    fresh,
+    material,
+    reason,
+  };
+  if st.brush.step(grid, brush_budget()) {
+    st.to_log().emit();
+  } else {
+    *active = Some(st);
   }
 }
 
@@ -652,6 +993,9 @@ pub(crate) fn edit_selftest(
     return;
   }
   let (hit, face, t) = (hit.voxel, hit.face, hit.t);
+  // 自测笔触可能带位移（写到区域外）⇒ 一律按"可见"上报，避免残留值压制 GI 失效
+  scene.interior_only_edit = false;
+  scene.edit_in_flight = false;
   let grid = scene.volumes.main_mut();
   let slot = material_slot(grid, settings.mat);
   // 与 `voxel_edit_input` 的**放置路径同一条中心公式**（偏移四舍五入到格，见 `EditSettings::offset`）
@@ -865,6 +1209,258 @@ mod tests {
     assert_eq!(*grid.palette().get(v), a.entry(), "旧槽内容 = 最初的材质");
   }
 
+  /// 分帧推进与"一次做完"等价：预算 0（每帧只处理一个块）逐体素结果 + 计数完全一致。
+  #[test]
+  fn plain_brush_slicing_equals_single_pass() {
+    let center = IVec3::new(20, 20, 20);
+    for shape in [BrushShape::Sphere, BrushShape::Cube] {
+      for size in [1u32, 4, 7, 17] {
+        // 参照：一次做完
+        let mut once = VolumeGrid::new();
+        let n_once = apply_brush(&mut once, center, shape, size, PaletteId(3));
+        // 分帧：预算 0 ⇒ 每帧只处理一个块
+        let mut sliced = VolumeGrid::new();
+        let mut brush = PlainBrush::new(center, shape, size, PaletteId(3));
+        let mut frames = 0;
+        while !brush.step(&mut sliced, std::time::Duration::ZERO) {
+          frames += 1;
+          assert!(frames < 100_000, "预算 0 也应在有限帧内做完");
+        }
+        assert_eq!(brush.changed, n_once, "{shape:?} size={size}：改动计数应一致");
+        if size > 1 {
+          assert!(frames > 1, "{shape:?} size={size}：预算 0 应跨多帧（实际 {frames}）");
+        }
+        assert_brush_region_eq(&once, &sliced, center, size, &format!("{shape:?} size={size}"));
+        // 无限预算 ⇒ 一帧做完
+        let mut one_shot = PlainBrush::new(center, shape, size, PaletteId(3));
+        assert!(one_shot.step(&mut VolumeGrid::new(), std::time::Duration::MAX));
+        assert_eq!(one_shot.frames, 1);
+      }
+    }
+    // 擦除路径同样等价（挖既有实体：走 Solid 整块写 + Mixed 下钻）
+    let mut filled = VolumeGrid::new();
+    apply_brush(&mut filled, center, BrushShape::Cube, 31, PaletteId(5));
+    let mut once = filled.clone();
+    let n_once = apply_brush(&mut once, center, BrushShape::Sphere, 9, PaletteId::AIR);
+    let mut sliced = filled;
+    let mut brush = PlainBrush::new(center, BrushShape::Sphere, 9, PaletteId::AIR);
+    let mut frames = 0;
+    while !brush.step(&mut sliced, std::time::Duration::ZERO) {
+      frames += 1;
+      assert!(frames < 100_000);
+    }
+    assert_eq!(brush.changed, n_once, "擦除计数应一致");
+    assert!(frames > 1, "擦除预算 0 应跨多帧（实际 {frames}）");
+    assert_brush_region_eq(&once, &sliced, center, 9, "erase sphere size=9");
+  }
+
+  /// 笔触区域 ±1 格内逐体素比对（±1 是为了同时验证"没有多写区域外一格"）
+  fn assert_brush_region_eq(a: &VolumeGrid, b: &VolumeGrid, center: IVec3, size: u32, what: &str) {
+    let r = size as i32;
+    for x in -r - 1..=r + 1 {
+      for y in -r - 1..=r + 1 {
+        for z in -r - 1..=r + 1 {
+          let p = center + IVec3::new(x, y, z);
+          let c = VoxelCoord::from_ivec3(p);
+          assert_eq!(a.get_voxel(c), b.get_voxel(c), "{what}：体素 {p:?} 不一致");
+        }
+      }
+    }
+  }
+
+  /// 可见性判定：外壳全为实体 ⇒ "不可见"（GI 可复用历史）；外壳碰到空气 ⇒ "可见"；空世界恒"可见"。
+  #[test]
+  fn stroke_hidden_only_when_fully_enclosed() {
+    let mut grid = VolumeGrid::new();
+    // 32³ 实心块（其余为空气）
+    for x in 0..32 {
+      for y in 0..32 {
+        for z in 0..32 {
+          grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
+        }
+      }
+    }
+    let inner = IVec3::new(16, 16, 16);
+    assert!(stroke_hidden(&grid, BrushShape::Sphere, inner, 8), "块内部 ⇒ 不可见");
+    assert!(stroke_hidden(&grid, BrushShape::Cube, inner, 8), "块内部 ⇒ 不可见");
+    assert!(
+      stroke_hidden(&grid, BrushShape::Cube, inner, 14),
+      "外壳最远到 ±15 格，仍在 [0,32) 实体块内 ⇒ 不可见"
+    );
+    // 越出块外：外壳碰到空气 ⇒ 可见（块面在 ±16 格处）
+    assert!(!stroke_hidden(&grid, BrushShape::Cube, inner, 15), "立方外壳压到块面 z=0/32 ⇒ 可见");
+    assert!(!stroke_hidden(&grid, BrushShape::Cube, inner, 16), "立方越出块面 ⇒ 可见");
+    let near_face = IVec3::new(16, 16, 28);
+    assert!(!stroke_hidden(&grid, BrushShape::Sphere, near_face, 8), "球越出块面 ⇒ 可见");
+    assert!(!stroke_hidden(&grid, BrushShape::Cube, near_face, 8), "立方越出块面 ⇒ 可见");
+    // 空世界：外壳全是空气 ⇒ 可见
+    assert!(!stroke_hidden(&VolumeGrid::new(), BrushShape::Sphere, inner, 8), "空世界 ⇒ 可见");
+    assert!(!stroke_hidden(&VolumeGrid::new(), BrushShape::Cube, inner, 0), "单格落点也⇒ 可见");
+  }
+
+  /// 旧口径的逐格参照笔触（本测试的对照物）：只填空气 / 只挖实体，逐格写。
+  fn naive_brush(
+    grid: &mut VolumeGrid,
+    center: IVec3,
+    shape: BrushShape,
+    size: u32,
+    palette: PaletteId,
+  ) -> usize {
+    let r = brush_radius(size);
+    let erase = palette.is_air();
+    let mut changed = 0usize;
+    for x in -r..=r {
+      for y in -r..=r {
+        for z in -r..=r {
+          let d = IVec3::new(x, y, z);
+          if !brush_contains(shape, d, r) {
+            continue;
+          }
+          let p = center + d;
+          let cur = grid.get_voxel(VoxelCoord::from_ivec3(p)).unwrap_or(PaletteId::AIR);
+          if cur.is_air() != erase && grid.set_voxel_ivec3(p, palette).is_some() {
+            changed += 1;
+          }
+        }
+      }
+    }
+    changed
+  }
+
+  /// 4³ 批量写路径与"逐格写"的旧口径等价：空世界放置 / 实心块擦除 / 贴面擦除，逐体素 + 计数一致。
+  #[test]
+  fn plain_brush_batched_writes_match_naive_reference() {
+    let center = IVec3::new(20, 20, 20);
+    for shape in [BrushShape::Sphere, BrushShape::Cube] {
+      // 放置：空世界
+      for size in [1u32, 2, 4, 5, 8, 9, 17, 33] {
+        let mut fast = VolumeGrid::new();
+        let n_fast = apply_brush(&mut fast, center, shape, size, PaletteId(3));
+        let mut slow = VolumeGrid::new();
+        let n_slow = naive_brush(&mut slow, center, shape, size, PaletteId(3));
+        assert_eq!(n_fast, n_slow, "place {shape:?} size={size}：改动计数不一致");
+        assert_brush_region_eq(&fast, &slow, center, size, &format!("place {shape:?} {size}"));
+      }
+      // 擦除：先在笔触外扩一圈铺实体（让外壳/内部都非空），再挖
+      for size in [4u32, 9, 17] {
+        let mut base = VolumeGrid::new();
+        naive_brush(&mut base, center, shape, size + 8, PaletteId(7));
+        let mut fast = base.clone();
+        let n_fast = apply_brush(&mut fast, center, shape, size, PaletteId::AIR);
+        let mut slow = base;
+        let n_slow = naive_brush(&mut slow, center, shape, size, PaletteId::AIR);
+        assert_eq!(n_fast, n_slow, "erase {shape:?} size={size}：改动计数不一致");
+        assert_brush_region_eq(&fast, &slow, center, size + 8, &format!("erase {shape:?} {size}"));
+      }
+    }
+  }
+
+  /// 性能记录（忽略型，常规门禁不跑）：castle.vox 上"一笔"的固定成本。
+  ///
+  /// - 笔触本身：4³ 批量写之前（逐格写）`size=61 place 33.17ms / erase 20.34ms`，现在 ≈5ms；
+  /// - 序列化（**只在全量安装 / 整棵重建时付**）：59 chunk 合计 173–208ms（均值 ≈2.9ms / 最大 ≈8.3ms）；
+  /// - 增量上传（节点级重写，**每笔都付**）：单格 356B / 13.7µs，size=4 → 1.6KB / 4.4µs，
+  ///   size=9 → 10KB / 17.9µs，size=17 → 39KB / 51.7µs（旧实现：每笔整棵 chunk 树 ≈2MB + 2.9ms）。
+  ///
+  /// 跑法：`cargo test --release -p gate-app brush_cost_on_castle -- --ignored --nocapture`
+  #[test]
+  #[ignore = "性能记录：需读 assets/vox/castle.vox"]
+  fn brush_cost_on_castle() {
+    let path = gate_render::assets_dir().join("vox").join("castle.vox");
+    let mut volumes = gate_voxel::Volumes::new(VolumeGrid::new());
+    let info = crate::vox_scene::load_vox_scene(volumes.main_mut(), &path, IVec3::ZERO)
+      .expect("载入 castle");
+    let (mut lo, mut hi) = (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN));
+    for c in volumes.main().chunk_coords() {
+      lo = lo.min(c.0);
+      hi = hi.max(c.0);
+    }
+    let (wlo, whi) = (lo * 256, (hi + IVec3::ONE) * 256);
+    let origin = glam::Vec3::new(
+      (whi.x + 96) as f32,
+      ((wlo.y + whi.y) / 2) as f32,
+      ((wlo.z + whi.z) / 2) as f32,
+    );
+    let hit =
+      gate_render::raycast(&volumes, origin, glam::Vec3::NEG_X, EDIT_REACH).expect("射线应命中");
+    println!(
+      "hit voxel={:?} face={:?} | instances={} voxels={}",
+      hit.voxel, hit.face, info.instances_used, info.voxels_written
+    );
+    for size in [17u32, 33, 61, 121] {
+      let c = hit.voxel + hit.face; // 与落笔同一公式（off = 1）
+      let t0 = Instant::now();
+      let n = apply_brush(volumes.main_mut(), c, BrushShape::Sphere, size, PaletteId(2));
+      let place = t0.elapsed();
+      let t1 = Instant::now();
+      let m = apply_brush(volumes.main_mut(), c, BrushShape::Sphere, size, PaletteId::AIR);
+      let erase = t1.elapsed();
+      println!("size={size:4} place {place:>10.2?} ({n}vx) / erase {erase:>10.2?} ({m}vx)");
+    }
+    // 序列化成本（增量路径每笔对"碰到的那个 chunk"做一次）
+    let mut times: Vec<(usize, std::time::Duration)> = volumes
+      .main()
+      .chunk_coords()
+      .filter_map(|cc| volumes.main().chunk(cc))
+      .map(|tree| {
+        let t = Instant::now();
+        let words = tree.serialize().len();
+        (words, t.elapsed())
+      })
+      .collect();
+    times.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
+    let total: std::time::Duration = times.iter().map(|(_, d)| *d).sum();
+    let max = times.first().copied().unwrap_or_default();
+    println!(
+      "序列化 chunks={} 总计={:?} 均值={:?} 最大={:?}（{}字）",
+      times.len(),
+      total,
+      total / times.len().max(1) as u32,
+      max.1,
+      max.0
+    );
+
+    // 增量上传：节点级重写后**实际写进 GPU 的 struct 字节**（旧实现=整棵 chunk 树 ≈1.4MB/笔）。
+    // 先消化掉建场景与上面那些大笔触留下的标记（含 reset），只看"一笔小编辑"的量。
+    let mut vbuild = gate_render::brickmap::VolumesBuilder::build_full(&volumes);
+    let first = vbuild.snapshot();
+    println!("全量 mode={} struct={}KB", first.mode_tag, first.struct_total_bytes / 1024);
+    let all: Vec<_> = volumes.main().chunk_coords().collect();
+    for cc in all {
+      let dirty = volumes.main_mut().chunk_mut(cc).map(|t| t.take_dirty()).unwrap_or_default();
+      vbuild.update_chunk(&volumes, 0, cc, &dirty, true);
+    }
+    let _ = volumes.main_mut().dirty.drain_data_budget(usize::MAX);
+    let _ = vbuild.snapshot();
+
+    for (label, size) in [("单格", 0u32), ("size=4", 4), ("size=9", 9), ("size=17", 17)] {
+      let c = hit.voxel + hit.face + IVec3::new(size as i32, 0, 0);
+      let n = if size == 0 {
+        usize::from(volumes.main_mut().set_voxel_ivec3(c, PaletteId(2)).is_some())
+      } else {
+        apply_brush(volumes.main_mut(), c, BrushShape::Sphere, size, PaletteId(2))
+      };
+      let coords = volumes.main_mut().dirty.drain_data_budget(4096);
+      let (mut marks, mut chunks, mut reset) = (0usize, 0usize, 0usize);
+      let t0 = Instant::now();
+      for cc in coords {
+        let dirty = volumes.main_mut().chunk_mut(cc).map(|t| t.take_dirty()).unwrap_or_default();
+        marks += dirty.nodes.len();
+        reset += usize::from(dirty.reset);
+        chunks += 1;
+        vbuild.update_chunk(&volumes, 0, cc, &dirty, true);
+      }
+      let cpu = t0.elapsed();
+      let snap = vbuild.snapshot();
+      let bytes: usize = snap.struct_blobs.iter().map(|(_, p)| p.len()).sum();
+      println!(
+        "{label:>7} ({n}vx) → 脏 chunk {chunks} / 节点标记 {marks} / reset {reset} / \
+         上传 {bytes}B / mode={} / builder {cpu:>10.2?}",
+        snap.mode_tag,
+      );
+    }
+  }
+
   /// 平凡变体的去重行为与改动前一致（同内容复用 / 不同内容新槽）。
   #[test]
   fn plain_material_dedup_unchanged() {
@@ -874,5 +1470,44 @@ mod tests {
     assert_eq!(material_slot(&mut grid, a), s1);
     let b = BrushMaterial { color: [1, 2, 3], ..a };
     assert_ne!(material_slot(&mut grid, b), s1);
+  }
+
+  /// 按住连发：按下当帧立即落一笔；之后每 `EDIT_REPEAT_SECS` 一笔；松开清零、再按下又立即触发。
+  /// 触发次数**与帧率无关**（余数结转 ⇒ 60fps 与 240fps 同样时长内触发次数相同）。
+  #[test]
+  fn hold_repeat_fires_immediately_then_on_interval() {
+    let dt = 0.02f32;
+    let mut acc = 0.0f32;
+    assert!(hold_repeat(true, true, &mut acc, dt), "按下当帧立即触发");
+    // 头 4 帧（0.08s）不足一个间隔 ⇒ 一笔都不该落
+    for _ in 0..4 {
+      assert!(!hold_repeat(false, true, &mut acc, dt), "不足 {EDIT_REPEAT_SECS} 不该触发");
+    }
+    // 按住 1s：触发次数 ≈ 1s / 间隔（按下那笔不算），只准 ±1（浮点余数）
+    let over_1s = 1.0f32 / dt;
+    let expect = (1.0 / EDIT_REPEAT_SECS).floor() as usize;
+    let mut got = 0usize;
+    for _ in 4..over_1s as usize {
+      got += hold_repeat(false, true, &mut acc, dt) as usize;
+    }
+    let lo = expect.saturating_sub(1);
+    assert!((lo..=expect + 1).contains(&got), "1s 内触发 {got} 次，预期 {expect}±1");
+    // 松开清零 → 再按下又立即触发
+    assert!(!hold_repeat(false, false, &mut acc, dt));
+    assert!(hold_repeat(true, true, &mut acc, dt));
+
+    // 帧率无关：同样 1s（含按下当帧），60fps 与 240fps 的触发次数一致
+    let (mut slow, mut fast) = (0.0f32, 0.0f32);
+    let (mut n_slow, mut n_fast) = (0usize, 0usize);
+    hold_repeat(true, true, &mut slow, 1.0 / 60.0);
+    hold_repeat(true, true, &mut fast, 1.0 / 240.0);
+    for _ in 0..59 {
+      n_slow += hold_repeat(false, true, &mut slow, 1.0 / 60.0) as usize;
+    }
+    for _ in 0..239 {
+      n_fast += hold_repeat(false, true, &mut fast, 1.0 / 240.0) as usize;
+    }
+    assert_eq!(n_slow, n_fast, "60fps {n_slow} 次 vs 240fps {n_fast} 次");
+    assert!(n_slow > 5, "1s 内至少该触发若干次（实际 {n_slow}）");
   }
 }

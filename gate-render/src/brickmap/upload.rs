@@ -58,6 +58,19 @@ impl BufferLayout {
 pub struct VoxelScene {
   pub volumes: gate_voxel::Volumes,
   pub demo_force_full_rebuild: bool,
+  /// 本帧待上传的改动是否**全部**来自"被实体完全包围"的笔触（⇒ 可见几何未变），且是**唯一**待上传改动。
+  ///
+  /// 由笔触在落笔那一刻判定并写入（`gate-app`：`stroke_hidden` 判"被包围"，并要求其余 dirty 队列为空），
+  /// `extract` 消费：命中时只上传数据、不报 [`BrickMapDirty`] 盒 ⇒ GI 不必丢弃时域历史、`gi_sec_slots`
+  /// 也不必整表失效（见 `gi::prepare_gi`）。
+  ///
+  /// CONSTRAINT: 每个写世界的路径都要**重写**它（笔触两条路径 + 自测），否则会残留上一次的值 ——
+  /// 残留 true 会让一次真正可见的编辑被当作不可见。全量重建走 `full`，与它无关。
+  pub interior_only_edit: bool,
+  /// 是否有一笔普通笔触正在**跨帧**推进（`gate-app` 的 `ActiveStroke` 还有剩余块）。
+  /// `extract` 用它判定"现在能不能压实树区"：压实要重传搬动过的树段，塞进笔触中途就是一次可见卡顿
+  /// （见 `BrickMapBuilder::compact`）。
+  pub edit_in_flight: bool,
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -138,7 +151,8 @@ pub fn world_dirty_box(t: gate_voxel::VolumeTransform, lo: IVec3, hi: IVec3) -> 
 #[derive(Resource, Default)]
 pub struct MainPending {
   pub force_full: bool,
-  pub data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  /// `(volume_idx, coord, 该 chunk 自上次上传以来的**节点级**改动)`
+  pub data_chunks: Vec<(usize, gate_voxel::ChunkCoord, gate_voxel::TreeDirty)>,
   pub comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
   /// 与 `data_chunks` 并行的编辑 AABB：`(volume_idx, coord, lo, hi)`，闭开世界 voxel 区间。
   pub data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
@@ -146,6 +160,9 @@ pub struct MainPending {
 
 /// 在主 world `Last` 阶段按预算 drain dirty → `MainPending`，遍历所有 volume 附带 `volume_idx`。
 /// 进入时清空 `data_chunks` / `comp_chunks` / `data_aabbs`；`force_full` 处理一帧后复位。
+///
+/// 每个被 drain 的 chunk 顺手 `take_dirty()` 带走它的节点级改动 —— 必须在**同一处**取，
+/// 否则 wire 层不知道"这个 chunk 哪些节点动过"，只能整棵重传。
 pub fn poll_pending(
   scene: Option<ResMut<VoxelScene>>,
   budget: Option<Res<UploadBudget>>,
@@ -180,7 +197,8 @@ pub fn poll_pending(
 
   for (vol_idx, grid) in scene.volumes.list.iter_mut().enumerate() {
     for c in grid.dirty.drain_data_budget(data_n) {
-      pending.data_chunks.push((vol_idx, c));
+      let dirty = grid.chunk_mut(c).map(|t| t.take_dirty()).unwrap_or_default();
+      pending.data_chunks.push((vol_idx, c, dirty));
 
       if let Some((lo, hi)) = grid.take_edit_aabb(c) {
         pending.data_aabbs.push((vol_idx, c, lo, hi));
@@ -225,12 +243,14 @@ impl VoxelDumpRequest {
 }
 
 /// ExtractSchedule 用的 CPU builder / pending 状态（render world resource）
-/// `builder: Option<VolumesBuilder>` 持有 `Vec<BrickMapBuilder>`；pending chunks 带 volume_idx。
+/// `builder: Option<VolumesBuilder>` 持有 `Vec<BrickMapBuilder>`；pending chunks 带 volume_idx +
+/// 该 chunk 的节点级改动（`TreeDirty`）。
 #[derive(Resource, Default)]
 pub struct BuilderMirror {
   pub builder: Option<VolumesBuilder>,
   pub pending_full: bool,
-  pub pending_data_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  /// `(volume_idx, coord, 节点级改动)`
+  pub pending_data_chunks: Vec<(usize, gate_voxel::ChunkCoord, gate_voxel::TreeDirty)>,
   /// 与 `pending_data_chunks` 并行的编辑 AABB（`(volume_idx, coord, lo, hi)`）
   pub pending_data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
   /// 各 volume 调色板上次同步的写版本（判断「只改材质」是否需上传）。
@@ -421,13 +441,13 @@ fn extract(
   if main_pending.force_full {
     mirror.pending_full = true;
   }
-  mirror.pending_data_chunks.extend(main_pending.data_chunks.iter().copied());
+  mirror.pending_data_chunks.extend(main_pending.data_chunks.iter().cloned());
   mirror.pending_data_aabbs.extend(main_pending.data_aabbs.iter().copied());
   mirror.pending_comp_chunks.extend(main_pending.comp_chunks.iter().copied());
 
   let first = mirror.builder.is_none();
   let pending_full = std::mem::take(&mut mirror.pending_full);
-  let mut pending_data: Vec<(usize, gate_voxel::ChunkCoord)> =
+  let mut pending_data: Vec<(usize, gate_voxel::ChunkCoord, gate_voxel::TreeDirty)> =
     std::mem::take(&mut mirror.pending_data_chunks);
   let pending_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)> =
     std::mem::take(&mut mirror.pending_data_aabbs);
@@ -451,10 +471,16 @@ fn extract(
   if dirty_any {
     if need_full {
       dirty_aabb.full = true;
+    } else if scene.interior_only_edit {
+      // 本帧的脏数据全部来自"被实体完全包围"的笔触 ⇒ 可见几何（含 GI 二次命中的面）一个都没变：
+      // 数据照常上传，但不报改动盒 ⇒ `prepare_gi` 认为世界没变（GI 复用上一帧历史、面缓存不失效）。
+      // 只改材质的编辑仍由 `palette_changed` 上报（见 `VoxelScene::interior_only_edit`）。
     } else {
       // 逐 volume 先并集局部 AABB（同一 volume 的多个脏 chunk 合成一盒 ⇒ 主世界与旧版单盒等价）。
       let mut acc: Vec<(usize, IVec3, IVec3)> = Vec::new();
-      for (vol_idx, c) in pending_data.iter().chain(_pending_comp.iter()) {
+      for (vol_idx, c) in
+        pending_data.iter().map(|(v, c, _)| (v, c)).chain(_pending_comp.iter().map(|(v, c)| (v, c)))
+      {
         let (cl, ch) = match pending_aabbs.iter().find(|(v, cc, ..)| v == vol_idx && cc == c) {
           Some((_, _, alo, ahi)) => (*alo, *ahi),
           None => {
@@ -490,9 +516,17 @@ fn extract(
     *builder = VolumesBuilder::build_full(volumes_ref);
     pending_data.clear();
   } else {
+    // 压实的时机：必须"安静"（没有笔触在跑、且这一批就是全部待上传的改动），否则会把一次
+    // 大块重传塞进笔触中途 —— 见 `BrickMapBuilder::compact`。
+    let quiet = !scene.edit_in_flight
+      && scene
+        .volumes
+        .list
+        .iter()
+        .all(|g| g.dirty.data_dirty_count() == 0 && g.dirty.comp_dirty_count() == 0);
     builder.sync(volumes_ref);
-    for (vol_idx, c) in pending_data.drain(..) {
-      builder.update_chunk(volumes_ref, vol_idx, c);
+    for (vol_idx, c, dirty) in pending_data.drain(..) {
+      builder.update_chunk(volumes_ref, vol_idx, c, &dirty, quiet);
     }
   }
 
@@ -834,8 +868,8 @@ pub(crate) fn prepare(
 
 /// 转储文件魔数（小端写盘 ⇒ 文件头 4 字节读出来是 `VOXD`）
 const DUMP_MAGIC: u32 = 0x4458_4F56;
-/// 转储布局版本（布局一改就 +1）
-const DUMP_LAYOUT_VERSION: u32 = 1;
+/// 转储布局版本（布局一改就 +1；2 = 根节点固定 64 槽指针表 + 块内节点 arena）
+const DUMP_LAYOUT_VERSION: u32 = 2;
 /// 转储头字数（随后是 `volume_count × 16` 的逐 volume 表）
 const DUMP_HEADER_WORDS: usize = 16;
 /// 逐 volume 表每条字数
@@ -851,7 +885,7 @@ const DUMP_VOLUME_WORDS: usize = 16;
 /// 0               64B                   头 16 字：magic / 版本 / 各段总字数 / 主世界窗口与全局计数
 /// 64B             64B × N               逐 volume 表 16 字 × N：tree_base / palette_base / 各段字数 /
 ///                                       窗口 origin+dims / chunk_count / node_words / node_free_words / rejected
-/// 64+64N          struct_words × 4B     struct 段：chunk 窗口 + DFS 树（mask_lo/hi + node palette + leaf inline）
+/// 64+64N          struct_words × 4B     struct 段：chunk 窗口 + 各 chunk 树块（mask_lo/hi + node palette + leaf inline）
 /// …               palette_words × 4B    palette 段：8B 材质条目（2 字/条）
 /// …               leaves_words × 4B     leaves 段：方向可达掩码 LUT（2 字/u64 对）
 /// ```
@@ -860,10 +894,13 @@ const DUMP_VOLUME_WORDS: usize = 16;
 ///
 /// 定位与解码（与 `wire.rs` / `brickmap.wesl` 的契约一致）：
 /// - chunk 窗口字址 = `tree_base + rel.x + rel.y×64 + rel.z×64²`，`rel = chunk − 窗口 origin`
-///   （`CHUNK_INDEX_CAP = 64`）；该字是 `entry`，`entry != 0` ⇒ 树基址 = `tree_base + entry − 1`
-///   （= shader 的 `chunk_base`）；
-/// - 每个节点 3 字 fixed：`mask_lo` / `mask_hi` /（低 16 位 = 统一色，0 = AIR；高 16 位 = LOD 代表色），
-///   随后**按 mask 位序密集**放"该位置 1"的子块偏移（值 = 相对本 chunk 树基址的字偏移）；`mask = 0`
+///   （`CHUNK_INDEX_CAP = 64`）；该字是 `entry`，`entry != 0` ⇒ 树块首 = `tree_base + entry − 1`
+///   （= shader 的 `chunk_base` = 根节点地址）；
+/// - 根节点固定 `[ROOT_WIRE_WORDS]` = 3 + 64 字（掩码增减不改根的字数 ⇒ 根永不搬迁），
+///   其余节点是块内 arena 里的块（地址任意，`node_words` 不再等于"紧排字数"）；
+/// - 每个节点 3 字 fixed：`mask_lo` / `mask_hi` /（低 16 位 = 统一色，0 = AIR；高 16 位恒 0 ——
+///   旧「LOD 代表色」字段，无消费方，见 `chunk_tree.rs::pack_node_palette`），
+///   随后**按 mask 位序密集**放"该位置 1"的子块偏移（值 = 相对**根节点地址**的字偏移）；`mask = 0`
 ///   的节点到此为止（整个 4^level 子块同色）；叶父层换成 32 字 inline（每字 2 个体素 × 16 位索引，
 ///   0 = AIR）。
 ///

@@ -1,5 +1,17 @@
 //! Brick Tree wire 格式：常量、编码函数、全局参数；CPU 构建器与 GPU shader 之间的字节契约。
-//! b_struct = Region ① 稠密 chunk 窗口 + Region ② 各 chunk 的 DFS 树；`PALETTE_BITS`=16 同宽约束两侧一致。
+//! b_struct = Region ① 稠密 chunk 窗口 + Region ② 各 chunk 的**树块**（块首 = 根节点地址，
+//! 块内是节点 arena；节点地址 = 块首 + 块内偏移）；`PALETTE_BITS`=16 同宽约束两侧一致。
+//!
+//! 节点字节契约（CPU `gate-voxel::ChunkTree::serialize_with_layout` 写、shader `trace.wesl` /
+//! `brickmap.wesl` 读）：
+//! ```text
+//! [chunk 窗口] entry = 树块首（b_struct 内本 volume 字址）+ 1；0 = 无此 chunk
+//! [节点]  +0/+1 = mask_lo/mask_hi（64 位子块占用）；+2 = uniform 子块色（低 16 位）
+//!         有掩码时 +3 起：内部层 = 紧凑子块指针表（指针 = **相对根节点**的字偏移，按 mask 位序）
+//!                        叶父层（4³）= 32 字 inline（每字 2 体素 × 16 位索引，0 = AIR）
+//! ```
+//! CONSTRAINT: 根节点恒占 `gate_voxel::ROOT_WIRE_WORDS` 字（3 + 满 64 槽指针表）—— 指针以根地址
+//! 为基准，根一搬迁全体指针都要重算，故根的字数不随掩码变化（见 `ChunkTree::serialize_with_layout`）。
 
 use gate_voxel::{PALETTE_BITS, PALETTE_ENTRY_COUNT, PaletteEntry, PaletteFlags};
 use glam::{IVec3, Mat3, Vec3, Vec4};
@@ -368,7 +380,7 @@ fn transform_aabb(pos: Vec3, rot: Mat3, scale: f32) -> (Vec3, Vec3) {
 /// 构建产物：与 GPU buffer 字节一一对应的内容（原样上传）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrickMapBuffers {
-  /// Region ① chunk 窗口 + Region ② 各 chunk DFS 树
+  /// Region ① chunk 窗口 + Region ② 各 chunk 树块
   pub b_struct: Vec<u32>,
   pub b_palette: Vec<u32>,
   pub globals: BrickMapGlobals,

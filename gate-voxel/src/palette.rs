@@ -1,6 +1,6 @@
 //! 调色板：u16 索引 × 65536 条目，材质参数 + 视觉/语义标志位。
 //! 索引 0 保留给空气，最多 65535 种材质；表本体 65536 × 8B = 512KB/volume，与体素数量无关。
-//! 节点 uniform 色与叶层逐体素色同宽（16 位，见 `chunk_tree.rs` 的 `pack_pal_lod`）。
+//! 节点 uniform 色与叶层逐体素色同宽（16 位，见 `chunk_tree.rs` 的 `pack_node_palette`）。
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

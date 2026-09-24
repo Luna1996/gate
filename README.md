@@ -22,7 +22,7 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 
 - `WASD` 平移 / `Space` 升 / `Shift` 降 / `Ctrl` 切低高速档（缺省 128 → 256 voxel/s；低速档基础速度在菜单可调）
 - `Q` 切鼠标锁定（**缺省锁定**）：锁定后鼠标位移 = 转头（准星在屏幕中心、系统光标隐藏，编辑射线也走准星）；解锁后鼠标自由移动但不转视角
-- 左键 = 放置笔触；右键 = 擦除。形状 / 大小 / 材质在菜单「游戏/编辑」
+- 左键 = 放置笔触；右键 = 擦除；**按住不放连续落笔**（间隔 `consts::EDIT_REPEAT_SECS`，单笔按 `consts::EDIT_BUDGET_MS` 分帧推进）。形状 / 大小 / 材质在菜单「游戏/编辑」
 - `F3` 开关左上角调试菜单；右上角 FPS 覆盖层与组件展示窗默认隐藏（菜单「视频/FPS」「界面/showcase」）
 
 **相机模式**
@@ -45,12 +45,12 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 | **体素核心（gate-voxel）** | ✅ 生产可用 | Douglas Brick Tree：`HashMap<ChunkCoord, ChunkTree>`，每 chunk 256³ voxel，分裂因子 4³（256 → 64 → 16 → 4 → 1）；非叶节点 u64 占用掩码 + 紧凑 child 偏移表；`Node::Uniform` 自适应叶；16 位材质索引（65536 槽，8B/条）；三级查询 `get_voxel` / `get_brick_state` / `fill_brick`（O(深度) 整块写）；`try_merge` + `compact()` DFS GC |
 | **多 volume** | ✅ 生产可用 | `Volumes`：`list[0]` = 主世界（`obj_id = -1`），`add_object` 注册物体（`VolumeTransform { pos, rot, scale }`）；同一 dirty → builder → upload 路径；GPU 侧为统一 `GridDesc` 数组（144B/条），shader `trace_scene` 无分支遍历 |
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
-| **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
+| **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk **树块**）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；**节点级增量**：block 首 = 根节点地址，块内是节点 arena，编辑只重写路径上动过的那几个节点（单格编辑 ≈ 百字节）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
 | **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass（GPU 专属）；局部 AABB slab 剔除。CPU 侧同一套（`brickmap/raytrace.rs::raycast`，无 beam）供拾取 / 编辑落笔 |
 | **GI（屏幕空间 ReSTIR）** | ✅ 生产可用 | 逐像素一个 reservoir（每 GI 像素 `GI_RES_WORDS` 个 word × 2 块 ping-pong），`gi_main` 一次派发完成「新鲜候选（4 条余弦；「高」档 8 条；去遮挡再翻倍）→ 时域复用 → 空间复用 → 着色」。复用判据 = **同一个面**（平面归属靠面键，相似度靠**着色法线** `dot ≥ GI_DEN_N_DOT`）⇒ 薄板/墙缝不漏光，而凸棱上被梯度法线平均过的那一段仍与相邻同面体素连成一片。**空间复用零射线**（8 tap 只并上一帧邻居的累计量），且**只作用在本帧估计、不回写时域历史**。辐亮度 = 单次弹射（命中面按「太阳直射 + 天光」着色后除 π，miss 取天光）⇒ 输入只依赖几何与光照、逐帧确定，第 1 帧即稳态。降噪 = 时域累积（输入在「面不跨 texel」时取**同一面邻域均值**做预平均 + 方差驱动历史权重 + 累积矩给出的平滑噪声尺度 + AABB 钳制 + 离群抑制，上限 96 帧）→ 5 轮 atrous（同面键满权重、其他走法线点积 × 亮度权重）；回全分辨率用**几何感知上采样**。菜单「渲染/ReSTIR GI」开关 + 分辨率档（1/1、1/2、1/4；每档都跑 GI，只是网格疏密不同）+「降噪质量」档（关/低/中/高，**与分辨率档正交**：关 = 一条降噪 pass 都不跑、直接采样原始 GI；低 = 时域 + 5 轮 3×3；中 = atrous 换 5×5；高 = 再把每像素候选数翻倍即 GI 射线翻倍 + 记忆窗 20→32 帧）。此外：**① 逐面合并**（同一个可见体素面的全部 texel 的候选是**同一个积分**的 i.i.d. 样本 ⇒ `gi_main` 定点累加、`gi_face_flatten` 在**降噪之前**把整面换成均值，方差 ÷ texel 数）；**② 二次顶点缓存跨帧持久**（槽里的键带 epoch 掩码：几何 / 太阳 / 天光任一变化即整表自失效 ⇒ 不再每帧 `clear_buffer`）；**④ 二次弹射**（菜单「光照/二次弹射」：二次顶点再加一跳的间接光，稀疏档按 `1/4` 概率带上并乘 `4` 补齐期望 ⇒ 无偏）。 |
 | **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
 | **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
-| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除；球 / 立方笔触按 brick 粒度整块写入（整块全在笔触内 → 一次 O(深度) 写，落成 uniform 上级节点）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传；`EDIT[place\|erase]` 日志 |
+| **体素编辑** | ✅ 生产可用 | 幽灵模式左键放置 / 右键单击擦除，按住连续落笔并按 `EDIT_BUDGET_MS` 分帧；球 / 立方笔触**按 4³ 砖整块写**（整块在笔触内 → 一次 O(深度) `fill_brick` 落成 uniform 上级节点；边界砖 → `set_brick_voxels` 一次写完 64 格）；材质按**内容去重**落调色板槽（改材质不影响旧体素）；编辑 AABB 同时驱动增量上传；`EDIT[place\|erase]` 日志 |
 | **渲染管线** | ✅ 生产可用 | **无 render node**：extract / prepare / dispatch / blit 全部系统级显式调度；`blit.wgsl` 双入口 `fs_main` / `fs_fxaa`（FXAA 3.11 移植）；半分辨率 `RenderScale` + 线性上采样；MSAA 强制关闭 |
 | **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界** |
 | **世界标签** | ✅ 生产可用 | `WorldAnchor`：世界坐标 → 屏幕像素 UI 标签（距离缩放、CJK 字体延迟解析） |
@@ -77,7 +77,8 @@ cargo clippy --release --workspace --all-targets -- -D warnings
             → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
   Last    : poll_pending —— UploadBudget（4MB/帧）× DirtyTracker → MainPending
       ↓ ExtractSchedule（main → render world）
-  extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB)
+  extract        : VolumesBuilder 增量/全量构建 → UploadSnapshot + BrickMapDirty(AABB)；
+                   笔触只动"被实体完全包围"区域时不上报盒（GI 保留历史，`VoxelScene::interior_only_edit`）
   extract_camera : DdaCameraConfig → DdaViewUniform
   extract_gi     : GiSettings（GI 开关 / 分辨率除数）+ 曝光活参数
       ↓ render world
@@ -131,7 +132,9 @@ cargo clippy --release --workspace --all-targets -- -D warnings
    没有「收敛」这件事，也没有相机运动相关的延迟。代价是丢掉二次以上的弹射。
    GI 回全分辨率时用**几何感知上采样**（joint bilateral：只接受与命中面同一个面的
    GI texel）⇒ 棱边 / 墙角不渗色（纯双线性会混边界两侧）。
-6. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
+6. **脏区增量上传**：struct 字区间 + palette 槽区间局部写，且**细到节点** —— 一个 chunk 是一块
+   （块首 = 根节点地址、块内节点 arena、子块指针相对根地址），编辑只重写路径上动过的那几个节点
+   （单格编辑 ≈ 百字节）；全量路径只在首帧 / 换世界 / 树基址漂移 / 块几何增长时触发。
 7. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
    关掉 FXAA 时只是换一条 fragment 入口，无分支代价。
 
@@ -159,7 +162,9 @@ gate-render/       渲染与 wire 契约（CPU 侧；GPU 状态全部在 render 
                                    firstTrailingBit 跨级跳 / 方向可达 LUT / AABB slab / chunk 间 A&W；
                                    跑权威 VolumeGrid，无 beam）
                        builder.rs  BrickMapBuilder（单 volume）/ VolumesBuilder（多 volume）+
-                                   DirtyRanges（struct 字区间 + palette 槽区间）+ snapshot（自动降级全量）
+                                   DirtyRanges（struct 字区间 + palette 槽区间）+ snapshot（自动降级全量）；
+                                   每 chunk 一个树块（块内节点 arena）⇒ 按 TreeDirty 只重写动过的节点；
+                                   块级空闲段 first-fit 复用、空闲过半压实（高水位不随编辑次数增长）
                        upload.rs   poll_pending / extract / prepare / init_empty_gpu；ensure_with_copy 扩容；
                                    UPLOAD[full|incremental] 日志；VolumePlugin
                        dda.rs      GPU 侧 DDA pass：OrbitCamera / DdaCameraConfig、RenderScale /
@@ -329,8 +334,9 @@ chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
 1. **存储 buffer 扩容必须带内容**：`ensure_with_copy` 做 GPU-GPU 前缀拷贝再写尾部；直接重建会把
    chunk 索引表清零 → 全屏空（经典回归）。
 2. **上传别逐帧硬扛 backlog**：`poll_pending` 在 backlog > 3× 预算时一次性刷新，否则每次 Prepare 被长阻塞。
-3. **树编辑走整块路径**：笔触用 `fill_brick`（O(深度)）而不是逐体素 `set_voxel`（31³ 笔触 = 近 3 万次树下降
-   + 沿途 `try_merge`）。
+3. **树编辑按 4³ 砖整块走**：整块在笔触内 → `fill_brick`（O(深度)）；被笔触切到的 4³ 砖 →
+   `set_brick_voxels`（一次下钻 + 一次向上合并，64 格一起写）—— 逐体素 `set_voxel` 要付每格一次
+   树下降 + 每层 64 子块的 `try_merge`。实测 castle.vox 球 `size=61`：33.2ms → 4.9ms。
 4. **空间复用的结果绝不回写时域历史**（`gi/screen.wesl` 文件头 ②）：空间复用读的是**上一帧**邻居的
    reservoir；把「新鲜 + 时域 + 空间」一起存回去，下一帧的历史里就混进了邻居的历史 ⇒ 时域链被横向
    污染（相关性、拖影、移动物体「前沿带」）。正确写法是：存回 reservoir 的只有「新鲜 + 时域」，

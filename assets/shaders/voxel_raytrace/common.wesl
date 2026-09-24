@@ -9,7 +9,8 @@ const NODE_FIXED_WORDS: u32 = 3u;    // mask_lo + mask_hi + palette
 const CHUNK_INDEX_CAP: u32 = 64u;
 
 // --- 材质索引格式（16 位，与 Rust `gate_voxel::PALETTE_BITS` / `LEAF_*` 同源）---
-// 节点第 3 字：bit0..15 = uniform 子块色，bit16..31 = LOD 子树多数色；叶父层 inline 每字装 2 个体素（LEAF_VOXELS_PER_WORD）。
+// 节点第 3 字：bit0..15 = uniform 子块色；bit16..31 恒 0（旧「LOD 子树多数色」，无消费方 —— 所有读点都 & 0xFFFF）；
+// 叶父层 inline 每字装 2 个体素（LEAF_VOXELS_PER_WORD）。
 // 权威定义在 `wire.rs`，改位宽须同步全部读点。
 
 // --- palette flags 位（与 Rust `gate_voxel::PaletteFlags` 同源；权威定义在 palette.rs）---
