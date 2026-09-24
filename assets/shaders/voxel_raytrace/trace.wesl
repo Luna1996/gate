@@ -37,6 +37,9 @@ struct Brick {
   addr: u32,  // 节点绝对字址（b_struct）
   mask: u64,  // 分裂掩码（bit=1 = 子块分裂；bit=0 = 统一子块，色 = pal）
   pal: u32,   // 节点 palette（统一子块颜色，0 = 空气）
+  // 节点 palette word 的高 16 位 = **叶块代表值**（M2，写侧 `chunk_tree::leaf_rep_palette` 的
+  // 加权众数；非叶节点恒 0）。只有 `level == 0`（4³ 值块）的 brick 会用它，见 `leaf_lod_pal`。
+  pal_rep: u32,
 }
 
 /// 子块 `idx`（0..63）是否分裂。
@@ -53,12 +56,13 @@ fn mask_pop_below(mask: u64, idx: u32) -> u32 {
 
 /// 叶级 LOD 的像素阈值，取 `fp = t·px_ang`：`1/fp` = 一个体素在屏幕上占多少像素。
 /// `fp >= 1` ⇔ 一个像素已经覆盖 ≥ 1 个体素 ⇒ 一个 4³ 值块约 4 像素宽，块内 1 体素尺度的细节
-/// 已不可分辨 ⇒ 整块取一个颜色（代表色 = `leaf_lod_pal`：块内 `pal` 非空时取它，否则取第一个
-/// **置位且非空**的体素色 —— 最便宜的规则，不做平均、不维护新字段）。
+/// 已不可分辨 ⇒ 整块取一个颜色（代表色 = `leaf_lod_pal`：M2 存好的**块内加权众数**槽号，
+/// 写侧 `chunk_tree::leaf_rep_palette`）。
 ///
-/// CONSTRAINT: 块内结构被**整体替换**，轮廓误差可达整块（4 像素）—— 这是"代表色取块内某个体素"
-/// 的固有代价，按"先用最便宜的规则"接受。视觉不合适时把这个常量调回 4（只影响远场：1080p 下
-/// `fp >= 1` ⇔ 935 体素≈234 m、`fp >= 4` ⇔ 3 740 体素≈935 m）；根治要等代表色（M2）。
+/// CONSTRAINT: 块内结构被**整体替换**，轮廓误差可达整块（4 像素）—— 这是"一个块一个色"的固有
+/// 代价。M2 已把"代表色取哪一粒体素"换成众数（块内多数材质），残余误差 = 少数派的那部分体素
+/// 被染成多数派的色；视觉仍不合适就把这个常量调回 4（只影响远场：1080p 下 `fp >= 1` ⇔
+/// 935 体素≈234 m、`fp >= 4` ⇔ 3 740 体素≈935 m），根治要等叶代表色能逐块给平均色（M2 之后）。
 /// 依据 docs/editable-gigavoxel.md 3.3 与 §9 的实测（`fp>=1` 比关闭省总 GPU 8.1%、重帧 p90 −28%）。
 const LEAF_LOD_FP: f32 = 1.0;
 
@@ -82,15 +86,18 @@ fn diag_sampled(addr: u32) -> bool {
   return LOD_DIAG == 1u && (addr & 63u) == 0u;
 }
 
-/// 叶级 LOD 代表色：4³ 值块里**首个非空体素**的色（0 = 整块空气）。
+/// 叶级 LOD 代表色（M2）：节点 palette word 高 16 位存的就是它 —— 写侧算的是**块内按体素数加权的
+/// 众数**槽号（`chunk_tree::leaf_rep_palette`），即"这块看起来最像的那个材质"。
 ///
 /// 只在"块内混合"（`mask != 0`）且**入口体素是空气**时被调用（入口是实体时上游已精确返回）。
-/// 掩码位置位只表示"该格不取 `pal`"，它的 inline 半字仍可能是 0（空气）⇒ 不能只取最低置位，
-/// 必须逐位置位扫到第一个非零值；`pal` 只在**存在未置位格**（`mask != ~u64(0)`）时才是块内
-/// 真实存在的颜色（掩码满时它是"无未置位格"的残留值，见 `chunk_tree.rs::Leaf::tile_color`）。
-/// 成本：常见 1 次存储读（地形砖的最低置位格即实体），最坏 `LEAF_LOD_SCAN_CAP` 次；一次扫描替掉
-/// 的是块内最多约 12 次逐格查（每轴 4 格）。
+/// 字段为 0（旧数据 / 全空气）时退回旧口径：块内**首个非空体素**色 —— 掩码位置位只表示"该格不取
+/// `pal`"，它的 inline 半字仍可能是 0（空气）⇒ 不能只取最低置位，必须逐位置位扫到第一个非零值；
+/// `pal` 只在**存在未置位格**（`mask != ~u64(0)`）时才是块内真实存在的颜色（掩码满时它是"无未置位格"
+/// 的残留值，见 `chunk_tree.rs::Leaf::tile_color`）。
+/// 成本：常见路径 1 次字段读；退回扫描时最坏 `LEAF_LOD_SCAN_CAP` 次（一次扫描替掉的是块内最多
+/// 约 12 次逐格查）。
 fn leaf_lod_pal(b: Brick) -> u32 {
+  if (b.pal_rep != 0u) { return b.pal_rep; }
   if (b.mask != ~u64(0) && b.pal != 0u) { return b.pal; }
   var m = b.mask;
   for (var k: u32 = 0u; k < LEAF_LOD_SCAN_CAP; k = k + 1u) {
@@ -194,8 +201,10 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
-  let r_pal = b_struct[chunk_base + 2u] & 0xFFFFu;  // 节点字低 16 位 = uniform 色（16 位材质索引）
-  bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal);
+  let r_pw = b_struct[chunk_base + 2u];
+  let r_pal = r_pw & 0xFFFFu;  // 节点字低 16 位 = uniform 色（16 位材质索引）
+  let r_rep = r_pw >> 16u;     // 高 16 位 = 叶代表值（M2；根是层 3 节点 ⇒ 恒 0，带上只为口径完整）
+  bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal, r_rep);
   var level: u32 = 3u;
   // 当前体素（chunk 局部 voxel 整数坐标 0..255；跨出 chunk 的步进瞬态可达 -1/256）
   let p0 = ro_c + rd * t0;
@@ -252,8 +261,8 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
       // CONSTRAINT: 这里返回的 `pal` 是**本节点**的 uniform 色，而当前子块是**分裂**的 ⇒ 它不保证是
       // 该子块的颜色（通常 0 = 空气）。因此这条早停只对"只消费 t"的调用者合法（beam 预 pass）；
-      // 着色射线必须走 `depth_cap >= 3`（不早停）。上层三档 LOD 要启用须先有 M2 的代表色字段
-      // （docs/editable-gigavoxel.md 硬不变量 4）。
+      // 着色射线必须走 `depth_cap >= 3`（不早停）。上层三档 LOD 要启用须先有**非叶**节点的代表值
+      // （M2 只给了叶块，M2b 尚未落地；docs/editable-gigavoxel.md 硬不变量 4）。
       let gd = 3u - level;
       if (gd >= depth_cap) {
         // 颜色契约的机器可校验形式（M0）：`pal == 0` = "返回了不属于该子块的颜色"最露骨的情形。
@@ -268,6 +277,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       let c_mh = b_struct[child_addr + 1u];
       let c_pw = b_struct[child_addr + 2u];
       let c_pal = c_pw & 0xFFFFu;  // 节点字低 16 位 = uniform 色
+      let c_rep = c_pw >> 16u;     // 高 16 位 = 叶代表值（M2；只有层 0 的值块非 0）
       let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
       // 统一子节点快路径：wire 任意层的分裂位都可能指向 3 字统一节点（mask=0，禁读 addr+3 之后）
       if (c_mask == u64(0)) {
@@ -275,7 +285,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
         break;
       }
       level = level - 1u;
-      bricks[level] = Brick(child_addr, c_mask, c_pal);
+      bricks[level] = Brick(child_addr, c_mask, c_pal, c_rep);
     }
     // ---- 整砖 LUT 跳过（仅 palette==0 节点安全）----
     {
@@ -399,8 +409,10 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
-  let r_pal = b_struct[chunk_base + 2u] & 0xFFFFu;  // 节点字低 16 位 = uniform 色（16 位材质索引）
-  bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal);
+  let r_pw = b_struct[chunk_base + 2u];
+  let r_pal = r_pw & 0xFFFFu;  // 节点字低 16 位 = uniform 色（16 位材质索引）
+  let r_rep = r_pw >> 16u;     // 高 16 位 = 叶代表值（M2；根是层 3 节点 ⇒ 恒 0，带上只为口径完整）
+  bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal, r_rep);
   var level: u32 = 3u;
   // 当前体素（chunk 局部 voxel 整数坐标 0..255；跨出 chunk 的步进瞬态可达 -1/256）
   let p0 = ro_c + rd * t0;
@@ -468,6 +480,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let c_mh = b_struct[child_addr + 1u];
       let c_pw = b_struct[child_addr + 2u];
       let c_pal = c_pw & 0xFFFFu;  // 节点字低 16 位 = uniform 色
+      let c_rep = c_pw >> 16u;     // 高 16 位 = 叶代表值（M2；只有层 0 的值块非 0）
       let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
       // 统一子节点快路径：wire 任意层的分裂位都可能指向 3 字统一节点（mask=0，禁读 addr+3 之后）
       if (c_mask == u64(0)) {
@@ -475,7 +488,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         break;
       }
       level = level - 1u;
-      bricks[level] = Brick(child_addr, c_mask, c_pal);
+      bricks[level] = Brick(child_addr, c_mask, c_pal, c_rep);
     }
     // ---- traverse 唯一出口：命中 / 穿透 / 出射面 ----
     if (hit_pal != 0u) {

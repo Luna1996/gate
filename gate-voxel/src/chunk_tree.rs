@@ -11,7 +11,8 @@
 //! —— wire 的子块指针以**根地址**为基准，故增量编辑可以只重写动过的那几个节点（节点级改动走
 //! [`ChunkTree::take_dirty`]，消费方是 `gate-render` 的树块 arena）。
 //! Level 链 256 → 64 → 16 → 4 → 1；材质索引是 `PaletteId`（16 位，容量 2^16），节点 tile 色与叶层逐体素色
-//! 同宽，二者都从同一 u32 字段解包（见 `pack_node_palette`）。
+//! 同宽，二者都从同一 u32 字段解包（见 [`pack_palette_word`]）。该字的高 16 位是**叶块代表值**
+//! （M2，见 [`leaf_rep_palette`]）：shader 的叶级 LOD 拿它当命中材质，非叶节点恒 0。
 
 use super::coords::{BRICK_FACTOR, CHUNK_SIZE, LEVEL_EXTENT, child_linear_idx};
 use crate::palette::{PALETTE_BITS, PaletteId};
@@ -20,6 +21,10 @@ use crate::palette::{PALETTE_BITS, PaletteId};
 pub const LEAF_VOXELS_PER_WORD: usize = 32 / PALETTE_BITS as usize;
 /// 叶父层（level 3）inline 字数：4³ = 64 体素，每字装 [`LEAF_VOXELS_PER_WORD`] 个
 pub const LEAF_INLINE_WORDS: usize = 64 / LEAF_VOXELS_PER_WORD;
+/// 叶块（level 3）体素数
+const LEAF_VOXELS: usize = LEAF_INLINE_WORDS * LEAF_VOXELS_PER_WORD;
+/// 叶代表值计数表的容量（块内**材质种类**数上限）：超过就退回"首个非空"（见 [`leaf_rep_palette`]）。
+const REP_TALLY_CAP: usize = 8;
 
 /// 非叶节点 fixed 字数（mask_lo / mask_hi / palette）
 const NODE_FIXED_WORDS: usize = 3;
@@ -46,6 +51,9 @@ pub struct NodeView<'a> {
   pub mask: u64,
   /// tile 色 / 值块的默认色（0 = 空气）
   pub palette: PaletteId,
+  /// **叶块代表值**（M2）：wire 的 palette word 高 16 位（bit16..31）在 CPU 侧的取值 ——
+  /// 叶块 = [`leaf_rep_palette`]（块内加权众数），非叶节点 = [`PaletteId::AIR`]（wire 里恒 0）。
+  pub rep: PaletteId,
   /// 紧凑子节点表（按 mask 位序）；层 3 的值块没有子节点（内容走 [`ChunkTree::node_inline_words`]）
   pub children: &'a [u32],
 }
@@ -101,6 +109,12 @@ impl Leaf {
     self.inline[slot] =
       (self.inline[slot] & !(0xFFFF << shift)) | ((palette.get() as u32) << shift);
     self.mask |= 1u64 << i;
+  }
+
+  /// 本块的代表值（M2，见 [`leaf_rep_palette`]）：wire 的节点 palette word 高 16 位就填它。
+  #[inline]
+  fn rep(&self) -> PaletteId {
+    leaf_rep_palette(self.mask, self.palette, &self.inline)
   }
 
   /// 全 64 格同色 → Some(色)。
@@ -173,14 +187,66 @@ fn child_slot(mask: u64, i: u32) -> u32 {
   (mask & ((1u64 << i) - 1)).count_ones()
 }
 
-/// 节点 palette word 打包：bit0..15 = tile 色；bit16..31 恒 0。
+/// 节点 palette word 打包：bit0..15 = tile 色；bit16..31 = **叶块代表值**（M2；非叶 = AIR）。
 ///
-/// CONSTRAINT: 高 16 位（wire 里的旧字段「LOD 子树多数色」，配合 `consts::DDA_LOD` 的远场早停）
-/// **没有消费方** —— shader 侧所有节点读取点都 `& 0xFFFF` 屏蔽高半字，`view_u.lod.y` 也没有读取点。
-/// 它的逐节点递归 + 64² 计票曾占序列化 88% 的耗时，故整段移除。
+/// 高 16 位曾是 wire 的旧字段「LOD 子树多数色」（逐节点递归计票占序列化 88% 的耗时，已整段移除，
+/// 见 `docs/editable-gigavoxel.md` §9 的「M2 的一处事实修正」），现由 M2 复用为叶块代表值。
+/// 读侧**所有 uniform 色的读取点都只取低 16 位**（shader 里逐处 `& 0xFFFF`）⇒ 填高半字对既有
+/// 语义零影响；唯一读高半字的是叶级 LOD（`trace.wesl::leaf_lod_pal`）。
 #[inline]
-fn pack_node_palette(palette: PaletteId) -> u32 {
-  palette.get() as u32
+pub fn pack_palette_word(palette: PaletteId, rep: PaletteId) -> u32 {
+  palette.get() as u32 | ((rep.get() as u32) << 16)
+}
+
+/// 叶块（4³）的**代表值**：块内按体素数加权的众数槽号 —— 出现次数最多的那个材质；平手取槽号小者；
+/// 全空气 ⇒ 0（= 无代表，读侧退回旧口径"块内首个非空体素色"，故 0 只可能来自旧数据）。
+///
+/// **为什么存槽号、不存平均色**（M2 的语义决定）：槽号让材质属性照旧（命中直接进 `fetch_material`）、
+/// 调色板改色自动跟随、也不必另立"命中 = 颜色"的第二条表示；众数 = 这块**看起来最像**的那个材质
+/// （旧口径取"首个非空体素"，可能只是一粒别的色 ⇒ 整块 4 像素被染成它）。
+///
+/// 成本：一次 64 格扫描 + 一张 ≤ [`REP_TALLY_CAP`] 项的小表（常见块只有 2~4 种材质）⇒ 编辑路径每块
+/// 百纳秒量级；块内材质种类爆表（噪声块）直接退回"首个非空"，不为精确众数付二次扫描。
+pub fn leaf_rep_palette(
+  mask: u64,
+  palette: PaletteId,
+  inline: &[u32; LEAF_INLINE_WORDS],
+) -> PaletteId {
+  let mut tally = [(0u16, 0u8); REP_TALLY_CAP];
+  let mut used = 0usize;
+  let mut first = 0u16;
+  for i in 0..LEAF_VOXELS as u32 {
+    let v = if mask & (1u64 << i) == 0 {
+      palette.get()
+    } else {
+      let w = inline[(i >> 1) as usize];
+      ((w >> ((i & 1) * 16)) & 0xFFFF) as u16
+    };
+    if v == 0 {
+      continue;
+    }
+    if first == 0 {
+      first = v;
+    }
+    match tally[..used].iter_mut().find(|(id, _)| *id == v) {
+      Some(slot) => slot.1 = slot.1.saturating_add(1),
+      None if used < REP_TALLY_CAP => {
+        tally[used] = (v, 1);
+        used += 1;
+      }
+      None => return PaletteId(first),
+    }
+  }
+  if used == 0 {
+    return PaletteId::AIR;
+  }
+  let mut best = (u16::MAX, 0u8);
+  for &(id, w) in &tally[..used] {
+    if w > best.1 || (w == best.1 && id < best.0) {
+      best = (id, w);
+    }
+  }
+  PaletteId(best.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +380,16 @@ impl ChunkTree {
       Node::Leaf(l) => (l.mask, l.palette, &[]),
       Node::Split { mask, palette, children } => (*mask, *palette, children),
     };
-    Some(NodeView { mask, palette, children })
+    Some(NodeView { mask, palette, rep: self.node_rep(id as usize), children })
+  }
+
+  /// 节点的 wire 代表值（M2）：叶块 = [`leaf_rep_palette`]，其余（含越界 id）= AIR。
+  #[inline]
+  fn node_rep(&self, id: usize) -> PaletteId {
+    match self.nodes.get(id) {
+      Some(Node::Leaf(l)) => l.rep(),
+      _ => PaletteId::AIR,
+    }
   }
 
   /// wire 层 3（4³ 值块）节点的 32 字 inline 值表。非值块节点（含越界）→ None。
@@ -358,7 +433,7 @@ impl ChunkTree {
     };
     out.push(mask as u32);
     out.push((mask >> 32) as u32);
-    out.push(pack_node_palette(palette));
+    out.push(pack_palette_word(palette, self.node_rep(0)));
     layout[0] = (0, 0);
     // 根**恒**占满预留区（即便 mask=0 只用到前 3 字）：根的字数不随掩码变化 ⇒ 永不搬迁。
     out.resize(ROOT_WIRE_WORDS, 0);
@@ -384,10 +459,10 @@ impl ChunkTree {
       Node::Leaf(l) => (l.mask, l.palette, &[]),
       Node::Split { mask, palette, children } => (*mask, *palette, children),
     };
-    // 写 3 words: mask_lo, mask_hi, palette(bit0..15，高 16 位恒 0 —— 见 `pack_node_palette`)
+    // 写 3 words: mask_lo, mask_hi, palette（bit0..15 = tile 色、bit16..31 = 叶代表值 —— `pack_palette_word`）
     out.push(mask as u32);
     out.push((mask >> 32) as u32);
-    out.push(pack_node_palette(palette));
+    out.push(pack_palette_word(palette, self.node_rep(idx)));
     if mask == 0 {
       return;
     }
@@ -1118,27 +1193,13 @@ impl ChunkTree {
     my
   }
 
-  /// 子树代表色（0 = 全空气）。与 shader `trace.wesl::leaf_lod_pal` **同一口径**：
-  /// 先看本节点 `palette`（存在未置位格且非空 ⇒ 用它），否则按子块序找第一个非空的子树；
-  /// 叶层按"第一个置位且非空的 inline 半字"。
+  /// 子树代表色（0 = 全空气）。与 shader 的叶级 LOD **同一口径**：叶层 = 叶块代表值（块内加权
+  /// 众数，M2 的 [`leaf_rep_palette`]，也就是 wire 高 16 位那个字段）；上层 = 先看本节点 `palette`
+  /// （存在未置位格且非空 ⇒ 用它），否则按子块序找第一个非空的子树。
   fn rep_of(&self, id: usize) -> PaletteId {
     match &self.nodes[id] {
       Node::Uniform(p) => *p,
-      Node::Leaf(l) => {
-        if l.mask != u64::MAX && !l.palette.is_air() {
-          return l.palette;
-        }
-        let mut m = l.mask;
-        while m != 0 {
-          let i = m.trailing_zeros();
-          m &= m - 1;
-          let c = l.get(i);
-          if !c.is_air() {
-            return c;
-          }
-        }
-        PaletteId::AIR
-      }
+      Node::Leaf(l) => l.rep(),
       Node::Split { mask, palette, children } => {
         if *mask != u64::MAX && !palette.is_air() {
           return *palette;
@@ -1312,7 +1373,11 @@ mod tests {
       assert_eq!(lv, level, "id {id} 的 layout 层号不符");
       let o = off as usize;
       assert_eq!((blob[o + 1] as u64) << 32 | blob[o] as u64, v.mask, "id {id} 掩码不符");
-      assert_eq!(blob[o + 2] & 0xFFFF, v.palette.get() as u32, "id {id} 的 tile 色不符");
+      assert_eq!(
+        blob[o + 2],
+        pack_palette_word(v.palette, v.rep),
+        "id {id} 的 palette word（tile 色 + 叶代表值）不符"
+      );
       seen += 1;
       if v.mask == 0 {
         continue;
@@ -1403,6 +1468,90 @@ mod tests {
           );
         }
         assert_eq!(a.serialize(), b.serialize(), "case {case} {palette:?}：序列化字节不一致");
+      }
+    }
+  }
+
+  /// M2：叶代表值 = 块内**按体素数加权的众数**；平手取槽号小者；全空气 = 0；
+  /// 材质种类超过 [`REP_TALLY_CAP`] 时退回"首个非空"（与读侧旧口径一致）。
+  #[test]
+  fn leaf_rep_is_weighted_mode() {
+    let put = |inline: &mut [u32; LEAF_INLINE_WORDS], i: u32, v: u16| {
+      let (slot, shift) = ((i >> 1) as usize, (i & 1) * 16);
+      inline[slot] = (inline[slot] & !(0xFFFF << shift)) | ((v as u32) << shift);
+    };
+    // 前 `n` 格 = `va`，其余 = `vb`；`pal` 只有当 `mask` 有 0 位时才是块内真实存在的色
+    let build = |n: u32, va: u16, vb: u16| {
+      let (mut inline, mut mask) = ([0u32; LEAF_INLINE_WORDS], 0u64);
+      for i in 0..64u32 {
+        put(&mut inline, i, if i < n { va } else { vb });
+        mask |= 1u64 << i;
+      }
+      (mask, inline)
+    };
+
+    let (mask, inline) = build(40, 7, 3);
+    assert_eq!(leaf_rep_palette(mask, PaletteId::AIR, &inline), PaletteId(7), "体素数多者胜");
+    let (mask, inline) = build(32, 9, 2);
+    assert_eq!(leaf_rep_palette(mask, PaletteId::AIR, &inline), PaletteId(2), "平手取槽号小者");
+    // 全空气
+    assert_eq!(leaf_rep_palette(0, PaletteId::AIR, &[0; LEAF_INLINE_WORDS]), PaletteId::AIR);
+    // 掩码 0 ⇒ 64 格全是 tile 色
+    assert_eq!(leaf_rep_palette(0, PaletteId(5), &[0; LEAF_INLINE_WORDS]), PaletteId(5));
+    // 8 格 inline(4) + 56 格 tile(9)：tile 色也是候选，且体素数占优
+    let mut inline = [0u32; LEAF_INLINE_WORDS];
+    let mut mask = 0u64;
+    for i in 0..8u32 {
+      put(&mut inline, i, 4);
+      mask |= 1u64 << i;
+    }
+    assert_eq!(leaf_rep_palette(mask, PaletteId(9), &inline), PaletteId(9), "未置位格的 tile 色要计入");
+    // 9 种材质（超过计数表容量）⇒ 退回"首个非空"
+    let mut inline = [0u32; LEAF_INLINE_WORDS];
+    let mut mask = 0u64;
+    for i in 0..64u32 {
+      put(&mut inline, i, (i % 9 + 1) as u16);
+      mask |= 1u64 << i;
+    }
+    assert_eq!(leaf_rep_palette(mask, PaletteId::AIR, &inline), PaletteId(1), "爆表退回首个非空");
+  }
+
+  /// M2：叶块的 wire 代表值写进 palette word 的高 16 位（= 加权众数，**不是**"首个非空"——
+  /// 本块首格特意放了一粒别的色），非叶节点那个字段恒 0。
+  #[test]
+  fn wire_palette_word_carries_leaf_rep() {
+    let mut t = ChunkTree::empty();
+    t.set_brick_voxels([0, 0, 0], u64::MAX, PaletteId(2)); // 整块 = 2
+    t.set_voxel(0, 0, 0, PaletteId(3)); // 首格 = 3（旧口径会选它）
+    let (blob, layout) = t.serialize_with_layout();
+    let mut leaves = 0;
+    for (id, &(off, level)) in layout.iter().enumerate() {
+      if off == NODE_OFFSET_NONE {
+        continue; // 不可达节点
+      }
+      let word = blob[off as usize + 2];
+      if level == 3 {
+        assert_eq!(word >> 16, 2, "id {id} 的叶代表值应为加权众数 2（高半字 = {}）", word >> 16);
+        leaves += 1;
+      } else {
+        assert_eq!(word >> 16, 0, "id {id} 在第 {level} 层，代表值字段应恒 0");
+      }
+    }
+    assert_eq!(leaves, 1, "本用例只有一条到叶的路径");
+  }
+
+  /// M2：proxy 的塌缩色与叶级 LOD **同一口径** —— 混合叶块塌成**众数**色（不是"首个非空"那一粒）。
+  #[test]
+  fn proxy_collapse_uses_leaf_rep() {
+    let mut t = ChunkTree::empty();
+    t.set_brick_voxels([0, 0, 0], u64::MAX, PaletteId(2)); // 整块 = 2
+    t.set_voxel(0, 0, 0, PaletteId(3)); // 首格 = 3（旧口径会选它）
+    let p = t.proxy(BRICK_FACTOR); // 塌 4³ 及以下 ⇒ 该块成一个 uniform 色
+    for x in 0..4 {
+      for y in 0..4 {
+        for z in 0..4 {
+          assert_eq!(p.get_voxel(x, y, z), Some(PaletteId(2)), "proxy 塌缩色应为众数 2");
+        }
       }
     }
   }

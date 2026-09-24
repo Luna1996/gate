@@ -16,7 +16,7 @@ pub use coords::{
 
 pub use chunk_tree::{
   BrickState, ChunkTree, LEAF_INLINE_WORDS, LEAF_VOXELS_PER_WORD, NODE_OFFSET_NONE, NodeDesc,
-  NodeLayout, NodeView, ROOT_WIRE_WORDS, TreeDirty,
+  NodeLayout, NodeView, ROOT_WIRE_WORDS, TreeDirty, leaf_rep_palette, pack_palette_word,
 };
 
 pub use dirty::DirtyTracker;

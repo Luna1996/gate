@@ -931,8 +931,8 @@ const DUMP_VOLUME_WORDS: usize = 16;
 ///   （= shader 的 `chunk_base` = 根节点地址）；
 /// - 根节点固定 `[ROOT_WIRE_WORDS]` = 3 + 64 字（掩码增减不改根的字数 ⇒ 根永不搬迁），
 ///   其余节点是块内 arena 里的块（地址任意，`node_words` 不再等于"紧排字数"）；
-/// - 每个节点 3 字 fixed：`mask_lo` / `mask_hi` /（低 16 位 = 统一色，0 = AIR；高 16 位恒 0 ——
-///   旧「LOD 代表色」字段，无消费方，见 `chunk_tree.rs::pack_node_palette`），
+/// - 每个节点 3 字 fixed：`mask_lo` / `mask_hi` /（低 16 位 = 统一色，0 = AIR；高 16 位 = **叶块
+///   代表值**（M2，非叶恒 0），见 `chunk_tree.rs::pack_palette_word`），
 ///   随后**按 mask 位序密集**放"该位置 1"的子块偏移（值 = 相对**根节点地址**的字偏移）；`mask = 0`
 ///   的节点到此为止（整个 4^level 子块同色）；叶父层换成 32 字 inline（每字 2 个体素 × 16 位索引，
 ///   0 = AIR）。

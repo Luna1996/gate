@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use gate_voxel::{
   ChunkCoord, ChunkTree, NODE_OFFSET_NONE, NodeLayout, NodeView, PALETTE_INDEX_MAX, PaletteId,
-  ROOT_WIRE_WORDS, TreeDirty, VolumeGrid, VolumeTransform, Volumes,
+  ROOT_WIRE_WORDS, TreeDirty, VolumeGrid, VolumeTransform, Volumes, pack_palette_word,
 };
 use glam::{IVec3, Vec4};
 
@@ -556,7 +556,8 @@ impl BrickMapBuilder {
     let mut out: Vec<u32> = Vec::with_capacity(new_words);
     out.push(view.mask as u32);
     out.push((view.mask >> 32) as u32);
-    out.push(view.palette.get() as u32);
+    // palette word：低 16 = tile 色、高 16 = 叶代表值（M2）—— 与全量路径同一个打包函数
+    out.push(pack_palette_word(view.palette, view.rep));
     if view.mask != 0 {
       if level == 3 {
         out.extend_from_slice(&tree.node_inline_words(id).expect("level 3 分裂节点有 inline"));
@@ -1102,7 +1103,11 @@ mod tests {
     let view = tree.node_view(id).expect("grid 侧节点必 live");
     let at = base + off;
     assert_eq!(read_mask(buf, at), view.mask, "节点 {id}（层 {level}）掩码不符");
-    assert_eq!((buf[at + 2] & 0xFFFF) as u16, view.palette.get(), "节点 {id} 的 uniform 色不符");
+    assert_eq!(
+      buf[at + 2],
+      pack_palette_word(view.palette, view.rep),
+      "节点 {id}（层 {level}）的 palette word（tile 色 + 叶代表值）不符"
+    );
     if view.mask == 0 {
       return 1;
     }
@@ -1138,9 +1143,9 @@ mod tests {
       if tree.is_uniform_root() {
         assert_eq!(read_mask(&b.buffers().b_struct, base), 0, "{what}：{c:?} 单色根掩码应为 0");
         assert_eq!(
-          (b.buffers().b_struct[base + 2] & 0xFFFF) as u16,
-          tree.root_palette().get(),
-          "{what}：{c:?} 单色根色不符"
+          b.buffers().b_struct[base + 2],
+          pack_palette_word(tree.root_palette(), PaletteId::AIR),
+          "{what}：{c:?} 单色根的 palette word 不符（代表值字段恒 0）"
         );
         nodes += 1;
       } else {
