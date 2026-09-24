@@ -108,8 +108,10 @@ pub fn load_menu(config: &Config) -> MenuFile {
 /// 选中项按名字找回，找不到 → `nuke` → 第一项。
 fn apply_world_model_options(model: &mut MenuFile) {
   let mut options = crate::vox_scene::scan_vox_models();
-  // 程序化场景不来自磁盘（见 `scene::build_cube_in_void`），与 .vox 名字同列在一个下拉里
+  // 程序化场景不来自磁盘（见 `scene::build_cube_in_void` / `scene::build_infinite_cubes`），
+  // 与 .vox 名字同列在一个下拉里
   options.push(crate::scene::CUBE_IN_VOID.to_string());
+  options.push(crate::scene::INFINITE_CUBES.to_string());
   options.sort();
   options.dedup();
   let Some(MenuNode::Dropdown { options: opts, selected, .. }) =

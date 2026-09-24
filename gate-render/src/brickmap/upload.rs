@@ -13,6 +13,7 @@ use bevy::{
 };
 
 use super::builder::{VolumesBuilder, VolumesSnapshot};
+use super::residency::{Level, Residency, ResidencyPolicy, want_level};
 use super::wire::{
   BrickMapGlobals, CHUNK_COMP_WORDS, GridDesc, MARCH_MASK_WORDS, MaterialAsset, TREE_BASE,
   march_mask_lut_words,
@@ -267,6 +268,21 @@ pub struct UploadSnapshot {
   pub comp_chunks: usize,
 }
 
+/// **M3 常驻调度状态**（render world）：账目 + 策略 + 本帧被编辑的 chunk。**不持有 GPU 资源**。
+#[derive(Resource)]
+pub struct ResidencyState {
+  pub residency: Residency,
+  pub policy: ResidencyPolicy,
+  /// 本帧被编辑过的主世界 chunk（`extract` 填、`plan_residency` 消费）⇒ 钉住 + 排除在换出之外。
+  pub edited: Vec<gate_voxel::ChunkCoord>,
+}
+
+impl Default for ResidencyState {
+  fn default() -> Self {
+    Self { residency: Residency::new(), policy: ResidencyPolicy::DEFAULT, edited: Vec::new() }
+  }
+}
+
 /// 上传 CPU 耗时样本（render world 资源，由 prepare 每帧覆盖）。
 /// render→main 同步走 [`UploadCpuSampleChannel`]；GPU 拷贝发生在 submit 时，不计入此值。
 #[derive(Resource, Clone, Copy, Debug, Default)]
@@ -290,6 +306,9 @@ pub struct GpuBrickMap {
   pub palette: Buffer,
   pub comp: Buffer,
   pub state: Buffer,
+  /// 叶级 LOD 诊断计数器（BG1 binding 9，M0）：`consts::LOD_DIAG_WORDS` 个 u32，**只增不清**
+  /// （CPU 侧读差值，见 `crate::profiler::report_lod_diag`）。固定尺寸、不参与扩容；`COPY_SRC` 供读回。
+  pub lod_diag: Buffer,
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
   pub globals: UniformBuffer<BrickMapGlobals>,
@@ -400,7 +419,15 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 
   // ---- MT8-3：反射缓存的乒乓双缓冲（BG1 binding 10/11）已随反射缓存一起删除 ----
   // 那两块 buffer（`REFL_CACHE_SLOTS × 32B` = 合计 8 MiB）与 `refl_consts()` / `ReflEntry`
-  // 都不再存在（用户实测判为负优化）。BG1 的 binding 号现在到 8 为止。
+  // 都不再存在（用户实测判为负优化）。BG1 的 binding 号现在到 9（9 = 诊断计数器）为止。
+
+  // 叶级 LOD 诊断计数器（M0）：固定 3 字，wgpu 建 buffer 时零初始化 ⇒ 不需要首帧清零。
+  let lod_diag = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_lod_diag"),
+    size: (crate::brickmap::consts::LOD_DIAG_WORDS * 4) as u64,
+    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+    mapped_at_creation: false,
+  });
 
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
@@ -408,6 +435,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     palette: make("gate_palette"),
     comp: make("gate_comp"),
     state: make("gate_state"),
+    lod_diag,
     grid_descs_buf: make("gate_grid_descs"),
     grid_descs_count: 0,
     globals,
@@ -434,6 +462,7 @@ fn extract(
   budget: Option<Extract<Res<UploadBudget>>>,
   main_pending: Option<Extract<Res<MainPending>>>,
   mut mirror: ResMut<BuilderMirror>,
+  mut resid: ResMut<ResidencyState>,
 ) {
   let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
     return;
@@ -454,6 +483,10 @@ fn extract(
   let _pending_comp: Vec<(usize, gate_voxel::ChunkCoord)> =
     std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
+
+  // M3：把"本帧被编辑过的主世界 chunk"交给常驻调度（钉住 + 排除在换出之外）。
+  resid.edited.clear();
+  resid.edited.extend(pending_data.iter().filter(|(v, ..)| *v == 0).map(|(_, c, _)| *c));
 
   let palette_dirty = scene
     .volumes
@@ -1117,6 +1150,125 @@ fn dump_voxel_buffers(
   }
 }
 
+/// **M3 常驻调度**（`ExtractSchedule`，排在 `extract` 之后；见 `docs/editable-gigavoxel.md` §9 M3a-1）。
+///
+/// 为什么不并进 `extract`：① `extract` 在"本帧无脏改动"时提前返回，而常驻决策必须每帧跑；
+/// ② 唤醒需要 CPU 树（`Extract<Res<VoxelScene>>`），只有这里拿得到。
+///
+/// 分工：决策在 [`super::residency`]（纯逻辑 + 单测），这里只做三件事 —— 算每 chunk 的需求档位
+/// （[`want_level`]：按**距离**给档，不由预算给）、落实安装 / 换出、有变化时**重出 `UploadSnapshot`**
+/// （否则 `prepare` 看不到这次改动）。
+///
+/// 档位阶梯是保守的（`fp ≥ 块边长` 才允许粗化 ⇒ 16³ 档在 720p 要 2.5 km 外）⇒ **当前场景（≤1 km）
+/// 永远是全分辨率**，本系统每帧只花 O(chunk 数) 的记账，不产生任何上传。
+fn plan_residency(
+  scene: Option<Extract<Res<VoxelScene>>>,
+  cam: Option<Extract<Res<crate::brickmap::dda::DdaCameraConfig>>>,
+  mut mirror: ResMut<BuilderMirror>,
+  mut state: ResMut<ResidencyState>,
+  mut commands: Commands,
+) {
+  let (Some(scene), Some(cam)) = (scene, cam) else { return };
+  let Some(builder) = mirror.builder.as_mut() else { return };
+  let grid = scene.volumes.main();
+  let frame = state.residency.frame().wrapping_add(1);
+  state.residency.tick(frame);
+  let px = crate::brickmap::dda::px_ang(crate::consts::VIEW_SIZE.y as f32);
+
+  // ① 账目同步：CPU 有内容的 chunk ↔ builder 里有没有块。首次见到的按**全分辨率**记
+  //    （建场景走全量安装；proxy 档位只由本系统自己写）。
+  for c in grid.chunk_coords().collect::<Vec<_>>() {
+    match builder.resident_bytes_of(0, c) {
+      Some(bytes) => {
+        if state.residency.resident_level(c).is_some() {
+          state.residency.note_bytes(c, bytes);
+        } else {
+          state.residency.note_resident(c, bytes, gate_voxel::BRICK_FACTOR, frame);
+        }
+      }
+      None => state.residency.note_gone(c),
+    }
+  }
+
+  // ② 需求集：按距离给档位（迟滞的输入是"当前档"）。
+  let cam_pos = cam.position_world;
+  let cam_chunk = (cam_pos / gate_voxel::CHUNK_SIZE as f32).floor().as_ivec3();
+  let mut wants: Vec<(gate_voxel::ChunkCoord, Level)> = Vec::new();
+  for c in grid.chunk_coords() {
+    let Some(tree) = grid.chunk(c) else { continue };
+    if tree.is_empty() {
+      continue;
+    }
+    let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
+    let dist = (center - cam_pos).length();
+    let cur = state.residency.resident_level(c).unwrap_or(gate_voxel::BRICK_FACTOR);
+    wants.push((c, want_level(dist, px, cur)));
+    state.residency.note_use(c, frame);
+  }
+
+  // ③ 钉住本帧被编辑的（编辑优先于流式），并把它们排除在换出之外。
+  let edited = std::mem::take(&mut state.edited);
+  let must_keep: std::collections::HashSet<gate_voxel::ChunkCoord> = edited.iter().copied().collect();
+  let pin_frames = state.policy.pin_frames;
+  for &c in &edited {
+    state.residency.note_edit(c, frame, pin_frames);
+  }
+
+  // ④ 落实
+  let plan = state.residency.plan(&state.policy, cam_chunk, wants.into_iter(), &must_keep);
+  let mut evicted = 0usize;
+  for c in plan.evict {
+    if builder.evict(0, c) {
+      state.residency.note_gone(c);
+      evicted += 1;
+    }
+  }
+  let mut installed = 0usize;
+  for (c, level) in plan.install {
+    let Some(tree) = grid.chunk(c) else { continue };
+    let proxy;
+    let tree = if level > gate_voxel::BRICK_FACTOR {
+      proxy = tree.proxy(level);
+      &proxy
+    } else {
+      tree
+    };
+    // 档位变化要先归还旧块（`ensure_resident_tree` 对"已常驻"直接返回）。
+    let _ = builder.evict(0, c);
+    if builder.ensure_resident_tree(0, c, tree) {
+      let bytes = builder.resident_bytes_of(0, c).unwrap_or(0);
+      state.residency.note_resident(c, bytes, level, frame);
+      installed += 1;
+    }
+  }
+  // ⑤ 反向同步：builder 里还有块、但 CPU 侧已经没有这个 chunk（被真卸载 / 整块清空）⇒ 归还 GPU 块。
+  //    流式世界的卸载就是走这条路：`VolumeGrid::unmount_chunk` 拿掉 CPU 树，这里跟着释放显存。
+  for c in builder.resident_chunks(0) {
+    if grid.chunk(c).is_none() {
+      builder.evict(0, c);
+      state.residency.note_gone(c);
+      evicted += 1;
+    }
+  }
+  if installed == 0 && evicted == 0 {
+    return;
+  }
+  // ⑥ 变化时重出 snapshot（`prepare` 只认 `UploadSnapshot`）。
+  let volumes = builder.snapshot();
+  commands.insert_resource(UploadSnapshot {
+    volumes,
+    state_bytes: grid.state_table_bytes().to_vec(),
+    comp_chunks: grid.comp_layer().len(),
+  });
+  debug!(
+    "RESID[resident {} {}KB install {} evict {}]",
+    state.residency.resident_count(),
+    state.residency.resident_bytes() / 1024,
+    installed,
+    evicted
+  );
+}
+
 /// 统一体素渲染上传插件：主世界与物体同一路径。
 /// 物体是 `Volumes.list[1..N]` 的普通 `VolumeGrid`，走相同的 dirty → VolumesBuilder → UploadSnapshot 路径。
 pub struct VolumePlugin;
@@ -1138,9 +1290,12 @@ impl Plugin for VolumePlugin {
     render_app
       .insert_resource(ch)
       .init_resource::<BrickMapRevision>()
+      .init_resource::<ResidencyState>()
       .insert_resource(BuilderMirror { pending_full: true, ..Default::default() })
       .add_systems(RenderStartup, init_empty_gpu)
-      .add_systems(ExtractSchedule, extract)
+      // 常驻调度必须在 `extract` 之后：它要看到本帧的编辑（钉住）与已建好的 builder；
+      // 它自己产生的改动走"重出 `UploadSnapshot`"这条路（见 `plan_residency`）。
+      .add_systems(ExtractSchedule, (extract, plan_residency).chain())
       .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources))
       // 转储必须在 prepare 之后：先写完本帧上传，再 readback（同一帧的 GPU 状态）
       .add_systems(Render, dump_voxel_buffers.after(prepare));

@@ -54,12 +54,12 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 | **渲染管线** | ✅ 生产可用 | **无 render node**：extract / prepare / dispatch / blit 全部系统级显式调度；`blit.wgsl` 双入口 `fs_main` / `fs_fxaa`（FXAA 3.11 移植）；半分辨率 `RenderScale` + 线性上采样；MSAA 强制关闭 |
 | **调试菜单 + i18n** | ✅ 生产可用 | gate-ui 的 TOML 可序列化 `DebugWindow`（9 种行控件）+ `MenuActionEvent` 观察者；5 个顶层页（视频 / 渲染 / 玩家 / 游戏 / 界面，游戏页下含编辑与世界两个子页）；文案全走 i18n key（`assets/locales/zh-CN.yml` 编译期 codegen，缺键回落中文）；「游戏/世界」可扫 `assets/vox/*.vox` 选择模型并**热重载世界** |
 | **世界标签** | ✅ 生产可用 | `WorldAnchor`：世界坐标 → 屏幕像素 UI 标签（距离缩放、CJK 字体延迟解析） |
-| **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本 |
+| **性能剖析** | ✅ 生产可用 | `--features profile`：wgpu-profiler GPU pass 时间戳（Tracy 时间线）+ tracing span → Tracy CPU zone 桥；非 profile 构建零成本。另有**叶级 LOD 诊断计数**（`brickmap::consts::LOD_DIAG`，须与 `trace.wesl::LOD_DIAG` 同开）：每 2 s 一行 `DIAG[leaf_in … lod_stop … % illegal …]` |
 
 ### 已知限制 / 待办（不阻塞当前开发）
 
 - **没有自动化测试与 CI**：workspace 0 个 `#[test]`，回归靠手工验收 + 日志。
-- **文档缺口**：代码注释引用的 `docs/brickmap.md`、`docs/decisions.md`（ADR-0001/0002/0005）、`docs/ui-dark-theme.md` 尚未落盘；`docs/` 目前只有 Douglas 开发日志转录（`docs/douglas/`）与早期光照截图（`docs/screenshots/`）。
+- **文档缺口**：代码注释引用的 `docs/brickmap.md`、`docs/decisions.md`（ADR-0001/0002/0005）、`docs/ui-dark-theme.md` 尚未落盘；`docs/` 目前有 Douglas 开发日志转录（`docs/douglas/`）、早期光照截图（`docs/screenshots/`），以及 Ray-Guided 大世界 + 高速编辑的计划书 `docs/editable-gigavoxel.md`（未实现）。
 - **正式 sim tick 未实现**：StateTable 只有数据通路与上传，没有逐帧模拟系统驱动它。
 - **WorldAnchor 不做体素遮挡判断**（永远绘制在最上层）。
 - **`assets/lighting/dark_lab.ron` 暂无代码引用**：当前只加载 `day_outdoor.ron`。

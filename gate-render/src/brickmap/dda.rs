@@ -154,7 +154,8 @@ pub struct DdaViewUniform {
   pub cam_pos_voxel: Vec4, // w=1
   /// x/y = debug 可视化；z = 2 跳过 chunk 步进；w = +2 skyout / +4 makegrid_only
   pub debug_mode: Vec4,
-  /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = LOD 早停开关（`consts::DDA_LOD`）
+  /// x = 单像素角大小(rad) = 2·tan(FOV_Y/2)/render_h；y = 叶级 LOD 开关（`consts::DDA_LOD`：
+  /// 远场 4³ 值块整块取一个色，阈值见 `trace.wesl::LEAF_LOD_FP`）
   pub lod: Vec4,
 }
 
@@ -163,10 +164,17 @@ use crate::brickmap::consts::{
   DDA_BEAM, DDA_CHUNKWALK, DDA_DIR_LUT, DDA_LOD, DDA_MAKEGRID_ONLY, DDA_SKY_ONLY, EYE_ADAPT,
 };
 
+/// 单像素角大小（rad/px）= `2·tan(FOV_Y/2) / render_h`。
+/// **唯一的计算点**：`DdaViewUniform.lod.x`（shader 的 `fp = t·px_ang`）与常驻档位阶梯
+/// （`brickmap::residency::want_level`）都用它 ⇒ 两侧的"像素预算"口径不会分叉。
+pub fn px_ang(render_h: f32) -> f32 {
+  2.0 * (crate::brickmap::consts::DDA_FOV_Y * 0.5).tan() / render_h.max(1.0)
+}
+
 impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
     // 垂直 FOV 均分到 render_h 像素（FOV 见 `consts::DDA_FOV_Y`，镜像 gate-app consts）
-    let px_ang = 2.0 * (crate::brickmap::consts::DDA_FOV_Y * 0.5).tan() / render_h.max(1.0);
+    let px_ang = px_ang(render_h);
     Self {
       view_proj: cfg.view_proj,
       inv_view_proj: cfg.inv_view_proj,
@@ -728,6 +736,10 @@ pub(crate) fn init_dda_pipelines(
         // ClampToEdge 且无 mip，两者状态要求相反。desc 权威在
         // `pbr_texture::create_pbr_sampler`（占位与真身共用 `GpuBrickMap.pbr_sampler`）。
         sampler(SamplerBindingType::Filtering),
+        // @binding(9)：叶级 LOD 诊断计数器（M0；`consts::LOD_DIAG` 打开时才有写入，其余时候恒 0）。
+        // 放 BG1 而不是 BG0：BG1 是 dda / beam / gi / 光柱掩码四个**会调 trace** 的 pass 共用的那一份，
+        // 而 BG0 有两份（完整版 + GI 瘦版）⇒ 挂这里只需改这一处 layout 与下面那一处 BG1 bind group。
+        storage_buffer_sized(false, None),
       ),
     ),
   );
@@ -1323,6 +1335,9 @@ pub(crate) fn prepare_dda_bind_groups(
       // @binding(8)：PBR 专用采样器（MT2-3）——`init_empty_gpu` 建一次、占位与真身共用同一个实例，
       // 不存在"资源未就绪"的状态（采样器与它所采样的纹理无关）。
       &gpu.pbr_sampler,
+      // @binding(9)：叶级 LOD 诊断计数器（M0）：固定 3 字的 buffer，`LOD_DIAG` 关闭时无人写
+      // （shader 侧整段被折叠）⇒ 恒 0，读回侧也整个不注册。
+      gpu.lod_diag.as_entire_binding(),
     )),
   );
 

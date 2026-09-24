@@ -1062,6 +1062,98 @@ impl ChunkTree {
     self.set_voxel(local_x, local_y, local_z, PaletteId::AIR)
   }
 
+  // ---- proxy 树（M3）------------------------------------------------------------------------
+
+  /// **proxy 树**：把 `keep_extent` 及以下的细节整体塌成「子树代表色」，保留 `keep_extent` 以上的
+  /// 几何与拓扑。`keep_extent <= BRICK_FACTOR` ⇒ 与整棵树等价（不截断）。
+  ///
+  /// 用途：常驻预算紧张时用 proxy 顶替整棵 chunk（`brickmap::builder::ensure_resident` 的另一种来源）。
+  ///
+  /// CONSTRAINT: **不挖洞** —— 只要子树里有任何实体，塌出来的就是**实体色**（只有全空气子树才塌成空气）。
+  /// 所以 proxy 的实心集合是原树的**超集**，外扩最多一个 `keep_extent`（与"停止下钻"的误差同量级）。
+  /// CONSTRAINT: proxy 树**只用于安装、不参与编辑** ⇒ 不保证 `try_merge` 意义上的规范化
+  /// （塌缩可能让"与父同色的 Uniform 子块"重新出现）。
+  pub fn proxy(&self, keep_extent: i32) -> Self {
+    let keep = keep_extent.max(BRICK_FACTOR);
+    let mut out = Self {
+      nodes: Vec::new(),
+      root_palette: PaletteId::AIR,
+      identity_reset: false,
+      dirty_nodes: Vec::new(),
+    };
+    match self.nodes.first() {
+      None => out.root_palette = self.root_palette,
+      Some(Node::Uniform(p)) => out.root_palette = *p,
+      // 整 chunk 也塌掉 ⇒ 结果必须落在 `root_palette` 上（"uniform 根不占节点"的表示约定）。
+      Some(_) if CHUNK_SIZE <= keep => out.root_palette = self.rep_of(0),
+      Some(_) => {
+        let root = self.copy_proxy(0, CHUNK_SIZE, keep, &mut out.nodes);
+        debug_assert_eq!(root, 0, "根必须落在 nodes[0]");
+      }
+    }
+    out
+  }
+
+  /// 递归复制到 `out`（`extent <= keep` 时塌成代表色）；返回新树里的节点下标。
+  fn copy_proxy(&self, id: usize, extent: i32, keep: i32, out: &mut Vec<Node>) -> usize {
+    let my = out.len();
+    if extent <= keep {
+      out.push(Node::Uniform(self.rep_of(id)));
+      return my;
+    }
+    let Node::Split { mask, palette, children } = &self.nodes[id] else {
+      // keep ≥ BRICK_FACTOR ⇒ 叶层（extent = 4）必已在上面的分支塌缩；到这里的只可能是 Uniform。
+      let Node::Uniform(p) = self.nodes[id] else { unreachable!("节点只有三种形态") };
+      out.push(Node::Uniform(p));
+      return my;
+    };
+    let (mask, palette) = (*mask, *palette);
+    out.push(Node::Uniform(PaletteId::AIR)); // 占位：子节点必须先落位
+    let child_extent = extent / BRICK_FACTOR;
+    let mapped: Vec<u32> = children
+      .iter()
+      .map(|&c| self.copy_proxy(c as usize, child_extent, keep, out) as u32)
+      .collect();
+    out[my] = Node::Split { mask, palette, children: mapped };
+    my
+  }
+
+  /// 子树代表色（0 = 全空气）。与 shader `trace.wesl::leaf_lod_pal` **同一口径**：
+  /// 先看本节点 `palette`（存在未置位格且非空 ⇒ 用它），否则按子块序找第一个非空的子树；
+  /// 叶层按"第一个置位且非空的 inline 半字"。
+  fn rep_of(&self, id: usize) -> PaletteId {
+    match &self.nodes[id] {
+      Node::Uniform(p) => *p,
+      Node::Leaf(l) => {
+        if l.mask != u64::MAX && !l.palette.is_air() {
+          return l.palette;
+        }
+        let mut m = l.mask;
+        while m != 0 {
+          let i = m.trailing_zeros();
+          m &= m - 1;
+          let c = l.get(i);
+          if !c.is_air() {
+            return c;
+          }
+        }
+        PaletteId::AIR
+      }
+      Node::Split { mask, palette, children } => {
+        if *mask != u64::MAX && !palette.is_air() {
+          return *palette;
+        }
+        for &c in children {
+          let r = self.rep_of(c as usize);
+          if !r.is_air() {
+            return r;
+          }
+        }
+        PaletteId::AIR
+      }
+    }
+  }
+
   /// 整个 chunk 是否 uniform AIR（空）
   pub fn is_empty(&self) -> bool {
     self.nodes.is_empty() && self.root_palette.is_air()
@@ -1313,5 +1405,81 @@ mod tests {
         assert_eq!(a.serialize(), b.serialize(), "case {case} {palette:?}：序列化字节不一致");
       }
     }
+  }
+
+  /// M3：proxy **不挖洞** —— 原来实体的体素在 proxy 里仍然实体（只有全空气的子树才塌成空气），
+  /// 且原来空的地方不会长出实体；同时节点数应显著下降（塌缩确实发生了）。
+  #[test]
+  fn proxy_has_no_holes() {
+    let mut t = ChunkTree::empty();
+    // 16³ 混合色实心块（三种 palette 交错，保证内部有 Split）+ 一个孤立体素
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          let p = match (x + y + z) % 3 {
+            0 => PaletteId(1),
+            1 => PaletteId(2),
+            _ => PaletteId(3),
+          };
+          t.set_voxel(x, y, z, p);
+        }
+      }
+    }
+    t.set_voxel(200, 3, 40, PaletteId(3));
+    let full_nodes = t.nodes.len();
+
+    for keep in [16, 64] {
+      let p = t.proxy(keep);
+      for x in 0..16 {
+        for y in 0..16 {
+          for z in 0..16 {
+            assert!(p.get_voxel(x, y, z).is_some(), "keep={keep}：原实体 ({x},{y},{z}) 在 proxy 里丢了");
+          }
+        }
+      }
+      assert!(p.get_voxel(200, 3, 40).is_some(), "keep={keep}：孤立实体丢了");
+      assert!(p.get_voxel(64, 64, 64).is_none(), "keep={keep}：全空气区不该长出实体");
+      assert!(p.nodes.len() < full_nodes, "keep={keep}：塌缩后节点数应减少");
+    }
+
+    // keep = 256 = "整 chunk 单色"这一档：整块本来就该填成同一个代表色（含原本是空气的位置）。
+    let whole = t.proxy(CHUNK_SIZE);
+    let rep = whole.get_voxel(0, 0, 0).expect("整块有实体 ⇒ 代表色非空");
+    assert!(whole.nodes.is_empty(), "整 chunk 单色应落在 root_palette 上（零节点）");
+    for p in [(0, 0, 0), (64, 64, 64), (200, 3, 40), (255, 255, 255)] {
+      assert_eq!(whole.get_voxel(p.0, p.1, p.2), Some(rep), "整 chunk 档应为同一个代表色");
+    }
+  }
+
+  /// M3：proxy 只塌 `keep_extent` **及以下**；`keep_extent = BRICK_FACTOR` 等价于不截断。
+  /// 用一个"半个 16³ 块实心"的形状验证外扩范围：塌缩后该 16³ 块整体变实心，但相邻块不受影响。
+  #[test]
+  fn proxy_collapses_only_at_or_below_keep_extent() {
+    let mut t = ChunkTree::empty();
+    for x in 0..16 {
+      for y in 0..8 {
+        for z in 0..16 {
+          t.set_voxel(x, y, z, PaletteId(1)); // 只用 16³ 块的下半
+        }
+      }
+    }
+    // 未截断：语义逐点不变
+    let same = t.proxy(BRICK_FACTOR);
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          assert_eq!(
+            same.get_voxel(x, y, z),
+            t.get_voxel(x, y, z),
+            "keep=4 应等价于不截断"
+          );
+        }
+      }
+    }
+    // 截断到 16³：本块上半（原本是空气）随塌缩变实心；相邻块仍为空气
+    let p = t.proxy(16);
+    assert!(p.get_voxel(0, 12, 0).is_some(), "同块内应被代表色填实（不挖洞的另一面）");
+    assert!(p.get_voxel(16, 0, 0).is_none(), "相邻 16³ 块不该受影响");
+    assert!(p.get_voxel(0, 0, 200).is_none(), "远处仍为空气");
   }
 }

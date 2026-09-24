@@ -1,4 +1,4 @@
-import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, view_u};
+import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, view_u};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, NODE_FIXED_WORDS, face_normal_from_index};
 
@@ -49,6 +49,60 @@ fn mask_bit(mask: u64, idx: u32) -> bool {
 fn mask_pop_below(mask: u64, idx: u32) -> u32 {
   let below = mask & ((u64(1) << idx) - u64(1));
   return u32(countOneBits(below));
+}
+
+/// 叶级 LOD 的像素阈值，取 `fp = t·px_ang`：`1/fp` = 一个体素在屏幕上占多少像素。
+/// `fp >= 1` ⇔ 一个像素已经覆盖 ≥ 1 个体素 ⇒ 一个 4³ 值块约 4 像素宽，块内 1 体素尺度的细节
+/// 已不可分辨 ⇒ 整块取一个颜色（代表色 = `leaf_lod_pal`：块内 `pal` 非空时取它，否则取第一个
+/// **置位且非空**的体素色 —— 最便宜的规则，不做平均、不维护新字段）。
+///
+/// CONSTRAINT: 块内结构被**整体替换**，轮廓误差可达整块（4 像素）—— 这是"代表色取块内某个体素"
+/// 的固有代价，按"先用最便宜的规则"接受。视觉不合适时把这个常量调回 4（只影响远场：1080p 下
+/// `fp >= 1` ⇔ 935 体素≈234 m、`fp >= 4` ⇔ 3 740 体素≈935 m）；根治要等代表色（M2）。
+/// 依据 docs/editable-gigavoxel.md 3.3 与 §9 的实测（`fp>=1` 比关闭省总 GPU 8.1%、重帧 p90 −28%）。
+const LEAF_LOD_FP: f32 = 1.0;
+
+/// 代表色扫描的置位上限（**成本护栏**，不是语义）：扫不到就返回 0 = 放弃本块的 LOD，
+/// 调用点退回逐格 march（只是慢，不会漏命中）。
+const LEAF_LOD_SCAN_CAP: u32 = 8u;
+
+/// **诊断开关（M0）**：置 `1u` ⇒ 统计叶级 LOD 的覆盖与颜色契约违规，写进 `bindings::lod_diag`。
+/// 编译期常量 ⇒ 置 0 时整段被折叠掉，正常路径零开销（与 `DIAG_DISABLE_MEDIUM_TINT` 同款）。
+/// **必须与 Rust 侧 `consts::LOD_DIAG`（读回开关）同步改**，否则计数器加了没人读、或读了永远是 0。
+/// 采样闸门 = 叶节点地址 `& 63`：只统计 1/64 的叶入口（全量计数会有 ~10M/帧 的单地址原子加，
+/// 把收益本身吃掉）；分子分母用**同一个**闸门 ⇒ 比值无偏。
+const LOD_DIAG: u32 = 0u;
+/// `lod_diag` 槽位：0 = 采样到的叶入口数（本来要逐格 march 的那些），1 = 其中被叶级 LOD 拦下的，
+/// 2 = 非法早停（`gd >= depth_cap` 且本节点 `pal == 0` —— 那不是该子块的颜色）。
+const DIAG_LEAF_ENTRIES: u32 = 0u;
+const DIAG_LEAF_STOPS: u32 = 1u;
+const DIAG_ILLEGAL_STOPS: u32 = 2u;
+/// 诊断采样闸门：叶节点地址低位为零的叶才计数（≈1/64）。`LOD_DIAG = 0` 时恒 false ⇒ 整个 `if` 被折叠。
+fn diag_sampled(addr: u32) -> bool {
+  return LOD_DIAG == 1u && (addr & 63u) == 0u;
+}
+
+/// 叶级 LOD 代表色：4³ 值块里**首个非空体素**的色（0 = 整块空气）。
+///
+/// 只在"块内混合"（`mask != 0`）且**入口体素是空气**时被调用（入口是实体时上游已精确返回）。
+/// 掩码位置位只表示"该格不取 `pal`"，它的 inline 半字仍可能是 0（空气）⇒ 不能只取最低置位，
+/// 必须逐位置位扫到第一个非零值；`pal` 只在**存在未置位格**（`mask != ~u64(0)`）时才是块内
+/// 真实存在的颜色（掩码满时它是"无未置位格"的残留值，见 `chunk_tree.rs::Leaf::tile_color`）。
+/// 成本：常见 1 次存储读（地形砖的最低置位格即实体），最坏 `LEAF_LOD_SCAN_CAP` 次；一次扫描替掉
+/// 的是块内最多约 12 次逐格查（每轴 4 格）。
+fn leaf_lod_pal(b: Brick) -> u32 {
+  if (b.mask != ~u64(0) && b.pal != 0u) { return b.pal; }
+  var m = b.mask;
+  for (var k: u32 = 0u; k < LEAF_LOD_SCAN_CAP; k = k + 1u) {
+    if (m == u64(0)) { return 0u; }
+    // 最低置位下标：`low - 1` 的置位数 = 它下面有多少位（u64 无 firstTrailingBit 重载）
+    let i = u32(countOneBits(m & (u64(0) - m)) - u64(1));
+    let w = b_struct[b.addr + NODE_FIXED_WORDS + (i >> 1u)];
+    let v = (w >> ((i & 1u) * 16u)) & 0xFFFFu;
+    if (v != 0u) { return v; }
+    m = m & (m - u64(1));
+  }
+  return 0u;
 }
 
 /// 读 palette 槽的介质属性：`rgb` = **该材质的"一段"透过率**（乘性；一段 = 连续的同一材质，
@@ -151,6 +205,9 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
   // 防挂死安全网：迭代上限。
   var budget: u32 = 65536u;
   let lut_disable = view_u.lod.w > 0.5;
+  // 叶级 LOD：`lod.y` = `consts::DDA_LOD`；`px_ang` = 单像素角大小（rad，见 `lod` 字段说明）。
+  let leaf_lod = view_u.lod.y > 0.5;
+  let px_ang = view_u.lod.x;
   loop {
     if (budget == 0u) { break; }
     budget = budget - 1u;
@@ -172,6 +229,19 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
         } else if (b.pal != 0u) {
           return VoxelHit(true, cur_t, b.pal, face, v);
         }
+        // 入口体素是空气 ⇒ 下面是"叶级 LOD 早停 / 退回逐格 march"的分界：诊断计数放这里
+        // （分母 = 本来要逐格 march 的叶入口数，分子 = 其中被 LOD 拦下的）。
+        let diag = diag_sampled(b.addr);
+        if (diag) { atomicAdd(&lod_diag[DIAG_LEAF_ENTRIES], 1u); }
+        // 叶级 LOD：整块不足一个像素时不再逐格走，直接取块内首个非空体素色
+        // （t 恒取块入口 = 保守下界，见 `LEAF_LOD_FP`）。
+        if (leaf_lod && b.mask != u64(0) && cur_t * px_ang >= LEAF_LOD_FP) {
+          let p = leaf_lod_pal(b);
+          if (p != 0u) {
+            if (diag) { atomicAdd(&lod_diag[DIAG_LEAF_STOPS], 1u); }
+            return VoxelHit(true, cur_t, p, face, v);
+          }
+        }
         break;
       }
       if (!mask_bit(b.mask, idx)) {
@@ -180,8 +250,18 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
         break;
       }
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
+      // CONSTRAINT: 这里返回的 `pal` 是**本节点**的 uniform 色，而当前子块是**分裂**的 ⇒ 它不保证是
+      // 该子块的颜色（通常 0 = 空气）。因此这条早停只对"只消费 t"的调用者合法（beam 预 pass）；
+      // 着色射线必须走 `depth_cap >= 3`（不早停）。上层三档 LOD 要启用须先有 M2 的代表色字段
+      // （docs/editable-gigavoxel.md 硬不变量 4）。
       let gd = 3u - level;
-      if (gd >= depth_cap) { return VoxelHit(true, cur_t, b.pal, face, v); }
+      if (gd >= depth_cap) {
+        // 颜色契约的机器可校验形式（M0）：`pal == 0` = "返回了不属于该子块的颜色"最露骨的情形。
+        if (LOD_DIAG == 1u && b.pal == 0u && (b.addr & 63u) == 0u) {
+          atomicAdd(&lod_diag[DIAG_ILLEGAL_STOPS], 1u);
+        }
+        return VoxelHit(true, cur_t, b.pal, face, v);
+      }
       let pop = mask_pop_below(b.mask, idx);
       let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
       let c_ml = b_struct[child_addr];
@@ -330,6 +410,9 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   // 防挂死安全网：迭代上限。
   var budget: u32 = 65536u;
   let lut_disable = view_u.lod.w > 0.5;
+  // 叶级 LOD：与 `trace_chunk_opaque` 同一口径（`lod.y` 开关 + `LEAF_LOD_FP` 阈值）。
+  let leaf_lod = view_u.lod.y > 0.5;
+  let px_ang = view_u.lod.x;
   loop {
     if (budget == 0u) { break; }
     budget = budget - 1u;
@@ -350,6 +433,17 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         } else {
           hit_pal = b.pal;
         }
+        // 入口体素是空气 ⇒ 叶级 LOD（同 `trace_chunk_opaque`，含同一套诊断计数）。走 `hit_pal`
+        // 而不是直接 return：代表色若是可穿透介质，下面"唯一出口"仍要按介质段语义处理（穿透 / 出射面）。
+        let diag = diag_sampled(b.addr);
+        if (diag) { atomicAdd(&lod_diag[DIAG_LEAF_ENTRIES], 1u); }
+        if (hit_pal == 0u && leaf_lod && b.mask != u64(0) && cur_t * px_ang >= LEAF_LOD_FP) {
+          let p = leaf_lod_pal(b);
+          if (p != 0u) {
+            if (diag) { atomicAdd(&lod_diag[DIAG_LEAF_STOPS], 1u); }
+            hit_pal = p;
+          }
+        }
         break;
       }
       if (!mask_bit(b.mask, idx)) {
@@ -358,8 +452,16 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         break;
       }
       // depth_cap（beam 保守）：gate 深度 d=3-level 的分裂子块到达 cap → 子块入口 t
+      // CONSTRAINT: 同 `trace_chunk_opaque` 的同名分支 —— 返回的 `pal` 不带当前分裂子块的颜色语义，
+      // 只有"只消费 t"的调用者可用（docs/editable-gigavoxel.md 硬不变量 4）。
       let gd = 3u - level;
-      if (gd >= depth_cap) { return VoxelHit(true, cur_t, b.pal, face, v); }
+      if (gd >= depth_cap) {
+        // 颜色契约的机器可校验形式（M0）：`pal == 0` = "返回了不属于该子块的颜色"最露骨的情形。
+        if (LOD_DIAG == 1u && b.pal == 0u && (b.addr & 63u) == 0u) {
+          atomicAdd(&lod_diag[DIAG_ILLEGAL_STOPS], 1u);
+        }
+        return VoxelHit(true, cur_t, b.pal, face, v);
+      }
       let pop = mask_pop_below(b.mask, idx);
       let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
       let c_ml = b_struct[child_addr];

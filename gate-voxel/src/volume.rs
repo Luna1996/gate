@@ -34,6 +34,9 @@ pub struct VolumeGrid {
   /// 编辑产生的最小 voxel AABB（按 chunk 记录，闭开区间 `[lo, hi)`，世界 voxel 坐标）。
   /// 上传该 chunk 时由 `take_edit_aabb` 取走；未记录者消费方回退到 chunk 包围盒。
   edit_aabbs: HashMap<ChunkCoord, (IVec3, IVec3)>,
+  /// **流式窗口提示**：`(chunk 原点, 各轴跨度)`，由流式世界设置（见 [`Self::set_stream_window`]）。
+  /// 只影响渲染侧 `compute_window` 的窗口推导，不进 wire、不进序列化。
+  stream_window: Option<(IVec3, IVec3)>,
 }
 
 impl Default for VolumeGrid {
@@ -49,6 +52,7 @@ impl Default for VolumeGrid {
       obj_id: -1,
       edit_generation: 0,
       edit_aabbs: HashMap::new(),
+      stream_window: None,
     }
   }
 }
@@ -248,6 +252,25 @@ impl VolumeGrid {
     self.chunks.insert(cc, tree);
     self.dirty.mark_data(cc);
     self.edit_generation = self.edit_generation.wrapping_add(applied_edits);
+  }
+
+  /// **真卸载**：把 chunk 从 CPU 侧拿掉（树 / 组件层 / 编辑 AABB），返回此前是否有内容。
+  /// 渲染侧由常驻调度反向同步发现（`gate_render::brickmap::upload` 的 `plan_residency`）并归还 GPU 块。
+  /// WARNING: 卸载即丢弃该 chunk 上的本地修改（无覆盖层落盘）—— 流式世界的既定语义。
+  pub fn unmount_chunk(&mut self, cc: ChunkCoord) -> bool {
+    self.edit_aabbs.remove(&cc);
+    self.comp_layer.remove(&cc);
+    self.chunks.remove(&cc).is_some()
+  }
+
+  /// 设置/清除**流式窗口提示**（chunk 原点 + 各轴跨度）：流式世界用它把窗口钉在相机周围，
+  /// 否则 `compute_window` 只会按"当前已加载内容"算 ⇒ 一飞就出窗口（见 `docs/editable-gigavoxel.md` §9）。
+  pub fn set_stream_window(&mut self, window: Option<(IVec3, IVec3)>) {
+    self.stream_window = window;
+  }
+
+  pub fn stream_window(&self) -> Option<(IVec3, IVec3)> {
+    self.stream_window
   }
 
   pub fn get_voxel(&self, voxel: VoxelCoord) -> Option<PaletteId> {

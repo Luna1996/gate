@@ -109,7 +109,13 @@ fn camera_solid_pal(origin_voxel: vec3<f32>) -> u32 {
   return sample_brickmap(make_grid(0u), vec3<i32>(floor(origin_voxel)));
 }
 
-/// 世界求交配置：`t_min` = 起点沿 dir 跳过的距离；`depth_cap` = 树深度上限（3 = 全深度，不限）。
+/// 世界求交配置：`t_min` = 起点沿 dir 跳过的距离；`depth_cap` = 早停闸门深度（`trace_chunk_opaque`
+/// 的 `gd >= depth_cap` 分支，`gd = 3 - level`）。
+///
+/// CONSTRAINT: 对**着色射线**只有 `depth_cap = 3`（不早停）合法 —— `depth_cap <= 2` 的早停会把本节点的
+/// `pal` 当成分裂子块的颜色返回，而那一位不是该子块的颜色（docs/editable-gigavoxel.md 硬不变量 4）。
+/// 目前唯一使用者是 beam 预 pass：它只消费 `t`，且该早停给出的是保守下界（`t` 只会更近）。
+/// 上层三档 LOD 要复用这条闸门，须先有 M2 的代表色字段（每节点一个可增量维护的平均色）。
 struct WorldRayQuery {
   t_min: f32,
   depth_cap: u32,

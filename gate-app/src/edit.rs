@@ -1433,6 +1433,28 @@ mod tests {
       nodes_total,
     );
 
+    // M3 proxy：按"停止下钻"的四档塌缩后，**每个 chunk 的 wire 字数**（= 常驻字节 / 4）。
+    // 这是"常驻有界"能压到什么量级的实测口径：proxy 越粗，能常驻的 chunk 越多。
+    {
+      let full: usize = volumes
+        .main()
+        .chunk_coords()
+        .filter_map(|cc| volumes.main().chunk(cc))
+        .map(|t| t.serialize().len())
+        .sum();
+      print!("proxy 常驻字数（chunk 数 {}）：全树 {}", volumes.main().chunk_coords().count(), full);
+      for keep in [4i32, 16, 64, 256] {
+        let words: usize = volumes
+          .main()
+          .chunk_coords()
+          .filter_map(|cc| volumes.main().chunk(cc))
+          .map(|t| t.proxy(keep).serialize().len())
+          .sum();
+        print!(" / {keep}³ {}", words);
+      }
+      println!("（keep=4 = 不截断）");
+    }
+
     // 增量上传：节点级重写后**实际写进 GPU 的 struct 字节**（旧实现=整棵 chunk 树 ≈1.4MB/笔）。
     // 先消化掉建场景与上面那些大笔触留下的标记（含 reset），只看"一笔小编辑"的量。
     let mut vbuild = gate_render::brickmap::VolumesBuilder::build_full(&volumes);

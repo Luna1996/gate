@@ -16,7 +16,7 @@ struct DdaViewUniform {
   inv_view_proj: mat4x4<f32>,   // 64B
   cam_pos_voxel: vec4<f32>,      // 16B，w=1
   debug_mode: vec4<f32>,        // 16B：x = 法向可视化，y = face 6 色诊断
-  lod: vec4<f32>,               // 16B：x = 像素角大小(rad)，y = LOD 早停开关
+  lod: vec4<f32>,               // 16B：x = 像素角大小(rad)，y = 叶级 LOD 开关（阈值在 trace.wesl）
 }
 @group(0) @binding(1) var<uniform> view_u: DdaViewUniform;
 
@@ -89,7 +89,13 @@ struct MaterialAsset {
 // 改那边的状态必须同改这里（占位与真身共用同一个 sampler 实例，见 `upload.rs::init_empty_gpu`）。
 @group(1) @binding(8) var pbr_samp: sampler;
 
-// **BG1 的 binding 号到此为止（0..8）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，
+/// 9：**叶级 LOD 诊断计数器**（M0；`trace.wesl::LOD_DIAG` 为 1 时才被写）。
+/// 为什么挂 BG1 而不是 BG0：BG1 是 dda / beam / gi / 光柱掩码**四个会调 trace 的 pass 共用**的那一份，
+/// 而 BG0 有两份（完整版 + GI 瘦版）⇒ 挂 BG1 只需改一处 layout + 一处 bind group。
+/// 槽位见 `trace.wesl::DIAG_*`；**只增不清**（CPU 侧读差值）⇒ 不需要清零，也没有"清零写 vs GPU 写"的竞态。
+@group(1) @binding(9) var<storage, read_write> lod_diag: array<atomic<u32>>;
+
+// **BG1 的 binding 号到此为止（0..9）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，
 // 已按实测整体删除（负优化：用户判定"删除后画面不变、反而更快"）—— 见 `main.wesl` 文件头的
 // MT4 注释块。**别再往 10 起加东西**以为这里是预留空位：那两块 buffer 与 `ReflEntry` 都已不存在。
 

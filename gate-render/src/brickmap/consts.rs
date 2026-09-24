@@ -28,6 +28,13 @@ pub const DDA_SKY_ONLY: bool = false;
 pub const DDA_MAKEGRID_ONLY: bool = false;
 /// 八叉树远场早停（LOD）
 pub const DDA_LOD: bool = true;
+/// 叶级 LOD 诊断（M0）：读回 `trace.wesl::LOD_DIAG` 写的计数器，每 `REPORT_PERIOD_SECS` 落一行
+/// `DIAG[...]` 日志（见 `crate::profiler::report_lod_diag`）。
+/// CONSTRAINT: **须与 `assets/shaders/voxel_raytrace/trace.wesl::LOD_DIAG` 同步改** ——
+/// 只开一侧会得到"一片空转"（shader 不写）或"永远 0"（没人读）。
+pub const LOD_DIAG: bool = false;
+/// 诊断计数器字数（`lod_diag`）：叶入口 / 叶级早停 / 非法早停。须与 `trace.wesl::DIAG_*` 对齐。
+pub const LOD_DIAG_WORDS: usize = 3;
 /// beam 预 pass（关掉则主 pass 从 t=0 起步）
 pub const DDA_BEAM: bool = true;
 /// 方向可达掩码剔除（LUT）

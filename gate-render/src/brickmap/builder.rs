@@ -387,6 +387,66 @@ impl BrickMapBuilder {
     self.chunks.get(&coord).map(|s| s.base)
   }
 
+  // ---- 常驻管理（M3）：唤醒 / 换出 / 记账 ----------------------------------------------------
+  //
+  // CPU 树是权威（`VolumeGrid`），GPU 块是派生缓存 ⇒ "换出"只是归还 GPU 块，"唤醒"是从 CPU 树
+  // 重新整块序列化（约 0.9 ms/chunk，见 `docs/editable-gigavoxel.md` §3.5）。两者的决策在
+  // [`super::residency::Residency`]，这里只提供落实动作与记账。
+
+  /// 该 chunk 现在有没有 GPU 块（= 是否常驻）。空 chunk 永远不常驻。
+  pub fn is_resident(&self, coord: ChunkCoord) -> bool {
+    self.chunks.contains_key(&coord)
+  }
+
+  /// 常驻块占用的**字数**（含块内余量）× 4 = 字节。常驻预算按它算。
+  pub fn resident_words(&self) -> usize {
+    self.chunks.values().map(|s| s.cap).sum()
+  }
+
+  /// 单个 chunk 的常驻字节（None = 未常驻）。
+  pub fn resident_bytes_of(&self, coord: ChunkCoord) -> Option<usize> {
+    self.chunks.get(&coord).map(|s| s.cap * 4)
+  }
+
+  /// 当前常驻的 chunk 列表（常驻调度的反向同步用：CPU 侧没了 ⇒ 归还这些块）。
+  pub fn resident_chunks(&self) -> Vec<ChunkCoord> {
+    self.chunks.keys().copied().collect()
+  }
+
+  /// **唤醒**：把 CPU 树整块装进 GPU。返回是否真的发生了安装。
+  /// 已常驻 / CPU 侧为空 / 不在窗口内 ⇒ 什么都不做。
+  pub fn ensure_resident(&mut self, grid: &VolumeGrid, coord: ChunkCoord) -> bool {
+    if !chunk_has_content(grid, coord) {
+      return false;
+    }
+    let tree = grid.chunk(coord).expect("chunk_has_content 已判非空");
+    self.ensure_resident_tree(coord, tree)
+  }
+
+  /// **唤醒**（给定树）：调用方决定装全树还是 proxy 树（[`ChunkTree::proxy`]）；其余语义同
+  /// [`Self::ensure_resident`]。
+  pub fn ensure_resident_tree(&mut self, coord: ChunkCoord, tree: &ChunkTree) -> bool {
+    if self.chunks.contains_key(&coord) || tree.is_empty() {
+      return false;
+    }
+    if chunk_index_pos(self.origin, self.dims, coord.0).is_none() {
+      return false;
+    }
+    self.install_chunk(coord, tree);
+    self.refresh_globals();
+    true
+  }
+
+  /// **换出**：归还 GPU 块（CPU 树不动 ⇒ 之后可再唤醒）。返回是否真的释放了。
+  pub fn evict(&mut self, coord: ChunkCoord) -> bool {
+    if !self.chunks.contains_key(&coord) {
+      return false;
+    }
+    self.release_chunk(coord);
+    self.refresh_globals();
+    true
+  }
+
   pub fn origin(&self) -> IVec3 {
     self.origin
   }
@@ -878,6 +938,43 @@ impl VolumesBuilder {
     self.builders[volume_idx].chunk_base(coord)
   }
 
+  // ---- 常驻管理（M3，逐 volume 分发）-------------------------------------------------------
+
+  /// 该 volume 的 chunk 当前是否常驻（有 GPU 块）。
+  pub fn is_resident(&self, vol_idx: usize, coord: ChunkCoord) -> bool {
+    self.builders.get(vol_idx).is_some_and(|b| b.is_resident(coord))
+  }
+
+  /// 该 volume 常驻块占用的**字数**（×4 = 字节；预算按它算）。
+  pub fn resident_words(&self, vol_idx: usize) -> usize {
+    self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_words)
+  }
+
+  /// 该 volume 里单个 chunk 的常驻字节（None = 未常驻）。
+  pub fn resident_bytes_of(&self, vol_idx: usize, coord: ChunkCoord) -> Option<usize> {
+    self.builders.get(vol_idx).and_then(|b| b.resident_bytes_of(coord))
+  }
+
+  /// 该 volume 当前常驻的 chunk 列表。
+  pub fn resident_chunks(&self, vol_idx: usize) -> Vec<ChunkCoord> {
+    self.builders.get(vol_idx).map(BrickMapBuilder::resident_chunks).unwrap_or_default()
+  }
+
+  /// 唤醒：按**给定的树**（全树或 proxy）整块装进 GPU（见 [`BrickMapBuilder::ensure_resident_tree`]）。
+  pub fn ensure_resident_tree(
+    &mut self,
+    vol_idx: usize,
+    coord: ChunkCoord,
+    tree: &ChunkTree,
+  ) -> bool {
+    self.builders.get_mut(vol_idx).is_some_and(|b| b.ensure_resident_tree(coord, tree))
+  }
+
+  /// 换出：归还 GPU 块（CPU 树不动 ⇒ 之后可再唤醒）。
+  pub fn evict(&mut self, vol_idx: usize, coord: ChunkCoord) -> bool {
+    self.builders.get_mut(vol_idx).is_some_and(|b| b.evict(coord))
+  }
+
   /// 逐 volume 的 wire 字节状态（按 volume 索引序，非拼接序）：供调试转储（`upload::dump_voxel_buffers`）
   /// 把"CPU 认为该上传什么"整份取出；内容与 `snapshot()` 上传的字节同源。
   pub fn volume_buffers(&self) -> Vec<&BrickMapBuffers> {
@@ -895,9 +992,12 @@ impl VolumesBuilder {
 
 /// 窗口计算：原点 = 最小非空 chunk - 1（±1 chunk 余量），跨度 = max - min + 3，封顶 64³（CHUNK_INDEX_CAP）。
 fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
-  let mut min = IVec3::splat(i32::MAX);
-  let mut max = IVec3::splat(i32::MIN);
-  let mut any = false;
+  // 流式世界的窗口由 `VolumeGrid::set_stream_window` 钉住：只按"当前已加载内容"算的话，
+  // 相机一飞出已加载区就无法再装新 chunk（窗口是 `b_struct` 索引区的定义域）。
+  let (mut min, mut max, mut any) = match grid.stream_window() {
+    Some((o, d)) => (o, o + d - IVec3::ONE, true),
+    None => (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN), false),
+  };
   for c in grid.chunk_coords() {
     if chunk_has_content(grid, c) {
       any = true;
@@ -1258,5 +1358,40 @@ mod tests {
     let dirty = take_dirty_of(&mut grid, c1);
     assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Rebuilt);
     assert_wire_matches_grid(&b, &grid, "重建后");
+  }
+
+  /// M3：换出 → 唤醒是**无损**的（唤醒重建的 wire 与 grid 逐节点相同）。
+  #[test]
+  fn evict_then_wake_is_lossless() {
+    let (mut grid, _, c1) = two_chunk_grid();
+    let mut b = build_and_drain(&mut grid);
+    let words_all = b.resident_words();
+    assert!(b.is_resident(c1));
+
+    assert!(b.evict(c1), "常驻的 chunk 应能换出");
+    assert!(!b.is_resident(c1), "换出后窗口条目应清零");
+    assert_eq!(b.chunk_base(c1), None);
+    assert!(b.resident_words() < words_all, "换出应释放字数");
+    assert!(!b.evict(c1), "重复换出应无操作");
+    // 注意：这里**不能**用 `assert_wire_matches_grid` —— 它要求"每个有内容的 chunk 都有块"，
+    // 与"故意换出"天然冲突（换出后窗口条目就该是 0）。
+
+    // CPU 树不动 ⇒ 唤醒就是整块重装，且重建的 wire 必须与 grid 一致
+    assert!(b.ensure_resident(&grid, c1), "有内容的 chunk 应能唤醒");
+    assert!(b.is_resident(c1));
+    assert_eq!(b.resident_words(), words_all, "唤醒后字数应回到原值");
+    assert!(!b.ensure_resident(&grid, c1), "已常驻 ⇒ 唤醒应无操作");
+    assert_wire_matches_grid(&b, &grid, "唤醒后");
+  }
+
+  /// M3：空 chunk（CPU 侧无内容）永远不常驻 —— 唤醒它是无操作。
+  #[test]
+  fn empty_chunk_is_never_resident() {
+    let (mut grid, c0, c1) = two_chunk_grid();
+    let mut b = build_and_drain(&mut grid);
+    assert!(b.is_resident(c0) && b.is_resident(c1), "有内容的 chunk 建树后即常驻");
+    let empty = ChunkCoord(IVec3::new(3, 0, 0));
+    assert!(!b.is_resident(empty), "空 chunk 没有块");
+    assert!(!b.ensure_resident(&grid, empty), "对空 chunk 唤醒应无操作");
   }
 }

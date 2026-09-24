@@ -8,6 +8,7 @@ mod consts;
 mod debug_menu;
 mod edit;
 mod height_field;
+mod infinite_cubes;
 mod scene;
 mod showcase;
 #[cfg(feature = "profile")]
@@ -138,6 +139,8 @@ fn main() {
     .init_resource::<MouseLock>()
     // MT8-5：笔触位移按材质 id 缓存的高度场（首次落笔解码 ≈22ms，之后解码耗时 0）
     .init_resource::<height_field::MaterialDisplaceCache>()
+    // infinite_cubes 世界的流式加载/卸载参数（是否启用看 `grid.stream_window`，非流式世界自带 early return）
+    .init_resource::<infinite_cubes::Streaming>()
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()
@@ -201,6 +204,8 @@ fn main() {
   // profile feature：主世界每帧一个 Tracy frame mark（CPU/GPU zone 归帧）
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
+  // 流式世界（infinite_cubes）的按需生成 / 真卸载；非流式世界在系统内直接早退
+  app.add_systems(Update, infinite_cubes::stream_chunks);
   // 无鼠标输入地走通一次"编辑 → 增量上传"链路
   if consts::EDIT_SELFTEST {
     app.add_systems(Update, edit::edit_selftest);

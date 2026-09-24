@@ -6,6 +6,7 @@ mod builder;
 pub mod consts;
 pub mod dda;
 pub mod raytrace;
+pub mod residency;
 pub mod upload;
 pub mod wire;
 

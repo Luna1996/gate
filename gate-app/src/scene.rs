@@ -23,9 +23,12 @@ use crate::{
   vox_scene,
 };
 
-/// 程序化调试场景名（**不来自磁盘**，见 `build_cube_in_void`）：与 `assets/vox/*.vox` 的名字同列在
+/// 程序化调试场景名（**不来自磁盘**，见 [`build_cube_in_void`]）：与 `assets/vox/*.vox` 的名字同列在
 /// 「世界」页的模型下拉里，由 [`build_world`] 按名分发。
 pub(crate) const CUBE_IN_VOID: &str = "cube_in_void";
+
+/// 程序化**无限**场景名（**不来自磁盘**，见 [`build_infinite_cubes`] 与 `docs/infinite_cubes.md`）。
+pub(crate) const INFINITE_CUBES: &str = "infinite_cubes";
 
 pub(crate) fn setup(
   mut commands: Commands,
@@ -170,6 +173,9 @@ fn build_world(
   if name == CUBE_IN_VOID {
     return Ok(build_cube_in_void(grid));
   }
+  if name == INFINITE_CUBES {
+    return Ok(build_infinite_cubes(grid));
+  }
   let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
   let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
   vox_scene::load_vox_scene(grid, &path, anchor)
@@ -203,6 +209,37 @@ fn build_cube_in_void(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
   vox_scene::VoxSceneInfo {
     aabb_min: min,
     aabb_max: min + IVec3::splat(EDGE),
+    instances_used: 1,
+    voxels_written,
+    voxels_dropped: 0,
+  }
+}
+
+/// 程序化**无限**场景（「世界」页模型下拉里的 `infinite_cubes`，规则见 `docs/infinite_cubes.md`）：
+/// 向六个方向无限生长的 room 网格 —— 每条棱是纯白柱体、每个 room 中心一个随机材质的 cube。
+///
+/// 本次只铺**起始视野**那一块（半径 `infinite_cubes::START_CHUNKS` 个 chunk，brick 对齐）：把这套
+/// 生成函数接进真流式（按相机加载 / 卸载、卸载即丢修改）是下一步 —— 那时"读系统文件"那一步换成调用
+/// `infinite_cubes::build_region`，其余（挂载 / 常驻 / 换出）全走既有流水线。
+fn build_infinite_cubes(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
+  use crate::infinite_cubes;
+  /// 窗口 = 64³ chunk（`CHUNK_INDEX_CAP` 的上限），钉在起始位置 ⇒ 可飞约 ±150m。
+  /// 更远需要 M6 的环形窗口（那时 shader 寻址做模运算，索引区跟着相机转）。
+  const WINDOW_CHUNKS: i32 = 32;
+  // 与 .vox 世界同一个锚（相机初始就在这附近），世界本身是周期性的 ⇒ 锚在哪都一样
+  let center = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
+  // 槽 1：柱体的纯白（`PaletteEntry::default` 其余字段 = 不发光 / 不透射 / 非金属 / 非 PBR）
+  grid.palette_mut().set(PaletteId(1), PaletteEntry { color: [255, 255, 255], ..Default::default() });
+  let origin = center.div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE)) - IVec3::splat(WINDOW_CHUNKS);
+  grid.set_stream_window(Some((origin, IVec3::splat(WINDOW_CHUNKS * 2))));
+  // 起始只铺相机附近那一块，其余由 `infinite_cubes::stream_chunks` 按需生成
+  let r = infinite_cubes::START_CHUNKS * gate_voxel::CHUNK_SIZE;
+  let lo = ((center - IVec3::splat(r)) / 4) * 4;
+  let hi = ((center + IVec3::splat(r)) / 4 + 1) * 4;
+  let voxels_written = infinite_cubes::build_region(grid, lo, hi, &[]) as usize;
+  vox_scene::VoxSceneInfo {
+    aabb_min: lo,
+    aabb_max: hi,
     instances_used: 1,
     voxels_written,
     voxels_dropped: 0,
