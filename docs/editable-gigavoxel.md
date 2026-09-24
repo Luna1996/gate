@@ -116,7 +116,7 @@ fp     = t · px_ang                       # 体素/像素：一个像素在该�
 | M2 | 叶代表色 **〔已落地，见 §9〕** | 叶块的代表值 = **块内按体素数加权的众数槽号**（复用节点字高 16 位，§9）；替掉旧口径"首个非空体素色"，压掉 `fp ≥ 1` 下 4 像素的块内替换误差 | 远景颜色正确性 | 编辑额外一次 64 格扫描（百纳秒级） | 不碰 wire 尺寸；中，独立提交 |
 | M2b | 上层三档 LOD（**推迟到 M3 之后**） | `fp` 派生 `depth_cap` 的 16³/64³/整 chunk 三档；前提是分裂节点的代表色（颜色契约） | 视距的真正杠杆 | — | 需先有 M3 的公里级视距才能验证 |
 | M3 | 驻留状态机 + LRU + proxy + 编辑三规则 **〔主体已落地，见 §9〕** | `ResidencyPolicy`/`Residency`（档位阶梯 + 迟滞 + 最小驻留 + 编辑钉住 + 每帧上限）、`ChunkTree::proxy`、builder 的 `ensure_resident`/`ensure_resident_tree`/`evict`/`resident_bytes_of`、逐帧调度 `plan_residency` | 有界常驻，大世界成立 | 编辑优先于流式（钉住 + 结构性唤醒） | 剩：CPU 侧卸载与覆盖层落盘（要等 M5 的 `ChunkSource`） |
-| M4 | ray-guided 请求通道 | shader 有界 request buffer（chunk key + 所需档位 + 溢出计数）；Rust 异步回读（1–2 帧延迟）+ 合并排序 + 主射线优先于阴影 / GI；关闭时回退启发式半径 | 细节按真实需求分配 | 编辑走优先通道 | shader 与 Rust 各一处；中高 |
+| M4 | ray-guided 请求通道 **〔切片 1 已落地，见 §9〕** | shader 有界 request buffer（chunk key + 所需档位 + 溢出计数）；Rust 异步回读（1–2 帧延迟）+ 合并排序 + 主射线优先于阴影 / GI；关闭时回退启发式半径 | 细节按真实需求分配 | 编辑走优先通道 | shader 与 Rust 各一处；中高 |
 | M5 | 生产管线（ChunkSource） | `trait ChunkSource { fn produce(coord, level_range) -> ChunkTree }`：程序化 / `.vox` 区域 / 磁盘按层文件；线程池 + 预算；产出走 `mount_chunk_tree` | 粗到细流式、后台加载 | 编辑以覆盖层叠加，不改生成基线 | 新模块；中 |
 | M6 | 真无限 | 环形窗口（`compute_window` 改玩家为中心）+ shader 窗口寻址模运算 + 平移帧条目重写 + 相机相对坐标 | 跨过 16384³ 上限 | 无影响 | shader 寻址 + builder + 坐标；高 |
 | M7 | 试验世界 `infinite_cubes`（M4/M5/M6 的最小可用形态）**〔已落地，见 §10〕** | 程序化生成器（`docs/infinite_cubes.md` 规则）+ 逐帧加载 / **真卸载** + 相机跟随窗口（接近边界整块重定）；规矩：只在"读系统文件"那一步换成生成、卸载走真实流程、末端不落盘 | 用真实流水线验证流式闭环 | 卸载即丢本地修改（既定语义） | `gate-app/src/infinite_cubes.rs` + 两处 `VolumeGrid` API + `plan_residency` 反向同步；中 |
@@ -215,6 +215,26 @@ fp     = t · px_ang                       # 体素/像素：一个像素在该�
   现在逐节点比对**整个** palette word ⇒ 增量与全量的一致性由既有 `incremental_layout_survives_random_edits`
   （200 步随机编辑）持续取证。
 - 未做：非叶节点的代表值（M2b 的三档上层 LOD 才要用），仍按"本节点 `palette` / 首个非空子树"。
+
+### M4（切片 1）：ray-guided 请求通道 —— 已落地
+
+- **产生**（`trace.wesl`）：`REQ_ENABLE`（默认 0，关掉时整段折叠）+ `req_push`。发射点 = **chunk 级 DDA
+  里"窗口有这个槽位、GPU 上没有树块"**（`entry == 0`）那一步；只报"这个距离还需要细节"的
+  （`req_level(fp)` 给出整 chunk 档 ⇒ 连一个平色都够 ⇒ 不发）。请求字 = chunk 相对窗口下标（3×6 位）
+  + 所需档位（2 位，与 `residency::want_level` 同一阶梯，两边不分叉）+ 射线类型（1 位，留给消费端排序）。
+- **通道**：`bindings::lod_req`（BG1 **@binding(10)**，read_write 环缓冲；10/11 曾是已删的反射缓存
+  乒乓，那条"别再往 10 起加东西"的告诫已随之更新）+ `brickmap::consts::{RAY_GUIDED_REQUESTS, REQ_CAP,
+  LOD_REQ_WORDS}`：`[0]` 累计条数、`[1]` 溢出计数、其后 `REQ_CAP = 1024` 条（满了覆盖最旧的）。
+- **主射线优先**：请求闸门由 `WorldRayQuery::req` 给 —— 主 pass 用 `world_cfg_primary`，阴影 / 反射 /
+  GI / 光柱 / 光束一律 `world_cfg_full`（`req = 0`）⇒ 次级射线整段被折叠（不是靠"少发"）。
+- **回读**（`profiler::report_lod_requests`）：每 `REPORT_PERIOD_SECS` 同步读回（与 `report_lod_diag`
+  同一取舍、同一注册条件），**合并**（同一 chunk 的条数 = 有多少条射线要它、档位取最细）后落一行
+  `REQ[新 N 条 → M chunk；最热 (x,y,z)l<档>×<票> …；溢出 K]`（坐标 = 相对下标 + `main_window_origin`）。
+- **未做（切片 2）**：① 把请求**并入需求**驱动加载 —— 现在仍走 `infinite_cubes` 的距离半径；
+  ② "常驻档位比射线要求粗"这条请求（shader 现在只看得见"没有树块"，看不见"档位不够"—— 那需要在
+  窗口条目里编码常驻档位）。两条开关默认关 ⇒ 行为零变化。
+- 单测/验证：`cargo test --release -p gate-render wesl`（WESL 编译 + 校验通过）、clippy 无新增告警；
+  运行期取证 = 两侧开关同时打开，看 `REQ[...]`。
 
 ### 颜色契约（M1 起生效，M2 要延续）
 
@@ -347,12 +367,16 @@ wire 的**节点字高 16 位**（`pack_palette_word` 的 bit16..31）原本就�
 | M3a-2 逐帧调度 | `upload.rs::plan_residency`（`ExtractSchedule`，`.chain()` 在 `extract` 之后） | 已跑通：`RESID` 107 MB → 417 KB，每帧安装上限生效 |
 | M3b-1 proxy 树 | `ChunkTree::proxy` / `rep_of` | 单测 2 项咬死"不挖洞" |
 | M7 试验世界 `infinite_cubes` | `gate-app/src/infinite_cubes.rs`、`gate_voxel::VolumeGrid::{unmount_chunk, set_stream_window, stream_window}`、`plan_residency` 第 ⑤ 步反向同步、`builder::compute_window` 认窗口提示 | 加载/卸载已跑通（`STREAM[gen 1 unload 15 …]`、零错误）；**最后一轮窗口修复未复验**（见 10.2） |
+| M4 切片 1（请求通道：产生 + 合并读回；消费端未接） | `trace.wesl::{REQ_ENABLE, req_push, req_level}`、`world.wesl::world_cfg_primary`、`bindings::lod_req`（BG1 binding 10）、`brickmap::consts::{RAY_GUIDED_REQUESTS, REQ_CAP}`、`profiler::report_lod_requests` | WESL 编译 + 校验通过、clippy 干净；**运行期未取证**（两侧开关默认关） |
+| 断口取证：「CPU 有 / GPU 无」告警 | `upload.rs::plan_residency` 第 ⑦ 段（`RESID[!!CPU 有 / GPU 无 …]`） | 待 10.2 第 1 条的实跑 |
 
 ### 10.2 待验证（下轮第一件事）
 
 1. **`infinite_cubes` 的窗口修复**：菜单「游戏/世界」→ 选 `infinite_cubes` → 「重载世界」。预期 = 近处
-   ±10m 结构完整、无空洞、无轴对齐断口；超出后整片干净结束。若仍有断口 ⇒ 在 `plan_residency` 里加
-   一条"CPU 有 / GPU 无"的常驻差值告警（现在没有这条日志，静默跳过发生在 `install_chunk` 的窗口检查里）。
+   ±10m 结构完整、无空洞、无轴对齐断口；超出后整片干净结束。**取证手段已就位**：`plan_residency` 第 ⑦
+   段会在"本帧没有待安装动作、相机近旁仍有有内容的 chunk 不在 GPU 上"时报
+   `RESID[!!CPU 有 / GPU 无 N chunk（3 chunk 内最近 …）→ 画面上是空洞 / 齐平断口]`（只报数量变化）
+   ⇒ 有断口必有这行，不必靠肉眼找。
 2. **M1 的视觉验收**（一直没做）：`consts::DDA_LOD` 开关前后各看一次远景，确认不开时逐像素与旧版一致、
    开时只在 935 体素外交替（`LEAF_LOD_FP` 现为 1.0，块内替换误差 ≤ 4 像素）。
 3. **M2 的视觉验收**：远景里 `fp ≥ 1` 的块应呈现**块内多数材质**的色（不再是"首个非空体素"那种偶发跳色）；
@@ -376,8 +400,9 @@ wire 的**节点字高 16 位**（`pack_palette_word` 的 bit16..31）原本就�
 
 1. 复验 10.2 第 1 条，并定死 `Streaming` 的三个半径 / 帧额。
 2. **M2 叶代表色已落地**（§9），只欠 10.2 第 3 条的视觉验收。M2b（上层三档 LOD）仍等公里级视距。
-3. **M4 ray-guided 请求通道**：把"相机距离当需求"换成"渲染 pass 发回请求"（`infinite_cubes` 正是它的
-   验收台）；同时它也是 M0 步数直方图的读回通道。
+3. **M4**：切片 1（请求通道：产生 + 合并读回）已落地（§9）。切片 2 = 把请求并入需求（替换
+   `infinite_cubes` 的距离半径）+ "档位不够"那条请求（要先把常驻档位编进窗口条目）；同时也是 M0
+   步数直方图的读回通道（同一套回读骨架）。
 4. **M5 生产管线 + 粗粒度层**（`ChunkSource`）：远景按粗格生成，视距才可能从 10m 走到百米级。
 5. **M6 环形窗口 + 相机相对坐标**：消掉"接近边界整块重定"的卡顿。
 

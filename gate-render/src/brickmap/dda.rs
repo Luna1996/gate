@@ -740,6 +740,9 @@ pub(crate) fn init_dda_pipelines(
         // 放 BG1 而不是 BG0：BG1 是 dda / beam / gi / 光柱掩码四个**会调 trace** 的 pass 共用的那一份，
         // 而 BG0 有两份（完整版 + GI 瘦版）⇒ 挂这里只需改这一处 layout 与下面那一处 BG1 bind group。
         storage_buffer_sized(false, None),
+        // @binding(10)：**M4 ray-guided 请求环缓冲**（read_write —— shader 侧原子追加，
+        // 见 `consts::RAY_GUIDED_REQUESTS` 与 `trace.wesl::req_push`）。
+        storage_buffer_sized(false, None),
       ),
     ),
   );
@@ -1338,6 +1341,8 @@ pub(crate) fn prepare_dda_bind_groups(
       // @binding(9)：叶级 LOD 诊断计数器（M0）：固定 3 字的 buffer，`LOD_DIAG` 关闭时无人写
       // （shader 侧整段被折叠）⇒ 恒 0，读回侧也整个不注册。
       gpu.lod_diag.as_entire_binding(),
+      // @binding(10)：M4 请求环缓冲：`RAY_GUIDED_REQUESTS` 关闭时无人写（shader 整段折叠）。
+      gpu.lod_req.as_entire_binding(),
     )),
   );
 

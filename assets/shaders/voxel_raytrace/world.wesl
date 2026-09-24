@@ -73,10 +73,11 @@ struct SceneHit {
 
 // 主世界先跑 + 逐物体收缩 t_cap 取最近命中；g0 = 主世界网格（由 world_raycast 提供）。
 // 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
-fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32) -> SceneHit {
+fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
+               req: u32) -> SceneHit {
   var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0));
   var best_t = 1e+30;
-  var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap, false, &mc_off), 0u);
+  var best = SceneHit(trace_grid(g0, origin, dir, t_cap, t_min, depth_cap, false, req, &mc_off), 0u);
   if (best.uh.hit) {
     best_t = best.uh.t;
     best.palette_base = g0.palette_base;
@@ -84,7 +85,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
   let n = g.grid_count;
   for (var i: u32 = 1u; i < n; i = i + 1u) {
     let gi = make_grid(i);
-    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap, false, &mc_off);
+    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap, false, req, &mc_off);
     if (mhi.hit && mhi.t < best_t) {
       best_t = mhi.t;
       best.uh = mhi;
@@ -119,11 +120,19 @@ fn camera_solid_pal(origin_voxel: vec3<f32>) -> u32 {
 struct WorldRayQuery {
   t_min: f32,
   depth_cap: u32,
+  /// 本 pass 是否允许发 ray-guided 请求（M4；见 `trace.wesl::REQ_ENABLE` 与 `world_cfg_primary`）
+  req: u32,
 }
 
-/// 完整层次 DDA 的配置构造。
+/// 完整层次 DDA 的配置构造。`req = 0`：**次级射线**（阴影 / 反射 / GI / 光柱）不发请求 ——
+/// 主射线优先，正因为它们的像素才代表"用户真的在看这里"。
 fn world_cfg_full(t_min: f32, depth_cap: u32) -> WorldRayQuery {
-  return WorldRayQuery(t_min, depth_cap);
+  return WorldRayQuery(t_min, depth_cap, 0u);
+}
+
+/// 同 [`world_cfg_full`]，但**允许发 ray-guided 请求**：只给主着色 pass 用（`req = 1`）。
+fn world_cfg_primary(t_min: f32, depth_cap: u32) -> WorldRayQuery {
+  return WorldRayQuery(t_min, depth_cap, 1u);
 }
 
 /// 世界求交结果。
@@ -147,7 +156,7 @@ fn world_miss() -> WorldHit {
 /// 世界求交唯一入口；g0 = 主世界网格（`make_grid(0u)`），在其上追加逐物体网格。
 /// 自带 65536 步防挂死安全网，超限返回 miss（= 保守判可见）。
 fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: WorldRayQuery) -> WorldHit {
-  let s = trace_scene(g0, origin, dir, max_t, cfg.t_min, cfg.depth_cap);
+  let s = trace_scene(g0, origin, dir, max_t, cfg.t_min, cfg.depth_cap, cfg.req);
   return WorldHit(
     s.uh.hit, s.uh.t, origin + dir * s.uh.t, s.uh.pal, s.uh.n,
     s.uh.face_id, s.uh.voxel, s.uh.obj_id, s.palette_base);
@@ -160,7 +169,7 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
                       stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
   var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
-  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, &mc);
+  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, 0u, &mc);
   *tint = *tint * mc.tint;
   return WorldHit(
     h.hit, h.t, origin + dir * h.t, h.pal, h.n,

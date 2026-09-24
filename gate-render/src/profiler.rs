@@ -153,6 +153,13 @@ impl Plugin for GateProfilerPlugin {
         report_lod_diag.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
     }
+    // M4 ray-guided 请求读回：同样只在开关打开时注册（须与 `trace.wesl::REQ_ENABLE` 同时打开）。
+    if crate::brickmap::consts::RAY_GUIDED_REQUESTS {
+      render_app.add_systems(
+        bevy::render::renderer::RenderGraph,
+        report_lod_requests.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
+      );
+    }
     #[cfg(feature = "profile")]
     {
       render_app.add_systems(bevy::render::RenderStartup, init_gpu_profiler);
@@ -305,4 +312,106 @@ fn report_lod_diag(
     d[1] as f32 * 100.0 / entries as f32,
     d[2]
   );
+}
+
+/// chunk 相对窗口下标的解包（`trace.wesl::req_push` 的位域：3 × 6 位）
+fn req_rel(key: u32) -> IVec3 {
+  IVec3::new((key & 63) as i32, ((key >> 6) & 63) as i32, ((key >> 12) & 63) as i32)
+}
+
+/// **M4 ray-guided 请求的读回**（`docs/editable-gigavoxel.md` §4 M4）：每 [`crate::consts::REPORT_PERIOD_SECS`]
+/// 把 `gpu.lod_req`（环缓冲）拷进 staging 同步读回，**合并**后落一行 `REQ[...]`（新增条数 → 去重后的
+/// chunk 数 → 最热的几个 → 溢出计数）。
+///
+/// 与 [`report_lod_diag`] 同一取舍（自建 encoder + `map_buffer` + `poll` 等待）与同一注册条件
+/// （`consts::RAY_GUIDED_REQUESTS`；须与 shader 侧 `trace.wesl::REQ_ENABLE` 同步开，否则永远没有请求）。
+///
+/// 与诊断计数器的差别：那是累积量（只加不清）⇒ 读差值；这里是**环缓冲** ⇒ 差值只用来算"本窗口新增
+/// 了几条"，字面值本身要解码（见 `trace.wesl::req_push`），且只解释**最近**那批（跨窗口累积超过容量
+/// 时尾部就是全部有意义的样本）。
+fn report_lod_requests(
+  device: Res<RenderDevice>,
+  queue: Res<RenderQueue>,
+  gpu: Option<Res<crate::brickmap::upload::GpuBrickMap>>,
+  mut period: Local<Option<std::time::Instant>>,
+  mut prev: Local<Option<[u32; 2]>>,
+) {
+  use crate::brickmap::consts::{LOD_REQ_WORDS, REQ_CAP};
+  let Some(gpu) = gpu else { return };
+  let now = std::time::Instant::now();
+  let due = period
+    .is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
+  if !due {
+    return;
+  }
+  *period = Some(now);
+
+  let bytes = (LOD_REQ_WORDS * 4) as u64;
+  let staging = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_lod_req_staging"),
+    size: bytes,
+    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+    mapped_at_creation: false,
+  });
+  let mut enc =
+    device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
+      label: Some("gate_lod_req_readback"),
+    });
+  enc.copy_buffer_to_buffer(&gpu.lod_req, 0, &staging, 0, bytes);
+  queue.submit([enc.finish()]);
+
+  let slice = staging.slice(..);
+  let (tx, rx) = std::sync::mpsc::channel();
+  device.map_buffer(&slice, MapMode::Read, move |r| {
+    let _ = tx.send(r);
+  });
+  if device.poll(PollType::wait_indefinitely()).is_err()
+    || !matches!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(Ok(())))
+  {
+    warn!("REQ 读回：等待 / 映射失败 → 本窗口跳过");
+    staging.unmap();
+    return;
+  }
+  let mut words = vec![0u32; LOD_REQ_WORDS];
+  if let Ok(view) = slice.get_mapped_range() {
+    for (i, w) in words.iter_mut().enumerate() {
+      let o = i * 4;
+      *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
+    }
+  }
+  staging.unmap();
+
+  let (count, overflow) = (words[0], words[1]);
+  let (new_reqs, new_over) = match *prev {
+    // 首个窗口只建立基线：倒推"最近 N 条"要靠差值
+    None => (0, 0),
+    Some(p) => (count.wrapping_sub(p[0]), overflow.wrapping_sub(p[1])),
+  };
+  *prev = Some([count, overflow]);
+  let n = (new_reqs as usize).min(REQ_CAP);
+  if n == 0 {
+    return;
+  }
+
+  // 合并：同一 chunk 的多条请求合成一条（值 = 有多少条射线要它 / 其中**最细**的档位要求）。
+  let mut tally: std::collections::HashMap<u32, (u32, u32)> = std::collections::HashMap::new();
+  for i in 0..n {
+    // 环缓冲：最近一条在 `count - 1` 处，往前倒推
+    let slot = count.wrapping_sub(1).wrapping_sub(i as u32) as usize % REQ_CAP;
+    let w = words[2 + slot];
+    let e = tally.entry(w & 0x3_FFFF).or_insert((0, 3));
+    e.0 += 1;
+    e.1 = e.1.min((w >> 18) & 3);
+  }
+  let mut top: Vec<(u32, (u32, u32))> = tally.into_iter().collect();
+  top.sort_unstable_by_key(|(_, (votes, _))| std::cmp::Reverse(*votes));
+  let shown: Vec<String> = top
+    .iter()
+    .take(6)
+    .map(|(key, (votes, level))| {
+      let p = gpu.main_window_origin + req_rel(*key);
+      format!("({},{},{})l{level}×{votes}", p.x, p.y, p.z)
+    })
+    .collect();
+  info!("REQ[新 {new_reqs} 条 → {} chunk；最热 {}；溢出 {new_over}]", top.len(), shown.join(" "));
 }

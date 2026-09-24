@@ -309,6 +309,10 @@ pub struct GpuBrickMap {
   /// 叶级 LOD 诊断计数器（BG1 binding 9，M0）：`consts::LOD_DIAG_WORDS` 个 u32，**只增不清**
   /// （CPU 侧读差值，见 `crate::profiler::report_lod_diag`）。固定尺寸、不参与扩容；`COPY_SRC` 供读回。
   pub lod_diag: Buffer,
+  /// **M4 ray-guided 请求环缓冲**（BG1 binding 10）：`consts::LOD_REQ_WORDS` 个 u32（`[0]` 条数、
+  /// `[1]` 溢出计数、其后 `REQ_CAP` 个请求字）。**只增不清**（CPU 侧读差值，见
+  /// `crate::profiler::report_lod_requests`）；写入侧是 shader 的原子追加，故需要 read_write 绑定。
+  pub lod_req: Buffer,
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
   pub globals: UniformBuffer<BrickMapGlobals>,
@@ -429,6 +433,14 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     mapped_at_creation: false,
   });
 
+  // M4 ray-guided 请求环缓冲：同样零初始化即可（`[0]` 起就是"还没有任何请求"）。
+  let lod_req = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_lod_req"),
+    size: (crate::brickmap::consts::LOD_REQ_WORDS * 4) as u64,
+    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+    mapped_at_creation: false,
+  });
+
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     leaves: make("gate_leaves"),
@@ -436,6 +448,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     comp: make("gate_comp"),
     state: make("gate_state"),
     lod_diag,
+    lod_req,
     grid_descs_buf: make("gate_grid_descs"),
     grid_descs_count: 0,
     globals,
@@ -1150,6 +1163,9 @@ fn dump_voxel_buffers(
   }
 }
 
+/// ⑦ 的"近旁"半径（chunk，切比雪夫）：与流式世界的卸载半径同量级 —— 近处缺块是断口，远处缺只是空地。
+const GAP_NEAR_CHUNKS: i32 = 3;
+
 /// **M3 常驻调度**（`ExtractSchedule`，排在 `extract` 之后；见 `docs/editable-gigavoxel.md` §9 M3a-1）。
 ///
 /// 为什么不并进 `extract`：① `extract` 在"本帧无脏改动"时提前返回，而常驻决策必须每帧跑；
@@ -1157,7 +1173,7 @@ fn dump_voxel_buffers(
 ///
 /// 分工：决策在 [`super::residency`]（纯逻辑 + 单测），这里只做三件事 —— 算每 chunk 的需求档位
 /// （[`want_level`]：按**距离**给档，不由预算给）、落实安装 / 换出、有变化时**重出 `UploadSnapshot`**
-/// （否则 `prepare` 看不到这次改动）。
+/// （否则 `prepare` 看不到这次改动）；另外 ⑦ 顺带做"CPU 有 / GPU 无"的取证（§10.2 第 1 条）。
 ///
 /// 档位阶梯是保守的（`fp ≥ 块边长` 才允许粗化 ⇒ 16³ 档在 720p 要 2.5 km 外）⇒ **当前场景（≤1 km）
 /// 永远是全分辨率**，本系统每帧只花 O(chunk 数) 的记账，不产生任何上传。
@@ -1166,6 +1182,7 @@ fn plan_residency(
   cam: Option<Extract<Res<crate::brickmap::dda::DdaCameraConfig>>>,
   mut mirror: ResMut<BuilderMirror>,
   mut state: ResMut<ResidencyState>,
+  mut gap_last: Local<usize>,
   mut commands: Commands,
 ) {
   let (Some(scene), Some(cam)) = (scene, cam) else { return };
@@ -1248,6 +1265,29 @@ fn plan_residency(
       builder.evict(0, c);
       state.residency.note_gone(c);
       evicted += 1;
+    }
+  }
+  // ⑦ 「CPU 有 / GPU 无」取证（`docs/editable-gigavoxel.md` §10.2 第 1 条）：本帧**没有任何**待安装 /
+  //    待换出的动作，相机近旁却仍有"有内容的 chunk 没装在 GPU 上" ⇒ 那一片在画面上就是空洞与齐平断口
+  //    （静默跳过发生在 `install_chunk` 的窗口检查里，没有这条日志就查不出来）。
+  //    安装积压（`max_install_per_frame` 截断）不算：那时 `installed > 0`，本段整段跳过。只报**数量
+  //    变化**，免得常驻缺口每帧刷一行。
+  if installed == 0 && evicted == 0 {
+    let gaps: Vec<IVec3> = grid
+      .chunk_coords()
+      .filter(|c| {
+        !state.residency.is_resident(*c) && (c.0 - cam_chunk).abs().max_element() <= GAP_NEAR_CHUNKS
+      })
+      .map(|c| c.0)
+      .collect();
+    if gaps.len() != *gap_last {
+      *gap_last = gaps.len();
+      if let Some(n) = gaps.iter().min_by_key(|p| (*p - cam_chunk).abs().max_element()) {
+        warn!(
+          "RESID[!!CPU 有 / GPU 无 {} chunk（{GAP_NEAR_CHUNKS} chunk 内最近 {n}）→ 画面上是空洞 / 齐平断口",
+          gaps.len()
+        );
+      }
     }
   }
   if installed == 0 && evicted == 0 {

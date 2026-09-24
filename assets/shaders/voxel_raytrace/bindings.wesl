@@ -95,9 +95,16 @@ struct MaterialAsset {
 /// 槽位见 `trace.wesl::DIAG_*`；**只增不清**（CPU 侧读差值）⇒ 不需要清零，也没有"清零写 vs GPU 写"的竞态。
 @group(1) @binding(9) var<storage, read_write> lod_diag: array<atomic<u32>>;
 
-// **BG1 的 binding 号到此为止（0..9）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，
-// 已按实测整体删除（负优化：用户判定"删除后画面不变、反而更快"）—— 见 `main.wesl` 文件头的
-// MT4 注释块。**别再往 10 起加东西**以为这里是预留空位：那两块 buffer 与 `ReflEntry` 都已不存在。
+/// 10：**M4 ray-guided 请求环缓冲**（`trace.wesl::REQ_ENABLE` 为 1 时才被写）。
+/// 布局（Rust `brickmap::consts::{REQ_CAP, LOD_REQ_WORDS}`）：`[0]` = 累计条数、`[1]` = 溢出计数、
+/// 其后 `REQ_CAP` 个请求字（编码见 `trace.wesl::req_push`）。
+/// 必须是 **read_write**（shader 原子追加）；GPU 上无人读它 —— 只给 Rust 侧回读（M4 的消费端）。
+@group(1) @binding(10) var<storage, read_write> lod_req: array<atomic<u32>>;
+
+// **BG1 的 binding 号到此为止（0..10）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，已按实测
+// 整体删除（负优化：用户判定"删除后画面不变、反而更快"）—— 见 `main.wesl` 文件头的 MT4 注释块。
+// 10 现在被 M4 的请求环缓冲占用（上面那条），**11 起没有预留**：加新东西要另找位置并同步
+// `dda.rs` 的 `DdaBg1` layout + bind group 两处。
 
 // --- BG2：GridDesc 数组（144B/entry，与 Rust GridDesc 字节一致）---
 struct GridDesc {

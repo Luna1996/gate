@@ -35,6 +35,19 @@ pub const DDA_LOD: bool = true;
 pub const LOD_DIAG: bool = false;
 /// 诊断计数器字数（`lod_diag`）：叶入口 / 叶级早停 / 非法早停。须与 `trace.wesl::DIAG_*` 对齐。
 pub const LOD_DIAG_WORDS: usize = 3;
+/// **M4 ray-guided 请求通道**（`docs/editable-gigavoxel.md` §4 M4）：shader 把"射线想要细节、而那个
+/// chunk 在 GPU 上没有树块"记成一条请求（chunk 相对窗口下标 + 所需档位 + 射线类型），Rust 侧按
+/// `REPORT_PERIOD_SECS` 回读 + 合并排序后驱动流式加载。
+///
+/// CONSTRAINT: **须与 `assets/shaders/voxel_raytrace/trace.wesl::REQ_ENABLE` 同步改**（与 `LOD_DIAG`
+/// 同款两侧约定）：只开一侧会得到"一片空转"或"永远 0"。关闭时 shader 整段被折叠（零开销），
+/// 读回侧也不注册。
+pub const RAY_GUIDED_REQUESTS: bool = false;
+/// 请求环缓冲槽数：新的覆盖旧的 ⇒ 回读只看到最近 [`REQ_CAP`] 条（溢出另有计数）。
+pub const REQ_CAP: usize = 1024;
+/// 请求缓冲字数：`[0]` = 累计条数（只增，CPU 读差值配对 `REQ_CAP` 取模）、`[1]` = 溢出计数、
+/// 其后 [`REQ_CAP`] 个请求字。
+pub const LOD_REQ_WORDS: usize = 2 + REQ_CAP;
 /// beam 预 pass（关掉则主 pass 从 t=0 起步）
 pub const DDA_BEAM: bool = true;
 /// 方向可达掩码剔除（LUT）

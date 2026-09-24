@@ -1,4 +1,4 @@
-import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, view_u};
+import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, lod_req, view_u};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, NODE_FIXED_WORDS, face_normal_from_index};
 
@@ -84,6 +84,56 @@ const DIAG_ILLEGAL_STOPS: u32 = 2u;
 /// 诊断采样闸门：叶节点地址低位为零的叶才计数（≈1/64）。`LOD_DIAG = 0` 时恒 false ⇒ 整个 `if` 被折叠。
 fn diag_sampled(addr: u32) -> bool {
   return LOD_DIAG == 1u && (addr & 63u) == 0u;
+}
+
+// ============================================================================
+// M4 · ray-guided 请求通道（`docs/editable-gigavoxel.md` §4 M4）
+// ============================================================================
+
+/// 请求通道开关：置 `1u` ⇒ 射线撞上"**窗口里有槽位、GPU 上还没有树块**"的 chunk 时记一条请求
+/// （`bindings::lod_req`），Rust 侧回读 + 合并排序后驱动流式加载。
+/// **必须与 Rust 侧 `consts::RAY_GUIDED_REQUESTS` 同步改**（与 `LOD_DIAG` 同款两侧约定）。
+/// 编译期常量 ⇒ 置 0 时 `req_push` 整段被折叠，正常路径零开销，也不需要那条 binding 有内容。
+///
+/// CONSTRAINT（**主射线优先**）：只有主射线会发请求 —— 请求闸门由 `WorldRayQuery::req` 给，
+/// 主 pass 用 `world_cfg_primary`，阴影 / 反射 / GI / 光柱一律用 `world_cfg_full`（req=0）。
+const REQ_ENABLE: u32 = 0u;
+/// 请求环缓冲槽数（= Rust `consts::REQ_CAP`）：满了就覆盖最旧的，另抬 [`REQ_OVERFLOW`]。
+const REQ_CAP: u32 = 1024u;
+/// 缓冲字下标（= Rust `consts::LOD_REQ_WORDS` 的布局）
+const REQ_COUNT: u32 = 0u;
+const REQ_OVERFLOW: u32 = 1u;
+const REQ_BASE: u32 = 2u;
+/// 请求字里 chunk 相对窗口下标的每轴位数（窗口 = 64³ chunk ⇒ 6 位）
+const REQ_REL_BITS: u32 = 6u;
+/// 请求字里的"整 chunk 档"（最粗）：这个档位连一个平色都够 ⇒ **不发请求**（缺了也看不见）。
+const REQ_LEVEL_COARSEST: u32 = 3u;
+
+/// 该距离"够用的档位"下标：0 = 全分辨率（4³）、1 = 16³、2 = 64³、3 = 整 chunk（256³）。
+/// 阶梯与 Rust `residency::want_level` **同一口径**（`fp ≥ 4/16/64` ⇒ 16³/64³/整 chunk）——
+/// 消费端按同一个阶梯决定装到哪一档，两边不分叉。
+fn req_level(fp: f32) -> u32 {
+  if (fp >= 64.0) { return 3u; }
+  if (fp >= 16.0) { return 2u; }
+  if (fp >= 4.0) { return 1u; }
+  return 0u;
+}
+
+/// 记一条请求。`rel` = chunk 相对窗口下标，`level` = [`req_level`] 的下标，`kind` = 0 主射线 / 1 次级
+/// （位留给消费端排序；当前只有主射线会走到这里）。
+///
+/// 环缓冲追加：`n = atomicAdd([0])` ⇒ 写 `[REQ_BASE + n % REQ_CAP]`；`n ≥ REQ_CAP` 时同时抬
+/// `[1]`（= 这一窗口里"被覆盖过"的条数，读回侧用它判容量够不够）。**不去重、不排序**：那是消费端的事。
+fn req_push(rel: vec3<u32>, level: u32, kind: u32) {
+  if (REQ_ENABLE == 0u) { return; }
+  let n = atomicAdd(&lod_req[REQ_COUNT], 1u);
+  if (n >= REQ_CAP) { atomicAdd(&lod_req[REQ_OVERFLOW], 1u); }
+  let w = (rel.x & 63u)
+    | ((rel.y & 63u) << REQ_REL_BITS)
+    | ((rel.z & 63u) << (REQ_REL_BITS * 2u))
+    | ((level & 3u) << 18u)
+    | ((kind & 1u) << 20u);
+  atomicStore(&lod_req[REQ_BASE + (n % REQ_CAP)], w);
 }
 
 /// 叶级 LOD 代表色（M2）：节点 palette word 高 16 位存的就是它 —— 写侧算的是**块内按体素数加权的
@@ -631,8 +681,9 @@ fn grid_hit(h: VoxelHit, ci: vec3<i32>,
 }
 
 // 统一层次 DDA：slab→chunk 间 A&W→trace_chunk，`penetrate = false` 时一次都不碰 mc。
+/// `req` = 本 pass 是否允许发 ray-guided 请求（0 = 不发；见 `REQ_ENABLE` 的 CONSTRAINT）。
 fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
-              penetrate: bool, mc: ptr<function, MediumRay>) -> UnifiedHit {
+              penetrate: bool, req: u32, mc: ptr<function, MediumRay>) -> UnifiedHit {
   let w_mn = g.w_mn;
   let w_mx = g.w_mx;
   let l_min = g.l_min;
@@ -775,6 +826,13 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
         + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
       let entry = b_struct[index_addr];
+      // M4：槽位在窗口里、GPU 上却没有树块 ⇒ 射线本来要的细节缺了（`entry == 0` 在 shader 里与
+      // "这块是空气"同形，故消费端要自己过滤"其实已经加载完的 chunk"）。只报"这个距离还需要细节"的：
+      // 整 chunk 档连一个平色都够 ⇒ 不发（见 `REQ_LEVEL_COARSEST`）。
+      if (entry == 0u && req != 0u) {
+        let lv = req_level(t_enter_c * view_u.lod.x);
+        if (lv < REQ_LEVEL_COARSEST) { req_push(rel_u, lv, 0u); }
+      }
       if (entry != 0u) {
         air_chunk = false;
         let chunk_base = tree_base + entry - 1u;

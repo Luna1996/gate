@@ -7,7 +7,7 @@ import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::trace::{make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
-import package::world::{WorldHit, camera_solid_pal, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_miss, world_raycast, world_trace_medium};
+import package::world::{WorldHit, camera_solid_pal, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
 // 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`brickmap::raytrace`、`wire.rs::encode_slot` 一致。
@@ -204,7 +204,7 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     if (in_medium) {
       best = world_trace_medium(make_grid(0u), org, dir, max_t, true, &seg);
     } else {
-      best = world_raycast(make_grid(0u), org, dir, max_t, world_cfg_full(t_start, 3u));
+      best = world_raycast(make_grid(0u), org, dir, max_t, world_cfg_primary(t_start, 3u));
     }
     tint = tint * seg;
     if (!best.hit) { return GlassOut(best, tint, refl, dir); }
@@ -832,7 +832,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let sky = light_u.sky_color.xyz;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
   let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
-                            world_cfg_full(t_min, 3u));
+                            world_cfg_primary(t_min, 3u));
 
   // ---- 逐面去重查表（`face_slots`：认领在 `gi/screen.wesl`、计算在 `dda_face_main`）----
   // 命中条件 = 认领标志置位 + **两个键 word 逐位相等**（同一体素 + 同一个面 + 同一物体）。
