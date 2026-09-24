@@ -28,6 +28,7 @@ pub use lighting::{
 };
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use pbr_texture::{PBR_TEXTURE_DIR, PbrTextureSet, PbrTexturesPlugin, material_ids};
+pub use profiler::{LodRequest, LodRequestFeed};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
 pub use sky::{SkyPlugin, SkySettings, sun_altitude_deg};
 pub use volumetric::{FogPlugin, FogSettings};

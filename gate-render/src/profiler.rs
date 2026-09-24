@@ -136,11 +136,16 @@ impl Plugin for GateProfilerPlugin {
     // 必须在取 render_app 之前插进主世界（渲染世界那份下面一起给）。
     let pace = FramePace::default();
     app.insert_resource(pace.clone());
+    // M4 请求通道：主世界留一份（`infinite_cubes::stream_chunks` 读需求），渲染世界共享同一份
+    // （`report_lod_requests` 写）。两个世界都插入 ⇒ 关掉开关时它就是一张空表。
+    let req_feed = LodRequestFeed::default();
+    app.insert_resource(req_feed.clone());
     let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
       return;
     };
     render_app.init_resource::<GpuProfilerRes>();
     render_app.insert_resource(pace);
+    render_app.insert_resource(req_feed);
     render_app.add_systems(
       bevy::render::renderer::RenderGraph,
       tick_frame_pace.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
@@ -314,6 +319,33 @@ fn report_lod_diag(
   );
 }
 
+/// 一条 **ray-guided 请求**（**合并后**的一条 = 一个 chunk）：几票 = 有多少条主射线要它。
+///
+/// 编码侧是 shader 的 `trace.wesl::req_push`（请求字 = 窗口相对下标 + 档位 + 射线类型），
+/// 合并与窗口下标 → 绝对坐标的还原都在 [`report_lod_requests`] 里做（只有那里拿得到
+/// `main_window_origin`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LodRequest {
+  /// 请求的 chunk（**绝对** chunk 坐标）
+  pub chunk: IVec3,
+  /// 档位要求（阶梯下标：0 = 全分辨率 … 3 = 整 chunk；与 `residency::want_level` /
+  /// `trace.wesl::req_level` 同一口径）。
+  /// **当前消费端不消费它**：流式生成出来的永远是 CPU 全分辨率树，装到哪一档由 `plan_residency`
+  /// 按距离定（档位耦合留给 M5 的粗粒度层）。
+  pub level: u8,
+  /// 票数：主射线里有多少条撞在"这个 chunk 不在 GPU 上"上 —— 越大的越该先补。
+  pub votes: u32,
+}
+
+/// **最近一批 ray-guided 请求**（渲染世界写、主世界读）。
+///
+/// 跨世界手法与 [`crate::brickmap::upload::UploadCpuSampleChannel`] 同一套：`ExtractResource` 只搬
+/// "变化过的资源"，而这条通道每 `REPORT_PERIOD_SECS` 换一批 ⇒ 用 `Arc<Mutex<..>>` 两个世界共享同一份。
+///
+/// 空表 = 没有需求（`consts::RAY_GUIDED_REQUESTS` 关着，或这一窗口没人看缺块）⇒ 消费端退回纯半径启发式。
+#[derive(Resource, Clone, Default)]
+pub struct LodRequestFeed(pub Arc<std::sync::Mutex<Vec<LodRequest>>>);
+
 /// chunk 相对窗口下标的解包（`trace.wesl::req_push` 的位域：3 × 6 位）
 fn req_rel(key: u32) -> IVec3 {
   IVec3::new((key & 63) as i32, ((key >> 6) & 63) as i32, ((key >> 12) & 63) as i32)
@@ -333,6 +365,7 @@ fn report_lod_requests(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
   gpu: Option<Res<crate::brickmap::upload::GpuBrickMap>>,
+  feed: Option<Res<LodRequestFeed>>,
   mut period: Local<Option<std::time::Instant>>,
   mut prev: Local<Option<[u32; 2]>>,
 ) {
@@ -389,7 +422,14 @@ fn report_lod_requests(
   };
   *prev = Some([count, overflow]);
   let n = (new_reqs as usize).min(REQ_CAP);
+  // 本窗口**没有任何请求**（都装好了 / 没人在看缺块）⇒ 需求表清空：消费端退回纯半径启发式。
+  let set_feed = |list: Vec<LodRequest>| {
+    if let Some(feed) = feed.as_ref() {
+      *feed.0.lock().unwrap_or_else(|e| e.into_inner()) = list;
+    }
+  };
   if n == 0 {
+    set_feed(Vec::new());
     return;
   }
 
@@ -405,13 +445,19 @@ fn report_lod_requests(
   }
   let mut top: Vec<(u32, (u32, u32))> = tally.into_iter().collect();
   top.sort_unstable_by_key(|(_, (votes, _))| std::cmp::Reverse(*votes));
-  let shown: Vec<String> = top
+  let merged: Vec<LodRequest> = top
     .iter()
-    .take(6)
-    .map(|(key, (votes, level))| {
-      let p = gpu.main_window_origin + req_rel(*key);
-      format!("({},{},{})l{level}×{votes}", p.x, p.y, p.z)
+    .map(|(key, (votes, level))| LodRequest {
+      chunk: gpu.main_window_origin + req_rel(*key),
+      level: *level as u8,
+      votes: *votes,
     })
     .collect();
+  let shown: Vec<String> = merged
+    .iter()
+    .take(6)
+    .map(|r| format!("({},{},{})l{}×{}", r.chunk.x, r.chunk.y, r.chunk.z, r.level, r.votes))
+    .collect();
+  set_feed(merged);
   info!("REQ[新 {new_reqs} 条 → {} chunk；最热 {}；溢出 {new_over}]", top.len(), shown.join(" "));
 }

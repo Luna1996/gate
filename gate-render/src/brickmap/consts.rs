@@ -42,7 +42,7 @@ pub const LOD_DIAG_WORDS: usize = 3;
 /// CONSTRAINT: **须与 `assets/shaders/voxel_raytrace/trace.wesl::REQ_ENABLE` 同步改**（与 `LOD_DIAG`
 /// 同款两侧约定）：只开一侧会得到"一片空转"或"永远 0"。关闭时 shader 整段被折叠（零开销），
 /// 读回侧也不注册。
-pub const RAY_GUIDED_REQUESTS: bool = false;
+pub const RAY_GUIDED_REQUESTS: bool = true;
 /// 请求环缓冲槽数：新的覆盖旧的 ⇒ 回读只看到最近 [`REQ_CAP`] 条（溢出另有计数）。
 pub const REQ_CAP: usize = 1024;
 /// 请求缓冲字数：`[0]` = 累计条数（只增，CPU 读差值配对 `REQ_CAP` 取模）、`[1]` = 溢出计数、

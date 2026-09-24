@@ -97,7 +97,7 @@ fn diag_sampled(addr: u32) -> bool {
 ///
 /// CONSTRAINT（**主射线优先**）：只有主射线会发请求 —— 请求闸门由 `WorldRayQuery::req` 给，
 /// 主 pass 用 `world_cfg_primary`，阴影 / 反射 / GI / 光柱一律用 `world_cfg_full`（req=0）。
-const REQ_ENABLE: u32 = 0u;
+const REQ_ENABLE: u32 = 1u;
 /// 请求环缓冲槽数（= Rust `consts::REQ_CAP`）：满了就覆盖最旧的，另抬 [`REQ_OVERFLOW`]。
 const REQ_CAP: u32 = 1024u;
 /// 缓冲字下标（= Rust `consts::LOD_REQ_WORDS` 的布局）

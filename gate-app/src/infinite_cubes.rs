@@ -79,11 +79,16 @@ impl Default for Streaming {
 /// （请求通道见 `docs/editable-gigavoxel.md` §9 M4）。生成 / 挂载 / 常驻 / 换出 / 卸载全走既有流水线：
 /// 生成直接写主世界对应 chunk 盒（`fill_bricks` 自会标脏 ⇒ 走既有上传路径），
 /// 卸载只拿掉 CPU 树，显存由常驻调度的反向同步（`plan_residency` 第 ⑤ 步）跟着归还。
+///
+/// M4 切片 2：**ray-guided 请求并入需求**（`feed`）—— 主射线当下真正看到的缺块插到队首（票数多的先），
+/// 半径补块退居其后 ⇒ 同样的帧额先补"人在看的"。开关（`consts::RAY_GUIDED_REQUESTS`）关着时这份表是
+/// 空的 ⇒ 逐帧行为与纯半径启发式完全一致。
 pub fn stream_chunks(
   stream: ResMut<Streaming>,
   mut scene: ResMut<gate_render::VoxelScene>,
   cam: Option<Res<gate_render::DdaCameraConfig>>,
   pbr: Option<Res<gate_render::PbrTextureSet>>,
+  feed: Option<Res<gate_render::LodRequestFeed>>,
 ) {
   let Some(cam) = cam else { return };
   let Some((mut w_origin, w_dims)) = scene.volumes.main().stream_window() else {
@@ -110,26 +115,28 @@ pub fn stream_chunks(
   }
   let grid = scene.volumes.main_mut();
 
-  // ① 生成：半径内**且在窗口内**尚未挂载的 chunk，近的优先，每帧 ≤ per_frame
-  let r = stream.load_radius;
-  let mut todo: Vec<(i32, IVec3)> = Vec::new();
+  // ① 生成：**请求优先，再半径补块**，合计每帧 ≤ per_frame（策略见 `plan_generation`）
+  let requests: Vec<(u32, IVec3)> = feed
+    .as_ref()
+    .map(|f| {
+      f.0.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|q| (q.votes, q.chunk))
+        .collect()
+    })
+    .unwrap_or_default();
+  let (batch, gen_req) = plan_generation(
+    center,
+    w_origin,
+    w_dims,
+    stream.load_radius,
+    stream.unload_radius,
+    stream.per_frame,
+    &requests,
+    |c| grid.chunk(gate_voxel::ChunkCoord(c)).is_some(),
+  );
   let mut generated = 0usize;
-  for dx in -r..=r {
-    for dy in -r..=r {
-      for dz in -r..=r {
-        let c = center + IVec3::new(dx, dy, dz);
-        let t = c - w_origin;
-        if t.cmplt(IVec3::ZERO).any() || t.cmpge(w_dims).any() {
-          continue; // 窗口外：生成了也装不上
-        }
-        if grid.chunk(gate_voxel::ChunkCoord(c)).is_none() {
-          todo.push((dx.abs().max(dy.abs()).max(dz.abs()), c));
-        }
-      }
-    }
-  }
-  todo.sort_unstable_by_key(|(d, c)| (*d, c.x, c.y, c.z));
-  let batch: Vec<IVec3> = todo.into_iter().take(stream.per_frame).map(|(_, c)| c).collect();
   if !batch.is_empty() {
     // PBR 档要真资产槽（`docs/infinite_cubes.md` 规则 5）；扫描只在"资源还没插入"时发生。
     let ids = crate::scene::pbr_asset_ids(pbr.as_deref());
@@ -155,7 +162,10 @@ pub fn stream_chunks(
     grid.unmount_chunk(cc);
   }
   if generated > 0 || unloaded > 0 {
-    bevy::log::debug!("STREAM[gen {generated} unload {unloaded} chunks {}]", grid.chunk_count());
+    bevy::log::debug!(
+      "STREAM[gen {generated}(req {gen_req}) unload {unloaded} chunks {}]",
+      grid.chunk_count()
+    );
   }
 }
 
@@ -340,6 +350,57 @@ pub fn build_region(grid: &mut VolumeGrid, lo: IVec3, hi: IVec3, pbr_ids: &[Stri
   covered
 }
 
+/// 本帧该生成哪些 chunk（[`stream_chunks`] 第 ① 步的策略，抽成纯函数以便单测）：
+/// **请求优先**（票数多的先，M4 切片 2），再用半径补块（近的先），合计 ≤ `per_frame`。
+///
+/// 两级过滤，两边都要过：
+/// - **窗口内**：窗口是 `b_struct` 索引区的定义域，窗口外生成出来也装不上 GPU；
+/// - **卸载半径内**：超出就轮到 [`stream_chunks`] 第 ② 步回收 —— 生成出来只活一帧，白付一次生成 + 上传。
+///
+/// 返回 `(本帧的 chunk 列表, 其中来自请求的条数)`；`mounted` 回答"这个 chunk 已经在了吗"。
+fn plan_generation(
+  center: IVec3,
+  w_origin: IVec3,
+  w_dims: IVec3,
+  radius: i32,
+  unload_radius: i32,
+  per_frame: usize,
+  requests: &[(u32, IVec3)],
+  mounted: impl Fn(IVec3) -> bool,
+) -> (Vec<IVec3>, usize) {
+  let in_window = |c: IVec3| {
+    let t = c - w_origin;
+    t.cmpge(IVec3::ZERO).all() && t.cmplt(w_dims).all()
+  };
+  let mut picked: Vec<IVec3> = Vec::with_capacity(per_frame);
+  let mut requested: Vec<(u32, IVec3)> = requests
+    .iter()
+    .copied()
+    .filter(|(_, c)| in_window(*c) && (*c - center).abs().max_element() <= unload_radius)
+    .collect();
+  requested.sort_unstable_by_key(|(votes, c)| (std::cmp::Reverse(*votes), c.x, c.y, c.z));
+  picked.extend(
+    requested.into_iter().filter(|(_, c)| !mounted(*c)).take(per_frame).map(|(_, c)| c),
+  );
+  let from_req = picked.len();
+  if picked.len() < per_frame {
+    let mut todo: Vec<(i32, IVec3)> = Vec::new();
+    for dx in -radius..=radius {
+      for dy in -radius..=radius {
+        for dz in -radius..=radius {
+          let c = center + IVec3::new(dx, dy, dz);
+          if in_window(c) && !mounted(c) && !picked.contains(&c) {
+            todo.push((dx.abs().max(dy.abs()).max(dz.abs()), c));
+          }
+        }
+      }
+    }
+    todo.sort_unstable_by_key(|(d, c)| (*d, c.x, c.y, c.z));
+    picked.extend(todo.into_iter().take(per_frame - picked.len()).map(|(_, c)| c));
+  }
+  (picked, from_req)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -361,6 +422,39 @@ mod tests {
 
   fn solid(g: &VolumeGrid, p: IVec3) -> bool {
     g.get_voxel(VoxelCoord::new(p.x, p.y, p.z)).is_some()
+  }
+
+  /// M4 切片 2：**请求优先于半径补块**（票数多的先），而窗口外 / 卸载半径外 / 已挂载的请求一律丢；
+  /// 没有请求时逐字退回"半径 + 近的先"（= 开关关掉时的行为）。
+  #[test]
+  fn requests_outrank_radius_fill() {
+    use std::collections::HashSet;
+    let (center, origin, dims) = (IVec3::ZERO, IVec3::splat(-8), IVec3::splat(16));
+    let mounted: HashSet<IVec3> = [IVec3::new(1, 0, 0)].into_iter().collect();
+    let is_mounted = |c: IVec3| mounted.contains(&c);
+    // 票数最高的三条分别撞在"卸载半径外 / 窗口外 / 已挂载"上 —— 三种都必须丢
+    let reqs = [
+      (99u32, IVec3::new(5, 0, 0)),
+      (98, IVec3::new(9, 0, 0)),
+      (97, IVec3::new(1, 0, 0)),
+      (9, IVec3::new(2, 0, 0)),
+      (5, IVec3::new(3, 0, 0)),
+    ];
+    // 帧额 2 全给请求：票数多的在前
+    let (batch, from_req) = plan_generation(center, origin, dims, 1, 3, 2, &reqs, is_mounted);
+    assert_eq!(batch, vec![IVec3::new(2, 0, 0), IVec3::new(3, 0, 0)]);
+    assert_eq!(from_req, 2);
+    // 帧额 4：请求先占 2（都在半径外），剩下两条按半径近的先 —— 先是中心，再是 (-1,-1,-1)
+    let (batch, from_req) = plan_generation(center, origin, dims, 1, 3, 4, &reqs, is_mounted);
+    assert_eq!(from_req, 2);
+    assert_eq!(
+      batch,
+      vec![IVec3::new(2, 0, 0), IVec3::new(3, 0, 0), IVec3::ZERO, IVec3::new(-1, -1, -1)]
+    );
+    // 无请求（开关关掉）⇒ 逐字退回半径启发式
+    let (batch, from_req) = plan_generation(center, origin, dims, 1, 3, 3, &[], is_mounted);
+    assert_eq!(from_req, 0);
+    assert_eq!(batch, vec![IVec3::ZERO, IVec3::new(-1, -1, -1), IVec3::new(-1, -1, 0)]);
   }
 
   /// 规则 1/2：棱上有柱体，离开棱（且不在 cube 内）留空。
