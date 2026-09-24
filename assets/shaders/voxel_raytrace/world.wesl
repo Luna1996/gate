@@ -101,6 +101,14 @@ fn world_solid(g: Grid, voxel: vec3<i32>) -> bool {
   return sample_brickmap(g, voxel) != 0u;
 }
 
+/// 相机所在体素（主世界，整数格 = `floor` 相机位置）的 palette 条目；0 = 相机在空气里。
+/// WHY: 未做相机碰撞检测 ⇒ 相机可以陷在实心体素内部。那时主射线在 t≈0 命中相机自己所在的体素，
+/// 全屏像素共享同一个面键（画面退化成几块平色），而 GI / 玻璃状态机仍在按这个假面运行。
+/// 该状态没有正确的着色可言 ⇒ `dda_main` 与 `gi_main` 都用本判据整屏早退（唯一判据，不分叉）。
+fn camera_solid_pal(origin_voxel: vec3<f32>) -> u32 {
+  return sample_brickmap(make_grid(0u), vec3<i32>(floor(origin_voxel)));
+}
+
 /// 世界求交配置：`t_min` = 起点沿 dir 跳过的距离；`depth_cap` = 树深度上限（3 = 全深度，不限）。
 struct WorldRayQuery {
   t_min: f32,
@@ -123,6 +131,11 @@ struct WorldHit {
   voxel: vec3<i32>,     // grid 局部命中体素
   obj_id: i32,          // -1 = 主世界，>=0 = 物体
   palette_base: u32,    // 命中 volume 的 palette 基址
+}
+
+/// 未命中（天空 / 早退）的 `WorldHit`：唯一构造点，字段顺序只在这里与结构体同步。
+fn world_miss() -> WorldHit {
+  return WorldHit(false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), -1, 0u);
 }
 
 /// 世界求交唯一入口；g0 = 主世界网格（`make_grid(0u)`），在其上追加逐物体网格。

@@ -90,6 +90,12 @@ fn srgb_word_to_linear(w: u32) -> vec3<f32> {
   return srgb_to_linear(srgb);
 }
 
+/// palette 条目的 rgb（linear），供不走着色链的平色输出使用（相机陷在实心体素内的异常态）。
+/// PBR 变体下 word0 的 rgb 是标量回退 albedo（布局同 `MaterialAsset::albedo_rough`）⇒ 两变体同一条读法。
+fn palette_rgb_linear(palette_base: u32, pal: u32) -> vec3<f32> {
+  return srgb_word_to_linear(b_palette[palette_base + pal * 2u]);
+}
+
 /// palette 条目的 flags 字节（word1 bit16..23，`flags << 16` 同布局）。
 /// 变体位与介质位都从这里读，与 transmission 同在 word1 ⇒ DDA 内读它不额外 load 一个字
 /// （`medium_of` 逐体素调用，成本敏感）。位的权威定义在 `gate_voxel::PaletteFlags`。

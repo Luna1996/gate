@@ -1,5 +1,5 @@
 import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
-import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, sky_rgb, srgb_to_linear};
+import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_of, face_slot_of_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
@@ -7,7 +7,7 @@ import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::trace::{make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
-import package::world::{WorldHit, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_raycast, world_trace_medium};
+import package::world::{WorldHit, camera_solid_pal, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_miss, world_raycast, world_trace_medium};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
 // 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`view.rs::get_voxel`、`wire.rs::encode_slot` 一致。
@@ -774,6 +774,17 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
 
+  // WHY: 相机陷在实心体素内部时（未做相机碰撞检测）主射线在 t≈0 命中相机自己所在的体素，
+  // 整屏像素共享同一个面键 ⇒ 画面是几块平色，而且整条 GI / 玻璃状态机 / 阴影仍在按这个假面运行。
+  // 该状态没有"正确的着色"可言 ⇒ 整屏直接输出该体素的本色并早退，其余产物（含光柱）一律不消费。
+  // 输出经 `write_output`（曝光 + sRGB 编码）⇒ 与其余路径同一收尾。
+  let cam_g = make_grid(0u);
+  let cam_pal = camera_solid_pal(view_u.cam_pos_voxel.xyz);
+  if (cam_pal != 0u) {
+    write_output(coord0, palette_rgb_linear(cam_g.palette_base, cam_pal));
+    return;
+  }
+
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
   let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
   let near_ndc = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
@@ -1030,6 +1041,14 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let frustum_length = length(diff_world);
   let dir_voxel = normalize(diff_world);
   let origin_voxel = view_u.cam_pos_voxel.xyz;
+
+  // WHY: 相机陷在实心体素内部（同 `dda_main`）⇒ 整屏按"无 GI 数据"处理：走 `gi_ss_main` 的 miss
+  // 分支（写 valid = 0、清 reservoir、清降噪导引），**不发射任何 GI 射线**。复用这条既有分支而不是
+  // 自建早退的收益：离开该体素的那一帧从零重建（M = 1、无历史），异常态的累积不会带进正常画面。
+  if (camera_solid_pal(origin_voxel) != 0u) {
+    gi_ss_main(coord, size, world_miss());
+    return;
+  }
 
   // beam 纹理 = 全分辨率 / BEAM_DIV；本 pass 网格 = 全分辨率 / gi_div ⇒ 下标除 (BEAM_DIV / gi_div)。
   // gi_div = 1 → 除 BEAM_DIV；gi_div = 2 → 除 BEAM_DIV/2；gi_div = 4 → 1:1（一个 GI 像素正好一个 beam 纹素）。
