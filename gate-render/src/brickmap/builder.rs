@@ -15,7 +15,7 @@ use super::wire::{
   TREE_BASE,
 };
 
-/// 稠密 chunk 窗口线性位置（stride = CHUNK_INDEX_CAP，与 view.rs 同构）；窗口外 None
+/// 稠密 chunk 窗口线性位置（stride = CHUNK_INDEX_CAP，与 WGSL `trace.wesl` 的窗口寻址同构）；窗口外 None
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   let rel = chunk - origin;
   if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dims).any() {

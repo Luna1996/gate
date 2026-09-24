@@ -10,7 +10,7 @@ import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass
 import package::world::{WorldHit, camera_solid_pal, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_miss, world_raycast, world_trace_medium};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
-// 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`view.rs::get_voxel`、`wire.rs::encode_slot` 一致。
+// 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`brickmap::raytrace`、`wire.rs::encode_slot` 一致。
 
 // beam 预 pass：全分辨率 / BEAM_DIV 的低分辨率保守 trace，输出每像素最近命中 t。
 // 只行进到 min(t_cap, 0.35/(BEAM_DIV·px_ang))；miss 存该上限（非 t_cap）。

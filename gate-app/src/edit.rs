@@ -1,5 +1,6 @@
 //! 体素编辑：幽灵模式下左键放置 / 右键擦除，笔触 = 形状（球/立方）× 大小（voxel）× 材质。
-//! 目标选取：光标 → 世界射线（`crate::camera::cursor_ray`）→ 主世界体素 DDA（`raycast_main`）；
+//! 目标选取：准星/光标 → 世界射线（`crate::camera::cursor_ray`）→ 统一 CPU 射线入口
+//! `gate_render::raycast`（层次栈式 mask DDA，见 `brickmap::raytrace`）；
 //! 放置落点 = 命中面外侧一格（擦除取命中格自身），写经 `set_voxel` → `mark_data(chunk)` 驱动增量上传。
 //!
 //! **MT8-5 的笔触接线（本文件）**：落笔时按**笔触材质的资产**判断要不要位移 ——
@@ -13,10 +14,10 @@
 use std::time::Instant;
 
 use bevy::prelude::*;
-use glam::{IVec3, Vec3};
+use glam::IVec3;
 
 use gate_render::brickmap::wire::pack_palette_entry;
-use gate_render::{DdaCameraConfig, PbrTextureSet, VoxelScene};
+use gate_render::{DdaCameraConfig, PbrTextureSet, VoxelScene, raycast};
 use gate_voxel::{
   BRICK_FACTOR, BrickState, Displace, FillStats, LEVEL_EXTENT, PALETTE_INDEX_MAX, PaletteEntry,
   PaletteFlags, PaletteId, PbrOverrides, VolumeGrid, VoxelCoord, fill_box_displaced,
@@ -242,55 +243,6 @@ fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   };
   grid.palette_mut().set(slot, mat.entry());
   slot
-}
-
-/// 世界空间射线 × 体素的 Amanatides-Woo 步进。返回 `(命中体素, 入面法线, 命中 t)`；
-/// 法线指向射线来向（朝外），故 `命中体素 + 法线` 即前方那格空气。`dir` 分量可为 0（该轴不被选中）；仅主世界。
-pub fn raycast_main(
-  grid: &VolumeGrid,
-  origin: Vec3,
-  dir: Vec3,
-  max_dist: f32,
-) -> Option<(IVec3, IVec3, f32)> {
-  let mut v = IVec3::new(origin.x.floor() as i32, origin.y.floor() as i32, origin.z.floor() as i32);
-  let step = IVec3::new(
-    if dir.x >= 0.0 { 1 } else { -1 },
-    if dir.y >= 0.0 { 1 } else { -1 },
-    if dir.z >= 0.0 { 1 } else { -1 },
-  );
-  let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
-  // 到下一个边界轴的参数距离，以及每跨一格的增量
-  let mut t_max = Vec3::new(
-    ((v.x + if step.x > 0 { 1 } else { 0 }) as f32 - origin.x) * inv.x,
-    ((v.y + if step.y > 0 { 1 } else { 0 }) as f32 - origin.y) * inv.y,
-    ((v.z + if step.z > 0 { 1 } else { 0 }) as f32 - origin.z) * inv.z,
-  );
-  let t_delta = Vec3::new(inv.x.abs(), inv.y.abs(), inv.z.abs());
-  let mut face = IVec3::ZERO; // 起点格的入面无定义（相机嵌在固体里）→ 零向量
-  let mut t = 0.0f32;
-  // 步数上限：三轴各走 max_dist 格的上界，防退化射线空转
-  let max_steps = (3.0 * max_dist) as u32 + 3;
-  for _ in 0..max_steps {
-    if !grid.get_voxel(VoxelCoord::from_ivec3(v)).unwrap_or(PaletteId::AIR).is_air() {
-      return Some((v, face, t));
-    }
-    let axis = if t_max.x <= t_max.y && t_max.x <= t_max.z {
-      0
-    } else if t_max.y <= t_max.z {
-      1
-    } else {
-      2
-    };
-    t = t_max[axis];
-    if t > max_dist {
-      return None;
-    }
-    v[axis] += step[axis];
-    t_max[axis] += t_delta[axis];
-    face = IVec3::ZERO;
-    face[axis] = -step[axis]; // 入面朝来向：+x 步进 → 入面法线 -x
-  }
-  None
 }
 
 /// 单格是否落在笔触区域内（`d` = 该格相对中心的有符号偏移）。
@@ -622,10 +574,15 @@ pub(crate) fn voxel_edit_input(
     return;
   };
   let (shape, size) = (settings.shape, settings.size);
-  let grid = scene.volumes.main_mut();
-  let Some((hit, face, _t)) = raycast_main(grid, origin, dir, EDIT_REACH) else {
+  // 笔触只写主世界 ⇒ 物体命中不落笔（物体的命中 voxel 是它自己的局部系）
+  let Some(hit) = raycast(&scene.volumes, origin, dir, EDIT_REACH) else {
     return;
   };
+  if hit.obj_id != -1 {
+    return;
+  }
+  let (hit, face) = (hit.voxel, hit.face);
+  let grid = scene.volumes.main_mut();
   // 笔触几何中心 = 命中体素沿**入面法线**偏移 `round(offset)` 格（见 `EditSettings::offset`）：
   // 放置往**外**推、摧毁往**内**挖 —— 同一个值取反方向。中心必须是整数体素格 ⇒ 四舍五入。
   let off = settings.offset.max(0.0).round() as i32;
@@ -687,11 +644,15 @@ pub(crate) fn edit_selftest(
     return;
   }
   let (shape, size) = (settings.shape, settings.size);
-  let grid = scene.volumes.main_mut();
-  let Some((hit, face, t)) = raycast_main(grid, orbit.eye(), dir, EDIT_REACH) else {
-    bevy::log::warn!("EDIT SELFTEST: 射线未命中（{EDIT_REACH} 内无体素）→ 跳过");
+  let Some(hit) = raycast(&scene.volumes, orbit.eye(), dir, EDIT_REACH) else {
+    bevy::log::warn!("EDIT SELFTEST: 射线未命中体素 → 跳过");
     return;
   };
+  if hit.obj_id != -1 {
+    return;
+  }
+  let (hit, face, t) = (hit.voxel, hit.face, hit.t);
+  let grid = scene.volumes.main_mut();
   let slot = material_slot(grid, settings.mat);
   // 与 `voxel_edit_input` 的**放置路径同一条中心公式**（偏移四舍五入到格，见 `EditSettings::offset`）
   let center = hit + face * settings.offset.max(0.0).round() as i32;

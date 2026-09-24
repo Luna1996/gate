@@ -9,12 +9,8 @@ use bevy::{
 };
 use serde::{Deserialize, Serialize};
 
-use gate_render::{
-  BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, OrbitCamera, VIEW_SIZE, VoxelScene,
-  cpu_reference_trace_volumes,
-};
+use gate_render::{DdaCameraConfig, OrbitCamera, VIEW_SIZE, VoxelScene, raycast};
 use gate_ui::widgets::px;
-use gate_voxel::VolumeTransform;
 
 use crate::consts::{
   CAM_FAR, CAM_NEAR, CROSSHAIR_ARM, CROSSHAIR_GAP, CROSSHAIR_THICK, FLY_SPEED_DEFAULT,
@@ -406,7 +402,8 @@ pub(crate) fn cursor_ray(
 }
 
 /// 左键拾取 recenter（仅 Orbit 模式）：射线命中体素表面 → 轨道 target 移到命中点（沿入面
-/// 法线推进半个 voxel）；未命中 / UI 捕获 / Fly 模式不做操作。CPU picking 走 `cpu_reference_trace_volumes`。
+/// 法线推进半个 voxel）；未命中 / UI 捕获 / Fly 模式不做操作。CPU picking 走 `raycast`
+/// （直接查权威 `VolumeGrid`，不必先序列化 brickmap）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn left_click_pick_recenter(
   mouse: Res<ButtonInput<MouseButton>>,
@@ -436,14 +433,8 @@ pub(crate) fn left_click_pick_recenter(
   let Some((origin, dir)) = cursor_ray(window, &cfg, false) else {
     return;
   };
-  let t_max = CAM_FAR - CAM_NEAR;
-  // CPU picking：点击时同步 build_full 各 volume 的 brickmap 再 trace（不做跨帧缓存）。
-  let per_vol_bufs: Vec<BrickMapBuffers> =
-    scene.volumes.list.iter().map(|v| BrickMapBuilder::build_full(v).buffers().clone()).collect();
-  let vols_with_tr: Vec<(&BrickMapBuffers, VolumeTransform)> =
-    per_vol_bufs.iter().zip(scene.volumes.list.iter().map(|v| v.transform)).collect();
   // 主世界 + 物体统一求最近
-  if let Some(hit) = cpu_reference_trace_volumes(&vols_with_tr, origin, dir, t_max) {
+  if let Some(hit) = raycast(&scene.volumes, origin, dir, CAM_FAR - CAM_NEAR) {
     let mut p = origin + dir * hit.t;
     let half = 0.5;
     p += hit.normal * half; // 沿入面法线推进命中体素内 0.5 voxel

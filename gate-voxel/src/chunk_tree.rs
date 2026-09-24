@@ -51,6 +51,15 @@ pub enum BrickState {
   Mixed,
 }
 
+/// brick 节点描述：64bit 子块分裂掩码 + uniform 子块色。
+/// 语义 = GPU `b_struct` 节点前两字段（`mask_lo/mask_hi` + palette 低 16 位）：
+/// `mask` bit=1 的子块有独立节点，bit=0 的子块与该节点同色 = `palette`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeDesc {
+  pub mask: u64,
+  pub palette: PaletteId,
+}
+
 /// palette → brick 三态（palette 0 = AIR）
 #[inline]
 fn brick_state_of(palette: PaletteId) -> BrickState {
@@ -290,6 +299,52 @@ impl ChunkTree {
       return brick_state_of(self.root_palette);
     }
     self.brick_state_at(local_x, local_y, local_z, query_extent, Some(0), CHUNK_SIZE)
+  }
+
+  /// 体素 `(x,y,z)` 所在的 `LEVEL_EXTENT[level]` 粒度 brick 的节点描述（见 [`NodeDesc`]）：
+  /// level 0 = 256³（chunk 根，子块 64³）… 3 = 4³（子块 = 1³ 体素，即 DDA 的最内层）。
+  /// 更粗的祖先已是 uniform / 该子块在更粗层就 uniform → `mask = 0` 且 `palette` = 那一层的色。
+  /// 遍历侧按「节点掩码常驻」用：同一节点内跨 4³ 子块步进不必重查。
+  pub fn node_desc(&self, local_x: i32, local_y: i32, local_z: i32, level: u8) -> NodeDesc {
+    // 下钻全程用**节点内**坐标（与 `get_at` 同一手法）：每层减去该 4³ 子块的偏移
+    let (mut x, mut y, mut z) = (local_x, local_y, local_z);
+    let mut idx = if self.nodes.is_empty() { None } else { Some(0usize) };
+    let mut extent = CHUNK_SIZE;
+    // 从根下钻到目标层：LEVEL_EXTENT 下标 0(256³) → level
+    for _ in 0..level.min(3) {
+      let (mask, palette) = match idx {
+        Some(i) => match &self.nodes[i] {
+          Node::Uniform(p) => return NodeDesc { mask: 0, palette: *p },
+          Node::Split { mask, palette, .. } => (*mask, *palette),
+        },
+        None => return NodeDesc { mask: 0, palette: self.root_palette },
+      };
+      let child_extent = extent / BRICK_FACTOR;
+      let (cx, cy, cz) = (
+        (x / child_extent).clamp(0, BRICK_FACTOR - 1),
+        (y / child_extent).clamp(0, BRICK_FACTOR - 1),
+        (z / child_extent).clamp(0, BRICK_FACTOR - 1),
+      );
+      let cell = child_linear_idx(cx, cy, cz);
+      if (mask & (1u64 << cell)) == 0 {
+        return NodeDesc { mask: 0, palette };
+      }
+      idx = match &self.nodes[idx.unwrap()] {
+        Node::Split { children, .. } => Some(children[child_slot(mask, cell) as usize] as usize),
+        _ => unreachable!(),
+      };
+      x -= cx * child_extent;
+      y -= cy * child_extent;
+      z -= cz * child_extent;
+      extent = child_extent;
+    }
+    match idx {
+      Some(i) => match &self.nodes[i] {
+        Node::Uniform(p) => NodeDesc { mask: 0, palette: *p },
+        Node::Split { mask, palette, .. } => NodeDesc { mask: *mask, palette: *palette },
+      },
+      None => NodeDesc { mask: 0, palette: self.root_palette },
+    }
   }
 
   fn brick_state_at(

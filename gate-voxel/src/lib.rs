@@ -14,7 +14,7 @@ pub use coords::{
   child_linear_idx,
 };
 
-pub use chunk_tree::{BrickState, ChunkTree, LEAF_INLINE_WORDS, LEAF_VOXELS_PER_WORD};
+pub use chunk_tree::{BrickState, ChunkTree, LEAF_INLINE_WORDS, LEAF_VOXELS_PER_WORD, NodeDesc};
 
 pub use dirty::DirtyTracker;
 

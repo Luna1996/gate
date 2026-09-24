@@ -46,7 +46,7 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 | **多 volume** | ✅ 生产可用 | `Volumes`：`list[0]` = 主世界（`obj_id = -1`），`add_object` 注册物体（`VolumeTransform { pos, rot, scale }`）；同一 dirty → builder → upload 路径；GPU 侧为统一 `GridDesc` 数组（144B/条），shader `trace_scene` 无分支遍历 |
 | **组件层 / 状态表** | ✅ 数据通路可用 | `comp_layer`：每 chunk 4096 个 16³ 组件 ID（u16）；`StateTable`：256 条 × 4×u32；随 dirty 双通道（data / comp）分别上传。**尚无逐帧模拟驱动**（仅 demo 场景写测试值） |
 | **GPU 上传** | ✅ 生产可用 | `b_struct`（64³ 稠密 chunk 窗口 + 各 chunk DFS 序列化树）+ `b_palette`（512KB/volume）+ `globals`；脏区增量部分写（struct 字区间 + palette 槽区间）；扩容 `ensure_with_copy`（GPU-GPU 前缀拷贝）；backlog > 3× 预算时一次性刷新，避免逐帧阻塞 Prepare；日志 `UPLOAD[full\|incremental]` |
-| **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass；局部 AABB slab 剔除 |
+| **DDA 光追** | ✅ 生产可用 | WESL 包（`assets/shaders/voxel_raytrace/`）启动时读盘编译；层次栈式 mask DDA（节点掩码常驻寄存器，4³ 子块间步进零 load；`firstTrailingBit` 跨级跳）；方向可达掩码 LUT（Douglas #18 Bitwise Masking）辅助剔除；beam 低分辨率最近命中断面预 pass（GPU 专属）；局部 AABB slab 剔除。CPU 侧同一套（`brickmap/raytrace.rs::raycast`，无 beam）供拾取 / 编辑落笔 |
 | **GI（屏幕空间 ReSTIR）** | ✅ 生产可用 | 逐像素一个 reservoir（每 GI 像素 `GI_RES_WORDS` 个 word × 2 块 ping-pong），`gi_main` 一次派发完成「新鲜候选（4 条余弦；「高」档 8 条；去遮挡再翻倍）→ 时域复用 → 空间复用 → 着色」。复用判据 = **同一个面**（平面归属靠面键，相似度靠**着色法线** `dot ≥ GI_DEN_N_DOT`）⇒ 薄板/墙缝不漏光，而凸棱上被梯度法线平均过的那一段仍与相邻同面体素连成一片。**空间复用零射线**（8 tap 只并上一帧邻居的累计量），且**只作用在本帧估计、不回写时域历史**。辐亮度 = 单次弹射（命中面按「太阳直射 + 天光」着色后除 π，miss 取天光）⇒ 输入只依赖几何与光照、逐帧确定，第 1 帧即稳态。降噪 = 时域累积（输入在「面不跨 texel」时取**同一面邻域均值**做预平均 + 方差驱动历史权重 + 累积矩给出的平滑噪声尺度 + AABB 钳制 + 离群抑制，上限 96 帧）→ 5 轮 atrous（同面键满权重、其他走法线点积 × 亮度权重）；回全分辨率用**几何感知上采样**。菜单「渲染/ReSTIR GI」开关 + 分辨率档（1/1、1/2、1/4；每档都跑 GI，只是网格疏密不同）+「降噪质量」档（关/低/中/高，**与分辨率档正交**：关 = 一条降噪 pass 都不跑、直接采样原始 GI；低 = 时域 + 5 轮 3×3；中 = atrous 换 5×5；高 = 再把每像素候选数翻倍即 GI 射线翻倍 + 记忆窗 20→32 帧）。此外：**① 逐面合并**（同一个可见体素面的全部 texel 的候选是**同一个积分**的 i.i.d. 样本 ⇒ `gi_main` 定点累加、`gi_face_flatten` 在**降噪之前**把整面换成均值，方差 ÷ texel 数）；**② 二次顶点缓存跨帧持久**（槽里的键带 epoch 掩码：几何 / 太阳 / 天光任一变化即整表自失效 ⇒ 不再每帧 `clear_buffer`）；**④ 二次弹射**（菜单「光照/二次弹射」：二次顶点再加一跳的间接光，稀疏档按 `1/4` 概率带上并乘 `4` 补齐期望 ⇒ 无偏）。 |
 | **材质与介质** | ✅ 生产可用 | `PaletteEntry { color, roughness, emissive, transmission }`；`transmission > 0` 走玻璃状态机（折射/透射 + 太阳透射率，`trace_glass`）；表面法线与命中体素由整数 DDA 精确产出（禁「命中点 ± 半法线」启发式重建） |
 | **自动曝光** | ✅ 生产可用 | UE EyeAdaptation 式：1/16 抽样 → 64 桶 log2 亮度直方图 → 5%~95% 百分位均值 → 分方向时间平滑（变亮/变暗常数分开）；菜单「渲染/曝光」可调 EV± / tau / key |
@@ -102,7 +102,11 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 2. **方向可达掩码 LUT（b_leaves，Douglas #18）**：8 octant × 64 入口格 × 2 字的保守可达集，
    `occupancy & reach` 在进入子块前剔除；LUT 是真实可达集的**超集**，绝不漏命中。
 3. **beam 预 pass**：1/4 分辨率先求「最近命中 t」，主 pass 从该 t 起步 —— 近场空空间不产生步进。
-4. **屏幕空间 ReSTIR GI**：逐像素一个 reservoir，每帧「新鲜候选 → 时域复用 → 空间复用 → 着色」，
+   （只对 GPU 有意义：CPU 一次只有一根射线，没东西可共享 ⇒ CPU 侧没有这一项）
+4. **CPU 侧同一套（`raytrace.rs::raycast`）**：拾取 / 体素编辑落笔走的唯一射线入口 = 上面第 1、2 条
+   加 AABB slab 剔除与 chunk 间 256³ A&W，**无 beam**；数据源是权威 `VolumeGrid`，
+   不先序列化 brickmap（castle.vox 的 87MB 树 `build_full` ≈ 1.7s，每次点击付不起）。
+5. **屏幕空间 ReSTIR GI**：逐像素一个 reservoir，每帧「新鲜候选 → 时域复用 → 空间复用 → 着色」，
    再走降噪：**SVGF 家族**（时域累积：方差驱动历史权重 + 累积矩 + AABB 钳制、上限 32 帧）→
    5 轮迭代 atrous（步长 1/2/4/8/16）。NRD / RELAX / FidelityFX 的处方已对标闭环：
    离群抑制并进时域 pass（`mean ± K·σ`）；**history-fix** = `GI_HIST_SEARCH_TAPS`（落点不接受时
@@ -127,8 +131,8 @@ cargo clippy --release --workspace --all-targets -- -D warnings
    没有「收敛」这件事，也没有相机运动相关的延迟。代价是丢掉二次以上的弹射。
    GI 回全分辨率时用**几何感知上采样**（joint bilateral：只接受与命中面同一个面的
    GI texel）⇒ 棱边 / 墙角不渗色（纯双线性会混边界两侧）。
-5. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
-6. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
+6. **脏区增量上传**：struct 字区间 + palette 槽区间局部写；全量路径只在首帧 / 换世界 / 树基址漂移时触发。
+7. **半分辨率 + FXAA**：渲染内部分辨率 = 窗口物理像素 ÷ factor（菜单「视频/半分辨率」），blit 线性上采样；
    关掉 FXAA 时只是换一条 fragment 入口，无分支代价。
 
 ---
@@ -151,13 +155,14 @@ gate-render/       渲染与 wire 契约（CPU 侧；GPU 状态全部在 render 
                    - brickmap/
                        wire.rs     字节契约：常量、pack_palette_entry、BrickMapGlobals、GridDesc(144B)、
                                    方向可达掩码 LUT、BrickMapBuffers（b_struct/b_palette/globals）
-                       view.rs     BrickMapView 纯读端寻址链（get_voxel / cell_occupied / chunk_base）
+                       raytrace.rs CPU 侧**唯一**射线求交入口 raycast（层次栈式 mask DDA /
+                                   firstTrailingBit 跨级跳 / 方向可达 LUT / AABB slab / chunk 间 A&W；
+                                   跑权威 VolumeGrid，无 beam）
                        builder.rs  BrickMapBuilder（单 volume）/ VolumesBuilder（多 volume）+
                                    DirtyRanges（struct 字区间 + palette 槽区间）+ snapshot（自动降级全量）
                        upload.rs   poll_pending / extract / prepare / init_empty_gpu；ensure_with_copy 扩容；
                                    UPLOAD[full|incremental] 日志；VolumePlugin
-                       dda.rs      全部 CPU DDA 参考实现（brute / AABB-skip / 两级 cell / 层次栈式 /
-                                   多 volume trace）、OrbitCamera / DdaCameraConfig、RenderScale /
+                       dda.rs      GPU 侧 DDA pass：OrbitCamera / DdaCameraConfig、RenderScale /
                                    PostFxSettings / EyeAdaptSettings、全部 BG layout + pipeline +
                                    prepare_dda_bind_groups / dispatch_dda / blit_dda_view
                    - gi.rs          GI（GiUniform / GiSettings / GiGpu / BG4·BG5 布局 /
@@ -190,7 +195,7 @@ gate-app/          Demo 应用入口
                    - main.rs       插件装配、窗口/日志/i18n 初始化、系统注册、环境变量开关
                    - scene.rs      setup + 程序化极限场景 build_demo_scene + reload_world 换世界
                    - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / MouseLock + 准星 / cursor_ray / 拾取 recenter
-                   - edit.rs       EditSettings + BrushShape/BrushMaterial + raycast_main + 笔触施加与输入
+                   - edit.rs       EditSettings + BrushShape/BrushMaterial + 笔触施加与输入（射线走 raycast）
                    - vox_scene.rs  MagicaVoxel .vox 导入（vox-rs）+ scan_vox_models 模型发现
                    - debug_menu.rs 菜单结构/缺省值加载 + 配置值合并 + 状态应用 + FPS 覆盖层 + 相机信息 + F3 开关
                    - config.rs     <安装根>/data/config.toml 读写（菜单窗口/控件值 + 相机姿态）+ 退出落盘

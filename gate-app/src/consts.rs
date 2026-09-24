@@ -39,8 +39,9 @@ pub const CROSSHAIR_GAP: f32 = 3.0;
 
 /// 笔触尺寸下限（体素）
 pub const EDIT_SIZE_MIN: u32 = 1;
-/// 编辑射线射程（体素）
-pub const EDIT_REACH: f32 = 256.0;
+/// 编辑射线射程（体素）：无界（`∞`）⇒ 只要射线能打到就有笔触。
+/// 实际步进由 `gate_render::raycast` 截在各 volume 的占用窗口 AABB 内（世界之外恒为空气），故不会空转。
+pub const EDIT_REACH: f32 = f32::INFINITY;
 
 /// 显示用换算：1 米 = 多少体素
 pub const VOXEL_PER_METER: f32 = 50.0;
