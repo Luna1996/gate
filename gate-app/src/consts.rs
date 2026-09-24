@@ -21,7 +21,7 @@ pub const FOV_Y: f32 = 60.0_f32.to_radians();
 pub const CAM_NEAR: f32 = 1.0;
 /// 远裁剪面（voxel）
 pub const CAM_FAR: f32 = 65536.0;
-/// 右键拖拽转向灵敏度（弧度/像素）
+/// 右键拖拽转向灵敏度（弧度/像素）；自由模式锁定后的鼠标转头用同一个值
 pub const ROT_SPEED: f32 = 0.005;
 /// 滚轮缩放速率（对数档/格）
 pub const ZOOM_LOG_SPEED: f32 = 0.35;
@@ -30,12 +30,17 @@ pub const FLY_SPEED_DEFAULT: f32 = 128.0;
 /// 飞行相机加速档倍率
 pub const FLY_SPEED_FAST_MUL: f32 = 2.0;
 
+/// 准星：每条臂的长度（像素，自中心缺口外缘起算）
+pub const CROSSHAIR_ARM: f32 = 8.0;
+/// 准星：线宽（像素）
+pub const CROSSHAIR_THICK: f32 = 1.0;
+/// 准星：中心缺口半径（像素，缺口内不画）
+pub const CROSSHAIR_GAP: f32 = 3.0;
+
 /// 笔触尺寸下限（体素）
 pub const EDIT_SIZE_MIN: u32 = 1;
 /// 编辑射线射程（体素）
 pub const EDIT_REACH: f32 = 256.0;
-/// 左键点击与拖拽转向的判定阈值（像素）
-pub const DRAG_PX: f32 = 4.0;
 
 /// 显示用换算：1 米 = 多少体素
 pub const VOXEL_PER_METER: f32 = 50.0;

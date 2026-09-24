@@ -1,10 +1,11 @@
-//! 相机与输入：两种相机模式（轨道 / 幽灵飞行）、左键拾取 recenter。
+//! 相机与输入：两种相机模式（轨道 / 幽灵飞行）、左键拾取 recenter、自由模式的鼠标锁定 + 准星。
 //! 模式互斥由 `CameraMode` 单点决定；`build_camera_config` 是唯一矩阵构造点。
 //! 朝向 yaw/pitch 两模式共享，切换模式时视线方向连续。
 
 use bevy::{
   input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
   prelude::*,
+  window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,10 +13,12 @@ use gate_render::{
   BrickMapBuffers, BrickMapBuilder, DdaCameraConfig, OrbitCamera, VIEW_SIZE, VoxelScene,
   cpu_reference_trace_volumes,
 };
+use gate_ui::widgets::px;
 use gate_voxel::VolumeTransform;
 
 use crate::consts::{
-  CAM_FAR, CAM_NEAR, FLY_SPEED_DEFAULT, FLY_SPEED_FAST_MUL, FOV_Y, ROT_SPEED, ZOOM_LOG_SPEED,
+  CAM_FAR, CAM_NEAR, CROSSHAIR_ARM, CROSSHAIR_GAP, CROSSHAIR_THICK, FLY_SPEED_DEFAULT,
+  FLY_SPEED_FAST_MUL, FOV_Y, ROT_SPEED, ZOOM_LOG_SPEED,
 };
 
 /// 相机模式（main world Resource）。切换的唯一入口是 DebugMenu 的「玩家/相机/相机模式」切换组。
@@ -116,16 +119,78 @@ pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>)
   orbit.clamp();
 }
 
-/// 共享转头：右键拖拽旋转 yaw/pitch，两种模式都生效（轨道 = 绕目标转，幽灵 = 原地转头）。
-/// `pitch` 已 clamp 到 ±89°，保证视线与 +Y 不共线。
+/// 轨道模式转头：右键拖拽旋转 yaw/pitch（绕目标转）。自由模式的转头走鼠标锁定（`free_look_input`），
+/// 不再吃右键拖拽。`pitch` 已 clamp 到 ±89°，保证视线与 +Y 不共线。
 pub(crate) fn camera_look_input(
   mouse: Res<ButtonInput<MouseButton>>,
   motion: Res<AccumulatedMouseMotion>,
   captured: Res<gate_ui::UiPointerCaptured>,
   intercepted: Res<gate_ui::MouseIntercepted>,
+  mode: Res<CameraMode>,
   mut orbit: ResMut<OrbitCamera>,
 ) {
-  if captured.0 || intercepted.0 || !mouse.pressed(MouseButton::Right) {
+  if *mode != CameraMode::Orbit || captured.0 || intercepted.0 || !mouse.pressed(MouseButton::Right)
+  {
+    return;
+  }
+  let delta = motion.delta;
+  orbit.yaw -= delta.x * ROT_SPEED;
+  orbit.pitch += delta.y * ROT_SPEED;
+  orbit.clamp();
+}
+
+/// 自由模式的鼠标锁定（Q 切换，`toggle_mouse_lock`）：锁定 = 隐藏系统光标、光标钉在窗口中心、
+/// 鼠标相对位移直接转头（`free_look_input`），准星落在屏幕中心（`Crosshair`）。
+/// 只在 Fly 模式生效；切到轨道模式自动解锁（`apply_mouse_lock`）。
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct MouseLock(pub bool);
+
+/// Q 切换鼠标锁定（仅 Fly 模式）：文本输入焦点在控件上时不响应，否则打字里的 q 会误切。
+pub(crate) fn toggle_mouse_lock(
+  keys: Res<ButtonInput<KeyCode>>,
+  focus: Res<gate_ui::TextInputFocus>,
+  mode: Res<CameraMode>,
+  mut lock: ResMut<MouseLock>,
+) {
+  if *mode != CameraMode::Fly || focus.0.is_some() || !keys.just_pressed(KeyCode::KeyQ) {
+    return;
+  }
+  lock.0 = !lock.0;
+  bevy::log::info!("鼠标锁定 → {}", if lock.0 { "on" } else { "off" });
+}
+
+/// 把锁定状态落到窗口光标：锁定 ⇒ `visible = false` + `grab_mode = Confined`。
+///
+/// WHY: 用 `Confined` 而非 `Locked` —— winit（Windows）对「被抓取且隐藏」的光标把裁剪矩形收成
+/// 窗口客户区中心的 1×1，光标因而钉在中心；`Locked` 则钉在**按下那一刻的位置**，UI 悬停映射
+/// （`UiPointerCaptured`）会一直停在那儿，且该位置的控件会吃掉编辑用的左右键。
+/// 隐藏 + 钉中心同时让「准星位置 = 光标位置 = 编辑射线」三者一致。转头不吃光标位置，
+/// 走设备原始位移（`AccumulatedMouseMotion`），故光标被钉住不影响转头。
+/// 只在状态翻转时写窗口（`CursorOptions` 变更会触发 bevy_winit 重新下发）。
+pub(crate) fn apply_mouse_lock(
+  lock: Res<MouseLock>,
+  mode: Res<CameraMode>,
+  mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+  let want = lock.0 && *mode == CameraMode::Fly;
+  let Ok(mut cursor) = cursor.single_mut() else { return };
+  let (visible, grab) =
+    if want { (false, CursorGrabMode::Confined) } else { (true, CursorGrabMode::None) };
+  if cursor.visible != visible || cursor.grab_mode != grab {
+    cursor.visible = visible;
+    cursor.grab_mode = grab;
+  }
+}
+
+/// 锁定模式转头（仅 Fly）：鼠标相对位移转 yaw/pitch。不做 UI 指针门控 ——
+/// 锁定即"鼠标交给相机"（光标被钉在中心，悬停判定没有意义）。
+pub(crate) fn free_look_input(
+  motion: Res<AccumulatedMouseMotion>,
+  mode: Res<CameraMode>,
+  lock: Res<MouseLock>,
+  mut orbit: ResMut<OrbitCamera>,
+) {
+  if *mode != CameraMode::Fly || !lock.0 {
     return;
   }
   let delta = motion.delta;
@@ -307,9 +372,17 @@ fn ndc_ray(cfg: &DdaCameraConfig, u: f32, v: f32) -> Option<(Vec3, Vec3)> {
   Some((cfg.position_world, dir))
 }
 
-/// 屏幕光标 → 世界射线 `(origin, dir)`。
+/// 屏幕准星 / 光标 → 世界射线 `(origin, dir)`。
+/// `locked`（自由模式鼠标锁定）时准星是屏幕中心 ⇒ 固定走中心，与光标缓存位置无关；
 /// 轨道 recenter / 幽灵编辑共用；指针不在窗口内 / 矩阵退化 → None。
-pub(crate) fn cursor_ray(window: &Window, cfg: &DdaCameraConfig) -> Option<(Vec3, Vec3)> {
+pub(crate) fn cursor_ray(
+  window: &Window,
+  cfg: &DdaCameraConfig,
+  locked: bool,
+) -> Option<(Vec3, Vec3)> {
+  if locked {
+    return ndc_ray(cfg, 0.0, 0.0);
+  }
   let cursor = window.cursor_position()?;
   let sf = window.scale_factor();
   let phys = cursor * sf; // 物理像素（左上原点，y 向下）
@@ -353,7 +426,7 @@ pub(crate) fn left_click_pick_recenter(
   let Ok(window) = windows.single() else {
     return;
   };
-  let Some((origin, dir)) = cursor_ray(window, &cfg) else {
+  let Some((origin, dir)) = cursor_ray(window, &cfg, false) else {
     return;
   };
   let t_max = CAM_FAR - CAM_NEAR;
@@ -378,5 +451,67 @@ pub(crate) fn left_click_pick_recenter(
       hit.obj_id,
     );
     // 新 target 由 build_camera_config 在本系统之后同帧重建并当帧生效
+  }
+}
+
+/// 屏幕中心准星根节点（`sync_crosshair` 控显隐）。
+#[derive(Component)]
+pub(crate) struct Crosshair;
+
+/// 准星颜色
+const CROSSHAIR_COLOR: Color = Color::WHITE;
+
+/// Startup 生成准星：绝对定位在窗口中心（50%/50%）的零尺寸节点，四条臂以此为中心排布。
+/// 全树不挂 `Pickable` ⇒ 对 UI 拾取不可见（`UiPickingSettings::require_markers`），不挡悬停与点击；
+/// UI 相机由 `scene::setup` 提供。
+pub(crate) fn spawn_crosshair(mut commands: Commands) {
+  commands
+    .spawn((
+      Name::new("crosshair"),
+      Crosshair,
+      Node {
+        position_type: PositionType::Absolute,
+        left: Val::Percent(50.0),
+        top: Val::Percent(50.0),
+        ..default()
+      },
+      Visibility::Hidden,
+    ))
+    .with_children(|p| {
+      // (dx, dy) = 臂的指向；水平臂 长×厚，垂直臂 厚×长；左/上 偏移取负，故四条臂对称
+      for (dx, dy) in [(-1.0_f32, 0.0_f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        let (w, h) = if dx == 0.0 {
+          (CROSSHAIR_THICK, CROSSHAIR_ARM)
+        } else {
+          (CROSSHAIR_ARM, CROSSHAIR_THICK)
+        };
+        let off = CROSSHAIR_GAP + CROSSHAIR_ARM / 2.0;
+        p.spawn((
+          Node {
+            position_type: PositionType::Absolute,
+            width: px(w),
+            height: px(h),
+            left: px(dx * off - w / 2.0),
+            top: px(dy * off - h / 2.0),
+            ..default()
+          },
+          BackgroundColor(CROSSHAIR_COLOR),
+        ));
+      }
+    });
+}
+
+/// 准星显隐：仅「自由模式 + 鼠标锁定」时显示（只在翻转时写 `Visibility`，避免每帧触发变更传播）。
+pub(crate) fn sync_crosshair(
+  mode: Res<CameraMode>,
+  lock: Res<MouseLock>,
+  mut crosshairs: Query<&mut Visibility, With<Crosshair>>,
+) {
+  let want =
+    if *mode == CameraMode::Fly && lock.0 { Visibility::Visible } else { Visibility::Hidden };
+  for mut vis in &mut crosshairs {
+    if *vis != want {
+      *vis = want;
+    }
   }
 }

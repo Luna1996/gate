@@ -21,14 +21,14 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 **操作（默认「幽灵飞行」模式，无碰撞）**
 
 - `WASD` 平移 / `Space` 升 / `Shift` 降 / `Ctrl` 切低高速档（缺省 128 → 256 voxel/s；低速档基础速度在菜单可调）
-- 右键拖拽 = 转头（两种相机模式共享 yaw/pitch，切换时视线连续）
-- 左键 = 放置笔触；右键**单击**（按下到释放位移 < 4px）= 擦除。形状 / 大小 / 材质在菜单「游戏/编辑」
+- `Q` 切鼠标锁定：锁定后鼠标位移 = 转头（准星在屏幕中心、系统光标隐藏，编辑射线也走准星）；解锁后鼠标自由移动但不转视角
+- 左键 = 放置笔触；右键 = 擦除。形状 / 大小 / 材质在菜单「游戏/编辑」
 - `F3` 开关左上角调试菜单；右上角 FPS 覆盖层与组件展示窗默认隐藏（菜单「视频/FPS」「界面/showcase」）
 
 **相机模式**
 
 - 默认 **Fly**（幽灵飞行）；菜单「玩家/相机/相机模式」切到 **Orbit** 后：
-  中键拖拽平移 / 滚轮对数缩放（`Shift` 细调档）/ 左键拾取重设注视点
+  中键拖拽平移 / 滚轮对数缩放（`Shift` 细调档）/ 右键拖拽转头 / 左键拾取重设注视点
 
 **菜单持久化**
 
@@ -73,7 +73,7 @@ cargo clippy --release --workspace --all-targets -- -D warnings
 [Bevy 主 world]
   Startup : scene::setup —— 读 lighting/*.ron、建 VolumeGrid（默认 vox / demo 程序化，见 consts）、
             初始化 OrbitCamera / FlyCamera / CameraMode / UploadBudget
-  Update  : 相机链（模式对齐 → 转头 → 各模式输入 → 拾取 → build_camera_config）→ 体素编辑
+  Update  : 相机链（模式对齐 → 鼠标锁定 → 转头 → 各模式输入 → 拾取 → build_camera_config）→ 体素编辑
             → 调试菜单 / 组件展示窗 / FPS 覆盖层 / 相机信息文本
   Last    : poll_pending —— UploadBudget（4MB/帧）× DirtyTracker → MainPending
       ↓ ExtractSchedule（main → render world）
@@ -189,7 +189,7 @@ gate-ui/           自研 bevy_ui 组件库 + 调试菜单 + 世界标签
 gate-app/          Demo 应用入口
                    - main.rs       插件装配、窗口/日志/i18n 初始化、系统注册、环境变量开关
                    - scene.rs      setup + 程序化极限场景 build_demo_scene + reload_world 换世界
-                   - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / cursor_ray / 拾取 recenter
+                   - camera.rs     CameraMode（Orbit|Fly）/ FlyCamera / 输入系统 / MouseLock + 准星 / cursor_ray / 拾取 recenter
                    - edit.rs       EditSettings + BrushShape/BrushMaterial + raycast_main + 笔触施加与输入
                    - vox_scene.rs  MagicaVoxel .vox 导入（vox-rs）+ scan_vox_models 模型发现
                    - debug_menu.rs 菜单结构/缺省值加载 + 配置值合并 + 状态应用 + FPS 覆盖层 + 相机信息 + F3 开关

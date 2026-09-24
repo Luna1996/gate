@@ -12,7 +12,6 @@
 
 use std::time::Instant;
 
-use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
@@ -25,8 +24,8 @@ use gate_voxel::{
 };
 
 use crate::{
-  camera::{CameraMode, cursor_ray},
-  consts::{DEMO_DISPLACE_TEX_SCALE, DRAG_PX, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH},
+  camera::{CameraMode, MouseLock, cursor_ray},
+  consts::{DEMO_DISPLACE_TEX_SCALE, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH},
   height_field::{MaterialDisplace, MaterialDisplaceCache},
 };
 
@@ -593,41 +592,33 @@ fn stats_suffix(stats: Option<&FillStats>) -> String {
 }
 
 /// 体素编辑输入（仅幽灵模式；轨道模式左键仍是 recenter）：左键 = 放置，右键 = 擦除；
-/// 按下到释放累计位移 > `DRAG_PX` 视为「拖拽转头」，不编辑。
+/// 锁定鼠标时射线取屏幕中心（准星），否则取光标。
 #[allow(clippy::too_many_arguments)] // Bevy system：输入/资源逐一注入
 pub(crate) fn voxel_edit_input(
   mouse: Res<ButtonInput<MouseButton>>,
-  motion: Res<AccumulatedMouseMotion>,
   captured: Res<gate_ui::UiPointerCaptured>,
   intercepted: Res<gate_ui::MouseIntercepted>,
   windows: Query<&Window>,
   cfg: Res<DdaCameraConfig>,
   mode: Res<CameraMode>,
+  lock: Res<MouseLock>,
   settings: Res<EditSettings>,
   // MT8-5：位移源（槽 → 资产 id）要过贴图集 + 按 id 缓存的高度场（首次解码 ≈22ms，之后 0）
   pbr_set: Option<Res<PbrTextureSet>>,
   mut displace_cache: ResMut<MaterialDisplaceCache>,
   scene: Option<ResMut<VoxelScene>>,
-  mut right_drag_px: Local<f32>,
 ) {
-  // 右键位移累计（区分点击/拖拽）；两种模式都累计，避免切模式后残留旧值
-  if mouse.just_pressed(MouseButton::Right) {
-    *right_drag_px = 0.0;
-  }
-  if mouse.pressed(MouseButton::Right) {
-    *right_drag_px += motion.delta.length();
-  }
   if *mode != CameraMode::Fly || captured.0 || intercepted.0 {
     return;
   }
   let place = mouse.just_pressed(MouseButton::Left);
-  let erase = mouse.just_released(MouseButton::Right) && *right_drag_px < DRAG_PX;
+  let erase = mouse.just_released(MouseButton::Right);
   if !place && !erase {
     return;
   }
   let Some(mut scene) = scene else { return };
   let Ok(window) = windows.single() else { return };
-  let Some((origin, dir)) = cursor_ray(window, &cfg) else {
+  let Some((origin, dir)) = cursor_ray(window, &cfg, lock.0) else {
     return;
   };
   let (shape, size) = (settings.shape, settings.size);

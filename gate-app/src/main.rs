@@ -26,8 +26,9 @@ use gate_render::VIEW_SIZE;
 use gate_ui::{ThemeFont, UiCtx, UiTheme};
 
 use camera::{
-  build_camera_config, camera_look_input, fly_camera_input, left_click_pick_recenter,
-  orbit_camera_input, sync_camera_mode_switch,
+  MouseLock, apply_mouse_lock, build_camera_config, camera_look_input, fly_camera_input,
+  free_look_input, left_click_pick_recenter, orbit_camera_input, spawn_crosshair,
+  sync_camera_mode_switch, sync_crosshair, toggle_mouse_lock,
 };
 use config::{Config, save_config_on_exit};
 use debug_menu::{
@@ -133,6 +134,8 @@ fn main() {
     .add_plugins(gate_ui::GateUiPlugin)
     // 体素编辑设置（形状/大小/材质）；DebugMenu 的「游戏/编辑」是它的视图
     .init_resource::<edit::EditSettings>()
+    // 自由模式的鼠标锁定（Q 切换）：窗口光标显隐 + 准星显隐都由它派生
+    .init_resource::<MouseLock>()
     // MT8-5：笔触位移按材质 id 缓存的高度场（首次落笔解码 ≈22ms，之后解码耗时 0）
     .init_resource::<height_field::MaterialDisplaceCache>()
     // DebugMenu 相关：FPS 覆盖层显隐 + 1s 帧时长滚动窗口
@@ -151,15 +154,19 @@ fn main() {
         bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_secs_f64(1.0 / 60.0))
       },
     })
-    .add_systems(Startup, setup)
+    .add_systems(Startup, (setup, spawn_crosshair))
     .add_systems(
       Update,
       (
-        // 相机链顺序固定：模式切换对齐 → 转头 → 各自输入 → 左键拾取 → build_camera_config → 体素编辑。
+        // 相机链顺序固定：模式切换对齐 → 鼠标锁定（Q 切换 + 落到窗口光标）→ 转头 → 各自输入 →
+        // 左键拾取 → build_camera_config → 体素编辑。
         // 必须严格串行：都读写 OrbitCamera/FlyCamera/DdaCameraConfig；体素编辑读本帧 cfg，故在矩阵构造之后。
         (
           sync_camera_mode_switch,
+          toggle_mouse_lock,
+          apply_mouse_lock,
           camera_look_input,
+          free_look_input,
           orbit_camera_input,
           fly_camera_input,
           left_click_pick_recenter,
@@ -167,6 +174,8 @@ fn main() {
           voxel_edit_input,
         )
           .chain(),
+        // 屏幕中心准星：仅自由模式 + 锁定鼠标时显示
+        sync_crosshair,
         debug_ui_setup,
         // 右上角 FPS 覆盖层（开关打开时每帧刷新）+ 纯文本行的相机信息
         (fps_overlay_tick, camera_info_tick),
