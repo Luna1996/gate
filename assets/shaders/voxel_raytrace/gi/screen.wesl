@@ -36,13 +36,19 @@ import package::world::{WorldHit, voxel_normal};
 //
 //  ⑥ **累加量的前提被破坏 ⇒ 本帧不复用任何历史**（门 = `gi_u.flags.z`，含义「上帧那条累加量在本帧
 //     仍然成立」）：时域（① 段）与空间（③ 段）两条复用都要求它为真。两个触发源（都在 Rust 侧判定）：
-//     · **世界几何变了**（体素占据逐个字节比对）；
+//     · **遮挡关系变了** —— 判据是"间接光真的依赖的那些几何"变没变（`gi.rs::GiGpu::wide_rev`）：
+//       默认（「太阳反弹」关）二次顶点与**任何别的**几何无关 ⇒ 流式挂载 / 卸载、逐体素编辑**都不算**
+//       "变了"（它们只改别的体素，本像素的着色照旧）；只有全量重建 / 调色板变化才算。
+//       打开「太阳反弹」后二次顶点会发阴影射线 ⇒ 那时回落到"任何上传都算"（`world_rev`）。
 //     · **光照阶跃**（主光 / 天光一帧内跳过阈值，或主光方向一帧内转过 60° 以上）。
-//     为什么**必须**这么粗：reservoir 里存的是 `w_sum` / `M` 这条**累加量**，而它的验证射线只重发
+//     为什么粗门仍然必须存在：reservoir 里存的是 `w_sum` / `M` 这条**累加量**，而它的验证射线只重发
 //     **被选中的那一个代表样本**的光路 —— 代表样本没变**不代表**累加量里那些别的样本还有效。
 //     典型症状：擦掉一块自发光体素后，接收面上「打到它」的候选**全部**失效，但只要代表样本
 //     （例如一条逃向天空的方向）仍然成立，整条累加量就照收 ⇒ 那束光只能靠记忆窗淡出
 //     （τ = `GI_SS_M_CAP_K` 帧；相机不动时看不出任何即时变化）。
+//     CONSTRAINT: **别把门改成"任何上传都算"**（曾经如此）：流式世界每帧都在挂载 / 卸载 chunk
+//     ⇒ `flags.z` 恒 0 ⇒ ① 每个像素走"没有历史"的贵路径（候选数 ×4）；② 时域累积恒不成立
+//     （`M` 每帧重来）⇒ 表现就是"噪声严重、静态也不收敛"。实测 720p：`gate_gi` 里约 10 ms 是这一条。
 //     光照阶跃是同一回事的另一半：二次顶点缓存被 epoch 作废（新鲜候选算的已经是新光照），而
 //     累加量还是旧光照的 ⇒ 两侧时间基准劈开，靠记忆窗淡出会整屏滞后、各像素不同步，且相机一动
 //     就借到旧值成大鬼影。逐帧的小变化（自动流逝 / 拖动「时刻」）不触发这条门：那种变化每个窗口帧
@@ -178,7 +184,12 @@ fn gi_res_adopt(r: GiRes, h: GiRes) -> GiRes {
 /// 候选会被立刻压掉、boost 等于白做。
 /// `m_cap_k` 由调用方按「降噪质量」档给（`GI_SS_M_CAP_K` / `GI_SS_M_CAP_K_HQ`）——它同时就是记忆帧数。
 fn gi_res_cap(r: GiRes, cand_n: u32, m_cap_k: u32) -> GiRes {
-  let cap = f32(m_cap_k * cand_n);
+  // CONSTRAINT: `cand_n == 0`（本 texel 这一帧**没轮到**发候选：分数预算的轮转、或不是面的认领者）
+  // 时窗上限必须**保持不变**，不能按 0 缩放 —— 否则每次轮到"没发候选"就把整条历史清零，
+  // 于是"没轮到"的那些帧上报 `has_evidence = false`，逐面均值 / 空间复用 / `dda_main` 的 cov
+  // 全部塌成"无数据"。`cand_n >= 1` 时 `m_cap_k * cand_n` 与 `cand_n` 无关（见 `m_cap_k` 的算法），
+  // 所以取 `max(..., 1)` 对原来的路径逐位不变。
+  let cap = f32(m_cap_k * max(cand_n, 1u));
   if (r.m <= cap) { return r; }
   let shrink = cap / r.m;
   var out = r;
@@ -249,8 +260,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
   // 二次顶点太阳反弹（菜单「渲染/RESTIR GI/太阳反弹」）：0 = 连 NEE 阴影射线都不发。
   let sun_bounce = gi_u.params.x;
-  // ② 二次顶点缓存的 epoch（`gi_u.seq.y`）：光照/几何变了才自增 ⇒ 槽里的键掩码跟着变、
-  // 整张表自失效（跨帧持久，见 `gi/common.wesl`）。
+  // ② 二次顶点缓存的 epoch（`gi_u.seq.y`）：`gi_face_shade` 的输入变了才自增 ⇒ 槽里的键掩码跟着变、
+  // 整张表自失效（跨帧持久，见 `gi/common.wesl`）。**它不在流式世界里每帧变**（见 `gi.rs::ShadeKey`）。
   let epoch = gi_u.seq.y;
   // ④ 第二条弹射的**倍数**（菜单「渲染/光照/二次弹射」，`gi_u.misc.w`）：0 = 关；
   // 1 = 每个候选都带；> 1 = 弹射分裂（每个候选以 `1/本值` 的概率带上、带上时乘本值 ⇒ 期望无偏）。
@@ -268,7 +279,16 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let gg = make_grid(u32(h.obj_id) + 1u);
   let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
   let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
-  let n = voxel_normal(gg, h.voxel, h.face_id, h.n);
+  // **GI 候选的着色法线**：`1` = 直接用命中面的法线 `h.n`（DDA 已经算好，零额外开销），`0` = 走
+  // `voxel_normal`（**要探 6 个邻域体素**）。
+  // WHY 默认取 1：GI 候选的单价实测 400–600 ns（`docs/editable-gigavoxel.md` 的「GI 代价取证」），
+  // 6 次邻域探测约占其中三成；而间接光是低频量 ⇒ 面法线足够。要对比就把这个常量置 0 再跑
+  // `GATE_BENCH=static` + `--features profile` 看 `gate_gi`。
+  const GI_FACE_NORMAL_ONLY: u32 = 1u;
+  var n = h.n;
+  if (GI_FACE_NORMAL_ONLY == 0u) {
+    n = voxel_normal(gg, h.voxel, h.face_id, h.n);
+  }
   // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS：与 `dda_main` 同一套外推（起点离开命中体素）。
   let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
   let org = p_voxel + n * n_off;
@@ -391,11 +411,54 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     b_err = select(hi, lo, hist_ok);
   }
   let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
-  let cand_n = max(1u, u32(floor(f32(cand_n0) * b_err / f32(share) + dither)));
+  var cand_n = max(1u, u32(floor(f32(cand_n0) * b_err / f32(share) + dither)));
+  // ---- 把**分数预算**兑现成"少发射线"（否则整数钳制会白烧 N 倍）----
+  // WHY：上面的 `max(1u, …)` 把预算直接舍成"每 texel 每帧 1 条"。而「降噪质量 = 高」（基准 8 条）
+  // 配「分帧 ÷8」的本意是 **1 条/texel/8 帧**，实际却按 1 条/帧 发 ⇒ 白烧 8 倍射线（文件上面
+  // 「整数钳制」那段算术自己就记着这个退化）。这里按**逐帧轮转**抽样兑现分数：预算是 `f` 条/texel/帧
+  // 时，每帧只让约 `1/stride` 的 texel 发候选，其余 texel 照常走**时域累积**（零射线）与**空间复用**
+  // （读邻居、零射线）⇒ 帧时间 ÷stride，而 8 帧窗口内的总样本数不变（与「分帧」的语义一致），
+  // 只有光照响应随 N 变慢。抽样用 `idx` 与帧号混合 ⇒ 相邻 texel 不同步（不会出现整块屏幕同时变钝的环）。
+  if (cand_n == 1u) {
+    let frac = f32(cand_n0) * b_err / f32(share);
+    if (frac < 0.999) {
+      let stride = max(u32(ceil(1.0 / max(frac, 1.0 / 64.0))), 1u);
+      if (gi_mix(idx ^ (gi_u.seq.x * 0x9E3779B9u)) % stride != 0u) {
+        cand_n = 0u;
+      }
+    }
+  }
+  // ---- 候选是否只在"面的认领者"上发射 ----
+  //
+  // `0` = 每个 texel 按自己的分数预算发候选（**逐面平均才有东西可平均**）；`1` = 只有认领者发。
+  //
+  // WHY 默认 0：`gi_face_flatten` 的降噪前提是"同一个面的 N 个 texel 各自是**同一个积分的独立估计**
+  // ⇒ 面内平均把方差 ÷N"。开 1 时一个体素面只剩认领者那 1 条样本，`÷N` 永远不发生；而且非认领者
+  // 的时域状态留空 ⇒ 它们只能靠 flatten 摊值，一旦 flatten 因撞键（槽被别的键占着）跳过本面，
+  // 面上就是"1/4 的 texel 有数据、3/4 没有"的棋盘 ⇒ 逐体素斑驳死点（`a` / cov 在面内不一致）。
+  //
+  // CONSTRAINT: 开 1 的代价与收益都要重新量 —— 它把每条面的射线数降到 1/N（N = 面覆盖的 texel 数，
+  // 1/1 分辨率下约 16、1/2 下约 4），换来 N 倍的候选开销。GI 现在只值 ~1 ms（GPU 逐 pass 共 ~5 ms、
+  // 整帧预算 16.7 ms），所以先按"质量优先"取 0；要省射线再改回 1 并把噪声一并量出来。
+  const GI_SS_CLAIM_ONLY: u32 = 0u;
+  if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
+    var fok2 = false;
+    let fs2 = face_slot_of(pk0, pk1, &fok2);
+    if (fok2) {
+      let fe2 = fs2 * FACE_WORDS;
+      if (atomicLoad(&face_slots[fe2 + FACE_W_FLAG]) != 0u
+          && atomicLoad(&face_slots[fe2 + FACE_W_K0]) == pk0
+          && atomicLoad(&face_slots[fe2 + FACE_W_K1]) == pk1
+          && atomicLoad(&face_slots[fe2 + FACE_W_TEXEL]) != idx) {
+        cand_n = 0u;
+      }
+    }
+  }
   // 记忆窗上限：按"每帧实际候选数相对基准缩小了几倍"放大。减发一侧 ⇒ 窗内样本数 = 基准值
   // （稳态噪声不变、只有响应变慢）；增发一侧按本式取 max(...,1) ⇒ 窗内样本数随之变大。
   // （本项零性能成本，但窗越长光照响应越钝 ⇒ 这就是分摊/重分配的代价。）
-  let m_cap_k = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq) * max(cand_n0 / cand_n, 1u);
+  let m_cap_k =
+    select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq) * max(cand_n0 / max(cand_n, 1u), 1u);
   var r = gi_res_none();
   // **ILP 批量**：批内 `GI_SS_RAY_BATCH` 条射线只差方向、互相独立 ⇒ 先把它们全发出去（多条层次
   // DDA 的依赖 load 同时在飞），再按原本的 `k` 顺序做累计与蓄水池更新。方向序列、样本与比较顺序
@@ -460,7 +523,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   var sk_m = 0.0;
   // **累加量的前提不成立 ⇒ 本帧不复用空间邻域**（文件头 ⑥）：tap 读的是**上一帧**邻居的 reservoir，
   // 那些累加量同样可能已经失效（同一个理由：代表样本验证不了它）。
-  let reuse_taps = select(GI_SS_REUSE_TAPS, 0u, !prev_ok || gi_u.flags.z <= 0.5);
+  // `r.m < 0.5`：本帧既没发候选（分数预算把本 texel 排到了别的帧）**又**没接上历史 ⇒ 手里没有
+  // "本位置"的当帧证据，`est_self` 会是 0，拿它当钳制锚会把邻居的累加量全拉向 0 ⇒ 这一帧不做空间复用
+  // （零射线，只是少一次平滑；下一帧轮到本 texel 发候选时就恢复）。
+  let reuse_taps =
+    select(GI_SS_REUSE_TAPS, 0u, !prev_ok || gi_u.flags.z <= 0.5 || r.m < 0.5);
   // 借来的值要锚在「本像素当帧自己的估计」附近（`GI_SS_REUSE_CLAMP_*`）：`w_sum / M`，
   // **含**时域合并（排在上面的 ④）、**不含**借来的量 ⇒ 它就是"我这个位置"的当帧证据，也是唯一的锚。
   let est_self = r.w_sum / max(r.m, 1e-6);
@@ -500,17 +567,27 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     est = (r.w_sum + sk_sum * keep) / denom;
   }
   let gi = est * (gi_u.params.z / GI_PI);
-  // valid = 1（供 `dda_main` 的天光兜底权重使用）：GI 有数据 ⇒ 天光只占 `GI_AMBIENT_FLOOR` 倍。
+  // 本 texel 的**当帧证据**：发了候选（`r.m`）或从时域 / 空间邻居借到了量（`sk_m`）。
+  // 「候选只在面的认领者上发射」（见上方那条闸门）⇒ 一个面里**只有认领者**有证据，其余 texel 在
+  // 接上历史之前 `est` 恒为 0。
+  let has_evidence = (r.m + sk_m) > 0.0;
+  // CONSTRAINT: 没有证据的 texel **必须写 `a = 0`**，不能写"值是 0 却报有效"：
+  //   · `dda_main` 把 `a` 当 cov —— `cov = 1` 会把天光乘 `GI_AMBIENT_FLOOR` 压暗 ⇒ 无数据处被渲染成
+  //     "天光被压暗 **且** GI = 0" = 全黑（症状：自发光完全照不亮任何体素）；
+  //   · `gi_face_flatten` / `dda_face_accum` 的逐面均值按 `a > 0` 取参与集合 ⇒ 把 0 混进去会把
+  //     面均值稀释成 0、整片 GI 归零。
   // 覆盖度 cov 与 valid 是同一个场（旧实现单开一张 `gi_cov_out` 写的恒是「valid ? 1 : 0」），
   // 所以这里只写这一张、`dda_main` 从 `a` 自取。
-  textureStore(gi_out, coord, vec4<f32>(gi, 1.0));
+  textureStore(gi_out, coord, vec4<f32>(gi, select(0.0, 1.0, has_evidence)));
 
   // ---- ① 逐面合并：把本 texel 的估计定点累加到该面的槽（`gi_face_flatten` 事后取面均值）----
   // 同一个面的所有 texel 的估计是**同一个积分**的独立估计 ⇒ 面内平均是纯降噪（方差 ÷ texel 数）。
   // 只有"槽已被本面认领、且两个键 word 逐位相等"才并：撞键 / 抢在认领之前到达的 texel 一律跳过
   // （那条路退化成逐 texel，只损失收益、不会污染别的面）。
   // 定点 + CAS 预留计数的手法与 `dda_face_accum` 逐字一致（`GI_ACC_*` 的溢出账也共用）。
-  if (pk_ok) {
+  // `has_evidence`：无证据的 texel **不参与**逐面均值（它的 `est` 是 0，"没有数据"不等于"值是 0"，
+  // 混进去会把面均值拉向 0）—— 与 `gi_face_flatten` / `dda_face_accum` 的 `a > 0` 参与集合同一条口径。
+  if (pk_ok && has_evidence) {
     var fok = false;
     let fslot = face_slot_of(pk0, pk1, &fok);
     if (fok) {

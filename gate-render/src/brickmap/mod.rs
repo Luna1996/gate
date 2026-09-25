@@ -19,6 +19,6 @@ pub use raytrace::{RayHit, raycast};
 pub use upload::{
   BindingLimits, BrickMapRevision, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,
   UploadCpuSample, UploadCpuSampleChannel, UploadSnapshot, VolumePlugin, VoxelDumpRequest,
-  VoxelScene,
+  VoxelScene, pool_capacity_chunks,
 };
 pub use wire::{BrickMapBuffers, BrickMapGlobals, GridDesc};

@@ -96,6 +96,7 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
 
 /// `gi_face_shade` 的**带缓存**版本（`gi_sec_slots`：epoch 掩码键、跨帧持久，见 `gi/common.wesl`）。
 /// 同一个面在同一 epoch 内被成千上万条射线打到时只算一次（含它那条太阳 NEE 阴影射线）。
+/// 键里除了面键还有命中体素的 `pal`（材质重刷 ⇒ 键变，见 `gi_sec_key_masked`）。
 /// 读侧两次键校验、写侧「辐亮度 → 键」的顺序与撕裂窗口的说明都在 `gi/common.wesl`。
 fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                         sun_bounce: f32, epoch: u32, k0: u32, k1: u32, key_ok: bool) -> vec3<f32> {
@@ -107,7 +108,7 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
     let slot = gi_sec_slot_of(k0, k1, &slot_ok);
     if (slot_ok) {
       sb = slot * GI_SEC_WORDS;
-      mine = gi_sec_key_masked(k0, k1, epoch);
+      mine = gi_sec_key_masked(k0, k1, epoch, sh.pal);
       if (atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]) == mine.x
           && atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]) == mine.y) {
         let r = vec3<f32>(
@@ -197,8 +198,8 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
 /// `Volumes::add_object` 在应用里没有调用点 ⇒ 无实际行为差异）。
 /// 命中分支的着色走 `gi_face_shade_cached`（按面缓存：同一个面被多条射线打到时只算一次），
 /// 命中面的**二次弹射**由 `gi_bounce2` 在缓存之外叠加（`bounce2` = 倍数，0 = 关；`seed` 是候选种子）。
-/// `epoch`（uniform `gi_u.seq.y`）= 光照/几何的修订号，参与槽里键的掩码 ⇒ 它一变整张表
-/// 自失效（跨帧持久，见 `gi/common.wesl` 的「跨帧持久」段）。
+/// `epoch`（uniform `gi_u.seq.y`）= `gi_face_shade` 全部输入的修订号，参与槽里键的掩码 ⇒ 它一变整张表
+/// 自失效（跨帧持久，见 `gi/common.wesl` 的「跨帧持久」段；**流式挂载与逐体素编辑不会让它变**）。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> vec3<f32> {
   var tint = vec3<f32>(1.0);

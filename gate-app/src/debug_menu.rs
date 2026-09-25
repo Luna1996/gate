@@ -47,6 +47,8 @@ const WORLD_COARSE_RADIUS_PATH: &str = "game/world/coarse_radius";
 const WORLD_COARSE_HEIGHT_PATH: &str = "game/world/coarse_height";
 const WORLD_MOUNT_WORDS_PATH: &str = "game/world/mount_words";
 const WORLD_MOUNT_COUNT_PATH: &str = "game/world/mount_count";
+const WORLD_REQUESTS_LOAD_PATH: &str = "game/world/requests_load";
+const WORLD_REQUEST_MB_PATH: &str = "game/world/request_mb";
 /// 「编辑/材质」页 PBR 资产下拉的节点路径（MT7-1；选项 = `assets/textures/pbr/` 的目录名）
 pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/mat/pbr_asset";
 /// 「编辑/笔触」页「偏移距离」输入框的节点路径：改「笔触大小」时要把自动值写回这个控件
@@ -744,6 +746,14 @@ fn register_callbacks(world: &mut World) {
         }
         (WORLD_MOUNT_COUNT_PATH, MenuAction::Value(v)) => {
           stream.mount_count = v.round().max(1.0) as usize;
+        }
+        // 请求圈（ray-guided）：装载位置由射线给 ⇒ 这是"视距"唯一的闸门
+        (WORLD_REQUESTS_LOAD_PATH, MenuAction::Toggle(on)) => {
+          stream.requests_load = *on;
+          info!("请求装载 → {}", if *on { "on" } else { "off（退回纯半径）" });
+        }
+        (WORLD_REQUEST_MB_PATH, MenuAction::Value(v)) => {
+          stream.request_bytes = (v.round().max(0.0) as usize) * 1024 * 1024;
         }
         _ => {}
       }

@@ -69,7 +69,7 @@ fn main() {
   rust_i18n::set_locale(DEFAULT_LOCALE);
 
   // 失焦后台跑帧开关见 `consts::BENCH_UNFOCUSED`
-  let bench = consts::BENCH_UNFOCUSED;
+  let bench = consts::BENCH_UNFOCUSED || consts::bench();
   let mut app = App::new();
   app.add_plugins(
     DefaultPlugins
@@ -93,11 +93,12 @@ fn main() {
         ..default()
       })
       .set(LogPlugin {
-        // info 基线 + 定向屏蔽 wgpu_hal::vulkan 的 instance/surface 层 VUID 报错
-        filter: "info,wgpu=debug,wgpu_core=debug,\
-          wgpu_hal::vulkan::instance=off,\
-          wgpu_hal::vulkan::surface=off"
-          .into(),
+        // info 基线 + 定向屏蔽 wgpu_hal::vulkan 的 instance/surface 层 VUID 报错。
+        // **取证用**：`GATE_LOG`（如 `GATE_LOG=gate_render=debug,gate_app=debug`）覆盖整条过滤串
+        // —— `LogPlugin.filter` 是权威，`RUST_LOG` 不再被读 ⇒ 想让那些 `debug!`
+        // （`STREAM` / `RESID` / `WINDOW` / `GI epoch`）落盘只能从这里进。
+        filter: std::env::var("GATE_LOG")
+          .unwrap_or_else(|_| consts::DEFAULT_LOG_FILTER.to_string()),
         // 附加层：无色文件层写 <安装根>/logs/latest.log（stderr 彩色层不受影响）；
         // profile feature 再叠加 TracyLayer（tracing span → Tracy CPU zone）
         custom_layer: |_app| {
@@ -211,7 +212,7 @@ fn main() {
     app.add_systems(Update, edit::edit_selftest);
   }
   // 相机自动绕目标旋转并平移（配 BENCH_UNFOCUSED 读移动中的逐 pass 帧时）
-  if consts::AUTO_ORBIT {
+  if consts::AUTO_ORBIT || consts::bench_orbit() {
     app.add_systems(Update, camera::auto_orbit_system);
   }
   app.run();

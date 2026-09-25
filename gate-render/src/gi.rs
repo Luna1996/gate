@@ -31,15 +31,16 @@ pub struct GiUniform {
   pub misc: Vec4,
   /// x = 保留（恒 0）、y = GI 分辨率除数（1 = 全分辨率、2 = 半分辨率、4 = 四分之一；**整数值的 f32**，
   /// 只被 `gi_main` 用来把本 pass 的像素下标换成 beam 纹理下标）、
-  /// z = 世界的体素占据自「写入上一帧 reservoir 的那一帧」起是否**逐位未变**（1 = 未变）⇒
-  /// **本帧允许复用历史**（时域 + 空间两条；变过就整帧不复用，见 `gi/screen.wesl` 文件头 ⑥）、
+  /// z = **本帧允许复用历史**（时域 + 空间两条；1 = 允许）：遮挡关系没变、且这一帧不是光照阶跃。
+  /// 「遮挡关系」= 间接光真的依赖的那些几何 —— 默认（「太阳反弹」关）只有**世界整体**变才算
+  /// （见 [`GiGpu::wide_rev`]），流式挂载 / 卸载与逐体素编辑**不**算。见 `gi/screen.wesl` 文件头 ⑥、
   /// w = **降噪质量档位**（0 = 关 / 1 = 低 / 2 = 中 / 3 = 高；
   /// 菜单「渲染/RESTIR GI/降噪质量」）：`gi_ss_main` 按它取 1/4 档的新鲜候选数
   /// （`GI_SS_CAND_N` vs `..._HQ`）与记忆窗（`GI_SS_M_CAP_K` vs `..._HQ`）——**这两项与分辨率档无关**。
   /// 时域/atrous 的派发与核半径不在本 pass 里，由 Rust 的 `denoise_plan` 决定。
   pub flags: Vec4,
   /// x = 自增帧号（精确 u32）、**y = 二次顶点缓存的 epoch**（见 [`GiGpu::epoch`]；
-  /// 光照 / 几何的修订号 ⇒ `gi_sec_slots` 槽里键的掩码，跨帧持久的前提）、
+  /// [`ShadeKey`] 的修订号 ⇒ `gi_sec_slots` 槽里键的掩码，跨帧持久的前提）、
   /// zw = 保留（恒 0）。所有整数帧逻辑（本帧的 RNG 种子混入、像素 hash）都用 x：
   /// 帧号曾经以 f32 存在 `params.x`，超过 2^24 后无法表示连续整数 ⇒ 种子会偶发重复。
   pub seq: UVec4,
@@ -49,31 +50,25 @@ pub struct GiUniform {
   pub prev_view_proj: Mat4,
 }
 
-/// ② **二次顶点缓存的 epoch 输入**：`gi_secondary_shade` 的全部输入（逐项比对，任一变化即自增）。
+/// 光照的**全部**输入（逐项比对，任一变化即"变过"）。
 /// 只比位、不比语义（f32 一律比 `to_bits()`）—— 目的只是"变了就失效"，比"算不算真的变了"更保守才对。
+/// 主光方向在**没有光量**时也要进 key：日月交接那一帧方向已经跳了、只是不携带能量，下一帧它就带着。
+/// 唯一消费者是 [`light_jump`]（判「光照阶跃」⇒ `flags.z`）。
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct GiEpochKey {
-  /// 世界几何修订号（`GiGpu::world_rev`）：几何一变，命中面与遮挡都可能变。
-  world_rev: u32,
-  /// 太阳方向（世界系，指向光）与色 × 强度。
-  sun_dir: [u32; 3],
+struct LightKey {
+  /// 太阳方向（世界系，指向光）与色 × 强度；无主光时为全 0。
+  dir: [u32; 3],
   sun_c: [u32; 3],
   /// 天光色（sRGB 编码，与 `sky_rgb()` 的输入同一个）。
   sky: [u32; 3],
-  /// 「二次顶点太阳反弹」开关：关掉时二次顶点不做 NEE ⇒ 值是另一个数。
-  sun_bounce: bool,
 }
 
-impl GiEpochKey {
-  fn of(
-    world_rev: u32,
-    sun_bounce: bool,
-    theme: Option<&crate::lighting::LightingTheme>,
-  ) -> Self {
+impl LightKey {
+  fn of(theme: Option<&crate::lighting::LightingTheme>) -> Self {
     let bits3 = |v: [f32; 3]| v.map(f32::to_bits);
-    let (sun_dir, sun_c, sky) = match theme {
+    let (dir, sun_c, sky) = match theme {
       Some(t) => {
-        let (dir, c) = match &t.sun {
+        let (d, c) = match &t.sun {
           Some(s) => {
             let l = -glam::Vec3::from(s.dir).normalize_or_zero();
             (
@@ -84,11 +79,44 @@ impl GiEpochKey {
           None => ([0.0; 3], [0.0; 3]),
         };
         let sky = t.sky.as_ref().map_or(crate::consts::MINECRAFT_SKY, |s| s.color);
-        (bits3(dir), bits3(c), bits3(sky))
+        (bits3(d), bits3(c), bits3(sky))
       }
       None => (bits3([0.0; 3]), bits3([0.0; 3]), bits3(crate::consts::MINECRAFT_SKY)),
     };
-    Self { world_rev, sun_dir, sun_c, sky, sun_bounce }
+    Self { dir, sun_c, sky }
+  }
+}
+
+/// ② **二次顶点缓存的 epoch 输入**（uniform `seq.y` 的来源）：`gi_face_shade` 的**全部**输入。
+/// 变了就自增 ⇒ `gi_sec_slots` 槽里键的掩码跟着变、旧槽一律不匹配（整表自失效，无需清表）。
+///
+/// 它与 [`LightKey`] 是**两个集合**，差别有两处、都不是笔误（两处都是"值真的不依赖它"，不是放宽）：
+///   · **主光只在「太阳反弹」打开时进**：关掉时 `sun_vis = 0` ⇒ `brdf_reflected` 里整支太阳项
+///     （`l.sun_vis > 0` 才进）被折掉 ⇒ 出射辐亮度只剩 `(kd·albedo + f0)·amb + emissive`，
+///     与主光的方向 / 颜色 / 强度**无关**（`gi/ray.wesl::gi_face_shade`）。
+///     CONSTRAINT: 少了这一条，「时刻自动流逝」这类每帧都在动的主光会让整张表每帧自失效 ——
+///     缓存等于不存在。实测（2026-09-25，720p/GI 1/2/分帧 8）：epoch 每帧 +1。
+///   · **几何只在遮挡项真的依赖它时才进**：`sun_bounce` 关掉时二次顶点**不发阴影射线** ⇒
+///     值与**任何别的**几何无关 ⇒ 流式挂载 / 卸载与逐体素编辑都不该作废它（它们只改别的体素）。
+///     打开时才回落到 [`GiGpu::world_rev`]（任何上传）—— 那条遮挡项确实依赖远场几何。
+/// 逐面材质不在本 key 里：它由槽里的 `pal` 参与掩码覆盖（`gi_sec_key_masked`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShadeKey {
+  /// 世界几何：`sun_bounce` 关掉时 = [`GiGpu::wide_rev`]（全量重建 / 调色板），
+  /// 打开时 = [`GiGpu::world_rev`]（任何上传，含流式挂载与编辑）。与 `flags.z` 用的是同一个
+  /// `occluder_rev`（见 `prepare_gi`）：两处问的是同一个问题 ——「间接光依赖别的几何吗」。
+  geom: u32,
+  /// 主光（仅 `sun_bounce` 打开时有效，关掉时全 0 ⇒ 不进比较）。
+  dir: [u32; 3],
+  sun_c: [u32; 3],
+  sky: [u32; 3],
+  sun_bounce: bool,
+}
+
+impl ShadeKey {
+  fn of(geom: u32, sun_bounce: bool, light: &LightKey) -> Self {
+    let gated = |v: [u32; 3]| if sun_bounce { v } else { [0u32; 3] };
+    Self { geom, dir: gated(light.dir), sun_c: gated(light.sun_c), sky: light.sky, sun_bounce }
   }
 }
 
@@ -104,14 +132,14 @@ const LIGHT_STEP_MAX: f32 = 0.5;
 ///   · 主光色 × 强度的相对变化（分母取两侧较大者 ⇒ "从 0 亮起"不会被除零放大）；
 ///   · 天光色的相对变化（同上）；
 ///   · 主光方向变化 `1 − cosθ`，只在两侧光量都超过 [`LIGHT_DIR_MIN_MAG`] 时才计。
-fn light_jump(prev: &GiEpochKey, now: &GiEpochKey) -> f32 {
+fn light_jump(prev: &LightKey, now: &LightKey) -> f32 {
   let vec3 = |v: [u32; 3]| glam::Vec3::from(v.map(f32::from_bits));
   let rel = |a: [u32; 3], b: [u32; 3]| -> f32 {
     let (a, b) = (vec3(a), vec3(b));
     (a - b).length() / a.length().max(b.length()).max(1e-4)
   };
-  let dir = if vec3(prev.sun_dir).length().min(vec3(now.sun_dir).length()) > LIGHT_DIR_MIN_MAG {
-    1.0 - vec3(prev.sun_dir).normalize_or_zero().dot(vec3(now.sun_dir).normalize_or_zero())
+  let dir = if vec3(prev.dir).length().min(vec3(now.dir).length()) > LIGHT_DIR_MIN_MAG {
+    1.0 - vec3(prev.dir).normalize_or_zero().dot(vec3(now.dir).normalize_or_zero())
   } else {
     0.0
   };
@@ -571,15 +599,19 @@ pub struct GiGpu {
   pub prev_view_proj: Mat4,
   /// reservoir 双缓冲的换绑状态：true ⇒ 本帧 `binding 20 = b`、`21 = a`（见 `prepare_gi`）。
   pub res_flip: bool,
-  /// 世界几何修订号：**只在世界真的可能变了的那一帧**自增（全量上传 / palette 变化 / 收到脏盒）。
-  /// 「变过」的判据取的是最粗也最可靠的一种（体素占据逐个字节没变）—— 键只能证明"上帧那个面还在"，
-  /// 证明不了"上帧累计进来的那些光路还成立"，所以世界一变就整帧不复用历史（见 `gi/screen.wesl` ⑥）。
+  /// 世界几何修订号的**任何上传**口径：**每次真实上传**都自增（全量重建 / 调色板 / 任何脏盒 ——
+  /// 含流式挂载与卸载、逐体素编辑）。只在「太阳反弹」打开时才被用（见 `occluder_rev`）：
+  /// 那时二次顶点会发阴影射线，值真的依赖**别的**体素。
   pub world_rev: u32,
-  /// 上一次真正跑 `gi_main` 的那一帧的 `world_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
-  /// ⇒ `world_rev == world_rev_gi` ⇔ 上帧 reservoir 里的累计量在本帧仍然成立。
+  /// 上一次真正跑 `gi_main` 的那一帧的 `occluder_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
+  /// ⇒ 相等 ⇔ 上帧的累计量在本帧仍然成立。
   /// 它与「本帧是不是光照阶跃」合起来决定 uniform `flags.z`（**允许复用历史**）：
-  /// 几何变了、或光照一帧内跳过了 [`LIGHT_STEP_MAX`]，都整帧不复用（见 `prepare_gi`）。
+  /// 遮挡关系变了、或光照一帧内跳过了 [`LIGHT_STEP_MAX`]，都整帧不复用（见 `prepare_gi`）。
   pub world_rev_gi: u32,
+  /// 世界几何修订号的**世界整体**口径：只在**全量重建 / 调色板变化**时自增，
+  /// **不含**流式挂载 / 卸载与逐体素编辑的脏盒。默认（「太阳反弹」关）它就是那个 `occluder_rev` ——
+  /// 间接光与**任何别的**几何无关，所以"世界在流式"不该作废历史（见 `prepare_gi` 的 CONSTRAINT）。
+  pub wide_rev: u32,
   /// 降噪 pipeline：`[0]` = 时域、`[1..6]` = atrous 第 1..5 轮（步长 1/2/4/8/16）。
   /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）；
   /// 实际跑几轮由 `GI_DEN_ATROUS_ITER` 决定（1..=5，Rust 按它选 src→dst 链）。
@@ -587,12 +619,14 @@ pub struct GiGpu {
   /// ① 逐面合并的落地 pass（`gi_face_flatten`）：layout 只有 group(0)（见 [`gi_flatten_layout`]），
   /// 派发在 `gi_main` 之后、降噪链之前。
   pub flatten_pipeline: Option<CachedComputePipelineId>,
-  /// ② **二次顶点缓存的 epoch**（uniform `seq.y`）：光照 / 几何的任一输入变化就自增。
+  /// ② **二次顶点缓存的 epoch**（uniform `seq.y`）：`gi_face_shade` 的**全部**输入变化就自增。
   /// 它参与 `gi_sec_slots` 槽里键的掩码 ⇒ 一变整张表自失效。表**不清空**（省掉每帧的 `clear_buffer`），
-  /// 所以 epoch 必须覆盖 `gi_secondary_shade` 的**全部**输入（见 [`GiEpochKey`]）。
+  /// 所以 epoch 必须覆盖 `gi_face_shade` 的**全部**输入（见 [`ShadeKey`]）。
   pub epoch: u32,
   /// 上一帧用过的 epoch 输入（`None` = 还没比过 ⇒ 首帧自增一次，无妨）。
-  epoch_key: Option<GiEpochKey>,
+  epoch_key: Option<ShadeKey>,
+  /// 上一帧的光照（`None` = 还没比过）：[`light_jump`] 的比较对象。
+  light_key: Option<LightKey>,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
@@ -691,10 +725,12 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     // 都是零（M = 0 ⇒ 一律判无效），跳过与否都不会接受任何历史 ⇒ 安全。
     world_rev: 0,
     world_rev_gi: 0,
+    wide_rev: 0,
     den_pipelines: [None; 6],
     flatten_pipeline: None,
     epoch: 0,
     epoch_key: None,
+    light_key: None,
   });
 }
 
@@ -782,44 +818,57 @@ fn prepare_gi(
 
   // ---- 世界几何修订号（uniform `flags.z` = **本帧允不允许复用历史**）----
   // 键只能证明"上帧那个面还在"，证明不了"上帧累计进来的那些光路还成立"：reservoir 里存的是
-  // `w_sum` / `M` 这条**累加量**（`gi/screen.wesl` 文件头 ⑥）。所以「变过」判据取最粗也最可靠的
-  // 一种 —— 世界的体素占据自**上次真正跑 `gi_main`** 起是否逐个字节没变：那时上帧的累计量逐位
-  // 成立，复用免费且正确；变过就整帧不复用（时域 + 空间两侧同一个门）。
+  // `w_sum` / `M` 这条**累加量**（`gi/screen.wesl` 文件头 ⑥）。
+  // 两个口径，取哪一个由「间接光是否真的依赖**别的**几何」定（`occluder_rev`）：
+  //   · [`GiGpu::world_rev`] —— **任何**上传（流式挂载 / 卸载、逐体素编辑、全量重建 / 调色板）；
+  //   · [`GiGpu::wide_rev`]  —— 只有**世界整体**变（全量重建 / 调色板）。
+  // 判据：二次顶点只有发阴影射线（`sun_bounce`，见 `gi/ray.wesl::gi_face_shade`）时才知道"别的体素"，
+  // 关掉时它与别的几何无关 ⇒ 流式挂载 / 卸载、逐体素编辑都不该作废任何东西。
   //
-  // 前提（改动这里前先读）：`world_rev` 必须覆盖**一切可能改变 `world_raycast` 结果的输入**。
-  // 今天覆盖 = 世界全量上传、palette 变化、以及任何脏盒（= 一切增量体素编辑）。而"笔触只动了被实体
-  // 完全包围的区域"不会改动可见几何（`VoxelScene::interior_only_edit` ⇒ `extract` 不报脏盒）——
-  // 从外部进入该区域的任何光线都先命中外壳，而外壳未被触碰 ⇒ 首命中与二次命中的面都没变，
-  // 复用历史免费且正确。
+  // CONSTRAINT: 用 `world_rev`（任何上传）来判会**每帧**都判"变过" —— 流式世界每帧都在挂载 / 卸载
+  // chunk（实测 720p：`UPLOAD[incremental]` 每帧 6~8 chunk、0.8~1.0 MB）⇒ `flags.z` 恒 0 ⇒
+  // ① 每个像素都走"没有历史"的贵路径（候选数 ×4，实测 `gate_gi` 里 ~10 ms）；
+  // ② 时域累积恒不成立（`M` 每帧从头来）—— 这正是"光影噪声严重、静态也不收敛"的直接原因。
+  //
   // 运行时不存在别的几何变化源：物体变换只在建世界时设定，LOD / beam 只改遍历起点、不改最近命中。
-  // 若将来加了「物体动画 / 运行时改变换」，必须让那条路径也自增 `world_rev`。
-  let world_changed =
-    dirty.as_ref().is_some_and(|d| d.full || d.palette_changed || !d.boxes.is_empty());
-  if world_changed {
+  // 若将来加了「物体动画 / 运行时改变换」，必须让那条路径也自增这两个修订号。
+  let any_upload = dirty.as_ref().is_some_and(|d| d.full || d.palette_changed || !d.boxes.is_empty());
+  if any_upload {
     gpu.world_rev = gpu.world_rev.wrapping_add(1);
   }
-  let world_same = gpu.world_rev == gpu.world_rev_gi;
+  if dirty.as_ref().is_some_and(|d| d.full || d.palette_changed) {
+    gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
+  }
+  let occluder_rev = if settings.sun_bounce { gpu.world_rev } else { gpu.wide_rev };
+  let world_same = occluder_rev == gpu.world_rev_gi;
 
   // ---- ② 二次顶点缓存的 epoch（同一次比对给出「光照阶跃」）----
-  // 输入 = `gi_secondary_shade` 的全部输入（几何修订号、太阳方向/色×强度、天光色、「太阳反弹」）。
-  // **逐项比对、变了才自增**（不做哈希：哈希只是把"变没变"变得更难查）。
-  // 只比位（f32 比 `to_bits`）⇒ 值改了但位没变（不可能）与位变了值没变（保守失效）都安全。
+  // 两个集合刻意不同、各服务一件事（见 [`LightKey`] / [`ShadeKey`] 的说明）：
+  //   · `light_key`（全部光量）→ [`light_jump`] → `light_step` → `flags.z`；
+  //   · `shade_key`（`gi_face_shade` 真正读到的那些）→ epoch → `gi_sec_slots` 的键掩码。
   //
-  // `light_step` = 光照量在**一帧内**跳过了 [`LIGHT_STEP_MAX`]（见 [`light_jump`]）。它与"世界几何
-  // 变过"同口径：该帧整帧不复用历史（`flags.z = 0`）。理由是两侧证据的时间基准已经劈开 ——
+  // `light_step` = 光照量在**一帧内**跳过了 [`LIGHT_STEP_MAX`]。它与"世界几何变过"同口径：
+  // 该帧整帧不复用历史（`flags.z = 0`）。理由是两侧证据的时间基准已经劈开 ——
   // 二次顶点缓存被 epoch 作废 ⇒ 本帧的新鲜候选算的是**新光照**，而 reservoir 里存的 `w_sum` / `M`
   // 是**旧光照**下攒出来的。不劈开就只能靠记忆窗淡出：整屏一起滞后（每个像素的窗口相位不同，
   // 于是暗下来的先后也不同步），相机一动重投影滑到邻近 texel 还会借到旧值 ⇒ 大片鬼影。
   // 逐帧的小变化（自动流逝 / 拖动「时刻」滑杆）不触发：那种变化每个窗口帧只有一小步，历史跟着走
   // 正是想要的行为。
-  let epoch_key = GiEpochKey::of(gpu.world_rev, settings.sun_bounce, lighting.as_deref());
+  let light = LightKey::of(lighting.as_deref());
   let mut light_step = false;
-  if gpu.epoch_key != Some(epoch_key) {
-    light_step = gpu.epoch_key.as_ref().is_some_and(|p| light_jump(p, &epoch_key) > LIGHT_STEP_MAX);
-    gpu.epoch_key = Some(epoch_key);
+  if gpu.light_key != Some(light) {
+    light_step = gpu.light_key.as_ref().is_some_and(|p| light_jump(p, &light) > LIGHT_STEP_MAX);
+    gpu.light_key = Some(light);
+  }
+  let shade_key = ShadeKey::of(occluder_rev, settings.sun_bounce, &light);
+  if gpu.epoch_key != Some(shade_key) {
+    gpu.epoch_key = Some(shade_key);
     gpu.epoch = gpu.epoch.wrapping_add(1);
-    bevy::log::debug!(target: "gate", "GI 二次顶点缓存 epoch → {}{}", gpu.epoch,
-                      if light_step { " [光照阶跃 ⇒ 本帧不复用历史]" } else { "" });
+    bevy::log::debug!(target: "gate", "GI 二次顶点缓存 epoch → {} [sun_bounce={}]",
+                      gpu.epoch, settings.sun_bounce);
+  }
+  if light_step {
+    bevy::log::debug!(target: "gate", "GI 光照阶跃 ⇒ 本帧不复用历史");
   }
 
   // ---- uniform（字段与 WESL `GiUniform` 逐字段镜像）----
@@ -862,8 +911,8 @@ fn prepare_gi(
   let gi_runs = settings.enabled;
   if gi_runs && let Some(v) = view.as_ref() {
     gpu.prev_view_proj = v.view_proj;
-    // 本帧的 reservoir 就是在当前 `world_rev` 下写出的 ⇒ 记下来，供下一帧判 `world_same`。
-    gpu.world_rev_gi = gpu.world_rev;
+    // 本帧的 reservoir 就是在当前 `occluder_rev` 下写出的 ⇒ 记下来，供下一帧判 `world_same`。
+    gpu.world_rev_gi = occluder_rev;
   }
 
   // ---- BG4：uniform + reservoir 双缓冲（绑定号 0/20/21，必须显式给 entry）----

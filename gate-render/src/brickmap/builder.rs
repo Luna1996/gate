@@ -386,6 +386,15 @@ impl BrickMapBuilder {
     }
   }
 
+  /// 还有没有**未上传**的改动（[`Self::take_dirty_ranges`] 会清空它）。
+  ///
+  /// 给"本帧该不该出快照"用：常驻调度（`upload::plan_residency`）的 evict / install 也走标脏，
+  /// 但它在 `extract`（唯一的出快照点）之后 ⇒ 那一份改动要到**下一帧**才被取走，`extract` 必须
+  /// 因此知道"虽然没有脏 chunk、窗口也没动，但 builder 还有待上传的东西"。
+  pub fn has_dirty(&self) -> bool {
+    !self.dirty_struct.is_empty() || self.dirty_palette.is_some()
+  }
+
   /// chunk 当前树基址（b_struct 内绝对字址；None = 未渲染）
   pub fn chunk_base(&self, coord: ChunkCoord) -> Option<usize> {
     self.chunks.get(&coord).map(|s| s.base)
@@ -873,6 +882,11 @@ impl VolumesBuilder {
   /// 某个 volume 当前的窗口（`None` = 该 volume 还没建起来）
   pub fn window_of(&self, volume_idx: usize) -> Option<(IVec3, IVec3)> {
     self.builders.get(volume_idx).map(BrickMapBuilder::window)
+  }
+
+  /// 还有没有未上传的改动（见 [`BrickMapBuilder::has_dirty`]）
+  pub fn has_dirty(&self) -> bool {
+    self.builders.iter().any(BrickMapBuilder::has_dirty)
   }
 
   /// **M6**：把每个 volume 的窗口对齐到 `grid.stream_window()`（流式世界每帧钉在相机中心）。

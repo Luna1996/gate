@@ -741,6 +741,25 @@ step = 1.0
 decimals = 0
 tooltip = "menu.game.world.mount_count.tip"
 
+# 请求（ray-guided）：装载位置与档位都由主射线给（不受半径环约束）—— 这才是"视距"的来源
+[[items.children.children]]
+kind = "toggle"
+id = "requests_load"
+label = "menu.game.world.requests_load"
+checked = true
+tooltip = "menu.game.world.requests_load.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "request_mb"
+label = "menu.game.world.request_mb"
+value = 2048.0
+min = 0.0
+max = 16384.0
+step = 256.0
+decimals = 0
+tooltip = "menu.game.world.request_mb.tip"
+
 [[items]]
 kind = "sub_menu"
 id = "ui"

@@ -12,8 +12,39 @@ pub const DEMO_TILES: i32 = 2;
 pub const BENCH_UNFOCUSED: bool = false;
 /// 相机自动绕目标旋转并平移（配 BENCH_UNFOCUSED 读移动中的逐 pass 帧）
 pub const AUTO_ORBIT: bool = false;
+
+/// 基准开关：环境变量 `GATE_BENCH` 已设置且非 `0`（`GATE_BENCH=1` 即可）。
+///
+/// WHY：跑"逐 pass 帧"的取证要打开 [`BENCH_UNFOCUSED`]（窗口启动即失焦，不开就几乎不出帧），
+/// 让它们只由常量控制就意味着每次取证都要改代码重编译。用环境变量把这两个开关变成运行期可开，
+/// 与 `GATE_LOG`（日志过滤）同一套路；两个常量仍是默认值（正常游玩不触发）。
+pub fn bench() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| {
+    std::env::var("GATE_BENCH").is_ok_and(|v| !v.is_empty() && v != "0")
+  })
+}
+
+/// 是否**额外**打开自动绕行（相机持续转头 + 以 500 v/s 平移）：`GATE_BENCH` 的值里含 `orbit`。
+///
+/// WHY 与 [`bench`] 分开：`GATE_BENCH=static` 就是"相机不动、世界静止"的**对照**——
+/// 没有这个对照，分不清某个 pass 的代价来自"世界每帧在变（历史/缓存被作废）"还是"它本身就贵"。
+pub fn bench_orbit() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| {
+    std::env::var("GATE_BENCH").is_ok_and(|v| v.to_ascii_lowercase().contains("orbit"))
+  })
+}
 /// 第 60 帧自动刷一次笔触（无鼠标走通编辑 → 增量上传链路）
 pub const EDIT_SELFTEST: bool = false;
+
+/// 日志过滤串的缺省值（喂给 bevy `LogPlugin.filter`）：info 基线 + 定向屏蔽 wgpu_hal::vulkan 的
+/// instance/surface 层 VUID 报错。**取证时用环境变量 `GATE_LOG` 覆盖整串**（见 `main.rs`）——
+/// `LogPlugin.filter` 是权威，`RUST_LOG` 不再被读，那些 `debug!`（`STREAM` / `RESID` / `WINDOW` /
+/// `GI epoch`）默认不落盘。
+pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=debug,wgpu_core=debug,\
+  wgpu_hal::vulkan::instance=off,\
+  wgpu_hal::vulkan::surface=off";
 
 /// 垂直视场角（弧度）
 pub const FOV_Y: f32 = 60.0_f32.to_radians();

@@ -196,6 +196,23 @@ impl Residency {
     }
   }
 
+  /// **还在用**的常驻 chunk，按最近使用降序（`frame - last_use <= keep`）：需求集只取这一批。
+  ///
+  /// WHY 不能拿"CPU 里全量 chunk"当需求：那等于"常驻 = CPU 里恰好有的东西"，预算一开就变成
+  /// **换出 → 下一帧又被想要 → 又装回来**的抖振（每帧 `max_install_per_frame` 全烧在装卸同一批上）。
+  /// 论文里需求**由渲染结果给**（`note_use` ← 用途戳），调用方再按池容量截断 ⇒ 常驻收敛成一个稳定的
+  /// 滚动窗口（新看到的进来、最久没看到的被换出），而不是"永远在补差集"。
+  pub fn recent_desc(&self, keep: u64) -> Vec<(ChunkCoord, u64)> {
+    let mut v: Vec<(ChunkCoord, u64)> = self
+      .entries
+      .iter()
+      .filter(|(_, e)| self.frame.saturating_sub(e.last_use) <= keep)
+      .map(|(c, e)| (*c, e.last_use))
+      .collect();
+    v.sort_unstable_by_key(|(c, t)| (std::cmp::Reverse(*t), c.0.x, c.0.y, c.0.z));
+    v
+  }
+
   /// 决策。`wants` = 需求集：`(chunk, 想要的档位)`（调用方用 [`want_level`] 按距离算，可能含未常驻的）。
   /// `must_keep` = 本帧必须保留的（正在上传 / 正在编辑）。
   pub fn plan(

@@ -15,15 +15,39 @@ use crate::chunk_tree::ChunkTree;
 use crate::coords::ChunkCoord;
 use crate::volume::VolumeGrid;
 
-/// 产出档位（"粗到细流式"的档）。**声明序即精细度序**（`Coarse < Full`，见 `#[derive(PartialOrd)]`）：
-/// 消费端用 `>=` 判"已有的够不够细"（粗档要细化时重新产出即可，挂载会整体替换）。
-/// - [`Detail::Full`]：逐体素（1 体素 = 2cm，现状口径）；
-/// - [`Detail::Coarse`]：**16³ 量化（32cm 块）** —— 每个 16³ 格一个代表材质，节点数 / 树大小远小于
-///   全分辨率。远景用它 ⇒ 同样的内存/帧额把视距推远（`docs/editable-gigavoxel.md` §10.3 第一条）。
+/// 产出档位（"粗到细流式"的梯级）。值 = **格粒度**：`grain() = 4^(4-值)` 体素 ——
+/// `0` = 整 chunk 一格（5.12 m）、`1` = 64³（1.28 m）、`2` = 16³（32 cm）、`3` = 4³（8 cm）、
+/// `4` = 逐体素（2 cm）。**声明序即精细度序**（`Detail(0) < Detail(4)`，见 `#[derive(PartialOrd)]`）：
+/// 消费端用 `>=` 判"已有的够不够细"（不够细就重新产出，挂载会整体替换）。
+///
+/// CONSTRAINT：**档位由"这一级在当前屏幕上是否 ≤ 1 px"定，不由半径拍**（`docs/editable-gigavoxel.md`
+/// §3.3）。粒度 `g` 体素的一档，在距离 `d` 处的像素尺寸是 `g / (d·px_ang)` ⇒ 只有当
+/// `d ≥ g/px_ang` 时才允许用它；否则画面里就是 `g/(d·px_ang)` 像素的方块（"稍远就什么都看不清"）。
+/// 允许档里取**最粗**的那个（内存最优）。切换判据见 `gate-app::infinite_cubes::detail_at`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Detail {
-  Coarse,
-  Full,
+pub struct Detail(pub u8);
+
+impl Detail {
+  /// 逐体素（2 cm）—— 最细一档。
+  pub const Full: Detail = Detail(4);
+  /// 4³ 量化（8 cm）。
+  pub const Fine: Detail = Detail(3);
+  /// 16³ 量化（32 cm）。
+  pub const Coarse: Detail = Detail(2);
+  /// 64³ 量化（1.28 m）。
+  pub const Wide: Detail = Detail(1);
+  /// 整 chunk 一格（5.12 m）—— 最粗一档。
+  pub const Chunk: Detail = Detail(0);
+
+  /// 本档的**格粒度**（格边长，体素）：1、4、16、64、256。
+  pub fn grain(self) -> i32 {
+    1 << (2 * (4 - self.0.min(4)))
+  }
+
+  /// 比本档更粗一档（最粗档返回自己）。
+  pub fn coarser(self) -> Detail {
+    Detail(self.0.saturating_sub(1))
+  }
 }
 
 /// 生产源：按坐标产出一棵 chunk 树。

@@ -38,14 +38,43 @@ pub const LOD_DIAG_WORDS: usize = 3;
 /// chunk 在 GPU 上没有树块"记成一条请求（chunk 相对窗口下标 + 所需档位 + 射线类型），Rust 侧按
 /// `REPORT_PERIOD_SECS` 回读 + 合并排序后驱动流式加载。
 ///
-/// 请求环缓冲槽数：新的覆盖旧的 ⇒ 回读只看到最近这么多条（溢出另有计数）。
+/// 请求环缓冲槽数：新的覆盖旧的 ⇒ 回读只看到最近这么多条（**这不是"丢失"**：消费端也只读最新
+/// `REQ_CAP` 条；真的丢要等"单窗口新增条数 > `REQ_CAP`"）。
 /// **shader 侧不写死容量**：`trace.wesl::req_push` 用 `arrayLength(&lod_req)` 取绑定的实际长度 ⇒
 /// 这里就是唯一来源。开关同样不在这里（权威值是 `trace.wesl::REQ_ENABLE`，经
 /// [`crate::wesl_consts::trace_consts`] 解析）。
-pub const REQ_CAP: usize = 1024;
-/// 请求缓冲字数：`[0]` = 累计条数（只增，CPU 读差值配对 `REQ_CAP` 取模）、`[1]` = 溢出计数、
-/// 其后 [`REQ_CAP`] 个请求字。
-pub const LOD_REQ_WORDS: usize = 2 + REQ_CAP;
+///
+/// CONSTRAINT（**这个值就是"ray-guided 的信息量"**）：环是**最近性**采样，而"每条射线只报最前面的
+/// 两个缺失 chunk"（`REQ_PER_RAY_MAX`）⇒ 最近的缺失块被反复报、把远处的挤掉。环太小就只剩"刚执行的
+/// 那一小片屏幕"（实测 1024：合并后 8–27 个 chunk，全是眼前那一对）⇒ 消费端每窗只学到几十个"要装
+/// 哪里"，加载既慢又不看视线。
+/// 1 M 字（4 MB）= **整屏采样射线一帧的量**（约 `像素/16 × 2` 条事件）：环里装得下"整个画面这一帧
+/// 想看什么" ⇒ 合并后给出上千个 chunk 的需求分布（消费端再按票数取前 [`REQ_FEED_MAX`] 条）。
+/// 回读侧用**稠密 64³ 计数器**做合并（`profiler::report_lod_requests`：一次 1 M 遍历，无哈希）。
+pub const REQ_CAP: usize = 1024 * 1024;
+/// 回读**合并后**喂给消费端的条数上限（票数最高的前 N 条）。
+/// 需求表只需要"最想要的那一批"：票数排序天然把近处/正对着的排在前面；不封顶会让
+/// `LodRequestFeed` 带着上万个 chunk 进主线程（每帧拷一份 + 排序 = 几十 ms 的尖峰）。
+///
+/// 环里最多同时存几条**请求**。环只承载"缺了"这一类（`trace.wesl::req_push`）；"看见了"这类
+/// 走下面的**用途戳表**（稠密，按构造不可能溢出）⇒ 这里给一个够宽的量就够（实测每窗口几十万条 →
+/// 去重后 44–150 个 chunk，消费端按票数取前 [`REQ_FEED_MAX`] 条）。
+pub const REQ_FEED_MAX: usize = 16 * 1024;
+/// `lod_req` 头部字数：`[0]` 累计条数、`[1]` 保留、`[2]` 用途戳计数器，其后是用途戳表。
+pub const USE_BASE: usize = 3;
+/// 请求缓冲字数：`[0]` = 累计条数（只增，CPU 读差值配对 `REQ_CAP` 取模）、`[1]` = 保留、
+/// `[2]` = 用途戳计数器、`[3 .. 3+USE_WORDS)` = 用途戳表、其后 [`REQ_CAP`] 个请求字。
+pub const LOD_REQ_WORDS: usize = 3 + USE_WORDS + REQ_CAP;
+/// **用途戳表**的格数 = 窗口 chunk 数（64³）= 表是**稠密**的：窗口内每个 chunk 一格。
+///
+/// 论文 §III.A 的 usage stamp：`trace.wesl::req_use` 在遍历中对**已加载**的 chunk 记一笔
+/// "这条主射线看到了它"（值 = 单调计数器发的戳，`atomicMax` 合并）。它是**缓存替换（LRU）唯一的
+/// "最近使用"来源** —— 取代原先"每射线一条环记录"的可见性投票：后者会被约 1000 万条/秒的投票打爆
+/// （实测环 100% 溢出 ⇒ 消费端读到的需求列表退化成 71 条垃圾），而稠密表**按构造不可能溢出**。
+pub const USE_WORDS: usize = 64 * 64 * 64;
+/// 请求环在 `lod_req` 里的起始字下标（`[0]` 累计条数 / `[1]` 保留 / `[2]` 用途戳计数器 /
+/// `[3 .. 3+USE_WORDS)` 用途戳表）。**必须与 `trace.wesl::REQ_BASE` 一致**（那边是 shader 侧的唯一来源）。
+pub const REQ_BASE: usize = USE_BASE + USE_WORDS;
 /// beam 预 pass（关掉则主 pass 从 t=0 起步）
 pub const DDA_BEAM: bool = true;
 /// 方向可达掩码剔除（LUT）

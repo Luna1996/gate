@@ -55,8 +55,10 @@ import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DE
 // ============================================================================
 
 /// 导引 [word 址]：本像素是否有效（首命中不透明体素）。
-/// 判据 = **键非零** —— 切**不要**改成「读某个有效位」：`GI_DEN_G_KEY1` 里 face 占 13..15
-/// 三个 bit，`face = 4 (-z)` 的 0x8000 会与 bit15 撞车（见 `gi/consts.wesl` 的说明）。
+/// 判据 = **键非零** —— 切**不要**改成「读某个有效位」：`GI_DEN_G_KEY1` 的位域**已经被占满**
+/// （z 0..15、face 16..18、obj 19..31），任何"另设一个有效位"都会与既有字段撞车。
+/// 唯一的代价是「体素恰好在 (−32768, −32768, −32768)」会被当作无效 —— `gi_key_ok` 把这个点
+/// 排除在合法范围外（见 `gi/common.wesl`），所以撞不到。
 fn gi_den_valid_b(b: u32) -> bool {
   return (gi_guide[b + GI_DEN_G_KEY0] | gi_guide[b + GI_DEN_G_KEY1]) != 0u;
 }
@@ -121,13 +123,13 @@ fn gi_den_guide_store(
 /// **它只看 DDA 的入射面**，因此不受 `voxel_normal` 的梯度法线影响（凸棱上那条法线是斜的，
 /// 拿它去算平面距离会自相矛盾 —— 平面归属必须用这个轴对齐的面）。
 fn gi_den_same_plane(hk0: u32, hk1: u32, k0: u32, k1: u32) -> bool {
-  let face = (k1 >> 13u) & 7u;
-  if (face != ((hk1 >> 13u) & 7u)) { return false; }
-  if ((k1 >> 16u) != (hk1 >> 16u)) { return false; }
+  let face = (k1 >> 16u) & 7u;
+  if (face != ((hk1 >> 16u) & 7u)) { return false; }
+  if ((k1 >> 19u) != (hk1 >> 19u)) { return false; }
   let axis = face >> 1u;
-  if (axis == 0u) { return (k0 & 0x1FFFu) == (hk0 & 0x1FFFu); }
-  if (axis == 1u) { return ((k0 >> 13u) & 0x1FFFu) == ((hk0 >> 13u) & 0x1FFFu); }
-  return (k1 & 0x1FFFu) == (hk1 & 0x1FFFu);
+  if (axis == 0u) { return (k0 & 0xFFFFu) == (hk0 & 0xFFFFu); }
+  if (axis == 1u) { return (k0 >> 16u) == (hk0 >> 16u); }
+  return (k1 & 0xFFFFu) == (hk1 & 0xFFFFu);
 }
 
 /// **全管线唯一的「同一个面」判据** = 平面归属（`gi_den_same_plane`，键）**且** 着色法线相似。

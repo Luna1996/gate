@@ -987,10 +987,10 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
 
   // ---- 从面键重建命中（位布局见 `gi/common.wesl` 的 `gi_key0`/`gi_key1`）----
-  let voxel = vec3<i32>(i32(k0 & 0x1FFFu) - 4096, i32((k0 >> 13u) & 0x1FFFu) - 4096,
-                        i32(k1 & 0x1FFFu) - 4096);
-  let face_id = (k1 >> 13u) & 7u;
-  let obj_id = i32((k1 >> 16u) & 0xFFFFu) - 1;
+  let voxel = vec3<i32>(i32(k0 & 0xFFFFu) - 32768, i32((k0 >> 16u) & 0xFFFFu) - 32768,
+                        i32(k1 & 0xFFFFu) - 32768);
+  let face_id = (k1 >> 16u) & 7u;
+  let obj_id = i32((k1 >> 19u) & 0x1FFFu) - 1;
   let gg = make_grid(u32(obj_id) + 1u);
   let p_voxel = voxel_center_world(gg, voxel);
   // `point` 传**体素中心**：`fetch_material` 内部本来就量化到体素中心（UV 逐位相同）；唯一差别是

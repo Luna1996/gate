@@ -1076,7 +1076,12 @@ pub(crate) fn prepare_dda_bind_groups(
     let face_slots_n = (px * 2).next_power_of_two().clamp(256, 1u64 << 21);
     beam_cache.face_slots =
       Some(make_buf("gate_face_slots", face_slots_n * c.face_words as u64 * 4));
-    // 二次顶点按面缓存：同一套槽数规则（被 GI 射线打到的面的数量与可见面同量级）。
+    // 二次顶点按面缓存：槽数跟屏幕走（与可见面同量级）。
+    // 实测（2026-09-25）：把它从 2^19 放大到 2^24 槽（10 MB → 336 MB）**没有任何收益**
+    // （`gate_gi` 16.35 → 17.39 ms，反而略差）。**别把那次实测读成"命中率无关"**：当时槽里的键
+    // 带着"任何上传都自增"的 epoch（流式世界里每帧 +1）⇒ 整张表每帧自失效、命中率恒为 0，
+    // 放大槽数自然没有收益。epoch 现在只跟 `gi_face_shade` 的真实输入走（见 `gi::ShadeKey`），
+    // 槽数够不够要重新量。
     beam_cache.gi_sec_slots =
       Some(make_buf("gate_gi_sec_slots", face_slots_n * c.gi_sec_words as u64 * 4));
     beam_cache.gi_hist = [
@@ -1479,8 +1484,8 @@ pub(crate) fn dispatch_dda(
     // 逐面去重表**每帧整块清空**（`FACE_W_FLAG == 0` = 空槽）：清空必须排在 `gi_main` 之前，
     // 否则上一帧的认领会把本轮同槽的新键挡在门外（撞键只会少赚，但残留表会让收益归零）。
     // 二次顶点缓存（`gi_sec_slots`）**不清空**：它靠槽里键的 epoch 掩码自失效（uniform `gi_u.seq.y`，
-    // 由 `prepare_gi` 逐项比对光照/几何的输入后自增）⇒ 省掉每帧那份 clear 带宽
-    // （2K + 1/4 档那张表约 42MB/帧），见 `gi/common.wesl` 的「跨帧持久」段。
+    // 由 `prepare_gi` 逐项比对 `gi_face_shade` 的输入后自增 —— 流式挂载与编辑**不**计入）⇒ 省掉每帧
+    // 那份 clear 带宽（2K + 1/4 档那张表约 42MB/帧），见 `gi/common.wesl` 的「跨帧持久」段。
     if let Some(fs) = aux.face_slots_buffer() {
       ctx.command_encoder().clear_buffer(fs, 0, None);
     }

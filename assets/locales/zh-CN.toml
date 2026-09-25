@@ -286,9 +286,9 @@ GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 """
 "menu.game.world.unload_radius" = "卸载半径"
 "menu.game.world.unload_radius.tip" = """
-全分辨率的卸载半径（切比雪夫），**须 > 加载半径**：差值就是迟滞带。
+相机近旁的**保护半径**（切比雪夫，chunk）：这一圈内一律**不参与换出**，须 `>` 加载半径。
 
-差 `1` 够用，且能把常驻集真正限住；差 `2` 会在相机身后留下更大的尾迹。
+用途戳每 `2s` 才回来一批 ⇒ 启动后头两秒没有任何"最近使用"信号，全靠这一圈保住脚下不出现空洞。
 """
 "menu.game.world.coarse_radius" = "粗档半径"
 "menu.game.world.coarse_radius.tip" = """
@@ -313,6 +313,19 @@ GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 每帧挂载的**条数**上限：防一大堆极小的树把单帧的记账开销顶爆。
 
 字数预算没花完也最多挂这么多条。
+"""
+"menu.game.world.requests_load" = "请求装载"
+"menu.game.world.requests_load.tip" = """
+**开** ⇒ 主射线请求的 chunk **不再受半径环约束**（只要在流式窗口内就装）—— 装载位置由射线给、不由距离给。
+
+关掉就退回"请求只在半径环内重排"的纯半径行为。加载区域因此从**对称立方体**变成**顺着视线的那一块**。
+"""
+"menu.game.world.request_mb" = "常驻池"
+"menu.game.world.request_mb.tip" = """
+**常驻池的内存预算**（MB）：池满就换出**最久没被主射线看到**的 chunk。
+
+CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的每块约 `0.5MB` 折算（GPU 的 wire 只要约
+`0.3MB`）⇒ 这个数基本上就是"进程里那块 chunk 缓存占多少内存"。调 `0` = 不限。
 """
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"

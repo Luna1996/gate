@@ -95,10 +95,13 @@ struct MaterialAsset {
 /// 槽位见 `trace.wesl::DIAG_*`；**只增不清**（CPU 侧读差值）⇒ 不需要清零，也没有"清零写 vs GPU 写"的竞态。
 @group(1) @binding(9) var<storage, read_write> lod_diag: array<atomic<u32>>;
 
-/// 10：**M4 ray-guided 请求环缓冲**（`trace.wesl::REQ_ENABLE` 为 1 时才被写）。
-/// 布局（Rust `brickmap::consts::{REQ_CAP, LOD_REQ_WORDS}`）：`[0]` = 累计条数、`[1]` = 溢出计数、
+/// 10：**M4 ray-guided 请求环缓冲 + 用途戳表**（`trace.wesl::REQ_ENABLE` 为 1 时才被写）。
+/// 布局（Rust `brickmap::consts::{REQ_CAP, USE_WORDS, LOD_REQ_WORDS}`）：`[0]` = 累计条数、
+/// `[1]` = 保留（见 `trace.wesl::REQ_RESERVED`）、`[2]` = 用途戳计数器、
+/// `[3 .. 3+USE_WORDS)` = **用途戳表**（窗口内每 chunk 一格，`atomicMax` 写）、
 /// 其后 `REQ_CAP` 个请求字（编码见 `trace.wesl::req_push`）。
-/// 必须是 **read_write**（shader 原子追加）；GPU 上无人读它 —— 只给 Rust 侧回读（M4 的消费端）。
+/// 两张表共用一块绑定：用途戳是**稠密**表（按构造不溢出）⇒ 可见性投票不再挤占请求环。
+/// 必须是 **read_write**（shader 原子写）；GPU 上无人读它 —— 只给 Rust 侧回读（M4 的消费端 + LRU）。
 @group(1) @binding(10) var<storage, read_write> lod_req: array<atomic<u32>>;
 
 // **BG1 的 binding 号到此为止（0..10）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，已按实测
@@ -281,7 +284,8 @@ struct FogUniform {
 /// 键口径与 `face_slots` 相同（`gi_key0`/`gi_key1`），但填充者是 GI 射线自己（惰性、写同值 ⇒ 竞态
 /// 幂等）：同一个面被成千上万条射线打到时只算一次二次顶点着色（含它那条太阳 NEE 阴影射线）。
 /// **跨帧持久**（与 `face_slots` 不同）：不需要认领、**没有每帧清空**，槽里的键带 epoch 掩码
-/// （uniform `gi_u.seq.y`）⇒ 光照 / 几何一变整张表自失效。算法与代价、撕裂窗口的
+/// （uniform `gi_u.seq.y`，键里还有命中体素的 `pal`）⇒ 只有 `gi_face_shade` 的输入真的变了
+/// 才整表自失效（**流式挂载 / 卸载与逐体素编辑不算**）。算法与代价、撕裂窗口的
 /// 处理都在 `gi/common.wesl` 的那两段说明里；这里只声明它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
 @group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
 

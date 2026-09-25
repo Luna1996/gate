@@ -105,17 +105,38 @@ const REQ_ENABLE: u32 = 1u;
 const REQ_SAMPLE: u32 = 16u;
 /// 每条射线最多记几条（一条射线连续穿过很多缺失 chunk 时只记最前面的几条）
 const REQ_PER_RAY_MAX: u32 = 2u;
-/// 缓冲字下标（`[0]` 条数、`[1]` 溢出计数、其后是环）。
-/// **容量不在这里写死**：`req_push` 用 `arrayLength(&lod_req)` 取绑定的实际长度 ⇒ 与 Rust 的
+/// 缓冲字下标（`[0]` 累计条数、`[1]` 保留、`[2]` 用途戳计数器、`[3 .. 3+USE_WORDS)` 用途戳表、
+/// 其后是环）。**容量不在这里写死**：`req_push` 用 `arrayLength(&lod_req)` 取绑定的实际长度 ⇒ 与 Rust 的
 /// `consts::LOD_REQ_WORDS` **同源**，不会出现两边常量不一致（那会导致越界写 + 解包全垃圾）。
 const REQ_COUNT: u32 = 0u;
-const REQ_OVERFLOW: u32 = 1u;
-const REQ_BASE: u32 = 2u;
+/// `[1]` **保留**：原先这里是"溢出计数"（`n >= cap` 就 +1），但 `n` 是**累计**的 ⇒ 累计条数一旦超过
+/// 环容量，它每窗口都恰好等于窗口条数，看着像"100% 溢出"其实一条都没丢（消费端只读最新 `cap` 条）。
+/// "这一窗口有没有丢"改由消费端按 `REQ_CAP` 判（见 `profiler::report_lod_requests`）。
+const REQ_RESERVED: u32 = 1u;
 /// 请求字里 chunk 相对窗口下标的每轴位数（窗口 = 64³ chunk ⇒ 6 位）
 const REQ_REL_BITS: u32 = 6u;
 /// 只报"需要 ≤ 这个档位"的请求（0 = 全分辨率 4³、1 = 16³）：更远的（64³ / 整 chunk 档）连一个平色
 /// 都够 ⇒ 不值得为它加载。
 const REQ_LEVEL_KEEP: u32 = 1u;
+
+// ---------------------------------------------------------------------------
+// 用途戳（usage stamp，论文 §III.A）：**"哪些 chunk 现在真的被看"的唯一来源**。
+//
+// 为什么要有它：论文的缓存替换靠"最近使用"（LRU），而本仓原先把"最后被**请求**时刻"当 LRU 键 ——
+// 那个信号只在"块缺了"时才更新，块一装好就冻结 ⇒ 看起来永远是最旧的 ⇒ 被换出 ⇒ 再被请求 ⇒
+// 反复产出。用途戳反过来：**只要射线还在看它，戳就一直被刷新**，所以正在看的东西永远排最后。
+//
+// 与请求环共用同一块绑定（前缀区）⇒ 不加 binding、不改任何 layout；表是**稠密**的（窗口内每 chunk
+// 一个 u32）⇒ **按构造不可能溢出**（这正是把"看见了"从环记录改成戳的原因：环记录会被 1000 万条/秒
+// 的可见性投票打爆，而 100% 溢出时消费端读到的就是垃圾）。
+//
+// 戳值由 `USE_TICK` 计数器发（`atomicAdd`）⇒ 单调、与 CPU 帧号无关、**不需要清零**：CPU 侧只认
+// "(上次读数, 本次读数] 区间内的戳"，陈旧条目天然落在区间外。
+const USE_WORDS: u32 = 64u * 64u * 64u;
+const USE_TICK: u32 = 2u;
+const USE_BASE: u32 = 3u;
+const REQ_BASE: u32 = 3u + USE_WORDS;
+
 
 /// 该距离"够用的档位"下标：0 = 全分辨率（4³）、1 = 16³、2 = 64³、3 = 整 chunk（256³）。
 /// 阶梯与 Rust `residency::want_level` **同一口径**（`fp ≥ 4/16/64` ⇒ 16³/64³/整 chunk）——
@@ -138,20 +159,33 @@ fn req_sampled(origin: vec3<f32>, dir: vec3<f32>) -> bool {
 /// 记一条请求。`rel` = chunk 相对窗口下标，`level` = [`req_level`] 的下标，`kind` = 0 主射线 / 1 次级
 /// （位留给消费端排序；当前只有主射线会走到这里）。
 ///
-/// 环缓冲追加：`n = atomicAdd([0])` ⇒ 写 `[REQ_BASE + n % cap]`；`n ≥ cap` 时同时抬 `[1]`
-/// （= 被覆盖掉的条数，读回侧用它判容量够不够）。**容量取自绑定的实际长度**（见 `REQ_COUNT` 的说明）。
+/// 环缓冲追加：`n = atomicAdd([0])` ⇒ 写 `[REQ_BASE + n % cap]`。环满即**覆盖最旧的**：消费端只读最新
+/// 的 `cap` 条（见 `REQ_RESERVED` 的说明）。**容量取自绑定的实际长度**（见 `REQ_COUNT` 的说明）。
 /// **不去重、不排序**：那是消费端的事。
 fn req_push(rel: vec3<u32>, level: u32, kind: u32) {
   if (REQ_ENABLE == 0u) { return; }
   let cap = arrayLength(&lod_req) - REQ_BASE;
   let n = atomicAdd(&lod_req[REQ_COUNT], 1u);
-  if (n >= cap) { atomicAdd(&lod_req[REQ_OVERFLOW], 1u); }
   let w = (rel.x & 63u)
     | ((rel.y & 63u) << REQ_REL_BITS)
     | ((rel.z & 63u) << (REQ_REL_BITS * 2u))
     | ((level & 3u) << 18u)
     | ((kind & 1u) << 20u);
   atomicStore(&lod_req[REQ_BASE + (n % cap)], w);
+}
+
+/// 记一条**用途戳**："这条主射线看到了 `rel` 那个 chunk"。只喂缓存替换（LRU），**不进需求表**。
+///
+/// 戳 = `USE_TICK` 计数器的当前值（`atomicAdd` 取）⇒ 单调递增；表项用 `atomicMax` ⇒ 同一窗口内
+/// 任意多条射线并发写只留最新的一笔。窗口相对下标 3×6 位 ⇒ 偏移落在 `[USE_BASE, USE_BASE+USE_WORDS)`
+/// 之内（`USE_WORDS` 恰好是窗口 chunk 数 64³）⇒ 与请求环互不重叠。
+fn req_use(rel: vec3<u32>) {
+  if (REQ_ENABLE == 0u) { return; }
+  let i = (rel.x & 63u)
+    | ((rel.y & 63u) << REQ_REL_BITS)
+    | ((rel.z & 63u) << (REQ_REL_BITS * 2u));
+  let t = atomicAdd(&lod_req[USE_TICK], 1u);
+  atomicMax(&lod_req[USE_BASE + i], t);
 }
 
 /// 叶级 LOD 代表色（M2）：节点 palette word 高 16 位存的就是它 —— 写侧算的是**块内按体素数加权的
@@ -702,8 +736,21 @@ fn grid_hit(h: VoxelHit, ci: vec3<i32>,
 /// `req` = 本 pass 是否允许发 ray-guided 请求（0 = 不发；见 `REQ_ENABLE` 的 CONSTRAINT）。
 fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
               penetrate: bool, req: u32, mc: ptr<function, MediumRay>) -> UnifiedHit {
-  let w_mn = g.w_mn;
-  let w_mx = g.w_mx;
+  // **次级射线的行程上限**（chunk；`0` = 不限）：GI / 阴影 / 反射只需要**局部**信息，而窗口是 ±32 chunk
+  // ⇒ 它们在"窗口内但没加载"的空间里一路走空。出界按"没几何"处理即可 —— 调用方落回天空
+  // （离开窗口本来就等于天空）。
+  // CONSTRAINT: 只夹**这个局部副本** ⇒ 主射线（`req == 1`）与物体完全不受影响。调大它 = 换来更远的
+  // 间接光贡献、代价是空区步数线性增长。
+  // 实测（2026-09-25）：12 → 1 让 `gate_gi` 16.2 → 6.2 ms —— 代价**随行程线性**，这是 GI 的两个真
+  // 杠杆之一（另一个是候选数）。见 `docs/editable-gigavoxel.md` 的「附二」。
+  const SECONDARY_REACH_CHUNKS: f32 = 12.0;
+  var w_mn = g.w_mn;
+  var w_mx = g.w_mx;
+  if (req == 0u && SECONDARY_REACH_CHUNKS > 0.0) {
+    let reach = vec3<f32>(SECONDARY_REACH_CHUNKS * 256.0);
+    w_mn = max(w_mn, origin - reach);
+    w_mx = min(w_mx, origin + reach);
+  }
   let l_min = g.l_min;
   let l_max = g.l_max;
   let index_origin = g.index_origin;
@@ -859,6 +906,14 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       }
       if (entry != 0u) {
         air_chunk = false;
+        // **用途戳**（论文 §III.A 的 usage stamp）：已加载的 chunk 要留下"射线在看它"的证据 ——
+        // 缓存替换（LRU）唯一的"最近使用"来源。**不占 `req_sent` 的名额**（那条留给"缺了"的请求：
+        // 命中射线多，名额要留给真正需要加载的地方），只走 `REQ_SAMPLE` 采样闸门。
+        // 与请求环的关键差别：戳表是**稠密**的（窗口内每 chunk 一格 + `atomicMax`）⇒ 并发再多也不
+        // 会溢出、也不会把"缺了"的请求挤出环；而"每射线一条环记录"的写法会被可见性投票打爆。
+        if (req != 0u && req_sampled(origin, dir)) {
+          req_use(rel_u);
+        }
         let chunk_base = tree_base + entry - 1u;
         let chunk_min = vec3<f32>(ci) * f32(CHUNK_SIZE);
         // chunk 内遍历从 max(chunk 入口, t_min) 开始，跳过 t_min 前的空空间

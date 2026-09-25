@@ -163,6 +163,7 @@ pub(crate) fn setup(
     demo_force_full_rebuild: true,
     interior_only_edit: false,
     edit_in_flight: false,
+    residency_budget_bytes: 0,
   });
   commands
     .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
