@@ -529,7 +529,6 @@ pub fn stream_chunks(
   let uses: Vec<gate_render::LodUse> =
     use_feed.as_ref().map(|f| f.peek()).unwrap_or_default();
 
-  let mut gen_req = 0usize;
   let mut generated = 0usize;
   {
     let mut guard = stream
@@ -606,8 +605,8 @@ pub fn stream_chunks(
     let first = (*frames as usize) % n_vol.max(1);
     for i in 0..n_vol {
       let vol = (first + i) % n_vol;
-      // 逐卷重置：`gen_req` 只有非远场那条路会写，不重置的话远场那条会打印上一卷留下的读数
-      gen_req = 0;
+      // 本卷需求表里来自请求的条数（只有非远场那条路会写；远场整表都是请求，见下面的日志）
+      let mut gen_req = 0usize;
       let scope = scopes[vol];
       let st = &mut vols[vol];
       let far_level = scene.volumes.list[vol].is_far_level();

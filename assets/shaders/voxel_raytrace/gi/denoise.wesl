@@ -312,6 +312,13 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       var clamped = hcol;
       if (cnt > 1.5) {
         clamped = clamp(hcol, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
+      } else {
+        // 面只占一个 GI texel（5×5 邻域里找不到同面的 tap）⇒ ⑤ 的邻域统计量拿不到。
+        // 用**逐像素相对钳制**顶替：历史落在"本帧输入"的 `[1/K, K]` 倍内 = 与观测一致（差异只
+        // 可能是噪声），落在范围外 = 真变了。`pad` 给近零输入一点绝对余量。
+        // 没有这一支时这些像素只能退回按 σ 缩权重（时域盒形同关闭）⇒ **极个别孤立体素点仍涨落**。
+        let pad = l_ref * GI_DEN_LUMA_FLOOR_REL;
+        clamped = clamp(hcol, c_in * (1.0 / GI_DEN_CLAMP_K) - pad, c_in * GI_DEN_CLAMP_K + pad);
       }
       // σ 取**累积矩**与本帧观测的较大者：累积矩把多帧的观测平均掉 ⇒ σ 不再逐帧抖
       // （逐帧抖会让下面的历史权重跟着抖，表现为持续的细颗粒闪动）；
@@ -320,7 +327,15 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let h_m2 = bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_M2]);
       let sigma_hist = sqrt(max(h_m2 - h_m1 * h_m1, 0.0));
       sigma_use = max(sigma, sigma_hist);
-      let w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
+      // σ 回答"本帧输入有多不可信"，**不回答"画面变没变"** —— 而缩历史权重需要后者。
+      // 重尾估计（暗处被小发光体照亮的面：候选少、命中发光体的概率低 ⇒ 逐帧 σ 远大于均值）在
+      // **静止**时 σ 就很大 ⇒ 按 `σ_α/σ_use` 缩权重会让这类像素的时域累积形同关闭。
+      // 判"变没变"的就是**上面那次 AABB 钳制**（含 `cnt ≤ 1.5` 的相对钳制那一支）：钳制一字未动
+      // ⇒ 与观测一致 ⇒ 不缩权重；钳制动过它 ⇒ 确实偏离 ⇒ 才按 σ 缩。
+      var w_var = 1.0;
+      if (any(clamped != hcol)) {
+        w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
+      }
       // WHY: 位移惩罚**只作用于靠搜索挪开落点才接上的那类历史**（`shifted`）—— 只有它是"借到邻居
       // 位置"的来源（判据只要求同平面 + 法线相似，切向坐标不进判据）。正中命中（`s = 0`）的历史
       // 就落在本像素命中点的重投影上，是同一个世界点的同一个积分 ⇒ 与相机位移无关，不吃惩罚。
@@ -393,9 +408,6 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
   }
   // 核半径来自降噪自己的小配置 buffer（降噪 pass 只有 group(0)，够不到 `gi_u`，见 `bindings.wesl`）。
   let r = i32(gi_den_cfg[0u]);
-  // **短历史稳定化**（`GI_DEN_STAB_FRAMES` / `GI_DEN_STAB_MAX`）：本帧的历史长度由时域 pass 写进
-  // `gi_hist_cur`（两个降噪 pass 共用同一份 group(0) ⇒ 这里读得到）。`M` 小 ⇒ 步长放大 ⇒
-  // 用**更宽的模糊**代替生噪点；`M ≥ GI_DEN_STAB_FRAMES` ⇒ 倍率 1 ⇒ 与稳定像素的路径逐位相同。
   let hb = idx * GI_DEN_HIST_WORDS;
   let m_hist = bitcast<f32>(gi_hist_cur[hb + GI_DEN_H_M]);
   let stab = clamp(GI_DEN_STAB_FRAMES / max(m_hist, 1.0), 1.0, GI_DEN_STAB_MAX);

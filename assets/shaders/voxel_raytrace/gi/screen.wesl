@@ -401,12 +401,20 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let err_tier = u32(gi_u.misc.z);
   var b_err = 1.0;
   if (err_tier > 0u) {
-    let lo = select(select(0.70, 0.50, err_tier >= 2u), 0.25, err_tier >= 3u);
+    // **只增不砍**：`hi` = 窗没填满时的加速倍率（尽快把窗填满），填满后回到 **1.0 = 基准**。
+    //
+    // WHY 不再有 `lo`（原来是 0.25 / 0.5 / 0.7，**低于基准**）：那条的前提是"窗填满 ⇒ 累积量已经
+    // 承载了信息 ⇒ 边际收益低，可以省射线"。但降噪侧的 `w_var = clamp(σ_α/σ_use, 0.05, 1)` 会在
+    // **同一批像素**上独立地判定"这份历史不可信"（重尾估计里 σ_use ≫ σ_α，暗处靠自发光照明的面
+    // 最典型）。两个机制对同一份历史给出**相反结论** ⇒ 那些像素变成"**1 条射线 + 不被信任的历史**"，
+    // 而运动时（历史接不上 ⇒ 走 `hi`）反而是 32 条 ⇒ **静止比运动脏 16~32 倍**。
+    // 实测：把「重分配」拨到「关」（= 恒 1.0）立刻好转。所以这里把语义改回字面意思 ——
+    // "重分配"只把预算**重新分配**给没填满的像素，绝不把基准砍掉。
     let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
     // 「填满了」的判据 = `gi_res_cap` 的样本上限（`m_cap_k` 的 `cand_n0/cand_n` 放大与这里相乘
     // 互补 ⇒ 与本帧候选数无关，恒为 `m_cap_base × cand_n0`）。
     let warm_m = f32(m_cap_base * cand_n0);
-    b_err = select(hi, lo, hist_ok && hist.m >= warm_m);
+    b_err = select(hi, 1.0, hist_ok && hist.m >= warm_m);
   }
   // 抖动 = `floor(want + dither)`：整数条数会把预算差变成同心环，用逐帧抖动的分数部分摊成噪声。
   let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;

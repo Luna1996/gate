@@ -263,6 +263,9 @@ pub struct BuilderMirror {
   pub pending_data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
   /// 各 volume 调色板上次同步的写版本（判断「只改材质」是否需上传）。
   pub palette_versions: Vec<u64>,
+  /// 各 volume 调色板上次同步的**内容版本**（判断「世界外观变了吗」）—— 与 `palette_versions`
+  /// 分开的理由（认领新槽不算外观变化）见 `gate_voxel::Palette::content_version`。
+  pub palette_content_versions: Vec<u64>,
   pub pending_comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
 }
 
@@ -518,13 +521,23 @@ fn extract(
     .iter()
     .enumerate()
     .any(|(i, g)| mirror.palette_versions.get(i).copied() != Some(g.palette().version()));
+  // **外观是否变了**用内容版本，不用写版本：流式源逐帧认领新槽（`Pool::intern`）也会让写版本自增，
+  // 而新槽不影响任何已上传体素 ⇒ 拿写版本会让流式世界**每帧整屏作废 GI 历史**（症状：噪声反复被
+  // 重置回原始估计、静止也不收敛、一动更频繁）。见 `gate_voxel::Palette::content_version`。
+  let palette_content_changed = scene
+    .volumes
+    .list
+    .iter()
+    .enumerate()
+    .any(|(i, g)| mirror.palette_content_versions.get(i).copied() != Some(g.palette().content_version()));
   let dirty_any =
     need_full || !pending_data.is_empty() || !_pending_comp.is_empty() || palette_dirty;
 
   // 本帧上传改动范围（世界 voxel 脏盒）：全量上传 = full，增量 = 逐 volume（主世界 + 物体）一个盒。
   // 主世界与物体走同一路径：物体的局部 AABB 经 transform 转成世界 AABB，余量按 scale 放大（见 `world_dirty_box`）。
   // 只改材质（palette 版本变化）时没有有意义的 AABB，走 `palette_changed`。
-  let mut dirty_aabb = BrickMapDirty { palette_changed: palette_dirty, ..Default::default() };
+  let mut dirty_aabb =
+    BrickMapDirty { palette_changed: palette_content_changed, ..Default::default() };
   if dirty_any {
     if need_full {
       dirty_aabb.full = true;
@@ -608,6 +621,8 @@ fn extract(
   let snapshot = builder.snapshot();
 
   mirror.palette_versions = scene.volumes.list.iter().map(|g| g.palette().version()).collect();
+  mirror.palette_content_versions =
+    scene.volumes.list.iter().map(|g| g.palette().content_version()).collect();
 
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();

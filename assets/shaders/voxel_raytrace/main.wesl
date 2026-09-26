@@ -1020,6 +1020,21 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       f32(atomicLoad(&face_slots[fe + FACE_W_GI + 1u])),
       f32(atomicLoad(&face_slots[fe + FACE_W_GI + 2u]))) * inv;
   }
+  // **折叠**（`GI_ACC_MAX_N` 只封顶、不遗忘 ⇒ 必须在这里补上遗忘）：
+  // `FACE_W_GI` / `FACE_W_GI_N` 由 `dda_face_accum` 只增不减地累加，而这个 pass 的认领者恰好是
+  // 每面每帧唯一写者 ⇒ 到顶时把**和与计数同比例减半**：比值 `sum/n` 逐位不变（画面连续无跳变），
+  // 而窗口变成"τ ≈ `GI_ACC_MAX_N` 个样本的指数窗"，从此**继续跟着画面走**。
+  // 不做这一步的后果（实测症状）：面的值 = 它**头 1024 个样本**的平均，然后永久冻结。小面每帧只进
+  // 1~2 个样本 ⇒ 要 500~1000 帧才填满，那整段时间里显示的是"被新样本缓慢稀释的累计平均"
+  // ⇒ **静止时多个小片体素低频明暗涨落**，填满后再也不更新。与业界对齐的写法见 NRD 的
+  // `maxAccumulatedFrameNum` / SVGF 的 `α = max(σ_c/σ_m, 1/(m+1))`：上限必须**同时改变权重**。
+  if (gi_n >= GI_ACC_MAX_N) {
+    for (var i = 0u; i < 3u; i = i + 1u) {
+      let w = fe + FACE_W_GI + i;
+      atomicStore(&face_slots[w], atomicLoad(&face_slots[w]) >> 1u);
+    }
+    atomicStore(&face_slots[fe + FACE_W_GI_N], gi_n >> 1u);
+  }
   // `ray_dir` 传该面的世界法线：逐面路径**只处理命中面**（天空在那里不渲染）⇒ 这个实参不会被消费，
   // 但必须是合法单位向量（`shade_face` 的注释里写了理由）。
   let col = shade_face(first, view_u.cam_pos_voxel.xyz, fnw, frustum_length,

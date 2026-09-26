@@ -301,6 +301,13 @@ pub struct Palette {
   dirty: Mutex<Option<(u16, u16)>>,
   /// 写版本：每次 `set` 自增，消费者据此判断是否需同步；`new()` 从 1 起，0 = 克隆出的新副本（视为全表待上传）。
   version: AtomicU64,
+  /// **内容版本**：只在**覆写一个已占用的槽、且值真的变了**时自增。
+  ///
+  /// 与 `version` 分开是必须的：`version` 回答"要不要重传这张表"，而**认领一个新槽**（流式源按方块
+  /// 状态 `intern`）也会让它自增 —— 新槽不影响任何已上传体素的外观。拿 `version` 去回答
+  /// "世界外观变了吗"（GI 历史失效 / 二次顶点缓存），流式世界会**每帧整屏丢历史**
+  /// （症状：噪声反复被重置回原始估计、静止也不收敛）。见 `gate_render::gi::prepare_gi`。
+  content_version: AtomicU64,
 }
 
 /// 克隆出的副本一律视为全表待上传（`version` = 0）。
@@ -311,6 +318,7 @@ impl Clone for Palette {
       used: self.used.clone(),
       dirty: Mutex::new(Some((0, PALETTE_INDEX_MAX))),
       version: AtomicU64::new(0),
+      content_version: AtomicU64::new(0),
     }
   }
 }
@@ -348,6 +356,7 @@ impl Palette {
       used: Box::new([0u64; OCCUPIED_WORDS]),
       dirty: Mutex::new(Some((0, PALETTE_INDEX_MAX))),
       version: AtomicU64::new(1),
+      content_version: AtomicU64::new(0),
     }
   }
 
@@ -359,16 +368,30 @@ impl Palette {
   /// 写入条目（AIR 槽不可占用，违规 panic）并标脏该槽
   pub fn set(&mut self, idx: PaletteId, entry: PaletteEntry) {
     assert!(!idx.is_air(), "index 0 is reserved for air");
-    self.entries[idx.0 as usize] = entry;
-    self.used[idx.0 as usize / 64] |= 1u64 << (idx.0 % 64);
+    let i = idx.0 as usize;
+    // 认领新槽 vs 覆写已有槽：只有后者可能改变世界外观（见 `content_version`）
+    let was_used = (self.used[i / 64] >> (i % 64)) & 1 == 1;
+    let changed = self.entries[i] != entry;
+    self.entries[i] = entry;
+    self.used[i / 64] |= 1u64 << (i % 64);
     self.mark_dirty(idx.0);
     self.version.fetch_add(1, Ordering::Release);
+    if was_used && changed {
+      self.content_version.fetch_add(1, Ordering::Release);
+    }
   }
 
   /// 当前写版本（供消费者判断是否已同步）。
   #[inline]
   pub fn version(&self) -> u64 {
     self.version.load(Ordering::Acquire)
+  }
+
+  /// 当前**内容版本**：只在「已占用的槽被改成别的值」时变化 ⇒ 回答"世界外观变了吗"。
+  /// 与 [`Self::version`] 的区别见字段说明。
+  #[inline]
+  pub fn content_version(&self) -> u64 {
+    self.content_version.load(Ordering::Acquire)
   }
 
   /// 标脏单个槽（区间取并集）
@@ -471,5 +494,27 @@ mod tests {
     assert_eq!(e.pbr_overrides(), ov);
     assert!(e.flags.contains(PaletteFlags::IS_PBR), "IS_PBR 由构造器保证置上");
     assert!(e.flags.contains(PaletteFlags::TRANSMISSIVE), "其余位原样保留");
+  }
+
+  /// `content_version` 只认「已占用的槽被改成别的值」——**认领新槽不算**。
+  /// 这是流式世界（MC 地图逐帧按方块状态 `intern` 新槽）不被逐帧作废 GI 历史的前提，
+  /// 见 `Palette::content_version` 与 `gate_render::gi::prepare_gi`。
+  #[test]
+  fn content_version_ignores_slot_claims() {
+    let a = PaletteEntry { color: [1, 2, 3], ..Default::default() };
+    let b = PaletteEntry { color: [4, 5, 6], ..Default::default() };
+    let mut p = Palette::new();
+    assert_eq!(p.content_version(), 0);
+    p.set(PaletteId(1), a);
+    assert_eq!(p.content_version(), 0, "认领新槽不改外观");
+    assert_eq!(p.version(), 2, "写版本照常自增（要重传）");
+    p.set(PaletteId(2), b);
+    assert_eq!(p.content_version(), 0, "再认领一个也不改外观");
+    p.set(PaletteId(1), a);
+    assert_eq!(p.content_version(), 0, "写同一个值是幂等的");
+    p.set(PaletteId(1), b);
+    assert_eq!(p.content_version(), 1, "覆写已有槽改的是外观");
+    p.set(PaletteId(2), a);
+    assert_eq!(p.content_version(), 2);
   }
 }
