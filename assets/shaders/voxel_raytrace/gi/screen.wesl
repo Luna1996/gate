@@ -388,23 +388,27 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 方向不重复：种子含逐帧自增的帧号（`gi_ss_seed(coord, gi_u.seq.x)`）⇒ 每帧的候选都是新的独立样本。
   let share = max(u32(gi_u.misc.y), 1u);
   // ---- 预算重分配（菜单「渲染/RESTIR GI/重分配」，`gi_u.misc.z`）----
-  // 代理量 = **本帧是否拿到了可用历史**（`hist_ok`，上面刚判出来）：它正是"这个像素的时域累积还在
-  // 不在工作"的直接度量。接上了 ⇒ 按 `lo` 倍发（它已经在累积，多发的边际收益低）；没接上 ⇒ 按
-  // `hi` 倍发（这种像素每帧都是全新估计，只能靠候选数压方差）。
+  // 代理量 = **本像素已经累积到多少样本**（`hist.m`）：窗**没填满**时按 `hi` 倍发（尽快把窗填满 ⇒
+  // 画面尽快 settle），填满后按 `lo` 倍发（稳态，边际收益低）。
   //
-  // **不要换回"上一帧 reservoir 的 M"**（曾经的写法）：那个代理量在**永远接不上历史**的像素上恒
-  // 等于本帧候选数 ⇒ `cand_n ← 4·√(32 / cand_n)` 把自己钉在不动点（≈ 关档的 2 倍，档位表里 4.0
-  // 那一档永远够不到）⇒ 从「关」拨到「强」只差 1.41× 的 σ，肉眼看不出。改用 `hist_ok` 之后代理量
-  // 与候选数**脱钩**，`lo`/`hi` 才真正生效，也就不再需要靠 `m_cap_k` 去压反馈振荡。
-  //
-  // 抖动 = `floor(want + dither)`：整数条数会把预算差变成同心环，用逐帧抖动的分数部分摊成噪声。
+  // **不要换回 `hist_ok`（曾经的二值写法）**：它在第 2 帧就翻真 ⇒ 整段填充期都按 `lo` 发（「强」档 =
+  // 1/4 速率）⇒ 256 个样本的窗要 **1024 帧 ≈ 17 s** 才填满，表现就是"GI 收敛很慢"。
+  // CONSTRAINT: 这个代理量**不是本帧候选数的函数**（`hist.m` 单调增、被 `cap` 封顶）⇒ 不构成反馈
+  // 回路，不会像更早的 `4·√(32/cand_n)` 那样把自己钉在不动点上。
+  // **射线总账不变**：一个样本 = 一条射线，"填满 256 个样本"无论快慢都要 256 条 —— 本改动只把同一
+  // 批射线**提前**花掉；镜头平移时 `hist.m` 一直被重置 ⇒ 照旧走 `hi`，那段行为逐位不变。
+  let m_cap_base = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq);
   let err_tier = u32(gi_u.misc.z);
   var b_err = 1.0;
   if (err_tier > 0u) {
     let lo = select(select(0.70, 0.50, err_tier >= 2u), 0.25, err_tier >= 3u);
     let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
-    b_err = select(hi, lo, hist_ok);
+    // 「填满了」的判据 = `gi_res_cap` 的样本上限（`m_cap_k` 的 `cand_n0/cand_n` 放大与这里相乘
+    // 互补 ⇒ 与本帧候选数无关，恒为 `m_cap_base × cand_n0`）。
+    let warm_m = f32(m_cap_base * cand_n0);
+    b_err = select(hi, lo, hist_ok && hist.m >= warm_m);
   }
+  // 抖动 = `floor(want + dither)`：整数条数会把预算差变成同心环，用逐帧抖动的分数部分摊成噪声。
   let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
   var cand_n = max(1u, u32(floor(f32(cand_n0) * b_err / f32(share) + dither)));
   // ---- 把**分数预算**兑现成"少发射线"（否则整数钳制会白烧 N 倍）----
@@ -452,8 +456,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 记忆窗上限：按"每帧实际候选数相对基准缩小了几倍"放大。减发一侧 ⇒ 窗内样本数 = 基准值
   // （稳态噪声不变、只有响应变慢）；增发一侧按本式取 max(...,1) ⇒ 窗内样本数随之变大。
   // （本项零性能成本，但窗越长光照响应越钝 ⇒ 这就是分摊/重分配的代价。）
-  let m_cap_k =
-    select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq) * max(cand_n0 / max(cand_n, 1u), 1u);
+  let m_cap_k = m_cap_base * max(cand_n0 / max(cand_n, 1u), 1u);
   var r = gi_res_none();
   // **ILP 批量**：批内 `GI_SS_RAY_BATCH` 条射线只差方向、互相独立 ⇒ 先把它们全发出去（多条层次
   // DDA 的依赖 load 同时在飞），再按原本的 `k` 顺序做累计与蓄水池更新。方向序列、样本与比较顺序
