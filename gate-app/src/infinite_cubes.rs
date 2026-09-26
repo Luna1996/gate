@@ -109,17 +109,37 @@ pub fn far_coverage_voxels(vol: usize) -> i32 {
 /// - **与主世界共享原点**（`add_far_level` 的 `pos = 0`）⇒ 格点锚在世界坐标上，窗口滑动不改相位。
 ///
 /// `center` = 相机眼位（世界体素）：起始窗口就钉在它周围，省掉开局那几帧的跨级平移。
+///
+/// **MC 地图**（`docs/mc_map.md` §8.2）走 [`attach_far_levels_mc`]：那一边的槽号不是固定方案。
 pub fn attach_far_levels(volumes: &mut Volumes, pbr_ids: &[String], center: IVec3) {
-  /// 窗口每轴 chunk 数（= `brickmap::wire::CHUNK_INDEX_CAP`，与 `scene::build_infinite_cubes` 同值）
-  const WINDOW_CHUNKS: i32 = 32;
-  let dims = IVec3::splat(WINDOW_CHUNKS * 2);
   let slots = material_slots(pbr_ids.len());
-  for &scale in FAR_SCALES.iter() {
-    let vol = volumes.add_far_level(scale as f32);
-    let g = &mut volumes.list[vol];
+  attach_far_levels_with(volumes, center, |g| {
     for (id, entry) in slots.iter() {
       g.palette_mut().set(*id, *entry);
     }
+  });
+}
+
+/// **MC 地图的远场级**：只挂 volume，**不装调色板** —— MC 的槽号是 worker 按方块状态认领的
+/// （`mc::material::Pool` 的日志），由 `stream_chunks` ⓪''' 的 `palette_log` 重放填进**所有** volume
+/// （含远场级）。这里若也按 `material_slots` 装一份，两套槽号会互相覆盖。
+pub fn attach_far_levels_mc(volumes: &mut Volumes, center: IVec3) {
+  attach_far_levels_with(volumes, center, |_| {});
+}
+
+/// [`attach_far_levels`] / [`attach_far_levels_mc`] 的共同实现：逐级 `add_far_level` + 钉窗口。
+fn attach_far_levels_with(
+  volumes: &mut Volumes,
+  center: IVec3,
+  fill_palette: impl Fn(&mut gate_voxel::VolumeGrid),
+) {
+  /// 窗口每轴 chunk 数（= `brickmap::wire::CHUNK_INDEX_CAP`，与 `scene::build_infinite_cubes` 同值）
+  const WINDOW_CHUNKS: i32 = 32;
+  let dims = IVec3::splat(WINDOW_CHUNKS * 2);
+  for &scale in FAR_SCALES.iter() {
+    let vol = volumes.add_far_level(scale as f32);
+    let g = &mut volumes.list[vol];
+    fill_palette(g);
     // 相机在该级的 chunk 空间：`floor(cam_world / scale / 256)` ⇒ 窗口以它为中心
     let c = (center / scale).div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE));
     g.set_stream_window(Some((c - IVec3::splat(WINDOW_CHUNKS), dims)));
@@ -164,6 +184,10 @@ const READY_MAX: usize = 384;
 /// 换手漏过（约 4 s 一次，成本摊到几百分之一）。
 const SWEEP_FRAMES: u32 = 240;
 
+/// **每个远场级**的在飞条数上限（见 [`VolState::inflight`] 的 WHY）：取 worker 数的两倍 ⇒ 每个
+/// worker 手上至多一条远场任务，剩下的产能全部留给近场。
+const FAR_INFLIGHT_MAX: usize = PRODUCER_WORKERS * 2;
+
 /// **单 volume 的流式状态**（M8：主世界 + 每个远场级各一份）。主世界与远场级走**同一套**驱动逻辑，
 /// 差别只有"需求怎么算"（见 [`plan_generation`] 与 [`plan_generation_far`]）。
 #[derive(Default)]
@@ -195,6 +219,12 @@ struct VolState {
   last_used: std::collections::HashMap<ChunkCoord, u64>,
   /// 产出过、但**没有内容**的 chunk（免得每帧重复派发；infinite_cubes 不会出现，留作通用性）
   empty: std::collections::HashSet<ChunkCoord>,
+  /// 已派发、还没取回的条数（**本卷**的在飞数）。
+  ///
+  /// WHY 要按卷数：worker 池的去重 / 在飞上限是**全局**的（`ChunkProducer::max_inflight`），而各卷的
+  /// 单块成本差三个数量级 —— MC 远场一块要读几百个 chunk 列（`mc::summary`），近场一块只读 1~16 个。
+  /// 不按卷封顶的话，远场一开场就把全局在飞槽位占满（`READY_MAX` 也跟着顶住）⇒ **近场加载被饿死**。
+  inflight: usize,
 }
 
 /// 生产管线的活状态（M5）：worker 池 + **逐 volume 的**流式状态。
@@ -204,6 +234,8 @@ struct VolState {
 /// 竞争，不会出现"远处刷得凶、脚下反而饿着"。
 struct Pipeline {
   producer: ChunkProducer,
+  /// 这个池在给哪个源干活（换世界时比对它决定是否重建）
+  source: std::sync::Arc<dyn ChunkSource>,
   /// 每个 volume 一份（下标 = `Volumes.list` 下标 = shader 的 `grid_descs` 下标）
   vols: Vec<VolState>,
   /// 用途批次的序号（每**换一批** `ChunkUseFeed` +1），就是各 [`VolState::last_used`] 的值域。
@@ -266,8 +298,36 @@ pub struct Streaming {
   pub request_bytes: usize,
   /// **是否让请求圈真的装载**（关闭 ⇒ 回到"请求只在半径环内重排"的旧行为，便于 A/B）
   pub requests_load: bool,
+  /// **生产源**：`None` = 用内置的 `infinite_cubes` 生成器；MC 地图在建世界时塞自己的源（见
+  /// `crate::mc::build`）。换世界时两边不一样 ⇒ 池会重建（见 [`stream_chunks`] ①）。
+  source: Option<std::sync::Arc<dyn ChunkSource>>,
+  /// 内置生成器的源 + 建它时的 `n_pbr`（**惰性建一次，缓存住**）。
+  /// WHY 必须缓存：判"要不要重建池"用的是 `Arc::ptr_eq`，每帧 `Arc::new` 会让它**恒为假** ⇒
+  /// 池每帧重建 ⇒ 在飞的产出全被丢掉、一块也挂不上（实测常驻集卡在初始的 27 块不动）。
+  /// `n_pbr` 变了（用户换 PBR 资产）⇒ 槽号方案变了 ⇒ 那时才该换一个新的源。
+  builtin: Option<(usize, std::sync::Arc<dyn ChunkSource>)>,
+  /// [`ChunkSource::palette_log`] 的游标：已经装进各 volume 调色板的条数（换源 / 换世界清零重放）
+  palette_applied: usize,
   /// M5 生产管线：首次进入流式世界时惰性起（要 `n_pbr` 才能定槽号方案）
   pipeline: Option<std::sync::Mutex<Pipeline>>,
+}
+
+impl Streaming {
+  /// **换世界时同步生产源**（`None` = 回到内置的 `infinite_cubes` 生成器）。
+  ///
+  /// 只动这一项 —— 半径 / 预算那些量**同时被 DebugMenu「世界」页拥有**：`apply_initial_state` 会把
+  /// 菜单的最终控件值重放成 `MenuActionEvent`（在 `setup` 之后一帧执行）⇒ 世界代码写它们会被当场
+  /// 覆盖（实测：`tune_for_mc` 设的 `coarse_radius=4` 被菜单的 8 顶掉）。世界的调参只能走菜单，
+  /// 见 `docs/mc_map.md` §7。
+  pub fn set_source(&mut self, source: Option<std::sync::Arc<dyn ChunkSource>>) {
+    self.source = source;
+  }
+
+  /// 是否挂了**自定义生产源**（⇒ 槽号由源自己认领，走 `palette_log` 重放；见
+  /// [`attach_far_levels_mc`]）。`false` = 内置生成器的固定槽号方案。
+  pub fn has_custom_source(&self) -> bool {
+    self.source.is_some()
+  }
 }
 
 impl Default for Streaming {
@@ -293,6 +353,9 @@ impl Default for Streaming {
       // `0.33` + builder/wgpu 约 `2.3`）⇒ 2048 块 ≈ `6.5 GB` + 约 `1.8 GB` 进程基座。
       request_bytes: 2 * 1024 * 1024 * 1024,
       requests_load: true,
+      source: None,
+      builtin: None,
+      palette_applied: 0,
       pipeline: None,
     }
   }
@@ -356,7 +419,10 @@ pub fn stream_chunks(
   use_feed: Option<Res<gate_render::ChunkUseFeed>>,
   // 卸载扫描的兜底周期计数（见 ② 的闸门说明）
   mut frames: Local<u32>,
+  // 诊断：本系统的耗时（每 60 帧一行，见 `gate_render::profiler::SysTimer`）
+  mut diag: Local<(f64, u32)>,
 ) {
+  let _t = gate_render::profiler::SysTimer::new("STREAM 流式装载", &mut diag);
   // WHY: 暂停 = 冻结整个流式环（连窗口都不跟）—— 让相机能飞出加载边界，看"世界到此为止"的那一圈。
   if stream.paused {
     return;
@@ -425,16 +491,37 @@ pub fn stream_chunks(
   let fill = DEMAND_TABLE_MAX.min(cap.saturating_sub(main_in_window));
 
   // ① 生产管线（M5）：**派发**需求给 worker 池（请求优先，再半径补块），本帧只**挂载**已完成的。
-  //    管线惰性起：要 `n_pbr` 才能定槽号方案 —— 与建世界时装进调色板的那份同源（`pbr_asset_ids`）。
-  if stream.pipeline.is_none() {
-    let n_pbr = crate::scene::pbr_asset_ids(pbr.as_deref()).len();
-    let source = std::sync::Arc::new(InfiniteCubes { n_pbr });
+  //    管线惰性起（缺省源要 `n_pbr` 才能定槽号方案 —— 与建世界时装进调色板的那份同源）；
+  //    **换源（换世界）⇒ 重建池**：旧池的 worker 还在产旧世界的东西，且新 volume 的调色板是空的
+  //    ⇒ 调色板游标清零、从头重放（见 `ChunkSource::palette_log` 的契约）。
+  let n_pbr = crate::scene::pbr_asset_ids(pbr.as_deref()).len();
+  let source: std::sync::Arc<dyn ChunkSource> = if let Some(s) = stream.source.clone() {
+    s
+  } else {
+    // 内置生成器：**同一个 `n_pbr` 只建一次并缓存**（判"换源"靠 `Arc::ptr_eq`，每帧新建会让它恒为假）
+    match stream.builtin.as_ref().filter(|(n, _)| *n == n_pbr).map(|(_, s)| s.clone()) {
+      Some(s) => s,
+      None => {
+        let s: std::sync::Arc<dyn ChunkSource> = std::sync::Arc::new(InfiniteCubes { n_pbr });
+        stream.builtin = Some((n_pbr, s.clone()));
+        s
+      }
+    }
+  };
+  let stale = match &stream.pipeline {
+    None => true,
+    Some(p) => !std::sync::Arc::ptr_eq(&p.lock().unwrap_or_else(|e| e.into_inner()).source, &source),
+  };
+  let mut palette_applied = stream.palette_applied;
+  if stale {
     stream.pipeline = Some(std::sync::Mutex::new(Pipeline {
-      producer: ChunkProducer::new(source, PRODUCER_WORKERS),
+      producer: ChunkProducer::new(source.clone(), PRODUCER_WORKERS),
+      source: source.clone(),
       vols: (0..n_vol).map(|_| VolState::default()).collect(),
       use_seq: 0,
       use_stamp: 0,
     }));
+    palette_applied = 0;
   }
   // 请求与用途戳各取一次（都是每 `REPORT_PERIOD_SECS` 一批的**快照**，不是队列 ⇒ 每帧看到同一份）。
   let requests: Vec<gate_render::LodRequest> =
@@ -452,7 +539,7 @@ pub fn stream_chunks(
       .lock()
       .unwrap_or_else(|e| e.into_inner());
     // 拆借：`producer` 与逐卷状态是两个字段，必须分开借（一个池服务所有卷）
-    let Pipeline { producer, vols, use_seq, use_stamp } = &mut *guard;
+    let Pipeline { producer, vols, use_seq, use_stamp, source: _ } = &mut *guard;
     while vols.len() < n_vol {
       vols.push(VolState::default()); // 换世界后卷数可能变（长度对齐）
     }
@@ -477,21 +564,50 @@ pub fn stream_chunks(
     // 取回产出 → **各自 volume 的**待挂载队列（一次 poll；`None` = 这个 chunk 没有内容，记下免得反复派发）
     for (v, cc, detail, tree) in producer.poll(POLL_MAX) {
       let Some(st) = vols.get_mut(v) else { continue };
+      st.inflight = st.inflight.saturating_sub(1);
       match tree {
         // 同一块的在飞重复（派发修好前遗留的）⇒ 留先到的那个，别再堆一份
         Some(_) if !st.ready_set.insert(cc) => {}
         Some(tree) => st.ready.push_back((cc, detail, tree)),
         None => {
           st.empty.insert(cc);
+          // **同时也告诉渲染侧**：这是"已知空块"，不是"还没加载" —— GPU 索引条目会写成哨兵，
+          // shader 就不再对它发 ray-guided 请求（见 `gate_voxel::VolumeGrid::mark_empty_chunk`
+          // 与 `gate_render::brickmap::consts::INDEX_ENTRY_EMPTY`）。
+          if let Some(g) = scene.volumes.list.get_mut(v) {
+            g.mark_empty_chunk(cc);
+          }
         }
       }
+    }
+
+    // ⓪''' **调色板日志 → 各 volume 的调色板**（见 `ChunkSource::palette_log` 的契约）：必须在
+    //       **挂载之前**装好 —— 树里的槽号是 worker 认领的，主线程不装表就会引用到全 0 的槽。
+    //       每帧都取一次（不只是有取回产出的帧）：worker 认领的槽可能属于还在飞的树。
+    let updates = source.palette_log(palette_applied);
+    if !updates.is_empty() {
+      for (id, e) in &updates {
+        for g in scene.volumes.list.iter_mut() {
+          g.palette_mut().set(*id, *e);
+        }
+      }
+      bevy::log::debug!("MC 调色板 +{} 槽（累计 {}）", updates.len(), palette_applied + updates.len());
+      palette_applied += updates.len();
     }
 
     // 挂载的**字数预算跨卷共用**（一个池、一份帧额 ⇒ 远场不会把近场的帧额吃掉）
     let mut words = 0usize;
     let mut words_mounted = 0usize;
 
-    for vol in 0..n_vol {
+    // WHY 轮转起点：以下各段的预算（`DISPATCH_PER_FRAME` / `READY_MAX` 背压 / `mount_count` 挂载额）
+    // 都是**跨卷共用**的，而循环按卷号顺序走 ⇒ 末尾那个卷永远只能捡前面剩下的、在背压下常常一条都派不
+    // 出去（实测：MC 的 L3 在相机持续移动时恒为 0 个常驻，L1/L2 各涨到两三百）。每帧把起点转一格，
+    // 让每一卷轮流当"先到先得"的那个。
+    let first = (*frames as usize) % n_vol.max(1);
+    for i in 0..n_vol {
+      let vol = (first + i) % n_vol;
+      // 逐卷重置：`gen_req` 只有非远场那条路会写，不重置的话远场那条会打印上一卷留下的读数
+      gen_req = 0;
       let scope = scopes[vol];
       let st = &mut vols[vol];
       let far_level = scene.volumes.list[vol].is_far_level();
@@ -530,6 +646,22 @@ pub fn stream_chunks(
           gen_req = from_req;
           batch
         };
+        // 需求表的规模是流式世界的**第一诊断读数**（每 `DEMAND_REBUILD_FRAMES` 一行）：环（半径补块）
+        // 与请求各占多少、池里还空多少。排查"常驻集涨得比环大"这类问题就靠它。
+        // 远场级**整表都是请求**（没有环 / 没有 fill），分开写免得那三个字段被读成"远场的读数"。
+        if far_level {
+          bevy::log::debug!(
+            "DEMAND[v{vol} far] batch {}（全为请求；常驻 {}）",
+            batch.len(),
+            grid.chunk_count(),
+          );
+        } else {
+          bevy::log::debug!(
+            "DEMAND[v{vol} far{far_level}] batch {}（请求 {gen_req}；环 {coarse_r}×{coarse_h}；fill {fill}；常驻 {}）",
+            batch.len(),
+            grid.chunk_count(),
+          );
+        }
         st.demand = batch.into();
         st.demand_center = Some(scope.center);
         st.demand_age = 0;
@@ -537,11 +669,12 @@ pub fn stream_chunks(
 
       // ①b 派发：从表头取（已满足 / 已在飞的当场划过），到在飞上限为止
       let mut dispatched = 0usize;
-      while let Some((c, detail)) = st.demand.front().copied() {
+      while !(far_level && st.inflight >= FAR_INFLIGHT_MAX) {
         // 背压（见 `READY_MAX`）：待挂载 + 在飞已经够多就停 —— 否则 worker 会把产出灌进一个无界队列
         if st.ready.len() + producer.inflight() >= READY_MAX {
           break;
         }
+        let Some((c, detail)) = st.demand.front().copied() else { break };
         if producer.in_flight(vol, ChunkCoord(c)) {
           st.demand.pop_front();
           continue;
@@ -556,6 +689,7 @@ pub fn stream_chunks(
         if !producer.request(vol, ChunkCoord(c), detail) {
           break; // 在飞满（或已在飞）⇒ 下帧继续
         }
+        st.inflight += 1;
         st.demand.pop_front();
         dispatched += 1;
         if dispatched >= DISPATCH_PER_FRAME {
@@ -662,6 +796,8 @@ pub fn stream_chunks(
       }
     }
   }
+  // 调色板游标回写（`stream.pipeline` 那段借用已结束）
+  stream.palette_applied = palette_applied;
 }
 
 /// room 坐标 → 确定性随机流。**同一个 room 在任何机器、任何时候都得到同一材质**。
@@ -1124,6 +1260,21 @@ struct GenScope {
 /// "在视野内"的点积门槛：`±60°` 锥。只用它分两档 —— 连续值参与排序反而会被远处的巧合压过距离。
 const VIEW_COS: f32 = 0.5;
 
+/// 视锥候选集的**纵深**（chunk）：到窗口边为止（窗口 ±32 chunk = ±164 m）。
+/// `coarse_radius` 只当**侧向**半径用 ⇒ 同一份预算"沿视线伸出去"，而不是各方向等距摊平。
+const CONE_ALONG_CHUNKS: i32 = 32;
+
+/// 相机取向的正交基 `(前, 右, 上)`（[`CONE_ALONG_CHUNKS`] 那组候选按它算偏移）。
+/// 退化输入（`forward` 近零 / 与 up 共线）给出任何一组正交基即可 —— 候选只是"先看哪儿"的启发式，
+/// 不是正确性条件。`forward == ZERO` 由调用方单独走"世界轴对齐"那条路（见 [`plan_generation`]）。
+fn view_basis(forward: Vec3) -> (Vec3, Vec3, Vec3) {
+  let f = forward.normalize_or_zero();
+  let reference = if f.y.abs() > 0.99 { Vec3::X } else { Vec3::Y };
+  let r = f.cross(reference).normalize_or_zero();
+  let u = r.cross(f).normalize_or_zero();
+  (f, r, u)
+}
+
 /// **档位判据**（[`Detail`] 的 CONSTRAINT）：粒度 `g` 体素的一档，只有在该 chunk 的距离处
 /// `g / (d·px_ang) ≤ 1` 时才允许使用；取允许档里**最粗**的那个（内存最优）。
 ///
@@ -1234,17 +1385,54 @@ fn plan_generation(
     // 请求那一批可能上千条（`REQ_FEED_MAX`）⇒ 去重走集合，别在候选循环里线性扫
     let taken: std::collections::HashSet<IVec3> = picked.iter().map(|(c, _)| *c).collect();
     let mut todo: Vec<(IVec3, Detail)> = Vec::new();
-    for dx in -coarse_radius..=coarse_radius {
-      for dz in -coarse_radius..=coarse_radius {
-        for dy in -coarse_height..=coarse_height {
-          let c = center + IVec3::new(dx, dy, dz);
-          let d = detail_of(c);
-          if in_window(c) && !have(c, d) && !taken.contains(&c) {
-            todo.push((c, d));
+    let mut seen: std::collections::HashSet<IVec3> = std::collections::HashSet::new();
+    let mut push = |c: IVec3, todo: &mut Vec<(IVec3, Detail)>| {
+      let d = detail_of(c);
+      if in_window(c) && !have(c, d) && !taken.contains(&c) && seen.insert(c) {
+        todo.push((c, d));
+      }
+    };
+    // 候选集合 = **相机取向的"视锥盒"**（`docs/editable-gigavoxel.md` §9 动态测试第三轮）：
+    //   · 近处：以相机为中心的各向同性小盒（脚下/身后始终有东西，`load_radius`）；
+    //   · 远处：沿视线方向的**锥**（侧向 ±`coarse_radius`、纵深到窗口边），身后也留一条。
+    //
+    // WHY 不能再用世界轴对齐的 ±`coarse_radius` 盒子：那种集合在**任何方向**都只够到
+    // `coarse_radius × 5.12 m`（菜单缺省 8 ⇒ 41 m）。转视角后新露出来的 41–164 m 全都落在
+    // 盒外 ⇒ 只能靠 ray 通道一点点补（旧实现每 2 s 一报、每报只几十个 chunk ⇒ 实测"每秒一两个
+    // chunk"，就是"远景半天不出来"的直接原因）。同样的预算摊到视锥上，够得到窗口边。
+    if forward == Vec3::ZERO {
+      // 无相机（或调用方明确不要视野偏置）：退回世界轴对齐的对称盒（旧行为）
+      for dx in -coarse_radius..=coarse_radius {
+        for dz in -coarse_radius..=coarse_radius {
+          for dy in -coarse_height..=coarse_height {
+            push(center + IVec3::new(dx, dy, dz), &mut todo);
+          }
+        }
+      }
+    } else {
+      let (f, rt, up) = view_basis(forward);
+      // 近处小盒
+      for dx in -load_radius..=load_radius {
+        for dz in -load_radius..=load_radius {
+          for dy in -coarse_height..=coarse_height {
+            push(center + IVec3::new(dx, dy, dz), &mut todo);
+          }
+        }
+      }
+      // 前方锥 + 身后一条
+      for (sign, far) in [(1.0f32, CONE_ALONG_CHUNKS), (-1.0, coarse_radius)] {
+        for a in (load_radius + 1)..=far {
+          let lat = coarse_radius.min(a);
+          for p in -lat..=lat {
+            for q in -lat..=lat {
+              let off = f * (sign * a as f32) + rt * p as f32 + up * q as f32;
+              push(center + off.round().as_ivec3(), &mut todo);
+            }
           }
         }
       }
     }
+    drop(push);
     todo.sort_unstable_by_key(|(c, _)| key(*c));
     picked.extend(todo.into_iter().take(fill));
   }
@@ -1626,9 +1814,11 @@ mod tests {
     scope.forward = Vec3::new(0.0, 0.0, 1.0); // 朝 +Z 看
     let ahead = IVec3::new(0, 0, 3);
     let behind = IVec3::new(0, 0, -3);
-    // 环内共 7×7×7 = 343 个候选 ⇒ 要够 400 才能保证"身后那个也被选中"（它排得很后，这正是论点）
-    let (batch, _) = plan_generation(scope, 400, &[], |_, _| false);
-    let at = |c: IVec3| batch.iter().position(|(p, _)| *p == c).expect("环内必然入选");
+    // 候选集合现在是"近处小盒 + 沿视线的锥" ⇒ 视野内与身后的那些都必然在集合里。
+    // `fill` 要**足够大以装下整个候选集**：否则截断先吃掉身后那半（视野内的锥在前），
+    // 这时"身后排在视野内之后"是排序键本该有的结论，与候选集合无关，测不到要测的东西。
+    let (batch, _) = plan_generation(scope, 4096, &[], |_, _| false);
+    let at = |c: IVec3| batch.iter().position(|(p, _)| *p == c).expect("候选集里必然入选");
     assert_eq!(batch[0].0, IVec3::ZERO, "近处圈永远第一");
     assert!(at(ahead) < at(behind), "同距离：视野内 {} < 身后 {}", at(ahead), at(behind));
   }

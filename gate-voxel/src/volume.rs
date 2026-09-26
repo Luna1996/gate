@@ -2,7 +2,7 @@
 //! `VolumeGrid` = 单个体素 volume（主世界 = identity transform + 无界 chunk HashMap；物体 = 任意 transform）。
 //! `Volumes` = `Vec<VolumeGrid>`，list[0] 恒为主世界（obj_id = -1），list[1..N] 为物体。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glam::{IVec3, Mat3, Vec3};
 
@@ -39,11 +39,33 @@ pub struct VolumeGrid {
   /// **流式窗口提示**：`(chunk 原点, 各轴跨度)`，由流式世界设置（见 [`Self::set_stream_window`]）。
   /// 只影响渲染侧 `compute_window` 的窗口推导，不进 wire、不进序列化。
   stream_window: Option<(IVec3, IVec3)>,
+  /// **已知空块**（流式源产出过 `None` 的 chunk）：与 [`Self::stream_window`] 同类的"流式提示"。
+  ///
+  /// WHY 需要：`b_struct` 的索引条目用一个 `0` 同时表示"还没加载"与"是空的"，shader 分不出来 ⇒
+  /// 射线会在**永远装不上东西**的空 chunk 上一直发请求（MC 地图里大多数 section 是空气，实测最热一块
+  /// 103 万票/窗，把请求环整圈打满）。渲染侧把这里的成员写成哨兵 `INDEX_ENTRY_EMPTY`，
+  /// shader 就不再请求它（见 `gate_render::brickmap::consts::INDEX_ENTRY_EMPTY`）。
+  ///
+  /// 只增不减（"这块没有内容"是数据源的既定事实）。渲染侧写哨兵时会**跳过已常驻的块**（索引条目
+  /// 由挂载路径写，哨兵不该盖掉真树），所以集合里留着曾经的空块不会出错。不进 wire、不进序列化。
+  empty_chunks: HashSet<ChunkCoord>,
+  /// **已知空块的追加日志**（与 `empty_chunks` 同一批，只是按"发现顺序"排列）。
+  ///
+  /// WHY 另存一份 `Vec`：消费端（`gate_render::brickmap::upload` 的哨兵同步）要"只处理**新增**的那些"
+  /// —— 拿 `HashSet` 迭代只能全量重扫，而它在爬坡期会被逐块触发 ⇒ O(n²)（实测一轮填充里 2000 块
+  /// = 200 万次哈希探测的白扫）。有了追加日志，消费端存一个游标即可 O(新增)。
+  empty_log: Vec<ChunkCoord>,
+  /// 已知空块的变更序号（每次新记一块 +1）：给渲染侧当"要不要同步哨兵"的信号（比集合大小可靠）。
+  empty_seq: u64,
   /// **远场级标记（M8，`docs/editable-gigavoxel.md` §4 M8）**：该 volume 是一个"级体素 = `transform.scale`
   /// 个主世界体素"的远场级（本仓取 4/16/64）。渲染侧唯一用途 = **分壳裁剪**：
   /// `trace.wesl::trace_scene` 让远场级只从**上一级的覆盖半径**起参与求交，否则它的膨胀格会盖住近场。
   /// 不进 wire、不进序列化。
   far_level: bool,
+  /// **是否给这个（主）volume 挂远场级**：由建世界的代码设置（`infinite_cubes` 设 true）。
+  /// 与 `stream_window` 分开是因为"流式"与"有远场"不是一回事 —— MC 地图当前是流式但**没有**远场级
+  /// （远场要按更粗的粒度采样方块，见 `docs/mc_map.md` §6）。不进 wire、不进序列化。
+  attach_far: bool,
 }
 
 impl Default for VolumeGrid {
@@ -61,7 +83,11 @@ impl Default for VolumeGrid {
       resident_seq: 0,
       edit_aabbs: HashMap::new(),
       stream_window: None,
+      empty_chunks: HashSet::new(),
+      empty_log: Vec::new(),
+      empty_seq: 0,
       far_level: false,
+      attach_far: false,
     }
   }
 }
@@ -208,6 +234,16 @@ impl VolumeGrid {
     self.far_level
   }
 
+  /// 这个（主）volume 是否要**挂远场级**（见 [`Self::attach_far`]）
+  pub fn attach_far(&self) -> bool {
+    self.attach_far
+  }
+
+  /// 设置"是否挂远场级"（建世界的代码设置；见 [`Self::attach_far`]）
+  pub fn set_attach_far(&mut self, on: bool) {
+    self.attach_far = on;
+  }
+
   /// 体素编辑代数（派生数据重烘判据；palette 变化不计入）
   pub fn edit_generation(&self) -> u64 {
     self.edit_generation
@@ -267,6 +303,30 @@ impl VolumeGrid {
   /// 只增不清，比较相等即可（wrapping 也安全：两次变更之间不会真的绕一圈）。
   pub fn resident_seq(&self) -> u64 {
     self.resident_seq
+  }
+
+  /// **记一块"已知没有内容"**（流式源在该 chunk 上产出过 `None`）：渲染侧会把它写成索引哨兵，
+  /// 让 shader 不再对它发 ray-guided 请求（见 [`Self::empty_chunks`] 的说明）。重复记同一块为空操作。
+  pub fn mark_empty_chunk(&mut self, cc: ChunkCoord) {
+    if self.empty_chunks.insert(cc) {
+      self.empty_log.push(cc);
+      self.empty_seq = self.empty_seq.wrapping_add(1);
+    }
+  }
+
+  /// 已知空块的**追加日志**的 `[from..]` 段（消费端存一个游标即可只处理新增的那些；见 [`Self::empty_log`]）
+  pub fn empty_log_from(&self, from: usize) -> &[ChunkCoord] {
+    self.empty_log.get(from.min(self.empty_log.len())..).unwrap_or(&[])
+  }
+
+  /// 已知空块的总数（= 追加日志的长度，消费端用它推进游标）
+  pub fn empty_count(&self) -> usize {
+    self.empty_log.len()
+  }
+
+  /// 已知空块的变更序号（单调）：渲染侧据此决定要不要重写哨兵
+  pub fn empty_seq(&self) -> u64 {
+    self.empty_seq
   }
 
   /// GC 所有 chunk，回收累积的废弃节点（见 `ChunkTree::compact`）；chunk 间零共享，rayon 并行。

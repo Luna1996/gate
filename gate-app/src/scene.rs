@@ -20,6 +20,7 @@ use crate::{
     START_CAMERA_SKY, STARTUP_DEMO_SCENE,
   },
   height_field::MaterialDisplace,
+  mc,
   vox_scene,
 };
 
@@ -34,6 +35,7 @@ pub(crate) fn setup(
   mut commands: Commands,
   mut images: ResMut<Assets<Image>>,
   config: Res<crate::config::Config>,
+  mut stream: ResMut<crate::infinite_cubes::Streaming>,
   pbr: Option<Res<gate_render::PbrTextureSet>>,
 ) {
   let dda_handle = create_dda_image(&mut images);
@@ -72,16 +74,27 @@ pub(crate) fn setup(
     // 启动世界 = 「游戏/世界」页模型下拉的最终选中项（结构来自资产、选中项来自配置；读不到 → nuke）
     let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu(&config))
       .unwrap_or_else(|| "nuke".to_string());
-    // 默认机位：`cube_in_void` 的立方体（原点、边长 64）从斜上方看；其余 .vox 沿用既有读数
-    (cam_eye, cam_target) = if name == CUBE_IN_VOID {
-      (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO)
-    } else {
-      (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5))
+    // 默认机位：`cube_in_void` 的立方体（原点、边长 64）从斜上方看；MC 地图落在出生点（存档只存
+    // 方块坐标，机位由它推）；其余 .vox 沿用既有读数
+    (cam_eye, cam_target) = match name.as_str() {
+      CUBE_IN_VOID => (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO),
+      mc::MC_MAP => mc_camera(),
+      _ => (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5)),
     };
     // 相机最终会落在哪（存档姿态优先，口径与下面的 `orbit` 完全一致）：`infinite_cubes` 是
     // **相机驱动**的世界 ⇒ 起始块要铺在它脚下，否则开局那一块得等流式一帧一个 chunk 补出来。
     start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
-    let info = build_world(&mut grid, &name, &pbr_ids, start_eye.as_ivec3())
+    // MC 地图：存档姿态若离出生点太远（上一次可能停在别的世界），直接用出生点 ——
+    // 否则选 mc_map 会落在几百米外的空气里，什么都看不到。
+    if name == mc::MC_MAP
+      && let Some(spawn) = mc::spawn_eye()
+      && start_eye.distance_squared(spawn.as_vec3()) > 25_000.0 * 25_000.0
+    {
+      bevy::log::info!("MC 地图：存档机位 {start_eye} 离出生点 {spawn} 过远 → 落在出生点");
+      (cam_eye, cam_target) = mc_camera();
+      start_eye = cam_eye;
+    }
+    let info = build_world(&mut grid, &name, &pbr_ids, start_eye.as_ivec3(), &mut stream)
       .unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
     bevy::log::info!(
       "STEP 2 world {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
@@ -163,10 +176,16 @@ pub(crate) fn setup(
 
   // 物体 = 普通 VolumeGrid，经 `Volumes.add_object()` 注册变换，走与主世界相同的 dirty → builder → upload 路径。
   let mut volumes = Volumes::new(grid);
-  // **M8**：流式世界（`infinite_cubes`）额外挂三级远场 volume —— 判据就用 `stream_window`
-  // （只有 `build_infinite_cubes` 会设它），与 `stream_chunks` 的启用判据同一个。
-  if volumes.main().stream_window().is_some() {
-    crate::infinite_cubes::attach_far_levels(&mut volumes, &pbr_ids, start_eye.as_ivec3());
+  // **M8**：额外挂三级远场 volume —— 判据是 `attach_far`（`build_infinite_cubes` 与 `mc::build` 会设它）。
+  // 与 `stream_window` 分开是因为"流式"不等于"有远场"。
+  // 调色板的口径不同：程序化世界用固定方案（`material_slots`）；MC 的槽号由 worker 认领、靠
+  // `palette_log` 重放填（见 `attach_far_levels_mc`）。
+  if volumes.main().attach_far() {
+    if stream.has_custom_source() {
+      crate::infinite_cubes::attach_far_levels_mc(&mut volumes, start_eye.as_ivec3());
+    } else {
+      crate::infinite_cubes::attach_far_levels(&mut volumes, &pbr_ids, start_eye.as_ivec3());
+    }
   }
 
   commands.insert_resource(VoxelScene {
@@ -181,26 +200,46 @@ pub(crate) fn setup(
 }
 
 /// 按名字把主世界体素写进 `grid`（`setup` 与 `reload_world` 的唯一分发点）：
-/// `cube_in_void` = 程序化调试场景（[`build_cube_in_void`]）；其余 = `assets/vox/<name>.vox`。
+/// `cube_in_void` = 程序化调试场景（[`build_cube_in_void`]）；`mc_map` = MC 存档（[`mc::build`]，
+/// 内容由流式环逐帧产出，这里只挂窗口与生产源）；其余 = `assets/vox/<name>.vox`。
 /// 不做 `compact_all` —— GC 时机由调用方定（`setup` 在场景构建后统一做一次）。
 ///
-/// `cam_eye` = 相机眼位（体素）：`infinite_cubes` 是相机驱动的世界，起始块铺在它所在的 chunk 上；
-/// 其余世界锚在 `EXT_VOXEL_HALF`，忽略这一项。
+/// `cam_eye` = 相机眼位（体素）：`infinite_cubes` / `mc_map` 是相机驱动的世界，起始块 / 流式窗口
+/// 钉在它上面；其余世界锚在 `EXT_VOXEL_HALF`，忽略这一项。
+///
+/// `stream` = 流式资源：**换世界必须同步换生产源与调参**（`Streaming::source` / `tune_*`），
+/// 否则流式环会继续喂上一个世界的生成器。
 fn build_world(
   grid: &mut VolumeGrid,
   name: &str,
   pbr_ids: &[String],
   cam_eye: IVec3,
+  stream: &mut crate::infinite_cubes::Streaming,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   if name == CUBE_IN_VOID {
+    stream.set_source(None);
     return Ok(build_cube_in_void(grid));
   }
   if name == INFINITE_CUBES {
+    stream.set_source(None);
     return Ok(build_infinite_cubes(grid, pbr_ids, cam_eye));
   }
+  if name == mc::MC_MAP {
+    let (info, city) = mc::build(grid, cam_eye)?;
+    stream.set_source(Some(city));
+    return Ok(info);
+  }
+  stream.set_source(None);
   let anchor = IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF);
   let path = gate_render::assets_dir().join("vox").join(format!("{name}.vox"));
   vox_scene::load_vox_scene(grid, &path, anchor)
+}
+
+/// MC 地图的默认机位：站在出生点上方、往世界 −z 方向退 8 m 看回来（1 体素 = 2 cm ⇒ 400 体素 = 8 m）。
+/// 出生点由 `level.dat` 给（[`mc::spawn_eye`]）；读不到就退回原点上方 8 m。
+fn mc_camera() -> (Vec3, Vec3) {
+  let target = mc::spawn_eye().unwrap_or(IVec3::new(0, 400, 0)).as_vec3() + Vec3::new(0.0, 80.0, 0.0);
+  (target + Vec3::new(-400.0, 400.0, -400.0), target)
 }
 
 /// PBR 资产槽列表，给 `infinite_cubes` 的 PBR 档用（`docs/infinite_cubes.md` 规则 5：
@@ -221,15 +260,20 @@ pub(crate) fn reload_world(
   name: &str,
   pbr_ids: &[String],
   cam_eye: Option<IVec3>,
+  stream: &mut crate::infinite_cubes::Streaming,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   let mut grid = VolumeGrid::new();
   let eye = cam_eye.unwrap_or(IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF));
-  let info = build_world(&mut grid, name, pbr_ids, eye)?;
+  let info = build_world(&mut grid, name, pbr_ids, eye, stream)?;
   grid.compact_all();
   let mut volumes = Volumes::new(grid);
-  // M8：换到流式世界时同样要挂三级远场（判据与 `setup` / `stream_chunks` 同一个）
-  if volumes.main().stream_window().is_some() {
-    crate::infinite_cubes::attach_far_levels(&mut volumes, pbr_ids, eye);
+  // M8：换到挂远场的世界时同样要挂三级远场（判据与 `setup` 同一个；调色板口径见上）
+  if volumes.main().attach_far() {
+    if stream.has_custom_source() {
+      crate::infinite_cubes::attach_far_levels_mc(&mut volumes, eye);
+    } else {
+      crate::infinite_cubes::attach_far_levels(&mut volumes, pbr_ids, eye);
+    }
   }
   scene.volumes = volumes;
   scene.demo_force_full_rebuild = true;
@@ -279,6 +323,8 @@ fn build_infinite_cubes(
   }
   let origin = center.div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE)) - IVec3::splat(WINDOW_CHUNKS);
   grid.set_stream_window(Some((origin, IVec3::splat(WINDOW_CHUNKS * 2))));
+  // M8：这个世界的 chunk 会随相机无限平移，且远处必须用**远场级**补上（见 `attach_far`）
+  grid.set_attach_far(true);
   // 起始只铺相机脚下那一块（**整 chunk**，见 `initial_box`），其余由 `stream_chunks` 按需生成
   let (lo, hi) = infinite_cubes::initial_box(center);
   let voxels_written =

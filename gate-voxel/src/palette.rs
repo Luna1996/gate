@@ -130,7 +130,7 @@ impl From<PaletteId> for usize {
 /// `PartialEq`（内容去重的判据，见 `gate-app/src/edit.rs::material_slot`）在**两个变体上都与
 /// `pack_palette_entry` 的输出一一对应**：打包是单射（每个字段都落在固定的 bit 段里、无重叠、
 /// 无被丢弃的字段）⇒ 等字段 ⟺ 等 8B payload。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct PaletteEntry {
   /// sRGB 颜色（管线在 shader 侧转 linear）
@@ -262,7 +262,7 @@ pub fn inverted_pct_to_override(pct: f32) -> u8 {
 }
 
 /// 标志位：手写 bit 常量（不引 bitflags crate）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct PaletteFlags(pub u8);
 
 impl PaletteFlags {

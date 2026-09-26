@@ -119,9 +119,11 @@ pub fn load_menu(config: &Config) -> MenuFile {
 fn apply_world_model_options(model: &mut MenuFile) {
   let mut options = crate::vox_scene::scan_vox_models();
   // 程序化场景不来自磁盘（见 `scene::build_cube_in_void` / `scene::build_infinite_cubes`），
-  // 与 .vox 名字同列在一个下拉里
+  // MC 地图也不来自 `assets/vox`（见 `mc::build`，存档与资产在 `GATE_MC_MAP` / `GATE_MC_ASSETS`）——
+  // 三者与 .vox 名字同列在一个下拉里
   options.push(crate::scene::CUBE_IN_VOID.to_string());
   options.push(crate::scene::INFINITE_CUBES.to_string());
+  options.push(crate::mc::MC_MAP.to_string());
   options.sort();
   options.dedup();
   let Some(MenuNode::Dropdown { options: opts, selected, .. }) =
@@ -720,6 +722,7 @@ fn register_callbacks(world: &mut World) {
             &name,
             &crate::scene::pbr_asset_ids(pbr.as_deref()),
             cam.map(|c| c.position_world.as_ivec3()),
+            &mut stream,
           ) {
             Ok(_info) => info!("世界重载 → {name} {:?}", t0.elapsed()),
             Err(e) => warn!("重载世界失败 {name}：{e} → 原世界不变"),
@@ -1154,6 +1157,9 @@ pub(crate) fn fps_overlay_tick(
   let min = rate_of(min_dt);
   let max = if max_dt < f32::MAX { rate_of(max_dt) } else { 0.0 };
   let text = format!("({:>3}, {:>3}, {:>3}, {:>3})", fps3(cur), fps3(avg), fps3(min), fps3(max));
+  // 同一组数字也落一行日志：画面上的四元组只有"人在看"才有用，跑基准时读的是日志
+  // （`GATE_LOG=gate_app=debug` 下每 `FPS_UPDATE_SECS` 一行）。
+  bevy::log::debug!("FPS[1s] {avg:.0} 低 {min:.0} 高 {max:.0}（当前 {cur:.0}）");
   if let Ok(mut t) = q_text.single_mut()
     && t.0 != text
   {

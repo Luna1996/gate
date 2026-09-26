@@ -66,6 +66,19 @@ pub trait ChunkSource: Send + Sync + 'static {
     detail: Detail,
     scratch: &mut VolumeGrid,
   ) -> Option<ChunkTree>;
+
+  /// **调色板日志**：源在 worker 线程上认领的槽位（`[from..]` 段），主线程负责装进各 volume 的
+  /// 调色板（`VolumeGrid::palette_mut`）。默认空 —— 槽号是固定方案的源（如程序化场景）不需要它。
+  ///
+  /// 契约（与"worker 不得碰主线程 `VolumeGrid`"一致）：
+  /// - 日志**只增不减**，`from` 是消费方记的游标；`from = 0` = 重放整份（换世界 / 换源后新 volume
+  ///   的调色板是空的，必须从头重放）；
+  /// - 消费方必须在**挂载树之前**至少取一次，否则树会用上主线程还没装的槽；
+  /// - 返回的是副本，主线程只读。
+  fn palette_log(&self, from: usize) -> Vec<(crate::palette::PaletteId, crate::palette::PaletteEntry)> {
+    let _ = from;
+    Vec::new()
+  }
 }
 
 /// 任务 / 产出的键：**卷号 + 坐标**。同一坐标在不同 volume 里是不同的东西（远场级的 chunk 坐标

@@ -53,6 +53,18 @@ ron = "0.12"
 glam = "=0.33.2"
 # 全量构建并行分块
 rayon = "1"
+# MC 地图流式加载（gate-app/src/mc）：**存档读取全用现成 crate**，不自己实现 NBT / Anvil。
+# - fastnbt：MC 的 NBT 反序列化（serde），`pre18` 区块结构与它同源
+# - fastanvil：region（.mca）索引与解压（zlib / gzip / lz4 / 裸）＋ 1.13–1.17 区块结构
+#   （`pre18::{Level, Pre18Section}` 与位打包展开）—— 默认特性 `render` 拉 `image`/调色板渲染，
+#   与本项目无关，关掉
+# 贴图 PNG / blockstate+model JSON 走已在依赖树里的 png / serde_json（后者无同类替代：MC 的资源包
+# 模型格式没有成熟 Rust 解析 crate，见 `docs/mc_map.md` §4）。
+fastnbt = "2"
+fastanvil = { version = "0.32", default-features = false }
+flate2 = "1"
+png = "0.18"
+serde_json = "1"
 # WESL（wgsl 超集）运行时编译为 WGSL；本项目不使用 bevy 的 shader_format_wesl
 # naga-ext：校验器识别 u64/i64/f16 等 Naga 扩展类型
 wesl = { version = "0.5", features = ["naga-ext"] }

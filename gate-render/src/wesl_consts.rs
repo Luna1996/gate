@@ -89,11 +89,21 @@ pub struct TraceConsts {
   /// **grid volume 数**（`GRID_VOLUMES`：主世界 + 远场级）。请求环与用途戳表按它分段定长，
   /// Rust 的 [`crate::brickmap::consts::VOLUMES`] 必须与它**逐字相等**（见 `load` 里的核对）。
   pub volumes: u32,
+  /// **索引条目的"已知空块"哨兵**（`INDEX_ENTRY_EMPTY`，权威值在 `common.wesl`）：
+  /// Rust 往 `b_struct` 的窗口条目里写它，shader 读它来决定"不请求"。两侧必须逐字相等
+  /// （不等 = 把哨兵当成树块地址去解引用）。
+  pub index_entry_empty: u32,
 }
 
 /// [`TraceConsts`] 需要的常量名（缺一即 fail fast）。
-const TRACE_REQUIRED: &[&str] =
-  &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX", "GRID_VOLUMES"];
+const TRACE_REQUIRED: &[&str] = &[
+  "LOD_DIAG",
+  "REQ_ENABLE",
+  "REQ_SAMPLE",
+  "REQ_PER_RAY_MAX",
+  "GRID_VOLUMES",
+  "INDEX_ENTRY_EMPTY",
+];
 
 // MT8-3 的 `ReflConsts` / `refl_consts()` / `REFL_ENTRY_BYTES` 已随反射缓存一起删除（实测负优化）。
 // 这里只保留**通用**解析器（`parse_package_u32_consts` / `parse_u32_consts_in_source`），
@@ -279,7 +289,7 @@ impl TraceConsts {
     if !missing.is_empty() {
       let msg = format!(
         "WESL trace 跨端常量缺失（{}）：{:?}\n\
-         —— 权威值只写在 .wesl 里，Rust 从源码解析；请检查 voxel_raytrace/trace.wesl，\
+         —— 权威值只写在 .wesl 里，Rust 从源码解析；请检查 voxel_raytrace/trace.wesl 与 common.wesl，\
          并确保它们写成 `const NAME: u32 = <字面量>u;` 形式。",
         dir.display(),
         missing
@@ -294,6 +304,7 @@ impl TraceConsts {
       req_sample: get("REQ_SAMPLE"),
       req_per_ray_max: get("REQ_PER_RAY_MAX"),
       volumes: get("GRID_VOLUMES"),
+      index_entry_empty: get("INDEX_ENTRY_EMPTY"),
     };
 
     // 采样率是素数/取模的分母、每条射线上限是条目数上限：两者为 0 会让请求通道静默失效。
@@ -310,6 +321,17 @@ impl TraceConsts {
          brickmap::consts::VOLUMES = {}（两侧必须相等，它决定 `lod_req` 的分段与长度）",
         out.volumes,
         crate::brickmap::consts::VOLUMES
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    // "已知空块"哨兵：Rust 写进索引、shader 拿它当"不请求"的判据 ⇒ 不等就会把哨兵当树块地址解引用。
+    if out.index_entry_empty != crate::brickmap::consts::INDEX_ENTRY_EMPTY {
+      let msg = format!(
+        "已知空块哨兵不一致：common.wesl::INDEX_ENTRY_EMPTY = {:#x}，\
+         brickmap::consts::INDEX_ENTRY_EMPTY = {:#x}（两侧必须相等）",
+        out.index_entry_empty,
+        crate::brickmap::consts::INDEX_ENTRY_EMPTY
       );
       error!("{msg}");
       panic!("{msg}");

@@ -1,5 +1,5 @@
 import package::bindings::{b_struct, g};
-import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, MAX_LEVEL, NODE_FIXED_WORDS};
+import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, INDEX_ENTRY_EMPTY, MAX_LEVEL, NODE_FIXED_WORDS};
 
 // 统一网格上下文：一套 DDA 跑所有网格（主世界 + 物体），由 `make_grid(idx)` 从 `grid_descs[idx]` 构造。
 // tree_base / palette_base / index_origin / index_dims 为数据源基址。
@@ -23,7 +23,7 @@ struct Grid {
 }
 
 // 树点查询：voxel → chunk 窗口定位 → 4 层 mask 树遍历 → palette。
-// 窗口外或 entry==0 的 chunk 返回 0（空气）。
+// 窗口外、`entry == 0`（还没加载）、`entry == INDEX_ENTRY_EMPTY`（已确认是空块）三种都返回 0（空气）。
 fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   // ---- chunk 窗口定位 ----
   let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
@@ -34,10 +34,10 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   if (any(rel < vec3<i32>(0))) { return 0u; }
   let rel_u = vec3<u32>(rel);
   if (any(rel_u >= dims)) { return 0u; }
-  // Region ① chunk 窗口：entry = 本 volume 内树相对字基址 + 1（0 = 无此 chunk）
+  // Region ① chunk 窗口：entry = 本 volume 内树相对字基址 + 1（0 = 无此 chunk；见 `common.wesl`）
   let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
   let entry = b_struct[index_addr];
-  if (entry == 0u) { return 0u; }
+  if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { return 0u; }
   // 统一 buffer 内绝对字基址 = volume 基址 + entry - 1（entry 编码本 volume 内相对地址）
   let chunk_base = g.tree_base + entry - 1u;
 

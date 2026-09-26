@@ -9,6 +9,7 @@ mod debug_menu;
 mod edit;
 mod height_field;
 mod infinite_cubes;
+mod mc;
 mod scene;
 mod showcase;
 #[cfg(feature = "profile")]

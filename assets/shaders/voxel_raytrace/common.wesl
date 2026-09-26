@@ -6,7 +6,12 @@ const CHUNK_SIZE: u32 = 256u;
 const MAX_LEVEL: u32 = 4u;
 const NODE_FIXED_WORDS: u32 = 3u;    // mask_lo + mask_hi + palette
 // b_struct Region ①：稠密 chunk 窗口。
+// 条目编码 = **本 volume 内树块首字址 + 1**；`0` = 无此 chunk（还没加载）；`INDEX_ENTRY_EMPTY` =
+// **CPU 已确认这块没有内容**（流式源产出过 `None`）。"空"与"没加载"必须分开：前者不该再发请求
+// （发了也永远装不上），后者才是 ray-guided 要补的缺口。权威值在 Rust
+// `brickmap::consts::INDEX_ENTRY_EMPTY`（两侧经 `wesl_consts` 核对相等）。
 const CHUNK_INDEX_CAP: u32 = 64u;
+const INDEX_ENTRY_EMPTY: u32 = 0xFFFFFFFFu;
 
 // --- 材质索引格式（16 位，与 Rust `gate_voxel::PALETTE_BITS` / `LEAF_*` 同源）---
 // 节点第 3 字：bit0..15 = uniform 子块色；bit16..31 = **叶块代表值**（M2：块内加权众数槽号，

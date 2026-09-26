@@ -5,7 +5,8 @@
 //! 节点字节契约（CPU `gate-voxel::ChunkTree::serialize_with_layout` 写、shader `trace.wesl` /
 //! `brickmap.wesl` 读）：
 //! ```text
-//! [chunk 窗口] entry = 树块首（b_struct 内本 volume 字址）+ 1；0 = 无此 chunk
+//! [chunk 窗口] entry = 树块首（b_struct 内本 volume 字址）+ 1；0 = 无此 chunk（还没加载）；
+//!            `INDEX_ENTRY_EMPTY`（u32::MAX）= **CPU 已确认这块没有内容**（见 `consts` 的说明）
 //! [节点]  +0/+1 = mask_lo/mask_hi（64 位子块占用）；+2 = uniform 子块色（低 16 位）
 //!         有掩码时 +3 起：内部层 = 紧凑子块指针表（指针 = **相对根节点**的字偏移，按 mask 位序）
 //!                        叶父层（4³）= 32 字 inline（每字 2 体素 × 16 位索引，0 = AIR）
@@ -122,6 +123,54 @@ pub fn pack_palette_entry_pbr(asset: u16, ov: PbrOverrides, flags: PaletteFlags)
 /// `MaterialAsset` 各 `*_slot` 的「无贴图」哨兵：该通道退回 `albedo_rough` / `emissive_metal` /
 /// `transmission_ior` 里的标量值。**0 不是哨兵**（层 0 可以被真实贴图占用）——判据是 `u32::MAX`。
 pub const MATERIAL_SLOT_NONE: u32 = 0xFFFF_FFFF;
+
+/// **图集资产**（贴图集里"一层装多张小图"的资产，MC 地图的方块贴图就是这类）在
+/// [`MaterialAsset`] 里对两个**当时无人读**的字段的复用（权威定义；shader 侧同形、逐位对齐）。
+///
+/// 为什么可以复用：`emissive_slot` / `transmission_slot` 的贴图**不进 GPU**（MT2 的 GPU 侧只有
+/// `albedo_rough` / `metal` 两组，见 `common.wesl::fetch_material_asset` 的说明）⇒ 两个字段
+/// 至今没有读取方；而 PBR 变体的 palette 条目只需 `albedo_slot`/`roughmetal_slot` 指层。
+///
+/// ```text
+/// emissive_slot     = uv_log2 << 16 | 0xFFFF          // 贴图周期 = 2^uv_log2 体素；低 16 位不用
+/// transmission_slot = TILE_FLAG | tile:6              // 最高位 = "这是图集小格"，不是层号
+/// ```
+///
+/// `uv_log2 = 0` ⇒ 用全局常量 `MATERIAL_TEX_WORLD_SCALE`（PBR 资产的老口径，逐位不变）。
+/// 小格 = 层内 `TEX_TILE_DIV × TEX_TILE_DIV` 网格里的一格（见 `pbr_texture::ExtraLayer`）。
+pub struct TileMeta;
+
+impl TileMeta {
+  /// 图集小格的标志位（`transmission_slot` 的最高位）
+  pub const TILE_FLAG: u32 = 0x8000_0000;
+  /// 小格编号的位宽（`TEX_TILE_DIV = 8` ⇒ 6 位够）
+  pub const TILE_BITS: u32 = 0x3F;
+
+  /// `emissive_slot`：`uv_log2`（贴图周期 = `2^uv_log2` 体素；`0` = 用全局常量）
+  pub fn emissive_slot(uv_log2: u8) -> u32 {
+    (uv_log2 as u32) << 16 | 0xFFFF
+  }
+
+  /// `transmission_slot`：`TILE_FLAG | tile`
+  pub fn transmission_slot(tile: u8) -> u32 {
+    Self::TILE_FLAG | (tile as u32 & Self::TILE_BITS)
+  }
+
+  /// shader 侧解码：是不是"图集小格"资产
+  pub fn is_tiled(transmission_slot: u32) -> bool {
+    transmission_slot & Self::TILE_FLAG != 0
+  }
+
+  /// shader 侧解码：小格编号
+  pub fn tile(transmission_slot: u32) -> u32 {
+    transmission_slot & Self::TILE_BITS
+  }
+
+  /// shader 侧解码：uv 尺度（`uv_log2`）
+  pub fn uv_log2(emissive_slot: u32) -> u32 {
+    (emissive_slot >> 16) & 0xFF
+  }
+}
 
 /// 材质资产条目：PBR 变体的 palette 槽按 `asset: u16` 索引本表。
 /// **全局一张表**（所有 volume 共用，不是 per-volume；`asset` 是全局下标），大小 `MATERIAL_ASSET_SLOTS` 项。

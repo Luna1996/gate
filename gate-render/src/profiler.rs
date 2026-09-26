@@ -5,8 +5,8 @@
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-  BufferDescriptor, BufferUsages, CommandEncoder, ComputePass, ComputePassDescriptor, MapMode,
-  PollType,
+  Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePass, ComputePassDescriptor,
+  MapMode, PollType,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use std::sync::Arc;
@@ -51,6 +51,37 @@ pub(crate) struct DiagFrameGap {
 
 fn diag_gap_begin(mut st: ResMut<DiagFrameGap>) {
   st.busy0 = Some(std::time::Instant::now());
+}
+
+/// **逐系统的周期计时**（诊断）：在系统体开头建一个，出口（含提前 `return`）时自动记账，
+/// 每 60 次落一行 `debug!`。
+///
+/// WHY 需要它：`DiagFrameGap` 只把一帧切成"渲染世界自身 / 等别处"，而"等别处"里还挤着
+/// 主世界 `Update` + `ExtractSchedule`（常驻调度 / 上传 / 流式装载都在这儿）—— 它回答"是不是 CPU 卡"，
+/// 不回答"卡在哪个系统"。本仓实测过一次：`RENDER 帧周期 5.9ms：自身 0.4ms` 之后就是靠它定位到
+/// 常驻调度的整块序列化。`debug!` 级别：它是周期量，排查时才开。
+pub struct SysTimer<'a> {
+  t0: std::time::Instant,
+  label: &'static str,
+  acc: &'a mut (f64, u32),
+}
+
+impl<'a> SysTimer<'a> {
+  pub fn new(label: &'static str, acc: &'a mut (f64, u32)) -> Self {
+    Self { t0: std::time::Instant::now(), label, acc }
+  }
+}
+
+impl Drop for SysTimer<'_> {
+  fn drop(&mut self) {
+    self.acc.0 += self.t0.elapsed().as_secs_f64();
+    self.acc.1 += 1;
+    if self.acc.1 >= 60 {
+      bevy::log::debug!(target: "gate", "{} {:.2} ms/帧", self.label, self.acc.0 / self.acc.1 as f64 * 1000.0);
+      self.acc.0 = 0.0;
+      self.acc.1 = 0;
+    }
+  }
 }
 
 fn diag_gap_end(mut st: ResMut<DiagFrameGap>) {
@@ -450,13 +481,118 @@ fn req_rel(key: u32) -> IVec3 {
   IVec3::new((key & 63) as i32, ((key >> 6) & 63) as i32, ((key >> 12) & 63) as i32)
 }
 
-/// **M4 ray-guided 请求的读回**（`docs/editable-gigavoxel.md` §4 M4）：每 [`crate::consts::REPORT_PERIOD_SECS`]
-/// 把 `gpu.lod_req`（环缓冲 + 用途戳表）拷进 staging 同步读回：用途戳整批发给
-/// [`ChunkUseFeed`]（LRU 的"最近使用"），请求**合并**后落一行 `REQ[...]`（新增条数 → 去重后的
-/// chunk 数 → 最热的几个 → 超容丢失条数）并发给 [`LodRequestFeed`]。
+/// **异步回读设施**（"每帧一报"的前提）：一份 staging、同一时刻最多一趟在飞，**从不等待**。
 ///
-/// 与 [`report_lod_diag`] 同一取舍（自建 encoder + `map_buffer` + `poll` 等待）与同一注册条件
-/// （`trace.wesl::REQ_ENABLE` 非 0；Rust 经 [`crate::wesl_consts::trace_consts`] 读同一份源码）。
+/// WHY 必须异步：本工程是 GPU 限帧（实测 5.5 ms/6.1 ms 都在 GPU）⇒ 每帧一次
+/// `poll(wait_indefinitely)` 会把 GPU 管线每帧掐停一次，帧率直接崩。流水是经典的"读上一趟、
+/// 立刻备下一趟"：
+///
+/// ```text
+/// 帧 k   ：拷 `lod_req` → staging（GPU 内部拷贝），map_async（不等待）
+/// 帧 k+1 ：poll(Poll) 问一下 —— 好了就读出来 + 解映射 + **立刻**再拷一份备下一帧；
+///          没好就跳过本帧（不阻塞），下一帧继续问
+/// ```
+///
+/// ⇒ 数据**最多落后一帧**，而旧实现（`REPORT_PERIOD_SECS = 2 s` + 同步等待）落后 **2 秒**：
+/// 模型侧实测"转视角后远景每秒只补进一两个 chunk"，主因就是这条延迟（见 `docs/mc_map.md` §8）。
+struct ReqReadback {
+  staging: Buffer,
+  /// 有一趟拷贝在飞
+  pending: bool,
+  /// map 回调的结果（`try_recv` 非阻塞取）
+  rx: Option<std::sync::mpsc::Receiver<Result<(), bevy::render::render_resource::BufferAsyncError>>>,
+  /// 复用的整块解包缓冲（**不再每趟分配 8 MB**）
+  words: Vec<u32>,
+  /// 提交 / 交付次数（诊断：核对"每帧一报"实际跑成了几帧一报）
+  submitted: u64,
+  delivered: u64,
+}
+
+impl ReqReadback {
+  fn new(device: &RenderDevice, bytes: u64) -> Self {
+    let staging = device.create_buffer(&BufferDescriptor {
+      label: Some("gate_lod_req_staging"),
+      size: bytes,
+      usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    Self {
+      staging,
+      pending: false,
+      rx: None,
+      words: vec![0u32; crate::brickmap::consts::LOD_REQ_WORDS],
+      submitted: 0,
+      delivered: 0,
+    }
+  }
+
+  /// 上一趟到位了吗？到位就拷进 `words` 并解映射（**非阻塞**；没到位返回 `false`）。
+  fn fetch(&mut self, device: &RenderDevice) -> bool {
+    if !self.pending {
+      return false; // 首帧 / 上一趟刚被丢掉：没有新数据
+    }
+    let _ = device.poll(bevy::render::render_resource::PollType::Poll);
+    match self.rx.as_ref().map(|rx| rx.try_recv()) {
+      Some(Ok(Ok(()))) => {
+        let slice = self.staging.slice(..);
+        if let Ok(view) = slice.get_mapped_range() {
+          let (head, mid, _tail) = unsafe { view.align_to::<u32>() };
+          let n = crate::brickmap::consts::LOD_REQ_WORDS;
+          if head.is_empty() && mid.len() >= n {
+            self.words.copy_from_slice(&mid[..n]);
+          } else {
+            for (i, w) in self.words.iter_mut().enumerate() {
+              let o = i * 4;
+              *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
+            }
+          }
+        }
+        self.staging.unmap(); // 必须：下一次拷贝要写它
+        self.pending = false;
+        self.delivered += 1;
+        true
+      }
+      Some(Ok(Err(_))) | Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+        warn!("REQ 读回：映射失败 → 本趟丢弃");
+        self.staging.unmap();
+        self.pending = false;
+        self.rx = None;
+        false
+      }
+      // 还没拷完：本帧不报，下一帧再问
+      Some(Err(std::sync::mpsc::TryRecvError::Empty)) => false,
+      None => false,
+    }
+  }
+
+  /// 提交下一趟：拷 `src` → staging + 异步映射（**不等待**）
+  fn submit(&mut self, device: &RenderDevice, queue: &RenderQueue, src: &Buffer, bytes: u64) {
+    let mut enc = device.create_command_encoder(
+      &bevy::render::render_resource::CommandEncoderDescriptor {
+        label: Some("gate_lod_req_readback"),
+      },
+    );
+    enc.copy_buffer_to_buffer(src, 0, &self.staging, 0, bytes);
+    queue.submit([enc.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let slice = self.staging.slice(..);
+    device.map_buffer(&slice, MapMode::Read, move |r| {
+      let _ = tx.send(r);
+    });
+    self.rx = Some(rx);
+    self.pending = true;
+    self.submitted += 1;
+  }
+}
+
+/// **M4 ray-guided 请求的读回**（`docs/editable-gigavoxel.md` §4 M4）：**每帧**把 `gpu.lod_req`
+/// （环缓冲 + 用途戳表）**异步**拷出来（见 [`ReqReadback`]）：用途戳整批发给
+/// [`ChunkUseFeed`]（LRU 的"最近使用"），请求**合并**后发给 [`LodRequestFeed`]。
+/// `REQ[...]` 日志仍按 [`crate::consts::REPORT_PERIOD_SECS`] 的节奏落（它是验收口径的节奏，
+/// 不必变成每帧一行 —— 每帧刷的是**装载清单**，不是日志）。
+///
+/// 与 [`report_lod_diag`] 同一注册条件（`trace.wesl::REQ_ENABLE` 非 0；Rust 经
+/// [`crate::wesl_consts::trace_consts`] 读同一份源码）。
 ///
 /// 与诊断计数器的差别：那是累积量（只加不清）⇒ 读差值；这里是**环缓冲** ⇒ 差值只用来算"本窗口新增
 /// 了几条"，字面值本身要解码（见 `trace.wesl::req_push`），且只解释**最近**那批（跨窗口累积超过容量
@@ -467,69 +603,44 @@ fn report_lod_requests(
   gpu: Option<Res<crate::brickmap::upload::GpuBrickMap>>,
   feed: Option<Res<LodRequestFeed>>,
   use_feed: Option<Res<ChunkUseFeed>>,
-  mut period: Local<Option<std::time::Instant>>,
   mut prev: Local<Option<[u32; 2]>>,
-  // 合并用的稠密计数器（1 M 字 = 4 MB/卷）：只在首次分配，之后每窗**只清上一窗碰过的格子**
+  // 合并用的稠密计数器（1 M 字 = 4 MB/卷）：只在首次分配，之后每趟**只清上一趟碰过的格子**
   mut counts: Local<Vec<u32>>,
   // 同上尺寸的"每格最细请求档位"（与 `counts` 同一趟填）
   mut min_levels: Local<Vec<u32>>,
   // 上一窗碰过的 key（清表 + 建 `top` 都只走这一批，不扫 4 M 格）
   mut touched: Local<Vec<u32>>,
+  // 异步回读设施（见 `ReqReadback`）：每帧一报的前提
+  mut rb: Local<Option<ReqReadback>>,
+  // `REQ[...]` 日志的节奏（装载清单每帧都刷，日志不必每帧一行）
+  mut log_at: Local<Option<std::time::Instant>>,
+  // 诊断：读回+合并的每帧耗时（见 `SysTimer`）
+  mut diag: Local<(f64, u32)>,
 ) {
   use crate::brickmap::consts::{LOD_REQ_WORDS, REQ_BASE, REQ_CAP, USE_BASE, USE_WORDS, VOLUMES};
   let Some(gpu) = gpu else { return };
-  let now = std::time::Instant::now();
-  let due = period
-    .is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
-  if !due {
-    return;
-  }
-  *period = Some(now);
-
   let bytes = (LOD_REQ_WORDS * 4) as u64;
-  let staging = device.create_buffer(&BufferDescriptor {
-    label: Some("gate_lod_req_staging"),
-    size: bytes,
-    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-    mapped_at_creation: false,
-  });
-  let mut enc =
-    device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
-      label: Some("gate_lod_req_readback"),
-    });
-  enc.copy_buffer_to_buffer(&gpu.lod_req, 0, &staging, 0, bytes);
-  queue.submit([enc.finish()]);
-
-  let slice = staging.slice(..);
-  let (tx, rx) = std::sync::mpsc::channel();
-  device.map_buffer(&slice, MapMode::Read, move |r| {
-    let _ = tx.send(r);
-  });
-  if device.poll(PollType::wait_indefinitely()).is_err()
-    || !matches!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(Ok(())))
-  {
-    warn!("REQ 读回：等待 / 映射失败 → 本窗口跳过");
-    staging.unmap();
+  let Some(r) = rb.as_mut() else {
+    *rb = Some(ReqReadback::new(&device, bytes)); // 首帧只建 staging
+    return;
+  };
+  // **每帧一报**（不再按 `REPORT_PERIOD_SECS` 的门）：上一趟到位就用，没到位就跳过本帧（不阻塞）。
+  let fresh = r.fetch(&device);
+  if !r.pending {
+    r.submit(&device, &queue, &gpu.lod_req, bytes); // 立刻备下一帧
+  }
+  if !fresh {
     return;
   }
-  // **整块解包**：staging 的映射区间是页对齐的（偏移 0）⇒ 可当 `&[u32]` 用；逐字
-  // `u32::from_le_bytes([view[o], …])` 在 210 万字的规模上是一个 ~30 ms 的标量循环（每窗一次 =
-  // 每 2 s 掉一帧），整块 memcpy 是 ~1 ms。对齐不成立（理论上不会）时退回逐字节。
-  let mut words = vec![0u32; LOD_REQ_WORDS];
-  if let Ok(view) = slice.get_mapped_range() {
-    let (head, mid, _tail) = unsafe { view.align_to::<u32>() };
-    if head.is_empty() && mid.len() >= LOD_REQ_WORDS {
-      words.copy_from_slice(&mid[..LOD_REQ_WORDS]);
-    } else {
-      for (i, w) in words.iter_mut().enumerate() {
-        let o = i * 4;
-        *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
-      }
-    }
+  // 日志仍按 `REPORT_PERIOD_SECS` 落：每帧刷的是**装载清单**（消费端），日志是验收口径的节奏。
+  let _t = SysTimer::new("REQ 读回+合并", &mut diag);
+  let now = std::time::Instant::now();
+  let log_now = log_at
+    .is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
+  if log_now {
+    *log_at = Some(now);
   }
-  staging.unmap();
-
-  // `[1]` 保留（见 `trace.wesl::REQ_RESERVED`：那个"溢出计数"是累计量，读不出"这一窗口丢没丢"）
+  let words = &r.words;
   let (count, tick) = (words[0], words[2]);
 
   // ---- ① 用途戳（LRU 的"最近使用"信号；**先发**，因为它与请求无关：没有缺块时它也照样有值）----
@@ -579,7 +690,9 @@ fn report_lod_requests(
   };
   if n == 0 {
     set_feed(Vec::new());
-    debug!("REQ[本窗口 0 条请求；用途戳 {used_n} chunk]");
+    if log_now {
+      debug!("REQ[本窗口 0 条请求；用途戳 {used_n} chunk]");
+    }
     return;
   }
 
@@ -666,10 +779,14 @@ fn report_lod_requests(
     .map(|r| format!("v{}({},{},{})×{}", r.vol, r.chunk.x, r.chunk.y, r.chunk.z, r.votes))
     .collect();
   set_feed(merged);
-  info!(
-    "REQ[去重 {distinct} chunk、取 {} 条（按卷配额，最热 {}）；本窗口 {new_reqs} 条、超容丢失 {lost}；\
-     用途戳 {used_n} chunk]",
-    top.len(),
-    shown.join(" ")
-  );
+  if log_now {
+    info!(
+      "REQ[去重 {distinct} chunk、取 {} 条（按卷配额，最热 {}）；本窗口 {new_reqs} 条、超容丢失 {lost}；\
+       用途戳 {used_n} chunk；读回 {}/{} 趟]",
+      top.len(),
+      shown.join(" "),
+      r.delivered,
+      r.submitted,
+    );
+  }
 }

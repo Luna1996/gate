@@ -102,6 +102,21 @@ pub const FAR_RESERVE_WORDS_PER_CHUNK: usize = 2048;
 /// 预留一段够用满池的固定区 ⇒ 长度恒定 ⇒ 布局不漂移。用完（罕见）才真长一次。
 pub const FAR_TREE_RESERVE_WORDS: usize = FAR_POOL_CHUNKS * FAR_RESERVE_WORDS_PER_CHUNK;
 
+/// **索引条目的哨兵：这块已知没有内容**（`docs/mc_map.md` §8）。
+///
+/// `b_struct` 的 chunk 窗口条目编码是"本 volume 内树块首字址 + 1，0 = 无此 chunk"（`wire.rs` 头注释）。
+/// `0` 同时表示"还没加载"与"是空的" —— 对 shader 是同一件事，所以射线在**永远装不上东西的空 chunk**
+/// 上会一直发请求（`trace.wesl` 的 `entry == 0` 请求闸门）。
+///
+/// 无限世界不会遇到（每个 chunk 都有内容），而 MC 地图里**大多数 section 是空气**：实跑最热一块
+/// **103 万票/窗**（`REQ[本窗口 6.8M 条、超容丢失 5.8M]`），请求环被这一块打满 ⇒ 真正的请求全被挤掉，
+/// 且每秒几百万次原子写在同一个字上。
+///
+/// 于是让"已知空"成为索引里的一等状态：CPU 把**流式源产出过 `None`** 的 chunk 写成这个哨兵，
+/// shader 见到它既不请求（`trace.wesl` 的请求闸门）也不遍历（按空气算）。
+/// 取值 `u32::MAX`：合法条目是"树块首 + 1"，树区不可能有 40 亿字。
+pub const INDEX_ENTRY_EMPTY: u32 = u32::MAX;
+
 /// 请求环在 `lod_req` 里的起始字下标（`[0]` 累计条数 / `[1]` 保留 / `[2]` 用途戳计数器 /
 /// `[3 .. 3+USE_WORDS×VOLUMES)` 逐 volume 用途戳表）。**必须与 `trace.wesl::REQ_BASE` 一致**。
 pub const REQ_BASE: usize = USE_BASE + USE_WORDS * VOLUMES;

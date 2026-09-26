@@ -1,6 +1,6 @@
 import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, lod_req, view_u};
 import package::brickmap::{Grid};
-import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, NODE_FIXED_WORDS, face_normal_from_index};
+import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, INDEX_ENTRY_EMPTY, NODE_FIXED_WORDS, face_normal_from_index};
 
 // 层级命中记录：t 为 ro 系绝对 t；face_id 0..5 = ±xyz 六面（命中面法线索引）。
 // voxel = 命中固体体素 chunk 局部整数坐标，着色阶段直接消费。
@@ -928,9 +928,15 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
         + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
       let entry = b_struct[index_addr];
-      // M4：槽位在窗口里、GPU 上却没有树块 ⇒ 射线本来要的细节缺了（`entry == 0` 在 shader 里与
-      // "这块是空气"同形，故消费端要自己过滤"其实已经加载完的 chunk"）。
-      // **三道闸门**（不加节流会变成每秒数亿次原子写，GPU 全耗在 `lod_req[0]` 上）：
+      // **"空"与"没加载"是两件事**（见 `common.wesl` 的条目编码）：
+      // - `entry == 0` = 还没加载 ⇒ 射线本来要的细节缺了，该请求（M4）；
+      // - `entry == INDEX_ENTRY_EMPTY` = CPU 已确认这块没有内容 ⇒ **不该请求**（发了也永远装不上）。
+      //   无限世界不需要这条（每个 chunk 都有内容），MC 地图必需：城里大多数 section 是空气，实测最热
+      //   一块 **103 万票/窗**（`REQ[6.8M 条、超容丢失 5.8M]`）—— 请求环被这一块整圈覆盖，真正的请求
+      //   全被挤掉，且每秒数百万次原子写砸在同一个字上。
+      // 两者对遍历都是空气。
+      let has_tree = entry != 0u && entry != INDEX_ENTRY_EMPTY;
+      // M4：三道闸门（不加节流会变成每秒数亿次原子写，GPU 全耗在 `lod_req[0]` 上）：
       // ① 只要 16³ 或更细的（`REQ_LEVEL_KEEP`）② 采样 `1/REQ_SAMPLE` ③ 每条射线 ≤ `REQ_PER_RAY_MAX`。
       // M8：**远场级跳过闸门 ①** —— 那个闸门问的是"这个距离值不值得加载细节"，而远场级的
       // chunk 尺度本身就是为那个距离设计的（`scale` 就是按"一格 ≈ 一像素"选的）⇒ 一律报 0 档。
@@ -942,7 +948,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
           req_sent += 1u;
         }
       }
-      if (entry != 0u) {
+      if (has_tree) {
         air_chunk = false;
         // **用途戳**（论文 §III.A 的 usage stamp）：已加载的 chunk 要留下"射线在看它"的证据 ——
         // 缓存替换（LRU）唯一的"最近使用"来源。**不占 `req_sent` 的名额**（那条留给"缺了"的请求：

@@ -693,8 +693,6 @@ fn ensure_capacity(
     return;
   }
   let new_size = grow_size(cap, need_bytes);
-  // TODO(diag): 临时计时，核对"显存扩容单次只有几 ms"；查完删。
-  let t = std::time::Instant::now();
   let new_buf = device.create_buffer(&BufferDescriptor {
     label: Some(label),
     size: new_size,
@@ -709,10 +707,9 @@ fn ensure_capacity(
     enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
     queue.submit([enc.finish()]);
   }
-  let ms = t.elapsed().as_secs_f32() * 1000.0;
-  if ms > 1.0 {
-    debug!("DIAG[显存 {label} 扩容 {cap} → {new_size} B（含前缀拷贝）：{ms:.1}ms]");
-  }
+  // 扩容是**少见但重要**的事件（一次 mV 级的分配 + 前缀拷贝，实测 1.1–1.4ms/次）：
+  // 它一旦频繁出现就说明估算偏小，值得留一行读数。
+  debug!("显存 {label} 扩容 {cap} → {new_size} B（含前缀拷贝）");
   *cur = new_buf;
 }
 
@@ -1298,6 +1295,10 @@ pub fn pool_capacity_chunks(budget_bytes: usize) -> usize {
   }
 }
 
+/// **静态世界**补标"已知空块"的窗口槽位上限：超过它就不扫（一次 O(窗口) 的扫描，每帧都做）。
+/// 64K 槽 ≈ 20–40 µs/帧（实测 `nuke.vox` 只有 400 槽）；再大就不值得为这个优化付每帧扫描。
+const STATIC_EMPTY_SCAN_MAX: i64 = 64 * 1024;
+
 /// 池容量（chunk）→ GPU 侧的字节预算（[`ResidencyPolicy::budget_bytes`]）。不限 ⇒ 0（= 关闭预算）。
 fn gpu_pool_bytes(cap_chunks: usize) -> usize {
   if cap_chunks == usize::MAX {
@@ -1336,7 +1337,12 @@ fn plan_residency(
   mut ledger_busy: Local<bool>,
   mut far_seq: Local<Vec<u64>>,
   mut sync_seq: Local<u64>,
+  // ①' 的"已知空块"游标（`VolumeGrid::empty_log`），逐卷一个
+  mut empty_cursor: Local<Vec<usize>>,
+  // 诊断：本系统的耗时（每 60 帧一行，见函数尾）
+  mut diag: Local<(f64, u32)>,
 ) {
+  let _t = crate::profiler::SysTimer::new("RESID 常驻调度", &mut diag);
   let (Some(scene), Some(cam)) = (scene, cam) else { return };
   let Some(builder) = mirror.builder.as_mut() else { return };
   let grid = scene.volumes.main();
@@ -1370,6 +1376,55 @@ fn plan_residency(
       }
     }
     *ledger_seq = seq;
+  }
+
+  // ①' **已知空块 → 索引哨兵**（`docs/mc_map.md` §8）：`VolumeGrid` 里那些"流式源产出过 `None`"的
+  //     chunk，要在 GPU 索引里标成 [`crate::brickmap::consts::INDEX_ENTRY_EMPTY`] —— 否则 shader 把
+  //     "这块是空的"当成"还没加载"，射线会对它反复发请求（MC 地图实测最热一块 103 万票/窗，把请求环
+  //     整圈打满）。**只处理新增的那些**（`empty_log` 的游标，见 `VolumeGrid::empty_log` 的说明）。
+  //
+  //     **逐卷**都要做（M8 + MC 远场）：MC 的远场级同样会产出 `None`（没建筑的格 = 空气），而远场
+  //     窗口铺满 ±10.5 km ⇒ 不标哨兵时"空"与"没加载"的混淆会把请求环整圈打满（比主世界那次更凶）。
+  //     窗口平移时的重打由 `BrickMapBuilder::set_window` 负责（那趟会把索引区整体清零）。
+  if empty_cursor.len() != scene.volumes.len() {
+    empty_cursor.resize(scene.volumes.len(), 0);
+  }
+  for (vol, g) in scene.volumes.all().iter().enumerate() {
+    // 换世界后日志长度会从头开始 ⇒ 游标必须跟着回退（否则新增的那些被当成"处理过"而漏标）
+    if empty_cursor[vol] > g.empty_count() {
+      empty_cursor[vol] = 0;
+    }
+    let fresh = g.empty_log_from(empty_cursor[vol]);
+    if fresh.is_empty() {
+      continue;
+    }
+    let n = fresh.iter().filter(|c| builder.note_empty(vol, **c)).count();
+    empty_cursor[vol] = g.empty_count();
+    bevy::log::debug!("EMPTY[vol{vol}] 哨兵 +{n}（已知空共 {}）", empty_cursor[vol]);
+  }
+  // ①″ **静态世界**（没有流式窗口）：渲染窗口内没有内容 = **确定是空的**，不必等"产出过 `None`"
+  //     —— 那种世界根本没有生产源（`stream_chunks` 不跑），射线会在这些块上无限发请求。
+  //     实测：`nuke.vox` 一窗 **283 万条请求 / 178 万条被环丢弃**（最热一块 15.7 万票），
+  //     全是"窗口内、没内容"的槽位。流式世界**不能**这么推（那块可能正在产出）。
+  if grid.stream_window().is_none() {
+    let (o, d) = builder.window(0);
+    let slots = d.x as i64 * d.y as i64 * d.z as i64;
+    if slots > 0 && slots <= STATIC_EMPTY_SCAN_MAX {
+      let mut n = 0usize;
+      for z in 0..d.z {
+        for y in 0..d.y {
+          for x in 0..d.x {
+            let c = gate_voxel::ChunkCoord(o + IVec3::new(x, y, z));
+            if grid.chunk(c).is_none() && builder.note_empty(0, c) {
+              n += 1;
+            }
+          }
+        }
+      }
+      if n > 0 {
+        bevy::log::debug!("EMPTY[vol0] 静态世界补标 +{n}（窗口 {d} 槽）");
+      }
+    }
   }
 
   // ② 用途戳 → LRU 信号（论文 §III.A）：`report_lod_requests` 每 `REPORT_PERIOD_SECS` 从**稠密表**
@@ -1569,11 +1624,12 @@ fn plan_residency(
   // 本函数的 evict / install 一样会标脏 ⇒ 由**下一帧的 `extract`** 连它那份改动一起上传
   // （`extract` 的提前返回条件已含 `VolumesBuilder::has_dirty`）。
   debug!(
-    "RESID[resident {} {}KB install {} evict {} | 远场 install {} evict {}]",
+    "RESID[resident {} {}KB install {} evict {} | 远场 {}块/装 {} evict {}]",
     state.residency.resident_count(),
     state.residency.resident_bytes() / 1024,
     installed,
     evicted,
+    (1..scene.volumes.len()).map(|v| builder.resident_chunks(v).len()).sum::<usize>(),
     far_installed,
     far_evicted
   );
