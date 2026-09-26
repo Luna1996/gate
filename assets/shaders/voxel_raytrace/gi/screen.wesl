@@ -279,16 +279,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let gg = make_grid(u32(h.obj_id) + 1u);
   let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
   let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
-  // **GI 候选的着色法线**：`1` = 直接用命中面的法线 `h.n`（DDA 已经算好，零额外开销），`0` = 走
-  // `voxel_normal`（**要探 6 个邻域体素**）。
-  // WHY 默认取 1：GI 候选的单价实测 400–600 ns（`docs/editable-gigavoxel.md` 的「GI 代价取证」），
-  // 6 次邻域探测约占其中三成；而间接光是低频量 ⇒ 面法线足够。要对比就把这个常量置 0 再跑
-  // `GATE_BENCH=static` + `--features profile` 看 `gate_gi`。
-  const GI_FACE_NORMAL_ONLY: u32 = 1u;
-  var n = h.n;
-  if (GI_FACE_NORMAL_ONLY == 0u) {
-    n = voxel_normal(gg, h.voxel, h.face_id, h.n);
-  }
+  // CONSTRAINT: GI 候选必须用**与主 pass 同一个着色法线** `voxel_normal`（体素中心的梯度法线），
+  // 不能用 DDA 的入射面法线 `h.n`。两者在有起伏的表面上不是一回事：面法线是**逐面**的（台阶的
+  // 顶面/侧面各自一个常数方向）⇒ 间接光的半球整片偏转 ⇒ 沿墙面出现与台阶行对齐的**长条**；
+  // `voxel_normal` 逐体素连续 ⇒ 与可见着色同向、逐体素。代价：6 次邻域探测。
+  let n = voxel_normal(gg, h.voxel, h.face_id, h.n);
   // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS：与 `dda_main` 同一套外推（起点离开命中体素）。
   let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
   let org = p_voxel + n * n_off;

@@ -1,4 +1,4 @@
-﻿//! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
+//! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
 //! [`BrickMapBuilder`]（单 volume）：**每个 chunk 一个树块**（块首 = 根节点地址），块内是节点
 //! arena —— 全量构建按 ChunkCoord 排序并行 `serialize_with_layout()` 后顺序安装；增量更新按
 //! [`TreeDirty`] **只重写动过的节点**（字节没变就不写不标脏），节点在块内原地增删。
@@ -493,13 +493,16 @@ impl BrickMapBuilder {
     // CONSTRAINT: **不能边读边搬** —— 平移是**循环位移**，某个 chunk 的新槽位可能正是另一个 chunk 的
     // 旧槽位；边搬会互相覆盖（表现为画面里出现"别处 chunk 的几何"这种错位巨块）。
     let mut keep: Vec<(usize, u32)> = Vec::with_capacity(self.chunks.len());
-    let mut dropped = 0usize;
+    let mut dropped: Vec<ChunkCoord> = Vec::new();
     for c in self.chunks.keys().copied().collect::<Vec<_>>() {
-      let Some(a) = chunk_index_pos(old.0, old.1, c.0) else { continue };
+      let Some(a) = chunk_index_pos(old.0, old.1, c.0) else {
+        dropped.push(c);
+        continue;
+      };
       let entry = self.buffers.b_struct[a];
       match chunk_index_pos(origin, dims, c.0) {
         Some(b) => keep.push((b, entry)),
-        None => dropped += 1,
+        None => dropped.push(c),
       }
     }
     // 索引区是**定长**的 `TREE_BASE` 字（64³ 槽，与窗口大小无关；窗口只是它被使用的子盒）
@@ -509,6 +512,12 @@ impl BrickMapBuilder {
     }
     self.origin = origin;
     self.dims = dims;
+    // 掉出窗口的**必须真的释放**（块归还全局空闲段 + 从 `self.chunks` 移除），不能只丢条目 ——
+    // 留下的"没有槽位的块"会让 [`Self::compact`] 逐块重指条目时 `window_word` panic（高速移动后崩）。
+    // CONSTRAINT: 必须在 `self.origin/dims` 换过之后调 —— `release_chunk` 靠新窗口判"没有条目可清"。
+    for c in &dropped {
+      self.release_chunk(*c);
+    }
     {
       let g = &mut self.buffers.globals;
       g.index_origin_x = origin.x;
@@ -520,7 +529,7 @@ impl BrickMapBuilder {
     }
     // 整个索引区都要重传（旧的要让 GPU 忘掉、新的要写上）
     self.mark_struct_words(0, TREE_BASE);
-    bevy::log::debug!("WINDOW 平移 {} → {origin} dims {dims}（掉了 {dropped} 个出门的）", old.0);
+    bevy::log::debug!("WINDOW 平移 {} → {origin} dims {dims}（掉了 {} 个出门的）", old.0, dropped.len());
   }
 
   /// 从全局空闲段取一个 ≥`cap` 字的块（找不到就追加到高水位）。
@@ -574,7 +583,8 @@ impl BrickMapBuilder {
   fn release_chunk(&mut self, coord: ChunkCoord) {
     let Some(slot) = self.chunks.remove(&coord) else { return };
     self.free.free(slot.base, slot.cap);
-    let ip = self.window_word(coord);
+    // 掉出窗口的 chunk 没有条目（[`Self::set_window`] 已把整个索引区清零）⇒ 不写条目
+    let Some(ip) = chunk_index_pos(self.origin, self.dims, coord.0) else { return };
     self.buffers.b_struct[ip] = 0;
     self.mark_struct_words(ip, 1);
   }
@@ -1146,6 +1156,49 @@ mod tests {
     assert_eq!(b.buffers().b_struct[pos1], 0, "掉出窗口的条目清空");
     assert!(grid.chunk(c).is_some(), "CPU 侧 chunk 不受窗口平移影响");
     assert_ne!(b.window_word(c2), 0, "仍在窗口内的 chunk 条目照旧跟着走");
+
+    // 掉出窗口的必须**真的释放**（块归还空闲段 + 从 `chunks` 移除），不能只丢条目：留下的
+    // "没有槽位的块"会让 [`BrickMapBuilder::compact`] 逐块重指条目时 panic（实测高速移动后崩）。
+    let words_before = b.buffers().b_struct.len();
+    b.compact();
+    assert!(
+      b.buffers().b_struct.len() < words_before,
+      "掉出窗口的块该被回收：{words_before} → {}",
+      b.buffers().b_struct.len()
+    );
+  }
+
+  /// **wire → GPU 一致性**：`install_blob` 之后，`b_struct` 里那个 4³ 值块的 32 个 inline 半字
+  /// 必须逐格等于 CPU 写入的槽号。
+  ///
+  /// 把"逐体素取色"的数据链验到 GPU 缓冲（CPU 树 → wire → `b_struct`）：任何一环把块内合并成
+  /// uniform、或写漏 inline，着色端就只能拿到一个节点色 ⇒ 画面变成"一个 4³ 块一个色"。
+  /// 读法与 `trace.wesl` 的层次 DDA **同式**：节点 3 字 = mask_lo + mask_hi + palette，
+  /// 子块指针存**相对根的字偏移**（根恒占 3 + 64 字）。
+  #[test]
+  fn gpu_blob_carries_per_voxel_palette_in_a_brick() {
+    const N_FIXED: usize = 3;
+    let mut grid = VolumeGrid::new();
+    for i in 0..64i32 {
+      let p = IVec3::new(i % 4, (i / 4) % 4, i / 16);
+      grid.set_voxel_ivec3(p, PaletteId((i + 1) as u16));
+    }
+    let b = build_and_drain(&mut grid);
+    let words = &b.buffers().b_struct;
+    let ip = b.window_word(ChunkCoord(IVec3::ZERO));
+    let base = words[ip] as usize - 1;
+    // 逐层走 cell (0,0,0)：`pop` = 该格之前的置位数 = 0 ⇒ 取指针表第 0 项
+    let mut addr = base;
+    for lv in 0..3 {
+      assert_ne!(words[addr] | words[addr + 1], 0, "第 {lv} 层应已分裂（cell 0 有内容）");
+      addr = base + words[addr + N_FIXED] as usize;
+    }
+    let mask = (words[addr] as u64) | ((words[addr + 1] as u64) << 32);
+    assert_eq!(mask.count_ones(), 64, "4³ 值块应 64 格全置位（否则整块一色）");
+    for i in 0..64usize {
+      let w = words[addr + N_FIXED + (i >> 1)];
+      assert_eq!((w >> ((i & 1) * 16)) & 0xFFFF, (i + 1) as u32, "GPU 第 {i} 格槽号");
+    }
   }
 
   /// 空闲段：first-fit、相邻合并（前向 / 后向 / 双向）、跨洞不合并

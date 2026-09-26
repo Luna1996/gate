@@ -17,8 +17,18 @@ import package::bindings::{face_slots, face_slots_flat, gi_sec_slots};
 ///
 /// 已知代价：超出范围的坐标按 16 bit 取模别名 ⇒ 两处相距 65536 体素（1.3 km）的同轴同面号会撞键、
 /// 在时域里互相借历史。彻底解决要等相机相对坐标（`docs/editable-gigavoxel.md` 的 M8 之后）。
+/// **面键可编码的坐标半径**（体素；坐标为世界体素坐标，可正负）。
+///
+/// 超出半径的坐标按 16 bit 取模别名 ⇒ `gi_key_ok` 恒 false ⇒ 它同时是**整条复用链的总闸门**：
+/// 时域复用（`gi_res_adopt`）、空间复用（`gi_screen` ③）、逐面认领（`face_slots`）以及
+/// `dda_main` 的逐面缓存着色全部退化，只剩每像素独立估计。
+///
+/// CONSTRAINT: 半径必须覆盖相机可能到达的坐标范围，否则复用链整体失效（键别名还会让相距 65536
+/// 体素的同轴同面互相借历史）。
+const GI_KEY_LIMIT: i32 = 32768;
+
 fn gi_key_ok(v: vec3<i32>) -> bool {
-  return all(v > vec3<i32>(-32768)) && all(v < vec3<i32>(32768));
+  return all(v > vec3<i32>(-GI_KEY_LIMIT)) && all(v < vec3<i32>(GI_KEY_LIMIT));
 }
 
 /// 键 word 0：x、y 各 16 bit（+32768 偏移）。

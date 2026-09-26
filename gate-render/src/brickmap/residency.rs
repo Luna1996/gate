@@ -94,13 +94,18 @@ pub struct ResidencyPolicy {
   /// 编辑钉住帧数：被编辑过的 chunk 在此期间不许换出 / 降级。
   pub pin_frames: u64,
   /// 每帧安装上限（唤醒 + 重装合计）：安装是 0.9–2.4 ms/chunk 的一次性开销，必须摊到多帧。
+  ///
+  /// 取 8 而不是 2：**每帧上限只在"有尖峰要摊"时才有意义**。池空时（冷启动 / 大跨度移动）没有尖峰可摊，
+  /// 摊的代价是整屏空洞要 `池容量 / 上限 / 帧率` 才补完 —— 实测上限 2 时 2048 块要 **17 s**（而全部安装
+  /// 的 CPU 总账只有 `2048 × 1.65 ms ≈ 3.4 s`）。8/帧 把这一段压到 ~4 s（≈ 底线），代价是这 4 s 里
+  /// 每帧多 6 × 1.65 ≈ 10 ms；池满之后需要安装的块是"新进视野的那几个"，自然不会每帧 8 个。
   pub max_install_per_frame: usize,
 }
 
 impl ResidencyPolicy {
-  /// 默认：**预算不限**（只走档位阶梯，不整块丢弃）、每帧最多装 2 个。
+  /// 默认：**预算不限**（只走档位阶梯，不整块丢弃）、每帧最多装 8 个。
   pub const DEFAULT: Self =
-    Self { budget_bytes: 0, min_resident_frames: 30, pin_frames: 120, max_install_per_frame: 2 };
+    Self { budget_bytes: 0, min_resident_frames: 30, pin_frames: 120, max_install_per_frame: 8 };
 
   /// 预算不限。
   pub fn budget_is_off(&self) -> bool {

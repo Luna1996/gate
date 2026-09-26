@@ -1456,6 +1456,37 @@ impl ChunkTree {
 mod tests {
   use super::*;
 
+  /// **wire 必须承载"块内混色"**：一个 4³ 值块里逐体素写不同槽号时，序列化后的节点必须
+  /// `mask` 64 位全置位、且 32 个 inline 半字逐格等于写入值。
+  ///
+  /// 这条是"逐体素取色"的**数据前提**：若块内被合并成 uniform（`mask == 0`），着色端只能拿到
+  /// 一个节点色 ⇒ 画面变成"一个 4³ 块一个色"，与体素分辨率无关。着色逻辑本身无法补救。
+  #[test]
+  fn wire_carries_per_voxel_palette_in_a_brick() {
+    let mut t = ChunkTree::empty();
+    for i in 0..64u16 {
+      t.set_voxel((i % 4) as i32, ((i / 4) % 4) as i32, (i / 16) as i32, PaletteId(i + 1));
+    }
+    let (words, layout) = t.serialize_with_layout();
+    let lvl3 = level_of_extent(BRICK_FACTOR);
+    let mut checked = 0usize;
+    for &(off, lv) in layout.iter() {
+      if lv != lvl3 {
+        continue;
+      }
+      let o = off as usize;
+      let mask = (words[o] as u64) | ((words[o + 1] as u64) << 32);
+      assert_eq!(mask.count_ones(), 64, "块内 64 格都该有独立槽号（被合并成 uniform = 整块一色）");
+      for i in 0..64usize {
+        let w = words[o + NODE_FIXED_WORDS + (i >> 1)];
+        let v = (w >> ((i & 1) * 16)) & 0xFFFF;
+        assert_eq!(v, (i + 1) as u32, "wire 第 {i} 格的槽号必须与写入一致");
+      }
+      checked += 1;
+    }
+    assert!(checked >= 1, "至少应有一个 4³ 值块节点");
+  }
+
   /// 节点 wire 内容快照（`id` → `(层, 掩码, tile 色, 子 id, 层 3 的 inline 值表)`）。
   /// **不含地址** —— 只回答"这个节点的 wire 内容变了没 / 它在第几层"。
   type WireEntry = (u8, u64, PaletteId, Vec<u32>, Option<[u32; LEAF_INLINE_WORDS]>);

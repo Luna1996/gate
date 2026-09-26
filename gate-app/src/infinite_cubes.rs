@@ -163,7 +163,9 @@ impl Default for Streaming {
       unload_radius: 3,
       coarse_radius: 3,
       coarse_height: 3,
-      mount_words: 256 * 1024,
+      // 挂载字数预算：**8 个全分辨率 chunk/帧**（每个 73 K 字）。原值 256 K 只够 3.5 个，与 GPU 侧
+      // `max_install_per_frame` 一起把冷启动拖到十几秒（见 `ResidencyPolicy::max_install_per_frame`）。
+      mount_words: 1024 * 1024,
       mount_count: 48,
       // 池预算 **2 GB**（≈2048 块；换算与实测见 [`Streaming::request_bytes`]）。
       // 依据是**本机 16 GB 内存**：实测每块的**整进程**开销约 `3.2 MB`（CPU 树 `0.54` + GPU wire

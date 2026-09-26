@@ -1199,10 +1199,15 @@ const GAP_NEAR_CHUNKS: i32 = 3;
 /// 取几倍于一个回读窗口（`REPORT_PERIOD_SECS` × 帧率）的量：太短会让"上一窗口看到、这一窗口刚好没被
 /// 采样到"的 chunk 掉出需求集而被换出 ⇒ 下一窗口再装回来（装卸抖振）。
 const USE_KEEP_FRAMES: u64 = 600;
-/// 每个 chunk 在 GPU 上的**典型字节数**（实测 `RESID[]` 与 `struct_buf` 同步读数：3757 chunk
-/// ≈ 1.14 GB ⇒ 约 304 KB/chunk）。只用来把"块数"折成 GPU 侧的字节预算 —— 真实的字节账仍是
-/// [`Residency::resident_bytes`]。
-const GPU_CHUNK_BYTES_EST: usize = 304 * 1024;
+/// 每个 chunk 在 GPU 上的**每块字节上界**（不是均值）—— 用来把"块数"折成 GPU 侧的字节预算。
+///
+/// CONSTRAINT: 必须取**上界**。`pick_evicts` 只在"实际字节 > 预算"时换出；若按均值给预算，池会在
+/// **块数上限之前**就被字节预算顶住，于是每帧换出 1–4 块、`install` 恒为 0 —— 新挂上的块立刻被换掉，
+/// 视线内的缺口再也补不齐（实测：`RESID[resident 1897 622573KB install 0 evict 4]` 每帧重复）。
+///
+/// 实测（同一条 `RESID` 行的 `bytes / resident`）：全分辨率为主的混合下 **367 KB/chunk**
+/// （`349851KB / 952`），逼近块数上限时 **328 KB/chunk**（`622573KB / 1897`）。取 `384 KB` 留 5% 余量。
+const GPU_CHUNK_BYTES_EST: usize = 384 * 1024;
 /// 每个 chunk 在 **CPU**（`VolumeGrid` 里的树）的典型字节数 —— **池容量的真正约束**。
 ///
 /// 实测（`gate-app` 的 `mem_per_chunk` 直读 `ChunkTree::heap_bytes`，`infinite_cubes` 全分辨率）：
