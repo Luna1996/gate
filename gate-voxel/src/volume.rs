@@ -31,6 +31,8 @@ pub struct VolumeGrid {
   pub obj_id: i32,
   /// 体素编辑单调代数（每次实际改变体素 +1；noop 同色重复写不递增，palette 变化不计入）；渲染侧派生数据（如探针烘焙）据此判断是否需重烘。
   edit_generation: u64,
+  /// 常驻集变更序号（挂载 / 卸载 +1）：见 [`Self::resident_seq`]。
+  resident_seq: u64,
   /// 编辑产生的最小 voxel AABB（按 chunk 记录，闭开区间 `[lo, hi)`，世界 voxel 坐标）。
   /// 上传该 chunk 时由 `take_edit_aabb` 取走；未记录者消费方回退到 chunk 包围盒。
   edit_aabbs: HashMap<ChunkCoord, (IVec3, IVec3)>,
@@ -56,6 +58,7 @@ impl Default for VolumeGrid {
       transform: VolumeTransform::IDENTITY,
       obj_id: -1,
       edit_generation: 0,
+      resident_seq: 0,
       edit_aabbs: HashMap::new(),
       stream_window: None,
       far_level: false,
@@ -259,6 +262,13 @@ impl VolumeGrid {
     self.chunks.len()
   }
 
+  /// **常驻集变更序号**（单调，每次挂载 / 卸载 +1）：给渲染侧的"账目同步 / 反向同步"当**精确的**
+  /// 变更信号用（比 `chunk_count` 可靠：同帧"进一块、出一块"时块数不变，但集合变了）。
+  /// 只增不清，比较相等即可（wrapping 也安全：两次变更之间不会真的绕一圈）。
+  pub fn resident_seq(&self) -> u64 {
+    self.resident_seq
+  }
+
   /// GC 所有 chunk，回收累积的废弃节点（见 `ChunkTree::compact`）；chunk 间零共享，rayon 并行。
   pub fn compact_all(&mut self) {
     use rayon::prelude::*;
@@ -274,6 +284,7 @@ impl VolumeGrid {
     self.chunks.insert(cc, tree);
     self.dirty.mark_data(cc);
     self.edit_generation = self.edit_generation.wrapping_add(applied_edits);
+    self.resident_seq = self.resident_seq.wrapping_add(1);
   }
 
   /// **真卸载**：把 chunk 从 CPU 侧拿掉（树 / 组件层 / 编辑 AABB），返回此前是否有内容。
@@ -282,7 +293,11 @@ impl VolumeGrid {
   pub fn unmount_chunk(&mut self, cc: ChunkCoord) -> bool {
     self.edit_aabbs.remove(&cc);
     self.comp_layer.remove(&cc);
-    self.chunks.remove(&cc).is_some()
+    let had = self.chunks.remove(&cc).is_some();
+    if had {
+      self.resident_seq = self.resident_seq.wrapping_add(1);
+    }
+    had
   }
 
   /// 取走一个 chunk 的树（同 [`Self::unmount_chunk`] 的清理，但把树**还给调用方**）。
@@ -290,7 +305,11 @@ impl VolumeGrid {
   pub fn take_chunk(&mut self, cc: ChunkCoord) -> Option<ChunkTree> {
     self.edit_aabbs.remove(&cc);
     self.comp_layer.remove(&cc);
-    self.chunks.remove(&cc)
+    let t = self.chunks.remove(&cc);
+    if t.is_some() {
+      self.resident_seq = self.resident_seq.wrapping_add(1);
+    }
+    t
   }
 
   /// 设置/清除**流式窗口提示**（chunk 原点 + 各轴跨度）：流式世界用它把窗口钉在相机周围，

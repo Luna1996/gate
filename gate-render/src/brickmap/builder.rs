@@ -205,9 +205,11 @@ pub struct BrickMapBuilder {
   dirty_palette: Option<(u16, u16)>,
   /// 调色板同步游标：本 builder 上次同步时调色板的写版本；None = 从未同步过。
   palette_synced_at: Option<u64>,
-  /// **树区预留字数**（M8，0 = 不预留）：见 [`BrickMapBuilder::new_unbuilt_reserved`] 的说明。
+  /// **树区预留字数**（M8，0 = 不预留）：见 [`BrickMapBuilder::new_unbuilt_sized`] 的说明。
   /// 预留区让 `b_struct` 的**长度恒定** ⇒ 排在后面的 volume 的 `tree_base` 不漂移。
   reserve: usize,
+  /// **树区增长的目标块数**（M8）：高水位不够时一次跳到 `本值 × 实测每块字数`，见 [`Self::grow_region`]。
+  region_chunks: usize,
 }
 
 /// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）；空 = 未修改。
@@ -240,18 +242,17 @@ impl BrickMapBuilder {
   /// 由 grid 包围盒确定 chunk 窗口（min - 1 起，跨度 +3 封顶 64³），不序列化内容。
   /// 随后可逐 [`Self::update_chunk`] 累积内容（渐进式初载）。
   pub fn new_unbuilt(grid: &VolumeGrid) -> Self {
-    Self::new_unbuilt_reserved(grid, 0)
+    Self::new_unbuilt_sized(grid, 0, 0)
   }
 
-  /// 同 [`Self::new_unbuilt`]，但**预占一段固定长度的树区**（`reserve_words`）。
+  /// 同 [`Self::new_unbuilt`]，但**预占长度**，并给出树区增长的**目标块数**：
   ///
-  /// WHY（M8）：[`VolumesBuilder::snapshot`] 的 `bases_shifted` 以"各 volume 的 `b_struct` 长度"为判据；
-  /// 排在**主世界之前**的远场级一变长，主世界的 `tree_base` 就漂移 ⇒ 降级**全量快照**（把四个 volume
-  /// 拼一遍 = 580 MB 的 memcpy + 上传，实测 `UPLOAD[full] … elapsed=81–200ms`，`extract` 107–227 ms/帧
-  /// ⇒ 帧率掉到个位数）。预留一段够用满池的固定区 ⇒ 长度恒定 ⇒ 布局不漂移（§8 的"用增长余量摊薄"）。
-  ///
-  /// CONSTRAINT: 预留区**只能被块级分配用掉**；用满后 `alloc_block` 会照旧追加（真变长一次，罕见）。
-  pub fn new_unbuilt_reserved(grid: &VolumeGrid, reserve_words: usize) -> Self {
+  /// - `reserve_words` = **长度**预留（`b_struct` 一开场就是这个长度）。**只给排在别的 volume 之前的
+  ///   远场级用**（见 [`FAR_TREE_RESERVE_WORDS`]）：它的长度一变，后面 volume 的 `tree_base` 就漂移 ⇒
+  ///   `bases_shifted` 降级全量重传（实测 577 MB / 81–200 ms/帧）。主世界在布局序最后，长度可变。
+  /// - `region_chunks` = 这个 volume 最终会有多少块（上限）。树区高水位不够时**一次跳到**
+  ///   `region_chunks × 实测每块字数`，而不是让 `Vec` 逐次翻倍 —— 见 [`Self::grow_region`]。
+  pub fn new_unbuilt_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
     let (origin, dims, rejected) = compute_window(grid);
     let mut b = Self {
       buffers: BrickMapBuffers {
@@ -288,6 +289,7 @@ impl BrickMapBuilder {
       dirty_palette: None,
       palette_synced_at: None,
       reserve: reserve_words,
+      region_chunks: region_chunks.max(1),
     };
     // 预留区登记为**空闲**：块级分配走 first-fit，会优先把它切走
     if reserve_words > 0 {
@@ -300,12 +302,12 @@ impl BrickMapBuilder {
   /// 全量构建（初始化 / 兜底）：确定性 + Rayon 并行序列化。
   /// chunk 按 ChunkCoord 升序安装；序列化并行，安装顺序不变（块地址按安装序递增）。
   pub fn build_full(grid: &VolumeGrid) -> Self {
-    Self::build_full_reserved(grid, 0)
+    Self::build_full_sized(grid, 0, 0)
   }
 
-  /// 同 [`Self::build_full`]，但带树区预留（见 [`Self::new_unbuilt_reserved`]）。
-  pub fn build_full_reserved(grid: &VolumeGrid, reserve_words: usize) -> Self {
-    let mut b = Self::new_unbuilt_reserved(grid, reserve_words);
+  /// 同 [`Self::build_full`]，但带长度预留与增长目标（见 [`Self::new_unbuilt_sized`]）。
+  pub fn build_full_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
+    let mut b = Self::new_unbuilt_sized(grid, reserve_words, region_chunks);
     let mut coords: Vec<ChunkCoord> = grid
       .chunk_coords()
       .filter(|&c| chunk_index_pos(b.origin, b.dims, c.0).is_some() && chunk_has_content(grid, c))
@@ -563,9 +565,47 @@ impl BrickMapBuilder {
       Some(start) => start,
       None => {
         let start = self.buffers.b_struct.len();
-        self.buffers.b_struct.resize(start + cap, 0);
+        let end = start + cap;
+        if end > self.buffers.b_struct.capacity() {
+          self.grow_region(cap);
+        }
+        self.buffers.b_struct.resize(end, 0);
         start
       }
+    }
+  }
+
+  /// 树区**容量**增长（M8 的"扩容策略"）：一次把 `Vec` 的**容量**拨到"这个 volume 最终会有多大"，
+  /// 而不是让 `Vec` 逐次翻倍；**长度**仍按块逐个长（`len` = 高水位，语义不变）。
+  ///
+  /// WHY：容量不足时 `Vec` 会 realloc —— 一次 **O(旧内容)** 的 memcpy。逐次翻倍时最后那一次要搬
+  /// 几百 MB（实测树区 589 MB 时单次 ≈ 几十 ms），而它发生在**渲染世界的 `extract` 里**
+  /// （`install_chunk` → `alloc_block`）⇒ 直接掉一帧（"爬坡期卡顿"的来源）。
+  /// 一次拨到位后不再扩容；而拨得早（第一次装块时容量才 1 MB）⇒ 要拷的旧内容还很小 ⇒ 代价可忽略。
+  /// `reserve` 只给**容量**、不写内存、不提交物理页 ⇒ 拨大是免费的。
+  /// 显存侧跟着受益：`prepare` 的 `ensure_capacity` 拿到的 `need` 随长度渐增，单次拷贝只与旧容量同阶
+  /// （几百 MB 的 GPU-GPU 拷贝 ≈ 2 ms），不再是 CPU 那种几十 ms 的 realloc。
+  ///
+  /// 目标 = `目标块数 × 实测每块字数`，其中"实测每块字数"取 `max(已装块平均, 本次要装的块)`：
+  /// 用**实测**而不是猜常量 ⇒ 对世界的稠密度自适应（`infinite_cubes` 266 KB/块 vs 城堡 1.5 MB/块）。
+  fn grow_region(&mut self, block_cap: usize) {
+    let used = self.buffers.b_struct.len().saturating_sub(TREE_BASE);
+    let per_chunk = (used / self.chunks.len().max(1)).max(block_cap);
+    let target = TREE_BASE + self.region_chunks.saturating_mul(per_chunk);
+    if target <= self.buffers.b_struct.capacity() {
+      return;
+    }
+    let extra = target.saturating_sub(self.buffers.b_struct.len());
+    // TODO(diag): 临时计时，看"爬坡期卡顿"是否就是这里；查完删。
+    let t = std::time::Instant::now();
+    self.buffers.b_struct.reserve(extra);
+    let ms = t.elapsed().as_secs_f32() * 1000.0;
+    if ms > 1.0 {
+      bevy::log::debug!(
+        "DIAG[树区容量拨到 {} 字（旧高水位 {used} 字 / {} 块，每块估 {per_chunk} 字）：{ms:.1}ms]",
+        target - TREE_BASE,
+        self.chunks.len(),
+      );
     }
   }
 
@@ -845,6 +885,8 @@ pub struct VolumesBuilder {
   /// 每 volume 是不是**远场级**（M8）：进 `GridDesc::grid_flags` 的 [`GRID_FLAG_FAR`]，
   /// 唯一消费者是 shader 的分壳裁剪（`trace.wesl::grid_is_far`）。
   far: Vec<bool>,
+  /// 构造时的 GPU 常驻池预算：新增 volume 时（[`Self::sync`]）重算它的树区增长目标要用。
+  budget_bytes: usize,
   /// 上一次 snapshot 的 tree_bases（字偏移）；空 = 首帧 → 强制全量
   prev_tree_bases: Vec<u32>,
   /// 上一次 snapshot 的 palette_bases（字偏移）
@@ -854,8 +896,8 @@ pub struct VolumesBuilder {
 }
 
 impl VolumesBuilder {
-  /// 该 volume 的树区预留（M8）：远场级固定预留 [`FAR_TREE_RESERVE_WORDS`]（长度恒定 ⇒ 主世界的
-  /// `tree_base` 不漂移 ⇒ 不降级全量重传），主世界与普通物体为 0。
+  /// 该 volume 的树区**长度预留**（M8）：远场级固定预留 [`FAR_TREE_RESERVE_WORDS`]（长度恒定 ⇒ 主世界的
+  /// `tree_base` 不漂移 ⇒ 不降级全量重传），主世界与普通物体为 0（它们是布局序最后，长度可变）。
   fn reserve_of(grid: &gate_voxel::VolumeGrid) -> usize {
     if grid.is_far_level() {
       super::consts::FAR_TREE_RESERVE_WORDS
@@ -864,13 +906,38 @@ impl VolumesBuilder {
     }
   }
 
-  /// 全量构建所有 volume（初始化 / 兜底）
-  pub fn build_full(volumes: &Volumes) -> Self {
+  /// 该 volume 的树区**目标块数**（"这个 volume 最终会有多少块"，给 [`BrickMapBuilder::grow_region`]
+  /// 一次跳到位用）。三个口径：
+  /// - 远场级：它的池上限（`FAR_POOL_CHUNKS`，与它的长度预留同一把尺）；
+  /// - 流式世界（有窗口提示）：上限由**池预算**定（与 `plan_residency` 的 `budget_bytes` 同源）
+  ///   —— 世界无限，只能按池封顶；`budget_bytes = 0`（不限）时退回默认池容量；
+  /// - 有限世界（.vox / 演示场景）：按**它自己的块数**，一块不多给。
+  fn region_chunks_of(grid: &gate_voxel::VolumeGrid, budget_bytes: usize) -> usize {
+    if grid.is_far_level() {
+      return crate::brickmap::consts::FAR_POOL_CHUNKS;
+    }
+    if grid.stream_window().is_some() {
+      if budget_bytes == 0 {
+        crate::brickmap::consts::FAR_POOL_CHUNKS // 预算不限时按默认池量级
+      } else {
+        super::upload::pool_capacity_chunks(budget_bytes)
+      }
+    } else {
+      grid.chunk_count().max(1)
+    }
+  }
+
+  /// 全量构建所有 volume（初始化 / 兜底）。`budget_bytes` = GPU 常驻池预算（定树区增长目标）。
+  pub fn build_full(volumes: &Volumes, budget_bytes: usize) -> Self {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
-      builders.push(BrickMapBuilder::build_full_reserved(grid, Self::reserve_of(grid)));
+      builders.push(BrickMapBuilder::build_full_sized(
+        grid,
+        Self::reserve_of(grid),
+        Self::region_chunks_of(grid, budget_bytes),
+      ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
     }
@@ -878,6 +945,7 @@ impl VolumesBuilder {
       builders,
       transforms,
       far,
+      budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
       force_full: true,
@@ -885,12 +953,16 @@ impl VolumesBuilder {
   }
 
   /// 空构造（渐进式：先 new_unbuilt，再 update_chunk 累积）
-  pub fn new_unbuilt(volumes: &Volumes) -> Self {
+  pub fn new_unbuilt(volumes: &Volumes, budget_bytes: usize) -> Self {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
-      builders.push(BrickMapBuilder::new_unbuilt_reserved(grid, Self::reserve_of(grid)));
+      builders.push(BrickMapBuilder::new_unbuilt_sized(
+        grid,
+        Self::reserve_of(grid),
+        Self::region_chunks_of(grid, budget_bytes),
+      ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
     }
@@ -898,6 +970,7 @@ impl VolumesBuilder {
       builders,
       transforms,
       far,
+      budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
       force_full: true,
@@ -918,7 +991,11 @@ impl VolumesBuilder {
     while self.builders.len() < volumes.all().len() {
       let idx = self.builders.len();
       let grid = &volumes.all()[idx];
-      self.builders.push(BrickMapBuilder::build_full_reserved(grid, Self::reserve_of(grid)));
+      self.builders.push(BrickMapBuilder::build_full_sized(
+        grid,
+        Self::reserve_of(grid),
+        Self::region_chunks_of(grid, self.budget_bytes),
+      ));
       self.transforms.push(grid.transform());
       self.far.push(grid.is_far_level());
       self.force_full = true;
@@ -1418,6 +1495,40 @@ mod tests {
     );
   }
 
+  /// **M8 扩容策略**：树区**容量**在第一次需要增长时就拨到"目标块数 × 实测每块字数"，此后在目标以内
+  /// **不再扩容**（`capacity` 不变 ⇒ 不再有 O(旧内容) 的 realloc ⇒ 渲染线程不再被搬几百 MB 卡住）。
+  #[test]
+  fn tree_region_grows_once_to_target() {
+    let mut grid = VolumeGrid::new();
+    let coords: Vec<ChunkCoord> =
+      (0..40).map(|i| ChunkCoord(IVec3::new(i % 8, i / 8, 0))).collect();
+    for c in &coords {
+      for x in 0..8 {
+        for y in 0..8 {
+          for z in 0..8 {
+            grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(1));
+          }
+        }
+      }
+    }
+    let mut b = BrickMapBuilder::new_unbuilt_sized(&grid, 0, coords.len());
+    let cap0 = b.buffers().b_struct.capacity();
+    let mut caps = Vec::new();
+    for c in &coords {
+      let dirty = take_dirty_of(&mut grid, *c);
+      b.update_chunk(&grid, *c, &dirty, true);
+      caps.push(b.buffers().b_struct.capacity());
+    }
+    assert!(caps[0] > cap0, "第一次装块就该把容量拨到目标：{cap0} → {}", caps[0]);
+    let target = caps[0];
+    assert!(
+      caps.iter().all(|&c| c == target),
+      "容量只该拨一次（目标以内不再 realloc），实际 {caps:?}"
+    );
+    assert!(b.buffers().b_struct.len() <= b.buffers().b_struct.capacity());
+    assert_eq!(b.resident_chunks().len(), coords.len());
+  }
+
   /// **M8**：远场级的树区**长度恒定** —— 这是"不降级全量重传"的前提。
   ///
   /// `VolumesBuilder::snapshot` 的 `bases_shifted` 以各 volume 的 `b_struct` 长度为判据；远场级排在
@@ -1439,7 +1550,7 @@ mod tests {
       }
     }
     let reserve = 1 << 20; // 4 M 字（够这 12 块的 1.5 万倍余量）
-    let mut b = BrickMapBuilder::new_unbuilt_reserved(&grid, reserve);
+    let mut b = BrickMapBuilder::new_unbuilt_sized(&grid, reserve, 12);
     let len0 = b.buffers().b_struct.len();
     assert_eq!(len0, TREE_BASE + reserve, "预留区应当场占住");
     for c in &coords {

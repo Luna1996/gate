@@ -582,9 +582,11 @@ fn extract(
   if !dirty_any && !window_moved && !builder_dirty {
     return;
   }
-  let builder = mirror.builder.get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref));
+  let builder = mirror
+    .builder
+    .get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref, scene.residency_budget_bytes));
   if need_full {
-    *builder = VolumesBuilder::build_full(volumes_ref);
+    *builder = VolumesBuilder::build_full(volumes_ref, scene.residency_budget_bytes);
     pending_data.clear();
   } else {
     // 压实的时机：必须"安静"（没有笔触在跑、且这一批就是全部待上传的改动），否则会把一次
@@ -691,6 +693,8 @@ fn ensure_capacity(
     return;
   }
   let new_size = grow_size(cap, need_bytes);
+  // TODO(diag): 临时计时，核对"显存扩容单次只有几 ms"；查完删。
+  let t = std::time::Instant::now();
   let new_buf = device.create_buffer(&BufferDescriptor {
     label: Some(label),
     size: new_size,
@@ -704,6 +708,10 @@ fn ensure_capacity(
       .create_command_encoder(&CommandEncoderDescriptor { label: Some("gate_grow_prefix_copy") });
     enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
     queue.submit([enc.finish()]);
+  }
+  let ms = t.elapsed().as_secs_f32() * 1000.0;
+  if ms > 1.0 {
+    debug!("DIAG[显存 {label} 扩容 {cap} → {new_size} B（含前缀拷贝）：{ms:.1}ms]");
   }
   *cur = new_buf;
 }
@@ -1212,6 +1220,10 @@ const GAP_NEAR_CHUNKS: i32 = 3;
 /// 的产出率同量级 —— 让**产出**（而不是挂载）成为远场铺开速度的瓶颈。
 const FAR_INSTALL_PER_FRAME: usize = 24;
 
+/// 账目同步（`plan_residency` ①）与远场扫描（⑥）的**兜底全扫周期**（帧）：平时靠"块数变了 / 有编辑 /
+/// 上一帧动过"三个信号跳过 O(常驻数) 的那趟，这个周期只是防漏信号（约 4 s 一次，成本摊到几百分之一）。
+const LEDGER_SWEEP_FRAMES: u64 = 240;
+
 /// 需求集只看"最近 `USE_KEEP_FRAMES` 帧内被用到过"的 chunk。
 /// 取几倍于一个回读窗口（`REPORT_PERIOD_SECS` × 帧率）的量：太短会让"上一窗口看到、这一窗口刚好没被
 /// 采样到"的 chunk 掉出需求集而被换出 ⇒ 下一窗口再装回来（装卸抖振）。
@@ -1318,6 +1330,12 @@ fn plan_residency(
   mut mirror: ResMut<BuilderMirror>,
   mut state: ResMut<ResidencyState>,
   mut gap_last: Local<usize>,
+  // ①/⑥/⑤ 的"账目可能变了"闸门（见 ① 的说明）：常驻集变更序号、上一帧有没有 install/evict、
+  // 远场各自的序号
+  mut ledger_seq: Local<u64>,
+  mut ledger_busy: Local<bool>,
+  mut far_seq: Local<Vec<u64>>,
+  mut sync_seq: Local<u64>,
 ) {
   let (Some(scene), Some(cam)) = (scene, cam) else { return };
   let Some(builder) = mirror.builder.as_mut() else { return };
@@ -1328,17 +1346,30 @@ fn plan_residency(
 
   // ① 账目同步：CPU 有内容的 chunk ↔ builder 里有没有块。首次见到的按**全分辨率**记
   //    （建场景走全量安装；proxy 档位只由本系统自己写）。
-  for c in grid.chunk_coords().collect::<Vec<_>>() {
-    match builder.resident_bytes_of(0, c) {
-      Some(bytes) => {
-        if state.residency.resident_level(c).is_some() {
-          state.residency.note_bytes(c, bytes);
-        } else {
-          state.residency.note_resident(c, bytes, gate_voxel::BRICK_FACTOR, frame);
+  //
+  // **闸门**（M8）：这趟是 O(CPU 常驻块数) —— 常驻 1–2 万块时 3–5 ms/帧（§10.4 第 1 条），而绝大多数
+  // 帧里账目一个字都没变（相机静置、或只是移动了几帧没触发装载）。只在"可能变了"时重算：
+  // **常驻集变更序号**变了（挂载 / 卸载 —— 用序号而不是块数：同帧"进一块、出一块"块数不变但集合变了）
+  // / 本帧有编辑 / 上一帧做过 install-evict（字节数变了要更新）/ 每 [`LEDGER_SWEEP_FRAMES`] 帧的兜底。
+  let seq = grid.resident_seq();
+  let ledger_may_change = *ledger_seq != seq
+    || *ledger_busy
+    || !state.edited.is_empty()
+    || frame % LEDGER_SWEEP_FRAMES == 0;
+  if ledger_may_change {
+    for c in grid.chunk_coords().collect::<Vec<_>>() {
+      match builder.resident_bytes_of(0, c) {
+        Some(bytes) => {
+          if state.residency.resident_level(c).is_some() {
+            state.residency.note_bytes(c, bytes);
+          } else {
+            state.residency.note_resident(c, bytes, gate_voxel::BRICK_FACTOR, frame);
+          }
         }
+        None => state.residency.note_gone(c),
       }
-      None => state.residency.note_gone(c),
     }
+    *ledger_seq = seq;
   }
 
   // ② 用途戳 → LRU 信号（论文 §III.A）：`report_lod_requests` 每 `REPORT_PERIOD_SECS` 从**稠密表**
@@ -1447,11 +1478,16 @@ fn plan_residency(
   }
   // ⑤ 反向同步：builder 里还有块、但 CPU 侧已经没有这个 chunk（被真卸载 / 整块清空）⇒ 归还 GPU 块。
   //    流式世界的卸载就是走这条路：`VolumeGrid::unmount_chunk` 拿掉 CPU 树，这里跟着释放显存。
-  for c in builder.resident_chunks(0) {
-    if grid.chunk(c).is_none() {
-      builder.evict(0, c);
-      state.residency.note_gone(c);
-      evicted += 1;
+  //    **闸门**（M8）：`resident_chunks` 是 O(builder 常驻块数) + 一次 Vec 分配；而 orphan 只在
+  //    "CPU 常驻集变了"时才可能出现（本系统自己的 install/evict 已同步记账）⇒ 序号没变就跳过。
+  if seq != *sync_seq || frame % LEDGER_SWEEP_FRAMES == 0 {
+    *sync_seq = seq;
+    for c in builder.resident_chunks(0) {
+      if grid.chunk(c).is_none() {
+        builder.evict(0, c);
+        state.residency.note_gone(c);
+        evicted += 1;
+      }
     }
   }
   // ⑥ **远场级（vol ≥ 1）的 GPU 常驻**（M8）：**只做"CPU 有 ⇒ GPU 有" + "CPU 没了 ⇒ 归还"**，
@@ -1461,11 +1497,20 @@ fn plan_residency(
   //    每帧安装上限取 [`FAR_INSTALL_PER_FRAME`]（远场块的安装是"整棵小树序列化"，比主世界的
   //    proxy 唤醒便宜得多 —— 实测远场树 ≈ 66 KB vs 主世界 278 KB）。
   let (mut far_installed, mut far_evicted) = (0usize, 0usize);
+  if far_seq.len() != scene.volumes.len() {
+    far_seq.resize(scene.volumes.len(), u64::MAX);
+  }
   for vol in 1..scene.volumes.len() {
     let far_grid = &scene.volumes.all()[vol];
     if !far_grid.is_far_level() {
       continue;
     }
+    // 闸门（M8）：这两趟各是 O(远场常驻块数)，而远场块只在"装载 / 卸载"时变 ⇒ 平时整段跳过。
+    let fseq = far_grid.resident_seq();
+    if far_seq[vol] == fseq && frame % LEDGER_SWEEP_FRAMES != 0 {
+      continue;
+    }
+    far_seq[vol] = fseq;
     let quota = FAR_INSTALL_PER_FRAME.saturating_sub(far_installed);
     if quota > 0 {
       let mut todo: Vec<gate_voxel::ChunkCoord> =
@@ -1510,7 +1555,10 @@ fn plan_residency(
       }
     }
   }
-  if installed + evicted + far_installed + far_evicted == 0 {
+  // ① 的闸门信号：本帧动过账目（装/换了块）⇒ 下一帧要重算字节（同一坐标的驻留字节会变）。
+  let busy = installed + evicted + far_installed + far_evicted > 0;
+  *ledger_busy = busy;
+  if !busy {
     return;
   }
   // WARNING: **这里不重出 `UploadSnapshot`**（`extract` 是唯一的出快照点）。`snapshot()` 会**取走**

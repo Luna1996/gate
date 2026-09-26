@@ -842,13 +842,50 @@ wire 的**节点字高 16 位**（`pack_palette_word` 的 bit16..31）原本就�
    - ~~**GI 历史每帧作废**：流式期间 `dirty.boxes` 每帧非空 ⇒ GI 走"不复用历史"的贵路径（每像素重新寻
      光照）。这是"一动就掉帧"最可能的大头，且**与本仓的流式策略直接冲突**（越努力加载，GI 越贵）。~~
      **〔已修，见「附二」：`flags.z` 与二次顶点缓存的 epoch 都改成"世界整体"口径；`gate_gi` 15.4 → 1.7 ms〕**
-   - 每帧 O(常驻 chunk 数) 的扫描：`plan_residency` ①+②、`stream_chunks` 卸载三分法、`resident_chunks`
-     的 Vec 分配 —— 常驻 1–2 万 chunk 时约 3–5 ms/帧，可用"仅在相机跨 chunk / 常驻集变化时重算"削掉。
-   - `b_struct` 扩容：32 MB 一跳、整块 GPU-GPU 前缀拷贝 ⇒ 爬坡期有几十 ms 的卡顿（可改增长策略）。
+   - ~~**每帧 O(常驻 chunk 数) 的扫描**：`plan_residency` ①+②、`stream_chunks` 卸载三分法、
+     `resident_chunks` 的 Vec 分配 —— 常驻 1–2 万 chunk 时约 3–5 ms/帧，可用"仅在相机跨 chunk /
+     常驻集变化时重算"削掉。~~ **〔已修〕** 见下面「第三轮」。
+   - ~~**`b_struct` 扩容：32 MB 一跳、整块 GPU-GPU 前缀拷贝 ⇒ 爬坡期有几十 ms 的卡顿（可改增长策略）**。~~
+     **〔已修〕** 见下面「第三轮」。
 2. 复验 10.2 第 1 条，并定死 `Streaming` 的三个半径 / 帧额。
 3. **M2b / M4 切片 3**：M8 落地后才有意义（那时才有 16³/64³/整 chunk 三档的用武之地）。
 4. **相机相对坐标**：M8 的 L2 到 ±10.5 km 后，f32 世界坐标（2 cm/体素 ⇒ 5 km = 25 万体素）仍在
    安全区（~10⁵ 体素吃紧是数十公里）；要再放到 30 km+ 就得与"相机相对坐标"一起做。
+
+### 第三轮（优化 ①②）：帧内扫描的闸门 + 树区扩容策略
+
+两项都按"先加计时、再改、再对比"做的（计时用 `DIAG[...]`，查完即删）。
+
+**① 每帧 O(常驻数) 的扫描 → 按"账目可能变了"闸门跳过。** 三处：
+
+- `plan_residency` ①（CPU↔builder 账目同步，逐块一次 HashMap 查询 + 一次 Vec 分配）：只在
+  **常驻集变更序号变了 / 本帧有编辑 / 上一帧做过 install-evict / 每 240 帧兜底** 时重算。
+- `plan_residency` ⑤（反向同步，`resident_chunks` = O(builder 常驻块数) + 一次 Vec 分配）与 ⑥（远场
+  两趟扫描）：同样按序号 + 兜底周期跳过。
+- `stream_chunks` ②（卸载遍历：`chunk_coords` 收集 + `pending` HashSet + 候选 Vec）：只在
+  **窗口平移过 / 常驻集变了 / 超容量 / 每 240 帧兜底** 时跑。
+
+为此给 `VolumeGrid` 加了 **`resident_seq`**（挂载 / 卸载时 +1 的单调序号，`gate-voxel::volume`）：
+闸门要的是"**集合**变了"，用 `chunk_count` 会在"同帧进一块、出一块"时漏掉（流式世界里窗口滑动 +
+新块装载同帧发生很常见）——而漏掉 ⑤ 的后果是**GPU 上留下幽灵块**（CPU 已卸、显存没还，画面里多一块
+不该有的几何）。
+
+**② 树区扩容策略：一次把"容量"拨到位，不再让 `Vec` 逐次翻倍。** `alloc_block` 的追加走
+`Vec::resize`，容量不够时是一次 **O(旧内容)** 的 memcpy；逐次翻倍下最后那一次要搬几百 MB
+（实测树区 589 MB），而它发生在**渲染世界的 `extract` 里**（`install_chunk` 内）⇒ 直接掉一帧。
+现在：容量不足时 `grow_region` **一次 `reserve` 到** `目标块数 × 实测每块字数` ——
+
+- 目标块数（`VolumesBuilder::region_chunks_of`）：远场级 = 它的池上限；流式世界 = 池预算折出的块数；
+  有限世界（.vox / 演示场景）= 它自己的块数（一块不多给）。
+- 每块字数用**实测**（`max(已装块平均, 本次要装的块)`），不猜常量 ⇒ 对世界的稠密度自适应
+  （`infinite_cubes` ≈ 266 KB/块 vs 城堡 ≈ 1.5 MB/块）。
+- `reserve` 只给**容量**（不写内存、不提交物理页）；`len`（高水位、`node_words` 的语义）照旧按块增长。
+
+⇒ 拨容量的时机早（第一次装块时容量才 1 MB）⇒ 要拷的旧内容也小；此后在目标以内**永不 realloc**。
+显存侧跟着受益：`prepare` 的 `ensure_capacity` 拿到的 `need` 随长度渐增，单次拷贝只与旧容量同阶
+（几百 MB 的 GPU-GPU 拷贝 ≈ 2 ms），不再是 CPU 那种几十 ms 的 realloc。
+回归测试：`tree_region_grows_once_to_target`（容量只拨一次）、`far_reserve_keeps_tree_region_length_stable`
+（远场长度恒定）。
 
 ### 10.6 常驻内存：节点布局 + 一处 churn（2026-09-25 下半场）
 

@@ -1457,7 +1457,7 @@ mod tests {
 
     // 增量上传：节点级重写后**实际写进 GPU 的 struct 字节**（旧实现=整棵 chunk 树 ≈1.4MB/笔）。
     // 先消化掉建场景与上面那些大笔触留下的标记（含 reset），只看"一笔小编辑"的量。
-    let mut vbuild = gate_render::brickmap::VolumesBuilder::build_full(&volumes);
+    let mut vbuild = gate_render::brickmap::VolumesBuilder::build_full(&volumes, 0);
     let first = vbuild.snapshot();
     println!("全量 mode={} struct={}KB", first.mode_tag, first.struct_total_bytes / 1024);
     let all: Vec<_> = volumes.main().chunk_coords().collect();

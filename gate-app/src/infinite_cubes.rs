@@ -22,7 +22,7 @@
 //! 槽号由 [`slot_of`] 的**固定方案**给出（与生成顺序、线程调度无关 —— 后台生产的前提），
 //! 整表由 [`material_slots`] 在建世界时一次装进调色板。
 
-use bevy::prelude::{Res, ResMut, Resource};
+use bevy::prelude::{Local, Res, ResMut, Resource};
 use gate_voxel::{
   ChunkCoord, ChunkProducer, ChunkSource, ChunkTree, Detail, PaletteEntry, PaletteFlags, PaletteId,
   PbrOverrides, VolumeGrid, Volumes, fill_bricks,
@@ -159,6 +159,11 @@ const POLL_MAX: usize = 256;
 /// 灌 —— 表现为"一动就掉帧、越飞越卡"）。满仓就不再派发，把产能留给"预算调大"的时刻。
 const READY_MAX: usize = 384;
 
+/// 每 volume 卸载扫描（`stream_chunks` ②）的**兜底全扫周期**（帧）：平时靠"窗口平移 / 块数变化 /
+/// 超容量"三个信号跳过那趟 O(常驻块数) 的遍历，这个周期只是防"同帧进一块、出一块"这种块数不变的
+/// 换手漏过（约 4 s 一次，成本摊到几百分之一）。
+const SWEEP_FRAMES: u32 = 240;
+
 /// **单 volume 的流式状态**（M8：主世界 + 每个远场级各一份）。主世界与远场级走**同一套**驱动逻辑，
 /// 差别只有"需求怎么算"（见 [`plan_generation`] 与 [`plan_generation_far`]）。
 #[derive(Default)]
@@ -178,6 +183,9 @@ struct VolState {
   /// 建世界时同步铺的起始块不在表里 —— 缺省按 [`Detail::Full`] 算（它们确实是全分辨率）。
   /// **远场级不用它**（只有一档），留空即可。
   detail: std::collections::HashMap<ChunkCoord, Detail>,
+  /// 上一轮卸载扫描时的常驻集序号（M8 闸门）：序号没变、窗口没动、也没超容量时整段跳过那趟
+  /// O(常驻块数) 的遍历（见 [`stream_chunks`] ② 的说明）。
+  last_seq: u64,
   /// **LRU 的"最近使用"**（论文 §III.A 的 usage stamp）：chunk → 最近一次"被主射线看到"的批次序号
   /// （`ChunkUseFeed` 每 `REPORT_PERIOD_SECS` 换一批，`use_seq` 每批 +1）。
   ///
@@ -212,6 +220,8 @@ struct VolScope {
   /// 该 volume 当前的窗口（chunk 单位）
   w_origin: IVec3,
   w_dims: IVec3,
+  /// 本帧窗口是否刚平移过（卸载扫描的闸门之一：平移才可能有块"出门"）
+  moved: bool,
 }
 
 impl VolScope {
@@ -344,11 +354,14 @@ pub fn stream_chunks(
   pbr: Option<Res<gate_render::PbrTextureSet>>,
   feed: Option<Res<gate_render::LodRequestFeed>>,
   use_feed: Option<Res<gate_render::ChunkUseFeed>>,
+  // 卸载扫描的兜底周期计数（见 ② 的闸门说明）
+  mut frames: Local<u32>,
 ) {
   // WHY: 暂停 = 冻结整个流式环（连窗口都不跟）—— 让相机能飞出加载边界，看"世界到此为止"的那一圈。
   if stream.paused {
     return;
   }
+  *frames = frames.wrapping_add(1);
   let Some(cam) = cam else { return };
   if scene.volumes.main().stream_window().is_none() {
     return; // 非流式世界
@@ -373,15 +386,21 @@ pub fn stream_chunks(
     let scale = scene.volumes.list[vol].transform().scale;
     let Some((o, d)) = scene.volumes.list[vol].stream_window() else {
       // 既不是主世界也不是远场级（未使用物体路径）：占位保持卷号对齐，后面按 `is_far_level` 跳过
-      scopes.push(VolScope { center: IVec3::ZERO, w_origin: IVec3::ZERO, w_dims: IVec3::ZERO });
+      scopes.push(VolScope {
+        center: IVec3::ZERO,
+        w_origin: IVec3::ZERO,
+        w_dims: IVec3::ZERO,
+        moved: false,
+      });
       continue;
     };
     let c = (cam_world / scale / chunk as f32).floor().as_ivec3();
     let want = c - d / 2;
-    if want != o {
+    let moved = want != o;
+    if moved {
       scene.volumes.list[vol].set_stream_window(Some((want, d)));
     }
-    scopes.push(VolScope { center: c, w_origin: want, w_dims: d });
+    scopes.push(VolScope { center: c, w_origin: want, w_dims: d, moved });
   }
   let (load_r, unload_r, coarse_r, coarse_h, mount_words, mount_count) = (
     stream.load_radius,
@@ -579,6 +598,21 @@ pub fn stream_chunks(
       //
       // CONSTRAINT：这里只卸 **CPU 侧**（`VolumeGrid`）。GPU 侧的换出由渲染侧的 `plan_residency`
       // 独立决定（主世界同一个容量、同一个 `last_used` 信号；远场级按"CPU 没了就归还"）。
+      //
+      // **闸门**（M8）：这趟是 O(常驻块数) 的收集 + 判定，而它只在三种情形下有事可做：
+      //   ① 窗口动了（有块出了窗口）② 常驻集变了（挂载 / 卸载）③ 超容量（要按 LRU 裁）。
+      // 三者都不成立时（相机静置、装载已收敛 —— 也就是绝大多数帧）整段跳过；再留一个每
+      // `SWEEP_FRAMES` 帧的兜底。
+      // 用 `resident_seq` 而不是块数：同帧"进一块、出一块"时块数不变但集合变了。
+      let seq = grid.resident_seq();
+      let need_scan = scope.moved
+        || seq != st.last_seq
+        || grid.chunk_count() > cap
+        || *frames % SWEEP_FRAMES == 0;
+      st.last_seq = seq;
+      if !need_scan {
+        continue;
+      }
       let resident: Vec<ChunkCoord> = grid.chunk_coords().collect();
       let pending: std::collections::HashSet<ChunkCoord> =
         st.ready.iter().map(|(cc, ..)| *cc).collect();
@@ -1630,7 +1664,12 @@ mod tests {
   #[test]
   fn far_generation_is_request_only() {
     let scope =
-      VolScope { center: IVec3::ZERO, w_origin: IVec3::splat(-32), w_dims: IVec3::splat(64) };
+      VolScope {
+        center: IVec3::ZERO,
+        w_origin: IVec3::splat(-32),
+        w_dims: IVec3::splat(64),
+        moved: false,
+      };
     let req = |vol: u8, votes: u32, c: IVec3| gate_render::LodRequest {
       vol,
       chunk: c,
