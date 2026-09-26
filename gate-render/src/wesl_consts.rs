@@ -86,10 +86,14 @@ pub struct TraceConsts {
   pub req_sample: u32,
   /// 每条射线最多记几条请求（`REQ_PER_RAY_MAX`）。
   pub req_per_ray_max: u32,
+  /// **grid volume 数**（`GRID_VOLUMES`：主世界 + 远场级）。请求环与用途戳表按它分段定长，
+  /// Rust 的 [`crate::brickmap::consts::VOLUMES`] 必须与它**逐字相等**（见 `load` 里的核对）。
+  pub volumes: u32,
 }
 
 /// [`TraceConsts`] 需要的常量名（缺一即 fail fast）。
-const TRACE_REQUIRED: &[&str] = &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX"];
+const TRACE_REQUIRED: &[&str] =
+  &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX", "GRID_VOLUMES"];
 
 // MT8-3 的 `ReflConsts` / `refl_consts()` / `REFL_ENTRY_BYTES` 已随反射缓存一起删除（实测负优化）。
 // 这里只保留**通用**解析器（`parse_package_u32_consts` / `parse_u32_consts_in_source`），
@@ -289,6 +293,7 @@ impl TraceConsts {
       req_enable: get("REQ_ENABLE"),
       req_sample: get("REQ_SAMPLE"),
       req_per_ray_max: get("REQ_PER_RAY_MAX"),
+      volumes: get("GRID_VOLUMES"),
     };
 
     // 采样率是素数/取模的分母、每条射线上限是条目数上限：两者为 0 会让请求通道静默失效。
@@ -297,14 +302,28 @@ impl TraceConsts {
       error!("{msg}");
       panic!("{msg}");
     }
+    // volume 数是 `lod_req` 的**分段 stride**（用途戳表 + 请求环的起始下标都由它算）：两侧不等
+    // 会直接越界写 / 解包全垃圾 ⇒ 必须逐字相等。
+    if out.volumes != crate::brickmap::consts::VOLUMES as u32 {
+      let msg = format!(
+        "grid volume 数不一致：trace.wesl::GRID_VOLUMES = {}，\
+         brickmap::consts::VOLUMES = {}（两侧必须相等，它决定 `lod_req` 的分段与长度）",
+        out.volumes,
+        crate::brickmap::consts::VOLUMES
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
     info!(
       target: "gate",
-      "WESL 跨端常量（源 {}）：LOD 诊断 {}；ray-guided 请求 {}（采样 1/{}/条射线、每条 ≤ {} 条）",
+      "WESL 跨端常量（源 {}）：LOD 诊断 {}；ray-guided 请求 {}（采样 1/{}/条射线、每条 ≤ {} 条）；\
+       grid volume 数 {}",
       dir.display(),
       if out.lod_diag != 0 { "开" } else { "关" },
       if out.req_enable != 0 { "开" } else { "关" },
       out.req_sample,
       out.req_per_ray_max,
+      out.volumes,
     );
     out
   }

@@ -25,7 +25,7 @@
 use bevy::prelude::{Res, ResMut, Resource};
 use gate_voxel::{
   ChunkCoord, ChunkProducer, ChunkSource, ChunkTree, Detail, PaletteEntry, PaletteFlags, PaletteId,
-  PbrOverrides, VolumeGrid, fill_bricks,
+  PbrOverrides, VolumeGrid, Volumes, fill_bricks,
 };
 use glam::{IVec3, Vec3};
 
@@ -53,6 +53,87 @@ pub(crate) fn initial_box(center: IVec3) -> (IVec3, IVec3) {
   ((c - IVec3::splat(START_CHUNKS)) * chunk, (c + IVec3::splat(START_CHUNKS + 1)) * chunk)
 }
 
+// ---------------------------------------------------------------------------
+// M8 · 多级远场（`docs/editable-gigavoxel.md` §4 M8）
+// ---------------------------------------------------------------------------
+
+/// **远场梯级**：每级的「级体素」= 多少个主世界体素（= 该 volume 的 `transform.scale`）。
+///
+/// 梯级由两条约束一起定（§10.4 第 2 条）：
+/// - **接缝 ≤ 1 px**：本级在内沿 `d_in` 处要 `g ≤ d_in/935`（1080p，`1/px_ang = 935` 体素）；
+/// - **每级的「覆盖/粒度」比恒定**：覆盖 = 32 chunk × 256 级体素 = `8192·scale` 体素，
+///   粒度 `g = FAR_GRAIN · scale` ⇒ `覆盖/g = 8192/FAR_GRAIN = 2048`，接缝处恒
+///   `935·FAR_GRAIN/8192 = 0.46 px`（**与 scale 无关** ⇒ 接缝宽度不随级数变）。
+///
+/// ⇒ 覆盖半径（世界体素 / 米，1 体素 = 2 cm）：`4` → 32768 / **655 m**、`16` → 131072 / **2.6 km**、
+/// `64` → 524288 / **10.5 km**。**5 km 视距由 L3 覆盖**（§10.4 的验收目标）。
+///
+/// CONSTRAINT: 级体素必须是 `FAR_GRAIN` 的倍数（格点才能落在世界坐标的整数格上）。
+pub const FAR_SCALES: [i32; 3] = [4, 16, 64];
+
+/// **远场每格的边长（级体素）**：每 chunk `(256/16)³ = 16³ = 4096` 格。
+///
+/// 取值是"**接缝宽度** vs **内存 / 产出**"的取舍，实测（`far_detail_is_much_smaller_than_full`
+/// 与 `produce_cost` 同一批数据，`infinite_cubes`）：
+///
+/// | `FAR_GRAIN` | 格（世界体素，L1） | 树（wire） | 接缝像素（本级内沿） |
+/// |---|---|---|---|
+/// | 4 | 16 | 418 KB/chunk —— **比全分辨率（288 KB）还大** | 2 px |
+/// | 16 | 64 | **4–6 KB/chunk**（≈ 50–60× 便宜） | 7 px |
+///
+/// `grain = 4` 不可用：格（16 世界体素）比白柱截面（24）还细 ⇒ 远场把柱体的**截面**也画出来，
+/// 采样结果是"孤立的一格格"，父层无从合并（树比近场还大）；而 §10.4 的"覆盖/g = 8192/cell"推出来的
+/// `cell = 4` 正是按"接缝 ≤ 0.5 px"给的 —— 那条判据买不到这个内存。
+/// `grain = 16`（格 = 64 世界体素 ≈ 655 m 处的一像素）让**相邻格多半同色** ⇒ 父层大量合并，
+/// 树掉到个位数 KB，一帧能产出上百个 chunk。代价 = 接缝处 7 px 的块（本级内沿；外沿恒 1.8 px）——
+/// **这是本轮明确接受的偏差**（见 `docs/editable-gigavoxel.md` §10.4 的"处处 ≤ 1 px"是那条判据的
+/// 理论值，不是可承受的内存）。
+///
+/// CONSTRAINT：必须是 4 的幂且在 `LEVEL_EXTENT`（`fill_brick` 的合法粒度）内。
+pub const FAR_GRAIN: i32 = 16;
+
+/// 第 `vol` 级（`vol ≥ 1`，与 `Volumes.list` 下标同一口径）的覆盖半径（**世界体素**）。
+/// 窗口 = 64³ chunk、每 chunk 256 级体素 ⇒ 半窗 = 32·256·scale。
+pub fn far_coverage_voxels(vol: usize) -> i32 {
+  let scale = FAR_SCALES[vol - 1];
+  32 * gate_voxel::CHUNK_SIZE * scale
+}
+
+/// **给主世界挂上三级远场 volume（M8）**：逐级 `Volumes::add_far_level` + 装调色板 + 钉窗口。
+///
+/// 三个口径：
+/// - **窗口 = 64³ chunk**（`CHUNK_INDEX_CAP` 的上限，与主世界同宽）⇒ 覆盖 = 32·256·scale 世界体素；
+///   逐帧由 [`stream_chunks`] 钉在相机中心（平移索引区，不重传树块）。
+/// - **调色板逐份复制**：每个 volume 有自己的 `b_palette`（512 KB），而远场产出的槽号来自**同一套
+///   方案**（[`material_slots`]）⇒ 必须把同一张表装进每一份（worker 从头到尾不写调色板）。
+/// - **与主世界共享原点**（`add_far_level` 的 `pos = 0`）⇒ 格点锚在世界坐标上，窗口滑动不改相位。
+///
+/// `center` = 相机眼位（世界体素）：起始窗口就钉在它周围，省掉开局那几帧的跨级平移。
+pub fn attach_far_levels(volumes: &mut Volumes, pbr_ids: &[String], center: IVec3) {
+  /// 窗口每轴 chunk 数（= `brickmap::wire::CHUNK_INDEX_CAP`，与 `scene::build_infinite_cubes` 同值）
+  const WINDOW_CHUNKS: i32 = 32;
+  let dims = IVec3::splat(WINDOW_CHUNKS * 2);
+  let slots = material_slots(pbr_ids.len());
+  for &scale in FAR_SCALES.iter() {
+    let vol = volumes.add_far_level(scale as f32);
+    let g = &mut volumes.list[vol];
+    for (id, entry) in slots.iter() {
+      g.palette_mut().set(*id, *entry);
+    }
+    // 相机在该级的 chunk 空间：`floor(cam_world / scale / 256)` ⇒ 窗口以它为中心
+    let c = (center / scale).div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE));
+    g.set_stream_window(Some((c - IVec3::splat(WINDOW_CHUNKS), dims)));
+    // 启动里程碑（一次性，3 行）：覆盖半径是验收"视距 ≥ 5 km"的直接依据（1 体素 = 2 cm）
+    bevy::log::info!(
+      "FAR L{vol} scale {scale}（1 级体素 = {scale} 世界体素）覆盖 ±{:.2}km；窗口 {}³ chunk × 256 级体素、\
+       格 {FAR_GRAIN} 级体素 = {:.2}m",
+      far_coverage_voxels(vol) as f32 * 0.02 / 1000.0,
+      dims.x,
+      FAR_GRAIN as f32 * scale as f32 * 0.02,
+    );
+  }
+}
+
 /// 生产管线的 worker 线程数（M5）：生成是纯 CPU、与主线程争核 ⇒ 给 3 个够把"每帧 1 个"的瓶颈
 /// 打开，又不会在 4/8 核机器上把渲染挤掉。
 const PRODUCER_WORKERS: usize = 3;
@@ -78,13 +159,14 @@ const POLL_MAX: usize = 256;
 /// 灌 —— 表现为"一动就掉帧、越飞越卡"）。满仓就不再派发，把产能留给"预算调大"的时刻。
 const READY_MAX: usize = 384;
 
-/// 生产管线的活状态（M5）：worker 池 + 需求表 + 待挂载队列 + 各 chunk 的**现有档位** + 空产出表。
-struct Pipeline {
-  producer: ChunkProducer,
+/// **单 volume 的流式状态**（M8：主世界 + 每个远场级各一份）。主世界与远场级走**同一套**驱动逻辑，
+/// 差别只有"需求怎么算"（见 [`plan_generation`] 与 [`plan_generation_far`]）。
+#[derive(Default)]
+struct VolState {
   /// **需求表**（按 [`plan_generation`] 的键排好序）：只在相机换 chunk / 每
   /// [`DEMAND_REBUILD_FRAMES`] 帧重建；每帧只从表头派发（已满足 / 已在飞的当场划过）
   demand: std::collections::VecDeque<(IVec3, Detail)>,
-  /// 建表时的相机 chunk（None = 还没建过）
+  /// 建表时的相机 chunk（该 volume 自己的 chunk 空间；None = 还没建过）
   demand_center: Option<IVec3>,
   /// 距上次建表过了几帧
   demand_age: u32,
@@ -94,6 +176,7 @@ struct Pipeline {
   ready_set: std::collections::HashSet<ChunkCoord>,
   /// 已挂载 chunk 的档位（粗 / 细）：判"够不够细"（要细化就重新产出，挂载会整体替换）。
   /// 建世界时同步铺的起始块不在表里 —— 缺省按 [`Detail::Full`] 算（它们确实是全分辨率）。
+  /// **远场级不用它**（只有一档），留空即可。
   detail: std::collections::HashMap<ChunkCoord, Detail>,
   /// **LRU 的"最近使用"**（论文 §III.A 的 usage stamp）：chunk → 最近一次"被主射线看到"的批次序号
   /// （`ChunkUseFeed` 每 `REPORT_PERIOD_SECS` 换一批，`use_seq` 每批 +1）。
@@ -102,12 +185,40 @@ struct Pipeline {
   /// 永远最旧 ⇒ 被回收 ⇒ 再被请求 ⇒ 反复产出（且相机静止时世界也在变 ⇒ GI 时域永远接不上）。
   /// 用途戳反过来：**只要射线还在看它，键就一直涨** ⇒ 正在看的块永远排最后被回收。
   last_used: std::collections::HashMap<ChunkCoord, u64>,
-  /// 用途批次的序号（每**换一批** `ChunkUseFeed` +1），就是 [`Self::last_used`] 的值域。
+  /// 产出过、但**没有内容**的 chunk（免得每帧重复派发；infinite_cubes 不会出现，留作通用性）
+  empty: std::collections::HashSet<ChunkCoord>,
+}
+
+/// 生产管线的活状态（M5）：worker 池 + **逐 volume 的**流式状态。
+///
+/// M8：三级远场与主世界共用**一个** worker 池（一个线程池，任务带卷号）与一套节流常量 ——
+/// 各自起池会让线程数按级数翻倍，而生成是纯 CPU。用一个池还有个好处：远场与近场**按同一份帧额**
+/// 竞争，不会出现"远处刷得凶、脚下反而饿着"。
+struct Pipeline {
+  producer: ChunkProducer,
+  /// 每个 volume 一份（下标 = `Volumes.list` 下标 = shader 的 `grid_descs` 下标）
+  vols: Vec<VolState>,
+  /// 用途批次的序号（每**换一批** `ChunkUseFeed` +1），就是各 [`VolState::last_used`] 的值域。
   use_seq: u64,
   /// 最近处理过的用途戳（判"有没有换新的一批"；同批反复处理会把"没有新信息"当成"又一轮最近"）。
   use_stamp: u32,
-  /// 产出过、但**没有内容**的 chunk（免得每帧重复派发；infinite_cubes 不会出现，留作通用性）
-  empty: std::collections::HashSet<ChunkCoord>,
+}
+
+/// 单 volume 的几何 scope（该 volume **自己的 chunk 空间**）：窗口 + 相机在其空间里的 chunk。
+#[derive(Clone, Copy)]
+struct VolScope {
+  /// 相机在该 volume chunk 空间里的位置
+  center: IVec3,
+  /// 该 volume 当前的窗口（chunk 单位）
+  w_origin: IVec3,
+  w_dims: IVec3,
+}
+
+impl VolScope {
+  fn in_window(&self, c: IVec3) -> bool {
+    let t = c - self.w_origin;
+    t.cmpge(IVec3::ZERO).all() && t.cmplt(self.w_dims).all()
+  }
 }
 
 /// 流式驱动参数（主世界资源）。**是否启用由 `grid.stream_window()` 判定** —— 只有
@@ -179,14 +290,29 @@ impl Default for Streaming {
 
 /// M5 的生产源（程序化）：在 worker 线程上跑，**只引用确定性槽号**（[`slot_of`]），
 /// 不碰主线程的 `VolumeGrid`（`scratch` 是 worker 独占的）。
+///
+/// **M8**：同一个源同时服务主世界（`vol == 0`）与远场级（`vol ≥ 1`）—— 远场走
+/// [`build_region_far`]（级体素 = `FAR_SCALES[vol-1]`，每格一次采样）。
 struct InfiniteCubes {
   n_pbr: usize,
 }
 
 impl ChunkSource for InfiniteCubes {
-  fn produce(&self, coord: ChunkCoord, detail: Detail, scratch: &mut VolumeGrid) -> Option<ChunkTree> {
+  fn produce(
+    &self,
+    vol: usize,
+    coord: ChunkCoord,
+    detail: Detail,
+    scratch: &mut VolumeGrid,
+  ) -> Option<ChunkTree> {
     let lo = coord.0 * gate_voxel::CHUNK_SIZE;
-    build_region(scratch, lo, lo + IVec3::splat(gate_voxel::CHUNK_SIZE), self.n_pbr, detail);
+    let hi = lo + IVec3::splat(gate_voxel::CHUNK_SIZE);
+    if vol == 0 {
+      build_region(scratch, lo, hi, self.n_pbr, detail);
+    } else {
+      // 远场级：格粒度固定 = FAR_GRAIN 级体素（`Detail` 不参与 —— 远场只有一档）
+      build_region_far(scratch, lo, hi, self.n_pbr, FAR_SCALES[vol - 1], FAR_GRAIN);
+    }
     scratch.take_chunk(coord) // 搬所有权（不 clone 整棵树）；取走即清空暂存
   }
 }
@@ -199,9 +325,18 @@ impl ChunkSource for InfiniteCubes {
 /// 主线程只做"派发 + 挂载"；挂载 / 常驻 / 换出全走既有流水线（`mount_chunk_tree` 自会标脏 ⇒
 /// 走既有上传路径，显存由 `plan_residency` 的反向同步跟着归还）。
 ///
-/// 两档半径（M5 粗粒度层）：`load_radius` 内是**全分辨率**、`coarse_radius` 内是**16³ 粗档**
-/// （树小得多 ⇒ 视距的杠杆）；粗档 chunk 进到 `load_radius` 内会被重新全分辨率产出顶掉
-/// （`mount_chunk_tree` 是整体替换）。
+/// 主世界的档位（M5 粗粒度层）：`load_radius` 内按"这一级在屏幕上是否 ≤ 1 px"给档（[`detail_at`]）、
+/// 粗档 chunk 进到细档门槛内会被重新产出顶掉（`mount_chunk_tree` 是整体替换）。
+///
+/// **M8 · 三级远场**：主世界（`vol == 0`）之外，每个远场级（`vol ≥ 1`）是一个独立 volume ——
+/// 级体素 = `FAR_SCALES[vol-1]` 个主世界体素、窗口同样 64³ chunk（覆盖 `±655 m / ±2.6 km / ±10.5 km`）。
+/// 三处口径与主世界**刻意一致**，因为整套"窗口平移 + 请求 + LRU"机制由此原样复用：
+/// - **窗口钉在相机上**（与 M6 同一手法）：换到该级的 chunk 空间（`相机世界坐标 / scale / 256`）
+///   ⇒ `builder.set_window` 的平移索引区一字不改；
+/// - **只由请求驱动装载**（[`plan_generation_far`]）：远场**不做半径补块** —— 铺满一级
+///   64³ = 262144 个 chunk ≈ 17 GB（§10.4），而射线真正在看的（视锥内）只有约 1.5 万个/级；
+/// - **卸载按容量 + LRU**：与主世界同一把尺（用途戳 + `unload_radius` 保护圈），
+///   容量按**远场自己的每块字节**换算（[`gate_render::pool_capacity_chunks_far`]），**每级各一份**。
 pub fn stream_chunks(
   mut stream: ResMut<Streaming>,
   mut scene: ResMut<gate_render::VoxelScene>,
@@ -215,12 +350,12 @@ pub fn stream_chunks(
     return;
   }
   let Some(cam) = cam else { return };
-  let Some((mut w_origin, w_dims)) = scene.volumes.main().stream_window() else {
+  if scene.volumes.main().stream_window().is_none() {
     return; // 非流式世界
-  };
+  }
   let chunk = gate_voxel::CHUNK_SIZE;
-  let center = (cam.position_world / chunk as f32).floor().as_ivec3();
   let forward = cam.forward;
+  let cam_world = cam.position_world;
 
   // ⓪' **GPU 常驻池预算**（论文 §III.A 的定长 pool）交给渲染侧：`plan_residency` 用它当
   //     `ResidencyPolicy::budget_bytes`。暂停时这条路不走 ⇒ 渲染侧沿用上一次的值（暂停的语义就是冻结）。
@@ -228,15 +363,26 @@ pub fn stream_chunks(
 
   // ⓪ 窗口跟着相机（**M6**）。窗口是 `b_struct` 索引区的定义域：跑出窗口的 chunk 生成得出、
   //    却装不上 GPU（索引区之外）⇒ 画面成片空洞。旧版是"接近边界就整块重定"（丢全部 CPU chunk +
-  //    全量重传，一次性卡顿）；现在每帧把窗口钉在**相机为中心的 `w_dims`** 上，移动交给 builder 的
+  //    全量重传，一次性卡顿）；现在每帧把窗口钉在**相机为中心的 `dims`** 上，移动交给 builder 的
   //    **平移索引区**（只搬 1 MB 条目、不重传树块、不丢 CPU 内容）⇒ 世界随你走，不卡。
   //    CONSTRAINT：常驻环必须远小于半窗宽，否则相机走到窗边会卸载掉"还在窗内但已过界"的 chunk。
-  let want_origin = center - w_dims / 2;
-  if want_origin != w_origin {
-    scene.volumes.main_mut().set_stream_window(Some((want_origin, w_dims)));
-    w_origin = want_origin;
+  //    **远场级同一手法**，只是"相机位置"要换到该级的 chunk 空间（`cam_world / scale`）。
+  let n_vol = scene.volumes.len();
+  let mut scopes: Vec<VolScope> = Vec::with_capacity(n_vol);
+  for vol in 0..n_vol {
+    let scale = scene.volumes.list[vol].transform().scale;
+    let Some((o, d)) = scene.volumes.list[vol].stream_window() else {
+      // 既不是主世界也不是远场级（未使用物体路径）：占位保持卷号对齐，后面按 `is_far_level` 跳过
+      scopes.push(VolScope { center: IVec3::ZERO, w_origin: IVec3::ZERO, w_dims: IVec3::ZERO });
+      continue;
+    };
+    let c = (cam_world / scale / chunk as f32).floor().as_ivec3();
+    let want = c - d / 2;
+    if want != o {
+      scene.volumes.list[vol].set_stream_window(Some((want, d)));
+    }
+    scopes.push(VolScope { center: c, w_origin: want, w_dims: d });
   }
-  let grid = scene.volumes.main_mut();
   let (load_r, unload_r, coarse_r, coarse_h, mount_words, mount_count) = (
     stream.load_radius,
     stream.unload_radius,
@@ -246,18 +392,18 @@ pub fn stream_chunks(
     stream.mount_count,
   );
   let (request_bytes, requests_load) = (stream.request_bytes, stream.requests_load);
-  let in_window = |c: IVec3| {
-    let t = c - w_origin;
-    t.cmpge(IVec3::ZERO).all() && t.cmplt(w_dims).all()
-  };
   // **池容量**（chunk）：与渲染侧的 GPU 常驻池**同源换算**（[`gate_render::pool_capacity_chunks`]）
   // —— 两侧各按各的公式算就会出现"CPU 还留着 / GPU 已换出"（每帧重传）或反之（CPU 卸了 / GPU 还占着）。
-  // `fill` = **还剩几个空位**（池容量 − 窗口内的 CPU 常驻）。它是半径补块的预算：池满 ⇒ `fill = 0`
+  // **主世界与远场级分开换算**（M8）：主世界按"可编辑的全分辨率树"（1 MiB/块），远场按几 KB/块
+  // —— 同一个口径会把远场卡在 2048 块，而视锥内一级就要 ≈ 1.5 万块（见 `pool_capacity_chunks_far`）。
+  let cap = gate_render::pool_capacity_chunks(request_bytes);
+  let cap_far = gate_render::pool_capacity_chunks_far(request_bytes);
+  // `fill` = 主世界**还剩几个空位**（池容量 − 窗口内的 CPU 常驻）。它是半径补块的预算：池满 ⇒ `fill = 0`
   // ⇒ 不再按半径产出（否则就是"装一块、被 LRU 换掉、下帧再装"的空转）。**请求不受它限制** ——
   // 未命中换进一个槽位、同时挤出一个 LRU 槽位，池满时正是最该放行的。
-  let cap = gate_render::pool_capacity_chunks(request_bytes);
-  let fill = cap.saturating_sub(grid.chunk_coords().filter(|c| in_window(c.0)).count());
-  let fill = DEMAND_TABLE_MAX.min(fill);
+  let main_in_window =
+    scene.volumes.main().chunk_coords().filter(|c| scopes[0].in_window(c.0)).count();
+  let fill = DEMAND_TABLE_MAX.min(cap.saturating_sub(main_in_window));
 
   // ① 生产管线（M5）：**派发**需求给 worker 池（请求优先，再半径补块），本帧只**挂载**已完成的。
   //    管线惰性起：要 `n_pbr` 才能定槽号方案 —— 与建世界时装进调色板的那份同源（`pbr_asset_ids`）。
@@ -266,187 +412,220 @@ pub fn stream_chunks(
     let source = std::sync::Arc::new(InfiniteCubes { n_pbr });
     stream.pipeline = Some(std::sync::Mutex::new(Pipeline {
       producer: ChunkProducer::new(source, PRODUCER_WORKERS),
-      demand: Default::default(),
-      demand_center: None,
-      demand_age: 0,
-      ready: Default::default(),
-      ready_set: Default::default(),
-      detail: Default::default(),
-      last_used: Default::default(),
+      vols: (0..n_vol).map(|_| VolState::default()).collect(),
       use_seq: 0,
       use_stamp: 0,
-      empty: Default::default(),
     }));
   }
+  // 请求与用途戳各取一次（都是每 `REPORT_PERIOD_SECS` 一批的**快照**，不是队列 ⇒ 每帧看到同一份）。
+  let requests: Vec<gate_render::LodRequest> =
+    if requests_load { feed.as_ref().map(|f| f.peek()).unwrap_or_default() } else { Vec::new() };
+  let uses: Vec<gate_render::LodUse> =
+    use_feed.as_ref().map(|f| f.peek()).unwrap_or_default();
+
+  let mut gen_req = 0usize;
   let mut generated = 0usize;
   {
-    let mut pipe = stream
+    let mut guard = stream
       .pipeline
       .as_ref()
       .expect("上面刚装上")
       .lock()
       .unwrap_or_else(|e| e.into_inner());
-    let mut gen_req = 0usize;
-    // ⓪'' **用途戳 → LRU**（论文 §III.A）：每**换一批**（回读侧每 `REPORT_PERIOD_SECS` 换一批）就把
-    //      `use_seq` +1，批内每个 chunk 记成"本批次被看到过"。`last_used` 的值域就是这个批次序号 ⇒
-    //      **单调、可比大小**，正是 `②卸载` 需要的 LRU 键。
-    //      `peek` 每帧都返回**同一份快照**（GPU 侧也要读它）⇒ 用批内最大戳判"是不是新的一批"，
-    //      否则每帧推进一次批次号 = 把"没有新信息"当成"又一轮最近"。
-    if let Some(f) = use_feed.as_ref() {
-      let batch = f.peek();
-      let stamp = batch.iter().map(|u| u.stamp).max().unwrap_or(0);
-      if stamp != 0 && stamp != pipe.use_stamp {
-        pipe.use_stamp = stamp;
-        pipe.use_seq += 1;
-        let seq = pipe.use_seq;
-        for u in &batch {
-          pipe.last_used.insert(ChunkCoord(u.chunk), seq);
-        }
-      }
-    }
-    pipe.demand_age += 1;
-    if pipe.demand_center != Some(center) || pipe.demand_age >= DEMAND_REBUILD_FRAMES {
-      // 请求：**票数决定装哪里**（`plan_generation` 用它排序），**档位由射线报回**（`LodRequest::level`
-      // ⇒ 论文的 "refinement 由渲染结果给"）。请求圈**不受半径环约束** —— 这是 ray-guided 的落点。
-      let requests: Vec<gate_render::LodRequest> = if requests_load {
-        feed.as_ref().map(|f| f.peek()).unwrap_or_default()
-      } else {
-        Vec::new()
-      };
-      let have = |c: IVec3, want: Detail| {
-        let held = pipe.detail.get(&ChunkCoord(c)).copied().unwrap_or(Detail::Full);
-        (grid.chunk(ChunkCoord(c)).is_some() && held >= want) || pipe.empty.contains(&ChunkCoord(c))
-      };
-      let (batch, from_req) = plan_generation(
-        GenScope {
-          center,
-          w_origin,
-          w_dims,
-          load_radius: load_r,
-          coarse_radius: coarse_r,
-          coarse_height: coarse_h,
-          forward,
-        },
-        fill,
-        &requests,
-        have,
-      );
-      pipe.demand = batch.into();
-      pipe.demand_center = Some(center);
-      pipe.demand_age = 0;
-      gen_req = from_req;
-    }
-    // 派发：从表头取（已满足 / 已在飞的当场划过），到在飞上限为止
-    let mut dispatched = 0usize;
-    while let Some((c, detail)) = pipe.demand.front().copied() {
-      // 背压（见 `READY_MAX`）：待挂载 + 在飞已经够多就停 —— 否则 worker 会把产出灌进一个无界队列
-      if pipe.ready.len() + pipe.producer.inflight() >= READY_MAX {
-        break;
-      }
-      if pipe.producer.in_flight(ChunkCoord(c)) {
-        pipe.demand.pop_front();
-        continue;
-      }
-      // **已在待挂载队列里的也算"已经在飞"**：`in_flight` 只覆盖 worker 手上的，产出取回后它就不再为真
-      // ⇒ 不挡的话同一块会被反复重产、反复重挂（`chunk_count` 不动、`gen` 每帧都在涨、
-      // 而 `ready` 顶在 `READY_MAX` 把真正的新块堵在后面）。
-      if pipe.ready_set.contains(&ChunkCoord(c)) {
-        pipe.demand.pop_front();
-        continue;
-      }
-      if !pipe.producer.request(ChunkCoord(c), detail) {
-        break; // 在飞满（或已在飞）⇒ 下帧继续
-      }
-      pipe.demand.pop_front();
-      dispatched += 1;
-      if dispatched >= DISPATCH_PER_FRAME {
-        break;
-      }
-    }
-    // 取回产出 → 待挂载队列（`None` = 这个 chunk 没有内容，记下免得每帧反复派发）
-    for (cc, detail, tree) in pipe.producer.poll(POLL_MAX) {
-      match tree {
-        // 同一块的在飞重复（派发修好前遗留的）⇒ 留先到的那个，别再堆一份
-        Some(_) if !pipe.ready_set.insert(cc) => {}
-        Some(tree) => pipe.ready.push_back((cc, detail, tree)),
-        None => {
-          pipe.empty.insert(cc);
-        }
-      }
-    }
-    // 挂载：按**字数预算**逐帧消化（装树 + 标脏 + 后面的序列化上传都吃这条预算）；粗档细化也走
-    // 这条路（`mount_chunk_tree` 是**整体替换** ⇒ 粗树被全分辨率树顶掉）。
-    let mut words = 0usize;
-    let mut words_mounted = 0usize;
-    while !pipe.ready.is_empty() && words_mounted < mount_count {
-      let w = pipe.ready.front().expect("刚看过 len").2.len_words();
-      // 预算用尽就停，但**至少挂一个**：否则一个超大 chunk 会永远排不上
-      if words_mounted > 0 && words + w > mount_words {
-        break;
-      }
-      let (cc, detail, tree) = pipe.ready.pop_front().expect("刚看过 front");
-      pipe.ready_set.remove(&cc);
-      grid.mount_chunk_tree(cc, tree, 0);
-      pipe.detail.insert(cc, detail);
-      // **装载即使用**（与 GPU 侧的 `note_resident` 同一个口径）：请求带进来的块在射线眼里
-      // 还是"缺的"（射线没进过它 ⇒ 没有用途戳），若不在这里记一笔，它一挂上就被 LRU 判成最旧
-      // ⇒ 立刻换出 ⇒ 下个窗口又请求同一块（装卸死循环）。
-      pipe.use_seq += 1;
-      let seq = pipe.use_seq;
-      pipe.last_used.insert(cc, seq);
-      words += w;
-      words_mounted += 1;
-      generated += 1;
+    // 拆借：`producer` 与逐卷状态是两个字段，必须分开借（一个池服务所有卷）
+    let Pipeline { producer, vols, use_seq, use_stamp } = &mut *guard;
+    while vols.len() < n_vol {
+      vols.push(VolState::default()); // 换世界后卷数可能变（长度对齐）
     }
 
-    // ② 卸载：**容量 + LRU**（论文 §III.A），不再有"半径 / TTL 保护"。
-    //
-    // 论文的缓存替换只有一条规则：**最近使用**。旧的三分法（窗口外卸 / **半径环内一律保留** /
-    // 请求圈按"最后被请求时刻 + TTL"保留）有两个结构性后果：
-    //   · 半径环是"永久保留"的 ⇒ 相机不动时**环形永远不环**（常驻只增不减，日志里恒 `unload 0`）；
-    //   · 请求圈的键只在"块缺了"时更新（装好即冻结）⇒ 看着最旧 ⇒ 被卸 ⇒ 又被请求 ⇒ **反复产出**。
-    // 现在：窗口外一律卸（装不上 GPU，确定性）；其余按**容量**裁，超了卸"最久没被看到"的。
-    // 安全网：相机近旁 `unload_radius` 一圈 + 在飞 / 待挂载的一律不动 —— 用途戳每
-    // `REPORT_PERIOD_SECS` 才来一批，头两秒没有任何信号。
-    //
-    // CONSTRAINT：这里只卸 **CPU 侧**（`VolumeGrid`）。GPU 侧的换出由渲染侧的 `plan_residency`
-    // 独立决定（同一个容量、同一个 `last_used` 信号）；两侧都卸同一批是正常的收敛结果，不是重复劳动。
-    let resident: Vec<ChunkCoord> = grid.chunk_coords().collect();
-    let pending: std::collections::HashSet<ChunkCoord> =
-      pipe.ready.iter().map(|(cc, ..)| *cc).collect();
-    let mut far: Vec<ChunkCoord> = Vec::new();
-    let mut cand: Vec<(u64, ChunkCoord)> = Vec::new();
-    for c in &resident {
-      if !in_window(c.0) {
-        far.push(*c);
+    // ⓪'' **用途戳 → LRU**（论文 §III.A）：每**换一批**（回读侧每 `REPORT_PERIOD_SECS` 换一批）就把
+    //      `use_seq` +1，批内每个 chunk 记成"本批次被看到过"。`last_used` 的值域就是这个批次序号 ⇒
+    //      **单调、可比大小**，正是卸载需要的 LRU 键。批号**跨卷共用**（同一批里各卷的戳一起到）。
+    //      `peek` 每帧都返回**同一份快照**（GPU 侧也要读它）⇒ 用批内最大戳判"是不是新的一批"，
+    //      否则每帧推进一次批次号 = 把"没有新信息"当成"又一轮最近"。
+    let stamp = uses.iter().map(|u| u.stamp).max().unwrap_or(0);
+    if stamp != 0 && stamp != *use_stamp {
+      *use_stamp = stamp;
+      *use_seq += 1;
+      let seq = *use_seq;
+      for u in &uses {
+        if let Some(st) = vols.get_mut(u.vol as usize) {
+          st.last_used.insert(ChunkCoord(u.chunk), seq);
+        }
+      }
+    }
+
+    // 取回产出 → **各自 volume 的**待挂载队列（一次 poll；`None` = 这个 chunk 没有内容，记下免得反复派发）
+    for (v, cc, detail, tree) in producer.poll(POLL_MAX) {
+      let Some(st) = vols.get_mut(v) else { continue };
+      match tree {
+        // 同一块的在飞重复（派发修好前遗留的）⇒ 留先到的那个，别再堆一份
+        Some(_) if !st.ready_set.insert(cc) => {}
+        Some(tree) => st.ready.push_back((cc, detail, tree)),
+        None => {
+          st.empty.insert(cc);
+        }
+      }
+    }
+
+    // 挂载的**字数预算跨卷共用**（一个池、一份帧额 ⇒ 远场不会把近场的帧额吃掉）
+    let mut words = 0usize;
+    let mut words_mounted = 0usize;
+
+    for vol in 0..n_vol {
+      let scope = scopes[vol];
+      let st = &mut vols[vol];
+      let far_level = scene.volumes.list[vol].is_far_level();
+      // 非流式、非远场的 volume（未使用物体路径）：跳过
+      if !far_level && scene.volumes.list[vol].stream_window().is_none() {
         continue;
       }
-      if (c.0 - center).abs().max_element() <= unload_r
-        || pending.contains(c)
-        || pipe.producer.in_flight(*c)
-      {
-        continue;
+      // 该 volume 的池容量：主世界与远场级**各自的口径**（见上面 `cap` / `cap_far` 的说明）
+      let cap = if far_level { cap_far } else { cap };
+      let grid = &mut scene.volumes.list[vol];
+
+      // ①a **重建需求表**（相机换 chunk / 每 [`DEMAND_REBUILD_FRAMES`] 帧，顺带吸收新的请求）
+      st.demand_age += 1;
+      if st.demand_center != Some(scope.center) || st.demand_age >= DEMAND_REBUILD_FRAMES {
+        let have = |c: IVec3, want: Detail| {
+          let held = st.detail.get(&ChunkCoord(c)).copied().unwrap_or(Detail::Full);
+          (grid.chunk(ChunkCoord(c)).is_some() && held >= want) || st.empty.contains(&ChunkCoord(c))
+        };
+        let batch: Vec<(IVec3, Detail)> = if far_level {
+          plan_generation_far(vol, scope, &requests, have)
+        } else {
+          let (batch, from_req) = plan_generation(
+            GenScope {
+              center: scope.center,
+              w_origin: scope.w_origin,
+              w_dims: scope.w_dims,
+              load_radius: load_r,
+              coarse_radius: coarse_r,
+              coarse_height: coarse_h,
+              forward,
+            },
+            fill,
+            &requests,
+            have,
+          );
+          gen_req = from_req;
+          batch
+        };
+        st.demand = batch.into();
+        st.demand_center = Some(scope.center);
+        st.demand_age = 0;
       }
-      cand.push((pipe.last_used.get(c).copied().unwrap_or(0), *c));
-    }
-    // 超容量 ⇒ 卸掉"最久没被看到"的那些（`last_used` 升序 ⇒ LRU 在前）
-    let over = resident.len().saturating_sub(far.len()).saturating_sub(cap);
-    if over > 0 {
-      cand.sort_unstable_by_key(|(t, c)| (*t, c.0.x, c.0.y, c.0.z));
-      far.extend(cand.into_iter().take(over).map(|(_, c)| c));
-    }
-    let unloaded = far.len();
-    for cc in far {
-      grid.unmount_chunk(cc);
-      pipe.detail.remove(&cc);
-      pipe.last_used.remove(&cc);
-    }
-    if generated > 0 || unloaded > 0 || !pipe.ready.is_empty() {
-      bevy::log::debug!(
-        "STREAM[gen {generated}(req {gen_req}) unload {unloaded} chunks {} cap {cap} ready {}]",
-        grid.chunk_count(),
-        pipe.ready.len()
-      );
+
+      // ①b 派发：从表头取（已满足 / 已在飞的当场划过），到在飞上限为止
+      let mut dispatched = 0usize;
+      while let Some((c, detail)) = st.demand.front().copied() {
+        // 背压（见 `READY_MAX`）：待挂载 + 在飞已经够多就停 —— 否则 worker 会把产出灌进一个无界队列
+        if st.ready.len() + producer.inflight() >= READY_MAX {
+          break;
+        }
+        if producer.in_flight(vol, ChunkCoord(c)) {
+          st.demand.pop_front();
+          continue;
+        }
+        // **已在待挂载队列里的也算"已经在飞"**：`in_flight` 只覆盖 worker 手上的，产出取回后它就不再为真
+        // ⇒ 不挡的话同一块会被反复重产、反复重挂（`chunk_count` 不动、`gen` 每帧都在涨、
+        // 而 `ready` 顶在 `READY_MAX` 把真正的新块堵在后面）。
+        if st.ready_set.contains(&ChunkCoord(c)) {
+          st.demand.pop_front();
+          continue;
+        }
+        if !producer.request(vol, ChunkCoord(c), detail) {
+          break; // 在飞满（或已在飞）⇒ 下帧继续
+        }
+        st.demand.pop_front();
+        dispatched += 1;
+        if dispatched >= DISPATCH_PER_FRAME {
+          break;
+        }
+      }
+
+      // ①c 挂载：按**字数预算**逐帧消化（装树 + 标脏 + 后面的序列化上传都吃这条预算）；主世界的
+      //     粗档细化也走这条路（`mount_chunk_tree` 是**整体替换** ⇒ 粗树被细树顶掉）。
+      while !st.ready.is_empty() && words_mounted < mount_count {
+        let w = st.ready.front().expect("刚看过 len").2.len_words();
+        // 预算用尽就停，但**至少挂一个**：否则一个超大 chunk 会永远排不上
+        if words_mounted > 0 && words + w > mount_words {
+          break;
+        }
+        let (cc, detail, tree) = st.ready.pop_front().expect("刚看过 front");
+        st.ready_set.remove(&cc);
+        grid.mount_chunk_tree(cc, tree, 0);
+        st.detail.insert(cc, detail);
+        // **装载即使用**（与 GPU 侧的 `note_resident` 同一个口径）：请求带进来的块在射线眼里
+        // 还是"缺的"（射线没进过它 ⇒ 没有用途戳），若不在这里记一笔，它一挂上就被 LRU 判成最旧
+        // ⇒ 立刻换出 ⇒ 下个窗口又请求同一块（装卸死循环）。
+        *use_seq += 1;
+        st.last_used.insert(cc, *use_seq);
+        words += w;
+        words_mounted += 1;
+        generated += 1;
+      }
+
+      // ② 卸载：**容量 + LRU**（论文 §III.A），不再有"半径 / TTL 保护"。
+      //
+      // 论文的缓存替换只有一条规则：**最近使用**。旧的三分法（窗口外卸 / **半径环内一律保留** /
+      // 请求圈按"最后被请求时刻 + TTL"保留）有两个结构性后果：
+      //   · 半径环是"永久保留"的 ⇒ 相机不动时**环形永远不环**（常驻只增不减，日志里恒 `unload 0`）；
+      //   · 请求圈的键只在"块缺了"时更新（装好即冻结）⇒ 看着最旧 ⇒ 被卸 ⇒ 又被请求 ⇒ **反复产出**。
+      // 现在：窗口外一律卸（装不上 GPU，确定性）；其余按**容量**裁，超了卸"最久没被看到"的。
+      // 安全网：相机近旁 `unload_radius` 一圈 + 在飞 / 待挂载的一律不动 —— 用途戳每
+      // `REPORT_PERIOD_SECS` 才来一批，头两秒没有任何信号。远场级用的是**该级自己的 chunk 空间**里的
+      // 距离（`unload_r` 在 L3 上 = 3 × 256 × 64 体素 ≈ 983 m —— 与它的格尺度成比例，正是想要的）。
+      //
+      // CONSTRAINT：这里只卸 **CPU 侧**（`VolumeGrid`）。GPU 侧的换出由渲染侧的 `plan_residency`
+      // 独立决定（主世界同一个容量、同一个 `last_used` 信号；远场级按"CPU 没了就归还"）。
+      let resident: Vec<ChunkCoord> = grid.chunk_coords().collect();
+      let pending: std::collections::HashSet<ChunkCoord> =
+        st.ready.iter().map(|(cc, ..)| *cc).collect();
+      let mut out: Vec<ChunkCoord> = Vec::new();
+      let mut cand: Vec<(u64, ChunkCoord)> = Vec::new();
+      for c in &resident {
+        if !scope.in_window(c.0) {
+          out.push(*c);
+          continue;
+        }
+        if (c.0 - scope.center).abs().max_element() <= unload_r
+          || pending.contains(c)
+          || producer.in_flight(vol, *c)
+        {
+          continue;
+        }
+        cand.push((st.last_used.get(c).copied().unwrap_or(0), *c));
+      }
+      // 超容量 ⇒ 卸掉"最久没被看到"的那些（`last_used` 升序 ⇒ LRU 在前）
+      let over = resident.len().saturating_sub(out.len()).saturating_sub(cap);
+      if over > 0 {
+        cand.sort_unstable_by_key(|(t, c)| (*t, c.0.x, c.0.y, c.0.z));
+        out.extend(cand.into_iter().take(over).map(|(_, c)| c));
+      }
+      let n_unload = out.len();
+      for cc in out {
+        grid.unmount_chunk(cc);
+        st.detail.remove(&cc);
+        st.last_used.remove(&cc);
+      }
+
+      if generated > 0 || n_unload > 0 || !st.ready.is_empty() {
+        if far_level {
+          bevy::log::debug!(
+            "STREAM[v{vol} far gen{} unload {n_unload} chunks {} cap {cap} ready {}]",
+            generated,
+            grid.chunk_count(),
+            st.ready.len(),
+          );
+        } else {
+          bevy::log::debug!(
+            "STREAM[v0 gen{generated}(req {gen_req}) unload {n_unload} chunks {} cap {cap} ready {}]",
+            grid.chunk_count(),
+            st.ready.len(),
+          );
+        }
+      }
     }
   }
 }
@@ -835,6 +1014,61 @@ fn build_region_quantized(
   covered
 }
 
+/// **远场级产出（M8）**：把 `[lo, hi)`（**级体素**坐标）按 `FAR_GRAIN³` 的格填进 `grid`，
+/// **每格一次点采样**（§10.4 的字面口径）。
+///
+/// 采样点 = 格的**世界中心** `(p + FAR_GRAIN/2) · scale`（`scale` = 级体素有几个主世界体素）——
+/// 于是格点锚在**世界坐标**上：窗口滑动只换"哪些 chunk 装着"，不移动格点相位 ⇒ 远处不闪。
+///
+/// 为什么是点采样而不是 M5 粗档那套解析求占比：
+/// - **成本**：每 chunk `16³ = 4096` 格、每格一次 [`voxel_at`]（几次整数运算 + 一次 room 哈希）
+///   ≈ **0.3 ms/chunk**（与 M5 的 `Detail::Coarse`（同样 16³ 个格、同样解析求占比）实测同量级）；
+///   解析版在同样的格数上要十几倍（它要逐轴算占比 + 扫相交 room），而远场要"几秒铺出上万个 chunk"。
+/// - **观感**：解析求占比在格内**不允许空气胜出**（M5 有意为之："宁可膨胀也别消失"）⇒ 粗档格很容易
+///   整片判成白（这个 lattice 世界里白柱的格内占比高于 cube）⇒ 远处是一片**白墙**。点采样给出
+///   **稀疏**的白格点阵：不发明几何、颜色都是真材质。⇒ **宁可稀疏的真相，不要成片的假白**。
+///   要换成解析口径只改这一个函数。
+///
+/// CONSTRAINT（与 [`build_region`] 同一份生成盒契约）：lo/hi 各轴对齐 chunk（因而也对齐 `FAR_GRAIN`）。
+pub fn build_region_far(
+  grid: &mut VolumeGrid,
+  lo: IVec3,
+  hi: IVec3,
+  n_pbr: usize,
+  scale: i32,
+  grain: i32,
+) -> u64 {
+  let chunk = gate_voxel::CHUNK_SIZE;
+  debug_assert!(
+    lo % chunk == IVec3::ZERO && hi % chunk == IVec3::ZERO,
+    "远场区域须对齐 {chunk} 的 chunk：lo={lo} hi={hi}"
+  );
+  debug_assert!(grain as i64 * scale as i64 > 0, "级体素与格宽必须为正");
+  let half = grain / 2;
+  let voxels = (grain * grain * grain) as u64;
+  let mut covered = 0u64;
+  let mut z = lo.z;
+  while z < hi.z {
+    let mut y = lo.y;
+    while y < hi.y {
+      let mut x = lo.x;
+      while x < hi.x {
+        // 格中心（级体素）→ 世界体素：`world = p · scale`（远场级是 scale-only 变换、与主世界同原点）
+        let c = IVec3::new(x + half, y + half, z + half) * scale;
+        let id = voxel_at(c, n_pbr);
+        if !id.is_air() {
+          covered += fill_bricks(grid, IVec3::new(x, y, z), IVec3::splat(grain), grain, id) as u64
+            * voxels;
+        }
+        x += grain;
+      }
+      y += grain;
+    }
+    z += grain;
+  }
+  covered
+}
+
 /// [`plan_generation`] 的几何 / 策略输入（打包成一项，免去一长串位置参数）
 #[derive(Clone, Copy)]
 struct GenScope {
@@ -947,8 +1181,13 @@ fn plan_generation(
     (far, off_view, dist, c.x, c.y, c.z)
   };
   let mut picked: Vec<(IVec3, Detail)> = Vec::new();
-  let mut requested: Vec<gate_render::LodRequest> =
-    requests.iter().filter(|r| in_window(r.chunk)).copied().collect();
+  // M8：**只收主世界的请求**（`vol == 0`）—— 远场级的 chunk 坐标是它自己的级体素空间，
+  // 数值上会落在主世界的窗口内 ⇒ 不过滤就会让主世界去装"远场请求里那些坐标"的 chunk（白装）。
+  let mut requested: Vec<gate_render::LodRequest> = requests
+    .iter()
+    .filter(|r| r.vol == 0 && in_window(r.chunk))
+    .copied()
+    .collect();
   requested.sort_unstable_by_key(|r| (std::cmp::Reverse(r.votes), r.chunk.x, r.chunk.y, r.chunk.z));
   picked.extend(
     requested
@@ -978,6 +1217,36 @@ fn plan_generation(
   (picked, from_req)
 }
 
+/// **远场级的需求**（M8 第 ① 步的策略，抽成纯函数以便单测）：**只由射线请求驱动**。
+///
+/// 与 [`plan_generation`] 的两处差别：
+/// - **没有半径补块**：铺满一级 `64³ = 262144` 个 chunk ≈ 17 GB（§10.4），而射线真正在看的
+///   （视锥内）只有几千个 ⇒ 远场只装"射线撞上、而 GPU 上还没有"的那些（`entry == 0` 就是未命中）。
+///   近场有半径环保底，远场没有：射线没看的地方本来就看不见（不装 = 正确）。
+/// - **只有一档**：远场的格已经是 `FAR_GRAIN` 级体素，所以档位恒 [`Detail::Full`]
+///   （它在这里只表示"已经有了，别再产出"），不再走 `detail_at` 的阶梯。
+///
+/// 过滤：**本卷**的请求（`r.vol == vol`；远场级的 chunk 坐标与主世界数值上会撞）+ **窗口内**
+/// （窗口是 `b_struct` 索引区的定义域）+ 还没有 / 还不够细（`have`）。
+/// 排序：**票数降序**（有多少条主射线要它），平手按坐标（确定性）。
+fn plan_generation_far(
+  vol: usize,
+  scope: VolScope,
+  requests: &[gate_render::LodRequest],
+  have: impl Fn(IVec3, Detail) -> bool,
+) -> Vec<(IVec3, Detail)> {
+  let mut req: Vec<gate_render::LodRequest> = requests
+    .iter()
+    .filter(|r| r.vol as usize == vol && scope.in_window(r.chunk))
+    .copied()
+    .collect();
+  req.sort_unstable_by_key(|r| (std::cmp::Reverse(r.votes), r.chunk.x, r.chunk.y, r.chunk.z));
+  req.into_iter()
+    .filter(|r| !have(r.chunk, Detail::Full))
+    .map(|r| (r.chunk, Detail::Full))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1002,7 +1271,7 @@ mod tests {
       let mut words = 0usize;
       for i in 0..n {
         let cc = ChunkCoord(IVec3::new(i as i32, 0, 0));
-        if let Some(tree) = src.produce(cc, detail, &mut scratch) {
+        if let Some(tree) = src.produce(0, cc, detail, &mut scratch) {
           words += tree.len_words();
         }
       }
@@ -1025,7 +1294,7 @@ mod tests {
       let (mut split, mut fanout, mut uni, mut leaf) = (0usize, 0usize, 0usize, 0usize);
       for i in 0..n {
         let cc = ChunkCoord(IVec3::new(i as i32, 0, 0));
-        if let Some(tree) = src.produce(cc, detail, &mut scratch) {
+        if let Some(tree) = src.produce(0, cc, detail, &mut scratch) {
           heap += tree.heap_bytes();
           wire += tree.len_words() * 4;
           nodes += tree.node_capacity();
@@ -1071,7 +1340,7 @@ mod tests {
       for y in -6..=6 {
         for z in -6..=6 {
           let cc = ChunkCoord(IVec3::new(x, y, z));
-          if src.produce(cc, Detail::Coarse, &mut scratch).is_none() {
+          if src.produce(0, cc, Detail::Coarse, &mut scratch).is_none() {
             empty.push(cc.0);
           }
         }
@@ -1092,7 +1361,7 @@ mod tests {
 
     let src = std::sync::Arc::new(InfiniteCubes { n_pbr: 0 });
     let mut scratch = VolumeGrid::new();
-    let async_tree = src.produce(cc, Detail::Full, &mut scratch).expect("管线产出应有内容").serialize();
+    let async_tree = src.produce(0, cc, Detail::Full, &mut scratch).expect("管线产出应有内容").serialize();
     assert_eq!(async_tree, sync_tree, "后台产出与同步产出必须逐位相同");
     assert!(scratch.chunk(cc).is_none(), "暂存被取空（同 chunk 不会下次再用到旧内容）");
   }
@@ -1143,6 +1412,84 @@ mod tests {
     assert!(wc * 4 < wf, "粗档字数应远小于全分辨率（粗 {wc} vs 全 {wf}）");
   }
 
+  /// **M8**：远场级产出 = **每格一次点采样**（格中心 · `scale` 的世界坐标）—— 与 [`voxel_at`] 逐格
+  /// 同源。顺带钉住两件事：
+  /// ① **格点锚在世界坐标上**（窗口滑动只换"装着哪些 chunk"、不移动格点相位 ⇒ 远处不闪）——
+  ///    用例就是"格心的世界坐标点采样"，与"这个 chunk 被摆在哪"无关；
+  /// ② **稀疏**：这个 lattice 世界里多数格是空气，远场是白格点阵而不是整片实体
+  ///    （这是"点采样"相对"解析求占比"的观感取舍，见 [`build_region_far`] 的说明）。
+  #[test]
+  fn far_region_is_one_point_sample_per_cell() {
+    for (i, &scale) in FAR_SCALES.iter().enumerate() {
+      let vol = i + 1;
+      let cc = ChunkCoord(IVec3::new(-1, 0, 2));
+      let lo = cc.0 * gate_voxel::CHUNK_SIZE;
+      let hi = lo + IVec3::splat(gate_voxel::CHUNK_SIZE);
+      let mut grid = VolumeGrid::new();
+      let covered = build_region_far(&mut grid, lo, hi, 0, scale, FAR_GRAIN);
+      assert!(covered > 0, "L{vol}（scale {scale}）远场 chunk 不该全空");
+      let tree = grid.chunk(cc).expect("远场 chunk 有内容");
+      let n = gate_voxel::CHUNK_SIZE / FAR_GRAIN;
+      let (mut solid, mut cells) = (0usize, 0usize);
+      for kz in 0..n {
+        for ky in 0..n {
+          for kx in 0..n {
+            let p = IVec3::new(kx, ky, kz) * FAR_GRAIN;
+            let want = voxel_at((lo + p + IVec3::splat(FAR_GRAIN / 2)) * scale, 0);
+            let got = tree.get_voxel(p.x, p.y, p.z);
+            assert_eq!(
+              got,
+              if want.is_air() { None } else { Some(want) },
+              "L{vol} 格 {p:?} 的槽号必须 = 格心世界坐标的点采样"
+            );
+            solid += usize::from(got.is_some());
+            cells += 1;
+          }
+        }
+      }
+      assert!(solid < cells / 2, "L{vol} 远场应是稀疏的（实体 {solid}/{cells} 格）");
+    }
+  }
+
+  /// **M8**：梯级覆盖半径 = `32 chunk × 256 级体素 × scale` 世界体素（1 体素 = 2 cm）
+  /// ⇒ **655 m / 2.6 km / 10.5 km**；`§10.4` 的验收目标是 5 km，由最后一级覆盖。
+  #[test]
+  fn far_ladder_covers_five_km() {
+    assert_eq!(FAR_SCALES, [4, 16, 64]);
+    assert_eq!(FAR_GRAIN, 16, "每 chunk 16³ = 4096 格（取值依据见 `FAR_GRAIN` 的实测表）");
+    let m = |v: i32| v as f32 * 0.02;
+    let cov: Vec<f32> = (1..=FAR_SCALES.len()).map(|v| m(far_coverage_voxels(v))).collect();
+    assert!((cov[0] - 655.4).abs() < 1.0, "L1 覆盖 {cov:?}");
+    assert!((cov[1] - 2621.4).abs() < 2.0, "L2 覆盖 {cov:?}");
+    assert!((cov[2] - 10485.8).abs() < 2.0, "L3 覆盖 {cov:?}");
+    assert!(cov[cov.len() - 1] > 5000.0, "5 km 视距必须落在梯级之内：{cov:?}");
+  }
+
+  /// **M8**：远场 chunk 的树远小于同 chunk 的全分辨率树（"远场几乎免费"的来源）。
+  ///
+  /// 读数用来核对 [`FAR_GRAIN`] 的取值是否划算：`grain = 4`（级体素）时每格只有 16 世界体素
+  /// —— 比白柱（24）还细 ⇒ 远场反而把柱体的截面画出来，**树比全分辨率还大**（实测 418 KB vs 288 KB）。
+  /// `grain = 16` 时每格 64 世界体素（≈ 一像素在 655 m 处），树掉到个位数 KB，且"相邻格多半同色"
+  /// ⇒ 父层能合并。**这是"接缝略宽"与"内存/产出可承受"之间的取舍**（见 [`FAR_GRAIN`] 的说明）。
+  #[test]
+  fn far_detail_is_much_smaller_than_full() {
+    let src = InfiniteCubes { n_pbr: 0 };
+    let mut scratch = VolumeGrid::new();
+    let cc = ChunkCoord(IVec3::new(0, 0, 0));
+    let full = src.produce(0, cc, Detail::Full, &mut scratch).expect("全分辨率有内容").len_words();
+    for vol in 1..=FAR_SCALES.len() {
+      let w = src.produce(vol, cc, Detail::Full, &mut scratch).expect("远场有内容").len_words();
+      println!(
+        "[L{vol} scale {:>2}] {w:>6} 字/chunk（{:>3} KB）；全分辨率 {full} 字（{} KB）= {:.0}× 便宜",
+        FAR_SCALES[vol - 1],
+        w * 4 / 1024,
+        full * 4 / 1024,
+        full as f64 / w as f64,
+      );
+      assert!(w * 8 < full, "L{vol} 远场 {w} 字应远小于全分辨率 {full} 字");
+    }
+  }
+
   /// 测试用的整 chunk 盒（chunk -1..=1，覆盖原点两侧的 room）。
   fn region() -> (IVec3, IVec3) {
     let chunk = gate_voxel::CHUNK_SIZE;
@@ -1172,7 +1519,12 @@ mod tests {
   /// **装哪里**，多细也由它一起报回来（[`detail_of_req`]）。没有请求时逐字退回"半径 + 近的先 + 距离定档"。
   #[test]
   fn requests_outrank_radius_fill() {
-    let req = |votes: u32, c: IVec3, level: u8| gate_render::LodRequest { chunk: c, votes, level };
+    let req = |votes: u32, c: IVec3, level: u8| gate_render::LodRequest {
+      vol: 0,
+      chunk: c,
+      votes,
+      level,
+    };
     // 窗口开大：让梯级的每一档都落在窗口内（现实里 64³ 索引区只到 8 cm 档，见 `detail_at`）
     let scope = gen_scope(1024, 1, 3, 3);
     let mounted: std::collections::HashSet<IVec3> = [IVec3::new(1, 0, 0)].into_iter().collect();
@@ -1223,6 +1575,13 @@ mod tests {
         (IVec3::new(-1, -1, 0), Detail::Full),
       ]
     );
+    // M8：**别的卷的请求不算主世界的需求** —— 远场级的 chunk 坐标会落在主世界窗口内，
+    // 不过滤就会让主世界去装那些坐标上的 chunk（白装，且需求表被远场的坐标污染）。
+    let far_req =
+      gate_render::LodRequest { vol: 1, chunk: IVec3::new(2, 2, 2), votes: 999, level: 0 };
+    let (batch, from_req) = plan_generation(narrow, 1, &[far_req], have);
+    assert_eq!(from_req, 0, "v1 的请求不该进主世界的需求表：{batch:?}");
+    assert_eq!(batch, vec![(IVec3::ZERO, Detail::Full)], "这条空位转给半径补块");
   }
 
   /// M5：需求排序**视野优先** —— 同样距离时，相机看着的 chunk 必须先于身后的。
@@ -1264,6 +1623,36 @@ mod tests {
     let (batch, _) = plan_generation(gen_scope(20, 1, 6, 6), 400, &[], |_, _| false);
     assert!(batch.iter().all(|(c, d)| *d == Detail::Full), "6 chunk = 31 m 内都还没到 8 cm 档");
     assert!(batch.iter().all(|(c, _)| c.abs().max_element() <= 6), "半径外不该要");
+  }
+
+  /// **M8**：远场级的需求**只由请求驱动** —— 没有半径补块、没有档位阶梯，且只收**本卷**的请求
+  /// （远场级的 chunk 坐标与主世界数值上会撞）。
+  #[test]
+  fn far_generation_is_request_only() {
+    let scope =
+      VolScope { center: IVec3::ZERO, w_origin: IVec3::splat(-32), w_dims: IVec3::splat(64) };
+    let req = |vol: u8, votes: u32, c: IVec3| gate_render::LodRequest {
+      vol,
+      chunk: c,
+      votes,
+      level: 0,
+    };
+    let reqs = [
+      req(2, 3, IVec3::new(0, 0, 0)),
+      req(2, 9, IVec3::new(1, 0, 0)),  // 已挂载 ⇒ 不算需求
+      req(0, 99, IVec3::new(2, 0, 0)), // 主世界的请求（坐标会撞）⇒ 必须丢
+      req(2, 5, IVec3::new(40, 0, 0)), // 窗口外（半宽 32）⇒ 装不上 GPU，必须丢
+      req(1, 99, IVec3::new(3, 0, 0)), // 别的远场级 ⇒ 必须丢
+    ];
+    let mounted: std::collections::HashSet<IVec3> = [IVec3::new(1, 0, 0)].into_iter().collect();
+    let have = |c: IVec3, _want: Detail| mounted.contains(&c);
+    assert_eq!(
+      plan_generation_far(2, scope, &reqs, have),
+      vec![(IVec3::new(0, 0, 0), Detail::Full)],
+      "只留本卷 + 窗口内 + 还没挂载的；档位恒 Full"
+    );
+    // 没有请求 ⇒ 远场一个 chunk 都不产出（这是"不铺满"的落点：铺满一级 64³ ≈ 17 GB）
+    assert!(plan_generation_far(2, scope, &[], |_, _| false).is_empty());
   }
 
   /// 规则 1/2：棱上有柱体，离开棱（且不在 cube 内）留空。

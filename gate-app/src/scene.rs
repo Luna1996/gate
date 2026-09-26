@@ -57,6 +57,12 @@ pub(crate) fn setup(
   let mut grid = VolumeGrid::new();
   let mut cam_eye = Vec3::new(1., 0., 0.);
   let mut cam_target = Vec3::new(0., 0., 0.);
+  // PBR 资产槽列表（`infinite_cubes` 的 PBR 档 + 远场级调色板都要它）：`Startup` 早于贴图加载完成时
+  // 退回磁盘扫描口径（见 [`pbr_asset_ids`]），两条路都只用一次。
+  let pbr_ids = pbr_asset_ids(pbr.as_deref());
+  // 相机最终会落在哪（存档姿态优先，口径与下面的 `orbit` 完全一致）：`infinite_cubes` 是
+  // **相机驱动**的世界 ⇒ 起始块与三级远场窗口都按它铺（否则开局得等流式一帧一块补出来）。
+  let mut start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
   if STARTUP_DEMO_SCENE {
     paint_demo_palette(&mut grid);
     bevy::log::info!("STEP 1 palette {:?}", t0.elapsed());
@@ -74,8 +80,8 @@ pub(crate) fn setup(
     };
     // 相机最终会落在哪（存档姿态优先，口径与下面的 `orbit` 完全一致）：`infinite_cubes` 是
     // **相机驱动**的世界 ⇒ 起始块要铺在它脚下，否则开局那一块得等流式一帧一个 chunk 补出来。
-    let start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
-    let info = build_world(&mut grid, &name, &pbr_asset_ids(pbr.as_deref()), start_eye.as_ivec3())
+    start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
+    let info = build_world(&mut grid, &name, &pbr_ids, start_eye.as_ivec3())
       .unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
     bevy::log::info!(
       "STEP 2 world {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
@@ -156,7 +162,12 @@ pub(crate) fn setup(
   }
 
   // 物体 = 普通 VolumeGrid，经 `Volumes.add_object()` 注册变换，走与主世界相同的 dirty → builder → upload 路径。
-  let volumes = Volumes::new(grid);
+  let mut volumes = Volumes::new(grid);
+  // **M8**：流式世界（`infinite_cubes`）额外挂三级远场 volume —— 判据就用 `stream_window`
+  // （只有 `build_infinite_cubes` 会设它），与 `stream_chunks` 的启用判据同一个。
+  if volumes.main().stream_window().is_some() {
+    crate::infinite_cubes::attach_far_levels(&mut volumes, &pbr_ids, start_eye.as_ivec3());
+  }
 
   commands.insert_resource(VoxelScene {
     volumes,
@@ -215,7 +226,12 @@ pub(crate) fn reload_world(
   let eye = cam_eye.unwrap_or(IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF));
   let info = build_world(&mut grid, name, pbr_ids, eye)?;
   grid.compact_all();
-  scene.volumes = Volumes::new(grid);
+  let mut volumes = Volumes::new(grid);
+  // M8：换到流式世界时同样要挂三级远场（判据与 `setup` / `stream_chunks` 同一个）
+  if volumes.main().stream_window().is_some() {
+    crate::infinite_cubes::attach_far_levels(&mut volumes, pbr_ids, eye);
+  }
+  scene.volumes = volumes;
   scene.demo_force_full_rebuild = true;
   Ok(info)
 }

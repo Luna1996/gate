@@ -124,6 +124,12 @@ const REQ_REL_BITS: u32 = 6u;
 /// 都够 ⇒ 不值得为它加载。
 const REQ_LEVEL_KEEP: u32 = 1u;
 
+/// **grid volume 数**（主世界 + 远场级；M8）：`grid_descs` 的条目数上限，也是请求字里"卷号"的位宽
+/// （2 bit ⇒ 至多 4 个）。请求环与用途戳表按它分段 ⇒ **Rust 侧 [`brickmap::consts::VOLUMES`] 必须与它
+/// 逐字相等**（`wesl_consts::trace_consts` 会核对，不等就 panic）。
+/// `brickmap::consts::{LOD_REQ_WORDS, REQ_BASE}` 由它算出长度与分段起点。
+const GRID_VOLUMES: u32 = 4u;
+
 // ---------------------------------------------------------------------------
 // 用途戳（usage stamp，论文 §III.A）：**"哪些 chunk 现在真的被看"的唯一来源**。
 //
@@ -137,10 +143,13 @@ const REQ_LEVEL_KEEP: u32 = 1u;
 //
 // 戳值由 `USE_TICK` 计数器发（`atomicAdd`）⇒ 单调、与 CPU 帧号无关、**不需要清零**：CPU 侧只认
 // "(上次读数, 本次读数] 区间内的戳"，陈旧条目天然落在区间外。
+//
+// M8：表按 **volume 分段**（每段 `USE_WORDS` 格，段号 = `Grid::vol`）—— 远场级的 chunk 坐标是它自己的
+// 级体素空间（与主世界**数值上会撞**），不分段就会互相顶掉。
 const USE_WORDS: u32 = 64u * 64u * 64u;
 const USE_TICK: u32 = 2u;
 const USE_BASE: u32 = 3u;
-const REQ_BASE: u32 = 3u + USE_WORDS;
+const REQ_BASE: u32 = 3u + GRID_VOLUMES * USE_WORDS;
 
 
 /// 该距离"够用的档位"下标：0 = 全分辨率（4³）、1 = 16³、2 = 64³、3 = 整 chunk（256³）。
@@ -155,19 +164,36 @@ fn req_level(fp: f32) -> u32 {
 
 /// 采样判定：拿射线本身做哈希（同一条射线稳定命中同一结论，不闪烁）⇒ 约 `1/REQ_SAMPLE` 的射线发请求。
 /// 用射线而不是像素下标：`trace_grid` 没有像素 id（GI / 光柱 / 玻璃状态机都走它）。
-fn req_sampled(origin: vec3<f32>, dir: vec3<f32>) -> bool {
-  let h = u32(bitcast<i32>(origin.x * 64.0)) ^ (u32(bitcast<i32>(origin.y * 64.0)) << 11u)
+fn req_hash(origin: vec3<f32>, dir: vec3<f32>) -> u32 {
+  return u32(bitcast<i32>(origin.x * 64.0)) ^ (u32(bitcast<i32>(origin.y * 64.0)) << 11u)
     ^ (u32(bitcast<i32>(origin.z * 64.0)) << 21u) ^ u32(bitcast<i32>(dir.z * 4096.0));
-  return (h % REQ_SAMPLE) == 0u;
+}
+
+/// 远场级的请求**采样率倒数**：远场只需要"哪一带要看"的粗信号（它的窗口里几乎全是"缺了"），
+/// 而请求字的追加是**单地址原子加**（`lod_req[0]`）⇒ 用主世界那个 1/16 会把 GPU 全烧在它上面。
+/// 实测（`GATE_LOG=info` 的首窗 `REQ[...]`，相机刚进世界、三级远场全空）：远场用 1/16 时首窗
+/// **1200 万条**（≈ 100k 次/帧的单地址原子加，与 `docs/editable-gigavoxel.md` §9 M4 记的
+/// "4.8 亿条 ⇒ 帧率崩到个位数"同一形态）；1/64 把这一波按 4× 压小，而合并后的 chunk 数不变
+/// （样本更少、分布不变 ⇒ 该装哪里照旧看得出来）。
+const REQ_SAMPLE_FAR: u32 = 64u;
+
+/// 按卷的采样判定：主世界 `REQ_SAMPLE`、远场级 `REQ_SAMPLE_FAR`（见 [`REQ_SAMPLE_FAR`]）。
+/// 采样率与用途戳共用本判据（两者都是每射线一次的原子写，远场同样是"粗信号就够"）。
+fn req_sampled(origin: vec3<f32>, dir: vec3<f32>, vol: u32) -> bool {
+  let m = select(REQ_SAMPLE, REQ_SAMPLE_FAR, vol > 0u);
+  return (req_hash(origin, dir) % m) == 0u;
 }
 
 /// 记一条请求。`rel` = chunk 相对窗口下标，`level` = [`req_level`] 的下标，`kind` = 0 主射线 / 1 次级
-/// （位留给消费端排序；当前只有主射线会走到这里）。
+/// （位留给消费端排序；当前只有主射线会走到这里），`vol` = 哪个 volume（0 = 主世界，≥1 = 远场级）。
 ///
 /// 环缓冲追加：`n = atomicAdd([0])` ⇒ 写 `[REQ_BASE + n % cap]`。环满即**覆盖最旧的**：消费端只读最新
 /// 的 `cap` 条（见 `REQ_RESERVED` 的说明）。**容量取自绑定的实际长度**（见 `REQ_COUNT` 的说明）。
 /// **不去重、不排序**：那是消费端的事。
-fn req_push(rel: vec3<u32>, level: u32, kind: u32) {
+///
+/// CONSTRAINT（M8）：`rel` 是**各 volume 自己的窗口**里的相对下标 —— 卷号必须随字一起走，否则远场级
+/// 的 chunk 会被消费端当成主世界的坐标（两个空间数值上会撞）。
+fn req_push(rel: vec3<u32>, level: u32, kind: u32, vol: u32) {
   if (REQ_ENABLE == 0u) { return; }
   let cap = arrayLength(&lod_req) - REQ_BASE;
   let n = atomicAdd(&lod_req[REQ_COUNT], 1u);
@@ -175,22 +201,24 @@ fn req_push(rel: vec3<u32>, level: u32, kind: u32) {
     | ((rel.y & 63u) << REQ_REL_BITS)
     | ((rel.z & 63u) << (REQ_REL_BITS * 2u))
     | ((level & 3u) << 18u)
-    | ((kind & 1u) << 20u);
+    | ((kind & 1u) << 20u)
+    | ((vol & 3u) << 21u);
   atomicStore(&lod_req[REQ_BASE + (n % cap)], w);
 }
 
-/// 记一条**用途戳**："这条主射线看到了 `rel` 那个 chunk"。只喂缓存替换（LRU），**不进需求表**。
+/// 记一条**用途戳**："这条主射线看到了 `vol` 的 `rel` 那个 chunk"。只喂缓存替换（LRU），**不进需求表**。
 ///
 /// 戳 = `USE_TICK` 计数器的当前值（`atomicAdd` 取）⇒ 单调递增；表项用 `atomicMax` ⇒ 同一窗口内
-/// 任意多条射线并发写只留最新的一笔。窗口相对下标 3×6 位 ⇒ 偏移落在 `[USE_BASE, USE_BASE+USE_WORDS)`
-/// 之内（`USE_WORDS` 恰好是窗口 chunk 数 64³）⇒ 与请求环互不重叠。
-fn req_use(rel: vec3<u32>) {
+/// 任意多条射线并发写只留最新的一笔。窗口相对下标 3×6 位 ⇒ 偏移落在
+/// `[USE_BASE + vol·USE_WORDS, …+USE_WORDS)` 之内（每 volume `USE_WORDS` 恰好是窗口 chunk 数 64³）
+/// ⇒ 与请求环互不重叠。
+fn req_use(rel: vec3<u32>, vol: u32) {
   if (REQ_ENABLE == 0u) { return; }
   let i = (rel.x & 63u)
     | ((rel.y & 63u) << REQ_REL_BITS)
     | ((rel.z & 63u) << (REQ_REL_BITS * 2u));
   let t = atomicAdd(&lod_req[USE_TICK], 1u);
-  atomicMax(&lod_req[USE_BASE + i], t);
+  atomicMax(&lod_req[USE_BASE + (vol & 3u) * USE_WORDS + i], t);
 }
 
 /// 叶级 LOD 代表色（M2）：节点 palette word 高 16 位存的就是它 —— 写侧算的是**块内按体素数加权的
@@ -766,6 +794,8 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   let col1 = g.col1;
   let col2 = g.col2;
   let obj_id = g.obj_id;
+  // M8：请求字与用途戳表都要卷号（远场级的 chunk 坐标与主世界**数值上会撞**）
+  let vol = g.vol;
   let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), obj_id);
   // M4：本条射线已发出的请求数（见 `REQ_PER_RAY_MAX`）
   var req_sent: u32 = 0u;
@@ -902,10 +932,13 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       // "这块是空气"同形，故消费端要自己过滤"其实已经加载完的 chunk"）。
       // **三道闸门**（不加节流会变成每秒数亿次原子写，GPU 全耗在 `lod_req[0]` 上）：
       // ① 只要 16³ 或更细的（`REQ_LEVEL_KEEP`）② 采样 `1/REQ_SAMPLE` ③ 每条射线 ≤ `REQ_PER_RAY_MAX`。
-      if (entry == 0u && req != 0u && req_sent < REQ_PER_RAY_MAX && req_sampled(origin, dir)) {
-        let lv = req_level(t_enter_c * view_u.lod.x);
+      // M8：**远场级跳过闸门 ①** —— 那个闸门问的是"这个距离值不值得加载细节"，而远场级的
+      // chunk 尺度本身就是为那个距离设计的（`scale` 就是按"一格 ≈ 一像素"选的）⇒ 一律报 0 档。
+      // 不跳的话：L2 起 `req_level` 恒 ≥ 2 ⇒ 永远发不出请求 ⇒ 远场永远空着。
+      if (entry == 0u && req != 0u && req_sent < REQ_PER_RAY_MAX && req_sampled(origin, dir, vol)) {
+        let lv = select(req_level(t_enter_c * view_u.lod.x), 0u, vol > 0u);
         if (lv <= REQ_LEVEL_KEEP) {
-          req_push(rel_u, lv, 0u);
+          req_push(rel_u, lv, 0u, vol);
           req_sent += 1u;
         }
       }
@@ -916,8 +949,8 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
         // 命中射线多，名额要留给真正需要加载的地方），只走 `REQ_SAMPLE` 采样闸门。
         // 与请求环的关键差别：戳表是**稠密**的（窗口内每 chunk 一格 + `atomicMax`）⇒ 并发再多也不
         // 会溢出、也不会把"缺了"的请求挤出环；而"每射线一条环记录"的写法会被可见性投票打爆。
-        if (req != 0u && req_sampled(origin, dir)) {
-          req_use(rel_u);
+        if (req != 0u && req_sampled(origin, dir, vol)) {
+          req_use(rel_u, vol);
         }
         let chunk_base = tree_base + entry - 1u;
         let chunk_min = vec3<f32>(ci) * f32(CHUNK_SIZE);
@@ -992,19 +1025,21 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   return miss;
 }
 
-// 从 `grid_descs[idx]` 解码统一 `Grid`（主世界 idx=0 = identity 变换，物体 idx≥1 = 任意变换）。
-// chunk 步数上限由窗口 dims 估算（曼哈顿对角 ×3 + 余量）；物体 dims=(1,1,1)。
+// 从 `grid_descs[idx]` 解码统一 `Grid`（主世界 idx=0 = identity 变换，远场级 / 物体 idx≥1 = 带变换）。
+// chunk 步数上限由窗口 dims 估算（曼哈顿对角 ×3 + 余量）。
 fn make_grid(idx: u32) -> Grid {
   let d = grid_descs[idx];
   let origin = vec3<i32>(d.index_origin_x, d.index_origin_y, d.index_origin_z);
   let dims = vec3<i32>(i32(d.index_dims_x), i32(d.index_dims_y), i32(d.index_dims_z));
   let chunk_budget = u32(dims.x + dims.y + dims.z) * 3u + 16u;
-  // 主世界（idx=0，identity）：局部 AABB = 窗口 AABB（origin 可为负）；物体 = 单 chunk 局部 [0,256]³。
+  // 主世界（idx=0，identity）：跳过变换段（`obj_id < 0` 分支随常量折叠）；远场级 / 物体读 `rot/pos/scale`。
   let is_world = idx == 0u;
-  let l_mn = select(vec3<f32>(0.0), d.aabb_min.xyz, is_world);
-  let l_mx = select(vec3<f32>(f32(CHUNK_SIZE)), d.aabb_max.xyz, is_world);
-  // 变换段：主世界是 identity（Rust `VolumeTransform::IDENTITY`）⇒ 不读 `rot0..2` / `pos_scale`，
-  // 直接给常量；下游 `obj_id < 0` 分支（ro/rd 直取、`voxel_normal` 的 mat-vec 短路）随之常量折叠。
+  // 局部 AABB = **窗口**（chunk 单位 → 局部体素）：所有 grid 都按窗口给。
+  // WHY 不能写死 [0,256]（远场级会因此只渲染一个 chunk）：物体路径原先用 `vec3(0)..vec3(256)` 是因为
+  // 物体的窗口恰是"一个 chunk 的内容窗口"；远场级的窗口是 64³ chunk ⇒ 必须取真窗口。
+  let l_mn = vec3<f32>(vec3<i32>(i32(CHUNK_SIZE)) * origin);
+  let l_mx = l_mn + vec3<f32>(vec3<i32>(i32(CHUNK_SIZE)) * dims);
+  // 变换段：主世界是 identity（Rust `VolumeTransform::IDENTITY`）⇒ 不读 `rot0..2` / `pos_scale`。
   var col0 = vec3<f32>(1.0, 0.0, 0.0);
   var col1 = vec3<f32>(0.0, 1.0, 0.0);
   var col2 = vec3<f32>(0.0, 0.0, 1.0);
@@ -1014,18 +1049,50 @@ fn make_grid(idx: u32) -> Grid {
     col0 = d.rot0.xyz;      // 旋转矩阵列
     col1 = d.rot1.xyz;
     col2 = d.rot2.xyz;
-    pos = d.pos_scale.xyz;  // 物体位置
+    pos = d.pos_scale.xyz;  // 位置
     scale = d.pos_scale.w;
   }
   return Grid(
     d.aabb_min.xyz, d.aabb_max.xyz,       // 世界 AABB
-    l_mn, l_mx,                            // 局部 AABB
+    l_mn, l_mx,                            // 局部 AABB（= 窗口）
     chunk_budget,
     col0, col1, col2,                      // 旋转矩阵列
     pos, scale,                            // pos + scale
     d.tree_base, d.palette_base,           // 数据源基址
     origin, vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z),
-    // obj_id 约定（镜像 Rust）：idx=0 主世界 → -1；idx≥1 物体 → idx-1。
+    // obj_id 约定（镜像 Rust）：idx=0 主世界 → -1；idx≥1 物体 / 远场级 → idx-1。
     select(-1i, i32(idx) - 1i, idx > 0u),
+    idx,                                   // vol：请求字 / 用途戳表的分段号（M8）
   );
+}
+
+// ============================================================================
+// M8 · 分壳裁剪（`docs/editable-gigavoxel.md` §4 M8）
+// ============================================================================
+
+/// `GridDesc._pad0` 的位编码：bit0 = 该 grid 是**远场级**。
+/// 写侧 = Rust `brickmap::wire::GRID_FLAG_FAR`（`VolumesBuilder::snapshot` 按 `VolumeGrid::is_far_level` 置位）；
+/// 读侧只有 [`grid_is_far`] 一个调用点（`world.wesl::trace_scene` 的分壳裁剪）。
+const GRID_FLAG_FAR: u32 = 1u;
+
+/// 该 grid 是不是远场级。
+fn grid_is_far(idx: u32) -> bool {
+  return (grid_descs[idx]._pad0 & GRID_FLAG_FAR) != 0u;
+}
+
+/// 世界 AABB 的**出口**距离（`ro` 系绝对 t，起点在盒内时为 > 0）：分壳裁剪用它算"上一级的覆盖半径"。
+///
+/// 为什么用 AABB 出口而不是"窗口半宽"（常数）：远场级的窗口是**相机居中**的盒 ⇒ 同一级沿不同方向
+/// 的覆盖距离在 `R .. √3·R` 之间（对角更长）。用常数 R 会在对角方向把"上一级其实还覆盖着"的那段
+/// 也交给下一级 ⇒ 两级在同一段空间里各画一份（近场细节 + 远场膨胀格）。
+fn aabb_exit(mn: vec3<f32>, mx: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+  var e = 1e+30;
+  let inv = 1.0 / dir;
+  for (var a: u32 = 0u; a < 3u; a = a + 1u) {
+    // 轴平行时该轴对出口无贡献（`0 × ∞` 会出 NaN ⇒ 必须跳过）
+    if (abs(dir[a]) > 1e-30) {
+      e = min(e, max((mn[a] - origin[a]) * inv[a], (mx[a] - origin[a]) * inv[a]));
+    }
+  }
+  return e;
 }

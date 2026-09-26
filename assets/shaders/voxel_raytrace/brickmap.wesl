@@ -19,6 +19,7 @@ struct Grid {
   index_origin: vec3<i32>,      // chunk 窗口 origin（chunk 单位）
   index_dims: vec3<u32>,        // chunk 窗口 dims（chunk 单位）
   obj_id: i32,                  // -1 = 主世界，>=0 = 物体索引
+  vol: u32,                     // grid_descs 下标（0 = 主世界，≥1 = 远场级）：请求字与用途戳表的分段号
 }
 
 // 树点查询：voxel → chunk 窗口定位 → 4 层 mask 树遍历 → palette。

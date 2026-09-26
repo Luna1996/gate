@@ -379,7 +379,10 @@ fn report_lod_diag(
 /// 绝对坐标的还原都在 [`report_lod_requests`] 里做（只有那里拿得到 `main_window_origin`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LodRequest {
-  /// 请求的 chunk（**绝对** chunk 坐标）
+  /// 哪个 volume（0 = 主世界，≥1 = 远场级）：**远场级的 chunk 坐标是它自己的级体素空间**，
+  /// 与主世界数值上会撞 ⇒ 卷号必须随请求一起走（M8）。
+  pub vol: u8,
+  /// 请求的 chunk（**绝对** chunk 坐标，在该 volume 自己的 chunk 空间里）
   pub chunk: IVec3,
   /// 票数：主射线里有多少条撞在"这个 chunk 不在 GPU 上"上 —— 越大的越该先补（消费端按它排）
   pub votes: u32,
@@ -419,7 +422,9 @@ impl LodRequestFeed {
 /// ⇒ 用途必须走**稠密表 + `atomicMax`**（`trace.wesl::req_use`），不能走环记录 —— 后者会被投票打爆。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LodUse {
-  /// 被看到的 chunk（**绝对** chunk 坐标）
+  /// 哪个 volume（0 = 主世界，≥1 = 远场级）；见 [`LodRequest::vol`]。
+  pub vol: u8,
+  /// 被看到的 chunk（**绝对** chunk 坐标，在该 volume 自己的 chunk 空间里）
   pub chunk: IVec3,
   /// 用途戳（单调计数器，只在同一块缓冲内比较先后）
   pub stamp: u32,
@@ -464,12 +469,14 @@ fn report_lod_requests(
   use_feed: Option<Res<ChunkUseFeed>>,
   mut period: Local<Option<std::time::Instant>>,
   mut prev: Local<Option<[u32; 2]>>,
-  // 合并用的稠密 64³ 计数器（1 M 字 = 4 MB）：只在首次分配，之后每窗 `fill(0)` 复用
+  // 合并用的稠密计数器（1 M 字 = 4 MB/卷）：只在首次分配，之后每窗**只清上一窗碰过的格子**
   mut counts: Local<Vec<u32>>,
   // 同上尺寸的"每格最细请求档位"（与 `counts` 同一趟填）
   mut min_levels: Local<Vec<u32>>,
+  // 上一窗碰过的 key（清表 + 建 `top` 都只走这一批，不扫 4 M 格）
+  mut touched: Local<Vec<u32>>,
 ) {
-  use crate::brickmap::consts::{LOD_REQ_WORDS, REQ_BASE, REQ_CAP, USE_BASE, USE_WORDS};
+  use crate::brickmap::consts::{LOD_REQ_WORDS, REQ_BASE, REQ_CAP, USE_BASE, USE_WORDS, VOLUMES};
   let Some(gpu) = gpu else { return };
   let now = std::time::Instant::now();
   let due = period
@@ -505,11 +512,19 @@ fn report_lod_requests(
     staging.unmap();
     return;
   }
+  // **整块解包**：staging 的映射区间是页对齐的（偏移 0）⇒ 可当 `&[u32]` 用；逐字
+  // `u32::from_le_bytes([view[o], …])` 在 210 万字的规模上是一个 ~30 ms 的标量循环（每窗一次 =
+  // 每 2 s 掉一帧），整块 memcpy 是 ~1 ms。对齐不成立（理论上不会）时退回逐字节。
   let mut words = vec![0u32; LOD_REQ_WORDS];
   if let Ok(view) = slice.get_mapped_range() {
-    for (i, w) in words.iter_mut().enumerate() {
-      let o = i * 4;
-      *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
+    let (head, mid, _tail) = unsafe { view.align_to::<u32>() };
+    if head.is_empty() && mid.len() >= LOD_REQ_WORDS {
+      words.copy_from_slice(&mid[..LOD_REQ_WORDS]);
+    } else {
+      for (i, w) in words.iter_mut().enumerate() {
+        let o = i * 4;
+        *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
+      }
     }
   }
   staging.unmap();
@@ -518,20 +533,25 @@ fn report_lod_requests(
   let (count, tick) = (words[0], words[2]);
 
   // ---- ① 用途戳（LRU 的"最近使用"信号；**先发**，因为它与请求无关：没有缺块时它也照样有值）----
-  // 表是稠密的 ⇒ 扫满 `USE_WORDS` 格（262144 次顺序读，每窗一次 ≈ 0.1 ms），只挑戳落在
+  // 表是稠密的 ⇒ 每个 volume 扫满 `USE_WORDS` 格（262144 次顺序读，每窗一次 ≈ 0.1 ms），只挑戳落在
   // **区间 `(上次读的戳, 本次读的戳]`** 里的 —— 陈旧条目天然落在区间外，所以表**不需要清零**。
+  // M8：表按 volume 分段（段号 = `Grid::vol`），各 volume 的窗口原点不同 ⇒ 还原绝对坐标要用各自的。
   let prev_tick = prev.map(|p| p[1]).unwrap_or(tick);
   let span = tick.wrapping_sub(prev_tick);
   let mut used: Vec<LodUse> = Vec::new();
+  let nv = gpu.volume_windows.len().min(VOLUMES);
   if span > 0 {
-    for i in 0..USE_WORDS {
-      let s = words[USE_BASE + i];
-      if s == 0 {
-        continue;
-      }
-      let d = tick.wrapping_sub(s);
-      if d > 0 && d <= span {
-        used.push(LodUse { chunk: gpu.main_window_origin + req_rel(i as u32), stamp: s });
+    for vol in 0..nv {
+      let origin = gpu.volume_windows[vol];
+      for i in 0..USE_WORDS {
+        let s = words[USE_BASE + vol * USE_WORDS + i];
+        if s == 0 {
+          continue;
+        }
+        let d = tick.wrapping_sub(s);
+        if d > 0 && d <= span {
+          used.push(LodUse { vol: vol as u8, chunk: origin + req_rel(i as u32), stamp: s });
+        }
       }
     }
   }
@@ -564,54 +584,91 @@ fn report_lod_requests(
   }
 
   // 合并：同一 chunk 的多条请求合成一条（票数 = 有多少条**采样射线**要它）。
-  // 用**稠密 64³ 计数器**（键就是窗口相对下标，18 位 ⇒ 正好 64³）而不是 HashMap：一整屏的采样射线
-  // 有几十万条事件，哈希表要 20–30 ms（每 2 s 抖一下），稠密数组是 1 M 次顺序写（~1–2 ms）。
+  // 用**稠密计数器**（键 = `vol` 段号 × `USE_WORDS` + 窗口相对下标，18 位 ⇒ 每 volume 64³）而不是
+  // HashMap：一整屏的采样射线有几十万条事件，哈希表要 20–30 ms（每 2 s 抖一下），稠密数组是顺序写。
+  // M8：数组按 volume 分段（4 段 = 4 MB 计数 + 4 MB 档位）—— 远场级的 chunk 坐标与主世界会撞，
+  // 不按卷分段就会把两个空间的票数加到一起（消费端据此装载 ⇒ 装错地方）。
+  // 合并用的稠密计数器（`VOLUMES × 64³` 字 = 16 MB）：只在首次分配，之后**只清上一窗口碰过的格子**
+  // ——整表 `fill` 是 32 MB × 2（计 + 档位）= ~3 ms，而一窗口真正碰到的 key 只有几百~几万个。
+  let cells = VOLUMES * USE_WORDS;
   let counts = &mut *counts;
-  if counts.len() != 64 * 64 * 64 {
-    *counts = vec![0u32; 64 * 64 * 64];
+  if counts.len() != cells {
+    *counts = vec![0u32; cells];
   }
-  counts.fill(0);
   // 每格的**最细**请求档位（`min` 合并；初值 3 = 最粗 ⇒ 任何请求都会把它压低）
   let min_lv = &mut *min_levels;
-  if min_lv.len() != 64 * 64 * 64 {
-    *min_lv = vec![3u32; 64 * 64 * 64];
+  if min_lv.len() != cells {
+    *min_lv = vec![3u32; cells];
   }
-  min_lv.fill(3);
-  for i in 0..n {
-    // 环缓冲：最近一条在 `count - 1` 处，往前倒推
-    let slot = count.wrapping_sub(1).wrapping_sub(i as u32) as usize % REQ_CAP;
+  for &k in touched.iter() {
+    counts[k as usize] = 0;
+    min_lv[k as usize] = 3;
+  }
+  touched.clear();
+  // 环缓冲：最近一条在 `count - 1`（mod `REQ_CAP`）处，往前逐条退（退到 0 就绕回 cap-1）。
+  // 用增量下标而不是 `% REQ_CAP`：那是每条约 20–40 周期的整数除法，100 万条 ≈ 17 ms。
+  let mut slot = (count.wrapping_sub(1) as usize) % REQ_CAP;
+  for _ in 0..n {
     let w = words[REQ_BASE + slot];
-    let key = (w & 0x3_FFFF) as usize;
+    let key = ((w >> 21) & 3) as usize * USE_WORDS + (w & 0x3_FFFF) as usize;
+    if counts[key] == 0 {
+      touched.push(key as u32); // 本窗口第一次碰到它（清过了 ⇒ 0 就是"还没碰过"）
+    }
     counts[key] = counts[key].saturating_add(1);
     let lv = (w >> 18) & 3;
     if lv < min_lv[key] {
       min_lv[key] = lv;
     }
+    if slot == 0 {
+      slot = REQ_CAP - 1;
+    } else {
+      slot -= 1;
+    }
   }
+  // 只遍历**碰过的** key（不再扫 4 M 格：那是 ~11 ms 的过滤器 + collect）
   let mut top: Vec<(usize, u32)> =
-    counts.iter().enumerate().filter(|(_, v)| **v > 0).map(|(k, v)| (k, *v)).collect();
+    touched.iter().map(|&k| (k as usize, counts[k as usize])).filter(|(_, v)| *v > 0).collect();
   let distinct = top.len();
   top.sort_unstable_by_key(|(k, v)| (std::cmp::Reverse(*v), *k));
-  // 只把**票数最高的前 `REQ_FEED_MAX` 条**喂给消费端（见该常量的说明）：需求表要的是"最想要的那
-  // 一批"，而带一万多条进主线程会让每帧的拷贝 + 排序变成几十 ms 的尖峰。日志里的条数仍报真实的
+  // 只把**票数最高的前 `REQ_FEED_MAX` 条 / 卷**喂给消费端（见该常量的说明）：需求表要的是"最想要
+  // 的那一批"，而带一万多条进主线程会让每帧的拷贝 + 排序变成几十 ms 的尖峰。日志里的条数仍报真实的
   // 去重总数（`distinct`），所以"信息量够不够"照旧看得见。
-  top.truncate(crate::brickmap::consts::REQ_FEED_MAX);
+  //
+  // M8：**按卷配额**，不是全局前 N —— 主世界的请求票数天然高得多（近处每条射线都在走它），
+  // 全局截断会把远场那点票直接挤没（远场只在"走廊方向"上被看到，票少）。按卷各给
+  // `REQ_FEED_MAX` ⇒ 每级都拿得到自己的装载清单。
+  let mut per_vol = [0usize; VOLUMES];
+  top.retain(|(k, _)| {
+    let v = k / USE_WORDS;
+    if v < VOLUMES && per_vol[v] < crate::brickmap::consts::REQ_FEED_MAX {
+      per_vol[v] += 1;
+      true
+    } else {
+      false
+    }
+  });
   let merged: Vec<LodRequest> = top
     .iter()
-    .map(|(key, votes)| LodRequest {
-      chunk: gpu.main_window_origin + req_rel(*key as u32),
-      votes: *votes,
-      level: min_lv[*key].min(3) as u8,
+    .map(|(key, votes)| {
+      let vol = key / USE_WORDS;
+      let origin = gpu.volume_windows.get(vol).copied().unwrap_or(IVec3::ZERO);
+      LodRequest {
+        vol: vol as u8,
+        chunk: origin + req_rel((key % USE_WORDS) as u32),
+        votes: *votes,
+        level: min_lv[*key].min(3) as u8,
+      }
     })
     .collect();
   let shown: Vec<String> = merged
     .iter()
     .take(6)
-    .map(|r| format!("({},{},{})×{}", r.chunk.x, r.chunk.y, r.chunk.z, r.votes))
+    .map(|r| format!("v{}({},{},{})×{}", r.vol, r.chunk.x, r.chunk.y, r.chunk.z, r.votes))
     .collect();
   set_feed(merged);
   info!(
-    "REQ[去重 {distinct} chunk、取前 {}（最热 {}）；本窗口 {new_reqs} 条、超容丢失 {lost}；用途戳 {used_n} chunk]",
+    "REQ[去重 {distinct} chunk、取 {} 条（按卷配额，最热 {}）；本窗口 {new_reqs} 条、超容丢失 {lost}；\
+     用途戳 {used_n} chunk]",
     top.len(),
     shown.join(" ")
   );

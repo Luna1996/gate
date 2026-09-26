@@ -257,12 +257,18 @@ pub struct GridDesc {
   pub index_origin_x: i32,
   pub index_origin_y: i32,
   pub index_origin_z: i32,
-  pub _pad0: u32,
+  /// **位标记（M8）**：bit0 = [`GRID_FLAG_FAR`]（该 grid 是远场级）。其余位保留（恒 0）。
+  /// 唯一消费者 = shader 的 `trace.wesl::grid_is_far` / `world.wesl::trace_scene` 的分壳裁剪。
+  pub grid_flags: u32,
   pub index_dims_x: u32,
   pub index_dims_y: u32,
   pub index_dims_z: u32,
   pub _pad1: u32,
 }
+
+/// [`GridDesc::grid_flags`] 的 bit0 = **该 grid 是远场级**（M8）。
+/// 权威读侧在 `trace.wesl::GRID_FLAG_FAR`（两侧必须一致；值就是这一个 bit）。
+pub const GRID_FLAG_FAR: u32 = 1;
 
 impl GridDesc {
   /// 主世界默认 GridDesc（identity transform，由 builder 填充 tree_base/palette_base/window）
@@ -280,7 +286,7 @@ impl GridDesc {
     index_origin_x: 0,
     index_origin_y: 0,
     index_origin_z: 0,
-    _pad0: 0,
+    grid_flags: 0,
     index_dims_x: 0,
     index_dims_y: 0,
     index_dims_z: 0,
@@ -314,13 +320,40 @@ impl GridDesc {
       index_origin_x: origin.x,
       index_origin_y: origin.y,
       index_origin_z: origin.z,
-      _pad0: 0,
+      grid_flags: 0,
       index_dims_x: dims.x as u32,
       index_dims_y: dims.y as u32,
       index_dims_z: dims.z as u32,
       _pad1: 0,
     }
   }
+}
+
+/// 窗口（chunk 单位）在该 volume 变换下的**世界 AABB**（8 角点外包）。`rot`/`scale` 任意时保守。
+///
+/// 为什么不能沿用 [`transform_aabb`]：它算的是**局部 `[0,256]³`**（"单 chunk 物体"的形态）。
+/// 主世界与远场级的局部范围是它们的**窗口**（`origin·256 .. (origin+dims)·256`）—— 远场级的窗口是
+/// 64³ chunk（`±10.5 km` 级），按 `[0,256]³` 算出来的 AABB 会让 shader 的 AABB 预剔除把整级裁掉。
+pub fn window_world_aabb(
+  t: gate_voxel::VolumeTransform,
+  origin: IVec3,
+  dims: IVec3,
+) -> (Vec3, Vec3) {
+  let s = if t.scale.is_finite() && t.scale > 0.0 { t.scale } else { 1.0 };
+  let lo = origin * CHUNK_SIZE;
+  let hi = (origin + dims) * CHUNK_SIZE;
+  let mut mn = Vec3::splat(f32::MAX);
+  let mut mx = Vec3::splat(f32::MIN);
+  for &x in &[lo.x, hi.x] {
+    for &y in &[lo.y, hi.y] {
+      for &z in &[lo.z, hi.z] {
+        let w = t.pos + t.rot * (Vec3::new(x as f32, y as f32, z as f32) * s);
+        mn = mn.min(w);
+        mx = mx.max(w);
+      }
+    }
+  }
+  (mn, mx)
 }
 
 /// LUT octant 数：射线方向符号组合。编码同 shaders/voxel_raytrace/ `dir_mask`：

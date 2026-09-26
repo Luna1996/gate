@@ -326,6 +326,9 @@ pub struct GpuBrickMap {
   /// 主世界 chunk 窗口（chunk 单位）CPU 副本
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
+  /// **每 volume 的 chunk 窗口原点**（按 `grid_descs` 索引序）：`report_lod_requests` 把请求 / 用途戳
+  /// 的"窗口相对下标"还原成绝对 chunk 坐标时要用**各自 volume** 的窗口（M8：远场级的坐标空间不同）。
+  pub volume_windows: Vec<IVec3>,
   /// GI 缓冲（`gi_tex`）的**线性采样器**（BG1 binding 4，ClampToEdge ×3 + mipmap_filter = Nearest）。
   pub light_sampler: Sampler,
   /// **全局材质资产表**（BG1 binding 5）：storage buffer，`MATERIAL_ASSET_SLOTS × 32B`（当前 = 32KB）。
@@ -461,6 +464,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     globals,
     main_window_origin: IVec3::ZERO,
     main_window_dims: UVec3::ZERO,
+    volume_windows: Vec::new(),
     light_sampler,
     material_assets,
     material_assets_uploaded: false,
@@ -883,6 +887,13 @@ pub(crate) fn prepare(
     IVec3::new(main_desc.index_origin_x, main_desc.index_origin_y, main_desc.index_origin_z);
   gpu.main_window_dims =
     UVec3::new(main_desc.index_dims_x, main_desc.index_dims_y, main_desc.index_dims_z);
+  // M8：逐 volume 的窗口原点（请求 / 用途戳按各自 volume 的窗口还原绝对坐标）
+  gpu.volume_windows = snap
+    .volumes
+    .grid_descs
+    .iter()
+    .map(|d| IVec3::new(d.index_origin_x, d.index_origin_y, d.index_origin_z))
+    .collect();
 
   revision.0 = revision.0.wrapping_add(1);
 
@@ -1195,6 +1206,12 @@ fn dump_voxel_buffers(
 /// ⑦ 的"近旁"半径（chunk，切比雪夫）：与流式世界的卸载半径同量级 —— 近处缺块是断口，远处缺只是空地。
 const GAP_NEAR_CHUNKS: i32 = 3;
 
+/// **远场级每帧的 GPU 安装上限**（M8，`plan_residency` ⑥ 段）：远场块的安装是"整棵小树直接序列化"
+/// （≈ 66 KB，见 `infinite_cubes::FAR_GRAIN`），没有主世界那样的 proxy 生成 + 0.9 ms 唤醒，
+/// 所以一次可以装得多；24/帧 × 60 ≈ 1440 个 chunk/s，与"3 个 worker 产出远场 ≈ 9 ms/chunk ⇒ 330/s"
+/// 的产出率同量级 —— 让**产出**（而不是挂载）成为远场铺开速度的瓶颈。
+const FAR_INSTALL_PER_FRAME: usize = 24;
+
 /// 需求集只看"最近 `USE_KEEP_FRAMES` 帧内被用到过"的 chunk。
 /// 取几倍于一个回读窗口（`REPORT_PERIOD_SECS` × 帧率）的量：太短会让"上一窗口看到、这一窗口刚好没被
 /// 采样到"的 chunk 掉出需求集而被换出 ⇒ 下一窗口再装回来（装卸抖振）。
@@ -1218,6 +1235,38 @@ const GPU_CHUNK_BYTES_EST: usize = 384 * 1024;
 const CPU_CHUNK_BYTES_EST: usize = 1024 * 1024;
 /// 池容量下限（chunk）：预算给得再小也至少留这么多格，否则"相机脚下那一圈"都装不下 ⇒ 画面空洞。
 const MIN_POOL_CHUNKS: usize = 64;
+
+/// 每个 **远场** chunk 的典型字节数（CPU 树 + builder 记账 + wire）：远场树的 wire 只有 4–6 KB
+/// （实测 `far_detail_is_much_smaller_than_full`，`FAR_GRAIN = 16`），另加 CPU 树与 builder 槽表约 3×
+/// ⇒ 取 **32 KB**（留余量）。
+const CPU_FAR_CHUNK_BYTES_EST: usize = 32 * 1024;
+
+/// 远场级池容量的下限（chunk）：预算给得再小也要够铺"眼前那一锥"，否则远场直接是空的。
+const MIN_POOL_CHUNKS_FAR: usize = 512;
+
+/// **远场级的池容量**（chunk；M8）。与主世界的 [`pool_capacity_chunks`] **分开换算**：
+///
+/// 主世界那 **1 MiB/chunk** 是"可编辑的全分辨率树"的口径，而远场块只有几 KB（见
+/// [`CPU_FAR_CHUNK_BYTES_EST`]）。用同一个换算会把远场卡在 2048 块 —— 而一级远场在视锥内就有
+/// **约 1.5 万个 chunk**（覆盖 = `32·256·scale` 世界体素、每 chunk `256·scale` ⇒ 壳层体积/块体积
+/// 与级数无关）⇒ 2048 块会在大半个锥里留**成片空洞**。
+///
+/// 预算口径 = `budget_bytes / 4`（三级远场合计吃掉 3/4，主世界仍按自己的口径拿满额）。
+///
+/// CONSTRAINT: **上限 = [`crate::brickmap::consts::FAR_POOL_CHUNKS`]** —— 它同时是远场 volume 的
+/// 树区预留区大小（`FAR_TREE_RESERVE_WORDS`）；容量超过预留，`b_struct` 就会变长，而远场级排在
+/// 主世界**之前** ⇒ 主世界的 `tree_base` 漂移 ⇒ `bases_shifted` 降级全量重传（实测 580 MB /
+/// 100–200 ms/帧 ⇒ 帧率掉到个位数）。两者必须一起改。
+pub fn pool_capacity_chunks_far(budget_bytes: usize) -> usize {
+  // 预算 = 0（不限）时**仍受预留区上限**：远场能装多少由"预留区放得下几块"物理决定（见上）。
+  if budget_bytes == 0 {
+    crate::brickmap::consts::FAR_POOL_CHUNKS
+  } else {
+    (budget_bytes / 4 / CPU_FAR_CHUNK_BYTES_EST)
+      .max(MIN_POOL_CHUNKS_FAR)
+      .min(crate::brickmap::consts::FAR_POOL_CHUNKS)
+  }
+}
 
 /// `LodRequest::level`（`trace.wesl::req_level` 的下标：0 = 全分辨率、1 = 16³、2 = 64³、3 = 整 chunk）
 /// → [`Level`]（proxy 的 `keep_extent`）。两边是**同一把尺**（`req_level` ≡ [`super::residency::raw_level`]）
@@ -1297,6 +1346,11 @@ fn plan_residency(
   //    `pick_evicts` 的排序键 —— **两边必须共用同一个信号**，否则会出现"一边说没用过、一边说还要"。
   if let Some(feed) = use_feed.as_ref() {
     for u in feed.peek() {
+      // M8：只收**主世界**的戳 —— 远场级的 chunk 坐标与主世界数值上会撞，混进来会把不相干的块
+      // 标成"刚被看到"（永远不被换出）。远场级的 LRU 由 `infinite_cubes::stream_chunks` 自己按卷裁。
+      if u.vol != 0 {
+        continue;
+      }
       state.residency.note_use(gate_voxel::ChunkCoord(u.chunk), frame);
     }
   }
@@ -1319,6 +1373,10 @@ fn plan_residency(
     std::collections::HashMap::new();
   if let Some(feed) = req_feed.as_ref() {
     for r in feed.peek() {
+      // M8：只收主世界的请求（远场级的坐标空间不同，见 `note_use` 处的说明）
+      if r.vol != 0 {
+        continue;
+      }
       let lv = *LEVEL_OF_REQ.get(r.level as usize).unwrap_or(&gate_voxel::BRICK_FACTOR);
       let e = want_level_of.entry(gate_voxel::ChunkCoord(r.chunk)).or_insert(lv);
       *e = (*e).min(lv); // 同一 chunk 被多档请求过 ⇒ 取**最细**的那个
@@ -1396,6 +1454,39 @@ fn plan_residency(
       evicted += 1;
     }
   }
+  // ⑥ **远场级（vol ≥ 1）的 GPU 常驻**（M8）：**只做"CPU 有 ⇒ GPU 有" + "CPU 没了 ⇒ 归还"**，
+  //    不走档位阶梯 —— 远场级本身已经是粗档（每格 `FAR_GRAIN` 级体素），没有"再塌一层"可做；
+  //    容量上限由 CPU 侧（`infinite_cubes::stream_chunks` 的池预算）先把住，这里不做 LRU：
+  //    一个块一旦在 CPU 上就应该在 GPU 上（否则画面上直接是空洞），而要卸的块 CPU 侧已经卸了。
+  //    每帧安装上限取 [`FAR_INSTALL_PER_FRAME`]（远场块的安装是"整棵小树序列化"，比主世界的
+  //    proxy 唤醒便宜得多 —— 实测远场树 ≈ 66 KB vs 主世界 278 KB）。
+  let (mut far_installed, mut far_evicted) = (0usize, 0usize);
+  for vol in 1..scene.volumes.len() {
+    let far_grid = &scene.volumes.all()[vol];
+    if !far_grid.is_far_level() {
+      continue;
+    }
+    let quota = FAR_INSTALL_PER_FRAME.saturating_sub(far_installed);
+    if quota > 0 {
+      let mut todo: Vec<gate_voxel::ChunkCoord> =
+        far_grid.chunk_coords().filter(|c| !builder.is_resident(vol, *c)).collect();
+      if !todo.is_empty() {
+        // 坐标升序：同帧内确定（不依赖 HashMap 迭代序）
+        todo.sort_unstable_by_key(|c| (c.0.x, c.0.y, c.0.z));
+        for c in todo.into_iter().take(quota) {
+          if builder.ensure_resident(&scene.volumes, vol, c) {
+            far_installed += 1;
+          }
+        }
+      }
+    }
+    for c in builder.resident_chunks(vol) {
+      if far_grid.chunk(c).is_none() {
+        builder.evict(vol, c);
+        far_evicted += 1;
+      }
+    }
+  }
   // ⑦ 「CPU 有 / GPU 无」取证（`docs/editable-gigavoxel.md` §10.2 第 1 条）：本帧**没有任何**待安装 /
   //    待换出的动作，相机近旁却仍有"有内容的 chunk 没装在 GPU 上" ⇒ 那一片在画面上就是空洞与齐平断口
   //    （静默跳过发生在 `install_chunk` 的窗口检查里，没有这条日志就查不出来）。
@@ -1419,7 +1510,7 @@ fn plan_residency(
       }
     }
   }
-  if installed == 0 && evicted == 0 {
+  if installed + evicted + far_installed + far_evicted == 0 {
     return;
   }
   // WARNING: **这里不重出 `UploadSnapshot`**（`extract` 是唯一的出快照点）。`snapshot()` 会**取走**
@@ -1430,11 +1521,13 @@ fn plan_residency(
   // 本函数的 evict / install 一样会标脏 ⇒ 由**下一帧的 `extract`** 连它那份改动一起上传
   // （`extract` 的提前返回条件已含 `VolumesBuilder::has_dirty`）。
   debug!(
-    "RESID[resident {} {}KB install {} evict {}]",
+    "RESID[resident {} {}KB install {} evict {} | 远场 install {} evict {}]",
     state.residency.resident_count(),
     state.residency.resident_bytes() / 1024,
     installed,
-    evicted
+    evicted,
+    far_installed,
+    far_evicted
   );
 }
 

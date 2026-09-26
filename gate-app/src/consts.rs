@@ -50,8 +50,16 @@ pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=debug,wgpu_core=debug,\
 pub const FOV_Y: f32 = 60.0_f32.to_radians();
 /// 近裁剪面（voxel）
 pub const CAM_NEAR: f32 = 1.0;
-/// 远裁剪面（voxel）
-pub const CAM_FAR: f32 = 65536.0;
+/// 远裁剪面（voxel）。**主射线的 `t_cap` 由它推出**（`main.wesl`：`t_cap = length(far_world − near_world)`）
+/// ⇒ 它必须盖住最远那一级远场的覆盖半径，否则远场被截在视锥外。
+///
+/// M8：L3 的覆盖半径 = `32 chunk × 256 级体素 × scale 64` = **524288 体素 ≈ 10.5 km**
+/// （对角 ×√3 ≈ 908k）⇒ 取 `2^20 = 1048576` 体素（≈ 21 km）已含对角。再大只是让主射线的
+/// 空走预算白涨（世界是无限的）。1 体素 = 2 cm。
+///
+/// 精度：`near:far = 1 : 2^20` 只影响光栅化深度的分布，而世界几何是 compute 里的射线步进
+/// （用线性 `t`，不读深度缓冲）⇒ 不受影响。
+pub const CAM_FAR: f32 = 1_048_576.0;
 /// 右键拖拽转向灵敏度（弧度/像素）；自由模式锁定后的鼠标转头用同一个值
 pub const ROT_SPEED: f32 = 0.005;
 /// 滚轮缩放速率（对数档/格）

@@ -1,7 +1,7 @@
 import package::bindings::{g};
 import package::brickmap::{Grid, sample_brickmap};
 import package::common::{face_normal_from_index};
-import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid};
+import package::trace::{MediumRay, UnifiedHit, aabb_exit, grid_is_far, make_grid, trace_grid};
 
 // 着色法线 = 逐体素（隐式）法线 = 可见面法线 + 该面**切平面内**的邻域倾斜。
 // 倾斜量取命中体素邻域占据度（主世界 4 个面邻居 / 物体 6 个，见下面的成本说明）的负梯度，
@@ -71,8 +71,15 @@ struct SceneHit {
   palette_base: u32,
 }
 
-// 主世界先跑 + 逐物体收缩 t_cap 取最近命中；g0 = 主世界网格（由 world_raycast 提供）。
+// 主世界先跑 + 逐物体/远场级收缩 t_cap 取最近命中；g0 = 主世界网格（由 world_raycast 提供）。
 // 物体循环不被世界 miss 短路：天空背景前的物体必须可见。
+//
+// **M8 · 分壳裁剪**：远场级（`grid_is_far`）只从**上一级的覆盖半径**起参与求交 —— `shell` 随每级推进，
+// 每跑完一级就把它推到该级世界 AABB 的出口（`aabb_exit`）。不做这件事的直接后果：远场级的格是
+// `4·scale` 体素的膨胀块，而它的窗口**同样包含相机**（与主世界一样钉在相机上）⇒ 不裁的话
+// 近处的膨胀格会盖在近场细节前面（画面变成"远处的大方块糊住脚下"）。
+// **次级射线**（`req == 0`）不受影响也不参与：`trace_grid` 自己的 `SECONDARY_REACH_CHUNKS` 把它们的
+// 行程夹在 ±61 m，而第一级远场从 164 m 起 ⇒ 远场对 GI / 阴影 / 镜面天然不可见（近场已覆盖那段）。
 fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
                req: u32) -> SceneHit {
   var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0));
@@ -83,14 +90,23 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
     best.palette_base = g0.palette_base;
   }
   let n = g.grid_count;
+  // **M8 分壳**：`shell` = "上一级覆盖到哪"，每跑完一级就推进到该级世界 AABB 的出口；远场级从它起画。
+  // CONSTRAINT: **必须从"第 0 级（主世界）的出口"起步、且每一级都推进** —— 只推进远场级的话，
+  // L1 拿到的 `shell` 还是 `t_min`（≈ 0）⇒ 它的 1.28 m 膨胀格从相机脸上就开始画：近场细节被一片
+  // "材质随机、颜色花"的大方块糊住（实测现象：`docs/editable-gigavoxel.md` §9 M8 的"模型都不对"）。
+  var shell = aabb_exit(g0.w_mn, g0.w_mx, origin, dir);
   for (var i: u32 = 1u; i < n; i = i + 1u) {
     let gi = make_grid(i);
-    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_min, depth_cap, false, req, &mc_off);
+    let far = grid_is_far(i);
+    let t_lo = select(t_min, max(t_min, shell), far);
+    let mhi = trace_grid(gi, origin, dir, min(best_t, t_cap), t_lo, depth_cap, false, req, &mc_off);
     if (mhi.hit && mhi.t < best_t) {
       best_t = mhi.t;
       best.uh = mhi;
       best.palette_base = gi.palette_base;
     }
+    // 推进放在 `if (far)` 之外：命中与否都要推进（下一级从**这一级**的覆盖半径起）
+    shell = max(shell, aabb_exit(gi.w_mn, gi.w_mx, origin, dir));
   }
   return best;
 }

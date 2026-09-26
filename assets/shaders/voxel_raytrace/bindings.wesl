@@ -124,6 +124,8 @@ struct GridDesc {
   index_origin_x: i32,    // chunk 窗口 origin（chunk 单位）
   index_origin_y: i32,
   index_origin_z: i32,
+  /// M8：位标记，bit0 = **远场级**（`trace.wesl::GRID_FLAG_FAR`；写侧 Rust `wire::GRID_FLAG_FAR`）。
+  /// 唯一消费者 = `world.wesl::trace_scene` 的分壳裁剪。其余位保留（恒 0）。
   _pad0: u32,
   index_dims_x: u32,      // chunk 窗口 dims（chunk 单位）
   index_dims_y: u32,

@@ -62,19 +62,49 @@ pub const REQ_CAP: usize = 1024 * 1024;
 pub const REQ_FEED_MAX: usize = 16 * 1024;
 /// `lod_req` 头部字数：`[0]` 累计条数、`[1]` 保留、`[2]` 用途戳计数器，其后是用途戳表。
 pub const USE_BASE: usize = 3;
+/// **grid volume 数**（主世界 + 远场级）：权威在 `trace.wesl::GRID_VOLUMES`，Rust 经
+/// [`crate::wesl_consts::trace_consts`] 解析同一份源码并**核对相等**（不等就 panic）。
+/// 请求环与用途戳表按它定长 ⇒ 两侧不一致会越界写。
+pub const VOLUMES: usize = 4;
 /// 请求缓冲字数：`[0]` = 累计条数（只增，CPU 读差值配对 `REQ_CAP` 取模）、`[1]` = 保留、
-/// `[2]` = 用途戳计数器、`[3 .. 3+USE_WORDS)` = 用途戳表、其后 [`REQ_CAP`] 个请求字。
-pub const LOD_REQ_WORDS: usize = 3 + USE_WORDS + REQ_CAP;
-/// **用途戳表**的格数 = 窗口 chunk 数（64³）= 表是**稠密**的：窗口内每个 chunk 一格。
+/// `[2]` = 用途戳计数器、`[3 .. 3+USE_WORDS×VOLUMES)` = **逐 volume** 的用途戳表、
+/// 其后 [`REQ_CAP`] 个请求字。
+pub const LOD_REQ_WORDS: usize = 3 + USE_WORDS * VOLUMES + REQ_CAP;
+/// **用途戳表**的格数 = 每 volume 一个窗口 chunk 数（64³）。
 ///
 /// 论文 §III.A 的 usage stamp：`trace.wesl::req_use` 在遍历中对**已加载**的 chunk 记一笔
 /// "这条主射线看到了它"（值 = 单调计数器发的戳，`atomicMax` 合并）。它是**缓存替换（LRU）唯一的
 /// "最近使用"来源** —— 取代原先"每射线一条环记录"的可见性投票：后者会被约 1000 万条/秒的投票打爆
 /// （实测环 100% 溢出 ⇒ 消费端读到的需求列表退化成 71 条垃圾），而稠密表**按构造不可能溢出**。
+///
+/// M8：表按 **volume** 分段（`[USE_BASE + vol*USE_WORDS, … + USE_WORDS)`）—— 远场级的 chunk 坐标
+/// 是它自己的级体素空间，与主世界**数值上会撞**，不分段就互相顶掉。
 pub const USE_WORDS: usize = 64 * 64 * 64;
+/// **远场级池容量**（块/级，M8）：CPU 侧 LRU 的容量，**同时**决定远场 volume 的树区预留区大小
+/// （见 [`FAR_RESERVE_WORDS_PER_CHUNK`]）。
+///
+/// 实测（用户机 `logs/latest.log`）：远场每次只在视锥的"走廊方向"上装几块~几十块（v1/v2/v3 各 10/35/30），
+/// 取 2048 留了两个数量级的余量，而预留区仍是可接受的 16 MB/级（三级 48 MB）。
+/// 这个数**不必**随「请求内存」滑杆涨：远场的数量由"射线真看到多少"定，不由预算定。
+pub const FAR_POOL_CHUNKS: usize = 2048;
+/// 远场级树区**每块的上界字数**：实测远场 chunk 的 wire = 1219–1463 字（4.9–5.9 KB，见
+/// `far_detail_is_much_smaller_than_full`），加 `install_blob` 的 25% 余量与根预留 ⇒ 取
+/// **2048 字（8 KB）/块**。
+pub const FAR_RESERVE_WORDS_PER_CHUNK: usize = 2048;
+/// 远场级 volume 的**树区预留字数**（每个远场 volume 固定这么多 ⇒ 它的 `b_struct` 长度**永不变**）。
+///
+/// WHY 必须预留（M8 首轮实跑暴露）：`VolumesBuilder::snapshot` 的 `bases_shifted` 以"各 volume 的
+/// `b_struct` 长度"为判据，而**远场级排在主世界之前**（布局序 = 物体/远场在前、主世界最后）⇒
+/// 远场一变长，主世界的 `tree_base` 就漂移 ⇒ 降级**全量快照**：把全部 volume 拼一遍。
+/// 实测（`--features profile` + `GATE_LOG=gate=debug`）：
+/// `UPLOAD[full]: bytes=577MB … elapsed=81–200ms`，每装几块远场就来一次（`extract` = 107–227 ms/帧）
+/// ⇒ 帧率掉到个位数。这就是 §8 那条"物体变长的代价用**增长余量**摊薄"在远场级上的落地：
+/// 预留一段够用满池的固定区 ⇒ 长度恒定 ⇒ 布局不漂移。用完（罕见）才真长一次。
+pub const FAR_TREE_RESERVE_WORDS: usize = FAR_POOL_CHUNKS * FAR_RESERVE_WORDS_PER_CHUNK;
+
 /// 请求环在 `lod_req` 里的起始字下标（`[0]` 累计条数 / `[1]` 保留 / `[2]` 用途戳计数器 /
-/// `[3 .. 3+USE_WORDS)` 用途戳表）。**必须与 `trace.wesl::REQ_BASE` 一致**（那边是 shader 侧的唯一来源）。
-pub const REQ_BASE: usize = USE_BASE + USE_WORDS;
+/// `[3 .. 3+USE_WORDS×VOLUMES)` 逐 volume 用途戳表）。**必须与 `trace.wesl::REQ_BASE` 一致**。
+pub const REQ_BASE: usize = USE_BASE + USE_WORDS * VOLUMES;
 /// beam 预 pass（关掉则主 pass 从 t=0 起步）
 pub const DDA_BEAM: bool = true;
 /// 方向可达掩码剔除（LUT）

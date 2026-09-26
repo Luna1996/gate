@@ -54,14 +54,27 @@ impl Detail {
 ///
 /// CONSTRAINT: 实现方在 **worker 线程**上被调用 ⇒ 必须 `Send + Sync`，且**不得碰主线程的
 /// `VolumeGrid`**；`scratch` 是 worker 线程独占、可复用的暂存（实现方拿它当中转，避免每次分配）。
+///
+/// `vol` = 该 chunk 属于哪个 volume（0 = 主世界，≥1 = 远场级，与 `Volumes.list` 下标同一口径）——
+/// 多级世界的各 volume 共用**同一个** producer（一个线程池），卷号随任务一起走。
 pub trait ChunkSource: Send + Sync + 'static {
-  /// 产出 `coord` 处的 chunk 树（`None` = 这个 chunk 没有内容，调用方不必挂载）。
-  fn produce(&self, coord: ChunkCoord, detail: Detail, scratch: &mut VolumeGrid) -> Option<ChunkTree>;
+  /// 产出 `vol` 的 `coord` 处的 chunk 树（`None` = 这个 chunk 没有内容，调用方不必挂载）。
+  fn produce(
+    &self,
+    vol: usize,
+    coord: ChunkCoord,
+    detail: Detail,
+    scratch: &mut VolumeGrid,
+  ) -> Option<ChunkTree>;
 }
+
+/// 任务 / 产出的键：**卷号 + 坐标**。同一坐标在不同 volume 里是不同的东西（远场级的 chunk 坐标
+/// 是它自己的级体素空间），只按坐标去重会让两个卷互相顶掉。
+type JobKey = (u8, ChunkCoord);
 
 /// worker 回传的一条产出。
 struct Done {
-  coord: ChunkCoord,
+  key: JobKey,
   detail: Detail,
   tree: Option<ChunkTree>,
 }
@@ -71,11 +84,11 @@ struct Done {
 /// 用法（主线程，每帧）：先 [`Self::request`] 派需求（多派几条，`max_inflight` 封顶），再
 /// [`Self::poll`] 取回成品去挂载。**去重**由 `inflight` 负责：同一个 chunk 不会同时产两份。
 pub struct ChunkProducer {
-  queues: Vec<Sender<(ChunkCoord, Detail)>>,
+  queues: Vec<Sender<(JobKey, Detail)>>,
   next: usize,
   rx: Receiver<Done>,
   /// 已派发、还没取回的 chunk（去重 + 在飞上限）
-  inflight: std::collections::HashSet<ChunkCoord>,
+  inflight: std::collections::HashSet<JobKey>,
   /// 在飞上限：队列再长也只是排队（不加速），但太小会让 worker 空转 —— 粗档 chunk 只花几十 µs，
   /// 一帧就能吃掉几十条 ⇒ 按 worker 数的 32 倍留队列，真正的节流交给消费端的挂载预算。
   max_inflight: usize,
@@ -91,7 +104,7 @@ impl ChunkProducer {
     let mut handles = Vec::with_capacity(workers);
     let (done_tx, rx) = std::sync::mpsc::channel::<Done>();
     for i in 0..workers {
-      let (tx, job_rx) = std::sync::mpsc::channel::<(ChunkCoord, Detail)>();
+      let (tx, job_rx) = std::sync::mpsc::channel::<(JobKey, Detail)>();
       let src = source.clone();
       let out = done_tx.clone();
       handles.push(
@@ -100,9 +113,10 @@ impl ChunkProducer {
           .spawn(move || {
             // worker 线程独占一份暂存：`VolumeGrid` 的调色板表是 512KB，建一次反复用
             let mut scratch = VolumeGrid::new();
-            for (coord, detail) in job_rx.iter() {
-              let tree = src.produce(coord, detail, &mut scratch);
-              if out.send(Done { coord, detail, tree }).is_err() {
+            for (key, detail) in job_rx.iter() {
+              let (vol, coord) = (key.0 as usize, key.1);
+              let tree = src.produce(vol, coord, detail, &mut scratch);
+              if out.send(Done { key, detail, tree }).is_err() {
                 return; // 主线程没了
               }
             }
@@ -124,8 +138,9 @@ impl ChunkProducer {
   }
 
   /// 派发一条需求；`false` = 这次没派（已在飞 / 在飞已满 ⇒ 调用方下一帧再试）。
-  pub fn request(&mut self, coord: ChunkCoord, detail: Detail) -> bool {
-    if self.inflight.len() >= self.max_inflight || !self.inflight.insert(coord) {
+  pub fn request(&mut self, vol: usize, coord: ChunkCoord, detail: Detail) -> bool {
+    let key: JobKey = (vol as u8, coord);
+    if self.inflight.len() >= self.max_inflight || !self.inflight.insert(key) {
       return false;
     }
     // 轮转派发；某条队列断了（那个 worker 退了）就换下一条 —— 只试一圈，全断才算失败。
@@ -133,11 +148,11 @@ impl ChunkProducer {
     for _ in 0..self.queues.len() {
       let i = self.next % self.queues.len();
       self.next = self.next.wrapping_add(1);
-      if self.queues[i].send((coord, detail)).is_ok() {
+      if self.queues[i].send((key, detail)).is_ok() {
         return true;
       }
     }
-    self.inflight.remove(&coord);
+    self.inflight.remove(&key);
     false
   }
 
@@ -146,20 +161,20 @@ impl ChunkProducer {
     self.inflight.len()
   }
 
-  /// 这个坐标是否已在飞（消费端用来跳过"已派发但还没回来"的那些，免得重复入队或空转）
-  pub fn in_flight(&self, coord: ChunkCoord) -> bool {
-    self.inflight.contains(&coord)
+  /// 这个 volume 的这个坐标是否已在飞（消费端用来跳过"已派发但还没回来"的那些，免得重复入队或空转）
+  pub fn in_flight(&self, vol: usize, coord: ChunkCoord) -> bool {
+    self.inflight.contains(&(vol as u8, coord))
   }
 
   /// 取回已完成的产出（非阻塞，本次最多 `max` 条）。返回的 `tree = None` 表示"这个 chunk 没有内容"，
   /// 调用方应把它记成"已生成、无内容"（免得每帧重复派发）。
-  pub fn poll(&mut self, max: usize) -> Vec<(ChunkCoord, Detail, Option<ChunkTree>)> {
+  pub fn poll(&mut self, max: usize) -> Vec<(usize, ChunkCoord, Detail, Option<ChunkTree>)> {
     let mut out = Vec::new();
     while out.len() < max {
       match self.rx.try_recv() {
         Ok(d) => {
-          self.inflight.remove(&d.coord);
-          out.push((d.coord, d.detail, d.tree));
+          self.inflight.remove(&d.key);
+          out.push((d.key.0 as usize, d.key.1, d.detail, d.tree));
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => break,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => break, // worker 全退：不再有产出

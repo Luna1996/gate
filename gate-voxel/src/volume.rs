@@ -37,6 +37,11 @@ pub struct VolumeGrid {
   /// **流式窗口提示**：`(chunk 原点, 各轴跨度)`，由流式世界设置（见 [`Self::set_stream_window`]）。
   /// 只影响渲染侧 `compute_window` 的窗口推导，不进 wire、不进序列化。
   stream_window: Option<(IVec3, IVec3)>,
+  /// **远场级标记（M8，`docs/editable-gigavoxel.md` §4 M8）**：该 volume 是一个"级体素 = `transform.scale`
+  /// 个主世界体素"的远场级（本仓取 4/16/64）。渲染侧唯一用途 = **分壳裁剪**：
+  /// `trace.wesl::trace_scene` 让远场级只从**上一级的覆盖半径**起参与求交，否则它的膨胀格会盖住近场。
+  /// 不进 wire、不进序列化。
+  far_level: bool,
 }
 
 impl Default for VolumeGrid {
@@ -53,6 +58,7 @@ impl Default for VolumeGrid {
       edit_generation: 0,
       edit_aabbs: HashMap::new(),
       stream_window: None,
+      far_level: false,
     }
   }
 }
@@ -140,6 +146,17 @@ impl Volumes {
     self.list.get_mut(obj_id + 1)
   }
 
+  /// **加一个远场级（M8）**：scale-only 变换（`pos = 0`、`rot = I`）⇒ 级体素 = `scale` 个主世界体素，
+  /// 与主世界**共享原点**（格点锚在世界坐标上，窗口滑动不改变格点相位 ⇒ 远处不闪）。
+  /// 返回新 volume 的索引（= `list` 下标，也是 shader 的 `grid_descs` 下标）。
+  pub fn add_far_level(&mut self, scale: f32) -> usize {
+    let idx = self.list.len();
+    let mut grid = VolumeGrid::new_object(idx as i32 - 1, Vec3::ZERO, Mat3::IDENTITY, scale);
+    grid.far_level = true;
+    self.list.push(grid);
+    idx
+  }
+
   /// volume 总数（含主世界）
   pub fn len(&self) -> usize {
     self.list.len()
@@ -181,6 +198,11 @@ impl VolumeGrid {
 
   pub fn obj_id(&self) -> i32 {
     self.obj_id
+  }
+
+  /// 该 volume 是不是**远场级**（M8；见 [`Self::far_level`] 与 [`Volumes::add_far_level`]）。
+  pub fn is_far_level(&self) -> bool {
+    self.far_level
   }
 
   /// 体素编辑代数（派生数据重烘判据；palette 变化不计入）

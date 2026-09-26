@@ -14,7 +14,7 @@ use gate_voxel::{
 };
 use glam::{IVec3, Vec4};
 
-use super::wire::{CHUNK_SIZE, GridDesc, LEAF_INLINE_WORDS, NODE_FIXED_WORDS, pack_palette_entry};
+use super::wire::{GridDesc, LEAF_INLINE_WORDS, NODE_FIXED_WORDS, pack_palette_entry};
 use rayon::prelude::*;
 
 use super::wire::{
@@ -205,6 +205,9 @@ pub struct BrickMapBuilder {
   dirty_palette: Option<(u16, u16)>,
   /// 调色板同步游标：本 builder 上次同步时调色板的写版本；None = 从未同步过。
   palette_synced_at: Option<u64>,
+  /// **树区预留字数**（M8，0 = 不预留）：见 [`BrickMapBuilder::new_unbuilt_reserved`] 的说明。
+  /// 预留区让 `b_struct` 的**长度恒定** ⇒ 排在后面的 volume 的 `tree_base` 不漂移。
+  reserve: usize,
 }
 
 /// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）；空 = 未修改。
@@ -237,10 +240,22 @@ impl BrickMapBuilder {
   /// 由 grid 包围盒确定 chunk 窗口（min - 1 起，跨度 +3 封顶 64³），不序列化内容。
   /// 随后可逐 [`Self::update_chunk`] 累积内容（渐进式初载）。
   pub fn new_unbuilt(grid: &VolumeGrid) -> Self {
+    Self::new_unbuilt_reserved(grid, 0)
+  }
+
+  /// 同 [`Self::new_unbuilt`]，但**预占一段固定长度的树区**（`reserve_words`）。
+  ///
+  /// WHY（M8）：[`VolumesBuilder::snapshot`] 的 `bases_shifted` 以"各 volume 的 `b_struct` 长度"为判据；
+  /// 排在**主世界之前**的远场级一变长，主世界的 `tree_base` 就漂移 ⇒ 降级**全量快照**（把四个 volume
+  /// 拼一遍 = 580 MB 的 memcpy + 上传，实测 `UPLOAD[full] … elapsed=81–200ms`，`extract` 107–227 ms/帧
+  /// ⇒ 帧率掉到个位数）。预留一段够用满池的固定区 ⇒ 长度恒定 ⇒ 布局不漂移（§8 的"用增长余量摊薄"）。
+  ///
+  /// CONSTRAINT: 预留区**只能被块级分配用掉**；用满后 `alloc_block` 会照旧追加（真变长一次，罕见）。
+  pub fn new_unbuilt_reserved(grid: &VolumeGrid, reserve_words: usize) -> Self {
     let (origin, dims, rejected) = compute_window(grid);
     let mut b = Self {
       buffers: BrickMapBuffers {
-        b_struct: vec![0; TREE_BASE],
+        b_struct: vec![0; TREE_BASE + reserve_words],
         b_palette: vec![0; PALETTE_WORDS],
         globals: BrickMapGlobals {
           index_origin_x: origin.x,
@@ -272,7 +287,12 @@ impl BrickMapBuilder {
       dirty_struct: Vec::new(),
       dirty_palette: None,
       palette_synced_at: None,
+      reserve: reserve_words,
     };
+    // 预留区登记为**空闲**：块级分配走 first-fit，会优先把它切走
+    if reserve_words > 0 {
+      b.free.free(TREE_BASE, reserve_words);
+    }
     b.write_palette(grid);
     b
   }
@@ -280,7 +300,12 @@ impl BrickMapBuilder {
   /// 全量构建（初始化 / 兜底）：确定性 + Rayon 并行序列化。
   /// chunk 按 ChunkCoord 升序安装；序列化并行，安装顺序不变（块地址按安装序递增）。
   pub fn build_full(grid: &VolumeGrid) -> Self {
-    let mut b = Self::new_unbuilt(grid);
+    Self::build_full_reserved(grid, 0)
+  }
+
+  /// 同 [`Self::build_full`]，但带树区预留（见 [`Self::new_unbuilt_reserved`]）。
+  pub fn build_full_reserved(grid: &VolumeGrid, reserve_words: usize) -> Self {
+    let mut b = Self::new_unbuilt_reserved(grid, reserve_words);
     let mut coords: Vec<ChunkCoord> = grid
       .chunk_coords()
       .filter(|&c| chunk_index_pos(b.origin, b.dims, c.0).is_some() && chunk_has_content(grid, c))
@@ -334,7 +359,7 @@ impl BrickMapBuilder {
       ChunkUpdate::Rebuilt
     };
     // 树区过半是空闲段 ⇒ 压实：否则碎片会累积到"没有足够大的连续段"从而只能追加，高水位长期膨胀。
-    // 只在安静时刻做（见 `allow_compact` 的说明）。
+    // 只在安静时刻做（见 `allow_compact` 的说明）。（带预留的 volume 在 `compact` 里直接跳过。）
     if allow_compact && self.free.words() * 2 > self.buffers.b_struct.len() - TREE_BASE {
       self.compact();
     }
@@ -732,6 +757,12 @@ impl BrickMapBuilder {
   /// 只在空闲过半、且处于安静时刻时调用（见 [`Self::update_chunk`]）；**只标"搬动过的块"的目标段**
   /// （没动的块在 GPU 上本来就是对的），相邻段由 `mark_struct_words` 自动并成 1~2 段。
   fn compact(&mut self) {
+    // CONSTRAINT（M8）：**带预留的 volume（远场级）直接跳过** —— 它的 `b_struct` 长度必须恒定，
+    // 否则排在其后的 volume 的 `tree_base` 漂移 ⇒ `bases_shifted` 全量重传（实测 577 MB / 81–200 ms/帧）。
+    // 而压实**只会**把长度压小 ⇒ 对预留区毫无收益（预留区一开场就是空闲的 ⇒ 判据恒真 ⇒ 每帧白搬一遍块）。
+    if self.reserve > 0 {
+      return;
+    }
     let mut items: Vec<(ChunkCoord, usize, usize)> =
       self.chunks.iter().map(|(&c, s)| (c, s.base, s.cap)).collect();
     // CONSTRAINT: 必须按**旧基址**升序搬（不是按坐标）—— 压实只会前移，升序搬运才能保证"目标段"
@@ -811,6 +842,9 @@ pub struct VolumesBuilder {
   builders: Vec<BrickMapBuilder>,
   /// 每 volume 的变换（缓存自 Volumes，用于 GridDesc 生成）
   transforms: Vec<VolumeTransform>,
+  /// 每 volume 是不是**远场级**（M8）：进 `GridDesc::grid_flags` 的 [`GRID_FLAG_FAR`]，
+  /// 唯一消费者是 shader 的分壳裁剪（`trace.wesl::grid_is_far`）。
+  far: Vec<bool>,
   /// 上一次 snapshot 的 tree_bases（字偏移）；空 = 首帧 → 强制全量
   prev_tree_bases: Vec<u32>,
   /// 上一次 snapshot 的 palette_bases（字偏移）
@@ -820,17 +854,30 @@ pub struct VolumesBuilder {
 }
 
 impl VolumesBuilder {
+  /// 该 volume 的树区预留（M8）：远场级固定预留 [`FAR_TREE_RESERVE_WORDS`]（长度恒定 ⇒ 主世界的
+  /// `tree_base` 不漂移 ⇒ 不降级全量重传），主世界与普通物体为 0。
+  fn reserve_of(grid: &gate_voxel::VolumeGrid) -> usize {
+    if grid.is_far_level() {
+      super::consts::FAR_TREE_RESERVE_WORDS
+    } else {
+      0
+    }
+  }
+
   /// 全量构建所有 volume（初始化 / 兜底）
   pub fn build_full(volumes: &Volumes) -> Self {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
+    let mut far = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
-      builders.push(BrickMapBuilder::build_full(grid));
+      builders.push(BrickMapBuilder::build_full_reserved(grid, Self::reserve_of(grid)));
       transforms.push(grid.transform());
+      far.push(grid.is_far_level());
     }
     Self {
       builders,
       transforms,
+      far,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
       force_full: true,
@@ -841,13 +888,16 @@ impl VolumesBuilder {
   pub fn new_unbuilt(volumes: &Volumes) -> Self {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
+    let mut far = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
-      builders.push(BrickMapBuilder::new_unbuilt(grid));
+      builders.push(BrickMapBuilder::new_unbuilt_reserved(grid, Self::reserve_of(grid)));
       transforms.push(grid.transform());
+      far.push(grid.is_far_level());
     }
     Self {
       builders,
       transforms,
+      far,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
       force_full: true,
@@ -868,12 +918,14 @@ impl VolumesBuilder {
     while self.builders.len() < volumes.all().len() {
       let idx = self.builders.len();
       let grid = &volumes.all()[idx];
-      self.builders.push(BrickMapBuilder::build_full(grid));
+      self.builders.push(BrickMapBuilder::build_full_reserved(grid, Self::reserve_of(grid)));
       self.transforms.push(grid.transform());
+      self.far.push(grid.is_far_level());
       self.force_full = true;
     }
     for (i, grid) in volumes.all().iter().enumerate() {
       self.transforms[i] = grid.transform();
+      self.far[i] = grid.is_far_level();
     }
   }
 
@@ -950,20 +1002,14 @@ impl VolumesBuilder {
         origin,
         dims,
       );
-      if i == 0 {
-        desc.aabb_min = Vec4::new(
-          (origin.x * CHUNK_SIZE) as f32,
-          (origin.y * CHUNK_SIZE) as f32,
-          (origin.z * CHUNK_SIZE) as f32,
-          0.0,
-        );
-        desc.aabb_max = Vec4::new(
-          ((origin.x + dims.x) * CHUNK_SIZE) as f32,
-          ((origin.y + dims.y) * CHUNK_SIZE) as f32,
-          ((origin.z + dims.z) * CHUNK_SIZE) as f32,
-          0.0,
-        );
-      }
+      // **世界 AABB 一律按窗口算**（主世界 / 远场级 / 物体同一口径）：`from_transform` 给的是
+      // 局部 `[0,256]³` 的 AABB（"单 chunk 物体"的形态），而主世界与远场级的局部范围是它们的窗口。
+      // 这里覆盖成窗口 AABB 后，shader 的 AABB 预剔除对三级远场都成立（否则远场级整级会被裁掉）。
+      let (mn, mx) = super::wire::window_world_aabb(tr, origin, dims);
+      desc.aabb_min = Vec4::new(mn.x, mn.y, mn.z, 0.0);
+      desc.aabb_max = Vec4::new(mx.x, mx.y, mx.z, 0.0);
+      // M8：远场级标记（分壳裁剪的开关，见 `trace.wesl::grid_is_far`）
+      desc.grid_flags = if self.far[i] { super::wire::GRID_FLAG_FAR } else { 0 };
       grid_descs.push(desc);
     }
 
@@ -1063,6 +1109,14 @@ impl VolumesBuilder {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.ensure_resident_tree(coord, tree))
   }
 
+  /// 唤醒：从该 volume 的 CPU 树整块装进 GPU（**近场不截断**）。远场级走这一条 ——
+  /// 它们本身已经是粗档（每格 `FAR_GRAIN` 级体素），没有"再截断一层"可做的（见 `upload::plan_residency`）。
+  pub fn ensure_resident(&mut self, volumes: &Volumes, vol_idx: usize, coord: ChunkCoord) -> bool {
+    let Some(b) = self.builders.get_mut(vol_idx) else { return false };
+    let Some(g) = volumes.all().get(vol_idx) else { return false };
+    b.ensure_resident(g, coord)
+  }
+
   /// 换出：归还 GPU 块（CPU 树不动 ⇒ 之后可再唤醒）。
   pub fn evict(&mut self, vol_idx: usize, coord: ChunkCoord) -> bool {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.evict(coord))
@@ -1115,6 +1169,7 @@ fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use super::super::wire::CHUNK_SIZE;
 
   /// **M6**：窗口平移 —— 条目跟着 chunk **搬家**、树块**原地不动**（"走得再远也不整块重定"的实现）。
   ///
@@ -1361,6 +1416,44 @@ mod tests {
       "20 次编辑最多只该用掉初始余量：{hw0} → {}",
       hw_seq[19]
     );
+  }
+
+  /// **M8**：远场级的树区**长度恒定** —— 这是"不降级全量重传"的前提。
+  ///
+  /// `VolumesBuilder::snapshot` 的 `bases_shifted` 以各 volume 的 `b_struct` 长度为判据；远场级排在
+  /// 主世界**之前** ⇒ 远场一变长，主世界的 `tree_base` 就漂移 ⇒ 全量快照（实测 `UPLOAD[full]
+  /// bytes=577MB elapsed=81–200ms`，`extract` 107–227 ms/帧 ⇒ 帧率掉到个位数）。
+  /// 预留区必须同时扛住**装块**与**压实**（压实原来会把尾巴截掉）。
+  #[test]
+  fn far_reserve_keeps_tree_region_length_stable() {
+    let mut grid = VolumeGrid::new();
+    let coords: Vec<ChunkCoord> =
+      (0..12).map(|i| ChunkCoord(IVec3::new(i % 4, i / 4, 0))).collect();
+    for c in &coords {
+      for x in 0..8 {
+        for y in 0..8 {
+          for z in 0..8 {
+            grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(1));
+          }
+        }
+      }
+    }
+    let reserve = 1 << 20; // 4 M 字（够这 12 块的 1.5 万倍余量）
+    let mut b = BrickMapBuilder::new_unbuilt_reserved(&grid, reserve);
+    let len0 = b.buffers().b_struct.len();
+    assert_eq!(len0, TREE_BASE + reserve, "预留区应当场占住");
+    for c in &coords {
+      let dirty = take_dirty_of(&mut grid, *c);
+      b.update_chunk(&grid, *c, &dirty, true);
+      assert_eq!(
+        b.buffers().b_struct.len(),
+        len0,
+        "装块必须被预留区吃掉，不许改长度（否则主世界 tree_base 漂移 ⇒ 全量重传）"
+      );
+    }
+    b.compact();
+    assert_eq!(b.buffers().b_struct.len(), len0, "压实必须保住预留区长度");
+    assert_eq!(b.window(), (b.origin, b.dims), "压实后窗口不变");
   }
 
   /// chunk 清空后空闲段占满树区 ⇒ 触发压实：高水位回落，存活 chunk 的树跟着前移且内容不变
