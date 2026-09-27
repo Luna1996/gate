@@ -56,7 +56,10 @@ pub fn want_level(dist_voxels: f32, px_ang: f32, cur_level: Level) -> Level {
 }
 
 /// 按阈值直接给档：`fp` 够大 ⇒ 允许更粗的档（`LADDER` 是粗 → 细序，取第一个够格的）。
-fn raw_level(fp: f32) -> Level {
+///
+/// `pub(crate)`：`plan_residency` 的账目同步要用它给"首次见到的 chunk"**记准档位**（见那里的说明）
+/// —— 记错档会让每块白付一次降级重装。
+pub(crate) fn raw_level(fp: f32) -> Level {
   for &(level, thr) in LADDER {
     if fp >= thr {
       return level;
@@ -201,20 +204,30 @@ impl Residency {
     }
   }
 
-  /// **还在用**的常驻 chunk，按最近使用降序（`frame - last_use <= keep`）：需求集只取这一批。
+  /// **还在用**的常驻 chunk 里最近使用的 `n` 个。`n` 取不到（≥ 候选数）时**顺序未定义**。
   ///
   /// WHY 不能拿"CPU 里全量 chunk"当需求：那等于"常驻 = CPU 里恰好有的东西"，预算一开就变成
   /// **换出 → 下一帧又被想要 → 又装回来**的抖振（每帧 `max_install_per_frame` 全烧在装卸同一批上）。
   /// 论文里需求**由渲染结果给**（`note_use` ← 用途戳），调用方再按池容量截断 ⇒ 常驻收敛成一个稳定的
   /// 滚动窗口（新看到的进来、最久没看到的被换出），而不是"永远在补差集"。
-  pub fn recent_desc(&self, keep: u64) -> Vec<(ChunkCoord, u64)> {
+  ///
+  /// WHY 只选不排：常驻 1–2 万块时全排序是 O(n log n) 的每帧白账（`docs/editable-gigavoxel.md`
+  /// §10.4）。截断只需"前 `n` 名"⇒ `select_nth_unstable` 就够；`n ≥ 候选数` 时连选都不用
+  /// （消费端只拿它求档位，`plan` 自己会按距离重排）。
+  pub fn recent_top(&self, keep: u64, n: usize) -> Vec<(ChunkCoord, u64)> {
     let mut v: Vec<(ChunkCoord, u64)> = self
       .entries
       .iter()
       .filter(|(_, e)| self.frame.saturating_sub(e.last_use) <= keep)
       .map(|(c, e)| (*c, e.last_use))
       .collect();
-    v.sort_unstable_by_key(|(c, t)| (std::cmp::Reverse(*t), c.0.x, c.0.y, c.0.z));
+    if n >= v.len() {
+      return v;
+    }
+    let key = |(c, t): &(ChunkCoord, u64)| (std::cmp::Reverse(*t), c.0.x, c.0.y, c.0.z);
+    v.select_nth_unstable_by(n, |a, b| key(a).cmp(&key(b)));
+    v.truncate(n);
+    v.sort_unstable_by_key(key);
     v
   }
 

@@ -16,17 +16,22 @@
 //! | `Coarse` | 整块（16） | 1 |
 //! | `Wide` / `Chunk` | `4³` / 整 section 个方块 | 1 / 每 64 个方块 |
 //!
-//! **远场级（`vol ≥ 1`）**走 [`super::summary`] 的摘要金字塔：远场 chunk 的坐标是它自己的级体素空间
+//! **远场级（`vol ≥ 1`）**默认走 [`super::summary`] 的摘要金字塔：远场 chunk 的坐标是它自己的级体素空间
 //! （级体素 = `FAR_SCALES[vol-1]` 个世界体素），一个 chunk = `16·scale` 个方块每轴 ⇒ 每格 `scale³` 方块
 //! 取一个摘要色、按 `FAR_GRAIN` 级体素填格（见该模块的采样口径）。
+//! **装了 [`super::lod`]（离线粗粒度世界）之后**，`scale ≥ 16` 的格改从那份文件内存采样（同一条填充
+//! 口径，见 [`McCITY::far_tree`]）——那才是"看得远"的正路（列读是这条路的成本大头）。
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use gate_voxel::{ChunkCoord, ChunkSource, ChunkTree, Detail, PaletteEntry, PaletteId};
 use glam::IVec3;
 
 use super::assets::Assets;
+use super::lod;
 use super::material::Pool;
 use super::summary::{self, Summary};
 use super::voxel::{self, BlockPlan, Fill};
@@ -35,6 +40,13 @@ use crate::infinite_cubes::{FAR_GRAIN, FAR_SCALES};
 
 /// 一个 MC chunk-section 的方块边长（= 我们一块的体素边长 / 16）
 const SEC: i32 = 16;
+
+/// 远场级的**格**有多少方块（每轴）：`FAR_GRAIN` 级体素 × `scale`（1 级体素 = 几个世界体素）
+/// ÷ [`super::VOXELS_PER_BLOCK`]。单元（chunk）恒 = `256` 级体素 ⇒ "单元有多粗"与"格有多大"
+/// 是两个独立的量（见 `mc_map.md` §8.9）。
+fn cell_blocks_of(scale: i32) -> i32 {
+  FAR_GRAIN * scale / super::VOXELS_PER_BLOCK
+}
 
 /// 生产源（worker 线程共享 `&self`）
 pub struct McCity {
@@ -45,6 +57,9 @@ pub struct McCity {
   plans: Mutex<HashMap<String, Option<Arc<BlockPlan>>>>,
   /// 远场级的摘要金字塔（按 section 缓存，见 [`super::summary`]）
   summary: Summary,
+  /// **离线粗粒度世界**（[`super::lod`]）：远场 `scale ≥ 16` 改走它（内存查表）。构建任务跑在裸线程上、
+  /// 完成后热装新的一份 ⇒ 共享句柄（而不是普通字段）。
+  lod: lod::Cell,
   /// 已产出的 section 数（诊断）
   produced: Mutex<usize>,
 }
@@ -57,6 +72,7 @@ impl McCity {
       pool,
       plans: Mutex::new(HashMap::new()),
       summary: Summary::new(),
+      lod: Arc::new(std::sync::RwLock::new(None)),
       produced: Mutex::new(0),
     }
   }
@@ -83,25 +99,77 @@ impl McCity {
     self.world.reads()
   }
 
-  /// **远场级产出**（`docs/mc_map.md` §8.2）：一个远场 chunk = `16·scale` 个方块每轴，逐格取摘要色。
+  /// **远场级产出**（`docs/mc_map.md` §8.2）：一个远场 chunk = `256` 级体素每轴，逐格取摘要色。
   ///
-  /// 格的**级体素**原点 = `k · FAR_GRAIN`、块的方块原点 = `origin + k · scale` —— 与
-  /// `infinite_cubes::build_region_far` 的"格中心采样"是同一套坐标（`scale` 级体素 = 一个格）。
+  /// 格的**级体素**原点 = `k · FAR_GRAIN`、块的方块原点 = `origin + k · cell_blocks` —— 与
+  /// `infinite_cubes::build_region_far` 的"格中心采样"是同一套坐标。
   fn produce_far(&self, coord: ChunkCoord, scale: i32) -> Option<ChunkTree> {
-    let blocks = 16 * scale; // 远场 chunk = 256 级体素 = 16·scale 方块（每轴）
-    let origin = coord.0 * blocks;
+    // **离线粗粒度世界**（[`super::lod`]）：格的边长在文件里有对应档（`4` 方块 = 一节里的 `4³` 细格、
+    // `≥16` 方块 = 整数个节）⇒ 直接内存采样。一条 L2 块因此从"读 256 个 chunk 列（实测 295 ms）"降到
+    // "4096 次查表（≈1 ms）"；L1（4 方块格）靠文件里的细格同样走它，不再按需读 Anvil。
+    let cell_blocks = cell_blocks_of(scale);
+    if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
+      return self.far_tree(coord, cell_blocks, |cell| view.cell(cell, cell_blocks));
+    }
+    let summary = &self.summary;
+    self.far_tree(coord, cell_blocks, |cell| summary.cell(self, cell, cell_blocks))
+  }
+
+  /// 远场一块 = 逐格取样、每格填一块 `FAR_GRAIN³` 等值砖（[`super::summary`] 与 [`super::lod`] 共用
+  /// 这条填充口径，差别只在"这一格取什么色"）。
+  fn far_tree(
+    &self,
+    coord: ChunkCoord,
+    cell_blocks: i32,
+    cell: impl Fn(IVec3) -> Option<PaletteId>,
+  ) -> Option<ChunkTree> {
+    // 每轴格数由**格**的级体素边长推出（`FAR_GRAIN` 变 ⇒ 格变 ⇒ 块变，三者始终铺满一个 chunk）
+    let cells = gate_voxel::CHUNK_SIZE / FAR_GRAIN;
+    let origin = coord.0 * cells * cell_blocks;
     let mut tree = ChunkTree::empty();
-    for kz in 0..16 {
-      for ky in 0..16 {
-        for kx in 0..16 {
-          let cell = origin + IVec3::new(kx, ky, kz) * scale;
-          if let Some(id) = self.summary.cell(self, cell, scale) {
+    for kz in 0..cells {
+      for ky in 0..cells {
+        for kx in 0..cells {
+          if let Some(id) = cell(origin + IVec3::new(kx, ky, kz) * cell_blocks) {
             tree.fill_brick([kx * FAR_GRAIN, ky * FAR_GRAIN, kz * FAR_GRAIN], FAR_GRAIN, id);
           }
         }
       }
     }
     (!tree.is_empty()).then_some(tree)
+  }
+
+  /// 已装载的离线粗粒度世界（`None` = 没建 / 过期 ⇒ 远场按需读 Anvil）
+  pub fn lod(&self) -> Option<Arc<lod::View>> {
+    self.lod.read().unwrap_or_else(|e| e.into_inner()).clone()
+  }
+
+  /// 装载一份 LOD 文件并**热装**（构建完成时也走它）。名字 → 代表色的解析在这里做：文件里存的是
+  /// 方块状态键，色要按**本次运行**的调色板认领（见 [`super::lod`] 的模块头）。
+  pub fn install_lod(&self, f: lod::File) {
+    let view = lod::View::new(f, |key| self.plan_for(&BlockState::from_key(key)).map(|p| p.rep));
+    bevy::log::info!(
+      "LOD 装载：{} 列 {} 节、{} KB、名字 {} 个（{} 个没认领到槽 ⇒ 那些节算空）；远场 scale ≥ {} 改走它",
+      view.cols(),
+      view.sections(),
+      view.heap_bytes() / 1024,
+      view.names(),
+      view.missing(),
+      lod::CELL,
+    );
+    *self.lod.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(view));
+  }
+
+  /// **构建 LOD 缓存**：算完整张图 → 写盘 → 热装。跑在 DebugMenu 起的后台线程上（`cancel` 中止）。
+  pub fn build_lod(
+    &self,
+    path: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(usize, usize) + Sync,
+  ) -> Result<lod::BuildStats, String> {
+    let (stats, f) = lod::build(&self.world, path, cancel, progress)?;
+    self.install_lod(f);
+    Ok(stats)
   }
 }
 
@@ -132,6 +200,15 @@ impl summary::SectionReps for McCity {
 }
 
 impl ChunkSource for McCity {
+  /// MC 世界的内容是**有界的**：`SECTIONS_PER_CHUNK` 个节、每节 16 方块 ⇒ 世界高
+  /// `16 × 16 方块 × VOXELS_PER_BLOCK` 世界体素（= 123 m），从 y = 0 起。
+  ///
+  /// 声明它是为了让远场预载的竖向**不再跟着相机**（见 [`ChunkSource::content_y_range`]）——
+  /// 飞到 123 m 之上时预载仍能枚举到地面。
+  fn content_y_range(&self) -> Option<(i32, i32)> {
+    Some((0, world::SECTIONS_PER_CHUNK * SEC * super::VOXELS_PER_BLOCK))
+  }
+
   fn produce(
     &self,
     vol: usize,
@@ -213,6 +290,12 @@ impl ChunkSource for McCity {
 
   fn palette_log(&self, from: usize) -> Vec<(PaletteId, PaletteEntry)> {
     self.palette_from(from)
+  }
+
+  /// 暴露自身：DebugMenu 的「构建 LOD 缓存」要拿到 `Arc<McCity>` 才能在后台线程里建好并热装
+  fn clone_as_any(self: Arc<Self>) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    let any: Arc<dyn std::any::Any + Send + Sync> = self;
+    Some(any)
   }
 }
 

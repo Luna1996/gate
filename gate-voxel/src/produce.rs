@@ -67,6 +67,18 @@ pub trait ChunkSource: Send + Sync + 'static {
     scratch: &mut VolumeGrid,
   ) -> Option<ChunkTree>;
 
+  /// **远场级的竖向内容范围**（世界体素，`[y_lo, y_hi)`）；`None` = 竖向无限。
+  ///
+  /// WHY 需要它：远场预载的竖向枚举原先以**相机**为中心，而世界的内容是有界的 —— 飞到内容之上
+  /// （MC 世界高 256 方块 ≈ 123 m）预载就够不到地面，只剩远场 1/64 采样的请求补 ⇒ "升空后加载不完全"。
+  /// 声明了这个范围之后，远场窗口的**竖向中点**钉在内容带上，与相机高度无关（见
+  /// `gate_app::infinite_cubes::stream_chunks` ⓪）。
+  ///
+  /// 程序化世界（竖向真的无限）保持默认 `None`：那一侧"相机为中心"才是对的。
+  fn content_y_range(&self) -> Option<(i32, i32)> {
+    None
+  }
+
   /// **调色板日志**：源在 worker 线程上认领的槽位（`[from..]` 段），主线程负责装进各 volume 的
   /// 调色板（`VolumeGrid::palette_mut`）。默认空 —— 槽号是固定方案的源（如程序化场景）不需要它。
   ///
@@ -78,6 +90,16 @@ pub trait ChunkSource: Send + Sync + 'static {
   fn palette_log(&self, from: usize) -> Vec<(crate::palette::PaletteId, crate::palette::PaletteEntry)> {
     let _ = from;
     Vec::new()
+  }
+
+  /// 具体类型（`None` = 不暴露该源自己的类型）。
+  ///
+  /// 给"运行期要拿到这个源本身做别的事"的调用方 —— 现在只有一条：DebugMenu 的「构建 LOD 缓存」
+  /// 要把算好的粗粒度世界**热装**进 `gate_app::mc::source::McCity`（见 `gate_app::mc::lod`）。
+  ///
+  /// WHY 收 `Arc<Self>` 而不是 `&self`：调用方要的是一个**能跨线程持有的** `Arc`（构建跑在裸线程上）。
+  fn clone_as_any(self: Arc<Self>) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    None
   }
 }
 

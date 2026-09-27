@@ -140,6 +140,11 @@ impl Default for ReflectionSettings {
 pub struct BaseSettings {
   pub shadow: bool,
   pub implicit_normal: bool,
+  /// **诊断：按卷给主射线命中上色**（0 = 关、1 = 开）。
+  ///
+  /// 主世界=绿、L1=红、L2=蓝、L3=黄 —— 一眼看出画面上某一块（尤其是"骨架楼"那一圈）属于哪一级，
+  /// 以及空洞处到底是哪一级没内容。只改 `main.wesl` 的输出色，不动求交与几何。
+  pub vol_tint: bool,
 }
 
 impl BaseSettings {
@@ -147,18 +152,21 @@ impl BaseSettings {
   pub const FLAG_SHADOW: u32 = 1 << 0;
   /// 位 1：隐式法相（`bindings.wesl::BASE_FLAG_IMPLICIT_NORMAL`）。
   pub const FLAG_IMPLICIT_NORMAL: u32 = 1 << 1;
+  /// 位 2：**诊断**按卷着色（`bindings.wesl::BASE_FLAG_VOL_TINT`）。
+  pub const FLAG_VOL_TINT: u32 = 1 << 2;
 
   /// 打包成 uniform `LightGlobals::base_flags`（置位 = 算）。
   pub fn flags(&self) -> u32 {
     (if self.shadow { Self::FLAG_SHADOW } else { 0 })
       | (if self.implicit_normal { Self::FLAG_IMPLICIT_NORMAL } else { 0 })
+      | (if self.vol_tint { Self::FLAG_VOL_TINT } else { 0 })
   }
 }
 
 impl Default for BaseSettings {
-  /// 全开 = 与引入这些开关前**逐位相同**。
+  /// 全开 = 与引入这些开关前**逐位相同**（诊断位默认关）。
   fn default() -> Self {
-    Self { shadow: true, implicit_normal: true }
+    Self { shadow: true, implicit_normal: true, vol_tint: false }
   }
 }
 

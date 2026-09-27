@@ -1,4 +1,4 @@
-import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_of, face_slot_of_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
@@ -7,7 +7,7 @@ import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::trace::{make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
-import package::world::{WorldHit, camera_solid_pal, face_normal_world, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium};
+import package::world::{WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
 
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
 // 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`brickmap::raytrace`、`wire.rs::encode_slot` 一致。
@@ -202,7 +202,9 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     var seg = vec3<f32>(1.0);
     var best: WorldHit;
     if (in_medium) {
-      best = world_trace_medium(make_grid(0u), org, dir, max_t, true, &seg);
+      // 介质段走**场景**查询（近场起点 ≡ 原来的单卷主世界路径；远场起点落在哪一级就查那一级）——
+      // 远场玻璃的出射面在远场级里，单卷主世界查不到（见 `world_trace_medium_scene`）。
+      best = world_trace_medium_scene(org, dir, max_t, true, &seg);
     } else {
       best = world_raycast(make_grid(0u), org, dir, max_t, world_cfg_primary(t_start, 3u));
     }
@@ -384,13 +386,13 @@ fn refl_seed(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> u32 {
 /// 光源项从 uniform 自取（与 `shade_face` 的调用方传进来的那三份**逐字同源**：同一个
 /// `light_u.lights[0]` / `sky_color`）⇒ 两边不会因为"谁传了什么"而分叉。
 fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m: MaterialParams,
-                  frustum_length: f32) -> vec3<f32> {
+                  frustum_length: f32, n_off: f32) -> vec3<f32> {
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
   let sky = light_u.sky_color.xyz;
-  // 起点 = 与阴影射线**同一个构造**（命中体素中心沿 n 推 `0.5/|n| + eps` ⇒ 恰在表面外侧），
-  // 口径一致、不另立第二套外推。它同时是下面那次着色里"本条射线的起点"。
-  let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
+  // 起点 = 与阴影射线**同一个构造**（命中体素中心沿 n 推 `world::surface_offset` ⇒ 恰在表面外侧），
+  // 口径一致、不另立第二套外推 —— `n_off` 由调用方（`shade_face`）算好传入，两份公式只留一份。
+  // 它同时是下面那次着色里"本条射线的起点"。
   // 镜面方向由**逐面**视向量 `v` 给出（`reflect` 要入射方向 ⇒ 传 `-v`）⇒ 一个体素面一条方向、
   // 一个反射值 = "反射逐体素"。代价：反射是**块状镜面**（按面采样），不再是逐像素的清晰镜面 ——
   // 本档的预期，见 `common.wesl::face_view_dir` 里"已知代价"那一段与两次实测的历史。
@@ -430,8 +432,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
     // 同一个结构）；每级独立起算，不跨级复用。
     // 已知简化：玻璃**表面自身**的界面反射与 in-scatter 不进镜像（这一级只取"透过它看到的东西"）。
     var r_tint = vec3<f32>(1.0);
-    let h = world_trace_medium(make_grid(0u), chain_org, chain_dir,
-                               frustum_length, false, &r_tint);
+    let h = world_trace_medium_scene(chain_org, chain_dir, frustum_length, false, &r_tint);
     if (!h.hit) {
       // 逃逸到天空 ⇒ 反射内容就是天空，链条结束。**档 ≥2** 走 `sky_primary`（方向性天空 +
       // 太阳盘/光晕：镜子里看得见太阳，与主 pass 的 miss 同一个口径）；**档 1** 走 `sky_rgb()`
@@ -537,7 +538,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let fg = make_grid(u32(first.obj_id) + 1u);
     let fp = voxel_center_world(fg, first.voxel);
     let fnn = voxel_normal(fg, first.voxel, first.face_id, first.n);
-    let f_off = 0.5 / max(max(abs(fnn.x), abs(fnn.y)), max(abs(fnn.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
     // 玻璃**界面点**：光路起点与 in-scatter 的阴影射线起点共用它，不另立第二套外推。
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
@@ -648,8 +649,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // 为什么按面、代价是什么、历史两次实测结论：见 `common.wesl::face_view_dir`（**改这里前必读**）。
     // 它只喂反光/高光三项（GGX 高光、`mirror`、反射权重）—— 本工程没有别的地方读 `v`。
     let v = face_view_dir(origin_voxel, p_voxel);
-    // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS，使起点离开命中体素。
-    let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    // 沿 n 外推半个体素 + SHADOW_SURFACE_EPS，使起点离开命中体素（半个体素按该 grid 的体素算）。
+    let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = 0.0;
     if (ndl > 0.0) {
@@ -739,7 +740,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         // 反射内容（含 MT4-5 的嵌套链）由 `refl_env_chain` 算，种子由 `refl_seed` 按面给出。
         let refl_env = refl_env_chain(p_voxel, n, v,
                                       refl_seed(best.voxel, best.face_id, best.obj_id),
-                                      m, frustum_length);
+                                      m, frustum_length, n_off);
         // 权重 = Schlick Fresnel（同一个 `fresnel_schlick`：完美镜面下 h ≈ n ⇒ 余弦取 `v·n`）
         //        × 粗糙度淡出（`roughness → PBR_REFL_MAX_ROUGH` 时权重**连续**归零 ⇒ 粗糙度扫描下
         //        总亮度单调、阈值处不出现亮度台阶；这也是 MT4-3 的能量自检要看的量）。
@@ -872,6 +873,12 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 而它的内容是低频的（模糊过）⇒ 双线性足够，且不需要给本 pipeline 拉一个采样器进来。
   // 关掉光柱时 Rust 在 group(6) 绑 1×1 零纹理 ⇒ 这一行恒 `+0`。
   col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
+  // ---- 诊断：按卷着色（`BASE_FLAG_VOL_TINT`）----
+  // 放在最后、覆盖 `col` 全部内容（含光柱）：诊断要的是"这一像素的几何来自哪一级"，
+  // 掺进光照/雾反而难分辨。`first` 是主命中，带 `palette_base`（无需给 `WorldHit` 加字段）。
+  if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) {
+    col = vol_tint_color(first);
+  }
   write_output(coord0, col);
 }
 

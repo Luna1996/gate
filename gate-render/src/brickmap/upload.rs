@@ -1242,21 +1242,36 @@ const LEDGER_SWEEP_FRAMES: u64 = 240;
 const USE_KEEP_FRAMES: u64 = 600;
 /// 每个 chunk 在 GPU 上的**每块字节上界**（不是均值）—— 用来把"块数"折成 GPU 侧的字节预算。
 ///
-/// CONSTRAINT: 必须取**上界**。`pick_evicts` 只在"实际字节 > 预算"时换出；若按均值给预算，池会在
-/// **块数上限之前**就被字节预算顶住，于是每帧换出 1–4 块、`install` 恒为 0 —— 新挂上的块立刻被换掉，
-/// 视线内的缺口再也补不齐（实测：`RESID[resident 1897 622573KB install 0 evict 4]` 每帧重复）。
+/// CONSTRAINT: 这里取的是**粗档混合**的估计，不是单块上界 —— **只在
+/// `infinite_cubes::plan_generation` 把**预载**档位封顶在 `Detail::Coarse` 时才成立**（那时绝大多数
+/// 块是 1–3 KB 的粗档，全分辨率只出现在射线细化过的几百块上 ⇒ 实际字节远低于这个估计）。若哪天预载
+/// 又去要 `Full`/`Wide`（278 KB–1 MB/块），必须回到**上界**口径（384 KB）：否则池会在块数上限之前就被
+/// 字节预算顶住，每帧换出 1–4 块、`install` 恒为 0 —— 新挂上的块立刻被换掉，缺口再也补不齐
+/// （实测：`RESID[resident 1897 622573KB install 0 evict 4]` 每帧重复）。
 ///
-/// 实测（同一条 `RESID` 行的 `bytes / resident`）：全分辨率为主的混合下 **367 KB/chunk**
-/// （`349851KB / 952`），逼近块数上限时 **328 KB/chunk**（`622573KB / 1897`）。取 `384 KB` 留 5% 余量。
-const GPU_CHUNK_BYTES_EST: usize = 384 * 1024;
-/// 每个 chunk 在 **CPU**（`VolumeGrid` 里的树）的典型字节数 —— **池容量的真正约束**。
+/// REF: 本值 = **64 KB**（⇒ 4 GB 预算下池 65536），与 [`CPU_CHUNK_BYTES_EST`] 同值。曾因"池块数 ×
+/// 每块字数"的一次顶到位预分配（池 87381 ⇒ 单次 44.5 GB 分配失败）而不敢调小 —— 那条已在
+/// `grow_region` 改成**有界倍增**后解除：瞬时占用 ≤ 2× 实际用量。实测池 65536、常驻 18094 块、
+/// 835 MB（`mc_map.md` §8.16.1）。
 ///
-/// 实测（`gate-app` 的 `mem_per_chunk` 直读 `ChunkTree::heap_bytes`，`infinite_cubes` 全分辨率）：
-/// **0.54 MB/chunk**（节点 25,336 × 16 B + 子块池 + 池块档位余量），仍比 GPU 侧的 0.30 MB 大近一倍
-/// —— GPU 侧只存 wire（3 字/节点），CPU 侧还要存"可编辑的树"。
+/// REF: 与 [`CPU_CHUNK_BYTES_EST`] 取**同值**：两边块数必须一致，否则 CPU 会留住 GPU 装不下的块。
+const GPU_CHUNK_BYTES_EST: usize = 64 * 1024;
+/// 每个 chunk 在 **CPU**（`VolumeGrid` 里的树）的**混合**字节数 —— **池容量的真正约束**。
 ///
-/// 取 **1 MiB** 作预算折算：留一倍余量给"被编辑过、出现叶块值表"的 chunk（每个 4³ 值块 128 B）。
-const CPU_CHUNK_BYTES_EST: usize = 1024 * 1024;
+/// REF: 实测（MC 地图，`RESID[resident 2040 146392KB]`）⇒ **71 KB/块**（近处全分辨率 + 远处粗档）。
+/// `mem_per_chunk` 直读全分辨率块是 **0.54 MB**（节点 25.3K×16 B + 子块池），被编辑过还要加叶块
+/// 值表 ⇒ 单个的上界约 1 MB，但**只有 ≤ 1 px 判据内（~75 m）的块才是全分辨率**
+/// （`infinite_cubes::detail_at`）⇒ 混合值远低于上界。
+///
+/// WARNING: 别退回"按单块上界"（1 MiB）：那会把池算成 `预算/1MiB`（= 2048 块），比实际能装的小
+/// **14×** ⇒ 主世界的预载盘被截断（`chunks == cap` 且 `ready` 常年非空），画面里那一圈永远是洞。
+/// 取 **384 KB**（与 [`GPU_CHUNK_BYTES_EST`] 同值）：两边**块数必须一致** —— CPU 若比 GPU 能装得更多，
+/// 多出来的那些块会被 GPU 侧按字节预算换出、下一帧又被 CPU 侧装回来（`install`/`evict` 抖振）。
+/// 与 GPU 侧同一条依赖：**只在预载档位封顶在 `Detail::Coarse` 时安全**（见 `GPU_CHUNK_BYTES_EST`）。
+///
+/// REF: 本值 = **64 KB**，与 [`GPU_CHUNK_BYTES_EST`] 同值（两边块数必须一致）。曾经的一次顶到位
+/// 预分配风险已在 `grow_region` 的有界倍增后解除，见 [`GPU_CHUNK_BYTES_EST`] 的 REF。
+const CPU_CHUNK_BYTES_EST: usize = 64 * 1024;
 /// 池容量下限（chunk）：预算给得再小也至少留这么多格，否则"相机脚下那一圈"都装不下 ⇒ 画面空洞。
 const MIN_POOL_CHUNKS: usize = 64;
 
@@ -1282,13 +1297,16 @@ const MIN_POOL_CHUNKS_FAR: usize = 512;
 /// 主世界**之前** ⇒ 主世界的 `tree_base` 漂移 ⇒ `bases_shifted` 降级全量重传（实测 580 MB /
 /// 100–200 ms/帧 ⇒ 帧率掉到个位数）。两者必须一起改。
 pub fn pool_capacity_chunks_far(budget_bytes: usize) -> usize {
-  // 预算 = 0（不限）时**仍受预留区上限**：远场能装多少由"预留区放得下几块"物理决定（见上）。
+  // 上限 = **常驻目标**而不是预留区大小：预留区要留出余量，否则撑破一次就降级全量快照
+  // （见 `brickmap::consts::FAR_RESIDENT_TARGET` 的实测）。
+  let target = crate::brickmap::consts::FAR_RESIDENT_TARGET;
+  // 预算 = 0（不限）时**仍受**常驻目标：远场能装多少由"预留区放得下几块"物理决定（见上）。
   if budget_bytes == 0 {
-    crate::brickmap::consts::FAR_POOL_CHUNKS
+    target
   } else {
     (budget_bytes / 4 / CPU_FAR_CHUNK_BYTES_EST)
       .max(MIN_POOL_CHUNKS_FAR)
-      .min(crate::brickmap::consts::FAR_POOL_CHUNKS)
+      .min(target)
   }
 }
 
@@ -1323,6 +1341,47 @@ fn gpu_pool_bytes(cap_chunks: usize) -> usize {
   }
 }
 
+/// ① 的单块记账：CPU 侧有内容的 `c` ↔ builder 里有没有块（见 [`plan_residency`] 的 ①）。
+fn ledger_note(
+  builder: &VolumesBuilder,
+  residency: &mut Residency,
+  c: gate_voxel::ChunkCoord,
+  cam_now: glam::Vec3,
+  streamed: bool,
+  px: f32,
+  frame: u64,
+) {
+  match builder.resident_bytes_of(0, c) {
+    Some(bytes) => {
+      if residency.resident_level(c).is_some() {
+        residency.note_bytes(c, bytes);
+      } else {
+        // 首次见到：**流式世界**记距离阶梯给出的档位，不是 `BRICK_FACTOR`。
+        //
+        // WHY：流式世界的 CPU 侧生产已经在按档位阶梯量化（`infinite_cubes::detail_at`），
+        // 而它与这里的 [`want_level`] 是**同一把尺**（阈值逐档对齐：14.6 chunk ↔ 74.8 m、
+        // 58 ↔ 299 m、234 ↔ 1196 m）⇒ 记成阶梯值就等于"这块刚装上时已经是它该有的档"，
+        // ④ 不会再为它发一条 install。
+        //
+        // 记 `BRICK_FACTOR` 的话，**每块**新挂载的 chunk 都会先被记成全分辨率、再被 ④ 降级重装
+        // 一遍（`builder.evict` + `ensure_resident_tree` ≈ 1.65 ms）。实测 40 s 内 6952 次这种
+        // 空转降级 ⇒ 每帧白烧约 11 ms（帧率 60 → 36）。
+        //
+        // CONSTRAINT: **静态世界（没有流式窗口）不能这么记**。那种世界的初始安装是全分辨率的
+        // 一次性全量上传，档位阶梯是它唯一的省显存手段 ⇒ 记准档会把它废掉。
+        let lv = if streamed {
+          let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
+          crate::brickmap::residency::raw_level((center - cam_now).length() * px)
+        } else {
+          gate_voxel::BRICK_FACTOR
+        };
+        residency.note_resident(c, bytes, lv, frame);
+      }
+    }
+    None => residency.note_gone(c),
+  }
+}
+
 /// **M3 常驻调度**（`ExtractSchedule`，排在 `extract` 之后；见 `docs/editable-gigavoxel.md` §9 M3a-1）。
 ///
 /// 为什么不并进 `extract`：① `extract` 在"本帧无脏改动"时提前返回，而常驻决策必须每帧跑；
@@ -1337,7 +1396,7 @@ fn gpu_pool_bytes(cap_chunks: usize) -> usize {
 /// 下一帧又要装回来（抖振）。
 ///
 /// 档位阶梯是保守的（`fp ≥ 块边长` 才允许粗化 ⇒ 16³ 档在 720p 要 2.5 km 外）⇒ **当前场景（≤1 km）
-/// 永远是全分辨率**，本系统每帧只花 O(chunk 数) 的记账，不产生任何上传。
+/// 永远是全分辨率**，本系统每帧只花 O(本帧挂载 / 卸载块数) 的记账，不产生任何上传。
 fn plan_residency(
   scene: Option<Extract<Res<VoxelScene>>>,
   cam: Option<Extract<Res<crate::brickmap::dda::DdaCameraConfig>>>,
@@ -1346,12 +1405,12 @@ fn plan_residency(
   mut mirror: ResMut<BuilderMirror>,
   mut state: ResMut<ResidencyState>,
   mut gap_last: Local<usize>,
-  // ①/⑥/⑤ 的"账目可能变了"闸门（见 ① 的说明）：常驻集变更序号、上一帧有没有 install/evict、
-  // 远场各自的序号
+  // ① 的"账目可能变了"闸门：常驻集变更序号 + 变更日志游标 / 代数 / 首次标记（见 ① 的说明）
   mut ledger_seq: Local<u64>,
-  mut ledger_busy: Local<bool>,
+  mut ledger_ready: Local<bool>,
+  mut ledger_epoch: Local<u64>,
+  mut ledger_cursor: Local<usize>,
   mut far_seq: Local<Vec<u64>>,
-  mut sync_seq: Local<u64>,
   // ①' 的"已知空块"游标（`VolumeGrid::empty_log`），逐卷一个
   mut empty_cursor: Local<Vec<usize>>,
   // 诊断：本系统的耗时（每 60 帧一行，见函数尾）
@@ -1365,33 +1424,50 @@ fn plan_residency(
   state.residency.tick(frame);
   let px = crate::brickmap::dda::px_ang(crate::consts::VIEW_SIZE.y as f32);
 
-  // ① 账目同步：CPU 有内容的 chunk ↔ builder 里有没有块。首次见到的按**全分辨率**记
+  // ① 账目同步：CPU 有内容的 chunk ↔ builder 里有没有块。首次见到的按**档位阶梯**记
   //    （建场景走全量安装；proxy 档位只由本系统自己写）。
   //
-  // **闸门**（M8）：这趟是 O(CPU 常驻块数) —— 常驻 1–2 万块时 3–5 ms/帧（§10.4 第 1 条），而绝大多数
-  // 帧里账目一个字都没变（相机静置、或只是移动了几帧没触发装载）。只在"可能变了"时重算：
-  // **常驻集变更序号**变了（挂载 / 卸载 —— 用序号而不是块数：同帧"进一块、出一块"块数不变但集合变了）
-  // / 本帧有编辑 / 上一帧做过 install-evict（字节数变了要更新）/ 每 [`LEDGER_SWEEP_FRAMES`] 帧的兜底。
+  // **增量**（M8）：这趟原先是遍历 `grid.chunk_coords()` —— O(CPU 常驻块数)，常驻 1–2 万块时
+  // 3–5 ms/帧（§10.4 第 1 条），而绝大多数帧里只有几块变了。改为消费 `VolumeGrid` 的**常驻集变更
+  // 日志**（挂载 / 卸载各一条，与 `resident_seq` 同一批事件）：日志尾部长度对上序号增量就只处理
+  // 那几条，否则退回一次全量扫描。退回的场合：首次、日志被容量上限清空（代数变了）、尾部与序号
+  // 增量对不上（世界被换掉 / 日志与序号脱节）、每 [`LEDGER_SWEEP_FRAMES`] 帧的兜底。
+  //
+  // 卸载那几条同时是 ⑤ 的输入（CPU 没了 ⇒ 归还 GPU 块），所以这里就地把块还给 `builder`。
+  //
+  // CONSTRAINT：日志与 `resident_seq` 必须**逐条成对**（`mount_chunk_tree` / `unmount_chunk` /
+  // `take_chunk` 三处）。谁再动 `chunks` 而不同步这两样，就要么漏账（这里看不见），要么让下面
+  // 的计数对不上 ⇒ 每帧退回全量扫描。
+  let streamed = grid.stream_window().is_some();
   let seq = grid.resident_seq();
-  let ledger_may_change = *ledger_seq != seq
-    || *ledger_busy
-    || !state.edited.is_empty()
-    || frame % LEDGER_SWEEP_FRAMES == 0;
-  if ledger_may_change {
-    for c in grid.chunk_coords().collect::<Vec<_>>() {
-      match builder.resident_bytes_of(0, c) {
-        Some(bytes) => {
-          if state.residency.resident_level(c).is_some() {
-            state.residency.note_bytes(c, bytes);
-          } else {
-            state.residency.note_resident(c, bytes, gate_voxel::BRICK_FACTOR, frame);
-          }
+  let epoch = grid.resident_log_epoch();
+  let changes = grid.resident_log_from(*ledger_cursor);
+  let mut evicted = 0usize;
+  let incremental = *ledger_ready
+    && *ledger_epoch == epoch
+    && changes.len() as u64 == seq.wrapping_sub(*ledger_seq)
+    && frame % LEDGER_SWEEP_FRAMES != 0;
+  let cam_now = cam.position_world;
+  if incremental {
+    for ch in changes {
+      if ch.mounted {
+        ledger_note(builder, &mut state.residency, ch.c, cam_now, streamed, px, frame);
+      } else {
+        state.residency.note_gone(ch.c);
+        if builder.evict(0, ch.c) {
+          evicted += 1;
         }
-        None => state.residency.note_gone(c),
       }
     }
-    *ledger_seq = seq;
+  } else {
+    for c in grid.chunk_coords().collect::<Vec<_>>() {
+      ledger_note(builder, &mut state.residency, c, cam_now, streamed, px, frame);
+    }
+    *ledger_epoch = epoch;
   }
+  *ledger_cursor = grid.resident_log_len();
+  *ledger_ready = true;
+  *ledger_seq = seq;
 
   // ①' **已知空块 → 索引哨兵**（`docs/mc_map.md` §8）：`VolumeGrid` 里那些"流式源产出过 `None`"的
   //     chunk，要在 GPU 索引里标成 [`crate::brickmap::consts::INDEX_ENTRY_EMPTY`] —— 否则 shader 把
@@ -1486,7 +1562,7 @@ fn plan_residency(
   let cam_pos = cam.position_world;
   let cam_chunk = (cam_pos / gate_voxel::CHUNK_SIZE as f32).floor().as_ivec3();
   let mut wants: Vec<(gate_voxel::ChunkCoord, Level)> = Vec::new();
-  for (c, _) in state.residency.recent_desc(USE_KEEP_FRAMES).into_iter().take(cap_chunks) {
+  for (c, _) in state.residency.recent_top(USE_KEEP_FRAMES, cap_chunks) {
     let Some(tree) = grid.chunk(c) else { continue };
     if tree.is_empty() {
       continue;
@@ -1495,10 +1571,31 @@ fn plan_residency(
       wants.push((c, lv));
       continue;
     }
+    let cur = state.residency.resident_level(c).unwrap_or(gate_voxel::BRICK_FACTOR);
+    // 流式世界 **已在最细档** ⇒ 下面的 `lv = min(want, cur)` 恒等于 `cur`（`plan` 又会把 `lv == cur`
+    // 的滤掉）⇒ 这一块永远不产生动作，连距离都不必算。
+    //
+    // WHY 值得单列：常驻 1–2 万块时这段逐块算距离 + 阶梯是每帧上千次的固定开销，而流式世界的近场
+    // （≤1 km）本来就在最细档 —— `cur == BRICK_FACTOR` 是稳态下的绝大多数（实测 4018/4018）。
+    if streamed && cur == gate_voxel::BRICK_FACTOR {
+      continue;
+    }
     let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
     let dist = (center - cam_pos).length();
-    let cur = state.residency.resident_level(c).unwrap_or(gate_voxel::BRICK_FACTOR);
-    wants.push((c, want_level(dist, px, cur)));
+    let lv = want_level(dist, px, cur);
+    // **流式世界只细化、不粗化**：`min(cur)` 把"粗化"这一半关掉。
+    //
+    // WHY：流式世界的粗化已经在 **CPU 侧生产时**做过一次（`infinite_cubes::detail_at` 按同一个距离
+    // 阶梯给 `Detail`，树本身就是那个粒度）。这里再按距离粗化一次是重复劳动，而且会与射线打架：
+    // 射线按**命中距离**报 `level`（近面比块心近）⇒ 它可以把一块 100 m 外的块要成全分辨率；那条
+    // 请求在块装上后就消失了（shader 只在 `entry == 0` 时请求），下一帧这里的距离阶梯又按**块心**
+    // 距离把它粗化回去 ⇒ 下一窗射线再把它要回来。实测升级 1666 / 降级 1574（40 s，成对出现），
+    // 每次 ~1.65 ms 的重序列化 + 重上传全白花（`install` 长期顶在 `max_install_per_frame`）。
+    //
+    // CONSTRAINT: 静态世界（没有流式窗口）不适用 —— 那种世界没有 CPU 侧预量化，档位阶梯是它唯一的
+    // 省显存手段。
+    let lv = if streamed { lv.min(cur) } else { lv };
+    wants.push((c, lv));
   }
   // 请求里那些**还没常驻**的：它没有用途戳（射线没进去过）⇒ 上面那个循环收不到它，单独补进来。
   for (c, _) in want_level_of.iter() {
@@ -1512,16 +1609,18 @@ fn plan_residency(
   }
 
   // ③ 钉住本帧被编辑的（编辑优先于流式），并把它们排除在换出之外。
+  //    顺带刷它们的驻留字节：内容变了 ⇒ `builder` 里那棵树的大小变了（① 那趟只看挂载 / 卸载，
+  //    看不见"同一块内容长大"；旧写法靠"有编辑就全量重算"覆盖这一点）。
   let edited = std::mem::take(&mut state.edited);
   let must_keep: std::collections::HashSet<gate_voxel::ChunkCoord> = edited.iter().copied().collect();
   let pin_frames = state.policy.pin_frames;
   for &c in &edited {
+    ledger_note(builder, &mut state.residency, c, cam_pos, streamed, px, frame);
     state.residency.note_edit(c, frame, pin_frames);
   }
 
   // ④ 落实
   let plan = state.residency.plan(&state.policy, cam_chunk, wants.into_iter(), &must_keep);
-  let mut evicted = 0usize;
   for c in plan.evict {
     if builder.evict(0, c) {
       state.residency.note_gone(c);
@@ -1529,7 +1628,22 @@ fn plan_residency(
     }
   }
   let mut installed = 0usize;
+  // 诊断：把 install 拆成 新增/升级/降级 —— `install` 长期顶在 `max_install_per_frame` 时，
+  // 只有这个拆分能区分"在补缺口"（新增）与"在空转重装"（同坐标的档位变化）。
+  let (mut t_new, mut t_up, mut t_down) = (0usize, 0usize, 0usize);
+  let mut t_sample: Vec<(gate_voxel::ChunkCoord, Option<Level>, Level)> = Vec::new();
   for (c, level) in plan.install {
+    {
+      let cur = state.residency.resident_level(c);
+      match cur {
+        None => t_new += 1,
+        Some(x) if level < x => t_up += 1,
+        Some(_) => t_down += 1,
+      }
+      if t_sample.len() < 3 {
+        t_sample.push((c, cur, level));
+      }
+    }
     let Some(tree) = grid.chunk(c) else { continue };
     let proxy;
     let tree = if level > gate_voxel::BRICK_FACTOR {
@@ -1548,10 +1662,10 @@ fn plan_residency(
   }
   // ⑤ 反向同步：builder 里还有块、但 CPU 侧已经没有这个 chunk（被真卸载 / 整块清空）⇒ 归还 GPU 块。
   //    流式世界的卸载就是走这条路：`VolumeGrid::unmount_chunk` 拿掉 CPU 树，这里跟着释放显存。
-  //    **闸门**（M8）：`resident_chunks` 是 O(builder 常驻块数) + 一次 Vec 分配；而 orphan 只在
-  //    "CPU 常驻集变了"时才可能出现（本系统自己的 install/evict 已同步记账）⇒ 序号没变就跳过。
-  if seq != *sync_seq || frame % LEDGER_SWEEP_FRAMES == 0 {
-    *sync_seq = seq;
+  //    **增量**（M8）：卸载的那几条已在 ① 里就地归还（那趟只处理本帧新增的变更）；这里只在
+  //    [`LEDGER_SWEEP_FRAMES`] 帧的兜底里做一次全量对照 —— `resident_chunks` 是 O(builder 常驻块数)
+  //    + 一次 Vec 分配，而 ledger 与日志脱节时 ① 已经会退回全量扫描并重记。
+  if frame % LEDGER_SWEEP_FRAMES == 0 {
     for c in builder.resident_chunks(0) {
       if grid.chunk(c).is_none() {
         builder.evict(0, c);
@@ -1607,11 +1721,14 @@ fn plan_residency(
   //    （静默跳过发生在 `install_chunk` 的窗口检查里，没有这条日志就查不出来）。
   //    安装积压（`max_install_per_frame` 截断）不算：那时 `installed > 0`，本段整段跳过。只报**数量
   //    变化**，免得常驻缺口每帧刷一行。
+  //
+  //    距离判据放前面：它是 O(1) 的算术，而 `is_resident` 是一次哈希探测 —— 反过来写就是每帧
+  //    常驻块数量级的哈希白账。
   if installed == 0 && evicted == 0 {
     let gaps: Vec<IVec3> = grid
       .chunk_coords()
       .filter(|c| {
-        !state.residency.is_resident(*c) && (c.0 - cam_chunk).abs().max_element() <= GAP_NEAR_CHUNKS
+        (c.0 - cam_chunk).abs().max_element() <= GAP_NEAR_CHUNKS && !state.residency.is_resident(*c)
       })
       .map(|c| c.0)
       .collect();
@@ -1625,9 +1742,9 @@ fn plan_residency(
       }
     }
   }
-  // ① 的闸门信号：本帧动过账目（装/换了块）⇒ 下一帧要重算字节（同一坐标的驻留字节会变）。
+  // 本帧动过账目（装 / 换了块）⇒ 那些坐标的驻留字节与档位都已在 ④⑤ 里就地更新（`note_resident` /
+  // `note_gone`）⇒ ① 下一帧不必再为此重算。
   let busy = installed + evicted + far_installed + far_evicted > 0;
-  *ledger_busy = busy;
   if !busy {
     return;
   }
@@ -1638,6 +1755,11 @@ fn plan_residency(
   // 而 builder 又认为那些块"已常驻"（没人再标脏）⇒ **缺块永远补不上**（表现为"加载停住"）。
   // 本函数的 evict / install 一样会标脏 ⇒ 由**下一帧的 `extract`** 连它那份改动一起上传
   // （`extract` 的提前返回条件已含 `VolumesBuilder::has_dirty`）。
+  debug!(
+    "INST[install {} 新增 {t_new} 升级 {t_up} 降级 {t_down}] 样本 {:?}",
+    installed,
+    t_sample.iter().map(|(c, cur, want)| (c.0.to_array(), *cur, *want)).collect::<Vec<_>>()
+  );
   debug!(
     "RESID[resident {} {}KB install {} evict {} | 远场 {}块/装 {} evict {}]",
     state.residency.resident_count(),

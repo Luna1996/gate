@@ -1,4 +1,4 @@
-//! Brick Tree wire 格式：常量、编码函数、全局参数；CPU 构建器与 GPU shader 之间的字节契约。
+﻿//! Brick Tree wire 格式：常量、编码函数、全局参数；CPU 构建器与 GPU shader 之间的字节契约。
 //! b_struct = Region ① 稠密 chunk 窗口 + Region ② 各 chunk 的**树块**（块首 = 根节点地址，
 //! 块内是节点 arena；节点地址 = 块首 + 块内偏移）；`PALETTE_BITS`=16 同宽约束两侧一致。
 //!
@@ -312,7 +312,14 @@ pub struct GridDesc {
   pub index_dims_x: u32,
   pub index_dims_y: u32,
   pub index_dims_z: u32,
-  pub _pad1: u32,
+  /// **该 grid 的覆盖半径**（世界体素，M8）= 它的内容真正铺到的半径，由 `VolumeGrid::coverage_r()`
+  /// 带过来。shader 拿它当**分壳裁剪的接力半径**（`world.wesl::trace_scene`）：下一级只从上一级的
+  /// 覆盖半径起参与求交。
+  ///
+  /// 与 `aabb_*` 的区别：AABB 是**窗口**的外包盒（索引区 / 请求区，主世界是 ±164 m）⇒ 拿它当接力点
+  /// 会在"窗口里有、内容里没有"的那一圈留洞；而且盒子随方向变（正面对 368 m、对角 521 m）⇒ 分界线
+  /// 在画面上是**方**的。半径 ⇒ 每一级是球壳、分界线是圆的。
+  pub coverage_r: f32,
 }
 
 /// [`GridDesc::grid_flags`] 的 bit0 = **该 grid 是远场级**（M8）。
@@ -339,7 +346,7 @@ impl GridDesc {
     index_dims_x: 0,
     index_dims_y: 0,
     index_dims_z: 0,
-    _pad1: 0,
+    coverage_r: 0.0,
   };
 
   /// 从 VolumeTransform + tree/palette 基址构造
@@ -373,7 +380,7 @@ impl GridDesc {
       index_dims_x: dims.x as u32,
       index_dims_y: dims.y as u32,
       index_dims_z: dims.z as u32,
-      _pad1: 0,
+      coverage_r: 0.0,
     }
   }
 }

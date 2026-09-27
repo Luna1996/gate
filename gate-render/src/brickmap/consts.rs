@@ -80,13 +80,40 @@ pub const LOD_REQ_WORDS: usize = 3 + USE_WORDS * VOLUMES + REQ_CAP;
 /// M8：表按 **volume** 分段（`[USE_BASE + vol*USE_WORDS, … + USE_WORDS)`）—— 远场级的 chunk 坐标
 /// 是它自己的级体素空间，与主世界**数值上会撞**，不分段就互相顶掉。
 pub const USE_WORDS: usize = 64 * 64 * 64;
+/// 远场级**实际常驻**的目标（块/级）：**必须低于** [`FAR_POOL_CHUNKS`] 留出余量。
+///
+/// WHY：树区是按 `FAR_POOL_CHUNKS × FAR_RESERVE_WORDS_PER_CHUNK` **预留成固定长度**的，而远场
+/// volume 排在主世界**之前** ⇒ 只要实际常驻顶满预留、块内余量（`install_blob` 的 25%）把它撑破一次，
+/// `b_struct` 就变长、主世界的 `tree_base` 跟着漂移 ⇒ 上传降级成**全量快照**（`UPLOAD[full]`）。
+/// 实测（`GATE_BENCH=orbit`）：常驻 ~1600 时 `UPLOAD[full]` 不出现、60 fps；被预载推到 **2076 > 2048**
+/// 后 40 s 内出现 **128 次**、中位 **26.3 ms**（最大 41.2）⇒ 而 `RENDER` 行显示渲染世界自身只要
+/// **3.2 ms**、其余 41 ms 全在等这个快照 ⇒ 帧率掉到 22。
+///
+/// 3/4 是"预留区放得下、又不撑破"的取值：预留仍按 2048 块算（16 MB/级、三级 48 MB），
+/// 常驻目标 1536 块。
+pub const FAR_RESIDENT_TARGET: usize = FAR_POOL_CHUNKS / 4 * 3;
+
 /// **远场级池容量**（块/级，M8）：CPU 侧 LRU 的容量，**同时**决定远场 volume 的树区预留区大小
 /// （见 [`FAR_RESERVE_WORDS_PER_CHUNK`]）。
 ///
-/// 实测（用户机 `logs/latest.log`）：远场每次只在视锥的"走廊方向"上装几块~几十块（v1/v2/v3 各 10/35/30），
-/// 取 2048 留了两个数量级的余量，而预留区仍是可接受的 16 MB/级（三级 48 MB）。
-/// 这个数**不必**随「请求内存」滑杆涨：远场的数量由"射线真看到多少"定，不由预算定。
-pub const FAR_POOL_CHUNKS: usize = 2048;
+/// CONSTRAINT: 这个数同时是**帧时间的预算** —— 一级常驻多少块 = 主射线要穿多少个有料的远场卷。
+/// 实测（`GATE_BENCH=orbit`，同一机位 80 s）：常驻 1677 块全程 60 fps；放到 2736 块时尾段掉到
+/// 27–53 fps。所以它不能跟着"产量"涨：**产出便宜（`gate_app::mc::lod` 之后一块 0.2 ms）不等于
+/// 该多装**，装多少由"画面撑不撑得住"定。真正的代价在**填充期**（挂载/上传成簇掉帧，见
+/// `FAR_INFLIGHT_MAX` 的 CONSTRAINT），不在稳态。
+///
+/// REF: 视距与它同源的量是 `FAR_RESIDENT_TARGET`（= 3/4 本值）当**每级的阶梯预算**用 ——
+/// 阶梯按 `Σ 8·层数·r ≤ 预算` 反算外圈 ⇒ 名义上**视距 ∝ √本值**。
+///
+/// WARNING: 但**内存 ∝ 本值²** —— 树区按 `本值 × 实测每块字数` 一次顶到位（`grow_region`），
+/// 而"实测每块字数"与阶梯预算无关 ⇒ 把本值翻倍，树区涨 4 倍。实测（`GATE_BENCH=orbit` 175 s）：
+/// 本值 **8192** 时 L1 的 1.28 m 档 369 → 512 m（**+39%**）、远场常驻 3175 → 4953 块，而
+/// `struct_buf` 从 **224 MB 涨到 800 MB**（CPU 与显存各一份）；L2/L3 的到达半径**没变**
+/// （rmax 26 / 7 —— 那两级的外圈由 `plan_generation_far` 的候选枚举上限与"已知空"的学习速度定，
+/// 不是由预算定）。⇒ 这个旋钮在当前机制下**性价比很差**：先修
+/// `plan_generation_far` 的枚举上限与树区口径（`region_chunks_of` 用实际目标而不是池块数），
+/// 再谈放池。判据与读数见 `docs/mc_map.md` §8.11。
+pub const FAR_POOL_CHUNKS: usize = 4096;
 /// 远场级树区**每块的上界字数**：实测远场 chunk 的 wire = 1219–1463 字（4.9–5.9 KB，见
 /// `far_detail_is_much_smaller_than_full`），加 `install_blob` 的 25% 余量与根预留 ⇒ 取
 /// **2048 字（8 KB）/块**。

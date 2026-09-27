@@ -130,7 +130,9 @@ struct GridDesc {
   index_dims_x: u32,      // chunk 窗口 dims（chunk 单位）
   index_dims_y: u32,
   index_dims_z: u32,
-  _pad1: u32,
+  /// **覆盖半径**（世界体素）：该 volume 的内容真正铺到的半径，分壳裁剪的接力半径。
+  /// 写侧 = Rust `wire::GridDesc::coverage_r`（来源 `VolumeGrid::coverage_r()`）。0 = 不参与接力。
+  coverage_r: f32,
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
 
@@ -173,6 +175,10 @@ struct LightPool {
 const BASE_FLAG_SHADOW: u32 = 1u;
 /// bit1 **隐式法相**：置位 ⇒ 算邻域梯度法线；清零 ⇒ 不算它，并且**原色直出**。
 const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
+/// bit2 **诊断：按卷着色**（`main.wesl` 主 pass 的输出色换成"命中来自哪个 volume"）。
+/// 主世界=绿、L1=红、L2=蓝、L3=黄 ⇒ 一眼看出某一块（尤其是"骨架楼"那一圈）属于哪一级。
+/// 只改输出色，不动求交 / 几何 / 光照。写侧 = Rust `BaseSettings::FLAG_VOL_TINT`。
+const BASE_FLAG_VOL_TINT: u32 = 4u;
 
 // ===== GI（屏幕空间逐面 ReSTIR）=====
 // uniform 与 Rust `GiUniform` 逐字段镜像（字节一致）。

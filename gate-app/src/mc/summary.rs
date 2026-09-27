@@ -7,13 +7,15 @@
 //! section，逐块读完整张图要几千万次 region 解压，不可行（`docs/mc_map.md` §8.2 的量化）。
 //!
 //! 这里的做法是**按级降采样**：每一级只读它需要的**一个** section 列，把该 section 的 4096 个方块
-//! 折成一个代表色，再用代表色填格。三级的采样口径（`FAR_GRAIN = 16` 级体素 = 一格的边长）：
+//! 折成一个代表色，再用代表色填格。**每一级都取"最上面那一层够实的子格"的色**（表面色，见
+//! [`voxel::rep_of_surface`]）—— 整格多数色会把"一层水面 / 草皮压厚基座"染成基座 ⇒ 与近场成片色差。
+//! 三级的采样口径（`FAR_GRAIN = 16` 级体素 = 一格的边长）：
 //!
 //! | 级 | `scale` | 一格（方块） | 采样 |
 //! |---|---|---|---|
-//! | L1 | 4 | 4 | 读所在 section，取格内 `4³` 方块的多数色 |
-//! | L2 | 16 | 16 | 格正好是一个 section ⇒ 取该 section 的多数色 |
-//! | L3 | 64 | 64 | 只读格**中心**那一个 chunk 列（1/16 的采样面），取该列在本格高度内的 section 多数色 |
+//! | L1 | 4 | 4 | 读所在 section，取格内 `4³` 方块**最上面那一层**的多数色 |
+//! | L2 | 16 | 16 | 格正好是一个 section ⇒ 取该 section 的代表色（= 它最上面那一层有料的`4³`格的多数色） |
+//! | L3 | 64 | 64 | 只读格**中心**那一个 chunk 列（1/16 的采样面），取该列在本格高度内**最上面那一节有料**的代表色 |
 //!
 //! **为什么 L3 敢只采中心**：远场的格边长是按"这一级在屏幕上 ≈ 0.46 px"选的（`infinite_cubes::FAR_GRAIN`）
 //! ⇒ 格内的一切都是亚像素的，"格中心有没有东西"就是"这一格显不显示"的全部信息。代价是 L3 会把
@@ -39,9 +41,15 @@ pub const SEC: i32 = 16;
 const FINE_PER_AXIS: i32 = 4;
 const FINE: usize = (FINE_PER_AXIS * FINE_PER_AXIS * FINE_PER_AXIS) as usize;
 
-/// "这一格算实体"的最小实体占比（千分比）。远场要的是**轮廓**：格内实体太少就不写，免得把街道、
-/// 空地也糊成实心；格内实体够多就整格填成多数色。
-const SOLID_MIN_PERMILLE: u32 = 125;
+/// "这一格算实体"的最小实体占比（千分比，`4³` 细格与整节两个口径共用）。远场要的是**轮廓**：格内实体
+/// 太少就不写，免得把街道、空地也糊成实心。`mc::lod` 的离线摘要用同一个门槛。
+///
+/// WHY 取 16‰ 而不是 125‰：`4³` 细格的分母是 64，125‰ ⇒ 一格要 ≥ 8 块才算实体。高楼/厂房这类**薄
+/// 结构**（一层楼板、一堵外墙）在 `4³` 格里恰好铺满一层 = 16 块 ⇒ 过门槛；但它们落在**竖直方向**
+/// 只有 1 层，整节占比 ≈ 4‰~62‰，任何按"整节占比"判空的口径都会把成栋楼整节丢掉 ⇒ 远场中空。
+/// 16‰ 下细格需 ≥ 2 块、整节需 ≥ 66 块，薄结构不再被删；代价是稀疏植被/装饰会更早显形 —— 与"不许
+/// 掉几何"的取舍一致。
+pub(crate) const SOLID_MIN_PERMILLE: u32 = 16;
 
 /// 摘要缓存的节数上限（一节约 200 B ⇒ 32768 节约 6.4 MB）。远场按 chunk 列采样，相邻 chunk 会复用
 /// 同一列里的多个 section，这个量级够覆盖几十个远场 chunk 的重叠面。
@@ -108,12 +116,17 @@ impl Summary {
     built
   }
 
-  /// `scale` 级、格原点 `cell`（**方块**坐标，须是 `scale` 的倍数）处的代表色；`None` = 这一格算空。
+  /// `cell_blocks` 方块边长的一格、格原点 `cell`（**方块**坐标，须是 `cell_blocks` 的倍数）处的
+  /// 代表色；`None` = 这一格算空。
   ///
-  /// 三级的采样口径见模块头。格原点恒对齐 section（`scale` 是 4 的倍数），所以 L1/L2 只需一次除法
-  /// 定位，L3 用格中心所在的那一个 chunk 列。
-  pub fn cell(&self, src: &dyn SectionReps, cell: IVec3, scale: i32) -> Option<PaletteId> {
-    match scale {
+  /// 三档口径见模块头。格原点恒对齐 section（`cell_blocks` 是 4 的倍数），所以细档与整节档只需一次
+  /// 除法定位，最粗档用格中心所在的那一个 chunk 列。
+  ///
+  /// WHY 参数是**格的方块边长**而不是远场级的 `scale`：格的边长 = `FAR_GRAIN · scale / 16`，两者在
+  /// `FAR_GRAIN = 16` 时数值相同 —— 但"单元变粗、格不变"（见 `mc_map.md` §8.9）之后就不再相同，
+  /// 采样口径只该关心格有多大。
+  pub fn cell(&self, src: &dyn SectionReps, cell: IVec3, cell_blocks: i32) -> Option<PaletteId> {
+    match cell_blocks {
       4 => {
         let sec = self.sec(src, cell.div_euclid(IVec3::splat(SEC)))?;
         let l = cell.rem_euclid(IVec3::splat(SEC)) / 4;
@@ -122,31 +135,37 @@ impl Summary {
       }
       16 => {
         let sec = self.sec(src, cell.div_euclid(IVec3::splat(SEC)))?;
-        (sec.solid as u32 * 1000 >= SOLID_MIN_PERMILLE * SECTION_VOLUME as u32).then_some(sec.rep)
+        // **整节实体占比不够，但任一细格有料 ⇒ 也算有料**：与 `mc::lod` 的写侧口径一致
+        // （远场文件里"节存在"就是同一判据）。少了这一条，只有薄墙/一层楼板的节（典型**高楼**，
+        // 16 方块见方的一节里仅一层楼板 ≈ 6%）会被判空 ⇒ 楼变中空、且随距离换档来回翻。
+        let occupied = sec.solid as u32 * 1000 >= SOLID_MIN_PERMILLE * SECTION_VOLUME as u32
+          || sec.fine.iter().any(|id| !id.is_air());
+        occupied.then_some(sec.rep)
       }
       _ => {
-        // L3：只读格**中心**那一个 chunk 列 —— xz 取格中心所在的 chunk，y 仍是本格自己的高度范围
-        // （`scale/16` 个 section）。xz 与 y 的取法不同是必须的：本格高 `scale` 个方块，若 y 也按
-        // "中心"取，读到的就是本格上面半格的那一节。
+        // 最粗档：只读格**中心**那一个 chunk 列 —— xz 取格中心所在的 chunk，y 仍是本格自己的高度范围
+        // （`cell_blocks/16` 个 section）。xz 与 y 的取法不同是必须的：本格高 `cell_blocks` 个方块，
+        // 若 y 也按"中心"取，读到的就是本格上面半格的那一节。
         let c = cell.div_euclid(IVec3::splat(SEC));
-        let col_x = (cell.x + scale / 2).div_euclid(SEC);
-        let col_z = (cell.z + scale / 2).div_euclid(SEC);
-        let n = scale / SEC;
-        let mut reps = Vec::with_capacity(n as usize);
-        for sy in 0..n {
+        let col_x = (cell.x + cell_blocks / 2).div_euclid(SEC);
+        let col_z = (cell.z + cell_blocks / 2).div_euclid(SEC);
+        let n = cell_blocks / SEC;
+        // 取**最上面那一节有料的**代表色（不是这几节的多数色）：与细档/整节档同一条"表面"口径
+        // （见 `voxel::rep_of_surface`）—— 否则最粗的格又会退回"把水面染成河床"。
+        for sy in (0..n).rev() {
           if let Some(sec) = self.sec(src, IVec3::new(col_x, c.y + sy, col_z)) {
             if !sec.rep.is_air() {
-              reps.push(sec.rep);
+              return Some(sec.rep);
             }
           }
         }
-        voxel::rep_of(&reps)
+        None
       }
     }
   }
 }
 
-/// 一份 section 的 4096 个代表色 → 摘要（`fine` 的 64 格 + 整节多数色 + 实体数）
+/// 一份 section 的 4096 个代表色 → 摘要（`fine` 的 64 格 + 整节代表色 + 实体数）
 fn build(reps: &[PaletteId]) -> Sec {
   let mut fine = Box::new([PaletteId::AIR; FINE]);
   let mut solid = 0u16;
@@ -169,23 +188,26 @@ fn build(reps: &[PaletteId]) -> Sec {
             }
           }
         }
-        // 实体不足的格当空 —— 与 L2/L3 的判据同源（免得 L1 把街道也画出来）
-        let cell_id = group(&buf, 64);
+        // 实体不足的格当空 —— 与 L2/L3 的判据同源（免得 L1 把街道也画出来）；
+        // 色取**表面**（每层 4×4 = 16 个方块，见 `voxel::rep_of_surface`）。
+        let cell_id = group(&buf, 64, 16);
         groups[(gx + FINE_PER_AXIS * gz + FINE_PER_AXIS * FINE_PER_AXIS * gy) as usize] = cell_id;
         fine[(gx + FINE_PER_AXIS * gz + FINE_PER_AXIS * FINE_PER_AXIS * gy) as usize] = cell_id;
       }
     }
   }
-  Sec { fine, rep: voxel::rep_of(&groups).unwrap_or(PaletteId::AIR), solid }
+  // 整节色 = 最上面那一层**有料的细格**里的多数色（每层 `4×4` 个细格）⇒ 逐级递归都是"表面"。
+  Sec { fine, rep: voxel::rep_of_surface(&groups, 16).unwrap_or(PaletteId::AIR), solid }
 }
 
-/// 一组方块的代表色：实体占比不足 `SOLID_MIN_PERMILLE` → 空
-fn group(buf: &[PaletteId], n: usize) -> PaletteId {
+/// 一组方块的代表色：实体占比不足 `SOLID_MIN_PERMILLE` → 空；否则取**表面**色
+/// （`cells` 按 `y-major` 排布、每层 `per_layer` 个，见 [`voxel::rep_of_surface`]）。
+fn group(buf: &[PaletteId], n: usize, per_layer: usize) -> PaletteId {
   let solid = buf[..n].iter().filter(|c| !c.is_air()).count();
   if (solid as u32) * 1000 < SOLID_MIN_PERMILLE * n as u32 {
     return PaletteId::AIR;
   }
-  voxel::rep_of(buf).unwrap_or(PaletteId::AIR)
+  voxel::rep_of_surface(&buf[..n], per_layer).unwrap_or(PaletteId::AIR)
 }
 
 #[cfg(test)]
@@ -215,18 +237,18 @@ mod tests {
     }
   }
 
-  /// **L1（`scale = 4`）**：格内 `4³` 方块多数色；格内实体太少 → 空。
+  /// **L1（`scale = 4`）**：格内 `4³` 方块（最上面那一层有料的）多数色；格内实体太少 → 空。
   #[test]
-  fn l1_cell_is_the_majority_of_its_own_section() {
+  fn l1_cell_is_its_own_4cubed_cell() {
     let stone = PaletteId(7);
     let s = Fake {
       f: Box::new(move |b: IVec3| {
-        // 第一格（`x,z,y ∈ [0,4)`）铺满 64 块 ⇒ 实体；第二格只铺 4 块（< 1/8）⇒ 应算空
+        // 第一格（`x,z,y ∈ [0,4)`）铺满 64 块 ⇒ 实体；第二格只铺 1 块（< 门槛 2 块）⇒ 应算空
         let in_first = |v: i32| (0..4).contains(&v);
         if in_first(b.x) && in_first(b.y) && in_first(b.z) {
           return stone;
         }
-        ((4..8).contains(&b.x) && b.y == 0 && b.z == 0).then_some(stone).unwrap_or(PaletteId::AIR)
+        (b.x == 4 && b.y == 0 && b.z == 0).then_some(stone).unwrap_or(PaletteId::AIR)
       }),
     };
     let sum = Summary::new();
@@ -237,9 +259,9 @@ mod tests {
     assert_eq!(sum.cell(&s, IVec3::new(0, 0, 0), 4), Some(stone));
   }
 
-  /// **L2（`scale = 16`）**：格正好是一个 section ⇒ 整节多数色；整节空 → 空。
+  /// **L2（`scale = 16`）**：格正好是一个 section ⇒ 取该节的代表色（表面色）；整节空 → 空。
   #[test]
-  fn l2_cell_is_the_section_majority() {
+  fn l2_cell_is_the_section_rep() {
     let stone = PaletteId(3);
     let wood = PaletteId(9);
     let s = Fake {
@@ -251,9 +273,43 @@ mod tests {
       }),
     };
     let sum = Summary::new();
-    // 一半 stone 一半 wood，各自 2048/4096 = 50% ⇒ 多数色按 (n, Reverse(id)) 取 id 小的 stone
+    // 一半 stone 一半 wood，各自 2048/4096 = 50% ⇒ 最上面那一层有料的细格里平手，按 (n, Reverse(id))
+    // 取 id 小的 stone
     assert_eq!(sum.cell(&s, IVec3::ZERO, 16), Some(stone));
     assert_eq!(sum.cell(&s, IVec3::new(0, 16, 0), 16), None, "第二节全空");
+  }
+
+  /// **表面色**（本次改的口径）：一格是"薄表面 + 厚基座"时取**表面** —— 水面上的一格必须取水，
+  /// 不能取河床的沙（旧口径整格多数色，在画面上就是"远场水面变成一片沙/石"的成片色差）。
+  #[test]
+  fn cell_rep_is_the_topmost_layer() {
+    let water = PaletteId(4);
+    let sand = PaletteId(9);
+    // 每一列的**最上面那一层**（y = 3）是水，下面三层是沙 ⇒ 沙的块数是水的 3 倍
+    let s = Fake {
+      f: Box::new(move |b: IVec3| if b.y == 3 { water } else if (0..3).contains(&b.y) { sand } else { PaletteId::AIR }),
+    };
+    let sum = Summary::new();
+    assert_eq!(sum.cell(&s, IVec3::ZERO, 4), Some(water), "L1 细格取最上面那一层（水）");
+    assert_eq!(sum.cell(&s, IVec3::ZERO, 16), Some(water), "L2 整节同样取表面（水）");
+  }
+
+  /// **表面色的闸门**：一层之上只有**单个**悬空方块（火把 / 花 / 栅栏）时**不取它** —— 否则远场一格
+  /// （L3 = 20.5 m）会被那一个方块染成它的颜色。这种格退回旧的整格多数色。
+  #[test]
+  fn lone_top_block_does_not_repaint_the_cell() {
+    let stone = PaletteId(3);
+    let torch = PaletteId(11);
+    let s = Fake {
+      f: Box::new(move |b: IVec3| {
+        if b.y == 3 {
+          return if b.x == 0 && b.z == 0 { torch } else { PaletteId::AIR };
+        }
+        if (0..3).contains(&b.y) { stone } else { PaletteId::AIR }
+      }),
+    };
+    let sum = Summary::new();
+    assert_eq!(sum.cell(&s, IVec3::ZERO, 4), Some(stone), "单个悬空方块不得把整格染成它的色");
   }
 
   /// **L3（`scale = 64`）**：只读格中心那一个 chunk 列；中心列有东西才算这一格。

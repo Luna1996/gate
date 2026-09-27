@@ -2,8 +2,13 @@ import package::bindings::{gi_sec_slots, light_u};
 import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
 import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
-import package::trace::{make_grid};
-import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_medium};
+import package::trace::{SECONDARY_REACH_CHUNKS, make_grid};
+import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal, world_trace_medium_scene};
+
+/// **GI 候选射线**的行程上限（世界体素）：GI 只要局部信息（见 `trace::SECONDARY_REACH_CHUNKS` 的
+/// CONSTRAINT）。**只有候选这一路**用它 —— `sun_transmittance`（可见阴影 / 二次顶点的 NEE）走
+/// `GI_T_MAX`：阴影必须与"直接看到的几何"在同一个尺度上成立，否则会被截出直线边界。
+const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 
 // ============================================================================
 // 单条 GI 射线的辐射求值（**唯一口径**：新鲜候选、借用候选、时域/空间复用全部走这里）。
@@ -39,7 +44,11 @@ import package::world::{WorldHit, voxel_center_world, voxel_normal, world_trace_
 /// 本写法按它后面的不透明遮挡给值 —— 起点已沿法线外推半个体素 + eps，正常路径不会走到那里。
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
   var tint = vec3<f32>(1.0);
-  let h = world_trace_medium(make_grid(0u), origin, sun_dir, GI_T_MAX, false, &tint);
+  // **阴影只查局部**（`GI_REACH_T` = 12 chunk = 61 m）：挡住我的东西一定在附近 —— 本仓世界 1 体素
+  // = 2 cm，阴影长度 = 内容高度 / tan(太阳高度角)，MC 全高 4096 体素、日高 38.4° ⇒ 约 100 m，
+  // 而"看得见的"楼影都在 61 m 内。这条闸门也是**帧时**的闸门：阴影射线每像素一条（远场则每可见面
+  // 一条），不夹就要走到窗口边（+1~3 ms）。
+  let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
   let through = (tint.r + tint.g + tint.b) / 3.0;
   // 段内没有不透明遮挡 ⇒ 只有介质的乘性透过（无介质时恒 1.0）。
   if (!h.hit) { return through; }
@@ -73,7 +82,7 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
   var sun = 0.0;
   // `sun_bounce` 来自 uniform（一次派发内恒定 ⇒ 分支不发散）：关掉时整条阴影射线都不发。
   if (sun_bounce > 0.0 && ndl > 0.0) {
-    let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
+    let h_off = surface_offset(hg, hn, SHADOW_SURFACE_EPS);
     sun = sun_transmittance(hp + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
   }
   // 天光项：与主着色点同一套系数（口径不分叉）。
@@ -156,7 +165,7 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
 fn gi_bounce2_probe(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32) -> vec3<f32> {
   var tint = vec3<f32>(1.0);
-  let h = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
+  let h = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
   if (!h.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }
@@ -180,7 +189,7 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
   let hp = voxel_center_world(hg, sh.voxel);
   let hn = voxel_normal(hg, sh.voxel, sh.face_id, sh.n);
   let m = fetch_material(sh.palette_base, sh.pal, hp, hn, MATERIAL_DEBUG_NONE);
-  let off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3)) + SHADOW_SURFACE_EPS;
+  let off = surface_offset(hg, hn, SHADOW_SURFACE_EPS);
   let d2 = gi_cos_hemisphere(hn, gi_rand2(seed));
   let l2 = gi_bounce2_probe(hp + hn * off, d2, sun_dir, sun_c, sun_bounce, epoch);
   // `kD·albedo·L2`：与 `brdf_reflected` 的环境项同一个量纲与相位（见 `gi_bounce2_probe`）。
@@ -203,7 +212,7 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> vec3<f32> {
   var tint = vec3<f32>(1.0);
-  let sh = world_trace_medium(make_grid(0u), org, dir, GI_T_MAX, false, &tint);
+  let sh = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
   // 逃逸 → 天光辐亮度（穿过介质看到的天空同样按 `tint` 吸收）；天空没有面 ⇒ 不进缓存。
   if (!sh.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;

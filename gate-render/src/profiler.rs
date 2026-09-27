@@ -198,11 +198,43 @@ pub(crate) fn gpu_compute_pass<T>(
   body(&mut pass)
 }
 
+/// **主世界调度耗时**（诊断）：`First` 打点、`Last` 收尾 ⇒ 得到"除渲染与 present 之外，主世界
+/// 自己花了多少"。把 `RENDER` 行的"等别处"拆成三段：主世界 / extract+prepare / present 等待。
+///
+/// WHY 需要它：`等别处` 是个大杂烩（主世界 + extract + prepare + submit + present）。本仓实测过一次
+/// 帧时 44 ms，`RENDER` 只说"自身 3.3、等别处 41"，而三个 `SysTimer`（STREAM/RESID/REQ）合计不到
+/// 2 ms —— 只看那几行会以为是 GPU 或 present，其实要先把主世界这一段量出来才谈得上归因。
+#[derive(Resource, Default)]
+pub(crate) struct DiagMainFrame {
+  t0: Option<std::time::Instant>,
+  acc: f64,
+  n: u32,
+}
+
+fn main_frame_begin(mut st: ResMut<DiagMainFrame>) {
+  st.t0 = Some(std::time::Instant::now());
+}
+
+fn main_frame_end(mut st: ResMut<DiagMainFrame>) {
+  let Some(t0) = st.t0.take() else { return };
+  st.acc += t0.elapsed().as_secs_f64();
+  st.n += 1;
+  if st.n >= 60 {
+    bevy::log::debug!(target: "gate", "MAIN 主世界调度 {:.2} ms/帧", st.acc / st.n as f64 * 1000.0);
+    st.acc = 0.0;
+    st.n = 0;
+  }
+}
+
 /// 渲染剖析插件（profile feature 关闭时仅注册空资源）。
 pub(crate) struct GateProfilerPlugin;
 
 impl Plugin for GateProfilerPlugin {
   fn build(&self, app: &mut App) {
+    // 主世界调度计时（见 [`DiagMainFrame`]）：`First` / `Last` 是主世界调度的两端
+    app.init_resource::<DiagMainFrame>();
+    app.add_systems(bevy::prelude::First, main_frame_begin);
+    app.add_systems(bevy::prelude::Last, main_frame_end);
     // 呈现帧计数：**两个世界共享同一个 `Arc`**（主世界读、渲染世界每帧自增）。
     // 必须在取 render_app 之前插进主世界（渲染世界那份下面一起给）。
     let pace = FramePace::default();

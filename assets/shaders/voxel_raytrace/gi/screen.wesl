@@ -4,7 +4,7 @@ import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAN
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
 import package::trace::{make_grid};
-import package::world::{WorldHit, voxel_normal};
+import package::world::{WorldHit, surface_offset, voxel_normal};
 
 // ============================================================================
 // 屏幕空间 ReSTIR GI —— **GI 的唯一路径**（逐像素 reservoir，每帧完整估计）。
@@ -284,8 +284,9 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 顶面/侧面各自一个常数方向）⇒ 间接光的半球整片偏转 ⇒ 沿墙面出现与台阶行对齐的**长条**；
   // `voxel_normal` 逐体素连续 ⇒ 与可见着色同向、逐体素。代价：6 次邻域探测。
   let n = voxel_normal(gg, h.voxel, h.face_id, h.n);
-  // 沿 n 外推 0.5/max|n| + SHADOW_SURFACE_EPS：与 `dda_main` 同一套外推（起点离开命中体素）。
-  let n_off = 0.5 / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-3)) + SHADOW_SURFACE_EPS;
+  // 沿 n 外推半个体素 + SHADOW_SURFACE_EPS：与 `dda_main` 同一套外推（起点离开命中体素）。
+  // 半个体素按**该 grid 的体素**算（远场级的体素 = `scale` 个世界体素，见 `world::surface_offset`）。
+  let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
   let org = p_voxel + n * n_off;
 
   // 主命中面键（唯一的复用判据）+ 是否可编码。

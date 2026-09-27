@@ -321,6 +321,37 @@ pub fn rep_of(cells: &[PaletteId]) -> Option<PaletteId> {
   tally.into_iter().max_by_key(|(id, n)| (*n, std::cmp::Reverse(id.0))).map(|(id, _)| id)
 }
 
+/// **表面代表色**：`cells` 按 `y-major` 排布、每层 `per_layer` 个方块 ⇒ 取**最上面那一层"够实"的方块**
+/// （实体 ≥ 半层）里的多数非空气状态；没有这样的层（薄墙 / 竖直面）或整组全空 ⇒ 退回整组多数色
+/// （即 [`rep_of`]）。
+///
+/// WHY 不是整组的 [`rep_of`]：远场的一格都是"薄表面 + 厚基座"（水面 1 层压河床 3 层、草地 1 层压土
+/// 3 层……），整组多数色会把这一格染成**基座**（水面 → 沙/石、草地 → 土）⇒ 与近场成片色差，且边界
+/// 是格对齐的直角（远场一格 = L1/L2/L3 的 `FAR_GRAIN³`，在画面上就是成片的方块）。远场只求轮廓，
+/// 取"从外面看到的那一层"才是这一格的颜色。
+///
+/// CONSTRAINT: "够实 ≥ 半层"这道闸门是必需的 —— 只取"最上面那一层有料"时，一层之上**单个**悬空方块
+/// （火把 / 花 / 栅栏 / 一片树叶）会把整格（L3 = 20.5 m）染成它的颜色，比原来的多数色更差。加了闸门
+/// ⇒ 只改"薄表面压厚基座"那一类，其余逐字节等于旧的多数色口径。
+///
+/// 逐级递归（细格 → 节 → 更粗的格都用本函数）⇒ 最粗的格也拿到**整列里最上面那一层表面**的色。
+pub fn rep_of_surface(cells: &[PaletteId], per_layer: usize) -> Option<PaletteId> {
+  if per_layer == 0 {
+    return None;
+  }
+  debug_assert_eq!(cells.len() % per_layer, 0, "每层方块数必须整除总格数");
+  for y in (0..cells.len() / per_layer).rev() {
+    let layer = &cells[y * per_layer..(y + 1) * per_layer];
+    let solid = layer.iter().filter(|c| !c.is_air()).count();
+    if solid * 2 >= per_layer {
+      if let Some(r) = rep_of(layer) {
+        return Some(r);
+      }
+    }
+  }
+  rep_of(cells)
+}
+
 /// 体素层面的块级旋转（`x` 先、`y` 后；见 `docs/mc_map.md` §5）
 fn rotate(src: &[PaletteId; CELLS], r: Rot) -> [PaletteId; CELLS] {
   let step = |s: &[PaletteId; CELLS], f: fn(i32, i32, i32) -> (i32, i32, i32)| {

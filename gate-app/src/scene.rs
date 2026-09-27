@@ -1,4 +1,4 @@
-//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 `reload_world` + demo 极限场景生成。
+﻿//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 `reload_world` + demo 极限场景生成。
 //! 启动场景与规模见 `consts`（`STARTUP_DEMO_SCENE` / `DEMO_TILES`）。
 
 use bevy::{image::Image, prelude::*};
@@ -222,7 +222,7 @@ fn build_world(
   }
   if name == INFINITE_CUBES {
     stream.set_source(None);
-    return Ok(build_infinite_cubes(grid, pbr_ids, cam_eye));
+    return Ok(build_infinite_cubes(grid, pbr_ids, cam_eye, stream.coarse_radius));
   }
   if name == mc::MC_MAP {
     let (info, city) = mc::build(grid, cam_eye)?;
@@ -310,6 +310,7 @@ fn build_infinite_cubes(
   grid: &mut VolumeGrid,
   pbr_ids: &[String],
   center: IVec3,
+  coarse_radius: i32,
 ) -> vox_scene::VoxSceneInfo {
   use crate::infinite_cubes;
   /// 窗口 = 64³ chunk（`CHUNK_INDEX_CAP` 的上限），钉在起始位置 ⇒ 可飞约 ±150m。
@@ -321,8 +322,15 @@ fn build_infinite_cubes(
   for (id, entry) in infinite_cubes::material_slots(n_pbr) {
     grid.palette_mut().set(id, entry);
   }
-  let origin = center.div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE)) - IVec3::splat(WINDOW_CHUNKS);
-  grid.set_stream_window(Some((origin, IVec3::splat(WINDOW_CHUNKS * 2))));
+  // 窗口半宽用常量（启动顺序：菜单值在加载之后才写进 `Streaming`，读它会得到 0 ⇒ 见 `mc::build`）；
+  // 菜单的"粗档半径"只决定**预载盘**半径，它要比覆盖半径**大** `SEAM_MARGIN` chunk（见 `mc::build`）。
+  let _ = coarse_radius;
+  let win = WINDOW_CHUNKS;
+  let origin = center.div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE)) - IVec3::splat(win);
+  grid.set_stream_window(Some((origin, IVec3::splat(win * 2))));
+  // **覆盖半径** = 预载盘半径 − 交接余量（见 `mc::NEAR_COVER_CHUNKS` 的 WHY：内容锚 chunk 角、
+  // 裁剪按相机，不留余量就会在交接处留一圈没内容的环）。与 `FAR_PRELOAD_INNER` 同源。
+  grid.set_coverage_r(crate::mc::NEAR_COVER_CHUNKS as f32 * gate_voxel::CHUNK_SIZE as f32);
   // M8：这个世界的 chunk 会随相机无限平移，且远处必须用**远场级**补上（见 `attach_far`）
   grid.set_attach_far(true);
   // 起始只铺相机脚下那一块（**整 chunk**，见 `initial_box`），其余由 `stream_chunks` 按需生成

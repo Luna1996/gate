@@ -765,25 +765,28 @@ fn grid_hit(h: VoxelHit, ci: vec3<i32>,
   return UnifiedHit(true, h.t, h.pal, n_world, h.face_id, voxel, obj_id);
 }
 
+/// **GI 候选射线的行程上限**（chunk）：GI 只需要**局部**信息，而窗口是 ±32 chunk ⇒ 它在"窗口内但
+/// 没加载"的空间里一路走空。出界按"没几何"处理即可（调用方落回天空）。
+///
+/// CONSTRAINT: 这个夹取**只属于 GI 候选射线**，由调用点把它折进 `t_cap`（`gi/ray.wesl`）——
+/// **不能**再放在 `trace_grid` 里按 `req` 一刀切：**阴影**与**反射**要在场景尺度上成立（本仓 MC
+/// 城市的水面倒影在百米级、楼影同样），用 GI 的 12 chunk 去夹会把它们截断在 61 m；而从前那种夹法
+/// 还是**轴对齐的盒子**（`w_mn/w_mx`）⇒ 在平整的反射面 / 受影面上切出一条**轴对齐、带直角**的边界
+/// （用户截图"水面上一个明显的矩形的一个角、色差很严重"就是它：倒影只在每个水面点周围 61 m 的方盒里）。
+/// 现在 `trace_grid` 只受调用方给的 `t_cap` 与**窗口 AABB**约束 ⇒ 次级射线的可见范围**与主射线一致**，
+/// 代价也以主射线为界（阴影射线现在要走到窗口边，实测代价是每帧 1–3 ms 量级；要收回就把它自己的
+/// `t_cap` 夹小 —— 那是"阴影能看多远"的旋钮，不再是全局一刀切）。
+///
+/// 实测（2026-09-25）：GI 行程 12 → 1 让 `gate_gi` 16.2 → 6.2 ms —— 代价**随行程线性**，这是 GI
+/// 的两个真杠杆之一（另一个是候选数）。见 `docs/editable-gigavoxel.md` 的「附二」。
+const SECONDARY_REACH_CHUNKS: f32 = 12.0;
+
 // 统一层次 DDA：slab→chunk 间 A&W→trace_chunk，`penetrate = false` 时一次都不碰 mc。
 /// `req` = 本 pass 是否允许发 ray-guided 请求（0 = 不发；见 `REQ_ENABLE` 的 CONSTRAINT）。
 fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
               penetrate: bool, req: u32, mc: ptr<function, MediumRay>) -> UnifiedHit {
-  // **次级射线的行程上限**（chunk；`0` = 不限）：GI / 阴影 / 反射只需要**局部**信息，而窗口是 ±32 chunk
-  // ⇒ 它们在"窗口内但没加载"的空间里一路走空。出界按"没几何"处理即可 —— 调用方落回天空
-  // （离开窗口本来就等于天空）。
-  // CONSTRAINT: 只夹**这个局部副本** ⇒ 主射线（`req == 1`）与物体完全不受影响。调大它 = 换来更远的
-  // 间接光贡献、代价是空区步数线性增长。
-  // 实测（2026-09-25）：12 → 1 让 `gate_gi` 16.2 → 6.2 ms —— 代价**随行程线性**，这是 GI 的两个真
-  // 杠杆之一（另一个是候选数）。见 `docs/editable-gigavoxel.md` 的「附二」。
-  const SECONDARY_REACH_CHUNKS: f32 = 12.0;
-  var w_mn = g.w_mn;
-  var w_mx = g.w_mx;
-  if (req == 0u && SECONDARY_REACH_CHUNKS > 0.0) {
-    let reach = vec3<f32>(SECONDARY_REACH_CHUNKS * 256.0);
-    w_mn = max(w_mn, origin - reach);
-    w_mx = min(w_mx, origin + reach);
-  }
+  let w_mn = g.w_mn;
+  let w_mx = g.w_mx;
   let l_min = g.l_min;
   let l_max = g.l_max;
   let index_origin = g.index_origin;
@@ -1069,6 +1072,7 @@ fn make_grid(idx: u32) -> Grid {
     // obj_id 约定（镜像 Rust）：idx=0 主世界 → -1；idx≥1 物体 / 远场级 → idx-1。
     select(-1i, i32(idx) - 1i, idx > 0u),
     idx,                                   // vol：请求字 / 用途戳表的分段号（M8）
+    d.coverage_r,                          // 覆盖半径：分壳裁剪的接力半径（M8）
   );
 }
 

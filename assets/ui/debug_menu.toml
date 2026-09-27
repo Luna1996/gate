@@ -1,4 +1,4 @@
-[window]
+﻿[window]
 x = 8.0
 y = 8.0
 collapsed = false
@@ -699,7 +699,7 @@ tooltip = "menu.game.world.unload_radius.tip"
 kind = "slider"
 id = "coarse_radius"
 label = "menu.game.world.coarse_radius"
-value = 8.0
+value = 32.0
 min = 0.0
 max = 32.0
 step = 1.0
@@ -753,12 +753,40 @@ tooltip = "menu.game.world.requests_load.tip"
 kind = "slider"
 id = "request_mb"
 label = "menu.game.world.request_mb"
-value = 2048.0
+value = 4096.0
 min = 0.0
 max = 16384.0
 step = 256.0
 decimals = 0
 tooltip = "menu.game.world.request_mb.tip"
+
+# 诊断：远场级上限（0..3）。调到 k ⇒ 只保留前 k 级远场，更粗的整卷停用（不产出、不挂载、已常驻的卸载）
+[[items.children.children]]
+kind = "slider"
+id = "far_levels"
+label = "menu.game.world.far_levels"
+value = 3.0
+min = 0.0
+max = 3.0
+step = 1.0
+decimals = 0
+tooltip = "menu.game.world.far_levels.tip"
+
+# 诊断：按卷着色（主世界=绿、L1=红、L2=蓝、L3=黄）—— 一眼看出画面上某一块属于哪一级
+[[items.children.children]]
+kind = "toggle"
+id = "vol_tint"
+label = "menu.game.world.vol_tint"
+checked = false
+tooltip = "menu.game.world.vol_tint.tip"
+
+# 离线粗粒度世界（`mc::lod`）：把整张图预计算成一份 section 级摘要存盘（一次性，十几秒），此后远场
+# scale ≥ 16 直接内存采样（实测 L2 一块 0.2 ms，而按需读存档是 1 s 级）。构建跑在后台线程、完成即热装。
+[[items.children.children]]
+kind = "buttons"
+id = "lod"
+label = ""
+items = ["menu.game.world.lod_build", "menu.game.world.lod_cancel"]
 
 [[items]]
 kind = "sub_menu"

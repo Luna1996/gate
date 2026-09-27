@@ -599,18 +599,19 @@ impl BrickMapBuilder {
 
   /// 从全局空闲段取一个 ≥`cap` 字的块（找不到就追加到高水位）。
   fn alloc_block(&mut self, cap: usize) -> usize {
-    match self.free.alloc(cap) {
-      Some(start) => start,
-      None => {
-        let start = self.buffers.b_struct.len();
-        let end = start + cap;
-        if end > self.buffers.b_struct.capacity() {
-          self.grow_region(cap);
-        }
-        self.buffers.b_struct.resize(end, 0);
-        start
-      }
+    if let Some(start) = self.free.alloc(cap) {
+      return start;
     }
+    // 空闲段用完：先让容量长到位。**预留型 volume（远场级）会被一次把长度顶到最终值**并把新段
+    // 登记为空闲（见 [`Self::grow_region`]）⇒ 这里必须**重试空闲表**，不能沿用旧长度自行 `resize`
+    // （那会把刚顶上去的长度又截回去）。
+    self.grow_region(cap);
+    if let Some(start) = self.free.alloc(cap) {
+      return start;
+    }
+    let start = self.buffers.b_struct.len();
+    self.buffers.b_struct.resize(start + cap, 0);
+    start
   }
 
   /// 树区**容量**增长（M8 的"扩容策略"）：一次把 `Vec` 的**容量**拨到"这个 volume 最终会有多大"，
@@ -627,14 +628,65 @@ impl BrickMapBuilder {
   /// 目标 = `目标块数 × 实测每块字数`，其中"实测每块字数"取 `max(已装块平均, 本次要装的块)`：
   /// 用**实测**而不是猜常量 ⇒ 对世界的稠密度自适应（`infinite_cubes` 266 KB/块 vs 城堡 1.5 MB/块）。
   fn grow_region(&mut self, block_cap: usize) {
+    /// 目标块数天花板：`region_chunks` 是"最终会有多大"的**上限**，不该被池预算推到几万块。
+    const REGION_CHUNKS_CAP: usize = 32768;
+    /// 每块字数天花板：`per_chunk` 取 `max(历史平均, 本次要装的块)`，单个稠密块可达 16 万字。
+    const PER_CHUNK_WORDS_CAP: usize = 65536;
+    /// 目标字数天花板（512 M 字 = 2 GB）：实测 MC 城市常年 ~835 MB，留 2.4× 余量。
+    const REGION_WORDS_CAP: usize = 512 * 1024 * 1024;
     let used = self.buffers.b_struct.len().saturating_sub(TREE_BASE);
     let per_chunk = (used / self.chunks.len().max(1)).max(block_cap);
-    let target = TREE_BASE + self.region_chunks.saturating_mul(per_chunk);
+    // **目标块数的硬上限 + 目标的字节上限**。
+    //
+    // `region_chunks` 只该是"这个 volume 最终会有多大"的**上限**，而 `per_chunk` 取的是
+    // `max(历史平均, 本次要装的块)`（保守）⇒ 池很大时乘积轻易到几十 GB：实测池 65536 块、某块
+    // 163840 字 ⇒ `target = 65536 × 163840 × 4 ≈ 40 GiB`，`resize` 直接 `memory allocation of
+    // 42949672960 bytes failed`（40 GiB 整）。这两个上限把目标钉住；配合下面的**有界倍增**，
+    // 实际占用仍然只按真实用量增长（上限只是天花板）。
+    let region_chunks = self.region_chunks.min(REGION_CHUNKS_CAP);
+    let per_chunk = per_chunk.min(PER_CHUNK_WORDS_CAP);
+    let target = (TREE_BASE + region_chunks.saturating_mul(per_chunk)).min(REGION_WORDS_CAP);
+    // **预留型 volume（远场级）：长度一次顶到位**，并把新段登记为空闲。
+    //
+    // WHY：`VolumesBuilder::snapshot` 的 `bases_shifted` 只比较各 volume 的 `b_struct` **长度** ——
+    // 而远场级排在主世界之前，长度每变一次就降级一次**全量快照**（整份拼一遍再上传）。
+    // 预留区的取值（`FAR_RESERVE_WORDS_PER_CHUNK`）是按 `infinite_cubes` 的远场块（1219–1463 字）
+    // 定的，而 **MC 的 L1 远场块实测 5773 字/块（4×）** ⇒ 预留区迅速用尽，此后**每装一块长度都长一次**：
+    // 实测（`GATE_BENCH=static`，35 s）`UPLOAD[full]` **121 次**、每次整份拼接，帧时从 16.7 ms 涨到 45 ms。
+    //
+    // 一次顶到 `region_chunks × 实测每块字数` 之后长度恒定 ⇒ 全量快照只在第一次发生。
+    //
+    // 代价是这段长度会被 `resize` 清零（几十 MB 的 memset，一次性）；换来的是此后**不再有**全量快照。
+    if self.reserve > 0 && target > self.buffers.b_struct.len() {
+      let from = self.buffers.b_struct.len();
+      bevy::log::debug!(
+        "树区长度一次顶到位：{from} → {target} 字（块 {}、每块估 {per_chunk} 字）",
+        self.chunks.len()
+      );
+      self.buffers.b_struct.resize(target, 0);
+      self.free.free(from, target - from);
+      return;
+    }
     if target <= self.buffers.b_struct.capacity() {
       return;
     }
-    let extra = target.saturating_sub(self.buffers.b_struct.len());
-    self.buffers.b_struct.reserve(extra);
+    // **有界倍增**（不是"一次跳到 target"）：`target` = `region_chunks × 实测每块字数`，而
+    // `region_chunks` 对**流式世界**取自池预算（可以是几万块）⇒ 一次 `reserve` 到 target 就是
+    // 几 GB 的**瞬时**占用。实测：池块数 87381（per-chunk 估 48 KB）时启动即
+    // `memory allocation of 44552265872 bytes failed`（单次 44.5 GB）。
+    // 每次最多翻倍（再夹到 target）⇒ 分配次数仍是 log₂ 级，但瞬时占用 ≤ 2× **实际**用量，
+    // 池块数怎么调都不会炸（`target` 只是上限）。
+    let grown = self
+      .buffers
+      .b_struct
+      .capacity()
+      .saturating_mul(2)
+      .max(TREE_BASE + (1 << 20));
+    let want = grown.min(target);
+    let extra = want.saturating_sub(self.buffers.b_struct.len());
+    if extra > 0 {
+      self.buffers.b_struct.reserve(extra);
+    }
     // 少见但重要：一次跳到目标容量（避免逐次翻倍）。实测只在**爬坡期**发生一次
     // （MC 城市：树区 0 → ~100 MB），且 `Vec::reserve` 本身 < 1 ms（对照：同期的 GPU 缓冲扩容
     // 100 → 134 MB 要 1.1–1.4 ms）⇒ 它不是启动期卡顿的来源。
@@ -923,6 +975,9 @@ pub struct VolumesBuilder {
   /// 每 volume 是不是**远场级**（M8）：进 `GridDesc::grid_flags` 的 [`GRID_FLAG_FAR`]，
   /// 唯一消费者是 shader 的分壳裁剪（`trace.wesl::grid_is_far`）。
   far: Vec<bool>,
+  /// 每 volume 的**覆盖半径**（世界体素，M8）：进 `GridDesc.coverage_r`，当分壳裁剪的接力半径
+  /// （见 `VolumeGrid::set_coverage_r`）。0 = 不参与接力（物体）。
+  coverage: Vec<f32>,
   /// 构造时的 GPU 常驻池预算：新增 volume 时（[`Self::sync`]）重算它的树区增长目标要用。
   budget_bytes: usize,
   /// 上一次 snapshot 的 tree_bases（字偏移）；空 = 首帧 → 强制全量
@@ -970,6 +1025,7 @@ impl VolumesBuilder {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
+    let mut coverage = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
       builders.push(BrickMapBuilder::build_full_sized(
         grid,
@@ -978,11 +1034,13 @@ impl VolumesBuilder {
       ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
+      coverage.push(grid.coverage_r());
     }
     Self {
       builders,
       transforms,
       far,
+      coverage,
       budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
@@ -995,6 +1053,7 @@ impl VolumesBuilder {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
+    let mut coverage = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
       builders.push(BrickMapBuilder::new_unbuilt_sized(
         grid,
@@ -1003,11 +1062,13 @@ impl VolumesBuilder {
       ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
+      coverage.push(grid.coverage_r());
     }
     Self {
       builders,
       transforms,
       far,
+      coverage,
       budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
@@ -1036,11 +1097,13 @@ impl VolumesBuilder {
       ));
       self.transforms.push(grid.transform());
       self.far.push(grid.is_far_level());
+      self.coverage.push(grid.coverage_r());
       self.force_full = true;
     }
     for (i, grid) in volumes.all().iter().enumerate() {
       self.transforms[i] = grid.transform();
       self.far[i] = grid.is_far_level();
+      self.coverage[i] = grid.coverage_r();
     }
   }
 
@@ -1125,6 +1188,8 @@ impl VolumesBuilder {
       desc.aabb_max = Vec4::new(mx.x, mx.y, mx.z, 0.0);
       // M8：远场级标记（分壳裁剪的开关，见 `trace.wesl::grid_is_far`）
       desc.grid_flags = if self.far[i] { super::wire::GRID_FLAG_FAR } else { 0 };
+      // M8：**覆盖半径** = 分壳裁剪的接力半径（见 `VolumeGrid::set_coverage_r` 的 WHY）
+      desc.coverage_r = self.coverage[i];
       grid_descs.push(desc);
     }
 
@@ -1132,6 +1197,20 @@ impl VolumesBuilder {
       || self.prev_tree_bases.iter().zip(tree_bases.iter()).any(|(p, c)| p != c)
       || self.prev_palette_bases.iter().zip(palette_bases.iter()).any(|(p, c)| p != c);
     let need_full = self.force_full || bases_shifted;
+    // 诊断：`need_full` 是每帧几十 ms 的整份快照，而它只由"某个 volume 变长"引起。
+    if bases_shifted {
+      let info: Vec<String> = self
+        .builders
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+          let len = b.buffers.b_struct.len();
+          let used = len.saturating_sub(TREE_BASE);
+          format!("v{i} 树区 {used} 字/预留 {}（{} 块）", b.reserve, b.chunks.len())
+        })
+        .collect();
+      bevy::log::debug!("BASES 漂移 → 全量快照：{}", info.join(" | "));
+    }
 
     let dirty_chunks: usize = self.builders.iter().map(|b| b.dirty_struct.len()).sum();
 

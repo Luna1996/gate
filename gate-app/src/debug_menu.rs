@@ -39,6 +39,14 @@ pub const WORLD_RELOAD_PATH: &str = "game/world/reload";
 /// 「世界」页「数据转储」按钮的节点路径（把 CPU/GPU 两份体素数据写进 `logs/`，见
 /// `gate_render::VoxelDumpRequest`）
 pub const WORLD_DUMP_PATH: &str = "game/world/dump";
+/// 「世界」页 LOD 缓存按钮组的节点路径（第 0 个 = 构建、第 1 个 = 中止，见 `mc::start_lod_build`）
+pub const WORLD_LOD_PATH: &str = "game/world/lod";
+/// 「世界」页**远场级上限**滑杆的节点路径（诊断：静音更粗的远场级，见
+/// [`crate::infinite_cubes::Streaming::far_levels_max`]）
+const WORLD_FAR_LEVELS_PATH: &str = "game/world/far_levels";
+/// 「世界」页**卷着色**开关的节点路径（诊断：把主射线命中按所属 volume 上色，见
+/// `gate_render::BaseSettings::vol_tint`）
+const WORLD_VOL_TINT_PATH: &str = "game/world/vol_tint";
 /// 「世界」页**流式加载**控件的节点路径（只对流式世界有效，写 `crate::infinite_cubes::Streaming`）
 const WORLD_STREAM_PAUSE_PATH: &str = "game/world/stream_pause";
 const WORLD_LOAD_RADIUS_PATH: &str = "game/world/load_radius";
@@ -703,6 +711,7 @@ fn register_callbacks(world: &mut World) {
      mut scene: ResMut<gate_render::VoxelScene>,
      mut dump: ResMut<gate_render::VoxelDumpRequest>,
      mut stream: ResMut<crate::infinite_cubes::Streaming>,
+     mut base: ResMut<gate_render::BaseSettings>,
      pbr: Option<Res<gate_render::PbrTextureSet>>,
      cam: Option<Res<gate_render::DdaCameraConfig>>,
      q_menu: Query<&gate_ui::DebugMenu>| {
@@ -734,6 +743,21 @@ fn register_callbacks(world: &mut World) {
           dump.arm();
           info!("数据转储 → 请求");
         }
+        // LOD 缓存（`mc::lod`）：第 0 个按钮 = 后台构建整张图的粗粒度世界（完成即热装），第 1 个 = 中止。
+        // 源要从 `Streaming` 里取出来（`clone_as_any` → 下转成 `McCity`），构建任务跑在裸线程上。
+        (WORLD_LOD_PATH, MenuAction::Button(i)) => match i {
+          0 => {
+            let city = stream
+              .source()
+              .and_then(|s| s.clone_as_any())
+              .and_then(|a| a.downcast::<crate::mc::source::McCity>().ok());
+            match city {
+              Some(city) => crate::mc::start_lod_build(city),
+              None => warn!("LOD 构建：当前世界不是 MC 地图（换到 mc_map 再点）→ 忽略"),
+            }
+          }
+          _ => crate::mc::cancel_lod_build(),
+        },
         // 流式加载（`crate::infinite_cubes::Streaming`）：直接写资源，下一帧 `stream_chunks` 就用新值。
         // 暂停 = 冻结整个流式环（连窗口都不跟）⇒ 相机可以飞出去看加载边界。
         (WORLD_STREAM_PAUSE_PATH, MenuAction::Toggle(on)) => {
@@ -758,6 +782,16 @@ fn register_callbacks(world: &mut World) {
         }
         (WORLD_REQUEST_MB_PATH, MenuAction::Value(v)) => {
           stream.request_bytes = (v.round().max(0.0) as usize) * 1024 * 1024;
+        }
+        // 远场级上限（诊断）：只保留前 k 级，更粗的整卷停用 ⇒ 用来钉死"某一圈异常归哪一级"
+        (WORLD_FAR_LEVELS_PATH, MenuAction::Value(v)) => {
+          stream.far_levels_max = v.round().clamp(0.0, 3.0) as usize;
+          info!("远场级上限 → L{}", stream.far_levels_max);
+        }
+        // 卷着色（诊断）：绿色 = 主世界、红 = L1、蓝 = L2、黄 = L3（见 `world.wesl::vol_tint_color`）
+        (WORLD_VOL_TINT_PATH, MenuAction::Toggle(on)) => {
+          base.vol_tint = *on;
+          info!("卷着色 → {}", if *on { "on" } else { "off" });
         }
         _ => {}
       }
