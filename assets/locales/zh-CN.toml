@@ -329,6 +329,11 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 """
 "menu.game.world.lod_build" = "构建 LOD"
 "menu.game.world.lod_cancel" = "中止"
+"menu.game.world.lod_state" = "LOD 状态"
+# `lod_state` 行的值（`debug_menu::lod_state_tick` 按状态取一条）
+"menu.game.world.lod_state.none" = "无（远场读存档）"
+"menu.game.world.lod_state.building" = "构建中 %{pct}%"
+"menu.game.world.lod_state.ready" = "已装载 %{mb} MB"
 "menu.game.world.far_levels" = "远场级数"
 "menu.game.world.vol_tint" = "卷着色"
 "menu.game.world.vol_tint.tip" = """

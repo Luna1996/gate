@@ -171,11 +171,22 @@ pub fn build(grid: &mut VolumeGrid, cam_eye: IVec3) -> Result<(VoxSceneInfo, Arc
     WINDOW_CHUNKS as f32 * chunk as f32 * 0.02,
   );
   // **离线粗粒度世界**（[`lod`]）：算过一次、且与当前存档对得上（指纹）就装上 —— 远场 `scale ≥ 16`
-  // 从此走内存查表；没有则远端继续按需读 Anvil（[`lod::load`] 会落一行说明怎么构建）。
-  let lod_file = lod::load(&lod::path_for(MC_MAP), lod::stamp(world.dir()));
+  // 从此走内存查表；拿不到就**自动起一次后台重建**（回落到按需读 Anvil 只作为"重建还没完成"的临时
+  // 状态，不是终局）。
+  let stamp = lod::stamp(world.dir());
   let city = Arc::new(source::McCity::new(world, assets, pool));
-  if let Some(f) = lod_file {
-    city.install_lod(f);
+  let lod_path = lod::path_for(MC_MAP);
+  match lod::load(&lod_path, stamp) {
+    Ok(f) => city.install_lod(f),
+    // WARNING: 回落路径慢 **293–6305×**（L1 349–520 ms/chunk、L2 917 ms vs LOD 0.1–1.3 ms/chunk），
+    // 表现为"远处一直空着 + 帧率长期偏低"⇒ 这条归因日志必须带代价，且必须触发重建。
+    Err(why) => {
+      bevy::log::warn!(
+        "LOD {} → 远场暂按需读 Anvil（L1 ≈ 350–520 ms/chunk，比 LOD 慢 293–6305×）；已起后台重建",
+        why.reason(&lod_path)
+      );
+      start_lod_build(city.clone());
+    }
   }
   Ok((
     VoxSceneInfo {
@@ -192,6 +203,13 @@ pub fn build(grid: &mut VolumeGrid, cam_eye: IVec3) -> Result<(VoxSceneInfo, Arc
 /// LOD 构建任务的进程级状态：`RUNNING` 防重复启动；`CANCEL` 供「中止」按钮置位（`mc::lod::build` 每列查一次）
 static LOD_RUNNING: AtomicBool = AtomicBool::new(false);
 static LOD_CANCEL: AtomicBool = AtomicBool::new(false);
+/// 构建进度（%）：进度回调写，DebugMenu 的「LOD 状态」行读（见 `debug_menu::lod_state_tick`）
+static LOD_PERCENT: AtomicU32 = AtomicU32::new(0);
+
+/// `(在跑?, 进度%)`：给「LOD 状态」行用。没在跑时百分比无意义。
+pub fn lod_build_state() -> (bool, u32) {
+  (LOD_RUNNING.load(Ordering::Relaxed), LOD_PERCENT.load(Ordering::Relaxed))
+}
 
 /// 起一次 LOD 构建（后台线程；已在跑则忽略）。结果由 [`source::McCity::build_lod`] **热装**，不必重启：
 /// 此后新的远场块直接走内存采样，已经在 GPU 上的那些自然按 LRU 换出。
@@ -201,11 +219,13 @@ pub fn start_lod_build(city: Arc<source::McCity>) {
     return;
   }
   LOD_CANCEL.store(false, Ordering::SeqCst);
+  LOD_PERCENT.store(0, Ordering::Relaxed);
   let spawned = std::thread::Builder::new().name("mc-lod-build".into()).spawn(move || {
     let t0 = std::time::Instant::now();
     let last = AtomicU32::new(0);
     let r = city.build_lod(&lod::path_for(MC_MAP), &LOD_CANCEL, |done, total| {
       let pct = (done * 100 / total.max(1)) as u32;
+      LOD_PERCENT.store(pct, Ordering::Relaxed);
       // 每跨 5% 一行（构建全程十几行；`build` 自己每 4096 列叫一次）
       if pct >= last.load(Ordering::Relaxed) + 5 {
         last.store(pct, Ordering::Relaxed);

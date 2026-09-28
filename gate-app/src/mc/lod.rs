@@ -770,26 +770,41 @@ impl Interner {
   }
 }
 
-/// 读一个文件并校验（魔数 / 版本 / 指纹）；`None` = 不可用（原因落一行日志）。
-///
-/// 指纹不符（换了地图 / 存档被改过）⇒ 作废：LOD 是**从存档算出来的**，存档变了它就不代表任何东西了。
-pub fn load(path: &Path, want_stamp: u64) -> Option<File> {
+/// [`load`] 拿不到 LOD 的三种结局。**三种的处置相同**（远场回落 `summary` + 自动重建，见
+/// `mc::build`），分开只为了让归因日志说清"为什么"。
+pub enum Unavailable {
+  /// 文件不在（没建过，或 `data/` 被清过 —— 它不在版本控制里）
+  Missing,
+  /// 读失败 / 损坏 / **版本不符**（`VERSION` 或 [`FORMAT_TAG`] 变过 ⇒ 文件是按旧口径算的）
+  Bad(String),
+  /// 指纹不符：换了地图，或存档被改过 —— LOD 是**从存档算出来的**，存档变了它就不代表任何东西了
+  Stale,
+}
+
+impl Unavailable {
+  /// 一行"为什么拿不到"（含路径）：调用点的归因日志用
+  pub fn reason(&self, path: &Path) -> String {
+    let p = path.display();
+    match self {
+      Self::Missing => format!("无 {p}"),
+      Self::Bad(e) => format!("{p} 不可用：{e}"),
+      Self::Stale => format!("{p} 是别的地图 / 存档改过了 → 作废"),
+    }
+  }
+}
+
+/// 读一个文件并校验（魔数 / 版本 / 指纹）；`Err` = 不可用（原因由调用点落日志 —— 那里才知道代价与
+/// 后续动作，见 [`Unavailable`]）。
+pub fn load(path: &Path, want_stamp: u64) -> Result<File, Unavailable> {
   let f = match File::read(path) {
     Ok(f) => f,
-    Err(_) if !path.exists() => {
-      bevy::log::info!("LOD 无 {}（远端仍按需读 Anvil；DebugMenu「世界」页可构建）", path.display());
-      return None;
-    }
-    Err(e) => {
-      bevy::log::warn!("LOD {} 不可用：{e} → 远端仍按需读 Anvil", path.display());
-      return None;
-    }
+    Err(_) if !path.exists() => return Err(Unavailable::Missing),
+    Err(e) => return Err(Unavailable::Bad(e)),
   };
   if f.stamp != want_stamp {
-    bevy::log::warn!("LOD {} 是别的地图 / 存档改过了 → 作废", path.display());
-    return None;
+    return Err(Unavailable::Stale);
   }
-  Some(f)
+  Ok(f)
 }
 
 /// 已装载的 LOD（进程级的共享句柄）：`McCITY` 每次远场采样读它，构建任务完成后热装新的一份。
@@ -871,6 +886,38 @@ mod tests {
     // 能服务的格边长只有"一节"与"细格"两档
     assert!(v.supports(FINE_CELL) && v.supports(16) && v.supports(64));
     assert!(!v.supports(8), "8 方块既不是细格也不是整数节 ⇒ 该回退 Anvil");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir(&dir);
+  }
+
+  /// [`load`] 三种"拿不到"的结局各归各的变体（调用点 `mc::build` 靠它写归因日志 + 触发自动重建）。
+  #[test]
+  fn load_distinguishes_missing_stale_bad() {
+    let dir = std::env::temp_dir().join("gate_lod_load_test");
+    let path = dir.join("t.lod");
+    let _ = fs::remove_file(&path);
+    assert!(matches!(load(&path, 1), Err(Unavailable::Missing)));
+    // 最小合法文件（1×1 列、空列）：指纹对得上 ⇒ Ok，对不上 ⇒ Stale
+    let f = File {
+      stamp: 7,
+      col_min: (0, 0),
+      dims: (1, 1),
+      sec_y: 16,
+      names: vec!["minecraft:air".to_string()],
+      mask: vec![0],
+      offs: vec![0],
+      body: Vec::new(),
+      fine_offs: Vec::new(),
+      fine_body: Vec::new(),
+    };
+    f.write(&path).expect("应能写出");
+    assert!(load(&path, 7).is_ok());
+    assert!(matches!(load(&path, 8), Err(Unavailable::Stale)));
+    // 版本字节被改 ⇒ Bad（而不是静默当"没有文件"）
+    let mut raw = fs::read(&path).expect("刚写过");
+    raw[8] = 99;
+    fs::write(&path, &raw).expect("应能改写");
+    assert!(matches!(load(&path, 7), Err(Unavailable::Bad(_))));
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir(&dir);
   }

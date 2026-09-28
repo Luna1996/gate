@@ -47,20 +47,42 @@ section y=3  调色板 16 项  实体 3849/4096
 存档**不含**贴图与形状；形状在客户端 jar 的 `blockstates/*.json` + `models/block/*.json`，
 贴图在 `textures/block/*.png`（16×16）。两份来源按 MC 的规则叠加：**资源包优先、客户端 jar 兜底**。
 
-已验证的两份来源：
+已验证的两份来源（**本机的实际位置**；注意 PCL2 是便携版，`%APPDATA%\.minecraft\versions` 是空的）：
 
-- 客户端 jar `…\.minecraft\versions\Greenfield\Greenfield.jar`（1.17.1）：1710 models / 900 blockstates / 818 textures
-- 资源包 `Greenfield.Texture.Pack.1.17.zip`：919 block 贴图 + 224 models + 108 blockstates（**覆盖**同名）
+- 客户端 jar `C:\game\PCL2\.minecraft\versions\Greenfield\Greenfield.jar`（1.17.1）：1710 models / 900 blockstates / 861 textures 条目（含 43 个 `.mcmeta`）
+- 资源包 `C:\game\Greenfield v0.5.4\Greenfield.Texture.Pack.1.17.zip`：918 block 贴图条目 + 183 models + 107 blockstates（**覆盖**同名）
 
-一次性解包（把 jar 打底、包覆盖，解到仓库外）：
+一次性解包（把 jar 打底、包覆盖，解到仓库外）。**这一步是可复现的**，别丢：
 
 ```powershell
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 $out = "C:\game\Greenfield v0.5.4\assets_mc"
-# 先解 jar 的 assets/minecraft/{blockstates,models,textures}（去掉前缀），再解包的同名覆盖
-# 结果：902 blockstates / 1823 models / 1021 textures，15.4 MB
+$jar = "C:\game\PCL2\.minecraft\versions\Greenfield\Greenfield.jar"
+$zip = "C:\game\Greenfield v0.5.4\Greenfield.Texture.Pack.1.17.zip"
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+function Unpack($src, $tag) {
+  $z = [System.IO.Compression.ZipFile]::OpenRead($src); $n = 0
+  foreach ($e in $z.Entries) {
+    if ($e.Name -eq "" -or -not $e.FullName.StartsWith("assets/minecraft/")) { continue }
+    $dest = Join-Path $out ($e.FullName.Substring(18) -replace '/', '\')
+    $d = Split-Path $dest -Parent
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $true)  # $true = 覆盖
+    $n++
+  }
+  $z.Dispose(); Write-Output "$tag 写入 $n 个文件"
+}
+Unpack $jar "jar(打底)"; Unpack $zip "资源包(覆盖)"   # 顺序不能反：包覆盖同名
 ```
 
+结果（本机实测）：**902 blockstates / 1823 `models/block` / 1021 `textures/block`**、整个
+`assets_minecraft/` 树 16.0 MB。计数对不上就是解包顺序或前缀错了。
+
 ⇒ 运行时按普通目录读 `<assets>/{blockstates,models/block,textures/block}`，**不读 zip**。
+
+WARNING: 资产**不在**世界下载包里 —— 它是从上面两份源现解出来的**派生物**。目录缺失时
+`mc::build` 直接返回 `Err`（`… 不是资产目录`）⇒ 「世界」页选 `mc_map` 时会报**重载世界失败、原世界不变**，
+而不是降级成"没贴图的方块"。要恢复就重跑上面那段脚本（幂等，可重复执行）。
 
 两个目录各有环境变量覆盖，缺省是本机的这两份：`GATE_MC_MAP`（存档根）、`GATE_MC_ASSETS`（资产根）。
 

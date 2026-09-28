@@ -1,4 +1,4 @@
-﻿[window]
+[window]
 x = 8.0
 y = 8.0
 collapsed = false
@@ -787,6 +787,13 @@ kind = "buttons"
 id = "lod"
 label = ""
 items = ["menu.game.world.lod_build", "menu.game.world.lod_cancel"]
+
+# LOD 状态（只读）：装了没有 / 构建到几成。拿不到 LOD 时远场会静默回落成按需读存档 ⇒
+# 画面只是"远处一直空着"，看不出原因，这一行就是第一现场（见 `debug_menu::lod_state_tick`）。
+[[items.children.children]]
+kind = "text"
+id = "lod_state"
+text = "menu.game.world.lod_state"
 
 [[items]]
 kind = "sub_menu"

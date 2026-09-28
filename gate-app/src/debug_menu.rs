@@ -1129,6 +1129,48 @@ pub(crate) fn camera_info_tick(
   }
 }
 
+/// 「世界」页 LOD 状态行的值：装了没有 / 构建到几成。
+///
+/// WHY 要有这一行：拿不到 LOD 时远场**静默**回落成按需读存档（L1 ≈ 350–520 ms/chunk，比 LOD 慢
+/// 293–6305×）⇒ 画面只表现为"远处一直空着"，从日志里看不出来。配上 `mc::build` 的自动重建，
+/// 回落只是"重建还没完成"的临时状态（见 docs/handover-2026-09-27.md §4.2）。
+pub(crate) fn lod_state_tick(
+  time: Res<Time>,
+  stream: Res<crate::infinite_cubes::Streaming>,
+  mut q_values: Query<(&gate_ui::MenuTextValue, &mut Text)>,
+  mut acc: Local<f32>,
+) {
+  *acc += time.delta_secs();
+  if *acc < CAM_INFO_REFRESH_SECS {
+    return;
+  }
+  *acc = 0.0;
+  let city = stream
+    .source()
+    .and_then(|s| s.clone_as_any())
+    .and_then(|a| a.downcast::<crate::mc::source::McCity>().ok());
+  let s = match city {
+    // 非 MC 地图没有 LOD 这回事（内置生成器 / 体素文件）
+    None => "—".to_string(),
+    Some(city) => match city.lod() {
+      Some(v) => t!(
+        "menu.game.world.lod_state.ready",
+        mb = format!("{:.0}", v.heap_bytes() as f64 / 1048576.0)
+      )
+      .to_string(),
+      None => match crate::mc::lod_build_state() {
+        (true, pct) => t!("menu.game.world.lod_state.building", pct = pct).to_string(),
+        _ => t!("menu.game.world.lod_state.none").to_string(),
+      },
+    },
+  };
+  for (value, mut text) in &mut q_values {
+    if value.path == "game/world/lod_state" && text.0 != s {
+      text.0 = s.clone();
+    }
+  }
+}
+
 /// 右上角 FPS：`(当前, 平均, 最低, 最高)`，每 `FPS_UPDATE_SECS` 刷新一次。
 /// - 当前 = **最新这一帧**的帧率（1 ÷ 该帧间隔）
 /// - 平均 = 近 `FPS_WINDOW_SECS` 的帧数 ÷ 该窗口时长

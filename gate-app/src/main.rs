@@ -35,7 +35,7 @@ use camera::{
 use config::{Config, save_config_on_exit};
 use debug_menu::{
   DebugUiRoot, FpsOverlayVisible, FpsWindow, camera_info_tick, debug_menu_toggle, fps_overlay_tick,
-  spawn_debug_menu_ui, sync_edit_menu, sync_sky_menu, sync_ui_locale, sync_video_menu,
+  lod_state_tick, spawn_debug_menu_ui, sync_edit_menu, sync_sky_menu, sync_ui_locale, sync_video_menu,
 };
 use edit::voxel_edit_input;
 use scene::setup;
@@ -182,8 +182,8 @@ fn main() {
         // 屏幕中心准星：仅自由模式 + 锁定鼠标时显示
         sync_crosshair,
         debug_ui_setup,
-        // 右上角 FPS 覆盖层（开关打开时每帧刷新）+ 纯文本行的相机信息
-        (fps_overlay_tick, camera_info_tick),
+        // 右上角 FPS 覆盖层（开关打开时每帧刷新）+ 纯文本行的相机信息 + 「世界」页的 LOD 状态
+        (fps_overlay_tick, camera_info_tick, lod_state_tick),
         // 「天空」页：自动流逝推进的时刻回写进菜单（面板显示的就是画面里的时刻）
         sync_sky_menu,
         // 「编辑」页：PBR 变体开着时把材质控件整行置灰（参数全由资产/贴图决定）
