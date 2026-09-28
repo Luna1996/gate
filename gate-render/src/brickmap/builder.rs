@@ -162,13 +162,6 @@ struct ChunkSlot {
   nodes: Vec<NodeSlot>,
 }
 
-impl ChunkSlot {
-  /// 已占用字数（含根节点的固定预留区）
-  fn used(&self) -> usize {
-    self.cap - self.free.words()
-  }
-}
-
 /// 节点在块内占用的字数（wire 形态）：根固定 [`ROOT_WIRE_WORDS`]（掩码增减不改根的字数 ⇒ 根永不搬迁）。
 #[inline]
 fn wire_words_of(id: u32, level: u8, mask: u64) -> usize {
@@ -872,14 +865,18 @@ impl BrickMapBuilder {
     let new_base = self.alloc_block(new_cap);
     self.buffers.b_struct.copy_within(slot.base..slot.base + old_cap, new_base);
     self.free.free(slot.base, old_cap);
-    let used = slot.used();
     slot.base = new_base;
     slot.cap = new_cap;
     slot.free.free(old_cap, new_cap - old_cap);
     let ip = self.window_word(coord);
     self.buffers.b_struct[ip] = new_base as u32 + 1;
     self.mark_struct_words(ip, 1);
-    self.mark_struct_words(new_base, used);
+    // CONSTRAINT: 整块搬走 ⇒ 标满**搬走的整个旧块**，不能只标"已占用字数"：
+    // `used() = cap − 空闲总字数`，而 [`Self::rewrite_node`] 会在块**中间**归还空闲段
+    // ⇒ 空闲段有洞时 `used()` 小于"最高占用偏移" ⇒ 洞以上的活节点既不写也不标 ⇒ GPU 侧那片字
+    // 停在搬块前的旧内容 = **该 chunk 的垃圾值**（症状：编辑后"笔触范围之外一片被改乱"）。
+    // 实测见 `dirty_ranges_cover_every_changed_word_across_block_grow`。
+    self.mark_struct_words(new_base, old_cap);
   }
 
   /// 压实树区：把存活块紧排到 `TREE_BASE` 之后、丢掉全部空闲段、窗口条目重指。
@@ -1516,6 +1513,77 @@ mod tests {
       let w = words[addr + N_FIXED + (i >> 1)];
       assert_eq!((w >> ((i & 1) * 16)) & 0xFFFF, (i + 1) as u32, "GPU 第 {i} 格槽号");
     }
+  }
+
+  /// **增量上传不变式**：`take_dirty_ranges()` 报出的区间必须覆盖 `b_struct` 里**每一个变化的字**。
+  ///
+  /// 这条就是"GPU 镜像"的定义 —— 既有测试只验 CPU 侧 wire 与 grid 一致（[`assert_wire_matches_grid`]），
+  /// **验不到它**：没被报出去的字节在 GPU 上停在旧内容，画面上就是该 chunk 的**垃圾值**（用户口径：
+  /// 放置体素时"笔触范围之外一片被改乱"）。
+  ///
+  /// 触发条件是**块扩容**（`grow_block`）：块内 arena 碎片化（反复分裂 / 合并同一片砖）后再分配失败。
+  /// 只用"把报出的区间贴回上一份快照"模拟上传；树区**长度**变化的那几轮走的是生产路径的整份重传
+  /// （`snapshot` 的 `bases_shifted` 降级全量）⇒ 跳过，但要求至少有一轮"块扩容 + 长度不变"被真验到。
+  #[test]
+  fn dirty_ranges_cover_every_changed_word_across_block_grow() {
+    let mut grid = VolumeGrid::new();
+    for x in 0..16 {
+      for y in 0..16 {
+        for z in 0..16 {
+          grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
+        }
+      }
+    }
+    let c = ChunkCoord(IVec3::ZERO);
+    // 用**带预留**的 builder（预留区就是全局空闲段）：块扩容才能从全局空闲段拿到空间 ⇒ 树区长度
+    // 不变 ⇒ 走增量上传。否则每次块扩容都伴随树区变长，而那条路会整份重传，把这处的漏报掩掉。
+    let mut b = BrickMapBuilder::new_unbuilt_sized(&grid, 1 << 20, 12);
+    let dirty = take_dirty_of(&mut grid, c);
+    b.update_chunk(&grid, c, &dirty, false);
+    assert_eq!(
+      b.buffers().b_struct.len(),
+      TREE_BASE + (1 << 20),
+      "前提：预留区当场占住（块扩容因此不会再改树区长度）"
+    );
+    let _ = b.take_dirty_ranges();
+    let mut base = b.chunk_base(c).expect("前提：有块");
+    let mut block_grows = 0usize;
+    let mut checked_grows = 0usize;
+    for i in 0..96i32 {
+      // 反复改同一片 16³ 里的格子（值在 1..=4 之间跳）⇒ 砖反复分裂 / 合并 ⇒ arena 碎片化
+      let p = IVec3::new(i % 16, (i / 16) % 16, (i / 2) % 16);
+      grid.set_voxel_ivec3(p, PaletteId((i % 4 + 1) as u16));
+      let dirty = take_dirty_of(&mut grid, c);
+      let before = b.buffers().b_struct.clone();
+      // `allow_compact = false`：把压实排除掉，让块首的变化只可能来自块扩容
+      b.update_chunk(&grid, c, &dirty, false);
+      let after = b.buffers().b_struct.clone();
+      let ranged = b.take_dirty_ranges().struct_ranges;
+      let grew_here = b.chunk_base(c).expect("前提：有块") != base;
+      if grew_here {
+        block_grows += 1;
+        base = b.chunk_base(c).expect("前提：有块");
+      }
+      if after.len() != before.len() {
+        continue; // 树区长度变了 ⇒ 整份重传，区间不变式不适用
+      }
+      let mut gpu = before;
+      for (lo, hi) in ranged {
+        gpu[lo / 4..hi / 4].copy_from_slice(&after[lo / 4..hi / 4]);
+      }
+      if let Some(w) = (0..after.len()).find(|&w| gpu[w] != after[w]) {
+        panic!(
+          "第 {i} 次编辑后有字改了却没报：word #{w}（模拟 GPU 侧 {:#x} ≠ 真值 {:#x}）\
+           —— 没报的字节在 GPU 上停在旧内容 ⇒ 该 chunk 出垃圾值",
+          gpu[w], after[w]
+        );
+      }
+      if grew_here {
+        checked_grows += 1;
+      }
+    }
+    assert!(block_grows > 0, "前提：这串编辑必须逼出至少一次块扩容（否则没覆盖 grow_block）");
+    assert!(checked_grows > 0, "前提：至少有一次块扩容发生在树区长度不变时（否则本轮没真验到区间）");
   }
 
   /// 空闲段：first-fit、相邻合并（前向 / 后向 / 双向）、跨洞不合并
