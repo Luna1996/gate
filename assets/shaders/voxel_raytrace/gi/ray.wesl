@@ -44,8 +44,8 @@ const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 /// 本写法按它后面的不透明遮挡给值 —— 起点已沿法线外推半个体素 + eps，正常路径不会走到那里。
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
   var tint = vec3<f32>(1.0);
-  // **阴影只查局部**（`GI_REACH_T` = 12 chunk = 61 m）：挡住我的东西一定在附近 —— 本仓世界 1 体素
-  // = 2 cm，阴影长度 = 内容高度 / tan(太阳高度角)，MC 全高 4096 体素、日高 38.4° ⇒ 约 100 m，
+  // **阴影只查局部**（`GI_REACH_T` = 12 chunk = 61 m）：挡住我的东西一定在附近 —— 按本仓显示换算
+  // （50 体素/米），阴影长度 = 内容高度 / tan(太阳高度角)，MC 全高 4096 体素、日高 38.4° ⇒ 约 100 m，
   // 而"看得见的"楼影都在 61 m 内。这条闸门也是**帧时**的闸门：阴影射线每像素一条（远场则每可见面
   // 一条），不夹就要走到窗口边（+1~3 ms）。
   let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, &tint);

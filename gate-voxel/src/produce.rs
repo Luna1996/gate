@@ -16,9 +16,13 @@ use crate::coords::ChunkCoord;
 use crate::volume::VolumeGrid;
 
 /// 产出档位（"粗到细流式"的梯级）。值 = **格粒度**：`grain() = 4^(4-值)` 体素 ——
-/// `0` = 整 chunk 一格（5.12 m）、`1` = 64³（1.28 m）、`2` = 16³（32 cm）、`3` = 4³（8 cm）、
-/// `4` = 逐体素（2 cm）。**声明序即精细度序**（`Detail(0) < Detail(4)`，见 `#[derive(PartialOrd)]`）：
+/// `0` = 整 chunk 一格（256 体素）、`1` = 64³（64 体素）、`2` = 16³（16 体素）、`3` = 4³（4 体素）、
+/// `4` = 逐体素（1 体素）。**声明序即精细度序**（`Detail(0) < Detail(4)`，见 `#[derive(PartialOrd)]`）：
 /// 消费端用 `>=` 判"已有的够不够细"（不够细就重新产出，挂载会整体替换）。
+///
+/// 各档的**物理边长随世界变**（体素没有固定物理边长，见 `README.md` §4「坐标系约定」）：按程序化世界的
+/// 显示换算（50 体素/米）折算，上面五档依次是 5.12 m / 1.28 m / 32 cm / 8 cm / 2 cm；MC 地图那边
+/// 1 体素 = 方块/16，所以 `16³` 那档恰好 = **1 个 MC 方块**。
 ///
 /// CONSTRAINT：**档位由"这一级在当前屏幕上是否 ≤ 1 px"定，不由半径拍**（`docs/editable-gigavoxel.md`
 /// §3.3）。粒度 `g` 体素的一档，在距离 `d` 处的像素尺寸是 `g / (d·px_ang)` ⇒ 只有当
@@ -28,15 +32,15 @@ use crate::volume::VolumeGrid;
 pub struct Detail(pub u8);
 
 impl Detail {
-  /// 逐体素（2 cm）—— 最细一档。
+  /// 逐体素（1 体素）—— 最细一档。
   pub const Full: Detail = Detail(4);
-  /// 4³ 量化（8 cm）。
+  /// 4³ 量化（4 体素）。
   pub const Fine: Detail = Detail(3);
-  /// 16³ 量化（32 cm）。
+  /// 16³ 量化（16 体素 = MC 世界的 1 个方块）。
   pub const Coarse: Detail = Detail(2);
-  /// 64³ 量化（1.28 m）。
+  /// 64³ 量化（64 体素）。
   pub const Wide: Detail = Detail(1);
-  /// 整 chunk 一格（5.12 m）—— 最粗一档。
+  /// 整 chunk 一格（256 体素）—— 最粗一档。
   pub const Chunk: Detail = Detail(0);
 
   /// 本档的**格粒度**（格边长，体素）：1、4、16、64、256。

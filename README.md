@@ -225,15 +225,23 @@ dist/              打包产物（bash package.sh 生成，gitignore）
 
 ## 4. 常量体系
 
-**坐标系约定**：1 voxel = 2cm。DDA 内所有坐标（ray origin/dir、cell、tmax）、
-`DdaCameraConfig::position_world`、`GridDesc` 的世界 AABB 与 chunk 窗口全部为 **voxel 单位**；
-chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
+**坐标系约定**：**引擎的长度单位就是体素，体素没有固定的物理边长** —— "一格有多粗"是**每个世界自己的
+约定**，`VOXEL_PER_METER` 只是给显示 / 摄像机速度 / 贴图世界尺度用的换算（随世界取，不是引擎常量）。
+DDA 内所有坐标（ray origin/dir、cell、tmax）、`DdaCameraConfig::position_world`、`GridDesc` 的世界 AABB
+与 chunk 窗口全部为 **voxel 单位**；chunk 窗口原点/尺寸为 chunk 单位（×256 即 voxel）。
+
+| 世界 | 1 体素 = | 依据 |
+|---|---|---|
+| 程序化世界 `infinite_cubes` | 1/50 m（2 cm） | 默认显示换算 `VOXEL_PER_METER = 50` |
+| **MC 地图 `mc_map`** | **MC 方块边长的 1/16** | `mc::VOXELS_PER_BLOCK = 16`，与 MC 原版材质包 16×16 一一对应 ⇒ **1 体素 = 1 texel** |
+
+本文其余地方的米 / 千米数都按程序化世界的默认换算折算（= 上述 2 cm/体素），换世界后按比例看。
 
 ### 体素 / 树（gate-voxel::coords，渲染侧在 brickmap::wire 同步一份）
 
 | 符号 | 值 | 含义 |
 |---|---|---|
-| `CHUNK_SIZE` | 256 voxel（= 5.12m） | chunk 边长；存储 / dirty 的共同粒度 |
+| `CHUNK_SIZE` | 256 voxel | chunk 边长；存储 / dirty 的共同粒度 |
 | `BRICK_FACTOR` | 4 | 分裂因子：每节点 4³ = 64 子块 |
 | `MAX_LEVEL` / `LEVEL_EXTENT` | 4 / `[256, 64, 16, 4, 1]` | 树层级边长（voxel）；level 2 = 16³ 组件粒度 |
 | `PALETTE_ENTRY_COUNT` / `PALETTE_BITS` | 65536 / 16 | 材质索引位宽（`0 = AIR`），索引上限 65535 |

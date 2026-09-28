@@ -5,7 +5,9 @@
 //! 生成走 M5 的生产管线（[`InfiniteCubes`] 实现 `gate_voxel::ChunkSource`，worker 线程并行产出），
 //! 挂载 / 常驻 / 卸载全走真实流程（真 world 只是把"读系统文件"那一步换成了本模块的生成函数）。
 //!
-//! **尺度**：1 体素 = 2cm（`README` §4）。为对齐 4³ brick（批量填充的前提；不对齐的话生成成本会从
+//! **尺度**：体素没有固定物理边长（`README` §4「坐标系约定」）—— 本世界按显示换算
+//! `VOXEL_PER_METER = 50`（2 cm/体素）折算下面这些"规格米数"，体素数本身与世界无关。
+//! 为对齐 4³ brick（批量填充的前提；不对齐的话生成成本会从
 //! µs 级掉到 ms 级）取 **4 的倍数**：
 //! - room = **148 体素 = 2.96m**（规格 3m）—— 4 的倍数里离 3m 最近、又满足 `(room − cube) % 8 == 0`
 //!   （cube 偏移既 4 对齐又精确居中）的那个取值
@@ -65,8 +67,8 @@ pub(crate) fn initial_box(center: IVec3) -> (IVec3, IVec3) {
 ///   粒度 `g = FAR_GRAIN · scale` ⇒ `覆盖/g = 8192/FAR_GRAIN = 2048`，接缝处恒
 ///   `935·FAR_GRAIN/8192 = 0.46 px`（**与 scale 无关** ⇒ 接缝宽度不随级数变）。
 ///
-/// ⇒ 覆盖半径（世界体素 / 米，1 体素 = 2 cm）：`4` → 32768 / **655 m**、`16` → 131072 / **2.6 km**、
-/// `64` → 524288 / **10.5 km**。**5 km 视距由 L3 覆盖**（§10.4 的验收目标）。
+/// ⇒ 覆盖半径（世界体素 / 米，米数按本世界显示换算 50 体素/米折算）：`4` → 32768 / **655 m**、
+/// `16` → 131072 / **2.6 km**、`64` → 524288 / **10.5 km**。**5 km 视距由 L3 覆盖**（§10.4 的验收目标）。
 ///
 /// CONSTRAINT: 级体素必须是 `FAR_GRAIN` 的倍数（格点才能落在世界坐标的整数格上）。
 pub const FAR_SCALES: [i32; 3] = [4, 16, 64];
@@ -172,7 +174,7 @@ fn attach_far_levels_with(
     // `(r_out+1)·256·scale` 世界体素（最外那一圈 chunk 的外缘）—— 与窗口 AABB 分开，见
     // `VolumeGrid::set_coverage_r` 的 WHY。
     g.set_coverage_r(far_coverage_voxels(vol) as f32);
-    // 启动里程碑（一次性，3 行）：覆盖半径是验收"视距 ≥ 5 km"的直接依据（1 体素 = 2 cm）
+    // 启动里程碑（一次性，3 行）：覆盖半径是验收"视距 ≥ 5 km"的直接依据（体素数；米数按本世界换算）
     bevy::log::info!(
       "FAR L{vol} scale {scale}（1 级体素 = {scale} 世界体素）覆盖 ±{:.2}km；窗口 {}×{}×{} chunk × 256 级体素、\
        格 {FAR_GRAIN} 级体素 = {:.2}m；半径阶梯 r{r_in}..{r_out}",
@@ -1439,12 +1441,30 @@ pub(crate) const SEAM_MARGIN: i32 = 2;
 /// 多出来的只是最内那一圈块。
 const FAR_PRELOAD_INNER: i32 = crate::mc::NEAR_COVER_CHUNKS / 4 - 2;
 
-/// **全档位预载的内圈半径**（该级自己的 chunk 单位）：它的外面封顶到 `Detail::Coarse`（32 cm）。
+/// **预载底子档的封顶**（`detail_at` 之上再取 min）：盘内实际档位 = `min(detail_at(距离), 本值)`。
 ///
-/// 越界的那一圈（41 m → 主世界窗口边 164 m）由预载**铺底子**、射线细化，所以底子必须便宜：
-/// `detail_at` 在 ≤75 m 会要 `Full`（2 cm，278 KB/块）⇒ 铺到 164 m 就是几万块 × 几百 KB = 几 GB，
-/// 池一定装不下、装不下就被截断 ⇒ 洞。8 chunk = 41 m 处取 32 cm（12 KB/块）⇒ 底子 ~500 MB 装得下。
-/// 判据不变：**近处画面上仍是 2 cm/8 cm** —— 那是射线按"≤ 1 px"报 level 细化出来的（`detail_of_req`）。
+/// `Detail::Fine` = **不要 `Detail::Coarse`**（当前取值）：盘内 = 内圈逐体素、41–164 m 走 `4³` 体素档。
+/// （米数是程序化世界的显示换算；档位本身按**格粒度**读 —— 见 [`Detail`]。）
+///
+/// WHY 不能要 `Detail::Coarse`：只有它会把方块**逐块 `fill_brick` 填满 `16³`**（`mc/source.rs` 的
+/// `grain == 16` 分支只写 `plan.rep`）⇒ **子方块形状丢掉**（台阶 / 栅栏 / 火把都塌成整格）；而
+/// `Detail::Fine`（`4³` 体素）走 `plan.fills` ⇒ 形状完整保留。
+///
+/// WHY 止步于 `Detail::Fine` 而不上 `Detail::Full`：**MC 侧的产出只有 `4³` 体素一档**
+/// （`mc/voxel.rs::BlockPlan::fills` 就是 `4³` 砖；`mc/source.rs` 里 `grain == 1` 与 `grain == 4`
+/// 走**同一分支**）⇒ 对 MC 地图 Full 与 Fine 的产出**逐字相同**，"最准"就是 Fine；取 Full 只会
+/// 让程序化世界在 41–75 m 白花逐体素的内存（那里 `detail_at` 要的是 Full）。
+///
+/// 代价：MC 的**满方块**（城市里绝大多数）在 Coarse 与 Fine 下都是**一条整块写** ⇒ 逐字相同，
+/// 增量只来自子方块模型 ⇒ 常驻字节基本不变（`upload.rs` 的 64 KB/块 估计仍成立）。
+/// 装不下 / 想换视距时按档调：往下退一档就是 `Detail::Coarse`（形状会丢，见上）；或调小「粗档半径」。
+const PRELOAD_DETAIL_CAP: Detail = Detail::Fine;
+
+/// **全档位预载的内圈半径**（该级自己的 chunk 单位）：它的外面按 [`PRELOAD_DETAIL_CAP`] 封顶。
+///
+/// 内圈按裸 `detail_at` 给档（8 chunk = 41 m 处要逐体素），外面封顶到 [`PRELOAD_DETAIL_CAP`]
+/// ⇒ 41 m 之外一律 `4³` 体素档。判据不变：**近处画面上仍是最细那两档** —— 那是射线按"≤ 1 px"
+/// 报 level 细化出来的（`detail_of_req`）。
 const PRELOAD_FULL_CHUNKS: i32 = 8;
 
 /// 远场预载枚举的**外圈上限**（该级自己的 chunk 单位）：与窗口半宽同量级（窗口 64³）。
@@ -1549,10 +1569,15 @@ fn detail_at(dist_chunks: i32) -> Detail {
 /// （`trace.wesl::req_level`：0 = 全分辨率 4³、1 = 16³、2 = 64³、3 = 整 chunk）。
 ///
 /// 只有四档：射线分不出 `Full` 与 `Fine` 的差别（2 cm 与 8 cm 落在同一像素内），所以不造第五档。
+///
+/// level 1 落到 [`Detail::Fine`] 而**不是** `Detail::Coarse`：Coarse(grain 16) 会把 MC 的方块
+/// 整块填满 ⇒ 子方块形状丢掉（见 [`PRELOAD_DETAIL_CAP`]）。改成 Fine 之后，请求与 [`detail_at`]
+/// 在 75–164 m 上取值一致 ⇒ 两者不打架（否则请求先产出 Coarse、预载下一帧再把它升到 Fine，
+/// 同一块产出两遍）。
 fn detail_of_req(level: u8) -> Detail {
   match level {
     0 => Detail::Full,
-    1 => Detail::Coarse,
+    1 => Detail::Fine,
     2 => Detail::Wide,
     _ => Detail::Chunk,
   }
@@ -1653,15 +1678,29 @@ fn plan_generation(
         seen[w] |= m;
       }
     }
+    // 预载目标档（下面的判据与 `picked.extend` **共用同一份**，避免两处口径分叉）：
+    // 内圈（`PRELOAD_FULL_CHUNKS`）按 `detail_at`，更远按 `PRELOAD_DETAIL_CAP` 封顶。
+    let detail_for = |c: IVec3| {
+      let d = detail_of(c);
+      if (c - center).abs().max_element() <= PRELOAD_FULL_CHUNKS {
+        d
+      } else {
+        Detail(d.0.min(PRELOAD_DETAIL_CAP.0))
+      }
+    };
     let mut todo: Vec<IVec3> = Vec::new();
-    // 判据是**存在性**（`Detail::Chunk` = 最粗一档），不是"够不够细"。
+    // 判据是"**够不够细**"（`detail_for`），不是"有没有块"。
     //
-    // WHY：预载负责**覆盖**，细化由射线负责（论文口径"refinement 由渲染结果给"）。若这里也用
-    // `detail_of(c)` 当判据，那么相机一移动，常驻块的档位就会按新的距离被要求升级 ⇒ 每帧都有块
-    // 被重装（`max_install_per_frame` 顶死、`evict 0` 却恒有 install）—— 实测帧率 60 → 33。
-    // 缺失的块按 `detail_of(c)` 首次产出，之后不动它；真需要更细的，射线会报 level 上来。
+    // WHY：常驻块可能是**远处加载时**按当时距离产出的更粗的档；用"有没有块"当判据的话，它飞近后
+    // 永远升不上来（`have(c, Detail::Chunk)` 恒真）。也别指望"细化交给射线"那条路 —— 请求只在
+    // 射线发现"这块没有树"时才发，已经有树（哪怕很粗）的块不会被再要。
+    //
+    // 只升不降（降级交给 LRU 换出）⇒ 一个块每次"变细"只重装一次，且**不会来回抖**：档位随距离
+    // 单调，升级后回到远处时 `have(细档, 粗档)` 恒真 ⇒ 不再产生需求。
+    // 与那次 60 → 33 fps 的旧尝试的区别：这里用的是**封顶后**的 `detail_for`（内圈 41 m、外面
+    // 8 cm），不是裸的 `detail_of`（≤75 m 要 Full）⇒ 需求量级与"原地加载"完全一致。
     let mut push = |c: IVec3, todo: &mut Vec<IVec3>| {
-      if !in_window(c) || have(c, Detail::Chunk) {
+      if !in_window(c) || have(c, detail_for(c)) {
         return;
       }
       if let Some((w, m)) = bit_of(c) {
@@ -1710,20 +1749,8 @@ fn plan_generation(
       };
       (d.length_squared(), off, c.x, c.y, c.z)
     });
-    // **预载档位封顶到 `Detail::Coarse`**（近处立方核除外）。`detail_at` 在 41–164 m 会要 `Full`
-    // （2 cm，278 KB/块）—— 要覆盖 164 m 的盘就是几万块 × 几百 KB ⇒ 几个 GB，池一定装不下，
-    // 装不下就被截断 ⇒ 洞。改成：底子用 32 cm（12 KB/块）**铺满**，**细节仍由射线细化**
-    // （`detail_of_req`：射线按"屏幕上 ≤ 1 px"报 level，命中的块会被升级到 Full）⇒ 铺得满、
-    // 近处画面上仍是 2 cm/8 cm。
-    let cap = Detail(Detail::Coarse.0);
-    let detail_for = |c: IVec3| {
-      let d = detail_of(c);
-      if (c - center).abs().max_element() <= PRELOAD_FULL_CHUNKS {
-        d
-      } else {
-        Detail(d.0.min(cap.0))
-      }
-    };
+    // 档位一律取 `detail_for`（内圈按 `detail_at`、外面封顶到 [`PRELOAD_DETAIL_CAP`]）——
+    // 封顶后的档位一旦被靠近，由上面的判据按 `detail_for` 重装顶细。
     picked.extend(todo.into_iter().take(budget).map(|c| (c, detail_for(c))));
   }
   (picked, from_req)
@@ -2093,6 +2120,42 @@ mod tests {
     g.get_voxel(VoxelCoord::new(p.x, p.y, p.z)).is_some()
   }
 
+  /// **预载必须"认升级"，且只升不降**。
+  ///
+  /// 锁的回归：从**远处**加载过的块（那时按距离只能拿更粗的档）飞近后必须被**按 `detail_for`
+  /// 重新产出**顶细，否则它永久停在粗档 —— 请求那一路救不了它（请求只在"这块没有树"时才发）。
+  /// 反向也要锁：常驻块已够细时**不许**再产生需求，否则帧帧重装（曾经 60 → 33 fps）。
+  #[test]
+  fn preload_upgrades_coarse_chunks_and_never_downgrades() {
+    // 半径 12 ⇒ 盘里同时有"内圈（≤ [`PRELOAD_FULL_CHUNKS`]，目标按 `detail_at`）"与
+    // "外圈（更远，目标封顶到 [`PRELOAD_DETAIL_CAP`]）"
+    let scope = gen_scope(1024, 1, 12, 3);
+    let near = IVec3::new(2, 0, 0); // 内圈 ⇒ 目标 Full
+    let far = IVec3::new(10, 0, 0); // 外圈 ⇒ 目标封顶到 PRELOAD_DETAIL_CAP
+    let plan_with = |held: Detail| {
+      let have = |c: IVec3, want: Detail| (c == near || c == far) && held >= want;
+      plan_generation(scope, 4096, &[], have).0
+    };
+    // ① 常驻是 Coarse ⇒ 内圈那块必须被升级到 Full
+    let batch = plan_with(Detail::Coarse);
+    assert!(
+      batch.contains(&(near, Detail::Full)),
+      "内圈的粗档块必须被重新要（升级到 Full）：{batch:?}"
+    );
+    // ② 已经够细（Full）⇒ 不再要它（只升不降，否则帧帧重装）
+    let batch = plan_with(Detail::Full);
+    assert!(!batch.iter().any(|(c, _)| *c == near), "已够细就不该再要：{batch:?}");
+    // ③ 外圈已经到封顶档 ⇒ 不该再要（否则盘一铺满就帧帧重装）
+    let batch = plan_with(PRELOAD_DETAIL_CAP);
+    assert!(!batch.iter().any(|(c, _)| *c == far), "封顶档不该被反复重发：{batch:?}");
+    // ④ 外圈的**更粗**块必须被升到封顶档 —— 这就是"从远处重载再飞过来一直是整块"那一类
+    let batch = plan_with(PRELOAD_DETAIL_CAP.coarser());
+    assert!(
+      batch.contains(&(far, PRELOAD_DETAIL_CAP)),
+      "外圈的粗档块必须被升到封顶档：{batch:?}"
+    );
+  }
+
   /// 测试用 scope：以原点为中心的窗口（半宽 = `window`）；`forward` 由用例按需覆盖
   /// （它只当排序的次序键，见 [`plan_generation`]）。
   fn gen_scope(window: i32, load_radius: i32, coarse_radius: i32, coarse_height: i32) -> GenScope {
@@ -2138,7 +2201,7 @@ mod tests {
       batch,
       vec![
         (IVec3::new(5, 0, 0), Detail::Full),
-        (IVec3::new(20, 0, 0), Detail::Coarse),
+        (IVec3::new(20, 0, 0), Detail::Fine),
         (IVec3::new(60, 0, 0), Detail::Wide),
         (IVec3::new(300, 0, 0), Detail::Chunk),
         (IVec3::new(1000, 0, 0), Detail::Chunk),
@@ -2215,9 +2278,10 @@ mod tests {
     assert_eq!(detail_at(234), Detail::Wide);
     assert_eq!(detail_at(934), Detail::Wide);
     assert_eq!(detail_at(935), Detail::Chunk);
-    // 请求档位是**四档**（射线分不出 Full 与 Fine —— 2 cm 与 8 cm 落在同一像素内）
+    // 请求档位是**四档**（射线分不出 Full 与 Fine —— 2 cm 与 8 cm 落在同一像素内）；
+    // level 1 落 `Fine`（不是 `Coarse`：Coarse 丢 MC 的子方块形状，见 `detail_of_req`）
     for (level, want) in
-      [(0u8, Detail::Full), (1, Detail::Coarse), (2, Detail::Wide), (3, Detail::Chunk)]
+      [(0u8, Detail::Full), (1, Detail::Fine), (2, Detail::Wide), (3, Detail::Chunk)]
     {
       assert_eq!(detail_of_req(level), want, "level {level} 的档位映射");
     }

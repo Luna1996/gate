@@ -11,7 +11,8 @@
 //!
 //! 于是 M5/M6/M8 那套流式环（窗口跟相机、射线请求驱动装载、LRU 卸载、多 volume）**原样可用**：
 //! [`source::McCity::produce`] 只要把"我们的一块 = MC 的一个 section"翻译成方块 → 体素即可，
-//! 不需要任何缩放或偏移。（1 体素 = 2 cm ⇒ 一个 section = 5.12 m，与 `infinite_cubes` 的 chunk 同尺寸。）
+//! 不需要任何缩放或偏移。（本世界的体素边长取 MC 材质分辨率：1 体素 = 方块/16 ⇒ 一个 section
+//! = 256 体素 = 16 方块，与 `infinite_cubes` 的 chunk 同**体素数**。）
 //!
 //! # 数据来源
 //!
@@ -59,7 +60,8 @@ use crate::infinite_cubes::SEAM_MARGIN;
 /// 世界名（「游戏/世界」页模型下拉里就选它，见 `crate::debug_menu`）
 pub const MC_MAP: &str = "mc_map";
 
-/// 一个 MC 方块跨多少**世界体素**：1 方块 = 32 cm、1 体素 = 2 cm ⇒ 16。
+/// 一个 MC 方块跨多少**世界体素** = **16**（本世界的体素边长取 MC 材质分辨率：1 方块 = 16³ 体素，
+/// 即 **1 体素 = 1/16 方块 = 1 texel**；见 `docs/mc_map.md` §1。体素本身没有固定物理边长。）
 ///
 /// 这是"方块 ↔ 体素"唯一的换算口径（`spawn_eye` 的出生点、远场格的方块边长、`far_tree` 的块原点
 /// 都按它算）—— 别再拿 `FAR_GRAIN` 当它用：`FAR_GRAIN` 是**格**的级体素边长，两者只是在

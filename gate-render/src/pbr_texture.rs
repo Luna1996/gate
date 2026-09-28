@@ -80,7 +80,8 @@ const MATERIAL_FLAT_SHADING_CONST: &str = "MATERIAL_FLAT_SHADING";
 ///
 /// **为什么是 128（而不是原来的 1024）**：显存/带宽该由**真实采样密度**决定，而 MT8-1 之后
 /// 一个体素面只取 **1 个**采样点（`MATERIAL_FLAT_SHADING = 1`，见 `common.wesl::material_sample_pos`）：
-///   · 一张贴图铺 `MATERIAL_TEX_WORLD_SCALE = 2m`，而 `MATERIAL_VOXEL_PER_METER = 50` ⇒ **100 体素/张**；
+///   · 一张贴图铺 `MATERIAL_TEX_WORLD_SCALE = 2m`，而显示换算 `MATERIAL_VOXEL_PER_METER = 50`
+///     （程序化世界；体素没有固定物理边长，见 `gate_app::consts::VOXEL_PER_METER`）⇒ **100 体素/张**；
 ///   · 128 / 100 = **1.28 texel/体素 ≥ 1** ⇒ 贴图分辨率与体素格**同量级**（再高的 texel 密度只是
 ///     "每体素面只取 1 次"时被丢掉的过采样）。1024 是 **8× 过采样**（每轴），纯浪费。
 ///   · 与 MT6 的高度图路径**恰好对齐**：`height_field::HEIGHT_DOWNSAMPLE = 8` 把 1k 高度图降到

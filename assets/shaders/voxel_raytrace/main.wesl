@@ -902,7 +902,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   //   · **同平面**（`gi_den_same_plane`）：挡住跨朝向（台阶顶面 / 薄板背面 / 玻璃后面的实心墙）；
   //   · **同着色法线**（导引里的 `GI_DEN_G_NRM` 与本像素 `gi_pack_dir(voxel_normal)` **逐位相等**）：
   //     `voxel_normal` 是**邻域梯度**法线，在同一平面内部也会因凸点 / 台阶而倾斜（本工程一个方块是
-  //     16³ 微体素 ⇒ 这类凸点零散分布在 2cm 体素尺度上）；它经 `triplanar_sample` 的三轴混合权重
+  //     16³ 微体素 ⇒ 这类凸点零散分布在**体素尺度**上）；它经 `triplanar_sample` 的三轴混合权重
   //     直接改变 albedo，又决定 `ndl` 与反光 ⇒ 缓存色里烘的那一份必须与本像素自己的一致。
   //     判"逐位相等"而不是 `gi_same_surface` 的 `dot ≥ 0.7`：后者对 GI 积分够用（45° 凸棱法线算
   //     同一个面，见 `gi/denoise.wesl`），但**对颜色不够** —— 45° 的三轴权重差足以让 albedo 明显变。

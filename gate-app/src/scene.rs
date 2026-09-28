@@ -1,4 +1,4 @@
-﻿//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 `reload_world` + demo 极限场景生成。
+//! 场景搭建：Startup 系统 setup（相机/资源/诊断）+ 运行期换世界 `reload_world` + demo 极限场景生成。
 //! 启动场景与规模见 `consts`（`STARTUP_DEMO_SCENE` / `DEMO_TILES`）。
 
 use bevy::{image::Image, prelude::*};
@@ -235,7 +235,8 @@ fn build_world(
   vox_scene::load_vox_scene(grid, &path, anchor)
 }
 
-/// MC 地图的默认机位：站在出生点上方、往世界 −z 方向退 8 m 看回来（1 体素 = 2 cm ⇒ 400 体素 = 8 m）。
+/// MC 地图的默认机位：站在出生点上方、往世界 −z 方向退 8 m 看回来（本世界 1 体素 = 方块/16
+/// ⇒ 400 体素 = 25 方块 ≈ 25 m）。
 /// 出生点由 `level.dat` 给（[`mc::spawn_eye`]）；读不到就退回原点上方 8 m。
 fn mc_camera() -> (Vec3, Vec3) {
   let target = mc::spawn_eye().unwrap_or(IVec3::new(0, 400, 0)).as_vec3() + Vec3::new(0.0, 80.0, 0.0);

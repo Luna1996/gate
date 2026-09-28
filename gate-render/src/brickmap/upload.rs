@@ -1240,21 +1240,19 @@ const LEDGER_SWEEP_FRAMES: u64 = 240;
 /// 取几倍于一个回读窗口（`REPORT_PERIOD_SECS` × 帧率）的量：太短会让"上一窗口看到、这一窗口刚好没被
 /// 采样到"的 chunk 掉出需求集而被换出 ⇒ 下一窗口再装回来（装卸抖振）。
 const USE_KEEP_FRAMES: u64 = 600;
-/// 每个 chunk 在 GPU 上的**每块字节上界**（不是均值）—— 用来把"块数"折成 GPU 侧的字节预算。
+/// 每个 chunk 在 GPU 上的**每块字节估计**（混合口径）—— 用来把"块数"折成 GPU 侧的字节预算。
 ///
-/// CONSTRAINT: 这里取的是**粗档混合**的估计，不是单块上界 —— **只在
-/// `infinite_cubes::plan_generation` 把**预载**档位封顶在 `Detail::Coarse` 时才成立**（那时绝大多数
-/// 块是 1–3 KB 的粗档，全分辨率只出现在射线细化过的几百块上 ⇒ 实际字节远低于这个估计）。若哪天预载
-/// 又去要 `Full`/`Wide`（278 KB–1 MB/块），必须回到**上界**口径（384 KB）：否则池会在块数上限之前就被
-/// 字节预算顶住，每帧换出 1–4 块、`install` 恒为 0 —— 新挂上的块立刻被换掉，缺口再也补不齐
-/// （实测：`RESID[resident 1897 622573KB install 0 evict 4]` 每帧重复）。
+/// CONSTRAINT: 本值与 [`CPU_CHUNK_BYTES_EST`] **必须同值**：两边块数不一致时，CPU 会留住 GPU 装不下
+/// 的块（GPU 按字节预算换出、下一帧 CPU 又装回来 ⇒ `install`/`evict` 抖振）。
+///
+/// 估计偏低会让池在**块数上限之前**就被字节预算顶住，每帧换出 1–4 块、`install` 恒为 0 —— 新挂上的
+/// 块立刻被换掉，缺口再也补不齐（实测：`RESID[resident 1897 622573KB install 0 evict 4]` 每帧重复）；
+/// 估计偏高则把池算小 ⇒ 预载盘被截断（`chunks == cap`）⇒ 画面里那一圈永远是洞。
 ///
 /// REF: 本值 = **64 KB**（⇒ 4 GB 预算下池 65536），与 [`CPU_CHUNK_BYTES_EST`] 同值。曾因"池块数 ×
 /// 每块字数"的一次顶到位预分配（池 87381 ⇒ 单次 44.5 GB 分配失败）而不敢调小 —— 那条已在
 /// `grow_region` 改成**有界倍增**后解除：瞬时占用 ≤ 2× 实际用量。实测池 65536、常驻 18094 块、
 /// 835 MB（`mc_map.md` §8.16.1）。
-///
-/// REF: 与 [`CPU_CHUNK_BYTES_EST`] 取**同值**：两边块数必须一致，否则 CPU 会留住 GPU 装不下的块。
 const GPU_CHUNK_BYTES_EST: usize = 64 * 1024;
 /// 每个 chunk 在 **CPU**（`VolumeGrid` 里的树）的**混合**字节数 —— **池容量的真正约束**。
 ///
@@ -1265,9 +1263,11 @@ const GPU_CHUNK_BYTES_EST: usize = 64 * 1024;
 ///
 /// WARNING: 别退回"按单块上界"（1 MiB）：那会把池算成 `预算/1MiB`（= 2048 块），比实际能装的小
 /// **14×** ⇒ 主世界的预载盘被截断（`chunks == cap` 且 `ready` 常年非空），画面里那一圈永远是洞。
-/// 取 **384 KB**（与 [`GPU_CHUNK_BYTES_EST`] 同值）：两边**块数必须一致** —— CPU 若比 GPU 能装得更多，
-/// 多出来的那些块会被 GPU 侧按字节预算换出、下一帧又被 CPU 侧装回来（`install`/`evict` 抖振）。
-/// 与 GPU 侧同一条依赖：**只在预载档位封顶在 `Detail::Coarse` 时安全**（见 `GPU_CHUNK_BYTES_EST`）。
+///
+/// CONSTRAINT: 本值同时决定**块数上限**（`预算/本值`）与 GPU 侧的字节预算
+/// （`gpu_pool_bytes` = 块数上限 × [`GPU_CHUNK_BYTES_EST`]；两者同值时 = 预算本身）。
+/// 取 64 KB ⇒ 4 GB 预算下 65536 块，而实测需求 ~1 万块（`mc_map.md` §8.16.1）⇒ 有余量。
+/// 别按"每块上界"取（384 KB）：那会把块数上限压到 10922 ≈ 需求 ⇒ 预载盘被截断。
 ///
 /// REF: 本值 = **64 KB**，与 [`GPU_CHUNK_BYTES_EST`] 同值（两边块数必须一致）。曾经的一次顶到位
 /// 预分配风险已在 `grow_region` 的有界倍增后解除，见 [`GPU_CHUNK_BYTES_EST`] 的 REF。
