@@ -85,7 +85,7 @@ const LOD_DIAG: u32 = 0u;
 /// `lod_diag` 槽位：0 = 采样到的叶入口数（本来要逐格 march 的那些），1 = 其中被叶级 LOD 拦下的，
 /// 2 = 非法早停（`gd >= depth_cap` 且本节点 `pal == 0` —— 那不是该子块的颜色）。
 /// 3..8 = **主 pass 逐面查表的覆盖计数**（`main.wesl::dda_main` 的仪表，槽位常量在那边）：
-/// 精确命中 / 覆盖 texel 回退命中 / 回退无键 / 回退槽失配 / 内联着色。
+/// 精确命中 / 覆盖 texel 回退命中 / 回退不可用（无键或异面或异法线或异材质） / 回退槽失配 / 内联着色。
 const DIAG_LEAF_ENTRIES: u32 = 0u;
 const DIAG_LEAF_STOPS: u32 = 1u;
 const DIAG_ILLEGAL_STOPS: u32 = 2u;

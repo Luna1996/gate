@@ -35,8 +35,8 @@ pub const DDA_LOD: bool = true;
 /// 解析同一份源码（单一来源，见该函数的说明）。
 ///
 /// 槽位 3..9 = **主 pass 逐面查表的覆盖计数**（`main.wesl::dda_main` 的仪表，
-/// 见那里的 `DIAG_FACE_*`）：精确命中 / 覆盖 texel 回退命中 / 回退无键 / 回退槽失配 /
-/// 命中像素走了内联 / 天空像素（`first.hit == false`）。
+/// 见那里的 `DIAG_FACE_*`）：精确命中 / 覆盖 texel 回退命中 /
+/// 回退不可用（无键或异面或异法线或异材质） / 回退槽失配 / 命中像素走了内联 / 天空像素。
 /// 它就是"认领覆盖率"的量具：一次读数即知每个像素从哪条路拿到颜色（`LOD_DIAG = 0` 时零开销）。
 pub const LOD_DIAG_WORDS: usize = 9;
 /// **M4 ray-guided 请求通道**（`docs/editable-gigavoxel.md` §4 M4）：shader 把"射线想要细节、而那个

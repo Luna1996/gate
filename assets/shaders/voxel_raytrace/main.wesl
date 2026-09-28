@@ -1,6 +1,6 @@
 import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
@@ -806,20 +806,25 @@ const GI_FACE_FALLBACK: u32 = 1u;
 /// "内联的唯一来源是回退失败"两条结论（见 `docs/editable-gigavoxel.md` §10 第五轮）。
 const DIAG_FACE_EXACT: u32 = 3u;    // 精确键命中
 const DIAG_FACE_FB_HIT: u32 = 4u;   // 覆盖 texel 回退命中
-const DIAG_FACE_FB_NOKEY: u32 = 5u; // 回退失败：覆盖 texel 没有主命中（键为 0）
+const DIAG_FACE_FB_NOKEY: u32 = 5u; // 回退不可用：无主命中 / 异平面 / 异着色法线 / 异材质
 const DIAG_FACE_FB_MISS: u32 = 6u;  // 回退失败：键有、槽没认领 / 键不符（撞键）
 const DIAG_FACE_INLINE: u32 = 7u;   // 命中像素最终走内联着色
 const DIAG_FACE_SKY: u32 = 8u;      // 天空像素（`first.hit == false`）
 
-/// **本像素所在那个 GI texel 的主命中面键**（返回值 = 该 texel 有主命中）。
+/// **本像素所在那个 GI texel 的主命中面键 + 该 texel 的导引字址**（返回值 = 该 texel 有主命中）。
 /// 下标口径与 `shade_face` 里 `gi_div = 1` 的法线复用**逐字相同**（`floor(uv · gi_size)`，
 /// `gi_guide_out` 的布局见 `gi/consts.wesl`：键非零 = 有效，**没有**独立有效位）。
-/// 它是「覆盖 texel 回退」的键源：该 texel 命中的面必然被 `gi_main` 认领过（同一帧、同一张表）。
-fn gi_cover_key(uv: vec2<f32>, key_out: ptr<function, vec2<u32>>) -> bool {
+/// 它只回答"那个 texel 有主命中"，**不回答"命中的是同一个面"** —— 调用方必须再判
+/// 同平面 / 同着色法线 / 同材质（见 `dda_main` 的覆盖回退段）。
+/// `guide_off_out` = 该 texel 在 `gi_guide_out` 里的字址（取 `GI_DEN_G_NRM` 那格用它）。
+fn gi_cover_key(uv: vec2<f32>, key_out: ptr<function, vec2<u32>>,
+                guide_off_out: ptr<function, u32>) -> bool {
   let gi_size = vec2<u32>(textureDimensions(gi_tex));
   let tp = vec2<i32>(floor(uv * vec2<f32>(f32(gi_size.x), f32(gi_size.y))));
+  *guide_off_out = 0u;
   if (tp.x < 0 || tp.y < 0 || tp.x >= i32(gi_size.x) || tp.y >= i32(gi_size.y)) { return false; }
   let gb = (u32(tp.y) * gi_size.x + u32(tp.x)) * GI_DEN_GUIDE_WORDS;
+  *guide_off_out = gb;
   *key_out = vec2<u32>(gi_guide_out[gb + GI_DEN_G_KEY0], gi_guide_out[gb + GI_DEN_G_KEY1]);
   return (*key_out).x != 0u || (*key_out).y != 0u;
 }
@@ -879,18 +884,39 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             world_cfg_primary(t_min, 3u));
 
   // ---- 逐面去重查表（`face_slots`：认领在 `gi/screen.wesl`、计算在 `dda_face_main`）----
-  // 两级，判据都以「**同一个面**（键逐位相等）」为唯一准入：
-  //   ① **精确键** = 本像素自己的可见面（体素 + 面号 + 物体）。
-  //   ② **覆盖 texel 回退**（`GI_FACE_FALLBACK`）= 本像素**所在那个 GI texel** 命中的面。
-  // 两级都查不到（未认领 / 撞键 / GI 关 / 键越界）⇒ 内联 `shade_face`，结果与认领者**逐位相同**。
+  // 两级，准入都是「**同一个面**」，但口径两级不同：
+  //   ① **精确键** = 本像素自己的可见面（体素 + 面号 + 物体）**逐位相等**（认领者算的就是它）。
+  //   ② **覆盖 texel 回退**（`GI_FACE_FALLBACK`）= 本像素**所在那个 GI texel** 命中的面，
+  //      准入 = **同平面 + 同（逐位）着色法线 + 同材质**（见下面回退段）。
+  // 两级都查不到（未认领 / 撞键 / GI 关 / 键越界 / 覆盖 texel 异面或异法线或异材质）⇒ 内联着色。
   //
   // WHY ②必须存在：认领发生在 **GI 分辨率**（`gi_main` 每个 texel 抢自己命中的那个面），而消费者是
   // **全分辨率**像素。一个面上屏幕 ≤ 一个 texel（远场小面 / 细杆 / 薄板边缘）时，它只可能被"包含它的
   // 那个 texel"认领，而它自己的**体素**在 1/2 档下与相邻 2×2 像素里的邻居不是同一个键 ⇒ 精确键对不上
   // ⇒ 从前那些像素**每个都内联整条 `shade_face`**（含阴影射线 + 材质 + 法线 + GI 采样），实测这是
   // 主 pass 的最大单项。回退用"覆盖 texel 的面"接住它们：那是**同一套逐面着色**（同一个槽、同一个
-  // '认领者算一次'的值），代价 = 一次导引读 + 一次槽读。差异只落在"面 < 一个 texel"的细节上，
-  // 粒度 = 一个 GI texel（1/2 档 = 2×2 像素）—— 与作者「着色量子 = 一个可见体素面」同一口径。
+  // '认领者算一次'的值），代价 = 一次导引读 + 一次槽读。
+  //
+  // ⚠️ 回退借的是**另一个体素**的 baked 颜色 ⇒ 「色相同」必须显式判足三条，少一条就出
+  // **零散的单体素面大小的明暗点**（实测根因：`隐式法相` 清零后斑点消失 ⇒ 载体是**着色法线**）：
+  //   · **同平面**（`gi_den_same_plane`）：挡住跨朝向（台阶顶面 / 薄板背面 / 玻璃后面的实心墙）；
+  //   · **同着色法线**（导引里的 `GI_DEN_G_NRM` 与本像素 `gi_pack_dir(voxel_normal)` **逐位相等**）：
+  //     `voxel_normal` 是**邻域梯度**法线，在同一平面内部也会因凸点 / 台阶而倾斜（本工程一个方块是
+  //     16³ 微体素 ⇒ 这类凸点零散分布在 2cm 体素尺度上）；它经 `triplanar_sample` 的三轴混合权重
+  //     直接改变 albedo，又决定 `ndl` 与反光 ⇒ 缓存色里烘的那一份必须与本像素自己的一致。
+  //     判"逐位相等"而不是 `gi_same_surface` 的 `dot ≥ 0.7`：后者对 GI 积分够用（45° 凸棱法线算
+  //     同一个面，见 `gi/denoise.wesl`），但**对颜色不够** —— 45° 的三轴权重差足以让 albedo 明显变。
+  //   · **同材质**（`pal` 相等）：挡住同一平面上相邻的**另一种方块**。
+  //
+  // ---- 本像素自己的**着色法线**：查表**之前**算一次（准入门槛 + 内联色的 `n_hint` 都要它）----
+  // `隐式法相` 清零时不看它（`shade_face` 提前返回 albedo 且用 DDA 面法线取材质）⇒ 不算、也不判。
+  let need_n = (light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) != 0u;
+  var n_own = vec3<f32>(0.0);
+  var n_own_word = 0u;
+  if (first.hit && need_n) {
+    n_own = voxel_normal(make_grid(u32(first.obj_id) + 1u), first.voxel, first.face_id, first.n);
+    n_own_word = gi_pack_dir(n_own);
+  }
   // ---- 帧内逐面查表的**覆盖计数**（归因仪表；`LOD_DIAG = 0` 时整段被折掉）----
   // 采样闸门 = 像素下标 & 63（1/64），与 `trace.wesl::diag_sampled` 同一个判据（比值无偏）。
   // 六个槽位互斥且穷尽（前提：GI 开、回退开）⇒ 一次读数就给出"每个像素从哪条路拿到颜色"。
@@ -901,9 +927,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (first.hit && gi_u.misc.x > 0.5) {
     if (gi_key_ok(first.voxel)) {
       var ok = false;
+      var pal_exact = 0u;
       let c = face_slot_color(
         gi_key0(first.voxel),
         gi_key1(first.voxel, first.face_id, first.obj_id),
+        &pal_exact,
         &ok);
       if (ok) {
         col = c;
@@ -912,24 +940,31 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
     var fb_tried = false;
-    var fb_nokey = false;
+    var fb_unusable = false;
     if (!cached && GI_FACE_FALLBACK == 1u) {
       fb_tried = true;
       var gk = vec2<u32>(0u, 0u);
-      if (gi_cover_key(px, &gk)) {
-        var ok2 = false;
-        let c2 = face_slot_color(gk.x, gk.y, &ok2);
-        if (ok2) {
-          col = c2;
-          cached = true;
-          if (diag_on) { atomicAdd(&lod_diag[DIAG_FACE_FB_HIT], 1u); }
-        }
+      var gb_cov = 0u;
+      var ok2 = false;
+      var pal2 = 0u;
+      var c2 = vec3<f32>(0.0);
+      // 三条准入见文件头部那段 ⚠️（同平面 / 同逐位着色法线 / 同材质）。
+      if (gi_cover_key(px, &gk, &gb_cov)
+          && gi_den_same_plane(gk.x, gk.y, gi_key0(first.voxel),
+                               gi_key1(first.voxel, first.face_id, first.obj_id))
+          && (!need_n || gi_guide_out[gb_cov + GI_DEN_G_NRM] == n_own_word)) {
+        c2 = face_slot_color(gk.x, gk.y, &pal2, &ok2);
+      }
+      if (ok2 && pal2 == first.pal) {
+        col = c2;
+        cached = true;
+        if (diag_on) { atomicAdd(&lod_diag[DIAG_FACE_FB_HIT], 1u); }
       } else {
-        fb_nokey = true;
+        fb_unusable = true;
       }
     }
     if (diag_on && !cached) {
-      if (fb_tried && fb_nokey) {
+      if (fb_tried && fb_unusable) {
         atomicAdd(&lod_diag[DIAG_FACE_FB_NOKEY], 1u);
       } else if (fb_tried) {
         atomicAdd(&lod_diag[DIAG_FACE_FB_MISS], 1u);
@@ -940,9 +975,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&lod_diag[DIAG_FACE_SKY], 1u);
   }
   if (!cached) {
+    // `n_hint` = 上面已经算好的本像素自己的着色法线（`need_n` = false 时留空 ⇒ 函数内按原路取）。
     col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                      GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
-                     vec3<f32>(0.0), false);
+                     n_own, need_n);
   }
   // ---- 光柱（godray，`volumetric.wesl`）：**线性 HDR 相加，必须在 `write_output` 的曝光之前** ----
   // 三步都是确定性取值（掩码 1 条主射线 → 两趟径向模糊）⇒ **没有噪声、没有滞后**；

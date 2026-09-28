@@ -267,13 +267,20 @@ fn face_slot_find_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   return 0u;
 }
 
-/// **面键 → 槽里的着色结果**（`face_slots` 的唯一读入口；认领在 `gi_main`、填色在 `dda_face_main`）。
-/// 命中条件 = 认领标志置位 + **两个键 word 逐位相等**（同一体素 + 同一个面 + 同一物体）。
-/// `ok = false` 时调用方一律回落（覆盖 texel 回退 / 内联着色）。
-fn face_slot_color(k0: u32, k1: u32, ok: ptr<function, bool>) -> vec3<f32> {
+/// **面键 → 槽里的着色结果 + 材质条目号**（`face_slots` 的唯一读入口；认领在 `gi_main`、填色在
+/// `dda_face_main`；`pal` 由认领侧写）。命中条件 = 认领标志置位 + **两个键 word 逐位相等**。
+/// `ok = false` 时调用方一律回落（覆盖 texel 回退 / 内联着色），`pal_out` 无意义。
+///
+/// `pal_out` 给「覆盖 texel 回退」做**同材质**准入（见 `main.wesl::dda_main`）：那个 texel 的面与
+/// 本像素的面是**邻居**（不同体素），键相等证明不了材质相同 ⇒ 必须显式比 `pal`。
+/// 只在同一 `obj` 内比较：`pal` 是**该 volume** 调色板的条目号，跨 volume 同号不同材质
+/// （准入已由 `gi_den_same_plane` 的 `obj` 那一半保证）。
+fn face_slot_color(k0: u32, k1: u32, pal_out: ptr<function, u32>, ok: ptr<function, bool>) -> vec3<f32> {
+  *pal_out = 0u;
   let slot = face_slot_find(k0, k1, ok);
   if (!*ok) { return vec3<f32>(0.0); }
   let fe = slot * FACE_WORDS;
+  *pal_out = atomicLoad(&face_slots[fe + FACE_W_PAL]);
   let c0 = atomicLoad(&face_slots[fe + FACE_W_COL]);
   let c1 = atomicLoad(&face_slots[fe + FACE_W_COL + 1u]);
   let c2 = atomicLoad(&face_slots[fe + FACE_W_COL + 2u]);
