@@ -35,6 +35,23 @@ pub fn bench_orbit() -> bool {
     std::env::var("GATE_BENCH").is_ok_and(|v| v.to_ascii_lowercase().contains("orbit"))
   })
 }
+
+/// 是否**边转视角边绕圈飞**（`GATE_BENCH` 的值里含 `fly`）：朝向按 `0.35 rad/s` 转、眼位沿半径
+/// `≈3.3 km` 的圆以 [`BENCH_FLY_SPEED`] 平移（轨迹同 `camera::auto_orbit_system`）。
+///
+/// WHY 单开一档：`camera::auto_orbit_system` 只改 `OrbitCamera` 的位置，而 `CameraMode::Fly` 的相机
+/// 位置取自 `FlyCamera`（`camera::build_camera_config`）⇒ **Fly 模式下 orbit 根本不移动相机**。
+/// 实测口径（用户）："光转没用，要移动起来……地图不是无限大，要绕圈飞，边转视角边绕圈" ——
+/// 只有真的在穿过新 chunk 才复现"移动时掉到个位数"。**不能走直线**：MC 城市 ~2.8 km，直线会飞出世界。
+pub fn bench_fly() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| {
+    std::env::var("GATE_BENCH").is_ok_and(|v| v.to_ascii_lowercase().contains("fly"))
+  })
+}
+
+/// 基准向前飞的速度（voxel/s）：取 [`crate::camera`] 里自动绕行那条路径的同一量级（500 v/s）。
+pub const BENCH_FLY_SPEED: f32 = 500.0;
 /// 第 60 帧自动刷一次笔触（无鼠标走通编辑 → 增量上传链路）
 pub const EDIT_SELFTEST: bool = false;
 

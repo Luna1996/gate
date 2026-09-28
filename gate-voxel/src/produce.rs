@@ -116,6 +116,13 @@ struct Done {
   key: JobKey,
   detail: Detail,
   tree: Option<ChunkTree>,
+  /// 树的**序列化字数**（`tree.len_words()`，`None` ⇒ 0）。
+  ///
+  /// WHY 在 worker 上算：消费端要按字数做**每帧挂载预算**，而 `len_words()` = `serialize().len()`
+  /// ——**整棵树走一遍 + 一次等长分配**。放在主线程就是"每挂一块序列化一遍"：实测
+  /// （`GATE_BENCH=fly`，MC 城市移动中）占主世界调度 **8–31 ms/帧**，是帧时掉到十几 fps 的唯一大头。
+  /// 产出这一步本来就在 worker 上，顺带算掉它 ⇒ 主线程只剩 O(1) 的记账。
+  words: usize,
 }
 
 /// 后台生产者：`workers` 个线程，每条消息恰好派给一个 worker（每 worker 一条队列，轮转派发）。
@@ -155,7 +162,8 @@ impl ChunkProducer {
             for (key, detail) in job_rx.iter() {
               let (vol, coord) = (key.0 as usize, key.1);
               let tree = src.produce(vol, coord, detail, &mut scratch);
-              if out.send(Done { key, detail, tree }).is_err() {
+              let words = tree.as_ref().map_or(0, |t| t.len_words());
+              if out.send(Done { key, detail, tree, words }).is_err() {
                 return; // 主线程没了
               }
             }
@@ -206,14 +214,15 @@ impl ChunkProducer {
   }
 
   /// 取回已完成的产出（非阻塞，本次最多 `max` 条）。返回的 `tree = None` 表示"这个 chunk 没有内容"，
-  /// 调用方应把它记成"已生成、无内容"（免得每帧重复派发）。
-  pub fn poll(&mut self, max: usize) -> Vec<(usize, ChunkCoord, Detail, Option<ChunkTree>)> {
+  /// 调用方应把它记成"已生成、无内容"（免得每帧重复派发）。末位是**序列化字数**（见 `Done::words`：
+  /// worker 已算好，消费端的挂载预算直接用，不要 `tree.len_words()` 现算）。
+  pub fn poll(&mut self, max: usize) -> Vec<(usize, ChunkCoord, Detail, Option<ChunkTree>, usize)> {
     let mut out = Vec::new();
     while out.len() < max {
       match self.rx.try_recv() {
         Ok(d) => {
           self.inflight.remove(&d.key);
-          out.push((d.key.0 as usize, d.key.1, d.detail, d.tree));
+          out.push((d.key.0 as usize, d.key.1, d.detail, d.tree, d.words));
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => break,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => break, // worker 全退：不再有产出

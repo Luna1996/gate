@@ -216,6 +216,16 @@ fn main() {
   if consts::AUTO_ORBIT || consts::bench_orbit() {
     app.add_systems(Update, camera::auto_orbit_system);
   }
+  // 相机持续向前飞（`GATE_BENCH=fly`）：Fly 模式下 orbit 不动相机，而"移动时掉帧"只有真的穿过
+  // 新 chunk 才复现。必须插在 `fly_camera_input` 之后（否则被玩家输入覆盖）、矩阵构造之前。
+  if consts::bench_fly() {
+    app.add_systems(
+      Update,
+      camera::auto_fly_system
+        .after(camera::fly_camera_input)
+        .before(camera::build_camera_config),
+    );
+  }
   app.run();
 }
 

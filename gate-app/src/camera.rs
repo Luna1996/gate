@@ -306,6 +306,31 @@ pub(crate) fn fly_camera_input(
   }
 }
 
+/// 基准：**边转视角边绕圈飞**（`GATE_BENCH=fly`，见 `consts::bench_fly`）。
+///
+/// WHY 需要它：`auto_orbit_system` 只改 `OrbitCamera` 的位置，而 Fly 模式的相机位置取自 `FlyCamera`
+/// ⇒ 那条路径在 Fly 模式下**不移动相机**（只有切模式那一帧会对一次位置）。而"移动时掉帧"只有真的
+/// 在穿过新 chunk 时才触发（用户口径："光转没用，要移动起来"）。
+///
+/// 轨迹：朝向按 `0.35 rad/s` 转、眼位沿**半径 `500/0.15 ≈ 3.3 km` 的圆**以 500 v/s 平移 —— 与
+/// [`auto_orbit_system`] 同一条曲线，只是写进 Fly 相机。**不能走直线**：地图有限（MC 城市 ~2.8 km），
+/// 直线会飞出世界。
+pub(crate) fn auto_fly_system(
+  time: Res<Time>,
+  mut orbit: ResMut<OrbitCamera>,
+  mode: Res<CameraMode>,
+  mut fly: ResMut<FlyCamera>,
+) {
+  if *mode != CameraMode::Fly {
+    return;
+  }
+  let dt = time.delta_secs().min(0.1);
+  orbit.yaw -= 0.35 * dt;
+  let a = time.elapsed_secs() * 0.15;
+  let dir = Vec3::new(-a.sin(), 0.0, a.cos());
+  fly.pos += dir * crate::consts::BENCH_FLY_SPEED * dt;
+}
+
 /// 切换模式时对一次位置：Orbit→Fly 取轨道眼位；Fly→Orbit 把 target 放到「沿当前朝向 `distance`
 /// 处」使 `orbit.eye() == fly.pos`；`is_changed()` 首帧为真但幂等。
 pub(crate) fn sync_camera_mode_switch(

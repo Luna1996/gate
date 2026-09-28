@@ -644,6 +644,14 @@ fn u8_of_material_assets(assets: &[MaterialAsset]) -> &[u8] {
 }
 
 /// GPU buffer 扩容尺寸策略（纯函数）：need ≥ 扩容阈值 → 32MB 对齐；否则 2× 增长（下限 64KB）。
+///
+/// WARNING: **别改成"倍数增长"来摊薄拷贝**（试过并回退）：`ensure_*` 扩容要把整个旧缓冲拷一遍，
+/// 于是"固定 32 MB 步进"的累计拷贝量是 `O(n²/步长)`（实测 `GATE_BENCH=orbit`、`gate_struct` 涨到
+/// 1.7 GB：**38 次**扩容、累计 **≈45 GB**）。但改成 `1.5×cap` 后，`1.5 GiB → 2.25 GiB` 这一步
+/// **越过 wgpu 的 `max_buffer_binding_size`（2 GiB − 4）** ⇒ `create_bind_group` 校验失败、
+/// 应用直接退出。**任何超出量 > 25% 的倍数增长在这个体量上都会撞墙** ⇒ 本值必须贴着 `need`。
+///
+/// TODO(perf): 真要吃这份拷贝，得先把树区压到 1 GB 以下（或把 `b_struct` 分片成多个 binding）。
 fn grow_size(cap: u64, need: u64) -> u64 {
   let big = crate::brickmap::consts::BUFFER_GROW_BIG;
   let reserve = crate::brickmap::consts::BUFFER_GROW_RESERVE;
@@ -870,9 +878,15 @@ pub(crate) fn prepare(
   write(&device, &queue, &mut gpu.state, "gate_state", &snap.state_bytes);
 
   {
-    let placeholder = vec![0u8; comp_bytes.max(4)];
-
-    ensure_with_copy(&device, &queue, &mut gpu.comp, "gate_comp", &placeholder, true);
+    // 已知空块占位：**只在容量不够时**写，别每帧都 `vec![0u8; comp_bytes]`。
+    //
+    // comp 层目前**没有逐帧驱动**（只有数据通路），这块 buffer 的内容恒为零占位（也没有别的写入方）
+    // ⇒ 每帧重写一遍不保住任何东西，只买一次分配 + memset（`comp_chunks × CHUNK_COMP_WORDS × 4`
+    // = 每块 8 KB）。容量只随常驻数增长 ⇒ 判"够不够"与原来的每帧写等价。
+    if gpu.comp.size() < comp_bytes.max(4) as u64 {
+      let placeholder = vec![0u8; comp_bytes.max(4)];
+      ensure_with_copy(&device, &queue, &mut gpu.comp, "gate_comp", &placeholder, true);
+    }
   }
 
   let main_desc = snap.volumes.grid_descs.first().copied().unwrap_or_default();
@@ -1800,7 +1814,36 @@ impl Plugin for VolumePlugin {
       // 它自己产生的改动**只标脏**，由下一帧的 `extract` 随那一份快照上传（见 `plan_residency` 尾注）。
       .add_systems(ExtractSchedule, (extract, plan_residency).chain())
       .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources))
-      // 转储必须在 prepare 之后：先写完本帧上传，再 readback（同一帧的 GPU 状态）
+      // 转储必须在 prepare 之后：先写完本帧上传，再读回（同一帧的 GPU 状态）
       .add_systems(Render, dump_voxel_buffers.after(prepare));
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// **扩容不得明显超出需求** —— 这是 `gate_struct` 的硬约束，不是口味。
+  ///
+  /// 锁的回归：把大缓冲改成"几何增长"以摊薄拷贝（`1.5×cap`）后，`1.5 GiB → 2.25 GiB` 这一步越过
+  /// wgpu 的 `max_buffer_binding_size`（2 GiB − 4）⇒ `create_bind_group` 校验失败、**应用直接退出**
+  /// （实测 `GATE_BENCH=orbit`）。而树区在同一场景已涨到 1.7 GB ⇒ 超出量只能留在几十 MB 量级。
+  #[test]
+  fn buffer_grow_stays_close_to_need() {
+    const STEP: u64 = 32 * 1024 * 1024;
+    // 采样点含实测终值（1.7 GB）与它的上界（2 GB，binding 墙）
+    for need in [1u64, 64 << 20, 1 << 30, 1_700 << 20, 2_000 << 20] {
+      for cap in [0, need / 4, need / 2, need - 1] {
+        if cap >= need {
+          continue;
+        }
+        let next = grow_size(cap, need);
+        assert!(next >= need, "容量必须容得下需求：{next} < {need}");
+        assert!(
+          next < need + STEP,
+          "超出量必须 < 32 MB（否则会撞 2 GiB binding 上界）：cap={cap} need={need} → {next}"
+        );
+      }
+    }
   }
 }

@@ -241,8 +241,12 @@ struct VolState {
   demand_center: Option<IVec3>,
   /// 距上次建表过了几帧
   demand_age: u32,
-  /// 已取回、还没挂载的产出（挂载按**字数预算**逐帧消化，见 [`Streaming::mount_words`]）
-  ready: std::collections::VecDeque<(ChunkCoord, Detail, ChunkTree)>,
+  /// 已取回、还没挂载的产出（挂载按**字数预算**逐帧消化，见 [`Streaming::mount_words`]）。
+  ///
+  /// 末位 = **序列化字数**，由 worker 线程算好带过来（`produce::ChunkProducer::poll` 的末位）：
+  /// `ChunkTree::len_words()` = `serialize().len()`，在主线程现算就是"每挂一块整树序列化一遍"
+  /// （实测 8–31 ms/帧，见 `mount_words` 的 CONSTRAINT）。
+  ready: std::collections::VecDeque<(ChunkCoord, Detail, ChunkTree, usize)>,
   /// [`Self::ready`] 里已有的 chunk（派发去重用：`producer.in_flight` 只覆盖 worker 手上的）
   ready_set: std::collections::HashSet<ChunkCoord>,
   /// 已挂载 chunk 的档位（粗 / 细）：判"够不够细"（要细化就重新产出，挂载会整体替换）。
@@ -343,6 +347,11 @@ pub struct Streaming {
   /// 每帧挂载的**序列化字数**预算（挂载要主线程做：装树 + 标脏 + 后面排队序列化上传）。
   /// 序列化约 0.5 ms/MB ⇒ 256 K 字（1 MB）/帧 ≈ 0.5 ms/帧，与 `UPLOAD_BYTES_PER_FRAME` 同量级；
   /// 折算成 chunk = 每帧约 3.7 个全分辨率 或 87 个粗档。
+  ///
+  /// CONSTRAINT: 这个预算的**分子（每块字数）必须来自 worker**（`VolState::ready` 的末位），
+  /// 别在挂载循环里现算 `ChunkTree::len_words()` —— 它是 `serialize().len()`（整树走一遍 + 等长分配），
+  /// 放在主线程等于"每挂一块序列化一遍"：实测（`GATE_BENCH=fly`，MC 城市移动中）**8–31 ms/帧**，
+  /// 是当时帧时掉到十几 fps 的唯一大头。
   pub mount_words: usize,
   /// 每帧挂载的条数上限（防"一堆极小树"把单帧的记账开销顶爆）
   pub mount_count: usize,
@@ -650,7 +659,7 @@ pub fn stream_chunks(
     }
 
     // 取回产出 → **各自 volume 的**待挂载队列（一次 poll；`None` = 这个 chunk 没有内容，记下免得反复派发）
-    for (v, cc, detail, tree) in producer.poll(POLL_MAX) {
+    for (v, cc, detail, tree, words) in producer.poll(POLL_MAX) {
       // 诊断：静音的远场级 —— 产出直接丢弃，否则它会堆在 `ready` 里白占背压额度
       if v > far_max {
         if let Some(st) = vols.get_mut(v) {
@@ -663,7 +672,7 @@ pub fn stream_chunks(
       match tree {
         // 同一块的在飞重复（派发修好前遗留的）⇒ 留先到的那个，别再堆一份
         Some(_) if !st.ready_set.insert(cc) => {}
-        Some(tree) => st.ready.push_back((cc, detail, tree)),
+        Some(tree) => st.ready.push_back((cc, detail, tree, words)),
         None => {
           st.empty.insert(cc);
           // **同时也告诉渲染侧**：这是"已知空块"，不是"还没加载" —— GPU 索引条目会写成哨兵，
@@ -815,12 +824,14 @@ pub fn stream_chunks(
       // ①c 挂载：按**字数预算**逐帧消化（装树 + 标脏 + 后面的序列化上传都吃这条预算）；主世界的
       //     粗档细化也走这条路（`mount_chunk_tree` 是**整体替换** ⇒ 粗树被细树顶掉）。
       while !st.ready.is_empty() && words_mounted < mount_count {
-        let w = st.ready.front().expect("刚看过 len").2.len_words();
+        // CONSTRAINT: 字数**必须取 worker 算好的那份**，别在这里现算 `tree.len_words()`
+        // —— 那是整树序列化一遍（实测 8–31 ms/帧，见 [`Streaming::mount_words`]）。
+        let w = st.ready.front().expect("刚看过 len").3;
         // 预算用尽就停，但**至少挂一个**：否则一个超大 chunk 会永远排不上
         if words_mounted > 0 && words + w > mount_words {
           break;
         }
-        let (cc, detail, tree) = st.ready.pop_front().expect("刚看过 front");
+        let (cc, detail, tree, _words) = st.ready.pop_front().expect("刚看过 front");
         st.ready_set.remove(&cc);
         grid.mount_chunk_tree(cc, tree, 0);
         st.detail.insert(cc, detail);
@@ -867,32 +878,44 @@ pub fn stream_chunks(
         continue;
       }
       let resident: Vec<ChunkCoord> = grid.chunk_coords().collect();
-      // 保护集直接用缓存好的两份集合（`ready_set` 就是"已取回、待挂载"那份），别每帧现折：
-      // 现折一次是 8192（需求）+ ≤384（待挂载）条插入，每帧白花。
+      // **① 出窗的先摘掉**：这一趟只需要 `in_window` 一个判据（O(常驻) 的算术），
+      // 保护集（需求 / 待挂载 / 在飞）对"已经出窗"的块没有意义 —— 出窗就装不上 GPU 了。
       let mut out: Vec<ChunkCoord> = Vec::new();
-      let mut cand: Vec<(u64, ChunkCoord)> = Vec::new();
       for c in &resident {
         if !scope.in_window(c.0) {
           out.push(*c);
-          continue;
         }
-        if (c.0 - scope.center).abs().max_element() <= unload_r
-          || st.demand_set.contains(c)
-          || st.ready_set.contains(c)
-          || producer.in_flight(vol, *c)
-        {
-          continue;
-        }
-        cand.push((st.last_used.get(c).copied().unwrap_or(0), *c));
       }
-      // 超容量 ⇒ 卸掉"最久没被看到"的那些（`last_used` 升序 ⇒ LRU 在前）
-      let had_candidates = !cand.is_empty();
+      // **② 只有超容量才需要"最久没被看到"的那一份**（下面的 LRU 候选）。
+      //
+      // WHY 分成两段：上面那 4 次哈希查询（`demand_set` / `ready_set` / `in_flight` / `last_used`）
+      // 乘上常驻块数就是**每秒几百 ms** 的量 —— 实测（`GATE_BENCH=fly`，MC 城市移动中）这趟扫描
+      // 占主世界调度 **24–38 ms/次**（≈2–4 次/s ⇒ 帧率在 20–70 之间摆）。而容量**没超**时
+      // （`cap` 4 GB ⇒ 65536 块，实测常驻 1.9 万）候选一份都用不上 ⇒ 白付。
       let over = resident.len().saturating_sub(out.len()).saturating_sub(cap);
+      st.trim_idle = false; // 没超容量时不敢自称"无事可做"（保守：下次超容量仍允许扫）
       if over > 0 {
+        // 保护集直接用缓存好的两份集合（`ready_set` 就是"已取回、待挂载"那份），别每帧现折：
+        // 现折一次是 8192（需求）+ ≤384（待挂载）条插入，每帧白花。
+        let mut cand: Vec<(u64, ChunkCoord)> = Vec::new();
+        for c in &resident {
+          if !scope.in_window(c.0) {
+            continue; // ① 已经收走了
+          }
+          if (c.0 - scope.center).abs().max_element() <= unload_r
+            || st.demand_set.contains(c)
+            || st.ready_set.contains(c)
+            || producer.in_flight(vol, *c)
+          {
+            continue;
+          }
+          cand.push((st.last_used.get(c).copied().unwrap_or(0), *c));
+        }
+        st.trim_idle = cand.is_empty();
+        // 超容量 ⇒ 卸掉"最久没被看到"的那些（`last_used` 升序 ⇒ LRU 在前）
         cand.sort_unstable_by_key(|(t, c)| (*t, c.0.x, c.0.y, c.0.z));
         out.extend(cand.into_iter().take(over).map(|(_, c)| c));
       }
-      st.trim_idle = had_candidates == false;
       let n_unload = out.len();
       for cc in out {
         grid.unmount_chunk(cc);
