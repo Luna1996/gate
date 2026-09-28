@@ -33,7 +33,12 @@ pub const DDA_LOD: bool = true;
 ///
 /// 开关不在这里：权威值是 `trace.wesl::LOD_DIAG`，Rust 经 [`crate::wesl_consts::trace_consts`]
 /// 解析同一份源码（单一来源，见该函数的说明）。
-pub const LOD_DIAG_WORDS: usize = 3;
+///
+/// 槽位 3..9 = **主 pass 逐面查表的覆盖计数**（`main.wesl::dda_main` 的仪表，
+/// 见那里的 `DIAG_FACE_*`）：精确命中 / 覆盖 texel 回退命中 / 回退无键 / 回退槽失配 /
+/// 命中像素走了内联 / 天空像素（`first.hit == false`）。
+/// 它就是"认领覆盖率"的量具：一次读数即知每个像素从哪条路拿到颜色（`LOD_DIAG = 0` 时零开销）。
+pub const LOD_DIAG_WORDS: usize = 9;
 /// **M4 ray-guided 请求通道**（`docs/editable-gigavoxel.md` §4 M4）：shader 把"射线想要细节、而那个
 /// chunk 在 GPU 上没有树块"记成一条请求（chunk 相对窗口下标 + 所需档位 + 射线类型），Rust 侧按
 /// `REPORT_PERIOD_SECS` 回读 + 合并排序后驱动流式加载。

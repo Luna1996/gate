@@ -205,6 +205,17 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
     if (gi.coverage_r > 0.0) {
       t_hi = min(t_hi, level_cap(gi.coverage_r, dir));
     }
+    // **空区间早退**：本级在这条射线上的参与区间为空（近场已命中在更近处 / 超出 `t_cap`）⇒ 直接进下一级。
+    // `trace_grid` 自己会在 slab 之后判 `tl1 <= tl0` 返回 miss，但那要先付世界 AABB + 局部 AABB 的
+    // ~12 次除法与一次变换；这里只用两个已经算好的标量判**同一个结论**（纯等式变换：区间空 ⇒ 那次
+    // 调用除了返回 miss 什么都不会做 —— 连 `mc` 的 tint 都不动，因为它在那之前就 return 了）。
+    // `shell` 照常推进：与"调用了 trace_grid、它返回 miss"后的状态逐位相同。
+    if (t_lo >= t_hi) {
+      if (far) {
+        shell = max(shell, coverage_r_of(gi));
+      }
+      continue;
+    }
     let mhi = trace_grid(gi, origin, dir, t_hi, t_lo, depth_cap, false, req, &mc_off);
     if (mhi.hit && mhi.t < best_t) {
       best_t = mhi.t;

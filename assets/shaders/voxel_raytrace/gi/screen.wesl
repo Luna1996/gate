@@ -1,5 +1,5 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
@@ -313,12 +313,24 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 退回逐像素内联着色 —— 撞键只损失收益、不会出错。
   // 判据用 `pk_ok`（键可编码），与查表侧 `dda_main` 的条件一致：越界键会与远处的面撞键。
   // 位置必须在 `gi_den_guide_store` 之后（认领者要被 `dda_face_main` 用 texel 下标找回）。
+  // **双探针**（`face_slot_next`）：基槽被撞就再试第二格 —— 实测撞键的面占全屏 4.6% 像素，
+  // 从前那些像素整帧只能逐像素内联着色；多一格落脚就把它们接回逐面路径（判据一字未改）。
   if (pk_ok) {
     var face_ok = false;
     let fslot = face_slot_of(pk0, pk1, &face_ok);
     if (face_ok) {
-      let fe = fslot * FACE_WORDS;
-      if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged) {
+      var fe = fslot * FACE_WORDS;
+      var claimed =
+        atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
+      if (!claimed) {
+        // 基槽已被占：要么是**别的键**（撞键 ⇒ 试第二格），要么**就是本键**（同一个面的另一个 texel
+        // 先抢到了）。后者**不能**再占第二格 —— 同一个键占两格会把撞键率凭空抬上去（有效载入翻倍）。
+        if (!face_slot_matches(fslot, pk0, pk1)) {
+          fe = face_slot_next(fslot) * FACE_WORDS;
+          claimed = atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
+        }
+      }
+      if (claimed) {
         atomicStore(&face_slots[fe + FACE_W_K0], pk0);
         atomicStore(&face_slots[fe + FACE_W_K1], pk1);
         atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
@@ -451,13 +463,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   const GI_SS_CLAIM_ONLY: u32 = 0u;
   if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
     var fok2 = false;
-    let fs2 = face_slot_of(pk0, pk1, &fok2);
+    // 双探针（`face_slot_find`）：认领可能落在第二格 —— 只探基槽会把"本 texel 就是认领者"判错。
+    let fs2 = face_slot_find(pk0, pk1, &fok2);
     if (fok2) {
       let fe2 = fs2 * FACE_WORDS;
-      if (atomicLoad(&face_slots[fe2 + FACE_W_FLAG]) != 0u
-          && atomicLoad(&face_slots[fe2 + FACE_W_K0]) == pk0
-          && atomicLoad(&face_slots[fe2 + FACE_W_K1]) == pk1
-          && atomicLoad(&face_slots[fe2 + FACE_W_TEXEL]) != idx) {
+      if (atomicLoad(&face_slots[fe2 + FACE_W_TEXEL]) != idx) {
         cand_n = 0u;
       }
     }
@@ -596,29 +606,26 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 混进去会把面均值拉向 0）—— 与 `gi_face_flatten` / `dda_face_accum` 的 `a > 0` 参与集合同一条口径。
   if (pk_ok && has_evidence) {
     var fok = false;
-    let fslot = face_slot_of(pk0, pk1, &fok);
+    // 双探针（`face_slot_find`）：认领可能落在第二格 —— 只探基槽会让那些面**没有面内平均**。
+    let fslot = face_slot_find(pk0, pk1, &fok);
     if (fok) {
       let fe = fslot * FACE_WORDS;
-      if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != 0u
-          && atomicLoad(&face_slots[fe + FACE_W_K0]) == pk0
-          && atomicLoad(&face_slots[fe + FACE_W_K1]) == pk1) {
-        // 归一化 + 定点取整（进位到最近，避免系统性偏暗）—— 与 `dda_face_accum` 同一句。
-        let q = clamp(gi, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
-        let qv = vec3<u32>(round(q * GI_ACC_SCALE));
-        var reserved = false;
-        loop {
-          let c = atomicLoad(&face_slots[fe + FACE_W_RAW_N]);
-          if (c + 1u > GI_ACC_MAX_N) { break; }
-          if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_RAW_N], c, c + 1u).exchanged) {
-            reserved = true;
-            break;
-          }
+      // 归一化 + 定点取整（进位到最近，避免系统性偏暗）—— 与 `dda_face_accum` 同一句。
+      let q = clamp(gi, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+      let qv = vec3<u32>(round(q * GI_ACC_SCALE));
+      var reserved = false;
+      loop {
+        let c = atomicLoad(&face_slots[fe + FACE_W_RAW_N]);
+        if (c + 1u > GI_ACC_MAX_N) { break; }
+        if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_RAW_N], c, c + 1u).exchanged) {
+          reserved = true;
+          break;
         }
-        if (reserved) {
-          atomicAdd(&face_slots[fe + FACE_W_RAW], qv.x);
-          atomicAdd(&face_slots[fe + FACE_W_RAW + 1u], qv.y);
-          atomicAdd(&face_slots[fe + FACE_W_RAW + 2u], qv.z);
-        }
+      }
+      if (reserved) {
+        atomicAdd(&face_slots[fe + FACE_W_RAW], qv.x);
+        atomicAdd(&face_slots[fe + FACE_W_RAW + 1u], qv.y);
+        atomicAdd(&face_slots[fe + FACE_W_RAW + 2u], qv.z);
       }
     }
   }

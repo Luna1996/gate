@@ -84,6 +84,8 @@ const LEAF_LOD_SCAN_CAP: u32 = 8u;
 const LOD_DIAG: u32 = 0u;
 /// `lod_diag` 槽位：0 = 采样到的叶入口数（本来要逐格 march 的那些），1 = 其中被叶级 LOD 拦下的，
 /// 2 = 非法早停（`gd >= depth_cap` 且本节点 `pal == 0` —— 那不是该子块的颜色）。
+/// 3..8 = **主 pass 逐面查表的覆盖计数**（`main.wesl::dda_main` 的仪表，槽位常量在那边）：
+/// 精确命中 / 覆盖 texel 回退命中 / 回退无键 / 回退槽失配 / 内联着色。
 const DIAG_LEAF_ENTRIES: u32 = 0u;
 const DIAG_LEAF_STOPS: u32 = 1u;
 const DIAG_ILLEGAL_STOPS: u32 = 2u;
@@ -314,25 +316,45 @@ fn medium_exit(mc: ptr<function, MediumRay>) -> bool {
   return (*mc).stop_on_air && ((*mc).last_pal != 0u);
 }
 
+/// **射线级不变量**（只由本 volume 局部系的 `rd` / `sign_v` 决定）：同一条射线**每次进入 chunk**
+/// （`trace_chunk_opaque` / `trace_chunk`）都要用到的量。
+///
+/// WHY 必须传参而不能就地重算：这两个函数是**每条射线每个 chunk 进入一次**，而其中 `1.0/rd` 是
+/// **三次除法**、`oct` / `dir_side` / `face_base` 是三组 `select` —— 同一条射线进入十几次就重算十几次。
+/// 而 `trace_grid` 本来就已经算出**同一批值**（`grid_inv_rd` / `grid_axis_on` / `DIR_LUT` 的 `side` 与
+/// 三轴 face id / `dir_mask`）⇒ 传参是**纯等式变换**：同样的输入、同样的运算、同样的顺序，
+/// 只是从"每次进入算一遍"变成"每条射线每个 volume 算一遍"（位精确：`1.0/rd` 的两次求值逐位相同，
+/// `DIR_LUT` 的 side/face 与 `select(...)` 逐位等价，见 `common.wesl::DIR_LUT`）。
+struct RayBasis {
+  /// `1.0 / rd`（chunk 局部系；与 `trace_grid::grid_inv_rd` 是同一个值）
+  inv_rd: vec3<f32>,
+  /// `abs(inv_rd)`
+  abs_inv_rd: vec3<f32>,
+  /// `abs(rd) > 1e-30`（= `trace_grid::grid_axis_on`）
+  axis_on: vec3<bool>,
+  /// 每轴步进所取的那一侧边界（0 = 取基址、1 = 取基址 + 边长）= `DIR_LUT` 的 side
+  dir_side: vec3<f32>,
+  /// 每轴两个面的 face id 基（0/1、2/3、4/5 的**低位**）= `DIR_LUT` 的 face_x/y/z
+  face_base: vec3<u32>,
+  /// 方向位掩码（`DIR_LUT` 的下标；= 处处那个 `oct`）
+  oct: u32,
+}
+
 // 单 chunk 内层级遍历（不透明版）：chunk_base = 根节点绝对字址，chunk_min = chunk 原点（局部 voxel）。
 // [t0,t1] 与返回 t 为 ro 系绝对 t；entry_face = 进入面；depth_cap 下 gate 深度 d=3-level 达上限时返回子块入口 t（保守下界）。
+// `basis` = 本射线的**不变量**（见 `RayBasis` 的说明：调用方算一次，这里只消费）。
 fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
-                      ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
+                      ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>, basis: RayBasis,
                       t0: f32, t1: f32, entry_face: u32, depth_cap: u32) -> VoxelHit {
   if (t0 >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
   // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = ro - chunk_min;
-  let inv_rd = 1.0 / rd;
-  let abs_inv_rd = abs(inv_rd);
-  let axis_on = abs(rd) > vec3<f32>(1e-30);
-  let oct = select(0u, 1u, sign_v.x >= 0)
-    | (select(0u, 1u, sign_v.y >= 0) << 1u)
-    | (select(0u, 1u, sign_v.z >= 0) << 2u);
-  let dir_side = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0));
-  let face_base = vec3<u32>(                     // 每轴两个面的 face id 基（0/1、2/3、4/5）
-    select(1u, 0u, sign_v.x >= 0),
-    select(1u, 0u, sign_v.y >= 0),
-    select(1u, 0u, sign_v.z >= 0));
+  let inv_rd = basis.inv_rd;
+  let abs_inv_rd = basis.abs_inv_rd;
+  let axis_on = basis.axis_on;
+  let dir_side = basis.dir_side;
+  let face_base = basis.face_base;
+  let oct = basis.oct;
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
@@ -523,24 +545,20 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
 // 命中 / 穿透 / 出射面判定只在两处唯一出口做。
 // **介质吸收**（逐段 alpha，见 `MediumRay` 的头注释）：`tint` 只在**进入一个新材质段**时乘一次
 // （`pass_through_medium`），本函数**不做任何距离/入口 t 的记账**，也没有 chunk 边界收尾。
+// `basis` = 本射线的不变量（同 `trace_chunk_opaque`）。
 fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
-               ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>,
+               ro: vec3<f32>, rd: vec3<f32>, sign_v: vec3<i32>, basis: RayBasis,
                t0: f32, t1: f32, entry_face: u32, depth_cap: u32,
                mc: ptr<function, MediumRay>) -> VoxelHit {
   if (t0 >= t1) { return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0)); }
   // chunk 局部 voxel 坐标（chunk 原点 = 0）；t 仍是 ro 系绝对 t
   let ro_c = ro - chunk_min;
-  let inv_rd = 1.0 / rd;
-  let abs_inv_rd = abs(inv_rd);
-  let axis_on = abs(rd) > vec3<f32>(1e-30);
-  let oct = select(0u, 1u, sign_v.x >= 0)
-    | (select(0u, 1u, sign_v.y >= 0) << 1u)
-    | (select(0u, 1u, sign_v.z >= 0) << 2u);
-  let dir_side = select(vec3<f32>(0.0), vec3<f32>(1.0), sign_v >= vec3<i32>(0));
-  let face_base = vec3<u32>(                     // 每轴两个面的 face id 基（0/1、2/3、4/5）
-    select(1u, 0u, sign_v.x >= 0),
-    select(1u, 0u, sign_v.y >= 0),
-    select(1u, 0u, sign_v.z >= 0));
+  let inv_rd = basis.inv_rd;
+  let abs_inv_rd = basis.abs_inv_rd;
+  let axis_on = basis.axis_on;
+  let dir_side = basis.dir_side;
+  let face_base = basis.face_base;
+  let oct = basis.oct;
   var bricks: array<Brick, 4u>;
   let r_ml = b_struct[chunk_base];
   let r_mh = b_struct[chunk_base + 1u];
@@ -903,6 +921,16 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   let grid_axis_on = abs(rd) > vec3<f32>(1e-30);
   let delta = select(vec3<f32>(1e+30), abs(grid_inv_rd), grid_axis_on);
   let delta_c = delta * f32(CHUNK_SIZE);
+  // ---- 射线级不变量：本 volume 内**每次 chunk 进入**都复用这一份（见 `RayBasis`）----
+  // 与 `trace_chunk*` 里原来就地重算的表达式**逐项等价**：`side` / `face_x/y/z` / `dir_mask` 全出自
+  // 上面那次 `DIR_LUT` 查表，而 `DIR_LUT` 与那三组 `select(...)` 逐位等价（见 `common.wesl` 的表注释）。
+  let basis = RayBasis(
+    grid_inv_rd,
+    abs(grid_inv_rd),
+    grid_axis_on,
+    side,
+    vec3<u32>(face_x & 1u, face_y & 1u, face_z & 1u),
+    dir_mask);
   let start = ro + rd * tl0;
   var ci = vec3<i32>(floor(start / f32(CHUNK_SIZE)));
   // tmax_c：到下一 chunk 边界的 t（ro 系绝对）
@@ -997,11 +1025,11 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
           }
         }
         if (penetrate && !chunk_skipped) {
-          let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v,
+          let h = trace_chunk(chunk_base, chunk_min, ro, rd, sign_v, basis,
                               t0c, t1, entry_face, depth_cap, mc);
           if (h.hit) { return grid_hit(h, ci, col0, col1, col2, obj_id); }
         } else if (!penetrate) {
-          let h = trace_chunk_opaque(chunk_base, chunk_min, ro, rd, sign_v,
+          let h = trace_chunk_opaque(chunk_base, chunk_min, ro, rd, sign_v, basis,
                                      t0c, t1, entry_face, depth_cap);
           if (h.hit) { return grid_hit(h, ci, col0, col1, col2, obj_id); }
         }

@@ -180,6 +180,106 @@ fn face_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
 }
 
+/// **双探针**：基槽之后的第二个候选槽（掩码回绕）。
+///
+/// WHY：哈希撞键时，从前那个面**整帧**退回"逐像素内联 `shade_face`"（含它那条阴影射线）——
+/// 而实测（2026-09-28，MC 城市 / 1/2 档）**撞键的面占全屏 4.6% 的像素**，是一整块可回收的代价。
+/// 认领侧（`gi_main`）在基槽 CAS 失败时**再试这一格**；读取侧（`dda_main` / `dda_face_main`）
+/// 按"基槽 → 第二个槽"的顺序找**键逐位相等**的那一格。判据一个字没变（仍是同一个键、同一套
+/// 校验），只是给撞键的面多一次落脚机会 ⇒ 那一小部分像素从"内联整条 `shade_face`"变成
+/// "多读一条缓存行"。命中的绝大多数（基槽即中）**一次探针都不多付**。
+fn face_slot_next(base: u32) -> u32 {
+  return (base + 1u) & (face_slot_count() - 1u);
+}
+
+/// 槽里是否**确实**存放着这个键（认领标志置位 + 两个键 word 逐位相等）。
+/// 三个字并行读出再判（不靠 `&&` 短路去串行化访存）—— 槽是 16 字 = 恰好一条 64B 缓存行。
+fn face_slot_matches(slot: u32, k0: u32, k1: u32) -> bool {
+  let fe = slot * FACE_WORDS;
+  let flag = atomicLoad(&face_slots[fe + FACE_W_FLAG]);
+  let s0 = atomicLoad(&face_slots[fe + FACE_W_K0]);
+  let s1 = atomicLoad(&face_slots[fe + FACE_W_K1]);
+  return flag != 0u && s0 == k0 && s1 == k1;
+}
+
+/// **面键 → 确实被本键认领的那个槽**（双探针：基槽 → 第二格；读 `@group(5) @binding(8)` 那份声明）。
+/// `ok = false` = 表未就绪 / 两个候选槽都没有这个键（未认领 / 撞键）。
+///
+/// ⚠️ **所有读侧都必须走本函数（或 `_flat` 版）**：认领（`gi_main`）在基槽抢不到时会落到第二格，
+/// 只探基槽的读者会把那些面当成"没被认领" ⇒ 逐面 GI 合并（`gi_ss_main` 的 `FACE_W_RAW*`）、
+/// 逐面均值累加（`dda_face_accum`）、逐面平均（`gi_face_flatten`）**全部静默漏掉那个面**
+/// ⇒ 症状：那些面拿不到 GI（`cov = 0`，只剩天光兜底）且降噪输入没有面内平均 ⇒ 斑驳噪点。
+/// 命中基槽的绝大多数（基槽即中）**一次探针都不多付**。
+fn face_slot_find(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+  var table_ok = false;
+  let base = face_slot_of(k0, k1, &table_ok);
+  *ok = false;
+  if (!table_ok) { return 0u; }
+  if (face_slot_matches(base, k0, k1)) {
+    *ok = true;
+    return base;
+  }
+  let second = face_slot_next(base);
+  if (face_slot_matches(second, k0, k1)) {
+    *ok = true;
+    return second;
+  }
+  return 0u;
+}
+
+// ---- `_flat` 版：读 `@group(0) @binding(18)` 那份声明（给只有瘦 group(0) 的 pass 用）----
+// 必须与上面那组**同一张表、同一个槽数、同一套判据**（`face_slot_of_flat` 的注释解释了为什么
+// 不能混用：混用会让槽数不同 ⇒ 哈希取模不同 ⇒ 查到别的槽）。
+/// 槽数（`face_slots_flat` 声明的 `arrayLength`）。
+fn face_slot_count_flat() -> u32 {
+  return arrayLength(&face_slots_flat) / FACE_WORDS;
+}
+
+/// 双探针的第二格（`_flat` 版）。
+fn face_slot_next_flat(base: u32) -> u32 {
+  return (base + 1u) & (face_slot_count_flat() - 1u);
+}
+
+/// 槽里是否确实存放着这个键（`_flat` 版）。
+fn face_slot_matches_flat(slot: u32, k0: u32, k1: u32) -> bool {
+  let fe = slot * FACE_WORDS;
+  let flag = atomicLoad(&face_slots_flat[fe + FACE_W_FLAG]);
+  let s0 = atomicLoad(&face_slots_flat[fe + FACE_W_K0]);
+  let s1 = atomicLoad(&face_slots_flat[fe + FACE_W_K1]);
+  return flag != 0u && s0 == k0 && s1 == k1;
+}
+
+/// 面键 → 确实被本键认领的那个槽（`_flat` 版；语义与 [`face_slot_find`] 逐字相同）。
+fn face_slot_find_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+  var table_ok = false;
+  let base = face_slot_of_flat(k0, k1, &table_ok);
+  *ok = false;
+  if (!table_ok) { return 0u; }
+  if (face_slot_matches_flat(base, k0, k1)) {
+    *ok = true;
+    return base;
+  }
+  let second = face_slot_next_flat(base);
+  if (face_slot_matches_flat(second, k0, k1)) {
+    *ok = true;
+    return second;
+  }
+  return 0u;
+}
+
+/// **面键 → 槽里的着色结果**（`face_slots` 的唯一读入口；认领在 `gi_main`、填色在 `dda_face_main`）。
+/// 命中条件 = 认领标志置位 + **两个键 word 逐位相等**（同一体素 + 同一个面 + 同一物体）。
+/// `ok = false` 时调用方一律回落（覆盖 texel 回退 / 内联着色）。
+fn face_slot_color(k0: u32, k1: u32, ok: ptr<function, bool>) -> vec3<f32> {
+  let slot = face_slot_find(k0, k1, ok);
+  if (!*ok) { return vec3<f32>(0.0); }
+  let fe = slot * FACE_WORDS;
+  let c0 = atomicLoad(&face_slots[fe + FACE_W_COL]);
+  let c1 = atomicLoad(&face_slots[fe + FACE_W_COL + 1u]);
+  let c2 = atomicLoad(&face_slots[fe + FACE_W_COL + 2u]);
+  return vec3<f32>(bitcast<f32>(c0), bitcast<f32>(c1), bitcast<f32>(c2));
+}
+
 // ============================================================================
 // 二次顶点按面缓存（`gi_sec_slots`）—— 只服务 GI 射线的命中着色（`gi/ray.wesl`）
 // ============================================================================

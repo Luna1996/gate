@@ -1,11 +1,11 @@
-import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, out_tex, out_tex_src, view_u};
+import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_of, face_slot_of_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
-import package::trace::{make_grid};
+import package::trace::{diag_sampled, make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
 
@@ -512,8 +512,13 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
 /// ⚠️ `ray_dir` 是唯一一个**逐像素**的实参，且**只被天空背景那一行消费**（`sky_primary` 要用它定太阳盘）。
 /// 命中面（含逐面缓存那条路径）根本不会走到那一行 ⇒ 那里的实参不被消费，但必须是合法值
 /// （不能是零向量：`sky_primary` 里对方向做了点积）。
+///
+/// `n_hint` / `n_hint_ok`：调用方**已经算好**的着色法线（`dda_face_main` 从降噪导引里拿 —— 那里存的
+/// 就是同一个键的 `voxel_normal`，逐位相同）⇒ 省掉 `voxel_normal` 的 4 次邻域点查询。
+/// `dda_main` 传 `false`（它没有可直接复用的同键法线）。
 fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frustum_length: f32,
-              gi_in: GiInput, sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
+              gi_in: GiInput, sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>,
+              n_hint: vec3<f32>, n_hint_ok: bool) -> vec3<f32> {
   var best = first;
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
@@ -622,7 +627,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     // ⇒ 不做尝试，连那次必然失败的键读取都省掉。
     var n = best.n;
     var n_reused = false;
-    if (u32(gi_u.flags.y) == 1u) {
+    if (n_hint_ok) {
+      // 调用方给的**同键**着色法线（`dda_face_main` 从降噪导引里取，见函数头）⇒ 直接用，不重算。
+      n = n_hint;
+      n_reused = true;
+    } else if (u32(gi_u.flags.y) == 1u) {
       let gi_size = vec2<u32>(textureDimensions(gi_tex));
       // texel 下标由采样 uv 反推（全分辨率档下 `gi_in.uv` 恰是本像素中心 ⇒ 逐位等于 `gid`）。
       let tp = vec2<i32>(floor(gi_in.uv * vec2<f32>(f32(gi_size.x), f32(gi_size.y))));
@@ -781,6 +790,40 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   return col;
 }
 
+/// **「覆盖 texel 回退」总开关（A/B 自检用）**：`1u` = 开（仓库默认）、`0u` = 关（回到逐像素内联口径）。
+///
+/// WHY 需要它：这条回退改变的是**远场小面**（一个可见体素面 < 一个 GI texel，即屏幕上 ≤ 2×2 像素的
+/// 细节）的颜色来源 —— 从「逐像素各自内联 `shade_face`」换成「该像素所在 GI texel 命中的那个面的
+/// 逐面着色结果」。近中景（面比 texel 大的那些像素）走的是精确键，**一个像素都不受影响**。
+/// 关掉它即回到"只有精确键命中才用槽色、其余全部内联"的行为（逐位一致）⇒ 它是 A/B 与回退的开关。
+const GI_FACE_FALLBACK: u32 = 1u;
+
+/// **逐面查表覆盖计数的槽位**（`lod_diag` 的 3..9；`trace.wesl::DIAG_*` 的 0..2 是叶级 LOD 的）。
+/// 六个槽互斥且穷尽（GI 开 + 回退开时）⇒ 一次读数就给出"每个像素从哪条路拿到颜色"。
+/// 只在 `LOD_DIAG = 1`（`trace.wesl`）时被写：置 0 时调用点整段被折掉，正常构建零开销。
+/// 实测（2026-09-28，MC 城市 / 1/2 档 / 静止机位）：天空 32% / 精确 0% / 回退 40% /
+/// 回退无键 9.5% / 回退槽失配 4.6% / 内联 14% —— 就是这组数字定下了"认领粒度实际是 GI texel"与
+/// "内联的唯一来源是回退失败"两条结论（见 `docs/editable-gigavoxel.md` §10 第五轮）。
+const DIAG_FACE_EXACT: u32 = 3u;    // 精确键命中
+const DIAG_FACE_FB_HIT: u32 = 4u;   // 覆盖 texel 回退命中
+const DIAG_FACE_FB_NOKEY: u32 = 5u; // 回退失败：覆盖 texel 没有主命中（键为 0）
+const DIAG_FACE_FB_MISS: u32 = 6u;  // 回退失败：键有、槽没认领 / 键不符（撞键）
+const DIAG_FACE_INLINE: u32 = 7u;   // 命中像素最终走内联着色
+const DIAG_FACE_SKY: u32 = 8u;      // 天空像素（`first.hit == false`）
+
+/// **本像素所在那个 GI texel 的主命中面键**（返回值 = 该 texel 有主命中）。
+/// 下标口径与 `shade_face` 里 `gi_div = 1` 的法线复用**逐字相同**（`floor(uv · gi_size)`，
+/// `gi_guide_out` 的布局见 `gi/consts.wesl`：键非零 = 有效，**没有**独立有效位）。
+/// 它是「覆盖 texel 回退」的键源：该 texel 命中的面必然被 `gi_main` 认领过（同一帧、同一张表）。
+fn gi_cover_key(uv: vec2<f32>, key_out: ptr<function, vec2<u32>>) -> bool {
+  let gi_size = vec2<u32>(textureDimensions(gi_tex));
+  let tp = vec2<i32>(floor(uv * vec2<f32>(f32(gi_size.x), f32(gi_size.y))));
+  if (tp.x < 0 || tp.y < 0 || tp.x >= i32(gi_size.x) || tp.y >= i32(gi_size.y)) { return false; }
+  let gb = (u32(tp.y) * gi_size.x + u32(tp.x)) * GI_DEN_GUIDE_WORDS;
+  *key_out = vec2<u32>(gi_guide_out[gb + GI_DEN_G_KEY0], gi_guide_out[gb + GI_DEN_G_KEY1]);
+  return (*key_out).x != 0u || (*key_out).y != 0u;
+}
+
 // DDA 主入口：命中 → **逐面去重查表**（命中即直出）；未认领 / 撞键 / miss → 内联 `shade_face`。
 @compute @workgroup_size(8, 8, 1)
 fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -836,31 +879,70 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             world_cfg_primary(t_min, 3u));
 
   // ---- 逐面去重查表（`face_slots`：认领在 `gi/screen.wesl`、计算在 `dda_face_main`）----
-  // 命中条件 = 认领标志置位 + **两个键 word 逐位相等**（同一体素 + 同一个面 + 同一物体）。
-  // 查不到（未认领 / 撞键 / GI 关 / 键越界）⇒ 内联 `shade_face`，结果与认领者**逐位相同**。
+  // 两级，判据都以「**同一个面**（键逐位相等）」为唯一准入：
+  //   ① **精确键** = 本像素自己的可见面（体素 + 面号 + 物体）。
+  //   ② **覆盖 texel 回退**（`GI_FACE_FALLBACK`）= 本像素**所在那个 GI texel** 命中的面。
+  // 两级都查不到（未认领 / 撞键 / GI 关 / 键越界）⇒ 内联 `shade_face`，结果与认领者**逐位相同**。
+  //
+  // WHY ②必须存在：认领发生在 **GI 分辨率**（`gi_main` 每个 texel 抢自己命中的那个面），而消费者是
+  // **全分辨率**像素。一个面上屏幕 ≤ 一个 texel（远场小面 / 细杆 / 薄板边缘）时，它只可能被"包含它的
+  // 那个 texel"认领，而它自己的**体素**在 1/2 档下与相邻 2×2 像素里的邻居不是同一个键 ⇒ 精确键对不上
+  // ⇒ 从前那些像素**每个都内联整条 `shade_face`**（含阴影射线 + 材质 + 法线 + GI 采样），实测这是
+  // 主 pass 的最大单项。回退用"覆盖 texel 的面"接住它们：那是**同一套逐面着色**（同一个槽、同一个
+  // '认领者算一次'的值），代价 = 一次导引读 + 一次槽读。差异只落在"面 < 一个 texel"的细节上，
+  // 粒度 = 一个 GI texel（1/2 档 = 2×2 像素）—— 与作者「着色量子 = 一个可见体素面」同一口径。
+  // ---- 帧内逐面查表的**覆盖计数**（归因仪表；`LOD_DIAG = 0` 时整段被折掉）----
+  // 采样闸门 = 像素下标 & 63（1/64），与 `trace.wesl::diag_sampled` 同一个判据（比值无偏）。
+  // 六个槽位互斥且穷尽（前提：GI 开、回退开）⇒ 一次读数就给出"每个像素从哪条路拿到颜色"。
+  let diag_pix = gid.x + gid.y * size.x;
+  let diag_on = diag_sampled(diag_pix);
   var col = vec3<f32>(0.0);
   var cached = false;
-  if (first.hit && gi_u.misc.x > 0.5 && gi_key_ok(first.voxel)) {
-    let k0 = gi_key0(first.voxel);
-    let k1 = gi_key1(first.voxel, first.face_id, first.obj_id);
-    var ok = false;
-    let slot = face_slot_of(k0, k1, &ok);
-    if (ok) {
-      let fe = slot * FACE_WORDS;
-      if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != 0u
-          && atomicLoad(&face_slots[fe + FACE_W_K0]) == k0
-          && atomicLoad(&face_slots[fe + FACE_W_K1]) == k1) {
-        col = vec3<f32>(
-          bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_COL])),
-          bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_COL + 1u])),
-          bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_COL + 2u])));
+  if (first.hit && gi_u.misc.x > 0.5) {
+    if (gi_key_ok(first.voxel)) {
+      var ok = false;
+      let c = face_slot_color(
+        gi_key0(first.voxel),
+        gi_key1(first.voxel, first.face_id, first.obj_id),
+        &ok);
+      if (ok) {
+        col = c;
         cached = true;
+        if (diag_on) { atomicAdd(&lod_diag[DIAG_FACE_EXACT], 1u); }
       }
     }
+    var fb_tried = false;
+    var fb_nokey = false;
+    if (!cached && GI_FACE_FALLBACK == 1u) {
+      fb_tried = true;
+      var gk = vec2<u32>(0u, 0u);
+      if (gi_cover_key(px, &gk)) {
+        var ok2 = false;
+        let c2 = face_slot_color(gk.x, gk.y, &ok2);
+        if (ok2) {
+          col = c2;
+          cached = true;
+          if (diag_on) { atomicAdd(&lod_diag[DIAG_FACE_FB_HIT], 1u); }
+        }
+      } else {
+        fb_nokey = true;
+      }
+    }
+    if (diag_on && !cached) {
+      if (fb_tried && fb_nokey) {
+        atomicAdd(&lod_diag[DIAG_FACE_FB_NOKEY], 1u);
+      } else if (fb_tried) {
+        atomicAdd(&lod_diag[DIAG_FACE_FB_MISS], 1u);
+      }
+      atomicAdd(&lod_diag[DIAG_FACE_INLINE], 1u);
+    }
+  } else if (diag_on) {
+    atomicAdd(&lod_diag[DIAG_FACE_SKY], 1u);
   }
   if (!cached) {
     col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
-                     GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c);
+                     GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
+                     vec3<f32>(0.0), false);
   }
   // ---- 光柱（godray，`volumetric.wesl`）：**线性 HDR 相加，必须在 `write_output` 的曝光之前** ----
   // 三步都是确定性取值（掩码 1 条主射线 → 两趟径向模糊）⇒ **没有噪声、没有滞后**；
@@ -917,21 +999,19 @@ fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>,
     let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
     if ((k0 | k1) != 0u) {
       var ok = false;
-      let s = face_slot_of(k0, k1, &ok);
+      // 双探针（`face_slot_find`）：认领可能落在第二格 —— 只探基槽会**静默漏掉那些面**
+      // （它们就永远没有逐面均值 ⇒ `dda_face_main` 取到 `gi_n = 0` ⇒ 只剩天光兜底）。见该函数的 ⚠️。
+      let s = face_slot_find(k0, k1, &ok);
       if (ok) {
         let fe = s * FACE_WORDS;
-        if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != 0u
-            && atomicLoad(&face_slots[fe + FACE_W_K0]) == k0
-            && atomicLoad(&face_slots[fe + FACE_W_K1]) == k1) {
-          let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
-                  / vec2<f32>(f32(gsize.x), f32(gsize.y));
-          let smp = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
-          if (smp.a > 0.0) {   // 无效（天空）texel 不参与
-            // 归一化（premultiplied：rgb = gi·valid、a = valid），再定点取整（进位到最近，避免系统性偏暗）。
-            let q = clamp(smp.rgb / max(smp.a, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
-            val = vec3<u32>(round(q * GI_ACC_SCALE));
-            slot = s;
-          }
+        let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+                / vec2<f32>(f32(gsize.x), f32(gsize.y));
+        let smp = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
+        if (smp.a > 0.0) {   // 无效（天空）texel 不参与
+          // 归一化（premultiplied：rgb = gi·valid、a = valid），再定点取整（进位到最近，避免系统性偏暗）。
+          let q = clamp(smp.rgb / max(smp.a, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+          val = vec3<u32>(round(q * GI_ACC_SCALE));
+          slot = s;
         }
       }
     }
@@ -981,16 +1061,18 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k0 = gi_guide_out[gb + GI_DEN_G_KEY0];
   let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
   if ((k0 | k1) == 0u) { return; }
-  var ok = false;
-  // 逐面两个 pass 的 group(5) 里就有 `face_slots`（`dda_layouts`）⇒ 这里用 `face_slot_of`（读的是
+  // 同一格里的**着色法线**（`gi_main` 用本 texel 的命中面写的 `voxel_normal`）：本 pass 要着色的面
+  // 与写它的那个面是**同一个键**（体素 + 面 + 物体），而 `voxel_normal` 是那个键的纯函数
+  // ⇒ 逐位相同，直接当 `shade_face` 的着色法线用，省掉每面那 4 次邻域点查询（`world_solid`）。
+  let g_nrm = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
+  // 逐面两个 pass 的 group(5) 里就有 `face_slots`（`dda_layouts`）⇒ 这里用 `face_slot_find`（读的是
   // `@group(5) @binding(8)` 那份声明）。**新入口**（`gi_face_flatten`）的 layout 里没有 group(5)，
-  // 它必须用 `face_slot_of_flat`（见那个函数的说明）。
-  let slot = face_slot_of(k0, k1, &ok);
+  // 它必须用 `face_slot_find_flat`（见那个函数的说明）。
+  // 双探针（与认领侧同一套判据）：基槽 → 第二格（撞键的面）。
+  var ok = false;
+  let slot = face_slot_find(k0, k1, &ok);
   if (!ok) { return; }
   let fe = slot * FACE_WORDS;
-  if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) == 0u
-      || atomicLoad(&face_slots[fe + FACE_W_K0]) != k0
-      || atomicLoad(&face_slots[fe + FACE_W_K1]) != k1) { return; }
   if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
 
   // ---- 从面键重建命中（位布局见 `gi/common.wesl` 的 `gi_key0`/`gi_key1`）----
@@ -1046,7 +1128,7 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 但必须是合法单位向量（`shade_face` 的注释里写了理由）。
   let col = shade_face(first, view_u.cam_pos_voxel.xyz, fnw, frustum_length,
                        GiInput(true, gi_avg, select(0.0, 1.0, gi_n > 0u), gi_uv),
-                       sun_dir, sky, sun_c);
+                       sun_dir, sky, sun_c, g_nrm, true);
   atomicStore(&face_slots[fe + FACE_W_COL], bitcast<u32>(col.x));
   atomicStore(&face_slots[fe + FACE_W_COL + 1u], bitcast<u32>(col.y));
   atomicStore(&face_slots[fe + FACE_W_COL + 2u], bitcast<u32>(col.z));
@@ -1141,14 +1223,12 @@ fn gi_face_flatten(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 天空 texel：`gi_out` 已是 0（`gi_ss_main` 的 miss 分支），不动。
   if ((k0 | k1) == 0u) { return; }
   var ok = false;
-  // 查槽走 `face_slot_of_flat`（读 `@group(0) @binding(18)` 那份声明）：本 pass 的 layout 只有
-  // group(0)，调 `face_slot_of` 会把 group(5) 拖进来 ⇒ pipeline 创建直接失败（见那个函数的说明）。
-  let slot = face_slot_of_flat(k0, k1, &ok);
+  // 查槽走 `face_slot_find_flat`（读 `@group(0) @binding(18)` 那份声明）：本 pass 的 layout 只有
+  // group(0)，调 `face_slot_find` 会把 group(5) 拖进来 ⇒ pipeline 创建直接失败（见那个函数的说明）。
+  // 双探针：认领可能落在第二格 —— 只探基槽会让那些面**没有面内平均**（降噪输入留着逐 texel 噪声）。
+  let slot = face_slot_find_flat(k0, k1, &ok);
   if (!ok) { return; }
   let fe = slot * FACE_WORDS;
-  if (atomicLoad(&face_slots_flat[fe + FACE_W_FLAG]) == 0u
-      || atomicLoad(&face_slots_flat[fe + FACE_W_K0]) != k0
-      || atomicLoad(&face_slots_flat[fe + FACE_W_K1]) != k1) { return; }
   let n = atomicLoad(&face_slots_flat[fe + FACE_W_RAW_N]);
   if (n == 0u) { return; }
   let inv = 1.0 / (f32(n) * GI_ACC_SCALE);
