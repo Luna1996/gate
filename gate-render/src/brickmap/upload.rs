@@ -490,7 +490,15 @@ fn extract(
   main_pending: Option<Extract<Res<MainPending>>>,
   mut mirror: ResMut<BuilderMirror>,
   mut resid: ResMut<ResidencyState>,
+  // 诊断：本系统耗时（`SysTimer`，每 60 帧一行）+ 分段计时（`profiler::SPLIT_DIAG`，默认关 ⇒ 零成本）
+  mut diag: Local<(f64, u32)>,
+  mut split: Local<Option<crate::profiler::SplitDiag>>,
 ) {
+  let _t = crate::profiler::SysTimer::new("EXTRACT 快照", &mut diag);
+  let sd = split.get_or_insert_with(|| {
+    crate::profiler::SplitDiag::new(&["判脏", "sync", "sync_win", "update", "palette", "snapshot", "尾"])
+  });
+  sd.start();
   let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
     return;
   };
@@ -593,8 +601,11 @@ fn extract(
   let builder_dirty = mirror.builder.as_ref().is_some_and(VolumesBuilder::has_dirty);
 
   if !dirty_any && !window_moved && !builder_dirty {
+    sd.mark(0);
+    sd.frame_end("EXTRACT");
     return;
   }
+  sd.mark(0);
   let builder = mirror
     .builder
     .get_or_insert_with(|| VolumesBuilder::new_unbuilt(volumes_ref, scene.residency_budget_bytes));
@@ -611,14 +622,19 @@ fn extract(
         .iter()
         .all(|g| g.dirty.data_dirty_count() == 0 && g.dirty.comp_dirty_count() == 0);
     builder.sync(volumes_ref);
+    sd.mark(1);
     builder.sync_windows(volumes_ref);
+    sd.mark(2);
     for (vol_idx, c, dirty) in pending_data.drain(..) {
       builder.update_chunk(volumes_ref, vol_idx, c, &dirty, quiet);
     }
+    sd.mark(3);
   }
 
   builder.sync_palettes(volumes_ref);
+  sd.mark(4);
   let snapshot = builder.snapshot();
+  sd.mark(5);
 
   mirror.palette_versions = scene.volumes.list.iter().map(|g| g.palette().version()).collect();
   mirror.palette_content_versions =
@@ -627,6 +643,8 @@ fn extract(
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();
   commands.insert_resource(UploadSnapshot { volumes: snapshot, state_bytes, comp_chunks });
+  sd.mark(6);
+  sd.frame_end("EXTRACT");
 }
 
 fn u8_of_u32(w: &[u32]) -> &[u8] {
@@ -1427,10 +1445,17 @@ fn plan_residency(
   mut far_seq: Local<Vec<u64>>,
   // ①' 的"已知空块"游标（`VolumeGrid::empty_log`），逐卷一个
   mut empty_cursor: Local<Vec<usize>>,
-  // 诊断：本系统的耗时（每 60 帧一行，见函数尾）
+  // 诊断：本系统的耗时（每 60 帧一行，见函数尾）+ 分段计时（`profiler::SPLIT_DIAG`，默认关 ⇒ 零成本）
   mut diag: Local<(f64, u32)>,
+  mut split: Local<Option<crate::profiler::SplitDiag>>,
 ) {
   let _t = crate::profiler::SysTimer::new("RESID 常驻调度", &mut diag);
+  let sd = split.get_or_insert_with(|| {
+    crate::profiler::SplitDiag::new(&[
+      "①账目", "①'空块", "②用途", "④取候选", "④逐块", "④补请求", "④计划装", "⑤⑥远场", "⑦取证", "尾",
+    ])
+  });
+  sd.start();
   let (Some(scene), Some(cam)) = (scene, cam) else { return };
   let Some(builder) = mirror.builder.as_mut() else { return };
   let grid = scene.volumes.main();
@@ -1482,6 +1507,7 @@ fn plan_residency(
   *ledger_cursor = grid.resident_log_len();
   *ledger_ready = true;
   *ledger_seq = seq;
+  sd.mark(0);
 
   // ①' **已知空块 → 索引哨兵**（`docs/mc_map.md` §8）：`VolumeGrid` 里那些"流式源产出过 `None`"的
   //     chunk，要在 GPU 索引里标成 [`crate::brickmap::consts::INDEX_ENTRY_EMPTY`] —— 否则 shader 把
@@ -1531,6 +1557,7 @@ fn plan_residency(
       }
     }
   }
+  sd.mark(1);
 
   // ② 用途戳 → LRU 信号（论文 §III.A）：`report_lod_requests` 每 `REPORT_PERIOD_SECS` 从**稠密表**
   //    读回"这一窗口哪几个 chunk 被主射线看到过"，这里逐条记成"最近使用"。它同时是下面需求集的来源与
@@ -1545,6 +1572,7 @@ fn plan_residency(
       state.residency.note_use(gate_voxel::ChunkCoord(u.chunk), frame);
     }
   }
+  sd.mark(2);
   // ③ 预算：**GPU 常驻池容量**（论文的定长 pool），由 `gate-app` 的「常驻池」滑杆每帧写进来。
   //    口径是**块数**（由 CPU 侧的每块字节折出），这里再折成 GPU 的字节 —— 两侧的换出阈值才对齐。
   //    0 = 关闭（回归口径：无界常驻，只受窗口/半径约束）。
@@ -1576,7 +1604,9 @@ fn plan_residency(
   let cam_pos = cam.position_world;
   let cam_chunk = (cam_pos / gate_voxel::CHUNK_SIZE as f32).floor().as_ivec3();
   let mut wants: Vec<(gate_voxel::ChunkCoord, Level)> = Vec::new();
-  for (c, _) in state.residency.recent_top(USE_KEEP_FRAMES, cap_chunks) {
+  let top = state.residency.recent_top(USE_KEEP_FRAMES, cap_chunks);
+  sd.mark(3);
+  for (c, _) in top {
     let Some(tree) = grid.chunk(c) else { continue };
     if tree.is_empty() {
       continue;
@@ -1611,6 +1641,7 @@ fn plan_residency(
     let lv = if streamed { lv.min(cur) } else { lv };
     wants.push((c, lv));
   }
+  sd.mark(4);
   // 请求里那些**还没常驻**的：它没有用途戳（射线没进去过）⇒ 上面那个循环收不到它，单独补进来。
   for (c, _) in want_level_of.iter() {
     if state.residency.is_resident(*c) {
@@ -1621,6 +1652,7 @@ fn plan_residency(
       wants.push((*c, want_level_of[c]));
     }
   }
+  sd.mark(5);
 
   // ③ 钉住本帧被编辑的（编辑优先于流式），并把它们排除在换出之外。
   //    顺带刷它们的驻留字节：内容变了 ⇒ `builder` 里那棵树的大小变了（① 那趟只看挂载 / 卸载，
@@ -1674,6 +1706,7 @@ fn plan_residency(
       installed += 1;
     }
   }
+  sd.mark(6);
   // ⑤ 反向同步：builder 里还有块、但 CPU 侧已经没有这个 chunk（被真卸载 / 整块清空）⇒ 归还 GPU 块。
   //    流式世界的卸载就是走这条路：`VolumeGrid::unmount_chunk` 拿掉 CPU 树，这里跟着释放显存。
   //    **增量**（M8）：卸载的那几条已在 ① 里就地归还（那趟只处理本帧新增的变更）；这里只在
@@ -1730,6 +1763,7 @@ fn plan_residency(
       }
     }
   }
+  sd.mark(7);
   // ⑦ 「CPU 有 / GPU 无」取证（`docs/editable-gigavoxel.md` §10.2 第 1 条）：本帧**没有任何**待安装 /
   //    待换出的动作，相机近旁却仍有"有内容的 chunk 没装在 GPU 上" ⇒ 那一片在画面上就是空洞与齐平断口
   //    （静默跳过发生在 `install_chunk` 的窗口检查里，没有这条日志就查不出来）。
@@ -1759,7 +1793,10 @@ fn plan_residency(
   // 本帧动过账目（装 / 换了块）⇒ 那些坐标的驻留字节与档位都已在 ④⑤ 里就地更新（`note_resident` /
   // `note_gone`）⇒ ① 下一帧不必再为此重算。
   let busy = installed + evicted + far_installed + far_evicted > 0;
+  sd.mark(8);
   if !busy {
+    sd.mark(9);
+    sd.frame_end("RESID");
     return;
   }
   // WARNING: **这里不重出 `UploadSnapshot`**（`extract` 是唯一的出快照点）。`snapshot()` 会**取走**
@@ -1784,6 +1821,8 @@ fn plan_residency(
     far_installed,
     far_evicted
   );
+  sd.mark(9);
+  sd.frame_end("RESID");
 }
 
 /// 统一体素渲染上传插件：主世界与物体同一路径。

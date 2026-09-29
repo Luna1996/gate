@@ -498,8 +498,16 @@ pub fn stream_chunks(
   mut frames: Local<u32>,
   // 诊断：本系统的耗时（每 60 帧一行，见 `gate_render::profiler::SysTimer`）
   mut diag: Local<(f64, u32)>,
+  // 分段计时（`profiler::SPLIT_DIAG`，默认关 ⇒ 零成本；见 `SplitDiag`）
+  mut split: Local<Option<gate_render::profiler::SplitDiag>>,
 ) {
   let _t = gate_render::profiler::SysTimer::new("STREAM 流式装载", &mut diag);
+  let sd = split.get_or_insert_with(|| {
+    gate_render::profiler::SplitDiag::new(&[
+      "⓪窗口", "取源peek", "①取回", "①a建表", "①b派发", "①c挂载", "②卸载", "尾",
+    ])
+  });
+  sd.start();
   // WHY: 暂停 = 冻结整个流式环（连窗口都不跟）—— 让相机能飞出加载边界，看"世界到此为止"的那一圈。
   if stream.paused {
     return;
@@ -564,6 +572,7 @@ pub fn stream_chunks(
     }
     scopes.push(VolScope { center: c, w_origin: want, w_dims: d, moved, v_hy });
   }
+  sd.mark(0);
   let (load_r, unload_r, coarse_r, coarse_h, mount_words, mount_count) = (
     stream.load_radius,
     stream.unload_radius,
@@ -626,6 +635,7 @@ pub fn stream_chunks(
     if requests_load { feed.as_ref().map(|f| f.peek()).unwrap_or_default() } else { Vec::new() };
   let uses: Vec<gate_render::LodUse> =
     use_feed.as_ref().map(|f| f.peek()).unwrap_or_default();
+  sd.mark(1);
 
   let mut generated = 0usize;
   {
@@ -698,6 +708,7 @@ pub fn stream_chunks(
       bevy::log::debug!("MC 调色板 +{} 槽（累计 {}）", updates.len(), palette_applied + updates.len());
       palette_applied += updates.len();
     }
+    sd.mark(2);
 
     // 挂载的**字数预算跨卷共用**（一个池、一份帧额 ⇒ 远场不会把近场的帧额吃掉）
     let mut words = 0usize;
@@ -790,6 +801,7 @@ pub fn stream_chunks(
         // 需求集换了 ⇒ 保护集换了 ⇒ 允许再试一次"超容量换出"（见 `VolState::trim_idle`）
         st.trim_idle = false;
       }
+      sd.mark(3);
 
       // ①b 派发：从表头取（已满足 / 已在飞的当场划过），到在飞上限为止
       let mut dispatched = 0usize;
@@ -820,6 +832,7 @@ pub fn stream_chunks(
           break;
         }
       }
+      sd.mark(4);
 
       // ①c 挂载：按**字数预算**逐帧消化（装树 + 标脏 + 后面的序列化上传都吃这条预算）；主世界的
       //     粗档细化也走这条路（`mount_chunk_tree` 是**整体替换** ⇒ 粗树被细树顶掉）。
@@ -844,6 +857,7 @@ pub fn stream_chunks(
         words_mounted += 1;
         generated += 1;
       }
+      sd.mark(5);
 
       // ② 卸载：**容量 + LRU**（论文 §III.A），不再有"半径 / TTL 保护"。
       //
@@ -875,6 +889,7 @@ pub fn stream_chunks(
         || (over_cap && !st.trim_idle && seq != st.last_seq);
       st.last_seq = seq;
       if !need_scan {
+        sd.mark(6);
         continue;
       }
       let resident: Vec<ChunkCoord> = grid.chunk_coords().collect();
@@ -922,6 +937,7 @@ pub fn stream_chunks(
         st.detail.remove(&cc);
         st.last_used.remove(&cc);
       }
+      sd.mark(6);
 
       if generated > 0 || n_unload > 0 || !st.ready.is_empty() {
         if far_level {
@@ -972,6 +988,8 @@ pub fn stream_chunks(
   }
   // 调色板游标回写（`stream.pipeline` 那段借用已结束）
   stream.palette_applied = palette_applied;
+  sd.mark(7);
+  sd.frame_end("STREAM");
 }
 
 /// room 坐标 → 确定性随机流。**同一个 room 在任何机器、任何时候都得到同一材质**。

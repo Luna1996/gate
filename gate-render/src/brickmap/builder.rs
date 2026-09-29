@@ -133,17 +133,26 @@ pub enum ChunkUpdate {
 /// 节点槽未分配的哨兵
 const NODE_NONE: u32 = u32::MAX;
 
-/// 节点槽（索引 = 树节点 id）：节点在**块内**的字偏移 + 当前占用字数。
-/// 不存 wire 层 —— 层号由调用方给（`TreeDirty` 的层 / 递归深度），节点 id 与层的对应关系恒定。
-#[derive(Debug, Clone, Copy)]
-struct NodeSlot {
-  off: u32,
-  words: u16,
+/// **节点槽表 = 树自己的 wire 布局**（[`gate_voxel::NodeLayout`]，索引 = 节点 id，值 = `(块内字偏移,
+/// wire 层)`）：安装时**直接接管** `serialize` 产出的那份布局，不再逐节点重算一份带字数的表。
+///
+/// WHY 不再存"占用字数"：它由 `(id, level, 掩码)` 唯一决定（[`wire_words_of`]），而掩码随时能从
+/// `b_struct` 的节点头两个字读回来（[`read_mask`]）⇒ 需要它的只有**增量重写**那一条路，且每次只需
+/// 该节点自己那一个值。旧写法在**每次安装**时给整棵树（全分辨率 chunk ≈ 2.5 万节点）逐节点算一遍，
+/// 实测 `GATE_BENCH=fly`（MC 城市移动中、~48 块/帧）**15 ms/帧** —— 而其中绝大多数块永远不会被编辑。
+#[inline]
+fn slot_words(buf: &[u32], base: usize, id: u32, level: u8, off: u32) -> usize {
+  if off == NODE_NONE {
+    return 0;
+  }
+  wire_words_of(id, level, read_mask(buf, base + off as usize))
 }
 
-impl NodeSlot {
-  const UNASSIGNED: Self = Self { off: NODE_NONE, words: 0 };
-}
+/// 未分配的槽（与 [`NodeLayout`] 的初值同口径）
+const NODE_SLOT_NONE: (u32, u8) = (NODE_OFFSET_NONE, 0);
+/// 槽表由 `gate_voxel` 的布局直接接管 ⇒ 两边的"未分配"哨兵**必须同值**，否则会把未分配的槽当成
+/// 已分配（偏移读到别处）。绑成编译期断言，改一边就编译不过。
+const _: () = assert!(NODE_NONE == NODE_OFFSET_NONE);
 
 /// 单 chunk 的树块：块首（= 根节点地址）+ 块内节点 arena。
 ///
@@ -158,8 +167,8 @@ struct ChunkSlot {
   cap: usize,
   /// 块内空闲段（偏移相对 `base`）
   free: FreeRuns,
-  /// 节点槽表（索引 = 节点 id）
-  nodes: Vec<NodeSlot>,
+  /// 节点槽表（索引 = 节点 id；见 [`NODE_SLOT_NONE`] 处的说明）
+  nodes: gate_voxel::NodeLayout,
 }
 
 /// 节点在块内占用的字数（wire 形态）：根固定 [`ROOT_WIRE_WORDS`]（掩码增减不改根的字数 ⇒ 根永不搬迁）。
@@ -208,6 +217,11 @@ pub struct BrickMapBuilder {
   /// 只增不改（与 `VolumeGrid` 同口径，见那里的说明）；调用方是 [`Self::note_empty`] 与
   /// 窗口平移时的重打（[`Self::set_window`]）。
   empty: HashSet<ChunkCoord>,
+  /// **序列化复用缓冲**（blob + 布局）：安装一棵 chunk 树要序列化到几百 KB，逐棵新分配 + 释放
+  /// 会把内存分配器顶爆（实测 `GATE_BENCH=fly` 的 MC 城市：~48 块/帧 ⇒ 释放那一项就 6 ms/帧）。
+  /// 缓冲只增不减（高水位 = 最大的那棵树），容量由 `Vec` 自己摊。
+  scratch_blob: Vec<u32>,
+  scratch_layout: NodeLayout,
 }
 
 /// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）；空 = 未修改。
@@ -289,6 +303,8 @@ impl BrickMapBuilder {
       reserve: reserve_words,
       region_chunks: region_chunks.max(1),
       empty: HashSet::new(),
+      scratch_blob: Vec::new(),
+      scratch_layout: NodeLayout::new(),
     };
     // 预留区登记为**空闲**：块级分配走 first-fit，会优先把它切走
     if reserve_words > 0 {
@@ -323,7 +339,7 @@ impl BrickMapBuilder {
       .map(|&c| grid.chunk(c).expect("chunk_has_content 已过滤").serialize_with_layout())
       .collect();
     for (c, (blob, layout)) in coords.iter().zip(blobs) {
-      b.install_blob(*c, blob, layout);
+      b.install_blob(*c, &blob, layout);
     }
     b.refresh_globals();
 
@@ -692,32 +708,28 @@ impl BrickMapBuilder {
 
   /// 全量安装一个 chunk 的树（新块 + 窗口条目 + 节点槽表）
   fn install_chunk(&mut self, coord: ChunkCoord, tree: &ChunkTree) {
-    let (blob, layout) = tree.serialize_with_layout();
-    self.install_blob(coord, blob, layout);
+    // 序列化进**复用缓冲**（见 [`Self::scratch_blob`]）：每帧几十棵、每棵几百 KB，每棵都新分配 +
+    // 释放会把内存分配器顶爆（实测 `GATE_BENCH=fly`：单是"释放那个 blob"就 ~6 ms/帧）。
+    let mut blob = std::mem::take(&mut self.scratch_blob);
+    let mut layout = std::mem::take(&mut self.scratch_layout);
+    tree.serialize_into(&mut blob, &mut layout);
+    // 槽表**直接接管这份布局**（复制一份；scratch 那份留给下一棵树复用）—— 不再逐节点重算
+    // `(off, words)` 表（那是全分辨率块 ~2.5 万次 `read_mask` + `wire_words_of`，见 `slot_words`）。
+    let nodes = layout.clone();
+    self.install_blob(coord, &blob, nodes);
+    self.scratch_blob = blob;
+    self.scratch_layout = layout;
   }
 
-  fn install_blob(&mut self, coord: ChunkCoord, blob: Vec<u32>, layout: NodeLayout) {
+  fn install_blob(&mut self, coord: ChunkCoord, blob: &[u32], nodes: gate_voxel::NodeLayout) {
     let need = blob.len();
     // 块留 25% 余量（且至少容得下一个最大节点）：后续编辑的字数变化优先在块内解决，
     // 免得动不动搬整块（搬块 = 整棵 chunk 重传）。
     let cap = need + need / 4 + ROOT_WIRE_WORDS + 16;
     let base = self.alloc_block(cap);
-    self.buffers.b_struct[base..base + need].copy_from_slice(&blob);
+    self.buffers.b_struct[base..base + need].copy_from_slice(blob);
     let mut free = FreeRuns::default();
     free.free(need, cap - need);
-    // 节点槽表同样留 25% 余量：树每编辑一次就可能多几个节点，槽表若刚好卡在长度上，
-    // 头一次增长要 realloc + 填满整表（几十万槽 = 毫秒级）。
-    let mut nodes: Vec<NodeSlot> = Vec::with_capacity(layout.len() + layout.len() / 4 + 64);
-    nodes.extend(layout.iter().enumerate().map(|(id, &(off, level))| {
-      if off == NODE_OFFSET_NONE {
-        NodeSlot::UNASSIGNED
-      } else {
-        NodeSlot {
-          off,
-          words: wire_words_of(id as u32, level, read_mask(&blob, off as usize)) as u16,
-        }
-      }
-    }));
     let ip = self.window_word(coord);
     self.buffers.b_struct[ip] = base as u32 + 1;
     self.chunks.insert(coord, ChunkSlot { base, cap, free, nodes });
@@ -742,7 +754,7 @@ impl BrickMapBuilder {
   fn apply_node_dirty(&mut self, coord: ChunkCoord, tree: &ChunkTree, dirty: &TreeDirty) {
     let mut slot = self.chunks.remove(&coord).expect("调用方保证有块");
     if slot.nodes.len() < tree.node_capacity() {
-      slot.nodes.resize(tree.node_capacity(), NodeSlot::UNASSIGNED);
+      slot.nodes.resize(tree.node_capacity(), NODE_SLOT_NONE);
     }
     for &(level, id) in &dirty.nodes {
       let Some(view) = tree.node_view(id) else {
@@ -770,7 +782,10 @@ impl BrickMapBuilder {
     view: NodeView<'_>,
   ) {
     let new_words = wire_words_of(id, level, view.mask);
-    let old = slot.nodes[id as usize];
+    let (old_off, old_level) = slot.nodes[id as usize];
+    // 旧节点的字数**从 b_struct 里现读**（它的前两个字就是掩码）：槽表不再存 `words`，见
+    // [`NODE_SLOT_NONE`] 与 [`slot_words`] 的说明。
+    let old_words = slot_words(&self.buffers.b_struct, slot.base, id, old_level, old_off);
 
     // ---- 新字节：子块指针 = 子节点**当前**块内偏移 ----
     let mut out: Vec<u32> = Vec::with_capacity(new_words);
@@ -783,7 +798,7 @@ impl BrickMapBuilder {
         out.extend_from_slice(&tree.node_inline_words(id).expect("level 3 分裂节点有 inline"));
       } else {
         for &c in view.children {
-          out.push(slot.nodes[c as usize].off);
+          out.push(slot.nodes[c as usize].0);
         }
       }
     }
@@ -798,8 +813,8 @@ impl BrickMapBuilder {
     // 变 uniform 时），而"变 uniform 的节点其子块必然也已是 uniform"、uniform 节点恒 3 字且
     // 原地留驻 ⇒ 老 blob 里的子块偏移此刻仍然有效（换成"按偏移差集释放"就会把已搬走的活子块
     // 的旧地址当成死块释放 —— 那个地址可能已分给别人）。
-    if old.off != NODE_NONE && level < 3 && view.mask == 0 {
-      let old_at = slot.base + old.off as usize;
+    if old_off != NODE_NONE && level < 3 && view.mask == 0 {
+      let old_at = slot.base + old_off as usize;
       let old_mask = read_mask(&self.buffers.b_struct, old_at);
       for slot_i in 0..old_mask.count_ones() as usize {
         let c = self.buffers.b_struct[old_at + NODE_FIXED_WORDS + slot_i];
@@ -811,28 +826,25 @@ impl BrickMapBuilder {
     // 缩小（含字数不变）：原地留驻，**尾部必须归还**空闲段 —— 紧挨着的空闲段合到一起，下一次
     // 增长才能原地扩回来（同一个 4³ brick 反复"合并 → 再分裂"是高频场景：level 3 在 3 ↔ 35 字之间
     // 摆动，不还尾部就会攒出一堆填不上的洞，把高水位一路顶上去）。
-    let off = if old.off == NODE_NONE {
+    let off = if old_off == NODE_NONE {
       self.alloc_node(coord, slot, new_words)
-    } else if new_words <= old.words as usize {
-      slot.free.free(old.off as usize + new_words, old.words as usize - new_words);
-      old.off
-    } else if slot
-      .free
-      .take_range(old.off as usize + old.words as usize, new_words - old.words as usize)
-    {
-      old.off // 原地扩容：紧跟其后正好是空闲段
+    } else if new_words <= old_words {
+      slot.free.free(old_off as usize + new_words, old_words - new_words);
+      old_off
+    } else if slot.free.take_range(old_off as usize + old_words, new_words - old_words) {
+      old_off // 原地扩容：紧跟其后正好是空闲段
     } else {
-      slot.free.free(old.off as usize, old.words as usize);
+      slot.free.free(old_off as usize, old_words);
       self.alloc_node(coord, slot, new_words)
     };
 
     // ---- 写 ----
     let at = slot.base + off as usize;
-    if off != old.off || self.buffers.b_struct[at..at + content] != out[..] {
+    if off != old_off || self.buffers.b_struct[at..at + content] != out[..] {
       self.buffers.b_struct[at..at + content].copy_from_slice(&out);
       self.mark_struct_words(at, content);
     }
-    slot.nodes[id as usize] = NodeSlot { off, words: new_words as u16 };
+    slot.nodes[id as usize] = (off, level);
   }
 
   /// 释放一个节点块**及其全部后代**（子块关系读**旧 blob**，与缓存无关；根不在此路径上，

@@ -600,7 +600,18 @@ impl ChunkTree {
   pub fn serialize_with_layout(&self) -> (Vec<u32>, NodeLayout) {
     // 预估容量：每节点 3 字 + 指针/inline。不做精确预估，只为省掉增长期的反复重分配+拷贝。
     let mut out = Vec::with_capacity(self.nodes.len() * 3 + 4096);
-    let mut layout: NodeLayout = vec![(NODE_OFFSET_NONE, 0); self.nodes.len().max(1)];
+    let mut layout: NodeLayout = Vec::new();
+    self.serialize_into(&mut out, &mut layout);
+    (out, layout)
+  }
+
+  /// 同 [`Self::serialize_with_layout`]，但**写进调用方的两个缓冲**（先清空）——
+  /// 消费端每帧要序列化几十棵 chunk 树（每棵几百 KB），每次都新分配 + 释放会把内存分配器顶爆
+  /// （实测 `GATE_BENCH=fly`：单是"释放那个 blob"就占 ~6 ms/帧）。复用缓冲把这两笔都摊掉。
+  pub fn serialize_into(&self, out: &mut Vec<u32>, layout: &mut NodeLayout) {
+    out.clear();
+    layout.clear();
+    layout.resize(self.nodes.len().max(1), (NODE_OFFSET_NONE, 0));
     let (mask, palette) = match self.nodes.first() {
       None => (0u64, self.root_palette),
       Some(n) => (n.mask, n.palette),
@@ -622,12 +633,11 @@ impl ChunkTree {
           for slot in 0..count {
             let child = self.children.slice(n.off, count)[slot] as usize;
             out[NODE_FIXED_WORDS + slot] = out.len() as u32;
-            self.serialize_node(child, child_extent, &mut out, &mut layout);
+            self.serialize_node(child, child_extent, out, layout);
           }
         }
       },
     }
-    (out, layout)
   }
 
   /// DFS 序列化一个节点（层 0-2 紧凑指针表 / 层 3 值块 inline）

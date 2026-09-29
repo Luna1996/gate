@@ -84,6 +84,64 @@ impl Drop for SysTimer<'_> {
   }
 }
 
+/// **分段计时开关**（[`SplitDiag`]）：`false` 时全部标记在编译期消失（零成本），
+/// 打开即得到逐段 `SPLIT <系统> ms/帧` 行 —— 取证时把它置 `true` 重编译即可，不必再补代码。
+///
+/// WHY 留成常量而不是删掉：本仓的帧时排查反复需要"这个系统内部哪一段贵"（`extract` 的
+/// 序列化 / `stream_chunks` 的建表 / `plan_residency` 的需求集循环都靠它定位过）。
+pub const SPLIT_DIAG: bool = false;
+
+/// **分段计时**（`docs/editable-gigavoxel.md` 的取证手法）：把一个大系统切成几段，每 60 帧落一行明细。
+///
+/// 用法：`Local<Option<SplitDiag>>` + 入口 `start()` + 各段末尾 `mark(i)` + 出口 `frame_end(label)`。
+/// 关掉（[`SPLIT_DIAG`] = false）时 `mark` / `start` / `frame_end` 都被内联成空操作。
+pub struct SplitDiag {
+  names: &'static [&'static str],
+  acc: Vec<f64>,
+  n: u32,
+  t0: std::time::Instant,
+}
+
+impl SplitDiag {
+  pub fn new(names: &'static [&'static str]) -> Self {
+    Self { names, acc: vec![0.0; names.len()], n: 0, t0: std::time::Instant::now() }
+  }
+
+  pub fn mark(&mut self, i: usize) {
+    if !SPLIT_DIAG {
+      return;
+    }
+    let now = std::time::Instant::now();
+    self.acc[i] += now.duration_since(self.t0).as_secs_f64();
+    self.t0 = now;
+  }
+
+  /// 系统入口调一次：把起点挪到"本系统开始"，别把**跨系统的那段间隙**算进第一段。
+  pub fn start(&mut self) {
+    if !SPLIT_DIAG {
+      return;
+    }
+    self.t0 = std::time::Instant::now();
+  }
+
+  pub fn frame_end(&mut self, label: &str) {
+    if !SPLIT_DIAG {
+      return;
+    }
+    self.n += 1;
+    if self.n >= 60 {
+      let mut line = String::new();
+      for (name, s) in self.names.iter().zip(&self.acc) {
+        line.push_str(&format!("{name}={:.2} ", s / self.n as f64 * 1000.0));
+      }
+      bevy::log::debug!(target: "gate", "SPLIT {label} ms/帧: {line}");
+      self.acc.iter_mut().for_each(|v| *v = 0.0);
+      self.n = 0;
+    }
+    self.t0 = std::time::Instant::now();
+  }
+}
+
 fn diag_gap_end(mut st: ResMut<DiagFrameGap>) {
   let now = std::time::Instant::now();
   let (Some(t0), Some(b0)) = (st.prev_end, st.busy0) else {
