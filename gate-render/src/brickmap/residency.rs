@@ -49,6 +49,21 @@ pub const LADDER: &[(Level, f32)] = &[
 /// 迟滞系数：从细档退到粗档要 `fp ≥ 阈值`，从粗档回到细档要 `fp < 阈值 × 该值`（两者之间保持原档）。
 const HYSTERESIS: f32 = 0.75;
 
+/// **首次安装的引导档**（渐进加载：先给糊的，再变清晰）。
+///
+/// WHY：全分辨率首次安装要**整树序列化**（实测 ~99 µs/块）⇒ 跟不上一移动就留洞。先按这一档装上去
+/// （`ChunkTree::proxy` 几 µs，比全树便宜约 15×），随后由 `plan` 的常规路径**升级**到目标档。
+/// 配合 `world.wesl::trace_scene` 的远场兜底（保证"总有东西"），这条保证"多快变清晰"。
+///
+/// 取 `16`（16³ 档）：形状已经可辨（不是整块一个色），而代价仍在个位数 µs。
+pub const BOOTSTRAP_LEVEL: Level = 16;
+
+/// **首次安装（粗档引导）每帧上限**。
+///
+/// 它便宜（几 µs/块），所以**不占** `max_install_per_frame` 的名额（那个名额留给细化）；但不设上限
+/// 时，冷启动那一下会把全部待装块塞进一帧 ⇒ 主线程尖峰。取 128 ≈ 0.8 ms 上界。
+const BOOTSTRAP_PER_FRAME: usize = 128;
+
 /// 想要哪一档：`cur_level` = 当前档（参与迟滞）。
 /// 变粗按阈值（远端只看得到粗块）；**变细要退出迟滞带**（`fp < 阈值 × 0.75`）⇒ 相机在阈值附近
 /// 来回走不会反复重装（重装 = 0.9 ms 尖峰 + 画面跳变）。
@@ -123,8 +138,10 @@ impl ResidencyPolicy {
 /// 本帧的常驻动作（都由调用方落实到 builder）。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResidencyPlan {
-  /// 要**安装**的 `(chunk, 档位)`：新唤醒 + 档位变化（降级 / 升级），按到相机距离升序，
-  /// 已按 `max_install_per_frame` 截断。已在目标档位的不出现。
+  /// 要**安装**的 `(chunk, 档位)`：新唤醒 + 档位变化（降级 / 升级），按到相机距离升序。
+  ///
+  /// **两段**（见 [`BOOTSTRAP_LEVEL`]）：首次安装按引导档（粗、便宜）且**不占**每帧名额；档位变化（细化
+  /// / 粗化）才受 `max_install_per_frame` 截断。已在目标档位的不出现。
   pub install: Vec<(ChunkCoord, Level)>,
   /// 要**换出**的 chunk（LRU 序：最久没用到的在前）。
   pub evict: Vec<ChunkCoord>,
@@ -258,7 +275,29 @@ impl Residency {
     install.sort_by_key(|&(c, level)| {
       (dist_of(camera_chunk, c), std::cmp::Reverse(level), c.0.x, c.0.y, c.0.z)
     });
-    install.truncate(policy.max_install_per_frame);
+    // ---- 两段安装（渐进加载）----
+    //   · **首次安装**（`cur == None`）⇒ 按 [`BOOTSTRAP_LEVEL`] 粗档引导。它便宜 ⇒ **不占**每帧名额
+    //     （名额留给下面那类），但另有 [`BOOTSTRAP_PER_FRAME`] 防冷启动尖峰。
+    //   · **档位变化**（`cur == Some`）= 细化 / 粗化 ⇒ 走 `max_install_per_frame`。
+    //
+    // CONSTRAINT: 顺序仍是"按相机距离升序"（`install` 已排好），两段只是**名额分配**不同，不重排 ——
+    // 近了先装、先细，这条不能因为分段而破。
+    let mut picked: Vec<(ChunkCoord, Level)> = Vec::with_capacity(install.len());
+    let mut refine_budget = policy.max_install_per_frame;
+    let mut boot_budget = BOOTSTRAP_PER_FRAME;
+    for (c, level) in install {
+      if self.resident_level(c).is_none() {
+        if boot_budget == 0 {
+          continue;
+        }
+        boot_budget -= 1;
+        picked.push((c, level.max(BOOTSTRAP_LEVEL)));
+      } else if refine_budget > 0 {
+        refine_budget -= 1;
+        picked.push((c, level));
+      }
+    }
+    let install = picked;
 
     let evict = self.pick_evicts(policy, camera_chunk, must_keep);
     ResidencyPlan { install, evict }
@@ -472,11 +511,17 @@ mod tests {
     assert!(plan.evict.is_empty());
   }
 
-  /// 每帧安装上限：近的优先、且被截断。
+  /// **细化**（档位变化）仍受每帧上限约束，且近的优先。
+  ///
+  /// 首次安装**不**受这个上限（它走粗档引导、便宜 —— 见 [`first_install_bootstraps_without_spending_refine_budget`]），
+  /// 所以这里用三个**已常驻的粗档块**构造"纯细化"的场景。
   #[test]
-  fn installs_are_capped_and_nearest_first() {
+  fn refinements_are_capped_and_nearest_first() {
     let mut r = Residency::new();
     r.tick(100);
+    for x in [2, 5, 9] {
+      r.note_resident(cc(x, 0, 0), 100, CHUNK_SIZE, 0);
+    }
     let wants = [(cc(9, 0, 0), 16), (cc(2, 0, 0), 16), (cc(5, 0, 0), 16)];
     let plan = r.plan(&P, IVec3::ZERO, wants.into_iter(), &HashSet::new());
     assert_eq!(plan.install, vec![(cc(2, 0, 0), 16), (cc(5, 0, 0), 16)], "距离升序 + 上限 2");
@@ -486,5 +531,46 @@ mod tests {
   #[test]
   fn distance_is_chebyshev() {
     assert_eq!(chunk_distance(IVec3::new(0, 0, 0), IVec3::new(3, -5, 1)), 5);
+  }
+
+  /// **两段安装（渐进加载）**：首次安装按 [`BOOTSTRAP_LEVEL`] 粗档引导、且**不占**每帧名额
+  /// （名额留给细化）；细化仍受 `max_install_per_frame` 截断；两段都不打乱"按相机距离升序"。
+  #[test]
+  fn first_install_bootstraps_without_spending_refine_budget() {
+    let mut r = Residency::new();
+    r.tick(100);
+    // 两个已常驻的**粗档**块（想细化到全分辨率）
+    r.note_resident(cc(0, 0, 0), 100, CHUNK_SIZE, 0);
+    r.note_resident(cc(1, 0, 0), 100, CHUNK_SIZE, 0);
+    let wants = [
+      (cc(0, 0, 0), BRICK_FACTOR), // 细化
+      (cc(1, 0, 0), BRICK_FACTOR), // 细化
+      (cc(2, 0, 0), BRICK_FACTOR), // 首次安装
+      (cc(3, 0, 0), BRICK_FACTOR), // 首次安装
+      (cc(4, 0, 0), BRICK_FACTOR), // 首次安装
+    ];
+    let plan = r.plan(&P, IVec3::ZERO, wants.into_iter(), &HashSet::new());
+    assert_eq!(plan.install.len(), 5, "2 个细化（= 每帧名额）+ 3 个引导，都在计划里");
+    for x in 2..=4 {
+      let e = plan.install.iter().find(|(c, _)| c.0.x == x).expect("首次安装应在计划里");
+      assert_eq!(e.1, BOOTSTRAP_LEVEL, "首次安装必须走粗档引导（便宜 ⇒ 不占名额）");
+    }
+    for x in 0..=1 {
+      let e = plan.install.iter().find(|(c, _)| c.0.x == x).expect("细化应在计划里");
+      assert_eq!(e.1, BRICK_FACTOR, "细化到目标档");
+    }
+    let order: Vec<i32> = plan.install.iter().map(|(c, _)| c.0.x).collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(order, sorted, "分段不能打乱「按相机距离升序」");
+  }
+
+  /// 引导档只会让首次安装**更粗**，绝不会把远端本来就该粗的块变细。
+  #[test]
+  fn bootstrap_never_refines_a_deliberately_coarse_chunk() {
+    let mut r = Residency::new();
+    r.tick(100);
+    let plan = r.plan(&P, IVec3::ZERO, [(cc(0, 0, 0), CHUNK_SIZE)].into_iter(), &HashSet::new());
+    assert_eq!(plan.install, vec![(cc(0, 0, 0), CHUNK_SIZE)], "远端整 chunk 档不受引导影响");
   }
 }

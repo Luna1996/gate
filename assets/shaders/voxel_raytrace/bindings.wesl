@@ -104,10 +104,29 @@ struct MaterialAsset {
 /// 必须是 **read_write**（shader 原子写）；GPU 上无人读它 —— 只给 Rust 侧回读（M4 的消费端 + LRU）。
 @group(1) @binding(10) var<storage, read_write> lod_req: array<atomic<u32>>;
 
-// **BG1 的 binding 号到此为止（0..10）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，已按实测
+// **BG1 的 binding 号到此为止（0..11）**：MT8-3 曾在 10/11 加一对「反射缓存乒乓双缓冲」，已按实测
 // 整体删除（负优化：用户判定"删除后画面不变、反而更快"）—— 见 `main.wesl` 文件头的 MT4 注释块。
-// 10 现在被 M4 的请求环缓冲占用（上面那条），**11 起没有预留**：加新东西要另找位置并同步
-// `dda.rs` 的 `DdaBg1` layout + bind group 两处。
+// 10 = M4 的请求环缓冲，11 = **硬件光追的 TLAS（仅 RT 版）**；**12 起没有预留**：加新东西要另找位置并
+// 同步 `dda.rs` 的 `DdaBg1` layout + bind group 两处。
+
+/// 11：**硬件光追的 TLAS**（主世界每个常驻 chunk 一个实例，实例的 AABB = 该 chunk 的 64³ 子块）。
+///
+/// 只在 `@if(ray_query)` 下声明（= RT 版 shader）—— 软件版没有这条 binding，`dda.rs` 的 `DdaBg1`
+/// layout 也随之分成两版（见那里的说明）。
+///
+/// 实例的 `custom_data` = chunk 坐标三轴低 8 位（`rt.rs::rt_custom_index`）；查询只告诉调用方
+/// **最近的块 + 入口 t**，块内由软件下钻（`trace.wesl::trace_grid_rt`）。
+@if(ray_query)
+@group(1) @binding(11) var tlas: acceleration_structure;
+
+/// 12：**主世界的粗占用位图**（32 KB，`builder::OCC_WORDS` 个 u32）。
+///
+/// 逐 chunk 一位、**组优先布局**：4×4×4 个 chunk 一组，同一组的 64 位**连续**（2 个 u32）⇒
+/// "整组是否为空"就是相邻两个字是否全 0（一次 cache line 读，无需第二级表）。
+/// 不变式：位为 1 ⟺ 该 chunk 有 GPU 树块（Rust 侧 `BrickMapBuilder` 的 `occ` 字段）。
+///
+/// 它是 `trace.wesl` **空组跳过**的唯一输入 —— 与硬件光追无关，**两版 shader 都声明**。
+@group(1) @binding(12) var<storage, read> occ: array<u32>;
 
 // --- BG2：GridDesc 数组（144B/entry，与 Rust GridDesc 字节一致）---
 struct GridDesc {

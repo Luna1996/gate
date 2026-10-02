@@ -40,6 +40,59 @@ fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   )
 }
 
+/// 窗口相对下标（`None` = 窗口外）。与 [`chunk_index_pos`] 同一个判据 —— 后者由它算出线性序。
+fn chunk_rel(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<IVec3> {
+  let rel = chunk - origin;
+  if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dims).any() {
+    return None;
+  }
+  Some(rel)
+}
+
+/// **粗占用位图的粒度**：每轴 4 个 chunk 一组（4×4×4 = 64 个 chunk 一组）。
+const OCC_GROUP: i32 = 4;
+/// 组数（窗口是定长 `CHUNK_INDEX_CAP³` = 64³ 槽 ⇒ 每轴 16 组）。
+const OCC_GROUPS: usize = 16 * 16 * 16;
+/// 位图字数：每组 64 位 = **2 个 u32**，且**同组的位连续** ⇒ "整组是否占用"就是相邻两个字是否全 0
+/// （一次 cache line 读，无需第二级表）。
+pub const OCC_WORDS: usize = OCC_GROUPS * 2;
+
+/// 窗口相对下标 → 占用位图的**位号**。
+///
+/// 布局是**组优先**的：`组号 * 64 + 组内号` ⇒ 同一组的 64 个 chunk 落在连续的 64 位（2 个字）里。
+/// 组内号与索引区同轴序（`x` 最低位、`z` 最高），这样 shader 侧只需移位与或。
+#[inline]
+fn occ_bit(rel: IVec3) -> usize {
+  let g = (rel.x >> 2) as usize
+    + ((rel.y >> 2) as usize) * 16
+    + ((rel.z >> 2) as usize) * 256;
+  let w = (rel.x & 3) as usize | (((rel.y & 3) as usize) << 2) | (((rel.z & 3) as usize) << 4);
+  g * 64 + w
+}
+
+/// 组 `g` 在位图里占的两个字（`[g*2, g*2+1]`）——"整组为空"的判据就是这两个字全 0。
+#[cfg(test)]
+#[inline]
+fn occ_group_words(g: usize) -> (usize, usize) {
+  (g * 2, g * 2 + 1)
+}
+
+/// 相对下标 → 组号（测试用）。
+#[cfg(test)]
+#[inline]
+fn occ_group_of(rel: IVec3) -> usize {
+  (rel.x >> 2) as usize + ((rel.y >> 2) as usize) * 16 + ((rel.z >> 2) as usize) * 256
+}
+
+const _: () = assert!(OCC_GROUP == 4, "组内的位打包按 4×4×4 写死（`>> 2` 与 `& 3`）");
+const _: () = assert!(
+  OCC_WORDS * 32 == (CHUNK_INDEX_CAP as usize).pow(3),
+  "位图必须逐 chunk 一位地覆盖整个索引区（64³ 槽）"
+);
+/// shader 侧的 `trace.wesl::OCC_WORDS` 写成同一个推导式；这条断言把它与 `CHUNK_INDEX_CAP` 绑在一起，
+/// 于是任何一方改动都会在这里（而不是在画面上）暴露。
+const _: () = assert!(OCC_WORDS == 8192, "trace.wesl::OCC_WORDS 必须同值");
+
 /// ChunkCoord 确定性排序键（展开为分量元组）。
 fn coord_key(c: ChunkCoord) -> (i32, i32, i32) {
   (c.0.x, c.0.y, c.0.z)
@@ -169,7 +222,30 @@ struct ChunkSlot {
   free: FreeRuns,
   /// 节点槽表（索引 = 节点 id；见 [`NODE_SLOT_NONE`] 处的说明）
   nodes: gate_voxel::NodeLayout,
+  /// 该块的**格空间** AABB 表（被占用的 64³ 子块的紧致包围盒）：硬件光追结构
+  /// （[`crate::brickmap::rt`]）的输入。安装时从树上折一次、之后随块一起丢弃 ——
+  /// 树上没有"只改一个子块占用"的增量维护（重折一棵树只在安装路径上付）。
+  ///
+  /// CONSTRAINT: 与**档位无关**（只读根节点的 `mask`/`palette`，而 `proxy` 在 `keep` 以上逐字保留）
+  /// ⇒ 档位变化**不必**重建 BLAS，见 [`BrickMapBuilder::relayout_resident_tree`]。
+  aabbs: crate::brickmap::rt::ChunkAabbs,
 }
+
+/// GPU 块存在性的变更记录（挂载 / 卸载各一条）：硬件光追结构（[`crate::brickmap::rt::RtScene`]）的同步输入。
+///
+/// 为什么另起一份而不是复用 `VolumeGrid::resident_log`：那一份记的是 **CPU 树**，RT 要跟的是 **GPU 块**
+/// —— 跟不上的后果是"画面里已经没有了、光线里还在"的幽灵几何（窗口平移丢块时最明显）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentEvent {
+  pub c: ChunkCoord,
+  pub mounted: bool,
+}
+
+/// 变更日志容量上限：超了就地清空并递增 epoch（消费方据此退回一次全量对照）。
+///
+/// CONSTRAINT: 必须足够大 —— 溢出会让消费方（`dda::sync_rt_scene`）重建**全部** BLAS。流式世界实测
+/// ~8 块/帧（GPU 侧安装上限），取 1 M 条 ≈ 8 MB ⇒ 溢出周期数小时。
+const RESIDENT_LOG_CAP: usize = 1 << 20;
 
 /// 节点在块内占用的字数（wire 形态）：根固定 [`ROOT_WIRE_WORDS`]（掩码增减不改根的字数 ⇒ 根永不搬迁）。
 #[inline]
@@ -189,6 +265,20 @@ fn wire_words_of(id: u32, level: u8, mask: u64) -> usize {
 #[inline]
 fn read_mask(buf: &[u32], at: usize) -> u64 {
   (buf[at + 1] as u64) << 32 | buf[at] as u64
+}
+
+/// 该 chunk 的格空间 AABB 表（口径见 [`crate::brickmap::rt::gather_chunk_aabbs`]）：
+/// `chunk_min` = chunk 格坐标 × 256、`scale = 1` —— 这就是"格空间"的口径（shader 侧 TLAS 实例是
+/// 恒等变换，射线进 `trace_grid` 时已被折进这个空间）。
+///
+/// 硬件光追关掉时**不折**（`consts::RT_RAY_QUERY` 是编译期常量 ⇒ 整段消失，不付 CPU 与 ~1.5 KB/块）。
+#[inline]
+fn gather_aabbs(tree: &ChunkTree, c: ChunkCoord) -> crate::brickmap::rt::ChunkAabbs {
+  if crate::brickmap::consts::RT_RAY_QUERY {
+    crate::brickmap::rt::gather_chunk_aabbs(tree, (c.0 * gate_voxel::CHUNK_SIZE).as_vec3(), 1.0)
+  } else {
+    crate::brickmap::rt::ChunkAabbs::default()
+  }
 }
 
 /// 砖块图构建器：持有与 GPU buffer 字节一致的持久状态。
@@ -222,6 +312,19 @@ pub struct BrickMapBuilder {
   /// 缓冲只增不减（高水位 = 最大的那棵树），容量由 `Vec` 自己摊。
   scratch_blob: Vec<u32>,
   scratch_layout: NodeLayout,
+  /// GPU 块存在性变更日志（环形语义：满了就清空并递增 epoch），见 [`ResidentEvent`]。
+  resident_log: Vec<ResidentEvent>,
+  resident_epoch: u64,
+  resident_seq: u64,
+  /// **粗占用位图**（`OCC_WORDS` 个 u32 = 32 KB）：逐 chunk 一位 + **组优先布局**（见 [`occ_bit`]）。
+  ///
+  /// 不变式（唯一）：**第 `occ_bit(rel)` 位为 1 ⟺ `self.chunks` 里有窗口相对下标为 `rel` 的那个
+  /// chunk**。shader 侧靠它跳过"整组都是空气"的 4×4×4 chunk 区（见 `trace.wesl` 的空组跳过）。
+  /// 三处写点与索引区**同源**：`install_blob_inner`（置位）、`release_chunk_inner`（清位）、
+  /// `set_window`（整表重建，因为它是**窗口相对**的）。
+  occ: Vec<u32>,
+  /// 位图自上次上传以来变过（调用方据此决定要不要重传那 32 KB）。
+  occ_dirty: bool,
 }
 
 /// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）；空 = 未修改。
@@ -305,6 +408,11 @@ impl BrickMapBuilder {
       empty: HashSet::new(),
       scratch_blob: Vec::new(),
       scratch_layout: NodeLayout::new(),
+      resident_log: Vec::new(),
+      resident_epoch: 0,
+      resident_seq: 0,
+      occ: vec![0; OCC_WORDS],
+      occ_dirty: true,
     };
     // 预留区登记为**空闲**：块级分配走 first-fit，会优先把它切走
     if reserve_words > 0 {
@@ -334,12 +442,17 @@ impl BrickMapBuilder {
       .collect();
     coords.sort_by_key(|&c| coord_key(c));
 
-    let blobs: Vec<(Vec<u32>, NodeLayout)> = coords
+    let blobs: Vec<(Vec<u32>, NodeLayout, crate::brickmap::rt::ChunkAabbs)> = coords
       .par_iter()
-      .map(|&c| grid.chunk(c).expect("chunk_has_content 已过滤").serialize_with_layout())
+      .map(|&c| {
+        let tree = grid.chunk(c).expect("chunk_has_content 已过滤");
+        let aabbs = gather_aabbs(tree, c);
+        let (blob, layout) = tree.serialize_with_layout();
+        (blob, layout, aabbs)
+      })
       .collect();
-    for (c, (blob, layout)) in coords.iter().zip(blobs) {
-      b.install_blob(*c, &blob, layout);
+    for (c, (blob, layout, aabbs)) in coords.iter().zip(blobs) {
+      b.install_blob(*c, &blob, layout, aabbs);
     }
     b.refresh_globals();
 
@@ -473,6 +586,123 @@ impl BrickMapBuilder {
     self.chunks.keys().copied().collect()
   }
 
+  /// 该块的格空间 AABB 表（None = 未常驻）。
+  pub fn aabbs_of(&self, coord: ChunkCoord) -> Option<&crate::brickmap::rt::ChunkAabbs> {
+    self.chunks.get(&coord).map(|s| &s.aabbs)
+  }
+
+  // ---- GPU 块存在性日志（硬件光追结构的同步输入，见 [`ResidentEvent`]）------------------------
+
+  fn note_resident_event(&mut self, c: ChunkCoord, mounted: bool) {
+    if self.resident_log.len() >= RESIDENT_LOG_CAP {
+      // 清空 + 递增 epoch：消费方看到 epoch 变了会退回一次全量对照
+      // （与 `VolumeGrid::resident_log` 同口径）。
+      self.resident_log.clear();
+      self.resident_epoch = self.resident_epoch.wrapping_add(1);
+    }
+    self.resident_log.push(ResidentEvent { c, mounted });
+    self.resident_seq = self.resident_seq.wrapping_add(1);
+  }
+
+  /// 日志**代数**：变化 ⇒ 中间发生过清空，游标必须回退并做一次全量对照。
+  pub fn resident_epoch(&self) -> u64 {
+    self.resident_epoch
+  }
+
+  /// 变更序号（挂载 + 卸载的累计条数，单调递增）。
+  pub fn resident_seq(&self) -> u64 {
+    self.resident_seq
+  }
+
+  /// 日志总长（= 游标的上界）。
+  pub fn resident_log_len(&self) -> usize {
+    self.resident_log.len()
+  }
+
+  /// 从 `cursor` 起的变更（cursor 一律夹到当前长度，去程不回退）。
+  pub fn resident_log_from(&self, cursor: usize) -> &[ResidentEvent] {
+    let from = cursor.min(self.resident_log.len());
+    &self.resident_log[from..]
+  }
+
+  // ---- 粗占用位图（shader 的空组跳过用，见字段说明的不变式）------------------------------------
+
+  /// 置位（挂载）。
+  fn occ_set(&mut self, coord: ChunkCoord) {
+    if let Some(rel) = chunk_rel(self.origin, self.dims, coord.0) {
+      let b = occ_bit(rel);
+      self.occ[b >> 5] |= 1u32 << (b & 31);
+      self.occ_dirty = true;
+    }
+  }
+
+  /// 清位（卸载）。**组一级不单独存**：组的占用是它那两个字算出来的（见 [`occ_group_words`]）。
+  fn occ_clear(&mut self, coord: ChunkCoord) {
+    if let Some(rel) = chunk_rel(self.origin, self.dims, coord.0) {
+      let b = occ_bit(rel);
+      self.occ[b >> 5] &= !(1u32 << (b & 31));
+      self.occ_dirty = true;
+    }
+  }
+
+  /// 整表重建。**窗口平移后必须调**：位图是**窗口相对**的，相位一变全部失效
+  /// （与索引区整体清零同一个理由）。O(常驻块数)，只在跨 chunk 时发生。
+  fn occ_rebuild(&mut self) {
+    self.occ.fill(0);
+    let cs: Vec<ChunkCoord> = self.chunks.keys().copied().collect();
+    for c in cs {
+      self.occ_set(c);
+    }
+    self.occ_dirty = true;
+  }
+
+  /// 位图字数（上传长度）。
+  pub fn occ_len(&self) -> usize {
+    self.occ.len()
+  }
+
+  /// 位图数据（上传用）。
+  pub fn occ_words(&self) -> &[u32] {
+    &self.occ
+  }
+
+  /// 取走"变过"标志（调用方据此决定要不要重传那 32 KB）。
+  pub fn take_occ_dirty(&mut self) -> bool {
+    std::mem::take(&mut self.occ_dirty)
+  }
+
+  /// 位图是否待传（只读，不取走）——`snapshot` 用它决定要不要把这份 32 KB 带上。
+  pub fn occ_dirty_pending(&self) -> bool {
+    self.occ_dirty
+  }
+
+  /// 位图与 `chunks` 是否一致（**只在测试里调**：不变式一破就是"画面上少几何"，必须能取证）。
+  #[cfg(test)]
+  fn occ_consistent(&self) -> bool {
+    for i in 0..OCC_WORDS {
+      let mut want = 0u32;
+      for bit in 0..32usize {
+        let b = i * 32 + bit;
+        // 位号 → 相对下标（`occ_bit` 的逆）
+        let g = b / 64;
+        let w = b % 64;
+        let rel = IVec3::new(
+          ((g % 16) as i32) * 4 + (w & 3) as i32,
+          (((g / 16) % 16) as i32) * 4 + ((w >> 2) & 3) as i32,
+          ((g / 256) as i32) * 4 + ((w >> 4) & 3) as i32,
+        );
+        let c = ChunkCoord(self.origin + rel);
+        if self.chunks.contains_key(&c) && chunk_index_pos(self.origin, self.dims, c.0).is_some() {
+          want |= 1u32 << bit;
+        }
+      }
+      if self.occ[i] != want {
+        return false;
+      }
+    }
+    true
+  }
+
   /// **唤醒**：把 CPU 树整块装进 GPU。返回是否真的发生了安装。
   /// 已常驻 / CPU 侧为空 / 不在窗口内 ⇒ 什么都不做。
   pub fn ensure_resident(&mut self, grid: &VolumeGrid, coord: ChunkCoord) -> bool {
@@ -603,6 +833,8 @@ impl BrickMapBuilder {
     }
     // 整个索引区都要重传（旧的要让 GPU 忘掉、新的要写上）
     self.mark_struct_words(0, TREE_BASE);
+    // 占用位图是**窗口相对**的 ⇒ 相位一变整表失效，必须重建（与上面索引区清零同一个理由）。
+    self.occ_rebuild();
     bevy::log::debug!(
       "WINDOW 平移 {} → {origin} dims {dims}（掉了 {} 个出门的）",
       old.0,
@@ -707,6 +939,15 @@ impl BrickMapBuilder {
 
   /// 全量安装一个 chunk 的树（新块 + 窗口条目 + 节点槽表）
   fn install_chunk(&mut self, coord: ChunkCoord, tree: &ChunkTree) {
+    self.install_chunk_impl(coord, tree, true);
+  }
+
+  /// [`Self::install_chunk`] 的**不发事件**版本（见 [`Self::relayout_resident_tree`]）。
+  fn install_chunk_quiet(&mut self, coord: ChunkCoord, tree: &ChunkTree) {
+    self.install_chunk_impl(coord, tree, false);
+  }
+
+  fn install_chunk_impl(&mut self, coord: ChunkCoord, tree: &ChunkTree, emit: bool) {
     // 序列化进**复用缓冲**（见 [`Self::scratch_blob`]）：每帧几十棵、每棵几百 KB，每棵都新分配 +
     // 释放会把内存分配器顶爆（实测 `GATE_BENCH=fly`：单是"释放那个 blob"就 ~6 ms/帧）。
     let mut blob = std::mem::take(&mut self.scratch_blob);
@@ -715,12 +956,56 @@ impl BrickMapBuilder {
     // 槽表**直接接管这份布局**（复制一份；scratch 那份留给下一棵树复用）—— 不再逐节点重算
     // `(off, words)` 表（那是全分辨率块 ~2.5 万次 `read_mask` + `wire_words_of`，见 `slot_words`）。
     let nodes = layout.clone();
-    self.install_blob(coord, &blob, nodes);
+    let aabbs = gather_aabbs(tree, coord);
+    if emit {
+      self.install_blob(coord, &blob, nodes, aabbs);
+    } else {
+      self.install_blob_inner(coord, &blob, nodes, aabbs);
+    }
     self.scratch_blob = blob;
     self.scratch_layout = layout;
   }
 
-  fn install_blob(&mut self, coord: ChunkCoord, blob: &[u32], nodes: gate_voxel::NodeLayout) {
+  /// **就地换档**（chunk 一直在常驻集里，只换它的树内容与档位）。返回是否真的换了。
+  ///
+  /// WHY 单列（**不发 `ResidentEvent`**）：RT 的 BLAS 只由 AABB 表建，而 **AABB 表与档位无关** ——
+  /// [`crate::brickmap::rt::gather_chunk_aabbs`] 只读**根节点**的 `mask` / `palette`，而
+  /// `ChunkTree::proxy` 在 `keep` 以上**逐字保留**这两样（`copy_proxy` 只在 `extent <= keep` 处塌缩）
+  /// ⇒ proxy(64) / proxy(16) / 全树的 AABB 表**完全相同**。走 `evict` + `ensure_resident_tree` 会发一对
+  /// "卸载 + 挂载"，`dda::sync_rt_scene` 于是每帧为这几次升级丢掉旧 BLAS、建一张新的、还把 TLAS 标脏
+  /// （流式飞行实测 3.5 次升级/帧）—— 而 BLAS 一行都不用改。
+  pub fn relayout_resident_tree(&mut self, coord: ChunkCoord, tree: &ChunkTree) -> bool {
+    if !self.chunks.contains_key(&coord) || tree.is_empty() {
+      return false;
+    }
+    if chunk_index_pos(self.origin, self.dims, coord.0).is_none() {
+      return false;
+    }
+    // 块大小随档位变（变细 = 节点更多）⇒ 换块而不是就地改内容；只跳过那条变更日志。
+    self.release_chunk_inner(coord);
+    self.install_chunk_quiet(coord, tree);
+    self.refresh_globals();
+    true
+  }
+
+  fn install_blob(
+    &mut self,
+    coord: ChunkCoord,
+    blob: &[u32],
+    nodes: gate_voxel::NodeLayout,
+    aabbs: crate::brickmap::rt::ChunkAabbs,
+  ) {
+    self.install_blob_inner(coord, blob, nodes, aabbs);
+    self.note_resident_event(coord, true);
+  }
+
+  fn install_blob_inner(
+    &mut self,
+    coord: ChunkCoord,
+    blob: &[u32],
+    nodes: gate_voxel::NodeLayout,
+    aabbs: crate::brickmap::rt::ChunkAabbs,
+  ) {
     let need = blob.len();
     // 块留 25% 余量（且至少容得下一个最大节点）：后续编辑的字数变化优先在块内解决，
     // 免得动不动搬整块（搬块 = 整棵 chunk 重传）。
@@ -731,7 +1016,8 @@ impl BrickMapBuilder {
     free.free(need, cap - need);
     let ip = self.window_word(coord);
     self.buffers.b_struct[ip] = base as u32 + 1;
-    self.chunks.insert(coord, ChunkSlot { base, cap, free, nodes });
+    self.chunks.insert(coord, ChunkSlot { base, cap, free, nodes, aabbs });
+    self.occ_set(coord);
     self.mark_struct_words(ip, 1);
     self.mark_struct_words(base, need);
   }
@@ -739,13 +1025,22 @@ impl BrickMapBuilder {
   /// chunk 变空 / 身份空间作废：块归还全局空闲段 + 窗口条目清零（无块时无操作）。
   /// **已知空块**的条目写哨兵（不是 0）：它仍然"没有内容"，shader 不该再对它发请求。
   fn release_chunk(&mut self, coord: ChunkCoord) {
-    let Some(slot) = self.chunks.remove(&coord) else { return };
+    if self.release_chunk_inner(coord) {
+      self.note_resident_event(coord, false);
+    }
+  }
+
+  /// [`Self::release_chunk`] 的**不发事件**版本：只做块与条目的账，供 [`Self::relayout_resident_tree`] 用。
+  fn release_chunk_inner(&mut self, coord: ChunkCoord) -> bool {
+    let Some(slot) = self.chunks.remove(&coord) else { return false };
+    self.occ_clear(coord);
     self.free.free(slot.base, slot.cap);
     // 掉出窗口的 chunk 没有条目（[`Self::set_window`] 已把整个索引区清零）⇒ 不写条目
-    let Some(ip) = chunk_index_pos(self.origin, self.dims, coord.0) else { return };
+    let Some(ip) = chunk_index_pos(self.origin, self.dims, coord.0) else { return true };
     self.buffers.b_struct[ip] =
       if self.empty.contains(&coord) { INDEX_ENTRY_EMPTY } else { 0 };
     self.mark_struct_words(ip, 1);
+    true
   }
 
   /// 增量重写一个 chunk 里动过的节点（[`TreeDirty`] 保证按层降序 = 自底向上：
@@ -972,6 +1267,15 @@ pub struct VolumesSnapshot {
   pub palette_total_bytes: usize,
   /// 本轮更新的 dirty chunk 总数（跨所有 volume；日志用）
   pub dirty_chunks: usize,
+  /// **各 volume 的粗占用位图**，按 volume 序拼接（每个 `OCC_WORDS` 字；`Some` = 本帧至少有一个
+  /// volume 变过，需要整块重传）。
+  ///
+  /// WHY 逐 volume：位图是**窗口相对**的，而各 volume 的窗口互不相同（远场级的 chunk 坐标空间也不同）
+  /// ⇒ shader 用 `vol * OCC_WORDS` 分段寻址。**远场级的收益最大**：它一窗口只有几百块常驻
+  /// （占用率 ≪ 1%），而主射线每条都要穿过去。
+  ///
+  /// 不走"字节脏区间"那套：它本身就是稠密表，整块重传比维护位级脏区间更简单也更快。
+  pub occ_all: Option<Vec<u32>>,
 }
 
 /// 多 volume 统一构建器：持有 `Vec<BrickMapBuilder>`，输出统一 buffer + GridDesc 数组。
@@ -1271,6 +1575,19 @@ impl VolumesBuilder {
       struct_total_bytes: struct_total_words * 4,
       palette_total_bytes: palette_total_words * 4,
       dirty_chunks,
+      // 各 volume 的粗占用位图：任一个变过就整份带上（每卷 32 KB）。窗口平移会整表重建 ⇒ 也走这条。
+      occ_all: {
+        if self.builders.iter().any(BrickMapBuilder::occ_dirty_pending) {
+          let mut v = Vec::with_capacity(self.builders.len() * OCC_WORDS);
+          for b in self.builders.iter_mut() {
+            b.take_occ_dirty();
+            v.extend_from_slice(b.occ_words());
+          }
+          Some(v)
+        } else {
+          None
+        }
+      },
     }
   }
 
@@ -1320,6 +1637,46 @@ impl VolumesBuilder {
     tree: &ChunkTree,
   ) -> bool {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.ensure_resident_tree(coord, tree))
+  }
+
+  /// 就地换档（见 [`BrickMapBuilder::relayout_resident_tree`]）：**不发 `ResidentEvent`**，
+  /// RT 侧不重建 BLAS。
+  pub fn relayout_resident_tree(
+    &mut self,
+    vol_idx: usize,
+    coord: ChunkCoord,
+    tree: &ChunkTree,
+  ) -> bool {
+    self.builders.get_mut(vol_idx).is_some_and(|b| b.relayout_resident_tree(coord, tree))
+  }
+
+  /// 该块的格空间 AABB 表（None = 未常驻）；口径见 [`BrickMapBuilder::aabbs_of`]。
+  pub fn aabbs_of(
+    &self,
+    vol_idx: usize,
+    coord: ChunkCoord,
+  ) -> Option<&crate::brickmap::rt::ChunkAabbs> {
+    self.builders.get(vol_idx).and_then(|b| b.aabbs_of(coord))
+  }
+
+  /// 该 volume 的 GPU 块存在性日志游标三件套（见 [`BrickMapBuilder::resident_epoch`]）。
+  pub fn resident_epoch(&self, vol_idx: usize) -> u64 {
+    self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_epoch)
+  }
+
+  /// 见 [`BrickMapBuilder::resident_seq`]。
+  pub fn resident_seq(&self, vol_idx: usize) -> u64 {
+    self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_seq)
+  }
+
+  /// 见 [`BrickMapBuilder::resident_log_len`]。
+  pub fn resident_log_len(&self, vol_idx: usize) -> usize {
+    self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_log_len)
+  }
+
+  /// 见 [`BrickMapBuilder::resident_log_from`]。
+  pub fn resident_log_from(&self, vol_idx: usize, cursor: usize) -> &[ResidentEvent] {
+    self.builders.get(vol_idx).map_or(&[], |b| b.resident_log_from(cursor))
   }
 
   /// 唤醒：从该 volume 的 CPU 树整块装进 GPU（**近场不截断**）。远场级走这一条 ——
@@ -1434,6 +1791,52 @@ mod tests {
       "掉出窗口的块该被回收：{words_before} → {}",
       b.buffers().b_struct.len()
     );
+  }
+
+  /// **粗占用位图的不变式**：位为 1 ⟺ 该 chunk 有 GPU 树块。
+  ///
+  /// 三处写点（挂载 / 卸载 / 窗口平移）之后都必须成立 —— 一破就是 shader 的"空组跳过"把**有几何的
+  /// 组**当成空的（画面上少几何，且只在某些机位出现）。顺便钉住"组一级是算出来的"这条：同组两块，
+  /// 只卸一块时组**仍非空**，卸掉最后一块才变空。
+  #[test]
+  fn occupancy_bitmap_tracks_resident_chunks() {
+    let mut grid = VolumeGrid::new();
+    let a = ChunkCoord(IVec3::new(4, 0, 0));
+    let b2 = ChunkCoord(IVec3::new(4, 1, 0)); // 与 `a` **同组**（组边长 4）
+    let far = ChunkCoord(IVec3::new(12, 0, 0)); // 另一组，把窗口撑开
+    for x in 0..8 {
+      for y in 0..8 {
+        grid.set_voxel_ivec3(a.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
+        grid.set_voxel_ivec3(b2.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
+        grid.set_voxel_ivec3(far.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
+      }
+    }
+    let mut b = build_and_drain(&mut grid);
+    assert!(b.occ_consistent(), "建场景后位图必须与常驻集一致");
+
+    let rel_a = chunk_rel(b.origin, b.dims, a.0).expect("a 在窗口内");
+    let g = occ_group_of(rel_a);
+    let (w0, w1) = occ_group_words(g);
+    assert!(b.occ[w0] != 0 || b.occ[w1] != 0, "前提：`a` 所在的组非空");
+
+    // 卸掉同组的一块 ⇒ 组**仍非空**（组位是算出来的，不是单独存的）
+    assert!(b.evict(a), "a 应本来常驻");
+    assert!(b.occ_consistent(), "卸载一块后位图必须一致");
+    assert!(b.occ[w0] != 0 || b.occ[w1] != 0, "同组还有 `b2` ⇒ 组不该变空");
+
+    // 卸掉同组的最后一块 ⇒ 组变空
+    assert!(b.evict(b2), "b2 应本来常驻");
+    assert!(b.occ_consistent(), "卸载最后一块后位图必须一致");
+    assert!(b.occ[w0] == 0 && b.occ[w1] == 0, "同组已无块 ⇒ 组必须是空的");
+
+    // 窗口平移 ⇒ 位图是**窗口相对**的，必须整表重建
+    let (o, d) = b.window();
+    b.set_window(o + IVec3::new(1, 0, 0), d);
+    assert!(b.occ_consistent(), "窗口平移后位图必须一致");
+    let rel_far = chunk_rel(b.origin, b.dims, far.0).expect("far 仍在窗口内");
+    let gf = occ_group_of(rel_far);
+    let (f0, f1) = occ_group_words(gf);
+    assert!(b.occ[f0] != 0 || b.occ[f1] != 0, "平移后 far 所在的组仍应非空");
   }
 
   /// **已知空块的哨兵**（`consts::INDEX_ENTRY_EMPTY`，M8 空块请求洪水）：写进索引条目、

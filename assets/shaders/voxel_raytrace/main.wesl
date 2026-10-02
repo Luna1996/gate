@@ -9,6 +9,12 @@ import package::trace::{diag_sampled, make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
 
+// RT 版（`ray_query` 开）才声明这条扩展。**必须放在入口模块、且在所有 import 之后**
+// （WESL 的解析器不接受 `import` 出现在其它全局声明 / 指令之后）。
+// 软件版里出现它会让 `create_shader_module` 在无该特性的设备上直接失败（不是运行期退化）。
+@if(ray_query)
+enable wgpu_ray_query;
+
 // 全屏逐像素层次栈式 mask DDA（64-tree）：chunk 间 256³ A&W，chunk 内 4 层栈帧（256→64→16→4→1）。
 // 常量/寻址/slot 打包须与 Rust `brickmap::dda::wgsl_consts`、`brickmap::raytrace`、`wire.rs::encode_slot` 一致。
 

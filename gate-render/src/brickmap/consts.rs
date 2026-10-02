@@ -28,6 +28,19 @@ pub const DDA_SKY_ONLY: bool = false;
 pub const DDA_MAKEGRID_ONLY: bool = false;
 /// 八叉树远场早停（LOD）
 pub const DDA_LOD: bool = true;
+/// **硬件光追**（每 chunk 一张 BLAS + 一棵 TLAS + `trace.wesl` 的 ray query 遍历）总开关。
+///
+/// **默认关**。理由（实测口径）：开与关对比，`gate_dda_trace` 从未见过 RT 更低；而结构上也说得通 ——
+/// [`crate::brickmap::rt`] 用的是 **AABB 代理 + 软件下钻**，拿不到"一次查询回答整条射线"那个前提
+/// （那需要 intersection shader，wgpu 只暴露 ray query）⇒ 每条射线要么多付一趟 BVH 下行，
+/// 要么在 miss 上付两趟（软件步进是语义真值，见 `trace.wesl::RT_TRUST_MISS`）。
+///
+/// 保留它的价值在**下一步**：几何换成真三角形（远场 mesh 化）时，一次查询就能走完整条射线，
+/// 那时整条链路（TLAS/BLAS、BG1 binding(11)、两版 shader、常驻事件日志、AABB 表）都是现成的。
+///
+/// 本开关与设备能力**正交**：置 `true` 也只会在支持 `EXPERIMENTAL_RAY_QUERY` 的机器上走 RT
+/// （见 [`crate::brickmap::rt::rt_enabled`]）。
+pub const RT_RAY_QUERY: bool = false;
 /// 叶级 LOD 诊断计数器的字数（`lod_diag`：叶入口 / 叶级早停 / 非法早停）。须与
 /// `trace.wesl::DIAG_*` 的槽位对齐。
 ///

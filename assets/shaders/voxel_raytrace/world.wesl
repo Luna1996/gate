@@ -1,4 +1,4 @@
-﻿﻿import package::bindings::{g, grid_descs};
+﻿import package::bindings::{g, grid_descs};
 import package::brickmap::{Grid, sample_brickmap};
 import package::common::{face_normal_from_index};
 import package::trace::{MediumRay, UnifiedHit, grid_is_far, make_grid, trace_grid};
@@ -157,6 +157,8 @@ fn level_cap(cov: f32, dir: vec3<f32>) -> f32 {
 fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
                req: u32) -> SceneHit {
   var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0));
+  // 近场这一趟里**第一次遇到"没加载"的 chunk** 的 `t`（`1e30` = 没有）。见下面的远场兜底。
+  var gap: f32 = 1.0e+30;
   let n = g.grid_count;
   // `shell` = **上一级覆盖到的水平半径**（世界体素，柱面半径）—— 与内容同形，所以在每级用
   // [`level_cap`] 折算成射线距离。
@@ -172,11 +174,20 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
   if (g0.coverage_r > 0.0) {
     g0_cap = min(t_cap, level_cap(g0.coverage_r, dir));
   }
-  var best = SceneHit(trace_grid(g0, origin, dir, g0_cap, t_min, depth_cap, false, req, &mc_off), 0u);
+  var best = SceneHit(
+    trace_grid(g0, origin, dir, g0_cap, t_min, depth_cap, false, req, &mc_off, &gap), 0u);
   if (best.uh.hit) {
     best_t = best.uh.t;
     best.palette_base = g0.palette_base;
   }
+  // **远场兜底（渐进加载的"先给糊的"）**：近场这一趟遇到了"没加载"的 chunk（`gap < 1e30`）**且近场没
+  // 命中** ⇒ 从那个 `t` 起就让远场级参与，用粗级把洞填上，而不是留一片空洞。
+  //
+  // CONSTRAINT①：**只在近场没命中时**兜底。近场命中时把远场提前，会让远场的**膨胀格**盖在近处的细几何
+  // 前面（画面变成"大方块糊住脚下"）—— 那正是分壳裁剪原本要防的。
+  // CONSTRAINT②：提前量**以壳半径为界**（下面 `min(shell_cap, fb)`）⇒ 多走的行程 ≤ 近场覆盖半径，
+  // 成本有界；无论洞有多大都不会让远场从 0 开始扫全窗口。
+  var fb = select(1.0e+30, gap, !best.uh.hit);
   for (var i: u32 = 1u; i < n; i = i + 1u) {
     let gi = make_grid(i);
     let far = grid_is_far(i);
@@ -198,7 +209,14 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
     // **起点所在的那一段整段剪掉**（远场玻璃的入射面被跳过 ⇒ 状态机落回天空）。起点已在 `shell` 之外
     // ⇒ 本级就是"起点所在的级"，从 `t_min` 起参与。主射线起点是相机（`origin_xz ≈ 0 < shell`）
     // ⇒ 恒走原路径、逐位不变。
-    let t_lo = select(t_min, select(max(t_min, level_cap(shell, dir)), t_min, origin_xz >= shell), far);
+    let shell_cap = level_cap(shell, dir);
+    // 兜底时用 `min(shell_cap, fb)`：`fb == 1e30`（无兜底）⇒ 与改动前逐位相同。
+    let t_lo = select(t_min, select(max(t_min, min(shell_cap, fb)), t_min, origin_xz >= shell), far);
+    // CONSTRAINT: 兜底**只给第一级远场**。再往外那一级的"洞"归它上一级负责（远场各级的膨胀格互相
+    // 叠加会让洞里出现"糊上加糊"，而它补的是同一片区域）。用完即失效 ⇒ 后面的级回到常规壳裁剪。
+    if (far) {
+      fb = 1.0e+30;
+    }
     // 上限同理（物体 `coverage_r == 0` 不裁）。对起点在本级内的次级射线，这条是**略宽松的上界**
     // （见 `level_cap` 的 CONSTRAINT）⇒ 不裁内容、只省空步，并且让倒影的边界与直接视野重合。
     var t_hi = min(best_t, t_cap);
@@ -216,7 +234,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
       }
       continue;
     }
-    let mhi = trace_grid(gi, origin, dir, t_hi, t_lo, depth_cap, false, req, &mc_off);
+    let mhi = trace_grid(gi, origin, dir, t_hi, t_lo, depth_cap, false, req, &mc_off, &gap);
     if (mhi.hit && mhi.t < best_t) {
       best_t = mhi.t;
       best.uh = mhi;
@@ -305,7 +323,9 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
                       stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
   var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
-  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, 0u, &mc);
+  // 介质穿透路径不需要远场兜底的 `gap`（它的调用方不消费）⇒ 传一个局部占位。
+  var gap: f32 = 1.0e+30;
+  let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, 0u, &mc, &gap);
   *tint = *tint * mc.tint;
   return WorldHit(
     h.hit, h.t, origin + dir * h.t, h.pal, h.n,
@@ -350,7 +370,8 @@ fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_
       break;
     }
     var mc = MediumRay(stop_on_air, gi.palette_base, 0u, vec3<f32>(1.0));
-    let h = trace_grid(gi, origin, dir, min(best_t, max_t), 0.0, 3u, true, 0u, &mc);
+    var gap: f32 = 1.0e+30;
+    let h = trace_grid(gi, origin, dir, min(best_t, max_t), 0.0, 3u, true, 0u, &mc, &gap);
     *tint = *tint * mc.tint;
     if (h.hit && h.t < best_t) {
       best_t = h.t;

@@ -1,4 +1,7 @@
-import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, lod_req, view_u};
+import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, lod_req, occ, view_u};
+// TLAS 只在 RT 版存在（`bindings.wesl` 里那条声明也带 `@if(ray_query)`）⇒ import 必须同步条件化。
+@if(ray_query)
+import package::bindings::{tlas};
 import package::brickmap::{Grid};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, INDEX_ENTRY_EMPTY, NODE_FIXED_WORDS, face_normal_from_index};
 
@@ -801,10 +804,167 @@ fn grid_hit(h: VoxelHit, ci: vec3<i32>,
 /// 的两个真杠杆之一（另一个是候选数）。见 `docs/editable-gigavoxel.md` 的「附二」。
 const SECONDARY_REACH_CHUNKS: f32 = 12.0;
 
+// ============================================================================
+// 空空间跳过（粗占用位图，`bindings::occ`）
+// ============================================================================
+
+/// 开关（诊断）：置 `0u` ⇒ 退回原路径（**两者语义逐位等价**，见 `trace_grid` 里的 CONSTRAINT）。
+const OCC_SKIP: u32 = 1u;
+/// 每个 volume 的位图字数：与 Rust `brickmap::builder::OCC_WORDS` **必须同值**。
+/// 写成推导式（64³ 个 chunk 槽 ÷ 32 位/字）而不是字面量：两边漂移是静默的（寻址错位）。
+const OCC_WORDS: u32 = (64u * 64u * 64u) / 32u;
+
+// ============================================================================
+// 硬件光追（`@if(ray_query)`）：TLAS 取代"逐 chunk 读索引区找下一个有几何的块"那一段
+// ============================================================================
+
+/// 每条射线最多发起几次 ray query（每次 = 一个被占用的 chunk）。到顶就置 `exhausted`
+/// ⇒ 调用点落回软件步进（**不能当 miss** —— 那会把后面的几何吞掉）。
+///
+/// 正常情形只有 **1–3 次**：查询给的是"最近的**块**"，随后软件下钻**整块**并在未命中时越过它；
+/// 只有"擦到盒但错过几何"才会多查一次。取 64 只是防挂死的安全网。
+const RT_QUERY_BUDGET: u32 = 64u;
+/// RT 说 miss 时，是否**直接按 miss 收**（不再落回软件步进）。
+///
+/// WARNING: 置 `1u` 会让"RT 的覆盖不完整"或"查询没命中"直接变成**画面上少几何** —— 实测（近场
+/// 依赖 RT）就是**主世界整片不渲染**，而远场（软件 DDA）照常 ⇒ 症状是"近场没渲染"。
+/// 它省下的是"miss 射线不必再走一遍软件步进"，但那正是软件路径作为**语义真值**的价值所在；
+/// 在"查询确实会命中"被证实之前，本值必须保持 `0u`。
+///
+/// `exhausted` 只能挡住"预算耗尽 / 两侧不一致"这几种可判定的不完整，挡不住"TLAS 少了几千个实例"
+/// 或"驱动侧 AABB ray query 就是不报候选"—— 那两种只能靠"落回软件"兜住。
+const RT_TRUST_MISS: u32 = 0u;
+/// 实例 cull mask：不筛（Rust 侧建实例时一律给 `0xFF`）。
+const RT_CULL_MASK: u32 = 0xFFu;
+/// ray flags：空。几何带 `OPAQUE` 只免掉 any-hit —— **procedural（AABB）命中不会因此自动提交**，
+/// 仍然要在 `rt_query` 里显式 `rayQueryConfirmIntersection`。
+const RT_FLAGS: u32 = 0u;
+
+/// 提交一次查询并返回**最近命中**（`kind == RAY_QUERY_INTERSECTION_NONE` ⇒ 没打中）。
+///
+/// CONSTRAINT：这里用的是 **naga 的 ray query 接口**（`rayQueryInitialize(&q, as, RayDesc(..))` +
+/// `rayQueryProceed(&q)` + `rayQueryGetCommittedIntersection(&q)`），**不是** WGSL 草案里的
+/// `rayQueryInitializeEXT` 那一族 —— 本仓着色器最终由 naga 解析（编译期测试 + 运行期建 module），
+/// 而 naga 30 只认前者（后者报 `no definition in scope`）。
+@if(ray_query)
+fn rt_query(ro: vec3<f32>, rd: vec3<f32>, tmin: f32, tmax: f32) -> RayIntersection {
+  var q: ray_query;
+  rayQueryInitialize(&q, tlas, RayDesc(RT_FLAGS, RT_CULL_MASK, tmin, tmax, ro, rd));
+  // CONSTRAINT: 本仓的图元是 **AABB（procedural）几何** —— 它的命中在 Vulkan/SPIR-V 里是**候选交点**，
+  // 必须显式 `rayQueryConfirmIntersection` 才会提交（只 `Proceed` 不确认 ⇒ `getCommittedIntersection`
+  // 永远是 NONE = 整片 miss）。候选按 t 升序给出 ⇒ 确认第一个就是最近的那个块。
+  if (rayQueryProceed(&q)) {
+    if (rayQueryGetCandidateIntersection(&q).kind != RAY_QUERY_INTERSECTION_NONE) {
+      rayQueryConfirmIntersection(&q);
+    }
+  }
+  return rayQueryGetCommittedIntersection(&q);
+}
+
+/// chunk 盒 `[mn, mn+CHUNK_SIZE]` 在射线上的**出口** t（没有穿过 ⇒ 返回 `t_hi`）。
+///
+/// 这是"每 chunk 一个盒子"这个粒度换来的能力：出口可算 ⇒ 下钻完就能安全越过整块。子块粒度的盒
+/// 算不出出口，因此不能用（见 `rt.rs` 文件头"粒度"的 CONSTRAINT）。
+@if(ray_query)
+fn chunk_exit_t(mn: vec3<f32>, ro: vec3<f32>, inv_rd: vec3<f32>, axis_on: vec3<bool>, t_hi: f32) -> f32 {
+  var t1 = t_hi;
+  for (var a: u32 = 0u; a < 3u; a = a + 1u) {
+    // 轴平行 ⇒ 该轴对出口无贡献（`0 × ∞` 会出 NaN）
+    if (!axis_on[a]) { continue; }
+    let ta = (mn[a] - ro[a]) * inv_rd[a];
+    let tb = (mn[a] + f32(CHUNK_SIZE) - ro[a]) * inv_rd[a];
+    t1 = min(t1, max(ta, tb));
+  }
+  return t1;
+}
+
+/// 硬件光追版的**主世界**遍历：ray query 直接给出"下一个有几何的 chunk"，块内仍走软件
+/// [`trace_chunk_opaque`]。换掉的只是**"逐个 chunk 读 1 MB 索引区"那一段**。
+///
+/// WHY 一次查询够用：查询返回的是**最近的块**（不是子块）⇒ 拿到入口 `t` 之后**下钻整块**即可
+/// —— AABB 是保守包围盒，从最近盒的入口 `t` 起下钻不会漏掉任何几何。这正是"一次查询回答整条
+/// 射线"的形态；若改成"每个 64³ 子块查一次"，就退化成"每次都要从 BVH 根下行"的迭代查询（实测净亏）。
+///
+/// CONSTRAINT: 只用于 `obj_id < 0`（主世界）且 `penetrate == false`。物体的格空间带旋转 / 缩放，
+/// 其 AABB 不在 TLAS 里；介质穿透版的出射面语义建在 **chunk 边界**上，而这里会整块跳过空气 chunk。
+///
+/// `exhausted`（出参）：`1` = 这次遍历**不能证明**是 miss（预算耗尽 / 实例集与 `b_struct` 不一致）
+/// ⇒ 调用点必须落回软件步进。`0` + 返回 miss = 候选全抽干且两侧一致 ⇒ 这就是真 miss。
+@if(ray_query)
+fn trace_grid_rt(ro: vec3<f32>, rd: vec3<f32>, tl0: f32, tl1: f32, depth_cap: u32,
+                 sign_v: vec3<i32>, basis: RayBasis, g: Grid,
+                 col0: vec3<f32>, col1: vec3<f32>, col2: vec3<f32>,
+                 exhausted: ptr<function, u32>) -> UnifiedHit {
+  let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), g.obj_id);
+  let index_origin = g.index_origin;
+  let tree_base = g.tree_base;
+  // 首个 chunk 的入射面（同一个兜底口径：取方向的主轴面对应的面号，见 `trace_grid` 里同名的段）。
+  let ad = abs(rd);
+  var entry_face: u32 = 4u;
+  if (ad.x >= max(ad.y, ad.z)) {
+    entry_face = basis.face_base.x;
+  } else if (ad.y >= ad.z) {
+    entry_face = basis.face_base.y;
+  } else {
+    entry_face = basis.face_base.z;
+  }
+  var t_lo = tl0;
+  var guard: u32 = 0u;
+  loop {
+    if (guard >= RT_QUERY_BUDGET) { *exhausted = 1u; break; }
+    guard = guard + 1u;
+    let q = rt_query(ro, rd, t_lo, tl1);
+    if (q.kind == RAY_QUERY_INTERSECTION_NONE) { break; }
+    let c8 = q.instance_custom_data;
+    // `custom_data` = chunk 坐标三轴低 8 位（`rt.rs::rt_custom_index`）⇒ 模 256 的差就是窗口相对下标
+    // （窗口每轴 ≤ 64 ⇒ 无歧义）。
+    let rel = vec3<i32>(
+      (i32(c8 & 0xFFu) - (index_origin.x & 0xFF)) & 0xFF,
+      (i32((c8 >> 8u) & 0xFFu) - (index_origin.y & 0xFF)) & 0xFF,
+      (i32((c8 >> 16u) & 0xFFu) - (index_origin.z & 0xFF)) & 0xFF,
+    );
+    // 窗口范围检查：解码错（或实例表里有窗口外的块）时**必须早退**，否则会按错地址读 `b_struct`
+    // —— 读出来的"树基址"是垃圾，软件下钻会去访问别的 chunk 的内容。
+    // 这是**不一致**而不是 miss ⇒ 置 `exhausted`，让调用点落回软件（那里是语义真值）。
+    if (any(rel < vec3<i32>(0)) || any(vec3<u32>(rel) >= g.index_dims)) { *exhausted = 1u; break; }
+    let ci = index_origin + rel;
+    let rel_u = vec3<u32>(rel);
+    let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
+      + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+    let entry = b_struct[index_addr];
+    // 常驻块必有非零条目（`install_blob` 与窗口条目在同一个调用里写）⇒ 走到这里说明两侧不一致。
+    if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { *exhausted = 1u; break; }
+    let chunk_base = tree_base + entry - 1u;
+    let chunk_min = vec3<f32>(vec3<i32>(i32(CHUNK_SIZE)) * ci);
+    let t0 = max(q.t, t_lo);
+    let t1 = chunk_exit_t(chunk_min, ro, basis.inv_rd, basis.axis_on, tl1);
+    if (t1 <= t0) {
+      // 数值边界：本块在入口之后已经走完 ⇒ 前进一点点再查，避免原地打转。
+      t_lo = t0 + 1.0e-3;
+      if (t_lo >= tl1) { break; }
+      continue;
+    }
+    let h = trace_chunk_opaque(chunk_base, chunk_min, ro, rd, sign_v, basis,
+                               t0, t1, entry_face, depth_cap);
+    if (h.hit) { return grid_hit(h, ci, col0, col1, col2, g.obj_id); }
+    // 本块这条射线上确实没有几何（AABB 是**保守**的）⇒ 从块尾之外继续找下一个块。
+    // CONSTRAINT: 必须**严格前进**（`t1 > t0 >= t_lo` 已保证），否则会反复命中同一块、烧完预算。
+    t_lo = max(t1 + max(1.0e-3, t1 * 1.0e-6), t_lo + 1.0e-3);
+    if (t_lo >= tl1) { break; }
+  }
+  return miss;
+}
+
 // 统一层次 DDA：slab→chunk 间 A&W→trace_chunk，`penetrate = false` 时一次都不碰 mc。
 /// `req` = 本 pass 是否允许发 ray-guided 请求（0 = 不发；见 `REQ_ENABLE` 的 CONSTRAINT）。
+///
+/// `gap`（出参/入参）：**第一次走到"没加载"的 chunk 时的 `t`**（只增不减地取 min；初值 `1e30` = 暂无）。
+/// 调用方（`world.wesl::trace_scene`）用它给远场级的内边界兜底：近场没命中而路上有"没加载"的格子 ⇒
+/// 那一段用**粗级**顶上，而不是留洞（渐进加载的"先给糊的"）。`INDEX_ENTRY_EMPTY`（CPU 确认"这块是
+/// 空的"）**不算** gap —— 那里本来就没有内容，粗级也一样空。
 fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
-              penetrate: bool, req: u32, mc: ptr<function, MediumRay>) -> UnifiedHit {
+              penetrate: bool, req: u32, mc: ptr<function, MediumRay>,
+              gap: ptr<function, f32>) -> UnifiedHit {
   let w_mn = g.w_mn;
   let w_mx = g.w_mx;
   let l_min = g.l_min;
@@ -933,6 +1093,19 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
     side,
     vec3<u32>(face_x & 1u, face_y & 1u, face_z & 1u),
     dir_mask);
+  // 硬件光追路径（仅 RT 版 shader）：主世界 + 不透明射线**先试 TLAS** —— 它一次给出"下一个有几何的
+  // chunk"，正是软件循环里"逐个 chunk 读 1 MB 索引区"那一段的替代。其余（物体 / 远场级 / 介质穿透）
+  // 全程走软件步进：物体的 AABB 不在 TLAS 里，介质穿透的出射面语义建在 chunk 边界上。
+  //
+  // CONSTRAINT: RT 命中就返回；**覆盖完整的 miss 也直接返回**（见 `RT_TRUST_MISS`）；只有
+  // `exhausted`（预算耗尽 / 两侧不一致）才落回下面的软件步进 —— 软件是语义真值，RT 只是加速。
+  @if(ray_query)
+  if (obj_id < 0 && !penetrate) {
+    var ex: u32 = 0u;
+    let h = trace_grid_rt(ro, rd, tl0, tl1, depth_cap, sign_v, basis, g, col0, col1, col2, &ex);
+    if (h.hit) { return h; }
+    if (RT_TRUST_MISS == 1u && ex == 0u) { return miss; }
+  }
   let start = ro + rd * tl0;
   var ci = vec3<i32>(floor(start / f32(CHUNK_SIZE)));
   // tmax_c：到下一 chunk 边界的 t（ro 系绝对）
@@ -953,6 +1126,33 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   for (var step_c: u32 = 0u; step_c < max_chunk_steps; step_c = step_c + 1u) {
     let t_exit_c = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
     let t1 = min(t_exit_c, tl1);
+    // ---- 空空间跳过：当前 chunk 所在的 4³ 组里一个 GPU 树块都没有 ⇒ **索引条目必为 0** ----
+    //
+    // 只省掉那一次读（1 MB 索引区，L2 常驻 / 竞争激烈），换成 32 KB 位图里的一次 L1 读。
+    //
+    // CONSTRAINT（**这是本优化唯一的正确性依据，别改成"跳转"**）：
+    //   · 只**删掉一次必然为 0 的读**，遍历路径与 `ci` / `tmax_c` / `t_enter_c` / `entry_face`
+    //     与不跳过时**逐位相同** —— 落点、下钻起点、命中体素因此不可能变。
+    //   · 曾经写过"直接跳到组出口"的版本（省掉 A&W 的算术），它必须**重新推导** `tmax_c`；
+    //     而原路径的 `tmax_c` 是逐 chunk `+= delta_c` **累加**出来的，一次重算只差 ULP，
+    //     但在体素边界上 `floor` 会翻转 ⇒ 命中体素换了（表现为"本来不发光的体素变发光"）。
+    //     要省那份算术，必须让重算与累加**逐位一致**，否则不许动。
+    //
+    // 只在**请求通道关闭**时生效：`REQ_ENABLE` 打开时那条 `entry == 0` 分支要发请求，
+    // 而省掉读就看不见那件事。
+    //
+    // 覆盖**每个 volume**（位图按 `vol * OCC_WORDS` 分段）。收益最大的是**远场级**：它一窗口只有
+    // 几百块常驻（占用率 ≪ 1%），而主射线每条都要穿过去。
+    var group_empty = false;
+    if (OCC_SKIP != 0u && vol < GRID_VOLUMES && REQ_ENABLE == 0u) {
+      let rg = ci - index_origin;
+      if (all(rg >= vec3<i32>(0)) && all(vec3<u32>(rg) < index_dims)) {
+        let rgg = vec3<u32>(rg);
+        let gg = (rgg.x >> 2u) + (rgg.y >> 2u) * 16u + (rgg.z >> 2u) * 256u;
+        let base = vol * OCC_WORDS + gg * 2u;
+        group_empty = occ[base] == 0u && occ[base + 1u] == 0u;
+      }
+    }
     // ---- chunk 窗口定位（窗口外 / entry==0 = 空气）----
     var air_chunk = true;
     let rel = ci - index_origin;
@@ -960,7 +1160,10 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       let rel_u = vec3<u32>(rel);
       let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
         + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
-      let entry = b_struct[index_addr];
+      // `group_empty` ⇒ 该组的每个 chunk 都没有树块 ⇒ 索引条目必为 0（与读出来的值相同）⇒ 整趟读可以省。
+      // CONSTRAINT: 必须用 `if` 而不是 `select` —— `select` 两个分支都会求值，读照样发生。
+      var entry: u32 = 0u;
+      if (!group_empty) { entry = b_struct[index_addr]; }
       // **"空"与"没加载"是两件事**（见 `common.wesl` 的条目编码）：
       // - `entry == 0` = 还没加载 ⇒ 射线本来要的细节缺了，该请求（M4）；
       // - `entry == INDEX_ENTRY_EMPTY` = CPU 已确认这块没有内容 ⇒ **不该请求**（发了也永远装不上）。
@@ -969,6 +1172,11 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       //   全被挤掉，且每秒数百万次原子写砸在同一个字上。
       // 两者对遍历都是空气。
       let has_tree = entry != 0u && entry != INDEX_ENTRY_EMPTY;
+      // "没加载"（`entry == 0`）= 本该有的细节缺了 ⇒ 记下最早的那个 `t`，供远场级兜底（见参数 `gap`）。
+      // CONSTRAINT: `group_empty` 时我们**没读条目**（省了那次 1 MB 读）⇒ 分不出"没加载"与"已知空"，
+      // 因此按保守方向记一笔（当作可能没加载）。代价是真空区也会去问一次远场；那里远场同样为空，
+      // 只是多走一趟遍历 —— 而**漏记**会让洞填不上，两害相权取轻。
+      if (group_empty || entry == 0u) { *gap = min(*gap, t_enter_c); }
       // M4：三道闸门（不加节流会变成每秒数亿次原子写，GPU 全耗在 `lod_req[0]` 上）：
       // ① 只要 16³ 或更细的（`REQ_LEVEL_KEEP`）② 采样 `1/REQ_SAMPLE` ③ 每条射线 ≤ `REQ_PER_RAY_MAX`。
       // M8：**远场级跳过闸门 ①** —— 那个闸门问的是"这个距离值不值得加载细节"，而远场级的

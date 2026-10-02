@@ -573,10 +573,12 @@ impl Plugin for BrickMapDdaPlugin {
     // （main.rs setup 注入的 Resource）→ 转成 DdaViewUniform（render world 资源，
     // 供 PrepareBindGroups 每帧写 uniform buffer）
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
+    let dda_shader_rt = app.world().resource::<crate::shader::DdaShaderRtHandle>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app.insert_resource(dda_shader);
+    render_app.insert_resource(dda_shader_rt);
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
       .add_systems(RenderStartup, init_dda_pipelines)
@@ -587,6 +589,12 @@ impl Plugin for BrickMapDdaPlugin {
       )
       .add_systems(
         Render,
+        // 加速结构的实例表同步（消费 builder 的常驻变更日志）。与 `prepare` 同阶段即可：
+        // 它只写 CPU 侧的 `RtScene`，真正的 `build_acceleration_structures` 在 RenderGraph 里录。
+        prepare_rt_scene.in_set(RenderSystems::PrepareResources),
+      )
+      .add_systems(
+        Render,
         prepare_dda_bind_groups
           .in_set(RenderSystems::PrepareBindGroups)
           .after(sync_eye_adapt_settings)
@@ -594,6 +602,15 @@ impl Plugin for BrickMapDdaPlugin {
           .after(super::upload::prepare),
       )
       // 必须挂 RenderGraph::Render set（而非 Render schedule）。
+      .add_systems(
+        RenderGraph,
+        // 加速结构的构建**必须排在 `dispatch_dda` 之前**：wgpu 在提交时按命令顺序校验
+        // "用到的 TLAS 已经建过"（`ValidateAsActionsError::UsedUnbuiltTlas`），而 BG1 在
+        // `PrepareBindGroups` 就已经把它绑上了。
+        sync_rt_scene
+          .in_set(bevy::render::renderer::RenderGraphSystems::Render)
+          .before(dispatch_dda),
+      )
       .add_systems(
         RenderGraph,
         dispatch_dda
@@ -621,9 +638,15 @@ pub(crate) fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
   dda_shader: Res<crate::shader::DdaShaderHandle>,
+  dda_shader_rt: Res<crate::shader::DdaShaderRtHandle>,
   pipeline_cache: Res<PipelineCache>,
-  _render_device: Res<RenderDevice>,
+  render_device: Res<RenderDevice>,
 ) {
+  // 一次问定：编译期开关 + 设备是否支持 ray query（见 `rt::rt_enabled`）。这个 `rt` 决定
+  // ①用哪一版 shader ②BG1 有没有 binding(11) ③RtScene 要不要建结构。
+  let rt = super::rt::rt_enabled(&render_device);
+  commands.insert_resource(super::rt::RtScene::new(rt, &render_device));
+
   // ---- BG0：out tex write + DdaViewUniform uniform + beam depth rw ----
   let bg0 = BindGroupLayoutDescriptor::new(
     "DdaBg0",
@@ -718,42 +741,63 @@ pub(crate) fn init_dda_pipelines(
   // 6/7/8/9 = MT2-2 / MT2-3 的全局材质资产表 + PBR 贴图数组 + **PBR 专用采样器**
   // （**BG1 被 dda / beam / gi 三个 pass 共用**，这几条只在这一份 layout 里加；
   // `dda.rs` 是 BG1 layout 的唯一出处，`gi` 侧 no-op）。
-  // **binding 号到 9 为止**：MT8-3 曾在 10/11 加一对反射缓存 buffer（`array<ReflEntry>`），
-  // 已随反射缓存整体删除（实测负优化，见 `assets/shaders/voxel_raytrace/main.wesl` 文件头）。
-  let bg1 = BindGroupLayoutDescriptor::new(
-    "DdaBg1",
-    &BindGroupLayoutEntries::sequential(
-      ShaderStages::COMPUTE,
-      (
-        // 运行时 sized：min_binding_size=None
-        storage_buffer_read_only_sized(false, None), // @binding(0) b_struct
-        storage_buffer_read_only_sized(false, None), // @binding(1) b_leaves（存放方向可达掩码 LUT）
-        storage_buffer_read_only_sized(false, None), // @binding(2) b_palette
-        uniform_buffer::<super::wire::BrickMapGlobals>(false), // @binding(3) globals
-        // @binding(4)：GI 缓冲（`gi_tex`）的采样器 —— ClampToEdge ×3、mipmap_filter = Nearest。
-        // PBR 贴图走 @binding(8)（那一份要 Repeat + Linear mipmap，状态要求相反）。
-        sampler(SamplerBindingType::Filtering),
-        // @binding(5)：全局材质资产表（`array<MaterialAsset>`，32B/条 = 32KB）
-        storage_buffer_read_only_sized(false, None),
-        // @binding(6)/(7)：PBR 贴图数组（`texture_2d_array`，层 = 材质槽号）——
-        // 视图维度必须是 `D2Array`（`texture_2d_array()` 已按此生成 layout entry）。
-        texture_2d_array(TextureSampleType::Float { filterable: true }),
-        texture_2d_array(TextureSampleType::Float { filterable: true }),
-        // @binding(8)：PBR 贴图**专用采样器**（MT2-3）——三轴 Repeat（triplanar 平铺）+
-        // Linear mag/min/**mipmap**（贴图集带完整 mip 链）。**不能与 4 合并**：GI 缓冲那个是
-        // ClampToEdge 且无 mip，两者状态要求相反。desc 权威在
-        // `pbr_texture::create_pbr_sampler`（占位与真身共用 `GpuBrickMap.pbr_sampler`）。
-        sampler(SamplerBindingType::Filtering),
-        // @binding(9)：叶级 LOD 诊断计数器（M0；`trace.wesl::LOD_DIAG` 打开时才有写入，其余时候恒 0）。
-        // 放 BG1 而不是 BG0：BG1 是 dda / beam / gi / 光柱掩码四个**会调 trace** 的 pass 共用的那一份，
-        // 而 BG0 有两份（完整版 + GI 瘦版）⇒ 挂这里只需改这一处 layout 与下面那一处 BG1 bind group。
-        storage_buffer_sized(false, None),
-        // @binding(10)：**M4 ray-guided 请求环缓冲**（read_write —— shader 侧原子追加，
-        // 见 `trace.wesl::{REQ_ENABLE, req_push}`）。
-        storage_buffer_sized(false, None),
-      ),
+  // **10 = M4 的请求环缓冲；11 = 硬件光追的 TLAS（仅 RT 版有）**。
+  let mut bg1_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
+    ShaderStages::COMPUTE,
+    (
+      // 运行时 sized：min_binding_size=None
+      storage_buffer_read_only_sized(false, None), // @binding(0) b_struct
+      storage_buffer_read_only_sized(false, None), // @binding(1) b_leaves（存放方向可达掩码 LUT）
+      storage_buffer_read_only_sized(false, None), // @binding(2) b_palette
+      uniform_buffer::<super::wire::BrickMapGlobals>(false), // @binding(3) globals
+      // @binding(4)：GI 缓冲（`gi_tex`）的采样器 —— ClampToEdge ×3、mipmap_filter = Nearest。
+      // PBR 贴图走 @binding(8)（那一份要 Repeat + Linear mipmap，状态要求相反）。
+      sampler(SamplerBindingType::Filtering),
+      // @binding(5)：全局材质资产表（`array<MaterialAsset>`，32B/条 = 32KB）
+      storage_buffer_read_only_sized(false, None),
+      // @binding(6)/(7)：PBR 贴图数组（`texture_2d_array`，层 = 材质槽号）——
+      // 视图维度必须是 `D2Array`（`texture_2d_array()` 已按此生成 layout entry）。
+      texture_2d_array(TextureSampleType::Float { filterable: true }),
+      texture_2d_array(TextureSampleType::Float { filterable: true }),
+      // @binding(8)：PBR 贴图**专用采样器**（MT2-3）——三轴 Repeat（triplanar 平铺）+
+      // Linear mag/min/**mipmap**（贴图集带完整 mip 链）。**不能与 4 合并**：GI 缓冲那个是
+      // ClampToEdge 且无 mip，两者状态要求相反。desc 权威在
+      // `pbr_texture::create_pbr_sampler`（占位与真身共用 `GpuBrickMap.pbr_sampler`）。
+      sampler(SamplerBindingType::Filtering),
+      // @binding(9)：叶级 LOD 诊断计数器（M0；`trace.wesl::LOD_DIAG` 打开时才有写入，其余时候恒 0）。
+      // 放 BG1 而不是 BG0：BG1 是 dda / beam / gi / 光柱掩码四个**会调 trace** 的 pass 共用的那一份，
+      // 而 BG0 有两份（完整版 + GI 瘦版）⇒ 挂这里只需改这一处 layout 与下面那一处 BG1 bind group。
+      storage_buffer_sized(false, None),
+      // @binding(10)：**M4 ray-guided 请求环缓冲**（read_write —— shader 侧原子追加，
+      // 见 `trace.wesl::{REQ_ENABLE, req_push}`）。
+      storage_buffer_sized(false, None),
     ),
-  );
+  )
+  .to_vec();
+  // @binding(12)：**主世界的粗占用位图**（32 KB，见 `builder::OCC_WORDS`）—— `trace.wesl` 的空组
+  // 跳过唯一输入。与 RT 无关（软件路径同样用它），故**两版 shader 都声明**、无条件加这条 layout。
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 12,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: true },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  });
+  // @binding(11)：**硬件光追的 TLAS**。只在走 RT 时加这一条 —— 它对应的 WGSL 声明
+  // （`bindings.wesl` 的 `@if(ray_query) var tlas`）只在 RT 版 shader 里存在，两版必须各配各的
+  // layout，否则 wgpu 报"绑定号对不上"。
+  if rt {
+    bg1_entries.push(BindGroupLayoutEntry {
+      binding: 11,
+      visibility: ShaderStages::COMPUTE,
+      ty: BindingType::AccelerationStructure { vertex_return: false },
+      count: None,
+    });
+  }
+  let bg1 = BindGroupLayoutDescriptor::new("DdaBg1", &bg1_entries);
 
   // ---- BG2：GridDesc 数组（主世界 + 物体同描述符）----
   // shader `trace_grid` 遍历 grid_descs[0..count]，无 kind 分支。
@@ -804,7 +848,10 @@ pub(crate) fn init_dda_pipelines(
 
   // ---- Compute pipeline：shaders/voxel_raytrace/ 两个入口
   // （dda_main 主 trace+unlit 直出 / beam_main beam 预 pass）----
-  let dda_shader = dda_shader.0.clone();
+  // RT 设备用 RT 版 shader（多 `enable wgpu_ray_query;` 与 `tlas`）；否则软件版。
+  // CONSTRAINT: 两个 handle 都是**资产**，只有被 pipeline 引用时 Bevy 才建 module ⇒ 非 RT 设备上
+  // 那份 RT 资产永远不会被建，不会因缺特性而失败。
+  let dda_shader = if rt { dda_shader_rt.0.clone() } else { dda_shader.0.clone() };
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::gi::gi_bg4_layout()];
   // `dda_main` 比其它两个入口多两份 group：group(5) = GI 的采样侧（见 `gi_read`）、
@@ -953,6 +1000,11 @@ pub(crate) struct DdaTune<'w> {
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
   /// 「基础」开关（菜单「渲染/基础」）—— 写进 BG3 光池 uniform 的 `base_flags`。
   pub base: Option<Res<'w, crate::lighting::BaseSettings>>,
+  /// 硬件光追的 TLAS（`init_dda_pipelines` 建；非 RT 设备上它 `is_enabled() == false`）。
+  ///
+  /// 收进这个 SystemParam 而不是单列一个参数：Bevy 的 system 参数上限是 16，
+  /// `prepare_dda_bind_groups` 已经贴着上限。
+  pub rt: Option<Res<'w, super::rt::RtScene>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1334,10 +1386,8 @@ pub(crate) fn prepare_dda_bind_groups(
     pbr_albedo.map_or_else(|| gpu.pbr_albedo_rough_view.clone(), |i| i.texture_view.clone());
   let pbr_metal_view =
     pbr_metal.map_or_else(|| gpu.pbr_metal_view.clone(), |i| i.texture_view.clone());
-  let bg1 = render_device.create_bind_group(
-    None,
-    &bg1_layout,
-    &BindGroupEntries::sequential((
+  let bg1 = {
+    let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
       gpu.struct_buf.as_entire_binding(),
       gpu.leaves.as_entire_binding(),
       gpu.palette.as_entire_binding(),
@@ -1356,8 +1406,23 @@ pub(crate) fn prepare_dda_bind_groups(
       gpu.lod_diag.as_entire_binding(),
       // @binding(10)：M4 请求环缓冲：`trace.wesl::REQ_ENABLE` 关闭时无人写（shader 整段折叠）。
       gpu.lod_req.as_entire_binding(),
-    )),
-  );
+    ))
+    .to_vec();
+    // @binding(12)：主世界粗占用位图（两版 shader 都声明，无条件绑）。
+    entries.push(BindGroupEntry {
+      binding: 12,
+      resource: gpu.occ.as_entire_binding(),
+    });
+    // @binding(11)：TLAS。**只有 RT 设备上有这条 layout 项**（`init_dda_pipelines` 同条件加）
+    // ⇒ 两边必须一起判断，否则 wgpu 报绑定号对不上。
+    if let Some(rt) = tune.rt.as_deref().filter(|r| r.is_enabled()) {
+      entries.push(BindGroupEntry {
+        binding: 11,
+        resource: BindingResource::AccelerationStructure(rt.tlas()),
+      });
+    }
+    render_device.create_bind_group(None, &bg1_layout, &entries)
+  };
 
   // ---- BG2：GridDesc 数组（主世界 + 物体统一描述符）----
   // shader `dda_main` 遍历 grid_descs[0..arrayLength]，trace_grid 无 kind 分支。
@@ -1408,6 +1473,157 @@ pub(crate) fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBg2BindGroup(bg2));
   commands.insert_resource(DdaBg3BindGroup(bg3));
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
+}
+
+/// 每帧的**建 BLAS 额度**。
+///
+/// 每张 BLAS 只有 **1 个图元（24 字节的盒）** ⇒ 创建本身很廉价，额度可以给得比"每块一棵大树"的年代
+/// 高得多。取 1024：冷启动 1.8 万块约 **18 帧**（0.3 s）铺满；取 256 要 70 帧（1.2 s），那段时间里
+/// 没有 BLAS 的块在 RT 段上不可见（`trace.wesl::RT_TRUST_MISS` 关闭时由软件兜住，但那是白付）。
+const RT_INSERT_PER_FRAME: u32 = 1024;
+
+/// RT 实例表同步的游标（跨帧）。
+#[derive(Default)]
+struct RtSyncCursor {
+  ready: bool,
+  /// 已消费到 `resident_log` 的哪一条
+  cursor: usize,
+  seq: u64,
+  epoch: u64,
+  /// 诊断计数（每 [`RT_STAT_FRAMES`] 帧打一行）
+  stat: u32,
+}
+
+/// **RT 实例表同步**（`RenderSystems::PrepareResources`）：把 builder 的 **GPU 块**常驻变更日志逐条
+/// 落到 [`super::rt::RtScene`]（挂载 ⇒ 建 BLAS + 占槽；卸载 ⇒ 摘槽）。
+///
+/// WHY 用日志而不是每帧全量对照：流式世界每帧只有几十块变，全量对照是 O(常驻数) 的哈希遍历。
+/// 日志与序号脱节（`epoch` 变了 / 尾部长度对不上）时才退回一次全量对照。
+/// 真实的 `build_acceleration_structures` 不在这里录 —— 它要 encoder，见 [`sync_rt_scene`]。
+fn prepare_rt_scene(
+  mut rt: ResMut<super::rt::RtScene>,
+  mirror: Res<super::upload::BuilderMirror>,
+  device: Res<RenderDevice>,
+  queue: Res<RenderQueue>,
+  mut cur: Local<RtSyncCursor>,
+) {
+  if !rt.is_enabled() {
+    return;
+  }
+  rt.tick();
+  let Some(builder) = mirror.builder.as_ref() else { return };
+  let len = builder.resident_log_len(0);
+  let seq = builder.resident_seq(0);
+  let epoch = builder.resident_epoch(0);
+  // 与 `plan_residency` ① 同一套判据：日志与序号**逐条成对** ⇒ 增量；否则全量对照。
+  let consistent = cur.ready
+    && cur.epoch == epoch
+    && cur.cursor <= len
+    && (len as u64).wrapping_sub(cur.cursor as u64) == seq.wrapping_sub(cur.seq);
+  let mut budget = RT_INSERT_PER_FRAME;
+  // ① 先补上一帧欠下的账。
+  let mut still: Vec<gate_voxel::ChunkCoord> = Vec::new();
+  for c in std::mem::take(&mut rt.deferred) {
+    if budget == 0 {
+      still.push(c);
+      continue;
+    }
+    match builder.aabbs_of(0, c) {
+      Some(a) if !a.is_empty() && !rt.contains(c) => {
+        rt.insert_chunk(&device, &queue, c, a);
+        budget -= 1;
+      }
+      // 空块 / 已装上 / CPU 侧已经没了 ⇒ 这一条不再需要
+      _ => {}
+    }
+  }
+  rt.deferred = still;
+
+  if consistent {
+    for ev in builder.resident_log_from(0, cur.cursor) {
+      if !ev.mounted {
+        rt.remove_chunk(ev.c);
+        continue;
+      }
+      if budget == 0 {
+        rt.deferred.push(ev.c);
+        continue;
+      }
+      if let Some(a) = builder.aabbs_of(0, ev.c)
+        && !a.is_empty()
+        && !rt.contains(ev.c)
+      {
+        rt.insert_chunk(&device, &queue, ev.c, a);
+        budget -= 1;
+      }
+    }
+  } else {
+    // 全量对照：**builder 的常驻集是唯一真值**，两侧都补齐 / 清掉。
+    let resident: std::collections::HashSet<gate_voxel::ChunkCoord> =
+      builder.resident_chunks(0).into_iter().collect();
+    for c in rt.chunks().collect::<Vec<_>>() {
+      if !resident.contains(&c) {
+        rt.remove_chunk(c);
+      }
+    }
+    for &c in &resident {
+      if budget == 0 {
+        rt.deferred.push(c);
+        continue;
+      }
+      if let Some(a) = builder.aabbs_of(0, c)
+        && !a.is_empty()
+        && !rt.contains(c)
+      {
+        rt.insert_chunk(&device, &queue, c, a);
+        budget -= 1;
+      }
+    }
+  }
+  cur.cursor = len;
+  cur.seq = seq;
+  cur.epoch = epoch;
+  cur.ready = true;
+
+  if rt.slots_exhausted() {
+    bevy::log::warn_once!(
+      "RT: TLAS 实例槽用尽（{} 个）⇒ 之后挂载的块没有加速结构",
+      super::rt::RT_MAX_INSTANCES
+    );
+  }
+  cur.stat = cur.stat.wrapping_add(1);
+  if cur.stat % RT_STAT_FRAMES == 0 {
+    bevy::log::info!(
+      target: "gate",
+      "RT: 实例 {}（常驻 {} 块）/ 欠账 {}",
+      rt.instance_count(),
+      builder.resident_chunks(0).len(),
+      rt.deferred.len(),
+    );
+    // RT 是"覆盖完整的 miss 即射线终点"（`trace.wesl::RT_TRUST_MISS`）⇒ 实例集欠账的那几帧，
+    // 还没建 BLAS 的块在 RT 那一段上**不可见**（会露出它后面的东西）。稳态下这个数应当恒为 0。
+    if !rt.deferred.is_empty() {
+      bevy::log::warn!(
+        target: "gate",
+        "RT[!] 本帧 {} 块没有加速结构 ⇒ 这些块在 RT 段上不可见；应恒为 0，非零要查挂载速率",
+        rt.deferred.len()
+      );
+    }
+  }
+}
+
+/// 诊断计数周期（帧）。
+const RT_STAT_FRAMES: u32 = 240;
+
+/// `RenderGraph`：把本帧的加速结构构建**记进命令编码器**（唯一需要 encoder 的一步）。
+///
+/// 顺序必须在 `dispatch_dda` **之前**：wgpu 在提交时按命令顺序校验"用到的 TLAS 已经建过"
+/// （`ValidateAsActionsError::UsedUnbuiltTlas`），而 BG1 在 `PrepareBindGroups` 就把它绑好了。
+fn sync_rt_scene(mut ctx: RenderContext, mut rt: ResMut<super::rt::RtScene>) {
+  if !rt.is_enabled() {
+    return;
+  }
+  rt.record(ctx.command_encoder());
 }
 
 #[allow(clippy::too_many_arguments)] // Bevy render system：各 bind group + 资源逐一注入

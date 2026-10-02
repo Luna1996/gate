@@ -323,6 +323,18 @@ pub struct GpuBrickMap {
   /// `[1]` 保留、`[2]` 用途戳计数器、用途戳表、其后 `REQ_CAP` 个请求字）。**只增不清**（CPU 侧读差值，
   /// 见 `crate::profiler::report_lod_requests`）；写入侧是 shader 的原子追加，故需要 read_write 绑定。
   pub lod_req: Buffer,
+  /// **各 volume 的粗占用位图**（BG1 binding 12）：`VOLUMES × builder::OCC_WORDS` 个 u32
+  /// （每卷 **32 KB**，共 128 KB）。
+  ///
+  /// 逐 chunk 一位、**组优先布局**（4×4×4 个 chunk 一组，同组占连续 64 位 = 2 个字）⇒ shader 判
+  /// "整组是否为空"只需读**相邻两个字**。它是 `trace.wesl` 空空间跳过的唯一输入，不变式见
+  /// [`crate::brickmap::builder::BrickMapBuilder`] 的 `occ` 字段说明。
+  ///
+  /// 按 `vol * OCC_WORDS` 分段：位图是**窗口相对**的，而各 volume 的窗口不同（远场级的坐标空间也不同）。
+  pub occ: Buffer,
+  /// 位图是否已收到**真实数据**。见 `prepare` 的铺底：真实数据到位前必须当作"全占用"
+  /// （全 0 的含义是"全空" ⇒ 会让 shader 跳过一切组 ⇒ 画面空白）。
+  pub occ_ready: bool,
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
   pub globals: UniformBuffer<BrickMapGlobals>,
@@ -470,6 +482,14 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     mapped_at_creation: false,
   });
 
+  // 各 volume 的粗占用位图（每卷 32 KB）：零初始化即"全空"，真实内容由 `prepare` 按脏标志整块重写。
+  let occ = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_occ"),
+    size: (crate::brickmap::consts::VOLUMES * crate::brickmap::builder::OCC_WORDS * 4) as u64,
+    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    mapped_at_creation: false,
+  });
+
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     leaves: make("gate_leaves"),
@@ -478,6 +498,8 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     state: make("gate_state"),
     lod_diag,
     lod_req,
+    occ,
+    occ_ready: false,
     grid_descs_buf: make("gate_grid_descs"),
     grid_descs_count: 0,
     globals,
@@ -908,6 +930,19 @@ pub(crate) fn prepare(
   }
 
   let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
+  // 各 volume 的粗占用位图（每卷 32 KB）：只在变过的帧整块重传（与 full/incremental 无关）。
+  //
+  // CONSTRAINT: 真实数据没到位之前**必须铺成"全占用"**。位图全 0 的含义是"整窗口都是空的"，
+  // 而 shader 会据此按"索引条目为 0"处理 ⇒ 画面**空白**（不是少几何，是全没了）。铺 1 = 关掉
+  // 这个省读，只是慢一点。只发生在启动的最初一两次 `prepare`。
+  if let Some(occ) = snap.volumes.occ_all.as_ref() {
+    queue.write_buffer(&gpu.occ, 0, u8_of_u32(occ));
+    gpu.occ_ready = true;
+  } else if !gpu.occ_ready {
+    let n = crate::brickmap::consts::VOLUMES * crate::brickmap::builder::OCC_WORDS;
+    let all = vec![u32::MAX; n];
+    queue.write_buffer(&gpu.occ, 0, u8_of_u32(&all));
+  }
   let comp_bytes = snap.comp_chunks * CHUNK_COMP_WORDS * 4;
 
   // 方向可达掩码 LUT → b_leaves，与 volume 无关。
@@ -1789,9 +1824,14 @@ fn plan_residency(
     } else {
       tree
     };
-    // 档位变化要先归还旧块（`ensure_resident_tree` 对"已常驻"直接返回）。
-    let _ = builder.evict(0, c);
-    if builder.ensure_resident_tree(0, c, tree) {
+    // 已在常驻集里 ⇒ **就地换档**（`relayout_resident_tree` 的 WHY：AABB 表与档位无关，走
+    // evict + install 会让 RT 每帧为这几次升级白白丢/建 BLAS 并把 TLAS 标脏）；否则才是真正的挂载。
+    let ok = if builder.is_resident(0, c) {
+      builder.relayout_resident_tree(0, c, tree)
+    } else {
+      builder.ensure_resident_tree(0, c, tree)
+    };
+    if ok {
       let bytes = builder.resident_bytes_of(0, c).unwrap_or(0);
       state.residency.note_resident(c, bytes, level, frame);
       installed += 1;

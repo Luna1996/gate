@@ -9,10 +9,25 @@
 //!
 //! 注意它**验证不到**的：pipeline layout 与 bind group 的匹配（那是 wgpu 运行期的事）。
 
-/// WESL 编译通过 + 全部 `@compute` 入口都在产物里 + 产物是合法 WGSL（naga 校验）。
+/// WESL 编译通过（**两版**）+ 全部 `@compute` 入口都在产物里 + 产物是合法 WGSL（naga 校验）。
+///
+/// 两版都要过：软件版是**回退路径**（`ray_query` 关），RT 版是默认路径；任一侧的 `@if` 写错都会在
+/// 这里炸（例如把 `enable wgpu_ray_query;` 漏在软件版里、或 RT 版少声明 `tlas`）。
 #[test]
 fn wesl_package_compiles_and_validates() {
-  let src = gate_render::shader::compile_dda_wesl().expect("WESL 编译失败");
+  for ray_query in [false, true] {
+    let src = gate_render::shader::compile_dda_wesl(ray_query).expect("WESL 编译失败");
+    assert_eq!(src.contains("enable wgpu_ray_query"), ray_query, "enable 指令与 flag 不对应");
+    assert_eq!(
+      src.contains("var tlas: acceleration_structure"),
+      ray_query,
+      "tlas 声明与 flag 不对应"
+    );
+    validate_all_entries(&src, ray_query);
+  }
+}
+
+fn validate_all_entries(src: &str, ray_query: bool) {
   // 全部入口（Rust 侧按名字找它们建 pipeline，见 `brickmap::dda` / `volumetric` / `gi`）。
   for name in [
     "dda_main",
@@ -32,7 +47,12 @@ fn wesl_package_compiles_and_validates() {
   ] {
     assert!(src.contains(name), "WESL 产物里没有 {name}（入口被剪掉了？）");
   }
-  let module = naga::front::wgsl::parse_str(&src).expect("WESL 产物不是合法 WGSL");
+  if ray_query {
+    assert!(src.contains("trace_grid_rt"), "RT 版产物里没有光追遍历函数");
+  } else {
+    assert!(!src.contains("trace_grid_rt"), "软件版产物里不该有光追遍历函数");
+  }
+  let module = naga::front::wgsl::parse_str(src).expect("WESL 产物不是合法 WGSL");
   naga::valid::Validator::new(
     // 能力给满：校验口径不窄于运行期设备（产物无 64 位整数，不额外要求特性）。
     naga::valid::ValidationFlags::all(),

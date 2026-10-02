@@ -2598,6 +2598,7 @@ dependencies = [
  "ron",
  "serde",
  "wesl 0.5.0",
+ "wgpu",
  "wgpu-profiler",
 ]
 
