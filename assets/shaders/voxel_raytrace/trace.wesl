@@ -98,14 +98,16 @@ fn diag_sampled(addr: u32) -> bool {
 // M4 · ray-guided 请求通道（`docs/editable-gigavoxel.md` §4 M4）
 // ============================================================================
 
-/// 请求通道开关：置 `1u` ⇒ 射线撞上"**窗口里有槽位、GPU 上还没有树块**"的 chunk 时记一条请求
-/// （`bindings::lod_req`），Rust 侧回读 + 合并排序后驱动流式加载。
-/// 这里是**唯一来源**：Rust 侧经 `wesl_consts::trace_consts` 解析同一份源码，按它决定要不要注册回读。
-/// 编译期常量 ⇒ 置 0 时 `req_push` 整段被折叠，正常路径零开销，也不需要那条 binding 有内容。
+/// 请求通道开关（**已关闭**）：置 `1u` ⇒ 射线撞上"**窗口里有槽位、GPU 上还没有树块**"的 chunk 时记
+/// 一条请求（`bindings::lod_req`），Rust 侧回读 + 合并排序后驱动流式加载。
 ///
-/// CONSTRAINT（**主射线优先**）：只有主射线会发请求 —— 请求闸门由 `WorldRayQuery::req` 给，
-/// 主 pass 用 `world_cfg_primary`，阴影 / 反射 / GI / 光柱一律用 `world_cfg_full`（req=0）。
-const REQ_ENABLE: u32 = 1u;
+/// REF: ray-guided 流式已整条取消 —— 常驻的需求 / 换出改由**相机距离**给（`residency::nearest_top`），
+/// 见 `upload::plan_residency` 的函数头。这里恒 0：`req_push` / `req_use` 整段被折叠，正常路径零开销，
+/// `lod_req` 那张表也不再被写（`wesl_consts::trace_consts` 读到 0 ⇒ 不注册回读）。
+///
+/// CONSTRAINT：置回 `1u` 之前先把 `plan_residency` 的需求集换回"由渲染结果给"，否则常驻会同时被
+/// 两套信号驱动。
+const REQ_ENABLE: u32 = 0u;
 /// 请求**采样率倒数**：约每 `REQ_SAMPLE` 条射线只有 1 条发请求。
 /// 请求是"需求的采样"，不是逐像素民意调查 —— 全量会变成每秒数亿次原子写（实测 4.8 亿/窗口），
 /// GPU 全耗在 `lod_req[0]` 这一个字上，帧率崩到个位数 ⇒ 表现为"加载停了"。

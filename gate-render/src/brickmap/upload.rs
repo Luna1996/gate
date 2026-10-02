@@ -334,6 +334,10 @@ pub struct GpuBrickMap {
   pub volume_windows: Vec<IVec3>,
   /// GI 缓冲（`gi_tex`）的**线性采样器**（BG1 binding 4，ClampToEdge ×3 + mipmap_filter = Nearest）。
   pub light_sampler: Sampler,
+  /// Blit 的**线性**采样器（`dda_blit` pass 用，把 dda 纹理上采样到输出）：`mag/min = Linear`，
+  /// 其余取默认（desc 是常量）。与上面那份分开：GI 缓冲要 ClampToEdge + mipmap Nearest，状态相反。
+  /// 建在 [`init_empty_gpu`]（一次）而不是每帧的 `prepare_dda_bind_groups`。
+  pub blit_sampler: Sampler,
   /// **全局材质资产表**（BG1 binding 5）：storage buffer，`MATERIAL_ASSET_SLOTS × 32B`（当前 = 32KB）。
   /// **所有 volume 共用一张**（palette 的 PBR 变体里 `asset: u16` 是全局下标）。尺寸在
   /// [`init_empty_gpu`] 就按 WESL 常量定死（占位即最终尺寸，不需要扩容逻辑），
@@ -376,6 +380,18 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     mag_filter: FilterMode::Linear,
     min_filter: FilterMode::Linear,
     mipmap_filter: MipmapFilterMode::Nearest,
+    ..Default::default()
+  });
+
+  // Blit（把 dda 纹理上采样到输出）用的线性采样器。desc 是**常量** ⇒ 与上面两个一样建一次共用。
+  // 从前它建在 `prepare_dda_bind_groups` 里 —— 那是每帧跑的系统 ⇒ 每帧白建一个采样器对象
+  // （wgpu 内部虽有按 desc 的缓存，仍要走一次哈希查找 + Arc 克隆）。
+  // 必须是 Linear：半分辨率档（factor=2）上采样与 FXAA 亚像素偏移都依赖线性采样；
+  // factor=1 时线性与最近邻等价（采样点落在纹素中心）。
+  let blit_sampler = device.create_sampler(&SamplerDescriptor {
+    label: Some("gate_dda_blit_sampler"),
+    mag_filter: FilterMode::Linear,
+    min_filter: FilterMode::Linear,
     ..Default::default()
   });
 
@@ -469,6 +485,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     main_window_dims: UVec3::ZERO,
     volume_windows: Vec::new(),
     light_sampler,
+    blit_sampler,
     material_assets,
     material_assets_uploaded: false,
     pbr_albedo_rough_tex,
@@ -496,7 +513,9 @@ fn extract(
 ) {
   let _t = crate::profiler::SysTimer::new("EXTRACT 快照", &mut diag);
   let sd = split.get_or_insert_with(|| {
-    crate::profiler::SplitDiag::new(&["判脏", "sync", "sync_win", "update", "palette", "snapshot", "尾"])
+    crate::profiler::SplitDiag::new(&[
+      "判脏", "sync", "sync_win", "update", "palette", "snapshot", "尾",
+    ])
   });
   sd.start();
   let (Some(scene), Some(budget), Some(main_pending)) = (scene, budget, main_pending) else {
@@ -532,12 +551,9 @@ fn extract(
   // **外观是否变了**用内容版本，不用写版本：流式源逐帧认领新槽（`Pool::intern`）也会让写版本自增，
   // 而新槽不影响任何已上传体素 ⇒ 拿写版本会让流式世界**每帧整屏作废 GI 历史**（症状：噪声反复被
   // 重置回原始估计、静止也不收敛、一动更频繁）。见 `gate_voxel::Palette::content_version`。
-  let palette_content_changed = scene
-    .volumes
-    .list
-    .iter()
-    .enumerate()
-    .any(|(i, g)| mirror.palette_content_versions.get(i).copied() != Some(g.palette().content_version()));
+  let palette_content_changed = scene.volumes.list.iter().enumerate().any(|(i, g)| {
+    mirror.palette_content_versions.get(i).copied() != Some(g.palette().content_version())
+  });
   let dirty_any =
     need_full || !pending_data.is_empty() || !_pending_comp.is_empty() || palette_dirty;
 
@@ -669,11 +685,36 @@ fn u8_of_material_assets(assets: &[MaterialAsset]) -> &[u8] {
 /// **越过 wgpu 的 `max_buffer_binding_size`（2 GiB − 4）** ⇒ `create_bind_group` 校验失败、
 /// 应用直接退出。**任何超出量 > 25% 的倍数增长在这个体量上都会撞墙** ⇒ 本值必须贴着 `need`。
 ///
+/// CONSTRAINT: **还必须夹在 `limit`（= `device.limits().max_storage_buffer_binding_size`）以内**。
+/// "贴着 need"并不够：`need` 落在上限下方那 32 MB 窗口里时，向上对齐的结果正好越过上限 4 字节
+/// （实测 `need ∈ (2^31 − 32 MiB, 2^31 − 4]` ⇒ 对齐到 `2^31`）—— 那不是"树区太大"，只是对齐越界，
+/// 却同样让 `create_bind_group` 判错、应用退出。夹住之后，"贴着 need"才真的贴着。
+///
 /// TODO(perf): 真要吃这份拷贝，得先把树区压到 1 GB 以下（或把 `b_struct` 分片成多个 binding）。
-fn grow_size(cap: u64, need: u64) -> u64 {
+fn grow_size(cap: u64, need: u64, limit: u64) -> u64 {
   let big = crate::brickmap::consts::BUFFER_GROW_BIG;
   let reserve = crate::brickmap::consts::BUFFER_GROW_RESERVE;
-  if need >= big { need.div_ceil(reserve) * reserve } else { need.max(cap * 2).max(65536) }
+  let sized = if need >= big {
+    need.div_ceil(reserve) * reserve
+  } else {
+    need.max(cap * 2).max(65536)
+  };
+  sized.min(limit)
+}
+
+/// **主世界树区的字节上限**：设备的绑定上限减去 `b_struct` 里**不属于主世界**的那几段与扩容余量。
+///
+/// WHY 必须扣：`b_struct` 是各 volume **拼在一起**后整块绑进 BG0/BG1 的（`as_entire_binding()`）⇒
+/// 主世界占满自己的预算时，总量就越过设备上限 —— 实测主世界 ~2.1 GB + 其余 ~100 MB。
+/// 其余部分 = 远场各级的**固定预留树区**（[`crate::brickmap::consts::FAR_TREE_RESERVE_WORDS`]，
+/// 长度恒定；留一格余量给物体）+ 一次扩容的对齐量。
+///
+/// `Residency` 的 `resident_bytes` 就是主世界树区**实际分配**的字节（`resident_bytes_of` = 块容量
+/// × 4，已含 `install_blob` 的 25% 块内余量与碎片空洞）⇒ 拿它跟本上限比是同口径的。
+fn main_region_byte_cap(limit: u64) -> usize {
+  let far = 4 * crate::brickmap::consts::FAR_TREE_RESERVE_WORDS as u64 * 4;
+  let margin = far + crate::brickmap::consts::BUFFER_GROW_RESERVE;
+  limit.saturating_sub(margin).min(usize::MAX as u64) as usize
 }
 
 /// 保证 buffer 能容纳 `bytes`，扩容时保留旧内容。
@@ -691,7 +732,14 @@ fn ensure_with_copy(
   if cap >= need {
     return;
   }
-  let new_size = grow_size(cap, need);
+  let limit = device.limits().max_storage_buffer_binding_size;
+  if need > limit {
+    // 边界：夹到上限也放不下 ⇒ 越界写是必然的。这里给出**原因**（否则只看到 wgpu 的越界校验）。
+    bevy::log::warn_once!(
+      "显存 {label} 需要 {need} B，超过设备单次绑定上限 {limit} B ⇒ 调用方必须先缩小常驻池"
+    );
+  }
+  let new_size = grow_size(cap, need, limit);
   let new_buf = device.create_buffer(&BufferDescriptor {
     label: Some(label),
     size: new_size,
@@ -733,7 +781,13 @@ fn ensure_capacity(
   if cap >= need_bytes {
     return;
   }
-  let new_size = grow_size(cap, need_bytes);
+  let limit = device.limits().max_storage_buffer_binding_size;
+  if need_bytes > limit {
+    bevy::log::warn_once!(
+      "显存 {label} 需要 {need_bytes} B，超过设备单次绑定上限 {limit} B ⇒ 调用方必须先缩小常驻池"
+    );
+  }
+  let new_size = grow_size(cap, need_bytes, limit);
   let new_buf = device.create_buffer(&BufferDescriptor {
     label: Some(label),
     size: new_size,
@@ -819,6 +873,36 @@ pub(crate) fn prepare(
     if limits.force_multi() {
       warn!(target: "gate",
         "GPU storage binding < 1GB ⇒ 退化到全量上传（单 tile 170MB 跨帧）"
+      );
+    }
+  }
+
+  // ---- 硬件光追能力（一次）：决定走 ray query 还是软件 DDA ----
+  //
+  // 本仓**不往 `WgpuSettings.features` 里加任何东西**：Bevy 默认 `WgpuSettingsPriority::Functionality`
+  // ⇒ `required_features = adapter.features() | options.features`（见 bevy_render 的 renderer/mod.rs）
+  // ⇒ **支持 RT 的 adapter 上 `EXPERIMENTAL_RAY_QUERY` 已经自动打开**；不支持它的（如验收基线里的
+  // GTX 1660）只是不报这一位 ⇒ 设备照常建起、自动落到软件 DDA。所以这里**只查询、不请求**。
+  //
+  // 这正是我们要的语义：`options.features` 是"必需"（加进去会在老卡上建不起设备），
+  // 而 `adapter.features()` 是"有什么给什么"。两条路的分支点就是这个 `contains`。
+  static RT_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if !RT_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    use bevy::render::render_resource::WgpuFeatures;
+    let f = device.features();
+    let rt = f.contains(WgpuFeatures::EXPERIMENTAL_RAY_QUERY);
+    let l = device.limits();
+    info!(target: "gate",
+      "PROBE: ray query = {} → {}；BLAS 图元上限 {} / 几何数 {}、TLAS 实例上限 {}",
+      if rt { "有" } else { "无" },
+      if rt { "硬件光追路径可用（软件 DDA 仍是回退与对照）" } else { "只有软件 DDA 路径" },
+      l.max_blas_primitive_count,
+      l.max_blas_geometry_count,
+      l.max_tlas_instance_count,
+    );
+    if rt && l.max_tlas_instance_count == 0 {
+      warn!(target: "gate",
+        "ray query 已开但 TLAS 实例上限为 0 ⇒ BLAS/TLAS 不可用（驱动未给 RT 限额）"
       );
     }
   }
@@ -1268,10 +1352,6 @@ const FAR_INSTALL_PER_FRAME: usize = 24;
 /// 上一帧动过"三个信号跳过 O(常驻数) 的那趟，这个周期只是防漏信号（约 4 s 一次，成本摊到几百分之一）。
 const LEDGER_SWEEP_FRAMES: u64 = 240;
 
-/// 需求集只看"最近 `USE_KEEP_FRAMES` 帧内被用到过"的 chunk。
-/// 取几倍于一个回读窗口（`REPORT_PERIOD_SECS` × 帧率）的量：太短会让"上一窗口看到、这一窗口刚好没被
-/// 采样到"的 chunk 掉出需求集而被换出 ⇒ 下一窗口再装回来（装卸抖振）。
-const USE_KEEP_FRAMES: u64 = 600;
 /// 每个 chunk 在 GPU 上的**每块字节估计**（混合口径）—— 用来把"块数"折成 GPU 侧的字节预算。
 ///
 /// CONSTRAINT: 本值与 [`CPU_CHUNK_BYTES_EST`] **必须同值**：两边块数不一致时，CPU 会留住 GPU 装不下
@@ -1336,16 +1416,9 @@ pub fn pool_capacity_chunks_far(budget_bytes: usize) -> usize {
   if budget_bytes == 0 {
     target
   } else {
-    (budget_bytes / 4 / CPU_FAR_CHUNK_BYTES_EST)
-      .max(MIN_POOL_CHUNKS_FAR)
-      .min(target)
+    (budget_bytes / 4 / CPU_FAR_CHUNK_BYTES_EST).max(MIN_POOL_CHUNKS_FAR).min(target)
   }
 }
-
-/// `LodRequest::level`（`trace.wesl::req_level` 的下标：0 = 全分辨率、1 = 16³、2 = 64³、3 = 整 chunk）
-/// → [`Level`]（proxy 的 `keep_extent`）。两边是**同一把尺**（`req_level` ≡ [`super::residency::raw_level`]）
-/// ⇒ 请求报回来的档位直接就是需求档位，不再按距离重算。
-const LEVEL_OF_REQ: [Level; 4] = [gate_voxel::BRICK_FACTOR, 16, 64, gate_voxel::CHUNK_SIZE];
 
 /// **字节预算 → 池容量**（chunk）。0 = 不限（返回 `usize::MAX`）。
 ///
@@ -1366,11 +1439,7 @@ const STATIC_EMPTY_SCAN_MAX: i64 = 64 * 1024;
 
 /// 池容量（chunk）→ GPU 侧的字节预算（[`ResidencyPolicy::budget_bytes`]）。不限 ⇒ 0（= 关闭预算）。
 fn gpu_pool_bytes(cap_chunks: usize) -> usize {
-  if cap_chunks == usize::MAX {
-    0
-  } else {
-    cap_chunks.saturating_mul(GPU_CHUNK_BYTES_EST)
-  }
+  if cap_chunks == usize::MAX { 0 } else { cap_chunks.saturating_mul(GPU_CHUNK_BYTES_EST) }
 }
 
 /// ① 的单块记账：CPU 侧有内容的 `c` ↔ builder 里有没有块（见 [`plan_residency`] 的 ①）。
@@ -1419,23 +1488,29 @@ fn ledger_note(
 /// 为什么不并进 `extract`：① `extract` 在"本帧无脏改动"时提前返回，而常驻决策必须每帧跑；
 /// ② 唤醒需要 CPU 树（`Extract<Res<VoxelScene>>`），只有这里拿得到。
 ///
-/// 分工：决策在 [`super::residency`]（纯逻辑 + 单测），这里只做四件事 —— **读用途戳当 LRU 信号**、
-/// **按池容量截断需求集**（[`want_level`] 按**距离**给档）、落实安装 / 换出、把这次改动**标脏**
-/// （上传交给 `extract`，见函数尾的 WARNING）；另外 ⑦ 顺带做"CPU 有 / GPU 无"的取证（§10.2 第 1 条）。
+/// 分工：决策在 [`super::residency`]（纯逻辑 + 单测），这里只做四件事 —— **按池容量截断需求集**
+/// （[`want_level`] 按**距离**给档）、落实安装 / 换出、把这次改动**标脏**（上传交给 `extract`，
+/// 见函数尾的 WARNING）；另外 ⑦ 顺带做"CPU 有 / GPU 无"的取证（§10.2 第 1 条）。
 ///
-/// 结构（论文 §III.A）：**定长池 + 最近使用换出**。三者必须同时成立才有意义 —— 池没预算 ⇒ 只增不减
-/// （`evict 0`）；需求不是"射线在看什么" ⇒ 换出会把正在看的块也换掉；需求不按池容量截断 ⇒ 换出后
-/// 下一帧又要装回来（抖振）。
+/// 结构：**定长池 + 距离换出**。三者必须同时成立才有意义 —— 池没预算 ⇒ 只增不减（`evict 0`）；
+/// 需求不按池容量截断 ⇒ 换出后下一帧又要装回来（抖振）。
+///
+/// 需求集的**两个来源**（都不再来自渲染结果，见 `trace.wesl::REQ_ENABLE`）：
+///   · 已常驻的：`nearest_top`（离相机最近的前 `池容量` 个）⇒ 重新评估档位；
+///   · 未常驻的：`pending`（CPU 有内容、GPU 没有）⇒ 装上去。`pending` 增量维护自常驻集变更日志
+///     （挂载 +，卸载 −，安装成功后 −），每 [`LEDGER_SWEEP_FRAMES`] 帧随 ① 的全量兜底重建一次。
 ///
 /// 档位阶梯是保守的（`fp ≥ 块边长` 才允许粗化 ⇒ 16³ 档在 720p 要 2.5 km 外）⇒ **当前场景（≤1 km）
 /// 永远是全分辨率**，本系统每帧只花 O(本帧挂载 / 卸载块数) 的记账，不产生任何上传。
 fn plan_residency(
   scene: Option<Extract<Res<VoxelScene>>>,
   cam: Option<Extract<Res<crate::brickmap::dda::DdaCameraConfig>>>,
-  use_feed: Option<Res<crate::profiler::ChunkUseFeed>>,
-  req_feed: Option<Res<crate::profiler::LodRequestFeed>>,
   mut mirror: ResMut<BuilderMirror>,
   mut state: ResMut<ResidencyState>,
+  // ③ 的绑定上限（`max_storage_buffer_binding_size`）：`b_struct` 是整块绑进去的，预算必须让得开它。
+  device: Res<RenderDevice>,
+  // 需求集里"CPU 有内容、GPU 没有"的那些（见函数头）。跨帧保留 ⇒ 用 `Local`。
+  mut pending: Local<Vec<gate_voxel::ChunkCoord>>,
   mut gap_last: Local<usize>,
   // ① 的"账目可能变了"闸门：常驻集变更序号 + 变更日志游标 / 代数 / 首次标记（见 ① 的说明）
   mut ledger_seq: Local<u64>,
@@ -1452,7 +1527,16 @@ fn plan_residency(
   let _t = crate::profiler::SysTimer::new("RESID 常驻调度", &mut diag);
   let sd = split.get_or_insert_with(|| {
     crate::profiler::SplitDiag::new(&[
-      "①账目", "①'空块", "②用途", "④取候选", "④逐块", "④补请求", "④计划装", "⑤⑥远场", "⑦取证", "尾",
+      "①账目",
+      "①'空块",
+      "②-",
+      "④取候选",
+      "④逐块",
+      "④补缺",
+      "④计划装",
+      "⑤⑥远场",
+      "⑦取证",
+      "尾",
     ])
   });
   sd.start();
@@ -1491,17 +1575,25 @@ fn plan_residency(
     for ch in changes {
       if ch.mounted {
         ledger_note(builder, &mut state.residency, ch.c, cam_now, streamed, px, frame);
+        // 新挂载的 CPU 块还不在 GPU 上 ⇒ 进需求集（④ 会把它装上）。重复挂载不重复入队。
+        if !pending.contains(&ch.c) {
+          pending.push(ch.c);
+        }
       } else {
         state.residency.note_gone(ch.c);
         if builder.evict(0, ch.c) {
           evicted += 1;
         }
+        pending.retain(|c| *c != ch.c);
       }
     }
   } else {
     for c in grid.chunk_coords().collect::<Vec<_>>() {
       ledger_note(builder, &mut state.residency, c, cam_now, streamed, px, frame);
     }
+    // 全量兜底：`pending` 重建为"CPU 有内容 且 GPU 无常驻块"的全体。
+    pending.clear();
+    pending.extend(grid.chunk_coords().filter(|c| !state.residency.is_resident(*c)));
     *ledger_epoch = epoch;
   }
   *ledger_cursor = grid.resident_log_len();
@@ -1559,60 +1651,53 @@ fn plan_residency(
   }
   sd.mark(1);
 
-  // ② 用途戳 → LRU 信号（论文 §III.A）：`report_lod_requests` 每 `REPORT_PERIOD_SECS` 从**稠密表**
-  //    读回"这一窗口哪几个 chunk 被主射线看到过"，这里逐条记成"最近使用"。它同时是下面需求集的来源与
-  //    `pick_evicts` 的排序键 —— **两边必须共用同一个信号**，否则会出现"一边说没用过、一边说还要"。
-  if let Some(feed) = use_feed.as_ref() {
-    for u in feed.peek() {
-      // M8：只收**主世界**的戳 —— 远场级的 chunk 坐标与主世界数值上会撞，混进来会把不相干的块
-      // 标成"刚被看到"（永远不被换出）。远场级的 LRU 由 `infinite_cubes::stream_chunks` 自己按卷裁。
-      if u.vol != 0 {
-        continue;
-      }
-      state.residency.note_use(gate_voxel::ChunkCoord(u.chunk), frame);
-    }
-  }
+  // ② 需求/换出的排序信号 = **相机距离**（`super::residency::nearest_top` / `pick_evicts`）。
+  //    从前这里消费的是 shader 打下的用途戳（`ChunkUseFeed`）；ray-guided 请求一取消
+  //    （`trace.wesl::REQ_ENABLE = 0`）那张表恒空 ⇒ 信号改由距离免费给出，不占本段。
   sd.mark(2);
   // ③ 预算：**GPU 常驻池容量**（论文的定长 pool），由 `gate-app` 的「常驻池」滑杆每帧写进来。
   //    口径是**块数**（由 CPU 侧的每块字节折出），这里再折成 GPU 的字节 —— 两侧的换出阈值才对齐。
   //    0 = 关闭（回归口径：无界常驻，只受窗口/半径约束）。
+  //
+  //    再被**绑定上限**卡一道：`b_struct`（各 volume 拼在一起）是**整块**绑进 BG0/BG1 的
+  //    （`as_entire_binding()`）⇒ 它一旦超过设备的 `max_storage_buffer_binding_size`，
+  //    `create_bind_group` 直接判错、应用退出（实测：主世界占满 2 GB 预算 + 其余 ~100 MB 就越过
+  //    2^31−4）。`resident_bytes` 记的正是主世界树区**实际分配**的字节 ⇒ 与这个上限同口径。
   let cap_chunks = pool_capacity_chunks(scene.residency_budget_bytes);
-  state.policy.budget_bytes = gpu_pool_bytes(cap_chunks);
-
-  // ④ 需求集：**请求（未命中）优先** + 最近使用，按最近使用降序，再按池容量截断。
-  //
-  // 「请求」= `trace.wesl` 的主射线撞上 `entry == 0`（**GPU 上没有**）⇒ 这是缓存**未命中**，
-  // 正是"该装哪一块"的唯一权威来源（论文：refinement / 装载都由渲染结果给）。**不能只按 `note_use`
-  // 建需求**：射线根本没进过那个 chunk ⇒ 它没有用途戳 ⇒ 永远进不了需求集 ⇒ `install` 里永远没有它
-  // ⇒ 缺口再也补不上（每 2 s 又报一次同一个请求）。用途戳只回答"**已经装着的**哪些还值得留"。
-  //
-  // CONSTRAINT：请求的档位直接取射线报回的 `LodRequest::level`（两边同一把尺：`req_level` 就是
-  // `residency::raw_level`）—— 别再按距离重算，否则"射线要 64³ 的远处大块"会被升到全分辨率。
-  let mut want_level_of: std::collections::HashMap<gate_voxel::ChunkCoord, Level> =
-    std::collections::HashMap::new();
-  if let Some(feed) = req_feed.as_ref() {
-    for r in feed.peek() {
-      // M8：只收主世界的请求（远场级的坐标空间不同，见 `note_use` 处的说明）
-      if r.vol != 0 {
-        continue;
-      }
-      let lv = *LEVEL_OF_REQ.get(r.level as usize).unwrap_or(&gate_voxel::BRICK_FACTOR);
-      let e = want_level_of.entry(gate_voxel::ChunkCoord(r.chunk)).or_insert(lv);
-      *e = (*e).min(lv); // 同一 chunk 被多档请求过 ⇒ 取**最细**的那个
-    }
+  let want_bytes = gpu_pool_bytes(cap_chunks);
+  let binding_cap = main_region_byte_cap(device.limits().max_storage_buffer_binding_size);
+  // 0（用户把「请求内存」调成 0 = 不限）也要卡：不卡就等于"不限"必然撞上设备的硬上限。
+  let capped = if want_bytes == 0 { binding_cap } else { want_bytes.min(binding_cap) };
+  if capped < want_bytes || want_bytes == 0 {
+    let asked =
+      if want_bytes == 0 { "不限".to_string() } else { format!("{} MB", want_bytes >> 20) };
+    bevy::log::warn_once!(
+      "RESID[!] 常驻预算被**绑定上限**压到 {} MB（请求 {}）⇒ 池容量随之变小；树区是一整块绑进去的，\
+       超过设备的 max_storage_buffer_binding_size 会在 create_bind_group 判错。\
+       要更多常驻得先把树区压小，或把 b_struct 分片成多个 binding",
+      capped >> 20,
+      asked
+    );
   }
+  state.policy.budget_bytes = capped;
+
+  // ④ 需求集：**已常驻的按距离取前 `池容量` 个**（重评档位）+ **未常驻的 `pending`**（装上）。
   let cam_pos = cam.position_world;
   let cam_chunk = (cam_pos / gate_voxel::CHUNK_SIZE as f32).floor().as_ivec3();
   let mut wants: Vec<(gate_voxel::ChunkCoord, Level)> = Vec::new();
-  let top = state.residency.recent_top(USE_KEEP_FRAMES, cap_chunks);
+  let top = state.residency.nearest_top(cam_chunk, cap_chunks);
+  // 池容量截断给出的**距离闸门**：比"最远会留下的那块"还远的 `pending` 一律不要 ——
+  // 否则它这一帧被装上、下一帧就因超预算被换出（每帧 1.65 ms 的重装白烧，见 `plan` 的安装次序）。
+  // 预算关闭（`cap_chunks == usize::MAX`）时没有换出，闸门整段免掉。
+  let d_cut = if cap_chunks == usize::MAX {
+    i32::MAX
+  } else {
+    top.last().map_or(i32::MAX, |c| crate::brickmap::residency::chunk_distance(cam_chunk, c.0))
+  };
   sd.mark(3);
-  for (c, _) in top {
+  for c in top {
     let Some(tree) = grid.chunk(c) else { continue };
     if tree.is_empty() {
-      continue;
-    }
-    if let Some(&lv) = want_level_of.get(&c) {
-      wants.push((c, lv));
       continue;
     }
     let cur = state.residency.resident_level(c).unwrap_or(gate_voxel::BRICK_FACTOR);
@@ -1630,11 +1715,8 @@ fn plan_residency(
     // **流式世界只细化、不粗化**：`min(cur)` 把"粗化"这一半关掉。
     //
     // WHY：流式世界的粗化已经在 **CPU 侧生产时**做过一次（`infinite_cubes::detail_at` 按同一个距离
-    // 阶梯给 `Detail`，树本身就是那个粒度）。这里再按距离粗化一次是重复劳动，而且会与射线打架：
-    // 射线按**命中距离**报 `level`（近面比块心近）⇒ 它可以把一块 100 m 外的块要成全分辨率；那条
-    // 请求在块装上后就消失了（shader 只在 `entry == 0` 时请求），下一帧这里的距离阶梯又按**块心**
-    // 距离把它粗化回去 ⇒ 下一窗射线再把它要回来。实测升级 1666 / 降级 1574（40 s，成对出现），
-    // 每次 ~1.65 ms 的重序列化 + 重上传全白花（`install` 长期顶在 `max_install_per_frame`）。
+    // 阶梯给 `Detail`，树本身就是那个粒度）。这里再按距离粗化一次是重复劳动，而重装一次的代价是
+    // ~1.65 ms 的重序列化 + 重上传。
     //
     // CONSTRAINT: 静态世界（没有流式窗口）不适用 —— 那种世界没有 CPU 侧预量化，档位阶梯是它唯一的
     // 省显存手段。
@@ -1642,15 +1724,19 @@ fn plan_residency(
     wants.push((c, lv));
   }
   sd.mark(4);
-  // 请求里那些**还没常驻**的：它没有用途戳（射线没进去过）⇒ 上面那个循环收不到它，单独补进来。
-  for (c, _) in want_level_of.iter() {
-    if state.residency.is_resident(*c) {
+  // 未常驻、CPU 有内容的：按距离阶梯给档，装上。
+  // CONSTRAINT：必须过 `d_cut` 闸门（见上），否则就是"装上 → 换出 → 再装上"的抖振。
+  for &c in pending.iter() {
+    if crate::brickmap::residency::chunk_distance(cam_chunk, c.0) > d_cut {
       continue;
     }
-    let Some(tree) = grid.chunk(*c) else { continue };
-    if !tree.is_empty() {
-      wants.push((*c, want_level_of[c]));
+    let Some(tree) = grid.chunk(c) else { continue };
+    if tree.is_empty() {
+      continue;
     }
+    let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
+    let lv = crate::brickmap::residency::raw_level((center - cam_pos).length() * px);
+    wants.push((c, lv));
   }
   sd.mark(5);
 
@@ -1658,7 +1744,8 @@ fn plan_residency(
   //    顺带刷它们的驻留字节：内容变了 ⇒ `builder` 里那棵树的大小变了（① 那趟只看挂载 / 卸载，
   //    看不见"同一块内容长大"；旧写法靠"有编辑就全量重算"覆盖这一点）。
   let edited = std::mem::take(&mut state.edited);
-  let must_keep: std::collections::HashSet<gate_voxel::ChunkCoord> = edited.iter().copied().collect();
+  let must_keep: std::collections::HashSet<gate_voxel::ChunkCoord> =
+    edited.iter().copied().collect();
   let pin_frames = state.policy.pin_frames;
   for &c in &edited {
     ledger_note(builder, &mut state.residency, c, cam_pos, streamed, px, frame);
@@ -1671,6 +1758,10 @@ fn plan_residency(
     if builder.evict(0, c) {
       state.residency.note_gone(c);
       evicted += 1;
+      // 换出的块 CPU 侧还在 ⇒ 回到需求集（相机再靠近时由 ④ 的距离闸门放行、重新装上）。
+      if !pending.contains(&c) {
+        pending.push(c);
+      }
     }
   }
   let mut installed = 0usize;
@@ -1706,6 +1797,8 @@ fn plan_residency(
       installed += 1;
     }
   }
+  // `pending` 只保留"CPU 有内容、GPU 仍没有"的：装上的、CPU 侧已经没了的，都出队。
+  pending.retain(|c| !state.residency.is_resident(*c) && grid.chunk(*c).is_some());
   sd.mark(6);
   // ⑤ 反向同步：builder 里还有块、但 CPU 侧已经没有这个 chunk（被真卸载 / 整块清空）⇒ 归还 GPU 块。
   //    流式世界的卸载就是走这条路：`VolumeGrid::unmount_chunk` 拿掉 CPU 树，这里跟着释放显存。
@@ -1770,22 +1863,35 @@ fn plan_residency(
   //    安装积压（`max_install_per_frame` 截断）不算：那时 `installed > 0`，本段整段跳过。只报**数量
   //    变化**，免得常驻缺口每帧刷一行。
   //
-  //    距离判据放前面：它是 O(1) 的算术，而 `is_resident` 是一次哈希探测 —— 反过来写就是每帧
-  //    常驻块数量级的哈希白账。
+  //    距离判据放前面：它是 O(1) 的算术，而 `is_resident` 是一次哈希探测。
+  //
+  //    CONSTRAINT: **只探相机邻域，不扫 `grid.chunk_coords()`**。那个迭代器是 O(CPU 块数)
+  //    （MC 常驻上万块），而本段恰好在"相机静止、没有任何装卸"——最常见的稳态——时**每帧**命中
+  //    ⇒ 那是每帧一次全表哈希遍历。邻域只有 `(2·GAP_NEAR_CHUNKS+1)³ = 343` 格，每格一次哈希探测；
+  //    判据与扫全表**逐字等价**（`chunk_coords()` 就是 `chunks.keys()`，`chunk(c).is_some()` 同一件事）。
   if installed == 0 && evicted == 0 {
-    let gaps: Vec<IVec3> = grid
-      .chunk_coords()
-      .filter(|c| {
-        (c.0 - cam_chunk).abs().max_element() <= GAP_NEAR_CHUNKS && !state.residency.is_resident(*c)
-      })
-      .map(|c| c.0)
-      .collect();
-    if gaps.len() != *gap_last {
-      *gap_last = gaps.len();
-      if let Some(n) = gaps.iter().min_by_key(|p| (*p - cam_chunk).abs().max_element()) {
+    let (mut gap_count, mut gap_nearest) = (0usize, None);
+    for dy in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {
+      for dz in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {
+        for dx in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {
+          let d = dx.abs().max(dy.abs()).max(dz.abs());
+          let c = gate_voxel::ChunkCoord(cam_chunk + IVec3::new(dx, dy, dz));
+          if grid.chunk(c).is_none() || state.residency.is_resident(c) {
+            continue;
+          }
+          gap_count += 1;
+          if gap_nearest.is_none_or(|(_, nd)| d < nd) {
+            gap_nearest = Some((c.0, d));
+          }
+        }
+      }
+    }
+    if gap_count != *gap_last {
+      *gap_last = gap_count;
+      if let Some((n, _)) = gap_nearest {
         warn!(
           "RESID[!!CPU 有 / GPU 无 {} chunk（{GAP_NEAR_CHUNKS} chunk 内最近 {n}）→ 画面上是空洞 / 齐平断口",
-          gaps.len()
+          gap_count
         );
       }
     }
@@ -1862,27 +1968,50 @@ impl Plugin for VolumePlugin {
 mod tests {
   use super::*;
 
-  /// **扩容不得明显超出需求** —— 这是 `gate_struct` 的硬约束，不是口味。
+  /// **扩容不得明显超出需求，也不得越过绑定上限** —— 这是 `gate_struct` 的硬约束，不是口味。
   ///
-  /// 锁的回归：把大缓冲改成"几何增长"以摊薄拷贝（`1.5×cap`）后，`1.5 GiB → 2.25 GiB` 这一步越过
-  /// wgpu 的 `max_buffer_binding_size`（2 GiB − 4）⇒ `create_bind_group` 校验失败、**应用直接退出**
-  /// （实测 `GATE_BENCH=orbit`）。而树区在同一场景已涨到 1.7 GB ⇒ 超出量只能留在几十 MB 量级。
+  /// 锁的两个回归：
+  /// ① 改成"几何增长"（`1.5×cap`）以摊薄拷贝：`1.5 GiB → 2.25 GiB` 这一步越过 wgpu 的
+  ///    `max_buffer_binding_size`（2 GiB − 4）⇒ `create_bind_group` 校验失败、**应用直接退出**
+  ///    （实测 `GATE_BENCH=orbit`）。而树区在同一场景已涨到 1.7 GB ⇒ 超出量只能留在几十 MB 量级。
+  /// ② **32 MB 向上对齐自己就能越界**：`need` 落在上限下方那 32 MB 窗口里时，对齐结果比上限多 4 字节
+  ///    （实测：缓冲被建到 `2^31`，`create_bind_group` 判错、应用退出）⇒ 结果必须夹到上限以内。
   #[test]
-  fn buffer_grow_stays_close_to_need() {
+  fn buffer_grow_stays_close_to_need_and_under_the_binding_limit() {
     const STEP: u64 = 32 * 1024 * 1024;
-    // 采样点含实测终值（1.7 GB）与它的上界（2 GB，binding 墙）
-    for need in [1u64, 64 << 20, 1 << 30, 1_700 << 20, 2_000 << 20] {
+    /// 实测设备的 `max_storage_buffer_binding_size`（`2^31 − 4`）。
+    const LIMIT: u64 = (1 << 31) - 4;
+    // 采样点含实测终值（1.7 GB）、2 GB 与**上限本身**（对齐会越界的那一格）
+    for need in [1u64, 64 << 20, 1 << 30, 1_700 << 20, 2_000 << 20, LIMIT - 1, LIMIT] {
       for cap in [0, need / 4, need / 2, need - 1] {
         if cap >= need {
           continue;
         }
-        let next = grow_size(cap, need);
+        let next = grow_size(cap, need, LIMIT);
         assert!(next >= need, "容量必须容得下需求：{next} < {need}");
-        assert!(
-          next < need + STEP,
-          "超出量必须 < 32 MB（否则会撞 2 GiB binding 上界）：cap={cap} need={need} → {next}"
-        );
+        assert!(next < need + STEP, "超出量必须 < 32 MB：cap={cap} need={need} → {next}");
+        assert!(next <= LIMIT, "不得越过绑定上限 {LIMIT}：cap={cap} need={need} → {next}");
       }
     }
+    // 反向护栏：**朴素对齐在上限附近确实会越界**，夹住之后才贴着上限。
+    let need = LIMIT - 1;
+    assert!(need.div_ceil(STEP) * STEP > LIMIT, "前提：朴素对齐在这一点会越过上限");
+    assert_eq!(grow_size(0, need, LIMIT), LIMIT, "贴着上限时不许对齐到 2^31");
+  }
+
+  /// 主世界树区上限必须**真的留出**非主世界那几段：远场预留 + 扩容余量，否则总量仍会越过设备上限。
+  #[test]
+  fn main_region_cap_leaves_room_for_the_other_volumes() {
+    const LIMIT: u64 = (1 << 31) - 4;
+    let far = 4 * crate::brickmap::consts::FAR_TREE_RESERVE_WORDS as u64 * 4;
+    let cap = main_region_byte_cap(LIMIT) as u64;
+    assert!(cap < LIMIT, "必须比设备上限小（要给非主世界留位置）");
+    assert!(
+      cap + far <= LIMIT,
+      "主世界 + 非主世界预留仍在设备上限以外：{cap} + {far} > {LIMIT}"
+    );
+    // 上限小到装不下预留时不得下溢
+    assert_eq!(main_region_byte_cap(0), 0);
+    assert_eq!(main_region_byte_cap(far), 0);
   }
 }

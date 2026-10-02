@@ -58,6 +58,11 @@ const VERSION: u32 = 2;
 pub const CELL: i32 = 16;
 /// **细格**的方块边长（每轴）：一个 section 里 `4³` 个细格 —— 细档（L1 的 1.28 m 格）用这一档。
 pub const FINE_CELL: i32 = 4;
+/// [`View::cell`] 里"一格含 `n³` 个节"那份栈缓冲的上限。
+///
+/// 推导：`n = cell_blocks / CELL`，而 `cell_blocks` 取自 `FAR_SCALES`（见 `infinite_cubes`，最大 64）
+/// ⇒ `n ≤ 4`、`n³ ≤ 64`。改 `FAR_SCALES` / `FAR_GRAIN` 时同看这里（越界会在 `cell` 里直接 panic）。
+const MAX_CELL_SECTIONS: usize = 64;
 /// 每轴细格数与每节的细格总数
 const FINE_PER_AXIS: i32 = CELL / FINE_CELL;
 const FINE_TOTAL: usize = (FINE_PER_AXIS * FINE_PER_AXIS * FINE_PER_AXIS) as usize;
@@ -411,16 +416,26 @@ impl View {
     // 取**最上面那一层有料的节**（不是这几节的多数色）：与细档/整节档同一条"表面"口径
     // （`voxel::rep_of_surface`，「每层」= 本格一层的节数 `n²`）—— 否则最粗的格又会退回"把水面染成河床"。
     // 缺的节填空气占位，保持 y-major 的排布（`rep_of_surface` 按层切分）。
+    //
+    // 用**栈上定长缓冲**，不分配：本函数在产出一块远场时被调 `(256/FAR_GRAIN)³ = 4096` 次，
+    // 而只有 L3（`n = 4`）走这一支 ⇒ 从前是每块 4096 次 `Vec` 小分配。
     let per_layer = (n * n) as usize;
-    let mut reps: Vec<PaletteId> = Vec::with_capacity(per_layer * n as usize);
+    debug_assert!(
+      (n * n * n) as usize <= MAX_CELL_SECTIONS,
+      "一格的节数 {n}³ 超过栈缓冲上限 —— `FAR_SCALES` 是不是加了更大的级？"
+    );
+    let mut reps = [PaletteId::AIR; MAX_CELL_SECTIONS];
+    let mut len = 0usize;
     for dy in 0..n {
       for dz in 0..n {
         for dx in 0..n {
-          reps.push(self.section(base.x + dx, base.y + dy, base.z + dz).map_or(PaletteId::AIR, |(r, _)| r));
+          reps[len] =
+            self.section(base.x + dx, base.y + dy, base.z + dz).map_or(PaletteId::AIR, |(r, _)| r);
+          len += 1;
         }
       }
     }
-    voxel::rep_of_surface(&reps, per_layer)
+    voxel::rep_of_surface(&reps[..len], per_layer)
   }
 }
 

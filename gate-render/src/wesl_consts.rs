@@ -96,14 +96,8 @@ pub struct TraceConsts {
 }
 
 /// [`TraceConsts`] 需要的常量名（缺一即 fail fast）。
-const TRACE_REQUIRED: &[&str] = &[
-  "LOD_DIAG",
-  "REQ_ENABLE",
-  "REQ_SAMPLE",
-  "REQ_PER_RAY_MAX",
-  "GRID_VOLUMES",
-  "INDEX_ENTRY_EMPTY",
-];
+const TRACE_REQUIRED: &[&str] =
+  &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX", "GRID_VOLUMES", "INDEX_ENTRY_EMPTY"];
 
 // MT8-3 的 `ReflConsts` / `refl_consts()` / `REFL_ENTRY_BYTES` 已随反射缓存一起删除（实测负优化）。
 // 这里只保留**通用**解析器（`parse_package_u32_consts` / `parse_u32_consts_in_source`），
@@ -309,7 +303,8 @@ impl TraceConsts {
 
     // 采样率是素数/取模的分母、每条射线上限是条目数上限：两者为 0 会让请求通道静默失效。
     if out.req_sample < 1 || out.req_per_ray_max < 1 {
-      let msg = format!("请求通道节流常量非法（`%REQ_SAMPLE` 与 `<REQ_PER_RAY_MAX` 都要 ≥ 1）：{out:?}");
+      let msg =
+        format!("请求通道节流常量非法（`%REQ_SAMPLE` 与 `<REQ_PER_RAY_MAX` 都要 ≥ 1）：{out:?}");
       error!("{msg}");
       panic!("{msg}");
     }

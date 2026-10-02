@@ -15,7 +15,9 @@
 //! 与 GI 的关系：**两条链完全独立**（各自的网格尺寸、资源、开关），唯一的共享是主 pass 的
 //! `group(0..3)` 绑定（掩码 pass 要相机矩阵与 brickmap 做那条主射线）。
 
-use bevy::render::render_resource::{BindGroupLayoutDescriptor, CachedComputePipelineId, ShaderType};
+use bevy::render::render_resource::{
+  BindGroupLayoutDescriptor, CachedComputePipelineId, ShaderType,
+};
 use glam::{Mat4, UVec2, Vec2, Vec4};
 
 use crate::brickmap::dda::DDA_WORKGROUP_SIZE;
@@ -94,10 +96,7 @@ impl FogSettings {
 
   /// 光柱网格尺寸 = 渲染分辨率 ÷ [`FOG_DIV`]（逐轴向下取整，至少 1×1）。
   pub fn grid_size(&self, render_size: UVec2) -> UVec2 {
-    UVec2::new(
-      (render_size.x / FOG_DIV).max(1),
-      (render_size.y / FOG_DIV).max(1),
-    )
+    UVec2::new((render_size.x / FOG_DIV).max(1), (render_size.y / FOG_DIV).max(1))
   }
 }
 
@@ -243,6 +242,18 @@ pub fn fog_read_layout() -> BindGroupLayoutDescriptor {
 // GPU 状态与资源
 // ============================================================================
 
+/// 光柱的 4 份**静态** layout 句柄。desc 由 `fog_layout_*` 常量给出 ⇒ 查一次就够。
+///
+/// WHY 要缓存：`fog_layout` 每次调用都 `collect` 一个 `Vec<BindGroupLayoutEntry>`，而
+/// `prepare_fog` 每帧跑 ⇒ 从前每帧 4 次小分配 + 4 次 desc 哈希，纯白付（句柄本身就是 Arc）。
+#[derive(Default)]
+struct FogLayouts {
+  mask: Option<bevy::render::render_resource::BindGroupLayout>,
+  blur_a: Option<bevy::render::render_resource::BindGroupLayout>,
+  blur_b: Option<bevy::render::render_resource::BindGroupLayout>,
+  read: Option<bevy::render::render_resource::BindGroupLayout>,
+}
+
 /// 光柱的全部 GPU 状态：uniform + 两张中间靶（随分辨率重建）+ bind group + pipeline。
 /// 资源**不放进** `AuxTexCache`（GI 的缓存）：光柱的尺寸、生命周期、开关都与 GI 无关，
 /// 混在一处会让两条链互相牵制；`dda_main` 侧只需要一个 group(6) 的 bind group（本模块给出）。
@@ -272,6 +283,8 @@ pub struct FogGpu {
   ph_view: Option<bevy::render::render_resource::TextureView>,
   /// `[0]` = 掩码、`[1]`/`[2]` = 模糊 A/B。
   pipelines: [Option<CachedComputePipelineId>; 3],
+  /// 4 份静态 layout 的句柄（查一次 ⇒ 见 [`FogLayouts`]）。
+  layouts: FogLayouts,
 }
 
 /// 占位资源（关掉光柱 / 首帧）：1×1 rgba16f 零纹理。
@@ -390,12 +403,10 @@ fn queue_fog_pipelines(
     ..Default::default()
   }));
   // 两趟模糊：只用光柱那一组（当 group(0) 用）⇒ 各一份只含所需号的 layout。
-  for (i, (entry, layout)) in [
-    ("godray_blur_a", fog_layout_blur_a()),
-    ("godray_blur_b", fog_layout_blur_b()),
-  ]
-  .into_iter()
-  .enumerate()
+  for (i, (entry, layout)) in
+    [("godray_blur_a", fog_layout_blur_a()), ("godray_blur_b", fog_layout_blur_b())]
+      .into_iter()
+      .enumerate()
   {
     gpu.pipelines[i + 1] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
       label: Some(Cow::from(match i {
@@ -438,23 +449,16 @@ fn prepare_fog(
     .and_then(|l| l.sun.as_ref())
     .map(|s| -glam::Vec3::from_array(s.dir).normalize_or_zero())
     .unwrap_or_default();
-  let (view_proj, cam_pos) = view.as_deref().map_or((Mat4::IDENTITY, glam::Vec3::ZERO), |v| {
-    (v.view_proj, v.cam_pos_voxel.truncate())
-  });
+  let (view_proj, cam_pos) = view
+    .as_deref()
+    .map_or((Mat4::IDENTITY, glam::Vec3::ZERO), |v| (v.view_proj, v.cam_pos_voxel.truncate()));
   let (sun_uv, facing) = project_sun(view_proj, cam_pos, sun);
 
   // ---- uniform ----
-  let size = scale
-    .as_deref()
-    .map_or(crate::consts::VIEW_SIZE, |s| s.size);
+  let size = scale.as_deref().map_or(crate::consts::VIEW_SIZE, |s| s.size);
   *gpu.uniform.get_mut() = FogUniform {
     params: Vec4::new(settings.decay(), 0.0, 0.0, 0.0),
-    misc: Vec4::new(
-      0.0,
-      settings.focus(),
-      settings.strength(),
-      facing,
-    ),
+    misc: Vec4::new(0.0, settings.focus(), settings.strength(), facing),
     // x = 日月外观开关（0/1），z 与 WESL `SUN_CONE_MAX` 的关系：只在 `sky_primary` 里
     // 用于太阳盘半径（会硬夹）。
     misc2: Vec4::new(
@@ -503,10 +507,25 @@ fn prepare_fog(
   }
 
   // ---- bind group（每帧重建；句柄都是 Arc，重建只是换绑）----
-  let mask_layout = pipeline_cache.get_bind_group_layout(&fog_layout_mask());
-  let blur_a_layout = pipeline_cache.get_bind_group_layout(&fog_layout_blur_a());
-  let blur_b_layout = pipeline_cache.get_bind_group_layout(&fog_layout_blur_b());
-  let read_layout = pipeline_cache.get_bind_group_layout(&fog_read_layout());
+  // layout 的 desc 是**常量** ⇒ 只查一次并缓存承载（见 [`FogLayouts`]）。克隆出来的都是 Arc 句柄，
+  // 这里先把它们取出来，好让后面能可变借 `gpu` 写回 bind group 句柄。
+  let (mask_layout, blur_a_layout, blur_b_layout, read_layout) = {
+    let l = &mut gpu.layouts;
+    (
+      l.mask
+        .get_or_insert_with(|| pipeline_cache.get_bind_group_layout(&fog_layout_mask()))
+        .clone(),
+      l.blur_a
+        .get_or_insert_with(|| pipeline_cache.get_bind_group_layout(&fog_layout_blur_a()))
+        .clone(),
+      l.blur_b
+        .get_or_insert_with(|| pipeline_cache.get_bind_group_layout(&fog_layout_blur_b()))
+        .clone(),
+      l.read
+        .get_or_insert_with(|| pipeline_cache.get_bind_group_layout(&fog_read_layout()))
+        .clone(),
+    )
+  };
   let ph_view = placeholder(&device, &mut gpu);
   if let (Some(a_src), Some(a_dst), Some(b_src), Some(b_dst)) =
     (gpu.a_src.clone(), gpu.a_dst.clone(), gpu.b_src.clone(), gpu.b_dst.clone())
@@ -543,11 +562,8 @@ fn prepare_fog(
     );
     // group(6)：主 pass 采样**中间靶 A**（模糊 B 的输出 = 最终结果）；
     // 关掉光柱时绑占位零纹理 —— 否则那一项会一直留着上一帧的光柱（"关不掉的光柱"）。
-    let final_view = if settings.enabled && settings.strength() > 0.0 {
-      a_src.clone()
-    } else {
-      ph_view.clone()
-    };
+    let final_view =
+      if settings.enabled && settings.strength() > 0.0 { a_src.clone() } else { ph_view.clone() };
     let read_bg = device.create_bind_group(
       None,
       &read_layout,
@@ -635,12 +651,10 @@ pub(crate) fn dispatch_fog(
     });
   }
   // ---- ② 径向模糊两趟（各自的 layout/bind group，只换 pipeline）----
-  for (i, (label, bg)) in [
-    ("gate_godray_blur_a", gpu.blur_a_bg.as_ref()),
-    ("gate_godray_blur_b", gpu.blur_b_bg.as_ref()),
-  ]
-  .into_iter()
-  .enumerate()
+  for (i, (label, bg)) in
+    [("gate_godray_blur_a", gpu.blur_a_bg.as_ref()), ("gate_godray_blur_b", gpu.blur_b_bg.as_ref())]
+      .into_iter()
+      .enumerate()
   {
     let Some(bg) = bg else { continue };
     let Some(pipe) = gpu.pipelines[i + 1].and_then(|id| pipeline_cache.get_compute_pipeline(id))

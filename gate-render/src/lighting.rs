@@ -69,7 +69,9 @@ pub struct LightPoolUniform {
 ///
 /// 与 `main.wesl` 的 `PBR_REFLECTION_ENABLED`（编译期总开关）的关系：那条是 A/B 自检用的**编译期**
 /// 常量（关掉整段反射代码被折掉），本资源是**运行期**档位，只在总开关打开时起作用。
-#[derive(Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource)]
+#[derive(
+  Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource,
+)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct ReflectionSettings {
   /// 档位（0..[`Self::TIERS`]），写入 uniform `LightGlobals::refl_tier`。
@@ -107,10 +109,7 @@ impl ReflectionSettings {
 
   /// 当前嵌套层级（把枚举值钳成 `NEST_CHOICES` 里最接近的合法值）。
   pub fn nest(&self) -> u32 {
-    *Self::NEST_CHOICES
-      .iter()
-      .min_by_key(|c| c.abs_diff(self.nest))
-      .expect("NEST_CHOICES 非空")
+    *Self::NEST_CHOICES.iter().min_by_key(|c| c.abs_diff(self.nest)).expect("NEST_CHOICES 非空")
   }
 }
 
@@ -135,7 +134,9 @@ impl Default for ReflectionSettings {
 ///   反射链 / 玻璃 in-scatter 全部不算。这是"看材质本色"的调试视图，也是全链最省的一档。
 ///
 /// 位编码写在 [`Self::flags`]；WESL 侧的名字是 `BASE_FLAG_*`（`bindings.wesl`，两处必须同步）。
-#[derive(Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource)]
+#[derive(
+  Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource,
+)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct BaseSettings {
   pub shadow: bool,

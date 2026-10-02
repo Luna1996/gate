@@ -601,7 +601,7 @@ pub fn stream_chunks(
   //    管线惰性起（缺省源要 `n_pbr` 才能定槽号方案 —— 与建世界时装进调色板的那份同源）；
   //    **换源（换世界）⇒ 重建池**：旧池的 worker 还在产旧世界的东西，且新 volume 的调色板是空的
   //    ⇒ 调色板游标清零、从头重放（见 `ChunkSource::palette_log` 的契约）。
-  let n_pbr = crate::scene::pbr_asset_ids(pbr.as_deref()).len();
+  let n_pbr = crate::scene::pbr_asset_count(pbr.as_deref());
   let source: std::sync::Arc<dyn ChunkSource> = if let Some(s) = stream.source.clone() {
     s
   } else {

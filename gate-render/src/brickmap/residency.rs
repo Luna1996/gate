@@ -1,8 +1,14 @@
 //! M3 的**常驻决策核心**：纯逻辑，不碰 GPU、不碰树。
 //!
-//! 输入 = 相机所在 chunk + 当前常驻账目（字节 / 档位 / 最近使用帧 / 钉住）+ 各 chunk 想要的档位；
+//! 输入 = 相机所在 chunk + 当前常驻账目（字节 / 档位 / 钉住）+ 各 chunk 想要的档位；
 //! 输出 = 该安装哪些（含**降级 / 升级**）、该换出哪些。真正的安装 / 释放由 [`super::builder`] 做，
 //! 逐帧调度由 `upload` 做。
+//!
+//! ## 优先级由**距离**定，不由渲染结果定
+//!
+//! 「最近使用」的排序键是**相机到 chunk 的距离**（切比雪夫），不是渲染时打下的用途戳 —— 后者
+//! 随 ray-guided 请求一起取消（`trace.wesl::REQ_ENABLE = 0`）。距离是同一个信号的免费近似：
+//! 相机在哪儿，哪儿的块就该留；`want_level` 的档位阶梯本来就按距离给。
 //!
 //! ## 档位由**距离**定，不由预算定（这是"性能优先但不许牺牲视觉"的落点）
 //!
@@ -20,8 +26,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::IVec3;
 use gate_voxel::{BRICK_FACTOR, CHUNK_SIZE, ChunkCoord};
+use glam::IVec3;
 
 /// 档位 = proxy 的 `keep_extent`（4 = 全分辨率不截断）。
 pub type Level = i32;
@@ -79,8 +85,6 @@ struct Entry {
   bytes: usize,
   /// 当前档位（`keep_extent`；`BRICK_FACTOR` = 全分辨率）。
   level: Level,
-  /// 最近一次"被需要"的帧号（相机半径内 / 被安装 / 被编辑都会刷新）。
-  last_use: u64,
   /// 钉住到这一帧（含）：此前不许换出 / 降级。
   pinned_until: u64,
   /// 常驻起始帧（最小驻留判据）。
@@ -130,6 +134,13 @@ pub struct ResidencyPlan {
 #[derive(Debug, Default, Clone)]
 pub struct Residency {
   entries: HashMap<ChunkCoord, Entry>,
+  /// [`Self::resident_bytes`] 的**增量账**。`entries` 的全部写点只有
+  /// [`Self::note_resident`] / [`Self::note_gone`] / [`Self::note_bytes`] 三处 ⇒ 在这三处按差值维护。
+  ///
+  /// WHY 不写成 `entries.values().map(|e| e.bytes).sum()`：它在 `plan` → `pick_evicts` 里**每帧**
+  /// 被读到，而常驻可达 1–2 万块 ⇒ 每帧一次全表求和的白账（与 `recent_top` 的"只选不排"同一类取舍，
+  /// 见 `docs/editable-gigavoxel.md` §10.4）。加这个字段后它是 O(1)。
+  bytes_total: usize,
   frame: u64,
 }
 
@@ -152,7 +163,7 @@ impl Residency {
   }
 
   pub fn resident_bytes(&self) -> usize {
-    self.entries.values().map(|e| e.bytes).sum()
+    self.bytes_total
   }
 
   pub fn is_resident(&self, c: ChunkCoord) -> bool {
@@ -166,33 +177,31 @@ impl Residency {
 
   /// 报告"该 chunk 现在常驻（这个档位 / 这些字节）"（由 builder 的实际状态或刚做的安装同步过来）。
   pub fn note_resident(&mut self, c: ChunkCoord, bytes: usize, level: Level, frame: u64) {
-    let e = self.entries.entry(c).or_insert(Entry {
-      bytes,
-      level,
-      last_use: frame,
-      pinned_until: 0,
-      since: frame,
-    });
-    e.bytes = bytes;
-    e.level = level;
+    match self.entries.get_mut(&c) {
+      Some(e) => {
+        self.bytes_total = self.bytes_total.saturating_sub(e.bytes) + bytes;
+        e.bytes = bytes;
+        e.level = level;
+      }
+      None => {
+        self.bytes_total += bytes;
+        self.entries.insert(c, Entry { bytes, level, pinned_until: 0, since: frame });
+      }
+    }
   }
 
   /// 报告"该 chunk 已不在 GPU 上"。
   pub fn note_gone(&mut self, c: ChunkCoord) {
-    self.entries.remove(&c);
+    if let Some(e) = self.entries.remove(&c) {
+      self.bytes_total = self.bytes_total.saturating_sub(e.bytes);
+    }
   }
 
   /// 只刷新字节（档位不动）：安装 / 编辑后块内余量会变，常驻预算按实际块算。
   pub fn note_bytes(&mut self, c: ChunkCoord, bytes: usize) {
     if let Some(e) = self.entries.get_mut(&c) {
+      self.bytes_total = self.bytes_total.saturating_sub(e.bytes) + bytes;
       e.bytes = bytes;
-    }
-  }
-
-  /// 该 chunk 被需要（在需求范围内）⇒ 刷新最近使用。
-  pub fn note_use(&mut self, c: ChunkCoord, frame: u64) {
-    if let Some(e) = self.entries.get_mut(&c) {
-      e.last_use = e.last_use.max(frame);
     }
   }
 
@@ -200,31 +209,25 @@ impl Residency {
   pub fn note_edit(&mut self, c: ChunkCoord, frame: u64, pin_frames: u64) {
     if let Some(e) = self.entries.get_mut(&c) {
       e.pinned_until = e.pinned_until.max(frame + pin_frames);
-      e.last_use = e.last_use.max(frame);
     }
   }
 
-  /// **还在用**的常驻 chunk 里最近使用的 `n` 个。`n` 取不到（≥ 候选数）时**顺序未定义**。
+  /// 离相机最近的 `n` 个常驻 chunk（升序）。`n ≥ 候选数` 时返回全部。
   ///
   /// WHY 不能拿"CPU 里全量 chunk"当需求：那等于"常驻 = CPU 里恰好有的东西"，预算一开就变成
   /// **换出 → 下一帧又被想要 → 又装回来**的抖振（每帧 `max_install_per_frame` 全烧在装卸同一批上）。
-  /// 论文里需求**由渲染结果给**（`note_use` ← 用途戳），调用方再按池容量截断 ⇒ 常驻收敛成一个稳定的
-  /// 滚动窗口（新看到的进来、最久没看到的被换出），而不是"永远在补差集"。
+  /// 调用方按池容量 `n` 截断 ⇒ 常驻收敛成一个稳定的滚动窗口（相机附近的进来、最远的被换出）。
   ///
   /// WHY 只选不排：常驻 1–2 万块时全排序是 O(n log n) 的每帧白账（`docs/editable-gigavoxel.md`
   /// §10.4）。截断只需"前 `n` 名"⇒ `select_nth_unstable` 就够；`n ≥ 候选数` 时连选都不用
   /// （消费端只拿它求档位，`plan` 自己会按距离重排）。
-  pub fn recent_top(&self, keep: u64, n: usize) -> Vec<(ChunkCoord, u64)> {
-    let mut v: Vec<(ChunkCoord, u64)> = self
-      .entries
-      .iter()
-      .filter(|(_, e)| self.frame.saturating_sub(e.last_use) <= keep)
-      .map(|(c, e)| (*c, e.last_use))
-      .collect();
+  pub fn nearest_top(&self, camera_chunk: IVec3, n: usize) -> Vec<ChunkCoord> {
+    let mut v: Vec<ChunkCoord> = self.entries.keys().copied().collect();
+    let key = |c: &ChunkCoord| (chunk_distance(camera_chunk, c.0), c.0.x, c.0.y, c.0.z);
     if n >= v.len() {
+      // 不截断 ⇒ 顺序无人消费（调用方只遍历，`plan` 自己按距离重排）⇒ 省掉这次排序。
       return v;
     }
-    let key = |(c, t): &(ChunkCoord, u64)| (std::cmp::Reverse(*t), c.0.x, c.0.y, c.0.z);
     v.select_nth_unstable_by(n, |a, b| key(a).cmp(&key(b)));
     v.truncate(n);
     v.sort_unstable_by_key(key);
@@ -257,12 +260,17 @@ impl Residency {
     });
     install.truncate(policy.max_install_per_frame);
 
-    let evict = self.pick_evicts(policy, must_keep);
+    let evict = self.pick_evicts(policy, camera_chunk, must_keep);
     ResidencyPlan { install, evict }
   }
 
-  /// 换出名单：只在**超预算**时给；LRU 序，跳过（钉住 / 未满最小驻留 / `must_keep`）的。
-  fn pick_evicts(&self, policy: &ResidencyPolicy, must_keep: &HashSet<ChunkCoord>) -> Vec<ChunkCoord> {
+  /// 换出名单：只在**超预算**时给；**离相机最远的先走**，跳过（钉住 / 未满最小驻留 / `must_keep`）的。
+  fn pick_evicts(
+    &self,
+    policy: &ResidencyPolicy,
+    camera_chunk: IVec3,
+    must_keep: &HashSet<ChunkCoord>,
+  ) -> Vec<ChunkCoord> {
     if policy.budget_is_off() {
       return Vec::new();
     }
@@ -271,7 +279,9 @@ impl Residency {
       return Vec::new();
     }
     let mut order: Vec<(&ChunkCoord, &Entry)> = self.entries.iter().collect();
-    order.sort_by_key(|(c, e)| (e.last_use, c.0.x, c.0.y, c.0.z));
+    order.sort_by_key(|(c, _)| {
+      (std::cmp::Reverse(chunk_distance(camera_chunk, c.0)), c.0.x, c.0.y, c.0.z)
+    });
     let mut out = Vec::new();
     for (c, e) in order {
       if over == 0 {
@@ -344,6 +354,32 @@ mod tests {
     assert_eq!(r.resident_bytes(), 800);
   }
 
+  /// `resident_bytes` 是**增量账** ⇒ `entries` 的三个写点（`note_resident` / `note_bytes` / `note_gone`）
+  /// 都必须维护它。漏掉任何一处，`pick_evicts` 的"超预算多少"就会算错（表现为换出永远不够、
+  /// 或永远在换），而那是**静默**的 —— 所以在本测试里逐个写点钉住。
+  #[test]
+  fn resident_bytes_tracks_all_write_points() {
+    let mut r = Residency::new();
+    assert_eq!(r.resident_bytes(), 0);
+    r.note_resident(cc(0, 0, 0), 100, BRICK_FACTOR, 0);
+    r.note_resident(cc(1, 0, 0), 200, BRICK_FACTOR, 0);
+    assert_eq!(r.resident_bytes(), 300, "两个新块");
+    // 重复上报同一个 chunk：按**差值**替换，不是累加
+    r.note_resident(cc(0, 0, 0), 150, BRICK_FACTOR, 0);
+    assert_eq!(r.resident_bytes(), 350, "重复上报按差值替换");
+    // 只刷字节（档位不动）
+    r.note_bytes(cc(1, 0, 0), 50);
+    assert_eq!(r.resident_bytes(), 200, "note_bytes 按差值替换");
+    // 未常驻的 note_bytes 是 no-op
+    r.note_bytes(cc(9, 9, 9), 999);
+    assert_eq!(r.resident_bytes(), 200, "未常驻的 note_bytes 不改账");
+    // 走了就减
+    r.note_gone(cc(0, 0, 0));
+    assert_eq!(r.resident_bytes(), 50, "note_gone 减掉该块的字节");
+    r.note_gone(cc(9, 9, 9));
+    assert_eq!(r.resident_bytes(), 50, "本来就不在的 note_gone 不减");
+  }
+
   /// 档位不同就要重装（降级 / 升级都算），已在目标档位的不出现。
   #[test]
   fn level_change_means_reinstall() {
@@ -374,18 +410,42 @@ mod tests {
     assert!(up.install.is_empty(), "已在该档 ⇒ 无事发生");
   }
 
-  /// 超预算 ⇒ 换出 LRU（最久没用到的最先走），且跳过钉住 / 刚驻留 / `must_keep`。
+  /// 超预算 ⇒ 换出**离相机最远的**，且跳过钉住 / 刚驻留 / `must_keep`。
   #[test]
-  fn over_budget_evicts_lru_first() {
+  fn over_budget_evicts_farthest_first() {
     let mut r = Residency::new();
     r.tick(100);
-    r.note_resident(cc(-20, 0, 0), 100, BRICK_FACTOR, 10);
-    r.note_resident(cc(-21, 0, 0), 100, BRICK_FACTOR, 20);
-    r.note_resident(cc(-22, 0, 0), 100, BRICK_FACTOR, 60);
-    r.note_resident(cc(-23, 0, 0), 100, BRICK_FACTOR, 70);
-    r.note_resident(cc(-24, 0, 0), 100, BRICK_FACTOR, 80);
+    for x in -20..=-16 {
+      r.note_resident(cc(x, 0, 0), 100, BRICK_FACTOR, 0);
+    }
     let plan = r.plan(&P, IVec3::ZERO, std::iter::empty(), &HashSet::new());
-    assert_eq!(plan.evict, vec![cc(-20, 0, 0), cc(-21, 0, 0)], "500 字节超预算 200 ⇒ 淘汰最久未用的两个");
+    assert_eq!(
+      plan.evict,
+      vec![cc(-20, 0, 0), cc(-19, 0, 0)],
+      "500 字节超预算 200 ⇒ 淘汰离相机最远的两个"
+    );
+  }
+
+  /// `nearest_top`：截断时给出**最近的 `n` 个**（距离升序）；不截断时只保证集合正确（顺序无消费者）。
+  #[test]
+  fn nearest_top_is_distance_ordered() {
+    let mut r = Residency::new();
+    r.tick(100);
+    for x in [-5, 2, -1, 9, 3] {
+      r.note_resident(cc(x, 0, 0), 100, BRICK_FACTOR, 0);
+    }
+    let mut all = r.nearest_top(IVec3::ZERO, usize::MAX);
+    all.sort_by_key(|c| c.0.x);
+    assert_eq!(
+      all,
+      vec![cc(-5, 0, 0), cc(-1, 0, 0), cc(2, 0, 0), cc(3, 0, 0), cc(9, 0, 0)],
+      "全集"
+    );
+    assert_eq!(
+      r.nearest_top(IVec3::ZERO, 2),
+      vec![cc(-1, 0, 0), cc(2, 0, 0)],
+      "截断到最近的 2 个（距离升序）"
+    );
   }
 
   /// 钉住与刚驻留的都不许换出。

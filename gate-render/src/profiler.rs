@@ -8,11 +8,11 @@ use bevy::render::render_resource::{
   Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePass, ComputePassDescriptor,
   MapMode, PollType,
 };
+#[cfg(feature = "profile")]
+use bevy::render::renderer::{PendingCommandBuffers, RenderAdapter};
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "profile")]
-use bevy::render::renderer::{PendingCommandBuffers, RenderAdapter};
 
 /// **呈现侧的帧计数**（诊断用；跨 feature 恒定存在）。
 ///
@@ -436,8 +436,8 @@ fn report_lod_diag(
   const WORDS: usize = crate::brickmap::consts::LOD_DIAG_WORDS;
   let Some(gpu) = gpu else { return };
   let now = std::time::Instant::now();
-  let due = period
-    .is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
+  let due =
+    period.is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
   if !due {
     return;
   }
@@ -450,9 +450,10 @@ fn report_lod_diag(
     usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
     mapped_at_creation: false,
   });
-  let mut enc = device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
-    label: Some("gate_lod_diag_readback"),
-  });
+  let mut enc =
+    device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
+      label: Some("gate_lod_diag_readback"),
+    });
   enc.copy_buffer_to_buffer(&gpu.lod_diag, 0, &staging, 0, bytes);
   queue.submit([enc.finish()]);
 
@@ -608,7 +609,8 @@ struct ReqReadback {
   /// 有一趟拷贝在飞
   pending: bool,
   /// map 回调的结果（`try_recv` 非阻塞取）
-  rx: Option<std::sync::mpsc::Receiver<Result<(), bevy::render::render_resource::BufferAsyncError>>>,
+  rx:
+    Option<std::sync::mpsc::Receiver<Result<(), bevy::render::render_resource::BufferAsyncError>>>,
   /// 复用的整块解包缓冲（**不再每趟分配 8 MB**）
   words: Vec<u32>,
   /// 提交 / 交付次数（诊断：核对"每帧一报"实际跑成了几帧一报）
@@ -675,11 +677,10 @@ impl ReqReadback {
 
   /// 提交下一趟：拷 `src` → staging + 异步映射（**不等待**）
   fn submit(&mut self, device: &RenderDevice, queue: &RenderQueue, src: &Buffer, bytes: u64) {
-    let mut enc = device.create_command_encoder(
-      &bevy::render::render_resource::CommandEncoderDescriptor {
+    let mut enc =
+      device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
         label: Some("gate_lod_req_readback"),
-      },
-    );
+      });
     enc.copy_buffer_to_buffer(src, 0, &self.staging, 0, bytes);
     queue.submit([enc.finish()]);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -743,8 +744,8 @@ fn report_lod_requests(
   // 日志仍按 `REPORT_PERIOD_SECS` 落：每帧刷的是**装载清单**（消费端），日志是验收口径的节奏。
   let _t = SysTimer::new("REQ 读回+合并", &mut diag);
   let now = std::time::Instant::now();
-  let log_now = log_at
-    .is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
+  let log_now =
+    log_at.is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
   if log_now {
     *log_at = Some(now);
   }
@@ -881,13 +882,15 @@ fn report_lod_requests(
       }
     })
     .collect();
-  let shown: Vec<String> = merged
-    .iter()
-    .take(6)
-    .map(|r| format!("v{}({},{},{})×{}", r.vol, r.chunk.x, r.chunk.y, r.chunk.z, r.votes))
-    .collect();
-  set_feed(merged);
+  // `shown` 只在**真要打日志**时才构造：它是 6 个 `format!`（各一次 String 分配），而 `log_now`
+  // 每 `REPORT_PERIOD_SECS`（≈2 s）才为真一次 ⇒ 从前那 59/60 的帧都在白建 6 个 String 再丢掉。
+  // 必须排在 `set_feed(merged)` 之前（那里会把 `merged` 移走）。
   if log_now {
+    let shown: Vec<String> = merged
+      .iter()
+      .take(6)
+      .map(|r| format!("v{}({},{},{})×{}", r.vol, r.chunk.x, r.chunk.y, r.chunk.z, r.votes))
+      .collect();
     info!(
       "REQ[去重 {distinct} chunk、取 {} 条（按卷配额，最热 {}）；本窗口 {new_reqs} 条、超容丢失 {lost}；\
        用途戳 {used_n} chunk；读回 {}/{} 趟]",
@@ -897,4 +900,5 @@ fn report_lod_requests(
       r.submitted,
     );
   }
+  set_feed(merged);
 }

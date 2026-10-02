@@ -451,10 +451,10 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
   BindGroupLayoutDescriptor::new(
     "GiDenTemporal",
     &[
-      ro(10), // 导引
+      ro(10),  // 导引
       tex(11), // 本帧原始 GI（gi_out 的采样视图）
-      ro(12), // 历史（上帧）
-      rw(13), // 历史（本帧）
+      ro(12),  // 历史（上帧）
+      rw(13),  // 历史（本帧）
       BindGroupLayoutEntry {
         binding: 16, // 时域输出
         visibility: C,
@@ -834,7 +834,8 @@ fn prepare_gi(
   //
   // 运行时不存在别的几何变化源：物体变换只在建世界时设定，LOD / beam 只改遍历起点、不改最近命中。
   // 若将来加了「物体动画 / 运行时改变换」，必须让那条路径也自增这两个修订号。
-  let any_upload = dirty.as_ref().is_some_and(|d| d.full || d.palette_changed || !d.boxes.is_empty());
+  let any_upload =
+    dirty.as_ref().is_some_and(|d| d.full || d.palette_changed || !d.boxes.is_empty());
   if any_upload {
     gpu.world_rev = gpu.world_rev.wrapping_add(1);
   }

@@ -17,11 +17,11 @@ use glam::{IVec3, Vec4};
 use super::wire::{GridDesc, LEAF_INLINE_WORDS, NODE_FIXED_WORDS, pack_palette_entry};
 use rayon::prelude::*;
 
+use super::consts::INDEX_ENTRY_EMPTY;
 use super::wire::{
   BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_BYTES_PER_ENTRY, PALETTE_WORDS,
   TREE_BASE,
 };
-use super::consts::INDEX_ENTRY_EMPTY;
 
 /// 稠密 chunk 窗口线性位置（stride = `CHUNK_INDEX_CAP`，与 WGSL `trace.wesl` 的窗口寻址同构）；窗口外 None。
 ///
@@ -603,7 +603,11 @@ impl BrickMapBuilder {
     }
     // 整个索引区都要重传（旧的要让 GPU 忘掉、新的要写上）
     self.mark_struct_words(0, TREE_BASE);
-    bevy::log::debug!("WINDOW 平移 {} → {origin} dims {dims}（掉了 {} 个出门的）", old.0, dropped.len());
+    bevy::log::debug!(
+      "WINDOW 平移 {} → {origin} dims {dims}（掉了 {} 个出门的）",
+      old.0,
+      dropped.len()
+    );
   }
 
   /// 从全局空闲段取一个 ≥`cap` 字的块（找不到就追加到高水位）。
@@ -685,12 +689,7 @@ impl BrickMapBuilder {
     // `memory allocation of 44552265872 bytes failed`（单次 44.5 GB）。
     // 每次最多翻倍（再夹到 target）⇒ 分配次数仍是 log₂ 级，但瞬时占用 ≤ 2× **实际**用量，
     // 池块数怎么调都不会炸（`target` 只是上限）。
-    let grown = self
-      .buffers
-      .b_struct
-      .capacity()
-      .saturating_mul(2)
-      .max(TREE_BASE + (1 << 20));
+    let grown = self.buffers.b_struct.capacity().saturating_mul(2).max(TREE_BASE + (1 << 20));
     let want = grown.min(target);
     let extra = want.saturating_sub(self.buffers.b_struct.len());
     if extra > 0 {

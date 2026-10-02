@@ -251,6 +251,16 @@ pub(crate) fn pbr_asset_ids(pbr: Option<&gate_render::PbrTextureSet>) -> Vec<Str
   pbr.map_or_else(gate_render::material_ids, |s| s.ids().to_vec())
 }
 
+/// [`pbr_asset_ids`] 的**只要个数**版本：口径（就绪用贴图集 / 未就绪退磁盘）逐字相同，但就绪分支
+/// 是 O(1)，不克隆任何一个 `String`。
+///
+/// WHY 单独开一个：`infinite_cubes::stream_chunks` **每帧**调用它，只为拿 `n_pbr` 判"换源"
+/// （`Arc::ptr_eq` 那个缓存键）。从前写的是 `pbr_asset_ids(..).len()` —— 每帧白建一个满表
+/// `Vec<String>` 再丢掉（贴图集未就绪时更重：`material_ids` 会**扫盘**）。
+pub(crate) fn pbr_asset_count(pbr: Option<&gate_render::PbrTextureSet>) -> usize {
+  pbr.map_or_else(|| gate_render::material_ids().len(), |s| s.ids().len())
+}
+
 /// 运行期换世界（DebugMenu「游戏/世界/重载世界」）：按名字重建主世界（`cube_in_void` 见
 /// [`build_cube_in_void`]，其余走 `assets/vox/<name>.vox`）。
 /// 与 `setup` 同一套不变量：先 `compact_all`；`demo_force_full_rebuild` 触发全量重建 + 全量 GPU 上传。

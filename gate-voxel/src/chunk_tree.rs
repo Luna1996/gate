@@ -674,13 +674,52 @@ impl ChunkTree {
     }
   }
 
+  /// 本树序列化后的字数（wire 长度）。**零分配**：只累加不写缓冲。
+  ///
+  /// CONSTRAINT: 必须与 [`Self::serialize_into`] 的布局逐字等价 —— 生产管线用它做字数预算
+  /// （`produce.rs` 的 `words`，进而在 `upload.rs` 里决定挂载额度），差一个字就会让预算与实际上传错位。
+  /// 改动序列化布局时**同改本函数**。
+  ///
+  /// WHY 不用 `self.serialize().len()`：那条路为拿一个标量要走完整个 DFS、写满整份 blob
+  /// （全分辨率块 ~2.5 万节点 ⇒ 每次几百 KB 的分配 + 一次等量拷贝），而这棵树稍后上传时**还要再序列化
+  /// 一遍** ⇒ 那份工作纯属白付（实测释放那棵 blob 单独就占 ~6 ms/帧）。递归深度 ≤ 树的层数（4）。
   pub fn len_words(&self) -> usize {
-    self.serialize().len()
+    let Some(n) = self.nodes.first() else {
+      return ROOT_WIRE_WORDS;
+    };
+    // 根**恒**占满预留区（即便 mask = 0 只用到前 3 字）：根的字数不随掩码变化。
+    let mut total = ROOT_WIRE_WORDS;
+    match n.kind {
+      NodeKind::Uniform => {}
+      // 注意：与序列化一致 —— 根的 Leaf 分支**不看掩码**，恒补 inline 值块。
+      NodeKind::Leaf => total += LEAF_INLINE_WORDS,
+      NodeKind::Split => {
+        let count = n.mask.count_ones() as usize;
+        for slot in 0..count {
+          total += self.count_node(self.children.slice(n.off, count)[slot] as usize);
+        }
+      }
+    }
+    total
   }
 
-  /// 序列化 buffer（上传 GPU 用）
-  pub fn nodes(&self) -> Vec<u32> {
-    self.serialize()
+  /// [`Self::serialize_node`] 的**只计数**版本：3 字固定 + 掩码为 0 就停 / 叶补 inline 值块 /
+  /// 分裂再补指针表（每置位一个字）并递归子块。
+  fn count_node(&self, idx: usize) -> usize {
+    let n = self.nodes[idx];
+    let mut total = NODE_FIXED_WORDS;
+    if n.mask == 0 {
+      return total;
+    }
+    if n.kind == NodeKind::Leaf {
+      return total + LEAF_INLINE_WORDS;
+    }
+    let count = n.mask.count_ones() as usize;
+    total += count;
+    for slot in 0..count {
+      total += self.count_node(self.children.slice(n.off, count)[slot] as usize);
+    }
+    total
   }
 
   /// 查询指定体素（1³，level 4）的 palette；未设置返回 None
@@ -1629,6 +1668,46 @@ mod tests {
       }
     }
     assert!(seen > 10, "树太小（{seen} 个 wire 节点），没测到东西");
+  }
+
+  /// [`ChunkTree::len_words`] 必须与 `serialize().len()` **逐字相等** —— 它是生产管线的字数预算来源
+  /// （`produce.rs` 的 `words`），差一个字就与实际上传错位。
+  /// 覆盖各形态：空树 / 统一根 / 分裂 + 叶值块 / 编辑后再合并（走 `try_merge` 的收缩路径）。
+  #[test]
+  fn len_words_matches_serialize() {
+    let mut trees = vec![ChunkTree::empty(), ChunkTree::uniform(PaletteId(2))];
+    let mut t = ChunkTree::empty();
+    for x in 0..64 {
+      for z in 0..64 {
+        t.set_voxel(x, 0, z, PaletteId(2));
+      }
+    }
+    for y in 0..8 {
+      t.set_voxel(4, y, 4, PaletteId(3));
+    }
+    t.set_brick_voxels([64, 0, 64], 0x0F0F_0F0F_0F0F_0F0F, PaletteId(4));
+    trees.push(t);
+    // 再走一遍"写满 → 逐个擦掉 → 合并回统一"的收缩路径：中间态会经过 mask 恰好为 0 的节点。
+    let mut shrinking = ChunkTree::empty();
+    for y in 0..64 {
+      shrinking.set_voxel(8, y, 8, PaletteId(5));
+    }
+    for y in 0..64 {
+      shrinking.set_voxel(8, y, 8, PaletteId::AIR);
+    }
+    trees.push(shrinking);
+    // 单个 4³ 砖：保证有一条"根 Split → 中间 Uniform/Split → 层 3 值块"的完整路径。
+    let mut one_brick = ChunkTree::empty();
+    one_brick.set_brick_voxels([0, 0, 0], 1, PaletteId(7));
+    trees.push(one_brick);
+
+    for (i, tr) in trees.iter().enumerate() {
+      assert_eq!(
+        tr.len_words(),
+        tr.serialize().len(),
+        "第 {i} 棵树：len_words 与 serialize().len() 不等（布局改了但 count_node 没跟上？）"
+      );
+    }
   }
 
   /// 逐格参照（口径 = [`ChunkTree::set_brick_voxels`] 的文档）：`mask` 内、且"该写"才写。
