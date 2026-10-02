@@ -6,6 +6,12 @@ import package::gi::ray::{gi_ray_radiance};
 import package::trace::{make_grid};
 import package::world::{WorldHit, surface_offset, voxel_normal};
 
+/// 归因用的 **texel 采样闸门**（1/64）。槽位 13（texel 数）与槽位 16（其中有历史的）**必须**用
+/// 同一个判据 ⇒ `d[16] / d[13]` 是**样本内**的精确比例，而不是两次独立采样（那会带采样噪声）。
+fn diag_texel_sampled(coord: vec2<i32>) -> bool {
+  return ((((u32(coord.x) * 73856093u) ^ (u32(coord.y) * 19349663u)) & 63u) == 0u);
+}
+
 // ============================================================================
 // 屏幕空间 ReSTIR GI —— **GI 的唯一路径**（逐像素 reservoir，每帧完整估计）。
 //
@@ -255,6 +261,11 @@ fn gi_ss_reproject(p_world: vec3<f32>, size: vec2<u32>, ok: ptr<function, bool>)
 /// 互相借样本（与"相邻同平面的不透明体素"是**同一条既有设计**）。它不跨面、不跨格、不跨薄板，
 /// 所以不是漏光；代价是"玻璃与不透明墙并排"处会有轻微串色。
 fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
+  // 归因（槽位 13）= **GI texel 数**（分母，用来算"每个 texel 发了几条射线"）。
+  // 1/64 采样计数后乘 64（同 `gi/ray.wesl` 的两项）：全量是每帧十万级单地址原子加。
+  if (diag_texel_sampled(coord)) {
+    atomicAdd(&lod_diag[13u], 64u);
+  }
   let idx = u32(coord.y) * size.x + u32(coord.x);
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
@@ -290,9 +301,9 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let org = p_voxel + n * n_off;
 
   // 主命中面键（唯一的复用判据）+ 是否可编码。
-  let pk0 = gi_key0(h.voxel);
+  let pk0 = gi_key0(h.voxel, h.obj_id);
   let pk1 = gi_key1(h.voxel, h.face_id, h.obj_id);
-  let pk_ok = gi_key_ok(h.voxel);
+  let pk_ok = gi_key_ok(h.voxel, h.obj_id);
 
   let frame = gi_u.seq.x;
   let seed = gi_ss_seed(coord, frame);
@@ -393,6 +404,15 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let hq = u32(gi_u.flags.w) >= 3u;
   let base_n = select(GI_SS_CAND_N, GI_SS_CAND_N_HQ, hq);
   let cand_n0 = select(base_n, base_n * 2u, !hist_ok);
+  // 归因（槽位 16）= **有可复用历史（`hist_ok`）的 texel 数**。与槽位 13 同闸门 ⇒
+  // `d[16] / d[13]` = 样本内的**精确命中率**。
+  //
+  // WHY 它是"GI 为什么贵"的关键读数：上一行 `!hist_ok` 会把候选数**翻倍**（去遮挡帧）⇒
+  // **没历史的比例 = 翻倍吃掉的份额**。命中率高 ⇒ 修重投影是**免费**收益（同样的收敛速度、
+  // 更少的射线）；已经很高 ⇒ 这条路不值得走，只能回到画质取舍（候选数 / 分辨率）。
+  if (hist_ok && diag_texel_sampled(coord)) {
+    atomicAdd(&lod_diag[16u], 64u);
+  }
   // ---- 每帧采样预算分摊（菜单「渲染/RESTIR GI/分帧」，`gi_u.misc.y`）----
   // `share = N`：把 N 帧的采样预算摊成每帧一份 ⇒ 帧时间恒定（不开分帧 = 1，就是原行为）。
   // **窗内样本总数不变**：候选数 ÷N 与记忆窗 ×N 相乘抵消（`gi_res_cap` 的 `cap = m_cap_k × cand_n`）

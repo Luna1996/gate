@@ -312,9 +312,9 @@ pub(crate) fn fly_camera_input(
 /// ⇒ 那条路径在 Fly 模式下**不移动相机**（只有切模式那一帧会对一次位置）。而"移动时掉帧"只有真的
 /// 在穿过新 chunk 时才触发（用户口径："光转没用，要移动起来"）。
 ///
-/// 轨迹：朝向按 `0.35 rad/s` 转、眼位沿**半径 `500/0.15 ≈ 3.3 km` 的圆**以 500 v/s 平移 —— 与
-/// [`auto_orbit_system`] 同一条曲线，只是写进 Fly 相机。**不能走直线**：地图有限（MC 城市 ~2.8 km），
-/// 直线会飞出世界。
+/// 轨迹：朝向按 [`BENCH_FLY_YAW`] 转、眼位沿**半径 = `BENCH_FLY_SPEED / BENCH_FLY_TURN`** 的圆
+/// 以 [`BENCH_FLY_SPEED`] 平移 —— 写进 Fly 相机。**不能走直线**：地图有限（MC 城市半幅 ≈ 22 k 体素），
+/// 直线会飞出世界。半径与速度都是为了让**新 chunk 装载持续发生**（见那两个常量的 WHY）。
 pub(crate) fn auto_fly_system(
   time: Res<Time>,
   mut orbit: ResMut<OrbitCamera>,
@@ -325,8 +325,8 @@ pub(crate) fn auto_fly_system(
     return;
   }
   let dt = time.delta_secs().min(0.1);
-  orbit.yaw -= 0.35 * dt;
-  let a = time.elapsed_secs() * 0.15;
+  orbit.yaw -= crate::consts::BENCH_FLY_YAW * dt;
+  let a = time.elapsed_secs() * crate::consts::BENCH_FLY_TURN;
   let dir = Vec3::new(-a.sin(), 0.0, a.cos());
   fly.pos += dir * crate::consts::BENCH_FLY_SPEED * dt;
 }

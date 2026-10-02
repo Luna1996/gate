@@ -1,6 +1,6 @@
 import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_unkey_voxel, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
@@ -582,7 +582,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       // ---- 环境 + GI（与不透明路径逐字段同构：同一个 `gi_upsample_joint`、同一套键、同一个 cov 地板）
       // 键必须取**玻璃那个体素/面**的（不是 `best` 的）：GI 缓冲在本像素上存的就是"主射线命中的那个面"
       // 的 GI，而主射线命中的正是这个玻璃面（`gi/screen.wesl` MT5-1：介质像素照常产出 GI）⇒ 键对得上。
-      let fk0 = gi_key0(first.voxel);
+      let fk0 = gi_key0(first.voxel, first.obj_id);
       let fk1 = gi_key1(first.voxel, first.face_id, first.obj_id);
       var f_gi = vec3<f32>(0.0);
       var f_cov = 0.0;
@@ -622,7 +622,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
       return fetch_material(best.palette_base, best.pal, best.point, best.n, PBR_DEBUG_ASSET).albedo;
     }
-    let k0 = gi_key0(best.voxel);
+    let k0 = gi_key0(best.voxel, best.obj_id);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
     // 着色法线（`voxel_normal`，主世界要探 4 个 / 物体 6 个邻域体素）：**先试导引复用，键相等就用它、不再自己算**。
     // 复用合法性由键给出：键逐位编码了精确体素 + 面号 + 物体，而 `voxel_normal` 是
@@ -816,6 +816,13 @@ const DIAG_FACE_FB_NOKEY: u32 = 5u; // 回退不可用：无主命中 / 异平�
 const DIAG_FACE_FB_MISS: u32 = 6u;  // 回退失败：键有、槽没认领 / 键不符（撞键）
 const DIAG_FACE_INLINE: u32 = 7u;   // 命中像素最终走内联着色
 const DIAG_FACE_SKY: u32 = 8u;      // 天空像素（`first.hit == false`）
+// 主射线的**像素分类**（槽位 9..13，见 `consts::LOD_DIAG_WORDS` 的说明）：同一个采样闸门
+// （1/64 像素）⇒ 四项互斥穷尽、和 = 采样总数。用 `obj_id` 分近场/远场（`make_grid` 约定：
+// 主世界 -1、物体/远场 `idx-1 >= 0`）。
+const DIAG_MAIN_RAYS: u32 = 9u;     // 采样到的主射线总数（分母）
+const DIAG_MAIN_NEAR: u32 = 10u;    // 命中主世界（近场）⇒ 代价在 chunk 内下钻
+const DIAG_MAIN_FAR: u32 = 11u;     // 命中远场级 / 物体 ⇒ 代价在远场遍历
+const DIAG_MAIN_SKY: u32 = 12u;     // 未命中（天空）⇒ 代价在空区步进
 
 /// **本像素所在那个 GI texel 的主命中面键 + 该 texel 的导引字址**（返回值 = 该 texel 有主命中）。
 /// 下标口径与 `shade_face` 里 `gi_div = 1` 的法线复用**逐字相同**（`floor(uv · gi_size)`，
@@ -928,14 +935,33 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 六个槽位互斥且穷尽（前提：GI 开、回退开）⇒ 一次读数就给出"每个像素从哪条路拿到颜色"。
   let diag_pix = gid.x + gid.y * size.x;
   let diag_on = diag_sampled(diag_pix);
+  // ---- 主射线的**像素分类**（槽位 9..13）----
+  // 同一个闸门（`diag_sampled`，1/64 像素）⇒ 四项互斥且穷尽，占比按四项和归一。
+  //
+  // WHY 要它：四类像素的**代价完全不同**，而"该砍哪里"取决于这个混合比 ——
+  //   · **近场命中**（`obj_id < 0`）= 主世界命中 ⇒ 代价在 **chunk 内下钻**（依赖 load 链）；
+  //   · **远场/物体命中**（`obj_id >= 0`）= 代价在**远场级的遍历**（窗口大、占用稀疏）；
+  //   · **未命中**（天空） = 代价在**空区步进**（逐 chunk 走完窗口）；
+  //   · 采样总数 = 分母。
+  // 不先量这个比，"优化"就只能在几类之间盲猜（前几轮的实际处境）。
+  if (diag_on) {
+    atomicAdd(&lod_diag[DIAG_MAIN_RAYS], 1u);
+    if (!first.hit) {
+      atomicAdd(&lod_diag[DIAG_MAIN_SKY], 1u);
+    } else if (first.obj_id < 0) {
+      atomicAdd(&lod_diag[DIAG_MAIN_NEAR], 1u);
+    } else {
+      atomicAdd(&lod_diag[DIAG_MAIN_FAR], 1u);
+    }
+  }
   var col = vec3<f32>(0.0);
   var cached = false;
   if (first.hit && gi_u.misc.x > 0.5) {
-    if (gi_key_ok(first.voxel)) {
+    if (gi_key_ok(first.voxel, first.obj_id)) {
       var ok = false;
       var pal_exact = 0u;
       let c = face_slot_color(
-        gi_key0(first.voxel),
+        gi_key0(first.voxel, first.obj_id),
         gi_key1(first.voxel, first.face_id, first.obj_id),
         &pal_exact,
         &ok);
@@ -956,7 +982,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       var c2 = vec3<f32>(0.0);
       // 三条准入见文件头部那段 ⚠️（同平面 / 同逐位着色法线 / 同材质）。
       if (gi_cover_key(px, &gk, &gb_cov)
-          && gi_den_same_plane(gk.x, gk.y, gi_key0(first.voxel),
+          && gi_den_same_plane(gk.x, gk.y, gi_key0(first.voxel, first.obj_id),
                                gi_key1(first.voxel, first.face_id, first.obj_id))
           && (!need_n || gi_guide_out[gb_cov + GI_DEN_G_NRM] == n_own_word)) {
         c2 = face_slot_color(gk.x, gk.y, &pal2, &ok2);
@@ -1117,11 +1143,10 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let fe = slot * FACE_WORDS;
   if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
 
-  // ---- 从面键重建命中（位布局见 `gi/common.wesl` 的 `gi_key0`/`gi_key1`）----
-  let voxel = vec3<i32>(i32(k0 & 0xFFFFu) - 32768, i32((k0 >> 16u) & 0xFFFFu) - 32768,
-                        i32(k1 & 0xFFFFu) - 32768);
+  // ---- 从面键重建命中（位布局与"加回编码原点"见 `gi/common.wesl` 的 `gi_unkey_voxel`）----
   let face_id = (k1 >> 16u) & 7u;
   let obj_id = i32((k1 >> 19u) & 0x1FFFu) - 1;
+  let voxel = gi_unkey_voxel(k0, k1, obj_id);
   let gg = make_grid(u32(obj_id) + 1u);
   let p_voxel = voxel_center_world(gg, voxel);
   // `point` 传**体素中心**：`fetch_material` 内部本来就量化到体素中心（UV 逐位相同）；唯一差别是

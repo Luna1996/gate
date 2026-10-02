@@ -69,3 +69,14 @@ fn cross_language_consts_parse_from_wesl() {
   gate_render::wesl_consts::gi_consts();
   gate_render::wesl_consts::trace_consts();
 }
+
+/// 面键的**量化编码原点步长**两侧必须逐字相等（`gi::KEY_ORG_Q` ↔ `gi/common.wesl::GI_KEY_ORG_Q`）：
+/// 不等 = Rust 判"原点变了"的时机与 shader 实际换编码基准的时机错位 ⇒ 复用链要么被无谓地每帧
+/// 作废、要么跨基准误配（同一体素拿到另一个坐标系下的历史）。
+#[test]
+fn key_org_q_matches_wesl() {
+  let path = gate_render::paths::dda_wesl_dir().join("gi").join("common.wesl");
+  let src = std::fs::read_to_string(&path).expect("读不到 gi/common.wesl");
+  let v = gate_render::wesl_consts::parse_u32_consts_in_source(&src)["GI_KEY_ORG_Q"];
+  assert_eq!(v, gate_render::gi::KEY_ORG_Q as u32, "gi::KEY_ORG_Q 与 gi/common.wesl 不一致");
+}

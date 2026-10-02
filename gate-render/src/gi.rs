@@ -128,6 +128,23 @@ const LIGHT_DIR_MIN_MAG: f32 = 0.02;
 /// 常规的逐帧变化都在其下：自动流逝 0.5 游戏小时/秒 ≈ 0.125°/帧；拖动「时刻」滑杆的常规步长同理。
 const LIGHT_STEP_MAX: f32 = 0.5;
 
+/// **面键编码原点的量化步长**（体素）。必须与 `gi/common.wesl::GI_KEY_ORG_Q` 逐字相等——
+/// 单测 `key_org_q_matches_wesl` 从 `.wesl` 源码解析并断言，改一侧漏另一侧会被测出来。
+/// 参见 [`GiGpu::key_org`] 的 CONSTRAINT（为什么要量化）。
+pub const KEY_ORG_Q: i32 = 8192;
+
+/// 一组窗口原点（chunk 单位）→ **量化后的体素编码原点**。截断整除，与 shader 侧 `i32 /` 一致。
+pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
+  let chunk = gate_voxel::CHUNK_SIZE as i32;
+  windows
+    .iter()
+    .map(|w| {
+      let o = *w * chunk;
+      glam::IVec3::new(o.x / KEY_ORG_Q, o.y / KEY_ORG_Q, o.z / KEY_ORG_Q) * KEY_ORG_Q
+    })
+    .collect()
+}
+
 /// **光照阶跃**判据：当前 key 相对上一帧 key 的"最大相对变化"（0 = 没变）。三项取 max：
 ///   · 主光色 × 强度的相对变化（分母取两侧较大者 ⇒ "从 0 亮起"不会被除零放大）；
 ///   · 天光色的相对变化（同上）；
@@ -601,6 +618,17 @@ pub struct GiGpu {
   pub prev_view_proj: Mat4,
   /// reservoir 双缓冲的换绑状态：true ⇒ 本帧 `binding 20 = b`、`21 = a`（见 `prepare_gi`）。
   pub res_flip: bool,
+  /// 每个 volume 上一帧的**量化编码原点**（`None` = 还没比过）。
+  ///
+  /// 键只有 16 bit/轴（±32768 体素 = ±655 m），而世界远超它 ⇒ shader 侧一律**减去窗口原点**再编码
+  /// （`gi/common.wesl::gi_key_org`）。窗口随相机走 ⇒ 原点一变，上一帧的键就在另一个坐标系里
+  /// ⇒ 必须把整条复用链作废。这里与 shader **逐字同源**：取 `GpuBrickMap::volume_windows`（chunk 单位），
+  /// 乘 `CHUNK_SIZE` 得到体素原点，再按 [`KEY_ORG_Q`] 量化（截断整除，与 shader 的 `i32 /` 一致）。
+  ///
+  /// CONSTRAINT: 必须量化。流式窗口是相机居中的，相机每跨一个 chunk 它就平移一格 ⇒ 不量化的话
+  /// 正常移动即 ~15 次/s 作废整链（静止之外的画面没有机会累积，表现为"一动就闪"）。量化后只在
+  /// 相机跨过 `KEY_ORG_Q` 边界时才变。步长必须与 `gi/common.wesl::GI_KEY_ORG_Q` 相等（有单测闸门）。
+  pub key_org: Option<Vec<glam::IVec3>>,
   /// 世界几何修订号的**任何上传**口径：**每次真实上传**都自增（全量重建 / 调色板 / 任何脏盒 ——
   /// 含流式挂载与卸载、逐体素编辑）。只在「太阳反弹」打开时才被用（见 `occluder_rev`）：
   /// 那时二次顶点会发阴影射线，值真的依赖**别的**体素。
@@ -723,6 +751,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     // 首帧没有「上一帧」⇒ 恒等矩阵；此时 reservoir 两块都是零（M = 0）⇒ 复用一律判无效。
     prev_view_proj: Mat4::IDENTITY,
     res_flip: false,
+    key_org: None,
     // 两者都从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`world_same` 会是真；那时 reservoir 两块
     // 都是零（M = 0 ⇒ 一律判无效），跳过与否都不会接受任何历史 ⇒ 安全。
     world_rev: 0,
@@ -813,6 +842,7 @@ fn prepare_gi(
   lighting: Option<bevy::ecs::system::Res<crate::lighting::LightingTheme>>,
   aux: Option<bevy::ecs::system::Res<crate::brickmap::dda::AuxTexCache>>,
   dirty: Option<bevy::ecs::system::Res<crate::brickmap::upload::BrickMapDirty>>,
+  brickmap: Option<bevy::ecs::system::Res<crate::brickmap::upload::GpuBrickMap>>,
   mut gi_ph: bevy::ecs::system::ResMut<GiPlaceholder>,
   mut gpu: bevy::ecs::system::ResMut<GiGpu>,
 ) {
@@ -912,10 +942,35 @@ fn prepare_gi(
   // 「分帧」不在这里：它是"**每帧**少发几条射线、记忆窗同步拉长"（`screen.wesl` 的 `share`，
   // 见 `GiSettings::share`），GI 链本身仍然每帧都跑 ⇒ 帧时间是平的，没有跳帧。
   let gi_runs = settings.enabled;
-  if gi_runs && let Some(v) = view.as_ref() {
-    gpu.prev_view_proj = v.view_proj;
-    // 本帧的 reservoir 就是在当前 `occluder_rev` 下写出的 ⇒ 记下来，供下一帧判 `world_same`。
+  if gi_runs {
+    // CONSTRAINT: `world_rev_gi` 只跟「GI 链跑没跑」走，**不能**被 `view` 的存在性门住 ——
+    // 它的语义是"本帧的 reservoir 是在哪个 `occluder_rev` 下写出的"，与相机矩阵无关。
+    // 曾经它与下面的矩阵更新共用一个 `&& view.is_some()`：只要有帧"GI 跑了但没有 view"，
+    // 它就停住，而 `occluder_rev`（太阳反弹关闭时 = `wide_rev`）在启动的全量重建 / 调色板上传时
+    // 已经推走 ⇒ `world_same` **永久为假** ⇒ `flags.z` 恒 0 ⇒ WESL 侧 `hist_ok` 恒假
+    // （`gi/screen.wesl`：`pk_ok && prev_ok && gi_u.flags.z > 0.5`）⇒ 时域累积永不成立
+    // = **永不收敛 + 逐帧闪烁**，且与相机是否静止、与任何 GI 档位都无关。
     gpu.world_rev_gi = occluder_rev;
+    // 上一帧相机矩阵只服务重投影 ⇒ 它才该跟 `view` 走（`view` 缺失时保持不动，重投影自洽）。
+    if let Some(v) = view.as_ref() {
+      gpu.prev_view_proj = v.view_proj;
+    }
+    // **面键的编码原点变了就把整条复用链作废**（shader 侧 `gi/common.wesl::gi_key_org`）：
+    // 上一帧所有键都在另一个坐标系里，留着只会让"同面判定"误配。
+    // 推 `wide_rev` 一次同时打到两处（太阳反弹关闭时 `occluder_rev == wide_rev`）：
+    // ① reservoir 历史（`flags.z` = 0，见上面的 `world_same`）② 二次顶点缓存（`ShadeKey.geom` ⇒ epoch）。
+    // 逐 volume 比（主世界 / 远场级 / 物体各有自己的窗口），任一个变过就整链作废。
+    // CONSTRAINT: 原点**已量化**（[`KEY_ORG_Q`]）—— 窗口逐 chunk 跟相机平移，不量化会每跨一格
+    // 作废一次（正常移动 ~15 次/s）⇒ 画面没有机会累积。量化后只在相机跨过 Q 边界时才作废。
+    if let Some(bm) = brickmap.as_ref() {
+      let org = key_origins_q(&bm.volume_windows);
+      if gpu.key_org.as_deref() != Some(org.as_slice()) {
+        if gpu.key_org.is_some() {
+          gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
+        }
+        gpu.key_org = Some(org);
+      }
+    }
   }
 
   // ---- BG4：uniform + reservoir 双缓冲（绑定号 0/20/21，必须显式给 entry）----

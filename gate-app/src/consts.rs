@@ -50,8 +50,17 @@ pub fn bench_fly() -> bool {
   })
 }
 
-/// 基准向前飞的速度（voxel/s）：取 [`crate::camera`] 里自动绕行那条路径的同一量级（500 v/s）。
-pub const BENCH_FLY_SPEED: f32 = 500.0;
+/// 基准向前飞的速度（voxel/s）。眼位沿一个圆以本速度平移（半径 = 本值 ÷ [`BENCH_FLY_TURN`]）。
+///
+/// WHY 取这么大（2026-10-02 调）：`fly` 的用途是**频繁触发新 chunk 装载**（"移动时掉帧"只有在真的
+/// 穿过新 chunk 时才复现）。原值 500 在 MC 城市里约 **2 chunk/s**，跑几圈就不再产生新装载 ⇒ 测的是
+/// 稳态而不是加载。**不能走直线**（地图有限），所以只能把圆放大 + 提速。
+pub const BENCH_FLY_SPEED: f32 = 2000.0;
+/// 基准绕圈的**角速度**（rad/s）：眼位绕圆的半径 = [`BENCH_FLY_SPEED`] ÷ 本值 ≈ **12.5 k 体素**
+/// （MC 地图半幅 ≈ 22 k 体素，仍在地图内）。与旧值（0.15）同量级 ⇒ 转头观感不变，只是圆大了 ~3.8×。
+pub const BENCH_FLY_TURN: f32 = 0.16;
+/// 基准**转头**的角速度（rad/s）：与绕圈独立（视线持续扫过新方向 ⇒ 主射线不断打到没加载过的地方）。
+pub const BENCH_FLY_YAW: f32 = 0.35;
 /// 第 60 帧自动刷一次笔触（无鼠标走通编辑 → 增量上传链路）
 pub const EDIT_SELFTEST: bool = false;
 

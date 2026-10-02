@@ -43,6 +43,12 @@ const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 /// 与旧写法的唯一差别在「起点落在**透射**的命中体素内部」这种 UB 情形：旧写法按自命中返回 1.0，
 /// 本写法按它后面的不透明遮挡给值 —— 起点已沿法线外推半个体素 + eps，正常路径不会走到那里。
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
+  // 归因（槽位 15）= **NEE 阴影射线数**（`consts::LOD_DIAG_WORDS` 的说明）。
+  // 1/64 采样后乘 64 计：全量是每秒数百万次**单地址**原子加 —— 见 `trace.wesl` 里 `lod_req[0]`
+  // 被打爆那条实测（GPU 全耗在争用上）。用起点+方向做哈希 ⇒ 同一方向的射线稳定同结论、不闪烁。
+  if (((u32(bitcast<i32>(origin.x * 64.0)) ^ u32(bitcast<i32>(sun_dir.x * 4096.0))) & 63u) == 0u) {
+    atomicAdd(&lod_diag[15u], 64u);
+  }
   var tint = vec3<f32>(1.0);
   // **阴影只查局部**（`GI_REACH_T` = 12 chunk = 61 m）：挡住我的东西一定在附近 —— 按本仓显示换算
   // （50 体素/米），阴影长度 = 内容高度 / tan(太阳高度角)，MC 全高 4096 体素、日高 38.4° ⇒ 约 100 m，
@@ -169,9 +175,9 @@ fn gi_bounce2_probe(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: v
   if (!h.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }
-  let k0 = gi_key0(h.voxel);
+  let k0 = gi_key0(h.voxel, h.obj_id);
   let k1 = gi_key1(h.voxel, h.face_id, h.obj_id);
-  return gi_face_shade_cached(h, org, sun_dir, sun_c, sun_bounce, epoch, k0, k1, gi_key_ok(h.voxel))
+  return gi_face_shade_cached(h, org, sun_dir, sun_c, sun_bounce, epoch, k0, k1, gi_key_ok(h.voxel, h.obj_id))
          * tint;
 }
 
@@ -211,15 +217,20 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
 /// 自失效（跨帧持久，见 `gi/common.wesl` 的「跨帧持久」段；**流式挂载与逐体素编辑不会让它变**）。
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> vec3<f32> {
+  // 归因（槽位 14）= **GI 候选射线数**（每条 = 一次 `world_trace_medium_scene` 全程遍历）。
+  // 与 `sun_transmittance` 同款 1/64 采样计数（见那里对原子争用的说明）。
+  if (((u32(bitcast<i32>(org.z * 64.0)) ^ u32(bitcast<i32>(dir.x * 4096.0))) & 63u) == 0u) {
+    atomicAdd(&lod_diag[14u], 64u);
+  }
   var tint = vec3<f32>(1.0);
   let sh = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
   // 逃逸 → 天光辐亮度（穿过介质看到的天空同样按 `tint` 吸收）；天空没有面 ⇒ 不进缓存。
   if (!sh.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }
-  let k0 = gi_key0(sh.voxel);
+  let k0 = gi_key0(sh.voxel, sh.obj_id);
   let k1 = gi_key1(sh.voxel, sh.face_id, sh.obj_id);
-  let key_ok = gi_key_ok(sh.voxel);
+  let key_ok = gi_key_ok(sh.voxel, sh.obj_id);
   var l = gi_face_shade_cached(sh, org, sun_dir, sun_c, sun_bounce, epoch, k0, k1, key_ok);
   if (bounce2 > 0.0) {
     l = l + gi_bounce2(sh, org, sun_dir, sun_c, sun_bounce, epoch, seed, bounce2);
