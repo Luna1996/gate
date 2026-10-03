@@ -74,7 +74,15 @@ pub const RT_RAY_QUERY: bool = false;
 /// （上限 = 8 个 tap）；`越界数 ÷ 命中数` = **面键越界占比**（>0 = 那些面的时域复用 / 逐面认领被
 /// 整条关掉）；`孤立数 ÷ 命中数` = **孤立 texel 占比**；`钳制数 ÷ 命中数` = **钳制命中占比**
 /// （`GI_SS_CAND_CLAMP_K` 在不在咬：太大 ⇒ K 偏小、画面偏暗；≈0 ⇒ K 偏大、尖峰没压住）。
-pub const LOD_DIAG_WORDS: usize = 23;
+///
+/// 槽位 23..26 = **世界累积层（WAL）的接管比例**（`main.wesl` 的 `DIAG_GI_WAL_*` /
+/// `DIAG_WAL_FACES` / `DIAG_WAL_NSUM`：成熟面数 / 未熟面数 / **被逐面着色的面数（分母）** /
+/// 采样面的 `Σn` 之和，都在 `dda_face_main` 里每面记一次）：不能用屏幕像素做分母 —— 显示链多数
+/// 像素走**同平面回退**（用邻居面的烘焙色），它们拿到的正是"那个面"的 WAL 值 ⇒ 按面统计才是
+/// 真实接管比例。判定用**同面邻面池化后**的权重；`Σn ÷ 面数` = 池子平均样本数（正常接近
+/// `GI_WAL_CAP_N × 池子面数`；长期只有几百 ⇒ 条目被区域失效反复打回短窗）。读数恒 0 而开关
+/// 是开的 ⇒ 掩码 / 表 / 绑定没接上（M1 的自检读数）。
+pub const LOD_DIAG_WORDS: usize = 27;
 /// **M4 ray-guided 请求通道**（`docs/editable-gigavoxel.md` §4 M4）：shader 把"射线想要细节、而那个
 /// chunk 在 GPU 上没有树块"记成一条请求（chunk 相对窗口下标 + 所需档位 + 射线类型），Rust 侧按
 /// `REPORT_PERIOD_SECS` 回读 + 合并排序后驱动流式加载。

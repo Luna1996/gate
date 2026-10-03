@@ -368,6 +368,15 @@ pub(crate) struct AuxTexCache {
   /// （10 = 导引、18 = 逐面去重表、19 = GI 写入侧），布局见 `crate::gi::gi_flatten_layout`。
   /// 与 GI 分辨率同帧重建（三件资源都是）。
   gi_flatten_bg: Option<BindGroup>,
+  /// **世界空间累积层（WAL）的面表**（`gi/wal.wesl`，@group(5) @binding(11)）：`gi::WAL_SLOTS` 槽 ×
+  /// `gi::WAL_WORDS` 个 u32（2^20 × 8 × 4 B = 32 MB）。**跨帧持久、不清零、不随 GI 分辨率重建**
+  /// （槽下标 = 世界坐标哈希，世界锚定）⇒ 只在首次创建一次；内容语义见 `gi/wal.wesl` 文件头。
+  wal: Option<Buffer>,
+  /// **区域修订表**（`gi_region_rev`，@group(5) @binding(10)，[`crate::gi::REGION_TABLE_BYTES`] = 16 KB）：
+  /// Rust（`prepare_gi`）维护并整表上传，**两侧都读它** —— `gi_main` 的 BG5（写侧掩码）与显示链的
+  /// group(5)（读侧掩码，见 `gi/wal.wesl::gi_wal_mask`）⇒ **必须是同一块**，否则两侧掩码不一致、
+  /// 世界累积的权重恒为 0。与 WAL 表同一生命周期（跨帧持久、不随 GI 分辨率重建），只在首次创建一次。
+  region_table: Option<Buffer>,
 }
 /// atrous 的 src→dst 组合表（下标 = `AuxTexCache::den_bg` 的 1..7）。
 /// 链的选取只取决于 `GI_DEN_ATROUS_ITER`（见 `DEN_ATROUS_ROUNDS`）。
@@ -390,6 +399,18 @@ impl AuxTexCache {
   /// `None` = 尚未创建（首帧，或本帧 `prepare_dda_bind_groups` 提前返回）⇒ 调用方须用占位纹理。
   pub(crate) fn gi_write_view(&self) -> Option<&TextureView> {
     self.gi_view.as_ref()
+  }
+
+  /// 世界空间累积层（WAL）的面表（`gi_main` 的 BG5 binding 11 与显示链的 group(5) binding 11 共用）。
+  /// `None` = 尚未创建 ⇒ 调用方须用占位 buffer（shader 侧 `gi_wal_slot` 的 `arrayLength` 守卫会跳过）。
+  pub(crate) fn wal_buffer(&self) -> Option<&Buffer> {
+    self.wal.as_ref()
+  }
+
+  /// 区域修订表（16 KB，`gi_main` 的 BG5 binding 10 = 写侧掩码、显示链的 group(5) binding 10 = 读侧掩码）。
+  /// `None` = 尚未创建 ⇒ 调用方须用占位 buffer（shader 侧 `gi_local_rev` 会返回 0）。
+  pub(crate) fn region_buffer(&self) -> Option<&Buffer> {
+    self.region_table.as_ref()
   }
 
   /// 屏幕空间 reservoir 的双缓冲（BG4 binding 20/21 用；`prepare_gi` 决定哪块是「本帧写」）。
@@ -698,6 +719,32 @@ pub(crate) fn init_dda_pipelines(
       // read-write，否则 wgpu 报绑定类型不匹配。
       BindGroupLayoutEntry {
         binding: 8,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      // 10 = 区域修订表：显示链要用它算**读侧**失效掩码（`gi/wal.wesl::gi_wal_mask` 折进
+      // `gi_local_rev`）⇒ 与 `gi_main` 的 BG5 **必须是同一块 buffer**（否则掩码对不上、
+      // 世界累积权重恒 0）。WESL 里是 `var<storage, read>`（只有 Rust 写）⇒ read_only = true。
+      BindGroupLayoutEntry {
+        binding: 10,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      // 11 = 世界空间累积层（WAL）的面表：`gi_main`（认领者合并 + 写入侧注入）要为它写、
+      // 显示链（`dda_face_main` 的诊断池化）只读它，
+      // 但声明是 `array<atomic<u32>>`（`gi_main` 的认领者要写）⇒ 同 8，layout 必须 read-write。
+      BindGroupLayoutEntry {
+        binding: 11,
         visibility: ShaderStages::COMPUTE,
         ty: BindingType::Buffer {
           ty: BufferBindingType::Storage { read_only: false },
@@ -1150,6 +1197,29 @@ pub(crate) fn prepare_dda_bind_groups(
       beam_cache.gi_dn[i] = Some(t);
     }
   }
+  // ---- 世界空间累积层（WAL）的面表：**不随 GI 分辨率重建**（槽下标 = 世界坐标哈希）⇒
+  // 只建一次、跨帧持久、不清零（wgpu 新建 buffer 自动归零 ⇒ 首帧全表无条目，显示端权重 0
+  // ⇒ 无缝地完全走旧链）。
+  if beam_cache.wal.is_none() {
+    beam_cache.wal = Some(render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_gi_wal"),
+      size: crate::gi::WAL_SLOTS * crate::gi::WAL_WORDS * 4,
+      usage: BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    }));
+  }
+  // ---- 区域修订表：**写侧（`gi_main` 的 BG5）与读侧（显示链）必须绑同一块** ⇒ buffer 的归属放这里
+  // （与 WAL 表同一生命周期：跨帧持久、不随 GI 分辨率重建），内容由 `gi.rs::prepare_gi` 整表上传。
+  // 初值全 0 就是正确的初始状态（所有区域修订号 = 0）。
+  if beam_cache.region_table.is_none() {
+    beam_cache.region_table = Some(render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_gi_region_rev"),
+      size: crate::gi::REGION_TABLE_BYTES,
+      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    }));
+  }
+
   // clone 成句柄（`TextureView` 内部是 Arc）：之后还要可变借 `beam_cache` 写入 bind group 字段。
   let gi_view = beam_cache.gi_view.as_ref().expect("gi view not created").clone();
 
@@ -1235,6 +1305,14 @@ pub(crate) fn prepare_dda_bind_groups(
   let gi_guide = beam_cache.gi_guide.as_ref().expect("降噪导引 buffer 未创建").clone();
   // binding 8 = 帧内逐面去重表（`dda_main` 查表 / `dda_face_main` 写着色）；与本函数上方的 GI 资源同帧创建。
   let face_slots = beam_cache.face_slots.as_ref().expect("逐面去重表 buffer 未创建").clone();
+  // binding 11 = 世界空间累积层（WAL）的面表（显示链只读；写者在 `gi_main`）。
+  let wal = beam_cache.wal.as_ref().expect("WAL 表 buffer 未创建").clone();
+  // binding 10 = 区域修订表（读侧失效掩码；与 `gi_main` 的 BG5 绑同一块，见本函数上方的创建）。
+  let region_table = beam_cache
+    .region_table
+    .as_ref()
+    .expect("区域修订表 buffer 未创建")
+    .clone();
   let gi_read_bg = render_device.create_bind_group(
     None,
     &gi_read_layout,
@@ -1242,6 +1320,8 @@ pub(crate) fn prepare_dda_bind_groups(
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
       BindGroupEntry { binding: 6, resource: gi_guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
+      BindGroupEntry { binding: 10, resource: region_table.as_entire_binding() },
+      BindGroupEntry { binding: 11, resource: wal.as_entire_binding() },
     ],
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);

@@ -387,6 +387,13 @@ fn register_callbacks(world: &mut World) {
           gi.sun_bounce = *on;
           info!("GI 二次顶点太阳反弹 → {}", if *on { "on" } else { "off" });
         }
+        // 世界累积层（WAL，M1）：显示端按"可见体素面"的持久条目成熟度与旧链 GI 混合
+        // （没有重投影/时域历史 ⇒ 拖影、流光按构造消失；零额外射线）。设计见
+        // `~/.commandcode/plans/gi-world-space-accumulation.md`。
+        ("render/gi/wal", MenuAction::Toggle(on)) => {
+          gi.wal = *on;
+          info!("GI 世界累积（WAL）→ {}", if *on { "on" } else { "off" });
+        }
         // 「二次弹射」档（菜单「渲染/光照/二次弹射」）：在二次顶点上再发**一条**余弦射线，把"多一跳"
         // 的间接光（互反射 / 彩色渗色）叠回去 —— 关掉时 GI 只算一次弹射。
         // 档位 → uniform `gi_u.misc.w` 里的**倍数**（0 = 关、4 = 稀疏、1 = 全）：WESL 侧按它的**倒数**

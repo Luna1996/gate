@@ -1,10 +1,11 @@
 import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_unkey_voxel, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
+import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_SUN, FACE_W_TEXEL, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_unkey_voxel, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
+import package::gi::wal::{gi_wal_pool, GI_WAL_MATURE_N};
 import package::trace::{diag_sampled, make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
@@ -308,6 +309,35 @@ fn write_output(coord: vec2<i32>, col: vec3<f32>) {
   textureStore(out_tex, coord, vec4<f32>(linear_to_srgb(exposed), 1.0));
 }
 
+/// **覆盖空档的邻域搜索半径**（GI texel）：`gi_upsample_joint` 的 2×2 与"最近 texel"两档都失败时，
+/// 在最近 texel 周围 `(2R+1)²` 里找数据（先同面、再任何有效 texel）。见该函数里的 WHY。
+const GI_UPSAMPLE_HOLE_R: i32 = 3;
+
+/// **小面的"跨面联合池化"半径**（`dda_face_main`，GI texel）—— 2026-10-03 第九轮，
+/// 针对用户实拍的"自发光体素周围网格状光纹"。
+///
+/// **症状与隔离**（用户实测，各切一个菜单开关）：暗场里一个自发光方块周围，落光呈**固定格子**
+/// （单元格 = 一个可见体素面）。**GI 分辨率 1/1 ⇒ 完全消失**（不是变小）；**降噪质量关 ⇒ 完全消失**；
+/// **WAL 关 ⇒ 更明显**（面表池化在压它，但只压 ~1.6×）。三条合起来指向：**每个面的估计噪声**
+/// 被降噪链稳定成一张固定格子 —— 1/1 时一个可见面跨 ~8 个 texel，等于自动多平均 8 倍 ⇒ 看不见了。
+///
+/// **量级对得上**：1/4 档下一个可见面通常只覆盖 **1 个 GI texel** ⇒ `dda_face_accum` 的"面均值"
+/// 只有**一个样本**；而小而亮的发光体在半球采样下命中率 p ≈ 1%~8% ⇒ 单 texel 的相对 σ =
+/// √((1−p)/(p·M))，M ≈ 256 个窗口样本时是 **5%~7%** —— 暗场里就是绕着发光体的那张格子。
+///
+/// **修法**：在本面的**代表 texel**（= 本 pass 的认领者）周围 `(2R+1)²` 里，用**全管线同一个判据**
+/// `gi_same_surface` 把**共面**的 texel 值平均进来 —— 与 `gi_wal_*` 的池化是同一条道理
+/// （"共面邻面物理上几乎是同一个积分"，且同样**不跨台阶/棱边**），只是作用在**降噪后的场**上。
+/// R=3（49 tap，实测多数面上可接受 ~40 个）⇒ 这类残差 ÷≈6。
+/// **成本**：只在 `gi_n ≤ GI_FACE_POOL_MIN_N` 的面上跑一次（每面 49 次导引读 + 纹理取值），
+/// 按 1/4 档 ~4.5 万个面算 ≈ +0.1~0.3 ms/帧，**不加任何射线、不加 pass**。
+const GI_FACE_POOL_R: i32 = 3;
+/// 触发池化的**面均值样本数**上限：`FACE_W_GI_N` 数的是"这个面在 GI 网格上占几个 texel"。
+/// 取 4：1/4 档下多数可见面是 1 个 texel（值 = 单样本）、2 档下 2~4 个 —— 这些"面均值"没有
+/// 统计意义，池化是纯收益；更大的面**自己就在平均**（跨 texel 的无偏均值，正是设计要的
+/// 「面内恒定」），不该再被池化糊掉。
+const GI_FACE_POOL_MIN_N: u32 = 4u;
+
 /// **几何感知上采样**（joint bilateral）—— `dda_main` 取 GI 的唯一入口。
 /// GI 跑在低于全分辨率的网格上（`GiSettings.gi_div` = 1 / 2 / 4），纯双线性会把**几何边界
 /// 两侧**的值混在一起（棱边/墙角一侧的亮 GI 渗到另一侧），而这正是「GI 低于全分辨率」唯一
@@ -316,11 +346,15 @@ fn write_output(coord: vec2<i32>, col: vec3<f32>) {
 /// （`gi_same_surface`：平面归属靠键 ⇒ 薄板另一侧 / 隔一格的平行面不可能被接受；
 /// 相似度靠**存的着色法线** ⇒ 凸棱上那一段倾斜的法线与本像素比仍在容差内 ⇒ 与着色一致地连起来），
 /// 按双线性权重加权平均。退化顺序：一个都没接受 ⇒ **最近的 texel**（它至少在几何上覆盖本像素，
-/// 比双线性更不容易渗色）⇒ 最近 texel 无有效数据 ⇒ 传进来的纯双线性结果。
+/// 比双线性更不容易渗色）⇒ 最近 texel 无有效数据 ⇒ **`GI_UPSAMPLE_HOLE_R` 邻域搜索**
+/// （先找同一个面的最近 texel，再退到任何有效 texel）⇒ 都没有 ⇒ 传进来的纯双线性结果。
 /// 有效性判据 = 导引的「键非零」（与降噪侧一致）；最近 texel 那一档直接用纹理的 `a`（那里不插值，
 /// `a` 恒是 0/1）。
 /// `n` = 本像素的着色法线（`dda_main` 自己那条）—— 相似度那一条用它。
-/// 代价：每全分辨率像素 4 次导引读（每次 3 word），**不加任何射线、不加 pass**。
+/// 返回值 `a` = **"本函数额外找到了数据"**（0/1）：调用方用 `cov = max(双线性 a, 本值)` ——
+/// 只有邻域搜索那一档会给出 1（前面的档都由调用方的双线性 `a` 覆盖）。
+/// 代价：每全分辨率像素 4 次导引读（每次 3 word）；**只有前两档都失败**的像素才付邻域搜索
+/// （最多 `(2R+1)²` 次导引读），**不加任何射线、不加 pass**。
 fn gi_upsample_joint(
   guv: vec2<f32>,
   gsize: vec2<u32>,
@@ -328,7 +362,7 @@ fn gi_upsample_joint(
   k1: u32,
   n: vec3<f32>,
   fallback: vec3<f32>,
-) -> vec3<f32> {
+) -> vec4<f32> {
   let g = guv * vec2<f32>(f32(gsize.x), f32(gsize.y));
   let base = floor(g - vec2<f32>(0.5));
   let f = g - vec2<f32>(0.5) - base;
@@ -350,14 +384,63 @@ fn gi_upsample_joint(
       wsum = wsum + bw;
     }
   }
-  if (wsum > 0.0) { return acc / wsum; }
+  if (wsum > 0.0) { return vec4<f32>(acc / wsum, 0.0); }
   // 一个同面的 texel 都没有（凸角 / 贴天空的轮廓）：退回最近的 texel。
   let nc = clamp(base + vec2<f32>(select(0.0, 1.0, f.x >= 0.5), select(0.0, 1.0, f.y >= 0.5)),
                  vec2<f32>(0.0), vec2<f32>(f32(gsize.x) - 1.0, f32(gsize.y) - 1.0));
-  let sn = textureLoad(gi_tex, vec2<i32>(nc), 0);
-  if (sn.a > 0.5) { return sn.rgb; }
-  return fallback;
+  let nci = vec2<i32>(nc);
+  let sn = textureLoad(gi_tex, nci, 0);
+  if (sn.a > 0.5) { return vec4<f32>(sn.rgb, 0.0); }
+  // ---- 邻域搜索（`GI_UPSAMPLE_HOLE_R`）----
+  // 走到这里 = **本像素的 4 个覆盖 texel 一个有效的都没有**（含"最近 texel 是天空"）。
+  // 直接返回 `fallback` 会让这一格 **GI = 0 且 cov = 0**（只剩全额天光兜底）⇒ 背光面上是一块
+  // **黑洞**：1/4 档下一个 texel = 4×4 像素，而**远景细几何 / 薄板 / 掠射面**在自己的 4 个 texel 上
+  // 常常一个都没命中（覆盖它的是天空或别的面）。实测症状（2026-10-03 第八轮用户配图）：
+  // "远处出现 GI 黑洞"（远景天际线的背光面上一块块暗斑）。
+  // 半径 3（±3 texel = ±12 屏幕像素）足以接上同一个面上的邻域证据；判据仍是**同一个**
+  // `gi_same_surface` ⇒ 不跨几何。先找同面（最近者），找不到才退到"任何有效 texel"（宁可借错面
+  // 的一点光，也不要黑洞 —— 借来的值仍受天光地板与后续降噪约束）。
+  var best_ok = false;
+  var best_d2 = 0;
+  var best = vec3<f32>(0.0);
+  var any_ok = false;
+  var any_d2 = 0;
+  var any = vec3<f32>(0.0);
+  for (var dy: i32 = -GI_UPSAMPLE_HOLE_R; dy <= GI_UPSAMPLE_HOLE_R; dy = dy + 1) {
+    for (var dx: i32 = -GI_UPSAMPLE_HOLE_R; dx <= GI_UPSAMPLE_HOLE_R; dx = dx + 1) {
+      let c = nci + vec2<i32>(dx, dy);
+      if (c.x < 0 || c.y < 0 || c.x >= i32(gsize.x) || c.y >= i32(gsize.y)) { continue; }
+      let tb = (u32(c.y) * gsize.x + u32(c.x)) * GI_DEN_GUIDE_WORDS;
+      let gk0 = gi_guide_out[tb + GI_DEN_G_KEY0];
+      let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
+      if ((gk0 | gk1) == 0u) { continue; }
+      let d2 = dx * dx + dy * dy;
+      if (!any_ok || d2 < any_d2) {
+        any_ok = true;
+        any_d2 = d2;
+        any = textureLoad(gi_tex, c, 0).rgb;
+      }
+      if (gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)
+          && (!best_ok || d2 < best_d2)) {
+        best_ok = true;
+        best_d2 = d2;
+        best = textureLoad(gi_tex, c, 0).rgb;
+      }
+    }
+  }
+  if (best_ok) { return vec4<f32>(best, 1.0); }
+  if (any_ok) { return vec4<f32>(any, 1.0); }
+  return vec4<f32>(fallback, 0.0);
 }
+
+// ---- WAL（世界空间累积层）的注入点在**写侧**，不在显示侧（2026-10-03 第八轮）----
+// 这里曾经是 `gi_wal_blend`：在显示端把降噪结果**整个替换**成面表的池化值。那等于把降噪链的
+// **空间滤波**（`gi_face_flatten` 的逐面平均 + 5 轮 atrous）白算 —— WAL 自己的池化只有 7×7 个面
+// （≈38 屏幕像素，且约一半 tap 是空的：没被认领过的面没有条目），残余噪声在暗场里就是**固定的
+// 斑纹**（世界锚定 ⇒ 等它"收敛"不会消失）。现在改成：`gi/screen.wesl::gi_ss_main` 在写 `gi_out`
+// 时按成熟度把面表值混进本 texel 的估计（连同 `FACE_W_RAW*` 合并量一起），随后照常走整条降噪链。
+// ⚠️ **不要把它加回显示端**（重复注入 + 又绕开 atrous）。成熟度的分子/分母（`Σn`、`GI_WAL_MATURE_N`）
+// 与失效语义仍全在 `gi/wal.wesl`。
 
 /// 本面的 GI 输入。
 /// `use_face = true` ⇒ 走**逐面均值**（认领路径：`dda_face_accum` 已把该面所有 GI texel 的值累加进
@@ -522,9 +605,21 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
 /// `n_hint` / `n_hint_ok`：调用方**已经算好**的着色法线（`dda_face_main` 从降噪导引里拿 —— 那里存的
 /// 就是同一个键的 `voxel_normal`，逐位相同）⇒ 省掉 `voxel_normal` 的 4 次邻域点查询。
 /// `dda_main` 传 `false`（它没有可直接复用的同键法线）。
+///
+/// `sun_io`：太阳可见性的**借用口**（只有「覆盖 texel 回退」路径会传借用值，见 `GI_FACE_FALLBACK`）。
+/// 入参 ≥ 0 ⇒ **直接采用、不发射阴影射线**（该值由 `dda_face_main` 逐面烘焙进 `FACE_W_SUN`）；
+/// 入参 < 0 ⇒ 按原路自算（`ndl > 0` 且「直光阴影」开 ⇒ 一条 `sun_transmittance`）。
+/// 出口恒是**本次着色实际用到**的值（早退分支写 0：原色直出 / 天空没有太阳量可报）——
+/// `dda_face_main` 把它烘焙进槽，回退路径据此跳过逐像素的阴影射线。
+/// 借用是**有意为之的近似**：回退的准入已保证被借的面与本像素同平面 / 同逐位着色法线 / 同材质、
+/// 且屏距 ≤ 一个 GI texel（细节在该尺度下本来就是亚像素的）——与"整条着色都借用"的旧口径相比，
+/// 借用面从"整色"缩到"只有射线量"，材质 / 法线 / 视角 / GI / 自发光全部逐像素。
 fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frustum_length: f32,
               gi_in: GiInput, sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>,
-              n_hint: vec3<f32>, n_hint_ok: bool) -> vec3<f32> {
+              n_hint: vec3<f32>, n_hint_ok: bool, sun_io: ptr<function, f32>) -> vec3<f32> {
+  // 先把入参读成局部量（`sun_io` 同时是出口，见函数头），再把出口清零：早退分支没有太阳量可报。
+  let sun_hint = *sun_io;
+  *sun_io = 0.0;
   var best = first;
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
@@ -592,10 +687,13 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       } else if (gi_u.misc.x > 0.5) {
         let fs = textureSampleLevel(gi_tex, light_samp, gi_in.uv, 0.0);
         let fgw = max(fs.a, 1e-4);
-        f_gi = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), fk0, fk1, fnn,
-                                 fs.rgb / fgw);
-        f_cov = fs.a / fgw;
+        let fup = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), fk0, fk1, fnn,
+                                    fs.rgb / fgw);
+        f_gi = fup.rgb;
+        f_cov = max(fs.a / fgw, fup.a);
       }
+      // WAL：不在这里混 —— 面表的值已在**写侧**注入 `gi_out`（见上面的说明段），这里读到的
+      // `gi_tex` 已经含它（且已过 atrous）。
       let f_amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, f_cov);
       glass_col = brdf_reflected(fm, fnn, fv,
                                  SurfaceLight(sun_dir, sun_c, f_sun, f_amb, f_gi))
@@ -668,7 +766,12 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = 0.0;
-    if (ndl > 0.0) {
+    if (sun_hint >= 0.0) {
+      // **借用**（覆盖 texel 回退路径）：采用被借面已算好的太阳可见性，**不发射线** ——
+      // 阴影射线是逐像素内联的最大单项（实测 5 ms 量级），而回退存在的价值就是省掉它。
+      // 与本像素自洽：准入保证同平面 / 同逐位着色法线（⇒ 同一个 `ndl`）/ 同材质。
+      sun = sun_hint;
+    } else if (ndl > 0.0) {
       // 「基础/直光阴影」清零 ⇒ **不发射阴影射线**（省每像素 1 条 DDA），`sun = 1` = 太阳照旧直射、
       // 只是没有明暗遮挡。**必须用真分支**：`select` 会把两侧都算了（射线照发，白花钱）。
       sun = 1.0;
@@ -676,6 +779,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         sun = sun_transmittance(p_voxel + n * n_off, sun_dir, best.voxel, best.obj_id);
       }
     }
+    // 出口 = 本次实际用到的值（`dda_face_main` 烘焙它、回退路径借用它；见函数头）。
+    *sun_io = sun;
     let gi_on = gi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     var cov = 0.0;
@@ -694,9 +799,14 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       // GI 值走**几何感知上采样**（纯双线性作 fallback）：不接受与采样点不同「面」的 texel
       // ⇒ 棱边 / 墙角不渗色、不糊（相似度那一条用采样点的着色法线 `n`）。cov 不参与
       // （它是 0/1 覆盖度，双线性归一化即可）。
-      gi = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n, s.rgb / gw);
-      cov = s.a / gw;
+      let up = gi_upsample_joint(gi_in.uv, vec2<u32>(textureDimensions(gi_tex)), k0, k1, n,
+                                 s.rgb / gw);
+      gi = up.rgb;
+      // `up.a` = 邻域搜索补到的数据（见 `gi_upsample_joint` 的退化顺序）⇒ 那些像素不再是"无数据"。
+      cov = max(s.a / gw, up.a);
     }
+    // WAL：不在这里混 —— 面表的值已在**写侧**注入 `gi_out`（见上面的说明段），这里读到的
+    // `gi_tex` 已经含它且已过 `gi_face_flatten` / 时域 / atrous。
     // cov 由缓存给出（命中 = 1、没有数据 = 0）：有数据处天光只占少量、无数据处天光兜底。
     // mix 实参顺序必须是 `mix(1.0, GI_AMBIENT_FLOOR, cov)`（cov = 1 → FLOOR）。
     let amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, cov);
@@ -798,10 +908,20 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
 
 /// **「覆盖 texel 回退」总开关（A/B 自检用）**：`1u` = 开（仓库默认）、`0u` = 关（回到逐像素内联口径）。
 ///
-/// WHY 需要它：这条回退改变的是**远场小面**（一个可见体素面 < 一个 GI texel，即屏幕上 ≤ 2×2 像素的
-/// 细节）的颜色来源 —— 从「逐像素各自内联 `shade_face`」换成「该像素所在 GI texel 命中的那个面的
-/// 逐面着色结果」。近中景（面比 texel 大的那些像素）走的是精确键，**一个像素都不受影响**。
-/// 关掉它即回到"只有精确键命中才用槽色、其余全部内联"的行为（逐位一致）⇒ 它是 A/B 与回退的开关。
+/// WHY 需要它：这条回退改变的是**远场小面**（一个可见体素面 < 一个 GI texel）的颜色来源 ——
+/// `0u` 时那些像素各自内联整条 `shade_face`（含阴影射线 + 材质 + 法线 + GI 采样，实测这是主 pass
+/// 的最大单项）；`1u` 时用「该像素所在 GI texel 命中的那个面」的**逐面量**把这条重复计算接回去。
+/// 近中景（面比 texel 大的那些像素）走的是精确键，**一个像素都不受影响**。
+///
+/// ⚠️ **`1u` 的借用面只保留"逐面射线量"**：太阳可见性借被借面的（`FACE_W_SUN`，见 `shade_face` 的
+/// `sun_io`），材质 / 着色法线 / 视角 / GI / 自发光 / 反射全部**逐像素**重算。
+/// **为什么不能再借整条颜色**：借整色 = 这一格（1/4 档 = 4×4 屏幕像素）的像素整块显示"那个面"的
+/// 材质色，而那是**另一个体素**的面（逐体素纹理量化 ⇒ 相邻面本来就不同色）⇒ 远场整片成为
+/// **屏幕对齐的小方块**、与体素格无关（2026-10-03 用户报的"GI 没有逐体素着色"）。
+/// ⚠️ **玻璃（介质）也没有例外**：曾经给它留过"整色借用"（理由是 `trace_glass` 的逐面光路状态机
+/// 逐像素重算更贵），结果是**水面**在掠射角下整片变成屏幕对齐的方块、倒影/桥影被抹平（同日第二次
+/// 用户实测）。现在一律逐像素重算 —— 代价与"GI 关掉"时同一口径（见 `dda_main` 的回退段）。
+/// 关掉它（`0u`）即回到"只有精确键命中才用槽色、其余全部内联"的行为（逐位一致）。
 const GI_FACE_FALLBACK: u32 = 1u;
 
 /// **逐面查表覆盖计数的槽位**（`lod_diag` 的 3..9；`trace.wesl::DIAG_*` 的 0..2 是叶级 LOD 的）。
@@ -811,7 +931,7 @@ const GI_FACE_FALLBACK: u32 = 1u;
 /// 回退无键 9.5% / 回退槽失配 4.6% / 内联 14% —— 就是这组数字定下了"认领粒度实际是 GI texel"与
 /// "内联的唯一来源是回退失败"两条结论（见 `docs/editable-gigavoxel.md` §10 第五轮）。
 const DIAG_FACE_EXACT: u32 = 3u;    // 精确键命中
-const DIAG_FACE_FB_HIT: u32 = 4u;   // 覆盖 texel 回退命中
+const DIAG_FACE_FB_HIT: u32 = 4u;   // 覆盖 texel 回退命中（逐像素重着色 + 借太阳可见性）
 const DIAG_FACE_FB_NOKEY: u32 = 5u; // 回退不可用：无主命中 / 异平面 / 异着色法线 / 异材质
 const DIAG_FACE_FB_MISS: u32 = 6u;  // 回退失败：键有、槽没认领 / 键不符（撞键）
 const DIAG_FACE_INLINE: u32 = 7u;   // 命中像素最终走内联着色
@@ -823,6 +943,18 @@ const DIAG_MAIN_RAYS: u32 = 9u;     // 采样到的主射线总数（分母）
 const DIAG_MAIN_NEAR: u32 = 10u;    // 命中主世界（近场）⇒ 代价在 chunk 内下钻
 const DIAG_MAIN_FAR: u32 = 11u;     // 命中远场级 / 物体 ⇒ 代价在远场遍历
 const DIAG_MAIN_SKY: u32 = 12u;     // 未命中（天空）⇒ 代价在空区步进
+// 世界累积层（WAL）的**接管比例**（槽位 23..26）：分母 = 槽位 25（本帧**被逐面着色**的面数，
+// `dda_face_main` 每个面记一次、1/64 票）—— 不能用屏幕像素做分母：显示链的像素要么取某个面的
+// **烘焙色**（精确键：GI 已按那个面取 WAL），要么按**本像素自己的面**逐像素着色（覆盖回退 / 内联：
+// 读到的是该面位置上的 GI 场，WAL 已在写侧按面注入）⇒ 两种情况都是"面级"的量 ⇒ 按面统计才是
+// 真实接管比例。
+// 判定 = **同面邻面池化后**的权重（成熟 = 池子样本数 Σn ≥ `GI_WAL_MATURE_N`、未熟 = 按比例渐入）。
+// 槽位 26 = 采样面的 `Σn` 之和 ⇒ 平均 Σn 是"池子有多热"的量具：正常应接近
+// `GI_WAL_CAP_N × 池子面数`（几千）；若长期只有几百 ⇒ 条目被区域失效反复打回短窗。
+const DIAG_GI_WAL_MATURE: u32 = 23u;
+const DIAG_GI_WAL_FRESH: u32 = 24u;
+const DIAG_WAL_FACES: u32 = 25u;
+const DIAG_WAL_NSUM: u32 = 26u;
 
 /// **本像素所在那个 GI texel 的主命中面键 + 该 texel 的导引字址**（返回值 = 该 texel 有主命中）。
 /// 下标口径与 `shade_face` 里 `gi_div = 1` 的法线复用**逐字相同**（`floor(uv · gi_size)`，
@@ -897,20 +1029,24 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             world_cfg_primary(t_min, 3u));
 
   // ---- 逐面去重查表（`face_slots`：认领在 `gi/screen.wesl`、计算在 `dda_face_main`）----
-  // 两级，准入都是「**同一个面**」，但口径两级不同：
-  //   ① **精确键** = 本像素自己的可见面（体素 + 面号 + 物体）**逐位相等**（认领者算的就是它）。
+  // 两级，准入都是「**同一个面**」，但两级拿到的**东西**不同：
+  //   ① **精确键** = 本像素自己的可见面（体素 + 面号 + 物体）**逐位相等**（认领者算的就是它）⇒
+  //      直接取它的**整条烘焙色**（材质 / 阴影 / GI / 自发光全是这个面的）。
   //   ② **覆盖 texel 回退**（`GI_FACE_FALLBACK`）= 本像素**所在那个 GI texel** 命中的面，
-  //      准入 = **同平面 + 同（逐位）着色法线 + 同材质**（见下面回退段）。
+  //      准入 = **同平面 + 同（逐位）着色法线 + 同材质**（见下面回退段）。它**只借该面的太阳可见性**
+  //      （`FACE_W_SUN`）、**其余全部逐像素重算** —— 见 `GI_FACE_FALLBACK` 的 ⚠️ 段。
   // 两级都查不到（未认领 / 撞键 / GI 关 / 键越界 / 覆盖 texel 异面或异法线或异材质）⇒ 内联着色。
   //
   // WHY ②必须存在：认领发生在 **GI 分辨率**（`gi_main` 每个 texel 抢自己命中的那个面），而消费者是
   // **全分辨率**像素。一个面上屏幕 ≤ 一个 texel（远场小面 / 细杆 / 薄板边缘）时，它只可能被"包含它的
   // 那个 texel"认领，而它自己的**体素**在 1/2 档下与相邻 2×2 像素里的邻居不是同一个键 ⇒ 精确键对不上
   // ⇒ 从前那些像素**每个都内联整条 `shade_face`**（含阴影射线 + 材质 + 法线 + GI 采样），实测这是
-  // 主 pass 的最大单项。回退用"覆盖 texel 的面"接住它们：那是**同一套逐面着色**（同一个槽、同一个
-  // '认领者算一次'的值），代价 = 一次导引读 + 一次槽读。
+  // 主 pass 的最大单项。回退借"覆盖 texel 的面"的**逐面射线量**（太阳可见性，逐面只算一次）接住
+  // 它们，其余仍逐像素 ⇒ 省掉的是**每条候选都发一条阴影射线**，而不是把整条着色也借走。
   //
-  // ⚠️ 回退借的是**另一个体素**的 baked 颜色 ⇒ 「色相同」必须显式判足三条，少一条就出
+  // ⚠️ 回退借的是**另一个体素**的太阳可见性（回退唯一的借用量）⇒ "借得对"必须显式判足三条 ——
+  // 三条说的是同一件事：**借来的阴影必须与本像素自洽**（同平面 ⇒ 同一个朝向；同着色法线 ⇒
+  // 同一个 `ndl`、albedo 的三轴权重也一致；同材质 ⇒ 同一条 BRDF）。少一条就出
   // **零散的单体素面大小的明暗点**（实测根因：`隐式法相` 清零后斑点消失 ⇒ 载体是**着色法线**）：
   //   · **同平面**（`gi_den_same_plane`）：挡住跨朝向（台阶顶面 / 薄板背面 / 玻璃后面的实心墙）；
   //   · **同着色法线**（导引里的 `GI_DEN_G_NRM` 与本像素 `gi_pack_dir(voxel_normal)` **逐位相等**）：
@@ -960,10 +1096,12 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gi_key_ok(first.voxel, first.obj_id)) {
       var ok = false;
       var pal_exact = 0u;
+      var sun_exact = 0u;
       let c = face_slot_color(
         gi_key0(first.voxel, first.obj_id),
         gi_key1(first.voxel, first.face_id, first.obj_id),
         &pal_exact,
+        &sun_exact,
         &ok);
       if (ok) {
         col = c;
@@ -979,16 +1117,32 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       var gb_cov = 0u;
       var ok2 = false;
       var pal2 = 0u;
+      var sun2 = 0u;
       var c2 = vec3<f32>(0.0);
       // 三条准入见文件头部那段 ⚠️（同平面 / 同逐位着色法线 / 同材质）。
       if (gi_cover_key(px, &gk, &gb_cov)
           && gi_den_same_plane(gk.x, gk.y, gi_key0(first.voxel, first.obj_id),
                                gi_key1(first.voxel, first.face_id, first.obj_id))
           && (!need_n || gi_guide_out[gb_cov + GI_DEN_G_NRM] == n_own_word)) {
-        c2 = face_slot_color(gk.x, gk.y, &pal2, &ok2);
+        c2 = face_slot_color(gk.x, gk.y, &pal2, &sun2, &ok2);
       }
       if (ok2 && pal2 == first.pal) {
-        col = c2;
+        // **逐像素重着色，只借"太阳可见性"**（`FACE_W_SUN`，`dda_face_main` 烘焙）。
+        // 这是"逐体素着色"的前提：材质（逐体素纹理量化）/ 着色法线 / 视角 / GI（逐面 WAL 或
+        // 逐像素上采样）/ 自发光 / 反射全部按**本像素自己的面**算 —— 旧口径借整条颜色时，
+        // 这一格的像素整块显示"那个面"的颜色，而那张网格是**屏幕对齐**的 ⇒ 远场 / 掠射面
+        // 看起来就是一片"平行于屏幕的大正方形"、与体素格无关。
+        // ⚠️ **玻璃（介质）没有例外**（2026-10-03 第八轮撤掉的例外）：水面这类大面积介质在掠射
+        // 角下几乎每个像素都过不了精确键 ⇒ 旧例外把它们整片变成"邻居水面面的颜色"（同平面 /
+        // 同法线 / 同材质对一张水平面恒成立）⇒ 倒影与桥影被抹成屏幕对齐的方块。
+        // 逐像素跑 `trace_glass`（最多 `GLASS_MAX_BOUNCE` 次界面事件）确实更贵，但**与"GI 关掉"
+        // 时同一口径** —— 那条路径本来就每个像素跑一遍 ⇒ 本项的代价上限 = 那些像素在 GI 关掉时
+        // 的代价，不会比关掉 GI 更贵；不透明面仍只借阴影（逐面一次，见 `shade_face` 的 `sun_io`）。
+        // （`c2` / `face_slot_color` 的色只在**精确键**那条路消费；这里只需要 `pal` 与 `sun`。）
+        var sun_io = bitcast<f32>(sun2);
+        col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
+                         GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
+                         n_own, need_n, &sun_io);
         cached = true;
         if (diag_on) { atomicAdd(&lod_diag[DIAG_FACE_FB_HIT], 1u); }
       } else {
@@ -1008,9 +1162,11 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   if (!cached) {
     // `n_hint` = 上面已经算好的本像素自己的着色法线（`need_n` = false 时留空 ⇒ 函数内按原路取）。
+    // `sun_io` 传 -1 = **不借用**：逐像素自算（发射阴影射线）——这是"完全逐像素"的那条路。
+    var sun_io = -1.0;
     col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                      GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
-                     n_own, need_n);
+                     n_own, need_n, &sun_io);
   }
   // ---- 光柱（godray，`volumetric.wesl`）：**线性 HDR 相加，必须在 `write_output` 的曝光之前** ----
   // 三步都是确定性取值（掩码 1 条主射线 → 两趟径向模糊）⇒ **没有噪声、没有滞后**；
@@ -1155,6 +1311,23 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let fnw = face_normal_world(gg, face_id);
   let first = WorldHit(true, 0.0, p_voxel, atomicLoad(&face_slots[fe + FACE_W_PAL]),
                        fnw, face_id, voxel, obj_id, gg.palette_base);
+  // ---- WAL 接管计数（槽位 23..26，1/64 个**面**）：分母 = 本帧被逐面着色的面数。
+  // 判据与 `gi/screen.wesl` 的注入点（`gi_wal_sample` 的成熟度权重）**同一次池化**、同一个公式
+  // ⇒ 读数就是"多少面从面表拿到了值、池子有多热"；开关打开却恒 0 ⇒ 掩码 / 表 / 绑定没接上。
+  if (diag_sampled(texel)) {
+    atomicAdd(&lod_diag[DIAG_WAL_FACES], 1u);
+    if (gi_u.params.y > 0.5) {
+      let wp = gi_wal_pool(voxel, obj_id, first.pal, k1);
+      if (wp.w > 0.0) {
+        atomicAdd(&lod_diag[DIAG_WAL_NSUM], u32(min(wp.w, 1.0e7)));
+        if (wp.w >= GI_WAL_MATURE_N) {
+          atomicAdd(&lod_diag[DIAG_GI_WAL_MATURE], 1u);
+        } else {
+          atomicAdd(&lod_diag[DIAG_GI_WAL_FRESH], 1u);
+        }
+      }
+    }
+  }
   let gi_uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
             / vec2<f32>(f32(gsize.x), f32(gsize.y));
   let ndc = vec2<f32>(gi_uv.x * 2.0 - 1.0, 1.0 - gi_uv.y * 2.0);
@@ -1191,11 +1364,41 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     atomicStore(&face_slots[fe + FACE_W_GI_N], gi_n >> 1u);
   }
+  // ---- 小面的**跨面联合池化**（见 `GI_FACE_POOL_R` 的 WHY）----
+  // `dda_face_accum` 的"面均值"在面只占 1~2 个 texel 时其实是**单样本** ⇒ 那是单 texel 的噪声，
+  // 被降噪链稳定成固定格子 ⇒ 暗场里绕发光体的网格纹。这里用**全管线同一个判据**在本面代表 texel
+  // 周围取共面 texel 的平均（= `gi_wal_*` 池化同一条道理，只是作用在**降噪后的场**上）。
+  // CONSTRAINT: 只对小面生效 —— 大面的 `gi_n` 本身就是跨 texel 的**无偏均值**（设计要的「面内恒定」），
+  // 再池化只会把它糊掉。
+  if (gi_n <= GI_FACE_POOL_MIN_N) {
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var dy: i32 = -GI_FACE_POOL_R; dy <= GI_FACE_POOL_R; dy = dy + 1) {
+      for (var dx: i32 = -GI_FACE_POOL_R; dx <= GI_FACE_POOL_R; dx = dx + 1) {
+        let c = vec2<i32>(i32(gid.x) + dx, i32(gid.y) + dy);
+        if (c.x < 0 || c.y < 0 || c.x >= i32(gsize.x) || c.y >= i32(gsize.y)) { continue; }
+        let tb = (u32(c.y) * gsize.x + u32(c.x)) * GI_DEN_GUIDE_WORDS;
+        let tk0 = gi_guide_out[tb + GI_DEN_G_KEY0];
+        let tk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
+        if ((tk0 | tk1) == 0u) { continue; }
+        if (!gi_same_surface(tk0, tk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, g_nrm)) { continue; }
+        let v = textureLoad(gi_tex, c, 0);
+        if (v.a <= 0.5) { continue; }
+        acc = acc + v.rgb;
+        wsum = wsum + 1.0;
+      }
+    }
+    if (wsum > 0.5) { gi_avg = acc / wsum; }
+  }
   // `ray_dir` 传该面的世界法线：逐面路径**只处理命中面**（天空在那里不渲染）⇒ 这个实参不会被消费，
   // 但必须是合法单位向量（`shade_face` 的注释里写了理由）。
+  // `sun_io` 传 -1 = 本面自算（发射阴影射线）；出口值**烘焙进 `FACE_W_SUN`** —— `dda_main` 的
+  // 覆盖 texel 回退借它跳过逐像素阴影射线（见 `GI_FACE_FALLBACK` 段）。
+  var sun_io = -1.0;
   let col = shade_face(first, view_u.cam_pos_voxel.xyz, fnw, frustum_length,
                        GiInput(true, gi_avg, select(0.0, 1.0, gi_n > 0u), gi_uv),
-                       sun_dir, sky, sun_c, g_nrm, true);
+                       sun_dir, sky, sun_c, g_nrm, true, &sun_io);
+  atomicStore(&face_slots[fe + FACE_W_SUN], bitcast<u32>(sun_io));
   atomicStore(&face_slots[fe + FACE_W_COL], bitcast<u32>(col.x));
   atomicStore(&face_slots[fe + FACE_W_COL + 1u], bitcast<u32>(col.y));
   atomicStore(&face_slots[fe + FACE_W_COL + 2u], bitcast<u32>(col.z));

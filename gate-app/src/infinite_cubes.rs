@@ -205,6 +205,23 @@ const DEMAND_TABLE_MAX: usize = 8192;
 /// 每帧做就是白花 ~1ms 帧时间，所以缓存起来。
 const DEMAND_REBUILD_FRAMES: u32 = 30;
 
+/// **全量重建的位移阈值**（chunk）：相机相对"上次建表的中心"移动 ≥ 本值才重扫**整个盘**；
+/// 小位移只做下面的"近场补丁"。
+///
+/// WHY（2026-10-03 第八轮实测，`GATE_BENCH=fly` + `SPLIT`）：整盘枚举是 65×19×65 ≈ **8 万个格**、
+/// 每格一次 `have()`（`detail` HashMap + `grid.chunk()` 各一次哈希查询），而原来的触发是
+/// "**相机换任意一格 chunk**"—— fly（[`BENCH_FLY_SPEED`] = 2000 v/s）下相机每 ~2 帧就换一格
+/// ⇒ **每帧全扫**，实测 `SPLIT STREAM ①a建表 = 2.4~2.7 ms/帧`（全场最大的单项）。
+/// 改成"小位移补近场、大位移/超时才全扫"之后：近场优先级仍是每帧新鲜的（补丁覆盖
+/// `load_radius + DEMAND_PATCH_MARGIN`，远大于两次补丁之间走过的 chunk 数 ≤1），
+/// 远盘（本来就只是预载、优先级最低，急的走 ray-guided 请求）由全扫与 `DEMAND_REBUILD_FRAMES` 兜底。
+const DEMAND_REBUILD_CHUNKS: i32 = 6;
+
+/// **近场补丁的额外半径**（chunk，`load_radius` 之外）：见 [`DEMAND_REBUILD_CHUNKS`]。
+/// 取 3：预载盘的意义是"提前一步"，补丁的覆盖 = `load_radius + 3` ⇒ 相机正前方的块不会因为
+/// "表中心落后一格"而排在深处（那会让挂载落后于行进）。
+const DEMAND_PATCH_MARGIN: i32 = 3;
+
 /// 每帧最多取回几条产出（取回本身极便宜，挂载才是要摊帧的那一步）
 const POLL_MAX: usize = 256;
 
@@ -746,13 +763,25 @@ pub fn stream_chunks(
         continue;
       }
 
-      // ①a **重建需求表**（相机换 chunk / 每 [`DEMAND_REBUILD_FRAMES`] 帧，顺带吸收新的请求）
+      // ①a **需求表**：全量重建只在"没建过 / 位移 ≥ [`DEMAND_REBUILD_CHUNKS`] / 到
+      //     [`DEMAND_REBUILD_FRAMES`]"时做；小位移只补**近场**（两条常量的 WHY 里有原因与实测）。
+      //     远场级没有"近场"可言 ⇒ 照旧按位移全量重建（它的中心随相机/scale 变化，慢得多）。
       st.demand_age += 1;
-      if st.demand_center != Some(scope.center) || st.demand_age >= DEMAND_REBUILD_FRAMES {
-        let have = |c: IVec3, want: Detail| {
-          let held = st.detail.get(&ChunkCoord(c)).copied().unwrap_or(Detail::Full);
-          (grid.chunk(ChunkCoord(c)).is_some() && held >= want) || st.empty.contains(&ChunkCoord(c))
-        };
+      let moved = match st.demand_center {
+        Some(c) => (c - scope.center).abs().max_element(),
+        None => i32::MAX,
+      };
+      let have = |c: IVec3, want: Detail| {
+        let held = st.detail.get(&ChunkCoord(c)).copied().unwrap_or(Detail::Full);
+        (grid.chunk(ChunkCoord(c)).is_some() && held >= want) || st.empty.contains(&ChunkCoord(c))
+      };
+      // 竖向半高：源声明了内容带就用**内容带的行数**（[`VolScope::v_hy`]）—— 预载盒的竖向于是
+      // **锚在地面上、与相机高度无关**。用菜单的 `coarse_height` 时，相机飞到它之上（MC 世界只有
+      // 16 行）预载盒里全是空气 ⇒ 地面只剩射线请求补 ⇒ "升空俯瞰正中是空洞"（判据：`STREAM[v0 …]
+      // y a..b` 必须恒包含内容带）。全量重建与近场补丁**共用同一个值**。
+      let ch = if content_y.is_some() { scope.v_hy } else { coarse_h };
+      let far_moved = far_level && moved > 0;
+      if moved >= DEMAND_REBUILD_CHUNKS || st.demand_age >= DEMAND_REBUILD_FRAMES || far_moved {
         let batch: Vec<(IVec3, Detail)> = if far_level {
           let (r_in, r_out) = ladder[(vol - 1).min(ladder.len() - 1)];
           plan_generation_far(vol, scope, far_cap(vol, cap), r_in, r_out, &requests, have)
@@ -764,11 +793,7 @@ pub fn stream_chunks(
               w_dims: scope.w_dims,
               load_radius: load_r,
               coarse_radius: coarse_r,
-              // 竖向半高：源声明了内容带就用**内容带的行数**（[`VolScope::v_hy`]）——
-              // 预载盒的竖向于是**锚在地面上、与相机高度无关**。用菜单的 `coarse_height` 时，
-              // 相机飞到它之上（MC 世界只有 16 行）预载盒里全是空气 ⇒ 地面只剩射线请求补 ⇒
-              // "升空俯瞰正中是空洞"（判据：`STREAM[v0 …] y a..b` 必须恒包含内容带）。
-              coarse_height: if content_y.is_some() { scope.v_hy } else { coarse_h },
+              coarse_height: ch,
               forward,
             },
             cap_main,
@@ -800,6 +825,49 @@ pub fn stream_chunks(
         st.demand_age = 0;
         // 需求集换了 ⇒ 保护集换了 ⇒ 允许再试一次"超容量换出"（见 `VolState::trim_idle`）
         st.trim_idle = false;
+      } else if moved > 0 {
+        // ---- 近场补丁（见 [`DEMAND_REBUILD_CHUNKS`] / [`DEMAND_PATCH_MARGIN`] 的 WHY）----
+        // 只扫相机周围 `load_r + DEMAND_PATCH_MARGIN` 的立方核，把**新出现的缺口**按共用的
+        // [`plan_key`] 排序后插到**表头**（表头 = 最高优先级），同时写进卸载扫描的保护集。
+        // CONSTRAINT: 旧条目不动（要么已被派发、要么等下一次全量重建清掉；重复项无害：①b 派发时按
+        // `have` 当场划过并 pop）。`demand_center` 照常前移（`moved` 的语义 = 距上次任何一次更新）。
+        let pr = load_r + DEMAND_PATCH_MARGIN;
+        let mut patch: Vec<(IVec3, Detail)> = Vec::new();
+        for dx in -pr..=pr {
+          for dz in -pr..=pr {
+            for dy in -ch..=ch {
+              let c = scope.center + IVec3::new(dx, dy, dz);
+              let t = c - scope.w_origin;
+              if !t.cmpge(IVec3::ZERO).all() || !t.cmplt(scope.w_dims).all() {
+                continue;
+              }
+              let want = preload_detail(c, scope.center);
+              if have(c, want) || st.demand_set.contains(&ChunkCoord(c)) {
+                continue;
+              }
+              patch.push((c, want));
+            }
+          }
+        }
+        if !patch.is_empty() {
+          patch.sort_unstable_by_key(|(c, _)| plan_key(*c, scope.center, forward));
+          for (c, want) in patch.into_iter().rev() {
+            st.demand_set.insert(ChunkCoord(c));
+            st.demand.push_front((c, want));
+          }
+          // 表长与全量重建同一上限：超了从**尾部**丢最低优先级的（保护集同步摘掉）。
+          while st.demand.len() > DEMAND_TABLE_MAX {
+            match st.demand.pop_back() {
+              Some((c, _)) => {
+                st.demand_set.remove(&ChunkCoord(c));
+              }
+              None => break,
+            }
+          }
+          // 保护集变了 ⇒ 允许再试一次"超容量换出"（与全量重建同一处理）
+          st.trim_idle = false;
+        }
+        st.demand_center = Some(scope.center);
       }
       sd.mark(3);
 
@@ -1582,6 +1650,31 @@ fn far_radius_ladder(cap: usize) -> [(i32, i32); 3] {
   out
 }
 
+/// 预载候选的**排序键**：欧氏距离为主（朝向无关、转身不重排）⇒ 同距离再看视野
+/// （相机背后推后）⇒ 最后看坐标（确定性）。
+/// **全量重建（`plan_generation`）与近场补丁（`stream_chunks` ①a）共用同一份** —— 两处各写一遍
+/// 迟早漂移（那会让"谁先被加载"在两段路上不一致）。
+fn plan_key(c: IVec3, center: IVec3, forward: Vec3) -> (i32, i32, i32, i32, i32) {
+  let d = c - center;
+  let off = if forward == Vec3::ZERO || d == IVec3::ZERO {
+    0
+  } else {
+    (d.as_vec3().normalize_or_zero().dot(forward) <= VIEW_COS) as i32
+  };
+  (d.length_squared(), off, c.x, c.y, c.z)
+}
+
+/// **预载目标档**：内圈（[`PRELOAD_FULL_CHUNKS`]）按裸 `detail_at`，更远封顶到
+/// [`PRELOAD_DETAIL_CAP`]。同样两处共用（见 [`plan_key`]）。
+fn preload_detail(c: IVec3, center: IVec3) -> Detail {
+  let d = detail_at((c - center).abs().max_element());
+  if (c - center).abs().max_element() <= PRELOAD_FULL_CHUNKS {
+    d
+  } else {
+    Detail(d.0.min(PRELOAD_DETAIL_CAP.0))
+  }
+}
+
 /// **档位判据**（[`Detail`] 的 CONSTRAINT）：粒度 `g` 体素的一档，只有在该 chunk 的距离处
 /// `g / (d·px_ang) ≤ 1` 时才允许使用；取允许档里**最粗**的那个（内存最优）。
 ///
@@ -1676,8 +1769,6 @@ fn plan_generation(
     let t = c - w_origin;
     t.cmpge(IVec3::ZERO).all() && t.cmplt(w_dims).all()
   };
-  // 该 chunk 该用哪一档：由"这一级在屏幕上是否 ≤ 1 px"定（[`detail_at`]），不由半径拍
-  let detail_of = |c: IVec3| detail_at((c - center).abs().max_element());
   let mut picked: Vec<(IVec3, Detail)> = Vec::new();
   // M8：**只收主世界的请求**（`vol == 0`）—— 远场级的 chunk 坐标是它自己的级体素空间，
   // 数值上会落在主世界的窗口内 ⇒ 不过滤就会让主世界去装"远场请求里那些坐标"的 chunk（白装）。
@@ -1719,16 +1810,8 @@ fn plan_generation(
         seen[w] |= m;
       }
     }
-    // 预载目标档（下面的判据与 `picked.extend` **共用同一份**，避免两处口径分叉）：
-    // 内圈（`PRELOAD_FULL_CHUNKS`）按 `detail_at`，更远按 `PRELOAD_DETAIL_CAP` 封顶。
-    let detail_for = |c: IVec3| {
-      let d = detail_of(c);
-      if (c - center).abs().max_element() <= PRELOAD_FULL_CHUNKS {
-        d
-      } else {
-        Detail(d.0.min(PRELOAD_DETAIL_CAP.0))
-      }
-    };
+    // 预载目标档：**共用的 [`preload_detail`]**（下面的判据与 `picked.extend` 是同一份口径）。
+    let detail_for = |c: IVec3| preload_detail(c, center);
     let mut todo: Vec<IVec3> = Vec::new();
     // 判据是"**够不够细**"（`detail_for`），不是"有没有块"。
     //
@@ -1780,16 +1863,8 @@ fn plan_generation(
       }
     }
     drop(push);
-    // 欧氏距离为主（朝向无关、转身不重排）⇒ 同距离再看视野、最后看坐标（确定性）
-    todo.sort_unstable_by_key(|c| {
-      let d = *c - center;
-      let off = if forward == Vec3::ZERO || d == IVec3::ZERO {
-        0
-      } else {
-        (d.as_vec3().normalize_or_zero().dot(forward) <= VIEW_COS) as i32
-      };
-      (d.length_squared(), off, c.x, c.y, c.z)
-    });
+    // 排序键 = **共用的 [`plan_key`]**（近场补丁也用同一份）。
+    todo.sort_unstable_by_key(|c| plan_key(*c, center, forward));
     // 档位一律取 `detail_for`（内圈按 `detail_at`、外面封顶到 [`PRELOAD_DETAIL_CAP`]）——
     // 封顶后的档位一旦被靠近，由上面的判据按 `detail_for` 重装顶细。
     picked.extend(todo.into_iter().take(budget).map(|c| (c, detail_for(c))));

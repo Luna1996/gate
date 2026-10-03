@@ -91,6 +91,15 @@ label = "menu.render.gi.sun_bounce"
 checked = false
 tooltip = "menu.render.gi.sun_bounce.tip"
 
+# 世界累积（WAL，M1）：按"可见体素面"持久缓存辐照度，显示端按成熟度与旧链 GI 混合
+# —— 没有重投影/时域历史 ⇒ 拖影/流光按构造消失；未成熟的面仍用旧链兜底。
+[[items.children.children]]
+kind = "toggle"
+id = "wal"
+label = "menu.render.gi.wal"
+checked = false
+tooltip = "menu.render.gi.wal.tip"
+
 # 二次弹射：二次顶点上再发一条余弦射线，叠回"多一跳"的间接光（默认关 = 只算一次弹射）
 [[items.children.children]]
 kind = "switch_group"

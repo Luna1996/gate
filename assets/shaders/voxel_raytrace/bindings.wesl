@@ -204,7 +204,10 @@ const BASE_FLAG_VOL_TINT: u32 = 4u;
 struct GiUniform {
   // x = **二次顶点太阳反弹**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/太阳反弹」：
   // 关掉则二次顶点不做太阳 NEE，`sun_transmittance` 那条阴影射线整条不发）、
-  // y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
+  // y = **世界空间累积层（WAL）**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/世界累积」：
+  // 按面表成熟度把持久累积值注入 GI 写入侧（`gi/screen.wesl::gi_ss_main`，见 `gi/wal.wesl`
+  // 的「注入点」段）、
+  // z = GI 增益、w = 保留（恒 0）
   params: vec4<f32>,
   // x = GI 开关、y = 每帧采样预算分摊 N、z = 误差驱动重分配档位、
   // w = **第二条弹射的倍数**（菜单「渲染/光照/二次弹射」）：0 = 关；1 = 每个候选都带；
@@ -323,6 +326,12 @@ struct FogUniform {
 /// 只被 `gi_main`（经 `gi_local_rev`）使用 ⇒ 与 @binding(9) 同一个先例，只出现在它的 layout。
 /// 表未就绪（占位 buffer）时 `arrayLength` 不足 ⇒ `gi_local_rev` 返回 0（退化为旧行为）。
 @group(5) @binding(10) var<storage, read> gi_region_rev: array<u32>;
+
+/// @binding(11)：**世界空间累积层（WAL）的面表**（`gi/wal.wesl`）：`2^20` 槽 × 8 词（32 B）。
+/// 布局/语义/失效掩码全在 `gi/wal.wesl` 的文件头；槽下标 = **世界坐标哈希**（不用窗口基址 ⇒
+/// 相机移动不重定基）。写入者是 `gi_main` 的面认领者（单写者），读取者是显示链（`dda_main` /
+/// `dda_face_main` 经 `shade_face`）⇒ 两个 layout 都用 read_write（声明是 atomic）。
+@group(5) @binding(11) var<storage, read_write> gi_wal: array<atomic<u32>>;
 
 // ===== @group(6)：光柱（godray）的**读侧**（只给 `dda_main` 的 pipeline）=====
 // 为什么单开一组而不是塞进 group(5)：group(5) 是「GI 网格」的号段，而光柱的网格尺寸、资源、

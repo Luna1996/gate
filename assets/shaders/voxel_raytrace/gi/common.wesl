@@ -100,6 +100,11 @@ fn gi_unkey_voxel(k0: u32, k1: u32, obj: i32) -> vec3<i32> {
 // **任何上传都作废整表**（`ShadeKey.geom` = world_rev）—— 流式世界里每帧成立 ⇒ 缓存等于不存在
 // （见 `gi.rs::ShadeKey` 的 CONSTRAINT）。现在改成：**只有该面附近真的变过，这个面的槽才失效**。
 //
+// 消费者共两处，**都按同一个口径门控**（`sun_bounce > 0.5` 才折进各自的掩码）：
+// `gi_sec_slots`（`gi/ray.wesl::gi_face_shade_cached`）与**世界累积层 WAL 的掩码**
+// （`gi/wal.wesl::gi_wal_mask_at`）。关掉太阳反弹时入射光与别的几何无关 ⇒ 折入只会白吃这
+// ±REACH 的失效（实测症状："编辑/飞行时全屏 GI 闪烁"，见 `gi_wal_mask_at` 的 CONSTRAINT）。
+//
 // 布局：窗口（64³ chunk）按 8³ chunk 切区域；表 = 16³ = 4096 个 u32，**基址 = 该 volume 的量化键
 // 原点**（`gi_key_org`，与面键同源 ⇒ 基准与键永远一致，一起被 `wide_rev` 作废）。
 // Rust 侧每次上传把覆盖到的区域**及其 ±REACH 邻域** +1（膨胀在写侧做 ⇒ 读侧只付一次 load，
@@ -229,6 +234,19 @@ const FACE_W_GI: u32 = 9u;
 const FACE_W_RAW_N: u32 = 12u;
 const FACE_W_RAW: u32 = 13u;
 
+/// **后半帧复用字**：太阳可见性（`main.wesl::shade_face` 实际用到的那个 `sun`，f32 位）。
+/// `dda_face_main` 逐面烘焙、`dda_main` 的**覆盖 texel 回退**借用（见 `main.wesl` 的
+/// `GI_FACE_FALLBACK` 段：回退现在只借这个量，其余逐像素重着色）。
+/// **它复用 `FACE_W_RAW_N` 的位置**（同一个 word 12）——两个字在本帧内的生命期**互斥**：
+/// `gi_main`（前半帧）里它是合并计数（`gi_ss_main` 的 CAS 预留 + `gi_face_flatten` 的读取），
+/// `gi_face_flatten` 之后本帧再没有读者 ⇒ `dda_face_main` 改写成太阳可见性是安全的。
+/// CONSTRAINT: 复用的两个前提 —— ① **派发顺序**（`gi_face_flatten` → `dda_face_accum` →
+/// `dda_face_main` → `dda_main`，见 `brickmap::dda::dispatch_dda`）；② 表在 `gi_main` **之前**
+/// 整块 `clear_buffer`（否则上一帧的太阳可见性会被当成残留的合并计数）。
+/// 为什么复用而不是加第 17 个字：槽是 16 字 = **恰好一条 64B 缓存行**，认领（写 0..4）与查表
+/// （读 4..7、12..15）都落在这一行里；加到 20 字（80 B）会让**每次认领**跨两行，把最热的路径变贵。
+const FACE_W_SUN: u32 = 12u;
+
 /// **逐面 GI 均值**的定点参数（WGSL 默认没有 float 原子 ⇒ 只能加整数）。
 /// 每个 GI texel 把自己的 GI 值（`gi_tex.rgb`，已含增益）加上去，面着色时除以计数取平均。
 /// 为什么必须做这一步：同一个面的所有 texel 的 GI 射线**起点都是该体素中心**（见 `gi_ss_main` 的
@@ -351,20 +369,27 @@ fn face_slot_find_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   return 0u;
 }
 
-/// **面键 → 槽里的着色结果 + 材质条目号**（`face_slots` 的唯一读入口；认领在 `gi_main`、填色在
-/// `dda_face_main`；`pal` 由认领侧写）。命中条件 = 认领标志置位 + **两个键 word 逐位相等**。
-/// `ok = false` 时调用方一律回落（覆盖 texel 回退 / 内联着色），`pal_out` 无意义。
+/// **面键 → 槽里的着色结果 + 材质条目号 + 太阳可见性**（`face_slots` 的唯一读入口；认领在
+/// `gi_main`、填色在 `dda_face_main`；`pal` 由认领侧写）。命中条件 = 认领标志置位 + **两个键 word
+/// 逐位相等**。`ok = false` 时调用方一律回落（覆盖 texel 回退 / 内联着色），`pal_out` 无意义。
 ///
 /// `pal_out` 给「覆盖 texel 回退」做**同材质**准入（见 `main.wesl::dda_main`）：那个 texel 的面与
 /// 本像素的面是**邻居**（不同体素），键相等证明不了材质相同 ⇒ 必须显式比 `pal`。
 /// 只在同一 `obj` 内比较：`pal` 是**该 volume** 调色板的条目号，跨 volume 同号不同材质
 /// （准入已由 `gi_den_same_plane` 的 `obj` 那一半保证）。
-fn face_slot_color(k0: u32, k1: u32, pal_out: ptr<function, u32>, ok: ptr<function, bool>) -> vec3<f32> {
+///
+/// `sun_out` = `FACE_W_SUN` 那一个字（f32 位；`dda_face_main` 烘焙的太阳可见性）——只有回退路径
+/// 消费它（借用该面的阴影结果，见 `main.wesl` 的 `GI_FACE_FALLBACK` 段）；精确键路径读它无用。
+/// 与色、`pal` **同一次 `face_slot_find`**（同一条缓存行）⇒ 回退路径不多付一次哈希查找。
+fn face_slot_color(k0: u32, k1: u32, pal_out: ptr<function, u32>, sun_out: ptr<function, u32>,
+                   ok: ptr<function, bool>) -> vec3<f32> {
   *pal_out = 0u;
+  *sun_out = 0u;
   let slot = face_slot_find(k0, k1, ok);
   if (!*ok) { return vec3<f32>(0.0); }
   let fe = slot * FACE_WORDS;
   *pal_out = atomicLoad(&face_slots[fe + FACE_W_PAL]);
+  *sun_out = atomicLoad(&face_slots[fe + FACE_W_SUN]);
   let c0 = atomicLoad(&face_slots[fe + FACE_W_COL]);
   let c1 = atomicLoad(&face_slots[fe + FACE_W_COL + 1u]);
   let c2 = atomicLoad(&face_slots[fe + FACE_W_COL + 2u]);

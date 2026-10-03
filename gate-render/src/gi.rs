@@ -23,7 +23,8 @@ use crate::wesl_consts::gi_consts;
 #[derive(Debug, Default, Clone, Copy, ShaderType)]
 pub struct GiUniform {
   /// x = **二次顶点太阳反弹**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/太阳反弹」）、
-  /// y = 保留（恒 0）、z = GI 增益、w = 保留（恒 0）
+  /// y = **世界空间累积层（WAL）**（1 = 开、0 = 关；菜单「渲染/RESTIR GI/世界累积」）、
+  /// z = GI 增益、w = 保留（恒 0）
   pub params: Vec4,
   /// x = GI 开关（0/1）、y = **每帧采样预算分摊 N**（见 `GiSettings::share`）、
   /// z = 误差驱动重分配档位、w = **第二条弹射的倍数**（`GiSettings::bounce2_mult`：0 = 关 /
@@ -158,8 +159,23 @@ pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
 pub const REGION_CHUNKS: i32 = 8;
 /// 表每轴格数（16³ = 4096 个 u32 = 16 KB）；基址 = 主世界窗口的量化键原点。
 pub const REGION_TABLE: i32 = 16;
+/// 区域修订表的字节数（16³ × 4 B = 16 KB）。buffer 的**归属**在
+/// `crate::brickmap::dda::AuxTexCache`（与 WAL 面表同一生命周期：跨帧持久、不随 GI 分辨率重建）——
+/// 写侧（`gi_main` 的 BG5）与读侧（显示链的 group(5)）必须**绑同一块**，否则两侧算出的失效掩码
+/// 不一致（读侧全落到 0 ⇒ 权重恒 0 ⇒ 世界累积整条失效）。
+pub const REGION_TABLE_BYTES: u64 =
+  (REGION_TABLE as u64) * (REGION_TABLE as u64) * (REGION_TABLE as u64) * 4;
 /// 写侧膨胀半径（区域单位）= `ceil(NEE 行程 12 chunk / REGION_CHUNKS)`。
 pub const REGION_REACH: i32 = 2;
+
+// ============================================================================
+// 世界空间累积层（WAL）—— `gi/wal.wesl`
+// ============================================================================
+/// WAL 面表的槽数（**2 的幂**：shader 用位与取模；16 槽起步才有效）。2^20 × 8 词 × 4 B = 32 MB。
+/// 调大/调小直接改这里（表不随 GI 分辨率重建，见 `AuxTexCache::wal`）。
+pub const WAL_SLOTS: u64 = 1 << 20;
+/// 每槽字数（布局的权威在 `gi/wal.wesl` 的文件头；Rust 只负责分配大小）。
+pub const WAL_WORDS: u64 = 8;
 
 /// 窗口原点（chunk）→ 区域表的**基址**（chunk）：与 `gi_key_org` 同一条量化
 /// （截断整除，Q = [`KEY_ORG_Q`] / `CHUNK_SIZE` = 32 chunk）。
@@ -258,6 +274,15 @@ pub struct GiSettings {
   /// AABB 钳制）+ 5 轮迭代 atrous；**没有**独立的前滤 pass（等价物是时域内的共面邻域 mean ± K·σ
   /// 离群钳制）与 fast-history/history-fix。
   pub denoise: u32,
+  /// **世界空间累积层（WAL）**（菜单「渲染/RESTIR GI/世界累积」）：按成熟度把"该面的持久条目"
+  /// （`gi/wal.wesl`：认领者单写者、世界坐标哈希、掩码失效）**注入 GI 写入侧**
+  /// （`gi/screen.wesl::gi_ss_main`，随后照常走逐面平均 + 时域 + atrous），而不是在显示端替换。
+  /// 关掉时**逐位等于旧行为**（`gi_u.params.y ≤ 0.5` 时注入那段一行不跑）。
+  /// 目的：按面累积 ⇒ **累积里没有屏幕空间重投影 / 没有屏幕空间历史**（注入之后才进降噪链，
+  /// 那一段的时域/邻域只作用在**世界锚定**的值上 ⇒ 不会拖出鬼影），拖影/流光按构造消失；
+  /// 旧链保留做未成熟面的兜底（M1 边界：单层、无金字塔）。设计见
+  /// `~/.commandcode/plans/gi-world-space-accumulation.md`。
+  pub wal: bool,
   /// **二次顶点的太阳反弹**（菜单「渲染/RESTIR GI/太阳反弹」）：**默认关**。
   /// GI 射线命中点（二次顶点）是否做一次太阳 NEE —— 朝太阳发一条阴影射线，把「被阳光照亮的
   /// 表面」这一路能量算进间接光。
@@ -401,7 +426,17 @@ impl Default for GiSettings {
     // 想要更干净就往「中/高」拨，想量原始噪声与上限帧率就拨到「关」。
     // 太阳反弹默认关：实测画面差异细微（静态场景几乎看不出），代价却是 `gate_gi` 的 41%。
     // 二次弹射默认关（= 与引入前逐位一致）：它改的是**能量**（多一跳的间接光），要开就拨「稀疏」。
-    Self { enabled: true, gi_div: 4, denoise: 1, sun_bounce: false, share: 2, realloc: 0, depth: 0 }
+    // 世界累积（WAL）默认关：M1 阶段先做 A/B（验收通过后再考虑改默认）。
+    Self {
+      enabled: true,
+      gi_div: 4,
+      denoise: 1,
+      wal: false,
+      sun_bounce: false,
+      share: 2,
+      realloc: 0,
+      depth: 0,
+    }
   }
 }
 
@@ -500,6 +535,9 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
+      // 世界空间累积层（WAL）的面表（`gi/wal.wesl`）：`gi_main` 的认领者写、显示链在 dda.rs 的
+      // group(5) read layout 上读同一块 buffer ⇒ 声明是 atomic ⇒ 两个 layout 都 read_write。
+      buf(11),
     ],
   )
 }
@@ -708,9 +746,9 @@ pub struct GiGpu {
   /// 每次上传把覆盖区域 ±[`REGION_REACH`] +1（见 [`region_mark`]）⇒ 二次顶点缓存**局部失效**：
   /// 只有面附近真的变过的槽才失效（旧口径"任何上传作废整表"在流式世界里等于没有缓存）。
   region_rev: Vec<u32>,
-  /// 区域表的 GPU 缓冲（16 KB，惰性创建；未创建时 BG5 绑占位 buffer ⇒ shader 侧
-  /// [`gi_local_rev`] 由 `arrayLength` 守卫返回 0）。
-  region_buf: Option<bevy::render::render_resource::Buffer>,
+  /// 区域表**待上传**标记：`region_rev` 里攒了还没送上 GPU 的修订 ⇒ 每帧尝试上传一次
+  /// （GPU buffer 在 `AuxTexCache`，见 [`REGION_TABLE_BYTES`]；未就绪时保留标记，下一帧再传）。
+  region_dirty: bool,
   /// 表当前的基址（chunk，见 [`region_origin`]；`None` = 还没比过）：基址一变（= 键原点变）
   /// 就整表 +1 重新起算（与 `wide_rev` 的作废同步）。
   region_org: Option<glam::IVec3>,
@@ -836,7 +874,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     res_flip: false,
     key_org: None,
     region_rev: vec![0; (REGION_TABLE * REGION_TABLE * REGION_TABLE) as usize],
-    region_buf: None,
+    region_dirty: false,
     region_org: None,
     region_staging: Vec::new(),
     // 从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`world_same` 会是真；那时 reservoir 两块
@@ -910,6 +948,7 @@ fn extract_gi_settings(
     enabled: s.enabled,
     gi_div: s.div(),
     denoise: s.tier(),
+    wal: s.wal,
     sun_bounce: s.sun_bounce,
     share: s.share(),
     realloc: s.realloc_tier(),
@@ -981,19 +1020,14 @@ fn prepare_gi(
     }
   }
   if region_touched {
-    // 惰性建 16 KB storage buffer + 整表上传（有变化才写：流式每帧也就 16 KB，可忽略）。
-    let buf = gpu
-      .region_buf
-      .get_or_insert_with(|| {
-        device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
-          label: Some("gate_gi_region_rev"),
-          size: (REGION_TABLE * REGION_TABLE * REGION_TABLE * 4) as u64,
-          usage: bevy::render::render_resource::BufferUsages::STORAGE
-            | bevy::render::render_resource::BufferUsages::COPY_DST,
-          mapped_at_creation: false,
-        })
-      })
-      .clone();
+    gpu.region_dirty = true;
+  }
+  // 整表上传（有变化才写：流式每帧也就 16 KB，可忽略）。GPU buffer 的**归属**在
+  // `crate::brickmap::dda::AuxTexCache`（写侧 BG5 与显示链 group(5) 必须绑同一块，见
+  // [`REGION_TABLE_BYTES`]）；还没建好就留着标记，下一帧再传（不会丢修订）。
+  if gpu.region_dirty
+    && let Some(buf) = aux.as_ref().and_then(|a| a.region_buffer()).cloned()
+  {
     // 暂存 vec 先 `take` 出来（借用分割：`gpu` 经 `ResMut` 解引用，字段级拆分通不过借用检查）。
     let mut staging = std::mem::take(&mut gpu.region_staging);
     staging.clear();
@@ -1002,6 +1036,7 @@ fn prepare_gi(
     }
     queue.write_buffer(&buf, 0, &staging);
     gpu.region_staging = staging;
+    gpu.region_dirty = false;
   }
 
   // ---- ② 二次顶点缓存的 epoch（同一次比对给出「光照阶跃」）----
@@ -1037,7 +1072,9 @@ fn prepare_gi(
   let u = GiUniform {
     params: Vec4::new(
       if settings.sun_bounce { 1.0 } else { 0.0 },
-      0.0,
+      // y = **世界空间累积层（WAL）开关**（菜单「渲染/RESTIR GI/世界累积」）：显示端按面表的
+      // 成熟度与旧链 GI 混合（`main.wesl::gi_wal_blend`）；0 时逐位等于旧行为。
+      if settings.wal { 1.0 } else { 0.0 },
       crate::consts::GI_GAIN,
       0.0,
     ),
@@ -1159,9 +1196,21 @@ fn prepare_gi(
     .and_then(|a| a.gi_sec_slots_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
-  // binding 10 = 区域修订表（二次顶点缓存的局部失效）：本帧刚在上方维护/上传；未建时用 4 B 占位
+  // binding 10 = 区域修订表（二次顶点缓存与世界累积层的**共同**失效掩码）：本帧刚在上方维护/上传
+  // （归属在 `AuxTexCache`，与显示链的 group(5) 绑同一块）；未建时用 4 B 占位
   // （`gi_local_rev` 会因 `arrayLength` 不足而返回 0 ⇒ 退化为旧行为）。
-  let region_rev = gpu.region_buf.clone().unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
+  let region_rev = aux
+    .as_ref()
+    .and_then(|a| a.region_buffer())
+    .cloned()
+    .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
+  // binding 11 = 世界空间累积层（WAL）的面表：`AuxTexCache` 建一次、跨帧持久（不随 GI 分辨率重建）；
+  // 未就绪时用 4 B 占位（`gi_wal_slot` 的 `arrayLength` 守卫会判 ok = false ⇒ 合并/读取都跳过）。
+  let wal = aux
+    .as_ref()
+    .and_then(|a| a.wal_buffer())
+    .cloned()
+    .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
@@ -1171,6 +1220,7 @@ fn prepare_gi(
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
       BindGroupEntry { binding: 9, resource: gi_sec_slots.as_entire_binding() },
       BindGroupEntry { binding: 10, resource: region_rev.as_entire_binding() },
+      BindGroupEntry { binding: 11, resource: wal.as_entire_binding() },
     ],
   );
   commands.insert_resource(GiBg5(bg5));

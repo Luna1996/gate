@@ -3,6 +3,7 @@ import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE
 import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
+import package::gi::wal::{gi_wal_merge, gi_wal_sample};
 import package::trace::{make_grid};
 import package::world::{WorldHit, surface_offset, voxel_normal};
 
@@ -350,6 +351,9 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 位置必须在 `gi_den_guide_store` 之后（认领者要被 `dda_face_main` 用 texel 下标找回）。
   // **双探针**（`face_slot_next`）：基槽被撞就再试第二格 —— 实测撞键的面占全屏 4.6% 像素，
   // 从前那些像素整帧只能逐像素内联着色；多一格落脚就把它们接回逐面路径（判据一字未改）。
+  // **本 texel 是不是本面的认领者**：WAL（世界空间累积层）的合并由认领者单写者执行
+  // （每面每帧一次，零竞态；见 `gi/wal.wesl` 文件头）。
+  var wal_claimer = false;
   if (pk_ok) {
     var face_ok = false;
     let fslot = face_slot_of(pk0, pk1, &face_ok);
@@ -366,6 +370,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
         }
       }
       if (claimed) {
+        wal_claimer = true;
         atomicStore(&face_slots[fe + FACE_W_K0], pk0);
         atomicStore(&face_slots[fe + FACE_W_K1], pk1);
         atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
@@ -574,6 +579,13 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     k = k + nb;
   }
 
+  // ---- WAL（世界空间累积层）：认领者把本帧的**新鲜候选**并入该面的持久条目（零额外射线）----
+  // 单写者（每面每帧一次）⇒ 无竞态；`r.w_sum` 此刻只含新鲜样本的 Σ π·L（时域合并还没发生）。
+  // 失效（编辑/流式/原点/材质）由掩码承担、显示端按成熟度与旧链混合（`gi/wal.wesl` / `main.wesl`）。
+  if (gi_u.params.y > 0.5 && wal_claimer && r.m > 0.5) {
+    gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m));
+  }
+
   // ---- ④ 时域合并 + 写**时域** reservoir（空间复用的合并量绝不写回，见文件头 ③）----
   // CONSTRAINT: 必须排在 ③ 之前 —— ③ 的钳制锚是「本像素当帧的估计」，含时域历史才干净；
   // 只含本帧那几条新鲜候选时锚自身就是噪声，拿它去钳邻居的长历史会把锚的偏倚带进画面。
@@ -684,30 +696,52 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 「候选只在面的认领者上发射」（见上方那条闸门）⇒ 一个面里**只有认领者**有证据，其余 texel 在
   // 接上历史之前 `est` 恒为 0。
   let has_evidence = (r.m + sk_m) > 0.0;
-  // CONSTRAINT: 没有证据的 texel **必须写 `a = 0`**，不能写"值是 0 却报有效"：
+  // ---- ⑤′ WAL 注入（**写侧**；语义与取舍见 `gi/wal.wesl` 文件头的「注入点」段）----
+  // 按成熟度把本面的持久条目值混进本 texel 的估计，随后它照常走**整条降噪链**（`gi_face_flatten`
+  // 的逐面平均 → 时域 → 5 轮 atrous）。为什么必须在写侧、而不是像从前那样在**显示端**替换：
+  //   · 显示端替换 = 把那条链的**空间滤波**白算 —— WAL 自己的池化只有 7×7 个面（≈38 屏幕像素，
+  //     且实测约一半 tap 是空的：没被认领过的面没有条目），残余噪声在暗场里就是**固定的斑纹**
+  //     （世界空间固定 ⇒ 等它"收敛"不会消失，它已经收敛了）。实测（2026-10-03 第七轮）：
+  //     Σn≈6700 时墙面仍有肉眼可见的 2~4% 斑纹 ⇒ 观感"脏"。
+  //   · 注入的值是**世界锚定**的 ⇒ 时域那一段不会把它拖出鬼影（重投影落回同一个面 ⇒ 历史里是
+  //     同一个值）；WAL 的设计收益（没有屏幕空间重投影/邻域借用）保留。
+  // CONSTRAINT: 注入必须同时改**纹理**与**逐面合并量**（`FACE_W_RAW*`，下面 ① 段）——
+  // `gi_face_flatten` 会把纹理覆盖成"未注入的均值"，只改一处等于白做。
+  var gi_w = gi;
+  var cov_w = select(0.0, 1.0, has_evidence);
+  if (gi_u.params.y > 0.5) {
+    let s = gi_wal_sample(h.voxel, h.obj_id, h.pal, pk1);
+    if (s.w > 0.0) {
+      gi_w = mix(gi, s.rgb * (gi_u.params.z / GI_PI), s.w);
+      cov_w = max(cov_w, s.w);
+    }
+  }
+  // CONSTRAINT: 没有证据（且没有 WAL 数据）的 texel **必须写 `a = 0`**，不能写"值是 0 却报有效"：
   //   · `dda_main` 把 `a` 当 cov —— `cov = 1` 会把天光乘 `GI_AMBIENT_FLOOR` 压暗 ⇒ 无数据处被渲染成
   //     "天光被压暗 **且** GI = 0" = 全黑（症状：自发光完全照不亮任何体素）；
   //   · `gi_face_flatten` / `dda_face_accum` 的逐面均值按 `a > 0` 取参与集合 ⇒ 把 0 混进去会把
   //     面均值稀释成 0、整片 GI 归零。
   // 覆盖度 cov 与 valid 是同一个场（旧实现单开一张 `gi_cov_out` 写的恒是「valid ? 1 : 0」），
   // 所以这里只写这一张、`dda_main` 从 `a` 自取。
-  textureStore(gi_out, coord, vec4<f32>(gi, select(0.0, 1.0, has_evidence)));
+  textureStore(gi_out, coord, vec4<f32>(gi_w, cov_w));
 
   // ---- ① 逐面合并：把本 texel 的估计定点累加到该面的槽（`gi_face_flatten` 事后取面均值）----
   // 同一个面的所有 texel 的估计是**同一个积分**的独立估计 ⇒ 面内平均是纯降噪（方差 ÷ texel 数）。
   // 只有"槽已被本面认领、且两个键 word 逐位相等"才并：撞键 / 抢在认领之前到达的 texel 一律跳过
   // （那条路退化成逐 texel，只损失收益、不会污染别的面）。
   // 定点 + CAS 预留计数的手法与 `dda_face_accum` 逐字一致（`GI_ACC_*` 的溢出账也共用）。
-  // `has_evidence`：无证据的 texel **不参与**逐面均值（它的 `est` 是 0，"没有数据"不等于"值是 0"，
-  // 混进去会把面均值拉向 0）—— 与 `gi_face_flatten` / `dda_face_accum` 的 `a > 0` 参与集合同一条口径。
-  if (pk_ok && has_evidence) {
+  // `cov_w > 0`（有当帧证据**或** WAL 数据）：两者都"有数据"；都没有的 texel **不参与**逐面均值
+  // （它的 `est` 是 0，"没有数据"不等于"值是 0"，混进去会把面均值拉向 0）—— 与 `gi_face_flatten` /
+  // `dda_face_accum` 的 `a > 0` 参与集合同一条口径。
+  if (pk_ok && cov_w > 0.0) {
     var fok = false;
     // 双探针（`face_slot_find`）：认领可能落在第二格 —— 只探基槽会让那些面**没有面内平均**。
     let fslot = face_slot_find(pk0, pk1, &fok);
     if (fok) {
       let fe = fslot * FACE_WORDS;
       // 归一化 + 定点取整（进位到最近，避免系统性偏暗）—— 与 `dda_face_accum` 同一句。
-      let q = clamp(gi, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+      // 用 `gi_w`（= 注入后的值）：`gi_face_flatten` 拿这个均值覆盖纹理，用未注入的 `gi` 会让注入白做。
+      let q = clamp(gi_w, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
       let qv = vec3<u32>(round(q * GI_ACC_SCALE));
       var reserved = false;
       loop {
