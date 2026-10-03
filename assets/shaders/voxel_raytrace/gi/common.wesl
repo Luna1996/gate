@@ -5,7 +5,7 @@
 //   · `gi/ray.wesl`     —— 射线命中后算键（二次顶点缓存与复用判据都吃它）；
 //   · `gi/denoise.wesl` —— 降噪导引的键与法线打包（与复用判据必须是同一套编码）。
 
-import package::bindings::{face_slots, face_slots_flat, gi_sec_slots};
+import package::bindings::{face_slots, face_slots_flat, gi_region_rev, gi_sec_slots};
 // 面键的编码原点取**该体素所属 volume** 的量化窗口原点（`gi_key_org`）⇒ 需要 `grid_descs` 与 `CHUNK_SIZE`。
 import package::bindings::{grid_descs};
 import package::common::{CHUNK_SIZE};
@@ -91,6 +91,38 @@ fn gi_unkey_voxel(k0: u32, k1: u32, obj: i32) -> vec3<i32> {
   return vec3<i32>(i32(k0 & 0xFFFFu) - 32768,
                    i32((k0 >> 16u) & 0xFFFFu) - 32768,
                    i32(k1 & 0xFFFFu) - 32768) + gi_key_org(obj);
+}
+
+// ============================================================================
+// 区域修订表（`gi_region_rev`）：二次顶点缓存的**局部失效**
+// ============================================================================
+// 解决什么：`gi_sec_slots` 的值（太阳 NEE 的遮挡 + 天光 + 自发光）依赖「别的几何」，旧口径是
+// **任何上传都作废整表**（`ShadeKey.geom` = world_rev）—— 流式世界里每帧成立 ⇒ 缓存等于不存在
+// （见 `gi.rs::ShadeKey` 的 CONSTRAINT）。现在改成：**只有该面附近真的变过，这个面的槽才失效**。
+//
+// 布局：窗口（64³ chunk）按 8³ chunk 切区域；表 = 16³ = 4096 个 u32，**基址 = 该 volume 的量化键
+// 原点**（`gi_key_org`，与面键同源 ⇒ 基准与键永远一致，一起被 `wide_rev` 作废）。
+// Rust 侧每次上传把覆盖到的区域**及其 ±REACH 邻域** +1（膨胀在写侧做 ⇒ 读侧只付一次 load，
+// REACH = ceil(太阳阴影行程 12 chunk / 8) = 2，定义在 `gi.rs::REGION_REACH`）。
+// 取值 0 = 表未就绪 / 非主世界 ⇒ 不参与失效（退化为旧行为）。
+const GI_REGION_CHUNKS: u32 = 8u;
+const GI_REGION_TABLE: u32 = 16u;
+
+/// 命中面 `(v_world, obj)` 的**区域修订号**（0 = 无 / 表未就绪 / 非主世界）。
+///
+/// CONSTRAINT: 与 Rust 侧 `gi.rs::region_cell()` 必须**逐字同源**（常量有单测
+/// `region_consts_match_wesl` 解析本文件比对）：同样的"相对键原点 → chunk → 区域 → 钳制"。
+/// 只用 u32 数学（键原点保证 `v − org ≥ 0`：org ≤ 窗口原点 ≤ 窗口内任何 chunk），
+/// 所以除法即 floor、与 Rust 的 `/` 同口径；越界一律钳到表边界（保守：多失效、不漏失效）。
+fn gi_local_rev(v_world: vec3<i32>, obj: i32) -> u32 {
+  if (obj != -1) { return 0u; }
+  if (arrayLength(&gi_region_rev) < GI_REGION_TABLE * GI_REGION_TABLE * GI_REGION_TABLE) {
+    return 0u;
+  }
+  let rel = max(v_world - gi_key_org(obj), vec3<i32>(0));
+  let chunk = vec3<u32>(rel) / vec3<u32>(CHUNK_SIZE);
+  let cell = min(chunk / vec3<u32>(GI_REGION_CHUNKS), vec3<u32>(GI_REGION_TABLE - 1u));
+  return gi_region_rev[cell.x + GI_REGION_TABLE * (cell.y + GI_REGION_TABLE * cell.z)];
 }
 
 /// 32 位整数混合（RNG 与哈希共用）。
@@ -417,10 +449,15 @@ fn gi_sec_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
 /// 被重新刷上另一个材质时，键逐位不变（`gi_key0`/`gi_key1` 里没有材质），而值从材质来
 /// ⇒ 不进掩码就会把旧材质的颜色一直挂在那个面上。它**不参与槽下标**（`gi_sec_slot_of` 只用明文键）
 /// ⇒ 换材质是"同一个槽重新算"，不是"换一个槽"。
-fn gi_sec_key_masked(k0: u32, k1: u32, epoch: u32, pal: u32) -> vec2<u32> {
+///
+/// `rev` = **区域修订号**（`gi_local_rev`；太阳反弹关掉时调用方传 0）：把"该面附近几何变过"折进
+/// 掩码 ⇒ 只有附近真的变过的槽才失效（局部化；见上面「区域修订表」那一段）。
+/// `rev = 0` 时本函数与引入 rev 之前**逐位相同**（加法项为 0）。
+fn gi_sec_key_masked(k0: u32, k1: u32, epoch: u32, pal: u32, rev: u32) -> vec2<u32> {
   return vec2<u32>(
-    k0 + gi_mix(epoch * 0x9E3779B1u + 0x165667B1u),
-    k1 + gi_mix(gi_mix(epoch + 0x85EBCA77u) + 0x27D4EB2Fu + pal * 0x9E3779B1u),
+    k0 + gi_mix(epoch * 0x9E3779B1u + rev * 0x85EBCA77u + 0x165667B1u),
+    k1 + gi_mix(gi_mix(epoch + 0x85EBCA77u) + rev * 0x27D4EB2Fu + 0x27D4EB2Fu
+                + pal * 0x9E3779B1u),
   );
 }
 

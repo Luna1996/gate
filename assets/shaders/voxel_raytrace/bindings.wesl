@@ -316,6 +316,14 @@ struct FogUniform {
 /// 处理都在 `gi/common.wesl` 的那两段说明里；这里只声明它只被 `gi_main` 使用 ⇒ 只出现在 group(5)。
 @group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
 
+/// @binding(10)：**区域修订表**（`gi/common.wesl` 的「区域修订表」段 / `gi_local_rev`）。
+/// 16³ = 4096 个 u32，基址 = 主世界窗口的**量化键原点**（`gi_key_org`，与面键同源）。
+/// Rust 侧每次上传把覆盖区域**及其 ±REACH 邻域**的计数 +1（膨胀在写侧做 ⇒ 读侧只付一次 load）：
+/// 二次顶点缓存的**局部失效**靠它 —— 旧的粗口径是"任何上传作废整表"，在流式世界里等于没有缓存。
+/// 只被 `gi_main`（经 `gi_local_rev`）使用 ⇒ 与 @binding(9) 同一个先例，只出现在它的 layout。
+/// 表未就绪（占位 buffer）时 `arrayLength` 不足 ⇒ `gi_local_rev` 返回 0（退化为旧行为）。
+@group(5) @binding(10) var<storage, read> gi_region_rev: array<u32>;
+
 // ===== @group(6)：光柱（godray）的**读侧**（只给 `dda_main` 的 pipeline）=====
 // 为什么单开一组而不是塞进 group(5)：group(5) 是「GI 网格」的号段，而光柱的网格尺寸、资源、
 // 生命周期都与 GI 无关（分辨率档各自独立）⇒ 混在一组里会让两个模块的绑定互相牵制。这一组只有

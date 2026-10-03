@@ -80,3 +80,23 @@ fn key_org_q_matches_wesl() {
   let v = gate_render::wesl_consts::parse_u32_consts_in_source(&src)["GI_KEY_ORG_Q"];
   assert_eq!(v, gate_render::gi::KEY_ORG_Q as u32, "gi::KEY_ORG_Q 与 gi/common.wesl 不一致");
 }
+
+/// **区域修订表**的常量两侧必须逐字相等（`gi::REGION_CHUNKS` / `REGION_TABLE` ↔
+/// `gi/common.wesl::GI_REGION_CHUNKS` / `GI_REGION_TABLE`）：不等 = Rust 标记的区域与 shader
+/// 查询的区域错位 ⇒ 二次顶点缓存的局部失效既不覆盖该失效的、又误伤别的（画面滞后或闪烁）。
+#[test]
+fn region_consts_match_wesl() {
+  let path = gate_render::paths::dda_wesl_dir().join("gi").join("common.wesl");
+  let src = std::fs::read_to_string(&path).expect("读不到 gi/common.wesl");
+  let v = gate_render::wesl_consts::parse_u32_consts_in_source(&src);
+  assert_eq!(
+    v["GI_REGION_CHUNKS"],
+    gate_render::gi::REGION_CHUNKS as u32,
+    "gi::REGION_CHUNKS 与 gi/common.wesl 不一致"
+  );
+  assert_eq!(
+    v["GI_REGION_TABLE"],
+    gate_render::gi::REGION_TABLE as u32,
+    "gi::REGION_TABLE 与 gi/common.wesl 不一致"
+  );
+}

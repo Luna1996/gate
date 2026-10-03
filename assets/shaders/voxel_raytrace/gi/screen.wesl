@@ -1,6 +1,6 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
 import package::trace::{make_grid};
@@ -11,6 +11,18 @@ import package::world::{WorldHit, surface_offset, voxel_normal};
 fn diag_texel_sampled(coord: vec2<i32>) -> bool {
   return ((((u32(coord.x) * 73856093u) ^ (u32(coord.y) * 19349663u)) & 63u) == 0u);
 }
+/// 归因槽位（`lod_diag`；语义的权威说明在 `gate-render/src/brickmap/consts.rs::LOD_DIAG_WORDS`）：
+/// 17 = 采样到的**静止像素**数（`px_static`；用来验证空间复用的分档门真的开/关），
+/// 18 = 这些采样像素**并入的 tap 数之和**（×64 计）、19 = 采样到的**命中（非天空）像素**数、
+/// 20 = 其中**面键越界**（`!pk_ok`）的像素数、21 = 其中**孤立**（试过 tap 但一个都没并进来）
+/// 的像素数、22 = 其中**本帧有候选被钳制**的像素数。按 17..22 除以 19（命中像素内）读，
+/// 就能区分"键越界零历史" / "孤立小面的重尾尖峰" / "钳制在不在咬" 三个问题。
+const GI_DIAG_STATIC: u32 = 17u;
+const GI_DIAG_TAPS: u32 = 18u;
+const GI_DIAG_HIT: u32 = 19u;
+const GI_DIAG_PKFAIL: u32 = 20u;
+const GI_DIAG_LONE: u32 = 21u;
+const GI_DIAG_CLAMP: u32 = 22u;
 
 // ============================================================================
 // 屏幕空间 ReSTIR GI —— **GI 的唯一路径**（逐像素 reservoir，每帧完整估计）。
@@ -92,6 +104,11 @@ const GI_RES_W_M: u32 = 7u; // 候选数 M
 const GI_RES_VALID: u32 = 1u;
 /// 主键可编码（体素在 `gi_key_ok` 范围内）⇒ 允许参与复用。
 const GI_RES_PK_OK: u32 = 2u;
+/// 本 texel **孤立**：写 reservoir 的那一帧里，空间复用试过 tap 但**一个同平面 tap 都没并进来**
+/// （`tap_used == 0`）⇒ "面 < 1 texel 且邻域全打在别的面" 的小面/细几何。
+/// 下一帧读它来加记忆窗（`GI_SS_M_CAP_REST_K` 的"孤立"那一半）。放在 bit31：清位用
+/// `& 0x7FFFFFFF`（本工程 WESL 解析器不接受 `~`，别写取反）。
+const GI_RES_LONE: u32 = 0x80000000u;
 
 /// 单个 GI 像素的 reservoir：**累计量 + 判据**，就这些。
 /// `w_sum` / `M` 是跨帧累计量（`M` 上限 = `GI_SS_M_CAP_K` × 本帧新鲜候选数），估计就是 `w_sum / M`。
@@ -317,6 +334,13 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   var prev_ok = false;
   let prev_pc = gi_ss_reproject(h.point, size, &prev_ok);
   gi_den_guide_store(coord, size, true, pk0, pk1, n, prev_ok, prev_pc);
+  // **本像素当帧是否"静止"**（`prev_pc == coord`：命中点上帧的落点就是本像素 ⇒ 相机在此像素上
+  // 没有动）。静止相机下恒真（命中点精确映回本像素，见上面的重投影说明）；一动就假。
+  // 消费者（两处都是"静止没有'位置'风险、放开纯收益"的同一条逻辑）：
+  //   · 本帧的记忆窗倍数（`GI_SS_M_CAP_REST_K`）；
+  //   · ③ 空间复用的限权档（`GI_SS_REUSE_M_K_STATIC`）：静止时 tap 读到的就是同一世界区域的
+  //     上帧统计 ⇒ 把 8 个邻居的证据放开并进来，池化 ×(1+K)、重尾慢漂移的振幅 ÷√(1+K)。
+  let px_static = prev_ok && prev_pc.x == coord.x && prev_pc.y == coord.y;
 
   // ---- 帧内逐面去重：认领本面（`face_slots`，见 `gi/common.wesl` 的表头注释）----
   // 每个 GI texel 用**自己命中的那个面键**去抢一个槽：抢到的成为该面的"认领者"，负责在
@@ -389,6 +413,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
       break;
     }
   }
+  // **上一帧这个 texel 是否"孤立"**（没有任何同平面 tap 可并，见 `GI_RES_LONE` 的说明）：
+  // 它决定本帧的记忆窗倍数（`GI_SS_M_CAP_REST_K` 的"孤立"那一半；候选钳制是全局的，
+  // 与这个位无关）。
+  // 只认上一帧写下的位，本帧末尾再更新（"有没有 tap 可并"要到空间复用那一步才知道）。
+  let lone_prev = hist_ok && (hist.flags & GI_RES_LONE) != 0u;
 
   // ---- ② 新鲜候选：`cand_n` 条余弦加权半球方向（无历史 = 去遮挡 ⇒ 候选数翻倍）----
   // 每条走 `gi_ray_radiance`（1 条 GI 射线，命中时含 1 条太阳 NEE 阴影射线）。
@@ -495,13 +524,18 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   // 记忆窗上限：按"每帧实际候选数相对基准缩小了几倍"放大。减发一侧 ⇒ 窗内样本数 = 基准值
   // （稳态噪声不变、只有响应变慢）；增发一侧按本式取 max(...,1) ⇒ 窗内样本数随之变大。
   // （本项零性能成本，但窗越长光照响应越钝 ⇒ 这就是分摊/重分配的代价。）
-  let m_cap_k = m_cap_base * max(cand_n0 / max(cand_n, 1u), 1u);
+  // **静止或孤立 texel 再 ×`GI_SS_M_CAP_REST_K`**：两类 texel 都"没有别的平均可用"
+  // （静止没有位置风险；孤立没有同平面邻居），加窗只压噪声、不加空间模糊 —— 见那条常量。
+  let cap_mul = select(1u, GI_SS_M_CAP_REST_K, px_static || lone_prev);
+  let m_cap_k = m_cap_base * max(cand_n0 / max(cand_n, 1u), 1u) * cap_mul;
   var r = gi_res_none();
   // **ILP 批量**：批内 `GI_SS_RAY_BATCH` 条射线只差方向、互相独立 ⇒ 先把它们全发出去（多条层次
   // DDA 的依赖 load 同时在飞），再按原本的 `k` 顺序做累计与蓄水池更新。方向序列、样本与比较顺序
   // 都与逐条写法完全一致 ⇒ 结果**逐位相同**（`gi_ray_radiance` 无副作用：它对 `gi_sec_slots` 的
   // 填充是写同值的幂等操作，只影响性能不影响值）。
   // 批大小取 1 即退化成逐条；分帧把 `cand_n` 降到 1~2 时最后一批不满（`nb`），按实际条数跑。
+  // 归因（槽位 22）：本帧有没有候选被钳制（判读钳制是否真的在咬）。
+  var clamped_any = false;
   var k = 0u;
   loop {
     if (k >= cand_n) { break; }
@@ -521,7 +555,20 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     }
     for (var i = 0u; i < nb; i = i + 1u) {
       // 累计量就是全部：辐亮度估计 = `w_sum / M`。
-      r.w_sum = r.w_sum + b_s[i] * GI_PI;
+      var c = b_s[i] * GI_PI;
+      // **候选钳制**（`GI_SS_CAND_CLAMP_K`，作用于全部 texel）：重尾的单样本尖峰（S ≫ 当前估计，
+      // 进来时在 1/窗 的权重上跳一下、再衰减好几秒）在这里被改成斜坡 —— 候选超过
+      // `K × 当前估计`（含时域合并、不含本候选）时钳到该上限。有偏（只会偏暗），
+      // 取舍与 K 的旋钮见那条常量；`K = 0` 时整段被折叠。
+      if (GI_SS_CAND_CLAMP_K > 0.0) {
+        let m_now = r.m + hist.m;
+        if (m_now > 0.5) {
+          let cap = (r.w_sum + hist.w_sum) / m_now * GI_SS_CAND_CLAMP_K;
+          if (c.x > cap.x || c.y > cap.y || c.z > cap.z) { clamped_any = true; }
+          c = min(c, cap);
+        }
+      }
+      r.w_sum = r.w_sum + c;
       r.m = r.m + 1.0;
     }
     k = k + nb;
@@ -558,6 +605,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   let tb = prev_pc;
   var sk_sum = vec3<f32>(0.0);
   var sk_m = 0.0;
+  // 归因（槽位 18）：本 texel 实际并入的 tap 数（读侧除以槽位 19 得"平均并 tap 数"）。
+  var tap_used = 0u;
   // **累加量的前提不成立 ⇒ 本帧不复用空间邻域**（文件头 ⑥）：tap 读的是**上一帧**邻居的 reservoir，
   // 那些累加量同样可能已经失效（同一个理由：代表样本验证不了它）。
   // `r.m < 0.5`：本帧既没发候选（分数预算把本 texel 排到了别的帧）**又**没接上历史 ⇒ 手里没有
@@ -588,18 +637,45 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     let vc = clamp(v, est_self * GI_SS_REUSE_CLAMP_LO, est_self * GI_SS_REUSE_CLAMP_HI);
     sk_sum = sk_sum + vc * wm.w;
     sk_m = sk_m + wm.w;
+    tap_used = tap_used + 1u;
   }
+  // 本帧这个 texel 是否**孤立**：确实试过 tap、但一个同平面 tap 都没并进来（"没有几何关系的
+  // 闸门"整段关掉 tap 的帧 —— 重投影失败 / 世界变过 —— 不算，那种帧保留上一帧的位不算数）。
+  let lone_now = reuse_taps > 0u && tap_used == 0u;
+  // 归因（槽位 17..22）：静止门、并 tap 数、命中 texel 数、面键越界数、孤立 texel 数、
+  // 钳制命中数（1/64 采样，与槽位 13/16 同一个闸门）。判读（分母都用 19 = 命中 texel 数）：
+  // `d[17]/d[19]` = 静止占比；`d[18]/d[19]` = 平均并 tap 数；`d[20]/d[19]` = 面键越界占比；
+  // `d[21]/d[19]` = 孤立占比；`d[22]/d[19]` = 钳制命中占比（钳制在不在咬的直接读数 ——
+  // 太大 ⇒ K 偏小、画面会偏暗；≈0 ⇒ K 偏大、尖峰没被压住）。
+  if (diag_texel_sampled(coord)) {
+    atomicAdd(&lod_diag[GI_DIAG_STATIC], select(0u, 64u, px_static));
+    atomicAdd(&lod_diag[GI_DIAG_TAPS], tap_used * 64u);
+    atomicAdd(&lod_diag[GI_DIAG_HIT], 64u);
+    atomicAdd(&lod_diag[GI_DIAG_PKFAIL], select(0u, 64u, !pk_ok));
+    atomicAdd(&lod_diag[GI_DIAG_LONE], select(0u, 64u, lone_now));
+    atomicAdd(&lod_diag[GI_DIAG_CLAMP], select(0u, 64u, clamped_any));
+  }
+  // 把本帧的"孤立"状态写回**本帧**的 reservoir（`gi_res_store_cur` 已经写过这一格，这里只更新
+  // flags 那一个 word；只有本 texel 的线程会写它，无竞态）—— 下一帧的记忆窗与候选钳制分档用它。
+  // 闸门整段关掉 tap 的帧（重投影失败 / 世界变过）不算数：**保留上一帧的位**，别把状态抖掉。
+  let lone_keep = select(lone_now, hist_ok && (hist.flags & GI_RES_LONE) != 0u, reuse_taps == 0u);
+  gi_res_cur[idx * GI_RES_WORDS + GI_RES_W_FLAGS] =
+    select(r.flags & 0x7FFFFFFFu, r.flags | GI_RES_LONE, lone_keep);
 
   // ---- ⑤ 着色：估计 = w_sum / M = π·⟨L⟩ ⇒ 乘增益、除 π；空间复用只加在这一步 ----
   // 与 ③ 的钳制锚 `est_self` 是同一个量（`w_sum / M`）：钳制就是把借来的值拉回它附近。
   var est = est_self;
   if (sk_m > 0.0) {
-    // **借来的权重不超过我们自己的**（`GI_SS_REUSE_M_K`，默认 `1.0` ⇒ 最多各占一半）。
-    // 空间复用的目的是"抹平相邻面之间的台阶"，**不是**用邻居的长历史替换本像素的估计：
-    // 邻居的 `M` 上限与我们相同，而 8 个 tap 合计可达它的数倍 ⇒ 不设限时本帧几条新鲜样本被完全
-    // 淹没，画面被"上一帧 + 屏幕偏移一格"的值支配（诊断实测：只接受逐位相同的键时拖影基本消失）。
-    // `sk_sum` / `sk_m` 同比例缩 ⇒ 邻居的估计值不变，只压它的权重。
-    let keep = min(1.0, GI_SS_REUSE_M_K * r.m / max(sk_m, 1e-6));
+    // **借来的权重上限分两档**（`px_static` 选档；两档的完整理由见 `GI_SS_REUSE_M_K_STATIC`）：
+    //  · 移动像素（0.25×）：空间复用的目的是"抹平相邻面之间的台阶"，**不是**用邻居的长历史替换
+    //    本像素的估计 —— 判据只证明"同一个面"、不证明"同一个位置"（面键允许沿平面任意平移）：
+    //    一动就把邻居位置上的值（及其长历史）搬进来，在高对比处成拖影（诊断实测：只接受逐位相同
+    //    的键时拖影基本消失）。`sk_sum` / `sk_m` 同比例缩 ⇒ 邻居的估计值不变，只压它的权重。
+    //  · 静止像素（4×）：tap 读到的就是同一世界区域的上帧统计，没有"位置"可借错 ⇒ 旧限权只会
+    //    白白扔掉 8 个邻居的独立证据（重尾慢漂移的振幅 ∝ 1/√证据量）；结果不写回（文件头 ③）
+    //    ⇒ 没有可积累的路径，至多是一次静态的等权模糊。
+    let m_k = select(GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, px_static);
+    let keep = min(1.0, m_k * r.m / max(sk_m, 1e-6));
     let denom = max(r.m + sk_m * keep, 1e-6);
     est = (r.w_sum + sk_sum * keep) / denom;
   }

@@ -1,6 +1,6 @@
 import package::bindings::{gi_sec_slots, light_u};
 import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
-import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
+import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::trace::{SECONDARY_REACH_CHUNKS, make_grid};
 import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal, world_trace_medium_scene};
@@ -123,7 +123,10 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
     let slot = gi_sec_slot_of(k0, k1, &slot_ok);
     if (slot_ok) {
       sb = slot * GI_SEC_WORDS;
-      mine = gi_sec_key_masked(k0, k1, epoch, sh.pal);
+      // 区域修订号（`gi_local_rev`）：**只有太阳反弹打开时**才让"附近几何变过"参与失效 ——
+      // 关掉时二次顶点的值与任何别的几何无关，作废只会白费 ⇒ 恒 0（掩码与旧行为逐位相同）。
+      let rev = select(0u, gi_local_rev(sh.voxel, sh.obj_id), sun_bounce > 0.5);
+      mine = gi_sec_key_masked(k0, k1, epoch, sh.pal, rev);
       if (atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]) == mine.x
           && atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]) == mine.y) {
         let r = vec3<f32>(

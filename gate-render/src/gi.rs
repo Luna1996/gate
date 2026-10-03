@@ -96,15 +96,17 @@ impl LightKey {
 ///     与主光的方向 / 颜色 / 强度**无关**（`gi/ray.wesl::gi_face_shade`）。
 ///     CONSTRAINT: 少了这一条，「时刻自动流逝」这类每帧都在动的主光会让整张表每帧自失效 ——
 ///     缓存等于不存在。实测（2026-09-25，720p/GI 1/2/分帧 8）：epoch 每帧 +1。
-///   · **几何只在遮挡项真的依赖它时才进**：`sun_bounce` 关掉时二次顶点**不发阴影射线** ⇒
-///     值与**任何别的**几何无关 ⇒ 流式挂载 / 卸载与逐体素编辑都不该作废它（它们只改别的体素）。
-///     打开时才回落到 [`GiGpu::world_rev`]（任何上传）—— 那条遮挡项确实依赖远场几何。
+///   · **几何的"局部变化"不进本 key**：它由**区域修订表**承担（`gi_region_rev` / `gi_local_rev`）——
+///     每个槽的掩码里折进"该面附近变没变"，于是只有附近真的变过的槽才失效。为什么不回到"任何上传
+///     都作废整表"的老口径：流式世界里每帧都在挂载 / 卸载 ⇒ 整表每帧自失效 = 缓存等于
+///     不存在（2026-09-25 实测：720p/GI 1/2 档下 `gate_gi` 15.56 ms 里的大头正是这个）。
+/// 本 key 的 `geom` 因此**只看世界整体**（全量重建 / 调色板 / 键原点，= [`GiGpu::wide_rev`]）。
 /// 逐面材质不在本 key 里：它由槽里的 `pal` 参与掩码覆盖（`gi_sec_key_masked`）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ShadeKey {
-  /// 世界几何：`sun_bounce` 关掉时 = [`GiGpu::wide_rev`]（全量重建 / 调色板），
-  /// 打开时 = [`GiGpu::world_rev`]（任何上传，含流式挂载与编辑）。与 `flags.z` 用的是同一个
-  /// `occluder_rev`（见 `prepare_gi`）：两处问的是同一个问题 ——「间接光依赖别的几何吗」。
+  /// **世界整体**几何：= [`GiGpu::wide_rev`]（全量重建 / 调色板 / 键原点；**不含**流式挂载与
+  /// 逐体素编辑 —— 局部变化由区域修订表承担）。与 `flags.z` 用的是同一个 `occluder_rev`（见
+  /// `prepare_gi`）：两处问的是同一个问题 ——「世界整体变了吗」。
   geom: u32,
   /// 主光（仅 `sun_bounce` 打开时有效，关掉时全 0 ⇒ 不进比较）。
   dir: [u32; 3],
@@ -143,6 +145,67 @@ pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
       glam::IVec3::new(o.x / KEY_ORG_Q, o.y / KEY_ORG_Q, o.z / KEY_ORG_Q) * KEY_ORG_Q
     })
     .collect()
+}
+
+// ============================================================================
+// 区域修订表（`gi_region_rev`）：二次顶点缓存的**局部失效**
+// ============================================================================
+// 语义与 shader 侧 `gi/common.wesl::gi_local_rev` 逐字同源（常量有单测 `region_consts_match_wesl`）。
+// 每次上传把覆盖到的区域**及其 ±[`REGION_REACH`] 邻域** +1（膨胀在写侧做 ⇒ 读侧只付一次 load）。
+
+/// 区域边长（chunk）。窗口 64³ chunk ⇒ 8³ = 512 个区域；取 8³ 还让
+/// `ceil(太阳阴影行程 12 chunk / 本值) = 2` 的膨胀半径恰好盖住 NEE 的影响球。
+pub const REGION_CHUNKS: i32 = 8;
+/// 表每轴格数（16³ = 4096 个 u32 = 16 KB）；基址 = 主世界窗口的量化键原点。
+pub const REGION_TABLE: i32 = 16;
+/// 写侧膨胀半径（区域单位）= `ceil(NEE 行程 12 chunk / REGION_CHUNKS)`。
+pub const REGION_REACH: i32 = 2;
+
+/// 窗口原点（chunk）→ 区域表的**基址**（chunk）：与 `gi_key_org` 同一条量化
+/// （截断整除，Q = [`KEY_ORG_Q`] / `CHUNK_SIZE` = 32 chunk）。
+pub fn region_origin(window_origin: glam::IVec3) -> glam::IVec3 {
+  let q = KEY_ORG_Q / gate_voxel::CHUNK_SIZE as i32;
+  glam::IVec3::new(window_origin.x / q, window_origin.y / q, window_origin.z / q) * q
+}
+
+/// 世界 voxel → 区域格（与 shader `gi_local_rev` 同一条公式：相对键原点 → chunk → 区域 → 钳制；
+/// 越界钳到边界 = 保守）。`org_chunks` = [`region_origin`]。
+pub fn region_cell(v_world: glam::IVec3, org_chunks: glam::IVec3) -> glam::IVec3 {
+  let chunk = gate_voxel::CHUNK_SIZE as i32;
+  let rel = (v_world - org_chunks * chunk).max(glam::IVec3::ZERO);
+  (rel / chunk / REGION_CHUNKS).min(glam::IVec3::splat(REGION_TABLE - 1))
+}
+
+/// 一个闭开世界盒 `[lo, hi)` → 标记区域表（含 ±[`REGION_REACH`] 膨胀）。
+/// 盒大到超过 `BIG_BOX_CELLS` 格时退化为"全表 +1"（等价于整表失效，保守且便宜）。
+fn region_mark(table: &mut [u32], lo: glam::IVec3, hi: glam::IVec3, org_chunks: glam::IVec3) {
+  const BIG_BOX_CELLS: i32 = 256;
+  let c0 = region_cell(lo, org_chunks);
+  let c1 = if hi.cmpgt(lo).all() { region_cell(hi - glam::IVec3::ONE, org_chunks) } else { c0 };
+  let span = c1 - c0 + glam::IVec3::ONE;
+  if span.x * span.y * span.z > BIG_BOX_CELLS {
+    for v in table.iter_mut() {
+      *v = v.wrapping_add(1);
+    }
+    return;
+  }
+  for z in c0.z..=c1.z {
+    for y in c0.y..=c1.y {
+      for x in c0.x..=c1.x {
+        for dz in -REGION_REACH..=REGION_REACH {
+          for dy in -REGION_REACH..=REGION_REACH {
+            for dx in -REGION_REACH..=REGION_REACH {
+              let cx = (x + dx).clamp(0, REGION_TABLE - 1);
+              let cy = (y + dy).clamp(0, REGION_TABLE - 1);
+              let cz = (z + dz).clamp(0, REGION_TABLE - 1);
+              let i = (cz * REGION_TABLE * REGION_TABLE + cy * REGION_TABLE + cx) as usize;
+              table[i] = table[i].wrapping_add(1);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 /// **光照阶跃**判据：当前 key 相对上一帧 key 的"最大相对变化"（0 = 没变）。三项取 max：
@@ -425,6 +488,18 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
       buf(8),
       // 二次顶点按面缓存（`gi/common.wesl` 的 `GI_SEC_*`）：只有 `gi_main` 用（GI 射线的命中着色）。
       buf(9),
+      // 区域修订表（`gi/common.wesl` 的「区域修订表」段 / `gi_local_rev`）：只有 `gi_main` 读
+      // ⇒ `read_only = true`（与 WESL 侧 `var<storage, read>` 的声明一致；有独立的 Rust 写入者）。
+      BindGroupLayoutEntry {
+        binding: 10,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
     ],
   )
 }
@@ -629,18 +704,26 @@ pub struct GiGpu {
   /// 正常移动即 ~15 次/s 作废整链（静止之外的画面没有机会累积，表现为"一动就闪"）。量化后只在
   /// 相机跨过 `KEY_ORG_Q` 边界时才变。步长必须与 `gi/common.wesl::GI_KEY_ORG_Q` 相等（有单测闸门）。
   pub key_org: Option<Vec<glam::IVec3>>,
-  /// 世界几何修订号的**任何上传**口径：**每次真实上传**都自增（全量重建 / 调色板 / 任何脏盒 ——
-  /// 含流式挂载与卸载、逐体素编辑）。只在「太阳反弹」打开时才被用（见 `occluder_rev`）：
-  /// 那时二次顶点会发阴影射线，值真的依赖**别的**体素。
-  pub world_rev: u32,
-  /// 上一次真正跑 `gi_main` 的那一帧的 `occluder_rev`（那正是 reservoir 双缓冲里「上帧」的来源帧）
-  /// ⇒ 相等 ⇔ 上帧的累计量在本帧仍然成立。
+  /// **区域修订表**（`gi_region_rev`，`REGION_TABLE³` 个 u32）：Rust 维护、有变化时整表上传。
+  /// 每次上传把覆盖区域 ±[`REGION_REACH`] +1（见 [`region_mark`]）⇒ 二次顶点缓存**局部失效**：
+  /// 只有面附近真的变过的槽才失效（旧口径"任何上传作废整表"在流式世界里等于没有缓存）。
+  region_rev: Vec<u32>,
+  /// 区域表的 GPU 缓冲（16 KB，惰性创建；未创建时 BG5 绑占位 buffer ⇒ shader 侧
+  /// [`gi_local_rev`] 由 `arrayLength` 守卫返回 0）。
+  region_buf: Option<bevy::render::render_resource::Buffer>,
+  /// 表当前的基址（chunk，见 [`region_origin`]；`None` = 还没比过）：基址一变（= 键原点变）
+  /// 就整表 +1 重新起算（与 `wide_rev` 的作废同步）。
+  region_org: Option<glam::IVec3>,
+  /// 区域表上传的**暂存字节**（复用，避免每帧分配）。
+  region_staging: Vec<u8>,
+  /// 上一次真正跑 `gi_main` 的那一帧的 `occluder_rev`（= `wide_rev`；那正是 reservoir 双缓冲里
+  /// 「上帧」的来源帧）⇒ 相等 ⇔ 上帧的累计量在本帧仍然成立。
   /// 它与「本帧是不是光照阶跃」合起来决定 uniform `flags.z`（**允许复用历史**）：
-  /// 遮挡关系变了、或光照一帧内跳过了 [`LIGHT_STEP_MAX`]，都整帧不复用（见 `prepare_gi`）。
+  /// 世界整体变了、或光照一帧内跳过了 [`LIGHT_STEP_MAX`]，都整帧不复用（见 `prepare_gi`）。
   pub world_rev_gi: u32,
-  /// 世界几何修订号的**世界整体**口径：只在**全量重建 / 调色板变化**时自增，
-  /// **不含**流式挂载 / 卸载与逐体素编辑的脏盒。默认（「太阳反弹」关）它就是那个 `occluder_rev` ——
-  /// 间接光与**任何别的**几何无关，所以"世界在流式"不该作废历史（见 `prepare_gi` 的 CONSTRAINT）。
+  /// 世界几何修订号的**世界整体**口径：只在**全量重建 / 调色板变化**（以及键原点变化）时自增，
+  /// **不含**流式挂载 / 卸载与逐体素编辑的脏盒。**它就是那个 `occluder_rev`**（`flags.z` 与
+  /// `ShadeKey.geom` 都用它）—— 局部几何变化改由区域修订表承担，不再整帧丢历史（见 `prepare_gi`）。
   pub wide_rev: u32,
   /// 降噪 pipeline：`[0]` = 时域、`[1..6]` = atrous 第 1..5 轮（步长 1/2/4/8/16）。
   /// layout 只有 group(0) 一份（见 [`gi_den_temporal_layout`] / [`gi_den_atrous_layout`]）；
@@ -752,9 +835,12 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     prev_view_proj: Mat4::IDENTITY,
     res_flip: false,
     key_org: None,
-    // 两者都从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`world_same` 会是真；那时 reservoir 两块
+    region_rev: vec![0; (REGION_TABLE * REGION_TABLE * REGION_TABLE) as usize],
+    region_buf: None,
+    region_org: None,
+    region_staging: Vec::new(),
+    // 从 0 起 ⇒ 首帧若恰好没有检测到任何变化，`world_same` 会是真；那时 reservoir 两块
     // 都是零（M = 0 ⇒ 一律判无效），跳过与否都不会接受任何历史 ⇒ 安全。
-    world_rev: 0,
     world_rev_gi: 0,
     wide_rev: 0,
     den_pipelines: [None; 6],
@@ -851,29 +937,72 @@ fn prepare_gi(
   // ---- 世界几何修订号（uniform `flags.z` = **本帧允不允许复用历史**）----
   // 键只能证明"上帧那个面还在"，证明不了"上帧累计进来的那些光路还成立"：reservoir 里存的是
   // `w_sum` / `M` 这条**累加量**（`gi/screen.wesl` 文件头 ⑥）。
-  // 两个口径，取哪一个由「间接光是否真的依赖**别的**几何」定（`occluder_rev`）：
-  //   · [`GiGpu::world_rev`] —— **任何**上传（流式挂载 / 卸载、逐体素编辑、全量重建 / 调色板）；
-  //   · [`GiGpu::wide_rev`]  —— 只有**世界整体**变（全量重建 / 调色板）。
-  // 判据：二次顶点只有发阴影射线（`sun_bounce`，见 `gi/ray.wesl::gi_face_shade`）时才知道"别的体素"，
-  // 关掉时它与别的几何无关 ⇒ 流式挂载 / 卸载、逐体素编辑都不该作废任何东西。
+  // 口径分两层（2026-10 起）：
+  //   · **世界整体**（[`GiGpu::wide_rev`]）—— 全量重建 / 调色板 / 键原点：整链作废（`flags.z` = 0，
+  //     二次顶点缓存的 `ShadeKey.geom` 也走它）；
+  //   · **局部几何** —— 流式挂载 / 卸载与逐体素编辑：**不再**整帧丢历史，改由**区域修订表**
+  //     （`gi_region_rev`，见 [`region_mark`]）在 shader 侧按面**局部**作废二次顶点缓存。
   //
-  // CONSTRAINT: 用 `world_rev`（任何上传）来判会**每帧**都判"变过" —— 流式世界每帧都在挂载 / 卸载
-  // chunk（实测 720p：`UPLOAD[incremental]` 每帧 6~8 chunk、0.8~1.0 MB）⇒ `flags.z` 恒 0 ⇒
-  // ① 每个像素都走"没有历史"的贵路径（候选数 ×4，实测 `gate_gi` 里 ~10 ms）；
-  // ② 时域累积恒不成立（`M` 每帧从头来）—— 这正是"光影噪声严重、静态也不收敛"的直接原因。
+  // CONSTRAINT: 别把局部几何塞回这里（即别用"任何上传"）—— 流式世界每帧都在挂载 / 卸载 chunk
+  // （实测 720p：`UPLOAD[incremental]` 每帧 6~8 chunk）⇒ `flags.z` 恒 0、缓存每帧整表失效 ⇒
+  // ① 每个像素都走"没有历史"的贵路径（候选数 ×2~4）；② 时域累积恒不成立（`M` 每帧从头来）
+  // —— 这正是"光影噪声严重、静态也不收敛"的直接原因（2026-09-25 实测：720p/GI 1/2 档下
+  // `gate_gi` 15.56 ms 里的大头就是缓存每帧自失效）。
   //
   // 运行时不存在别的几何变化源：物体变换只在建世界时设定，LOD / beam 只改遍历起点、不改最近命中。
-  // 若将来加了「物体动画 / 运行时改变换」，必须让那条路径也自增这两个修订号。
-  let any_upload =
-    dirty.as_ref().is_some_and(|d| d.full || d.palette_changed || !d.boxes.is_empty());
-  if any_upload {
-    gpu.world_rev = gpu.world_rev.wrapping_add(1);
-  }
+  // 若将来加了「物体动画 / 运行时改变换」，必须让那条路径也同时推这两个修订号。
   if dirty.as_ref().is_some_and(|d| d.full || d.palette_changed) {
     gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
   }
-  let occluder_rev = if settings.sun_bounce { gpu.world_rev } else { gpu.wide_rev };
+  let occluder_rev = gpu.wide_rev;
   let world_same = occluder_rev == gpu.world_rev_gi;
+
+  // ---- 区域修订表：把本帧的**局部**几何变化记进去（二次顶点缓存的局部失效）----
+  // 只认主世界窗口（`volume_windows[0]`）；基址 = 窗口原点的量化（与键原点同源，见 [`region_origin`]）。
+  // 基址一变（= 键原点变；那一路 `wide_rev` 也会作废）就整表 +1 重新起算。
+  let mut region_touched = false;
+  if let Some(bm) = brickmap.as_ref()
+    && let Some(w) = bm.volume_windows.first()
+  {
+    let org = region_origin(*w);
+    if gpu.region_org != Some(org) {
+      for v in gpu.region_rev.iter_mut() {
+        *v = v.wrapping_add(1);
+      }
+      gpu.region_org = Some(org);
+      region_touched = true;
+    }
+    if let Some(d) = dirty.as_ref() {
+      // 盒可能属于物体 / 远场卷（已换算成世界坐标）—— 一律折进主世界表（保守：只会多失效）。
+      for b in &d.boxes {
+        region_mark(&mut gpu.region_rev, b.lo, b.hi, org);
+        region_touched = true;
+      }
+    }
+  }
+  if region_touched {
+    // 惰性建 16 KB storage buffer + 整表上传（有变化才写：流式每帧也就 16 KB，可忽略）。
+    let buf = gpu
+      .region_buf
+      .get_or_insert_with(|| {
+        device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
+          label: Some("gate_gi_region_rev"),
+          size: (REGION_TABLE * REGION_TABLE * REGION_TABLE * 4) as u64,
+          usage: bevy::render::render_resource::BufferUsages::STORAGE
+            | bevy::render::render_resource::BufferUsages::COPY_DST,
+          mapped_at_creation: false,
+        })
+      })
+      .clone();
+    // 暂存 vec 先 `take` 出来（借用分割：`gpu` 经 `ResMut` 解引用，字段级拆分通不过借用检查）。
+    let mut staging = std::mem::take(&mut gpu.region_staging);
+    staging.clear();
+    for v in &gpu.region_rev {
+      staging.extend_from_slice(&v.to_le_bytes());
+    }
+    queue.write_buffer(&buf, 0, &staging);
+    gpu.region_staging = staging;
+  }
 
   // ---- ② 二次顶点缓存的 epoch（同一次比对给出「光照阶跃」）----
   // 两个集合刻意不同、各服务一件事（见 [`LightKey`] / [`ShadeKey`] 的说明）：
@@ -946,7 +1075,7 @@ fn prepare_gi(
     // CONSTRAINT: `world_rev_gi` 只跟「GI 链跑没跑」走，**不能**被 `view` 的存在性门住 ——
     // 它的语义是"本帧的 reservoir 是在哪个 `occluder_rev` 下写出的"，与相机矩阵无关。
     // 曾经它与下面的矩阵更新共用一个 `&& view.is_some()`：只要有帧"GI 跑了但没有 view"，
-    // 它就停住，而 `occluder_rev`（太阳反弹关闭时 = `wide_rev`）在启动的全量重建 / 调色板上传时
+    // 它就停住，而 `occluder_rev`（= `wide_rev`）在启动的全量重建 / 调色板上传时
     // 已经推走 ⇒ `world_same` **永久为假** ⇒ `flags.z` 恒 0 ⇒ WESL 侧 `hist_ok` 恒假
     // （`gi/screen.wesl`：`pk_ok && prev_ok && gi_u.flags.z > 0.5`）⇒ 时域累积永不成立
     // = **永不收敛 + 逐帧闪烁**，且与相机是否静止、与任何 GI 档位都无关。
@@ -957,8 +1086,9 @@ fn prepare_gi(
     }
     // **面键的编码原点变了就把整条复用链作废**（shader 侧 `gi/common.wesl::gi_key_org`）：
     // 上一帧所有键都在另一个坐标系里，留着只会让"同面判定"误配。
-    // 推 `wide_rev` 一次同时打到两处（太阳反弹关闭时 `occluder_rev == wide_rev`）：
-    // ① reservoir 历史（`flags.z` = 0，见上面的 `world_same`）② 二次顶点缓存（`ShadeKey.geom` ⇒ epoch）。
+    // 推 `wide_rev` 一次同时打到三处（`occluder_rev` 恒等于 `wide_rev`）：
+    // ① reservoir 历史（`flags.z` = 0，见上面的 `world_same`）② 二次顶点缓存（`ShadeKey.geom` ⇒
+    // epoch）③ 区域修订表（基址变 ⇒ 整表 +1，见上面的区域表维护）。
     // 逐 volume 比（主世界 / 远场级 / 物体各有自己的窗口），任一个变过就整链作废。
     // CONSTRAINT: 原点**已量化**（[`KEY_ORG_Q`]）—— 窗口逐 chunk 跟相机平移，不量化会每跨一格
     // 作废一次（正常移动 ~15 次/s）⇒ 画面没有机会累积。量化后只在相机跨过 Q 边界时才作废。
@@ -1029,6 +1159,9 @@ fn prepare_gi(
     .and_then(|a| a.gi_sec_slots_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
+  // binding 10 = 区域修订表（二次顶点缓存的局部失效）：本帧刚在上方维护/上传；未建时用 4 B 占位
+  // （`gi_local_rev` 会因 `arrayLength` 不足而返回 0 ⇒ 退化为旧行为）。
+  let region_rev = gpu.region_buf.clone().unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
@@ -1037,6 +1170,7 @@ fn prepare_gi(
       BindGroupEntry { binding: 6, resource: guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
       BindGroupEntry { binding: 9, resource: gi_sec_slots.as_entire_binding() },
+      BindGroupEntry { binding: 10, resource: region_rev.as_entire_binding() },
     ],
   );
   commands.insert_resource(GiBg5(bg5));
