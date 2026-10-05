@@ -229,11 +229,6 @@ pub fn draw_text(
   count
 }
 
-//
-//
-//
-//
-
 pub type DisplaceFn<'a> = dyn Fn(Vec3, Vec3) -> f32 + 'a;
 
 #[derive(Clone, Copy)]

@@ -690,8 +690,7 @@ pub(crate) fn voxel_edit_input(
   let entry = *scene.volumes.main().palette().get(pal);
   let (displaced, reason) =
     brush_displaced(entry, size, pbr_set.as_deref(), Some(&mut displace_cache));
-  //
-  let hidden = !displaced && stroke_hidden(scene.volumes.main(), shape, center, brush_radius(size));
+    let hidden = !displaced && stroke_hidden(scene.volumes.main(), shape, center, brush_radius(size));
   let no_backlog = scene
     .volumes
     .list

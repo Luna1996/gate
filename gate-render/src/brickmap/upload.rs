@@ -710,9 +710,7 @@ pub(crate) fn prepare(
     }
   }
 
-  //
-  //
-  static RT_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+      static RT_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
   if !RT_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
     use bevy::render::render_resource::WgpuFeatures;
     let f = device.features();
@@ -734,8 +732,7 @@ pub(crate) fn prepare(
   }
 
   let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
-  //
-  if let Some(occ) = snap.volumes.occ_all.as_ref() {
+    if let Some(occ) = snap.volumes.occ_all.as_ref() {
     queue.write_buffer(&gpu.occ, 0, u8_of_u32(occ));
     gpu.occ_ready = true;
   } else if !gpu.occ_ready {
@@ -829,8 +826,7 @@ pub(crate) fn prepare(
   write(&device, &queue, &mut gpu.state, "gate_state", &snap.state_bytes);
 
   {
-    //
-    if gpu.comp.size() < comp_bytes.max(4) as u64 {
+        if gpu.comp.size() < comp_bytes.max(4) as u64 {
       let placeholder = vec![0u8; comp_bytes.max(4)];
       ensure_with_copy(&device, &queue, &mut gpu.comp, "gate_comp", &placeholder, true);
     }
@@ -1184,10 +1180,7 @@ fn ledger_note(
       if residency.resident_level(c).is_some() {
         residency.note_bytes(c, bytes);
       } else {
-        //
-        //
-        //
-        let lv = if streamed {
+                                let lv = if streamed {
           let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
           crate::brickmap::residency::raw_level((center - cam_now).length() * px)
         } else {
@@ -1240,10 +1233,7 @@ fn plan_residency(
   state.residency.tick(frame);
   let px = crate::brickmap::dda::px_ang(crate::consts::VIEW_SIZE.y as f32);
 
-  //
-  //
-  //
-  let streamed = grid.stream_window().is_some();
+        let streamed = grid.stream_window().is_some();
   let seq = grid.resident_seq();
   let epoch = grid.resident_log_epoch();
   let changes = grid.resident_log_from(*ledger_cursor);
@@ -1281,8 +1271,7 @@ fn plan_residency(
   *ledger_seq = seq;
   sd.mark(0);
 
-  //
-  if empty_cursor.len() != scene.volumes.len() {
+    if empty_cursor.len() != scene.volumes.len() {
     empty_cursor.resize(scene.volumes.len(), 0);
   }
   for (vol, g) in scene.volumes.all().iter().enumerate() {
@@ -1320,9 +1309,7 @@ fn plan_residency(
   sd.mark(1);
 
   sd.mark(2);
-  //
-  //
-  let cap_chunks = pool_capacity_chunks(scene.residency_budget_bytes);
+      let cap_chunks = pool_capacity_chunks(scene.residency_budget_bytes);
   let want_bytes = gpu_pool_bytes(cap_chunks);
   let binding_cap = main_region_byte_cap(
     device.limits().max_storage_buffer_binding_size,
@@ -1358,16 +1345,13 @@ fn plan_residency(
       continue;
     }
     let cur = state.residency.resident_level(c).unwrap_or(gate_voxel::BRICK_FACTOR);
-    //
-    if streamed && cur == gate_voxel::BRICK_FACTOR {
+        if streamed && cur == gate_voxel::BRICK_FACTOR {
       continue;
     }
     let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
     let dist = (center - cam_pos).length();
     let lv = want_level(dist, px, cur);
-    //
-    //
-    let lv = if streamed { lv.min(cur) } else { lv };
+            let lv = if streamed { lv.min(cur) } else { lv };
     wants.push((c, lv));
   }
   sd.mark(4);
@@ -1484,9 +1468,7 @@ fn plan_residency(
     }
   }
   sd.mark(7);
-  //
-  //
-  if installed == 0 && evicted == 0 {
+      if installed == 0 && evicted == 0 {
     let (mut gap_count, mut gap_nearest) = (0usize, None);
     for dy in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {
       for dz in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {

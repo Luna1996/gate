@@ -3,11 +3,6 @@ import package::common::{sky_rgb};
 import package::trace::{make_grid};
 import package::world::{world_cfg_full, world_raycast};
 
-//
-//
-//
-//
-
 const SUN_DISK_GAIN: f32 = 3.0;
 const LIMB_POW: f32 = 0.5;
 const HALO_T: f32 = 10.0;

@@ -1,40 +1,4 @@
 
-//
-
-
-
-
-//
-
-
-
-
-
-
-
-
-
-//
-
-
-
-
-
-
-
-
-
-
-
-
-//
-
-
-
-
-//
-
-
 
 import package::bindings::{gi_u, gi_wal};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok, gi_key_org, gi_local_rev, gi_mix};
@@ -47,30 +11,13 @@ const GI_WAL_MATURE_N: f32 = 64.0;
 
 const GI_WAL_RESET_N: f32 = 16.0;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const GI_WAL_POOL_R: i32 = 3;
-
 
 fn gi_wal_nmask() -> u32 {
   let n = arrayLength(&gi_wal) / GI_WAL_WORDS;
   if (n < 16u || (n & (n - 1u)) != 0u) { return 0u; }
   return n - 1u;
 }
-
 
 fn gi_wal_slot(v_world: vec3<i32>, face: u32, obj: i32, nmask: u32) -> u32 {
   let rkey = face | ((u32(obj) + 1u) << 3u);
@@ -80,25 +27,19 @@ fn gi_wal_slot(v_world: vec3<i32>, face: u32, obj: i32, nmask: u32) -> u32 {
   return h & nmask;
 }
 
-
-
-
-
 fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32 {
   
   
   
   
   
-  //
+    
   
   
   
   
   
-  
-  //
-  
+    
   
   
   var rev = 0u;
@@ -107,8 +48,6 @@ fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32
           + gi_mix(u32(org.y)
             + gi_mix(u32(org.z) + gi_mix(rev + pal * 0x9E3779B1u))));
 }
-
-
 
 fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
                 sum_e: vec3<f32>, cnt: u32) {
@@ -153,7 +92,6 @@ fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
   atomicStore(&gi_wal[b], k0);
 }
 
-
 fn gi_wal_fetch(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32, face: u32,
                 nmask: u32, k0: u32, k1: u32) -> vec4<f32> {
   let b = gi_wal_slot(v_world, face, obj, nmask) * GI_WAL_WORDS;
@@ -165,12 +103,6 @@ fn gi_wal_fetch(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32, face: u3
                    bitcast<f32>(atomicLoad(&gi_wal[b + 4u])),
                    bitcast<f32>(atomicLoad(&gi_wal[b + 5u])), n);
 }
-
-
-
-
-
-
 
 fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
   let nmask = gi_wal_nmask();
@@ -195,9 +127,6 @@ fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
   }
   return vec4<f32>(sum, cnt);
 }
-
-
-
 
 fn gi_wal_sample(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
   let p = gi_wal_pool(v_world, obj, pal, k1);

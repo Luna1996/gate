@@ -17,12 +17,6 @@ const GI_DIAG_PKFAIL: u32 = 20u;
 const GI_DIAG_LONE: u32 = 21u;
 const GI_DIAG_CLAMP: u32 = 22u;
 
-//
-//
-//
-//
-//
-
 const GI_RES_WORDS: u32 = 8u;
 const GI_RES_W_FLAGS: u32 = 0u; const GI_RES_W_PK: u32 = 1u; const GI_RES_W_NRM: u32 = 3u;
 const GI_RES_W_WSUM: u32 = 4u; const GI_RES_W_M: u32 = 7u; 
@@ -136,7 +130,6 @@ fn gi_ss_reproject(p_world: vec3<f32>, size: vec2<u32>, ok: ptr<function, bool>)
   return c;
 }
 
-
 fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
       if (diag_texel_sampled(coord)) {
     atomicAdd(&lod_diag[13u], 64u);
@@ -198,8 +191,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     }
   }
 
-                    //
-                  var hist = gi_res_none();
+                                      var hist = gi_res_none();
   var hist_ok = false;
         if (pk_ok && prev_ok && gi_u.flags.z > 0.5) {
     for (var s = 0u; s <= GI_HIST_SEARCH_TAPS; s = s + 1u) {
@@ -219,18 +211,15 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
                         let hq = u32(gi_u.flags.w) >= 3u;
   let base_n = select(GI_SS_CAND_N, GI_SS_CAND_N_HQ, hq);
   let cand_n0 = select(base_n, base_n * 2u, !hist_ok);
-      //
-        if (hist_ok && diag_texel_sampled(coord)) {
+              if (hist_ok && diag_texel_sampled(coord)) {
     atomicAdd(&lod_diag[16u], 64u);
   }
               let share = max(u32(gi_u.misc.y), 1u);
-        //
-              let m_cap_base = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq);
+                      let m_cap_base = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq);
   let err_tier = u32(gi_u.misc.z);
   var b_err = 1.0;
   if (err_tier > 0u) {
-        //
-                                let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
+                                        let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
             let warm_m = f32(m_cap_base * cand_n0);
     b_err = select(hi, 1.0, hist_ok && hist.m >= warm_m);
   }
@@ -245,10 +234,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
       }
     }
   }
-    //
-    //
-          //
-        const GI_SS_CLAIM_ONLY: u32 = 0u;
+                          const GI_SS_CLAIM_ONLY: u32 = 0u;
   if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
     var fok2 = false;
         let fs2 = face_slot_find(pk0, pk1, &fok2);
@@ -306,8 +292,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m));
   }
 
-                      //
-              let tb = prev_pc;
+                                    let tb = prev_pc;
   var sk_sum = vec3<f32>(0.0);
   var sk_m = 0.0;
     var tap_used = 0u;

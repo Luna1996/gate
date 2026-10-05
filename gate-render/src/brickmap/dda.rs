@@ -1,9 +1,5 @@
 
 
-
-
-
-
 use bevy::{
   asset::RenderAssetUsages,
   image::Image,
@@ -13,11 +9,9 @@ use bevy::{
 use glam::camera::{rh::proj, rh::view};
 use std::ops::Mul;
 
-
 pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
 
 pub const DDA_WORKGROUP_SIZE: u32 = 8;
-
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
@@ -39,14 +33,12 @@ impl Default for RenderScale {
   }
 }
 
-
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct PostFxSettings {
   
   pub fxaa: bool,
 }
-
 
 #[derive(Resource, Clone, Copy)]
 pub struct DdaCameraConfig {
@@ -76,18 +68,12 @@ impl DdaCameraConfig {
   }
 }
 
-
-
 #[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct DebugNormals(pub u32);
 
-
 pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians();
 pub const DIST_MIN: f32 = 32.0;
-
-
-
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
@@ -154,7 +140,6 @@ impl DdaCameraConfig {
   }
 }
 
-
 #[derive(Resource, Clone, Copy, ShaderType)]
 pub struct DdaViewUniform {
   pub view_proj: Mat4,
@@ -167,13 +152,9 @@ pub struct DdaViewUniform {
   pub lod: Vec4,
 }
 
-
 use crate::brickmap::consts::{
   DDA_BEAM, DDA_CHUNKWALK, DDA_DIR_LUT, DDA_LOD, DDA_MAKEGRID_ONLY, DDA_SKY_ONLY, EYE_ADAPT,
 };
-
-
-
 
 pub fn px_ang(render_h: f32) -> f32 {
   2.0 * (crate::brickmap::consts::DDA_FOV_Y * 0.5).tan() / render_h.max(1.0)
@@ -211,14 +192,11 @@ impl DdaViewUniform {
   }
 }
 
-
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct DdaImages {
   pub target: Handle<Image>,
 }
-
-
 
 pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
   let mut image = Image::new_target_texture(
@@ -234,7 +212,6 @@ pub fn create_dda_image(images: &mut Assets<Image>) -> Handle<Image> {
     | TextureUsages::COPY_DST;
   images.add(image)
 }
-
 
 pub mod wgsl_consts {
   pub const CHUNK_SIZE: u32 = 256;
@@ -260,12 +237,6 @@ pub mod wgsl_consts {
   
   pub const SHADOW_SURFACE_EPS: f32 = 0.03125;
 }
-
-
-
-
-
-
 
 use bevy::{
   core_pipeline::schedule::{Core2d, Core2dSystems, camera_driver},
@@ -306,22 +277,8 @@ pub(crate) struct DdaBg3BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
 struct DdaBlitBindGroup(BindGroup);
 
-
 #[derive(Resource)]
 pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[derive(Resource, Default)]
 pub(crate) struct AuxTexCache {
@@ -379,17 +336,8 @@ pub(crate) struct AuxTexCache {
   region_table: Option<Buffer>,
 }
 
-
-
-
 pub(crate) const DEN_ATROUS_CHAINS: [[usize; 2]; 6] =
   [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3], [2, 1]];
-
-
-
-
-
-
 
 pub(crate) const DEN_ATROUS_ROUNDS: [[usize; 5]; 5] =
   [[3, 0, 0, 0, 0], [0, 4, 0, 0, 0], [0, 1, 2, 0, 0], [0, 1, 5, 4, 0], [0, 1, 5, 1, 2]];
@@ -472,8 +420,6 @@ pub(crate) struct DdaPipelines {
   blit_fxaa_pipeline: CachedRenderPipelineId,
 }
 
-
-
 #[derive(bevy::ecs::resource::Resource)]
 pub struct EyeAdaptGpu {
   pub buf: Option<Buffer>,
@@ -498,8 +444,6 @@ impl Default for EyeAdaptGpu {
   }
 }
 
-
-
 fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResMut<EyeAdaptGpu>) {
   let Some(s) = eye_set else {
     return;
@@ -510,8 +454,6 @@ fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResM
   eye.settings = *s;
   eye.settings_dirty = true;
 }
-
-
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
@@ -545,11 +487,9 @@ impl EyeAdaptSettings {
   }
 }
 
-
 const EYE_PARAM_WORD: u64 = 72;
 
 const EYE_PARAM_OFFSET: u64 = EYE_PARAM_WORD * 4;
-
 
 fn eye_param_bytes(s: EyeAdaptSettings) -> [u8; 20] {
   let mut out = [0u8; 20];
@@ -1035,9 +975,6 @@ pub(crate) fn init_dda_pipelines(
   commands.insert_resource(AuxTexCache::default());
   commands.insert_resource(EyeAdaptGpu::default());
 }
-
-
-
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct DdaTune<'w> {
@@ -1555,13 +1492,7 @@ pub(crate) fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
-
-
-
-
-
 const RT_INSERT_PER_FRAME: u32 = 1024;
-
 
 #[derive(Default)]
 struct RtSyncCursor {
@@ -1573,12 +1504,6 @@ struct RtSyncCursor {
   
   stat: u32,
 }
-
-
-
-
-
-
 
 fn prepare_rt_scene(
   mut rt: ResMut<super::rt::RtScene>,
@@ -1692,12 +1617,7 @@ fn prepare_rt_scene(
   }
 }
 
-
 const RT_STAT_FRAMES: u32 = 240;
-
-
-
-
 
 fn sync_rt_scene(mut ctx: RenderContext, mut rt: ResMut<super::rt::RtScene>) {
   if !rt.is_enabled() {

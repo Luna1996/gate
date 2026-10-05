@@ -1,23 +1,11 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
 use bevy::render::render_resource::{
   BindGroupLayoutDescriptor, CachedComputePipelineId, ShaderType,
 };
 use glam::{Mat4, UVec2, UVec4, Vec4};
 
 use crate::wesl_consts::gi_consts;
-
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, ShaderType)]
@@ -50,10 +38,6 @@ pub struct GiUniform {
   
   pub prev_view_proj: Mat4,
 }
-
-
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LightKey {
@@ -88,21 +72,6 @@ impl LightKey {
   }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ShadeKey {
   
@@ -123,19 +92,11 @@ impl ShadeKey {
   }
 }
 
-
-
 const LIGHT_DIR_MIN_MAG: f32 = 0.02;
-
-
 
 const LIGHT_STEP_MAX: f32 = 0.5;
 
-
-
-
 pub const KEY_ORG_Q: i32 = 8192;
-
 
 pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
   let chunk = gate_voxel::CHUNK_SIZE as i32;
@@ -148,51 +109,29 @@ pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
     .collect()
 }
 
-
-
-
-
-
-
-
-
 pub const REGION_CHUNKS: i32 = 8;
 
 pub const REGION_TABLE: i32 = 16;
-
-
-
 
 pub const REGION_TABLE_BYTES: u64 =
   (REGION_TABLE as u64) * (REGION_TABLE as u64) * (REGION_TABLE as u64) * 4;
 
 pub const REGION_REACH: i32 = 2;
 
-
-
-
-
-
 pub const WAL_SLOTS: u64 = 1 << 20;
 
 pub const WAL_WORDS: u64 = 8;
-
-
 
 pub fn region_origin(window_origin: glam::IVec3) -> glam::IVec3 {
   let q = KEY_ORG_Q / gate_voxel::CHUNK_SIZE as i32;
   glam::IVec3::new(window_origin.x / q, window_origin.y / q, window_origin.z / q) * q
 }
 
-
-
 pub fn region_cell(v_world: glam::IVec3, org_chunks: glam::IVec3) -> glam::IVec3 {
   let chunk = gate_voxel::CHUNK_SIZE as i32;
   let rel = (v_world - org_chunks * chunk).max(glam::IVec3::ZERO);
   (rel / chunk / REGION_CHUNKS).min(glam::IVec3::splat(REGION_TABLE - 1))
 }
-
-
 
 fn region_mark(table: &mut [u32], lo: glam::IVec3, hi: glam::IVec3, org_chunks: glam::IVec3) {
   const BIG_BOX_CELLS: i32 = 256;
@@ -224,10 +163,6 @@ fn region_mark(table: &mut [u32], lo: glam::IVec3, hi: glam::IVec3, org_chunks: 
   }
 }
 
-
-
-
-
 fn light_jump(prev: &LightKey, now: &LightKey) -> f32 {
   let vec3 = |v: [u32; 3]| glam::Vec3::from(v.map(f32::from_bits));
   let rel = |a: [u32; 3], b: [u32; 3]| -> f32 {
@@ -241,7 +176,6 @@ fn light_jump(prev: &LightKey, now: &LightKey) -> f32 {
   };
   rel(prev.sun_c, now.sun_c).max(rel(prev.sky, now.sky)).max(dir)
 }
-
 
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
 pub struct GiSettings {
@@ -334,8 +268,6 @@ pub struct GiSettings {
   
   pub depth: u32,
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenoisePlan {
@@ -440,8 +372,6 @@ impl Default for GiSettings {
   }
 }
 
-
-
 pub fn gi_bg4_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -473,10 +403,6 @@ pub fn gi_bg4_layout() -> BindGroupLayoutDescriptor {
     ],
   )
 }
-
-
-
-
 
 pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
@@ -542,9 +468,6 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
-
-
-
 pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -600,9 +523,6 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
     ],
   )
 }
-
-
-
 
 pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
@@ -675,12 +595,6 @@ pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
     ],
   )
 }
-
-
-
-
-
-
 
 pub fn gi_flatten_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
@@ -783,11 +697,8 @@ pub struct GiGpu {
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiBg4(pub bevy::render::render_resource::BindGroup);
 
-
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
-
-
 
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
@@ -981,14 +892,12 @@ fn prepare_gi(
   
   
   
-  //
+    
   
   
   
   
-  
-  //
-  
+    
   
   if dirty.as_ref().is_some_and(|d| d.full || d.palette_changed) {
     gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
@@ -1043,8 +952,7 @@ fn prepare_gi(
   
   
   
-  //
-  
+    
   
   
   

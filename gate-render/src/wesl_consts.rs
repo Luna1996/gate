@@ -59,7 +59,6 @@ pub struct TraceConsts {
 const TRACE_REQUIRED: &[&str] =
   &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX", "GRID_VOLUMES", "INDEX_ENTRY_EMPTY"];
 
-
 pub fn gi_consts() -> &'static GiConsts {
   static CONSTS: OnceLock<GiConsts> = OnceLock::new();
   CONSTS.get_or_init(GiConsts::load)

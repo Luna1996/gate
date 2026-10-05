@@ -299,8 +299,7 @@ impl View {
       let (rep, _) = self.section(base.x, base.y, base.z)?;
       return Some(rep);
     }
-    //
-    let per_layer = (n * n) as usize;
+        let per_layer = (n * n) as usize;
     debug_assert!(
       (n * n * n) as usize <= MAX_CELL_SECTIONS,
       "一格的节数 {n}³ 超过栈缓冲上限 —— `FAR_SCALES` 是不是加了更大的级？"
@@ -464,8 +463,7 @@ fn column(world: &World, names: &Mutex<Interner>, cx: i32, cz: i32) -> Option<Ve
         .collect()
     };
     let fine = fine_cells(&ids, &buf, &mut counts);
-    //
-    let mut cells = [FINE_AIR; FINE_TOTAL];
+        let mut cells = [FINE_AIR; FINE_TOTAL];
     {
       let mut i = 0usize;
       for &(name, len) in &fine {

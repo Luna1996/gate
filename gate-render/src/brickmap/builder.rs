@@ -403,8 +403,7 @@ impl BrickMapBuilder {
     self.chunks.get(&coord).map(|s| s.base)
   }
 
-  //
-
+  
   pub fn is_resident(&self, coord: ChunkCoord) -> bool {
     self.chunks.contains_key(&coord)
   }
@@ -622,14 +621,10 @@ impl BrickMapBuilder {
     const REGION_WORDS_CAP: usize = 512 * 1024 * 1024;
     let used = self.buffers.b_struct.len().saturating_sub(TREE_BASE);
     let per_chunk = (used / self.chunks.len().max(1)).max(block_cap);
-    //
-    let region_chunks = self.region_chunks.min(REGION_CHUNKS_CAP);
+        let region_chunks = self.region_chunks.min(REGION_CHUNKS_CAP);
     let per_chunk = per_chunk.min(PER_CHUNK_WORDS_CAP);
     let target = (TREE_BASE + region_chunks.saturating_mul(per_chunk)).min(REGION_WORDS_CAP);
-    //
-    //
-    //
-    if self.reserve > 0 && target > self.buffers.b_struct.len() {
+                if self.reserve > 0 && target > self.buffers.b_struct.len() {
       let from = self.buffers.b_struct.len();
       bevy::log::debug!(
         "树区长度一次顶到位：{from} → {target} 字（块 {}、每块估 {per_chunk} 字）",
@@ -785,8 +780,7 @@ impl BrickMapBuilder {
     let content = out.len();
     debug_assert!(content == new_words || id == 0, "节点 {id} 的编码字数与定址口径不符");
 
-    //
-    if old_off != NODE_NONE && level < 3 && view.mask == 0 {
+        if old_off != NODE_NONE && level < 3 && view.mask == 0 {
       let old_at = slot.base + old_off as usize;
       let old_mask = read_mask(&self.buffers.b_struct, old_at);
       for slot_i in 0..old_mask.count_ones() as usize {

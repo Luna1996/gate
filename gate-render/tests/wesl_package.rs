@@ -1,18 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[test]
 fn wesl_package_compiles_and_validates() {
   for ray_query in [false, true] {
@@ -62,16 +49,11 @@ fn validate_all_entries(src: &str, ray_query: bool) {
   .expect("WGSL 校验失败");
 }
 
-
-
 #[test]
 fn cross_language_consts_parse_from_wesl() {
   gate_render::wesl_consts::gi_consts();
   gate_render::wesl_consts::trace_consts();
 }
-
-
-
 
 #[test]
 fn key_org_q_matches_wesl() {
@@ -80,9 +62,6 @@ fn key_org_q_matches_wesl() {
   let v = gate_render::wesl_consts::parse_u32_consts_in_source(&src)["GI_KEY_ORG_Q"];
   assert_eq!(v, gate_render::gi::KEY_ORG_Q as u32, "gi::KEY_ORG_Q 与 gi/common.wesl 不一致");
 }
-
-
-
 
 #[test]
 fn region_consts_match_wesl() {

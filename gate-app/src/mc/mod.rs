@@ -62,9 +62,7 @@ pub fn build(
   let c = cam_eye.div_euclid(IVec3::splat(chunk));
   let win = WINDOW_CHUNKS;
   grid.set_stream_window(Some((c - IVec3::splat(win), IVec3::splat(win * 2))));
-  //
-  //
-  let cover = NEAR_COVER_CHUNKS;
+      let cover = NEAR_COVER_CHUNKS;
   grid.set_coverage_r(cover as f32 * chunk as f32);
   grid.set_attach_far(true);
   let half = IVec3::splat(WINDOW_CHUNKS * chunk);

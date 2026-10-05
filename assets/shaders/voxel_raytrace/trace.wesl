@@ -12,7 +12,6 @@ struct VoxelHit {
   voxel: vec3<i32>,
 }
 
-//
 struct MediumRay {
   stop_on_air: bool,
   palette_base: u32,
@@ -45,7 +44,6 @@ fn diag_sampled(addr: u32) -> bool {
   return LOD_DIAG == 1u && (addr & 63u) == 0u;
 }
 
-
 const REQ_ENABLE: u32 = 0u;
 const REQ_SAMPLE: u32 = 16u;
 const REQ_PER_RAY_MAX: u32 = 2u;
@@ -56,15 +54,10 @@ const REQ_LEVEL_KEEP: u32 = 1u;
 
 const GRID_VOLUMES: u32 = 4u;
 
-//
-//
-//
-//
 const USE_WORDS: u32 = 64u * 64u * 64u;
 const USE_TICK: u32 = 2u;
 const USE_BASE: u32 = 3u;
 const REQ_BASE: u32 = 3u + GRID_VOLUMES * USE_WORDS;
-
 
 fn req_level(fp: f32) -> u32 {
   if (fp >= 64.0) { return 3u; }
@@ -498,7 +491,6 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   return VoxelHit(false, 0.0, 0u, 0u, vec3<i32>(0));
 }
 
-
 struct UnifiedHit {
   hit: bool,
   t: f32,
@@ -515,10 +507,8 @@ fn grid_hit(h: VoxelHit, ci: vec3<i32>,
 
 const SECONDARY_REACH_CHUNKS: f32 = 12.0;
 
-
 const OCC_SKIP: u32 = 1u;
 const OCC_WORDS: u32 = (64u * 64u * 64u) / 32u;
-
 
 const RT_QUERY_BUDGET: u32 = 64u;
 const RT_TRUST_MISS: u32 = 0u;
@@ -722,7 +712,6 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
     side,
     vec3<u32>(face_x & 1u, face_y & 1u, face_z & 1u),
     dir_mask);
-        //
       @if(ray_query)
   if (obj_id < 0 && !penetrate) {
     var ex: u32 = 0u;
@@ -748,11 +737,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   for (var step_c: u32 = 0u; step_c < max_chunk_steps; step_c = step_c + 1u) {
     let t_exit_c = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
     let t1 = min(t_exit_c, tl1);
-        //
-        //
-                                //
-            //
-            var group_empty = false;
+    var group_empty = false;
     if (OCC_SKIP != 0u && vol < GRID_VOLUMES && REQ_ENABLE == 0u) {
       let rg = ci - index_origin;
       if (all(rg >= vec3<i32>(0)) && all(vec3<u32>(rg) < index_dims)) {
@@ -865,7 +850,6 @@ fn make_grid(idx: u32) -> Grid {
         select(-1i, i32(idx) - 1i, idx > 0u),
     idx,                                       d.coverage_r,                            );
 }
-
 
 const GRID_FLAG_FAR: u32 = 1u;
 

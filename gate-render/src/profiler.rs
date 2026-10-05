@@ -431,8 +431,7 @@ fn report_lod_diag(
     d[8],
     pct(d[8]),
   );
-  //
-  let main_total = (d[9]).max(1);
+    let main_total = (d[9]).max(1);
   let mpct = |v: u32| v as f32 * 100.0 / main_total as f32;
   info!(
     "DIAG[主射线 {} 条（1/64 采样）| 近场 {} {:.1}% 远场 {} {:.1}% 天空 {} {:.1}%]",
@@ -444,8 +443,7 @@ fn report_lod_diag(
     d[12],
     mpct(d[12]),
   );
-  //
-  let gi_texels = (d[13]).max(1);
+    let gi_texels = (d[13]).max(1);
   let gi_hits = (d[19]).max(1);
   info!(
     "DIAG[GI {} texel|候选射线 {}（{:.1}/texel）| NEE 阴影 {}（{:.1}/texel）| 命中历史 {:.1}%| \
@@ -712,8 +710,7 @@ fn report_lod_requests(
     touched.iter().map(|&k| (k as usize, counts[k as usize])).filter(|(_, v)| *v > 0).collect();
   let distinct = top.len();
   top.sort_unstable_by_key(|(k, v)| (std::cmp::Reverse(*v), *k));
-  //
-  let mut per_vol = [0usize; VOLUMES];
+    let mut per_vol = [0usize; VOLUMES];
   top.retain(|(k, _)| {
     let v = k / USE_WORDS;
     if v < VOLUMES && per_vol[v] < crate::brickmap::consts::REQ_FEED_MAX {

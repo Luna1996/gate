@@ -7,11 +7,6 @@ import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_norm
 
 const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 
-//
-//
-//
-//
-
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
         if (((u32(bitcast<i32>(origin.x * 64.0)) ^ u32(bitcast<i32>(sun_dir.x * 4096.0))) & 63u) == 0u) {
     atomicAdd(&lod_diag[15u], 64u);

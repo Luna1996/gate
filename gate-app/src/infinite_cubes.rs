@@ -554,11 +554,7 @@ pub fn stream_chunks(
       }
       sd.mark(5);
 
-      //
-      //
-      //
-      //
-      let seq = grid.resident_seq();
+                              let seq = grid.resident_seq();
       let over_cap = grid.chunk_count() > cap;
       let need_scan = scope.moved
         || (*frames % SWEEP_FRAMES == 0)
@@ -575,8 +571,7 @@ pub fn stream_chunks(
           out.push(*c);
         }
       }
-      //
-      let over = resident.len().saturating_sub(out.len()).saturating_sub(cap);
+            let over = resident.len().saturating_sub(out.len()).saturating_sub(cap);
       st.trim_idle = false;
       if over > 0 {
         let mut cand: Vec<(u64, ChunkCoord)> = Vec::new();
@@ -1112,8 +1107,7 @@ fn plan_generation(
   let from_req = picked.len();
   let budget = cap.saturating_sub(from_req);
   if budget > 0 {
-    //
-    let r = coarse_radius.max(load_radius);
+        let r = coarse_radius.max(load_radius);
     let h = coarse_height;
     let (nx, ny, nz) = ((2 * r + 1) as usize, (2 * h + 1) as usize, (2 * r + 1) as usize);
     let mut seen = vec![0u64; (nx * ny * nz + 63) / 64];
@@ -1132,9 +1126,7 @@ fn plan_generation(
     }
     let detail_for = |c: IVec3| preload_detail(c, center);
     let mut todo: Vec<IVec3> = Vec::new();
-    //
-    //
-    let mut push = |c: IVec3, todo: &mut Vec<IVec3>| {
+            let mut push = |c: IVec3, todo: &mut Vec<IVec3>| {
       if !in_window(c) || have(c, detail_for(c)) {
         return;
       }
@@ -1153,8 +1145,7 @@ fn plan_generation(
         }
       }
     }
-    //
-    let r2 = coarse_radius * coarse_radius;
+        let r2 = coarse_radius * coarse_radius;
     for dx in -coarse_radius..=coarse_radius {
       for dz in -coarse_radius..=coarse_radius {
         if dx * dx + dz * dz > r2 {
@@ -1201,8 +1192,7 @@ fn plan_generation_far(
   }
   let mut seen: std::collections::HashSet<IVec3> = out.iter().map(|(c, _)| *c).collect();
   let mut todo: Vec<IVec3> = Vec::new();
-  //
-  let outer = r_out.min(scope.w_dims.min_element() / 2);
+    let outer = r_out.min(scope.w_dims.min_element() / 2);
   let (lo2, hi2) = {
     let r = r_in.min(outer);
     (r * r, outer * outer)

@@ -2,5 +2,4 @@ edition = "2024"
 
 use_small_heuristics = "Max"
 
-
 tab_spaces = 2

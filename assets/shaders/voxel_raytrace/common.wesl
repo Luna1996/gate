@@ -4,15 +4,11 @@ const CHUNK_SIZE: u32 = 256u;
 const MAX_LEVEL: u32 = 4u;
 const NODE_FIXED_WORDS: u32 = 3u;    const CHUNK_INDEX_CAP: u32 = 64u;
 const INDEX_ENTRY_EMPTY: u32 = 0xFFFFFFFFu;
-
-
 const FLAGS_IS_PBR: u32 = 1u << 4u;
 const FLAGS_TRANSMISSIVE: u32 = 1u << 5u;
-
 const MATERIAL_ASSET_SLOTS: u32 = 1024u;
 const MATERIAL_TEX_SLOTS: u32 = 64u;
 const MATERIAL_SLOT_NONE: u32 = 0xFFFFFFFFu;
-
 const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
   0x05030100u,
   0x05030001u,
@@ -79,19 +75,13 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
   );
 }
 
-//
-//
-//
-
 const MATERIAL_FLAT_SHADING: u32 = 1u;
-
 const MATERIAL_TEX_WORLD_SCALE: f32 = 2.0;
 const MATERIAL_VOXEL_PER_METER: f32 = 50.0;
 const MATERIAL_TRIPLANAR_SHARPNESS: f32 = 4.0;
 const MATERIAL_MIN_ROUGHNESS: f32 = 0.05;
 const MATERIAL_DEFAULT_IOR: f32 = 1.5;
 const MATERIAL_DEBUG_NONE: u32 = 0xFFFFFFFFu;
-
 struct MaterialParams {
   albedo: vec3<f32>,     roughness: f32,        metallic: f32,         emissive: f32,         transmission: f32,                                                   ior: f32,              specular: f32,       }
 
@@ -219,7 +209,6 @@ fn ggx_peak(n: vec3<f32>, h: vec3<f32>, roughness: f32) -> f32 {
 fn fresnel_schlick(f0: vec3<f32>, cos_theta: f32) -> vec3<f32> {
   return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
-
 
 fn view_dir_to(ray_origin: vec3<f32>, hit_point: vec3<f32>) -> vec3<f32> {
   let d = ray_origin - hit_point;

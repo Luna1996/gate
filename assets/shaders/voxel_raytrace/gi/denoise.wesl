@@ -2,89 +2,21 @@ import package::bindings::{gi_den_cfg, gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_t
 import package::gi::common::{gi_hist_search_offset, gi_pack_dir, gi_unpack_dir};
 import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_W_HIST_MIN, GI_HIST_SEARCH_TAPS, GI_LUMA};
 
-
-
-
-//
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-//
-
-
-
-
-
-
-
-
-
-
-
-//
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn gi_den_valid_b(b: u32) -> bool {
   return (gi_guide[b + GI_DEN_G_KEY0] | gi_guide[b + GI_DEN_G_KEY1]) != 0u;
 }
-
 
 fn gi_den_key0_b(b: u32) -> u32 {
   return gi_guide[b + GI_DEN_G_KEY0];
 }
 
-
 fn gi_den_key1_b(b: u32) -> u32 {
   return gi_guide[b + GI_DEN_G_KEY1];
 }
 
-
-
 fn gi_den_nrm_b(b: u32) -> vec3<f32> {
   return gi_unpack_dir(gi_guide[b + GI_DEN_G_NRM]);
 }
-
-
-
-
-
-
-
 
 fn gi_den_guide_store(
   coord: vec2<i32>,
@@ -111,17 +43,6 @@ fn gi_den_guide_store(
   gi_guide_out[b + GI_DEN_G_PREV] = code;
 }
 
-
-
-
-
-
-
-
-
-
-
-
 fn gi_den_same_plane(hk0: u32, hk1: u32, k0: u32, k1: u32) -> bool {
   let face = (k1 >> 16u) & 7u;
   if (face != ((hk1 >> 16u) & 7u)) { return false; }
@@ -132,50 +53,14 @@ fn gi_den_same_plane(hk0: u32, hk1: u32, k0: u32, k1: u32) -> bool {
   return (k1 & 0xFFFFu) == (hk1 & 0xFFFFu);
 }
 
-
-
-
-
-
-
-
-
-
 fn gi_same_surface_n(hk0: u32, hk1: u32, hn: vec3<f32>, k0: u32, k1: u32, n: vec3<f32>) -> bool {
   if (!gi_den_same_plane(hk0, hk1, k0, k1)) { return false; }
   return dot(hn, n) >= GI_DEN_N_DOT;
 }
 
-
-
 fn gi_same_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: vec3<f32>) -> bool {
   return gi_same_surface_n(hk0, hk1, gi_unpack_dir(hn), k0, k1, n);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   let x = i32(coord.x);
@@ -191,13 +76,9 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   }
   let k0 = gi_den_key0_b(gb);
   let k1 = gi_den_key1_b(gb);
-  
   let n_c = gi_den_nrm_b(gb);
   let c_raw = textureLoad(gi_raw_tex, coord, 0).rgb;
 
-  
-  
-  
   var n3 = 0.0; 
   var m3 = 0.0;
   var q3 = 0.0;
@@ -242,45 +123,20 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   let l_ref = max(dot(cmean, GI_LUMA), mu3);
   
   var sigma_use = sigma;
-  
   var c_in = select(c_raw, c3 / max(n3, 1.0), n3 > 1.5);
   
-  
-  
-  
-  
-  
   if (n3 <= 1.5 && cnt > 1.5) { c_in = cmean; }
-  
-  
-  
-  
-  
   if (cnt > 1.5) {
     c_in = clamp(c_in, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
   }
-  
-  
-  
   let l_in = dot(c_in, GI_LUMA);
   var m1_acc = l_in;
   var m2_acc = l_in * l_in;
-
-  
   var color = c_in;
   var m = 1.0;
   let code = gi_guide[gb + GI_DEN_G_PREV];
   if (code != 0xFFFFFFFFu) {
     let prev_px = vec2<i32>(i32(code & 0xFFFFu), i32((code >> 16u) & 0xFFFFu));
-    
-    
-    
-    
-    //
-    
-    
-    
-    
     var hb = 0u;
     var h_m = 0.0;
     var found = false;
@@ -313,56 +169,27 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       if (cnt > 1.5) {
         clamped = clamp(hcol, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
       } else {
-        
-        
-        
-        
         let pad = l_ref * GI_DEN_LUMA_FLOOR_REL;
         clamped = clamp(hcol, c_in * (1.0 / GI_DEN_CLAMP_K) - pad, c_in * GI_DEN_CLAMP_K + pad);
       }
-      
-      
-      
       let h_m1 = bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_M1]);
       let h_m2 = bitcast<f32>(gi_hist_prev[hb + GI_DEN_H_M2]);
       let sigma_hist = sqrt(max(h_m2 - h_m1 * h_m1, 0.0));
       sigma_use = max(sigma, sigma_hist);
-      
-      
-      
-      
-      
       var w_var = 1.0;
       if (any(clamped != hcol)) {
         w_var = clamp(GI_DEN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DEN_W_HIST_MIN, 1.0);
       }
-      
-      
-      
-      
-      
-      
       let dx = f32(prev_px.x - x);
       let dy = f32(prev_px.y - y);
       let mo = sqrt(dx * dx + dy * dy);
       let w_motion = select(1.0 / (1.0 + mo), 1.0, !shifted);
-      
       let w = min(min(w_var, (m - 1.0) / m), w_motion);
       color = mix(c_in, clamped, w);
-      
-      
       m1_acc = mix(h_m1, l_in, 1.0 - w);
       m2_acc = mix(h_m2, l_in * l_in, 1.0 - w);
     }
   }
-
-  
-  
-  
-  
-  
-  
-  
   
   let sigma_phi = select(dot(cstd, GI_LUMA), sigma_use, n3 > 1.5);
   gi_den_phi[idx] = GI_DEN_LUMA_K * max(max(sigma_phi, GI_DEN_LUMA_FLOOR_REL * l_ref), 1e-5);
@@ -380,22 +207,6 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   gi_hist_cur[hb + GI_DEN_H_NRM] = gi_guide[gb + GI_DEN_G_NRM];
   textureStore(gi_dn_tmp, coord, vec4<f32>(color, 1.0));
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
   let x = i32(coord.x);
@@ -428,8 +239,6 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
       let tb = (u32(ty) * size.x + u32(tx)) * GI_DEN_GUIDE_WORDS;
       
-      
-      
       let tk0 = gi_guide[tb + GI_DEN_G_KEY0];
       let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
       if ((tk0 | tk1) == 0u) { continue; }
@@ -437,8 +246,6 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
       let tn = gi_den_nrm_b(tb);
       if (dot(tn, n_c) < GI_DEN_N_DOT) { continue; }
       let s = textureLoad(gi_dn_src, vec2<i32>(tx, ty), 0).rgb;
-      
-      
       
       var w = 1.0;
       if (!(tk0 == k0 && tk1 == k1)) {

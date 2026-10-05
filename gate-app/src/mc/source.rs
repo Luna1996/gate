@@ -176,8 +176,7 @@ impl ChunkSource for McCity {
     let grain = detail.grain();
     let mut tree = ChunkTree::empty();
     match grain {
-      //
-      1 | 4 => {
+            1 | 4 => {
         for (i, &pi) in states.iter().enumerate() {
           let Some(plan) = plans.get(pi as usize).and_then(|p| p.clone()) else { continue };
           let org = block_origin(i);
