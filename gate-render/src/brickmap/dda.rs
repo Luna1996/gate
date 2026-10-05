@@ -169,14 +169,14 @@ impl DdaViewUniform {
       inv_view_proj: cfg.inv_view_proj,
       cam_pos_voxel: cfg.position_world.extend(1.0),
       debug_mode: Vec4::new(
-        (debug_mode == 1) as u32 as f32,
-        (debug_mode == 2) as u32 as f32,
+        (debug_mode == 4) as u32 as f32,
+        (debug_mode == 5) as u32 as f32,
         if DDA_CHUNKWALK { 0.0 } else { 2.0 },
         if DDA_SKY_ONLY {
           2.0
         } else if DDA_MAKEGRID_ONLY {
           4.0
-        } else if debug_mode == 3 {
+        } else if debug_mode == 6 {
           1.0
         } else {
           0.0
@@ -1800,6 +1800,8 @@ pub(crate) fn dispatch_dda(
   
   
   
+  // WHY: 只跑面缓存的 GI 累加（dda_main 改按"面"查 FACE_W_GI，避免后面的面在视觉交界处取到前面面的
+  // GI）；gate_dda_face 那趟全色着色仍停派发——它的 FACE_W_COL/FACE_W_SUN 无消费者。
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
   {
@@ -1812,28 +1814,6 @@ pub(crate) fn dispatch_dda(
         "gate_dda_face_accum",
         |pass| {
           pass.set_pipeline(accum_pipe);
-          pass.set_bind_group(0, &bg0.0, &[]);
-          pass.set_bind_group(1, &bg1.0, &[]);
-          pass.set_bind_group(2, &bg2.0, &[]);
-          pass.set_bind_group(3, &bg3.0, &[]);
-          pass.set_bind_group(4, &bg4.0, &[]);
-          if let Some(gi_read) = aux.gi_read_bg.as_ref() {
-            pass.set_bind_group(5, gi_read, &[]);
-          }
-          if let Some(fog_read) = fog_read {
-            pass.set_bind_group(6, fog_read, &[]);
-          }
-          pass.dispatch_workgroups(gx, gy, 1);
-        },
-      );
-    }
-    if let Some(face_pipe) = pipeline_cache.get_compute_pipeline(pipelines.face_pipeline) {
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_dda_face",
-        |pass| {
-          pass.set_pipeline(face_pipe);
           pass.set_bind_group(0, &bg0.0, &[]);
           pass.set_bind_group(1, &bg1.0, &[]);
           pass.set_bind_group(2, &bg2.0, &[]);

@@ -438,6 +438,19 @@ id = "sky"
 label = "menu.render.sky.color.sky"
 hex = "78A7FF"
 
+[[items.children]]
+kind = "switch_group"
+id = "debug_view"
+label = "menu.render.debug_view"
+options = [
+    "menu.render.debug_view.off",
+    "menu.render.debug_view.gi",
+    "menu.render.debug_view.sun",
+    "menu.render.debug_view.cov",
+]
+selected = 0
+tooltip = "menu.render.debug_view.tip"
+
 [[items]]
 kind = "sub_menu"
 id = "player"

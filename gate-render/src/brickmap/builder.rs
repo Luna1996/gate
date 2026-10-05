@@ -1194,7 +1194,11 @@ impl VolumesBuilder {
     let mut words = 0usize;
     for (i, b) in self.builders.iter().enumerate() {
       if i == 0 {
-        words += b.buffers.b_struct.len().saturating_sub(b.resident_words());
+        // WHY: 主卷树区里只有索引表是固定开销，其余（常驻数据 + 空闲段）都归常驻预算管。
+        // 把空闲段也算作"不可预算"会让预算随常驻量反向漂移：空闲 = 树区高水位 - 常驻，
+        // 于是 capacity - unbudgeted = 常驻 + 常量，驱逐量 = 常驻 - 预算 = 常量 ≠ 0，
+        // 永远驱逐不收敛，形成 min_resident_frames 周期的装/驱对冲。
+        words += TREE_BASE;
       } else {
         words += b.buffers.b_struct.len();
       }

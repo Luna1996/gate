@@ -110,6 +110,15 @@ const GI_ACC_SCALE: f32 = 4096.0;
 const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;
 
+// WHY: 面号占 k1 的 bit16..18。屏蔽后缓存键 = 体素：同一体素 6 个面共用一条目（保持逐体素着色），
+// 且键里不含面号，因而不可能取到相邻体素的值（后面的暗面在视觉交界处取到前面亮面 GI 的成因）。
+const FACE_KMASK_NOFACE: u32 = 0xFFF8FFFFu;
+const FACE_SLOT_PROBE: u32 = 8u;
+
+fn gi_vox_k1(k1: u32) -> u32 {
+  return k1 & FACE_KMASK_NOFACE;
+}
+
 fn face_slot_count() -> u32 {
   return arrayLength(&face_slots) / FACE_WORDS;
 }
@@ -133,19 +142,43 @@ fn face_slot_matches(slot: u32, k0: u32, k1: u32) -> bool {
   return flag != 0u && s0 == k0 && s1 == k1;
 }
 
-fn face_slot_find(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+// 找到或新建槽位（线性探测，遇到同键即返回；遇到空槽即占用）。缓存键必须已屏蔽面号，
+// 这样每个体素恰好有一条目，且不依赖别处的认领是否成功。
+fn face_slot_claim(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   var table_ok = false;
-  let base = face_slot_of(k0, k1, &table_ok);
+  var s = face_slot_of(k0, k1, &table_ok);
   *ok = false;
   if (!table_ok) { return 0u; }
-  if (face_slot_matches(base, k0, k1)) {
-    *ok = true;
-    return base;
+  for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
+    if (face_slot_matches(s, k0, k1)) {
+      *ok = true;
+      return s;
+    }
+    let fe = s * FACE_WORDS;
+    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged) {
+      atomicStore(&face_slots[fe + FACE_W_K0], k0);
+      atomicStore(&face_slots[fe + FACE_W_K1], k1);
+      *ok = true;
+      return s;
+    }
+    s = face_slot_next(s);
   }
-  let second = face_slot_next(base);
-  if (face_slot_matches(second, k0, k1)) {
-    *ok = true;
-    return second;
+  return 0u;
+}
+
+fn face_slot_find(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+  var table_ok = false;
+  var s = face_slot_of(k0, k1, &table_ok);
+  *ok = false;
+  if (!table_ok) { return 0u; }
+  for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
+    if (face_slot_matches(s, k0, k1)) {
+      *ok = true;
+      return s;
+    }
+    // 线性探测：遇到空槽即未命中。
+    if (atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]) == 0u) { break; }
+    s = face_slot_next(s);
   }
   return 0u;
 }

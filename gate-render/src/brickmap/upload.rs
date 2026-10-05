@@ -908,7 +908,7 @@ pub(crate) fn prepare(
     + gpu.state.size()
     + gpu.grid_descs_buf.size();
   if vram > crate::brickmap::consts::VRAM_WARN_BYTES {
-    bevy::log::warn!("GPU VRAM {vram}B 超旧预算线（仅提示）");
+    bevy::log::warn_once!("GPU VRAM {vram}B 超旧预算线（仅提示）");
   }
   if !limits.force_multi() {
     debug_assert!(
@@ -1508,9 +1508,10 @@ fn plan_residency(
     t_sample.iter().map(|(c, cur, want)| (c.0.to_array(), *cur, *want)).collect::<Vec<_>>()
   );
   debug!(
-    "RESID[resident {} {}KB install {} evict {} | 远场 {}块/装 {} evict {}]",
+    "RESID[resident {} {}KB 预算 {}MB install {} evict {} | 远场 {}块/装 {} evict {}]",
     state.residency.resident_count(),
     state.residency.resident_bytes() / 1024,
+    state.policy.budget_bytes >> 20,
     installed,
     evicted,
     (1..scene.volumes.len()).map(|v| builder.resident_chunks(v).len()).sum::<usize>(),

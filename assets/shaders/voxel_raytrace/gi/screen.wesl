@@ -1,5 +1,5 @@
 import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
 import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
@@ -170,13 +170,14 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
                       var wal_claimer = false;
   if (pk_ok) {
     var face_ok = false;
-    let fslot = face_slot_of(pk0, pk1, &face_ok);
+    let kv1 = gi_vox_k1(pk1);
+    let fslot = face_slot_of(pk0, kv1, &face_ok);
     if (face_ok) {
       var fe = fslot * FACE_WORDS;
       var claimed =
         atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
       if (!claimed) {
-                        if (!face_slot_matches(fslot, pk0, pk1)) {
+                        if (!face_slot_matches(fslot, pk0, kv1)) {
           fe = face_slot_next(fslot) * FACE_WORDS;
           claimed = atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
         }
@@ -184,7 +185,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
       if (claimed) {
         wal_claimer = true;
         atomicStore(&face_slots[fe + FACE_W_K0], pk0);
-        atomicStore(&face_slots[fe + FACE_W_K1], pk1);
+        atomicStore(&face_slots[fe + FACE_W_K1], kv1);
         atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
         atomicStore(&face_slots[fe + FACE_W_PAL], h.pal);
       }
@@ -351,7 +352,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
 
                   if (pk_ok && cov_w > 0.0) {
     var fok = false;
-        let fslot = face_slot_find(pk0, pk1, &fok);
+        let fslot = face_slot_find(pk0, gi_vox_k1(pk1), &fok);
     if (fok) {
       let fe = fslot * FACE_WORDS;
                   let q = clamp(gi_w, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
