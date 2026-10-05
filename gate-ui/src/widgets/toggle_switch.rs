@@ -1,7 +1,3 @@
-//! toggle_switch：滑动开关。
-//! 复用 `Checked` presence 语义（有 = 开，无 = 关）。视觉：32×16 轨道（圆角 sm）+ 方形滑块
-//! （absolute，左 = 关 / 右 = 开）：关 = 抬升表面+边框（hover 提亮）+ 灰滑块；开 = 强调填充+主色滑块。
-
 use std::ops::Deref;
 
 use bevy::picking::hover::Hovered;
@@ -13,19 +9,15 @@ use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::UiTheme;
 use crate::widgets::consts::{TRACK_H, TRACK_W};
 
-/// 开关根节点标记
 #[derive(Component, Debug, Default)]
 pub struct ToggleSwitch;
 
-/// 轨道标记（滑块定位/配色的查询目标）
 #[derive(Component, Debug, Default)]
 pub struct ToggleTrack;
 
-/// 滑块标记
 #[derive(Component, Debug, Default)]
 pub struct ToggleKnob;
 
-/// 开关句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ToggleSwitchHandle(pub Entity);
 
@@ -42,25 +34,19 @@ impl From<ToggleSwitchHandle> for Entity {
   }
 }
 
-/// 开关配置（Default = 无文本、关、不禁用）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToggleSwitchConfig {
   pub text: Option<String>,
   pub checked: bool,
-  /// true = 禁用态：不响应点击翻转、配色暗一档（开关状态仍可见）
   pub disabled: bool,
 }
 
-/// 开关状态变化事件（用户点击翻转时触发；EntityEvent，target = 根实体）。
-/// `Checked` 组件仍是真源，事件仅通知；主动读状态用 Query/Has。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct ToggleSwitchToggled {
   pub entity: Entity,
-  /// 翻转后的新状态
   pub checked: bool,
 }
 
-/// 滑动开关（可选文本标签）
 pub fn toggle_switch(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -125,7 +111,6 @@ pub fn toggle_switch(
   ToggleSwitchHandle(ec.id())
 }
 
-/// 开关状态机查询集（type alias 满足 clippy::type_complexity）
 type ToggleQuery = (
   Entity,
   &'static Hovered,
@@ -140,8 +125,6 @@ type TrackFilter = (With<ToggleTrack>, Without<ToggleSwitch>);
 type KnobData = (&'static mut Node, &'static mut BackgroundColor);
 type KnobFilter = (With<ToggleKnob>, Without<ToggleTrack>);
 
-/// 开关状态机：释放时翻转 `Checked` 并触发 `ToggleSwitchToggled`；轨道/滑块配色与位置跟随状态（每帧重算）。
-/// Disabled：跳过翻转、配色降亮一档，滑块位置仍按当前 checked。
 pub fn toggle_switch_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -161,7 +144,6 @@ pub fn toggle_switch_state_system(
   for (e, hovered, pressed, mut prev, checked, children, disabled) in &mut q {
     let inter = UiInteract::of(hovered, pressed);
     if !disabled {
-      // click = 按下并释放（与 button/checkbox 一致）
       if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
         if checked {
           commands.entity(e).remove::<Checked>();
@@ -173,7 +155,6 @@ pub fn toggle_switch_state_system(
     }
     prev.0 = inter;
     let hovered = !disabled && inter == UiInteract::Hovered;
-    // 开 → 强调填充轨道 + 主色滑块；关 → 抬升轨道 + 灰滑块（hover 边框提亮）
     let (target_bg, target_border) = if checked {
       (accent, accent)
     } else if hovered {

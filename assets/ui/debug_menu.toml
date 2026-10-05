@@ -50,14 +50,11 @@ kind = "sub_menu"
 id = "render"
 label = "menu.render"
 
-# ---- 「基础」：把着色链里几件"基础"的事关掉（A/B 观感与成本）----
-# 置位/勾选 = **算**；默认全开 = 引入这些开关前的行为。
 [[items.children]]
 kind = "sub_menu"
 id = "base"
 label = "menu.render.base"
 
-# 隐式法相：关掉 ⇒ 不算邻域梯度法线，并且原色直出（看材质本色的调试视图，全链最省）
 [[items.children.children]]
 kind = "toggle"
 id = "normal"
@@ -65,7 +62,6 @@ label = "menu.render.base.normal"
 checked = true
 tooltip = "menu.render.base.normal.tip"
 
-# 直光阴影：关掉 ⇒ 不发射阴影射线（省每像素 1 条 DDA），太阳照旧直射、只是没有明暗遮挡
 [[items.children.children]]
 kind = "toggle"
 id = "shadow"
@@ -91,8 +87,6 @@ label = "menu.render.gi.sun_bounce"
 checked = false
 tooltip = "menu.render.gi.sun_bounce.tip"
 
-# 世界累积（WAL，M1）：按"可见体素面"持久缓存辐照度，显示端按成熟度与旧链 GI 混合
-# —— 没有重投影/时域历史 ⇒ 拖影/流光按构造消失；未成熟的面仍用旧链兜底。
 [[items.children.children]]
 kind = "toggle"
 id = "wal"
@@ -100,7 +94,6 @@ label = "menu.render.gi.wal"
 checked = false
 tooltip = "menu.render.gi.wal.tip"
 
-# 二次弹射：二次顶点上再发一条余弦射线，叠回"多一跳"的间接光（默认关 = 只算一次弹射）
 [[items.children.children]]
 kind = "switch_group"
 id = "depth"
@@ -169,9 +162,6 @@ kind = "sub_menu"
 id = "refl"
 label = "menu.render.refl"
 
-# 镜面档位：只改**反射内容的着色口径**，不改逐面量化的粒度（镜面恒为一个体素面一个反射值）。
-# 档 0/1/2 都不发额外射线，只有最后一档在反射命中点补太阳 NEE（每个触发像素 +1 次 DDA）。
-# 默认 `selected = 2` 与 Rust 侧 `ReflectionSettings::default()` 一致。
 [[items.children.children]]
 kind = "switch_group"
 id = "tier"
@@ -185,10 +175,6 @@ options = [
 selected = 2
 tooltip = "menu.render.refl.tier.tip"
 
-# 镜面嵌套层级：镜子里的镜子最多再反射几级（`0 / 1 / 2 / 4`）。
-# **只在"上一级命中的面本身也是镜面"时才继续发线** ⇒ 墙 / 地形在第一级就断链，
-# 日常场景下这几个档的画面与成本完全一样。最坏 `层级 + 1` 条反射射线。
-# 默认 `selected = 0` 与 Rust 侧 `ReflectionSettings::default()` 一致（= 不嵌套）。
 [[items.children.children]]
 kind = "switch_group"
 id = "nest"
@@ -268,18 +254,11 @@ step = 0.01
 decimals = 3
 tooltip = "menu.render.exposure.key.tip"
 
-# ---- 天空：时间（天象）+ 径向模糊（光柱）+ 天体盘 + 颜色 ----
-# 推导与取舍见 `gate-render/src/sky.rs`（时间控件的缺省必须与 `SkySettings::default()` 一致）；
-# 光柱的算法、成本模型与取舍见 `gate-render/src/volumetric.rs` 与
-# `assets/shaders/voxel_raytrace/volumetric.wesl`（本段只给「档位 → 数值」的映射）。
-# 「径向模糊」「天体盘」「颜色」三组各有一个「覆写」开关：关（默认）⇒ 该组随时刻变化、
-# 下面的滑杆实时显示当前值；开 ⇒ 用下面的值（拖动任一项会自动打开覆写）。
 [[items.children]]
 kind = "sub_menu"
 id = "sky"
 label = "menu.render.sky"
 
-# 时间：时刻 / 年积日 / 纬度 → 太阳与月亮的位置
 [[items.children.children]]
 kind = "sub_menu"
 id = "time"
@@ -336,7 +315,6 @@ step = 1.0
 decimals = 0
 tooltip = "menu.render.sky.time.lat.tip"
 
-# 径向模糊（光柱那条链：掩码 + 两趟屏幕空间径向模糊）
 [[items.children.children]]
 kind = "sub_menu"
 id = "blur"
@@ -389,14 +367,11 @@ step = 1.0
 decimals = 0
 tooltip = "menu.render.sky.blur.focus.tip"
 
-# 天体盘（天空里那个盘的形状；日月共用同一组值，角径同时决定光晕的尺度）
 [[items.children.children]]
 kind = "sub_menu"
 id = "disk"
 label = "menu.render.sky.disk"
 
-# 日月外观开关（最上面）：关掉 ⇒ 天空不画日月（那颗盘 + 它那圈光晕），只剩天光基色。
-# 与下面「覆写」正交：它决定"画不画"，覆写决定"角径/光晕由谁给"。
 [[items.children.children.children]]
 kind = "toggle"
 id = "enabled"
@@ -433,7 +408,6 @@ step = 0.1
 decimals = 1
 tooltip = "menu.render.sky.disk.halo.tip"
 
-# 颜色（覆写开着时用下面三个色代替时间算出来的颜色；强度仍由时间给）
 [[items.children.children]]
 kind = "sub_menu"
 id = "color"
@@ -514,7 +488,6 @@ kind = "sub_menu"
 id = "edit"
 label = "menu.game.edit"
 
-# ---- 「笔触」：笔触几何（形状 / 大小 / 偏移距离）----
 [[items.children.children]]
 kind = "sub_menu"
 id = "brush"
@@ -543,9 +516,6 @@ max = inf
 step = 1.0
 decimals = 0
 
-# 偏移距离：笔触几何中心相对**点击选中的体素**沿命中面法线方向的偏移（体素）。
-# 放置取 `+offset`、摧毁取 `-offset`（反方向）；中心必须是整数体素格 ⇒ 落笔时四舍五入到格。
-# 改「笔触大小」时自动置为 `大小 / 2`（仍可自由输入）——初值 `1.5` = 大小 `3` 的一半。
 [[items.children.children.children]]
 kind = "input"
 id = "offset"
@@ -559,15 +529,11 @@ max = inf
 step = 0.5
 decimals = 1
 
-# ---- 「材质」：笔触材质（平凡参数 / PBR 资产）----
 [[items.children.children]]
 kind = "sub_menu"
 id = "mat"
 label = "menu.game.edit.mat"
 
-# ---- MT7-1 · 材质编写（PBR 变体）----
-# 选项 = assets/textures/pbr/ 的目录名（字典序 = texture_2d_array 层号 = 资产表槽号，
-# 与 pbr_texture.rs 的层号契约一致）；选中项按 id 查 PbrTextureSet 的真实槽号。
 [[items.children.children.children]]
 kind = "toggle"
 id = "pbr"
@@ -638,8 +604,6 @@ step = 1.0
 decimals = 0
 tooltip = "menu.game.edit.smooth.tip"
 
-# 金属度是**二值**（电介质 / 金属），所以是开关不是滑杆：写材质的 0 / 255 两个字节。
-# 打开时同时给出 `F0 = albedo`（反射）与 `kD = 0`（漫反射清零）⇒ 配上"颜色 = 白 + 光滑度 100"就是镜面。
 [[items.children.children.children]]
 kind = "toggle"
 id = "metal"
@@ -665,15 +629,12 @@ id = "reload"
 label = ""
 items = ["menu.game.world.reload"]
 
-# 数据转储：把 CPU 侧 wire 状态与 GPU 实际字节各写一份 .bin 到 logs/（对照查 mask 用）
 [[items.children.children]]
 kind = "buttons"
 id = "dump"
 label = ""
 items = ["menu.game.world.dump"]
 
-# 流式加载参数（`crate::infinite_cubes::Streaming`）：只对流式世界（infinite_cubes）有效，换世界不影响。
-# 开关停下整套流式（不跟窗 / 不派发 / 不挂载 / 不卸载）⇒ 可以飞到加载边界看"世界到此为止"。
 [[items.children.children]]
 kind = "toggle"
 id = "stream_pause"
@@ -681,7 +642,6 @@ label = "menu.game.world.stream_pause"
 checked = false
 tooltip = "menu.game.world.stream_pause.tip"
 
-# 半径单位 = chunk（5.12m）：全分辨率 ≈ 278KB/chunk、粗档 ≈ 12KB/chunk ⇒ 全分辨率半径是内存的硬杠杆
 [[items.children.children]]
 kind = "slider"
 id = "load_radius"
@@ -726,7 +686,6 @@ step = 1.0
 decimals = 0
 tooltip = "menu.game.world.coarse_height.tip"
 
-# 挂载预算：每帧允许挂载的序列化字数（千字/帧）。挂载要主线程装树 + 标脏 ⇒ 它是"多快能看到新块"的闸门
 [[items.children.children]]
 kind = "slider"
 id = "mount_words"
@@ -738,7 +697,6 @@ step = 16.0
 decimals = 0
 tooltip = "menu.game.world.mount_words.tip"
 
-# 每帧挂载条数上限：防"一堆极小树"把单帧的记账开销顶爆
 [[items.children.children]]
 kind = "slider"
 id = "mount_count"
@@ -750,7 +708,6 @@ step = 1.0
 decimals = 0
 tooltip = "menu.game.world.mount_count.tip"
 
-# 请求（ray-guided）：装载位置与档位都由主射线给（不受半径环约束）—— 这才是"视距"的来源
 [[items.children.children]]
 kind = "toggle"
 id = "requests_load"
@@ -769,7 +726,6 @@ step = 256.0
 decimals = 0
 tooltip = "menu.game.world.request_mb.tip"
 
-# 诊断：远场级上限（0..3）。调到 k ⇒ 只保留前 k 级远场，更粗的整卷停用（不产出、不挂载、已常驻的卸载）
 [[items.children.children]]
 kind = "slider"
 id = "far_levels"
@@ -781,7 +737,6 @@ step = 1.0
 decimals = 0
 tooltip = "menu.game.world.far_levels.tip"
 
-# 诊断：按卷着色（主世界=绿、L1=红、L2=蓝、L3=黄）—— 一眼看出画面上某一块属于哪一级
 [[items.children.children]]
 kind = "toggle"
 id = "vol_tint"
@@ -789,16 +744,12 @@ label = "menu.game.world.vol_tint"
 checked = false
 tooltip = "menu.game.world.vol_tint.tip"
 
-# 离线粗粒度世界（`mc::lod`）：把整张图预计算成一份 section 级摘要存盘（一次性，十几秒），此后远场
-# scale ≥ 16 直接内存采样（实测 L2 一块 0.2 ms，而按需读存档是 1 s 级）。构建跑在后台线程、完成即热装。
 [[items.children.children]]
 kind = "buttons"
 id = "lod"
 label = ""
 items = ["menu.game.world.lod_build", "menu.game.world.lod_cancel"]
 
-# LOD 状态（只读）：装了没有 / 构建到几成。拿不到 LOD 时远场会静默回落成按需读存档 ⇒
-# 画面只是"远处一直空着"，看不出原因，这一行就是第一现场（见 `debug_menu::lod_state_tick`）。
 [[items.children.children]]
 kind = "text"
 id = "lod_state"

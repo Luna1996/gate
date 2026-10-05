@@ -5,29 +5,18 @@ version.workspace = true
 license.workspace = true
 
 [features]
-# 性能剖析：wgpu-profiler GPU scope（数据进 Tracy，需配套 gate-app/profile）
 profile = ["dep:wgpu-profiler"]
 
 [dependencies]
-# jpeg feature = bevy_image 的 `.jpg` 解码器（PBR 贴图集是 Poly Haven 的 jpg）。
-# 缺它 `AssetServer` 根本没有注册 jpg 扩展名 ⇒ 全部贴图加载失败（不是回落纯色，是 Failed）。
 bevy = { workspace = true, features = ["jpeg"] }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 rayon = { workspace = true }
-# 光照主题 RON 解析（版本随 workspace，避免双份编译）
 serde = { workspace = true }
 ron = { workspace = true }
-# GPU 帧剖析（feature = "profile"）：compute/render pass 时间戳 → Tracy
 wgpu-profiler = { workspace = true, optional = true }
-# WESL 运行时编译（dda shader 拆包 → WGSL 交给 Bevy 资产系统）
 wesl = { workspace = true }
-# 硬件光追的 AABB 几何：bevy_render 只重导出了三角形那一组（`BlasTriangleGeometry` 等），
-# `BlasAabbGeometry` / `BlasAABBGeometrySizeDescriptor` 没在重导出名单里 ⇒ 直接引 wgpu。
-# 版本必须与 bevy 的 wgpu **逐字相同**（否则两套类型对不上，编译期就炸）。
 wgpu = { version = "=30.0.1", default-features = false }
 
 [dev-dependencies]
-# `tests/wesl_package.rs`：把 WESL 包编译成 WGSL 后用 naga 校验（着色器的错误否则只在运行期暴露）。
-# 版本跟着 wgpu/bevy（naga 是 wgpu 的内部依赖，这里只是把它显式引进来做校验）。
 naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }

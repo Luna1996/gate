@@ -1,6 +1,3 @@
-//! 主题令牌：`UiTheme` RON 数据资产 + 内置暗色默认 + 加载/回退接线。
-//! 改 RON 换肤不改代码；加载失败/缺失 → 内置暗色默认 + `warn!`（不 panic，不静默）。
-
 use bevy::app::{Plugin, PreStartup, Update};
 use bevy::asset::io::Reader;
 use bevy::asset::{
@@ -14,14 +11,11 @@ use serde::Deserialize;
 
 use crate::consts::AUTOFIT_BASE_HEIGHT;
 
-/// 主题资产路径（相对资源根 `assets/`，见 gate-render `paths`）
 pub const THEME_ASSET_PATH: &str = "ui/theme.ron";
 
-/// 十六进制颜色："RRGGBB"（alpha=FF）或 "RRGGBBAA"
 #[derive(Clone, Debug, PartialEq)]
 pub struct HexColor(pub String);
 
-/// 解析 hex → `[r, g, b, a]`；非法输入返回 None
 pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
   let s = s.trim();
   let body = s.strip_prefix('#').unwrap_or(s);
@@ -40,7 +34,6 @@ pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
 }
 
 impl HexColor {
-  /// 转 bevy Color（sRGB）；非法 hex → None（仅运行时构造的可能非法）
   pub fn to_color(&self) -> Option<Color> {
     parse_hex_color(&self.0).map(|[r, g, b, a]| Color::srgba_u8(r, g, b, a))
   }
@@ -60,52 +53,32 @@ impl<'de> Deserialize<'de> for HexColor {
   }
 }
 
-/// 颜色组；全部带 alpha。
-/// 暗色令牌：5 层表面（亮度即海拔）+ HUD 变体 + 3 档边框 + 4 档文字 + 全灰度强调/语义色。
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeColors {
-  // ---- 表面 5 层（L0 基底 → L4 顶层，每层亮约 3-4%）----
   pub surface_base: HexColor,
   pub surface_card: HexColor,
   pub surface_elevated: HexColor,
   pub surface_overlay: HexColor,
   pub surface_top: HexColor,
-  /// HUD 半透明卡片（浮在 3D 场景上，alpha 下限 90%）
   pub surface_card_hud: HexColor,
-  /// 模态遮罩
   pub scrim: HexColor,
-  // ---- 边框 3 档（1px）----
   pub border_subtle: HexColor,
   pub border: HexColor,
   pub border_strong: HexColor,
-  // ---- 文字 4 档（禁纯白）----
   pub text_primary: HexColor,
   pub text_body: HexColor,
   pub text_muted: HexColor,
-  /// 仅限 ≥18px 大号弱化标签
   pub text_faint: HexColor,
-  // ---- 强调色（全灰度，靠亮度差区分）----
-  /// 主按钮填充（最亮表面）
   pub accent_fill: HexColor,
-  /// 主按钮 hover 填充（提亮一档）
   pub accent_fill_hover: HexColor,
-  /// 主按钮按压填充（压暗）
   pub accent_fill_pressed: HexColor,
-  /// 强调文字/图标/折线（最高对比）
   pub accent_text: HexColor,
-  // ---- 语义色（全灰度，靠亮度差区分）----
-  /// success 文字 = 正文灰
   pub success: HexColor,
-  /// success 填充 = 抬升表面
   pub success_fill: HexColor,
-  /// warning 文字 = 说明灰
   pub warning: HexColor,
-  /// warning 填充 = 卡片表面
   pub warning_fill: HexColor,
-  /// danger 文字 = 主文本色
   pub danger: HexColor,
-  /// danger 填充 = 强边框灰（最深灰）
   pub danger_fill: HexColor,
 }
 
@@ -117,7 +90,6 @@ impl Default for ThemeColors {
       surface_elevated: HexColor("1A1A20".into()),
       surface_overlay: HexColor("222228".into()),
       surface_top: HexColor("2A2A31".into()),
-      // HUD 面板不透明，与卡片同色
       surface_card_hud: HexColor("131316".into()),
       scrim: HexColor("09090B".into()),
       border_subtle: HexColor("232329".into()),
@@ -141,13 +113,10 @@ impl Default for ThemeColors {
   }
 }
 
-/// 度量组
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct ThemeMetrics {
-  /// 容器圆角：面板、按钮、弹窗
   pub corner_radius: f32,
-  /// 小控件圆角：checkbox、slider thumb、标签 chip
   pub corner_radius_sm: f32,
   pub border_width: f32,
   pub spacing: Spacing,
@@ -166,7 +135,6 @@ impl Default for ThemeMetrics {
   }
 }
 
-/// 间距令牌 xs/sm/md/lg
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Spacing {
@@ -182,7 +150,6 @@ impl Default for Spacing {
   }
 }
 
-/// 字号令牌 sm/md/lg
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct FontSize {
@@ -197,20 +164,14 @@ impl Default for FontSize {
   }
 }
 
-/// 主题令牌资产（RON）；字段缺失回退内置默认，整份解析失败整体回退。
-/// 运行时以 Resource 形式存在（`Res<UiTheme>`），同时是 Asset 供 AssetServer 管理。
 #[derive(Asset, Resource, TypePath, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct UiTheme {
   pub colors: ThemeColors,
   pub metrics: ThemeMetrics,
-  /// 全局 UI 缩放，接到 Bevy `UiScale` 资源
   pub ui_scale: f32,
-  /// true 时按窗口高度/AUTOFIT_BASE_HEIGHT 推导总缩放
   pub auto_fit_ui_scale: bool,
-  /// 字体资产路径；None → bevy default_font
   pub font_path: Option<String>,
-  /// 图标字体（FontAwesome Free Solid）资产路径；None → 图标回退正文字体
   pub icon_font_path: Option<String>,
 }
 
@@ -227,17 +188,14 @@ impl Default for UiTheme {
   }
 }
 
-/// 内置暗色默认主题
 pub fn default_theme() -> UiTheme {
   UiTheme::default()
 }
 
-/// RON 解析纯函数（system 接线只做加载与回退）
 pub fn parse_theme_ron(src: &str) -> Result<UiTheme, ron::error::SpannedError> {
   ron::de::from_str(src)
 }
 
-/// UiScale 推导：auto_fit 时按窗口高度缩放；窗口高钳 4096，缩放系数钳 [0.25, 4.0] 防极端。
 pub fn autofit_ui_scale(ui_scale: f32, auto_fit: bool, window_height: f32) -> f32 {
   if auto_fit {
     let h = window_height.min(4096.0);
@@ -247,7 +205,6 @@ pub fn autofit_ui_scale(ui_scale: f32, auto_fit: bool, window_height: f32) -> f3
   }
 }
 
-/// RON 加载错误（IO 读取 + RON 解析）
 #[derive(Debug)]
 pub enum RonLoadError {
   Io(std::io::Error),
@@ -284,7 +241,6 @@ impl From<ron::error::SpannedError> for RonLoadError {
   }
 }
 
-/// UiTheme 的 RON 资产加载器（bevy 上游无内置 RonAssetPlugin；具体类型避免泛型 TypePath 边界）
 #[derive(TypePath)]
 pub struct RonThemeLoader;
 
@@ -309,11 +265,9 @@ impl AssetLoader for RonThemeLoader {
   }
 }
 
-/// 主题资产句柄（PreStartup 请求加载后插入）
 #[derive(Resource)]
 pub struct UiThemeHandle(pub Handle<UiTheme>);
 
-/// 主题应用状态（防重复日志/重复插入）
 #[derive(Resource, Default)]
 pub struct UiThemeState {
   pub applied: bool,
@@ -321,7 +275,6 @@ pub struct UiThemeState {
 }
 
 fn ui_theme_request(mut commands: Commands, server: Option<Res<AssetServer>>) {
-  // headless 测试环境无 AssetServer 时跳过
   let Some(server) = server else { return };
   let handle: Handle<UiTheme> = server.load(THEME_ASSET_PATH);
   commands.insert_resource(UiThemeHandle(handle));
@@ -339,7 +292,6 @@ fn ui_theme_resolve(
     return;
   };
   let hid = handle.0.id();
-  // 成功：LoadedWithDependencies → 插入运行时主题
   for ev in evr.read() {
     if let AssetEvent::LoadedWithDependencies { id } = ev
       && id == &hid
@@ -351,7 +303,6 @@ fn ui_theme_resolve(
       debug!("theme → {THEME_ASSET_PATH}");
     }
   }
-  // 失败：load_state Failed（文件缺失 / RON 解析失败 / hex 非法）
   if !state.applied
     && !state.fell_back
     && let LoadState::Failed(err) = server.load_state(hid)
@@ -376,7 +327,6 @@ fn ui_scale_autofit(
   }
 }
 
-/// 主题字体资源（theme.font_path 加载结果；None → widget 层用 FontSource::SystemUi）
 #[derive(Resource, Default)]
 pub struct ThemeFont {
   pub path: Option<String>,
@@ -405,8 +355,6 @@ fn ui_theme_font_load(
   debug!("theme font → {path}");
 }
 
-/// 主题字体加载成功后 clone 到 `AssetId::<Font>::default()` slot，使隐式字体的文本都用主题字体。
-/// Bevy 内置 FiraMono 不含 CJK（中文方框）。只执行一次；headless 无 AssetServer 时跳过。
 fn ui_theme_font_install_default(
   server: Option<Res<AssetServer>>,
   font: Res<ThemeFont>,
@@ -425,10 +373,7 @@ fn ui_theme_font_install_default(
   match server.load_state(handle.id()) {
     LoadState::Loaded => {}
     LoadState::Failed(_) => {
-      warn!(
-        "theme font {:?} load failed → default slot not overridden (CJK boxes)",
-        font.path
-      );
+      warn!("theme font {:?} load failed → default slot not overridden (CJK boxes)", font.path);
       *done = true;
       return;
     }
@@ -446,7 +391,6 @@ fn ui_theme_font_install_default(
   }
 }
 
-/// gate-ui 插件：主题资产注册 + UiScale 联动 + 各 widget 状态机注册。
 #[derive(Default)]
 pub struct GateUiPlugin;
 
@@ -466,10 +410,7 @@ impl Plugin for GateUiPlugin {
       .init_resource::<crate::i18n::UiTranslator>()
       .init_resource::<crate::world_anchor::AnchorCamera>()
       .register_asset_loader(RonThemeLoader)
-      // UI 拾取只认显式挂 `Pickable` 的节点：装饰节点（标签/图标/容器）对 picking 不可见，
-      // 等价旧模型里「只有 `FocusPolicy::Block` 才拦命中」（见 pointer 模块）
       .insert_resource(bevy::ui::picking_backend::UiPickingSettings { require_markers: true })
-      // 指针交互：picking 事件 → 控件根 `Pressed`（见 pointer 模块）
       .add_observer(crate::pointer::ui_pointer_press)
       .add_observer(crate::pointer::ui_pointer_release)
       .add_observer(crate::pointer::ui_pointer_drag_end)
@@ -496,7 +437,6 @@ impl Plugin for GateUiPlugin {
             crate::widgets::plot_redraw_system,
             crate::widgets::scroll_view_system,
             crate::widgets::tab_view_system,
-            // 下拉框：交互（开/选/关）在前，视觉（跟随锚点+展开）在后
             (crate::widgets::dropdown_system, crate::widgets::dropdown_visual_system).chain(),
           ),
           (
@@ -507,12 +447,7 @@ impl Plugin for GateUiPlugin {
             crate::widgets::tooltip_system,
           ),
           (
-            // 调色板浮窗：交互（开/选/关）在前，视觉（跟随色块+选中框）在后；
-            // 必须早于 `menu_system`（选中的色是写进 HEX 输入框，由它那条链路落到模型并通知调用方）
-            (
-              crate::menu::color_picker_system,
-              crate::menu::color_picker_visual_system,
-            )
+            (crate::menu::color_picker_system, crate::menu::color_picker_visual_system)
               .chain()
               .before(crate::menu::menu_system),
             (

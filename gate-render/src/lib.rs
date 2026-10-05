@@ -41,12 +41,9 @@ impl Plugin for GateRenderPlugin {
       brickmap::upload::VolumePlugin,
       brickmap::dda::BrickMapDdaPlugin,
       gi::GiPlugin,
-      // 径向模糊（光柱）：屏幕空间径向模糊的 pass / 资源 / 档位（菜单「渲染/天空/径向模糊」）
       volumetric::FogPlugin,
-      // 天象（时间 → 太阳 / 月亮 / 天空色）：每帧把推导结果写进 `LightingTheme`（菜单「渲染/天空」）
       sky::SkyPlugin,
       profiler::GateProfilerPlugin,
-      // PBR 贴图集（MT2-1）：扫描 assets/textures/pbr/ → 两张 texture_2d_array（只加载，不绑定）
       pbr_texture::PbrTexturesPlugin,
     ));
   }

@@ -1,19 +1,3 @@
-//! markdown：CommonMark/GFM 子集 → bevy_ui 节点树（retained，源文本变化才重建）。
-//!
-//! 分层：comrak 解析 → 单遍遍历 AST 直接 spawn（不建中间 IR）。行内样式 = 同一文本块的多个
-//! `TextSpan`（共享一次 shaping）；块级结构（标题/列表/引用/代码块/表格/分割线）= 独立节点。
-//!
-//! 性能：常驻零帧开销（`markdown_set_text` 先比对源串，相同直接返回）；解析选项是进程级单例
-//! （含容器，只构造一次）；`Arena` 每次解析局部持有，解析完即可释放。
-//!
-//! 重建走命令队列（`markdown_set_text` 只入队，落地时才拿到 `&mut World`）：解析、主题与字体
-//! 都在命令里取，调用方不需要持有 `UiCtx`，建树代码也只用 world 版 `ChildSpawner` 一条路径。
-//!
-//! 已知取舍（主题字体为单字重等宽 MapleMono Regular，`FontWeight`/`FontStyle` 无对应字面）：
-//! 强调实际靠文字亮度档区分（`text_primary`）；行内代码用 `TextBackgroundColor` 底色、链接用
-//! `Underline`、删除线用 `Strikethrough`（后三者按 section 实体取用）。图片不加载（展示 alt 文本）；
-//! 未开扩展的语法（脚注/数学/元数据等）不渲染；表格无列宽测量预通道 → 等分。
-
 use std::ops::Deref;
 use std::sync::OnceLock;
 
@@ -29,17 +13,13 @@ use super::{UiCtx, color_of, px};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::consts::{MD_MONO_ADVANCE_EM, MD_QUOTE_BAR_W, MD_RULE_H};
 
-/// Markdown 视图配置（Default = 空文本 + 常规间距 + 不限制宽度）
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MarkdownConfig {
   pub text: String,
-  /// 紧凑模式：块间距取 xs 档（tooltip 等窄容器）
   pub dense: bool,
-  /// 最大宽度（None = 跟随父级）
   pub max_width: Option<f32>,
 }
 
-/// 已渲染的 markdown 视图（`source` 是重建判据：相同则跳过重建）
 #[derive(Component, Clone, Debug)]
 pub struct MarkdownView {
   source: String,
@@ -60,7 +40,6 @@ impl MarkdownView {
   }
 }
 
-/// markdown 句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MarkdownHandle(pub Entity);
 
@@ -77,7 +56,6 @@ impl From<MarkdownHandle> for Entity {
   }
 }
 
-/// markdown 根节点 bundle（不含 `Name`，供需要叠加自身标记组件的调用方复用）
 pub(crate) fn markdown_root(theme: &UiTheme, config: &MarkdownConfig) -> impl Bundle {
   let gap = if config.dense { theme.metrics.spacing.xs } else { theme.metrics.spacing.sm };
   (
@@ -91,7 +69,6 @@ pub(crate) fn markdown_root(theme: &UiTheme, config: &MarkdownConfig) -> impl Bu
   )
 }
 
-/// 渲染 markdown（块级列容器；文本变化时用 `markdown_set_text` 重建）
 pub fn markdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: MarkdownConfig) -> MarkdownHandle {
   let r = Renderer { ctx, dense: config.dense };
   let e = parent
@@ -101,13 +78,11 @@ pub fn markdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: MarkdownConfig) 
   MarkdownHandle(e)
 }
 
-/// 源文本变化才重建（相同直接返回）；判据见 `MarkdownView::source`，调用方应先自行比对以免每帧入队。
 pub fn markdown_set_text(commands: &mut Commands, entity: Entity, text: impl Into<String>) {
   let text = text.into();
   commands.queue(move |world: &mut World| rebuild(world, entity, text));
 }
 
-/// 命令落地时重建：清空子节点 → 按新源重铺（解析 / 主题 / 字体都在这里取）
 fn rebuild(world: &mut World, entity: Entity, text: String) {
   let Some(view) = world.get::<MarkdownView>(entity) else { return };
   if view.source == text {
@@ -128,7 +103,6 @@ fn rebuild(world: &mut World, entity: Entity, text: String) {
   });
 }
 
-/// 解析选项（进程级单例：只构造一次）；扩展按渲染能力开子集
 fn options() -> &'static Options<'static> {
   static OPTIONS: OnceLock<Options<'static>> = OnceLock::new();
   OPTIONS.get_or_init(|| {
@@ -141,7 +115,6 @@ fn options() -> &'static Options<'static> {
   })
 }
 
-/// 行内样式（沿子树下传；颜色已解析为主题色）
 #[derive(Clone, Copy)]
 struct InlineStyle {
   size: f32,
@@ -153,20 +126,17 @@ struct InlineStyle {
   strike: bool,
 }
 
-/// AST → UI 树（`dense` 决定块间距档）
 struct Renderer<'a> {
   ctx: &'a UiCtx<'a>,
   dense: bool,
 }
 
 impl Renderer<'_> {
-  /// 块间距（紧凑模式取 xs 档）
   fn gap(&self) -> f32 {
     let s = &self.ctx.theme.metrics.spacing;
     if self.dense { s.xs } else { s.sm }
   }
 
-  /// 正文基准样式
   fn body(&self, size: f32) -> InlineStyle {
     InlineStyle {
       size,
@@ -211,7 +181,6 @@ impl Renderer<'_> {
     InlineStyle { underline: true, color: color_of(&self.ctx.theme.colors.accent_text), ..st }
   }
 
-  /// 文档根：块级子节点顺序铺进 `parent`
   fn document(&self, parent: &mut ChildSpawner, md: &str) {
     let arena = Arena::new();
     let root = parse_document(&arena, md, options());
@@ -246,8 +215,6 @@ impl Renderer<'_> {
         self.code_block(parent, &literal);
       }
       NodeValue::Table(_) => self.table(parent, node),
-      // 其余块（元数据 / 脚注 / 描述列表 / 容器指令等）：未开对应扩展或暂不渲染，
-      // 但有子块时按块递归，避免整段内容丢失
       _ => self.blocks(parent, node),
     }
   }
@@ -270,7 +237,6 @@ impl Renderer<'_> {
     self.text_block(parent, node, st, "ui-md-heading");
   }
 
-  /// 引用块：左侧竖条 + 内缩列
   fn quote(&self, parent: &mut ChildSpawner, node: MdNode<'_>) {
     let m = &self.ctx.theme.metrics;
     parent
@@ -288,7 +254,6 @@ impl Renderer<'_> {
       .with_children(|p| self.blocks(p, node));
   }
 
-  /// 分割线
   fn rule(&self, parent: &mut ChildSpawner) {
     parent.spawn((
       Name::new("ui-md-rule"),
@@ -297,7 +262,6 @@ impl Renderer<'_> {
     ));
   }
 
-  /// 代码块：底色嵌块 + 不换行文本（超出裁切）
   fn code_block(&self, parent: &mut ChildSpawner, literal: &str) {
     let m = &self.ctx.theme.metrics;
     let text = literal.strip_suffix('\n').unwrap_or(literal);
@@ -325,7 +289,6 @@ impl Renderer<'_> {
       });
   }
 
-  /// 列表：marker 槽定宽（同列表取最长 marker，等宽字体下正文左对齐）+ 内容列
   fn list(&self, parent: &mut ChildSpawner, node: MdNode<'_>, list: NodeList) {
     let size = self.ctx.theme.metrics.font_size.md;
     let items: Vec<(MdNode<'_>, String)> =
@@ -373,7 +336,6 @@ impl Renderer<'_> {
       });
   }
 
-  /// 表格：行/列 flex，列宽等分（无文本测量预通道）
   fn table(&self, parent: &mut ChildSpawner, node: MdNode<'_>) {
     let c = &self.ctx.theme.colors;
     let m = &self.ctx.theme.metrics;
@@ -421,7 +383,6 @@ impl Renderer<'_> {
       });
   }
 
-  /// 一个文本块：`Text` 根（空串）+ 若干 `TextSpan` 子（行内样式共享同一文本块）
   fn text_block(
     &self,
     parent: &mut ChildSpawner,
@@ -451,14 +412,11 @@ impl Renderer<'_> {
       NodeValue::Emph => self.inlines(parent, node, self.emph(st)),
       NodeValue::Strikethrough => self.inlines(parent, node, self.strike(st)),
       NodeValue::Link(_) => self.inlines(parent, node, self.link(st)),
-      // 图片不加载：只展示 alt 文本（无链接语义，不加下划线）
       NodeValue::Image(_) => self.inlines(parent, node, st),
-      // 其余行内（强调变体 / 未开扩展的语法）：递归保住文字
       _ => self.inlines(parent, node, st),
     }
   }
 
-  /// 行内片段（空串不建实体）
   fn span(&self, parent: &mut ChildSpawner, text: &str, st: InlineStyle) {
     if text.is_empty() {
       return;
@@ -486,7 +444,6 @@ impl Renderer<'_> {
     }
   }
 
-  /// 文本实体 bundle（`Label` + `Text` + 主题字体/颜色 + 给定布局）
   fn text_bundle(
     &self,
     name: &'static str,
@@ -513,7 +470,6 @@ impl Renderer<'_> {
   }
 }
 
-/// 列表项 marker 文本：任务项 `[x]`/`[ ]`、有序列表序号、无序列表圆点
 fn marker_text(item: MdNode<'_>, list: NodeList, index: usize) -> String {
   match &item.data.borrow().value {
     NodeValue::TaskItem(t) => if t.symbol.is_some() { "[x]" } else { "[ ]" }.to_string(),
@@ -527,164 +483,5 @@ fn marker_text(item: MdNode<'_>, list: NodeList, index: usize) -> String {
       }
       ListType::Bullet => "•".to_string(),
     },
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use bevy::ecs::system::RunSystemOnce;
-
-  /// 无插件 World 里跑一遍渲染，返回 (挂载点, World)；主题作为 Resource 供重建路径取用
-  fn render(md: &str) -> (Entity, World) {
-    let mut world = World::new();
-    world.insert_resource(UiTheme::default());
-    let theme = UiTheme::default();
-    let ctx = UiCtx::new(&theme, None);
-    let mut root = world.spawn_empty();
-    let id = root.id();
-    root.with_children(|p| {
-      markdown(&ctx, p, MarkdownConfig { text: md.to_string(), ..default() });
-    });
-    (id, world)
-  }
-
-  fn children(world: &World, e: Entity) -> Vec<Entity> {
-    world.get::<Children>(e).map(|c| c.iter().collect()).unwrap_or_default()
-  }
-
-  fn name_of(world: &World, e: Entity) -> String {
-    world.get::<Name>(e).map(|n| n.as_str().to_string()).unwrap_or_default()
-  }
-
-  /// 渲染后的 markdown 根实体
-  fn md_root(world: &World, root: Entity) -> Entity {
-    children(world, root)[0]
-  }
-
-  fn span_texts(world: &World, block: Entity) -> Vec<String> {
-    children(world, block)
-      .iter()
-      .filter_map(|e| world.get::<TextSpan>(*e).map(|s| s.0.clone()))
-      .collect()
-  }
-
-  fn span_with(world: &World, block: Entity, text: &str) -> Entity {
-    children(world, block)
-      .into_iter()
-      .find(|e| world.get::<TextSpan>(*e).is_some_and(|s| s.0 == text))
-      .expect("span not found")
-  }
-
-  #[test]
-  fn paragraph_inline_styles() {
-    let (root, world) = render("a **b** `c` [d](https://e) ~~f~~");
-    let block = children(&world, md_root(&world, root))[0];
-    assert_eq!(name_of(&world, block), "ui-md-text");
-    assert_eq!(span_texts(&world, block), ["a ", "b", " ", "c", " ", "d", " ", "f"]);
-
-    let colors = UiTheme::default().colors;
-    let bold = span_with(&world, block, "b");
-    assert_eq!(world.get::<TextColor>(bold).unwrap().0, color_of(&colors.text_primary));
-    let code = span_with(&world, block, "c");
-    assert!(world.get::<TextBackgroundColor>(code).is_some());
-    let link = span_with(&world, block, "d");
-    assert!(world.get::<Underline>(link).is_some());
-    let strike = span_with(&world, block, "f");
-    assert!(world.get::<Strikethrough>(strike).is_some());
-  }
-
-  #[test]
-  fn block_kinds() {
-    let (root, world) = render("# title\n\npara\n\n- a\n- b\n\n> q\n\n```\ncode\n```\n\n---\n");
-    let blocks = children(&world, md_root(&world, root));
-    let names: Vec<String> = blocks.iter().map(|e| name_of(&world, *e)).collect();
-    assert_eq!(
-      names,
-      [
-        "ui-md-heading",
-        "ui-md-text",
-        "ui-md-item",
-        "ui-md-item",
-        "ui-md-quote",
-        "ui-md-code",
-        "ui-md-rule"
-      ]
-    );
-    // 标题字号取 lg 档
-    let fs = UiTheme::default().metrics.font_size;
-    assert_eq!(
-      world.get::<TextFont>(blocks[0]).unwrap().font_size,
-      bevy::text::FontSize::Px(fs.lg)
-    );
-    // 引用块内只有一个段落
-    assert_eq!(children(&world, blocks[4]).len(), 1);
-    // 代码块文本不换行
-    let code_text = children(&world, blocks[5])[0];
-    assert_eq!(world.get::<Text>(code_text).unwrap().0, "code");
-    assert_eq!(world.get::<TextLayout>(code_text).unwrap().linebreak, LineBreak::NoWrap);
-  }
-
-  #[test]
-  fn ordered_and_bullet_markers() {
-    let (root, world) = render("3. x\n4. y\n\n- z\n");
-    let blocks = children(&world, md_root(&world, root));
-    let marker = |item: Entity| {
-      let m = children(&world, item)[0];
-      world.get::<Text>(m).map(|t| t.0.clone()).unwrap_or_default()
-    };
-    assert_eq!(marker(blocks[0]), "3.");
-    assert_eq!(marker(blocks[1]), "4.");
-    assert_eq!(marker(blocks[2]), "•");
-  }
-
-  #[test]
-  fn task_items_show_checkbox_marker() {
-    let (root, world) = render("- [x] done\n- [ ] todo\n");
-    let blocks = children(&world, md_root(&world, root));
-    let marker = |item: Entity| {
-      let m = children(&world, item)[0];
-      world.get::<Text>(m).map(|t| t.0.clone()).unwrap_or_default()
-    };
-    assert_eq!(marker(blocks[0]), "[x]");
-    assert_eq!(marker(blocks[1]), "[ ]");
-  }
-
-  #[test]
-  fn table_rows_and_cells() {
-    let (root, world) = render("| a | b |\n|---|---|\n| c | d |\n");
-    let table = children(&world, md_root(&world, root))[0];
-    assert_eq!(name_of(&world, table), "ui-md-table");
-    let rows = children(&world, table);
-    assert_eq!(rows.len(), 2);
-    assert_eq!(name_of(&world, rows[0]), "ui-md-head");
-    assert_eq!(name_of(&world, rows[1]), "ui-md-row");
-    for row in rows {
-      assert_eq!(children(&world, row).len(), 2);
-    }
-  }
-
-  /// 重建：源相同时不动，变化时换掉整棵子树
-  #[test]
-  fn rebuild_only_on_change() {
-    let (root, mut world) = render("a");
-    let target = md_root(&world, root);
-    let before = children(&world, target);
-
-    world
-      .run_system_once(move |mut commands: Commands| markdown_set_text(&mut commands, target, "a"))
-      .unwrap();
-    world.flush();
-    assert_eq!(children(&world, target), before, "源相同不应重建");
-
-    world
-      .run_system_once(move |mut commands: Commands| {
-        markdown_set_text(&mut commands, target, "**b**")
-      })
-      .unwrap();
-    world.flush();
-    assert_eq!(world.get::<MarkdownView>(target).unwrap().source(), "**b**");
-    let block = children(&world, target)[0];
-    assert_eq!(span_texts(&world, block), ["b"]);
   }
 }

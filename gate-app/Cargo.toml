@@ -4,16 +4,12 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# rust-i18n CLI 配置；load-path 须与 main.rs 的 rust_i18n::i18n!("../assets/locales") 一致
 [package.metadata.i18n]
-# 加语言：这里 + assets/locales/<locale>.yml 一起加
 available-locales = ["zh-CN"]
 default-locale = "zh-CN"
 load-path = "../assets/locales"
 
 [features]
-# 性能剖析：Tracy CPU zones + gate-render 的 wgpu-profiler GPU zones
-# 用法：cargo run -p gate-app --features profile
 profile = [
   "gate-render/profile",
   "bevy/trace",
@@ -21,33 +17,23 @@ profile = [
 ]
 
 [dependencies]
-# png feature = bevy_image 的 `.png` 解码器：MT6-2 的高度图（`assets/textures/pbr/<id>/<id>_height.png`）
-# 在 CPU 侧同步解码（`height_field.rs`）。缺它 `bevy_image` 连 `ImageFormat::Png` 都不存在
-# ⇒ 与 MT2 给 jpg 开 feature 同一手法：不动依赖树里的 crate，只打开已有 `image` 依赖的编码器。
 bevy = { workspace = true, features = ["png"] }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }
 gate-ui = { workspace = true }
-# 日志落盘（版本对齐 bevy_log 0.20 的 subscriber）；"time" = 本地时区时间戳
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["time"] }
 tracing-appender = "0.2"
-# CPU 帧剖析（feature = "profile"）：Tracy 客户端
 tracy-client = { workspace = true, optional = true }
-# formatting = Rfc3339；local-offset = current_local_offset()
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 vox-rs = "0.2.0"
-# vox 场景并行分桶/建树
 rayon = { workspace = true }
-# MC 存档读取（`src/mc/world.rs`）：NBT 与 Anvil 格式都用现成 crate（见 workspace 的说明）
 fastnbt = { workspace = true }
 fastanvil = { workspace = true }
 flate2 = { workspace = true }
 png = { workspace = true }
 serde_json = { workspace = true }
-# i18n：文案表编译期 codegen 进二进制，运行期只有 t! 查表 + set_locale 切换两条路
 rust-i18n = "4.2"
-# 配置存档（`data/config.toml`）序列化（版本与 gate-ui 的菜单模型一致）
 serde = { workspace = true }
 toml = "0.8"

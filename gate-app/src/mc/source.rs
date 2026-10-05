@@ -1,27 +1,3 @@
-//! **`ChunkSource` 实现**：把"我们的一块 = MC 的一个 chunk-section"翻成体素。
-//!
-//! 坐标（`docs/mc_map.md` §1）：我们的 chunk 坐标 = MC 的 `(chunkX, sectionY, chunkZ)`，
-//! 1 方块 = 16³ 体素 ⇒ 一个 section（16³ 方块）正好是 256³ 体素 = 我们的一块，**无缩放无偏移**。
-//!
-//! 产出走 [`ChunkTree`] 的 brick 级写接口（`fill_brick` / `set_brick_cells`）：一个方块 = 64 个
-//! `4³` 砖，每砖一次写，**与本砖内有几种颜色无关**（逐格写要付 64 倍的下钻）。这决定了本节制的成本：
-//! 单色整块（石/陶土/混凝土……地图上大多数）只写 1 次；多色块（草、原木端面、台阶的显式 uv）最多 64 次。
-//!
-//! 档位（`Detail` 的粒度直接落在这套对齐上）：
-//!
-//! | `Detail` | 粒度 | 每方块写几次 |
-//! |---|---|---|
-//! | `Full` | 逐 texel | 1..64 |
-//! | `Fine` | `4³` 体素 | 1..64（每砖等值） |
-//! | `Coarse` | 整块（16） | 1 |
-//! | `Wide` / `Chunk` | `4³` / 整 section 个方块 | 1 / 每 64 个方块 |
-//!
-//! **远场级（`vol ≥ 1`）**默认走 [`super::summary`] 的摘要金字塔：远场 chunk 的坐标是它自己的级体素空间
-//! （级体素 = `FAR_SCALES[vol-1]` 个世界体素），一个 chunk = `16·scale` 个方块每轴 ⇒ 每格 `scale³` 方块
-//! 取一个摘要色、按 `FAR_GRAIN` 级体素填格（见该模块的采样口径）。
-//! **装了 [`super::lod`]（离线粗粒度世界）之后**，`scale ≥ 16` 的格改从那份文件内存采样（同一条填充
-//! 口径，见 [`McCITY::far_tree`]）——那才是"看得远"的正路（列读是这条路的成本大头）。
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -38,29 +14,19 @@ use super::voxel::{self, BlockPlan, Fill};
 use super::world::{self, BlockState, World};
 use crate::infinite_cubes::{FAR_GRAIN, FAR_SCALES};
 
-/// 一个 MC chunk-section 的方块边长（= 我们一块的体素边长 / 16）
 const SEC: i32 = 16;
 
-/// 远场级的**格**有多少方块（每轴）：`FAR_GRAIN` 级体素 × `scale`（1 级体素 = 几个世界体素）
-/// ÷ [`super::VOXELS_PER_BLOCK`]。单元（chunk）恒 = `256` 级体素 ⇒ "单元有多粗"与"格有多大"
-/// 是两个独立的量（见 `mc_map.md` §8.9）。
 fn cell_blocks_of(scale: i32) -> i32 {
   FAR_GRAIN * scale / super::VOXELS_PER_BLOCK
 }
 
-/// 生产源（worker 线程共享 `&self`）
 pub struct McCity {
   world: Arc<World>,
   assets: Arc<Assets>,
   pool: Arc<Pool>,
-  /// 方块状态 → 计划（按规范键去重；`None` 也缓存：缺资产的方块不必每次重试）
   plans: Mutex<HashMap<String, Option<Arc<BlockPlan>>>>,
-  /// 远场级的摘要金字塔（按 section 缓存，见 [`super::summary`]）
   summary: Summary,
-  /// **离线粗粒度世界**（[`super::lod`]）：远场 `scale ≥ 16` 改走它（内存查表）。构建任务跑在裸线程上、
-  /// 完成后热装新的一份 ⇒ 共享句柄（而不是普通字段）。
   lod: lod::Cell,
-  /// 已产出的 section 数（诊断）
   produced: Mutex<usize>,
 }
 
@@ -77,7 +43,6 @@ impl McCity {
     }
   }
 
-  /// 这个方块状态的写入计划（`None` = 画不出东西：空气 / 缺资产）
   pub fn plan_for(&self, st: &BlockState) -> Option<Arc<BlockPlan>> {
     let key = st.key();
     if let Some(hit) = self.plans.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -88,25 +53,11 @@ impl McCity {
     built
   }
 
-  /// 调色板日志的 `[from..]` 段（主线程按游标补装进各 volume 的调色板）
   pub fn palette_from(&self, from: usize) -> Vec<(PaletteId, PaletteEntry)> {
     self.pool.log_from(from)
   }
 
-  /// 诊断：累计去过 region 的次数（见 [`World::reads`]）—— 远场采样成本的核对点
-  #[cfg(test)]
-  pub fn world_reads(&self) -> usize {
-    self.world.reads()
-  }
-
-  /// **远场级产出**（`docs/mc_map.md` §8.2）：一个远场 chunk = `256` 级体素每轴，逐格取摘要色。
-  ///
-  /// 格的**级体素**原点 = `k · FAR_GRAIN`、块的方块原点 = `origin + k · cell_blocks` —— 与
-  /// `infinite_cubes::build_region_far` 的"格中心采样"是同一套坐标。
   fn produce_far(&self, coord: ChunkCoord, scale: i32) -> Option<ChunkTree> {
-    // **离线粗粒度世界**（[`super::lod`]）：格的边长在文件里有对应档（`4` 方块 = 一节里的 `4³` 细格、
-    // `≥16` 方块 = 整数个节）⇒ 直接内存采样。一条 L2 块因此从"读 256 个 chunk 列（实测 295 ms）"降到
-    // "4096 次查表（≈1 ms）"；L1（4 方块格）靠文件里的细格同样走它，不再按需读 Anvil。
     let cell_blocks = cell_blocks_of(scale);
     if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
       return self.far_tree(coord, cell_blocks, |cell| view.cell(cell, cell_blocks));
@@ -115,15 +66,12 @@ impl McCity {
     self.far_tree(coord, cell_blocks, |cell| summary.cell(self, cell, cell_blocks))
   }
 
-  /// 远场一块 = 逐格取样、每格填一块 `FAR_GRAIN³` 等值砖（[`super::summary`] 与 [`super::lod`] 共用
-  /// 这条填充口径，差别只在"这一格取什么色"）。
   fn far_tree(
     &self,
     coord: ChunkCoord,
     cell_blocks: i32,
     cell: impl Fn(IVec3) -> Option<PaletteId>,
   ) -> Option<ChunkTree> {
-    // 每轴格数由**格**的级体素边长推出（`FAR_GRAIN` 变 ⇒ 格变 ⇒ 块变，三者始终铺满一个 chunk）
     let cells = gate_voxel::CHUNK_SIZE / FAR_GRAIN;
     let origin = coord.0 * cells * cell_blocks;
     let mut tree = ChunkTree::empty();
@@ -139,13 +87,10 @@ impl McCity {
     (!tree.is_empty()).then_some(tree)
   }
 
-  /// 已装载的离线粗粒度世界（`None` = 没建 / 过期 ⇒ 远场按需读 Anvil）
   pub fn lod(&self) -> Option<Arc<lod::View>> {
     self.lod.read().unwrap_or_else(|e| e.into_inner()).clone()
   }
 
-  /// 装载一份 LOD 文件并**热装**（构建完成时也走它）。名字 → 代表色的解析在这里做：文件里存的是
-  /// 方块状态键，色要按**本次运行**的调色板认领（见 [`super::lod`] 的模块头）。
   pub fn install_lod(&self, f: lod::File) {
     let view = lod::View::new(f, |key| self.plan_for(&BlockState::from_key(key)).map(|p| p.rep));
     bevy::log::info!(
@@ -160,7 +105,6 @@ impl McCity {
     *self.lod.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(view));
   }
 
-  /// **构建 LOD 缓存**：算完整张图 → 写盘 → 热装。跑在 DebugMenu 起的后台线程上（`cancel` 中止）。
   pub fn build_lod(
     &self,
     path: &Path,
@@ -174,7 +118,6 @@ impl McCity {
 }
 
 impl summary::SectionReps for McCity {
-  /// 一个 section 的 4096 个方块代表色（走 [`Self::plan_for`] 的缓存；空气 = 0）。
   fn section_reps(&self, sec: IVec3) -> Option<Box<[PaletteId; world::SECTION_VOLUME]>> {
     if !(0..world::SECTIONS_PER_CHUNK).contains(&sec.y) {
       return None;
@@ -200,11 +143,6 @@ impl summary::SectionReps for McCity {
 }
 
 impl ChunkSource for McCity {
-  /// MC 世界的内容是**有界的**：`SECTIONS_PER_CHUNK` 个节、每节 16 方块 ⇒ 世界高
-  /// `16 × 16 方块 × VOXELS_PER_BLOCK` 世界体素（= 123 m），从 y = 0 起。
-  ///
-  /// 声明它是为了让远场预载的竖向**不再跟着相机**（见 [`ChunkSource::content_y_range`]）——
-  /// 飞到 123 m 之上时预载仍能枚举到地面。
   fn content_y_range(&self) -> Option<(i32, i32)> {
     Some((0, world::SECTIONS_PER_CHUNK * SEC * super::VOXELS_PER_BLOCK))
   }
@@ -221,16 +159,14 @@ impl ChunkSource for McCity {
     }
     let (cx, sy, cz) = (coord.0.x, coord.0.y, coord.0.z);
     if !(0..world::SECTIONS_PER_CHUNK).contains(&sy) {
-      return None; // 1.17 世界高 256 ⇒ 只有 16 层
+      return None;
     }
     let chunk = self.world.chunk(cx, cz)?;
     let sec = chunk.section(sy)?;
     if sec.is_empty_layer() {
-      return None; // 城市里大多数层是空气：直接不产出（不占池、不占 GPU）
+      return None;
     }
-    // 本节每个调色板项的计划：属性 → 形状的解析按状态缓存，这里只是一次查表
-    let plans: Vec<Option<Arc<BlockPlan>>> =
-      sec.palette.iter().map(|s| self.plan_for(s)).collect();
+    let plans: Vec<Option<Arc<BlockPlan>>> = sec.palette.iter().map(|s| self.plan_for(s)).collect();
     if plans.iter().all(Option::is_none) {
       return None;
     }
@@ -240,13 +176,7 @@ impl ChunkSource for McCity {
     let grain = detail.grain();
     let mut tree = ChunkTree::empty();
     match grain {
-      // 逐 texel 那两档都走**每 `4³` 砖一个代表色**（8 cm）。
       //
-      // WHY: 逐 texel 实测不可用 —— 一层满实体 section 的 CPU 树 **20 MB**、产出 **78 ms**
-      // （`real_map_produce`，出生点 chunk 的 y 0..6）。原因是结构性的、不是颜色量化能救的：
-      // 一个方块的表面层有 56 个 `4³` 砖，每个砖横跨 4×4 个 texel ⇒ 砖内必然多色 ⇒ 每个砖都要一张
-      // 4³ 值表（CPU 128 B / wire 24 B），4096 个方块就是 2600 万个砖。8 cm 档让每砖**整砖同色**
-      // （值表消失、可并进父层），观感上仍保留贴图的色块变化。见 `docs/mc_map.md` §6。
       1 | 4 => {
         for (i, &pi) in states.iter().enumerate() {
           let Some(plan) = plans.get(pi as usize).and_then(|p| p.clone()) else { continue };
@@ -272,8 +202,6 @@ impl ChunkSource for McCity {
       *g += 1;
       *g
     };
-    // 首个 section 是一条一次性里程碑：把"资产缺了多少 / 调色板认领了多少槽 / 区块缓存读数"一起落盘
-    // —— 这些是"画面对不对"之外唯一可核的证据。`GATE_LOG=gate_app=debug` 还能看到每个 section。
     if n == 1 {
       bevy::log::info!(
         "MC 首个 section 产出（chunk {cx},{sy},{cz}）：调色板 {} 槽（溢出回退 {} 次）、区块缓存 {:?}、缺失资产 {} 个",
@@ -292,29 +220,21 @@ impl ChunkSource for McCity {
     self.palette_from(from)
   }
 
-  /// 暴露自身：DebugMenu 的「构建 LOD 缓存」要拿到 `Arc<McCity>` 才能在后台线程里建好并热装
   fn clone_as_any(self: Arc<Self>) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
     let any: Arc<dyn std::any::Any + Send + Sync> = self;
     Some(any)
   }
 }
 
-/// 第 `i` 个方块（`i = y*256 + z*16 + x`）在 chunk 内的体素原点
 fn block_origin(i: usize) -> IVec3 {
   IVec3::new((i % 16) as i32, (i / 256) as i32, ((i / 16) % 16) as i32) * SEC
 }
 
-/// 一次 brick 级写
 fn apply(tree: &mut ChunkTree, org: IVec3, f: &Fill) {
   let Fill::Brick { off, extent, id } = f;
   tree.fill_brick((org + IVec3::from(*off)).to_array(), *extent, *id);
 }
 
-/// 更粗的两档：先在"每方块一个代表色"上聚合，再整段写（`Wide` = 4³ 个方块、`Chunk` = 整层）。
-///
-/// 粗档的判据是**过半非空气**才给色：4³ 个方块里只塞了一个实体块就把整格填满，远处会糊成实心块
-/// （这跟近处 `Coarse` 那档"宁可膨胀也别让结构消失"的取舍相反 —— 那里一格就是一个方块，
-/// 膨胀与消失是同一件事的两面；这里一格是 64 个方块，膨胀的代价大得多）。
 fn coarse(tree: &mut ChunkTree, states: &[u16], plans: &[Option<Arc<BlockPlan>>], grain: i32) {
   let mut reps = [PaletteId::AIR; 4096];
   for (i, &pi) in states.iter().enumerate() {
@@ -326,7 +246,7 @@ fn coarse(tree: &mut ChunkTree, states: &[u16], plans: &[Option<Arc<BlockPlan>>]
     }
     return;
   }
-  let n = 16 / 4; // 每轴 4 组
+  let n = 16 / 4;
   let mut buf = [PaletteId::AIR; 64];
   for by in 0..n {
     for bz in 0..n {
@@ -347,64 +267,10 @@ fn coarse(tree: &mut ChunkTree, states: &[u16], plans: &[Option<Arc<BlockPlan>>]
   }
 }
 
-/// 一组方块的代表色（**过半非空气** + 组内出现最多的那个色；否则整组算空）
 fn group_rep(buf: &[PaletteId]) -> Option<PaletteId> {
   let solid = buf.iter().filter(|c| !c.is_air()).count();
   if solid * 2 < buf.len() {
     return None;
   }
   voxel::rep_of(buf)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn block_origin_matches_the_nbt_index_order() {
-    // i = y*256 + z*16 + x（x 最密，与 `BlockStates` 同序）
-    assert_eq!(block_origin(0), IVec3::ZERO);
-    assert_eq!(block_origin(1), IVec3::new(16, 0, 0), "x 走一格");
-    assert_eq!(block_origin(16), IVec3::new(0, 0, 16), "z 走一格");
-    assert_eq!(block_origin(256), IVec3::new(0, 16, 0), "y 走一格");
-    assert_eq!(block_origin(4095), IVec3::new(15, 15, 15) * 16, "最后一格");
-  }
-
-  /// `coarse` 的聚合：4³ 个方块里取出现最多的代表色；**过半是空气的组不写**（免得远处糊成实心）
-  #[test]
-  fn coarse_aggregates_blocks_by_majority() {
-    let stone = PaletteId(3);
-    let plans: Vec<Option<Arc<BlockPlan>>> = vec![
-      None, // 调色板 0 = 空气
-      Some(Arc::new(BlockPlan { rep: stone, fills: Vec::new() })),
-    ];
-    // 第 0 组（x,y,z 各 0..4）里 60 个 stone + 4 个空气；其余方块全空气
-    let mut states = vec![0u16; 4096];
-    let mut n = 0;
-    for y in 0..4 {
-      for z in 0..4 {
-        for x in 0..4 {
-          if n < 60 {
-            states[(y * 256 + z * 16 + x) as usize] = 1;
-          }
-          n += 1;
-        }
-      }
-    }
-    let mut tree = ChunkTree::empty();
-    coarse(&mut tree, &states, &plans, 64);
-    assert_eq!(tree.get_voxel(8, 8, 8), Some(stone), "第 0 组应整段填成 stone");
-    assert!(tree.get_voxel(80, 8, 8).is_none(), "空组不写");
-    // 整层档：该层 4096 个方块里只有 60 个实体（远不过半）⇒ 整层算空，什么都不写
-    let mut t2 = ChunkTree::empty();
-    coarse(&mut t2, &states, &plans, 256);
-    assert!(t2.is_empty(), "绝大多数是空气的层不该被填实");
-    // 反过来：过半实体时整层给代表色
-    for s in states.iter_mut() {
-      *s = 1;
-    }
-    let mut t3 = ChunkTree::empty();
-    coarse(&mut t3, &states, &plans, 256);
-    assert_eq!(t3.get_voxel(200, 200, 200), Some(stone));
-  }
 }

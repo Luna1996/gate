@@ -1,10 +1,3 @@
-//! dropdown：单行下拉框（点击展开；选中项与控件原位重合，其余选项自上方/下方缓动展开）。
-//! 框体与 `text_input` 同款（底/边框/高度/内距/字号），右侧多一个箭头图标。
-//! 展开浮层是顶层实体（无父节点 + `GlobalZIndex`，不进调用方 UI 树），位置每帧从控件锚点重算；
-//! 浮层下垫一层全屏透明遮罩：列表只在「点击列表外」时关闭（该次点击不再下传）；
-//! 列表整体按 `WINDOW_MARGIN` 钳制在窗口内（优先于「选中项与控件重合」）；
-//! 滚轮在「未展开且悬停控件」或「展开中任意位置」时上下移动选中项，浮层播放滑动动画。
-
 use std::ops::Deref;
 
 use bevy::ecs::message::MessageReader;
@@ -27,72 +20,54 @@ use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::consts::{DROPDOWN_ANIM_SECS, DROPDOWN_ARROW_SIZE, DROPDOWN_SCROLL_SPEED};
 
-/// 浮层层深：高于所有面板/菜单，低于 tooltip（1000）
 const DROPDOWN_Z: i32 = 900;
 
-/// 下拉框控件根标记
 #[derive(Component, Debug, Default)]
 pub struct DropdownRoot;
 
-/// 关闭态显示文本子实体标记
 #[derive(Component, Debug, Default)]
 pub struct DropdownText;
 
-/// 框内右侧箭头图标子实体标记
 #[derive(Component, Debug, Default)]
 pub struct DropdownArrow;
 
-/// 展开浮层根标记（顶层实体；`owner` = 所属控件）
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct DropdownPopup {
   pub owner: Entity,
-  /// 同一生存期的遮罩实体（随浮层一并销毁）
   pub backdrop: Entity,
-  /// 展开进度 0..=1
   pub t: f32,
-  /// 选中项视觉下标：向真源缓动（= 滚动动画）；与真源相等时选中项与控件逐像素重合
   pub sel: f32,
 }
 
-/// 浮层遮罩标记（全屏透明顶层实体，压在浮层之下；`owner` = 所属控件）。
-/// 存在期间吞掉所有指针事件：点击它 = 关闭列表，且不触发其他 UI / 场景逻辑。
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DropdownBackdrop {
   pub owner: Entity,
 }
 
-/// 浮层里的一个选项（`owner` = 所属控件，`index` = 选项下标）
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct DropdownOption {
   pub owner: Entity,
   pub index: usize,
 }
 
-/// 选项文案列表（i18n key；未注入解析器时 key 原样显示，直接写字面量同样成立）
 #[derive(Component, Clone, Debug, PartialEq, Eq, Default)]
 pub struct DropdownOptions(pub Vec<String>);
 
-/// 选中下标（真源）
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DropdownValue(pub usize);
 
-/// 交互状态
 #[derive(Component, Clone, Copy, Debug, PartialEq, Default)]
 pub struct DropdownState {
-  /// 展开中（浮层存活期间恒为 true）
   pub open: bool,
-  /// 滚轮累计增量（格；满 1 格移动一项，余数留到下一帧）
   pub wheel: f32,
 }
 
-/// 选中项变化事件（EntityEvent，target = 控件根实体；由点击选项或滚轮改选触发）
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct DropdownChanged {
   pub entity: Entity,
   pub value: usize,
 }
 
-/// 下拉框句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DropdownHandle(pub Entity);
 
@@ -109,17 +84,13 @@ impl From<DropdownHandle> for Entity {
   }
 }
 
-/// 下拉框配置（全部字段进 Config；Default = 空选项 + 选中 0、不禁用）
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DropdownConfig {
-  /// 选项文案（i18n key / 字面量）
   pub options: Vec<String>,
-  /// 选中下标（越界自动钳到末项）
   pub selected: usize,
   pub disabled: bool,
 }
 
-/// 主题下拉框（宽度由父容器决定；最小宽度 56px，与输入框一致）
 pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) -> DropdownHandle {
   let m = &ctx.theme.metrics;
   let selected = config.selected.min(config.options.len().saturating_sub(1));
@@ -139,7 +110,6 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
     UiInteractBundle::default(),
     Node {
       min_width: px(56.0),
-      // 与输入框同高（文字高 + 上下内距 + 上下边框）
       height: px(m.font_size.md + m.spacing.sm + m.border_width * 2.0),
       flex_direction: FlexDirection::Row,
       align_items: AlignItems::Center,
@@ -150,7 +120,6 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
     },
     BackgroundColor(bg),
     BorderColor::all(border),
-    // 控件吞掉鼠标事件（点击展开 / 悬停不穿透到菜单行与 3D 场景）
     MouseIntercept,
   ));
   if config.disabled {
@@ -172,7 +141,6 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
       crate::i18n::I18nKey::new(&key),
       TextColor(text_color),
       TextLayout { linebreak: LineBreak::NoWrap, ..default() },
-      // 占满剩余宽度：文本左对齐、箭头贴右（只补字段，不覆盖 label 自带 Node）
       Node { flex_grow: 1.0, ..default() },
     ));
     let a = spawn_icon(
@@ -187,7 +155,6 @@ pub fn dropdown(ctx: &UiCtx, parent: &mut ChildSpawner, config: DropdownConfig) 
   DropdownHandle(ec.id())
 }
 
-/// (背景, 边框, 文字) 配色：与输入框同档；展开态 = 输入框编辑态（强调边框），hover 提亮一档
 fn dropdown_colors(theme: &UiTheme, open: bool, inter: UiInteract) -> (Color, Color, Color) {
   let c = &theme.colors;
   let border = if open {
@@ -200,13 +167,10 @@ fn dropdown_colors(theme: &UiTheme, open: bool, inter: UiInteract) -> (Color, Co
   (color_of(&c.surface_elevated), border, color_of(&c.text_primary))
 }
 
-/// 缓动（ease-in-out cubic；与菜单分页动画同一曲线）
 fn ease_in_out(t: f32) -> f32 {
   if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
-/// 锚点矩形（逻辑 px 左上角 + 尺寸）；`ComputedNode`/`UiGlobalTransform` 是物理 px，按 `scale_factor` 折算为逻辑 px。
-/// 浮层定位共用（下拉浮层 / 调色板浮窗）。
 pub(crate) fn anchor_rect(
   node: &ComputedNode,
   xform: &UiGlobalTransform,
@@ -217,7 +181,6 @@ pub(crate) fn anchor_rect(
   (xform.translation / sf - size * 0.5, size)
 }
 
-/// 从资源装配 `UiCtx`（展开时现场建浮层用；主题未就绪 → None）
 fn ctx_of<'a>(
   theme: &'a Option<Res<UiTheme>>,
   font: &'a Option<Res<ThemeFont>>,
@@ -232,9 +195,6 @@ fn ctx_of<'a>(
   )
 }
 
-/// 建展开浮层：容器 = 锚点控件矩形；选项绝对定位（动画由 `dropdown_visual_system` 推进）。
-/// 选项与控件同高/同内距/同字号：`t = 1` 时选中项与关闭态控件逐像素重合。
-/// 另建一层全屏透明遮罩（浮层之下）：列表存活期间吞掉所有指针事件，点击它只关列表。
 fn spawn_popup(
   commands: &mut Commands,
   ctx: &UiCtx,
@@ -247,7 +207,6 @@ fn spawn_popup(
   let c = &ctx.theme.colors;
   let (pos, size) = rect;
   let selected = selected.min(options.0.len().saturating_sub(1));
-  // 命令上下文用显式 `ChildOf` 组装：commands 版 spawner 拿不到 world 版 `ChildSpawner`
   let backdrop = commands
     .spawn((
       Name::new("ui-dropdown-backdrop"),
@@ -261,7 +220,6 @@ fn spawn_popup(
         ..default()
       },
       BackgroundColor(Color::NONE),
-      // 压在所有面板/菜单之上、浮层之下
       GlobalZIndex(DROPDOWN_Z - 1),
       MouseIntercept,
       UiInteractBundle::default(),
@@ -280,7 +238,6 @@ fn spawn_popup(
         ..default()
       },
       BackgroundColor(Color::NONE),
-      // 容器只有控件那么大，自身不吃命中（选项各自 Block）
       Pickable::IGNORE,
       GlobalZIndex(DROPDOWN_Z),
     ))
@@ -294,7 +251,6 @@ fn spawn_popup(
         UiInteractBundle::default(),
         Node {
           position_type: PositionType::Absolute,
-          // 动画每帧写 top = (i - sel) · h · ease(t)；t = 0 时全部叠在锚点矩形上
           left: px(0.0),
           top: px(0.0),
           width: Val::Percent(100.0),
@@ -304,7 +260,6 @@ fn spawn_popup(
           border: UiRect {
             left: px(m.border_width),
             right: px(m.border_width),
-            // 纵向相邻共享 1px：首项画上边框，其余靠前一项的下边框
             top: px(if i == 0 { m.border_width } else { 0.0 }),
             bottom: px(m.border_width),
           },
@@ -317,7 +272,6 @@ fn spawn_popup(
         MouseIntercept,
       ))
       .id();
-    // 选项文本与控件同字号/同内距 → 选中项与关闭态控件文本完全重叠
     let text = commands
       .spawn((
         label_bundle_attrs(
@@ -338,7 +292,6 @@ fn spawn_popup(
   }
 }
 
-/// 关闭：销毁该控件的浮层（连同其遮罩）+ 复位展开态
 fn close_popup(
   commands: &mut Commands,
   owner: Entity,
@@ -354,9 +307,7 @@ fn close_popup(
   state.open = false;
 }
 
-/// 指针交互：点控件展开 / 点选项选中 / 点遮罩关闭（不再有其他关闭路径）。
-/// 滚轮：未展开时需悬停控件、展开时任意位置；上/下滚 = 选中项上移/下移（满一格动一项）。
-#[allow(clippy::type_complexity, clippy::too_many_arguments)] // Bevy system：多组件查询/入参签名固有
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn dropdown_system(
   mut commands: Commands,
   mut wheel: MessageReader<MouseWheel>,
@@ -393,7 +344,6 @@ pub fn dropdown_system(
 ) {
   let sf = windows.single().ok().map(|w| w.scale_factor()).unwrap_or(1.0);
 
-  // ---------- 0. 滚轮增量：Line 一格；Pixel（触控板）按 16px 行高折算 ----------
   let mut lines = 0.0;
   for ev in wheel.read() {
     match ev.unit {
@@ -402,7 +352,6 @@ pub fn dropdown_system(
     }
   }
 
-  // ---------- 1. 选项：点击判定 ----------
   let mut clicked: Option<(Entity, usize)> = None;
   for (hovered, pressed, mut prev, opt) in &mut q_options {
     let inter = UiInteract::of(hovered, pressed);
@@ -412,7 +361,6 @@ pub fn dropdown_system(
     prev.0 = inter;
   }
 
-  // ---------- 2. 遮罩：点击列表外 ----------
   let mut clicked_outside: Option<Entity> = None;
   for (_, hovered, pressed, mut prev, bd) in &mut q_backdrops {
     let inter = UiInteract::of(hovered, pressed);
@@ -422,7 +370,6 @@ pub fn dropdown_system(
     prev.0 = inter;
   }
 
-  // ---------- 3. 控件：选项选中 / 展开 / 收起 / 滚轮改选 ----------
   for (
     e,
     hovered,
@@ -443,7 +390,6 @@ pub fn dropdown_system(
     if disabled {
       continue;
     }
-    // 点选项 = 选中（写真源 + 通知）；点当前项 = 只关闭
     if let Some((owner, index)) = clicked
       && owner == e
     {
@@ -454,12 +400,10 @@ pub fn dropdown_system(
       close_popup(&mut commands, e, &q_popups, &mut state);
       continue;
     }
-    // 点列表外（遮罩）→ 只关闭
     if clicked_outside == Some(e) {
       close_popup(&mut commands, e, &q_popups, &mut state);
       continue;
     }
-    // 滚轮改选（满一格动一项，余数留到下一帧）
     if lines != 0.0 && (state.open || inter.is_active()) {
       state.wheel += lines;
       let steps = state.wheel.trunc();
@@ -467,7 +411,6 @@ pub fn dropdown_system(
         state.wheel -= steps;
         let count = options.0.len();
         if count > 0 {
-          // 滚轮上（steps > 0）→ 下标减
           let next = (value.0 as i32 - steps as i32).clamp(0, count as i32 - 1) as usize;
           if next != value.0 {
             value.0 = next;
@@ -484,11 +427,9 @@ pub fn dropdown_system(
         state.open = true;
       }
     } else if state.open && !visible.map(|v| v.get()).unwrap_or(true) {
-      // 菜单被隐藏 → 浮层与遮罩一并回收
       close_popup(&mut commands, e, &q_popups, &mut state);
     }
   }
-  // 锚点控件已销毁 → 浮层（连同遮罩）立即回收，不留孤儿
   for (popup, p) in &q_popups {
     if q_roots.get(p.owner).is_err() {
       commands.entity(popup).despawn();
@@ -497,8 +438,7 @@ pub fn dropdown_system(
   }
 }
 
-/// 视觉：关闭态文本/配色 + 浮层跟随锚点（窗口内钳制）+ 展开/滚动动画 + 选项配色（每帧重算）
-#[allow(clippy::type_complexity, clippy::too_many_arguments)] // Bevy system：多组件查询/入参签名固有
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn dropdown_visual_system(
   theme: Option<Res<UiTheme>>,
   i18n: Option<Res<crate::i18n::UiTranslator>>,
@@ -543,7 +483,6 @@ pub fn dropdown_visual_system(
   let c = &theme.colors;
   let window = windows.single().ok();
   let sf = window.map(|w| w.scale_factor()).unwrap_or(1.0);
-  // 窗口逻辑尺寸（与 `anchor_rect` 同坐标系），列表钳制用
   let win_size = window.map(|w| Vec2::new(w.width(), w.height()));
   let dt = time.delta_secs();
   let surface_elevated = color_of(&c.surface_elevated);
@@ -554,7 +493,6 @@ pub fn dropdown_visual_system(
   let text_body = color_of(&c.text_body);
   let text_muted = color_of(&c.text_muted);
 
-  // ---------- 1. 控件：关闭态文本 + 配色（展开/hover/禁用） ----------
   for (value, options, hovered, pressed, state, children, mut bg, mut border_c, disabled) in
     &mut q_roots
   {
@@ -607,17 +545,14 @@ pub fn dropdown_visual_system(
     }
   }
 
-  // ---------- 2. 浮层：跟随锚点（窗口内钳制）+ 展开/滚动动画 + 选项配色 ----------
   for (mut popup, mut node) in &mut q_popups {
     let Ok((anchor_node, anchor_xform, visible)) = q_anchors.get(popup.owner) else { continue };
     if !visible.map(|v| v.get()).unwrap_or(true) {
-      continue; // 菜单隐藏时冻结位置（关闭由 dropdown_system 负责）
+      continue;
     }
     let (selected, count) =
       q_roots.get(popup.owner).map(|r| (r.0.0, r.1.0.len())).unwrap_or((0, 0));
     let (mut pos, size) = anchor_rect(anchor_node, anchor_xform, sf);
-    // 整份列表（n 项首尾相接，选中项与控件重合）必须留在窗口内并留 `WINDOW_MARGIN`；
-    // 该规则优先于「选中项与控件重合」：贴边时整份列表平移，选中项不再对齐控件。
     if let Some(win) = win_size {
       let list_h = size.y * count as f32;
       let list_top = pos.y - selected as f32 * size.y;
@@ -639,7 +574,6 @@ pub fn dropdown_visual_system(
     }
     popup.t = (popup.t + dt / DROPDOWN_ANIM_SECS).min(1.0);
     let p = ease_in_out(popup.t);
-    // 视觉下标向真源匀速靠拢（滚轮改选时的滑动动画）
     let target = selected as f32;
     let d = target - popup.sel;
     if d != 0.0 {
@@ -653,7 +587,6 @@ pub fn dropdown_visual_system(
       if opt.owner != popup.owner {
         continue;
       }
-      // 选中项 (i - sel) = 0 → 与控件矩形重合；其余按缓动从它上下滑出
       let top = px((opt.index as f32 - popup.sel) * size.y * p);
       if opt_node.top != top {
         opt_node.top = top;
@@ -661,7 +594,6 @@ pub fn dropdown_visual_system(
       if opt_node.height != px(size.y) {
         opt_node.height = px(size.y);
       }
-      // 配色：hover 提亮；选中项与关闭态控件同款（底/边框/主文本色）
       let hovered = inter.is_active();
       let (target_bg, target_border, target_text) = if hovered {
         (surface_overlay, border_strong, text_primary)

@@ -1,7 +1,3 @@
-//! 相机与输入：两种相机模式（轨道 / 幽灵飞行）、左键拾取 recenter、自由模式的鼠标锁定 + 准星。
-//! 模式互斥由 `CameraMode` 单点决定；`build_camera_config` 是唯一矩阵构造点。
-//! 朝向 yaw/pitch 两模式共享，切换模式时视线方向连续。
-
 use bevy::{
   input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
   prelude::*,
@@ -17,25 +13,17 @@ use crate::consts::{
   FLY_SPEED_FAST_MUL, FOV_Y, ROT_SPEED, ZOOM_LOG_SPEED,
 };
 
-/// 相机模式（main world Resource）。切换的唯一入口是 DebugMenu 的「玩家/相机/相机模式」切换组。
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum CameraMode {
-  /// 轨道相机：右键旋转 / 中键平移 / 滚轮缩放
   Orbit,
-  /// 幽灵飞行：WASD 沿视线平移、Space 升 / Shift 降，不做碰撞检测（默认模式）
   #[default]
   Fly,
 }
 
-/// 幽灵相机状态；朝向复用 `OrbitCamera` 的 yaw/pitch（两模式共享），位置在模式切换时同步
-/// （见 `sync_camera_mode_switch`）。
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct FlyCamera {
-  /// 眼位（voxel）
   pub pos: Vec3,
-  /// 基础飞行速度（voxel/s；低速档值，滑杆改的就是它）
   pub speed: f32,
-  /// true = 高速档（实际速度 = `speed` × `FLY_SPEED_FAST_MUL`）
   pub fast: bool,
 }
 
@@ -46,30 +34,22 @@ impl Default for FlyCamera {
 }
 
 impl FlyCamera {
-  /// 本帧实际飞行速度（含高速档倍率）
   pub fn effective_speed(&self) -> f32 {
     if self.fast { self.speed * FLY_SPEED_FAST_MUL } else { self.speed }
   }
 }
 
-/// 跨启动保留的相机姿态（持久化在 `<安装根>/data/config.toml` 的 `[camera]` 节）。
-/// 只存两模式共有的量：眼位 + yaw/pitch（朝向共享）。
-/// 轨道参数由 eye/yaw/pitch/distance 反推 —— 保证 `orbit.eye() == eye`，
-/// 首帧 `sync_camera_mode_switch` 才幂等（否则它会用 `orbit.eye()` 覆盖眼位）。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct CameraPose {
   pub mode: CameraMode,
   pub eye: [f32; 3],
   pub yaw: f32,
   pub pitch: f32,
-  /// 轨道半径（仅 Orbit 模式有意义）
   pub distance: f32,
 }
 
 impl CameraPose {
-  /// 记录本帧相机状态（退出时调用）。
   pub fn capture(mode: CameraMode, orbit: &OrbitCamera, fly: &FlyCamera) -> Self {
-    // 眼位取当前模式自己的那个：Orbit 用 `orbit.eye()`，Fly 用 `fly.pos`。
     let eye = match mode {
       CameraMode::Orbit => orbit.eye(),
       CameraMode::Fly => fly.pos,
@@ -77,12 +57,10 @@ impl CameraPose {
     Self { mode, eye: eye.to_array(), yaw: orbit.yaw, pitch: orbit.pitch, distance: orbit.distance }
   }
 
-  /// 眼位的世界坐标（voxel）。
   fn eye_vec(&self) -> Vec3 {
     Vec3::from_array(self.eye)
   }
 
-  /// 还原轨道参数：`target = eye − distance·dir`，与 `OrbitCamera::eye()` 互为逆运算。
   pub fn to_orbit(self) -> OrbitCamera {
     let dir = look_forward(self.yaw, self.pitch) * -1.0;
     let mut o = OrbitCamera {
@@ -96,27 +74,21 @@ impl CameraPose {
   }
 }
 
-/// yaw/pitch → 视线单位向量（eye→target 方向，即 `OrbitCamera::eye()` 偏移方向取反）；
-/// 中键平移基 / 飞行前进 / 矩阵构造共用。
 pub(crate) fn look_forward(yaw: f32, pitch: f32) -> Vec3 {
   let (sin_yaw, cos_yaw) = yaw.sin_cos();
   let (sin_pitch, cos_pitch) = pitch.sin_cos();
   Vec3::new(-sin_yaw * cos_pitch, -sin_pitch, -cos_yaw * cos_pitch)
 }
 
-/// 相机每帧边转（yaw 0.35 rad/s）边沿圆轨迹平移（500 voxel/s）；由 `consts::AUTO_ORBIT` 决定是否注册。
-/// 必须带平移：纯旋转不改变所在 world cell / chunk，"移动中"才触发的路径不会跑。
 pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>) {
   let dt = time.delta_secs();
   orbit.yaw -= 0.35 * dt;
   let a = time.elapsed_secs() * 0.15;
-  let speed = 500.0 * dt; // 500 voxel/s
+  let speed = 500.0 * dt;
   orbit.target += Vec3::new(-a.sin(), 0.0, a.cos()) * speed;
   orbit.clamp();
 }
 
-/// 轨道模式转头：右键拖拽旋转 yaw/pitch（绕目标转）。自由模式的转头走鼠标锁定（`free_look_input`），
-/// 不再吃右键拖拽。`pitch` 已 clamp 到 ±89°，保证视线与 +Y 不共线。
 pub(crate) fn camera_look_input(
   mouse: Res<ButtonInput<MouseButton>>,
   motion: Res<AccumulatedMouseMotion>,
@@ -135,20 +107,15 @@ pub(crate) fn camera_look_input(
   orbit.clamp();
 }
 
-/// 自由模式的鼠标锁定（Q 切换，`toggle_mouse_lock`）：锁定 = 隐藏系统光标、光标钉在窗口中心、
-/// 鼠标相对位移直接转头（`free_look_input`），准星落在屏幕中心（`Crosshair`）。
-/// 只在 Fly 模式生效；切到轨道模式自动解锁（`apply_mouse_lock`）。
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct MouseLock(pub bool);
 
 impl Default for MouseLock {
-  /// 缺省锁定：启动即"鼠标交给相机"（要用菜单先按 `Q` 解锁）
   fn default() -> Self {
     Self(true)
   }
 }
 
-/// Q 切换鼠标锁定（仅 Fly 模式）：文本输入焦点在控件上时不响应，否则打字里的 q 会误切。
 pub(crate) fn toggle_mouse_lock(
   keys: Res<ButtonInput<KeyCode>>,
   focus: Res<gate_ui::TextInputFocus>,
@@ -162,14 +129,6 @@ pub(crate) fn toggle_mouse_lock(
   bevy::log::info!("鼠标锁定 → {}", if lock.0 { "on" } else { "off" });
 }
 
-/// 把锁定状态落到窗口光标：锁定 ⇒ `visible = false` + `grab_mode = Confined`。
-///
-/// WHY: 用 `Confined` 而非 `Locked` —— winit（Windows）对「被抓取且隐藏」的光标把裁剪矩形收成
-/// 窗口客户区中心的 1×1，光标因而钉在中心；`Locked` 则钉在**按下那一刻的位置**，UI 悬停映射
-/// （`UiPointerCaptured`）会一直停在那儿，且该位置的控件会吃掉编辑用的左右键。
-/// 隐藏 + 钉中心同时让「准星位置 = 光标位置 = 编辑射线」三者一致。转头不吃光标位置，
-/// 走设备原始位移（`AccumulatedMouseMotion`），故光标被钉住不影响转头。
-/// 只在状态翻转时写窗口（`CursorOptions` 变更会触发 bevy_winit 重新下发）。
 pub(crate) fn apply_mouse_lock(
   lock: Res<MouseLock>,
   mode: Res<CameraMode>,
@@ -185,8 +144,6 @@ pub(crate) fn apply_mouse_lock(
   }
 }
 
-/// 锁定模式转头（仅 Fly）：鼠标相对位移转 yaw/pitch。不做 UI 指针门控 ——
-/// 锁定即"鼠标交给相机"（光标被钉在中心，悬停判定没有意义）。
 pub(crate) fn free_look_input(
   motion: Res<AccumulatedMouseMotion>,
   mode: Res<CameraMode>,
@@ -202,8 +159,6 @@ pub(crate) fn free_look_input(
   orbit.clamp();
 }
 
-/// 轨道相机输入（仅 Orbit 模式）：中键拖拽平移 target（按距离缩放 pan，1:1 跟手）、
-/// 滚轮对数缩放（exp(±ZOOM_LOG_SPEED·lines)）+ Shift 细调 1/10；右键旋转在 `camera_look_input`。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn orbit_camera_input(
   mouse: Res<ButtonInput<MouseButton>>,
@@ -219,12 +174,9 @@ pub(crate) fn orbit_camera_input(
   if *mode != CameraMode::Orbit {
     return;
   }
-  // UI 指针捕获/鼠标拦截优先：hover/按下控件时吞掉拖拽/滚轮
   if !captured.0 && !intercepted.0 {
     let delta = motion.delta;
     if mouse.pressed(MouseButton::Middle) {
-      // 正交基：forward = eye→target；right = forward × Y；up = right × forward
-      // （pitch ±89° clamp 保证 forward 不与 Y 共线）
       let forward = look_forward(orbit.yaw, orbit.pitch);
       let right = forward.cross(Vec3::Y).normalize();
       let up = right.cross(forward).normalize();
@@ -232,13 +184,11 @@ pub(crate) fn orbit_camera_input(
       orbit.target += (right * (-delta.x) + up * delta.y) * pan_per_px;
     }
 
-    // 滚轮缩放独立于拖拽；Line 单位，Pixel 按 16px 行高折算
     let lines = match scroll.unit {
       MouseScrollUnit::Line => scroll.delta.y,
       MouseScrollUnit::Pixel => scroll.delta.y / 16.0,
     };
     if lines != 0.0 {
-      // Shift 细调：步进缩为 1/10
       let zoom_speed = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
         ZOOM_LOG_SPEED * 0.1
       } else {
@@ -250,9 +200,6 @@ pub(crate) fn orbit_camera_input(
   }
 }
 
-/// 幽灵模式飞行输入（仅 Fly 模式，无碰撞）：WASD 沿视线平移，Space 升 / Shift 降（世界 +Y），
-/// 斜向归一化；不受 `UiPointerCaptured` 拦截，但文本输入焦点（`gate_ui::TextInputFocus`）会挡键盘，
-/// 滑杆精细拖动占用的 Shift（`gate_ui::UiShiftCaptured`）也不算下降。
 pub(crate) fn fly_camera_input(
   keys: Res<ButtonInput<KeyCode>>,
   time: Res<Time>,
@@ -265,7 +212,6 @@ pub(crate) fn fly_camera_input(
   if *mode != CameraMode::Fly || focus.0.is_some() {
     return;
   }
-  // Control 切换低速/高速档（just_pressed = 按一下切一次）
   if keys.just_pressed(KeyCode::ControlLeft) || keys.just_pressed(KeyCode::ControlRight) {
     fly.fast = !fly.fast;
     bevy::log::debug!(
@@ -274,7 +220,6 @@ pub(crate) fn fly_camera_input(
       fly.effective_speed(),
     );
   }
-  // dt 上限 0.1s
   let dt = time.delta_secs().min(0.1);
   let forward = look_forward(orbit.yaw, orbit.pitch);
   let right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -294,10 +239,7 @@ pub(crate) fn fly_camera_input(
   if keys.pressed(KeyCode::Space) {
     dir += Vec3::Y;
   }
-  // Shift 被滑杆精细拖动占用时不下降（同一个按键按一次只能有一个语义）
-  if !shift_captured.0
-    && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight))
-  {
+  if !shift_captured.0 && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)) {
     dir -= Vec3::Y;
   }
   if let Some(d) = dir.try_normalize() {
@@ -306,15 +248,6 @@ pub(crate) fn fly_camera_input(
   }
 }
 
-/// 基准：**边转视角边绕圈飞**（`GATE_BENCH=fly`，见 `consts::bench_fly`）。
-///
-/// WHY 需要它：`auto_orbit_system` 只改 `OrbitCamera` 的位置，而 Fly 模式的相机位置取自 `FlyCamera`
-/// ⇒ 那条路径在 Fly 模式下**不移动相机**（只有切模式那一帧会对一次位置）。而"移动时掉帧"只有真的
-/// 在穿过新 chunk 时才触发（用户口径："光转没用，要移动起来"）。
-///
-/// 轨迹：朝向按 [`BENCH_FLY_YAW`] 转、眼位沿**半径 = `BENCH_FLY_SPEED / BENCH_FLY_TURN`** 的圆
-/// 以 [`BENCH_FLY_SPEED`] 平移 —— 写进 Fly 相机。**不能走直线**：地图有限（MC 城市半幅 ≈ 22 k 体素），
-/// 直线会飞出世界。半径与速度都是为了让**新 chunk 装载持续发生**（见那两个常量的 WHY）。
 pub(crate) fn auto_fly_system(
   time: Res<Time>,
   mut orbit: ResMut<OrbitCamera>,
@@ -331,8 +264,6 @@ pub(crate) fn auto_fly_system(
   fly.pos += dir * crate::consts::BENCH_FLY_SPEED * dt;
 }
 
-/// 切换模式时对一次位置：Orbit→Fly 取轨道眼位；Fly→Orbit 把 target 放到「沿当前朝向 `distance`
-/// 处」使 `orbit.eye() == fly.pos`；`is_changed()` 首帧为真但幂等。
 pub(crate) fn sync_camera_mode_switch(
   mode: Res<CameraMode>,
   mut orbit: ResMut<OrbitCamera>,
@@ -358,8 +289,6 @@ pub(crate) fn sync_camera_mode_switch(
   );
 }
 
-/// 按当前模式重建 `DdaCameraConfig`（唯一矩阵构造点；幂等，成本 = 一次 4×4 求逆）。
-/// 必须排在所有相机输入之后（同帧位移/旋转当帧生效）；aspect 读当前窗口物理尺寸。
 pub(crate) fn build_camera_config(
   mode: Res<CameraMode>,
   orbit: Res<OrbitCamera>,
@@ -382,12 +311,10 @@ pub(crate) fn build_camera_config(
   };
 }
 
-/// 主窗口物理高度（pan_per_px 1:1 基准；无窗口时回退 VIEW_SIZE.y）
 fn window_height(windows: &Query<&Window>) -> f32 {
   windows.single().map(|w| w.physical_height().max(1) as f32).unwrap_or(VIEW_SIZE.y as f32)
 }
 
-/// NDC `(u, v)` → 世界射线 `(origin, dir)`（voxel 空间；origin = 相机眼位）；矩阵退化 → None。
 fn ndc_ray(cfg: &DdaCameraConfig, u: f32, v: f32) -> Option<(Vec3, Vec3)> {
   let near = cfg.inv_view_proj * Vec4::new(u, v, 0.0, 1.0);
   let far = cfg.inv_view_proj * Vec4::new(u, v, 1.0, 1.0);
@@ -400,9 +327,6 @@ fn ndc_ray(cfg: &DdaCameraConfig, u: f32, v: f32) -> Option<(Vec3, Vec3)> {
   Some((cfg.position_world, dir))
 }
 
-/// 屏幕准星 / 光标 → 世界射线 `(origin, dir)`。
-/// `locked`（自由模式鼠标锁定）时准星是屏幕中心 ⇒ 固定走中心，与光标缓存位置无关；
-/// 轨道 recenter / 幽灵编辑共用；指针不在窗口内 / 矩阵退化 → None。
 pub(crate) fn cursor_ray(
   window: &Window,
   cfg: &DdaCameraConfig,
@@ -413,22 +337,17 @@ pub(crate) fn cursor_ray(
   }
   let cursor = window.cursor_position()?;
   let sf = window.scale_factor();
-  let phys = cursor * sf; // 物理像素（左上原点，y 向下）
+  let phys = cursor * sf;
   let pw = window.physical_width().max(1) as f32;
   let ph = window.physical_height().max(1) as f32;
-  // 指针在别的显示器上时 winit 仍可能给出窗口外的坐标 ⇒ 直接当"没有指针"，
-  // 否则会拿一条越界的 NDC 射线去拾取（诊断视图会莫名其妙什么都不画）。
   if !(0.0..pw).contains(&phys.x) || !(0.0..ph).contains(&phys.y) {
     return None;
   }
-  let u = (phys.x / pw) * 2.0 - 1.0; // [-1, 1]
-  let v = 1.0 - (phys.y / ph) * 2.0; // [-1, 1]，翻转 y（NDC +y 朝上）
+  let u = (phys.x / pw) * 2.0 - 1.0;
+  let v = 1.0 - (phys.y / ph) * 2.0;
   ndc_ray(cfg, u, v)
 }
 
-/// 左键拾取 recenter（仅 Orbit 模式）：射线命中体素表面 → 轨道 target 移到命中点（沿入面
-/// 法线推进半个 voxel）；未命中 / UI 捕获 / Fly 模式不做操作。CPU picking 走 `raycast`
-/// （直接查权威 `VolumeGrid`，不必先序列化 brickmap）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn left_click_pick_recenter(
   mouse: Res<ButtonInput<MouseButton>>,
@@ -447,7 +366,7 @@ pub(crate) fn left_click_pick_recenter(
     return;
   }
   if captured.0 || intercepted.0 {
-    return; // UI 控件点击 → 吞掉
+    return;
   }
   let Some(scene) = scene else {
     return;
@@ -458,11 +377,10 @@ pub(crate) fn left_click_pick_recenter(
   let Some((origin, dir)) = cursor_ray(window, &cfg, false) else {
     return;
   };
-  // 主世界 + 物体统一求最近
   if let Some(hit) = raycast(&scene.volumes, origin, dir, CAM_FAR - CAM_NEAR) {
     let mut p = origin + dir * hit.t;
     let half = 0.5;
-    p += hit.normal * half; // 沿入面法线推进命中体素内 0.5 voxel
+    p += hit.normal * half;
     orbit.target = p;
     bevy::log::debug!(
       "PICK → target=({:.1},{:.1},{:.1}) t={:.1} pal={} obj_id={}",
@@ -473,20 +391,14 @@ pub(crate) fn left_click_pick_recenter(
       hit.pal,
       hit.obj_id,
     );
-    // 新 target 由 build_camera_config 在本系统之后同帧重建并当帧生效
   }
 }
 
-/// 屏幕中心准星根节点（`sync_crosshair` 控显隐）。
 #[derive(Component)]
 pub(crate) struct Crosshair;
 
-/// 准星颜色
 const CROSSHAIR_COLOR: Color = Color::WHITE;
 
-/// Startup 生成准星：绝对定位在窗口中心（50%/50%）的零尺寸节点，四条臂以此为中心排布。
-/// 全树不挂 `Pickable` ⇒ 对 UI 拾取不可见（`UiPickingSettings::require_markers`），不挡悬停与点击；
-/// UI 相机由 `scene::setup` 提供。
 pub(crate) fn spawn_crosshair(mut commands: Commands) {
   commands
     .spawn((
@@ -501,7 +413,6 @@ pub(crate) fn spawn_crosshair(mut commands: Commands) {
       Visibility::Hidden,
     ))
     .with_children(|p| {
-      // (dx, dy) = 臂的指向；水平臂 长×厚，垂直臂 厚×长；左/上 偏移取负，故四条臂对称
       for (dx, dy) in [(-1.0_f32, 0.0_f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
         let (w, h) = if dx == 0.0 {
           (CROSSHAIR_THICK, CROSSHAIR_ARM)
@@ -524,7 +435,6 @@ pub(crate) fn spawn_crosshair(mut commands: Commands) {
     });
 }
 
-/// 准星显隐：仅「自由模式 + 鼠标锁定」时显示（只在翻转时写 `Visibility`，避免每帧触发变更传播）。
 pub(crate) fn sync_crosshair(
   mode: Res<CameraMode>,
   lock: Res<MouseLock>,

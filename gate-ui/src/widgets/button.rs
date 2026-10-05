@@ -1,7 +1,3 @@
-//! button：四变体 + 交互状态机 + hover/pressed 视觉 + 按压缩放 + UiClick。
-//! 变体：Primary（强调填充）/ Danger（破坏性）/ Secondary（抬升表面+边框）/
-//! Ghost（透明底）。反馈：hover 提亮一档；pressed 填充压深 + `UiTransform` scale 0.98（绕节点中心）。
-
 use std::ops::Deref;
 
 use bevy::picking::hover::Hovered;
@@ -13,14 +9,11 @@ use crate::pointer::{UiInteract, UiInteractBundle, UiInteractPrev};
 use crate::theme::UiTheme;
 use crate::widgets::consts::PRESSED_SCALE;
 
-/// 按钮点击事件（EntityEvent，target = 按钮实体）。
-/// 用法：`entity_mut(btn).observe(|_: On<UiClick>| ...)` 或 `app.add_observer(...)`。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct UiClick {
   pub entity: Entity,
 }
 
-/// 按钮变体（驱动状态机配色）
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ButtonVariant {
   #[default]
@@ -30,7 +23,6 @@ pub enum ButtonVariant {
   Danger,
 }
 
-/// 按钮句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ButtonHandle(pub Entity);
 
@@ -47,16 +39,13 @@ impl From<ButtonHandle> for Entity {
   }
 }
 
-/// 按钮配置（全部字段进 Config；Default = 空文本 + Primary、不禁用）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ButtonConfig {
   pub text: String,
   pub variant: ButtonVariant,
-  /// true = 禁用态：不响应点击、不缩放、配色暗一档
   pub disabled: bool,
 }
 
-/// 主题按钮（文本子标签；变体由 `ButtonConfig::variant` 决定）
 pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, config: ButtonConfig) -> ButtonHandle {
   let m = &ctx.theme.metrics;
   let (bg, border, text_color) = variant_colors(ctx.theme, config.variant, UiInteract::None);
@@ -96,7 +85,6 @@ pub fn button(ctx: &UiCtx, parent: &mut ChildSpawner, config: ButtonConfig) -> B
   ButtonHandle(e)
 }
 
-/// 变体 × 交互态 → (背景, 边框, 文字) 配色
 fn variant_colors(
   theme: &UiTheme,
   variant: ButtonVariant,
@@ -114,7 +102,6 @@ fn variant_colors(
       (bg, bg, color_of(&c.text_primary))
     }
     ButtonVariant::Danger => {
-      // danger 仅一档填充，hover 靠边框提亮区分
       let bg = color_of(&c.danger_fill);
       let border = match inter {
         UiInteract::Hovered => color_of(&c.danger),
@@ -149,7 +136,6 @@ fn variant_colors(
   }
 }
 
-/// 按钮状态机查询集（type alias 满足 clippy::type_complexity）
 type ButtonQuery = (
   Entity,
   &'static Hovered,
@@ -163,8 +149,6 @@ type ButtonQuery = (
   Has<UiDisabled>,
 );
 
-/// 按钮状态机：hover/pressed 视觉 + 按压缩放 + 释放触发 UiClick（每帧重算）；Disabled 态跳过
-/// click、配色恒 None 态并降亮、不缩放。查询集本身只可能落在按钮根上（`ButtonVariant` 唯一于此）。
 pub fn button_state_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,
@@ -199,11 +183,9 @@ pub fn button_state_system(
           tc.0 = target_text;
         }
       }
-      // 重置 prev 避免 re-enable 瞬间误触发 click
       prev.0 = UiInteract::None;
       continue;
     }
-    // click = 按下后在按钮上释放（拖出释放视为取消）
     if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
       commands.trigger(UiClick { entity: e });
     }
@@ -216,12 +198,10 @@ pub fn button_state_system(
     if *border != target_border {
       *border = target_border;
     }
-    // 按压缩放（绕节点中心，bevy_ui 变换原点即节点中心）
     let target_scale = if inter == UiInteract::Pressed { PRESSED_SCALE } else { 1.0 };
     if (ui_t.scale.x - target_scale).abs() > f32::EPSILON {
       ui_t.scale = Vec2::splat(target_scale);
     }
-    // 文本子标签颜色（按钮只有一个文本子节点）
     for child in children.iter() {
       if let Ok(mut tc) = q_text.get_mut(child)
         && tc.0 != target_text

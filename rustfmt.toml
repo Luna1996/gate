@@ -1,11 +1,6 @@
-# 对齐 Fuchsia 的 rustfmt 配置（Google 风格无官方 Rust 版本）
 edition = "2024"
 
-# 行宽 100；"Max" 避免启发式把行切碎（rustfmt#3119 / #3120）
 use_small_heuristics = "Max"
 
-# 同一模块合并为一条 use；nightly-only，stable 忽略并告警，用 nightly 时取消注释
-# imports_granularity = "Module"
 
-# 本仓库缩进 2 空格
 tab_spaces = 2

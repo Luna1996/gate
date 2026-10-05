@@ -1,10 +1,5 @@
-# gate-app 中文文案表（rust-i18n 编译期 codegen 进二进制）
-# 写文案的约定（键的写法 / label 长度 / `*.tip` 的 Markdown 与"最低限度"要求）见
-# .trae/rules/i18n-copy.md —— 那一条是权威，本表不再重复。
-# 改本文件需**重新编译**（proc macro 编译期内联）；gate-app/build.rs 已登记 rerun-if-changed
 _version = 1
 
-# ---------------- DebugMenu（左上角调试菜单）----------------
 "menu.video" = "视频"
 "menu.video.scale" = "像素大小"
 "menu.video.scale.full" = "1"
@@ -341,7 +336,6 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 "menu.game.world.lod_build" = "构建 LOD"
 "menu.game.world.lod_cancel" = "中止"
 "menu.game.world.lod_state" = "LOD 状态"
-# `lod_state` 行的值（`debug_menu::lod_state_tick` 按状态取一条）
 "menu.game.world.lod_state.none" = "无（远场读存档）"
 "menu.game.world.lod_state.building" = "构建中 %{pct}%"
 "menu.game.world.lod_state.ready" = "已装载 %{mb} MB"
@@ -367,12 +361,9 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 """
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
-# 纯文本行的值
 "menu.camera.pos.value" = "%{v}"
 "menu.camera.dir.value" = "yaw %{yaw}°, pitch %{pitch}°"
 
-# ---------------- 右上角组件展示窗 ----------------
-# 展示窗文案只在启动时求值（未挂 i18n key），不随切语言重建
 "showcase.tab.widgets" = "组件"
 "showcase.tab.data" = "数据"
 "showcase.title" = "UI 组件展示"

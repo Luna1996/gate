@@ -1,7 +1,3 @@
-//! slider：SliderValue + clamp/step + 拖动 + 强调填充视觉。
-//! 拖动复用 bevy_ui `RelativeCursorPosition`（归一化坐标以节点中心为原点，-0.5..0.5）。
-//! 视觉：`TRACK_HEIGHT` 轨道槽 + 强调填充段 + `THUMB_SIZE` 顶层滑块（拖拽放大到 18px）。
-
 use std::ops::Deref;
 
 use bevy::picking::hover::Hovered;
@@ -15,11 +11,9 @@ use crate::widgets::consts::{
   SLIDER_FINE_SCALE, THUMB_INSET, THUMB_SIZE, THUMB_SIZE_DRAG, TRACK_HEIGHT,
 };
 
-/// 滑杆根节点标记
 #[derive(Component, Debug, Default)]
 pub struct UiSlider;
 
-/// 值域
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct SliderRange {
   pub min: f32,
@@ -32,43 +26,31 @@ impl Default for SliderRange {
   }
 }
 
-/// 步长（None = 连续）
 #[derive(Component, Clone, Copy, Debug, PartialEq, Default)]
 pub struct SliderStep(pub Option<f32>);
 
-/// 当前值（clamp/step 后落在 [min, max]）
 #[derive(Component, Clone, Copy, Debug, PartialEq, Default)]
 pub struct SliderValue(pub f32);
 
-/// 填充条子实体标记
 #[derive(Component, Debug, Default)]
 pub struct SliderFill;
 
-/// 轨道槽子实体标记（配色每帧重算的查询目标）
 #[derive(Component, Debug, Default)]
 pub struct SliderTrack;
 
-/// 滑块子实体标记
 #[derive(Component, Debug, Default)]
 pub struct SliderThumb;
 
-/// 滑块行程槽标记：track 内左右各内缩半 thumb 宽的绝对定位容器，
-/// 滑块放在它里面 → `left: norm%` 的行程端点让滑块整块落在轨道槽两端之内
 #[derive(Component, Debug, Default)]
 pub struct SliderThumbSlot;
 
-/// 拖拽状态（精细档的锚点；只在拖动期间有意义）
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct SliderDrag {
-  /// 当前处于精细档（拖动中按住 Shift）：值由光标位移增量给出，而非光标绝对位置
   fine: bool,
-  /// 进入精细档那一刻的光标 x（物理 px，与拖动映射同坐标系）
   anchor_cursor_x: f32,
-  /// 进入精细档那一刻的值
   anchor_value: f32,
 }
 
-/// 滑杆句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SliderHandle(pub Entity);
 
@@ -85,14 +67,12 @@ impl From<SliderHandle> for Entity {
   }
 }
 
-/// 滑杆配置（全部字段进 Config；Default = [0,1] 连续、初值 0、不禁用）
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SliderConfig {
   pub min: f32,
   pub max: f32,
   pub value: f32,
   pub step: Option<f32>,
-  /// true = 禁用态：不响应拖动、配色暗一档（当前值仍显示）
   pub disabled: bool,
 }
 
@@ -102,15 +82,12 @@ impl Default for SliderConfig {
   }
 }
 
-/// 滑杆值变化事件（仅用户拖动产生的变化触发；EntityEvent，target = 滑杆根实体）。
-/// 组件 `SliderValue` 仍是真源，事件只是通知，主动读值可 Query。
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq)]
 pub struct SliderValueChanged {
   pub entity: Entity,
   pub value: f32,
 }
 
-/// clamp + step 归一（纯函数）
 pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {
   let v = value.clamp(min, max);
   match step {
@@ -120,9 +97,6 @@ pub fn clamp_step(value: f32, min: f32, max: f32, step: Option<f32>) -> f32 {
   .clamp(min, max)
 }
 
-/// 主题滑杆（横向；宽度由父容器 flex 决定，最小 120px）。
-/// 根节点无水平内边距 → 轨道槽两端与同行其它控件左右边缘对齐；轨道槽内套「行程槽」
-/// （绝对定位 + 左右各内缩半 thumb 宽），thumb 的 `left: norm%` 相对槽宽（= track 宽 - thumb 宽）。
 pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> SliderHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -149,7 +123,6 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
     Node { min_width: px(120.0), height: px(24.0), align_items: AlignItems::Center, ..default() },
   ));
   ec.with_children(|root| {
-    // flex_grow 撑满内容盒（根宽 - 2*THUMB_INSET）；fill 与 thumb 均以其为包含块
     root
       .spawn((
         Name::new("ui-slider-track"),
@@ -171,7 +144,6 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
           },
           BackgroundColor(fill_bg),
         ));
-        // 盒宽 = track 宽 - thumb 宽；滑块以它为包含块做 left: norm%（两端档位不出界）
         track
           .spawn((
             Name::new("ui-slider-thumb-slot"),
@@ -187,7 +159,6 @@ pub fn slider(ctx: &UiCtx, parent: &mut ChildSpawner, config: SliderConfig) -> S
             },
           ))
           .with_children(|slot| {
-            // margin 左/上各负半尺寸把滑块中心钉在定位点；top:50% 相对槽高（= track 高）
             slot.spawn((
               Name::new("ui-slider-thumb"),
               SliderThumb,
@@ -221,11 +192,7 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
   if (max - min).abs() < f32::EPSILON { 0.0 } else { ((v - min) / (max - min)).clamp(0.0, 1.0) }
 }
 
-/// 拖动：按下时把光标位置映射为值（每帧重算）；值变化时触发 `SliderValueChanged`（仅用户拖动）。
-/// 映射基准 = 行程槽（根内容盒再各内缩半 thumb 宽）；光标落在槽外即吸附 min/max；有 step 时经 `clamp_step` 逐档吸附。
-/// **精细档**：按住 Shift 时改为按光标位移增量给值（灵敏度 ×`SLIDER_FINE_SCALE`），锚点是按下 Shift 那一刻的
-/// 「光标 + 值」⇒ 进出精细档都不跳变；Shift 被占用的事实写进 `UiShiftCaptured`，场景输入据此忽略它。
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub fn slider_drag_system(
   mut commands: Commands,
   keys: Res<ButtonInput<KeyCode>>,
@@ -251,21 +218,17 @@ pub fn slider_drag_system(
       drag.fine = false;
       continue;
     }
-    // Shift 在这一格上被占用：光标拖出节点也照样占着（否则拖出后同一个 Shift 会去把相机往下降）
     fine_drag = shift;
     let Some(n) = rcp.normalized else { continue };
-    // normalized 以节点中心为原点（-0.5..0.5）；size 与 padding（min_inset.x=左、max_inset.x=右）同为物理 px，比值单位自洽
     let root_w = node.size().x;
     let cursor_x = (n.x + 0.5) * root_w;
     let pad_l = node.padding.min_inset.x;
     let pad_r = node.padding.max_inset.x;
-    // 行程槽 = 根内容盒再各内缩半 thumb 宽（与 visual 里 thumb 的行程一致）
     let travel_w = root_w - pad_l - pad_r - THUMB_SIZE;
     let span = range.max - range.min;
     let target = if travel_w <= 0.0 {
       range.min
     } else if shift {
-      // 精细档：锚点只在「进入精细档」那帧写一次，之后按位移增量走 1/10 灵敏度
       if !drag.fine {
         drag.fine = true;
         drag.anchor_cursor_x = cursor_x;
@@ -273,7 +236,6 @@ pub fn slider_drag_system(
       }
       drag.anchor_value + (cursor_x - drag.anchor_cursor_x) / travel_w * span * SLIDER_FINE_SCALE
     } else {
-      // 绝对档：光标位置直接映射到值；松开 Shift 立即回到绝对映射（由光标决定，不受精细档残值影响）
       drag.fine = false;
       let norm = ((cursor_x - pad_l - THUMB_SIZE / 2.0) / travel_w).clamp(0.0, 1.0);
       range.min + norm * span
@@ -287,13 +249,7 @@ pub fn slider_drag_system(
   shift_captured.set_if_neq(crate::capture::UiShiftCaptured(fine_drag));
 }
 
-/// 视觉：填充宽度 + 滑块位置跟随 SliderValue；拖拽中滑块放大到 18px；轨道 / 填充 / 滑块配色每帧重算。
-/// Disabled：滑块恒为 16px，配色按 `UiDisabled` 降亮。
-/// 结构 root → track → (fill | thumb_slot → thumb)；thumb 的 `top:50%` + 负半高 margin 垂直居中也在此同步。
-///
-/// 配色**每帧从主题令牌（未降亮的基色）重算**：禁用态靠装/摘 `UiDisabled` 动态切换，不必重建页面；
-/// 不能读组件当前值 —— `dim_color(dim_color(x)) != dim_color(x)`，那样会逐帧叠加降亮。
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub fn slider_visual_system(
   theme: Option<Res<UiTheme>>,
   mut q_root: Query<
@@ -326,7 +282,6 @@ pub fn slider_visual_system(
       (track_bg, fill_bg, thumb_bg, thumb_border)
     };
     for child in children.iter() {
-      // fill 是 track 的子节点；thumb 在 track 里的行程槽下（再下一层）
       if let Ok(tc) = q_track_children.get(child) {
         if let Ok(mut bg) = q_track.get_mut(child)
           && bg.0 != track_bg
@@ -344,7 +299,6 @@ pub fn slider_visual_system(
           for thumb in sc.iter() {
             if let Ok((mut node, mut bg, mut bc)) = thumbs.get_mut(thumb) {
               node.left = Val::Percent(pct);
-              // margin 负半高把中心钉在 track 中心线；拖拽放大时尺寸与负 margin 同步
               node.top = Val::Percent(50.0);
               node.width = px(thumb_size);
               node.height = px(thumb_size);

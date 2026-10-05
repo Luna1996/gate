@@ -1,6 +1,3 @@
-//! 场景响应式：窗口 resize → 渲染目标纹理原地重建 + RenderScale 跟随。
-//! 渲染内部分辨率 = 窗口物理像素 ÷ factor（渲染降采样倍数见 [`crate::consts::RENDER_SCALE`]）。
-
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 
@@ -11,14 +8,11 @@ fn size_is_sane(s: UVec2) -> bool {
   (MIN_DIM..=MAX_DIM).contains(&s.x) && (MIN_DIM..=MAX_DIM).contains(&s.y)
 }
 
-/// 窗口物理尺寸 → 渲染目标尺寸（每轴 ÷ factor 向下取整，钳到合法下限）
 fn render_size_for_window(full: UVec2, factor: u32) -> UVec2 {
   let f = factor.max(1);
   UVec2::new((full.x / f).max(MIN_DIM), (full.y / f).max(MIN_DIM))
 }
 
-/// 每帧对照主窗口物理尺寸；变化 → 原地重建 DDA 目标纹理并更新 RenderScale。
-/// 退化尺寸（<64 或 >4096）：跳过本次 resize，warn 仅一次。
 pub fn resize_render_targets(
   windows: Query<&Window>,
   dda: Option<Res<DdaImages>>,
@@ -66,7 +60,6 @@ impl Plugin for ResponsivePlugin {
       .init_resource::<PostFxSettings>()
       .add_systems(Update, resize_render_targets);
 
-    // 启动降采样倍数：只是初值，运行期以 RenderScale.factor 为准（菜单「视频/半分辨率」写它）
     let f = crate::consts::RENDER_SCALE;
     if f > 1 {
       app.world_mut().resource_mut::<RenderScale>().factor = f;

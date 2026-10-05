@@ -1,7 +1,3 @@
-//! 右上角 gate-ui 组件展示窗：全部 widget 的功能演示面板。
-//! `spawn_showcase` 在主题/字体就绪后由 `debug_ui_setup` 一次调用；交互经观察者写事件日志，
-//! `showcase_demo_system` 每帧给演示折线喂正弦样本。
-
 use bevy::prelude::*;
 
 use gate_ui::{
@@ -19,7 +15,6 @@ use rust_i18n::t;
 
 use crate::consts::{SHOWCASE_PLOT_CAP, SHOWCASE_PLOT_H, SHOWCASE_PLOT_W};
 
-/// 按钮标识（写进事件日志；日志不翻译，用英文标识符）
 #[derive(Component)]
 struct ShowcaseButton(&'static str);
 
@@ -37,11 +32,9 @@ pub(crate) struct ShowcasePlot;
 #[derive(Component)]
 struct ShowcaseLog;
 
-/// 右上角展示面板根标记（debug overlay toggle 以此定位整体显隐）
 #[derive(Component)]
 pub(crate) struct ShowcaseRoot;
 
-/// 右上角 hud-showcase-panel：TabView 组件/数据两页，每页包 scrollview；直接操作 World（commands.queue 内调用）。
 pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -56,7 +49,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
         right: px(8.0),
         top: px(8.0),
         width: px(280.0),
-        // 内容超出靠内部 scroll view 滚动
         height: Val::Vh(88.0),
         flex_direction: FlexDirection::Column,
         border: UiRect::all(px(m.border_width)),
@@ -64,7 +56,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
       },
       BackgroundColor(color_of(&c.surface_card_hud)),
       BorderColor::all(color_of(&c.border)),
-      // 默认隐藏（与 toggle 初始未勾选一致）
       Visibility::Hidden,
     ))
     .with_children(|root| {
@@ -253,7 +244,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
             let l = list(ctx, inner, ListConfig { capacity: 6 });
             let w = inner.world_mut();
             w.entity_mut(*l).insert(ShowcaseLog);
-            // 种子日志在 spawn 处写入
             if let Some(mut ring) = w.get_mut::<RingList>(*l) {
               ring.push(t!("showcase.log.ready"));
               ring.push(t!("showcase.log.try_all"));
@@ -307,7 +297,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
               ..default()
             },
           );
-          // 父为 Column → 横线
           splitter(ctx, root);
           root
             .spawn((
@@ -320,7 +309,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
                 row,
                 LabelConfig { text: t!("showcase.splitter.left").into(), ..default() },
               );
-              // 父为 Row → 竖线
               splitter(ctx, row);
               label(
                 ctx,
@@ -416,7 +404,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
       });
     });
 
-  // 按钮点击 → 写事件日志（UiClick 观察者）
   world.add_observer(
     |click: On<UiClick>,
      q_btn: Query<&ShowcaseButton>,
@@ -430,7 +417,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
     },
   );
 
-  // checkbox 翻转 → 写事件日志（CheckboxToggled 观察者）
   world.add_observer(
     |ev: On<CheckboxToggled>,
      q_cb: Query<&ShowcaseCheckbox>,
@@ -444,7 +430,6 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
     },
   );
 
-  // slider 值变化 → 实时值标签 + 事件日志（SliderValueChanged 观察者）
   world.add_observer(
     |ev: On<SliderValueChanged>,
      mut q_val: Query<&mut Text, With<ShowcaseSliderValue>>,
@@ -462,13 +447,11 @@ pub(crate) fn spawn_showcase(world: &mut World, ctx: &UiCtx) {
   );
 }
 
-/// 展示窗动态行为：正弦波喂演示折线（其它交互由观察者写日志）。
 pub(crate) fn showcase_demo_system(
   time: Res<Time>,
   mut q_plot: Query<&mut PlotData, bevy::prelude::With<ShowcasePlot>>,
   mut plot_acc: Local<f32>,
 ) {
-  // 演示折线：每 0.1s 喂一个正弦样本
   *plot_acc += time.delta_secs();
   if *plot_acc >= 0.1 {
     *plot_acc = 0.0;

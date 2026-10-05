@@ -1,22 +1,13 @@
-//! 坐标系与层级常量（Douglas Brick Tree 对齐）。
-//! VoxelCoord = 最细格（1³，i32³ 世界坐标）；ChunkCoord = 256³ chunk 的分层 HashMap key；BrickCoord = 树内 brick。
-//! 层级 256 → 64 → 16 → 4 → 1；Level 2（16³）= 组件粒度，Level 4（1³）= 编辑最细粒度。
-
 use glam::IVec3;
 
-/// chunk 边长（体素）：256³
 pub const CHUNK_SIZE: i32 = 256;
 
-/// 分裂因子（4³ = 64 子块）
 pub const BRICK_FACTOR: i32 = 4;
 
-/// 最大分裂深度
 pub const MAX_LEVEL: u8 = 4;
 
-/// 每层级 brick 边长（体素）：[256, 64, 16, 4, 1]
 pub const LEVEL_EXTENT: [i32; 5] = [256, 64, 16, 4, 1];
 
-/// Brick Tree 内 4³ 子块的线性索引（z*16 + y*4 + x）
 #[inline]
 pub fn child_linear_idx(local_x: i32, local_y: i32, local_z: i32) -> u32 {
   debug_assert!((0..BRICK_FACTOR).contains(&local_x));
@@ -25,7 +16,6 @@ pub fn child_linear_idx(local_x: i32, local_y: i32, local_z: i32) -> u32 {
   (local_z * BRICK_FACTOR * BRICK_FACTOR + local_y * BRICK_FACTOR + local_x) as u32
 }
 
-/// Chunk 网格坐标（i32³，无界）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkCoord(pub IVec3);
 
@@ -47,7 +37,6 @@ impl PartialOrd for ChunkCoord {
   }
 }
 
-/// 世界体素坐标（1³ 最细格，i32³）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxelCoord {
   pub x: i32,
@@ -68,20 +57,16 @@ impl VoxelCoord {
     IVec3::new(self.x, self.y, self.z)
   }
 
-  /// 对应的 chunk 坐标（欧氏除法）。
   pub fn chunk(&self) -> ChunkCoord {
     let v = IVec3::new(self.x, self.y, self.z);
     ChunkCoord(v.div_euclid(IVec3::splat(CHUNK_SIZE)))
   }
 
-  /// 在所在 chunk 内的本地坐标（各分量 0..255）。
   pub fn in_chunk(&self) -> IVec3 {
     let v = IVec3::new(self.x, self.y, self.z);
     v.rem_euclid(IVec3::splat(CHUNK_SIZE))
   }
 
-  /// 映射到 chunk 内指定 level 的 brick 索引（各分量 0..4^level）
-  /// 返回值 = (chunk_coord, level_brick_x, level_brick_y, level_brick_z)
   pub fn to_level_brick(&self, level: u8) -> (ChunkCoord, u32, u32, u32) {
     let chunk = self.chunk();
     let extent = LEVEL_EXTENT[level as usize];
@@ -93,13 +78,10 @@ impl VoxelCoord {
   }
 }
 
-/// Brick Tree 内 brick 的坐标
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BrickCoord {
-  /// 分裂深度（0..MAX_LEVEL）
   pub level: u8,
   pub chunk: ChunkCoord,
-  /// 该层级 brick 在 chunk 内的索引（各分量 0..4^level）
   pub x: u32,
   pub y: u32,
   pub z: u32,
@@ -110,12 +92,10 @@ impl BrickCoord {
     Self { level, chunk, x, y, z }
   }
 
-  /// brick 边长（体素）
   pub fn size(&self) -> i32 {
     LEVEL_EXTENT[self.level as usize]
   }
 
-  /// brick 覆盖的体素世界最小角（VoxelCoord）
   pub fn voxel_min(&self) -> VoxelCoord {
     let extent = self.size();
     let offset_x = self.x as i32 * extent;

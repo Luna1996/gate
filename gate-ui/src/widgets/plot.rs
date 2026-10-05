@@ -1,6 +1,3 @@
-//! plot：折线图 widget（环形缓冲 + CPU 光栅化 + ImageNode）。
-//! 光栅化是纯函数（buf + 样本 → 像素），重绘走 change 检测。
-
 use std::collections::VecDeque;
 use std::ops::Deref;
 
@@ -12,21 +9,18 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use super::{UiCtx, color_of, label_bundle, px};
 use crate::widgets::consts::{PLOT_H, PLOT_W};
 
-/// Y 轴值域：Fixed(min, max) 或 Auto（按当前样本 min/max 推导）
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlotDomain {
   Fixed(f32, f32),
   Auto,
 }
 
-/// 折线数据（固定容量环形缓冲，新样本顶替最旧样本）
 #[derive(Component, Clone, Debug)]
 pub struct PlotData {
   capacity: usize,
   samples: VecDeque<f32>,
   y_domain: PlotDomain,
   pub line_color: Color,
-  /// 纵轴数值后缀（plot_yaxis 标签用），如 "ms"；None → 纯数字
   pub unit: Option<&'static str>,
 }
 
@@ -35,13 +29,11 @@ impl PlotData {
     Self { capacity, samples: VecDeque::new(), y_domain, line_color, unit: None }
   }
 
-  /// 链式设置纵轴单位后缀
   pub fn with_unit(mut self, unit: &'static str) -> Self {
     self.unit = Some(unit);
     self
   }
 
-  /// 压入样本；超出容量时顶替最旧样本，返回被顶替者
   pub fn push(&mut self, v: f32) -> Option<f32> {
     self.samples.push_back(v);
     if self.samples.len() > self.capacity { self.samples.pop_front() } else { None }
@@ -59,7 +51,6 @@ impl PlotData {
     self.samples.iter().copied()
   }
 
-  /// 当前有效值域：Fixed 原样返回；Auto 按样本推导（空 → (0,1)；单点/等值 → ±1 扩展）
   pub fn domain(&self) -> (f32, f32) {
     match self.y_domain {
       PlotDomain::Fixed(min, max) => (min, max),
@@ -79,8 +70,6 @@ impl PlotData {
   }
 }
 
-/// 空白 rgba8 画布（plot spawn 前由调用方注册进 `Assets<Image>`）。
-/// 须带 `MAIN_WORLD`（否则 GPU 上传会清空 CPU 端 `data`，`plot_redraw_system` 写不到）。
 pub fn blank_plot_image(w: u32, h: u32) -> Image {
   Image::new(
     Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -136,7 +125,6 @@ fn draw_line(buf: &mut [u8], w: u32, h: u32, x0: i64, y0: i64, x1: i64, y1: i64,
   }
 }
 
-/// CPU 光栅化到 rgba8 缓冲（纯函数，先清零再画 Bresenham 折线）
 pub fn rasterize(
   buf: &mut [u8],
   w: u32,
@@ -172,19 +160,15 @@ fn color_rgba(c: Color) -> [u8; 4] {
   c.to_srgba().to_u8_array()
 }
 
-/// 画布实体标记（ImageNode 持有 plot 纹理）
 #[derive(Component, Debug)]
 pub struct PlotCanvas;
 
-/// 极值文本实体标记（每次重绘更新 min-max）
 #[derive(Component, Debug)]
 pub struct PlotExtents;
 
-/// 左侧纵轴标签列标记（YAxis 布局 spawn；列内子实体按 spawn 顺序 = 上(max)/中/下(min)）
 #[derive(Component, Debug)]
 pub struct PlotYAxis;
 
-/// 折线图句柄（Deref 到根实体 Entity；PlotData 就挂在该实体上）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlotHandle(pub Entity);
 
@@ -201,38 +185,23 @@ impl From<PlotHandle> for Entity {
   }
 }
 
-/// 折线图布局档
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlotLayout {
-  /// 简单布局：画布（固定 PLOT_W 宽）+ 底部极值文本
   #[default]
   Plain,
-  /// 纵轴布局：左侧纵轴标签列（max/mid/min）+ 画布（flex_grow 撑满宽度）
   YAxis,
 }
 
-/// 折线图配置（全部字段进 Config；Default 见字段说明）
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotConfig {
-  /// 布局档（Default = Plain）
   pub layout: PlotLayout,
-  /// 画布图像句柄，调用方预先注册 `Assets<Image>::add(blank_plot_image(..))`
   pub image: Handle<Image>,
-  /// 样本环形缓冲容量（Default = 128）
   pub capacity: usize,
-  /// Y 轴值域（Default = Auto）
   pub y_domain: PlotDomain,
-  /// 折线颜色（须取自主题令牌；Default = 白）
   pub line_color: Color,
-  /// 纵轴数值后缀（YAxis 标签用），如 "ms"；None → 纯数字
   pub unit: Option<&'static str>,
-  /// 画布高度 px（Default = PLOT_H）
   pub canvas_h: f32,
-  /// 纵轴标签列宽度（仅 YAxis 布局生效；Default = Auto 内容自适应，
-  /// 可显式指定 Px/Percent 等布局约束）
   pub y_axis_width: Val,
-  /// 画布宽度约束（Default = Auto：YAxis → flex_grow 撑满父容器剩余宽度，
-  /// Plain → 固定 PLOT_W；显式 Px/Percent → 定宽，不参与 flex 拉伸）
   pub canvas_width: Val,
 }
 
@@ -252,9 +221,6 @@ impl Default for PlotConfig {
   }
 }
 
-/// 主题折线图：数据 + 画布（`ImageNode`）+ 标签，布局由 `PlotConfig::layout` 决定。
-/// 画布带 1px 主题边框（`border` 令牌），纹理透明，背景由父容器提供。
-/// Plain：画布（Auto 宽 → PLOT_W）+ 极值文本；YAxis：纵轴标签列（右对齐 max/mid/min，Auto 宽自适应）+ 画布（Auto 宽 → flex_grow）。
 pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotHandle {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -296,7 +262,6 @@ pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotH
       PlotHandle(e)
     }
     PlotLayout::YAxis => {
-      // 画布宽度：Auto → flex_grow 撑满剩余；显式约束 → 定宽不拉伸
       let (canvas_width, canvas_grow) = match config.canvas_width {
         Val::Auto => (Val::Auto, 1.0),
         w => (w, 0.0),
@@ -316,7 +281,6 @@ pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotH
           },
         ))
         .with_children(|root| {
-          // 纵轴标签列：高度随画布拉伸，SpaceBetween 分布 max/mid/min
           root
             .spawn((
               Name::new("ui-plot-yaxis-labels"),
@@ -359,13 +323,11 @@ pub fn plot(ctx: &UiCtx, parent: &mut ChildSpawner, config: PlotConfig) -> PlotH
   }
 }
 
-/// 重绘：PlotData 变更 → 光栅化写回 Image（Handle 不变）+ 更新极值文本
 pub fn plot_redraw_system(
   mut images: ResMut<Assets<Image>>,
   mut q_roots: Query<(Entity, &Children, &PlotData), Changed<PlotData>>,
   mut q_canvas: Query<&mut ImageNode>,
   q_yaxis: Query<&Children, With<PlotYAxis>>,
-  // 单个 Text 查询覆盖两类标签：Plain 的极值文本（root 直接子节点）与 YAxis 的纵轴标签（纵轴列子节点）
   mut q_text: Query<&mut Text>,
 ) {
   for (root_e, children, data) in &mut q_roots {
@@ -395,7 +357,6 @@ pub fn plot_redraw_system(
         t.set_if_neq(Text::new(text.clone()));
       }
     }
-    // 纵轴标签列：子实体顺序 = 上(max)/中/下(min)；格式 000.0（5 位定宽）+ 可选单位后缀
     let vals = [domain.1, (domain.0 + domain.1) * 0.5, domain.0];
     for ch in children.iter() {
       let Ok(labels) = q_yaxis.get(ch) else {

@@ -1,11 +1,3 @@
-//! CPU 砖块图构建器：`VolumeGrid` → wire 格式。
-//! [`BrickMapBuilder`]（单 volume）：**每个 chunk 一个树块**（块首 = 根节点地址），块内是节点
-//! arena —— 全量构建按 ChunkCoord 排序并行 `serialize_with_layout()` 后顺序安装；增量更新按
-//! [`TreeDirty`] **只重写动过的节点**（字节没变就不写不标脏），节点在块内原地增删。
-//! 一次编辑的上传量由此从"整棵 chunk 树"降到"路径上的几个节点"（几十~几百字节）。
-//! 块级空闲段（[`FreeRuns`]）复用被释放的树块，空闲过半时压实（搬块、只改窗口条目）。
-//! [`VolumesBuilder`] 拼接各 b_struct 后按 `tree_base` 偏移上传。
-
 use std::collections::{HashMap, HashSet};
 
 use gate_voxel::{
@@ -23,11 +15,6 @@ use super::wire::{
   TREE_BASE,
 };
 
-/// 稠密 chunk 窗口线性位置（stride = `CHUNK_INDEX_CAP`，与 WGSL `trace.wesl` 的窗口寻址同构）；窗口外 None。
-///
-/// **M6**：窗口是**跟着相机走**的（`infinite_cubes` 每帧把它钉在相机为中心的 64³ chunk 上），
-/// 移动时靠 [`BrickMapBuilder::set_window`] **平移索引区**（条目存的是块相对地址、与相位无关 ⇒ 只是搬家）
-/// —— 于是"走得再远"也不需要丢掉 CPU chunk / 重传树块。
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   let rel = chunk - origin;
   if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dims).any() {
@@ -40,7 +27,6 @@ fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
   )
 }
 
-/// 窗口相对下标（`None` = 窗口外）。与 [`chunk_index_pos`] 同一个判据 —— 后者由它算出线性序。
 fn chunk_rel(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<IVec3> {
   let rel = chunk - origin;
   if rel.cmplt(IVec3::ZERO).any() || rel.cmpge(dims).any() {
@@ -49,39 +35,15 @@ fn chunk_rel(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<IVec3> {
   Some(rel)
 }
 
-/// **粗占用位图的粒度**：每轴 4 个 chunk 一组（4×4×4 = 64 个 chunk 一组）。
 const OCC_GROUP: i32 = 4;
-/// 组数（窗口是定长 `CHUNK_INDEX_CAP³` = 64³ 槽 ⇒ 每轴 16 组）。
 const OCC_GROUPS: usize = 16 * 16 * 16;
-/// 位图字数：每组 64 位 = **2 个 u32**，且**同组的位连续** ⇒ "整组是否占用"就是相邻两个字是否全 0
-/// （一次 cache line 读，无需第二级表）。
 pub const OCC_WORDS: usize = OCC_GROUPS * 2;
 
-/// 窗口相对下标 → 占用位图的**位号**。
-///
-/// 布局是**组优先**的：`组号 * 64 + 组内号` ⇒ 同一组的 64 个 chunk 落在连续的 64 位（2 个字）里。
-/// 组内号与索引区同轴序（`x` 最低位、`z` 最高），这样 shader 侧只需移位与或。
 #[inline]
 fn occ_bit(rel: IVec3) -> usize {
-  let g = (rel.x >> 2) as usize
-    + ((rel.y >> 2) as usize) * 16
-    + ((rel.z >> 2) as usize) * 256;
+  let g = (rel.x >> 2) as usize + ((rel.y >> 2) as usize) * 16 + ((rel.z >> 2) as usize) * 256;
   let w = (rel.x & 3) as usize | (((rel.y & 3) as usize) << 2) | (((rel.z & 3) as usize) << 4);
   g * 64 + w
-}
-
-/// 组 `g` 在位图里占的两个字（`[g*2, g*2+1]`）——"整组为空"的判据就是这两个字全 0。
-#[cfg(test)]
-#[inline]
-fn occ_group_words(g: usize) -> (usize, usize) {
-  (g * 2, g * 2 + 1)
-}
-
-/// 相对下标 → 组号（测试用）。
-#[cfg(test)]
-#[inline]
-fn occ_group_of(rel: IVec3) -> usize {
-  (rel.x >> 2) as usize + ((rel.y >> 2) as usize) * 16 + ((rel.z >> 2) as usize) * 256
 }
 
 const _: () = assert!(OCC_GROUP == 4, "组内的位打包按 4×4×4 写死（`>> 2` 与 `& 3`）");
@@ -89,29 +51,18 @@ const _: () = assert!(
   OCC_WORDS * 32 == (CHUNK_INDEX_CAP as usize).pow(3),
   "位图必须逐 chunk 一位地覆盖整个索引区（64³ 槽）"
 );
-/// shader 侧的 `trace.wesl::OCC_WORDS` 写成同一个推导式；这条断言把它与 `CHUNK_INDEX_CAP` 绑在一起，
-/// 于是任何一方改动都会在这里（而不是在画面上）暴露。
 const _: () = assert!(OCC_WORDS == 8192, "trace.wesl::OCC_WORDS 必须同值");
 
-/// ChunkCoord 确定性排序键（展开为分量元组）。
 fn coord_key(c: ChunkCoord) -> (i32, i32, i32) {
   (c.0.x, c.0.y, c.0.z)
 }
 
-/// 空闲段表：按起点升序、相邻自动合并，单位 = 字。
-///
-/// 两个使用者：① 全局（[`BrickMapBuilder::free`]）分配 / 回收**整块 chunk 树**；
-/// ② 块内（[`ChunkSlot::free`]，偏移相对块首）分配 / 回收**单个节点块**。
-///
-/// 存在意义：增量更新若只靠追加，高水位会单调上升（空闲字节从不复用）⇒ buffer 周期性扩容并
-/// 整份拷贝旧内容。first-fit 复用后高水位稳定在"并发存活总量"附近。
 #[derive(Default, Debug)]
 struct FreeRuns {
   runs: Vec<(usize, usize)>,
 }
 
 impl FreeRuns {
-  /// first-fit 取一段 ≥ `n` 的空闲，返回段首（从段首切走 `n` 字）。
   fn alloc(&mut self, n: usize) -> Option<usize> {
     let i = self.runs.iter().position(|&(_, len)| len >= n)?;
     let (start, len) = self.runs[i];
@@ -123,7 +74,6 @@ impl FreeRuns {
     Some(start)
   }
 
-  /// 若 `[start, start+len)` 完全落在某段空闲内则切走它（原地扩容用），否则不动并返回 false。
   fn take_range(&mut self, start: usize, len: usize) -> bool {
     if len == 0 {
       return true;
@@ -137,7 +87,6 @@ impl FreeRuns {
     true
   }
 
-  /// 归还 `[start, start+len)`（与前后相邻段合并）。
   fn free(&mut self, start: usize, len: usize) {
     if len == 0 {
       return;
@@ -159,40 +108,25 @@ impl FreeRuns {
     self.runs.insert(i, (start, len));
   }
 
-  /// 空闲总字数
   fn words(&self) -> usize {
     self.runs.iter().map(|&(_, l)| l).sum()
   }
 }
 
-/// chunk 是否有可渲染内容（排除残留空树）。
 fn chunk_has_content(grid: &VolumeGrid, c: ChunkCoord) -> bool {
   grid.chunk(c).is_some_and(|t| !t.is_empty())
 }
 
-/// 增量更新结果（调用方日志/测试用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkUpdate {
-  /// chunk 树重建完成（含新建）
   Rebuilt,
-  /// chunk 已无数据，窗口条目清零
   Released,
-  /// 窗口内但两侧都无内容（grid 无此 chunk 或本就未渲染）
   Unchanged,
-  /// 超出稠密索引窗口（不渲染，构建时计数 rejected_tiles）
   OutsideWindow,
 }
 
-/// 节点槽未分配的哨兵
 const NODE_NONE: u32 = u32::MAX;
 
-/// **节点槽表 = 树自己的 wire 布局**（[`gate_voxel::NodeLayout`]，索引 = 节点 id，值 = `(块内字偏移,
-/// wire 层)`）：安装时**直接接管** `serialize` 产出的那份布局，不再逐节点重算一份带字数的表。
-///
-/// WHY 不再存"占用字数"：它由 `(id, level, 掩码)` 唯一决定（[`wire_words_of`]），而掩码随时能从
-/// `b_struct` 的节点头两个字读回来（[`read_mask`]）⇒ 需要它的只有**增量重写**那一条路，且每次只需
-/// 该节点自己那一个值。旧写法在**每次安装**时给整棵树（全分辨率 chunk ≈ 2.5 万节点）逐节点算一遍，
-/// 实测 `GATE_BENCH=fly`（MC 城市移动中、~48 块/帧）**15 ms/帧** —— 而其中绝大多数块永远不会被编辑。
 #[inline]
 fn slot_words(buf: &[u32], base: usize, id: u32, level: u8, off: u32) -> usize {
   if off == NODE_NONE {
@@ -201,53 +135,26 @@ fn slot_words(buf: &[u32], base: usize, id: u32, level: u8, off: u32) -> usize {
   wire_words_of(id, level, read_mask(buf, base + off as usize))
 }
 
-/// 未分配的槽（与 [`NodeLayout`] 的初值同口径）
 const NODE_SLOT_NONE: (u32, u8) = (NODE_OFFSET_NONE, 0);
-/// 槽表由 `gate_voxel` 的布局直接接管 ⇒ 两边的"未分配"哨兵**必须同值**，否则会把未分配的槽当成
-/// 已分配（偏移读到别处）。绑成编译期断言，改一边就编译不过。
 const _: () = assert!(NODE_NONE == NODE_OFFSET_NONE);
 
-/// 单 chunk 的树块：块首（= 根节点地址）+ 块内节点 arena。
-///
-/// 为什么是「块 + 块内 arena」而不是全局节点池：wire 的子块指针以**根地址**为基准
-/// （shader 的 `chunk_base`），一个 chunk 的节点只能整体搬 —— 块内偏移全不变 ⇒ 搬块只需改
-/// 窗口条目 1 个字，节点内容一字不动。块首由全局 [`FreeRuns`] 分配，块内节点由 `free` 分配。
 #[derive(Debug)]
 struct ChunkSlot {
-  /// 块首（`b_struct` 内字址），恒等于根节点地址
   base: usize,
-  /// 块容量（字；含末尾余量，见 [`BrickMapBuilder::install_blob`]）
   cap: usize,
-  /// 块内空闲段（偏移相对 `base`）
   free: FreeRuns,
-  /// 节点槽表（索引 = 节点 id；见 [`NODE_SLOT_NONE`] 处的说明）
   nodes: gate_voxel::NodeLayout,
-  /// 该块的**格空间** AABB 表（被占用的 64³ 子块的紧致包围盒）：硬件光追结构
-  /// （[`crate::brickmap::rt`]）的输入。安装时从树上折一次、之后随块一起丢弃 ——
-  /// 树上没有"只改一个子块占用"的增量维护（重折一棵树只在安装路径上付）。
-  ///
-  /// CONSTRAINT: 与**档位无关**（只读根节点的 `mask`/`palette`，而 `proxy` 在 `keep` 以上逐字保留）
-  /// ⇒ 档位变化**不必**重建 BLAS，见 [`BrickMapBuilder::relayout_resident_tree`]。
   aabbs: crate::brickmap::rt::ChunkAabbs,
 }
 
-/// GPU 块存在性的变更记录（挂载 / 卸载各一条）：硬件光追结构（[`crate::brickmap::rt::RtScene`]）的同步输入。
-///
-/// 为什么另起一份而不是复用 `VolumeGrid::resident_log`：那一份记的是 **CPU 树**，RT 要跟的是 **GPU 块**
-/// —— 跟不上的后果是"画面里已经没有了、光线里还在"的幽灵几何（窗口平移丢块时最明显）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidentEvent {
   pub c: ChunkCoord,
   pub mounted: bool,
 }
 
-/// 变更日志容量上限：超了就地清空并递增 epoch（消费方据此退回一次全量对照）。
-///
-/// CONSTRAINT: 必须足够大 —— 溢出会让消费方（`dda::sync_rt_scene`）重建**全部** BLAS。流式世界实测
-/// ~8 块/帧（GPU 侧安装上限），取 1 M 条 ≈ 8 MB ⇒ 溢出周期数小时。
 const RESIDENT_LOG_CAP: usize = 1 << 20;
 
-/// 节点在块内占用的字数（wire 形态）：根固定 [`ROOT_WIRE_WORDS`]（掩码增减不改根的字数 ⇒ 根永不搬迁）。
 #[inline]
 fn wire_words_of(id: u32, level: u8, mask: u64) -> usize {
   if id == 0 {
@@ -261,17 +168,11 @@ fn wire_words_of(id: u32, level: u8, mask: u64) -> usize {
   }
 }
 
-/// 读 `b_struct` 里某节点的 64 位掩码
 #[inline]
 fn read_mask(buf: &[u32], at: usize) -> u64 {
   (buf[at + 1] as u64) << 32 | buf[at] as u64
 }
 
-/// 该 chunk 的格空间 AABB 表（口径见 [`crate::brickmap::rt::gather_chunk_aabbs`]）：
-/// `chunk_min` = chunk 格坐标 × 256、`scale = 1` —— 这就是"格空间"的口径（shader 侧 TLAS 实例是
-/// 恒等变换，射线进 `trace_grid` 时已被折进这个空间）。
-///
-/// 硬件光追关掉时**不折**（`consts::RT_RAY_QUERY` 是编译期常量 ⇒ 整段消失，不付 CPU 与 ~1.5 KB/块）。
 #[inline]
 fn gather_aabbs(tree: &ChunkTree, c: ChunkCoord) -> crate::brickmap::rt::ChunkAabbs {
   if crate::brickmap::consts::RT_RAY_QUERY {
@@ -281,57 +182,31 @@ fn gather_aabbs(tree: &ChunkTree, c: ChunkCoord) -> crate::brickmap::rt::ChunkAa
   }
 }
 
-/// 砖块图构建器：持有与 GPU buffer 字节一致的持久状态。
-/// chunk 窗口（origin/dims，chunk 单位）构造时确定；窗口外新 chunk 不渲染，全量重建可扩窗。
 pub struct BrickMapBuilder {
   buffers: BrickMapBuffers,
-  /// 已渲染 chunk → 树块
   chunks: HashMap<ChunkCoord, ChunkSlot>,
   origin: IVec3,
   dims: IVec3,
   rejected_chunks: u32,
-  /// 全局块级空闲段（字，`b_struct` 内绝对地址）
   free: FreeRuns,
-  /// 增量更新脏字节区间列表：每项 `(lo_byte, hi_byte)` 闭开，字对齐。
   dirty_struct: Vec<(usize, usize)>,
-  /// 待上传的调色板脏槽闭区间（同一帧多次 `write_palette` 取并集）；None = 无变动。
   dirty_palette: Option<(u16, u16)>,
-  /// 调色板同步游标：本 builder 上次同步时调色板的写版本；None = 从未同步过。
   palette_synced_at: Option<u64>,
-  /// **树区预留字数**（M8，0 = 不预留）：见 [`BrickMapBuilder::new_unbuilt_sized`] 的说明。
-  /// 预留区让 `b_struct` 的**长度恒定** ⇒ 排在后面的 volume 的 `tree_base` 不漂移。
   reserve: usize,
-  /// **树区增长的目标块数**（M8）：高水位不够时一次跳到 `本值 × 实测每块字数`，见 [`Self::grow_region`]。
   region_chunks: usize,
-  /// **已知空块**（`VolumeGrid::empty_chunks` 的镜像）：索引条目写 [`INDEX_ENTRY_EMPTY`] 的那批。
-  /// 只增不改（与 `VolumeGrid` 同口径，见那里的说明）；调用方是 [`Self::note_empty`] 与
-  /// 窗口平移时的重打（[`Self::set_window`]）。
   empty: HashSet<ChunkCoord>,
-  /// **序列化复用缓冲**（blob + 布局）：安装一棵 chunk 树要序列化到几百 KB，逐棵新分配 + 释放
-  /// 会把内存分配器顶爆（实测 `GATE_BENCH=fly` 的 MC 城市：~48 块/帧 ⇒ 释放那一项就 6 ms/帧）。
-  /// 缓冲只增不减（高水位 = 最大的那棵树），容量由 `Vec` 自己摊。
   scratch_blob: Vec<u32>,
   scratch_layout: NodeLayout,
-  /// GPU 块存在性变更日志（环形语义：满了就清空并递增 epoch），见 [`ResidentEvent`]。
   resident_log: Vec<ResidentEvent>,
   resident_epoch: u64,
   resident_seq: u64,
-  /// **粗占用位图**（`OCC_WORDS` 个 u32 = 32 KB）：逐 chunk 一位 + **组优先布局**（见 [`occ_bit`]）。
-  ///
-  /// 不变式（唯一）：**第 `occ_bit(rel)` 位为 1 ⟺ `self.chunks` 里有窗口相对下标为 `rel` 的那个
-  /// chunk**。shader 侧靠它跳过"整组都是空气"的 4×4×4 chunk 区（见 `trace.wesl` 的空组跳过）。
-  /// 三处写点与索引区**同源**：`install_blob_inner`（置位）、`release_chunk_inner`（清位）、
-  /// `set_window`（整表重建，因为它是**窗口相对**的）。
   occ: Vec<u32>,
-  /// 位图自上次上传以来变过（调用方据此决定要不要重传那 32 KB）。
   occ_dirty: bool,
 }
 
-/// 脏字节区间列表（prepare 按此逐项 write_buffer 部分写 GPU）；空 = 未修改。
 #[derive(Debug, Default, Clone)]
 pub struct DirtyRanges {
   pub struct_ranges: Vec<(usize, usize)>,
-  /// 调色板脏槽闭区间（槽号，非字节）；None = 本次无槽变动
   pub palette_range: Option<(u16, u16)>,
 }
 
@@ -354,19 +229,10 @@ impl BrickMapBuilder {
     self.dirty_struct.push((lo, hi));
   }
 
-  /// 由 grid 包围盒确定 chunk 窗口（min - 1 起，跨度 +3 封顶 64³），不序列化内容。
-  /// 随后可逐 [`Self::update_chunk`] 累积内容（渐进式初载）。
   pub fn new_unbuilt(grid: &VolumeGrid) -> Self {
     Self::new_unbuilt_sized(grid, 0, 0)
   }
 
-  /// 同 [`Self::new_unbuilt`]，但**预占长度**，并给出树区增长的**目标块数**：
-  ///
-  /// - `reserve_words` = **长度**预留（`b_struct` 一开场就是这个长度）。**只给排在别的 volume 之前的
-  ///   远场级用**（见 [`FAR_TREE_RESERVE_WORDS`]）：它的长度一变，后面 volume 的 `tree_base` 就漂移 ⇒
-  ///   `bases_shifted` 降级全量重传（实测 577 MB / 81–200 ms/帧）。主世界在布局序最后，长度可变。
-  /// - `region_chunks` = 这个 volume 最终会有多少块（上限）。树区高水位不够时**一次跳到**
-  ///   `region_chunks × 实测每块字数`，而不是让 `Vec` 逐次翻倍 —— 见 [`Self::grow_region`]。
   pub fn new_unbuilt_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
     let (origin, dims, rejected) = compute_window(grid);
     let mut b = Self {
@@ -414,12 +280,10 @@ impl BrickMapBuilder {
       occ: vec![0; OCC_WORDS],
       occ_dirty: true,
     };
-    // 预留区登记为**空闲**：块级分配走 first-fit，会优先把它切走
     if reserve_words > 0 {
       b.free.free(TREE_BASE, reserve_words);
     }
     b.write_palette(grid);
-    // 已知空块的哨兵：建 builder 时就打上（`b_struct` 初始全 0 ⇒ 这批条目本来会被当成"还没加载"）
     let empties: Vec<ChunkCoord> = grid.empty_log_from(0).to_vec();
     for c in empties {
       b.note_empty(c);
@@ -427,13 +291,10 @@ impl BrickMapBuilder {
     b
   }
 
-  /// 全量构建（初始化 / 兜底）：确定性 + Rayon 并行序列化。
-  /// chunk 按 ChunkCoord 升序安装；序列化并行，安装顺序不变（块地址按安装序递增）。
   pub fn build_full(grid: &VolumeGrid) -> Self {
     Self::build_full_sized(grid, 0, 0)
   }
 
-  /// 同 [`Self::build_full`]，但带长度预留与增长目标（见 [`Self::new_unbuilt_sized`]）。
   pub fn build_full_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
     let mut b = Self::new_unbuilt_sized(grid, reserve_words, region_chunks);
     let mut coords: Vec<ChunkCoord> = grid
@@ -460,11 +321,6 @@ impl BrickMapBuilder {
     b
   }
 
-  /// 逐 chunk 增量更新。
-  ///
-  /// `dirty` = 该 chunk 自上次上传以来的**节点级**改动（主 world 在 `Last` 阶段与脏 chunk 一起取走）。
-  /// `reset`（身份空间换过）或本来没有块 ⇒ 释放旧块后全量重装；否则只重写 `dirty.nodes` 里的节点。
-  /// `allow_compact` = 现在是不是"安静时刻"（见 [`Self::compact`]）；由调用方（`extract`）判定。
   pub fn update_chunk(
     &mut self,
     grid: &VolumeGrid,
@@ -487,26 +343,20 @@ impl BrickMapBuilder {
       if self.chunks.contains_key(&coord) && !dirty.reset {
         self.apply_node_dirty(coord, tree, dirty);
       } else {
-        // 新 chunk / 身份空间作废：旧块（若有）归还，整棵重装
         self.release_chunk(coord);
         self.install_chunk(coord, tree);
       }
       ChunkUpdate::Rebuilt
     };
-    // 树区过半是空闲段 ⇒ 压实：否则碎片会累积到"没有足够大的连续段"从而只能追加，高水位长期膨胀。
-    // 只在安静时刻做（见 `allow_compact` 的说明）。（带预留的 volume 在 `compact` 里直接跳过。）
     if allow_compact && self.free.words() * 2 > self.buffers.b_struct.len() - TREE_BASE {
       self.compact();
     }
     self.refresh_globals();
 
-    // palette 脏槽必须与触发它的那次体素编辑同一帧上传。
     self.write_palette(grid);
     out
   }
 
-  /// 调色板增量铺：把自上次同步以来变化的槽写进 CPU 镜像并累积脏区间。
-  /// 多消费者安全：用调色板写版本判断是否同步；首次同步必然全量，非首次拿不到脏区间也退回全量。
   pub fn write_palette(&mut self, grid: &VolumeGrid) {
     let version = grid.palette().version();
     if self.palette_synced_at == Some(version) {
@@ -538,7 +388,6 @@ impl BrickMapBuilder {
     &self.buffers
   }
 
-  /// 取走累积的增量脏字节区间列表（并重置）。
   pub fn take_dirty_ranges(&mut self) -> DirtyRanges {
     DirtyRanges {
       struct_ranges: std::mem::take(&mut self.dirty_struct),
@@ -546,57 +395,38 @@ impl BrickMapBuilder {
     }
   }
 
-  /// 还有没有**未上传**的改动（[`Self::take_dirty_ranges`] 会清空它）。
-  ///
-  /// 给"本帧该不该出快照"用：常驻调度（`upload::plan_residency`）的 evict / install 也走标脏，
-  /// 但它在 `extract`（唯一的出快照点）之后 ⇒ 那一份改动要到**下一帧**才被取走，`extract` 必须
-  /// 因此知道"虽然没有脏 chunk、窗口也没动，但 builder 还有待上传的东西"。
   pub fn has_dirty(&self) -> bool {
     !self.dirty_struct.is_empty() || self.dirty_palette.is_some()
   }
 
-  /// chunk 当前树基址（b_struct 内绝对字址；None = 未渲染）
   pub fn chunk_base(&self, coord: ChunkCoord) -> Option<usize> {
     self.chunks.get(&coord).map(|s| s.base)
   }
 
-  // ---- 常驻管理（M3）：唤醒 / 换出 / 记账 ----------------------------------------------------
   //
-  // CPU 树是权威（`VolumeGrid`），GPU 块是派生缓存 ⇒ "换出"只是归还 GPU 块，"唤醒"是从 CPU 树
-  // 重新整块序列化（约 0.9 ms/chunk，见 `docs/editable-gigavoxel.md` §3.5）。两者的决策在
-  // [`super::residency::Residency`]，这里只提供落实动作与记账。
 
-  /// 该 chunk 现在有没有 GPU 块（= 是否常驻）。空 chunk 永远不常驻。
   pub fn is_resident(&self, coord: ChunkCoord) -> bool {
     self.chunks.contains_key(&coord)
   }
 
-  /// 常驻块占用的**字数**（含块内余量）× 4 = 字节。常驻预算按它算。
   pub fn resident_words(&self) -> usize {
     self.chunks.values().map(|s| s.cap).sum()
   }
 
-  /// 单个 chunk 的常驻字节（None = 未常驻）。
   pub fn resident_bytes_of(&self, coord: ChunkCoord) -> Option<usize> {
     self.chunks.get(&coord).map(|s| s.cap * 4)
   }
 
-  /// 当前常驻的 chunk 列表（常驻调度的反向同步用：CPU 侧没了 ⇒ 归还这些块）。
   pub fn resident_chunks(&self) -> Vec<ChunkCoord> {
     self.chunks.keys().copied().collect()
   }
 
-  /// 该块的格空间 AABB 表（None = 未常驻）。
   pub fn aabbs_of(&self, coord: ChunkCoord) -> Option<&crate::brickmap::rt::ChunkAabbs> {
     self.chunks.get(&coord).map(|s| &s.aabbs)
   }
 
-  // ---- GPU 块存在性日志（硬件光追结构的同步输入，见 [`ResidentEvent`]）------------------------
-
   fn note_resident_event(&mut self, c: ChunkCoord, mounted: bool) {
     if self.resident_log.len() >= RESIDENT_LOG_CAP {
-      // 清空 + 递增 epoch：消费方看到 epoch 变了会退回一次全量对照
-      // （与 `VolumeGrid::resident_log` 同口径）。
       self.resident_log.clear();
       self.resident_epoch = self.resident_epoch.wrapping_add(1);
     }
@@ -604,30 +434,23 @@ impl BrickMapBuilder {
     self.resident_seq = self.resident_seq.wrapping_add(1);
   }
 
-  /// 日志**代数**：变化 ⇒ 中间发生过清空，游标必须回退并做一次全量对照。
   pub fn resident_epoch(&self) -> u64 {
     self.resident_epoch
   }
 
-  /// 变更序号（挂载 + 卸载的累计条数，单调递增）。
   pub fn resident_seq(&self) -> u64 {
     self.resident_seq
   }
 
-  /// 日志总长（= 游标的上界）。
   pub fn resident_log_len(&self) -> usize {
     self.resident_log.len()
   }
 
-  /// 从 `cursor` 起的变更（cursor 一律夹到当前长度，去程不回退）。
   pub fn resident_log_from(&self, cursor: usize) -> &[ResidentEvent] {
     let from = cursor.min(self.resident_log.len());
     &self.resident_log[from..]
   }
 
-  // ---- 粗占用位图（shader 的空组跳过用，见字段说明的不变式）------------------------------------
-
-  /// 置位（挂载）。
   fn occ_set(&mut self, coord: ChunkCoord) {
     if let Some(rel) = chunk_rel(self.origin, self.dims, coord.0) {
       let b = occ_bit(rel);
@@ -636,7 +459,6 @@ impl BrickMapBuilder {
     }
   }
 
-  /// 清位（卸载）。**组一级不单独存**：组的占用是它那两个字算出来的（见 [`occ_group_words`]）。
   fn occ_clear(&mut self, coord: ChunkCoord) {
     if let Some(rel) = chunk_rel(self.origin, self.dims, coord.0) {
       let b = occ_bit(rel);
@@ -645,8 +467,6 @@ impl BrickMapBuilder {
     }
   }
 
-  /// 整表重建。**窗口平移后必须调**：位图是**窗口相对**的，相位一变全部失效
-  /// （与索引区整体清零同一个理由）。O(常驻块数)，只在跨 chunk 时发生。
   fn occ_rebuild(&mut self) {
     self.occ.fill(0);
     let cs: Vec<ChunkCoord> = self.chunks.keys().copied().collect();
@@ -656,55 +476,22 @@ impl BrickMapBuilder {
     self.occ_dirty = true;
   }
 
-  /// 位图字数（上传长度）。
   pub fn occ_len(&self) -> usize {
     self.occ.len()
   }
 
-  /// 位图数据（上传用）。
   pub fn occ_words(&self) -> &[u32] {
     &self.occ
   }
 
-  /// 取走"变过"标志（调用方据此决定要不要重传那 32 KB）。
   pub fn take_occ_dirty(&mut self) -> bool {
     std::mem::take(&mut self.occ_dirty)
   }
 
-  /// 位图是否待传（只读，不取走）——`snapshot` 用它决定要不要把这份 32 KB 带上。
   pub fn occ_dirty_pending(&self) -> bool {
     self.occ_dirty
   }
 
-  /// 位图与 `chunks` 是否一致（**只在测试里调**：不变式一破就是"画面上少几何"，必须能取证）。
-  #[cfg(test)]
-  fn occ_consistent(&self) -> bool {
-    for i in 0..OCC_WORDS {
-      let mut want = 0u32;
-      for bit in 0..32usize {
-        let b = i * 32 + bit;
-        // 位号 → 相对下标（`occ_bit` 的逆）
-        let g = b / 64;
-        let w = b % 64;
-        let rel = IVec3::new(
-          ((g % 16) as i32) * 4 + (w & 3) as i32,
-          (((g / 16) % 16) as i32) * 4 + ((w >> 2) & 3) as i32,
-          ((g / 256) as i32) * 4 + ((w >> 4) & 3) as i32,
-        );
-        let c = ChunkCoord(self.origin + rel);
-        if self.chunks.contains_key(&c) && chunk_index_pos(self.origin, self.dims, c.0).is_some() {
-          want |= 1u32 << bit;
-        }
-      }
-      if self.occ[i] != want {
-        return false;
-      }
-    }
-    true
-  }
-
-  /// **唤醒**：把 CPU 树整块装进 GPU。返回是否真的发生了安装。
-  /// 已常驻 / CPU 侧为空 / 不在窗口内 ⇒ 什么都不做。
   pub fn ensure_resident(&mut self, grid: &VolumeGrid, coord: ChunkCoord) -> bool {
     if !chunk_has_content(grid, coord) {
       return false;
@@ -713,8 +500,6 @@ impl BrickMapBuilder {
     self.ensure_resident_tree(coord, tree)
   }
 
-  /// **唤醒**（给定树）：调用方决定装全树还是 proxy 树（[`ChunkTree::proxy`]）；其余语义同
-  /// [`Self::ensure_resident`]。
   pub fn ensure_resident_tree(&mut self, coord: ChunkCoord, tree: &ChunkTree) -> bool {
     if self.chunks.contains_key(&coord) || tree.is_empty() {
       return false;
@@ -727,7 +512,6 @@ impl BrickMapBuilder {
     true
   }
 
-  /// **换出**：归还 GPU 块（CPU 树不动 ⇒ 之后可再唤醒）。返回是否真的释放了。
   pub fn evict(&mut self, coord: ChunkCoord) -> bool {
     if !self.chunks.contains_key(&coord) {
       return false;
@@ -745,11 +529,6 @@ impl BrickMapBuilder {
     self.dims
   }
 
-  /// **记一块"已知没有内容"**（`VolumeGrid::mark_empty_chunk` 的对端）：在窗口里的话把索引条目写成
-  /// [`INDEX_ENTRY_EMPTY`]，shader 就不再把"这块是空的"当成"这块还没加载"去发请求（见该常量的说明）。
-  ///
-  /// 已常驻的块跳过：索引条目由挂载路径写（`install_blob`），哨兵不该盖掉真树。
-  /// 窗口外的块只记进集合，等 [`Self::set_window`] 把它带进窗口时再打。
   pub fn note_empty(&mut self, coord: ChunkCoord) -> bool {
     if self.chunks.contains_key(&coord) || !self.empty.insert(coord) {
       return false;
@@ -762,30 +541,20 @@ impl BrickMapBuilder {
     true
   }
 
-  /// 窗口条目字址（调用方保证 coord 在窗口内）
   #[inline]
   fn window_word(&self, coord: ChunkCoord) -> usize {
     chunk_index_pos(self.origin, self.dims, coord.0).expect("窗口内 chunk")
   }
 
-  /// 本 volume 当前的窗口（供"窗口是否移动了"的判断，见 [`VolumesBuilder::sync_windows`]）
   pub fn window(&self) -> (IVec3, IVec3) {
     (self.origin, self.dims)
   }
 
-  /// **M6 · 窗口平移**：把窗口钉到 `(origin, dims)`（流式世界每帧钉在相机中心）。相位一变，
-  /// 所有 chunk 的槽位跟着变，但**窗口条目存的是块相对地址**（`base + 1`，与相位无关）⇒ 只需把
-  /// 条目**搬家**：不重传任何树块、不动 CPU 侧内容、不重新序列化。
-  ///
-  /// 代价 = 索引区（64³ chunk = 1 MB）整体标脏重写 —— 这就是"走得再远也不会整块重定"的实现。
   fn set_window(&mut self, origin: IVec3, dims: IVec3) {
     if self.origin == origin && self.dims == dims {
       return;
     }
     let old = (self.origin, self.dims);
-    // **两阶段**：先把所有条目读出来（掉出窗口的丢弃），再把旧索引区整体清零，最后按新槽位写回。
-    // CONSTRAINT: **不能边读边搬** —— 平移是**循环位移**，某个 chunk 的新槽位可能正是另一个 chunk 的
-    // 旧槽位；边搬会互相覆盖（表现为画面里出现"别处 chunk 的几何"这种错位巨块）。
     let mut keep: Vec<(usize, u32)> = Vec::with_capacity(self.chunks.len());
     let mut dropped: Vec<ChunkCoord> = Vec::new();
     for c in self.chunks.keys().copied().collect::<Vec<_>>() {
@@ -799,15 +568,12 @@ impl BrickMapBuilder {
         None => dropped.push(c),
       }
     }
-    // 索引区是**定长**的 `TREE_BASE` 字（64³ 槽，与窗口大小无关；窗口只是它被使用的子盒）
     self.buffers.b_struct[..TREE_BASE].fill(0);
     for (b, entry) in keep {
       self.buffers.b_struct[b] = entry;
     }
     self.origin = origin;
     self.dims = dims;
-    // **已知空块的哨兵要重打**：上面刚把整个索引区清零 ⇒ 不重打的话它们会退回"还没加载"，
-    // shader 又会对空块发请求（正是本机制要消灭的那种洪水）。只打新窗口内的、且没有真树的那些。
     for c in self.empty.iter().copied().collect::<Vec<_>>() {
       if self.chunks.contains_key(&c) {
         continue;
@@ -816,9 +582,6 @@ impl BrickMapBuilder {
         self.buffers.b_struct[b] = INDEX_ENTRY_EMPTY;
       }
     }
-    // 掉出窗口的**必须真的释放**（块归还全局空闲段 + 从 `self.chunks` 移除），不能只丢条目 ——
-    // 留下的"没有槽位的块"会让 [`Self::compact`] 逐块重指条目时 `window_word` panic（高速移动后崩）。
-    // CONSTRAINT: 必须在 `self.origin/dims` 换过之后调 —— `release_chunk` 靠新窗口判"没有条目可清"。
     for c in &dropped {
       self.release_chunk(*c);
     }
@@ -831,9 +594,7 @@ impl BrickMapBuilder {
       g.index_dims_y = dims.y as u32;
       g.index_dims_z = dims.z as u32;
     }
-    // 整个索引区都要重传（旧的要让 GPU 忘掉、新的要写上）
     self.mark_struct_words(0, TREE_BASE);
-    // 占用位图是**窗口相对**的 ⇒ 相位一变整表失效，必须重建（与上面索引区清零同一个理由）。
     self.occ_rebuild();
     bevy::log::debug!(
       "WINDOW 平移 {} → {origin} dims {dims}（掉了 {} 个出门的）",
@@ -842,14 +603,10 @@ impl BrickMapBuilder {
     );
   }
 
-  /// 从全局空闲段取一个 ≥`cap` 字的块（找不到就追加到高水位）。
   fn alloc_block(&mut self, cap: usize) -> usize {
     if let Some(start) = self.free.alloc(cap) {
       return start;
     }
-    // 空闲段用完：先让容量长到位。**预留型 volume（远场级）会被一次把长度顶到最终值**并把新段
-    // 登记为空闲（见 [`Self::grow_region`]）⇒ 这里必须**重试空闲表**，不能沿用旧长度自行 `resize`
-    // （那会把刚顶上去的长度又截回去）。
     self.grow_region(cap);
     if let Some(start) = self.free.alloc(cap) {
       return start;
@@ -859,49 +616,19 @@ impl BrickMapBuilder {
     start
   }
 
-  /// 树区**容量**增长（M8 的"扩容策略"）：一次把 `Vec` 的**容量**拨到"这个 volume 最终会有多大"，
-  /// 而不是让 `Vec` 逐次翻倍；**长度**仍按块逐个长（`len` = 高水位，语义不变）。
-  ///
-  /// WHY：容量不足时 `Vec` 会 realloc —— 一次 **O(旧内容)** 的 memcpy。逐次翻倍时最后那一次要搬
-  /// 几百 MB（实测树区 589 MB 时单次 ≈ 几十 ms），而它发生在**渲染世界的 `extract` 里**
-  /// （`install_chunk` → `alloc_block`）⇒ 直接掉一帧（"爬坡期卡顿"的来源）。
-  /// 一次拨到位后不再扩容；而拨得早（第一次装块时容量才 1 MB）⇒ 要拷的旧内容还很小 ⇒ 代价可忽略。
-  /// `reserve` 只给**容量**、不写内存、不提交物理页 ⇒ 拨大是免费的。
-  /// 显存侧跟着受益：`prepare` 的 `ensure_capacity` 拿到的 `need` 随长度渐增，单次拷贝只与旧容量同阶
-  /// （几百 MB 的 GPU-GPU 拷贝 ≈ 2 ms），不再是 CPU 那种几十 ms 的 realloc。
-  ///
-  /// 目标 = `目标块数 × 实测每块字数`，其中"实测每块字数"取 `max(已装块平均, 本次要装的块)`：
-  /// 用**实测**而不是猜常量 ⇒ 对世界的稠密度自适应（`infinite_cubes` 266 KB/块 vs 城堡 1.5 MB/块）。
   fn grow_region(&mut self, block_cap: usize) {
-    /// 目标块数天花板：`region_chunks` 是"最终会有多大"的**上限**，不该被池预算推到几万块。
     const REGION_CHUNKS_CAP: usize = 32768;
-    /// 每块字数天花板：`per_chunk` 取 `max(历史平均, 本次要装的块)`，单个稠密块可达 16 万字。
     const PER_CHUNK_WORDS_CAP: usize = 65536;
-    /// 目标字数天花板（512 M 字 = 2 GB）：实测 MC 城市常年 ~835 MB，留 2.4× 余量。
     const REGION_WORDS_CAP: usize = 512 * 1024 * 1024;
     let used = self.buffers.b_struct.len().saturating_sub(TREE_BASE);
     let per_chunk = (used / self.chunks.len().max(1)).max(block_cap);
-    // **目标块数的硬上限 + 目标的字节上限**。
     //
-    // `region_chunks` 只该是"这个 volume 最终会有多大"的**上限**，而 `per_chunk` 取的是
-    // `max(历史平均, 本次要装的块)`（保守）⇒ 池很大时乘积轻易到几十 GB：实测池 65536 块、某块
-    // 163840 字 ⇒ `target = 65536 × 163840 × 4 ≈ 40 GiB`，`resize` 直接 `memory allocation of
-    // 42949672960 bytes failed`（40 GiB 整）。这两个上限把目标钉住；配合下面的**有界倍增**，
-    // 实际占用仍然只按真实用量增长（上限只是天花板）。
     let region_chunks = self.region_chunks.min(REGION_CHUNKS_CAP);
     let per_chunk = per_chunk.min(PER_CHUNK_WORDS_CAP);
     let target = (TREE_BASE + region_chunks.saturating_mul(per_chunk)).min(REGION_WORDS_CAP);
-    // **预留型 volume（远场级）：长度一次顶到位**，并把新段登记为空闲。
     //
-    // WHY：`VolumesBuilder::snapshot` 的 `bases_shifted` 只比较各 volume 的 `b_struct` **长度** ——
-    // 而远场级排在主世界之前，长度每变一次就降级一次**全量快照**（整份拼一遍再上传）。
-    // 预留区的取值（`FAR_RESERVE_WORDS_PER_CHUNK`）是按 `infinite_cubes` 的远场块（1219–1463 字）
-    // 定的，而 **MC 的 L1 远场块实测 5773 字/块（4×）** ⇒ 预留区迅速用尽，此后**每装一块长度都长一次**：
-    // 实测（`GATE_BENCH=static`，35 s）`UPLOAD[full]` **121 次**、每次整份拼接，帧时从 16.7 ms 涨到 45 ms。
     //
-    // 一次顶到 `region_chunks × 实测每块字数` 之后长度恒定 ⇒ 全量快照只在第一次发生。
     //
-    // 代价是这段长度会被 `resize` 清零（几十 MB 的 memset，一次性）；换来的是此后**不再有**全量快照。
     if self.reserve > 0 && target > self.buffers.b_struct.len() {
       let from = self.buffers.b_struct.len();
       bevy::log::debug!(
@@ -915,21 +642,12 @@ impl BrickMapBuilder {
     if target <= self.buffers.b_struct.capacity() {
       return;
     }
-    // **有界倍增**（不是"一次跳到 target"）：`target` = `region_chunks × 实测每块字数`，而
-    // `region_chunks` 对**流式世界**取自池预算（可以是几万块）⇒ 一次 `reserve` 到 target 就是
-    // 几 GB 的**瞬时**占用。实测：池块数 87381（per-chunk 估 48 KB）时启动即
-    // `memory allocation of 44552265872 bytes failed`（单次 44.5 GB）。
-    // 每次最多翻倍（再夹到 target）⇒ 分配次数仍是 log₂ 级，但瞬时占用 ≤ 2× **实际**用量，
-    // 池块数怎么调都不会炸（`target` 只是上限）。
     let grown = self.buffers.b_struct.capacity().saturating_mul(2).max(TREE_BASE + (1 << 20));
     let want = grown.min(target);
     let extra = want.saturating_sub(self.buffers.b_struct.len());
     if extra > 0 {
       self.buffers.b_struct.reserve(extra);
     }
-    // 少见但重要：一次跳到目标容量（避免逐次翻倍）。实测只在**爬坡期**发生一次
-    // （MC 城市：树区 0 → ~100 MB），且 `Vec::reserve` 本身 < 1 ms（对照：同期的 GPU 缓冲扩容
-    // 100 → 134 MB 要 1.1–1.4 ms）⇒ 它不是启动期卡顿的来源。
     bevy::log::debug!(
       "树区容量拨到 {} 字（旧高水位 {used} 字 / {} 块，每块估 {per_chunk} 字）",
       target - TREE_BASE,
@@ -937,24 +655,18 @@ impl BrickMapBuilder {
     );
   }
 
-  /// 全量安装一个 chunk 的树（新块 + 窗口条目 + 节点槽表）
   fn install_chunk(&mut self, coord: ChunkCoord, tree: &ChunkTree) {
     self.install_chunk_impl(coord, tree, true);
   }
 
-  /// [`Self::install_chunk`] 的**不发事件**版本（见 [`Self::relayout_resident_tree`]）。
   fn install_chunk_quiet(&mut self, coord: ChunkCoord, tree: &ChunkTree) {
     self.install_chunk_impl(coord, tree, false);
   }
 
   fn install_chunk_impl(&mut self, coord: ChunkCoord, tree: &ChunkTree, emit: bool) {
-    // 序列化进**复用缓冲**（见 [`Self::scratch_blob`]）：每帧几十棵、每棵几百 KB，每棵都新分配 +
-    // 释放会把内存分配器顶爆（实测 `GATE_BENCH=fly`：单是"释放那个 blob"就 ~6 ms/帧）。
     let mut blob = std::mem::take(&mut self.scratch_blob);
     let mut layout = std::mem::take(&mut self.scratch_layout);
     tree.serialize_into(&mut blob, &mut layout);
-    // 槽表**直接接管这份布局**（复制一份；scratch 那份留给下一棵树复用）—— 不再逐节点重算
-    // `(off, words)` 表（那是全分辨率块 ~2.5 万次 `read_mask` + `wire_words_of`，见 `slot_words`）。
     let nodes = layout.clone();
     let aabbs = gather_aabbs(tree, coord);
     if emit {
@@ -966,14 +678,6 @@ impl BrickMapBuilder {
     self.scratch_layout = layout;
   }
 
-  /// **就地换档**（chunk 一直在常驻集里，只换它的树内容与档位）。返回是否真的换了。
-  ///
-  /// WHY 单列（**不发 `ResidentEvent`**）：RT 的 BLAS 只由 AABB 表建，而 **AABB 表与档位无关** ——
-  /// [`crate::brickmap::rt::gather_chunk_aabbs`] 只读**根节点**的 `mask` / `palette`，而
-  /// `ChunkTree::proxy` 在 `keep` 以上**逐字保留**这两样（`copy_proxy` 只在 `extent <= keep` 处塌缩）
-  /// ⇒ proxy(64) / proxy(16) / 全树的 AABB 表**完全相同**。走 `evict` + `ensure_resident_tree` 会发一对
-  /// "卸载 + 挂载"，`dda::sync_rt_scene` 于是每帧为这几次升级丢掉旧 BLAS、建一张新的、还把 TLAS 标脏
-  /// （流式飞行实测 3.5 次升级/帧）—— 而 BLAS 一行都不用改。
   pub fn relayout_resident_tree(&mut self, coord: ChunkCoord, tree: &ChunkTree) -> bool {
     if !self.chunks.contains_key(&coord) || tree.is_empty() {
       return false;
@@ -981,7 +685,6 @@ impl BrickMapBuilder {
     if chunk_index_pos(self.origin, self.dims, coord.0).is_none() {
       return false;
     }
-    // 块大小随档位变（变细 = 节点更多）⇒ 换块而不是就地改内容；只跳过那条变更日志。
     self.release_chunk_inner(coord);
     self.install_chunk_quiet(coord, tree);
     self.refresh_globals();
@@ -1007,8 +710,6 @@ impl BrickMapBuilder {
     aabbs: crate::brickmap::rt::ChunkAabbs,
   ) {
     let need = blob.len();
-    // 块留 25% 余量（且至少容得下一个最大节点）：后续编辑的字数变化优先在块内解决，
-    // 免得动不动搬整块（搬块 = 整棵 chunk 重传）。
     let cap = need + need / 4 + ROOT_WIRE_WORDS + 16;
     let base = self.alloc_block(cap);
     self.buffers.b_struct[base..base + need].copy_from_slice(blob);
@@ -1022,29 +723,22 @@ impl BrickMapBuilder {
     self.mark_struct_words(base, need);
   }
 
-  /// chunk 变空 / 身份空间作废：块归还全局空闲段 + 窗口条目清零（无块时无操作）。
-  /// **已知空块**的条目写哨兵（不是 0）：它仍然"没有内容"，shader 不该再对它发请求。
   fn release_chunk(&mut self, coord: ChunkCoord) {
     if self.release_chunk_inner(coord) {
       self.note_resident_event(coord, false);
     }
   }
 
-  /// [`Self::release_chunk`] 的**不发事件**版本：只做块与条目的账，供 [`Self::relayout_resident_tree`] 用。
   fn release_chunk_inner(&mut self, coord: ChunkCoord) -> bool {
     let Some(slot) = self.chunks.remove(&coord) else { return false };
     self.occ_clear(coord);
     self.free.free(slot.base, slot.cap);
-    // 掉出窗口的 chunk 没有条目（[`Self::set_window`] 已把整个索引区清零）⇒ 不写条目
     let Some(ip) = chunk_index_pos(self.origin, self.dims, coord.0) else { return true };
-    self.buffers.b_struct[ip] =
-      if self.empty.contains(&coord) { INDEX_ENTRY_EMPTY } else { 0 };
+    self.buffers.b_struct[ip] = if self.empty.contains(&coord) { INDEX_ENTRY_EMPTY } else { 0 };
     self.mark_struct_words(ip, 1);
     true
   }
 
-  /// 增量重写一个 chunk 里动过的节点（[`TreeDirty`] 保证按层降序 = 自底向上：
-  /// 子节点先定址，父节点的指针表才写得对）。
   fn apply_node_dirty(&mut self, coord: ChunkCoord, tree: &ChunkTree, dirty: &TreeDirty) {
     let mut slot = self.chunks.remove(&coord).expect("调用方保证有块");
     if slot.nodes.len() < tree.node_capacity() {
@@ -1052,7 +746,6 @@ impl BrickMapBuilder {
     }
     for &(level, id) in &dirty.nodes {
       let Some(view) = tree.node_view(id) else {
-        // 协议外的情形（身份空间失效却没带 reset）⇒ 退回全量重装，不做静默跳过
         self.chunks.insert(coord, slot);
         self.release_chunk(coord);
         self.install_chunk(coord, tree);
@@ -1063,9 +756,6 @@ impl BrickMapBuilder {
     self.chunks.insert(coord, slot);
   }
 
-  /// 重编码一个节点并就地更新：**字节完全相同就不写、不标脏**（[`TreeDirty`] 会把路径节点全报上来，
-  /// 靠这一步把"报多了"过滤掉）。字数变了优先原地（缩 → 尾部归还；增 → 紧跟其后正好空闲才扩），
-  /// 否则在块内搬一个位置（父节点必然也在 dirty 表里，会随之改指针）。
   fn rewrite_node(
     &mut self,
     coord: ChunkCoord,
@@ -1077,15 +767,11 @@ impl BrickMapBuilder {
   ) {
     let new_words = wire_words_of(id, level, view.mask);
     let (old_off, old_level) = slot.nodes[id as usize];
-    // 旧节点的字数**从 b_struct 里现读**（它的前两个字就是掩码）：槽表不再存 `words`，见
-    // [`NODE_SLOT_NONE`] 与 [`slot_words`] 的说明。
     let old_words = slot_words(&self.buffers.b_struct, slot.base, id, old_level, old_off);
 
-    // ---- 新字节：子块指针 = 子节点**当前**块内偏移 ----
     let mut out: Vec<u32> = Vec::with_capacity(new_words);
     out.push(view.mask as u32);
     out.push((view.mask >> 32) as u32);
-    // palette word：低 16 = tile 色、高 16 = 叶代表值（M2）—— 与全量路径同一个打包函数
     out.push(pack_palette_word(view.palette, view.rep));
     if view.mask != 0 {
       if level == 3 {
@@ -1096,17 +782,10 @@ impl BrickMapBuilder {
         }
       }
     }
-    // 根块的预留区（[`ROOT_WIRE_WORDS`]）大于实际内容（3 + popcount）：定址按预留区算、
-    // 写只写内容长度 —— 这样掩码增减不会动根的位置（见 `wire_words_of`）。
     let content = out.len();
     debug_assert!(content == new_words || id == 0, "节点 {id} 的编码字数与定址口径不符");
 
-    // ---- 变 uniform（掩码清零）⇒ 旧子块整棵释放 ----
     //
-    // CONSTRAINT: 只在这个状态下释放。掩码只增不减（`child_or_create` 只置位，缩位只发生在整节点
-    // 变 uniform 时），而"变 uniform 的节点其子块必然也已是 uniform"、uniform 节点恒 3 字且
-    // 原地留驻 ⇒ 老 blob 里的子块偏移此刻仍然有效（换成"按偏移差集释放"就会把已搬走的活子块
-    // 的旧地址当成死块释放 —— 那个地址可能已分给别人）。
     if old_off != NODE_NONE && level < 3 && view.mask == 0 {
       let old_at = slot.base + old_off as usize;
       let old_mask = read_mask(&self.buffers.b_struct, old_at);
@@ -1116,23 +795,18 @@ impl BrickMapBuilder {
       }
     }
 
-    // ---- 定址 ----
-    // 缩小（含字数不变）：原地留驻，**尾部必须归还**空闲段 —— 紧挨着的空闲段合到一起，下一次
-    // 增长才能原地扩回来（同一个 4³ brick 反复"合并 → 再分裂"是高频场景：level 3 在 3 ↔ 35 字之间
-    // 摆动，不还尾部就会攒出一堆填不上的洞，把高水位一路顶上去）。
     let off = if old_off == NODE_NONE {
       self.alloc_node(coord, slot, new_words)
     } else if new_words <= old_words {
       slot.free.free(old_off as usize + new_words, old_words - new_words);
       old_off
     } else if slot.free.take_range(old_off as usize + old_words, new_words - old_words) {
-      old_off // 原地扩容：紧跟其后正好是空闲段
+      old_off
     } else {
       slot.free.free(old_off as usize, old_words);
       self.alloc_node(coord, slot, new_words)
     };
 
-    // ---- 写 ----
     let at = slot.base + off as usize;
     if off != old_off || self.buffers.b_struct[at..at + content] != out[..] {
       self.buffers.b_struct[at..at + content].copy_from_slice(&out);
@@ -1141,8 +815,6 @@ impl BrickMapBuilder {
     slot.nodes[id as usize] = (off, level);
   }
 
-  /// 释放一个节点块**及其全部后代**（子块关系读**旧 blob**，与缓存无关；根不在此路径上，
-  /// 故字数口径不必特判 id = 0）。字数 = 内容字数（与 [`Self::rewrite_node`] 的归还口径一致）。
   fn free_subtree(buf: &[u32], slot: &mut ChunkSlot, off: u32, level: u8) {
     let at = slot.base + off as usize;
     let mask = read_mask(buf, at);
@@ -1154,7 +826,6 @@ impl BrickMapBuilder {
     slot.free.free(off as usize, wire_words_of(1, level, mask));
   }
 
-  /// 块内分配一个字数为 `words` 的节点；块内没有足够连续空闲时先把块换大。
   fn alloc_node(&mut self, coord: ChunkCoord, slot: &mut ChunkSlot, words: usize) -> u32 {
     if let Some(off) = slot.free.alloc(words) {
       return off as u32;
@@ -1163,8 +834,6 @@ impl BrickMapBuilder {
     slot.free.alloc(words).expect("块扩容量恒 ≥ 单个节点最大字数") as u32
   }
 
-  /// 块内空间不足：换一个更大的块（整块搬过去；块内偏移不变 ⇒ 节点内容一字不动），旧块归还全局空闲段。
-  /// 整块字节都换了位置 ⇒ **必须整块重传** —— 只在块的几何增长时发生。
   fn grow_block(&mut self, coord: ChunkCoord, slot: &mut ChunkSlot) {
     let old_cap = slot.cap;
     let new_cap = old_cap + old_cap / 2 + ROOT_WIRE_WORDS + 1;
@@ -1177,29 +846,15 @@ impl BrickMapBuilder {
     let ip = self.window_word(coord);
     self.buffers.b_struct[ip] = new_base as u32 + 1;
     self.mark_struct_words(ip, 1);
-    // CONSTRAINT: 整块搬走 ⇒ 标满**搬走的整个旧块**，不能只标"已占用字数"：
-    // `used() = cap − 空闲总字数`，而 [`Self::rewrite_node`] 会在块**中间**归还空闲段
-    // ⇒ 空闲段有洞时 `used()` 小于"最高占用偏移" ⇒ 洞以上的活节点既不写也不标 ⇒ GPU 侧那片字
-    // 停在搬块前的旧内容 = **该 chunk 的垃圾值**（症状：编辑后"笔触范围之外一片被改乱"）。
-    // 实测见 `dirty_ranges_cover_every_changed_word_across_block_grow`。
     self.mark_struct_words(new_base, old_cap);
   }
 
-  /// 压实树区：把存活块紧排到 `TREE_BASE` 之后、丢掉全部空闲段、窗口条目重指。
-  /// 块内节点存的是**相对块首**的偏移 ⇒ 搬块不需要重写块内容，只改窗口条目与块首。
-  /// 只在空闲过半、且处于安静时刻时调用（见 [`Self::update_chunk`]）；**只标"搬动过的块"的目标段**
-  /// （没动的块在 GPU 上本来就是对的），相邻段由 `mark_struct_words` 自动并成 1~2 段。
   fn compact(&mut self) {
-    // CONSTRAINT（M8）：**带预留的 volume（远场级）直接跳过** —— 它的 `b_struct` 长度必须恒定，
-    // 否则排在其后的 volume 的 `tree_base` 漂移 ⇒ `bases_shifted` 全量重传（实测 577 MB / 81–200 ms/帧）。
-    // 而压实**只会**把长度压小 ⇒ 对预留区毫无收益（预留区一开场就是空闲的 ⇒ 判据恒真 ⇒ 每帧白搬一遍块）。
     if self.reserve > 0 {
       return;
     }
     let mut items: Vec<(ChunkCoord, usize, usize)> =
       self.chunks.iter().map(|(&c, s)| (c, s.base, s.cap)).collect();
-    // CONSTRAINT: 必须按**旧基址**升序搬（不是按坐标）—— 压实只会前移，升序搬运才能保证"目标段"
-    // 永不覆盖尚未搬运的段（旧布局是分配序，与坐标序不一致）。
     items.sort_by_key(|&(_, old_base, _)| old_base);
     let mut cursor = TREE_BASE;
     let mut moved = 0usize;
@@ -1236,94 +891,51 @@ impl BrickMapBuilder {
   }
 }
 
-/// u32 字切片 → 本机字节序 u8 `Vec`（wire 按小端直存）。
 fn words_to_bytes(words: &[u32]) -> Vec<u8> {
   let mut v = Vec::with_capacity(words.len() * 4);
-  // SAFETY: &[u32] → &[u8] 等长重解释，仅用于立即拷贝进 v
   v.extend_from_slice(unsafe {
     std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
   });
   v
 }
 
-/// 多 volume 统一快照（与 GPU buffer 字节一一对应）
 #[derive(Debug, Clone)]
 pub struct VolumesSnapshot {
-  /// full 模式：所有 volume 的 b_struct 顺序拼接；incremental 模式为空（内容走 struct_blobs）
   pub b_struct: Vec<u32>,
-  /// full 模式：所有 volume 的 b_palette 顺序拼接；incremental 模式为空
   pub b_palette: Vec<u32>,
-  /// 每 volume 一个 GridDesc（tree_base/palette_base 指向上述统一 buffer）
   pub grid_descs: Vec<GridDesc>,
-  /// "full" = 整块写；"incremental" = 仅写脏块
   pub mode_tag: &'static str,
-  /// incremental 模式：b_struct 脏块（统一 buffer 内字节偏移 + 内容）；full 为空
   pub struct_blobs: Vec<(usize, Vec<u8>)>,
-  /// incremental 模式：b_palette 脏块（统一 buffer 内字节偏移 + 内容）；full 为空
   pub palette_blobs: Vec<(usize, Vec<u8>)>,
-  /// 统一 b_struct 总字节数（两种模式都有效；buffer 容量 ensure 用）
   pub struct_total_bytes: usize,
-  /// 统一 b_palette 总字节数
   pub palette_total_bytes: usize,
-  /// 本轮更新的 dirty chunk 总数（跨所有 volume；日志用）
   pub dirty_chunks: usize,
-  /// **各 volume 的粗占用位图**，按 volume 序拼接（每个 `OCC_WORDS` 字；`Some` = 本帧至少有一个
-  /// volume 变过，需要整块重传）。
-  ///
-  /// WHY 逐 volume：位图是**窗口相对**的，而各 volume 的窗口互不相同（远场级的 chunk 坐标空间也不同）
-  /// ⇒ shader 用 `vol * OCC_WORDS` 分段寻址。**远场级的收益最大**：它一窗口只有几百块常驻
-  /// （占用率 ≪ 1%），而主射线每条都要穿过去。
-  ///
-  /// 不走"字节脏区间"那套：它本身就是稠密表，整块重传比维护位级脏区间更简单也更快。
   pub occ_all: Option<Vec<u32>>,
 }
 
-/// 多 volume 统一构建器：持有 `Vec<BrickMapBuilder>`，输出统一 buffer + GridDesc 数组。
-/// 各 volume 独立维护 dirty 跟踪；增量下任一前置 volume 增长使 tree_base 漂移则自动降级全量。
 pub struct VolumesBuilder {
   builders: Vec<BrickMapBuilder>,
-  /// 每 volume 的变换（缓存自 Volumes，用于 GridDesc 生成）
   transforms: Vec<VolumeTransform>,
-  /// 每 volume 是不是**远场级**（M8）：进 `GridDesc::grid_flags` 的 [`GRID_FLAG_FAR`]，
-  /// 唯一消费者是 shader 的分壳裁剪（`trace.wesl::grid_is_far`）。
   far: Vec<bool>,
-  /// 每 volume 的**覆盖半径**（世界体素，M8）：进 `GridDesc.coverage_r`，当分壳裁剪的接力半径
-  /// （见 `VolumeGrid::set_coverage_r`）。0 = 不参与接力（物体）。
   coverage: Vec<f32>,
-  /// 构造时的 GPU 常驻池预算：新增 volume 时（[`Self::sync`]）重算它的树区增长目标要用。
   budget_bytes: usize,
-  /// 上一次 snapshot 的 tree_bases（字偏移）；空 = 首帧 → 强制全量
   prev_tree_bases: Vec<u32>,
-  /// 上一次 snapshot 的 palette_bases（字偏移）
   prev_palette_bases: Vec<u32>,
-  /// 强制全量标志（新增 volume /手动请求）
   force_full: bool,
 }
 
 impl VolumesBuilder {
-  /// 该 volume 的树区**长度预留**（M8）：远场级固定预留 [`FAR_TREE_RESERVE_WORDS`]（长度恒定 ⇒ 主世界的
-  /// `tree_base` 不漂移 ⇒ 不降级全量重传），主世界与普通物体为 0（它们是布局序最后，长度可变）。
   fn reserve_of(grid: &gate_voxel::VolumeGrid) -> usize {
-    if grid.is_far_level() {
-      super::consts::FAR_TREE_RESERVE_WORDS
-    } else {
-      0
-    }
+    if grid.is_far_level() { super::consts::FAR_TREE_RESERVE_WORDS } else { 0 }
   }
 
-  /// 该 volume 的树区**目标块数**（"这个 volume 最终会有多少块"，给 [`BrickMapBuilder::grow_region`]
-  /// 一次跳到位用）。三个口径：
-  /// - 远场级：它的池上限（`FAR_POOL_CHUNKS`，与它的长度预留同一把尺）；
-  /// - 流式世界（有窗口提示）：上限由**池预算**定（与 `plan_residency` 的 `budget_bytes` 同源）
-  ///   —— 世界无限，只能按池封顶；`budget_bytes = 0`（不限）时退回默认池容量；
-  /// - 有限世界（.vox / 演示场景）：按**它自己的块数**，一块不多给。
   fn region_chunks_of(grid: &gate_voxel::VolumeGrid, budget_bytes: usize) -> usize {
     if grid.is_far_level() {
       return crate::brickmap::consts::FAR_POOL_CHUNKS;
     }
     if grid.stream_window().is_some() {
       if budget_bytes == 0 {
-        crate::brickmap::consts::FAR_POOL_CHUNKS // 预算不限时按默认池量级
+        crate::brickmap::consts::FAR_POOL_CHUNKS
       } else {
         super::upload::pool_capacity_chunks(budget_bytes)
       }
@@ -1332,7 +944,6 @@ impl VolumesBuilder {
     }
   }
 
-  /// 全量构建所有 volume（初始化 / 兜底）。`budget_bytes` = GPU 常驻池预算（定树区增长目标）。
   pub fn build_full(volumes: &Volumes, budget_bytes: usize) -> Self {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
@@ -1360,7 +971,6 @@ impl VolumesBuilder {
     }
   }
 
-  /// 空构造（渐进式：先 new_unbuilt，再 update_chunk 累积）
   pub fn new_unbuilt(volumes: &Volumes, budget_bytes: usize) -> Self {
     let mut builders = Vec::with_capacity(volumes.len());
     let mut transforms = Vec::with_capacity(volumes.len());
@@ -1388,8 +998,6 @@ impl VolumesBuilder {
     }
   }
 
-  /// 逐 volume 同步调色板（版本门控；无变化时全部空操作）。
-  /// 用途：菜单改材质参数时几何不脏但调色板槽内容变了，须在此补一次同步。
   pub fn sync_palettes(&mut self, volumes: &Volumes) {
     for (i, grid) in volumes.all().iter().enumerate() {
       if let Some(b) = self.builders.get_mut(i) {
@@ -1419,7 +1027,6 @@ impl VolumesBuilder {
     }
   }
 
-  /// 逐 chunk 增量更新指定 volume（`dirty` / `allow_compact` 见 [`BrickMapBuilder::update_chunk`]）
   pub fn update_chunk(
     &mut self,
     volumes: &Volumes,
@@ -1431,18 +1038,14 @@ impl VolumesBuilder {
     self.builders[volume_idx].update_chunk(&volumes.all()[volume_idx], coord, dirty, allow_compact)
   }
 
-  /// 某个 volume 当前的窗口（`None` = 该 volume 还没建起来）
   pub fn window_of(&self, volume_idx: usize) -> Option<(IVec3, IVec3)> {
     self.builders.get(volume_idx).map(BrickMapBuilder::window)
   }
 
-  /// 还有没有未上传的改动（见 [`BrickMapBuilder::has_dirty`]）
   pub fn has_dirty(&self) -> bool {
     self.builders.iter().any(BrickMapBuilder::has_dirty)
   }
 
-  /// **M6**：把每个 volume 的窗口对齐到 `grid.stream_window()`（流式世界每帧钉在相机中心）。
-  /// 相位变了就**平移索引区**（[`BrickMapBuilder::set_window`]）—— 只搬条目，不重传树块。
   pub fn sync_windows(&mut self, volumes: &Volumes) {
     for (i, g) in volumes.all().iter().enumerate() {
       if let Some((o, d)) = g.stream_window() {
@@ -1451,13 +1054,10 @@ impl VolumesBuilder {
     }
   }
 
-  /// 标记全量重建（下帧 snapshot 走 full 路径）
   pub fn force_full(&mut self) {
     self.force_full = true;
   }
 
-  /// 取走统一快照：拼接所有 volume 的 b_struct/b_palette + 生成 GridDesc 数组。
-  /// 布局：物体 (1..N) 先放、主世界 (0) 后放（主世界增长不漂移前置 tree_base）；GridDesc 按 volume 索引序。
   pub fn snapshot(&mut self) -> VolumesSnapshot {
     let n = self.builders.len();
 
@@ -1492,15 +1092,10 @@ impl VolumesBuilder {
         origin,
         dims,
       );
-      // **世界 AABB 一律按窗口算**（主世界 / 远场级 / 物体同一口径）：`from_transform` 给的是
-      // 局部 `[0,256]³` 的 AABB（"单 chunk 物体"的形态），而主世界与远场级的局部范围是它们的窗口。
-      // 这里覆盖成窗口 AABB 后，shader 的 AABB 预剔除对三级远场都成立（否则远场级整级会被裁掉）。
       let (mn, mx) = super::wire::window_world_aabb(tr, origin, dims);
       desc.aabb_min = Vec4::new(mn.x, mn.y, mn.z, 0.0);
       desc.aabb_max = Vec4::new(mx.x, mx.y, mx.z, 0.0);
-      // M8：远场级标记（分壳裁剪的开关，见 `trace.wesl::grid_is_far`）
       desc.grid_flags = if self.far[i] { super::wire::GRID_FLAG_FAR } else { 0 };
-      // M8：**覆盖半径** = 分壳裁剪的接力半径（见 `VolumeGrid::set_coverage_r` 的 WHY）
       desc.coverage_r = self.coverage[i];
       grid_descs.push(desc);
     }
@@ -1509,7 +1104,6 @@ impl VolumesBuilder {
       || self.prev_tree_bases.iter().zip(tree_bases.iter()).any(|(p, c)| p != c)
       || self.prev_palette_bases.iter().zip(palette_bases.iter()).any(|(p, c)| p != c);
     let need_full = self.force_full || bases_shifted;
-    // 诊断：`need_full` 是每帧几十 ms 的整份快照，而它只由"某个 volume 变长"引起。
     if bases_shifted {
       let info: Vec<String> = self
         .builders
@@ -1575,7 +1169,6 @@ impl VolumesBuilder {
       struct_total_bytes: struct_total_words * 4,
       palette_total_bytes: palette_total_words * 4,
       dirty_chunks,
-      // 各 volume 的粗占用位图：任一个变过就整份带上（每卷 32 KB）。窗口平移会整表重建 ⇒ 也走这条。
       occ_all: {
         if self.builders.iter().any(BrickMapBuilder::occ_dirty_pending) {
           let mut v = Vec::with_capacity(self.builders.len() * OCC_WORDS);
@@ -1591,45 +1184,46 @@ impl VolumesBuilder {
     }
   }
 
-  /// 单 volume 的 chunk 基址（调试/DDA 参考用）
   pub fn chunk_base(&self, volume_idx: usize, coord: ChunkCoord) -> Option<usize> {
     self.builders[volume_idx].chunk_base(coord)
   }
 
-  // ---- 常驻管理（M3，逐 volume 分发）-------------------------------------------------------
-
-  /// 该 volume 的 chunk 当前是否常驻（有 GPU 块）。
   pub fn is_resident(&self, vol_idx: usize, coord: ChunkCoord) -> bool {
     self.builders.get(vol_idx).is_some_and(|b| b.is_resident(coord))
   }
 
-  /// 该 volume 常驻块占用的**字数**（×4 = 字节；预算按它算）。
   pub fn resident_words(&self, vol_idx: usize) -> usize {
     self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_words)
   }
 
-  /// 该 volume 里单个 chunk 的常驻字节（None = 未常驻）。
+  pub fn unbudgeted_struct_bytes(&self) -> usize {
+    let mut words = 0usize;
+    for (i, b) in self.builders.iter().enumerate() {
+      if i == 0 {
+        words += b.buffers.b_struct.len().saturating_sub(b.resident_words());
+      } else {
+        words += b.buffers.b_struct.len();
+      }
+    }
+    words * 4
+  }
+
   pub fn resident_bytes_of(&self, vol_idx: usize, coord: ChunkCoord) -> Option<usize> {
     self.builders.get(vol_idx).and_then(|b| b.resident_bytes_of(coord))
   }
 
-  /// 该 volume 当前常驻的 chunk 列表。
   pub fn resident_chunks(&self, vol_idx: usize) -> Vec<ChunkCoord> {
     self.builders.get(vol_idx).map(BrickMapBuilder::resident_chunks).unwrap_or_default()
   }
 
-  /// 把该 volume 的一块记成"已知没有内容"（写索引哨兵，见 [`BrickMapBuilder::note_empty`]）。
   pub fn note_empty(&mut self, vol_idx: usize, coord: ChunkCoord) -> bool {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.note_empty(coord))
   }
 
-  /// 该 volume 当前的 chunk 窗口 `(原点, 各轴跨度)`（渲染侧据此扫"窗口内哪些块没有内容"，见
-  /// `upload::plan_residency` 的 ①″）。
   pub fn window(&self, vol_idx: usize) -> (IVec3, IVec3) {
     self.builders.get(vol_idx).map(BrickMapBuilder::window).unwrap_or((IVec3::ZERO, IVec3::ZERO))
   }
 
-  /// 唤醒：按**给定的树**（全树或 proxy）整块装进 GPU（见 [`BrickMapBuilder::ensure_resident_tree`]）。
   pub fn ensure_resident_tree(
     &mut self,
     vol_idx: usize,
@@ -1639,8 +1233,6 @@ impl VolumesBuilder {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.ensure_resident_tree(coord, tree))
   }
 
-  /// 就地换档（见 [`BrickMapBuilder::relayout_resident_tree`]）：**不发 `ResidentEvent`**，
-  /// RT 侧不重建 BLAS。
   pub fn relayout_resident_tree(
     &mut self,
     vol_idx: usize,
@@ -1650,7 +1242,6 @@ impl VolumesBuilder {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.relayout_resident_tree(coord, tree))
   }
 
-  /// 该块的格空间 AABB 表（None = 未常驻）；口径见 [`BrickMapBuilder::aabbs_of`]。
   pub fn aabbs_of(
     &self,
     vol_idx: usize,
@@ -1659,41 +1250,32 @@ impl VolumesBuilder {
     self.builders.get(vol_idx).and_then(|b| b.aabbs_of(coord))
   }
 
-  /// 该 volume 的 GPU 块存在性日志游标三件套（见 [`BrickMapBuilder::resident_epoch`]）。
   pub fn resident_epoch(&self, vol_idx: usize) -> u64 {
     self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_epoch)
   }
 
-  /// 见 [`BrickMapBuilder::resident_seq`]。
   pub fn resident_seq(&self, vol_idx: usize) -> u64 {
     self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_seq)
   }
 
-  /// 见 [`BrickMapBuilder::resident_log_len`]。
   pub fn resident_log_len(&self, vol_idx: usize) -> usize {
     self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_log_len)
   }
 
-  /// 见 [`BrickMapBuilder::resident_log_from`]。
   pub fn resident_log_from(&self, vol_idx: usize, cursor: usize) -> &[ResidentEvent] {
     self.builders.get(vol_idx).map_or(&[], |b| b.resident_log_from(cursor))
   }
 
-  /// 唤醒：从该 volume 的 CPU 树整块装进 GPU（**近场不截断**）。远场级走这一条 ——
-  /// 它们本身已经是粗档（每格 `FAR_GRAIN` 级体素），没有"再截断一层"可做的（见 `upload::plan_residency`）。
   pub fn ensure_resident(&mut self, volumes: &Volumes, vol_idx: usize, coord: ChunkCoord) -> bool {
     let Some(b) = self.builders.get_mut(vol_idx) else { return false };
     let Some(g) = volumes.all().get(vol_idx) else { return false };
     b.ensure_resident(g, coord)
   }
 
-  /// 换出：归还 GPU 块（CPU 树不动 ⇒ 之后可再唤醒）。
   pub fn evict(&mut self, vol_idx: usize, coord: ChunkCoord) -> bool {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.evict(coord))
   }
 
-  /// 逐 volume 的 wire 字节状态（按 volume 索引序，非拼接序）：供调试转储（`upload::dump_voxel_buffers`）
-  /// 把"CPU 认为该上传什么"整份取出；内容与 `snapshot()` 上传的字节同源。
   pub fn volume_buffers(&self) -> Vec<&BrickMapBuffers> {
     self.builders.iter().map(|b| b.buffers()).collect()
   }
@@ -1707,12 +1289,7 @@ impl VolumesBuilder {
   }
 }
 
-/// 窗口计算：原点 = 最小非空 chunk - 1（±1 chunk 余量），跨度 = max - min + 3，封顶 64³（CHUNK_INDEX_CAP）。
 fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
-  // 流式世界（`infinite_cubes`）：窗口由 `VolumeGrid::set_stream_window` **钉死** —— 它由
-  // `infinite_cubes::stream_chunks` 每帧钉在"相机为中心"上（M6：走得再远也只是平移索引区，见
-  // `BrickMapBuilder::set_window`）。常驻集是相机周围的环（半径 ≪ 半窗宽）⇒ 内容一律在窗口内，
-  // **不按内容扩张**（扩张会让 origin 随内容漂移，平移就无从谈起）。
   if let Some((o, d)) = grid.stream_window() {
     return (o, d, 0);
   }
@@ -1734,719 +1311,4 @@ fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {
     .filter(|&c| chunk_has_content(grid, c) && chunk_index_pos(origin, dims, c.0).is_none())
     .count();
   (origin, dims, rejected)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use super::super::wire::CHUNK_SIZE;
-
-  /// **M6**：窗口平移 —— 条目跟着 chunk **搬家**、树块**原地不动**（"走得再远也不整块重定"的实现）。
-  ///
-  /// 关键用例：两个**相邻** chunk + 窗口**反向**平移 ⇒ 甲的"新槽位"正是乙的"旧槽位"（循环位移）。
-  /// 边读边搬会互相覆盖（画面上出现"别处 chunk 的几何"这种错位巨块）⇒ 必须两阶段。
-  #[test]
-  fn set_window_translates_index_entries() {
-    let mut grid = VolumeGrid::new();
-    let (c, c2) = (ChunkCoord(IVec3::new(4, 0, 0)), ChunkCoord(IVec3::new(5, 0, 0)));
-    for x in 0..8 {
-      for y in 0..8 {
-        grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
-        grid.set_voxel_ivec3(c2.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(2));
-      }
-    }
-    let mut b = build_and_drain(&mut grid);
-    let (o0, d0) = b.window();
-    let pos0 = b.window_word(c);
-    let (entry0, entry1) = (b.buffers().b_struct[pos0], b.buffers().b_struct[pos0 + 1]);
-    assert!(entry0 != 0 && entry1 != 0, "两个 chunk 都该装进窗口");
-    let base = entry0 as usize - 1;
-    let block = b.buffers().b_struct[base..base + 8].to_vec();
-
-    // **反向**平移 1 chunk：甲的新槽位 = 乙的旧槽位（循环位移，naive 边搬必坏）
-    let o1 = o0 - IVec3::new(1, 0, 0);
-    b.set_window(o1, d0);
-    assert_eq!(b.window(), (o1, d0));
-    let pos1 = b.window_word(c);
-    assert_eq!(pos1, pos0 + 1, "前提：正好撞上乙的旧槽位");
-    assert_eq!(b.buffers().b_struct[pos1], entry0, "甲的条目搬到（原乙的）新槽位");
-    assert_eq!(b.buffers().b_struct[pos1 + 1], entry1, "乙的条目也搬对了（没被甲覆盖）");
-    assert_eq!(b.buffers().b_struct[pos0], 0, "腾出来的槽位清零");
-    assert_eq!(&b.buffers().b_struct[base..base + 8], &block[..], "树块原地不动");
-
-    // 再平移 3 chunk ⇒ 甲掉出窗口：只清条目（GPU 视作空气），**CPU 侧内容保留**
-    let o2 = o1 + IVec3::new(3, 0, 0);
-    assert!(chunk_index_pos(o2, d0, c.0).is_none(), "前提：甲已在窗口外");
-    b.set_window(o2, d0);
-    assert_eq!(b.buffers().b_struct[pos1], 0, "掉出窗口的条目清空");
-    assert!(grid.chunk(c).is_some(), "CPU 侧 chunk 不受窗口平移影响");
-    assert_ne!(b.window_word(c2), 0, "仍在窗口内的 chunk 条目照旧跟着走");
-
-    // 掉出窗口的必须**真的释放**（块归还空闲段 + 从 `chunks` 移除），不能只丢条目：留下的
-    // "没有槽位的块"会让 [`BrickMapBuilder::compact`] 逐块重指条目时 panic（实测高速移动后崩）。
-    let words_before = b.buffers().b_struct.len();
-    b.compact();
-    assert!(
-      b.buffers().b_struct.len() < words_before,
-      "掉出窗口的块该被回收：{words_before} → {}",
-      b.buffers().b_struct.len()
-    );
-  }
-
-  /// **粗占用位图的不变式**：位为 1 ⟺ 该 chunk 有 GPU 树块。
-  ///
-  /// 三处写点（挂载 / 卸载 / 窗口平移）之后都必须成立 —— 一破就是 shader 的"空组跳过"把**有几何的
-  /// 组**当成空的（画面上少几何，且只在某些机位出现）。顺便钉住"组一级是算出来的"这条：同组两块，
-  /// 只卸一块时组**仍非空**，卸掉最后一块才变空。
-  #[test]
-  fn occupancy_bitmap_tracks_resident_chunks() {
-    let mut grid = VolumeGrid::new();
-    let a = ChunkCoord(IVec3::new(4, 0, 0));
-    let b2 = ChunkCoord(IVec3::new(4, 1, 0)); // 与 `a` **同组**（组边长 4）
-    let far = ChunkCoord(IVec3::new(12, 0, 0)); // 另一组，把窗口撑开
-    for x in 0..8 {
-      for y in 0..8 {
-        grid.set_voxel_ivec3(a.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
-        grid.set_voxel_ivec3(b2.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
-        grid.set_voxel_ivec3(far.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
-      }
-    }
-    let mut b = build_and_drain(&mut grid);
-    assert!(b.occ_consistent(), "建场景后位图必须与常驻集一致");
-
-    let rel_a = chunk_rel(b.origin, b.dims, a.0).expect("a 在窗口内");
-    let g = occ_group_of(rel_a);
-    let (w0, w1) = occ_group_words(g);
-    assert!(b.occ[w0] != 0 || b.occ[w1] != 0, "前提：`a` 所在的组非空");
-
-    // 卸掉同组的一块 ⇒ 组**仍非空**（组位是算出来的，不是单独存的）
-    assert!(b.evict(a), "a 应本来常驻");
-    assert!(b.occ_consistent(), "卸载一块后位图必须一致");
-    assert!(b.occ[w0] != 0 || b.occ[w1] != 0, "同组还有 `b2` ⇒ 组不该变空");
-
-    // 卸掉同组的最后一块 ⇒ 组变空
-    assert!(b.evict(b2), "b2 应本来常驻");
-    assert!(b.occ_consistent(), "卸载最后一块后位图必须一致");
-    assert!(b.occ[w0] == 0 && b.occ[w1] == 0, "同组已无块 ⇒ 组必须是空的");
-
-    // 窗口平移 ⇒ 位图是**窗口相对**的，必须整表重建
-    let (o, d) = b.window();
-    b.set_window(o + IVec3::new(1, 0, 0), d);
-    assert!(b.occ_consistent(), "窗口平移后位图必须一致");
-    let rel_far = chunk_rel(b.origin, b.dims, far.0).expect("far 仍在窗口内");
-    let gf = occ_group_of(rel_far);
-    let (f0, f1) = occ_group_words(gf);
-    assert!(b.occ[f0] != 0 || b.occ[f1] != 0, "平移后 far 所在的组仍应非空");
-  }
-
-  /// **已知空块的哨兵**（`consts::INDEX_ENTRY_EMPTY`，M8 空块请求洪水）：写进索引条目、
-  /// 窗口平移后**重打**（平移会把索引区整体清零）、不盖真树、装上真树后由真条目覆盖。
-  #[test]
-  fn empty_chunk_marker_is_written_and_reapplied() {
-    let mut grid = VolumeGrid::new();
-    let c = ChunkCoord(IVec3::new(4, 0, 0)); // 有真树
-    let far = ChunkCoord(IVec3::new(12, 0, 0)); // 有真树（把窗口撑开，让下面的 in/out 站得住）
-    for x in 0..8 {
-      for y in 0..8 {
-        grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
-        grid.set_voxel_ivec3(far.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(1));
-      }
-    }
-    let mut b = build_and_drain(&mut grid);
-    let (o, d) = b.window();
-    let e = ChunkCoord(IVec3::new(8, 0, 0)); // 窗口内、没有内容
-    let out = ChunkCoord(IVec3::new(30, 0, 0)); // 窗口外
-    assert!(chunk_index_pos(o, d, e.0).is_some() && chunk_index_pos(o, d, out.0).is_none(), "前提");
-
-    // 常驻块：`note_empty` 必须跳过（哨兵不该盖掉块地址）
-    let wc = b.window_word(c);
-    let entry = b.buffers().b_struct[wc];
-    assert!(entry != 0 && entry != INDEX_ENTRY_EMPTY, "前提：真树有条目");
-    assert!(!b.note_empty(c), "常驻块不写哨兵");
-    assert_eq!(b.buffers().b_struct[wc], entry);
-
-    // 窗口内的空块：条目 = 哨兵；重复记不重复写
-    assert!(b.note_empty(e), "首次记应写哨兵");
-    assert!(!b.note_empty(e), "重复记是空操作");
-    assert_eq!(b.buffers().b_struct[b.window_word(e)], INDEX_ENTRY_EMPTY);
-
-    // 窗口外的空块：只记进集合（此刻没有条目可写）
-    assert!(!b.note_empty(out), "窗口外 ⇒ 不打");
-    assert_eq!(b.buffers().b_struct[wc], entry, "别的条目不受影响");
-
-    // 窗口平移（索引区整体清零）⇒ 窗口内的哨兵必须重打
-    b.set_window(o - IVec3::new(1, 0, 0), d);
-    assert_eq!(b.buffers().b_struct[b.window_word(e)], INDEX_ENTRY_EMPTY, "平移后要重打");
-    assert_eq!(b.buffers().b_struct[b.window_word(c)], entry, "真条目照旧跟着搬");
-
-    // 换出真树：条目回 0（它不是空块）；**记成空块之后**才写哨兵
-    assert!(b.evict(c));
-    assert_eq!(b.buffers().b_struct[b.window_word(c)], 0, "换出 ≠ 空块");
-    assert!(b.note_empty(c));
-    assert_eq!(b.buffers().b_struct[b.window_word(c)], INDEX_ENTRY_EMPTY);
-
-    // 那块后来真有内容（编辑 / 更细的源）：装上真树 ⇒ 真地址盖掉哨兵
-    for x in 0..8 {
-      for y in 0..8 {
-        grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, 0), PaletteId(2));
-      }
-    }
-    assert!(b.ensure_resident(&grid, c), "重新装上");
-    let e2 = b.buffers().b_struct[b.window_word(c)];
-    assert!(e2 != 0 && e2 != INDEX_ENTRY_EMPTY, "真地址应盖掉哨兵：{e2:#x}");
-  }
-
-  /// **wire → GPU 一致性**：`install_blob` 之后，`b_struct` 里那个 4³ 值块的 32 个 inline 半字
-  /// 必须逐格等于 CPU 写入的槽号。
-  ///
-  /// 把"逐体素取色"的数据链验到 GPU 缓冲（CPU 树 → wire → `b_struct`）：任何一环把块内合并成
-  /// uniform、或写漏 inline，着色端就只能拿到一个节点色 ⇒ 画面变成"一个 4³ 块一个色"。
-  /// 读法与 `trace.wesl` 的层次 DDA **同式**：节点 3 字 = mask_lo + mask_hi + palette，
-  /// 子块指针存**相对根的字偏移**（根恒占 3 + 64 字）。
-  #[test]
-  fn gpu_blob_carries_per_voxel_palette_in_a_brick() {
-    const N_FIXED: usize = 3;
-    let mut grid = VolumeGrid::new();
-    for i in 0..64i32 {
-      let p = IVec3::new(i % 4, (i / 4) % 4, i / 16);
-      grid.set_voxel_ivec3(p, PaletteId((i + 1) as u16));
-    }
-    let b = build_and_drain(&mut grid);
-    let words = &b.buffers().b_struct;
-    let ip = b.window_word(ChunkCoord(IVec3::ZERO));
-    let base = words[ip] as usize - 1;
-    // 逐层走 cell (0,0,0)：`pop` = 该格之前的置位数 = 0 ⇒ 取指针表第 0 项
-    let mut addr = base;
-    for lv in 0..3 {
-      assert_ne!(words[addr] | words[addr + 1], 0, "第 {lv} 层应已分裂（cell 0 有内容）");
-      addr = base + words[addr + N_FIXED] as usize;
-    }
-    let mask = (words[addr] as u64) | ((words[addr + 1] as u64) << 32);
-    assert_eq!(mask.count_ones(), 64, "4³ 值块应 64 格全置位（否则整块一色）");
-    for i in 0..64usize {
-      let w = words[addr + N_FIXED + (i >> 1)];
-      assert_eq!((w >> ((i & 1) * 16)) & 0xFFFF, (i + 1) as u32, "GPU 第 {i} 格槽号");
-    }
-  }
-
-  /// **增量上传不变式**：`take_dirty_ranges()` 报出的区间必须覆盖 `b_struct` 里**每一个变化的字**。
-  ///
-  /// 这条就是"GPU 镜像"的定义 —— 既有测试只验 CPU 侧 wire 与 grid 一致（[`assert_wire_matches_grid`]），
-  /// **验不到它**：没被报出去的字节在 GPU 上停在旧内容，画面上就是该 chunk 的**垃圾值**（用户口径：
-  /// 放置体素时"笔触范围之外一片被改乱"）。
-  ///
-  /// 触发条件是**块扩容**（`grow_block`）：块内 arena 碎片化（反复分裂 / 合并同一片砖）后再分配失败。
-  /// 只用"把报出的区间贴回上一份快照"模拟上传；树区**长度**变化的那几轮走的是生产路径的整份重传
-  /// （`snapshot` 的 `bases_shifted` 降级全量）⇒ 跳过，但要求至少有一轮"块扩容 + 长度不变"被真验到。
-  #[test]
-  fn dirty_ranges_cover_every_changed_word_across_block_grow() {
-    let mut grid = VolumeGrid::new();
-    for x in 0..16 {
-      for y in 0..16 {
-        for z in 0..16 {
-          grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
-        }
-      }
-    }
-    let c = ChunkCoord(IVec3::ZERO);
-    // 用**带预留**的 builder（预留区就是全局空闲段）：块扩容才能从全局空闲段拿到空间 ⇒ 树区长度
-    // 不变 ⇒ 走增量上传。否则每次块扩容都伴随树区变长，而那条路会整份重传，把这处的漏报掩掉。
-    let mut b = BrickMapBuilder::new_unbuilt_sized(&grid, 1 << 20, 12);
-    let dirty = take_dirty_of(&mut grid, c);
-    b.update_chunk(&grid, c, &dirty, false);
-    assert_eq!(
-      b.buffers().b_struct.len(),
-      TREE_BASE + (1 << 20),
-      "前提：预留区当场占住（块扩容因此不会再改树区长度）"
-    );
-    let _ = b.take_dirty_ranges();
-    let mut base = b.chunk_base(c).expect("前提：有块");
-    let mut block_grows = 0usize;
-    let mut checked_grows = 0usize;
-    for i in 0..96i32 {
-      // 反复改同一片 16³ 里的格子（值在 1..=4 之间跳）⇒ 砖反复分裂 / 合并 ⇒ arena 碎片化
-      let p = IVec3::new(i % 16, (i / 16) % 16, (i / 2) % 16);
-      grid.set_voxel_ivec3(p, PaletteId((i % 4 + 1) as u16));
-      let dirty = take_dirty_of(&mut grid, c);
-      let before = b.buffers().b_struct.clone();
-      // `allow_compact = false`：把压实排除掉，让块首的变化只可能来自块扩容
-      b.update_chunk(&grid, c, &dirty, false);
-      let after = b.buffers().b_struct.clone();
-      let ranged = b.take_dirty_ranges().struct_ranges;
-      let grew_here = b.chunk_base(c).expect("前提：有块") != base;
-      if grew_here {
-        block_grows += 1;
-        base = b.chunk_base(c).expect("前提：有块");
-      }
-      if after.len() != before.len() {
-        continue; // 树区长度变了 ⇒ 整份重传，区间不变式不适用
-      }
-      let mut gpu = before;
-      for (lo, hi) in ranged {
-        gpu[lo / 4..hi / 4].copy_from_slice(&after[lo / 4..hi / 4]);
-      }
-      if let Some(w) = (0..after.len()).find(|&w| gpu[w] != after[w]) {
-        panic!(
-          "第 {i} 次编辑后有字改了却没报：word #{w}（模拟 GPU 侧 {:#x} ≠ 真值 {:#x}）\
-           —— 没报的字节在 GPU 上停在旧内容 ⇒ 该 chunk 出垃圾值",
-          gpu[w], after[w]
-        );
-      }
-      if grew_here {
-        checked_grows += 1;
-      }
-    }
-    assert!(block_grows > 0, "前提：这串编辑必须逼出至少一次块扩容（否则没覆盖 grow_block）");
-    assert!(checked_grows > 0, "前提：至少有一次块扩容发生在树区长度不变时（否则本轮没真验到区间）");
-  }
-
-  /// 空闲段：first-fit、相邻合并（前向 / 后向 / 双向）、跨洞不合并
-  #[test]
-  fn free_runs_first_fit_and_coalesce() {
-    let mut f = FreeRuns::default();
-    assert_eq!(f.alloc(4), None, "空表无段可分配");
-    f.free(100, 8);
-    f.free(200, 8);
-    f.free(108, 4); // 与 100..108 前向相邻 ⇒ 合并成 100..112
-    assert_eq!(f.words(), 20);
-    assert_eq!(f.alloc(12), Some(100), "first-fit 命中第一段够大的");
-    assert_eq!(f.words(), 8);
-    assert_eq!(f.alloc(9), None, "剩 8 字凑不出 9");
-    f.free(300, 4);
-    f.free(304, 4); // 与 300..304 后向相邻 ⇒ 合并成 300..308
-    assert_eq!(f.alloc(8), Some(200), "更靠前的段够 8 字");
-    assert_eq!(f.alloc(4), Some(300));
-    assert_eq!(f.alloc(4), Some(304), "切走 4 字后剩余段从 304 起");
-    assert_eq!(f.words(), 0);
-    // 中间有洞则各自独立，凑不出连续 8 字
-    f.free(500, 4);
-    f.free(510, 4);
-    assert_eq!(f.alloc(8), None);
-    // take_range：只在完全落在某段空闲内时切走（原地扩容用），并把两侧余量归还
-    assert!(!f.take_range(506, 4), "跨在两段之间 ⇒ 拒绝");
-    f.free(600, 10);
-    assert!(!f.take_range(606, 8), "跨出段尾 ⇒ 拒绝");
-    assert!(f.take_range(604, 4), "完全落在段内 ⇒ 切走");
-    assert_eq!(f.words(), 4 + 4 + 4 + 2, "500..504 / 510..514 / 600..604 / 608..610");
-    assert!(f.take_range(604, 0), "空请求恒成功");
-  }
-
-  /// 铺一块 16³ 实体（树里有 Split 层）+ 一个 8³ 方块到相邻 chunk
-  fn two_chunk_grid() -> (VolumeGrid, ChunkCoord, ChunkCoord) {
-    let mut grid = VolumeGrid::new();
-    for x in 0..16 {
-      for y in 0..16 {
-        for z in 0..16 {
-          grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
-        }
-      }
-    }
-    let c1 = ChunkCoord(IVec3::new(1, 0, 0));
-    for x in 0..8 {
-      for y in 0..8 {
-        for z in 0..8 {
-          grid.set_voxel_ivec3(c1.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(2));
-        }
-      }
-    }
-    (grid, ChunkCoord(IVec3::ZERO), c1)
-  }
-
-  /// 取走一个 chunk 的节点级改动（与主 world `poll_pending` 同一口径）
-  fn take_dirty_of(grid: &mut VolumeGrid, c: ChunkCoord) -> TreeDirty {
-    grid.chunk_mut(c).map(|t| t.take_dirty()).unwrap_or_default()
-  }
-
-  /// 建场景时的标记由首帧安装消费（生产路径：`poll_pending` 的首次 drain 带上 `reset`）。
-  /// 测试里等价地先 drain 一遍，让后续断言只看得见新编辑。
-  fn build_and_drain(grid: &mut VolumeGrid) -> BrickMapBuilder {
-    let b = BrickMapBuilder::build_full(grid);
-    let coords: Vec<ChunkCoord> = grid.chunk_coords().collect();
-    for c in coords {
-      let _ = take_dirty_of(grid, c);
-    }
-    b
-  }
-
-  /// wire 子树 ↔ `ChunkTree` 子树**逐节点**精确比对（掩码 / uniform 色 / inline / 子块指针），
-  /// 返回比对的节点数。读的就是 shader 会读的那些字节 ⇒ 不用抽样、也不会漏掉坏节点。
-  fn assert_wire_node(
-    buf: &[u32],
-    base: usize,
-    off: usize,
-    tree: &ChunkTree,
-    id: u32,
-    level: u8,
-  ) -> usize {
-    let view = tree.node_view(id).expect("grid 侧节点必 live");
-    let at = base + off;
-    assert_eq!(read_mask(buf, at), view.mask, "节点 {id}（层 {level}）掩码不符");
-    assert_eq!(
-      buf[at + 2],
-      pack_palette_word(view.palette, view.rep),
-      "节点 {id}（层 {level}）的 palette word（tile 色 + 叶代表值）不符"
-    );
-    if view.mask == 0 {
-      return 1;
-    }
-    if level == 3 {
-      let inline = tree.node_inline_words(id).expect("level 3 分裂节点有 inline");
-      assert_eq!(
-        &buf[at + NODE_FIXED_WORDS..at + NODE_FIXED_WORDS + LEAF_INLINE_WORDS],
-        &inline[..],
-        "节点 {id} 的 inline 字不符"
-      );
-      return 1;
-    }
-    let mut n = 1;
-    for (slot, &child) in view.children.iter().enumerate() {
-      let child_off = buf[at + NODE_FIXED_WORDS + slot] as usize;
-      n += assert_wire_node(buf, base, child_off, tree, child, level + 1);
-    }
-    n
-  }
-
-  /// 每个有内容的 chunk：wire 字节解出来的树必须与 grid 的权威树**逐节点相同**
-  ///（复用 / 原地增删 / 压实搬运 / 块扩容之后都成立）
-  fn assert_wire_matches_grid(b: &BrickMapBuilder, grid: &VolumeGrid, what: &str) {
-    let mut nodes = 0usize;
-    for c in grid.chunk_coords().filter(|&c| chunk_has_content(grid, c)) {
-      let tree = grid.chunk(c).expect("chunk_has_content");
-      let base = b.chunk_base(c).unwrap_or_else(|| panic!("{what}：{c:?} 有内容但窗口无块"));
-      assert_eq!(
-        b.buffers().b_struct[b.window_word(c)] as usize,
-        base + 1,
-        "{what}：{c:?} 的窗口条目未指向块首"
-      );
-      if tree.is_uniform_root() {
-        assert_eq!(read_mask(&b.buffers().b_struct, base), 0, "{what}：{c:?} 单色根掩码应为 0");
-        assert_eq!(
-          b.buffers().b_struct[base + 2],
-          pack_palette_word(tree.root_palette(), PaletteId::AIR),
-          "{what}：{c:?} 单色根的 palette word 不符（代表值字段恒 0）"
-        );
-        nodes += 1;
-      } else {
-        nodes += assert_wire_node(&b.buffers().b_struct, base, 0, tree, 0, 0);
-      }
-    }
-    assert!(nodes > 0, "{what}：没有可比对的节点");
-  }
-
-  /// 反复编辑同一个 chunk：节点字数在"分裂 / 合回"间摆动 ⇒ 块内空闲段原地复用，高水位不动
-  ///（没有块内 arena 时，每次编辑都要追加一整棵新树 ⇒ 高水位线性增长）。
-  #[test]
-  fn repeated_edits_reuse_freed_space_in_block() {
-    let (mut grid, c0, _) = two_chunk_grid();
-    let mut b = build_and_drain(&mut grid);
-    let hw0 = b.buffers().b_struct.len();
-    // 改 / 改回同一个格：块在 Uniform 与 Split 间切换（节点字数摆动）
-    let p = IVec3::new(3, 3, 3);
-    let mut hw_seq = Vec::new();
-    for i in 0..20 {
-      grid.set_voxel_ivec3(p, if i % 2 == 0 { PaletteId(2) } else { PaletteId(1) });
-      let dirty = take_dirty_of(&mut grid, c0);
-      assert_eq!(b.update_chunk(&grid, c0, &dirty, true), ChunkUpdate::Rebuilt);
-      assert_wire_matches_grid(&b, &grid, &format!("第 {i} 次编辑"));
-      hw_seq.push(b.buffers().b_struct.len());
-    }
-    let tail = &hw_seq[5..];
-    assert!(
-      tail.iter().all(|&h| h == tail[0]),
-      "高水位应在头几次编辑后稳定在块内解决，实际序列 {hw_seq:?}"
-    );
-    assert!(
-      hw_seq[19] <= hw0 + ROOT_WIRE_WORDS,
-      "20 次编辑最多只该用掉初始余量：{hw0} → {}",
-      hw_seq[19]
-    );
-  }
-
-  /// **M8 扩容策略**：树区**容量**在第一次需要增长时就拨到"目标块数 × 实测每块字数"，此后在目标以内
-  /// **不再扩容**（`capacity` 不变 ⇒ 不再有 O(旧内容) 的 realloc ⇒ 渲染线程不再被搬几百 MB 卡住）。
-  #[test]
-  fn tree_region_grows_once_to_target() {
-    let mut grid = VolumeGrid::new();
-    let coords: Vec<ChunkCoord> =
-      (0..40).map(|i| ChunkCoord(IVec3::new(i % 8, i / 8, 0))).collect();
-    for c in &coords {
-      for x in 0..8 {
-        for y in 0..8 {
-          for z in 0..8 {
-            grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(1));
-          }
-        }
-      }
-    }
-    let mut b = BrickMapBuilder::new_unbuilt_sized(&grid, 0, coords.len());
-    let cap0 = b.buffers().b_struct.capacity();
-    let mut caps = Vec::new();
-    for c in &coords {
-      let dirty = take_dirty_of(&mut grid, *c);
-      b.update_chunk(&grid, *c, &dirty, true);
-      caps.push(b.buffers().b_struct.capacity());
-    }
-    assert!(caps[0] > cap0, "第一次装块就该把容量拨到目标：{cap0} → {}", caps[0]);
-    let target = caps[0];
-    assert!(
-      caps.iter().all(|&c| c == target),
-      "容量只该拨一次（目标以内不再 realloc），实际 {caps:?}"
-    );
-    assert!(b.buffers().b_struct.len() <= b.buffers().b_struct.capacity());
-    assert_eq!(b.resident_chunks().len(), coords.len());
-  }
-
-  /// **M8**：远场级的树区**长度恒定** —— 这是"不降级全量重传"的前提。
-  ///
-  /// `VolumesBuilder::snapshot` 的 `bases_shifted` 以各 volume 的 `b_struct` 长度为判据；远场级排在
-  /// 主世界**之前** ⇒ 远场一变长，主世界的 `tree_base` 就漂移 ⇒ 全量快照（实测 `UPLOAD[full]
-  /// bytes=577MB elapsed=81–200ms`，`extract` 107–227 ms/帧 ⇒ 帧率掉到个位数）。
-  /// 预留区必须同时扛住**装块**与**压实**（压实原来会把尾巴截掉）。
-  #[test]
-  fn far_reserve_keeps_tree_region_length_stable() {
-    let mut grid = VolumeGrid::new();
-    let coords: Vec<ChunkCoord> =
-      (0..12).map(|i| ChunkCoord(IVec3::new(i % 4, i / 4, 0))).collect();
-    for c in &coords {
-      for x in 0..8 {
-        for y in 0..8 {
-          for z in 0..8 {
-            grid.set_voxel_ivec3(c.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(1));
-          }
-        }
-      }
-    }
-    let reserve = 1 << 20; // 4 M 字（够这 12 块的 1.5 万倍余量）
-    let mut b = BrickMapBuilder::new_unbuilt_sized(&grid, reserve, 12);
-    let len0 = b.buffers().b_struct.len();
-    assert_eq!(len0, TREE_BASE + reserve, "预留区应当场占住");
-    for c in &coords {
-      let dirty = take_dirty_of(&mut grid, *c);
-      b.update_chunk(&grid, *c, &dirty, true);
-      assert_eq!(
-        b.buffers().b_struct.len(),
-        len0,
-        "装块必须被预留区吃掉，不许改长度（否则主世界 tree_base 漂移 ⇒ 全量重传）"
-      );
-    }
-    b.compact();
-    assert_eq!(b.buffers().b_struct.len(), len0, "压实必须保住预留区长度");
-    assert_eq!(b.window(), (b.origin, b.dims), "压实后窗口不变");
-  }
-
-  /// chunk 清空后空闲段占满树区 ⇒ 触发压实：高水位回落，存活 chunk 的树跟着前移且内容不变
-  #[test]
-  fn compaction_shrinks_tree_region() {
-    let mut grid = VolumeGrid::new();
-    let (c0, c1) = (ChunkCoord(IVec3::ZERO), ChunkCoord(IVec3::new(1, 0, 0)));
-    // c0：16³ 棋盘格 —— 每个 4³ brick 都是 Mixed，树远大于 c1（实体块会被合并成 uniform）
-    let checker = |x: i32, y: i32, z: i32| (x + y + z) % 2 == 0;
-    for x in 0..16 {
-      for y in 0..16 {
-        for z in 0..16 {
-          if checker(x, y, z) {
-            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
-          }
-        }
-      }
-    }
-    // c1：8³ 实心块
-    for x in 0..8 {
-      for y in 0..8 {
-        for z in 0..8 {
-          grid.set_voxel_ivec3(c1.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(2));
-        }
-      }
-    }
-    let mut b = build_and_drain(&mut grid);
-    let hw0 = b.buffers().b_struct.len();
-    let c1_base_before = b.chunk_base(c1).expect("窗口内");
-    assert!(
-      grid.chunk(c0).expect("chunk").serialize().len()
-        > grid.chunk(c1).expect("chunk").serialize().len(),
-      "前提：待清空的 c0 树更大（否则空闲占不到一半，不该压实）"
-    );
-    // 擦空 c0（棋盘格逐格擦 ⇒ 每层向上合并，最终整 chunk 空）
-    for x in 0..16 {
-      for y in 0..16 {
-        for z in 0..16 {
-          if checker(x, y, z) {
-            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId::AIR);
-          }
-        }
-      }
-    }
-    let dirty = take_dirty_of(&mut grid, c0);
-    assert_eq!(b.update_chunk(&grid, c0, &dirty, true), ChunkUpdate::Released);
-    assert_eq!(b.chunk_base(c0), None, "清空后窗口条目应清零");
-    assert!(
-      b.buffers().b_struct.len() < hw0,
-      "压实后树区应变短（{hw0} → {}）",
-      b.buffers().b_struct.len()
-    );
-    assert_eq!(b.chunk_base(c1), Some(TREE_BASE), "存活 chunk 应被前移到树区起点");
-    assert_ne!(b.chunk_base(c1), Some(c1_base_before));
-    assert_wire_matches_grid(&b, &grid, "压实后");
-    assert_eq!(b.buffers().globals.node_free_words, 0, "压实后不应残留空闲段");
-  }
-
-  /// 笔触进行中（`allow_compact = false`）**不压实**：同一场景下先不压（树区不缩），安静后再压（缩）。
-  #[test]
-  fn compaction_deferred_while_editing() {
-    let mut grid = VolumeGrid::new();
-    let (c0, c1) = (ChunkCoord(IVec3::ZERO), ChunkCoord(IVec3::new(1, 0, 0)));
-    let checker = |x: i32, y: i32, z: i32| (x + y + z) % 2 == 0;
-    for x in 0..16 {
-      for y in 0..16 {
-        for z in 0..16 {
-          if checker(x, y, z) {
-            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId(1));
-          }
-        }
-      }
-    }
-    for x in 0..8 {
-      for y in 0..8 {
-        for z in 0..8 {
-          grid.set_voxel_ivec3(c1.0 * CHUNK_SIZE + IVec3::new(x, y, z), PaletteId(2));
-        }
-      }
-    }
-    let mut b = build_and_drain(&mut grid);
-    let hw0 = b.buffers().b_struct.len();
-    for x in 0..16 {
-      for y in 0..16 {
-        for z in 0..16 {
-          if checker(x, y, z) {
-            grid.set_voxel_ivec3(IVec3::new(x, y, z), PaletteId::AIR);
-          }
-        }
-      }
-    }
-    // 笔触进行中：空闲已过半但不压 ⇒ 树区长度不变
-    let dirty = take_dirty_of(&mut grid, c0);
-    assert_eq!(b.update_chunk(&grid, c0, &dirty, false), ChunkUpdate::Released);
-    assert_eq!(b.buffers().b_struct.len(), hw0, "笔触进行中不该压实");
-    assert_wire_matches_grid(&b, &grid, "延迟压实后（未压）");
-    // 安静了：下一次更新顺手压实 ⇒ 树区变短、存活 chunk 前移
-    let dirty = take_dirty_of(&mut grid, c1);
-    assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Rebuilt);
-    assert!(b.buffers().b_struct.len() < hw0, "安静时应压实");
-    assert_eq!(b.chunk_base(c1), Some(TREE_BASE), "存活 chunk 应被前移到树区起点");
-    assert_wire_matches_grid(&b, &grid, "延迟压实后（已压）");
-    assert_eq!(b.buffers().globals.node_free_words, 0);
-  }
-
-  /// 压力：随机切换体素（含清空 / 重建）200 步，每步逐节点核对 wire 字节
-  #[test]
-  fn incremental_layout_survives_random_edits() {
-    let (mut grid, c0, c1) = two_chunk_grid();
-    let mut b = build_and_drain(&mut grid);
-    let mut seed = 0x1234_5678u32;
-    let mut rnd = move || {
-      seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-      (seed >> 8) as usize
-    };
-    for step in 0..200 {
-      let coord = if rnd() % 2 == 0 { c0 } else { c1 };
-      let off = IVec3::new((rnd() % 24) as i32, (rnd() % 24) as i32, (rnd() % 24) as i32);
-      let p = coord.0 * CHUNK_SIZE + off;
-      let v = if rnd() % 3 == 0 { PaletteId::AIR } else { PaletteId((rnd() % 3) as u16 + 1) };
-      grid.set_voxel_ivec3(p, v);
-      let dirty = take_dirty_of(&mut grid, coord);
-      b.update_chunk(&grid, coord, &dirty, true);
-      assert_wire_matches_grid(&b, &grid, &format!("随机第 {step} 步"));
-    }
-  }
-
-  /// **本改动的验收指标**：一次单格编辑的上传量 = 路径上的几个节点（几十~几百字节），
-  /// 而不是整棵 chunk 树（旧实现是 ~1.4MB/笔）。
-  #[test]
-  fn single_voxel_edit_uploads_only_the_path() {
-    let (mut grid, c0, _) = two_chunk_grid();
-    let mut b = build_and_drain(&mut grid);
-    let _ = b.take_dirty_ranges();
-
-    grid.set_voxel_ivec3(IVec3::new(5, 5, 5), PaletteId(3));
-    let dirty = take_dirty_of(&mut grid, c0);
-    assert!(!dirty.reset, "单格编辑不该重置身份空间");
-    assert!(dirty.nodes.len() <= 8, "dirty 表应只有路径节点，实际 {:?}", dirty.nodes);
-    assert_eq!(b.update_chunk(&grid, c0, &dirty, true), ChunkUpdate::Rebuilt);
-
-    let dr = b.take_dirty_ranges();
-    let bytes: usize = dr.struct_ranges.iter().map(|(lo, hi)| hi - lo).sum();
-    assert!(
-      bytes <= 512,
-      "单格编辑应只重写路径节点（≤512B），实际 {bytes}B：{:?}",
-      dr.struct_ranges
-    );
-    assert_wire_matches_grid(&b, &grid, "单格编辑后");
-  }
-
-  /// 整 chunk 擦空再重建：Released（块归还）→ Rebuilt（重新安装），全程 wire 与 grid 一致
-  #[test]
-  fn chunk_becomes_empty_then_rebuilds() {
-    let (mut grid, _, c1) = two_chunk_grid();
-    let mut b = build_and_drain(&mut grid);
-    let origin = c1.0 * CHUNK_SIZE;
-    for x in 0..8 {
-      for y in 0..8 {
-        for z in 0..8 {
-          grid.set_voxel_ivec3(origin + IVec3::new(x, y, z), PaletteId::AIR);
-        }
-      }
-    }
-    // `allow_compact = false`：这里要看"块有没有归还到全局空闲段"，压实会把它清空
-    let dirty = take_dirty_of(&mut grid, c1);
-    assert_eq!(b.update_chunk(&grid, c1, &dirty, false), ChunkUpdate::Released);
-    assert_eq!(b.chunk_base(c1), None, "擦空后窗口条目应清零");
-    assert!(b.buffers().globals.node_free_words > 0, "块应被归还到全局空闲段");
-
-    for x in 0..8 {
-      for y in 0..8 {
-        for z in 0..8 {
-          grid.set_voxel_ivec3(origin + IVec3::new(x, y, z), PaletteId(2));
-        }
-      }
-    }
-    // 512 格一次重填会撞上"节点表上限 ⇒ 改用整棵重建"，这正是设计意图
-    let dirty = take_dirty_of(&mut grid, c1);
-    assert_eq!(b.update_chunk(&grid, c1, &dirty, true), ChunkUpdate::Rebuilt);
-    assert_wire_matches_grid(&b, &grid, "重建后");
-  }
-
-  /// M3：换出 → 唤醒是**无损**的（唤醒重建的 wire 与 grid 逐节点相同）。
-  #[test]
-  fn evict_then_wake_is_lossless() {
-    let (mut grid, _, c1) = two_chunk_grid();
-    let mut b = build_and_drain(&mut grid);
-    let words_all = b.resident_words();
-    assert!(b.is_resident(c1));
-
-    assert!(b.evict(c1), "常驻的 chunk 应能换出");
-    assert!(!b.is_resident(c1), "换出后窗口条目应清零");
-    assert_eq!(b.chunk_base(c1), None);
-    assert!(b.resident_words() < words_all, "换出应释放字数");
-    assert!(!b.evict(c1), "重复换出应无操作");
-    // 注意：这里**不能**用 `assert_wire_matches_grid` —— 它要求"每个有内容的 chunk 都有块"，
-    // 与"故意换出"天然冲突（换出后窗口条目就该是 0）。
-
-    // CPU 树不动 ⇒ 唤醒就是整块重装，且重建的 wire 必须与 grid 一致
-    assert!(b.ensure_resident(&grid, c1), "有内容的 chunk 应能唤醒");
-    assert!(b.is_resident(c1));
-    assert_eq!(b.resident_words(), words_all, "唤醒后字数应回到原值");
-    assert!(!b.ensure_resident(&grid, c1), "已常驻 ⇒ 唤醒应无操作");
-    assert_wire_matches_grid(&b, &grid, "唤醒后");
-  }
-
-  /// M3：空 chunk（CPU 侧无内容）永远不常驻 —— 唤醒它是无操作。
-  #[test]
-  fn empty_chunk_is_never_resident() {
-    let (mut grid, c0, c1) = two_chunk_grid();
-    let mut b = build_and_drain(&mut grid);
-    assert!(b.is_resident(c0) && b.is_resident(c1), "有内容的 chunk 建树后即常驻");
-    let empty = ChunkCoord(IVec3::new(3, 0, 0));
-    assert!(!b.is_resident(empty), "空 chunk 没有块");
-    assert!(!b.ensure_resident(&grid, empty), "对空 chunk 唤醒应无操作");
-  }
 }

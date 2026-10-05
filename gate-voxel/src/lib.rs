@@ -1,7 +1,3 @@
-//! gate-voxel：权威体素数据层 + Douglas Brick Tree。
-//! 纯逻辑 crate，零渲染依赖，唯一外部依赖 `glam`。
-//! Brick Tree = 4³ 分裂因子 + u64 mask + 紧凑 child offset + 自适应 uniform leaf。
-
 pub mod chunk_tree;
 pub mod coords;
 pub mod dirty;
@@ -25,8 +21,8 @@ pub use dirty::DirtyTracker;
 pub use produce::{ChunkProducer, ChunkSource, Detail};
 
 pub use volume::{
-  COMP_BRICK_EXTENT, COMP_BRICKS_PER_CHUNK, DirtyEdit, ResidentChange, VolumeGrid,
-  VolumeTransform, Volumes,
+  COMP_BRICK_EXTENT, COMP_BRICKS_PER_CHUNK, DirtyEdit, ResidentChange, VolumeGrid, VolumeTransform,
+  Volumes,
 };
 
 pub use palette::{

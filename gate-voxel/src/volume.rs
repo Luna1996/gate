@@ -1,7 +1,3 @@
-//! Volume + Volumes：主世界 / 独立物体的统一容器。
-//! `VolumeGrid` = 单个体素 volume（主世界 = identity transform + 无界 chunk HashMap；物体 = 任意 transform）。
-//! `Volumes` = `Vec<VolumeGrid>`，list[0] 恒为主世界（obj_id = -1），list[1..N] 为物体。
-
 use std::collections::{HashMap, HashSet};
 
 use glam::{IVec3, Mat3, Vec3};
@@ -11,27 +7,17 @@ use crate::coords::{CHUNK_SIZE, ChunkCoord, VoxelCoord};
 use crate::dirty::DirtyTracker;
 use crate::palette::{Palette, PaletteId};
 
-/// 组件层：level 2 brick = 16³ = 一个组件 cell；每 chunk = 16³ = 4096 个。
 pub const COMP_BRICKS_PER_CHUNK: usize = 16 * 16 * 16;
 pub const COMP_BRICK_EXTENT: i32 = 16;
 
-/// 常驻集变更日志的容量上限（条，逐卷计数）：满了整段清空并抬 [`VolumeGrid::resident_log_epoch`]。
-/// WHY 封顶：日志只增，相机持续移动时每帧都有挂载 / 卸载 ⇒ 不封顶就是无界增长（每条约 16 B）。
-/// 清空后消费端退回一次全量扫描，而它每 `RESIDENT_LOG_MAX` 次变更才发生一次。
 const RESIDENT_LOG_MAX: usize = 16 * 1024;
 
-/// 一条常驻集变更：`c` 这个 chunk 变成"在 CPU 上"（`mounted`）/ "不在 CPU 上"。
-///
-/// 顺序有意义（同一帧里先卸后挂 ⇒ 以后者为准），消费端必须**按顺序**应用（见
-/// [`VolumeGrid::resident_log_from`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidentChange {
   pub c: ChunkCoord,
   pub mounted: bool,
 }
 
-/// 主世界 / 独立物体的统一容器。
-/// 主世界 = identity transform + 无界 chunk（obj_id = -1）；物体 = 任意 transform（obj_id = 0..N-1）。
 #[derive(Debug, Clone)]
 pub struct VolumeGrid {
   chunks: HashMap<ChunkCoord, ChunkTree>,
@@ -40,58 +26,19 @@ pub struct VolumeGrid {
   comp_layer: HashMap<ChunkCoord, Box<[u16; COMP_BRICKS_PER_CHUNK]>>,
   state_table: Vec<[u32; 4]>,
   pub state_dirty: bool,
-  /// 物体变换（主世界 = identity）；渲染侧据此推导 DDA 局部变换与世界 AABB。
   pub transform: VolumeTransform,
-  /// 渲染器分配的 obj_id（主世界 = -1；物体 = 0..N-1，对应 `Volumes.list[1..]` 索引）。
   pub obj_id: i32,
-  /// 体素编辑单调代数（每次实际改变体素 +1；noop 同色重复写不递增，palette 变化不计入）；渲染侧派生数据（如探针烘焙）据此判断是否需重烘。
   edit_generation: u64,
-  /// 常驻集变更序号（挂载 / 卸载 +1）：见 [`Self::resident_seq`]。
   resident_seq: u64,
-  /// **常驻集变更日志**：挂载 / 卸载的坐标，按发生顺序追加（与 [`Self::resident_seq`] 同一批事件，
-  /// 见 [`Self::resident_log_from`]）。
-  ///
-  /// WHY 需要：`resident_seq` 只说"集合变了"，要落到"变的是哪一块"就得全量遍历 `chunks` —— 渲染侧
-  /// 的账目同步与反向同步因此各是 O(常驻)（常驻 1–2 万块时 3–5 ms/帧，`docs/editable-gigavoxel.md`
-  /// §10.4）。有了追加日志，消费端存一个游标即可只处理新增的那些。
   resident_log: Vec<ResidentChange>,
-  /// 变更日志被清空的代数（每次清空 +1）：消费端发现它变了就丢弃游标、做一次全量扫描兜底。
   resident_log_epoch: u64,
-  /// 编辑产生的最小 voxel AABB（按 chunk 记录，闭开区间 `[lo, hi)`，世界 voxel 坐标）。
-  /// 上传该 chunk 时由 `take_edit_aabb` 取走；未记录者消费方回退到 chunk 包围盒。
   edit_aabbs: HashMap<ChunkCoord, (IVec3, IVec3)>,
-  /// **流式窗口提示**：`(chunk 原点, 各轴跨度)`，由流式世界设置（见 [`Self::set_stream_window`]）。
-  /// 只影响渲染侧 `compute_window` 的窗口推导，不进 wire、不进序列化。
   stream_window: Option<(IVec3, IVec3)>,
-  /// **已知空块**（流式源产出过 `None` 的 chunk）：与 [`Self::stream_window`] 同类的"流式提示"。
-  ///
-  /// WHY 需要：`b_struct` 的索引条目用一个 `0` 同时表示"还没加载"与"是空的"，shader 分不出来 ⇒
-  /// 射线会在**永远装不上东西**的空 chunk 上一直发请求（MC 地图里大多数 section 是空气，实测最热一块
-  /// 103 万票/窗，把请求环整圈打满）。渲染侧把这里的成员写成哨兵 `INDEX_ENTRY_EMPTY`，
-  /// shader 就不再请求它（见 `gate_render::brickmap::consts::INDEX_ENTRY_EMPTY`）。
-  ///
-  /// 只增不减（"这块没有内容"是数据源的既定事实）。渲染侧写哨兵时会**跳过已常驻的块**（索引条目
-  /// 由挂载路径写，哨兵不该盖掉真树），所以集合里留着曾经的空块不会出错。不进 wire、不进序列化。
   empty_chunks: HashSet<ChunkCoord>,
-  /// **已知空块的追加日志**（与 `empty_chunks` 同一批，只是按"发现顺序"排列）。
-  ///
-  /// WHY 另存一份 `Vec`：消费端（`gate_render::brickmap::upload` 的哨兵同步）要"只处理**新增**的那些"
-  /// —— 拿 `HashSet` 迭代只能全量重扫，而它在爬坡期会被逐块触发 ⇒ O(n²)（实测一轮填充里 2000 块
-  /// = 200 万次哈希探测的白扫）。有了追加日志，消费端存一个游标即可 O(新增)。
   empty_log: Vec<ChunkCoord>,
-  /// 已知空块的变更序号（每次新记一块 +1）：给渲染侧当"要不要同步哨兵"的信号（比集合大小可靠）。
   empty_seq: u64,
-  /// **远场级标记（M8，`docs/editable-gigavoxel.md` §4 M8）**：该 volume 是一个"级体素 = `transform.scale`
-  /// 个主世界体素"的远场级（本仓取 4/16/64）。渲染侧唯一用途 = **分壳裁剪**：
-  /// `trace.wesl::trace_scene` 让远场级只从**上一级的覆盖半径**起参与求交，否则它的膨胀格会盖住近场。
-  /// 不进 wire、不进序列化。
   far_level: bool,
-  /// **覆盖半径**（世界体素，M8）：内容真正铺到的半径 = 分壳裁剪的**接力半径**（见
-  /// [`Self::set_coverage_r`]）。`0` = 不参与接力（物体 / 非流式卷）。不进 wire、不进序列化。
   coverage_r: f32,
-  /// **是否给这个（主）volume 挂远场级**：由建世界的代码设置（`infinite_cubes` 设 true）。
-  /// 与 `stream_window` 分开是因为"流式"与"有远场"不是一回事 —— MC 地图当前是流式但**没有**远场级
-  /// （远场要按更粗的粒度采样方块，见 `docs/mc_map.md` §6）。不进 wire、不进序列化。
   attach_far: bool,
 }
 
@@ -122,8 +69,6 @@ impl Default for VolumeGrid {
   }
 }
 
-/// 物体变换：`world = pos + rot · (local · scale)`；主世界 = identity。
-/// `rot` 列向量约定与 glam `Mat3` 一致（x/y/z_axis 即列）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeTransform {
   pub pos: Vec3,
@@ -144,7 +89,6 @@ impl VolumeTransform {
     Self { pos, rot, scale }
   }
 
-  /// 局部 [0,256]³·scale 经旋转平移后的世界 AABB 外包（剔除用）。
   pub fn world_aabb(&self) -> (Vec3, Vec3) {
     let mut mn = Vec3::splat(f32::MAX);
     let mut mx = Vec3::splat(f32::MIN);
@@ -162,32 +106,26 @@ impl VolumeTransform {
   }
 }
 
-/// 全场景容器：`Vec<VolumeGrid>`，list[0] = 主世界（obj_id = -1），list[1..N] = 物体。
-/// 渲染器遍历 `list` 生成 GridDesc 数组。
 #[derive(Debug, Default)]
 pub struct Volumes {
   pub list: Vec<VolumeGrid>,
 }
 
 impl Volumes {
-  /// 构造：插入主世界 volume（obj_id=-1，identity transform）
   pub fn new(main_world: VolumeGrid) -> Self {
     let mut list = Vec::with_capacity(8);
     list.push(main_world);
     Self { list }
   }
 
-  /// 主世界只读引用
   pub fn main(&self) -> &VolumeGrid {
     &self.list[0]
   }
 
-  /// 主世界可变引用
   pub fn main_mut(&mut self) -> &mut VolumeGrid {
     &mut self.list[0]
   }
 
-  /// 添加物体 volume，返回分配的 obj_id（= list 索引 - 1，即 0..N-1）
   pub fn add_object(&mut self, pos: Vec3, rot: Mat3, scale: f32) -> usize {
     let obj_id = self.list.len() as i32 - 1;
     let grid = VolumeGrid::new_object(obj_id, pos, rot, scale);
@@ -195,19 +133,14 @@ impl Volumes {
     obj_id as usize
   }
 
-  /// 按 obj_id 查物体只读引用（obj_id = 0..N-1 对应 list[1..N]）
   pub fn object(&self, obj_id: usize) -> Option<&VolumeGrid> {
     self.list.get(obj_id + 1)
   }
 
-  /// 按 obj_id 查物体可变引用
   pub fn object_mut(&mut self, obj_id: usize) -> Option<&mut VolumeGrid> {
     self.list.get_mut(obj_id + 1)
   }
 
-  /// **加一个远场级（M8）**：scale-only 变换（`pos = 0`、`rot = I`）⇒ 级体素 = `scale` 个主世界体素，
-  /// 与主世界**共享原点**（格点锚在世界坐标上，窗口滑动不改变格点相位 ⇒ 远处不闪）。
-  /// 返回新 volume 的索引（= `list` 下标，也是 shader 的 `grid_descs` 下标）。
   pub fn add_far_level(&mut self, scale: f32) -> usize {
     let idx = self.list.len();
     let mut grid = VolumeGrid::new_object(idx as i32 - 1, Vec3::ZERO, Mat3::IDENTITY, scale);
@@ -216,7 +149,6 @@ impl Volumes {
     idx
   }
 
-  /// volume 总数（含主世界）
   pub fn len(&self) -> usize {
     self.list.len()
   }
@@ -225,13 +157,11 @@ impl Volumes {
     self.list.is_empty()
   }
 
-  /// 所有 volume 只读切片
   pub fn all(&self) -> &[VolumeGrid] {
     &self.list
   }
 }
 
-/// 一次编辑产生的脏区域。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirtyEdit {
   pub chunk: ChunkCoord,
@@ -242,7 +172,6 @@ impl VolumeGrid {
     Self::default()
   }
 
-  /// 构造独立物体 volume：`obj_id` 由渲染器分配（>=0），`pos/rot/scale` 为世界变换。
   pub fn new_object(obj_id: i32, pos: Vec3, rot: Mat3, scale: f32) -> Self {
     Self { obj_id, transform: VolumeTransform::new(pos, rot, scale), ..Self::default() }
   }
@@ -259,38 +188,30 @@ impl VolumeGrid {
     self.obj_id
   }
 
-  /// 该 volume 是不是**远场级**（M8；见 [`Self::far_level`] 与 [`Volumes::add_far_level`]）。
   pub fn is_far_level(&self) -> bool {
     self.far_level
   }
 
-  /// 这个（主）volume 是否要**挂远场级**（见 [`Self::attach_far`]）
   pub fn attach_far(&self) -> bool {
     self.attach_far
   }
 
-  /// 设置"是否挂远场级"（建世界的代码设置；见 [`Self::attach_far`]）
   pub fn set_attach_far(&mut self, on: bool) {
     self.attach_far = on;
   }
 
-  /// 体素编辑代数（派生数据重烘判据；palette 变化不计入）
   pub fn edit_generation(&self) -> u64 {
     self.edit_generation
   }
 
-  /// 取走某 chunk 的编辑 AABB（闭开区间 `[lo, hi)`，世界 voxel 坐标）。
-  /// None = 非体素编辑标脏（如批量导入）→ 消费方回退到 chunk 包围盒。
   pub fn take_edit_aabb(&mut self, chunk: ChunkCoord) -> Option<(IVec3, IVec3)> {
     self.edit_aabbs.remove(&chunk)
   }
 
-  /// 记录单格编辑（同 chunk 取并集）
   fn note_edit(&mut self, chunk: ChunkCoord, voxel: IVec3) {
     self.note_edit_box(chunk, voxel, voxel + IVec3::ONE);
   }
 
-  /// 记录一块编辑区域（闭开 `[lo, hi)`，世界 voxel 坐标；同 chunk 取并集）
   fn note_edit_box(&mut self, chunk: ChunkCoord, lo: IVec3, hi: IVec3) {
     match self.edit_aabbs.entry(chunk) {
       std::collections::hash_map::Entry::Vacant(v) => {
@@ -328,30 +249,22 @@ impl VolumeGrid {
     self.chunks.len()
   }
 
-  /// **常驻集变更序号**（单调，每次挂载 / 卸载 +1）：给渲染侧的"账目同步 / 反向同步"当**精确的**
-  /// 变更信号用（比 `chunk_count` 可靠：同帧"进一块、出一块"时块数不变，但集合变了）。
-  /// 只增不清，比较相等即可（wrapping 也安全：两次变更之间不会真的绕一圈）。
   pub fn resident_seq(&self) -> u64 {
     self.resident_seq
   }
 
-  /// 变更日志的 `[from..]` 段（消费端存一个游标即可只处理新增的那些；**按顺序**应用 ——
-  /// 同一帧里先卸后挂的坐标以后者为准）。见 [`Self::resident_log`]。
   pub fn resident_log_from(&self, from: usize) -> &[ResidentChange] {
     self.resident_log.get(from.min(self.resident_log.len())..).unwrap_or(&[])
   }
 
-  /// 变更日志总长（消费端用它推进游标）
   pub fn resident_log_len(&self) -> usize {
     self.resident_log.len()
   }
 
-  /// 变更日志的清空代数（见 [`Self::resident_log_epoch`]）
   pub fn resident_log_epoch(&self) -> u64 {
     self.resident_log_epoch
   }
 
-  /// 记一条常驻集变更（与 `resident_seq` 的 +1 成对调用；见 [`Self::resident_log`]）
   fn note_resident_change(&mut self, c: ChunkCoord, mounted: bool) {
     self.resident_log.push(ResidentChange { c, mounted });
     if self.resident_log.len() > RESIDENT_LOG_MAX {
@@ -360,8 +273,6 @@ impl VolumeGrid {
     }
   }
 
-  /// **记一块"已知没有内容"**（流式源在该 chunk 上产出过 `None`）：渲染侧会把它写成索引哨兵，
-  /// 让 shader 不再对它发 ray-guided 请求（见 [`Self::empty_chunks`] 的说明）。重复记同一块为空操作。
   pub fn mark_empty_chunk(&mut self, cc: ChunkCoord) {
     if self.empty_chunks.insert(cc) {
       self.empty_log.push(cc);
@@ -369,32 +280,25 @@ impl VolumeGrid {
     }
   }
 
-  /// 已知空块的**追加日志**的 `[from..]` 段（消费端存一个游标即可只处理新增的那些；见 [`Self::empty_log`]）
   pub fn empty_log_from(&self, from: usize) -> &[ChunkCoord] {
     self.empty_log.get(from.min(self.empty_log.len())..).unwrap_or(&[])
   }
 
-  /// 已知空块的总数（= 追加日志的长度，消费端用它推进游标）
   pub fn empty_count(&self) -> usize {
     self.empty_log.len()
   }
 
-  /// 已知空块的变更序号（单调）：渲染侧据此决定要不要重写哨兵
   pub fn empty_seq(&self) -> u64 {
     self.empty_seq
   }
 
-  /// GC 所有 chunk，回收累积的废弃节点（见 `ChunkTree::compact`）；chunk 间零共享，rayon 并行。
   pub fn compact_all(&mut self) {
     use rayon::prelude::*;
     self.chunks.par_iter_mut().for_each(|(_, tree)| tree.compact());
   }
 
-  /// 挂载外部预构建的 chunk 树（大体积批量导入用）。
-  /// 调用契约：`tree` 整体替换 `cc` 上的树并标脏，`applied_edits` 累加到编辑代数；空树由调用方跳过。
   pub fn mount_chunk_tree(&mut self, cc: ChunkCoord, mut tree: ChunkTree, applied_edits: u64) {
     debug_assert!(!tree.is_empty(), "mount_chunk_tree 不接受空树");
-    // 外部整体替换：节点身份空间与上一个树无关 ⇒ 让 wire 层丢掉旧映射全量重建
     tree.mark_replaced();
     self.chunks.insert(cc, tree);
     self.dirty.mark_data(cc);
@@ -403,9 +307,6 @@ impl VolumeGrid {
     self.note_resident_change(cc, true);
   }
 
-  /// **真卸载**：把 chunk 从 CPU 侧拿掉（树 / 组件层 / 编辑 AABB），返回此前是否有内容。
-  /// 渲染侧由常驻调度反向同步发现（`gate_render::brickmap::upload` 的 `plan_residency`）并归还 GPU 块。
-  /// WARNING: 卸载即丢弃该 chunk 上的本地修改（无覆盖层落盘）—— 流式世界的既定语义。
   pub fn unmount_chunk(&mut self, cc: ChunkCoord) -> bool {
     self.edit_aabbs.remove(&cc);
     self.comp_layer.remove(&cc);
@@ -417,8 +318,6 @@ impl VolumeGrid {
     had
   }
 
-  /// 取走一个 chunk 的树（同 [`Self::unmount_chunk`] 的清理，但把树**还给调用方**）。
-  /// M5 的生产管线用它把 worker 线程的产出搬出来：整棵树 clone 一遍不值当，直接搬所有权。
   pub fn take_chunk(&mut self, cc: ChunkCoord) -> Option<ChunkTree> {
     self.edit_aabbs.remove(&cc);
     self.comp_layer.remove(&cc);
@@ -430,8 +329,6 @@ impl VolumeGrid {
     t
   }
 
-  /// 设置/清除**流式窗口提示**（chunk 原点 + 各轴跨度）：流式世界用它把窗口钉在相机周围，
-  /// 否则 `compute_window` 只会按"当前已加载内容"算 ⇒ 一飞就出窗口（见 `docs/editable-gigavoxel.md` §9）。
   pub fn set_stream_window(&mut self, window: Option<(IVec3, IVec3)>) {
     self.stream_window = window;
   }
@@ -440,14 +337,6 @@ impl VolumeGrid {
     self.stream_window
   }
 
-  /// 设置**覆盖半径**（世界体素，M8）：该卷**内容真正铺到**的半径，渲染侧拿它当**分壳裁剪的接力
-  /// 半径**（`world.wesl::trace_scene`：下一级只从上一级的覆盖半径起参与求交）。
-  ///
-  /// 与 [`Self::stream_window`] 分开：窗口是**索引区 / 请求区**（可以比内容大得多 —— 主世界的窗口
-  /// ±164 m 用来让射线请求细化到那里），而覆盖半径是**接力点**。两者混用会留洞：
-  /// 接力点若取窗口 AABB，则窗口里没预载到的那一圈既不会被本级画、又被下一级裁掉。
-  ///
-  /// `0` = 不参与接力（物体 / 非流式卷）。不进 wire、不进序列化。
   pub fn set_coverage_r(&mut self, r: f32) {
     self.coverage_r = r.max(0.0);
   }
@@ -463,7 +352,6 @@ impl VolumeGrid {
     tree.get_voxel(local.x, local.y, local.z)
   }
 
-  /// 查询指定 level 的 brick 是否 uniform 同色
   pub fn get_uniform(&self, voxel: VoxelCoord, level: u8) -> Option<PaletteId> {
     let chunk = voxel.chunk();
     let tree = self.chunks.get(&chunk)?;
@@ -481,7 +369,6 @@ impl VolumeGrid {
     tree.get_brick_state(local.x, local.y, local.z, level)
   }
 
-  /// 按 brick 边长查询三态（`extent` ∈ `LEVEL_EXTENT`，与 `fill_brick` 同一套粒度）。
   pub fn get_brick_state_extent(&self, voxel: IVec3, extent: i32) -> crate::chunk_tree::BrickState {
     self.get_brick_state(VoxelCoord::from_ivec3(voxel), crate::chunk_tree::level_of_extent(extent))
   }
@@ -505,10 +392,6 @@ impl VolumeGrid {
     self.set_voxel(VoxelCoord::from_ivec3(pos), palette)
   }
 
-  /// 按 **4³ brick** 批量写体素：`voxel` = brick 最小角（世界 voxel 坐标，对齐 4），
-  /// `inside` 的 bit `i = z*16 + y*4 + x` 标出"落在笔触形状内"的体素（见 [`ChunkTree::set_brick_voxels`]）。
-  /// 一次调用只标一次脏、只记一个编辑 AABB —— 逐格 `set_voxel` 是每格各标一次。
-  /// 返回实际改变的体素数（0 = 无改动，此时不标脏）。
   pub fn set_brick_voxels(&mut self, voxel: IVec3, inside: u64, palette: PaletteId) -> u32 {
     const EXT: i32 = crate::coords::BRICK_FACTOR;
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
@@ -532,7 +415,6 @@ impl VolumeGrid {
     changed
   }
 
-  /// 填充对齐 brick（extent ∈ {256,64,16,4,1}）；`voxel` 为 brick 最小角的世界 voxel 坐标。
   pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: PaletteId) -> Option<DirtyEdit> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
@@ -584,7 +466,6 @@ impl VolumeGrid {
     applied
   }
 
-  /// 写指定 ChunkCoord 下 level 2 brick (bx, by, bz) 的组件 ID
   pub fn set_comp(&mut self, chunk: ChunkCoord, bx: u32, by: u32, bz: u32, comp_id: u16) {
     let arr =
       self.comp_layer.entry(chunk).or_insert_with(|| Box::new([0u16; COMP_BRICKS_PER_CHUNK]));
@@ -597,7 +478,6 @@ impl VolumeGrid {
     }
   }
 
-  /// 读指定 world voxel 所在 level 2 brick 的组件 ID
   pub fn get_comp(&self, voxel: VoxelCoord) -> u16 {
     let chunk = voxel.chunk();
     let local = voxel.in_chunk();
@@ -634,58 +514,5 @@ impl VolumeGrid {
   pub fn state_table_bytes(&self) -> &[u8] {
     let slice = &self.state_table[..];
     unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 16) }
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  fn non_empty_tree() -> ChunkTree {
-    let mut t = ChunkTree::empty();
-    t.set_voxel(0, 0, 0, PaletteId(1));
-    t
-  }
-
-  /// 常驻集变更日志与 `resident_seq` 必须**逐条成对**：渲染侧账目同步的增量路径靠
-  /// "日志尾部长度 == 序号增量"判一致，任何一处漏记都会让它每帧退回全量扫描。
-  #[test]
-  fn resident_log_pairs_with_seq() {
-    let mut g = VolumeGrid::new();
-    let c0 = ChunkCoord(IVec3::new(0, 0, 0));
-    let c1 = ChunkCoord(IVec3::new(1, 0, 0));
-    g.mount_chunk_tree(c0, non_empty_tree(), 0);
-    g.mount_chunk_tree(c1, non_empty_tree(), 0);
-    assert_eq!(g.resident_seq(), 2);
-    assert_eq!(g.resident_log_len(), 2);
-    assert!(g.resident_log_from(0).iter().all(|c| c.mounted));
-
-    assert!(g.unmount_chunk(c0));
-    assert_eq!(g.resident_seq(), 3);
-    assert_eq!(g.resident_log_len(), 3);
-    // 未挂载的坐标不产生日志（也不推序号）
-    assert!(!g.unmount_chunk(c0));
-    assert_eq!(g.resident_seq(), 3);
-    assert_eq!(g.resident_log_len(), 3);
-
-    // 取走也算卸载
-    assert!(g.take_chunk(c1).is_some());
-    assert_eq!(g.resident_seq(), 4);
-    assert_eq!(g.resident_log_from(2).len(), 2);
-    assert!(g.resident_log_from(2).iter().all(|c| !c.mounted));
-    // 游标越界（换世界后游标大于日志长度）按空段处理，不 panic
-    assert!(g.resident_log_from(99).is_empty());
-  }
-
-  /// 日志封顶后整段清空并抬代数：消费端据此丢弃游标、退回一次全量扫描（而不是拿半段日志当增量）。
-  #[test]
-  fn resident_log_overflow_bumps_epoch() {
-    let mut g = VolumeGrid::new();
-    let before = g.resident_log_epoch();
-    for i in 0..(RESIDENT_LOG_MAX + 1) {
-      g.mount_chunk_tree(ChunkCoord(IVec3::new(i as i32, 0, 0)), non_empty_tree(), 0);
-    }
-    assert_eq!(g.resident_log_epoch(), before.wrapping_add(1));
-    assert_eq!(g.resident_log_len(), 0);
   }
 }

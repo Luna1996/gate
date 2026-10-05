@@ -1,7 +1,3 @@
-//! scroll_view：可滚动视图（overflow 裁剪 + 鼠标滚轮纵向滚动）。
-//! viewport：`Overflow::clip()` 裁剪 + 固定高度；content：绝对定位，`top = -scroll_y`；滚动量钳制在
-//! `[-(content_h - viewport_h), 0]`。仅响应悬停的 viewport；MouseWheel 是 `Message`（用 `MessageReader`）。
-
 use std::ops::Deref;
 
 use bevy::ecs::message::MessageReader;
@@ -14,23 +10,17 @@ use super::{UiCtx, color_of, px};
 use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::widgets::consts::SCROLL_SPEED;
 
-/// 滚动视图状态（挂在 viewport 节点上）
 #[derive(Component, Debug, Default)]
 pub struct ScrollView {
-  /// 当前纵向滚动偏移（0 = 顶部；负值 = 向下滚）
   pub scroll_y: f32,
 }
 
-/// viewport 节点标记
 #[derive(Component, Debug, Default)]
 pub struct ScrollViewport;
 
-/// content 节点标记（调用方在此实体上添加子节点）
 #[derive(Component, Debug, Default)]
 pub struct ScrollContent;
 
-/// 滚动视图句柄：viewport 根实体 + content 实体（调用方在 content 上添加子节点）。
-/// Deref 到 viewport 实体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScrollViewHandle {
   pub entity: Entity,
@@ -44,7 +34,6 @@ impl Deref for ScrollViewHandle {
   }
 }
 
-/// 滚动视图配置（`height`：viewport 高度，Val；Default = Val::Auto）
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollConfig {
   pub height: Val,
@@ -56,7 +45,6 @@ impl Default for ScrollConfig {
   }
 }
 
-/// 创建可滚动视图。`height`：viewport 高度（Val，可传 px/vh/percent）。
 pub fn scroll_view(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -104,8 +92,7 @@ pub fn scroll_view(
   ScrollViewHandle { entity: vp_e, content: content_e.expect("scroll content spawned") }
 }
 
-/// 滚轮滚动系统：累加本帧 MouseWheel.y，更新悬停中 viewport 的 scroll_y
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub fn scroll_view_system(
   mut scroll_reader: MessageReader<MouseWheel>,
   mut q_vp: Query<
@@ -114,7 +101,6 @@ pub fn scroll_view_system(
   >,
   mut q_content: Query<(&mut Node, &ComputedNode), With<ScrollContent>>,
 ) {
-  // 滚轮 y 正值 = 向上滚，scroll_y 增大（趋向 0）；Pixel 单位（触控板）按 16px 行高折算成行。
   let mut lines = 0.0;
   for ev in scroll_reader.read() {
     match ev.unit {
@@ -125,7 +111,7 @@ pub fn scroll_view_system(
   if lines == 0.0 {
     return;
   }
-  let delta = lines * SCROLL_SPEED; // 滚轮上 → scroll_y 增大（内容下移）
+  let delta = lines * SCROLL_SPEED;
   for (mut sv, hovered, pressed, children, vp_computed) in &mut q_vp {
     let inter = UiInteract::of(hovered, pressed);
     if !inter.is_active() {

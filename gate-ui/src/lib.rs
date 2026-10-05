@@ -1,7 +1,3 @@
-//! gate-ui：bevy_ui 之上的自研组件库基座。
-//! 三层结构：主题令牌（theme）→ widget 层（widgets）→ 交互基座（pointer）/ 输入门控（capture）；
-//! 只依赖 bevy + serde/ron。
-
 pub mod capture;
 pub mod consts;
 pub mod i18n;

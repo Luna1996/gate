@@ -1,7 +1,3 @@
-//! panel：面板容器（暗色表面令牌）。
-//! 层级靠表面色 + 1px 边框表达，无阴影；表面档由 `PanelSurface` 选定（Card/Hud/Elevated）。
-//! 定位由调用方设置（PositionType::Absolute + Percent 边距锚边），本函数只给视觉令牌与 flex 纵向布局。
-
 use std::ops::Deref;
 
 use bevy::picking::Pickable;
@@ -9,19 +5,14 @@ use bevy::prelude::*;
 
 use super::{UiCtx, color_of, px};
 
-/// 面板表面档（决定背景与边框令牌）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PanelSurface {
-  /// L1 不透明卡片（菜单/设置/模态本体）
   #[default]
   Card,
-  /// L1 HUD 卡片（浮在 3D 体素场景上的 HUD/调试 overlay）
   Hud,
-  /// L2 抬升嵌块（卡片内分区）
   Elevated,
 }
 
-/// 面板句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PanelHandle(pub Entity);
 
@@ -38,13 +29,11 @@ impl From<PanelHandle> for Entity {
   }
 }
 
-/// 面板配置（Default = Card 档）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PanelConfig {
   pub surface: PanelSurface,
 }
 
-/// 主题面板容器（flex 纵向布局；定位由调用方设置）
 pub fn panel(ctx: &UiCtx, parent: &mut ChildSpawner, config: PanelConfig) -> PanelHandle {
   let c = &ctx.theme.colors;
   let (bg, border) = match config.surface {
@@ -70,7 +59,6 @@ pub fn panel(ctx: &UiCtx, parent: &mut ChildSpawner, config: PanelConfig) -> Pan
       },
       BackgroundColor(bg),
       BorderColor::all(border),
-      // 面板表面拦下命中（旧 `FocusPolicy::Block`）：指针落在面板上即被 UI 捕获
       Pickable::default(),
     ))
     .id();

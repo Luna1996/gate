@@ -1,8 +1,3 @@
-//! GPU 帧剖析：wgpu-profiler 接入（cargo feature = "profile" 时启用）。
-//! tracy 模式要求 gate-app main 最早期已 `tracy_client::Client::start()`；
-//! device 需 wgpu timestamp 特性；非 profile 构建为零依赖空壳。
-//! 另含**呈现帧计数**（[`FramePace`]）：跨 feature 恒定存在，理由见它的说明。
-
 use bevy::prelude::*;
 use bevy::render::render_resource::{
   Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePass, ComputePassDescriptor,
@@ -14,32 +9,15 @@ use bevy::render::renderer::{RenderDevice, RenderQueue};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// **呈现侧的帧计数**（诊断用；跨 feature 恒定存在）。
-///
-/// 为什么需要它：`Time::delta` 量的是**主循环**的节奏，而本工程是 pipelined rendering ——
-/// 主循环不必等渲染线程（实测能跑出 1ms 的主循环帧），于是"主循环 FPS"会显示成
-/// 66 ↔ 792 的锯齿，而真正被提交呈现的帧是稳定的一串（profiler 的逐 pass 计数可见：
-/// 2.0s 内 122 帧 = 61fps）。
-/// 本计数在**渲染世界**每帧自增（`RenderGraphSystems::Finish`，与 profiler 收尾同集），
-/// 主世界读差值算速率 ⇒ 覆盖层显示的就是真实呈现节奏。
-/// 两个世界共享同一个 `Arc` ⇒ 不需要 `ExtractResource`（见 `GateProfilerPlugin::build`）。
 #[derive(Resource, Clone, Default)]
 pub struct FramePace {
-  /// 已提交/呈现的帧数（渲染世界每帧 +1）
   pub presented: Arc<AtomicU64>,
 }
 
-/// 渲染世界：每帧自增（`GateProfilerPlugin` 注册在 `RenderGraphSystems::Finish`）。
 fn tick_frame_pace(pace: Res<FramePace>) {
   pace.presented.fetch_add(1, Ordering::Relaxed);
 }
 
-// 渲染帧周期拆解（**唯一的"帧率限制在哪一侧"量具**）：`Begin` 记起点、`Finish` 记终点 ⇒
-//   · 「自身」= 渲染图自己花的时间（extract / prepare 在 `Begin` 之前，故不在此列）；
-//   · 「等别处」= 周期 − 自身 = 渲染世界停在调度之外的时间（等主世界 / 等 present）。
-// WHY 必须有它：GPU 逐 pass 之和 + 进程 CPU% 都正常、但帧率很烂时，只看这两项会把人引到错误的方向
-// （本仓实测过一次：`gate_gi` 已降到 1.1 ms、GPU 共 5 ms、CPU 11%，帧率却只有 9 fps ——
-// 真凶是主世界的 ray-guided 装载路径，靠这一行走查出来）。用 `debug!`：它是周期量、排查时才开。
 #[derive(Resource, Default)]
 pub(crate) struct DiagFrameGap {
   prev_end: Option<std::time::Instant>,
@@ -53,13 +31,6 @@ fn diag_gap_begin(mut st: ResMut<DiagFrameGap>) {
   st.busy0 = Some(std::time::Instant::now());
 }
 
-/// **逐系统的周期计时**（诊断）：在系统体开头建一个，出口（含提前 `return`）时自动记账，
-/// 每 60 次落一行 `debug!`。
-///
-/// WHY 需要它：`DiagFrameGap` 只把一帧切成"渲染世界自身 / 等别处"，而"等别处"里还挤着
-/// 主世界 `Update` + `ExtractSchedule`（常驻调度 / 上传 / 流式装载都在这儿）—— 它回答"是不是 CPU 卡"，
-/// 不回答"卡在哪个系统"。本仓实测过一次：`RENDER 帧周期 5.9ms：自身 0.4ms` 之后就是靠它定位到
-/// 常驻调度的整块序列化。`debug!` 级别：它是周期量，排查时才开。
 pub struct SysTimer<'a> {
   t0: std::time::Instant,
   label: &'static str,
@@ -84,17 +55,8 @@ impl Drop for SysTimer<'_> {
   }
 }
 
-/// **分段计时开关**（[`SplitDiag`]）：`false` 时全部标记在编译期消失（零成本），
-/// 打开即得到逐段 `SPLIT <系统> ms/帧` 行 —— 取证时把它置 `true` 重编译即可，不必再补代码。
-///
-/// WHY 留成常量而不是删掉：本仓的帧时排查反复需要"这个系统内部哪一段贵"（`extract` 的
-/// 序列化 / `stream_chunks` 的建表 / `plan_residency` 的需求集循环都靠它定位过）。
 pub const SPLIT_DIAG: bool = false;
 
-/// **分段计时**（`docs/editable-gigavoxel.md` 的取证手法）：把一个大系统切成几段，每 60 帧落一行明细。
-///
-/// 用法：`Local<Option<SplitDiag>>` + 入口 `start()` + 各段末尾 `mark(i)` + 出口 `frame_end(label)`。
-/// 关掉（[`SPLIT_DIAG`] = false）时 `mark` / `start` / `frame_end` 都被内联成空操作。
 pub struct SplitDiag {
   names: &'static [&'static str],
   acc: Vec<f64>,
@@ -116,7 +78,6 @@ impl SplitDiag {
     self.t0 = now;
   }
 
-  /// 系统入口调一次：把起点挪到"本系统开始"，别把**跨系统的那段间隙**算进第一段。
   pub fn start(&mut self) {
     if !SPLIT_DIAG {
       return;
@@ -163,7 +124,6 @@ fn diag_gap_end(mut st: ResMut<DiagFrameGap>) {
   }
 }
 
-/// render world 资源：包 wgpu-profiler（profile feature 关闭时为 unit 资源）。
 #[derive(Resource, Default)]
 pub(crate) struct GpuProfilerRes {
   #[cfg(feature = "profile")]
@@ -172,11 +132,9 @@ pub(crate) struct GpuProfilerRes {
   report: PassReport,
 }
 
-/// 逐 pass GPU 耗时聚合器：按 label 累计，每 [`crate::consts::REPORT_PERIOD_SECS`] 秒落一行平均耗时日志。
 #[cfg(feature = "profile")]
 #[derive(Default)]
 struct PassReport {
-  /// label → 累计秒数
   acc: std::collections::BTreeMap<String, f64>,
   frames: u32,
   last: Option<std::time::Instant>,
@@ -212,19 +170,16 @@ impl PassReport {
   }
 }
 
-/// 取 profiler 可变引用。
 #[cfg(feature = "profile")]
 pub(crate) fn profiler_mut(res: &mut GpuProfilerRes) -> Option<&mut wgpu_profiler::GpuProfiler> {
   res.profiler.as_mut()
 }
 
-/// profile 构建需要的 wgpu 设备特性（gate-app 写入 WgpuSettings.features）。
 #[cfg(feature = "profile")]
 pub fn timestamp_wgpu_features() -> bevy::render::render_resource::WgpuFeatures {
   wgpu_profiler::GpuProfiler::ALL_WGPU_TIMER_FEATURES
 }
 
-/// 在一个 compute pass 外打 GPU scope（profile 下含 pass 时间戳；pass/scope 随 block 结束自动关闭）。
 #[cfg(feature = "profile")]
 pub(crate) fn gpu_compute_pass<T>(
   res: &mut GpuProfilerRes,
@@ -243,7 +198,6 @@ pub(crate) fn gpu_compute_pass<T>(
   }
 }
 
-/// 非 profile 构建：直接 begin_compute_pass（与 profile 分支同 body 形态）。
 #[cfg(not(feature = "profile"))]
 pub(crate) fn gpu_compute_pass<T>(
   _res: &mut GpuProfilerRes,
@@ -256,12 +210,6 @@ pub(crate) fn gpu_compute_pass<T>(
   body(&mut pass)
 }
 
-/// **主世界调度耗时**（诊断）：`First` 打点、`Last` 收尾 ⇒ 得到"除渲染与 present 之外，主世界
-/// 自己花了多少"。把 `RENDER` 行的"等别处"拆成三段：主世界 / extract+prepare / present 等待。
-///
-/// WHY 需要它：`等别处` 是个大杂烩（主世界 + extract + prepare + submit + present）。本仓实测过一次
-/// 帧时 44 ms，`RENDER` 只说"自身 3.3、等别处 41"，而三个 `SysTimer`（STREAM/RESID/REQ）合计不到
-/// 2 ms —— 只看那几行会以为是 GPU 或 present，其实要先把主世界这一段量出来才谈得上归因。
 #[derive(Resource, Default)]
 pub(crate) struct DiagMainFrame {
   t0: Option<std::time::Instant>,
@@ -284,21 +232,15 @@ fn main_frame_end(mut st: ResMut<DiagMainFrame>) {
   }
 }
 
-/// 渲染剖析插件（profile feature 关闭时仅注册空资源）。
 pub(crate) struct GateProfilerPlugin;
 
 impl Plugin for GateProfilerPlugin {
   fn build(&self, app: &mut App) {
-    // 主世界调度计时（见 [`DiagMainFrame`]）：`First` / `Last` 是主世界调度的两端
     app.init_resource::<DiagMainFrame>();
     app.add_systems(bevy::prelude::First, main_frame_begin);
     app.add_systems(bevy::prelude::Last, main_frame_end);
-    // 呈现帧计数：**两个世界共享同一个 `Arc`**（主世界读、渲染世界每帧自增）。
-    // 必须在取 render_app 之前插进主世界（渲染世界那份下面一起给）。
     let pace = FramePace::default();
     app.insert_resource(pace.clone());
-    // M4 请求通道：主世界留一份（`infinite_cubes::stream_chunks` 读需求），渲染世界共享同一份
-    // （`report_lod_requests` 写）。两个世界都插入 ⇒ 关掉开关时它就是一张空表。
     let req_feed = LodRequestFeed::default();
     app.insert_resource(req_feed.clone());
     let use_feed = ChunkUseFeed::default();
@@ -310,7 +252,6 @@ impl Plugin for GateProfilerPlugin {
     render_app.insert_resource(pace);
     render_app.insert_resource(req_feed);
     render_app.insert_resource(use_feed);
-    // 渲染帧周期拆解（**"帧率限制在哪一侧"的唯一量具**，见资源注释）。
     render_app.init_resource::<DiagFrameGap>();
     render_app.add_systems(
       bevy::render::renderer::RenderGraph,
@@ -324,8 +265,6 @@ impl Plugin for GateProfilerPlugin {
       bevy::render::renderer::RenderGraph,
       tick_frame_pace.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
     );
-    // 叶级 LOD 诊断读回（M0）：只在 `trace.wesl::LOD_DIAG` 打开时注册 ⇒ 关闭时零成本、零日志。
-    // 开关从 `.wesl` 源码解析（单一来源），Rust 侧不另抄一份。
     let trace = crate::wesl_consts::trace_consts();
     if trace.lod_diag != 0 {
       render_app.add_systems(
@@ -333,7 +272,6 @@ impl Plugin for GateProfilerPlugin {
         report_lod_diag.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
     }
-    // M4 ray-guided 请求读回：同样只看 `trace.wesl::REQ_ENABLE` 这一个开关。
     if trace.req_enable != 0 {
       render_app.add_systems(
         bevy::render::renderer::RenderGraph,
@@ -356,7 +294,6 @@ impl Plugin for GateProfilerPlugin {
   }
 }
 
-/// RenderStartup：建 GpuProfiler（tracy 模式）。
 #[cfg(feature = "profile")]
 fn init_gpu_profiler(
   device: Res<RenderDevice>,
@@ -381,7 +318,6 @@ fn init_gpu_profiler(
   }
 }
 
-/// Render→Submit 之间：resolve 本帧全部 timestamp query。
 #[cfg(feature = "profile")]
 fn resolve_profiler_queries(
   mut res: ResMut<GpuProfilerRes>,
@@ -396,11 +332,9 @@ fn resolve_profiler_queries(
       label: Some("wgpu_profiler_resolve"),
     });
   profiler.resolve_queries(&mut encoder);
-  // 第二参数是 bevy 0.20 新增的 encoder label（只在 `trace` feature 下消费）
   pending.push_encoder(encoder, "wgpu_profiler_resolve");
 }
 
-/// Finish 集（submit 已完成）：结束本帧并处理已就绪帧（tracy 模式自动上报）。
 #[cfg(feature = "profile")]
 fn finish_profiler_frame(mut res: ResMut<GpuProfilerRes>, queue: Res<RenderQueue>) {
   let period = queue.get_timestamp_period();
@@ -416,16 +350,6 @@ fn finish_profiler_frame(mut res: ResMut<GpuProfilerRes>, queue: Res<RenderQueue
   }
 }
 
-/// 叶级 LOD 诊断计数器（M0）的读回：每 [`crate::consts::REPORT_PERIOD_SECS`] 秒把 `gpu.lod_diag`
-/// 拷进 staging 并**同步**读回，落一行 `DIAG[...]`（见 `docs/editable-gigavoxel.md` §9）。
-///
-/// WHY 同步阻塞（自建 encoder + `map_buffer` + `poll(wait_indefinitely)`）：与
-/// `brickmap::upload::dump_voxel_buffers` 同一取舍 —— 诊断是离散动作，跨帧状态机
-/// （arm → 下帧 map → 再下帧读）比"submit 后等结果"复杂得多，而这里每 `REPORT_PERIOD_SECS` 才付一次。
-/// 调度在 `RenderGraphSystems::Finish`（本帧已提交）⇒ 读到的是本帧的值（累积计数，差一帧无影响）。
-///
-/// 计数器是**累积**的（shader 只加不清）⇒ 用 `wrapping_sub` 求窗口差值：既不需要清零，也没有
-/// "清零写 vs GPU 写"的竞态；`u32` 回绕也由 `wrapping_sub` 自然处理（窗口内增量远小于 2³²）。
 fn report_lod_diag(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
@@ -484,10 +408,6 @@ fn report_lod_diag(
   let p = *prev.get_or_insert(cur);
   let d: [u32; WORDS] = std::array::from_fn(|i| cur[i].wrapping_sub(p[i]));
   *prev = Some(cur);
-  // 槽位含义见 `trace.wesl::DIAG_*`：0 = 采样叶入口，1 = 其中叶级 LOD 拦下的，2 = 非法早停；
-  // 3..9 = 主 pass 逐面查表的覆盖计数（`main.wesl::DIAG_FACE_*`）：精确 / 回退命中 /
-  // 回退不可用（无键或异面或异法线或异材质） / 回退槽失配 / 命中像素走内联 / 天空。
-  // 采样闸门 = 像素下标 & 63（1/64）⇒ 占比按六项和归一。
   let entries = d[0].max(1);
   let face_total = (d[3] + d[4] + d[5] + d[6] + d[7] + d[8]).max(1);
   let pct = |v: u32| v as f32 * 100.0 / face_total as f32;
@@ -511,10 +431,7 @@ fn report_lod_diag(
     d[8],
     pct(d[8]),
   );
-  // 主射线的**像素分类**（槽位 9..13）：四项互斥穷尽、和 = 采样总数 ⇒ 直接读占比。
   //
-  // 这是"该砍哪里"的判据，不是过程指标：**近场命中**的代价在 chunk 内下钻（依赖 load 链）、
-  // **天空**的代价在空区步进、**远场命中**的代价在远场遍历 —— 三者要动的代码完全不同。
   let main_total = (d[9]).max(1);
   let mpct = |v: u32| v as f32 * 100.0 / main_total as f32;
   info!(
@@ -527,18 +444,7 @@ fn report_lod_diag(
     d[12],
     mpct(d[12]),
   );
-  // GI 侧的**射线预算**（槽位 13..16，均为 1/64 采样后已乘回 64 的估计值）。
   //
-  // 判读（这是"GI 为什么贵"的唯一分水岭）：
-  //   · `候选/texel` 接近候选上限（`GI_SS_CAND_N`） ⇒ **射线太多** ⇒ 只能动画质取舍；
-  //   · 射线数正常 ⇒ **每条射线太贵** ⇒ 去看介质穿透版 `trace_chunk` vs 不透明版
-  //     `trace_chunk_opaque` 的差（那是免费的一侧）。`NEE/texel` 高则说明阴影射线是另一个大头。
-  // 槽位 17..22 = 空间复用的**分档 / 池化 / 面键越界 / 孤立 / 钳制**（`gi/screen.wesl` 的
-  // `GI_DIAG_*`）：【静止】= 命中像素内的静止占比（静止机位应 ≈100%、一动应掉向 0）、【并 tap】=
-  // 每命中像素平均并进的 tap 数、【键越界】= 面键超出 ±32768 体素、【孤立】= 试过 tap 但一个
-  // 同平面 tap 都没并进来、【钳制】= 本帧有候选被 `GI_SS_CAND_CLAMP_K` 钳住的像素占比
-  // （太大 ⇒ K 偏小、画面会偏暗；≈0 ⇒ K 偏大、重尾尖峰没压住）。四项的**分母统一用槽位 19**
-  // （命中 texel 数，不含天空）；「命中历史」也改用同一个分母（槽位 13 含天空，会把占比压低）。
   let gi_texels = (d[13]).max(1);
   let gi_hits = (d[19]).max(1);
   info!(
@@ -556,11 +462,6 @@ fn report_lod_diag(
     d[21] as f32 * 100.0 / gi_hits as f32,
     d[22] as f32 * 100.0 / gi_hits as f32,
   );
-  // 槽位 23..26 = **世界累积层（WAL）的接管比例**（`main.wesl::DIAG_GI_WAL_*` / `DIAG_WAL_FACES` /
-  // `DIAG_WAL_NSUM`；在 `dda_face_main` 里**按面**记：分母 = 本帧被逐面着色的面数）：判定用
-  // **同面邻面池化后**的权重（成熟 = 池子样本数 ≥ `GI_WAL_MATURE_N`、未熟 = 按比例渐入）。
-  // 「平均 Σn」= 池子平均样本数（正常几千 = 窗满 × 池子面数；长期几百 ⇒ 条目被区域失效反复打回
-  // 短窗）。开关打开却恒 0 ⇒ 掩码 / 表 / 绑定没接上（自检口径，见 `gi/wal.wesl`）。关掉时不打印。
   if d[23] > 0 || d[24] > 0 {
     let faces = (d[25]).max(1) as f32;
     info!(
@@ -573,107 +474,49 @@ fn report_lod_diag(
   }
 }
 
-/// 一条 **ray-guided 请求**（**合并后**的一条 = 一个 chunk）：几票 = 有多少条采样主射线要它。
-///
-/// 编码侧是 shader 的 `trace.wesl::req_push`（请求字 = 窗口相对下标 + 档位），合并与窗口下标 →
-/// 绝对坐标的还原都在 [`report_lod_requests`] 里做（只有那里拿得到 `main_window_origin`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LodRequest {
-  /// 哪个 volume（0 = 主世界，≥1 = 远场级）：**远场级的 chunk 坐标是它自己的级体素空间**，
-  /// 与主世界数值上会撞 ⇒ 卷号必须随请求一起走（M8）。
   pub vol: u8,
-  /// 请求的 chunk（**绝对** chunk 坐标，在该 volume 自己的 chunk 空间里）
   pub chunk: IVec3,
-  /// 票数：主射线里有多少条撞在"这个 chunk 不在 GPU 上"上 —— 越大的越该先补（消费端按它排）
   pub votes: u32,
-  /// 射线报回的**最少需要多细**（`trace.wesl::req_level` 的下标：0 = 全分辨率、1 = 16³、2 = 64³、
-  /// 3 = 整 chunk）。同一个 chunk 被多档请求过时取**最细**的那个。
-  ///
-  /// WHY 要带着它走：档位原本在消费端**一律按距离**给（`detail_at`），于是"射线只想要 16³ 的远处大块"
-  /// 也会按近处规则升到全分辨率 ⇒ 反复细化、几何内容反复变（GI 时域永远接不上）。论文的口径是
-  /// **refinement 由渲染结果给**，所以档位必须来自请求。
   pub level: u8,
 }
 
-/// **最近一批 ray-guided 请求**（渲染世界写、主世界读）。
-///
-/// 跨世界手法与 [`crate::brickmap::upload::UploadCpuSampleChannel`] 同一套：`ExtractResource` 只搬
-/// "变化过的资源"，而这条通道每 `REPORT_PERIOD_SECS` 换一批 ⇒ 用 `Arc<Mutex<..>>` 两个世界共享同一份。
-///
-/// 空表 = 没有需求（`trace.wesl::REQ_ENABLE` 关着，或这一窗口没人看缺块）⇒ 消费端退回纯半径启发式。
-///
-/// 表是**快照**（每 `REPORT_PERIOD_SECS` 整份替换，不是队列）⇒ 见 [`Self::peek`]。
 #[derive(Resource, Clone, Default)]
 pub struct LodRequestFeed(pub Arc<std::sync::Mutex<Vec<LodRequest>>>);
 
 impl LodRequestFeed {
-  /// **看一眼**本批请求（**不清空**）。表是快照 ⇒ 每个消费者都该看到同一份，不该有"谁先读谁拿走"。
-  ///
-  /// WHY 不用 `std::mem::take`：GPU 侧（`plan_residency`）与 CPU 侧（`stream_chunks`）**都要**这份
-  /// 需求，而两个消费者里只有一个能 take 成功 ⇒ 另一个永远读到空表（需求通道形同虚设）。
   pub fn peek(&self) -> Vec<LodRequest> {
     self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
 }
 
-/// 一条**用途戳**（论文 §III.A 的 usage stamp）：主射线最近看到过这个 chunk。
-///
-/// 与 [`LodRequest`] 的差别是结构性的：请求 = "缺了，要装"（离散、稀有），用途 = "在看着"（连续、海量）
-/// ⇒ 用途必须走**稠密表 + `atomicMax`**（`trace.wesl::req_use`），不能走环记录 —— 后者会被投票打爆。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LodUse {
-  /// 哪个 volume（0 = 主世界，≥1 = 远场级）；见 [`LodRequest::vol`]。
   pub vol: u8,
-  /// 被看到的 chunk（**绝对** chunk 坐标，在该 volume 自己的 chunk 空间里）
   pub chunk: IVec3,
-  /// 用途戳（单调计数器，只在同一块缓冲内比较先后）
   pub stamp: u32,
 }
 
-/// **最近一批用途戳**（渲染世界写、两个世界都读）。
-///
-/// 消费者：`brickmap::upload::plan_residency` 把它喂给 `Residency::note_use`（LRU 的"最近使用"），
-/// 以及主世界的 `infinite_cubes::stream_chunks`（它自己的 CPU 侧保留策略按同一个信号裁）。
-/// 空表 = 这一窗口没人看（或 `trace.wesl::REQ_ENABLE` 关着）⇒ 消费端各自退回"无信号"路径。
 #[derive(Resource, Clone, Default)]
 pub struct ChunkUseFeed(pub Arc<std::sync::Mutex<Vec<LodUse>>>);
 
 impl ChunkUseFeed {
-  /// **看一眼**本批用途戳（**不清空**）—— 理由同 [`LodRequestFeed::peek`]：GPU 侧与 CPU 侧都要它。
   pub fn peek(&self) -> Vec<LodUse> {
     self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
 }
 
-/// chunk 相对窗口下标的解包（`trace.wesl::req_push` 的位域：3 × 6 位）
 fn req_rel(key: u32) -> IVec3 {
   IVec3::new((key & 63) as i32, ((key >> 6) & 63) as i32, ((key >> 12) & 63) as i32)
 }
 
-/// **异步回读设施**（"每帧一报"的前提）：一份 staging、同一时刻最多一趟在飞，**从不等待**。
-///
-/// WHY 必须异步：本工程是 GPU 限帧（实测 5.5 ms/6.1 ms 都在 GPU）⇒ 每帧一次
-/// `poll(wait_indefinitely)` 会把 GPU 管线每帧掐停一次，帧率直接崩。流水是经典的"读上一趟、
-/// 立刻备下一趟"：
-///
-/// ```text
-/// 帧 k   ：拷 `lod_req` → staging（GPU 内部拷贝），map_async（不等待）
-/// 帧 k+1 ：poll(Poll) 问一下 —— 好了就读出来 + 解映射 + **立刻**再拷一份备下一帧；
-///          没好就跳过本帧（不阻塞），下一帧继续问
-/// ```
-///
-/// ⇒ 数据**最多落后一帧**，而旧实现（`REPORT_PERIOD_SECS = 2 s` + 同步等待）落后 **2 秒**：
-/// 模型侧实测"转视角后远景每秒只补进一两个 chunk"，主因就是这条延迟（见 `docs/mc_map.md` §8）。
 struct ReqReadback {
   staging: Buffer,
-  /// 有一趟拷贝在飞
   pending: bool,
-  /// map 回调的结果（`try_recv` 非阻塞取）
   rx:
     Option<std::sync::mpsc::Receiver<Result<(), bevy::render::render_resource::BufferAsyncError>>>,
-  /// 复用的整块解包缓冲（**不再每趟分配 8 MB**）
   words: Vec<u32>,
-  /// 提交 / 交付次数（诊断：核对"每帧一报"实际跑成了几帧一报）
   submitted: u64,
   delivered: u64,
 }
@@ -696,10 +539,9 @@ impl ReqReadback {
     }
   }
 
-  /// 上一趟到位了吗？到位就拷进 `words` 并解映射（**非阻塞**；没到位返回 `false`）。
   fn fetch(&mut self, device: &RenderDevice) -> bool {
     if !self.pending {
-      return false; // 首帧 / 上一趟刚被丢掉：没有新数据
+      return false;
     }
     let _ = device.poll(bevy::render::render_resource::PollType::Poll);
     match self.rx.as_ref().map(|rx| rx.try_recv()) {
@@ -717,7 +559,7 @@ impl ReqReadback {
             }
           }
         }
-        self.staging.unmap(); // 必须：下一次拷贝要写它
+        self.staging.unmap();
         self.pending = false;
         self.delivered += 1;
         true
@@ -729,13 +571,11 @@ impl ReqReadback {
         self.rx = None;
         false
       }
-      // 还没拷完：本帧不报，下一帧再问
       Some(Err(std::sync::mpsc::TryRecvError::Empty)) => false,
       None => false,
     }
   }
 
-  /// 提交下一趟：拷 `src` → staging + 异步映射（**不等待**）
   fn submit(&mut self, device: &RenderDevice, queue: &RenderQueue, src: &Buffer, bytes: u64) {
     let mut enc =
       device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
@@ -754,18 +594,6 @@ impl ReqReadback {
   }
 }
 
-/// **M4 ray-guided 请求的读回**（`docs/editable-gigavoxel.md` §4 M4）：**每帧**把 `gpu.lod_req`
-/// （环缓冲 + 用途戳表）**异步**拷出来（见 [`ReqReadback`]）：用途戳整批发给
-/// [`ChunkUseFeed`]（LRU 的"最近使用"），请求**合并**后发给 [`LodRequestFeed`]。
-/// `REQ[...]` 日志仍按 [`crate::consts::REPORT_PERIOD_SECS`] 的节奏落（它是验收口径的节奏，
-/// 不必变成每帧一行 —— 每帧刷的是**装载清单**，不是日志）。
-///
-/// 与 [`report_lod_diag`] 同一注册条件（`trace.wesl::REQ_ENABLE` 非 0；Rust 经
-/// [`crate::wesl_consts::trace_consts`] 读同一份源码）。
-///
-/// 与诊断计数器的差别：那是累积量（只加不清）⇒ 读差值；这里是**环缓冲** ⇒ 差值只用来算"本窗口新增
-/// 了几条"，字面值本身要解码（见 `trace.wesl::req_push`），且只解释**最近**那批（跨窗口累积超过容量
-/// 时尾部就是全部有意义的样本）。
 fn report_lod_requests(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
@@ -773,35 +601,27 @@ fn report_lod_requests(
   feed: Option<Res<LodRequestFeed>>,
   use_feed: Option<Res<ChunkUseFeed>>,
   mut prev: Local<Option<[u32; 2]>>,
-  // 合并用的稠密计数器（1 M 字 = 4 MB/卷）：只在首次分配，之后每趟**只清上一趟碰过的格子**
   mut counts: Local<Vec<u32>>,
-  // 同上尺寸的"每格最细请求档位"（与 `counts` 同一趟填）
   mut min_levels: Local<Vec<u32>>,
-  // 上一窗碰过的 key（清表 + 建 `top` 都只走这一批，不扫 4 M 格）
   mut touched: Local<Vec<u32>>,
-  // 异步回读设施（见 `ReqReadback`）：每帧一报的前提
   mut rb: Local<Option<ReqReadback>>,
-  // `REQ[...]` 日志的节奏（装载清单每帧都刷，日志不必每帧一行）
   mut log_at: Local<Option<std::time::Instant>>,
-  // 诊断：读回+合并的每帧耗时（见 `SysTimer`）
   mut diag: Local<(f64, u32)>,
 ) {
   use crate::brickmap::consts::{LOD_REQ_WORDS, REQ_BASE, REQ_CAP, USE_BASE, USE_WORDS, VOLUMES};
   let Some(gpu) = gpu else { return };
   let bytes = (LOD_REQ_WORDS * 4) as u64;
   let Some(r) = rb.as_mut() else {
-    *rb = Some(ReqReadback::new(&device, bytes)); // 首帧只建 staging
+    *rb = Some(ReqReadback::new(&device, bytes));
     return;
   };
-  // **每帧一报**（不再按 `REPORT_PERIOD_SECS` 的门）：上一趟到位就用，没到位就跳过本帧（不阻塞）。
   let fresh = r.fetch(&device);
   if !r.pending {
-    r.submit(&device, &queue, &gpu.lod_req, bytes); // 立刻备下一帧
+    r.submit(&device, &queue, &gpu.lod_req, bytes);
   }
   if !fresh {
     return;
   }
-  // 日志仍按 `REPORT_PERIOD_SECS` 落：每帧刷的是**装载清单**（消费端），日志是验收口径的节奏。
   let _t = SysTimer::new("REQ 读回+合并", &mut diag);
   let now = std::time::Instant::now();
   let log_now =
@@ -812,10 +632,6 @@ fn report_lod_requests(
   let words = &r.words;
   let (count, tick) = (words[0], words[2]);
 
-  // ---- ① 用途戳（LRU 的"最近使用"信号；**先发**，因为它与请求无关：没有缺块时它也照样有值）----
-  // 表是稠密的 ⇒ 每个 volume 扫满 `USE_WORDS` 格（262144 次顺序读，每窗一次 ≈ 0.1 ms），只挑戳落在
-  // **区间 `(上次读的戳, 本次读的戳]`** 里的 —— 陈旧条目天然落在区间外，所以表**不需要清零**。
-  // M8：表按 volume 分段（段号 = `Grid::vol`），各 volume 的窗口原点不同 ⇒ 还原绝对坐标要用各自的。
   let prev_tick = prev.map(|p| p[1]).unwrap_or(tick);
   let span = tick.wrapping_sub(prev_tick);
   let mut used: Vec<LodUse> = Vec::new();
@@ -841,17 +657,12 @@ fn report_lod_requests(
   }
 
   let new_reqs = match *prev {
-    // 首个窗口只建立基线：倒推"最近 N 条"要靠差值
     None => 0,
     Some(p) => count.wrapping_sub(p[0]),
   };
   *prev = Some([count, tick]);
-  // 环满不代表丢数据：环指针是**累计**的，`count ≥ REQ_CAP` 之后每条新请求都会覆盖一条最旧的，
-  // 而消费端本来也只读最新 `REQ_CAP` 条 ⇒ 只有"**这一窗口**的新增条数超过环容量"才真的丢。
   let lost = new_reqs.saturating_sub(REQ_CAP as u32);
   let n = (new_reqs as usize).min(REQ_CAP);
-  // 本窗口**没有任何请求**（都装好了 / 没人在看缺块）⇒ 需求表清空：消费端退回纯半径启发式。
-  // 用途戳已经在上面发过了（它与请求是两条独立的信号）。
   let set_feed = |list: Vec<LodRequest>| {
     if let Some(feed) = feed.as_ref() {
       *feed.0.lock().unwrap_or_else(|e| e.into_inner()) = list;
@@ -865,19 +676,11 @@ fn report_lod_requests(
     return;
   }
 
-  // 合并：同一 chunk 的多条请求合成一条（票数 = 有多少条**采样射线**要它）。
-  // 用**稠密计数器**（键 = `vol` 段号 × `USE_WORDS` + 窗口相对下标，18 位 ⇒ 每 volume 64³）而不是
-  // HashMap：一整屏的采样射线有几十万条事件，哈希表要 20–30 ms（每 2 s 抖一下），稠密数组是顺序写。
-  // M8：数组按 volume 分段（4 段 = 4 MB 计数 + 4 MB 档位）—— 远场级的 chunk 坐标与主世界会撞，
-  // 不按卷分段就会把两个空间的票数加到一起（消费端据此装载 ⇒ 装错地方）。
-  // 合并用的稠密计数器（`VOLUMES × 64³` 字 = 16 MB）：只在首次分配，之后**只清上一窗口碰过的格子**
-  // ——整表 `fill` 是 32 MB × 2（计 + 档位）= ~3 ms，而一窗口真正碰到的 key 只有几百~几万个。
   let cells = VOLUMES * USE_WORDS;
   let counts = &mut *counts;
   if counts.len() != cells {
     *counts = vec![0u32; cells];
   }
-  // 每格的**最细**请求档位（`min` 合并；初值 3 = 最粗 ⇒ 任何请求都会把它压低）
   let min_lv = &mut *min_levels;
   if min_lv.len() != cells {
     *min_lv = vec![3u32; cells];
@@ -887,14 +690,12 @@ fn report_lod_requests(
     min_lv[k as usize] = 3;
   }
   touched.clear();
-  // 环缓冲：最近一条在 `count - 1`（mod `REQ_CAP`）处，往前逐条退（退到 0 就绕回 cap-1）。
-  // 用增量下标而不是 `% REQ_CAP`：那是每条约 20–40 周期的整数除法，100 万条 ≈ 17 ms。
   let mut slot = (count.wrapping_sub(1) as usize) % REQ_CAP;
   for _ in 0..n {
     let w = words[REQ_BASE + slot];
     let key = ((w >> 21) & 3) as usize * USE_WORDS + (w & 0x3_FFFF) as usize;
     if counts[key] == 0 {
-      touched.push(key as u32); // 本窗口第一次碰到它（清过了 ⇒ 0 就是"还没碰过"）
+      touched.push(key as u32);
     }
     counts[key] = counts[key].saturating_add(1);
     let lv = (w >> 18) & 3;
@@ -907,18 +708,11 @@ fn report_lod_requests(
       slot -= 1;
     }
   }
-  // 只遍历**碰过的** key（不再扫 4 M 格：那是 ~11 ms 的过滤器 + collect）
   let mut top: Vec<(usize, u32)> =
     touched.iter().map(|&k| (k as usize, counts[k as usize])).filter(|(_, v)| *v > 0).collect();
   let distinct = top.len();
   top.sort_unstable_by_key(|(k, v)| (std::cmp::Reverse(*v), *k));
-  // 只把**票数最高的前 `REQ_FEED_MAX` 条 / 卷**喂给消费端（见该常量的说明）：需求表要的是"最想要
-  // 的那一批"，而带一万多条进主线程会让每帧的拷贝 + 排序变成几十 ms 的尖峰。日志里的条数仍报真实的
-  // 去重总数（`distinct`），所以"信息量够不够"照旧看得见。
   //
-  // M8：**按卷配额**，不是全局前 N —— 主世界的请求票数天然高得多（近处每条射线都在走它），
-  // 全局截断会把远场那点票直接挤没（远场只在"走廊方向"上被看到，票少）。按卷各给
-  // `REQ_FEED_MAX` ⇒ 每级都拿得到自己的装载清单。
   let mut per_vol = [0usize; VOLUMES];
   top.retain(|(k, _)| {
     let v = k / USE_WORDS;
@@ -942,9 +736,6 @@ fn report_lod_requests(
       }
     })
     .collect();
-  // `shown` 只在**真要打日志**时才构造：它是 6 个 `format!`（各一次 String 分配），而 `log_now`
-  // 每 `REPORT_PERIOD_SECS`（≈2 s）才为真一次 ⇒ 从前那 59/60 的帧都在白建 6 个 String 再丢掉。
-  // 必须排在 `set_feed(merged)` 之前（那里会把 `merged` 移走）。
   if log_now {
     let shown: Vec<String> = merged
       .iter()

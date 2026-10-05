@@ -1,6 +1,3 @@
-//! list：固定容量环形列表（新条目顶替最旧条目）。
-//! 不做滚动裁剪；子标签同步重建，用 change 检测、只在脏时重建。
-
 use std::collections::VecDeque;
 use std::ops::Deref;
 
@@ -9,7 +6,6 @@ use bevy::prelude::*;
 use super::{UiCtx, color_of, px, spawn_label_cmd};
 use crate::theme::{ThemeFont, UiTheme};
 
-/// 固定容量环形列表组件
 #[derive(Component, Clone, Debug)]
 pub struct RingList {
   capacity: usize,
@@ -21,7 +17,6 @@ impl RingList {
     Self { capacity, items: VecDeque::new() }
   }
 
-  /// 压入条目；超出容量时顶替最旧条目，返回被顶替者
   pub fn push(&mut self, text: impl Into<String>) -> Option<String> {
     self.items.push_back(text.into());
     if self.items.len() > self.capacity { self.items.pop_front() } else { None }
@@ -36,7 +31,6 @@ impl RingList {
   }
 }
 
-/// 环形列表句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ListHandle(pub Entity);
 
@@ -53,7 +47,6 @@ impl From<ListHandle> for Entity {
   }
 }
 
-/// 环形列表配置（Default = 容量 8）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListConfig {
   pub capacity: usize,
@@ -65,7 +58,6 @@ impl Default for ListConfig {
   }
 }
 
-/// 环形列表容器（纵向排列）
 pub fn list(ctx: &UiCtx, parent: &mut ChildSpawner, config: ListConfig) -> ListHandle {
   let m = &ctx.theme.metrics;
   let e = parent
@@ -78,7 +70,6 @@ pub fn list(ctx: &UiCtx, parent: &mut ChildSpawner, config: ListConfig) -> ListH
   ListHandle(e)
 }
 
-/// 脏时同步：RingList changed → 重建文本子实体（条目顺序 = 自上而下）
 pub fn ring_list_sync_system(
   mut commands: Commands,
   theme: Option<Res<UiTheme>>,

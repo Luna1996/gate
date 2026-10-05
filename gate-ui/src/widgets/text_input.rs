@@ -1,7 +1,3 @@
-//! text_input：单行文本输入框（纯文本模式 / 数字模式）。
-//! 纯文本：点击进编辑态（字符输入 / Backspace·Delete / 左右键移光标，Enter·Escape·失焦提交），编辑态由 `TextInputFocus` 广播。
-//! 数字：按住左键水平拖拽调值（`DRAG_THRESHOLD_PX` 起判），提交按 `min/max/step/decimals` 归一；真源 `TextInputValue`。
-
 use std::ops::Deref;
 
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -15,25 +11,19 @@ use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::theme::UiTheme;
 use crate::widgets::consts::{CARET_CHAR, DRAG_THRESHOLD_PX, NUMBER_DRAG_PX_PER_STEP};
 
-/// 输入框根标记
 #[derive(Component, Debug, Default)]
 pub struct TextInputRoot;
 
-/// 输入框显示文本子实体标记
 #[derive(Component, Debug, Default)]
 pub struct TextInputText;
 
-/// 输入模式（挂在输入框根实体上）
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub enum TextInputKind {
-  /// 纯文本（任意可见字符）
   Text,
-  /// 数字（支持左键拖拽调值；提交时按 min/max/step 归一）
   Number { min: f32, max: f32, step: f32, decimals: usize },
 }
 
 impl TextInputKind {
-  /// 数值归一：clamp + 按 step 吸附（step <= 0 视为连续）
   pub fn normalize(&self, v: f32) -> f32 {
     let Self::Number { min, max, step, .. } = *self else {
       return v;
@@ -43,7 +33,6 @@ impl TextInputKind {
     snapped.clamp(min, max)
   }
 
-  /// 数值 → 显示文本
   pub fn format(&self, v: f32) -> String {
     match *self {
       Self::Text => String::new(),
@@ -51,7 +40,6 @@ impl TextInputKind {
     }
   }
 
-  /// 数值模式的初值（文本解析失败时的回退）
   pub fn min(&self) -> f32 {
     match *self {
       Self::Text => 0.0,
@@ -59,7 +47,6 @@ impl TextInputKind {
     }
   }
 
-  /// 文本 → 数值（数字模式；解析失败 → None）
   pub fn parse(&self, s: &str) -> Option<f32> {
     match *self {
       Self::Text => None,
@@ -68,7 +55,6 @@ impl TextInputKind {
   }
 }
 
-/// 输入框句柄（Deref 到根实体 Entity）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextInputHandle(pub Entity);
 
@@ -85,7 +71,6 @@ impl From<TextInputHandle> for Entity {
   }
 }
 
-/// 输入框配置（全部字段进 Config；Default = 空文本 + 纯文本模式、不禁用）
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextInputConfig {
   pub text: String,
@@ -99,40 +84,28 @@ impl Default for TextInputConfig {
   }
 }
 
-/// 输入值（真源；显示态可能会叠加光标字符）
 #[derive(Component, Clone, Debug, PartialEq, Eq, Default)]
 pub struct TextInputValue(pub String);
 
-/// 输入框交互/编辑状态
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct TextInputState {
-  /// 编辑态（键盘输入落到本框）
   pub editing: bool,
-  /// 光标位置（字符下标，0..=len）
   pub caret: usize,
-  /// 本次按下是否起始于本框
   armed: bool,
-  /// 是否已进入数字拖拽
   dragging: bool,
-  /// 拖拽累计位移（逻辑 px）
   accum: f32,
-  /// 拖拽起始值
   start_value: f32,
 }
 
-/// 输入值变化事件（提交或拖拽调值；EntityEvent，target = 输入框根实体）
 #[derive(EntityEvent, Clone, Debug, PartialEq)]
 pub struct TextInputChanged {
   pub entity: Entity,
-  /// 归一后的值文本（数字模式已 clamp/step；纯文本模式为原文）
   pub text: String,
 }
 
-/// 当前处于编辑态的输入框（None = 无）；3D 场景键盘输入须检查本资源。
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextInputFocus(pub Option<Entity>);
 
-/// 主题输入框（宽度由父容器决定；最小宽度 56px）
 pub fn text_input(
   ctx: &UiCtx,
   parent: &mut ChildSpawner,
@@ -154,7 +127,6 @@ pub fn text_input(
     config.kind,
     Node {
       min_width: px(56.0),
-      // 与行内其它控件同高（滑杆/切换组 = 24）：文字高 + 上下内距 + 上下边框
       height: px(m.font_size.md + m.spacing.sm + m.border_width * 2.0),
       padding: UiRect::horizontal(px(m.spacing.xs)),
       border: UiRect::all(px(m.border_width)),
@@ -164,7 +136,6 @@ pub fn text_input(
     },
     BackgroundColor(bg),
     BorderColor::all(border),
-    // 输入框吞掉鼠标事件（拖拽调值 / 点击聚焦都不外泄到 3D 场景）
     crate::capture::MouseIntercept,
   ));
   if config.disabled {
@@ -187,7 +158,6 @@ pub fn text_input(
   TextInputHandle(ec.id())
 }
 
-/// (背景, 边框, 文字) 配色：编辑态 → 强调边框；hover → 强边框；否则普通边框
 fn input_colors(theme: &UiTheme, editing: bool, inter: UiInteract) -> (Color, Color, Color) {
   let c = &theme.colors;
   let bg = color_of(&c.surface_elevated);
@@ -201,8 +171,7 @@ fn input_colors(theme: &UiTheme, editing: bool, inter: UiInteract) -> (Color, Co
   (bg, border, color_of(&c.text_primary))
 }
 
-/// 指针交互：点击聚焦（失焦提交）、数字模式拖拽调值
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub fn text_input_pointer_system(
   mut commands: Commands,
   mouse: Res<ButtonInput<MouseButton>>,
@@ -229,7 +198,6 @@ pub fn text_input_pointer_system(
     if disabled {
       continue;
     }
-    // 落在别的控件上的按下 → 提交并退出编辑态
     if pressed && inter == UiInteract::None && st.editing {
       st.editing = false;
       if focus.0 == Some(e) {
@@ -275,7 +243,6 @@ pub fn text_input_pointer_system(
         st.dragging = false;
         commands.trigger(TextInputChanged { entity: e, text: value.0.clone() });
       } else {
-        // 单击：进入编辑态并把光标放到末尾
         st.editing = true;
         st.caret = value.0.chars().count();
         focus.0 = Some(e);
@@ -285,7 +252,6 @@ pub fn text_input_pointer_system(
   }
 }
 
-/// 键盘编辑：字符输入 / 删除 / 移光标 / 提交（Enter、Escape、Tab）
 pub fn text_input_keyboard_system(
   mut commands: Commands,
   mut focus: ResMut<TextInputFocus>,
@@ -346,7 +312,6 @@ pub fn text_input_keyboard_system(
   if commit {
     st.editing = false;
     focus.0 = None;
-    // 数字模式提交时归一（非法输入回退到当前文本）
     if let Some(v) = kind.parse(&value.0) {
       value.0 = kind.format(v);
     }
@@ -354,8 +319,7 @@ pub fn text_input_keyboard_system(
   }
 }
 
-/// 视觉：显示文本（编辑态叠加光标）+ 边框/文字配色
-#[allow(clippy::type_complexity)] // Bevy system：多组件查询签名固有
+#[allow(clippy::type_complexity)]
 pub fn text_input_visual_system(
   theme: Option<Res<UiTheme>>,
   mut q: Query<(
@@ -387,7 +351,6 @@ pub fn text_input_visual_system(
     if *border != target_border {
       *border = target_border;
     }
-    // 编辑态显示光标（不写进真源值）；数字模式拖拽中显示归一后的文本
     let shown = if st.editing {
       let mut s: Vec<char> = value.0.chars().collect();
       let at = st.caret.min(s.len());

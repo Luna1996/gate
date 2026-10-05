@@ -1,7 +1,3 @@
-//! 脏标记与每帧上传预算队列。
-//! 数据脏（`data_dirty`，触发 Brick Tree 重建上传）与元件脏（`comp_dirty`，只传 StateTable）分离。
-//! 队列 FIFO + 去重，按帧预算 drain。
-
 use std::collections::{HashSet, VecDeque};
 
 use crate::coords::ChunkCoord;

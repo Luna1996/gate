@@ -1,7 +1,3 @@
-//! world_anchor：世界空间 UI 投影锚定。
-//! 每帧把锚点世界坐标经 view_proj 投影为屏幕像素，写入 UI 节点绝对定位（left/top）；越界 / 相机背后 → `Visibility::Hidden`。
-//! 可选距离缩放作用于本实体 TextFont；投影矩阵经 `AnchorCamera` 由 app 侧同步（gate-ui 不依赖 gate-render）。
-
 use crate::theme::ThemeFont;
 use bevy::asset::{AssetServer, LoadState};
 use bevy::log::debug;
@@ -9,7 +5,6 @@ use bevy::prelude::*;
 use bevy::text::{FontSize, FontSource, TextColor};
 use bevy::ui::widget::Label;
 
-/// 投影相机镜像（app 侧每帧同步；Identity = 未同步，锚点将投影到无效位置）
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct AnchorCamera {
   pub view_proj: Mat4,
@@ -22,25 +17,17 @@ impl Default for AnchorCamera {
   }
 }
 
-/// 世界空间锚点（挂任意 UI 节点；距离缩放作用于本实体 TextFont）
 #[derive(Component, Clone, Copy, Debug)]
 pub struct WorldAnchor {
-  /// 锚点世界坐标（voxel 单位，与渲染世界一致）
   pub pos_voxel: Vec3,
-  /// 手动开关（投影系统之外的总闸）
   pub visible: bool,
-  /// 近大远小（按 reference_distance / 距离 缩放 font_size）
   pub scale_with_distance: bool,
-  /// 距离缩放基准：相机距锚点 = 该值时缩放系数 = 1.0
   pub reference_distance: f32,
 }
 
-/// 首次应用缩放时记录的基准字号（后续 = base × scale）
 #[derive(Component, Debug)]
 pub struct AnchorBaseFont(FontSize);
 
-/// `world_anchor_label()` 生成的待应用文本（文本 + 颜色）。
-/// Text/TextFont 延迟到主题字体就绪后由 `world_anchor_apply_text` 补插，避免 CJK 方框。
 #[derive(Component, Clone, Debug)]
 pub struct PendingAnchorText {
   pub text: String,
@@ -48,8 +35,6 @@ pub struct PendingAnchorText {
   pub font_size: FontSize,
 }
 
-/// 世界坐标 → 屏幕像素（左上原点，y 向下）。
-/// 返回 None = 视锥外（NDC 越界）或在相机背后（w ≤ 0）。
 pub fn project_to_screen(view_proj: Mat4, pos: Vec3, screen: Vec2) -> Option<Vec2> {
   let clip = view_proj * pos.extend(1.0);
   if clip.w <= 1e-6 {
@@ -62,7 +47,6 @@ pub fn project_to_screen(view_proj: Mat4, pos: Vec3, screen: Vec2) -> Option<Vec
   Some(Vec2::new((ndc.x * 0.5 + 0.5) * screen.x, (1.0 - (ndc.y * 0.5 + 0.5)) * screen.y))
 }
 
-/// 距离缩放系数：reference_distance 处 = 1.0，近大远小，钳制 [0.25, 4.0]
 pub fn anchor_distance_scale(distance: f32, reference_distance: f32) -> f32 {
   if distance <= 1e-6 {
     return 4.0;
@@ -70,7 +54,6 @@ pub fn anchor_distance_scale(distance: f32, reference_distance: f32) -> f32 {
   (reference_distance / distance).clamp(0.25, 4.0)
 }
 
-/// 投影锚定查询集（type alias 满足 clippy::type_complexity）
 type AnchorQuery = (
   Entity,
   &'static WorldAnchor,
@@ -80,7 +63,6 @@ type AnchorQuery = (
   Option<&'static AnchorBaseFont>,
 );
 
-/// 投影锚定（每帧重算；gate-app 从 DdaCameraConfig 同步 AnchorCamera）
 pub fn world_anchor_system(
   windows: Query<&Window>,
   cam: Option<Res<AnchorCamera>>,
@@ -115,7 +97,6 @@ pub fn world_anchor_system(
       *vis = vis_of(show);
     }
 
-    // 可选距离缩放：无 TextFont 的节点跳过
     if anchor.scale_with_distance
       && let Some(mut tf) = tf
     {
@@ -142,8 +123,6 @@ fn vis_of(v: bool) -> Visibility {
   if v { Visibility::Inherited } else { Visibility::Hidden }
 }
 
-/// 快捷 spawn：世界空间文本标注（绝对定位由系统每帧写入）。
-/// 不立即插入 Text/TextFont，而是写入 `PendingAnchorText`，由 `world_anchor_apply_text` 字体就绪后补插。
 pub fn world_anchor_label(
   commands: &mut Commands,
   text: &str,
@@ -161,14 +140,11 @@ pub fn world_anchor_label(
         reference_distance: 760.0,
       },
       Node::default(),
-      // 文本延迟到字体就绪后插入（见 world_anchor_apply_text）
       PendingAnchorText { text: text.to_string(), color, font_size: FontSize::Px(14.0) },
     ))
     .id()
 }
 
-/// 将 `PendingAnchorText` 转换为 `Text + TextFont + TextColor` 组件。
-/// ThemeFont 已 Loaded → 用主题字体 Handle；不存在 / `font_path = None` → `FontSource::default()`；未就绪下一帧重试。
 pub fn world_anchor_apply_text(
   mut commands: Commands,
   server: Option<Res<AssetServer>>,
