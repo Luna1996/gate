@@ -226,7 +226,9 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
     b_err = mix(hi, 1.0, fill);
   }
     let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
-  let base = f32(cand_n0) * b_err / f32(share);
+  let gi_div2 = max(u32(gi_u.flags.y), 1u);
+  let res_k = f32(gi_div2 * gi_div2) * (1.0 / 16.0);
+  let base = f32(cand_n0) * b_err / f32(share) * res_k;
   let rate = base * w_adapt;
   let cand_base = max(1u, u32(floor(base + dither)));
   var cand_n = max(1u, u32(floor(rate + dither)));

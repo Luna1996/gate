@@ -8,6 +8,10 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .trae/hooks/reindex.ps1",
             "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .trae/hooks/adhd-always-on.ps1"
           }
         ]
       }
