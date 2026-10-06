@@ -273,9 +273,9 @@ fn rotate(src: &[PaletteId; CELLS], r: Rot) -> [PaletteId; CELLS] {
     out
   };
   let t = match r.x {
-    90 => step(src, |x, y, z| (x, 15 - z, y)),
+    90 => step(src, |x, y, z| (x, z, 15 - y)),
     180 => step(src, |x, y, z| (x, 15 - y, 15 - z)),
-    270 => step(src, |x, y, z| (x, z, 15 - y)),
+    270 => step(src, |x, y, z| (x, 15 - z, y)),
     _ => *src,
   };
   match r.y {
