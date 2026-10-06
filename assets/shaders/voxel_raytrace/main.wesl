@@ -100,21 +100,26 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
       
       let f0 = dielectric_f0(ior, 1.0);
       let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, nn), 0.0, 1.0), 5.0);
-      if (fres > GLASS_REFL_MIN) {
+      let r_tier = light_u.g.refl_tier;
+      if (r_tier > 0u && fres > GLASS_REFL_MIN) {
         
         let rdir = reflect(-v, nn);
         let r_org = p_hit + nn * GLASS_EPS;
         let rhit = world_raycast(make_grid(0u), r_org, rdir,
                                  max_t, world_cfg_full(0.0, 3u));
-        var rc = sky_rgb();
+        var rc = select(sky_rgb(), sky_primary(rdir, sun_dir, sun_c), r_tier >= 2u);
         if (rhit.hit) {
           let rgg = make_grid(u32(rhit.obj_id) + 1u);
           let rn = voxel_normal(rgg, rhit.voxel, rhit.face_id, rhit.n);
           let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
-          
-          
+          var r_vis = vec3<f32>(1.0);
+          if (r_tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
+            r_vis = sun_transmittance(
+              voxel_center_world(rgg, rhit.voxel) + rn * surface_offset(rgg, rn, SHADOW_SURFACE_EPS),
+              sun_dir, rhit.voxel, rhit.obj_id);
+          }
           rc = brdf_reflected(mr, rn, face_view_dir(r_org, voxel_center_world(rgg, rhit.voxel)),
-                              SurfaceLight(sun_dir, sun_c, 1.0, sky * GLASS_REFL_AMBIENT, vec3<f32>(0.0)))
+                              SurfaceLight(sun_dir, sun_c * r_vis, 1.0, sky * GLASS_REFL_AMBIENT, vec3<f32>(0.0)))
             + emissive_radiance(mr, GI_EMIT_GAIN);
         }
         refl = refl + tint * fres * rc;
@@ -125,11 +130,12 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
       in_medium = true;
     } else {
       let eta = ior;
-      let k = 1.0 - eta * eta * (1.0 - ci * ci);
+      let ci_out = clamp(dot(dir, nn), 0.0, 1.0);
+      let k = 1.0 - eta * eta * (1.0 - ci_out * ci_out);
       if (k < 0.0) {
         dir = reflect(dir, nn);
       } else {
-        dir = normalize(eta * dir + (eta * ci - sqrt(k)) * nn);
+        dir = normalize(eta * dir - (eta * ci_out - sqrt(k)) * nn);
         in_medium = false;
       }
     }
