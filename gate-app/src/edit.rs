@@ -106,21 +106,35 @@ pub fn metal_toggle_to_metallic(on: bool) -> u8 {
   if on { 255 } else { 0 }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum EditTarget {
+  #[default]
+  World,
+  Object,
+}
+
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct EditSettings {
   pub shape: BrushShape,
   pub size: u32,
   pub offset: f32,
   pub mat: BrushMaterial,
+  pub target: EditTarget,
 }
 
 impl Default for EditSettings {
   fn default() -> Self {
-    Self { shape: BrushShape::Sphere, size: 3, offset: 1.5, mat: BrushMaterial::default() }
+    Self {
+      shape: BrushShape::Sphere,
+      size: 3,
+      offset: 1.5,
+      mat: BrushMaterial::default(),
+      target: EditTarget::Object,
+    }
   }
 }
 
-fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
+pub(crate) fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   let want = pack_palette_entry(&mat.entry());
   let mut existing = None;
   let mut free = None;
@@ -573,6 +587,7 @@ impl StrokeLog {
 
 pub(crate) struct ActiveStroke {
   brush: PlainBrush,
+  target: i32,
   size: u32,
   off: i32,
   fresh: bool,
@@ -632,16 +647,22 @@ pub(crate) fn voxel_edit_input(
   mut hold: Local<HoldRepeat>,
 ) {
   let Some(mut scene) = scene else { return };
-  if *mode != CameraMode::Fly || scene.demo_force_full_rebuild {
+  if *mode != CameraMode::Fly
+    || scene.demo_force_full_rebuild
+    || settings.target != EditTarget::World
+  {
     *active = None;
+    scene.edit_in_flight = false;
     return;
   }
   scene.edit_in_flight = active.is_some();
   if active.is_some() {
-    let done = {
-      let st = active.as_mut().expect("is_some 已判定");
-      st.brush.step(scene.volumes.main_mut(), brush_budget())
+    let target = active.as_ref().map_or(-1, |st| st.target);
+    let Some(grid) = scene.volumes.volume_mut(target) else {
+      *active = None;
+      return;
     };
+    let done = active.as_mut().expect("is_some 已判定").brush.step(grid, brush_budget());
     if !done {
       return;
     }
@@ -678,26 +699,38 @@ pub(crate) fn voxel_edit_input(
   let Some(hit) = raycast(&scene.volumes, origin, dir, EDIT_REACH) else {
     return;
   };
-  if hit.obj_id != -1 {
-    return;
-  }
-  let (hit, face) = (hit.voxel, hit.face);
+  let target = hit.obj_id;
+  let (voxel, face) = (hit.voxel, hit.face);
   let off = settings.offset.max(0.0).round() as i32;
-  let pal =
-    if erase { PaletteId::AIR } else { material_slot(scene.volumes.main_mut(), settings.mat) };
-  let center = if erase { hit - face * off } else { hit + face * off };
+  let pal = if erase {
+    PaletteId::AIR
+  } else {
+    let Some(grid) = scene.volumes.volume_mut(target) else {
+      return;
+    };
+    material_slot(grid, settings.mat)
+  };
+  let center = if erase { voxel - face * off } else { voxel + face * off };
   let material = if erase { "-".to_string() } else { settings.mat.summary() };
-  let entry = *scene.volumes.main().palette().get(pal);
+  let entry = scene
+    .volumes
+    .volume(target)
+    .map_or_else(PaletteEntry::default, |g| *g.palette().get(pal));
   let (displaced, reason) =
     brush_displaced(entry, size, pbr_set.as_deref(), Some(&mut displace_cache));
-    let hidden = !displaced && stroke_hidden(scene.volumes.main(), shape, center, brush_radius(size));
+  let hidden = scene
+    .volumes
+    .volume(target)
+    .is_some_and(|g| !displaced && stroke_hidden(g, shape, center, brush_radius(size)));
   let no_backlog = scene
     .volumes
     .list
     .iter()
     .all(|g| g.dirty.data_dirty_count() == 0 && g.dirty.comp_dirty_count() == 0);
   scene.interior_only_edit = hidden && no_backlog;
-  let grid = scene.volumes.main_mut();
+  let Some(grid) = scene.volumes.volume_mut(target) else {
+    return;
+  };
   if displaced {
     let t0 = Instant::now();
     let run =
@@ -722,6 +755,7 @@ pub(crate) fn voxel_edit_input(
   }
   let mut st = ActiveStroke {
     brush: PlainBrush::new(center, shape, size, pal),
+    target,
     size,
     off,
     fresh,

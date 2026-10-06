@@ -6,6 +6,7 @@ mod edit;
 mod height_field;
 mod infinite_cubes;
 mod mc;
+mod objects;
 mod scene;
 mod showcase;
 #[cfg(feature = "profile")]
@@ -107,6 +108,7 @@ fn main() {
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
     .init_resource::<edit::EditSettings>()
+    .init_resource::<objects::ObjectSettings>()
     .init_resource::<MouseLock>()
     .init_resource::<height_field::MaterialDisplaceCache>()
     .init_resource::<infinite_cubes::Streaming>()
@@ -137,11 +139,13 @@ fn main() {
           left_click_pick_recenter,
           build_camera_config,
           voxel_edit_input,
+          objects::object_input,
         )
           .chain(),
         sync_crosshair,
         debug_ui_setup,
         (fps_overlay_tick, camera_info_tick, lod_state_tick),
+        objects::sync_objects_menu,
         sync_sky_menu,
         sync_edit_menu,
         sync_video_menu,

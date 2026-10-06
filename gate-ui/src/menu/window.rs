@@ -3,10 +3,12 @@ use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::ui::{Checked, Pressed};
 use bevy::window::PrimaryWindow;
+use std::collections::BTreeMap;
 
 use super::consts::*;
 use super::items::{
-  MenuColorSwatch, MenuItem, MenuPressPrev, MenuRole, MenuSliderValue, spawn_item,
+  MenuColorSwatch, MenuItem, MenuPressPrev, MenuRole, MenuSliderValue, section_header, spawn_item,
+  tab_bar_row,
 };
 use super::model::{MenuFile, MenuNode};
 use crate::capture::MouseIntercept;
@@ -25,10 +27,12 @@ pub struct MenuDrag(pub Option<Vec2>);
 pub struct DebugMenu {
   pub model: MenuFile,
   pub path: Vec<String>,
+  pub tabs: BTreeMap<String, usize>,
   pub collapsed: bool,
   dragging: bool,
   go: Option<Vec<String>>,
   back: bool,
+  rebuild: bool,
   reset_pos: bool,
   toggle_collapse: bool,
 }
@@ -210,16 +214,18 @@ pub fn spawn_debug_menu(world: &mut World, ctx: &UiCtx, model: MenuFile) -> Debu
     .id();
   world.entity_mut(root).add_child(viewport);
 
-  let page = build_page(world, ctx, viewport, &model, &path);
+  let page = build_page(world, ctx, viewport, &model, &path, &BTreeMap::new());
 
   world.entity_mut(root).insert((
     DebugMenu {
       model,
       path,
+      tabs: BTreeMap::new(),
       collapsed,
       dragging: false,
       go: None,
       back: false,
+      rebuild: false,
       reset_pos: false,
       toggle_collapse: false,
     },
@@ -276,6 +282,7 @@ fn build_page(
   viewport: Entity,
   model: &MenuFile,
   path: &[String],
+  tabs: &BTreeMap<String, usize>,
 ) -> Entity {
   let c = &ctx.theme.colors;
   let m = &ctx.theme.metrics;
@@ -303,15 +310,75 @@ fn build_page(
       },
     ))
     .id();
-  let path_str = path.join("/");
-  let items: Vec<MenuNode> = model.children_of(path).to_vec();
   world.entity_mut(page).with_children(|p| {
-    for node in items.iter() {
-      spawn_item(ctx, p, node, &path_str);
+    if path.is_empty() {
+      spawn_pins(ctx, p, model);
     }
+    spawn_page_body(ctx, p, model, path, tabs);
   });
   world.entity_mut(viewport).add_child(page);
   page
+}
+
+fn spawn_pins(ctx: &UiCtx, p: &mut ChildSpawner, model: &MenuFile) {
+  let mut started = false;
+  for pin in &model.window.pins {
+    let segs = split_path(pin);
+    let Some(node) = model.node(&segs) else { continue };
+    if !started {
+      section_header(ctx, p, PINNED_LABEL);
+      started = true;
+    }
+    let parent = segs[..segs.len() - 1].join("/");
+    spawn_item(ctx, p, node, &parent);
+  }
+}
+
+fn spawn_page_body(
+  ctx: &UiCtx,
+  p: &mut ChildSpawner,
+  model: &MenuFile,
+  path: &[String],
+  tabs: &BTreeMap<String, usize>,
+) {
+  if model.node(path).is_some_and(MenuNode::tabs) {
+    spawn_tab_section(ctx, p, model, path, tabs);
+    return;
+  }
+  let parent = path.join("/");
+  for node in model.children_of(path) {
+    spawn_item(ctx, p, node, &parent);
+  }
+}
+
+fn spawn_tab_section(
+  ctx: &UiCtx,
+  p: &mut ChildSpawner,
+  model: &MenuFile,
+  path: &[String],
+  tabs: &BTreeMap<String, usize>,
+) {
+  let Some(node) = model.node(path) else { return };
+  let children = node.children();
+  if children.is_empty() {
+    return;
+  }
+  let key = path.join("/");
+  let selected = tabs.get(&key).copied().unwrap_or(0).min(children.len() - 1);
+  let entries: Vec<(&str, bool)> =
+    children.iter().enumerate().map(|(i, n)| (n.label(), i == selected)).collect();
+  tab_bar_row(ctx, p, &key, &entries);
+  let child = &children[selected];
+  let mut child_path = path.to_vec();
+  child_path.push(child.id().to_string());
+  if child.tabs() {
+    spawn_tab_section(ctx, p, model, &child_path, tabs);
+    return;
+  }
+  let parent = child_path.join("/");
+  for grand in child.children() {
+    spawn_item(ctx, p, grand, &parent);
+  }
 }
 
 fn clip_nodes<'a>(model: &'a MenuFile, path: &'a [String]) -> Vec<&'a MenuNode> {
@@ -480,6 +547,10 @@ pub fn menu_system(world: &mut World) {
           events.push(ev(root, &path, MenuAction::Select(i)));
         }
       }
+      MenuRole::Tab(i) if menu.tabs.get(&path).copied() != Some(i) => {
+        menu.tabs.insert(path.clone(), i);
+        menu.rebuild = true;
+      }
       _ => {}
     }
   }
@@ -538,18 +609,21 @@ pub fn menu_system(world: &mut World) {
       menu.go = Some(p);
     }
   }
+  let rebuild = std::mem::take(&mut menu.rebuild);
 
   for e in events {
     world.trigger(e);
   }
 
-  let nav = {
+  let (nav, cur) = {
     let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
-    menu.go.clone()
+    (menu.go.clone(), menu.path.clone())
   };
   if let Some(target) = nav {
     let target = clip_path_segments(world, root, &target);
     start_navigation(world, root, parts.viewport, &target);
+  } else if rebuild {
+    rebuild_current_page(world, root, parts.viewport, &cur);
   }
 
   advance_pager(world, root, parts.viewport);
@@ -609,8 +683,11 @@ fn start_navigation(world: &mut World, root: Entity, viewport: Entity, target: &
   let Some((theme, font, icon, translate)) = ctx_from_world(world) else { return };
   let ctx =
     UiCtx::new(&theme, font.as_ref()).with_icon_font(icon.as_ref()).with_translate(translate);
-  let model = world.get::<DebugMenu>(root).expect("DebugMenu 存在").model.clone();
-  let new_page = build_page(world, &ctx, viewport, &model, target);
+  let (model, tabs) = {
+    let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
+    (menu.model.clone(), menu.tabs.clone())
+  };
+  let new_page = build_page(world, &ctx, viewport, &model, target, &tabs);
   let (old_page, stale, from_left) = {
     let p = world.get::<MenuPager>(root).expect("MenuPager 存在");
     let old_page = p.current;
@@ -650,6 +727,27 @@ fn start_navigation(world: &mut World, root: Entity, viewport: Entity, target: &
     p.dir = dir;
     p.start_off = from_left;
     p.t = 0.0;
+  }
+}
+
+fn rebuild_current_page(world: &mut World, root: Entity, viewport: Entity, path: &[String]) {
+  let Some((theme, font, icon, translate)) = ctx_from_world(world) else { return };
+  let ctx =
+    UiCtx::new(&theme, font.as_ref()).with_icon_font(icon.as_ref()).with_translate(translate);
+  let (model, tabs, old) = {
+    let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
+    (menu.model.clone(), menu.tabs.clone(), world.get::<MenuPager>(root).map(|p| p.current))
+  };
+  if let Some(e) = old
+    && world.get_entity(e).is_ok()
+  {
+    world.despawn(e);
+  }
+  let page = build_page(world, &ctx, viewport, &model, path, &tabs);
+  if let Some(mut p) = world.get_mut::<MenuPager>(root) {
+    p.current = page;
+    p.outgoing = None;
+    p.t = 1.0;
   }
 }
 
@@ -857,10 +955,14 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
       MenuRole::SubMenu => {
         (if hovered { surface_elevated } else { Color::NONE }, Color::NONE, text_body, 0)
       }
-      MenuRole::SwitchOption(i) => {
+      MenuRole::SwitchOption(i) | MenuRole::Tab(i) => {
         let selected = {
           let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
-          matches!(menu.model.node(&split_path(&path)), Some(MenuNode::SwitchGroup { selected, .. }) if *selected == i)
+          if matches!(role, MenuRole::Tab(_)) {
+            menu.tabs.get(&path).copied().unwrap_or(0) == i
+          } else {
+            matches!(menu.model.node(&split_path(&path)), Some(MenuNode::SwitchGroup { selected, .. }) if *selected == i)
+          }
         };
         if selected {
           (accent_fill, accent_text, text_primary, 2)
@@ -897,7 +999,7 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
         *b = target;
       }
     }
-    if let MenuRole::SwitchOption(i) | MenuRole::Button(i) = role
+    if let MenuRole::SwitchOption(i) | MenuRole::Tab(i) | MenuRole::Button(i) = role
       && let Some(group) = world.get::<ChildOf>(e).map(ChildOf::parent)
     {
       shared_edges.push((group, i, e, prio, border));

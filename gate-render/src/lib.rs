@@ -19,6 +19,7 @@ pub use brickmap::{
   EyeAdaptSettings, GpuBrickMap, GridDesc, OrbitCamera, RayHit, UploadBudget, UploadCpuSample,
   UploadCpuSampleChannel, UploadSnapshot, VolumesBuilder, VolumesSnapshot, VoxelDumpRequest,
   VoxelScene, create_dda_image, pool_capacity_chunks, pool_capacity_chunks_far, raycast,
+  raycast_objects,
 };
 pub use brickmap::{PostFxSettings, RenderScale};
 pub use consts::VIEW_SIZE;

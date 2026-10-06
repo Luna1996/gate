@@ -223,6 +223,7 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 "menu.player.camera.mode.orbit" = "轨道"
 "menu.player.camera.mode.fly" = "自由"
 "menu.player.camera.speed" = "飞行速度"
+"menu.pinned" = "常用"
 "menu.game" = "游戏"
 "menu.game.edit" = "编辑"
 "menu.game.edit.brush" = "笔触"
@@ -359,6 +360,26 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 构建在后台线程跑（十几秒），**完成即自动启用**，不用重启。中途可以「中止」。
 首次之后每次开机自动装载（存档改过会作废旧文件）。
 """
+"menu.game.objects" = "物体"
+"menu.game.objects.target" = "交互对象"
+"menu.game.objects.target.object" = "物体"
+"menu.game.objects.target.world" = "体素"
+"menu.game.objects.target.tip" = """
+左键 / 右键作用于哪一套操作，两套互斥：
+**物体** —— 左键在准星延长线固定距离处放置物体（不做射线求交），右键删除光标指向的物体。
+**体素** —— 左键落笔、右键擦除。
+"""
+"menu.game.objects.edge" = "生成边长"
+"menu.game.objects.edge.tip" = """
+生成立方体的边长（体素）。物体**中心**落在准星延长线的 `生成距离` 处。
+"""
+"menu.game.objects.dist" = "生成距离"
+"menu.game.objects.dist.tip" = """
+放置点沿准星方向的距离（体素）。放置不走射线求交，该值直接决定物体落在哪。
+"""
+"menu.game.objects.count" = "物体数"
+"menu.game.objects.hover" = "光标命中"
+"menu.game.objects.clear" = "全部销毁"
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
 "menu.camera.pos.value" = "%{v}"

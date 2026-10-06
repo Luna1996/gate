@@ -1165,10 +1165,13 @@ impl VolumesBuilder {
       dirty_chunks,
       occ_all: {
         if self.builders.iter().any(BrickMapBuilder::occ_dirty_pending) {
-          let mut v = Vec::with_capacity(self.builders.len() * OCC_WORDS);
-          for b in self.builders.iter_mut() {
+          let kept = self.builders.len().min(super::consts::VOLUMES);
+          let mut v = Vec::with_capacity(kept * OCC_WORDS);
+          for (i, b) in self.builders.iter_mut().enumerate() {
             b.take_occ_dirty();
-            v.extend_from_slice(b.occ_words());
+            if i < super::consts::VOLUMES {
+              v.extend_from_slice(b.occ_words());
+            }
           }
           Some(v)
         } else {

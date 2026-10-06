@@ -143,6 +143,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   let ctx = UiCtx::new(ctx.theme, ctx.font).with_icon_font(ctx.icon_font).with_translate(translate);
   let handle = spawn_debug_menu(world, &ctx, model);
   register_callbacks(world);
+  crate::objects::register_callbacks(world);
   apply_initial_state(world, handle.root);
   spawn_fps_overlay(world, &ctx);
 }

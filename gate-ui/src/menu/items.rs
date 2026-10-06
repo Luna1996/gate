@@ -21,6 +21,7 @@ pub enum MenuRole {
   Button(usize),
   Slider,
   SwitchOption(usize),
+  Tab(usize),
   Dropdown,
   Toggle,
   Input(usize),
@@ -241,6 +242,42 @@ fn sub_menu_row(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str, path: &str) -
       TITLE_ICON_SIZE,
       color_of(&ctx.theme.colors.text_muted),
     );
+  });
+  row
+}
+
+pub(crate) fn tab_bar_row(
+  ctx: &UiCtx,
+  parent: &mut ChildSpawner,
+  page_path: &str,
+  entries: &[(&str, bool)],
+) -> Entity {
+  let mut ec = base_row(parent, "menu-tab-bar");
+  let row = ec.id();
+  ec.with_children(|r| {
+    let mut group = r.spawn(Node {
+      flex_grow: 1.0,
+      height: px(CTRL_H),
+      flex_direction: FlexDirection::Row,
+      ..default()
+    });
+    group.with_children(|g| {
+      for (i, (key, _)) in entries.iter().enumerate() {
+        option_button(ctx, g, key, page_path, MenuRole::Tab(i), i == 0);
+      }
+    });
+  });
+  row
+}
+
+pub(crate) fn section_header(ctx: &UiCtx, parent: &mut ChildSpawner, key: &str) -> Entity {
+  let mut ec = base_row(parent, "menu-section-header");
+  let row = ec.id();
+  if let Some(mut n) = ec.get_mut::<Node>() {
+    n.height = px(SECTION_HEADER_H);
+  }
+  ec.with_children(|r| {
+    grow_label(ctx, r, key, LabelStyle::Muted);
   });
   row
 }

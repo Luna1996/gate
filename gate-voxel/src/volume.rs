@@ -126,19 +126,54 @@ impl Volumes {
     &mut self.list[0]
   }
 
-  pub fn add_object(&mut self, pos: Vec3, rot: Mat3, scale: f32) -> usize {
+  pub fn volume(&self, obj_id: i32) -> Option<&VolumeGrid> {
+    self.volume_index(obj_id).and_then(|i| self.list.get(i))
+  }
+
+  pub fn volume_mut(&mut self, obj_id: i32) -> Option<&mut VolumeGrid> {
+    self.volume_index(obj_id).and_then(|i| self.list.get_mut(i))
+  }
+
+  fn volume_index(&self, obj_id: i32) -> Option<usize> {
+    let idx = usize::try_from(obj_id.checked_add(1)?).ok()?;
+    (idx < self.list.len()).then_some(idx)
+  }
+
+  pub fn spawn_object(&mut self, pos: Vec3, rot: Mat3, scale: f32) -> i32 {
     let obj_id = self.list.len() as i32 - 1;
-    let grid = VolumeGrid::new_object(obj_id, pos, rot, scale);
-    self.list.push(grid);
-    obj_id as usize
+    self.list.push(VolumeGrid::new_object(obj_id, pos, rot, scale));
+    obj_id
   }
 
-  pub fn object(&self, obj_id: usize) -> Option<&VolumeGrid> {
-    self.list.get(obj_id + 1)
+  pub fn despawn_object(&mut self, obj_id: i32) -> bool {
+    if obj_id < 0 {
+      return false;
+    }
+    let Some(grid) = self.volume_mut(obj_id) else { return false };
+    if grid.is_far_level() || grid.chunk_count() == 0 {
+      return false;
+    }
+    grid.clear_all_chunks();
+    true
   }
 
-  pub fn object_mut(&mut self, obj_id: usize) -> Option<&mut VolumeGrid> {
-    self.list.get_mut(obj_id + 1)
+  pub fn live_object_ids(&self) -> impl Iterator<Item = i32> + '_ {
+    self
+      .list
+      .iter()
+      .enumerate()
+      .skip(1)
+      .filter(|(_, g)| !g.is_far_level() && g.chunk_count() > 0)
+      .map(|(i, _)| i as i32 - 1)
+  }
+
+  pub fn live_object_count(&self) -> usize {
+    self.live_object_ids().count()
+  }
+
+  pub fn despawn_all_objects(&mut self) -> usize {
+    let ids: Vec<i32> = self.live_object_ids().collect();
+    ids.into_iter().filter(|&id| self.despawn_object(id)).count()
   }
 
   pub fn add_far_level(&mut self, scale: f32) -> usize {
@@ -295,6 +330,14 @@ impl VolumeGrid {
   pub fn compact_all(&mut self) {
     use rayon::prelude::*;
     self.chunks.par_iter_mut().for_each(|(_, tree)| tree.compact());
+  }
+
+  pub fn clear_all_chunks(&mut self) {
+    let coords: Vec<ChunkCoord> = self.chunks.keys().copied().collect();
+    for c in coords {
+      self.unmount_chunk(c);
+      self.dirty.mark_data(c);
+    }
   }
 
   pub fn mount_chunk_tree(&mut self, cc: ChunkCoord, mut tree: ChunkTree, applied_edits: u64) {

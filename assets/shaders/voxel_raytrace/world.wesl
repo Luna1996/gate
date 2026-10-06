@@ -184,9 +184,6 @@ fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_
   let g0 = make_grid(0u);
   let cam_est = (g0.w_mn + g0.w_mx) * 0.5;
   let origin_xz = length((origin - cam_est).xz);
-  if (g0.coverage_r <= 0.0 || origin_xz < g0.coverage_r) {
-    return world_trace_medium(g0, origin, dir, max_t, stop_on_air, tint);
-  }
   let n = g.grid_count;
   var best = world_miss();
   var best_t = 1e+30;
@@ -195,7 +192,7 @@ fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_
     let gi = make_grid(i);
     let far = grid_is_far(i);
     if (far && origin_xz < shell) {
-      break;
+      continue;
     }
     var mc = MediumRay(stop_on_air, gi.palette_base, 0u, vec3<f32>(1.0));
     var gap: f32 = 1.0e+30;

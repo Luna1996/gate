@@ -32,6 +32,22 @@ pub fn raycast(volumes: &Volumes, origin: Vec3, dir: Vec3, t_max: f32) -> Option
   best
 }
 
+pub fn raycast_objects(volumes: &Volumes, origin: Vec3, dir: Vec3, t_max: f32) -> Option<RayHit> {
+  let mut best: Option<RayHit> = None;
+  for grid in volumes.list.iter().skip(1) {
+    if grid.is_far_level() {
+      continue;
+    }
+    let cap = best.as_ref().map_or(t_max, |b| b.t.min(t_max));
+    if let Some(hit) = trace_volume(grid, grid.transform, false, origin, dir, cap)
+      && best.as_ref().is_none_or(|b| hit.t < b.t)
+    {
+      best = Some(hit);
+    }
+  }
+  best
+}
+
 fn trace_volume(
   grid: &VolumeGrid,
   tr: VolumeTransform,

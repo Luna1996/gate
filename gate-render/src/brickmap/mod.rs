@@ -14,7 +14,7 @@ pub use dda::{
   DdaCameraConfig, DdaImages, DdaViewUniform, DebugNormals, EyeAdaptSettings, OrbitCamera,
   PostFxSettings, RenderScale, create_dda_image,
 };
-pub use raytrace::{RayHit, raycast};
+pub use raytrace::{RayHit, raycast, raycast_objects};
 pub use rt::{RT_MAX_INSTANCES, RtScene, rt_custom_index};
 pub use upload::{
   BindingLimits, BrickMapRevision, BufferLayout, BuilderMirror, GpuBrickMap, UploadBudget,

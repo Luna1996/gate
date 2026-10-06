@@ -14,7 +14,7 @@ pub use items::{
 };
 pub use model::{
   InputField, MenuFile, MenuNode, MenuValue, WindowState, buttons, color, dropdown, input, slider,
-  sub_menu, switch_group, text, toggle, toggle_tip,
+  sub_menu, sub_menu_tabs, switch_group, text, toggle, toggle_tip,
 };
 pub use window::{
   DebugMenu, DebugMenuHandle, DebugMenuRoot, MenuAction, MenuActionEvent, MenuDrag, MenuPage,

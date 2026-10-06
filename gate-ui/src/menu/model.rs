@@ -43,11 +43,19 @@ pub struct WindowState {
   pub collapsed: bool,
   #[serde(default)]
   pub path: Vec<String>,
+  #[serde(default)]
+  pub pins: Vec<String>,
 }
 
 impl Default for WindowState {
   fn default() -> Self {
-    Self { x: DEFAULT_WINDOW_POS.x, y: DEFAULT_WINDOW_POS.y, collapsed: false, path: Vec::new() }
+    Self {
+      x: DEFAULT_WINDOW_POS.x,
+      y: DEFAULT_WINDOW_POS.y,
+      collapsed: false,
+      path: Vec::new(),
+      pins: Vec::new(),
+    }
   }
 }
 
@@ -119,6 +127,8 @@ pub enum MenuNode {
     label: String,
     #[serde(default)]
     children: Vec<MenuNode>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    tabs: bool,
   },
   Buttons {
     #[serde(default)]
@@ -196,6 +206,10 @@ fn default_decimals() -> u32 {
   2
 }
 
+fn is_false(v: &bool) -> bool {
+  !*v
+}
+
 fn pick<'a>(id: &'a str, label: &'a str) -> &'a str {
   if id.is_empty() { label } else { id }
 }
@@ -245,6 +259,10 @@ impl MenuNode {
 
   pub fn is_sub_menu(&self) -> bool {
     matches!(self, Self::SubMenu { .. })
+  }
+
+  pub fn tabs(&self) -> bool {
+    matches!(self, Self::SubMenu { tabs: true, .. })
   }
 
   pub fn tooltip(&self) -> Option<&str> {
@@ -439,7 +457,11 @@ fn write_values(
 }
 
 pub fn sub_menu(id: &str, label: &str, children: Vec<MenuNode>) -> MenuNode {
-  MenuNode::SubMenu { id: id.into(), label: label.into(), children }
+  MenuNode::SubMenu { id: id.into(), label: label.into(), children, tabs: false }
+}
+
+pub fn sub_menu_tabs(id: &str, label: &str, children: Vec<MenuNode>) -> MenuNode {
+  MenuNode::SubMenu { id: id.into(), label: label.into(), children, tabs: true }
 }
 
 pub fn buttons(id: &str, label: &str, items: &[&str]) -> MenuNode {

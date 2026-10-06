@@ -3,6 +3,16 @@ x = 8.0
 y = 8.0
 collapsed = false
 path = []
+pins = [
+    "game/edit/brush/shape",
+    "game/edit/brush/size",
+    "game/edit/brush/offset",
+    "game/edit/mat/color",
+    "game/edit/mat/pbr",
+    "game/objects/target",
+    "game/world/reload",
+    "player/camera/mode",
+]
 
 [[items]]
 kind = "sub_menu"
@@ -49,6 +59,7 @@ checked = false
 kind = "sub_menu"
 id = "render"
 label = "menu.render"
+tabs = true
 
 [[items.children]]
 kind = "sub_menu"
@@ -258,6 +269,7 @@ tooltip = "menu.render.exposure.key.tip"
 kind = "sub_menu"
 id = "sky"
 label = "menu.render.sky"
+tabs = true
 
 [[items.children.children]]
 kind = "sub_menu"
@@ -487,6 +499,7 @@ label = "menu.game"
 kind = "sub_menu"
 id = "edit"
 label = "menu.game.edit"
+tabs = true
 
 [[items.children.children]]
 kind = "sub_menu"
@@ -610,6 +623,60 @@ id = "metal"
 label = "menu.game.edit.metal"
 checked = false
 tooltip = "menu.game.edit.metal.tip"
+
+[[items.children]]
+kind = "sub_menu"
+id = "objects"
+label = "menu.game.objects"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "target"
+label = "menu.game.objects.target"
+options = [
+    "menu.game.objects.target.object",
+    "menu.game.objects.target.world",
+]
+selected = 0
+tooltip = "menu.game.objects.target.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "edge"
+label = "menu.game.objects.edge"
+value = 32.0
+min = 4.0
+max = 128.0
+step = 4.0
+decimals = 0
+tooltip = "menu.game.objects.edge.tip"
+
+[[items.children.children]]
+kind = "slider"
+id = "dist"
+label = "menu.game.objects.dist"
+value = 80.0
+min = 8.0
+max = 512.0
+step = 8.0
+decimals = 0
+tooltip = "menu.game.objects.dist.tip"
+
+[[items.children.children]]
+kind = "text"
+id = "count"
+text = "menu.game.objects.count"
+
+[[items.children.children]]
+kind = "text"
+id = "hover"
+text = "menu.game.objects.hover"
+
+[[items.children.children]]
+kind = "buttons"
+id = "clear"
+label = ""
+items = ["menu.game.objects.clear"]
 
 [[items.children]]
 kind = "sub_menu"
