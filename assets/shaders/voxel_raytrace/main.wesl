@@ -162,6 +162,7 @@ fn gi_upsample_joint(
   let base = floor(g - vec2<f32>(0.5));
   let f = g - vec2<f32>(0.5) - base;
   var acc = vec3<f32>(0.0);
+  var acc_a = 0.0;
   var wsum = 0.0;
   for (var j: i32 = 0; j < 2; j = j + 1) {
     for (var i: i32 = 0; i < 2; i = i + 1) {
@@ -174,25 +175,26 @@ fn gi_upsample_joint(
       let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
       if ((gk0 | gk1) == 0u) { continue; }
       if (!gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)) { continue; }
-      
-      acc = acc + textureLoad(gi_tex, c, 0).rgb * bw;
+      let s = textureLoad(gi_tex, c, 0);
+      acc = acc + s.rgb * bw;
+      acc_a = acc_a + s.a * bw;
       wsum = wsum + bw;
     }
   }
-  if (wsum > 0.0) { return vec4<f32>(acc / wsum, 0.0); }
-  
+  if (wsum > 0.0) { return vec4<f32>(acc / wsum, acc_a / wsum); }
+
   let nc = clamp(base + vec2<f32>(select(0.0, 1.0, f.x >= 0.5), select(0.0, 1.0, f.y >= 0.5)),
                  vec2<f32>(0.0), vec2<f32>(f32(gsize.x) - 1.0, f32(gsize.y) - 1.0));
   let nci = vec2<i32>(nc);
   let sn = textureLoad(gi_tex, nci, 0);
-  if (sn.a > 0.5) { return vec4<f32>(sn.rgb, 0.0); }
-  
+  if (sn.a > 0.5) { return sn; }
+
   var best_ok = false;
   var best_d2 = 0;
-  var best = vec3<f32>(0.0);
+  var best = vec4<f32>(0.0);
   var any_ok = false;
   var any_d2 = 0;
-  var any = vec3<f32>(0.0);
+  var any = vec4<f32>(0.0);
   for (var dy: i32 = -GI_UPSAMPLE_HOLE_R; dy <= GI_UPSAMPLE_HOLE_R; dy = dy + 1) {
     for (var dx: i32 = -GI_UPSAMPLE_HOLE_R; dx <= GI_UPSAMPLE_HOLE_R; dx = dx + 1) {
       let c = nci + vec2<i32>(dx, dy);
@@ -205,18 +207,18 @@ fn gi_upsample_joint(
       if (!any_ok || d2 < any_d2) {
         any_ok = true;
         any_d2 = d2;
-        any = textureLoad(gi_tex, c, 0).rgb;
+        any = textureLoad(gi_tex, c, 0);
       }
       if (gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)
           && (!best_ok || d2 < best_d2)) {
         best_ok = true;
         best_d2 = d2;
-        best = textureLoad(gi_tex, c, 0).rgb;
+        best = textureLoad(gi_tex, c, 0);
       }
     }
   }
-  if (best_ok) { return vec4<f32>(best, 1.0); }
-  if (any_ok) { return vec4<f32>(any, 1.0); }
+  if (best_ok) { return best; }
+  if (any_ok) { return any; }
   return vec4<f32>(fallback, 0.0);
 }
 
@@ -437,7 +439,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         gi = acc.xyz / (acc.w * GI_ACC_SCALE);
         cov = 1.0;
       } else {
-        let s = textureSampleLevel(gi_tex, light_samp, vuv, 0.0);
+        let gup = vec2<u32>(textureDimensions(gi_tex));
+        let s = gi_upsample_joint(vuv, gup, k0, k1, n, vec3<f32>(0.0));
         let gw = max(s.a, 1e-4);
         gi = s.rgb / gw;
         cov = clamp(s.a, 0.0, 1.0);
