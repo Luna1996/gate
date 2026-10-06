@@ -7,16 +7,16 @@ import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_norm
 
 const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 
-fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> f32 {
+fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> vec3<f32> {
         if (((u32(bitcast<i32>(origin.x * 64.0)) ^ u32(bitcast<i32>(sun_dir.x * 4096.0))) & 63u) == 0u) {
     atomicAdd(&lod_diag[15u], 64u);
   }
   var tint = vec3<f32>(1.0);
           let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
-  let through = (tint.r + tint.g + tint.b) / 3.0;
+  let through = tint;
     if (!h.hit) { return through; }
-  if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return 1.0; }
-  return 0.0;
+  if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return vec3<f32>(1.0); }
+  return vec3<f32>(0.0);
 }
 
 fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
@@ -25,7 +25,7 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
   let hp = voxel_center_world(hg, sh.voxel);
   let hn = sh.n;
   let ndl = max(dot(hn, sun_dir), 0.0);
-  var sun = 0.0;
+  var sun = vec3<f32>(0.0);
     if (sun_bounce > 0.0 && ndl > 0.0) {
     let h_off = surface_offset(hg, hn, SHADOW_SURFACE_EPS);
     sun = sun_transmittance(hp + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
@@ -33,7 +33,7 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
     let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT;
                     let v = hn;
   let m = fetch_material(sh.palette_base, sh.pal, hp, hn, MATERIAL_DEBUG_NONE);
-  return brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c, sun * sun_bounce, amb, vec3<f32>(0.0)))
+  return brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c * (sun * sun_bounce), 1.0, amb, vec3<f32>(0.0)))
          / GI_PI
        + emissive_radiance(m, GI_EMIT_GAIN);
 }

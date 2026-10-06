@@ -292,7 +292,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
     let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3))
               + SHADOW_SURFACE_EPS;
     let h_start = h.point + hn * h_off;
-    var h_vis = 1.0;
+    var h_vis = vec3<f32>(1.0);
     
     if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
       h_vis = sun_transmittance(h_start, sun_dir, h.voxel, h.obj_id);
@@ -303,7 +303,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
       lvl < nest && h_fade > 0.0
       && dot(hf0, GI_LUMA) >= PBR_REFL_MIN_F0;
     var h_local = brdf_reflected(hm, hn, hv,
-                                 SurfaceLight(sun_dir, sun_c, h_vis, hamb, vec3<f32>(0.0)))
+                                 SurfaceLight(sun_dir, sun_c * h_vis, 1.0, hamb, vec3<f32>(0.0)))
                 + emissive_radiance(hm, GI_EMIT_GAIN);
     if (h_continue) {
       h_local = h_local - hf0 * hamb;
@@ -331,6 +331,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
   var glass_col = vec3<f32>(0.0);
+  var glass_w = 0.0;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
     let fp = voxel_center_world(fg, first.voxel);
@@ -344,11 +345,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     best = g.ray;
     through = g.tint;
     refl = g.refl;
-    let f_alpha = vec3<f32>(1.0) - through;
-    if (max(max(f_alpha.x, f_alpha.y), f_alpha.z) > 1.0 / 255.0) {
-      let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
+    let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
+    glass_w = clamp(1.0 - fm.transmission, 0.0, 1.0);
+    if (glass_w > 1.0 / 255.0) {
       let f_ndl = max(dot(fnn, sun_dir), 0.0);
-      var f_sun = 0.0;
+      var f_sun = vec3<f32>(0.0);
       if (f_ndl > 0.0) {
         f_sun = sun_transmittance(f_face, sun_dir, first.voxel, first.obj_id);
       }
@@ -365,7 +366,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       }
       let f_amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, f_cov);
       glass_col = brdf_reflected(fm, fnn, fv,
-                                 SurfaceLight(sun_dir, sun_c, f_sun, f_amb, f_gi))
+                                 SurfaceLight(sun_dir, sun_c * f_sun, 1.0, f_amb, f_gi))
                 + emissive_radiance(fm, GI_EMIT_GAIN);
     }
   }
@@ -400,16 +401,16 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let v = face_view_dir(origin_voxel, p_voxel);
     let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
     let ndl = max(dot(n, sun_dir), 0.0);
-    var sun = 0.0;
+    var sun = vec3<f32>(0.0);
     if (sun_hint >= 0.0) {
-      sun = sun_hint;
+      sun = vec3<f32>(sun_hint);
     } else if (ndl > 0.0) {
-      sun = 1.0;
+      sun = vec3<f32>(1.0);
       if ((light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
         sun = sun_transmittance(p_voxel + n * n_off, sun_dir, best.voxel, best.obj_id);
       }
     }
-    *sun_io = sun;
+    *sun_io = max(max(sun.x, sun.y), sun.z);
     let gi_on = gi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     var cov = 0.0;
@@ -460,7 +461,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     dbg_gi = gi;
     dbg_cov = cov;
     dbg_sun = *sun_io;
-    col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c, sun, amb, gi))
+    col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c * sun, 1.0, amb, gi))
         + emissive_radiance(m, GI_EMIT_GAIN);
     if (PBR_REFLECTION_ENABLED != 0u && light_u.g.refl_tier > 0u) {
       let tier = light_u.g.refl_tier;
@@ -477,10 +478,9 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     }
     col = col * through + refl;
   } else {
-    return sky_primary(ray_dir, sun_dir, sun_c) * through + refl;
+    return mix(glass_col, sky_primary(ray_dir, sun_dir, sun_c) * through + refl, 1.0 - glass_w);
   }
-  col = col + glass_col * (vec3<f32>(1.0) - through);
-  return col;
+  return mix(glass_col, col, 1.0 - glass_w);
 }
 
 const GI_FACE_FALLBACK: u32 = 1u;

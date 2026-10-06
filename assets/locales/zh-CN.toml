@@ -30,12 +30,6 @@ _version = 1
 "menu.render.gi.res.full" = "1/1"
 "menu.render.gi.res.half" = "1/2"
 "menu.render.gi.res.quarter" = "1/4"
-"menu.render.debug_view" = "调试视图"
-"menu.render.debug_view.off" = "关"
-"menu.render.debug_view.gi" = "间接光"
-"menu.render.debug_view.sun" = "阴影"
-"menu.render.debug_view.cov" = "归属检查"
-"menu.render.debug_view.tip" = "只输出单个照明项（绕过曝光）：间接光 / 阴影可见度 / 归属检查（绿=读到自己的面，红=读到别人的面）"
 "menu.render.gi.res.tip" = """
 GI 网格边长 = 渲染分辨率 ÷ 档位（每一档都跑 GI，不是开关）。
 

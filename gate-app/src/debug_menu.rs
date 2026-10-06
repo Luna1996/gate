@@ -282,18 +282,8 @@ fn register_callbacks(world: &mut World) {
      mut gi: ResMut<gate_render::gi::GiSettings>,
      mut eye: ResMut<gate_render::EyeAdaptSettings>,
      mut refl: ResMut<gate_render::ReflectionSettings>,
-     mut base: ResMut<gate_render::BaseSettings>,
-     mut debug: ResMut<gate_render::DebugNormals>| {
+     mut base: ResMut<gate_render::BaseSettings>| {
       match (ev.path.as_str(), &ev.action) {
-        ("render/debug_view", MenuAction::Select(i)) => {
-          debug.0 = match *i {
-            1 => 4,
-            2 => 5,
-            3 => 6,
-            _ => 0,
-          };
-          info!("调试视图 → {}", ["关", "间接光", "阴影可见度", "归属检查"][(*i).min(3)]);
-        }
         ("render/base/shadow", MenuAction::Toggle(on)) => {
           base.shadow = *on;
           info!("直光阴影 → {}", if *on { "on" } else { "off" });
