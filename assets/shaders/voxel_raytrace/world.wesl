@@ -87,7 +87,6 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
     best_t = best.uh.t;
     best.palette_base = g0.palette_base;
   }
-  var fb = select(1.0e+30, gap, !best.uh.hit);
   for (var i: u32 = 1u; i < n; i = i + 1u) {
     let gi = make_grid(i);
     let far = grid_is_far(i);
@@ -95,9 +94,9 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
       continue;
     }
     let shell_cap = level_cap(shell, dir);
-    let t_lo = select(t_min, select(max(t_min, min(shell_cap, fb)), t_min, origin_xz >= shell), far);
-    if (far) {
-      fb = 1.0e+30;
+    var t_lo = t_min;
+    if (far && origin_xz < shell) {
+      t_lo = max(t_min, shell_cap);
     }
     var t_hi = min(best_t, t_cap);
     if (gi.coverage_r > 0.0) {
