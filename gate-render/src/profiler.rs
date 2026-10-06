@@ -103,7 +103,7 @@ impl SplitDiag {
   }
 }
 
-fn diag_gap_end(mut st: ResMut<DiagFrameGap>) {
+fn diag_gap_end(mut st: ResMut<DiagFrameGap>, scale: Option<Res<crate::RenderScale>>) {
   let now = std::time::Instant::now();
   let (Some(t0), Some(b0)) = (st.prev_end, st.busy0) else {
     st.prev_end = Some(now);
@@ -115,8 +115,9 @@ fn diag_gap_end(mut st: ResMut<DiagFrameGap>) {
   st.prev_end = Some(now);
   if st.n >= 60 {
     let n = st.n as f64;
+    let size = scale.map(|s| format!("{}x{}", s.size.x, s.size.y)).unwrap_or_default();
     bevy::log::debug!(target: "gate",
-      "RENDER 帧周期 {:.1} ms（{:.1} fps）：渲染世界自身 {:.1} ms，等别处 {:.1} ms",
+      "RENDER 帧周期 {:.1} ms（{:.1} fps）：渲染世界自身 {:.1} ms，等别处 {:.1} ms [渲染 {size}]",
       st.acc / n * 1000.0, n / st.acc, st.acc_busy / n * 1000.0, (st.acc - st.acc_busy) / n * 1000.0);
     st.acc = 0.0;
     st.acc_busy = 0.0;
@@ -135,17 +136,23 @@ pub(crate) struct GpuProfilerRes {
 #[cfg(feature = "profile")]
 #[derive(Default)]
 struct PassReport {
-  acc: std::collections::BTreeMap<String, f64>,
+  acc: std::collections::BTreeMap<String, (f64, u32)>,
   frames: u32,
+  frames_empty: u32,
   last: Option<std::time::Instant>,
 }
 
 #[cfg(feature = "profile")]
 impl PassReport {
   fn push(&mut self, results: &[wgpu_profiler::GpuTimerQueryResult]) {
+    if results.is_empty() {
+      self.frames_empty += 1;
+    }
     for r in results {
       if let Some(t) = &r.time {
-        *self.acc.entry(r.label.clone()).or_insert(0.0) += t.end - t.start;
+        let e = self.acc.entry(r.label.clone()).or_insert((0.0, 0));
+        e.0 += t.end - t.start;
+        e.1 += 1;
       }
     }
     self.frames += 1;
@@ -155,17 +162,17 @@ impl PassReport {
     if dt < crate::consts::REPORT_PERIOD_SECS || self.frames == 0 {
       return;
     }
-    let n = self.frames as f64;
-    let ms = |s: f64| s / n * 1000.0;
-    let mut line = format!("GPU[{dt:.1}s x{}] ", self.frames);
+    let mut line = format!("GPU[{dt:.1}s 帧{} 无结果{}] ", self.frames, self.frames_empty);
     let mut total = 0.0;
-    for (label, s) in &self.acc {
-      total += ms(*s);
-      line.push_str(&format!("{label}={:.2}ms ", ms(*s)));
+    for (label, (s, n)) in &self.acc {
+      let ms = s / *n as f64 * 1000.0;
+      total += ms;
+      line.push_str(&format!("{label}={ms:.2}ms/{n} "));
     }
     bevy::log::info!("GPU 逐 pass 均值（共 {total:.2}ms/frame）：{line}");
     self.acc.clear();
     self.frames = 0;
+    self.frames_empty = 0;
     self.last = Some(now);
   }
 }
@@ -302,8 +309,12 @@ fn init_gpu_profiler(
   mut res: ResMut<GpuProfilerRes>,
 ) {
   let backend = adapter.get_info().backend;
+  let settings = wgpu_profiler::GpuProfilerSettings {
+    enable_debug_groups: false,
+    ..Default::default()
+  };
   match wgpu_profiler::GpuProfiler::new_with_tracy_client(
-    wgpu_profiler::GpuProfilerSettings::default(),
+    settings,
     backend,
     device.wgpu_device(),
     &queue,

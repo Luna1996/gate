@@ -1344,7 +1344,8 @@ fn plan_residency(
     if tree.is_empty() {
       continue;
     }
-    let cur = state.residency.resident_level(c).unwrap_or(gate_voxel::BRICK_FACTOR);
+    let cur_level = state.residency.resident_level(c);
+    let cur = cur_level.unwrap_or(gate_voxel::BRICK_FACTOR);
         if streamed && cur == gate_voxel::BRICK_FACTOR {
       continue;
     }
@@ -1352,6 +1353,9 @@ fn plan_residency(
     let dist = (center - cam_pos).length();
     let lv = want_level(dist, px, cur);
             let lv = if streamed { lv.min(cur) } else { lv };
+    if cur_level == Some(lv) {
+      continue;
+    }
     wants.push((c, lv));
   }
   sd.mark(4);

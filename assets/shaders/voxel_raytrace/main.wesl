@@ -1,7 +1,7 @@
 import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_SUN, FACE_W_TEXEL, face_slot_claim, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_GUIDE_WORDS, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
@@ -57,11 +57,9 @@ fn refl_cone_dir(r: vec3<f32>, u: vec2<f32>, spread: f32) -> vec3<f32> {
 
 const PBR_DEBUG_ASSET: u32 = 0xFFFFFFFFu;
 
-// 调试视图临时量：shade_face 内算出、dda_main 出口按 view_u.debug_mode 输出。
 var<private> dbg_gi: vec3<f32> = vec3<f32>(0.0);
 var<private> dbg_cov: f32 = 0.0;
 var<private> dbg_sun: f32 = 0.0;
-// 归属检查：1 = 采样到的 GI texel 与本像素的面同键；0.5 = 是别人的键；0 = 该处无 guide。
 var<private> dbg_owner: f32 = 0.0;
 
 struct GlassOut {
@@ -229,7 +227,6 @@ fn voxel_screen_uv(p_voxel: vec3<f32>, fallback: vec2<f32>) -> vec2<f32> {
   return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 }
 
-// 取某体素（该面）的 GI 累积。键已屏蔽面号 → 逐体素。返回 (sum.xyz, n)。
 fn gi_vox_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> vec4<f32> {
   var ok = false;
   let s = face_slot_find(gi_key0(voxel, obj_id), gi_vox_k1(gi_key1(voxel, face_id, obj_id)), &ok);
@@ -418,13 +415,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       gi = gi_in.face_avg;
       cov = gi_in.face_cov;
     } else if (gi_on) {
-      // WHY: 按"面"取 GI，不按屏幕位置取。后面暗面上靠近视觉交界的体素，其体素中心投影落在前面亮面
-      // 所占的屏幕位置上（中心被亮面挡住）→ 按位置取就会拿到亮面的 GI，暗面上出现亮齿。
-      // 面缓存按 (体素,面) 键累加，绝不会跨面取值。
       var acc = gi_vox_gi(best.voxel, best.face_id, best.obj_id);
       acc = acc * vec4<f32>(2.0, 2.0, 2.0, 2.0);
-      // 同面 ±1（沿面的两条切向轴）补空洞并压噪声：远处体素小于一个 GI texel，常无自身证据。
-      // 只沿面内走，不跨面 → 不会取到别的面的值。
       var t1 = vec3<i32>(1, 0, 0);
       var t2 = vec3<i32>(0, 1, 0);
       if (best.face_id / 2u == 0u) {
@@ -445,14 +437,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         gi = acc.xyz / (acc.w * GI_ACC_SCALE);
         cov = 1.0;
       } else {
-        // 三级兜底的最后一级：屏幕采样。只在"自己与同面邻居都没有 GI 证据"时用到——即远景/亚 texel
-        // 的面，那里跨面误差是亚像素级的；近处的边界体素会由上一级（同面邻居）命中，不会走到这里。
         let s = textureSampleLevel(gi_tex, light_samp, vuv, 0.0);
         let gw = max(s.a, 1e-4);
         gi = s.rgb / gw;
         cov = clamp(s.a, 0.0, 1.0);
       }
-      // 归属检查：屏幕位置处的 guide 键是否就是本像素自己的面键（用于确认毛刺机制）。
       let gsize = vec2<u32>(textureDimensions(gi_tex));
       let tp = vec2<i32>(floor(vuv * vec2<f32>(gsize)));
       if (tp.x >= 0 && tp.y >= 0 && tp.x < i32(gsize.x) && tp.y < i32(gsize.y)) {
@@ -591,7 +580,6 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) {
     col = vol_tint_color(first);
   }
-  // 调试视图：直接输出单个照明项并绕过曝光，便于目视定位毛刺来自哪一项。
   if (view_u.debug_mode.x > 0.5) {
     textureStore(out_tex, coord0, vec4<f32>(linear_to_srgb(dbg_gi), 1.0));
     return;
@@ -601,7 +589,6 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
   if (view_u.debug_mode.w > 0.5) {
-    // 归属检查：绿 = 读到自己的面；红 = 读到别人的面；黑 = 该处没有 GI。
     var oc = vec3<f32>(0.0);
     if (dbg_owner > 0.9) {
       oc = vec3<f32>(0.0, 1.0, 0.0);
@@ -766,10 +753,37 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   atomicStore(&face_slots[fe + FACE_W_COL + 2u], bitcast<u32>(col.z));
 }
 
+var<workgroup> gi_adapt_wg: array<f32, 64u>;
+var<workgroup> gi_adapt_r: array<f32, 64u>;
+
 @compute @workgroup_size(8, 8, 1)
 fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_out);
-  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let in_range = gid.x < size.x && gid.y < size.y;
+  let ccoord = vec2<i32>(i32(min(gid.x, size.x - 1u)), i32(min(gid.y, size.y - 1u)));
+  let cidx = u32(ccoord.y) * size.x + u32(ccoord.x);
+  let lid = (gid.y & 7u) * 8u + (gid.x & 7u);
+  let pu = unpack2x16float(gi_guide_out[cidx * GI_DEN_GUIDE_WORDS + GI_DEN_G_NOISE]);
+  var s = pu.x;
+  if (!(s > 0.0)) { s = GI_SS_ADAPT_REF; }
+  var rbase = pu.y;
+  if (!(rbase > 0.0)) { rbase = 1.0; }
+  gi_adapt_wg[lid] = s;
+  gi_adapt_r[lid] = rbase;
+  workgroupBarrier();
+  var acc_s = 0.0;
+  var acc_r = 0.0;
+  for (var i = 0u; i < 64u; i = i + 1u) {
+    acc_s = acc_s + gi_adapt_wg[i];
+    acc_r = acc_r + gi_adapt_r[i];
+  }
+  let w_raw = clamp(s / max(acc_s / 64.0, 1e-5), GI_SS_ADAPT_LO, GI_SS_ADAPT_HI);
+  gi_adapt_wg[lid] = w_raw * rbase;
+  workgroupBarrier();
+  var acc_wr = 0.0;
+  for (var i = 0u; i < 64u; i = i + 1u) { acc_wr = acc_wr + gi_adapt_wg[i]; }
+  let w_adapt = w_raw * acc_r / max(acc_wr, 1e-5);
+  if (!in_range) { return; }
   let coord = vec2<i32>(i32(gid.x), i32(gid.y));
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
          / vec2<f32>(f32(size.x), f32(size.y));
@@ -785,7 +799,7 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir_voxel = normalize(diff_world);
   let origin_voxel = view_u.cam_pos_voxel.xyz;
   if (camera_solid_pal(origin_voxel) != 0u) {
-    gi_ss_main(coord, size, world_miss());
+    gi_ss_main(coord, size, world_miss(), w_adapt);
     return;
   }
   let gi_div = max(u32(gi_u.flags.y), 1u);
@@ -807,7 +821,7 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let h = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
                         world_cfg_full(t_min, 3u));
-  gi_ss_main(coord, size, h);
+  gi_ss_main(coord, size, h, w_adapt);
 }
 
 @compute @workgroup_size(8, 8, 1)

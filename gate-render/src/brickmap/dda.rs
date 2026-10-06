@@ -1800,8 +1800,6 @@ pub(crate) fn dispatch_dda(
   
   
   
-  // WHY: 只跑面缓存的 GI 累加（dda_main 改按"面"查 FACE_W_GI，避免后面的面在视觉交界处取到前面面的
-  // GI）；gate_dda_face 那趟全色着色仍停派发——它的 FACE_W_COL/FACE_W_SUN 无消费者。
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
   {

@@ -1,6 +1,6 @@
-import package::bindings::{face_slots, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
+import package::bindings::{face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
-import package::gi::consts::{GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_PI, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_LUMA_FLOOR_REL, GI_DEN_N_DOT, GI_HIST_SEARCH_TAPS, GI_LUMA, GI_PI, GI_SS_ADAPT_EMA, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
 import package::gi::wal::{gi_wal_merge, gi_wal_sample};
@@ -130,7 +130,7 @@ fn gi_ss_reproject(p_world: vec3<f32>, size: vec2<u32>, ok: ptr<function, bool>)
   return c;
 }
 
-fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
+fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
       if (diag_texel_sampled(coord)) {
     atomicAdd(&lod_diag[13u], 64u);
   }
@@ -222,12 +222,16 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
   if (err_tier > 0u) {
                                         let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
             let warm_m = f32(m_cap_base * cand_n0);
-    b_err = select(hi, 1.0, hist_ok && hist.m >= warm_m);
+    let fill = select(0.0, clamp(hist.m / max(warm_m, 1.0), 0.0, 1.0), hist_ok);
+    b_err = mix(hi, 1.0, fill);
   }
     let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
-  var cand_n = max(1u, u32(floor(f32(cand_n0) * b_err / f32(share) + dither)));
+  let base = f32(cand_n0) * b_err / f32(share);
+  let rate = base * w_adapt;
+  let cand_base = max(1u, u32(floor(base + dither)));
+  var cand_n = max(1u, u32(floor(rate + dither)));
                 if (cand_n == 1u) {
-    let frac = f32(cand_n0) * b_err / f32(share);
+    let frac = rate;
     if (frac < 0.999) {
       let stride = max(u32(ceil(1.0 / max(frac, 1.0 / 64.0))), 1u);
       if (gi_mix(idx ^ (gi_u.seq.x * 0x9E3779B9u)) % stride != 0u) {
@@ -247,7 +251,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
     }
   }
             let cap_mul = select(1u, GI_SS_M_CAP_REST_K, px_static || lone_prev);
-  let m_cap_k = m_cap_base * max(cand_n0 / max(cand_n, 1u), 1u) * cap_mul;
+  let m_cap_k = m_cap_base * max(cand_n0 / max(cand_base, 1u), 1u) * cap_mul;
   var r = gi_res_none();
               var clamped_any = false;
   var k = 0u;
@@ -279,6 +283,21 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit) {
       r.m = r.m + 1.0;
     }
     k = k + nb;
+  }
+
+  {
+    var noise = GI_SS_ADAPT_REF;
+    if (!hist_ok) {
+      noise = GI_SS_ADAPT_REF * 2.0;
+    } else if (hist.m > 0.5 && r.m > 0.5) {
+      let hm = hist.w_sum / hist.m;
+      let rm = r.w_sum / r.m;
+      noise = length(rm - hm) / max(dot(hm, GI_LUMA), GI_DEN_LUMA_FLOOR_REL * 4.0);
+    }
+    let nbi = idx * GI_DEN_GUIDE_WORDS + GI_DEN_G_NOISE;
+    let prev = unpack2x16float(gi_guide_out[nbi]);
+    let ema = select(noise, mix(prev.x, noise, GI_SS_ADAPT_EMA), prev.x > 0.0);
+    gi_guide_out[nbi] = pack2x16float(vec2<f32>(clamp(ema, 1e-3, 16.0), clamp(base, 0.0, 16.0)));
   }
 
         r.pk0 = pk0;

@@ -23,8 +23,6 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
                  sun_bounce: f32) -> vec3<f32> {
   let hg = make_grid(u32(sh.obj_id) + 1u);
   let hp = voxel_center_world(hg, sh.voxel);
-  // WHY: 间接光是低频量。sun_bounce 关时 sun_vis=0，brdf_reflected 不走太阳项，法线只影响
-  // 材质法线贴图的细节；用遍历给出的面法线即可，省掉 6 次分裂树占据采样。
   let hn = sh.n;
   let ndl = max(dot(hn, sun_dir), 0.0);
   var sun = 0.0;
