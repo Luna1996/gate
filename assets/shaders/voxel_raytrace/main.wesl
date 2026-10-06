@@ -508,15 +508,21 @@ fn gi_cover_key(uv: vec2<f32>, key_out: ptr<function, vec2<u32>>,
   return (*key_out).x != 0u || (*key_out).y != 0u;
 }
 
+var<workgroup> cam_pal_wg: u32;
+
 @compute @workgroup_size(8, 8, 1)
-fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32) {
+  if (lid == 0u) {
+    cam_pal_wg = camera_solid_pal(view_u.cam_pos_voxel.xyz);
+  }
+  workgroupBarrier();
   let size = textureDimensions(out_tex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
-  let cam_g = make_grid(0u);
-  let cam_pal = camera_solid_pal(view_u.cam_pos_voxel.xyz);
+  let cam_pal = cam_pal_wg;
   if (cam_pal != 0u) {
-    write_output(coord0, palette_rgb_linear(cam_g.palette_base, cam_pal));
+    write_output(coord0, palette_rgb_linear(make_grid(0u).palette_base, cam_pal));
     return;
   }
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
@@ -770,6 +776,7 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (!(rbase > 0.0)) { rbase = 1.0; }
   gi_adapt_wg[lid] = s;
   gi_adapt_r[lid] = rbase;
+  if (lid == 0u) { cam_pal_wg = camera_solid_pal(view_u.cam_pos_voxel.xyz); }
   workgroupBarrier();
   var acc_s = 0.0;
   var acc_r = 0.0;
@@ -798,7 +805,7 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let frustum_length = length(diff_world);
   let dir_voxel = normalize(diff_world);
   let origin_voxel = view_u.cam_pos_voxel.xyz;
-  if (camera_solid_pal(origin_voxel) != 0u) {
+  if (cam_pal_wg != 0u) {
     gi_ss_main(coord, size, world_miss(), w_adapt);
     return;
   }
