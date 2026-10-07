@@ -10,13 +10,13 @@ use micropool::iter::{
 use micropool::{ThreadPool, ThreadPoolBuilder};
 
 use crate::body::{BodySet, MassProps};
-use crate::contact::{ContactConfig, ContactPath, Probe, manifold_bounded};
+use crate::contact::{Contact, ContactConfig, ContactPath, Probe, finish, manifold_into, probe_pairs};
 use crate::dissolve::dissolve_into_main;
-use crate::field::Field;
-use crate::solver::{Constraint, ContactConstraint, ContactParams, color_by_body};
+use crate::field::{Field, world_aabb_of};
+use crate::solver::{Constraint, ContactConstraint, ContactParams, POSITION_BETA, color_by_body};
+use crate::statics::{StaticField, chunk_of};
 
 pub const VOXELS_PER_METER: f32 = 50.0;
-
 pub const WORLD_BODY: usize = 0;
 
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +27,8 @@ pub struct StepConfig {
   pub params: ContactParams,
   pub contact: ContactConfig,
   pub density: f32,
+  pub position_beta: f32,
+  pub position_iterations: u32,
   pub sleep_lin_vel: f32,
   pub sleep_ang_vel: f32,
   pub sleep_time: f32,
@@ -37,11 +39,13 @@ impl Default for StepConfig {
   fn default() -> Self {
     Self {
       gravity: Vec3::new(0.0, -9.81 * VOXELS_PER_METER, 0.0),
-      substeps: 32,
-      iterations: 1,
+      substeps: 8,
+      iterations: 2,
       params: ContactParams::default(),
       contact: ContactConfig::default(),
       density: 1.0,
+      position_beta: POSITION_BETA,
+      position_iterations: 2,
       sleep_lin_vel: 0.5,
       sleep_ang_vel: 0.05,
       sleep_time: 0.5,
@@ -90,6 +94,7 @@ pub struct StepStats {
 #[derive(Default)]
 pub struct PhysicsWorld {
   pub bodies: BodySet,
+  pub statics: StaticField,
   cache: HashMap<u64, [f32; 3]>,
   pool: Option<ThreadPool>,
 }
@@ -113,16 +118,21 @@ impl PhysicsWorld {
     grid_index: usize,
   ) -> usize {
     let i = self.bodies.push_static(bounds, grid_index);
-    self.bodies.build_accel(i, grid);
+    self.statics.clear();
+    self.statics.sync(grid, bounds.0, bounds.1);
     debug_assert_eq!(i, WORLD_BODY, "静态世界必须是第 0 个体");
     i
   }
 
+  pub fn sync_static(&mut self, grid: &VolumeGrid, lo: IVec3, hi: IVec3) -> usize {
+    self.bodies.local_bounds[WORLD_BODY] = (lo, hi);
+    self.statics.sync(grid, lo, hi)
+  }
+
   pub fn rebuild_static(&mut self, grid: &VolumeGrid, bounds: (IVec3, IVec3)) -> usize {
-    self.bodies.local_bounds[WORLD_BODY] = bounds;
-    self.bodies.build_accel(WORLD_BODY, grid);
+    self.sync_static(grid, bounds.0, bounds.1);
     self.cache.clear();
-    self.bodies.vox[WORLD_BODY].len()
+    self.statics.corners()
   }
 
   pub fn add_body(
@@ -171,8 +181,30 @@ impl PhysicsWorld {
     n
   }
 
+  pub fn freeze_outside(&mut self, lo: Vec3, hi: Vec3) -> usize {
+    let mut n = 0;
+    for i in WORLD_BODY + 1..self.bodies.len() {
+      if self.bodies.is_static(i) || self.bodies.is_frozen(i) {
+        continue;
+      }
+      let (blo, bhi) = self.bodies.world_aabb(i);
+      if bhi.x < lo.x
+        || blo.x > hi.x
+        || bhi.y < lo.y
+        || blo.y > hi.y
+        || bhi.z < lo.z
+        || blo.z > hi.z
+      {
+        self.bodies.freeze(i);
+        n += 1;
+      }
+    }
+    n
+  }
+
   pub fn step(&mut self, grids: &Volumes, dt: f32, cfg: &StepConfig) -> StepStats {
-    let Self { bodies, cache, pool } = self;
+    let Self { bodies, statics, cache, pool } = self;
+    let statics: &StaticField = statics;
     let pool = pool.get_or_insert_with(|| ThreadPoolBuilder::default().build());
     //
     let fast = (0..bodies.len())
@@ -191,7 +223,7 @@ impl PhysicsWorld {
     pool.install(|| {
       if k == 1 {
         let pairs = broad_phase(bodies);
-        let mut s = step_inner(bodies, cache, grids, &pairs, &pairs, &[], dt, cfg);
+        let mut s = step_inner(bodies, statics, cache, grids, &pairs, &pairs, &[], dt, cfg);
         s.pairs = pairs.len();
         s.subdiv = 1;
         return s;
@@ -203,10 +235,11 @@ impl PhysicsWorld {
         .collect();
       let (fresh, stale): (Vec<_>, Vec<_>) =
         pairs.iter().copied().partition(|&(a, b)| moving[a] || moving[b]);
-      let stale_cons = build(grids, bodies, &stale, cfg);
+      let stale_cons = build(statics, grids, bodies, &stale, cfg);
       let mut stats = StepStats::default();
       for _ in 0..k {
-        let s = step_inner(bodies, cache, grids, &fresh, &pairs, &stale_cons, dt / k as f32, cfg);
+        let s =
+          step_inner(bodies, statics, cache, grids, &fresh, &pairs, &stale_cons, dt / k as f32, cfg);
         merge_stats(&mut stats, &s);
       }
       stats.pairs = pairs.len();
@@ -283,6 +316,7 @@ fn merge_stats(acc: &mut StepStats, s: &StepStats) {
 #[allow(clippy::too_many_arguments)]
 fn step_inner(
   bodies: &mut BodySet,
+  statics: &StaticField,
   cache: &mut HashMap<u64, [f32; 3]>,
   grids: &Volumes,
   build_pairs: &[(usize, usize)],
@@ -308,7 +342,7 @@ fn step_inner(
   }
   tick(&mut prof.broad_ms, t);
   let t = cfg.profile.then(std::time::Instant::now);
-  let mut cons = build(grids, bodies, build_pairs, cfg);
+  let mut cons = build(statics, grids, bodies, build_pairs, cfg);
   cons.extend_from_slice(reused);
   count_contacts(&cons, &mut stats);
   bodies.update_all_inertia();
@@ -317,6 +351,10 @@ fn step_inner(
     if let Some(&imp) = carried.get(&c.key()) {
       c.set_impulse(imp);
     }
+  }
+  for c in &mut cons {
+    c.capture_restitution(bodies, &cfg.params);
+    c.reset_pseudo();
   }
   tick(&mut prof.build_ms, t);
   let t = cfg.profile.then(std::time::Instant::now);
@@ -347,7 +385,24 @@ fn step_inner(
   }
   carried.clear();
   for c in &cons {
+    if c.bouncing() {
+      continue;
+    }
     carried.insert(c.key(), c.impulse());
+  }
+  if cfg.position_beta > 0.0 {
+    bodies.clear_pseudo();
+    for _ in 0..cfg.position_iterations.max(1) {
+      for_each_color(&mut cons, bodies, &ranges, |c, b| {
+        c.solve_position(b, cfg.position_beta, dt);
+      });
+    }
+    for i in 0..bodies.len() {
+      if bodies.integrate_pseudo(i, dt) {
+        bodies.sleep_timer[i] = 0.0;
+      }
+    }
+    bodies.clear_pseudo();
   }
   let t = cfg.profile.then(std::time::Instant::now);
   stats.max_penetration = cons.iter().map(|c| c.penetration()).fold(0.0f32, f32::max);
@@ -397,6 +452,7 @@ fn for_each_color(
 }
 
 fn build(
+  statics: &StaticField,
   grids: &Volumes,
   bodies: &BodySet,
   pairs: &[(usize, usize)],
@@ -406,7 +462,7 @@ fn build(
     pairs.par_iter().with_thread_pool(micropool::split_per(64)).fold_per_thread(
       Vec::new,
       |mut acc, &(ia, ib)| {
-        build_pair_into(&mut acc, grids, bodies, ia, ib, cfg);
+        build_pair_into(&mut acc, statics, grids, bodies, ia, ib, cfg);
         acc
       },
       Vec::with_capacity,
@@ -441,12 +497,17 @@ fn count_contacts(cons: &[ContactConstraint], stats: &mut StepStats) {
 
 fn build_pair_into(
   out: &mut Vec<ContactConstraint>,
+  statics: &StaticField,
   grids: &Volumes,
   bodies: &BodySet,
   ia: usize,
   ib: usize,
   cfg: &StepConfig,
 ) {
+  if (ia == WORLD_BODY || ib == WORLD_BODY) && bodies.is_static(WORLD_BODY) {
+    build_world_pair_into(out, statics, grids, bodies, ia, ib, cfg);
+    return;
+  }
   if bodies.sleeping[ia] && bodies.sleeping[ib] {
     return;
   }
@@ -470,11 +531,77 @@ fn build_pair_into(
     local: bodies.local_bounds[other],
     world: bodies.world_aabb(other),
   };
-  let m = manifold_bounded(&pa, &pb, &cfg.contact);
-  out.reserve(m.points.len());
-  for c in &m.points {
-    out.push(ContactConstraint::new(c, probe, other, &cfg.params));
+  SCRATCH.with(|s| {
+    let mut guard = s.borrow_mut();
+    let (cand, pts) = &mut *guard;
+    manifold_into(&pa, &pb, &cfg.contact, cand, pts);
+    out.reserve(pts.len());
+    for c in pts.iter() {
+      out.push(ContactConstraint::new(c, probe, other, &cfg.params));
+    }
+  });
+}
+
+fn build_world_pair_into(
+  out: &mut Vec<ContactConstraint>,
+  statics: &StaticField,
+  grids: &Volumes,
+  bodies: &BodySet,
+  ia: usize,
+  ib: usize,
+  cfg: &StepConfig,
+) {
+  let other = if ia == WORLD_BODY { ib } else { ia };
+  if other == WORLD_BODY || bodies.sleeping[other] {
+    return;
   }
+  let (Some(gw), Some(go)) = (
+    grids.list.get(bodies.grid_index[WORLD_BODY]),
+    grids.list.get(bodies.grid_index[other]),
+  ) else {
+    return;
+  };
+  let po = Probe {
+    field: Field::new_at(go, bodies.field_transform(other)),
+    vox: &bodies.vox[other],
+    local: bodies.local_bounds[other],
+    world: bodies.world_aabb(other),
+  };
+  let blo = po.world.0.floor().as_ivec3();
+  let bhi = po.world.1.ceil().as_ivec3();
+  let c_lo = chunk_of(blo);
+  let c_hi = chunk_of(bhi);
+  let gw_tr = gw.transform();
+  SCRATCH.with(|s| {
+    let mut guard = s.borrow_mut();
+    let (cand, pts) = &mut *guard;
+    cand.clear();
+    pts.clear();
+    for cz in c_lo.z..=c_hi.z {
+      for cy in c_lo.y..=c_hi.y {
+        for cx in c_lo.x..=c_hi.x {
+          let Some(sc) = statics.get(IVec3::new(cx, cy, cz)) else { continue };
+          let pc = Probe {
+            field: Field::new_at(gw, gw_tr),
+            vox: &sc.vox,
+            local: sc.local,
+            world: world_aabb_of(sc.local, gw_tr),
+          };
+          probe_pairs(&po, &pc, cand);
+        }
+      }
+    }
+    finish(cand, &cfg.contact, po.field.transform().scale, pts);
+    out.reserve(pts.len());
+    for c in pts.iter() {
+      out.push(ContactConstraint::new(c, other, WORLD_BODY, &cfg.params));
+    }
+  });
+}
+
+thread_local! {
+  static SCRATCH: std::cell::RefCell<(Vec<Contact>, Vec<Contact>)> =
+    std::cell::RefCell::new((Vec::new(), Vec::new()));
 }
 
 #[derive(Clone, Copy)]
@@ -491,6 +618,7 @@ fn broad_phase(bodies: &BodySet) -> Vec<(usize, usize)> {
   }
   let dyn_start = if bodies.is_static(WORLD_BODY) { 1 } else { 0 };
   let mut sweep: Vec<Sweep> = (dyn_start..bodies.len())
+    .filter(|&body| !bodies.is_frozen(body))
     .map(|body| {
       let (lo, hi) = bodies.world_aabb(body);
       Sweep { body, lo, hi }

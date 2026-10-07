@@ -90,6 +90,13 @@ impl VoxelBits {
   }
 
   #[inline]
+  pub fn clamp_region(&self, lo: IVec3, hi: IVec3) -> Option<(IVec3, IVec3)> {
+    let lo = lo.max(self.lo);
+    let hi = hi.min(self.lo + self.size - IVec3::ONE);
+    lo.cmple(hi).all().then_some((lo, hi))
+  }
+
+  #[inline]
   pub fn strides(&self) -> (usize, usize) {
     let sx = self.size.x as usize;
     (sx, sx * self.size.y as usize)
@@ -148,8 +155,8 @@ pub struct ContactVoxels {
 impl ContactVoxels {
   pub fn build(field: &Field, (lo, hi): (IVec3, IVec3)) -> Self {
     let mut out = Self {
-      solid: VoxelBits::covering(lo, hi),
-      edge: VoxelBits::covering(lo, hi),
+      solid: VoxelBits::covering(lo - IVec3::ONE, hi + IVec3::ONE),
+      edge: VoxelBits::covering(lo - IVec3::ONE, hi + IVec3::ONE),
       ..Self::default()
     };
     let start = lo & IVec3::splat(!(CHUNK_SIZE - 1));
@@ -169,11 +176,6 @@ impl ContactVoxels {
     sort_xyz(&mut out.corners);
     sort_xyz(&mut out.edges);
     out
-  }
-
-  #[inline]
-  pub fn has_edge(&self, p: IVec3) -> bool {
-    self.edge.get(p) == Some(true)
   }
 
   #[inline]

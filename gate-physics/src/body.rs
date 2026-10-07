@@ -72,6 +72,8 @@ pub struct BodySet {
   pub rot: Vec<Mat3>,
   pub lin_vel: Vec<Vec3>,
   pub ang_vel: Vec<Vec3>,
+  pub pseudo_lin: Vec<Vec3>,
+  pub pseudo_ang: Vec<Vec3>,
   pub inv_mass: Vec<f32>,
   pub inv_inertia_local: Vec<Mat3>,
   pub inv_inertia: Vec<Mat3>,
@@ -82,6 +84,7 @@ pub struct BodySet {
   pub vox: Vec<ContactVoxels>,
   pub sleep_timer: Vec<f32>,
   pub sleeping: Vec<bool>,
+  pub frozen: Vec<bool>,
 }
 
 impl BodySet {
@@ -102,6 +105,8 @@ impl BodySet {
     self.rot.push(Mat3::IDENTITY);
     self.lin_vel.push(Vec3::ZERO);
     self.ang_vel.push(Vec3::ZERO);
+    self.pseudo_lin.push(Vec3::ZERO);
+    self.pseudo_ang.push(Vec3::ZERO);
     self.inv_mass.push(0.0);
     self.inv_inertia_local.push(Mat3::ZERO);
     self.inv_inertia.push(Mat3::ZERO);
@@ -112,6 +117,7 @@ impl BodySet {
     self.vox.push(ContactVoxels::default());
     self.sleep_timer.push(0.0);
     self.sleeping.push(true);
+    self.frozen.push(false);
     self.len() - 1
   }
 
@@ -130,6 +136,8 @@ impl BodySet {
     self.rot.push(rot);
     self.lin_vel.push(Vec3::ZERO);
     self.ang_vel.push(Vec3::ZERO);
+    self.pseudo_lin.push(Vec3::ZERO);
+    self.pseudo_ang.push(Vec3::ZERO);
     self.inv_mass.push(1.0 / props.mass);
     self.inv_inertia_local.push(inv);
     self.inv_inertia.push(Mat3::ZERO);
@@ -140,6 +148,7 @@ impl BodySet {
     self.vox.push(ContactVoxels::default());
     self.sleep_timer.push(0.0);
     self.sleeping.push(false);
+    self.frozen.push(false);
     let i = self.len() - 1;
     self.update_inertia(i);
     i
@@ -152,6 +161,8 @@ impl BodySet {
     self.rot.swap_remove(i);
     self.lin_vel.swap_remove(i);
     self.ang_vel.swap_remove(i);
+    self.pseudo_lin.swap_remove(i);
+    self.pseudo_ang.swap_remove(i);
     self.inv_mass.swap_remove(i);
     self.inv_inertia_local.swap_remove(i);
     self.inv_inertia.swap_remove(i);
@@ -162,6 +173,7 @@ impl BodySet {
     self.vox.swap_remove(i);
     self.sleep_timer.swap_remove(i);
     self.sleeping.swap_remove(i);
+    self.frozen.swap_remove(i);
     last
   }
 
@@ -201,11 +213,28 @@ impl BodySet {
   }
 
   pub fn wake(&mut self, i: usize) {
-    if self.is_static(i) {
+    if self.is_static(i) || self.frozen[i] {
       return;
     }
     self.sleeping[i] = false;
     self.sleep_timer[i] = 0.0;
+  }
+
+  pub fn freeze(&mut self, i: usize) {
+    if self.is_static(i) {
+      return;
+    }
+    self.frozen[i] = true;
+    self.sleeping[i] = true;
+    self.sleep_timer[i] = 0.0;
+    self.lin_vel[i] = Vec3::ZERO;
+    self.ang_vel[i] = Vec3::ZERO;
+    self.pseudo_lin[i] = Vec3::ZERO;
+    self.pseudo_ang[i] = Vec3::ZERO;
+  }
+
+  pub fn is_frozen(&self, i: usize) -> bool {
+    self.frozen[i]
   }
 
   pub fn put_to_sleep(&mut self, i: usize) {
@@ -215,6 +244,36 @@ impl BodySet {
     self.sleeping[i] = true;
     self.lin_vel[i] = Vec3::ZERO;
     self.ang_vel[i] = Vec3::ZERO;
+    self.pseudo_lin[i] = Vec3::ZERO;
+    self.pseudo_ang[i] = Vec3::ZERO;
+  }
+
+  pub fn clear_pseudo(&mut self) {
+    self.pseudo_lin.fill(Vec3::ZERO);
+    self.pseudo_ang.fill(Vec3::ZERO);
+  }
+
+  pub fn apply_pseudo_impulse(&mut self, i: usize, p: Vec3, r: Vec3) {
+    if self.sleeping[i] {
+      return;
+    }
+    self.pseudo_lin[i] += self.inv_mass[i] * p;
+    self.pseudo_ang[i] += self.inv_inertia[i] * r.cross(p);
+  }
+
+  pub fn integrate_pseudo(&mut self, i: usize, h: f32) -> bool {
+    if self.sleeping[i] || (self.pseudo_lin[i] == Vec3::ZERO && self.pseudo_ang[i] == Vec3::ZERO) {
+      return false;
+    }
+    let d = self.pseudo_lin[i] * h;
+    self.pos[i] += d;
+    let w = self.pseudo_ang[i] * h;
+    let l = w.length();
+    if l > 1e-12 {
+      self.rot[i] = orthonormalize(Mat3::from_axis_angle(w / l, l) * self.rot[i]);
+      self.update_inertia(i);
+    }
+    d.length_squared() > 0.0625
   }
 
   pub fn is_slow(&self, i: usize, lin: f32, ang: f32) -> bool {
@@ -251,6 +310,10 @@ impl BodySet {
 
   pub fn point_velocity(&self, i: usize, r: Vec3) -> Vec3 {
     self.lin_vel[i] + self.ang_vel[i].cross(r)
+  }
+
+  pub fn pseudo_point_velocity(&self, i: usize, r: Vec3) -> Vec3 {
+    self.pseudo_lin[i] + self.pseudo_ang[i].cross(r)
   }
 
   pub fn effective_mass(&self, i: usize, r: Vec3, dir: Vec3) -> f32 {

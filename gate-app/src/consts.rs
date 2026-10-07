@@ -45,6 +45,16 @@ pub fn phys_pile() -> bool {
   })
 }
 
+pub fn phys_pile_count() -> usize {
+  static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+  *N.get_or_init(|| {
+    std::env::var("GATE_PHYS")
+      .ok()
+      .and_then(|v| v.split(':').nth(1).and_then(|s| s.trim().parse().ok()))
+      .unwrap_or(crate::objects::PILE_COUNT)
+  })
+}
+
 pub const BENCH_FLY_SPEED: f32 = 2000.0;
 pub const BENCH_FLY_TURN: f32 = 0.16;
 pub const BENCH_FLY_YAW: f32 = 0.35;

@@ -15,11 +15,13 @@ pub trait Constraint {
 #[derive(Clone, Copy, Debug)]
 pub struct ContactParams {
   pub friction: f32,
+  pub restitution: f32,
+  pub restitution_threshold: f32,
 }
 
 impl Default for ContactParams {
   fn default() -> Self {
-    Self { friction: 0.6 }
+    Self { friction: 0.6, restitution: 0.2, restitution_threshold: 50.0 }
   }
 }
 
@@ -39,6 +41,8 @@ pub struct ContactConstraint {
   depth: f32,
   friction: f32,
   accum: [f32; 3],
+  target_vn: f32,
+  pseudo: f32,
   color: u8,
   path: ContactPath,
 }
@@ -71,6 +75,8 @@ impl ContactConstraint {
       depth: c.depth,
       friction: p.friction,
       accum: [0.0; 3],
+      target_vn: 0.0,
+      pseudo: 0.0,
       color: 0,
       path: c.path,
     }
@@ -87,7 +93,47 @@ impl ContactConstraint {
   pub fn penetration(&self) -> f32 {
     self.depth
   }
+
+  pub fn bouncing(&self) -> bool {
+    self.target_vn != 0.0
+  }
+
+  pub fn reset_pseudo(&mut self) {
+    self.pseudo = 0.0;
+  }
+
+  pub fn capture_restitution(&mut self, bodies: &BodySet, p: &ContactParams) {
+    self.target_vn = 0.0;
+    if p.restitution <= 0.0 {
+      return;
+    }
+    let ra = bodies.rot[self.ia] * ((self.local_a - bodies.com[self.ia]) * bodies.scale[self.ia]);
+    let rb = bodies.rot[self.ib] * ((self.local_b - bodies.com[self.ib]) * bodies.scale[self.ib]);
+    let vn = relative_velocity(bodies, self.ia, self.ib, ra, rb).dot(self.n);
+    if vn < -p.restitution_threshold {
+      self.target_vn = -p.restitution * vn;
+    }
+  }
+
+  pub fn solve_position(&mut self, bodies: &mut BodySet, beta: f32, h: f32) {
+    let pen = self.depth - POSITION_SLOP;
+    if pen <= 0.0 {
+      return;
+    }
+    let target = beta * pen / h;
+    let vn = pseudo_velocity(bodies, self.ia, self.ib, self.ra, self.rb).dot(self.n);
+    let old = self.pseudo;
+    self.pseudo = (old + self.mass_n * (target - vn)).max(0.0);
+    let applied = self.pseudo - old;
+    if applied != 0.0 {
+      apply_pseudo(bodies, self.ia, self.ib, self.n * applied, self.ra, self.rb);
+    }
+  }
 }
+
+pub const POSITION_SLOP: f32 = 0.1;
+
+pub const POSITION_BETA: f32 = 0.45;
 
 impl Constraint for ContactConstraint {
   fn prepare(&mut self, bodies: &BodySet) {
@@ -113,7 +159,7 @@ impl Constraint for ContactConstraint {
     {
       let vn = relative_velocity(bodies, self.ia, self.ib, self.ra, self.rb).dot(self.n);
       let old = self.accum[0];
-      self.accum[0] = (old + self.mass_n * -vn).max(0.0);
+      self.accum[0] = (old + self.mass_n * (self.target_vn - vn)).max(0.0);
       let applied = self.accum[0] - old;
       if applied != 0.0 {
         apply(bodies, self.ia, self.ib, self.n * applied, self.ra, self.rb);
@@ -153,6 +199,10 @@ impl Constraint for ContactConstraint {
 
 fn relative_velocity(bodies: &BodySet, ia: usize, ib: usize, ra: Vec3, rb: Vec3) -> Vec3 {
   bodies.point_velocity(ib, rb) - bodies.point_velocity(ia, ra)
+}
+
+fn pseudo_velocity(bodies: &BodySet, ia: usize, ib: usize, ra: Vec3, rb: Vec3) -> Vec3 {
+  bodies.pseudo_point_velocity(ib, rb) - bodies.pseudo_point_velocity(ia, ra)
 }
 
 pub fn color_by_body(cons: &mut [ContactConstraint], bodies: &BodySet) -> Vec<(usize, usize)> {
@@ -206,6 +256,11 @@ pub fn color_by_body(cons: &mut [ContactConstraint], bodies: &BodySet) -> Vec<(u
 fn apply(bodies: &mut BodySet, ia: usize, ib: usize, p: Vec3, ra: Vec3, rb: Vec3) {
   bodies.apply_impulse(ib, p, rb);
   bodies.apply_impulse(ia, -p, ra);
+}
+
+fn apply_pseudo(bodies: &mut BodySet, ia: usize, ib: usize, p: Vec3, ra: Vec3, rb: Vec3) {
+  bodies.apply_pseudo_impulse(ib, p, rb);
+  bodies.apply_pseudo_impulse(ia, -p, ra);
 }
 
 fn mix_pair(key: u64, ia: usize, ib: usize) -> u64 {

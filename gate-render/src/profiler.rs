@@ -230,16 +230,12 @@ pub(crate) struct CpuProbe {
 }
 
 fn cpu_probe(mut st: ResMut<CpuProbe>) {
-  let Some(t0) = st.last else {
-    st.last = Some(std::time::Instant::now());
-    return;
-  };
   let now = std::time::Instant::now();
+  let Some(t0) = st.last.replace(now) else { return };
   let idx = st.idx;
   if let Some(a) = st.acc.get_mut(idx) {
     *a += now.duration_since(t0).as_secs_f64();
   }
-  st.last = Some(now);
   st.idx += 1;
   if st.idx < st.names.len() {
     return;
@@ -296,7 +292,13 @@ fn setup_cpu_probe(app: &mut App) {
   if let Some(first) = names.first_mut() {
     *first = format!("帧间+{first}");
   }
-  app.insert_resource(CpuProbe { acc: vec![0.0; names.len()], names, idx: 0, last: None, n: 0 });
+  app.insert_resource(CpuProbe {
+    acc: vec![0.0; names.len()],
+    names,
+    idx: 0,
+    last: Some(std::time::Instant::now()),
+    n: 0,
+  });
   app.add_systems(GateCpuProbe, cpu_probe);
 }
 
@@ -544,6 +546,13 @@ fn report_lod_diag(
       d[26] as f32 / faces,
     );
   }
+  let calls = (d[34]).max(1) as f32;
+  info!(
+    "DIAG[近场射线 {} 条（1/64 采样）| 叶条目 {:.2}/条 实际 march {:.2}/条]",
+    d[34],
+    d[32] as f32 / calls,
+    d[33] as f32 / calls,
+  );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

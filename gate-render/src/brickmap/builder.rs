@@ -237,10 +237,15 @@ impl BrickMapBuilder {
   }
 
   pub fn new_unbuilt(grid: &VolumeGrid) -> Self {
-    Self::new_unbuilt_sized(grid, 0, 0)
+    Self::new_unbuilt_sized(grid, 0, 0, true)
   }
 
-  pub fn new_unbuilt_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
+  pub fn new_unbuilt_sized(
+    grid: &VolumeGrid,
+    reserve_words: usize,
+    region_chunks: usize,
+    occ: bool,
+  ) -> Self {
     let (origin, dims, rejected) = compute_window(grid);
     let tree_base = Self::tree_base(dims);
     let mut b = Self {
@@ -285,8 +290,8 @@ impl BrickMapBuilder {
       resident_log: Vec::new(),
       resident_epoch: 0,
       resident_seq: 0,
-      occ: vec![0; OCC_WORDS],
-      occ_dirty: true,
+      occ: if occ { vec![0; OCC_WORDS] } else { Vec::new() },
+      occ_dirty: false,
     };
     if reserve_words > 0 {
       b.free.free(tree_base, reserve_words);
@@ -300,11 +305,16 @@ impl BrickMapBuilder {
   }
 
   pub fn build_full(grid: &VolumeGrid) -> Self {
-    Self::build_full_sized(grid, 0, 0)
+    Self::build_full_sized(grid, 0, 0, true)
   }
 
-  pub fn build_full_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
-    let mut b = Self::new_unbuilt_sized(grid, reserve_words, region_chunks);
+  pub fn build_full_sized(
+    grid: &VolumeGrid,
+    reserve_words: usize,
+    region_chunks: usize,
+    occ: bool,
+  ) -> Self {
+    let mut b = Self::new_unbuilt_sized(grid, reserve_words, region_chunks, occ);
     let mut coords: Vec<ChunkCoord> = grid
       .chunk_coords()
       .filter(|&c| chunk_index_pos(b.origin, b.dims, c.0).is_some() && chunk_has_content(grid, c))
@@ -464,6 +474,9 @@ impl BrickMapBuilder {
   }
 
   fn occ_set(&mut self, coord: ChunkCoord) {
+    if self.occ.is_empty() {
+      return;
+    }
     if let Some(rel) = chunk_rel(self.origin, self.dims, coord.0) {
       let b = occ_bit(rel);
       self.occ[b >> 5] |= 1u32 << (b & 31);
@@ -472,6 +485,9 @@ impl BrickMapBuilder {
   }
 
   fn occ_clear(&mut self, coord: ChunkCoord) {
+    if self.occ.is_empty() {
+      return;
+    }
     if let Some(rel) = chunk_rel(self.origin, self.dims, coord.0) {
       let b = occ_bit(rel);
       self.occ[b >> 5] &= !(1u32 << (b & 31));
@@ -480,16 +496,15 @@ impl BrickMapBuilder {
   }
 
   fn occ_rebuild(&mut self) {
+    if self.occ.is_empty() {
+      return;
+    }
     self.occ.fill(0);
     let cs: Vec<ChunkCoord> = self.chunks.keys().copied().collect();
     for c in cs {
       self.occ_set(c);
     }
     self.occ_dirty = true;
-  }
-
-  pub fn occ_len(&self) -> usize {
-    self.occ.len()
   }
 
   pub fn occ_words(&self) -> &[u32] {
@@ -910,11 +925,13 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
 }
 
 fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
-  const STEP: i32 = 16;
-  const TOP: i32 = 64;
-  let lvl =
-    gate_voxel::LEVEL_EXTENT.iter().position(|&e| e == STEP).expect("16 必须是 brick 粒度之一")
-      as u8;
+  const N64: i32 = 64;
+  const N16: i32 = 16;
+  const N4: i32 = 4;
+  let lvl = |e: i32| {
+    gate_voxel::LEVEL_EXTENT.iter().position(|&l| l == e).expect("粒度必须是 LEVEL_EXTENT 之一") as u8
+  };
+  let (l16, l4) = (lvl(N16), lvl(N4));
   let mut lo = IVec3::splat(i32::MAX);
   let mut hi = IVec3::splat(i32::MIN);
   let mut any = false;
@@ -931,21 +948,48 @@ fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
         continue;
       }
       let (ix, iy, iz) = crate::brickmap::rt::slab_axes(i);
-      let top = IVec3::new(ix as i32, iy as i32, iz as i32) * TOP;
-      any = true;
-      if tree.get_uniform(top.x, top.y, top.z, 1).is_some() {
-        lo = lo.min(base + top);
-        hi = hi.max(base + top + IVec3::splat(TOP - 1));
+      let p64 = IVec3::new(ix as i32, iy as i32, iz as i32) * N64;
+      if tree.get_uniform(p64.x, p64.y, p64.z, l16 - 1).is_some() {
+        any = true;
+        lo = lo.min(base + p64);
+        hi = hi.max(base + p64 + IVec3::splat(N64 - 1));
         continue;
       }
-      for k in 0..64u32 {
-        let (kx, ky, kz) = crate::brickmap::rt::slab_axes(k);
-        let p = top + IVec3::new(kx as i32, ky as i32, kz as i32) * STEP;
-        if matches!(tree.get_brick_state(p.x, p.y, p.z, lvl), BrickState::Air) {
+      for j in 0..64u32 {
+        let (jx, jy, jz) = crate::brickmap::rt::slab_axes(j);
+        let p16 = p64 + IVec3::new(jx as i32, jy as i32, jz as i32) * N16;
+        if matches!(tree.get_brick_state(p16.x, p16.y, p16.z, l16), BrickState::Air) {
           continue;
         }
-        lo = lo.min(base + p);
-        hi = hi.max(base + p + IVec3::splat(STEP - 1));
+        if tree.get_uniform(p16.x, p16.y, p16.z, l16).is_some() {
+          any = true;
+          lo = lo.min(base + p16);
+          hi = hi.max(base + p16 + IVec3::splat(N16 - 1));
+          continue;
+        }
+        for k in 0..64u32 {
+          let (kx, ky, kz) = crate::brickmap::rt::slab_axes(k);
+          let p4 = p16 + IVec3::new(kx as i32, ky as i32, kz as i32) * N4;
+          if matches!(tree.get_brick_state(p4.x, p4.y, p4.z, l4), BrickState::Air) {
+            continue;
+          }
+          if tree.get_uniform(p4.x, p4.y, p4.z, l4).is_some() {
+            any = true;
+            lo = lo.min(base + p4);
+            hi = hi.max(base + p4 + IVec3::splat(N4 - 1));
+            continue;
+          }
+          for m in 0..64u32 {
+            let (mx, my, mz) = crate::brickmap::rt::slab_axes(m);
+            let v = p4 + IVec3::new(mx as i32, my as i32, mz as i32);
+            if tree.get_voxel(v.x, v.y, v.z).is_none() {
+              continue;
+            }
+            any = true;
+            lo = lo.min(base + v);
+            hi = hi.max(base + v);
+          }
+        }
       }
     }
   }
@@ -967,7 +1011,7 @@ pub struct VolumesSnapshot {
   pub struct_total_bytes_p1: usize,
   pub palette_total_bytes: usize,
   pub dirty_chunks: usize,
-  pub occ_all: Option<Vec<u32>>,
+  pub occ_range: Option<(usize, Vec<u32>)>,
 }
 
 pub struct VolumesBuilder {
@@ -977,6 +1021,7 @@ pub struct VolumesBuilder {
   coverage: Vec<f32>,
   tight: Vec<Option<(IVec3, IVec3)>>,
   tight_gen: Vec<u64>,
+  tight_window_gen: Vec<u64>,
   budget_bytes: usize,
   prev_tree_bases: Vec<u32>,
   prev_palette_bases: Vec<u32>,
@@ -1012,12 +1057,13 @@ impl VolumesBuilder {
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
     let mut coverage = Vec::with_capacity(volumes.len());
-    for grid in volumes.all() {
+    for (idx, grid) in volumes.all().iter().enumerate() {
       let region_chunks = Self::region_chunks_of(grid, budget_bytes);
       builders.push(BrickMapBuilder::build_full_sized(
         grid,
         Self::reserve_of(grid, region_chunks),
         region_chunks,
+        idx < super::consts::OCC_VOLUMES,
       ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
@@ -1030,6 +1076,7 @@ impl VolumesBuilder {
       coverage,
       tight: vec![None; volumes.len()],
       tight_gen: vec![u64::MAX; volumes.len()],
+      tight_window_gen: vec![u64::MAX; volumes.len()],
       budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
@@ -1045,12 +1092,13 @@ impl VolumesBuilder {
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
     let mut coverage = Vec::with_capacity(volumes.len());
-    for grid in volumes.all() {
+    for (idx, grid) in volumes.all().iter().enumerate() {
       let region_chunks = Self::region_chunks_of(grid, budget_bytes);
       builders.push(BrickMapBuilder::new_unbuilt_sized(
         grid,
         Self::reserve_of(grid, region_chunks),
         region_chunks,
+        idx < super::consts::VOLUMES,
       ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
@@ -1063,6 +1111,7 @@ impl VolumesBuilder {
       coverage,
       tight: vec![None; volumes.len()],
       tight_gen: vec![u64::MAX; volumes.len()],
+      tight_window_gen: vec![u64::MAX; volumes.len()],
       budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
@@ -1090,6 +1139,7 @@ impl VolumesBuilder {
         grid,
         Self::reserve_of(grid, region_chunks),
         region_chunks,
+        idx < super::consts::OCC_VOLUMES,
       ));
       self.transforms.push(grid.transform());
       self.far.push(grid.is_far_level());
@@ -1104,6 +1154,7 @@ impl VolumesBuilder {
       self.coverage[i] = grid.coverage_r();
     }
     self.sync_tight(volumes);
+    self.sync_windows_tight(volumes);
   }
 
   fn sync_tight(&mut self, volumes: &Volumes) {
@@ -1121,6 +1172,26 @@ impl VolumesBuilder {
       if self.tight_gen[i] != stamp {
         self.tight[i] = tight_local(grid);
         self.tight_gen[i] = stamp;
+      }
+    }
+  }
+
+  fn sync_windows_tight(&mut self, volumes: &Volumes) {
+    let n = volumes.all().len();
+    if self.tight_window_gen.len() < n {
+      self.tight_window_gen.resize(n, u64::MAX);
+    }
+    for (i, grid) in volumes.all().iter().enumerate() {
+      if i == 0 || self.far[i] || grid.stream_window().is_some() {
+        continue;
+      }
+      let stamp = grid.edit_generation();
+      if self.tight_window_gen[i] == stamp {
+        continue;
+      }
+      self.tight_window_gen[i] = stamp;
+      if let Some((o, d)) = tight_window(grid) {
+        self.builders[i].set_window(o, d);
       }
     }
   }
@@ -1361,19 +1432,27 @@ impl VolumesBuilder {
       struct_total_bytes_p1: page_used[1] * 4,
       palette_total_bytes: palette_total_words * 4,
       dirty_chunks,
-      occ_all: {
-        if self.builders.iter().any(BrickMapBuilder::occ_dirty_pending) {
-          let kept = self.builders.len().min(super::consts::VOLUMES);
-          let mut v = Vec::with_capacity(kept * OCC_WORDS);
-          for (i, b) in self.builders.iter_mut().enumerate() {
-            b.take_occ_dirty();
-            if i < super::consts::VOLUMES {
-              v.extend_from_slice(b.occ_words());
-            }
+      occ_range: {
+        let limit = self.builders.len().min(super::consts::OCC_VOLUMES);
+        let (mut first, mut last) = (usize::MAX, 0usize);
+        for (i, b) in self.builders.iter_mut().enumerate() {
+          let dirty = b.take_occ_dirty();
+          if i >= limit {
+            continue;
           }
-          Some(v)
-        } else {
+          if dirty || full {
+            first = first.min(i);
+            last = last.max(i);
+          }
+        }
+        if first == usize::MAX {
           None
+        } else {
+          let mut v = Vec::with_capacity((last - first + 1) * OCC_WORDS);
+          for i in first..=last {
+            v.extend_from_slice(self.builders[i].occ_words());
+          }
+          Some((first, v))
         }
       },
     }
@@ -1479,6 +1558,21 @@ impl VolumesBuilder {
   pub fn is_empty(&self) -> bool {
     self.builders.is_empty()
   }
+}
+
+fn tight_window(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
+  let (mut min, mut max, mut any) = (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN), false);
+  for c in grid.chunk_coords() {
+    if chunk_has_content(grid, c) {
+      any = true;
+      min = min.min(c.0);
+      max = max.max(c.0);
+    }
+  }
+  if !any {
+    return None;
+  }
+  Some((min, max - min + IVec3::ONE))
 }
 
 fn compute_window(grid: &VolumeGrid) -> (IVec3, IVec3, usize) {

@@ -1,7 +1,8 @@
-import package::bindings::{g, grid_descs, inst_bvh};
+import package::bindings::{g, grid_descs, inst_bvh, lod_diag};
 import package::brickmap::{Grid, sample_brickmap};
 import package::common::{face_normal_from_index};
-import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid};
+import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid, diag_ray, DIAG_NEAR_CALLS,
+  DIAG_LEAF_ITER, DIAG_LEAF_MARCH};
 
 fn vol_tint_color(h: WorldHit) -> vec3<f32> {
   if (!h.hit) {
@@ -70,7 +71,7 @@ fn level_cap(cov: f32, dir: vec3<f32>) -> f32 {
 
 const BVH_HEADER: u32 = 4u;
 const BVH_NODE_WORDS: u32 = 8u;
-const BVH_STACK: u32 = 48u;
+const BVH_STACK: u32 = 16u;
 
 fn bvh_bits(w: u32) -> f32 {
   return bitcast<f32>(inst_bvh[w]);
@@ -93,7 +94,7 @@ fn bvh_node_slab(idx: u32, origin: vec3<f32>, inv: vec3<f32>) -> vec2<f32> {
 
 fn bvh_leaf(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_hi_cap: f32, t_min: f32, depth_cap: u32,
             req: u32, best: ptr<function, SceneHit>, best_t: ptr<function, f32>,
-            mc: ptr<function, MediumRay>, gap: ptr<function, f32>) {
+            mc: ptr<function, MediumRay>, gap: ptr<function, f32>, marches: ptr<function, u32>) {
   var t_hi = min(*best_t, t_hi_cap);
   if (gi.coverage_r > 0.0) {
     t_hi = min(t_hi, level_cap(gi.coverage_r, dir));
@@ -101,6 +102,7 @@ fn bvh_leaf(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_hi_cap: f32, t_min: f
   if (t_min >= t_hi) {
     return;
   }
+  *marches = *marches + 1u;
   let mhi = trace_grid(gi, origin, dir, t_hi, t_min, depth_cap, false, req, mc, gap);
   if (mhi.hit && mhi.t < *best_t) {
     *best_t = mhi.t;
@@ -112,6 +114,9 @@ fn bvh_leaf(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_hi_cap: f32, t_min: f
 fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
               req: u32, best: ptr<function, SceneHit>, best_t: ptr<function, f32>,
               mc: ptr<function, MediumRay>, gap: ptr<function, f32>) {
+  let sampled = diag_ray(origin, dir);
+  var leaf_it: u32 = 0u;
+  var marches: u32 = 0u;
   if (inst_bvh[0u] == 0u) {
     return;
   }
@@ -136,32 +141,40 @@ fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_c
     }
     let count = inst_bvh[base + 7u];
     if (count == 0u) {
-                  let left = node + 1u;
+      let left = node + 1u;
       let right = inst_bvh[base + 3u];
       let sl_l = bvh_node_slab(left, origin, inv);
       let sl_r = bvh_node_slab(right, origin, inv);
-      if (sp + 2u <= BVH_STACK) {
-        if (sl_l.x <= sl_r.x) {
-          stack[sp] = right;
-          sp = sp + 1u;
-          stack[sp] = left;
-          sp = sp + 1u;
-        } else {
-          stack[sp] = left;
-          sp = sp + 1u;
-          stack[sp] = right;
-          sp = sp + 1u;
-        }
+      let ok_l = sl_l.x <= sl_l.y && sl_l.y >= t_min && sl_l.x <= *best_t && sl_l.x <= t_cap;
+      let ok_r = sl_r.x <= sl_r.y && sl_r.y >= t_min && sl_r.x <= *best_t && sl_r.x <= t_cap;
+      let l_first = sl_l.x <= sl_r.x;
+      let near = select(right, left, l_first);
+      let far = select(left, right, l_first);
+      let far_ok = select(ok_l, ok_r, l_first);
+      let near_ok = select(ok_r, ok_l, l_first);
+      if (far_ok && sp + 2u <= BVH_STACK) {
+        stack[sp] = far;
+        sp = sp + 1u;
+      }
+      if (near_ok && sp + 1u <= BVH_STACK) {
+        stack[sp] = near;
+        sp = sp + 1u;
       }
       continue;
     }
     let first = order_base + inst_bvh[base + 3u];
             let tl = max(t_min, sl.x);
     let th = min(t_cap, sl.y);
+    leaf_it = leaf_it + count;
     for (var k: u32 = 0u; k < count; k = k + 1u) {
       bvh_leaf(make_grid(inst_bvh[first + k]), origin, dir, th, tl, depth_cap, req,
-               best, best_t, mc, gap);
+               best, best_t, mc, gap, &marches);
     }
+  }
+  if (sampled) {
+    atomicAdd(&lod_diag[DIAG_NEAR_CALLS], 1u);
+    atomicAdd(&lod_diag[DIAG_LEAF_ITER], leaf_it);
+    atomicAdd(&lod_diag[DIAG_LEAF_MARCH], marches);
   }
 }
 
@@ -172,10 +185,10 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
   let far_base = inst_bvh[2u];
   let far_count = inst_bvh[3u];
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
-    let gi = make_grid(inst_bvh[far_base + k]);
     if (req == 0u && origin_xz < *shell) {
       continue;
     }
+    let gi = make_grid(inst_bvh[far_base + k]);
     var t_hi = min(*best_t, t_cap);
     if (gi.coverage_r > 0.0) {
       t_hi = min(t_hi, level_cap(gi.coverage_r, dir));
@@ -325,18 +338,20 @@ fn medium_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, stop_on_air: bool,
       let right = inst_bvh[base + 3u];
       let sl_l = bvh_node_slab(left, origin, inv);
       let sl_r = bvh_node_slab(right, origin, inv);
-      if (sp + 2u <= BVH_STACK) {
-        if (sl_l.x <= sl_r.x) {
-          stack[sp] = right;
-          sp = sp + 1u;
-          stack[sp] = left;
-          sp = sp + 1u;
-        } else {
-          stack[sp] = left;
-          sp = sp + 1u;
-          stack[sp] = right;
-          sp = sp + 1u;
-        }
+      let ok_l = sl_l.x <= sl_l.y && sl_l.y >= 0.0 && sl_l.x <= *best_t && sl_l.x <= t_cap;
+      let ok_r = sl_r.x <= sl_r.y && sl_r.y >= 0.0 && sl_r.x <= *best_t && sl_r.x <= t_cap;
+      let l_first = sl_l.x <= sl_r.x;
+      let near = select(right, left, l_first);
+      let far = select(left, right, l_first);
+      let far_ok = select(ok_l, ok_r, l_first);
+      let near_ok = select(ok_r, ok_l, l_first);
+      if (far_ok && sp + 2u <= BVH_STACK) {
+        stack[sp] = far;
+        sp = sp + 1u;
+      }
+      if (near_ok && sp + 1u <= BVH_STACK) {
+        stack[sp] = near;
+        sp = sp + 1u;
       }
       continue;
     }
@@ -363,10 +378,10 @@ fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_
     let far_base = inst_bvh[2u];
   let far_count = inst_bvh[3u];
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
-    let gi = make_grid(inst_bvh[far_base + k]);
     if (origin_xz < shell) {
       continue;
     }
+    let gi = make_grid(inst_bvh[far_base + k]);
     medium_one(gi, origin, dir, max_t, 0.0, stop_on_air, &best, &best_t, tint);
     shell = max(shell, coverage_r_of(gi));
   }

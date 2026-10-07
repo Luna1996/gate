@@ -2,16 +2,14 @@ use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
 use gate_physics::{
-  Field, PhysicsWorld, Probe, StepConfig, manifold_bounded, mass_properties, tight_bounds,
+  Field, PhysicsWorld, Probe, StepConfig, mass_properties, tight_bounds,
 };
 use gate_render::{DdaCameraConfig, VoxelScene};
 use gate_voxel::{VolumeGrid, Volumes};
 
 use crate::edit::{BrushMaterial, BrushShape, Burst};
 
-const REGION_SIDE: i32 = 32;
-const REGION_DOWN: i32 = 192;
-const REGION_UP: i32 = 16;
+const STATIC_MARGIN: f32 = 32.0;
 const FIXED_DT: f32 = 1.0 / 60.0;
 const MAX_STEPS_PER_FRAME: u32 = 1;
 pub const PHYS_SUBSTEPS: [u32; 4] = [4, 8, 16, 32];
@@ -23,7 +21,6 @@ pub struct PhysicsState {
   pub world: PhysicsWorld,
   pub cfg: StepConfig,
   static_ready: bool,
-  region: Option<(IVec3, IVec3)>,
   accumulator: f32,
   last_penetration: f32,
   last_contacts: usize,
@@ -47,7 +44,6 @@ impl Default for PhysicsState {
         ..StepConfig::default()
       },
       static_ready: false,
-      region: None,
       accumulator: 0.0,
       last_penetration: 0.0,
       last_contacts: 0,
@@ -61,38 +57,21 @@ impl Default for PhysicsState {
 }
 
 impl PhysicsState {
-  pub fn ensure_region(&mut self, main: &VolumeGrid, lo: Vec3, hi: Vec3) -> bool {
-    let aabb_lo = lo.floor().as_ivec3();
-    let aabb_hi = hi.ceil().as_ivec3();
-    if self.static_ready
-      && let Some((clo, chi)) = self.region
-      && clo.cmple(aabb_lo).all()
-      && chi.cmpge(aabb_hi).all()
-    {
-      return false;
-    }
-    let region = region_covering(lo, hi);
-    if self.static_ready {
-      let n = self.world.rebuild_static(main, region);
-      debug!(target: "gate", "PHYS[region] 重建 [{:?}]-[{:?}] 角棱 {n}", region.0, region.1);
-    } else {
-      self.world.init_static_world(main, region, 0);
-      self.static_ready = true;
-      info!(
-        target: "gate",
-        "PHYS[region] 建立 [{:?}]-[{:?}] 角棱 {}",
-        region.0, region.1, self.world.bodies.vox[0].len()
-      );
-    }
-    self.region = Some(region);
-    true
+  pub fn sync_statics(&mut self, main: &VolumeGrid, lo: Vec3, hi: Vec3) -> usize {
+    let m = Vec3::splat(STATIC_MARGIN);
+    let lo = (lo - m).floor().as_ivec3();
+    let hi = (hi + m).ceil().as_ivec3();
+    self.world.sync_static(main, lo, hi)
   }
 
   pub fn ensure_static_world(&mut self, main: &VolumeGrid, center: Vec3) -> bool {
     if self.static_ready {
       return false;
     }
-    self.ensure_region(main, center, center);
+    let b = center.floor().as_ivec3();
+    self.world.init_static_world(main, (b, b), 0);
+    self.static_ready = true;
+    info!(target: "gate", "PHYS[static] 建立 角棱 {}", self.world.statics.corners());
     true
   }
 
@@ -124,16 +103,8 @@ impl PhysicsState {
   pub fn reset(&mut self) {
     self.world = PhysicsWorld::new();
     self.static_ready = false;
-    self.region = None;
     self.accumulator = 0.0;
   }
-}
-
-fn region_covering(lo: Vec3, hi: Vec3) -> (IVec3, IVec3) {
-  (
-    lo.floor().as_ivec3() - IVec3::new(REGION_SIDE, REGION_DOWN, REGION_SIDE),
-    hi.ceil().as_ivec3() + IVec3::new(REGION_SIDE, REGION_UP, REGION_SIDE),
-  )
 }
 
 fn awake_bounds(world: &PhysicsWorld) -> Option<(Vec3, Vec3)> {
@@ -151,10 +122,22 @@ fn awake_bounds(world: &PhysicsWorld) -> Option<(Vec3, Vec3)> {
   bounds
 }
 
-pub(crate) fn follow_view(mut st: ResMut<PhysicsState>, scene: Option<Res<VoxelScene>>) {
+pub(crate) fn follow_view(
+  mut st: ResMut<PhysicsState>,
+  scene: Option<Res<VoxelScene>>,
+  cam: Res<DdaCameraConfig>,
+  mut diag: Local<(f64, u32)>,
+) {
+  let _t = gate_render::profiler::SysTimer::new("PHYS 静态", &mut diag);
+  if !st.static_ready {
+    return;
+  }
   let Some(scene) = scene else { return };
-  let Some((lo, hi)) = awake_bounds(&st.world) else { return };
-  st.ensure_region(scene.volumes.main(), lo, hi);
+  let (lo, hi) = match awake_bounds(&st.world) {
+    Some(b) => b,
+    None => (cam.position_world, cam.position_world),
+  };
+  st.sync_statics(scene.volumes.main(), lo, hi);
 }
 
 pub(crate) fn step_physics(
@@ -256,10 +239,12 @@ pub(crate) fn selftest(
       s.push_str(&format!("[{i} {state} {:.0},{:.0},{:.0} v{v:.2} w{w:.3}]", p.x, p.y, p.z));
     }
   }
+  let asleep = (1..st.world.bodies.len()).filter(|&i| st.world.bodies.sleeping[i]).count();
   info!(
     target: "gate",
-    "PHYS[selftest] 体={} 内步{} 配{} 接触{} 复用{} 深度{:.2} 角{}棱{}横{} {s}",
+    "PHYS[selftest] 体={} 睡{} 内步{} 配{} 接触{} 复用{} 深度{:.2} 角{}棱{}横{} {s}",
     st.live_bodies(),
+    asleep,
     st.last_split.0,
     st.last_pairs,
     st.last_contacts,
@@ -294,17 +279,33 @@ fn manifold_dump(st: &PhysicsState, volumes: &Volumes, body: usize) -> String {
     local: b.local_bounds[body],
     world: b.world_aabb(body),
   };
-  let w = Probe {
-    field: Field::new_at(&volumes.list[b.grid_index[0]], b.field_transform(0)),
-    vox: &b.vox[0],
-    local: b.local_bounds[0],
-    world: b.world_aabb(0),
-  };
-  let m = manifold_bounded(&a, &w, &st.cfg.contact);
-  let lo = m.points.iter().map(|p| p.depth).fold(f32::MAX, f32::min);
-  let hi = m.points.iter().map(|p| p.depth).fold(f32::MIN, f32::max);
-  let mut s = format!(" 体{body} 接触{} 深{lo:.2}..{hi:.2}:", m.points.len());
-  for p in m.points.iter().take(8) {
+  let gw = &volumes.list[b.grid_index[0]];
+  let gw_tr = gw.transform();
+  let (c_lo, c_hi) = (
+    gate_physics::chunk_of(a.world.0.floor().as_ivec3()),
+    gate_physics::chunk_of(a.world.1.ceil().as_ivec3()),
+  );
+  let mut cand: Vec<gate_physics::Contact> = Vec::new();
+  let mut pts: Vec<gate_physics::Contact> = Vec::new();
+  for cz in c_lo.z..=c_hi.z {
+    for cy in c_lo.y..=c_hi.y {
+      for cx in c_lo.x..=c_hi.x {
+        let Some(sc) = st.world.statics.get(IVec3::new(cx, cy, cz)) else { continue };
+        let w = Probe {
+          field: Field::new_at(gw, gw_tr),
+          vox: &sc.vox,
+          local: sc.local,
+          world: gate_physics::world_aabb_of(sc.local, gw_tr),
+        };
+        gate_physics::probe_pairs(&a, &w, &mut cand);
+      }
+    }
+  }
+  gate_physics::finish(&mut cand, &st.cfg.contact, a.field.transform().scale, &mut pts);
+  let lo = pts.iter().map(|p| p.depth).fold(f32::MAX, f32::min);
+  let hi = pts.iter().map(|p| p.depth).fold(f32::MIN, f32::max);
+  let mut s = format!(" 体{body} 接触{} 深{lo:.2}..{hi:.2}:", pts.len());
+  for p in pts.iter().take(8) {
     s.push_str(&format!(
       " n({:+.1},{:+.1},{:+.1})d{:.2}@({:.1},{:.1},{:.1})",
       p.normal.x, p.normal.y, p.normal.z, p.depth, p.point.x, p.point.y, p.point.z
@@ -316,7 +317,7 @@ fn manifold_dump(st: &PhysicsState, volumes: &Volumes, body: usize) -> String {
 fn write_back(world: &PhysicsWorld, volumes: &mut Volumes) -> bool {
   let mut moved = false;
   for i in 0..world.bodies.len() {
-    if world.bodies.is_static(i) {
+    if world.bodies.is_static(i) || world.bodies.is_frozen(i) {
       continue;
     }
     let Some(g) = volumes.list.get_mut(world.bodies.grid_index[i]) else { continue };

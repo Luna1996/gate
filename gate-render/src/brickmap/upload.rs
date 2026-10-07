@@ -353,7 +353,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 
   let occ = device.create_buffer(&BufferDescriptor {
     label: Some("gate_occ"),
-    size: (crate::brickmap::consts::VOLUMES * crate::brickmap::builder::OCC_WORDS * 4) as u64,
+    size: (crate::brickmap::consts::OCC_VOLUMES * crate::brickmap::builder::OCC_WORDS * 4) as u64,
     usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     mapped_at_creation: false,
   });
@@ -744,11 +744,12 @@ pub(crate) fn prepare(
   }
 
   let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
-  if let Some(occ) = snap.volumes.occ_all.as_ref() {
-    queue.write_buffer(&gpu.occ, 0, u8_of_u32(occ));
+  if let Some((first, occ)) = snap.volumes.occ_range.as_ref() {
+    let at = (*first * crate::brickmap::builder::OCC_WORDS * 4) as u64;
+    queue.write_buffer(&gpu.occ, at, u8_of_u32(occ));
     gpu.occ_ready = true;
   } else if !gpu.occ_ready {
-    let n = crate::brickmap::consts::VOLUMES * crate::brickmap::builder::OCC_WORDS;
+    let n = crate::brickmap::consts::OCC_VOLUMES * crate::brickmap::builder::OCC_WORDS;
     let all = vec![u32::MAX; n];
     queue.write_buffer(&gpu.occ, 0, u8_of_u32(&all));
   }

@@ -9,6 +9,8 @@ const REGION_EXTENT: i32 = 4;
 
 const CONTACT_MARGIN: f32 = 0.05;
 
+const CONSENSUS_RATIO: f32 = 0.25;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ContactPath {
   Corner,
@@ -53,7 +55,7 @@ pub struct ContactConfig {
 
 impl Default for ContactConfig {
   fn default() -> Self {
-    Self { max_points: 96, spread: 2.0 }
+    Self { max_points: 24, spread: 2.0 }
   }
 }
 
@@ -88,28 +90,86 @@ pub fn manifold(a: &Field, b: &Field, cfg: &ContactConfig) -> Manifold {
 }
 
 pub fn manifold_bounded(a: &Probe, b: &Probe, cfg: &ContactConfig) -> Manifold {
-  let mut out = Manifold::default();
-  if a.world.0.max(b.world.0).cmpgt(a.world.1.min(b.world.1)).any() {
-    return out;
-  }
   let mut cand = Vec::new();
+  let mut points = Vec::new();
+  manifold_into(a, b, cfg, &mut cand, &mut points);
+  Manifold { points }
+}
+
+pub fn manifold_into(
+  a: &Probe,
+  b: &Probe,
+  cfg: &ContactConfig,
+  cand: &mut Vec<Contact>,
+  points: &mut Vec<Contact>,
+) {
+  cand.clear();
+  points.clear();
+  probe_pairs(a, b, cand);
+  finish(cand, cfg, a.field.transform().scale, points);
+}
+
+pub fn probe_pairs(a: &Probe, b: &Probe, cand: &mut Vec<Contact>) {
+  if a.world.0.max(b.world.0).cmpgt(a.world.1.min(b.world.1)).any() {
+    return;
+  }
   if let Some((lo, hi)) = bounds_in(&a.field, a.local, b.world) {
     let dir_a = buried_axis(lo, hi, a.local.0, a.local.1);
-    for p in x_slab(a.vox.corners(), lo, hi) {
-      probe_pair(a, b, false, p, false, dir_a, &mut cand);
+    for p in x_slab_blocks(a.vox.corners(), lo, hi) {
+      probe_pair(a, b, false, p, false, dir_a, cand);
     }
-    for p in x_slab(a.vox.edges(), lo, hi) {
-      probe_pair(a, b, false, p, true, dir_a, &mut cand);
+    for p in x_slab_blocks(a.vox.edges(), lo, hi) {
+      probe_pair(a, b, false, p, true, dir_a, cand);
     }
   }
   if let Some((lo, hi)) = bounds_in(&b.field, b.local, a.world) {
     let dir_b = buried_axis(lo, hi, b.local.0, b.local.1);
-    for p in x_slab(b.vox.corners(), lo, hi) {
-      probe_pair(a, b, true, p, false, dir_b, &mut cand);
+    for p in x_slab_blocks(b.vox.corners(), lo, hi) {
+      probe_pair(a, b, true, p, false, dir_b, cand);
     }
   }
-  select(&mut out, cand, cfg, a.field.transform().scale);
-  out
+}
+
+pub fn finish(cand: &mut [Contact], cfg: &ContactConfig, unit: f32, points: &mut Vec<Contact>) {
+  align_normals(cand);
+  select(points, cand, cfg, unit);
+}
+
+fn x_slab_blocks<'a>(
+  list: &'a [IVec3],
+  lo: IVec3,
+  hi: IVec3,
+) -> impl Iterator<Item = IVec3> + 'a {
+  let mask = IVec3::splat(!(REGION_EXTENT - 1));
+  let mut last: Option<IVec3> = None;
+  x_slab(list, lo, hi).filter(move |v| {
+    let k = *v & mask;
+    if last == Some(k) {
+      false
+    } else {
+      last = Some(k);
+      true
+    }
+  })
+}
+
+fn align_normals(cand: &mut [Contact]) {
+  let mut s = Vec3::ZERO;
+  let mut w = 0.0f32;
+  for c in cand.iter() {
+    s += c.normal * c.depth;
+    w += c.depth;
+  }
+  let len = s.length();
+  if w <= 1e-6 || len <= CONSENSUS_RATIO * w {
+    return;
+  }
+  let dir = s / len;
+  for c in cand.iter_mut() {
+    if c.normal.dot(dir) < 0.0 {
+      c.normal = dir;
+    }
+  }
 }
 
 fn probe_pair(
@@ -130,21 +190,23 @@ fn probe_pair(
   let r = 0.5 * (1.0 + eb) + CONTACT_MARGIN;
   let lo = (q - Vec3::splat(0.5 + r)).ceil().as_ivec3();
   let hi = (q - Vec3::splat(0.5 - r)).floor().as_ivec3();
-  let n = hi - lo + IVec3::ONE;
-  if n.cmple(IVec3::ZERO).any() {
-    return;
-  }
   let bits = if edges_only { other.vox.edge() } else { other.vox.solid() };
+  let Some((lo, hi)) = bits.clamp_region(lo, hi) else { return };
+  let n = hi - lo + IVec3::ONE;
+  let mut best: Option<Contact> = None;
   let mut emit = |pb: IVec3| {
     let cb = probe.field.to_local(other.field.to_world(pb.as_vec3() + Vec3::splat(0.5)));
     let Some((mut n, mut depth, deep)) = rounded_pair(pa, cb, eb, body_dir) else { return };
+    if best.as_ref().is_some_and(|b| b.depth >= depth * unit) {
+      return;
+    }
     if deep && let Some(face) = face_axis(other, pb) {
       n = -(probe.field.transform().rot.transpose() * face);
       depth = pair_depth(cb - pa, eb, n).max(0.0);
     }
     let point = probe.field.to_world((pa + cb) * 0.5);
     let (voxel_a, voxel_b) = if swapped { (pb, p) } else { (p, pb) };
-    out.push(Contact {
+    best = Some(Contact {
       point,
       normal: probe.field.transform().rot * (if swapped { -n } else { n }),
       depth: depth * unit,
@@ -155,7 +217,8 @@ fn probe_pair(
       path: if edges_only { ContactPath::Edge } else { ContactPath::Corner },
     });
   };
-  if let Some(base) = bits.cursor(lo, hi) {
+  {
+    let Some(base) = bits.cursor(lo, hi) else { return };
     let (sx, syz) = bits.strides();
     for dz in 0..n.z as usize {
       for dy in 0..n.y as usize {
@@ -167,18 +230,9 @@ fn probe_pair(
         }
       }
     }
-    return;
   }
-  for z in lo.z..=hi.z {
-    for y in lo.y..=hi.y {
-      for x in lo.x..=hi.x {
-        let pb = IVec3::new(x, y, z);
-        let hit = if edges_only { other.vox.has_edge(pb) } else { other.solid_at(pb) };
-        if hit {
-          emit(pb);
-        }
-      }
-    }
+  if let Some(c) = best {
+    out.push(c);
   }
 }
 
@@ -251,23 +305,23 @@ fn face_axis(other: &Probe, p: IVec3) -> Option<Vec3> {
   Some(other.field.transform().rot * DIRS6[bit].as_vec3())
 }
 
-fn select(out: &mut Manifold, mut cand: Vec<Contact>, cfg: &ContactConfig, unit: f32) {
+fn select(out: &mut Vec<Contact>, cand: &mut [Contact], cfg: &ContactConfig, unit: f32) {
   let mask = IVec3::splat(!(REGION_EXTENT - 1));
-  for c in &mut cand {
+  for c in cand.iter_mut() {
     c.voxel_a &= mask;
     c.voxel_b &= mask;
   }
   cand.sort_by(|x, y| y.depth.total_cmp(&x.depth));
   let r2 = (cfg.spread * unit) * (cfg.spread * unit);
-  for c in cand {
-    if out.points.iter().any(|e| {
+  for c in cand.iter() {
+    if out.iter().any(|e| {
       (e.voxel_a == c.voxel_a && e.voxel_b == c.voxel_b)
         || (e.point - c.point).length_squared() < r2
     }) {
       continue;
     }
-    out.points.push(c);
-    if out.points.len() >= cfg.max_points {
+    out.push(*c);
+    if out.len() >= cfg.max_points {
       break;
     }
   }

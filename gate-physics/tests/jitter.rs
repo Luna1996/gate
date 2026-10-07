@@ -1,7 +1,9 @@
 //
 //
 //
-use gate_physics::{Field, PhysicsWorld, Probe, StepConfig, manifold_bounded, tight_bounds};
+use gate_physics::{
+  Field, PhysicsWorld, Probe, StepConfig, chunk_of, manifold_bounded, tight_bounds, world_aabb_of,
+};
 use gate_voxel::{PaletteEntry, PaletteId, VolumeGrid, VolumeTransform, Volumes};
 use glam::{IVec3, Mat3, Vec3};
 
@@ -85,11 +87,14 @@ fn dump_rest(name: &str, ground: VolumeGrid, at: Vec3) {
     local: bb.local_bounds[b],
     world: bb.world_aabb(b),
   };
+  let cc = chunk_of(pa.world.0.floor().as_ivec3());
+  let sc = world.statics.get(cc).expect("体所在静态分块");
+  let gw = &volumes.list[0];
   let pb = Probe {
-    field: Field::new_at(&volumes.list[0], bb.field_transform(0)),
-    vox: &bb.vox[0],
-    local: bb.local_bounds[0],
-    world: bb.world_aabb(0),
+    field: Field::new_at(gw, gw.transform()),
+    vox: &sc.vox,
+    local: sc.local,
+    world: world_aabb_of(sc.local, gw.transform()),
   };
   let m = manifold_bounded(&pa, &pb, &StepConfig::default().contact);
   eprintln!("{name}: 接触={}", m.points.len());

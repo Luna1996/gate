@@ -16,11 +16,16 @@ use crate::{
 const DELETE_REACH: f32 = 4096.0;
 const FIRE_DISTANCE: f32 = 8.0;
 const FIRE_SPEED: f32 = 1600.0;
-const PILE_COUNT: usize = 1000;
+pub(crate) const PILE_COUNT: usize = 1000;
 const PILE_ALTITUDE: f32 = 512.0;
 const PILE_PITCH: f32 = 0.75;
 const PILE_PROBE_UP: f32 = 256.0;
 const PILE_PROBE_DOWN: f32 = 8192.0;
+const PILE_REACH: f32 = 4096.0;
+const PILE_LANDING: f32 = 160.0;
+const PILE_AIM_MAX: i32 = 24;
+const PILE_AIM_STEP: f32 = 0.06;
+const PILE_PITCH_MAX: f32 = 1.45;
 
 const _: () = assert!(
   FIRE_SPEED / 60.0 >= (2 * RANDOM_SIZE_MAX - 1) as f32,
@@ -154,6 +159,7 @@ pub(crate) fn object_input(
 pub(crate) fn pile_fire(
   mut started: Local<bool>,
   mut fired: Local<usize>,
+  mut aiming: Local<i32>,
   mut rng: Local<Rng>,
   cam: Res<DdaCameraConfig>,
   settings: Res<EditSettings>,
@@ -175,20 +181,38 @@ pub(crate) fn pile_fire(
     info!(
       target: "gate",
       "PHYS[pile] 升到地面以上 {PILE_ALTITUDE:.0} vx（地面 {ground:.0} → 机位 y {:.0}）、\
-       俯角 {:.0}°，笔触按随机，连发 {PILE_COUNT} 件",
+       俯角 {:.0}°，笔触按随机，连发 {} 件",
       fly.pos.y,
-      PILE_PITCH.to_degrees()
+      PILE_PITCH.to_degrees(),
+      crate::consts::phys_pile_count()
     );
     return;
   }
-  if *fired >= PILE_COUNT {
+  if *fired == 0
+    && *aiming <= PILE_AIM_MAX
+    && !raycast(&scene.volumes, cam.position_world, cam.forward, PILE_REACH)
+      .is_some_and(|h| h.normal.y > 0.5 && (h.t * cam.forward.x).hypot(h.t * cam.forward.z) <= PILE_LANDING)
+  {
+    if *aiming == PILE_AIM_MAX {
+      warn!(target: "gate", "PHYS[pile] 视线始终未落到实地 → 按当前俯角开火");
+    } else {
+      orbit.pitch = (orbit.pitch + PILE_AIM_STEP).min(PILE_PITCH_MAX);
+      orbit.clamp();
+      if *aiming == 0 {
+        info!(target: "gate", "PHYS[pile] 视线落空 → 逐步调陡俯角寻找实地");
+      }
+    }
+    *aiming += 1;
+    return;
+  }
+  if *fired >= crate::consts::phys_pile_count() {
     return;
   }
   let random = EditSettings { shape: BrushShape::Random, ..*settings };
   fire(&mut scene, &mut phys, cam.position_world, cam.forward, burst(&random, &mut rng));
   *fired += 1;
-  if *fired == PILE_COUNT {
-    info!(target: "gate", "PHYS[pile] 连发完成 {PILE_COUNT} 件");
+  if *fired == crate::consts::phys_pile_count() {
+    info!(target: "gate", "PHYS[pile] 连发完成 {} 件", crate::consts::phys_pile_count());
   }
 }
 
@@ -227,11 +251,13 @@ pub(crate) fn sync_objects_menu(
   lock: Res<MouseLock>,
   scene: Option<Res<VoxelScene>>,
   mut q_values: Query<(&gate_ui::MenuTextValue, &mut Text)>,
+  mut diag: Local<(f64, u32)>,
 ) {
   let Some(scene) = scene else { return };
   if !q_values.iter().any(|(v, _)| v.path.starts_with("game/edit/place/")) {
     return;
   }
+  let _t = gate_render::profiler::SysTimer::new("OBJECT 悬停", &mut diag);
   let count = scene.volumes.live_object_count();
   let pointed = view_ray(&windows, &cfg, lock.0)
     .and_then(|(origin, dir)| raycast_objects(&scene.volumes, origin, dir, DELETE_REACH))

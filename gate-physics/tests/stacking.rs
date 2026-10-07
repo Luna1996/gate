@@ -145,6 +145,49 @@ fn two_boxes_touching_are_quiet() {
   }
 }
 
+#[test]
+fn deeply_overlapped_boxes_separate() {
+  for overlap in [4.0f32, 8.0, 12.0] {
+    let mut volumes = Volumes::new(VolumeGrid::new());
+    let mut world = PhysicsWorld::new();
+    let a = spawn_box(&mut volumes, &mut world, Vec3::ZERO);
+    let b = spawn_box(&mut volumes, &mut world, Vec3::new(EDGE as f32 - overlap, 0.0, 0.0));
+    let cfg = StepConfig { gravity: Vec3::ZERO, ..StepConfig::default() };
+    for _ in 0..300 {
+      world.step(&volumes, DT, &cfg);
+    }
+    let gap = world.bodies.field_transform(b).pos.x - world.bodies.field_transform(a).pos.x;
+    assert!(
+      gap > EDGE as f32 - 4.0,
+      "初始重叠 {overlap} 的两箱必须自行分开，实测间距 {gap:.2}（初始 {:.1}）",
+      EDGE as f32 - overlap
+    );
+  }
+}
+
+#[test]
+fn dropped_box_bounces_before_resting() {
+  let mut volumes = Volumes::new(ground_grid());
+  let mut world = PhysicsWorld::new();
+  world.init_static_world(&volumes.list[0], tight_bounds(&volumes.list[0]).unwrap(), 0);
+  let b = spawn_box(&mut volumes, &mut world, Vec3::new(24.0, 40.0, 24.0));
+  let cfg = StepConfig::default();
+  let mut touched = false;
+  let mut peak = 0.0f32;
+  for _ in 0..240 {
+    world.step(&volumes, DT, &cfg);
+    let y = world.bodies.field_transform(b).pos.y;
+    if y < 9.0 {
+      touched = true;
+    }
+    if touched {
+      peak = peak.max(y);
+    }
+  }
+  let rest = world.bodies.field_transform(b).pos.y;
+  assert!(peak > rest + 0.3, "落体应先回弹再静止：回弹峰值 {peak:.2}，静息 {rest:.2}");
+}
+
 fn stack_ids(volumes: &mut Volumes, world: &mut PhysicsWorld, layers: i32) -> Vec<usize> {
   (0..layers)
     .map(|k| {

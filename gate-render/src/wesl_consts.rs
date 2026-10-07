@@ -52,6 +52,7 @@ pub struct TraceConsts {
   pub req_sample: u32,
   pub req_per_ray_max: u32,
   pub volumes: u32,
+  pub occ_volumes: u32,
   pub index_entry_empty: u32,
   pub seg_words: u32,
 }
@@ -62,6 +63,7 @@ const TRACE_REQUIRED: &[&str] = &[
   "REQ_SAMPLE",
   "REQ_PER_RAY_MAX",
   "GRID_VOLUMES",
+  "OCC_VOLUMES",
   "INDEX_ENTRY_EMPTY",
   "SEG_WORDS",
 ];
@@ -254,6 +256,7 @@ impl TraceConsts {
       req_sample: get("REQ_SAMPLE"),
       req_per_ray_max: get("REQ_PER_RAY_MAX"),
       volumes: get("GRID_VOLUMES"),
+      occ_volumes: get("OCC_VOLUMES"),
       index_entry_empty: get("INDEX_ENTRY_EMPTY"),
       seg_words: get("SEG_WORDS"),
     };
@@ -276,6 +279,16 @@ impl TraceConsts {
          brickmap::consts::VOLUMES = {}（两侧必须相等，它决定 `lod_req` 的分段与长度）",
         out.volumes,
         crate::brickmap::consts::VOLUMES
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if out.occ_volumes != crate::brickmap::consts::OCC_VOLUMES as u32 {
+      let msg = format!(
+        "occ volume 容量不一致：trace.wesl::OCC_VOLUMES = {}，\
+         brickmap::consts::OCC_VOLUMES = {}（两侧必须相等，它决定 `occ` 缓冲的分槽）",
+        out.occ_volumes,
+        crate::brickmap::consts::OCC_VOLUMES
       );
       error!("{msg}");
       panic!("{msg}");

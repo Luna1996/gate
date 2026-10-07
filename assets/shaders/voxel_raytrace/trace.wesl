@@ -40,6 +40,12 @@ const LOD_DIAG: u32 = 1u;
 const DIAG_LEAF_ENTRIES: u32 = 0u;
 const DIAG_LEAF_STOPS: u32 = 1u;
 const DIAG_ILLEGAL_STOPS: u32 = 2u;
+const DIAG_LEAF_ITER: u32 = 32u;
+const DIAG_LEAF_MARCH: u32 = 33u;
+const DIAG_NEAR_CALLS: u32 = 34u;
+fn diag_ray(origin: vec3<f32>, dir: vec3<f32>) -> bool {
+  return LOD_DIAG == 1u && ((bitcast<u32>(origin.x) ^ bitcast<u32>(dir.z)) & 63u) == 0u;
+}
 fn diag_sampled(addr: u32) -> bool {
   return LOD_DIAG == 1u && (addr & 63u) == 0u;
 }
@@ -509,6 +515,7 @@ const SECONDARY_REACH_CHUNKS: f32 = 12.0;
 
 const OCC_SKIP: u32 = 1u;
 const OCC_WORDS: u32 = (64u * 64u * 64u) / 32u;
+const OCC_VOLUMES: u32 = 1024u;
 
 const RT_QUERY_BUDGET: u32 = 64u;
 const RT_TRUST_MISS: u32 = 0u;
@@ -738,7 +745,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
     let t_exit_c = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
     let t1 = min(t_exit_c, tl1);
     var group_empty = false;
-    if (OCC_SKIP != 0u && vol < GRID_VOLUMES && REQ_ENABLE == 0u) {
+    if (OCC_SKIP != 0u && vol < OCC_VOLUMES && REQ_ENABLE == 0u) {
       let rg = ci - index_origin;
       if (all(rg >= vec3<i32>(0)) && all(vec3<u32>(rg) < index_dims)) {
         let rgg = vec3<u32>(rg);
