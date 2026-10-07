@@ -76,6 +76,8 @@ struct MaterialAsset {
 
 @group(1) @binding(12) var<storage, read> occ: array<u32>;
 
+@group(1) @binding(13) var<storage, read> b_struct_p1: array<u32>;
+
 struct GridDesc {
   pos_scale: vec4<f32>,   
   rot0: vec4<f32>,        
@@ -101,6 +103,8 @@ struct GridDesc {
   coverage_r: f32,
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
+
+@group(2) @binding(1) var<storage, read> inst_bvh: array<u32>;
 
 struct LightDesc {
   kind_pos_dir: vec4<f32>,    

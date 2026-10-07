@@ -196,8 +196,9 @@ fn gi_upsample_joint(
   if (sn.a > 0.5) { return sn; }
 
   var best_ok = false;
-  var best_d2 = 0;
-  var best = vec4<f32>(0.0);
+  var best_w = 0.0;
+  var best_acc = vec3<f32>(0.0);
+  var best_a = 0.0;
   var any_ok = false;
   var any_d2 = 0;
   var any = vec4<f32>(0.0);
@@ -215,15 +216,17 @@ fn gi_upsample_joint(
         any_d2 = d2;
         any = textureLoad(gi_tex, c, 0);
       }
-      if (gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)
-          && (!best_ok || d2 < best_d2)) {
+      if (gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)) {
+                                let w = 1.0 / (1.0 + f32(d2));
+        let s = textureLoad(gi_tex, c, 0);
+        best_acc = best_acc + s.rgb * w;
+        best_a = best_a + s.a * w;
+        best_w = best_w + w;
         best_ok = true;
-        best_d2 = d2;
-        best = textureLoad(gi_tex, c, 0);
       }
     }
   }
-  if (best_ok) { return best; }
+  if (best_ok) { return vec4<f32>(best_acc / best_w, best_a / best_w); }
   if (any_ok) { return any; }
   return vec4<f32>(fallback, 0.0);
 }
@@ -504,6 +507,10 @@ const DIAG_GI_WAL_MATURE: u32 = 23u;
 const DIAG_GI_WAL_FRESH: u32 = 24u;
 const DIAG_WAL_FACES: u32 = 25u;
 const DIAG_WAL_NSUM: u32 = 26u;
+const DIAG_GI_MEAN_NEAR: u32 = 28u;
+const DIAG_GI_MEAN_FAR: u32 = 29u;
+const DIAG_LUMA_NEAR: u32 = 30u;
+const DIAG_LUMA_FAR: u32 = 31u;
 
 fn gi_cover_key(uv: vec2<f32>, key_out: ptr<function, vec2<u32>>,
                 guide_off_out: ptr<function, u32>) -> bool {
@@ -591,6 +598,17 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
   col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                    GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
                    n_own, need_n, &sun_io);
+  if (diag_on && first.hit) {
+            let q = u32(clamp(dot(dbg_gi, GI_LUMA), 0.0, 255.0) * 256.0);
+    let p = u32(clamp(dot(col, GI_LUMA), 0.0, 255.0) * 256.0);
+    if (first.obj_id < 0) {
+      atomicAdd(&lod_diag[DIAG_GI_MEAN_NEAR], q);
+      atomicAdd(&lod_diag[DIAG_LUMA_NEAR], p);
+    } else {
+      atomicAdd(&lod_diag[DIAG_GI_MEAN_FAR], q);
+      atomicAdd(&lod_diag[DIAG_LUMA_FAR], p);
+    }
+  }
   col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
   if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) {
     col = vol_tint_color(first);

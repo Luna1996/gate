@@ -250,10 +250,10 @@ pub fn rep_of_surface(cells: &[PaletteId], per_layer: usize) -> Option<PaletteId
   for y in (0..cells.len() / per_layer).rev() {
     let layer = &cells[y * per_layer..(y + 1) * per_layer];
     let solid = layer.iter().filter(|c| !c.is_air()).count();
-    if solid * 2 >= per_layer {
-      if let Some(r) = rep_of(layer) {
-        return Some(r);
-      }
+    if solid * 2 >= per_layer
+      && let Some(r) = rep_of(layer)
+    {
+      return Some(r);
     }
   }
   rep_of(cells)

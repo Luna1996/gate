@@ -558,6 +558,60 @@ impl ChunkTree {
     )
   }
 
+  pub fn block_solid_bits(&self, local_x: i32, local_y: i32, local_z: i32) -> u64 {
+    if self.nodes.is_empty() {
+      return if self.root_palette.is_air() { 0 } else { u64::MAX };
+    }
+    self.block_solid_bits_at(
+      local_x.clamp(0, CHUNK_SIZE - 1),
+      local_y.clamp(0, CHUNK_SIZE - 1),
+      local_z.clamp(0, CHUNK_SIZE - 1),
+      0,
+      CHUNK_SIZE,
+    )
+  }
+
+  fn block_solid_bits_at(&self, x: i32, y: i32, z: i32, idx: usize, extent: i32) -> u64 {
+    let n = self.nodes[idx];
+    let uniform = || if n.palette.is_air() { 0 } else { u64::MAX };
+    match n.kind {
+      NodeKind::Uniform => uniform(),
+      NodeKind::Leaf => {
+        let l = self.leaf(idx);
+        let mut bits = 0u64;
+        for i in 0u32..64 {
+          if !l.get(i).is_air() {
+            bits |= 1u64 << i;
+          }
+        }
+        bits
+      }
+      NodeKind::Split => {
+        if n.mask == 0 {
+          return uniform();
+        }
+        let child_extent = extent / BRICK_FACTOR;
+        let (ix, iy, iz) = (
+          (x / child_extent).clamp(0, BRICK_FACTOR - 1),
+          (y / child_extent).clamp(0, BRICK_FACTOR - 1),
+          (z / child_extent).clamp(0, BRICK_FACTOR - 1),
+        );
+        let cell = child_linear_idx(ix, iy, iz);
+        if (n.mask & (1u64 << cell)) == 0 {
+          return uniform();
+        }
+        let child = self.child_at(n, cell);
+        self.block_solid_bits_at(
+          x - ix * child_extent,
+          y - iy * child_extent,
+          z - iz * child_extent,
+          child,
+          child_extent,
+        )
+      }
+    }
+  }
+
   fn get_at(&self, x: i32, y: i32, z: i32, idx: usize, extent: i32) -> Option<PaletteId> {
     let n = self.nodes[idx];
     match n.kind {

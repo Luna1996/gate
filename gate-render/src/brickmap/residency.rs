@@ -169,7 +169,7 @@ impl Residency {
     install.sort_by_key(|&(c, level)| {
       (dist_of(camera_chunk, c), std::cmp::Reverse(level), c.0.x, c.0.y, c.0.z)
     });
-        let mut picked: Vec<(ChunkCoord, Level)> = Vec::with_capacity(install.len());
+    let mut picked: Vec<(ChunkCoord, Level)> = Vec::with_capacity(install.len());
     let mut refine_budget = policy.max_install_per_frame;
     let mut boot_budget = BOOTSTRAP_PER_FRAME;
     for (c, level) in install {

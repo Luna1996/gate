@@ -21,6 +21,7 @@ bevy = { workspace = true, features = ["png"] }
 glam = { workspace = true }
 gate-voxel = { workspace = true }
 gate-render = { workspace = true }
+gate-physics = { workspace = true }
 gate-ui = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["time"] }

@@ -1,5 +1,3 @@
-
-
 use bevy::render::render_resource::{
   BindGroupLayoutDescriptor, CachedComputePipelineId, ShaderType,
 };
@@ -10,41 +8,22 @@ use crate::wesl_consts::gi_consts;
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, ShaderType)]
 pub struct GiUniform {
-  
-  
-  
   pub params: Vec4,
-  
-  
-  
+
   pub misc: Vec4,
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub flags: Vec4,
-  
-  
-  
-  
+
   pub seq: UVec4,
-  
-  
-  
+
   pub prev_view_proj: Mat4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LightKey {
-  
   dir: [u32; 3],
   sun_c: [u32; 3],
-  
+
   sky: [u32; 3],
 }
 
@@ -74,11 +53,8 @@ impl LightKey {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ShadeKey {
-  
-  
-  
   geom: u32,
-  
+
   dir: [u32; 3],
   sun_c: [u32; 3],
   sky: [u32; 3],
@@ -99,7 +75,7 @@ const LIGHT_STEP_MAX: f32 = 0.5;
 pub const KEY_ORG_Q: i32 = 8192;
 
 pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
-  let chunk = gate_voxel::CHUNK_SIZE as i32;
+  let chunk = gate_voxel::CHUNK_SIZE;
   windows
     .iter()
     .map(|w| {
@@ -123,12 +99,12 @@ pub const WAL_SLOTS: u64 = 1 << 20;
 pub const WAL_WORDS: u64 = 8;
 
 pub fn region_origin(window_origin: glam::IVec3) -> glam::IVec3 {
-  let q = KEY_ORG_Q / gate_voxel::CHUNK_SIZE as i32;
+  let q = KEY_ORG_Q / gate_voxel::CHUNK_SIZE;
   glam::IVec3::new(window_origin.x / q, window_origin.y / q, window_origin.z / q) * q
 }
 
 pub fn region_cell(v_world: glam::IVec3, org_chunks: glam::IVec3) -> glam::IVec3 {
-  let chunk = gate_voxel::CHUNK_SIZE as i32;
+  let chunk = gate_voxel::CHUNK_SIZE;
   let rel = (v_world - org_chunks * chunk).max(glam::IVec3::ZERO);
   (rel / chunk / REGION_CHUNKS).min(glam::IVec3::splat(REGION_TABLE - 1))
 }
@@ -179,136 +155,51 @@ fn light_jump(prev: &LightKey, now: &LightKey) -> f32 {
 
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
 pub struct GiSettings {
-  
   pub enabled: bool,
-  
-  
-  
-  
-  
+
   pub gi_div: u32,
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub denoise: u32,
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub wal: bool,
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub sun_bounce: bool,
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub share: u32,
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub realloc: u32,
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenoisePlan {
-  
   pub on: bool,
-  
+
   pub rounds: u32,
-  
+
   pub radius: u32,
 }
 
 impl GiSettings {
-  
-  
   pub const DIV_CHOICES: [u32; 3] = [1, 2, 4];
 
-  
   pub const DENOISE_TIERS: u32 = 4;
 
-  
   pub const SHARE_CHOICES: [u32; 4] = [1, 2, 4, 8];
 
-  
   pub fn share(&self) -> u32 {
     self.share.clamp(1, 8)
   }
 
-  
   pub const REALLOC_TIERS: u32 = 4;
 
-  
   pub const BOUNCE2_TIERS: u32 = 3;
 
-  
   pub fn depth_tier(&self) -> u32 {
     self.depth.min(Self::BOUNCE2_TIERS - 1)
   }
 
-  
-  
-  
   pub fn bounce2_mult(&self) -> f32 {
     match self.depth_tier() {
       0 => 0.0,
@@ -317,35 +208,29 @@ impl GiSettings {
     }
   }
 
-  
   pub fn realloc_tier(&self) -> u32 {
     self.realloc.min(Self::REALLOC_TIERS - 1)
   }
 
-  
   pub fn div(&self) -> u32 {
     self.gi_div.clamp(1, 4)
   }
 
-  
   pub fn tier(&self) -> u32 {
     self.denoise.min(Self::DENOISE_TIERS - 1)
   }
 
-  
   pub fn denoise_plan(&self) -> DenoisePlan {
     let c = gi_consts();
     match self.tier() {
-      
       0 => DenoisePlan { on: false, rounds: 0, radius: c.gi_den_atrous_r_fast },
-      
+
       1 => DenoisePlan { on: true, rounds: c.gi_den_atrous_iter, radius: c.gi_den_atrous_r_fast },
-      
+
       _ => DenoisePlan { on: true, rounds: c.gi_den_atrous_iter, radius: c.gi_den_atrous_r },
     }
   }
 
-  
   pub fn gi_size(&self, render_size: UVec2) -> UVec2 {
     let d = self.div();
     UVec2::new((render_size.x / d).max(1), (render_size.y / d).max(1))
@@ -354,11 +239,6 @@ impl GiSettings {
 
 impl Default for GiSettings {
   fn default() -> Self {
-    
-    
-    
-    
-    
     Self {
       enabled: true,
       gi_div: 4,
@@ -430,9 +310,7 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   BindGroupLayoutDescriptor::new(
     "GiBg5",
     &[
-      
       store(2, TextureFormat::Rgba16Float),
-      
       BindGroupLayoutEntry {
         binding: 6,
         visibility: C,
@@ -443,14 +321,8 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
-      
-      
-      
       buf(8),
-      
       buf(9),
-      
-      
       BindGroupLayoutEntry {
         binding: 10,
         visibility: C,
@@ -461,8 +333,6 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
-      
-      
       buf(11),
     ],
   )
@@ -504,12 +374,12 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
   BindGroupLayoutDescriptor::new(
     "GiDenTemporal",
     &[
-      ro(10),  
-      tex(11), 
-      ro(12),  
-      rw(13),  
+      ro(10),
+      tex(11),
+      ro(12),
+      rw(13),
       BindGroupLayoutEntry {
-        binding: 16, 
+        binding: 16,
         visibility: C,
         ty: BindingType::StorageTexture {
           access: StorageTextureAccess::WriteOnly,
@@ -518,8 +388,8 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
-      rw(17), 
-      ro(20), 
+      rw(17),
+      ro(20),
     ],
   )
 }
@@ -540,8 +410,6 @@ pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
-      
-      
       BindGroupLayoutEntry {
         binding: 13,
         visibility: C,
@@ -640,57 +508,33 @@ pub fn gi_flatten_layout() -> BindGroupLayoutDescriptor {
 pub struct GiGpu {
   pub uniform: bevy::render::render_resource::UniformBuffer<GiUniform>,
   pub frame: u32,
-  
-  
+
   pub prev_view_proj: Mat4,
-  
+
   pub res_flip: bool,
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+
   pub key_org: Option<Vec<glam::IVec3>>,
-  
-  
-  
+
   region_rev: Vec<u32>,
-  
-  
+
   region_dirty: bool,
-  
-  
+
   region_org: Option<glam::IVec3>,
-  
+
   region_staging: Vec<u8>,
-  
-  
-  
-  
+
   pub world_rev_gi: u32,
-  
-  
-  
+
   pub wide_rev: u32,
-  
-  
-  
+
   pub den_pipelines: [Option<CachedComputePipelineId>; 6],
-  
-  
+
   pub flatten_pipeline: Option<CachedComputePipelineId>,
-  
-  
-  
+
   pub epoch: u32,
-  
+
   epoch_key: Option<ShadeKey>,
-  
+
   light_key: Option<LightKey>,
 }
 
@@ -704,7 +548,7 @@ pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
 struct GiPlaceholder {
   tex: Option<bevy::render::render_resource::Texture>,
   view: Option<bevy::render::render_resource::TextureView>,
-  
+
   res: Option<bevy::render::render_resource::Buffer>,
 }
 
@@ -731,7 +575,6 @@ impl GiPlaceholder {
     self.view.as_ref().expect("刚创建")
   }
 
-  
   fn res_buffer(
     &mut self,
     device: &bevy::render::renderer::RenderDevice,
@@ -780,7 +623,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
   commands.insert_resource(GiGpu {
     uniform: bevy::render::render_resource::UniformBuffer::default(),
     frame: 0,
-    
+
     prev_view_proj: Mat4::IDENTITY,
     res_flip: false,
     key_org: None,
@@ -788,8 +631,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     region_dirty: false,
     region_org: None,
     region_staging: Vec::new(),
-    
-    
+
     world_rev_gi: 0,
     wide_rev: 0,
     den_pipelines: [None; 6],
@@ -807,7 +649,7 @@ fn queue_gi_pipelines(
 ) {
   use bevy::render::render_resource::ComputePipelineDescriptor;
   use std::borrow::Cow;
-  
+
   if gpu.den_pipelines[0].is_some() {
     return;
   }
@@ -840,8 +682,7 @@ fn queue_gi_pipelines(
       ..Default::default()
     }));
   }
-  
-  
+
   gpu.flatten_pipeline = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_gi_face_flatten")),
     layout: vec![gi_flatten_layout()],
@@ -884,30 +725,12 @@ fn prepare_gi(
 ) {
   gpu.frame = gpu.frame.wrapping_add(1);
 
-  
-  
-  
-  
-  
-  
-  
-  
-    
-  
-  
-  
-  
-    
-  
   if dirty.as_ref().is_some_and(|d| d.full || d.palette_changed) {
     gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
   }
   let occluder_rev = gpu.wide_rev;
   let world_same = occluder_rev == gpu.world_rev_gi;
 
-  
-  
-  
   let mut region_touched = false;
   if let Some(bm) = brickmap.as_ref()
     && let Some(w) = bm.volume_windows.first()
@@ -921,7 +744,6 @@ fn prepare_gi(
       region_touched = true;
     }
     if let Some(d) = dirty.as_ref() {
-      
       for b in &d.boxes {
         region_mark(&mut gpu.region_rev, b.lo, b.hi, org);
         region_touched = true;
@@ -931,13 +753,10 @@ fn prepare_gi(
   if region_touched {
     gpu.region_dirty = true;
   }
-  
-  
-  
+
   if gpu.region_dirty
     && let Some(buf) = aux.as_ref().and_then(|a| a.region_buffer()).cloned()
   {
-    
     let mut staging = std::mem::take(&mut gpu.region_staging);
     staging.clear();
     for v in &gpu.region_rev {
@@ -948,17 +767,6 @@ fn prepare_gi(
     gpu.region_dirty = false;
   }
 
-  
-  
-  
-  
-    
-  
-  
-  
-  
-  
-  
   let light = LightKey::of(lighting.as_deref());
   let mut light_step = false;
   if gpu.light_key != Some(light) {
@@ -976,12 +784,9 @@ fn prepare_gi(
     bevy::log::debug!(target: "gate", "GI 光照阶跃 ⇒ 本帧不复用历史");
   }
 
-  
   let u = GiUniform {
     params: Vec4::new(
       if settings.sun_bounce { 1.0 } else { 0.0 },
-      
-      
       if settings.wal { 1.0 } else { 0.0 },
       crate::consts::GI_GAIN,
       0.0,
@@ -990,53 +795,30 @@ fn prepare_gi(
       if settings.enabled { 1.0 } else { 0.0 },
       settings.share() as f32,
       settings.realloc_tier() as f32,
-      
       settings.bounce2_mult(),
     ),
     flags: Vec4::new(
       0.0,
       settings.div() as f32,
-      
       if world_same && !light_step { 1.0 } else { 0.0 },
-      
       settings.tier() as f32,
     ),
-    
-    
-    
+
     seq: UVec4::new(gpu.frame, gpu.epoch, 0, 0),
-    
+
     prev_view_proj: gpu.prev_view_proj,
   };
   *gpu.uniform.get_mut() = u;
   gpu.uniform.write_buffer(&device, &queue);
-  
-  
-  
-  
-  
+
   let gi_runs = settings.enabled;
   if gi_runs {
-    
-    
-    
-    
-    
-    
-    
     gpu.world_rev_gi = occluder_rev;
-    
+
     if let Some(v) = view.as_ref() {
       gpu.prev_view_proj = v.view_proj;
     }
-    
-    
-    
-    
-    
-    
-    
-    
+
     if let Some(bm) = brickmap.as_ref() {
       let org = key_origins_q(&bm.volume_windows);
       if gpu.key_org.as_deref() != Some(org.as_slice()) {
@@ -1048,11 +830,9 @@ fn prepare_gi(
     }
   }
 
-  
   use bevy::render::render_resource::{BindGroupEntry, BindingResource};
   let bg4_layout = pipeline_cache.get_bind_group_layout(&gi_bg4_layout());
-  
-  
+
   let (res_cur, res_prev) = match aux.as_ref().and_then(|a| a.gi_res_buffers()) {
     Some((a, b)) if gpu.res_flip => (b, a),
     Some((a, b)) => (a, b),
@@ -1071,49 +851,41 @@ fn prepare_gi(
     ],
   );
   commands.insert_resource(GiBg4(bg4));
-  
+
   if gi_runs {
     gpu.res_flip = !gpu.res_flip;
   }
 
-  
-  
-  
   let bg5_layout = pipeline_cache.get_bind_group_layout(&gi_bg5_layout());
   let gi_view = match aux.as_ref().and_then(|a| a.gi_write_view()) {
     Some(v) => v.clone(),
     None => gi_ph.view(&device).clone(),
   };
-  
+
   let guide = aux
     .as_ref()
     .and_then(|a| a.gi_guide_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
-  
-  
+
   let face_slots = aux
     .as_ref()
     .and_then(|a| a.face_slots_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
-  
-  
+
   let gi_sec_slots = aux
     .as_ref()
     .and_then(|a| a.gi_sec_slots_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
-  
-  
-  
+
   let region_rev = aux
     .as_ref()
     .and_then(|a| a.region_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
-  
-  
+
   let wal = aux
     .as_ref()
     .and_then(|a| a.wal_buffer())

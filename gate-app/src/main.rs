@@ -7,6 +7,7 @@ mod height_field;
 mod infinite_cubes;
 mod mc;
 mod objects;
+mod physics;
 mod scene;
 mod showcase;
 #[cfg(feature = "profile")]
@@ -108,7 +109,7 @@ fn main() {
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)
     .init_resource::<edit::EditSettings>()
-    .init_resource::<objects::ObjectSettings>()
+    .init_resource::<physics::PhysicsState>()
     .init_resource::<MouseLock>()
     .init_resource::<height_field::MaterialDisplaceCache>()
     .init_resource::<infinite_cubes::Streaming>()
@@ -159,10 +160,19 @@ fn main() {
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
   app.add_systems(Update, infinite_cubes::stream_chunks);
+  app.add_systems(
+    Update,
+    (physics::selftest, physics::follow_view, physics::step_physics)
+      .chain()
+      .after(objects::object_input),
+  );
   if consts::EDIT_SELFTEST {
     app.add_systems(Update, edit::edit_selftest);
   }
-  if consts::AUTO_ORBIT || consts::bench_orbit() {
+  if consts::phys_pile() {
+    app.add_systems(Update, objects::pile_fire);
+  }
+  if (consts::AUTO_ORBIT || consts::bench_orbit()) && !consts::phys_pile() {
     app.add_systems(Update, camera::auto_orbit_system);
   }
   if consts::bench_fly() {

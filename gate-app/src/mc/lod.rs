@@ -115,9 +115,9 @@ impl File {
     let fine_len = c.u32()? as usize;
     let fine_body = c.take(fine_len)?.to_vec();
     let mut at = 0usize;
-    for k in 0..want as usize {
-      if fine_offs[k] as usize != at {
-        return Err(format!("细格偏移 [{k}] = {} ≠ 走到 {}（区间不连续）", fine_offs[k], at));
+    for (k, &off) in fine_offs.iter().enumerate() {
+      if off as usize != at {
+        return Err(format!("细格偏移 [{k}] = {off} ≠ 走到 {at}（区间不连续）"));
       }
       let mut cells = 0usize;
       while cells < FINE_TOTAL {
@@ -299,7 +299,7 @@ impl View {
       let (rep, _) = self.section(base.x, base.y, base.z)?;
       return Some(rep);
     }
-        let per_layer = (n * n) as usize;
+    let per_layer = (n * n) as usize;
     debug_assert!(
       (n * n * n) as usize <= MAX_CELL_SECTIONS,
       "一格的节数 {n}³ 超过栈缓冲上限 —— `FAR_SCALES` 是不是加了更大的级？"
@@ -323,7 +323,6 @@ impl View {
 pub struct BuildStats {
   pub cols: usize,
   pub sections: usize,
-  pub names: usize,
   pub bytes: usize,
   pub secs: f64,
 }
@@ -358,7 +357,7 @@ pub fn build(
       let cz = col_min.1 + (i as i32) / dims.0;
       let out = column(world, &names, cx, cz);
       let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-      if n % PROGRESS_COLS == 0 {
+      if n.is_multiple_of(PROGRESS_COLS) {
         progress(n, cols);
       }
       out
@@ -409,12 +408,13 @@ pub fn build(
     fine_body,
   };
   let bytes = f.write(out)?;
-  let stats =
-    BuildStats { cols, sections, names: f.names.len(), bytes, secs: t0.elapsed().as_secs_f64() };
+  let stats = BuildStats { cols, sections, bytes, secs: t0.elapsed().as_secs_f64() };
   Ok((stats, f))
 }
 
-fn region_bounds(dir: &Path) -> Result<((i32, i32), (i32, i32), usize), String> {
+type RegionBounds = ((i32, i32), (i32, i32), usize);
+
+fn region_bounds(dir: &Path) -> Result<RegionBounds, String> {
   let rdir = dir.join("region");
   let rd = fs::read_dir(&rdir).map_err(|e| format!("读 {} 失败：{e}", rdir.display()))?;
   let (mut lo, mut hi, mut n) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN), 0usize);
@@ -463,7 +463,7 @@ fn column(world: &World, names: &Mutex<Interner>, cx: i32, cz: i32) -> Option<Ve
         .collect()
     };
     let fine = fine_cells(&ids, &buf, &mut counts);
-        let mut cells = [FINE_AIR; FINE_TOTAL];
+    let mut cells = [FINE_AIR; FINE_TOTAL];
     {
       let mut i = 0usize;
       for &(name, len) in &fine {

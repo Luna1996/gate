@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use gate_voxel::{
-  ChunkCoord, ChunkTree, NODE_OFFSET_NONE, NodeLayout, NodeView, PALETTE_INDEX_MAX, PaletteId,
-  ROOT_WIRE_WORDS, TreeDirty, VolumeGrid, VolumeTransform, Volumes, pack_palette_word,
+  BrickState, ChunkCoord, ChunkTree, NODE_OFFSET_NONE, NodeLayout, NodeView, PALETTE_INDEX_MAX,
+  PaletteId, ROOT_WIRE_WORDS, TreeDirty, VolumeGrid, VolumeTransform, Volumes, pack_palette_word,
 };
-use glam::{IVec3, Vec4};
+use glam::{IVec3, Vec3, Vec4};
 
 use super::wire::{GridDesc, LEAF_INLINE_WORDS, NODE_FIXED_WORDS, pack_palette_entry};
 use rayon::prelude::*;
@@ -12,7 +12,6 @@ use rayon::prelude::*;
 use super::consts::INDEX_ENTRY_EMPTY;
 use super::wire::{
   BrickMapBuffers, BrickMapGlobals, CHUNK_INDEX_CAP, PALETTE_BYTES_PER_ENTRY, PALETTE_WORDS,
-  TREE_BASE,
 };
 
 fn chunk_index_pos(origin: IVec3, dims: IVec3, chunk: IVec3) -> Option<usize> {
@@ -48,7 +47,7 @@ fn occ_bit(rel: IVec3) -> usize {
 
 const _: () = assert!(OCC_GROUP == 4, "组内的位打包按 4×4×4 写死（`>> 2` 与 `& 3`）");
 const _: () = assert!(
-  OCC_WORDS * 32 == (CHUNK_INDEX_CAP as usize).pow(3),
+  OCC_WORDS * 32 == CHUNK_INDEX_CAP.pow(3),
   "位图必须逐 chunk 一位地覆盖整个索引区（64³ 槽）"
 );
 const _: () = assert!(OCC_WORDS == 8192, "trace.wesl::OCC_WORDS 必须同值");
@@ -229,15 +228,24 @@ impl BrickMapBuilder {
     self.dirty_struct.push((lo, hi));
   }
 
+  fn tree_base(dims: IVec3) -> usize {
+    let cap = CHUNK_INDEX_CAP;
+    (dims.x.max(1) as usize - 1)
+      + cap * (dims.y.max(1) as usize - 1)
+      + cap * cap * (dims.z.max(1) as usize - 1)
+      + 1
+  }
+
   pub fn new_unbuilt(grid: &VolumeGrid) -> Self {
     Self::new_unbuilt_sized(grid, 0, 0)
   }
 
   pub fn new_unbuilt_sized(grid: &VolumeGrid, reserve_words: usize, region_chunks: usize) -> Self {
     let (origin, dims, rejected) = compute_window(grid);
+    let tree_base = Self::tree_base(dims);
     let mut b = Self {
       buffers: BrickMapBuffers {
-        b_struct: vec![0; TREE_BASE + reserve_words],
+        b_struct: vec![0; tree_base + reserve_words],
         b_palette: vec![0; PALETTE_WORDS],
         globals: BrickMapGlobals {
           index_origin_x: origin.x,
@@ -281,7 +289,7 @@ impl BrickMapBuilder {
       occ_dirty: true,
     };
     if reserve_words > 0 {
-      b.free.free(TREE_BASE, reserve_words);
+      b.free.free(tree_base, reserve_words);
     }
     b.write_palette(grid);
     let empties: Vec<ChunkCoord> = grid.empty_log_from(0).to_vec();
@@ -348,7 +356,9 @@ impl BrickMapBuilder {
       }
       ChunkUpdate::Rebuilt
     };
-    if allow_compact && self.free.words() * 2 > self.buffers.b_struct.len() - TREE_BASE {
+    if allow_compact
+      && self.free.words() * 2 > self.buffers.b_struct.len() - Self::tree_base(self.dims)
+    {
       self.compact();
     }
     self.refresh_globals();
@@ -403,7 +413,6 @@ impl BrickMapBuilder {
     self.chunks.get(&coord).map(|s| s.base)
   }
 
-  
   pub fn is_resident(&self, coord: ChunkCoord) -> bool {
     self.chunks.contains_key(&coord)
   }
@@ -418,6 +427,10 @@ impl BrickMapBuilder {
 
   pub fn resident_chunks(&self) -> Vec<ChunkCoord> {
     self.chunks.keys().copied().collect()
+  }
+
+  pub fn resident_chunk_count(&self) -> usize {
+    self.chunks.len()
   }
 
   pub fn aabbs_of(&self, coord: ChunkCoord) -> Option<&crate::brickmap::rt::ChunkAabbs> {
@@ -567,7 +580,7 @@ impl BrickMapBuilder {
         None => dropped.push(c),
       }
     }
-    self.buffers.b_struct[..TREE_BASE].fill(0);
+    self.buffers.b_struct[..Self::tree_base(old.1)].fill(0);
     for (b, entry) in keep {
       self.buffers.b_struct[b] = entry;
     }
@@ -593,7 +606,7 @@ impl BrickMapBuilder {
       g.index_dims_y = dims.y as u32;
       g.index_dims_z = dims.z as u32;
     }
-    self.mark_struct_words(0, TREE_BASE);
+    self.mark_struct_words(0, Self::tree_base(dims));
     self.occ_rebuild();
     bevy::log::debug!(
       "WINDOW 平移 {} → {origin} dims {dims}（掉了 {} 个出门的）",
@@ -619,12 +632,13 @@ impl BrickMapBuilder {
     const REGION_CHUNKS_CAP: usize = 32768;
     const PER_CHUNK_WORDS_CAP: usize = 65536;
     const REGION_WORDS_CAP: usize = 512 * 1024 * 1024;
-    let used = self.buffers.b_struct.len().saturating_sub(TREE_BASE);
+    let base = Self::tree_base(self.dims);
+    let used = self.buffers.b_struct.len().saturating_sub(base);
     let per_chunk = (used / self.chunks.len().max(1)).max(block_cap);
-        let region_chunks = self.region_chunks.min(REGION_CHUNKS_CAP);
+    let region_chunks = self.region_chunks.min(REGION_CHUNKS_CAP);
     let per_chunk = per_chunk.min(PER_CHUNK_WORDS_CAP);
-    let target = (TREE_BASE + region_chunks.saturating_mul(per_chunk)).min(REGION_WORDS_CAP);
-                if self.reserve > 0 && target > self.buffers.b_struct.len() {
+    let target = (base + region_chunks.saturating_mul(per_chunk)).min(REGION_WORDS_CAP);
+    if self.reserve > 0 && target > self.buffers.b_struct.len() {
       let from = self.buffers.b_struct.len();
       bevy::log::debug!(
         "树区长度一次顶到位：{from} → {target} 字（块 {}、每块估 {per_chunk} 字）",
@@ -637,7 +651,7 @@ impl BrickMapBuilder {
     if target <= self.buffers.b_struct.capacity() {
       return;
     }
-    let grown = self.buffers.b_struct.capacity().saturating_mul(2).max(TREE_BASE + (1 << 20));
+    let grown = self.buffers.b_struct.capacity().saturating_mul(2).max(base + (1 << 20));
     let want = grown.min(target);
     let extra = want.saturating_sub(self.buffers.b_struct.len());
     if extra > 0 {
@@ -645,7 +659,7 @@ impl BrickMapBuilder {
     }
     bevy::log::debug!(
       "树区容量拨到 {} 字（旧高水位 {used} 字 / {} 块，每块估 {per_chunk} 字）",
-      target - TREE_BASE,
+      target - base,
       self.chunks.len(),
     );
   }
@@ -780,7 +794,7 @@ impl BrickMapBuilder {
     let content = out.len();
     debug_assert!(content == new_words || id == 0, "节点 {id} 的编码字数与定址口径不符");
 
-        if old_off != NODE_NONE && level < 3 && view.mask == 0 {
+    if old_off != NODE_NONE && level < 3 && view.mask == 0 {
       let old_at = slot.base + old_off as usize;
       let old_mask = read_mask(&self.buffers.b_struct, old_at);
       for slot_i in 0..old_mask.count_ones() as usize {
@@ -850,7 +864,8 @@ impl BrickMapBuilder {
     let mut items: Vec<(ChunkCoord, usize, usize)> =
       self.chunks.iter().map(|(&c, s)| (c, s.base, s.cap)).collect();
     items.sort_by_key(|&(_, old_base, _)| old_base);
-    let mut cursor = TREE_BASE;
+    let base = Self::tree_base(self.dims);
+    let mut cursor = base;
     let mut moved = 0usize;
     for (coord, old_base, cap) in items {
       if old_base != cursor {
@@ -869,15 +884,16 @@ impl BrickMapBuilder {
     bevy::log::debug!(
       "COMPACT 树区 长{}字 → {}字（搬 {moved} 字 / {} 块）",
       self.buffers.globals.node_words,
-      cursor - TREE_BASE,
+      cursor - base,
       self.chunks.len()
     );
   }
 
   fn refresh_globals(&mut self) {
+    let base = Self::tree_base(self.dims);
     let g = &mut self.buffers.globals;
     g.tile_count = self.chunks.len() as u32;
-    g.node_words = (self.buffers.b_struct.len() - TREE_BASE) as u32;
+    g.node_words = (self.buffers.b_struct.len() - base) as u32;
     g.node_free_words = self.free.words() as u32;
     g.brick_slabs = 0;
     g.brick_free = 0;
@@ -893,15 +909,62 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
   v
 }
 
+fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
+  const STEP: i32 = 16;
+  const TOP: i32 = 64;
+  let lvl =
+    gate_voxel::LEVEL_EXTENT.iter().position(|&e| e == STEP).expect("16 必须是 brick 粒度之一")
+      as u8;
+  let mut lo = IVec3::splat(i32::MAX);
+  let mut hi = IVec3::splat(i32::MIN);
+  let mut any = false;
+  for c in grid.chunk_coords() {
+    let Some(tree) = grid.chunk(c) else { continue };
+    let base = c.0 * gate_voxel::CHUNK_SIZE;
+    let (mask, root_pal) = match tree.node_view(0) {
+      Some(v) => (v.mask, v.palette),
+      None => (0, tree.root_palette()),
+    };
+    let uniform_solid = !root_pal.is_air();
+    for i in 0..64u32 {
+      if ((mask >> i) & 1 == 0) && !uniform_solid {
+        continue;
+      }
+      let (ix, iy, iz) = crate::brickmap::rt::slab_axes(i);
+      let top = IVec3::new(ix as i32, iy as i32, iz as i32) * TOP;
+      any = true;
+      if tree.get_uniform(top.x, top.y, top.z, 1).is_some() {
+        lo = lo.min(base + top);
+        hi = hi.max(base + top + IVec3::splat(TOP - 1));
+        continue;
+      }
+      for k in 0..64u32 {
+        let (kx, ky, kz) = crate::brickmap::rt::slab_axes(k);
+        let p = top + IVec3::new(kx as i32, ky as i32, kz as i32) * STEP;
+        if matches!(tree.get_brick_state(p.x, p.y, p.z, lvl), BrickState::Air) {
+          continue;
+        }
+        lo = lo.min(base + p);
+        hi = hi.max(base + p + IVec3::splat(STEP - 1));
+      }
+    }
+  }
+  any.then_some((lo, hi))
+}
+
 #[derive(Debug, Clone)]
 pub struct VolumesSnapshot {
   pub b_struct: Vec<u32>,
+  pub b_struct_p1: Vec<u32>,
   pub b_palette: Vec<u32>,
   pub grid_descs: Vec<GridDesc>,
+  pub inst_bvh: Vec<u32>,
   pub mode_tag: &'static str,
   pub struct_blobs: Vec<(usize, Vec<u8>)>,
+  pub struct_blobs_p1: Vec<(usize, Vec<u8>)>,
   pub palette_blobs: Vec<(usize, Vec<u8>)>,
   pub struct_total_bytes: usize,
+  pub struct_total_bytes_p1: usize,
   pub palette_total_bytes: usize,
   pub dirty_chunks: usize,
   pub occ_all: Option<Vec<u32>>,
@@ -912,14 +975,20 @@ pub struct VolumesBuilder {
   transforms: Vec<VolumeTransform>,
   far: Vec<bool>,
   coverage: Vec<f32>,
+  tight: Vec<Option<(IVec3, IVec3)>>,
+  tight_gen: Vec<u64>,
   budget_bytes: usize,
   prev_tree_bases: Vec<u32>,
   prev_palette_bases: Vec<u32>,
   force_full: bool,
+  slot_tree: Vec<(u32, u32)>,
+  page_hi: [usize; 2],
+  slot_free: Vec<(u32, u32)>,
 }
 
 impl VolumesBuilder {
-  fn reserve_of(grid: &gate_voxel::VolumeGrid) -> usize {
+  fn reserve_of(grid: &gate_voxel::VolumeGrid, region_chunks: usize) -> usize {
+    let _ = region_chunks;
     if grid.is_far_level() { super::consts::FAR_TREE_RESERVE_WORDS } else { 0 }
   }
 
@@ -944,10 +1013,11 @@ impl VolumesBuilder {
     let mut far = Vec::with_capacity(volumes.len());
     let mut coverage = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
+      let region_chunks = Self::region_chunks_of(grid, budget_bytes);
       builders.push(BrickMapBuilder::build_full_sized(
         grid,
-        Self::reserve_of(grid),
-        Self::region_chunks_of(grid, budget_bytes),
+        Self::reserve_of(grid, region_chunks),
+        region_chunks,
       ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
@@ -958,10 +1028,15 @@ impl VolumesBuilder {
       transforms,
       far,
       coverage,
+      tight: vec![None; volumes.len()],
+      tight_gen: vec![u64::MAX; volumes.len()],
       budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
       force_full: true,
+      slot_tree: Vec::new(),
+      page_hi: [0, 0],
+      slot_free: Vec::new(),
     }
   }
 
@@ -971,10 +1046,11 @@ impl VolumesBuilder {
     let mut far = Vec::with_capacity(volumes.len());
     let mut coverage = Vec::with_capacity(volumes.len());
     for grid in volumes.all() {
+      let region_chunks = Self::region_chunks_of(grid, budget_bytes);
       builders.push(BrickMapBuilder::new_unbuilt_sized(
         grid,
-        Self::reserve_of(grid),
-        Self::region_chunks_of(grid, budget_bytes),
+        Self::reserve_of(grid, region_chunks),
+        region_chunks,
       ));
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
@@ -985,10 +1061,15 @@ impl VolumesBuilder {
       transforms,
       far,
       coverage,
+      tight: vec![None; volumes.len()],
+      tight_gen: vec![u64::MAX; volumes.len()],
       budget_bytes,
       prev_tree_bases: Vec::new(),
       prev_palette_bases: Vec::new(),
       force_full: true,
+      slot_tree: Vec::new(),
+      page_hi: [0, 0],
+      slot_free: Vec::new(),
     }
   }
 
@@ -1004,20 +1085,43 @@ impl VolumesBuilder {
     while self.builders.len() < volumes.all().len() {
       let idx = self.builders.len();
       let grid = &volumes.all()[idx];
+      let region_chunks = Self::region_chunks_of(grid, self.budget_bytes);
       self.builders.push(BrickMapBuilder::build_full_sized(
         grid,
-        Self::reserve_of(grid),
-        Self::region_chunks_of(grid, self.budget_bytes),
+        Self::reserve_of(grid, region_chunks),
+        region_chunks,
       ));
       self.transforms.push(grid.transform());
       self.far.push(grid.is_far_level());
       self.coverage.push(grid.coverage_r());
-      self.force_full = true;
+      let b = &mut self.builders[idx];
+      let words = b.buffers().b_struct.len();
+      b.mark_struct_words(0, words);
     }
     for (i, grid) in volumes.all().iter().enumerate() {
       self.transforms[i] = grid.transform();
       self.far[i] = grid.is_far_level();
       self.coverage[i] = grid.coverage_r();
+    }
+    self.sync_tight(volumes);
+  }
+
+  fn sync_tight(&mut self, volumes: &Volumes) {
+    let n = volumes.all().len();
+    if self.tight.len() < n {
+      self.tight.resize(n, None);
+      self.tight_gen.resize(n, u64::MAX);
+    }
+    for (i, grid) in volumes.all().iter().enumerate() {
+      if i == 0 || self.far[i] {
+        self.tight[i] = None;
+        continue;
+      }
+      let stamp = grid.edit_generation();
+      if self.tight_gen[i] != stamp {
+        self.tight[i] = tight_local(grid);
+        self.tight_gen[i] = stamp;
+      }
     }
   }
 
@@ -1052,24 +1156,107 @@ impl VolumesBuilder {
     self.force_full = true;
   }
 
+  fn alloc_tree_slot(
+    &mut self,
+    volume_idx: usize,
+    need: usize,
+    cap_hint: usize,
+  ) -> Option<(u32, u32)> {
+    let seg = crate::wesl_consts::trace_consts().seg_words as usize;
+    let page = usize::from(volume_idx != 0);
+    let mut pick: Option<usize> = None;
+    for (k, &(base, cap)) in self.slot_free.iter().enumerate() {
+      if ((base as usize) < seg) != (page == 0) || (cap as usize) < need {
+        continue;
+      }
+      if pick.is_none_or(|j| self.slot_free[j].1 > cap) {
+        pick = Some(k);
+      }
+    }
+    if let Some(k) = pick {
+      return Some(self.slot_free.swap_remove(k));
+    }
+    let hi = self.page_hi[page];
+    if hi + need > seg {
+      return None;
+    }
+    let cap = cap_hint.clamp(need, seg - hi);
+    self.page_hi[page] = hi + cap;
+    Some(((page * seg + hi) as u32, cap as u32))
+  }
+
   pub fn snapshot(&mut self) -> VolumesSnapshot {
     let n = self.builders.len();
 
-    let layout_order: Vec<usize> = (1..n).chain(std::iter::once(0)).collect();
+    //
+    let seg = crate::wesl_consts::trace_consts().seg_words as usize;
+    let world_cap = (self.budget_bytes / 4).clamp(1, seg);
+    if self.slot_tree.len() < n {
+      self.slot_tree.resize(n, (0, 0));
+    }
+    let full = self.force_full || self.prev_tree_bases.is_empty();
 
     let mut tree_bases = vec![0u32; n];
     let mut palette_bases = vec![0u32; n];
-    let mut struct_total_words = 0usize;
+    let mut struct_blobs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut struct_blobs_p1: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut palette_blobs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut page_used = [0usize; 2];
+    let mut relocated = 0usize;
     let mut palette_total_words = 0usize;
-    for &i in &layout_order {
-      let buffers = self.builders[i].buffers();
-      tree_bases[i] = struct_total_words as u32;
+    for i in 0..n {
+      let need = self.builders[i].buffers().b_struct.len();
+      if (self.slot_tree[i].1 as usize) < need {
+        let cap_hint = if i == 0 { world_cap } else { need.saturating_mul(2) };
+        match self.alloc_tree_slot(i, need, cap_hint) {
+          Some(slot) => {
+            let old = std::mem::replace(&mut self.slot_tree[i], slot);
+            if old.1 > 0 {
+              self.slot_free.push(old);
+            }
+            if !full {
+              let bytes = words_to_bytes(&self.builders[i].buffers().b_struct);
+              if !bytes.is_empty() {
+                let at = slot.0 as usize;
+                if at >= seg {
+                  struct_blobs_p1.push(((at - seg) * 4, bytes));
+                } else {
+                  struct_blobs.push((at * 4, bytes));
+                }
+              }
+              relocated += 1;
+            }
+          }
+          None => {
+            bevy::log::warn_once!(
+              target: "gate",
+              "树区第 {} 页已无余量（v{i} 需要 {need} 字）⇒ 该体按旧槽容量截断，绝不越槽盖住邻居。\
+               物体页见 `SEG_WORDS`：要更多物体空间得先清理已删体块占着不还的槽",
+              usize::from(i != 0),
+            );
+          }
+        }
+      }
+      let slot = self.slot_tree[i];
+      let at = slot.0 as usize;
+      let page = if at >= seg { 1 } else { 0 };
+      let usable = need.min(slot.1 as usize);
+      tree_bases[i] = slot.0;
+      page_used[page] = page_used[page].max(at - page * seg + usable);
       palette_bases[i] = palette_total_words as u32;
-      struct_total_words += buffers.b_struct.len();
-      palette_total_words += buffers.b_palette.len();
+      palette_total_words += self.builders[i].buffers().b_palette.len();
+    }
+    if relocated > 0 {
+      bevy::log::debug!(
+        target: "gate",
+        "树区槽迁移 {relocated} 个（页高水位 {} / {} 字）",
+        self.page_hi[0],
+        self.page_hi[1]
+      );
     }
 
     let mut grid_descs = Vec::with_capacity(n);
+    let mut aabbs: Vec<(Vec3, Vec3)> = Vec::with_capacity(n);
     for i in 0..n {
       let buffers = self.builders[i].buffers();
       let g = &buffers.globals;
@@ -1086,7 +1273,11 @@ impl VolumesBuilder {
         origin,
         dims,
       );
-      let (mn, mx) = super::wire::window_world_aabb(tr, origin, dims);
+      let (mn, mx) = match self.tight[i] {
+        Some((lo, hi)) if i != 0 => super::wire::box_world_aabb(tr, lo.as_vec3(), hi.as_vec3()),
+        _ => super::wire::window_world_aabb(tr, origin, dims),
+      };
+      aabbs.push((mn, mx));
       desc.aabb_min = Vec4::new(mn.x, mn.y, mn.z, 0.0);
       desc.aabb_max = Vec4::new(mx.x, mx.y, mx.z, 0.0);
       desc.grid_flags = if self.far[i] { super::wire::GRID_FLAG_FAR } else { 0 };
@@ -1094,49 +1285,49 @@ impl VolumesBuilder {
       grid_descs.push(desc);
     }
 
-    let bases_shifted = self.prev_tree_bases.len() != tree_bases.len()
-      || self.prev_tree_bases.iter().zip(tree_bases.iter()).any(|(p, c)| p != c)
-      || self.prev_palette_bases.iter().zip(palette_bases.iter()).any(|(p, c)| p != c);
-    let need_full = self.force_full || bases_shifted;
-    if bases_shifted {
-      let info: Vec<String> = self
-        .builders
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-          let len = b.buffers.b_struct.len();
-          let used = len.saturating_sub(TREE_BASE);
-          format!("v{i} 树区 {used} 字/预留 {}（{} 块）", b.reserve, b.chunks.len())
-        })
-        .collect();
-      bevy::log::debug!("BASES 漂移 → 全量快照：{}", info.join(" | "));
-    }
-
     let dirty_chunks: usize = self.builders.iter().map(|b| b.dirty_struct.len()).sum();
 
     let mut b_struct = Vec::new();
+    let mut b_struct_p1 = Vec::new();
     let mut b_palette = Vec::new();
-    let mut struct_blobs = Vec::new();
-    let mut palette_blobs = Vec::new();
 
-    if need_full {
+    if full {
       for b in &mut self.builders {
         let _ = b.take_dirty_ranges();
       }
-      for &i in &layout_order {
-        let buffers = self.builders[i].buffers();
-        b_struct.extend_from_slice(&buffers.b_struct);
-        b_palette.extend_from_slice(&buffers.b_palette);
+      b_struct = vec![0u32; page_used[0]];
+      b_struct_p1 = vec![0u32; page_used[1]];
+      for i in 0..n {
+        let src = &self.builders[i].buffers().b_struct;
+        let src = &src[..src.len().min(self.slot_tree[i].1 as usize)];
+        let at = tree_bases[i] as usize;
+        if at >= seg {
+          let off = at - seg;
+          b_struct_p1[off..off + src.len()].copy_from_slice(src);
+        } else {
+          b_struct[at..at + src.len()].copy_from_slice(src);
+        }
+        b_palette.extend_from_slice(&self.builders[i].buffers().b_palette);
       }
     } else {
       for i in 0..n {
         let dr = self.builders[i].take_dirty_ranges();
         let tb = tree_bases[i] as usize;
         let pb = palette_bases[i] as usize;
+        let cap_bytes = self.slot_tree[i].1 as usize * 4;
         let buffers = self.builders[i].buffers();
         for (lo, hi) in dr.struct_ranges {
+          let hi = hi.min(cap_bytes);
+          if lo >= hi {
+            continue;
+          }
           let (lw, hw) = (lo / 4, hi / 4);
-          struct_blobs.push((tb * 4 + lo, words_to_bytes(&buffers.b_struct[lw..hw])));
+          let bytes = words_to_bytes(&buffers.b_struct[lw..hw]);
+          if tb >= seg {
+            struct_blobs_p1.push(((tb - seg) * 4 + lo, bytes));
+          } else {
+            struct_blobs.push((tb * 4 + lo, bytes));
+          }
         }
         if let Some((lo, hi)) = dr.palette_range {
           let w0 = lo as usize * 2;
@@ -1145,6 +1336,9 @@ impl VolumesBuilder {
             pb * 4 + lo as usize * PALETTE_BYTES_PER_ENTRY,
             words_to_bytes(&buffers.b_palette[w0..w1]),
           ));
+        }
+        if self.prev_palette_bases.get(i) != Some(&(pb as u32)) && !buffers.b_palette.is_empty() {
+          palette_blobs.push((pb * 4, words_to_bytes(&buffers.b_palette)));
         }
       }
     }
@@ -1155,12 +1349,16 @@ impl VolumesBuilder {
 
     VolumesSnapshot {
       b_struct,
+      b_struct_p1,
       b_palette,
       grid_descs,
-      mode_tag: if need_full { "full" } else { "incremental" },
+      inst_bvh: super::bvh::build(&aabbs, &self.far),
+      mode_tag: if full { "full" } else { "incremental" },
       struct_blobs,
+      struct_blobs_p1,
       palette_blobs,
-      struct_total_bytes: struct_total_words * 4,
+      struct_total_bytes: page_used[0] * 4,
+      struct_total_bytes_p1: page_used[1] * 4,
       palette_total_bytes: palette_total_words * 4,
       dirty_chunks,
       occ_all: {
@@ -1194,14 +1392,7 @@ impl VolumesBuilder {
   }
 
   pub fn unbudgeted_struct_bytes(&self) -> usize {
-    let mut words = 0usize;
-    for (i, b) in self.builders.iter().enumerate() {
-      if i == 0 {
-        words += TREE_BASE;
-      } else {
-        words += b.buffers.b_struct.len();
-      }
-    }
+    let words = self.builders.first().map_or(0, |b| BrickMapBuilder::tree_base(b.dims));
     words * 4
   }
 
@@ -1210,7 +1401,11 @@ impl VolumesBuilder {
   }
 
   pub fn resident_chunks(&self, vol_idx: usize) -> Vec<ChunkCoord> {
-    self.builders.get(vol_idx).map(BrickMapBuilder::resident_chunks).unwrap_or_default()
+    self.builders.get(vol_idx).map_or(Vec::new(), BrickMapBuilder::resident_chunks)
+  }
+
+  pub fn resident_chunk_count(&self, vol_idx: usize) -> usize {
+    self.builders.get(vol_idx).map_or(0, BrickMapBuilder::resident_chunk_count)
   }
 
   pub fn note_empty(&mut self, vol_idx: usize, coord: ChunkCoord) -> bool {

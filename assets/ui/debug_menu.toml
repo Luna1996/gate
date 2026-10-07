@@ -4,12 +4,12 @@ y = 8.0
 collapsed = false
 path = []
 pins = [
-    "game/edit/brush/shape",
-    "game/edit/brush/size",
-    "game/edit/brush/offset",
+    "game/edit/place/shape",
+    "game/edit/place/size",
+    "game/edit/place/offset",
+    "game/edit/place/target",
     "game/edit/mat/color",
     "game/edit/mat/pbr",
-    "game/objects/target",
     "game/world/reload",
     "player/camera/mode",
 ]
@@ -503,23 +503,39 @@ tabs = true
 
 [[items.children.children]]
 kind = "sub_menu"
-id = "brush"
-label = "menu.game.edit.brush"
+id = "place"
+label = "menu.game.edit.place"
 
 [[items.children.children.children]]
 kind = "switch_group"
-id = "shape"
-label = "menu.game.edit.shape"
+id = "target"
+label = "menu.game.edit.place.target"
 options = [
-    "menu.game.edit.shape.sphere",
-    "menu.game.edit.shape.cube",
+    "menu.game.edit.place.target.object",
+    "menu.game.edit.place.target.world",
+]
+selected = 0
+tooltip = "menu.game.edit.place.target.tip"
+
+[[items.children.children.children]]
+kind = "dropdown"
+id = "shape"
+label = "menu.game.edit.place.shape"
+options = [
+    "menu.game.edit.place.shape.sphere",
+    "menu.game.edit.place.shape.cube",
+    "menu.game.edit.place.shape.cylinder",
+    "menu.game.edit.place.shape.cone",
+    "menu.game.edit.place.shape.capsule",
+    "menu.game.edit.place.shape.torus",
+    "menu.game.edit.place.shape.random",
 ]
 selected = 0
 
 [[items.children.children.children]]
 kind = "input"
 id = "size"
-label = "menu.game.edit.size"
+label = "menu.game.edit.place.size"
 
 [[items.children.children.children.fields]]
 label = ""
@@ -532,7 +548,7 @@ decimals = 0
 [[items.children.children.children]]
 kind = "input"
 id = "offset"
-label = "menu.game.edit.offset"
+label = "menu.game.edit.place.offset"
 
 [[items.children.children.children.fields]]
 label = ""
@@ -541,6 +557,22 @@ min = 0.0
 max = inf
 step = 0.5
 decimals = 1
+
+[[items.children.children.children]]
+kind = "text"
+id = "count"
+text = "menu.game.edit.place.count"
+
+[[items.children.children.children]]
+kind = "text"
+id = "hover"
+text = "menu.game.edit.place.hover"
+
+[[items.children.children.children]]
+kind = "buttons"
+id = "clear"
+label = ""
+items = ["menu.game.edit.place.clear"]
 
 [[items.children.children]]
 kind = "sub_menu"
@@ -623,60 +655,6 @@ id = "metal"
 label = "menu.game.edit.metal"
 checked = false
 tooltip = "menu.game.edit.metal.tip"
-
-[[items.children]]
-kind = "sub_menu"
-id = "objects"
-label = "menu.game.objects"
-
-[[items.children.children]]
-kind = "switch_group"
-id = "target"
-label = "menu.game.objects.target"
-options = [
-    "menu.game.objects.target.object",
-    "menu.game.objects.target.world",
-]
-selected = 0
-tooltip = "menu.game.objects.target.tip"
-
-[[items.children.children]]
-kind = "slider"
-id = "edge"
-label = "menu.game.objects.edge"
-value = 32.0
-min = 4.0
-max = 128.0
-step = 4.0
-decimals = 0
-tooltip = "menu.game.objects.edge.tip"
-
-[[items.children.children]]
-kind = "slider"
-id = "dist"
-label = "menu.game.objects.dist"
-value = 80.0
-min = 8.0
-max = 512.0
-step = 8.0
-decimals = 0
-tooltip = "menu.game.objects.dist.tip"
-
-[[items.children.children]]
-kind = "text"
-id = "count"
-text = "menu.game.objects.count"
-
-[[items.children.children]]
-kind = "text"
-id = "hover"
-text = "menu.game.objects.hover"
-
-[[items.children.children]]
-kind = "buttons"
-id = "clear"
-label = ""
-items = ["menu.game.objects.clear"]
 
 [[items.children]]
 kind = "sub_menu"
@@ -821,6 +799,36 @@ items = ["menu.game.world.lod_build", "menu.game.world.lod_cancel"]
 kind = "text"
 id = "lod_state"
 text = "menu.game.world.lod_state"
+
+[[items.children]]
+kind = "sub_menu"
+id = "phys"
+label = "menu.game.phys"
+
+[[items.children.children]]
+kind = "dropdown"
+id = "substeps"
+label = "menu.game.phys.substeps"
+options = [
+    "menu.game.phys.substeps.4",
+    "menu.game.phys.substeps.8",
+    "menu.game.phys.substeps.16",
+    "menu.game.phys.substeps.32",
+]
+selected = 1
+tooltip = "menu.game.phys.substeps.tip"
+
+[[items.children.children]]
+kind = "dropdown"
+id = "rate"
+label = "menu.game.phys.rate"
+options = [
+    "menu.game.phys.rate.60",
+    "menu.game.phys.rate.30",
+    "menu.game.phys.rate.20",
+]
+selected = 0
+tooltip = "menu.game.phys.rate.tip"
 
 [[items]]
 kind = "sub_menu"

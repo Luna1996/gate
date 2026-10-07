@@ -1,0 +1,10 @@
+[package]
+name = "gate-physics"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+gate-voxel = { workspace = true }
+micropool = "0.4.2"

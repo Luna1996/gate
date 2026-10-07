@@ -42,7 +42,7 @@ const WORLD_MOUNT_COUNT_PATH: &str = "game/world/mount_count";
 const WORLD_REQUESTS_LOAD_PATH: &str = "game/world/requests_load";
 const WORLD_REQUEST_MB_PATH: &str = "game/world/request_mb";
 pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/mat/pbr_asset";
-const EDIT_OFFSET_PATH: &str = "game/edit/brush/offset";
+const EDIT_OFFSET_PATH: &str = "game/edit/place/offset";
 const VIDEO_AA_PATH: &str = "video/aa";
 
 const EDIT_MATERIAL_PATHS: [&str; 5] = [
@@ -144,6 +144,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   let handle = spawn_debug_menu(world, &ctx, model);
   register_callbacks(world);
   crate::objects::register_callbacks(world);
+  crate::physics::register_callbacks(world);
   apply_initial_state(world, handle.root);
   spawn_fps_overlay(world, &ctx);
 }
@@ -503,22 +504,22 @@ fn register_callbacks(world: &mut World) {
      pbr_set: Option<Res<gate_render::PbrTextureSet>>,
      mut q_show: Query<&mut Visibility, With<ShowcaseRoot>>| {
       match (ev.path.as_str(), &ev.action) {
-        ("game/edit/brush/shape", MenuAction::Select(i)) => {
-          edit.shape = if *i == 0 { BrushShape::Sphere } else { BrushShape::Cube };
-          info!("笔触形状 → {:?}", edit.shape);
+        ("game/edit/place/shape", MenuAction::Select(i)) => {
+          edit.shape = BrushShape::from_index(*i);
+          info!(target: "gate", "笔触形状 → {:?}", edit.shape);
         }
-        ("game/edit/brush/size", MenuAction::Text(t)) => {
+        ("game/edit/place/size", MenuAction::Text(t)) => {
           if let Ok(v) = t.trim().parse::<u32>() {
             edit.size = v.max(EDIT_SIZE_MIN);
             let auto = edit.size as f32;
             write_brush_offset(&mut edit, auto, &mut q_offsets);
-            info!("笔触大小 → {} vx；偏移距离自动 → {:.1}", edit.size, auto);
+            info!(target: "gate", "笔触大小 → {} vx；偏移距离自动 → {:.1}", edit.size, auto);
           }
         }
-        ("game/edit/brush/offset", MenuAction::Text(t)) => match t.trim().parse::<f32>() {
+        ("game/edit/place/offset", MenuAction::Text(t)) => match t.trim().parse::<f32>() {
           Ok(v) => {
             edit.offset = v.max(0.0);
-            info!("笔触偏移距离 → {:.1} vx", edit.offset);
+            info!(target: "gate", "笔触偏移距离 → {:.1} vx", edit.offset);
           }
           Err(_) => debug!(target: "gate", "偏移距离未成形 {t:?} → 忽略"),
         },
@@ -583,6 +584,7 @@ fn register_callbacks(world: &mut World) {
      mut dump: ResMut<gate_render::VoxelDumpRequest>,
      mut stream: ResMut<crate::infinite_cubes::Streaming>,
      mut base: ResMut<gate_render::BaseSettings>,
+     mut phys: ResMut<crate::physics::PhysicsState>,
      pbr: Option<Res<gate_render::PbrTextureSet>>,
      cam: Option<Res<gate_render::DdaCameraConfig>>,
      q_menu: Query<&gate_ui::DebugMenu>| {
@@ -604,7 +606,10 @@ fn register_callbacks(world: &mut World) {
             cam.map(|c| c.position_world.as_ivec3()),
             &mut stream,
           ) {
-            Ok(_info) => info!("世界重载 → {name} {:?}", t0.elapsed()),
+            Ok(_info) => {
+              phys.reset();
+              info!("世界重载 → {name} {:?}", t0.elapsed());
+            }
             Err(e) => warn!("重载世界失败 {name}：{e} → 原世界不变"),
           }
         }

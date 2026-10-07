@@ -236,15 +236,19 @@ pub fn window_world_aabb(
   origin: IVec3,
   dims: IVec3,
 ) -> (Vec3, Vec3) {
-  let s = if t.scale.is_finite() && t.scale > 0.0 { t.scale } else { 1.0 };
   let lo = origin * CHUNK_SIZE;
   let hi = (origin + dims) * CHUNK_SIZE;
+  box_world_aabb(t, lo.as_vec3(), hi.as_vec3())
+}
+
+pub fn box_world_aabb(t: gate_voxel::VolumeTransform, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
+  let s = if t.scale.is_finite() && t.scale > 0.0 { t.scale } else { 1.0 };
   let mut mn = Vec3::splat(f32::MAX);
   let mut mx = Vec3::splat(f32::MIN);
   for &x in &[lo.x, hi.x] {
     for &y in &[lo.y, hi.y] {
       for &z in &[lo.z, hi.z] {
-        let w = t.pos + t.rot * (Vec3::new(x as f32, y as f32, z as f32) * s);
+        let w = t.pos + t.rot * (Vec3::new(x, y, z) * s);
         mn = mn.min(w);
         mx = mx.max(w);
       }

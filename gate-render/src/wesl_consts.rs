@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -9,18 +8,18 @@ use crate::paths::dda_wesl_dir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GiConsts {
-    pub gi_res_words: u32,
-    pub gi_den_guide_words: u32,
-    pub gi_den_hist_words: u32,
-    pub gi_den_atrous_iter: u32,
-    pub gi_den_atrous_r: u32,
-    pub gi_den_atrous_r_fast: u32,
-      pub gi_ss_cand_n: u32,
-    pub gi_ss_cand_n_hq: u32,
-    pub gi_ss_m_cap_k: u32,
-    pub gi_ss_m_cap_k_hq: u32,
-      pub face_words: u32,
-      pub gi_sec_words: u32,
+  pub gi_res_words: u32,
+  pub gi_den_guide_words: u32,
+  pub gi_den_hist_words: u32,
+  pub gi_den_atrous_iter: u32,
+  pub gi_den_atrous_r: u32,
+  pub gi_den_atrous_r_fast: u32,
+  pub gi_ss_cand_n: u32,
+  pub gi_ss_cand_n_hq: u32,
+  pub gi_ss_m_cap_k: u32,
+  pub gi_ss_m_cap_k_hq: u32,
+  pub face_words: u32,
+  pub gi_sec_words: u32,
 }
 
 const REQUIRED: &[&str] = &[
@@ -40,24 +39,32 @@ const REQUIRED: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaterialConsts {
-      pub material_asset_slots: u32,
-    pub material_tex_slots: u32,
+  pub material_asset_slots: u32,
+  pub material_tex_slots: u32,
 }
 
 const MATERIAL_REQUIRED: &[&str] = &["MATERIAL_ASSET_SLOTS", "MATERIAL_TEX_SLOTS"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceConsts {
-    pub lod_diag: u32,
-    pub req_enable: u32,
-    pub req_sample: u32,
-    pub req_per_ray_max: u32,
-      pub volumes: u32,
-        pub index_entry_empty: u32,
+  pub lod_diag: u32,
+  pub req_enable: u32,
+  pub req_sample: u32,
+  pub req_per_ray_max: u32,
+  pub volumes: u32,
+  pub index_entry_empty: u32,
+  pub seg_words: u32,
 }
 
-const TRACE_REQUIRED: &[&str] =
-  &["LOD_DIAG", "REQ_ENABLE", "REQ_SAMPLE", "REQ_PER_RAY_MAX", "GRID_VOLUMES", "INDEX_ENTRY_EMPTY"];
+const TRACE_REQUIRED: &[&str] = &[
+  "LOD_DIAG",
+  "REQ_ENABLE",
+  "REQ_SAMPLE",
+  "REQ_PER_RAY_MAX",
+  "GRID_VOLUMES",
+  "INDEX_ENTRY_EMPTY",
+  "SEG_WORDS",
+];
 
 pub fn gi_consts() -> &'static GiConsts {
   static CONSTS: OnceLock<GiConsts> = OnceLock::new();
@@ -199,7 +206,7 @@ impl MaterialConsts {
       material_tex_slots: get("MATERIAL_TEX_SLOTS"),
     };
 
-        if out.material_asset_slots < 1 || out.material_asset_slots > 65_536 {
+    if out.material_asset_slots < 1 || out.material_asset_slots > 65_536 {
       let msg = format!("材质资产槽数越界（1..=65536，asset 索引是 u16）：{out:?}");
       error!("{msg}");
       panic!("{msg}");
@@ -248,15 +255,22 @@ impl TraceConsts {
       req_per_ray_max: get("REQ_PER_RAY_MAX"),
       volumes: get("GRID_VOLUMES"),
       index_entry_empty: get("INDEX_ENTRY_EMPTY"),
+      seg_words: get("SEG_WORDS"),
     };
 
-        if out.req_sample < 1 || out.req_per_ray_max < 1 {
+    if out.seg_words == 0 {
+      let msg = format!("SEG_WORDS = 0：树区分页边界非法（{out:?}）");
+      error!("{msg}");
+      panic!("{msg}");
+    }
+
+    if out.req_sample < 1 || out.req_per_ray_max < 1 {
       let msg =
         format!("请求通道节流常量非法（`%REQ_SAMPLE` 与 `<REQ_PER_RAY_MAX` 都要 ≥ 1）：{out:?}");
       error!("{msg}");
       panic!("{msg}");
     }
-            if out.volumes != crate::brickmap::consts::VOLUMES as u32 {
+    if out.volumes != crate::brickmap::consts::VOLUMES as u32 {
       let msg = format!(
         "grid volume 数不一致：trace.wesl::GRID_VOLUMES = {}，\
          brickmap::consts::VOLUMES = {}（两侧必须相等，它决定 `lod_req` 的分段与长度）",
@@ -266,7 +280,7 @@ impl TraceConsts {
       error!("{msg}");
       panic!("{msg}");
     }
-        if out.index_entry_empty != crate::brickmap::consts::INDEX_ENTRY_EMPTY {
+    if out.index_entry_empty != crate::brickmap::consts::INDEX_ENTRY_EMPTY {
       let msg = format!(
         "已知空块哨兵不一致：common.wesl::INDEX_ENTRY_EMPTY = {:#x}，\
          brickmap::consts::INDEX_ENTRY_EMPTY = {:#x}（两侧必须相等）",

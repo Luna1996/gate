@@ -1,4 +1,5 @@
 mod builder;
+pub mod bvh;
 pub mod consts;
 pub mod dda;
 pub mod raytrace;

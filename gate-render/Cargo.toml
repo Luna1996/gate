@@ -20,3 +20,4 @@ wgpu = { version = "=30.0.1", default-features = false }
 
 [dev-dependencies]
 naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }
+gate-physics = { workspace = true }

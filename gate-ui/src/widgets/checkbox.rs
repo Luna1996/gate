@@ -119,15 +119,13 @@ pub fn checkbox_state_system(
   let border_strong = color_of(&c.border_strong);
   for (e, hovered, pressed, mut prev, checked, children, disabled) in &mut q {
     let inter = UiInteract::of(hovered, pressed);
-    if !disabled {
-      if prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
-        if checked {
-          commands.entity(e).remove::<Checked>();
-        } else {
-          commands.entity(e).insert(Checked);
-        }
-        commands.trigger(CheckboxToggled { entity: e, checked: !checked });
+    if !disabled && prev.0 == UiInteract::Pressed && inter == UiInteract::Hovered {
+      if checked {
+        commands.entity(e).remove::<Checked>();
+      } else {
+        commands.entity(e).insert(Checked);
       }
+      commands.trigger(CheckboxToggled { entity: e, checked: !checked });
     }
     prev.0 = inter;
     let hovered = !disabled && inter == UiInteract::Hovered;

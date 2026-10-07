@@ -1,66 +1,118 @@
 use bevy::prelude::*;
-use glam::{IVec3, Mat3, Vec3};
+use glam::{IVec3, Vec3};
 
-use gate_render::{DdaCameraConfig, VoxelScene, raycast_objects};
+use gate_render::{DdaCameraConfig, OrbitCamera, VoxelScene, raycast, raycast_objects};
 use gate_ui::{MenuAction, MenuActionEvent};
-use gate_voxel::fill_box;
 
 use crate::{
-  camera::{CameraMode, MouseLock, cursor_ray},
-  edit::{BrushMaterial, EditSettings, EditTarget, material_slot},
+  camera::{CameraMode, FlyCamera, MouseLock, cursor_ray},
+  edit::{
+    BrushShape, Burst, EditSettings, EditTarget, HoldRepeat, RANDOM_SIZE_MAX, Rng, apply_brush,
+    brush_radius, burst, material_slot,
+  },
+  physics::PhysicsState,
 };
 
-const EDGE_DEFAULT: i32 = 32;
-const EDGE_MIN: i32 = 4;
-const DIST_DEFAULT: f32 = 80.0;
 const DELETE_REACH: f32 = 4096.0;
+const FIRE_DISTANCE: f32 = 8.0;
+const FIRE_SPEED: f32 = 1600.0;
+const PILE_COUNT: usize = 1000;
+const PILE_ALTITUDE: f32 = 512.0;
+const PILE_PITCH: f32 = 0.75;
+const PILE_PROBE_UP: f32 = 256.0;
+const PILE_PROBE_DOWN: f32 = 8192.0;
 
-#[derive(Resource, Clone, Copy, Debug)]
-pub(crate) struct ObjectSettings {
-  pub edge: i32,
-  pub dist: f32,
-}
-
-impl Default for ObjectSettings {
-  fn default() -> Self {
-    Self { edge: EDGE_DEFAULT, dist: DIST_DEFAULT }
-  }
-}
+const _: () = assert!(
+  FIRE_SPEED / 60.0 >= (2 * RANDOM_SIZE_MAX - 1) as f32,
+  "发射初速度偏低：60 fps 下相邻两件间距小于随机外形的上限，枪口会互相嵌入"
+);
 
 fn view_ray(windows: &Query<&Window>, cfg: &DdaCameraConfig, locked: bool) -> Option<(Vec3, Vec3)> {
   let window = windows.single().ok()?;
   cursor_ray(window, cfg, locked)
 }
 
-fn place(scene: &mut VoxelScene, center: Vec3, edge: i32, mat: BrushMaterial) -> Option<i32> {
-  let edge = edge.max(EDGE_MIN);
-  let pos = center - Vec3::splat(edge as f32 * 0.5);
-  let obj_id = scene.volumes.spawn_object(pos, Mat3::IDENTITY, 1.0);
-  let grid = scene.volumes.volume_mut(obj_id)?;
-  let slot = material_slot(grid, mat);
-  let written = fill_box(grid, IVec3::ZERO, IVec3::splat(edge), slot);
-  bevy::log::info!(
-    "OBJECT[place] obj={obj_id} @({:.1},{:.1},{:.1}) 边长{edge} slot={slot} {written}vx",
-    pos.x,
-    pos.y,
-    pos.z
-  );
+pub(crate) fn place(
+  scene: &mut VoxelScene,
+  phys: &mut PhysicsState,
+  center: Vec3,
+  b: Burst,
+) -> Option<i32> {
+  spawn_body(scene, phys, center, b, None)
+}
+
+pub(crate) fn fire(
+  scene: &mut VoxelScene,
+  phys: &mut PhysicsState,
+  origin: Vec3,
+  dir: Vec3,
+  b: Burst,
+) {
+  let r = brush_radius(b.size);
+  let center = origin + dir * (FIRE_DISTANCE + r as f32);
+  spawn_body(scene, phys, center, b, Some(dir * FIRE_SPEED));
+}
+
+fn spawn_body(
+  scene: &mut VoxelScene,
+  phys: &mut PhysicsState,
+  center: Vec3,
+  b: Burst,
+  launch: Option<Vec3>,
+) -> Option<i32> {
+  let r = brush_radius(b.size);
+  let pos = center - Vec3::splat(r as f32);
+  let obj_id = scene.volumes.spawn_object(pos, b.rot, 1.0);
+  let written = {
+    let grid = scene.volumes.volume_mut(obj_id)?;
+    let slot = material_slot(grid, b.mat);
+    apply_brush(grid, IVec3::splat(r), b.shape, b.size, slot)
+  };
+  match launch {
+    Some(v) => debug!(
+      target: "gate",
+      "OBJECT[fire] obj={obj_id} {:?} size={} {written}vx v={:.0}vx/s",
+      b.shape,
+      b.size,
+      v.length()
+    ),
+    None => info!(
+      target: "gate",
+      "OBJECT[place] obj={obj_id} @({:.1},{:.1},{:.1}) {:?} size={} {written}vx",
+      pos.x,
+      pos.y,
+      pos.z,
+      b.shape,
+      b.size
+    ),
+  }
+  let grid_index = obj_id as usize + 1;
+  let main = scene.volumes.main();
+  match scene.volumes.list.get(grid_index).and_then(|g| phys.add_object_body(main, g, grid_index)) {
+    Some(i) => match launch {
+      Some(v) => phys.world.launch(i, v),
+      None => info!(target: "gate", "PHYS[body] obj={obj_id} 体={i}"),
+    },
+    None => warn!(target: "gate", "PHYS[body] obj={obj_id} 质量为 0 → 不参与物理"),
+  }
   Some(obj_id)
 }
 
-fn delete_pointed(scene: &mut VoxelScene, origin: Vec3, dir: Vec3) {
+fn delete_pointed(scene: &mut VoxelScene, phys: &mut PhysicsState, origin: Vec3, dir: Vec3) {
   let Some(hit) = raycast_objects(&scene.volumes, origin, dir, DELETE_REACH) else {
-    bevy::log::debug!("OBJECT[delete] 未命中物体");
+    debug!(target: "gate", "OBJECT[delete] 未命中物体");
     return;
   };
   if scene.volumes.despawn_object(hit.obj_id) {
-    bevy::log::info!("OBJECT[delete] obj={}", hit.obj_id);
+    phys.remove_object_body(hit.obj_id as usize + 1);
+    info!(target: "gate", "OBJECT[delete] obj={}", hit.obj_id);
   }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn object_input(
   mouse: Res<ButtonInput<MouseButton>>,
+  time: Res<Time>,
   captured: Res<gate_ui::UiPointerCaptured>,
   intercepted: Res<gate_ui::MouseIntercepted>,
   windows: Query<&Window>,
@@ -68,10 +120,12 @@ pub(crate) fn object_input(
   mode: Res<CameraMode>,
   lock: Res<MouseLock>,
   settings: Res<EditSettings>,
-  obj: Res<ObjectSettings>,
   scene: Option<ResMut<VoxelScene>>,
+  phys: Option<ResMut<PhysicsState>>,
+  mut hold: Local<HoldRepeat>,
+  mut rng: Local<Rng>,
 ) {
-  let Some(mut scene) = scene else { return };
+  let (Some(mut scene), Some(mut phys)) = (scene, phys) else { return };
   if *mode != CameraMode::Fly
     || settings.target != EditTarget::Object
     || scene.demo_force_full_rebuild
@@ -81,42 +135,85 @@ pub(crate) fn object_input(
   if captured.0 || intercepted.0 {
     return;
   }
-  let placing = mouse.just_pressed(MouseButton::Left);
-  let deleting = mouse.just_pressed(MouseButton::Right);
+  let dt = time.delta_secs();
+  let placing = mouse.pressed(MouseButton::Left);
+  let deleting =
+    hold.erase_tick(mouse.just_pressed(MouseButton::Right), mouse.pressed(MouseButton::Right), dt);
   if !placing && !deleting {
     return;
   }
   let Some((origin, dir)) = view_ray(&windows, &cfg, lock.0) else { return };
   if deleting {
-    delete_pointed(&mut scene, origin, dir);
+    delete_pointed(&mut scene, &mut phys, origin, dir);
     return;
   }
-  place(&mut scene, origin + dir * obj.dist, obj.edge, settings.mat);
+  fire(&mut scene, &mut phys, origin, dir, burst(&settings, &mut rng));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pile_fire(
+  mut started: Local<bool>,
+  mut fired: Local<usize>,
+  mut rng: Local<Rng>,
+  cam: Res<DdaCameraConfig>,
+  settings: Res<EditSettings>,
+  mut fly: ResMut<FlyCamera>,
+  mut orbit: ResMut<OrbitCamera>,
+  scene: Option<ResMut<VoxelScene>>,
+  phys: Option<ResMut<PhysicsState>>,
+) {
+  if !crate::consts::phys_pile() {
+    return;
+  }
+  let (Some(mut scene), Some(mut phys)) = (scene, phys) else { return };
+  if !*started {
+    *started = true;
+    let ground = ground_below(&scene, fly.pos);
+    fly.pos.y = ground + PILE_ALTITUDE;
+    orbit.pitch = PILE_PITCH;
+    orbit.clamp();
+    info!(
+      target: "gate",
+      "PHYS[pile] 升到地面以上 {PILE_ALTITUDE:.0} vx（地面 {ground:.0} → 机位 y {:.0}）、\
+       俯角 {:.0}°，笔触按随机，连发 {PILE_COUNT} 件",
+      fly.pos.y,
+      PILE_PITCH.to_degrees()
+    );
+    return;
+  }
+  if *fired >= PILE_COUNT {
+    return;
+  }
+  let random = EditSettings { shape: BrushShape::Random, ..*settings };
+  fire(&mut scene, &mut phys, cam.position_world, cam.forward, burst(&random, &mut rng));
+  *fired += 1;
+  if *fired == PILE_COUNT {
+    info!(target: "gate", "PHYS[pile] 连发完成 {PILE_COUNT} 件");
+  }
+}
+
+fn ground_below(scene: &VoxelScene, from: Vec3) -> f32 {
+  let top = Vec3::new(from.x, from.y + PILE_PROBE_UP, from.z);
+  raycast(&scene.volumes, top, Vec3::NEG_Y, PILE_PROBE_UP + PILE_PROBE_DOWN)
+    .map_or(from.y, |h| h.voxel.y as f32 + 1.0)
 }
 
 pub(crate) fn register_callbacks(world: &mut World) {
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut settings: ResMut<EditSettings>,
-     mut obj: ResMut<ObjectSettings>,
-     scene: Option<ResMut<VoxelScene>>| {
+     scene: Option<ResMut<VoxelScene>>,
+     mut phys: Option<ResMut<PhysicsState>>| {
       match (ev.path.as_str(), &ev.action) {
-        ("game/objects/target", MenuAction::Select(i)) => {
+        ("game/edit/place/target", MenuAction::Select(i)) => {
           settings.target = if *i == 0 { EditTarget::Object } else { EditTarget::World };
-          bevy::log::info!("交互对象 → {:?}", settings.target);
+          info!(target: "gate", "交互对象 → {:?}", settings.target);
         }
-        ("game/objects/edge", MenuAction::Value(v)) => {
-          obj.edge = (*v).round() as i32;
-          bevy::log::info!("OBJECT 生成边长 → {}", obj.edge.max(EDGE_MIN));
-        }
-        ("game/objects/dist", MenuAction::Value(v)) => {
-          obj.dist = *v;
-          bevy::log::info!("OBJECT 生成距离 → {:.0}vx", obj.dist);
-        }
-        ("game/objects/clear", MenuAction::Button(0)) => {
+        ("game/edit/place/clear", MenuAction::Button(0)) => {
           let Some(mut scene) = scene else { return };
           let n = scene.volumes.despawn_all_objects();
-          bevy::log::info!("OBJECT[delete] 全部 n={n}");
+          let bodies = phys.as_mut().map_or(0, |p| p.clear_object_bodies());
+          info!(target: "gate", "OBJECT[delete] 全部 n={n} 刚体={bodies}");
         }
         _ => {}
       }
@@ -132,7 +229,7 @@ pub(crate) fn sync_objects_menu(
   mut q_values: Query<(&gate_ui::MenuTextValue, &mut Text)>,
 ) {
   let Some(scene) = scene else { return };
-  if !q_values.iter().any(|(v, _)| v.path.starts_with("game/objects/")) {
+  if !q_values.iter().any(|(v, _)| v.path.starts_with("game/edit/place/")) {
     return;
   }
   let count = scene.volumes.live_object_count();
@@ -143,8 +240,8 @@ pub(crate) fn sync_objects_menu(
   let pointed_text = if pointed < 0 { "—".to_string() } else { format!("obj {pointed}") };
   for (value, mut text) in &mut q_values {
     let s = match value.path.as_str() {
-      "game/objects/count" => &count_text,
-      "game/objects/hover" => &pointed_text,
+      "game/edit/place/count" => &count_text,
+      "game/edit/place/hover" => &pointed_text,
       _ => continue,
     };
     if text.0 != *s {

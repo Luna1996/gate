@@ -384,7 +384,7 @@ fn build_texture_arrays(
   }
   let layers = ids.len() as u32;
   let extent = Extent3d { width: size.x, height: size.y, depth_or_array_layers: layers };
-      let make_image = |data: Vec<u8>, format: TextureFormat, label: &'static str| {
+  let make_image = |data: Vec<u8>, format: TextureFormat, label: &'static str| {
     let mut img =
       Image::new_uninit(extent, TextureDimension::D2, format, RenderAssetUsages::RENDER_WORLD);
     img.texture_descriptor.label = Some(label);

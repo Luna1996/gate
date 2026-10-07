@@ -217,6 +217,47 @@ pub(crate) fn gpu_compute_pass<T>(
   body(&mut pass)
 }
 
+#[derive(bevy::ecs::schedule::ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+struct GateCpuProbe;
+
+#[derive(Resource, Default)]
+pub(crate) struct CpuProbe {
+  names: Vec<String>,
+  idx: usize,
+  last: Option<std::time::Instant>,
+  acc: Vec<f64>,
+  n: u32,
+}
+
+fn cpu_probe(mut st: ResMut<CpuProbe>) {
+  let Some(t0) = st.last else {
+    st.last = Some(std::time::Instant::now());
+    return;
+  };
+  let now = std::time::Instant::now();
+  let idx = st.idx;
+  if let Some(a) = st.acc.get_mut(idx) {
+    *a += now.duration_since(t0).as_secs_f64();
+  }
+  st.last = Some(now);
+  st.idx += 1;
+  if st.idx < st.names.len() {
+    return;
+  }
+  st.idx = 0;
+  st.n += 1;
+  if st.n < 60 {
+    return;
+  }
+  let mut line = String::new();
+  for (name, a) in st.names.iter().zip(&st.acc) {
+    line.push_str(&format!("{name}={:.2} ", a / st.n as f64 * 1000.0));
+  }
+  bevy::log::debug!(target: "gate", "CPU 分段 ms/帧: {line}");
+  st.acc.iter_mut().for_each(|v| *v = 0.0);
+  st.n = 0;
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct DiagMainFrame {
   t0: Option<std::time::Instant>,
@@ -241,8 +282,27 @@ fn main_frame_end(mut st: ResMut<DiagMainFrame>) {
 
 pub(crate) struct GateProfilerPlugin;
 
+fn setup_cpu_probe(app: &mut App) {
+  use bevy::ecs::schedule::ScheduleLabel as _;
+  let mut order = app.world_mut().resource_mut::<bevy::app::MainScheduleOrder>();
+  let labels: Vec<bevy::ecs::schedule::InternedScheduleLabel> = std::mem::take(&mut order.labels);
+  let mut names = Vec::with_capacity(labels.len());
+  for label in labels {
+    names.push(format!("{label:?}"));
+    order.labels.push(label);
+    order.labels.push(GateCpuProbe.intern());
+  }
+  drop(order);
+  if let Some(first) = names.first_mut() {
+    *first = format!("帧间+{first}");
+  }
+  app.insert_resource(CpuProbe { acc: vec![0.0; names.len()], names, idx: 0, last: None, n: 0 });
+  app.add_systems(GateCpuProbe, cpu_probe);
+}
+
 impl Plugin for GateProfilerPlugin {
   fn build(&self, app: &mut App) {
+    setup_cpu_probe(app);
     app.init_resource::<DiagMainFrame>();
     app.add_systems(bevy::prelude::First, main_frame_begin);
     app.add_systems(bevy::prelude::Last, main_frame_end);
@@ -309,10 +369,8 @@ fn init_gpu_profiler(
   mut res: ResMut<GpuProfilerRes>,
 ) {
   let backend = adapter.get_info().backend;
-  let settings = wgpu_profiler::GpuProfilerSettings {
-    enable_debug_groups: false,
-    ..Default::default()
-  };
+  let settings =
+    wgpu_profiler::GpuProfilerSettings { enable_debug_groups: false, ..Default::default() };
   match wgpu_profiler::GpuProfiler::new_with_tracy_client(
     settings,
     backend,
@@ -442,10 +500,11 @@ fn report_lod_diag(
     d[8],
     pct(d[8]),
   );
-    let main_total = (d[9]).max(1);
+  let main_total = (d[9]).max(1);
   let mpct = |v: u32| v as f32 * 100.0 / main_total as f32;
   info!(
-    "DIAG[主射线 {} 条（1/64 采样）| 近场 {} {:.1}% 远场 {} {:.1}% 天空 {} {:.1}%]",
+    "DIAG[主射线 {} 条（1/64 采样）| 近场 {} {:.1}% 远场 {} {:.1}% 天空 {} {:.1}% | \
+     GI 均值 近 {:.3} 远 {:.3} | 亮度 均值 近 {:.3} 远 {:.3}]",
     d[9],
     d[10],
     mpct(d[10]),
@@ -453,8 +512,12 @@ fn report_lod_diag(
     mpct(d[11]),
     d[12],
     mpct(d[12]),
+    d[28] as f32 / 256.0 / d[10].max(1) as f32,
+    d[29] as f32 / 256.0 / d[11].max(1) as f32,
+    d[30] as f32 / 256.0 / d[10].max(1) as f32,
+    d[31] as f32 / 256.0 / d[11].max(1) as f32,
   );
-    let gi_texels = (d[13]).max(1);
+  let gi_texels = (d[13]).max(1);
   let gi_hits = (d[19]).max(1);
   info!(
     "DIAG[GI {} texel|候选射线 {}（{:.1}/texel）| NEE 阴影 {}（{:.1}/texel）| 命中历史 {:.1}%| \
@@ -603,6 +666,7 @@ impl ReqReadback {
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_lod_requests(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
@@ -721,7 +785,7 @@ fn report_lod_requests(
     touched.iter().map(|&k| (k as usize, counts[k as usize])).filter(|(_, v)| *v > 0).collect();
   let distinct = top.len();
   top.sort_unstable_by_key(|(k, v)| (std::cmp::Reverse(*v), *k));
-    let mut per_vol = [0usize; VOLUMES];
+  let mut per_vol = [0usize; VOLUMES];
   top.retain(|(k, _)| {
     let v = k / USE_WORDS;
     if v < VOLUMES && per_vol[v] < crate::brickmap::consts::REQ_FEED_MAX {

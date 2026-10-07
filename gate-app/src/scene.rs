@@ -161,6 +161,7 @@ pub(crate) fn setup(
     interior_only_edit: false,
     edit_in_flight: false,
     residency_budget_bytes: 0,
+    transforms_dirty: false,
   });
   commands
     .insert_resource(UploadBudget { max_bytes_per_frame: 4 * 1024 * 1024, incremental: true });
@@ -372,7 +373,6 @@ fn build_demo_scene(grid: &mut VolumeGrid) {
             }
           }
         }
-      } else {
       }
       x += 16;
     }

@@ -1,7 +1,7 @@
-import package::bindings::{b_leaves, b_palette, b_struct, grid_descs, lod_diag, lod_req, occ, view_u};
+import package::bindings::{b_leaves, b_palette, grid_descs, lod_diag, lod_req, occ, view_u};
 @if(ray_query)
 import package::bindings::{tlas};
-import package::brickmap::{Grid};
+import package::brickmap::{Grid, ts};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, INDEX_ENTRY_EMPTY, NODE_FIXED_WORDS, face_normal_from_index};
 
 struct VoxelHit {
@@ -107,7 +107,7 @@ fn leaf_lod_pal(b: Brick) -> u32 {
   for (var k: u32 = 0u; k < LEAF_LOD_SCAN_CAP; k = k + 1u) {
     if (m == u64(0)) { return 0u; }
         let i = u32(countOneBits(m & (u64(0) - m)) - u64(1));
-    let w = b_struct[b.addr + NODE_FIXED_WORDS + (i >> 1u)];
+    let w = ts(b.addr + NODE_FIXED_WORDS + (i >> 1u));
     let v = (w >> ((i & 1u) * 16u)) & 0xFFFFu;
     if (v != 0u) { return v; }
     m = m & (m - u64(1));
@@ -164,9 +164,9 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
   let face_base = basis.face_base;
   let oct = basis.oct;
   var bricks: array<Brick, 4u>;
-  let r_ml = b_struct[chunk_base];
-  let r_mh = b_struct[chunk_base + 1u];
-  let r_pw = b_struct[chunk_base + 2u];
+  let r_ml = ts(chunk_base);
+  let r_mh = ts(chunk_base + 1u);
+  let r_pw = ts(chunk_base + 2u);
   let r_pal = r_pw & 0xFFFFu;    let r_rep = r_pw >> 16u;       bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal, r_rep);
   var level: u32 = 3u;
     let p0 = ro_c + rd * t0;
@@ -188,7 +188,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
                         if (mask_bit(b.mask, idx)) {
-          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          let w = ts(b.addr + NODE_FIXED_WORDS + (idx >> 1u));
           let leaf_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
           if (leaf_pal != 0u) { return VoxelHit(true, cur_t, leaf_pal, face, v); }
         } else if (b.pal != 0u) {
@@ -217,10 +217,10 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
         return VoxelHit(true, cur_t, b.pal, face, v);
       }
       let pop = mask_pop_below(b.mask, idx);
-      let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
-      let c_ml = b_struct[child_addr];
-      let c_mh = b_struct[child_addr + 1u];
-      let c_pw = b_struct[child_addr + 2u];
+      let child_addr = chunk_base + ts(b.addr + NODE_FIXED_WORDS + pop);
+      let c_ml = ts(child_addr);
+      let c_mh = ts(child_addr + 1u);
+      let c_pw = ts(child_addr + 2u);
       let c_pal = c_pw & 0xFFFFu;        let c_rep = c_pw >> 16u;           let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
             if (c_mask == u64(0)) {
         if (c_pal != 0u) { return VoxelHit(true, cur_t, c_pal, face, v); }
@@ -278,7 +278,7 @@ fn trace_chunk_opaque(chunk_base: u32, chunk_min: vec3<f32>,
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
                 if (mask_bit(b.mask, idx)) {
-          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          let w = ts(b.addr + NODE_FIXED_WORDS + (idx >> 1u));
           let dp = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
           if (dp != 0u) { return VoxelHit(true, cur_t, dp, face, v); }
         } else if (b.pal != 0u) {
@@ -327,9 +327,9 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
   let face_base = basis.face_base;
   let oct = basis.oct;
   var bricks: array<Brick, 4u>;
-  let r_ml = b_struct[chunk_base];
-  let r_mh = b_struct[chunk_base + 1u];
-  let r_pw = b_struct[chunk_base + 2u];
+  let r_ml = ts(chunk_base);
+  let r_mh = ts(chunk_base + 1u);
+  let r_pw = ts(chunk_base + 2u);
   let r_pal = r_pw & 0xFFFFu;    let r_rep = r_pw >> 16u;       bricks[3u] = Brick(chunk_base, (u64(r_mh) << 32u) | u64(r_ml), r_pal, r_rep);
   var level: u32 = 3u;
     let p0 = ro_c + rd * t0;
@@ -352,7 +352,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       let idx = u32(cell.z * 16 + cell.y * 4 + cell.x);
       if (level == 0u) {
                 if (mask_bit(b.mask, idx)) {
-          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          let w = ts(b.addr + NODE_FIXED_WORDS + (idx >> 1u));
           hit_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
         } else {
           hit_pal = b.pal;
@@ -380,10 +380,10 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
         return VoxelHit(true, cur_t, b.pal, face, v);
       }
       let pop = mask_pop_below(b.mask, idx);
-      let child_addr = chunk_base + b_struct[b.addr + NODE_FIXED_WORDS + pop];
-      let c_ml = b_struct[child_addr];
-      let c_mh = b_struct[child_addr + 1u];
-      let c_pw = b_struct[child_addr + 2u];
+      let child_addr = chunk_base + ts(b.addr + NODE_FIXED_WORDS + pop);
+      let c_ml = ts(child_addr);
+      let c_mh = ts(child_addr + 1u);
+      let c_pw = ts(child_addr + 2u);
       let c_pal = c_pw & 0xFFFFu;        let c_rep = c_pw >> 16u;           let c_mask = (u64(c_mh) << 32u) | u64(c_ml);
             if (c_mask == u64(0)) {
         hit_pal = c_pal;
@@ -452,7 +452,7 @@ fn trace_chunk(chunk_base: u32, chunk_min: vec3<f32>,
       hit_pal = 0u;
       if (level == 0u) {
         if (mask_bit(b.mask, idx)) {
-          let w = b_struct[b.addr + NODE_FIXED_WORDS + (idx >> 1u)];
+          let w = ts(b.addr + NODE_FIXED_WORDS + (idx >> 1u));
           hit_pal = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
         } else {
           hit_pal = b.pal;          }
@@ -574,7 +574,7 @@ fn trace_grid_rt(ro: vec3<f32>, rd: vec3<f32>, tl0: f32, tl1: f32, depth_cap: u3
     let rel_u = vec3<u32>(rel);
     let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
       + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
-    let entry = b_struct[index_addr];
+    let entry = ts(index_addr);
         if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { *exhausted = 1u; break; }
     let chunk_base = tree_base + entry - 1u;
     let chunk_min = vec3<f32>(vec3<i32>(i32(CHUNK_SIZE)) * ci);
@@ -754,7 +754,7 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
       let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
         + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
                   var entry: u32 = 0u;
-      if (!group_empty) { entry = b_struct[index_addr]; }
+      if (!group_empty) { entry = ts(index_addr); }
                                                 let has_tree = entry != 0u && entry != INDEX_ENTRY_EMPTY;
                               if (group_empty || entry == 0u) { *gap = min(*gap, t_enter_c); }
                                     if (entry == 0u && req != 0u && req_sent < REQ_PER_RAY_MAX && req_sampled(origin, dir, vol)) {
@@ -774,10 +774,10 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
                 let t0c = max(t_enter_c, t_min);
                                                                                                                 var chunk_skipped = false;
         if (penetrate && t1 > t0c) {
-          let r_ml = b_struct[chunk_base];
-          let r_mh = b_struct[chunk_base + 1u];
+          let r_ml = ts(chunk_base);
+          let r_mh = ts(chunk_base + 1u);
           if (r_ml == 0u && r_mh == 0u) {
-            let r_pal = b_struct[chunk_base + 2u] & 0xFFFFu;
+            let r_pal = ts(chunk_base + 2u) & 0xFFFFu;
             if (r_pal != 0u && r_pal != (*mc).last_pal) {
               let m_uni = medium_of((*mc).palette_base, r_pal);
               if (m_uni.a < 1.0) {

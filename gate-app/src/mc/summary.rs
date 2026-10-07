@@ -86,10 +86,10 @@ impl Summary {
         let col_z = (cell.z + cell_blocks / 2).div_euclid(SEC);
         let n = cell_blocks / SEC;
         for sy in (0..n).rev() {
-          if let Some(sec) = self.sec(src, IVec3::new(col_x, c.y + sy, col_z)) {
-            if !sec.rep.is_air() {
-              return Some(sec.rep);
-            }
+          if let Some(sec) = self.sec(src, IVec3::new(col_x, c.y + sy, col_z))
+            && !sec.rep.is_air()
+          {
+            return Some(sec.rep);
           }
         }
         None

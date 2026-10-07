@@ -43,6 +43,7 @@ pub fn compile_wesl_entry(entry: impl AsRef<Path>, ray_query: bool) -> Result<St
 }
 
 pub fn build_dda_shader(app: &mut App) {
+  let t0 = std::time::Instant::now();
   let source = match compile_dda_wesl(false) {
     Ok(source) => source,
     Err(e) => {
@@ -51,6 +52,7 @@ pub fn build_dda_shader(app: &mut App) {
       panic!("{msg}");
     }
   };
+  let t1 = std::time::Instant::now();
   let source_rt = match compile_dda_wesl(true) {
     Ok(source) => source,
     Err(e) => {
@@ -59,6 +61,15 @@ pub fn build_dda_shader(app: &mut App) {
       panic!("{msg}");
     }
   };
+  let t2 = std::time::Instant::now();
+  info!(
+    target: "gate",
+    "WESL→WGSL：主 {} ms（{} KB）/ ray_query 版 {} ms（{} KB）",
+    t1.duration_since(t0).as_millis(),
+    source.len() / 1024,
+    t2.duration_since(t1).as_millis(),
+    source_rt.len() / 1024
+  );
 
   crate::wesl_consts::gi_consts();
   crate::wesl_consts::trace_consts();

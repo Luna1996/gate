@@ -1,5 +1,12 @@
-import package::bindings::{b_struct, g};
+import package::bindings::{b_struct, b_struct_p1, g};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, INDEX_ENTRY_EMPTY, MAX_LEVEL, NODE_FIXED_WORDS};
+
+const SEG_WORDS: u32 = 536870912u;
+
+fn ts(addr: u32) -> u32 {
+  if (addr >= SEG_WORDS) { return b_struct_p1[addr - SEG_WORDS]; }
+  return b_struct[addr];
+}
 
 struct Grid {
   w_mn: vec3<f32>,                w_mx: vec3<f32>,                l_min: vec3<f32>,               l_max: vec3<f32>,               max_chunk_steps: u32,           col0: vec3<f32>,                col1: vec3<f32>,
@@ -17,15 +24,15 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   let rel_u = vec3<u32>(rel);
   if (any(rel_u >= dims)) { return 0u; }
     let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
-  let entry = b_struct[index_addr];
+  let entry = ts(index_addr);
   if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { return 0u; }
     let chunk_base = g.tree_base + entry - 1u;
 
     let local = vec3<u32>(m);    var node_addr = chunk_base;
   for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
-    let mask_lo = b_struct[node_addr];
-    let mask_hi = b_struct[node_addr + 1u];
-    let palette = b_struct[node_addr + 2u] & 0xFFFFu;  
+    let mask_lo = ts(node_addr);
+    let mask_hi = ts(node_addr + 1u);
+    let palette = ts(node_addr + 2u) & 0xFFFFu;  
     let shift = 8u - (level + 1u) * 2u;
     let cx = (local.x >> shift) & 3u;
     let cy = (local.y >> shift) & 3u;
@@ -43,7 +50,7 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
       return palette;      }
 
     if (level == 3u) {
-            let w = b_struct[node_addr + NODE_FIXED_WORDS + (child_idx >> 1u)];
+            let w = ts(node_addr + NODE_FIXED_WORDS + (child_idx >> 1u));
       return (w >> ((child_idx & 1u) * 16u)) & 0xFFFFu;
     }
 
@@ -53,6 +60,6 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
     } else {
       popcount_below = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
     }
-    node_addr = chunk_base + b_struct[node_addr + NODE_FIXED_WORDS + popcount_below];
+    node_addr = chunk_base + ts(node_addr + NODE_FIXED_WORDS + popcount_below);
   }
-  return b_struct[node_addr + 2u] & 0xFFFFu;  }
+  return ts(node_addr + 2u) & 0xFFFFu;  }

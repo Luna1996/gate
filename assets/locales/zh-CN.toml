@@ -72,10 +72,11 @@ GI 网格边长 = 渲染分辨率 ÷ 档位（每一档都跑 GI，不是开关�
 "menu.render.gi.sun_bounce.tip" = """
 GI 二次顶点是否朝太阳发一条阴影射线（NEE）。
 
-- **开**：阴影区被阳光「弹亮」
+- **开**：能看见阳光的阴影面被「弹亮」
 - **关**（默认）：只剩天光项，**整条阴影射线都不发**（2K + `1/4` 档下省 `gate_gi` 的 ~`40%`）
 
-这是**能量取舍**（不是噪声取舍），降噪救不回来。"""
+只影响**能看见阳光的那些阴影面**；堆体内部互相遮挡的面拿不到它，那部分靠
+`GI_AMBIENT_FLOOR` 的环境光地板。"""
 "menu.render.gi.wal" = "世界累积"
 "menu.render.gi.wal.tip" = """
 GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面持久缓存辐照度）。
@@ -226,21 +227,37 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 "menu.pinned" = "常用"
 "menu.game" = "游戏"
 "menu.game.edit" = "编辑"
-"menu.game.edit.brush" = "笔触"
+"menu.game.edit.place" = "放置"
 "menu.game.edit.mat" = "材质"
-"menu.game.edit.shape" = "笔触形状"
-"menu.game.edit.shape.sphere" = "球体"
-"menu.game.edit.shape.cube" = "正方体"
-"menu.game.edit.size" = "笔触大小"
-"menu.game.edit.offset" = "偏移距离"
-"menu.game.edit.offset.tip" = """
-笔触几何中心相对**点击选中的体素**沿命中面法线方向的偏移（体素）：
+"menu.game.edit.place.target" = "交互对象"
+"menu.game.edit.place.target.object" = "物体"
+"menu.game.edit.place.target.world" = "体素"
+"menu.game.edit.place.target.tip" = """
+左键 / 右键作用于哪一套，两套互斥：
+**物体** —— 左键在命中面外侧放一个刚体，右键删除光标指向的物体。
+**体素** —— 左键落笔、右键擦除。
+
+两套共用下面的形状 / 大小 / 偏移。
+"""
+"menu.game.edit.place.shape" = "形状"
+"menu.game.edit.place.shape.sphere" = "球体"
+"menu.game.edit.place.shape.cube" = "正方体"
+"menu.game.edit.place.shape.cylinder" = "圆柱"
+"menu.game.edit.place.shape.cone" = "圆锥"
+"menu.game.edit.place.shape.capsule" = "胶囊"
+"menu.game.edit.place.shape.torus" = "圆环"
+"menu.game.edit.place.shape.random" = "随机"
+"menu.game.edit.place.size" = "大小"
+"menu.game.edit.place.offset" = "偏移距离"
+"menu.game.edit.place.offset.tip" = """
+几何中心相对**点击选中的体素**沿命中面法线方向的偏移（体素）：
 **放置**取 `+偏移`（往**外**推）、**摧毁**取 `−偏移`（往**内**挖）。
 
-取 `1` 就是旧的"放置贴面外一格"，取 `0` 则是"以命中格为中心"（放置不再外推）。
-
-改「笔触大小」时本值**自动**置为大小的一半（`3` ⇒ `1.5`），之后仍可自由输入。
-笔触中心必须落在**整数体素格**上 ⇒ 落笔时四舍五入（`1.5 ⇒ 2`）。"""
+改「大小」时本值**自动**置为大小的一半（`3` ⇒ `1.5`），之后仍可自由输入。
+中心必须落在**整数体素格**上 ⇒ 落笔时四舍五入（`1.5 ⇒ 2`）。"""
+"menu.game.edit.place.count" = "物体数"
+"menu.game.edit.place.hover" = "光标命中"
+"menu.game.edit.place.clear" = "全部销毁"
 "menu.game.edit.color" = "颜色"
 "menu.game.edit.emissive" = "自发光"
 "menu.game.edit.emissive.tip" = """
@@ -360,26 +377,26 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 构建在后台线程跑（十几秒），**完成即自动启用**，不用重启。中途可以「中止」。
 首次之后每次开机自动装载（存档改过会作废旧文件）。
 """
-"menu.game.objects" = "物体"
-"menu.game.objects.target" = "交互对象"
-"menu.game.objects.target.object" = "物体"
-"menu.game.objects.target.world" = "体素"
-"menu.game.objects.target.tip" = """
-左键 / 右键作用于哪一套操作，两套互斥：
-**物体** —— 左键在准星延长线固定距离处放置物体（不做射线求交），右键删除光标指向的物体。
-**体素** —— 左键落笔、右键擦除。
+"menu.game.phys" = "物理"
+"menu.game.phys.substeps" = "子步数"
+"menu.game.phys.substeps.4" = "4"
+"menu.game.phys.substeps.8" = "8"
+"menu.game.phys.substeps.16" = "16"
+"menu.game.phys.substeps.32" = "32"
+"menu.game.phys.substeps.tip" = """
+每个固定步里扫掠几遍。遍数越多，多条接触的堆叠压得越稳。
+
+1000 体压测里这是最大的一项开销，减半等于省一半求解时间。
 """
-"menu.game.objects.edge" = "生成边长"
-"menu.game.objects.edge.tip" = """
-生成立方体的边长（体素）。物体**中心**落在准星延长线的 `生成距离` 处。
+"menu.game.phys.rate" = "物理步频"
+"menu.game.phys.rate.60" = "60"
+"menu.game.phys.rate.30" = "30"
+"menu.game.phys.rate.20" = "20"
+"menu.game.phys.rate.tip" = """
+物理每秒推进多少个固定步（**Hz**）。**60** 是实时满速。
+
+降到 **30** 等于每两帧推进一步：每帧物理开销减半，代价是仿真按**半速**走。
 """
-"menu.game.objects.dist" = "生成距离"
-"menu.game.objects.dist.tip" = """
-放置点沿准星方向的距离（体素）。放置不走射线求交，该值直接决定物体落在哪。
-"""
-"menu.game.objects.count" = "物体数"
-"menu.game.objects.hover" = "光标命中"
-"menu.game.objects.clear" = "全部销毁"
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
 "menu.camera.pos.value" = "%{v}"

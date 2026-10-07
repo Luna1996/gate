@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use bevy::prelude::*;
-use glam::IVec3;
+use glam::{IVec3, Mat3, Vec3};
 
 use gate_render::brickmap::wire::pack_palette_entry;
 use gate_render::{DdaCameraConfig, PbrTextureSet, VoxelScene, raycast};
@@ -24,6 +24,72 @@ pub enum BrushShape {
   #[default]
   Sphere,
   Cube,
+  Cylinder,
+  Cone,
+  Capsule,
+  Torus,
+  Random,
+}
+
+pub const BRUSH_SHAPES: [BrushShape; 6] = [
+  BrushShape::Sphere,
+  BrushShape::Cube,
+  BrushShape::Cylinder,
+  BrushShape::Cone,
+  BrushShape::Capsule,
+  BrushShape::Torus,
+];
+
+pub const SHAPE_CHOICES: [BrushShape; 7] = [
+  BrushShape::Sphere,
+  BrushShape::Cube,
+  BrushShape::Cylinder,
+  BrushShape::Cone,
+  BrushShape::Capsule,
+  BrushShape::Torus,
+  BrushShape::Random,
+];
+
+impl BrushShape {
+  pub fn from_index(i: usize) -> Self {
+    SHAPE_CHOICES.get(i).copied().unwrap_or_default()
+  }
+
+  pub fn contains(self, d: IVec3, r: i32) -> bool {
+    let r2 = r.saturating_mul(r);
+    match self {
+      Self::Sphere => d.length_squared() <= r2.saturating_add(r),
+      Self::Cube => d.x.abs() <= r && d.y.abs() <= r && d.z.abs() <= r,
+      Self::Cylinder => d.x * d.x + d.z * d.z <= r2 && d.y.abs() <= r,
+      Self::Cone => {
+        d.y >= -r && d.y <= r && {
+          let k = r - d.y;
+          4 * (d.x * d.x + d.z * d.z) <= k * k
+        }
+      }
+      Self::Capsule => {
+        let t = (r / 2).max(1);
+        let dy = (d.y.abs() - (r - t).max(0)).max(0);
+        d.x * d.x + d.z * d.z + dy * dy <= t * t
+      }
+      Self::Torus => {
+        let t = (r / 4).max(1);
+        let big = (r - t).max(0);
+        let q = (d.x * d.x + d.z * d.z) as i64;
+        let (big2, t2, dy2) = ((big * big) as i64, (t * t) as i64, (d.y * d.y) as i64);
+        let lhs = q + big2 + dy2 - t2;
+        lhs * lhs <= 4 * big2 * q
+      }
+      Self::Random => {
+        debug_assert!(false, "Random 必须先经 burst() 解析成具体形状");
+        Self::Sphere.contains(d, r)
+      }
+    }
+  }
+
+  pub fn is_convex(self) -> bool {
+    !matches!(self, Self::Torus)
+  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +200,79 @@ impl Default for EditSettings {
   }
 }
 
+pub(crate) const RANDOM_SIZE_MIN: u32 = 5;
+pub(crate) const RANDOM_SIZE_MAX: u32 = 12;
+
+pub(crate) struct Rng(u64);
+
+impl Default for Rng {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Rng {
+  pub(crate) const SEED: u64 = 0x5EED_5EED_5EED_5EED;
+
+  pub(crate) fn new() -> Self {
+    Self(Self::SEED)
+  }
+  fn next_u64(&mut self) -> u64 {
+    self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = self.0;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+  }
+
+  fn unit(&mut self) -> f32 {
+    (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+  }
+
+  fn int(&mut self, lo: i32, hi: i32) -> i32 {
+    lo + (self.next_u64() % (hi - lo + 1) as u64) as i32
+  }
+
+  fn dir(&mut self) -> Vec3 {
+    let d = Vec3::new(self.unit() * 2.0 - 1.0, self.unit() * 2.0 - 1.0, self.unit() * 2.0 - 1.0);
+    if d.length_squared() < 1e-6 { Vec3::Y } else { d.normalize() }
+  }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Burst {
+  pub shape: BrushShape,
+  pub size: u32,
+  pub mat: BrushMaterial,
+  pub rot: Mat3,
+}
+
+impl Burst {
+  pub(crate) fn fixed(shape: BrushShape, size: u32, mat: BrushMaterial) -> Self {
+    Self { shape, size, mat, rot: Mat3::IDENTITY }
+  }
+}
+
+pub(crate) fn burst(settings: &EditSettings, rng: &mut Rng) -> Burst {
+  if settings.shape != BrushShape::Random {
+    return Burst {
+      shape: settings.shape,
+      size: settings.size,
+      mat: settings.mat,
+      rot: Mat3::IDENTITY,
+    };
+  }
+  let mut mat = settings.mat;
+  mat.pbr = false;
+  mat.color = [rng.int(48, 255) as u8, rng.int(48, 255) as u8, rng.int(48, 255) as u8];
+  Burst {
+    shape: BRUSH_SHAPES[rng.int(0, BRUSH_SHAPES.len() as i32 - 1) as usize],
+    size: rng.int(RANDOM_SIZE_MIN as i32, RANDOM_SIZE_MAX as i32) as u32,
+    mat,
+    rot: Mat3::from_axis_angle(rng.dir(), rng.unit() * std::f32::consts::TAU),
+  }
+}
+
 pub(crate) fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> PaletteId {
   let want = pack_palette_entry(&mat.entry());
   let mut existing = None;
@@ -168,19 +307,35 @@ pub(crate) fn material_slot(grid: &mut VolumeGrid, mat: BrushMaterial) -> Palett
   slot
 }
 
-fn brush_contains(shape: BrushShape, d: IVec3, r: i32) -> bool {
-  match shape {
-    BrushShape::Cube => d.x.abs() <= r && d.y.abs() <= r && d.z.abs() <= r,
-    BrushShape::Sphere => d.length_squared() <= r.saturating_mul(r).saturating_add(r),
-  }
-}
-
 fn brush_box_disjoint(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent: i32) -> bool {
   let hi = lo + IVec3::splat(extent - 1);
-  !brush_contains(shape, center.clamp(lo, hi) - center, r)
+  if shape == BrushShape::Torus {
+    let t = (r / 4).max(1) as i64;
+    let big = (r - t as i32).max(0) as i64;
+    let span = |a: i64, b: i64| -> (i64, i64) {
+      let near = if a > 0 {
+        a
+      } else if b < 0 {
+        -b
+      } else {
+        0
+      };
+      (near, a.abs().max(b.abs()))
+    };
+    let (nx, fx) = span((lo.x - center.x) as i64, (hi.x - center.x) as i64);
+    let (nz, fz) = span((lo.z - center.z) as i64, (hi.z - center.z) as i64);
+    let (ny, _) = span((lo.y - center.y) as i64, (hi.y - center.y) as i64);
+    let (rho_min2, rho_max2) = (nx * nx + nz * nz, fx * fx + fz * fz);
+    let (inner, outer) = ((big - t).max(0), big + t);
+    return ny > t || rho_min2 > outer * outer || rho_max2 < inner * inner;
+  }
+  !shape.contains(center.clamp(lo, hi) - center, r)
 }
 
 fn brush_box_inside(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent: i32) -> bool {
+  if !shape.is_convex() {
+    return false;
+  }
   let e = extent - 1;
   for i in 0..8 {
     let c = IVec3::new(
@@ -188,14 +343,14 @@ fn brush_box_inside(shape: BrushShape, center: IVec3, r: i32, lo: IVec3, extent:
       if i & 2 == 0 { 0 } else { e },
       if i & 4 == 0 { 0 } else { e },
     );
-    if !brush_contains(shape, lo + c - center, r) {
+    if !shape.contains(lo + c - center, r) {
       return false;
     }
   }
   true
 }
 
-fn brush_radius(size: u32) -> i32 {
+pub(crate) fn brush_radius(size: u32) -> i32 {
   size.saturating_sub(1).min(i32::MAX as u32) as i32
 }
 
@@ -206,15 +361,12 @@ fn block_metric_range(shape: BrushShape, center: IVec3, blo: IVec3, extent: i32)
     let hi = lo + (extent - 1) as f32;
     let near = if lo <= 0.0 && hi >= 0.0 { 0.0 } else { lo.abs().min(hi.abs()) };
     let far = lo.abs().max(hi.abs());
-    match shape {
-      BrushShape::Cube => {
-        dmin = dmin.max(near);
-        dmax = dmax.max(far);
-      }
-      BrushShape::Sphere => {
-        dmin += near * near;
-        dmax += far * far;
-      }
+    if shape == BrushShape::Cube {
+      dmin = dmin.max(near);
+      dmax = dmax.max(far);
+    } else {
+      dmin += near * near;
+      dmax += far * far;
     }
   }
   (dmin, dmax)
@@ -227,6 +379,7 @@ fn stroke_hidden(grid: &VolumeGrid, shape: BrushShape, center: IVec3, r: i32) ->
       let rf = r as f32;
       (rf * rf + rf, (rf + 1.0) * (rf + 1.0) + rf)
     }
+    _ => return false,
   };
   const EXT: i32 = 4;
   let reach = r.saturating_add(8);
@@ -350,7 +503,7 @@ impl PlainBrush {
       }
     }
     if extent == 1 {
-      if brush_contains(self.shape, lo - self.center, self.r) {
+      if self.shape.contains(lo - self.center, self.r) {
         let cur = grid.get_voxel(VoxelCoord::from_ivec3(lo)).unwrap_or(PaletteId::AIR);
         if cur.is_air() != self.erase && grid.set_voxel_ivec3(lo, self.palette).is_some() {
           self.changed += 1;
@@ -366,7 +519,7 @@ impl PlainBrush {
           (i / BRICK_FACTOR) % BRICK_FACTOR,
           i / (BRICK_FACTOR * BRICK_FACTOR),
         );
-        if brush_contains(self.shape, lo + d - self.center, self.r) {
+        if self.shape.contains(lo + d - self.center, self.r) {
           inside |= 1u64 << i;
         }
       }
@@ -498,6 +651,7 @@ fn fill_brush_displaced(
     BrushShape::Sphere => {
       (r > 0).then(|| fill_sphere_displaced(grid, center, r, palette, Some(disp)))
     }
+    _ => None,
   }
 }
 
@@ -517,6 +671,12 @@ fn stats_suffix(stats: Option<&FillStats>) -> String {
 pub(crate) struct HoldRepeat {
   place: f32,
   erase: f32,
+}
+
+impl HoldRepeat {
+  pub(crate) fn erase_tick(&mut self, just_pressed: bool, held: bool, dt: f32) -> bool {
+    hold_repeat(just_pressed, held, &mut self.erase, dt)
+  }
 }
 
 fn hold_repeat(just_pressed: bool, held: bool, acc: &mut f32, dt: f32) -> bool {
@@ -645,6 +805,7 @@ pub(crate) fn voxel_edit_input(
   scene: Option<ResMut<VoxelScene>>,
   mut active: Local<Option<ActiveStroke>>,
   mut hold: Local<HoldRepeat>,
+  mut rng: Local<Rng>,
 ) {
   let Some(mut scene) = scene else { return };
   if *mode != CameraMode::Fly
@@ -695,7 +856,8 @@ pub(crate) fn voxel_edit_input(
   let Some((origin, dir)) = cursor_ray(window, &cfg, lock.0) else {
     return;
   };
-  let (shape, size) = (settings.shape, settings.size);
+  let b = burst(&settings, &mut rng);
+  let (shape, size) = (b.shape, b.size);
   let Some(hit) = raycast(&scene.volumes, origin, dir, EDIT_REACH) else {
     return;
   };
@@ -708,14 +870,12 @@ pub(crate) fn voxel_edit_input(
     let Some(grid) = scene.volumes.volume_mut(target) else {
       return;
     };
-    material_slot(grid, settings.mat)
+    material_slot(grid, b.mat)
   };
   let center = if erase { voxel - face * off } else { voxel + face * off };
-  let material = if erase { "-".to_string() } else { settings.mat.summary() };
-  let entry = scene
-    .volumes
-    .volume(target)
-    .map_or_else(PaletteEntry::default, |g| *g.palette().get(pal));
+  let material = if erase { "-".to_string() } else { b.mat.summary() };
+  let entry =
+    scene.volumes.volume(target).map_or_else(PaletteEntry::default, |g| *g.palette().get(pal));
   let (displaced, reason) =
     brush_displaced(entry, size, pbr_set.as_deref(), Some(&mut displace_cache));
   let hidden = scene
@@ -789,7 +949,8 @@ pub(crate) fn edit_selftest(
     bevy::log::warn!("EDIT SELFTEST: 相机朝向退化 → 跳过");
     return;
   }
-  let (shape, size) = (settings.shape, settings.size);
+  let b = burst(&settings, &mut Rng::new());
+  let (shape, size) = (b.shape, b.size);
   let Some(hit) = raycast(&scene.volumes, orbit.eye(), dir, EDIT_REACH) else {
     bevy::log::warn!("EDIT SELFTEST: 射线未命中体素 → 跳过");
     return;
@@ -801,7 +962,7 @@ pub(crate) fn edit_selftest(
   scene.interior_only_edit = false;
   scene.edit_in_flight = false;
   let grid = scene.volumes.main_mut();
-  let slot = material_slot(grid, settings.mat);
+  let slot = material_slot(grid, b.mat);
   let center = hit + face * settings.offset.max(0.0).round() as i32;
   let t0 = Instant::now();
   let run =
@@ -817,7 +978,7 @@ pub(crate) fn edit_selftest(
     center.y,
     center.z,
     shape,
-    settings.mat.summary(),
+    b.mat.summary(),
     run.displace,
     stats_suffix(run.stats.as_ref()),
     elapsed,

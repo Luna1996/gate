@@ -1,5 +1,3 @@
-
-
 use bevy::{
   asset::RenderAssetUsages,
   image::Image,
@@ -16,14 +14,12 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct RenderScale {
-  
   pub size: UVec2,
-  
+
   pub factor: u32,
 }
 
 impl RenderScale {
-  
   pub const SCALE_CHOICES: [u32; 4] = [1, 2, 3, 4];
 }
 
@@ -36,7 +32,6 @@ impl Default for RenderScale {
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct PostFxSettings {
-  
   pub fxaa: bool,
 }
 
@@ -45,13 +40,11 @@ pub struct DdaCameraConfig {
   pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
   pub position_world: Vec3,
-  
-  
+
   pub forward: Vec3,
 }
 
 impl DdaCameraConfig {
-  
   pub fn build_static() -> Self {
     let eye = Vec3::new(700.0, 560.0, 700.0);
     let target = Vec3::new(260.0, 120.0, 260.0);
@@ -84,7 +77,6 @@ pub struct OrbitCamera {
 }
 
 impl OrbitCamera {
-  
   pub fn from_eye(eye: Vec3, target: Vec3) -> Self {
     let offset = eye - target;
     let distance = offset.length();
@@ -93,14 +85,12 @@ impl OrbitCamera {
     Self { target, distance, yaw, pitch }
   }
 
-  
   pub fn eye(&self) -> Vec3 {
     let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
     let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
     self.target + self.distance * Vec3::new(sin_yaw * cos_pitch, sin_pitch, cos_yaw * cos_pitch)
   }
 
-  
   pub fn clamp(&mut self) {
     self.pitch = self.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
     self.distance = self.distance.max(DIST_MIN);
@@ -108,8 +98,6 @@ impl OrbitCamera {
 }
 
 impl DdaCameraConfig {
-  
-  
   pub fn from_eye_forward(
     eye: Vec3,
     forward: Vec3,
@@ -125,7 +113,6 @@ impl DdaCameraConfig {
     Self { view_proj, inv_view_proj: view_proj.inverse(), position_world: eye, forward: f }
   }
 
-  
   pub fn from_orbit(orbit: &OrbitCamera, fov_y: f32, aspect: f32, near: f32, far: f32) -> Self {
     let eye = orbit.eye();
     let view = view::look_at_mat4(eye, orbit.target, Vec3::Y);
@@ -144,11 +131,10 @@ impl DdaCameraConfig {
 pub struct DdaViewUniform {
   pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
-  pub cam_pos_voxel: Vec4, 
-  
+  pub cam_pos_voxel: Vec4,
+
   pub debug_mode: Vec4,
-  
-  
+
   pub lod: Vec4,
 }
 
@@ -162,7 +148,6 @@ pub fn px_ang(render_h: f32) -> f32 {
 
 impl DdaViewUniform {
   pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
-    
     let px_ang = px_ang(render_h);
     Self {
       view_proj: cfg.view_proj,
@@ -217,24 +202,24 @@ pub mod wgsl_consts {
   pub const CHUNK_SIZE: u32 = 256;
   pub const BRICK_FACTOR: u32 = 4;
   pub const MAX_LEVEL: u32 = 4;
-  
+
   pub const NODE_FIXED_WORDS: u32 = 3;
   pub const CHUNK_INDEX_CAP: u32 = 64;
   pub const CHUNK_INDEX_WORDS: u32 = 262_144;
   pub const TREE_BASE: u32 = 262_144;
-  
+
   pub const PALETTE_WORDS: u32 = crate::brickmap::wire::PALETTE_WORDS as u32;
-  
+
   pub const LEAF_INLINE_WORDS: u32 = crate::brickmap::wire::LEAF_INLINE_WORDS as u32;
   pub const LEAF_VOXELS_PER_WORD: u32 = crate::brickmap::wire::LEAF_VOXELS_PER_WORD as u32;
-  pub const CHUNK_COMP_WORDS: u32 = 2048; 
+  pub const CHUNK_COMP_WORDS: u32 = 2048;
   pub const STATE_ENTRY_COUNT: u32 = 256;
   pub const STATE_WORDS_PER_ENTRY: u32 = 4;
   pub const STATE_TOTAL_WORDS: u32 = 1024;
   pub const SHADOW_BIAS: f32 = crate::consts::SHADOW_BIAS;
   pub const SHADOW_DIR_T_MAX: f32 = crate::consts::SHADOW_DIR_T_MAX;
   pub const EMISSIVE_EMIT_GAIN: f32 = crate::consts::EMISSIVE_EMIT_GAIN;
-  
+
   pub const SHADOW_SURFACE_EPS: f32 = 0.03125;
 }
 
@@ -290,49 +275,36 @@ pub(crate) struct AuxTexCache {
   gi_res_a: Option<Buffer>,
   gi_res_b: Option<Buffer>,
   gi_bg0: Option<BindGroup>,
-  
+
   gi_read_bg: Option<BindGroup>,
-  
-  
+
   gi_guide: Option<Buffer>,
-  
-  
+
   face_slots: Option<Buffer>,
-  
-  
+
   gi_sec_slots: Option<Buffer>,
-  
+
   gi_hist: [Option<Buffer>; 2],
-  
+
   gi_phi: Option<Buffer>,
-  
-  
+
   gi_dn: [Option<Texture>; 4],
-  
+
   gi_dn_src: [Option<TextureView>; 4],
-  
+
   gi_dn_dst: [Option<TextureView>; 4],
-  
+
   den_bg: [Option<BindGroup>; 7],
-  
-  
-  
+
   den_cfg: Option<Buffer>,
   den_cfg_r: u32,
-  
+
   den_flip: bool,
-  
-  
-  
+
   gi_flatten_bg: Option<BindGroup>,
-  
-  
-  
+
   wal: Option<Buffer>,
-  
-  
-  
-  
+
   region_table: Option<Buffer>,
 }
 
@@ -343,48 +315,34 @@ pub(crate) const DEN_ATROUS_ROUNDS: [[usize; 5]; 5] =
   [[3, 0, 0, 0, 0], [0, 4, 0, 0, 0], [0, 1, 2, 0, 0], [0, 1, 5, 4, 0], [0, 1, 5, 1, 2]];
 
 impl AuxTexCache {
-  
-  
   pub(crate) fn gi_write_view(&self) -> Option<&TextureView> {
     self.gi_view.as_ref()
   }
 
-  
-  
   pub(crate) fn wal_buffer(&self) -> Option<&Buffer> {
     self.wal.as_ref()
   }
 
-  
-  
   pub(crate) fn region_buffer(&self) -> Option<&Buffer> {
     self.region_table.as_ref()
   }
 
-  
-  
   pub(crate) fn gi_res_buffers(&self) -> Option<(&Buffer, &Buffer)> {
     Some((self.gi_res_a.as_ref()?, self.gi_res_b.as_ref()?))
   }
 
-  
   pub(crate) fn gi_guide_buffer(&self) -> Option<&Buffer> {
     self.gi_guide.as_ref()
   }
 
-  
   pub(crate) fn face_slots_buffer(&self) -> Option<&Buffer> {
     self.face_slots.as_ref()
   }
 
-  
   pub(crate) fn gi_sec_slots_buffer(&self) -> Option<&Buffer> {
     self.gi_sec_slots.as_ref()
   }
 
-  
-  
-  
   pub(crate) fn gi_bg0(&self) -> Option<&BindGroup> {
     self.gi_bg0.as_ref()
   }
@@ -394,41 +352,41 @@ impl AuxTexCache {
 #[allow(dead_code)]
 pub(crate) struct DdaPipelines {
   pub(crate) bg0_layout: BindGroupLayoutDescriptor,
-  
+
   pub(crate) bg0_gi_layout: BindGroupLayoutDescriptor,
-  
+
   pub(crate) gi_read_layout: BindGroupLayoutDescriptor,
   pub(crate) bg1_layout: BindGroupLayoutDescriptor,
   pub(crate) bg2_layout: BindGroupLayoutDescriptor,
   pub(crate) bg3_layout: BindGroupLayoutDescriptor,
   blit_layout: BindGroupLayoutDescriptor,
-  
+
   eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
-  
+
   pub(crate) face_pipeline: CachedComputePipelineId,
-  
+
   pub(crate) face_accum_pipeline: CachedComputePipelineId,
   pub(crate) beam_pipeline: CachedComputePipelineId,
-  
+
   pub(crate) gi_pipeline: CachedComputePipelineId,
-  
+
   eye_histogram_pipeline: CachedComputePipelineId,
   eye_update_pipeline: CachedComputePipelineId,
   blit_pipeline: CachedRenderPipelineId,
-  
+
   blit_fxaa_pipeline: CachedRenderPipelineId,
 }
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct EyeAdaptGpu {
   pub buf: Option<Buffer>,
-  
+
   pub last: Option<std::time::Instant>,
   pub bg: Option<BindGroup>,
-  
+
   pub settings: EyeAdaptSettings,
-  
+
   pub settings_dirty: bool,
 }
 
@@ -458,30 +416,26 @@ fn sync_eye_adapt_settings(eye_set: Option<Res<EyeAdaptSettings>>, mut eye: ResM
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct EyeAdaptSettings {
-  
-  
   pub enabled: bool,
-  
+
   pub ev_max: f32,
-  
+
   pub ev_min: f32,
-  
+
   pub tau_brighten: f32,
-  
+
   pub tau_darken: f32,
-  
+
   pub key: f32,
 }
 
 impl Default for EyeAdaptSettings {
-  
   fn default() -> Self {
     Self { enabled: true, ev_max: 3.0, ev_min: -3.0, tau_brighten: 2.0, tau_darken: 1.0, key: 0.18 }
   }
 }
 
 impl EyeAdaptSettings {
-  
   pub fn startup() -> Self {
     Self { enabled: EYE_ADAPT, ..Self::default() }
   }
@@ -503,36 +457,21 @@ pub struct BrickMapDdaPlugin;
 
 impl Plugin for BrickMapDdaPlugin {
   fn build(&self, app: &mut App) {
-    
     crate::shader::build_dda_shader(app);
 
     app.add_plugins((
       bevy::render::extract_resource::ExtractResourcePlugin::<DdaImages>::default(),
-      
       bevy::render::extract_resource::ExtractResourcePlugin::<RenderScale>::default(),
-      
       bevy::render::extract_resource::ExtractResourcePlugin::<PostFxSettings>::default(),
-      
       bevy::render::extract_resource::ExtractResourcePlugin::<LightingTheme>::default(),
-      
-      
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::ReflectionSettings>::default(),
-      
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::BaseSettings>::default(),
-      
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       crate::responsive::ResponsivePlugin,
     ));
     app.insert_resource(EyeAdaptSettings::startup());
-    
-    
     app.init_resource::<crate::lighting::ReflectionSettings>();
-    
     app.init_resource::<crate::lighting::BaseSettings>();
-
-    
-    
-    
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
     let dda_shader_rt = app.world().resource::<crate::shader::DdaShaderRtHandle>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -543,31 +482,17 @@ impl Plugin for BrickMapDdaPlugin {
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
       .add_systems(RenderStartup, init_dda_pipelines)
-      .add_systems(
-        Render,
-        
-        sync_eye_adapt_settings.in_set(RenderSystems::PrepareResources),
-      )
-      .add_systems(
-        Render,
-        
-        
-        prepare_rt_scene.in_set(RenderSystems::PrepareResources),
-      )
+      .add_systems(Render, sync_eye_adapt_settings.in_set(RenderSystems::PrepareResources))
+      .add_systems(Render, prepare_rt_scene.in_set(RenderSystems::PrepareResources))
       .add_systems(
         Render,
         prepare_dda_bind_groups
           .in_set(RenderSystems::PrepareBindGroups)
           .after(sync_eye_adapt_settings)
-          
           .after(super::upload::prepare),
       )
-      
       .add_systems(
         RenderGraph,
-        
-        
-        
         sync_rt_scene
           .in_set(bevy::render::renderer::RenderGraphSystems::Render)
           .before(dispatch_dda),
@@ -603,12 +528,9 @@ pub(crate) fn init_dda_pipelines(
   pipeline_cache: Res<PipelineCache>,
   render_device: Res<RenderDevice>,
 ) {
-  
-  
   let rt = super::rt::rt_enabled(&render_device);
   commands.insert_resource(super::rt::RtScene::new(rt, &render_device));
 
-  
   let bg0 = BindGroupLayoutDescriptor::new(
     "DdaBg0",
     &BindGroupLayoutEntries::sequential(
@@ -616,21 +538,12 @@ pub(crate) fn init_dda_pipelines(
       (
         texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
         uniform_buffer::<DdaViewUniform>(false),
-        
         texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
-        
-        
         storage_buffer_read_only_sized(false, None),
       ),
     ),
   );
 
-  
-  
-  
-  
-  
-  
   let gi_read = BindGroupLayoutDescriptor::new(
     "DdaBg5GiRead",
     &[
@@ -654,9 +567,6 @@ pub(crate) fn init_dda_pipelines(
         },
         count: None,
       },
-      
-      
-      
       BindGroupLayoutEntry {
         binding: 8,
         visibility: ShaderStages::COMPUTE,
@@ -667,9 +577,6 @@ pub(crate) fn init_dda_pipelines(
         },
         count: None,
       },
-      
-      
-      
       BindGroupLayoutEntry {
         binding: 10,
         visibility: ShaderStages::COMPUTE,
@@ -680,9 +587,6 @@ pub(crate) fn init_dda_pipelines(
         },
         count: None,
       },
-      
-      
-      
       BindGroupLayoutEntry {
         binding: 11,
         visibility: ShaderStages::COMPUTE,
@@ -696,8 +600,6 @@ pub(crate) fn init_dda_pipelines(
     ],
   );
 
-  
-  
   let bg0_gi = BindGroupLayoutDescriptor::new(
     "DdaBg0Gi",
     &[
@@ -724,45 +626,24 @@ pub(crate) fn init_dda_pipelines(
     ],
   );
 
-  
-  
-  
-  
-  
   let mut bg1_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
     ShaderStages::COMPUTE,
     (
-      
-      storage_buffer_read_only_sized(false, None), 
-      storage_buffer_read_only_sized(false, None), 
-      storage_buffer_read_only_sized(false, None), 
-      uniform_buffer::<super::wire::BrickMapGlobals>(false), 
-      
-      
-      sampler(SamplerBindingType::Filtering),
-      
       storage_buffer_read_only_sized(false, None),
-      
-      
-      texture_2d_array(TextureSampleType::Float { filterable: true }),
-      texture_2d_array(TextureSampleType::Float { filterable: true }),
-      
-      
-      
-      
+      storage_buffer_read_only_sized(false, None),
+      storage_buffer_read_only_sized(false, None),
+      uniform_buffer::<super::wire::BrickMapGlobals>(false),
       sampler(SamplerBindingType::Filtering),
-      
-      
-      
+      storage_buffer_read_only_sized(false, None),
+      texture_2d_array(TextureSampleType::Float { filterable: true }),
+      texture_2d_array(TextureSampleType::Float { filterable: true }),
+      sampler(SamplerBindingType::Filtering),
       storage_buffer_sized(false, None),
-      
-      
       storage_buffer_sized(false, None),
     ),
   )
   .to_vec();
-  
-  
+
   bg1_entries.push(BindGroupLayoutEntry {
     binding: 12,
     visibility: ShaderStages::COMPUTE,
@@ -773,9 +654,18 @@ pub(crate) fn init_dda_pipelines(
     },
     count: None,
   });
-  
-  
-  
+
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 13,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: true },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  });
+
   if rt {
     bg1_entries.push(BindGroupLayoutEntry {
       binding: 11,
@@ -786,21 +676,14 @@ pub(crate) fn init_dda_pipelines(
   }
   let bg1 = BindGroupLayoutDescriptor::new("DdaBg1", &bg1_entries);
 
-  
-  
-  
-  
   let bg2 = BindGroupLayoutDescriptor::new(
     "DdaBg2",
     &BindGroupLayoutEntries::sequential(
       ShaderStages::COMPUTE,
-      (
-        storage_buffer_read_only_sized(false, None), 
-      ),
+      (storage_buffer_read_only_sized(false, None), storage_buffer_read_only_sized(false, None)),
     ),
   );
 
-  
   let bg3 = BindGroupLayoutDescriptor::new(
     "DdaBg3",
     &BindGroupLayoutEntries::sequential(
@@ -809,7 +692,6 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  
   let blit = BindGroupLayoutDescriptor::new(
     "DdaBlit",
     &BindGroupLayoutEntries::sequential(
@@ -821,7 +703,6 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  
   let eye = BindGroupLayoutDescriptor::new(
     "DdaBgEye",
     &BindGroupLayoutEntries::sequential(
@@ -833,28 +714,20 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  
-  
-  
-  
-  
   let dda_shader = if rt { dda_shader_rt.0.clone() } else { dda_shader.0.clone() };
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::gi::gi_bg4_layout()];
-  
-  
-  
-  
+
   let dda_layouts = {
     let mut v = layouts.clone();
     v.push(gi_read.clone());
     v.push(crate::volumetric::fog_read_layout());
     v
   };
-  
+
   let dda_layouts_face = dda_layouts.clone();
   let dda_layouts_accum = dda_layouts.clone();
-  
+
   let eye_layouts = vec![eye.clone(); 8];
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
@@ -863,8 +736,7 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("dda_main")),
     ..default()
   });
-  
-  
+
   let face = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_face")),
     layout: dda_layouts_face,
@@ -872,8 +744,7 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("dda_face_main")),
     ..default()
   });
-  
-  
+
   let face_accum = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_face_accum")),
     layout: dda_layouts_accum,
@@ -881,7 +752,7 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("dda_face_accum")),
     ..default()
   });
-  
+
   let beam = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_beam")),
     layout: layouts.clone(),
@@ -889,9 +760,7 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("beam_main")),
     ..default()
   });
-  
-  
-  
+
   let gi_layouts = vec![
     bg0_gi.clone(),
     bg1.clone(),
@@ -907,8 +776,7 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("gi_main")),
     ..default()
   });
-  
-  
+
   let eye_histogram = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_eye_histogram")),
     layout: eye_layouts.clone(),
@@ -924,8 +792,6 @@ pub(crate) fn init_dda_pipelines(
     ..default()
   });
 
-  
-  
   let blit_shader = asset_server.load(BLIT_SHADER_ASSET_PATH);
   let blit_make = |label: &str, entry: &str| {
     pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
@@ -978,16 +844,12 @@ pub(crate) fn init_dda_pipelines(
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct DdaTune<'w> {
-  
   pub gi: Option<Res<'w, crate::gi::GiSettings>>,
-  
+
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
-  
+
   pub base: Option<Res<'w, crate::lighting::BaseSettings>>,
-  
-  
-  
-  
+
   pub rt: Option<Res<'w, super::rt::RtScene>>,
 }
 
@@ -1037,7 +899,6 @@ pub(crate) fn prepare_dda_bind_groups(
   let bg3_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg3_layout);
   let blit_layout = pipeline_cache.get_bind_group_layout(&pipelines.blit_layout);
 
-  
   let beam_div = crate::brickmap::consts::BEAM_DIV;
   let beam_size = UVec2::new(scale.size.x.div_ceil(beam_div), scale.size.y.div_ceil(beam_div));
   if beam_cache.texture.is_none() || beam_cache.size != beam_size {
@@ -1057,10 +918,6 @@ pub(crate) fn prepare_dda_bind_groups(
   let beam_tex = beam_cache.texture.as_ref().expect("beam texture not created");
   let beam_view = beam_tex.create_view(&TextureViewDescriptor::default());
 
-  
-  
-  
-  
   let gi_size = tune.gi.as_deref().copied().unwrap_or_default().gi_size(scale.size);
   if beam_cache.gi_tex.is_none() || beam_cache.gi_size != gi_size {
     let make = |label: &str, format: TextureFormat| {
@@ -1071,7 +928,7 @@ pub(crate) fn prepare_dda_bind_groups(
         sample_count: 1,
         dimension: TextureDimension::D2,
         format,
-        
+
         usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
       })
@@ -1080,8 +937,7 @@ pub(crate) fn prepare_dda_bind_groups(
     beam_cache.gi_view = Some(gi_tex.create_view(&TextureViewDescriptor::default()));
     beam_cache.gi_tex = Some(gi_tex);
     beam_cache.gi_size = gi_size;
-    
-    
+
     let res_bytes =
       gi_size.x as u64 * gi_size.y as u64 * crate::wesl_consts::gi_consts().gi_res_words as u64 * 4;
     let make_res = |label: &str| {
@@ -1094,7 +950,7 @@ pub(crate) fn prepare_dda_bind_groups(
     };
     beam_cache.gi_res_a = Some(make_res("gate_gi_res_a"));
     beam_cache.gi_res_b = Some(make_res("gate_gi_res_b"));
-    
+
     let c = crate::wesl_consts::gi_consts();
     let px = gi_size.x as u64 * gi_size.y as u64;
     let make_buf = |label: &str, bytes: u64| {
@@ -1106,18 +962,11 @@ pub(crate) fn prepare_dda_bind_groups(
       })
     };
     beam_cache.gi_guide = Some(make_buf("gate_gi_guide", px * c.gi_den_guide_words as u64 * 4));
-    
-    
-    
+
     let face_slots_n = (px * 2).next_power_of_two().clamp(256, 1u64 << 21);
     beam_cache.face_slots =
       Some(make_buf("gate_face_slots", face_slots_n * c.face_words as u64 * 4));
-    
-    
-    
-    
-    
-    
+
     beam_cache.gi_sec_slots =
       Some(make_buf("gate_gi_sec_slots", face_slots_n * c.gi_sec_words as u64 * 4));
     beam_cache.gi_hist = [
@@ -1134,9 +983,7 @@ pub(crate) fn prepare_dda_bind_groups(
       beam_cache.gi_dn[i] = Some(t);
     }
   }
-  
-  
-  
+
   if beam_cache.wal.is_none() {
     beam_cache.wal = Some(render_device.create_buffer(&BufferDescriptor {
       label: Some("gate_gi_wal"),
@@ -1145,9 +992,7 @@ pub(crate) fn prepare_dda_bind_groups(
       mapped_at_creation: false,
     }));
   }
-  
-  
-  
+
   if beam_cache.region_table.is_none() {
     beam_cache.region_table = Some(render_device.create_buffer(&BufferDescriptor {
       label: Some("gate_gi_region_rev"),
@@ -1157,12 +1002,8 @@ pub(crate) fn prepare_dda_bind_groups(
     }));
   }
 
-  
   let gi_view = beam_cache.gi_view.as_ref().expect("gi view not created").clone();
 
-  
-  
-  
   const EYE_WORDS: u64 = 80;
   if eye.buf.is_none() {
     let b = render_device.create_buffer(&BufferDescriptor {
@@ -1174,29 +1015,28 @@ pub(crate) fn prepare_dda_bind_groups(
     let mut init = [0u8; (EYE_WORDS * 4) as usize];
     init[..4].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
     queue.write_buffer(&b, 0, &init);
-    
+
     queue.write_buffer(&b, EYE_PARAM_OFFSET, &eye_param_bytes(eye.settings));
     eye.buf = Some(b);
   }
-  
+
   let eye_buf = eye.buf.clone().expect("刚插入");
-  
-  
+
   let now = std::time::Instant::now();
   if eye.settings.enabled {
     let dt = eye.last.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32());
     queue.write_buffer(&eye_buf, 12, &dt.clamp(0.0, 0.25).to_bits().to_le_bytes());
   }
   eye.last = Some(now);
-  
+
   if std::mem::take(&mut eye.settings_dirty) {
     let s = eye.settings;
     queue.write_buffer(&eye_buf, EYE_PARAM_OFFSET, &eye_param_bytes(s));
-    
+
     if !s.enabled {
       queue.write_buffer(&eye_buf, 0, &1.0f32.to_bits().to_le_bytes());
     }
-    
+
     bevy::log::debug!(
       target: "gate",
       "eye adapt → GPU: {} EV+ {:.2} / EV- {:.2} / tau+ {:.2}s / tau- {:.2}s / key {:.3}",
@@ -1219,17 +1059,9 @@ pub(crate) fn prepare_dda_bind_groups(
       eye_buf.as_entire_binding(),
     )),
   );
-  
-  
-  
-  
-  
-  
-  
+
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
-  
-  
-  
+
   let den_plan = match tune.gi.as_ref() {
     Some(g) => g.denoise_plan(),
     None => crate::gi::GiSettings::default().denoise_plan(),
@@ -1240,16 +1072,12 @@ pub(crate) fn prepare_dda_bind_groups(
     gi_view.clone()
   };
   let gi_guide = beam_cache.gi_guide.as_ref().expect("降噪导引 buffer 未创建").clone();
-  
+
   let face_slots = beam_cache.face_slots.as_ref().expect("逐面去重表 buffer 未创建").clone();
-  
+
   let wal = beam_cache.wal.as_ref().expect("WAL 表 buffer 未创建").clone();
-  
-  let region_table = beam_cache
-    .region_table
-    .as_ref()
-    .expect("区域修订表 buffer 未创建")
-    .clone();
+
+  let region_table = beam_cache.region_table.as_ref().expect("区域修订表 buffer 未创建").clone();
   let gi_read_bg = render_device.create_bind_group(
     None,
     &gi_read_layout,
@@ -1263,10 +1091,6 @@ pub(crate) fn prepare_dda_bind_groups(
   );
   beam_cache.gi_read_bg = Some(gi_read_bg);
 
-  
-  
-  
-  
   let gi_flatten_layout = pipeline_cache.get_bind_group_layout(&crate::gi::gi_flatten_layout());
   let gi_flatten_bg = render_device.create_bind_group(
     None,
@@ -1279,11 +1103,6 @@ pub(crate) fn prepare_dda_bind_groups(
   );
   beam_cache.gi_flatten_bg = Some(gi_flatten_bg);
 
-  
-  
-  
-  
-  
   let den_r = den_plan.radius;
   if beam_cache.den_cfg.is_none() {
     beam_cache.den_cfg = Some(render_device.create_buffer(&BufferDescriptor {
@@ -1311,9 +1130,6 @@ pub(crate) fn prepare_dda_bind_groups(
   }
   let den_cfg = beam_cache.den_cfg.as_ref().expect("刚创建").clone();
 
-  
-  
-  
   let den_runs = tune.gi.as_ref().is_some_and(|g| g.enabled);
   let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
   {
@@ -1347,8 +1163,6 @@ pub(crate) fn prepare_dda_bind_groups(
         &atrous_layout,
         &[
           BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
-          
-          
           BindGroupEntry { binding: 13, resource: hist_cur.as_entire_binding() },
           BindGroupEntry { binding: 14, resource: BindingResource::TextureView(&dn_src[*s]) },
           BindGroupEntry { binding: 15, resource: BindingResource::TextureView(&dn_dst[*d]) },
@@ -1361,9 +1175,7 @@ pub(crate) fn prepare_dda_bind_groups(
   if den_runs {
     beam_cache.den_flip = !beam_cache.den_flip;
   }
-  
-  
-  
+
   let bg0_gi_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_gi_layout);
   let gi_bg0 = render_device.create_bind_group(
     None,
@@ -1374,7 +1186,7 @@ pub(crate) fn prepare_dda_bind_groups(
     ],
   );
   beam_cache.gi_bg0 = Some(gi_bg0);
-  
+
   let eye_bg = render_device.create_bind_group(
     None,
     &eye_layout,
@@ -1382,14 +1194,10 @@ pub(crate) fn prepare_dda_bind_groups(
   );
   eye.bg = Some(eye_bg);
 
-  
-  
   let globals_bind = gpu.globals.binding().expect(
     "GpuBrickMap.globals uniform buffer 未初始化（RenderStartup init_empty_gpu 应默认构造）",
   );
-  
-  
-  
+
   let pbr_albedo = pbr_set.as_deref().and_then(|s| gpu_images.get(s.albedo_rough()));
   let pbr_metal = pbr_set.as_deref().and_then(|s| gpu_images.get(s.metal()));
   if pbr_albedo.is_none() || pbr_metal.is_none() {
@@ -1410,28 +1218,19 @@ pub(crate) fn prepare_dda_bind_groups(
       gpu.palette.as_entire_binding(),
       globals_bind,
       &gpu.light_sampler,
-      
       gpu.material_assets.as_entire_binding(),
-      
       &pbr_albedo_view,
       &pbr_metal_view,
-      
-      
       &gpu.pbr_sampler,
-      
-      
       gpu.lod_diag.as_entire_binding(),
-      
       gpu.lod_req.as_entire_binding(),
     ))
     .to_vec();
-    
-    entries.push(BindGroupEntry {
-      binding: 12,
-      resource: gpu.occ.as_entire_binding(),
-    });
-    
-    
+
+    entries.push(BindGroupEntry { binding: 12, resource: gpu.occ.as_entire_binding() });
+
+    entries.push(BindGroupEntry { binding: 13, resource: gpu.struct_buf_p1.as_entire_binding() });
+
     if let Some(rt) = tune.rt.as_deref().filter(|r| r.is_enabled()) {
       entries.push(BindGroupEntry {
         binding: 11,
@@ -1441,15 +1240,15 @@ pub(crate) fn prepare_dda_bind_groups(
     render_device.create_bind_group(None, &bg1_layout, &entries)
   };
 
-  
-  
   let bg2 = render_device.create_bind_group(
     None,
     &bg2_layout,
-    &BindGroupEntries::sequential((gpu.grid_descs_buf.as_entire_binding(),)),
+    &BindGroupEntries::sequential((
+      gpu.grid_descs_buf.as_entire_binding(),
+      gpu.inst_bvh_buf.as_entire_binding(),
+    )),
   );
 
-  
   let Some(lighting) = lighting else {
     bevy::log::info_once!("DDA prepare: no LightingTheme");
     return;
@@ -1459,20 +1258,15 @@ pub(crate) fn prepare_dda_bind_groups(
     return;
   };
   *lp.0.get_mut() = build_light_pool(&lighting);
-  
-  
+
   lp.0.get_mut().g.refl_tier = tune.refl.as_ref().map_or(0, |r| r.tier());
   lp.0.get_mut().g.refl_nest = tune.refl.as_ref().map_or(0, |r| r.nest());
-  
-  
+
   lp.0.get_mut().g.base_flags =
     tune.base.as_ref().map_or(crate::lighting::BaseSettings::default().flags(), |b| b.flags());
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 
-  
-  
-  
   let blit_sampler = render_device.create_sampler(&SamplerDescriptor {
     label: Some("gate_dda_blit_sampler"),
     mag_filter: FilterMode::Linear,
@@ -1497,11 +1291,11 @@ const RT_INSERT_PER_FRAME: u32 = 1024;
 #[derive(Default)]
 struct RtSyncCursor {
   ready: bool,
-  
+
   cursor: usize,
   seq: u64,
   epoch: u64,
-  
+
   stat: u32,
 }
 
@@ -1520,13 +1314,13 @@ fn prepare_rt_scene(
   let len = builder.resident_log_len(0);
   let seq = builder.resident_seq(0);
   let epoch = builder.resident_epoch(0);
-  
+
   let consistent = cur.ready
     && cur.epoch == epoch
     && cur.cursor <= len
     && (len as u64).wrapping_sub(cur.cursor as u64) == seq.wrapping_sub(cur.seq);
   let mut budget = RT_INSERT_PER_FRAME;
-  
+
   let mut still: Vec<gate_voxel::ChunkCoord> = Vec::new();
   for c in std::mem::take(&mut rt.deferred) {
     if budget == 0 {
@@ -1538,7 +1332,7 @@ fn prepare_rt_scene(
         rt.insert_chunk(&device, &queue, c, a);
         budget -= 1;
       }
-      
+
       _ => {}
     }
   }
@@ -1563,7 +1357,6 @@ fn prepare_rt_scene(
       }
     }
   } else {
-    
     let resident: std::collections::HashSet<gate_voxel::ChunkCoord> =
       builder.resident_chunks(0).into_iter().collect();
     for c in rt.chunks().collect::<Vec<_>>() {
@@ -1597,7 +1390,7 @@ fn prepare_rt_scene(
     );
   }
   cur.stat = cur.stat.wrapping_add(1);
-  if cur.stat % RT_STAT_FRAMES == 0 {
+  if cur.stat.is_multiple_of(RT_STAT_FRAMES) {
     bevy::log::info!(
       target: "gate",
       "RT: 实例 {}（常驻 {} 块）/ 欠账 {}",
@@ -1605,8 +1398,7 @@ fn prepare_rt_scene(
       builder.resident_chunks(0).len(),
       rt.deferred.len(),
     );
-    
-    
+
     if !rt.deferred.is_empty() {
       bevy::log::warn!(
         target: "gate",
@@ -1626,7 +1418,7 @@ fn sync_rt_scene(mut ctx: RenderContext, mut rt: ResMut<super::rt::RtScene>) {
   rt.record(ctx.command_encoder());
 }
 
-#[allow(clippy::too_many_arguments)] 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_dda(
   mut ctx: RenderContext,
   bg0: Option<Res<DdaBg0BindGroup>>,
@@ -1645,8 +1437,6 @@ pub(crate) fn dispatch_dda(
   scale: Res<RenderScale>,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
-  
-  
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
     (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref(), bg4.as_ref())
   else {
@@ -1660,21 +1450,14 @@ pub(crate) fn dispatch_dda(
   });
   let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
 
-  
-  
-  
-  
   let fog_read = fog.read_bg.as_ref().and_then(|b| b.0.as_ref());
 
   let gx = scale.size.x.div_ceil(DDA_WORKGROUP_SIZE);
   let gy = scale.size.y.div_ceil(DDA_WORKGROUP_SIZE);
-  
+
   let bx = scale.size.x.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
   let by = scale.size.y.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
 
-  
-  
-  
   if DDA_BEAM && let Some(beam_pipe) = beam_pipe {
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_beam", |pass| {
       pass.set_pipeline(beam_pipe);
@@ -1687,8 +1470,6 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-  
-  
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_bg0) = aux.gi_bg0.as_ref()
@@ -1697,11 +1478,7 @@ pub(crate) fn dispatch_dda(
   {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
-    
-    
-    
-    
-    
+
     if let Some(fs) = aux.face_slots_buffer() {
       ctx.command_encoder().clear_buffer(fs, 0, None);
     }
@@ -1717,10 +1494,6 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-  
-  
-  
-  
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
@@ -1742,9 +1515,6 @@ pub(crate) fn dispatch_dda(
     );
   }
 
-  
-  
-  
   if let Some(cur) = gi.as_ref()
     && cur.enabled
     && let Some(aux) = aux.as_ref()
@@ -1796,10 +1566,6 @@ pub(crate) fn dispatch_dda(
     }
   }
 
-  
-  
-  
-  
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
   {
@@ -1829,10 +1595,6 @@ pub(crate) fn dispatch_dda(
     }
   }
 
-  
-  
-  
-  
   crate::volumetric::dispatch_fog(
     &mut profiler,
     ctx.command_encoder(),
@@ -1845,8 +1607,6 @@ pub(crate) fn dispatch_dda(
     Some(&bg3.0),
   );
 
-  
-  
   if fog_read.is_none() {
     bevy::log::debug_once!("DDA dispatch: 光柱 group(6) 未就绪（本帧跳过主 pass）");
     return;
@@ -1863,12 +1623,11 @@ pub(crate) fn dispatch_dda(
         pass.set_bind_group(2, &bg2.0, &[]);
         pass.set_bind_group(3, &bg3.0, &[]);
         pass.set_bind_group(4, &bg4.0, &[]);
-        
-        
+
         if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
           pass.set_bind_group(5, gi_read, &[]);
         }
-        
+
         if let Some(fog_read) = fog_read {
           pass.set_bind_group(6, fog_read, &[]);
         }
@@ -1877,9 +1636,6 @@ pub(crate) fn dispatch_dda(
     );
   }
 
-  
-  
-  
   if eye.as_ref().is_some_and(|e| e.settings.enabled)
     && let Some(eye_bg) = eye.as_ref().and_then(|e| e.bg.as_ref())
     && let Some(h) = pipeline_cache.get_compute_pipeline(pipelines.eye_histogram_pipeline)
@@ -1891,7 +1647,7 @@ pub(crate) fn dispatch_dda(
       "gate_eye_histogram",
       |pass| {
         pass.set_pipeline(h);
-        
+
         for i in 0..8u32 {
           pass.set_bind_group(i, eye_bg, &[]);
         }
@@ -1914,6 +1670,7 @@ pub(crate) fn dispatch_dda(
 }
 
 #[cfg_attr(not(feature = "profile"), allow(unused_variables, unused_mut))]
+#[allow(clippy::too_many_arguments)]
 fn blit_dda_view(
   mut ctx: RenderContext,
   views: Query<&ViewTarget>,
@@ -1928,12 +1685,7 @@ fn blit_dda_view(
     bevy::log::debug_once!("DDA blit: bg or ViewTarget missing");
     return;
   };
-  
-  
-  
-  
-  
-  
+
   let downscaled = scale.as_ref().is_some_and(|s| s.factor != 1);
   let id = if post.as_ref().is_some_and(|p| p.fxaa) && !downscaled {
     pipelines.blit_fxaa_pipeline
@@ -1944,8 +1696,7 @@ fn blit_dda_view(
     bevy::log::debug_once!("DDA blit: blit pipeline not ready");
     return;
   };
-  
-  
+
   #[cfg(feature = "profile")]
   if let Some(profiler) = crate::profiler::profiler_mut(&mut profiler) {
     let mut encoder_scope = profiler.scope("gate_dda_blit", ctx.command_encoder());

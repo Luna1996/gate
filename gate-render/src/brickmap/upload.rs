@@ -58,6 +58,7 @@ pub struct VoxelScene {
   pub interior_only_edit: bool,
   pub edit_in_flight: bool,
   pub residency_budget_bytes: usize,
+  pub transforms_dirty: bool,
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -123,6 +124,7 @@ pub struct MainPending {
   pub data_chunks: Vec<(usize, gate_voxel::ChunkCoord, gate_voxel::TreeDirty)>,
   pub comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
   pub data_aabbs: Vec<(usize, gate_voxel::ChunkCoord, IVec3, IVec3)>,
+  pub transforms_moved: bool,
 }
 
 pub fn poll_pending(
@@ -137,6 +139,7 @@ pub fn poll_pending(
   pending.comp_chunks.clear();
   pending.data_aabbs.clear();
   pending.force_full = false;
+  pending.transforms_moved = std::mem::take(&mut scene.transforms_dirty);
   if scene.demo_force_full_rebuild {
     pending.force_full = true;
     scene.demo_force_full_rebuild = false;
@@ -201,6 +204,7 @@ pub struct BuilderMirror {
   pub palette_versions: Vec<u64>,
   pub palette_content_versions: Vec<u64>,
   pub pending_comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
+  pub pending_transforms: bool,
 }
 
 #[derive(Resource, Clone)]
@@ -235,6 +239,7 @@ pub struct UploadCpuSampleChannel(pub std::sync::Arc<std::sync::Mutex<Option<Upl
 #[derive(Resource)]
 pub struct GpuBrickMap {
   pub struct_buf: Buffer,
+  pub struct_buf_p1: Buffer,
   pub leaves: Buffer,
   pub palette: Buffer,
   pub comp: Buffer,
@@ -245,6 +250,7 @@ pub struct GpuBrickMap {
   pub occ_ready: bool,
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
+  pub inst_bvh_buf: Buffer,
   pub globals: UniformBuffer<BrickMapGlobals>,
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
@@ -354,6 +360,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
 
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
+    struct_buf_p1: make("gate_struct_p1"),
     leaves: make("gate_leaves"),
     palette: make("gate_palette"),
     comp: make("gate_comp"),
@@ -364,6 +371,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     occ_ready: false,
     grid_descs_buf: make("gate_grid_descs"),
     grid_descs_count: 0,
+    inst_bvh_buf: make("gate_inst_bvh"),
     globals,
     main_window_origin: IVec3::ZERO,
     main_window_dims: UVec3::ZERO,
@@ -404,6 +412,9 @@ fn extract(
   if main_pending.force_full {
     mirror.pending_full = true;
   }
+  if main_pending.transforms_moved {
+    mirror.pending_transforms = true;
+  }
   mirror.pending_data_chunks.extend(main_pending.data_chunks.iter().cloned());
   mirror.pending_data_aabbs.extend(main_pending.data_aabbs.iter().copied());
   mirror.pending_comp_chunks.extend(main_pending.comp_chunks.iter().copied());
@@ -417,6 +428,7 @@ fn extract(
   let _pending_comp: Vec<(usize, gate_voxel::ChunkCoord)> =
     std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
+  let transforms_moved = std::mem::take(&mut mirror.pending_transforms);
 
   resid.edited.clear();
   resid.edited.extend(pending_data.iter().filter(|(v, ..)| *v == 0).map(|(_, c, _)| *c));
@@ -480,7 +492,7 @@ fn extract(
   });
   let builder_dirty = mirror.builder.as_ref().is_some_and(VolumesBuilder::has_dirty);
 
-  if !dirty_any && !window_moved && !builder_dirty {
+  if !dirty_any && !window_moved && !builder_dirty && !transforms_moved {
     sd.mark(0);
     sd.frame_end("EXTRACT");
     return;
@@ -710,7 +722,7 @@ pub(crate) fn prepare(
     }
   }
 
-      static RT_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  static RT_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
   if !RT_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
     use bevy::render::render_resource::WgpuFeatures;
     let f = device.features();
@@ -732,7 +744,7 @@ pub(crate) fn prepare(
   }
 
   let is_full = matches!(snap.volumes.mode_tag, "full" | "fallback_full");
-    if let Some(occ) = snap.volumes.occ_all.as_ref() {
+  if let Some(occ) = snap.volumes.occ_all.as_ref() {
     queue.write_buffer(&gpu.occ, 0, u8_of_u32(occ));
     gpu.occ_ready = true;
   } else if !gpu.occ_ready {
@@ -754,12 +766,14 @@ pub(crate) fn prepare(
 
   if is_full {
     let struct_bytes = u8_of_u32(&snap.volumes.b_struct);
+    let struct_bytes_p1 = u8_of_u32(&snap.volumes.b_struct_p1);
     let palette_bytes = u8_of_u32(&snap.volumes.b_palette);
     let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
-    struct_tx_bytes = struct_bytes.len();
+    struct_tx_bytes = struct_bytes.len() + struct_bytes_p1.len();
     palette_tx_bytes = palette_bytes.len();
     grid_descs_tx_bytes = grid_descs_bytes.len();
     write(&device, &queue, &mut gpu.struct_buf, "gate_struct", struct_bytes);
+    write(&device, &queue, &mut gpu.struct_buf_p1, "gate_struct_p1", struct_bytes_p1);
     write(&device, &queue, &mut gpu.palette, "gate_palette", palette_bytes);
     write(&device, &queue, &mut gpu.grid_descs_buf, "gate_grid_descs", grid_descs_bytes);
   } else {
@@ -769,6 +783,13 @@ pub(crate) fn prepare(
       &mut gpu.struct_buf,
       "gate_struct",
       snap.volumes.struct_total_bytes as u64,
+    );
+    ensure_capacity(
+      &device,
+      &queue,
+      &mut gpu.struct_buf_p1,
+      "gate_struct_p1",
+      snap.volumes.struct_total_bytes_p1 as u64,
     );
     ensure_capacity(
       &device,
@@ -799,8 +820,24 @@ pub(crate) fn prepare(
     if s_skipped > 0 {
       bevy::log::warn_once!(
         "增量上传 gate_struct：{s_skipped} B 脏块越过 buffer 末尾（容量 {}B）⇒ 本次跳过（该块在 GPU 上\
-         保持旧内容）；树区超过设备单次绑定上限，先缩小常驻池（见 `plan_residency` 的绑定上限）",
+         保持旧内容）；第 0 页（世界体）超过设备单次绑定上限，先缩小常驻池（见 `plan_residency`）",
         gpu.struct_buf.size()
+      );
+    }
+    let mut s_tx_p1 = 0usize;
+    let mut s_skipped_p1 = 0usize;
+    for (off, payload) in &snap.volumes.struct_blobs_p1 {
+      if write_blob(&queue, &gpu.struct_buf_p1, *off as u64, payload) {
+        s_tx_p1 += payload.len();
+      } else {
+        s_skipped_p1 += payload.len();
+      }
+    }
+    if s_skipped_p1 > 0 {
+      bevy::log::warn_once!(
+        "增量上传 gate_struct_p1：{s_skipped_p1} B 脏块越过 buffer 末尾（容量 {}B）⇒ 本次跳过；\
+         第 1 页（物体与远场）超过设备单次绑定上限",
+        gpu.struct_buf_p1.size()
       );
     }
     let mut p_tx = 0usize;
@@ -818,7 +855,7 @@ pub(crate) fn prepare(
         gpu.palette.size()
       );
     }
-    struct_tx_bytes = s_tx;
+    struct_tx_bytes = s_tx + s_tx_p1;
     palette_tx_bytes = p_tx;
     grid_descs_tx_bytes = grid_descs_bytes.len();
   }
@@ -826,7 +863,19 @@ pub(crate) fn prepare(
   write(&device, &queue, &mut gpu.state, "gate_state", &snap.state_bytes);
 
   {
-        if gpu.comp.size() < comp_bytes.max(4) as u64 {
+    let bvh_bytes = u8_of_u32(&snap.volumes.inst_bvh);
+    ensure_capacity(
+      &device,
+      &queue,
+      &mut gpu.inst_bvh_buf,
+      "gate_inst_bvh",
+      bvh_bytes.len().max(4) as u64,
+    );
+    queue.write_buffer(&gpu.inst_bvh_buf, 0, bvh_bytes);
+  }
+
+  {
+    if gpu.comp.size() < comp_bytes.max(4) as u64 {
       let placeholder = vec![0u8; comp_bytes.max(4)];
       ensure_with_copy(&device, &queue, &mut gpu.comp, "gate_comp", &placeholder, true);
     }
@@ -902,6 +951,7 @@ pub(crate) fn prepare(
   }
 
   let vram = gpu.struct_buf.size()
+    + gpu.struct_buf_p1.size()
     + gpu.leaves.size()
     + gpu.palette.size()
     + gpu.comp.size()
@@ -917,10 +967,16 @@ pub(crate) fn prepare(
       snap.volumes.struct_total_bytes,
       limits.max_storage_buffer_binding_size,
     );
+    debug_assert!(
+      snap.volumes.struct_total_bytes_p1 as u64 <= limits.max_storage_buffer_binding_size,
+      "b_struct_p1 {} bytes > binding limit {}",
+      snap.volumes.struct_total_bytes_p1,
+      limits.max_storage_buffer_binding_size,
+    );
   }
   debug!(target: "gate",
-    "GpuBrickMap: struct_buf={}B leaves={}B palette={}B comp={}B state={}B grid_descs={}B(count={}) bind_group_ready=pending(P2.4)",
-    gpu.struct_buf.size(), gpu.leaves.size(), gpu.palette.size(),
+    "GpuBrickMap: struct_buf={}B struct_buf_p1={}B leaves={}B palette={}B comp={}B state={}B grid_descs={}B(count={}) bind_group_ready=pending(P2.4)",
+    gpu.struct_buf.size(), gpu.struct_buf_p1.size(), gpu.leaves.size(), gpu.palette.size(),
     gpu.comp.size(), gpu.state.size(), gpu.grid_descs_buf.size(), gpu.grid_descs_count,
   );
 
@@ -1180,7 +1236,7 @@ fn ledger_note(
       if residency.resident_level(c).is_some() {
         residency.note_bytes(c, bytes);
       } else {
-                                let lv = if streamed {
+        let lv = if streamed {
           let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
           crate::brickmap::residency::raw_level((center - cam_now).length() * px)
         } else {
@@ -1193,6 +1249,7 @@ fn ledger_note(
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_residency(
   scene: Option<Extract<Res<VoxelScene>>>,
   cam: Option<Extract<Res<crate::brickmap::dda::DdaCameraConfig>>>,
@@ -1233,7 +1290,7 @@ fn plan_residency(
   state.residency.tick(frame);
   let px = crate::brickmap::dda::px_ang(crate::consts::VIEW_SIZE.y as f32);
 
-        let streamed = grid.stream_window().is_some();
+  let streamed = grid.stream_window().is_some();
   let seq = grid.resident_seq();
   let epoch = grid.resident_log_epoch();
   let changes = grid.resident_log_from(*ledger_cursor);
@@ -1241,7 +1298,7 @@ fn plan_residency(
   let incremental = *ledger_ready
     && *ledger_epoch == epoch
     && changes.len() as u64 == seq.wrapping_sub(*ledger_seq)
-    && frame % LEDGER_SWEEP_FRAMES != 0;
+    && !frame.is_multiple_of(LEDGER_SWEEP_FRAMES);
   let cam_now = cam.position_world;
   if incremental {
     for ch in changes {
@@ -1271,7 +1328,7 @@ fn plan_residency(
   *ledger_seq = seq;
   sd.mark(0);
 
-    if empty_cursor.len() != scene.volumes.len() {
+  if empty_cursor.len() != scene.volumes.len() {
     empty_cursor.resize(scene.volumes.len(), 0);
   }
   for (vol, g) in scene.volumes.all().iter().enumerate() {
@@ -1309,7 +1366,7 @@ fn plan_residency(
   sd.mark(1);
 
   sd.mark(2);
-      let cap_chunks = pool_capacity_chunks(scene.residency_budget_bytes);
+  let cap_chunks = pool_capacity_chunks(scene.residency_budget_bytes);
   let want_bytes = gpu_pool_bytes(cap_chunks);
   let binding_cap = main_region_byte_cap(
     device.limits().max_storage_buffer_binding_size,
@@ -1320,9 +1377,9 @@ fn plan_residency(
     let asked =
       if want_bytes == 0 { "不限".to_string() } else { format!("{} MB", want_bytes >> 20) };
     bevy::log::warn_once!(
-      "RESID[!] 常驻预算被**绑定上限**压到 {} MB（请求 {}）⇒ 池容量随之变小；树区是一整块绑进去的，\
-       超过设备的 max_storage_buffer_binding_size 会在 create_bind_group 判错。\
-       要更多常驻得先把树区压小，或把 b_struct 分片成多个 binding",
+      "RESID[!] 常驻预算被第 0 页的**绑定上限**压到 {} MB（请求 {}）⇒ 池容量随之变小。\
+       树区已分两页（第 0 页世界体、第 1 页物体与远场），两页各自独立绑定，所以两页之和可以超过\
+       单次上限；这里只约束世界体那一页。",
       capped >> 20,
       asked
     );
@@ -1346,13 +1403,13 @@ fn plan_residency(
     }
     let cur_level = state.residency.resident_level(c);
     let cur = cur_level.unwrap_or(gate_voxel::BRICK_FACTOR);
-        if streamed && cur == gate_voxel::BRICK_FACTOR {
+    if streamed && cur == gate_voxel::BRICK_FACTOR {
       continue;
     }
     let center = (c.0.as_vec3() + glam::Vec3::splat(0.5)) * gate_voxel::CHUNK_SIZE as f32;
     let dist = (center - cam_pos).length();
     let lv = want_level(dist, px, cur);
-            let lv = if streamed { lv.min(cur) } else { lv };
+    let lv = if streamed { lv.min(cur) } else { lv };
     if cur_level == Some(lv) {
       continue;
     }
@@ -1428,7 +1485,7 @@ fn plan_residency(
   }
   pending.retain(|c| !state.residency.is_resident(*c) && grid.chunk(*c).is_some());
   sd.mark(6);
-  if frame % LEDGER_SWEEP_FRAMES == 0 {
+  if frame.is_multiple_of(LEDGER_SWEEP_FRAMES) {
     for c in builder.resident_chunks(0) {
       if grid.chunk(c).is_none() {
         builder.evict(0, c);
@@ -1447,7 +1504,7 @@ fn plan_residency(
       continue;
     }
     let fseq = far_grid.resident_seq();
-    if far_seq[vol] == fseq && frame % LEDGER_SWEEP_FRAMES != 0 {
+    if far_seq[vol] == fseq && !frame.is_multiple_of(LEDGER_SWEEP_FRAMES) {
       continue;
     }
     far_seq[vol] = fseq;
@@ -1472,7 +1529,7 @@ fn plan_residency(
     }
   }
   sd.mark(7);
-      if installed == 0 && evicted == 0 {
+  if installed == 0 && evicted == 0 {
     let (mut gap_count, mut gap_nearest) = (0usize, None);
     for dy in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {
       for dz in -GAP_NEAR_CHUNKS..=GAP_NEAR_CHUNKS {
@@ -1512,13 +1569,15 @@ fn plan_residency(
     t_sample.iter().map(|(c, cur, want)| (c.0.to_array(), *cur, *want)).collect::<Vec<_>>()
   );
   debug!(
-    "RESID[resident {} {}KB 预算 {}MB install {} evict {} | 远场 {}块/装 {} evict {}]",
+    "RESID[resident {} {}KB 预算 {}MB | v0 {}块 树{}KB | install {} evict {} | 远场 {}块/装 {} evict {}]",
     state.residency.resident_count(),
     state.residency.resident_bytes() / 1024,
     state.policy.budget_bytes >> 20,
+    builder.resident_chunk_count(0),
+    builder.resident_words(0) * 4 / 1024,
     installed,
     evicted,
-    (1..scene.volumes.len()).map(|v| builder.resident_chunks(v).len()).sum::<usize>(),
+    (1..scene.volumes.len()).map(|v| builder.resident_chunk_count(v)).sum::<usize>(),
     far_installed,
     far_evicted
   );

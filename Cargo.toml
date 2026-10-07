@@ -1,5 +1,5 @@
 [workspace]
-members = ["gate-app", "gate-voxel", "gate-render", "gate-ui"]
+members = ["gate-app", "gate-voxel", "gate-render", "gate-ui", "gate-physics"]
 exclude = ["third_party"]
 resolver = "3"
 
@@ -33,6 +33,7 @@ bevy = { version = "=0.20.0-rc.1", default-features = false, features = [
 wgpu-profiler = { version = "0.28", features = ["tracy"] }
 tracy-client = "0.18"
 gate-voxel = { path = "gate-voxel" }
+gate-physics = { path = "gate-physics" }
 gate-render = { path = "gate-render" }
 gate-ui = { path = "gate-ui" }
 serde = { version = "1", features = ["derive"] }

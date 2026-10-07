@@ -1,4 +1,4 @@
-const GI_T_MAX: f32 = 8192.0;
+﻿const GI_T_MAX: f32 = 8192.0;
 const GI_SKY_RADIANCE_SCALE: f32 = 1.0;
 const GI_EMIT_GAIN: f32 = 1.0;
 const GI_PI: f32 = 3.14159265;

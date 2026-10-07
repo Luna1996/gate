@@ -1,5 +1,4 @@
 fn validate_all_entries(src: &str, ray_query: bool) {
-  
   for name in [
     "dda_main",
     "dda_face_main",
@@ -25,7 +24,6 @@ fn validate_all_entries(src: &str, ray_query: bool) {
   }
   let module = naga::front::wgsl::parse_str(src).expect("WESL 产物不是合法 WGSL");
   naga::valid::Validator::new(
-    
     naga::valid::ValidationFlags::all(),
     naga::valid::Capabilities::all(),
   )

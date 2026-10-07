@@ -416,6 +416,13 @@ impl VolumeGrid {
     self.get_brick_state(VoxelCoord::from_ivec3(voxel), crate::chunk_tree::level_of_extent(extent))
   }
 
+  pub fn block_solid_bits(&self, voxel: IVec3) -> u64 {
+    let v = VoxelCoord::from_ivec3(voxel);
+    let Some(tree) = self.chunks.get(&v.chunk()) else { return 0 };
+    let local = v.in_chunk();
+    tree.block_solid_bits(local.x, local.y, local.z)
+  }
+
   pub fn set_voxel(&mut self, voxel: VoxelCoord, palette: PaletteId) -> Option<DirtyEdit> {
     let chunk = voxel.chunk();
     let local = voxel.in_chunk();
