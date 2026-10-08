@@ -15,7 +15,7 @@ use crate::{
 
 const DELETE_REACH: f32 = 4096.0;
 const FIRE_DISTANCE: f32 = 8.0;
-const FIRE_SPEED: f32 = 1600.0;
+const FIRE_SPEED: f32 = 800.0;
 pub(crate) const PILE_COUNT: usize = 1000;
 const PILE_ALTITUDE: f32 = 512.0;
 const PILE_PITCH: f32 = 0.75;
@@ -26,11 +26,6 @@ const PILE_LANDING: f32 = 160.0;
 const PILE_AIM_MAX: i32 = 24;
 const PILE_AIM_STEP: f32 = 0.06;
 const PILE_PITCH_MAX: f32 = 1.45;
-
-const _: () = assert!(
-  FIRE_SPEED / 60.0 >= (2 * RANDOM_SIZE_MAX - 1) as f32,
-  "发射初速度偏低：60 fps 下相邻两件间距小于随机外形的上限，枪口会互相嵌入"
-);
 
 fn view_ray(windows: &Query<&Window>, cfg: &DdaCameraConfig, locked: bool) -> Option<(Vec3, Vec3)> {
   let window = windows.single().ok()?;

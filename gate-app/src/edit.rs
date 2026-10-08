@@ -200,8 +200,8 @@ impl Default for EditSettings {
   }
 }
 
-pub(crate) const RANDOM_SIZE_MIN: u32 = 5;
-pub(crate) const RANDOM_SIZE_MAX: u32 = 12;
+pub(crate) const RANDOM_SIZE_MIN: u32 = 10;
+pub(crate) const RANDOM_SIZE_MAX: u32 = 30;
 
 pub(crate) struct Rng(u64);
 
