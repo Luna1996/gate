@@ -571,6 +571,7 @@ fn ensure_with_copy(
   label: &str,
   bytes: &[u8],
   prefix_valid: bool,
+  prof: Option<&mut crate::profiler::GpuProfilerRes>,
 ) {
   let cap = cur.size();
   let need = bytes.len() as u64;
@@ -597,7 +598,12 @@ fn ensure_with_copy(
   if prefix_valid && cap > 0 {
     let mut enc = device
       .create_command_encoder(&CommandEncoderDescriptor { label: Some("gate_grow_prefix_copy") });
-    enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
+    match prof {
+      Some(p) => crate::profiler::gpu_encoder_scope(p, &mut enc, "gate_upload_grow", |e| {
+        e.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap)
+      }),
+      None => enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap),
+    }
     queue.submit([enc.finish()]);
     if (cap as usize) < fits {
       queue.write_buffer(&new_buf, cap, &bytes[cap as usize..fits]);
@@ -609,7 +615,7 @@ fn ensure_with_copy(
 }
 
 fn write(device: &RenderDevice, queue: &RenderQueue, cur: &mut Buffer, label: &str, bytes: &[u8]) {
-  ensure_with_copy(device, queue, cur, label, bytes, false);
+  ensure_with_copy(device, queue, cur, label, bytes, false, None);
   if !bytes.is_empty() {
     let fits = (cur.size() as usize).min(bytes.len());
     queue.write_buffer(cur, 0, &bytes[..fits]);
@@ -630,6 +636,7 @@ fn ensure_capacity(
   cur: &mut Buffer,
   label: &str,
   need_bytes: u64,
+  prof: &mut crate::profiler::GpuProfilerRes,
 ) {
   let cap = cur.size();
   if cap >= need_bytes {
@@ -654,7 +661,9 @@ fn ensure_capacity(
   if cap > 0 {
     let mut enc = device
       .create_command_encoder(&CommandEncoderDescriptor { label: Some("gate_grow_prefix_copy") });
-    enc.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap);
+    crate::profiler::gpu_encoder_scope(prof, &mut enc, "gate_upload_grow", |e| {
+      e.copy_buffer_to_buffer(cur, 0, &new_buf, 0, cap)
+    });
     queue.submit([enc.finish()]);
   }
   debug!("显存 {label} 扩容 {cap} → {new_size} B（含前缀拷贝）");
@@ -699,6 +708,7 @@ pub(crate) fn prepare(
   mut gpu: ResMut<GpuBrickMap>,
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
+  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
   sample_channel: Option<Res<UploadCpuSampleChannel>>,
   mut revision: ResMut<BrickMapRevision>,
 ) {
@@ -784,6 +794,7 @@ pub(crate) fn prepare(
       &mut gpu.struct_buf,
       "gate_struct",
       snap.volumes.struct_total_bytes as u64,
+      &mut profiler,
     );
     ensure_capacity(
       &device,
@@ -791,6 +802,7 @@ pub(crate) fn prepare(
       &mut gpu.struct_buf_p1,
       "gate_struct_p1",
       snap.volumes.struct_total_bytes_p1 as u64,
+      &mut profiler,
     );
     ensure_capacity(
       &device,
@@ -798,6 +810,7 @@ pub(crate) fn prepare(
       &mut gpu.palette,
       "gate_palette",
       snap.volumes.palette_total_bytes as u64,
+      &mut profiler,
     );
     let grid_descs_bytes = u8_of_grid_descs(&snap.volumes.grid_descs);
     ensure_capacity(
@@ -806,6 +819,7 @@ pub(crate) fn prepare(
       &mut gpu.grid_descs_buf,
       "gate_grid_descs",
       grid_descs_bytes.len() as u64,
+      &mut profiler,
     );
     queue.write_buffer(&gpu.grid_descs_buf, 0, grid_descs_bytes);
 
@@ -871,6 +885,7 @@ pub(crate) fn prepare(
       &mut gpu.inst_bvh_buf,
       "gate_inst_bvh",
       bvh_bytes.len().max(4) as u64,
+      &mut profiler,
     );
     queue.write_buffer(&gpu.inst_bvh_buf, 0, bvh_bytes);
   }
@@ -878,7 +893,15 @@ pub(crate) fn prepare(
   {
     if gpu.comp.size() < comp_bytes.max(4) as u64 {
       let placeholder = vec![0u8; comp_bytes.max(4)];
-      ensure_with_copy(&device, &queue, &mut gpu.comp, "gate_comp", &placeholder, true);
+      ensure_with_copy(
+        &device,
+        &queue,
+        &mut gpu.comp,
+        "gate_comp",
+        &placeholder,
+        true,
+        Some(&mut profiler),
+      );
     }
   }
 

@@ -1,4 +1,4 @@
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Mat3, Vec3};
 
 use crate::classify::{ContactVoxels, DIRS6, Exposed, VoxelClass, x_slab};
 use crate::field::{Field, world_aabb_of};
@@ -55,7 +55,7 @@ pub struct ContactConfig {
 
 impl Default for ContactConfig {
   fn default() -> Self {
-    Self { max_points: 24, spread: 2.0 }
+    Self { max_points: 8, spread: 2.0 }
   }
 }
 
@@ -113,19 +113,101 @@ pub fn probe_pairs(a: &Probe, b: &Probe, cand: &mut Vec<Contact>) {
   if a.world.0.max(b.world.0).cmpgt(a.world.1.min(b.world.1)).any() {
     return;
   }
-  if let Some((lo, hi)) = bounds_in(&a.field, a.local, b.world) {
+  let ab = LocalMap::between(&a.field, &b.field);
+  let ba = LocalMap::between(&b.field, &a.field);
+  if let Some((lo, hi)) = bounds_in(&a.field, a.local, b) {
     let dir_a = buried_axis(lo, hi, a.local.0, a.local.1);
-    for p in x_slab_blocks(a.vox.corners(), lo, hi) {
-      probe_pair(a, b, false, p, false, dir_a, cand);
-    }
-    for p in x_slab_blocks(a.vox.edges(), lo, hi) {
-      probe_pair(a, b, false, p, true, dir_a, cand);
+    let prune = CoarsePrune::new(ab, b, a.field.transform().scale);
+    probe_list(a, b, false, a.vox.corners(), false, dir_a, lo, hi, &ab, &ba, &prune, cand);
+    probe_list(a, b, false, a.vox.edges(), true, dir_a, lo, hi, &ab, &ba, &prune, cand);
+  }
+  if let Some((lo, hi)) = bounds_in(&b.field, b.local, a) {
+    let dir_b = buried_axis(lo, hi, b.local.0, b.local.1);
+    let prune = CoarsePrune::new(ba, a, b.field.transform().scale);
+    probe_list(a, b, true, b.vox.corners(), false, dir_b, lo, hi, &ab, &ba, &prune, cand);
+  }
+}
+
+#[derive(Clone, Copy)]
+struct LocalMap {
+  m: Mat3,
+  t: Vec3,
+}
+
+impl LocalMap {
+  fn between(from: &Field, to: &Field) -> Self {
+    let (fs, ts) = (from.transform(), to.transform());
+    let m = ts.rot.transpose() * fs.rot * (fs.scale / ts.scale);
+    let t = ts.rot.transpose() * (fs.pos - ts.pos) / ts.scale;
+    Self { m, t }
+  }
+
+  #[inline]
+  fn map(&self, v: Vec3) -> Vec3 {
+    self.m * v + self.t
+  }
+}
+
+const COARSE_EXTENT: i32 = 16;
+
+#[derive(Clone, Copy)]
+struct CoarsePrune {
+  map: LocalMap,
+  half: Vec3,
+  blo: Vec3,
+  bhi: Vec3,
+}
+
+impl CoarsePrune {
+  fn new(map: LocalMap, other: &Probe, unit: f32) -> Self {
+    let am = Mat3::from_cols(map.m.x_axis.abs(), map.m.y_axis.abs(), map.m.z_axis.abs());
+    let hq = am * Vec3::splat(COARSE_EXTENT as f32 * 0.5);
+    let eb = other.field.transform().scale / unit;
+    let m = 0.5 + (0.5 * (1.0 + eb) + CONTACT_MARGIN);
+    Self {
+      map,
+      half: hq,
+      blo: other.local.0.as_vec3() - Vec3::splat(m),
+      bhi: (other.local.1 + IVec3::ONE).as_vec3() + Vec3::splat(m),
     }
   }
-  if let Some((lo, hi)) = bounds_in(&b.field, b.local, a.world) {
-    let dir_b = buried_axis(lo, hi, b.local.0, b.local.1);
-    for p in x_slab_blocks(b.vox.corners(), lo, hi) {
-      probe_pair(a, b, true, p, false, dir_b, cand);
+
+  #[inline]
+  fn keep(&self, cell: IVec3) -> bool {
+    let qc = self.map.map(cell.as_vec3() + Vec3::splat(COARSE_EXTENT as f32 * 0.5));
+    (qc + self.half).cmpge(self.blo).all() && (qc - self.half).cmple(self.bhi).all()
+  }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_list(
+  a: &Probe,
+  b: &Probe,
+  swapped: bool,
+  list: &[IVec3],
+  edges_only: bool,
+  body_dir: Vec3,
+  lo: IVec3,
+  hi: IVec3,
+  ab: &LocalMap,
+  ba: &LocalMap,
+  prune: &CoarsePrune,
+  cand: &mut Vec<Contact>,
+) {
+  let mask = IVec3::splat(!(COARSE_EXTENT - 1));
+  let mut cur: Option<(IVec3, bool)> = None;
+  for p in x_slab_blocks(list, lo, hi) {
+    let cell = p & mask;
+    let keep = match cur {
+      Some((c, k)) if c == cell => k,
+      _ => {
+        let k = prune.keep(cell);
+        cur = Some((cell, k));
+        k
+      }
+    };
+    if keep {
+      probe_pair(a, b, swapped, p, edges_only, body_dir, ab, ba, cand);
     }
   }
 }
@@ -135,11 +217,7 @@ pub fn finish(cand: &mut [Contact], cfg: &ContactConfig, unit: f32, points: &mut
   select(points, cand, cfg, unit);
 }
 
-fn x_slab_blocks<'a>(
-  list: &'a [IVec3],
-  lo: IVec3,
-  hi: IVec3,
-) -> impl Iterator<Item = IVec3> + 'a {
+fn x_slab_blocks<'a>(list: &'a [IVec3], lo: IVec3, hi: IVec3) -> impl Iterator<Item = IVec3> + 'a {
   let mask = IVec3::splat(!(REGION_EXTENT - 1));
   let mut last: Option<IVec3> = None;
   x_slab(list, lo, hi).filter(move |v| {
@@ -179,14 +257,16 @@ fn probe_pair(
   p: IVec3,
   edges_only: bool,
   body_dir: Vec3,
+  ab: &LocalMap,
+  ba: &LocalMap,
   out: &mut Vec<Contact>,
 ) {
   let (probe, other) = if swapped { (b, a) } else { (a, b) };
+  let (map_q, map_cb) = if swapped { (ba, ab) } else { (ab, ba) };
   let unit = probe.field.transform().scale;
   let eb = other.field.transform().scale / unit;
   let pa = p.as_vec3() + Vec3::splat(0.5);
-  let q = other.field.to_local(probe.field.to_world(pa));
-  //
+  let q = map_q.map(pa);
   let r = 0.5 * (1.0 + eb) + CONTACT_MARGIN;
   let lo = (q - Vec3::splat(0.5 + r)).ceil().as_ivec3();
   let hi = (q - Vec3::splat(0.5 - r)).floor().as_ivec3();
@@ -195,7 +275,7 @@ fn probe_pair(
   let n = hi - lo + IVec3::ONE;
   let mut best: Option<Contact> = None;
   let mut emit = |pb: IVec3| {
-    let cb = probe.field.to_local(other.field.to_world(pb.as_vec3() + Vec3::splat(0.5)));
+    let cb = map_cb.map(pb.as_vec3() + Vec3::splat(0.5));
     let Some((mut n, mut depth, deep)) = rounded_pair(pa, cb, eb, body_dir) else { return };
     if best.as_ref().is_some_and(|b| b.depth >= depth * unit) {
       return;
@@ -327,21 +407,16 @@ fn select(out: &mut Vec<Contact>, cand: &mut [Contact], cfg: &ContactConfig, uni
   }
 }
 
-fn bounds_in(
-  field: &Field,
-  field_local: (IVec3, IVec3),
-  other_world: (Vec3, Vec3),
-) -> Option<(IVec3, IVec3)> {
-  let (mn, mx) = other_world;
+fn bounds_in(field: &Field, field_local: (IVec3, IVec3), other: &Probe) -> Option<(IVec3, IVec3)> {
   let mut lo = Vec3::splat(f32::MAX);
   let mut hi = Vec3::splat(f32::MIN);
   for i in 0..8 {
     let c = Vec3::new(
-      if i & 1 == 0 { mn.x } else { mx.x },
-      if i & 2 == 0 { mn.y } else { mx.y },
-      if i & 4 == 0 { mn.z } else { mx.z },
+      if i & 1 == 0 { other.local.0.x as f32 } else { (other.local.1.x + 1) as f32 },
+      if i & 2 == 0 { other.local.0.y as f32 } else { (other.local.1.y + 1) as f32 },
+      if i & 4 == 0 { other.local.0.z as f32 } else { (other.local.1.z + 1) as f32 },
     );
-    let l = field.to_local(c);
+    let l = field.to_local(other.field.to_world(c));
     lo = lo.min(l);
     hi = hi.max(l);
   }

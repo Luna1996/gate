@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use glam::IVec3;
 use gate_voxel::{CHUNK_SIZE, VolumeGrid};
+use glam::IVec3;
 
 use crate::classify::ContactVoxels;
 use crate::field::{Field, NodeFill};

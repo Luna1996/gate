@@ -501,11 +501,15 @@ fn bench_pile() {
       }
       let p = s.profile;
       prof.broad_ms += p.broad_ms;
+      prof.pair_ms += p.pair_ms;
       prof.build_ms += p.build_ms;
+      prof.setup_ms += p.setup_ms;
       prof.color_ms += p.color_ms;
       prof.prepare_ms += p.prepare_ms;
       prof.solve_ms += p.solve_ms;
       prof.integrate_ms += p.integrate_ms;
+      prof.position_ms += p.position_ms;
+      prof.carry_ms += p.carry_ms;
       prof.sleep_ms += p.sleep_ms;
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
@@ -523,13 +527,17 @@ fn bench_pile() {
       marks.get(2).copied().unwrap_or(0),
     );
     eprintln!(
-      "  分解 ms/帧：宽相 {:.3} · 窄相 {:.3} · 着色 {:.3} · 准备 {:.3} · 求解 {:.3} · 积分 {:.3} · 休眠 {:.3}  | 合计 {:.3}",
+      "  分解 ms/帧：宽相 {:.3} · 配对 {:.3} · 窄相 {:.3} · 装配 {:.3} · 着色 {:.3} · 准备 {:.3} · 求解 {:.3} · 积分 {:.3} · 位修 {:.3} · 回写 {:.3} · 休眠 {:.3}  | 合计 {:.3}",
       prof.broad_ms / FRAMES as f32,
+      prof.pair_ms / FRAMES as f32,
       prof.build_ms / FRAMES as f32,
+      prof.setup_ms / FRAMES as f32,
       prof.color_ms / FRAMES as f32,
       prof.prepare_ms / FRAMES as f32,
       prof.solve_ms / FRAMES as f32,
       prof.integrate_ms / FRAMES as f32,
+      prof.position_ms / FRAMES as f32,
+      prof.carry_ms / FRAMES as f32,
       prof.sleep_ms / FRAMES as f32,
       prof.total_ms() / FRAMES as f32
     );

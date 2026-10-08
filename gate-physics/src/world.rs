@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 
 use gate_voxel::{VolumeGrid, VolumeTransform, Volumes};
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Mat3, Vec3};
 use micropool::iter::{
   ExactParallelSourceExt, IntoExactParallelRefMutSource, IntoExactParallelRefSource,
   ParallelIteratorExt,
@@ -10,7 +10,9 @@ use micropool::iter::{
 use micropool::{ThreadPool, ThreadPoolBuilder};
 
 use crate::body::{BodySet, MassProps};
-use crate::contact::{Contact, ContactConfig, ContactPath, Probe, finish, manifold_into, probe_pairs};
+use crate::contact::{
+  Contact, ContactConfig, ContactPath, Probe, finish, manifold_into, probe_pairs,
+};
 use crate::dissolve::dissolve_into_main;
 use crate::field::{Field, world_aabb_of};
 use crate::solver::{Constraint, ContactConstraint, ContactParams, POSITION_BETA, color_by_body};
@@ -32,6 +34,8 @@ pub struct StepConfig {
   pub sleep_lin_vel: f32,
   pub sleep_ang_vel: f32,
   pub sleep_time: f32,
+  pub lin_damp: f32,
+  pub ang_damp: f32,
   pub profile: bool,
 }
 
@@ -46,9 +50,11 @@ impl Default for StepConfig {
       density: 1.0,
       position_beta: POSITION_BETA,
       position_iterations: 2,
-      sleep_lin_vel: 0.5,
-      sleep_ang_vel: 0.05,
-      sleep_time: 0.5,
+      sleep_lin_vel: 40.0,
+      sleep_ang_vel: 1.0,
+      sleep_time: 2.0,
+      lin_damp: 0.0,
+      ang_damp: 0.0,
       profile: false,
     }
   }
@@ -57,22 +63,30 @@ impl Default for StepConfig {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepProfile {
   pub broad_ms: f32,
+  pub pair_ms: f32,
   pub build_ms: f32,
+  pub setup_ms: f32,
   pub color_ms: f32,
   pub prepare_ms: f32,
   pub solve_ms: f32,
   pub integrate_ms: f32,
+  pub position_ms: f32,
+  pub carry_ms: f32,
   pub sleep_ms: f32,
 }
 
 impl StepProfile {
   pub fn total_ms(&self) -> f32 {
     self.broad_ms
+      + self.pair_ms
       + self.build_ms
+      + self.setup_ms
       + self.color_ms
       + self.prepare_ms
       + self.solve_ms
       + self.integrate_ms
+      + self.position_ms
+      + self.carry_ms
       + self.sleep_ms
   }
 }
@@ -96,14 +110,122 @@ pub struct PhysicsWorld {
   pub bodies: BodySet,
   pub statics: StaticField,
   cache: HashMap<u64, [f32; 3]>,
+  pairs: PairCache,
   pool: Option<ThreadPool>,
+}
+
+#[derive(Default)]
+struct PairCache {
+  map: HashMap<u64, CachedPair>,
+  stamp: u64,
+}
+
+#[derive(Default)]
+struct CachedPair {
+  rel_pos: Vec3,
+  rel_rot: Mat3,
+  rot_a: Mat3,
+  gen_a: u64,
+  gen_b: u64,
+  stamp: u64,
+  cons: Vec<ContactConstraint>,
+}
+
+const PAIR_POS_TOL_SQ: f32 = 0.01;
+const PAIR_COS_MIN: f32 = 0.999_990_5;
+const PAIR_KEEP_STEPS: u64 = 120;
+const PAIR_SWEEP_EVERY: u64 = 64;
+
+impl PairCache {
+  fn begin(&mut self) {
+    self.stamp = self.stamp.wrapping_add(1);
+    if self.stamp.is_multiple_of(PAIR_SWEEP_EVERY) {
+      let now = self.stamp;
+      self.map.retain(|_, e| now.wrapping_sub(e.stamp) < PAIR_KEEP_STEPS);
+    }
+  }
+
+  fn clear(&mut self) {
+    self.map.clear();
+  }
+
+  fn reuse(
+    &mut self,
+    bodies: &BodySet,
+    grids: &Volumes,
+    ia: usize,
+    ib: usize,
+    out: &mut Vec<ContactConstraint>,
+  ) -> bool {
+    let key = pair_key(ia, ib);
+    let Some((rel_pos, rel_rot, rot_a, gen_a, gen_b)) =
+      self.map.get(&key).map(|e| (e.rel_pos, e.rel_rot, e.rot_a, e.gen_a, e.gen_b))
+    else {
+      return false;
+    };
+    let (Some(ga), Some(gb)) =
+      (grids.list.get(bodies.grid_index[ia]), grids.list.get(bodies.grid_index[ib]))
+    else {
+      return false;
+    };
+    if ga.edit_generation() != gen_a || gb.edit_generation() != gen_b {
+      return false;
+    }
+    let rot_a_now = bodies.rot[ia];
+    if (bodies.pos[ib] - bodies.pos[ia] - rel_pos).length_squared() > PAIR_POS_TOL_SQ {
+      return false;
+    }
+    let drift = rel_rot.transpose() * (rot_a_now.transpose() * bodies.rot[ib]);
+    if (drift.x_axis.x + drift.y_axis.y + drift.z_axis.z - 1.0) * 0.5 < PAIR_COS_MIN {
+      return false;
+    }
+    let delta = rot_a_now * rot_a.transpose();
+    let Some(entry) = self.map.get_mut(&key) else { return false };
+    entry.stamp = self.stamp;
+    let base = out.len();
+    out.extend_from_slice(&entry.cons);
+    for c in &mut out[base..] {
+      c.refresh_normal(delta);
+      c.refresh_depth(bodies);
+    }
+    true
+  }
+
+  fn store(
+    &mut self,
+    bodies: &BodySet,
+    grids: &Volumes,
+    ia: usize,
+    ib: usize,
+    fresh: &[ContactConstraint],
+  ) {
+    let (Some(ga), Some(gb)) =
+      (grids.list.get(bodies.grid_index[ia]), grids.list.get(bodies.grid_index[ib]))
+    else {
+      return;
+    };
+    let rot_a = bodies.rot[ia];
+    let entry = self.map.entry(pair_key(ia, ib)).or_default();
+    entry.rel_pos = bodies.pos[ib] - bodies.pos[ia];
+    entry.rel_rot = rot_a.transpose() * bodies.rot[ib];
+    entry.rot_a = rot_a;
+    entry.gen_a = ga.edit_generation();
+    entry.gen_b = gb.edit_generation();
+    entry.stamp = self.stamp;
+    entry.cons.clear();
+    entry.cons.extend_from_slice(fresh);
+  }
+}
+
+fn pair_key(ia: usize, ib: usize) -> u64 {
+  debug_assert!(ia < ib, "配对键要求 ia < ib");
+  ((ia as u64) << 32) | ib as u64
 }
 
 impl PhysicsWorld {
   pub fn new() -> Self {
     Self::default()
   }
-
   pub fn with_threads(num_threads: usize) -> Self {
     Self {
       pool: Some(ThreadPoolBuilder::default().num_threads(num_threads).build()),
@@ -163,6 +285,7 @@ impl PhysicsWorld {
     }
     self.bodies.remove(i);
     self.cache.clear();
+    self.pairs.clear();
     true
   }
 
@@ -178,6 +301,7 @@ impl PhysicsWorld {
       n += 1;
     }
     self.cache.clear();
+    self.pairs.clear();
     n
   }
 
@@ -203,12 +327,15 @@ impl PhysicsWorld {
   }
 
   pub fn step(&mut self, grids: &Volumes, dt: f32, cfg: &StepConfig) -> StepStats {
-    let Self { bodies, statics, cache, pool } = self;
+    let Self { bodies, statics, cache, pairs: pcache, pool } = self;
     let statics: &StaticField = statics;
     let pool = pool.get_or_insert_with(|| ThreadPoolBuilder::default().build());
-    //
+    pcache.begin();
+    let t = cfg.profile.then(std::time::Instant::now);
+    let substeps = cfg.substeps.max(1) as f32;
+    let h = dt / substeps;
     let fast = (0..bodies.len())
-      .filter(|&i| !bodies.sleeping[i] && bodies.lin_vel[i].length() * dt > MAX_STEP_TRAVEL)
+      .filter(|&i| !bodies.sleeping[i] && bodies.lin_vel[i].length() * h > MAX_STEP_TRAVEL)
       .count();
     let k = if fast == 0 || fast > MAX_SUBDIV_BODIES {
       1
@@ -217,36 +344,48 @@ impl PhysicsWorld {
         .filter(|&i| !bodies.sleeping[i])
         .map(|i| bodies.lin_vel[i].length())
         .fold(0.0f32, f32::max)
-        * dt;
+        * h;
       (travel / MAX_STEP_TRAVEL).ceil().clamp(1.0, MAX_SUBDIV as f32) as u32
     };
-    pool.install(|| {
+    let pairs = broad_phase(bodies);
+    let pair_ms = t.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
+    let mut stats = pool.install(|| {
       if k == 1 {
-        let pairs = broad_phase(bodies);
-        let mut s = step_inner(bodies, statics, cache, grids, &pairs, &pairs, &[], dt, cfg);
+        let mut s = step_inner(bodies, statics, cache, pcache, grids, &pairs, &pairs, &[], dt, cfg);
         s.pairs = pairs.len();
         s.subdiv = 1;
         return s;
       }
-      let pairs = broad_phase(bodies);
       let limit = MAX_STEP_TRAVEL / k as f32;
       let moving: Vec<bool> = (0..bodies.len())
-        .map(|i| !bodies.sleeping[i] && bodies.lin_vel[i].length() * dt > limit)
+        .map(|i| !bodies.sleeping[i] && bodies.lin_vel[i].length() * h > limit)
         .collect();
       let (fresh, stale): (Vec<_>, Vec<_>) =
         pairs.iter().copied().partition(|&(a, b)| moving[a] || moving[b]);
-      let stale_cons = build(statics, grids, bodies, &stale, cfg);
+      let stale_cons = build(pcache, statics, grids, bodies, &stale, cfg);
       let mut stats = StepStats::default();
       for _ in 0..k {
-        let s =
-          step_inner(bodies, statics, cache, grids, &fresh, &pairs, &stale_cons, dt / k as f32, cfg);
+        let s = step_inner(
+          bodies,
+          statics,
+          cache,
+          pcache,
+          grids,
+          &fresh,
+          &pairs,
+          &stale_cons,
+          dt / k as f32,
+          cfg,
+        );
         merge_stats(&mut stats, &s);
       }
       stats.pairs = pairs.len();
       stats.subdiv = k;
       stats.reused_contacts = stale_cons.len() * k as usize;
       stats
-    })
+    });
+    stats.profile.pair_ms += pair_ms;
+    stats
   }
 
   pub fn dissolve_body(&mut self, i: usize, volumes: &mut Volumes) -> usize {
@@ -305,11 +444,15 @@ fn merge_stats(acc: &mut StepStats, s: &StepStats) {
   acc.sleeping = s.sleeping;
   let (a, b) = (&mut acc.profile, &s.profile);
   a.broad_ms += b.broad_ms;
+  a.pair_ms += b.pair_ms;
   a.build_ms += b.build_ms;
+  a.setup_ms += b.setup_ms;
   a.color_ms += b.color_ms;
   a.prepare_ms += b.prepare_ms;
   a.solve_ms += b.solve_ms;
   a.integrate_ms += b.integrate_ms;
+  a.position_ms += b.position_ms;
+  a.carry_ms += b.carry_ms;
   a.sleep_ms += b.sleep_ms;
 }
 
@@ -318,6 +461,7 @@ fn step_inner(
   bodies: &mut BodySet,
   statics: &StaticField,
   cache: &mut HashMap<u64, [f32; 3]>,
+  pcache: &mut PairCache,
   grids: &Volumes,
   build_pairs: &[(usize, usize)],
   sleep_pairs: &[(usize, usize)],
@@ -342,8 +486,10 @@ fn step_inner(
   }
   tick(&mut prof.broad_ms, t);
   let t = cfg.profile.then(std::time::Instant::now);
-  let mut cons = build(statics, grids, bodies, build_pairs, cfg);
+  let mut cons = build(pcache, statics, grids, bodies, build_pairs, cfg);
   cons.extend_from_slice(reused);
+  tick(&mut prof.build_ms, t);
+  let t = cfg.profile.then(std::time::Instant::now);
   count_contacts(&cons, &mut stats);
   bodies.update_all_inertia();
   let mut carried = std::mem::take(cache);
@@ -356,7 +502,7 @@ fn step_inner(
     c.capture_restitution(bodies, &cfg.params);
     c.reset_pseudo();
   }
-  tick(&mut prof.build_ms, t);
+  tick(&mut prof.setup_ms, t);
   let t = cfg.profile.then(std::time::Instant::now);
   let ranges = color_by_body(&mut cons, bodies);
   tick(&mut prof.color_ms, t);
@@ -364,7 +510,7 @@ fn step_inner(
   for _ in 0..substeps {
     let t = cfg.profile.then(std::time::Instant::now);
     for i in 0..bodies.len() {
-      bodies.integrate_velocity(i, cfg.gravity, h);
+      bodies.integrate_velocity(i, cfg.gravity, h, cfg.lin_damp, cfg.ang_damp);
     }
     cons
       .par_iter_mut()
@@ -383,6 +529,7 @@ fn step_inner(
     }
     tick(&mut prof.integrate_ms, t);
   }
+  let t = cfg.profile.then(std::time::Instant::now);
   carried.clear();
   for c in &cons {
     if c.bouncing() {
@@ -390,7 +537,9 @@ fn step_inner(
     }
     carried.insert(c.key(), c.impulse());
   }
+  tick(&mut prof.carry_ms, t);
   if cfg.position_beta > 0.0 {
+    let t = cfg.profile.then(std::time::Instant::now);
     bodies.clear_pseudo();
     for _ in 0..cfg.position_iterations.max(1) {
       for_each_color(&mut cons, bodies, &ranges, |c, b| {
@@ -403,6 +552,7 @@ fn step_inner(
       }
     }
     bodies.clear_pseudo();
+    tick(&mut prof.position_ms, t);
   }
   let t = cfg.profile.then(std::time::Instant::now);
   stats.max_penetration = cons.iter().map(|c| c.penetration()).fold(0.0f32, f32::max);
@@ -414,7 +564,7 @@ fn step_inner(
   stats
 }
 
-const MAX_STEP_TRAVEL: f32 = 2.0;
+const MAX_STEP_TRAVEL: f32 = 0.5;
 
 const MAX_SUBDIV: u32 = 16;
 
@@ -452,18 +602,37 @@ fn for_each_color(
 }
 
 fn build(
+  pcache: &mut PairCache,
   statics: &StaticField,
   grids: &Volumes,
   bodies: &BodySet,
   pairs: &[(usize, usize)],
   cfg: &StepConfig,
 ) -> Vec<ContactConstraint> {
-  let parts: Vec<Vec<ContactConstraint>> =
-    pairs.par_iter().with_thread_pool(micropool::split_per(64)).fold_per_thread(
-      Vec::new,
-      |mut acc, &(ia, ib)| {
+  let mut cons: Vec<ContactConstraint> = Vec::with_capacity(pairs.len() * 2);
+  let mut misses: Vec<(usize, usize)> = Vec::new();
+  for &(ia, ib) in pairs {
+    if ia != WORLD_BODY && ib != WORLD_BODY {
+      if bodies.sleeping[ia] && bodies.sleeping[ib] {
+        continue;
+      }
+      if pcache.reuse(bodies, grids, ia, ib, &mut cons) {
+        continue;
+      }
+    }
+    misses.push((ia, ib));
+  }
+  if misses.is_empty() {
+    return cons;
+  }
+  let parts: Vec<(Vec<ContactConstraint>, Vec<(u32, u32, usize, usize)>)> =
+    misses.as_slice().par_iter().with_thread_pool(micropool::split_per(64)).fold_per_thread(
+      || (Vec::new(), Vec::new()),
+      |(mut acc, mut ranges), &(ia, ib)| {
+        let lo = acc.len() as u32;
         build_pair_into(&mut acc, statics, grids, bodies, ia, ib, cfg);
-        acc
+        ranges.push((lo, acc.len() as u32, ia, ib));
+        (acc, ranges)
       },
       Vec::with_capacity,
       |mut parts, acc| {
@@ -471,10 +640,14 @@ fn build(
         parts
       },
     );
-  let total = parts.iter().map(Vec::len).sum();
-  let mut cons = Vec::with_capacity(total);
-  for part in parts {
-    cons.extend(part);
+  for (part, ranges) in parts {
+    let base = cons.len();
+    cons.extend_from_slice(&part);
+    for (lo, hi, ia, ib) in ranges {
+      if ia != WORLD_BODY && ib != WORLD_BODY {
+        pcache.store(bodies, grids, ia, ib, &cons[base + lo as usize..base + hi as usize]);
+      }
+    }
   }
   cons
 }
@@ -555,10 +728,9 @@ fn build_world_pair_into(
   if other == WORLD_BODY || bodies.sleeping[other] {
     return;
   }
-  let (Some(gw), Some(go)) = (
-    grids.list.get(bodies.grid_index[WORLD_BODY]),
-    grids.list.get(bodies.grid_index[other]),
-  ) else {
+  let (Some(gw), Some(go)) =
+    (grids.list.get(bodies.grid_index[WORLD_BODY]), grids.list.get(bodies.grid_index[other]))
+  else {
     return;
   };
   let po = Probe {

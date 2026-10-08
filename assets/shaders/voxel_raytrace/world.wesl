@@ -2,7 +2,7 @@ import package::bindings::{g, grid_descs, inst_bvh, lod_diag};
 import package::brickmap::{Grid, sample_brickmap};
 import package::common::{face_normal_from_index};
 import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid, diag_ray, DIAG_NEAR_CALLS,
-  DIAG_LEAF_ITER, DIAG_LEAF_MARCH};
+  DIAG_LEAF_ITER, DIAG_LEAF_MARCH, DIAG_BVH_NODES, DIAG_FAR_ITERS, DIAG_FAR_TRACES};
 
 fn vol_tint_color(h: WorldHit) -> vec3<f32> {
   if (!h.hit) {
@@ -117,6 +117,7 @@ fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_c
   let sampled = diag_ray(origin, dir);
   var leaf_it: u32 = 0u;
   var marches: u32 = 0u;
+  var nodes: u32 = 0u;
   if (inst_bvh[0u] == 0u) {
     return;
   }
@@ -131,6 +132,7 @@ fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_c
       break;
     }
     sp = sp - 1u;
+    nodes = nodes + 1u;
     let node = stack[sp];
     let base = BVH_HEADER + node * BVH_NODE_WORDS;
     let mn = vec3<f32>(bvh_bits(base), bvh_bits(base + 1u), bvh_bits(base + 2u));
@@ -175,6 +177,7 @@ fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_c
     atomicAdd(&lod_diag[DIAG_NEAR_CALLS], 1u);
     atomicAdd(&lod_diag[DIAG_LEAF_ITER], leaf_it);
     atomicAdd(&lod_diag[DIAG_LEAF_MARCH], marches);
+    atomicAdd(&lod_diag[DIAG_BVH_NODES], nodes);
   }
 }
 
@@ -184,7 +187,11 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
              mc: ptr<function, MediumRay>, gap: ptr<function, f32>) {
   let far_base = inst_bvh[2u];
   let far_count = inst_bvh[3u];
+  let sampled = diag_ray(origin, dir);
+  var iters: u32 = 0u;
+  var traces: u32 = 0u;
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
+    iters = iters + 1u;
     if (req == 0u && origin_xz < *shell) {
       continue;
     }
@@ -197,6 +204,7 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
       *shell = max(*shell, coverage_r_of(gi));
       continue;
     }
+    traces = traces + 1u;
     let mhi = trace_grid(gi, origin, dir, t_hi, t_min, depth_cap, false, req, mc, gap);
     if (mhi.hit && mhi.t < *best_t) {
       *best_t = mhi.t;
@@ -204,6 +212,10 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
       (*best).palette_base = gi.palette_base;
     }
     *shell = max(*shell, coverage_r_of(gi));
+  }
+  if (sampled) {
+    atomicAdd(&lod_diag[DIAG_FAR_ITERS], iters);
+    atomicAdd(&lod_diag[DIAG_FAR_TRACES], traces);
   }
 }
 

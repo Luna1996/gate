@@ -1,4 +1,4 @@
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 
 use crate::body::BodySet;
 use crate::contact::{Contact, ContactPath};
@@ -50,22 +50,13 @@ pub struct ContactConstraint {
 impl ContactConstraint {
   pub fn new(c: &Contact, ia: usize, ib: usize, p: &ContactParams) -> Self {
     let n = c.normal;
-    let a = n.abs();
-    let aux = if a.x <= a.y && a.x <= a.z {
-      Vec3::X
-    } else if a.y <= a.z {
-      Vec3::Y
-    } else {
-      Vec3::Z
-    };
-    let t1 = n.cross(aux).normalize_or_zero();
-    let t2 = n.cross(t1);
+    let t = tangents(n);
     Self {
       ia,
       ib,
       key: mix_pair(c.key(), ia, ib),
       n,
-      t: [t1, t2],
+      t,
       local_a: c.local_a,
       local_b: c.local_b,
       ra: Vec3::ZERO,
@@ -80,6 +71,23 @@ impl ContactConstraint {
       color: 0,
       path: c.path,
     }
+  }
+
+  pub fn refresh_normal(&mut self, delta: Mat3) {
+    let n = delta * self.n;
+    if n.length_squared() <= 1e-12 {
+      return;
+    }
+    self.n = n;
+    self.t = tangents(n);
+  }
+
+  pub fn refresh_depth(&mut self, bodies: &BodySet) {
+    debug_assert!(!bodies.is_static(self.ia) && !bodies.is_static(self.ib));
+    let ra = bodies.rot[self.ia] * ((self.local_a - bodies.com[self.ia]) * bodies.scale[self.ia]);
+    let rb = bodies.rot[self.ib] * ((self.local_b - bodies.com[self.ib]) * bodies.scale[self.ib]);
+    let sep = (bodies.pos[self.ib] + rb) - (bodies.pos[self.ia] + ra);
+    self.depth = -sep.dot(self.n);
   }
 
   pub fn normal(&self) -> Vec3 {
@@ -199,6 +207,19 @@ impl Constraint for ContactConstraint {
 
 fn relative_velocity(bodies: &BodySet, ia: usize, ib: usize, ra: Vec3, rb: Vec3) -> Vec3 {
   bodies.point_velocity(ib, rb) - bodies.point_velocity(ia, ra)
+}
+
+fn tangents(n: Vec3) -> [Vec3; 2] {
+  let a = n.abs();
+  let aux = if a.x <= a.y && a.x <= a.z {
+    Vec3::X
+  } else if a.y <= a.z {
+    Vec3::Y
+  } else {
+    Vec3::Z
+  };
+  let t1 = n.cross(aux).normalize_or_zero();
+  [t1, n.cross(t1)]
 }
 
 fn pseudo_velocity(bodies: &BodySet, ia: usize, ib: usize, ra: Vec3, rb: Vec3) -> Vec3 {

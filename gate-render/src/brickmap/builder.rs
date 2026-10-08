@@ -929,7 +929,8 @@ fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
   const N16: i32 = 16;
   const N4: i32 = 4;
   let lvl = |e: i32| {
-    gate_voxel::LEVEL_EXTENT.iter().position(|&l| l == e).expect("粒度必须是 LEVEL_EXTENT 之一") as u8
+    gate_voxel::LEVEL_EXTENT.iter().position(|&l| l == e).expect("粒度必须是 LEVEL_EXTENT 之一")
+      as u8
   };
   let (l16, l4) = (lvl(N16), lvl(N4));
   let mut lo = IVec3::splat(i32::MAX);
@@ -1259,7 +1260,6 @@ impl VolumesBuilder {
   pub fn snapshot(&mut self) -> VolumesSnapshot {
     let n = self.builders.len();
 
-    //
     let seg = crate::wesl_consts::trace_consts().seg_words as usize;
     let world_cap = (self.budget_bytes / 4).clamp(1, seg);
     if self.slot_tree.len() < n {

@@ -280,11 +280,24 @@ impl BodySet {
     self.lin_vel[i].length_squared() <= lin * lin && self.ang_vel[i].length_squared() <= ang * ang
   }
 
-  pub fn integrate_velocity(&mut self, i: usize, gravity: Vec3, h: f32) {
+  pub fn integrate_velocity(
+    &mut self,
+    i: usize,
+    gravity: Vec3,
+    h: f32,
+    lin_damp: f32,
+    ang_damp: f32,
+  ) {
     if self.sleeping[i] {
       return;
     }
     self.lin_vel[i] += gravity * h;
+    if lin_damp > 0.0 {
+      self.lin_vel[i] /= 1.0 + h * lin_damp;
+    }
+    if ang_damp > 0.0 {
+      self.ang_vel[i] /= 1.0 + h * ang_damp;
+    }
   }
 
   pub fn integrate_position(&mut self, i: usize, h: f32) {

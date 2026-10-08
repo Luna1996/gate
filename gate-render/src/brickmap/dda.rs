@@ -493,6 +493,12 @@ impl Plugin for BrickMapDdaPlugin {
       )
       .add_systems(
         RenderGraph,
+        frame_bracket_head
+          .in_set(bevy::render::renderer::RenderGraphSystems::Render)
+          .before(sync_rt_scene),
+      )
+      .add_systems(
+        RenderGraph,
         sync_rt_scene
           .in_set(bevy::render::renderer::RenderGraphSystems::Render)
           .before(dispatch_dda),
@@ -502,6 +508,10 @@ impl Plugin for BrickMapDdaPlugin {
         dispatch_dda
           .in_set(bevy::render::renderer::RenderGraphSystems::Render)
           .before(camera_driver),
+      )
+      .add_systems(
+        Core2d,
+        frame_bracket_tail.in_set(Core2dSystems::PostProcess).after(blit_dda_view),
       )
       .add_systems(Core2d, blit_dda_view.in_set(Core2dSystems::PostProcess));
   }
@@ -1418,6 +1428,30 @@ fn sync_rt_scene(mut ctx: RenderContext, mut rt: ResMut<super::rt::RtScene>) {
   rt.record(ctx.command_encoder());
 }
 
+fn frame_bracket_head(
+  mut ctx: RenderContext,
+  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
+) {
+  crate::profiler::gpu_encoder_scope(
+    &mut profiler,
+    ctx.command_encoder(),
+    "gate_frame_head",
+    |_| (),
+  );
+}
+
+fn frame_bracket_tail(
+  mut ctx: RenderContext,
+  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
+) {
+  crate::profiler::gpu_encoder_scope(
+    &mut profiler,
+    ctx.command_encoder(),
+    "gate_frame_tail",
+    |_| (),
+  );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_dda(
   mut ctx: RenderContext,
@@ -1480,7 +1514,12 @@ pub(crate) fn dispatch_dda(
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
 
     if let Some(fs) = aux.face_slots_buffer() {
-      ctx.command_encoder().clear_buffer(fs, 0, None);
+      crate::profiler::gpu_encoder_scope(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_gi_slots_clear",
+        |enc| enc.clear_buffer(fs, 0, None),
+      );
     }
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_gi", |pass| {
       pass.set_pipeline(gi_pipe);

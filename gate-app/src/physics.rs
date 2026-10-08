@@ -1,9 +1,7 @@
 use bevy::prelude::*;
 use glam::{IVec3, Vec3};
 
-use gate_physics::{
-  Field, PhysicsWorld, Probe, StepConfig, mass_properties, tight_bounds,
-};
+use gate_physics::{Field, PhysicsWorld, Probe, StepConfig, mass_properties, tight_bounds};
 use gate_render::{DdaCameraConfig, VoxelScene};
 use gate_voxel::{VolumeGrid, Volumes};
 
@@ -145,6 +143,7 @@ pub(crate) fn step_physics(
   mut st: ResMut<PhysicsState>,
   scene: Option<ResMut<VoxelScene>>,
   mut diag: Local<(f64, u32)>,
+  mut dbg_n: Local<u32>,
 ) {
   let _t = gate_render::profiler::SysTimer::new("PHYS 求解", &mut diag);
   let Some(mut scene) = scene else { return };
@@ -170,6 +169,30 @@ pub(crate) fn step_physics(
   }
   if steps == 0 {
     return;
+  }
+  *dbg_n += 1;
+  if st.cfg.profile && *dbg_n % 30 == 0 {
+    let p = st.last_profile;
+    info!(
+      target: "gate",
+      "PHYS[profile] 体{} 对{} 接触{} 内步{} 宽{:.2} 配对{:.2} 窄{:.2} 装配{:.2} 色{:.2} 备{:.2} 解{:.2} 积{:.2} 位{:.2} 回写{:.2} 睡{:.2} | 合计{:.2}",
+      st.live_bodies(),
+      st.last_pairs,
+      st.last_contacts,
+      st.last_split.0,
+      p.broad_ms,
+      p.pair_ms,
+      p.build_ms,
+      p.setup_ms,
+      p.color_ms,
+      p.prepare_ms,
+      p.solve_ms,
+      p.integrate_ms,
+      p.position_ms,
+      p.carry_ms,
+      p.sleep_ms,
+      p.total_ms(),
+    );
   }
   if write_back(&st.world, &mut scene.volumes) {
     scene.transforms_dirty = true;

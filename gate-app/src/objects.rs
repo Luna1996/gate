@@ -185,8 +185,9 @@ pub(crate) fn pile_fire(
   }
   if *fired == 0
     && *aiming <= PILE_AIM_MAX
-    && !raycast(&scene.volumes, cam.position_world, cam.forward, PILE_REACH)
-      .is_some_and(|h| h.normal.y > 0.5 && (h.t * cam.forward.x).hypot(h.t * cam.forward.z) <= PILE_LANDING)
+    && !raycast(&scene.volumes, cam.position_world, cam.forward, PILE_REACH).is_some_and(|h| {
+      h.normal.y > 0.5 && (h.t * cam.forward.x).hypot(h.t * cam.forward.z) <= PILE_LANDING
+    })
   {
     if *aiming == PILE_AIM_MAX {
       warn!(target: "gate", "PHYS[pile] 视线始终未落到实地 → 按当前俯角开火");

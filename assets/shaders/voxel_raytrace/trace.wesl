@@ -43,6 +43,9 @@ const DIAG_ILLEGAL_STOPS: u32 = 2u;
 const DIAG_LEAF_ITER: u32 = 32u;
 const DIAG_LEAF_MARCH: u32 = 33u;
 const DIAG_NEAR_CALLS: u32 = 34u;
+const DIAG_BVH_NODES: u32 = 35u;
+const DIAG_FAR_ITERS: u32 = 36u;
+const DIAG_FAR_TRACES: u32 = 37u;
 fn diag_ray(origin: vec3<f32>, dir: vec3<f32>) -> bool {
   return LOD_DIAG == 1u && ((bitcast<u32>(origin.x) ^ bitcast<u32>(dir.z)) & 63u) == 0u;
 }

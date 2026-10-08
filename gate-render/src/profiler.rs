@@ -140,6 +140,8 @@ struct PassReport {
   frames: u32,
   frames_empty: u32,
   last: Option<std::time::Instant>,
+  span_acc: f64,
+  span_n: u32,
 }
 
 #[cfg(feature = "profile")]
@@ -148,12 +150,20 @@ impl PassReport {
     if results.is_empty() {
       self.frames_empty += 1;
     }
+    let mut lo = f64::MAX;
+    let mut hi = f64::MIN;
     for r in results {
       if let Some(t) = &r.time {
         let e = self.acc.entry(r.label.clone()).or_insert((0.0, 0));
-        e.0 += t.end - t.start;
+        e.0 += (t.end - t.start) as f64;
         e.1 += 1;
+        lo = lo.min(t.start as f64);
+        hi = hi.max(t.end as f64);
       }
+    }
+    if hi > lo {
+      self.span_acc += hi - lo;
+      self.span_n += 1;
     }
     self.frames += 1;
     let now = std::time::Instant::now();
@@ -169,10 +179,16 @@ impl PassReport {
       total += ms;
       line.push_str(&format!("{label}={ms:.2}ms/{n} "));
     }
-    bevy::log::info!("GPU 逐 pass 均值（共 {total:.2}ms/frame）：{line}");
+    let span = if self.span_n > 0 { self.span_acc / self.span_n as f64 * 1000.0 } else { 0.0 };
+    bevy::log::info!(
+      "GPU 逐 pass 均值（共 {total:.2}ms/frame；整帧跨度 head→tail {span:.2}ms；跨度内未计 pass 残差 {:.2}ms）：{line}",
+      (span - total).max(0.0)
+    );
     self.acc.clear();
     self.frames = 0;
     self.frames_empty = 0;
+    self.span_acc = 0.0;
+    self.span_n = 0;
     self.last = Some(now);
   }
 }
@@ -215,6 +231,26 @@ pub(crate) fn gpu_compute_pass<T>(
   let mut pass =
     encoder.begin_compute_pass(&ComputePassDescriptor { label: Some(label), ..default() });
   body(&mut pass)
+}
+
+pub(crate) fn gpu_encoder_scope<T>(
+  res: &mut GpuProfilerRes,
+  encoder: &mut CommandEncoder,
+  label: &str,
+  mut body: impl FnMut(&mut CommandEncoder) -> T,
+) -> T {
+  #[cfg(feature = "profile")]
+  if let Some(p) = res.profiler.as_ref() {
+    let q = p.begin_query(label, encoder);
+    let out = body(encoder);
+    p.end_query(encoder, q);
+    return out;
+  }
+  #[cfg(not(feature = "profile"))]
+  {
+    let _ = (res, label);
+  }
+  body(encoder)
 }
 
 #[derive(bevy::ecs::schedule::ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
@@ -548,10 +584,14 @@ fn report_lod_diag(
   }
   let calls = (d[34]).max(1) as f32;
   info!(
-    "DIAG[近场射线 {} 条（1/64 采样）| 叶条目 {:.2}/条 实际 march {:.2}/条]",
+    "DIAG[近场射线 {} 条（1/64 采样）| 叶条目 {:.2}/条 实际 march {:.2}/条 | \
+     节点 {:.2}/条 | far 迭代 {:.2}/条 实追 {:.2}/条]",
     d[34],
     d[32] as f32 / calls,
     d[33] as f32 / calls,
+    d[35] as f32 / calls,
+    d[36] as f32 / calls,
+    d[37] as f32 / calls,
   );
 }
 

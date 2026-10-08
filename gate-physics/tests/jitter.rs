@@ -1,6 +1,3 @@
-//
-//
-//
 use gate_physics::{
   Field, PhysicsWorld, Probe, StepConfig, chunk_of, manifold_bounded, tight_bounds, world_aabb_of,
 };
