@@ -132,10 +132,10 @@ pub(crate) fn toggle_mouse_lock(
 pub(crate) fn apply_mouse_lock(
   lock: Res<MouseLock>,
   mode: Res<CameraMode>,
-  mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+  mut cursor: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
 ) {
-  let want = lock.0 && *mode == CameraMode::Fly;
-  let Ok(mut cursor) = cursor.single_mut() else { return };
+  let Ok((window, mut cursor)) = cursor.single_mut() else { return };
+  let want = lock.0 && *mode == CameraMode::Fly && window.focused;
   let (visible, grab) =
     if want { (false, CursorGrabMode::Confined) } else { (true, CursorGrabMode::None) };
   if cursor.visible != visible || cursor.grab_mode != grab {

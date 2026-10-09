@@ -196,16 +196,21 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
       continue;
     }
     let gi = make_grid(inst_bvh[far_base + k]);
+    let shell_cap = level_cap(*shell, dir);
+    var t_lo = t_min;
+    if (origin_xz < *shell) {
+      t_lo = max(t_min, shell_cap);
+    }
     var t_hi = min(*best_t, t_cap);
     if (gi.coverage_r > 0.0) {
       t_hi = min(t_hi, level_cap(gi.coverage_r, dir));
     }
-    if (t_min >= t_hi) {
+    if (t_lo >= t_hi) {
       *shell = max(*shell, coverage_r_of(gi));
       continue;
     }
     traces = traces + 1u;
-    let mhi = trace_grid(gi, origin, dir, t_hi, t_min, depth_cap, false, req, mc, gap);
+    let mhi = trace_grid(gi, origin, dir, t_hi, t_lo, depth_cap, false, req, mc, gap);
     if (mhi.hit && mhi.t < *best_t) {
       *best_t = mhi.t;
       (*best).uh = mhi;
