@@ -10,8 +10,35 @@ use crate::camera::{CameraMode, CameraPose, FlyCamera};
 
 pub const CONFIG_PATH: &str = "config.toml";
 
+pub fn name() -> String {
+  match crate::consts::bench_config_tag() {
+    Some(tag) => format!("config.{tag}.toml"),
+    None => CONFIG_PATH.to_owned(),
+  }
+}
+
 pub fn path() -> PathBuf {
+  gate_render::data_dir().join(name())
+}
+
+fn base_path() -> PathBuf {
   gate_render::data_dir().join(CONFIG_PATH)
+}
+
+fn write_text(path: &std::path::Path, src: &str) -> bool {
+  if let Some(dir) = path.parent()
+    && let Err(e) = std::fs::create_dir_all(dir)
+  {
+    warn!("config 目录创建失败 {e} → 未写入");
+    return false;
+  }
+  match std::fs::write(path, src) {
+    Ok(()) => true,
+    Err(e) => {
+      warn!("config 写入失败 {e}");
+      false
+    }
+  }
 }
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug, Default)]
@@ -28,8 +55,17 @@ impl Config {
     let src = match std::fs::read_to_string(&path) {
       Ok(s) => s,
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-        info!("config 无 {} → 缺省", path.display());
-        return Self::default();
+        let name = name();
+        let Some(seed) =
+          (name != CONFIG_PATH).then(|| std::fs::read_to_string(base_path()).ok()).flatten()
+        else {
+          info!("config 无 {} → 缺省", path.display());
+          return Self::default();
+        };
+        if write_text(&path, &seed) {
+          info!("config[{}] 无 → 复制 {} 建文件", name, CONFIG_PATH);
+        }
+        seed
       }
       Err(e) => {
         warn!("config 读取失败 {e} → 缺省");
@@ -54,15 +90,8 @@ impl Config {
       warn!("config 序列化失败 → 未保存");
       return;
     };
-    if let Some(dir) = path.parent()
-      && let Err(e) = std::fs::create_dir_all(dir)
-    {
-      warn!("config 目录创建失败 {e} → 未保存");
-      return;
-    }
-    match std::fs::write(&path, src) {
-      Ok(()) => debug!("config → {}", path.display()),
-      Err(e) => warn!("config 写入失败 {e}"),
+    if write_text(&path, &src) {
+      debug!("config → {}", path.display());
     }
   }
 }

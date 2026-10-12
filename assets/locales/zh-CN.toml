@@ -389,14 +389,6 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 1000 体压测里这是最大的一项开销，减半等于省一半求解时间。
 """
 "menu.game.phys.rate" = "物理步频"
-"menu.game.phys.rate.60" = "60"
-"menu.game.phys.rate.30" = "30"
-"menu.game.phys.rate.20" = "20"
-"menu.game.phys.rate.tip" = """
-物理每秒推进多少个固定步（**Hz**）。**60** 是实时满速。
-
-降到 **30** 等于每两帧推进一步：每帧物理开销减半，代价是仿真按**半速**走。
-"""
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
 "menu.camera.pos.value" = "%{v}"

@@ -9,9 +9,11 @@ use crate::edit::{BrushMaterial, BrushShape, Burst};
 
 const STATIC_MARGIN: f32 = 32.0;
 const FIXED_DT: f32 = 1.0 / 60.0;
-const MAX_STEPS_PER_FRAME: u32 = 1;
+const FIXED_HZ: f32 = 1.0 / FIXED_DT;
 pub const PHYS_SUBSTEPS: [u32; 4] = [4, 8, 16, 32];
-pub const PHYS_RATE_HZ: [u32; 3] = [60, 30, 20];
+pub const PHYS_RATE_HZ_DEFAULT: f32 = 20.0;
+pub const PHYS_RATE_HZ_MIN: f32 = 1.0;
+pub const PHYS_RATE_HZ_MAX: f32 = 240.0;
 const PHYS_SUBSTEPS_DEFAULT: usize = 1;
 
 #[derive(Resource)]
@@ -19,14 +21,14 @@ pub struct PhysicsState {
   pub world: PhysicsWorld,
   pub cfg: StepConfig,
   static_ready: bool,
-  accumulator: f32,
+  tick_frame: u32,
   last_penetration: f32,
   last_contacts: usize,
   last_pairs: usize,
   last_split: (u32, usize),
   last_mix: (usize, usize, usize),
   last_profile: gate_physics::StepProfile,
-  pub tick_div: u32,
+  pub tick_hz: f32,
 }
 
 impl Default for PhysicsState {
@@ -42,14 +44,14 @@ impl Default for PhysicsState {
         ..StepConfig::default()
       },
       static_ready: false,
-      accumulator: 0.0,
+      tick_frame: 0,
       last_penetration: 0.0,
       last_contacts: 0,
       last_pairs: 0,
       last_split: (0, 0),
       last_mix: (0, 0, 0),
       last_profile: gate_physics::StepProfile::default(),
-      tick_div: 1,
+      tick_hz: PHYS_RATE_HZ_DEFAULT,
     }
   }
 }
@@ -101,7 +103,7 @@ impl PhysicsState {
   pub fn reset(&mut self) {
     self.world = PhysicsWorld::new();
     self.static_ready = false;
-    self.accumulator = 0.0;
+    self.tick_frame = 0;
   }
 }
 
@@ -139,7 +141,6 @@ pub(crate) fn follow_view(
 }
 
 pub(crate) fn step_physics(
-  time: Res<Time>,
   mut st: ResMut<PhysicsState>,
   scene: Option<ResMut<VoxelScene>>,
   mut diag: Local<(f64, u32)>,
@@ -148,28 +149,24 @@ pub(crate) fn step_physics(
   let _t = gate_render::profiler::SysTimer::new("PHYS 求解", &mut diag);
   let Some(mut scene) = scene else { return };
   if !st.static_ready || st.live_bodies() == 0 {
-    st.accumulator = 0.0;
+    st.tick_frame = 0;
     return;
   }
-  let div = st.tick_div.max(1);
-  st.accumulator =
-    (st.accumulator + time.delta_secs() / div as f32).min(FIXED_DT * MAX_STEPS_PER_FRAME as f32);
-  let mut steps = 0u32;
-  while st.accumulator >= FIXED_DT {
+  let every = (FIXED_HZ / st.tick_hz).round().clamp(1.0, FIXED_HZ) as u32;
+  st.tick_frame = st.tick_frame.wrapping_add(1);
+  if !st.tick_frame.is_multiple_of(every) {
+    return;
+  }
+  let stats = {
     let PhysicsState { world, cfg, .. } = &mut *st;
-    let stats = world.step(&scene.volumes, FIXED_DT, cfg);
-    st.accumulator -= FIXED_DT;
-    st.last_penetration = stats.max_penetration;
-    st.last_contacts = stats.contacts;
-    st.last_pairs = stats.pairs;
-    st.last_split = (stats.subdiv, stats.reused_contacts);
-    st.last_mix = (stats.corner_contacts, stats.edge_contacts, stats.lateral_contacts);
-    st.last_profile = stats.profile;
-    steps += 1;
-  }
-  if steps == 0 {
-    return;
-  }
+    world.step(&scene.volumes, FIXED_DT, cfg)
+  };
+  st.last_penetration = stats.max_penetration;
+  st.last_contacts = stats.contacts;
+  st.last_pairs = stats.pairs;
+  st.last_split = (stats.subdiv, stats.reused_contacts);
+  st.last_mix = (stats.corner_contacts, stats.edge_contacts, stats.lateral_contacts);
+  st.last_profile = stats.profile;
   *dbg_n += 1;
   if st.cfg.profile && *dbg_n % 30 == 0 {
     let p = st.last_profile;
@@ -200,20 +197,51 @@ pub(crate) fn step_physics(
 }
 
 pub(crate) fn register_callbacks(world: &mut World) {
-  world.add_observer(|ev: On<gate_ui::MenuActionEvent>, mut st: ResMut<PhysicsState>| {
-    match (ev.path.as_str(), &ev.action) {
-      ("game/phys/substeps", gate_ui::MenuAction::Select(i)) => {
-        st.cfg.substeps = PHYS_SUBSTEPS.get(*i).copied().unwrap_or(st.cfg.substeps);
-        info!(target: "gate", "PHYS[cfg] 子步 → {}", st.cfg.substeps);
+  world.add_observer(
+    |ev: On<gate_ui::MenuActionEvent>,
+     mut st: ResMut<PhysicsState>,
+     mut q_menu: Query<&mut gate_ui::DebugMenu>,
+     mut q_rate: Query<(&gate_ui::menu::MenuItem, &mut gate_ui::TextInputValue)>| {
+      match (ev.path.as_str(), &ev.action) {
+        ("game/phys/substeps", gate_ui::MenuAction::Select(i)) => {
+          st.cfg.substeps = PHYS_SUBSTEPS.get(*i).copied().unwrap_or(st.cfg.substeps);
+          info!(target: "gate", "PHYS[cfg] 子步 → {}", st.cfg.substeps);
+        }
+        ("game/phys/rate", gate_ui::MenuAction::Text(t)) => {
+          let parsed = t
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v.clamp(PHYS_RATE_HZ_MIN, PHYS_RATE_HZ_MAX));
+          let hz = parsed.unwrap_or(PHYS_RATE_HZ_DEFAULT);
+          st.tick_hz = hz;
+          if parsed.is_none() {
+            warn!(
+              target: "gate",
+              "PHYS[cfg] 步频输入未成形 {t:?} → 默认 {hz:.0} Hz",
+            );
+          }
+          let text = format!("{hz:.0}");
+          for (item, mut tv) in &mut q_rate {
+            if item.path == "game/phys/rate" && tv.0 != text {
+              tv.0 = text.clone();
+            }
+          }
+          if let Ok(mut menu) = q_menu.single_mut()
+            && let Some(gate_ui::MenuNode::Input { fields, .. }) =
+              menu.model.node_mut(&["game".to_string(), "phys".to_string(), "rate".to_string()])
+            && let Some(f) = fields.first_mut()
+            && f.text != text
+          {
+            f.text = text;
+          }
+          info!(target: "gate", "PHYS[cfg] 步频 → {hz:.0} Hz");
+        }
+        _ => {}
       }
-      ("game/phys/rate", gate_ui::MenuAction::Select(i)) => {
-        let hz = PHYS_RATE_HZ.get(*i).copied().unwrap_or(PHYS_RATE_HZ[0]);
-        st.tick_div = (60 / hz).max(1);
-        info!(target: "gate", "PHYS[cfg] 步频 → {hz} Hz");
-      }
-      _ => {}
-    }
-  });
+    },
+  );
 }
 
 pub(crate) fn selftest(

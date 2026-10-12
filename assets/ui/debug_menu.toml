@@ -819,16 +819,17 @@ selected = 1
 tooltip = "menu.game.phys.substeps.tip"
 
 [[items.children.children]]
-kind = "dropdown"
+kind = "input"
 id = "rate"
 label = "menu.game.phys.rate"
-options = [
-    "menu.game.phys.rate.60",
-    "menu.game.phys.rate.30",
-    "menu.game.phys.rate.20",
-]
-selected = 0
-tooltip = "menu.game.phys.rate.tip"
+
+[[items.children.children.fields]]
+label = ""
+text = "20"
+min = 1.0
+max = 240.0
+step = 10.0
+decimals = 0
 
 [[items]]
 kind = "sub_menu"

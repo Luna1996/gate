@@ -23,6 +23,21 @@ pub fn bench_fly() -> bool {
   })
 }
 
+pub fn bench_config_tag() -> Option<&'static str> {
+  static TAG: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+  *TAG.get_or_init(|| {
+    if phys_pile() {
+      Some("pile")
+    } else if bench_fly() {
+      Some("fly")
+    } else if bench_orbit() {
+      Some("orbit")
+    } else {
+      None
+    }
+  })
+}
+
 pub fn phys_threads() -> Option<usize> {
   static ON: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
   *ON.get_or_init(|| std::env::var("GATE_PHYS_THREADS").ok().and_then(|v| v.parse().ok()))
