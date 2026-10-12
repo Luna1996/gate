@@ -5,7 +5,7 @@ import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_sur
 import package::gi::ray::{gi_ray_radiance};
 import package::gi::wal::{gi_wal_merge, gi_wal_sample};
 import package::trace::{make_grid};
-import package::world::{WorldHit, surface_offset, voxel_normal};
+import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal};
 
 fn diag_texel_sampled(coord: vec2<i32>) -> bool {
   return ((((u32(coord.x) * 73856093u) ^ (u32(coord.y) * 19349663u)) & 63u) == 0u);
@@ -149,8 +149,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   }
 
   let gg = make_grid(u32(h.obj_id) + 1u);
-  let vc = vec3<f32>(h.voxel) + vec3<f32>(0.5);
-  let p_voxel = gg.pos + vec3<f32>(dot(vc, gg.col0), dot(vc, gg.col1), dot(vc, gg.col2)) * gg.scale;
+  let p_voxel = voxel_center_world(gg, h.voxel);
             let n = voxel_normal(gg, h.voxel, h.face_id, h.n);
       let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
   let org = p_voxel + n * n_off;

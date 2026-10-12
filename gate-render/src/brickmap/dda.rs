@@ -690,7 +690,11 @@ pub(crate) fn init_dda_pipelines(
     "DdaBg2",
     &BindGroupLayoutEntries::sequential(
       ShaderStages::COMPUTE,
-      (storage_buffer_read_only_sized(false, None), storage_buffer_read_only_sized(false, None)),
+      (
+        storage_buffer_read_only_sized(false, None),
+        storage_buffer_read_only_sized(false, None),
+        storage_buffer_read_only_sized(false, None),
+      ),
     ),
   );
 
@@ -1256,6 +1260,7 @@ pub(crate) fn prepare_dda_bind_groups(
     &BindGroupEntries::sequential((
       gpu.grid_descs_buf.as_entire_binding(),
       gpu.inst_bvh_buf.as_entire_binding(),
+      gpu.obj_pose_rev_buf.as_entire_binding(),
     )),
   );
 
@@ -1617,6 +1622,35 @@ pub(crate) fn dispatch_dda(
         "gate_dda_face_accum",
         |pass| {
           pass.set_pipeline(accum_pipe);
+          pass.set_bind_group(0, &bg0.0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          if let Some(gi_read) = aux.gi_read_bg.as_ref() {
+            pass.set_bind_group(5, gi_read, &[]);
+          }
+          if let Some(fog_read) = fog_read {
+            pass.set_bind_group(6, fog_read, &[]);
+          }
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
+  }
+
+  if gi.as_ref().is_some_and(|g| g.enabled)
+    && let Some(aux) = aux.as_ref()
+  {
+    let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
+    let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+    if let Some(face_pipe) = pipeline_cache.get_compute_pipeline(pipelines.face_pipeline) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_face",
+        |pass| {
+          pass.set_pipeline(face_pipe);
           pass.set_bind_group(0, &bg0.0, &[]);
           pass.set_bind_group(1, &bg1.0, &[]);
           pass.set_bind_group(2, &bg2.0, &[]);

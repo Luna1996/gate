@@ -850,7 +850,7 @@ fn make_grid(idx: u32) -> Grid {
   var pos = vec3<f32>(0.0);
   var scale = 1.0;
   if (!is_world) {
-    col0 = d.rot0.xyz;          col1 = d.rot1.xyz;
+            col0 = d.rot0.xyz;          col1 = d.rot1.xyz;
     col2 = d.rot2.xyz;
     pos = d.pos_scale.xyz;      scale = d.pos_scale.w;
   }

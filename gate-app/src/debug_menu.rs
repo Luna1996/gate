@@ -146,7 +146,17 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   crate::objects::register_callbacks(world);
   crate::physics::register_callbacks(world);
   apply_initial_state(world, handle.root);
+  apply_env_overrides(world);
   spawn_fps_overlay(world, &ctx);
+}
+
+fn apply_env_overrides(world: &mut World) {
+  if let Some(on) = crate::consts::gi_force()
+    && let Some(mut gi) = world.get_resource_mut::<gate_render::gi::GiSettings>()
+  {
+    gi.enabled = on;
+    info!(target: "gate", "GI → {}（GATE_GI 覆写）", if on { "on" } else { "off" });
+  }
 }
 
 pub(crate) fn sync_ui_locale(mut translator: ResMut<UiTranslator>, mut last: Local<String>) {

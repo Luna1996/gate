@@ -17,6 +17,10 @@ use super::wire::{
 use crate::pbr_texture::{METAL_DEMO_ID, PbrTextureSet, build_material_asset_table};
 use glam::{IVec3, UVec3};
 
+pub const POSE_REV_SLOTS: usize = 8192;
+
+const POSE_MOVE_EPS2: f32 = 1e-8;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BindingLimits {
   pub max_storage_buffer_binding_size: u64,
@@ -205,6 +209,12 @@ pub struct BuilderMirror {
   pub palette_content_versions: Vec<u64>,
   pub pending_comp_chunks: Vec<(usize, gate_voxel::ChunkCoord)>,
   pub pending_transforms: bool,
+
+  pub prev_obj_transforms: Vec<gate_voxel::VolumeTransform>,
+
+  pub obj_pose_rev: Vec<u32>,
+
+  pub pose_rev_dirty: bool,
 }
 
 #[derive(Resource, Clone)]
@@ -212,6 +222,8 @@ pub struct UploadSnapshot {
   pub volumes: VolumesSnapshot,
   pub state_bytes: Vec<u8>,
   pub comp_chunks: usize,
+
+  pub obj_pose_rev: Vec<u32>,
 }
 
 #[derive(Resource)]
@@ -251,6 +263,8 @@ pub struct GpuBrickMap {
   pub grid_descs_buf: Buffer,
   pub grid_descs_count: u32,
   pub inst_bvh_buf: Buffer,
+
+  pub obj_pose_rev_buf: Buffer,
   pub globals: UniformBuffer<BrickMapGlobals>,
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
@@ -358,6 +372,13 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     mapped_at_creation: false,
   });
 
+  let obj_pose_rev = device.create_buffer(&BufferDescriptor {
+    label: Some("gate_obj_pose_rev"),
+    size: (POSE_REV_SLOTS * 4) as u64,
+    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    mapped_at_creation: false,
+  });
+
   commands.insert_resource(GpuBrickMap {
     struct_buf: make("gate_struct"),
     struct_buf_p1: make("gate_struct_p1"),
@@ -372,6 +393,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     grid_descs_buf: make("gate_grid_descs"),
     grid_descs_count: 0,
     inst_bvh_buf: make("gate_inst_bvh"),
+    obj_pose_rev_buf: obj_pose_rev,
     globals,
     main_window_origin: IVec3::ZERO,
     main_window_dims: UVec3::ZERO,
@@ -429,6 +451,33 @@ fn extract(
     std::mem::take(&mut mirror.pending_comp_chunks);
   let need_full = first || pending_full || !budget.incremental;
   let transforms_moved = std::mem::take(&mut mirror.pending_transforms);
+
+  {
+    let n = scene.volumes.list.len().min(POSE_REV_SLOTS);
+    if mirror.obj_pose_rev.len() < n {
+      mirror.obj_pose_rev.resize(n, 0);
+      mirror.prev_obj_transforms.resize(n, gate_voxel::VolumeTransform::IDENTITY);
+      mirror.pose_rev_dirty = true;
+    }
+    for i in 1..n {
+      let Some(g) = scene.volumes.list.get(i) else { break };
+      if g.is_far_level() {
+        continue;
+      }
+      let tr = g.transform();
+      let prev = mirror.prev_obj_transforms[i];
+      let moved = (tr.pos - prev.pos).length_squared() > POSE_MOVE_EPS2
+        || (tr.scale - prev.scale) * (tr.scale - prev.scale) > POSE_MOVE_EPS2
+        || (tr.rot.x_axis - prev.rot.x_axis).length_squared() > POSE_MOVE_EPS2
+        || (tr.rot.y_axis - prev.rot.y_axis).length_squared() > POSE_MOVE_EPS2
+        || (tr.rot.z_axis - prev.rot.z_axis).length_squared() > POSE_MOVE_EPS2;
+      if moved {
+        mirror.obj_pose_rev[i] = mirror.obj_pose_rev[i].wrapping_add(1);
+        mirror.prev_obj_transforms[i] = tr;
+        mirror.pose_rev_dirty = true;
+      }
+    }
+  }
 
   resid.edited.clear();
   resid.edited.extend(pending_data.iter().filter(|(v, ..)| *v == 0).map(|(_, c, _)| *c));
@@ -492,7 +541,7 @@ fn extract(
   });
   let builder_dirty = mirror.builder.as_ref().is_some_and(VolumesBuilder::has_dirty);
 
-  if !dirty_any && !window_moved && !builder_dirty && !transforms_moved {
+  if !dirty_any && !window_moved && !builder_dirty && !transforms_moved && !mirror.pose_rev_dirty {
     sd.mark(0);
     sd.frame_end("EXTRACT");
     return;
@@ -532,7 +581,17 @@ fn extract(
 
   let state_bytes = volumes_ref.main().state_table_bytes().to_vec();
   let comp_chunks = volumes_ref.main().comp_layer().len();
-  commands.insert_resource(UploadSnapshot { volumes: snapshot, state_bytes, comp_chunks });
+  let obj_pose_rev = if std::mem::take(&mut mirror.pose_rev_dirty) {
+    mirror.obj_pose_rev.clone()
+  } else {
+    Vec::new()
+  };
+  commands.insert_resource(UploadSnapshot {
+    volumes: snapshot,
+    state_bytes,
+    comp_chunks,
+    obj_pose_rev,
+  });
   sd.mark(6);
   sd.frame_end("EXTRACT");
 }
@@ -888,6 +947,16 @@ pub(crate) fn prepare(
       &mut profiler,
     );
     queue.write_buffer(&gpu.inst_bvh_buf, 0, bvh_bytes);
+  }
+
+  if !snap.obj_pose_rev.is_empty() {
+    let bytes = u8_of_u32(&snap.obj_pose_rev);
+    queue.write_buffer(&gpu.obj_pose_rev_buf, 0, bytes);
+    let tail = POSE_REV_SLOTS * 4 - bytes.len();
+    if tail > 0 {
+      static ZEROS: [u8; POSE_REV_SLOTS * 4] = [0u8; POSE_REV_SLOTS * 4];
+      queue.write_buffer(&gpu.obj_pose_rev_buf, bytes.len() as u64, &ZEROS[..tail]);
+    }
   }
 
   {

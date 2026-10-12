@@ -55,6 +55,17 @@ pub fn phys_pile_count() -> usize {
   })
 }
 
+pub fn gi_force() -> Option<bool> {
+  static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| {
+    std::env::var("GATE_GI").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+      "1" | "on" | "true" => Some(true),
+      "0" | "off" | "false" => Some(false),
+      _ => None,
+    })
+  })
+}
+
 pub const BENCH_FLY_SPEED: f32 = 2000.0;
 pub const BENCH_FLY_TURN: f32 = 0.16;
 pub const BENCH_FLY_YAW: f32 = 0.35;

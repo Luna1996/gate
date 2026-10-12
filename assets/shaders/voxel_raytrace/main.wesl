@@ -1,8 +1,8 @@
 import package::bindings::{BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_COL, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_SUN, FACE_W_TEXEL, face_slot_claim, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_BAKED_BIT, FACE_WORDS, FACE_W_COL, FACE_W_FACE, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_SUN, FACE_W_TEXEL, face_slot_claim, face_slot_color, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, SHADOW_SURFACE_EPS};
-import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
+import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_pool, GI_WAL_MATURE_N};
@@ -298,9 +298,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
     let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
     let hamb = sky * GI_SKY_AMBIENT;
     let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
-    let h_off = 0.5 / max(max(abs(hn.x), abs(hn.y)), max(abs(hn.z), 1e-3))
-              + SHADOW_SURFACE_EPS;
-    let h_start = h.point + hn * h_off;
+    let h_start = h.point + hn * surface_offset(hgg, hn, SHADOW_SURFACE_EPS);
     var h_vis = vec3<f32>(1.0);
     
     if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
@@ -493,6 +491,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
 }
 
 const GI_FACE_FALLBACK: u32 = 1u;
+
+const GI_SUN_BORROW: u32 = 1u;
 const DIAG_FACE_EXACT: u32 = 3u;    
 const DIAG_FACE_FB_HIT: u32 = 4u;   
 const DIAG_FACE_FB_NOKEY: u32 = 5u; 
@@ -592,9 +592,60 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
     }
   }
   var col = vec3<f32>(0.0);
-  if (diag_on && first.hit) { atomicAdd(&lod_diag[DIAG_FACE_INLINE], 1u); }
-  if (diag_on && !first.hit) { atomicAdd(&lod_diag[DIAG_FACE_SKY], 1u); }
   var sun_io = -1.0;
+  var borrowed = false;
+  var fb_tried = false;
+  var fb_nokey = false;
+  if (GI_SUN_BORROW == 1u && first.hit && gi_u.misc.x > 0.5
+      && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+    let sk0 = gi_key0(first.voxel, first.obj_id);
+    let sk1 = gi_key1(first.voxel, first.face_id, first.obj_id);
+        var fok = false;
+    let s = face_slot_find(sk0, gi_vox_k1(sk1), &fok);
+    if (fok) {
+      let fe = s * FACE_WORDS;
+      if (atomicLoad(&face_slots[fe + FACE_W_FACE]) == (first.face_id | FACE_BAKED_BIT)) {
+        sun_io = bitcast<f32>(atomicLoad(&face_slots[fe + FACE_W_SUN]));
+        borrowed = true;
+      }
+    }
+                        if (!borrowed && GI_FACE_FALLBACK == 1u) {
+      fb_tried = true;
+      var gk = vec2<u32>(0u, 0u);
+      var gbo = 0u;
+      if (gi_cover_key(px, &gk, &gbo)) {
+        if (gi_den_same_plane(gk.x, gk.y, sk0, sk1)) {
+          let gf = (gk.y >> 16u) & 7u;
+          var fok2 = false;
+          let s2 = face_slot_find(gk.x, gi_vox_k1(gk.y), &fok2);
+          if (fok2) {
+            let fe2 = s2 * FACE_WORDS;
+            if (atomicLoad(&face_slots[fe2 + FACE_W_FACE]) == (gf | FACE_BAKED_BIT)
+                && atomicLoad(&face_slots[fe2 + FACE_W_PAL]) == first.pal
+                && (!need_n || gi_guide_out[gbo + GI_DEN_G_NRM] == gi_pack_dir(n_own))) {
+              sun_io = bitcast<f32>(atomicLoad(&face_slots[fe2 + FACE_W_SUN]));
+              borrowed = true;
+            }
+          }
+        }
+      } else {
+        fb_nokey = true;
+      }
+    }
+  }
+  if (diag_on && first.hit) {
+    if (borrowed) {
+      atomicAdd(&lod_diag[select(DIAG_FACE_FB_HIT, DIAG_FACE_EXACT, !fb_tried)], 1u);
+    } else {
+      if (fb_tried && fb_nokey) {
+        atomicAdd(&lod_diag[DIAG_FACE_FB_NOKEY], 1u);
+      } else if (fb_tried) {
+        atomicAdd(&lod_diag[DIAG_FACE_FB_MISS], 1u);
+      }
+      atomicAdd(&lod_diag[DIAG_FACE_INLINE], 1u);
+    }
+  }
+  if (diag_on && !first.hit) { atomicAdd(&lod_diag[DIAG_FACE_SKY], 1u); }
   col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                    GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
                    n_own, need_n, &sun_io);
@@ -705,7 +756,7 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if ((k0 | k1) == 0u) { return; }
   let g_nrm = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
   var ok = false;
-  let slot = face_slot_find(k0, k1, &ok);
+      let slot = face_slot_find(k0, gi_vox_k1(k1), &ok);
   if (!ok) { return; }
   let fe = slot * FACE_WORDS;
   if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
@@ -781,6 +832,7 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                        GiInput(true, gi_avg, select(0.0, 1.0, gi_n > 0u), gi_uv),
                        sun_dir, sky, sun_c, g_nrm, true, &sun_io);
   atomicStore(&face_slots[fe + FACE_W_SUN], bitcast<u32>(sun_io));
+  atomicStore(&face_slots[fe + FACE_W_FACE], face_id | FACE_BAKED_BIT);
   atomicStore(&face_slots[fe + FACE_W_COL], bitcast<u32>(col.x));
   atomicStore(&face_slots[fe + FACE_W_COL + 1u], bitcast<u32>(col.y));
   atomicStore(&face_slots[fe + FACE_W_COL + 2u], bitcast<u32>(col.z));
@@ -869,7 +921,7 @@ fn gi_face_flatten(@builtin(global_invocation_id) gid: vec3<u32>) {
   
   if ((k0 | k1) == 0u) { return; }
   var ok = false;
-  let slot = face_slot_find_flat(k0, k1, &ok);
+      let slot = face_slot_find_flat(k0, gi_vox_k1(k1), &ok);
   if (!ok) { return; }
   let fe = slot * FACE_WORDS;
   let n = atomicLoad(&face_slots_flat[fe + FACE_W_RAW_N]);

@@ -1,4 +1,4 @@
-import package::bindings::{face_slots, face_slots_flat, gi_region_rev, gi_sec_slots};
+import package::bindings::{face_slots, face_slots_flat, gi_region_rev, gi_sec_slots, obj_pose_rev};
 
 import package::bindings::{grid_descs};
 import package::common::{CHUNK_SIZE};
@@ -14,6 +14,13 @@ fn gi_key_org(obj: i32) -> vec3<i32> {
   return (o / q) * q;
 }
 
+fn gi_pose_salt(obj: i32) -> u32 {
+  if (obj < 0) { return 0u; }
+  let i = u32(obj + 1);
+  if (i >= arrayLength(&obj_pose_rev)) { return 0u; }
+  return gi_mix(obj_pose_rev[i] * 0x9E3779B1u + 0x85EBCA77u) & 0xFFFFu;
+}
+
 fn gi_key_ok(v_world: vec3<i32>, obj: i32) -> bool {
   let v = v_world - gi_key_org(obj);
   return all(v > vec3<i32>(-GI_KEY_LIMIT)) && all(v < vec3<i32>(GI_KEY_LIMIT));
@@ -21,20 +28,23 @@ fn gi_key_ok(v_world: vec3<i32>, obj: i32) -> bool {
 
 fn gi_key0(v_world: vec3<i32>, obj: i32) -> u32 {
   let v = v_world - gi_key_org(obj);
-  return (u32(v.x + 32768) & 0xFFFFu) | ((u32(v.y + 32768) & 0xFFFFu) << 16u);
+  return ((u32(v.x + 32768) & 0xFFFFu) | ((u32(v.y + 32768) & 0xFFFFu) << 16u))
+    ^ gi_pose_salt(obj);
 }
 
 fn gi_key1(v_world: vec3<i32>, face: u32, obj: i32) -> u32 {
   let v = v_world - gi_key_org(obj);
-  return (u32(v.z + 32768) & 0xFFFFu)
+  return ((u32(v.z + 32768) & 0xFFFFu)
     | ((face & 7u) << 16u)
-    | ((u32(obj + 1) & 0x1FFFu) << 19u);
+    | ((u32(obj + 1) & 0x1FFFu) << 19u))
+    ^ gi_pose_salt(obj);
 }
 
 fn gi_unkey_voxel(k0: u32, k1: u32, obj: i32) -> vec3<i32> {
-  return vec3<i32>(i32(k0 & 0xFFFFu) - 32768,
-                   i32((k0 >> 16u) & 0xFFFFu) - 32768,
-                   i32(k1 & 0xFFFFu) - 32768) + gi_key_org(obj);
+  let s = gi_pose_salt(obj);
+  return vec3<i32>(i32((k0 & 0xFFFFu) ^ s) - 32768,
+                   i32(((k0 >> 16u) & 0xFFFFu) ^ s) - 32768,
+                   i32((k1 & 0xFFFFu) ^ s) - 32768) + gi_key_org(obj);
 }
 
 const GI_REGION_CHUNKS: u32 = 8u;
@@ -94,7 +104,7 @@ fn gi_cos_hemisphere(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
   return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u.x, 0.0)));
 }
 
-const FACE_WORDS: u32 = 16u;
+const FACE_WORDS: u32 = 20u;
 const FACE_W_FLAG: u32 = 0u;
 const FACE_W_K0: u32 = 1u;
 const FACE_W_K1: u32 = 2u;
@@ -105,7 +115,11 @@ const FACE_W_GI_N: u32 = 8u;
 const FACE_W_GI: u32 = 9u;
 const FACE_W_RAW_N: u32 = 12u;
 const FACE_W_RAW: u32 = 13u;
-const FACE_W_SUN: u32 = 12u;
+
+const FACE_W_SUN: u32 = 16u;
+
+const FACE_W_FACE: u32 = 17u;
+const FACE_BAKED_BIT: u32 = 8u;
 const GI_ACC_SCALE: f32 = 4096.0;
 const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;

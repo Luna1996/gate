@@ -106,6 +106,8 @@ struct GridDesc {
 
 @group(2) @binding(1) var<storage, read> inst_bvh: array<u32>;
 
+@group(2) @binding(2) var<storage, read> obj_pose_rev: array<u32>;
+
 struct LightDesc {
   kind_pos_dir: vec4<f32>,    
   color_intensity: vec4<f32>, 

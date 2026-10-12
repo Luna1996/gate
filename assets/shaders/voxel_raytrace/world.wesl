@@ -43,8 +43,8 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> v
 }
 
 fn voxel_center_world(g: Grid, voxel: vec3<i32>) -> vec3<f32> {
-  let vc = vec3<f32>(voxel) + vec3<f32>(0.5);
-  return g.pos + vec3<f32>(dot(vc, g.col0), dot(vc, g.col1), dot(vc, g.col2)) * g.scale;
+  let vc = (vec3<f32>(voxel) + vec3<f32>(0.5)) * g.scale;
+  return g.pos + vc.x * g.col0 + vc.y * g.col1 + vc.z * g.col2;
 }
 
 fn surface_offset(g: Grid, n: vec3<f32>, eps: f32) -> f32 {
