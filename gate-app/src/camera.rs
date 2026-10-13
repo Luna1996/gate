@@ -112,7 +112,7 @@ pub struct MouseLock(pub bool);
 
 impl Default for MouseLock {
   fn default() -> Self {
-    Self(true)
+    Self(false)
   }
 }
 

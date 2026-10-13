@@ -363,6 +363,7 @@ pub(crate) struct DdaPipelines {
 
   eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
+  preview_pipeline: CachedComputePipelineId,
 
   pub(crate) face_pipeline: CachedComputePipelineId,
 
@@ -743,6 +744,13 @@ pub(crate) fn init_dda_pipelines(
   let dda_layouts_accum = dda_layouts.clone();
 
   let eye_layouts = vec![eye.clone(); 8];
+  let preview = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_preview")),
+    layout: dda_layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_preview")),
+    ..default()
+  });
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
     layout: dda_layouts,
@@ -842,6 +850,7 @@ pub(crate) fn init_dda_pipelines(
     blit_layout: blit,
     eye_layout: eye,
     compute_pipeline: compute,
+    preview_pipeline: preview,
     face_pipeline: face,
     face_accum_pipeline: face_accum,
     beam_pipeline: beam,
@@ -1457,6 +1466,21 @@ fn frame_bracket_tail(
   );
 }
 
+static WARM_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static WARM_BEAM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_DDA: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_GI: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_EYE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_DEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_FACE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn warm_mark(slot: &'static std::sync::OnceLock<()>, label: &str, ready: bool) {
+  if ready && slot.set(()).is_ok() {
+    let t0 = *WARM_T0.get_or_init(std::time::Instant::now);
+    bevy::log::info!(target: "gate", "WARM {label} 就绪 @{:.1}s", t0.elapsed().as_secs_f32());
+  }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_dda(
   mut ctx: RenderContext,
@@ -1476,6 +1500,7 @@ pub(crate) fn dispatch_dda(
   scale: Res<RenderScale>,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
 ) {
+  WARM_T0.get_or_init(std::time::Instant::now);
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
     (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref(), bg4.as_ref())
   else {
@@ -1488,6 +1513,28 @@ pub(crate) fn dispatch_dda(
     None
   });
   let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
+
+  warm_mark(&WARM_BEAM, "beam", beam_pipe.is_some());
+  warm_mark(&WARM_DDA, "dda_main", dda_pipe.is_some());
+  warm_mark(&WARM_GI, "gi", pipeline_cache.get_compute_pipeline(pipelines.gi_pipeline).is_some());
+  warm_mark(
+    &WARM_EYE,
+    "eye_hist",
+    pipeline_cache.get_compute_pipeline(pipelines.eye_histogram_pipeline).is_some(),
+  );
+  warm_mark(
+    &WARM_DEN,
+    "denoise1",
+    gi_gpu
+      .as_ref()
+      .and_then(|g| g.den_pipelines[1])
+      .is_some_and(|id| pipeline_cache.get_compute_pipeline(id).is_some()),
+  );
+  warm_mark(
+    &WARM_FACE,
+    "face",
+    pipeline_cache.get_compute_pipeline(pipelines.face_pipeline).is_some(),
+  );
 
   let fog_read = fog.read_bg.as_ref().and_then(|b| b.0.as_ref());
 
@@ -1684,29 +1731,29 @@ pub(crate) fn dispatch_dda(
     bevy::log::debug_once!("DDA dispatch: 光柱 group(6) 未就绪（本帧跳过主 pass）");
     return;
   }
-  if let Some(dda_pipe) = dda_pipe {
-    crate::profiler::gpu_compute_pass(
-      &mut profiler,
-      ctx.command_encoder(),
-      "gate_dda_trace",
-      |pass| {
-        pass.set_pipeline(dda_pipe);
-        pass.set_bind_group(0, &bg0.0, &[]);
-        pass.set_bind_group(1, &bg1.0, &[]);
-        pass.set_bind_group(2, &bg2.0, &[]);
-        pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, &bg4.0, &[]);
+  let (main_pipe, main_label) = if let Some(p) = dda_pipe {
+    (Some(p), "gate_dda_trace")
+  } else {
+    (pipeline_cache.get_compute_pipeline(pipelines.preview_pipeline), "gate_dda_preview")
+  };
+  if let Some(pipe) = main_pipe {
+    crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), main_label, |pass| {
+      pass.set_pipeline(pipe);
+      pass.set_bind_group(0, &bg0.0, &[]);
+      pass.set_bind_group(1, &bg1.0, &[]);
+      pass.set_bind_group(2, &bg2.0, &[]);
+      pass.set_bind_group(3, &bg3.0, &[]);
+      pass.set_bind_group(4, &bg4.0, &[]);
 
-        if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
-          pass.set_bind_group(5, gi_read, &[]);
-        }
+      if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+        pass.set_bind_group(5, gi_read, &[]);
+      }
 
-        if let Some(fog_read) = fog_read {
-          pass.set_bind_group(6, fog_read, &[]);
-        }
-        pass.dispatch_workgroups(gx, gy, 1);
-      },
-    );
+      if let Some(fog_read) = fog_read {
+        pass.set_bind_group(6, fog_read, &[]);
+      }
+      pass.dispatch_workgroups(gx, gy, 1);
+    });
   }
 
   if eye.as_ref().is_some_and(|e| e.settings.enabled)

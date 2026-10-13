@@ -79,6 +79,7 @@ const MATERIAL_FLAT_SHADING: u32 = 1u;
 const MATERIAL_TEX_WORLD_SCALE: f32 = 2.0;
 const MATERIAL_VOXEL_PER_METER: f32 = 50.0;
 const MATERIAL_TRIPLANAR_SHARPNESS: f32 = 4.0;
+const MATERIAL_TRIPLANAR_SINGLE_AXIS: u32 = 0u;
 const MATERIAL_MIN_ROUGHNESS: f32 = 0.05;
 const MATERIAL_DEFAULT_IOR: f32 = 1.5;
 const MATERIAL_DEBUG_NONE: u32 = 0xFFFFFFFFu;
@@ -108,8 +109,14 @@ fn triplanar_axis(slot: u32, uv: vec2<f32>, lod: f32) -> TriplanarSample {
 }
 
 fn triplanar_sample(slot: u32, p: vec3<f32>, n: vec3<f32>, lod: f32) -> TriplanarSample {
-  let w = pow(abs(n), vec3<f32>(MATERIAL_TRIPLANAR_SHARPNESS));
   let uv_scale = 1.0 / (MATERIAL_TEX_WORLD_SCALE * MATERIAL_VOXEL_PER_METER);
+  if (MATERIAL_TRIPLANAR_SINGLE_AXIS != 0u) {
+    let an = abs(n);
+    if (an.x >= an.y && an.x >= an.z) { return triplanar_axis(slot, p.zy * uv_scale, lod); }
+    if (an.y >= an.z) { return triplanar_axis(slot, p.xz * uv_scale, lod); }
+    return triplanar_axis(slot, p.xy * uv_scale, lod);
+  }
+  let w = pow(abs(n), vec3<f32>(MATERIAL_TRIPLANAR_SHARPNESS));
   let sx = triplanar_axis(slot, p.zy * uv_scale, lod);
   let sy = triplanar_axis(slot, p.xz * uv_scale, lod);
   let sz = triplanar_axis(slot, p.xy * uv_scale, lod);

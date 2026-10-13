@@ -457,15 +457,54 @@ fn finish_profiler_frame(mut res: ResMut<GpuProfilerRes>, queue: Res<RenderQueue
   }
 }
 
+struct DiagReadback {
+  staging: Buffer,
+  done: Arc<std::sync::atomic::AtomicBool>,
+  err: Arc<std::sync::atomic::AtomicBool>,
+}
+
 fn report_lod_diag(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
   gpu: Option<Res<crate::brickmap::upload::GpuBrickMap>>,
   mut period: Local<Option<std::time::Instant>>,
   mut prev: Local<Option<[u32; crate::brickmap::consts::LOD_DIAG_WORDS]>>,
+  mut pending: Local<Option<DiagReadback>>,
 ) {
   const WORDS: usize = crate::brickmap::consts::LOD_DIAG_WORDS;
   let Some(gpu) = gpu else { return };
+
+  if pending.is_some() {
+    let _ = device.poll(PollType::Poll);
+    let (failed, ready) = {
+      let p = pending.as_ref().expect("刚判过 is_some");
+      (p.err.load(Ordering::Acquire), p.done.load(Ordering::Acquire))
+    };
+    if failed || ready {
+      let p = pending.take().expect("刚判过 is_some");
+      let mut cur = [0u32; WORDS];
+      if ready && !failed {
+        let slice = p.staging.slice(..);
+        if let Ok(view) = slice.get_mapped_range() {
+          for (i, w) in cur.iter_mut().enumerate() {
+            let o = i * 4;
+            *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
+          }
+        }
+      }
+      p.staging.unmap();
+      if ready && !failed {
+        let p0 = *prev.get_or_insert(cur);
+        let d: [u32; WORDS] = std::array::from_fn(|i| cur[i].wrapping_sub(p0[i]));
+        *prev = Some(cur);
+        emit_lod_diag(&d);
+      }
+    }
+  }
+
+  if pending.is_some() {
+    return;
+  }
   let now = std::time::Instant::now();
   let due =
     period.is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
@@ -488,33 +527,19 @@ fn report_lod_diag(
   enc.copy_buffer_to_buffer(&gpu.lod_diag, 0, &staging, 0, bytes);
   queue.submit([enc.finish()]);
 
-  let slice = staging.slice(..);
-  let (tx, rx) = std::sync::mpsc::channel();
-  device.map_buffer(&slice, MapMode::Read, move |r| {
-    let _ = tx.send(r);
-  });
-  if device.poll(PollType::wait_indefinitely()).is_err() {
-    warn!("诊断读回：等待失败 → 本窗口跳过");
-    staging.unmap();
-    return;
-  }
-  if !matches!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(Ok(()))) {
-    warn!("诊断读回：映射超时 → 本窗口跳过");
-    staging.unmap();
-    return;
-  }
-  let mut cur = [0u32; WORDS];
-  if let Ok(view) = slice.get_mapped_range() {
-    for (i, w) in cur.iter_mut().enumerate() {
-      let o = i * 4;
-      *w = u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]);
+  let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let err = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let (done_cb, err_cb) = (done.clone(), err.clone());
+  device.map_buffer(&staging.slice(..), MapMode::Read, move |r| {
+    if r.is_err() {
+      err_cb.store(true, Ordering::Release);
     }
-  }
-  staging.unmap();
+    done_cb.store(true, Ordering::Release);
+  });
+  *pending = Some(DiagReadback { staging, done, err });
+}
 
-  let p = *prev.get_or_insert(cur);
-  let d: [u32; WORDS] = std::array::from_fn(|i| cur[i].wrapping_sub(p[i]));
-  *prev = Some(cur);
+fn emit_lod_diag(d: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS]) {
   let entries = d[0].max(1);
   let face_total = (d[3] + d[4] + d[5] + d[6] + d[7] + d[8]).max(1);
   let pct = |v: u32| v as f32 * 100.0 / face_total as f32;

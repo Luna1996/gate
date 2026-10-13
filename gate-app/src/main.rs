@@ -155,8 +155,10 @@ fn main() {
         debug_menu_toggle,
         enforce_integer_scale_factor,
       ),
-    )
-    .add_systems(Last, save_config_on_exit.after(bevy::window::ExitSystems));
+    );
+  if !bench && consts::bench_config_tag().is_none() {
+    app.add_systems(Last, save_config_on_exit.after(bevy::window::ExitSystems));
+  }
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
   app.add_systems(Update, infinite_cubes::stream_chunks);

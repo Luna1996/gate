@@ -74,7 +74,7 @@ impl Config {
     };
     match toml::from_str::<Self>(&src) {
       Ok(c) => {
-        debug!("config ← {}", path.display());
+        info!("config ← {}", path.display());
         c
       }
       Err(e) => {
@@ -109,8 +109,18 @@ pub(crate) fn save_config_on_exit(
     return;
   }
   *saved = true;
+  snapshot(&config, &q_menu, *mode, &orbit, &fly).save();
+}
+
+fn snapshot(
+  config: &Config,
+  q_menu: &Query<&DebugMenu>,
+  mode: CameraMode,
+  orbit: &gate_render::OrbitCamera,
+  fly: &FlyCamera,
+) -> Config {
   let mut out = config.clone();
-  out.camera = Some(CameraPose::capture(*mode, &orbit, &fly));
+  out.camera = Some(CameraPose::capture(mode, orbit, fly));
   if let Ok(menu) = q_menu.single() {
     let mut window = menu.model.window.clone();
     window.path = menu.path.clone();
@@ -118,5 +128,5 @@ pub(crate) fn save_config_on_exit(
     out.window = window;
     out.menu = menu.model.values();
   }
-  out.save();
+  out
 }
