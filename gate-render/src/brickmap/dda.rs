@@ -306,6 +306,17 @@ pub(crate) struct AuxTexCache {
   wal: Option<Buffer>,
 
   region_table: Option<Buffer>,
+
+  refl_write_bg: Option<BindGroup>,
+  refl_read_bg: Option<BindGroup>,
+  refl_compose_bg0: Option<BindGroup>,
+  refl_cap: u64,
+  refl_req: Option<Buffer>,
+  refl_sum: Option<Buffer>,
+  refl_meta: Option<Buffer>,
+  refl_cfg: Option<Buffer>,
+  out_base: Option<Texture>,
+  out_base_view: Option<TextureView>,
 }
 
 pub(crate) const DEN_ATROUS_CHAINS: [[usize; 2]; 6] =
@@ -364,6 +375,10 @@ pub(crate) struct DdaPipelines {
   eye_layout: BindGroupLayoutDescriptor,
   pub(crate) compute_pipeline: CachedComputePipelineId,
   preview_pipeline: CachedComputePipelineId,
+  refl_write_layout: BindGroupLayoutDescriptor,
+  refl_read_layout: BindGroupLayoutDescriptor,
+  refl_pipeline: CachedComputePipelineId,
+  compose_pipeline: CachedComputePipelineId,
 
   pub(crate) face_pipeline: CachedComputePipelineId,
 
@@ -707,6 +722,134 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
+  let refl_write = BindGroupLayoutDescriptor::new(
+    "DdaBg7ReflWrite",
+    &[
+      BindGroupLayoutEntry {
+        binding: 10,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 11,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 12,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+    ],
+  );
+
+  let mut refl_all_entries: Vec<BindGroupLayoutEntry> = Vec::new();
+  for (binding, rw) in [(10u32, true), (11, true)] {
+    refl_all_entries.push(BindGroupLayoutEntry {
+      binding,
+      visibility: ShaderStages::COMPUTE,
+      ty: BindingType::Buffer {
+        ty: BufferBindingType::Storage { read_only: !rw },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+      },
+      count: None,
+    });
+  }
+  refl_all_entries.push(BindGroupLayoutEntry {
+    binding: 12,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Uniform,
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  });
+  let refl_write = BindGroupLayoutDescriptor::new("DdaBg7ReflWrite", &refl_all_entries);
+  let mut refl_read_entries = refl_all_entries.clone();
+  refl_read_entries.push(BindGroupLayoutEntry {
+    binding: 20,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format: TextureFormat::Rgba8Unorm,
+      view_dimension: TextureViewDimension::D2,
+    },
+    count: None,
+  });
+  refl_read_entries.push(BindGroupLayoutEntry {
+    binding: 21,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Texture {
+      sample_type: TextureSampleType::Float { filterable: true },
+      view_dimension: TextureViewDimension::D2,
+      multisampled: false,
+    },
+    count: None,
+  });
+  refl_read_entries.push(BindGroupLayoutEntry {
+    binding: 22,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  });
+  let _unused = BindGroupLayoutDescriptor::new(
+    "DdaBg7ReflReadOld",
+    &[
+      BindGroupLayoutEntry {
+        binding: 20,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::WriteOnly,
+          format: TextureFormat::Rgba8Unorm,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 21,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Float { filterable: true },
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 22,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+    ],
+  );
+  let refl_read = BindGroupLayoutDescriptor::new("DdaBg7ReflRead", &refl_read_entries);
+
   let blit = BindGroupLayoutDescriptor::new(
     "DdaBlit",
     &BindGroupLayoutEntries::sequential(
@@ -737,6 +880,7 @@ pub(crate) fn init_dda_pipelines(
     let mut v = layouts.clone();
     v.push(gi_read.clone());
     v.push(crate::volumetric::fog_read_layout());
+    v.push(refl_write.clone());
     v
   };
 
@@ -753,9 +897,32 @@ pub(crate) fn init_dda_pipelines(
   });
   let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_compute")),
-    layout: dda_layouts,
+    layout: dda_layouts.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("dda_main")),
+    ..default()
+  });
+
+  let refl = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_refl")),
+    layout: {
+      let mut v = dda_layouts.clone();
+      v[7] = refl_read.clone();
+      v
+    },
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_refl")),
+    ..default()
+  });
+  let compose = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_refl_compose")),
+    layout: {
+      let mut v = dda_layouts.clone();
+      v[7] = refl_read.clone();
+      v
+    },
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_refl_compose")),
     ..default()
   });
 
@@ -850,6 +1017,10 @@ pub(crate) fn init_dda_pipelines(
     blit_layout: blit,
     eye_layout: eye,
     compute_pipeline: compute,
+    refl_write_layout: refl_write,
+    refl_read_layout: refl_read,
+    refl_pipeline: refl,
+    compose_pipeline: compose,
     preview_pipeline: preview,
     face_pipeline: face,
     face_accum_pipeline: face_accum,
@@ -867,6 +1038,7 @@ pub(crate) fn init_dda_pipelines(
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct DdaTune<'w> {
+  pub fog: Option<Res<'w, crate::volumetric::FogGpu>>,
   pub gi: Option<Res<'w, crate::gi::GiSettings>>,
 
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
@@ -997,6 +1169,46 @@ pub(crate) fn prepare_dda_bind_groups(
       Some(make_buf("gate_gi_hist_b", px * c.gi_den_hist_words as u64 * 4)),
     ];
     beam_cache.gi_phi = Some(make_buf("gate_gi_den_phi", px * 4));
+
+    let vpx = crate::consts::VIEW_SIZE.x as u64 * crate::consts::VIEW_SIZE.y as u64;
+    let refl_cap = vpx * 2;
+    beam_cache.refl_req = Some(make_buf("gate_refl_req", refl_cap * 8 * 4));
+    beam_cache.refl_sum = Some(make_buf("gate_refl_sum", vpx * 3 * 4));
+    beam_cache.refl_meta = Some(make_buf("gate_refl_meta", 16));
+    let cfg_buf = render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_refl_cfg"),
+      size: 16,
+      usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    {
+      let mut b = [0u8; 16];
+      b[0..4].copy_from_slice(&(refl_cap as u32).to_le_bytes());
+      b[4..8].copy_from_slice(&(vpx as u32).to_le_bytes());
+      queue.write_buffer(&cfg_buf, 0, &b);
+    }
+    beam_cache.refl_cfg = Some(cfg_buf);
+    beam_cache.out_base = Some(render_device.create_texture(&TextureDescriptor {
+      label: Some("gate_out_base"),
+      size: Extent3d {
+        width: crate::consts::VIEW_SIZE.x,
+        height: crate::consts::VIEW_SIZE.y,
+        depth_or_array_layers: 1,
+      },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D2,
+      format: TextureFormat::Rgba8Unorm,
+      usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+      view_formats: &[],
+    }));
+    beam_cache.out_base_view = Some(
+      beam_cache
+        .out_base
+        .as_ref()
+        .expect("out_base")
+        .create_view(&TextureViewDescriptor::default()),
+    );
     for (i, label) in
       ["gate_gi_dn_tmp", "gate_gi_dn_a", "gate_gi_dn_b", "gate_gi_den"].iter().enumerate()
     {
@@ -1076,12 +1288,65 @@ pub(crate) fn prepare_dda_bind_groups(
     None,
     &bg0_layout,
     &BindGroupEntries::sequential((
+      &*beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
+      &u,
+      &beam_view,
+      eye_buf.as_entire_binding(),
+    )),
+  );
+
+  let (refl_write_bg, refl_read_bg) =
+    if let (Some(req), Some(sum), Some(meta), Some(cfg), Some(base_view)) = (
+      beam_cache.refl_req.as_ref(),
+      beam_cache.refl_sum.as_ref(),
+      beam_cache.refl_meta.as_ref(),
+      beam_cache.refl_cfg.as_ref(),
+      beam_cache.out_base_view.as_ref(),
+    ) {
+      let wl = pipeline_cache.get_bind_group_layout(&pipelines.refl_write_layout);
+      let rl = pipeline_cache.get_bind_group_layout(&pipelines.refl_read_layout);
+      let wbg = render_device.create_bind_group(
+        None,
+        &wl,
+        &[
+          BindGroupEntry { binding: 10, resource: req.as_entire_binding() },
+          BindGroupEntry { binding: 11, resource: meta.as_entire_binding() },
+          BindGroupEntry { binding: 12, resource: cfg.as_entire_binding() },
+        ],
+      );
+      let rbg = render_device.create_bind_group(
+        None,
+        &rl,
+        &[
+          BindGroupEntry { binding: 10, resource: req.as_entire_binding() },
+          BindGroupEntry { binding: 11, resource: meta.as_entire_binding() },
+          BindGroupEntry { binding: 12, resource: cfg.as_entire_binding() },
+          BindGroupEntry {
+            binding: 20,
+            resource: BindingResource::TextureView(&tex_view.texture_view),
+          },
+          BindGroupEntry { binding: 21, resource: BindingResource::TextureView(base_view) },
+          BindGroupEntry { binding: 22, resource: sum.as_entire_binding() },
+        ],
+      );
+      (Some(wbg), Some(rbg))
+    } else {
+      (None, None)
+    };
+  let compose_bg0 = render_device.create_bind_group(
+    None,
+    &bg0_layout,
+    &BindGroupEntries::sequential((
       &tex_view.texture_view,
       &u,
       &beam_view,
       eye_buf.as_entire_binding(),
     )),
   );
+  beam_cache.refl_compose_bg0 = Some(compose_bg0);
+  beam_cache.refl_write_bg = refl_write_bg;
+  beam_cache.refl_read_bg = refl_read_bg;
+  beam_cache.refl_cap = crate::consts::VIEW_SIZE.x as u64 * crate::consts::VIEW_SIZE.y as u64 * 2;
 
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
 
@@ -1483,6 +1748,7 @@ fn warm_mark(slot: &'static std::sync::OnceLock<()>, label: &str, ready: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_dda(
   mut ctx: RenderContext,
   bg0: Option<Res<DdaBg0BindGroup>>,
@@ -1545,6 +1811,28 @@ pub(crate) fn dispatch_dda(
   let bx = scale.size.x.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
   let by = scale.size.y.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
 
+  let refl_ok = match aux.as_ref() {
+    Some(a) => {
+      a.refl_sum
+        .as_ref()
+        .zip(a.refl_meta.as_ref())
+        .map(|(sum, meta)| {
+          ctx.command_encoder().clear_buffer(sum, 0, None);
+          ctx.command_encoder().clear_buffer(meta, 0, None);
+          true
+        })
+        .unwrap_or(false)
+        && a.refl_write_bg.is_some()
+        && a.refl_read_bg.is_some()
+        && a.refl_cap > 0
+    }
+    None => false,
+  };
+  let refl_write_bg = aux.as_ref().and_then(|a| a.refl_write_bg.as_ref());
+  let refl_read_bg = aux.as_ref().and_then(|a| a.refl_read_bg.as_ref());
+  let refl_compose_bg0 = aux.as_ref().and_then(|a| a.refl_compose_bg0.as_ref());
+  let refl_cap = aux.as_ref().map(|a| a.refl_cap).unwrap_or(0);
+
   if DDA_BEAM && let Some(beam_pipe) = beam_pipe {
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_beam", |pass| {
       pass.set_pipeline(beam_pipe);
@@ -1586,7 +1874,7 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-    if crate::gi::GI_FLAT_ACC
+  if crate::gi::GI_FLAT_ACC
     && gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
@@ -1682,6 +1970,9 @@ pub(crate) fn dispatch_dda(
           if let Some(fog_read) = fog_read {
             pass.set_bind_group(6, fog_read, &[]);
           }
+          if refl_ok && let Some(w) = refl_write_bg {
+            pass.set_bind_group(7, w, &[]);
+          }
           pass.dispatch_workgroups(gx, gy, 1);
         },
       );
@@ -1711,6 +2002,9 @@ pub(crate) fn dispatch_dda(
           if let Some(fog_read) = fog_read {
             pass.set_bind_group(6, fog_read, &[]);
           }
+          if refl_ok && let Some(w) = refl_write_bg {
+            pass.set_bind_group(7, w, &[]);
+          }
           pass.dispatch_workgroups(gx, gy, 1);
         },
       );
@@ -1738,6 +2032,7 @@ pub(crate) fn dispatch_dda(
   } else {
     (pipeline_cache.get_compute_pipeline(pipelines.preview_pipeline), "gate_dda_preview")
   };
+
   if let Some(pipe) = main_pipe {
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), main_label, |pass| {
       pass.set_pipeline(pipe);
@@ -1754,8 +2049,69 @@ pub(crate) fn dispatch_dda(
       if let Some(fog_read) = fog_read {
         pass.set_bind_group(6, fog_read, &[]);
       }
+      if refl_ok && let Some(w) = refl_write_bg {
+        pass.set_bind_group(7, w, &[]);
+      }
       pass.dispatch_workgroups(gx, gy, 1);
     });
+
+    if refl_ok
+      && let (Some(rr), Some(cb0)) = (refl_read_bg, refl_compose_bg0)
+      && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.refl_pipeline)
+    {
+      let groups = ((refl_cap as u32) / 64u32).max(1);
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_refl",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(0, cb0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          if let Some(gr) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+            pass.set_bind_group(5, gr, &[]);
+          }
+          if let Some(fog_read) = fog_read {
+            pass.set_bind_group(6, fog_read, &[]);
+          }
+          pass.set_bind_group(7, rr, &[]);
+          pass.dispatch_workgroups(groups, 1, 1);
+        },
+      );
+    }
+
+    if refl_ok
+      && let Some(rr) = refl_read_bg
+      && let Some(cb0) = refl_compose_bg0
+      && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.compose_pipeline)
+    {
+      let gxc = gx.max(1);
+      let gyc = gy.max(1);
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_refl_compose",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(0, cb0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          if let Some(gr) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+            pass.set_bind_group(5, gr, &[]);
+          }
+          if let Some(fog_read) = fog_read {
+            pass.set_bind_group(6, fog_read, &[]);
+          }
+          pass.set_bind_group(7, rr, &[]);
+          pass.dispatch_workgroups(gxc, gyc, 1);
+        },
+      );
+    }
   }
 
   if eye.as_ref().is_some_and(|e| e.settings.enabled)

@@ -1,4 +1,12 @@
-@group(0) @binding(0) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var out_base: texture_storage_2d<rgba8unorm, write>;
+
+@group(7) @binding(10) var<storage, read_write> refl_req: array<vec4<u32>>;
+@group(7) @binding(11) var<storage, read_write> refl_meta: array<atomic<u32>>;
+@group(7) @binding(12) var<uniform> refl_cfg: vec4<u32>;
+
+@group(7) @binding(20) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(7) @binding(21) var out_base_tex: texture_2d<f32>;
+@group(7) @binding(22) var<storage, read_write> refl_sum: array<atomic<u32>>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 

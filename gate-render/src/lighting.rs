@@ -46,7 +46,7 @@ pub struct ReflectionSettings {
 impl ReflectionSettings {
   pub const TIERS: u32 = 4;
   pub const NEST_CHOICES: [u32; 4] = [0, 1, 2, 4];
-    pub const REACH_CHOICES: [u32; 4] = [0, 1024, 4096, u32::MAX];
+  pub const REACH_CHOICES: [u32; 4] = [0, 1024, 4096, u32::MAX];
 
   pub fn tier(&self) -> u32 {
     self.tier.min(Self::TIERS - 1)
