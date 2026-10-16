@@ -30,10 +30,12 @@ _version = 1
 "menu.render.gi.res.full" = "1/1"
 "menu.render.gi.res.half" = "1/2"
 "menu.render.gi.res.quarter" = "1/4"
+"menu.render.gi.res.eighth" = "1/8"
 "menu.render.gi.res.tip" = """
 GI 网格边长 = 渲染分辨率 ÷ 档位（每一档都跑 GI，不是开关）。
 
-代价按 GI 像素数计：`1/2` ≈ 全分辨率的 `1/4`，`1/4` 再降 `4` 倍。"""
+代价按 GI 像素数计：`1/2` ≈ 全分辨率的 `1/4`，`1/4` 再降 `4` 倍，`1/8` 再降 `4` 倍。
+GI 是低频量（半球间接光），降到 `1/8` 仍是平滑上采样，只是阴影过渡更糊。"""
 "menu.render.gi.denoise" = "降噪质量"
 "menu.render.gi.denoise.off" = "关"
 "menu.render.gi.denoise.low" = "低"
@@ -49,11 +51,13 @@ GI 网格边长 = 渲染分辨率 ÷ 档位（每一档都跑 GI，不是开关�
 "menu.render.gi.interval.2" = "2"
 "menu.render.gi.interval.4" = "4"
 "menu.render.gi.interval.8" = "8"
+"menu.render.gi.interval.16" = "16"
 "menu.render.gi.interval.tip" = """
 把 GI 采样预算**摊到 N 帧**：每帧只发 `基准候选 ÷ N` 条射线，记忆窗同步 ×N。
 
 **帧时间恒定、稳态噪声不变**（窗内样本数 = 候选数 × 记忆窗，相乘抵消），代价是响应时间 ×N。
-`8` 需要「降噪质量 = 高」（每帧 1 条）；低/中档下每帧至少 1 条 ⇒ `8` 等同 `4`。"""
+`8` 需要「降噪质量 = 高」（每帧 1 条）；低/中档下每帧至少 1 条 ⇒ `8` 等同 `4`。
+`16` 让一半 texel 隔帧采样 ⇒ GI pass 减半，间接光收敛速度随之减半。"""
 "menu.render.gi.realloc" = "重分配"
 "menu.render.gi.realloc.off" = "关"
 "menu.render.gi.realloc.mild" = "弱"
@@ -127,6 +131,20 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 "menu.render.refl.nest.1" = "1"
 "menu.render.refl.nest.2" = "2"
 "menu.render.refl.nest.4" = "4"
+"menu.render.refl.reach" = "次级射线"
+"menu.render.refl.reach.tip" = """
+控制**次级射线**（玻璃镜面反射、玻璃透射链里的折线、镜面嵌套链）能追多远，以及发不发。
+
+- **关**：一条次级射线都不发 ⇒ 玻璃只剩透射染色与环境光，没有倒影
+- **近**：限 `1024` 体素
+- **中**：限 `4096` 体素
+- **远**（默认）：无限远，追到世界窗口边界
+
+追太远时多数像素是在空网格里空走：反射方向朝天的像素要一路走到世界边界才判未命中。限长把这段空走砍掉，未命中处直接出环境色。"""
+"menu.render.refl.reach.off" = "关"
+"menu.render.refl.reach.near" = "近"
+"menu.render.refl.reach.mid" = "中"
+"menu.render.refl.reach.far" = "远"
 "menu.render.exposure" = "曝光"
 "menu.render.exposure.enabled" = "开启"
 "menu.render.exposure.ev_up" = "提亮上限"

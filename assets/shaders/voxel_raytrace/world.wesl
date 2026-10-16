@@ -1,6 +1,6 @@
 import package::bindings::{g, grid_descs, inst_bvh, lod_diag};
-import package::brickmap::{Grid, sample_brickmap};
-import package::common::{face_normal_from_index};
+import package::brickmap::{Grid, sample_brickmap, ts};
+import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, INDEX_ENTRY_EMPTY, MAX_LEVEL, NODE_FIXED_WORDS, face_normal_from_index};
 import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid, diag_ray, DIAG_NEAR_CALLS,
   DIAG_LEAF_ITER, DIAG_LEAF_MARCH, DIAG_BVH_NODES, DIAG_FAR_ITERS, DIAG_FAR_TRACES};
 
@@ -35,11 +35,91 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> v
   d.x = f32(world_solid(g, voxel - x)) - f32(world_solid(g, voxel + x));
   d.y = f32(world_solid(g, voxel - y)) - f32(world_solid(g, voxel + y));
   d.z = f32(world_solid(g, voxel - z)) - f32(world_solid(g, voxel + z));
-  
+
   var dw = d;
   if (g.obj_id >= 0) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
   if (dot(dw, dw) > 0.0) { return normalize(dw); }
       return face_n;
+}
+
+fn nb_solid_fast(leaf: u32, leaf_pal: u32, mask: u64, c: vec3<i32>, off: vec3<i32>) -> f32 {
+  let n = c + off;
+  if (any(n < vec3<i32>(0)) || any(n > vec3<i32>(3))) { return -1.0; }
+  let idx = u32(n.z * 16 + n.y * 4 + n.x);
+  if ((mask & (u64(1) << idx)) != u64(0)) {
+    let w = ts(leaf + NODE_FIXED_WORDS + (idx >> 1u));
+    let v = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
+    return select(0.0, 1.0, v != 0u);
+  }
+  return select(0.0, 1.0, leaf_pal != 0u);
+}
+
+fn leaf_brick_of(g: Grid, voxel: vec3<i32>) -> u32 {
+  let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
+  let chunk_i = (voxel - m) / vec3<i32>(i32(CHUNK_SIZE));
+  let origin = g.index_origin;
+  let dims = g.index_dims;
+  let rel = chunk_i - origin;
+  if (any(rel < vec3<i32>(0))) { return 0u; }
+  if (any(vec3<u32>(rel) >= dims)) { return 0u; }
+  let rel_u = vec3<u32>(rel);
+  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
+    + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+  let entry = ts(index_addr);
+  if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { return 0u; }
+  let chunk_base = g.tree_base + entry - 1u;
+  let local = vec3<u32>(m);
+  var node_addr = chunk_base;
+  for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
+    let mask_lo = ts(node_addr);
+    let mask_hi = ts(node_addr + 1u);
+    let shift = 8u - (level + 1u) * 2u;
+    let cx = (local.x >> shift) & 3u;
+    let cy = (local.y >> shift) & 3u;
+    let cz = (local.z >> shift) & 3u;
+    let child_idx = cz * 16u + cy * 4u + cx;
+    var mask_word: u32 = mask_lo;
+    var bit_in_word: u32 = child_idx;
+    if (child_idx >= 32u) {
+      mask_word = mask_hi;
+      bit_in_word = child_idx - 32u;
+    }
+    if ((mask_word & (1u << bit_in_word)) == 0u) { return 0u; }
+    if (level == 3u) { return node_addr; }
+    var popcount_below: u32;
+    if (child_idx < 32u) {
+      popcount_below = countOneBits(mask_lo & ((1u << bit_in_word) - 1u));
+    } else {
+      popcount_below = countOneBits(mask_lo) + countOneBits(mask_hi & ((1u << bit_in_word) - 1u));
+    }
+    let off = ts(node_addr + NODE_FIXED_WORDS + popcount_below);
+    if (off == 0u) { return 0u; }
+    node_addr = chunk_base + off;
+  }
+  return 0u;
+}
+
+fn voxel_normal_fast(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> vec3<f32> {
+  let leaf = leaf_brick_of(g, voxel);
+  if (leaf == 0u) { return voxel_normal(g, voxel, face_id, face_n); }
+  let mask = (u64(ts(leaf + 1u)) << 32u) | u64(ts(leaf));
+  let leaf_pal = ts(leaf + 2u) & 0xFFFFu;
+  let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
+  let c = m & vec3<i32>(3);
+  let xp = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(1, 0, 0));
+  let xm = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(-1, 0, 0));
+  let yp = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, 1, 0));
+  let ym = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, -1, 0));
+  let zp = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, 0, 1));
+  let zm = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, 0, -1));
+  if (any(vec3<f32>(xp, yp, zp) < vec3<f32>(0.0)) || any(vec3<f32>(xm, ym, zm) < vec3<f32>(0.0))) {
+    return voxel_normal(g, voxel, face_id, face_n);
+  }
+  var d = vec3<f32>(xm - xp, ym - yp, zm - zp);
+  var dw = d;
+  if (g.obj_id >= 0) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
+  if (dot(dw, dw) > 0.0) { return normalize(dw); }
+  return face_n;
 }
 
 fn voxel_center_world(g: Grid, voxel: vec3<i32>) -> vec3<f32> {

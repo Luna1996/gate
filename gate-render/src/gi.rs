@@ -182,11 +182,11 @@ pub struct DenoisePlan {
 }
 
 impl GiSettings {
-  pub const DIV_CHOICES: [u32; 3] = [1, 2, 4];
+  pub const DIV_CHOICES: [u32; 4] = [1, 2, 4, 8];
 
   pub const DENOISE_TIERS: u32 = 4;
 
-  pub const SHARE_CHOICES: [u32; 4] = [1, 2, 4, 8];
+  pub const SHARE_CHOICES: [u32; 5] = [1, 2, 4, 8, 16];
 
   pub fn share(&self) -> u32 {
     self.share.clamp(1, 8)
@@ -213,7 +213,7 @@ impl GiSettings {
   }
 
   pub fn div(&self) -> u32 {
-    self.gi_div.clamp(1, 4)
+    self.gi_div.clamp(1, 8)
   }
 
   pub fn tier(&self) -> u32 {
@@ -503,6 +503,8 @@ pub fn gi_flatten_layout() -> BindGroupLayoutDescriptor {
     ],
   )
 }
+
+pub const GI_FLAT_ACC: bool = false;
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiGpu {

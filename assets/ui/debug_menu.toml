@@ -125,6 +125,7 @@ options = [
     "menu.render.gi.res.full",
     "menu.render.gi.res.half",
     "menu.render.gi.res.quarter",
+    "menu.render.gi.res.eighth",
 ]
 selected = 1
 tooltip = "menu.render.gi.res.tip"
@@ -138,8 +139,9 @@ options = [
     "menu.render.gi.interval.2",
     "menu.render.gi.interval.4",
     "menu.render.gi.interval.8",
+    "menu.render.gi.interval.16",
 ]
-selected = 1
+selected = 3
 tooltip = "menu.render.gi.interval.tip"
 
 [[items.children.children]]
@@ -198,6 +200,19 @@ options = [
 ]
 selected = 0
 tooltip = "menu.render.refl.nest.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "reach"
+label = "menu.render.refl.reach"
+options = [
+    "menu.render.refl.reach.off",
+    "menu.render.refl.reach.near",
+    "menu.render.refl.reach.mid",
+    "menu.render.refl.reach.far",
+]
+selected = 3
+tooltip = "menu.render.refl.reach.tip"
 
 [[items.children]]
 kind = "sub_menu"

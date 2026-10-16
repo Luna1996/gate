@@ -3,7 +3,7 @@ import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emis
 import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
 import package::trace::{SECONDARY_REACH_CHUNKS, make_grid};
-import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal, world_trace_medium_scene};
+import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal_fast, world_trace_medium_scene};
 
 const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 
@@ -95,7 +95,7 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
               sun_bounce: f32, epoch: u32, seed: u32, mult: f32) -> vec3<f32> {
   let hg = make_grid(u32(sh.obj_id) + 1u);
   let hp = voxel_center_world(hg, sh.voxel);
-  let hn = voxel_normal(hg, sh.voxel, sh.face_id, sh.n);
+  let hn = voxel_normal_fast(hg, sh.voxel, sh.face_id, sh.n);
   let m = fetch_material(sh.palette_base, sh.pal, hp, hn, MATERIAL_DEBUG_NONE);
   let off = surface_offset(hg, hn, SHADOW_SURFACE_EPS);
   let d2 = gi_cos_hemisphere(hn, gi_rand2(seed));

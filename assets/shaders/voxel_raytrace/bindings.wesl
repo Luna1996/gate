@@ -126,7 +126,7 @@ struct LightGlobals {
   
   refl_nest: u32,
   
-  
+  refl_reach: u32,
   
   base_flags: u32,
   ambient: vec4<f32>,     

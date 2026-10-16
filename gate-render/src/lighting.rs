@@ -19,6 +19,7 @@ pub struct LightGlobals {
   pub count: u32,
   pub refl_tier: u32,
   pub refl_nest: u32,
+  pub refl_reach: u32,
   pub base_flags: u32,
   pub ambient: Vec4,
   pub exposure_pad: Vec4,
@@ -39,11 +40,13 @@ pub struct LightPoolUniform {
 pub struct ReflectionSettings {
   pub tier: u32,
   pub nest: u32,
+  pub reach: u32,
 }
 
 impl ReflectionSettings {
   pub const TIERS: u32 = 4;
   pub const NEST_CHOICES: [u32; 4] = [0, 1, 2, 4];
+    pub const REACH_CHOICES: [u32; 4] = [0, 1024, 4096, u32::MAX];
 
   pub fn tier(&self) -> u32 {
     self.tier.min(Self::TIERS - 1)
@@ -52,11 +55,15 @@ impl ReflectionSettings {
   pub fn nest(&self) -> u32 {
     *Self::NEST_CHOICES.iter().min_by_key(|c| c.abs_diff(self.nest)).expect("NEST_CHOICES 非空")
   }
+
+  pub fn reach(&self) -> u32 {
+    Self::REACH_CHOICES[(self.reach as usize).min(Self::REACH_CHOICES.len() - 1)]
+  }
 }
 
 impl Default for ReflectionSettings {
   fn default() -> Self {
-    Self { tier: 2, nest: 0 }
+    Self { tier: 2, nest: 0, reach: 3 }
   }
 }
 
@@ -148,6 +155,7 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
       count: 0,
       refl_tier: 0,
       refl_nest: 0,
+      refl_reach: 0,
       base_flags: 0,
       ambient: Vec4::new(theme.ambient[0], theme.ambient[1], theme.ambient[2], 0.0),
       exposure_pad: Vec4::new(theme.exposure, 0.0, 0.0, 0.0),

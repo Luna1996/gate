@@ -125,7 +125,7 @@ const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;
 
 const FACE_KMASK_NOFACE: u32 = 0xFFF8FFFFu;
-const FACE_SLOT_PROBE: u32 = 8u;
+const FACE_SLOT_PROBE: u32 = 2u;
 
 fn gi_vox_k1(k1: u32) -> u32 {
   return k1 & FACE_KMASK_NOFACE;

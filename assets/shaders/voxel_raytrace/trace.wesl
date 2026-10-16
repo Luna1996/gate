@@ -36,7 +36,7 @@ const LEAF_LOD_FP: f32 = 3.4e38;
 
 const LEAF_LOD_SCAN_CAP: u32 = 8u;
 
-const LOD_DIAG: u32 = 1u;
+const LOD_DIAG: u32 = 0u;
 const DIAG_LEAF_ENTRIES: u32 = 0u;
 const DIAG_LEAF_STOPS: u32 = 1u;
 const DIAG_ILLEGAL_STOPS: u32 = 2u;
@@ -46,6 +46,8 @@ const DIAG_NEAR_CALLS: u32 = 34u;
 const DIAG_BVH_NODES: u32 = 35u;
 const DIAG_FAR_ITERS: u32 = 36u;
 const DIAG_FAR_TRACES: u32 = 37u;
+const DIAG_GLASS_REFL: u32 = 38u;
+const DIAG_GLASS_ITERS: u32 = 39u;
 fn diag_ray(origin: vec3<f32>, dir: vec3<f32>) -> bool {
   return LOD_DIAG == 1u && ((bitcast<u32>(origin.x) ^ bitcast<u32>(dir.z)) & 63u) == 0u;
 }

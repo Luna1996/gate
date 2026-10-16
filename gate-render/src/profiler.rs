@@ -618,6 +618,11 @@ fn emit_lod_diag(d: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS]) {
     d[36] as f32 / calls,
     d[37] as f32 / calls,
   );
+  info!(
+    "DIAG[玻璃循环 {:.2}/条 | 反射射线 {:.2}/条]",
+    d[39] as f32 / (d[9].max(1) as f32),
+    d[38] as f32 / (d[9].max(1) as f32),
+  );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

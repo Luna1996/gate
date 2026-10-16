@@ -6,9 +6,9 @@ import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal,
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_pool, GI_WAL_MATURE_N};
-import package::trace::{diag_sampled, make_grid};
+import package::trace::{DIAG_GLASS_ITERS, DIAG_GLASS_REFL, diag_ray, diag_sampled, make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
-import package::world::{WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
+import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
 
 @if(ray_query)
 enable wgpu_ray_query;
@@ -38,8 +38,10 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 const GLASS_EPS: f32 = 1e-3;
-const GLASS_MAX_BOUNCE: u32 = 8u;
+const GLASS_MAX_BOUNCE: u32 = 3u;
 const GLASS_REFL_MIN: f32 = 0.02;
+const GLASS_REFL_WEIGHT_MIN: f32 = 0.015;
+const GLASS_TINT_MIN: f32 = 0.02;
 const GLASS_REFL_AMBIENT: f32 = 0.15;
 const PBR_REFLECTION_ENABLED: u32 = 1u;
 const PBR_REFL_MIN_F0: f32 = 0.03;
@@ -76,57 +78,125 @@ struct GlassOut {
   dir: vec3<f32>,
 }
 
+fn secondary_reach(max_t: f32) -> f32 {
+  let rc = light_u.g.refl_reach;
+  return select(min(max_t, f32(rc)), max_t, rc == 0xFFFFFFFFu);
+}
+
+fn secondary_on() -> bool {
+  return light_u.g.refl_reach != 0u;
+}
+
 fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t: f32,
-               sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>) -> GlassOut {
+               sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>,
+               entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>) -> GlassOut {
   var org = origin_voxel;
   var dir = dir_voxel;
-  var t_start = t_min;
-  var in_medium = false;
+  var in_medium = true;
   var tint = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
+  let gdiag = diag_ray(origin_voxel, dir_voxel);
+  let g0w = make_grid(0u);
+  let sec_on = secondary_on();
+  let mt = secondary_reach(max_t);
+  var pal_c: u32 = 0xFFFFFFFFu;
+  var pbase_c: u32 = 0u;
+  var xpar_c: bool = true;
+  var ior_c: f32 = 1.0;
+  {
+    let nn = entry_n;
+    let v = entry_v;
+    let ci = clamp(dot(-dir, nn), 0.0, 1.0);
+    let ior = entry_ior;
+    let f0 = dielectric_f0(ior, 1.0);
+    let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, nn), 0.0, 1.0), 5.0);
+    let r_tier = light_u.g.refl_tier;
+    let refl_w = tint * fres;
+    if (sec_on && r_tier > 0u && fres > GLASS_REFL_MIN
+        && dot(refl_w, GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
+      if (gdiag) { atomicAdd(&lod_diag[DIAG_GLASS_REFL], 1u); }
+      let rdir = reflect(-v, nn);
+      let r_org = org + nn * GLASS_EPS;
+      let rhit = world_raycast(g0w, r_org, rdir, mt, world_cfg_full(0.0, 3u));
+      var rc = select(sky_rgb(), sky_primary(rdir, sun_dir, sun_c), r_tier >= 2u);
+      if (rhit.hit) {
+        let rgg = make_grid(u32(rhit.obj_id) + 1u);
+        let r_vc = voxel_center_world(rgg, rhit.voxel);
+        let rn = voxel_normal_fast(rgg, rhit.voxel, rhit.face_id, rhit.n);
+        let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
+        var r_vis = vec3<f32>(1.0);
+        if (r_tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u
+            && dot(rn, sun_dir) > 0.0) {
+          r_vis = sun_transmittance(
+            r_vc + rn * surface_offset(rgg, rn, SHADOW_SURFACE_EPS),
+            sun_dir, rhit.voxel, rhit.obj_id);
+        }
+        rc = brdf_reflected(mr, rn, face_view_dir(r_org, r_vc),
+                            SurfaceLight(sun_dir, sun_c * r_vis, 1.0, sky * GLASS_REFL_AMBIENT, vec3<f32>(0.0)))
+          + emissive_radiance(mr, GI_EMIT_GAIN);
+      }
+      refl = refl + tint * fres * rc;
+    }
+    let eta = 1.0 / ior;
+    let k = 1.0 - eta * eta * (1.0 - ci * ci);
+    dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
+    org = org + dir * GLASS_EPS;
+  }
   for (var bounce = 0u; bounce < GLASS_MAX_BOUNCE; bounce = bounce + 1u) {
     var seg = vec3<f32>(1.0);
     var best: WorldHit;
     if (in_medium) {
-      best = world_trace_medium_scene(org, dir, max_t, true, &seg);
+      best = world_trace_medium_scene(org, dir, mt, true, &seg);
     } else {
-      best = world_raycast(make_grid(0u), org, dir, max_t, world_cfg_primary(t_start, 3u));
+      best = world_raycast(g0w, org, dir, mt, world_cfg_primary(0.0, 3u));
     }
+    if (gdiag) { atomicAdd(&lod_diag[DIAG_GLASS_ITERS], 1u); }
     tint = tint * seg;
+    if (bounce > 0u && dot(tint, GI_LUMA) < GLASS_TINT_MIN) { break; }
     if (!best.hit) { return GlassOut(best, tint, refl, dir); }
-    if ((palette_flags(best.palette_base, best.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+    if (best.pal != pal_c || best.palette_base != pbase_c) {
+      pal_c = best.pal;
+      pbase_c = best.palette_base;
+      xpar_c = (palette_flags(best.palette_base, best.pal) & FLAGS_TRANSMISSIVE) != 0u;
+      ior_c = material_ior(best.palette_base, best.pal);
+    }
+    if (!xpar_c) {
       return GlassOut(best, tint, refl, dir);
     }
     let p_hit = org + dir * best.t;
-    let nn = voxel_normal(make_grid(0u), best.voxel, best.face_id, best.n);
+    let nn = best.n;
     let ci = clamp(dot(-dir, nn), 0.0, 1.0);
-    let ior = material_ior(best.palette_base, best.pal);
-    let v = face_view_dir(view_u.cam_pos_voxel.xyz, voxel_center_world(make_grid(0u), best.voxel));
+    let ior = ior_c;
+    let v = face_view_dir(view_u.cam_pos_voxel.xyz, voxel_center_world(g0w, best.voxel));
     if (!in_medium) {
       
       
       let f0 = dielectric_f0(ior, 1.0);
       let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, nn), 0.0, 1.0), 5.0);
       let r_tier = light_u.g.refl_tier;
-      if (r_tier > 0u && fres > GLASS_REFL_MIN) {
+      let refl_w = tint * fres;
+      if (sec_on && r_tier > 0u && fres > GLASS_REFL_MIN
+          && dot(refl_w, GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
         
+        if (gdiag) { atomicAdd(&lod_diag[DIAG_GLASS_REFL], 1u); }
         let rdir = reflect(-v, nn);
         let r_org = p_hit + nn * GLASS_EPS;
-        let rhit = world_raycast(make_grid(0u), r_org, rdir,
-                                 max_t, world_cfg_full(0.0, 3u));
+        let rhit = world_raycast(g0w, r_org, rdir,
+                                 mt, world_cfg_full(0.0, 3u));
         var rc = select(sky_rgb(), sky_primary(rdir, sun_dir, sun_c), r_tier >= 2u);
         if (rhit.hit) {
           let rgg = make_grid(u32(rhit.obj_id) + 1u);
-          let rn = voxel_normal(rgg, rhit.voxel, rhit.face_id, rhit.n);
+          let r_vc = voxel_center_world(rgg, rhit.voxel);
+          let rn = voxel_normal_fast(rgg, rhit.voxel, rhit.face_id, rhit.n);
           let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
           var r_vis = vec3<f32>(1.0);
           if (r_tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u
               && dot(rn, sun_dir) > 0.0) {
             r_vis = sun_transmittance(
-              voxel_center_world(rgg, rhit.voxel) + rn * surface_offset(rgg, rn, SHADOW_SURFACE_EPS),
+              r_vc + rn * surface_offset(rgg, rn, SHADOW_SURFACE_EPS),
               sun_dir, rhit.voxel, rhit.obj_id);
           }
-          rc = brdf_reflected(mr, rn, face_view_dir(r_org, voxel_center_world(rgg, rhit.voxel)),
+          rc = brdf_reflected(mr, rn, face_view_dir(r_org, r_vc),
                               SurfaceLight(sun_dir, sun_c * r_vis, 1.0, sky * GLASS_REFL_AMBIENT, vec3<f32>(0.0)))
             + emissive_radiance(mr, GI_EMIT_GAIN);
         }
@@ -148,7 +218,6 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
       }
     }
     org = p_hit + dir * GLASS_EPS;
-    t_start = 0.0;
   }
   return GlassOut(WorldHit(false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), 0, 0u),
                   tint, refl, dir);
@@ -160,7 +229,7 @@ fn write_output(coord: vec2<i32>, col: vec3<f32>) {
   textureStore(out_tex, coord, vec4<f32>(linear_to_srgb(exposed), 1.0));
 }
 
-const GI_UPSAMPLE_HOLE_R: i32 = 3;
+const GI_UPSAMPLE_HOLE_R: i32 = 1;
 const GI_FACE_POOL_R: i32 = 3;
 const GI_FACE_POOL_MIN_N: u32 = 4u;
 
@@ -286,6 +355,8 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
   
   if (dot(rdir, n) <= 0.0) { rdir = mirror; }
   let r_org = p_voxel + n * n_off;
+  if (!secondary_on()) { return vec3<f32>(0.0); }
+  let reach = secondary_reach(frustum_length);
   let tier = light_u.g.refl_tier;
   let nest = light_u.g.refl_nest;
   var refl_env = vec3<f32>(0.0);
@@ -294,7 +365,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
   var chain_dir = rdir;
   for (var lvl = 0u; lvl <= nest; lvl = lvl + 1u) {
     var r_tint = vec3<f32>(1.0);
-    let h = world_trace_medium_scene(chain_org, chain_dir, frustum_length, false, &r_tint);
+    let h = world_trace_medium_scene(chain_org, chain_dir, reach, false, &r_tint);
     if (!h.hit) {
       refl_env = refl_env
                + chain_w * r_tint
@@ -302,7 +373,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
       break;
     }
     let hgg = make_grid(u32(h.obj_id) + 1u);
-    let hn = voxel_normal(hgg, h.voxel, h.face_id, h.n);
+    let hn = voxel_normal_fast(hgg, h.voxel, h.face_id, h.n);
     let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
     let hamb = sky * GI_SKY_AMBIENT;
     let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
@@ -352,12 +423,13 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let fg = make_grid(u32(first.obj_id) + 1u);
     let fp = voxel_center_world(fg, first.voxel);
     let fvuv = voxel_screen_uv(fp, gi_in.uv);
-    let fnn = voxel_normal(fg, first.voxel, first.face_id, first.n);
+    var fnn = n_hint;
+    if (!n_hint_ok) { fnn = voxel_normal_fast(fg, first.voxel, first.face_id, first.n); }
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
     
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let g = trace_glass(f_face, -fv, 0.0, frustum_length, sun_dir, sky, sun_c);
+    let g = trace_glass(f_face, -fv, 0.0, frustum_length, sun_dir, sky, sun_c, fnn, material_ior(first.palette_base, first.pal), fv);
     best = g.ray;
     through = g.tint;
     refl = g.refl;
@@ -412,7 +484,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         }
       }
     }
-    if (!n_reused && PROBE_NO_NORMAL == 0u) { n = voxel_normal(gg, best.voxel, best.face_id, best.n); }
+    if (!n_reused && PROBE_NO_NORMAL == 0u) { n = voxel_normal_fast(gg, best.voxel, best.face_id, best.n); }
     var m = fetch_material(best.palette_base, best.pal, p_voxel, n, PBR_DEBUG_ASSET);
     if (PROBE_NO_MAT != 0u) {
       m = MaterialParams(palette_rgb_linear(best.palette_base, best.pal),
@@ -440,21 +512,23 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     } else if (PROBE_NO_GI == 0u && gi_on) {
       var acc = gi_vox_gi(best.voxel, best.face_id, best.obj_id);
       acc = acc * vec4<f32>(2.0, 2.0, 2.0, 2.0);
-      var t1 = vec3<i32>(1, 0, 0);
-      var t2 = vec3<i32>(0, 1, 0);
-      if (best.face_id / 2u == 0u) {
-        t1 = vec3<i32>(0, 1, 0);
-        t2 = vec3<i32>(0, 0, 1);
-      } else if (best.face_id / 2u == 1u) {
-        t1 = vec3<i32>(1, 0, 0);
-        t2 = vec3<i32>(0, 0, 1);
-      }
-      for (var i = 0u; i < 4u; i = i + 1u) {
-        let s1 = select(-1, 1, (i & 1u) == 0u);
-        let s2 = select(-1, 1, (i & 2u) == 0u);
-        let nv = best.voxel + t1 * s1 + t2 * s2;
-        if (!gi_key_ok(nv, best.obj_id)) { continue; }
-        acc = acc + gi_vox_gi(nv, best.face_id, best.obj_id);
+      if (acc.w > 0.0) {
+        var t1 = vec3<i32>(1, 0, 0);
+        var t2 = vec3<i32>(0, 1, 0);
+        if (best.face_id / 2u == 0u) {
+          t1 = vec3<i32>(0, 1, 0);
+          t2 = vec3<i32>(0, 0, 1);
+        } else if (best.face_id / 2u == 1u) {
+          t1 = vec3<i32>(1, 0, 0);
+          t2 = vec3<i32>(0, 0, 1);
+        }
+        for (var i = 0u; i < 4u; i = i + 1u) {
+          let s1 = select(-1, 1, (i & 1u) == 0u);
+          let s2 = select(-1, 1, (i & 2u) == 0u);
+          let nv = best.voxel + t1 * s1 + t2 * s2;
+          if (!gi_key_ok(nv, best.obj_id)) { continue; }
+          acc = acc + gi_vox_gi(nv, best.face_id, best.obj_id);
+        }
       }
       if (acc.w > 0.0) {
         gi = acc.xyz / (acc.w * GI_ACC_SCALE);
@@ -591,7 +665,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
   let need_n = (light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) != 0u;
   var n_own = vec3<f32>(0.0);
   if (first.hit && need_n) {
-    n_own = voxel_normal(make_grid(u32(first.obj_id) + 1u), first.voxel, first.face_id, first.n);
+    let first_xpar = (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u;
+    let fgrid = make_grid(u32(first.obj_id) + 1u);
+    n_own = select(voxel_normal_fast(fgrid, first.voxel, first.face_id, first.n), first.n, first_xpar);
   }
   let diag_pix = gid.x + gid.y * size.x;
   let diag_on = diag_sampled(diag_pix);
@@ -771,7 +847,7 @@ fn dda_preview(@builtin(global_invocation_id) gid: vec3<u32>,
   var col = sky_rgb();
   if (first.hit) {
     let gg = make_grid(u32(first.obj_id) + 1u);
-    let n = voxel_normal(gg, first.voxel, first.face_id, first.n);
+    let n = voxel_normal_fast(gg, first.voxel, first.face_id, first.n);
     let albedo = palette_rgb_linear(first.palette_base, first.pal);
     col = albedo * (sky * GI_SKY_AMBIENT + sun_c * max(dot(n, sun_dir), 0.0));
   }
@@ -861,6 +937,9 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let fnw = face_normal_world(gg, face_id);
   let first = WorldHit(true, 0.0, p_voxel, atomicLoad(&face_slots[fe + FACE_W_PAL]),
                        fnw, face_id, voxel, obj_id, gg.palette_base);
+  if ((palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
+    return;
+  }
   if (diag_sampled(texel)) {
     atomicAdd(&lod_diag[DIAG_WAL_FACES], 1u);
     if (gi_u.params.y > 0.5) {

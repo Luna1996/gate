@@ -309,7 +309,7 @@ fn register_callbacks(world: &mut World) {
           info!("GI → {}", if *on { "on" } else { "off" });
         }
         ("render/gi/res", MenuAction::Select(i)) => {
-          gi.gi_div = gate_render::gi::GiSettings::DIV_CHOICES[(*i).min(2)];
+          gi.gi_div = gate_render::gi::GiSettings::DIV_CHOICES[(*i).min(3)];
           info!("GI 分辨率 → 1/{}", gi.gi_div);
         }
         ("render/gi/denoise", MenuAction::Select(i)) => {
@@ -343,7 +343,7 @@ fn register_callbacks(world: &mut World) {
           info!("GI 二次弹射 → {name} mult={mult}");
         }
         ("render/gi/interval", MenuAction::Select(i)) => {
-          gi.share = gate_render::gi::GiSettings::SHARE_CHOICES[(*i).min(3)];
+          gi.share = gate_render::gi::GiSettings::SHARE_CHOICES[(*i).min(4)];
           let c = gate_render::wesl_consts::gi_consts();
           let base = if gi.tier() >= 3 { c.gi_ss_cand_n_hq } else { c.gi_ss_cand_n };
           info!("GI 分帧 → ÷{}（基准候选 {} ⇒ 每帧 {}）", gi.share, base, (base / gi.share).max(1));
@@ -374,6 +374,17 @@ fn register_callbacks(world: &mut World) {
           let n = gate_render::ReflectionSettings::NEST_CHOICES[(*i).min(3)];
           refl.nest = n;
           info!("镜面嵌套 → {n} 层");
+        }
+        ("render/refl/reach", MenuAction::Select(i)) => {
+          let k = (*i).min(3);
+          refl.reach = k as u32;
+          let (name, v) = match k {
+            0 => ("关", "不发次级射线"),
+            1 => ("近", "≤1024vx"),
+            2 => ("中", "≤4096vx"),
+            _ => ("远", "无限"),
+          };
+          info!("次级射线 → {name}（{v}）");
         }
         ("render/exposure/enabled", MenuAction::Toggle(on)) => {
           eye.enabled = *on;

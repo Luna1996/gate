@@ -5,7 +5,8 @@ import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_sur
 import package::gi::ray::{gi_ray_radiance};
 import package::gi::wal::{gi_wal_merge, gi_wal_sample};
 import package::trace::{make_grid};
-import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal};
+import package::common::{FLAGS_TRANSMISSIVE};
+import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal_fast};
 
 fn diag_texel_sampled(coord: vec2<i32>) -> bool {
   return ((((u32(coord.x) * 73856093u) ^ (u32(coord.y) * 19349663u)) & 63u) == 0u);
@@ -150,8 +151,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
 
   let gg = make_grid(u32(h.obj_id) + 1u);
   let p_voxel = voxel_center_world(gg, h.voxel);
-            let n = voxel_normal(gg, h.voxel, h.face_id, h.n);
-      let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
+  var n = h.n;
+  if ((palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+    n = voxel_normal_fast(gg, h.voxel, h.face_id, h.n);
+  }
+  let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
   let org = p_voxel + n * n_off;
 
     let pk0 = gi_key0(h.voxel, h.obj_id);
@@ -241,6 +245,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
     }
   }
                           const GI_SS_CLAIM_ONLY: u32 = 0u;
+const GI_FLAT_ACC: u32 = 0u;
   if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
     var fok2 = false;
         let fs2 = face_slot_find(pk0, pk1, &fok2);
@@ -370,7 +375,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   }
                 textureStore(gi_out, coord, vec4<f32>(gi_w, cov_w));
 
-                  if (pk_ok && cov_w > 0.0) {
+      if (GI_FLAT_ACC != 0u && pk_ok && cov_w > 0.0) {
     var fok = false;
         let fslot = face_slot_find(pk0, gi_vox_k1(pk1), &fok);
     if (fok) {

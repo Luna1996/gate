@@ -1285,6 +1285,7 @@ pub(crate) fn prepare_dda_bind_groups(
 
   lp.0.get_mut().g.refl_tier = tune.refl.as_ref().map_or(0, |r| r.tier());
   lp.0.get_mut().g.refl_nest = tune.refl.as_ref().map_or(0, |r| r.nest());
+  lp.0.get_mut().g.refl_reach = tune.refl.as_ref().map_or(0, |r| r.reach());
 
   lp.0.get_mut().g.base_flags =
     tune.base.as_ref().map_or(crate::lighting::BaseSettings::default().flags(), |b| b.flags());
@@ -1585,7 +1586,8 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-  if gi.as_ref().is_some_and(|g| g.enabled)
+    if crate::gi::GI_FLAT_ACC
+    && gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
     && let Some(bg) = aux.gi_flatten_bg.as_ref()

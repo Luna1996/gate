@@ -86,9 +86,7 @@ pub const BENCH_FLY_TURN: f32 = 0.16;
 pub const BENCH_FLY_YAW: f32 = 0.35;
 pub const EDIT_SELFTEST: bool = false;
 
-pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=debug,wgpu_core=debug,\
-  wgpu_hal::vulkan::instance=off,\
-  wgpu_hal::vulkan::surface=off";
+pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=warn,wgpu_core=warn";
 
 pub const FOV_Y: f32 = 60.0_f32.to_radians();
 pub const CAM_NEAR: f32 = 1.0;
