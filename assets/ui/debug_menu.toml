@@ -475,15 +475,57 @@ kind = "sub_menu"
 id = "camera"
 label = "menu.player.camera"
 
+# 相机位置/角度：可输入。tick 每 CAM_INFO_REFRESH_SECS 把真实机位回灌，
+# 用户编辑期间（TextInputState.editing）不回灌，避免打字被冲掉。
 [[items.children.children]]
-kind = "text"
+kind = "input"
 id = "pos"
-text = "menu.player.camera.pos"
+label = "menu.player.camera.pos"
+
+[[items.children.children.fields]]
+label = "menu.camera.axis.x"
+text = "0.00"
+min = -1000000.0
+max = 1000000.0
+step = 0.1
+decimals = 2
+
+[[items.children.children.fields]]
+label = "menu.camera.axis.y"
+text = "0.00"
+min = -1000000.0
+max = 1000000.0
+step = 0.1
+decimals = 2
+
+[[items.children.children.fields]]
+label = "menu.camera.axis.z"
+text = "0.00"
+min = -1000000.0
+max = 1000000.0
+step = 0.1
+decimals = 2
 
 [[items.children.children]]
-kind = "text"
+kind = "input"
 id = "dir"
-text = "menu.player.camera.dir"
+label = "menu.player.camera.dir"
+
+[[items.children.children.fields]]
+label = "menu.camera.dir.yaw"
+text = "0.00"
+min = -360.0
+max = 360.0
+step = 0.1
+decimals = 2
+
+[[items.children.children.fields]]
+label = "menu.camera.dir.pitch"
+text = "0.00"
+min = -89.0
+max = 89.0
+step = 0.1
+decimals = 2
 
 [[items.children.children]]
 kind = "switch_group"

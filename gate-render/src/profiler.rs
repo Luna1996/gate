@@ -497,7 +497,7 @@ fn report_lod_diag(
         let p0 = *prev.get_or_insert(cur);
         let d: [u32; WORDS] = std::array::from_fn(|i| cur[i].wrapping_sub(p0[i]));
         *prev = Some(cur);
-        emit_lod_diag(&d);
+        emit_lod_diag(&d, &cur);
       }
     }
   }
@@ -539,7 +539,10 @@ fn report_lod_diag(
   *pending = Some(DiagReadback { staging, done, err });
 }
 
-fn emit_lod_diag(d: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS]) {
+fn emit_lod_diag(
+  d: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS],
+  abs: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS],
+) {
   let entries = d[0].max(1);
   let face_total = (d[3] + d[4] + d[5] + d[6] + d[7] + d[8]).max(1);
   let pct = |v: u32| v as f32 * 100.0 / face_total as f32;
@@ -623,6 +626,27 @@ fn emit_lod_diag(d: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS]) {
     d[39] as f32 / (d[9].max(1) as f32),
     d[38] as f32 / (d[9].max(1) as f32),
   );
+  info!(
+    "DIAG[玻璃终止: 迭代 {} | tint跳出 {} (luma累加 {}) | 预算耗尽 {} | 介质打空 {} | 续射打空 {} | 命中不透明 {} | 再折射 {}]",
+    d[88], d[89], d[95], d[90], d[91], d[92], d[93], d[94],
+  );
+  {
+    let mut mats: Vec<String> = Vec::new();
+    for k in 0..8usize {
+      let b = 104 + k * 4;
+      if abs[b] == 0 {
+        continue;
+      }
+      mats.push(format!(
+        "(pal{} base{} flags0x{:02x} a×255={})",
+        abs[b] - 1,
+        abs[b + 1],
+        abs[b + 2],
+        abs[b + 3]
+      ));
+    }
+    info!("DIAG[透射材质 {} 次: {}]", d[96], mats.join(" "));
+  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

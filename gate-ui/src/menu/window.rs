@@ -16,8 +16,8 @@ use crate::icon::{Icon, IconFont};
 use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::{
-  DropdownValue, LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputValue, UiCtx,
-  color_of, dim_color, label, px, spawn_icon,
+  DropdownValue, LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputState,
+  TextInputValue, UiCtx, color_of, dim_color, label, px, spawn_icon,
 };
 
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -489,10 +489,11 @@ pub fn menu_system(world: &mut World) {
       Has<Checked>,
       Option<&TextInputValue>,
       Option<&DropdownValue>,
+      Option<&TextInputState>,
     )>();
     let snapshot: Vec<ControlSnapshot> = q
       .iter(world)
-      .map(|(item, sv, checked, tv, dv)| {
+      .map(|(item, sv, checked, tv, dv, ts)| {
         (
           item.path.clone(),
           item.role,
@@ -500,10 +501,11 @@ pub fn menu_system(world: &mut World) {
           Some(checked),
           tv.map(|t| t.0.clone()),
           dv.map(|d| d.0),
+          ts.is_some_and(|s| s.editing),
         )
       })
       .collect();
-    for (path, role, sv, checked, tv, dv) in snapshot {
+    for (path, role, sv, checked, tv, dv, editing) in snapshot {
       match role {
         MenuRole::Slider => {
           if let Some(v) = sv {
@@ -515,11 +517,12 @@ pub fn menu_system(world: &mut World) {
             value_changes.push((path, role, MenuValue::Checked(b)));
           }
         }
-        MenuRole::Input(_) | MenuRole::Color => {
+        MenuRole::Input(_) | MenuRole::Color if !editing => {
           if let Some(t) = tv {
             value_changes.push((path, role, MenuValue::Text(t)));
           }
         }
+        MenuRole::Input(_) | MenuRole::Color => {}
         MenuRole::Dropdown => {
           if let Some(i) = dv {
             value_changes.push((path, role, MenuValue::Index(i)));
@@ -642,7 +645,8 @@ enum MenuValue {
   Index(usize),
 }
 
-type ControlSnapshot = (String, MenuRole, Option<f32>, Option<bool>, Option<String>, Option<usize>);
+type ControlSnapshot =
+  (String, MenuRole, Option<f32>, Option<bool>, Option<String>, Option<usize>, bool);
 
 fn ev(root: Entity, path: &str, action: MenuAction) -> MenuActionEvent {
   MenuActionEvent { entity: root, path: path.to_string(), action }

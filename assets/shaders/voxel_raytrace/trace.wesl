@@ -48,6 +48,16 @@ const DIAG_FAR_ITERS: u32 = 36u;
 const DIAG_FAR_TRACES: u32 = 37u;
 const DIAG_GLASS_REFL: u32 = 38u;
 const DIAG_GLASS_ITERS: u32 = 39u;
+const DIAG_GL_IT: u32 = 88u;
+const DIAG_GL_TINTBRK: u32 = 89u;
+const DIAG_GL_BUDGET: u32 = 90u;
+const DIAG_GL_MEDMISS: u32 = 91u;
+const DIAG_GL_RAYMISS: u32 = 92u;
+const DIAG_GL_OPAQUE: u32 = 93u;
+const DIAG_GL_REFRACT: u32 = 94u;
+const DIAG_GL_TINT: u32 = 95u;
+const DIAG_MAT_N: u32 = 96u;
+const DIAG_MAT_BASE: u32 = 104u;
 fn diag_ray(origin: vec3<f32>, dir: vec3<f32>) -> bool {
   return LOD_DIAG == 1u && ((bitcast<u32>(origin.x) ^ bitcast<u32>(dir.z)) & 63u) == 0u;
 }

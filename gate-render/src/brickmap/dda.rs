@@ -260,7 +260,7 @@ pub(crate) struct DdaBg2BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
 pub(crate) struct DdaBg3BindGroup(pub(crate) BindGroup);
 #[derive(Resource)]
-struct DdaBlitBindGroup(BindGroup);
+pub struct DdaBlitBindGroup(pub BindGroup);
 
 #[derive(Resource)]
 pub(crate) struct LightPoolGpu(UniformBuffer<LightPoolUniform>);
@@ -389,7 +389,7 @@ pub(crate) struct DdaPipelines {
 
   eye_histogram_pipeline: CachedComputePipelineId,
   eye_update_pipeline: CachedComputePipelineId,
-  blit_pipeline: CachedRenderPipelineId,
+  pub blit_pipeline: CachedRenderPipelineId,
 
   blit_fxaa_pipeline: CachedRenderPipelineId,
 }
@@ -528,6 +528,12 @@ impl Plugin for BrickMapDdaPlugin {
       .add_systems(
         Core2d,
         frame_bracket_tail.in_set(Core2dSystems::PostProcess).after(blit_dda_view),
+      )
+      .add_systems(
+        Core2d,
+        crate::capture_system::capture_dda_view
+          .in_set(Core2dSystems::PostProcess)
+          .after(blit_dda_view),
       )
       .add_systems(Core2d, blit_dda_view.in_set(Core2dSystems::PostProcess));
   }

@@ -10,6 +10,7 @@ mod objects;
 mod physics;
 mod scene;
 mod showcase;
+mod single_instance;
 #[cfg(feature = "profile")]
 mod tracy_layer;
 mod vox_scene;
@@ -53,6 +54,8 @@ pub fn log_path() -> std::path::PathBuf {
 }
 
 fn main() {
+  let _single_instance = single_instance::acquire("gate");
+
   #[cfg(feature = "profile")]
   let _tracy_client = tracy_client::Client::start();
 

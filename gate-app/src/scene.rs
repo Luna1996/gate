@@ -24,6 +24,8 @@ pub(crate) const CUBE_IN_VOID: &str = "cube_in_void";
 
 pub(crate) const INFINITE_CUBES: &str = "infinite_cubes";
 
+pub(crate) const GLASS_TEST: &str = "glass_test";
+
 pub(crate) fn setup(
   mut commands: Commands,
   mut images: ResMut<Assets<Image>>,
@@ -60,6 +62,7 @@ pub(crate) fn setup(
       .unwrap_or_else(|| "nuke".to_string());
     (cam_eye, cam_target) = match name.as_str() {
       CUBE_IN_VOID => (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO),
+      GLASS_TEST => glass_test_camera(),
       mc::MC_MAP => mc_camera(),
       _ => (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5)),
     };
@@ -182,6 +185,10 @@ fn build_world(
     stream.set_source(None);
     return Ok(build_infinite_cubes(grid, pbr_ids, cam_eye, stream.coarse_radius));
   }
+  if name == GLASS_TEST {
+    stream.set_source(None);
+    return Ok(build_glass_test(grid));
+  }
   if name == mc::MC_MAP {
     let (info, city) = mc::build(grid, cam_eye)?;
     stream.set_source(Some(city));
@@ -241,6 +248,100 @@ fn build_cube_in_void(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
   vox_scene::VoxSceneInfo {
     aabb_min: min,
     aabb_max: min + IVec3::splat(EDGE),
+    instances_used: 1,
+    voxels_written,
+    voxels_dropped: 0,
+  }
+}
+
+const GLASS_ROOM_HALF: i32 = 64;
+const GLASS_ROOM_H: i32 = 64;
+const GLASS_WALL: i32 = 2;
+const GLASS_CUBE_EDGE: i32 = 32;
+const GLASS_CUBE_Y: i32 = 40;
+
+fn glass_test_camera() -> (Vec3, Vec3) {
+  let eye = Vec3::new(0.0, GLASS_CUBE_Y as f32 - 2.0, 52.0);
+  (eye, Vec3::new(0.0, GLASS_CUBE_Y as f32 - 4.0, 0.0))
+}
+
+fn build_glass_test(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
+  use gate_voxel::palette::PaletteFlags;
+
+  const P_FLOOR: u16 = 1;
+  const P_CEIL: u16 = 2;
+  const P_WALL_NX: u16 = 3;
+  const P_WALL_PX: u16 = 4;
+  const P_WALL_NZ: u16 = 5;
+  const P_WALL_PZ: u16 = 6;
+  const P_GLASS: u16 = 7;
+  const P_POST: u16 = 8;
+
+  let solid = |color: [u8; 3]| PaletteEntry { color, roughness: 210, ..Default::default() };
+  let palette = grid.palette_mut();
+  palette.set(PaletteId(P_FLOOR), solid([72, 72, 80]));
+  palette.set(PaletteId(P_CEIL), solid([205, 210, 220]));
+  palette.set(PaletteId(P_WALL_NX), solid([200, 64, 64]));
+  palette.set(PaletteId(P_WALL_PX), solid([64, 190, 84]));
+  palette.set(PaletteId(P_WALL_NZ), solid([72, 112, 220]));
+  palette.set(PaletteId(P_WALL_PZ), solid([222, 202, 72]));
+  palette.set(
+    PaletteId(P_GLASS),
+    PaletteEntry {
+      color: [232, 244, 255],
+      roughness: 8,
+      transmission: 240,
+      flags: PaletteFlags::TRANSMISSIVE,
+      ..Default::default()
+    },
+  );
+  palette.set(PaletteId(P_POST), solid([236, 64, 190]));
+
+  let h = GLASS_ROOM_HALF;
+  let height = GLASS_ROOM_H;
+  let mut voxels_written = 0usize;
+
+  voxels_written += fill_box(
+    grid,
+    IVec3::new(-h - GLASS_WALL, -GLASS_WALL, -h - GLASS_WALL),
+    IVec3::new(2 * (h + GLASS_WALL), GLASS_WALL, 2 * (h + GLASS_WALL)),
+    P_FLOOR,
+  );
+  voxels_written += fill_box(
+    grid,
+    IVec3::new(-h - GLASS_WALL, height, -h - GLASS_WALL),
+    IVec3::new(2 * (h + GLASS_WALL), GLASS_WALL, 2 * (h + GLASS_WALL)),
+    P_CEIL,
+  );
+  for (min_x, pal_x) in [(-h - GLASS_WALL, P_WALL_NX), (h, P_WALL_PX)] {
+    voxels_written += fill_box(
+      grid,
+      IVec3::new(min_x, 0, -h - GLASS_WALL),
+      IVec3::new(GLASS_WALL, height, 2 * (h + GLASS_WALL)),
+      pal_x,
+    );
+  }
+  for (min_z, pal_z) in [(-h - GLASS_WALL, P_WALL_NZ), (h, P_WALL_PZ)] {
+    voxels_written +=
+      fill_box(grid, IVec3::new(-h, 0, min_z), IVec3::new(2 * h, height, GLASS_WALL), pal_z);
+  }
+
+  let cube_min =
+    IVec3::new(-GLASS_CUBE_EDGE / 2, GLASS_CUBE_Y - GLASS_CUBE_EDGE / 2, -GLASS_CUBE_EDGE / 2);
+  voxels_written += fill_box(grid, cube_min, IVec3::splat(GLASS_CUBE_EDGE), P_GLASS);
+
+  voxels_written += fill_box(
+    grid,
+    IVec3::new(-6, GLASS_CUBE_Y - 6, cube_min.z - GLASS_WALL - 6),
+    IVec3::new(12, 12, 6),
+    P_POST,
+  );
+
+  let aabb_min = IVec3::new(-h - GLASS_WALL, -GLASS_WALL, -h - GLASS_WALL);
+  vox_scene::VoxSceneInfo {
+    aabb_min,
+    aabb_max: aabb_min
+      + IVec3::new(2 * (h + GLASS_WALL), height + 2 * GLASS_WALL, 2 * (h + GLASS_WALL)),
     instances_used: 1,
     voxels_written,
     voxels_dropped: 0,

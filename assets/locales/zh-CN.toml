@@ -409,8 +409,11 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 "menu.game.phys.rate" = "物理步频"
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
-"menu.camera.pos.value" = "%{v}"
-"menu.camera.dir.value" = "yaw %{yaw}°, pitch %{pitch}°"
+"menu.camera.axis.x" = "X"
+"menu.camera.axis.y" = "Y"
+"menu.camera.axis.z" = "Z"
+"menu.camera.dir.yaw" = "偏航°"
+"menu.camera.dir.pitch" = "俯仰°"
 
 "showcase.tab.widgets" = "组件"
 "showcase.tab.data" = "数据"

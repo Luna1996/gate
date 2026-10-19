@@ -29,8 +29,7 @@ impl TextInputKind {
       return v;
     };
     let c = v.clamp(min, max);
-    let snapped = if step > 0.0 { min + ((c - min) / step).round() * step } else { c };
-    snapped.clamp(min, max)
+    if step > 0.0 { (c / step).round() * step } else { c }.clamp(min, max)
   }
 
   pub fn format(&self, v: f32) -> String {
@@ -202,6 +201,9 @@ pub fn text_input_pointer_system(
       st.editing = false;
       if focus.0 == Some(e) {
         focus.0 = None;
+      }
+      if let Some(v) = kind.parse(&value.0) {
+        value.0 = kind.format(v);
       }
       commands.trigger(TextInputChanged { entity: e, text: value.0.clone() });
       continue;

@@ -18,8 +18,9 @@ use crate::edit::{
 };
 use crate::showcase::ShowcaseRoot;
 use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
+use gate_ui::widgets::{TextInputState, TextInputValue};
 use gate_ui::{
-  DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
+  DebugMenu, DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
   parse_hex_color, spawn_debug_menu,
 };
 use std::sync::atomic::Ordering;
@@ -96,6 +97,7 @@ fn apply_world_model_options(model: &mut MenuFile) {
   let mut options = crate::vox_scene::scan_vox_models();
   options.push(crate::scene::CUBE_IN_VOID.to_string());
   options.push(crate::scene::INFINITE_CUBES.to_string());
+  options.push(crate::scene::GLASS_TEST.to_string());
   options.push(crate::mc::MC_MAP.to_string());
   options.sort();
   options.dedup();
@@ -518,6 +520,57 @@ fn register_callbacks(world: &mut World) {
   );
 
   world.add_observer(
+    |ev: On<gate_ui::TextInputChanged>,
+     q_items: Query<&gate_ui::MenuItem>,
+     mut mode: ResMut<CameraMode>,
+     mut orbit: ResMut<gate_render::OrbitCamera>,
+     mut fly: ResMut<FlyCamera>,
+     q_menu: Query<&DebugMenu>| {
+      let Ok(item) = q_items.get(ev.entity) else { return };
+      let p = item.path.as_str();
+      let want = match p {
+        CAM_POS_PATH => 3,
+        CAM_DIR_PATH => 2,
+        _ => return,
+      };
+      let gate_ui::MenuRole::Input(edited) = item.role else { return };
+      if edited >= want {
+        return;
+      }
+      let segs: Vec<String> = p.split('/').map(str::to_owned).collect();
+      let Ok(menu) = q_menu.single() else { return };
+      let Some(MenuNode::Input { fields, .. }) = menu.model.node(&segs) else { return };
+      if fields.len() < want {
+        return;
+      }
+      let Some(v) = merge_camera_fields(fields, edited, &ev.text, want) else {
+        warn!("相机输入未成形 → 忽略本次提交");
+        return;
+      };
+      if p == CAM_POS_PATH {
+        let eye = Vec3::new(v[0], v[1], v[2]);
+        match *mode {
+          CameraMode::Fly => fly.pos = eye,
+          CameraMode::Orbit => {
+            let f = crate::camera::look_forward(orbit.yaw, orbit.pitch);
+            orbit.target = eye + f * orbit.distance;
+          }
+        }
+        info!("相机位置 → ({:.2}, {:.2}, {:.2})", eye.x, eye.y, eye.z);
+      } else {
+        orbit.yaw = v[0].to_radians();
+        orbit.pitch = v[1].to_radians();
+        orbit.clamp();
+        info!(
+          "相机角度 → yaw {:.2}° pitch {:.2}°",
+          orbit.yaw.to_degrees(),
+          orbit.pitch.to_degrees()
+        );
+      }
+    },
+  );
+
+  world.add_observer(
     |ev: On<MenuActionEvent>,
      mut edit: ResMut<EditSettings>,
      q_menu: Query<&gate_ui::DebugMenu>,
@@ -900,12 +953,47 @@ pub(crate) fn sync_edit_menu(
   }
 }
 
+pub(crate) fn merge_camera_fields(
+  fields: &[gate_ui::InputField],
+  edited: usize,
+  event_text: &str,
+  want: usize,
+) -> Option<[f32; 3]> {
+  if edited >= want || fields.len() < want {
+    return None;
+  }
+  let mut v = [0.0f32; 3];
+  for (k, slot) in v.iter_mut().enumerate().take(want) {
+    let raw: &str = if k == edited { event_text } else { &fields[k].text };
+    *slot = raw.trim().parse::<f32>().ok().filter(|x| x.is_finite())?;
+  }
+  Some(v)
+}
+
+pub(crate) fn wrap_deg(deg: f32) -> f32 {
+  if !deg.is_finite() {
+    return 0.0;
+  }
+  let w = deg % 360.0;
+  if w >= 180.0 {
+    w - 360.0
+  } else if w < -180.0 {
+    w + 360.0
+  } else {
+    w
+  }
+}
+
+pub(crate) const CAM_POS_PATH: &str = "player/camera/pos";
+pub(crate) const CAM_DIR_PATH: &str = "player/camera/dir";
+
 pub(crate) fn camera_info_tick(
   time: Res<Time>,
   orbit: Res<gate_render::OrbitCamera>,
   mode: Res<CameraMode>,
   fly: Res<FlyCamera>,
-  mut q_values: Query<(&gate_ui::MenuTextValue, &mut Text)>,
+  mut q_fields: Query<(&gate_ui::MenuItem, &TextInputState, &mut TextInputValue)>,
+  mut q_menu: Query<&mut DebugMenu>,
   mut acc: Local<f32>,
 ) {
   *acc += time.delta_secs();
@@ -917,22 +1005,40 @@ pub(crate) fn camera_info_tick(
     CameraMode::Orbit => orbit.eye(),
     CameraMode::Fly => fly.pos,
   };
-  let pos = t!("menu.camera.pos.value", v = format!("({:.1}, {:.1}, {:.1})", eye.x, eye.y, eye.z))
-    .to_string();
-  let dir = t!(
-    "menu.camera.dir.value",
-    yaw = format!("{:.1}", orbit.yaw.to_degrees()),
-    pitch = format!("{:.1}", orbit.pitch.to_degrees())
-  )
-  .to_string();
-  for (value, mut text) in &mut q_values {
-    let s = match value.path.as_str() {
-      "player/camera/pos" => &pos,
-      "player/camera/dir" => &dir,
+  let yaw_deg = wrap_deg(orbit.yaw.to_degrees());
+  let pitch_deg = orbit.pitch.to_degrees();
+
+  let mut writes: Vec<(String, usize, String)> = Vec::new();
+  for (item, st, mut value) in &mut q_fields {
+    if st.editing {
+      continue;
+    }
+    let vals: &[f32] = match item.path.as_str() {
+      CAM_POS_PATH => &[eye.x, eye.y, eye.z],
+      CAM_DIR_PATH => &[yaw_deg, pitch_deg],
       _ => continue,
     };
-    if text.0 != *s {
-      text.0 = s.clone();
+    let gate_ui::MenuRole::Input(i) = item.role else { continue };
+    let Some(v) = vals.get(i) else { continue };
+    let text = format!("{v:.2}");
+    if value.0 != text {
+      value.0 = text.clone();
+      writes.push((item.path.clone(), i, text));
+    }
+  }
+  if writes.is_empty() {
+    return;
+  }
+  let Ok(mut menu) = q_menu.single_mut() else { return };
+  for (path, i, text) in writes {
+    let segs: Vec<String> = path.split('/').map(str::to_owned).collect();
+    let Some(MenuNode::Input { fields, .. }) = menu.model.node_mut(&segs) else {
+      continue;
+    };
+    if let Some(f) = fields.get_mut(i)
+      && f.text != text
+    {
+      f.text = text;
     }
   }
 }

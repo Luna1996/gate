@@ -1,4 +1,6 @@
 pub mod brickmap;
+pub mod capture;
+pub mod capture_system;
 pub mod consts;
 pub mod gi;
 pub mod lighting;
@@ -38,14 +40,16 @@ pub struct GateRenderPlugin;
 
 impl Plugin for GateRenderPlugin {
   fn build(&self, app: &mut App) {
-    app.add_plugins((
-      brickmap::upload::VolumePlugin,
-      brickmap::dda::BrickMapDdaPlugin,
-      gi::GiPlugin,
-      volumetric::FogPlugin,
-      sky::SkyPlugin,
-      profiler::GateProfilerPlugin,
-      pbr_texture::PbrTexturesPlugin,
-    ));
+    app
+      .add_plugins((
+        brickmap::upload::VolumePlugin,
+        brickmap::dda::BrickMapDdaPlugin,
+        gi::GiPlugin,
+        volumetric::FogPlugin,
+        sky::SkyPlugin,
+        profiler::GateProfilerPlugin,
+        pbr_texture::PbrTexturesPlugin,
+      ))
+      .add_plugins(capture_system::CapturePlugin);
   }
 }

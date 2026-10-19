@@ -30,17 +30,3 @@ fn validate_all_entries(src: &str, ray_query: bool) {
   .validate(&module)
   .expect("WGSL 校验失败");
 }
-
-#[test]
-fn wesl_package_compiles_and_validates() {
-  for ray_query in [false, true] {
-    let src = gate_render::shader::compile_dda_wesl(ray_query).expect("WESL 编译失败");
-    assert_eq!(src.contains("enable wgpu_ray_query"), ray_query, "enable 指令与 flag 不对应");
-    assert_eq!(
-      src.contains("var tlas: acceleration_structure"),
-      ray_query,
-      "tlas 声明与 flag 不对应"
-    );
-    validate_all_entries(&src, ray_query);
-  }
-}

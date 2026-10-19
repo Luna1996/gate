@@ -6,7 +6,7 @@ import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal,
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_pool, GI_WAL_MATURE_N};
-import package::trace::{DIAG_GLASS_ITERS, DIAG_GLASS_REFL, diag_ray, diag_sampled, make_grid};
+import package::trace::{medium_of, DIAG_MAT_BASE, DIAG_MAT_N, DIAG_GLASS_ITERS, DIAG_GLASS_REFL, DIAG_GL_BUDGET, DIAG_GL_IT, DIAG_GL_MEDMISS, DIAG_GL_OPAQUE, DIAG_GL_RAYMISS, DIAG_GL_REFRACT, DIAG_GL_TINT, DIAG_GL_TINTBRK, diag_ray, diag_sampled, make_grid};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
 
@@ -38,7 +38,7 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 const GLASS_EPS: f32 = 1e-3;
-const GLASS_MAX_BOUNCE: u32 = 3u;
+const GLASS_MAX_BOUNCE: u32 = 8u;
 const GLASS_REFL_MIN: f32 = 0.02;
 const GLASS_REFL_WEIGHT_MIN: f32 = 0.015;
 const GLASS_TINT_MIN: f32 = 0.02;
@@ -132,7 +132,7 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
   let gdiag = diag_ray(origin_voxel, dir_voxel);
   let g0w = make_grid(0u);
   let sec_on = secondary_on();
-  let mt = secondary_reach(max_t);
+        let mt = max_t;
   var pal_c: u32 = 0xFFFFFFFFu;
   var pbase_c: u32 = 0u;
   var xpar_c: bool = true;
@@ -156,6 +156,7 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
     org = org + dir * GLASS_EPS;
   }
+  var last = world_miss();
   for (var bounce = 0u; bounce < GLASS_MAX_BOUNCE; bounce = bounce + 1u) {
     var seg = vec3<f32>(1.0);
     var best: WorldHit;
@@ -164,10 +165,34 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
     } else {
       best = world_raycast(g0w, org, dir, mt, world_cfg_primary(0.0, 3u));
     }
-    if (gdiag) { atomicAdd(&lod_diag[DIAG_GLASS_ITERS], 1u); }
+    if (gdiag) {
+      atomicAdd(&lod_diag[DIAG_GLASS_ITERS], 1u);
+      atomicAdd(&lod_diag[DIAG_GL_IT], 1u);
+            let mc2 = atomicAdd(&lod_diag[DIAG_MAT_N], 1u);
+      if (mc2 < 8u || (mc2 & 2047u) == 0u) {
+        if (best.hit) {
+          let slot = min(mc2 / 2048u, 7u);
+          let xb = DIAG_MAT_BASE + slot * 4u;
+          if (atomicLoad(&lod_diag[xb]) == 0u) {
+            atomicStore(&lod_diag[xb + 0u], best.pal + 1u);
+            atomicStore(&lod_diag[xb + 1u], best.palette_base);
+            atomicStore(&lod_diag[xb + 2u], palette_flags(best.palette_base, best.pal));
+            atomicStore(&lod_diag[xb + 3u], u32(medium_of(best.palette_base, best.pal).a * 255.0));
+          }
+        }
+      }
+    }
     tint = tint * seg;
-    if (bounce > 0u && dot(tint, GI_LUMA) < GLASS_TINT_MIN) { break; }
-    if (!best.hit) { return GlassOut(best, tint, refl, dir); }
+    if (best.hit) { last = best; }
+    if (bounce > 0u && dot(tint, GI_LUMA) < GLASS_TINT_MIN) {
+      if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_TINTBRK], 1u); atomicAdd(&lod_diag[DIAG_GL_TINT], u32(clamp(dot(tint, GI_LUMA), 0.0, 1.0) * 1000.0)); }
+                  if (last.hit) { return GlassOut(last, tint, refl, dir); }
+      break;
+    }
+    if (!best.hit) {
+      if (gdiag) { atomicAdd(&lod_diag[select(DIAG_GL_RAYMISS, DIAG_GL_MEDMISS, in_medium)], 1u); }
+      return GlassOut(best, tint, refl, dir);
+    }
     if (best.pal != pal_c || best.palette_base != pbase_c) {
       pal_c = best.pal;
       pbase_c = best.palette_base;
@@ -175,6 +200,7 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
       ior_c = material_ior(best.palette_base, best.pal);
     }
     if (!xpar_c) {
+      if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_OPAQUE], 1u); }
       return GlassOut(best, tint, refl, dir);
     }
     let p_hit = org + dir * best.t;
@@ -200,18 +226,22 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t:
       dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
       in_medium = true;
     } else {
+                              let n_out = select(-nn, nn, dot(dir, nn) < 0.0);
       let eta = ior;
-      let ci_out = clamp(dot(dir, nn), 0.0, 1.0);
+      let ci_out = clamp(dot(-dir, n_out), 0.0, 1.0);
       let k = 1.0 - eta * eta * (1.0 - ci_out * ci_out);
       if (k < 0.0) {
-        dir = reflect(dir, nn);
+        dir = reflect(dir, n_out);
       } else {
-        dir = normalize(eta * dir - (eta * ci_out - sqrt(k)) * nn);
+        dir = normalize(eta * dir + (eta * ci_out - sqrt(k)) * n_out);
         in_medium = false;
       }
     }
+    if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_REFRACT], 1u); }
     org = p_hit + dir * GLASS_EPS;
   }
+  if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_BUDGET], 1u); }
+      if (last.hit) { return GlassOut(last, tint, refl, dir); }
   return GlassOut(WorldHit(false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), 0, 0u),
                   tint, refl, dir);
 }
