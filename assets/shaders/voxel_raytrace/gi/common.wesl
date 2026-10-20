@@ -110,16 +110,11 @@ const FACE_W_K0: u32 = 1u;
 const FACE_W_K1: u32 = 2u;
 const FACE_W_TEXEL: u32 = 3u;
 const FACE_W_PAL: u32 = 4u;
-const FACE_W_COL: u32 = 5u;
 const FACE_W_GI_N: u32 = 8u;
 const FACE_W_GI: u32 = 9u;
 const FACE_W_RAW_N: u32 = 12u;
 const FACE_W_RAW: u32 = 13u;
 
-const FACE_W_SUN: u32 = 16u;
-
-const FACE_W_FACE: u32 = 17u;
-const FACE_BAKED_BIT: u32 = 8u;
 const GI_ACC_SCALE: f32 = 4096.0;
 const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;
@@ -223,21 +218,6 @@ fn face_slot_find_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
     return second;
   }
   return 0u;
-}
-
-fn face_slot_color(k0: u32, k1: u32, pal_out: ptr<function, u32>, sun_out: ptr<function, u32>,
-                   ok: ptr<function, bool>) -> vec3<f32> {
-  *pal_out = 0u;
-  *sun_out = 0u;
-  let slot = face_slot_find(k0, k1, ok);
-  if (!*ok) { return vec3<f32>(0.0); }
-  let fe = slot * FACE_WORDS;
-  *pal_out = atomicLoad(&face_slots[fe + FACE_W_PAL]);
-  *sun_out = atomicLoad(&face_slots[fe + FACE_W_SUN]);
-  let c0 = atomicLoad(&face_slots[fe + FACE_W_COL]);
-  let c1 = atomicLoad(&face_slots[fe + FACE_W_COL + 1u]);
-  let c2 = atomicLoad(&face_slots[fe + FACE_W_COL + 2u]);
-  return vec3<f32>(bitcast<f32>(c0), bitcast<f32>(c1), bitcast<f32>(c2));
 }
 
 const GI_SEC_WORDS: u32 = 5u;

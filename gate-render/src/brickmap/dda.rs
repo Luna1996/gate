@@ -529,12 +529,6 @@ impl Plugin for BrickMapDdaPlugin {
         Core2d,
         frame_bracket_tail.in_set(Core2dSystems::PostProcess).after(blit_dda_view),
       )
-      .add_systems(
-        Core2d,
-        crate::capture_system::capture_dda_view
-          .in_set(Core2dSystems::PostProcess)
-          .after(blit_dda_view),
-      )
       .add_systems(Core2d, blit_dda_view.in_set(Core2dSystems::PostProcess));
   }
 }

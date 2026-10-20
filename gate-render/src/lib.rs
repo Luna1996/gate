@@ -1,6 +1,4 @@
 pub mod brickmap;
-pub mod capture;
-pub mod capture_system;
 pub mod consts;
 pub mod gi;
 pub mod lighting;
@@ -49,7 +47,6 @@ impl Plugin for GateRenderPlugin {
         sky::SkyPlugin,
         profiler::GateProfilerPlugin,
         pbr_texture::PbrTexturesPlugin,
-      ))
-      .add_plugins(capture_system::CapturePlugin);
+      ));
   }
 }
