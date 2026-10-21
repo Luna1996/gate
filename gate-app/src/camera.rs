@@ -80,6 +80,16 @@ pub(crate) fn look_forward(yaw: f32, pitch: f32) -> Vec3 {
   Vec3::new(-sin_yaw * cos_pitch, -sin_pitch, -cos_yaw * cos_pitch)
 }
 
+pub(crate) fn set_camera_preset(
+  orbit: &mut OrbitCamera,
+  fly: &mut FlyCamera,
+  eye: Vec3,
+  target: Vec3,
+) {
+  *orbit = OrbitCamera::from_eye(eye, target);
+  fly.pos = eye;
+}
+
 pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>) {
   let dt = time.delta_secs();
   orbit.yaw -= 0.35 * dt;

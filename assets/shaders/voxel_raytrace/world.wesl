@@ -462,9 +462,6 @@ fn medium_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, stop_on_air: bool,
   }
 }
 
-// 玻璃与反射的透射追踪：允许穿过介质，可见性与主射线 world_raycast 保持一致
-// （近体积封顶于覆盖半径，远体积只取覆盖半径之外的段）。
-// world_trace_medium_scene 对远体积整体跳过、且不封顶近体积，反射里会在覆盖半径处留下断层（彩环）。
 fn world_trace_glass_path(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_on_air: bool,
                           tint: ptr<function, vec3<f32>>) -> WorldHit {
   let g0 = make_grid(0u);

@@ -38,8 +38,8 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 const GLASS_EPS: f32 = 1e-3;
-// 出射处是否再折射一次：开启为物理模型（平行窗格的角度会抵消）；关闭则只在入射处折射一次。
 const GLASS_EXIT_BEND: bool = true;
+const GLASS_FRESNEL_PER_PIXEL: bool = true;
 const GLASS_REFL_MIN: f32 = 0.02;
 const GLASS_REFL_WEIGHT_MIN: f32 = 0.015;
 const GLASS_REFL_AMBIENT: f32 = 0.15;
@@ -121,14 +121,13 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
   refl_req[o + 1u] = vec4<u32>(pbase, face_id, 0u, px);
 }
 
-// 玻璃：空气 → 玻璃、玻璃 → 空气 各一次折射；菲涅尔反射只在入射时计算一次；玻璃内部不循环弹射。
-// 平行面的玻璃板出射后方向复原（只产生位移）；玻璃块侧面出射时才有明显偏折。
-// 全反射时取钳位后的折射方向：与临界角两侧连续，不会出现断层。
 fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
-               entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32) -> GlassOut {
+               entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32,
+               entry_v_px: vec3<f32>) -> GlassOut {
   var tint = vec3<f32>(1.0);
   let f0 = dielectric_f0(entry_ior, 1.0);
-  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(entry_v, entry_n), 0.0, 1.0), 5.0);
+  let fres_v = select(entry_v, entry_v_px, GLASS_FRESNEL_PER_PIXEL);
+  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(fres_v, entry_n), 0.0, 1.0), 5.0);
   if (secondary_on() && light_u.g.refl_tier > 0u && fres > GLASS_REFL_MIN
       && dot(vec3<f32>(fres), GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
     queue_refl_ray(origin_voxel + entry_n * GLASS_EPS, reflect(-entry_v, entry_n),
@@ -355,9 +354,10 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if (!n_hint_ok) { fnn = voxel_normal_fast(fg, first.voxel, first.face_id, first.n); }
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
     
-    let f_face = fp + fnn * f_off;
+            let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let g = trace_glass(f_face, -fv, frustum_length, fnn, material_ior(first.palette_base, first.pal), fv, qpx);
+    let fv_px = origin_voxel - first.point;
+    let g = trace_glass(f_face, -fv, frustum_length, fnn, material_ior(first.palette_base, first.pal), fv, qpx, fv_px);
     best = g.ray;
     through = g.tint;
     refl = g.refl;

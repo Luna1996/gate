@@ -26,6 +26,8 @@ pub(crate) const INFINITE_CUBES: &str = "infinite_cubes";
 
 pub(crate) const GLASS_TEST: &str = "glass_test";
 
+pub(crate) const GLASS_SLAB: &str = "glass_slab";
+
 pub(crate) fn setup(
   mut commands: Commands,
   mut images: ResMut<Assets<Image>>,
@@ -63,6 +65,7 @@ pub(crate) fn setup(
     (cam_eye, cam_target) = match name.as_str() {
       CUBE_IN_VOID => (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO),
       GLASS_TEST => glass_test_camera(),
+      GLASS_SLAB => glass_slab_camera(),
       mc::MC_MAP => mc_camera(),
       _ => (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5)),
     };
@@ -189,6 +192,10 @@ fn build_world(
     stream.set_source(None);
     return Ok(build_glass_test(grid));
   }
+  if name == GLASS_SLAB {
+    stream.set_source(None);
+    return Ok(build_glass_slab(grid));
+  }
   if name == mc::MC_MAP {
     let (info, city) = mc::build(grid, cam_eye)?;
     stream.set_source(Some(city));
@@ -280,7 +287,10 @@ fn build_glass_test(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
   let solid = |color: [u8; 3]| PaletteEntry { color, ..Default::default() };
   let palette = grid.palette_mut();
   palette.set(PaletteId(P_FLOOR), solid([72, 72, 80]));
-  palette.set(PaletteId(P_CEIL), PaletteEntry { color: [205, 210, 220], emissive: 255, ..Default::default() });
+  palette.set(
+    PaletteId(P_CEIL),
+    PaletteEntry { color: [205, 210, 220], emissive: 255, ..Default::default() },
+  );
   palette.set(PaletteId(P_WALL_NX), solid([200, 64, 64]));
   palette.set(PaletteId(P_WALL_PX), solid([64, 190, 84]));
   palette.set(PaletteId(P_WALL_NZ), solid([72, 112, 220]));
@@ -342,6 +352,70 @@ fn build_glass_test(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
     aabb_min,
     aabb_max: aabb_min
       + IVec3::new(2 * (h + GLASS_WALL), height + 2 * GLASS_WALL, 2 * (h + GLASS_WALL)),
+    instances_used: 1,
+    voxels_written,
+    voxels_dropped: 0,
+  }
+}
+
+const SLAB_HALF: i32 = 1024;
+const SLAB_DEPTH: i32 = 64;
+const SLAB_GLASS: i32 = 64;
+fn glass_slab_camera() -> (Vec3, Vec3) {
+  let eye = Vec3::new(0.0, (SLAB_GLASS + 16) as f32, 600.0);
+  (eye, Vec3::new(0.0, 0.0, -600.0))
+}
+
+pub(crate) fn test_world_camera(name: &str) -> Option<(Vec3, Vec3)> {
+  match name {
+    GLASS_TEST => Some(glass_test_camera()),
+    GLASS_SLAB => Some(glass_slab_camera()),
+    _ => None,
+  }
+}
+
+fn build_glass_slab(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
+  use gate_voxel::palette::PaletteFlags;
+
+  const P_GROUND: u16 = 1;
+  const P_GLASS: u16 = 2;
+
+  let palette = grid.palette_mut();
+  palette.set(
+    PaletteId(P_GROUND),
+    PaletteEntry { color: [128, 128, 132], roughness: 200, ..Default::default() },
+  );
+  palette.set(
+    PaletteId(P_GLASS),
+    PaletteEntry {
+      color: [255, 255, 255],
+      roughness: 8,
+      transmission: 255,
+      flags: PaletteFlags::TRANSMISSIVE,
+      ..Default::default()
+    },
+  );
+
+  let half = SLAB_HALF;
+  let mut voxels_written = 0usize;
+
+  voxels_written += fill_box(
+    grid,
+    IVec3::new(-half, -SLAB_DEPTH, -half),
+    IVec3::new(2 * half, SLAB_DEPTH, 2 * half),
+    P_GROUND,
+  );
+  voxels_written += fill_box(
+    grid,
+    IVec3::new(-half, 0, -half),
+    IVec3::new(2 * half, SLAB_GLASS, 2 * half),
+    P_GLASS,
+  );
+
+  let aabb_min = IVec3::new(-half, -SLAB_DEPTH, -half);
+  vox_scene::VoxSceneInfo {
+    aabb_min,
+    aabb_max: aabb_min + IVec3::new(2 * half, SLAB_DEPTH + SLAB_GLASS, 2 * half),
     instances_used: 1,
     voxels_written,
     voxels_dropped: 0,

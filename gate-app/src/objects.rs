@@ -7,8 +7,8 @@ use gate_ui::{MenuAction, MenuActionEvent};
 use crate::{
   camera::{CameraMode, FlyCamera, MouseLock, cursor_ray},
   edit::{
-    BrushShape, Burst, EditSettings, EditTarget, HoldRepeat, RANDOM_SIZE_MAX, Rng, apply_brush,
-    brush_radius, burst, material_slot,
+    BrushShape, Burst, EditSettings, EditTarget, HoldRepeat, Rng, apply_brush, brush_radius, burst,
+    material_slot,
   },
   physics::PhysicsState,
 };

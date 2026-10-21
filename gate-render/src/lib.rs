@@ -38,15 +38,14 @@ pub struct GateRenderPlugin;
 
 impl Plugin for GateRenderPlugin {
   fn build(&self, app: &mut App) {
-    app
-      .add_plugins((
-        brickmap::upload::VolumePlugin,
-        brickmap::dda::BrickMapDdaPlugin,
-        gi::GiPlugin,
-        volumetric::FogPlugin,
-        sky::SkyPlugin,
-        profiler::GateProfilerPlugin,
-        pbr_texture::PbrTexturesPlugin,
-      ));
+    app.add_plugins((
+      brickmap::upload::VolumePlugin,
+      brickmap::dda::BrickMapDdaPlugin,
+      gi::GiPlugin,
+      volumetric::FogPlugin,
+      sky::SkyPlugin,
+      profiler::GateProfilerPlugin,
+      pbr_texture::PbrTexturesPlugin,
+    ));
   }
 }

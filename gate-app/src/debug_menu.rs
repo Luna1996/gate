@@ -98,6 +98,7 @@ fn apply_world_model_options(model: &mut MenuFile) {
   options.push(crate::scene::CUBE_IN_VOID.to_string());
   options.push(crate::scene::INFINITE_CUBES.to_string());
   options.push(crate::scene::GLASS_TEST.to_string());
+  options.push(crate::scene::GLASS_SLAB.to_string());
   options.push(crate::mc::MC_MAP.to_string());
   options.sort();
   options.dedup();
@@ -522,7 +523,7 @@ fn register_callbacks(world: &mut World) {
   world.add_observer(
     |ev: On<gate_ui::TextInputChanged>,
      q_items: Query<&gate_ui::MenuItem>,
-     mut mode: ResMut<CameraMode>,
+     mode: Res<CameraMode>,
      mut orbit: ResMut<gate_render::OrbitCamera>,
      mut fly: ResMut<FlyCamera>,
      q_menu: Query<&DebugMenu>| {
@@ -661,6 +662,8 @@ fn register_callbacks(world: &mut World) {
      mut phys: ResMut<crate::physics::PhysicsState>,
      pbr: Option<Res<gate_render::PbrTextureSet>>,
      cam: Option<Res<gate_render::DdaCameraConfig>>,
+     mut orbit: ResMut<gate_render::OrbitCamera>,
+     mut fly: ResMut<crate::camera::FlyCamera>,
      q_menu: Query<&gate_ui::DebugMenu>| {
       match (ev.path.as_str(), &ev.action) {
         (WORLD_MODEL_PATH, MenuAction::Select(_)) => {
@@ -682,6 +685,10 @@ fn register_callbacks(world: &mut World) {
           ) {
             Ok(_info) => {
               phys.reset();
+              if let Some((eye, target)) = crate::scene::test_world_camera(&name) {
+                crate::camera::set_camera_preset(&mut orbit, &mut fly, eye, target);
+                info!("机位 → {name} 默认视角 eye={eye:?} target={target:?}");
+              }
               info!("世界重载 → {name} {:?}", t0.elapsed());
             }
             Err(e) => warn!("重载世界失败 {name}：{e} → 原世界不变"),

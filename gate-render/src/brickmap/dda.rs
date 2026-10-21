@@ -722,42 +722,6 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  let refl_write = BindGroupLayoutDescriptor::new(
-    "DdaBg7ReflWrite",
-    &[
-      BindGroupLayoutEntry {
-        binding: 10,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Storage { read_only: false },
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
-      BindGroupLayoutEntry {
-        binding: 11,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Storage { read_only: false },
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
-      BindGroupLayoutEntry {
-        binding: 12,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Uniform,
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
-    ],
-  );
-
   let mut refl_all_entries: Vec<BindGroupLayoutEntry> = Vec::new();
   for (binding, rw) in [(10u32, true), (11, true)] {
     refl_all_entries.push(BindGroupLayoutEntry {
@@ -1038,7 +1002,6 @@ pub(crate) fn init_dda_pipelines(
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct DdaTune<'w> {
-  pub fog: Option<Res<'w, crate::volumetric::FogGpu>>,
   pub gi: Option<Res<'w, crate::gi::GiSettings>>,
 
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
