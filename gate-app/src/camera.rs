@@ -90,7 +90,14 @@ pub(crate) fn set_camera_preset(
   fly.pos = eye;
 }
 
-pub(crate) fn auto_orbit_system(time: Res<Time>, mut orbit: ResMut<OrbitCamera>) {
+pub(crate) fn auto_orbit_system(
+  time: Res<Time>,
+  mode: Res<CameraMode>,
+  mut orbit: ResMut<OrbitCamera>,
+) {
+  if *mode == CameraMode::Fly {
+    return;
+  }
   let dt = time.delta_secs();
   orbit.yaw -= 0.35 * dt;
   let a = time.elapsed_secs() * 0.15;

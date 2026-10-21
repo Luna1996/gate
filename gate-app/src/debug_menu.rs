@@ -299,6 +299,16 @@ fn register_callbacks(world: &mut World) {
      mut refl: ResMut<gate_render::ReflectionSettings>,
      mut base: ResMut<gate_render::BaseSettings>| {
       match (ev.path.as_str(), &ev.action) {
+        ("render/ray/quality", MenuAction::Select(i)) => {
+          let q = (*i).min(2) as u32;
+          base.glass_quality = q;
+          let name = match q {
+            0 => "关闭（完全不透明）",
+            1 => "透明（直线透过）",
+            _ => "折射（按折射率偏折）",
+          };
+          info!("玻璃质量 → {q} {name}");
+        }
         ("render/base/shadow", MenuAction::Toggle(on)) => {
           base.shadow = *on;
           info!("直光阴影 → {}", if *on { "on" } else { "off" });
@@ -362,7 +372,7 @@ fn register_callbacks(world: &mut World) {
           };
           info!("GI 重分配 → {name} 窗已满×{lo} 窗未满×{hi}");
         }
-        ("render/refl/tier", MenuAction::Select(i)) => {
+        ("render/ray/tier", MenuAction::Select(i)) => {
           let t = (*i).min((gate_render::ReflectionSettings::TIERS - 1) as usize) as u32;
           refl.tier = t;
           let (name, _cost) = match t {
@@ -373,12 +383,12 @@ fn register_callbacks(world: &mut World) {
           };
           info!("镜面档位 → {t} {name}");
         }
-        ("render/refl/nest", MenuAction::Select(i)) => {
+        ("render/ray/nest", MenuAction::Select(i)) => {
           let n = gate_render::ReflectionSettings::NEST_CHOICES[(*i).min(3)];
           refl.nest = n;
           info!("镜面嵌套 → {n} 层");
         }
-        ("render/refl/reach", MenuAction::Select(i)) => {
+        ("render/ray/reach", MenuAction::Select(i)) => {
           let k = (*i).min(3);
           refl.reach = k as u32;
           let (name, v) = match k {

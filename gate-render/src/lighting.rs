@@ -75,23 +75,31 @@ pub struct BaseSettings {
   pub shadow: bool,
   pub implicit_normal: bool,
   pub vol_tint: bool,
+  pub glass_quality: u32,
 }
 
 impl BaseSettings {
   pub const FLAG_SHADOW: u32 = 1 << 0;
   pub const FLAG_IMPLICIT_NORMAL: u32 = 1 << 1;
   pub const FLAG_VOL_TINT: u32 = 1 << 2;
+  pub const GLASS_QUALITY_SHIFT: u32 = 3;
 
   pub fn flags(&self) -> u32 {
     (if self.shadow { Self::FLAG_SHADOW } else { 0 })
       | (if self.implicit_normal { Self::FLAG_IMPLICIT_NORMAL } else { 0 })
       | (if self.vol_tint { Self::FLAG_VOL_TINT } else { 0 })
+      | ((self.glass_quality & 3) << Self::GLASS_QUALITY_SHIFT)
   }
 }
 
 impl Default for BaseSettings {
   fn default() -> Self {
-    Self { shadow: true, implicit_normal: true, vol_tint: false }
+    Self {
+      shadow: true,
+      implicit_normal: true,
+      vol_tint: false,
+      glass_quality: 2,
+    }
   }
 }
 

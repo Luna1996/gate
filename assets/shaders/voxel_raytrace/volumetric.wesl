@@ -21,7 +21,10 @@ fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32
     let t2 = (1.0 - cos_t) / max(1.0 - cos(ang), 1e-12);
   let limb = clamp(1.0 - t2, 0.0, 1.0);
   let disk = pow(limb, LIMB_POW);
-  let halo = pow(max(1.0 - t2 / (HALO_T * HALO_T), 0.0), HALO_POW);
+  // 光晕平滑衰减到 0：原来在 t2 = HALO_T^2 处用 max(...,0) 硬切，边界导数不连续，
+  // 天空里是一个硬边圆，被水面/玻璃镜面反出来就是一圈硬边彩环
+  let hx = clamp(t2 / (HALO_T * HALO_T), 0.0, 1.0);
+  let halo = pow(1.0 - hx, HALO_POW) * (1.0 - hx * hx * hx);
   let disk_gain = max(light_u.lights[0].shape.x, 0.0);
   return base
        + sun_c * (disk * SUN_DISK_GAIN * disk_gain

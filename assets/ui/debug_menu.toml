@@ -172,47 +172,59 @@ tooltip = "menu.render.gi.realloc.tip"
 
 [[items.children]]
 kind = "sub_menu"
-id = "refl"
-label = "menu.render.refl"
+id = "ray"
+label = "menu.render.ray"
 
 [[items.children.children]]
 kind = "switch_group"
 id = "tier"
-label = "menu.render.refl.tier"
+label = "menu.render.ray.tier"
 options = [
-    "menu.render.refl.tier.off",
-    "menu.render.refl.tier.sun",
-    "menu.render.refl.tier.sky",
-    "menu.render.refl.tier.shadow",
+    "menu.render.ray.tier.off",
+    "menu.render.ray.tier.sun",
+    "menu.render.ray.tier.sky",
+    "menu.render.ray.tier.shadow",
 ]
 selected = 2
-tooltip = "menu.render.refl.tier.tip"
+tooltip = "menu.render.ray.tier.tip"
 
 [[items.children.children]]
 kind = "switch_group"
 id = "nest"
-label = "menu.render.refl.nest"
+label = "menu.render.ray.nest"
 options = [
-    "menu.render.refl.nest.0",
-    "menu.render.refl.nest.1",
-    "menu.render.refl.nest.2",
-    "menu.render.refl.nest.4",
+    "menu.render.ray.nest.0",
+    "menu.render.ray.nest.1",
+    "menu.render.ray.nest.2",
+    "menu.render.ray.nest.4",
 ]
 selected = 0
-tooltip = "menu.render.refl.nest.tip"
+tooltip = "menu.render.ray.nest.tip"
 
 [[items.children.children]]
 kind = "switch_group"
 id = "reach"
-label = "menu.render.refl.reach"
+label = "menu.render.ray.reach"
 options = [
-    "menu.render.refl.reach.off",
-    "menu.render.refl.reach.near",
-    "menu.render.refl.reach.mid",
-    "menu.render.refl.reach.far",
+    "menu.render.ray.reach.off",
+    "menu.render.ray.reach.near",
+    "menu.render.ray.reach.mid",
+    "menu.render.ray.reach.far",
 ]
 selected = 3
-tooltip = "menu.render.refl.reach.tip"
+tooltip = "menu.render.ray.reach.tip"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "quality"
+label = "menu.render.ray.quality"
+options = [
+    "menu.render.ray.quality.off",
+    "menu.render.ray.quality.transparent",
+    "menu.render.ray.quality.refract",
+]
+selected = 2
+tooltip = "menu.render.ray.quality.tip"
 
 [[items.children]]
 kind = "sub_menu"

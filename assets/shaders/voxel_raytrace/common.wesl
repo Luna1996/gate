@@ -66,6 +66,21 @@ fn sky_rgb() -> vec3<f32> {
   return srgb_to_linear(light_u.sky_color.xyz);
 }
 
+fn hash_u32(x: u32) -> u32 {
+  var h = x;
+  h = (h ^ (h >> 16u)) * 2246822519u;
+  h = (h ^ (h >> 13u)) * 3266489917u;
+  return h ^ (h >> 16u);
+}
+
+fn dither3(coord: vec2<i32>) -> vec3<f32> {
+  let base = u32(coord.x) * 1973u + u32(coord.y) * 9277u + 26699u;
+  let a = f32(hash_u32(base) & 0xFFFFu);
+  let b = f32(hash_u32(base ^ 0x9E3779B9u) & 0xFFFFu);
+  let c = f32(hash_u32(base + 0x85EBCA6Bu) & 0xFFFFu);
+  return (vec3<f32>(a, b, c) / 65535.0 - vec3<f32>(0.5)) * (1.0 / 255.0);
+}
+
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
   let l = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
   return vec3<f32>(

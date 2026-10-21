@@ -1,5 +1,5 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
-import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
+import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
@@ -38,8 +38,9 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 const GLASS_EPS: f32 = 1e-3;
+
 const GLASS_EXIT_BEND: bool = true;
-const GLASS_FRESNEL_PER_PIXEL: bool = true;
+const GLASS_QUALITY_SHIFT: u32 = 3u;
 const GLASS_REFL_MIN: f32 = 0.02;
 const GLASS_REFL_WEIGHT_MIN: f32 = 0.015;
 const GLASS_REFL_AMBIENT: f32 = 0.15;
@@ -123,29 +124,36 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
 
 fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
                entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32,
-               entry_v_px: vec3<f32>) -> GlassOut {
+               refr_org: vec3<f32>, refr_v: vec3<f32>, quality: u32) -> GlassOut {
   var tint = vec3<f32>(1.0);
   let f0 = dielectric_f0(entry_ior, 1.0);
-  let fres_v = select(entry_v, entry_v_px, GLASS_FRESNEL_PER_PIXEL);
-  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(fres_v, entry_n), 0.0, 1.0), 5.0);
+  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(entry_v, entry_n), 0.0, 1.0), 5.0);
+  // 倒影：权重、起点、方向都按体素算（保持逐体素观感），菲涅尔够大才排队
+  let r_org = origin_voxel + entry_n * GLASS_EPS;
+  let r_dir = reflect(-entry_v, entry_n);
   if (secondary_on() && light_u.g.refl_tier > 0u && fres > GLASS_REFL_MIN
       && dot(vec3<f32>(fres), GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
-    queue_refl_ray(origin_voxel + entry_n * GLASS_EPS, reflect(-entry_v, entry_n),
-                   vec3<f32>(fres), qpx);
+    queue_refl_ray(r_org, r_dir, vec3<f32>(fres), qpx);
   }
+  if (quality == 0u) {
+    return GlassOut(world_miss(), vec3<f32>(1.0), vec3<f32>(0.0), dir_voxel);
+  }
+  // 入射折射一次：方向逐像素（否则折射被体素量化，画面上是一格一格）
   let eta_in = 1.0 / entry_ior;
-  let ci_in = clamp(dot(-dir_voxel, entry_n), 0.0, 1.0);
+  let ci_in = clamp(dot(refr_v, entry_n), 0.0, 1.0);
   let k_in = 1.0 - eta_in * eta_in * (1.0 - ci_in * ci_in);
-  let dir_in = normalize(eta_in * dir_voxel + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
-  let inner = world_trace_glass_path(origin_voxel + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
+  var dir_in = normalize(eta_in * (-refr_v) + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
+  if (quality < 2u) { dir_in = -refr_v; }
+  let inner = world_trace_glass_path(refr_org + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
   if (!inner.hit || medium_of(inner.palette_base, inner.pal).a >= 1.0) {
     return GlassOut(inner, tint, vec3<f32>(0.0), dir_in);
   }
+  // 出射折射一次，玻璃内部不做弹射
   let n_out = select(-inner.n, inner.n, dot(dir_in, inner.n) < 0.0);
   let ci_out = clamp(dot(-dir_in, n_out), 0.0, 1.0);
   let k_out = 1.0 - entry_ior * entry_ior * (1.0 - ci_out * ci_out);
   let dir_bent = normalize(entry_ior * dir_in + (entry_ior * ci_out - sqrt(max(k_out, 0.0))) * n_out);
-  let dir_out = select(dir_in, dir_bent, GLASS_EXIT_BEND);
+  let dir_out = select(dir_in, dir_bent, GLASS_EXIT_BEND && quality >= 2u);
   let outer = world_trace_glass_path(inner.point + (dir_out - n_out) * GLASS_EPS, dir_out, max_t, false, &tint);
   return GlassOut(outer, tint, vec3<f32>(0.0), dir_out);
 }
@@ -153,7 +161,7 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
 fn write_output(coord: vec2<i32>, col: vec3<f32>) {
   let exposure = bitcast<f32>(eye_adapt_ro[0u]);
   let exposed = col * select(1.0, exposure, exposure > 0.0);
-  textureStore(out_base, coord, vec4<f32>(linear_to_srgb(exposed), 1.0));
+  textureStore(out_base, coord, vec4<f32>(linear_to_srgb(exposed) + dither3(coord), 1.0));
 }
 
 const GI_UPSAMPLE_HOLE_R: i32 = 1;
@@ -346,6 +354,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var glass_col = vec3<f32>(0.0);
   var glass_w = 0.0;
   var sky_dir = ray_dir;
+  let glass_q = (light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
     let fp = voxel_center_world(fg, first.voxel);
@@ -354,16 +363,21 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if (!n_hint_ok) { fnn = voxel_normal_fast(fg, first.voxel, first.face_id, first.n); }
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
     
-            let f_face = fp + fnn * f_off;
+    let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let fv_px = origin_voxel - first.point;
-    let g = trace_glass(f_face, -fv, frustum_length, fnn, material_ior(first.palette_base, first.pal), fv, qpx, fv_px);
-    best = g.ray;
-    through = g.tint;
-    refl = g.refl;
-    sky_dir = g.dir;
+    let fv_px = normalize(origin_voxel - first.point);
+    let g = trace_glass(f_face, -fv, frustum_length, fnn, material_ior(first.palette_base, first.pal), fv, qpx,
+                        first.point + fnn * f_off, fv_px, glass_q);
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
-    glass_w = clamp(1.0 - fm.transmission, 0.0, 1.0);
+    if (glass_q > 0u) {
+      best = g.ray;
+      through = g.tint;
+      refl = g.refl;
+      sky_dir = g.dir;
+      glass_w = clamp(1.0 - fm.transmission, 0.0, 1.0);
+    } else {
+      glass_w = 1.0;
+    }
     if (glass_w > 1.0 / 255.0) {
       let f_ndl = max(dot(fnn, sun_dir), 0.0);
       var f_sun = vec3<f32>(0.0);
@@ -1032,7 +1046,8 @@ fn eye_adapt_update() {
 
 fn refl_accum(px: u32, v: vec3<f32>) {
   if (px >= refl_cfg.y) { return; }
-  let q = clamp(v, vec3<f32>(0.0), vec3<f32>(63.0)) * 1024.0 + 0.5;
+  // 定点精度 1/65536：原来 1/1024 的台阶在夜景高曝光下有好几级色阶，水面上就成了一圈圈色带
+  let q = clamp(v, vec3<f32>(0.0), vec3<f32>(63.0)) * 65536.0 + 0.5;
   let o = px * 3u;
   atomicAdd(&refl_sum[o + 0u], u32(q.x));
   atomicAdd(&refl_sum[o + 1u], u32(q.y));
@@ -1110,8 +1125,8 @@ fn dda_refl_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
   let add = vec3<f32>(f32(atomicLoad(&refl_sum[o])),
                       f32(atomicLoad(&refl_sum[o + 1u])),
                       f32(atomicLoad(&refl_sum[o + 2u])))
-          * (1.0 / 1024.0);
+          * (1.0 / 65536.0);
   let exposure = bitcast<f32>(eye_adapt_ro[0u]);
   let lin = base + add * select(1.0, exposure, exposure > 0.0);
-  textureStore(out_tex, coord, vec4<f32>(linear_to_srgb(lin), 1.0));
+  textureStore(out_tex, coord, vec4<f32>(linear_to_srgb(lin) + dither3(coord), 1.0));
 }

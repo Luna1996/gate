@@ -333,7 +333,7 @@ fn prepare_fog(
       if settings.body { 1.0 } else { 0.0 },
       0.0,
       settings.sun_cone.max(0.0),
-      settings.halo.max(0.0),
+      if settings.body { settings.halo.max(0.0) } else { 0.0 },
     ),
     misc3: Vec4::new(sun_uv.x, sun_uv.y, 0.0, 0.0),
   };

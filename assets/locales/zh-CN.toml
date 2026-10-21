@@ -103,9 +103,19 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 "menu.render.gi.depth.off" = "关"
 "menu.render.gi.depth.sparse" = "稀疏"
 "menu.render.gi.depth.full" = "全"
-"menu.render.refl" = "反射"
-"menu.render.refl.tier" = "镜面质量"
-"menu.render.refl.tier.tip" = """
+"menu.render.ray" = "射线"
+
+"menu.render.ray.quality" = "玻璃质量"
+"menu.render.ray.quality.tip" = """
+关闭 = 玻璃完全不透明（不透视、不折射）；
+透明 = 直线透过（不偏折）；
+折射 = 按折射率偏折。
+"""
+"menu.render.ray.quality.off" = "关闭"
+"menu.render.ray.quality.transparent" = "透明"
+"menu.render.ray.quality.refract" = "折射"
+"menu.render.ray.tier" = "镜面质量"
+"menu.render.ray.tier.tip" = """
 镜面反射（不透明体素与半透明体素）追到什么程度。**镜面恒为逐体素面**（一个面一个反射值）—— 档位只改反射内容的着色口径。
 
 - **关**：不发反射射线，只有 `F0·(amb+gi)` 环境近似
@@ -114,12 +124,12 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 - **阴影**：再给反射命中点补太阳 NEE（**每个触发像素 +1 次 DDA**）⇒ 镜像里的明暗正确；上面两档是**无遮挡近似**（背光的墙在镜子里也亮）
 
 ⚠️ **要镜面就得涂一整片**：单个方块只有 1 个面 ⇒ 只有 1 个颜色，看不出成像。"""
-"menu.render.refl.tier.off" = "关"
-"menu.render.refl.tier.sun" = "直射"
-"menu.render.refl.tier.sky" = "天空"
-"menu.render.refl.tier.shadow" = "阴影"
-"menu.render.refl.nest" = "嵌套层级"
-"menu.render.refl.nest.tip" = """
+"menu.render.ray.tier.off" = "关"
+"menu.render.ray.tier.sun" = "直射"
+"menu.render.ray.tier.sky" = "天空"
+"menu.render.ray.tier.shadow" = "阴影"
+"menu.render.ray.nest" = "嵌套层级"
+"menu.render.ray.nest.tip" = """
 镜子里的镜子最多再反射几级。`0` = 不嵌套（镜子里看不到另一面镜子的倒影），`1 / 2 / 4` = 依次多嵌几级。
 
 **成本只在真的"镜子对着镜子"时才付**：链条遇到**非镜面**的面（墙 / 地形 / 普通方块）立刻断开 ⇒ 日常场景下 `0 / 1 / 2 / 4` 的画面与成本**完全一样**，多出来的只是一次判据。
@@ -127,12 +137,12 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 最坏情况：每个触发像素 `层级 + 1` 条反射射线（上面「镜面档位」选「阴影」时每条再 +1 条阴影射线）。
 
 嵌套的镜像仍是**块状镜面**（每级方向都按体素面量化），与逐面平色的画风一致。"""
-"menu.render.refl.nest.0" = "0"
-"menu.render.refl.nest.1" = "1"
-"menu.render.refl.nest.2" = "2"
-"menu.render.refl.nest.4" = "4"
-"menu.render.refl.reach" = "次级射线"
-"menu.render.refl.reach.tip" = """
+"menu.render.ray.nest.0" = "0"
+"menu.render.ray.nest.1" = "1"
+"menu.render.ray.nest.2" = "2"
+"menu.render.ray.nest.4" = "4"
+"menu.render.ray.reach" = "次级射线"
+"menu.render.ray.reach.tip" = """
 控制**次级射线**（玻璃镜面反射、玻璃透射链里的折线、镜面嵌套链）能追多远，以及发不发。
 
 - **关**：一条次级射线都不发 ⇒ 玻璃只剩透射染色与环境光，没有倒影
@@ -141,10 +151,10 @@ GI 的累积从"屏幕像素"搬到"世界上的面"（M1：按可见体素面�
 - **远**（默认）：无限远，追到世界窗口边界
 
 追太远时多数像素是在空网格里空走：反射方向朝天的像素要一路走到世界边界才判未命中。限长把这段空走砍掉，未命中处直接出环境色。"""
-"menu.render.refl.reach.off" = "关"
-"menu.render.refl.reach.near" = "近"
-"menu.render.refl.reach.mid" = "中"
-"menu.render.refl.reach.far" = "远"
+"menu.render.ray.reach.off" = "关"
+"menu.render.ray.reach.near" = "近"
+"menu.render.ray.reach.mid" = "中"
+"menu.render.ray.reach.far" = "远"
 "menu.render.exposure" = "曝光"
 "menu.render.exposure.enabled" = "开启"
 "menu.render.exposure.ev_up" = "提亮上限"
