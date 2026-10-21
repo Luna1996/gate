@@ -541,30 +541,17 @@ fn report_lod_diag(
 
 fn emit_lod_diag(
   d: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS],
-  abs: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS],
+  _abs: &[u32; crate::brickmap::consts::LOD_DIAG_WORDS],
 ) {
   let entries = d[0].max(1);
-  let face_total = (d[3] + d[4] + d[5] + d[6] + d[7] + d[8]).max(1);
-  let pct = |v: u32| v as f32 * 100.0 / face_total as f32;
   info!(
-    "DIAG[leaf_in {} lod_stop {} {:.1}% illegal {} | 面查表 精确 {}({:.1}%) 回退 {}({:.1}%) \
-     回退不可用 {}({:.1}%) 回退槽失配 {}({:.1}%) 内联 {}({:.1}%) 天空 {}({:.1}%)]",
+    "DIAG[leaf_in {} lod_stop {} {:.1}% illegal {} | 天空像素 {}（{:.1}%）]",
     d[0],
     d[1],
     d[1] as f32 * 100.0 / entries as f32,
     d[2],
-    d[3],
-    pct(d[3]),
-    d[4],
-    pct(d[4]),
-    d[5],
-    pct(d[5]),
-    d[6],
-    pct(d[6]),
-    d[7],
-    pct(d[7]),
     d[8],
-    pct(d[8]),
+    d[8] as f32 * 100.0 / (d[9].max(1)) as f32,
   );
   let main_total = (d[9]).max(1);
   let mpct = |v: u32| v as f32 * 100.0 / main_total as f32;
@@ -621,32 +608,6 @@ fn emit_lod_diag(
     d[36] as f32 / calls,
     d[37] as f32 / calls,
   );
-  info!(
-    "DIAG[玻璃循环 {:.2}/条 | 反射射线 {:.2}/条]",
-    d[39] as f32 / (d[9].max(1) as f32),
-    d[38] as f32 / (d[9].max(1) as f32),
-  );
-  info!(
-    "DIAG[玻璃终止: 迭代 {} | tint跳出 {} (luma累加 {}) | 预算耗尽 {} | 介质打空 {} | 续射打空 {} | 命中不透明 {} | 再折射 {}]",
-    d[88], d[89], d[95], d[90], d[91], d[92], d[93], d[94],
-  );
-  {
-    let mut mats: Vec<String> = Vec::new();
-    for k in 0..8usize {
-      let b = 104 + k * 4;
-      if abs[b] == 0 {
-        continue;
-      }
-      mats.push(format!(
-        "(pal{} base{} flags0x{:02x} a×255={})",
-        abs[b] - 1,
-        abs[b + 1],
-        abs[b + 2],
-        abs[b + 3]
-      ));
-    }
-    info!("DIAG[透射材质 {} 次: {}]", d[96], mats.join(" "));
-  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

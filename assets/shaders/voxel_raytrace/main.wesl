@@ -6,9 +6,9 @@ import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_pool, GI_WAL_MATURE_N};
-import package::trace::{medium_of, DIAG_MAT_BASE, DIAG_MAT_N, DIAG_GLASS_ITERS, DIAG_GLASS_REFL, DIAG_GL_BUDGET, DIAG_GL_IT, DIAG_GL_MEDMISS, DIAG_GL_OPAQUE, DIAG_GL_RAYMISS, DIAG_GL_REFRACT, DIAG_GL_TINT, DIAG_GL_TINTBRK, diag_ray, diag_sampled, make_grid};
+import package::trace::{diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
-import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_medium_scene};
+import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
 @if(ray_query)
 enable wgpu_ray_query;
@@ -38,10 +38,10 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 const GLASS_EPS: f32 = 1e-3;
-const GLASS_MAX_BOUNCE: u32 = 8u;
+// 出射处是否再折射一次：开启为物理模型（平行窗格的角度会抵消）；关闭则只在入射处折射一次。
+const GLASS_EXIT_BEND: bool = true;
 const GLASS_REFL_MIN: f32 = 0.02;
 const GLASS_REFL_WEIGHT_MIN: f32 = 0.015;
-const GLASS_TINT_MIN: f32 = 0.02;
 const GLASS_REFL_AMBIENT: f32 = 0.15;
 const PBR_REFLECTION_ENABLED: u32 = 1u;
 const PBR_REFL_MIN_F0: f32 = 0.03;
@@ -121,129 +121,34 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
   refl_req[o + 1u] = vec4<u32>(pbase, face_id, 0u, px);
 }
 
-fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, t_min: f32, max_t: f32,
-               sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>,
+// 玻璃：空气 → 玻璃、玻璃 → 空气 各一次折射；菲涅尔反射只在入射时计算一次；玻璃内部不循环弹射。
+// 平行面的玻璃板出射后方向复原（只产生位移）；玻璃块侧面出射时才有明显偏折。
+// 全反射时取钳位后的折射方向：与临界角两侧连续，不会出现断层。
+fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
                entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32) -> GlassOut {
-  var org = origin_voxel;
-  var dir = dir_voxel;
-  var in_medium = true;
   var tint = vec3<f32>(1.0);
-  var refl = vec3<f32>(0.0);
-  let gdiag = diag_ray(origin_voxel, dir_voxel);
-  let g0w = make_grid(0u);
-  let sec_on = secondary_on();
-        let mt = max_t;
-  var pal_c: u32 = 0xFFFFFFFFu;
-  var pbase_c: u32 = 0u;
-  var xpar_c: bool = true;
-  var ior_c: f32 = 1.0;
-  {
-    let nn = entry_n;
-    let v = entry_v;
-    let ci = clamp(dot(-dir, nn), 0.0, 1.0);
-    let ior = entry_ior;
-    let f0 = dielectric_f0(ior, 1.0);
-    let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, nn), 0.0, 1.0), 5.0);
-    let r_tier = light_u.g.refl_tier;
-    let refl_w = tint * fres;
-    if (sec_on && r_tier > 0u && fres > GLASS_REFL_MIN
-        && dot(refl_w, GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
-      if (gdiag) { atomicAdd(&lod_diag[DIAG_GLASS_REFL], 1u); }
-      queue_refl_ray(org + nn * GLASS_EPS, reflect(-v, nn), tint * fres, qpx);
-    }
-    let eta = 1.0 / ior;
-    let k = 1.0 - eta * eta * (1.0 - ci * ci);
-    dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
-    org = org + dir * GLASS_EPS;
+  let f0 = dielectric_f0(entry_ior, 1.0);
+  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(entry_v, entry_n), 0.0, 1.0), 5.0);
+  if (secondary_on() && light_u.g.refl_tier > 0u && fres > GLASS_REFL_MIN
+      && dot(vec3<f32>(fres), GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
+    queue_refl_ray(origin_voxel + entry_n * GLASS_EPS, reflect(-entry_v, entry_n),
+                   vec3<f32>(fres), qpx);
   }
-  var last = world_miss();
-  for (var bounce = 0u; bounce < GLASS_MAX_BOUNCE; bounce = bounce + 1u) {
-    var seg = vec3<f32>(1.0);
-    var best: WorldHit;
-    if (in_medium) {
-      best = world_trace_medium_scene(org, dir, mt, true, &seg);
-    } else {
-      best = world_raycast(g0w, org, dir, mt, world_cfg_primary(0.0, 3u));
-    }
-    if (gdiag) {
-      atomicAdd(&lod_diag[DIAG_GLASS_ITERS], 1u);
-      atomicAdd(&lod_diag[DIAG_GL_IT], 1u);
-            let mc2 = atomicAdd(&lod_diag[DIAG_MAT_N], 1u);
-      if (mc2 < 8u || (mc2 & 2047u) == 0u) {
-        if (best.hit) {
-          let slot = min(mc2 / 2048u, 7u);
-          let xb = DIAG_MAT_BASE + slot * 4u;
-          if (atomicLoad(&lod_diag[xb]) == 0u) {
-            atomicStore(&lod_diag[xb + 0u], best.pal + 1u);
-            atomicStore(&lod_diag[xb + 1u], best.palette_base);
-            atomicStore(&lod_diag[xb + 2u], palette_flags(best.palette_base, best.pal));
-            atomicStore(&lod_diag[xb + 3u], u32(medium_of(best.palette_base, best.pal).a * 255.0));
-          }
-        }
-      }
-    }
-    tint = tint * seg;
-    if (best.hit) { last = best; }
-    if (bounce > 0u && dot(tint, GI_LUMA) < GLASS_TINT_MIN) {
-      if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_TINTBRK], 1u); atomicAdd(&lod_diag[DIAG_GL_TINT], u32(clamp(dot(tint, GI_LUMA), 0.0, 1.0) * 1000.0)); }
-                  if (last.hit) { return GlassOut(last, tint, refl, dir); }
-      break;
-    }
-    if (!best.hit) {
-      if (gdiag) { atomicAdd(&lod_diag[select(DIAG_GL_RAYMISS, DIAG_GL_MEDMISS, in_medium)], 1u); }
-      return GlassOut(best, tint, refl, dir);
-    }
-    if (best.pal != pal_c || best.palette_base != pbase_c) {
-      pal_c = best.pal;
-      pbase_c = best.palette_base;
-      xpar_c = (palette_flags(best.palette_base, best.pal) & FLAGS_TRANSMISSIVE) != 0u;
-      ior_c = material_ior(best.palette_base, best.pal);
-    }
-    if (!xpar_c) {
-      if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_OPAQUE], 1u); }
-      return GlassOut(best, tint, refl, dir);
-    }
-    let p_hit = org + dir * best.t;
-    let nn = best.n;
-    let ci = clamp(dot(-dir, nn), 0.0, 1.0);
-    let ior = ior_c;
-    let v = face_view_dir(view_u.cam_pos_voxel.xyz, voxel_center_world(g0w, best.voxel));
-    if (!in_medium) {
-      
-      
-      let f0 = dielectric_f0(ior, 1.0);
-      let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, nn), 0.0, 1.0), 5.0);
-      let r_tier = light_u.g.refl_tier;
-      let refl_w = tint * fres;
-      if (sec_on && r_tier > 0u && fres > GLASS_REFL_MIN
-          && dot(refl_w, GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
-        
-        if (gdiag) { atomicAdd(&lod_diag[DIAG_GLASS_REFL], 1u); }
-        queue_refl_ray(p_hit + nn * GLASS_EPS, reflect(-v, nn), tint * fres, qpx);
-      }
-      let eta = 1.0 / ior;
-      let k = 1.0 - eta * eta * (1.0 - ci * ci);
-      dir = normalize(eta * dir + (eta * ci - sqrt(max(k, 0.0))) * nn);
-      in_medium = true;
-    } else {
-                              let n_out = select(-nn, nn, dot(dir, nn) < 0.0);
-      let eta = ior;
-      let ci_out = clamp(dot(-dir, n_out), 0.0, 1.0);
-      let k = 1.0 - eta * eta * (1.0 - ci_out * ci_out);
-      if (k < 0.0) {
-        dir = reflect(dir, n_out);
-      } else {
-        dir = normalize(eta * dir + (eta * ci_out - sqrt(k)) * n_out);
-        in_medium = false;
-      }
-    }
-    if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_REFRACT], 1u); }
-    org = p_hit + dir * GLASS_EPS;
+  let eta_in = 1.0 / entry_ior;
+  let ci_in = clamp(dot(-dir_voxel, entry_n), 0.0, 1.0);
+  let k_in = 1.0 - eta_in * eta_in * (1.0 - ci_in * ci_in);
+  let dir_in = normalize(eta_in * dir_voxel + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
+  let inner = world_trace_glass_path(origin_voxel + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
+  if (!inner.hit || medium_of(inner.palette_base, inner.pal).a >= 1.0) {
+    return GlassOut(inner, tint, vec3<f32>(0.0), dir_in);
   }
-  if (gdiag) { atomicAdd(&lod_diag[DIAG_GL_BUDGET], 1u); }
-      if (last.hit) { return GlassOut(last, tint, refl, dir); }
-  return GlassOut(WorldHit(false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), 0, 0u),
-                  tint, refl, dir);
+  let n_out = select(-inner.n, inner.n, dot(dir_in, inner.n) < 0.0);
+  let ci_out = clamp(dot(-dir_in, n_out), 0.0, 1.0);
+  let k_out = 1.0 - entry_ior * entry_ior * (1.0 - ci_out * ci_out);
+  let dir_bent = normalize(entry_ior * dir_in + (entry_ior * ci_out - sqrt(max(k_out, 0.0))) * n_out);
+  let dir_out = select(dir_in, dir_bent, GLASS_EXIT_BEND);
+  let outer = world_trace_glass_path(inner.point + (dir_out - n_out) * GLASS_EPS, dir_out, max_t, false, &tint);
+  return GlassOut(outer, tint, vec3<f32>(0.0), dir_out);
 }
 
 fn write_output(coord: vec2<i32>, col: vec3<f32>) {
@@ -441,6 +346,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var refl = vec3<f32>(0.0);
   var glass_col = vec3<f32>(0.0);
   var glass_w = 0.0;
+  var sky_dir = ray_dir;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
     let fp = voxel_center_world(fg, first.voxel);
@@ -451,10 +357,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let g = trace_glass(f_face, -fv, 0.0, frustum_length, sun_dir, sky, sun_c, fnn, material_ior(first.palette_base, first.pal), fv, qpx);
+    let g = trace_glass(f_face, -fv, frustum_length, fnn, material_ior(first.palette_base, first.pal), fv, qpx);
     best = g.ray;
     through = g.tint;
     refl = g.refl;
+    sky_dir = g.dir;
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
     glass_w = clamp(1.0 - fm.transmission, 0.0, 1.0);
     if (glass_w > 1.0 / 255.0) {
@@ -593,7 +500,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     }
     col = col * through + refl;
   } else {
-    return mix(glass_col, sky_primary(ray_dir, sun_dir, sun_c) * through + refl, 1.0 - glass_w);
+    return mix(glass_col, sky_primary(sky_dir, sun_dir, sun_c) * through + refl, 1.0 - glass_w);
   }
   return mix(glass_col, col, 1.0 - glass_w);
 }

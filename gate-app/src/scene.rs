@@ -277,10 +277,10 @@ fn build_glass_test(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
   const P_GLASS: u16 = 7;
   const P_POST: u16 = 8;
 
-  let solid = |color: [u8; 3]| PaletteEntry { color, roughness: 210, ..Default::default() };
+  let solid = |color: [u8; 3]| PaletteEntry { color, ..Default::default() };
   let palette = grid.palette_mut();
   palette.set(PaletteId(P_FLOOR), solid([72, 72, 80]));
-  palette.set(PaletteId(P_CEIL), solid([205, 210, 220]));
+  palette.set(PaletteId(P_CEIL), PaletteEntry { color: [205, 210, 220], emissive: 255, ..Default::default() });
   palette.set(PaletteId(P_WALL_NX), solid([200, 64, 64]));
   palette.set(PaletteId(P_WALL_PX), solid([64, 190, 84]));
   palette.set(PaletteId(P_WALL_NZ), solid([72, 112, 220]));

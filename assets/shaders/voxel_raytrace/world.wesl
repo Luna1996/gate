@@ -462,6 +462,41 @@ fn medium_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, stop_on_air: bool,
   }
 }
 
+// 玻璃与反射的透射追踪：允许穿过介质，可见性与主射线 world_raycast 保持一致
+// （近体积封顶于覆盖半径，远体积只取覆盖半径之外的段）。
+// world_trace_medium_scene 对远体积整体跳过、且不封顶近体积，反射里会在覆盖半径处留下断层（彩环）。
+fn world_trace_glass_path(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_on_air: bool,
+                          tint: ptr<function, vec3<f32>>) -> WorldHit {
+  let g0 = make_grid(0u);
+  let cam_est = (g0.w_mn + g0.w_mx) * 0.5;
+  let origin_xz = length((origin - cam_est).xz);
+  var best = world_miss();
+  var best_t = 1e+30;
+  var shell = coverage_r_of(g0);
+  var g0_cap = max_t;
+  if (g0.coverage_r > 0.0) {
+    g0_cap = min(max_t, level_cap(g0.coverage_r, dir));
+  }
+  medium_one(g0, origin, dir, g0_cap, 0.0, stop_on_air, &best, &best_t, tint);
+  medium_near(origin, dir, max_t, stop_on_air, &best, &best_t, tint);
+  let far_base = inst_bvh[2u];
+  let far_count = inst_bvh[3u];
+  for (var k: u32 = 0u; k < far_count; k = k + 1u) {
+    let gi = make_grid(inst_bvh[far_base + k]);
+    var t_lo = 0.0;
+    if (origin_xz < shell) {
+      t_lo = level_cap(shell, dir);
+    }
+    var t_cap = max_t;
+    if (gi.coverage_r > 0.0) {
+      t_cap = min(max_t, level_cap(gi.coverage_r, dir));
+    }
+    medium_one(gi, origin, dir, t_cap, t_lo, stop_on_air, &best, &best_t, tint);
+    shell = max(shell, coverage_r_of(gi));
+  }
+  return best;
+}
+
 fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_on_air: bool,
                             tint: ptr<function, vec3<f32>>) -> WorldHit {
   let g0 = make_grid(0u);
