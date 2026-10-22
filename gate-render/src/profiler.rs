@@ -376,6 +376,11 @@ impl Plugin for GateProfilerPlugin {
         bevy::render::renderer::RenderGraph,
         report_lod_diag.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
+      render_app.init_resource::<GiFlickerProbe>();
+      render_app.add_systems(
+        bevy::render::renderer::RenderGraph,
+        report_gi_flicker.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
+      );
     }
     if trace.req_enable != 0 {
       render_app.add_systems(
@@ -461,6 +466,177 @@ struct DiagReadback {
   staging: Buffer,
   done: Arc<std::sync::atomic::AtomicBool>,
   err: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// GI 时域稳定性探针（诊断用，`LOD_DIAG = 1` 时才挂）。
+///
+/// 读回两块 GPU 数据，量两件事：
+/// ① **收敛度** = 屏幕空间 reservoir 的平均样本数 `m`（记忆窗满了没有；
+///    `m` 卡在低位 ⇒ 历史每帧被作废，GI 永不收敛）；
+/// ② **抖动幅度** = 帧间变化：
+///    - 原始：reservoir 的估计值 `w_sum/m`；
+///    - **可见**：降噪时域历史里的颜色（= 画面上真正看到的那一份），
+///      这个才是"满屏花不花"的判据。
+///
+/// 为什么要有它：GI 的失效链（面键 / 降噪历史 / WAL 掩码 / 位姿盐 / 邻域复用）有五条，
+/// 靠读代码推机制已经错过多次（见 docs 的 §10.11/§10.13/§10.14）——
+/// **每帧的 M 与创新量必须能从 GPU 读回来**，否则"GI 为什么不收敛 / 会不会花"只能靠猜。
+#[derive(Resource, Default)]
+struct GiFlickerProbe {
+  staging: Option<Buffer>,
+  prev: Vec<(f32, f32)>,
+  prev_vis: Vec<f32>,
+  pending: Option<DiagReadback>,
+  n: usize,
+}
+
+fn report_gi_flicker(
+  device: Res<RenderDevice>,
+  queue: Res<RenderQueue>,
+  aux: Option<Res<crate::brickmap::dda::AuxTexCache>>,
+  gi: Option<Res<crate::gi::GiGpu>>,
+  mut probe: ResMut<GiFlickerProbe>,
+) {
+  let (Some(aux), Some(gi)) = (aux, gi) else { return };
+  let Some((a, b)) = aux.gi_res_buffers() else { return };
+  // prepare_gi 末尾已把 res_flip 翻转 ⇒ 刚写完的那块是它的反侧。
+  let written = if gi.res_flip { a } else { b };
+  let words = crate::wesl_consts::gi_consts().gi_res_words as usize;
+  let n_texels = (written.size() / 4) as usize / words.max(1);
+  if n_texels == 0 {
+    return;
+  }
+  let bytes = (n_texels * words * 4) as u64;
+  // 可见 GI：降噪时域历史（当前帧刚写的那块）。
+  let vis = aux.gi_hist_current();
+  let vis_words = crate::wesl_consts::gi_consts().gi_den_hist_words as usize;
+  let vis_bytes = vis.map(|v| v.size()).unwrap_or(0);
+  let vis_px = vis.map(|v| (v.size() / 4) as usize / vis_words.max(1)).unwrap_or(0);
+
+  if probe.pending.is_some() {
+    let _ = device.poll(PollType::Poll);
+    let p = probe.pending.take().expect("刚判过 is_some");
+    let (failed, ready) = (p.err.load(Ordering::Acquire), p.done.load(Ordering::Acquire));
+    if ready && !failed {
+      let slice = p.staging.slice(..);
+      if let Ok(view) = slice.get_mapped_range() {
+        let mut cur: Vec<(f32, f32)> = Vec::with_capacity(n_texels);
+        for t in 0..n_texels {
+          let b0 = t * words * 4;
+          let f = |k: usize| {
+            let o = b0 + k * 4;
+            f32::from_bits(u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]))
+          };
+          let m = f(7);
+          let est = if m > 0.5 { (f(4) + f(5) + f(6)) / (3.0 * m) } else { 0.0 };
+          cur.push((est, m));
+        }
+        // 可见 GI（降噪时域历史的颜色）：帧间 |Δ| = 画面上的抖动。
+        let vis_base = bytes as usize;
+        let mut cur_vis: Vec<f32> = Vec::with_capacity(vis_px);
+        for t in 0..vis_px {
+          let b0 = vis_base + t * vis_words * 4;
+          if b0 + 12 > view.len() {
+            break;
+          }
+          let f = |k: usize| {
+            let o = b0 + k * 4;
+            f32::from_bits(u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]))
+          };
+          cur_vis.push((f(0) + f(1) + f(2)) / 3.0);
+        }
+        if probe.prev.len() == cur.len() {
+          let mut sum = 0.0f32;
+          let mut cnt = 0u32;
+          let mut sum_m = 0.0f32;
+          let mut low_m = 0u32;
+          let mut worst = 0.0f32;
+          for (i, (e, m)) in cur.iter().enumerate() {
+            sum_m += *m;
+            if *m < 32.0 {
+              low_m += 1;
+            }
+            let d = (e - probe.prev[i].0).abs();
+            sum += d;
+            cnt += 1;
+            if d > worst { worst = d; }
+          }
+          let n = cnt.max(1);
+          // 可见 GI（降噪后的颜色）的帧间抖动 = 画面上真正看到的抖动。
+          let mut vsum = 0.0f32;
+          let mut vmax = 0.0f32;
+          let mut vn = 0u32;
+          let mut vmean = 0.0f32;
+          if probe.prev_vis.len() == cur_vis.len() && cur_vis.len() > 0 {
+            for (i, v) in cur_vis.iter().enumerate() {
+              let d = (v - probe.prev_vis[i]).abs();
+              vsum += d;
+              vmean += *v;
+              vn += 1;
+              if d > vmax {
+                vmax = d;
+              }
+            }
+          }
+          let vmean = vmean / vn.max(1) as f32;
+          info!(
+            "GIPROBE[样本均值 {:.1}（m<32 占比 {:.2}%）| 原始 |Δest| 均值 {:.5} 最大 {:.4} | \
+             可见GI 均值 {:.5} |Δ| 均值 {:.5}（相对 {:.3}%）最大 {:.4}]",
+            sum_m / n as f32,
+            low_m as f32 * 100.0 / n as f32,
+            sum / n as f32,
+            worst,
+            vmean,
+            vsum / vn.max(1) as f32,
+            vsum / vn.max(1) as f32 * 100.0 / vmean.abs().max(1e-6),
+            vmax
+          );
+        }
+        probe.prev = cur;
+        probe.prev_vis = cur_vis;
+      }
+    }
+    p.staging.unmap();
+  }
+  if probe.pending.is_some() {
+    return;
+  }
+  probe.n += 1;
+  if probe.n % 3 != 0 {
+    return;
+  }
+
+  let staging = match probe.staging.as_ref() {
+    Some(s) if s.size() >= bytes + vis_bytes => s.clone(),
+    _ => {
+      let s = device.create_buffer(&BufferDescriptor {
+        label: Some("gate_gi_flicker_staging"),
+        size: bytes + vis_bytes,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+      });
+      probe.staging = Some(s.clone());
+      s
+    }
+  };
+  let mut enc = device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
+    label: Some("gate_gi_flicker_readback"),
+  });
+  enc.copy_buffer_to_buffer(written, 0, &staging, 0, bytes);
+  if let Some(v) = vis {
+    enc.copy_buffer_to_buffer(v, 0, &staging, bytes, vis_bytes);
+  }
+  queue.submit([enc.finish()]);
+  let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let err = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let (done_cb, err_cb) = (done.clone(), err.clone());
+  device.map_buffer(&staging.slice(..), MapMode::Read, move |r| {
+    if r.is_err() {
+      err_cb.store(true, Ordering::Release);
+    }
+    done_cb.store(true, Ordering::Release);
+  });
+  probe.pending = Some(DiagReadback { staging, done, err });
 }
 
 fn report_lod_diag(
@@ -572,6 +748,15 @@ fn emit_lod_diag(
   );
   let gi_texels = (d[13]).max(1);
   let gi_hits = (d[19]).max(1);
+  if d[42] > 0 || d[44] > 0 {
+    let tot = (d[42] + d[44]).max(1);
+    info!(
+      "DIAG[面槽未命中 {}/{} = {:.2}%]",
+      d[42],
+      tot,
+      d[42] as f32 * 100.0 / tot as f32
+    );
+  }
   info!(
     "DIAG[GI {} texel|候选射线 {}（{:.1}/texel）| NEE 阴影 {}（{:.1}/texel）| 命中历史 {:.1}%| \
      静止 {:.1}% 并 tap {:.1}| 键越界 {:.1}% 孤立 {:.1}% 钳制 {:.1}%]",

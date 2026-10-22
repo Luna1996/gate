@@ -330,6 +330,15 @@ impl AuxTexCache {
     self.gi_view.as_ref()
   }
 
+  /// 降噪的时域历史（当前帧刚写的那块）—— 诊断用。
+  ///
+  /// 它存的就是"可见 GI"的颜色（降噪时域滤波后的逐 texel 值），
+  /// 比读纹理更直接：帧间 |Δ| 就是**画面上**的抖动幅度。
+  pub(crate) fn gi_hist_current(&self) -> Option<&Buffer> {
+    let i = if self.den_flip { 1 } else { 0 };
+    self.gi_hist[i].as_ref()
+  }
+
   pub(crate) fn wal_buffer(&self) -> Option<&Buffer> {
     self.wal.as_ref()
   }

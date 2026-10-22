@@ -337,6 +337,12 @@ impl VolumeGrid {
     for c in coords {
       self.unmount_chunk(c);
       self.dirty.mark_data(c);
+      // 清空 = 几何真的消失了 ⇒ 必须记**编辑 AABB**：
+      // 这是「物体消失」与「流式卸载」的区分点（`mount_chunk_tree` / `unmount_chunk` 都不记）。
+      // 少了这一条，GI 的时域历史不会作废 ⇒ 物体消失后它投下的间接光还留在场上。
+      // （必须放在 `unmount_chunk` 之后：它会 `edit_aabbs.remove` 掉刚记的 AABB。）
+      let lo = c.0 * CHUNK_SIZE;
+      self.note_edit_box(c, lo, lo + IVec3::splat(CHUNK_SIZE));
     }
   }
 

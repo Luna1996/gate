@@ -94,6 +94,9 @@ pub const REGION_TABLE_BYTES: u64 =
 
 pub const REGION_REACH: i32 = 2;
 
+/// 本帧最多上传多少个"真编辑"的世界空间 AABB（局部 GI 失效用）。
+pub const GI_EDIT_BOX_MAX: u32 = 8;
+
 pub const WAL_SLOTS: u64 = 1 << 20;
 
 pub const WAL_WORDS: u64 = 8;
@@ -334,6 +337,17 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
         count: None,
       },
       buf(11),
+      // 真编辑的世界空间 AABB（局部 GI 失效用）。
+      BindGroupLayoutEntry {
+        binding: 12,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
     ],
   )
 }
@@ -535,6 +549,27 @@ pub struct GiGpu {
 
   pub epoch: u32,
 
+  /// 内容修订号：世界的**内容**变了（真编辑 / 物体清空=出现或消失）时自增。
+  ///
+  /// 用途：WAL（世界空间累积）的失效键 —— 内容变了以后旧的世界累积值不再成立，
+  /// 必须靠它把旧条目作废，否则 GI 会一直停在旧亮度上
+  /// （WAL 成熟后权重接近 1，它会盖过屏幕空间刚算出来的新值）。
+  pub content_rev: u32,
+
+  /// 最近一次「时域历史降权事件」的帧号（内容变化 / 光照阶跃）。
+  ///
+  /// 着色器用 `seq.x - seq.w` 算出"过了几帧"：
+  /// ① 事件**当帧**把屏幕空间旧历史降权一次（不是丢弃 ⇒ 不闪）；
+  /// ② 随后 `GI_HIST_RESET_FRAMES` 帧内，降噪历史持续降权 + 邻域钳制收窄
+  ///    （否则旧亮度下一帧就全权重回来，收敛被拖回稳态速度；邻域钳制则会把变化
+  ///     变成"慢慢扩散"，变暗时还会被卡住 ⇒ 收敛不干净）。
+  ///
+  /// **降权只作用于被改到的那块**（见 `edit_boxes`）——整屏降权等于满屏重新累积。
+  pub hist_reset_frame: u32,
+
+  /// 真编辑的世界空间 AABB 列表（局部 GI 失效用）：`[count, (lo,hi)×N]`（世界体素坐标）。
+  pub edit_boxes: Option<bevy::render::render_resource::Buffer>,
+
   epoch_key: Option<ShadeKey>,
 
   light_key: Option<LightKey>,
@@ -639,6 +674,9 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     den_pipelines: [None; 6],
     flatten_pipeline: None,
     epoch: 0,
+    content_rev: 0,
+    hist_reset_frame: 0,
+    edit_boxes: None,
     epoch_key: None,
     light_key: None,
   });
@@ -731,7 +769,27 @@ fn prepare_gi(
     gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
   }
   let occluder_rev = gpu.wide_rev;
-  let world_same = occluder_rev == gpu.world_rev_gi;
+
+  // 本帧世界的**内容**变了吗？（离散变化：体素被改 / 物体出现或消失）
+  //
+  // 这是「自发光体素/物体出现或消失 ⇒ GI 不更新」的根因：这些改动走的是增量通道
+  // （`dirty.full == false`、调色板内容没变 ⇒ `wide_rev` 不变 ⇒ `world_same` 仍为真），
+  // 于是屏幕空间的采样历史（`gi_res`）和降噪侧的历史（`gi_hist`）都被复用，
+  // GI 一直停在旧亮度上；只有当那个面被挤出视野（面键变了 ⇒ 历史接不上）
+  // 再回到视野，GI 才重新算出来 —— 表现为"相机不动就永远没反应"。
+  //
+  // 判据必须区分「编辑」与「流式装载新块」：后者每帧都在发生（`mount_chunk_tree`
+  // 也会标脏），若也作废历史，流式世界里 GI 永远收敛不了（"GI 每帧失效"风险条目）。
+  //
+  // **只认离散变化**：连续变化（物体被物理推着走）绝不能作废历史 ——
+  // 每帧作废 ⇒ 记忆窗永远填不满 ⇒ GI 永不收敛、疯狂闪烁。
+  // 位姿变化交给「面键盐」（`gi_pose_salt`）：物体自己的面会重新累积，
+  // 而周围地面的历史保留 ⇒ 光斑平滑地跟着走，而不是每帧从零重来。
+  let content_changed = dirty.as_ref().is_some_and(|d| d.edited);
+  if content_changed {
+    gpu.content_rev = gpu.content_rev.wrapping_add(1);
+    bevy::log::debug!(target: "gate", "GI 内容变化 ⇒ 时域历史作废（content_rev → {}）", gpu.content_rev);
+  }
 
   let mut region_touched = false;
   if let Some(bm) = brickmap.as_ref()
@@ -786,12 +844,21 @@ fn prepare_gi(
     bevy::log::debug!(target: "gate", "GI 光照阶跃 ⇒ 本帧不复用历史");
   }
 
+  // 「时域历史降权事件」：内容变了（编辑 / 物体出现或消失）或光照阶跃。
+  // 记下事件当帧的帧号 ⇒ 着色器知道"过了几帧"：
+  // 事件当帧把屏幕空间旧历史降权一次（不丢弃 ⇒ 不闪），
+  // 随后若干帧内降噪历史持续降权、空间复用停用（⇒ 响应直达，不被扩散拖慢）。
+  if content_changed || light_step {
+    gpu.hist_reset_frame = gpu.frame;
+  }
+  let since_reset = gpu.frame.wrapping_sub(gpu.hist_reset_frame);
+
   let u = GiUniform {
     params: Vec4::new(
       if settings.sun_bounce { 1.0 } else { 0.0 },
       if settings.wal { 1.0 } else { 0.0 },
       crate::consts::GI_GAIN,
-      0.0,
+      gpu.content_rev as f32,
     ),
     misc: Vec4::new(
       if settings.enabled { 1.0 } else { 0.0 },
@@ -802,11 +869,13 @@ fn prepare_gi(
     flags: Vec4::new(
       0.0,
       settings.div() as f32,
-      if world_same && !light_step { 1.0 } else { 0.0 },
+      // flags.z：1 ⇒ 时域历史照常用；0 ⇒ 本帧是「降权事件」当帧（屏幕空间侧降权一次）。
+      if since_reset == 0 { 0.0 } else { 1.0 },
       settings.tier() as f32,
     ),
 
-    seq: UVec4::new(gpu.frame, gpu.epoch, 0, 0),
+    // seq.w = 最近一次降权事件的帧号（着色器算 `seq.x - seq.w` 得到"过了几帧"）。
+    seq: UVec4::new(gpu.frame, gpu.epoch, 0, gpu.hist_reset_frame),
 
     prev_view_proj: gpu.prev_view_proj,
   };
@@ -893,6 +962,9 @@ fn prepare_gi(
     .and_then(|a| a.wal_buffer())
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
+
+  // 真编辑的世界空间 AABB ⇒ 局部 GI 失效（整屏失效 = 满屏重新累积 = "全屏花一下"）。
+  let edit_boxes = upload_edit_boxes(&device, &queue, &mut gpu, dirty.as_ref().map(|d| &**d));
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,
@@ -903,7 +975,53 @@ fn prepare_gi(
       BindGroupEntry { binding: 9, resource: gi_sec_slots.as_entire_binding() },
       BindGroupEntry { binding: 10, resource: region_rev.as_entire_binding() },
       BindGroupEntry { binding: 11, resource: wal.as_entire_binding() },
+      BindGroupEntry { binding: 12, resource: edit_boxes.as_entire_binding() },
     ],
   );
   commands.insert_resource(GiBg5(bg5));
+}
+
+/// 把本帧真编辑的世界空间 AABB 写进 GPU buffer（`[count, (lo,hi)×N]`）。
+fn upload_edit_boxes(
+  device: &bevy::render::renderer::RenderDevice,
+  queue: &bevy::render::renderer::RenderQueue,
+  gpu: &mut GiGpu,
+  dirty: Option<&crate::brickmap::upload::BrickMapDirty>,
+) -> bevy::render::render_resource::Buffer {
+  use bevy::render::render_resource::{BufferDescriptor, BufferUsages};
+  let words = 1 + GI_EDIT_BOX_MAX as usize * 6;
+  let bytes = (words * 4) as u64;
+  let buf = match gpu.edit_boxes.as_ref() {
+    Some(b) if b.size() >= bytes => b.clone(),
+    _ => {
+      let b = device.create_buffer(&BufferDescriptor {
+        label: Some("gate_gi_edit_boxes"),
+        size: bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+      });
+      gpu.edit_boxes = Some(b.clone());
+      b
+    }
+  };
+  let mut data = vec![0u32; words];
+  if let Some(d) = dirty {
+    let n = d.edit_boxes.len().min(GI_EDIT_BOX_MAX as usize);
+    data[0] = n as u32;
+    for (i, b) in d.edit_boxes.iter().take(n).enumerate() {
+      let o = 1 + i * 6;
+      data[o] = b.lo.x as u32;
+      data[o + 1] = b.lo.y as u32;
+      data[o + 2] = b.lo.z as u32;
+      data[o + 3] = b.hi.x as u32;
+      data[o + 4] = b.hi.y as u32;
+      data[o + 5] = b.hi.z as u32;
+    }
+  }
+  let mut raw = Vec::with_capacity(data.len() * 4);
+  for w in &data {
+    raw.extend_from_slice(&w.to_le_bytes());
+  }
+  queue.write_buffer(&buf, 0, &raw);
+  buf
 }

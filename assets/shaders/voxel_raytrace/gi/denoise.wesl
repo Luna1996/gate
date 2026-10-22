@@ -1,6 +1,6 @@
 import package::bindings::{gi_den_cfg, gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_tmp, gi_guide, gi_guide_out, gi_hist_cur, gi_hist_prev, gi_raw_tex};
 import package::gi::common::{gi_hist_search_offset, gi_pack_dir, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_W_HIST_MIN, GI_HIST_SEARCH_TAPS, GI_LUMA};
+import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_G_RESET, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_RESET_SCALE, GI_DEN_W_HIST_MIN, GI_HIST_SEARCH_TAPS, GI_LUMA};
 
 fn gi_den_valid_b(b: u32) -> bool {
   return (gi_guide[b + GI_DEN_G_KEY0] | gi_guide[b + GI_DEN_G_KEY1]) != 0u;
@@ -27,6 +27,7 @@ fn gi_den_guide_store(
   n: vec3<f32>,
   prev_ok: bool,
   prev_px: vec2<i32>,
+  reset: bool,
 ) {
   let idx = u32(coord.y) * size.x + u32(coord.x);
   let b = idx * GI_DEN_GUIDE_WORDS;
@@ -37,7 +38,10 @@ fn gi_den_guide_store(
   gi_guide_out[b + GI_DEN_G_KEY0] = k0;
   gi_guide_out[b + GI_DEN_G_KEY1] = k1;
   gi_guide_out[b + GI_DEN_G_NRM] = gi_pack_dir(n);
-  
+  // 「本次历史被降权」标志：内容变了时屏幕空间那边不是丢弃历史而是降权，
+  // 降噪侧要同样处理（只降权、继续用旧值兜底）⇒ 过渡平滑、不闪。
+  gi_guide_out[b + GI_DEN_G_RESET] = select(0u, 1u, reset);
+
   var code = 0xFFFFFFFFu;
   if (prev_ok) { code = u32(prev_px.x) | (u32(prev_px.y) << 16u); }
   gi_guide_out[b + GI_DEN_G_PREV] = code;
@@ -134,6 +138,9 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   var m2_acc = l_in * l_in;
   var color = c_in;
   var m = 1.0;
+  // `code` = 导引里记的「该面上一帧所在的位置」；0xFFFFFFFF = 没有（这个面是新的）⇒ 无历史可借。
+  // 内容变了时**不是**丢历史，而是把历史降权（`GI_DEN_G_RESET` + `w_scale`）⇒ 旧亮度继续兜底，
+  // 新亮度平滑接管 ⇒ 过渡不闪；同时响应比稳态快约 1/权重 倍。
   let code = gi_guide[gb + GI_DEN_G_PREV];
   if (code != 0xFFFFFFFFu) {
     let prev_px = vec2<i32>(i32(code & 0xFFFFu), i32((code >> 16u) & 0xFFFFu));
@@ -184,7 +191,12 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let dy = f32(prev_px.y - y);
       let mo = sqrt(dx * dx + dy * dy);
       let w_motion = select(1.0 / (1.0 + mo), 1.0, !shifted);
-      let w = min(min(w_var, (m - 1.0) / m), w_motion);
+      // 内容变了 ⇒ 历史**降权**而不是丢弃：旧亮度仍以小权重参与，
+      // 新亮度平滑地把它带过去（不闪）；响应比稳态快约 1/权重 倍。
+      // 降权在**过渡期内持续生效**（导引的 RESET 标志）——只降一帧的话，
+      // 下一帧旧亮度就又全权重回来 ⇒ 收敛被拖回稳态速度。
+      let w_scale = select(1.0, GI_DEN_RESET_SCALE, gi_guide[gb + GI_DEN_G_RESET] != 0u);
+      let w = min(min(w_var, (m - 1.0) / m), w_motion) * w_scale;
       color = mix(c_in, clamped, w);
       m1_acc = mix(h_m1, l_in, 1.0 - w);
       m2_acc = mix(h_m2, l_in * l_in, 1.0 - w);

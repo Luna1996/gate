@@ -7,6 +7,7 @@ mod height_field;
 mod infinite_cubes;
 mod mc;
 mod objects;
+mod obj_selftest;
 mod physics;
 mod scene;
 mod showcase;
@@ -174,6 +175,7 @@ fn main() {
   if consts::EDIT_SELFTEST {
     app.add_systems(Update, edit::edit_selftest);
   }
+  app.add_systems(Update, obj_selftest::object_selftest);
   if consts::phys_pile() {
     app.add_systems(Update, objects::pile_fire);
   }

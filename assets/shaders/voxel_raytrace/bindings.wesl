@@ -233,6 +233,9 @@ struct FogUniform {
 
 @group(5) @binding(11) var<storage, read_write> gi_wal: array<atomic<u32>>;
 
+/// 真编辑的世界空间 AABB 列表（局部 GI 失效用）：[count, (lo,hi)×N]。
+@group(5) @binding(12) var<storage, read> gi_edit_boxes: array<u32>;
+
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;
 

@@ -36,7 +36,7 @@ const LEAF_LOD_FP: f32 = 3.4e38;
 
 const LEAF_LOD_SCAN_CAP: u32 = 8u;
 
-const LOD_DIAG: u32 = 0u;
+const LOD_DIAG: u32 = 1u;
 const DIAG_LEAF_ENTRIES: u32 = 0u;
 const DIAG_LEAF_STOPS: u32 = 1u;
 const DIAG_ILLEGAL_STOPS: u32 = 2u;

@@ -6,7 +6,7 @@ import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_pool, GI_WAL_MATURE_N};
-import package::trace::{diag_sampled, make_grid, medium_of};
+import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
@@ -474,9 +474,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         }
       }
       if (acc.w > 0.0) {
+        if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[44u], 1u); }
         gi = acc.xyz / (acc.w * GI_ACC_SCALE);
         cov = 1.0;
       } else {
+        if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[42u], 1u); }
         let gup = vec2<u32>(textureDimensions(gi_tex));
         let s = gi_upsample_joint(vuv, gup, k0, k1, n, vec3<f32>(0.0));
         let gw = max(s.a, 1e-4);

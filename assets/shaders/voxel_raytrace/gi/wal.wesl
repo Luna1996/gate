@@ -44,9 +44,14 @@ fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32
   
   var rev = 0u;
   if (gi_u.params.x > 0.5) { rev = gi_local_rev(v_world, obj); }
+  // 内容修订号（`gi_u.params.w`）：世界内容变了（真编辑 / 物体清空=出现或消失）
+  // ⇒ 世界空间累积出来的旧值不再成立，必须靠它把旧条目作废，
+  // 否则 WAL 会把旧亮度一直混回来（自发光体素/物体出现或消失时 GI 看起来"没反应"）。
+  // 它只在**内容真的变了**时自增 ⇒ 不会被流式装载刷爆，也不会被"物体在动"刷爆。
+  let content_rev = u32(gi_u.params.w);
   return gi_mix(u32(org.x)
           + gi_mix(u32(org.y)
-            + gi_mix(u32(org.z) + gi_mix(rev + pal * 0x9E3779B1u))));
+            + gi_mix(u32(org.z) + gi_mix(rev + content_rev * 0x85EBCA77u + pal * 0x9E3779B1u))));
 }
 
 fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
