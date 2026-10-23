@@ -9,6 +9,7 @@
 @group(7) @binding(22) var<storage, read_write> refl_sum: array<atomic<u32>>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
+@group(0) @binding(4) var dda_hit: texture_storage_2d<rgba32uint, read_write>;
 
 const BEAM_DIV: u32 = 4u;
 

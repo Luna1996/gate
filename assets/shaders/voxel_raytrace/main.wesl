@@ -1,6 +1,6 @@
-import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
@@ -36,6 +36,38 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = world_raycast(make_grid(0u), origin, dir, t_cap_beam, world_cfg_full(0.0, 3u));
   let t = select(t_cap_beam, h.t, h.hit);
   textureStore(beam_depth, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(t, 0.0, 0.0, 0.0));
+}
+fn dda_hit_record(gid: vec3<u32>, first: WorldHit, origin_voxel: vec3<f32>) {
+  let d = max(u32(gi_u.flags.y), 1u);
+  if (gid.x % d != d / 2u || gid.y % d != d / 2u) { return; }
+  let texel = vec2<i32>(i32(gid.x / d), i32(gid.y / d));
+  let hsz = vec2<f32>(textureDimensions(dda_hit));
+  if (texel.x >= i32(hsz.x) || texel.y >= i32(hsz.y)) { return; }
+  
+  let gpx = (vec2<f32>(f32(texel.x), f32(texel.y)) + vec2<f32>(0.5))
+          / vec2<f32>(f32(hsz.x), f32(hsz.y));
+  let guv = vec2<f32>(gpx.x * 2.0 - 1.0, 1.0 - gpx.y * 2.0);
+  let gc_near_h = view_u.inv_view_proj * vec4<f32>(guv.x, guv.y, 0.0, 1.0);
+  let gc_far_h = view_u.inv_view_proj * vec4<f32>(guv.x, guv.y, 1.0, 1.0);
+  let dir_c = normalize(gc_far_h.xyz / gc_far_h.w - gc_near_h.xyz / gc_near_h.w);
+  let t_c = dot(first.point - origin_voxel, dir_c);
+  let pack_w = ((gi_u.seq.x & 0xFFu) << 24u) | ((first.pal & 0x7FFFFFu) << 1u) | u32(first.hit);
+  textureStore(dda_hit, texel,
+               vec4<u32>(bitcast<u32>(select(0.0, t_c, first.hit)),
+                         gi_key0(first.voxel, first.obj_id),
+                         gi_key1(first.voxel, first.face_id, first.obj_id),
+                         pack_w));
+}
+fn dda_hit_unpack(raw: vec4<u32>, origin_voxel: vec3<f32>, dir_voxel: vec3<f32>) -> WorldHit {
+  let t = bitcast<f32>(raw.x);
+  let obj = i32((raw.z >> 19u) & 0x1FFFu) - 1;
+  let salt = gi_pose_salt(obj);
+  let face = ((raw.z ^ salt) >> 16u) & 7u;
+  let g = make_grid(u32(obj + 1));
+  let voxel = gi_unkey_voxel(raw.y, raw.z, obj);
+  let n = face_normal_world(g, face);
+  return WorldHit(true, t, origin_voxel + dir_voxel * t, (raw.w >> 1u) & 0x7FFFFFu,
+                  n, face, voxel, obj, g.palette_base);
 }
 
 const GLASS_EPS: f32 = 1e-3;
@@ -641,6 +673,7 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
   let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
                             world_cfg_primary(t_min, 3u));
+  dda_hit_record(gid, first, origin_voxel);
   if (LOD_DIAG == 1u && first.hit) {
     let f2 = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length, world_cfg_full(t_min, 3u));
     let same2 = f2.hit && all(f2.voxel == first.voxel) && f2.obj_id == first.obj_id;
@@ -729,6 +762,7 @@ fn dda_preview(@builtin(global_invocation_id) gid: vec3<u32>,
   }
   let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
                             world_cfg_primary(t_min, 3u));
+  dda_hit_record(gid, first, origin_voxel);
   let diag_pix = gid.x + gid.y * size.x;
   if (diag_sampled(diag_pix)) {
     atomicAdd(&lod_diag[DIAG_MAIN_RAYS], 1u);
@@ -902,25 +936,34 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     gi_ss_main(coord, size, world_miss(), w_adapt);
     return;
   }
-  let gi_div = max(u32(gi_u.flags.y), 1u);
-  var t_min = 0.0;
-  if (view_u.lod.z < 0.5) {
-    let beam_size = textureDimensions(beam_depth);
-    let bx = gid.x / max(BEAM_DIV / gi_div, 1u);
-    let by = gid.y / max(BEAM_DIV / gi_div, 1u);
-    t_min = 1e+30;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
-        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
-        t_min = min(t_min, textureLoad(beam_depth, vec2<i32>(sx, sy)).x);
+  
+  
+  var h = world_miss();
+  let raw = textureLoad(dda_hit, coord);
+  let age_ok = (raw.w >> 24u) == (gi_u.seq.x & 0xFFu);
+  let hit_ok = (raw.w & 1u) != 0u && ((raw.w >> 1u) & 0x7FFFFFu) != 0u;
+  if (age_ok && hit_ok) {
+    h = dda_hit_unpack(raw, origin_voxel, dir_voxel);
+  } else if (age_ok) {
+    let gi_div = max(u32(gi_u.flags.y), 1u);
+    var t_min = 0.0;
+    if (view_u.lod.z < 0.5) {
+      let beam_size = textureDimensions(beam_depth);
+      let bx = gid.x / max(BEAM_DIV / gi_div, 1u);
+      let by = gid.y / max(BEAM_DIV / gi_div, 1u);
+      t_min = 1e+30;
+      for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+          let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
+          let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
+          t_min = min(t_min, textureLoad(beam_depth, vec2<i32>(sx, sy)).x);
+        }
       }
+      t_min = max(t_min - BEAM_BACKOFF, 0.0);
     }
-    t_min = max(t_min - BEAM_BACKOFF, 0.0);
+    h = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
+                      world_cfg_full(t_min, 3u));
   }
-
-  let h = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
-                        world_cfg_full(t_min, 3u));
   gi_ss_main(coord, size, h, w_adapt);
 }
 

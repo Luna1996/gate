@@ -1,7 +1,5 @@
-import package::bindings::{BEAM_BACKOFF, BEAM_DIV, beam_depth, fog_a_r_blur, fog_a_w, fog_a_w_blur, fog_b_r_blur, fog_b_w_blur, fog_u, fog_u_blur, fog_u_read, light_u, view_u};
+import package::bindings::{dda_hit, fog_a_r_blur, fog_a_w, fog_a_w_blur, fog_b_r_blur, fog_b_w_blur, fog_u, fog_u_blur, fog_u_read, gi_u, light_u, view_u};
 import package::common::{sky_rgb};
-import package::trace::{make_grid};
-import package::world::{world_cfg_full, world_raycast};
 
 const SUN_DISK_GAIN: f32 = 3.0;
 const LIMB_POW: f32 = 0.5;
@@ -42,31 +40,22 @@ fn godray_pass_mask(gid: vec3<u32>) {
   let near_world = near_world_h.xyz / near_world_h.w;
   let far_world = far_world_h.xyz / far_world_h.w;
   let diff_world = far_world - near_world;
-  let frustum_length = length(diff_world);
   let dir_voxel = normalize(diff_world);
-  let origin_voxel = view_u.cam_pos_voxel.xyz;
 
-  var t_min = 0.0;
-  if (view_u.lod.z < 0.5) {
-    let beam_size = textureDimensions(beam_depth);
-    let bx = gid.x / max(BEAM_DIV / FOG_DIV, 1u);
-    let by = gid.y / max(BEAM_DIV / FOG_DIV, 1u);
-    t_min = 1e+30;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
-        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
-        t_min = min(t_min, textureLoad(beam_depth, vec2<i32>(sx, sy)).x);
-      }
-    }
-    t_min = max(t_min - BEAM_BACKOFF, 0.0);
-  }
-  let h = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
-                        world_cfg_full(t_min, 3u));
+  
+  
+  
+  let gdv = max(u32(gi_u.flags.y), 1u);
+  let hsz = vec2<f32>(textureDimensions(dda_hit));
+  let center_px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) * f32(FOG_DIV);
+  let hc = vec2<i32>(
+    clamp(i32(floor(center_px.x / max(f32(gdv), 1.0))), 0, i32(hsz.x) - 1),
+    clamp(i32(floor(center_px.y / max(f32(gdv), 1.0))), 0, i32(hsz.y) - 1));
+  let rec = textureLoad(dda_hit, hc);
 
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-  let sky = select(0.0, 1.0, !h.hit);
+  let sky = select(0.0, 1.0, (rec.w & 1u) == 0u);
   let w = pow(clamp(dot(dir_voxel, sun_dir), 0.0, 1.0), max(fog_u.misc.y, 1.0));
   let lit = sun_c * (sky * w * max(fog_u.misc.z, 0.0) * clamp(fog_u.misc.w, 0.0, 1.0));
   textureStore(fog_a_w, coord, vec4<f32>(lit, 1.0));

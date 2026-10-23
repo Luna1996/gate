@@ -250,6 +250,8 @@ pub(crate) struct AuxTexCache {
   gi_tex: Option<Texture>,
   gi_view: Option<TextureView>,
   gi_size: UVec2,
+  dda_hit: Option<Texture>,
+  dda_hit_view: Option<TextureView>,
   gi_res_a: Option<Buffer>,
   gi_res_b: Option<Buffer>,
   gi_bg0: Option<BindGroup>,
@@ -548,6 +550,7 @@ pub(crate) fn init_dda_pipelines(
         uniform_buffer::<DdaViewUniform>(false),
         texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
         storage_buffer_read_only_sized(false, None),
+        texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
       ),
     ),
   );
@@ -627,6 +630,17 @@ pub(crate) fn init_dda_pipelines(
         ty: BindingType::StorageTexture {
           access: StorageTextureAccess::ReadWrite,
           format: TextureFormat::R32Float,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
+      
+      BindGroupLayoutEntry {
+        binding: 4,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::ReadWrite,
+          format: TextureFormat::Rgba32Uint,
           view_dimension: TextureViewDimension::D2,
         },
         count: None,
@@ -1086,6 +1100,11 @@ pub(crate) fn prepare_dda_bind_groups(
     beam_cache.gi_tex = Some(gi_tex);
     beam_cache.gi_size = gi_size;
 
+    
+    let hit_tex = make("gate_dda_hit", TextureFormat::Rgba32Uint);
+    beam_cache.dda_hit_view = Some(hit_tex.create_view(&TextureViewDescriptor::default()));
+    beam_cache.dda_hit = Some(hit_tex);
+
     let res_bytes =
       gi_size.x as u64 * gi_size.y as u64 * crate::wesl_consts::gi_consts().gi_res_words as u64 * 4;
     let make_res = |label: &str| {
@@ -1248,6 +1267,7 @@ pub(crate) fn prepare_dda_bind_groups(
       &u,
       &beam_view,
       eye_buf.as_entire_binding(),
+      &*beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
     )),
   );
 
@@ -1297,6 +1317,7 @@ pub(crate) fn prepare_dda_bind_groups(
       &u,
       &beam_view,
       eye_buf.as_entire_binding(),
+      &*beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
     )),
   );
   beam_cache.refl_compose_bg0 = Some(compose_bg0);
@@ -1420,12 +1441,14 @@ pub(crate) fn prepare_dda_bind_groups(
   }
 
   let bg0_gi_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_gi_layout);
+  let hit_view_ref = beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建").clone();
   let gi_bg0 = render_device.create_bind_group(
     None,
     &bg0_gi_layout,
     &[
       BindGroupEntry { binding: 1, resource: u.binding().expect("view uniform 已写入") },
       BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&beam_view) },
+      BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&hit_view_ref) },
     ],
   );
   beam_cache.gi_bg0 = Some(gi_bg0);
@@ -1800,6 +1823,54 @@ pub(crate) fn dispatch_dda(
     });
   }
 
+  
+  
+  
+  crate::volumetric::dispatch_fog(
+    &mut profiler,
+    ctx.command_encoder(),
+    fog.gpu.as_deref(),
+    fog.settings.as_deref(),
+    &pipeline_cache,
+    aux.as_ref().and_then(|a| a.gi_bg0()),
+    Some(&bg1.0),
+    Some(&bg2.0),
+    Some(&bg3.0),
+  );
+
+  let (main_pipe, main_label) = if let Some(p) = dda_pipe {
+    (Some(p), "gate_dda_trace")
+  } else {
+    (pipeline_cache.get_compute_pipeline(pipelines.preview_pipeline), "gate_dda_preview")
+  };
+  let main_ready = fog_read.is_some();
+  if !main_ready {
+    bevy::log::debug_once!("DDA dispatch: 光柱 group(6) 未就绪（本帧跳过主 pass）");
+  }
+
+  if let (Some(pipe), true) = (main_pipe, main_ready) {
+    crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), main_label, |pass| {
+      pass.set_pipeline(pipe);
+      pass.set_bind_group(0, &bg0.0, &[]);
+      pass.set_bind_group(1, &bg1.0, &[]);
+      pass.set_bind_group(2, &bg2.0, &[]);
+      pass.set_bind_group(3, &bg3.0, &[]);
+      pass.set_bind_group(4, &bg4.0, &[]);
+
+      if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+        pass.set_bind_group(5, gi_read, &[]);
+      }
+
+      if let Some(fog_read) = fog_read {
+        pass.set_bind_group(6, fog_read, &[]);
+      }
+      if refl_ok && let Some(w) = refl_write_bg {
+        pass.set_bind_group(7, w, &[]);
+      }
+      pass.dispatch_workgroups(gx, gy, 1);
+    });
+  }
+
   if gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_bg0) = aux.gi_bg0.as_ref()
@@ -1985,107 +2056,62 @@ pub(crate) fn dispatch_dda(
     }
   }
 
-  crate::volumetric::dispatch_fog(
-    &mut profiler,
-    ctx.command_encoder(),
-    fog.gpu.as_deref(),
-    fog.settings.as_deref(),
-    &pipeline_cache,
-    aux.as_ref().and_then(|a| a.gi_bg0()),
-    Some(&bg1.0),
-    Some(&bg2.0),
-    Some(&bg3.0),
-  );
-
-  if fog_read.is_none() {
-    bevy::log::debug_once!("DDA dispatch: 光柱 group(6) 未就绪（本帧跳过主 pass）");
-    return;
+  if refl_ok
+    && let (Some(rr), Some(cb0)) = (refl_read_bg, refl_compose_bg0)
+    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.refl_pipeline)
+  {
+    let groups = ((refl_cap as u32) / 64u32).max(1);
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_dda_refl",
+      |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, cb0, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
+        if let Some(gr) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+          pass.set_bind_group(5, gr, &[]);
+        }
+        if let Some(fog_read) = fog_read {
+          pass.set_bind_group(6, fog_read, &[]);
+        }
+        pass.set_bind_group(7, rr, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+      },
+    );
   }
-  let (main_pipe, main_label) = if let Some(p) = dda_pipe {
-    (Some(p), "gate_dda_trace")
-  } else {
-    (pipeline_cache.get_compute_pipeline(pipelines.preview_pipeline), "gate_dda_preview")
-  };
 
-  if let Some(pipe) = main_pipe {
-    crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), main_label, |pass| {
-      pass.set_pipeline(pipe);
-      pass.set_bind_group(0, &bg0.0, &[]);
-      pass.set_bind_group(1, &bg1.0, &[]);
-      pass.set_bind_group(2, &bg2.0, &[]);
-      pass.set_bind_group(3, &bg3.0, &[]);
-      pass.set_bind_group(4, &bg4.0, &[]);
-
-      if let Some(gi_read) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
-        pass.set_bind_group(5, gi_read, &[]);
-      }
-
-      if let Some(fog_read) = fog_read {
-        pass.set_bind_group(6, fog_read, &[]);
-      }
-      if refl_ok && let Some(w) = refl_write_bg {
-        pass.set_bind_group(7, w, &[]);
-      }
-      pass.dispatch_workgroups(gx, gy, 1);
-    });
-
-    if refl_ok
-      && let (Some(rr), Some(cb0)) = (refl_read_bg, refl_compose_bg0)
-      && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.refl_pipeline)
-    {
-      let groups = ((refl_cap as u32) / 64u32).max(1);
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_dda_refl",
-        |pass| {
-          pass.set_pipeline(pipe);
-          pass.set_bind_group(0, cb0, &[]);
-          pass.set_bind_group(1, &bg1.0, &[]);
-          pass.set_bind_group(2, &bg2.0, &[]);
-          pass.set_bind_group(3, &bg3.0, &[]);
-          pass.set_bind_group(4, &bg4.0, &[]);
-          if let Some(gr) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
-            pass.set_bind_group(5, gr, &[]);
-          }
-          if let Some(fog_read) = fog_read {
-            pass.set_bind_group(6, fog_read, &[]);
-          }
-          pass.set_bind_group(7, rr, &[]);
-          pass.dispatch_workgroups(groups, 1, 1);
-        },
-      );
-    }
-
-    if refl_ok
-      && let Some(rr) = refl_read_bg
-      && let Some(cb0) = refl_compose_bg0
-      && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.compose_pipeline)
-    {
-      let gxc = gx.max(1);
-      let gyc = gy.max(1);
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_dda_refl_compose",
-        |pass| {
-          pass.set_pipeline(pipe);
-          pass.set_bind_group(0, cb0, &[]);
-          pass.set_bind_group(1, &bg1.0, &[]);
-          pass.set_bind_group(2, &bg2.0, &[]);
-          pass.set_bind_group(3, &bg3.0, &[]);
-          pass.set_bind_group(4, &bg4.0, &[]);
-          if let Some(gr) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
-            pass.set_bind_group(5, gr, &[]);
-          }
-          if let Some(fog_read) = fog_read {
-            pass.set_bind_group(6, fog_read, &[]);
-          }
-          pass.set_bind_group(7, rr, &[]);
-          pass.dispatch_workgroups(gxc, gyc, 1);
-        },
-      );
-    }
+  if refl_ok
+    && let Some(rr) = refl_read_bg
+    && let Some(cb0) = refl_compose_bg0
+    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.compose_pipeline)
+  {
+    let gxc = gx.max(1);
+    let gyc = gy.max(1);
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_dda_refl_compose",
+      |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, cb0, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, &bg4.0, &[]);
+        if let Some(gr) = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref()) {
+          pass.set_bind_group(5, gr, &[]);
+        }
+        if let Some(fog_read) = fog_read {
+          pass.set_bind_group(6, fog_read, &[]);
+        }
+        pass.set_bind_group(7, rr, &[]);
+        pass.dispatch_workgroups(gxc, gyc, 1);
+      },
+    );
   }
 
   if eye.as_ref().is_some_and(|e| e.settings.enabled)

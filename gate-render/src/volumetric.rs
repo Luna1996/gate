@@ -83,6 +83,11 @@ fn fog_layout(name: &'static str, slots: &[(u32, FogSlot)]) -> BindGroupLayoutDe
           format: TextureFormat::Rgba16Float,
           view_dimension: TextureViewDimension::D2,
         },
+        FogSlot::GiUniform => BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(crate::gi::GiUniform::min_size()),
+        },
       },
       count: None,
     })
@@ -95,10 +100,15 @@ enum FogSlot {
   Uniform,
   Sample,
   Write,
+  GiUniform,
 }
 
 pub fn fog_layout_mask() -> BindGroupLayoutDescriptor {
-  fog_layout("FogGodrayMask", &[(1, FogSlot::Uniform), (3, FogSlot::Write)])
+  
+  fog_layout(
+    "FogGodrayMask",
+    &[(0, FogSlot::GiUniform), (1, FogSlot::Uniform), (3, FogSlot::Write)],
+  )
 }
 
 pub fn fog_layout_blur_a() -> BindGroupLayoutDescriptor {
@@ -169,6 +179,8 @@ pub struct FogGpu {
   read_bg: Option<bevy::render::render_resource::BindGroup>,
   ph_tex: Option<bevy::render::render_resource::Texture>,
   ph_view: Option<bevy::render::render_resource::TextureView>,
+  
+  gi_fb: Option<bevy::render::render_resource::Buffer>,
   pipelines: [Option<CachedComputePipelineId>; 3],
   layouts: FogLayouts,
 }
@@ -312,6 +324,7 @@ fn prepare_fog(
   view: Option<bevy::ecs::system::Res<crate::brickmap::dda::DdaViewUniform>>,
   scale: Option<bevy::ecs::system::Res<crate::brickmap::dda::RenderScale>>,
   lighting: Option<bevy::ecs::system::Res<crate::lighting::LightingTheme>>,
+  gi_gpu: Option<bevy::ecs::system::Res<crate::gi::GiGpu>>,
   mut gpu: bevy::ecs::system::ResMut<FogGpu>,
 ) {
   use bevy::render::render_resource::*;
@@ -393,11 +406,27 @@ fn prepare_fog(
   if let (Some(a_src), Some(a_dst), Some(b_src), Some(b_dst)) =
     (gpu.a_src.clone(), gpu.a_dst.clone(), gpu.b_src.clone(), gpu.b_dst.clone())
   {
+    
+    if gpu.gi_fb.is_none() {
+      gpu.gi_fb = Some(device.create_buffer(&BufferDescriptor {
+        label: Some("gate_godray_gi_u_fallback"),
+        size: crate::gi::GiUniform::min_size().get(),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+      }));
+    }
     let uniform = gpu.uniform.binding().expect("uniform 已写入");
+    let gi_fb = gi_gpu
+      .as_ref()
+      .and_then(|g| g.uniform.buffer())
+      .cloned()
+      .or_else(|| gpu.gi_fb.clone())
+      .expect("gi_u 占位 buffer 已建");
     let mask_bg = device.create_bind_group(
       None,
       &mask_layout,
       &[
+        BindGroupEntry { binding: 0, resource: gi_fb.as_entire_binding() },
         BindGroupEntry { binding: 1, resource: uniform.clone() },
         BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&a_dst) },
       ],
