@@ -182,8 +182,6 @@ struct FogUniform {
 
 @group(5) @binding(4) var gi_tex: texture_2d<f32>;
 
-@group(5) @binding(5) var gi_sun_tex: texture_2d<f32>;
-
 @group(5) @binding(6) var<storage, read_write> gi_guide_out: array<u32>;
 
 @group(5) @binding(8) var<storage, read_write> face_slots: array<atomic<u32>>;
@@ -195,8 +193,6 @@ struct FogUniform {
 @group(5) @binding(11) var<storage, read_write> gi_wal: array<atomic<u32>>;
 
 @group(5) @binding(12) var<storage, read> gi_edit_boxes: array<u32>;
-
-@group(5) @binding(13) var gi_sun_out: texture_storage_2d<rgba8unorm, write>;
 
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;

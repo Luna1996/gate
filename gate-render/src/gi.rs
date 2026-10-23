@@ -315,7 +315,6 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
     "GiBg5",
     &[
       store(2, TextureFormat::Rgba16Float),
-      store(13, TextureFormat::Rgba8Unorm),
       BindGroupLayoutEntry {
         binding: 6,
         visibility: C,
@@ -571,8 +570,6 @@ pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
 struct GiPlaceholder {
   tex: Option<bevy::render::render_resource::Texture>,
   view: Option<bevy::render::render_resource::TextureView>,
-  sun_tex: Option<bevy::render::render_resource::Texture>,
-  sun_view: Option<bevy::render::render_resource::TextureView>,
 
   res: Option<bevy::render::render_resource::Buffer>,
 }
@@ -598,28 +595,6 @@ impl GiPlaceholder {
       self.tex = Some(t);
     }
     self.view.as_ref().expect("刚创建")
-  }
-
-  fn sun_view(
-    &mut self,
-    device: &bevy::render::renderer::RenderDevice,
-  ) -> &bevy::render::render_resource::TextureView {
-    use bevy::render::render_resource::*;
-    if self.sun_tex.is_none() {
-      let t = device.create_texture(&TextureDescriptor {
-        label: Some("gate_gi_sun_placeholder"),
-        size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-      });
-      self.sun_view = Some(t.create_view(&TextureViewDescriptor::default()));
-      self.sun_tex = Some(t);
-    }
-    self.sun_view.as_ref().expect("刚创建")
   }
 
   fn res_buffer(
@@ -779,13 +754,6 @@ fn prepare_gi(
     gpu.wide_rev = gpu.wide_rev.wrapping_add(1);
   }
   let occluder_rev = gpu.wide_rev;
-
-  //
-
-  //
-
-  //
-
   let content_changed = dirty.as_ref().is_some_and(|d| d.edited);
   if content_changed {
     gpu.content_rev = gpu.content_rev.wrapping_add(1);
@@ -927,10 +895,6 @@ fn prepare_gi(
     Some(v) => v.clone(),
     None => gi_ph.view(&device).clone(),
   };
-  let gi_sun_view = match aux.as_ref().and_then(|a| a.gi_sun_view()) {
-    Some(v) => v.clone(),
-    None => gi_ph.sun_view(&device).clone(),
-  };
 
   let guide = aux
     .as_ref()
@@ -968,7 +932,6 @@ fn prepare_gi(
     &bg5_layout,
     &[
       BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&gi_view) },
-      BindGroupEntry { binding: 13, resource: BindingResource::TextureView(&gi_sun_view) },
       BindGroupEntry { binding: 6, resource: guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
       BindGroupEntry { binding: 9, resource: gi_sec_slots.as_entire_binding() },

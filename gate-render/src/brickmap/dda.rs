@@ -249,8 +249,6 @@ pub(crate) struct AuxTexCache {
   size: UVec2,
   gi_tex: Option<Texture>,
   gi_view: Option<TextureView>,
-  gi_sun: Option<Texture>,
-  gi_sun_view: Option<TextureView>,
   gi_size: UVec2,
   gi_res_a: Option<Buffer>,
   gi_res_b: Option<Buffer>,
@@ -308,10 +306,6 @@ pub(crate) const DEN_ATROUS_ROUNDS: [[usize; 5]; 5] =
 impl AuxTexCache {
   pub(crate) fn gi_write_view(&self) -> Option<&TextureView> {
     self.gi_view.as_ref()
-  }
-
-  pub(crate) fn gi_sun_view(&self) -> Option<&TextureView> {
-    self.gi_sun_view.as_ref()
   }
 
   pub(crate) fn gi_hist_current(&self) -> Option<&Buffer> {
@@ -562,16 +556,6 @@ pub(crate) fn init_dda_pipelines(
     &[
       BindGroupLayoutEntry {
         binding: 4,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Texture {
-          sample_type: TextureSampleType::Float { filterable: true },
-          view_dimension: TextureViewDimension::D2,
-          multisampled: false,
-        },
-        count: None,
-      },
-      BindGroupLayoutEntry {
-        binding: 5,
         visibility: ShaderStages::COMPUTE,
         ty: BindingType::Texture {
           sample_type: TextureSampleType::Float { filterable: true },
@@ -1099,9 +1083,6 @@ pub(crate) fn prepare_dda_bind_groups(
     let gi_tex = make("gate_gi", TextureFormat::Rgba16Float);
     beam_cache.gi_view = Some(gi_tex.create_view(&TextureViewDescriptor::default()));
     beam_cache.gi_tex = Some(gi_tex);
-    let sun_tex = make("gate_gi_sun", TextureFormat::Rgba8Unorm);
-    beam_cache.gi_sun_view = Some(sun_tex.create_view(&TextureViewDescriptor::default()));
-    beam_cache.gi_sun = Some(sun_tex);
     beam_cache.gi_size = gi_size;
 
     let res_bytes =
@@ -1342,12 +1323,6 @@ pub(crate) fn prepare_dda_bind_groups(
     &gi_read_layout,
     &[
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
-      BindGroupEntry {
-        binding: 5,
-        resource: BindingResource::TextureView(
-          beam_cache.gi_sun_view.as_ref().expect("太阳可见度视图未创建"),
-        ),
-      },
       BindGroupEntry { binding: 6, resource: gi_guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
       BindGroupEntry { binding: 10, resource: region_table.as_entire_binding() },

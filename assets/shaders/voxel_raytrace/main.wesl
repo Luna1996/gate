@@ -1,4 +1,4 @@
-import package::bindings::{gi_sun_tex, refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
@@ -351,18 +351,10 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
   return refl_env;
 }
 
-fn gi_sun_at(uv: vec2<f32>) -> vec3<f32> {
-  let s = textureSampleLevel(gi_sun_tex, light_samp, uv, 0.0);
-  if (!(s.a > 1.0 / 64.0)) { return vec3<f32>(-1.0); }
-  return s.rgb / s.a;
-}
-
 fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frustum_length: f32,
               gi_in: GiInput, sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>,
-              n_hint: vec3<f32>, n_hint_ok: bool, sun_io: ptr<function, f32>,
+              n_hint: vec3<f32>, n_hint_ok: bool,
               qpx: u32) -> vec3<f32> {
-  let sun_hint = *sun_io;
-  *sun_io = 0.0;
   var best = first;
   var through = vec3<f32>(1.0);
   var refl = vec3<f32>(0.0);
@@ -451,23 +443,12 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
     let ndl = max(dot(n, sun_dir), 0.0);
     var sun = vec3<f32>(0.0);
-    if (sun_hint >= 0.0) {
-      sun = vec3<f32>(sun_hint);
-    } else if (ndl > 0.0) {
+    if (ndl > 0.0) {
       sun = vec3<f32>(1.0);
       if ((light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
-        var hinted = vec3<f32>(-1.0);
-        if (gi_u.misc.x > 0.5) {
-          hinted = gi_sun_at(gi_in.uv);
-        }
-        if (hinted.x >= 0.0) {
-          sun = hinted;
-        } else {
-          sun = sun_transmittance(p_voxel + n * n_off, sun_dir, best.voxel, best.obj_id);
-        }
+        sun = sun_transmittance(p_voxel + n * n_off, sun_dir, best.voxel, best.obj_id);
       }
     }
-    *sun_io = max(max(sun.x, sun.y), sun.z);
     let gi_on = gi_u.misc.x > 0.5;
     var gi = vec3<f32>(0.0);
     var cov = 0.0;
@@ -686,11 +667,10 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
     }
   }
   var col = vec3<f32>(0.0);
-  var sun_io = -1.0;
   if (diag_on && !first.hit) { atomicAdd(&lod_diag[DIAG_FACE_SKY], 1u); }
   col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                      GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
-                     n_own, need_n, &sun_io, u32(gid.y) * size.x + u32(gid.x));
+                     n_own, need_n, u32(gid.y) * size.x + u32(gid.x));
   if (diag_on && first.hit) {
     let q = u32(clamp(dot(dbg_gi, GI_LUMA), 0.0, 255.0) * 256.0);
     let p = u32(clamp(dot(col, GI_LUMA), 0.0, 255.0) * 256.0);

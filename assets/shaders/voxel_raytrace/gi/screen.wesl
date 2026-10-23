@@ -1,8 +1,8 @@
-import package::bindings::{lod_diag, BASE_FLAG_SHADOW, face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_sun_out, gi_u, light_u};
+import package::bindings::{lod_diag, face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, gi_in_edit_box, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
 import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_LUMA_FLOOR_REL, GI_DEN_N_DOT, GI_HIST_RESET_FRAMES, GI_HIST_RESET_SCALE, GI_HIST_SEARCH_TAPS, GI_LUMA, GI_PI, GI_SS_ADAPT_EMA, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_HI_RESET, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_CLAMP_LO_RESET, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
-import package::gi::ray::{gi_ray_radiance, sun_transmittance};
+import package::gi::ray::{gi_ray_radiance};
 import package::gi::wal::{gi_wal_merge, gi_wal_sample};
 import package::trace::{LOD_DIAG, make_grid};
 import package::common::{FLAGS_TRANSMISSIVE};
@@ -153,7 +153,6 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
     gi_res_store_cur(idx, gi_res_none());
     gi_den_guide_store(coord, size, false, 0u, 0u, vec3<f32>(0.0, 0.0, 1.0), false, vec2<i32>(0), false);
-    textureStore(gi_sun_out, coord, vec4<f32>(0.0));
     return;
   }
 
@@ -165,15 +164,6 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   }
   let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
   let org = p_voxel + n * n_off;
-
-  var sun = vec3<f32>(0.0);
-  let ndl = max(dot(n, sun_dir), 0.0);
-  let sun_valid = ndl > 0.0;
-  if (sun_valid && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
-    sun = sun_transmittance(org, sun_dir, h.voxel, h.obj_id);
-  }
-
-  textureStore(gi_sun_out, coord, vec4<f32>(select(vec3<f32>(0.0), sun, sun_valid), select(0.0, 1.0, sun_valid)));
 
   let pk0 = gi_key0(h.voxel, h.obj_id);
   let pk1 = gi_key1(h.voxel, h.face_id, h.obj_id);
