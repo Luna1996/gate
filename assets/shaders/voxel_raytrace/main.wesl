@@ -113,8 +113,6 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
   refl_req[o + 1u] = vec4<u32>(pbase, face_id, 0u, px);
 }
 
-// 玻璃的反射、透射都必须逐体素：起点取体素面心，方向取体素中心视线。
-// 不要传入命中点或逐像素方向，否则透射会退化成逐像素（同面内出现连续变化的折射）。
 fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
                entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32,
                quality: u32) -> GlassOut {

@@ -295,6 +295,7 @@ pub(crate) struct AuxTexCache {
   refl_cfg: Option<Buffer>,
   out_base: Option<Texture>,
   out_base_view: Option<TextureView>,
+  out_base_size: UVec2,
 }
 
 pub(crate) const DEN_ATROUS_CHAINS: [[usize; 2]; 6] =
@@ -1122,45 +1123,6 @@ pub(crate) fn prepare_dda_bind_groups(
     ];
     beam_cache.gi_phi = Some(make_buf("gate_gi_den_phi", px * 4));
 
-    let vpx = crate::consts::VIEW_SIZE.x as u64 * crate::consts::VIEW_SIZE.y as u64;
-    let refl_cap = vpx * 2;
-    beam_cache.refl_req = Some(make_buf("gate_refl_req", refl_cap * 8 * 4));
-    beam_cache.refl_sum = Some(make_buf("gate_refl_sum", vpx * 3 * 4));
-    beam_cache.refl_meta = Some(make_buf("gate_refl_meta", 16));
-    let cfg_buf = render_device.create_buffer(&BufferDescriptor {
-      label: Some("gate_refl_cfg"),
-      size: 16,
-      usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-      mapped_at_creation: false,
-    });
-    {
-      let mut b = [0u8; 16];
-      b[0..4].copy_from_slice(&(refl_cap as u32).to_le_bytes());
-      b[4..8].copy_from_slice(&(vpx as u32).to_le_bytes());
-      queue.write_buffer(&cfg_buf, 0, &b);
-    }
-    beam_cache.refl_cfg = Some(cfg_buf);
-    beam_cache.out_base = Some(render_device.create_texture(&TextureDescriptor {
-      label: Some("gate_out_base"),
-      size: Extent3d {
-        width: crate::consts::VIEW_SIZE.x,
-        height: crate::consts::VIEW_SIZE.y,
-        depth_or_array_layers: 1,
-      },
-      mip_level_count: 1,
-      sample_count: 1,
-      dimension: TextureDimension::D2,
-      format: TextureFormat::Rgba8Unorm,
-      usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-      view_formats: &[],
-    }));
-    beam_cache.out_base_view = Some(
-      beam_cache
-        .out_base
-        .as_ref()
-        .expect("out_base")
-        .create_view(&TextureViewDescriptor::default()),
-    );
     for (i, label) in
       ["gate_gi_dn_tmp", "gate_gi_dn_a", "gate_gi_dn_b", "gate_gi_den"].iter().enumerate()
     {
@@ -1169,6 +1131,52 @@ pub(crate) fn prepare_dda_bind_groups(
       beam_cache.gi_dn_dst[i] = Some(t.create_view(&TextureViewDescriptor::default()));
       beam_cache.gi_dn[i] = Some(t);
     }
+  }
+
+  if beam_cache.out_base.is_none() || beam_cache.out_base_size != scale.size {
+    let refl_px = scale.size.x as u64 * scale.size.y as u64;
+    let tex = render_device.create_texture(&TextureDescriptor {
+      label: Some("gate_out_base"),
+      size: Extent3d {
+        width: scale.size.x,
+        height: scale.size.y,
+        depth_or_array_layers: 1,
+      },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D2,
+      format: TextureFormat::Rgba8Unorm,
+      usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+      view_formats: &[],
+    });
+    beam_cache.out_base_view = Some(tex.create_view(&TextureViewDescriptor::default()));
+    beam_cache.out_base = Some(tex);
+    beam_cache.out_base_size = scale.size;
+
+    let refl_cap = refl_px * 2;
+    let make_buf = |label: &str, bytes: u64| {
+      render_device.create_buffer(&BufferDescriptor {
+        label: Some(label),
+        size: bytes.max(4),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+      })
+    };
+    beam_cache.refl_req = Some(make_buf("gate_refl_req", refl_cap * 8 * 4));
+    beam_cache.refl_sum = Some(make_buf("gate_refl_sum", refl_px * 3 * 4));
+    beam_cache.refl_meta = Some(make_buf("gate_refl_meta", 16));
+    let cfg_buf = render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_refl_cfg"),
+      size: 16,
+      usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&(refl_cap as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&(refl_px as u32).to_le_bytes());
+    queue.write_buffer(&cfg_buf, 0, &b);
+    beam_cache.refl_cfg = Some(cfg_buf);
+    beam_cache.refl_cap = refl_cap;
   }
 
   if beam_cache.wal.is_none() {
@@ -1298,7 +1306,6 @@ pub(crate) fn prepare_dda_bind_groups(
   beam_cache.refl_compose_bg0 = Some(compose_bg0);
   beam_cache.refl_write_bg = refl_write_bg;
   beam_cache.refl_read_bg = refl_read_bg;
-  beam_cache.refl_cap = crate::consts::VIEW_SIZE.x as u64 * crate::consts::VIEW_SIZE.y as u64 * 2;
 
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
 
