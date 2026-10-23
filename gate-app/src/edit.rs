@@ -814,9 +814,7 @@ pub(crate) fn voxel_edit_input(
   {
     *active = None;
     scene.edit_in_flight = false;
-    // 这条路径不画笔 ⇒ 不能留着上一笔的「隐藏编辑」标记：
-    // 上游用它跳过脏盒计算（隐藏编辑不影响外观）⇒ 留着会让**后续所有编辑**
-    // （包括物体的出现/消失）都不产生脏盒 ⇒ GI 的时域历史不作废 ⇒ 看起来"没反应"。
+
     scene.interior_only_edit = false;
     return;
   }

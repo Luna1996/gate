@@ -82,22 +82,14 @@ fn gi_pack_dir(n: vec3<f32>) -> u32 {
   return pack2x16float(o);
 }
 
-/// 编辑处的光能影响到多远（体素）。
-///
-/// 一盏自发光灯的光随距离平方衰减 ⇒ 真正需要重新收敛的只有它周围这一小块；
-/// 再远的面 GI 变化不到百分之一 ⇒ 不该动它们的历史（动了就是"全屏重新累积"）。
 const GI_EDIT_BOX_REACH: f32 = 384.0;
 
-/// 这个面在不在"本次编辑"的影响范围内？
-///
-/// 范围 = 编辑的世界空间 AABB + 光的有效距离（`GI_EDIT_BOX_REACH`）。
-/// 只有范围内的面才降权/重算 ⇒ **屏幕其余部分纹丝不动**。
 fn gi_in_edit_box(p_world: vec3<f32>) -> bool {
   let n = min(gi_edit_boxes[0], 8u);
   for (var i = 0u; i < n; i = i + 1u) {
     let b = 1u + i * 6u;
-    let lo = vec3<f32>(f32(gi_edit_boxes[b]), f32(gi_edit_boxes[b + 1u]), f32(gi_edit_boxes[b + 2u]));
-    let hi = vec3<f32>(f32(gi_edit_boxes[b + 3u]), f32(gi_edit_boxes[b + 4u]), f32(gi_edit_boxes[b + 5u]));
+    let lo = vec3<f32>(f32(bitcast<i32>(gi_edit_boxes[b])), f32(bitcast<i32>(gi_edit_boxes[b + 1u])), f32(bitcast<i32>(gi_edit_boxes[b + 2u])));
+    let hi = vec3<f32>(f32(bitcast<i32>(gi_edit_boxes[b + 3u])), f32(bitcast<i32>(gi_edit_boxes[b + 4u])), f32(bitcast<i32>(gi_edit_boxes[b + 5u])));
     if (all(p_world >= lo - vec3<f32>(GI_EDIT_BOX_REACH)) &&
         all(p_world <= hi + vec3<f32>(GI_EDIT_BOX_REACH))) {
       return true;

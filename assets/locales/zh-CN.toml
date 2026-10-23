@@ -416,7 +416,7 @@ CPU 与 GPU 两侧共用同一个**块数**，而这个块数按 **CPU 侧**的�
 
 1000 体压测里这是最大的一项开销，减半等于省一半求解时间。
 """
-"menu.game.phys.rate" = "物理步频"
+"menu.game.phys.every" = "解算间隔"
 "menu.ui" = "界面"
 "menu.ui.showcase" = "UI 展示窗"
 "menu.camera.axis.x" = "X"

@@ -100,21 +100,9 @@ impl DirtyBox {
 pub struct BrickMapDirty {
   pub full: bool,
   pub palette_changed: bool,
-  /// 本帧脏盒里是否含**真实编辑**（用户改过体素）。
-  ///
-  /// 必须与「流式装载新块」区分开：两者都走增量通道、都只产生 `boxes`，
-  /// 但只有前者会改变光照（自发光体素出现/消失 ⇒ 周围面的间接光变了）——
-  /// GI 的时域历史必须因此作废；后者只是补内容，历史应当保留，
-  /// 否则流式世界里 GI 每帧都从头累积、永远收敛不了。
-  ///
-  /// 判据：编辑会经 `VolumeGrid::note_edit` 记下**编辑 AABB**，
-  /// 而流式装载（`mount_chunk_tree`）不会 ⇒ 有编辑 AABB 的脏盒才是真编辑。
+
   pub edited: bool,
-  /// 真编辑的**世界空间 AABB**（局部 GI 失效用）。
-  ///
-  /// GI 的时域历史必须**局部**作废：整屏作废会让满屏 GI 一起重新累积
-  /// （"全屏花一下再收敛"）。只有光真正被改到的那块（编辑处 + 光的有效距离）
-  /// 才需要重新收敛，其余像素的历史原样保留 ⇒ 画面其余部分纹丝不动。
+
   pub edit_boxes: Vec<DirtyBox>,
   pub boxes: Vec<DirtyBox>,
 }
@@ -525,7 +513,6 @@ fn extract(
         let (cl, ch, is_edit) =
           match pending_aabbs.iter().find(|(v, cc, ..)| v == vol_idx && cc == c) {
             Some((_, _, alo, ahi)) => {
-              // 有编辑 AABB ⇒ 这是**真实编辑**（不是流式装载）⇒ GI 的时域历史要作废。
               dirty_aabb.edited = true;
               (*alo, *ahi, true)
             }
@@ -557,7 +544,7 @@ fn extract(
           scene.volumes.list.get(vol_idx).map(|g| world_dirty_box(g.transform(), lo, hi))
         })
         .collect();
-      // 真编辑的世界空间 AABB（局部 GI 失效用）。
+
       dirty_aabb.edit_boxes = edit_acc
         .into_iter()
         .filter_map(|(vol_idx, lo, hi)| {

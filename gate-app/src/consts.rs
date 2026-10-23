@@ -84,7 +84,11 @@ pub fn gi_force() -> Option<bool> {
 pub const BENCH_FLY_SPEED: f32 = 2000.0;
 pub const BENCH_FLY_TURN: f32 = 0.16;
 pub const BENCH_FLY_YAW: f32 = 0.35;
-pub const EDIT_SELFTEST: bool = false;
+
+pub fn edit_selftest() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| std::env::var("GATE_EDIT_SELFTEST").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
 
 pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=warn,wgpu_core=warn";
 

@@ -94,12 +94,7 @@ impl BaseSettings {
 
 impl Default for BaseSettings {
   fn default() -> Self {
-    Self {
-      shadow: true,
-      implicit_normal: true,
-      vol_tint: false,
-      glass_quality: 2,
-    }
+    Self { shadow: true, implicit_normal: true, vol_tint: false, glass_quality: 2 }
   }
 }
 

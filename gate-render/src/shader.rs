@@ -53,23 +53,31 @@ pub fn build_dda_shader(app: &mut App) {
     }
   };
   let t1 = std::time::Instant::now();
-  let source_rt = match compile_dda_wesl(true) {
+  let source_rt = crate::brickmap::consts::RT_RAY_QUERY.then(|| match compile_dda_wesl(true) {
     Ok(source) => source,
     Err(e) => {
       let msg = format!("DDA WESL 编译失败（ray_query 版，{}）:\n{e}", dda_wesl_dir().display());
       error!("{msg}");
       panic!("{msg}");
     }
-  };
+  });
   let t2 = std::time::Instant::now();
-  info!(
-    target: "gate",
-    "WESL→WGSL：主 {} ms（{} KB）/ ray_query 版 {} ms（{} KB）",
-    t1.duration_since(t0).as_millis(),
-    source.len() / 1024,
-    t2.duration_since(t1).as_millis(),
-    source_rt.len() / 1024
-  );
+  match &source_rt {
+    Some(src) => info!(
+      target: "gate",
+      "WESL→WGSL：主 {} ms（{} KB）/ ray_query 版 {} ms（{} KB）",
+      t1.duration_since(t0).as_millis(),
+      source.len() / 1024,
+      t2.duration_since(t1).as_millis(),
+      src.len() / 1024
+    ),
+    None => info!(
+      target: "gate",
+      "WESL→WGSL：主 {} ms（{} KB）；ray_query 版已禁用（RT_RAY_QUERY=false）",
+      t1.duration_since(t0).as_millis(),
+      source.len() / 1024
+    ),
+  }
 
   crate::wesl_consts::gi_consts();
   crate::wesl_consts::trace_consts();
@@ -77,10 +85,13 @@ pub fn build_dda_shader(app: &mut App) {
     .world_mut()
     .resource_mut::<Assets<Shader>>()
     .add(Shader::from_wgsl(source, DDA_SHADER_PATH));
-  let handle_rt = app
-    .world_mut()
-    .resource_mut::<Assets<Shader>>()
-    .add(Shader::from_wgsl(source_rt, DDA_SHADER_RT_PATH));
+  let handle_rt = match source_rt {
+    Some(src) => app
+      .world_mut()
+      .resource_mut::<Assets<Shader>>()
+      .add(Shader::from_wgsl(src, DDA_SHADER_RT_PATH)),
+    None => handle.clone(),
+  };
   app.insert_resource(DdaShaderHandle(handle));
   app.insert_resource(DdaShaderRtHandle(handle_rt));
 }

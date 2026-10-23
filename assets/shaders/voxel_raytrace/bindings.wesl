@@ -15,11 +15,10 @@ const BEAM_DIV: u32 = 4u;
 const BEAM_BACKOFF: f32 = 4.0;
 
 struct DdaViewUniform {
-  view_proj: mat4x4<f32>,       
-  inv_view_proj: mat4x4<f32>,   
-  cam_pos_voxel: vec4<f32>,      
-  debug_mode: vec4<f32>,        
-  lod: vec4<f32>,               
+  view_proj: mat4x4<f32>,
+  inv_view_proj: mat4x4<f32>,
+  cam_pos_voxel: vec4<f32>,
+  lod: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> view_u: DdaViewUniform;
 
@@ -53,25 +52,21 @@ struct Globals {
 @group(1) @binding(4) var light_samp: sampler;
 
 struct MaterialAsset {
-  albedo_slot: u32,        
-  roughmetal_slot: u32,    
-  emissive_slot: u32,      
-  transmission_slot: u32,  
-  height_slot: u32,        
-  albedo_rough: u32,       
-  
-  
-  
-  
-  
+  albedo_slot: u32,
+  roughmetal_slot: u32,
+  emissive_slot: u32,
+  transmission_slot: u32,
+  height_slot: u32,
+  albedo_rough: u32,
+
   emissive_metal: u32,
-  transmission_ior: u32,   
+  transmission_ior: u32,
 };
 
 @group(1) @binding(5) var<storage, read> material_assets: array<MaterialAsset>;
 
-@group(1) @binding(6) var pbr_albedo_rough: texture_2d_array<f32>;  
-@group(1) @binding(7) var pbr_metal: texture_2d_array<f32>;         
+@group(1) @binding(6) var pbr_albedo_rough: texture_2d_array<f32>;
+@group(1) @binding(7) var pbr_metal: texture_2d_array<f32>;
 
 @group(1) @binding(8) var pbr_samp: sampler;
 
@@ -87,27 +82,25 @@ struct MaterialAsset {
 @group(1) @binding(13) var<storage, read> b_struct_p1: array<u32>;
 
 struct GridDesc {
-  pos_scale: vec4<f32>,   
-  rot0: vec4<f32>,        
-  rot1: vec4<f32>,        
-  rot2: vec4<f32>,        
-  aabb_min: vec4<f32>,    
-  aabb_max: vec4<f32>,    
-  tree_base: u32,         
-  tree_depth: u32,        
-  chunk_count: u32,       
-  palette_base: u32,      
-  index_origin_x: i32,    
+  pos_scale: vec4<f32>,
+  rot0: vec4<f32>,
+  rot1: vec4<f32>,
+  rot2: vec4<f32>,
+  aabb_min: vec4<f32>,
+  aabb_max: vec4<f32>,
+  tree_base: u32,
+  tree_depth: u32,
+  chunk_count: u32,
+  palette_base: u32,
+  index_origin_x: i32,
   index_origin_y: i32,
   index_origin_z: i32,
-  
-  
+
   _pad0: u32,
-  index_dims_x: u32,      
+  index_dims_x: u32,
   index_dims_y: u32,
   index_dims_z: u32,
-  
-  
+
   coverage_r: f32,
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
@@ -117,33 +110,28 @@ struct GridDesc {
 @group(2) @binding(2) var<storage, read> obj_pose_rev: array<u32>;
 
 struct LightDesc {
-  kind_pos_dir: vec4<f32>,    
-  color_intensity: vec4<f32>, 
-  
-  
+  kind_pos_dir: vec4<f32>,
+  color_intensity: vec4<f32>,
+
   shape: vec4<f32>,
 }
 struct LightGlobals {
   count: u32,
-  
-  
-  
-  
+
   refl_tier: u32,
-  
-  
+
   refl_nest: u32,
-  
+
   refl_reach: u32,
-  
+
   base_flags: u32,
-  ambient: vec4<f32>,     
-  exposure_pad: vec4<f32>, 
+  ambient: vec4<f32>,
+  exposure_pad: vec4<f32>,
 }
 struct LightPool {
   g: LightGlobals,
   lights: array<LightDesc, 8u>,
-  sky_color: vec4<f32>,   
+  sky_color: vec4<f32>,
 }
 @group(3) @binding(0) var<uniform> light_u: LightPool;
 
@@ -154,37 +142,14 @@ const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
 const BASE_FLAG_VOL_TINT: u32 = 4u;
 
 struct GiUniform {
-  
-  
-  
-  
-  
-  
   params: vec4<f32>,
-  
-  
-  
-  
+
   misc: vec4<f32>,
-  
-  
-  
-  
-  
-  
-  
-  
+
   flags: vec4<f32>,
-  
-  
-  
-  
-  
-  
+
   seq: vec4<u32>,
-  
-  
-  
+
   prev_view_proj: mat4x4<f32>,
 };
 @group(4) @binding(0) var<uniform> gi_u: GiUniform;
@@ -193,18 +158,12 @@ struct GiUniform {
 @group(4) @binding(21) var<storage, read_write> gi_res_prev: array<u32>;
 
 struct FogUniform {
-  
   params: vec4<f32>,
-  
-  
-  
+
   misc: vec4<f32>,
-  
-  
-  
-  
+
   misc2: vec4<f32>,
-  
+
   misc3: vec4<f32>,
 }
 @group(4) @binding(1) var<uniform> fog_u: FogUniform;
@@ -223,6 +182,8 @@ struct FogUniform {
 
 @group(5) @binding(4) var gi_tex: texture_2d<f32>;
 
+@group(5) @binding(5) var gi_sun_tex: texture_2d<f32>;
+
 @group(5) @binding(6) var<storage, read_write> gi_guide_out: array<u32>;
 
 @group(5) @binding(8) var<storage, read_write> face_slots: array<atomic<u32>>;
@@ -233,8 +194,9 @@ struct FogUniform {
 
 @group(5) @binding(11) var<storage, read_write> gi_wal: array<atomic<u32>>;
 
-/// 真编辑的世界空间 AABB 列表（局部 GI 失效用）：[count, (lo,hi)×N]。
 @group(5) @binding(12) var<storage, read> gi_edit_boxes: array<u32>;
+
+@group(5) @binding(13) var gi_sun_out: texture_storage_2d<rgba8unorm, write>;
 
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;

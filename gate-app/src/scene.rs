@@ -2,8 +2,8 @@ use bevy::{image::Image, prelude::*};
 use glam::{IVec3, Vec3};
 
 use gate_render::{
-  BrickMapBuilder, DdaCameraConfig, DdaImages, DebugNormals, OrbitCamera, UploadBudget, VIEW_SIZE,
-  VoxelScene, create_dda_image,
+  BrickMapBuilder, DdaCameraConfig, DdaImages, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene,
+  create_dda_image,
 };
 use gate_voxel::{
   Displace, PaletteEntry, PaletteId, VolumeGrid, Volumes, draw_text, fill_box, fill_box_displaced,
@@ -46,7 +46,6 @@ pub(crate) fn setup(
     });
   commands.insert_resource(theme);
   commands.insert_resource(DdaImages { target: dda_handle });
-  commands.insert_resource(DebugNormals(0));
 
   let t0 = std::time::Instant::now();
   let mut grid = VolumeGrid::new();

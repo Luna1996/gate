@@ -6,7 +6,7 @@ import package::trace::{MediumRay, UnifiedHit, make_grid, trace_grid, diag_ray, 
 
 fn vol_tint_color(h: WorldHit) -> vec3<f32> {
   if (!h.hit) {
-    return vec3<f32>(0.02, 0.02, 0.03); 
+    return vec3<f32>(0.02, 0.02, 0.03);
   }
   var idx = 255u;
   let n = g.grid_count;
@@ -16,8 +16,7 @@ fn vol_tint_color(h: WorldHit) -> vec3<f32> {
       break;
     }
   }
-  
-  
+
   switch (idx) {
     case 0u: { return vec3<f32>(0.05, 0.80, 0.10); }
     case 1u: { return vec3<f32>(0.90, 0.06, 0.06); }
@@ -39,7 +38,7 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> v
   var dw = d;
   if (g.obj_id >= 0) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
   if (dot(dw, dw) > 0.0) { return normalize(dw); }
-      return face_n;
+  return face_n;
 }
 
 fn nb_solid_fast(leaf: u32, leaf_pal: u32, mask: u64, c: vec3<i32>, off: vec3<i32>) -> f32 {
@@ -245,7 +244,7 @@ fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_c
       continue;
     }
     let first = order_base + inst_bvh[base + 3u];
-            let tl = max(t_min, sl.x);
+    let tl = max(t_min, sl.x);
     let th = min(t_cap, sl.y);
     leaf_it = leaf_it + count;
     for (var k: u32 = 0u; k < count; k = k + 1u) {
@@ -339,7 +338,7 @@ fn camera_solid_pal(origin_voxel: vec3<f32>) -> u32 {
 struct WorldRayQuery {
   t_min: f32,
   depth_cap: u32,
-  
+
   req: u32,
 }
 
@@ -353,14 +352,14 @@ fn world_cfg_primary(t_min: f32, depth_cap: u32) -> WorldRayQuery {
 
 struct WorldHit {
   hit: bool,
-  t: f32,               
-  point: vec3<f32>,     
+  t: f32,
+  point: vec3<f32>,
   pal: u32,
-  n: vec3<f32>,         
-  face_id: u32,         
-  voxel: vec3<i32>,     
-  obj_id: i32,          
-  palette_base: u32,    
+  n: vec3<f32>,
+  face_id: u32,
+  voxel: vec3<i32>,
+  obj_id: i32,
+  palette_base: u32,
 }
 
 fn world_miss() -> WorldHit {
@@ -377,7 +376,7 @@ fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: W
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
                       stop_on_air: bool, tint: ptr<function, vec3<f32>>) -> WorldHit {
   var mc = MediumRay(stop_on_air, g.palette_base, 0u, vec3<f32>(1.0));
-  
+
   var gap: f32 = 1.0e+30;
   let h = trace_grid(g, origin, dir, max_t, 0.0, 3u, true, 0u, &mc, &gap);
   *tint = *tint * mc.tint;
@@ -502,9 +501,9 @@ fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_
   var best = world_miss();
   var best_t = 1e+30;
   var shell = coverage_r_of(g0);
-    medium_one(g0, origin, dir, max_t, 0.0, stop_on_air, &best, &best_t, tint);
+  medium_one(g0, origin, dir, max_t, 0.0, stop_on_air, &best, &best_t, tint);
   medium_near(origin, dir, max_t, stop_on_air, &best, &best_t, tint);
-    let far_base = inst_bvh[2u];
+  let far_base = inst_bvh[2u];
   let far_count = inst_bvh[3u];
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
     if (origin_xz < shell) {

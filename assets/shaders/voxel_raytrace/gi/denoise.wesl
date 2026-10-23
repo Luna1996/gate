@@ -38,8 +38,7 @@ fn gi_den_guide_store(
   gi_guide_out[b + GI_DEN_G_KEY0] = k0;
   gi_guide_out[b + GI_DEN_G_KEY1] = k1;
   gi_guide_out[b + GI_DEN_G_NRM] = gi_pack_dir(n);
-  // 「本次历史被降权」标志：内容变了时屏幕空间那边不是丢弃历史而是降权，
-  // 降噪侧要同样处理（只降权、继续用旧值兜底）⇒ 过渡平滑、不闪。
+
   gi_guide_out[b + GI_DEN_G_RESET] = select(0u, 1u, reset);
 
   var code = 0xFFFFFFFFu;
@@ -83,11 +82,11 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   let n_c = gi_den_nrm_b(gb);
   let c_raw = textureLoad(gi_raw_tex, coord, 0).rgb;
 
-  var n3 = 0.0; 
+  var n3 = 0.0;
   var m3 = 0.0;
   var q3 = 0.0;
-  var c3 = vec3<f32>(0.0); 
-  var cnt = 0.0; 
+  var c3 = vec3<f32>(0.0);
+  var cnt = 0.0;
   var csum = vec3<f32>(0.0);
   var csum2 = vec3<f32>(0.0);
   let nr = i32(GI_DEN_NBR_R);
@@ -97,12 +96,12 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let ty = y + dy;
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
       let tb = (u32(ty) * size.x + u32(tx)) * GI_DEN_GUIDE_WORDS;
-      
+
       let tk0 = gi_guide[tb + GI_DEN_G_KEY0];
       let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
       if ((tk0 | tk1) == 0u) { continue; }
       if (!gi_den_same_plane(tk0, tk1, k0, k1)) { continue; }
-      
+
       if (dot(gi_den_nrm_b(tb), n_c) < GI_DEN_N_DOT) { continue; }
       let c = textureLoad(gi_raw_tex, vec2<i32>(tx, ty), 0).rgb;
       if (tk0 == k0 && tk1 == k1) {
@@ -118,17 +117,17 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
     }
   }
   let mu3 = m3 / max(n3, 1.0);
-  let mo2 = q3 / max(n3, 1.0); 
-  
+  let mo2 = q3 / max(n3, 1.0);
+
   let sigma = select(0.0, sqrt(max(mo2 - mu3 * mu3, 0.0)), n3 > 1.5);
   let cmean = csum / max(cnt, 1.0);
   let cstd = sqrt(max(csum2 / max(cnt, 1.0) - cmean * cmean, vec3<f32>(0.0)));
-  
+
   let l_ref = max(dot(cmean, GI_LUMA), mu3);
-  
+
   var sigma_use = sigma;
   var c_in = select(c_raw, c3 / max(n3, 1.0), n3 > 1.5);
-  
+
   if (n3 <= 1.5 && cnt > 1.5) { c_in = cmean; }
   if (cnt > 1.5) {
     c_in = clamp(c_in, cmean - GI_DEN_CLAMP_K * cstd, cmean + GI_DEN_CLAMP_K * cstd);
@@ -138,16 +137,14 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   var m2_acc = l_in * l_in;
   var color = c_in;
   var m = 1.0;
-  // `code` = 导引里记的「该面上一帧所在的位置」；0xFFFFFFFF = 没有（这个面是新的）⇒ 无历史可借。
-  // 内容变了时**不是**丢历史，而是把历史降权（`GI_DEN_G_RESET` + `w_scale`）⇒ 旧亮度继续兜底，
-  // 新亮度平滑接管 ⇒ 过渡不闪；同时响应比稳态快约 1/权重 倍。
+
   let code = gi_guide[gb + GI_DEN_G_PREV];
   if (code != 0xFFFFFFFFu) {
     let prev_px = vec2<i32>(i32(code & 0xFFFFu), i32((code >> 16u) & 0xFFFFu));
     var hb = 0u;
     var h_m = 0.0;
     var found = false;
-    
+
     var shifted = false;
     for (var s = 0u; s <= GI_HIST_SEARCH_TAPS; s = s + 1u) {
       let px = prev_px.x + gi_hist_search_offset(s).x;
@@ -191,10 +188,7 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let dy = f32(prev_px.y - y);
       let mo = sqrt(dx * dx + dy * dy);
       let w_motion = select(1.0 / (1.0 + mo), 1.0, !shifted);
-      // 内容变了 ⇒ 历史**降权**而不是丢弃：旧亮度仍以小权重参与，
-      // 新亮度平滑地把它带过去（不闪）；响应比稳态快约 1/权重 倍。
-      // 降权在**过渡期内持续生效**（导引的 RESET 标志）——只降一帧的话，
-      // 下一帧旧亮度就又全权重回来 ⇒ 收敛被拖回稳态速度。
+
       let w_scale = select(1.0, GI_DEN_RESET_SCALE, gi_guide[gb + GI_DEN_G_RESET] != 0u);
       let w = min(min(w_var, (m - 1.0) / m), w_motion) * w_scale;
       color = mix(c_in, clamped, w);
@@ -202,11 +196,10 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       m2_acc = mix(h_m2, l_in * l_in, 1.0 - w);
     }
   }
-  
+
   let sigma_phi = select(dot(cstd, GI_LUMA), sigma_use, n3 > 1.5);
   gi_den_phi[idx] = GI_DEN_LUMA_K * max(max(sigma_phi, GI_DEN_LUMA_FLOOR_REL * l_ref), 1e-5);
 
-  
   gi_hist_cur[hb + GI_DEN_H_COL] = bitcast<u32>(color.x);
   gi_hist_cur[hb + GI_DEN_H_COL + 1u] = bitcast<u32>(color.y);
   gi_hist_cur[hb + GI_DEN_H_COL + 2u] = bitcast<u32>(color.z);
@@ -215,7 +208,7 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   gi_hist_cur[hb + GI_DEN_H_M] = bitcast<u32>(m);
   gi_hist_cur[hb + GI_DEN_H_KEY0] = k0;
   gi_hist_cur[hb + GI_DEN_H_KEY1] = k1;
-  
+
   gi_hist_cur[hb + GI_DEN_H_NRM] = gi_guide[gb + GI_DEN_G_NRM];
   textureStore(gi_dn_tmp, coord, vec4<f32>(color, 1.0));
 }
@@ -229,7 +222,7 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
     textureStore(gi_dn_dst, coord, vec4<f32>(0.0));
     return;
   }
-  
+
   let r = i32(gi_den_cfg[0u]);
   let hb = idx * GI_DEN_HIST_WORDS;
   let m_hist = bitcast<f32>(gi_hist_cur[hb + GI_DEN_H_M]);
@@ -250,7 +243,7 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
       let ty = y + dy * st;
       if (tx < 0 || ty < 0 || tx >= i32(size.x) || ty >= i32(size.y)) { continue; }
       let tb = (u32(ty) * size.x + u32(tx)) * GI_DEN_GUIDE_WORDS;
-      
+
       let tk0 = gi_guide[tb + GI_DEN_G_KEY0];
       let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
       if ((tk0 | tk1) == 0u) { continue; }
@@ -258,7 +251,7 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
       let tn = gi_den_nrm_b(tb);
       if (dot(tn, n_c) < GI_DEN_N_DOT) { continue; }
       let s = textureLoad(gi_dn_src, vec2<i32>(tx, ty), 0).rgb;
-      
+
       var w = 1.0;
       if (!(tk0 == k0 && tk1 == k1)) {
         w = clamp(dot(tn, n_c), 0.0, 1.0) * exp(-abs(dot(s, GI_LUMA) - l0) / phi);

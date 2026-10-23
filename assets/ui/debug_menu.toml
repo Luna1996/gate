@@ -889,15 +889,15 @@ tooltip = "menu.game.phys.substeps.tip"
 
 [[items.children.children]]
 kind = "input"
-id = "rate"
-label = "menu.game.phys.rate"
+id = "every"
+label = "menu.game.phys.every"
 
 [[items.children.children.fields]]
 label = ""
-text = "20"
+text = "1"
 min = 1.0
 max = 240.0
-step = 10.0
+step = 1.0
 decimals = 0
 
 [[items]]

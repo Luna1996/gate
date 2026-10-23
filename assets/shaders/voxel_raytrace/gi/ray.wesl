@@ -1,20 +1,20 @@
 import package::bindings::{gi_sec_slots, light_u};
-import package::common::{MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, sky_rgb};
+import package::common::{FLAGS_TRANSMISSIVE, MATERIAL_DEBUG_NONE, SurfaceLight, brdf_reflected, emissive_radiance, fetch_material, palette_flags, sky_rgb};
 import package::gi::common::{GI_SEC_WORDS, GI_SEC_W_K0, GI_SEC_W_K1, GI_SEC_W_RAD, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_rand2, gi_sec_key_masked, gi_sec_slot_of};
 import package::gi::consts::{GI_EMIT_GAIN, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
-import package::trace::{SECONDARY_REACH_CHUNKS, make_grid};
-import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal_fast, world_trace_medium_scene};
+import package::trace::{SECONDARY_REACH_CHUNKS, make_grid, medium_of};
+import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal_fast, world_cfg_full, world_raycast, world_trace_medium_scene};
 
 const GI_REACH_T: f32 = SECONDARY_REACH_CHUNKS * 256.0;
 
 fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32) -> vec3<f32> {
-        if (((u32(bitcast<i32>(origin.x * 64.0)) ^ u32(bitcast<i32>(sun_dir.x * 4096.0))) & 63u) == 0u) {
+  if (((u32(bitcast<i32>(origin.x * 64.0)) ^ u32(bitcast<i32>(sun_dir.x * 4096.0))) & 63u) == 0u) {
     atomicAdd(&lod_diag[15u], 64u);
   }
   var tint = vec3<f32>(1.0);
-          let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
+  let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
   let through = tint;
-    if (!h.hit) { return through; }
+  if (!h.hit) { return through; }
   if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return vec3<f32>(1.0); }
   return vec3<f32>(0.0);
 }
@@ -26,12 +26,12 @@ fn gi_face_shade(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f
   let hn = sh.n;
   let ndl = max(dot(hn, sun_dir), 0.0);
   var sun = vec3<f32>(0.0);
-    if (sun_bounce > 0.0 && ndl > 0.0) {
+  if (sun_bounce > 0.0 && ndl > 0.0) {
     let h_off = surface_offset(hg, hn, SHADOW_SURFACE_EPS);
     sun = sun_transmittance(hp + hn * h_off, sun_dir, sh.voxel, sh.obj_id);
   }
-    let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT;
-                    let v = hn;
+  let amb = light_u.sky_color.xyz * GI_SKY_AMBIENT;
+  let v = hn;
   let m = fetch_material(sh.palette_base, sh.pal, hp, hn, MATERIAL_DEBUG_NONE);
   return brdf_reflected(m, hn, v, SurfaceLight(sun_dir, sun_c * (sun * sun_bounce), 1.0, amb, vec3<f32>(0.0)))
          / GI_PI
@@ -48,7 +48,7 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
     let slot = gi_sec_slot_of(k0, k1, &slot_ok);
     if (slot_ok) {
       sb = slot * GI_SEC_WORDS;
-                  let rev = select(0u, gi_local_rev(sh.voxel, sh.obj_id), sun_bounce > 0.5);
+      let rev = select(0u, gi_local_rev(sh.voxel, sh.obj_id), sun_bounce > 0.5);
       mine = gi_sec_key_masked(k0, k1, epoch, sh.pal, rev);
       if (atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]) == mine.x
           && atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]) == mine.y) {
@@ -56,7 +56,7 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
           bitcast<f32>(atomicLoad(&gi_sec_slots[sb + GI_SEC_W_RAD])),
           bitcast<f32>(atomicLoad(&gi_sec_slots[sb + GI_SEC_W_RAD + 1u])),
           bitcast<f32>(atomicLoad(&gi_sec_slots[sb + GI_SEC_W_RAD + 2u])));
-                        if (atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]) == mine.x
+        if (atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]) == mine.x
             && atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]) == mine.y) {
           return r;
         }
@@ -64,7 +64,7 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
     }
   }
   l = gi_face_shade(sh, org, sun_dir, sun_c, sun_bounce);
-      if (slot_ok) {
+  if (slot_ok) {
     let c0 = atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K0]);
     let c1 = atomicLoad(&gi_sec_slots[sb + GI_SEC_W_K1]);
     if (c0 != mine.x || c1 != mine.y) {
@@ -100,17 +100,17 @@ fn gi_bounce2(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>
   let off = surface_offset(hg, hn, SHADOW_SURFACE_EPS);
   let d2 = gi_cos_hemisphere(hn, gi_rand2(seed));
   let l2 = gi_bounce2_probe(hp + hn * off, d2, sun_dir, sun_c, sun_bounce, epoch);
-    return (1.0 - m.metallic) * m.albedo * l2 * mult;
+  return (1.0 - m.metallic) * m.albedo * l2 * mult;
 }
 
 fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32, bounce2: f32, seed: u32) -> vec3<f32> {
-      if (((u32(bitcast<i32>(org.z * 64.0)) ^ u32(bitcast<i32>(dir.x * 4096.0))) & 63u) == 0u) {
+  if (((u32(bitcast<i32>(org.z * 64.0)) ^ u32(bitcast<i32>(dir.x * 4096.0))) & 63u) == 0u) {
     atomicAdd(&lod_diag[14u], 64u);
   }
   var tint = vec3<f32>(1.0);
   let sh = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
-    if (!sh.hit) {
+  if (!sh.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }
   let k0 = gi_key0(sh.voxel, sh.obj_id);

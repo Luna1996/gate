@@ -376,6 +376,9 @@ impl Plugin for GateProfilerPlugin {
         bevy::render::renderer::RenderGraph,
         report_lod_diag.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
+    }
+
+    if std::env::var("GATE_GI_PROBE").is_ok_and(|v| !v.is_empty() && v != "0") {
       render_app.init_resource::<GiFlickerProbe>();
       render_app.add_systems(
         bevy::render::renderer::RenderGraph,
@@ -468,19 +471,6 @@ struct DiagReadback {
   err: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// GI 时域稳定性探针（诊断用，`LOD_DIAG = 1` 时才挂）。
-///
-/// 读回两块 GPU 数据，量两件事：
-/// ① **收敛度** = 屏幕空间 reservoir 的平均样本数 `m`（记忆窗满了没有；
-///    `m` 卡在低位 ⇒ 历史每帧被作废，GI 永不收敛）；
-/// ② **抖动幅度** = 帧间变化：
-///    - 原始：reservoir 的估计值 `w_sum/m`；
-///    - **可见**：降噪时域历史里的颜色（= 画面上真正看到的那一份），
-///      这个才是"满屏花不花"的判据。
-///
-/// 为什么要有它：GI 的失效链（面键 / 降噪历史 / WAL 掩码 / 位姿盐 / 邻域复用）有五条，
-/// 靠读代码推机制已经错过多次（见 docs 的 §10.11/§10.13/§10.14）——
-/// **每帧的 M 与创新量必须能从 GPU 读回来**，否则"GI 为什么不收敛 / 会不会花"只能靠猜。
 #[derive(Resource, Default)]
 struct GiFlickerProbe {
   staging: Option<Buffer>,
@@ -499,7 +489,7 @@ fn report_gi_flicker(
 ) {
   let (Some(aux), Some(gi)) = (aux, gi) else { return };
   let Some((a, b)) = aux.gi_res_buffers() else { return };
-  // prepare_gi 末尾已把 res_flip 翻转 ⇒ 刚写完的那块是它的反侧。
+
   let written = if gi.res_flip { a } else { b };
   let words = crate::wesl_consts::gi_consts().gi_res_words as usize;
   let n_texels = (written.size() / 4) as usize / words.max(1);
@@ -507,7 +497,7 @@ fn report_gi_flicker(
     return;
   }
   let bytes = (n_texels * words * 4) as u64;
-  // 可见 GI：降噪时域历史（当前帧刚写的那块）。
+
   let vis = aux.gi_hist_current();
   let vis_words = crate::wesl_consts::gi_consts().gi_den_hist_words as usize;
   let vis_bytes = vis.map(|v| v.size()).unwrap_or(0);
@@ -515,8 +505,15 @@ fn report_gi_flicker(
 
   if probe.pending.is_some() {
     let _ = device.poll(PollType::Poll);
+    let (failed, ready) = {
+      let p = probe.pending.as_ref().expect("刚判过 is_some");
+      (p.err.load(Ordering::Acquire), p.done.load(Ordering::Acquire))
+    };
+
+    if !ready && !failed {
+      return;
+    }
     let p = probe.pending.take().expect("刚判过 is_some");
-    let (failed, ready) = (p.err.load(Ordering::Acquire), p.done.load(Ordering::Acquire));
     if ready && !failed {
       let slice = p.staging.slice(..);
       if let Ok(view) = slice.get_mapped_range() {
@@ -531,7 +528,7 @@ fn report_gi_flicker(
           let est = if m > 0.5 { (f(4) + f(5) + f(6)) / (3.0 * m) } else { 0.0 };
           cur.push((est, m));
         }
-        // 可见 GI（降噪时域历史的颜色）：帧间 |Δ| = 画面上的抖动。
+
         let vis_base = bytes as usize;
         let mut cur_vis: Vec<f32> = Vec::with_capacity(vis_px);
         for t in 0..vis_px {
@@ -559,10 +556,12 @@ fn report_gi_flicker(
             let d = (e - probe.prev[i].0).abs();
             sum += d;
             cnt += 1;
-            if d > worst { worst = d; }
+            if d > worst {
+              worst = d;
+            }
           }
           let n = cnt.max(1);
-          // 可见 GI（降噪后的颜色）的帧间抖动 = 画面上真正看到的抖动。
+
           let mut vsum = 0.0f32;
           let mut vmax = 0.0f32;
           let mut vn = 0u32;
@@ -619,9 +618,10 @@ fn report_gi_flicker(
       s
     }
   };
-  let mut enc = device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
-    label: Some("gate_gi_flicker_readback"),
-  });
+  let mut enc =
+    device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
+      label: Some("gate_gi_flicker_readback"),
+    });
   enc.copy_buffer_to_buffer(written, 0, &staging, 0, bytes);
   if let Some(v) = vis {
     enc.copy_buffer_to_buffer(v, 0, &staging, bytes, vis_bytes);
@@ -751,10 +751,80 @@ fn emit_lod_diag(
   if d[42] > 0 || d[44] > 0 {
     let tot = (d[42] + d[44]).max(1);
     info!(
-      "DIAG[面槽未命中 {}/{} = {:.2}%]",
+      "DIAG[面槽未命中 {}/{} = {:.2}%（查无此槽 {} / 槽在但没累积 {} / GI 侧认领 {}）]",
       d[42],
       tot,
-      d[42] as f32 * 100.0 / tot as f32
+      d[42] as f32 * 100.0 / tot as f32,
+      d[45],
+      d[46],
+      d[47]
+    );
+  }
+  if d[100] + d[101] > 0 {
+    let tot = (d[100] + d[101]).max(1);
+    info!(
+      "DIAG[guide 键一致 {}/{} = {:.2}%（不一致 {}）| 查无此槽：哈希位空 {} / 同位槽键同 {} / 同位槽键异 {}]",
+      d[100],
+      tot,
+      d[100] as f32 * 100.0 / tot as f32,
+      d[101],
+      d[102],
+      d[103],
+      d[104]
+    );
+  }
+  if d[110] + d[111] > 0 {
+    let tot = (d[110] + d[111]).max(1);
+    info!(
+      "DIAG[texel 中心像素 键一致 {}/{} = {:.2}%]",
+      d[110],
+      tot,
+      d[110] as f32 * 100.0 / tot as f32
+    );
+  }
+  if d[121] + d[122] + d[123] + d[124] > 0 {
+    info!(
+      "DIAG[WAL 缓存更新 {} 条 | 访问插入 {} | 冲突让位 {} | 访问命中 {}]",
+      d[121], d[122], d[123], d[124]
+    );
+  }
+  if d[112] + d[113] > 0 {
+    let tot = (d[112] + d[113]).max(1);
+    info!(
+      "DIAG[texel 光线主上下文复算 = GI 存的键 {}/{} = {:.2}%]",
+      d[112],
+      tot,
+      d[112] as f32 * 100.0 / tot as f32
+    );
+  }
+  if d[114] + d[115] > 0 {
+    let tot = (d[114] + d[115]).max(1);
+    info!(
+      "DIAG[texel 中心像素（未折射 first）键 = GI 键 {}/{} = {:.2}%| 透射首命中 {}]",
+      d[114],
+      tot,
+      d[114] as f32 * 100.0 / tot as f32,
+      d[116]
+    );
+  }
+  if d[117] + d[118] > 0 {
+    let tot = (d[117] + d[118]).max(1);
+    let totn = (d[119] + d[120]).max(1);
+    info!(
+      "DIAG[texel 与像素命中点距离 <1 体素 {}/{} = {:.1}% | 法线同向 {:.1}%]",
+      d[117],
+      tot,
+      d[117] as f32 * 100.0 / tot as f32,
+      d[119] as f32 * 100.0 / totn as f32
+    );
+  }
+  if d[105] + d[106] > 0 {
+    let tot = (d[105] + d[106]).max(1);
+    info!(
+      "DIAG[同像素 primary 对 full 同体素 {}/{} = {:.2}%]",
+      d[105],
+      tot,
+      d[105] as f32 * 100.0 / tot as f32
     );
   }
   info!(

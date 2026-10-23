@@ -54,3 +54,9 @@ incremental = false
 [profile.dev.package."*"]
 opt-level = 3
 
+[profile.release]
+# fat LTO 在本机（16GB）链接 gate-app 时会 OOM（rustc STATUS_ACCESS_VIOLATION）。
+# thin 已能跨 crate 内联，且内存/耗时可控。
+lto = "thin"
+codegen-units = 1
+

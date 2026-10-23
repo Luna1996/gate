@@ -61,10 +61,6 @@ impl DdaCameraConfig {
   }
 }
 
-#[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
-#[extract_app(bevy::render::RenderApp)]
-pub struct DebugNormals(pub u32);
-
 pub const PITCH_LIMIT: f32 = 89.0_f32.to_radians();
 pub const DIST_MIN: f32 = 32.0;
 
@@ -133,40 +129,22 @@ pub struct DdaViewUniform {
   pub inv_view_proj: Mat4,
   pub cam_pos_voxel: Vec4,
 
-  pub debug_mode: Vec4,
-
   pub lod: Vec4,
 }
 
-use crate::brickmap::consts::{
-  DDA_BEAM, DDA_CHUNKWALK, DDA_DIR_LUT, DDA_LOD, DDA_MAKEGRID_ONLY, DDA_SKY_ONLY, EYE_ADAPT,
-};
+use crate::brickmap::consts::{DDA_BEAM, DDA_DIR_LUT, DDA_LOD, EYE_ADAPT};
 
 pub fn px_ang(render_h: f32) -> f32 {
   2.0 * (crate::brickmap::consts::DDA_FOV_Y * 0.5).tan() / render_h.max(1.0)
 }
 
 impl DdaViewUniform {
-  pub fn from_cfg(cfg: &DdaCameraConfig, debug_mode: u32, render_h: f32) -> Self {
+  pub fn from_cfg(cfg: &DdaCameraConfig, render_h: f32) -> Self {
     let px_ang = px_ang(render_h);
     Self {
       view_proj: cfg.view_proj,
       inv_view_proj: cfg.inv_view_proj,
       cam_pos_voxel: cfg.position_world.extend(1.0),
-      debug_mode: Vec4::new(
-        (debug_mode == 4) as u32 as f32,
-        (debug_mode == 5) as u32 as f32,
-        if DDA_CHUNKWALK { 0.0 } else { 2.0 },
-        if DDA_SKY_ONLY {
-          2.0
-        } else if DDA_MAKEGRID_ONLY {
-          4.0
-        } else if debug_mode == 6 {
-          1.0
-        } else {
-          0.0
-        },
-      ),
       lod: Vec4::new(
         px_ang,
         DDA_LOD as u32 as f32,
@@ -271,6 +249,8 @@ pub(crate) struct AuxTexCache {
   size: UVec2,
   gi_tex: Option<Texture>,
   gi_view: Option<TextureView>,
+  gi_sun: Option<Texture>,
+  gi_sun_view: Option<TextureView>,
   gi_size: UVec2,
   gi_res_a: Option<Buffer>,
   gi_res_b: Option<Buffer>,
@@ -330,10 +310,10 @@ impl AuxTexCache {
     self.gi_view.as_ref()
   }
 
-  /// 降噪的时域历史（当前帧刚写的那块）—— 诊断用。
-  ///
-  /// 它存的就是"可见 GI"的颜色（降噪时域滤波后的逐 texel 值），
-  /// 比读纹理更直接：帧间 |Δ| 就是**画面上**的抖动幅度。
+  pub(crate) fn gi_sun_view(&self) -> Option<&TextureView> {
+    self.gi_sun_view.as_ref()
+  }
+
   pub(crate) fn gi_hist_current(&self) -> Option<&Buffer> {
     let i = if self.den_flip { 1 } else { 0 };
     self.gi_hist[i].as_ref()
@@ -369,7 +349,6 @@ impl AuxTexCache {
 }
 
 #[derive(Resource)]
-#[allow(dead_code)]
 pub(crate) struct DdaPipelines {
   pub(crate) bg0_layout: BindGroupLayoutDescriptor,
 
@@ -395,6 +374,7 @@ pub(crate) struct DdaPipelines {
   pub(crate) beam_pipeline: CachedComputePipelineId,
 
   pub(crate) gi_pipeline: CachedComputePipelineId,
+  pub(crate) gi_wal_update_pipeline: CachedComputePipelineId,
 
   eye_histogram_pipeline: CachedComputePipelineId,
   eye_update_pipeline: CachedComputePipelineId,
@@ -545,13 +525,11 @@ impl Plugin for BrickMapDdaPlugin {
 fn extract_camera_config(
   mut commands: bevy::ecs::system::Commands,
   cfg: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DdaCameraConfig>>>,
-  debug: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DebugNormals>>>,
   scale: Option<bevy::render::Extract<bevy::ecs::system::Res<RenderScale>>>,
 ) {
   let Some(cfg) = cfg else { return };
-  let debug_mode = debug.map(|d| d.0).unwrap_or(0);
   let render_h = scale.map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
-  let uniform = DdaViewUniform::from_cfg(&cfg, debug_mode, render_h);
+  let uniform = DdaViewUniform::from_cfg(&cfg, render_h);
   commands.insert_resource(uniform);
 }
 
@@ -584,6 +562,16 @@ pub(crate) fn init_dda_pipelines(
     &[
       BindGroupLayoutEntry {
         binding: 4,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Float { filterable: true },
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 5,
         visibility: ShaderStages::COMPUTE,
         ty: BindingType::Texture {
           sample_type: TextureSampleType::Float { filterable: true },
@@ -933,9 +921,16 @@ pub(crate) fn init_dda_pipelines(
   ];
   let gi = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_gi")),
-    layout: gi_layouts,
+    layout: gi_layouts.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("gi_main")),
+    ..default()
+  });
+  let gi_wal_update = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_gi_wal_update")),
+    layout: gi_layouts,
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("gi_wal_update")),
     ..default()
   });
 
@@ -999,6 +994,7 @@ pub(crate) fn init_dda_pipelines(
     face_accum_pipeline: face_accum,
     beam_pipeline: beam,
     gi_pipeline: gi,
+    gi_wal_update_pipeline: gi_wal_update,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
     blit_pipeline,
@@ -1103,6 +1099,9 @@ pub(crate) fn prepare_dda_bind_groups(
     let gi_tex = make("gate_gi", TextureFormat::Rgba16Float);
     beam_cache.gi_view = Some(gi_tex.create_view(&TextureViewDescriptor::default()));
     beam_cache.gi_tex = Some(gi_tex);
+    let sun_tex = make("gate_gi_sun", TextureFormat::Rgba8Unorm);
+    beam_cache.gi_sun_view = Some(sun_tex.create_view(&TextureViewDescriptor::default()));
+    beam_cache.gi_sun = Some(sun_tex);
     beam_cache.gi_size = gi_size;
 
     let res_bytes =
@@ -1343,6 +1342,12 @@ pub(crate) fn prepare_dda_bind_groups(
     &gi_read_layout,
     &[
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
+      BindGroupEntry {
+        binding: 5,
+        resource: BindingResource::TextureView(
+          beam_cache.gi_sun_view.as_ref().expect("太阳可见度视图未创建"),
+        ),
+      },
       BindGroupEntry { binding: 6, resource: gi_guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
       BindGroupEntry { binding: 10, resource: region_table.as_entire_binding() },
@@ -1825,6 +1830,25 @@ pub(crate) fn dispatch_dda(
   {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
+
+    if let Some(upd_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_wal_update_pipeline) {
+      let wal_groups = (crate::gi::WAL_UPD_BUDGET / 64) as u32;
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_gi_wal_update",
+        |pass| {
+          pass.set_pipeline(upd_pipe);
+          pass.set_bind_group(0, gi_bg0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          pass.set_bind_group(5, &bg5.0, &[]);
+          pass.dispatch_workgroups(wal_groups, 1, 1);
+        },
+      );
+    }
 
     if let Some(fs) = aux.face_slots_buffer() {
       crate::profiler::gpu_encoder_scope(

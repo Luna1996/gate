@@ -1,6 +1,4 @@
-
-
-import package::bindings::{gi_u, gi_wal};
+import package::bindings::{gi_u, gi_wal, lod_diag};
 import package::gi::common::{gi_key0, gi_key1, gi_key_ok, gi_key_org, gi_local_rev, gi_mix};
 
 const GI_WAL_WORDS: u32 = 8u;
@@ -10,6 +8,14 @@ const GI_WAL_CAP_N: f32 = 256.0;
 const GI_WAL_MATURE_N: f32 = 64.0;
 
 const GI_WAL_RESET_N: f32 = 16.0;
+
+const GI_WAL_FRESH: u32 = 2u;
+
+const GI_WAL_UPD_R: u32 = 1u;
+
+const GI_WAL_UPD_B: u32 = 65536u;
+
+const GI_WAL_DIAG: u32 = 0u;
 
 const GI_WAL_POOL_R: i32 = 3;
 
@@ -28,26 +34,9 @@ fn gi_wal_slot(v_world: vec3<i32>, face: u32, obj: i32, nmask: u32) -> u32 {
 }
 
 fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32 {
-  
-  
-  
-  
-  
-    
-  
-  
-  
-  
-  
-    
-  
-  
   var rev = 0u;
   if (gi_u.params.x > 0.5) { rev = gi_local_rev(v_world, obj); }
-  // 内容修订号（`gi_u.params.w`）：世界内容变了（真编辑 / 物体清空=出现或消失）
-  // ⇒ 世界空间累积出来的旧值不再成立，必须靠它把旧条目作废，
-  // 否则 WAL 会把旧亮度一直混回来（自发光体素/物体出现或消失时 GI 看起来"没反应"）。
-  // 它只在**内容真的变了**时自增 ⇒ 不会被流式装载刷爆，也不会被"物体在动"刷爆。
+
   let content_rev = u32(gi_u.params.w);
   return gi_mix(u32(org.x)
           + gi_mix(u32(org.y)
@@ -55,7 +44,7 @@ fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32
 }
 
 fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
-                sum_e: vec3<f32>, cnt: u32) {
+  sum_e: vec3<f32>, cnt: u32, stamp: u32) {
   let nmask = gi_wal_nmask();
   if (nmask == 0u || cnt == 0u) { return; }
   let slot = gi_wal_slot(v_world, (k1 >> 16u) & 7u, obj, nmask);
@@ -74,24 +63,23 @@ fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
       n = n_old;
       mature = (atomicLoad(&gi_wal[b + 7u]) & 1u) != 0u;
       if (atomicLoad(&gi_wal[b + 2u]) != mask) {
-        
         let keep = min(n, GI_WAL_RESET_N);
         sum = (sum / n) * keep;
         n = keep;
       }
     }
   }
-  
+
   let n_eff = min(n, max(GI_WAL_CAP_N - f32(cnt), 0.0));
   if (n > n_eff) { sum = sum * (n_eff / n); }
   sum = sum + sum_e;
   n = n_eff + f32(cnt);
-  
+
   atomicStore(&gi_wal[b + 3u], bitcast<u32>(sum.x));
   atomicStore(&gi_wal[b + 4u], bitcast<u32>(sum.y));
   atomicStore(&gi_wal[b + 5u], bitcast<u32>(sum.z));
   atomicStore(&gi_wal[b + 6u], bitcast<u32>(n));
-  atomicStore(&gi_wal[b + 7u], select(0u, 1u, mature || n >= GI_WAL_MATURE_N));
+  atomicStore(&gi_wal[b + 7u], (stamp << 1u) | select(0u, 1u, mature || n >= GI_WAL_MATURE_N));
   atomicStore(&gi_wal[b + 2u], mask);
   atomicStore(&gi_wal[b + 1u], k1);
   atomicStore(&gi_wal[b], k0);
@@ -109,11 +97,40 @@ fn gi_wal_fetch(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32, face: u3
                    bitcast<f32>(atomicLoad(&gi_wal[b + 5u])), n);
 }
 
+fn gi_wal_touch(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32) {
+  let nmask = gi_wal_nmask();
+  if (nmask == 0u) { return; }
+  let frame = gi_u.seq.x;
+  let b = gi_wal_slot(v_world, (k1 >> 16u) & 7u, obj, nmask) * GI_WAL_WORDS;
+  let fl = atomicLoad(&gi_wal[b + 7u]);
+  let stamp = fl >> 1u;
+  if (stamp == frame) { return; }
+  if (atomicLoad(&gi_wal[b]) == k0 && atomicLoad(&gi_wal[b + 1u]) == k1) {
+    atomicStore(&gi_wal[b + 7u], (frame << 1u) | (fl & 1u));
+    if (GI_WAL_DIAG == 1u) { atomicAdd(&lod_diag[124u], 1u); }
+    return;
+  }
+  let live = frame - stamp <= GI_WAL_FRESH;
+  if (live && bitcast<f32>(atomicLoad(&gi_wal[b + 6u])) > 0.0) {
+    if (GI_WAL_DIAG == 1u) { atomicAdd(&lod_diag[123u], 1u); }
+    return;
+  }
+  if (GI_WAL_DIAG == 1u) { atomicAdd(&lod_diag[122u], 1u); }
+  atomicStore(&gi_wal[b], k0);
+  atomicStore(&gi_wal[b + 1u], k1);
+  atomicStore(&gi_wal[b + 2u], gi_wal_mask_at(v_world, gi_key_org(obj), obj, pal));
+  atomicStore(&gi_wal[b + 3u], 0u);
+  atomicStore(&gi_wal[b + 4u], 0u);
+  atomicStore(&gi_wal[b + 5u], 0u);
+  atomicStore(&gi_wal[b + 6u], 0u);
+  atomicStore(&gi_wal[b + 7u], frame << 1u);
+}
+
 fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
   let nmask = gi_wal_nmask();
   if (nmask == 0u || !gi_key_ok(v_world, obj)) { return vec4<f32>(0.0); }
   let face = (k1 >> 16u) & 7u;
-  
+
   let a1 = (face / 2u + 1u) % 3u;
   let a2 = (face / 2u + 2u) % 3u;
   let t1 = vec3<i32>(select(0, 1, a1 == 0u), select(0, 1, a1 == 1u), select(0, 1, a1 == 2u));

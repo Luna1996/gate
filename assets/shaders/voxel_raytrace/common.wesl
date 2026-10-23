@@ -102,11 +102,11 @@ struct MaterialParams {
   albedo: vec3<f32>,     roughness: f32,        metallic: f32,         emissive: f32,         transmission: f32,                                                   ior: f32,              specular: f32,       }
 
 fn material_sample_pos(p_world: vec3<f32>) -> vec3<f32> {
-    return select(p_world, floor(p_world) + vec3<f32>(0.5), MATERIAL_FLAT_SHADING != 0u);
+  return select(p_world, floor(p_world) + vec3<f32>(0.5), MATERIAL_FLAT_SHADING != 0u);
 }
 
 fn pbr_mip_lod(p: vec3<f32>) -> f32 {
-    let dist_voxel = length(p - view_u.cam_pos_voxel.xyz);
+  let dist_voxel = length(p - view_u.cam_pos_voxel.xyz);
   let footprint_m = dist_voxel / MATERIAL_VOXEL_PER_METER * max(view_u.lod.x, 1e-6);
   let texels = footprint_m / MATERIAL_TEX_WORLD_SCALE * f32(textureDimensions(pbr_albedo_rough).x);
   return max(log2(max(texels, 1.0)), 0.0);
@@ -152,7 +152,7 @@ fn apply_override(asset_value: f32, ov: f32) -> f32 {
 }
 
 fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: vec3<f32>) -> MaterialParams {
-      let a = material_assets[min(asset, MATERIAL_ASSET_SLOTS - 1u)];
+  let a = material_assets[min(asset, MATERIAL_ASSET_SLOTS - 1u)];
   let sc_albedo = srgb_word_to_linear(a.albedo_rough);
   let sc_roughness = f32((a.albedo_rough >> 24u) & 0xFFu) / 255.0;
   let sc_emissive = f32(a.emissive_metal & 0xFFu) / 255.0;
@@ -160,12 +160,12 @@ fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: v
   let sc_specular = f32((a.emissive_metal >> 16u) & 0xFFu) / 255.0;
   let sc_transmission = f32(a.transmission_ior & 0xFFFFu) / 255.0;
   let ior = f32(a.transmission_ior >> 16u) / 100.0;
-          let fused = select(a.roughmetal_slot, a.albedo_slot, a.albedo_slot != MATERIAL_SLOT_NONE);
+  let fused = select(a.roughmetal_slot, a.albedo_slot, a.albedo_slot != MATERIAL_SLOT_NONE);
   var albedo = sc_albedo;
   var roughness = sc_roughness;
   var metallic = sc_metallic;
   if (fused != MATERIAL_SLOT_NONE) {
-        let p = material_sample_pos(p_world);
+    let p = material_sample_pos(p_world);
     let ts = triplanar_sample(fused, p, n, pbr_mip_lod(p));
     albedo = ts.albedo;
     roughness = ts.roughness;
@@ -189,7 +189,7 @@ fn fetch_material(palette_base: u32, pal: u32, p_world: vec3<f32>, n: vec3<f32>,
   }
   let w0 = b_palette[palette_base + pal * 2u];
   let w1 = b_palette[palette_base + pal * 2u + 1u];
-    if (((w1 >> 16u) & 0xFFu & FLAGS_IS_PBR) != 0u) {
+  if (((w1 >> 16u) & 0xFFu & FLAGS_IS_PBR) != 0u) {
     return fetch_material_asset(w1 & 0xFFFFu, w0, w1, p_world, n);
   }
   return MaterialParams(

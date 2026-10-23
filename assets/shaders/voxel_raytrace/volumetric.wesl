@@ -15,14 +15,13 @@ const GODRAY_STEP_B: f32 = 0.65;
 
 fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
   let base = sky_rgb();
-      if (fog_u_read.misc2.x <= 0.5) { return base; }
+  if (fog_u_read.misc2.x <= 0.5) { return base; }
   let ang = clamp(fog_u_read.misc2.z, 1e-4, SUN_CONE_MAX);
   let cos_t = dot(dir, sun_dir);
-    let t2 = (1.0 - cos_t) / max(1.0 - cos(ang), 1e-12);
+  let t2 = (1.0 - cos_t) / max(1.0 - cos(ang), 1e-12);
   let limb = clamp(1.0 - t2, 0.0, 1.0);
   let disk = pow(limb, LIMB_POW);
-  // 光晕平滑衰减到 0：原来在 t2 = HALO_T^2 处用 max(...,0) 硬切，边界导数不连续，
-  // 天空里是一个硬边圆，被水面/玻璃镜面反出来就是一圈硬边彩环
+
   let hx = clamp(t2 / (HALO_T * HALO_T), 0.0, 1.0);
   let halo = pow(1.0 - hx, HALO_POW) * (1.0 - hx * hx * hx);
   let disk_gain = max(light_u.lights[0].shape.x, 0.0);
@@ -35,7 +34,7 @@ fn godray_pass_mask(gid: vec3<u32>) {
   let size = textureDimensions(fog_a_w);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord = vec2<i32>(i32(gid.x), i32(gid.y));
-    let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
          / vec2<f32>(f32(size.x), f32(size.y));
   let ndc = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
   let near_world_h = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
@@ -47,7 +46,7 @@ fn godray_pass_mask(gid: vec3<u32>) {
   let dir_voxel = normalize(diff_world);
   let origin_voxel = view_u.cam_pos_voxel.xyz;
 
-        var t_min = 0.0;
+  var t_min = 0.0;
   if (view_u.lod.z < 0.5) {
     let beam_size = textureDimensions(beam_depth);
     let bx = gid.x / max(BEAM_DIV / FOG_DIV, 1u);
@@ -67,9 +66,9 @@ fn godray_pass_mask(gid: vec3<u32>) {
 
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    let sky = select(0.0, 1.0, !h.hit);
-        let w = pow(clamp(dot(dir_voxel, sun_dir), 0.0, 1.0), max(fog_u.misc.y, 1.0));
-    let lit = sun_c * (sky * w * max(fog_u.misc.z, 0.0) * clamp(fog_u.misc.w, 0.0, 1.0));
+  let sky = select(0.0, 1.0, !h.hit);
+  let w = pow(clamp(dot(dir_voxel, sun_dir), 0.0, 1.0), max(fog_u.misc.y, 1.0));
+  let lit = sun_c * (sky * w * max(fog_u.misc.z, 0.0) * clamp(fog_u.misc.w, 0.0, 1.0));
   textureStore(fog_a_w, coord, vec4<f32>(lit, 1.0));
 }
 
@@ -102,7 +101,7 @@ fn godray_blur_accum(
   var wsum = 0.0;
   var w = 1.0;
   for (var i = 1u; i <= GODRAY_TAPS; i = i + 1u) {
-        let p = uv + to_sun * (f32(i) / f32(GODRAY_TAPS));
+    let p = uv + to_sun * (f32(i) / f32(GODRAY_TAPS));
     acc = acc + godray_sample_bilinear(src, src_size, p) * w;
     wsum = wsum + w;
     w = w * decay;

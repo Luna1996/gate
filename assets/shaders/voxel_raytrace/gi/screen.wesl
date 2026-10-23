@@ -1,10 +1,10 @@
-import package::bindings::{face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
+import package::bindings::{lod_diag, BASE_FLAG_SHADOW, face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_sun_out, gi_u, light_u};
 import package::gi::common::{FACE_WORDS, gi_in_edit_box, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
 import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_LUMA_FLOOR_REL, GI_DEN_N_DOT, GI_HIST_RESET_FRAMES, GI_HIST_RESET_SCALE, GI_HIST_SEARCH_TAPS, GI_LUMA, GI_PI, GI_SS_ADAPT_EMA, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_HI_RESET, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_CLAMP_LO_RESET, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
-import package::gi::ray::{gi_ray_radiance};
+import package::gi::ray::{gi_ray_radiance, sun_transmittance};
 import package::gi::wal::{gi_wal_merge, gi_wal_sample};
-import package::trace::{make_grid};
+import package::trace::{LOD_DIAG, make_grid};
 import package::common::{FLAGS_TRANSMISSIVE};
 import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal_fast};
 
@@ -20,7 +20,7 @@ const GI_DIAG_CLAMP: u32 = 22u;
 
 const GI_RES_WORDS: u32 = 8u;
 const GI_RES_W_FLAGS: u32 = 0u; const GI_RES_W_PK: u32 = 1u; const GI_RES_W_NRM: u32 = 3u;
-const GI_RES_W_WSUM: u32 = 4u; const GI_RES_W_M: u32 = 7u; 
+const GI_RES_W_WSUM: u32 = 4u; const GI_RES_W_M: u32 = 7u;
 const GI_RES_VALID: u32 = 1u;
 const GI_RES_PK_OK: u32 = 2u;
 const GI_RES_LONE: u32 = 0x80000000u;
@@ -95,8 +95,6 @@ fn gi_res_adopt(r: GiRes, h: GiRes) -> GiRes {
   return out;
 }
 
-/// 把历史的**权重**降下来（内容变化时用）：和计数一起缩 ⇒ 旧值的相对权重变小，
-/// 但它仍以"少量样本"的身份参与 ⇒ 估计值连续地滑向新值，而不是整屏重来一遍。
 fn gi_res_scaled(r: GiRes, k: f32) -> GiRes {
   var out = r;
   out.w_sum = r.w_sum * k;
@@ -105,7 +103,7 @@ fn gi_res_scaled(r: GiRes, k: f32) -> GiRes {
 }
 
 fn gi_res_cap(r: GiRes, cand_n: u32, m_cap_k: u32) -> GiRes {
-            let cap = f32(m_cap_k * max(cand_n, 1u));
+  let cap = f32(m_cap_k * max(cand_n, 1u));
   if (r.m <= cap) { return r; }
   let shrink = cap / r.m;
   var out = r;
@@ -141,20 +139,21 @@ fn gi_ss_reproject(p_world: vec3<f32>, size: vec2<u32>, ok: ptr<function, bool>)
 }
 
 fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
-      if (diag_texel_sampled(coord)) {
+  if (diag_texel_sampled(coord)) {
     atomicAdd(&lod_diag[13u], 64u);
   }
   let idx = u32(coord.y) * size.x + u32(coord.x);
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
   let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-    let sun_bounce = gi_u.params.x;
-      let epoch = gi_u.seq.y;
-      let b2_mult = gi_u.misc.w;
+  let sun_bounce = gi_u.params.x;
+  let epoch = gi_u.seq.y;
+  let b2_mult = gi_u.misc.w;
 
-    if (!h.hit) {
+  if (!h.hit) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
     gi_res_store_cur(idx, gi_res_none());
-        gi_den_guide_store(coord, size, false, 0u, 0u, vec3<f32>(0.0, 0.0, 1.0), false, vec2<i32>(0), false);
+    gi_den_guide_store(coord, size, false, 0u, 0u, vec3<f32>(0.0, 0.0, 1.0), false, vec2<i32>(0), false);
+    textureStore(gi_sun_out, coord, vec4<f32>(0.0));
     return;
   }
 
@@ -167,29 +166,36 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
   let org = p_voxel + n * n_off;
 
-    let pk0 = gi_key0(h.voxel, h.obj_id);
+  var sun = vec3<f32>(0.0);
+  let ndl = max(dot(n, sun_dir), 0.0);
+  let sun_valid = ndl > 0.0;
+  if (sun_valid && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
+    sun = sun_transmittance(org, sun_dir, h.voxel, h.obj_id);
+  }
+
+  textureStore(gi_sun_out, coord, vec4<f32>(select(vec3<f32>(0.0), sun, sun_valid), select(0.0, 1.0, sun_valid)));
+
+  let pk0 = gi_key0(h.voxel, h.obj_id);
   let pk1 = gi_key1(h.voxel, h.face_id, h.obj_id);
   let pk_ok = gi_key_ok(h.voxel, h.obj_id);
 
   let frame = gi_u.seq.x;
   let seed = gi_ss_seed(coord, frame);
 
-              var prev_ok = false;
+  var prev_ok = false;
   let prev_pc = gi_ss_reproject(h.point, size, &prev_ok);
-  // 距上次"历史降权事件"（内容变化 / 光照阶跃）过了几帧。`seq.w` = 事件当帧的帧号。
+
   let since = gi_u.seq.x - gi_u.seq.w;
-  // **只有被改到的那块**才降权：编辑处的光只影响它周围一小片（`gi_in_edit_box`），
-  // 屏幕其余部分的历史原样保留 ⇒ 不会出现"全屏重新累积"（满屏先花一下再收敛）。
+
   let affected = gi_in_edit_box(p_voxel);
-  let hist_reset_now = affected && (gi_u.flags.z <= 0.5);  // 事件当帧 ⇒ 屏幕空间侧降权一次
-  let hist_reset_recent = affected && (since < GI_HIST_RESET_FRAMES);  // 过渡期 ⇒ 降噪降权 + 收窄邻域钳制
-  // ① 屏幕空间历史：事件当帧把旧历史降权（不是丢弃）⇒ 无闪，且立刻开始向新值过渡。
-  // ② 降噪历史：通过导引里的标志告诉降噪侧"过渡期"⇒ 同样只降权、不丢弃。
+  let hist_reset_now = affected && (gi_u.flags.z <= 0.5);
+  let hist_reset_recent = affected && (since < GI_HIST_RESET_FRAMES);
+
   let h_scale = select(GI_HIST_RESET_SCALE, 1.0, !hist_reset_now);
   gi_den_guide_store(coord, size, true, pk0, pk1, n, prev_ok, prev_pc, hist_reset_recent);
-              let px_static = prev_ok && prev_pc.x == coord.x && prev_pc.y == coord.y;
+  let px_static = prev_ok && prev_pc.x == coord.x && prev_pc.y == coord.y;
 
-                      var wal_claimer = false;
+  var wal_claimer = false;
   if (pk_ok) {
     var face_ok = false;
     let kv1 = gi_vox_k1(pk1);
@@ -199,7 +205,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
       var claimed =
         atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
       if (!claimed) {
-                        if (!face_slot_matches(fslot, pk0, kv1)) {
+        if (!face_slot_matches(fslot, pk0, kv1)) {
           fe = face_slot_next(fslot) * FACE_WORDS;
           claimed = atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
         }
@@ -210,54 +216,53 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
         atomicStore(&face_slots[fe + FACE_W_K1], kv1);
         atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
         atomicStore(&face_slots[fe + FACE_W_PAL], h.pal);
+        if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[47u], 1u); }
       }
     }
   }
 
-                                      var hist = gi_res_none();
+  var hist = gi_res_none();
   var hist_ok = false;
-        // 历史**照常去找**（面键/法线对得上就是同一个面）——
-        // "世界变没变"不该由这里决定，该由**权重**决定（`h_scale`）：
-        // 丢掉历史 ⇒ 整屏 GI 重新抖一遍（闪）；降权 ⇒ 旧值小步让位给新值（平滑）。
-        if (pk_ok && prev_ok) {
+
+  if (pk_ok && prev_ok) {
     for (var s = 0u; s <= GI_HIST_SEARCH_TAPS; s = s + 1u) {
       let pc = prev_pc + gi_hist_search_offset(s);
       if (pc.x < 0 || pc.y < 0 || pc.x >= i32(size.x) || pc.y >= i32(size.y)) { continue; }
       let nidx = u32(pc.y) * size.x + u32(pc.x);
-            let head = gi_res_head_prev(nidx);
+      let head = gi_res_head_prev(nidx);
       if ((head.x & (GI_RES_VALID | GI_RES_PK_OK)) != (GI_RES_VALID | GI_RES_PK_OK)) { continue; }
       if (!gi_same_surface_n(head.y, head.z, gi_unpack_dir(head.w), pk0, pk1, n)) { continue; }
-                  hist = gi_res_load_prev(nidx);
+      hist = gi_res_load_prev(nidx);
       hist_ok = true;
       break;
     }
   }
-          let lone_prev = hist_ok && (hist.flags & GI_RES_LONE) != 0u;
+  let lone_prev = hist_ok && (hist.flags & GI_RES_LONE) != 0u;
 
-                        let hq = u32(gi_u.flags.w) >= 3u;
+  let hq = u32(gi_u.flags.w) >= 3u;
   let base_n = select(GI_SS_CAND_N, GI_SS_CAND_N_HQ, hq);
   let cand_n0 = select(base_n, base_n * 2u, !hist_ok);
-              if (hist_ok && diag_texel_sampled(coord)) {
+  if (hist_ok && diag_texel_sampled(coord)) {
     atomicAdd(&lod_diag[16u], 64u);
   }
-              let share = max(u32(gi_u.misc.y), 1u);
-                      let m_cap_base = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq);
+  let share = max(u32(gi_u.misc.y), 1u);
+  let m_cap_base = select(GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, hq);
   let err_tier = u32(gi_u.misc.z);
   var b_err = 1.0;
   if (err_tier > 0u) {
-                                        let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
-            let warm_m = f32(m_cap_base * cand_n0);
+    let hi = select(select(1.40, 2.00, err_tier >= 2u), 4.00, err_tier >= 3u);
+    let warm_m = f32(m_cap_base * cand_n0);
     let fill = select(0.0, clamp(hist.m / max(warm_m, 1.0), 0.0, 1.0), hist_ok);
     b_err = mix(hi, 1.0, fill);
   }
-    let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
+  let dither = gi_rand2(gi_mix(seed + 0x2545F491u)).x;
   let gi_div2 = max(u32(gi_u.flags.y), 1u);
   let res_k = f32(gi_div2 * gi_div2) * (1.0 / 16.0);
   let base = f32(cand_n0) * b_err / f32(share) * res_k;
   let rate = base * w_adapt;
   let cand_base = max(1u, u32(floor(base + dither)));
   var cand_n = max(1u, u32(floor(rate + dither)));
-                if (cand_n == 1u) {
+  if (cand_n == 1u) {
     let frac = rate;
     if (frac < 0.999) {
       let stride = max(u32(ceil(1.0 / max(frac, 1.0 / 64.0))), 1u);
@@ -266,11 +271,11 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
       }
     }
   }
-                          const GI_SS_CLAIM_ONLY: u32 = 0u;
-const GI_FLAT_ACC: u32 = 0u;
+  const GI_SS_CLAIM_ONLY: u32 = 0u;
+  const GI_FLAT_ACC: u32 = 0u;
   if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
     var fok2 = false;
-        let fs2 = face_slot_find(pk0, pk1, &fok2);
+    let fs2 = face_slot_find(pk0, pk1, &fok2);
     if (fok2) {
       let fe2 = fs2 * FACE_WORDS;
       if (atomicLoad(&face_slots[fe2 + FACE_W_TEXEL]) != idx) {
@@ -278,10 +283,10 @@ const GI_FLAT_ACC: u32 = 0u;
       }
     }
   }
-            let cap_mul = select(1u, GI_SS_M_CAP_REST_K, px_static || lone_prev);
+  let cap_mul = select(1u, GI_SS_M_CAP_REST_K, px_static || lone_prev);
   let m_cap_k = m_cap_base * max(cand_n0 / max(cand_base, 1u), 1u) * cap_mul;
   var r = gi_res_none();
-              var clamped_any = false;
+  var clamped_any = false;
   var k = 0u;
   loop {
     if (k >= cand_n) { break; }
@@ -291,12 +296,12 @@ const GI_FLAT_ACC: u32 = 0u;
       let kk = k + i;
       let cseed = gi_mix(seed + kk * 0x9E3779B9u + 1u);
       let dir = gi_cos_hemisphere(n, gi_rand2(cseed));
-                                    let b2 = select(0.0, b2_mult, gi_rand2(gi_mix(cseed + 0x27D4EB2Fu)).y < 1.0 / max(b2_mult, 1.0));
+      let b2 = select(0.0, b2_mult, gi_rand2(gi_mix(cseed + 0x27D4EB2Fu)).y < 1.0 / max(b2_mult, 1.0));
       b_s[i] = gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce, epoch, b2, cseed);
     }
     for (var i = 0u; i < nb; i = i + 1u) {
-            var c = b_s[i] * GI_PI;
-                                          if (GI_SS_CAND_CLAMP_K > 0.0) {
+      var c = b_s[i] * GI_PI;
+      if (GI_SS_CAND_CLAMP_K > 0.0) {
         let m_now = r.m + hist.m;
         if (m_now > 0.5) {
           let cap = max(
@@ -328,31 +333,27 @@ const GI_FLAT_ACC: u32 = 0u;
     gi_guide_out[nbi] = pack2x16float(vec2<f32>(clamp(ema, 1e-3, 16.0), clamp(base, 0.0, 16.0)));
   }
 
-        r.pk0 = pk0;
+  r.pk0 = pk0;
   r.pk1 = pk1;
   r.flags = GI_RES_VALID | select(0u, GI_RES_PK_OK, pk_ok);
   r.nrm = n;
-  // 历史按 `h_scale` 权重参与：稳态 1.0（照旧）；内容变了就降到 GI_HIST_RESET_SCALE
-  // ⇒ 旧值仍以小权重在场，新值平滑地接管（不闪），响应比稳态快 1/权重 倍。
+
   if (hist_ok) { r = gi_res_adopt(r, gi_res_scaled(hist, h_scale)); }
   r = gi_res_cap(r, cand_n, m_cap_k);
   gi_res_store_cur(idx, r);
 
-                        if (gi_u.params.y > 0.5 && wal_claimer && r.m > 0.5) {
-    gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m));
+  if (gi_u.params.y > 0.5 && wal_claimer && r.m > 0.5) {
+    gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m), gi_u.seq.x);
   }
 
-                                    let tb = prev_pc;
+  let tb = prev_pc;
   var sk_sum = vec3<f32>(0.0);
-  // 空间复用（邻域 tap）要有可用的历史才成立 ⇒ 判据是"历史找没找到"。
-  // **过渡期不能停用**：邻域 tap 是主要的**空间去噪**手段，停掉会让原始噪声直接
-  // 露出来（满屏"花"）。改成收窄它的钳制范围（见下）——既保留去噪，
-  // 又不让它把像素按在旧值上（那才是"收敛慢 / 收敛不干净"的真凶）。
+
   var sk_m = 0.0;
-    var tap_used = 0u;
-            let reuse_taps =
+  var tap_used = 0u;
+  let reuse_taps =
     select(GI_SS_REUSE_TAPS, 0u, !prev_ok || !hist_ok || r.m < 0.5 || hist_reset_recent);
-      let est_self = r.w_sum / max(r.m, 1e-6);
+  let est_self = r.w_sum / max(r.m, 1e-6);
   let clamp_lo = select(GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_CLAMP_LO_RESET, hist_reset_recent);
   let clamp_hi = select(GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_HI_RESET, hist_reset_recent);
   for (var t = 0u; t < reuse_taps; t = t + 1u) {
@@ -361,19 +362,19 @@ const GI_FLAT_ACC: u32 = 0u;
     let nidx = u32(nc.y) * size.x + u32(nc.x);
     let head = gi_tap_head(nidx);
     if ((head.x & (GI_RES_VALID | GI_RES_PK_OK)) != (GI_RES_VALID | GI_RES_PK_OK)) { continue; }
-        if (!gi_den_same_plane(head.y, head.z, pk0, pk1)) { continue; }
+    if (!gi_den_same_plane(head.y, head.z, pk0, pk1)) { continue; }
     if (dot(gi_unpack_dir(gi_res_prev[nidx * GI_RES_WORDS + GI_RES_W_NRM]), n) < GI_DEN_N_DOT) {
       continue;
     }
     let wm = gi_tap_merge(nidx);
-                    let v = wm.xyz / max(wm.w, 1e-6);
+    let v = wm.xyz / max(wm.w, 1e-6);
     let vc = clamp(v, est_self * clamp_lo, est_self * clamp_hi);
     sk_sum = sk_sum + vc * wm.w;
     sk_m = sk_m + wm.w;
     tap_used = tap_used + 1u;
   }
-      let lone_now = reuse_taps > 0u && tap_used == 0u;
-            if (diag_texel_sampled(coord)) {
+  let lone_now = reuse_taps > 0u && tap_used == 0u;
+  if (diag_texel_sampled(coord)) {
     atomicAdd(&lod_diag[GI_DIAG_STATIC], select(0u, 64u, px_static));
     atomicAdd(&lod_diag[GI_DIAG_TAPS], tap_used * 64u);
     atomicAdd(&lod_diag[GI_DIAG_HIT], 64u);
@@ -381,20 +382,20 @@ const GI_FLAT_ACC: u32 = 0u;
     atomicAdd(&lod_diag[GI_DIAG_LONE], select(0u, 64u, lone_now));
     atomicAdd(&lod_diag[GI_DIAG_CLAMP], select(0u, 64u, clamped_any));
   }
-        let lone_keep = select(lone_now, hist_ok && (hist.flags & GI_RES_LONE) != 0u, reuse_taps == 0u);
+  let lone_keep = select(lone_now, hist_ok && (hist.flags & GI_RES_LONE) != 0u, reuse_taps == 0u);
   gi_res_cur[idx * GI_RES_WORDS + GI_RES_W_FLAGS] =
     select(r.flags & 0x7FFFFFFFu, r.flags | GI_RES_LONE, lone_keep);
 
-      var est = est_self;
+  var est = est_self;
   if (sk_m > 0.0) {
-                                    let m_k = select(GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, px_static);
+    let m_k = select(GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, px_static);
     let keep = min(1.0, m_k * r.m / max(sk_m, 1e-6));
     let denom = max(r.m + sk_m * keep, 1e-6);
     est = (r.w_sum + sk_sum * keep) / denom;
   }
   let gi = est * (gi_u.params.z / GI_PI);
-        let has_evidence = (r.m + sk_m) > 0.0;
-                        var gi_w = gi;
+  let has_evidence = (r.m + sk_m) > 0.0;
+  var gi_w = gi;
   var cov_w = select(0.0, 1.0, has_evidence);
   if (gi_u.params.y > 0.5) {
     let s = gi_wal_sample(h.voxel, h.obj_id, h.pal, pk1);
@@ -403,14 +404,14 @@ const GI_FLAT_ACC: u32 = 0u;
       cov_w = max(cov_w, s.w);
     }
   }
-                textureStore(gi_out, coord, vec4<f32>(gi_w, cov_w));
+  textureStore(gi_out, coord, vec4<f32>(gi_w, cov_w));
 
-      if (GI_FLAT_ACC != 0u && pk_ok && cov_w > 0.0) {
+  if (GI_FLAT_ACC != 0u && pk_ok && cov_w > 0.0) {
     var fok = false;
-        let fslot = face_slot_find(pk0, gi_vox_k1(pk1), &fok);
+    let fslot = face_slot_find(pk0, gi_vox_k1(pk1), &fok);
     if (fok) {
       let fe = fslot * FACE_WORDS;
-                  let q = clamp(gi_w, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+      let q = clamp(gi_w, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
       let qv = vec3<u32>(round(q * GI_ACC_SCALE));
       var reserved = false;
       loop {

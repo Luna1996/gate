@@ -7,9 +7,6 @@ pub const BEAM_DIV: u32 = 4;
 pub const DDA_FOV_Y: f32 = 60.0_f32.to_radians();
 pub const CPU_TRACE_BUDGET: u32 = 65536;
 
-pub const DDA_CHUNKWALK: bool = true;
-pub const DDA_SKY_ONLY: bool = false;
-pub const DDA_MAKEGRID_ONLY: bool = false;
 pub const DDA_LOD: bool = true;
 pub const RT_RAY_QUERY: bool = false;
 pub const LOD_DIAG_WORDS: usize = 144;

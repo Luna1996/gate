@@ -15,8 +15,8 @@ use bevy::prelude::*;
 
 pub use brickmap::{
   BindingLimits, BrickMapBuffers, BrickMapBuilder, BrickMapGlobals, BufferLayout, BuilderMirror,
-  ChunkUpdate, DdaCameraConfig, DdaImages, DdaViewUniform, DebugNormals, DirtyRanges,
-  EyeAdaptSettings, GpuBrickMap, GridDesc, OrbitCamera, RayHit, UploadBudget, UploadCpuSample,
+  ChunkUpdate, DdaCameraConfig, DdaImages, DdaViewUniform, DirtyRanges, EyeAdaptSettings,
+  GpuBrickMap, GridDesc, OrbitCamera, RayHit, UploadBudget, UploadCpuSample,
   UploadCpuSampleChannel, UploadSnapshot, VolumesBuilder, VolumesSnapshot, VoxelDumpRequest,
   VoxelScene, create_dda_image, pool_capacity_chunks, pool_capacity_chunks_far, raycast,
   raycast_objects,

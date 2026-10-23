@@ -15,7 +15,7 @@ struct Grid {
   tree_base: u32,                 palette_base: u32,              index_origin: vec3<i32>,        index_dims: vec3<u32>,          obj_id: i32,                    vol: u32,                       coverage_r: f32,              }
 
 fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
-    let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
+  let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
   let chunk_i = (voxel - m) / vec3<i32>(i32(CHUNK_SIZE));
   let origin = g.index_origin;
   let dims = g.index_dims;
@@ -23,16 +23,16 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   if (any(rel < vec3<i32>(0))) { return 0u; }
   let rel_u = vec3<u32>(rel);
   if (any(rel_u >= dims)) { return 0u; }
-    let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
+  let index_addr = g.tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
   let entry = ts(index_addr);
   if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { return 0u; }
-    let chunk_base = g.tree_base + entry - 1u;
+  let chunk_base = g.tree_base + entry - 1u;
 
-    let local = vec3<u32>(m);    var node_addr = chunk_base;
+  let local = vec3<u32>(m);    var node_addr = chunk_base;
   for (var level = 0u; level < MAX_LEVEL; level = level + 1u) {
     let mask_lo = ts(node_addr);
     let mask_hi = ts(node_addr + 1u);
-    let palette = ts(node_addr + 2u) & 0xFFFFu;  
+    let palette = ts(node_addr + 2u) & 0xFFFFu;
     let shift = 8u - (level + 1u) * 2u;
     let cx = (local.x >> shift) & 3u;
     let cy = (local.y >> shift) & 3u;
@@ -50,7 +50,7 @@ fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
       return palette;      }
 
     if (level == 3u) {
-            let w = ts(node_addr + NODE_FIXED_WORDS + (child_idx >> 1u));
+      let w = ts(node_addr + NODE_FIXED_WORDS + (child_idx >> 1u));
       return (w >> ((child_idx & 1u) * 16u)) & 0xFFFFu;
     }
 

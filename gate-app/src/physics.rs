@@ -9,11 +9,11 @@ use crate::edit::{BrushMaterial, BrushShape, Burst};
 
 const STATIC_MARGIN: f32 = 32.0;
 const FIXED_DT: f32 = 1.0 / 60.0;
-const FIXED_HZ: f32 = 1.0 / FIXED_DT;
 pub const PHYS_SUBSTEPS: [u32; 4] = [4, 8, 16, 32];
-pub const PHYS_RATE_HZ_DEFAULT: f32 = 20.0;
-pub const PHYS_RATE_HZ_MIN: f32 = 1.0;
-pub const PHYS_RATE_HZ_MAX: f32 = 240.0;
+
+pub const PHYS_EVERY_DEFAULT: u32 = 1;
+pub const PHYS_EVERY_MIN: u32 = 1;
+pub const PHYS_EVERY_MAX: u32 = 240;
 const PHYS_SUBSTEPS_DEFAULT: usize = 1;
 
 #[derive(Resource)]
@@ -28,7 +28,7 @@ pub struct PhysicsState {
   last_split: (u32, usize),
   last_mix: (usize, usize, usize),
   last_profile: gate_physics::StepProfile,
-  pub tick_hz: f32,
+  pub tick_every: u32,
 }
 
 impl Default for PhysicsState {
@@ -51,7 +51,7 @@ impl Default for PhysicsState {
       last_split: (0, 0),
       last_mix: (0, 0, 0),
       last_profile: gate_physics::StepProfile::default(),
-      tick_hz: PHYS_RATE_HZ_DEFAULT,
+      tick_every: PHYS_EVERY_DEFAULT,
     }
   }
 }
@@ -152,7 +152,7 @@ pub(crate) fn step_physics(
     st.tick_frame = 0;
     return;
   }
-  let every = (FIXED_HZ / st.tick_hz).round().clamp(1.0, FIXED_HZ) as u32;
+  let every = st.tick_every.max(1);
   st.tick_frame = st.tick_frame.wrapping_add(1);
   if !st.tick_frame.is_multiple_of(every) {
     return;
@@ -207,36 +207,36 @@ pub(crate) fn register_callbacks(world: &mut World) {
           st.cfg.substeps = PHYS_SUBSTEPS.get(*i).copied().unwrap_or(st.cfg.substeps);
           info!(target: "gate", "PHYS[cfg] 子步 → {}", st.cfg.substeps);
         }
-        ("game/phys/rate", gate_ui::MenuAction::Text(t)) => {
+        ("game/phys/every", gate_ui::MenuAction::Text(t)) => {
           let parsed = t
             .trim()
-            .parse::<f32>()
+            .parse::<u32>()
             .ok()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| v.clamp(PHYS_RATE_HZ_MIN, PHYS_RATE_HZ_MAX));
-          let hz = parsed.unwrap_or(PHYS_RATE_HZ_DEFAULT);
-          st.tick_hz = hz;
+            .filter(|v| *v >= PHYS_EVERY_MIN)
+            .map(|v| v.min(PHYS_EVERY_MAX));
+          let every = parsed.unwrap_or(PHYS_EVERY_DEFAULT);
+          st.tick_every = every;
           if parsed.is_none() {
             warn!(
               target: "gate",
-              "PHYS[cfg] 步频输入未成形 {t:?} → 默认 {hz:.0} Hz",
+              "PHYS[cfg] 步进间隔输入未成形 {t:?} → 默认每 {every} 帧",
             );
           }
-          let text = format!("{hz:.0}");
+          let text = format!("{every}");
           for (item, mut tv) in &mut q_rate {
-            if item.path == "game/phys/rate" && tv.0 != text {
+            if item.path == "game/phys/every" && tv.0 != text {
               tv.0 = text.clone();
             }
           }
           if let Ok(mut menu) = q_menu.single_mut()
             && let Some(gate_ui::MenuNode::Input { fields, .. }) =
-              menu.model.node_mut(&["game".to_string(), "phys".to_string(), "rate".to_string()])
+              menu.model.node_mut(&["game".to_string(), "phys".to_string(), "every".to_string()])
             && let Some(f) = fields.first_mut()
             && f.text != text
           {
             f.text = text;
           }
-          info!(target: "gate", "PHYS[cfg] 步频 → {hz:.0} Hz");
+          info!(target: "gate", "PHYS[cfg] 步进间隔 → 每 {every} 帧");
         }
         _ => {}
       }
