@@ -1,6 +1,7 @@
-// WGSL: 全屏三角 blit，storage texture → ViewTarget（可降分辨率，uv 双线性上采样）。
+// WGSL: 全屏三角 blit，storage texture → ViewTarget（整数块上采样）。
 // 两个 fragment 入口：`fs_main`（纯 blit）/ `fs_fxaa`（FXAA 抗锯齿，菜单「视频/抗锯齿」）。
-// Rust 侧建两条 pipeline（同 layout、同 bind group），按开关选一条。
+// Rust 侧建两条 pipeline（同 layout、同 bind group），仅按抗锯齿开关选一条；
+// FXAA 作用在真实画布（`scale.size`）上，与「像素大小」无关（见 `fs_fxaa`）。
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_sampler: sampler;
@@ -43,7 +44,8 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 }
 
 // ============================================================================
-// FXAA（NVIDIA FXAA 3.11）。
+// FXAA（NVIDIA FXAA 3.11）。作用在真实画布（`src_tex`，即 `scale.size`）上，
+// 与窗口侧「像素大小」无关：先按 `fs_main` 的整数块映射定位源像素再全邻域采样。
 // 取值空间：输入为 sRGB 编码后的 LDR 缓冲（`dda_main` 的 `linear_to_srgb` 结果）。
 // ============================================================================
 /// 绝对下限：局部对比度低于它 → 判定不在边缘。
@@ -78,7 +80,13 @@ fn fxaa_at(uv: vec2<f32>, off: vec2<f32>, texel: vec2<f32>) -> vec3<f32> {
 @fragment
 fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
   let texel = 1.0 / vec2<f32>(textureDimensions(src_tex));
-  let uv = in.uv;
+  // 先取整数块映射的源像素中心（同 `fs_main` 的 `textureLoad` 映射）：目标 uv 的
+  // 起点换成块内唯一确定的 `base_uv` ⇒ FXAA 全程以源纹素为单位、在真实画布上
+  // 计算，与「像素大小」无关；同一源块内所有目标像素的结果逐位相同，
+  // 块上采样的颗粒感不被破坏。
+  let dim = textureDimensions(src_tex);
+  let s = min(vec2<u32>(floor(in.uv * vec2<f32>(dim))), dim - vec2<u32>(1u));
+  let uv = (vec2<f32>(s) + vec2<f32>(0.5)) / vec2<f32>(dim);
   let center = fxaa_at(uv, vec2<f32>(0.0, 0.0), texel);
   let luma_m = fxaa_luma(center);
   let luma_n = fxaa_luma(fxaa_at(uv, vec2<f32>(0.0, 1.0), texel));

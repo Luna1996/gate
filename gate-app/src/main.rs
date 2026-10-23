@@ -36,7 +36,6 @@ use config::{Config, save_config_on_exit};
 use debug_menu::{
   DebugUiRoot, FpsOverlayVisible, FpsWindow, camera_info_tick, debug_menu_toggle, fps_overlay_tick,
   lod_state_tick, spawn_debug_menu_ui, sync_edit_menu, sync_sky_menu, sync_ui_locale,
-  sync_video_menu,
 };
 use edit::voxel_edit_input;
 use scene::setup;
@@ -153,7 +152,6 @@ fn main() {
         objects::sync_objects_menu,
         sync_sky_menu,
         sync_edit_menu,
-        sync_video_menu,
         sync_ui_locale,
         showcase_demo_system,
         debug_menu_toggle,

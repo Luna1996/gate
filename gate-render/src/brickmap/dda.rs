@@ -1137,11 +1137,7 @@ pub(crate) fn prepare_dda_bind_groups(
     let refl_px = scale.size.x as u64 * scale.size.y as u64;
     let tex = render_device.create_texture(&TextureDescriptor {
       label: Some("gate_out_base"),
-      size: Extent3d {
-        width: scale.size.x,
-        height: scale.size.y,
-        depth_or_array_layers: 1,
-      },
+      size: Extent3d { width: scale.size.x, height: scale.size.y, depth_or_array_layers: 1 },
       mip_level_count: 1,
       sample_count: 1,
       dimension: TextureDimension::D2,
@@ -2132,7 +2128,6 @@ fn blit_dda_view(
   views: Query<&ViewTarget>,
   blit_bg: Option<Res<DdaBlitBindGroup>>,
   post: Option<Res<PostFxSettings>>,
-  scale: Option<Res<RenderScale>>,
   pipeline_cache: Res<PipelineCache>,
   pipelines: Res<DdaPipelines>,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
@@ -2142,8 +2137,7 @@ fn blit_dda_view(
     return;
   };
 
-  let downscaled = scale.as_ref().is_some_and(|s| s.factor != 1);
-  let id = if post.as_ref().is_some_and(|p| p.fxaa) && !downscaled {
+  let id = if post.as_ref().is_some_and(|p| p.fxaa) {
     pipelines.blit_fxaa_pipeline
   } else {
     pipelines.blit_pipeline

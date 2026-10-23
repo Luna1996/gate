@@ -44,7 +44,6 @@ const WORLD_REQUESTS_LOAD_PATH: &str = "game/world/requests_load";
 const WORLD_REQUEST_MB_PATH: &str = "game/world/request_mb";
 pub const EDIT_PBR_ASSET_PATH: &str = "game/edit/mat/pbr_asset";
 const EDIT_OFFSET_PATH: &str = "game/edit/place/offset";
-const VIDEO_AA_PATH: &str = "video/aa";
 
 const EDIT_MATERIAL_PATHS: [&str; 5] = [
   "game/edit/mat/color",
@@ -907,29 +906,6 @@ fn write_brush_offset(
   for (item, mut tv) in q.iter_mut() {
     if item.path == EDIT_OFFSET_PATH && tv.0 != text {
       tv.0 = text.clone();
-    }
-  }
-}
-
-pub(crate) fn sync_video_menu(
-  scale: Res<gate_render::RenderScale>,
-  mut commands: Commands,
-  mut q_menu: Query<&mut gate_ui::DebugMenu>,
-  q_aa: Query<(Entity, &gate_ui::menu::MenuItem, Has<gate_ui::widgets::UiDisabled>)>,
-) {
-  let want = scale.factor != 1;
-  let Ok(mut menu) = q_menu.single_mut() else { return };
-  if let Some(node) = menu.model.node_mut(&split(VIDEO_AA_PATH)) {
-    node.set_disabled(want);
-  }
-  for (e, item, disabled) in &q_aa {
-    if item.path != VIDEO_AA_PATH || disabled == want {
-      continue;
-    }
-    if want {
-      commands.entity(e).insert(gate_ui::widgets::UiDisabled);
-    } else {
-      commands.entity(e).remove::<gate_ui::widgets::UiDisabled>();
     }
   }
 }
