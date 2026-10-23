@@ -113,9 +113,11 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
   refl_req[o + 1u] = vec4<u32>(pbase, face_id, 0u, px);
 }
 
+// 玻璃的反射、透射都必须逐体素：起点取体素面心，方向取体素中心视线。
+// 不要传入命中点或逐像素方向，否则透射会退化成逐像素（同面内出现连续变化的折射）。
 fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
                entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32,
-               refr_org: vec3<f32>, refr_v: vec3<f32>, quality: u32) -> GlassOut {
+               quality: u32) -> GlassOut {
   var tint = vec3<f32>(1.0);
   let f0 = dielectric_f0(entry_ior, 1.0);
   let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(entry_v, entry_n), 0.0, 1.0), 5.0);
@@ -131,11 +133,11 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
   }
 
   let eta_in = 1.0 / entry_ior;
-  let ci_in = clamp(dot(refr_v, entry_n), 0.0, 1.0);
+  let ci_in = clamp(dot(-dir_voxel, entry_n), 0.0, 1.0);
   let k_in = 1.0 - eta_in * eta_in * (1.0 - ci_in * ci_in);
-  var dir_in = normalize(eta_in * (-refr_v) + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
-  if (quality < 2u) { dir_in = -refr_v; }
-  let inner = world_trace_glass_path(refr_org + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
+  var dir_in = normalize(eta_in * dir_voxel + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
+  if (quality < 2u) { dir_in = dir_voxel; }
+  let inner = world_trace_glass_path(origin_voxel + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
   if (!inner.hit || medium_of(inner.palette_base, inner.pal).a >= 1.0) {
     return GlassOut(inner, tint, vec3<f32>(0.0), dir_in);
   }
@@ -372,9 +374,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
 
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let fv_px = normalize(origin_voxel - first.point);
     let g = trace_glass(f_face, -fv, frustum_length, fnn, material_ior(first.palette_base, first.pal), fv, qpx,
-                        first.point + fnn * f_off, fv_px, glass_q);
+                        glass_q);
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
     if (glass_q > 0u) {
       best = g.ray;
