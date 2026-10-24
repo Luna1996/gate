@@ -945,6 +945,8 @@ fn gi_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (age_ok && hit_ok) {
     h = dda_hit_unpack(raw, origin_voxel, dir_voxel);
   } else if (age_ok) {
+    h = world_miss();
+  } else {
     let gi_div = max(u32(gi_u.flags.y), 1u);
     var t_min = 0.0;
     if (view_u.lod.z < 0.5) {
