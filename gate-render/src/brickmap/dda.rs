@@ -634,7 +634,6 @@ pub(crate) fn init_dda_pipelines(
         },
         count: None,
       },
-      
       BindGroupLayoutEntry {
         binding: 4,
         visibility: ShaderStages::COMPUTE,
@@ -1100,7 +1099,6 @@ pub(crate) fn prepare_dda_bind_groups(
     beam_cache.gi_tex = Some(gi_tex);
     beam_cache.gi_size = gi_size;
 
-    
     let hit_tex = make("gate_dda_hit", TextureFormat::Rgba32Uint);
     beam_cache.dda_hit_view = Some(hit_tex.create_view(&TextureViewDescriptor::default()));
     beam_cache.dda_hit = Some(hit_tex);
@@ -1823,9 +1821,6 @@ pub(crate) fn dispatch_dda(
     });
   }
 
-  
-  
-  
   crate::volumetric::dispatch_fog(
     &mut profiler,
     ctx.command_encoder(),

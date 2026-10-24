@@ -104,7 +104,6 @@ enum FogSlot {
 }
 
 pub fn fog_layout_mask() -> BindGroupLayoutDescriptor {
-  
   fog_layout(
     "FogGodrayMask",
     &[(0, FogSlot::GiUniform), (1, FogSlot::Uniform), (3, FogSlot::Write)],
@@ -179,7 +178,7 @@ pub struct FogGpu {
   read_bg: Option<bevy::render::render_resource::BindGroup>,
   ph_tex: Option<bevy::render::render_resource::Texture>,
   ph_view: Option<bevy::render::render_resource::TextureView>,
-  
+
   gi_fb: Option<bevy::render::render_resource::Buffer>,
   pipelines: [Option<CachedComputePipelineId>; 3],
   layouts: FogLayouts,
@@ -406,7 +405,6 @@ fn prepare_fog(
   if let (Some(a_src), Some(a_dst), Some(b_src), Some(b_dst)) =
     (gpu.a_src.clone(), gpu.a_dst.clone(), gpu.b_src.clone(), gpu.b_dst.clone())
   {
-    
     if gpu.gi_fb.is_none() {
       gpu.gi_fb = Some(device.create_buffer(&BufferDescriptor {
         label: Some("gate_godray_gi_u_fallback"),
