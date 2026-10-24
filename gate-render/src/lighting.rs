@@ -44,7 +44,7 @@ pub struct ReflectionSettings {
 }
 
 impl ReflectionSettings {
-  pub const TIERS: u32 = 4;
+  pub const TIERS: u32 = 5;
   pub const NEST_CHOICES: [u32; 4] = [0, 1, 2, 4];
   pub const REACH_CHOICES: [u32; 4] = [0, 1024, 4096, u32::MAX];
 

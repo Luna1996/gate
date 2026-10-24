@@ -589,6 +589,16 @@ pub(crate) fn init_dda_pipelines(
         count: None,
       },
       BindGroupLayoutEntry {
+        binding: 9,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Storage { read_only: false },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
         binding: 10,
         visibility: ShaderStages::COMPUTE,
         ty: BindingType::Buffer {
@@ -1337,6 +1347,8 @@ pub(crate) fn prepare_dda_bind_groups(
 
   let face_slots = beam_cache.face_slots.as_ref().expect("逐面去重表 buffer 未创建").clone();
 
+  let sec_slots = beam_cache.gi_sec_slots.as_ref().expect("二次顶点表 buffer 未创建").clone();
+
   let wal = beam_cache.wal.as_ref().expect("WAL 表 buffer 未创建").clone();
 
   let region_table = beam_cache.region_table.as_ref().expect("区域修订表 buffer 未创建").clone();
@@ -1347,6 +1359,7 @@ pub(crate) fn prepare_dda_bind_groups(
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&gi_den_view) },
       BindGroupEntry { binding: 6, resource: gi_guide.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: face_slots.as_entire_binding() },
+      BindGroupEntry { binding: 9, resource: sec_slots.as_entire_binding() },
       BindGroupEntry { binding: 10, resource: region_table.as_entire_binding() },
       BindGroupEntry { binding: 11, resource: wal.as_entire_binding() },
     ],

@@ -184,6 +184,7 @@ options = [
     "menu.render.ray.tier.sun",
     "menu.render.ray.tier.sky",
     "menu.render.ray.tier.shadow",
+    "menu.render.ray.tier.gi",
 ]
 selected = 2
 tooltip = "menu.render.ray.tier.tip"

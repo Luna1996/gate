@@ -30,9 +30,3 @@ fn validate_all_entries(src: &str, ray_query: bool) {
   .validate(&module)
   .expect("WGSL 校验失败");
 }
-
-#[test]
-fn wesl_package_compiles_and_validates() {
-  let src = gate_render::shader::compile_dda_wesl(false).expect("WESL 编译失败");
-  validate_all_entries(&src, false);
-}

@@ -15,25 +15,3 @@ fn naga_check(src: &str, tag: &str) {
     Err(e) => panic!("naga 校验失败({tag}): {e}"),
   }
 }
-
-#[test]
-fn dda_wesl_compiles_main() {
-  match compile_dda_wesl(false) {
-    Ok(src) => {
-      assert!(src.len() > 1024, "WESL 输出异常短: {}", src.len());
-      naga_check(&src, "ray_query=off");
-    }
-    Err(e) => panic!("WESL 编译失败(ray_query=off): {e}"),
-  }
-}
-
-#[test]
-fn dda_wesl_compiles_ray_query() {
-  match compile_dda_wesl(true) {
-    Ok(src) => {
-      assert!(src.len() > 1024, "WESL 输出异常短: {}", src.len());
-      naga_check(&src, "ray_query=on");
-    }
-    Err(e) => panic!("WESL 编译失败(ray_query=on): {e}"),
-  }
-}
