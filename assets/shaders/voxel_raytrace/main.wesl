@@ -433,7 +433,6 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
     let fp = voxel_center_world(fg, first.voxel);
-    let fvuv = voxel_screen_uv(fp, gi_in.uv);
     var fnn = n_hint;
     if (!n_hint_ok) { fnn = voxel_normal_fast(fg, first.voxel, first.face_id, first.n); }
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
@@ -466,11 +465,6 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       if (gi_in.use_face) {
         f_gi = gi_in.face_avg;
         f_cov = gi_in.face_cov;
-      } else if (gi_u.misc.x > 0.5) {
-        let fs = textureSampleLevel(gi_tex, light_samp, fvuv, 0.0);
-        let fgw = max(fs.a, 1e-4);
-        f_gi = fs.rgb / fgw;
-        f_cov = clamp(fs.a, 0.0, 1.0);
       }
       let f_amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, f_cov);
       glass_col = brdf_reflected(fm, fnn, fv,
