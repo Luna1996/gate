@@ -1,6 +1,6 @@
 import package::bindings::{gi_den_cfg, gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_tmp, gi_guide, gi_guide_out, gi_hist_cur, gi_hist_prev, gi_raw_tex};
 import package::gi::common::{gi_hist_search_offset, gi_pack_dir, gi_unpack_dir};
-import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_G_RESET, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_RESET_SCALE, GI_DEN_W_HIST_MIN, GI_HIST_SEARCH_TAPS, GI_LUMA};
+import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_G_RESET, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_RESET_SCALE, GI_DEN_W_HIST_MIN, GI_DEN_W_HIST_STATIC, GI_HIST_SEARCH_TAPS, GI_LUMA};
 
 fn gi_den_valid_b(b: u32) -> bool {
   return (gi_guide[b + GI_DEN_G_KEY0] | gi_guide[b + GI_DEN_G_KEY1]) != 0u;
@@ -190,7 +190,11 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let w_motion = select(1.0 / (1.0 + mo), 1.0, !shifted);
 
       let w_scale = select(1.0, GI_DEN_RESET_SCALE, gi_guide[gb + GI_DEN_G_RESET] != 0u);
-      let w = min(min(w_var, (m - 1.0) / m), w_motion) * w_scale;
+      var w = min(min(w_var, (m - 1.0) / m), w_motion) * w_scale;
+      if (!shifted && prev_px.x == x && prev_px.y == y
+          && gi_guide[gb + GI_DEN_G_RESET] == 0u) {
+        w = max(w, GI_DEN_W_HIST_STATIC * ((m - 1.0) / m));
+      }
       color = mix(c_in, clamped, w);
       m1_acc = mix(h_m1, l_in, 1.0 - w);
       m2_acc = mix(h_m2, l_in * l_in, 1.0 - w);

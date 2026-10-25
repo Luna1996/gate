@@ -72,6 +72,8 @@ const LIGHT_DIR_MIN_MAG: f32 = 0.02;
 
 const LIGHT_STEP_MAX: f32 = 0.5;
 
+const LIGHT_WAL_STEP_MAX: f32 = 0.1;
+
 pub const KEY_ORG_Q: i32 = 8192;
 
 pub fn key_origins_q(windows: &[glam::IVec3]) -> Vec<glam::IVec3> {
@@ -549,6 +551,8 @@ pub struct GiGpu {
 
   pub epoch: u32,
 
+  pub light_rev: u32,
+
   pub content_rev: u32,
 
   pub hist_reset_frame: u32,
@@ -659,6 +663,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     den_pipelines: [None; 6],
     flatten_pipeline: None,
     epoch: 0,
+    light_rev: 0,
     content_rev: 0,
     hist_reset_frame: 0,
     edit_boxes: None,
@@ -815,7 +820,11 @@ fn prepare_gi(p: PrepareGiParams) {
   let light = LightKey::of(lighting.as_deref());
   let mut light_step = false;
   if gpu.light_key != Some(light) {
-    light_step = gpu.light_key.as_ref().is_some_and(|p| light_jump(p, &light) > LIGHT_STEP_MAX);
+    let jump = gpu.light_key.as_ref().map_or(0.0, |p| light_jump(p, &light));
+    light_step = gpu.light_key.is_some() && jump > LIGHT_STEP_MAX;
+    if jump > LIGHT_WAL_STEP_MAX {
+      gpu.light_rev = gpu.light_rev.wrapping_add(1);
+    }
     gpu.light_key = Some(light);
   }
   let shade_key = ShadeKey::of(occluder_rev, settings.sun_bounce, &light);
@@ -854,7 +863,7 @@ fn prepare_gi(p: PrepareGiParams) {
       settings.tier() as f32,
     ),
 
-    seq: UVec4::new(gpu.frame, gpu.epoch, 0, gpu.hist_reset_frame),
+    seq: UVec4::new(gpu.frame, gpu.epoch, gpu.light_rev, gpu.hist_reset_frame),
 
     prev_view_proj: gpu.prev_view_proj,
   };

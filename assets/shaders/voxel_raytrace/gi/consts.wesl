@@ -56,6 +56,7 @@ const GI_DEN_NBR_R: u32 = 2u;
 const GI_DEN_M_MAX: u32 = 64u;
 const GI_DEN_SIGMA_ALPHA: f32 = 0.02;
 const GI_DEN_W_HIST_MIN: f32 = 0.05;
+const GI_DEN_W_HIST_STATIC: f32 = 0.85;
 const GI_DEN_CLAMP_K: f32 = 2.5;
 const GI_DEN_N_DOT: f32 = 0.7;
 const GI_DEN_LUMA_K: f32 = 1.0;

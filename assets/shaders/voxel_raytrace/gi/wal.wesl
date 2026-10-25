@@ -3,7 +3,7 @@ import package::gi::common::{gi_key0, gi_key1, gi_key_ok, gi_key_org, gi_local_r
 
 const GI_WAL_WORDS: u32 = 8u;
 
-const GI_WAL_CAP_N: f32 = 256.0;
+const GI_WAL_CAP_N: f32 = 1048576.0;
 
 const GI_WAL_MATURE_N: f32 = 64.0;
 
@@ -38,9 +38,11 @@ fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32
   if (gi_u.params.x > 0.5) { rev = gi_local_rev(v_world, obj); }
 
   let content_rev = u32(gi_u.params.w);
+  let light_rev = gi_u.seq.z;
   return gi_mix(u32(org.x)
           + gi_mix(u32(org.y)
-            + gi_mix(u32(org.z) + gi_mix(rev + content_rev * 0x85EBCA77u + pal * 0x9E3779B1u))));
+            + gi_mix(u32(org.z) + gi_mix(rev + light_rev * 0x27D4EB2Fu
+                + content_rev * 0x85EBCA77u + pal * 0x9E3779B1u))));
 }
 
 fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
@@ -51,6 +53,13 @@ fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
   let b = slot * GI_WAL_WORDS;
   let mask = gi_wal_mask_at(v_world, gi_key_org(obj), obj, pal);
   let same = (atomicLoad(&gi_wal[b]) == k0) && (atomicLoad(&gi_wal[b + 1u]) == k1);
+  if (!same) {
+    let st = atomicLoad(&gi_wal[b + 7u]) >> 1u;
+    if (st != 0u && gi_u.seq.x - st <= GI_WAL_FRESH
+        && bitcast<f32>(atomicLoad(&gi_wal[b + 6u])) > 0.0) {
+      return;
+    }
+  }
   var sum = vec3<f32>(0.0);
   var n = 0.0;
   var mature = false;

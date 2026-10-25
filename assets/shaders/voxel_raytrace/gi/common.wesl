@@ -136,10 +136,19 @@ const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;
 
 const FACE_KMASK_NOFACE: u32 = 0xFFF8FFFFu;
-const FACE_SLOT_PROBE: u32 = 2u;
+const FACE_SLOT_PROBE: u32 = 8u;
+const FACE_SLOT_EMPTY: u32 = 0u;
+const FACE_SLOT_READY: u32 = 1u;
+const FACE_SLOT_INIT: u32 = 2u;
+const FACE_SLOT_CLAIMED: u32 = 3u;
+const FACE_SLOT_SPIN: u32 = 8u;
 
 fn gi_vox_k1(k1: u32) -> u32 {
   return k1 & FACE_KMASK_NOFACE;
+}
+
+fn face_slot_ready(flag: u32) -> bool {
+  return (flag & 1u) != 0u;
 }
 
 fn face_slot_count() -> u32 {
@@ -160,25 +169,46 @@ fn face_slot_next(base: u32) -> u32 {
 fn face_slot_matches(slot: u32, k0: u32, k1: u32) -> bool {
   let fe = slot * FACE_WORDS;
   let flag = atomicLoad(&face_slots[fe + FACE_W_FLAG]);
+  if (!face_slot_ready(flag)) { return false; }
   let s0 = atomicLoad(&face_slots[fe + FACE_W_K0]);
   let s1 = atomicLoad(&face_slots[fe + FACE_W_K1]);
-  return flag != 0u && s0 == k0 && s1 == k1;
+  return s0 == k0 && s1 == k1;
 }
 
-fn face_slot_claim(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
+fn face_slot_claim(k0: u32, k1: u32, first: ptr<function, bool>, ok: ptr<function, bool>) -> u32 {
   var table_ok = false;
   var s = face_slot_of(k0, k1, &table_ok);
   *ok = false;
+  *first = false;
   if (!table_ok) { return 0u; }
   for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
-    if (face_slot_matches(s, k0, k1)) {
-      *ok = true;
-      return s;
-    }
     let fe = s * FACE_WORDS;
-    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged) {
-      atomicStore(&face_slots[fe + FACE_W_K0], k0);
-      atomicStore(&face_slots[fe + FACE_W_K1], k1);
+    let flag = atomicLoad(&face_slots[fe + FACE_W_FLAG]);
+    if (face_slot_ready(flag)) {
+      if (atomicLoad(&face_slots[fe + FACE_W_K0]) == k0
+          && atomicLoad(&face_slots[fe + FACE_W_K1]) == k1) {
+        *ok = true;
+        if (flag == FACE_SLOT_READY) {
+          *first = atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG],
+                                             FACE_SLOT_READY, FACE_SLOT_CLAIMED).exchanged;
+        }
+        return s;
+      }
+    } else if (flag == FACE_SLOT_EMPTY) {
+      if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG],
+                                    FACE_SLOT_EMPTY, FACE_SLOT_INIT).exchanged) {
+        atomicStore(&face_slots[fe + FACE_W_K0], k0);
+        atomicStore(&face_slots[fe + FACE_W_K1], k1);
+        atomicStore(&face_slots[fe + FACE_W_FLAG], FACE_SLOT_CLAIMED);
+        *ok = true;
+        *first = true;
+        return s;
+      }
+    }
+    for (var spin = 0u; spin < FACE_SLOT_SPIN; spin = spin + 1u) {
+      if (atomicLoad(&face_slots[fe + FACE_W_FLAG]) != FACE_SLOT_INIT) { break; }
+    }
+    if (face_slot_matches(s, k0, k1)) {
       *ok = true;
       return s;
     }
@@ -193,11 +223,23 @@ fn face_slot_find(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
   *ok = false;
   if (!table_ok) { return 0u; }
   for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
+    let flag = atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]);
+    if (flag == FACE_SLOT_EMPTY) { break; }
     if (face_slot_matches(s, k0, k1)) {
       *ok = true;
       return s;
     }
-    if (atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]) == 0u) { break; }
+    if (flag == FACE_SLOT_INIT) {
+      for (var spin = 0u; spin < FACE_SLOT_SPIN; spin = spin + 1u) {
+        if (atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]) != FACE_SLOT_INIT) {
+          break;
+        }
+      }
+      if (face_slot_matches(s, k0, k1)) {
+        *ok = true;
+        return s;
+      }
+    }
     s = face_slot_next(s);
   }
   return 0u;

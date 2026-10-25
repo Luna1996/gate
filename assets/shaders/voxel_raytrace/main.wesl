@@ -535,23 +535,21 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     } else if (gi_on) {
       var acc = gi_vox_gi(best.voxel, best.face_id, best.obj_id);
       acc = acc * vec4<f32>(2.0, 2.0, 2.0, 2.0);
-      if (acc.w > 0.0) {
-        var t1 = vec3<i32>(1, 0, 0);
-        var t2 = vec3<i32>(0, 1, 0);
-        if (best.face_id / 2u == 0u) {
-          t1 = vec3<i32>(0, 1, 0);
-          t2 = vec3<i32>(0, 0, 1);
-        } else if (best.face_id / 2u == 1u) {
-          t1 = vec3<i32>(1, 0, 0);
-          t2 = vec3<i32>(0, 0, 1);
-        }
-        for (var i = 0u; i < 4u; i = i + 1u) {
-          let s1 = select(-1, 1, (i & 1u) == 0u);
-          let s2 = select(-1, 1, (i & 2u) == 0u);
-          let nv = best.voxel + t1 * s1 + t2 * s2;
-          if (!gi_key_ok(nv, best.obj_id)) { continue; }
-          acc = acc + gi_vox_gi(nv, best.face_id, best.obj_id);
-        }
+      var t1 = vec3<i32>(1, 0, 0);
+      var t2 = vec3<i32>(0, 1, 0);
+      if (best.face_id / 2u == 0u) {
+        t1 = vec3<i32>(0, 1, 0);
+        t2 = vec3<i32>(0, 0, 1);
+      } else if (best.face_id / 2u == 1u) {
+        t1 = vec3<i32>(1, 0, 0);
+        t2 = vec3<i32>(0, 0, 1);
+      }
+      for (var i = 0u; i < 4u; i = i + 1u) {
+        let s1 = select(-1, 1, (i & 1u) == 0u);
+        let s2 = select(-1, 1, (i & 2u) == 0u);
+        let nv = best.voxel + t1 * s1 + t2 * s2;
+        if (!gi_key_ok(nv, best.obj_id)) { continue; }
+        acc = acc + gi_vox_gi(nv, best.face_id, best.obj_id);
       }
       if (acc.w > 0.0) {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[44u], 1u); }
@@ -853,7 +851,8 @@ fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>,
     let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
     if ((k0 | k1) != 0u) {
       var ok = false;
-      let s = face_slot_claim(k0, gi_vox_k1(k1), &ok);
+      var claim_first = false;
+      let s = face_slot_claim(k0, gi_vox_k1(k1), &claim_first, &ok);
       if (ok) {
         let fe = s * FACE_WORDS;
         let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
@@ -882,15 +881,16 @@ fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>,
       cnt = cnt + 1u;
     }
   }
+  let avg = vec3<u32>(round(vec3<f32>(sum) / f32(cnt)));
   let fe = slot * FACE_WORDS;
   loop {
     let c = atomicLoad(&face_slots[fe + FACE_W_GI_N]);
-    if (c + cnt > GI_ACC_MAX_N) { return; }
-    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_GI_N], c, c + cnt).exchanged) { break; }
+    if (c + 1u > GI_ACC_MAX_N) { return; }
+    if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_GI_N], c, c + 1u).exchanged) { break; }
   }
-  atomicAdd(&face_slots[fe + FACE_W_GI], sum.x);
-  atomicAdd(&face_slots[fe + FACE_W_GI + 1u], sum.y);
-  atomicAdd(&face_slots[fe + FACE_W_GI + 2u], sum.z);
+  atomicAdd(&face_slots[fe + FACE_W_GI], avg.x);
+  atomicAdd(&face_slots[fe + FACE_W_GI + 1u], avg.y);
+  atomicAdd(&face_slots[fe + FACE_W_GI + 2u], avg.z);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1289,7 +1289,10 @@ fn dda_refl(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (tier >= REFL_TIER_GI && gi_u.misc.x > 0.5 && gi_u.params.y > 0.5) {
       var fok = false;
       var fs = face_slot_find(k0, gi_vox_k1(k1), &fok);
-      if (!fok) { fs = face_slot_claim(k0, gi_vox_k1(k1), &fok); }
+      if (!fok) {
+        var claim_first = false;
+        fs = face_slot_claim(k0, gi_vox_k1(k1), &claim_first, &fok);
+      }
       if (fok) {
         let fe = fs * FACE_WORDS;
         merge_gi =

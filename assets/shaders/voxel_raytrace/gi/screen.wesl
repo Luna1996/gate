@@ -1,5 +1,5 @@
 import package::bindings::{lod_diag, face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::gi::common::{FACE_WORDS, gi_in_edit_box, FACE_W_FLAG, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_find, face_slot_next, face_slot_of, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
+import package::gi::common::{FACE_WORDS, gi_in_edit_box, FACE_W_FLAG, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_claim, face_slot_find, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
 import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_LUMA_FLOOR_REL, GI_DEN_N_DOT, GI_HIST_RESET_FRAMES, GI_HIST_RESET_SCALE, GI_HIST_SEARCH_TAPS, GI_LUMA, GI_PI, GI_SS_ADAPT_EMA, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_HI_RESET, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_CLAMP_LO_RESET, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
 import package::gi::ray::{gi_ray_radiance};
@@ -188,26 +188,15 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   var wal_claimer = false;
   if (pk_ok) {
     var face_ok = false;
+    var face_first = false;
     let kv1 = gi_vox_k1(pk1);
-    let fslot = face_slot_of(pk0, kv1, &face_ok);
-    if (face_ok) {
-      var fe = fslot * FACE_WORDS;
-      var claimed =
-        atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
-      if (!claimed) {
-        if (!face_slot_matches(fslot, pk0, kv1)) {
-          fe = face_slot_next(fslot) * FACE_WORDS;
-          claimed = atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], 0u, 1u).exchanged;
-        }
-      }
-      if (claimed) {
-        wal_claimer = true;
-        atomicStore(&face_slots[fe + FACE_W_K0], pk0);
-        atomicStore(&face_slots[fe + FACE_W_K1], kv1);
-        atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
-        atomicStore(&face_slots[fe + FACE_W_PAL], h.pal);
-        if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[47u], 1u); }
-      }
+    let fslot = face_slot_claim(pk0, kv1, &face_first, &face_ok);
+    if (face_ok && face_first) {
+      wal_claimer = true;
+      let fe = fslot * FACE_WORDS;
+      atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
+      atomicStore(&face_slots[fe + FACE_W_PAL], h.pal);
+      if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[47u], 1u); }
     }
   }
 
@@ -265,7 +254,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   const GI_FLAT_ACC: u32 = 0u;
   if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
     var fok2 = false;
-    let fs2 = face_slot_find(pk0, pk1, &fok2);
+    let fs2 = face_slot_find(pk0, gi_vox_k1(pk1), &fok2);
     if (fok2) {
       let fe2 = fs2 * FACE_WORDS;
       if (atomicLoad(&face_slots[fe2 + FACE_W_TEXEL]) != idx) {
