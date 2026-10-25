@@ -45,21 +45,36 @@ fn gi_wal_mask_at(v_world: vec3<i32>, org: vec3<i32>, obj: i32, pal: u32) -> u32
                 + content_rev * 0x85EBCA77u + pal * 0x9E3779B1u))));
 }
 
+const GI_WAL_FL_MATURE: u32 = 1u;
+const GI_WAL_FL_MERGED: u32 = 2u;
+const GI_WAL_FL_SHIFT: u32 = 2u;
+
 fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
-  sum_e: vec3<f32>, cnt: u32, stamp: u32) {
+  sum_e: vec3<f32>, cnt: u32) {
   let nmask = gi_wal_nmask();
   if (nmask == 0u || cnt == 0u) { return; }
   let slot = gi_wal_slot(v_world, (k1 >> 16u) & 7u, obj, nmask);
   let b = slot * GI_WAL_WORDS;
-  let mask = gi_wal_mask_at(v_world, gi_key_org(obj), obj, pal);
+  let frame = gi_u.seq.x;
   let same = (atomicLoad(&gi_wal[b]) == k0) && (atomicLoad(&gi_wal[b + 1u]) == k1);
   if (!same) {
-    let st = atomicLoad(&gi_wal[b + 7u]) >> 1u;
-    if (st != 0u && gi_u.seq.x - st <= GI_WAL_FRESH
+    let fl = atomicLoad(&gi_wal[b + 7u]);
+    let st = fl >> GI_WAL_FL_SHIFT;
+    if (st != 0u && frame - st <= GI_WAL_FRESH
         && bitcast<f32>(atomicLoad(&gi_wal[b + 6u])) > 0.0) {
       return;
     }
   }
+
+  loop {
+    let fl = atomicLoad(&gi_wal[b + 7u]);
+    let st = fl >> GI_WAL_FL_SHIFT;
+    if (st == frame && (fl & GI_WAL_FL_MERGED) != 0u) { return; }
+    let next = (frame << GI_WAL_FL_SHIFT) | (fl & GI_WAL_FL_MATURE) | GI_WAL_FL_MERGED;
+    if (atomicCompareExchangeWeak(&gi_wal[b + 7u], fl, next).exchanged) { break; }
+  }
+
+  let mask = gi_wal_mask_at(v_world, gi_key_org(obj), obj, pal);
   var sum = vec3<f32>(0.0);
   var n = 0.0;
   var mature = false;
@@ -70,7 +85,7 @@ fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
                       bitcast<f32>(atomicLoad(&gi_wal[b + 4u])),
                       bitcast<f32>(atomicLoad(&gi_wal[b + 5u])));
       n = n_old;
-      mature = (atomicLoad(&gi_wal[b + 7u]) & 1u) != 0u;
+      mature = (atomicLoad(&gi_wal[b + 7u]) & GI_WAL_FL_MATURE) != 0u;
       if (atomicLoad(&gi_wal[b + 2u]) != mask) {
         let keep = min(n, GI_WAL_RESET_N);
         sum = (sum / n) * keep;
@@ -88,7 +103,9 @@ fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
   atomicStore(&gi_wal[b + 4u], bitcast<u32>(sum.y));
   atomicStore(&gi_wal[b + 5u], bitcast<u32>(sum.z));
   atomicStore(&gi_wal[b + 6u], bitcast<u32>(n));
-  atomicStore(&gi_wal[b + 7u], (stamp << 1u) | select(0u, 1u, mature || n >= GI_WAL_MATURE_N));
+  atomicStore(&gi_wal[b + 7u],
+              (frame << GI_WAL_FL_SHIFT) | GI_WAL_FL_MERGED
+              | select(0u, GI_WAL_FL_MATURE, mature || n >= GI_WAL_MATURE_N));
   atomicStore(&gi_wal[b + 2u], mask);
   atomicStore(&gi_wal[b + 1u], k1);
   atomicStore(&gi_wal[b], k0);
@@ -112,10 +129,10 @@ fn gi_wal_touch(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32) {
   let frame = gi_u.seq.x;
   let b = gi_wal_slot(v_world, (k1 >> 16u) & 7u, obj, nmask) * GI_WAL_WORDS;
   let fl = atomicLoad(&gi_wal[b + 7u]);
-  let stamp = fl >> 1u;
+  let stamp = fl >> GI_WAL_FL_SHIFT;
   if (stamp == frame) { return; }
   if (atomicLoad(&gi_wal[b]) == k0 && atomicLoad(&gi_wal[b + 1u]) == k1) {
-    atomicStore(&gi_wal[b + 7u], (frame << 1u) | (fl & 1u));
+    atomicStore(&gi_wal[b + 7u], (frame << GI_WAL_FL_SHIFT) | (fl & GI_WAL_FL_MATURE));
     if (GI_WAL_DIAG == 1u) { atomicAdd(&lod_diag[124u], 1u); }
     return;
   }
@@ -132,7 +149,7 @@ fn gi_wal_touch(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32) {
   atomicStore(&gi_wal[b + 4u], 0u);
   atomicStore(&gi_wal[b + 5u], 0u);
   atomicStore(&gi_wal[b + 6u], 0u);
-  atomicStore(&gi_wal[b + 7u], frame << 1u);
+  atomicStore(&gi_wal[b + 7u], frame << GI_WAL_FL_SHIFT);
 }
 
 fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {

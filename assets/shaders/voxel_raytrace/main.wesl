@@ -1,11 +1,11 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, face_slot_sum_gi, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
 import package::gi::screen::{gi_ss_main};
-import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
+import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_FL_SHIFT, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
 import package::brickmap::{sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
@@ -272,11 +272,10 @@ fn voxel_screen_uv(p_voxel: vec3<f32>, fallback: vec2<f32>) -> vec2<f32> {
 }
 
 fn gi_vox_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> vec4<f32> {
-  var ok = false;
   let k0 = gi_key0(voxel, obj_id);
   let k1 = gi_vox_k1(gi_key1(voxel, face_id, obj_id));
-  let s = face_slot_find(k0, k1, &ok);
-  if (!ok) {
+  let acc = face_slot_sum_gi(k0, k1);
+  if (acc.w == 0u) {
     if (LOD_DIAG == 1u) {
       atomicAdd(&lod_diag[45u], 1u);
       var ok2 = false;
@@ -291,17 +290,7 @@ fn gi_vox_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> vec4<f32> {
     }
     return vec4<f32>(0.0);
   }
-  let fe = s * FACE_WORDS;
-  let n = atomicLoad(&face_slots[fe + FACE_W_GI_N]);
-  if (n == 0u) {
-    if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[46u], 1u); }
-    return vec4<f32>(0.0);
-  }
-  return vec4<f32>(
-    f32(atomicLoad(&face_slots[fe + FACE_W_GI])),
-    f32(atomicLoad(&face_slots[fe + FACE_W_GI + 1u])),
-    f32(atomicLoad(&face_slots[fe + FACE_W_GI + 2u])),
-    f32(n));
+  return vec4<f32>(f32(acc.x), f32(acc.y), f32(acc.z), f32(acc.w));
 }
 
 fn refl_hit_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32) -> vec3<f32> {
@@ -337,7 +326,7 @@ fn refl_gi_merge(h: WorldHit, seed: u32) {
     sum = sum + gi_ray_radiance(org, dir, sun_dir, sun_c, sun_bounce, epoch, b2, cseed) * GI_PI;
   }
   gi_wal_merge(h.voxel, h.obj_id, h.pal, gi_key0(h.voxel, h.obj_id),
-               gi_key1(h.voxel, h.face_id, h.obj_id), sum, REFL_GI_SAMPLES, gi_u.seq.x);
+               gi_key1(h.voxel, h.face_id, h.obj_id), sum, REFL_GI_SAMPLES);
 }
 
 struct GiInput {
@@ -533,24 +522,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       gi = gi_in.face_avg;
       cov = gi_in.face_cov;
     } else if (gi_on) {
-      var acc = gi_vox_gi(best.voxel, best.face_id, best.obj_id);
-      acc = acc * vec4<f32>(2.0, 2.0, 2.0, 2.0);
-      var t1 = vec3<i32>(1, 0, 0);
-      var t2 = vec3<i32>(0, 1, 0);
-      if (best.face_id / 2u == 0u) {
-        t1 = vec3<i32>(0, 1, 0);
-        t2 = vec3<i32>(0, 0, 1);
-      } else if (best.face_id / 2u == 1u) {
-        t1 = vec3<i32>(1, 0, 0);
-        t2 = vec3<i32>(0, 0, 1);
-      }
-      for (var i = 0u; i < 4u; i = i + 1u) {
-        let s1 = select(-1, 1, (i & 1u) == 0u);
-        let s2 = select(-1, 1, (i & 2u) == 0u);
-        let nv = best.voxel + t1 * s1 + t2 * s2;
-        if (!gi_key_ok(nv, best.obj_id)) { continue; }
-        acc = acc + gi_vox_gi(nv, best.face_id, best.obj_id);
-      }
+      let acc = gi_vox_gi(best.voxel, best.face_id, best.obj_id);
       if (acc.w > 0.0) {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[44u], 1u); }
         gi = acc.xyz / (acc.w * GI_ACC_SCALE);
@@ -1026,7 +998,7 @@ fn gi_wal_update(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k0 = atomicLoad(&gi_wal[b]);
   let k1 = atomicLoad(&gi_wal[b + 1u]);
   if ((k0 | k1) == 0u) { return; }
-  let stamp = atomicLoad(&gi_wal[b + 7u]) >> 1u;
+  let stamp = atomicLoad(&gi_wal[b + 7u]) >> GI_WAL_FL_SHIFT;
   if (frame - stamp > 1u) { return; }
   let obj = i32((k1 >> 19u) & 0x1FFFu) - 1;
   let voxel = gi_unkey_voxel(k0, k1, obj);
@@ -1057,7 +1029,7 @@ fn gi_wal_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     sum = sum + c;
   }
   if (GI_WAL_DIAG == 1u) { atomicAdd(&lod_diag[121u], 1u); }
-  gi_wal_merge(voxel, obj, pal, k0, k1, sum, GI_WAL_UPD_R, stamp);
+  gi_wal_merge(voxel, obj, pal, k0, k1, sum, GI_WAL_UPD_R);
 }
 
 @compute @workgroup_size(8, 8, 1)

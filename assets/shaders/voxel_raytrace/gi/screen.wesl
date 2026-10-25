@@ -185,14 +185,12 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   gi_den_guide_store(coord, size, true, pk0, pk1, n, prev_ok, prev_pc, hist_reset_recent);
   let px_static = prev_ok && prev_pc.x == coord.x && prev_pc.y == coord.y;
 
-  var wal_claimer = false;
   if (pk_ok) {
     var face_ok = false;
     var face_first = false;
     let kv1 = gi_vox_k1(pk1);
     let fslot = face_slot_claim(pk0, kv1, &face_first, &face_ok);
     if (face_ok && face_first) {
-      wal_claimer = true;
       let fe = fslot * FACE_WORDS;
       atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
       atomicStore(&face_slots[fe + FACE_W_PAL], h.pal);
@@ -321,8 +319,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   r = gi_res_cap(r, cand_n, m_cap_k);
   gi_res_store_cur(idx, r);
 
-  if (gi_u.params.y > 0.5 && wal_claimer && r.m > 0.5) {
-    gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m), gi_u.seq.x);
+  if (gi_u.params.y > 0.5 && pk_ok && r.m > 0.5) {
+    gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m));
   }
 
   let tb = prev_pc;

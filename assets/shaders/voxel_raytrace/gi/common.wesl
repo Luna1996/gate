@@ -136,7 +136,7 @@ const GI_ACC_CLAMP: f32 = 255.0;
 const GI_ACC_MAX_N: u32 = 1024u;
 
 const FACE_KMASK_NOFACE: u32 = 0xFFF8FFFFu;
-const FACE_SLOT_PROBE: u32 = 8u;
+const FACE_SLOT_PROBE: u32 = 32u;
 const FACE_SLOT_EMPTY: u32 = 0u;
 const FACE_SLOT_READY: u32 = 1u;
 const FACE_SLOT_INIT: u32 = 2u;
@@ -243,6 +243,27 @@ fn face_slot_find(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
     s = face_slot_next(s);
   }
   return 0u;
+}
+
+fn face_slot_sum_gi(k0: u32, k1: u32) -> vec4<u32> {
+  var table_ok = false;
+  var s = face_slot_of(k0, k1, &table_ok);
+  if (!table_ok) { return vec4<u32>(0u); }
+  var sum = vec3<u32>(0u);
+  var n = 0u;
+  for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
+    let flag = atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]);
+    if (flag == FACE_SLOT_EMPTY) { break; }
+    if (face_slot_matches(s, k0, k1)) {
+      let fe = s * FACE_WORDS;
+      sum = sum + vec3<u32>(atomicLoad(&face_slots[fe + FACE_W_GI]),
+                            atomicLoad(&face_slots[fe + FACE_W_GI + 1u]),
+                            atomicLoad(&face_slots[fe + FACE_W_GI + 2u]));
+      n = n + atomicLoad(&face_slots[fe + FACE_W_GI_N]);
+    }
+    s = face_slot_next(s);
+  }
+  return vec4<u32>(sum, n);
 }
 
 fn face_slot_count_flat() -> u32 {
