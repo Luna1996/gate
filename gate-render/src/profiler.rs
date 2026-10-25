@@ -155,10 +155,10 @@ impl PassReport {
     for r in results {
       if let Some(t) = &r.time {
         let e = self.acc.entry(r.label.clone()).or_insert((0.0, 0));
-        e.0 += (t.end - t.start) as f64;
+        e.0 += t.end - t.start;
         e.1 += 1;
-        lo = lo.min(t.start as f64);
-        hi = hi.max(t.end as f64);
+        lo = lo.min(t.start);
+        hi = hi.max(t.end);
       }
     }
     if hi > lo {
@@ -324,7 +324,6 @@ fn setup_cpu_probe(app: &mut App) {
     order.labels.push(label);
     order.labels.push(GateCpuProbe.intern());
   }
-  drop(order);
   if let Some(first) = names.first_mut() {
     *first = format!("帧间+{first}");
   }
@@ -566,7 +565,7 @@ fn report_gi_flicker(
           let mut vmax = 0.0f32;
           let mut vn = 0u32;
           let mut vmean = 0.0f32;
-          if probe.prev_vis.len() == cur_vis.len() && cur_vis.len() > 0 {
+          if probe.prev_vis.len() == cur_vis.len() && !cur_vis.is_empty() {
             for (i, v) in cur_vis.iter().enumerate() {
               let d = (v - probe.prev_vis[i]).abs();
               vsum += d;
@@ -601,7 +600,7 @@ fn report_gi_flicker(
     return;
   }
   probe.n += 1;
-  if probe.n % 3 != 0 {
+  if !probe.n.is_multiple_of(3) {
     return;
   }
 
@@ -985,21 +984,37 @@ impl ReqReadback {
   }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn report_lod_requests(
-  device: Res<RenderDevice>,
-  queue: Res<RenderQueue>,
-  gpu: Option<Res<crate::brickmap::upload::GpuBrickMap>>,
-  feed: Option<Res<LodRequestFeed>>,
-  use_feed: Option<Res<ChunkUseFeed>>,
-  mut prev: Local<Option<[u32; 2]>>,
-  mut counts: Local<Vec<u32>>,
-  mut min_levels: Local<Vec<u32>>,
-  mut touched: Local<Vec<u32>>,
-  mut rb: Local<Option<ReqReadback>>,
-  mut log_at: Local<Option<std::time::Instant>>,
-  mut diag: Local<(f64, u32)>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+struct LodReportParams<'w, 's> {
+  device: Res<'w, RenderDevice>,
+  queue: Res<'w, RenderQueue>,
+  gpu: Option<Res<'w, crate::brickmap::upload::GpuBrickMap>>,
+  feed: Option<Res<'w, LodRequestFeed>>,
+  use_feed: Option<Res<'w, ChunkUseFeed>>,
+  prev: Local<'s, Option<[u32; 2]>>,
+  counts: Local<'s, Vec<u32>>,
+  min_levels: Local<'s, Vec<u32>>,
+  touched: Local<'s, Vec<u32>>,
+  rb: Local<'s, Option<ReqReadback>>,
+  log_at: Local<'s, Option<std::time::Instant>>,
+  diag: Local<'s, (f64, u32)>,
+}
+
+fn report_lod_requests(p: LodReportParams) {
+  let LodReportParams {
+    device,
+    queue,
+    gpu,
+    feed,
+    use_feed,
+    mut prev,
+    mut counts,
+    mut min_levels,
+    mut touched,
+    mut rb,
+    mut log_at,
+    mut diag,
+  } = p;
   use crate::brickmap::consts::{LOD_REQ_WORDS, REQ_BASE, REQ_CAP, USE_BASE, USE_WORDS, VOLUMES};
   let Some(gpu) = gpu else { return };
   let bytes = (LOD_REQ_WORDS * 4) as u64;

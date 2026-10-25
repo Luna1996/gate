@@ -1073,7 +1073,6 @@ pub(crate) fn lod_state_tick(
   }
 }
 
-#[allow(clippy::type_complexity)]
 pub(crate) fn fps_overlay_tick(
   time: Res<Time>,
   visible: Res<FpsOverlayVisible>,

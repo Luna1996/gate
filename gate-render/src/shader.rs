@@ -6,21 +6,15 @@ use bevy::shader::Shader;
 use crate::paths::dda_wesl_dir;
 
 pub const DDA_SHADER_PATH: &str = "shaders/voxel_raytrace/main.wesl";
-pub const DDA_SHADER_RT_PATH: &str = "shaders/voxel_raytrace/main.wesl#ray_query";
-
-const FEATURE_RAY_QUERY: &str = "ray_query";
 
 #[derive(Resource, Clone)]
 pub struct DdaShaderHandle(pub Handle<Shader>);
 
-#[derive(Resource, Clone)]
-pub struct DdaShaderRtHandle(pub Handle<Shader>);
-
-pub fn compile_dda_wesl(ray_query: bool) -> Result<String, wesl::Error> {
-  compile_wesl_entry(dda_wesl_dir().join("main.wesl"), ray_query)
+pub fn compile_dda_wesl() -> Result<String, wesl::Error> {
+  compile_wesl_entry(dda_wesl_dir().join("main.wesl"))
 }
 
-pub fn compile_wesl_entry(entry: impl AsRef<Path>, ray_query: bool) -> Result<String, wesl::Error> {
+pub fn compile_wesl_entry(entry: impl AsRef<Path>) -> Result<String, wesl::Error> {
   let entry = entry.as_ref();
   let dir: PathBuf = entry.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
   let stem = entry.file_stem().and_then(|s| s.to_str()).unwrap_or("package");
@@ -28,15 +22,8 @@ pub fn compile_wesl_entry(entry: impl AsRef<Path>, ray_query: bool) -> Result<St
   let module_path =
     if stem == "package" { "package".to_string() } else { format!("package::{stem}") };
 
-  let mut features = wesl::pass::Features::default();
-  features.set(FEATURE_RAY_QUERY, ray_query);
-
-  let options = wesl::CompileOptions {
-    mangler: wesl::ManglerKind::None,
-    validate: !ray_query,
-    features,
-    ..Default::default()
-  };
+  let options =
+    wesl::CompileOptions { mangler: wesl::ManglerKind::None, validate: true, ..Default::default() };
   wesl::Compiler::new(options)
     .compile_module(&dir, &module_path.parse().expect("WESL 模块路径字面量合法"))
     .map(|result| result.to_string())
@@ -44,7 +31,7 @@ pub fn compile_wesl_entry(entry: impl AsRef<Path>, ray_query: bool) -> Result<St
 
 pub fn build_dda_shader(app: &mut App) {
   let t0 = std::time::Instant::now();
-  let source = match compile_dda_wesl(false) {
+  let source = match compile_dda_wesl() {
     Ok(source) => source,
     Err(e) => {
       let msg = format!("DDA WESL 编译失败（{}）:\n{e}", dda_wesl_dir().display());
@@ -52,32 +39,12 @@ pub fn build_dda_shader(app: &mut App) {
       panic!("{msg}");
     }
   };
-  let t1 = std::time::Instant::now();
-  let source_rt = crate::brickmap::consts::RT_RAY_QUERY.then(|| match compile_dda_wesl(true) {
-    Ok(source) => source,
-    Err(e) => {
-      let msg = format!("DDA WESL 编译失败（ray_query 版，{}）:\n{e}", dda_wesl_dir().display());
-      error!("{msg}");
-      panic!("{msg}");
-    }
-  });
-  let t2 = std::time::Instant::now();
-  match &source_rt {
-    Some(src) => info!(
-      target: "gate",
-      "WESL→WGSL：主 {} ms（{} KB）/ ray_query 版 {} ms（{} KB）",
-      t1.duration_since(t0).as_millis(),
-      source.len() / 1024,
-      t2.duration_since(t1).as_millis(),
-      src.len() / 1024
-    ),
-    None => info!(
-      target: "gate",
-      "WESL→WGSL：主 {} ms（{} KB）；ray_query 版已禁用（RT_RAY_QUERY=false）",
-      t1.duration_since(t0).as_millis(),
-      source.len() / 1024
-    ),
-  }
+  info!(
+    target: "gate",
+    "WESL→WGSL：{} ms（{} KB）",
+    t0.elapsed().as_millis(),
+    source.len() / 1024
+  );
 
   crate::wesl_consts::gi_consts();
   crate::wesl_consts::trace_consts();
@@ -85,13 +52,5 @@ pub fn build_dda_shader(app: &mut App) {
     .world_mut()
     .resource_mut::<Assets<Shader>>()
     .add(Shader::from_wgsl(source, DDA_SHADER_PATH));
-  let handle_rt = match source_rt {
-    Some(src) => app
-      .world_mut()
-      .resource_mut::<Assets<Shader>>()
-      .add(Shader::from_wgsl(src, DDA_SHADER_RT_PATH)),
-    None => handle.clone(),
-  };
   app.insert_resource(DdaShaderHandle(handle));
-  app.insert_resource(DdaShaderRtHandle(handle_rt));
 }

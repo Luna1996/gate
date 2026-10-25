@@ -2,13 +2,31 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "gate-app",
+      "name": "gate-app (build-fast)",
       "type": "f5anything",
       "request": "launch",
-      "command": "reset; ./target/release/gate-app.exe",
+      "command": "reset; ./target/build-fast/gate-app.exe",
       "terminalName": "gate-app",
       "showTerminal": true,
-      "preLaunchTask": "build-gate-app",
+      "preLaunchTask": "build-gate-app-fast",
+    },
+    {
+      "name": "gate-app (balance)",
+      "type": "f5anything",
+      "request": "launch",
+      "command": "reset; ./target/balance/gate-app.exe",
+      "terminalName": "gate-app",
+      "showTerminal": true,
+      "preLaunchTask": "build-gate-app-balance",
+    },
+    {
+      "name": "gate-app (run-fast)",
+      "type": "f5anything",
+      "request": "launch",
+      "command": "reset; ./target/run-fast/gate-app.exe",
+      "terminalName": "gate-app",
+      "showTerminal": true,
+      "preLaunchTask": "build-gate-app-run-fast",
     }
   ]
 }

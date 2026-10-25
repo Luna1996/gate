@@ -54,9 +54,24 @@ incremental = false
 [profile.dev.package."*"]
 opt-level = 3
 
-[profile.release]
-# fat LTO 在本机（16GB）链接 gate-app 时会 OOM（rustc STATUS_ACCESS_VIOLATION）。
-# thin 已能跨 crate 内联，且内存/耗时可控。
+# 编译优先：关闭 LTO，换取秒级增量编译。
+[profile.build-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
+# 编译 / 运行平衡：Thin LTO + 并行 codegen，接近 Fat LTO 的运行性能。
+[profile.balance]
+inherits = "release"
 lto = "thin"
+codegen-units = 4
+incremental = false
+
+# 运行优先：Fat LTO，仅用于最终打包。
+[profile.run-fast]
+inherits = "release"
+lto = "fat"
 codegen-units = 1
+incremental = false
 

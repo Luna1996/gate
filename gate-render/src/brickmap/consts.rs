@@ -8,7 +8,6 @@ pub const DDA_FOV_Y: f32 = 60.0_f32.to_radians();
 pub const CPU_TRACE_BUDGET: u32 = 65536;
 
 pub const DDA_LOD: bool = true;
-pub const RT_RAY_QUERY: bool = false;
 pub const LOD_DIAG_WORDS: usize = 144;
 pub const REQ_CAP: usize = 1024 * 1024;
 pub const REQ_FEED_MAX: usize = 16 * 1024;

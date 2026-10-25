@@ -192,23 +192,28 @@ fn normalize(v: f32, min: f32, max: f32) -> f32 {
   if (max - min).abs() < f32::EPSILON { 0.0 } else { ((v - min) / (max - min)).clamp(0.0, 1.0) }
 }
 
-#[allow(clippy::type_complexity)]
+type SliderDragQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    Entity,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static RelativeCursorPosition,
+    &'static ComputedNode,
+    &'static SliderRange,
+    &'static SliderStep,
+    &'static mut SliderValue,
+    &'static mut SliderDrag,
+    Has<UiDisabled>,
+  ),
+>;
+
 pub fn slider_drag_system(
   mut commands: Commands,
   keys: Res<ButtonInput<KeyCode>>,
   mut shift_captured: ResMut<crate::capture::UiShiftCaptured>,
-  mut q: Query<(
-    Entity,
-    &Hovered,
-    Has<Pressed>,
-    &RelativeCursorPosition,
-    &ComputedNode,
-    &SliderRange,
-    &SliderStep,
-    &mut SliderValue,
-    &mut SliderDrag,
-    Has<UiDisabled>,
-  )>,
+  mut q: SliderDragQuery,
 ) {
   let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
   let mut fine_drag = false;
@@ -249,18 +254,39 @@ pub fn slider_drag_system(
   shift_captured.set_if_neq(crate::capture::UiShiftCaptured(fine_drag));
 }
 
-#[allow(clippy::type_complexity)]
+type SliderRootQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static SliderValue,
+    &'static SliderRange,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static Children,
+    Has<UiDisabled>,
+  ),
+  With<UiSlider>,
+>;
+
+type SliderTrackQuery<'w, 's> = Query<
+  'w,
+  's,
+  &'static mut BackgroundColor,
+  (With<SliderTrack>, Without<SliderFill>, Without<SliderThumb>),
+>;
+
+type SliderFillQuery<'w, 's> = Query<
+  'w,
+  's,
+  (&'static mut Node, &'static mut BackgroundColor),
+  (With<SliderFill>, Without<SliderThumb>),
+>;
+
 pub fn slider_visual_system(
   theme: Option<Res<UiTheme>>,
-  mut q_root: Query<
-    (&SliderValue, &SliderRange, &Hovered, Has<Pressed>, &Children, Has<UiDisabled>),
-    With<UiSlider>,
-  >,
-  mut q_track: Query<
-    &mut BackgroundColor,
-    (With<SliderTrack>, Without<SliderFill>, Without<SliderThumb>),
-  >,
-  mut fills: Query<(&mut Node, &mut BackgroundColor), (With<SliderFill>, Without<SliderThumb>)>,
+  mut q_root: SliderRootQuery,
+  mut q_track: SliderTrackQuery,
+  mut fills: SliderFillQuery,
   mut thumbs: Query<(&mut Node, &mut BackgroundColor, &mut BorderColor), With<SliderThumb>>,
   q_track_children: Query<&Children, Without<UiSlider>>,
   q_slot_children: Query<&Children, With<SliderThumbSlot>>,

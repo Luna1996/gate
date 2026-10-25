@@ -2,12 +2,13 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "build-gate-app",
+      "label": "build-gate-app-fast",
       "type": "shell",
       "command": "cargo",
       "args": [
         "build",
-        "--release",
+        "--profile",
+        "build-fast",
         "-p",
         "gate-app"
       ],
@@ -26,9 +27,52 @@
         "kind": "build",
         "isDefault": true
       },
-      "problemMatcher": [
-        "$rustc"
-      ]
+    },
+    {
+      "label": "build-gate-app-balance",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build",
+        "--profile",
+        "balance",
+        "-p",
+        "gate-app"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": true
+      },
+    },
+    {
+      "label": "build-gate-app-run-fast",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build",
+        "--profile",
+        "run-fast",
+        "-p",
+        "gate-app"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": true
+      },
     },
     {
       "label": "package-gate-app",

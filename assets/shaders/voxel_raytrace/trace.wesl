@@ -1,6 +1,4 @@
 import package::bindings::{b_leaves, b_palette, grid_descs, lod_diag, lod_req, occ, view_u};
-@if(ray_query)
-import package::bindings::{tlas};
 import package::brickmap::{Grid, ts};
 import package::common::{CHUNK_INDEX_CAP, CHUNK_SIZE, DIR_LUT, FLAGS_IS_PBR, FLAGS_TRANSMISSIVE, INDEX_ENTRY_EMPTY, NODE_FIXED_WORDS, face_normal_from_index};
 
@@ -522,90 +520,6 @@ const OCC_SKIP: u32 = 1u;
 const OCC_WORDS: u32 = (64u * 64u * 64u) / 32u;
 const OCC_VOLUMES: u32 = 1024u;
 
-const RT_QUERY_BUDGET: u32 = 64u;
-const RT_TRUST_MISS: u32 = 0u;
-const RT_CULL_MASK: u32 = 0xFFu;
-const RT_FLAGS: u32 = 0u;
-
-@if(ray_query)
-fn rt_query(ro: vec3<f32>, rd: vec3<f32>, tmin: f32, tmax: f32) -> RayIntersection {
-  var q: ray_query;
-  rayQueryInitialize(&q, tlas, RayDesc(RT_FLAGS, RT_CULL_MASK, tmin, tmax, ro, rd));
-  if (rayQueryProceed(&q)) {
-    if (rayQueryGetCandidateIntersection(&q).kind != RAY_QUERY_INTERSECTION_NONE) {
-      rayQueryConfirmIntersection(&q);
-    }
-  }
-  return rayQueryGetCommittedIntersection(&q);
-}
-
-@if(ray_query)
-fn chunk_exit_t(mn: vec3<f32>, ro: vec3<f32>, inv_rd: vec3<f32>, axis_on: vec3<bool>, t_hi: f32) -> f32 {
-  var t1 = t_hi;
-  for (var a: u32 = 0u; a < 3u; a = a + 1u) {
-    if (!axis_on[a]) { continue; }
-    let ta = (mn[a] - ro[a]) * inv_rd[a];
-    let tb = (mn[a] + f32(CHUNK_SIZE) - ro[a]) * inv_rd[a];
-    t1 = min(t1, max(ta, tb));
-  }
-  return t1;
-}
-
-@if(ray_query)
-fn trace_grid_rt(ro: vec3<f32>, rd: vec3<f32>, tl0: f32, tl1: f32, depth_cap: u32,
-                 sign_v: vec3<i32>, basis: RayBasis, g: Grid,
-                 col0: vec3<f32>, col1: vec3<f32>, col2: vec3<f32>,
-                 exhausted: ptr<function, u32>) -> UnifiedHit {
-  let miss = UnifiedHit(false, 0.0, 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), g.obj_id);
-  let index_origin = g.index_origin;
-  let tree_base = g.tree_base;
-  let ad = abs(rd);
-  var entry_face: u32 = 4u;
-  if (ad.x >= max(ad.y, ad.z)) {
-    entry_face = basis.face_base.x;
-  } else if (ad.y >= ad.z) {
-    entry_face = basis.face_base.y;
-  } else {
-    entry_face = basis.face_base.z;
-  }
-  var t_lo = tl0;
-  var guard: u32 = 0u;
-  loop {
-    if (guard >= RT_QUERY_BUDGET) { *exhausted = 1u; break; }
-    guard = guard + 1u;
-    let q = rt_query(ro, rd, t_lo, tl1);
-    if (q.kind == RAY_QUERY_INTERSECTION_NONE) { break; }
-    let c8 = q.instance_custom_data;
-    let rel = vec3<i32>(
-      (i32(c8 & 0xFFu) - (index_origin.x & 0xFF)) & 0xFF,
-      (i32((c8 >> 8u) & 0xFFu) - (index_origin.y & 0xFF)) & 0xFF,
-      (i32((c8 >> 16u) & 0xFFu) - (index_origin.z & 0xFF)) & 0xFF,
-    );
-    if (any(rel < vec3<i32>(0)) || any(vec3<u32>(rel) >= g.index_dims)) { *exhausted = 1u; break; }
-    let ci = index_origin + rel;
-    let rel_u = vec3<u32>(rel);
-    let index_addr = tree_base + rel_u.x + rel_u.y * CHUNK_INDEX_CAP
-      + rel_u.z * (CHUNK_INDEX_CAP * CHUNK_INDEX_CAP);
-    let entry = ts(index_addr);
-    if (entry == 0u || entry == INDEX_ENTRY_EMPTY) { *exhausted = 1u; break; }
-    let chunk_base = tree_base + entry - 1u;
-    let chunk_min = vec3<f32>(vec3<i32>(i32(CHUNK_SIZE)) * ci);
-    let t0 = max(q.t, t_lo);
-    let t1 = chunk_exit_t(chunk_min, ro, basis.inv_rd, basis.axis_on, tl1);
-    if (t1 <= t0) {
-      t_lo = t0 + 1.0e-3;
-      if (t_lo >= tl1) { break; }
-      continue;
-    }
-    let h = trace_chunk_opaque(chunk_base, chunk_min, ro, rd, sign_v, basis,
-                               t0, t1, entry_face, depth_cap);
-    if (h.hit) { return grid_hit(h, ci, col0, col1, col2, g.obj_id); }
-    t_lo = max(t1 + max(1.0e-3, t1 * 1.0e-6), t_lo + 1.0e-3);
-    if (t_lo >= tl1) { break; }
-  }
-  return miss;
-}
-
 fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
               penetrate: bool, req: u32, mc: ptr<function, MediumRay>,
               gap: ptr<function, f32>) -> UnifiedHit {
@@ -723,13 +637,6 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
     side,
     vec3<u32>(face_x & 1u, face_y & 1u, face_z & 1u),
     dir_mask);
-  @if(ray_query)
-  if (obj_id < 0 && !penetrate) {
-    var ex: u32 = 0u;
-    let h = trace_grid_rt(ro, rd, tl0, tl1, depth_cap, sign_v, basis, g, col0, col1, col2, &ex);
-    if (h.hit) { return h; }
-    if (RT_TRUST_MISS == 1u && ex == 0u) { return miss; }
-  }
   let start = ro + rd * tl0;
   var ci = vec3<i32>(floor(start / f32(CHUNK_SIZE)));
   let bnd_c = (vec3<f32>(ci) + side) * f32(CHUNK_SIZE);

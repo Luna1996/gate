@@ -75,9 +75,6 @@ struct MaterialAsset {
 
 @group(1) @binding(10) var<storage, read_write> lod_req: array<atomic<u32>>;
 
-@if(ray_query)
-@group(1) @binding(11) var tlas: acceleration_structure;
-
 @group(1) @binding(12) var<storage, read> occ: array<u32>;
 
 @group(1) @binding(13) var<storage, read> b_struct_p1: array<u32>;

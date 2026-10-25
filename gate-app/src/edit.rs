@@ -789,24 +789,43 @@ fn brush_displaced(
   (source.is_some(), reason)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn voxel_edit_input(
-  mouse: Res<ButtonInput<MouseButton>>,
-  time: Res<Time>,
-  captured: Res<gate_ui::UiPointerCaptured>,
-  intercepted: Res<gate_ui::MouseIntercepted>,
-  windows: Query<&Window>,
-  cfg: Res<DdaCameraConfig>,
-  mode: Res<CameraMode>,
-  lock: Res<MouseLock>,
-  settings: Res<EditSettings>,
-  pbr_set: Option<Res<PbrTextureSet>>,
-  mut displace_cache: ResMut<MaterialDisplaceCache>,
-  scene: Option<ResMut<VoxelScene>>,
-  mut active: Local<Option<ActiveStroke>>,
-  mut hold: Local<HoldRepeat>,
-  mut rng: Local<Rng>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct VoxelEditParams<'w, 's> {
+  mouse: Res<'w, ButtonInput<MouseButton>>,
+  time: Res<'w, Time>,
+  captured: Res<'w, gate_ui::UiPointerCaptured>,
+  intercepted: Res<'w, gate_ui::MouseIntercepted>,
+  windows: Query<'w, 's, &'static Window>,
+  cfg: Res<'w, DdaCameraConfig>,
+  mode: Res<'w, CameraMode>,
+  lock: Res<'w, MouseLock>,
+  settings: Res<'w, EditSettings>,
+  pbr_set: Option<Res<'w, PbrTextureSet>>,
+  displace_cache: ResMut<'w, MaterialDisplaceCache>,
+  scene: Option<ResMut<'w, VoxelScene>>,
+  active: Local<'s, Option<ActiveStroke>>,
+  hold: Local<'s, HoldRepeat>,
+  rng: Local<'s, Rng>,
+}
+
+pub(crate) fn voxel_edit_input(p: VoxelEditParams) {
+  let VoxelEditParams {
+    mouse,
+    time,
+    captured,
+    intercepted,
+    windows,
+    cfg,
+    mode,
+    lock,
+    settings,
+    pbr_set,
+    mut displace_cache,
+    scene,
+    mut active,
+    mut hold,
+    mut rng,
+  } = p;
   let Some(mut scene) = scene else { return };
   if *mode != CameraMode::Fly
     || scene.demo_force_full_rebuild

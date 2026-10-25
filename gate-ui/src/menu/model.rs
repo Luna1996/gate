@@ -472,25 +472,24 @@ pub fn buttons(id: &str, label: &str, items: &[&str]) -> MenuNode {
   }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn slider(
-  id: &str,
-  label: &str,
-  value: f32,
-  min: f32,
-  max: f32,
-  step: f32,
-  decimals: u32,
-  tooltip: Option<&str>,
-) -> MenuNode {
+#[derive(Clone, Copy, Debug)]
+pub struct SliderSpec {
+  pub value: f32,
+  pub min: f32,
+  pub max: f32,
+  pub step: f32,
+  pub decimals: u32,
+}
+
+pub fn slider(id: &str, label: &str, spec: SliderSpec, tooltip: Option<&str>) -> MenuNode {
   MenuNode::Slider {
     id: id.into(),
     label: label.into(),
-    value,
-    min,
-    max,
-    step,
-    decimals,
+    value: spec.value,
+    min: spec.min,
+    max: spec.max,
+    step: spec.step,
+    decimals: spec.decimals,
     tooltip: tooltip.map(|s| s.to_string()),
     disabled: false,
   }

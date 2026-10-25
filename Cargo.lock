@@ -2601,7 +2601,6 @@ name = "gate-render"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "gate-physics",
  "gate-voxel",
  "glam",
  "naga",
@@ -2609,7 +2608,6 @@ dependencies = [
  "ron",
  "serde",
  "wesl 0.5.0",
- "wgpu",
  "wgpu-profiler",
 ]
 

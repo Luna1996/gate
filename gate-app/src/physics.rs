@@ -168,7 +168,7 @@ pub(crate) fn step_physics(
   st.last_mix = (stats.corner_contacts, stats.edge_contacts, stats.lateral_contacts);
   st.last_profile = stats.profile;
   *dbg_n += 1;
-  if st.cfg.profile && *dbg_n % 30 == 0 {
+  if st.cfg.profile && (*dbg_n).is_multiple_of(30) {
     let p = st.last_profile;
     info!(
       target: "gate",

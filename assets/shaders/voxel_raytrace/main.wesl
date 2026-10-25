@@ -11,9 +11,6 @@ import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
-@if(ray_query)
-enable wgpu_ray_query;
-
 @compute @workgroup_size(8, 8, 1)
 fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let beam_size = textureDimensions(beam_depth);

@@ -351,7 +351,14 @@ impl PhysicsWorld {
     let pair_ms = t.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
     let mut stats = pool.install(|| {
       if k == 1 {
-        let mut s = step_inner(bodies, statics, cache, pcache, grids, &pairs, &pairs, &[], dt, cfg);
+        let mut s = step_inner(
+          bodies,
+          statics,
+          cache,
+          pcache,
+          grids,
+          StepPlan { build_pairs: &pairs, sleep_pairs: &pairs, reused: &[], dt, cfg },
+        );
         s.pairs = pairs.len();
         s.subdiv = 1;
         return s;
@@ -371,11 +378,13 @@ impl PhysicsWorld {
           cache,
           pcache,
           grids,
-          &fresh,
-          &pairs,
-          &stale_cons,
-          dt / k as f32,
-          cfg,
+          StepPlan {
+            build_pairs: &fresh,
+            sleep_pairs: &pairs,
+            reused: &stale_cons,
+            dt: dt / k as f32,
+            cfg,
+          },
         );
         merge_stats(&mut stats, &s);
       }
@@ -456,19 +465,23 @@ fn merge_stats(acc: &mut StepStats, s: &StepStats) {
   a.sleep_ms += b.sleep_ms;
 }
 
-#[allow(clippy::too_many_arguments)]
+struct StepPlan<'a> {
+  build_pairs: &'a [(usize, usize)],
+  sleep_pairs: &'a [(usize, usize)],
+  reused: &'a [ContactConstraint],
+  dt: f32,
+  cfg: &'a StepConfig,
+}
+
 fn step_inner(
   bodies: &mut BodySet,
   statics: &StaticField,
   cache: &mut HashMap<u64, [f32; 3]>,
   pcache: &mut PairCache,
   grids: &Volumes,
-  build_pairs: &[(usize, usize)],
-  sleep_pairs: &[(usize, usize)],
-  reused: &[ContactConstraint],
-  dt: f32,
-  cfg: &StepConfig,
+  plan: StepPlan,
 ) -> StepStats {
+  let StepPlan { build_pairs, sleep_pairs, reused, dt, cfg } = plan;
   let mut stats = StepStats::default();
   let substeps = cfg.substeps.max(1);
   let h = dt / substeps as f32;
@@ -581,8 +594,7 @@ impl<'a> BodyWriter<'a> {
     Self { bodies: UnsafeCell::new(bodies) }
   }
 
-  #[allow(clippy::mut_from_ref)]
-  unsafe fn get(&self) -> &mut BodySet {
+  unsafe fn get(&self) -> *mut BodySet {
     unsafe { *self.bodies.get() }
   }
 }
@@ -596,10 +608,13 @@ fn for_each_color(
   let writer = BodyWriter::new(bodies);
   for &(lo, hi) in ranges {
     cons[lo..hi].par_iter_mut().with_thread_pool(micropool::split_by_threads()).for_each(|c| {
-      f(c, unsafe { writer.get() });
+      f(c, unsafe { &mut *writer.get() });
     });
   }
 }
+
+type PairRange = (u32, u32, usize, usize);
+type PairPart = (Vec<ContactConstraint>, Vec<PairRange>);
 
 fn build(
   pcache: &mut PairCache,
@@ -625,7 +640,7 @@ fn build(
   if misses.is_empty() {
     return cons;
   }
-  let parts: Vec<(Vec<ContactConstraint>, Vec<(u32, u32, usize, usize)>)> =
+  let parts: Vec<PairPart> =
     misses.as_slice().par_iter().with_thread_pool(micropool::split_per(64)).fold_per_thread(
       || (Vec::new(), Vec::new()),
       |(mut acc, mut ranges), &(ia, ib)| {
@@ -773,7 +788,7 @@ fn build_world_pair_into(
 
 thread_local! {
   static SCRATCH: std::cell::RefCell<(Vec<Contact>, Vec<Contact>)> =
-    std::cell::RefCell::new((Vec::new(), Vec::new()));
+    const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 #[derive(Clone, Copy)]

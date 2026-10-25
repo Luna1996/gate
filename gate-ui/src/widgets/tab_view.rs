@@ -167,17 +167,45 @@ pub fn tab_view(ctx: &UiCtx, parent: &mut ChildSpawner, config: TabConfig) -> Ta
   TabViewHandle { entity: root, contents: content_entities }
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn tab_view_system(
-  mut commands: Commands,
-  mut q_views: Query<(Entity, &mut TabView, &Children)>,
-  mut q_tab: Query<(&TabButton, &Hovered, Has<Pressed>, &mut UiInteractPrev, Has<UiDisabled>)>,
-  mut q_tab_node: Query<(&mut BackgroundColor, &mut BorderColor, &Children, Has<UiDisabled>)>,
-  mut q_tab_text: Query<&mut TextColor>,
-  q_children: Query<&Children>,
-  mut q_content: Query<(&TabContent, &mut Visibility, &mut Node)>,
-  theme: Option<Res<UiTheme>>,
-) {
+type TabButtonQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static TabButton,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static mut UiInteractPrev,
+    Has<UiDisabled>,
+  ),
+>;
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct TabViewParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  q_views: Query<'w, 's, (Entity, &'static mut TabView, &'static Children)>,
+  q_tab: TabButtonQuery<'w, 's>,
+  q_tab_node: Query<
+    'w,
+    's,
+    (&'static mut BackgroundColor, &'static mut BorderColor, &'static Children, Has<UiDisabled>),
+  >,
+  q_tab_text: Query<'w, 's, &'static mut TextColor>,
+  q_children: Query<'w, 's, &'static Children>,
+  q_content: Query<'w, 's, (&'static TabContent, &'static mut Visibility, &'static mut Node)>,
+  theme: Option<Res<'w, UiTheme>>,
+}
+
+pub fn tab_view_system(p: TabViewParams) {
+  let TabViewParams {
+    mut commands,
+    mut q_views,
+    mut q_tab,
+    mut q_tab_node,
+    mut q_tab_text,
+    q_children,
+    mut q_content,
+    theme,
+  } = p;
   let Some(theme) = theme else {
     return;
   };

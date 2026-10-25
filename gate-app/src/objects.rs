@@ -109,22 +109,39 @@ fn delete_pointed(scene: &mut VoxelScene, phys: &mut PhysicsState, origin: Vec3,
   }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn object_input(
-  mouse: Res<ButtonInput<MouseButton>>,
-  time: Res<Time>,
-  captured: Res<gate_ui::UiPointerCaptured>,
-  intercepted: Res<gate_ui::MouseIntercepted>,
-  windows: Query<&Window>,
-  cfg: Res<DdaCameraConfig>,
-  mode: Res<CameraMode>,
-  lock: Res<MouseLock>,
-  settings: Res<EditSettings>,
-  scene: Option<ResMut<VoxelScene>>,
-  phys: Option<ResMut<PhysicsState>>,
-  mut hold: Local<HoldRepeat>,
-  mut rng: Local<Rng>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct ObjectInputParams<'w, 's> {
+  mouse: Res<'w, ButtonInput<MouseButton>>,
+  time: Res<'w, Time>,
+  captured: Res<'w, gate_ui::UiPointerCaptured>,
+  intercepted: Res<'w, gate_ui::MouseIntercepted>,
+  windows: Query<'w, 's, &'static Window>,
+  cfg: Res<'w, DdaCameraConfig>,
+  mode: Res<'w, CameraMode>,
+  lock: Res<'w, MouseLock>,
+  settings: Res<'w, EditSettings>,
+  scene: Option<ResMut<'w, VoxelScene>>,
+  phys: Option<ResMut<'w, PhysicsState>>,
+  hold: Local<'s, HoldRepeat>,
+  rng: Local<'s, Rng>,
+}
+
+pub(crate) fn object_input(p: ObjectInputParams) {
+  let ObjectInputParams {
+    mouse,
+    time,
+    captured,
+    intercepted,
+    windows,
+    cfg,
+    mode,
+    lock,
+    settings,
+    scene,
+    phys,
+    mut hold,
+    mut rng,
+  } = p;
   let (Some(mut scene), Some(mut phys)) = (scene, phys) else { return };
   if *mode != CameraMode::Fly
     || settings.target != EditTarget::Object
@@ -150,19 +167,33 @@ pub(crate) fn object_input(
   fire(&mut scene, &mut phys, origin, dir, burst(&settings, &mut rng));
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn pile_fire(
-  mut started: Local<bool>,
-  mut fired: Local<usize>,
-  mut aiming: Local<i32>,
-  mut rng: Local<Rng>,
-  cam: Res<DdaCameraConfig>,
-  settings: Res<EditSettings>,
-  mut fly: ResMut<FlyCamera>,
-  mut orbit: ResMut<OrbitCamera>,
-  scene: Option<ResMut<VoxelScene>>,
-  phys: Option<ResMut<PhysicsState>>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PileFireParams<'w, 's> {
+  started: Local<'s, bool>,
+  fired: Local<'s, usize>,
+  aiming: Local<'s, i32>,
+  rng: Local<'s, Rng>,
+  cam: Res<'w, DdaCameraConfig>,
+  settings: Res<'w, EditSettings>,
+  fly: ResMut<'w, FlyCamera>,
+  orbit: ResMut<'w, OrbitCamera>,
+  scene: Option<ResMut<'w, VoxelScene>>,
+  phys: Option<ResMut<'w, PhysicsState>>,
+}
+
+pub(crate) fn pile_fire(p: PileFireParams) {
+  let PileFireParams {
+    mut started,
+    mut fired,
+    mut aiming,
+    mut rng,
+    cam,
+    settings,
+    mut fly,
+    mut orbit,
+    scene,
+    phys,
+  } = p;
   if !crate::consts::phys_pile() {
     return;
   }

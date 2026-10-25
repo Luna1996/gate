@@ -38,25 +38,44 @@ pub struct TooltipHoverState {
   pin: Option<(Entity, Vec2)>,
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub fn tooltip_system(
-  mut commands: Commands,
-  theme: Option<Res<UiTheme>>,
-  windows: Query<&Window, With<PrimaryWindow>>,
-  mut layer_res: ResMut<TooltipLayerEntity>,
-  time: Res<Time>,
-  mut state: Local<TooltipHoverState>,
-  mut layer_q: Query<(&mut Node, Option<&ComputedNode>), With<TooltipLayer>>,
-  view_q: Query<(Entity, &MarkdownView), With<TooltipText>>,
-  owners: Query<(
+type TooltipOwnerQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
     Entity,
-    &Tooltip,
-    Option<&Hovered>,
-    &ComputedNode,
-    &UiGlobalTransform,
-    Option<&InheritedVisibility>,
-  )>,
-) {
+    &'static Tooltip,
+    Option<&'static Hovered>,
+    &'static ComputedNode,
+    &'static UiGlobalTransform,
+    Option<&'static InheritedVisibility>,
+  ),
+>;
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct TooltipParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  theme: Option<Res<'w, UiTheme>>,
+  windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+  layer_res: ResMut<'w, TooltipLayerEntity>,
+  time: Res<'w, Time>,
+  state: Local<'s, TooltipHoverState>,
+  layer_q: Query<'w, 's, (&'static mut Node, Option<&'static ComputedNode>), With<TooltipLayer>>,
+  view_q: Query<'w, 's, (Entity, &'static MarkdownView), With<TooltipText>>,
+  owners: TooltipOwnerQuery<'w, 's>,
+}
+
+pub fn tooltip_system(p: TooltipParams) {
+  let TooltipParams {
+    mut commands,
+    theme,
+    windows,
+    mut layer_res,
+    time,
+    mut state,
+    mut layer_q,
+    view_q,
+    owners,
+  } = p;
   let Some(theme) = theme else { return };
   let Ok(window) = windows.single() else { return };
   let physical = window.physical_cursor_position();

@@ -170,21 +170,26 @@ fn input_colors(theme: &UiTheme, editing: bool, inter: UiInteract) -> (Color, Co
   (bg, border, color_of(&c.text_primary))
 }
 
-#[allow(clippy::type_complexity)]
+type TextInputPointerQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    Entity,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static TextInputKind,
+    &'static mut TextInputValue,
+    &'static mut TextInputState,
+    Has<UiDisabled>,
+  ),
+>;
+
 pub fn text_input_pointer_system(
   mut commands: Commands,
   mouse: Res<ButtonInput<MouseButton>>,
   motion: Res<AccumulatedMouseMotion>,
   mut focus: ResMut<TextInputFocus>,
-  mut q: Query<(
-    Entity,
-    &Hovered,
-    Has<Pressed>,
-    &TextInputKind,
-    &mut TextInputValue,
-    &mut TextInputState,
-    Has<UiDisabled>,
-  )>,
+  mut q: TextInputPointerQuery,
 ) {
   let pressed = mouse.just_pressed(MouseButton::Left);
   let held = mouse.pressed(MouseButton::Left);
@@ -321,20 +326,25 @@ pub fn text_input_keyboard_system(
   }
 }
 
-#[allow(clippy::type_complexity)]
+type TextInputVisualQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static TextInputValue,
+    &'static TextInputState,
+    &'static TextInputKind,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static mut BackgroundColor,
+    &'static mut BorderColor,
+    &'static Children,
+    Has<UiDisabled>,
+  ),
+>;
+
 pub fn text_input_visual_system(
   theme: Option<Res<UiTheme>>,
-  mut q: Query<(
-    &TextInputValue,
-    &TextInputState,
-    &TextInputKind,
-    &Hovered,
-    Has<Pressed>,
-    &mut BackgroundColor,
-    &mut BorderColor,
-    &Children,
-    Has<UiDisabled>,
-  )>,
+  mut q: TextInputVisualQuery,
   mut q_text: Query<(&mut Text, &mut TextColor)>,
 ) {
   let Some(theme) = theme else { return };

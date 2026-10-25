@@ -212,18 +212,31 @@ impl ChunkSource for InfiniteCubes {
   }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn stream_chunks(
-  mut stream: ResMut<Streaming>,
-  mut scene: ResMut<gate_render::VoxelScene>,
-  cam: Option<Res<gate_render::DdaCameraConfig>>,
-  pbr: Option<Res<gate_render::PbrTextureSet>>,
-  feed: Option<Res<gate_render::LodRequestFeed>>,
-  use_feed: Option<Res<gate_render::ChunkUseFeed>>,
-  mut frames: Local<u32>,
-  mut diag: Local<(f64, u32)>,
-  mut split: Local<Option<gate_render::profiler::SplitDiag>>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct StreamChunksParams<'w, 's> {
+  stream: ResMut<'w, Streaming>,
+  scene: ResMut<'w, gate_render::VoxelScene>,
+  cam: Option<Res<'w, gate_render::DdaCameraConfig>>,
+  pbr: Option<Res<'w, gate_render::PbrTextureSet>>,
+  feed: Option<Res<'w, gate_render::LodRequestFeed>>,
+  use_feed: Option<Res<'w, gate_render::ChunkUseFeed>>,
+  frames: Local<'s, u32>,
+  diag: Local<'s, (f64, u32)>,
+  split: Local<'s, Option<gate_render::profiler::SplitDiag>>,
+}
+
+pub fn stream_chunks(p: StreamChunksParams) {
+  let StreamChunksParams {
+    mut stream,
+    mut scene,
+    cam,
+    pbr,
+    feed,
+    use_feed,
+    mut frames,
+    mut diag,
+    mut split,
+  } = p;
   let _t = gate_render::profiler::SysTimer::new("STREAM 流式装载", &mut diag);
   let sd = split.get_or_insert_with(|| {
     gate_render::profiler::SplitDiag::new(&[

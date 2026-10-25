@@ -313,19 +313,33 @@ fn extract_fog_settings(
   commands.insert_resource(settings.map_or_else(FogSettings::default, |s| **s));
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prepare_fog(
-  mut commands: bevy::ecs::system::Commands,
-  device: bevy::ecs::system::Res<bevy::render::renderer::RenderDevice>,
-  queue: bevy::ecs::system::Res<bevy::render::renderer::RenderQueue>,
-  pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
-  settings: bevy::ecs::system::Res<FogSettings>,
-  view: Option<bevy::ecs::system::Res<crate::brickmap::dda::DdaViewUniform>>,
-  scale: Option<bevy::ecs::system::Res<crate::brickmap::dda::RenderScale>>,
-  lighting: Option<bevy::ecs::system::Res<crate::lighting::LightingTheme>>,
-  gi_gpu: Option<bevy::ecs::system::Res<crate::gi::GiGpu>>,
-  mut gpu: bevy::ecs::system::ResMut<FogGpu>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+struct PrepareFogParams<'w, 's> {
+  commands: bevy::ecs::system::Commands<'w, 's>,
+  device: bevy::ecs::system::Res<'w, bevy::render::renderer::RenderDevice>,
+  queue: bevy::ecs::system::Res<'w, bevy::render::renderer::RenderQueue>,
+  pipeline_cache: bevy::ecs::system::Res<'w, bevy::render::render_resource::PipelineCache>,
+  settings: bevy::ecs::system::Res<'w, FogSettings>,
+  view: Option<bevy::ecs::system::Res<'w, crate::brickmap::dda::DdaViewUniform>>,
+  scale: Option<bevy::ecs::system::Res<'w, crate::brickmap::dda::RenderScale>>,
+  lighting: Option<bevy::ecs::system::Res<'w, crate::lighting::LightingTheme>>,
+  gi_gpu: Option<bevy::ecs::system::Res<'w, crate::gi::GiGpu>>,
+  gpu: bevy::ecs::system::ResMut<'w, FogGpu>,
+}
+
+fn prepare_fog(p: PrepareFogParams) {
+  let PrepareFogParams {
+    mut commands,
+    device,
+    queue,
+    pipeline_cache,
+    settings,
+    view,
+    scale,
+    lighting,
+    gi_gpu,
+    mut gpu,
+  } = p;
   use bevy::render::render_resource::*;
   let sun = lighting
     .as_ref()
@@ -487,23 +501,19 @@ pub(crate) struct FogRes<'w> {
   pub read_bg: Option<bevy::ecs::system::Res<'w, FogReadBg>>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_fog(
   profiler: &mut crate::profiler::GpuProfilerRes,
   encoder: &mut bevy::render::render_resource::CommandEncoder,
   gpu: Option<&FogGpu>,
   settings: Option<&FogSettings>,
   pipeline_cache: &bevy::render::render_resource::PipelineCache,
-  bg0: Option<&bevy::render::render_resource::BindGroup>,
-  bg1: Option<&bevy::render::render_resource::BindGroup>,
-  bg2: Option<&bevy::render::render_resource::BindGroup>,
-  bg3: Option<&bevy::render::render_resource::BindGroup>,
+  bgs: [Option<&bevy::render::render_resource::BindGroup>; 4],
 ) {
   let (Some(gpu), Some(s)) = (gpu, settings) else { return };
   if !s.enabled || s.strength() <= 0.0 {
     return;
   }
-  let (Some(bg0), Some(bg1), Some(bg2), Some(bg3)) = (bg0, bg1, bg2, bg3) else {
+  let [Some(bg0), Some(bg1), Some(bg2), Some(bg3)] = bgs else {
     return;
   };
   let Some(mask_bg) = gpu.mask_bg.as_ref() else {

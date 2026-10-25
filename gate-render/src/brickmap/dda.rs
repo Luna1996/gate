@@ -475,17 +475,14 @@ impl Plugin for BrickMapDdaPlugin {
     app.init_resource::<crate::lighting::ReflectionSettings>();
     app.init_resource::<crate::lighting::BaseSettings>();
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
-    let dda_shader_rt = app.world().resource::<crate::shader::DdaShaderRtHandle>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app.insert_resource(dda_shader);
-    render_app.insert_resource(dda_shader_rt);
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
       .add_systems(RenderStartup, init_dda_pipelines)
       .add_systems(Render, sync_eye_adapt_settings.in_set(RenderSystems::PrepareResources))
-      .add_systems(Render, prepare_rt_scene.in_set(RenderSystems::PrepareResources))
       .add_systems(
         Render,
         prepare_dda_bind_groups
@@ -495,15 +492,7 @@ impl Plugin for BrickMapDdaPlugin {
       )
       .add_systems(
         RenderGraph,
-        frame_bracket_head
-          .in_set(bevy::render::renderer::RenderGraphSystems::Render)
-          .before(sync_rt_scene),
-      )
-      .add_systems(
-        RenderGraph,
-        sync_rt_scene
-          .in_set(bevy::render::renderer::RenderGraphSystems::Render)
-          .before(dispatch_dda),
+        frame_bracket_head.in_set(bevy::render::renderer::RenderGraphSystems::Render),
       )
       .add_systems(
         RenderGraph,
@@ -534,13 +523,8 @@ pub(crate) fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
   dda_shader: Res<crate::shader::DdaShaderHandle>,
-  dda_shader_rt: Res<crate::shader::DdaShaderRtHandle>,
   pipeline_cache: Res<PipelineCache>,
-  render_device: Res<RenderDevice>,
 ) {
-  let rt = super::rt::rt_enabled(&render_device);
-  commands.insert_resource(super::rt::RtScene::new(rt, &render_device));
-
   let bg0 = BindGroupLayoutDescriptor::new(
     "DdaBg0",
     &BindGroupLayoutEntries::sequential(
@@ -697,14 +681,6 @@ pub(crate) fn init_dda_pipelines(
     count: None,
   });
 
-  if rt {
-    bg1_entries.push(BindGroupLayoutEntry {
-      binding: 11,
-      visibility: ShaderStages::COMPUTE,
-      ty: BindingType::AccelerationStructure { vertex_return: false },
-      count: None,
-    });
-  }
   let bg1 = BindGroupLayoutDescriptor::new("DdaBg1", &bg1_entries);
 
   let bg2 = BindGroupLayoutDescriptor::new(
@@ -841,7 +817,7 @@ pub(crate) fn init_dda_pipelines(
     ),
   );
 
-  let dda_shader = if rt { dda_shader_rt.0.clone() } else { dda_shader.0.clone() };
+  let dda_shader = dda_shader.0.clone();
   let layouts =
     vec![bg0.clone(), bg1.clone(), bg2.clone(), bg3.clone(), crate::gi::gi_bg4_layout()];
 
@@ -1020,29 +996,47 @@ pub(crate) struct DdaTune<'w> {
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
 
   pub base: Option<Res<'w, crate::lighting::BaseSettings>>,
-
-  pub rt: Option<Res<'w, super::rt::RtScene>>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_dda_bind_groups(
-  mut commands: Commands,
-  pipelines: Res<DdaPipelines>,
-  gpu_images: Res<RenderAssets<GpuImage>>,
-  mut eye: ResMut<EyeAdaptGpu>,
-  images: Option<Res<DdaImages>>,
-  view_uniform: Option<Res<DdaViewUniform>>,
-  gpu_brickmap: Option<Res<GpuBrickMap>>,
-  pbr_set: Option<Res<crate::pbr_texture::PbrTextureSet>>,
-  lighting: Option<Res<LightingTheme>>,
-  light_gpu: Option<ResMut<LightPoolGpu>>,
-  render_device: Res<RenderDevice>,
-  pipeline_cache: Res<PipelineCache>,
-  queue: Res<RenderQueue>,
-  scale: Res<RenderScale>,
-  tune: DdaTune,
-  mut beam_cache: ResMut<AuxTexCache>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PrepareDdaBindGroupsParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  pipelines: Res<'w, DdaPipelines>,
+  gpu_images: Res<'w, RenderAssets<GpuImage>>,
+  eye: ResMut<'w, EyeAdaptGpu>,
+  images: Option<Res<'w, DdaImages>>,
+  view_uniform: Option<Res<'w, DdaViewUniform>>,
+  gpu_brickmap: Option<Res<'w, GpuBrickMap>>,
+  pbr_set: Option<Res<'w, crate::pbr_texture::PbrTextureSet>>,
+  lighting: Option<Res<'w, LightingTheme>>,
+  light_gpu: Option<ResMut<'w, LightPoolGpu>>,
+  render_device: Res<'w, RenderDevice>,
+  pipeline_cache: Res<'w, PipelineCache>,
+  queue: Res<'w, RenderQueue>,
+  scale: Res<'w, RenderScale>,
+  tune: DdaTune<'w>,
+  beam_cache: ResMut<'w, AuxTexCache>,
+}
+
+pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
+  let PrepareDdaBindGroupsParams {
+    mut commands,
+    pipelines,
+    gpu_images,
+    mut eye,
+    images,
+    view_uniform,
+    gpu_brickmap,
+    pbr_set,
+    lighting,
+    light_gpu,
+    render_device,
+    pipeline_cache,
+    queue,
+    scale,
+    tune,
+    mut beam_cache,
+  } = p;
   let Some(images) = images else {
     bevy::log::info_once!("DDA prepare: no DdaImages");
     return;
@@ -1271,11 +1265,11 @@ pub(crate) fn prepare_dda_bind_groups(
     None,
     &bg0_layout,
     &BindGroupEntries::sequential((
-      &*beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
+      beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
       &u,
       &beam_view,
       eye_buf.as_entire_binding(),
-      &*beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
+      beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
     )),
   );
 
@@ -1325,7 +1319,7 @@ pub(crate) fn prepare_dda_bind_groups(
       &u,
       &beam_view,
       eye_buf.as_entire_binding(),
-      &*beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
+      beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
     )),
   );
   beam_cache.refl_compose_bg0 = Some(compose_bg0);
@@ -1508,12 +1502,6 @@ pub(crate) fn prepare_dda_bind_groups(
 
     entries.push(BindGroupEntry { binding: 13, resource: gpu.struct_buf_p1.as_entire_binding() });
 
-    if let Some(rt) = tune.rt.as_deref().filter(|r| r.is_enabled()) {
-      entries.push(BindGroupEntry {
-        binding: 11,
-        resource: BindingResource::AccelerationStructure(rt.tlas()),
-      });
-    }
     render_device.create_bind_group(None, &bg1_layout, &entries)
   };
 
@@ -1565,138 +1553,6 @@ pub(crate) fn prepare_dda_bind_groups(
   commands.insert_resource(DdaBlitBindGroup(blit_bg));
 }
 
-const RT_INSERT_PER_FRAME: u32 = 1024;
-
-#[derive(Default)]
-struct RtSyncCursor {
-  ready: bool,
-
-  cursor: usize,
-  seq: u64,
-  epoch: u64,
-
-  stat: u32,
-}
-
-fn prepare_rt_scene(
-  mut rt: ResMut<super::rt::RtScene>,
-  mirror: Res<super::upload::BuilderMirror>,
-  device: Res<RenderDevice>,
-  queue: Res<RenderQueue>,
-  mut cur: Local<RtSyncCursor>,
-) {
-  if !rt.is_enabled() {
-    return;
-  }
-  rt.tick();
-  let Some(builder) = mirror.builder.as_ref() else { return };
-  let len = builder.resident_log_len(0);
-  let seq = builder.resident_seq(0);
-  let epoch = builder.resident_epoch(0);
-
-  let consistent = cur.ready
-    && cur.epoch == epoch
-    && cur.cursor <= len
-    && (len as u64).wrapping_sub(cur.cursor as u64) == seq.wrapping_sub(cur.seq);
-  let mut budget = RT_INSERT_PER_FRAME;
-
-  let mut still: Vec<gate_voxel::ChunkCoord> = Vec::new();
-  for c in std::mem::take(&mut rt.deferred) {
-    if budget == 0 {
-      still.push(c);
-      continue;
-    }
-    match builder.aabbs_of(0, c) {
-      Some(a) if !a.is_empty() && !rt.contains(c) => {
-        rt.insert_chunk(&device, &queue, c, a);
-        budget -= 1;
-      }
-
-      _ => {}
-    }
-  }
-  rt.deferred = still;
-
-  if consistent {
-    for ev in builder.resident_log_from(0, cur.cursor) {
-      if !ev.mounted {
-        rt.remove_chunk(ev.c);
-        continue;
-      }
-      if budget == 0 {
-        rt.deferred.push(ev.c);
-        continue;
-      }
-      if let Some(a) = builder.aabbs_of(0, ev.c)
-        && !a.is_empty()
-        && !rt.contains(ev.c)
-      {
-        rt.insert_chunk(&device, &queue, ev.c, a);
-        budget -= 1;
-      }
-    }
-  } else {
-    let resident: std::collections::HashSet<gate_voxel::ChunkCoord> =
-      builder.resident_chunks(0).into_iter().collect();
-    for c in rt.chunks().collect::<Vec<_>>() {
-      if !resident.contains(&c) {
-        rt.remove_chunk(c);
-      }
-    }
-    for &c in &resident {
-      if budget == 0 {
-        rt.deferred.push(c);
-        continue;
-      }
-      if let Some(a) = builder.aabbs_of(0, c)
-        && !a.is_empty()
-        && !rt.contains(c)
-      {
-        rt.insert_chunk(&device, &queue, c, a);
-        budget -= 1;
-      }
-    }
-  }
-  cur.cursor = len;
-  cur.seq = seq;
-  cur.epoch = epoch;
-  cur.ready = true;
-
-  if rt.slots_exhausted() {
-    bevy::log::warn_once!(
-      "RT: TLAS 实例槽用尽（{} 个）⇒ 之后挂载的块没有加速结构",
-      super::rt::RT_MAX_INSTANCES
-    );
-  }
-  cur.stat = cur.stat.wrapping_add(1);
-  if cur.stat.is_multiple_of(RT_STAT_FRAMES) {
-    bevy::log::info!(
-      target: "gate",
-      "RT: 实例 {}（常驻 {} 块）/ 欠账 {}",
-      rt.instance_count(),
-      builder.resident_chunks(0).len(),
-      rt.deferred.len(),
-    );
-
-    if !rt.deferred.is_empty() {
-      bevy::log::warn!(
-        target: "gate",
-        "RT[!] 本帧 {} 块没有加速结构 ⇒ 这些块在 RT 段上不可见；应恒为 0，非零要查挂载速率",
-        rt.deferred.len()
-      );
-    }
-  }
-}
-
-const RT_STAT_FRAMES: u32 = 240;
-
-fn sync_rt_scene(mut ctx: RenderContext, mut rt: ResMut<super::rt::RtScene>) {
-  if !rt.is_enabled() {
-    return;
-  }
-  rt.record(ctx.command_encoder());
-}
-
 fn frame_bracket_head(
   mut ctx: RenderContext,
   mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
@@ -1736,26 +1592,45 @@ fn warm_mark(slot: &'static std::sync::OnceLock<()>, label: &str, ready: bool) {
   }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn dispatch_dda(
-  mut ctx: RenderContext,
-  bg0: Option<Res<DdaBg0BindGroup>>,
-  bg1: Option<Res<DdaBg1BindGroup>>,
-  bg2: Option<Res<DdaBg2BindGroup>>,
-  bg3: Option<Res<DdaBg3BindGroup>>,
-  bg4: Option<Res<crate::gi::GiBg4>>,
-  bg5: Option<Res<crate::gi::GiBg5>>,
-  eye: Option<Res<EyeAdaptGpu>>,
-  gi: Option<Res<crate::gi::GiSettings>>,
-  gi_gpu: Option<Res<crate::gi::GiGpu>>,
-  fog: crate::volumetric::FogRes,
-  aux: Option<Res<AuxTexCache>>,
-  pipeline_cache: Res<PipelineCache>,
-  pipelines: Res<DdaPipelines>,
-  scale: Res<RenderScale>,
-  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct DispatchDdaParams<'w, 's> {
+  ctx: RenderContext<'w, 's>,
+  bg0: Option<Res<'w, DdaBg0BindGroup>>,
+  bg1: Option<Res<'w, DdaBg1BindGroup>>,
+  bg2: Option<Res<'w, DdaBg2BindGroup>>,
+  bg3: Option<Res<'w, DdaBg3BindGroup>>,
+  bg4: Option<Res<'w, crate::gi::GiBg4>>,
+  bg5: Option<Res<'w, crate::gi::GiBg5>>,
+  eye: Option<Res<'w, EyeAdaptGpu>>,
+  gi: Option<Res<'w, crate::gi::GiSettings>>,
+  gi_gpu: Option<Res<'w, crate::gi::GiGpu>>,
+  fog: crate::volumetric::FogRes<'w>,
+  aux: Option<Res<'w, AuxTexCache>>,
+  pipeline_cache: Res<'w, PipelineCache>,
+  pipelines: Res<'w, DdaPipelines>,
+  scale: Res<'w, RenderScale>,
+  profiler: ResMut<'w, crate::profiler::GpuProfilerRes>,
+}
+
+pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
+  let DispatchDdaParams {
+    mut ctx,
+    bg0,
+    bg1,
+    bg2,
+    bg3,
+    bg4,
+    bg5,
+    eye,
+    gi,
+    gi_gpu,
+    fog,
+    aux,
+    pipeline_cache,
+    pipelines,
+    scale,
+    mut profiler,
+  } = p;
   WARM_T0.get_or_init(std::time::Instant::now);
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
     (bg0.as_ref(), bg1.as_ref(), bg2.as_ref(), bg3.as_ref(), bg4.as_ref())
@@ -1840,10 +1715,7 @@ pub(crate) fn dispatch_dda(
     fog.gpu.as_deref(),
     fog.settings.as_deref(),
     &pipeline_cache,
-    aux.as_ref().and_then(|a| a.gi_bg0()),
-    Some(&bg1.0),
-    Some(&bg2.0),
-    Some(&bg3.0),
+    [aux.as_ref().and_then(|a| a.gi_bg0()), Some(&bg1.0), Some(&bg2.0), Some(&bg3.0)],
   );
 
   let (main_pipe, main_label) = if let Some(p) = dda_pipe {
@@ -2156,7 +2028,6 @@ pub(crate) fn dispatch_dda(
 }
 
 #[cfg_attr(not(feature = "profile"), allow(unused_variables, unused_mut))]
-#[allow(clippy::too_many_arguments)]
 fn blit_dda_view(
   mut ctx: RenderContext,
   views: Query<&ViewTarget>,

@@ -118,13 +118,29 @@ pub fn probe_pairs(a: &Probe, b: &Probe, cand: &mut Vec<Contact>) {
   if let Some((lo, hi)) = bounds_in(&a.field, a.local, b) {
     let dir_a = buried_axis(lo, hi, a.local.0, a.local.1);
     let prune = CoarsePrune::new(ab, b, a.field.transform().scale);
-    probe_list(a, b, false, a.vox.corners(), false, dir_a, lo, hi, &ab, &ba, &prune, cand);
-    probe_list(a, b, false, a.vox.edges(), true, dir_a, lo, hi, &ab, &ba, &prune, cand);
+    let ctx = ProbeCtx {
+      swapped: false,
+      edges_only: false,
+      body_dir: dir_a,
+      ab: &ab,
+      ba: &ba,
+      prune: &prune,
+    };
+    probe_list(a, b, &ctx, a.vox.corners(), lo, hi, cand);
+    probe_list(a, b, &ProbeCtx { edges_only: true, ..ctx }, a.vox.edges(), lo, hi, cand);
   }
   if let Some((lo, hi)) = bounds_in(&b.field, b.local, a) {
     let dir_b = buried_axis(lo, hi, b.local.0, b.local.1);
     let prune = CoarsePrune::new(ba, a, b.field.transform().scale);
-    probe_list(a, b, true, b.vox.corners(), false, dir_b, lo, hi, &ab, &ba, &prune, cand);
+    let ctx = ProbeCtx {
+      swapped: true,
+      edges_only: false,
+      body_dir: dir_b,
+      ab: &ab,
+      ba: &ba,
+      prune: &prune,
+    };
+    probe_list(a, b, &ctx, b.vox.corners(), lo, hi, cand);
   }
 }
 
@@ -179,19 +195,23 @@ impl CoarsePrune {
   }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct ProbeCtx<'a> {
+  swapped: bool,
+  edges_only: bool,
+  body_dir: Vec3,
+  ab: &'a LocalMap,
+  ba: &'a LocalMap,
+  prune: &'a CoarsePrune,
+}
+
 fn probe_list(
   a: &Probe,
   b: &Probe,
-  swapped: bool,
+  ctx: &ProbeCtx,
   list: &[IVec3],
-  edges_only: bool,
-  body_dir: Vec3,
   lo: IVec3,
   hi: IVec3,
-  ab: &LocalMap,
-  ba: &LocalMap,
-  prune: &CoarsePrune,
   cand: &mut Vec<Contact>,
 ) {
   let mask = IVec3::splat(!(COARSE_EXTENT - 1));
@@ -201,13 +221,13 @@ fn probe_list(
     let keep = match cur {
       Some((c, k)) if c == cell => k,
       _ => {
-        let k = prune.keep(cell);
+        let k = ctx.prune.keep(cell);
         cur = Some((cell, k));
         k
       }
     };
     if keep {
-      probe_pair(a, b, swapped, p, edges_only, body_dir, ab, ba, cand);
+      probe_pair(a, b, ctx, p, cand);
     }
   }
 }
@@ -250,17 +270,8 @@ fn align_normals(cand: &mut [Contact]) {
   }
 }
 
-fn probe_pair(
-  a: &Probe,
-  b: &Probe,
-  swapped: bool,
-  p: IVec3,
-  edges_only: bool,
-  body_dir: Vec3,
-  ab: &LocalMap,
-  ba: &LocalMap,
-  out: &mut Vec<Contact>,
-) {
+fn probe_pair(a: &Probe, b: &Probe, ctx: &ProbeCtx, p: IVec3, out: &mut Vec<Contact>) {
+  let ProbeCtx { swapped, edges_only, body_dir, ab, ba, .. } = *ctx;
   let (probe, other) = if swapped { (b, a) } else { (a, b) };
   let (map_q, map_cb) = if swapped { (ba, ab) } else { (ab, ba) };
   let unit = probe.field.transform().scale;

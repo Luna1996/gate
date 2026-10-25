@@ -196,23 +196,20 @@ impl GridDesc {
     coverage_r: 0.0,
   };
 
-  #[allow(clippy::too_many_arguments)]
   pub fn from_transform(
-    pos: Vec3,
-    rot: Mat3,
-    scale: f32,
+    tr: gate_voxel::VolumeTransform,
     tree_base: u32,
     palette_base: u32,
     chunk_count: u32,
     origin: IVec3,
     dims: IVec3,
   ) -> Self {
-    let (mn, mx) = transform_aabb(pos, rot, scale);
+    let (mn, mx) = transform_aabb(tr.pos, tr.rot, tr.scale);
     Self {
-      pos_scale: pos.extend(scale),
-      rot0: rot.x_axis.extend(0.0),
-      rot1: rot.y_axis.extend(0.0),
-      rot2: rot.z_axis.extend(0.0),
+      pos_scale: tr.pos.extend(tr.scale),
+      rot0: tr.rot.x_axis.extend(0.0),
+      rot1: tr.rot.y_axis.extend(0.0),
+      rot2: tr.rot.z_axis.extend(0.0),
       aabb_min: mn.extend(0.0),
       aabb_max: mx.extend(0.0),
       tree_base,

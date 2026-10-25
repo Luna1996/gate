@@ -414,17 +414,22 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
   });
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(bevy::ecs::system::SystemParam)]
+struct ExtractParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  mirror: ResMut<'w, BuilderMirror>,
+  resid: ResMut<'w, ResidencyState>,
+  diag: Local<'s, (f64, u32)>,
+  split: Local<'s, Option<crate::profiler::SplitDiag>>,
+}
+
 fn extract(
-  mut commands: Commands,
   scene: Option<Extract<Res<VoxelScene>>>,
   budget: Option<Extract<Res<UploadBudget>>>,
   main_pending: Option<Extract<Res<MainPending>>>,
-  mut mirror: ResMut<BuilderMirror>,
-  mut resid: ResMut<ResidencyState>,
-  mut diag: Local<(f64, u32)>,
-  mut split: Local<Option<crate::profiler::SplitDiag>>,
+  p: ExtractParams,
 ) {
+  let ExtractParams { mut commands, mut mirror, mut resid, mut diag, mut split } = p;
   let _t = crate::profiler::SysTimer::new("EXTRACT 快照", &mut diag);
   let sd = split.get_or_insert_with(|| {
     crate::profiler::SplitDiag::new(&[
@@ -784,18 +789,31 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
   }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare(
-  mut commands: Commands,
-  snapshot: Option<ResMut<UploadSnapshot>>,
-  pbr_set: Option<Res<PbrTextureSet>>,
-  mut gpu: ResMut<GpuBrickMap>,
-  device: Res<RenderDevice>,
-  queue: Res<RenderQueue>,
-  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
-  sample_channel: Option<Res<UploadCpuSampleChannel>>,
-  mut revision: ResMut<BrickMapRevision>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PrepareParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  snapshot: Option<ResMut<'w, UploadSnapshot>>,
+  pbr_set: Option<Res<'w, PbrTextureSet>>,
+  gpu: ResMut<'w, GpuBrickMap>,
+  device: Res<'w, RenderDevice>,
+  queue: Res<'w, RenderQueue>,
+  profiler: ResMut<'w, crate::profiler::GpuProfilerRes>,
+  sample_channel: Option<Res<'w, UploadCpuSampleChannel>>,
+  revision: ResMut<'w, BrickMapRevision>,
+}
+
+pub(crate) fn prepare(p: PrepareParams) {
+  let PrepareParams {
+    mut commands,
+    snapshot,
+    pbr_set,
+    mut gpu,
+    device,
+    queue,
+    mut profiler,
+    sample_channel,
+    mut revision,
+  } = p;
   upload_material_assets(&queue, pbr_set.as_deref(), &mut gpu);
   let Some(snap) = snapshot else { return };
   let t0 = std::time::Instant::now();
@@ -812,27 +830,6 @@ pub(crate) fn prepare(
     if limits.force_multi() {
       warn!(target: "gate",
         "GPU storage binding < 1GB ⇒ 退化到全量上传（单 tile 170MB 跨帧）"
-      );
-    }
-  }
-
-  static RT_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-  if !RT_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-    use bevy::render::render_resource::WgpuFeatures;
-    let f = device.features();
-    let rt = f.contains(WgpuFeatures::EXPERIMENTAL_RAY_QUERY);
-    let l = device.limits();
-    info!(target: "gate",
-      "PROBE: ray query = {} → {}；BLAS 图元上限 {} / 几何数 {}、TLAS 实例上限 {}",
-      if rt { "有" } else { "无" },
-      if rt { "硬件光追路径可用（软件 DDA 仍是回退与对照）" } else { "只有软件 DDA 路径" },
-      l.max_blas_primitive_count,
-      l.max_blas_geometry_count,
-      l.max_tlas_instance_count,
-    );
-    if rt && l.max_tlas_instance_count == 0 {
-      warn!(target: "gate",
-        "ray query 已开但 TLAS 实例上限为 0 ⇒ BLAS/TLAS 不可用（驱动未给 RT 限额）"
       );
     }
   }
@@ -1367,24 +1364,43 @@ fn ledger_note(
   }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(bevy::ecs::system::SystemParam)]
+struct PlanResidencyParams<'w, 's> {
+  mirror: ResMut<'w, BuilderMirror>,
+  state: ResMut<'w, ResidencyState>,
+  device: Res<'w, RenderDevice>,
+  pending: Local<'s, Vec<gate_voxel::ChunkCoord>>,
+  gap_last: Local<'s, usize>,
+  ledger_seq: Local<'s, u64>,
+  ledger_ready: Local<'s, bool>,
+  ledger_epoch: Local<'s, u64>,
+  ledger_cursor: Local<'s, usize>,
+  far_seq: Local<'s, Vec<u64>>,
+  empty_cursor: Local<'s, Vec<usize>>,
+  diag: Local<'s, (f64, u32)>,
+  split: Local<'s, Option<crate::profiler::SplitDiag>>,
+}
+
 fn plan_residency(
   scene: Option<Extract<Res<VoxelScene>>>,
   cam: Option<Extract<Res<crate::brickmap::dda::DdaCameraConfig>>>,
-  mut mirror: ResMut<BuilderMirror>,
-  mut state: ResMut<ResidencyState>,
-  device: Res<RenderDevice>,
-  mut pending: Local<Vec<gate_voxel::ChunkCoord>>,
-  mut gap_last: Local<usize>,
-  mut ledger_seq: Local<u64>,
-  mut ledger_ready: Local<bool>,
-  mut ledger_epoch: Local<u64>,
-  mut ledger_cursor: Local<usize>,
-  mut far_seq: Local<Vec<u64>>,
-  mut empty_cursor: Local<Vec<usize>>,
-  mut diag: Local<(f64, u32)>,
-  mut split: Local<Option<crate::profiler::SplitDiag>>,
+  p: PlanResidencyParams,
 ) {
+  let PlanResidencyParams {
+    mut mirror,
+    mut state,
+    device,
+    mut pending,
+    mut gap_last,
+    mut ledger_seq,
+    mut ledger_ready,
+    mut ledger_epoch,
+    mut ledger_cursor,
+    mut far_seq,
+    mut empty_cursor,
+    mut diag,
+    mut split,
+  } = p;
   let _t = crate::profiler::SysTimer::new("RESID 常驻调度", &mut diag);
   let sd = split.get_or_insert_with(|| {
     crate::profiler::SplitDiag::new(&[

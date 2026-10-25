@@ -191,38 +191,75 @@ fn close_popup(
   open.0 = false;
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub fn color_picker_system(
-  mut commands: Commands,
-  windows: Query<&Window, With<PrimaryWindow>>,
-  theme: Option<Res<UiTheme>>,
-  font: Option<Res<ThemeFont>>,
-  mut q_swatches: Query<
-    (
-      Entity,
-      &MenuColorSwatch,
-      &Hovered,
-      Has<Pressed>,
-      &mut UiInteractPrev,
-      &mut ColorPickerOpen,
-      &ComputedNode,
-      &UiGlobalTransform,
-      Option<&InheritedVisibility>,
-      Has<UiDisabled>,
-    ),
-    (Without<ColorPickerCell>, Without<ColorPickerBackdrop>, Without<ColorPickerPopup>),
-  >,
-  mut q_cells: Query<
-    (&Hovered, Has<Pressed>, &mut UiInteractPrev, &ColorPickerCell),
-    (Without<MenuColorSwatch>, Without<ColorPickerBackdrop>, Without<ColorPickerPopup>),
-  >,
-  mut q_backdrops: Query<
-    (&Hovered, Has<Pressed>, &mut UiInteractPrev, &ColorPickerBackdrop),
-    (Without<MenuColorSwatch>, Without<ColorPickerCell>, Without<ColorPickerPopup>),
-  >,
-  q_popups: Query<(Entity, &ColorPickerPopup)>,
-  mut q_inputs: Query<(&MenuItem, &mut TextInputValue)>,
-) {
+type ColorSwatchQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    Entity,
+    &'static MenuColorSwatch,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static mut UiInteractPrev,
+    &'static mut ColorPickerOpen,
+    &'static ComputedNode,
+    &'static UiGlobalTransform,
+    Option<&'static InheritedVisibility>,
+    Has<UiDisabled>,
+  ),
+  (Without<ColorPickerCell>, Without<ColorPickerBackdrop>, Without<ColorPickerPopup>),
+>;
+
+type ColorCellQuery<'w, 's> = Query<
+  'w,
+  's,
+  (&'static Hovered, Has<Pressed>, &'static mut UiInteractPrev, &'static ColorPickerCell),
+  (Without<MenuColorSwatch>, Without<ColorPickerBackdrop>, Without<ColorPickerPopup>),
+>;
+
+type ColorBackdropQuery<'w, 's> = Query<
+  'w,
+  's,
+  (&'static Hovered, Has<Pressed>, &'static mut UiInteractPrev, &'static ColorPickerBackdrop),
+  (Without<MenuColorSwatch>, Without<ColorPickerCell>, Without<ColorPickerPopup>),
+>;
+
+type ColorAnchorQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static ComputedNode,
+    &'static UiGlobalTransform,
+    Option<&'static InheritedVisibility>,
+    &'static MenuColorSwatch,
+  ),
+  Without<ColorPickerPopup>,
+>;
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ColorPickerParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+  theme: Option<Res<'w, UiTheme>>,
+  font: Option<Res<'w, ThemeFont>>,
+  q_swatches: ColorSwatchQuery<'w, 's>,
+  q_cells: ColorCellQuery<'w, 's>,
+  q_backdrops: ColorBackdropQuery<'w, 's>,
+  q_popups: Query<'w, 's, (Entity, &'static ColorPickerPopup)>,
+  q_inputs: Query<'w, 's, (&'static MenuItem, &'static mut TextInputValue)>,
+}
+
+pub fn color_picker_system(p: ColorPickerParams) {
+  let ColorPickerParams {
+    mut commands,
+    windows,
+    theme,
+    font,
+    mut q_swatches,
+    mut q_cells,
+    mut q_backdrops,
+    q_popups,
+    mut q_inputs,
+  } = p;
   let win_size = windows.single().ok().map(|w| Vec2::new(w.width(), w.height()));
   let sf = windows.single().ok().map(|w| w.scale_factor()).unwrap_or(1.0);
 
@@ -288,14 +325,10 @@ pub fn color_picker_system(
   }
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn color_picker_visual_system(
   theme: Option<Res<UiTheme>>,
   windows: Query<&Window, With<PrimaryWindow>>,
-  q_anchors: Query<
-    (&ComputedNode, &UiGlobalTransform, Option<&InheritedVisibility>, &MenuColorSwatch),
-    Without<ColorPickerPopup>,
-  >,
+  q_anchors: ColorAnchorQuery,
   q_menu: Query<&DebugMenu>,
   mut q_popups: Query<(&ColorPickerPopup, &mut Node)>,
   mut q_cells: Query<(&ColorPickerCell, &Hovered, Has<Pressed>, &mut BorderColor)>,

@@ -116,9 +116,13 @@ fn trace_volume(
       let s = CHUNK_SIZE as f32;
       let chunk_min = [ci[0] as f32 * s, ci[1] as f32 * s, ci[2] as f32 * s];
       let t1 = t_exit_c.min(tl1);
-      if let Some((t, pal, face_id, v)) =
-        trace_chunk(tree, chunk_min, ro_a, rd_a, sign, t_enter_c, t1, entry_face)
-      {
+      if let Some((t, pal, face_id, v)) = trace_chunk(
+        tree,
+        ChunkRay { min: chunk_min, ro: ro_a, rd: rd_a, sign },
+        t_enter_c,
+        t1,
+        entry_face,
+      ) {
         let voxel = IVec3::new(v[0], v[1], v[2]) + IVec3::new(ci[0], ci[1], ci[2]) * CHUNK_SIZE;
         let f = face_normal_from_index(face_id);
         let normal = if is_world { f } else { (tr.rot * f).normalize_or_zero() };
@@ -148,17 +152,22 @@ fn trace_volume(
   None
 }
 
-#[allow(clippy::too_many_arguments)]
-fn trace_chunk(
-  tree: &ChunkTree,
-  chunk_min: [f32; 3],
+#[derive(Clone, Copy)]
+struct ChunkRay {
+  min: [f32; 3],
   ro: [f32; 3],
   rd: [f32; 3],
   sign: [i32; 3],
+}
+
+fn trace_chunk(
+  tree: &ChunkTree,
+  ray: ChunkRay,
   t0: f32,
   t1: f32,
   entry_face: u8,
 ) -> Option<(f32, u16, u8, [i32; 3])> {
+  let ChunkRay { min: chunk_min, ro, rd, sign } = ray;
   if t0 >= t1 {
     return None;
   }

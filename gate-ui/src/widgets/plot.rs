@@ -100,8 +100,9 @@ fn sample_xy(i: usize, n: usize, v: f32, domain: (f32, f32), w: u32, h: u32) -> 
   (x, y)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_line(buf: &mut [u8], w: u32, h: u32, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 4]) {
+fn draw_line(buf: &mut [u8], w: u32, h: u32, a: (i64, i64), b: (i64, i64), c: [u8; 4]) {
+  let (x0, y0) = a;
+  let (x1, y1) = b;
   let dx = (x1 - x0).abs();
   let sx = if x0 < x1 { 1 } else { -1 };
   let dy = -(y1 - y0).abs();
@@ -150,7 +151,7 @@ pub fn rasterize(
   put_px(buf, w, h, px0, py0, line);
   for (i, pair) in samples.windows(2).enumerate() {
     let (x1, y1) = sample_xy(i + 1, n, pair[1], domain, w, h);
-    draw_line(buf, w, h, px0, py0, x1, y1, line);
+    draw_line(buf, w, h, (px0, py0), (x1, y1), line);
     px0 = x1;
     py0 = y1;
   }

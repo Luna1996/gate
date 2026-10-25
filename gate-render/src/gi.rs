@@ -733,21 +733,37 @@ fn extract_gi_settings(
   }));
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prepare_gi(
-  mut commands: bevy::ecs::system::Commands,
-  device: bevy::ecs::system::Res<bevy::render::renderer::RenderDevice>,
-  queue: bevy::ecs::system::Res<bevy::render::renderer::RenderQueue>,
-  pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
-  settings: bevy::ecs::system::Res<GiSettings>,
-  view: Option<bevy::ecs::system::Res<crate::brickmap::dda::DdaViewUniform>>,
-  lighting: Option<bevy::ecs::system::Res<crate::lighting::LightingTheme>>,
-  aux: Option<bevy::ecs::system::Res<crate::brickmap::dda::AuxTexCache>>,
-  dirty: Option<bevy::ecs::system::Res<crate::brickmap::upload::BrickMapDirty>>,
-  brickmap: Option<bevy::ecs::system::Res<crate::brickmap::upload::GpuBrickMap>>,
-  mut gi_ph: bevy::ecs::system::ResMut<GiPlaceholder>,
-  mut gpu: bevy::ecs::system::ResMut<GiGpu>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+struct PrepareGiParams<'w, 's> {
+  commands: bevy::ecs::system::Commands<'w, 's>,
+  device: bevy::ecs::system::Res<'w, bevy::render::renderer::RenderDevice>,
+  queue: bevy::ecs::system::Res<'w, bevy::render::renderer::RenderQueue>,
+  pipeline_cache: bevy::ecs::system::Res<'w, bevy::render::render_resource::PipelineCache>,
+  settings: bevy::ecs::system::Res<'w, GiSettings>,
+  view: Option<bevy::ecs::system::Res<'w, crate::brickmap::dda::DdaViewUniform>>,
+  lighting: Option<bevy::ecs::system::Res<'w, crate::lighting::LightingTheme>>,
+  aux: Option<bevy::ecs::system::Res<'w, crate::brickmap::dda::AuxTexCache>>,
+  dirty: Option<bevy::ecs::system::Res<'w, crate::brickmap::upload::BrickMapDirty>>,
+  brickmap: Option<bevy::ecs::system::Res<'w, crate::brickmap::upload::GpuBrickMap>>,
+  gi_ph: bevy::ecs::system::ResMut<'w, GiPlaceholder>,
+  gpu: bevy::ecs::system::ResMut<'w, GiGpu>,
+}
+
+fn prepare_gi(p: PrepareGiParams) {
+  let PrepareGiParams {
+    mut commands,
+    device,
+    queue,
+    pipeline_cache,
+    settings,
+    view,
+    lighting,
+    aux,
+    dirty,
+    brickmap,
+    mut gi_ph,
+    mut gpu,
+  } = p;
   gpu.frame = gpu.frame.wrapping_add(1);
 
   if dirty.as_ref().is_some_and(|d| d.full || d.palette_changed) {
@@ -926,7 +942,7 @@ fn prepare_gi(
     .cloned()
     .unwrap_or_else(|| gi_ph.res_buffer(&device).clone());
 
-  let edit_boxes = upload_edit_boxes(&device, &queue, &mut gpu, dirty.as_ref().map(|d| &**d));
+  let edit_boxes = upload_edit_boxes(&device, &queue, &mut gpu, dirty.as_deref());
   let bg5 = device.create_bind_group(
     None,
     &bg5_layout,

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 打包发布：release 构建 → 组装便携目录（exe + assets）
+# 打包发布：run-fast（Fat LTO）构建 → 组装便携目录（exe + assets）
 #
 # 产物：dist/gate-<版本>-win64/（gate-app.exe + assets/；logs/、data/ 首次启动自建）
 # 目录可放任意位置，exe 按自身目录找 assets（见 paths.rs）。不压缩，需 zip/7z 自行处理。
 # 用法：bash package.sh（Git Bash / MSYS2 / WSL / Linux）
+# 其他 profile：GATE_PROFILE=balance bash package.sh
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -12,10 +13,11 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 name="gate-${version}-win64"
 dist="dist/${name}"
 
-echo "== cargo build --release -p gate-app =="
-cargo build --release -p gate-app
+profile="${GATE_PROFILE:-run-fast}"
+echo "== cargo build --profile ${profile} -p gate-app =="
+cargo build --profile "$profile" -p gate-app
 
-bin="target/release/gate-app"
+bin="target/${profile}/gate-app"
 if [ -f "${bin}.exe" ]; then
   bin="${bin}.exe"
 fi

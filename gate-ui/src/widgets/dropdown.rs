@@ -307,41 +307,68 @@ fn close_popup(
   state.open = false;
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub fn dropdown_system(
-  mut commands: Commands,
-  mut wheel: MessageReader<MouseWheel>,
-  windows: Query<&Window, With<PrimaryWindow>>,
-  theme: Option<Res<UiTheme>>,
-  font: Option<Res<ThemeFont>>,
-  icon: Option<Res<IconFont>>,
-  i18n: Option<Res<crate::i18n::UiTranslator>>,
-  mut q_roots: Query<
-    (
-      Entity,
-      &Hovered,
-      Has<Pressed>,
-      &mut UiInteractPrev,
-      &mut DropdownState,
-      &DropdownOptions,
-      &mut DropdownValue,
-      &ComputedNode,
-      &UiGlobalTransform,
-      Option<&InheritedVisibility>,
-      Has<UiDisabled>,
-    ),
-    (With<DropdownRoot>, Without<DropdownOption>),
-  >,
-  mut q_options: Query<
-    (&Hovered, Has<Pressed>, &mut UiInteractPrev, &DropdownOption),
-    (Without<DropdownRoot>, Without<DropdownPopup>),
-  >,
-  mut q_backdrops: Query<
-    (Entity, &Hovered, Has<Pressed>, &mut UiInteractPrev, &DropdownBackdrop),
-    (Without<DropdownRoot>, Without<DropdownOption>),
-  >,
-  q_popups: Query<(Entity, &DropdownPopup)>,
-) {
+type DropdownRootQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    Entity,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static mut UiInteractPrev,
+    &'static mut DropdownState,
+    &'static DropdownOptions,
+    &'static mut DropdownValue,
+    &'static ComputedNode,
+    &'static UiGlobalTransform,
+    Option<&'static InheritedVisibility>,
+    Has<UiDisabled>,
+  ),
+  (With<DropdownRoot>, Without<DropdownOption>),
+>;
+
+type DropdownOptionHitQuery<'w, 's> = Query<
+  'w,
+  's,
+  (&'static Hovered, Has<Pressed>, &'static mut UiInteractPrev, &'static DropdownOption),
+  (Without<DropdownRoot>, Without<DropdownPopup>),
+>;
+
+type DropdownBackdropQuery<'w, 's> = Query<
+  'w,
+  's,
+  (Entity, &'static Hovered, Has<Pressed>, &'static mut UiInteractPrev, &'static DropdownBackdrop),
+  (Without<DropdownRoot>, Without<DropdownOption>),
+>;
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct DropdownParams<'w, 's> {
+  commands: Commands<'w, 's>,
+  wheel: MessageReader<'w, 's, MouseWheel>,
+  windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+  theme: Option<Res<'w, UiTheme>>,
+  font: Option<Res<'w, ThemeFont>>,
+  icon: Option<Res<'w, IconFont>>,
+  i18n: Option<Res<'w, crate::i18n::UiTranslator>>,
+  q_roots: DropdownRootQuery<'w, 's>,
+  q_options: DropdownOptionHitQuery<'w, 's>,
+  q_backdrops: DropdownBackdropQuery<'w, 's>,
+  q_popups: Query<'w, 's, (Entity, &'static DropdownPopup)>,
+}
+
+pub fn dropdown_system(p: DropdownParams) {
+  let DropdownParams {
+    mut commands,
+    mut wheel,
+    windows,
+    theme,
+    font,
+    icon,
+    i18n,
+    mut q_roots,
+    mut q_options,
+    mut q_backdrops,
+    q_popups,
+  } = p;
   let sf = windows.single().ok().map(|w| w.scale_factor()).unwrap_or(1.0);
 
   let mut lines = 0.0;
@@ -438,47 +465,80 @@ pub fn dropdown_system(
   }
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub fn dropdown_visual_system(
-  theme: Option<Res<UiTheme>>,
-  i18n: Option<Res<crate::i18n::UiTranslator>>,
-  time: Res<Time>,
-  windows: Query<&Window, With<PrimaryWindow>>,
-  mut q_roots: Query<
-    (
-      &DropdownValue,
-      &DropdownOptions,
-      &Hovered,
-      Has<Pressed>,
-      &DropdownState,
-      &Children,
-      &mut BackgroundColor,
-      &mut BorderColor,
-      Has<UiDisabled>,
-    ),
-    (With<DropdownRoot>, Without<DropdownOption>),
-  >,
-  q_anchors: Query<
-    (&ComputedNode, &UiGlobalTransform, Option<&InheritedVisibility>),
-    With<DropdownRoot>,
-  >,
-  mut q_texts: Query<(&mut Text, &mut crate::i18n::I18nKey), With<DropdownText>>,
-  q_arrow: Query<&DropdownArrow>,
-  mut q_colors: Query<&mut TextColor>,
-  mut q_popups: Query<(&mut DropdownPopup, &mut Node), Without<DropdownOption>>,
-  mut q_options: Query<
-    (
-      &DropdownOption,
-      &Hovered,
-      Has<Pressed>,
-      &mut Node,
-      &mut BackgroundColor,
-      &mut BorderColor,
-      &Children,
-    ),
-    Without<DropdownPopup>,
-  >,
-) {
+type DropdownVisualRootQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static DropdownValue,
+    &'static DropdownOptions,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static DropdownState,
+    &'static Children,
+    &'static mut BackgroundColor,
+    &'static mut BorderColor,
+    Has<UiDisabled>,
+  ),
+  (With<DropdownRoot>, Without<DropdownOption>),
+>;
+
+type DropdownAnchorQuery<'w, 's> = Query<
+  'w,
+  's,
+  (&'static ComputedNode, &'static UiGlobalTransform, Option<&'static InheritedVisibility>),
+  With<DropdownRoot>,
+>;
+
+type DropdownTextQuery<'w, 's> =
+  Query<'w, 's, (&'static mut Text, &'static mut crate::i18n::I18nKey), With<DropdownText>>;
+
+type DropdownPopupQuery<'w, 's> =
+  Query<'w, 's, (&'static mut DropdownPopup, &'static mut Node), Without<DropdownOption>>;
+
+type DropdownOptionVisualQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static DropdownOption,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static mut Node,
+    &'static mut BackgroundColor,
+    &'static mut BorderColor,
+    &'static Children,
+  ),
+  Without<DropdownPopup>,
+>;
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct DropdownVisualParams<'w, 's> {
+  theme: Option<Res<'w, UiTheme>>,
+  i18n: Option<Res<'w, crate::i18n::UiTranslator>>,
+  time: Res<'w, Time>,
+  windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+  q_roots: DropdownVisualRootQuery<'w, 's>,
+  q_anchors: DropdownAnchorQuery<'w, 's>,
+  q_texts: DropdownTextQuery<'w, 's>,
+  q_arrow: Query<'w, 's, &'static DropdownArrow>,
+  q_colors: Query<'w, 's, &'static mut TextColor>,
+  q_popups: DropdownPopupQuery<'w, 's>,
+  q_options: DropdownOptionVisualQuery<'w, 's>,
+}
+
+pub fn dropdown_visual_system(p: DropdownVisualParams) {
+  let DropdownVisualParams {
+    theme,
+    i18n,
+    time,
+    windows,
+    mut q_roots,
+    q_anchors,
+    mut q_texts,
+    q_arrow,
+    mut q_colors,
+    mut q_popups,
+    mut q_options,
+  } = p;
   let Some(theme) = theme else { return };
   let c = &theme.colors;
   let window = windows.single().ok();

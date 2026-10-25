@@ -92,13 +92,22 @@ pub fn scroll_view(
   ScrollViewHandle { entity: vp_e, content: content_e.expect("scroll content spawned") }
 }
 
-#[allow(clippy::type_complexity)]
+type ScrollViewportQuery<'w, 's> = Query<
+  'w,
+  's,
+  (
+    &'static mut ScrollView,
+    &'static Hovered,
+    Has<Pressed>,
+    &'static Children,
+    &'static ComputedNode,
+  ),
+  With<ScrollViewport>,
+>;
+
 pub fn scroll_view_system(
   mut scroll_reader: MessageReader<MouseWheel>,
-  mut q_vp: Query<
-    (&mut ScrollView, &Hovered, Has<Pressed>, &Children, &ComputedNode),
-    With<ScrollViewport>,
-  >,
+  mut q_vp: ScrollViewportQuery,
   mut q_content: Query<(&mut Node, &ComputedNode), With<ScrollContent>>,
 ) {
   let mut lines = 0.0;

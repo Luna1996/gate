@@ -124,14 +124,8 @@ pub(crate) fn camera_look_input(
   orbit.clamp();
 }
 
-#[derive(Resource, Clone, Copy, Debug)]
+#[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct MouseLock(pub bool);
-
-impl Default for MouseLock {
-  fn default() -> Self {
-    Self(false)
-  }
-}
 
 pub(crate) fn toggle_mouse_lock(
   keys: Res<ButtonInput<KeyCode>>,
@@ -176,18 +170,31 @@ pub(crate) fn free_look_input(
   orbit.clamp();
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn orbit_camera_input(
-  mouse: Res<ButtonInput<MouseButton>>,
-  keys: Res<ButtonInput<KeyCode>>,
-  motion: Res<AccumulatedMouseMotion>,
-  scroll: Res<AccumulatedMouseScroll>,
-  captured: Res<gate_ui::UiPointerCaptured>,
-  intercepted: Res<gate_ui::MouseIntercepted>,
-  windows: Query<&Window>,
-  mode: Res<CameraMode>,
-  mut orbit: ResMut<OrbitCamera>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct OrbitCameraInputParams<'w, 's> {
+  mouse: Res<'w, ButtonInput<MouseButton>>,
+  keys: Res<'w, ButtonInput<KeyCode>>,
+  motion: Res<'w, AccumulatedMouseMotion>,
+  scroll: Res<'w, AccumulatedMouseScroll>,
+  captured: Res<'w, gate_ui::UiPointerCaptured>,
+  intercepted: Res<'w, gate_ui::MouseIntercepted>,
+  windows: Query<'w, 's, &'static Window>,
+  mode: Res<'w, CameraMode>,
+  orbit: ResMut<'w, OrbitCamera>,
+}
+
+pub(crate) fn orbit_camera_input(p: OrbitCameraInputParams) {
+  let OrbitCameraInputParams {
+    mouse,
+    keys,
+    motion,
+    scroll,
+    captured,
+    intercepted,
+    windows,
+    mode,
+    mut orbit,
+  } = p;
   if *mode != CameraMode::Orbit {
     return;
   }
@@ -365,17 +372,20 @@ pub(crate) fn cursor_ray(
   ndc_ray(cfg, u, v)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn left_click_pick_recenter(
-  mouse: Res<ButtonInput<MouseButton>>,
-  captured: Res<gate_ui::UiPointerCaptured>,
-  intercepted: Res<gate_ui::MouseIntercepted>,
-  windows: Query<&Window>,
-  cfg: Res<DdaCameraConfig>,
-  mode: Res<CameraMode>,
-  scene: Option<Res<VoxelScene>>,
-  mut orbit: ResMut<OrbitCamera>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PickRecenterParams<'w, 's> {
+  mouse: Res<'w, ButtonInput<MouseButton>>,
+  captured: Res<'w, gate_ui::UiPointerCaptured>,
+  intercepted: Res<'w, gate_ui::MouseIntercepted>,
+  windows: Query<'w, 's, &'static Window>,
+  cfg: Res<'w, DdaCameraConfig>,
+  mode: Res<'w, CameraMode>,
+  scene: Option<Res<'w, VoxelScene>>,
+  orbit: ResMut<'w, OrbitCamera>,
+}
+
+pub(crate) fn left_click_pick_recenter(p: PickRecenterParams) {
+  let PickRecenterParams { mouse, captured, intercepted, windows, cfg, mode, scene, mut orbit } = p;
   if *mode != CameraMode::Orbit {
     return;
   }

@@ -16,8 +16,7 @@ serde = { workspace = true }
 ron = { workspace = true }
 wgpu-profiler = { workspace = true, optional = true }
 wesl = { workspace = true }
-wgpu = { version = "=30.0.1", default-features = false }
 
-[dev-dependencies]
+[build-dependencies]
 naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }
-gate-physics = { workspace = true }
+wesl = { workspace = true }

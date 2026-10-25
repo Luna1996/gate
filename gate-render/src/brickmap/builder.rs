@@ -52,6 +52,11 @@ const _: () = assert!(
 );
 const _: () = assert!(OCC_WORDS == 8192, "trace.wesl::OCC_WORDS 必须同值");
 
+#[inline]
+fn slab_axes(i: u32) -> (u32, u32, u32) {
+  (i & 3, (i >> 2) & 3, (i >> 4) & 3)
+}
+
 fn coord_key(c: ChunkCoord) -> (i32, i32, i32) {
   (c.0.x, c.0.y, c.0.z)
 }
@@ -143,7 +148,6 @@ struct ChunkSlot {
   cap: usize,
   free: FreeRuns,
   nodes: gate_voxel::NodeLayout,
-  aabbs: crate::brickmap::rt::ChunkAabbs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,15 +174,6 @@ fn wire_words_of(id: u32, level: u8, mask: u64) -> usize {
 #[inline]
 fn read_mask(buf: &[u32], at: usize) -> u64 {
   (buf[at + 1] as u64) << 32 | buf[at] as u64
-}
-
-#[inline]
-fn gather_aabbs(tree: &ChunkTree, c: ChunkCoord) -> crate::brickmap::rt::ChunkAabbs {
-  if crate::brickmap::consts::RT_RAY_QUERY {
-    crate::brickmap::rt::gather_chunk_aabbs(tree, (c.0 * gate_voxel::CHUNK_SIZE).as_vec3(), 1.0)
-  } else {
-    crate::brickmap::rt::ChunkAabbs::default()
-  }
 }
 
 pub struct BrickMapBuilder {
@@ -321,17 +316,16 @@ impl BrickMapBuilder {
       .collect();
     coords.sort_by_key(|&c| coord_key(c));
 
-    let blobs: Vec<(Vec<u32>, NodeLayout, crate::brickmap::rt::ChunkAabbs)> = coords
+    let blobs: Vec<(Vec<u32>, NodeLayout)> = coords
       .par_iter()
       .map(|&c| {
         let tree = grid.chunk(c).expect("chunk_has_content 已过滤");
-        let aabbs = gather_aabbs(tree, c);
         let (blob, layout) = tree.serialize_with_layout();
-        (blob, layout, aabbs)
+        (blob, layout)
       })
       .collect();
-    for (c, (blob, layout, aabbs)) in coords.iter().zip(blobs) {
-      b.install_blob(*c, &blob, layout, aabbs);
+    for (c, (blob, layout)) in coords.iter().zip(blobs) {
+      b.install_blob(*c, &blob, layout);
     }
     b.refresh_globals();
 
@@ -441,10 +435,6 @@ impl BrickMapBuilder {
 
   pub fn resident_chunk_count(&self) -> usize {
     self.chunks.len()
-  }
-
-  pub fn aabbs_of(&self, coord: ChunkCoord) -> Option<&crate::brickmap::rt::ChunkAabbs> {
-    self.chunks.get(&coord).map(|s| &s.aabbs)
   }
 
   fn note_resident_event(&mut self, c: ChunkCoord, mounted: bool) {
@@ -692,11 +682,10 @@ impl BrickMapBuilder {
     let mut layout = std::mem::take(&mut self.scratch_layout);
     tree.serialize_into(&mut blob, &mut layout);
     let nodes = layout.clone();
-    let aabbs = gather_aabbs(tree, coord);
     if emit {
-      self.install_blob(coord, &blob, nodes, aabbs);
+      self.install_blob(coord, &blob, nodes);
     } else {
-      self.install_blob_inner(coord, &blob, nodes, aabbs);
+      self.install_blob_inner(coord, &blob, nodes);
     }
     self.scratch_blob = blob;
     self.scratch_layout = layout;
@@ -715,24 +704,12 @@ impl BrickMapBuilder {
     true
   }
 
-  fn install_blob(
-    &mut self,
-    coord: ChunkCoord,
-    blob: &[u32],
-    nodes: gate_voxel::NodeLayout,
-    aabbs: crate::brickmap::rt::ChunkAabbs,
-  ) {
-    self.install_blob_inner(coord, blob, nodes, aabbs);
+  fn install_blob(&mut self, coord: ChunkCoord, blob: &[u32], nodes: gate_voxel::NodeLayout) {
+    self.install_blob_inner(coord, blob, nodes);
     self.note_resident_event(coord, true);
   }
 
-  fn install_blob_inner(
-    &mut self,
-    coord: ChunkCoord,
-    blob: &[u32],
-    nodes: gate_voxel::NodeLayout,
-    aabbs: crate::brickmap::rt::ChunkAabbs,
-  ) {
+  fn install_blob_inner(&mut self, coord: ChunkCoord, blob: &[u32], nodes: gate_voxel::NodeLayout) {
     let need = blob.len();
     let cap = need + need / 4 + ROOT_WIRE_WORDS + 16;
     let base = self.alloc_block(cap);
@@ -741,7 +718,7 @@ impl BrickMapBuilder {
     free.free(need, cap - need);
     let ip = self.window_word(coord);
     self.buffers.b_struct[ip] = base as u32 + 1;
-    self.chunks.insert(coord, ChunkSlot { base, cap, free, nodes, aabbs });
+    self.chunks.insert(coord, ChunkSlot { base, cap, free, nodes });
     self.occ_set(coord);
     self.mark_struct_words(ip, 1);
     self.mark_struct_words(base, need);
@@ -948,7 +925,7 @@ fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
       if ((mask >> i) & 1 == 0) && !uniform_solid {
         continue;
       }
-      let (ix, iy, iz) = crate::brickmap::rt::slab_axes(i);
+      let (ix, iy, iz) = slab_axes(i);
       let p64 = IVec3::new(ix as i32, iy as i32, iz as i32) * N64;
       if tree.get_uniform(p64.x, p64.y, p64.z, l16 - 1).is_some() {
         any = true;
@@ -957,7 +934,7 @@ fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
         continue;
       }
       for j in 0..64u32 {
-        let (jx, jy, jz) = crate::brickmap::rt::slab_axes(j);
+        let (jx, jy, jz) = slab_axes(j);
         let p16 = p64 + IVec3::new(jx as i32, jy as i32, jz as i32) * N16;
         if matches!(tree.get_brick_state(p16.x, p16.y, p16.z, l16), BrickState::Air) {
           continue;
@@ -969,7 +946,7 @@ fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
           continue;
         }
         for k in 0..64u32 {
-          let (kx, ky, kz) = crate::brickmap::rt::slab_axes(k);
+          let (kx, ky, kz) = slab_axes(k);
           let p4 = p16 + IVec3::new(kx as i32, ky as i32, kz as i32) * N4;
           if matches!(tree.get_brick_state(p4.x, p4.y, p4.z, l4), BrickState::Air) {
             continue;
@@ -981,7 +958,7 @@ fn tight_local(grid: &VolumeGrid) -> Option<(IVec3, IVec3)> {
             continue;
           }
           for m in 0..64u32 {
-            let (mx, my, mz) = crate::brickmap::rt::slab_axes(m);
+            let (mx, my, mz) = slab_axes(m);
             let v = p4 + IVec3::new(mx as i32, my as i32, mz as i32);
             if tree.get_voxel(v.x, v.y, v.z).is_none() {
               continue;
@@ -1334,16 +1311,8 @@ impl VolumesBuilder {
       let tr = self.transforms[i];
       let origin = IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z);
       let dims = IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32);
-      let mut desc = GridDesc::from_transform(
-        tr.pos,
-        tr.rot,
-        tr.scale,
-        tree_bases[i],
-        palette_bases[i],
-        g.tile_count,
-        origin,
-        dims,
-      );
+      let mut desc =
+        GridDesc::from_transform(tr, tree_bases[i], palette_bases[i], g.tile_count, origin, dims);
       let (mn, mx) = match self.tight[i] {
         Some((lo, hi)) if i != 0 => super::wire::box_world_aabb(tr, lo.as_vec3(), hi.as_vec3()),
         _ => super::wire::window_world_aabb(tr, origin, dims),
@@ -1511,14 +1480,6 @@ impl VolumesBuilder {
     tree: &ChunkTree,
   ) -> bool {
     self.builders.get_mut(vol_idx).is_some_and(|b| b.relayout_resident_tree(coord, tree))
-  }
-
-  pub fn aabbs_of(
-    &self,
-    vol_idx: usize,
-    coord: ChunkCoord,
-  ) -> Option<&crate::brickmap::rt::ChunkAabbs> {
-    self.builders.get(vol_idx).and_then(|b| b.aabbs_of(coord))
   }
 
   pub fn resident_epoch(&self, vol_idx: usize) -> u64 {

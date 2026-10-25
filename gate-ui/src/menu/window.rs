@@ -415,24 +415,7 @@ fn ctx_from_world(world: &World) -> Option<CtxParts> {
   Some((theme, font, icon, translate))
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn menu_system(world: &mut World) {
-  let mut q_roots = world.query_filtered::<Entity, With<DebugMenu>>();
-  let Ok(root) = q_roots.single(world) else { return };
-  let Some(parts) = world.get::<MenuParts>(root).map(|p| MenuParts {
-    title_bar: p.title_bar,
-    back_btn: p.back_btn,
-    back_icon: p.back_icon,
-    path_label: p.path_label,
-    reset_btn: p.reset_btn,
-    reset_icon: p.reset_icon,
-    collapse_btn: p.collapse_btn,
-    collapse_icon: p.collapse_icon,
-    viewport: p.viewport,
-  }) else {
-    return;
-  };
-
+fn title_actions(world: &mut World, root: Entity, parts: &MenuParts) {
   let mut actions: Vec<(TitleAction, bool)> = Vec::new();
   for (e, action) in [
     (parts.back_btn, TitleAction::Back),
@@ -465,7 +448,9 @@ pub fn menu_system(world: &mut World) {
       }
     };
   }
+}
 
+fn collect_clicks(world: &mut World) -> Vec<(String, MenuRole)> {
   let mut clicks: Vec<(String, MenuRole)> = Vec::new();
   {
     let mut q = world.query::<(Entity, &MenuItem, &Hovered, Has<Pressed>)>();
@@ -480,7 +465,10 @@ pub fn menu_system(world: &mut World) {
       }
     }
   }
+  clicks
+}
 
+fn collect_value_changes(world: &mut World) -> Vec<(String, MenuRole, MenuValue)> {
   let mut value_changes: Vec<(String, MenuRole, MenuValue)> = Vec::new();
   {
     let mut q = world.query::<(
@@ -532,7 +520,15 @@ pub fn menu_system(world: &mut World) {
       }
     }
   }
+  value_changes
+}
 
+fn apply_changes(
+  world: &mut World,
+  root: Entity,
+  clicks: Vec<(String, MenuRole)>,
+  value_changes: Vec<(String, MenuRole, MenuValue)>,
+) -> bool {
   let mut menu = world.get_mut::<DebugMenu>(root).expect("DebugMenu 存在");
   let mut events: Vec<MenuActionEvent> = Vec::new();
   for (path, role) in clicks {
@@ -617,6 +613,30 @@ pub fn menu_system(world: &mut World) {
   for e in events {
     world.trigger(e);
   }
+  rebuild
+}
+
+pub fn menu_system(world: &mut World) {
+  let mut q_roots = world.query_filtered::<Entity, With<DebugMenu>>();
+  let Ok(root) = q_roots.single(world) else { return };
+  let Some(parts) = world.get::<MenuParts>(root).map(|p| MenuParts {
+    title_bar: p.title_bar,
+    back_btn: p.back_btn,
+    back_icon: p.back_icon,
+    path_label: p.path_label,
+    reset_btn: p.reset_btn,
+    reset_icon: p.reset_icon,
+    collapse_btn: p.collapse_btn,
+    collapse_icon: p.collapse_icon,
+    viewport: p.viewport,
+  }) else {
+    return;
+  };
+
+  title_actions(world, root, &parts);
+  let clicks = collect_clicks(world);
+  let value_changes = collect_value_changes(world);
+  let rebuild = apply_changes(world, root, clicks, value_changes);
 
   let (nav, cur) = {
     let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
