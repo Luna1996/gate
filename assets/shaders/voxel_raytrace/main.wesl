@@ -2,7 +2,7 @@ import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, face_slot_sum_gi, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
-import package::gi::denoise::{gi_den_atrous, gi_den_temporal, gi_same_surface};
+import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_same_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_FL_SHIFT, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
@@ -827,11 +827,28 @@ fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>,
       let s = face_slot_claim(k0, gi_vox_k1(k1), &claim_first, &ok);
       if (ok) {
         let fe = s * FACE_WORDS;
-        let guv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
-                / vec2<f32>(f32(gsize.x), f32(gsize.y));
-        let smp = textureSampleLevel(gi_tex, light_samp, guv, 0.0);
-        if (smp.a > 0.0) {
-          let q = clamp(smp.rgb / max(smp.a, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+        let gc = vec2<i32>(i32(gid.x), i32(gid.y));
+        let hi = vec2<i32>(i32(gsize.x), i32(gsize.y)) - vec2<i32>(1);
+        var acc = vec3<f32>(0.0);
+        var ws = 0.0;
+        for (var dy: i32 = -2; dy <= 2; dy = dy + 1) {
+          for (var dx: i32 = -2; dx <= 2; dx = dx + 1) {
+            let c = clamp(gc + vec2<i32>(dx, dy), vec2<i32>(0), hi);
+            let tb = (u32(c.y) * gsize.x + u32(c.x)) * GI_DEN_GUIDE_WORDS;
+            let tk0 = gi_guide_out[tb + GI_DEN_G_KEY0];
+            let tk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
+            if ((tk0 | tk1) == 0u) { continue; }
+            if (!gi_den_same_plane(tk0, tk1, k0, k1)) { continue; }
+            let smp = textureLoad(gi_tex, c, 0);
+            if (!(smp.a > 0.0)) { continue; }
+            let w = select(1.0, select(4.0, 6.0, dx == 0), abs(dx) == 1)
+                  * select(1.0, select(4.0, 6.0, dy == 0), abs(dy) == 1);
+            acc = acc + smp.rgb * w;
+            ws = ws + smp.a * w;
+          }
+        }
+        if (ws > 0.0) {
+          let q = clamp(acc / max(ws, 1e-4), vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
           val = vec3<u32>(round(q * GI_ACC_SCALE));
           slot = s;
         }
