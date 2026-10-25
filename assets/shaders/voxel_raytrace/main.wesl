@@ -145,8 +145,7 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
   refl_req[o + 1u] = vec4<u32>(pbase, face_id, 0u, px);
 }
 
-fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>,
-               refr_org: vec3<f32>, refr_v: vec3<f32>, max_t: f32,
+fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
                entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32,
                quality: u32) -> GlassOut {
   var tint = vec3<f32>(1.0);
@@ -163,21 +162,12 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>,
     return GlassOut(world_miss(), vec3<f32>(1.0), vec3<f32>(0.0), dir_voxel);
   }
 
-  var in_org = origin_voxel;
-  var in_dir = dir_voxel;
-  var in_v = entry_v;
-  if (quality >= 2u) {
-    in_org = refr_org;
-    in_dir = -refr_v;
-    in_v = refr_v;
-  }
-
   let eta_in = 1.0 / entry_ior;
-  let ci_in = clamp(dot(in_v, entry_n), 0.0, 1.0);
+  let ci_in = clamp(dot(-dir_voxel, entry_n), 0.0, 1.0);
   let k_in = 1.0 - eta_in * eta_in * (1.0 - ci_in * ci_in);
-  var dir_in = normalize(eta_in * in_dir + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
-  if (quality < 2u) { dir_in = in_dir; }
-  let inner = world_trace_glass_path(in_org + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
+  var dir_in = normalize(eta_in * dir_voxel + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * entry_n);
+  if (quality < 2u) { dir_in = dir_voxel; }
+  let inner = world_trace_glass_path(origin_voxel + dir_in * GLASS_EPS, dir_in, max_t, true, &tint);
   if (!inner.hit || medium_of(inner.palette_base, inner.pal).a >= 1.0) {
     return GlassOut(inner, tint, vec3<f32>(0.0), dir_in);
   }
@@ -438,6 +428,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var glass_w = 0.0;
   var sky_dir = ray_dir;
   var refract_hit = false;
+  var through_transmission = false;
   let glass_q = (light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
@@ -449,9 +440,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
 
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
-    let refr_org = first.point + fnn * GLASS_EPS;
-    let refr_v = normalize(origin_voxel - first.point);
-    let g = trace_glass(f_face, -fv, refr_org, refr_v, frustum_length, fnn,
+    let g = trace_glass(f_face, -fv, frustum_length, fnn,
                         material_ior(first.palette_base, first.pal), fv, qpx, glass_q);
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
     if (glass_q > 0u) {
@@ -461,6 +450,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       refl = g.refl;
       sky_dir = g.dir;
       refract_hit = glass_q >= 2u;
+      through_transmission = true;
       glass_w = clamp(1.0 - fm.transmission, 0.0, 1.0);
     } else {
       glass_w = 1.0;
@@ -501,9 +491,10 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if (gi_u.params.y > 0.5 && gi_key_ok(best.voxel, best.obj_id)) {
       gi_wal_touch(best.voxel, best.obj_id, best.pal, k0, k1);
     }
+    let n_hint_own = n_hint_ok && !through_transmission;
     var n = best.n;
     var n_reused = false;
-    if (n_hint_ok) {
+    if (n_hint_own) {
       n = n_hint;
       n_reused = true;
     } else if (u32(gi_u.flags.y) == 1u) {
@@ -715,9 +706,8 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
   let need_n = (light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) != 0u;
   var n_own = vec3<f32>(0.0);
   if (first.hit && need_n) {
-    let first_xpar = (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u;
     let fgrid = make_grid(u32(first.obj_id) + 1u);
-    n_own = select(voxel_normal_fast(fgrid, first.voxel, first.face_id, first.n), first.n, first_xpar);
+    n_own = voxel_normal_fast(fgrid, first.voxel, first.face_id, first.n);
   }
   let diag_pix = gid.x + gid.y * size.x;
   let diag_on = diag_sampled(diag_pix);
