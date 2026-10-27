@@ -1,7 +1,7 @@
 import package::bindings::{lod_diag, face_slots, gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, light_u};
-import package::gi::common::{FACE_WORDS, gi_in_edit_box, FACE_W_FLAG, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_claim, face_slot_find, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_vox_k1};
-import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_LUMA_FLOOR_REL, GI_DEN_N_DOT, GI_HIST_RESET_FRAMES, GI_HIST_RESET_SCALE, GI_HIST_SEARCH_TAPS, GI_LUMA, GI_PI, GI_SS_ADAPT_EMA, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_HI_RESET, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_CLAMP_LO_RESET, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
-import package::gi::denoise::{gi_den_guide_store, gi_den_same_plane, gi_same_surface_n};
+import package::gi::common::{FACE_WORDS, gi_in_edit_box, FACE_W_FLAG, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE, face_slot_claim, face_slot_find, gi_cos_hemisphere, gi_hist_search_offset, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pack_dir, gi_rand2, gi_ring_offset, gi_unpack_dir};
+import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_LUMA_FLOOR_REL, GI_HIST_RESET_FRAMES, GI_HIST_RESET_SCALE, GI_HIST_SEARCH_TAPS, GI_LUMA, GI_PI, GI_SS_ADAPT_EMA, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_M_CAP_K_HQ, GI_SS_M_CAP_REST_K, GI_SS_RAY_BATCH, GI_SS_REUSE_CLAMP_HI, GI_SS_REUSE_CLAMP_HI_RESET, GI_SS_REUSE_CLAMP_LO, GI_SS_REUSE_CLAMP_LO_RESET, GI_SS_REUSE_M_K, GI_SS_REUSE_M_K_STATIC, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
+import package::gi::denoise::{gi_den_guide_store, gi_same_surface};
 import package::gi::ray::{gi_ray_radiance};
 import package::gi::wal::{gi_wal_merge, gi_wal_sample};
 import package::trace::{LOD_DIAG, make_grid};
@@ -162,6 +162,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   if ((palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u) {
     n = voxel_normal_fast(gg, h.voxel, h.face_id, h.n);
   }
+  let npack = gi_pack_dir(n);
   let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
   let org = p_voxel + n * n_off;
 
@@ -188,8 +189,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   if (pk_ok) {
     var face_ok = false;
     var face_first = false;
-    let kv1 = gi_vox_k1(pk1);
-    let fslot = face_slot_claim(pk0, kv1, &face_first, &face_ok);
+    let fslot = face_slot_claim(pk0, pk1, &face_first, &face_ok);
     if (face_ok && face_first) {
       let fe = fslot * FACE_WORDS;
       atomicStore(&face_slots[fe + FACE_W_TEXEL], idx);
@@ -208,7 +208,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
       let nidx = u32(pc.y) * size.x + u32(pc.x);
       let head = gi_res_head_prev(nidx);
       if ((head.x & (GI_RES_VALID | GI_RES_PK_OK)) != (GI_RES_VALID | GI_RES_PK_OK)) { continue; }
-      if (!gi_same_surface_n(head.y, head.z, gi_unpack_dir(head.w), pk0, pk1, n)) { continue; }
+      if (!gi_same_surface(head.y, head.z, head.w, pk0, pk1, npack)) { continue; }
       hist = gi_res_load_prev(nidx);
       hist_ok = true;
       break;
@@ -252,7 +252,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   const GI_FLAT_ACC: u32 = 0u;
   if (GI_SS_CLAIM_ONLY != 0u && pk_ok && cand_n > 0u) {
     var fok2 = false;
-    let fs2 = face_slot_find(pk0, gi_vox_k1(pk1), &fok2);
+    let fs2 = face_slot_find(pk0, pk1, &fok2);
     if (fok2) {
       let fe2 = fs2 * FACE_WORDS;
       if (atomicLoad(&face_slots[fe2 + FACE_W_TEXEL]) != idx) {
@@ -319,7 +319,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   r = gi_res_cap(r, cand_n, m_cap_k);
   gi_res_store_cur(idx, r);
 
-  if (gi_u.params.y > 0.5 && pk_ok && r.m > 0.5) {
+  if (pk_ok && r.m > 0.5) {
     gi_wal_merge(h.voxel, h.obj_id, h.pal, pk0, pk1, r.w_sum, u32(r.m));
   }
 
@@ -339,8 +339,8 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
     let nidx = u32(nc.y) * size.x + u32(nc.x);
     let head = gi_tap_head(nidx);
     if ((head.x & (GI_RES_VALID | GI_RES_PK_OK)) != (GI_RES_VALID | GI_RES_PK_OK)) { continue; }
-    if (!gi_den_same_plane(head.y, head.z, pk0, pk1)) { continue; }
-    if (dot(gi_unpack_dir(gi_res_prev[nidx * GI_RES_WORDS + GI_RES_W_NRM]), n) < GI_DEN_N_DOT) {
+    if (!gi_same_surface(head.y, head.z,
+                         gi_res_prev[nidx * GI_RES_WORDS + GI_RES_W_NRM], pk0, pk1, npack)) {
       continue;
     }
     let wm = gi_tap_merge(nidx);
@@ -385,7 +385,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
 
   if (GI_FLAT_ACC != 0u && pk_ok && cov_w > 0.0) {
     var fok = false;
-    let fslot = face_slot_find(pk0, gi_vox_k1(pk1), &fok);
+    let fslot = face_slot_find(pk0, pk1, &fok);
     if (fok) {
       let fe = fslot * FACE_WORDS;
       let q = clamp(gi_w, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));

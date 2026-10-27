@@ -62,7 +62,7 @@ pub(crate) fn setup(
     let name = crate::debug_menu::world_model_name(&crate::debug_menu::load_menu(&config))
       .unwrap_or_else(|| "nuke".to_string());
     (cam_eye, cam_target) = match name.as_str() {
-      CUBE_IN_VOID => (Vec3::new(96.0, 64.0, 96.0), Vec3::ZERO),
+      CUBE_IN_VOID => (Vec3::new(-64.0, 164.0, 192.0), Vec3::new(32.0, 64.0, 48.0)),
       GLASS_TEST => glass_test_camera(),
       GLASS_SLAB => glass_slab_camera(),
       mc::MC_MAP => mc_camera(),
@@ -246,14 +246,15 @@ pub(crate) fn reload_world(
 
 fn build_cube_in_void(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
   const EDGE: i32 = 64;
-  grid
-    .palette_mut()
-    .set(PaletteId(1), PaletteEntry { color: [255, 255, 255], ..Default::default() });
-  let min = IVec3::splat(-EDGE / 2);
-  let voxels_written = fill_box(grid, min, IVec3::splat(EDGE), 1);
+  const OFFSET: i32 = EDGE / 2;
+  grid.palette_mut().set(PaletteId(1), PaletteEntry { color: [0, 255, 0], ..Default::default() });
+  let min_a = IVec3::new(0, OFFSET, 0);
+  let min_b = IVec3::new(0, 0, OFFSET);
+  let voxels_written =
+    fill_box(grid, min_a, IVec3::splat(EDGE), 1) + fill_box(grid, min_b, IVec3::splat(EDGE), 1);
   vox_scene::VoxSceneInfo {
-    aabb_min: min,
-    aabb_max: min + IVec3::splat(EDGE),
+    aabb_min: min_a,
+    aabb_max: IVec3::new(EDGE, EDGE + OFFSET, EDGE + OFFSET),
     instances_used: 1,
     voxels_written,
     voxels_dropped: 0,

@@ -1,8 +1,8 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, face_slot_sum_gi, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
-import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_same_surface};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
+import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_near_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_FL_SHIFT, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
@@ -197,6 +197,7 @@ fn gi_upsample_joint(
   n: vec3<f32>,
   fallback: vec3<f32>,
 ) -> vec4<f32> {
+  let npack = gi_pack_dir(n);
   let g = guv * vec2<f32>(f32(gsize.x), f32(gsize.y));
   let base = floor(g - vec2<f32>(0.5));
   let f = g - vec2<f32>(0.5) - base;
@@ -213,7 +214,7 @@ fn gi_upsample_joint(
       let gk0 = gi_guide_out[tb + GI_DEN_G_KEY0];
       let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
       if ((gk0 | gk1) == 0u) { continue; }
-      if (!gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)) { continue; }
+      if (!gi_near_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack)) { continue; }
       let s = textureLoad(gi_tex, c, 0);
       acc = acc + s.rgb * bw;
       acc_a = acc_a + s.a * bw;
@@ -225,8 +226,14 @@ fn gi_upsample_joint(
   let nc = clamp(base + vec2<f32>(select(0.0, 1.0, f.x >= 0.5), select(0.0, 1.0, f.y >= 0.5)),
                  vec2<f32>(0.0), vec2<f32>(f32(gsize.x) - 1.0, f32(gsize.y) - 1.0));
   let nci = vec2<i32>(nc);
-  let sn = textureLoad(gi_tex, nci, 0);
-  if (sn.a > 0.5) { return sn; }
+  let ntb = (u32(nci.y) * gsize.x + u32(nci.x)) * GI_DEN_GUIDE_WORDS;
+  let ngk0 = gi_guide_out[ntb + GI_DEN_G_KEY0];
+  let ngk1 = gi_guide_out[ntb + GI_DEN_G_KEY1];
+  if ((ngk0 | ngk1) != 0u
+      && gi_near_surface(ngk0, ngk1, gi_guide_out[ntb + GI_DEN_G_NRM], k0, k1, npack)) {
+    let sn = textureLoad(gi_tex, nci, 0);
+    if (sn.a > 0.5) { return sn; }
+  }
 
   var best_ok = false;
   var best_w = 0.0;
@@ -249,7 +256,7 @@ fn gi_upsample_joint(
         any_d2 = d2;
         any = textureLoad(gi_tex, c, 0);
       }
-      if (gi_same_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, n)) {
+      if (gi_near_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack)) {
         let w = 1.0 / (1.0 + f32(d2));
         let s = textureLoad(gi_tex, c, 0);
         best_acc = best_acc + s.rgb * w;
@@ -271,35 +278,55 @@ fn voxel_screen_uv(p_voxel: vec3<f32>, fallback: vec2<f32>) -> vec2<f32> {
   return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 }
 
-fn gi_vox_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> vec4<f32> {
-  let k0 = gi_key0(voxel, obj_id);
-  let k1 = gi_vox_k1(gi_key1(voxel, face_id, obj_id));
-  let acc = face_slot_sum_gi(k0, k1);
-  if (acc.w == 0u) {
-    if (LOD_DIAG == 1u) {
-      atomicAdd(&lod_diag[45u], 1u);
-      var ok2 = false;
-      let fe0 = face_slot_of(k0, k1, &ok2) * FACE_WORDS;
-      if (atomicLoad(&face_slots[fe0 + FACE_W_FLAG]) == 0u) {
-        atomicAdd(&lod_diag[102u], 1u);
-      } else if (atomicLoad(&face_slots[fe0 + FACE_W_K0]) == k0) {
-        atomicAdd(&lod_diag[103u], 1u);
-      } else {
-        atomicAdd(&lod_diag[104u], 1u);
-      }
-    }
-    return vec4<f32>(0.0);
-  }
+fn prev_screen_uv(p_world: vec3<f32>, fallback: vec2<f32>) -> vec2<f32> {
+  let clip = gi_u.prev_view_proj * vec4<f32>(p_world, 1.0);
+  if (clip.w <= 1e-6) { return fallback; }
+  let ndc = clip.xyz / clip.w;
+  return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+fn gi_face_gi(voxel: vec3<i32>, face: u32, obj_id: i32) -> vec4<f32> {
+  let acc = face_slot_sum_gi(gi_key0(voxel, obj_id), gi_key1(voxel, face, obj_id));
+  if (acc.w == 0u) { return vec4<f32>(0.0); }
   return vec4<f32>(f32(acc.x), f32(acc.y), f32(acc.z), f32(acc.w));
+}
+
+fn gi_face_pool(voxel: vec3<i32>, face: u32, obj_id: i32, pal: u32) -> vec4<f32> {
+  let acc = gi_face_gi(voxel, face, obj_id);
+  if (acc.w > 0.0) { return vec4<f32>(acc.xyz / (acc.w * GI_ACC_SCALE), 1.0); }
+  let a1 = (face / 2u + 1u) % 3u;
+  let a2 = (face / 2u + 2u) % 3u;
+  let t1 = vec3<i32>(select(0, 1, a1 == 0u), select(0, 1, a1 == 1u), select(0, 1, a1 == 2u));
+  let t2 = vec3<i32>(select(0, 1, a2 == 0u), select(0, 1, a2 == 1u), select(0, 1, a2 == 2u));
+  for (var d = 1u; d <= 2u; d = d + 1u) {
+    let dv = i32(d);
+    var sum = vec3<f32>(0.0);
+    var n = 0.0;
+    let nb = array<vec3<i32>, 4u>(voxel + t1 * dv, voxel - t1 * dv, voxel + t2 * dv, voxel - t2 * dv);
+    for (var k = 0u; k < 4u; k = k + 1u) {
+      let a = gi_face_gi(nb[k], face, obj_id);
+      sum = sum + a.xyz;
+      n = n + a.w;
+    }
+    if (n > 0.0) { return vec4<f32>(sum / (n * GI_ACC_SCALE), 1.0); }
+  }
+  return vec4<f32>(0.0);
+}
+
+fn gi_vox_gi_cached(voxel: vec3<i32>, obj_id: i32) -> vec4<f32> {
+  let acc = face_slot_sum_gi(gi_key0(voxel, obj_id), gi_vox_k1(gi_key1(voxel, 0u, obj_id)));
+  if (acc.w == 0u) { return vec4<f32>(0.0); }
+  let inv = 1.0 / (f32(acc.w) * GI_ACC_SCALE);
+  return vec4<f32>(f32(acc.x) * inv, f32(acc.y) * inv, f32(acc.z) * inv, 1.0);
 }
 
 fn refl_hit_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32) -> vec3<f32> {
   if (gi_u.misc.x <= 0.5) { return vec3<f32>(0.0); }
   if (!gi_key_ok(voxel, obj_id)) { return vec3<f32>(0.0); }
   if (gi_u.params.y <= 0.5) {
-    let acc = gi_vox_gi(voxel, face_id, obj_id);
-    if (acc.w > 0.0) { return acc.xyz / (acc.w * GI_ACC_SCALE); }
-    return vec3<f32>(0.0);
+    let v = gi_face_pool(voxel, face_id, obj_id, pal);
+    if (!(v.w > 0.0)) { return vec3<f32>(0.0); }
+    return v.xyz;
   }
   let s = gi_wal_sample(voxel, obj_id, pal, gi_key1(voxel, face_id, obj_id));
   if (!(s.w > 0.0)) { return vec3<f32>(0.0); }
@@ -523,16 +550,16 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     } else if (gi_on) {
       var acc = vec4<f32>(0.0);
       if (!refract_hit) {
-        acc = gi_vox_gi(best.voxel, best.face_id, best.obj_id);
+        acc = gi_vox_gi_cached(best.voxel, best.obj_id);
       }
       if (acc.w > 0.0) {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[44u], 1u); }
-        gi = acc.xyz / (acc.w * GI_ACC_SCALE);
+        gi = acc.xyz;
         cov = 1.0;
       } else {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[42u], 1u); }
         let gup = vec2<u32>(textureDimensions(gi_tex));
-        let guv = select(vuv, gi_in.uv, refract_hit);
+        let guv = select(prev_screen_uv(best.point, vuv), gi_in.uv, refract_hit);
         let s = gi_upsample_joint(guv, gup, k0, k1, n, vec3<f32>(0.0));
         let gw = max(s.a, 1e-4);
         gi = s.rgb / gw;
@@ -826,7 +853,7 @@ fn dda_face_accum(@builtin(global_invocation_id) gid: vec3<u32>,
     if ((k0 | k1) != 0u) {
       var ok = false;
       var claim_first = false;
-      let s = face_slot_claim(k0, gi_vox_k1(k1), &claim_first, &ok);
+      let s = face_slot_claim(k0, k1, &claim_first, &ok);
       if (ok) {
         let fe = s * FACE_WORDS;
         let gc = vec2<i32>(i32(gid.x), i32(gid.y));
@@ -894,12 +921,45 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k1 = gi_guide_out[gb + GI_DEN_G_KEY1];
   if ((k0 | k1) == 0u) { return; }
   var ok = false;
-  let slot = face_slot_find(k0, gi_vox_k1(k1), &ok);
+  let slot = face_slot_find(k0, k1, &ok);
   if (!ok) { return; }
   let fe = slot * FACE_WORDS;
-  if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
   let obj_id = i32((k1 >> 19u) & 0x1FFFu) - 1;
   let voxel = gi_unkey_voxel(k0, k1, obj_id);
+  let vkey = gi_vox_k1(k1);
+  var vok = false;
+  var vfirst = false;
+  let vs = face_slot_claim(k0, vkey, &vfirst, &vok);
+  if (vok && vfirst) {
+    let pal = atomicLoad(&face_slots[fe + FACE_W_PAL]);
+    let n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
+    let g = make_grid(u32(obj_id) + 1u);
+    let dd = vec3<f32>(dot(n, normalize(g.col0)), dot(n, normalize(g.col1)), dot(n, normalize(g.col2)));
+    var sum = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var f = 0u; f < 6u; f = f + 1u) {
+      let axis = f / 2u;
+      let sgn = select(-1.0, 1.0, (f & 1u) == 1u);
+      var w = dd.z;
+      if (axis == 0u) { w = dd.x; } else if (axis == 1u) { w = dd.y; }
+      w = w * sgn;
+      if (w <= 0.0) { continue; }
+      let v = gi_face_pool(voxel, f, obj_id, pal);
+      if (!(v.w > 0.0)) { continue; }
+      sum = sum + v.xyz * w;
+      wsum = wsum + w;
+    }
+    if (wsum > 0.0) {
+      let q = clamp(sum / wsum, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+      let qv = vec3<u32>(round(q * GI_ACC_SCALE));
+      let nfe = vs * FACE_WORDS;
+      atomicStore(&face_slots[nfe + FACE_W_GI], qv.x);
+      atomicStore(&face_slots[nfe + FACE_W_GI + 1u], qv.y);
+      atomicStore(&face_slots[nfe + FACE_W_GI + 2u], qv.z);
+      atomicStore(&face_slots[nfe + FACE_W_GI_N], 1u);
+    }
+  }
+  if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
   if (diag_sampled(texel)) {
     atomicAdd(&lod_diag[DIAG_WAL_FACES], 1u);
     if (gi_u.params.y > 0.5) {
@@ -1279,10 +1339,10 @@ fn dda_refl(@builtin(global_invocation_id) gid: vec3<u32>) {
     var merge_gi = false;
     if (tier >= REFL_TIER_GI && gi_u.misc.x > 0.5 && gi_u.params.y > 0.5) {
       var fok = false;
-      var fs = face_slot_find(k0, gi_vox_k1(k1), &fok);
+      var fs = face_slot_find(k0, k1, &fok);
       if (!fok) {
         var claim_first = false;
-        fs = face_slot_claim(k0, gi_vox_k1(k1), &claim_first, &fok);
+        fs = face_slot_claim(k0, k1, &claim_first, &fok);
       }
       if (fok) {
         let fe = fs * FACE_WORDS;

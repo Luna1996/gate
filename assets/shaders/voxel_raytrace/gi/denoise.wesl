@@ -56,13 +56,15 @@ fn gi_den_same_plane(hk0: u32, hk1: u32, k0: u32, k1: u32) -> bool {
   return (k1 & 0xFFFFu) == (hk1 & 0xFFFFu);
 }
 
-fn gi_same_surface_n(hk0: u32, hk1: u32, hn: vec3<f32>, k0: u32, k1: u32, n: vec3<f32>) -> bool {
+fn gi_same_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: u32) -> bool {
   if (!gi_den_same_plane(hk0, hk1, k0, k1)) { return false; }
-  return dot(hn, n) >= GI_DEN_N_DOT;
+  return dot(gi_unpack_dir(hn), gi_unpack_dir(n)) >= GI_DEN_N_DOT;
 }
 
-fn gi_same_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: vec3<f32>) -> bool {
-  return gi_same_surface_n(hk0, hk1, gi_unpack_dir(hn), k0, k1, n);
+fn gi_near_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: u32) -> bool {
+  if ((k1 >> 19u) != (hk1 >> 19u)) { return false; }
+  if (dot(gi_unpack_dir(hn), gi_unpack_dir(n)) < GI_DEN_N_DOT) { return false; }
+  return hk0 == k0 || gi_den_same_plane(hk0, hk1, k0, k1);
 }
 
 fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
@@ -79,7 +81,7 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
   }
   let k0 = gi_den_key0_b(gb);
   let k1 = gi_den_key1_b(gb);
-  let n_c = gi_den_nrm_b(gb);
+  let n_c = gi_guide[gb + GI_DEN_G_NRM];
   let c_raw = textureLoad(gi_raw_tex, coord, 0).rgb;
 
   var n3 = 0.0;
@@ -101,8 +103,7 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
       if ((tk0 | tk1) == 0u) { continue; }
       if (!gi_den_same_plane(tk0, tk1, k0, k1)) { continue; }
-
-      if (dot(gi_den_nrm_b(tb), n_c) < GI_DEN_N_DOT) { continue; }
+      if (gi_guide[tb + GI_DEN_G_NRM] != n_c) { continue; }
       let c = textureLoad(gi_raw_tex, vec2<i32>(tx, ty), 0).rgb;
       if (tk0 == k0 && tk1 == k1) {
         let l = dot(c, GI_LUMA);
@@ -155,7 +156,8 @@ fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {
       if (cand_m <= 0.0) { continue; }
       if (!gi_same_surface(gi_hist_prev[cand_b + GI_DEN_H_KEY0],
                            gi_hist_prev[cand_b + GI_DEN_H_KEY1],
-                           gi_hist_prev[cand_b + GI_DEN_H_NRM], k0, k1, n_c)) { continue; }
+                           gi_hist_prev[cand_b + GI_DEN_H_NRM], k0, k1,
+                           gi_guide[gb + GI_DEN_G_NRM])) { continue; }
       hb = cand_b;
       h_m = cand_m;
       found = true;
@@ -234,7 +236,7 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
   let st = max(1, i32(round(f32(step) * stab)));
   let k0 = gi_den_key0_b(gb);
   let k1 = gi_den_key1_b(gb);
-  let n_c = gi_den_nrm_b(gb);
+  let n_c = gi_guide[gb + GI_DEN_G_NRM];
   let phi = max(gi_den_phi[idx], 1e-5);
   let c0 = textureLoad(gi_dn_src, coord, 0).rgb;
   let l0 = dot(c0, GI_LUMA);
@@ -252,13 +254,12 @@ fn gi_den_atrous(size: vec2<u32>, coord: vec2<i32>, step: i32) {
       let tk1 = gi_guide[tb + GI_DEN_G_KEY1];
       if ((tk0 | tk1) == 0u) { continue; }
       if (!gi_den_same_plane(tk0, tk1, k0, k1)) { continue; }
-      let tn = gi_den_nrm_b(tb);
-      if (dot(tn, n_c) < GI_DEN_N_DOT) { continue; }
+      if (gi_guide[tb + GI_DEN_G_NRM] != n_c) { continue; }
       let s = textureLoad(gi_dn_src, vec2<i32>(tx, ty), 0).rgb;
 
       var w = 1.0;
       if (!(tk0 == k0 && tk1 == k1)) {
-        w = clamp(dot(tn, n_c), 0.0, 1.0) * exp(-abs(dot(s, GI_LUMA) - l0) / phi);
+        w = exp(-abs(dot(s, GI_LUMA) - l0) / phi);
       }
       acc = acc + s * w;
       wsum = wsum + w;

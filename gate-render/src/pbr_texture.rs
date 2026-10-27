@@ -657,7 +657,7 @@ fn log_flat_shading_switch() {
     Some(v) => info!(
       target: "gate",
       "逐体素材质采样: 开启（MATERIAL_FLAT_SHADING = {v}）= 美学「甲」：triplanar 采样点量化到体素中心\
-       （一个体素面一个平色）；远处闪烁由 `pbr_mip_lod` 的解析 LOD 抑制",
+       （一个体素六个面同一个平色）；远处闪烁由 `pbr_mip_lod` 的解析 LOD 抑制",
     ),
   }
 }

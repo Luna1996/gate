@@ -1132,7 +1132,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     };
     beam_cache.gi_guide = Some(make_buf("gate_gi_guide", px * c.gi_den_guide_words as u64 * 4));
 
-    let face_slots_n = (px * 2).next_power_of_two().clamp(256, 1u64 << 21);
+    let face_slots_n = (px * 4).next_power_of_two().clamp(256, 1u64 << 21);
     beam_cache.face_slots =
       Some(make_buf("gate_face_slots", face_slots_n * c.face_words as u64 * 4));
 

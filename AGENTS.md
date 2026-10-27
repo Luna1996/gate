@@ -60,7 +60,9 @@
 - bind group layout、binding 编号和 pipeline group 向量是**手写**的（主要在 `brickmap/dda.rs`）。naga 校验只覆盖 shader 本身，不校验 wgpu bind group；改 binding 后必须启动程序验证。
 - 反射请求二进制布局有历史坑：两种请求都把 `kind|weight` 放在 `.w`；packed chain 的 `pal` 在 `.z`，第二行是 `(pbase, face_id, 0, px)`。改布局必须同时改读写两端。
 - 「镜面质量」档位固定为 `0=关, 1=直射, 2=天空, 3=阴影, 4=GI`。改档位时同步 `ReflectionSettings::TIERS`、shader 的 `REFL_TIER_GI`、`assets/ui/debug_menu.toml` 和 `assets/locales/zh-CN.toml`。
-- 镜面保持**逐体素面**着色；不要在镜面 GI 上重新引入屏幕空间 `gi_upsample` 兜底（会把屏幕边缘的 GI 串进镜中），也不要恢复全局 WAL 更新预算加速。镜面 GI 只对可见镜面面做定向采样。
+- **逐体素着色 = 一个体素六个面同一个平色**（不是逐面平色）：材质与 GI 都量化到体素，同体素的任意可见面共用一个颜色；不要在着色里引入逐像素 / 逐面差异，否则画风会被打碎。
+- GI 的逐体素值必须与世界空间一致：同体素各面按着色法相余弦加权混合成单值；屏幕空间补值必须落在同一套世界空间核上，否则棱上会明暗交替、暗部出网格纹。
+- 镜面是例外：保持**逐体素面**着色（一个面一个反射值）；不要在镜面 GI 上重新引入屏幕空间 `gi_upsample` 兜底（会把屏幕边缘的 GI 串进镜中），也不要恢复全局 WAL 更新预算加速。镜面 GI 只对可见镜面面做定向采样。
 
 ## 运行期数据 / 资源
 

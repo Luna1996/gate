@@ -788,7 +788,7 @@ fn build_world_pair_into(
 
 thread_local! {
   static SCRATCH: std::cell::RefCell<(Vec<Contact>, Vec<Contact>)> =
-    const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    std::cell::RefCell::new(Default::default());
 }
 
 #[derive(Clone, Copy)]
