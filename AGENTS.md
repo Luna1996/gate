@@ -111,3 +111,10 @@
 
 - Rust stable 1.98（`rust-toolchain.toml`）、edition 2024、Bevy `=0.20.0-rc.1`、WESL 0.5。不要套用更新版本 Bevy/WGPU 的 API 假设。
 - rustfmt 配置：2 空格缩进、`use_small_heuristics = "Max"`。
+
+## 优化方法
+
+- 针对硬件的优化：例如我们之前将大shader pass拆分为小pass，以及各种缓存优化（cache miss）
+- 空间换时间：典型的有各种LUT查表，我们的DDA算法中就用到了
+- 并行计算：例如我们的物理引擎中就用到了并行计算
+- 算法优化：利用数学等价或近似简化复杂运算

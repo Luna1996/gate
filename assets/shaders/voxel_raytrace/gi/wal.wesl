@@ -51,6 +51,7 @@ const GI_WAL_FL_SHIFT: u32 = 2u;
 
 fn gi_wal_merge(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32,
   sum_e: vec3<f32>, cnt: u32) {
+  if (gi_u.params.y <= 0.5) { return; }
   let nmask = gi_wal_nmask();
   if (nmask == 0u || cnt == 0u) { return; }
   let slot = gi_wal_slot(v_world, (k1 >> 16u) & 7u, obj, nmask);

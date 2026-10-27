@@ -1,5 +1,5 @@
 import package::bindings::{gi_den_cfg, gi_den_phi, gi_dn_dst, gi_dn_src, gi_dn_tmp, gi_guide, gi_guide_out, gi_hist_cur, gi_hist_prev, gi_raw_tex};
-import package::gi::common::{gi_hist_search_offset, gi_pack_dir, gi_unpack_dir};
+import package::gi::common::{gi_hist_search_offset, gi_pack_dir, gi_unpack_dir, gi_vox_k1};
 import package::gi::consts::{GI_DEN_CLAMP_K, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_G_PREV, GI_DEN_G_RESET, GI_DEN_GUIDE_WORDS, GI_DEN_H_COL, GI_DEN_H_KEY0, GI_DEN_H_KEY1, GI_DEN_H_M, GI_DEN_H_M1, GI_DEN_H_M2, GI_DEN_H_NRM, GI_DEN_HIST_WORDS, GI_DEN_LUMA_FLOOR_REL, GI_DEN_LUMA_K, GI_DEN_M_MAX, GI_DEN_NBR_R, GI_DEN_N_DOT, GI_DEN_SIGMA_ALPHA, GI_DEN_STAB_FRAMES, GI_DEN_STAB_MAX, GI_DEN_RESET_SCALE, GI_DEN_W_HIST_MIN, GI_DEN_W_HIST_STATIC, GI_HIST_SEARCH_TAPS, GI_LUMA};
 
 fn gi_den_valid_b(b: u32) -> bool {
@@ -64,7 +64,7 @@ fn gi_same_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: u32) -> boo
 fn gi_near_surface(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32, n: u32) -> bool {
   if ((k1 >> 19u) != (hk1 >> 19u)) { return false; }
   if (dot(gi_unpack_dir(hn), gi_unpack_dir(n)) < GI_DEN_N_DOT) { return false; }
-  return hk0 == k0 || gi_den_same_plane(hk0, hk1, k0, k1);
+  return (hk0 == k0 && gi_vox_k1(hk1) == gi_vox_k1(k1)) || gi_den_same_plane(hk0, hk1, k0, k1);
 }
 
 fn gi_den_temporal(size: vec2<u32>, coord: vec2<i32>) {

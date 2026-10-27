@@ -1760,7 +1760,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
 
-    if let Some(upd_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_wal_update_pipeline) {
+    if let Some(upd_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_wal_update_pipeline)
+      && gi.as_ref().is_some_and(|g| g.wal)
+    {
       let wal_groups = (crate::gi::WAL_UPD_BUDGET / 64) as u32;
       crate::profiler::gpu_compute_pass(
         &mut profiler,
@@ -1940,7 +1942,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     && let (Some(rr), Some(cb0)) = (refl_read_bg, refl_compose_bg0)
     && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.refl_pipeline)
   {
-    let groups = ((refl_cap as u32) / 64u32).max(1);
+    let groups = ((refl_cap as u32).div_ceil(64)).clamp(1, 1024);
     crate::profiler::gpu_compute_pass(
       &mut profiler,
       ctx.command_encoder(),

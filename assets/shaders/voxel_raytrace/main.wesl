@@ -1,6 +1,6 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_of, face_slot_sum_gi, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
+import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, FACE_SLOT_READY, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_flag_next, face_slot_of, face_slot_sum_gi, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_cache_k1, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_near_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
@@ -239,9 +239,6 @@ fn gi_upsample_joint(
   var best_w = 0.0;
   var best_acc = vec3<f32>(0.0);
   var best_a = 0.0;
-  var any_ok = false;
-  var any_d2 = 0;
-  var any = vec4<f32>(0.0);
   for (var dy: i32 = -GI_UPSAMPLE_HOLE_R; dy <= GI_UPSAMPLE_HOLE_R; dy = dy + 1) {
     for (var dx: i32 = -GI_UPSAMPLE_HOLE_R; dx <= GI_UPSAMPLE_HOLE_R; dx = dx + 1) {
       let c = nci + vec2<i32>(dx, dy);
@@ -251,11 +248,6 @@ fn gi_upsample_joint(
       let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
       if ((gk0 | gk1) == 0u) { continue; }
       let d2 = dx * dx + dy * dy;
-      if (!any_ok || d2 < any_d2) {
-        any_ok = true;
-        any_d2 = d2;
-        any = textureLoad(gi_tex, c, 0);
-      }
       if (gi_near_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack)) {
         let w = 1.0 / (1.0 + f32(d2));
         let s = textureLoad(gi_tex, c, 0);
@@ -267,7 +259,6 @@ fn gi_upsample_joint(
     }
   }
   if (best_ok) { return vec4<f32>(best_acc / best_w, best_a / best_w); }
-  if (any_ok) { return any; }
   return vec4<f32>(fallback, 0.0);
 }
 
@@ -314,7 +305,7 @@ fn gi_face_pool(voxel: vec3<i32>, face: u32, obj_id: i32, pal: u32) -> vec4<f32>
 }
 
 fn gi_vox_gi_cached(voxel: vec3<i32>, obj_id: i32) -> vec4<f32> {
-  let acc = face_slot_sum_gi(gi_key0(voxel, obj_id), gi_vox_k1(gi_key1(voxel, 0u, obj_id)));
+  let acc = face_slot_sum_gi(gi_key0(voxel, obj_id), gi_vox_cache_k1(gi_key1(voxel, 0u, obj_id)));
   if (acc.w == 0u) { return vec4<f32>(0.0); }
   let inv = 1.0 / (f32(acc.w) * GI_ACC_SCALE);
   return vec4<f32>(f32(acc.x) * inv, f32(acc.y) * inv, f32(acc.z) * inv, 1.0);
@@ -747,8 +738,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
   var best_rec = first;
   col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
                      GiInput(false, vec3<f32>(0.0), 0.0, px), sun_dir, sky, sun_c,
-                     n_own, need_n, u32(gid.y) * size.x + u32(gid.x), &best_rec);
-  dda_hit_record(gid, best_rec, origin_voxel);
+                     n_own, need_n, u32(gid.y) * size.x + u32(gid.x),
+                     &best_rec);
+  if (gi_u.misc.x > 0.5) { dda_hit_record(gid, best_rec, origin_voxel); }
   if (diag_on && first.hit) {
     let q = u32(clamp(dot(dbg_gi, GI_LUMA), 0.0, 255.0) * 256.0);
     let p = u32(clamp(dot(col, GI_LUMA), 0.0, 255.0) * 256.0);
@@ -808,7 +800,7 @@ fn dda_preview(@builtin(global_invocation_id) gid: vec3<u32>,
   }
   let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
                             world_cfg_primary(t_min, 3u));
-  dda_hit_record(gid, first, origin_voxel);
+  if (gi_u.misc.x > 0.5) { dda_hit_record(gid, first, origin_voxel); }
   let diag_pix = gid.x + gid.y * size.x;
   if (diag_sampled(diag_pix)) {
     atomicAdd(&lod_diag[DIAG_MAIN_RAYS], 1u);
@@ -926,7 +918,7 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let fe = slot * FACE_WORDS;
   let obj_id = i32((k1 >> 19u) & 0x1FFFu) - 1;
   let voxel = gi_unkey_voxel(k0, k1, obj_id);
-  let vkey = gi_vox_k1(k1);
+  let vkey = gi_vox_cache_k1(k1);
   var vok = false;
   var vfirst = false;
   let vs = face_slot_claim(k0, vkey, &vfirst, &vok);
@@ -957,6 +949,7 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       atomicStore(&face_slots[nfe + FACE_W_GI + 1u], qv.y);
       atomicStore(&face_slots[nfe + FACE_W_GI + 2u], qv.z);
       atomicStore(&face_slots[nfe + FACE_W_GI_N], 1u);
+      atomicStore(&face_slots[nfe + FACE_W_FLAG], face_slot_flag_next(FACE_SLOT_READY));
     }
   }
   if (atomicLoad(&face_slots[fe + FACE_W_TEXEL]) != texel) { return; }
@@ -1306,10 +1299,14 @@ fn refl_shade_ray(org: vec3<f32>, dir: vec3<f32>, tier: u32,
 }
 
 @compute @workgroup_size(64, 1, 1)
-fn dda_refl(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= atomicLoad(&refl_meta[0]) || i >= refl_cfg.x) { return; }
-  let a = refl_req[i * 2u];
+fn dda_refl(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>) {
+  let count = min(atomicLoad(&refl_meta[0]), refl_cfg.x);
+  let stride = nwg.x * 64u;
+  var i = gid.x;
+  loop {
+    if (i >= count) { break; }
+    let a = refl_req[i * 2u];
   let b = refl_req[i * 2u + 1u];
   let px = b.w;
   let kind = (a.w >> 30u) & 3u;
@@ -1354,6 +1351,8 @@ fn dda_refl(@builtin(global_invocation_id) gid: vec3<u32>) {
                          REFL_FAR_T, surface_offset(gg, hn, SHADOW_SURFACE_EPS), merge_gi);
   }
   refl_accum(px, w * rad);
+    i = i + stride;
+  }
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1362,6 +1361,10 @@ fn dda_refl_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   let coord = vec2<i32>(i32(gid.x), i32(gid.y));
   let px = u32(gid.y) * size.x + u32(gid.x);
+  if (atomicLoad(&refl_meta[0]) == 0u) {
+    textureStore(out_tex, coord, textureLoad(out_base_tex, coord, 0));
+    return;
+  }
   let base = srgb_to_linear(textureLoad(out_base_tex, coord, 0).rgb);
   let o = px * 3u;
   let add = vec3<f32>(f32(atomicLoad(&refl_sum[o])),

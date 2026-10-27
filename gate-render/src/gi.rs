@@ -713,13 +713,15 @@ fn queue_gi_pipelines(
     }));
   }
 
-  gpu.flatten_pipeline = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_gi_face_flatten")),
-    layout: vec![gi_flatten_layout()],
-    shader: dda_shader.0.clone(),
-    entry_point: Some(Cow::from("gi_face_flatten")),
-    ..Default::default()
-  }));
+  if GI_FLAT_ACC {
+    gpu.flatten_pipeline = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+      label: Some(Cow::from("gate_gi_face_flatten")),
+      layout: vec![gi_flatten_layout()],
+      shader: dda_shader.0.clone(),
+      entry_point: Some(Cow::from("gi_face_flatten")),
+      ..Default::default()
+    }));
+  }
 }
 
 fn extract_gi_settings(

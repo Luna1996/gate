@@ -655,14 +655,47 @@ fn trace_grid(g: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32
   for (var step_c: u32 = 0u; step_c < max_chunk_steps; step_c = step_c + 1u) {
     let t_exit_c = min(tmax_c.x, min(tmax_c.y, tmax_c.z));
     let t1 = min(t_exit_c, tl1);
+    let rg = ci - index_origin;
     var group_empty = false;
     if (OCC_SKIP != 0u && vol < OCC_VOLUMES && REQ_ENABLE == 0u) {
-      let rg = ci - index_origin;
       if (all(rg >= vec3<i32>(0)) && all(vec3<u32>(rg) < index_dims)) {
         let rgg = vec3<u32>(rg);
         let gg = (rgg.x >> 2u) + (rgg.y >> 2u) * 16u + (rgg.z >> 2u) * 256u;
         let base = vol * OCC_WORDS + gg * 2u;
         group_empty = occ[base] == 0u && occ[base + 1u] == 0u;
+      }
+    }
+    if (group_empty) {
+      if (penetrate && medium_exit(mc)) {
+        let nl = face_normal_from_index(entry_face);
+        let nw = normalize(nl.x * col0 + nl.y * col1 + nl.z * col2);
+        return UnifiedHit(true, t_enter_c, (*mc).last_pal, nw, entry_face,
+                          vec3<i32>(0), obj_id);
+      }
+      let gb = vec3<i32>(rg.x & -4, rg.y & -4, rg.z & -4);
+      let g0 = vec3<f32>(index_origin + gb) * f32(CHUNK_SIZE);
+      let g1 = vec3<f32>(index_origin + gb + vec3<i32>(4)) * f32(CHUNK_SIZE);
+      var t_go = tl1;
+      var axis_go: u32 = 0u;
+      for (var a: u32 = 0u; a < 3u; a = a + 1u) {
+        if (grid_axis_on[a]) {
+          let bound = select(g1[a], g0[a], sign_v[a] < 0);
+          let tt = (bound - ro[a]) * grid_inv_rd[a];
+          if (tt < t_go) { t_go = tt; axis_go = a; }
+        }
+      }
+      if (t_go > t_enter_c) {
+        if (t_go >= tl1) { break; }
+        t_enter_c = t_go;
+        let p_go = ro + rd * t_go;
+        ci = vec3<i32>(floor(p_go / f32(CHUNK_SIZE)));
+        let bnd_c = (vec3<f32>(ci) + side) * f32(CHUNK_SIZE);
+        tmax_c = select(vec3<f32>(1e30), (bnd_c - ro) * grid_inv_rd, grid_axis_on);
+        tmax_c = max(tmax_c, vec3<f32>(t_enter_c));
+        if (axis_go == 0u) { entry_face = face_x; }
+        else if (axis_go == 1u) { entry_face = face_y; }
+        else { entry_face = face_z; }
+        continue;
       }
     }
     var air_chunk = true;

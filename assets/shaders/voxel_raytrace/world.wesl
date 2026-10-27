@@ -41,16 +41,19 @@ fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> v
   return face_n;
 }
 
-fn nb_solid_fast(leaf: u32, leaf_pal: u32, mask: u64, c: vec3<i32>, off: vec3<i32>) -> f32 {
+fn nb_solid_fast(g: Grid, voxel: vec3<i32>, leaf: u32, leaf_pal: u32, mask: u64,
+                 c: vec3<i32>, off: vec3<i32>) -> f32 {
   let n = c + off;
-  if (any(n < vec3<i32>(0)) || any(n > vec3<i32>(3))) { return -1.0; }
-  let idx = u32(n.z * 16 + n.y * 4 + n.x);
-  if ((mask & (u64(1) << idx)) != u64(0)) {
-    let w = ts(leaf + NODE_FIXED_WORDS + (idx >> 1u));
-    let v = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
-    return select(0.0, 1.0, v != 0u);
+  if (all(n >= vec3<i32>(0)) && all(n <= vec3<i32>(3))) {
+    let idx = u32(n.z * 16 + n.y * 4 + n.x);
+    if ((mask & (u64(1) << idx)) != u64(0)) {
+      let w = ts(leaf + NODE_FIXED_WORDS + (idx >> 1u));
+      let v = (w >> ((idx & 1u) * 16u)) & 0xFFFFu;
+      return select(0.0, 1.0, v != 0u);
+    }
+    return select(0.0, 1.0, leaf_pal != 0u);
   }
-  return select(0.0, 1.0, leaf_pal != 0u);
+  return select(0.0, 1.0, sample_brickmap(g, voxel + off) != 0u);
 }
 
 fn leaf_brick_of(g: Grid, voxel: vec3<i32>) -> u32 {
@@ -105,15 +108,12 @@ fn voxel_normal_fast(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>)
   let leaf_pal = ts(leaf + 2u) & 0xFFFFu;
   let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));
   let c = m & vec3<i32>(3);
-  let xp = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(1, 0, 0));
-  let xm = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(-1, 0, 0));
-  let yp = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, 1, 0));
-  let ym = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, -1, 0));
-  let zp = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, 0, 1));
-  let zm = nb_solid_fast(leaf, leaf_pal, mask, c, vec3<i32>(0, 0, -1));
-  if (any(vec3<f32>(xp, yp, zp) < vec3<f32>(0.0)) || any(vec3<f32>(xm, ym, zm) < vec3<f32>(0.0))) {
-    return voxel_normal(g, voxel, face_id, face_n);
-  }
+  let xp = nb_solid_fast(g, voxel, leaf, leaf_pal, mask, c, vec3<i32>(1, 0, 0));
+  let xm = nb_solid_fast(g, voxel, leaf, leaf_pal, mask, c, vec3<i32>(-1, 0, 0));
+  let yp = nb_solid_fast(g, voxel, leaf, leaf_pal, mask, c, vec3<i32>(0, 1, 0));
+  let ym = nb_solid_fast(g, voxel, leaf, leaf_pal, mask, c, vec3<i32>(0, -1, 0));
+  let zp = nb_solid_fast(g, voxel, leaf, leaf_pal, mask, c, vec3<i32>(0, 0, 1));
+  let zm = nb_solid_fast(g, voxel, leaf, leaf_pal, mask, c, vec3<i32>(0, 0, -1));
   var d = vec3<f32>(xm - xp, ym - yp, zm - zp);
   var dw = d;
   if (g.obj_id >= 0) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
