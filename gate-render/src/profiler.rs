@@ -16,6 +16,24 @@ pub struct FramePace {
 
 fn tick_frame_pace(pace: Res<FramePace>) {
   pace.presented.fetch_add(1, Ordering::Relaxed);
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  if !*ON.get_or_init(|| std::env::var("GATE_BENCH").is_ok_and(|v| !v.is_empty() && v != "0")) {
+    return;
+  }
+  static PACE: std::sync::Mutex<Option<(std::time::Instant, u32)>> = std::sync::Mutex::new(None);
+  let Ok(mut g) = PACE.lock() else { return };
+  let now = std::time::Instant::now();
+  match g.as_mut() {
+    None => *g = Some((now, 1)),
+    Some((t0, n)) => {
+      *n += 1;
+      let dt = now.duration_since(*t0).as_secs_f32();
+      if dt >= 2.0 {
+        bevy::log::info!("PACE {:.1}fps {}帧/{:.2}s", *n as f32 / dt, *n, dt);
+        *g = Some((now, 0));
+      }
+    }
+  }
 }
 
 #[derive(Resource, Default)]
@@ -382,6 +400,13 @@ impl Plugin for GateProfilerPlugin {
       render_app.add_systems(
         bevy::render::renderer::RenderGraph,
         report_gi_flicker.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
+      );
+    }
+    if std::env::var("GATE_QUEUE_PROBE").is_ok_and(|v| !v.is_empty() && v != "0") {
+      render_app.init_resource::<QueueProbe>();
+      render_app.add_systems(
+        bevy::render::renderer::RenderGraph,
+        report_queue_counts.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
     }
     if trace.req_enable != 0 {
@@ -862,6 +887,82 @@ fn emit_lod_diag(
     d[36] as f32 / calls,
     d[37] as f32 / calls,
   );
+}
+
+#[derive(Resource, Default)]
+struct QueueProbe {
+  staging: Option<Buffer>,
+  pending: Option<DiagReadback>,
+  last: Option<std::time::Instant>,
+}
+
+fn report_queue_counts(
+  device: Res<RenderDevice>,
+  queue: Res<RenderQueue>,
+  aux: Option<Res<crate::brickmap::dda::AuxTexCache>>,
+  mut probe: ResMut<QueueProbe>,
+) {
+  let Some(aux) = aux else { return };
+  let (Some(glass), Some(refl)) = (aux.glass_meta_buffer(), aux.refl_meta_buffer()) else {
+    return;
+  };
+  if probe.pending.is_some() {
+    let _ = device.poll(PollType::Poll);
+    let (failed, ready) = {
+      let p = probe.pending.as_ref().expect("刚判过 is_some");
+      (p.err.load(Ordering::Acquire), p.done.load(Ordering::Acquire))
+    };
+    if ready || failed {
+      let p = probe.pending.take().expect("刚判过 is_some");
+      if ready && !failed {
+        let slice = p.staging.slice(..);
+        if let Ok(view) = slice.get_mapped_range() {
+          let g = u32::from_le_bytes([view[0], view[1], view[2], view[3]]);
+          let r = u32::from_le_bytes([view[4], view[5], view[6], view[7]]);
+          info!("QUEUE[glass {g} refl {r}]");
+        }
+      }
+      p.staging.unmap();
+    }
+  }
+  if probe.pending.is_some() {
+    return;
+  }
+  let now = std::time::Instant::now();
+  if probe.last.is_some_and(|t| now.duration_since(t).as_secs_f32() < 2.0) {
+    return;
+  }
+  probe.last = Some(now);
+  let staging = match probe.staging.as_ref() {
+    Some(s) if s.size() >= 8 => s.clone(),
+    _ => {
+      let s = device.create_buffer(&BufferDescriptor {
+        label: Some("gate_queue_probe"),
+        size: 8,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+      });
+      probe.staging = Some(s.clone());
+      s
+    }
+  };
+  let mut enc =
+    device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
+      label: Some("gate_queue_probe_readback"),
+    });
+  enc.copy_buffer_to_buffer(glass, 0, &staging, 0, 4);
+  enc.copy_buffer_to_buffer(refl, 0, &staging, 4, 4);
+  queue.submit([enc.finish()]);
+  let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let err = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let (done_cb, err_cb) = (done.clone(), err.clone());
+  device.map_buffer(&staging.slice(..), MapMode::Read, move |r| {
+    if r.is_err() {
+      err_cb.store(true, Ordering::Release);
+    }
+    done_cb.store(true, Ordering::Release);
+  });
+  probe.pending = Some(DiagReadback { staging, done, err });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

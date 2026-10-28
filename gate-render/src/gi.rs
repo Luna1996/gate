@@ -19,6 +19,23 @@ pub struct GiUniform {
   pub prev_view_proj: Mat4,
 }
 
+fn ab_mode() -> f32 {
+  use std::sync::OnceLock;
+  static CFG: OnceLock<Option<Vec<u32>>> = OnceLock::new();
+  let Some(modes) = CFG.get_or_init(|| {
+    let spec = std::env::var("GATE_AB").ok()?;
+    let v: Vec<u32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    if v.is_empty() { None } else { Some(v) }
+  }) else {
+    return 0.0;
+  };
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs();
+  modes[(now / 20) as usize % modes.len()] as f32
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LightKey {
   dir: [u32; 3],
@@ -859,7 +876,7 @@ fn prepare_gi(p: PrepareGiParams) {
       settings.bounce2_mult(),
     ),
     flags: Vec4::new(
-      0.0,
+      ab_mode(),
       settings.div() as f32,
       if since_reset == 0 { 0.0 } else { 1.0 },
       settings.tier() as f32,

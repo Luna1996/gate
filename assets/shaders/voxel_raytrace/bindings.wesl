@@ -217,3 +217,9 @@ struct FogUniform {
 @group(7) @binding(0) var out_tex_src: texture_2d<f32>;
 
 @group(7) @binding(1) var<storage, read_write> eye_adapt: array<atomic<u32>>;
+
+@group(0) @binding(30) var dda_vis: texture_storage_2d<rgba32uint, read_write>;
+@group(0) @binding(31) var dda_nrm: texture_storage_2d<rgba16float, read_write>;
+@group(0) @binding(32) var dda_shadow_tex: texture_storage_2d<rgba16float, read_write>;
+@group(0) @binding(33) var<storage, read_write> glass_req: array<u32>;
+@group(0) @binding(34) var<storage, read_write> glass_meta: array<atomic<u32>>;

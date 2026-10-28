@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 const ENTRY_POINTS: &[&str] = &[
   "dda_main",
   "dda_preview",
+  "dda_visible",
+  "dda_shadow",
+  "dda_shade",
+  "dda_glass",
   "dda_refl",
   "dda_refl_compose",
   "dda_face_accum",
