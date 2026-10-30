@@ -117,7 +117,7 @@ pub const GI_EDIT_BOX_MAX: u32 = 8;
 
 pub const WAL_SLOTS: u64 = 1 << 20;
 
-pub const WAL_UPD_BUDGET: u64 = 1 << 16;
+pub const WAL_UPD_BUDGET: u64 = 1 << 17;
 
 pub const WAL_WORDS: u64 = 8;
 

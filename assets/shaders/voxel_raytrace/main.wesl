@@ -69,6 +69,9 @@ fn dda_hit_unpack(raw: vec4<u32>, origin_voxel: vec3<f32>, dir_voxel: vec3<f32>)
 
 const GLASS_EPS: f32 = 1e-3;
 
+const GLASS_GI_FAR0: f32 = 1200.0;
+const GLASS_GI_FAR1: f32 = 2600.0;
+
 const GLASS_EXIT_BEND: bool = true;
 const GLASS_QUALITY_SHIFT: u32 = 3u;
 const GLASS_REFL_MIN: f32 = 0.02;
@@ -575,18 +578,22 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       gi = gi_in.face_avg;
       cov = gi_in.face_cov;
     } else if (gi_on && am != 4u && am != 14u) {
-      var acc = vec4<f32>(0.0);
-      if (!refract_hit) {
-        acc = gi_vox_gi_cached(best.voxel, best.obj_id);
-      }
+      var acc = gi_vox_gi_cached(best.voxel, best.obj_id);
       if (acc.w > 0.0) {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[44u], 1u); }
         gi = acc.xyz;
         cov = 1.0;
+      } else if (refract_hit) {
+        if (gi_u.params.y > 0.5 && gi_key_ok(best.voxel, best.obj_id)) {
+          gi_wal_touch(best.voxel, best.obj_id, best.pal, k0, k1);
+        }
+        let fade = 1.0 - smoothstep(GLASS_GI_FAR0, GLASS_GI_FAR1, length(best.point - origin_voxel));
+        gi = refl_hit_gi(best.voxel, best.face_id, best.obj_id, best.pal) * fade;
+        cov = select(0.0, 1.0, any(gi > vec3<f32>(0.0))) * fade;
       } else {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[42u], 1u); }
         let gup = vec2<u32>(textureDimensions(gi_tex));
-        let guv = select(prev_screen_uv(best.point, vuv), gi_in.uv, refract_hit);
+        let guv = prev_screen_uv(best.point, vuv);
         let s = gi_upsample_joint(guv, gup, k0, k1, n, vec3<f32>(0.0));
         let gw = max(s.a, 1e-4);
         gi = s.rgb / gw;

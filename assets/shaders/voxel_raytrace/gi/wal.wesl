@@ -13,7 +13,7 @@ const GI_WAL_FRESH: u32 = 2u;
 
 const GI_WAL_UPD_R: u32 = 1u;
 
-const GI_WAL_UPD_B: u32 = 65536u;
+const GI_WAL_UPD_B: u32 = 131072u;
 
 const GI_WAL_DIAG: u32 = 0u;
 
