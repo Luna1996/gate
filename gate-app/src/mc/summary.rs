@@ -67,6 +67,24 @@ impl Summary {
 
   pub fn cell(&self, src: &dyn SectionReps, cell: IVec3, cell_blocks: i32) -> Option<PaletteId> {
     match cell_blocks {
+      8 => {
+        let sec = self.sec(src, cell.div_euclid(IVec3::splat(SEC)))?;
+        let l = cell.rem_euclid(IVec3::splat(SEC)) / 4;
+        let mut reps = [PaletteId::AIR; 8];
+        let mut i = 0usize;
+        for dy in 0..2 {
+          for dz in 0..2 {
+            for dx in 0..2 {
+              let idx = (l.x + dx)
+                + FINE_PER_AXIS * (l.z + dz)
+                + FINE_PER_AXIS * FINE_PER_AXIS * (l.y + dy);
+              reps[i] = sec.fine[idx as usize];
+              i += 1;
+            }
+          }
+        }
+        voxel::rep_of_surface(&reps, 4)
+      }
       4 => {
         let sec = self.sec(src, cell.div_euclid(IVec3::splat(SEC)))?;
         let l = cell.rem_euclid(IVec3::splat(SEC)) / 4;

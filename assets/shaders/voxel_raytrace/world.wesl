@@ -480,7 +480,7 @@ fn world_trace_glass_path(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_on
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
     let gi = make_grid(inst_bvh[far_base + k]);
     var t_lo = 0.0;
-    if (origin_xz < shell) {
+    if (origin_xz < shell && abs(dir.y) < 0.5) {
       t_lo = level_cap(shell, dir);
     }
     var t_cap = max_t;

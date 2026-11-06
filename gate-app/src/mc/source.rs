@@ -27,6 +27,7 @@ pub struct McCity {
   plans: Mutex<HashMap<String, Option<Arc<BlockPlan>>>>,
   summary: Summary,
   lod: lod::Cell,
+  water: Mutex<Option<(PaletteId, i32)>>,
   produced: Mutex<usize>,
 }
 
@@ -39,6 +40,7 @@ impl McCity {
       plans: Mutex::new(HashMap::new()),
       summary: Summary::new(),
       lod: Arc::new(std::sync::RwLock::new(None)),
+      water: Mutex::new(None),
       produced: Mutex::new(0),
     }
   }
@@ -59,17 +61,24 @@ impl McCity {
 
   fn produce_far(&self, coord: ChunkCoord, scale: i32) -> Option<ChunkTree> {
     let cell_blocks = cell_blocks_of(scale);
+    let mut water = *self.water.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
-      return self.far_tree(coord, cell_blocks, |cell| view.cell(cell, cell_blocks));
+      if let Some((w, fallback)) = water {
+        let center =
+          (coord.0 * gate_voxel::CHUNK_SIZE + IVec3::splat(128)) * scale / super::VOXELS_PER_BLOCK;
+        water = Some((w, view.top_at_block(center.x, center.z, w).unwrap_or(fallback)));
+      }
+      return self.far_tree(coord, cell_blocks, water, |cell| view.cell(cell, cell_blocks));
     }
     let summary = &self.summary;
-    self.far_tree(coord, cell_blocks, |cell| summary.cell(self, cell, cell_blocks))
+    self.far_tree(coord, cell_blocks, water, |cell| summary.cell(self, cell, cell_blocks))
   }
 
   fn far_tree(
     &self,
     coord: ChunkCoord,
     cell_blocks: i32,
+    water: Option<(PaletteId, i32)>,
     cell: impl Fn(IVec3) -> Option<PaletteId>,
   ) -> Option<ChunkTree> {
     let cells = gate_voxel::CHUNK_SIZE / FAR_GRAIN;
@@ -78,7 +87,13 @@ impl McCity {
     for kz in 0..cells {
       for ky in 0..cells {
         for kx in 0..cells {
-          if let Some(id) = cell(origin + IVec3::new(kx, ky, kz) * cell_blocks) {
+          let c = origin + IVec3::new(kx, ky, kz) * cell_blocks;
+          let Some(id) = cell(c) else { continue };
+          if let Some((w, level)) = water
+            && id == w
+          {
+            fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level, id);
+          } else {
             tree.fill_brick([kx * FAR_GRAIN, ky * FAR_GRAIN, kz * FAR_GRAIN], FAR_GRAIN, id);
           }
         }
@@ -93,14 +108,17 @@ impl McCity {
 
   pub fn install_lod(&self, f: lod::File) {
     let view = lod::View::new(f, |key| self.plan_for(&BlockState::from_key(key)).map(|p| p.rep));
+    let water =
+      view.find_rep(|n| n.contains("water")).and_then(|w| view.top_mode(w).map(|h| (w, h)));
+    *self.water.lock().unwrap_or_else(|e| e.into_inner()) = water;
     bevy::log::info!(
-      "LOD 装载：{} 列 {} 节、{} KB、名字 {} 个（{} 个没认领到槽 ⇒ 那些节算空）；远场 scale ≥ {} 改走它",
+      "LOD 装载：{} 列 {} 节、{} KB、名字 {} 个（{} 个没认领到槽 ⇒ 那些节算空）；远场改走 LOD 细格；水面 {} block",
       view.cols(),
       view.sections(),
       view.heap_bytes() / 1024,
       view.names(),
       view.missing(),
-      lod::CELL,
+      water.map_or(-1, |(_, h)| h),
     );
     *self.lod.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(view));
   }
@@ -227,6 +245,43 @@ impl ChunkSource for McCity {
 
 fn block_origin(i: usize) -> IVec3 {
   IVec3::new((i % 16) as i32, (i / 256) as i32, ((i / 16) % 16) as i32) * SEC
+}
+
+/// 水面列在远场树里只填到 `level`（block），避免 8/16-block cell 把水面抬高。
+fn fill_water(
+  tree: &mut ChunkTree,
+  cell: [i32; 3],
+  cell_blocks: i32,
+  y0: i32,
+  level: i32,
+  id: PaletteId,
+) {
+  let [kx, ky, kz] = cell;
+  if y0 + cell_blocks <= level {
+    tree.fill_brick([kx * FAR_GRAIN, ky * FAR_GRAIN, kz * FAR_GRAIN], FAR_GRAIN, id);
+    return;
+  }
+  if y0 >= level {
+    return;
+  }
+  let vox_per_block = 16 / cell_blocks;
+  let layer = if vox_per_block == 2 { 2 } else { 4 };
+  let extent = layer * vox_per_block;
+  let h = level - y0;
+  let mut i = 0;
+  while i < h {
+    let y_far = ky * FAR_GRAIN + i * vox_per_block;
+    let mut z = 0;
+    while z < FAR_GRAIN {
+      let mut x = 0;
+      while x < FAR_GRAIN {
+        tree.fill_brick([kx * FAR_GRAIN + x, y_far, kz * FAR_GRAIN + z], extent, id);
+        x += extent;
+      }
+      z += extent;
+    }
+    i += layer;
+  }
 }
 
 fn apply(tree: &mut ChunkTree, org: IVec3, f: &Fill) {

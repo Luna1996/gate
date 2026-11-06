@@ -238,7 +238,7 @@ impl bevy::app::Plugin for FogPlugin {
       .add_systems(bevy::render::RenderStartup, init_fog_gpu)
       .add_systems(
         bevy::render::RenderStartup,
-        queue_fog_pipelines.after(crate::brickmap::dda::init_dda_pipelines),
+        queue_fog_pipelines.after(crate::brickmap::dda::init_dda_pipelines).after(init_fog_gpu),
       )
       .add_systems(bevy::render::ExtractSchedule, extract_fog_settings)
       .add_systems(

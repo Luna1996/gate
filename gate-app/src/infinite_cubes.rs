@@ -19,7 +19,7 @@ pub(crate) fn initial_box(center: IVec3) -> (IVec3, IVec3) {
   ((c - IVec3::splat(START_CHUNKS)) * chunk, (c + IVec3::splat(START_CHUNKS + 1)) * chunk)
 }
 
-pub const FAR_SCALES: [i32; 3] = [4, 16, 64];
+pub const FAR_SCALES: [i32; 3] = [4, 8, 16];
 
 pub const DEFAULT_REQUEST_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const FAR_GRAIN: i32 = 16;
@@ -1022,19 +1022,21 @@ const PRELOAD_DETAIL_CAP: Detail = Detail::FINE;
 
 const PRELOAD_FULL_CHUNKS: i32 = 8;
 
-const FAR_PRELOAD_OUTER: i32 = 30;
+const FAR_PRELOAD_OUTER: i32 = 40;
 
 const FAR_PRELOAD_HY: i32 = 8;
 
+const FAR_LEVELS: usize = FAR_SCALES.len();
+
 fn far_cap(vol: usize, cap: usize) -> usize {
-  let _ = vol;
-  cap
+  const W: [u32; FAR_LEVELS] = [31, 25, 44];
+  (cap as u64 * W[(vol - 1).min(FAR_LEVELS - 1)] as u64 / 100) as usize
 }
 
 const FAR_CONTENT_LAYERS: [i32; 3] = [3, 1, 1];
 
-fn far_radius_ladder(cap: usize) -> [(i32, i32); 3] {
-  let mut out = [(0, 0); 3];
+fn far_radius_ladder(cap: usize) -> [(i32, i32); FAR_LEVELS] {
+  let mut out = [(0, 0); FAR_LEVELS];
   let mut r_in = FAR_PRELOAD_INNER;
   for k in 0..FAR_SCALES.len() {
     let budget = far_cap(k + 1, cap) as u64;
@@ -1046,7 +1048,7 @@ fn far_radius_ladder(cap: usize) -> [(i32, i32); 3] {
       sum += per_ring(r_out);
     }
     out[k] = (r_in, r_out);
-    r_in = ((r_out - SEAM_MARGIN + 1) / 4 - 1).max(1);
+    r_in = ((r_out - SEAM_MARGIN + 1) / 2 - 1).max(1);
   }
   out
 }

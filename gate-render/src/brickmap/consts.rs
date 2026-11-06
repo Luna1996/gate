@@ -18,7 +18,7 @@ pub const LOD_REQ_WORDS: usize = 3 + USE_WORDS * VOLUMES + REQ_CAP;
 pub const USE_WORDS: usize = 64 * 64 * 64;
 pub const FAR_RESIDENT_TARGET: usize = FAR_POOL_CHUNKS / 4 * 3;
 
-pub const FAR_POOL_CHUNKS: usize = 4096;
+pub const FAR_POOL_CHUNKS: usize = 16384;
 pub const FAR_RESERVE_WORDS_PER_CHUNK: usize = 2048;
 pub const FAR_TREE_RESERVE_WORDS: usize = FAR_POOL_CHUNKS * FAR_RESERVE_WORDS_PER_CHUNK;
 

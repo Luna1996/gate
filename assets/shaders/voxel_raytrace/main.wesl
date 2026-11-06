@@ -153,14 +153,15 @@ fn queue_refl_chain(k0: u32, k1: u32, pal: u32, pbase: u32, face_id: u32,
 
 fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
                entry_n: vec3<f32>, entry_ior: f32, entry_v: vec3<f32>, qpx: u32,
-               quality: u32) -> GlassOut {
+               quality: u32, allow_refl: bool) -> GlassOut {
   var tint = vec3<f32>(1.0);
   let f0 = dielectric_f0(entry_ior, 1.0);
   let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(entry_v, entry_n), 0.0, 1.0), 5.0);
 
   let r_org = origin_voxel + entry_n * GLASS_EPS;
   let r_dir = reflect(-entry_v, entry_n);
-  if (secondary_on() && light_u.g.refl_tier > 0u && ab_mode() != 21u && fres > GLASS_REFL_MIN
+  if (allow_refl && secondary_on() && light_u.g.refl_tier > 0u && ab_mode() != 21u
+      && fres > GLASS_REFL_MIN
       && dot(vec3<f32>(fres), GI_LUMA) > GLASS_REFL_WEIGHT_MIN) {
     queue_refl_ray(r_org, r_dir, vec3<f32>(fres), qpx);
   }
@@ -464,6 +465,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var glass_col = vec3<f32>(0.0);
   var glass_w = 0.0;
   var sky_dir = ray_dir;
+  var water_miss = false;
   var refract_hit = false;
   var through_transmission = false;
   let glass_q = (light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u;
@@ -477,8 +479,9 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
     let g = trace_glass(f_face, -fv, frustum_length, fnn,
-                        material_ior(first.palette_base, first.pal), fv, qpx, glass_q);
+                        material_ior(first.palette_base, first.pal), fv, qpx, glass_q, true);
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
+    water_miss = fm.roughness < 0.1;
     if (glass_q > 0u) {
       best = g.ray;
       *best_out = g.ray;
@@ -684,7 +687,9 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     }
     col = col * through + refl;
   } else {
-    return mix(glass_col, sky_primary(sky_dir, sun_dir, sun_c) * through + refl, 1.0 - glass_w);
+    var miss = sky_primary(sky_dir, sun_dir, sun_c) * through;
+    if (water_miss) { miss = glass_col; }
+    return mix(glass_col, miss + refl, 1.0 - glass_w);
   }
   return mix(glass_col, col, 1.0 - glass_w);
 }
@@ -1688,7 +1693,7 @@ fn dda_glass(@builtin(global_invocation_id) gid: vec3<u32>,
       let gg = trace_glass(fp + fnn * surface_offset(fg, fnn, SHADOW_SURFACE_EPS), -fv,
                            frustum_length, fnn,
                            material_ior(first.palette_base, first.pal), fv,
-                           u32(coord.y) * size.x + u32(coord.x), glass_q);
+                           u32(coord.y) * size.x + u32(coord.x), glass_q, true);
       write_output(coord, gg.tint * 0.4);
       continue;
     }

@@ -237,7 +237,95 @@ impl View {
   }
 
   pub fn supports(&self, cell_blocks: i32) -> bool {
-    cell_blocks == FINE_CELL || (cell_blocks >= CELL && cell_blocks % CELL == 0)
+    cell_blocks == FINE_CELL
+      || cell_blocks == 2 * FINE_CELL
+      || (cell_blocks >= CELL && cell_blocks % CELL == 0)
+  }
+
+  /// 名字满足谓词的第一个已认领调色板。
+  pub fn find_rep(&self, pred: impl Fn(&str) -> bool) -> Option<PaletteId> {
+    self.f.names.iter().position(|n| pred(n)).and_then(|i| self.rep.get(i).copied().flatten())
+  }
+
+  /// 顶面代表色为 `rep` 的所有列中，出现最多的顶面高度（block）。
+  pub fn top_mode(&self, rep: PaletteId) -> Option<i32> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hmax = (self.f.sec_y * CELL) as usize;
+    let counts: Vec<AtomicUsize> = (0..hmax).map(|_| AtomicUsize::new(0)).collect();
+    let dims = self.f.dims;
+    (0..dims.1).into_par_iter().for_each(|iz| {
+      for ix in 0..dims.0 {
+        let col = (iz * dims.0 + ix) as usize;
+        if let Some(h) = self.top_height(col, rep) {
+          counts[h as usize].fetch_add(1, Ordering::Relaxed);
+        }
+      }
+    });
+    let mut best = None;
+    for (i, c) in counts.iter().enumerate() {
+      let n = c.load(Ordering::Relaxed);
+      if n > 0 && best.is_none_or(|(_, bn)| n > bn) {
+        best = Some((i as i32, n));
+      }
+    }
+    best.map(|(h, _)| h)
+  }
+
+  /// 该 block 列顶面为 `rep` 时返回其顶面高度；顶面不是 `rep` 则 `None`。
+  pub fn top_at_block(&self, bx: i32, bz: i32, rep: PaletteId) -> Option<i32> {
+    let cx = bx.div_euclid(CELL);
+    let cz = bz.div_euclid(CELL);
+    let (ix, iz) = (cx - self.f.col_min.0, cz - self.f.col_min.1);
+    if ix < 0 || iz < 0 || ix >= self.f.dims.0 || iz >= self.f.dims.1 {
+      return None;
+    }
+    let col = (iz * self.f.dims.0 + ix) as usize;
+    self.top_height(col, rep)
+  }
+
+  fn top_height(&self, col: usize, rep: PaletteId) -> Option<i32> {
+    let mask = self.f.mask[col];
+    if mask == 0 {
+      return None;
+    }
+    let mut k = 0usize;
+    let mut cells = [FINE_AIR; FINE_TOTAL];
+    for y in (0..self.f.sec_y).rev() {
+      if mask & (1 << y) == 0 {
+        continue;
+      }
+      let gidx = self.f.col_off(col) / 4 + k;
+      k += 1;
+      let Some(&start) = self.f.fine_offs.get(gidx) else { break };
+      let mut at = start as usize;
+      let mut pos = 0usize;
+      while pos < FINE_TOTAL {
+        if at + 3 > self.f.fine_body.len() {
+          break;
+        }
+        let name = u16::from_le_bytes([self.f.fine_body[at], self.f.fine_body[at + 1]]);
+        let run = self.f.fine_body[at + 2] as usize;
+        let end = (pos + run).min(FINE_TOTAL);
+        cells[pos..end].fill(name);
+        pos = end;
+        at += 3;
+      }
+      for ly in (0..FINE_PER_AXIS).rev() {
+        for lz in 0..FINE_PER_AXIS {
+          for lx in 0..FINE_PER_AXIS {
+            let name =
+              cells[(lx + FINE_PER_AXIS * lz + FINE_PER_AXIS * FINE_PER_AXIS * ly) as usize];
+            if name == FINE_AIR {
+              continue;
+            }
+            let r = self.rep.get(name as usize).copied().flatten()?;
+            return (r == rep).then_some(y * CELL + (ly + 1) * FINE_CELL);
+          }
+        }
+      }
+    }
+    None
   }
 
   fn entry(&self, cx: i32, y: i32, cz: i32) -> Option<(usize, usize, usize)> {
@@ -289,6 +377,24 @@ impl View {
       let l = cell.rem_euclid(IVec3::splat(CELL)) / FINE_CELL;
       let idx = (l.x + FINE_PER_AXIS * l.z + FINE_PER_AXIS * FINE_PER_AXIS * l.y) as usize;
       return self.fine(k, idx);
+    }
+    if cell_blocks == 2 * FINE_CELL {
+      let sec = cell.div_euclid(IVec3::splat(CELL));
+      let (_, _, k) = self.entry(sec.x, sec.y, sec.z)?;
+      let l = cell.rem_euclid(IVec3::splat(CELL)) / FINE_CELL;
+      let mut reps = [PaletteId::AIR; 8];
+      let mut i = 0usize;
+      for dy in 0..2 {
+        for dz in 0..2 {
+          for dx in 0..2 {
+            let idx =
+              (l.x + dx) + FINE_PER_AXIS * (l.z + dz) + FINE_PER_AXIS * FINE_PER_AXIS * (l.y + dy);
+            reps[i] = self.fine(k, idx as usize).unwrap_or(PaletteId::AIR);
+            i += 1;
+          }
+        }
+      }
+      return voxel::rep_of_surface(&reps, 4);
     }
     let n = cell_blocks / CELL;
     if n <= 0 {

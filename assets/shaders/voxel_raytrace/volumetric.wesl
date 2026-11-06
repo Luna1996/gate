@@ -11,8 +11,15 @@ const GODRAY_TAPS: u32 = 12u;
 const GODRAY_STEP_A: f32 = 0.35;
 const GODRAY_STEP_B: f32 = 0.65;
 
+fn sky_base(dir: vec3<f32>) -> vec3<f32> {
+  let c = sky_rgb();
+  let hor = mix(c, vec3<f32>(1.0, 0.97, 0.92), 0.28);
+  let zen = c * vec3<f32>(0.68, 0.76, 0.92);
+  return mix(hor, zen, smoothstep(-0.02, 0.55, dir.y));
+}
+
 fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
-  let base = sky_rgb();
+  let base = sky_base(dir);
   if (fog_u_read.misc2.x <= 0.5) { return base; }
   let ang = clamp(fog_u_read.misc2.z, 1e-4, SUN_CONE_MAX);
   let cos_t = dot(dir, sun_dir);
@@ -27,6 +34,7 @@ fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32
        + sun_c * (disk * SUN_DISK_GAIN * disk_gain
                   + halo * max(fog_u_read.misc2.w, 0.0));
 }
+
 
 fn godray_pass_mask(gid: vec3<u32>) {
   let size = textureDimensions(fog_a_w);
