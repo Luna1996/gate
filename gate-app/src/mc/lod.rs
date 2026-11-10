@@ -242,12 +242,10 @@ impl View {
       || (cell_blocks >= CELL && cell_blocks % CELL == 0)
   }
 
-  /// 名字满足谓词的第一个已认领调色板。
   pub fn find_rep(&self, pred: impl Fn(&str) -> bool) -> Option<PaletteId> {
     self.f.names.iter().position(|n| pred(n)).and_then(|i| self.rep.get(i).copied().flatten())
   }
 
-  /// 顶面代表色为 `rep` 的所有列中，出现最多的顶面高度（block）。
   pub fn top_mode(&self, rep: PaletteId) -> Option<i32> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -272,7 +270,6 @@ impl View {
     best.map(|(h, _)| h)
   }
 
-  /// 该 block 列顶面为 `rep` 时返回其顶面高度；顶面不是 `rep` 则 `None`。
   pub fn top_at_block(&self, bx: i32, bz: i32, rep: PaletteId) -> Option<i32> {
     let cx = bx.div_euclid(CELL);
     let cz = bz.div_euclid(CELL);

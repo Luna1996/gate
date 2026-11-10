@@ -516,7 +516,7 @@ fn grid_hit(h: VoxelHit, ci: vec3<i32>,
 
 const SECONDARY_REACH_CHUNKS: f32 = 12.0;
 
-const OCC_SKIP: u32 = 1u;
+const OCC_SKIP: u32 = 0u;
 const OCC_WORDS: u32 = (64u * 64u * 64u) / 32u;
 const OCC_VOLUMES: u32 = 1024u;
 

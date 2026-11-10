@@ -68,10 +68,22 @@ impl McCity {
           (coord.0 * gate_voxel::CHUNK_SIZE + IVec3::splat(128)) * scale / super::VOXELS_PER_BLOCK;
         water = Some((w, view.top_at_block(center.x, center.z, w).unwrap_or(fallback)));
       }
-      return self.far_tree(coord, cell_blocks, water, |cell| view.cell(cell, cell_blocks));
+      return self.far_tree(
+        coord,
+        cell_blocks,
+        water,
+        |cell| view.cell(cell, cell_blocks),
+        |cell| view.cell(cell, 4),
+      );
     }
     let summary = &self.summary;
-    self.far_tree(coord, cell_blocks, water, |cell| summary.cell(self, cell, cell_blocks))
+    self.far_tree(
+      coord,
+      cell_blocks,
+      water,
+      |cell| summary.cell(self, cell, cell_blocks),
+      |cell| summary.cell(self, cell, 4),
+    )
   }
 
   fn far_tree(
@@ -80,10 +92,15 @@ impl McCity {
     cell_blocks: i32,
     water: Option<(PaletteId, i32)>,
     cell: impl Fn(IVec3) -> Option<PaletteId>,
+    fine: impl Fn(IVec3) -> Option<PaletteId>,
   ) -> Option<ChunkTree> {
     let cells = gate_voxel::CHUNK_SIZE / FAR_GRAIN;
     let origin = coord.0 * cells * cell_blocks;
     let mut tree = ChunkTree::empty();
+    let wrep = water.map(|(w, _)| w);
+    let sub = if cell_blocks == 8 { 2 } else { 4 };
+    let n = cell_blocks / sub;
+    let extent = sub * 16 / cell_blocks;
     for kz in 0..cells {
       for ky in 0..cells {
         for kx in 0..cells {
@@ -93,8 +110,51 @@ impl McCity {
             && id == w
           {
             fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level, id);
+            let below =
+              if ky > 0 { cell(origin + IVec3::new(kx, ky - 1, kz) * cell_blocks) } else { None };
+            if ky == 0 || below.is_some_and(|b| Some(b) != wrep) {
+              for sz in 0..n {
+                for sx in 0..n {
+                  let fx = (c.x + sx * sub).div_euclid(4) * 4;
+                  let fz = (c.z + sz * sub).div_euclid(4) * 4;
+                  let Some(fid) = fine(IVec3::new(fx, c.y, fz)) else { continue };
+                  if Some(fid) == wrep {
+                    continue;
+                  }
+                  tree.fill_brick(
+                    [kx * FAR_GRAIN + sx * extent, ky * FAR_GRAIN, kz * FAR_GRAIN + sz * extent],
+                    extent,
+                    fid,
+                  );
+                }
+              }
+            }
           } else {
             tree.fill_brick([kx * FAR_GRAIN, ky * FAR_GRAIN, kz * FAR_GRAIN], FAR_GRAIN, id);
+            let above = if ky + 1 < cells {
+              cell(origin + IVec3::new(kx, ky + 1, kz) * cell_blocks)
+            } else {
+              None
+            };
+            if above.is_some_and(|a| Some(a) == wrep) {
+              let fy = c.y + cell_blocks - 4;
+              let y_far = ky * FAR_GRAIN + (cell_blocks - 4) * 16 / cell_blocks;
+              for sz in 0..n {
+                for sx in 0..n {
+                  let fx = (c.x + sx * sub).div_euclid(4) * 4;
+                  let fz = (c.z + sz * sub).div_euclid(4) * 4;
+                  let Some(fid) = fine(IVec3::new(fx, fy, fz)) else { continue };
+                  if Some(fid) == wrep {
+                    continue;
+                  }
+                  tree.fill_brick(
+                    [kx * FAR_GRAIN + sx * extent, y_far, kz * FAR_GRAIN + sz * extent],
+                    extent,
+                    fid,
+                  );
+                }
+              }
+            }
           }
         }
       }
@@ -247,7 +307,6 @@ fn block_origin(i: usize) -> IVec3 {
   IVec3::new((i % 16) as i32, (i / 256) as i32, ((i / 16) % 16) as i32) * SEC
 }
 
-/// 水面列在远场树里只填到 `level`（block），避免 8/16-block cell 把水面抬高。
 fn fill_water(
   tree: &mut ChunkTree,
   cell: [i32; 3],

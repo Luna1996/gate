@@ -1,12 +1,12 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, glass_req, glass_meta, eye_adapt, eye_adapt_ro, face_slots, face_slots_flat, fog_tex, gi_dn_dst, gi_dn_tmp, gi_guide, gi_guide_out, gi_out, gi_out_flat, gi_tex, gi_u, gi_wal, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
-import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
+import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{FACE_WORDS, FACE_W_FLAG, FACE_W_GI, FACE_W_GI_N, FACE_W_K0, FACE_W_K1, FACE_W_PAL, FACE_W_RAW, FACE_W_RAW_N, FACE_W_TEXEL, FACE_SLOT_READY, face_slot_claim, face_slot_find, face_slot_find_flat, face_slot_flag_next, face_slot_of, face_slot_sum_gi, gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pose_salt, gi_unkey_voxel, gi_vox_cache_k1, gi_vox_k1, gi_mix, gi_pack_dir, gi_rand2, gi_unpack_dir, GI_ACC_CLAMP, GI_ACC_MAX_N, GI_ACC_SCALE};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_near_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
 import package::gi::screen::{gi_ss_main};
 import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_FL_SHIFT, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
-import package::brickmap::{sample_brickmap};
+import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
 import package::world::{medium_one, voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
@@ -205,6 +205,7 @@ fn gi_upsample_joint(
   fallback: vec3<f32>,
 ) -> vec4<f32> {
   let npack = gi_pack_dir(n);
+  let nq = gi_unpack_dir(npack);
   let g = guv * vec2<f32>(f32(gsize.x), f32(gsize.y));
   let base = floor(g - vec2<f32>(0.5));
   let f = g - vec2<f32>(0.5) - base;
@@ -246,6 +247,9 @@ fn gi_upsample_joint(
   var best_w = 0.0;
   var best_acc = vec3<f32>(0.0);
   var best_a = 0.0;
+  var any_ok = false;
+  var any_d2 = 0;
+  var any = vec4<f32>(0.0);
   for (var dy: i32 = -GI_UPSAMPLE_HOLE_R; dy <= GI_UPSAMPLE_HOLE_R; dy = dy + 1) {
     for (var dx: i32 = -GI_UPSAMPLE_HOLE_R; dx <= GI_UPSAMPLE_HOLE_R; dx = dx + 1) {
       let c = nci + vec2<i32>(dx, dy);
@@ -255,6 +259,13 @@ fn gi_upsample_joint(
       let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
       if ((gk0 | gk1) == 0u) { continue; }
       let d2 = dx * dx + dy * dy;
+      let gsame = (k1 >> 19u) == (gk1 >> 19u)
+        && dot(gi_unpack_dir(gi_guide_out[tb + GI_DEN_G_NRM]), nq) >= GI_DEN_N_DOT;
+      if (gsame && (!any_ok || d2 < any_d2)) {
+        any_ok = true;
+        any_d2 = d2;
+        any = textureLoad(gi_tex, c, 0);
+      }
       if (gi_near_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack)) {
         let w = 1.0 / (1.0 + f32(d2));
         let s = textureLoad(gi_tex, c, 0);
@@ -266,6 +277,7 @@ fn gi_upsample_joint(
     }
   }
   if (best_ok) { return vec4<f32>(best_acc / best_w, best_a / best_w); }
+  if (any_ok) { return any; }
   return vec4<f32>(fallback, 0.0);
 }
 
@@ -281,6 +293,12 @@ fn prev_screen_uv(p_world: vec3<f32>, fallback: vec2<f32>) -> vec2<f32> {
   if (clip.w <= 1e-6) { return fallback; }
   let ndc = clip.xyz / clip.w;
   return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+fn voxel_face_index(gg: Grid, n: vec3<f32>, obj_id: i32) -> u32 {
+  let ln = select(n, vec3<f32>(dot(n, normalize(gg.col0)), dot(n, normalize(gg.col1)),
+                               dot(n, normalize(gg.col2))), obj_id >= 0);
+  return face_of_normal(ln);
 }
 
 fn gi_face_gi(voxel: vec3<i32>, face: u32, obj_id: i32) -> vec4<f32> {
@@ -465,23 +483,25 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var glass_col = vec3<f32>(0.0);
   var glass_w = 0.0;
   var sky_dir = ray_dir;
+  var entry_v = ray_dir;
   var water_miss = false;
   var refract_hit = false;
   var through_transmission = false;
   let glass_q = (light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
-    let fp = voxel_center_world(fg, first.voxel);
+    let fvx = first.voxel;
+    let fp = voxel_center_world(fg, fvx);
     var fnn = n_hint;
-    if (!n_hint_ok) { fnn = voxel_normal_fast(fg, first.voxel, first.face_id, first.n); }
+    if (!n_hint_ok) { fnn = voxel_normal_fast(fg, fvx, first.face_id, first.n); }
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
-
-    let f_face = fp + fnn * f_off;
-    let fv = face_view_dir(origin_voxel, fp);
-    let g = trace_glass(f_face, -fv, frustum_length, fnn,
-                        material_ior(first.palette_base, first.pal), fv, qpx, glass_q, true);
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
     water_miss = fm.roughness < 0.1;
+    let f_face = fp + fnn * f_off;
+    let fv = face_view_dir(origin_voxel, fp);
+    entry_v = fv;
+    let g = trace_glass(f_face, -fv, frustum_length, fnn,
+                        material_ior(first.palette_base, first.pal), fv, qpx, glass_q, true);
     if (glass_q > 0u) {
       best = g.ray;
       *best_out = g.ray;
@@ -519,31 +539,21 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let p_voxel = voxel_center_world(gg, best.voxel);
     let vuv = voxel_screen_uv(p_voxel, gi_in.uv);
     if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
-      return fetch_material(best.palette_base, best.pal, best.point, best.n, PBR_DEBUG_ASSET).albedo;
+      return fetch_material(best.palette_base, best.pal, p_voxel, normalize(gg.col1), PBR_DEBUG_ASSET).albedo;
     }
     let k0 = gi_key0(best.voxel, best.obj_id);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
     if (gi_u.params.y > 0.5 && gi_key_ok(best.voxel, best.obj_id)) {
       gi_wal_touch(best.voxel, best.obj_id, best.pal, k0, k1);
     }
-    let n_hint_own = n_hint_ok && !through_transmission;
     var n = best.n;
-    var n_reused = false;
-    if (n_hint_own) {
+    if (n_hint_ok && !through_transmission) {
       n = n_hint;
-      n_reused = true;
-    } else if (u32(gi_u.flags.y) == 1u) {
-      let gi_size = vec2<u32>(textureDimensions(gi_tex));
-      let tp = vec2<i32>(floor(gi_in.uv * vec2<f32>(f32(gi_size.x), f32(gi_size.y))));
-      if (tp.x >= 0 && tp.y >= 0 && tp.x < i32(gi_size.x) && tp.y < i32(gi_size.y)) {
-        let gb = (u32(tp.y) * gi_size.x + u32(tp.x)) * GI_DEN_GUIDE_WORDS;
-        if (gi_guide_out[gb + GI_DEN_G_KEY0] == k0 && gi_guide_out[gb + GI_DEN_G_KEY1] == k1) {
-          n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
-          n_reused = true;
-        }
-      }
+    } else {
+      n = voxel_normal_fast(gg, best.voxel, best.face_id, best.n);
     }
-    if (!n_reused) { n = voxel_normal_fast(gg, best.voxel, best.face_id, best.n); }
+    let nf = voxel_face_index(gg, n, best.obj_id);
+    let kv1 = gi_key1(best.voxel, nf, best.obj_id);
     var m = fetch_material(best.palette_base, best.pal, p_voxel, n, PBR_DEBUG_ASSET);
     let v = face_view_dir(origin_voxel, p_voxel);
     let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
@@ -564,9 +574,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
           } else if (am == 9u) {
             sun = vec3<f32>(1.0);
           } else {
-            // 介质吸收按同一水体沿太阳路径与视路径的行程比缩放；水下路径长度与
-            // 视路径成固定比例 |ray_dir.y| / |sun_dir.y|。
-            let k = clamp(abs(ray_dir.y) / max(abs(sun_dir.y), 0.05), 0.02, 8.0);
+            let k = clamp(abs(entry_v.y) / max(abs(sun_dir.y), 0.05), 0.02, 8.0);
             sun = f_shadow.vis * pow(max(through, vec3<f32>(1e-4)), vec3<f32>(k));
           }
         } else {
@@ -590,14 +598,14 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         if (gi_u.params.y > 0.5 && gi_key_ok(best.voxel, best.obj_id)) {
           gi_wal_touch(best.voxel, best.obj_id, best.pal, k0, k1);
         }
-        let fade = 1.0 - smoothstep(GLASS_GI_FAR0, GLASS_GI_FAR1, length(best.point - origin_voxel));
-        gi = refl_hit_gi(best.voxel, best.face_id, best.obj_id, best.pal) * fade;
+        let fade = 1.0 - smoothstep(GLASS_GI_FAR0, GLASS_GI_FAR1, length(p_voxel - origin_voxel));
+        gi = refl_hit_gi(best.voxel, nf, best.obj_id, best.pal) * fade;
         cov = select(0.0, 1.0, any(gi > vec3<f32>(0.0))) * fade;
       } else {
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[42u], 1u); }
         let gup = vec2<u32>(textureDimensions(gi_tex));
-        let guv = prev_screen_uv(best.point, vuv);
-        let s = gi_upsample_joint(guv, gup, k0, k1, n, vec3<f32>(0.0));
+        let guv = prev_screen_uv(p_voxel, vuv);
+        let s = gi_upsample_joint(guv, gup, k0, kv1, n, vec3<f32>(0.0));
         let gw = max(s.a, 1e-4);
         gi = s.rgb / gw;
         cov = clamp(s.a, 0.0, 1.0);
@@ -680,8 +688,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       if (f0_luma >= PBR_REFL_MIN_F0 && m.roughness <= PBR_REFL_MAX_ROUGH) {
         let fade = clamp(1.0 - m.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
         col = col - fade * f0r * (amb + gi);
-        queue_refl_chain(gi_key0(best.voxel, best.obj_id), gi_key1(best.voxel, best.face_id, best.obj_id),
-                         best.pal, best.palette_base, best.face_id,
+        queue_refl_chain(k0, kv1, best.pal, best.palette_base, nf,
                          fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade, qpx);
       }
     }
@@ -800,7 +807,9 @@ fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
       atomicAdd(&lod_diag[DIAG_LUMA_FAR], p);
     }
   }
-  col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
+  if (!first.hit) {
+    col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
+  }
   if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) {
     col = vol_tint_color(first);
   }
@@ -974,23 +983,10 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pal = atomicLoad(&face_slots[fe + FACE_W_PAL]);
     let n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
     let g = make_grid(u32(obj_id) + 1u);
-    let dd = vec3<f32>(dot(n, normalize(g.col0)), dot(n, normalize(g.col1)), dot(n, normalize(g.col2)));
-    var sum = vec3<f32>(0.0);
-    var wsum = 0.0;
-    for (var f = 0u; f < 6u; f = f + 1u) {
-      let axis = f / 2u;
-      let sgn = select(-1.0, 1.0, (f & 1u) == 1u);
-      var w = dd.z;
-      if (axis == 0u) { w = dd.x; } else if (axis == 1u) { w = dd.y; }
-      w = w * sgn;
-      if (w <= 0.0) { continue; }
-      let v = gi_face_pool(voxel, f, obj_id, pal);
-      if (!(v.w > 0.0)) { continue; }
-      sum = sum + v.xyz * w;
-      wsum = wsum + w;
-    }
-    if (wsum > 0.0) {
-      let q = clamp(sum / wsum, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
+    let ln = vec3<f32>(dot(n, normalize(g.col0)), dot(n, normalize(g.col1)), dot(n, normalize(g.col2)));
+    let v = gi_face_pool(voxel, face_of_normal(ln), obj_id, pal);
+    if (v.w > 0.0) {
+      let q = clamp(v.xyz, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
       let qv = vec3<u32>(round(q * GI_ACC_SCALE));
       let nfe = vs * FACE_WORDS;
       atomicStore(&face_slots[nfe + FACE_W_GI], qv.x);
@@ -1576,7 +1572,7 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
   let gg = make_grid(u32(first.obj_id) + 1u);
   let p_voxel = voxel_center_world(gg, first.voxel);
   if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
-    return fetch_material(first.palette_base, first.pal, first.point, first.n, PBR_DEBUG_ASSET).albedo;
+    return fetch_material(first.palette_base, first.pal, p_voxel, normalize(gg.col1), PBR_DEBUG_ASSET).albedo;
   }
   let k0 = gi_key0(first.voxel, first.obj_id);
   let k1 = gi_key1(first.voxel, first.face_id, first.obj_id);
@@ -1585,19 +1581,21 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
   }
   let m = fetch_material(first.palette_base, first.pal, p_voxel, n, PBR_DEBUG_ASSET);
   let v = face_view_dir(origin_voxel, p_voxel);
+  let nf = voxel_face_index(gg, n, first.obj_id);
+  let kv1 = gi_key1(first.voxel, nf, first.obj_id);
   let gi_on = gi_u.misc.x > 0.5;
   var gi = vec3<f32>(0.0);
   var cov = 0.0;
   if (gi_on) {
-    let acc = gi_vox_gi_cached(first.voxel, first.obj_id);
+    var acc = gi_vox_gi_cached(first.voxel, first.obj_id);
     if (acc.w > 0.0) {
       gi = acc.xyz;
       cov = 1.0;
     } else {
       let gup = vec2<u32>(textureDimensions(gi_tex));
       let vuv = voxel_screen_uv(p_voxel, uv);
-      let guv = prev_screen_uv(first.point, vuv);
-      let s = gi_upsample_joint(guv, gup, k0, k1, n, vec3<f32>(0.0));
+      let guv = prev_screen_uv(p_voxel, vuv);
+      let s = gi_upsample_joint(guv, gup, k0, kv1, n, vec3<f32>(0.0));
       let gw = max(s.a, 1e-4);
       gi = s.rgb / gw;
       cov = clamp(s.a, 0.0, 1.0);
@@ -1612,7 +1610,7 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
     if (f0_luma >= PBR_REFL_MIN_F0 && m.roughness <= PBR_REFL_MAX_ROUGH) {
       let fade = clamp(1.0 - m.roughness / PBR_REFL_MAX_ROUGH, 0.0, 1.0);
       col = col - fade * f0r * (amb + gi);
-      queue_refl_chain(k0, k1, first.pal, first.palette_base, first.face_id,
+      queue_refl_chain(k0, kv1, first.pal, first.palette_base, nf,
                        fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade, qpx);
     }
   }
@@ -1647,7 +1645,9 @@ fn dda_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
   let sun_vis = textureLoad(dda_shadow_tex, coord).rgb;
   var col = shade_split(first, origin_voxel, dir_voxel, px, u32(gid.y) * size.x + u32(gid.x),
                         n, sun_dir, sky, sun_c, sun_vis);
-  col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
+  if (!first.hit) {
+    col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
+  }
   if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
   write_output(coord, col);
   if (gi_u.misc.x > 0.5) { dda_hit_record(gid, first, origin_voxel); }
@@ -1699,9 +1699,8 @@ fn dda_glass(@builtin(global_invocation_id) gid: vec3<u32>,
     }
     var best = first;
     var col = shade_face(first, origin_voxel, dir_voxel, frustum_length,
-                         GiInput(false, vec3<f32>(0.0), 0.0, uv), sun_dir, sky, sun_c,
-                         n_hint, need_n, u32(coord.y) * size.x + u32(coord.x), &best, f_shadow);
-    col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), uv);
+                     GiInput(false, vec3<f32>(0.0), 0.0, uv), sun_dir, sky, sun_c,
+                     n_hint, need_n, u32(coord.y) * size.x + u32(coord.x), &best, f_shadow);
     if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
     write_output(coord, col);
     if (gi_u.misc.x > 0.5) { dda_hit_record(pgid, best, origin_voxel); }

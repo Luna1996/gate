@@ -20,6 +20,13 @@ const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
   0x04020007u,
 );
 
+fn face_of_normal(n: vec3<f32>) -> u32 {
+  let a = abs(n);
+  if (a.x >= a.y && a.x >= a.z) { return select(0u, 1u, n.x > 0.0); }
+  if (a.y >= a.z) { return select(2u, 3u, n.y > 0.0); }
+  return select(4u, 5u, n.z > 0.0);
+}
+
 fn face_normal_from_index(f: u32) -> vec3<f32> {
   if (f == 0u) { return vec3<f32>(-1.0, 0.0, 0.0); }
   if (f == 1u) { return vec3<f32>( 1.0, 0.0, 0.0); }
