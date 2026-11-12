@@ -9,7 +9,7 @@ import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
-import package::world::{medium_one, voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
+import package::world::{medium_one, voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_at_point, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
 @compute @workgroup_size(8, 8, 1)
 fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -61,9 +61,13 @@ fn dda_hit_unpack(raw: vec4<u32>, origin_voxel: vec3<f32>, dir_voxel: vec3<f32>)
   let salt = gi_pose_salt(obj);
   let face = ((raw.z ^ salt) >> 16u) & 7u;
   let g = make_grid(u32(obj + 1));
-  let voxel = gi_unkey_voxel(raw.y, raw.z, obj);
+  var voxel = gi_unkey_voxel(raw.y, raw.z, obj);
   let n = face_normal_world(g, face);
-  return WorldHit(true, t, origin_voxel + dir_voxel * t, (raw.w >> 1u) & 0x7FFFFFu,
+  let point = origin_voxel + dir_voxel * t;
+  if (obj >= 0) {
+    voxel = voxel_at_point(g, point - n * (0.5 * g.scale));
+  }
+  return WorldHit(true, t, point, (raw.w >> 1u) & 0x7FFFFFu,
                   n, face, voxel, obj, g.palette_base);
 }
 
@@ -196,16 +200,55 @@ fn write_output(coord: vec2<i32>, col: vec3<f32>) {
 
 const GI_UPSAMPLE_HOLE_R: i32 = 1;
 
+fn gi_upsample_step_tol(p_voxel: vec3<f32>, cam: vec3<f32>, g: Grid) -> f32 {
+  let gdv = f32(max(u32(gi_u.flags.y), 1u));
+  if (gdv < 1.5) { return 0.0; }
+  let dist = length(p_voxel - cam);
+  let proj_y = max(abs(view_u.view_proj[1][1]), 1e-3);
+  let hpx = max(f32(textureDimensions(gi_tex).y) * gdv, 1.0);
+  let world_root = 2.0 * dist / (proj_y * hpx) * gdv;
+  let tol_root = min(max(world_root, 32.0), 96.0);
+  return tol_root / max(g.scale, 1e-6);
+}
+
+fn gi_plane_axis(k0: u32, k1: u32, axis: u32) -> i32 {
+  if (axis == 0u) { return i32(k0 << 16u) >> 16u; }
+  if (axis == 1u) { return i32(k0) >> 16u; }
+  return i32(k1 << 16u) >> 16u;
+}
+
+fn gi_near_plane_step(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32,
+                      nq: vec3<f32>, nface: u32, tol: f32) -> bool {
+  if (nface != 2u && nface != 3u) { return false; }
+  if ((k1 >> 19u) != (hk1 >> 19u)) { return false; }
+  let hd = gi_unpack_dir(hn);
+  if (dot(hd, nq) < GI_DEN_N_DOT) { return false; }
+  if (face_of_normal(hd) != nface) { return false; }
+  let axis = nface >> 1u;
+  let a = gi_plane_axis(k0, k1, axis);
+  let b = gi_plane_axis(hk0, hk1, axis);
+  return abs(f32(a - b)) <= tol;
+}
+
+fn gi_upsample_ok(hk0: u32, hk1: u32, hn: u32, k0: u32, k1: u32,
+                  n: u32, nq: vec3<f32>, nface: u32, step_tol: f32) -> bool {
+  if (gi_near_surface(hk0, hk1, hn, k0, k1, n)) { return true; }
+  if (step_tol <= 0.5) { return false; }
+  return gi_near_plane_step(hk0, hk1, hn, k0, k1, nq, nface, step_tol);
+}
+
 fn gi_upsample_joint(
   guv: vec2<f32>,
   gsize: vec2<u32>,
   k0: u32,
   k1: u32,
   n: vec3<f32>,
+  step_tol: f32,
   fallback: vec3<f32>,
 ) -> vec4<f32> {
   let npack = gi_pack_dir(n);
   let nq = gi_unpack_dir(npack);
+  let nface = face_of_normal(nq);
   let g = guv * vec2<f32>(f32(gsize.x), f32(gsize.y));
   let base = floor(g - vec2<f32>(0.5));
   let f = g - vec2<f32>(0.5) - base;
@@ -222,7 +265,7 @@ fn gi_upsample_joint(
       let gk0 = gi_guide_out[tb + GI_DEN_G_KEY0];
       let gk1 = gi_guide_out[tb + GI_DEN_G_KEY1];
       if ((gk0 | gk1) == 0u) { continue; }
-      if (!gi_near_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack)) { continue; }
+      if (!gi_upsample_ok(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack, nq, nface, step_tol)) { continue; }
       let s = textureLoad(gi_tex, c, 0);
       acc = acc + s.rgb * bw;
       acc_a = acc_a + s.a * bw;
@@ -234,13 +277,15 @@ fn gi_upsample_joint(
   let nc = clamp(base + vec2<f32>(select(0.0, 1.0, f.x >= 0.5), select(0.0, 1.0, f.y >= 0.5)),
                  vec2<f32>(0.0), vec2<f32>(f32(gsize.x) - 1.0, f32(gsize.y) - 1.0));
   let nci = vec2<i32>(nc);
-  let ntb = (u32(nci.y) * gsize.x + u32(nci.x)) * GI_DEN_GUIDE_WORDS;
-  let ngk0 = gi_guide_out[ntb + GI_DEN_G_KEY0];
-  let ngk1 = gi_guide_out[ntb + GI_DEN_G_KEY1];
-  if ((ngk0 | ngk1) != 0u
-      && gi_near_surface(ngk0, ngk1, gi_guide_out[ntb + GI_DEN_G_NRM], k0, k1, npack)) {
-    let sn = textureLoad(gi_tex, nci, 0);
-    if (sn.a > 0.5) { return sn; }
+  if (step_tol <= 0.5) {
+    let ntb = (u32(nci.y) * gsize.x + u32(nci.x)) * GI_DEN_GUIDE_WORDS;
+    let ngk0 = gi_guide_out[ntb + GI_DEN_G_KEY0];
+    let ngk1 = gi_guide_out[ntb + GI_DEN_G_KEY1];
+    if ((ngk0 | ngk1) != 0u
+        && gi_near_surface(ngk0, ngk1, gi_guide_out[ntb + GI_DEN_G_NRM], k0, k1, npack)) {
+      let sn = textureLoad(gi_tex, nci, 0);
+      if (sn.a > 0.5) { return sn; }
+    }
   }
 
   var best_ok = false;
@@ -250,8 +295,10 @@ fn gi_upsample_joint(
   var any_ok = false;
   var any_d2 = 0;
   var any = vec4<f32>(0.0);
-  for (var dy: i32 = -GI_UPSAMPLE_HOLE_R; dy <= GI_UPSAMPLE_HOLE_R; dy = dy + 1) {
-    for (var dx: i32 = -GI_UPSAMPLE_HOLE_R; dx <= GI_UPSAMPLE_HOLE_R; dx = dx + 1) {
+  var hr = GI_UPSAMPLE_HOLE_R;
+  if (step_tol > 0.5) { hr = hr + 1; }
+  for (var dy: i32 = -hr; dy <= hr; dy = dy + 1) {
+    for (var dx: i32 = -hr; dx <= hr; dx = dx + 1) {
       let c = nci + vec2<i32>(dx, dy);
       if (c.x < 0 || c.y < 0 || c.x >= i32(gsize.x) || c.y >= i32(gsize.y)) { continue; }
       let tb = (u32(c.y) * gsize.x + u32(c.x)) * GI_DEN_GUIDE_WORDS;
@@ -266,7 +313,7 @@ fn gi_upsample_joint(
         any_d2 = d2;
         any = textureLoad(gi_tex, c, 0);
       }
-      if (gi_near_surface(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack)) {
+      if (gi_upsample_ok(gk0, gk1, gi_guide_out[tb + GI_DEN_G_NRM], k0, k1, npack, nq, nface, step_tol)) {
         let w = 1.0 / (1.0 + f32(d2));
         let s = textureLoad(gi_tex, c, 0);
         best_acc = best_acc + s.rgb * w;
@@ -308,24 +355,37 @@ fn gi_face_gi(voxel: vec3<i32>, face: u32, obj_id: i32) -> vec4<f32> {
 }
 
 fn gi_face_pool(voxel: vec3<i32>, face: u32, obj_id: i32, pal: u32) -> vec4<f32> {
-  let acc = gi_face_gi(voxel, face, obj_id);
-  if (acc.w > 0.0) { return vec4<f32>(acc.xyz / (acc.w * GI_ACC_SCALE), 1.0); }
   let a1 = (face / 2u + 1u) % 3u;
   let a2 = (face / 2u + 2u) % 3u;
   let t1 = vec3<i32>(select(0, 1, a1 == 0u), select(0, 1, a1 == 1u), select(0, 1, a1 == 2u));
   let t2 = vec3<i32>(select(0, 1, a2 == 0u), select(0, 1, a2 == 1u), select(0, 1, a2 == 2u));
-  for (var d = 1u; d <= 2u; d = d + 1u) {
+  let g = make_grid(u32(obj_id) + 1u);
+  let gdv = max(u32(gi_u.flags.y), 1u);
+  let dist = length(voxel_center_world(g, voxel) - view_u.cam_pos_voxel.xyz);
+  let proj_y = abs(view_u.view_proj[1][1]);
+  let hpx = max(f32(textureDimensions(out_base).y), 1.0);
+  let world_per_px = 2.0 * dist / max(proj_y * hpx, 1e-3);
+  let footprint = world_per_px * f32(gdv) / max(g.scale, 1e-6);
+  let rings = clamp(i32(footprint), i32(2u * gdv), 32);
+  var sum = vec3<f32>(0.0);
+  var wsum = 0.0;
+  let own = gi_face_gi(voxel, face, obj_id);
+  if (own.w > 0.0) {
+    sum = sum + own.xyz;
+    wsum = wsum + own.w;
+  }
+  for (var d = 1u; d <= u32(rings); d = d + 1u) {
     let dv = i32(d);
-    var sum = vec3<f32>(0.0);
-    var n = 0.0;
+    let dw = 1.0 / f32(d);
     let nb = array<vec3<i32>, 4u>(voxel + t1 * dv, voxel - t1 * dv, voxel + t2 * dv, voxel - t2 * dv);
     for (var k = 0u; k < 4u; k = k + 1u) {
       let a = gi_face_gi(nb[k], face, obj_id);
-      sum = sum + a.xyz;
-      n = n + a.w;
+      if (a.w == 0.0) { continue; }
+      sum = sum + a.xyz * dw;
+      wsum = wsum + a.w * dw;
     }
-    if (n > 0.0) { return vec4<f32>(sum / (n * GI_ACC_SCALE), 1.0); }
   }
+  if (wsum > 0.0) { return vec4<f32>(sum / (wsum * GI_ACC_SCALE), 1.0); }
   return vec4<f32>(0.0);
 }
 
@@ -334,6 +394,53 @@ fn gi_vox_gi_cached(voxel: vec3<i32>, obj_id: i32) -> vec4<f32> {
   if (acc.w == 0u) { return vec4<f32>(0.0); }
   let inv = 1.0 / (f32(acc.w) * GI_ACC_SCALE);
   return vec4<f32>(f32(acc.x) * inv, f32(acc.y) * inv, f32(acc.z) * inv, 1.0);
+}
+
+struct VoxCache {
+  val: vec3<f32>,
+  face: u32,
+  ok: bool,
+}
+
+fn gi_vox_cache_lookup(voxel: vec3<i32>, obj_id: i32) -> VoxCache {
+  let k0 = gi_key0(voxel, obj_id);
+  let vkey = gi_vox_cache_k1(gi_key1(voxel, 0u, obj_id));
+  var ok = false;
+  let s = face_slot_find(k0, vkey, &ok);
+  if (!ok) { return VoxCache(vec3<f32>(0.0), 0u, false); }
+  let fe = s * FACE_WORDS;
+  let n = atomicLoad(&face_slots[fe + FACE_W_GI_N]);
+  if (n == 0u) { return VoxCache(vec3<f32>(0.0), 0u, false); }
+  let inv = 1.0 / (f32(n) * GI_ACC_SCALE);
+  let val = vec3<f32>(f32(atomicLoad(&face_slots[fe + FACE_W_GI])),
+                      f32(atomicLoad(&face_slots[fe + FACE_W_GI + 1u])),
+                      f32(atomicLoad(&face_slots[fe + FACE_W_GI + 2u]))) * inv;
+  return VoxCache(val, atomicLoad(&face_slots[fe + FACE_W_PAL]), true);
+}
+
+fn gi_vox_plane(voxel: vec3<i32>, obj_id: i32, n: vec3<f32>) -> vec4<f32> {
+  let g = make_grid(u32(obj_id) + 1u);
+  let ln = vec3<f32>(dot(n, normalize(g.col0)), dot(n, normalize(g.col1)), dot(n, normalize(g.col2)));
+  let face = face_of_normal(ln);
+  let a1 = (face / 2u + 1u) % 3u;
+  let a2 = (face / 2u + 2u) % 3u;
+  let t1 = vec3<i32>(select(0, 1, a1 == 0u), select(0, 1, a1 == 1u), select(0, 1, a1 == 2u));
+  let t2 = vec3<i32>(select(0, 1, a2 == 0u), select(0, 1, a2 == 1u), select(0, 1, a2 == 2u));
+  var sum = vec3<f32>(0.0);
+  var wsum = 0.0;
+  for (var d = 1u; d <= 6u; d = d + 1u) {
+    let dv = i32(d);
+    let dw = 1.0 / f32(d);
+    let nb = array<vec3<i32>, 4u>(voxel + t1 * dv, voxel - t1 * dv, voxel + t2 * dv, voxel - t2 * dv);
+    for (var k = 0u; k < 4u; k = k + 1u) {
+      let a = gi_vox_cache_lookup(nb[k], obj_id);
+      if (!a.ok || a.face != face) { continue; }
+      sum = sum + a.val * dw;
+      wsum = wsum + dw;
+    }
+  }
+  if (wsum > 0.0) { return vec4<f32>(sum / wsum, 1.0); }
+  return vec4<f32>(0.0);
 }
 
 fn refl_hit_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32) -> vec3<f32> {
@@ -605,7 +712,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
         if (LOD_DIAG == 1u) { atomicAdd(&lod_diag[42u], 1u); }
         let gup = vec2<u32>(textureDimensions(gi_tex));
         let guv = prev_screen_uv(p_voxel, vuv);
-        let s = gi_upsample_joint(guv, gup, k0, kv1, n, vec3<f32>(0.0));
+        let s = gi_upsample_joint(guv, gup, k0, kv1, n,
+                                gi_upsample_step_tol(p_voxel, origin_voxel, gg), vec3<f32>(0.0));
         let gw = max(s.a, 1e-4);
         gi = s.rgb / gw;
         cov = clamp(s.a, 0.0, 1.0);
@@ -675,6 +783,16 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
             }
           }
         }
+      }
+    }
+    if (!refract_hit) {
+      let an = abs(n);
+      let edge_vox = (u32(an.x > 0.2) + u32(an.y > 0.2) + u32(an.z > 0.2)) >= 2u;
+      let vp = gi_vox_plane(best.voxel, best.obj_id, n);
+      if (vp.w > 0.0) {
+        let w = select(0.7, 1.0, edge_vox);
+        gi = mix(gi, vp.xyz, w);
+        cov = max(cov, w);
       }
     }
     let amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, cov);
@@ -984,11 +1102,13 @@ fn dda_face_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gi_unpack_dir(gi_guide_out[gb + GI_DEN_G_NRM]);
     let g = make_grid(u32(obj_id) + 1u);
     let ln = vec3<f32>(dot(n, normalize(g.col0)), dot(n, normalize(g.col1)), dot(n, normalize(g.col2)));
-    let v = gi_face_pool(voxel, face_of_normal(ln), obj_id, pal);
+    let face = face_of_normal(ln);
+    let v = gi_face_pool(voxel, face, obj_id, pal);
     if (v.w > 0.0) {
       let q = clamp(v.xyz, vec3<f32>(0.0), vec3<f32>(GI_ACC_CLAMP));
       let qv = vec3<u32>(round(q * GI_ACC_SCALE));
       let nfe = vs * FACE_WORDS;
+      atomicStore(&face_slots[nfe + FACE_W_PAL], face);
       atomicStore(&face_slots[nfe + FACE_W_GI], qv.x);
       atomicStore(&face_slots[nfe + FACE_W_GI + 1u], qv.y);
       atomicStore(&face_slots[nfe + FACE_W_GI + 2u], qv.z);
@@ -1535,12 +1655,19 @@ fn dda_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
   let obj_id = i32((raw.z >> 19u) & 0x1FFFu) - 1;
   let g = make_grid(u32(obj_id + 1));
   let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
+  let face_id = ((raw.z ^ gi_pose_salt(obj_id)) >> 16u) & 7u;
+  var voxel = gi_unkey_voxel(raw.y, raw.z, obj_id);
+  if (obj_id >= 0) {
+    let diff = split_ray(vec3<u32>(u32(coord.x), u32(coord.y), 0u), size);
+    let dir = normalize(diff);
+    let point = view_u.cam_pos_voxel.xyz + dir * bitcast<f32>(raw.x);
+    voxel = voxel_at_point(g, point - face_normal_world(g, face_id) * (0.5 * g.scale));
+  }
   if ((palette_flags(g.palette_base, pal) & FLAGS_TRANSMISSIVE) != 0u) {
     var vis = vec3<f32>(0.0);
     if (normals_on) {
       let n = textureLoad(dda_nrm, coord).xyz;
       if (dot(n, sun_dir) > 0.0) {
-        let voxel = gi_unkey_voxel(raw.y, raw.z, obj_id);
         let p = voxel_center_world(g, voxel);
         let off = surface_offset(g, n, SHADOW_SURFACE_EPS);
         vis = sun_transmittance(p + n * off, sun_dir, voxel, obj_id);
@@ -1559,7 +1686,6 @@ fn dda_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     shadow_store(coord, vec3<f32>(0.0));
     return;
   }
-  let voxel = gi_unkey_voxel(raw.y, raw.z, obj_id);
   let p = voxel_center_world(g, voxel);
   let off = surface_offset(g, n, SHADOW_SURFACE_EPS);
   shadow_store(coord, sun_transmittance(p + n * off, sun_dir, voxel, obj_id));
@@ -1595,10 +1721,21 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
       let gup = vec2<u32>(textureDimensions(gi_tex));
       let vuv = voxel_screen_uv(p_voxel, uv);
       let guv = prev_screen_uv(p_voxel, vuv);
-      let s = gi_upsample_joint(guv, gup, k0, kv1, n, vec3<f32>(0.0));
+      let s = gi_upsample_joint(guv, gup, k0, kv1, n,
+                                gi_upsample_step_tol(p_voxel, origin_voxel, gg), vec3<f32>(0.0));
       let gw = max(s.a, 1e-4);
       gi = s.rgb / gw;
       cov = clamp(s.a, 0.0, 1.0);
+    }
+  }
+  {
+    let an = abs(n);
+    let edge_vox = (u32(an.x > 0.2) + u32(an.y > 0.2) + u32(an.z > 0.2)) >= 2u;
+    let vp = gi_vox_plane(first.voxel, first.obj_id, n);
+    if (vp.w > 0.0) {
+      let w = select(0.7, 1.0, edge_vox);
+      gi = mix(gi, vp.xyz, w);
+      cov = max(cov, w);
     }
   }
   let amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, cov);
