@@ -12,7 +12,7 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
     atomicAdd(&lod_diag[15u], 64u);
   }
   var tint = vec3<f32>(1.0);
-  let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
+  let h = world_trace_medium_scene(origin, sun_dir, min(GI_T_MAX, GI_REACH_T), false, false, &tint);
   let through = tint;
   if (!h.hit) { return through; }
   if (all(h.voxel == self_voxel) && h.obj_id == self_obj) { return vec3<f32>(1.0); }
@@ -81,7 +81,7 @@ fn gi_face_shade_cached(sh: WorldHit, org: vec3<f32>, sun_dir: vec3<f32>, sun_c:
 fn gi_bounce2_probe(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>,
                     sun_bounce: f32, epoch: u32) -> vec3<f32> {
   var tint = vec3<f32>(1.0);
-  let h = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
+  let h = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, false, &tint);
   if (!h.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }
@@ -109,7 +109,7 @@ fn gi_ray_radiance(org: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: ve
     atomicAdd(&lod_diag[14u], 64u);
   }
   var tint = vec3<f32>(1.0);
-  let sh = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, &tint);
+  let sh = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, false, &tint);
   if (!sh.hit) {
     return sky_rgb() * GI_SKY_RADIANCE_SCALE * tint;
   }

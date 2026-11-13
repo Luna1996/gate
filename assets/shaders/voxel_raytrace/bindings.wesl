@@ -7,6 +7,8 @@
 @group(7) @binding(20) var out_tex: texture_storage_2d<rgba8unorm, write>;
 @group(7) @binding(21) var out_base_tex: texture_2d<f32>;
 @group(7) @binding(22) var<storage, read_write> refl_sum: array<atomic<u32>>;
+@group(7) @binding(23) var<storage, read_write> refl_first: array<atomic<u32>>;
+@group(7) @binding(24) var<storage, read_write> refl_ray: array<atomic<u32>>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 @group(0) @binding(4) var dda_hit: texture_storage_2d<rgba32uint, read_write>;

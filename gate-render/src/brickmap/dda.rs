@@ -293,6 +293,8 @@ pub(crate) struct AuxTexCache {
   refl_cap: u64,
   refl_req: Option<Buffer>,
   refl_sum: Option<Buffer>,
+  refl_ray: Option<Buffer>,
+  refl_first: Option<Buffer>,
   refl_meta: Option<Buffer>,
   refl_cfg: Option<Buffer>,
   glass_req: Option<Buffer>,
@@ -549,19 +551,34 @@ pub(crate) fn init_dda_pipelines(
   dda_shader: Res<crate::shader::DdaShaderHandle>,
   pipeline_cache: Res<PipelineCache>,
 ) {
-  let bg0 = BindGroupLayoutDescriptor::new(
-    "DdaBg0",
-    &BindGroupLayoutEntries::sequential(
-      ShaderStages::COMPUTE,
-      (
-        texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
-        uniform_buffer::<DdaViewUniform>(false),
-        texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
-        storage_buffer_read_only_sized(false, None),
-        texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
-      ),
+  let mut bg0_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
+    ShaderStages::COMPUTE,
+    (
+      texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+      uniform_buffer::<DdaViewUniform>(false),
+      texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
+      storage_buffer_read_only_sized(false, None),
+      texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
     ),
-  );
+  )
+  .to_vec();
+  for (binding, format) in [
+    (30u32, TextureFormat::Rgba32Uint),
+    (31, TextureFormat::Rgba16Float),
+    (32, TextureFormat::Rgba16Float),
+  ] {
+    bg0_entries.push(BindGroupLayoutEntry {
+      binding,
+      visibility: ShaderStages::COMPUTE,
+      ty: BindingType::StorageTexture {
+        access: StorageTextureAccess::ReadWrite,
+        format,
+        view_dimension: TextureViewDimension::D2,
+      },
+      count: None,
+    });
+  }
+  let bg0 = BindGroupLayoutDescriptor::new("DdaBg0", &bg0_entries);
 
   let mut bg0_perf_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
     ShaderStages::COMPUTE,
@@ -794,6 +811,26 @@ pub(crate) fn init_dda_pipelines(
     visibility: ShaderStages::COMPUTE,
     ty: BindingType::Buffer {
       ty: BufferBindingType::Uniform,
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  });
+  refl_all_entries.push(BindGroupLayoutEntry {
+    binding: 23,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  });
+  refl_all_entries.push(BindGroupLayoutEntry {
+    binding: 24,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
       has_dynamic_offset: false,
       min_binding_size: None,
     },
@@ -1256,8 +1293,11 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
         mapped_at_creation: false,
       })
     };
-    beam_cache.refl_req = Some(make_buf("gate_refl_req", refl_cap * 8 * 4));
+    beam_cache.refl_req = Some(make_buf("gate_refl_req", refl_cap * 12 * 4));
     beam_cache.refl_sum = Some(make_buf("gate_refl_sum", refl_px * 3 * 4));
+    beam_cache.refl_ray = Some(make_buf("gate_refl_ray", refl_px * 3 * 4));
+    let refl_slots = refl_px.next_power_of_two().clamp(1024, 1u64 << 21);
+    beam_cache.refl_first = Some(make_buf("gate_refl_first", refl_slots * 4 * 4));
     beam_cache.refl_meta = Some(make_buf("gate_refl_meta", 16));
     let cfg_buf = render_device.create_buffer(&BufferDescriptor {
       label: Some("gate_refl_cfg"),
@@ -1365,17 +1405,33 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     );
   }
 
-  let bg0 = render_device.create_bind_group(
-    None,
-    &bg0_layout,
-    &BindGroupEntries::sequential((
-      beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
-      &u,
-      &beam_view,
-      eye_buf.as_entire_binding(),
-      beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
-    )),
-  );
+  let mut bg0_entries_vec: Vec<BindGroupEntry> = BindGroupEntries::sequential((
+    beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
+    &u,
+    &beam_view,
+    eye_buf.as_entire_binding(),
+    beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
+  ))
+  .to_vec();
+  bg0_entries_vec.push(BindGroupEntry {
+    binding: 30,
+    resource: BindingResource::TextureView(
+      beam_cache.perf_vis_view.as_ref().expect("dda vis view 未建"),
+    ),
+  });
+  bg0_entries_vec.push(BindGroupEntry {
+    binding: 31,
+    resource: BindingResource::TextureView(
+      beam_cache.perf_nrm_view.as_ref().expect("dda nrm view 未建"),
+    ),
+  });
+  bg0_entries_vec.push(BindGroupEntry {
+    binding: 32,
+    resource: BindingResource::TextureView(
+      beam_cache.perf_shadow_view.as_ref().expect("dda shadow view 未建"),
+    ),
+  });
+  let bg0 = render_device.create_bind_group(None, &bg0_layout, &bg0_entries_vec);
 
   let perf_bg0 = if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta)) = (
     beam_cache.perf_vis_view.as_ref(),
@@ -1404,55 +1460,84 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   };
   beam_cache.perf_bg0 = perf_bg0;
 
-  let (refl_write_bg, refl_read_bg) =
-    if let (Some(req), Some(sum), Some(meta), Some(cfg), Some(base_view)) = (
-      beam_cache.refl_req.as_ref(),
-      beam_cache.refl_sum.as_ref(),
-      beam_cache.refl_meta.as_ref(),
-      beam_cache.refl_cfg.as_ref(),
-      beam_cache.out_base_view.as_ref(),
-    ) {
-      let wl = pipeline_cache.get_bind_group_layout(&pipelines.refl_write_layout);
-      let rl = pipeline_cache.get_bind_group_layout(&pipelines.refl_read_layout);
-      let wbg = render_device.create_bind_group(
-        None,
-        &wl,
-        &[
-          BindGroupEntry { binding: 10, resource: req.as_entire_binding() },
-          BindGroupEntry { binding: 11, resource: meta.as_entire_binding() },
-          BindGroupEntry { binding: 12, resource: cfg.as_entire_binding() },
-        ],
-      );
-      let rbg = render_device.create_bind_group(
-        None,
-        &rl,
-        &[
-          BindGroupEntry { binding: 10, resource: req.as_entire_binding() },
-          BindGroupEntry { binding: 11, resource: meta.as_entire_binding() },
-          BindGroupEntry { binding: 12, resource: cfg.as_entire_binding() },
-          BindGroupEntry {
-            binding: 20,
-            resource: BindingResource::TextureView(&tex_view.texture_view),
-          },
-          BindGroupEntry { binding: 21, resource: BindingResource::TextureView(base_view) },
-          BindGroupEntry { binding: 22, resource: sum.as_entire_binding() },
-        ],
-      );
-      (Some(wbg), Some(rbg))
-    } else {
-      (None, None)
-    };
-  let compose_bg0 = render_device.create_bind_group(
-    None,
-    &bg0_layout,
-    &BindGroupEntries::sequential((
-      &tex_view.texture_view,
-      &u,
-      &beam_view,
-      eye_buf.as_entire_binding(),
-      beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
-    )),
-  );
+  let (refl_write_bg, refl_read_bg) = if let (
+    Some(req),
+    Some(sum),
+    Some(ray),
+    Some(first),
+    Some(meta),
+    Some(cfg),
+    Some(base_view),
+  ) = (
+    beam_cache.refl_req.as_ref(),
+    beam_cache.refl_sum.as_ref(),
+    beam_cache.refl_ray.as_ref(),
+    beam_cache.refl_first.as_ref(),
+    beam_cache.refl_meta.as_ref(),
+    beam_cache.refl_cfg.as_ref(),
+    beam_cache.out_base_view.as_ref(),
+  ) {
+    let wl = pipeline_cache.get_bind_group_layout(&pipelines.refl_write_layout);
+    let rl = pipeline_cache.get_bind_group_layout(&pipelines.refl_read_layout);
+    let wbg = render_device.create_bind_group(
+      None,
+      &wl,
+      &[
+        BindGroupEntry { binding: 10, resource: req.as_entire_binding() },
+        BindGroupEntry { binding: 11, resource: meta.as_entire_binding() },
+        BindGroupEntry { binding: 12, resource: cfg.as_entire_binding() },
+        BindGroupEntry { binding: 23, resource: first.as_entire_binding() },
+        BindGroupEntry { binding: 24, resource: ray.as_entire_binding() },
+      ],
+    );
+    let rbg = render_device.create_bind_group(
+      None,
+      &rl,
+      &[
+        BindGroupEntry { binding: 10, resource: req.as_entire_binding() },
+        BindGroupEntry { binding: 11, resource: meta.as_entire_binding() },
+        BindGroupEntry { binding: 12, resource: cfg.as_entire_binding() },
+        BindGroupEntry { binding: 23, resource: first.as_entire_binding() },
+        BindGroupEntry { binding: 24, resource: ray.as_entire_binding() },
+        BindGroupEntry {
+          binding: 20,
+          resource: BindingResource::TextureView(&tex_view.texture_view),
+        },
+        BindGroupEntry { binding: 21, resource: BindingResource::TextureView(base_view) },
+        BindGroupEntry { binding: 22, resource: sum.as_entire_binding() },
+      ],
+    );
+    (Some(wbg), Some(rbg))
+  } else {
+    (None, None)
+  };
+  let mut compose_entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
+    &tex_view.texture_view,
+    &u,
+    &beam_view,
+    eye_buf.as_entire_binding(),
+    beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
+  ))
+  .to_vec();
+  compose_entries.push(BindGroupEntry {
+    binding: 30,
+    resource: BindingResource::TextureView(
+      beam_cache.perf_vis_view.as_ref().expect("dda vis view 未建"),
+    ),
+  });
+  compose_entries.push(BindGroupEntry {
+    binding: 31,
+    resource: BindingResource::TextureView(
+      beam_cache.perf_nrm_view.as_ref().expect("dda nrm view 未建"),
+    ),
+  });
+  compose_entries.push(BindGroupEntry {
+    binding: 32,
+    resource: BindingResource::TextureView(
+      beam_cache.perf_shadow_view.as_ref().expect("dda shadow view 未建"),
+    ),
+  });
+  let compose_bg0 = render_device.create_bind_group(None, &bg0_layout, &compose_entries);
   beam_cache.refl_compose_bg0 = Some(compose_bg0);
   beam_cache.refl_write_bg = refl_write_bg;
   beam_cache.refl_read_bg = refl_read_bg;
@@ -1842,6 +1927,12 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         .map(|(sum, meta)| {
           ctx.command_encoder().clear_buffer(sum, 0, None);
           ctx.command_encoder().clear_buffer(meta, 0, None);
+          if let Some(first) = a.refl_first.as_ref() {
+            ctx.command_encoder().clear_buffer(first, 0, None);
+          }
+          if let Some(ray) = a.refl_ray.as_ref() {
+            ctx.command_encoder().clear_buffer(ray, 0, None);
+          }
           true
         })
         .unwrap_or(false)

@@ -267,7 +267,7 @@ fn trace_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_c
 }
 
 fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
-             req: u32, origin_xz: f32, shell: ptr<function, f32>,
+             req: u32, far: u32, jit: f32, origin_xz: f32, shell: ptr<function, f32>,
              best: ptr<function, SceneHit>, best_t: ptr<function, f32>,
              mc: ptr<function, MediumRay>, gap: ptr<function, f32>) {
   let far_base = inst_bvh[2u];
@@ -277,18 +277,18 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
   var traces: u32 = 0u;
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
     iters = iters + 1u;
-    if (req == 0u && origin_xz < *shell) {
+    if (far == 0u && origin_xz < *shell) {
       continue;
     }
     let gi = make_grid(inst_bvh[far_base + k]);
-    let shell_cap = level_cap(*shell, dir);
+    let shell_cap = level_cap(*shell * jit, dir);
     var t_lo = t_min;
-    if (origin_xz < *shell) {
+    if (origin_xz < *shell && (*best).uh.hit) {
       t_lo = max(t_min, shell_cap);
     }
     var t_hi = min(*best_t, t_cap);
     if (gi.coverage_r > 0.0) {
-      t_hi = min(t_hi, level_cap(gi.coverage_r, dir));
+      t_hi = min(t_hi, level_cap(gi.coverage_r * jit, dir));
     }
     if (t_lo >= t_hi) {
       *shell = max(*shell, coverage_r_of(gi));
@@ -310,7 +310,7 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
 }
 
 fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_cap: u32,
-               req: u32) -> SceneHit {
+               req: u32, far: u32) -> SceneHit {
   var mc_off = MediumRay(false, g0.palette_base, 0u, vec3<f32>(1.0));
   var gap: f32 = 1.0e+30;
   var shell = coverage_r_of(g0);
@@ -321,6 +321,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
   if (g0.coverage_r > 0.0) {
     g0_cap = min(t_cap, level_cap(g0.coverage_r, dir));
   }
+  let jit = 1.0;
   var best = SceneHit(
     trace_grid(g0, origin, dir, g0_cap, t_min, depth_cap, false, req, &mc_off, &gap), 0u);
   if (best.uh.hit) {
@@ -328,7 +329,7 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
     best.palette_base = g0.palette_base;
   }
   trace_near(origin, dir, t_cap, t_min, depth_cap, req, &best, &best_t, &mc_off, &gap);
-  trace_far(origin, dir, t_cap, t_min, depth_cap, req, origin_xz, &shell, &best, &best_t,
+  trace_far(origin, dir, t_cap, t_min, depth_cap, req, far, jit, origin_xz, &shell, &best, &best_t,
             &mc_off, &gap);
   return best;
 }
@@ -346,14 +347,19 @@ struct WorldRayQuery {
   depth_cap: u32,
 
   req: u32,
+  far: u32,
 }
 
 fn world_cfg_full(t_min: f32, depth_cap: u32) -> WorldRayQuery {
-  return WorldRayQuery(t_min, depth_cap, 0u);
+  return WorldRayQuery(t_min, depth_cap, 0u, 0u);
 }
 
 fn world_cfg_primary(t_min: f32, depth_cap: u32) -> WorldRayQuery {
-  return WorldRayQuery(t_min, depth_cap, 1u);
+  return WorldRayQuery(t_min, depth_cap, 1u, 1u);
+}
+
+fn world_cfg_reflect(t_min: f32, depth_cap: u32) -> WorldRayQuery {
+  return WorldRayQuery(t_min, depth_cap, 0u, 1u);
 }
 
 struct WorldHit {
@@ -373,7 +379,7 @@ fn world_miss() -> WorldHit {
 }
 
 fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: WorldRayQuery) -> WorldHit {
-  let s = trace_scene(g0, origin, dir, max_t, cfg.t_min, cfg.depth_cap, cfg.req);
+  let s = trace_scene(g0, origin, dir, max_t, cfg.t_min, cfg.depth_cap, cfg.req, cfg.far);
   return WorldHit(
     s.uh.hit, s.uh.t, origin + dir * s.uh.t, s.uh.pal, s.uh.n,
     s.uh.face_id, s.uh.voxel, s.uh.obj_id, s.palette_base);
@@ -499,7 +505,8 @@ fn world_trace_glass_path(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_on
   return best;
 }
 
-fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_on_air: bool,
+fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, include_far: bool,
+                            stop_on_air: bool,
                             tint: ptr<function, vec3<f32>>) -> WorldHit {
   let g0 = make_grid(0u);
   let cam_est = (g0.w_mn + g0.w_mx) * 0.5;
@@ -512,11 +519,22 @@ fn world_trace_medium_scene(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, stop_
   let far_base = inst_bvh[2u];
   let far_count = inst_bvh[3u];
   for (var k: u32 = 0u; k < far_count; k = k + 1u) {
-    if (origin_xz < shell) {
+    let gi = make_grid(inst_bvh[far_base + k]);
+    var t_lo = 0.0;
+    if (include_far) {
+      if (origin_xz < shell && abs(dir.y) < 0.5) {
+        t_lo = level_cap(shell, dir);
+      }
+    } else if (origin_xz < shell) {
       continue;
     }
-    let gi = make_grid(inst_bvh[far_base + k]);
-    medium_one(gi, origin, dir, max_t, 0.0, stop_on_air, &best, &best_t, tint);
+    var t_cap = max_t;
+    if (gi.coverage_r > 0.0) {
+      t_cap = min(max_t, level_cap(gi.coverage_r, dir));
+    }
+    if (t_lo < t_cap) {
+      medium_one(gi, origin, dir, t_cap, t_lo, stop_on_air, &best, &best_t, tint);
+    }
     shell = max(shell, coverage_r_of(gi));
   }
   return best;

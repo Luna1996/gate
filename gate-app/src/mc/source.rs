@@ -61,13 +61,8 @@ impl McCity {
 
   fn produce_far(&self, coord: ChunkCoord, scale: i32) -> Option<ChunkTree> {
     let cell_blocks = cell_blocks_of(scale);
-    let mut water = *self.water.lock().unwrap_or_else(|e| e.into_inner());
+    let water = *self.water.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
-      if let Some((w, fallback)) = water {
-        let center =
-          (coord.0 * gate_voxel::CHUNK_SIZE + IVec3::splat(128)) * scale / super::VOXELS_PER_BLOCK;
-        water = Some((w, view.top_at_block(center.x, center.z, w).unwrap_or(fallback)));
-      }
       return self.far_tree(
         coord,
         cell_blocks,

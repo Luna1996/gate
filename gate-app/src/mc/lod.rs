@@ -23,7 +23,7 @@ const FINE_TOTAL: usize = (FINE_PER_AXIS * FINE_PER_AXIS * FINE_PER_AXIS) as usi
 const FINE_AIR: u16 = u16::MAX;
 const PROGRESS_COLS: usize = 4096;
 
-const FORMAT_TAG: u64 = 4;
+const FORMAT_TAG: u64 = 5;
 
 pub fn stamp(map_dir: &Path) -> u64 {
   let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -268,17 +268,6 @@ impl View {
       }
     }
     best.map(|(h, _)| h)
-  }
-
-  pub fn top_at_block(&self, bx: i32, bz: i32, rep: PaletteId) -> Option<i32> {
-    let cx = bx.div_euclid(CELL);
-    let cz = bz.div_euclid(CELL);
-    let (ix, iz) = (cx - self.f.col_min.0, cz - self.f.col_min.1);
-    if ix < 0 || iz < 0 || ix >= self.f.dims.0 || iz >= self.f.dims.1 {
-      return None;
-    }
-    let col = (iz * self.f.dims.0 + ix) as usize;
-    self.top_height(col, rep)
   }
 
   fn top_height(&self, col: usize, rep: PaletteId) -> Option<i32> {

@@ -153,7 +153,7 @@ fn gi_wal_touch(v_world: vec3<i32>, obj: i32, pal: u32, k0: u32, k1: u32) {
   atomicStore(&gi_wal[b + 7u], frame << GI_WAL_FL_SHIFT);
 }
 
-fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
+fn gi_wal_pool_rs(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32, r: i32, st: i32) -> vec4<f32> {
   let nmask = gi_wal_nmask();
   if (nmask == 0u || !gi_key_ok(v_world, obj)) { return vec4<f32>(0.0); }
   let face = (k1 >> 16u) & 7u;
@@ -165,8 +165,8 @@ fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
   let org = gi_key_org(obj);
   var sum = vec3<f32>(0.0);
   var cnt = 0.0;
-  for (var i = -GI_WAL_POOL_R; i <= GI_WAL_POOL_R; i = i + 1) {
-    for (var j = -GI_WAL_POOL_R; j <= GI_WAL_POOL_R; j = j + 1) {
+  for (var i = -r; i <= r; i = i + st) {
+    for (var j = -r; j <= r; j = j + st) {
       let v = v_world + t1 * i + t2 * j;
       if (!gi_key_ok(v, obj)) { continue; }
       let s = gi_wal_fetch(v, org, obj, pal, face, nmask, gi_key0(v, obj), gi_key1(v, face, obj));
@@ -177,8 +177,20 @@ fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
   return vec4<f32>(sum, cnt);
 }
 
-fn gi_wal_sample(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
-  let p = gi_wal_pool(v_world, obj, pal, k1);
+fn gi_wal_pool_r(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32, r: i32) -> vec4<f32> {
+  return gi_wal_pool_rs(v_world, obj, pal, k1, r, 1);
+}
+
+fn gi_wal_pool(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
+  return gi_wal_pool_rs(v_world, obj, pal, k1, GI_WAL_POOL_R, 1);
+}
+
+fn gi_wal_sample_rs(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32, r: i32, st: i32) -> vec4<f32> {
+  let p = gi_wal_pool_rs(v_world, obj, pal, k1, r, st);
   if (!(p.w > 0.0)) { return vec4<f32>(0.0); }
   return vec4<f32>(p.xyz / p.w, min(1.0, p.w / GI_WAL_MATURE_N));
+}
+
+fn gi_wal_sample(v_world: vec3<i32>, obj: i32, pal: u32, k1: u32) -> vec4<f32> {
+  return gi_wal_sample_rs(v_world, obj, pal, k1, GI_WAL_POOL_R, 1);
 }
