@@ -24,32 +24,54 @@ pub const FAR_SCALES: [i32; 3] = [4, 8, 16];
 pub const DEFAULT_REQUEST_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const FAR_GRAIN: i32 = 16;
 
-pub fn far_coverage_voxels(vol: usize) -> i32 {
-  let ladder = far_radius_ladder(gate_render::pool_capacity_chunks_far(DEFAULT_REQUEST_BYTES));
+const FAR_CONTENT_LAYERS_DEFAULT: [i32; 3] = [3, 1, 1];
+
+pub fn far_content_layers(content_y: Option<(i32, i32)>) -> [i32; 3] {
+  let Some((lo, hi)) = content_y else {
+    return FAR_CONTENT_LAYERS_DEFAULT;
+  };
+  let span = (hi - lo).max(1) as u64;
+  FAR_SCALES.map(|scale| {
+    let chunk = gate_voxel::CHUNK_SIZE as u64 * scale as u64;
+    (span.div_ceil(chunk)).max(1) as i32
+  })
+}
+
+pub fn far_coverage_voxels(vol: usize, budget_bytes: usize, layers: [i32; 3]) -> i32 {
+  let ladder = far_radius_ladder(gate_render::pool_capacity_chunks_far(budget_bytes), layers);
   let (_, r_out) = ladder[(vol - 1).min(ladder.len() - 1)];
   (r_out + 1 - SEAM_MARGIN).max(1) * gate_voxel::CHUNK_SIZE * FAR_SCALES[vol - 1]
 }
 
-pub fn attach_far_levels(volumes: &mut Volumes, pbr_ids: &[String], center: IVec3) {
+pub fn attach_far_levels(
+  volumes: &mut Volumes,
+  pbr_ids: &[String],
+  center: IVec3,
+  budget_bytes: usize,
+) {
   let slots = material_slots(pbr_ids.len());
-  attach_far_levels_with(volumes, center, |g| {
+  attach_far_levels_with(volumes, center, FAR_CONTENT_LAYERS_DEFAULT, budget_bytes, |g| {
     for (id, entry) in slots.iter() {
       g.palette_mut().set(*id, *entry);
     }
   });
 }
 
-pub fn attach_far_levels_mc(volumes: &mut Volumes, center: IVec3) {
-  attach_far_levels_with(volumes, center, |_| {});
+pub fn attach_far_levels_mc(volumes: &mut Volumes, center: IVec3, budget_bytes: usize) {
+  let layers = far_content_layers(Some(crate::mc::content_y()));
+  attach_far_levels_with(volumes, center, layers, budget_bytes, |_| {});
 }
 
 fn attach_far_levels_with(
   volumes: &mut Volumes,
   center: IVec3,
+  layers: [i32; 3],
+  budget_bytes: usize,
   fill_palette: impl Fn(&mut gate_voxel::VolumeGrid),
 ) {
   const WINDOW_CHUNKS: i32 = 32;
-  let ladder = far_radius_ladder(gate_render::pool_capacity_chunks_far(DEFAULT_REQUEST_BYTES));
+  let cap_far = gate_render::pool_capacity_chunks_far(budget_bytes);
+  let ladder = far_radius_ladder(cap_far, layers);
   let mut dims = IVec3::splat(WINDOW_CHUNKS * 2);
   for (k, &scale) in FAR_SCALES.iter().enumerate() {
     let (_, r_out) = ladder[k];
@@ -61,17 +83,18 @@ fn attach_far_levels_with(
     fill_palette(g);
     let c = (center / scale).div_euclid(IVec3::splat(gate_voxel::CHUNK_SIZE));
     g.set_stream_window(Some((c - dims / 2, dims)));
-    g.set_coverage_r(far_coverage_voxels(vol) as f32);
+    g.set_coverage_r(far_coverage_voxels(vol, budget_bytes, layers) as f32);
     bevy::log::info!(
       "FAR L{vol} scale {scale}（1 级体素 = {scale} 世界体素）覆盖 ±{:.2}km；窗口 {}×{}×{} chunk × 256 级体素、\
-       格 {FAR_GRAIN} 级体素 = {:.2}m；半径阶梯 r{r_in}..{r_out}",
-      far_coverage_voxels(vol) as f32 * 0.02 / 1000.0,
+       格 {FAR_GRAIN} 级体素 = {:.2}m；半径阶梯 r{r_in}..{r_out}、内容 {l} 层",
+      far_coverage_voxels(vol, budget_bytes, layers) as f32 * 0.02 / 1000.0,
       dims.x,
       dims.y,
       dims.z,
       FAR_GRAIN as f32 * scale as f32 * 0.02,
       r_in = ladder[k].0,
       r_out = r_out,
+      l = layers[k],
     );
   }
 }
@@ -134,6 +157,12 @@ impl VolScope {
     let t = c - self.w_origin;
     t.cmpge(IVec3::ZERO).all() && t.cmplt(self.w_dims).all()
   }
+}
+
+fn far_in_ring(c: IVec3, center: IVec3, r_in: i32, r_out: i32, hy: i32) -> bool {
+  let d = c - center;
+  let d2 = d.x * d.x + d.z * d.z;
+  d.y.abs() <= hy && d2 >= r_in * r_in && d2 <= r_out * r_out
 }
 
 #[derive(Resource)]
@@ -311,7 +340,7 @@ pub fn stream_chunks(p: StreamChunksParams) {
   let far_max = stream.far_levels_max;
   let cap = gate_render::pool_capacity_chunks(request_bytes);
   let cap_far = gate_render::pool_capacity_chunks_far(request_bytes);
-  let ladder = far_radius_ladder(cap_far);
+  let ladder = far_radius_ladder(cap_far, far_content_layers(content_y));
   let cap_main = DEMAND_TABLE_MAX.min(cap);
 
   let n_pbr = crate::scene::pbr_asset_count(pbr.as_deref());
@@ -551,6 +580,7 @@ pub fn stream_chunks(p: StreamChunksParams) {
       }
       sd.mark(4);
 
+      let far_ring = far_level.then(|| ladder[(vol - 1).min(ladder.len() - 1)]);
       while !st.ready.is_empty() && words_mounted < mount_count {
         let w = st.ready.front().expect("刚看过 len").3;
         if words_mounted > 0 && words + w > mount_words {
@@ -558,6 +588,11 @@ pub fn stream_chunks(p: StreamChunksParams) {
         }
         let (cc, detail, tree, _words) = st.ready.pop_front().expect("刚看过 front");
         st.ready_set.remove(&cc);
+        if let Some((r_in, r_out)) = far_ring
+          && !far_in_ring(cc.0, scope.center, r_in, r_out, scope.v_hy)
+        {
+          continue;
+        }
         grid.mount_chunk_tree(cc, tree, 0);
         st.detail.insert(cc, detail);
         *use_seq += 1;
@@ -581,7 +616,10 @@ pub fn stream_chunks(p: StreamChunksParams) {
       let resident: Vec<ChunkCoord> = grid.chunk_coords().collect();
       let mut out: Vec<ChunkCoord> = Vec::new();
       for c in &resident {
-        if !scope.in_window(c.0) {
+        let stale = !scope.in_window(c.0)
+          || far_ring
+            .is_some_and(|(r_in, r_out)| !far_in_ring(c.0, scope.center, r_in, r_out, scope.v_hy));
+        if stale {
           out.push(*c);
         }
       }
@@ -1016,13 +1054,17 @@ const VIEW_COS: f32 = 0.5;
 
 pub(crate) const SEAM_MARGIN: i32 = 2;
 
-const FAR_PRELOAD_INNER: i32 = crate::mc::NEAR_COVER_CHUNKS / 4 - 2;
+const FAR_PRELOAD_INNER: i32 = crate::mc::NEAR_COVER_CHUNKS / FAR_SCALES[0] - 2;
 
 const PRELOAD_DETAIL_CAP: Detail = Detail::FINE;
 
 const PRELOAD_FULL_CHUNKS: i32 = 8;
 
-const FAR_PRELOAD_OUTER: i32 = 40;
+const FAR_PRELOAD_OUTER: i32 = gate_render::brickmap::wire::CHUNK_INDEX_CAP as i32 / 2 - 1;
+const _: () = assert!(
+  FAR_PRELOAD_OUTER * 2 + 2 <= gate_render::brickmap::wire::CHUNK_INDEX_CAP as i32,
+  "远场窗口必须装进 b_struct 的 64 槽索引区"
+);
 
 const FAR_PRELOAD_HY: i32 = 8;
 
@@ -1033,14 +1075,12 @@ fn far_cap(vol: usize, cap: usize) -> usize {
   (cap as u64 * W[(vol - 1).min(FAR_LEVELS - 1)] as u64 / 100) as usize
 }
 
-const FAR_CONTENT_LAYERS: [i32; 3] = [3, 1, 1];
-
-fn far_radius_ladder(cap: usize) -> [(i32, i32); FAR_LEVELS] {
+fn far_radius_ladder(cap: usize, layers: [i32; 3]) -> [(i32, i32); FAR_LEVELS] {
   let mut out = [(0, 0); FAR_LEVELS];
   let mut r_in = FAR_PRELOAD_INNER;
   for k in 0..FAR_SCALES.len() {
     let budget = far_cap(k + 1, cap) as u64;
-    let layers = FAR_CONTENT_LAYERS[k].max(1) as u64;
+    let layers = layers[k].max(1) as u64;
     let per_ring = |r: i32| 8 * layers * r.max(0) as u64;
     let (mut r_out, mut sum) = (r_in - 1, 0u64);
     while r_out < FAR_PRELOAD_OUTER && sum + per_ring(r_out + 1) <= budget {
@@ -1048,7 +1088,8 @@ fn far_radius_ladder(cap: usize) -> [(i32, i32); FAR_LEVELS] {
       sum += per_ring(r_out);
     }
     out[k] = (r_in, r_out);
-    r_in = ((r_out - SEAM_MARGIN + 1) / 2 - 1).max(1);
+    let ratio = (FAR_SCALES[(k + 1).min(FAR_SCALES.len() - 1)] / FAR_SCALES[k]).max(1);
+    r_in = ((r_out - SEAM_MARGIN + 1) / ratio - 1).max(1);
   }
   out
 }
@@ -1191,7 +1232,11 @@ fn plan_generation_far(
 ) -> Vec<(IVec3, Detail)> {
   let mut req: Vec<gate_render::LodRequest> = requests
     .iter()
-    .filter(|r| r.vol as usize == vol && scope.in_window(r.chunk))
+    .filter(|r| {
+      r.vol as usize == vol
+        && scope.in_window(r.chunk)
+        && far_in_ring(r.chunk, scope.center, r_in, r_out, scope.v_hy)
+    })
     .copied()
     .collect();
   req.sort_unstable_by_key(|r| (std::cmp::Reverse(r.votes), r.chunk.x, r.chunk.y, r.chunk.z));

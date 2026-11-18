@@ -21,6 +21,10 @@ pub const MC_MAP: &str = "mc_map";
 
 pub const VOXELS_PER_BLOCK: i32 = 16;
 
+pub fn content_y() -> (i32, i32) {
+  (0, world::SECTIONS_PER_CHUNK * 16 * VOXELS_PER_BLOCK)
+}
+
 pub const NEAR_COVER_CHUNKS: i32 = WINDOW_CHUNKS - SEAM_MARGIN;
 
 const WINDOW_CHUNKS: i32 = 32;

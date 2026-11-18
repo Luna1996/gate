@@ -283,7 +283,9 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
     let gi = make_grid(inst_bvh[far_base + k]);
     let shell_cap = level_cap(*shell * jit, dir);
     var t_lo = t_min;
-    if (origin_xz < *shell && (*best).uh.hit) {
+    if (req != 0u) {
+      t_lo = max(t_min, shell_cap);
+    } else if (origin_xz < *shell && (*best).uh.hit) {
       t_lo = max(t_min, shell_cap);
     }
     var t_hi = min(*best_t, t_cap);

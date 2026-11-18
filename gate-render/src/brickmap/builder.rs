@@ -1225,6 +1225,15 @@ impl VolumesBuilder {
     if let Some(k) = pick {
       return Some(self.slot_free.swap_remove(k));
     }
+    if volume_idx == 0 && self.page_hi[0] + need > seg {
+      self.page_hi[0] = 0;
+      self.slot_tree[0] = (0, 0);
+      self.slot_free.retain(|(base, _)| *base as usize >= seg);
+      bevy::log::warn_once!(
+        target: "gate",
+        "世界体树槽第 0 页回收重排（需要 {need} 字）⇒ 不截断世界"
+      );
+    }
     let hi = self.page_hi[page];
     if hi + need > seg {
       return None;
@@ -1238,7 +1247,8 @@ impl VolumesBuilder {
     let n = self.builders.len();
 
     let seg = crate::wesl_consts::trace_consts().seg_words as usize;
-    let world_cap = (self.budget_bytes / 4).clamp(1, seg);
+    let world_cap =
+      if self.budget_bytes == 0 { seg } else { (self.budget_bytes / 4).clamp(1, seg) };
     if self.slot_tree.len() < n {
       self.slot_tree.resize(n, (0, 0));
     }

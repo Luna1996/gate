@@ -686,16 +686,28 @@ fn register_callbacks(world: &mut World) {
             return;
           };
           let t0 = std::time::Instant::now();
+          let eye_now = cam.as_ref().map_or(fly.pos, |c| c.position_world);
+          let was_mc = stream
+            .source()
+            .and_then(|s| s.clone_as_any())
+            .and_then(|a| a.downcast::<crate::mc::source::McCity>().ok())
+            .is_some();
           match crate::scene::reload_world(
             &mut scene,
             &name,
             &crate::scene::pbr_asset_ids(pbr.as_deref()),
-            cam.map(|c| c.position_world.as_ivec3()),
+            Some(eye_now.as_ivec3()),
             &mut stream,
           ) {
             Ok(_info) => {
               phys.reset();
-              if let Some((eye, target)) = crate::scene::test_world_camera(&name) {
+              let near_spawn = crate::mc::spawn_eye()
+                .is_none_or(|s| eye_now.distance_squared(s.as_vec3()) <= 25_000.0 * 25_000.0);
+              if name == crate::mc::MC_MAP && !was_mc && !near_spawn {
+                let (eye, target) = crate::scene::mc_camera();
+                crate::camera::set_camera_preset(&mut orbit, &mut fly, eye, target);
+                info!("机位 → {name} 距出生点过远，回到出生点 eye={eye:?} target={target:?}");
+              } else if let Some((eye, target)) = crate::scene::test_world_camera(&name) {
                 crate::camera::set_camera_preset(&mut orbit, &mut fly, eye, target);
                 info!("机位 → {name} 默认视角 eye={eye:?} target={target:?}");
               }

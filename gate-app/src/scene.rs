@@ -154,9 +154,18 @@ pub(crate) fn setup(
   let mut volumes = Volumes::new(grid);
   if volumes.main().attach_far() {
     if stream.has_custom_source() {
-      crate::infinite_cubes::attach_far_levels_mc(&mut volumes, start_eye.as_ivec3());
+      crate::infinite_cubes::attach_far_levels_mc(
+        &mut volumes,
+        start_eye.as_ivec3(),
+        stream.request_bytes,
+      );
     } else {
-      crate::infinite_cubes::attach_far_levels(&mut volumes, &pbr_ids, start_eye.as_ivec3());
+      crate::infinite_cubes::attach_far_levels(
+        &mut volumes,
+        &pbr_ids,
+        start_eye.as_ivec3(),
+        stream.request_bytes,
+      );
     }
   }
 
@@ -165,7 +174,7 @@ pub(crate) fn setup(
     demo_force_full_rebuild: true,
     interior_only_edit: false,
     edit_in_flight: false,
-    residency_budget_bytes: 0,
+    residency_budget_bytes: stream.request_bytes,
     transforms_dirty: false,
   });
   commands
@@ -206,7 +215,7 @@ fn build_world(
   vox_scene::load_vox_scene(grid, &path, anchor)
 }
 
-fn mc_camera() -> (Vec3, Vec3) {
+pub(crate) fn mc_camera() -> (Vec3, Vec3) {
   let target =
     mc::spawn_eye().unwrap_or(IVec3::new(0, 400, 0)).as_vec3() + Vec3::new(0.0, 80.0, 0.0);
   (target + Vec3::new(-400.0, 400.0, -400.0), target)
@@ -234,13 +243,14 @@ pub(crate) fn reload_world(
   let mut volumes = Volumes::new(grid);
   if volumes.main().attach_far() {
     if stream.has_custom_source() {
-      crate::infinite_cubes::attach_far_levels_mc(&mut volumes, eye);
+      crate::infinite_cubes::attach_far_levels_mc(&mut volumes, eye, stream.request_bytes);
     } else {
-      crate::infinite_cubes::attach_far_levels(&mut volumes, pbr_ids, eye);
+      crate::infinite_cubes::attach_far_levels(&mut volumes, pbr_ids, eye, stream.request_bytes);
     }
   }
   scene.volumes = volumes;
   scene.demo_force_full_rebuild = true;
+  scene.residency_budget_bytes = stream.request_bytes;
   Ok(info)
 }
 

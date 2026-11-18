@@ -217,7 +217,7 @@ impl summary::SectionReps for McCity {
 
 impl ChunkSource for McCity {
   fn content_y_range(&self) -> Option<(i32, i32)> {
-    Some((0, world::SECTIONS_PER_CHUNK * SEC * super::VOXELS_PER_BLOCK))
+    Some(super::content_y())
   }
 
   fn produce(
