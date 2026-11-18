@@ -1,5 +1,5 @@
 import package::bindings::{dda_hit, fog_a_r_blur, fog_a_w, fog_a_w_blur, fog_b_r_blur, fog_b_w_blur, fog_u, fog_u_blur, fog_u_read, gi_u, light_u, view_u};
-import package::common::{sky_rgb};
+import package::common::{hash_u32, sky_rgb};
 
 const SUN_DISK_GAIN: f32 = 3.0;
 const LIMB_POW: f32 = 0.5;
@@ -11,11 +11,37 @@ const GODRAY_TAPS: u32 = 12u;
 const GODRAY_STEP_A: f32 = 0.35;
 const GODRAY_STEP_B: f32 = 0.65;
 
+fn sky_luma(c: vec3<f32>) -> f32 {
+  return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn sky_stars(dir: vec3<f32>, night: f32) -> vec3<f32> {
+  if (night <= 0.001) { return vec3<f32>(0.0); }
+  let p = dir * 160.0;
+  let cell = floor(p);
+  let ip = vec3<i32>(cell);
+  let h = hash_u32(u32(ip.x) * 73856093u + u32(ip.y) * 19349663u + u32(ip.z) * 83492791u);
+  let pick = f32(h & 0xFFFFu) / 65535.0;
+  if (pick > 0.0035) { return vec3<f32>(0.0); }
+  let d = length(p - cell - vec3<f32>(0.5));
+  let core = 1.0 - smoothstep(0.02, 0.34, d);
+  let hot = f32((h >> 16u) & 0xFFu) / 255.0;
+  let tint = mix(vec3<f32>(1.0, 0.84, 0.68), vec3<f32>(0.78, 0.88, 1.0), hot);
+  let bright = (0.35 + 0.65 * hot) * night * smoothstep(0.02, 0.16, dir.y);
+  return tint * core * bright * 0.22;
+}
+
 fn sky_base(dir: vec3<f32>) -> vec3<f32> {
   let c = sky_rgb();
-  let hor = mix(c, vec3<f32>(1.0, 0.97, 0.92), 0.28);
-  let zen = c * vec3<f32>(0.68, 0.76, 0.92);
-  return mix(hor, zen, smoothstep(-0.02, 0.55, dir.y));
+  let luma = sky_luma(c);
+  let day = smoothstep(0.0025, 0.12, luma);
+  let night = 1.0 - smoothstep(0.0015, 0.012, luma);
+  let dusk = smoothstep(0.002, 0.02, luma) * (1.0 - smoothstep(0.05, 0.15, luma));
+  let warm = vec3<f32>(1.0, 0.97, 0.92);
+  let dusk_col = vec3<f32>(0.35, 0.12, 0.05);
+  let hor = mix(mix(c * 1.08, dusk_col, 0.22 * dusk), warm, 0.26 * day * day);
+  let zen = mix(c * 0.72, c * vec3<f32>(0.68, 0.76, 0.92), day);
+  return mix(hor, zen, smoothstep(-0.03, 0.55, dir.y)) + sky_stars(dir, night);
 }
 
 fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
