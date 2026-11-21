@@ -259,7 +259,7 @@ fn tonemap_output(coord: vec2<i32>, lin: vec3<f32>) {
 }
 
 const GI_WORLD_CACHE: bool = false;
-const GI_SHADE_GAIN: f32 = 0.55;
+const GI_SHADE_GAIN: f32 = 1.0;
 const AMB_SHADE_GAIN: f32 = 1.0;
 const SUN_SHADE_GAIN: f32 = 1.35;
 const GI_UPSAMPLE_HOLE_R: i32 = 1;
