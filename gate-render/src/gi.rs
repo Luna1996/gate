@@ -470,6 +470,83 @@ pub fn gi_res_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
+pub fn gi_res_spatial_layout() -> BindGroupLayoutDescriptor {
+  use bevy::render::render_resource::*;
+  const C: ShaderStages = ShaderStages::COMPUTE;
+  let rw = |binding: u32| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  };
+  BindGroupLayoutDescriptor::new(
+    "GiResSpatial",
+    &[
+      BindGroupLayoutEntry {
+        binding: 0,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(GiResUniform::min_size()),
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 1,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(crate::brickmap::dda::DdaViewUniform::min_size()),
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 42,
+        visibility: C,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Float { filterable: false },
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 43,
+        visibility: C,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Uint,
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      rw(45),
+      rw(46),
+      rw(47),
+      rw(49),
+      rw(50),
+      rw(51),
+      rw(52),
+      BindGroupLayoutEntry {
+        binding: 53,
+        visibility: C,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Uint,
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+    ],
+  )
+}
+
 pub fn gi_res_history_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -700,7 +777,7 @@ pub struct GiGpu {
 
   pub den_pipelines: [Option<CachedComputePipelineId>; 6],
 
-  pub res_pipelines: [Option<CachedComputePipelineId>; 8],
+  pub res_pipelines: [Option<CachedComputePipelineId>; 9],
 
   pub flatten_pipeline: Option<CachedComputePipelineId>,
 
@@ -730,6 +807,9 @@ pub struct GiResBg0(pub bevy::render::render_resource::BindGroup);
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiResHistoryBg(pub bevy::render::render_resource::BindGroup);
+
+#[derive(bevy::ecs::resource::Resource)]
+pub struct GiResSpatialBg(pub bevy::render::render_resource::BindGroup);
 
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
@@ -826,7 +906,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     world_rev_gi: 0,
     wide_rev: 0,
     den_pipelines: [None; 6],
-    res_pipelines: [None; 8],
+    res_pipelines: [None; 9],
     flatten_pipeline: None,
     epoch: 0,
     light_rev: 0,
@@ -908,6 +988,21 @@ fn queue_gi_pipelines(
           ..Default::default()
         }));
     }
+
+    gpu.res_pipelines[8] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+      label: Some(Cow::from("gate_gi_res_spatial")),
+      layout: vec![
+        gi_res_spatial_layout(),
+        dda_pipelines.bg1_layout.clone(),
+        dda_pipelines.bg2_layout.clone(),
+        dda_pipelines.bg3_layout.clone(),
+        gi_bg4_layout(),
+        gi_bg5_layout(),
+      ],
+      shader: dda_shader.0.clone(),
+      entry_point: Some(Cow::from("gi_res_spatial")),
+      ..Default::default()
+    }));
   }
 
   if gpu.den_pipelines[0].is_some() {
@@ -1271,6 +1366,33 @@ fn prepare_gi(p: PrepareGiParams) {
         ],
       );
       commands.insert_resource(GiResHistoryBg(history_bg));
+
+      let spatial_layout = pipeline_cache.get_bind_group_layout(&gi_res_spatial_layout());
+      let spatial_bg = device.create_bind_group(
+        None,
+        &spatial_layout,
+        &[
+          BindGroupEntry {
+            binding: 0,
+            resource: gpu.res_uniform.binding().expect("res uniform 已写入"),
+          },
+          BindGroupEntry {
+            binding: 1,
+            resource: gpu.res_view.binding().expect("view uniform 已写入"),
+          },
+          BindGroupEntry { binding: 42, resource: BindingResource::TextureView(&surf) },
+          BindGroupEntry { binding: 43, resource: BindingResource::TextureView(&key) },
+          BindGroupEntry { binding: 45, resource: buffers[5].as_entire_binding() },
+          BindGroupEntry { binding: 46, resource: buffers[4].as_entire_binding() },
+          BindGroupEntry { binding: 47, resource: buffers[6].as_entire_binding() },
+          BindGroupEntry { binding: 49, resource: buffers[0].as_entire_binding() },
+          BindGroupEntry { binding: 50, resource: buffers[1].as_entire_binding() },
+          BindGroupEntry { binding: 51, resource: buffers[2].as_entire_binding() },
+          BindGroupEntry { binding: 52, resource: buffers[3].as_entire_binding() },
+          BindGroupEntry { binding: 53, resource: BindingResource::TextureView(&own) },
+        ],
+      );
+      commands.insert_resource(GiResSpatialBg(spatial_bg));
     }
   }
 }

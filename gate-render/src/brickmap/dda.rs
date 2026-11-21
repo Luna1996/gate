@@ -20,16 +20,20 @@ pub(crate) const WORLD_GI: bool = false;
 pub(crate) fn gi_res_debug_mode() -> u32 {
   use std::sync::OnceLock;
   static MODE: OnceLock<u32> = OnceLock::new();
-  *MODE.get_or_init(|| match std::env::var("GATE_GI_RES_DEBUG").as_deref() {
-    Ok("0") | Ok("off") => 0,
-    Ok("buckets") => 2,
-    _ => 1,
+  let env_mode = std::env::var("GATE_GI_RES_DEBUG").ok();
+  *MODE.get_or_init(|| match env_mode.as_deref() {
+    Some("1") | Some("own") => 1,
+    Some("buckets") => 2,
+    _ => 0,
   })
 }
 
 pub(crate) fn gi_res_debug_on() -> bool {
   gi_res_debug_mode() != 0
 }
+
+// The Caelix resampler owns diffuse GI; the old WAL/screen accumulation is not dispatched.
+pub(crate) const GI_RES_FINAL: bool = true;
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
@@ -494,7 +498,6 @@ pub(crate) struct DdaPipelines {
   pub(crate) beam_pipeline: CachedComputePipelineId,
 
   pub(crate) gi_pipeline: CachedComputePipelineId,
-  pub(crate) gi_spatial_pipeline: CachedComputePipelineId,
   pub(crate) gi_wal_update_pipeline: CachedComputePipelineId,
 
   eye_histogram_pipeline: CachedComputePipelineId,
@@ -1212,13 +1215,6 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("gi_main")),
     ..default()
   });
-  let gi_spatial = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_gi_spatial")),
-    layout: gi_layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_gi_spatial")),
-    ..default()
-  });
   let gi_wal_update = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_gi_wal_update")),
     layout: gi_layouts,
@@ -1296,7 +1292,6 @@ pub(crate) fn init_dda_pipelines(
     face_accum_pipeline: face_accum,
     beam_pipeline: beam,
     gi_pipeline: gi,
-    gi_spatial_pipeline: gi_spatial,
     gi_wal_update_pipeline: gi_wal_update,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
@@ -2199,6 +2194,7 @@ static WARM_BEAM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_DDA: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_GI: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_GI_RES: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_GI_RES_SPATIAL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_EYE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_DEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_FACE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -2249,6 +2245,7 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   bg5: Option<Res<'w, crate::gi::GiBg5>>,
   res_bg0: Option<Res<'w, crate::gi::GiResBg0>>,
   res_hist_bg: Option<Res<'w, crate::gi::GiResHistoryBg>>,
+  res_spatial_bg: Option<Res<'w, crate::gi::GiResSpatialBg>>,
   eye: Option<Res<'w, EyeAdaptGpu>>,
   gi: Option<Res<'w, crate::gi::GiSettings>>,
   gi_gpu: Option<Res<'w, crate::gi::GiGpu>>,
@@ -2273,6 +2270,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     bg5,
     res_bg0,
     res_hist_bg,
+    res_spatial_bg,
     eye,
     gi,
     gi_gpu,
@@ -2649,6 +2647,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
 
     if let Some(upd_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_wal_update_pipeline)
+      && !GI_RES_FINAL
       && gi.as_ref().is_some_and(|g| g.wal)
     {
       let wal_groups = (crate::gi::WAL_UPD_BUDGET / 64) as u32;
@@ -2687,26 +2686,6 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
       pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     });
-    if !gi_res_debug_on()
-      && let Some(spatial_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_pipeline)
-    {
-      crate::profiler::gpu_compute_pass(
-        &mut profiler,
-        ctx.command_encoder(),
-        "gate_gi_spatial",
-        |pass| {
-          pass.set_pipeline(spatial_pipe);
-          pass.set_bind_group(0, gi_bg0, &[]);
-          pass.set_bind_group(1, &bg1.0, &[]);
-          pass.set_bind_group(2, &bg2.0, &[]);
-          pass.set_bind_group(3, &bg3.0, &[]);
-          pass.set_bind_group(4, &bg4.0, &[]);
-          pass.set_bind_group(5, &bg5.0, &[]);
-          pass.dispatch_workgroups(gx, gy, 1);
-        },
-      );
-    }
-
     if let (Some(res_bg), Some(gpu_res)) = (res_bg0.as_ref(), gi_gpu.as_ref())
       && let Some(pixels_pipe) =
         gpu_res.res_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
@@ -2828,6 +2807,30 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           |pass| {
             pass.set_pipeline(debug_pipe);
             pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, &bg4.0, &[]);
+            pass.set_bind_group(5, &bg5.0, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+          },
+        );
+      }
+
+      if gi_res_debug_mode() == 0
+        && let (Some(spatial_bg), Some(spatial_pipe)) = (
+          res_spatial_bg.as_ref(),
+          gpu_res.res_pipelines[8].and_then(|id| pipeline_cache.get_compute_pipeline(id)),
+        )
+      {
+        warm_mark(&WARM_GI_RES_SPATIAL, "gi_res_spatial", true);
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_res_spatial",
+          |pass| {
+            pass.set_pipeline(spatial_pipe);
+            pass.set_bind_group(0, &spatial_bg.0, &[]);
             pass.set_bind_group(1, &bg1.0, &[]);
             pass.set_bind_group(2, &bg2.0, &[]);
             pass.set_bind_group(3, &bg3.0, &[]);

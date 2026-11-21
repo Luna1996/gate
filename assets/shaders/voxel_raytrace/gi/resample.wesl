@@ -828,3 +828,251 @@ fn gi_r_debug_buckets(gid: vec3<u32>) {
     vec4<f32>(stored, gia_buckets[b].lit_ratio, clamp(gia_buckets[b].max_luminance, 0.0, 4.0) * 0.25, 1.0),
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// GiSpatial: reservoir resampling over nearby buckets, one visibility ray, write the diffuse
+// incident radiance into gi_out (the texture the shade reads).
+// ---------------------------------------------------------------------------------------------
+
+@group(0) @binding(53) var gia_own: texture_2d<u32>;
+
+fn gi_res_mirror(x: i32, size: i32) -> i32 {
+  var v = x;
+  if (v < 0) {
+    v = -v;
+  } else if (v >= size) {
+    v = 2 * size - 2 - v;
+  }
+  return clamp(v, 0, size - 1);
+}
+
+fn gi_res_neighbour_texel(p: vec2<u32>, offset: vec2<f32>) -> vec2<u32> {
+  let q = vec2<i32>(floor(vec2<f32>(p) + offset));
+  return vec2<u32>(
+    u32(gi_res_mirror(q.x, i32(gia_u.frame.x))),
+    u32(gi_res_mirror(q.y, i32(gia_u.frame.y))),
+  );
+}
+
+fn gi_res_bucket_accepts(
+  bucket: u32,
+  my_axis: u32,
+  my_distance: f32,
+  distance_factor: f32,
+) -> bool {
+  let normal_mask = (gia_buckets[bucket].packed >> 4u) & 63u;
+  if ((normal_mask & (1u << my_axis)) == 0u) {
+    return false;
+  }
+  let range = gi_unpack_f16_pair(gia_buckets[bucket].dist_range);
+  return !(my_distance < range.x * distance_factor
+    || my_distance > min(range.x * 2.0, range.y) / distance_factor);
+}
+
+// NAADF's isVaryingResmaplingRadius probe, with litRatio/stored/totalComp/maxLuminance from
+// GiBucketInfo in place of NAADF's packed fields.
+fn gi_res_adaptive_radius_factor(
+  p: vec2<u32>,
+  my_axis: u32,
+  my_distance: f32,
+  distance_factor: f32,
+  radius: f32,
+  rng: ptr<function, u32>,
+) -> f32 {
+  var valid_small = 0;
+  var valid_big = 0;
+  var max_color_small = 0.0;
+  var max_color_sum_small = 1.0;
+  var worst_lit_small = 0.0001;
+  var worst_lit_big = 0.0001;
+
+  for (var i: i32 = 0; i < 12; i = i + 1) {
+    let xy = (-radius * 0.5 + radius * gi_res_rand2(rng)) * select(1.0, 0.1, i < 6);
+    let texel = gi_res_neighbour_texel(p, xy);
+    let bucket = gi_res_bucket_index(texel);
+    if (!gi_res_bucket_accepts(bucket, my_axis, my_distance, distance_factor)) {
+      continue;
+    }
+
+    let bucket_stored = gia_buckets[bucket].packed & 15u;
+    let bucket_lit_ratio = gia_buckets[bucket].lit_ratio;
+    let samples_color_max = gia_buckets[bucket].max_luminance;
+    let total_sample_count_comp = f32((gia_buckets[bucket].packed >> 10u) & 7u) / 7.0;
+
+    if (bucket_stored > 0u) {
+      if (i < 6) {
+        valid_small = valid_small + 1;
+        max_color_small = max(max_color_small, samples_color_max);
+        worst_lit_small = worst_lit_small
+          + (bucket_lit_ratio * bucket_lit_ratio * f32(bucket_stored))
+          * total_sample_count_comp * total_sample_count_comp;
+        max_color_sum_small = max_color_sum_small + samples_color_max;
+      } else {
+        valid_big = valid_big + 1;
+        worst_lit_big = worst_lit_big
+          + bucket_lit_ratio * bucket_lit_ratio * f32(bucket_stored);
+      }
+    }
+  }
+
+  valid_small = max(1, valid_small);
+  valid_big = max(1, valid_big);
+  if (valid_small == 0) {
+    max_color_small = 100.0;
+  }
+
+  max_color_sum_small = max_color_sum_small / f32(valid_small);
+  worst_lit_small = worst_lit_small / f32(valid_small);
+  worst_lit_big = worst_lit_big / f32(valid_big);
+
+  let radius_fac_raw = (max(1.0, max_color_small / max_color_sum_small)
+    / worst_lit_small)
+    * sqrt(worst_lit_big) * gia_u.settings2.w * 0.01;
+  return 0.07 + clamp(1.0 - (1.0 / (1.0 + radius_fac_raw)), 0.0, 1.0);
+}
+
+fn gi_res_sanitize(c: vec3<f32>) -> vec3<f32> {
+  let v = select(vec3<f32>(0.0, 0.0, 0.0), c, c > vec3<f32>(0.0, 0.0, 0.0));
+  return min(v, vec3<f32>(32.0, 32.0, 32.0));
+}
+
+fn gi_r_spatial(gid: vec3<u32>) {
+  let p = gid.xy;
+  if (!gi_res_texel_in_range(p)) {
+    return;
+  }
+
+  let key = gi_res_load_key(p);
+  if ((key.z & GI_KEY_FLAG_DIFFUSE) == 0u) {
+    textureStore(gi_out, vec2<i32>(p), vec4<f32>(0.0));
+    return;
+  }
+
+  let surface = gi_res_load_surface(p);
+  let pw = surface.xyz;
+  let my_distance = surface.w;
+  let n = gi_unpack_dir(key.w);
+  let v = normalize(gi_res_camera_pos() - pw);
+  let my_axis = gi_axis_index(n);
+  let distance_factor = 0.95 * max(0.2, pow(max(dot(n, v), 0.0), 0.25));
+
+  var rng = gi_rand_seed(p, gia_u.frame.w, GI_RAND_SPATIAL);
+  var radius = gia_u.settings2.y;
+  if (gia_u.settings2.z > 0.5) {
+    radius = radius
+      * gi_res_adaptive_radius_factor(p, my_axis, my_distance, distance_factor,
+                                      gia_u.settings2.y, &rng);
+  }
+
+  var sum_w = 0.0;
+  var m = 0.0;
+  var has_selected = false;
+  var selected_color = vec3<f32>(0.0);
+  var selected_direction = n;
+  var selected_distance2 = 0.0;
+  var selected_p_hat = 0.0;
+  var selected_cos = 0.0;
+  var selected_sky = false;
+
+  let iterations = u32(max(gia_u.settings2.x, 1.0));
+  for (var it: u32 = 0u; it < iterations; it = it + 1u) {
+    let offset = (gi_res_rand2(&rng) - vec2<f32>(0.5, 0.5)) * radius;
+    let texel = gi_res_neighbour_texel(p, offset);
+    let bucket = gi_res_bucket_index(texel);
+    if (!gi_res_bucket_accepts(bucket, my_axis, my_distance, distance_factor)) {
+      continue;
+    }
+
+    let stored = gia_buckets[bucket].packed & 15u;
+    if (stored == 0u) {
+      m = m + 1.0;
+      continue;
+    }
+
+    let pick = min(u32(gi_rand(&rng) * f32(stored)), stored - 1u);
+    let s = gia_compact[bucket * GI_COMPACT_PER_BUCKET + pick];
+    if ((s.normals & 7u) != my_axis) {
+      continue;
+    }
+
+    let is_sky = (s.normals & GI_BUCKET_SKY_FLAG) != 0u;
+    var d = vec3<f32>(0.0);
+    var jacobian = 1.0;
+    var dist2 = 1.0e+30;
+    var source_direction = d;
+    let primary = vec3<f32>(s.px, s.py, s.pz);
+    let secondary = vec3<f32>(s.sx, s.sy, s.sz);
+    if (is_sky) {
+      d = secondary;
+      source_direction = d;
+    } else {
+      let seg = secondary - pw;
+      dist2 = dot(seg, seg);
+      d = seg * inverseSqrt(max(dist2, 1e-12));
+      let nq = gi_unpack_oct12(s.normals);
+      let cos_q_new = dot(nq, -d);
+      let seg_old = secondary - primary;
+      let seg_old_len2 = dot(seg_old, seg_old);
+      source_direction = seg_old * inverseSqrt(max(seg_old_len2, 1e-12));
+      let cos_q_old = dot(nq, -source_direction);
+      if (cos_q_old <= 1e-7 || cos_q_new <= 0.0) {
+        continue;
+      }
+      jacobian = (cos_q_new / cos_q_old) * seg_old_len2 / max(dist2, 1e-12);
+    }
+
+    let cos_new = dot(n, d);
+    if (cos_new <= 1e-4) {
+      continue;
+    }
+    if (jacobian < gia_u.settings3.z || jacobian > gia_u.settings3.w) {
+      continue;
+    }
+
+    let c = gi_unpack_radiance(s.radiance) * gia_buckets[bucket].lit_ratio;
+    let p_hat = gi_luminance(c) * cos_new;
+    let pdf_old = max(dot(n, source_direction), 1e-4) / GI_PI;
+    let w = p_hat * jacobian / pdf_old;
+
+    m = m + 1.0;
+    sum_w = sum_w + w;
+    if (gi_rand(&rng) * sum_w < w) {
+      has_selected = true;
+      selected_color = c;
+      selected_direction = d;
+      selected_distance2 = dist2;
+      selected_p_hat = p_hat;
+      selected_cos = cos_new;
+      selected_sky = is_sky;
+    }
+  }
+
+  var fallback = vec3<f32>(0.0);
+  var fallback_a = 0.0;
+  let own = textureLoad(gia_own, vec2<i32>(p), 0).x;
+  if (gia_u.settings4.y > 0.5 && own != 0u) {
+    fallback = gi_unpack_radiance(own);
+    fallback_a = 1.0;
+  }
+
+  if (!has_selected || sum_w <= 0.0 || selected_p_hat <= 0.0) {
+    textureStore(gi_out, vec2<i32>(p), vec4<f32>(fallback, fallback_a));
+    return;
+  }
+
+  let selected_distance = select(sqrt(selected_distance2), GI_T_MAX, selected_sky);
+  let push = SHADOW_SURFACE_EPS;
+  let ray_dir = selected_direction;
+  let ray_origin = pw + n * push;
+  let t_max = select(max(selected_distance - 2.0 * push, 1e-4), GI_T_MAX, selected_sky);
+  var tint = vec3<f32>(1.0);
+  let vis = world_trace_medium_scene(ray_origin, ray_dir, t_max, false, false, &tint);
+  if (vis.hit) {
+    textureStore(gi_out, vec2<i32>(p), vec4<f32>(fallback, fallback_a));
+    return;
+  }
+
+  let w_sum = sum_w / (m * selected_p_hat);
+  let l = gi_res_sanitize(selected_color * selected_cos * w_sum / GI_PI);
+  textureStore(gi_out, vec2<i32>(p), vec4<f32>(l, 1.0));
+}

@@ -33,6 +33,10 @@ const GI_RES_SKY: u32 = 8u;
 const GI_RECON_J_MIN: f32 = 0.3;
 const GI_RECON_J_MAX: f32 = 2.5;
 
+// The Caelix resampler owns the diffuse GI now: the old per-pixel reservoir only produces the
+// G-buffer guide and the surface/key targets.
+const GI_RES_FINAL: bool = true;
+
 struct GiRes {
   w_sum: vec3<f32>,
   m: f32,
@@ -351,6 +355,12 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   let hist_reset_recent = affected && (since < 32u);
 
   gi_den_guide_store(coord, size, true, pk0, pk1, n, prev_ok, prev_pc, hist_reset_recent);
+
+  if (GI_RES_FINAL) {
+    textureStore(gi_out, coord, vec4<f32>(0.0));
+    gi_res_store_cur(idx, gi_res_none());
+    return;
+  }
 
   var hist_ok = false;
   var hist = gi_res_none();

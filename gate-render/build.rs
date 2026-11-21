@@ -26,6 +26,7 @@ const ENTRY_POINTS: &[&str] = &[
   "gi_res_reproject_unlit",
   "gi_res_refine_buckets",
   "gi_res_debug_buckets",
+  "gi_res_spatial",
   "gi_face_flatten",
   "gi_denoise_temporal",
   "gi_denoise_atrous1",
@@ -81,7 +82,7 @@ fn validate(src: &str) {
     naga::valid::Capabilities::all(),
   )
   .validate(&module)
-  .unwrap_or_else(|e| panic!("WESL→WGSL 校验失败: {e}"));
+  .unwrap_or_else(|e| panic!("WESL→WGSL 校验失败:\n{}", e.emit_to_string(src)));
 
   for name in ENTRY_POINTS {
     assert!(module.entry_points.iter().any(|e| e.name == *name), "WESL 产物缺少入口 {name}");
