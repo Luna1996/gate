@@ -1,9 +1,10 @@
-import package::bindings::{gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, lod_diag, light_u};
+import package::bindings::{gi_guide_out, gi_out, gi_res_cur, gi_res_prev, gi_u, lod_diag, light_u, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, SurfaceLight, brdf_reflected, face_of_normal, face_view_dir, fetch_material, palette_flags, sky_rgb};
 import package::gi::common::{GI_ACC_CLAMP, gi_cos_hemisphere, gi_hist_search_offset, gi_in_edit_box, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_mix, gi_pack_dir, gi_pose_salt, gi_rand2, gi_ring_offset, gi_unpack_dir, gi_unkey_voxel, gi_vox_k1};
 import package::gi::consts::{GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SKY_RADIANCE_SCALE, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, GI_SS_CAND_N, GI_SS_CAND_N_HQ, GI_SS_M_CAP_K, GI_SS_REUSE_TAPS, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_guide_store, gi_same_surface};
 import package::gi::ray::{gi_bounce2, gi_face_shade_cached, gi_ray_radiance};
+import package::gi::resample::{GI_KEY_FLAG_DIFFUSE, GI_KEY_FLAG_HIT, GI_KEY_FLAG_OPAQUE, gi_res_store_miss, gi_res_store_primary};
 import package::gi::wal::gi_wal_merge;
 import package::trace::make_grid;
 import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_normal_fast, world_trace_medium_scene};
@@ -307,6 +308,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
 
   if (!h.hit) {
     textureStore(gi_out, coord, vec4<f32>(0.0));
+    gi_res_store_miss(coord);
     gi_res_store_cur(idx, gi_res_none());
     gi_den_guide_store(coord, size, false, 0u, 0u, vec3<f32>(0.0, 0.0, 1.0), false, vec2<i32>(0), false);
     return;
@@ -325,6 +327,17 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   let pk0 = gi_key0(h.voxel, h.obj_id);
   let pk1 = gi_key1(h.voxel, h.face_id, h.obj_id);
   let pk_ok = gi_key_ok(h.voxel, h.obj_id);
+
+  // G-buffer for the GI resampler: real surface, camera distance, path hash, instance slot
+  // (grid index + 1), lifetime token and the world normal.
+  let hh = gi_mix(pk0 ^ gi_mix(pk1));
+  let hash16 = max(1u, (hh ^ (hh >> 16u)) & 0xFFFFu);
+  let slot = u32(h.obj_id + 1) & 0xFFFFu;
+  let token = gi_pose_salt(h.obj_id) ^ gi_local_rev(h.voxel, h.obj_id);
+  let opaque = select(0u, GI_KEY_FLAG_OPAQUE,
+    (palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u);
+  gi_res_store_primary(coord, h.point, length(h.point - view_u.cam_pos_voxel.xyz),
+    hash16 | (slot << 16u), token, GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE | opaque, n);
 
   let frame = gi_u.seq.x;
   let seed = gi_ss_seed(coord, frame);

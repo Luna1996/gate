@@ -126,7 +126,7 @@ impl DdaCameraConfig {
   }
 }
 
-#[derive(Resource, Clone, Copy, ShaderType)]
+#[derive(Resource, Clone, Copy, Default, ShaderType)]
 pub struct DdaViewUniform {
   pub view_proj: Mat4,
   pub inv_view_proj: Mat4,
@@ -253,6 +253,19 @@ pub(crate) struct AuxTexCache {
   gi_tex: Option<Texture>,
   gi_view: Option<TextureView>,
   gi_size: UVec2,
+  gi_surf: Option<Texture>,
+  gi_surf_view: Option<TextureView>,
+  gi_key: Option<Texture>,
+  gi_key_view: Option<TextureView>,
+  gi_res_lit: Option<Buffer>,
+  gi_res_unlit: Option<Buffer>,
+  gi_res_refined: Option<Buffer>,
+  gi_res_compact: Option<Buffer>,
+  gi_res_buckets: Option<Buffer>,
+  gi_res_pixels: Option<Buffer>,
+  gi_res_counts: Option<Buffer>,
+  gi_res_args: Option<Buffer>,
+  gi_res_caps: [u32; 4],
   dda_hit: Option<Texture>,
   dda_hit_view: Option<TextureView>,
   gi_res_a: Option<Buffer>,
@@ -342,6 +355,35 @@ pub(crate) const DEN_ATROUS_ROUNDS: [[usize; 5]; 5] =
 impl AuxTexCache {
   pub(crate) fn gi_write_view(&self) -> Option<&TextureView> {
     self.gi_view.as_ref()
+  }
+
+  pub(crate) fn gi_surface_view(&self) -> Option<&TextureView> {
+    self.gi_surf_view.as_ref()
+  }
+
+  pub(crate) fn gi_key_view(&self) -> Option<&TextureView> {
+    self.gi_key_view.as_ref()
+  }
+
+  pub(crate) fn gi_resampler_buffers(&self) -> Option<[&Buffer; 8]> {
+    Some([
+      self.gi_res_lit.as_ref()?,
+      self.gi_res_unlit.as_ref()?,
+      self.gi_res_refined.as_ref()?,
+      self.gi_res_compact.as_ref()?,
+      self.gi_res_buckets.as_ref()?,
+      self.gi_res_pixels.as_ref()?,
+      self.gi_res_counts.as_ref()?,
+      self.gi_res_args.as_ref()?,
+    ])
+  }
+
+  pub(crate) fn gi_res_size(&self) -> UVec2 {
+    self.gi_size
+  }
+
+  pub(crate) fn gi_res_caps(&self) -> [u32; 4] {
+    self.gi_res_caps
   }
 
   pub(crate) fn gi_hist_current(&self) -> Option<&Buffer> {
@@ -776,6 +818,26 @@ pub(crate) fn init_dda_pipelines(
         visibility: ShaderStages::COMPUTE,
         ty: BindingType::StorageTexture {
           access: StorageTextureAccess::ReadWrite,
+          format: TextureFormat::Rgba32Uint,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 40,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::WriteOnly,
+          format: TextureFormat::Rgba16Float,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 41,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::WriteOnly,
           format: TextureFormat::Rgba32Uint,
           view_dimension: TextureViewDimension::D2,
         },
@@ -1339,6 +1401,13 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     beam_cache.dda_hit_view = Some(hit_tex.create_view(&TextureViewDescriptor::default()));
     beam_cache.dda_hit = Some(hit_tex);
 
+    let surf = make("gate_gi_surface", TextureFormat::Rgba16Float);
+    beam_cache.gi_surf_view = Some(surf.create_view(&TextureViewDescriptor::default()));
+    beam_cache.gi_surf = Some(surf);
+    let key = make("gate_gi_key", TextureFormat::Rgba32Uint);
+    beam_cache.gi_key_view = Some(key.create_view(&TextureViewDescriptor::default()));
+    beam_cache.gi_key = Some(key);
+
     let res_bytes =
       gi_size.x as u64 * gi_size.y as u64 * crate::wesl_consts::gi_consts().gi_res_words as u64 * 4;
     let make_res = |label: &str| {
@@ -1363,6 +1432,53 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       })
     };
     beam_cache.gi_guide = Some(make_buf("gate_gi_guide", px * c.gi_den_guide_words as u64 * 4));
+
+    {
+      let max_binding = render_device.limits().max_storage_buffer_binding_size;
+      let lit_stride = c.gi_lit_words as u64 * 4;
+      let unlit_stride = c.gi_unlit_words as u64 * 4;
+      let lit_cap = (px * c.gi_lit_ring_frames as u64)
+        .min(max_binding / lit_stride.max(1))
+        .clamp(1, u32::MAX as u64) as u32;
+      let unlit_cap = (px * c.gi_unlit_ring_frames as u64)
+        .min(max_binding / unlit_stride.max(1))
+        .clamp(1, u32::MAX as u64) as u32;
+      let bucket_size = c.gi_bucket_size as u64;
+      let buckets_x = (gi_size.x as u64).div_ceil(bucket_size) as u32;
+      let buckets_y = (gi_size.y as u64).div_ceil(bucket_size) as u32;
+      let buckets = buckets_x as u64 * buckets_y as u64;
+      let bucket_stride = c.gi_bucket_sample_words as u64 * 4;
+      let info_stride = c.gi_bucket_info_words as u64 * 4;
+      let px_stride = c.gi_pixel_info_words as u64 * 4;
+      let counts_words = 8 + 2 * c.gi_history_slots as u64;
+
+      beam_cache.gi_res_lit = Some(make_buf("gate_gi_res_lit", lit_cap as u64 * lit_stride));
+      beam_cache.gi_res_unlit =
+        Some(make_buf("gate_gi_res_unlit", unlit_cap as u64 * unlit_stride));
+      beam_cache.gi_res_refined = Some(make_buf(
+        "gate_gi_res_refined",
+        buckets * c.gi_refined_per_bucket as u64 * bucket_stride,
+      ));
+      beam_cache.gi_res_compact = Some(make_buf(
+        "gate_gi_res_compact",
+        buckets * c.gi_compact_per_bucket as u64 * bucket_stride,
+      ));
+      beam_cache.gi_res_buckets = Some(make_buf("gate_gi_res_buckets", buckets * info_stride));
+      beam_cache.gi_res_pixels = Some(make_buf("gate_gi_res_pixels", px * px_stride));
+      beam_cache.gi_res_counts = Some(make_buf("gate_gi_res_counts", counts_words * 4));
+      beam_cache.gi_res_args = Some(make_buf("gate_gi_res_args", 6 * 4));
+      beam_cache.gi_res_caps = [lit_cap, unlit_cap, buckets.min(u32::MAX as u64) as u32, buckets_x];
+
+      if let (Some(counts), Some(args)) = (&beam_cache.gi_res_counts, &beam_cache.gi_res_args) {
+        queue.write_buffer(counts, 0, &vec![0u8; (counts_words * 4) as usize]);
+        queue.write_buffer(args, 0, &[0u8; 24]);
+      }
+      bevy::log::debug!(
+        target: "gate",
+        "GI resampler buffers {}x{} → buckets {} ({}x{}), lit ring {} / unlit ring {} samples",
+        gi_size.x, gi_size.y, buckets, buckets_x, buckets_y, lit_cap, unlit_cap,
+      );
+    }
 
     let face_slots_n = (px * 4).next_power_of_two().clamp(256, 1u64 << 21);
     beam_cache.face_slots =
@@ -1902,6 +2018,8 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
 
   let bg0_gi_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_gi_layout);
   let hit_view_ref = beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建").clone();
+  let gi_surf_ref = beam_cache.gi_surf_view.as_ref().expect("gi surface view 未建").clone();
+  let gi_key_ref = beam_cache.gi_key_view.as_ref().expect("gi key view 未建").clone();
   let gi_bg0 = render_device.create_bind_group(
     None,
     &bg0_gi_layout,
@@ -1909,6 +2027,8 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       BindGroupEntry { binding: 1, resource: u.binding().expect("view uniform 已写入") },
       BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&beam_view) },
       BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&hit_view_ref) },
+      BindGroupEntry { binding: 40, resource: BindingResource::TextureView(&gi_surf_ref) },
+      BindGroupEntry { binding: 41, resource: BindingResource::TextureView(&gi_key_ref) },
     ],
   );
   beam_cache.gi_bg0 = Some(gi_bg0);
@@ -2036,6 +2156,7 @@ static WARM_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::n
 static WARM_BEAM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_DDA: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_GI: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_GI_RES: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_EYE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_DEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_FACE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -2084,6 +2205,7 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   bg3: Option<Res<'w, DdaBg3BindGroup>>,
   bg4: Option<Res<'w, crate::gi::GiBg4>>,
   bg5: Option<Res<'w, crate::gi::GiBg5>>,
+  res_bg0: Option<Res<'w, crate::gi::GiResBg0>>,
   eye: Option<Res<'w, EyeAdaptGpu>>,
   gi: Option<Res<'w, crate::gi::GiSettings>>,
   gi_gpu: Option<Res<'w, crate::gi::GiGpu>>,
@@ -2106,6 +2228,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     bg3,
     bg4,
     bg5,
+    res_bg0,
     eye,
     gi,
     gi_gpu,
@@ -2534,6 +2657,36 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           pass.set_bind_group(4, &bg4.0, &[]);
           pass.set_bind_group(5, &bg5.0, &[]);
           pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
+
+    if let (Some(res_bg), Some(gpu_res)) = (res_bg0.as_ref(), gi_gpu.as_ref())
+      && let Some(pixels_pipe) =
+        gpu_res.res_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      && let Some(buckets_pipe) =
+        gpu_res.res_pipelines[1].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+    {
+      warm_mark(&WARM_GI_RES, "gi_res", true);
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_gi_res_prepare_pixels",
+        |pass| {
+          pass.set_pipeline(pixels_pipe);
+          pass.set_bind_group(0, &res_bg.0, &[]);
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+      let bucket_groups = aux.gi_res_caps()[2].div_ceil(64).max(1);
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_gi_res_prepare_buckets",
+        |pass| {
+          pass.set_pipeline(buckets_pipe);
+          pass.set_bind_group(0, &res_bg.0, &[]);
+          pass.dispatch_workgroups(bucket_groups, 1, 1);
         },
       );
     }

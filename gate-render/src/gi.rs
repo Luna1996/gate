@@ -19,6 +19,28 @@ pub struct GiUniform {
   pub prev_view_proj: Mat4,
 }
 
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, ShaderType)]
+pub struct GiResUniform {
+  /// x, y = resampler size; z = frames these buffers have run; w = scene frame.
+  pub frame: UVec4,
+
+  /// x = lit ring capacity, y = unlit ring capacity, z = bucket count, w = buckets per row.
+  pub limits: UVec4,
+
+  /// x = sky sample probability, y = lit threshold, z = unlit keep divisor, w = max history frames.
+  pub settings: Vec4,
+
+  /// x = spatial iterations, y = spatial radius, z = adaptive radius, w = radius lit factor.
+  pub settings2: Vec4,
+
+  /// x = sample leveling, y = min bucket samples, z = jacobian min, w = jacobian max.
+  pub settings3: Vec4,
+
+  /// x = debug mode, y = own sample fallback, z = sample rate divisor, w = uniform sample rate.
+  pub settings4: Vec4,
+}
+
 fn ab_mode() -> f32 {
   use std::sync::OnceLock;
   static CFG: OnceLock<Option<Vec<u32>>> = OnceLock::new();
@@ -371,6 +393,74 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   )
 }
 
+pub fn gi_res_layout() -> BindGroupLayoutDescriptor {
+  use bevy::render::render_resource::*;
+  const C: ShaderStages = ShaderStages::COMPUTE;
+  let rw = |binding: u32| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  };
+  BindGroupLayoutDescriptor::new(
+    "GiRes",
+    &[
+      BindGroupLayoutEntry {
+        binding: 0,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(GiResUniform::min_size()),
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 1,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(crate::brickmap::dda::DdaViewUniform::min_size()),
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 42,
+        visibility: C,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Float { filterable: false },
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 43,
+        visibility: C,
+        ty: BindingType::Texture {
+          sample_type: TextureSampleType::Uint,
+          view_dimension: TextureViewDimension::D2,
+          multisampled: false,
+        },
+        count: None,
+      },
+      rw(45),
+      rw(46),
+      rw(47),
+      rw(48),
+      rw(49),
+      rw(50),
+      rw(51),
+      rw(52),
+    ],
+  )
+}
+
 pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
@@ -542,6 +632,11 @@ pub const GI_FLAT_ACC: bool = false;
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiGpu {
   pub uniform: bevy::render::render_resource::UniformBuffer<GiUniform>,
+  pub res_uniform: bevy::render::render_resource::UniformBuffer<GiResUniform>,
+  pub res_view: bevy::render::render_resource::UniformBuffer<crate::brickmap::dda::DdaViewUniform>,
+
+  pub res_ring_frame: u32,
+  pub res_size: UVec2,
   pub frame: u32,
 
   pub prev_view_proj: Mat4,
@@ -563,6 +658,8 @@ pub struct GiGpu {
   pub wide_rev: u32,
 
   pub den_pipelines: [Option<CachedComputePipelineId>; 6],
+
+  pub res_pipelines: [Option<CachedComputePipelineId>; 8],
 
   pub flatten_pipeline: Option<CachedComputePipelineId>,
 
@@ -586,6 +683,9 @@ pub struct GiBg4(pub bevy::render::render_resource::BindGroup);
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
+
+#[derive(bevy::ecs::resource::Resource)]
+pub struct GiResBg0(pub bevy::render::render_resource::BindGroup);
 
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
@@ -665,6 +765,10 @@ impl bevy::app::Plugin for GiPlugin {
 fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
   commands.insert_resource(GiGpu {
     uniform: bevy::render::render_resource::UniformBuffer::default(),
+    res_uniform: bevy::render::render_resource::UniformBuffer::default(),
+    res_view: bevy::render::render_resource::UniformBuffer::default(),
+    res_ring_frame: 0,
+    res_size: UVec2::ZERO,
     frame: 0,
 
     prev_view_proj: Mat4::IDENTITY,
@@ -678,6 +782,7 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
     world_rev_gi: 0,
     wide_rev: 0,
     den_pipelines: [None; 6],
+    res_pipelines: [None; 8],
     flatten_pipeline: None,
     epoch: 0,
     light_rev: 0,
@@ -696,6 +801,22 @@ fn queue_gi_pipelines(
 ) {
   use bevy::render::render_resource::ComputePipelineDescriptor;
   use std::borrow::Cow;
+
+  if gpu.res_pipelines[0].is_none() {
+    let layout = gi_res_layout();
+    let names = ["gate_gi_res_prepare_pixels", "gate_gi_res_prepare_buckets"];
+    let entries = ["gi_res_prepare_pixels", "gi_res_prepare_buckets"];
+    for (i, (label, entry)) in names.iter().zip(entries.iter()).enumerate() {
+      gpu.res_pipelines[i] =
+        Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+          label: Some(Cow::from(*label)),
+          layout: vec![layout.clone()],
+          shader: dda_shader.0.clone(),
+          entry_point: Some(Cow::from(*entry)),
+          ..Default::default()
+        }));
+    }
+  }
 
   if gpu.den_pipelines[0].is_some() {
     return;
@@ -985,6 +1106,64 @@ fn prepare_gi(p: PrepareGiParams) {
     ],
   );
   commands.insert_resource(GiBg5(bg5));
+
+  let res_size = aux.as_ref().map_or(UVec2::ZERO, |a| a.gi_res_size());
+  if res_size.x > 0 && res_size.y > 0 {
+    if gpu.res_size != res_size {
+      gpu.res_size = res_size;
+      gpu.res_ring_frame = 0;
+    }
+    let caps = aux.as_ref().map_or([1, 1, 1, 1], |a| a.gi_res_caps());
+    let c = gi_consts();
+    let ring = gpu.res_ring_frame;
+    *gpu.res_uniform.get_mut() = GiResUniform {
+      frame: UVec4::new(res_size.x, res_size.y, ring, gpu.frame),
+      limits: UVec4::new(caps[0], caps[1], caps[2], caps[3]),
+      settings: Vec4::new(1.0, 1.0, 8.0, c.gi_max_history_frames as f32),
+      settings2: Vec4::new(12.0, 160.0, 1.0, 3.0),
+      settings3: Vec4::new(1.0, 12.0, 0.3, 2.5),
+      settings4: Vec4::new(0.0, 1.0, 1.0, 0.0),
+    };
+    gpu.res_uniform.write_buffer(&device, &queue);
+
+    if let Some(v) = view.as_ref() {
+      *gpu.res_view.get_mut() = **v;
+      gpu.res_view.write_buffer(&device, &queue);
+    }
+
+    if gi_runs {
+      gpu.res_ring_frame = gpu.res_ring_frame.wrapping_add(1);
+    }
+
+    let res_buffers = aux.as_ref().and_then(|a| a.gi_resampler_buffers());
+    let res_surf = aux.as_ref().and_then(|a| a.gi_surface_view()).cloned();
+    let res_key = aux.as_ref().and_then(|a| a.gi_key_view()).cloned();
+    if let (Some(buffers), Some(surf), Some(key)) = (res_buffers, res_surf, res_key)
+      && let Some(res_binding) = gpu.res_uniform.binding()
+      && let Some(view_binding) = gpu.res_view.binding()
+    {
+      let layout = pipeline_cache.get_bind_group_layout(&gi_res_layout());
+      let bg = device.create_bind_group(
+        None,
+        &layout,
+        &[
+          BindGroupEntry { binding: 0, resource: res_binding },
+          BindGroupEntry { binding: 1, resource: view_binding },
+          BindGroupEntry { binding: 42, resource: BindingResource::TextureView(&surf) },
+          BindGroupEntry { binding: 43, resource: BindingResource::TextureView(&key) },
+          BindGroupEntry { binding: 45, resource: buffers[0].as_entire_binding() },
+          BindGroupEntry { binding: 46, resource: buffers[1].as_entire_binding() },
+          BindGroupEntry { binding: 47, resource: buffers[2].as_entire_binding() },
+          BindGroupEntry { binding: 48, resource: buffers[3].as_entire_binding() },
+          BindGroupEntry { binding: 49, resource: buffers[4].as_entire_binding() },
+          BindGroupEntry { binding: 50, resource: buffers[5].as_entire_binding() },
+          BindGroupEntry { binding: 51, resource: buffers[6].as_entire_binding() },
+          BindGroupEntry { binding: 52, resource: buffers[7].as_entire_binding() },
+        ],
+      );
+      commands.insert_resource(GiResBg0(bg));
+    }
+  }
 }
 
 fn upload_edit_boxes(

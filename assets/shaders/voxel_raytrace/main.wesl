@@ -6,6 +6,7 @@ import package::gi_cache::{GI_CACHE_MAX_N, GI_COARSE_DIST, gi_cache_budget_ok, g
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_near_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
+import package::gi::resample::{gi_r_prepare_buckets, gi_r_prepare_pixels};
 import package::gi::screen::{gi_ss_main, gi_ss_spatial};
 import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_sample_rs, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_FL_SHIFT, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
 import package::brickmap::{Grid, sample_brickmap};
@@ -1237,6 +1238,16 @@ fn dda_gi_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_out);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
   gi_ss_spatial(vec2<i32>(i32(gid.x), i32(gid.y)), size);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn gi_res_prepare_pixels(@builtin(global_invocation_id) gid: vec3<u32>) {
+  gi_r_prepare_pixels(gid);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn gi_res_prepare_buckets(@builtin(global_invocation_id) gid: vec3<u32>) {
+  gi_r_prepare_buckets(gid);
 }
 
 @compute @workgroup_size(64, 1, 1)

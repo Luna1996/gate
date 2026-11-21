@@ -20,6 +20,18 @@ pub struct GiConsts {
   pub gi_ss_m_cap_k_hq: u32,
   pub face_words: u32,
   pub gi_sec_words: u32,
+  pub gi_bucket_size: u32,
+  pub gi_refined_per_bucket: u32,
+  pub gi_compact_per_bucket: u32,
+  pub gi_history_slots: u32,
+  pub gi_lit_words: u32,
+  pub gi_unlit_words: u32,
+  pub gi_bucket_sample_words: u32,
+  pub gi_bucket_info_words: u32,
+  pub gi_pixel_info_words: u32,
+  pub gi_lit_ring_frames: u32,
+  pub gi_unlit_ring_frames: u32,
+  pub gi_max_history_frames: u32,
 }
 
 const REQUIRED: &[&str] = &[
@@ -35,6 +47,18 @@ const REQUIRED: &[&str] = &[
   "GI_SS_M_CAP_K_HQ",
   "FACE_WORDS",
   "GI_SEC_WORDS",
+  "GI_BUCKET_SIZE",
+  "GI_REFINED_PER_BUCKET",
+  "GI_COMPACT_PER_BUCKET",
+  "GI_HISTORY_SLOTS",
+  "GI_LIT_WORDS",
+  "GI_UNLIT_WORDS",
+  "GI_BUCKET_SAMPLE_WORDS",
+  "GI_BUCKET_INFO_WORDS",
+  "GI_PIXEL_INFO_WORDS",
+  "GI_LIT_RING_FRAMES",
+  "GI_UNLIT_RING_FRAMES",
+  "GI_MAX_HISTORY_FRAMES",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +138,18 @@ impl GiConsts {
       gi_ss_m_cap_k_hq: get("GI_SS_M_CAP_K_HQ"),
       face_words: get("FACE_WORDS"),
       gi_sec_words: get("GI_SEC_WORDS"),
+      gi_bucket_size: get("GI_BUCKET_SIZE"),
+      gi_refined_per_bucket: get("GI_REFINED_PER_BUCKET"),
+      gi_compact_per_bucket: get("GI_COMPACT_PER_BUCKET"),
+      gi_history_slots: get("GI_HISTORY_SLOTS"),
+      gi_lit_words: get("GI_LIT_WORDS"),
+      gi_unlit_words: get("GI_UNLIT_WORDS"),
+      gi_bucket_sample_words: get("GI_BUCKET_SAMPLE_WORDS"),
+      gi_bucket_info_words: get("GI_BUCKET_INFO_WORDS"),
+      gi_pixel_info_words: get("GI_PIXEL_INFO_WORDS"),
+      gi_lit_ring_frames: get("GI_LIT_RING_FRAMES"),
+      gi_unlit_ring_frames: get("GI_UNLIT_RING_FRAMES"),
+      gi_max_history_frames: get("GI_MAX_HISTORY_FRAMES"),
     };
 
     if out.gi_res_words < 8 {
@@ -142,6 +178,32 @@ impl GiConsts {
         "GI_SEC_WORDS = {} 太小：二次顶点缓存每槽至少要放「键 2 + 辐亮度 3」= 5 字：{out:?}",
         out.gi_sec_words
       );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if !(1..=32).contains(&out.gi_bucket_size)
+      || out.gi_refined_per_bucket < out.gi_compact_per_bucket
+      || out.gi_compact_per_bucket < 1
+      || out.gi_history_slots == 0
+      || !out.gi_history_slots.is_power_of_two()
+      || out.gi_max_history_frames == 0
+      || out.gi_max_history_frames > out.gi_history_slots
+    {
+      let msg = format!(
+        "GI 重采样布局常量不自洽（桶 1..=32、compact ≤ refined、history 为 2 的幂且 ≥ maxHistory）：{out:?}"
+      );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if out.gi_lit_words < 6
+      || out.gi_unlit_words < 5
+      || out.gi_bucket_sample_words < 6
+      || out.gi_bucket_info_words < 6
+      || out.gi_pixel_info_words < 2
+      || out.gi_lit_ring_frames < 1
+      || out.gi_unlit_ring_frames < 1
+    {
+      let msg = format!("GI 重采样样本/桶 stride 太小或环形帧数 < 1：{out:?}");
       error!("{msg}");
       panic!("{msg}");
     }
