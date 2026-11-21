@@ -449,6 +449,16 @@ pub fn gi_res_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
+      BindGroupLayoutEntry {
+        binding: 44,
+        visibility: C,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::WriteOnly,
+          format: TextureFormat::R32Uint,
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      },
       rw(45),
       rw(46),
       rw(47),
@@ -797,25 +807,49 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
 fn queue_gi_pipelines(
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
   dda_shader: bevy::ecs::system::Res<crate::shader::DdaShaderHandle>,
+  dda_pipelines: bevy::ecs::system::Res<crate::brickmap::dda::DdaPipelines>,
   mut gpu: bevy::ecs::system::ResMut<GiGpu>,
 ) {
   use bevy::render::render_resource::ComputePipelineDescriptor;
   use std::borrow::Cow;
 
   if gpu.res_pipelines[0].is_none() {
-    let layout = gi_res_layout();
+    let res_layout = gi_res_layout();
     let names = ["gate_gi_res_prepare_pixels", "gate_gi_res_prepare_buckets"];
     let entries = ["gi_res_prepare_pixels", "gi_res_prepare_buckets"];
     for (i, (label, entry)) in names.iter().zip(entries.iter()).enumerate() {
       gpu.res_pipelines[i] =
         Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
           label: Some(Cow::from(*label)),
-          layout: vec![layout.clone()],
+          layout: vec![res_layout.clone()],
           shader: dda_shader.0.clone(),
           entry_point: Some(Cow::from(*entry)),
           ..Default::default()
         }));
     }
+
+    let scene_layout = vec![
+      res_layout.clone(),
+      dda_pipelines.bg1_layout.clone(),
+      dda_pipelines.bg2_layout.clone(),
+      dda_pipelines.bg3_layout.clone(),
+      gi_bg4_layout(),
+      gi_bg5_layout(),
+    ];
+    gpu.res_pipelines[2] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+      label: Some(Cow::from("gate_gi_res_generate_samples")),
+      layout: scene_layout,
+      shader: dda_shader.0.clone(),
+      entry_point: Some(Cow::from("gi_res_generate_samples")),
+      ..Default::default()
+    }));
+    gpu.res_pipelines[3] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+      label: Some(Cow::from("gate_gi_res_prepare_history")),
+      layout: vec![res_layout],
+      shader: dda_shader.0.clone(),
+      entry_point: Some(Cow::from("gi_res_prepare_history")),
+      ..Default::default()
+    }));
   }
 
   if gpu.den_pipelines[0].is_some() {
@@ -1122,7 +1156,12 @@ fn prepare_gi(p: PrepareGiParams) {
       settings: Vec4::new(1.0, 1.0, 8.0, c.gi_max_history_frames as f32),
       settings2: Vec4::new(12.0, 160.0, 1.0, 3.0),
       settings3: Vec4::new(1.0, 12.0, 0.3, 2.5),
-      settings4: Vec4::new(0.0, 1.0, 1.0, 0.0),
+      settings4: Vec4::new(
+        if crate::brickmap::dda::GI_RES_DEBUG { 1.0 } else { 0.0 },
+        1.0,
+        1.0,
+        0.0,
+      ),
     };
     gpu.res_uniform.write_buffer(&device, &queue);
 
@@ -1138,7 +1177,9 @@ fn prepare_gi(p: PrepareGiParams) {
     let res_buffers = aux.as_ref().and_then(|a| a.gi_resampler_buffers());
     let res_surf = aux.as_ref().and_then(|a| a.gi_surface_view()).cloned();
     let res_key = aux.as_ref().and_then(|a| a.gi_key_view()).cloned();
-    if let (Some(buffers), Some(surf), Some(key)) = (res_buffers, res_surf, res_key)
+    let res_own = aux.as_ref().and_then(|a| a.gi_own_view()).cloned();
+    if let (Some(buffers), Some(surf), Some(key), Some(own)) =
+      (res_buffers, res_surf, res_key, res_own)
       && let Some(res_binding) = gpu.res_uniform.binding()
       && let Some(view_binding) = gpu.res_view.binding()
     {
@@ -1151,6 +1192,7 @@ fn prepare_gi(p: PrepareGiParams) {
           BindGroupEntry { binding: 1, resource: view_binding },
           BindGroupEntry { binding: 42, resource: BindingResource::TextureView(&surf) },
           BindGroupEntry { binding: 43, resource: BindingResource::TextureView(&key) },
+          BindGroupEntry { binding: 44, resource: BindingResource::TextureView(&own) },
           BindGroupEntry { binding: 45, resource: buffers[0].as_entire_binding() },
           BindGroupEntry { binding: 46, resource: buffers[1].as_entire_binding() },
           BindGroupEntry { binding: 47, resource: buffers[2].as_entire_binding() },

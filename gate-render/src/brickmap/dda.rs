@@ -14,6 +14,10 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
 pub(crate) const WORLD_GI: bool = false;
 
+// Milestone view: shade the resampler's own fresh samples instead of the old screen-space GI,
+// before the Caelix reprojection is wired. Also disables the old spatial pass and the denoiser.
+pub(crate) const GI_RES_DEBUG: bool = true;
+
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct RenderScale {
@@ -257,6 +261,8 @@ pub(crate) struct AuxTexCache {
   gi_surf_view: Option<TextureView>,
   gi_key: Option<Texture>,
   gi_key_view: Option<TextureView>,
+  gi_own: Option<Texture>,
+  gi_own_view: Option<TextureView>,
   gi_res_lit: Option<Buffer>,
   gi_res_unlit: Option<Buffer>,
   gi_res_refined: Option<Buffer>,
@@ -363,6 +369,10 @@ impl AuxTexCache {
 
   pub(crate) fn gi_key_view(&self) -> Option<&TextureView> {
     self.gi_key_view.as_ref()
+  }
+
+  pub(crate) fn gi_own_view(&self) -> Option<&TextureView> {
+    self.gi_own_view.as_ref()
   }
 
   pub(crate) fn gi_resampler_buffers(&self) -> Option<[&Buffer; 8]> {
@@ -1407,6 +1417,9 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     let key = make("gate_gi_key", TextureFormat::Rgba32Uint);
     beam_cache.gi_key_view = Some(key.create_view(&TextureViewDescriptor::default()));
     beam_cache.gi_key = Some(key);
+    let own = make("gate_gi_own", TextureFormat::R32Uint);
+    beam_cache.gi_own_view = Some(own.create_view(&TextureViewDescriptor::default()));
+    beam_cache.gi_own = Some(own);
 
     let res_bytes =
       gi_size.x as u64 * gi_size.y as u64 * crate::wesl_consts::gi_consts().gi_res_words as u64 * 4;
@@ -1855,7 +1868,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     (None, None)
   };
   let mut compose_entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
-    beam_cache.gi_view.as_ref().expect("gi view not created"),
+    beam_cache.gi_dn_src[0].as_ref().expect("降噪纹理未创建"),
     &u,
     &beam_view,
     eye_buf.as_entire_binding(),
@@ -1899,9 +1912,13 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
 
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
 
-  let den_plan = match tune.gi.as_ref() {
-    Some(g) => g.denoise_plan(),
-    None => crate::gi::GiSettings::default().denoise_plan(),
+  let den_plan = if GI_RES_DEBUG {
+    crate::gi::DenoisePlan { on: false, rounds: 0, radius: 1 }
+  } else {
+    match tune.gi.as_ref() {
+      Some(g) => g.denoise_plan(),
+      None => crate::gi::GiSettings::default().denoise_plan(),
+    }
   };
   let gi_den_view = if den_plan.on {
     beam_cache.gi_dn_src[3].as_ref().expect("降噪输出视图未创建").clone()
@@ -1970,7 +1987,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   }
   let den_cfg = beam_cache.den_cfg.as_ref().expect("刚创建").clone();
 
-  let den_runs = tune.gi.as_ref().is_some_and(|g| g.enabled);
+  let den_runs = !GI_RES_DEBUG && tune.gi.as_ref().is_some_and(|g| g.enabled);
   let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
   {
     let guide = beam_cache.gi_guide.as_ref().expect("导引 buffer 未创建").clone();
@@ -2643,7 +2660,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
       pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     });
-    if let Some(spatial_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_pipeline) {
+    if !GI_RES_DEBUG
+      && let Some(spatial_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_pipeline)
+    {
       crate::profiler::gpu_compute_pass(
         &mut profiler,
         ctx.command_encoder(),
@@ -2689,6 +2708,41 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           pass.dispatch_workgroups(bucket_groups, 1, 1);
         },
       );
+
+      if let Some(generate_pipe) =
+        gpu_res.res_pipelines[2].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_res_generate_samples",
+          |pass| {
+            pass.set_pipeline(generate_pipe);
+            pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, &bg4.0, &[]);
+            pass.set_bind_group(5, &bg5.0, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+          },
+        );
+      }
+
+      if let Some(history_pipe) =
+        gpu_res.res_pipelines[3].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_res_prepare_history",
+          |pass| {
+            pass.set_pipeline(history_pipe);
+            pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+          },
+        );
+      }
     }
   }
 
@@ -2716,6 +2770,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   }
 
   if !WORLD_GI
+    && !GI_RES_DEBUG
     && let Some(cur) = gi.as_ref()
     && cur.enabled
     && let Some(aux) = aux.as_ref()

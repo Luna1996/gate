@@ -20,6 +20,8 @@ const ENTRY_POINTS: &[&str] = &[
   "gi_wal_update",
   "gi_res_prepare_pixels",
   "gi_res_prepare_buckets",
+  "gi_res_generate_samples",
+  "gi_res_prepare_history",
   "gi_face_flatten",
   "gi_denoise_temporal",
   "gi_denoise_atrous1",

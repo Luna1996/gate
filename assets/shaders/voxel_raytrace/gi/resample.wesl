@@ -1,10 +1,14 @@
 // NAADF-style GI resampler: per-pixel bands, 8x8 buckets, lit/unlit sample rings.
 // Layouts and kernel order follow the Caelix GI reference; strides are mirrored by
 // gate-render/src/wesl_consts.rs and the buffers in brickmap/dda.rs.
-import package::bindings::{view_u};
+import package::bindings::{gi_out, gi_u, light_u, view_u};
 import package::brickmap::{Grid};
-import package::gi::common::{gi_pack_dir, gi_unpack_dir};
-import package::gi::consts::{GI_T_MAX};
+import package::common::{sky_rgb};
+import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pack_dir, gi_pose_salt, gi_unpack_dir};
+import package::gi::consts::{GI_PI, GI_SKY_RADIANCE_SCALE, GI_T_MAX, SHADOW_SURFACE_EPS};
+import package::gi::ray::{GI_REACH_T, gi_bounce2, gi_face_shade_cached};
+import package::trace::make_grid;
+import package::world::{WorldHit, voxel_normal_fast, world_trace_medium_scene};
 
 const GI_BUCKET_SIZE: u32 = 8u;
 const GI_REFINED_PER_BUCKET: u32 = 32u;
@@ -112,6 +116,7 @@ struct GiResUniform {
 @group(0) @binding(41) var gia_key_out: texture_storage_2d<rgba32uint, write>;
 @group(0) @binding(42) var gia_surface: texture_2d<f32>;
 @group(0) @binding(43) var gia_key: texture_2d<u32>;
+@group(0) @binding(44) var gia_own_out: texture_storage_2d<r32uint, write>;
 @group(0) @binding(45) var<storage, read_write> gia_pixels: array<GiPixelInfo>;
 @group(0) @binding(46) var<storage, read_write> gia_buckets: array<GiBucketInfo>;
 @group(0) @binding(47) var<storage, read_write> gia_counts: array<atomic<u32>>;
@@ -220,9 +225,31 @@ fn gi_luminance(c: vec3<f32>) -> f32 {
   return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+fn gi_oct_encode(n: vec3<f32>) -> vec2<f32> {
+  let l = abs(n.x) + abs(n.y) + abs(n.z);
+  var o = n.xy / max(l, 1e-9);
+  if (n.z < 0.0) {
+    o = (vec2<f32>(1.0, 1.0) - abs(o.yx))
+      * select(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), o >= vec2<f32>(0.0, 0.0));
+  }
+  return o;
+}
+
+fn gi_oct_decode(o: vec2<f32>) -> vec3<f32> {
+  var n = vec3<f32>(o.x, o.y, 1.0 - abs(o.x) - abs(o.y));
+  let t = max(-n.z, 0.0);
+  n = vec3<f32>(
+    n.x + select(t, -t, n.x >= 0.0),
+    n.y + select(t, -t, n.y >= 0.0),
+    n.z,
+  );
+  return normalize(n);
+}
+
 fn gi_pack_oct16(n: vec3<f32>) -> u32 {
-  let o = clamp(gi_pack_dir(normalize(n)) * 0.5 + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
-  let q = vec2<u32>(o * 65535.0 + vec2<f32>(0.5));
+  let half = vec2<f32>(0.5, 0.5);
+  let o = clamp(gi_oct_encode(normalize(n)) * half + half, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+  let q = vec2<u32>(o * 65535.0 + half);
   return q.x | (q.y << 16u);
 }
 
@@ -232,7 +259,7 @@ fn gi_oct16_to_12(oct16: u32) -> u32 {
 
 fn gi_unpack_oct12(normals: u32) -> vec3<f32> {
   let o = vec2<f32>(f32((normals >> 8u) & 0xFFFu), f32((normals >> 20u) & 0xFFFu)) / 4095.0;
-  return normalize(gi_unpack_dir(o * 2.0 - vec2<f32>(1.0)));
+  return gi_oct_decode(o * 2.0 - vec2<f32>(1.0, 1.0));
 }
 
 fn gi_pack_f16_pair(lo: f32, hi: f32) -> u32 {
@@ -258,7 +285,7 @@ fn gi_rand(state: ptr<function, u32>) -> f32 {
   return f32(*state >> 8u) * (1.0 / 16777216.0);
 }
 
-fn gi_rand2(state: ptr<function, u32>) -> vec2<f32> {
+fn gi_res_rand2(state: ptr<function, u32>) -> vec2<f32> {
   let x = gi_rand(state);
   let y = gi_rand(state);
   return vec2<f32>(x, y);
@@ -405,4 +432,184 @@ fn gi_r_prepare_buckets(gid: vec3<u32>) {
     0u,
     0u,
   );
+}
+
+// ---------------------------------------------------------------------------------------------
+// GiGenerateSamples: one new cosine-distributed path sample per eligible pixel.
+// ---------------------------------------------------------------------------------------------
+
+// The engine shades in units of outgoing radiance divided by pi (brdf_reflected has no 1/pi);
+// the resampler stores incident radiance, so the traced value is multiplied by pi once here.
+fn gi_trace_sample(
+  p: vec2<u32>,
+  key: vec4<u32>,
+  seed: u32,
+  sample: ptr<function, GiLitSample>,
+  is_lit: ptr<function, bool>,
+  is_unlit: ptr<function, bool>,
+  own: ptr<function, u32>,
+) {
+  *is_lit = false;
+  *is_unlit = false;
+  *own = 0u;
+  *sample = GiLitSample(0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u, 0.0, 0.0, 0.0, 0u, 0u);
+
+  let surface = gi_res_load_surface(p);
+  let pw = surface.xyz;
+  let n = gi_unpack_dir(key.w);
+  let slot = key.x >> 16u;
+  let g = make_grid(slot);
+  let local = gi_local_pos(g, pw);
+  (*sample).key = key.x;
+  (*sample).token = key.y;
+  (*sample).ox = local.x;
+  (*sample).oy = local.y;
+  (*sample).oz = local.z;
+
+  var rng = seed;
+  let dir = gi_cos_hemisphere(n, gi_res_rand2(&rng));
+  let org = pw + n * (SHADOW_SURFACE_EPS * g.scale * 2.0);
+
+  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
+  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
+  let sun_bounce = gi_u.params.x;
+  let epoch = gi_u.seq.y;
+  let b2_mult = gi_u.misc.w;
+  let sky_p = clamp(gia_u.settings.x, 1e-4, 1.0);
+
+  var c = vec3<f32>(0.0);
+  var secondary = dir;
+  var secondary_n = vec3<f32>(0.0, 0.0, 1.0);
+  var is_sky = true;
+
+  var tint = vec3<f32>(1.0);
+  let h = world_trace_medium_scene(org, dir, min(GI_T_MAX, GI_REACH_T), false, false, &tint);
+  if (!h.hit) {
+    if (gi_rand(&rng) < sky_p) {
+      c = sky_rgb() * GI_SKY_RADIANCE_SCALE * tint / sky_p;
+    }
+  } else {
+    is_sky = false;
+    secondary = h.point;
+    let hg = make_grid(u32(h.obj_id) + 1u);
+    let hn = voxel_normal_fast(hg, h.voxel, h.face_id, h.n);
+    secondary_n = select(hn, -hn, dot(hn, dir) > 0.0);
+    let k0 = gi_key0(h.voxel, h.obj_id);
+    let k1 = gi_key1(h.voxel, h.face_id, h.obj_id);
+    let key_ok = gi_key_ok(h.voxel, h.obj_id);
+    var l = gi_face_shade_cached(h, org, sun_dir, sun_c, sun_bounce, epoch, k0, k1, key_ok);
+    if (b2_mult > 0.0 && gi_rand(&rng) < 1.0 / max(b2_mult, 1.0)) {
+      l = l + gi_bounce2(h, org, sun_dir, sun_c, sun_bounce, epoch, seed, b2_mult);
+    }
+    c = l * tint * GI_PI;
+  }
+
+  *own = gi_pack_radiance(c);
+
+  let threshold = max(gia_u.settings.y, 1e-6);
+  let s = gi_luminance(c);
+  if (s < threshold) {
+    let keep = max(s, 0.05 * threshold) / threshold;
+    c = c * (1.0 / keep);
+    if (gi_rand(&rng) > keep) {
+      c = vec3<f32>(0.0);
+    }
+  }
+
+  (*sample).primary_normal = gi_axis_index(n) | select(0u, GI_SAMPLE_SKY_FLAG, is_sky);
+  (*sample).sx = secondary.x;
+  (*sample).sy = secondary.y;
+  (*sample).sz = secondary.z;
+  (*sample).secondary_normal = select(0u, gi_pack_oct16(secondary_n), !is_sky);
+  (*sample).radiance = gi_pack_radiance(c);
+
+  if ((*sample).radiance != 0u) {
+    *is_lit = true;
+  } else if (gi_rand(&rng) < 1.0 / f32(max(gia_u.settings.z, 1.0))) {
+    *is_unlit = true;
+  }
+}
+
+fn gi_r_generate_samples(gid: vec3<u32>) {
+  let p = gid.xy;
+  if (!gi_res_texel_in_range(p)) {
+    return;
+  }
+
+  let key = gi_res_load_key(p);
+  let eligible = (key.z & (GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE))
+    == (GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE);
+  let slot = gi_res_frame_slot();
+  let frame = gia_u.frame.w;
+  let seed = gi_rand_seed(p, frame, 2u);
+
+  var sample = GiLitSample(0u, 0u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u, 0.0, 0.0, 0.0, 0u, 0u);
+  var is_lit = false;
+  var is_unlit = false;
+  var own = 0u;
+  if (eligible) {
+    gi_trace_sample(p, key, seed, &sample, &is_lit, &is_unlit, &own);
+  }
+
+  textureStore(gia_own_out, vec2<i32>(p), vec4<u32>(own));
+
+  if (u32(gia_u.settings4.x) != 0u) {
+    textureStore(gi_out, vec2<i32>(p), vec4<f32>(gi_unpack_radiance(own), 1.0));
+  }
+
+  if (is_lit) {
+    let k = atomicAdd(&gia_counts[GI_COUNT_FRAME_BASE + 2u * slot], 1u);
+    let index = (atomicLoad(&gia_counts[GI_COUNT_LIT_HEAD]) + k) % max(gia_u.limits.x, 1u);
+    gia_lit[index] = sample;
+  } else if (is_unlit) {
+    let k = atomicAdd(&gia_counts[GI_COUNT_FRAME_BASE + 2u * slot + 1u], 1u);
+    let index = (atomicLoad(&gia_counts[GI_COUNT_UNLIT_HEAD]) + k) % max(gia_u.limits.y, 1u);
+    gia_unlit[index] = GiUnlitSample(
+      sample.key,
+      sample.token,
+      sample.ox,
+      sample.oy,
+      sample.oz,
+      sample.vx,
+      sample.vy,
+      sample.vz,
+      sample.primary_normal,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GiPrepareHistory: valid sample counts, ring starts and indirect dispatch arguments.
+// ---------------------------------------------------------------------------------------------
+
+fn gi_prepare_ring(ring: u32, capacity: u32, slot: u32) {
+  let head = (atomicLoad(&gia_counts[GI_COUNT_LIT_HEAD + ring])
+    + atomicLoad(&gia_counts[GI_COUNT_FRAME_BASE + 2u * slot + ring])) % max(capacity, 1u);
+  atomicStore(&gia_counts[GI_COUNT_LIT_HEAD + ring], head);
+
+  var total = 0u;
+  let max_frames = u32(max(gia_u.settings.w, 0.0));
+  for (var i: u32 = 0u; i < max_frames; i = i + 1u) {
+    let frame_slot = (slot + GI_HISTORY_SLOTS - i) % GI_HISTORY_SLOTS;
+    let n = atomicLoad(&gia_counts[GI_COUNT_FRAME_BASE + 2u * frame_slot + ring]);
+    if (total + n > capacity) {
+      break;
+    }
+    total = total + n;
+  }
+
+  atomicStore(&gia_counts[GI_COUNT_LIT_VALID + ring], total);
+  atomicStore(&gia_counts[GI_COUNT_LIT_START + ring], (head + capacity - total) % max(capacity, 1u));
+  atomicStore(&gia_counts[GI_COUNT_LIT_COPRIME + ring], gi_pcg(gia_u.frame.w * 2u + ring) | 1u);
+
+  let groups = select(0u, gi_next_pow2((total + 63u) / 64u), total > 0u);
+  gia_args[3u * ring] = min(groups, GI_MAX_GROUPS_X);
+  gia_args[3u * ring + 1u] = max(1u, groups / GI_MAX_GROUPS_X);
+  gia_args[3u * ring + 2u] = 1u;
+}
+
+fn gi_r_prepare_history() {
+  let slot = gi_res_frame_slot();
+  gi_prepare_ring(0u, max(gia_u.limits.x, 1u), slot);
+  gi_prepare_ring(1u, max(gia_u.limits.y, 1u), slot);
 }
