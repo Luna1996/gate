@@ -1887,6 +1887,8 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   } else {
     (None, None)
   };
+  // Binding 0 is unused by dda_refl_compose; a scratch view keeps the pass from aliasing the
+  // out_base/gi textures it samples through the other groups.
   let mut compose_entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
     beam_cache.gi_dn_src[0].as_ref().expect("降噪纹理未创建"),
     &u,
