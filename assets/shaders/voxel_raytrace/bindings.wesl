@@ -209,9 +209,11 @@ struct FogUniform {
 
 @group(0) @binding(16) var gi_dn_tmp: texture_storage_2d<rgba16float, write>;
 
-@group(0) @binding(17) var<storage, read_write> gi_den_phi: array<f32>;
 
 @group(0) @binding(20) var<storage, read> gi_den_cfg: array<u32>;
+
+@group(0) @binding(42) var gi_surface_tex: texture_2d<f32>;
+@group(0) @binding(43) var gi_key_tex: texture_2d<u32>;
 
 @group(0) @binding(18) var<storage, read_write> face_slots_flat: array<atomic<u32>>;
 @group(0) @binding(19) var gi_out_flat: texture_storage_2d<rgba16float, write>;

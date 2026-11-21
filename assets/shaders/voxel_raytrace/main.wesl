@@ -1359,42 +1359,42 @@ fn gi_face_flatten(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn gi_denoise_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_tmp);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
-  gi_den_temporal(size, vec2<i32>(i32(gid.x), i32(gid.y)));
+  gi_den_temporal(vec2<i32>(i32(gid.x), i32(gid.y)));
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous1(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
-  gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 1);
+  gi_den_atrous(vec2<i32>(i32(gid.x), i32(gid.y)), 1);
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous2(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
-  gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 2);
+  gi_den_atrous(vec2<i32>(i32(gid.x), i32(gid.y)), 2);
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous4(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
-  gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 4);
+  gi_den_atrous(vec2<i32>(i32(gid.x), i32(gid.y)), 4);
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous8(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
-  gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 8);
+  gi_den_atrous(vec2<i32>(i32(gid.x), i32(gid.y)), 8);
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_denoise_atrous16(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(gi_dn_dst);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
-  gi_den_atrous(size, vec2<i32>(i32(gid.x), i32(gid.y)), 16);
+  gi_den_atrous(vec2<i32>(i32(gid.x), i32(gid.y)), 16);
 }
 
 @compute @workgroup_size(8, 8, 1)

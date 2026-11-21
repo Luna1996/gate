@@ -1,7 +1,7 @@
 // NAADF-style GI resampler: per-pixel bands, 8x8 buckets, lit/unlit sample rings.
 // Layouts and kernel order follow the resampler GI reference; strides are mirrored by
 // gate-render/src/wesl_consts.rs and the buffers in brickmap/dda.rs.
-import package::bindings::{gi_out, gi_u, light_u, view_u};
+import package::bindings::{gi_out, gi_key_tex, gi_surface_tex, gi_u, light_u, view_u};
 import package::brickmap::{Grid};
 import package::common::{sky_rgb};
 import package::gi::common::{gi_cos_hemisphere, gi_key0, gi_key1, gi_key_ok, gi_local_rev, gi_pack_dir, gi_pose_salt, gi_unpack_dir};
@@ -114,8 +114,6 @@ struct GiResUniform {
 @group(0) @binding(0) var<uniform> gia_u: GiResUniform;
 @group(0) @binding(40) var gia_surface_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(41) var gia_key_out: texture_storage_2d<rgba32uint, write>;
-@group(0) @binding(42) var gia_surface: texture_2d<f32>;
-@group(0) @binding(43) var gia_key: texture_2d<u32>;
 @group(0) @binding(44) var gia_own_out: texture_storage_2d<r32uint, write>;
 @group(0) @binding(45) var<storage, read_write> gia_pixels: array<GiPixelInfo>;
 @group(0) @binding(46) var<storage, read_write> gia_buckets: array<GiBucketInfo>;
@@ -166,11 +164,11 @@ fn gi_res_store_miss(coord: vec2<i32>) {
 }
 
 fn gi_res_load_surface(p: vec2<u32>) -> vec4<f32> {
-  return textureLoad(gia_surface, vec2<i32>(p), 0);
+  return textureLoad(gi_surface_tex, vec2<i32>(p), 0);
 }
 
 fn gi_res_load_key(p: vec2<u32>) -> vec4<u32> {
-  return textureLoad(gia_key, vec2<i32>(p), 0);
+  return textureLoad(gi_key_tex, vec2<i32>(p), 0);
 }
 
 // 0..5 as +X, -X, +Y, -Y, +Z, -Z (the objectNormals order of the resampler reference).

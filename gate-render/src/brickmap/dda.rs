@@ -305,20 +305,9 @@ pub(crate) struct AuxTexCache {
 
   gi_hist: [Option<Buffer>; 2],
 
-  gi_phi: Option<Buffer>,
-
   gi_dn: [Option<Texture>; 4],
 
   gi_dn_src: [Option<TextureView>; 4],
-
-  gi_dn_dst: [Option<TextureView>; 4],
-
-  den_bg: [Option<BindGroup>; 7],
-
-  den_cfg: Option<Buffer>,
-  den_cfg_r: u32,
-
-  den_flip: bool,
 
   gi_flatten_bg: Option<BindGroup>,
 
@@ -369,11 +358,11 @@ pub(crate) struct AuxTexCache {
   rr_gb_bg: Option<BindGroup>,
 }
 
-pub(crate) const DEN_ATROUS_CHAINS: [[usize; 2]; 6] =
-  [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3], [2, 1]];
+// Atrous ping-pong pairs over the four denoise views: temporal (0) -> 1 -> 2 -> 1 -> ... -> 3.
+pub(crate) const DEN_ATROUS_PAIRS: [(usize, usize); 5] = [(0, 1), (1, 2), (2, 1), (2, 3), (1, 3)];
 
 pub(crate) const DEN_ATROUS_ROUNDS: [[usize; 5]; 5] =
-  [[3, 0, 0, 0, 0], [0, 4, 0, 0, 0], [0, 1, 2, 0, 0], [0, 1, 5, 4, 0], [0, 1, 5, 1, 2]];
+  [[3, 0, 0, 0, 0], [0, 4, 0, 0, 0], [0, 1, 3, 0, 0], [0, 1, 2, 4, 0], [0, 1, 2, 1, 3]];
 
 impl AuxTexCache {
   pub(crate) fn gi_write_view(&self) -> Option<&TextureView> {
@@ -417,8 +406,8 @@ impl AuxTexCache {
     self.gi_res_args.as_ref()
   }
 
-  pub(crate) fn gi_hist_current(&self) -> Option<&Buffer> {
-    let i = if self.den_flip { 1 } else { 0 };
+  pub(crate) fn gi_hist_current(&self, flip: bool) -> Option<&Buffer> {
+    let i = if flip { 1 } else { 0 };
     self.gi_hist[i].as_ref()
   }
 
@@ -436,6 +425,19 @@ impl AuxTexCache {
 
   pub(crate) fn gi_guide_buffer(&self) -> Option<&Buffer> {
     self.gi_guide.as_ref()
+  }
+
+  pub(crate) fn gi_hist_pair(&self) -> Option<[&Buffer; 2]> {
+    Some([self.gi_hist[0].as_ref()?, self.gi_hist[1].as_ref()?])
+  }
+
+  pub(crate) fn gi_dn_views(&self) -> Option<[&TextureView; 4]> {
+    Some([
+      self.gi_dn_src[0].as_ref()?,
+      self.gi_dn_src[1].as_ref()?,
+      self.gi_dn_src[2].as_ref()?,
+      self.gi_dn_src[3].as_ref()?,
+    ])
   }
 
   pub(crate) fn face_slots_buffer(&self) -> Option<&Buffer> {
@@ -1523,14 +1525,12 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       Some(make_buf("gate_gi_hist_a", px * c.gi_den_hist_words as u64 * 4)),
       Some(make_buf("gate_gi_hist_b", px * c.gi_den_hist_words as u64 * 4)),
     ];
-    beam_cache.gi_phi = Some(make_buf("gate_gi_den_phi", px * 4));
 
     for (i, label) in
       ["gate_gi_dn_tmp", "gate_gi_dn_a", "gate_gi_dn_b", "gate_gi_den"].iter().enumerate()
     {
       let t = make(label, TextureFormat::Rgba16Float);
       beam_cache.gi_dn_src[i] = Some(t.create_view(&TextureViewDescriptor::default()));
-      beam_cache.gi_dn_dst[i] = Some(t.create_view(&TextureViewDescriptor::default()));
       beam_cache.gi_dn[i] = Some(t);
     }
   }
@@ -1888,9 +1888,10 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     (None, None)
   };
   // Binding 0 is unused by dda_refl_compose; a scratch view keeps the pass from aliasing the
-  // out_base/gi textures it samples through the other groups.
+  // out_base/gi textures it samples through the other groups. It must not be the view the GI
+  // read group publishes (the temporal output), or the two usages conflict in one dispatch.
   let mut compose_entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
-    beam_cache.gi_dn_src[0].as_ref().expect("降噪纹理未创建"),
+    beam_cache.gi_dn_src[1].as_ref().expect("降噪纹理未创建"),
     &u,
     &beam_view,
     eye_buf.as_entire_binding(),
@@ -1981,79 +1982,6 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     ],
   );
   beam_cache.gi_flatten_bg = Some(gi_flatten_bg);
-
-  let den_r = den_plan.radius;
-  if beam_cache.den_cfg.is_none() {
-    beam_cache.den_cfg = Some(render_device.create_buffer(&BufferDescriptor {
-      label: Some("gate_gi_den_cfg"),
-      size: 16,
-      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-      mapped_at_creation: false,
-    }));
-  }
-  if beam_cache.den_cfg_r != den_r {
-    beam_cache.den_cfg_r = den_r;
-    let cfg = beam_cache.den_cfg.as_ref().expect("刚创建");
-    queue.write_buffer(cfg, 0, &den_r.to_le_bytes());
-    bevy::log::debug!(
-      target: "gate",
-      "GI 降噪档位 → {}（atrous 核半径 {}，每轮 {} tap）",
-      if den_plan.on {
-        format!("{} 轮 atrous", den_plan.rounds)
-      } else {
-        "关（直接采样原始 GI）".to_string()
-      },
-      den_r,
-      (2 * den_r + 1) * (2 * den_r + 1) - 1,
-    );
-  }
-  let den_cfg = beam_cache.den_cfg.as_ref().expect("刚创建").clone();
-
-  let den_runs = !gi_res_debug_on() && tune.gi.as_ref().is_some_and(|g| g.enabled);
-  let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
-  {
-    let guide = beam_cache.gi_guide.as_ref().expect("导引 buffer 未创建").clone();
-    let phi = beam_cache.gi_phi.as_ref().expect("φ buffer 未创建").clone();
-    let hist_prev = beam_cache.gi_hist[prev_i].as_ref().expect("历史 buffer 未创建").clone();
-    let hist_cur = beam_cache.gi_hist[cur_i].as_ref().expect("历史 buffer 未创建").clone();
-    let dn_src: Vec<TextureView> =
-      beam_cache.gi_dn_src.iter().map(|v| v.as_ref().expect("降噪纹理未创建").clone()).collect();
-    let dn_dst: Vec<TextureView> =
-      beam_cache.gi_dn_dst.iter().map(|v| v.as_ref().expect("降噪纹理未创建").clone()).collect();
-    let temporal_layout =
-      pipeline_cache.get_bind_group_layout(&crate::gi::gi_den_temporal_layout());
-    let atrous_layout = pipeline_cache.get_bind_group_layout(&crate::gi::gi_den_atrous_layout());
-    beam_cache.den_bg[0] = Some(render_device.create_bind_group(
-      None,
-      &temporal_layout,
-      &[
-        BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
-        BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&gi_view) },
-        BindGroupEntry { binding: 12, resource: hist_prev.as_entire_binding() },
-        BindGroupEntry { binding: 13, resource: hist_cur.as_entire_binding() },
-        BindGroupEntry { binding: 16, resource: BindingResource::TextureView(&dn_dst[0]) },
-        BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },
-        BindGroupEntry { binding: 20, resource: den_cfg.as_entire_binding() },
-      ],
-    ));
-    for (k, [s, d]) in DEN_ATROUS_CHAINS.iter().enumerate() {
-      beam_cache.den_bg[k + 1] = Some(render_device.create_bind_group(
-        None,
-        &atrous_layout,
-        &[
-          BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
-          BindGroupEntry { binding: 13, resource: hist_cur.as_entire_binding() },
-          BindGroupEntry { binding: 14, resource: BindingResource::TextureView(&dn_src[*s]) },
-          BindGroupEntry { binding: 15, resource: BindingResource::TextureView(&dn_dst[*d]) },
-          BindGroupEntry { binding: 17, resource: phi.as_entire_binding() },
-          BindGroupEntry { binding: 20, resource: den_cfg.as_entire_binding() },
-        ],
-      ));
-    }
-  }
-  if den_runs {
-    beam_cache.den_flip = !beam_cache.den_flip;
-  }
 
   let bg0_gi_layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_gi_layout);
   let hit_view_ref = beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建").clone();
@@ -2248,6 +2176,8 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   res_bg0: Option<Res<'w, crate::gi::GiResBg0>>,
   res_hist_bg: Option<Res<'w, crate::gi::GiResHistoryBg>>,
   res_spatial_bg: Option<Res<'w, crate::gi::GiResSpatialBg>>,
+  den_temporal_bg: Option<Res<'w, crate::gi::GiDenTemporalBg>>,
+  den_atrous_bg: Option<Res<'w, crate::gi::GiDenAtrousBg>>,
   eye: Option<Res<'w, EyeAdaptGpu>>,
   gi: Option<Res<'w, crate::gi::GiSettings>>,
   gi_gpu: Option<Res<'w, crate::gi::GiGpu>>,
@@ -2273,6 +2203,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     res_bg0,
     res_hist_bg,
     res_spatial_bg,
+    den_temporal_bg,
+    den_atrous_bg,
     eye,
     gi,
     gi_gpu,
@@ -2874,16 +2806,16 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     && cur.enabled
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
+    && let Some(temporal_bg) = den_temporal_bg.as_ref()
+    && let Some(atrous_bg) = den_atrous_bg.as_ref()
   {
     let plan = cur.denoise_plan();
     let n = plan.rounds.clamp(0, 5) as usize;
     if n > 0 {
       let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
       let gy = aux.gi_size.y.div_ceil(DDA_WORKGROUP_SIZE);
-      let rounds = &DEN_ATROUS_ROUNDS[n - 1];
-      if let Some(bg) = aux.den_bg[0].as_ref()
-        && let Some(pipe) =
-          gi_gpu.den_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      if let Some(pipe) =
+        gi_gpu.den_pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id))
       {
         crate::profiler::gpu_compute_pass(
           &mut profiler,
@@ -2891,13 +2823,15 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           "gate_gi_denoise_temporal",
           |pass| {
             pass.set_pipeline(pipe);
-            pass.set_bind_group(0, bg, &[]);
+            pass.set_bind_group(0, &temporal_bg.0, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
           },
         );
       }
+      let rounds = &DEN_ATROUS_ROUNDS[n - 1];
       for i in 0..n {
-        let Some(bg) = aux.den_bg[rounds[i] + 1].as_ref() else {
+        let pair = rounds[i];
+        let Some(bg) = atrous_bg.0.get(pair) else {
           continue;
         };
         let Some(pipe) =

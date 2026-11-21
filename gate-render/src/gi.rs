@@ -602,13 +602,23 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
     },
     count: None,
   };
-  let tex = |binding: u32| BindGroupLayoutEntry {
+  let tex = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
     binding,
     visibility: C,
     ty: BindingType::Texture {
-      sample_type: TextureSampleType::Float { filterable: true },
+      sample_type,
       view_dimension: TextureViewDimension::D2,
       multisampled: false,
+    },
+    count: None,
+  };
+  let store = |binding: u32| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format: TextureFormat::Rgba16Float,
+      view_dimension: TextureViewDimension::D2,
     },
     count: None,
   };
@@ -616,21 +626,13 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
     "GiDenTemporal",
     &[
       ro(10),
-      tex(11),
+      tex(11, TextureSampleType::Float { filterable: false }),
       ro(12),
       rw(13),
-      BindGroupLayoutEntry {
-        binding: 16,
-        visibility: C,
-        ty: BindingType::StorageTexture {
-          access: StorageTextureAccess::WriteOnly,
-          format: TextureFormat::Rgba16Float,
-          view_dimension: TextureViewDimension::D2,
-        },
-        count: None,
-      },
-      rw(17),
+      store(16),
       ro(20),
+      tex(42, TextureSampleType::Float { filterable: false }),
+      tex(43, TextureSampleType::Uint),
     ],
   )
 }
@@ -638,39 +640,31 @@ pub fn gi_den_temporal_layout() -> BindGroupLayoutDescriptor {
 pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
   use bevy::render::render_resource::*;
   const C: ShaderStages = ShaderStages::COMPUTE;
+  let ro = |binding: u32| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: true },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  };
+  let tex = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Texture {
+      sample_type,
+      view_dimension: TextureViewDimension::D2,
+      multisampled: false,
+    },
+    count: None,
+  };
   BindGroupLayoutDescriptor::new(
     "GiDenAtrous",
     &[
-      BindGroupLayoutEntry {
-        binding: 10,
-        visibility: C,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Storage { read_only: true },
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
-      BindGroupLayoutEntry {
-        binding: 13,
-        visibility: C,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Storage { read_only: false },
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
-      BindGroupLayoutEntry {
-        binding: 14,
-        visibility: C,
-        ty: BindingType::Texture {
-          sample_type: TextureSampleType::Float { filterable: true },
-          view_dimension: TextureViewDimension::D2,
-          multisampled: false,
-        },
-        count: None,
-      },
+      ro(10),
+      tex(14, TextureSampleType::Float { filterable: false }),
       BindGroupLayoutEntry {
         binding: 15,
         visibility: C,
@@ -681,26 +675,9 @@ pub fn gi_den_atrous_layout() -> BindGroupLayoutDescriptor {
         },
         count: None,
       },
-      BindGroupLayoutEntry {
-        binding: 17,
-        visibility: C,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Storage { read_only: false },
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
-      BindGroupLayoutEntry {
-        binding: 20,
-        visibility: C,
-        ty: BindingType::Buffer {
-          ty: BufferBindingType::Storage { read_only: true },
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      },
+      ro(20),
+      tex(42, TextureSampleType::Float { filterable: false }),
+      tex(43, TextureSampleType::Uint),
     ],
   )
 }
@@ -761,6 +738,10 @@ pub struct GiGpu {
 
   pub res_flip: bool,
 
+  pub den_flip: bool,
+
+  pub den_cfg: Option<bevy::render::render_resource::Buffer>,
+
   pub key_org: Option<Vec<glam::IVec3>>,
 
   region_rev: Vec<u32>,
@@ -810,6 +791,12 @@ pub struct GiResHistoryBg(pub bevy::render::render_resource::BindGroup);
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiResSpatialBg(pub bevy::render::render_resource::BindGroup);
+
+#[derive(bevy::ecs::resource::Resource)]
+pub struct GiDenTemporalBg(pub bevy::render::render_resource::BindGroup);
+
+#[derive(bevy::ecs::resource::Resource)]
+pub struct GiDenAtrousBg(pub [bevy::render::render_resource::BindGroup; 5]);
 
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
@@ -897,6 +884,8 @@ fn init_gi_gpu(mut commands: bevy::ecs::system::Commands) {
 
     prev_view_proj: Mat4::IDENTITY,
     res_flip: false,
+    den_flip: false,
+    den_cfg: None,
     key_org: None,
     region_rev: vec![0; (REGION_TABLE * REGION_TABLE * REGION_TABLE) as usize],
     region_dirty: false,
@@ -1393,6 +1382,77 @@ fn prepare_gi(p: PrepareGiParams) {
         ],
       );
       commands.insert_resource(GiResSpatialBg(spatial_bg));
+    }
+
+    let den_plan = if crate::brickmap::dda::gi_res_debug_on() {
+      DenoisePlan { on: false, rounds: 0, radius: 1 }
+    } else {
+      settings.denoise_plan()
+    };
+    let cfg_words: [u32; 8] = [res_size.x, res_size.y, gpu.frame, den_plan.radius, 0, 64, 0, 0];
+    let cfg = match gpu.den_cfg.as_ref() {
+      Some(b) if b.size() >= 32 => b.clone(),
+      _ => {
+        let b = device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
+          label: Some("gate_gi_den_cfg"),
+          size: 32,
+          usage: bevy::render::render_resource::BufferUsages::STORAGE
+            | bevy::render::render_resource::BufferUsages::COPY_DST,
+          mapped_at_creation: false,
+        });
+        gpu.den_cfg = Some(b.clone());
+        b
+      }
+    };
+    let mut cfg_raw = Vec::with_capacity(cfg_words.len() * 4);
+    for w in cfg_words {
+      cfg_raw.extend_from_slice(&w.to_le_bytes());
+    }
+    queue.write_buffer(&cfg, 0, &cfg_raw);
+
+    if den_plan.on
+      && let Some(guide) = aux.as_ref().and_then(|a| a.gi_guide_buffer())
+      && let Some(hist) = aux.as_ref().and_then(|a| a.gi_hist_pair())
+      && let Some(dn) = aux.as_ref().and_then(|a| a.gi_dn_views())
+      && let Some(dn_surf) = aux.as_ref().and_then(|a| a.gi_surface_view())
+      && let Some(dn_key) = aux.as_ref().and_then(|a| a.gi_key_view())
+    {
+      let (prev, cur) = if gpu.den_flip { (hist[1], hist[0]) } else { (hist[0], hist[1]) };
+      let temporal_layout = pipeline_cache.get_bind_group_layout(&gi_den_temporal_layout());
+      let temporal_bg = device.create_bind_group(
+        None,
+        &temporal_layout,
+        &[
+          BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
+          BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&gi_view) },
+          BindGroupEntry { binding: 12, resource: prev.as_entire_binding() },
+          BindGroupEntry { binding: 13, resource: cur.as_entire_binding() },
+          BindGroupEntry { binding: 16, resource: BindingResource::TextureView(dn[0]) },
+          BindGroupEntry { binding: 20, resource: cfg.as_entire_binding() },
+          BindGroupEntry { binding: 42, resource: BindingResource::TextureView(dn_surf) },
+          BindGroupEntry { binding: 43, resource: BindingResource::TextureView(dn_key) },
+        ],
+      );
+      commands.insert_resource(GiDenTemporalBg(temporal_bg));
+
+      let atrous_layout = pipeline_cache.get_bind_group_layout(&gi_den_atrous_layout());
+      let pairs = crate::brickmap::dda::DEN_ATROUS_PAIRS;
+      let atrous = pairs.map(|(s, d)| {
+        device.create_bind_group(
+          None,
+          &atrous_layout,
+          &[
+            BindGroupEntry { binding: 10, resource: guide.as_entire_binding() },
+            BindGroupEntry { binding: 14, resource: BindingResource::TextureView(dn[s]) },
+            BindGroupEntry { binding: 15, resource: BindingResource::TextureView(dn[d]) },
+            BindGroupEntry { binding: 20, resource: cfg.as_entire_binding() },
+            BindGroupEntry { binding: 42, resource: BindingResource::TextureView(dn_surf) },
+            BindGroupEntry { binding: 43, resource: BindingResource::TextureView(dn_key) },
+          ],
+        )
+      });
+      commands.insert_resource(GiDenAtrousBg(atrous));
+      gpu.den_flip = !gpu.den_flip;
     }
   }
 }

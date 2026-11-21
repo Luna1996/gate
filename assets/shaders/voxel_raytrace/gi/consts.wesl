@@ -25,14 +25,8 @@ const GI_SS_REUSE_CLAMP_HI: f32 = 2.0;
 const GI_SS_REUSE_CLAMP_LO_RESET: f32 = 0.8;
 const GI_SS_REUSE_CLAMP_HI_RESET: f32 = 1.25;
 
-const GI_HIST_RESET_SCALE: f32 = 0.05;
-
-const GI_DEN_RESET_SCALE: f32 = 0.25;
-
-const GI_HIST_RESET_FRAMES: u32 = 64u;
-const GI_HIST_SEARCH_TAPS: u32 = 8u;
 const GI_DEN_GUIDE_WORDS: u32 = 6u;
-const GI_DEN_HIST_WORDS: u32 = 9u;
+const GI_DEN_HIST_WORDS: u32 = 16u;
 const GI_DEN_G_KEY0: u32 = 0u;
 const GI_DEN_G_KEY1: u32 = 1u;
 const GI_DEN_G_NRM: u32 = 2u;
@@ -40,27 +34,10 @@ const GI_DEN_G_PREV: u32 = 3u;
 const GI_DEN_G_NOISE: u32 = 4u;
 
 const GI_DEN_G_RESET: u32 = 5u;
-const GI_DEN_H_COL: u32 = 0u;
-const GI_DEN_H_M1: u32 = 3u;
-const GI_DEN_H_M2: u32 = 4u;
-const GI_DEN_H_M: u32 = 5u;
-const GI_DEN_H_KEY0: u32 = 6u;
-const GI_DEN_H_KEY1: u32 = 7u;
-const GI_DEN_H_NRM: u32 = 8u;
 const GI_DEN_ATROUS_ITER: u32 = 5u;
 const GI_DEN_ATROUS_R: u32 = 2u;
 const GI_DEN_ATROUS_R_FAST: u32 = 1u;
-const GI_DEN_STAB_FRAMES: f32 = 8.0;
-const GI_DEN_STAB_MAX: f32 = 3.0;
-const GI_DEN_NBR_R: u32 = 2u;
-const GI_DEN_M_MAX: u32 = 64u;
-const GI_DEN_SIGMA_ALPHA: f32 = 0.02;
-const GI_DEN_W_HIST_MIN: f32 = 0.05;
-const GI_DEN_W_HIST_STATIC: f32 = 0.85;
-const GI_DEN_CLAMP_K: f32 = 2.5;
 const GI_DEN_N_DOT: f32 = 0.7;
-const GI_DEN_LUMA_K: f32 = 1.0;
-const GI_DEN_LUMA_FLOOR_REL: f32 = 0.05;
 
 const GI_SKY_AMBIENT: f32 = 0.10;
 const GI_AMBIENT_FLOOR: f32 = 0.01;

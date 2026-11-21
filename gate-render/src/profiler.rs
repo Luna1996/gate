@@ -522,7 +522,7 @@ fn report_gi_flicker(
   }
   let bytes = (n_texels * words * 4) as u64;
 
-  let vis = aux.gi_hist_current();
+  let vis = aux.gi_hist_current(gi.den_flip);
   let vis_words = crate::wesl_consts::gi_consts().gi_den_hist_words as usize;
   let vis_bytes = vis.map(|v| v.size()).unwrap_or(0);
   let vis_px = vis.map(|v| (v.size() / 4) as usize / vis_words.max(1)).unwrap_or(0);
@@ -555,9 +555,10 @@ fn report_gi_flicker(
 
         let vis_base = bytes as usize;
         let mut cur_vis: Vec<f32> = Vec::with_capacity(vis_px);
+        let mut vis_age = 0.0f32;
         for t in 0..vis_px {
           let b0 = vis_base + t * vis_words * 4;
-          if b0 + 12 > view.len() {
+          if b0 + 16 > view.len() {
             break;
           }
           let f = |k: usize| {
@@ -565,7 +566,9 @@ fn report_gi_flicker(
             f32::from_bits(u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]))
           };
           cur_vis.push((f(0) + f(1) + f(2)) / 3.0);
+          vis_age += f(3);
         }
+        let vis_age = vis_age / cur_vis.len().max(1) as f32;
         if probe.prev.len() == cur.len() {
           let mut sum = 0.0f32;
           let mut cnt = 0u32;
@@ -604,7 +607,7 @@ fn report_gi_flicker(
           let vmean = vmean / vn.max(1) as f32;
           info!(
             "GIPROBE[样本均值 {:.1}（m<32 占比 {:.2}%）| 原始 |Δest| 均值 {:.5} 最大 {:.4} | \
-             可见GI 均值 {:.5} |Δ| 均值 {:.5}（相对 {:.3}%）最大 {:.4}]",
+             可见GI 均值 {:.5} |Δ| 均值 {:.5}（相对 {:.3}%）最大 {:.4} | 历史年龄 {:.1}]",
             sum_m / n as f32,
             low_m as f32 * 100.0 / n as f32,
             sum / n as f32,
@@ -612,7 +615,8 @@ fn report_gi_flicker(
             vmean,
             vsum / vn.max(1) as f32,
             vsum / vn.max(1) as f32 * 100.0 / vmean.abs().max(1e-6),
-            vmax
+            vmax,
+            vis_age
           );
         }
         probe.prev = cur;
