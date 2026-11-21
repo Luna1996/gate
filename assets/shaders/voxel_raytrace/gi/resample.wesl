@@ -1,5 +1,5 @@
 // NAADF-style GI resampler: per-pixel bands, 8x8 buckets, lit/unlit sample rings.
-// Layouts and kernel order follow the Caelix GI reference; strides are mirrored by
+// Layouts and kernel order follow the resampler GI reference; strides are mirrored by
 // gate-render/src/wesl_consts.rs and the buffers in brickmap/dda.rs.
 import package::bindings::{gi_out, gi_u, light_u, view_u};
 import package::brickmap::{Grid};
@@ -173,7 +173,7 @@ fn gi_res_load_key(p: vec2<u32>) -> vec4<u32> {
   return textureLoad(gia_key, vec2<i32>(p), 0);
 }
 
-// 0..5 as +X, -X, +Y, -Y, +Z, -Z (the objectNormals order of the Caelix reference).
+// 0..5 as +X, -X, +Y, -Y, +Z, -Z (the objectNormals order of the resampler reference).
 fn gi_axis_index(n: vec3<f32>) -> u32 {
   let a = abs(n);
   if (a.x >= a.y && a.x >= a.z) {

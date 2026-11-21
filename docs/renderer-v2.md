@@ -134,10 +134,10 @@
 - 实测 720p：静态墙面无云雾状斑块、无黑墙；画面仍偏蓝/偏平，GI 能量和太阳反弹色需要在结构稳定后单独校准。
 - 未完成：8×8 bucket、12 次 spatial reservoir 迭代、移动物体 object-space、反射 GI 改读屏幕 GI。
 
-## M2.2 Caelix GI resampler（已切换，2026-11-22）
+## M2.2 GI resampler（已切换，2026-11-22）
 
-- 主漫反射 GI 改为 Caelix 的 NAADF bucket 重采样器：`assets/shaders/voxel_raytrace/gi/resample.wesl`，按 Caelix 顺序跑 8 个 kernel：`GiPreparePixels`、`GiPrepareBuckets`、`GiGenerateSamples`、`GiPrepareHistory`、`GiReprojectLit`、`GiReprojectUnlit`、`GiRefineBuckets`、`GiSpatial`。
-- 数据布局沿用 Caelix：lit 样本 14 word/56B（key/token/object-space primary/virtual offset/primary axis+sky/secondary position/oct16 normal/RGB9E5）、unlit 9 word/36B、bucket 样本 8 word/32B、bucket info 8 word/32B、pixel info 2 word/8B。Rust 侧 stride 与 ring 帧数从 `.wesl` 解析（`wesl_consts::GiConsts`）。
+- 主漫反射 GI 改为 resampler 的 NAADF bucket 重采样器：`assets/shaders/voxel_raytrace/gi/resample.wesl`，按 resampler 顺序跑 8 个 kernel：`GiPreparePixels`、`GiPrepareBuckets`、`GiGenerateSamples`、`GiPrepareHistory`、`GiReprojectLit`、`GiReprojectUnlit`、`GiRefineBuckets`、`GiSpatial`。
+- 数据布局沿用 resampler：lit 样本 14 word/56B（key/token/object-space primary/virtual offset/primary axis+sky/secondary position/oct16 normal/RGB9E5）、unlit 9 word/36B、bucket 样本 8 word/32B、bucket info 8 word/32B、pixel info 2 word/8B。Rust 侧 stride 与 ring 帧数从 `.wesl` 解析（`wesl_consts::GiConsts`）。
 - 采样器：lit ring 2 帧、unlit ring 4 帧、`maxHistoryFrames=64`、每桶 32 refined + 8 compact、12 次 adaptive-radius spatial 迭代、visible ray 失败回退本帧 own sample（RGB9E5，binding 44/53 读写分离）。
 - G-buffer：`gi_main` 每像素写 `gate_gi_surface`（世界坐标 + 相机距离）和 `gate_gi_key`（path hash16 | grid slot、token、hit/diffuse/opaque flags、packed normal）；`GiPreparePixels` 生成 3×3 距离范围与 hash bloom，`GiPrepareBuckets` 生成 8×8 bucket 的法线 mask 与距离范围。
 - 物体运动：样本存 grid 局部坐标，reproject 用当前 `grid_descs` 变换回世界；token 为 `gi_pose_salt(obj) ^ gi_local_rev(voxel, obj)`，pose/区域编辑变化会让旧样本在落点被拒绝。无全局历史清除。

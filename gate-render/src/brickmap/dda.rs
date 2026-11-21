@@ -14,7 +14,7 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
 pub(crate) const WORLD_GI: bool = false;
 
-// Debug view for the resampler while the Caelix reprojection is wired: 0 = off (normal shading),
+// Debug view for the resampler while the resampler reprojection is wired: 0 = off (normal shading),
 // 1 = this frame's own samples, 2 = per-bucket stored/lit ratio/luminance. Also disables the old
 // spatial pass and the denoiser in modes 1 and 2.
 pub(crate) fn gi_res_debug_mode() -> u32 {
@@ -32,7 +32,7 @@ pub(crate) fn gi_res_debug_on() -> bool {
   gi_res_debug_mode() != 0
 }
 
-// The Caelix resampler owns diffuse GI; the old WAL/screen accumulation is not dispatched.
+// The GI resampler owns diffuse GI; the old WAL/screen accumulation is not dispatched.
 pub(crate) const GI_RES_FINAL: bool = true;
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]

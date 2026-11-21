@@ -33,7 +33,7 @@ const GI_RES_SKY: u32 = 8u;
 const GI_RECON_J_MIN: f32 = 0.3;
 const GI_RECON_J_MAX: f32 = 2.5;
 
-// The Caelix resampler owns the diffuse GI now: the old per-pixel reservoir only produces the
+// The GI resampler owns the diffuse GI now: the old per-pixel reservoir only produces the
 // G-buffer guide and the surface/key targets.
 const GI_RES_FINAL: bool = true;
 
