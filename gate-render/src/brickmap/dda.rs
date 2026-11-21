@@ -1,8 +1,9 @@
+use crate::dlss::RrHook;
 use bevy::{
   asset::RenderAssetUsages,
   image::Image,
   prelude::*,
-  render::{extract_resource::ExtractResource, render_resource::*},
+  render::{extract_resource::ExtractResource, render_resource::*, renderer::RenderAdapter},
 };
 use glam::camera::{rh::proj, rh::view};
 use std::ops::Mul;
@@ -10,6 +11,8 @@ use std::ops::Mul;
 pub const BLIT_SHADER_ASSET_PATH: &str = "shaders/blit.wgsl";
 
 pub const DDA_WORKGROUP_SIZE: u32 = 8;
+
+pub(crate) const WORLD_GI: bool = false;
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
@@ -299,6 +302,9 @@ pub(crate) struct AuxTexCache {
   refl_cfg: Option<Buffer>,
   glass_req: Option<Buffer>,
   glass_meta: Option<Buffer>,
+  light_cache: Option<Buffer>,
+  light_cache_size: UVec2,
+  light_cache_meta: Option<Buffer>,
   out_base: Option<Texture>,
   out_base_view: Option<TextureView>,
   out_base_size: UVec2,
@@ -311,6 +317,20 @@ pub(crate) struct AuxTexCache {
   perf_shadow_view: Option<TextureView>,
   perf_size: UVec2,
   perf_bg0: Option<BindGroup>,
+  rr_size: UVec2,
+  rr_albedo: Option<Texture>,
+  rr_albedo_view: Option<TextureView>,
+  rr_spec: Option<Texture>,
+  rr_spec_view: Option<TextureView>,
+  rr_norm: Option<Texture>,
+  rr_norm_view: Option<TextureView>,
+  rr_depth: Option<Texture>,
+  rr_depth_view: Option<TextureView>,
+  rr_motion: Option<Texture>,
+  rr_motion_view: Option<TextureView>,
+  rr_out: Option<Texture>,
+  rr_out_view: Option<TextureView>,
+  rr_gb_bg: Option<BindGroup>,
 }
 
 pub(crate) const DEN_ATROUS_CHAINS: [[usize; 2]; 6] =
@@ -361,6 +381,10 @@ impl AuxTexCache {
     self.glass_meta.as_ref()
   }
 
+  pub(crate) fn light_cache_meta_buffer(&self) -> Option<&Buffer> {
+    self.light_cache_meta.as_ref()
+  }
+
   pub(crate) fn refl_meta_buffer(&self) -> Option<&Buffer> {
     self.refl_meta.as_ref()
   }
@@ -382,8 +406,12 @@ pub(crate) struct DdaPipelines {
   pub(crate) compute_pipeline: CachedComputePipelineId,
   preview_pipeline: CachedComputePipelineId,
   bg0_perf_layout: BindGroupLayoutDescriptor,
+  rr_gb_layout: BindGroupLayoutDescriptor,
   visible_pipeline: CachedComputePipelineId,
   shadow_pipeline: CachedComputePipelineId,
+  gbuffer_pipeline: CachedComputePipelineId,
+  gi_cache_pipeline: CachedComputePipelineId,
+  gi_filter_pipeline: CachedComputePipelineId,
   shade_pipeline: CachedComputePipelineId,
   glass_pipeline: CachedComputePipelineId,
   refl_write_layout: BindGroupLayoutDescriptor,
@@ -397,6 +425,7 @@ pub(crate) struct DdaPipelines {
   pub(crate) beam_pipeline: CachedComputePipelineId,
 
   pub(crate) gi_pipeline: CachedComputePipelineId,
+  pub(crate) gi_spatial_pipeline: CachedComputePipelineId,
   pub(crate) gi_wal_update_pipeline: CachedComputePipelineId,
 
   eye_histogram_pipeline: CachedComputePipelineId,
@@ -554,7 +583,7 @@ pub(crate) fn init_dda_pipelines(
   let mut bg0_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
     ShaderStages::COMPUTE,
     (
-      texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+      texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
       uniform_buffer::<DdaViewUniform>(false),
       texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
       storage_buffer_read_only_sized(false, None),
@@ -578,12 +607,24 @@ pub(crate) fn init_dda_pipelines(
       count: None,
     });
   }
+  for binding in [35u32, 36] {
+    bg0_entries.push(BindGroupLayoutEntry {
+      binding,
+      visibility: ShaderStages::COMPUTE,
+      ty: BindingType::Buffer {
+        ty: BufferBindingType::Storage { read_only: false },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+      },
+      count: None,
+    });
+  }
   let bg0 = BindGroupLayoutDescriptor::new("DdaBg0", &bg0_entries);
 
   let mut bg0_perf_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
     ShaderStages::COMPUTE,
     (
-      texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+      texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
       uniform_buffer::<DdaViewUniform>(false),
       texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
       storage_buffer_read_only_sized(false, None),
@@ -627,6 +668,18 @@ pub(crate) fn init_dda_pipelines(
     },
     count: None,
   });
+  for binding in [35u32, 36] {
+    bg0_perf_entries.push(BindGroupLayoutEntry {
+      binding,
+      visibility: ShaderStages::COMPUTE,
+      ty: BindingType::Buffer {
+        ty: BufferBindingType::Storage { read_only: false },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+      },
+      count: None,
+    });
+  }
   let bg0_perf = BindGroupLayoutDescriptor::new("DdaBg0Perf", &bg0_perf_entries);
 
   let gi_read = BindGroupLayoutDescriptor::new(
@@ -928,6 +981,43 @@ pub(crate) fn init_dda_pipelines(
     v[0] = bg0_perf.clone();
     v
   };
+  let rr_gb = BindGroupLayoutDescriptor::new(
+    "DdaRrGb",
+    &[30u32, 31, 32, 33, 34]
+      .into_iter()
+      .map(|binding| BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::StorageTexture {
+          access: StorageTextureAccess::WriteOnly,
+          format: match binding {
+            30 | 31 => TextureFormat::Rgba8Unorm,
+            32 => TextureFormat::Rgba16Float,
+            33 => TextureFormat::R32Float,
+            _ => TextureFormat::Rg16Float,
+          },
+          view_dimension: TextureViewDimension::D2,
+        },
+        count: None,
+      })
+      .collect::<Vec<_>>(),
+  );
+  let empty = BindGroupLayoutDescriptor::new("DdaEmpty", &[]);
+  let dda_layouts_gb = {
+    let mut v = layouts.clone();
+    v[0] = bg0_perf.clone();
+    v.push(empty.clone());
+    v.push(empty.clone());
+    v.push(rr_gb.clone());
+    v
+  };
+  let gbuffer = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_gbuffer")),
+    layout: dda_layouts_gb,
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_gbuffer")),
+    ..default()
+  });
   let visible = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_dda_visible")),
     layout: dda_layouts_perf.clone(),
@@ -940,6 +1030,20 @@ pub(crate) fn init_dda_pipelines(
     layout: dda_layouts_perf.clone(),
     shader: dda_shader.clone(),
     entry_point: Some(Cow::from("dda_shadow")),
+    ..default()
+  });
+  let gi_cache = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_gi_cache")),
+    layout: dda_layouts_perf.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_gi_cache")),
+    ..default()
+  });
+  let gi_filter = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_dda_gi_filter")),
+    layout: dda_layouts_perf.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_gi_filter")),
     ..default()
   });
   let shade = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -1019,6 +1123,13 @@ pub(crate) fn init_dda_pipelines(
     entry_point: Some(Cow::from("gi_main")),
     ..default()
   });
+  let gi_spatial = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    label: Some(Cow::from("gate_gi_spatial")),
+    layout: gi_layouts.clone(),
+    shader: dda_shader.clone(),
+    entry_point: Some(Cow::from("dda_gi_spatial")),
+    ..default()
+  });
   let gi_wal_update = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
     label: Some(Cow::from("gate_gi_wal_update")),
     layout: gi_layouts,
@@ -1079,8 +1190,12 @@ pub(crate) fn init_dda_pipelines(
     eye_layout: eye,
     compute_pipeline: compute,
     bg0_perf_layout: bg0_perf,
+    rr_gb_layout: rr_gb,
     visible_pipeline: visible,
     shadow_pipeline: shadow,
+    gbuffer_pipeline: gbuffer,
+    gi_cache_pipeline: gi_cache,
+    gi_filter_pipeline: gi_filter,
     shade_pipeline: shade,
     glass_pipeline: glass,
     refl_write_layout: refl_write,
@@ -1092,6 +1207,7 @@ pub(crate) fn init_dda_pipelines(
     face_accum_pipeline: face_accum,
     beam_pipeline: beam,
     gi_pipeline: gi,
+    gi_spatial_pipeline: gi_spatial,
     gi_wal_update_pipeline: gi_wal_update,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
@@ -1130,6 +1246,7 @@ pub(crate) struct PrepareDdaBindGroupsParams<'w, 's> {
   scale: Res<'w, RenderScale>,
   tune: DdaTune<'w>,
   beam_cache: ResMut<'w, AuxTexCache>,
+  rr: Option<Res<'w, RrHook>>,
 }
 
 pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
@@ -1150,6 +1267,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     scale,
     tune,
     mut beam_cache,
+    rr,
   } = p;
   let Some(images) = images else {
     bevy::log::info_once!("DDA prepare: no DdaImages");
@@ -1276,7 +1394,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       mip_level_count: 1,
       sample_count: 1,
       dimension: TextureDimension::D2,
-      format: TextureFormat::Rgba8Unorm,
+      format: TextureFormat::Rgba16Float,
       usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
       view_formats: &[],
     });
@@ -1338,6 +1456,67 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     beam_cache.perf_shadow_view = Some(shadow.create_view(&TextureViewDescriptor::default()));
     beam_cache.perf_shadow = Some(shadow);
     beam_cache.perf_size = scale.size;
+  }
+
+  if beam_cache.rr_size != scale.size {
+    let make = |label: &str, format: TextureFormat| {
+      let tex = render_device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d { width: scale.size.x, height: scale.size.y, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+      });
+      let view = tex.create_view(&TextureViewDescriptor::default());
+      (tex, view)
+    };
+    let (a, av) = make("gate_rr_albedo", TextureFormat::Rgba8Unorm);
+    let (s, sv) = make("gate_rr_spec", TextureFormat::Rgba8Unorm);
+    let (n, nv) = make("gate_rr_norm", TextureFormat::Rgba16Float);
+    let (d, dv) = make("gate_rr_depth", TextureFormat::R32Float);
+    let (m, mv) = make("gate_rr_motion", TextureFormat::Rg16Float);
+    let (o, ov) = make("gate_rr_out", TextureFormat::Rgba16Float);
+    beam_cache.rr_albedo = Some(a);
+    beam_cache.rr_albedo_view = Some(av);
+    beam_cache.rr_spec = Some(s);
+    beam_cache.rr_spec_view = Some(sv);
+    beam_cache.rr_norm = Some(n);
+    beam_cache.rr_norm_view = Some(nv);
+    beam_cache.rr_depth = Some(d);
+    beam_cache.rr_depth_view = Some(dv);
+    beam_cache.rr_motion = Some(m);
+    beam_cache.rr_motion_view = Some(mv);
+    beam_cache.rr_out = Some(o);
+    beam_cache.rr_out_view = Some(ov);
+    beam_cache.rr_size = scale.size;
+  }
+
+  if beam_cache.light_cache.is_none() || beam_cache.light_cache_size != scale.size {
+    let px = scale.size.x as u64 * scale.size.y as u64;
+    let slots = (px * 4).next_power_of_two().clamp(4096, 1u64 << 22);
+    let bytes = slots * 16 * 4;
+    let cache = render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_light_cache"),
+      size: bytes,
+      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    queue.write_buffer(&cache, 0, &vec![0u8; bytes as usize]);
+    beam_cache.light_cache = Some(cache);
+    beam_cache.light_cache_size = scale.size;
+  }
+  if beam_cache.light_cache_meta.is_none() {
+    let meta = render_device.create_buffer(&BufferDescriptor {
+      label: Some("gate_light_cache_meta"),
+      size: 16,
+      usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    queue.write_buffer(&meta, 0, &[0u8; 16]);
+    beam_cache.light_cache_meta = Some(meta);
   }
 
   if beam_cache.wal.is_none() {
@@ -1431,6 +1610,18 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       beam_cache.perf_shadow_view.as_ref().expect("dda shadow view 未建"),
     ),
   });
+  bg0_entries_vec.push(BindGroupEntry {
+    binding: 35,
+    resource: beam_cache.light_cache.as_ref().expect("light cache 未建").as_entire_binding(),
+  });
+  bg0_entries_vec.push(BindGroupEntry {
+    binding: 36,
+    resource: beam_cache
+      .light_cache_meta
+      .as_ref()
+      .expect("light cache meta 未建")
+      .as_entire_binding(),
+  });
   let bg0 = render_device.create_bind_group(None, &bg0_layout, &bg0_entries_vec);
 
   let perf_bg0 = if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta)) = (
@@ -1454,12 +1645,48 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     entries.push(BindGroupEntry { binding: 32, resource: BindingResource::TextureView(sh) });
     entries.push(BindGroupEntry { binding: 33, resource: greq.as_entire_binding() });
     entries.push(BindGroupEntry { binding: 34, resource: gmeta.as_entire_binding() });
+    entries.push(BindGroupEntry {
+      binding: 35,
+      resource: beam_cache.light_cache.as_ref().expect("light cache 未建").as_entire_binding(),
+    });
+    entries.push(BindGroupEntry {
+      binding: 36,
+      resource: beam_cache
+        .light_cache_meta
+        .as_ref()
+        .expect("light cache meta 未建")
+        .as_entire_binding(),
+    });
     Some(render_device.create_bind_group(None, &layout, &entries))
   } else {
     None
   };
   beam_cache.perf_bg0 = perf_bg0;
+  beam_cache.rr_gb_bg = if let (Some(a), Some(s), Some(n), Some(d), Some(m)) = (
+    beam_cache.rr_albedo_view.as_ref(),
+    beam_cache.rr_spec_view.as_ref(),
+    beam_cache.rr_norm_view.as_ref(),
+    beam_cache.rr_depth_view.as_ref(),
+    beam_cache.rr_motion_view.as_ref(),
+  ) {
+    let layout = pipeline_cache.get_bind_group_layout(&pipelines.rr_gb_layout);
+    Some(render_device.create_bind_group(
+      None,
+      &layout,
+      &[
+        BindGroupEntry { binding: 30, resource: BindingResource::TextureView(a) },
+        BindGroupEntry { binding: 31, resource: BindingResource::TextureView(s) },
+        BindGroupEntry { binding: 32, resource: BindingResource::TextureView(n) },
+        BindGroupEntry { binding: 33, resource: BindingResource::TextureView(d) },
+        BindGroupEntry { binding: 34, resource: BindingResource::TextureView(m) },
+      ],
+    ))
+  } else {
+    None
+  };
 
+  let base_view =
+    if rr.is_some() { beam_cache.rr_out_view.as_ref() } else { beam_cache.out_base_view.as_ref() };
   let (refl_write_bg, refl_read_bg) = if let (
     Some(req),
     Some(sum),
@@ -1475,7 +1702,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     beam_cache.refl_first.as_ref(),
     beam_cache.refl_meta.as_ref(),
     beam_cache.refl_cfg.as_ref(),
-    beam_cache.out_base_view.as_ref(),
+    base_view,
   ) {
     let wl = pipeline_cache.get_bind_group_layout(&pipelines.refl_write_layout);
     let rl = pipeline_cache.get_bind_group_layout(&pipelines.refl_read_layout);
@@ -1512,7 +1739,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     (None, None)
   };
   let mut compose_entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
-    &tex_view.texture_view,
+    beam_cache.gi_view.as_ref().expect("gi view not created"),
     &u,
     &beam_view,
     eye_buf.as_entire_binding(),
@@ -1536,6 +1763,18 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     resource: BindingResource::TextureView(
       beam_cache.perf_shadow_view.as_ref().expect("dda shadow view 未建"),
     ),
+  });
+  compose_entries.push(BindGroupEntry {
+    binding: 35,
+    resource: beam_cache.light_cache.as_ref().expect("light cache 未建").as_entire_binding(),
+  });
+  compose_entries.push(BindGroupEntry {
+    binding: 36,
+    resource: beam_cache
+      .light_cache_meta
+      .as_ref()
+      .expect("light cache meta 未建")
+      .as_entire_binding(),
   });
   let compose_bg0 = render_device.create_bind_group(None, &bg0_layout, &compose_entries);
   beam_cache.refl_compose_bg0 = Some(compose_bg0);
@@ -1854,6 +2093,8 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   pipelines: Res<'w, DdaPipelines>,
   scale: Res<'w, RenderScale>,
   profiler: ResMut<'w, crate::profiler::GpuProfilerRes>,
+  rr: Option<Res<'w, RrHook>>,
+  adapter: Option<Res<'w, RenderAdapter>>,
 }
 
 pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
@@ -1874,6 +2115,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     pipelines,
     scale,
     mut profiler,
+    rr,
+    adapter,
   } = p;
   WARM_T0.get_or_init(std::time::Instant::now);
   let (Some(bg0), Some(bg1), Some(bg2), Some(bg3), Some(bg4)) =
@@ -1953,6 +2196,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     }
     None => false,
   };
+  if let Some(meta) = aux.as_ref().and_then(|a| a.light_cache_meta_buffer()) {
+    ctx.command_encoder().clear_buffer(meta, 0, None);
+  }
 
   if DDA_BEAM && let Some(beam_pipe) = beam_pipe {
     crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), "gate_beam", |pass| {
@@ -1981,6 +2227,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   }
 
   let gi_read = aux.as_ref().and_then(|a| a.gi_read_bg.as_ref());
+  let gi_cache_pipe = pipeline_cache.get_compute_pipeline(pipelines.gi_cache_pipeline);
+  let gi_filter_pipe = pipeline_cache.get_compute_pipeline(pipelines.gi_filter_pipeline);
   let perf_bg0 = aux.as_ref().and_then(|a| a.perf_bg0.as_ref());
   let perf_pipes = (
     pipeline_cache.get_compute_pipeline(pipelines.visible_pipeline),
@@ -2016,6 +2264,26 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(gx, gy, 1);
       },
     );
+    if let (Some(gbuffer_pipe), Some(rr_gb_bg)) = (
+      pipeline_cache.get_compute_pipeline(pipelines.gbuffer_pipeline),
+      aux.as_ref().and_then(|a| a.rr_gb_bg.as_ref()),
+    ) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_gbuffer",
+        |pass| {
+          pass.set_pipeline(gbuffer_pipe);
+          pass.set_bind_group(0, pbg0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          pass.set_bind_group(7, rr_gb_bg, &[]);
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
     crate::profiler::gpu_compute_pass(
       &mut profiler,
       ctx.command_encoder(),
@@ -2038,6 +2306,54 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(gx, gy, 1);
       },
     );
+    if let Some(gi_cache_pipe) = gi_cache_pipe {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_gi_cache",
+        |pass| {
+          pass.set_pipeline(gi_cache_pipe);
+          bind_perf_groups(
+            pass,
+            &PerfBinds {
+              bg0: pbg0,
+              bg1: &bg1.0,
+              bg2: &bg2.0,
+              bg3: &bg3.0,
+              bg4: &bg4.0,
+              gi_read,
+              fog_read,
+              refl_write: refl_write_bg,
+            },
+          );
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
+    if let Some(gi_filter_pipe) = gi_filter_pipe {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_dda_gi_filter",
+        |pass| {
+          pass.set_pipeline(gi_filter_pipe);
+          bind_perf_groups(
+            pass,
+            &PerfBinds {
+              bg0: pbg0,
+              bg1: &bg1.0,
+              bg2: &bg2.0,
+              bg3: &bg3.0,
+              bg4: &bg4.0,
+              gi_read,
+              fog_read,
+              refl_write: refl_write_bg,
+            },
+          );
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
     crate::profiler::gpu_compute_pass(
       &mut profiler,
       ctx.command_encoder(),
@@ -2083,6 +2399,45 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(glass_groups, 1, 1);
       },
     );
+    if let (Some(rr), Some(adapter), Some(a)) = (rr.as_ref(), adapter.as_ref(), aux.as_ref())
+      && let (
+        Some(albedo),
+        Some(spec),
+        Some(norm),
+        Some(depth),
+        Some(motion),
+        Some(out_base),
+        Some(out),
+      ) = (
+        a.rr_albedo_view.as_ref(),
+        a.rr_spec_view.as_ref(),
+        a.rr_norm_view.as_ref(),
+        a.rr_depth_view.as_ref(),
+        a.rr_motion_view.as_ref(),
+        a.out_base_view.as_ref(),
+        a.rr_out_view.as_ref(),
+      )
+    {
+      let inputs = crate::dlss::RrInputs {
+        diffuse_albedo: albedo,
+        specular_albedo: spec,
+        normals: norm,
+        color: out_base,
+        depth,
+        motion_vectors: motion,
+        specular_guide: motion,
+        output: out,
+        reset: false,
+        jitter: [0.0, 0.0],
+      };
+      let cmd = {
+        let encoder = ctx.command_encoder();
+        rr.render(inputs, encoder, adapter)
+      };
+      if let Some(cmd) = cmd {
+        ctx.add_command_buffer(cmd);
+      }
+    }
     dispatched = true;
   }
 
@@ -2116,7 +2471,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     }
   }
 
-  if gi.as_ref().is_some_and(|g| g.enabled)
+  if !WORLD_GI
+    && gi.as_ref().is_some_and(|g| g.enabled)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_bg0) = aux.gi_bg0.as_ref()
     && let Some(bg5) = bg5.as_ref()
@@ -2164,10 +2520,28 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
       pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     });
+    if let Some(spatial_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_pipeline) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_gi_spatial",
+        |pass| {
+          pass.set_pipeline(spatial_pipe);
+          pass.set_bind_group(0, gi_bg0, &[]);
+          pass.set_bind_group(1, &bg1.0, &[]);
+          pass.set_bind_group(2, &bg2.0, &[]);
+          pass.set_bind_group(3, &bg3.0, &[]);
+          pass.set_bind_group(4, &bg4.0, &[]);
+          pass.set_bind_group(5, &bg5.0, &[]);
+          pass.dispatch_workgroups(gx, gy, 1);
+        },
+      );
+    }
   }
 
-  if crate::gi::GI_FLAT_ACC
-    && gi.as_ref().is_some_and(|g| g.enabled)
+  if !WORLD_GI
+    && crate::gi::GI_FLAT_ACC
+    && gi.as_ref().is_some_and(|g| g.enabled && g.wal)
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
     && let Some(bg) = aux.gi_flatten_bg.as_ref()
@@ -2188,7 +2562,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     );
   }
 
-  if let Some(cur) = gi.as_ref()
+  if !WORLD_GI
+    && let Some(cur) = gi.as_ref()
     && cur.enabled
     && let Some(aux) = aux.as_ref()
     && let Some(gi_gpu) = gi_gpu.as_ref()
@@ -2239,7 +2614,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     }
   }
 
-  if gi.as_ref().is_some_and(|g| g.enabled)
+  if !WORLD_GI
+    && gi.as_ref().is_some_and(|g| g.enabled && g.wal)
     && let Some(aux) = aux.as_ref()
   {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
@@ -2271,7 +2647,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     }
   }
 
-  if gi.as_ref().is_some_and(|g| g.enabled)
+  if !WORLD_GI
+    && gi.as_ref().is_some_and(|g| g.enabled && g.wal)
     && let Some(aux) = aux.as_ref()
   {
     let gx = aux.gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);

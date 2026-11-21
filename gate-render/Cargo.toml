@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 profile = ["dep:wgpu-profiler"]
+dlss = ["dep:dlss_wgpu", "dep:uuid", "bevy/raw_vulkan_init"]
 
 [dependencies]
 bevy = { workspace = true, features = ["jpeg"] }
@@ -16,6 +17,9 @@ serde = { workspace = true }
 ron = { workspace = true }
 wgpu-profiler = { workspace = true, optional = true }
 wesl = { workspace = true }
+dlss_wgpu = { version = "6.0.0", optional = true }
+uuid = { version = "1", optional = true }
+wgpu = "30.0.1"
 
 [build-dependencies]
 naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }

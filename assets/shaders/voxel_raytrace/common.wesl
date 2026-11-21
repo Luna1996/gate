@@ -97,6 +97,16 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
   );
 }
 
+fn aces_tonemap(c: vec3<f32>) -> vec3<f32> {
+  let x = max(c, vec3<f32>(0.0));
+  let a = 2.51;
+  let b = 0.03;
+  let d = 2.43;
+  let e = 0.59;
+  let f = 0.14;
+  return clamp((x * (a * x + b)) / (x * (d * x + e) + f), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 const MATERIAL_FLAT_SHADING: u32 = 1u;
 const MATERIAL_TEX_WORLD_SCALE: f32 = 2.0;
 const MATERIAL_VOXEL_PER_METER: f32 = 50.0;

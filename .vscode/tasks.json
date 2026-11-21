@@ -4,13 +4,15 @@
     {
       "label": "build-gate-app-fast",
       "type": "shell",
-      "command": "cargo",
+      "command": "powershell",
       "args": [
-        "build",
-        "--profile",
-        "build-fast",
-        "-p",
-        "gate-app"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        ".vscode/build-gate-app.ps1",
+        "-Profile",
+        "build-fast"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -26,18 +28,20 @@
       "group": {
         "kind": "build",
         "isDefault": true
-      },
+      }
     },
     {
       "label": "build-gate-app-balance",
       "type": "shell",
-      "command": "cargo",
+      "command": "powershell",
       "args": [
-        "build",
-        "--profile",
-        "balance",
-        "-p",
-        "gate-app"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        ".vscode/build-gate-app.ps1",
+        "-Profile",
+        "balance"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -49,18 +53,20 @@
         "panel": "shared",
         "showReuseMessage": false,
         "clear": true
-      },
+      }
     },
     {
       "label": "build-gate-app-run-fast",
       "type": "shell",
-      "command": "cargo",
+      "command": "powershell",
       "args": [
-        "build",
-        "--profile",
-        "run-fast",
-        "-p",
-        "gate-app"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        ".vscode/build-gate-app.ps1",
+        "-Profile",
+        "run-fast"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -72,7 +78,7 @@
         "panel": "shared",
         "showReuseMessage": false,
         "clear": true
-      },
+      }
     },
     {
       "label": "package-gate-app",
@@ -85,7 +91,7 @@
         "panel": "shared",
         "showReuseMessage": false,
         "clear": true
-      },
+      }
     }
   ]
 }

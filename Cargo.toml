@@ -29,6 +29,7 @@ bevy = { version = "=0.20.0-rc.1", default-features = false, features = [
   "default_font",
   "reflect_auto_register",
   "async_executor",
+  "raw_vulkan_init",
 ] }
 wgpu-profiler = { version = "0.28", features = ["tracy"] }
 tracy-client = "0.18"

@@ -1,5 +1,6 @@
 pub mod brickmap;
 pub mod consts;
+pub mod dlss;
 pub mod gi;
 pub mod lighting;
 pub mod paths;

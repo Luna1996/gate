@@ -4,7 +4,7 @@
 (
   sun: Some((
     dir: (0.5, -0.8, 0.3),
-    angular_radius_deg: 3.0,
+    angular_radius_deg: 8.0,
     color: (1.0, 0.96, 0.88),
     intensity: 0.8,
   )),

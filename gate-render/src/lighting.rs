@@ -181,7 +181,12 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
     u.lights[0] = LightDesc {
       kind_pos_dir: Vec4::new(0.0, l.x, l.y, l.z),
       color_intensity: Vec4::new(sun.color[0], sun.color[1], sun.color[2], sun.intensity),
-      shape: Vec4::new(sun.disk_scale.max(0.0), 0.0, 0.0, 0.0),
+      shape: Vec4::new(
+        sun.disk_scale.max(0.0),
+        sun.angular_radius_deg.max(0.0).to_radians(),
+        0.0,
+        0.0,
+      ),
     };
     u.g.count = 1;
   }

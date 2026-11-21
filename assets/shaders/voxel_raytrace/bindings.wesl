@@ -1,4 +1,4 @@
-@group(0) @binding(0) var out_base: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var out_base: texture_storage_2d<rgba16float, write>;
 
 @group(7) @binding(10) var<storage, read_write> refl_req: array<vec4<u32>>;
 @group(7) @binding(11) var<storage, read_write> refl_meta: array<atomic<u32>>;
@@ -225,3 +225,12 @@ struct FogUniform {
 @group(0) @binding(32) var dda_shadow_tex: texture_storage_2d<rgba16float, read_write>;
 @group(0) @binding(33) var<storage, read_write> glass_req: array<u32>;
 @group(0) @binding(34) var<storage, read_write> glass_meta: array<atomic<u32>>;
+
+@group(0) @binding(35) var<storage, read_write> light_cache: array<atomic<u32>>;
+@group(0) @binding(36) var<storage, read_write> light_cache_meta: array<atomic<u32>>;
+
+@group(7) @binding(30) var rr_albedo_out: texture_storage_2d<rgba8unorm, write>;
+@group(7) @binding(31) var rr_spec_out: texture_storage_2d<rgba8unorm, write>;
+@group(7) @binding(32) var rr_norm_out: texture_storage_2d<rgba16float, write>;
+@group(7) @binding(33) var rr_depth_out: texture_storage_2d<r32float, write>;
+@group(7) @binding(34) var rr_motion_out: texture_storage_2d<rg16float, write>;

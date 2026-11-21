@@ -63,6 +63,7 @@ fn main() {
 
   let bench = consts::BENCH_UNFOCUSED || consts::bench();
   let mut app = App::new();
+  gate_render::dlss::install(&mut app);
   app.add_plugins(
     DefaultPlugins
       .set(WindowPlugin {
@@ -186,6 +187,7 @@ fn main() {
       camera::auto_fly_system.after(camera::fly_camera_input).before(camera::build_camera_config),
     );
   }
+  gate_render::dlss::init_render(&mut app);
   app.run();
 }
 
