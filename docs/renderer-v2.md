@@ -120,7 +120,7 @@
 - 仍有极少数 shadow penumbra voxel 在缓存重建的前几十帧内闪烁；新条目首帧多写样本、直光预算覆盖全屏后已大幅缩短。
 - 水面反射仍有成片噪声、玻璃/反射 GI 粗糙、GI 只有一次弹射、没有 bloom/大气；这些是后续 M3/M5/M6 的工作。
 
-## M2.1 屏幕空间 GI（NAADF 方向，已切换）
+## M2.1 屏幕空间 GI（NAADF 方向，已被 M2.2 替换）
 
 - 主漫反射 GI 从世界空间 4³ cell 切到屏幕空间 reservoir 路径：`dda.rs::WORLD_GI=false`、`main.wesl::GI_WORLD_CACHE=false`。
 - `dda_shade` / `shade_face` 在 `!GI_WORLD_CACHE` 时把 primary hit 写入 `dda_hit`；`gi_main`（`gi_ss_main`）按 GI 分辨率重投影 primary，做 cosine 半球采样、lit/unlit 候选、时域历史、8 邻域 spatial reuse，然后 `gi_denoise_temporal` + 多轮 à-trous 写 `gi_dn_src[3]`。
@@ -133,6 +133,20 @@
 - 当前是 per-pixel reservoir + 8 邻域空间迭代，不是 8×8 bucket ring；bucket/更多迭代留作后续。
 - 实测 720p：静态墙面无云雾状斑块、无黑墙；画面仍偏蓝/偏平，GI 能量和太阳反弹色需要在结构稳定后单独校准。
 - 未完成：8×8 bucket、12 次 spatial reservoir 迭代、移动物体 object-space、反射 GI 改读屏幕 GI。
+
+## M2.2 Caelix GI resampler（已切换，2026-11-22）
+
+- 主漫反射 GI 改为 Caelix 的 NAADF bucket 重采样器：`assets/shaders/voxel_raytrace/gi/resample.wesl`，按 Caelix 顺序跑 8 个 kernel：`GiPreparePixels`、`GiPrepareBuckets`、`GiGenerateSamples`、`GiPrepareHistory`、`GiReprojectLit`、`GiReprojectUnlit`、`GiRefineBuckets`、`GiSpatial`。
+- 数据布局沿用 Caelix：lit 样本 14 word/56B（key/token/object-space primary/virtual offset/primary axis+sky/secondary position/oct16 normal/RGB9E5）、unlit 9 word/36B、bucket 样本 8 word/32B、bucket info 8 word/32B、pixel info 2 word/8B。Rust 侧 stride 与 ring 帧数从 `.wesl` 解析（`wesl_consts::GiConsts`）。
+- 采样器：lit ring 2 帧、unlit ring 4 帧、`maxHistoryFrames=64`、每桶 32 refined + 8 compact、12 次 adaptive-radius spatial 迭代、visible ray 失败回退本帧 own sample（RGB9E5，binding 44/53 读写分离）。
+- G-buffer：`gi_main` 每像素写 `gate_gi_surface`（世界坐标 + 相机距离）和 `gate_gi_key`（path hash16 | grid slot、token、hit/diffuse/opaque flags、packed normal）；`GiPreparePixels` 生成 3×3 距离范围与 hash bloom，`GiPrepareBuckets` 生成 8×8 bucket 的法线 mask 与距离范围。
+- 物体运动：样本存 grid 局部坐标，reproject 用当前 `grid_descs` 变换回世界；token 为 `gi_pose_salt(obj) ^ gi_local_rev(voxel, obj)`，pose/区域编辑变化会让旧样本在落点被拒绝。无全局历史清除。
+- 逐像素验证：落点距离范围（f16 3×3，×1022/1024 与 ×1026/1024）与 hash16/bloom 命中才进 bucket；`GiSpatial` 再做法线轴、bucket 距离、Jacobian 0.3–2.5、cos 与可见性射线筛选。
+- 调度：`dispatch_workgroups_indirect` 走 uint args（lit/unlit 两块）；args 只作为 INDIRECT 或独立 history bind group 的 storage，避免同一 dispatch 内 storage+indirect 冲突。
+- 旧屏幕空间路径已停用：`dda_gi_spatial` 不再 dispatch，`gi_ss_main` 在 `GI_RES_FINAL` 下只写 G-buffer/guide，`gi_wal_update` 停用；`gi_out` 由 `GiSpatial` 独占写入，之后仍走原 temporal+à-trous 与 `gi_upsample_joint`。
+- 调试：`GATE_GI_RES_DEBUG=own` 显示本帧 own sample（关闭旧 spatial 与降噪），`buckets` 显示每 bucket 的 stored/litRatio/maxLuminance；默认 `off` 走完整路径。
+- 实测 1280×720、GI 1/4：静态 8 连拍整帧均值波动 < 0.05/255，无闪烁；侧移/前进后无残影；`GI_SHADE_GAIN` 回到 1.0（旧屏幕空间 0.55 的补偿不再需要）。
+- 现状：仍未做 `sampleRateDivisor > 1` 的按像素分帧（默认 1，全像素每帧采样）；空间半径固定 160（按 GI 分辨率缩放留作调优）；玻璃/镜面 primary 仍按一次路径处理，virtual offset 为 0。
 
 ## DLSS RR（2026-11-21）
 
