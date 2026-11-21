@@ -14,9 +14,22 @@ pub const DDA_WORKGROUP_SIZE: u32 = 8;
 
 pub(crate) const WORLD_GI: bool = false;
 
-// Milestone view: shade the resampler's own fresh samples instead of the old screen-space GI,
-// before the Caelix reprojection is wired. Also disables the old spatial pass and the denoiser.
-pub(crate) const GI_RES_DEBUG: bool = true;
+// Debug view for the resampler while the Caelix reprojection is wired: 0 = off (normal shading),
+// 1 = this frame's own samples, 2 = per-bucket stored/lit ratio/luminance. Also disables the old
+// spatial pass and the denoiser in modes 1 and 2.
+pub(crate) fn gi_res_debug_mode() -> u32 {
+  use std::sync::OnceLock;
+  static MODE: OnceLock<u32> = OnceLock::new();
+  *MODE.get_or_init(|| match std::env::var("GATE_GI_RES_DEBUG").as_deref() {
+    Ok("0") | Ok("off") => 0,
+    Ok("buckets") => 2,
+    _ => 1,
+  })
+}
+
+pub(crate) fn gi_res_debug_on() -> bool {
+  gi_res_debug_mode() != 0
+}
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
@@ -394,6 +407,10 @@ impl AuxTexCache {
 
   pub(crate) fn gi_res_caps(&self) -> [u32; 4] {
     self.gi_res_caps
+  }
+
+  pub(crate) fn gi_res_args_buffer(&self) -> Option<&Buffer> {
+    self.gi_res_args.as_ref()
   }
 
   pub(crate) fn gi_hist_current(&self) -> Option<&Buffer> {
@@ -1479,7 +1496,15 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       beam_cache.gi_res_buckets = Some(make_buf("gate_gi_res_buckets", buckets * info_stride));
       beam_cache.gi_res_pixels = Some(make_buf("gate_gi_res_pixels", px * px_stride));
       beam_cache.gi_res_counts = Some(make_buf("gate_gi_res_counts", counts_words * 4));
-      beam_cache.gi_res_args = Some(make_buf("gate_gi_res_args", 6 * 4));
+      beam_cache.gi_res_args = Some(render_device.create_buffer(&BufferDescriptor {
+        label: Some("gate_gi_res_args"),
+        size: 24,
+        usage: BufferUsages::STORAGE
+          | BufferUsages::INDIRECT
+          | BufferUsages::COPY_DST
+          | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+      }));
       beam_cache.gi_res_caps = [lit_cap, unlit_cap, buckets.min(u32::MAX as u64) as u32, buckets_x];
 
       if let (Some(counts), Some(args)) = (&beam_cache.gi_res_counts, &beam_cache.gi_res_args) {
@@ -1912,7 +1937,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
 
   let gi_read_layout = pipeline_cache.get_bind_group_layout(&pipelines.gi_read_layout);
 
-  let den_plan = if GI_RES_DEBUG {
+  let den_plan = if gi_res_debug_on() {
     crate::gi::DenoisePlan { on: false, rounds: 0, radius: 1 }
   } else {
     match tune.gi.as_ref() {
@@ -1987,7 +2012,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   }
   let den_cfg = beam_cache.den_cfg.as_ref().expect("刚创建").clone();
 
-  let den_runs = !GI_RES_DEBUG && tune.gi.as_ref().is_some_and(|g| g.enabled);
+  let den_runs = !gi_res_debug_on() && tune.gi.as_ref().is_some_and(|g| g.enabled);
   let (prev_i, cur_i) = if beam_cache.den_flip { (1usize, 0usize) } else { (0usize, 1usize) };
   {
     let guide = beam_cache.gi_guide.as_ref().expect("导引 buffer 未创建").clone();
@@ -2223,6 +2248,7 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   bg4: Option<Res<'w, crate::gi::GiBg4>>,
   bg5: Option<Res<'w, crate::gi::GiBg5>>,
   res_bg0: Option<Res<'w, crate::gi::GiResBg0>>,
+  res_hist_bg: Option<Res<'w, crate::gi::GiResHistoryBg>>,
   eye: Option<Res<'w, EyeAdaptGpu>>,
   gi: Option<Res<'w, crate::gi::GiSettings>>,
   gi_gpu: Option<Res<'w, crate::gi::GiGpu>>,
@@ -2246,6 +2272,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     bg4,
     bg5,
     res_bg0,
+    res_hist_bg,
     eye,
     gi,
     gi_gpu,
@@ -2660,7 +2687,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
       pass.set_bind_group(5, &bg5.0, &[]);
       pass.dispatch_workgroups(gx, gy, 1);
     });
-    if !GI_RES_DEBUG
+    if !gi_res_debug_on()
       && let Some(spatial_pipe) = pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_pipeline)
     {
       crate::profiler::gpu_compute_pass(
@@ -2729,17 +2756,84 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         );
       }
 
-      if let Some(history_pipe) =
-        gpu_res.res_pipelines[3].and_then(|id| pipeline_cache.get_compute_pipeline(id))
-      {
+      if let (Some(history_pipe), Some(history_bg)) = (
+        gpu_res.res_pipelines[3].and_then(|id| pipeline_cache.get_compute_pipeline(id)),
+        res_hist_bg.as_ref(),
+      ) {
         crate::profiler::gpu_compute_pass(
           &mut profiler,
           ctx.command_encoder(),
           "gate_gi_res_prepare_history",
           |pass| {
             pass.set_pipeline(history_pipe);
-            pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.set_bind_group(0, &history_bg.0, &[]);
             pass.dispatch_workgroups(1, 1, 1);
+          },
+        );
+      }
+
+      let args = aux.gi_res_args_buffer();
+      let reproject_lit =
+        gpu_res.res_pipelines[4].and_then(|id| pipeline_cache.get_compute_pipeline(id));
+      let reproject_unlit =
+        gpu_res.res_pipelines[5].and_then(|id| pipeline_cache.get_compute_pipeline(id));
+      if let (Some(lit_pipe), Some(unlit_pipe), Some(args)) = (reproject_lit, reproject_unlit, args)
+      {
+        for (label, pipe, offset) in [
+          ("gate_gi_res_reproject_lit", lit_pipe, 0u64),
+          ("gate_gi_res_reproject_unlit", unlit_pipe, 12u64),
+        ] {
+          crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), label, |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, &bg4.0, &[]);
+            pass.set_bind_group(5, &bg5.0, &[]);
+            pass.dispatch_workgroups_indirect(args, offset);
+          });
+        }
+      }
+
+      if let Some(refine_pipe) =
+        gpu_res.res_pipelines[6].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        let bucket_groups = aux.gi_res_caps()[2].div_ceil(64).max(1);
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_res_refine_buckets",
+          |pass| {
+            pass.set_pipeline(refine_pipe);
+            pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, &bg4.0, &[]);
+            pass.set_bind_group(5, &bg5.0, &[]);
+            pass.dispatch_workgroups(bucket_groups, 1, 1);
+          },
+        );
+      }
+
+      if gi_res_debug_mode() == 2
+        && let Some(debug_pipe) =
+          gpu_res.res_pipelines[7].and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_res_debug_buckets",
+          |pass| {
+            pass.set_pipeline(debug_pipe);
+            pass.set_bind_group(0, &res_bg.0, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, &bg4.0, &[]);
+            pass.set_bind_group(5, &bg5.0, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
           },
         );
       }
@@ -2770,7 +2864,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   }
 
   if !WORLD_GI
-    && !GI_RES_DEBUG
+    && !gi_res_debug_on()
     && let Some(cur) = gi.as_ref()
     && cur.enabled
     && let Some(aux) = aux.as_ref()

@@ -6,7 +6,7 @@ import package::gi_cache::{GI_CACHE_MAX_N, GI_COARSE_DIST, gi_cache_budget_ok, g
 import package::gi::consts::{GI_AMBIENT_FLOOR, GI_DEN_GUIDE_WORDS, GI_DEN_G_NOISE, GI_DEN_G_KEY0, GI_DEN_G_KEY1, GI_DEN_G_NRM, GI_DEN_N_DOT, GI_EMIT_GAIN, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SS_ADAPT_HI, GI_SS_ADAPT_LO, GI_SS_ADAPT_REF, GI_SS_CAND_CLAMP_CEIL, GI_SS_CAND_CLAMP_K, SHADOW_SURFACE_EPS};
 import package::gi::denoise::{gi_den_atrous, gi_den_same_plane, gi_den_temporal, gi_near_surface};
 import package::gi::ray::{gi_ray_radiance, sun_transmittance};
-import package::gi::resample::{gi_r_generate_samples, gi_r_prepare_buckets, gi_r_prepare_history, gi_r_prepare_pixels};
+import package::gi::resample::{gi_r_debug_buckets, gi_r_generate_samples, gi_r_prepare_buckets, gi_r_prepare_history, gi_r_prepare_pixels, gi_r_refine_buckets, gi_r_reproject_lit_entry, gi_r_reproject_unlit_entry};
 import package::gi::screen::{gi_ss_main, gi_ss_spatial};
 import package::gi::wal::{gi_wal_merge, gi_wal_nmask, gi_wal_pool, gi_wal_sample, gi_wal_sample_rs, gi_wal_slot, gi_wal_touch, GI_WAL_DIAG, GI_WAL_FL_SHIFT, GI_WAL_MATURE_N, GI_WAL_UPD_B, GI_WAL_UPD_R, GI_WAL_WORDS};
 import package::brickmap::{Grid, sample_brickmap};
@@ -1258,6 +1258,28 @@ fn gi_res_generate_samples(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(1, 1, 1)
 fn gi_res_prepare_history() {
   gi_r_prepare_history();
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn gi_res_reproject_lit(@builtin(workgroup_id) gid: vec3<u32>,
+                        @builtin(local_invocation_index) lane: u32) {
+  gi_r_reproject_lit_entry(gid, lane);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn gi_res_reproject_unlit(@builtin(workgroup_id) gid: vec3<u32>,
+                          @builtin(local_invocation_index) lane: u32) {
+  gi_r_reproject_unlit_entry(gid, lane);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn gi_res_refine_buckets(@builtin(global_invocation_id) gid: vec3<u32>) {
+  gi_r_refine_buckets(gid);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn gi_res_debug_buckets(@builtin(global_invocation_id) gid: vec3<u32>) {
+  gi_r_debug_buckets(gid);
 }
 
 @compute @workgroup_size(64, 1, 1)

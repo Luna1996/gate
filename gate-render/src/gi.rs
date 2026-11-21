@@ -462,11 +462,42 @@ pub fn gi_res_layout() -> BindGroupLayoutDescriptor {
       rw(45),
       rw(46),
       rw(47),
-      rw(48),
       rw(49),
       rw(50),
       rw(51),
       rw(52),
+    ],
+  )
+}
+
+pub fn gi_res_history_layout() -> BindGroupLayoutDescriptor {
+  use bevy::render::render_resource::*;
+  const C: ShaderStages = ShaderStages::COMPUTE;
+  let rw = |binding: u32| BindGroupLayoutEntry {
+    binding,
+    visibility: C,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Storage { read_only: false },
+      has_dynamic_offset: false,
+      min_binding_size: None,
+    },
+    count: None,
+  };
+  BindGroupLayoutDescriptor::new(
+    "GiResHistory",
+    &[
+      BindGroupLayoutEntry {
+        binding: 0,
+        visibility: C,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(GiResUniform::min_size()),
+        },
+        count: None,
+      },
+      rw(47),
+      rw(48),
     ],
   )
 }
@@ -697,6 +728,9 @@ pub struct GiBg5(pub bevy::render::render_resource::BindGroup);
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiResBg0(pub bevy::render::render_resource::BindGroup);
 
+#[derive(bevy::ecs::resource::Resource)]
+pub struct GiResHistoryBg(pub bevy::render::render_resource::BindGroup);
+
 #[derive(bevy::ecs::resource::Resource, Default)]
 struct GiPlaceholder {
   tex: Option<bevy::render::render_resource::Texture>,
@@ -845,11 +879,35 @@ fn queue_gi_pipelines(
     }));
     gpu.res_pipelines[3] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
       label: Some(Cow::from("gate_gi_res_prepare_history")),
-      layout: vec![res_layout],
+      layout: vec![gi_res_history_layout()],
       shader: dda_shader.0.clone(),
       entry_point: Some(Cow::from("gi_res_prepare_history")),
       ..Default::default()
     }));
+
+    let tail = [
+      ("gate_gi_res_reproject_lit", "gi_res_reproject_lit", 4usize),
+      ("gate_gi_res_reproject_unlit", "gi_res_reproject_unlit", 5),
+      ("gate_gi_res_refine_buckets", "gi_res_refine_buckets", 6),
+      ("gate_gi_res_debug_buckets", "gi_res_debug_buckets", 7),
+    ];
+    for (label, entry, slot) in tail {
+      gpu.res_pipelines[slot] =
+        Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+          label: Some(Cow::from(label)),
+          layout: vec![
+            gi_res_layout(),
+            dda_pipelines.bg1_layout.clone(),
+            dda_pipelines.bg2_layout.clone(),
+            dda_pipelines.bg3_layout.clone(),
+            gi_bg4_layout(),
+            gi_bg5_layout(),
+          ],
+          shader: dda_shader.0.clone(),
+          entry_point: Some(Cow::from(entry)),
+          ..Default::default()
+        }));
+    }
   }
 
   if gpu.den_pipelines[0].is_some() {
@@ -1156,12 +1214,7 @@ fn prepare_gi(p: PrepareGiParams) {
       settings: Vec4::new(1.0, 1.0, 8.0, c.gi_max_history_frames as f32),
       settings2: Vec4::new(12.0, 160.0, 1.0, 3.0),
       settings3: Vec4::new(1.0, 12.0, 0.3, 2.5),
-      settings4: Vec4::new(
-        if crate::brickmap::dda::GI_RES_DEBUG { 1.0 } else { 0.0 },
-        1.0,
-        1.0,
-        0.0,
-      ),
+      settings4: Vec4::new(crate::brickmap::dda::gi_res_debug_mode() as f32, 1.0, 1.0, 0.0),
     };
     gpu.res_uniform.write_buffer(&device, &queue);
 
@@ -1193,17 +1246,31 @@ fn prepare_gi(p: PrepareGiParams) {
           BindGroupEntry { binding: 42, resource: BindingResource::TextureView(&surf) },
           BindGroupEntry { binding: 43, resource: BindingResource::TextureView(&key) },
           BindGroupEntry { binding: 44, resource: BindingResource::TextureView(&own) },
-          BindGroupEntry { binding: 45, resource: buffers[0].as_entire_binding() },
-          BindGroupEntry { binding: 46, resource: buffers[1].as_entire_binding() },
-          BindGroupEntry { binding: 47, resource: buffers[2].as_entire_binding() },
-          BindGroupEntry { binding: 48, resource: buffers[3].as_entire_binding() },
-          BindGroupEntry { binding: 49, resource: buffers[4].as_entire_binding() },
-          BindGroupEntry { binding: 50, resource: buffers[5].as_entire_binding() },
-          BindGroupEntry { binding: 51, resource: buffers[6].as_entire_binding() },
-          BindGroupEntry { binding: 52, resource: buffers[7].as_entire_binding() },
+          BindGroupEntry { binding: 45, resource: buffers[5].as_entire_binding() },
+          BindGroupEntry { binding: 46, resource: buffers[4].as_entire_binding() },
+          BindGroupEntry { binding: 47, resource: buffers[6].as_entire_binding() },
+          BindGroupEntry { binding: 49, resource: buffers[0].as_entire_binding() },
+          BindGroupEntry { binding: 50, resource: buffers[1].as_entire_binding() },
+          BindGroupEntry { binding: 51, resource: buffers[2].as_entire_binding() },
+          BindGroupEntry { binding: 52, resource: buffers[3].as_entire_binding() },
         ],
       );
       commands.insert_resource(GiResBg0(bg));
+
+      let history_layout = pipeline_cache.get_bind_group_layout(&gi_res_history_layout());
+      let history_bg = device.create_bind_group(
+        None,
+        &history_layout,
+        &[
+          BindGroupEntry {
+            binding: 0,
+            resource: gpu.res_uniform.binding().expect("res uniform 已写入"),
+          },
+          BindGroupEntry { binding: 47, resource: buffers[6].as_entire_binding() },
+          BindGroupEntry { binding: 48, resource: buffers[7].as_entire_binding() },
+        ],
+      );
+      commands.insert_resource(GiResHistoryBg(history_bg));
     }
   }
 }

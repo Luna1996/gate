@@ -87,8 +87,8 @@ struct GiBucketSample {
 }
 
 struct GiBucketInfo {
-  lit_count: u32,
-  unlit_count: u32,
+  lit_count: atomic<u32>,
+  unlit_count: atomic<u32>,
   dist_range: u32,
   packed: u32,
   lit_ratio: f32,
@@ -422,16 +422,14 @@ fn gi_r_prepare_buckets(gid: vec3<u32>) {
     }
   }
 
-  gia_buckets[b] = GiBucketInfo(
-    0u,
-    0u,
-    gi_pack_f16_pair(min_distance, max_distance),
-    normal_mask << 4u,
-    0.0,
-    0.0,
-    0u,
-    0u,
-  );
+  atomicStore(&gia_buckets[b].lit_count, 0u);
+  atomicStore(&gia_buckets[b].unlit_count, 0u);
+  gia_buckets[b].dist_range = gi_pack_f16_pair(min_distance, max_distance);
+  gia_buckets[b].packed = normal_mask << 4u;
+  gia_buckets[b].lit_ratio = 0.0;
+  gia_buckets[b].max_luminance = 0.0;
+  gia_buckets[b].reserved0 = 0u;
+  gia_buckets[b].reserved1 = 0u;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -553,7 +551,7 @@ fn gi_r_generate_samples(gid: vec3<u32>) {
 
   textureStore(gia_own_out, vec2<i32>(p), vec4<u32>(own));
 
-  if (u32(gia_u.settings4.x) != 0u) {
+  if (u32(gia_u.settings4.x) == 1u) {
     textureStore(gi_out, vec2<i32>(p), vec4<f32>(gi_unpack_radiance(own), 1.0));
   }
 
@@ -612,4 +610,221 @@ fn gi_r_prepare_history() {
   let slot = gi_res_frame_slot();
   gi_prepare_ring(0u, max(gia_u.limits.x, 1u), slot);
   gi_prepare_ring(1u, max(gia_u.limits.y, 1u), slot);
+}
+
+// ---------------------------------------------------------------------------------------------
+// GiReprojectLit / GiReprojectUnlit / GiRefineBuckets
+// ---------------------------------------------------------------------------------------------
+
+fn gi_shuffled_sample_index(
+  ring: u32,
+  group: u32,
+  lane: u32,
+  index: ptr<function, u32>,
+) -> bool {
+  *index = 0u;
+  let valid = atomicLoad(&gia_counts[GI_COUNT_LIT_VALID + ring]);
+  if (valid == 0u) {
+    return false;
+  }
+  let groups = gi_next_pow2((valid + 63u) / 64u);
+  if (group >= groups) {
+    return false;
+  }
+  let coprime = atomicLoad(&gia_counts[GI_COUNT_LIT_COPRIME + ring]);
+  let shuffled = ((coprime * group + gia_u.frame.w) % groups) * 64u + lane;
+  if (shuffled >= valid) {
+    return false;
+  }
+  *index = shuffled;
+  return true;
+}
+
+// Moves a stored sample's primary surface to this frame and validates it at its landing pixel.
+fn gi_reproject_to_bucket(
+  key: u32,
+  token: u32,
+  object_position: vec3<f32>,
+  virtual_offset: vec3<f32>,
+  world: ptr<function, vec3<f32>>,
+  bucket: ptr<function, u32>,
+) -> bool {
+  *world = vec3<f32>(0.0);
+  *bucket = 0u;
+
+  if (token == 0u) {
+    return false;
+  }
+
+  let slot = key >> 16u;
+  let obj = i32(slot) - 1;
+  let voxel = vec3<i32>(floor(object_position));
+  if ((gi_pose_salt(obj) ^ gi_local_rev(voxel, obj)) != token) {
+    return false;
+  }
+
+  let g = make_grid(slot);
+  let primary = gi_world_pos(g, object_position);
+  let virtual_point = primary + virtual_offset;
+
+  var texel = vec2<i32>(0);
+  if (!gi_project_to_texel(virtual_point, &texel)) {
+    return false;
+  }
+
+  let info = gia_pixels[u32(texel.y) * gia_u.frame.x + u32(texel.x)];
+  let range = gi_unpack_f16_pair(info.dist_range);
+  let distance = length(virtual_point - gi_res_camera_pos());
+  if (distance < range.x * (1022.0 / 1024.0) || distance > range.y * (1026.0 / 1024.0)) {
+    return false;
+  }
+
+  let hash16 = key & 0xFFFFu;
+  let centre_hash = info.hashes & 0xFFFFu;
+  let bloom = info.hashes >> 16u;
+  if (hash16 != centre_hash && (bloom & (1u << (hash16 & 15u))) == 0u) {
+    return false;
+  }
+
+  *world = primary;
+  *bucket = gi_res_bucket_index(vec2<u32>(texel));
+  return true;
+}
+
+fn gi_r_reproject_lit(group: u32, lane: u32) {
+  var i = 0u;
+  if (!gi_shuffled_sample_index(0u, group, lane, &i)) {
+    return;
+  }
+
+  let start = atomicLoad(&gia_counts[GI_COUNT_LIT_START]);
+  let sample = gia_lit[(start + i) % max(gia_u.limits.x, 1u)];
+
+  var world = vec3<f32>(0.0);
+  var bucket = 0u;
+  if (!gi_reproject_to_bucket(
+    sample.key,
+    sample.token,
+    vec3<f32>(sample.ox, sample.oy, sample.oz),
+    vec3<f32>(sample.vx, sample.vy, sample.vz),
+    &world,
+    &bucket,
+  )) {
+    return;
+  }
+
+  let k = atomicAdd(&gia_buckets[bucket].lit_count, 1u);
+  if (k < GI_REFINED_PER_BUCKET) {
+    let is_sky = (sample.primary_normal & GI_SAMPLE_SKY_FLAG) != 0u;
+    gia_refined[bucket * GI_REFINED_PER_BUCKET + k] = GiBucketSample(
+      world.x,
+      world.y,
+      world.z,
+      (sample.primary_normal & 7u)
+        | select(0u, GI_BUCKET_SKY_FLAG, is_sky)
+        | gi_oct16_to_12(sample.secondary_normal),
+      sample.sx,
+      sample.sy,
+      sample.sz,
+      sample.radiance,
+    );
+  }
+}
+
+fn gi_r_reproject_unlit(group: u32, lane: u32) {
+  var i = 0u;
+  if (!gi_shuffled_sample_index(1u, group, lane, &i)) {
+    return;
+  }
+
+  let start = atomicLoad(&gia_counts[GI_COUNT_UNLIT_START]);
+  let sample = gia_unlit[(start + i) % max(gia_u.limits.y, 1u)];
+
+  var world = vec3<f32>(0.0);
+  var bucket = 0u;
+  if (!gi_reproject_to_bucket(
+    sample.key,
+    sample.token,
+    vec3<f32>(sample.ox, sample.oy, sample.oz),
+    vec3<f32>(sample.vx, sample.vy, sample.vz),
+    &world,
+    &bucket,
+  )) {
+    return;
+  }
+
+  atomicAdd(&gia_buckets[bucket].unlit_count, u32(max(gia_u.settings.z, 1.0)));
+}
+
+fn gi_r_refine_buckets(gid: vec3<u32>) {
+  let b = gid.x;
+  if (b >= gia_u.limits.z) {
+    return;
+  }
+
+  let lit_count = atomicLoad(&gia_buckets[b].lit_count);
+  let unlit_count = atomicLoad(&gia_buckets[b].unlit_count);
+  let lit = min(lit_count, GI_REFINED_PER_BUCKET);
+  let unlit_effective = f32(unlit_count) * (f32(lit) / f32(max(lit_count, 1u)));
+
+  var max_luminance = 0.0;
+  for (var i: u32 = 0u; i < lit; i = i + 1u) {
+    max_luminance = max(
+      max_luminance,
+      gi_luminance(gi_unpack_radiance(gia_refined[b * GI_REFINED_PER_BUCKET + i].radiance)),
+    );
+  }
+
+  var rng = gi_rand_seed(vec2<u32>(b, 0u), gia_u.frame.w, GI_RAND_REFINE);
+  let leveling = u32(gia_u.settings3.x) != 0u;
+  var extra_unlit = 0u;
+  var stored = 0u;
+  for (var j: u32 = 0u; j < lit; j = j + 1u) {
+    var s = gia_refined[b * GI_REFINED_PER_BUCKET + j];
+    let radiance = gi_unpack_radiance(s.radiance);
+    let r = select(1.0, max_luminance / max(gi_luminance(radiance), 1e-6), leveling);
+    if (gi_rand(&rng) * r > 1.0) {
+      extra_unlit = extra_unlit + 1u;
+      continue;
+    }
+    if (stored < GI_COMPACT_PER_BUCKET) {
+      s.radiance = gi_pack_radiance(radiance * r);
+      gia_compact[b * GI_COMPACT_PER_BUCKET + stored] = s;
+      stored = stored + 1u;
+    }
+  }
+
+  let kept_lit = f32(lit - extra_unlit);
+  let lit_ratio = kept_lit / max(1.0, kept_lit + unlit_effective + f32(extra_unlit));
+  if (f32(lit) + unlit_effective < gia_u.settings3.y) {
+    stored = 0u;
+  }
+
+  let normal_mask = (gia_buckets[b].packed >> 4u) & 63u;
+  let total_comp = min(7u, (lit_count + unlit_count) / 64u);
+  gia_buckets[b].packed = stored | (normal_mask << 4u) | (total_comp << 10u);
+  gia_buckets[b].lit_ratio = lit_ratio;
+  gia_buckets[b].max_luminance = max_luminance;
+}
+
+fn gi_r_reproject_lit_entry(gid: vec3<u32>, lane: u32) {
+  gi_r_reproject_lit(gid.x + gid.y * GI_MAX_GROUPS_X, lane);
+}
+
+fn gi_r_reproject_unlit_entry(gid: vec3<u32>, lane: u32) {
+  gi_r_reproject_unlit(gid.x + gid.y * GI_MAX_GROUPS_X, lane);
+}
+
+fn gi_r_debug_buckets(gid: vec3<u32>) {
+  let p = gid.xy;
+  if (!gi_res_texel_in_range(p)) {
+    return;
+  }
+  let b = gi_res_bucket_index(p);
+  let stored = f32(gia_buckets[b].packed & 15u) / f32(GI_COMPACT_PER_BUCKET);
+  textureStore(
+    gi_out,
+    vec2<i32>(p),
+    vec4<f32>(stored, gia_buckets[b].lit_ratio, clamp(gia_buckets[b].max_luminance, 0.0, 4.0) * 0.25, 1.0),
+  );
 }
