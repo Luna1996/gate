@@ -1794,7 +1794,7 @@ fn dda_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (claimed != 0xFFFFFFFFu) {
         lc_budget_take();
         off = claimed;
-        let warm = select(1u, 2u, lc_sun_n(off) < 2u);
+        let warm = 1u;
         for (var i: u32 = 0u; i < warm; i = i + 1u) {
           if (want_sun) {
             lc_push_sun(off, sun_vis_samples(o, sun_dir, sun_radius, voxel, obj_id,
@@ -1923,9 +1923,9 @@ fn dda_gbuffer(@builtin(global_invocation_id) gid: vec3<u32>) {
   textureStore(rr_albedo_out, coord, vec4<f32>(clamp(albedo, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
   textureStore(rr_spec_out, coord, vec4<f32>(clamp(spec, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
   textureStore(rr_norm_out, coord, vec4<f32>(n, clamp(m.roughness, 0.0, 1.0)));
-  let depth = max(length(p - cam), 1.0e-3);
+  let depth = max((view_u.view_proj * vec4<f32>(first.point, 1.0)).w, 1.0e-3);
   textureStore(rr_depth_out, coord, vec4<f32>(depth, 0.0, 0.0, 0.0));
-  let prev_h = gi_u.prev_view_proj * vec4<f32>(p, 1.0);
+  let prev_h = gi_u.prev_view_proj * vec4<f32>(first.point, 1.0);
   let prev_ndc = prev_h.xy / max(prev_h.w, 1.0e-5);
   let raw_motion = vec2<f32>((prev_ndc.x - cur_ndc.x) * 0.5 * f32(size.x),
                              (prev_ndc.y - cur_ndc.y) * 0.5 * f32(size.y));

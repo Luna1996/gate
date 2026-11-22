@@ -724,6 +724,10 @@ pub fn gi_flatten_layout() -> BindGroupLayoutDescriptor {
 
 pub const GI_FLAT_ACC: bool = false;
 
+/// Mirrors `GI_WORLD_CACHE` in `main.wesl`: false uses the screen-space resampler and skips the
+/// full-resolution world-cache warm-up pass.
+pub const GI_WORLD_CACHE: bool = false;
+
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiGpu {
   pub uniform: bevy::render::render_resource::UniformBuffer<GiUniform>,

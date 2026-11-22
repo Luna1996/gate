@@ -152,7 +152,7 @@ mod imp {
         match DlssRayReconstruction::new(
           [crate::consts::VIEW_SIZE.x, crate::consts::VIEW_SIZE.y],
           DlssPerfQualityMode::Dlaa,
-          DlssFeatureFlags::empty(),
+          DlssFeatureFlags::HighDynamicRange | DlssFeatureFlags::LowResolutionMotionVectors,
           DlssRayReconstructionRoughnessMode::Packed,
           DlssRayReconstructionDepthMode::Linear,
           sdk.clone(),

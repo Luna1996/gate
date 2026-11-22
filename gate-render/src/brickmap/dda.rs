@@ -2405,7 +2405,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(gx, gy, 1);
       },
     );
-    if let Some(gi_cache_pipe) = gi_cache_pipe {
+    if crate::gi::GI_WORLD_CACHE
+      && let Some(gi_cache_pipe) = gi_cache_pipe
+    {
       crate::profiler::gpu_compute_pass(
         &mut profiler,
         ctx.command_encoder(),
@@ -2429,7 +2431,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         },
       );
     }
-    if let Some(gi_filter_pipe) = gi_filter_pipe {
+    if crate::gi::GI_WORLD_CACHE
+      && let Some(gi_filter_pipe) = gi_filter_pipe
+    {
       crate::profiler::gpu_compute_pass(
         &mut profiler,
         ctx.command_encoder(),

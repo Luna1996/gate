@@ -8,7 +8,7 @@ import package::world::{WorldHit, surface_offset, voxel_center_world, voxel_norm
 
 const GI_CACHE_MAX_N: u32 = 64u;
 const GI_COARSE_DIST: f32 = 1200.0;
-const GI_CACHE_BUDGET: u32 = 262144u;
+const GI_CACHE_BUDGET: u32 = 2048u;
 const GI_CELL: i32 = 4;
 const GI_CACHE_REACH: f32 = 4096.0;
 

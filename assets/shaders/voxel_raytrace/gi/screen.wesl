@@ -352,7 +352,7 @@ fn gi_ss_main(coord: vec2<i32>, size: vec2<u32>, h: WorldHit, w_adapt: f32) {
   let affected = gi_in_edit_box(p_voxel);
   let since = gi_u.seq.x - gi_u.seq.w;
   let hist_reset_now = affected && (gi_u.flags.z <= 0.5);
-  let hist_reset_recent = affected && (since < 32u);
+  let hist_reset_recent = since < 32u;
 
   gi_den_guide_store(coord, size, true, pk0, pk1, n, prev_ok, prev_pc, hist_reset_recent);
 

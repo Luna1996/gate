@@ -39,11 +39,7 @@ const GI_DN_DEPTH_REL: f32 = 0.005;
 const GI_DN_LATERAL_MAX: f32 = 32.0;
 const GI_DN_NORMAL_POWER: f32 = 64.0;
 const GI_DN_RADIANCE_SIGMA: f32 = 4.0;
-const GI_DN_CLAMP_K: f32 = 2.5;
-const GI_DN_SIGMA_ALPHA: f32 = 0.05;
 const GI_DN_RESET_SCALE: f32 = 0.25;
-const GI_DN_W_HIST_MIN: f32 = 0.05;
-const GI_DN_LUMA_FLOOR_REL: f32 = 0.05;
 
 // --- guide helpers (also used by the DDA GI pass) -------------------------------------------
 
@@ -216,38 +212,6 @@ fn gi_den_temporal(coord: vec2<i32>) {
   let p_c = surf.xyz;
   let tol = gi_dn_plane_tol(surf.w);
 
-  // Local statistics of the current signal over the centre plane. The temporal clamp uses them
-  // to reject history that no longer matches the neighbourhood (edits, lighting steps), while
-  // the moments below track the accumulated signal variance.
-  var sum = vec3<f32>(0.0);
-  var sum2 = vec3<f32>(0.0);
-  var lsum = 0.0;
-  var lsum2 = 0.0;
-  var cnt = 0.0;
-  for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-      let p = coord + vec2<i32>(dx, dy);
-      if (!gi_dn_valid_tap(p, size)) { continue; }
-      let tb = (u32(p.y) * size.x + u32(p.x)) * GI_DEN_GUIDE_WORDS;
-      if (!gi_den_valid_b(tb)) { continue; }
-      if (!gi_den_same_plane(gi_den_key0_b(tb), gi_den_key1_b(tb), k0, k1)) { continue; }
-      if (gi_guide[tb + GI_DEN_G_NRM] != n_c_packed) { continue; }
-      let s = textureLoad(gi_raw_tex, p, 0);
-      if (!(s.a > 0.001)) { continue; }
-      let l = gi_dn_luma(s.rgb);
-      sum = sum + s.rgb;
-      sum2 = sum2 + s.rgb * s.rgb;
-      lsum = lsum + l;
-      lsum2 = lsum2 + l * l;
-      cnt = cnt + 1.0;
-    }
-  }
-
-  let cmean = sum / max(cnt, 1.0);
-  let cstd = sqrt(max(sum2 / max(cnt, 1.0) - cmean * cmean, vec3<f32>(0.0)));
-  let lmean = lsum / max(cnt, 1.0);
-  let sigma_cur = sqrt(max(lsum2 / max(cnt, 1.0) - lmean * lmean, 0.0));
-
   var color = cur.rgb;
   var m1 = gi_dn_luma(cur.rgb);
   var m2 = m1 * m1;
@@ -295,35 +259,12 @@ fn gi_den_temporal(coord: vec2<i32>) {
   }
 
   if (hist_found) {
-    var clamped = hist_color;
-    var clipped = false;
-    if (cnt > 1.5) {
-      let lo = cmean - GI_DN_CLAMP_K * cstd;
-      let hi = cmean + GI_DN_CLAMP_K * cstd;
-      clamped = clamp(hist_color, lo, hi);
-      clipped = any(clamped != hist_color);
-    } else {
-      let pad = max(lmean, 1e-4) * GI_DN_LUMA_FLOOR_REL;
-      let lo = cur.rgb * (1.0 / GI_DN_CLAMP_K) - vec3<f32>(pad);
-      let hi = cur.rgb * GI_DN_CLAMP_K + vec3<f32>(pad);
-      clamped = clamp(hist_color, lo, hi);
-      clipped = any(clamped != hist_color);
-    }
-
-    let sigma_hist = sqrt(max(hist_m2 - hist_m1 * hist_m1, 0.0));
-    let sigma_use = max(sigma_cur, sigma_hist);
-    var w_var = 1.0;
-    if (clipped) {
-      w_var = clamp(GI_DN_SIGMA_ALPHA / max(sigma_use, 1e-5), GI_DN_W_HIST_MIN, 1.0);
-    }
     let age_max = min(hist_age, GI_DN_MAX_FRAMES - 1.0);
-    let w_static = clamp(1.0 - 1.0 / max(age_max + 1.0, 1.0), 0.0, 1.0);
-    var w_hist = w_static;
-    if (clipped) { w_hist = min(w_hist, w_var); }
+    var w_hist = clamp(1.0 - 1.0 / max(age_max + 1.0, 1.0), 0.0, 1.0);
     if (gi_guide[gb + GI_DEN_G_RESET] != 0u) { w_hist = min(w_hist, GI_DN_RESET_SCALE); }
     let cur_w = max(1.0 - w_hist, GI_DN_CURRENT_MIN_WEIGHT);
     let l_in = gi_dn_luma(cur.rgb);
-    color = mix(clamped, cur.rgb, cur_w);
+    color = mix(hist_color, cur.rgb, cur_w);
     m1 = mix(hist_m1, l_in, cur_w);
     m2 = mix(hist_m2, l_in * l_in, cur_w);
     hist_age = age_max + 1.0;
