@@ -834,21 +834,15 @@ fn gi_r_debug_buckets(gid: vec3<u32>) {
 
 @group(0) @binding(53) var gia_own: texture_2d<u32>;
 
-fn gi_res_mirror(x: i32, size: i32) -> i32 {
-  var v = x;
-  if (v < 0) {
-    v = -v;
-  } else if (v >= size) {
-    v = 2 * size - 2 - v;
-  }
-  return clamp(v, 0, size - 1);
+fn gi_res_clamp_texel(x: i32, size: i32) -> i32 {
+  return clamp(x, 0, size - 1);
 }
 
 fn gi_res_neighbour_texel(p: vec2<u32>, offset: vec2<f32>) -> vec2<u32> {
   let q = vec2<i32>(floor(vec2<f32>(p) + offset));
   return vec2<u32>(
-    u32(gi_res_mirror(q.x, i32(gia_u.frame.x))),
-    u32(gi_res_mirror(q.y, i32(gia_u.frame.y))),
+    u32(gi_res_clamp_texel(q.x, i32(gia_u.frame.x))),
+    u32(gi_res_clamp_texel(q.y, i32(gia_u.frame.y))),
   );
 }
 

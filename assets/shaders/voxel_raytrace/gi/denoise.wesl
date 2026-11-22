@@ -32,8 +32,10 @@ const GI_DN_H_TOKEN: u32 = 8u;
 const GI_DN_H_NRM: u32 = 9u;
 const GI_DN_H_POS: u32 = 12u; // words 12..14 = world position, 15 = pad
 
-const GI_DN_MAX_FRAMES: f32 = 4096.0;
-const GI_DN_CURRENT_MIN_WEIGHT: f32 = 0.0002;
+const GI_DN_MAX_FRAMES: f32 = 1024.0;
+const GI_DN_CURRENT_MIN_WEIGHT: f32 = 0.0005;
+const GI_DN_MOVE_FRAMES: f32 = 48.0;
+const GI_DN_MOVE_EPS: f32 = 2.0;
 const GI_DN_DEPTH_ABS: f32 = 0.5;
 const GI_DN_DEPTH_REL: f32 = 0.005;
 const GI_DN_LATERAL_MAX: f32 = 32.0;
@@ -218,6 +220,7 @@ fn gi_den_temporal(coord: vec2<i32>) {
 
   var hist_found = false;
   var hist_age = 0.0;
+  var hist_motion = 0.0;
   var hist_m1 = 0.0;
   var hist_m2 = 0.0;
   var hist_color = vec3<f32>(0.0);
@@ -225,6 +228,7 @@ fn gi_den_temporal(coord: vec2<i32>) {
   let code = gi_guide[gb + GI_DEN_G_PREV];
   if (code != 0xFFFFFFFFu) {
     let prev_px = vec2<i32>(i32(code & 0xFFFFu), i32((code >> 16u) & 0xFFFFu));
+    hist_motion = length(vec2<f32>(prev_px - coord));
     for (var s = 0u; s <= 8u; s = s + 1u) {
       let px = prev_px.x + gi_hist_search_offset(s).x;
       let py = prev_px.y + gi_hist_search_offset(s).y;
@@ -259,7 +263,8 @@ fn gi_den_temporal(coord: vec2<i32>) {
   }
 
   if (hist_found) {
-    let age_max = min(hist_age, GI_DN_MAX_FRAMES - 1.0);
+    let age_cap = select(GI_DN_MAX_FRAMES, GI_DN_MOVE_FRAMES, hist_motion > GI_DN_MOVE_EPS);
+    let age_max = min(hist_age, age_cap - 1.0);
     var w_hist = clamp(1.0 - 1.0 / max(age_max + 1.0, 1.0), 0.0, 1.0);
     if (gi_guide[gb + GI_DEN_G_RESET] != 0u) { w_hist = min(w_hist, GI_DN_RESET_SCALE); }
     let cur_w = max(1.0 - w_hist, GI_DN_CURRENT_MIN_WEIGHT);
