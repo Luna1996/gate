@@ -834,16 +834,8 @@ fn gi_r_debug_buckets(gid: vec3<u32>) {
 
 @group(0) @binding(53) var gia_own: texture_2d<u32>;
 
-fn gi_res_clamp_texel(x: i32, size: i32) -> i32 {
-  return clamp(x, 0, size - 1);
-}
-
-fn gi_res_neighbour_texel(p: vec2<u32>, offset: vec2<f32>) -> vec2<u32> {
-  let q = vec2<i32>(floor(vec2<f32>(p) + offset));
-  return vec2<u32>(
-    u32(gi_res_clamp_texel(q.x, i32(gia_u.frame.x))),
-    u32(gi_res_clamp_texel(q.y, i32(gia_u.frame.y))),
-  );
+fn gi_res_neighbour_texel(p: vec2<u32>, offset: vec2<f32>) -> vec2<i32> {
+  return vec2<i32>(floor(vec2<f32>(p) + offset));
 }
 
 fn gi_res_bucket_accepts(
@@ -880,7 +872,11 @@ fn gi_res_adaptive_radius_factor(
 
   for (var i: i32 = 0; i < 12; i = i + 1) {
     let xy = (-radius * 0.5 + radius * gi_res_rand2(rng)) * select(1.0, 0.1, i < 6);
-    let texel = gi_res_neighbour_texel(p, xy);
+    let q = gi_res_neighbour_texel(p, xy);
+    if (q.x < 0 || q.y < 0 || q.x >= i32(gia_u.frame.x) || q.y >= i32(gia_u.frame.y)) {
+      continue;
+    }
+    let texel = vec2<u32>(q);
     let bucket = gi_res_bucket_index(texel);
     if (!gi_res_bucket_accepts(bucket, my_axis, my_distance, distance_factor)) {
       continue;
@@ -969,7 +965,11 @@ fn gi_r_spatial(gid: vec3<u32>) {
   let iterations = u32(max(gia_u.settings2.x, 1.0));
   for (var it: u32 = 0u; it < iterations; it = it + 1u) {
     let offset = (gi_res_rand2(&rng) - vec2<f32>(0.5, 0.5)) * radius;
-    let texel = gi_res_neighbour_texel(p, offset);
+    let q = gi_res_neighbour_texel(p, offset);
+    if (q.x < 0 || q.y < 0 || q.x >= i32(gia_u.frame.x) || q.y >= i32(gia_u.frame.y)) {
+      continue;
+    }
+    let texel = vec2<u32>(q);
     let bucket = gi_res_bucket_index(texel);
     if (!gi_res_bucket_accepts(bucket, my_axis, my_distance, distance_factor)) {
       continue;
