@@ -1794,7 +1794,7 @@ fn dda_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (claimed != 0xFFFFFFFFu) {
         lc_budget_take();
         off = claimed;
-        let warm = 1u;
+        let warm = select(1u, 2u, lc_sun_n(off) < 2u);
         for (var i: u32 = 0u; i < warm; i = i + 1u) {
           if (want_sun) {
             lc_push_sun(off, sun_vis_samples(o, sun_dir, sun_radius, voxel, obj_id,

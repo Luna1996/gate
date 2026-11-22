@@ -18,13 +18,13 @@ const LC_EMIT_N: u32 = 10u;
 const LC_EMIT: u32 = 11u;
 const LC_ACCESS: u32 = 14u;
 
-const LC_MAX_N: u32 = 128u;
+const LC_MAX_N: u32 = 64u;
 const LC_SCALE: f32 = 1024.0;
 const LC_BUDGET: u32 = 262144u;
 const LC_HIT_BUDGET: u32 = 524288u;
 const LC_AO_T: f32 = 12.0;
-const LC_SUN_SAMPLES: u32 = 2u;
-const LC_AO_SAMPLES: u32 = 1u;
+const LC_SUN_SAMPLES: u32 = 4u;
+const LC_AO_SAMPLES: u32 = 4u;
 const LC_NONE: u32 = 0xFFFFFFFFu;
 const LC_BUSY: u32 = 0x80000000u;
 const LC_FRAME_MASK: u32 = 0x7FFFFFFFu;

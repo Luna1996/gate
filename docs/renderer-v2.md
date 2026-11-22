@@ -153,12 +153,12 @@
 - 旧 `gi_denoise`（屏幕空间 temporal + 移植不适配的 à-trous）整段删除，替换为 `assets/shaders/voxel_raytrace/gi/denoise.wesl` 的两级链：`gi_denoise_temporal` → 5 轮 `gi_denoise_atrous1/2/4/8/16`。输出仍是 GI 分辨率（默认 1/4）的 `rgba16float`，`gi_upsample_joint` 与 shade 的读取路径不变。
 - 信号约定：`.rgb` 是入射辐照度，`.a` 是有效性（1 = 有数据，0 = 无）；历史年龄/矩/表面数据放在独立 history buffer，不再把年龄写进信号 alpha，避免 shade 把年龄当覆盖率。
 - History：每像素 16 word（colour 3 + age + 亮度 m1/m2 + key0/key1 + token + packed normal + world position 3 + pad），双缓冲。`prev` / `cur` 每帧交换；buffer 创建时零初始化，首帧 age=0 自然从头累积，**不做全局历史清除**。
-- 时域：用 guide 的 `prev` 像素（`gi_ss_reproject` 按 `prev_view_proj` 生成）做 3×3 搜索；每个候选同时校验 age>0、token 相等、`gi_same_surface`（key + 法线）、以及历史主表面世界坐标到当前中心平面的距离 ≤ `max(0.5, 0.005·dist)`。不做逐帧辐亮度 clamp：颜色只按历史年龄混合，单个空间离群样本只以 `1/(age+1)` 进入；编辑/光照阶跃（`seq.w`）后 32 帧把历史权重压到 0.25，让局部快速重收敛。此前的 3×3 均值/方差 clamp 会在边缘把当前离群值放大成单帧闪白，已移除。
+- 时域：用 guide 的 `prev` 像素（`gi_ss_reproject` 按 `prev_view_proj` 生成）做 3×3 搜索；每个候选同时校验 age>0、token 相等、`gi_same_surface`（key + 法线）、以及历史主表面世界坐标到当前中心平面的距离 ≤ `max(0.5, 0.005·dist)`。不做逐帧辐亮度 clamp：颜色只按历史年龄混合，单个空间离群样本只以 `1/(age+1)` 进入；编辑盒附近 32 帧把历史权重压到 0.25，让局部快速重收敛。此前的 3×3 均值/方差 clamp 会在边缘把当前离群值放大成单帧闪白，已移除。
 - 时域权重：`current = max(1/(age+1), 0.002)`，age 上限 512；静态场景约 1–2 s 收敛，之后每帧只引入 0.2% 当前帧。相机运动由 `prev_view_proj` 精确重投影；实例运动由 token（pose salt）拒绝；静态世界编辑由 key + 区域修订 token + reset 标志三重拒绝。
 - 空间：5×5 B3 核、步长 1/2/4/8/16；几何权重使用与 resampler 相同来源的世界位置/法线（平面预测是精确世界空间距离，不做深度差），亮度权重用 3×3 当前步长的局部亮度标准差归一化（首轮 step=1 关闭亮度权重以保住 Nyquist 零点）。tap jitter 默认关闭：滤波在时域之后，逐帧抖动会变成静态场景闪烁。
 - 颜色/交叉 resolve：本渲染器没有 delta checkerboard（反射/折射不按奇偶像素拆分），也没有独立的主射线 jitter；最终颜色的时域/抗锯齿归 DLSS RR 所有，再叠一层 color resolve 会与 RR 双重累积并引入拖影，所以这两级不接入。GI 链的“resolve”就是上面的时域累积 + 空间滤波，结束时直接给 shade。
 - 调度与绑定：降噪 bind group 在 `gi.rs::prepare_gi` 创建，dispatch 在 `dda.rs` 的 `gate_gi_res_spatial` 之后；`gate_gi_den`（dn[3]）是 shade 的 GI 输入。`dda_refl_compose` 的 scratch binding 改用 dn[1]，避免与 shade 读取的 dn[3] 在同一 dispatch 内 storage/resource 冲突。
-- 实测 1280×720、GI 1/4、VSync off、DLSS RR DLAA：静态 8 连拍（0.4 s 间隔、剔除 UI）相邻帧平均绝对差 0.24–0.31 灰阶、>16 灰阶 680–1012 像素、最大 69；关闭 GI 的 DLSS 基线为平均 0.08–0.17、>16 灰阶 91–291。修复前同相机为平均 0.40–0.45、>16 灰阶 2200–2800、最大 225，闪白单帧消失。移动（侧移 3 s、无截图干扰）`PACE` 84–93 fps；修复前同一路径因 GI/阴影缓存重算会掉到 21–32 fps。
+- 实测 1280×720、GI 1/4、VSync off、DLSS RR DLAA：静态 8 连拍（0.4 s 间隔、剔除 UI）相邻帧平均绝对差 0.24–0.31 灰阶、>16 灰阶 680–1012 像素、最大 69；关闭 GI 的 DLSS 基线为平均 0.08–0.17、>16 灰阶 91–291。修复前同相机为平均 0.40–0.45、>16 灰阶 2200–2800、最大 225，闪白单帧消失。移动（侧移 3 s、无截图干扰）`PACE` 63–92 fps；修复前同一路径因 GI/阴影缓存重算会掉到 21–32 fps。
 - 截图检查：降噪开启后墙面无蓝/白 speckle；侧移 2.5 s、前进 0.6 s 后 0.6/4/14 s 均无残影；中心放置 15³ 编辑块后 0.6/4/14 s 无旧表面残影；直射阴影、玻璃、镜面、DLSS RR 的观感与关闭降噪时一致。
 - 现状：降噪按 GI 分辨率运行；`GI_DEN_ATROUS_ITER=5`、核半径低档 1 / 中高档 2。逐帧 tap jitter 的实现保留在 shader 里（`gi_den_cfg[4]`），默认关闭。
 
@@ -166,8 +166,8 @@
 
 - RR G-buffer 的 depth / motion 改用本像素真实命中点（`first.point`），不再用体素中心。体素中心会让同一面内所有像素共享一个深度/运动矢量，斜面与远近边缘在 DLSS 里重投影错位，表现为移动糊边和静态边缘抖动。motion 仍是不含 jitter 的 `prev - cur` 像素位移；`DlssFeatureFlags` 补 `HighDynamicRange | LowResolutionMotionVectors`。
 - `GI_WORLD_CACHE=false` 时跳过全分辨率 `dda_gi_cache`：该 pass 只预热 world-cache 的 emissive 链，当前 shade 走 `gi_upsample_joint`，pass 结果无人读取；旧预算 262144 下移动时它单帧可花 15.5 ms。`GI_CACHE_BUDGET` 同时收紧到 2048，重新启用 world cache 时也不会再出现单帧长尾。
-- 直光阴影缓存 `dda_shadow` 在新区域按 `LC_SUN_SAMPLES=2`、`warm=1` 逐帧累积（原 4 / 1–2），移动时该 pass 3.9 ms → 2.3 ms；终端太阳软阴影由 128 个累积样本收敛，静止画面观感不变。
-- 复测：侧移 3 s 的无截图 `PACE` 84–93 fps、移动窗口内不再下坠（此前最低 21–32 fps）；`GPU 逐 pass` 总时长 31.5 ms → 8.1 ms（同一移动窗口）。静态 3 连拍平均绝对差 0.18–0.24 灰阶、>16 灰阶 273–497 像素。
+- 直光/AO 缓存保持原太阳采样：`LC_SUN_SAMPLES=4`、新 cell 前两帧 `warm=2`、`LC_MAX_N=64`；AO 每 cell 每次取 `LC_AO_SAMPLES=4` 条短射线，降低新进入画面墙面的 4³ 体素块状 AO。移动时新 cell 单帧仍可能到 ~3.9 ms，但把 1 样本/帧的初值降得太狠会让新进入画面的墙面出现大块 AO 斑（用户实测“着色不稳定”），所以保留初始质量；重复的 GI 缓存 pass 才是移动掉帧的主因。
+- 复测：侧移 3 s 的无截图 `PACE` 60–92 fps（冷阴影 cell 集中的 2 s 窗口最低 59.9，之后回 90；此前最低 21–32 fps）。静态 3 连拍平均绝对差 0.18–0.27 灰阶、>16 灰阶 273–915 像素。
 
 ## DLSS RR（2026-11-21）
 
