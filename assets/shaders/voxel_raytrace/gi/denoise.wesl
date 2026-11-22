@@ -32,8 +32,8 @@ const GI_DN_H_TOKEN: u32 = 8u;
 const GI_DN_H_NRM: u32 = 9u;
 const GI_DN_H_POS: u32 = 12u; // words 12..14 = world position, 15 = pad
 
-const GI_DN_MAX_FRAMES: f32 = 512.0;
-const GI_DN_CURRENT_MIN_WEIGHT: f32 = 0.002;
+const GI_DN_MAX_FRAMES: f32 = 4096.0;
+const GI_DN_CURRENT_MIN_WEIGHT: f32 = 0.0002;
 const GI_DN_DEPTH_ABS: f32 = 0.5;
 const GI_DN_DEPTH_REL: f32 = 0.005;
 const GI_DN_LATERAL_MAX: f32 = 32.0;

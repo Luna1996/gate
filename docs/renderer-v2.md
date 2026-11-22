@@ -154,7 +154,7 @@
 - 信号约定：`.rgb` 是入射辐照度，`.a` 是有效性（1 = 有数据，0 = 无）；历史年龄/矩/表面数据放在独立 history buffer，不再把年龄写进信号 alpha，避免 shade 把年龄当覆盖率。
 - History：每像素 16 word（colour 3 + age + 亮度 m1/m2 + key0/key1 + token + packed normal + world position 3 + pad），双缓冲。`prev` / `cur` 每帧交换；buffer 创建时零初始化，首帧 age=0 自然从头累积，**不做全局历史清除**。
 - 时域：用 guide 的 `prev` 像素（`gi_ss_reproject` 按 `prev_view_proj` 生成）做 3×3 搜索；每个候选同时校验 age>0、token 相等、`gi_same_surface`（key + 法线）、以及历史主表面世界坐标到当前中心平面的距离 ≤ `max(0.5, 0.005·dist)`。不做逐帧辐亮度 clamp：颜色只按历史年龄混合，单个空间离群样本只以 `1/(age+1)` 进入；编辑盒附近 32 帧把历史权重压到 0.25，让局部快速重收敛。此前的 3×3 均值/方差 clamp 会在边缘把当前离群值放大成单帧闪白，已移除。
-- 时域权重：`current = max(1/(age+1), 0.002)`，age 上限 512；静态场景约 1–2 s 收敛，之后每帧只引入 0.2% 当前帧。相机运动由 `prev_view_proj` 精确重投影；实例运动由 token（pose salt）拒绝；静态世界编辑由 key + 区域修订 token + reset 标志三重拒绝。
+- 时域权重：`current = max(1/(age+1), 0.0002)`，age 上限 4096；静态场景前几秒按 1/age 快速收敛，之后每帧只引入 0.02% 当前帧，静态画面固定不再漂移。相机运动由 `prev_view_proj` 精确重投影；实例运动由 token（pose salt）拒绝；静态世界编辑由 key + 区域修订 token + reset 标志三重拒绝。
 - 空间：5×5 B3 核、步长 1/2/4/8/16；几何权重使用与 resampler 相同来源的世界位置/法线（平面预测是精确世界空间距离，不做深度差），亮度权重用 3×3 当前步长的局部亮度标准差归一化（首轮 step=1 关闭亮度权重以保住 Nyquist 零点）。tap jitter 默认关闭：滤波在时域之后，逐帧抖动会变成静态场景闪烁。
 - 颜色/交叉 resolve：本渲染器没有 delta checkerboard（反射/折射不按奇偶像素拆分），也没有独立的主射线 jitter；最终颜色的时域/抗锯齿归 DLSS RR 所有，再叠一层 color resolve 会与 RR 双重累积并引入拖影，所以这两级不接入。GI 链的“resolve”就是上面的时域累积 + 空间滤波，结束时直接给 shade。
 - 调度与绑定：降噪 bind group 在 `gi.rs::prepare_gi` 创建，dispatch 在 `dda.rs` 的 `gate_gi_res_spatial` 之后；`gate_gi_den`（dn[3]）是 shade 的 GI 输入。`dda_refl_compose` 的 scratch binding 改用 dn[1]，避免与 shade 读取的 dn[3] 在同一 dispatch 内 storage/resource 冲突。
@@ -167,7 +167,8 @@
 - RR G-buffer 的 depth / motion 改用本像素真实命中点（`first.point`），不再用体素中心。体素中心会让同一面内所有像素共享一个深度/运动矢量，斜面与远近边缘在 DLSS 里重投影错位，表现为移动糊边和静态边缘抖动。motion 仍是不含 jitter 的 `prev - cur` 像素位移；`DlssFeatureFlags` 补 `HighDynamicRange | LowResolutionMotionVectors`。
 - `GI_WORLD_CACHE=false` 时跳过全分辨率 `dda_gi_cache`：该 pass 只预热 world-cache 的 emissive 链，当前 shade 走 `gi_upsample_joint`，pass 结果无人读取；旧预算 262144 下移动时它单帧可花 15.5 ms。`GI_CACHE_BUDGET` 同时收紧到 2048，重新启用 world cache 时也不会再出现单帧长尾。
 - 直光/AO 缓存保持原太阳采样：`LC_SUN_SAMPLES=4`、新 cell 前两帧 `warm=2`、`LC_MAX_N=64`；AO 每 cell 每次取 `LC_AO_SAMPLES=4` 条短射线，降低新进入画面墙面的 4³ 体素块状 AO。移动时新 cell 单帧仍可能到 ~3.9 ms，但把 1 样本/帧的初值降得太狠会让新进入画面的墙面出现大块 AO 斑（用户实测“着色不稳定”），所以保留初始质量；重复的 GI 缓存 pass 才是移动掉帧的主因。
-- 复测：侧移 3 s 的无截图 `PACE` 60–92 fps（冷阴影 cell 集中的 2 s 窗口最低 59.9，之后回 90；此前最低 21–32 fps）。静态 3 连拍平均绝对差 0.18–0.27 灰阶、>16 灰阶 273–915 像素。
+- 1344×756 市政厅街景（正常景深，非贴地）：旧 512 帧上限时静止 6 连拍平均绝对差 0.22–0.46 灰阶、>16 灰阶 400–1000 像素；改为 4096 帧 / 0.0002 后无 DLSS 为 0.019–0.047、>16 灰阶 11–31，开 DLSS RR 为 0.09–0.12、>16 灰阶 172–241（DLSS 自身基线约 0.09、197）。蓝天空光斑块属于真实 GI 天空项，不再随时间漂移。
+- 同街景的确定性巡航（80 vox/s + 0.15 rad/s，边移动边旋转，2 fps 截图）`PACE` 46–60 fps；静止 95 fps。
 
 ## DLSS RR（2026-11-21）
 
