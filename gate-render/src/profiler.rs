@@ -396,10 +396,10 @@ impl Plugin for GateProfilerPlugin {
     }
 
     if std::env::var("GATE_GI_PROBE").is_ok_and(|v| !v.is_empty() && v != "0") {
-      render_app.init_resource::<GiFlickerProbe>();
+      render_app.init_resource::<GiStatsProbe>();
       render_app.add_systems(
         bevy::render::renderer::RenderGraph,
-        report_gi_flicker.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
+        report_gi_stats.in_set(bevy::render::renderer::RenderGraphSystems::Finish),
       );
     }
     if std::env::var("GATE_QUEUE_PROBE").is_ok_and(|v| !v.is_empty() && v != "0") {
@@ -441,20 +441,34 @@ fn init_gpu_profiler(
   let backend = adapter.get_info().backend;
   let settings =
     wgpu_profiler::GpuProfilerSettings { enable_debug_groups: false, ..Default::default() };
-  match wgpu_profiler::GpuProfiler::new_with_tracy_client(
-    settings,
-    backend,
-    device.wgpu_device(),
-    &queue,
-  ) {
+  let created = if tracy_zones() {
+    wgpu_profiler::GpuProfiler::new_with_tracy_client(
+      settings,
+      backend,
+      device.wgpu_device(),
+      &queue,
+    )
+  } else {
+    wgpu_profiler::GpuProfiler::new(device.wgpu_device(), settings)
+  };
+  match created {
     Ok(profiler) => {
-      bevy::log::info!("wgpu-profiler 就绪：GPU zone 直送 Tracy（backend={backend:?}）");
+      bevy::log::info!(
+        "wgpu-profiler 就绪：GPU zone {}（backend={backend:?}）",
+        if tracy_zones() { "直送 Tracy" } else { "仅日志（GATE_TRACY=0）" }
+      );
       res.profiler = Some(profiler);
     }
     Err(e) => {
       bevy::log::warn!("wgpu-profiler 初始化失败（{e:?}）；GPU scope 空转");
     }
   }
+}
+
+#[cfg(feature = "profile")]
+pub fn tracy_zones() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| std::env::var("GATE_TRACY").map_or(true, |v| v != "0"))
 }
 
 #[cfg(feature = "profile")]
@@ -496,36 +510,24 @@ struct DiagReadback {
 }
 
 #[derive(Resource, Default)]
-struct GiFlickerProbe {
+struct GiStatsProbe {
   staging: Option<Buffer>,
-  prev: Vec<(f32, f32)>,
-  prev_vis: Vec<f32>,
   pending: Option<DiagReadback>,
-  n: usize,
+  frames: u32,
+  last: Option<std::time::Instant>,
 }
 
-fn report_gi_flicker(
+fn report_gi_stats(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,
-  aux: Option<Res<crate::brickmap::dda::AuxTexCache>>,
   gi: Option<Res<crate::gi::GiGpu>>,
-  mut probe: ResMut<GiFlickerProbe>,
+  mut probe: ResMut<GiStatsProbe>,
 ) {
-  let (Some(aux), Some(gi)) = (aux, gi) else { return };
-  let Some((a, b)) = aux.gi_res_buffers() else { return };
-
-  let written = if gi.res_flip { a } else { b };
-  let words = crate::wesl_consts::gi_consts().gi_res_words as usize;
-  let n_texels = (written.size() / 4) as usize / words.max(1);
-  if n_texels == 0 {
-    return;
-  }
-  let bytes = (n_texels * words * 4) as u64;
-
-  let vis = aux.gi_hist_current();
-  let vis_words = crate::wesl_consts::gi_consts().gi_den_hist_words as usize;
-  let vis_bytes = vis.map(|v| v.size()).unwrap_or(0);
-  let vis_px = vis.map(|v| (v.size() / 4) as usize / vis_words.max(1)).unwrap_or(0);
+  probe.frames = probe.frames.saturating_add(1);
+  let Some(gi) = gi else { return };
+  let Some(stats) = gi.stats_buffer() else { return };
+  let words = crate::wesl_consts::gi_consts().gi_stat_words as u64;
+  let bytes = words * 4;
 
   if probe.pending.is_some() {
     let _ = device.poll(PollType::Poll);
@@ -533,7 +535,6 @@ fn report_gi_flicker(
       let p = probe.pending.as_ref().expect("刚判过 is_some");
       (p.err.load(Ordering::Acquire), p.done.load(Ordering::Acquire))
     };
-
     if !ready && !failed {
       return;
     }
@@ -541,82 +542,25 @@ fn report_gi_flicker(
     if ready && !failed {
       let slice = p.staging.slice(..);
       if let Ok(view) = slice.get_mapped_range() {
-        let mut cur: Vec<(f32, f32)> = Vec::with_capacity(n_texels);
-        for t in 0..n_texels {
-          let b0 = t * words * 4;
-          let f = |k: usize| {
-            let o = b0 + k * 4;
-            f32::from_bits(u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]))
-          };
-          let m = f(7);
-          let est = if m > 0.5 { (f(4) + f(5) + f(6)) / (3.0 * m) } else { 0.0 };
-          cur.push((est, m));
-        }
-
-        let vis_base = bytes as usize;
-        let mut cur_vis: Vec<f32> = Vec::with_capacity(vis_px);
-        for t in 0..vis_px {
-          let b0 = vis_base + t * vis_words * 4;
-          if b0 + 12 > view.len() {
-            break;
-          }
-          let f = |k: usize| {
-            let o = b0 + k * 4;
-            f32::from_bits(u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]]))
-          };
-          cur_vis.push((f(0) + f(1) + f(2)) / 3.0);
-        }
-        if probe.prev.len() == cur.len() {
-          let mut sum = 0.0f32;
-          let mut cnt = 0u32;
-          let mut sum_m = 0.0f32;
-          let mut low_m = 0u32;
-          let mut worst = 0.0f32;
-          for (i, (e, m)) in cur.iter().enumerate() {
-            sum_m += *m;
-            if *m < 32.0 {
-              low_m += 1;
-            }
-            let d = (e - probe.prev[i].0).abs();
-            sum += d;
-            cnt += 1;
-            if d > worst {
-              worst = d;
-            }
-          }
-          let n = cnt.max(1);
-
-          let mut vsum = 0.0f32;
-          let mut vmax = 0.0f32;
-          let mut vn = 0u32;
-          let mut vmean = 0.0f32;
-          if probe.prev_vis.len() == cur_vis.len() && !cur_vis.is_empty() {
-            for (i, v) in cur_vis.iter().enumerate() {
-              let d = (v - probe.prev_vis[i]).abs();
-              vsum += d;
-              vmean += *v;
-              vn += 1;
-              if d > vmax {
-                vmax = d;
-              }
-            }
-          }
-          let vmean = vmean / vn.max(1) as f32;
-          info!(
-            "GIPROBE[样本均值 {:.1}（m<32 占比 {:.2}%）| 原始 |Δest| 均值 {:.5} 最大 {:.4} | \
-             可见GI 均值 {:.5} |Δ| 均值 {:.5}（相对 {:.3}%）最大 {:.4}]",
-            sum_m / n as f32,
-            low_m as f32 * 100.0 / n as f32,
-            sum / n as f32,
-            worst,
-            vmean,
-            vsum / vn.max(1) as f32,
-            vsum / vn.max(1) as f32 * 100.0 / vmean.abs().max(1e-6),
-            vmax
-          );
-        }
-        probe.prev = cur;
-        probe.prev_vis = cur_vis;
+        let w = |i: usize| {
+          let o = i * 4;
+          u32::from_le_bytes([view[o], view[o + 1], view[o + 2], view[o + 3]])
+        };
+        let slots = gi.slots() as f32;
+        info!(
+          "GISTAT[缓存 活 {:.0}/{}（{:.0}% 占用）回收 {:.0} 写满丢弃 {:.0} | \
+           光源瓦片 活 {:.0} 链接 {:.0} 丢弃 {:.0} | GI 射线 {:.0}/帧 NEE {:.0}/帧]",
+          w(0) as f32,
+          gi.slots(),
+          w(0) as f32 * 100.0 / slots.max(1.0),
+          w(1) as f32,
+          w(2) as f32,
+          w(3) as f32,
+          w(4) as f32,
+          w(5) as f32,
+          w(6) as f32,
+          w(7) as f32,
+        );
       }
     }
     p.staging.unmap();
@@ -624,17 +568,22 @@ fn report_gi_flicker(
   if probe.pending.is_some() {
     return;
   }
-  probe.n += 1;
-  if !probe.n.is_multiple_of(3) {
+  let now = std::time::Instant::now();
+  let due = probe
+    .last
+    .is_none_or(|t| now.duration_since(t).as_secs_f32() >= crate::consts::REPORT_PERIOD_SECS);
+  if !due {
     return;
   }
+  probe.last = Some(now);
+  probe.frames = 0;
 
   let staging = match probe.staging.as_ref() {
-    Some(s) if s.size() >= bytes + vis_bytes => s.clone(),
+    Some(s) if s.size() >= bytes => s.clone(),
     _ => {
       let s = device.create_buffer(&BufferDescriptor {
-        label: Some("gate_gi_flicker_staging"),
-        size: bytes + vis_bytes,
+        label: Some("gate_gi_stats_staging"),
+        size: bytes,
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
       });
@@ -644,12 +593,9 @@ fn report_gi_flicker(
   };
   let mut enc =
     device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
-      label: Some("gate_gi_flicker_readback"),
+      label: Some("gate_gi_stats_readback"),
     });
-  enc.copy_buffer_to_buffer(written, 0, &staging, 0, bytes);
-  if let Some(v) = vis {
-    enc.copy_buffer_to_buffer(v, 0, &staging, bytes, vis_bytes);
-  }
+  enc.copy_buffer_to_buffer(stats, 0, &staging, 0, bytes);
   queue.submit([enc.finish()]);
   let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
   let err = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -662,7 +608,6 @@ fn report_gi_flicker(
   });
   probe.pending = Some(DiagReadback { staging, done, err });
 }
-
 fn report_lod_diag(
   device: Res<RenderDevice>,
   queue: Res<RenderQueue>,

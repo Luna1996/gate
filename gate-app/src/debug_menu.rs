@@ -324,52 +324,21 @@ fn register_callbacks(world: &mut World) {
           gi.gi_div = gate_render::gi::GiSettings::DIV_CHOICES[(*i).min(3)];
           info!("GI 分辨率 → 1/{}", gi.gi_div);
         }
-        ("render/gi/denoise", MenuAction::Select(i)) => {
-          let c = gate_render::wesl_consts::gi_consts();
-          let t = (*i).min((gate_render::gi::GiSettings::DENOISE_TIERS - 1) as usize) as u32;
-          gi.denoise = t;
-          let (name, cand, k, r) = match t {
-            0 => ("关", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r_fast),
-            1 => ("低", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r_fast),
-            2 => ("中", c.gi_ss_cand_n, c.gi_ss_m_cap_k, c.gi_den_atrous_r),
-            _ => ("高", c.gi_ss_cand_n_hq, c.gi_ss_m_cap_k_hq, c.gi_den_atrous_r),
-          };
-          info!("GI 降噪质量 → {name} cand={cand} win={k} atrous_r={r}");
+        ("render/gi/cell", MenuAction::Select(i)) => {
+          gi.cell_px = gate_render::gi::GiSettings::CELL_CHOICES[(*i).min(3)];
+          info!("GI 单元 → {:.0} px", gi.cell_px);
         }
-        ("render/gi/sun_bounce", MenuAction::Toggle(on)) => {
-          gi.sun_bounce = *on;
-          info!("GI 二次顶点太阳反弹 → {}", if *on { "on" } else { "off" });
+        ("render/gi/gain", MenuAction::Select(i)) => {
+          gi.emit_gain = gate_render::gi::GiSettings::GAIN_CHOICES[(*i).min(4)];
+          info!("GI 自发光增益 → {:.0}", gi.emit_gain);
+        }
+        ("render/gi/nee", MenuAction::Toggle(on)) => {
+          gi.nee = *on;
+          info!("GI 自发光光源采样（NEE）→ {}", if *on { "on" } else { "off" });
         }
         ("render/gi/wal", MenuAction::Toggle(on)) => {
           gi.wal = *on;
-          info!("GI 世界累积（WAL）→ {}", if *on { "on" } else { "off" });
-        }
-        ("render/gi/depth", MenuAction::Select(i)) => {
-          let t = (*i).min((gate_render::gi::GiSettings::BOUNCE2_TIERS - 1) as usize) as u32;
-          gi.depth = t;
-          let (name, mult) = match t {
-            0 => ("关", 0.0),
-            1 => ("稀疏", 4.0),
-            _ => ("全", 1.0),
-          };
-          info!("GI 二次弹射 → {name} mult={mult}");
-        }
-        ("render/gi/interval", MenuAction::Select(i)) => {
-          gi.share = gate_render::gi::GiSettings::SHARE_CHOICES[(*i).min(4)];
-          let c = gate_render::wesl_consts::gi_consts();
-          let base = if gi.tier() >= 3 { c.gi_ss_cand_n_hq } else { c.gi_ss_cand_n };
-          info!("GI 分帧 → ÷{}（基准候选 {} ⇒ 每帧 {}）", gi.share, base, (base / gi.share).max(1));
-        }
-        ("render/gi/realloc", MenuAction::Select(i)) => {
-          let t = (*i).min((gate_render::gi::GiSettings::REALLOC_TIERS - 1) as usize) as u32;
-          gi.realloc = t;
-          let (name, lo, hi) = match t {
-            0 => ("关", 1.0, 1.0),
-            1 => ("弱", 0.70, 1.40),
-            2 => ("中", 0.50, 2.00),
-            _ => ("强", 0.25, 4.00),
-          };
-          info!("GI 重分配 → {name} 窗已满×{lo} 窗未满×{hi}");
+          info!("GI 次级采样 → {}", if *on { "强制刷新" } else { "自适应" });
         }
         ("render/ray/tier", MenuAction::Select(i)) => {
           let t = (*i).min((gate_render::ReflectionSettings::TIERS - 1) as usize) as u32;

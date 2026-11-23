@@ -9,18 +9,10 @@ const ENTRY_POINTS: &[&str] = &[
   "dda_glass",
   "dda_refl",
   "dda_refl_compose",
-  "dda_face_accum",
-  "dda_face_main",
   "beam_main",
-  "gi_main",
-  "gi_wal_update",
-  "gi_face_flatten",
-  "gi_denoise_temporal",
-  "gi_denoise_atrous1",
-  "gi_denoise_atrous2",
-  "gi_denoise_atrous4",
-  "gi_denoise_atrous8",
-  "gi_denoise_atrous16",
+  "gi_light_sweep",
+  "gi_gather",
+  "gi_resolve",
   "godray_main",
   "godray_blur_a",
   "godray_blur_b",
@@ -69,7 +61,7 @@ fn validate(src: &str) {
     naga::valid::Capabilities::all(),
   )
   .validate(&module)
-  .unwrap_or_else(|e| panic!("WESL→WGSL 校验失败: {e}"));
+  .unwrap_or_else(|e| panic!("WESL→WGSL 校验失败:\n{}", e.emit_to_string(src)));
 
   for name in ENTRY_POINTS {
     assert!(module.entry_points.iter().any(|e| e.name == *name), "WESL 产物缺少入口 {name}");

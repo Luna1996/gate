@@ -4,6 +4,9 @@
 @group(7) @binding(11) var<storage, read_write> refl_meta: array<atomic<u32>>;
 @group(7) @binding(12) var<uniform> refl_cfg: vec4<u32>;
 
+@group(7) @binding(0) var out_tex_src: texture_2d<f32>;
+@group(7) @binding(1) var<storage, read_write> eye_adapt: array<atomic<u32>>;
+
 @group(7) @binding(20) var out_tex: texture_storage_2d<rgba8unorm, write>;
 @group(7) @binding(21) var out_base_tex: texture_2d<f32>;
 @group(7) @binding(22) var<storage, read_write> refl_sum: array<atomic<u32>>;
@@ -149,13 +152,8 @@ struct GiUniform {
   flags: vec4<f32>,
 
   seq: vec4<u32>,
-
-  prev_view_proj: mat4x4<f32>,
 };
 @group(4) @binding(0) var<uniform> gi_u: GiUniform;
-
-@group(4) @binding(20) var<storage, read_write> gi_res_cur: array<u32>;
-@group(4) @binding(21) var<storage, read_write> gi_res_prev: array<u32>;
 
 struct FogUniform {
   params: vec4<f32>,
@@ -178,47 +176,16 @@ struct FogUniform {
 @group(0) @binding(23) var fog_a_w_blur: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(25) var fog_b_w_blur: texture_storage_2d<rgba16float, write>;
 
-@group(5) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
-
-@group(5) @binding(4) var gi_tex: texture_2d<f32>;
-
-@group(5) @binding(6) var<storage, read_write> gi_guide_out: array<u32>;
-
-@group(5) @binding(8) var<storage, read_write> face_slots: array<atomic<u32>>;
-
-@group(5) @binding(9) var<storage, read_write> gi_sec_slots: array<atomic<u32>>;
-
-@group(5) @binding(10) var<storage, read> gi_region_rev: array<u32>;
-
-@group(5) @binding(11) var<storage, read_write> gi_wal: array<atomic<u32>>;
-
-@group(5) @binding(12) var<storage, read> gi_edit_boxes: array<u32>;
+@group(5) @binding(0) var<storage, read_write> irc: array<atomic<u32>>;
+@group(5) @binding(1) var<storage, read_write> irc_key: array<atomic<u32>>;
+@group(5) @binding(2) var<storage, read_write> lt_tile: array<atomic<u32>>;
+@group(5) @binding(3) var<storage, read_write> lt_tile_key: array<atomic<u32>>;
+@group(5) @binding(4) var<storage, read_write> lt_node: array<atomic<u32>>;
+@group(5) @binding(5) var<storage, read_write> lt_node_key: array<atomic<u32>>;
+@group(5) @binding(6) var<storage, read_write> gi_stats: array<atomic<u32>>;
 
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;
-
-@group(0) @binding(10) var<storage, read> gi_guide: array<u32>;
-
-@group(0) @binding(11) var gi_raw_tex: texture_2d<f32>;
-
-@group(0) @binding(12) var<storage, read> gi_hist_prev: array<u32>;
-@group(0) @binding(13) var<storage, read_write> gi_hist_cur: array<u32>;
-
-@group(0) @binding(14) var gi_dn_src: texture_2d<f32>;
-@group(0) @binding(15) var gi_dn_dst: texture_storage_2d<rgba16float, write>;
-
-@group(0) @binding(16) var gi_dn_tmp: texture_storage_2d<rgba16float, write>;
-
-@group(0) @binding(17) var<storage, read_write> gi_den_phi: array<f32>;
-
-@group(0) @binding(20) var<storage, read> gi_den_cfg: array<u32>;
-
-@group(0) @binding(18) var<storage, read_write> face_slots_flat: array<atomic<u32>>;
-@group(0) @binding(19) var gi_out_flat: texture_storage_2d<rgba16float, write>;
-
-@group(7) @binding(0) var out_tex_src: texture_2d<f32>;
-
-@group(7) @binding(1) var<storage, read_write> eye_adapt: array<atomic<u32>>;
 
 @group(0) @binding(30) var dda_vis: texture_storage_2d<rgba32uint, read_write>;
 @group(0) @binding(31) var dda_nrm: texture_storage_2d<rgba16float, read_write>;

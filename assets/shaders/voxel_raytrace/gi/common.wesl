@@ -1,6 +1,4 @@
-import package::bindings::{face_slots, face_slots_flat, gi_edit_boxes, gi_region_rev, gi_sec_slots, gi_u, obj_pose_rev};
-
-import package::bindings::{grid_descs};
+import package::bindings::{gi_u, grid_descs, obj_pose_rev};
 import package::common::{CHUNK_SIZE};
 
 const GI_KEY_LIMIT: i32 = 32768;
@@ -47,20 +45,6 @@ fn gi_unkey_voxel(k0: u32, k1: u32, obj: i32) -> vec3<i32> {
                    i32((k1 & 0xFFFFu) ^ s) - 32768) + gi_key_org(obj);
 }
 
-const GI_REGION_CHUNKS: u32 = 8u;
-const GI_REGION_TABLE: u32 = 16u;
-
-fn gi_local_rev(v_world: vec3<i32>, obj: i32) -> u32 {
-  if (obj != -1) { return 0u; }
-  if (arrayLength(&gi_region_rev) < GI_REGION_TABLE * GI_REGION_TABLE * GI_REGION_TABLE) {
-    return 0u;
-  }
-  let rel = max(v_world - gi_key_org(obj), vec3<i32>(0));
-  let chunk = vec3<u32>(rel) / vec3<u32>(CHUNK_SIZE);
-  let cell = min(chunk / vec3<u32>(GI_REGION_CHUNKS), vec3<u32>(GI_REGION_TABLE - 1u));
-  return gi_region_rev[cell.x + GI_REGION_TABLE * (cell.y + GI_REGION_TABLE * cell.z)];
-}
-
 fn gi_mix(x: u32) -> u32 {
   var h = x * 747796405u + 2891336453u;
   h = ((h >> ((h >> 28u) + 4u)) + h) * 277803737u;
@@ -73,44 +57,6 @@ fn gi_rand2(seed: u32) -> vec2<f32> {
   return vec2<f32>(f32(a), f32(b)) * (1.0 / 4294967296.0);
 }
 
-fn gi_pack_dir(n: vec3<f32>) -> u32 {
-  let l = abs(n.x) + abs(n.y) + abs(n.z);
-  var o = n.xy / max(l, 1e-6);
-  if (n.z < 0.0) {
-    o = (vec2<f32>(1.0) - abs(o.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), o >= vec2<f32>(0.0));
-  }
-  return pack2x16float(o);
-}
-
-const GI_EDIT_BOX_REACH: f32 = 384.0;
-
-fn gi_in_edit_box(p_world: vec3<f32>) -> bool {
-  let n = min(gi_edit_boxes[0], 8u);
-  for (var i = 0u; i < n; i = i + 1u) {
-    let b = 1u + i * 6u;
-    let lo = vec3<f32>(f32(bitcast<i32>(gi_edit_boxes[b])), f32(bitcast<i32>(gi_edit_boxes[b + 1u])), f32(bitcast<i32>(gi_edit_boxes[b + 2u])));
-    let hi = vec3<f32>(f32(bitcast<i32>(gi_edit_boxes[b + 3u])), f32(bitcast<i32>(gi_edit_boxes[b + 4u])), f32(bitcast<i32>(gi_edit_boxes[b + 5u])));
-    if (all(p_world >= lo - vec3<f32>(GI_EDIT_BOX_REACH)) &&
-        all(p_world <= hi + vec3<f32>(GI_EDIT_BOX_REACH))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-fn gi_unpack_dir(p: u32) -> vec3<f32> {
-  let o = unpack2x16float(p);
-  var n = vec3<f32>(o.x, o.y, 1.0 - abs(o.x) - abs(o.y));
-  if (n.z < 0.0) {
-    n = vec3<f32>(
-      (1.0 - abs(n.y)) * select(-1.0, 1.0, n.x >= 0.0),
-      (1.0 - abs(n.x)) * select(-1.0, 1.0, n.y >= 0.0),
-      n.z,
-    );
-  }
-  return normalize(n);
-}
-
 fn gi_cos_hemisphere(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
   let r = sqrt(u.x);
   let phi = 6.2831853 * u.y;
@@ -120,257 +66,31 @@ fn gi_cos_hemisphere(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
   return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u.x, 0.0)));
 }
 
-const FACE_WORDS: u32 = 16u;
-const FACE_W_FLAG: u32 = 0u;
-const FACE_W_K0: u32 = 1u;
-const FACE_W_K1: u32 = 2u;
-const FACE_W_TEXEL: u32 = 3u;
-const FACE_W_PAL: u32 = 4u;
-const FACE_W_GI_N: u32 = 8u;
-const FACE_W_GI: u32 = 9u;
-const FACE_W_RAW_N: u32 = 12u;
-const FACE_W_RAW: u32 = 13u;
-
-const GI_ACC_SCALE: f32 = 4096.0;
-const GI_ACC_CLAMP: f32 = 255.0;
-const GI_ACC_MAX_N: u32 = 1024u;
-
-const FACE_KMASK_NOFACE: u32 = 0xFFF8FFFFu;
-const FACE_K_VOX_CACHE: u32 = 0x00070000u;
-const FACE_SLOT_PROBE: u32 = 32u;
-const FACE_SLOT_NONE: u32 = 0xFFFFFFFFu;
-const FACE_SLOT_EMPTY: u32 = 0u;
-const FACE_SLOT_READY: u32 = 1u;
-const FACE_SLOT_INIT: u32 = 2u;
-const FACE_SLOT_CLAIMED: u32 = 3u;
-const FACE_SLOT_SPIN: u32 = 8u;
-const FACE_FRAME_SHIFT: u32 = 8u;
-const FACE_FRAME_MASK: u32 = 0x00FFFFFFu;
-const FACE_STATE_MASK: u32 = 0xFFu;
-
-fn gi_vox_k1(k1: u32) -> u32 {
-  return k1 & FACE_KMASK_NOFACE;
+fn gi_enabled() -> bool {
+  return gi_u.misc.x > 0.5;
 }
 
-fn gi_vox_cache_k1(k1: u32) -> u32 {
-  return gi_vox_k1(k1) | FACE_K_VOX_CACHE;
+fn gi_emit_gain() -> f32 {
+  return gi_u.params.x;
 }
 
-fn face_slot_ready(flag: u32) -> bool {
-  let state = face_slot_state(flag);
-  return state == FACE_SLOT_READY || state == FACE_SLOT_CLAIMED;
+fn gi_div() -> u32 {
+  return max(u32(gi_u.flags.y), 1u);
 }
 
-fn face_frame() -> u32 {
-  return gi_u.seq.x & FACE_FRAME_MASK;
-}
-
-fn face_slot_state(flag: u32) -> u32 {
-  if ((flag >> FACE_FRAME_SHIFT) != face_frame()) { return FACE_SLOT_EMPTY; }
-  return flag & FACE_STATE_MASK;
-}
-
-fn face_slot_flag(state: u32) -> u32 {
-  return (face_frame() << FACE_FRAME_SHIFT) | state;
-}
-
-fn face_slot_flag_next(state: u32) -> u32 {
-  return (((face_frame() + 1u) & FACE_FRAME_MASK) << FACE_FRAME_SHIFT) | state;
-}
-
-fn face_slot_count() -> u32 {
-  return arrayLength(&face_slots) / FACE_WORDS;
-}
-
-fn face_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
-  let n = face_slot_count();
-  *ok = n >= 1u;
-  if (!*ok) { return 0u; }
-  return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
-}
-
-fn face_slot_next(base: u32) -> u32 {
-  return (base + 1u) & (face_slot_count() - 1u);
-}
-
-fn face_slot_matches(slot: u32, k0: u32, k1: u32) -> bool {
-  let fe = slot * FACE_WORDS;
-  let flag = atomicLoad(&face_slots[fe + FACE_W_FLAG]);
-  if (!face_slot_ready(flag)) { return false; }
-  let s0 = atomicLoad(&face_slots[fe + FACE_W_K0]);
-  let s1 = atomicLoad(&face_slots[fe + FACE_W_K1]);
-  return s0 == k0 && s1 == k1;
-}
-
-fn face_slot_claim(k0: u32, k1: u32, first: ptr<function, bool>, ok: ptr<function, bool>) -> u32 {
-  var table_ok = false;
-  var s = face_slot_of(k0, k1, &table_ok);
-  *ok = false;
-  *first = false;
-  if (!table_ok) { return 0u; }
-  for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
-    let fe = s * FACE_WORDS;
-    let flag = atomicLoad(&face_slots[fe + FACE_W_FLAG]);
-    let state = face_slot_state(flag);
-    if (face_slot_ready(flag)) {
-      if (atomicLoad(&face_slots[fe + FACE_W_K0]) == k0
-          && atomicLoad(&face_slots[fe + FACE_W_K1]) == k1) {
-        *ok = true;
-        if (state == FACE_SLOT_READY) {
-          *first = atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG],
-                                             flag, face_slot_flag(FACE_SLOT_CLAIMED)).exchanged;
-        }
-        return s;
-      }
-    } else if (state == FACE_SLOT_EMPTY) {
-      let init = face_slot_flag(FACE_SLOT_INIT);
-      if (atomicCompareExchangeWeak(&face_slots[fe + FACE_W_FLAG], flag, init).exchanged) {
-        for (var j: u32 = 1u; j < FACE_WORDS; j = j + 1u) {
-          atomicStore(&face_slots[fe + j], 0u);
-        }
-        atomicStore(&face_slots[fe + FACE_W_K0], k0);
-        atomicStore(&face_slots[fe + FACE_W_K1], k1);
-        atomicStore(&face_slots[fe + FACE_W_FLAG], face_slot_flag(FACE_SLOT_CLAIMED));
-        *ok = true;
-        *first = true;
-        return s;
-      }
-    }
-    for (var spin = 0u; spin < FACE_SLOT_SPIN; spin = spin + 1u) {
-      if (face_slot_state(atomicLoad(&face_slots[fe + FACE_W_FLAG])) != FACE_SLOT_INIT) { break; }
-    }
-    if (face_slot_matches(s, k0, k1)) {
-      *ok = true;
-      return s;
-    }
-    s = face_slot_next(s);
+fn gi_jitter(frame: u32, d: u32) -> vec2<u32> {
+  if (d <= 1u) { return vec2<u32>(0u); }
+  let bits = 2u * firstTrailingBit(d);
+  let i = reverseBits(frame % (d * d)) >> (32u - bits);
+  var j = vec2<u32>(0u);
+  for (var b = 0u; b < 4u; b = b + 1u) {
+    j.x = j.x | (((i >> (2u * b)) & 1u) << b);
+    j.y = j.y | (((i >> (2u * b + 1u)) & 1u) << b);
   }
-  return 0u;
+  return j & vec2<u32>(d - 1u);
 }
 
-fn face_slot_find(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
-  var table_ok = false;
-  var s = face_slot_of(k0, k1, &table_ok);
-  *ok = false;
-  if (!table_ok) { return 0u; }
-  for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
-    let flag = atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]);
-    let state = face_slot_state(flag);
-    if (state == FACE_SLOT_EMPTY) { break; }
-    if (face_slot_matches(s, k0, k1)) {
-      *ok = true;
-      return s;
-    }
-    if (state == FACE_SLOT_INIT) {
-      for (var spin = 0u; spin < FACE_SLOT_SPIN; spin = spin + 1u) {
-        if (face_slot_state(atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG])) != FACE_SLOT_INIT) {
-          break;
-        }
-      }
-      if (face_slot_matches(s, k0, k1)) {
-        *ok = true;
-        return s;
-      }
-    }
-    s = face_slot_next(s);
-  }
-  return 0u;
-}
-
-fn face_slot_sum_gi(k0: u32, k1: u32) -> vec4<u32> {
-  var table_ok = false;
-  var s = face_slot_of(k0, k1, &table_ok);
-  if (!table_ok) { return vec4<u32>(0u); }
-  var sum = vec3<u32>(0u);
-  var n = 0u;
-  for (var i = 0u; i < FACE_SLOT_PROBE; i = i + 1u) {
-    let flag = atomicLoad(&face_slots[s * FACE_WORDS + FACE_W_FLAG]);
-    if (face_slot_state(flag) == FACE_SLOT_EMPTY) { break; }
-    if (face_slot_matches(s, k0, k1)) {
-      let fe = s * FACE_WORDS;
-      sum = sum + vec3<u32>(atomicLoad(&face_slots[fe + FACE_W_GI]),
-                            atomicLoad(&face_slots[fe + FACE_W_GI + 1u]),
-                            atomicLoad(&face_slots[fe + FACE_W_GI + 2u]));
-      n = n + atomicLoad(&face_slots[fe + FACE_W_GI_N]);
-    }
-    s = face_slot_next(s);
-  }
-  return vec4<u32>(sum, n);
-}
-
-fn face_slot_count_flat() -> u32 {
-  return arrayLength(&face_slots_flat) / FACE_WORDS;
-}
-
-fn face_slot_next_flat(base: u32) -> u32 {
-  return (base + 1u) & (face_slot_count_flat() - 1u);
-}
-
-fn face_slot_matches_flat(slot: u32, k0: u32, k1: u32) -> bool {
-  let fe = slot * FACE_WORDS;
-  let flag = atomicLoad(&face_slots_flat[fe + FACE_W_FLAG]);
-  if (!face_slot_ready(flag)) { return false; }
-  let s0 = atomicLoad(&face_slots_flat[fe + FACE_W_K0]);
-  let s1 = atomicLoad(&face_slots_flat[fe + FACE_W_K1]);
-  return s0 == k0 && s1 == k1;
-}
-
-fn face_slot_find_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
-  var table_ok = false;
-  let base = face_slot_of_flat(k0, k1, &table_ok);
-  *ok = false;
-  if (!table_ok) { return 0u; }
-  if (face_slot_matches_flat(base, k0, k1)) {
-    *ok = true;
-    return base;
-  }
-  let second = face_slot_next_flat(base);
-  if (face_slot_matches_flat(second, k0, k1)) {
-    *ok = true;
-    return second;
-  }
-  return 0u;
-}
-
-const GI_SEC_WORDS: u32 = 5u;
-const GI_SEC_W_K0: u32 = 0u;
-const GI_SEC_W_K1: u32 = 1u;
-const GI_SEC_W_RAD: u32 = 2u;
-
-fn face_slot_of_flat(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
-  let n = arrayLength(&face_slots_flat) / FACE_WORDS;
-  *ok = n >= 1u;
-  if (!*ok) { return 0u; }
-  return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
-}
-
-fn gi_sec_slot_of(k0: u32, k1: u32, ok: ptr<function, bool>) -> u32 {
-  let n = arrayLength(&gi_sec_slots) / GI_SEC_WORDS;
-  *ok = n >= 1u;
-  if (!*ok) { return 0u; }
-  return gi_mix(k0 + gi_mix(k1 * 0x9E3779B1u)) & (n - 1u);
-}
-
-fn gi_sec_key_masked(k0: u32, k1: u32, epoch: u32, pal: u32, rev: u32) -> vec2<u32> {
-  return vec2<u32>(
-    k0 + gi_mix(epoch * 0x9E3779B1u + rev * 0x85EBCA77u + 0x165667B1u),
-    k1 + gi_mix(gi_mix(epoch + 0x85EBCA77u) + rev * 0x27D4EB2Fu + 0x27D4EB2Fu
-                + pal * 0x9E3779B1u),
-  );
-}
-
-fn gi_ring_offset(s: u32) -> vec2<i32> {
-  if (s == 0u) { return vec2<i32>(1, 0); }
-  if (s == 1u) { return vec2<i32>(-1, 0); }
-  if (s == 2u) { return vec2<i32>(0, 1); }
-  if (s == 3u) { return vec2<i32>(0, -1); }
-  if (s == 4u) { return vec2<i32>(1, 1); }
-  if (s == 5u) { return vec2<i32>(1, -1); }
-  if (s == 6u) { return vec2<i32>(-1, 1); }
-  return vec2<i32>(-1, -1);
-}
-
-fn gi_hist_search_offset(s: u32) -> vec2<i32> {
-  if (s == 0u) { return vec2<i32>(0, 0); }
-  return gi_ring_offset(s - 1u);
+fn gi_record_pixel(texel: vec2<u32>) -> vec2<u32> {
+  let d = gi_div();
+  return texel * d + gi_jitter(gi_u.seq.x, d);
 }

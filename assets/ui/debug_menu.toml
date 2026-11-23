@@ -92,32 +92,6 @@ label = "menu.render.gi.enabled"
 checked = true
 
 [[items.children.children]]
-kind = "toggle"
-id = "sun_bounce"
-label = "menu.render.gi.sun_bounce"
-checked = false
-tooltip = "menu.render.gi.sun_bounce.tip"
-
-[[items.children.children]]
-kind = "toggle"
-id = "wal"
-label = "menu.render.gi.wal"
-checked = false
-tooltip = "menu.render.gi.wal.tip"
-
-[[items.children.children]]
-kind = "switch_group"
-id = "depth"
-label = "menu.render.gi.depth"
-options = [
-    "menu.render.gi.depth.off",
-    "menu.render.gi.depth.sparse",
-    "menu.render.gi.depth.full",
-]
-selected = 0
-tooltip = "menu.render.gi.depth.tip"
-
-[[items.children.children]]
 kind = "switch_group"
 id = "res"
 label = "menu.render.gi.res"
@@ -127,48 +101,49 @@ options = [
     "menu.render.gi.res.quarter",
     "menu.render.gi.res.eighth",
 ]
-selected = 1
+selected = 2
 tooltip = "menu.render.gi.res.tip"
 
 [[items.children.children]]
 kind = "switch_group"
-id = "interval"
-label = "menu.render.gi.interval"
+id = "cell"
+label = "menu.render.gi.cell"
 options = [
-    "menu.render.gi.interval.1",
-    "menu.render.gi.interval.2",
-    "menu.render.gi.interval.4",
-    "menu.render.gi.interval.8",
-    "menu.render.gi.interval.16",
-]
-selected = 3
-tooltip = "menu.render.gi.interval.tip"
-
-[[items.children.children]]
-kind = "switch_group"
-id = "denoise"
-label = "menu.render.gi.denoise"
-options = [
-    "menu.render.gi.denoise.off",
-    "menu.render.gi.denoise.low",
-    "menu.render.gi.denoise.mid",
-    "menu.render.gi.denoise.high",
+    "menu.render.gi.cell.1",
+    "menu.render.gi.cell.2",
+    "menu.render.gi.cell.4",
+    "menu.render.gi.cell.8",
 ]
 selected = 1
-tooltip = "menu.render.gi.denoise.tip"
+tooltip = "menu.render.gi.cell.tip"
 
 [[items.children.children]]
 kind = "switch_group"
-id = "realloc"
-label = "menu.render.gi.realloc"
+id = "gain"
+label = "menu.render.gi.gain"
 options = [
-    "menu.render.gi.realloc.off",
-    "menu.render.gi.realloc.mild",
-    "menu.render.gi.realloc.mid",
-    "menu.render.gi.realloc.strong",
+    "menu.render.gi.gain.0",
+    "menu.render.gi.gain.2",
+    "menu.render.gi.gain.4",
+    "menu.render.gi.gain.8",
+    "menu.render.gi.gain.16",
 ]
-selected = 0
-tooltip = "menu.render.gi.realloc.tip"
+selected = 3
+tooltip = "menu.render.gi.gain.tip"
+
+[[items.children.children]]
+kind = "toggle"
+id = "nee"
+label = "menu.render.gi.nee"
+checked = true
+tooltip = "menu.render.gi.nee.tip"
+
+[[items.children.children]]
+kind = "toggle"
+id = "wal"
+label = "menu.render.gi.wal"
+checked = false
+tooltip = "menu.render.gi.wal.tip"
 
 [[items.children]]
 kind = "sub_menu"

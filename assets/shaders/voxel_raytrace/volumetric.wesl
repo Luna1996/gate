@@ -31,17 +31,21 @@ fn sky_stars(dir: vec3<f32>, night: f32) -> vec3<f32> {
   return tint * core * bright * 0.22;
 }
 
-fn sky_base(dir: vec3<f32>) -> vec3<f32> {
+fn sky_ambient(dir: vec3<f32>) -> vec3<f32> {
   let c = sky_rgb();
   let luma = sky_luma(c);
   let day = smoothstep(0.0025, 0.12, luma);
-  let night = 1.0 - smoothstep(0.0015, 0.012, luma);
   let dusk = smoothstep(0.002, 0.02, luma) * (1.0 - smoothstep(0.05, 0.15, luma));
   let warm = vec3<f32>(1.0, 0.97, 0.92);
   let dusk_col = vec3<f32>(0.35, 0.12, 0.05);
   let hor = mix(mix(c * 1.08, dusk_col, 0.22 * dusk), warm, 0.26 * day * day);
   let zen = mix(c * 0.72, c * vec3<f32>(0.68, 0.76, 0.92), day);
-  return mix(hor, zen, smoothstep(-0.03, 0.55, dir.y)) + sky_stars(dir, night);
+  return mix(hor, zen, smoothstep(-0.03, 0.55, dir.y));
+}
+
+fn sky_base(dir: vec3<f32>) -> vec3<f32> {
+  let night = 1.0 - smoothstep(0.0015, 0.012, sky_luma(sky_rgb()));
+  return sky_ambient(dir) + sky_stars(dir, night);
 }
 
 fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {

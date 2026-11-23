@@ -61,8 +61,12 @@
 - 反射请求二进制布局有历史坑：两种请求都把 `kind|weight` 放在 `.w`；packed chain 的 `pal` 在 `.z`，第二行是 `(pbase, face_id, 0, px)`。改布局必须同时改读写两端。
 - 「镜面质量」档位固定为 `0=关, 1=直射, 2=天空, 3=阴影, 4=GI`。改档位时同步 `ReflectionSettings::TIERS`、shader 的 `REFL_TIER_GI`、`assets/ui/debug_menu.toml` 和 `assets/locales/zh-CN.toml`。
 - **逐体素着色 = 一个体素六个面同一个平色**（不是逐面平色）：材质与 GI 都量化到体素，同体素的任意可见面共用一个颜色；不要在着色里引入逐像素 / 逐面差异，否则画风会被打碎。
-- GI 的逐体素值必须与世界空间一致：同体素各面按着色法相余弦加权混合成单值；屏幕空间补值必须落在同一套世界空间核上，否则棱上会明暗交替、暗部出网格纹。
-- 镜面同样逐体素着色（一个体素一个反射值）：反射射线从体素中心出发，同一体素的像素共用同一方向与权重；不要引入逐像素 / 逐面差异或屏幕空间共享。镜面 GI 只对可见镜面面做定向采样；不要在镜面 GI 上重新引入屏幕空间 `gi_upsample` 兜底（会把屏幕边缘的 GI 串进镜中），也不要恢复全局 WAL 更新预算加速。
+- GI 是**世界空间辐照度缓存**（Rust：`src/gi.rs`；WESL：`assets/shaders/voxel_raytrace/gi/`）。条目按「体素坐标（世界/物体本地） × 面轴 × 屏幕足迹分级」哈希，值是 **E/π**（余弦加权平均辐亮度）；显示端每个体素按中心取一次值、同体素各面按余弦加权混合，所以画面上不会出现屏幕空间网格或重投影拖影。
+  - 采样由 1/N 分辨率的 GI 网格驱动（`gi_gather`，每 texel 一帧一个样本），`gi_resolve` 把本帧样本折进条目、与父级按置信度混合，`gi_light_sweep` 维护光源瓦片。缓存条目同时写本层与两级父层，新露出的表面立刻能取到平滑值。
+  - 改缓存布局 / 常量必须同步三处：`gi/consts.wesl`（权威字面量）、`src/wesl_consts.rs`（解析）、`src/gi.rs` 的 `gi_bg5_layout()` 与缓冲分配。
+  - 屏幕空间补值只允许出现在「缓存完全没有条目」的兜底上，且必须落在同一套世界空间核上（按同体素/同面判定），否则棱上会明暗交替。
+- 自发光是**真实光源**：`gi/light.wesl` 维护世界空间光源瓦片（发光面按 8×8 面片瓦片化）与按功率的层级树；`lt_nee` 做 NEE，命中按平衡启发式与 BRDF 采样合并，同一块发光面不会被算两次。**不要**引入「同屏最多 N 个光源」的列表或上限；容量只受 `LT_SLOTS` 约束（超出部分退化为 BRDF 命中，仍然可见）。
+- 镜面同样逐体素着色（一个体素一个反射值）：反射射线从体素中心出发，同一体素的像素共用同一方向与权重；不要引入逐像素 / 逐面差异或屏幕空间共享。镜面 GI 直接读世界缓存 `refl_hit_gi`（未成熟时按命中点补一条样本），不要再引入屏幕空间兜底（会把屏幕边缘的 GI 串进镜中）。
 
 ## 运行期数据 / 资源
 
@@ -71,7 +75,7 @@
 - 资源根目录由 `gate-render/src/paths.rs` 决定：exe 同目录有 `assets/` 就用 exe 目录，否则回退到仓库根。直接运行 `target/.../gate-app.exe` 也能找到仓库 `assets/`。
 - 默认场景名是 `nuke`，依赖 `assets/vox/nuke.vox`；该文件被 gitignore，新克隆可能没有。可在 `data/config.toml` 改 `game/world/model`，或把 `STARTUP_DEMO_SCENE` 改成 `true`。
 - MC 地图默认路径硬编码为 `C:\game\Greenfield v0.5.4\...`；用 `GATE_MC_MAP` / `GATE_MC_ASSETS` 覆盖。`data/lod/mc_map.lod` 是生成缓存。
-- 常用环境变量：`GATE_LOG`（日志过滤）、`GATE_BENCH`、`GATE_PHYS`、`GATE_PHYS_THREADS`、`GATE_GI`、`GATE_EDIT_SELFTEST`。
+- 常用环境变量：`GATE_LOG`（日志过滤）、`GATE_BENCH`、`GATE_PHYS`、`GATE_PHYS_THREADS`、`GATE_GI`、`GATE_EDIT_SELFTEST`、`GATE_TRACY`（`0` = 不建 Tracy zone，仍保留 GPU 逐 pass 均值日志）、`GATE_GI_PROBE`（每 2 s 打一条 `GISTAT`）。
 
 ## 日志规范
 

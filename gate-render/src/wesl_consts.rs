@@ -8,33 +8,25 @@ use crate::paths::dda_wesl_dir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GiConsts {
-  pub gi_res_words: u32,
-  pub gi_den_guide_words: u32,
-  pub gi_den_hist_words: u32,
-  pub gi_den_atrous_iter: u32,
-  pub gi_den_atrous_r: u32,
-  pub gi_den_atrous_r_fast: u32,
-  pub gi_ss_cand_n: u32,
-  pub gi_ss_cand_n_hq: u32,
-  pub gi_ss_m_cap_k: u32,
-  pub gi_ss_m_cap_k_hq: u32,
-  pub face_words: u32,
-  pub gi_sec_words: u32,
+  pub irc_words: u32,
+  pub lt_tile_words: u32,
+  pub lt_node_words: u32,
+  pub irc_bucket: u32,
+  pub irc_chain: u32,
+  pub lt_bucket: u32,
+  pub lt_top: u32,
+  pub gi_stat_words: u32,
 }
 
 const REQUIRED: &[&str] = &[
-  "GI_RES_WORDS",
-  "GI_DEN_GUIDE_WORDS",
-  "GI_DEN_HIST_WORDS",
-  "GI_DEN_ATROUS_ITER",
-  "GI_DEN_ATROUS_R",
-  "GI_DEN_ATROUS_R_FAST",
-  "GI_SS_CAND_N",
-  "GI_SS_CAND_N_HQ",
-  "GI_SS_M_CAP_K",
-  "GI_SS_M_CAP_K_HQ",
-  "FACE_WORDS",
-  "GI_SEC_WORDS",
+  "IRC_WORDS",
+  "LT_TILE_WORDS",
+  "LT_NODE_WORDS",
+  "IRC_BUCKET",
+  "IRC_CHAIN",
+  "LT_BUCKET",
+  "LT_TOP",
+  "GI_STAT_WORDS",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,84 +94,46 @@ impl GiConsts {
     }
     let get = |name: &str| -> u32 { values[name] };
     let out = GiConsts {
-      gi_res_words: get("GI_RES_WORDS"),
-      gi_den_guide_words: get("GI_DEN_GUIDE_WORDS"),
-      gi_den_hist_words: get("GI_DEN_HIST_WORDS"),
-      gi_den_atrous_iter: get("GI_DEN_ATROUS_ITER"),
-      gi_den_atrous_r: get("GI_DEN_ATROUS_R"),
-      gi_den_atrous_r_fast: get("GI_DEN_ATROUS_R_FAST"),
-      gi_ss_cand_n: get("GI_SS_CAND_N"),
-      gi_ss_cand_n_hq: get("GI_SS_CAND_N_HQ"),
-      gi_ss_m_cap_k: get("GI_SS_M_CAP_K"),
-      gi_ss_m_cap_k_hq: get("GI_SS_M_CAP_K_HQ"),
-      face_words: get("FACE_WORDS"),
-      gi_sec_words: get("GI_SEC_WORDS"),
+      irc_words: get("IRC_WORDS"),
+      lt_tile_words: get("LT_TILE_WORDS"),
+      lt_node_words: get("LT_NODE_WORDS"),
+      irc_bucket: get("IRC_BUCKET"),
+      irc_chain: get("IRC_CHAIN"),
+      lt_bucket: get("LT_BUCKET"),
+      lt_top: get("LT_TOP"),
+      gi_stat_words: get("GI_STAT_WORDS"),
     };
 
-    if out.gi_res_words < 8 {
+    if out.irc_words < 16 {
       let msg = format!(
-        "GI_RES_WORDS = {} 太小（reservoir = 状态位 + 面键 2 + 着色法线 + 累计量 rgb + M = 8）：{out:?}",
-        out.gi_res_words
+        "IRC_WORDS = {} 太小（键 2 + 值 + 均值 3 + n + var + stamp + 累加 5）：{out:?}",
+        out.irc_words
       );
       error!("{msg}");
       panic!("{msg}");
     }
-    if out.gi_den_guide_words < 4 || out.gi_den_hist_words < 4 {
-      let msg = format!("降噪 buffer 布局常量太小（导引 ≥ 4 字、历史 ≥ 4 字）：{out:?}");
+    if out.lt_tile_words < 12 || out.lt_node_words < 12 {
+      let msg = format!("光源瓦片/节点表字宽太小（≥ 12）：{out:?}");
       error!("{msg}");
       panic!("{msg}");
     }
-    if out.face_words < 8 {
-      let msg = format!(
-        "FACE_WORDS = {} 太小：逐面去重表每槽至少要放「标志 + 键 2 + 认领者 texel + palette + 颜色 3」= 8 字：{out:?}",
-        out.face_words
-      );
-      error!("{msg}");
-      panic!("{msg}");
-    }
-    if out.gi_sec_words < 5 {
-      let msg = format!(
-        "GI_SEC_WORDS = {} 太小：二次顶点缓存每槽至少要放「键 2 + 辐亮度 3」= 5 字：{out:?}",
-        out.gi_sec_words
-      );
-      error!("{msg}");
-      panic!("{msg}");
-    }
-    if !(1..=5).contains(&out.gi_den_atrous_iter) {
-      let msg = format!(
-        "GI_DEN_ATROUS_ITER = {} 越界：只实现了步长 1/2/4/8/16 五轮（Rust 侧的派发链表就 5 项）：{out:?}",
-        out.gi_den_atrous_iter
-      );
-      error!("{msg}");
-      panic!("{msg}");
-    }
-    if !(1..=4).contains(&out.gi_den_atrous_r) || !(1..=4).contains(&out.gi_den_atrous_r_fast) {
-      let msg =
-        format!("atrous 核半径越界（1..=4；tap 数按 (2R+1)²-1 涨，越界会造成性能悬崖）：{out:?}");
-      error!("{msg}");
-      panic!("{msg}");
-    }
-    if out.gi_ss_cand_n < 1
-      || out.gi_ss_cand_n_hq < out.gi_ss_cand_n
-      || out.gi_ss_m_cap_k < 1
-      || out.gi_ss_m_cap_k_hq < out.gi_ss_m_cap_k
-    {
-      let msg =
-        format!("「降噪质量」档的采样/记忆窗常量不自洽（高档应 ≥ 基础档、且都 ≥ 1）：{out:?}");
+    if !out.irc_bucket.is_power_of_two() || !out.lt_bucket.is_power_of_two() {
+      let msg = format!("桶宽必须是 2 的幂：{out:?}");
       error!("{msg}");
       panic!("{msg}");
     }
     info!(
       target: "gate",
-      "WESL 跨端常量（源 {}）：屏幕空间 reservoir {} word/像素；降噪：导引 {} / 历史 {} word/像素（双缓冲）、\
-       atrous {} 轮（核半径 质量档 {} / 快速档 {}）",
+      "WESL 跨端常量（源 {}）：世界空间辐照度缓存 {} word/槽 × {} 槽/桶、链 {} 级；\
+       光源瓦片 {} word / 节点 {} word、{}/桶、顶层 {}",
       dir.display(),
-      out.gi_res_words,
-      out.gi_den_guide_words,
-      out.gi_den_hist_words,
-      out.gi_den_atrous_iter,
-      out.gi_den_atrous_r,
-      out.gi_den_atrous_r_fast,
+      out.irc_words,
+      out.irc_bucket,
+      out.irc_chain,
+      out.lt_tile_words,
+      out.lt_node_words,
+      out.lt_bucket,
+      out.lt_top,
     );
     out
   }

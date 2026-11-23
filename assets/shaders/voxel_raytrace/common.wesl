@@ -210,6 +210,14 @@ fn fetch_material(palette_base: u32, pal: u32, p_world: vec3<f32>, n: vec3<f32>,
   );
 }
 
+fn material_emissive(palette_base: u32, pal: u32) -> f32 {
+  let w0 = b_palette[palette_base + pal * 2u];
+  let w1 = b_palette[palette_base + pal * 2u + 1u];
+  if (((w1 >> 16u) & FLAGS_IS_PBR) == 0u) { return f32(w1 & 0xFFu) / 255.0; }
+  let a = material_assets[min(w1 & 0xFFFFu, MATERIAL_ASSET_SLOTS - 1u)];
+  return apply_override(f32(a.emissive_metal & 0xFFu) / 255.0, override_value((w0 >> 16u) & 0xFFu));
+}
+
 fn material_ior(palette_base: u32, pal: u32) -> f32 {
   if ((palette_flags(palette_base, pal) & FLAGS_IS_PBR) == 0u) {
     return MATERIAL_DEFAULT_IOR;

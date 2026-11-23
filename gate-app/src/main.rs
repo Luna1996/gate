@@ -97,7 +97,11 @@ fn main() {
           #[cfg(feature = "profile")]
           {
             use tracing_subscriber::Layer as _;
-            Some(Box::new(crate::tracy_layer::TracyLayer.and_then(file_layer)) as BoxedLayer)
+            if gate_render::profiler::tracy_zones() {
+              Some(Box::new(crate::tracy_layer::TracyLayer.and_then(file_layer)) as BoxedLayer)
+            } else {
+              Some(Box::new(file_layer) as BoxedLayer)
+            }
           }
           #[cfg(not(feature = "profile"))]
           {
