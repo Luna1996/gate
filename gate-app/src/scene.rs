@@ -65,11 +65,11 @@ pub(crate) fn setup(
       CUBE_IN_VOID => (Vec3::new(-64.0, 164.0, 192.0), Vec3::new(32.0, 64.0, 48.0)),
       GLASS_TEST => glass_test_camera(),
       GLASS_SLAB => glass_slab_camera(),
-      mc::MC_MAP => mc_camera(),
+      mc::GREEN_FIELD => mc_camera(),
       _ => (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5)),
     };
     start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
-    if name == mc::MC_MAP
+    if name == mc::GREEN_FIELD
       && let Some(spawn) = mc::spawn_eye()
       && start_eye.distance_squared(spawn.as_vec3()) > 25_000.0 * 25_000.0
     {
@@ -204,7 +204,7 @@ fn build_world(
     stream.set_source(None);
     return Ok(build_glass_slab(grid));
   }
-  if name == mc::MC_MAP {
+  if name == mc::GREEN_FIELD {
     let (info, city) = mc::build(grid, cam_eye)?;
     stream.set_source(Some(city));
     return Ok(info);

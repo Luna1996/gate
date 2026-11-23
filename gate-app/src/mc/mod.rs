@@ -17,7 +17,7 @@ use glam::IVec3;
 use crate::infinite_cubes::SEAM_MARGIN;
 use crate::vox_scene::VoxSceneInfo;
 
-pub const MC_MAP: &str = "mc_map";
+pub const GREEN_FIELD: &str = "green_field";
 
 pub const VOXELS_PER_BLOCK: i32 = 16;
 
@@ -30,7 +30,7 @@ pub const NEAR_COVER_CHUNKS: i32 = WINDOW_CHUNKS - SEAM_MARGIN;
 const WINDOW_CHUNKS: i32 = 32;
 
 pub fn map_dir() -> PathBuf {
-  std::env::var_os("GATE_MC_MAP")
+  std::env::var_os("GATE_GREEN_FIELD")
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from(r"C:\game\Greenfield v0.5.4\Greenfield v0.5.4"))
 }
@@ -56,7 +56,7 @@ pub fn build(
   }
   let root = assets_root();
   if !root.is_dir() {
-    return Err(format!("{} 不是资产目录（见 docs/mc_map.md §3 的解包步骤）", root.display()));
+    return Err(format!("{} 不是资产目录", root.display()));
   }
   let world = Arc::new(world::World::new(&dir));
   let assets = Arc::new(assets::Assets::new(&root));
@@ -83,7 +83,7 @@ pub fn build(
   );
   let stamp = lod::stamp(world.dir());
   let city = Arc::new(source::McCity::new(world, assets, pool));
-  let lod_path = lod::path_for(MC_MAP);
+  let lod_path = lod::path_for(GREEN_FIELD);
   match lod::load(&lod_path, stamp) {
     Ok(f) => city.install_lod(f),
     Err(why) => {
@@ -124,7 +124,7 @@ pub fn start_lod_build(city: Arc<source::McCity>) {
   let spawned = std::thread::Builder::new().name("mc-lod-build".into()).spawn(move || {
     let t0 = std::time::Instant::now();
     let last = AtomicU32::new(0);
-    let r = city.build_lod(&lod::path_for(MC_MAP), &LOD_CANCEL, |done, total| {
+    let r = city.build_lod(&lod::path_for(GREEN_FIELD), &LOD_CANCEL, |done, total| {
       let pct = (done * 100 / total.max(1)) as u32;
       LOD_PERCENT.store(pct, Ordering::Relaxed);
       if pct >= last.load(Ordering::Relaxed) + 5 {

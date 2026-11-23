@@ -98,7 +98,7 @@ fn apply_world_model_options(model: &mut MenuFile) {
   options.push(crate::scene::INFINITE_CUBES.to_string());
   options.push(crate::scene::GLASS_TEST.to_string());
   options.push(crate::scene::GLASS_SLAB.to_string());
-  options.push(crate::mc::MC_MAP.to_string());
+  options.push(crate::mc::GREEN_FIELD.to_string());
   options.sort();
   options.dedup();
   let Some(MenuNode::Dropdown { options: opts, selected, .. }) =
@@ -703,7 +703,7 @@ fn register_callbacks(world: &mut World) {
               phys.reset();
               let near_spawn = crate::mc::spawn_eye()
                 .is_none_or(|s| eye_now.distance_squared(s.as_vec3()) <= 25_000.0 * 25_000.0);
-              if name == crate::mc::MC_MAP && !was_mc && !near_spawn {
+              if name == crate::mc::GREEN_FIELD && !was_mc && !near_spawn {
                 let (eye, target) = crate::scene::mc_camera();
                 crate::camera::set_camera_preset(&mut orbit, &mut fly, eye, target);
                 info!("机位 → {name} 距出生点过远，回到出生点 eye={eye:?} target={target:?}");
@@ -728,7 +728,7 @@ fn register_callbacks(world: &mut World) {
               .and_then(|a| a.downcast::<crate::mc::source::McCity>().ok());
             match city {
               Some(city) => crate::mc::start_lod_build(city),
-              None => warn!("LOD 构建：当前世界不是 MC 地图（换到 mc_map 再点）→ 忽略"),
+              None => warn!("LOD 构建：当前世界不是 MC 地图（换到 green_field 再点）→ 忽略"),
             }
           }
           _ => crate::mc::cancel_lod_build(),
