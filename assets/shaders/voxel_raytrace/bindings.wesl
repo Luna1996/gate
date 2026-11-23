@@ -152,6 +152,8 @@ struct GiUniform {
   flags: vec4<f32>,
 
   seq: vec4<u32>,
+
+  prev_view_proj: mat4x4<f32>,
 };
 @group(4) @binding(0) var<uniform> gi_u: GiUniform;
 
@@ -183,6 +185,9 @@ struct FogUniform {
 @group(5) @binding(4) var<storage, read_write> lt_node: array<atomic<u32>>;
 @group(5) @binding(5) var<storage, read_write> lt_node_key: array<atomic<u32>>;
 @group(5) @binding(6) var<storage, read_write> gi_stats: array<atomic<u32>>;
+@group(5) @binding(7) var<storage, read_write> res_prev: array<atomic<u32>>;
+@group(5) @binding(8) var<storage, read_write> res_tmp: array<atomic<u32>>;
+@group(5) @binding(9) var<storage, read_write> res_cur: array<atomic<u32>>;
 
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;

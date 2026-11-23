@@ -1,10 +1,11 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
-import package::gi::consts::{GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, IRC_WORDS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_LUMA, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, IRC_WORDS, SHADOW_SURFACE_EPS};
 import package::gi::irc::{irc_accumulate, irc_addr, irc_display, irc_lookup, irc_resolve_slot};
-import package::gi::light::{lt_hit_weight, lt_nee, lt_sweep_slot};
-import package::gi::ray::{gi_accumulate, gi_accumulate_sun, gi_sun_vis, gi_surface};
+import package::gi::light::{lt_hit_weight, lt_nee, lt_pick, lt_register, lt_sweep_slot};
+import package::gi::ray::{gi_accumulate, gi_accumulate_sun, gi_leaf_indirect, gi_origin, gi_sun_vis, gi_surface};
+import package::gi::restir::{Res, res_add_nb, res_add_pick, res_adopt, res_begin, res_direct, res_finish, res_load_cur, res_load_prev, res_load_tmp, res_none, res_store_cur, res_store_tmp};
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
@@ -507,6 +508,13 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let nf = voxel_face_index(gg, n, best.obj_id);
     let kv1 = gi_key1(best.voxel, nf, best.obj_id);
     let m = fetch_material(best.palette_base, best.pal, p_voxel, n, PBR_DEBUG_ASSET);
+    if (gi_enabled() && gi_u.params.y > 0.0
+        && (palette_flags(best.palette_base, best.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+      let le = emissive_radiance(m, gi_emit_gain());
+      if (max(le.x, max(le.y, le.z)) > 0.0) {
+        lt_register(best.voxel, nf, u32(best.obj_id + 1), dot(le, GI_LUMA));
+      }
+    }
     let v = face_view_dir(origin_voxel, p_voxel);
     let n_off = surface_offset(gg, n, SHADOW_SURFACE_EPS);
     let ndl = max(dot(n, sun_dir), 0.0);
@@ -1071,6 +1079,13 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
   let m = fetch_material(first.palette_base, first.pal, p_voxel, n, PBR_DEBUG_ASSET);
   let v = face_view_dir(origin_voxel, p_voxel);
   let nf = voxel_face_index(gg, n, first.obj_id);
+  if (gi_enabled() && gi_u.params.y > 0.0
+      && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+    let le = emissive_radiance(m, gi_emit_gain());
+    if (max(le.x, max(le.y, le.z)) > 0.0) {
+      lt_register(first.voxel, nf, u32(first.obj_id + 1), dot(le, GI_LUMA));
+    }
+  }
   let kv1 = gi_key1(first.voxel, nf, first.obj_id);
   var gi = vec3<f32>(0.0);
   var cov = 0.0;
@@ -1178,6 +1193,98 @@ fn gi_light_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
   lt_sweep_slot(gid.x);
 }
 
+const RES_SPATIAL_TAPS: u32 = 4u;
+
+@compute @workgroup_size(8, 8, 1)
+fn gi_restir_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (!gi_enabled() || gi_u.params.y <= 0.0) { return; }
+  let size = textureDimensions(dda_hit);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let idx = gid.y * size.x + gid.x;
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+  let raw = textureLoad(dda_hit, coord);
+  if ((raw.w & 1u) == 0u || ((raw.w >> 24u) != (gi_u.seq.x & 0xFFu))) {
+    res_store_tmp(idx, res_none());
+    return;
+  }
+  let px = gi_record_pixel(vec2<u32>(gid.x, gid.y));
+  let gsz = vec2<f32>(textureDimensions(dda_vis));
+  let p = (vec2<f32>(f32(px.x), f32(px.y)) + vec2<f32>(0.5)) / gsz;
+  let ndc = vec2<f32>(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0);
+  let nw4 = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
+  let fw4 = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
+  let nw = nw4.xyz / nw4.w;
+  let fw = fw4.xyz / fw4.w;
+  let dir = normalize(fw - nw);
+  let seed = gi_mix(u32(px.x) * 0x9E3779B1u
+                    + gi_mix(u32(px.y) * 0x85EBCA77u + gi_u.seq.x * 0x27D4EB2Fu));
+  var h = dda_hit_unpack(raw, view_u.cam_pos_voxel.xyz, dir);
+  if (!h.hit) { res_store_tmp(idx, res_none()); return; }
+  if ((palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) != 0u) {
+    let hm = fetch_material(h.palette_base, h.pal, h.point,
+                            face_normal_world(make_grid(u32(h.obj_id) + 1u), h.face_id),
+                            PBR_DEBUG_ASSET);
+    if (hm.roughness < 0.1) { res_store_tmp(idx, res_none()); return; }
+    var tint = vec3<f32>(1.0);
+    let bh = world_trace_medium_scene(view_u.cam_pos_voxel.xyz, dir,
+                                      length(fw - nw), false, false, &tint);
+    if (!bh.hit) { res_store_tmp(idx, res_none()); return; }
+    h = bh;
+  }
+  let g = make_grid(u32(h.obj_id) + 1u);
+  let n = voxel_normal_fast(g, h.voxel, h.face_id, h.n);
+  let s = gi_surface(h, g, n, h.face_id);
+  var r = res_begin(s.p, s.n, gi_key0(h.voxel, h.obj_id),
+                    gi_key1(h.voxel, h.face_id, h.obj_id), gi_u.seq.z);
+  let clip = gi_u.prev_view_proj * vec4<f32>(h.point, 1.0);
+  if (abs(clip.w) > 1e-6) {
+    let pn = clip.xyz / clip.w;
+    let uv = vec2<f32>(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+    let pp = vec2<i32>(floor(uv * vec2<f32>(f32(size.x), f32(size.y))));
+    if (pp.x >= 0 && pp.y >= 0 && pp.x < i32(size.x) && pp.y < i32(size.y)) {
+      let prev = res_load_prev(u32(pp.y) * size.x + u32(pp.x));
+      r = res_adopt(r, prev, gi_rand2(seed).x);
+    }
+  }
+  let pick = lt_pick(s.p, s.n, gi_mix(seed + 0x68E31DA4u));
+  var pick_vis = 0.0;
+  if (pick.ok) {
+    let origin = gi_origin(s);
+    let d = pick.y - origin;
+    let dist = length(d);
+    var tint = vec3<f32>(1.0);
+    let hit = world_trace_medium_scene(origin, d / max(dist, 1e-6),
+                                       max(dist - SHADOW_SURFACE_EPS * g.scale, 0.0),
+                                       false, false, &tint);
+    pick_vis = select(1.0, 0.0, hit.hit);
+  }
+  r = res_add_pick(r, pick, pick_vis, gi_rand2(gi_mix(seed + 0x517CC1B7u)).x);
+  r = res_finish(r);
+  res_store_tmp(idx, r);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn gi_restir_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (!gi_enabled() || gi_u.params.y <= 0.0) { return; }
+  let size = textureDimensions(dda_hit);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let idx = gid.y * size.x + gid.x;
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+  var r = res_load_tmp(idx);
+  let offs = array<vec2<i32>, 4>(vec2<i32>(1, 0), vec2<i32>(-1, 0),
+                                 vec2<i32>(0, 1), vec2<i32>(0, -1));
+  let seed = gi_mix(idx * 0x9E3779B1u + gi_u.seq.x * 0x27D4EB2Fu);
+  for (var i = 0u; r.valid && i < RES_SPATIAL_TAPS; i = i + 1u) {
+    let nc = coord + offs[i];
+    if (nc.x < 0 || nc.y < 0 || nc.x >= i32(size.x) || nc.y >= i32(size.y)) { continue; }
+    let nb = res_load_tmp(u32(nc.y) * size.x + u32(nc.x));
+    if (!nb.valid || nb.rev != r.rev || nb.k0 != r.k0 || nb.k1 != r.k1) { continue; }
+    r = res_add_nb(r, nb, gi_rand2(gi_mix(seed + i * 0x9E3779B9u)).x);
+  }
+  if (r.valid && r.rev != gi_u.seq.z) { r = res_none(); }
+  res_store_cur(idx, res_finish(r));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn gi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (!gi_enabled() || gi_u.params.y <= 0.0) { return; }
@@ -1226,9 +1333,27 @@ fn gi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gi_u.flags.w > 0.5) { spp = min(gi_sample_base(), 1u); }
   let seed0 = gi_mix(seed + 0x3C6EF372u);
   atomicAdd(&gi_stats[GI_STAT_RAYS], spp);
+  var indirect = vec3<f32>(0.0);
   for (var i = 0u; i < spp; i = i + 1u) {
-    gi_accumulate(s, gi_mix(seed0 + i * 0x9E3779B1u), sun);
+    indirect = indirect + gi_leaf_indirect(s, gi_mix(seed0 + i * 0x9E3779B1u));
   }
+  indirect = indirect / f32(spp);
+  if (maturity.conf > 0.5) {
+    let base = dot(maturity.e, GI_LUMA);
+    let il = dot(indirect, GI_LUMA);
+    if (base > 1e-5 && il > base * GI_SAMPLE_CLAMP) {
+      indirect = indirect * (base * GI_SAMPLE_CLAMP / il);
+    }
+  }
+  let rr = res_load_cur(gid.y * size.x + gid.x);
+  var direct = vec3<f32>(0.0);
+  if (rr.valid && rr.rev == gi_u.seq.z
+      && rr.k0 == gi_key0(h.voxel, h.obj_id)
+      && rr.k1 == gi_key1(h.voxel, h.face_id, h.obj_id)) {
+    direct = res_direct(rr);
+  }
+  irc_accumulate(s.addr, s.n, direct + indirect, true, sun,
+                 gi_rand2(gi_mix(seed + 0x9E3779B9u)));
 }
 
 @compute @workgroup_size(64, 1, 1)

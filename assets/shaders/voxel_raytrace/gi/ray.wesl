@@ -91,6 +91,20 @@ fn gi_leaf_irradiance(s: GiSurface, seed: u32) -> vec3<f32> {
   return e + rad * tint;
 }
 
+fn gi_leaf_indirect(s: GiSurface, seed: u32) -> vec3<f32> {
+  let dir = gi_cos_hemisphere(s.n, gi_rand2(seed));
+  var tint = vec3<f32>(1.0);
+  let h = world_trace_medium_scene(gi_origin(s), dir, min(GI_T_MAX, GI_REACH_T), false, false, &tint);
+  var rad = sky_ambient(dir);
+  if (h.hit) {
+    let g2 = make_grid(u32(h.obj_id) + 1u);
+    let n2 = voxel_normal_fast(g2, h.voxel, h.face_id, h.n);
+    let s2 = gi_surface(h, g2, n2, h.face_id);
+    rad = gi_emission(s2, s.p, s.n, dir, length(s2.p - s.p)) + s2.m.albedo * gi_hit_radiance(s2);
+  }
+  return rad * tint;
+}
+
 fn gi_accumulate(s: GiSurface, seed: u32, sun: f32) {
   if (!gi_enabled()) { return; }
   var sun_v = sun;

@@ -412,6 +412,53 @@ fn lt_nee_on() -> bool {
   return gi_u.flags.x > 0.5 && lt_active();
 }
 
+struct LtSample {
+  y: vec3<f32>,
+  le: vec3<f32>,
+  nl: vec3<f32>,
+  pa: f32,
+  ok: bool,
+}
+
+fn lt_pick(x: vec3<f32>, nx: vec3<f32>, seed: u32) -> LtSample {
+  var out = LtSample(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0, false);
+  if (!lt_active()) { return out; }
+  let r0 = gi_rand2(seed);
+  let pick = lt_walk(x, nx, r0.x);
+  if (pick.tile == LT_NONE) { return out; }
+  let tb = pick.tile * LT_TILE_WORDS;
+  let mlo = atomicLoad(&lt_tile[tb + LT_T_MASK]);
+  let mhi = atomicLoad(&lt_tile[tb + LT_T_MASK + 1u]);
+  let pop = countOneBits(mlo) + countOneBits(mhi);
+  if (pop == 0u) { return out; }
+  let bit = lt_nth_bit(mlo, mhi, min(u32(r0.y * f32(pop)), pop - 1u));
+  let t = lt_tile_load(pick.tile);
+  let voxel = lt_voxel(t, bit);
+  let g = make_grid(t.obj);
+  let ny = lt_normal_world(g, t.face);
+  let pal = sample_brickmap(g, voxel);
+  if (pal == 0u || (palette_flags(g.palette_base, pal) & FLAGS_TRANSMISSIVE) != 0u) { return out; }
+  let pc = lt_to_world(g, vec3<f32>(voxel) + vec3<f32>(0.5));
+  let le = emissive_radiance(fetch_material(g.palette_base, pal, pc, ny, MATERIAL_DEBUG_NONE),
+                             gi_u.params.x);
+  if (!(max(le.x, max(le.y, le.z)) > 0.0)) { return out; }
+  let y = lt_to_world(g, lt_face_local(voxel, t.face, gi_rand2(gi_mix(seed + 0x68E31DA4u))));
+  let d = y - x;
+  let dist2 = max(dot(d, d), 1e-6);
+  let dist = sqrt(dist2);
+  if (dist > LT_NEE_MAX_D) { return out; }
+  let dir = d / dist;
+  let cx = dot(nx, dir);
+  let cy = -dot(ny, dir);
+  if (cx <= 0.0 || cy <= 0.0) { return out; }
+  out.y = y;
+  out.le = le;
+  out.nl = ny;
+  out.pa = pick.pdf / (f32(pop) * g.scale * g.scale);
+  out.ok = true;
+  return out;
+}
+
 fn lt_nee(x: vec3<f32>, nx: vec3<f32>, seed: u32) -> vec3<f32> {
   if (!lt_active()) { return vec3<f32>(0.0); }
   let r0 = gi_rand2(seed);

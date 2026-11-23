@@ -12,6 +12,8 @@ const ENTRY_POINTS: &[&str] = &[
   "beam_main",
   "gi_light_sweep",
   "gi_gather",
+  "gi_restir_temporal",
+  "gi_restir_spatial",
   "gi_resolve",
   "godray_main",
   "godray_blur_a",

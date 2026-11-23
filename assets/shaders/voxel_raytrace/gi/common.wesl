@@ -117,5 +117,5 @@ fn gi_sample_boost(n: f32) -> u32 {
   if (n < GI_SPP_BOOST_N0) { return 8u; }
   if (n < GI_SPP_BOOST_N1) { return 4u; }
   if (n < GI_SPP_EASE_N) { return 2u; }
-  return 1u;
+  return 4u;
 }

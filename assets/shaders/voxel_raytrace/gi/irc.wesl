@@ -22,7 +22,7 @@ const IRC_K1_VALID: u32 = 0x80000000u;
 const IRC_K1_OBJ: u32 = 0x20000000u;
 
 const IRC_FRAME_SAMPLES_MAX: f32 = 256.0;
-const IRC_N_MAX: f32 = 4096.0;
+const IRC_N_MAX: f32 = 32768.0;
 
 fn rgb9e5_pack(c: vec3<f32>) -> u32 {
   let v = clamp(c, vec3<f32>(0.0), vec3<f32>(65408.0));

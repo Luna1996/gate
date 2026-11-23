@@ -8,7 +8,8 @@ const GI_AMBIENT_OPEN: f32 = 0.3;
 const GI_FALLBACK: f32 = 0.4;
 const GI_REFRESH_N: f32 = 8.0;
 const GI_REFRESH_MIN: f32 = 0.0625;
-const GI_NEE_P: f32 = 0.5;
+const GI_NEE_P: f32 = 1.0;
+const GI_SAMPLE_CLAMP: f32 = 16.0;
 const LT_NEE_MAX_D: f32 = 2048.0;
 const SHADOW_SURFACE_EPS: f32 = 0.03125;
 
@@ -34,6 +35,8 @@ const GI_SPP_MAX: u32 = 8u;
 const GI_SPP_BOOST_N0: f32 = 8.0;
 const GI_SPP_BOOST_N1: f32 = 64.0;
 const GI_SPP_EASE_N: f32 = 192.0;
+
+const RES_WORDS: u32 = 24u;
 
 const LT_TILE_WORDS: u32 = 12u;
 const LT_NODE_WORDS: u32 = 12u;

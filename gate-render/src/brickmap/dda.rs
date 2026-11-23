@@ -1779,6 +1779,44 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
       }
+      if let Some(pipe) =
+        bg4.restir_temporal_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_restir_temporal",
+          |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, gi_view_bg, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, gi_b0, &[]);
+            pass.set_bind_group(5, b5, &[]);
+            pass.dispatch_workgroups(ggx, ggy, 1);
+          },
+        );
+      }
+      if let Some(pipe) =
+        bg4.restir_spatial_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      {
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_restir_spatial",
+          |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, gi_view_bg, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, gi_b0, &[]);
+            pass.set_bind_group(5, b5, &[]);
+            pass.dispatch_workgroups(ggx, ggy, 1);
+          },
+        );
+      }
       if let Some(pipe) = bg4.gather_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
       {
         crate::profiler::gpu_compute_pass(
@@ -1816,6 +1854,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
             pass.dispatch_workgroups(groups, 1, 1);
           },
         );
+      }
+      if let Some((src, dst, bytes)) = bg4.reservoir_copy() {
+        ctx.command_encoder().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
       }
     }
   }

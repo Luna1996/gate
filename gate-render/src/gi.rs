@@ -13,6 +13,8 @@ pub struct GiUniform {
   pub flags: Vec4,
 
   pub seq: UVec4,
+
+  pub prev_view_proj: Mat4,
 }
 
 #[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, PartialEq)]
@@ -37,7 +39,7 @@ impl GiSettings {
 
   pub const GAIN_CHOICES: [f32; 5] = [0.0, 2.0, 4.0, 8.0, 16.0];
 
-  pub const HIST_CAP: f32 = 512.0;
+  pub const HIST_CAP: f32 = 32768.0;
 
   pub const HIST_CAP_RESET: f32 = 48.0;
 
@@ -115,7 +117,10 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
     },
     count: None,
   };
-  BindGroupLayoutDescriptor::new("GiBg5", &[buf(0), buf(1), buf(2), buf(3), buf(4), buf(5), buf(6)])
+  BindGroupLayoutDescriptor::new(
+    "GiBg5",
+    &[buf(0), buf(1), buf(2), buf(3), buf(4), buf(5), buf(6), buf(7), buf(8), buf(9)],
+  )
 }
 
 #[derive(bevy::ecs::resource::Resource)]
@@ -138,6 +143,10 @@ pub struct GiGpu {
 
   pub light_pipeline: Option<CachedComputePipelineId>,
 
+  pub restir_temporal_pipeline: Option<CachedComputePipelineId>,
+
+  pub restir_spatial_pipeline: Option<CachedComputePipelineId>,
+
   irc: Option<Buffer>,
 
   irc_key: Option<Buffer>,
@@ -149,6 +158,16 @@ pub struct GiGpu {
   lt_node: Option<Buffer>,
 
   lt_node_key: Option<Buffer>,
+
+  res_prev: Option<Buffer>,
+
+  res_tmp: Option<Buffer>,
+
+  res_cur: Option<Buffer>,
+
+  gi_size: UVec2,
+
+  res_bytes: u64,
 
   slots: u32,
 
@@ -174,6 +193,10 @@ impl GiGpu {
     self.slots.max(1)
   }
 
+  pub fn reservoir_copy(&self) -> Option<(&Buffer, &Buffer, u64)> {
+    Some((self.res_cur.as_ref()?, self.res_prev.as_ref()?, self.res_bytes))
+  }
+
   pub fn clear(&mut self) {
     self.irc = None;
     self.irc_key = None;
@@ -181,6 +204,11 @@ impl GiGpu {
     self.lt_tile_key = None;
     self.lt_node = None;
     self.lt_node_key = None;
+    self.res_prev = None;
+    self.res_tmp = None;
+    self.res_cur = None;
+    self.gi_size = UVec2::ZERO;
+    self.res_bytes = 0;
     self.slots = 0;
     self.slots_tag = 0;
   }
@@ -241,6 +269,8 @@ fn queue_gi_pipelines(
   let gather = queue("gate_gi_gather", "gi_gather");
   let resolve = queue("gate_gi_resolve", "gi_resolve");
   let light = queue("gate_gi_light", "gi_light_sweep");
+  let restir_temporal = queue("gate_gi_restir_temporal", "gi_restir_temporal");
+  let restir_spatial = queue("gate_gi_restir_spatial", "gi_restir_spatial");
 
   commands.insert_resource(GiGpu {
     uniform: bevy::render::render_resource::UniformBuffer::default(),
@@ -252,12 +282,19 @@ fn queue_gi_pipelines(
     gather_pipeline: Some(gather),
     resolve_pipeline: Some(resolve),
     light_pipeline: Some(light),
+    restir_temporal_pipeline: Some(restir_temporal),
+    restir_spatial_pipeline: Some(restir_spatial),
     irc: None,
     irc_key: None,
     lt_tile: None,
     lt_tile_key: None,
     lt_node: None,
     lt_node_key: None,
+    res_prev: None,
+    res_tmp: None,
+    res_cur: None,
+    gi_size: UVec2::ZERO,
+    res_bytes: 0,
     slots: 0,
     slots_tag: 0,
     prev_track: None,
@@ -313,6 +350,32 @@ fn prepare_gi(p: PrepareGiParams) {
   let render_size = scale.as_deref().map_or(crate::consts::VIEW_SIZE, |s| s.size);
   let slots = settings.irc_slots(render_size);
   let slots_tag = slots as u64 | ((settings.div() as u64) << 40);
+  let gi_size = settings.gi_size(render_size);
+  if gpu.gi_size != gi_size || gpu.res_prev.is_none() {
+    let c = crate::wesl_consts::gi_consts();
+    let bytes = (gi_size.x as u64 * gi_size.y as u64 * c.res_words as u64 * 4).max(4);
+    let make = |label: &str, bytes: u64| {
+      device.create_buffer(&BufferDescriptor {
+        label: Some(label),
+        size: bytes.max(4),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+      })
+    };
+    gpu.res_prev = Some(make("gate_gi_res_prev", bytes));
+    gpu.res_tmp = Some(make("gate_gi_res_tmp", bytes));
+    gpu.res_cur = Some(make("gate_gi_res_cur", bytes));
+    gpu.gi_size = gi_size;
+    gpu.res_bytes = bytes;
+    bevy::log::debug!(
+      target: "gate",
+      "GI reservoir → {}x{} × {} word（{:.1} MB ×3）",
+      gi_size.x,
+      gi_size.y,
+      c.res_words,
+      bytes as f64 / 1048576.0,
+    );
+  }
   if gpu.slots_tag != slots_tag {
     let c = crate::wesl_consts::gi_consts();
     let make = |label: &str, bytes: u64| {
@@ -348,7 +411,8 @@ fn prepare_gi(p: PrepareGiParams) {
   }
 
   let track = view.as_deref().map(|v| v.view_proj);
-  let moved = match (gpu.prev_track, track) {
+  let prev_track = gpu.prev_track;
+  let moved = match (prev_track, track) {
     (Some(a), Some(b)) => (a - b).to_cols_array().iter().any(|x| x.abs() > 1e-4),
     (None, Some(_)) => true,
     _ => false,
@@ -371,6 +435,10 @@ fn prepare_gi(p: PrepareGiParams) {
     }
   }
   let edited = dirty.as_ref().is_some_and(|d| d.edited || d.full || d.palette_changed);
+  if edited {
+    gpu.light_rev = gpu.light_rev.wrapping_add(1);
+    light_jump = true;
+  }
   let cap = if light_jump || edited { GiSettings::HIST_CAP_RESET } else { GiSettings::HIST_CAP };
   gpu.hist_cap = cap;
   let evict = if gpu.slots <= GiSettings::IRC_SLOTS_MIN {
@@ -399,6 +467,7 @@ fn prepare_gi(p: PrepareGiParams) {
       if moved { 1.0 } else { 0.0 },
     ),
     seq: UVec4::new(gpu.frame, evict, gpu.light_rev, light_slots()),
+    prev_view_proj: prev_track.unwrap_or_else(|| track.unwrap_or(Mat4::IDENTITY)),
   };
   gpu.uniform.write_buffer(&device, &queue);
 
@@ -411,7 +480,18 @@ fn prepare_gi(p: PrepareGiParams) {
   gpu.bg0 = Some(bg0);
 
   let bg5_layout = pipeline_cache.get_bind_group_layout(&gi_bg5_layout());
-  let (Some(irc), Some(irc_key), Some(tile), Some(tile_key), Some(node), Some(node_key), Some(st)) = (
+  let (
+    Some(irc),
+    Some(irc_key),
+    Some(tile),
+    Some(tile_key),
+    Some(node),
+    Some(node_key),
+    Some(st),
+    Some(rprev),
+    Some(rtmp),
+    Some(rcur),
+  ) = (
     gpu.irc.as_ref(),
     gpu.irc_key.as_ref(),
     gpu.lt_tile.as_ref(),
@@ -419,7 +499,11 @@ fn prepare_gi(p: PrepareGiParams) {
     gpu.lt_node.as_ref(),
     gpu.lt_node_key.as_ref(),
     gpu.stats.as_ref(),
-  ) else {
+    gpu.res_prev.as_ref(),
+    gpu.res_tmp.as_ref(),
+    gpu.res_cur.as_ref(),
+  )
+  else {
     return;
   };
   let bg5 = device.create_bind_group(
@@ -433,6 +517,9 @@ fn prepare_gi(p: PrepareGiParams) {
       BindGroupEntry { binding: 4, resource: node.as_entire_binding() },
       BindGroupEntry { binding: 5, resource: node_key.as_entire_binding() },
       BindGroupEntry { binding: 6, resource: st.as_entire_binding() },
+      BindGroupEntry { binding: 7, resource: rprev.as_entire_binding() },
+      BindGroupEntry { binding: 8, resource: rtmp.as_entire_binding() },
+      BindGroupEntry { binding: 9, resource: rcur.as_entire_binding() },
     ],
   );
   gpu.bg5 = Some(bg5);

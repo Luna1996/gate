@@ -9,6 +9,7 @@ use crate::paths::dda_wesl_dir;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GiConsts {
   pub irc_words: u32,
+  pub res_words: u32,
   pub lt_tile_words: u32,
   pub lt_node_words: u32,
   pub irc_bucket: u32,
@@ -20,6 +21,7 @@ pub struct GiConsts {
 
 const REQUIRED: &[&str] = &[
   "IRC_WORDS",
+  "RES_WORDS",
   "LT_TILE_WORDS",
   "LT_NODE_WORDS",
   "IRC_BUCKET",
@@ -95,6 +97,7 @@ impl GiConsts {
     let get = |name: &str| -> u32 { values[name] };
     let out = GiConsts {
       irc_words: get("IRC_WORDS"),
+      res_words: get("RES_WORDS"),
       lt_tile_words: get("LT_TILE_WORDS"),
       lt_node_words: get("LT_NODE_WORDS"),
       irc_bucket: get("IRC_BUCKET"),
