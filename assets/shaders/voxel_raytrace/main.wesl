@@ -1,10 +1,10 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
-import package::gi::common::{gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_unkey_voxel};
-import package::gi::consts::{GI_AMBIENT_FLOOR, GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_STAT_RAYS, IRC_WORDS, SHADOW_SURFACE_EPS};
+import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
+import package::gi::consts::{GI_LUMA, GI_PI, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, IRC_WORDS, SHADOW_SURFACE_EPS};
 import package::gi::irc::{irc_accumulate, irc_addr, irc_display, irc_lookup, irc_resolve_slot};
 import package::gi::light::{lt_hit_weight, lt_nee, lt_sweep_slot};
-import package::gi::ray::{gi_accumulate, gi_accumulate_sun, gi_surface};
+import package::gi::ray::{gi_accumulate, gi_accumulate_sun, gi_sun_vis, gi_surface};
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
@@ -305,7 +305,7 @@ fn gi_display_sky(h: WorldHit, n: vec3<f32>) -> vec3<f32> {
   let face = voxel_face_index(g, n, h.obj_id);
   let s = gi_surface(h, g, n, face);
   let d = irc_display(s.addr, s.n);
-  return mix(light_u.sky_color.xyz * GI_AMBIENT_FLOOR, d.rgb, d.a);
+  return mix(gi_ambient_fallback(n, 0.0), d.rgb, d.a);
 }
 
 fn refl_hit_gi_m(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32, pool_r: i32,
@@ -530,7 +530,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       gi = d.rgb;
       cov = d.a;
     }
-    let amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, cov);
+    let amb = gi_ambient_fallback(n, cov);
     col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c * sun, 1.0, amb, gi))
         + emissive_radiance(m, gi_emit_gain());
     if (PBR_REFLECTION_ENABLED != 0u && light_u.g.refl_tier > 0u) {
@@ -562,7 +562,11 @@ const DIAG_MAIN_SKY: u32 = 12u;
 var<workgroup> cam_pal_wg: u32;
 
 fn dda_hit_record(gid: vec3<u32>, size: vec2<u32>, hit: WorldHit, origin_voxel: vec3<f32>) {
-  let px = gi_record_pixel(vec2<u32>(u32(gid.x), u32(gid.y)) / gi_div());
+  let gid2 = vec2<u32>(u32(gid.x), u32(gid.y));
+  let px = gi_record_pixel(gid2 / gi_div());
+  // 一个 GI texel 内只允许当前帧抖动到的那一个像素写入，
+  // 这样 16 帧循环会轮流覆盖块内的所有表面，而不是固定由一个像素代表整块。
+  if (px.x != gid2.x || px.y != gid2.y) { return; }
   let texel = px / gi_div();
   let hsz = textureDimensions(dda_hit);
   if (texel.x >= hsz.x || texel.y >= hsz.y) { return; }
@@ -1076,7 +1080,7 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
     gi = d.rgb;
     cov = d.a;
   }
-  let amb = sky * GI_SKY_AMBIENT * mix(1.0, GI_AMBIENT_FLOOR, cov);
+  let amb = gi_ambient_fallback(n, cov);
   var col = brdf_reflected(m, n, v, SurfaceLight(sun_dir, sun_c * sun_vis, 1.0, amb, gi))
           + emissive_radiance(m, gi_emit_gain());
   if (PBR_REFLECTION_ENABLED != 0u && light_u.g.refl_tier > 0u) {
@@ -1214,8 +1218,17 @@ fn gi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
       && gi_key0(h.voxel, h.obj_id) == vis.y && gi_key1(h.voxel, h.face_id, h.obj_id) == vis.z) {
     sun = dot(textureLoad(dda_shadow_tex, vec2<i32>(px)).rgb, GI_LUMA);
   }
-  atomicAdd(&gi_stats[GI_STAT_RAYS], 1u);
-  gi_accumulate(s, seed, sun);
+  if (sun < 0.0) { sun = gi_sun_vis(s); }
+  let maturity = irc_lookup(s.addr, s.face);
+  var spp = min(gi_sample_base() * gi_sample_boost(maturity.n), GI_SPP_MAX);
+  // 相机在动时不额外加采样：此时大量单元刚被揭示，加采样换来的收敛很快又被下一帧的视角丢掉，
+  // 只会压帧率；世界空间缓存仍按 1 spp/texel 继续积累，静止后再集中补。
+  if (gi_u.flags.w > 0.5) { spp = min(gi_sample_base(), 1u); }
+  let seed0 = gi_mix(seed + 0x3C6EF372u);
+  atomicAdd(&gi_stats[GI_STAT_RAYS], spp);
+  for (var i = 0u; i < spp; i = i + 1u) {
+    gi_accumulate(s, gi_mix(seed0 + i * 0x9E3779B1u), sun);
+  }
 }
 
 @compute @workgroup_size(64, 1, 1)

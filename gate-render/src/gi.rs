@@ -349,12 +349,11 @@ fn prepare_gi(p: PrepareGiParams) {
 
   let track = view.as_deref().map(|v| v.view_proj);
   let moved = match (gpu.prev_track, track) {
-    (Some(a), Some(b)) => (a - b).to_cols_array().iter().any(|x| x.abs() > 1e-6),
+    (Some(a), Some(b)) => (a - b).to_cols_array().iter().any(|x| x.abs() > 1e-4),
     (None, Some(_)) => true,
     _ => false,
   };
   gpu.prev_track = track;
-  let _ = moved;
 
   let light = [
     lighting_digest(lighting.as_deref(), 0),
@@ -397,7 +396,7 @@ fn prepare_gi(p: PrepareGiParams) {
       if settings.nee { 1.0 } else { 0.0 },
       settings.div() as f32,
       if light_jump { 1.0 } else { 0.0 },
-      0.0,
+      if moved { 1.0 } else { 0.0 },
     ),
     seq: UVec4::new(gpu.frame, evict, gpu.light_rev, light_slots()),
   };

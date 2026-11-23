@@ -3,8 +3,9 @@ const GI_PI: f32 = 3.14159265;
 const GI_LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
 const GI_SKY_AMBIENT: f32 = 0.05;
-const GI_AMBIENT_FLOOR: f32 = 0.01;
-const GI_FALLBACK: f32 = 0.1;
+const GI_AMBIENT_FLOOR: f32 = 0.001;
+const GI_AMBIENT_OPEN: f32 = 0.3;
+const GI_FALLBACK: f32 = 0.4;
 const GI_REFRESH_N: f32 = 8.0;
 const GI_REFRESH_MIN: f32 = 0.0625;
 const GI_NEE_P: f32 = 0.5;
@@ -15,7 +16,8 @@ const IRC_WORDS: u32 = 16u;
 const IRC_BUCKET: u32 = 8u;
 const IRC_CHAIN: u32 = 4u;
 const IRC_MAX_LEVEL: u32 = 11u;
-const IRC_FALLBACK_LEVELS: u32 = 3u;
+const IRC_FALLBACK_LEVELS: u32 = 4u;
+const IRC_EVICT_GUARD: u32 = 4u;
 
 const IRC_ACC_SCALE: f32 = 16384.0;
 const IRC_V_MAX: f32 = 32.0;
@@ -27,6 +29,11 @@ const IRC_SHRINK_C: f32 = 4.0;
 const IRC_Z2: f32 = 16.0;
 const IRC_VAR_ALPHA: f32 = 0.125;
 const IRC_SUN_ALPHA: f32 = 0.125;
+
+const GI_SPP_MAX: u32 = 8u;
+const GI_SPP_BOOST_N0: f32 = 8.0;
+const GI_SPP_BOOST_N1: f32 = 64.0;
+const GI_SPP_EASE_N: f32 = 192.0;
 
 const LT_TILE_WORDS: u32 = 12u;
 const LT_NODE_WORDS: u32 = 12u;

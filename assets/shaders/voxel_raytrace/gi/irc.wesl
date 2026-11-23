@@ -1,8 +1,8 @@
 import package::bindings::{gi_stats, gi_u, irc, irc_key, view_u};
 import package::brickmap::{Grid};
 import package::common::{face_normal_from_index};
-import package::gi::common::{gi_mix};
-import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_FALLBACK_LEVELS, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_SHRINK_C, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2};
+import package::gi::common::{gi_div, gi_mix};
+import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVICT_GUARD, IRC_FALLBACK_LEVELS, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_SHRINK_C, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2};
 import package::trace::{grid_is_far};
 
 const IRC_W_VAL: u32 = 0u;
@@ -106,6 +106,7 @@ fn irc_find(k: vec2<u32>) -> u32 {
 
 fn irc_claim(k: vec2<u32>) -> u32 {
   let base = irc_bucket_base(k);
+  let frame = gi_u.seq.x;
   var free = IRC_BUCKET;
   for (var j = 0u; j < IRC_BUCKET; j = j + 1u) {
     let b = (base + j) * 2u;
@@ -121,6 +122,7 @@ fn irc_claim(k: vec2<u32>) -> u32 {
       if (r.exchanged) {
         atomicStore(&irc_key[b], k.x);
         atomicStore(&irc_key[b + 1u], k.y);
+        atomicStore(&irc[(base + j) * IRC_WORDS + IRC_W_STAMP], frame);
         return base + j;
       }
       k1 = r.old_value;
@@ -129,6 +131,36 @@ fn irc_claim(k: vec2<u32>) -> u32 {
       k1 = atomicLoad(&irc_key[b + 1u]);
     }
     if (k1 == k.y && atomicLoad(&irc_key[b]) == k.x) { return base + j; }
+  }
+  // 桶满时按最旧时间戳原位淘汰，保证新露出的表面总能拿到槽位，
+  // 否则要等全局年龄回收（数百帧）后才开始收敛，表现为成片斑纹卡住数秒。
+  for (var attempt = 0u; attempt < 2u; attempt = attempt + 1u) {
+    var victim = IRC_NONE;
+    var oldest = 0xFFFFFFFFu;
+    for (var j = 0u; j < IRC_BUCKET; j = j + 1u) {
+      let s = base + j;
+      let k1 = atomicLoad(&irc_key[s * 2u + 1u]);
+      if (k1 == 0u || k1 == IRC_LOCK) { continue; }
+      let st = atomicLoad(&irc[s * IRC_WORDS + IRC_W_STAMP]);
+      if (frame - st < IRC_EVICT_GUARD) { continue; }
+      if (st < oldest) {
+        oldest = st;
+        victim = s;
+      }
+    }
+    if (victim == IRC_NONE) { return IRC_NONE; }
+    let kb = victim * 2u;
+    let old_k1 = atomicLoad(&irc_key[kb + 1u]);
+    let r = atomicCompareExchangeWeak(&irc_key[kb + 1u], old_k1, IRC_LOCK);
+    if (!r.exchanged) { continue; }
+    for (var i = 0u; i < IRC_WORDS; i = i + 1u) {
+      atomicStore(&irc[victim * IRC_WORDS + i], 0u);
+    }
+    atomicStore(&irc_key[kb], k.x);
+    atomicStore(&irc_key[kb + 1u], k.y);
+    atomicStore(&irc[victim * IRC_WORDS + IRC_W_STAMP], frame);
+    atomicAdd(&gi_stats[GI_STAT_IRC_EVICT], 1u);
+    return victim;
   }
   return IRC_NONE;
 }
@@ -143,7 +175,8 @@ struct IrcAddr {
 fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
   let dist = length(p - view_u.cam_pos_voxel.xyz);
   let px = max(dist * view_u.lod.x, 1e-6);
-  var foot = px * gi_u.params.y;
+  let cell_tgt = max(gi_u.params.y, f32(gi_div()));
+  var foot = px * cell_tgt;
   var v = voxel;
   var obj = 0u;
   var lmin = 0u;
@@ -156,7 +189,9 @@ fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
       foot = foot / max(g.scale, 1e-6);
     }
   }
-  let level = clamp(u32(log2(max(foot, 1.0))), lmin, IRC_MAX_LEVEL);
+  // 单元屏幕尺寸必须 ≥ 一个 GI texel，否则一个 texel 覆盖多个单元，
+  // 只有被采样到的那个单元能拿到值，其余单元会留下长期不收敛的斑纹。
+  let level = clamp(u32(ceil(log2(max(foot, 1.0)))), lmin, IRC_MAX_LEVEL);
   let cell_px = f32(1u << level) * gi_u.params.y / foot;
   let per = cell_px / max(gi_u.flags.y, 1.0);
   return IrcAddr(v, obj, level, per * per);
@@ -405,7 +440,8 @@ fn irc_resolve_slot(s: u32) {
         let dv = mean - par.rgb;
         let d2 = dot(dv, dv) / max(dot(mean, mean), 1e-12);
         let se2 = varr / (n * l * l);
-        out_e = mix(par.rgb, mean, d2 / (d2 + IRC_SHRINK_C * se2 + 1e-9));
+        let w = min(d2 / (d2 + IRC_SHRINK_C * se2 + 1e-9), out_c);
+        out_e = mix(par.rgb, mean, w);
       }
       out_c = max(out_c, par.a * IRC_PARENT_CONF);
     }
