@@ -19,16 +19,10 @@ const RES_W_FLAGS: u32 = 21u;
 
 const RES_VALID: u32 = 1u;
 const RES_M_CAP: f32 = 1000000.0;
-const RES_N_DOT: f32 = 0.9;
-const RES_PLANE_TOL: f32 = 2.0;
-const RES_PLANE_REL: f32 = 0.02;
 
 fn res_same_surface(p: Res, r: Res) -> bool {
   if (!p.valid) { return false; }
-  if ((p.k1 >> 19u) != (r.k1 >> 19u)) { return false; }
-  if (dot(p.n, r.n) < RES_N_DOT) { return false; }
-  let d = p.x - r.x;
-  return abs(dot(d, r.n)) <= RES_PLANE_TOL + RES_PLANE_REL * length(d);
+  return p.k0 == r.k0 && p.k1 == r.k1;
 }
 
 struct Res {

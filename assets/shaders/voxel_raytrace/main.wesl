@@ -1194,7 +1194,7 @@ fn gi_light_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
   lt_sweep_slot(gid.x);
 }
 
-const RES_SPATIAL_TAPS: u32 = 8u;
+const RES_SPATIAL_TAPS: u32 = 0u;
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_restir_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
