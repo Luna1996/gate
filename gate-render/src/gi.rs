@@ -45,11 +45,13 @@ impl GiSettings {
 
   pub const EVICT_FRAMES: u32 = 900;
 
+  pub const EVICT_FRAMES_MOVING: u32 = 60;
+
   pub const FORGET: f32 = 0.9989;
 
   pub const GI_SIZE_REF_PX: u64 = 320 * 180;
 
-  pub const IRC_SLOTS_MIN: u32 = 1 << 18;
+  pub const IRC_SLOTS_MIN: u32 = 1 << 19;
 
   pub const IRC_SLOTS_MAX: u32 = 1 << 20;
 
@@ -441,11 +443,7 @@ fn prepare_gi(p: PrepareGiParams) {
   }
   let cap = if light_jump || edited { GiSettings::HIST_CAP_RESET } else { GiSettings::HIST_CAP };
   gpu.hist_cap = cap;
-  let evict = if gpu.slots <= GiSettings::IRC_SLOTS_MIN {
-    GiSettings::EVICT_FRAMES
-  } else {
-    GiSettings::EVICT_FRAMES / 2
-  };
+  let evict = if moved { GiSettings::EVICT_FRAMES_MOVING } else { GiSettings::EVICT_FRAMES };
 
   *gpu.uniform.get_mut() = GiUniform {
     params: Vec4::new(

@@ -132,8 +132,6 @@ fn irc_claim(k: vec2<u32>) -> u32 {
     }
     if (k1 == k.y && atomicLoad(&irc_key[b]) == k.x) { return base + j; }
   }
-  // 桶满时按最旧时间戳原位淘汰，保证新露出的表面总能拿到槽位，
-  // 否则要等全局年龄回收（数百帧）后才开始收敛，表现为成片斑纹卡住数秒。
   for (var attempt = 0u; attempt < 2u; attempt = attempt + 1u) {
     var victim = IRC_NONE;
     var oldest = 0xFFFFFFFFu;
@@ -189,8 +187,6 @@ fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
       foot = foot / max(g.scale, 1e-6);
     }
   }
-  // 单元屏幕尺寸必须 ≥ 一个 GI texel，否则一个 texel 覆盖多个单元，
-  // 只有被采样到的那个单元能拿到值，其余单元会留下长期不收敛的斑纹。
   let level = clamp(u32(ceil(log2(max(foot, 1.0)))), lmin, IRC_MAX_LEVEL);
   let cell_px = f32(1u << level) * gi_u.params.y / foot;
   let per = cell_px / max(gi_u.flags.y, 1.0);
@@ -235,7 +231,8 @@ fn irc_plane(v: vec3<i32>, level: u32, face: u32, obj: u32) -> vec4<f32> {
   return acc;
 }
 
-fn irc_display(a: IrcAddr, n: vec3<f32>) -> vec4<f32> {
+fn irc_display(a: IrcAddr, n_in: vec3<f32>) -> vec4<f32> {
+  let n = select(n_in, vec3<f32>(0.0, 1.0, 0.0), dot(n_in, n_in) < 1e-6);
   let w = n * n;
   var acc = vec4<f32>(0.0);
   var wsum = 0.0;
@@ -291,7 +288,9 @@ fn irc_lookup(a: IrcAddr, face: u32) -> IrcHit {
   return out;
 }
 
-fn irc_accumulate(a: IrcAddr, n: vec3<f32>, e: vec3<f32>, has_e: bool, sun: f32, rnd: vec2<f32>) {
+fn irc_accumulate(a: IrcAddr, n_in: vec3<f32>, e: vec3<f32>, has_e: bool, sun: f32,
+                  rnd: vec2<f32>) {
+  let n = select(n_in, vec3<f32>(0.0, 1.0, 0.0), dot(n_in, n_in) < 1e-6);
   let w = n * n;
   var ev = min(e, vec3<f32>(IRC_V_MAX));
   ev = select(vec3<f32>(0.0), ev, ev >= vec3<f32>(0.0));

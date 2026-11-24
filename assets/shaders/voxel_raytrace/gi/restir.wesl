@@ -19,6 +19,17 @@ const RES_W_FLAGS: u32 = 21u;
 
 const RES_VALID: u32 = 1u;
 const RES_M_CAP: f32 = 1000000.0;
+const RES_N_DOT: f32 = 0.9;
+const RES_PLANE_TOL: f32 = 2.0;
+const RES_PLANE_REL: f32 = 0.02;
+
+fn res_same_surface(p: Res, r: Res) -> bool {
+  if (!p.valid) { return false; }
+  if ((p.k1 >> 19u) != (r.k1 >> 19u)) { return false; }
+  if (dot(p.n, r.n) < RES_N_DOT) { return false; }
+  let d = p.x - r.x;
+  return abs(dot(d, r.n)) <= RES_PLANE_TOL + RES_PLANE_REL * length(d);
+}
 
 struct Res {
   y: vec3<f32>,
@@ -57,7 +68,9 @@ fn res_pack_n(n: vec3<f32>) -> vec2<u32> {
 
 fn res_unpack_n(a: u32, b: u32) -> vec3<f32> {
   let lo = unpack2x16float(a);
-  return normalize(vec3<f32>(lo.x, lo.y, unpack2x16float(b).x));
+  let n = vec3<f32>(lo.x, lo.y, unpack2x16float(b).x);
+  let l = length(n);
+  return select(vec3<f32>(0.0, 1.0, 0.0), n / l, l > 1e-6);
 }
 
 fn res_load_prev(idx: u32) -> Res {
@@ -247,7 +260,7 @@ fn res_add_pick(r: Res, p: LtSample, vis: f32, rnd: f32) -> Res {
 }
 
 fn res_adopt(r: Res, p: Res, rnd: f32) -> Res {
-  if (!p.valid || p.m <= 0.0 || p.rev != r.rev || p.k0 != r.k0 || p.k1 != r.k1) { return r; }
+  if (p.m <= 0.0 || p.rev != r.rev || !res_same_surface(p, r)) { return r; }
   var out = r;
   let ps = dot(p.sum, GI_LUMA);
   out.sum = out.sum + p.sum;
@@ -257,13 +270,13 @@ fn res_adopt(r: Res, p: Res, rnd: f32) -> Res {
     out.le = p.le;
     out.nl = p.nl;
     out.pa = p.pa;
-    out.vis = 0.0;
+    out.vis = p.vis;
   }
   return out;
 }
 
 fn res_add_nb(r: Res, p: Res, rnd: f32) -> Res {
-  if (!p.valid || p.m <= 0.0) { return r; }
+  if (p.m <= 0.0 || !res_same_surface(p, r)) { return r; }
   let c = res_chat(p.y, p.le, p.nl, p.pa, r.x, r.n) * p.vis;
   let w = dot(c, GI_LUMA);
   var out = r;

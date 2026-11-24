@@ -97,8 +97,6 @@ fn gi_record_pixel(texel: vec2<u32>) -> vec2<u32> {
   return texel * d + gi_jitter(gi_u.seq.x, d);
 }
 
-// 缓存完全没有条目时的天光兜底：按法线取天空环境，覆盖率上来后退回 GI 缓存值。
-// 用接近收敛量级的天光而不是一个极小的底值，避免新露出表面先闪黑再慢慢变亮。
 fn gi_ambient_fallback(n: vec3<f32>, cov: f32) -> vec3<f32> {
   let hemi = 0.5 + 0.5 * max(n.y, 0.0);
   let gap = 1.0 - clamp(cov, 0.0, 1.0);
@@ -106,8 +104,6 @@ fn gi_ambient_fallback(n: vec3<f32>, cov: f32) -> vec3<f32> {
   return sky_ambient(n) * (open + GI_AMBIENT_FLOOR);
 }
 
-// 一个 GI texel 每帧的样本数：先补足「每帧至少一次落到缓存单元」，
-// 未成熟的单元再按 n 加码，n 上来后回落，避免长期付高采样成本。
 fn gi_sample_base() -> u32 {
   let per_cell = f32(gi_div()) / max(gi_u.params.y, 1.0);
   return u32(clamp(ceil(per_cell * per_cell), 1.0, f32(GI_SPP_MAX)));

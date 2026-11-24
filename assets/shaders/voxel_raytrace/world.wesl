@@ -26,19 +26,38 @@ fn vol_tint_color(h: WorldHit) -> vec3<f32> {
   }
 }
 
+fn degenerate_axis_normal(solid_neg: vec3<f32>, solid_pos: vec3<f32>) -> vec3<f32> {
+  let air_pos = vec3<f32>(1.0) - solid_pos;
+  let air_neg = vec3<f32>(1.0) - solid_neg;
+  let air = air_pos + air_neg;
+  if (air.x + air.y + air.z <= 0.0) { return vec3<f32>(0.0, 1.0, 0.0); }
+  var axis = 1u;
+  if (air.x > air.y && air.x >= air.z) { axis = 0u; }
+  else if (air.z > air.y && air.z > air.x) { axis = 2u; }
+  var n = vec3<f32>(0.0);
+  n[axis] = select(-1.0, 1.0, air_pos[axis] > 0.0);
+  return n;
+}
+
 fn voxel_normal(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>) -> vec3<f32> {
   let x = vec3<i32>(1, 0, 0);
   let y = vec3<i32>(0, 1, 0);
   let z = vec3<i32>(0, 0, 1);
-  var d = vec3<f32>(0.0);
-  d.x = f32(world_solid(g, voxel - x)) - f32(world_solid(g, voxel + x));
-  d.y = f32(world_solid(g, voxel - y)) - f32(world_solid(g, voxel + y));
-  d.z = f32(world_solid(g, voxel - z)) - f32(world_solid(g, voxel + z));
+  let sn = vec3<f32>(f32(world_solid(g, voxel - x)),
+                     f32(world_solid(g, voxel - y)),
+                     f32(world_solid(g, voxel - z)));
+  let sp = vec3<f32>(f32(world_solid(g, voxel + x)),
+                     f32(world_solid(g, voxel + y)),
+                     f32(world_solid(g, voxel + z)));
+  let d = sn - sp;
 
   var dw = d;
   if (g.obj_id >= 0) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
   if (dot(dw, dw) > 0.0) { return normalize(dw); }
-  return normalize(g.col1);
+  let ln = degenerate_axis_normal(sn, sp);
+  var lw = ln;
+  if (g.obj_id >= 0) { lw = ln.x * g.col0 + ln.y * g.col1 + ln.z * g.col2; }
+  return normalize(lw);
 }
 
 fn nb_solid_fast(leaf: u32, leaf_pal: u32, mask: u64, c: vec3<i32>, off: vec3<i32>) -> f32 {
@@ -114,11 +133,16 @@ fn voxel_normal_fast(g: Grid, voxel: vec3<i32>, face_id: u32, face_n: vec3<f32>)
   if (any(vec3<f32>(xp, yp, zp) < vec3<f32>(0.0)) || any(vec3<f32>(xm, ym, zm) < vec3<f32>(0.0))) {
     return voxel_normal(g, voxel, face_id, face_n);
   }
-  var d = vec3<f32>(xm - xp, ym - yp, zm - zp);
+  let sn = vec3<f32>(xm, ym, zm);
+  let sp = vec3<f32>(xp, yp, zp);
+  let d = sn - sp;
   var dw = d;
   if (g.obj_id >= 0) { dw = d.x * g.col0 + d.y * g.col1 + d.z * g.col2; }
   if (dot(dw, dw) > 0.0) { return normalize(dw); }
-  return normalize(g.col1);
+  let ln = degenerate_axis_normal(sn, sp);
+  var lw = ln;
+  if (g.obj_id >= 0) { lw = ln.x * g.col0 + ln.y * g.col1 + ln.z * g.col2; }
+  return normalize(lw);
 }
 
 fn voxel_center_world(g: Grid, voxel: vec3<i32>) -> vec3<f32> {

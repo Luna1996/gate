@@ -1,7 +1,7 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
-import package::gi::consts::{GI_LUMA, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, IRC_WORDS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_LUMA, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS};
 import package::gi::irc::{irc_accumulate, irc_addr, irc_display, irc_lookup, irc_resolve_slot};
 import package::gi::light::{lt_hit_weight, lt_nee, lt_pick, lt_register, lt_sweep_slot};
 import package::gi::ray::{gi_accumulate, gi_accumulate_sun, gi_leaf_indirect, gi_origin, gi_sun_vis, gi_surface};
@@ -572,8 +572,6 @@ var<workgroup> cam_pal_wg: u32;
 fn dda_hit_record(gid: vec3<u32>, size: vec2<u32>, hit: WorldHit, origin_voxel: vec3<f32>) {
   let gid2 = vec2<u32>(u32(gid.x), u32(gid.y));
   let px = gi_record_pixel(gid2 / gi_div());
-  // 一个 GI texel 内只允许当前帧抖动到的那一个像素写入，
-  // 这样 16 帧循环会轮流覆盖块内的所有表面，而不是固定由一个像素代表整块。
   if (px.x != gid2.x || px.y != gid2.y) { return; }
   let texel = px / gi_div();
   let hsz = textureDimensions(dda_hit);
@@ -1002,6 +1000,9 @@ fn dda_visible(@builtin(global_invocation_id) gid: vec3<u32>,
   var n = vec3<f32>(0.0);
   if (first.hit && (light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) != 0u) {
     n = voxel_normal_fast(make_grid(u32(first.obj_id) + 1u), first.voxel, first.face_id, first.n);
+    if ((palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
+      n = first.n;
+    }
   }
   textureStore(dda_nrm, coord, vec4<f32>(n, 0.0));
   textureStore(dda_vis, coord, vec4<u32>(
@@ -1193,7 +1194,7 @@ fn gi_light_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
   lt_sweep_slot(gid.x);
 }
 
-const RES_SPATIAL_TAPS: u32 = 4u;
+const RES_SPATIAL_TAPS: u32 = 8u;
 
 @compute @workgroup_size(8, 8, 1)
 fn gi_restir_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1243,7 +1244,9 @@ fn gi_restir_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pp = vec2<i32>(floor(uv * vec2<f32>(f32(size.x), f32(size.y))));
     if (pp.x >= 0 && pp.y >= 0 && pp.x < i32(size.x) && pp.y < i32(size.y)) {
       let prev = res_load_prev(u32(pp.y) * size.x + u32(pp.x));
+      let m0 = r.m;
       r = res_adopt(r, prev, gi_rand2(seed).x);
+      if (r.m > m0) { atomicAdd(&gi_stats[GI_STAT_RES_TEMPORAL], 1u); }
     }
   }
   let pick = lt_pick(s.p, s.n, gi_mix(seed + 0x68E31DA4u));
@@ -1271,15 +1274,19 @@ fn gi_restir_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.y * size.x + gid.x;
   let coord = vec2<i32>(i32(gid.x), i32(gid.y));
   var r = res_load_tmp(idx);
-  let offs = array<vec2<i32>, 4>(vec2<i32>(1, 0), vec2<i32>(-1, 0),
-                                 vec2<i32>(0, 1), vec2<i32>(0, -1));
+  let offs = array<vec2<i32>, 8>(vec2<i32>(1, 0), vec2<i32>(-1, 0),
+                                 vec2<i32>(0, 1), vec2<i32>(0, -1),
+                                 vec2<i32>(1, 1), vec2<i32>(1, -1),
+                                 vec2<i32>(-1, 1), vec2<i32>(-1, -1));
   let seed = gi_mix(idx * 0x9E3779B1u + gi_u.seq.x * 0x27D4EB2Fu);
   for (var i = 0u; r.valid && i < RES_SPATIAL_TAPS; i = i + 1u) {
     let nc = coord + offs[i];
     if (nc.x < 0 || nc.y < 0 || nc.x >= i32(size.x) || nc.y >= i32(size.y)) { continue; }
     let nb = res_load_tmp(u32(nc.y) * size.x + u32(nc.x));
-    if (!nb.valid || nb.rev != r.rev || nb.k0 != r.k0 || nb.k1 != r.k1) { continue; }
+    if (nb.rev != r.rev) { continue; }
+    let m0 = r.m;
     r = res_add_nb(r, nb, gi_rand2(gi_mix(seed + i * 0x9E3779B9u)).x);
+    if (r.m > m0) { atomicAdd(&gi_stats[GI_STAT_RES_SPATIAL], 1u); }
   }
   if (r.valid && r.rev != gi_u.seq.z) { r = res_none(); }
   res_store_cur(idx, res_finish(r));
@@ -1328,8 +1335,6 @@ fn gi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (sun < 0.0) { sun = gi_sun_vis(s); }
   let maturity = irc_lookup(s.addr, s.face);
   var spp = min(gi_sample_base() * gi_sample_boost(maturity.n), GI_SPP_MAX);
-  // 相机在动时不额外加采样：此时大量单元刚被揭示，加采样换来的收敛很快又被下一帧的视角丢掉，
-  // 只会压帧率；世界空间缓存仍按 1 spp/texel 继续积累，静止后再集中补。
   if (gi_u.flags.w > 0.5) { spp = min(gi_sample_base(), 1u); }
   let seed0 = gi_mix(seed + 0x3C6EF372u);
   atomicAdd(&gi_stats[GI_STAT_RAYS], spp);
