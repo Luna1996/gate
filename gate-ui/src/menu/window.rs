@@ -46,6 +46,13 @@ pub struct MenuPager {
   start_off: f32,
 }
 
+impl DebugMenu {
+  /// 请求按当前模型重建菜单页（模型被外部修改后调用）。
+  pub fn request_rebuild(&mut self) {
+    self.rebuild = true;
+  }
+}
+
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct MenuCollapse {
   t: f32,

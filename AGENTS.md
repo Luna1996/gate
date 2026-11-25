@@ -82,7 +82,7 @@
 - NGX ProjectId 由驱动验证：GUID 形状 + 连续相同数字 < 5（`Init_with_ProjectID` 对占位符式 ID 返回 InvalidParameter）。改 `ngx_project_id()` 常量时保持 v4 形状与杂散尾部。
 - eval 约定（对齐 NVIDIA 官方样例与 bevy 0.20 集成）：`InJitterOffset` 传 **−j**（j = 射线采样子像素偏移）；mvec 以 forward（cur−pre）、输出像素、Y 向下存储 ⇒ `motion_vector_scale` 取负并乘内部/输出比（NGX 期望 backward、内部渲染像素）；depth 用线性视深（`clip.w`）、不设 `InvertedDepth`；上下文创建带 `AutoExposure | LowResolutionMotionVectors`（Automatic 曝光依赖 flag 声明，mvec 纹理在内部渲染分辨率）。
 - 依赖链：`tools/fetch-dlss-deps.ps1` 幂等拉取（libclang 优先复用系统 LLVM）；`.cargo/config.toml` 的 `DLSS_SDK`/`VULKAN_SDK`/`LIBCLANG_PATH` 与 exe 同目录 `nvngx_dlss.dll` 是构建/运行前提。gnu 构建不编译 dlss 模块，`responsive.rs` 的 cfg 门控使档位选择在无 dlss 构建下无效并打降级日志。
-- 菜单档位 `render/dlss/mode` 由 `apply_dlss_availability` 按探测结果置灰（`SwitchGroup.disabled`：dim 文本 + `UiDisabled` 拦截点击）；探测不可用时选中值强制回 Off。
+- 菜单档位 `video/dlss/mode` 由 `apply_dlss_availability` 按探测结果置灰（`SwitchGroup.disabled`：dim 文本 + `UiDisabled` 拦截点击）；探测不可用时选中值强制回 Off。DLSS 激活时「像素大小」「抗锯齿」联动置灰（`set_video_exclusivity` + `DebugMenu::request_rebuild` 重刷当前页），切回关恢复；渲染端同规则（`responsive.rs` 按 DLSS 档位取内部分辨率、blit 在 DLSS 激活时关 FXAA），UI 只呈现既有行为。
 
 ## 运行期数据 / 资源
 

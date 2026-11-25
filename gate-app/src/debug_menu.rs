@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use bevy::prelude::*;
 use bevy::window::{
@@ -20,8 +20,8 @@ use crate::showcase::ShowcaseRoot;
 use gate_ui::widgets::{LabelConfig, LabelStyle, label, px};
 use gate_ui::widgets::{TextInputState, TextInputValue};
 use gate_ui::{
-  DebugMenu, DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, UiCtx, UiTranslator,
-  parse_hex_color, spawn_debug_menu,
+  DebugMenu, DebugMenuRoot, MenuAction, MenuActionEvent, MenuFile, MenuNode, MenuValue, UiCtx,
+  UiTranslator, parse_hex_color, spawn_debug_menu,
 };
 use std::sync::atomic::Ordering;
 
@@ -85,11 +85,30 @@ pub fn load_menu(config: &Config) -> MenuFile {
     }
   };
   apply_world_model_options(&mut model);
-  let applied = model.apply_values(&config.menu);
+  let values = migrate_dlss_menu_path(&config.menu);
+  let applied = model.apply_values(&values);
   model.window = config.window.clone();
   model.sanitize();
-  info!("debug menu config 命中 {applied}/{}", config.menu.len());
+  info!("debug menu config 命中 {applied}/{}", values.len());
   model
+}
+
+/// DLSS 档位从 `render/dlss/mode` 迁到 `video/dlss/mode` 后，一次性改写旧键
+/// （键与选项 label 同前缀）。应用下一次保存会以新键落盘，旧键自然消失。
+fn migrate_dlss_menu_path(values: &BTreeMap<String, MenuValue>) -> BTreeMap<String, MenuValue> {
+  const OLD_KEY: &str = "render/dlss/mode";
+  const OLD_PREFIX: &str = "menu.render.dlss.mode.";
+  let Some(v) = values.get(OLD_KEY) else { return values.clone() };
+  let mut out = values.clone();
+  out.remove(OLD_KEY);
+  let v = match v {
+    MenuValue::Text(s) if s.starts_with(OLD_PREFIX) => {
+      MenuValue::Text(format!("menu.video.dlss.mode.{}", &s[OLD_PREFIX.len()..]))
+    }
+    v => v.clone(),
+  };
+  out.entry("video/dlss/mode".to_string()).or_insert(v);
+  out
 }
 
 fn apply_world_model_options(model: &mut MenuFile) {
@@ -155,6 +174,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
 
 /// DLSS 档位控件按探测可用性置灰：探测由渲染初始化（RenderPlugin::finish）
 /// 填充，本系统运行于其后的 Startup；未编译 dlss feature 时恒为不可用。
+/// DLSS 激活时「像素大小」与「抗锯齿」随之置灰（DLSS 接管内部分辨率与 AA）。
 fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   #[cfg(feature = "dlss")]
   let supported = world
@@ -163,7 +183,7 @@ fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   #[cfg(not(feature = "dlss"))]
   {
     let _ = world;
-    let path = split("render/dlss/mode");
+    let path = split("video/dlss/mode");
     if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) = model.node_mut(&path) {
       *disabled = true;
       *selected = 0;
@@ -172,14 +192,27 @@ fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   }
   #[cfg(feature = "dlss")]
   {
-    let path = split("render/dlss/mode");
+    let path = split("video/dlss/mode");
+    let mut dlss_on = false;
     if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) = model.node_mut(&path) {
       *disabled = !supported;
       if !supported {
         *selected = 0;
       }
+      dlss_on = supported && *selected != 0;
     }
+    set_video_exclusivity(&mut model, dlss_on);
     model
+  }
+}
+
+/// DLSS 与「像素大小」「抗锯齿」的互斥置灰；两侧节点在 menu toml 的 video 段。
+fn set_video_exclusivity(model: &mut MenuFile, dlss_on: bool) {
+  if let Some(MenuNode::SwitchGroup { disabled, .. }) = model.node_mut(&split("video/scale")) {
+    *disabled = dlss_on;
+  }
+  if let Some(MenuNode::Toggle { disabled, .. }) = model.node_mut(&split("video/aa")) {
+    *disabled = dlss_on;
   }
 }
 
@@ -328,14 +361,20 @@ fn register_callbacks(world: &mut World) {
      mut eye: ResMut<gate_render::EyeAdaptSettings>,
      mut refl: ResMut<gate_render::ReflectionSettings>,
      mut base: ResMut<gate_render::BaseSettings>,
-     mut dlss: ResMut<gate_render::DlssSettings>| {
+     mut dlss: ResMut<gate_render::DlssSettings>,
+     mut menu: Query<&mut DebugMenu, With<DebugMenuRoot>>| {
       match (ev.path.as_str(), &ev.action) {
-        ("render/dlss/mode", MenuAction::Select(i)) => {
+        ("video/dlss/mode", MenuAction::Select(i)) => {
           dlss.mode = gate_render::DlssMode::CHOICES[(*i).min(5)];
           #[cfg(feature = "dlss")]
           info!("DLSS → {:?}（内部 {:?}）", dlss.mode, dlss.mode.ratio());
           #[cfg(not(feature = "dlss"))]
           info!("DLSS ! 构建缺 --features dlss，档位不生效");
+          // DLSS 接管内部分辨率与 AA ⇒ 像素大小 / 抗锯齿置灰，切回关时恢复
+          if let Ok(mut menu) = menu.single_mut() {
+            set_video_exclusivity(&mut menu.model, dlss.mode != gate_render::DlssMode::Off);
+            menu.request_rebuild();
+          }
         }
         ("render/ray/quality", MenuAction::Select(i)) => {
           let q = (*i).min(2) as u32;

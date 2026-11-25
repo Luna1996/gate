@@ -32,6 +32,26 @@ options = [
 selected = 0
 
 [[items.children]]
+kind = "sub_menu"
+id = "dlss"
+label = "menu.video.dlss"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "mode"
+label = "menu.video.dlss.mode"
+options = [
+    "menu.video.dlss.mode.off",
+    "menu.video.dlss.mode.dlaa",
+    "menu.video.dlss.mode.quality",
+    "menu.video.dlss.mode.balanced",
+    "menu.video.dlss.mode.performance",
+    "menu.video.dlss.mode.ultra",
+]
+selected = 0
+tooltip = "menu.video.dlss.mode.tip"
+
+[[items.children]]
 kind = "toggle"
 id = "aa"
 label = "menu.video.aa"
@@ -267,26 +287,6 @@ max = 0.5
 step = 0.01
 decimals = 3
 tooltip = "menu.render.exposure.key.tip"
-
-[[items.children]]
-kind = "sub_menu"
-id = "dlss"
-label = "menu.render.dlss"
-
-[[items.children.children]]
-kind = "switch_group"
-id = "mode"
-label = "menu.render.dlss.mode"
-options = [
-    "menu.render.dlss.mode.off",
-    "menu.render.dlss.mode.dlaa",
-    "menu.render.dlss.mode.quality",
-    "menu.render.dlss.mode.balanced",
-    "menu.render.dlss.mode.performance",
-    "menu.render.dlss.mode.ultra",
-]
-selected = 0
-tooltip = "menu.render.dlss.mode.tip"
 
 [[items.children]]
 kind = "sub_menu"
