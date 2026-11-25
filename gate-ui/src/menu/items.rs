@@ -11,8 +11,8 @@ use crate::icon::Icon;
 use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::widgets::{
   DropdownConfig, LabelConfig, LabelOverflow, LabelStyle, SliderConfig, TextInputConfig,
-  TextInputKind, ToggleSwitchConfig, Tooltip, UiCtx, UiDisabled, color_of, dropdown, label, px,
-  slider, spawn_icon, text_input, toggle_switch,
+  TextInputKind, ToggleSwitchConfig, Tooltip, UiCtx, UiDisabled, color_of, dim_color, dropdown,
+  label, px, slider, spawn_icon, text_input, toggle_switch,
 };
 
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +130,21 @@ fn option_button(
   disabled: bool,
 ) -> Entity {
   let m = &ctx.theme.metrics;
+  // 与 button/checkbox 同款禁用约定：底/边/字全部 dim，拾取源头忽略
+  // （无 Hovered ⇒ 无悬停变色与光标变化；refresh_visuals 会持续钉住）
+  let (bg, border) = if disabled {
+    (
+      dim_color(color_of(&ctx.theme.colors.surface_elevated)),
+      dim_color(color_of(&ctx.theme.colors.border)),
+    )
+  } else {
+    (color_of(&ctx.theme.colors.surface_elevated), color_of(&ctx.theme.colors.border))
+  };
+  let text_color = if disabled {
+    dim_color(color_of(&ctx.theme.colors.text_muted))
+  } else {
+    color_of(&ctx.theme.colors.text_muted)
+  };
   let mut ec = parent.spawn((
     Name::new("menu-option-button"),
     MenuOptionButton,
@@ -150,32 +165,27 @@ fn option_button(
       },
       ..default()
     },
-    BackgroundColor(color_of(&ctx.theme.colors.surface_elevated)),
-    BorderColor::all(color_of(&ctx.theme.colors.border)),
+    BackgroundColor(bg),
+    BorderColor::all(border),
     MouseIntercept,
   ));
   if disabled {
-    ec.insert(UiDisabled);
+    ec.insert((UiDisabled, Pickable::IGNORE));
   }
   ec.with_children(|b| {
-    let id = b
-      .spawn((
-        Name::new("menu-option-text"),
-        bevy::ui::widget::Label,
-        crate::i18n::I18nKey::new(key),
-        Text::new(ctx.text(key)),
-        TextFont {
-          font: ctx.font_source(),
-          font_size: bevy::text::FontSize::Px(m.font_size.sm),
-          ..default()
-        },
-        TextColor(color_of(&ctx.theme.colors.text_muted)),
-        BevyTextLayout { linebreak: LineBreak::NoWrap, ..default() },
-      ))
-      .id();
-    if disabled {
-      dim_text(b.world_mut(), id);
-    }
+    b.spawn((
+      Name::new("menu-option-text"),
+      bevy::ui::widget::Label,
+      crate::i18n::I18nKey::new(key),
+      Text::new(ctx.text(key)),
+      TextFont {
+        font: ctx.font_source(),
+        font_size: bevy::text::FontSize::Px(m.font_size.sm),
+        ..default()
+      },
+      TextColor(text_color),
+      BevyTextLayout { linebreak: LineBreak::NoWrap, ..default() },
+    ));
   });
   ec.id()
 }

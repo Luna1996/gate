@@ -969,52 +969,65 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
     t.0 = glyph.to_string();
   }
 
-  let mut q = world.query::<(Entity, &MenuItem, &Hovered, Has<Pressed>, Option<&Children>)>();
-  let rows: Vec<(Entity, String, MenuRole, UiInteract, Vec<Entity>)> = q
+  let mut q = world
+    .query::<(Entity, &MenuItem, &Hovered, Has<Pressed>, Has<UiDisabled>, Option<&Children>)>();
+  let rows: Vec<(Entity, String, MenuRole, UiInteract, bool, Vec<Entity>)> = q
     .iter(world)
-    .map(|(e, item, hovered, pressed, ch)| {
+    .map(|(e, item, hovered, pressed, disabled, ch)| {
       (
         e,
         item.path.clone(),
         item.role,
         UiInteract::of(hovered, pressed),
+        disabled,
         ch.map(|c| c.iter().collect()).unwrap_or_default(),
       )
     })
     .collect();
   drop(q);
   let mut shared_edges: Vec<(Entity, usize, Entity, u8, Color)> = Vec::new();
-  for (e, path, role, inter, children) in rows {
-    let hovered = inter.is_active();
-    let (bg, border, fg, prio) = match role {
-      MenuRole::SubMenu => {
-        (if hovered { surface_elevated } else { Color::NONE }, Color::NONE, text_body, 0)
+  for (e, path, role, inter, disabled, children) in rows {
+    let hovered = inter.is_active() && !disabled;
+    let (bg, border, fg, prio) = if disabled {
+      match role {
+        MenuRole::SubMenu => (Color::NONE, Color::NONE, dim_color(text_body), 0),
+        MenuRole::SwitchOption(_) | MenuRole::Tab(_) | MenuRole::Button(_) => {
+          // button/checkbox 同款：钉在置灰静止色，悬停/选中不再起效
+          (dim_color(surface_elevated), dim_color(border), dim_color(text_muted), 0)
+        }
+        _ => continue,
       }
-      MenuRole::SwitchOption(i) | MenuRole::Tab(i) => {
-        let selected = {
-          let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
-          if matches!(role, MenuRole::Tab(_)) {
-            menu.tabs.get(&path).copied().unwrap_or(0) == i
+    } else {
+      match role {
+        MenuRole::SubMenu => {
+          (if hovered { surface_elevated } else { Color::NONE }, Color::NONE, text_body, 0)
+        }
+        MenuRole::SwitchOption(i) | MenuRole::Tab(i) => {
+          let selected = {
+            let menu = world.get::<DebugMenu>(root).expect("DebugMenu 存在");
+            if matches!(role, MenuRole::Tab(_)) {
+              menu.tabs.get(&path).copied().unwrap_or(0) == i
+            } else {
+              matches!(menu.model.node(&split_path(&path)), Some(MenuNode::SwitchGroup { selected, .. }) if *selected == i)
+            }
+          };
+          if selected {
+            (accent_fill, accent_text, text_primary, 2)
+          } else if hovered {
+            (surface_overlay, border_strong, text_body, 1)
           } else {
-            matches!(menu.model.node(&split_path(&path)), Some(MenuNode::SwitchGroup { selected, .. }) if *selected == i)
+            (surface_elevated, border, text_muted, 0)
           }
-        };
-        if selected {
-          (accent_fill, accent_text, text_primary, 2)
-        } else if hovered {
-          (surface_overlay, border_strong, text_body, 1)
-        } else {
-          (surface_elevated, border, text_muted, 0)
         }
-      }
-      MenuRole::Button(_) => {
-        if hovered {
-          (surface_overlay, border_strong, text_body, 1)
-        } else {
-          (surface_elevated, border, text_muted, 0)
+        MenuRole::Button(_) => {
+          if hovered {
+            (surface_overlay, border_strong, text_body, 1)
+          } else {
+            (surface_elevated, border, text_muted, 0)
+          }
         }
+        _ => continue,
       }
-      _ => continue,
     };
     if let Some(mut b) = world.get_mut::<BackgroundColor>(e)
       && b.0 != bg

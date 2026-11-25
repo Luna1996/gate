@@ -18,12 +18,12 @@ NVIDIA DLSS 超分辨率：内部按比例缩小渲染，由 GPU 张量核重建
 - **关**：回到「像素大小」的静态缩放；激活时「像素大小」与「抗锯齿」自动置灰（DLSS 接管内部分辨率与 AA）
 
 需要 RTX GPU 与 NGX 运行库；不可用时本行置灰、自动回退原生输出，切换时重建上下文会掉一帧。"""
-"menu.video.dlss.off" = "关"
+"menu.video.dlss.off" = "关闭"
 "menu.video.dlss.dlaa" = "DLAA"
 "menu.video.dlss.quality" = "质量"
 "menu.video.dlss.balanced" = "平衡"
 "menu.video.dlss.performance" = "性能"
-"menu.video.dlss.ultra" = "超性能"
+"menu.video.dlss.ultra" = "超级"
 "menu.video.fps" = "显示帧率"
 "menu.render" = "渲染"
 "menu.render.base" = "基础"
