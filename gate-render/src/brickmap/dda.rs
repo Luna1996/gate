@@ -207,12 +207,12 @@ use bevy::{
     Render, RenderApp, RenderStartup, RenderSystems,
     render_asset::RenderAssets,
     render_resource::{
-      BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayoutDescriptor,
+      BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
       BindGroupLayoutEntries, BindingResource, CachedComputePipelineId, CachedRenderPipelineId,
-      ColorTargetState, ColorWrites, ComputePipelineDescriptor, Extent3d, FilterMode,
-      FragmentState, PipelineCache, RenderPassDescriptor, SamplerBindingType, ShaderStages,
-      StorageTextureAccess, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
-      TextureUsages, TextureViewDescriptor, UniformBuffer, VertexState,
+      ColorTargetState, ColorWrites, ComputePipeline, ComputePipelineDescriptor, Extent3d,
+      FilterMode, FragmentState, PipelineCache, RenderPassDescriptor, SamplerBindingType,
+      ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension, TextureFormat,
+      TextureSampleType, TextureUsages, TextureViewDescriptor, UniformBuffer, VertexState,
       binding_types::{
         sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
         texture_2d_array, texture_storage_2d, uniform_buffer,
@@ -289,6 +289,60 @@ impl AuxTexCache {
   }
 }
 
+#[derive(Clone)]
+pub enum ComputePipe {
+  Bevy(CachedComputePipelineId),
+  Raw(std::sync::Arc<std::sync::OnceLock<ComputePipeline>>),
+}
+
+impl ComputePipe {
+  pub fn get<'a>(&'a self, cache: &'a PipelineCache) -> Option<&'a ComputePipeline> {
+    match self {
+      ComputePipe::Bevy(id) => cache.get_compute_pipeline(*id),
+      ComputePipe::Raw(p) => p.get(),
+    }
+  }
+}
+
+pub(crate) fn raw_compute_pipe(
+  device: &RenderDevice,
+  cache: &PipelineCache,
+  gate: &crate::pipe_cache::GatePipeCache,
+  label: &'static str,
+  layouts: &[BindGroupLayoutDescriptor],
+  entry: &'static str,
+) -> Option<ComputePipe> {
+  let module = gate.module.clone()?;
+  let pc = gate.pc.clone()?;
+  let bgs: Vec<BindGroupLayout> = layouts.iter().map(|d| cache.get_bind_group_layout(d)).collect();
+  let slot = std::sync::Arc::new(std::sync::OnceLock::new());
+  let slot_out = slot.clone();
+  let device = device.wgpu_device().clone();
+  std::thread::Builder::new()
+    .name(format!("gate-pipe-{entry}"))
+    .spawn(move || {
+      let t0 = std::time::Instant::now();
+      let bg_refs: Vec<Option<&wgpu::BindGroupLayout>> = bgs.iter().map(|b| Some(&**b)).collect();
+      let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &bg_refs,
+        immediate_size: 0,
+      });
+      let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: Some(&pc),
+      });
+      info!(target: "gate", "PIPE {entry} 编译 {:.1}s", t0.elapsed().as_secs_f32());
+      let _ = slot_out.set(ComputePipeline::from(pipe));
+    })
+    .expect("管线编译线程创建失败");
+  Some(ComputePipe::Raw(slot))
+}
+
 #[derive(Resource)]
 pub(crate) struct DdaPipelines {
   pub(crate) bg0_layout: BindGroupLayoutDescriptor,
@@ -301,22 +355,20 @@ pub(crate) struct DdaPipelines {
   blit_layout: BindGroupLayoutDescriptor,
 
   eye_layout: BindGroupLayoutDescriptor,
-  pub(crate) compute_pipeline: CachedComputePipelineId,
-  preview_pipeline: CachedComputePipelineId,
   bg0_perf_layout: BindGroupLayoutDescriptor,
-  visible_pipeline: CachedComputePipelineId,
-  shadow_pipeline: CachedComputePipelineId,
-  shade_pipeline: CachedComputePipelineId,
-  glass_pipeline: CachedComputePipelineId,
+  visible_pipeline: ComputePipe,
+  shadow_pipeline: ComputePipe,
+  shade_pipeline: ComputePipe,
+  glass_pipeline: ComputePipe,
   refl_write_layout: BindGroupLayoutDescriptor,
   refl_read_layout: BindGroupLayoutDescriptor,
-  refl_pipeline: CachedComputePipelineId,
-  compose_pipeline: CachedComputePipelineId,
+  refl_pipeline: ComputePipe,
+  compose_pipeline: ComputePipe,
 
-  pub(crate) beam_pipeline: CachedComputePipelineId,
+  pub(crate) beam_pipeline: ComputePipe,
 
-  eye_histogram_pipeline: CachedComputePipelineId,
-  eye_update_pipeline: CachedComputePipelineId,
+  eye_histogram_pipeline: ComputePipe,
+  eye_update_pipeline: ComputePipe,
   pub blit_pipeline: CachedRenderPipelineId,
 
   blit_fxaa_pipeline: CachedRenderPipelineId,
@@ -417,13 +469,18 @@ impl Plugin for BrickMapDdaPlugin {
     app.init_resource::<crate::lighting::ReflectionSettings>();
     app.init_resource::<crate::lighting::BaseSettings>();
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
+    let dda_source = app.world().resource::<crate::shader::DdaShaderSource>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
       return;
     };
     render_app.insert_resource(dda_shader);
+    render_app.insert_resource(dda_source);
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
-      .add_systems(RenderStartup, init_dda_pipelines)
+      .add_systems(
+        RenderStartup,
+        (crate::pipe_cache::init_gate_pipe_cache, init_dda_pipelines).chain(),
+      )
       .add_systems(Render, sync_eye_adapt_settings.in_set(RenderSystems::PrepareResources))
       .add_systems(
         Render,
@@ -464,7 +521,9 @@ fn extract_camera_config(
 pub(crate) fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
+  render_device: Res<RenderDevice>,
   dda_shader: Res<crate::shader::DdaShaderHandle>,
+  gate: Res<crate::pipe_cache::GatePipeCache>,
   pipeline_cache: Res<PipelineCache>,
 ) {
   let mut bg0_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
@@ -759,100 +818,46 @@ pub(crate) fn init_dda_pipelines(
   };
 
   let eye_layouts = vec![eye.clone(); 8];
-  let preview = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_preview")),
-    layout: dda_layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_preview")),
-    ..default()
-  });
-  let compute = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_compute")),
-    layout: dda_layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_main")),
-    ..default()
-  });
 
   let dda_layouts_perf = {
     let mut v = dda_layouts.clone();
     v[0] = bg0_perf.clone();
     v
   };
-  let visible = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_visible")),
-    layout: dda_layouts_perf.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_visible")),
-    ..default()
-  });
-  let shadow = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_shadow")),
-    layout: dda_layouts_perf.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_shadow")),
-    ..default()
-  });
-  let shade = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_shade")),
-    layout: dda_layouts_perf.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_shade")),
-    ..default()
-  });
-  let glass = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_glass")),
-    layout: dda_layouts_perf,
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_glass")),
-    ..default()
-  });
+  let refl_layouts = {
+    let mut v = dda_layouts.clone();
+    v[7] = refl_read.clone();
+    v
+  };
+  let pipe = |label: &'static str,
+              layout: Vec<BindGroupLayoutDescriptor>,
+              entry: &'static str|
+   -> ComputePipe {
+    if let Some(raw) =
+      raw_compute_pipe(&render_device, &pipeline_cache, &gate, label, &layout, entry)
+    {
+      return raw;
+    }
+    ComputePipe::Bevy(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+      label: Some(Cow::from(label)),
+      layout,
+      shader: dda_shader.clone(),
+      entry_point: Some(Cow::from(entry)),
+      ..default()
+    }))
+  };
+  let visible = pipe("gate_dda_visible", dda_layouts_perf.clone(), "dda_visible");
+  let shadow = pipe("gate_dda_shadow", dda_layouts_perf.clone(), "dda_shadow");
+  let shade = pipe("gate_dda_shade", dda_layouts_perf.clone(), "dda_shade");
+  let glass = pipe("gate_dda_glass", dda_layouts_perf, "dda_glass");
 
-  let refl = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_refl")),
-    layout: {
-      let mut v = dda_layouts.clone();
-      v[7] = refl_read.clone();
-      v
-    },
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_refl")),
-    ..default()
-  });
-  let compose = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_dda_refl_compose")),
-    layout: {
-      let mut v = dda_layouts.clone();
-      v[7] = refl_read.clone();
-      v
-    },
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("dda_refl_compose")),
-    ..default()
-  });
+  let refl = pipe("gate_dda_refl", refl_layouts.clone(), "dda_refl");
+  let compose = pipe("gate_dda_refl_compose", refl_layouts, "dda_refl_compose");
 
-  let beam = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_beam")),
-    layout: layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("beam_main")),
-    ..default()
-  });
+  let beam = pipe("gate_beam", layouts, "beam_main");
 
-  let eye_histogram = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_eye_histogram")),
-    layout: eye_layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("eye_adapt_histogram")),
-    ..default()
-  });
-  let eye_update = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_eye_update")),
-    layout: eye_layouts.clone(),
-    shader: dda_shader.clone(),
-    entry_point: Some(Cow::from("eye_adapt_update")),
-    ..default()
-  });
+  let eye_histogram = pipe("gate_eye_histogram", eye_layouts.clone(), "eye_adapt_histogram");
+  let eye_update = pipe("gate_eye_update", eye_layouts, "eye_adapt_update");
 
   let blit_shader = asset_server.load(BLIT_SHADER_ASSET_PATH);
   let blit_make = |label: &str, entry: &str| {
@@ -888,7 +893,6 @@ pub(crate) fn init_dda_pipelines(
     bg3_layout: bg3,
     blit_layout: blit,
     eye_layout: eye,
-    compute_pipeline: compute,
     bg0_perf_layout: bg0_perf,
     visible_pipeline: visible,
     shadow_pipeline: shadow,
@@ -898,7 +902,6 @@ pub(crate) fn init_dda_pipelines(
     refl_read_layout: refl_read,
     refl_pipeline: refl,
     compose_pipeline: compose,
-    preview_pipeline: preview,
     beam_pipeline: beam,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
@@ -908,6 +911,7 @@ pub(crate) fn init_dda_pipelines(
   commands.insert_resource(LightPoolGpu(UniformBuffer::default()));
   commands.insert_resource(AuxTexCache::default());
   commands.insert_resource(EyeAdaptGpu::default());
+  commands.insert_resource(DdaReady::default());
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1436,10 +1440,15 @@ fn frame_bracket_tail(
 }
 
 static WARM_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static WARM_VIS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_SHADOW: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_SHADE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_GLASS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_REFL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_BEAM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-static WARM_DDA: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_GI: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static WARM_EYE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static WARM_ALL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 fn warm_mark(slot: &'static std::sync::OnceLock<()>, label: &str, ready: bool) {
   if ready && slot.set(()).is_ok() {
@@ -1488,11 +1497,52 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   aux: Option<Res<'w, AuxTexCache>>,
   pipeline_cache: Res<'w, PipelineCache>,
   pipelines: Res<'w, DdaPipelines>,
+  gate: Res<'w, crate::pipe_cache::GatePipeCache>,
   scale: Res<'w, RenderScale>,
+  ready: ResMut<'w, DdaReady>,
   profiler: ResMut<'w, crate::profiler::GpuProfilerRes>,
 }
 
-pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
+#[derive(bevy::ecs::resource::Resource, Default)]
+pub(crate) struct DdaReady(pub bool);
+
+struct DdaReadyCtx<'a> {
+  pipeline_cache: &'a PipelineCache,
+  pipelines: &'a DdaPipelines,
+  fog: Option<&'a crate::volumetric::FogGpu>,
+  bg4: Option<&'a crate::gi::GiGpu>,
+  fog_on: bool,
+  gi_on: bool,
+  eye_on: bool,
+  refl_ok: bool,
+}
+
+fn dda_pipelines_ready(cx: &DdaReadyCtx<'_>) -> bool {
+  let comp = |p: &ComputePipe| p.get(cx.pipeline_cache).is_some();
+  let gi_ok = cx.bg4.is_some_and(|bg| {
+    let all = |x: &Option<ComputePipe>| x.as_ref().is_some_and(&comp);
+    all(&bg.light_pipeline)
+      && all(&bg.gather_pipeline)
+      && all(&bg.resolve_pipeline)
+      && all(&bg.restir_temporal_pipeline)
+      && all(&bg.restir_spatial_pipeline)
+      && all(&bg.merge_pipeline)
+  });
+  comp(&cx.pipelines.visible_pipeline)
+    && comp(&cx.pipelines.shadow_pipeline)
+    && comp(&cx.pipelines.shade_pipeline)
+    && comp(&cx.pipelines.glass_pipeline)
+    && (!DDA_BEAM || comp(&cx.pipelines.beam_pipeline))
+    && cx.pipeline_cache.get_render_pipeline(cx.pipelines.blit_pipeline).is_some()
+    && cx.pipeline_cache.get_render_pipeline(cx.pipelines.blit_fxaa_pipeline).is_some()
+    && (!cx.fog_on || cx.fog.is_some_and(|f| f.pipelines_ready(cx.pipeline_cache)))
+    && (!cx.gi_on || gi_ok)
+    && (!cx.refl_ok || comp(&cx.pipelines.refl_pipeline) && comp(&cx.pipelines.compose_pipeline))
+    && (!cx.eye_on
+      || comp(&cx.pipelines.eye_histogram_pipeline) && comp(&cx.pipelines.eye_update_pipeline))
+}
+
+fn dispatch_dda(p: DispatchDdaParams) {
   let DispatchDdaParams {
     mut ctx,
     bg0,
@@ -1506,7 +1556,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     aux,
     pipeline_cache,
     pipelines,
+    gate,
     scale,
+    mut ready,
     mut profiler,
   } = p;
   WARM_T0.get_or_init(std::time::Instant::now);
@@ -1529,24 +1581,15 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     return;
   };
 
-  let dda_pipe = pipeline_cache.get_compute_pipeline(pipelines.compute_pipeline).or_else(|| {
-    bevy::log::debug_once!("DDA dispatch: dda pipeline not ready");
-    None
-  });
-  let beam_pipe = pipeline_cache.get_compute_pipeline(pipelines.beam_pipeline);
+  let beam_pipe = pipelines.beam_pipeline.get(&pipeline_cache);
 
   warm_mark(&WARM_BEAM, "beam", beam_pipe.is_some());
-  warm_mark(&WARM_DDA, "dda_main", dda_pipe.is_some());
   warm_mark(
     &WARM_GI,
     "gi",
-    bg4.gather_pipeline.is_some_and(|id| pipeline_cache.get_compute_pipeline(id).is_some()),
+    bg4.gather_pipeline.as_ref().is_some_and(|p| p.get(&pipeline_cache).is_some()),
   );
-  warm_mark(
-    &WARM_EYE,
-    "eye_hist",
-    pipeline_cache.get_compute_pipeline(pipelines.eye_histogram_pipeline).is_some(),
-  );
+  warm_mark(&WARM_EYE, "eye_hist", pipelines.eye_histogram_pipeline.get(&pipeline_cache).is_some());
 
   let fog_read = fog.read_bg.as_ref().and_then(|b| b.0.as_ref());
 
@@ -1619,15 +1662,45 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
 
   let perf_bg0 = aux.as_ref().and_then(|a| a.perf_bg0.as_ref());
   let perf_pipes = (
-    pipeline_cache.get_compute_pipeline(pipelines.visible_pipeline),
-    pipeline_cache.get_compute_pipeline(pipelines.shadow_pipeline),
-    pipeline_cache.get_compute_pipeline(pipelines.shade_pipeline),
-    pipeline_cache.get_compute_pipeline(pipelines.glass_pipeline),
+    pipelines.visible_pipeline.get(&pipeline_cache),
+    pipelines.shadow_pipeline.get(&pipeline_cache),
+    pipelines.shade_pipeline.get(&pipeline_cache),
+    pipelines.glass_pipeline.get(&pipeline_cache),
   );
+  warm_mark(&WARM_VIS, "visible", perf_pipes.0.is_some());
+  warm_mark(&WARM_SHADOW, "shadow", perf_pipes.1.is_some());
+  warm_mark(&WARM_SHADE, "shade", perf_pipes.2.is_some());
+  warm_mark(&WARM_GLASS, "glass", perf_pipes.3.is_some());
+  warm_mark(&WARM_REFL, "refl", pipelines.refl_pipeline.get(&pipeline_cache).is_some());
   let perf_ready = main_ready && refl_ok && glass_ok && perf_bg0.is_some();
-  let mut dispatched = false;
-  if perf_ready
-    && let (Some(vis_pipe), Some(shadow_pipe), Some(shade_pipe), Some(glass_pipe)) = perf_pipes
+
+  let gi_on = gi.as_ref().is_some_and(|g| g.enabled);
+  let fog_on = fog.settings.as_deref().is_some_and(|s| s.enabled && s.strength() > 0.0);
+  let eye_on = eye.as_ref().is_some_and(|e| e.settings.enabled);
+  let all_ready = perf_ready
+    && perf_pipes.0.is_some()
+    && perf_pipes.1.is_some()
+    && perf_pipes.2.is_some()
+    && perf_pipes.3.is_some()
+    && dda_pipelines_ready(&DdaReadyCtx {
+      pipeline_cache: &pipeline_cache,
+      pipelines: &pipelines,
+      fog: fog.gpu.as_deref(),
+      bg4: Some(&**bg4),
+      fog_on,
+      gi_on,
+      eye_on,
+      refl_ok,
+    });
+  warm_mark(&WARM_ALL, "全部", all_ready);
+  *ready = DdaReady(all_ready);
+  if all_ready {
+    crate::pipe_cache::save_once(&gate);
+  }
+  if !all_ready {
+    return;
+  }
+  if let (Some(vis_pipe), Some(shadow_pipe), Some(shade_pipe), Some(glass_pipe)) = perf_pipes
     && let Some(pbg0) = perf_bg0
   {
     crate::profiler::gpu_compute_pass(
@@ -1719,38 +1792,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(glass_groups, 1, 1);
       },
     );
-    dispatched = true;
   }
 
-  if !dispatched {
-    let (main_pipe, main_label) = if let Some(p) = dda_pipe {
-      (Some(p), "gate_dda_trace")
-    } else {
-      (pipeline_cache.get_compute_pipeline(pipelines.preview_pipeline), "gate_dda_preview")
-    };
-    if let (Some(pipe), true) = (main_pipe, main_ready) {
-      crate::profiler::gpu_compute_pass(&mut profiler, ctx.command_encoder(), main_label, |pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &bg0.0, &[]);
-        pass.set_bind_group(1, &bg1.0, &[]);
-        pass.set_bind_group(2, &bg2.0, &[]);
-        pass.set_bind_group(3, &bg3.0, &[]);
-        pass.set_bind_group(4, gi_b0, &[]);
-
-        pass.set_bind_group(5, b5, &[]);
-
-        if let Some(fog_read) = fog_read {
-          pass.set_bind_group(6, fog_read, &[]);
-        }
-        if refl_ok && let Some(w) = refl_write_bg {
-          pass.set_bind_group(7, w, &[]);
-        }
-        pass.dispatch_workgroups(gx, gy, 1);
-      });
-    }
-  }
-
-  let gi_on = gi.as_ref().is_some_and(|g| g.enabled);
   if gi_on {
     let gi_size = aux.as_ref().map(|a| a.gi_size).unwrap_or(UVec2::ONE);
     let ggx = gi_size.x.div_ceil(DDA_WORKGROUP_SIZE);
@@ -1760,8 +1803,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     }
     {
       let _ = gi_b0;
-      if let Some(pipe) = bg4.light_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
-      {
+      if let Some(pipe) = bg4.light_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
         let groups = (crate::gi::LT_SLOTS as u32).div_ceil(64);
         crate::profiler::gpu_compute_pass(
           &mut profiler,
@@ -1779,8 +1821,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
       }
-      if let Some(pipe) =
-        bg4.restir_temporal_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      if let Some(pipe) = bg4.restir_temporal_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache))
       {
         crate::profiler::gpu_compute_pass(
           &mut profiler,
@@ -1798,8 +1839,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
       }
-      if let Some(pipe) =
-        bg4.restir_spatial_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
+      if let Some(pipe) = bg4.restir_spatial_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache))
       {
         crate::profiler::gpu_compute_pass(
           &mut profiler,
@@ -1817,8 +1857,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
       }
-      if let Some(pipe) = bg4.gather_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
-      {
+      if let Some(pipe) = bg4.gather_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
         crate::profiler::gpu_compute_pass(
           &mut profiler,
           ctx.command_encoder(),
@@ -1835,14 +1874,30 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
       }
-      if let Some(pipe) =
-        bg4.resolve_pipeline.and_then(|id| pipeline_cache.get_compute_pipeline(id))
-      {
+      if let Some(pipe) = bg4.resolve_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
         let groups = bg4.slots().div_ceil(64);
         crate::profiler::gpu_compute_pass(
           &mut profiler,
           ctx.command_encoder(),
           "gate_gi_resolve",
+          |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, gi_view_bg, &[]);
+            pass.set_bind_group(1, &bg1.0, &[]);
+            pass.set_bind_group(2, &bg2.0, &[]);
+            pass.set_bind_group(3, &bg3.0, &[]);
+            pass.set_bind_group(4, gi_b0, &[]);
+            pass.set_bind_group(5, b5, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+          },
+        );
+      }
+      if let Some(pipe) = bg4.merge_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
+        let groups = crate::gi::GI_MERGE_SLOTS.div_ceil(64);
+        crate::profiler::gpu_compute_pass(
+          &mut profiler,
+          ctx.command_encoder(),
+          "gate_gi_merge_drain",
           |pass| {
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, gi_view_bg, &[]);
@@ -1863,7 +1918,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
 
   if refl_ok
     && let (Some(rr), Some(cb0)) = (refl_read_bg, refl_compose_bg0)
-    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.refl_pipeline)
+    && let Some(pipe) = pipelines.refl_pipeline.get(&pipeline_cache)
   {
     let groups = ((refl_cap as u32).div_ceil(64)).clamp(1, 1024);
     crate::profiler::gpu_compute_pass(
@@ -1890,7 +1945,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   if refl_ok
     && let Some(rr) = refl_read_bg
     && let Some(cb0) = refl_compose_bg0
-    && let Some(pipe) = pipeline_cache.get_compute_pipeline(pipelines.compose_pipeline)
+    && let Some(pipe) = pipelines.compose_pipeline.get(&pipeline_cache)
   {
     let gxc = gx.max(1);
     let gyc = gy.max(1);
@@ -1917,8 +1972,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
 
   if eye.as_ref().is_some_and(|e| e.settings.enabled)
     && let Some(eye_bg) = eye.as_ref().and_then(|e| e.bg.as_ref())
-    && let Some(h) = pipeline_cache.get_compute_pipeline(pipelines.eye_histogram_pipeline)
-    && let Some(u) = pipeline_cache.get_compute_pipeline(pipelines.eye_update_pipeline)
+    && let Some(h) = pipelines.eye_histogram_pipeline.get(&pipeline_cache)
+    && let Some(u) = pipelines.eye_update_pipeline.get(&pipeline_cache)
   {
     crate::profiler::gpu_compute_pass(
       &mut profiler,
@@ -1948,16 +2003,35 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   }
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct BlitDdaParams<'w, 's> {
+  ctx: RenderContext<'w, 's>,
+  views: Query<'w, 's, &'static ViewTarget>,
+  ready: Res<'w, DdaReady>,
+  blit_bg: Option<Res<'w, DdaBlitBindGroup>>,
+  post: Option<Res<'w, PostFxSettings>>,
+  pipeline_cache: Res<'w, PipelineCache>,
+  pipelines: Res<'w, DdaPipelines>,
+  #[cfg(feature = "profile")]
+  profiler: ResMut<'w, crate::profiler::GpuProfilerRes>,
+}
+
 #[cfg_attr(not(feature = "profile"), allow(unused_variables, unused_mut))]
-fn blit_dda_view(
-  mut ctx: RenderContext,
-  views: Query<&ViewTarget>,
-  blit_bg: Option<Res<DdaBlitBindGroup>>,
-  post: Option<Res<PostFxSettings>>,
-  pipeline_cache: Res<PipelineCache>,
-  pipelines: Res<DdaPipelines>,
-  mut profiler: ResMut<crate::profiler::GpuProfilerRes>,
-) {
+fn blit_dda_view(p: BlitDdaParams) {
+  let BlitDdaParams {
+    mut ctx,
+    views,
+    ready,
+    blit_bg,
+    post,
+    pipeline_cache,
+    pipelines,
+    #[cfg(feature = "profile")]
+    mut profiler,
+  } = p;
+  if !ready.0 {
+    return;
+  }
   let (Some(bg), Ok(target)) = (blit_bg.as_ref(), views.single()) else {
     bevy::log::debug_once!("DDA blit: bg or ViewTarget missing");
     return;

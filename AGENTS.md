@@ -53,7 +53,9 @@
 
 ## WESL / 渲染约定
 
-- WESL 在**运行时**编译（`gate-render/src/shader.rs`），同时在 `gate-render/build.rs` 的构建阶段校验 naga WGSL 合法性和入口列表。改 `.wesl` 会触发 build script 并重编 `gate-render`/`gate-app`（`build-fast` 下约 10 秒），比 Rust 逻辑改动轻；重启程序会加载新 shader。
+- WESL 在**运行时**编译（`gate-render/src/shader.rs`），同时在 `gate-render/build.rs` 的构建阶段校验 naga WGSL 合法性和入口列表。改 `.wesl` 会触发 build script 并重编 `gate-render`/`gate-app`（`build-fast` 下约 10 秒），比 Rust 逻辑改动轻；重启程序会加载新 shader。**不要**保留「管线就绪前渲染预览 / 逐 pass 上线」的过渡路径：`dda_main`/`dda_preview` 已删除，`DdaReady` 门控保证全部用到的管线（按当前设置）就绪前不渲染、不 blit，首帧即完整画面。
+- 主模块（`main.wesl`）全部 compute 管线经 `gate-render/src/pipe_cache.rs` 直连 wgpu 创建，挂持久化 `wgpu::PipelineCache`（blob 在 `data/pipeline-cache.bin`，`DdaReady` 后回写）；bevy `PipelineCache` 是设备不支持 `PIPELINE_CACHE` 时的回退路径，两条路径都要能跑。启动变慢先看 `PIPE {入口} 编译` 日志定位是哪个入口的驱动编译涨了。
+- `gi_accumulate` 只允许出现在自带采样上下文的入口（`gi_gather` / `gi_merge_drain`）。把它内联进其他逐 texel 入口（`dda_refl`、`gi_gather` 等）会把该入口的驱动编译时间推高一个数量级（NVIDIA 驱动对「采样机器 × 逐 texel 循环」的组合有编译病理）。镜面 GI 补样（`refl_gi_merge`）因此走 `gi_merge_req` 请求队列，由 `gi_merge_drain` 消费，采样语义与时机不变。
 - 项目只保留软件 DDA；`RT_RAY_QUERY`、TLAS/BLAS 和 `@if(ray_query)` 分支已移除，不要重新引入。
 - `.wesl` 里的部分常量是 Rust 的资源布局真源：`gate-render/src/wesl_consts.rs` 会从源码解析 `const NAME: u32 = <字面量>u;`，缺失会 panic。不要把这些常量只改在 Rust 侧，也不要用非字面量表达式。
 - 新增 WESL compute 入口时，同步 `gate-render/build.rs` 的 `ENTRY_POINTS` 列表。
@@ -75,6 +77,7 @@
 
 - `assets/` 只读、随仓库分发；`data/`、`logs/`、`*.vox`、`*.log` 被 `.gitignore` 排除。
 - `data/config.toml` 保存菜单、相机和窗口状态；要重置用户配置就删除它。不要提交 `data/`。
+- `data/pipeline-cache.bin` 是驱动管线缓存 blob（机器/驱动绑定，wgpu 自带失效校验）；删除它下次启动就是全量冷编译。
 - 资源根目录由 `gate-render/src/paths.rs` 决定：exe 同目录有 `assets/` 就用 exe 目录，否则回退到仓库根。直接运行 `target/.../gate-app.exe` 也能找到仓库 `assets/`。
 - 默认场景名是 `nuke`，依赖 `assets/vox/nuke.vox`；该文件被 gitignore，新克隆可能没有。可在 `data/config.toml` 改 `game/world/model`，或把 `STARTUP_DEMO_SCENE` 改成 `true`。
 - MC 地图默认路径硬编码为 `C:\game\Greenfield v0.5.4\...`；用 `GATE_MC_MAP` / `GATE_MC_ASSETS` 覆盖。`data/lod/mc_map.lod` 是生成缓存。

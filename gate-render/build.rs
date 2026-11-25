@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
 const ENTRY_POINTS: &[&str] = &[
-  "dda_main",
-  "dda_preview",
   "dda_visible",
   "dda_shadow",
   "dda_shade",
@@ -15,6 +13,7 @@ const ENTRY_POINTS: &[&str] = &[
   "gi_restir_temporal",
   "gi_restir_spatial",
   "gi_resolve",
+  "gi_merge_drain",
   "godray_main",
   "godray_blur_a",
   "godray_blur_b",

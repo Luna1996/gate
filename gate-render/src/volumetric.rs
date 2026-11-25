@@ -1,6 +1,4 @@
-use bevy::render::render_resource::{
-  BindGroupLayoutDescriptor, CachedComputePipelineId, ShaderType,
-};
+use bevy::render::render_resource::{BindGroupLayoutDescriptor, ShaderType};
 use glam::{Mat4, UVec2, Vec2, Vec4};
 
 use crate::brickmap::dda::DDA_WORKGROUP_SIZE;
@@ -180,8 +178,17 @@ pub struct FogGpu {
   ph_view: Option<bevy::render::render_resource::TextureView>,
 
   gi_fb: Option<bevy::render::render_resource::Buffer>,
-  pipelines: [Option<CachedComputePipelineId>; 3],
+  pipelines: [Option<crate::brickmap::dda::ComputePipe>; 3],
   layouts: FogLayouts,
+}
+
+impl FogGpu {
+  pub(crate) fn pipelines_ready(
+    &self,
+    cache: &bevy::render::render_resource::PipelineCache,
+  ) -> bool {
+    self.pipelines.iter().all(|p| p.as_ref().is_some_and(|p| p.get(cache).is_some()))
+  }
 }
 
 fn placeholder(
@@ -238,7 +245,10 @@ impl bevy::app::Plugin for FogPlugin {
       .add_systems(bevy::render::RenderStartup, init_fog_gpu)
       .add_systems(
         bevy::render::RenderStartup,
-        queue_fog_pipelines.after(crate::brickmap::dda::init_dda_pipelines).after(init_fog_gpu),
+        queue_fog_pipelines
+          .after(crate::brickmap::dda::init_dda_pipelines)
+          .after(init_fog_gpu)
+          .after(crate::pipe_cache::init_gate_pipe_cache),
       )
       .add_systems(bevy::render::ExtractSchedule, extract_fog_settings)
       .add_systems(
@@ -265,8 +275,10 @@ fn init_fog_gpu(mut commands: bevy::ecs::system::Commands) {
 }
 
 fn queue_fog_pipelines(
+  render_device: bevy::ecs::system::Res<bevy::render::renderer::RenderDevice>,
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
   dda_shader: bevy::ecs::system::Res<crate::shader::DdaShaderHandle>,
+  gate: bevy::ecs::system::Res<crate::pipe_cache::GatePipeCache>,
   dda: bevy::ecs::system::Res<crate::brickmap::dda::DdaPipelines>,
   mut gpu: bevy::ecs::system::ResMut<FogGpu>,
 ) {
@@ -275,34 +287,50 @@ fn queue_fog_pipelines(
   if gpu.pipelines[0].is_some() {
     return;
   }
-  gpu.pipelines[0] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-    label: Some(Cow::from("gate_godray")),
-    layout: vec![
+  let dda_shader = dda_shader.0.clone();
+  let queue = |label: &'static str,
+               entry: &'static str,
+               layouts: Vec<bevy::render::render_resource::BindGroupLayoutDescriptor>|
+   -> crate::brickmap::dda::ComputePipe {
+    if let Some(raw) = crate::brickmap::dda::raw_compute_pipe(
+      &render_device,
+      &pipeline_cache,
+      &gate,
+      label,
+      &layouts,
+      entry,
+    ) {
+      return raw;
+    }
+    crate::brickmap::dda::ComputePipe::Bevy(pipeline_cache.queue_compute_pipeline(
+      ComputePipelineDescriptor {
+        label: Some(Cow::from(label)),
+        layout: layouts,
+        shader: dda_shader.clone(),
+        entry_point: Some(Cow::from(entry)),
+        ..Default::default()
+      },
+    ))
+  };
+  gpu.pipelines[0] = Some(queue(
+    "gate_godray",
+    "godray_main",
+    vec![
       dda.bg0_gi_layout.clone(),
       dda.bg1_layout.clone(),
       dda.bg2_layout.clone(),
       dda.bg3_layout.clone(),
       fog_layout_mask(),
     ],
-    shader: dda_shader.0.clone(),
-    entry_point: Some(Cow::from("godray_main")),
-    ..Default::default()
-  }));
-  for (i, (entry, layout)) in
-    [("godray_blur_a", fog_layout_blur_a()), ("godray_blur_b", fog_layout_blur_b())]
-      .into_iter()
-      .enumerate()
+  ));
+  for (i, (entry, layout, label)) in [
+    ("godray_blur_a", fog_layout_blur_a(), "gate_godray_blur_a"),
+    ("godray_blur_b", fog_layout_blur_b(), "gate_godray_blur_b"),
+  ]
+  .into_iter()
+  .enumerate()
   {
-    gpu.pipelines[i + 1] = Some(pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-      label: Some(Cow::from(match i {
-        0 => "gate_godray_blur_a",
-        _ => "gate_godray_blur_b",
-      })),
-      layout: vec![layout],
-      shader: dda_shader.0.clone(),
-      entry_point: Some(Cow::from(entry)),
-      ..Default::default()
-    }));
+    gpu.pipelines[i + 1] = Some(queue(label, entry, vec![layout]));
   }
 }
 
@@ -524,7 +552,7 @@ pub(crate) fn dispatch_fog(
   if gx == 0 || gy == 0 {
     return;
   }
-  if let Some(pipe) = gpu.pipelines[0].and_then(|id| pipeline_cache.get_compute_pipeline(id)) {
+  if let Some(pipe) = gpu.pipelines[0].as_ref().and_then(|p| p.get(pipeline_cache)) {
     crate::profiler::gpu_compute_pass(profiler, encoder, "gate_godray", |pass| {
       pass.set_pipeline(pipe);
       pass.set_bind_group(0, bg0, &[]);
@@ -541,8 +569,7 @@ pub(crate) fn dispatch_fog(
       .enumerate()
   {
     let Some(bg) = bg else { continue };
-    let Some(pipe) = gpu.pipelines[i + 1].and_then(|id| pipeline_cache.get_compute_pipeline(id))
-    else {
+    let Some(pipe) = gpu.pipelines[i + 1].as_ref().and_then(|p| p.get(pipeline_cache)) else {
       continue;
     };
     crate::profiler::gpu_compute_pass(profiler, encoder, label, |pass| {

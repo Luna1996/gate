@@ -4,6 +4,7 @@ pub mod gi;
 pub mod lighting;
 pub mod paths;
 pub mod pbr_texture;
+pub mod pipe_cache;
 pub mod profiler;
 mod responsive;
 pub mod shader;

@@ -1,4 +1,4 @@
-import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
 import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS};
@@ -33,70 +33,6 @@ fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = world_raycast(make_grid(0u), origin, dir, t_cap_beam, world_cfg_full(0.0, 3u));
   let t = select(t_cap_beam, h.t, h.hit);
   textureStore(beam_depth, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(t, 0.0, 0.0, 0.0));
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn dda_preview(@builtin(global_invocation_id) gid: vec3<u32>,
-               @builtin(local_invocation_index) lid: u32) {
-  if (lid == 0u) { cam_pal_wg = camera_solid_pal(view_u.cam_pos_voxel.xyz); }
-  workgroupBarrier();
-  let size = textureDimensions(out_base);
-  if (gid.x >= size.x || gid.y >= size.y) { return; }
-  let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
-  if (cam_pal_wg != 0u) {
-    write_output(coord0, palette_rgb_linear(make_grid(0u).palette_base, cam_pal_wg));
-    return;
-  }
-  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
-  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
-  let near_world_h = view_u.inv_view_proj * vec4<f32>(uv.x, uv.y, 0.0, 1.0);
-  let far_world_h = view_u.inv_view_proj * vec4<f32>(uv.x, uv.y, 1.0, 1.0);
-  let near_world = near_world_h.xyz / near_world_h.w;
-  let far_world = far_world_h.xyz / far_world_h.w;
-  let diff_world = far_world - near_world;
-  let frustum_length = length(diff_world);
-  let dir_voxel = normalize(diff_world);
-  let origin_voxel = view_u.cam_pos_voxel.xyz;
-  var t_min = 0.0;
-  if (view_u.lod.z < 0.5) {
-    let beam_size = textureDimensions(beam_depth);
-    let bx = gid.x / BEAM_DIV;
-    let by = gid.y / BEAM_DIV;
-    t_min = 1e+30;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
-        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
-        t_min = min(t_min, textureLoad(beam_depth, vec2<i32>(sx, sy)).x);
-      }
-    }
-    t_min = max(t_min - BEAM_BACKOFF, 0.0);
-  }
-  let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
-                            world_cfg_primary(t_min, 3u));
-  if (gi_enabled() && gi_u.params.y > 0.0) { dda_hit_record(gid, size, first, origin_voxel); }
-  let diag_pix = gid.x + gid.y * size.x;
-  if (diag_sampled(diag_pix)) {
-    atomicAdd(&lod_diag[DIAG_MAIN_RAYS], 1u);
-    if (!first.hit) {
-      atomicAdd(&lod_diag[DIAG_MAIN_SKY], 1u);
-    } else if (first.obj_id < 0) {
-      atomicAdd(&lod_diag[DIAG_MAIN_NEAR], 1u);
-    } else {
-      atomicAdd(&lod_diag[DIAG_MAIN_FAR], 1u);
-    }
-  }
-  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
-  let sky = light_u.sky_color.xyz;
-  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-  var col = sky_rgb();
-  if (first.hit) {
-    let gg = make_grid(u32(first.obj_id) + 1u);
-    let n = voxel_normal_fast(gg, first.voxel, first.face_id, first.n);
-    let albedo = palette_rgb_linear(first.palette_base, first.pal);
-    col = albedo * (sky * 0.3 + sun_c * max(dot(n, sun_dir), 0.0));
-  }
-  write_output(coord0, col);
 }
 
 struct FaceShadow {
@@ -323,6 +259,36 @@ fn refl_hit_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32, pos: vec3<
   return refl_hit_gi_m(voxel, face_id, obj_id, pal, 3, 1, pos).rgb;
 }
 
+const GI_MERGE_WORDS: u32 = 3u;
+
+fn gi_merge_push(k0: u32, k1: u32, seed: u32) {
+  let cap = arrayLength(&gi_merge_req) - 1u;
+  let i = atomicAdd(&gi_merge_req[0], 1u);
+  if (i >= cap) { return; }
+  let o = 1u + i * GI_MERGE_WORDS;
+  atomicStore(&gi_merge_req[o], k0);
+  atomicStore(&gi_merge_req[o + 1u], k1);
+  atomicStore(&gi_merge_req[o + 2u], seed);
+}
+
+fn gi_merge_one(i: u32) {
+  let o = 1u + i * GI_MERGE_WORDS;
+  let k0 = atomicLoad(&gi_merge_req[o]);
+  let k1 = atomicLoad(&gi_merge_req[o + 1u]);
+  let seed = atomicLoad(&gi_merge_req[o + 2u]);
+  let obj = i32((k1 >> 19u) & 0x1FFFu) - 1;
+  if (obj < 0) { return; }
+  let face_id = (k1 >> 16u) & 7u;
+  let voxel = gi_unkey_voxel(k0, k1, obj);
+  let gg = make_grid(u32(obj + 1));
+  let pal = sample_brickmap(gg, voxel);
+  if (pal == 0u) { return; }
+  let hn = voxel_normal_fast(gg, voxel, face_id, face_normal_world(gg, face_id));
+  let p = voxel_center_world(gg, voxel);
+  let h = WorldHit(true, 0.0, p, pal, hn, face_id, voxel, obj, gg.palette_base);
+  gi_accumulate(gi_surface(h, gg, hn, face_id), seed, -1.0);
+}
+
 fn refl_gi_merge(h: WorldHit, seed: u32) -> bool {
   if (!gi_enabled()) { return false; }
   let g = make_grid(u32(h.obj_id) + 1u);
@@ -330,8 +296,22 @@ fn refl_gi_merge(h: WorldHit, seed: u32) -> bool {
   let s = gi_surface(h, g, n, h.face_id);
   let hit = irc_lookup(s.addr, s.face);
   if (hit.conf > 0.0 || hit.fresh) { return false; }
-  gi_accumulate(s, seed, -1.0);
+  gi_merge_push(gi_key0(h.voxel, h.obj_id), gi_key1(h.voxel, h.face_id, h.obj_id), seed);
   return true;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn gi_merge_drain(@builtin(global_invocation_id) gid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>) {
+  let cap = arrayLength(&gi_merge_req) - 1u;
+  let count = min(atomicLoad(&gi_merge_req[0]), cap);
+  let stride = nwg.x * 64u;
+  var i = gid.x;
+  while (i < count) {
+    gi_merge_one(i);
+    i = i + stride;
+  }
+  if (gid.x == 0u) { atomicStore(&gi_merge_req[0], 0u); }
 }
 
 fn refl_seed(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> u32 {
@@ -608,87 +588,6 @@ fn dda_hit_unpack(raw: vec4<u32>, origin_voxel: vec3<f32>, dir_voxel: vec3<f32>)
                   n, face, voxel, obj, g.palette_base);
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn dda_main(@builtin(global_invocation_id) gid: vec3<u32>,
-            @builtin(local_invocation_index) lid: u32) {
-  if (lid == 0u) {
-    cam_pal_wg = camera_solid_pal(view_u.cam_pos_voxel.xyz);
-  }
-  workgroupBarrier();
-  let size = textureDimensions(out_base);
-  if (gid.x >= size.x || gid.y >= size.y) { return; }
-  let coord0 = vec2<i32>(i32(gid.x), i32(gid.y));
-  let cam_pal = cam_pal_wg;
-  if (cam_pal != 0u) {
-    write_output(coord0, palette_rgb_linear(make_grid(0u).palette_base, cam_pal));
-    return;
-  }
-  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
-  let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
-  let near_ndc = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
-  let far_ndc  = vec4<f32>(uv.x, uv.y, 1.0, 1.0);
-  let near_world_h = view_u.inv_view_proj * near_ndc;
-  let far_world_h  = view_u.inv_view_proj * far_ndc;
-  let near_world = near_world_h.xyz / near_world_h.w;
-  let far_world  = far_world_h.xyz  / far_world_h.w;
-  let diff_world = far_world - near_world;
-  let frustum_length = length(diff_world);
-  let dir_voxel = normalize(diff_world);
-  let origin_voxel = view_u.cam_pos_voxel.xyz;
-  var t_min = 0.0;
-  if (view_u.lod.z < 0.5) {
-    let beam_size = textureDimensions(beam_depth);
-    let bx = gid.x / BEAM_DIV;
-    let by = gid.y / BEAM_DIV;
-    t_min = 1e+30;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-      for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-        let sx = clamp(i32(bx) + dx, 0, i32(beam_size.x) - 1);
-        let sy = clamp(i32(by) + dy, 0, i32(beam_size.y) - 1);
-        let bt = textureLoad(beam_depth, vec2<i32>(sx, sy)).x;
-        t_min = min(t_min, bt);
-      }
-    }
-    t_min = max(t_min - BEAM_BACKOFF, 0.0);
-  }
-  let sun_dir = light_u.lights[0].kind_pos_dir.yzw;
-  let sky = light_u.sky_color.xyz;
-  let sun_c = light_u.lights[0].color_intensity.xyz * light_u.lights[0].color_intensity.w;
-  let first = world_raycast(make_grid(0u), origin_voxel, dir_voxel, frustum_length,
-                            world_cfg_primary(t_min, 3u));
-  let need_n = (light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) != 0u;
-  var n_own = vec3<f32>(0.0);
-  if (first.hit && need_n) {
-    let fgrid = make_grid(u32(first.obj_id) + 1u);
-    n_own = voxel_normal_fast(fgrid, first.voxel, first.face_id, first.n);
-  }
-  let diag_pix = gid.x + gid.y * size.x;
-  let diag_on = diag_sampled(diag_pix);
-  if (diag_on) {
-    atomicAdd(&lod_diag[DIAG_MAIN_RAYS], 1u);
-    if (!first.hit) {
-      atomicAdd(&lod_diag[DIAG_MAIN_SKY], 1u);
-    } else if (first.obj_id < 0) {
-      atomicAdd(&lod_diag[DIAG_MAIN_NEAR], 1u);
-    } else {
-      atomicAdd(&lod_diag[DIAG_MAIN_FAR], 1u);
-    }
-  }
-  var col = vec3<f32>(0.0);
-  if (diag_on && !first.hit) { atomicAdd(&lod_diag[DIAG_FACE_SKY], 1u); }
-  var best_rec = first;
-  col = shade_face(first, origin_voxel, dir_voxel, frustum_length, px, sun_dir, sky, sun_c,
-                   n_own, need_n, u32(gid.y) * size.x + u32(gid.x),
-                   &best_rec, FaceShadow(vec3<f32>(0.0), false));
-  if (gi_enabled() && gi_u.params.y > 0.0) { dda_hit_record(gid, size, best_rec, origin_voxel); }
-  if (!first.hit) {
-    col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
-  }
-  if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) {
-    col = vol_tint_color(first);
-  }
-  write_output(coord0, col);
-}
 
 @compute @workgroup_size(8, 8, 1)
 fn godray_main(@builtin(global_invocation_id) gid: vec3<u32>) {

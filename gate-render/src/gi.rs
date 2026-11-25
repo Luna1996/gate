@@ -1,6 +1,4 @@
-use bevy::render::render_resource::{
-  BindGroup, BindGroupLayoutDescriptor, Buffer, CachedComputePipelineId, ShaderType,
-};
+use bevy::render::render_resource::{BindGroup, BindGroupLayoutDescriptor, Buffer, ShaderType};
 use glam::{Mat4, UVec2, UVec4, Vec4};
 
 #[repr(C)]
@@ -119,9 +117,12 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   };
   BindGroupLayoutDescriptor::new(
     "GiBg5",
-    &[buf(0), buf(1), buf(2), buf(3), buf(4), buf(5), buf(6), buf(7), buf(8), buf(9)],
+    &[buf(0), buf(1), buf(2), buf(3), buf(4), buf(5), buf(6), buf(7), buf(8), buf(9), buf(10)],
   )
 }
+
+pub const GI_MERGE_SLOTS: u32 = 8192;
+pub const GI_MERGE_WORDS: u32 = 3;
 
 #[derive(bevy::ecs::resource::Resource)]
 pub struct GiGpu {
@@ -137,15 +138,19 @@ pub struct GiGpu {
 
   pub stats: Option<Buffer>,
 
-  pub gather_pipeline: Option<CachedComputePipelineId>,
+  pub gi_merge: Option<Buffer>,
 
-  pub resolve_pipeline: Option<CachedComputePipelineId>,
+  pub gather_pipeline: Option<crate::brickmap::dda::ComputePipe>,
 
-  pub light_pipeline: Option<CachedComputePipelineId>,
+  pub resolve_pipeline: Option<crate::brickmap::dda::ComputePipe>,
 
-  pub restir_temporal_pipeline: Option<CachedComputePipelineId>,
+  pub light_pipeline: Option<crate::brickmap::dda::ComputePipe>,
 
-  pub restir_spatial_pipeline: Option<CachedComputePipelineId>,
+  pub restir_temporal_pipeline: Option<crate::brickmap::dda::ComputePipe>,
+
+  pub restir_spatial_pipeline: Option<crate::brickmap::dda::ComputePipe>,
+
+  pub merge_pipeline: Option<crate::brickmap::dda::ComputePipe>,
 
   irc: Option<Buffer>,
 
@@ -227,7 +232,9 @@ impl bevy::app::Plugin for GiPlugin {
       .init_resource::<GiSettings>()
       .add_systems(
         bevy::render::RenderStartup,
-        queue_gi_pipelines.after(crate::brickmap::dda::init_dda_pipelines),
+        queue_gi_pipelines
+          .after(crate::brickmap::dda::init_dda_pipelines)
+          .after(crate::pipe_cache::init_gate_pipe_cache),
       )
       .add_systems(bevy::render::ExtractSchedule, extract_gi_settings)
       .add_systems(
@@ -241,8 +248,10 @@ impl bevy::app::Plugin for GiPlugin {
 }
 
 fn queue_gi_pipelines(
+  render_device: bevy::ecs::system::Res<bevy::render::renderer::RenderDevice>,
   pipeline_cache: bevy::ecs::system::Res<bevy::render::render_resource::PipelineCache>,
   dda_shader: bevy::ecs::system::Res<crate::shader::DdaShaderHandle>,
+  gate: bevy::ecs::system::Res<crate::pipe_cache::GatePipeCache>,
   dda: bevy::ecs::system::Res<crate::brickmap::dda::DdaPipelines>,
   mut commands: bevy::ecs::system::Commands,
 ) {
@@ -257,20 +266,34 @@ fn queue_gi_pipelines(
     gi_bg0_layout(),
     gi_bg5_layout(),
   ];
-  let queue = |label: &str, entry: &str| {
-    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-      label: Some(Cow::from(label.to_string())),
-      layout: layouts.clone(),
-      shader: dda_shader.0.clone(),
-      entry_point: Some(Cow::from(entry.to_string())),
-      ..Default::default()
-    })
+  let dda_shader = dda_shader.0.clone();
+  let pipe = |label: &'static str, entry: &'static str| -> crate::brickmap::dda::ComputePipe {
+    if let Some(raw) = crate::brickmap::dda::raw_compute_pipe(
+      &render_device,
+      &pipeline_cache,
+      &gate,
+      label,
+      &layouts,
+      entry,
+    ) {
+      return raw;
+    }
+    crate::brickmap::dda::ComputePipe::Bevy(pipeline_cache.queue_compute_pipeline(
+      ComputePipelineDescriptor {
+        label: Some(Cow::from(label)),
+        layout: layouts.clone(),
+        shader: dda_shader.clone(),
+        entry_point: Some(Cow::from(entry)),
+        ..Default::default()
+      },
+    ))
   };
-  let gather = queue("gate_gi_gather", "gi_gather");
-  let resolve = queue("gate_gi_resolve", "gi_resolve");
-  let light = queue("gate_gi_light", "gi_light_sweep");
-  let restir_temporal = queue("gate_gi_restir_temporal", "gi_restir_temporal");
-  let restir_spatial = queue("gate_gi_restir_spatial", "gi_restir_spatial");
+  let gather = pipe("gate_gi_gather", "gi_gather");
+  let resolve = pipe("gate_gi_resolve", "gi_resolve");
+  let light = pipe("gate_gi_light", "gi_light_sweep");
+  let restir_temporal = pipe("gate_gi_restir_temporal", "gi_restir_temporal");
+  let restir_spatial = pipe("gate_gi_restir_spatial", "gi_restir_spatial");
+  let merge_drain = pipe("gate_gi_merge_drain", "gi_merge_drain");
 
   commands.insert_resource(GiGpu {
     uniform: bevy::render::render_resource::UniformBuffer::default(),
@@ -279,11 +302,13 @@ fn queue_gi_pipelines(
     bg0: None,
     bg5: None,
     stats: None,
+    gi_merge: None,
     gather_pipeline: Some(gather),
     resolve_pipeline: Some(resolve),
     light_pipeline: Some(light),
     restir_temporal_pipeline: Some(restir_temporal),
     restir_spatial_pipeline: Some(restir_spatial),
+    merge_pipeline: Some(merge_drain),
     irc: None,
     irc_key: None,
     lt_tile: None,
@@ -397,6 +422,9 @@ fn prepare_gi(p: PrepareGiParams) {
       gpu.lt_node_key = Some(make("gate_gi_lt_node_key", LT_SLOTS * 2 * 4));
     }
     gpu.stats = Some(make("gate_gi_stats", c.gi_stat_words as u64 * 4));
+    let merge = make("gate_gi_merge_req", (1 + GI_MERGE_SLOTS as u64 * GI_MERGE_WORDS as u64) * 4);
+    queue.write_buffer(&merge, 0, &0u32.to_ne_bytes());
+    gpu.gi_merge = Some(merge);
     gpu.slots = slots;
     gpu.slots_tag = slots_tag;
     bevy::log::debug!(
@@ -483,6 +511,7 @@ fn prepare_gi(p: PrepareGiParams) {
     Some(node),
     Some(node_key),
     Some(st),
+    Some(gm),
     Some(rprev),
     Some(rtmp),
     Some(rcur),
@@ -494,6 +523,7 @@ fn prepare_gi(p: PrepareGiParams) {
     gpu.lt_node.as_ref(),
     gpu.lt_node_key.as_ref(),
     gpu.stats.as_ref(),
+    gpu.gi_merge.as_ref(),
     gpu.res_prev.as_ref(),
     gpu.res_tmp.as_ref(),
     gpu.res_cur.as_ref(),
@@ -515,6 +545,7 @@ fn prepare_gi(p: PrepareGiParams) {
       BindGroupEntry { binding: 7, resource: rprev.as_entire_binding() },
       BindGroupEntry { binding: 8, resource: rtmp.as_entire_binding() },
       BindGroupEntry { binding: 9, resource: rcur.as_entire_binding() },
+      BindGroupEntry { binding: 10, resource: gm.as_entire_binding() },
     ],
   );
   gpu.bg5 = Some(bg5);

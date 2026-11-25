@@ -10,6 +10,9 @@ pub const DDA_SHADER_PATH: &str = "shaders/voxel_raytrace/main.wesl";
 #[derive(Resource, Clone)]
 pub struct DdaShaderHandle(pub Handle<Shader>);
 
+#[derive(Resource, Clone)]
+pub struct DdaShaderSource(pub std::sync::Arc<str>);
+
 pub fn compile_dda_wesl() -> Result<String, wesl::Error> {
   compile_wesl_entry(dda_wesl_dir().join("main.wesl"))
 }
@@ -51,6 +54,7 @@ pub fn build_dda_shader(app: &mut App) {
   let handle = app
     .world_mut()
     .resource_mut::<Assets<Shader>>()
-    .add(Shader::from_wgsl(source, DDA_SHADER_PATH));
+    .add(Shader::from_wgsl(source.clone(), DDA_SHADER_PATH));
   app.insert_resource(DdaShaderHandle(handle));
+  app.insert_resource(DdaShaderSource(std::sync::Arc::from(source.as_str())));
 }
