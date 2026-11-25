@@ -1,0 +1,7 @@
+[env]
+# dlss_wgpu 构建脚本要求绝对路径；relative=true 由 cargo 在构建期解析为
+# 相对本仓库根的绝对路径（只影响本仓库的构建进程，不污染系统环境）。
+# 三个目录都是 tools/fetch-dlss-deps.ps1 幂等拉取的 gitignored 缓存。
+DLSS_SDK = { value = "deps/DLSS", relative = true }
+LIBCLANG_PATH = { value = "deps/LLVM/bin", relative = true }
+VULKAN_SDK = { value = "deps/Vulkan-Headers", relative = true }

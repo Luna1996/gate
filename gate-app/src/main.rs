@@ -112,6 +112,8 @@ fn main() {
       })
       .set(bevy::render::RenderPlugin { render_creation: profile_render_creation(), ..default() }),
   );
+  #[cfg(feature = "dlss")]
+  app.add_plugins(gate_render::dlss::DlssInitPlugin);
   app
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)

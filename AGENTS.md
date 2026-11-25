@@ -3,11 +3,12 @@
 ## 构建 / 运行
 
 - **本仓库禁止 debug 构建**：`gate-*/build.rs` 会在 `PROFILE=debug` 时 panic。使用 `build-fast` / `balance` / `run-fast`；不再维护自定义 `release` profile。
-- 默认 Build Task（`Ctrl+Shift+B`）是 `build-gate-app-fast`：
+- 默认 Build Task（`Ctrl+Shift+B`）是 `build-gate-app-fast`，走 **DLSS/MSVC 路径**：
   ```bash
-  cargo build --profile build-fast -p gate-app
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-dlss.ps1 -Profile build-fast
   ```
-  产物 `target/build-fast/gate-app.exe`。
+  产物 `target/x86_64-pc-windows-msvc/build-fast/gate-app.exe`（`--features dlss --target x86_64-pc-windows-msvc`）。依赖自检、vcvars 工具集发现、`nvngx_dlss.dll` 落位都在脚本里；首次运行自动下载 `deps/`（gitignored：DLSS SDK v310.9.1 最小集 + libclang 23.1.6），之后全走缓存。
+- 不带 DLSS 的本机构建用 `build-gate-app-fast-gnu` 任务（`cargo build --profile build-fast -p gate-app`），产物 `target/build-fast/gate-app.exe`。三套产物目录互不复用：`target/build-fast`（gnu）、`target/x86_64-pc-windows-msvc/{build-fast,balance,run-fast}`（DLSS）。
 - 三种构建 profile：`build-fast` 是默认与性能测试档，`balance` 暂保留，`run-fast` 仅用于最终打包：
 
   **`build-fast`：编译优先，默认档（F5 `gate-app (build-fast)` → `build-gate-app-fast`）**

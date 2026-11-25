@@ -15,6 +15,7 @@ profile = [
   "bevy/trace",
   "dep:tracy-client",
 ]
+dlss = ["gate-render/dlss"]
 
 [dependencies]
 bevy = { workspace = true, features = ["png"] }

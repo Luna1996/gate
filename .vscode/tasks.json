@@ -4,6 +4,35 @@
     {
       "label": "build-gate-app-fast",
       "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "tools/build-dlss.ps1",
+        "-Profile",
+        "build-fast"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": true
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+    },
+    {
+      "label": "build-gate-app-fast-gnu",
+      "type": "shell",
       "command": "cargo",
       "args": [
         "build",
@@ -23,21 +52,19 @@
         "showReuseMessage": false,
         "clear": true
       },
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
     },
     {
       "label": "build-gate-app-balance",
       "type": "shell",
-      "command": "cargo",
+      "command": "powershell",
       "args": [
-        "build",
-        "--profile",
-        "balance",
-        "-p",
-        "gate-app"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "tools/build-dlss.ps1",
+        "-Profile",
+        "balance"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -54,13 +81,15 @@
     {
       "label": "build-gate-app-run-fast",
       "type": "shell",
-      "command": "cargo",
+      "command": "powershell",
       "args": [
-        "build",
-        "--profile",
-        "run-fast",
-        "-p",
-        "gate-app"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "tools/build-dlss.ps1",
+        "-Profile",
+        "run-fast"
       ],
       "options": {
         "cwd": "${workspaceFolder}"

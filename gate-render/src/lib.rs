@@ -1,5 +1,7 @@
 pub mod brickmap;
 pub mod consts;
+#[cfg(feature = "dlss")]
+pub mod dlss;
 pub mod gi;
 pub mod lighting;
 pub mod paths;
