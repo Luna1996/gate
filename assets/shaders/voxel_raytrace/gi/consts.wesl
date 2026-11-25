@@ -19,6 +19,7 @@ const IRC_CHAIN: u32 = 4u;
 const IRC_MAX_LEVEL: u32 = 11u;
 const IRC_FALLBACK_LEVELS: u32 = 4u;
 const IRC_EVICT_GUARD: u32 = 4u;
+const IRC_EVICT_PRESSURE: u32 = 60u;
 
 const IRC_ACC_SCALE: f32 = 16384.0;
 const IRC_V_MAX: f32 = 32.0;
@@ -26,12 +27,22 @@ const IRC_W_MIN: f32 = 0.04;
 
 const IRC_N_HALF: f32 = 6.0;
 const IRC_PARENT_CONF: f32 = 0.9;
-const IRC_SHRINK_C: f32 = 8.0;
 const IRC_Z2: f32 = 16.0;
-const IRC_VAR_ALPHA: f32 = 0.125;
+const IRC_VAR_ALPHA: f32 = 0.03125;
+const IRC_RV_PRIOR: f32 = 1.0;
+const IRC_RV_K: f32 = 64.0;
+const IRC_RV_MIN: f32 = 0.0625;
+const IRC_RV_MAX: f32 = 64.0;
+const IRC_SIG_LO: f32 = 9.0;
+const IRC_SIG_HI: f32 = 25.0;
+const IRC_HET_K: f32 = 4.0;
+const IRC_HET_ALPHA: f32 = 0.25;
+const IRC_HET_MIN: u32 = 3u;
+const IRC_HET_SE_MAX: f32 = 0.25;
 const IRC_SUN_ALPHA: f32 = 0.125;
 
 const GI_SPP_MAX: u32 = 8u;
+const GI_NEE_STATIC: u32 = 2u;
 const GI_SPP_BOOST_N0: f32 = 8.0;
 const GI_SPP_BOOST_N1: f32 = 64.0;
 const GI_SPP_EASE_N: f32 = 192.0;

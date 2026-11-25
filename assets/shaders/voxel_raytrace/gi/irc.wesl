@@ -2,7 +2,7 @@ import package::bindings::{gi_stats, gi_u, irc, irc_key, view_u};
 import package::brickmap::{Grid};
 import package::common::{face_normal_from_index};
 import package::gi::common::{gi_div, gi_mix};
-import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVICT_GUARD, IRC_FALLBACK_LEVELS, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_SHRINK_C, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2};
+import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVICT_GUARD, IRC_EVICT_PRESSURE, IRC_FALLBACK_LEVELS, IRC_HET_ALPHA, IRC_HET_K, IRC_HET_MIN, IRC_HET_SE_MAX, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_RV_K, IRC_RV_MAX, IRC_RV_MIN, IRC_RV_PRIOR, IRC_SIG_HI, IRC_SIG_LO, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2};
 import package::trace::{grid_is_far};
 
 const IRC_W_VAL: u32 = 0u;
@@ -12,9 +12,11 @@ const IRC_W_N: u32 = 5u;
 const IRC_W_VAR: u32 = 6u;
 const IRC_W_STAMP: u32 = 7u;
 const IRC_W_SAMPLED: u32 = 8u;
+const IRC_W_RV: u32 = 9u;
 const IRC_W_ACC: u32 = 10u;
 const IRC_W_ACC_W: u32 = 13u;
 const IRC_W_ACC_SUN: u32 = 14u;
+const IRC_W_HET: u32 = 15u;
 
 const IRC_NONE: u32 = 0xFFFFFFFFu;
 const IRC_LOCK: u32 = 1u;
@@ -41,6 +43,30 @@ fn rgb9e5_pack(c: vec3<f32>) -> u32 {
 fn rgb9e5_unpack(p: u32) -> vec3<f32> {
   return vec3<f32>(f32(p & 0x1FFu), f32((p >> 9u) & 0x1FFu), f32((p >> 18u) & 0x1FFu))
     * exp2(f32(p >> 27u) - 24.0);
+}
+
+struct IrcStat {
+  rv_now: f32,
+  rv_mean: f32,
+  het: f32,
+}
+
+fn irc_rv_code(rv: f32) -> u32 {
+  return 1u + u32((log2(clamp(rv, IRC_RV_MIN, IRC_RV_MAX)) + 4.0) * 100.0 + 0.5);
+}
+
+fn irc_rv_decode(q: u32) -> f32 {
+  return select(0.0, exp2(f32(q) * 0.01 - 4.01), q != 0u);
+}
+
+fn irc_stat_pack(st: IrcStat) -> u32 {
+  return irc_rv_code(st.rv_now) | (irc_rv_code(st.rv_mean) << 10u)
+    | (u32(sqrt(clamp(st.het, 0.0, 1.0)) * 4095.0 + 0.5) << 20u);
+}
+
+fn irc_stat_unpack(w: u32) -> IrcStat {
+  let t = f32(w >> 20u) * (1.0 / 4095.0);
+  return IrcStat(irc_rv_decode(w & 0x3FFu), irc_rv_decode((w >> 10u) & 0x3FFu), t * t);
 }
 
 struct IrcCell {
@@ -331,7 +357,15 @@ fn irc_accumulate_sun(a: IrcAddr, face: u32, sun: f32, rnd: vec2<f32>) {
   irc_accumulate(a, face_normal_from_index(face), vec3<f32>(0.0), false, sun, rnd);
 }
 
-fn irc_parent(cl: IrcCell) -> vec4<f32> {
+struct IrcPar {
+  e: vec3<f32>,
+  conf: f32,
+  rv: f32,
+  het: f32,
+  slot: u32,
+}
+
+fn irc_parent(cl: IrcCell) -> IrcPar {
   let axis = cl.face >> 1u;
   let a1 = (axis + 1u) % 3u;
   let a2 = (axis + 2u) % 3u;
@@ -344,12 +378,20 @@ fn irc_parent(cl: IrcCell) -> vec4<f32> {
   c2[a2] = (pc[a2] + select(pm[a2], 1u, (cl.c[a2] & 1u) == 1u)) & pm[a2];
   var c3 = c1;
   c3[a2] = c2[a2];
-  var acc = irc_tap(irc_cell_key(IrcCell(pc, level, cl.face, cl.obj))) * 0.5625;
+  var acc = vec4<f32>(0.0);
+  var stat = IrcStat(0.0, 0.0, 0.0);
+  let s0 = irc_find(irc_cell_key(IrcCell(pc, level, cl.face, cl.obj)));
+  if (s0 != IRC_NONE) {
+    let pb = s0 * IRC_WORDS;
+    let conf = f32(atomicLoad(&irc[pb + IRC_W_META]) & 0xFFu) * (1.0 / 255.0);
+    acc = vec4<f32>(rgb9e5_unpack(atomicLoad(&irc[pb + IRC_W_VAL])) * conf, conf) * 0.5625;
+    stat = irc_stat_unpack(atomicLoad(&irc[pb + IRC_W_RV]));
+  }
   acc = acc + irc_tap(irc_cell_key(IrcCell(c1, level, cl.face, cl.obj))) * 0.1875;
   acc = acc + irc_tap(irc_cell_key(IrcCell(c2, level, cl.face, cl.obj))) * 0.1875;
   acc = acc + irc_tap(irc_cell_key(IrcCell(c3, level, cl.face, cl.obj))) * 0.0625;
-  if (!(acc.a > 0.0)) { return vec4<f32>(0.0); }
-  return vec4<f32>(acc.rgb / acc.a, acc.a);
+  if (!(acc.a > 0.0)) { return IrcPar(vec3<f32>(0.0), 0.0, stat.rv_now, stat.het, s0); }
+  return IrcPar(acc.rgb / acc.a, acc.a, stat.rv_now, stat.het, s0);
 }
 
 fn irc_resolve_slot(s: u32) {
@@ -362,7 +404,17 @@ fn irc_resolve_slot(s: u32) {
   let sunq = atomicLoad(&irc[b + IRC_W_ACC_SUN]);
   var stamp = atomicLoad(&irc[b + IRC_W_STAMP]);
   if (wq != 0u || sunq != 0u) { stamp = frame; }
-  if (k1 == IRC_LOCK || frame - stamp > gi_u.seq.y) {
+  let age = frame - stamp;
+  var evict = k1 == IRC_LOCK || age > gi_u.seq.y;
+  if (!evict && age > IRC_EVICT_PRESSURE) {
+    let base = s - (s % IRC_BUCKET);
+    var free = 0u;
+    for (var j = 0u; j < IRC_BUCKET && free < 2u; j = j + 1u) {
+      if (atomicLoad(&irc_key[(base + j) * 2u + 1u]) == 0u) { free = free + 1u; }
+    }
+    evict = free < 2u;
+  }
+  if (evict) {
     for (var i = 0u; i < IRC_WORDS; i = i + 1u) { atomicStore(&irc[b + i], 0u); }
     atomicStore(&irc_key[kb], 0u);
     atomicStore(&irc_key[kb + 1u], 0u);
@@ -381,6 +433,7 @@ fn irc_resolve_slot(s: u32) {
   var sun8 = (meta_w >> 8u) & 0xFFu;
   var sun_n = (meta_w >> 16u) & 0xFu;
   if (gi_u.flags.z > 0.5) { sun_n = 0u; }
+  var share = 0.0;
 
   if (wq != 0u) {
     let wsum = f32(wq) * (1.0 / 256.0);
@@ -398,13 +451,14 @@ fn irc_resolve_slot(s: u32) {
       } else {
         streak = 0u;
       }
-      varr = mix(varr, s2, IRC_VAR_ALPHA);
+      varr = mix(varr, s2, clamp(wsum / (n + wsum), IRC_VAR_ALPHA, 0.5));
     } else {
       varr = max(lf * lf, 1e-8);
       streak = 0u;
     }
     let n_new = min(n + wsum, IRC_N_MAX);
-    mean = mix(mean, fm, clamp(wsum / n_new, 0.0, 1.0));
+    share = clamp(wsum / n_new, 0.0, 1.0);
+    mean = mix(mean, fm, share);
     n = n_new;
     atomicStore(&irc[b + IRC_W_SAMPLED], frame);
     atomicStore(&irc[b + IRC_W_ACC], 0u);
@@ -426,25 +480,51 @@ fn irc_resolve_slot(s: u32) {
   atomicStore(&irc[b + IRC_W_N], bitcast<u32>(n));
   atomicStore(&irc[b + IRC_W_STAMP], stamp);
 
+  let stat = irc_stat_unpack(atomicLoad(&irc[b + IRC_W_RV]));
+  var het = stat.het;
+  let hq = atomicExchange(&irc[b + IRC_W_HET], 0u);
+  let hn = hq >> 28u;
+  if (hn >= IRC_HET_MIN) {
+    let md = f32(hq & 0x3FFFu) / (1023.0 * f32(hn));
+    let ms = f32((hq >> 14u) & 0x3FFFu) / (4092.0 * f32(hn));
+    het = mix(het, max(md - IRC_HET_K * ms, 0.0), IRC_HET_ALPHA);
+  } else {
+    het = het * (1.0 - IRC_HET_ALPHA);
+  }
+
   var out_e = mean;
   var out_c = n / (n + IRC_N_HALF);
+  var rv = IRC_RV_PRIOR;
+  var rv_mean = IRC_RV_PRIOR;
   let cl = irc_decode(vec2<u32>(atomicLoad(&irc_key[kb]), k1));
   if (cl.level < 15u) {
     let par = irc_parent(cl);
-    if (par.a > 0.0) {
+    let prior = select(IRC_RV_PRIOR, par.rv, par.rv > 0.0);
+    let l = dot(mean, GI_LUMA);
+    var rv_own = prior;
+    if (n >= 1.0 && l > 1e-6) { rv_own = varr / (l * l); }
+    rv = clamp((n * rv_own + IRC_RV_K * prior) / (n + IRC_RV_K), IRC_RV_MIN, IRC_RV_MAX);
+    rv_mean = select(rv, mix(stat.rv_mean, rv, share), stat.rv_mean > 0.0);
+    if (par.conf > 0.0) {
       if (n < 0.5) {
-        out_e = par.rgb;
+        out_e = par.e;
       } else {
-        let l = max(dot(mean, GI_LUMA), 1e-6);
-        let dv = mean - par.rgb;
-        let d2 = dot(dv, dv) / max(dot(mean, mean), 1e-12);
-        let se2 = varr / (n * l * l);
-        let w = min(d2 / (d2 + IRC_SHRINK_C * se2 + 1e-9), out_c);
-        out_e = mix(par.rgb, mean, w);
+        let dv = mean - par.e;
+        let d2 = dot(dv, dv) / max(max(dot(mean, mean), dot(par.e, par.e)), 1e-12);
+        let se2 = rv_mean / n;
+        var w = smoothstep(IRC_SIG_LO, IRC_SIG_HI, d2 / se2);
+        if (par.slot != IRC_NONE && se2 < IRC_HET_SE_MAX) {
+          atomicAdd(&irc[par.slot * IRC_WORDS + IRC_W_HET],
+                    u32(min(d2, 1.0) * 1023.0 + 0.5) | (u32(se2 * 4092.0 + 0.5) << 14u)
+                    | (1u << 28u));
+          w = max(w, par.het / (par.het + se2));
+        }
+        out_e = mix(par.e, mean, min(w, out_c));
       }
-      out_c = max(out_c, par.a * IRC_PARENT_CONF);
+      out_c = max(out_c, par.conf * IRC_PARENT_CONF);
     }
   }
+  atomicStore(&irc[b + IRC_W_RV], irc_stat_pack(IrcStat(rv, rv_mean, het)));
   atomicStore(&irc[b + IRC_W_VAL], rgb9e5_pack(out_e));
   atomicStore(&irc[b + IRC_W_META],
               (meta_w & 0xFF000000u) | u32(clamp(out_c, 0.0, 1.0) * 255.0 + 0.5)

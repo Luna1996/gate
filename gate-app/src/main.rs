@@ -184,6 +184,12 @@ fn main() {
   if (consts::AUTO_ORBIT || consts::bench_orbit()) && !consts::phys_pile() {
     app.add_systems(Update, camera::auto_orbit_system);
   }
+  if consts::bench_roam() {
+    app.add_systems(
+      Update,
+      camera::auto_roam_system.after(camera::fly_camera_input).before(camera::build_camera_config),
+    );
+  }
   if consts::bench_fly() {
     app.add_systems(
       Update,

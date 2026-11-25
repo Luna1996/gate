@@ -23,11 +23,20 @@ pub fn bench_fly() -> bool {
   })
 }
 
+pub fn bench_roam() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| {
+    std::env::var("GATE_BENCH").is_ok_and(|v| v.to_ascii_lowercase().contains("roam"))
+  })
+}
+
 pub fn bench_config_tag() -> Option<&'static str> {
   static TAG: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
   *TAG.get_or_init(|| {
     if phys_pile() {
       Some("pile")
+    } else if bench_roam() {
+      Some("roam")
     } else if bench_fly() {
       Some("fly")
     } else if bench_orbit() {
@@ -84,6 +93,9 @@ pub fn gi_force() -> Option<bool> {
 pub const BENCH_FLY_SPEED: f32 = 2000.0;
 pub const BENCH_FLY_TURN: f32 = 0.16;
 pub const BENCH_FLY_YAW: f32 = 0.35;
+pub const BENCH_ROAM_CYCLE: f64 = 32.0;
+pub const BENCH_ROAM_REACH: f32 = 150.0;
+pub const BENCH_ROAM_TURN: f32 = 1.3;
 
 pub fn edit_selftest() -> bool {
   static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

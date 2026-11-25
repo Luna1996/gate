@@ -1,7 +1,7 @@
 import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
-import package::gi::consts::{GI_LUMA, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS};
+import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS};
 import package::gi::irc::{irc_accumulate, irc_addr, irc_display, irc_lookup, irc_resolve_slot};
 import package::gi::light::{lt_hit_weight, lt_nee, lt_pick, lt_register, lt_sweep_slot};
 import package::gi::ray::{gi_accumulate, gi_accumulate_sun, gi_leaf_indirect, gi_origin, gi_sun_vis, gi_surface};
@@ -1249,19 +1249,23 @@ fn gi_restir_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (r.m > m0) { atomicAdd(&gi_stats[GI_STAT_RES_TEMPORAL], 1u); }
     }
   }
-  let pick = lt_pick(s.p, s.n, gi_mix(seed + 0x68E31DA4u));
-  var pick_vis = 0.0;
-  if (pick.ok) {
-    let origin = gi_origin(s);
-    let d = pick.y - origin;
-    let dist = length(d);
-    var tint = vec3<f32>(1.0);
-    let hit = world_trace_medium_scene(origin, d / max(dist, 1e-6),
-                                       max(dist - SHADOW_SURFACE_EPS * g.scale, 0.0),
-                                       false, false, &tint);
-    pick_vis = select(1.0, 0.0, hit.hit);
+  let origin = gi_origin(s);
+  let picks = select(GI_NEE_STATIC, 1u, gi_u.flags.w > 0.5);
+  for (var i = 0u; i < picks; i = i + 1u) {
+    let ps = gi_mix(seed + 0x68E31DA4u + i * 0x9E3779B1u);
+    let pick = lt_pick(s.p, s.n, ps);
+    var pick_vis = 0.0;
+    if (pick.ok) {
+      let d = pick.y - origin;
+      let dist = length(d);
+      var tint = vec3<f32>(1.0);
+      let hit = world_trace_medium_scene(origin, d / max(dist, 1e-6),
+                                         max(dist - SHADOW_SURFACE_EPS * g.scale, 0.0),
+                                         false, false, &tint);
+      pick_vis = select(1.0, 0.0, hit.hit);
+    }
+    r = res_add_pick(r, pick, pick_vis, gi_rand2(gi_mix(ps + 0x517CC1B7u)).x);
   }
-  r = res_add_pick(r, pick, pick_vis, gi_rand2(gi_mix(seed + 0x517CC1B7u)).x);
   r = res_finish(r);
   res_store_tmp(idx, r);
 }

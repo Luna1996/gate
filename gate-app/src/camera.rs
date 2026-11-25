@@ -288,6 +288,39 @@ pub(crate) fn auto_fly_system(
   fly.pos += dir * crate::consts::BENCH_FLY_SPEED * dt;
 }
 
+pub(crate) fn auto_roam_system(
+  mut orbit: ResMut<OrbitCamera>,
+  mode: Res<CameraMode>,
+  mut fly: ResMut<FlyCamera>,
+  mut base: Local<Option<(Vec3, f32)>>,
+) {
+  if *mode != CameraMode::Fly {
+    return;
+  }
+  let (pos, yaw) = *base.get_or_insert((fly.pos, orbit.yaw));
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0.0, |d| d.as_secs_f64());
+  let t = (now % crate::consts::BENCH_ROAM_CYCLE) as f32;
+  let pi = std::f32::consts::PI;
+  let reach = crate::consts::BENCH_ROAM_REACH;
+  let mut off = 0.0;
+  let mut turn = 0.0;
+  if t < 3.0 {
+    off = reach * 0.5 * (1.0 - (pi * t).cos());
+  } else if t < 7.0 {
+    off = reach;
+  } else if t < 8.0 {
+    off = reach * 0.5 * (1.0 + (pi * (t - 7.0)).cos());
+  } else if t < 11.0 {
+    let k = (t - 8.0).floor();
+    let sign = if k as i32 % 2 == 0 { 1.0 } else { -1.0 };
+    turn = sign * crate::consts::BENCH_ROAM_TURN * 0.5 * (1.0 - (2.0 * pi * (t - 8.0 - k)).cos());
+  }
+  fly.pos = pos + look_forward(yaw, 0.0) * off;
+  orbit.yaw = yaw + turn;
+}
+
 pub(crate) fn sync_camera_mode_switch(
   mode: Res<CameraMode>,
   mut orbit: ResMut<OrbitCamera>,

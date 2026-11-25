@@ -238,7 +238,10 @@ fn res_pick_chat(p: LtSample, x: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 fn res_add_pick(r: Res, p: LtSample, vis: f32, rnd: f32) -> Res {
   var out = r;
-  if (!p.ok) { return out; }
+  if (!p.ok) {
+    out.m = out.m + 1.0;
+    return out;
+  }
   let c = res_pick_chat(p, out.x, out.n);
   let w = dot(c, GI_LUMA);
   out.sum = out.sum + c * vis;

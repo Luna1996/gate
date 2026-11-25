@@ -45,8 +45,6 @@ impl GiSettings {
 
   pub const EVICT_FRAMES: u32 = 900;
 
-  pub const EVICT_FRAMES_MOVING: u32 = 60;
-
   pub const FORGET: f32 = 0.9989;
 
   pub const GI_SIZE_REF_PX: u64 = 320 * 180;
@@ -443,7 +441,6 @@ fn prepare_gi(p: PrepareGiParams) {
   }
   let cap = if light_jump || edited { GiSettings::HIST_CAP_RESET } else { GiSettings::HIST_CAP };
   gpu.hist_cap = cap;
-  let evict = if moved { GiSettings::EVICT_FRAMES_MOVING } else { GiSettings::EVICT_FRAMES };
 
   *gpu.uniform.get_mut() = GiUniform {
     params: Vec4::new(
@@ -464,7 +461,7 @@ fn prepare_gi(p: PrepareGiParams) {
       if light_jump { 1.0 } else { 0.0 },
       if moved { 1.0 } else { 0.0 },
     ),
-    seq: UVec4::new(gpu.frame, evict, gpu.light_rev, light_slots()),
+    seq: UVec4::new(gpu.frame, GiSettings::EVICT_FRAMES, gpu.light_rev, light_slots()),
     prev_view_proj: prev_track.unwrap_or_else(|| track.unwrap_or(Mat4::IDENTITY)),
   };
   gpu.uniform.write_buffer(&device, &queue);
