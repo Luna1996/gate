@@ -93,9 +93,6 @@ pub fn load_menu(config: &Config) -> MenuFile {
   model
 }
 
-/// DLSS 档位菜单项从 `render/dlss/mode` → `video/dlss/mode` → `video/dlss` 两代
-/// 迁移后的旧键一次性改写（键与选项 label 双前缀）。应用下一次保存会以新键
-/// 落盘，旧键自然消失。
 fn migrate_dlss_menu_path(values: &BTreeMap<String, MenuValue>) -> BTreeMap<String, MenuValue> {
   const NEW_KEY: &str = "video/dlss";
   const LEGACY: [(&str, &str); 2] =
@@ -180,9 +177,6 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   spawn_fps_overlay(world, &ctx);
 }
 
-/// DLSS 档位按探测可用性置灰：探测由渲染初始化（RenderPlugin::finish）填充，
-/// 本系统运行于其后的 Startup；未编译 dlss feature 时恒为不可用。
-/// DLSS 激活时「像素大小」与「抗锯齿」随之置灰（DLSS 接管内部分辨率与 AA）。
 fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   #[cfg(feature = "dlss")]
   let supported = world
@@ -214,7 +208,6 @@ fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   }
 }
 
-/// DLSS 与「像素大小」「抗锯齿」的互斥置灰；两侧节点在 menu toml 的 video 段。
 fn set_video_exclusivity(model: &mut MenuFile, dlss_on: bool) {
   if let Some(MenuNode::SwitchGroup { disabled, .. }) = model.node_mut(&split("video/scale")) {
     *disabled = dlss_on;
@@ -378,7 +371,6 @@ fn register_callbacks(world: &mut World) {
           info!("DLSS → {:?}（内部 {:?}）", dlss.mode, dlss.mode.ratio());
           #[cfg(not(feature = "dlss"))]
           info!("DLSS ! 构建缺 --features dlss，档位不生效");
-          // DLSS 接管内部分辨率与 AA ⇒ 像素大小 / 抗锯齿置灰，切回关时恢复
           if let Ok(mut menu) = menu.single_mut() {
             set_video_exclusivity(&mut menu.model, dlss.mode != gate_render::DlssMode::Off);
             menu.request_rebuild();

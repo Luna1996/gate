@@ -23,8 +23,6 @@ impl RenderScale {
   pub const SCALE_CHOICES: [u32; 4] = [1, 2, 3, 4];
 }
 
-/// DLSS 逐帧状态（主世界由 responsive/设置驱动，extract 进渲染端）。
-/// `out_size` 为 0 ⇒ DLSS 未启用（shader 侧跳过 mvec/depth 写出）。
 #[derive(Resource, Clone, Copy, Debug, Default, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct DlssFrame {
@@ -33,8 +31,6 @@ pub struct DlssFrame {
   pub frame: u32,
 }
 
-/// DLSS 档位。ratio 为内部分辨率相对输出的线性比例
-///（NGX 会在 [min,max] 内接受任意实际尺寸，动态分辨率语义）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DlssMode {
   #[default]
@@ -65,15 +61,12 @@ impl DlssMode {
 #[extract_app(bevy::render::RenderApp)]
 pub struct DlssSettings {
   pub mode: DlssMode,
-  /// NGX 探测支持超分（渲染初始化后由 dlss 模块回填；gnu 构建恒 false）。
   pub supported: bool,
 }
 
-/// 渲染端 DLSS 输出纹理视图（激活时由 dlss 模块逐帧发布；blit 优先用它）。
 #[derive(Resource, Default)]
 pub struct DlssBlitSource(pub Option<std::sync::Arc<TextureView>>);
 
-/// 渲染端最终颜色纹理视图（prepare 逐帧发布，DLSS eval 的输入）。
 #[derive(Resource, Default)]
 pub struct DdaColorView(pub Option<std::sync::Arc<TextureView>>);
 
@@ -94,7 +87,6 @@ fn halton(mut i: u32, base: u32) -> f32 {
 }
 
 impl DlssFrame {
-  /// 与 dlss_wgpu 的 suggested_jitter 同一序列（halton(2)/halton(3)，相位数 8·ratio²）。
   pub fn jitter(&self, render_size: UVec2) -> Vec2 {
     if !self.active || self.out_size.x == 0 || render_size.x == 0 {
       return Vec2::ZERO;
@@ -2179,7 +2171,6 @@ fn blit_dda_view(p: BlitDdaParams) {
     return;
   };
 
-  // DLSS 已做时域重建，不再叠 FXAA
   let fxaa = post.as_ref().is_some_and(|p| p.fxaa) && !dlss.active;
   let id = if fxaa { pipelines.blit_fxaa_pipeline } else { pipelines.blit_pipeline };
   let Some(pipe) = pipeline_cache.get_render_pipeline(id) else {

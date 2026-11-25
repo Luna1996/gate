@@ -570,8 +570,6 @@ struct LightRef {
 }
 
 impl LightRef {
-  // 主光/天空的慢速连续变化（时刻自动流逝）只更新参考态，缓存由 FORGET 衰减、
-  // streak 离群削减与太阳可见性 EMA 自行跟踪；超出容差的离散跳变才返回 true 触发历史重置。
   fn track(&mut self, theme: Option<&crate::lighting::LightingTheme>, emit_gain: f32) -> bool {
     let Some(t) = theme else {
       self.filled = false;

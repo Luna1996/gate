@@ -130,8 +130,6 @@ fn option_button(
   disabled: bool,
 ) -> Entity {
   let m = &ctx.theme.metrics;
-  // 与 button/checkbox 同款禁用约定：底/边/字全部 dim，拾取源头忽略
-  // （无 Hovered ⇒ 无悬停变色与光标变化；refresh_visuals 会持续钉住）
   let (bg, border) = if disabled {
     (
       dim_color(color_of(&ctx.theme.colors.surface_elevated)),

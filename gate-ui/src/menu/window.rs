@@ -47,7 +47,6 @@ pub struct MenuPager {
 }
 
 impl DebugMenu {
-  /// 请求按当前模型重建菜单页（模型被外部修改后调用）。
   pub fn request_rebuild(&mut self) {
     self.rebuild = true;
   }
@@ -992,7 +991,6 @@ fn refresh_visuals(world: &mut World, root: Entity, parts: &MenuParts) {
       match role {
         MenuRole::SubMenu => (Color::NONE, Color::NONE, dim_color(text_body), 0),
         MenuRole::SwitchOption(_) | MenuRole::Tab(_) | MenuRole::Button(_) => {
-          // button/checkbox 同款：钉在置灰静止色，悬停/选中不再起效
           (dim_color(surface_elevated), dim_color(border), dim_color(text_muted), 0)
         }
         _ => continue,
