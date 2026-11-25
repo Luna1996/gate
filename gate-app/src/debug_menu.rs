@@ -93,21 +93,29 @@ pub fn load_menu(config: &Config) -> MenuFile {
   model
 }
 
-/// DLSS 档位从 `render/dlss/mode` 迁到 `video/dlss/mode` 后，一次性改写旧键
-/// （键与选项 label 同前缀）。应用下一次保存会以新键落盘，旧键自然消失。
+/// DLSS 档位菜单项从 `render/dlss/mode` → `video/dlss/mode` → `video/dlss` 两代
+/// 迁移后的旧键一次性改写（键与选项 label 双前缀）。应用下一次保存会以新键
+/// 落盘，旧键自然消失。
 fn migrate_dlss_menu_path(values: &BTreeMap<String, MenuValue>) -> BTreeMap<String, MenuValue> {
-  const OLD_KEY: &str = "render/dlss/mode";
-  const OLD_PREFIX: &str = "menu.render.dlss.mode.";
-  let Some(v) = values.get(OLD_KEY) else { return values.clone() };
+  const NEW_KEY: &str = "video/dlss";
+  const LEGACY: [(&str, &str); 2] =
+    [("render/dlss/mode", "menu.render.dlss.mode."), ("video/dlss/mode", "menu.video.dlss.mode.")];
   let mut out = values.clone();
-  out.remove(OLD_KEY);
-  let v = match v {
-    MenuValue::Text(s) if s.starts_with(OLD_PREFIX) => {
-      MenuValue::Text(format!("menu.video.dlss.mode.{}", &s[OLD_PREFIX.len()..]))
+  let mut migrated = None;
+  for (key, prefix) in LEGACY {
+    if let Some(v) = out.remove(key) {
+      let v = match &v {
+        MenuValue::Text(s) if s.starts_with(prefix) => {
+          MenuValue::Text(format!("menu.video.dlss.{}", &s[prefix.len()..]))
+        }
+        v => v.clone(),
+      };
+      migrated = Some(v);
     }
-    v => v.clone(),
-  };
-  out.entry("video/dlss/mode".to_string()).or_insert(v);
+  }
+  if let Some(v) = migrated {
+    out.entry(NEW_KEY.to_string()).or_insert(v);
+  }
   out
 }
 
@@ -172,8 +180,8 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   spawn_fps_overlay(world, &ctx);
 }
 
-/// DLSS 档位控件按探测可用性置灰：探测由渲染初始化（RenderPlugin::finish）
-/// 填充，本系统运行于其后的 Startup；未编译 dlss feature 时恒为不可用。
+/// DLSS 档位按探测可用性置灰：探测由渲染初始化（RenderPlugin::finish）填充，
+/// 本系统运行于其后的 Startup；未编译 dlss feature 时恒为不可用。
 /// DLSS 激活时「像素大小」与「抗锯齿」随之置灰（DLSS 接管内部分辨率与 AA）。
 fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   #[cfg(feature = "dlss")]
@@ -183,7 +191,7 @@ fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   #[cfg(not(feature = "dlss"))]
   {
     let _ = world;
-    let path = split("video/dlss/mode");
+    let path = split("video/dlss");
     if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) = model.node_mut(&path) {
       *disabled = true;
       *selected = 0;
@@ -192,7 +200,7 @@ fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
   }
   #[cfg(feature = "dlss")]
   {
-    let path = split("video/dlss/mode");
+    let path = split("video/dlss");
     let mut dlss_on = false;
     if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) = model.node_mut(&path) {
       *disabled = !supported;
@@ -364,7 +372,7 @@ fn register_callbacks(world: &mut World) {
      mut dlss: ResMut<gate_render::DlssSettings>,
      mut menu: Query<&mut DebugMenu, With<DebugMenuRoot>>| {
       match (ev.path.as_str(), &ev.action) {
-        ("video/dlss/mode", MenuAction::Select(i)) => {
+        ("video/dlss", MenuAction::Select(i)) => {
           dlss.mode = gate_render::DlssMode::CHOICES[(*i).min(5)];
           #[cfg(feature = "dlss")]
           info!("DLSS → {:?}（内部 {:?}）", dlss.mode, dlss.mode.ratio());

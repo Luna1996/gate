@@ -21,6 +21,21 @@ label = "menu.video"
 
 [[items.children]]
 kind = "switch_group"
+id = "dlss"
+label = "menu.video.dlss"
+options = [
+    "menu.video.dlss.off",
+    "menu.video.dlss.dlaa",
+    "menu.video.dlss.quality",
+    "menu.video.dlss.balanced",
+    "menu.video.dlss.performance",
+    "menu.video.dlss.ultra",
+]
+selected = 0
+tooltip = "menu.video.dlss.tip"
+
+[[items.children]]
+kind = "switch_group"
 id = "scale"
 label = "menu.video.scale"
 options = [
@@ -30,26 +45,6 @@ options = [
     "menu.video.scale.quarter",
 ]
 selected = 0
-
-[[items.children]]
-kind = "sub_menu"
-id = "dlss"
-label = "menu.video.dlss"
-
-[[items.children.children]]
-kind = "switch_group"
-id = "mode"
-label = "menu.video.dlss.mode"
-options = [
-    "menu.video.dlss.mode.off",
-    "menu.video.dlss.mode.dlaa",
-    "menu.video.dlss.mode.quality",
-    "menu.video.dlss.mode.balanced",
-    "menu.video.dlss.mode.performance",
-    "menu.video.dlss.mode.ultra",
-]
-selected = 0
-tooltip = "menu.video.dlss.mode.tip"
 
 [[items.children]]
 kind = "toggle"
