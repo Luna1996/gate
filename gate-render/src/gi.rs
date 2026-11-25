@@ -1,5 +1,5 @@
 use bevy::render::render_resource::{BindGroup, BindGroupLayoutDescriptor, Buffer, ShaderType};
-use glam::{Mat4, UVec2, UVec4, Vec4};
+use glam::{Mat4, UVec2, UVec4, Vec3, Vec4};
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, ShaderType)]
@@ -182,7 +182,7 @@ pub struct GiGpu {
 
   light_rev: u32,
 
-  last_light: [u32; 8],
+  light_ref: LightRef,
 }
 
 impl GiGpu {
@@ -324,7 +324,7 @@ fn queue_gi_pipelines(
     slots_tag: 0,
     prev_track: None,
     light_rev: 0,
-    last_light: [0; 8],
+    light_ref: LightRef::default(),
   });
 }
 
@@ -447,20 +447,9 @@ fn prepare_gi(p: PrepareGiParams) {
   };
   gpu.prev_track = track;
 
-  let light = [
-    lighting_digest(lighting.as_deref(), 0),
-    lighting_digest(lighting.as_deref(), 1),
-    settings.emit_gain.to_bits(),
-  ];
-  let mut light_jump = false;
-  for (i, v) in light.iter().enumerate() {
-    if gpu.last_light[i] != *v {
-      if gpu.last_light[i] != 0 {
-        light_jump = true;
-        gpu.light_rev = gpu.light_rev.wrapping_add(1);
-      }
-      gpu.last_light[i] = *v;
-    }
+  let mut light_jump = gpu.light_ref.track(lighting.as_deref(), settings.emit_gain);
+  if light_jump {
+    gpu.light_rev = gpu.light_rev.wrapping_add(1);
   }
   let edited = dirty.as_ref().is_some_and(|d| d.edited || d.full || d.palette_changed);
   if edited {
@@ -556,31 +545,73 @@ fn light_slots() -> u32 {
   LT_SLOTS as u32
 }
 
-fn lighting_digest(theme: Option<&crate::lighting::LightingTheme>, part: u32) -> u32 {
-  let Some(t) = theme else { return 0 };
-  let mut h = 0x811C_9DC5u32;
-  let mut mix = |v: f32| {
-    h = (h ^ v.to_bits()).wrapping_mul(0x0100_0193);
-  };
-  if part == 0 {
-    if let Some(s) = &t.sun {
-      for v in s.dir {
-        mix(v);
-      }
-      for v in s.color {
-        mix(v);
-      }
-      mix(s.intensity);
+const LIGHT_JUMP_DIR: f32 = 6.0e-4;
+const LIGHT_JUMP_REL: f32 = 0.05;
+const LIGHT_JUMP_ABS: f32 = 0.02;
+
+fn light_scalar_jump(x: f32, r: f32) -> bool {
+  (x - r).abs() > LIGHT_JUMP_REL * r.abs().max(LIGHT_JUMP_ABS)
+}
+
+fn light_vec_jump(x: [f32; 3], r: [f32; 3]) -> bool {
+  x.iter().zip(r).any(|(a, b)| light_scalar_jump(*a, b))
+}
+
+#[derive(Default)]
+struct LightRef {
+  filled: bool,
+  has_sun: bool,
+  dir: Vec3,
+  sun_color: [f32; 3],
+  intensity: f32,
+  ambient: [f32; 3],
+  sky_color: Option<[f32; 3]>,
+  emit_gain: f32,
+}
+
+impl LightRef {
+  // 主光/天空的慢速连续变化（时刻自动流逝）只更新参考态，缓存由 FORGET 衰减、
+  // streak 离群削减与太阳可见性 EMA 自行跟踪；超出容差的离散跳变才返回 true 触发历史重置。
+  fn track(&mut self, theme: Option<&crate::lighting::LightingTheme>, emit_gain: f32) -> bool {
+    let Some(t) = theme else {
+      self.filled = false;
+      return false;
+    };
+    let sun = t.sun.as_ref().map(|s| {
+      let d = Vec3::from(s.dir);
+      (d / d.length().max(1e-6), s.color, s.intensity)
+    });
+    let mut jump = false;
+    if self.filled {
+      let sun_jump = match (sun, self.has_sun) {
+        (Some((d, c, i)), true) => {
+          1.0 - d.dot(self.dir) > LIGHT_JUMP_DIR
+            || light_vec_jump(c, self.sun_color)
+            || light_scalar_jump(i, self.intensity)
+        }
+        (None, false) => false,
+        _ => true,
+      };
+      let sky_jump = match (t.sky.as_ref().map(|s| s.color), self.sky_color) {
+        (Some(c), Some(r)) => light_vec_jump(c, r),
+        (None, None) => false,
+        _ => true,
+      };
+      jump = sun_jump
+        || sky_jump
+        || light_vec_jump(t.ambient, self.ambient)
+        || light_scalar_jump(emit_gain, self.emit_gain);
     }
-  } else {
-    for v in t.ambient {
-      mix(v);
+    self.filled = true;
+    self.has_sun = sun.is_some();
+    if let Some((d, c, i)) = sun {
+      self.dir = d;
+      self.sun_color = c;
+      self.intensity = i;
     }
-    if let Some(s) = &t.sky {
-      for v in s.color {
-        mix(v);
-      }
-    }
+    self.ambient = t.ambient;
+    self.sky_color = t.sky.as_ref().map(|s| s.color);
+    self.emit_gain = emit_gain;
+    jump
   }
-  h
 }
