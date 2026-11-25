@@ -16,6 +16,7 @@ pub mod wesl_consts;
 
 use bevy::prelude::*;
 
+pub use brickmap::dda::{DlssMode, DlssSettings};
 pub use brickmap::{
   BindingLimits, BrickMapBuffers, BrickMapBuilder, BrickMapGlobals, BufferLayout, BuilderMirror,
   ChunkUpdate, DdaCameraConfig, DdaImages, DdaViewUniform, DirtyRanges, EyeAdaptSettings,
@@ -25,7 +26,6 @@ pub use brickmap::{
   raycast_objects,
 };
 pub use brickmap::{PostFxSettings, RenderScale};
-pub use brickmap::dda::{DlssMode, DlssSettings};
 pub use consts::VIEW_SIZE;
 pub use lighting::{
   BaseSettings, DirLightCfg, LightDesc, LightGlobals, LightPoolUniform, LightingTheme, MAX_LIGHTS,

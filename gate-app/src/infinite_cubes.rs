@@ -297,9 +297,9 @@ pub fn stream_chunks(p: StreamChunksParams) {
   let n_vol = scene.volumes.len();
   let content_y = stream.source().and_then(|s| s.content_y_range());
   let mut scopes: Vec<VolScope> = Vec::with_capacity(n_vol);
-  for vol in 0..n_vol {
-    let scale = scene.volumes.list[vol].transform().scale;
-    let Some((o, d)) = scene.volumes.list[vol].stream_window() else {
+  for volume in scene.volumes.list.iter_mut() {
+    let scale = volume.transform().scale;
+    let Some((o, d)) = volume.stream_window() else {
       scopes.push(VolScope {
         center: IVec3::ZERO,
         w_origin: IVec3::ZERO,
@@ -323,7 +323,7 @@ pub fn stream_chunks(p: StreamChunksParams) {
     let want = c - d / 2;
     let moved = want != o;
     if moved {
-      scene.volumes.list[vol].set_stream_window(Some((want, d)));
+      volume.set_stream_window(Some((want, d)));
     }
     scopes.push(VolScope { center: c, w_origin: want, w_dims: d, moved, v_hy });
   }

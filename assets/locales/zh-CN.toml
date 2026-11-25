@@ -143,6 +143,22 @@ GI 采样网格边长 = 渲染分辨率 ÷ 档位：**只决定每帧往世界�
 "menu.render.exposure.tau_dn.tip" = "往暗处适应的速度（秒）：太小像**眨眼**"
 "menu.render.exposure.key" = "目标中灰"
 "menu.render.exposure.key.tip" = "百分位平均亮度被压到的**目标值**"
+"menu.render.dlss" = "DLSS"
+"menu.render.dlss.mode" = "档位"
+"menu.render.dlss.mode.tip" = """
+NVIDIA DLSS 超分辨率：内部按比例缩小渲染，由 GPU 张量核重建回全分辨率并顺带抗锯齿。
+
+- **DLAA**：内部 = 输出，纯时域抗锯齿不缩放
+- **质量 / 平衡 / 性能 / 超性能**：内部约为输出的 `2/3 / 0.58 / 1/2 / 1/3`，帧率递增、细节递减
+- **关**：回到「视频 → 像素大小」的静态缩放；激活时 FXAA 自动关闭
+
+需要 RTX GPU 与 NGX 运行库；不可用时自动回退原生输出，切换时重建上下文会掉一帧。"""
+"menu.render.dlss.mode.off" = "关"
+"menu.render.dlss.mode.dlaa" = "DLAA"
+"menu.render.dlss.mode.quality" = "质量"
+"menu.render.dlss.mode.balanced" = "平衡"
+"menu.render.dlss.mode.performance" = "性能"
+"menu.render.dlss.mode.ultra" = "超性能"
 "menu.render.sky" = "天空"
 "menu.render.sky.time" = "时间"
 "menu.render.sky.time.hour" = "时刻"

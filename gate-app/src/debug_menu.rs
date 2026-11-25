@@ -143,6 +143,7 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   };
   let translate = world.resource::<UiTranslator>().handle();
   let ctx = UiCtx::new(ctx.theme, ctx.font).with_icon_font(ctx.icon_font).with_translate(translate);
+  let model = apply_dlss_availability(world, model);
   let handle = spawn_debug_menu(world, &ctx, model);
   register_callbacks(world);
   crate::objects::register_callbacks(world);
@@ -150,6 +151,36 @@ pub(crate) fn spawn_debug_menu_ui(world: &mut World, ctx: &UiCtx) {
   apply_initial_state(world, handle.root);
   apply_env_overrides(world);
   spawn_fps_overlay(world, &ctx);
+}
+
+/// DLSS 档位控件按探测可用性置灰：探测由渲染初始化（RenderPlugin::finish）
+/// 填充，本系统运行于其后的 Startup；未编译 dlss feature 时恒为不可用。
+fn apply_dlss_availability(world: &World, mut model: MenuFile) -> MenuFile {
+  #[cfg(feature = "dlss")]
+  let supported = world
+    .get_resource::<gate_render::dlss::DlssProbe>()
+    .is_some_and(|p| p.0.lock().expect("DLSS 探测锁").super_resolution_supported);
+  #[cfg(not(feature = "dlss"))]
+  {
+    let _ = world;
+    let path = split("render/dlss/mode");
+    if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) = model.node_mut(&path) {
+      *disabled = true;
+      *selected = 0;
+    }
+    return model;
+  }
+  #[cfg(feature = "dlss")]
+  {
+    let path = split("render/dlss/mode");
+    if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) = model.node_mut(&path) {
+      *disabled = !supported;
+      if !supported {
+        *selected = 0;
+      }
+    }
+    model
+  }
 }
 
 fn apply_env_overrides(world: &mut World) {
@@ -296,8 +327,16 @@ fn register_callbacks(world: &mut World) {
      mut gi: ResMut<gate_render::gi::GiSettings>,
      mut eye: ResMut<gate_render::EyeAdaptSettings>,
      mut refl: ResMut<gate_render::ReflectionSettings>,
-     mut base: ResMut<gate_render::BaseSettings>| {
+     mut base: ResMut<gate_render::BaseSettings>,
+     mut dlss: ResMut<gate_render::DlssSettings>| {
       match (ev.path.as_str(), &ev.action) {
+        ("render/dlss/mode", MenuAction::Select(i)) => {
+          dlss.mode = gate_render::DlssMode::CHOICES[(*i).min(5)];
+          #[cfg(feature = "dlss")]
+          info!("DLSS → {:?}（内部 {:?}）", dlss.mode, dlss.mode.ratio());
+          #[cfg(not(feature = "dlss"))]
+          info!("DLSS ! 构建缺 --features dlss，档位不生效");
+        }
         ("render/ray/quality", MenuAction::Select(i)) => {
           let q = (*i).min(2) as u32;
           base.glass_quality = q;

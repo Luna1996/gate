@@ -1,7 +1,9 @@
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 
-use crate::brickmap::dda::{DlssFrame, DdaImages, DlssMode, DlssSettings, PostFxSettings, RenderScale};
+use crate::brickmap::dda::{
+  DdaImages, DlssFrame, DlssMode, DlssSettings, PostFxSettings, RenderScale,
+};
 use crate::consts::{MAX_DIM, MIN_DIM};
 
 fn size_is_sane(s: UVec2) -> bool {
@@ -36,7 +38,11 @@ pub fn resize_render_targets(
   }
   *warned = false;
 
-  let mode = settings.as_deref().map_or(DlssMode::Off, |s| s.mode);
+  let mode = if cfg!(feature = "dlss") {
+    settings.as_deref().filter(|s| s.supported).map_or(DlssMode::Off, |s| s.mode)
+  } else {
+    DlssMode::Off
+  };
   let dlss_on = mode != DlssMode::Off;
   let new_size = if dlss_on {
     let r = mode.ratio();

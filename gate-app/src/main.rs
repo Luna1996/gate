@@ -63,6 +63,10 @@ fn main() {
 
   let bench = consts::BENCH_UNFOCUSED || consts::bench();
   let mut app = App::new();
+  // NGX 实例/设备扩展回调必须先于 DefaultPlugins 注册：RenderCreation::Automatic
+  // 在 RenderPlugin::build 内就阻塞完成渲染器创建并捕获当时的 RawVulkanInitSettings。
+  #[cfg(feature = "dlss")]
+  app.add_plugins(gate_render::dlss::DlssInitPlugin);
   app.add_plugins(
     DefaultPlugins
       .set(WindowPlugin {
@@ -112,8 +116,6 @@ fn main() {
       })
       .set(bevy::render::RenderPlugin { render_creation: profile_render_creation(), ..default() }),
   );
-  #[cfg(feature = "dlss")]
-  app.add_plugins(gate_render::dlss::DlssInitPlugin);
   app
     .add_plugins(gate_render::GateRenderPlugin)
     .add_plugins(gate_ui::GateUiPlugin)

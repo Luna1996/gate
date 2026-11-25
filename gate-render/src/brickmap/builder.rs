@@ -1428,9 +1428,7 @@ impl VolumesBuilder {
           None
         } else {
           let mut v = Vec::with_capacity((last - first + 1) * OCC_WORDS);
-          for i in first..=last {
-            v.extend_from_slice(self.builders[i].occ_words());
-          }
+          v.extend(self.builders[first..=last].iter().flat_map(|b| b.occ_words().iter().copied()));
           Some((first, v))
         }
       },

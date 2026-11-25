@@ -270,6 +270,26 @@ tooltip = "menu.render.exposure.key.tip"
 
 [[items.children]]
 kind = "sub_menu"
+id = "dlss"
+label = "menu.render.dlss"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "mode"
+label = "menu.render.dlss.mode"
+options = [
+    "menu.render.dlss.mode.off",
+    "menu.render.dlss.mode.dlaa",
+    "menu.render.dlss.mode.quality",
+    "menu.render.dlss.mode.balanced",
+    "menu.render.dlss.mode.performance",
+    "menu.render.dlss.mode.ultra",
+]
+selected = 0
+tooltip = "menu.render.dlss.mode.tip"
+
+[[items.children]]
+kind = "sub_menu"
 id = "sky"
 label = "menu.render.sky"
 tabs = true

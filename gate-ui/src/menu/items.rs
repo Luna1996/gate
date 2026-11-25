@@ -127,6 +127,7 @@ fn option_button(
   path: &str,
   role: MenuRole,
   first: bool,
+  disabled: bool,
 ) -> Entity {
   let m = &ctx.theme.metrics;
   let mut ec = parent.spawn((
@@ -153,20 +154,28 @@ fn option_button(
     BorderColor::all(color_of(&ctx.theme.colors.border)),
     MouseIntercept,
   ));
+  if disabled {
+    ec.insert(UiDisabled);
+  }
   ec.with_children(|b| {
-    b.spawn((
-      Name::new("menu-option-text"),
-      bevy::ui::widget::Label,
-      crate::i18n::I18nKey::new(key),
-      Text::new(ctx.text(key)),
-      TextFont {
-        font: ctx.font_source(),
-        font_size: bevy::text::FontSize::Px(m.font_size.sm),
-        ..default()
-      },
-      TextColor(color_of(&ctx.theme.colors.text_muted)),
-      BevyTextLayout { linebreak: LineBreak::NoWrap, ..default() },
-    ));
+    let id = b
+      .spawn((
+        Name::new("menu-option-text"),
+        bevy::ui::widget::Label,
+        crate::i18n::I18nKey::new(key),
+        Text::new(ctx.text(key)),
+        TextFont {
+          font: ctx.font_source(),
+          font_size: bevy::text::FontSize::Px(m.font_size.sm),
+          ..default()
+        },
+        TextColor(color_of(&ctx.theme.colors.text_muted)),
+        BevyTextLayout { linebreak: LineBreak::NoWrap, ..default() },
+      ))
+      .id();
+    if disabled {
+      dim_text(b.world_mut(), id);
+    }
   });
   ec.id()
 }
@@ -195,8 +204,8 @@ pub(crate) fn spawn_item(
       *decimals,
       &path,
     ),
-    MenuNode::SwitchGroup { label: key, options, .. } => {
-      switch_group_row(ctx, parent, key, options, &path)
+    MenuNode::SwitchGroup { label: key, options, disabled, .. } => {
+      switch_group_row(ctx, parent, key, options, &path, *disabled)
     }
     MenuNode::Dropdown { label: key, options, selected, .. } => {
       dropdown_row(ctx, parent, key, options, *selected, &path)
@@ -263,7 +272,7 @@ pub(crate) fn tab_bar_row(
     });
     group.with_children(|g| {
       for (i, (key, _)) in entries.iter().enumerate() {
-        option_button(ctx, g, key, page_path, MenuRole::Tab(i), i == 0);
+        option_button(ctx, g, key, page_path, MenuRole::Tab(i), i == 0, false);
       }
     });
   });
@@ -304,7 +313,7 @@ fn buttons_row(
     });
     group.with_children(|g| {
       for (i, name) in items.iter().enumerate() {
-        option_button(ctx, g, name, path, MenuRole::Button(i), i == 0);
+        option_button(ctx, g, name, path, MenuRole::Button(i), i == 0, false);
       }
     });
   });
@@ -365,12 +374,15 @@ fn switch_group_row(
   key: &str,
   options: &[String],
   path: &str,
+  disabled: bool,
 ) -> Entity {
   let mut ec = base_row(parent, "menu-switch-group");
   let row = ec.id();
   ec.with_children(|r| {
+    let mut name = None;
     if !key.is_empty() {
-      fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
+      let e = fixed_label(ctx, r, key, LEFT_COL_W, LabelStyle::Body, Justify::Left);
+      name = Some(e);
     }
     let mut group = r.spawn(Node {
       flex_grow: 1.0,
@@ -381,9 +393,12 @@ fn switch_group_row(
     });
     group.with_children(|g| {
       for (i, name) in options.iter().enumerate() {
-        option_button(ctx, g, name, path, MenuRole::SwitchOption(i), i == 0);
+        option_button(ctx, g, name, path, MenuRole::SwitchOption(i), i == 0, disabled);
       }
     });
+    if disabled && let Some(e) = name {
+      dim_text(r.world_mut(), e);
+    }
   });
   row
 }

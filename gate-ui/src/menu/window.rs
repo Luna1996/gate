@@ -17,7 +17,7 @@ use crate::pointer::{UiInteract, UiInteractBundle};
 use crate::theme::{ThemeFont, UiTheme};
 use crate::widgets::{
   DropdownValue, LabelConfig, LabelOverflow, LabelStyle, SliderValue, TextInputState,
-  TextInputValue, UiCtx, color_of, dim_color, label, px, spawn_icon,
+  TextInputValue, UiCtx, UiDisabled, color_of, dim_color, label, px, spawn_icon,
 };
 
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -453,11 +453,13 @@ fn title_actions(world: &mut World, root: Entity, parts: &MenuParts) {
 fn collect_clicks(world: &mut World) -> Vec<(String, MenuRole)> {
   let mut clicks: Vec<(String, MenuRole)> = Vec::new();
   {
-    let mut q = world.query::<(Entity, &MenuItem, &Hovered, Has<Pressed>)>();
+    let mut q = world.query::<(Entity, &MenuItem, &Hovered, Has<Pressed>, Has<UiDisabled>)>();
     let hits: Vec<(Entity, String, MenuRole)> = q
       .iter(world)
-      .filter(|(_, _, hovered, pressed)| UiInteract::of(hovered, *pressed).is_active())
-      .map(|(e, item, _, _)| (e, item.path.clone(), item.role))
+      .filter(|(_, _, hovered, pressed, disabled)| {
+        !disabled && UiInteract::of(hovered, *pressed).is_active()
+      })
+      .map(|(e, item, _, _, _)| (e, item.path.clone(), item.role))
       .collect();
     for (e, path, role) in hits {
       if poll_click(world, e) {
@@ -539,7 +541,9 @@ fn apply_changes(
       }
       MenuRole::Button(i) => events.push(ev(root, &path, MenuAction::Button(i))),
       MenuRole::SwitchOption(i) => {
-        if let Some(MenuNode::SwitchGroup { selected, .. }) = menu.model.node_mut(&path_segs)
+        if let Some(MenuNode::SwitchGroup { selected, disabled, .. }) =
+          menu.model.node_mut(&path_segs)
+          && !*disabled
           && *selected != i
         {
           *selected = i;

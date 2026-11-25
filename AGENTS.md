@@ -74,6 +74,16 @@
 - 自发光是**真实光源**：`gi/light.wesl` 维护世界空间光源瓦片（发光面按 8×8 面片瓦片化）与按功率的层级树；`lt_nee` 做 NEE，命中按平衡启发式与 BRDF 采样合并，同一块发光面不会被算两次。可见自发光面在着色阶段就注册进光源瓦片，进入新区域时 NEE 从首帧起生效（否则要等 GI 射线偶然命中才注册，暗处会先出现严重 firefly）。**不要**引入「同屏最多 N 个光源」的列表或上限；容量只受 `LT_SLOTS` 约束（超出部分退化为 BRDF 命中，仍然可见）。`res_add_pick` 里落空的抽样（背向、超距、发光面已失效）是贡献为 0 的合法样本，必须计入 `m`，`sum/m` 才无偏；漏计会把直接光按 `1/命中率` 放大，每帧抽样数越多越明显。
 - 镜面同样逐体素着色（一个体素一个反射值）：反射射线从体素中心出发，同一体素的像素共用同一方向与权重；不要引入逐像素 / 逐面差异或屏幕空间共享。镜面 GI 直接读世界缓存 `refl_hit_gi`（未成熟时按命中点补一条样本），不要再引入屏幕空间兜底（会把屏幕边缘的 GI 串进镜中）。
 
+## DLSS / NGX
+
+- `DlssInitPlugin` 必须在 `DefaultPlugins` **之前**注册（见 `gate-app/src/main.rs`）：`RenderCreation::Automatic` 在 `RenderPlugin::build` 内就阻塞完成 Vulkan 实例/设备创建并捕获当时的 `RawVulkanInitSettings`，之后注册的 NGX 扩展回调不会执行（设备缺 `VK_NVX_binary_import` ⇒ DLSS 特性内核创建失败 ⇒ `SuperSampling_Available=0`）。渲染世界的 `DlssProbe` 因此由 `DlssRenderPlugin`（运行于 DefaultPlugins 之后）插入。
+- `dlss_wgpu::FeatureSupport::default()` 为 **true**：探测值「支持」只有配合「回调实际运行」才可信；`DLSS 实例/设备扩展 → [...]` 日志是否出现是判断依据。
+- `init_dlss_sdk` 每条路径（含失败/跳过）都要插入 `DlssGpu`：`sync_dlss_ctx` / `dispatch_dlss_eval` 以必需参数访问它，缺资源会在渲染首帧 panic，清理展开中 wgpu-hal 卸交换链二次 panic ⇒ 双重 panic = 进程 fail-fast（`0xc0000409`）。
+- NGX ProjectId 由驱动验证：GUID 形状 + 连续相同数字 < 5（`Init_with_ProjectID` 对占位符式 ID 返回 InvalidParameter）。改 `ngx_project_id()` 常量时保持 v4 形状与杂散尾部。
+- eval 约定（对齐 NVIDIA 官方样例与 bevy 0.20 集成）：`InJitterOffset` 传 **−j**（j = 射线采样子像素偏移）；mvec 以 forward（cur−pre）、输出像素、Y 向下存储 ⇒ `motion_vector_scale` 取负并乘内部/输出比（NGX 期望 backward、内部渲染像素）；depth 用线性视深（`clip.w`）、不设 `InvertedDepth`；上下文创建带 `AutoExposure | LowResolutionMotionVectors`（Automatic 曝光依赖 flag 声明，mvec 纹理在内部渲染分辨率）。
+- 依赖链：`tools/fetch-dlss-deps.ps1` 幂等拉取（libclang 优先复用系统 LLVM）；`.cargo/config.toml` 的 `DLSS_SDK`/`VULKAN_SDK`/`LIBCLANG_PATH` 与 exe 同目录 `nvngx_dlss.dll` 是构建/运行前提。gnu 构建不编译 dlss 模块，`responsive.rs` 的 cfg 门控使档位选择在无 dlss 构建下无效并打降级日志。
+- 菜单档位 `render/dlss/mode` 由 `apply_dlss_availability` 按探测结果置灰（`SwitchGroup.disabled`：dim 文本 + `UiDisabled` 拦截点击）；探测不可用时选中值强制回 Off。
+
 ## 运行期数据 / 资源
 
 - `assets/` 只读、随仓库分发；`data/`、`logs/`、`*.vox`、`*.log` 被 `.gitignore` 排除。

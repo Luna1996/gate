@@ -65,6 +65,8 @@ impl DlssMode {
 #[extract_app(bevy::render::RenderApp)]
 pub struct DlssSettings {
   pub mode: DlssMode,
+  /// NGX 探测支持超分（渲染初始化后由 dlss 模块回填；gnu 构建恒 false）。
+  pub supported: bool,
 }
 
 /// 渲染端 DLSS 输出纹理视图（激活时由 dlss 模块逐帧发布；blit 优先用它）。
@@ -360,9 +362,9 @@ pub(crate) struct AuxTexCache {
   perf_shadow: Option<Texture>,
   perf_shadow_view: Option<TextureView>,
   dlss_mvec: Option<Texture>,
-  dlss_mvec_view: Option<TextureView>,
+  pub(crate) dlss_mvec_view: Option<TextureView>,
   dlss_depth: Option<Texture>,
-  dlss_depth_view: Option<TextureView>,
+  pub(crate) dlss_depth_view: Option<TextureView>,
   perf_size: UVec2,
   perf_bg0: Option<BindGroup>,
 }
@@ -559,6 +561,8 @@ impl Plugin for BrickMapDdaPlugin {
     app.insert_resource(EyeAdaptSettings::startup());
     app.init_resource::<crate::lighting::ReflectionSettings>();
     app.init_resource::<crate::lighting::BaseSettings>();
+    app.init_resource::<DlssFrame>();
+    app.init_resource::<DlssSettings>();
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
     let dda_source = app.world().resource::<crate::shader::DdaShaderSource>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -607,7 +611,8 @@ fn extract_camera_config(
   dlss: Option<bevy::render::Extract<bevy::ecs::system::Res<DlssFrame>>>,
 ) {
   let Some(cfg) = cfg else { return };
-  let render_h = scale.as_deref().map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
+  let render_h =
+    scale.as_deref().map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
   let mut uniform = DdaViewUniform::from_cfg(&cfg, render_h);
   if let Some(frame) = dlss.as_deref() {
     let render_w = scale.as_deref().map(|s| s.size).unwrap_or(crate::consts::VIEW_SIZE);
@@ -1338,35 +1343,36 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   };
   beam_cache.gi_bg0 = Some(gi_bg0);
 
-  let perf_bg0 = if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta), Some(mvec), Some(dep)) = (
-    beam_cache.perf_vis_view.as_ref(),
-    beam_cache.perf_nrm_view.as_ref(),
-    beam_cache.perf_shadow_view.as_ref(),
-    beam_cache.glass_req.as_ref(),
-    beam_cache.glass_meta.as_ref(),
-    beam_cache.dlss_mvec_view.as_ref(),
-    beam_cache.dlss_depth_view.as_ref(),
-  ) {
-    let layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_perf_layout);
-    let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
-      beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
-      &u,
-      &beam_view,
-      eye_buf.as_entire_binding(),
-      beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
-    ))
-    .to_vec();
-    entries.push(BindGroupEntry { binding: 30, resource: BindingResource::TextureView(vis) });
-    entries.push(BindGroupEntry { binding: 31, resource: BindingResource::TextureView(nrm) });
-    entries.push(BindGroupEntry { binding: 32, resource: BindingResource::TextureView(sh) });
-    entries.push(BindGroupEntry { binding: 33, resource: greq.as_entire_binding() });
-    entries.push(BindGroupEntry { binding: 34, resource: gmeta.as_entire_binding() });
-    entries.push(BindGroupEntry { binding: 35, resource: BindingResource::TextureView(mvec) });
-    entries.push(BindGroupEntry { binding: 36, resource: BindingResource::TextureView(dep) });
-    Some(render_device.create_bind_group(None, &layout, &entries))
-  } else {
-    None
-  };
+  let perf_bg0 =
+    if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta), Some(mvec), Some(dep)) = (
+      beam_cache.perf_vis_view.as_ref(),
+      beam_cache.perf_nrm_view.as_ref(),
+      beam_cache.perf_shadow_view.as_ref(),
+      beam_cache.glass_req.as_ref(),
+      beam_cache.glass_meta.as_ref(),
+      beam_cache.dlss_mvec_view.as_ref(),
+      beam_cache.dlss_depth_view.as_ref(),
+    ) {
+      let layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_perf_layout);
+      let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
+        beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
+        &u,
+        &beam_view,
+        eye_buf.as_entire_binding(),
+        beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
+      ))
+      .to_vec();
+      entries.push(BindGroupEntry { binding: 30, resource: BindingResource::TextureView(vis) });
+      entries.push(BindGroupEntry { binding: 31, resource: BindingResource::TextureView(nrm) });
+      entries.push(BindGroupEntry { binding: 32, resource: BindingResource::TextureView(sh) });
+      entries.push(BindGroupEntry { binding: 33, resource: greq.as_entire_binding() });
+      entries.push(BindGroupEntry { binding: 34, resource: gmeta.as_entire_binding() });
+      entries.push(BindGroupEntry { binding: 35, resource: BindingResource::TextureView(mvec) });
+      entries.push(BindGroupEntry { binding: 36, resource: BindingResource::TextureView(dep) });
+      Some(render_device.create_bind_group(None, &layout, &entries))
+    } else {
+      None
+    };
   beam_cache.perf_bg0 = perf_bg0;
 
   let (refl_write_bg, refl_read_bg) = if let (
@@ -1533,10 +1539,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     min_filter: FilterMode::Linear,
     ..default()
   });
-  let blit_view = dlss_src
-    .0
-    .as_ref()
-    .map_or(&tex_view.texture_view, |v| v.as_ref());
+  let blit_view = dlss_src.0.as_ref().map_or(&tex_view.texture_view, |v| v.as_ref());
   let blit_bg = render_device.create_bind_group(
     None,
     &blit_layout,

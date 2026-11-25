@@ -1,4 +1,4 @@
-# DLSS 构建包装：依赖自检 → vcvars 自动发现 → MSVC target 构建 → 运行 DLL 落位。
+﻿# DLSS 构建包装：依赖自检 → vcvars 自动发现 → MSVC target 构建 → 运行 DLL 落位。
 # F5 默认路径；NGX 链接库只有 MSVC 格式，因此 DLSS 构建固定走 msvc target。
 param(
   [ValidateSet("build-fast", "balance", "run-fast")]

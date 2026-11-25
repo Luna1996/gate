@@ -163,6 +163,8 @@ pub enum MenuNode {
     selected: usize,
     #[serde(default)]
     tooltip: Option<String>,
+    #[serde(default)]
+    disabled: bool,
   },
   Dropdown {
     #[serde(default)]
@@ -508,6 +510,7 @@ pub fn switch_group(
     options: options.iter().map(|s| (*s).to_string()).collect(),
     selected,
     tooltip: tooltip.map(|s| s.to_string()),
+    disabled: false,
   }
 }
 
