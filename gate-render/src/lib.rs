@@ -25,6 +25,7 @@ pub use brickmap::{
   raycast_objects,
 };
 pub use brickmap::{PostFxSettings, RenderScale};
+pub use brickmap::dda::{DlssMode, DlssSettings};
 pub use consts::VIEW_SIZE;
 pub use lighting::{
   BaseSettings, DirLightCfg, LightDesc, LightGlobals, LightPoolUniform, LightingTheme, MAX_LIGHTS,
@@ -50,5 +51,7 @@ impl Plugin for GateRenderPlugin {
       profiler::GateProfilerPlugin,
       pbr_texture::PbrTexturesPlugin,
     ));
+    #[cfg(feature = "dlss")]
+    app.add_plugins(dlss::DlssRenderPlugin);
   }
 }

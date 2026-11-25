@@ -25,6 +25,8 @@ struct DdaViewUniform {
   inv_view_proj: mat4x4<f32>,
   cam_pos_voxel: vec4<f32>,
   lod: vec4<f32>,
+  // xy：DLSS 子像素抖动（[-0.5,0.5]，关时 0）；zw：DLSS 输出分辨率（关时 0）
+  dlss: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> view_u: DdaViewUniform;
 
@@ -198,3 +200,5 @@ struct FogUniform {
 @group(0) @binding(32) var dda_shadow_tex: texture_storage_2d<rgba16float, read_write>;
 @group(0) @binding(33) var<storage, read_write> glass_req: array<u32>;
 @group(0) @binding(34) var<storage, read_write> glass_meta: array<atomic<u32>>;
+@group(0) @binding(35) var dlss_mvec_tex: texture_storage_2d<rg16float, write>;
+@group(0) @binding(36) var dlss_depth_tex: texture_storage_2d<r32float, write>;

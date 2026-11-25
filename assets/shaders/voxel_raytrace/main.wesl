@@ -1,4 +1,4 @@
-import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
 import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS};
@@ -854,11 +854,32 @@ fn shadow_store(coord: vec2<i32>, vis: vec3<f32>) {
 }
 
 fn split_ray(gid: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
-  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
+  let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + view_u.dlss.xy)
+           / vec2<f32>(f32(size.x), f32(size.y));
   let uv = vec2<f32>(px.x * 2.0 - 1.0, 1.0 - px.y * 2.0);
   let near_world_h = view_u.inv_view_proj * vec4<f32>(uv.x, uv.y, 0.0, 1.0);
   let far_world_h = view_u.inv_view_proj * vec4<f32>(uv.x, uv.y, 1.0, 1.0);
   return far_world_h.xyz / far_world_h.w - near_world_h.xyz / near_world_h.w;
+}
+
+// DLSS 逐像素输入：运动矢量（输出像素单位，Y 向下）与线性视深。
+// 静止世界下 p_prev == p（相机运动由重投影吸收）；移动物体的 prev 位姿
+// 接入后 p_prev 换成上一帧位姿下的同一点。
+fn dlss_store_inputs(coord: vec2<i32>, hit: WorldHit, dir: vec3<f32>) {
+  let out_size = view_u.dlss.zw;
+  if (out_size.x < 1.0) { return; }
+  var p = view_u.cam_pos_voxel.xyz + dir * 100000.0;
+  var z = 1e+30;
+  if (hit.hit) {
+    p = hit.point;
+    z = (view_u.view_proj * vec4<f32>(p, 1.0)).w;
+  }
+  let c = view_u.view_proj * vec4<f32>(p, 1.0);
+  let pv = gi_u.prev_view_proj * vec4<f32>(p, 1.0);
+  let cur = vec2<f32>((c.x / c.w * 0.5 + 0.5) * out_size.x, (0.5 - c.y / c.w * 0.5) * out_size.y);
+  let pre = vec2<f32>((pv.x / pv.w * 0.5 + 0.5) * out_size.x, (0.5 - pv.y / pv.w * 0.5) * out_size.y);
+  textureStore(dlss_mvec_tex, coord, vec4<f32>(cur - pre, 0.0, 0.0));
+  textureStore(dlss_depth_tex, coord, vec4<f32>(z, 0.0, 0.0, 0.0));
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1018,12 +1039,13 @@ fn dda_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
   let coord = vec2<i32>(i32(gid.x), i32(gid.y));
   let raw = textureLoad(dda_vis, coord);
   let px = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(size.x), f32(size.y));
+  let diff_world = split_ray(gid, size);
+  let dir_voxel = normalize(diff_world);
   if (raw.x == VIS_CAM) {
+    dlss_store_inputs(coord, world_miss(), dir_voxel);
     write_output(coord, palette_rgb_linear(make_grid(0u).palette_base, vis_pal(raw)));
     return;
   }
-  let diff_world = split_ray(gid, size);
-  let dir_voxel = normalize(diff_world);
   let origin_voxel = view_u.cam_pos_voxel.xyz;
   let hit = (raw.w & 1u) != 0u;
   let pal = vis_pal(raw);
@@ -1043,6 +1065,7 @@ fn dda_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
     col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
   }
   if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
+  dlss_store_inputs(coord, first, dir_voxel);
   write_output(coord, col);
   if (gi_enabled() && gi_u.params.y > 0.0) { dda_hit_record(gid, size, first, origin_voxel); }
 }
@@ -1082,6 +1105,7 @@ fn dda_glass(@builtin(global_invocation_id) gid: vec3<u32>,
     var col = shade_face(first, origin_voxel, dir_voxel, frustum_length, uv, sun_dir, sky, sun_c,
                      n_hint, need_n, u32(coord.y) * size.x + u32(coord.x), &best, f_shadow);
     if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
+    dlss_store_inputs(coord, first, dir_voxel);
     write_output(coord, col);
     if (gi_enabled() && gi_u.params.y > 0.0) { dda_hit_record(pgid, size, best, origin_voxel); }
   }

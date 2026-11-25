@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 
-use crate::brickmap::dda::{DdaImages, PostFxSettings, RenderScale};
+use crate::brickmap::dda::{DlssFrame, DdaImages, DlssMode, DlssSettings, PostFxSettings, RenderScale};
 use crate::consts::{MAX_DIM, MIN_DIM};
 
 fn size_is_sane(s: UVec2) -> bool {
@@ -18,6 +18,8 @@ pub fn resize_render_targets(
   dda: Option<Res<DdaImages>>,
   mut images: ResMut<Assets<Image>>,
   mut scale: ResMut<RenderScale>,
+  settings: Option<Res<DlssSettings>>,
+  mut dlss_frame: ResMut<DlssFrame>,
   mut warned: Local<bool>,
 ) {
   let Ok(window) = windows.single() else { return };
@@ -34,13 +36,24 @@ pub fn resize_render_targets(
   }
   *warned = false;
 
-  let new_size = render_size_for_window(full, scale.factor);
+  let mode = settings.as_deref().map_or(DlssMode::Off, |s| s.mode);
+  let dlss_on = mode != DlssMode::Off;
+  let new_size = if dlss_on {
+    let r = mode.ratio();
+    UVec2::new(
+      ((full.x as f32 * r) as u32).max(MIN_DIM).min(full.x),
+      ((full.y as f32 * r) as u32).max(MIN_DIM).min(full.y),
+    )
+  } else {
+    render_size_for_window(full, scale.factor)
+  };
+  dlss_frame.out_size = if dlss_on { full } else { UVec2::ZERO };
   if new_size == scale.size {
     return;
   }
   debug!(
-    "render targets resized: {}x{} (window {}x{}, factor {})",
-    new_size.x, new_size.y, full.x, full.y, scale.factor
+    "render targets resized: {}x{} (window {}x{}, dlss {:?})",
+    new_size.x, new_size.y, full.x, full.y, mode
   );
   let extent = Extent3d { width: new_size.x, height: new_size.y, depth_or_array_layers: 1 };
   for handle in dda.iter().map(|d| &d.target) {

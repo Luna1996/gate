@@ -23,6 +23,87 @@ impl RenderScale {
   pub const SCALE_CHOICES: [u32; 4] = [1, 2, 3, 4];
 }
 
+/// DLSS 逐帧状态（主世界由 responsive/设置驱动，extract 进渲染端）。
+/// `out_size` 为 0 ⇒ DLSS 未启用（shader 侧跳过 mvec/depth 写出）。
+#[derive(Resource, Clone, Copy, Debug, Default, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
+pub struct DlssFrame {
+  pub active: bool,
+  pub out_size: UVec2,
+  pub frame: u32,
+}
+
+/// DLSS 档位。ratio 为内部分辨率相对输出的线性比例
+///（NGX 会在 [min,max] 内接受任意实际尺寸，动态分辨率语义）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DlssMode {
+  #[default]
+  Off,
+  Dlaa,
+  Quality,
+  Balanced,
+  Performance,
+  Ultra,
+}
+
+impl DlssMode {
+  pub const CHOICES: [DlssMode; 6] =
+    [Self::Off, Self::Dlaa, Self::Quality, Self::Balanced, Self::Performance, Self::Ultra];
+
+  pub fn ratio(self) -> f32 {
+    match self {
+      Self::Off | Self::Dlaa => 1.0,
+      Self::Quality => 2.0 / 3.0,
+      Self::Balanced => 0.577,
+      Self::Performance => 0.5,
+      Self::Ultra => 1.0 / 3.0,
+    }
+  }
+}
+
+#[derive(Resource, Clone, Copy, Default, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
+pub struct DlssSettings {
+  pub mode: DlssMode,
+}
+
+/// 渲染端 DLSS 输出纹理视图（激活时由 dlss 模块逐帧发布；blit 优先用它）。
+#[derive(Resource, Default)]
+pub struct DlssBlitSource(pub Option<std::sync::Arc<TextureView>>);
+
+/// 渲染端最终颜色纹理视图（prepare 逐帧发布，DLSS eval 的输入）。
+#[derive(Resource, Default)]
+pub struct DdaColorView(pub Option<std::sync::Arc<TextureView>>);
+
+fn advance_dlss_frame(mut frame: ResMut<DlssFrame>, settings: Res<DlssSettings>) {
+  frame.active = settings.mode != DlssMode::Off;
+  frame.frame = frame.frame.wrapping_add(1);
+}
+
+fn halton(mut i: u32, base: u32) -> f32 {
+  let mut f = 1.0;
+  let mut r = 0.0;
+  while i > 0 {
+    f /= base as f32;
+    r += f * (i % base) as f32;
+    i /= base;
+  }
+  r
+}
+
+impl DlssFrame {
+  /// 与 dlss_wgpu 的 suggested_jitter 同一序列（halton(2)/halton(3)，相位数 8·ratio²）。
+  pub fn jitter(&self, render_size: UVec2) -> Vec2 {
+    if !self.active || self.out_size.x == 0 || render_size.x == 0 {
+      return Vec2::ZERO;
+    }
+    let ratio = self.out_size.x as f32 / render_size.x as f32;
+    let phase_count = (8.0 * ratio * ratio).max(1.0) as u32;
+    let i = self.frame % phase_count;
+    Vec2::new(halton(i, 2) - 0.5, halton(i, 3) - 0.5)
+  }
+}
+
 impl Default for RenderScale {
   fn default() -> Self {
     Self { size: crate::consts::VIEW_SIZE, factor: 1 }
@@ -130,6 +211,8 @@ pub struct DdaViewUniform {
   pub cam_pos_voxel: Vec4,
 
   pub lod: Vec4,
+
+  pub dlss: Vec4,
 }
 
 use crate::brickmap::consts::{DDA_BEAM, DDA_DIR_LUT, DDA_LOD, EYE_ADAPT};
@@ -151,6 +234,7 @@ impl DdaViewUniform {
         !DDA_BEAM as u32 as f32,
         !DDA_DIR_LUT as u32 as f32,
       ),
+      dlss: Vec4::ZERO,
     }
   }
 }
@@ -275,6 +359,10 @@ pub(crate) struct AuxTexCache {
   perf_nrm_view: Option<TextureView>,
   perf_shadow: Option<Texture>,
   perf_shadow_view: Option<TextureView>,
+  dlss_mvec: Option<Texture>,
+  dlss_mvec_view: Option<TextureView>,
+  dlss_depth: Option<Texture>,
+  dlss_depth_view: Option<TextureView>,
   perf_size: UVec2,
   perf_bg0: Option<BindGroup>,
 }
@@ -463,8 +551,11 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::ReflectionSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::BaseSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
+      bevy::render::extract_resource::ExtractResourcePlugin::<DlssFrame>::default(),
+      bevy::render::extract_resource::ExtractResourcePlugin::<DlssSettings>::default(),
       crate::responsive::ResponsivePlugin,
     ));
+    app.add_systems(bevy::app::Update, advance_dlss_frame);
     app.insert_resource(EyeAdaptSettings::startup());
     app.init_resource::<crate::lighting::ReflectionSettings>();
     app.init_resource::<crate::lighting::BaseSettings>();
@@ -475,6 +566,8 @@ impl Plugin for BrickMapDdaPlugin {
     };
     render_app.insert_resource(dda_shader);
     render_app.insert_resource(dda_source);
+    render_app.init_resource::<DlssBlitSource>();
+    render_app.init_resource::<DdaColorView>();
     render_app
       .add_systems(bevy::render::ExtractSchedule, extract_camera_config)
       .add_systems(
@@ -511,10 +604,16 @@ fn extract_camera_config(
   mut commands: bevy::ecs::system::Commands,
   cfg: Option<bevy::render::Extract<bevy::ecs::system::Res<crate::brickmap::DdaCameraConfig>>>,
   scale: Option<bevy::render::Extract<bevy::ecs::system::Res<RenderScale>>>,
+  dlss: Option<bevy::render::Extract<bevy::ecs::system::Res<DlssFrame>>>,
 ) {
   let Some(cfg) = cfg else { return };
-  let render_h = scale.map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
-  let uniform = DdaViewUniform::from_cfg(&cfg, render_h);
+  let render_h = scale.as_deref().map(|s| s.size.y as f32).unwrap_or(crate::consts::VIEW_SIZE.y as f32);
+  let mut uniform = DdaViewUniform::from_cfg(&cfg, render_h);
+  if let Some(frame) = dlss.as_deref() {
+    let render_w = scale.as_deref().map(|s| s.size).unwrap_or(crate::consts::VIEW_SIZE);
+    let j = frame.jitter(render_w);
+    uniform.dlss = j.extend(frame.out_size.x as f32).extend(frame.out_size.y as f32);
+  }
   commands.insert_resource(uniform);
 }
 
@@ -599,6 +698,26 @@ pub(crate) fn init_dda_pipelines(
       ty: BufferBindingType::Storage { read_only: false },
       has_dynamic_offset: false,
       min_binding_size: None,
+    },
+    count: None,
+  });
+  bg0_perf_entries.push(BindGroupLayoutEntry {
+    binding: 35,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format: TextureFormat::Rg16Float,
+      view_dimension: TextureViewDimension::D2,
+    },
+    count: None,
+  });
+  bg0_perf_entries.push(BindGroupLayoutEntry {
+    binding: 36,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format: TextureFormat::R32Float,
+      view_dimension: TextureViewDimension::D2,
     },
     count: None,
   });
@@ -941,6 +1060,7 @@ pub(crate) struct PrepareDdaBindGroupsParams<'w, 's> {
   scale: Res<'w, RenderScale>,
   tune: DdaTune<'w>,
   beam_cache: ResMut<'w, AuxTexCache>,
+  dlss_src: Res<'w, DlssBlitSource>,
 }
 
 pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
@@ -961,6 +1081,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     scale,
     tune,
     mut beam_cache,
+    dlss_src,
   } = p;
   let Some(images) = images else {
     bevy::log::info_once!("DDA prepare: no DdaImages");
@@ -1098,6 +1219,12 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     let shadow = make("gate_dda_shadow", TextureFormat::Rgba16Float);
     beam_cache.perf_shadow_view = Some(shadow.create_view(&TextureViewDescriptor::default()));
     beam_cache.perf_shadow = Some(shadow);
+    let mvec = make("gate_dlss_mvec", TextureFormat::Rg16Float);
+    beam_cache.dlss_mvec_view = Some(mvec.create_view(&TextureViewDescriptor::default()));
+    beam_cache.dlss_mvec = Some(mvec);
+    let depth = make("gate_dlss_depth", TextureFormat::R32Float);
+    beam_cache.dlss_depth_view = Some(depth.create_view(&TextureViewDescriptor::default()));
+    beam_cache.dlss_depth = Some(depth);
     beam_cache.perf_size = scale.size;
   }
 
@@ -1211,12 +1338,14 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   };
   beam_cache.gi_bg0 = Some(gi_bg0);
 
-  let perf_bg0 = if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta)) = (
+  let perf_bg0 = if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta), Some(mvec), Some(dep)) = (
     beam_cache.perf_vis_view.as_ref(),
     beam_cache.perf_nrm_view.as_ref(),
     beam_cache.perf_shadow_view.as_ref(),
     beam_cache.glass_req.as_ref(),
     beam_cache.glass_meta.as_ref(),
+    beam_cache.dlss_mvec_view.as_ref(),
+    beam_cache.dlss_depth_view.as_ref(),
   ) {
     let layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_perf_layout);
     let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
@@ -1232,6 +1361,8 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     entries.push(BindGroupEntry { binding: 32, resource: BindingResource::TextureView(sh) });
     entries.push(BindGroupEntry { binding: 33, resource: greq.as_entire_binding() });
     entries.push(BindGroupEntry { binding: 34, resource: gmeta.as_entire_binding() });
+    entries.push(BindGroupEntry { binding: 35, resource: BindingResource::TextureView(mvec) });
+    entries.push(BindGroupEntry { binding: 36, resource: BindingResource::TextureView(dep) });
     Some(render_device.create_bind_group(None, &layout, &entries))
   } else {
     None
@@ -1402,11 +1533,17 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     min_filter: FilterMode::Linear,
     ..default()
   });
+  let blit_view = dlss_src
+    .0
+    .as_ref()
+    .map_or(&tex_view.texture_view, |v| v.as_ref());
   let blit_bg = render_device.create_bind_group(
     None,
     &blit_layout,
-    &BindGroupEntries::sequential((&tex_view.texture_view, &blit_sampler)),
+    &BindGroupEntries::sequential((blit_view, &blit_sampler)),
   );
+
+  commands.insert_resource(DdaColorView(Some(std::sync::Arc::new(tex_view.texture_view.clone()))));
 
   commands.insert_resource(DdaBg0BindGroup(bg0));
   commands.insert_resource(DdaBg1BindGroup(bg1));
@@ -1542,7 +1679,7 @@ fn dda_pipelines_ready(cx: &DdaReadyCtx<'_>) -> bool {
       || comp(&cx.pipelines.eye_histogram_pipeline) && comp(&cx.pipelines.eye_update_pipeline))
 }
 
-fn dispatch_dda(p: DispatchDdaParams) {
+pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   let DispatchDdaParams {
     mut ctx,
     bg0,
@@ -2010,6 +2147,7 @@ struct BlitDdaParams<'w, 's> {
   ready: Res<'w, DdaReady>,
   blit_bg: Option<Res<'w, DdaBlitBindGroup>>,
   post: Option<Res<'w, PostFxSettings>>,
+  dlss: Res<'w, DlssFrame>,
   pipeline_cache: Res<'w, PipelineCache>,
   pipelines: Res<'w, DdaPipelines>,
   #[cfg(feature = "profile")]
@@ -2024,6 +2162,7 @@ fn blit_dda_view(p: BlitDdaParams) {
     ready,
     blit_bg,
     post,
+    dlss,
     pipeline_cache,
     pipelines,
     #[cfg(feature = "profile")]
@@ -2037,11 +2176,9 @@ fn blit_dda_view(p: BlitDdaParams) {
     return;
   };
 
-  let id = if post.as_ref().is_some_and(|p| p.fxaa) {
-    pipelines.blit_fxaa_pipeline
-  } else {
-    pipelines.blit_pipeline
-  };
+  // DLSS 已做时域重建，不再叠 FXAA
+  let fxaa = post.as_ref().is_some_and(|p| p.fxaa) && !dlss.active;
+  let id = if fxaa { pipelines.blit_fxaa_pipeline } else { pipelines.blit_pipeline };
   let Some(pipe) = pipeline_cache.get_render_pipeline(id) else {
     bevy::log::debug_once!("DDA blit: blit pipeline not ready");
     return;
