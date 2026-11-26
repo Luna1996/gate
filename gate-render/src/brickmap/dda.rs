@@ -1933,6 +1933,10 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     if let Some(stats) = bg4.stats_buffer() {
       ctx.command_encoder().clear_buffer(stats, 0, None);
     }
+    if let Some(ev) = bg4.lt_event_buffer() {
+      // 灯事件通道计数头清零（事件体由本帧 sweep 覆写）
+      ctx.command_encoder().clear_buffer(ev, 0, None);
+    }
     {
       let _ = gi_b0;
       if let Some(pipe) = bg4.light_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {

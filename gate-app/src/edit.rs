@@ -950,18 +950,34 @@ pub(crate) fn voxel_edit_input(p: VoxelEditParams) {
   }
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SelftestParams<'w> {
+  scene: Option<ResMut<'w, VoxelScene>>,
+  orbit: Res<'w, gate_render::OrbitCamera>,
+  settings: Res<'w, EditSettings>,
+  pbr_set: Option<Res<'w, PbrTextureSet>>,
+  phys: Option<ResMut<'w, crate::physics::PhysicsState>>,
+  displace_cache: ResMut<'w, MaterialDisplaceCache>,
+}
+
 pub(crate) fn edit_selftest(
-  scene: Option<ResMut<VoxelScene>>,
-  orbit: Res<gate_render::OrbitCamera>,
-  settings: Res<EditSettings>,
-  pbr_set: Option<Res<PbrTextureSet>>,
-  mut displace_cache: ResMut<MaterialDisplaceCache>,
+  p: SelftestParams,
   mut frame: Local<u32>,
+  mut lamp_center: Local<Option<IVec3>>,
 ) {
+  let SelftestParams { scene, orbit, settings, pbr_set, phys, mut displace_cache } = p;
   *frame += 1;
+  // 60/70：随机笔刷；600/750：放一盏 1vx 自发光灯再删掉；
+  // 900：放普通物体（编辑闪烁回归）；1200/2400：放一盏长寿命自发光物体再删掉
+  //（长尾回归：深积累缓存才复现「删灯久不灭」）。全部走真实编辑管线。
   let nth = match *frame {
     60 => 1,
     70 => 2,
+    600 => 3,
+    750 => 4,
+    900 => 5,
+    1200 => 6,
+    2400 => 7,
     _ => return,
   };
   let Some(mut scene) = scene else { return };
@@ -976,13 +992,107 @@ pub(crate) fn edit_selftest(
     bevy::log::warn!("EDIT SELFTEST: 射线未命中体素 → 跳过");
     return;
   };
-  if hit.obj_id != -1 {
+  // 物体路径（nth≥5）允许命中已有物体：place 落在其表面；体素路径只编辑主世界。
+  if nth < 5 && hit.obj_id != -1 {
     return;
   }
   let (hit, face, t) = (hit.voxel, hit.face, hit.t);
   scene.interior_only_edit = false;
   scene.edit_in_flight = false;
+  if nth >= 5 {
+    let Some(mut phys) = phys else { return };
+    let center = orbit.eye() + dir * t;
+    match nth {
+      5 => {
+        // 二分诊断：无物理变体（只 spawn+brush）。若 GISTAT 仍现大规模条目死亡，
+        // 凶手在 volume/builder 路径；若干净，凶手在物理激活。
+        let mut obj_burst = b;
+        obj_burst.size = 2;
+        let pos = center - Vec3::splat(brush_radius(obj_burst.size) as f32);
+        let obj_id = scene.volumes.spawn_object(pos, obj_burst.rot, 1.0);
+        let written = {
+          let Some(grid) = scene.volumes.volume_mut(obj_id) else { return };
+          let slot = material_slot(grid, obj_burst.mat);
+          crate::edit::apply_brush(
+            grid,
+            IVec3::splat(brush_radius(obj_burst.size)),
+            obj_burst.shape,
+            obj_burst.size,
+            slot,
+          )
+        };
+        bevy::log::info!(
+          "EDIT SELFTEST 物体放(无物理) obj={obj_id} @({:.0},{:.0},{:.0}) {written}vx",
+          center.x,
+          center.y,
+          center.z
+        );
+      }
+      6 => {
+        let mut obj_burst = b;
+        obj_burst.size = 3;
+        obj_burst.mat.pbr = false;
+        obj_burst.mat.color = [255, 214, 130];
+        obj_burst.mat.emissive = 220;
+        let obj = crate::objects::place(&mut scene, &mut phys, center, obj_burst);
+        bevy::log::info!(
+          "EDIT SELFTEST 物体灯放 obj={:?} @({:.0},{:.0},{:.0})",
+          obj,
+          center.x,
+          center.y,
+          center.z
+        );
+      }
+      7 => {
+        crate::objects::delete_pointed(&mut scene, &mut phys, orbit.eye(), dir);
+        bevy::log::info!("EDIT SELFTEST 物体灯删（射线指向前方物体）");
+      }
+      _ => return,
+    }
+    return;
+  }
   let grid = scene.volumes.main_mut();
+  if nth >= 3 {
+    // 灯的位置固定用放置时记录的 center：删除帧的射线会先命中灯本身，
+    // 按 hit+face 重算会偏出一格。
+    let center = if nth == 3 {
+      let c = hit + face;
+      *lamp_center = Some(c);
+      c
+    } else {
+      lamp_center.unwrap_or(hit + face)
+    };
+    let (pal, mat_summary) = if nth == 3 {
+      let mut mat = b.mat;
+      mat.pbr = false;
+      mat.color = [255, 214, 130];
+      mat.emissive = 220;
+      (material_slot(grid, mat), mat.summary())
+    } else {
+      (PaletteId::AIR, "-".to_string())
+    };
+    let t0 = Instant::now();
+    let run = run_brush(
+      grid,
+      center,
+      BrushShape::Cube,
+      1,
+      pal,
+      pbr_set.as_deref(),
+      Some(&mut displace_cache),
+    );
+    bevy::log::info!(
+      "EDIT SELFTEST 灯{} @({},{},{}) {} → {}vx | {:?}",
+      if nth == 3 { "放" } else { "删" },
+      center.x,
+      center.y,
+      center.z,
+      mat_summary,
+      run.voxels,
+      t0.elapsed(),
+    );
+    return;
+  }
   let slot = material_slot(grid, b.mat);
   let center = hit + face * settings.offset.max(0.0).round() as i32;
   let t0 = Instant::now();

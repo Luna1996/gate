@@ -98,7 +98,12 @@ fn spawn_body(
   Some(obj_id)
 }
 
-fn delete_pointed(scene: &mut VoxelScene, phys: &mut PhysicsState, origin: Vec3, dir: Vec3) {
+pub(crate) fn delete_pointed(
+  scene: &mut VoxelScene,
+  phys: &mut PhysicsState,
+  origin: Vec3,
+  dir: Vec3,
+) {
   let Some(hit) = raycast_objects(&scene.volumes, origin, dir, DELETE_REACH) else {
     debug!(target: "gate", "OBJECT[delete] 未命中物体");
     return;

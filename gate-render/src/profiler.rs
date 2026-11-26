@@ -548,7 +548,7 @@ fn report_gi_stats(
         };
         let slots = gi.slots() as f32;
         info!(
-          "GISTAT[缓存 活 {:.0}/{}（{:.0}% 占用）回收 {:.0} 写满丢弃 {:.0} | \
+          "GISTAT[缓存 活 {:.0}/{}（{:.0}% 占用）回收 {:.0} 写满丢弃 {:.0} 孤儿 {:.0} 锁 {:.0} | \
            光源瓦片 活 {:.0} 链接 {:.0} 丢弃 {:.0} | GI 射线 {:.0}/帧 | \
            reservoir 复用 时域 {:.0} 空域 {:.0}]",
           w(0) as f32,
@@ -556,6 +556,8 @@ fn report_gi_stats(
           w(0) as f32 * 100.0 / slots.max(1.0),
           w(1) as f32,
           w(2) as f32,
+          w(10) as f32,
+          w(11) as f32,
           w(3) as f32,
           w(4) as f32,
           w(5) as f32,

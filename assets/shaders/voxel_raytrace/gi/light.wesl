@@ -1,8 +1,8 @@
-import package::bindings::{gi_stats, gi_u, lt_node, lt_node_key, lt_tile, lt_tile_key, view_u};
+import package::bindings::{gi_stats, gi_u, lt_event, lt_node, lt_node_key, lt_tile, lt_tile_key, view_u};
 import package::brickmap::{Grid, sample_brickmap};
 import package::common::{FLAGS_TRANSMISSIVE, MATERIAL_DEBUG_NONE, emissive_radiance, face_normal_from_index, fetch_material, material_emissive, palette_flags};
 import package::gi::common::{gi_mix, gi_rand2};
-import package::gi::consts::{GI_PI, GI_STAT_LT_DROP, GI_STAT_LT_LINKED, GI_STAT_LT_TILES, GI_STAT_NEE, LT_BUCKET, LT_EVICT_FRAMES, LT_MAX_DIST, LT_NEE_MAX_D, LT_NODE_WORDS, LT_POWER_MAX, LT_POWER_SCALE, LT_SHADOW_EPS, LT_TILE_WORDS, LT_TOP};
+import package::gi::consts::{GI_PI, GI_STAT_LT_DROP, GI_STAT_LT_LINKED, GI_STAT_LT_TILES, GI_STAT_NEE, LT_BUCKET, LT_EVENT_CAP, LT_EVENT_R_MAX, LT_EVENT_R_MIN, LT_EVICT_FRAMES, LT_MAX_DIST, LT_NEE_MAX_D, LT_NODE_WORDS, LT_POWER_MAX, LT_POWER_SCALE, LT_SHADOW_EPS, LT_TILE_WORDS, LT_TOP};
 import package::trace::{grid_is_far, make_grid};
 import package::world::{world_trace_medium_scene};
 
@@ -221,6 +221,9 @@ fn lt_register(voxel: vec3<i32>, face: u32, obj: u32, le_luma: f32) -> u32 {
   if (atomicLoad(&lt_tile[b + LT_T_STAMP]) != frame) { atomicStore(&lt_tile[b + LT_T_STAMP], frame); }
   if (atomicLoad(&lt_tile[b + LT_T_UNIT]) == 0u) {
     atomicStore(&lt_tile[b + LT_T_UNIT], bitcast<u32>(max(le_luma, 1e-4)));
+    // 新灯首注册：广播事件，半径内 IRC 条目降信任，反弹快速重建
+    lt_event_push(lt_tile_center_world(s),
+                  clamp(LT_EVENT_R_MIN + le_luma * 32.0, LT_EVENT_R_MIN, LT_EVENT_R_MAX));
   }
   return s;
 }
@@ -540,6 +543,31 @@ fn lt_tile_free(s: u32) {
   atomicStore(&lt_tile_key[s * 2u + 1u], 0u);
 }
 
+// 灯事件：dispatch 每帧清零计数头，本帧 sweep/register 产、resolve 同帧消费。
+// 中心为世界坐标、半径按旧功率或新灯亮度估计，覆盖灯的影响域。
+fn lt_event_push(center: vec3<f32>, radius: f32) {
+  let i = atomicAdd(&lt_event[0], 1u);
+  if (i >= LT_EVENT_CAP) { return; }
+  let o = 1u + i * 4u;
+  atomicStore(&lt_event[o], bitcast<u32>(i32(center.x)));
+  atomicStore(&lt_event[o + 1u], bitcast<u32>(i32(center.y)));
+  atomicStore(&lt_event[o + 2u], bitcast<u32>(i32(center.z)));
+  atomicStore(&lt_event[o + 3u], bitcast<u32>(radius));
+}
+
+fn lt_event_radius(power: u32) -> f32 {
+  return clamp(LT_EVENT_R_MIN + sqrt(f32(power)) * 2.0, LT_EVENT_R_MIN, LT_EVENT_R_MAX);
+}
+
+fn lt_tile_center_world(s: u32) -> vec3<f32> {
+  let t = lt_tile_load(s);
+  var c = lt_center_local(t);
+  if (t.obj != 0u) {
+    c = lt_to_world(make_grid(t.obj), c);
+  }
+  return c;
+}
+
 fn lt_sweep_tile(s: u32) {
   let k1 = atomicLoad(&lt_tile_key[s * 2u + 1u]);
   if (k1 == 0u) { return; }
@@ -556,19 +584,35 @@ fn lt_sweep_tile(s: u32) {
   var evict = pop == 0u || frame - atomicLoad(&lt_tile[b + LT_T_STAMP]) > LT_EVICT_FRAMES;
   let g = make_grid(t.obj);
   if (!evict) {
-    let bit = lt_nth_bit(mlo, mhi, gi_mix(s * 0x9E3779B1u + frame) % pop);
-    let voxel = lt_voxel(t, bit);
-    let pal = sample_brickmap(g, voxel);
-    var ok = pal != 0u && (palette_flags(g.palette_base, pal) & FLAGS_TRANSMISSIVE) == 0u
-      && material_emissive(g.palette_base, pal) > 0.0;
-    if (ok) {
-      let front = sample_brickmap(g, voxel + vec3<i32>(face_normal_from_index(t.face)));
-      ok = front == 0u || (palette_flags(g.palette_base, front) & FLAGS_TRANSMISSIVE) != 0u;
-    }
-    if (!ok) {
-      atomicAnd(&lt_tile[b + LT_T_MASK + (bit >> 5u)], ~(1u << (bit & 31u)));
-      pop = pop - 1u;
-      evict = pop == 0u;
+    // 成员验活：新鲜瓦片 1 位/帧；随陈旧（停止注册，疑似已删）按龄平方升级，
+    // 删除的自发光面在数十帧内退出 NEE 功率树，而不是等 1 位/帧 巡检
+    // 或整瓦 LT_EVICT_FRAMES 超时。遇存活位即停，活跃瓦片开销不变。
+    let age = frame - atomicLoad(&lt_tile[b + LT_T_STAMP]);
+    let checks = 1u + min(63u, age * age / 64u);
+    let seed = gi_mix(s * 0x9E3779B1u + frame * 0x85EBCA77u);
+    for (var c = 0u; c < checks; c = c + 1u) {
+      let bit = lt_nth_bit(mlo, mhi, (seed + c * 0x27D4EB2Fu) % pop);
+      let voxel = lt_voxel(t, bit);
+      let pal = sample_brickmap(g, voxel);
+      var ok = pal != 0u && (palette_flags(g.palette_base, pal) & FLAGS_TRANSMISSIVE) == 0u
+        && material_emissive(g.palette_base, pal) > 0.0;
+      if (ok) {
+        let front = sample_brickmap(g, voxel + vec3<i32>(face_normal_from_index(t.face)));
+        ok = front == 0u || (palette_flags(g.palette_base, front) & FLAGS_TRANSMISSIVE) != 0u;
+      }
+      if (!ok) {
+        atomicAnd(&lt_tile[b + LT_T_MASK + (bit >> 5u)], ~(1u << (bit & 31u)));
+        if (bit < 32u) {
+          mlo = mlo & ~(1u << bit);
+        } else {
+          mhi = mhi & ~(1u << (bit & 31u));
+        }
+        pop = pop - 1u;
+        evict = pop == 0u;
+        if (evict) { break; }
+      } else {
+        break;
+      }
     }
   }
   let center = lt_to_world(g, lt_center_local(t));
@@ -582,6 +626,9 @@ fn lt_sweep_tile(s: u32) {
   }
   let leaf = vec3<i32>(floor(center)) >> vec3<u32>(LT_LEAF_LEVEL);
   var p_old = atomicLoad(&lt_tile[b + LT_T_POWER]);
+  // 死亡半径用瓦片生前功率（清链后 p_old 归零），整瓦逐出 = 光配置突变，
+  // 广播事件让半径内 IRC 条目立刻降信任重建。
+  let p_death = p_old;
   let old_leaf = vec3<i32>(bitcast<i32>(atomicLoad(&lt_tile[b + LT_T_CELL])),
                            bitcast<i32>(atomicLoad(&lt_tile[b + LT_T_CELL + 1u])),
                            bitcast<i32>(atomicLoad(&lt_tile[b + LT_T_CELL + 2u])));
@@ -598,6 +645,9 @@ fn lt_sweep_tile(s: u32) {
     p_old = 0u;
   }
   if (evict) {
+    if (p_death > 0u) {
+      lt_event_push(center, lt_event_radius(p_death));
+    }
     lt_tile_free(s);
     return;
   }

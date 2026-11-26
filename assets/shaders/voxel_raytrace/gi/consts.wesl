@@ -59,6 +59,16 @@ const LT_POWER_MAX: u32 = 1048576u;
 const LT_MAX_DIST: f32 = 65536.0;
 const LT_SHADOW_EPS: f32 = 0.02;
 
+// 灯事件通道：发光瓦片生死时广播（中心 ×3 + 半径 ×1），irc_resolve 对
+// 半径内条目一次性降信任，跳过 streak 级联（间接光靠邻域逐层传播要几十秒）。
+// 布局：[0]=计数头，[1..1+CAP*4]=事件。每帧由 dispatch 清零，sweep 产、
+// resolve 同帧消费（同一 encoder 内 pass 顺序保证）。
+const LT_EVENT_CAP: u32 = 8u;
+const LT_EVENT_R_MIN: f32 = 96.0;
+const LT_EVENT_R_MAX: f32 = 640.0;
+const LT_EVENT_WORDS: u32 = 33u;
+const IRC_EVENT_N: f32 = 16.0;
+
 const GI_STAT_IRC_LIVE: u32 = 0u;
 const GI_STAT_IRC_EVICT: u32 = 1u;
 const GI_STAT_IRC_DROP: u32 = 2u;
@@ -69,4 +79,6 @@ const GI_STAT_RAYS: u32 = 6u;
 const GI_STAT_NEE: u32 = 7u;
 const GI_STAT_RES_TEMPORAL: u32 = 8u;
 const GI_STAT_RES_SPATIAL: u32 = 9u;
+const GI_STAT_IRC_ORPHAN: u32 = 10u;
+const GI_STAT_IRC_LOCKED: u32 = 11u;
 const GI_STAT_WORDS: u32 = 16u;

@@ -497,8 +497,14 @@ fn extract(
     .iter()
     .enumerate()
     .any(|(i, g)| mirror.palette_versions.get(i).copied() != Some(g.palette().version()));
+  // 新 volume（无记录）的 palette 首次写入只登记，不算内容重绘：spawn 物体后
+  // material_slot 给新卷的空调色板写入会走到这里，若计为 changed 会触发
+  // HIST_CAP_RESET 全局钳制，表现为一次全屏 GI 闪断。
   let palette_content_changed = scene.volumes.list.iter().enumerate().any(|(i, g)| {
-    mirror.palette_content_versions.get(i).copied() != Some(g.palette().content_version())
+    mirror
+      .palette_content_versions
+      .get(i)
+      .is_some_and(|prev| *prev != g.palette().content_version())
   });
   let dirty_any =
     need_full || !pending_data.is_empty() || !_pending_comp.is_empty() || palette_dirty;

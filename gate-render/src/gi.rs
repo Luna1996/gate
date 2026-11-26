@@ -117,7 +117,20 @@ pub fn gi_bg5_layout() -> BindGroupLayoutDescriptor {
   };
   BindGroupLayoutDescriptor::new(
     "GiBg5",
-    &[buf(0), buf(1), buf(2), buf(3), buf(4), buf(5), buf(6), buf(7), buf(8), buf(9), buf(10)],
+    &[
+      buf(0),
+      buf(1),
+      buf(2),
+      buf(3),
+      buf(4),
+      buf(5),
+      buf(6),
+      buf(7),
+      buf(8),
+      buf(9),
+      buf(10),
+      buf(11),
+    ],
   )
 }
 
@@ -139,6 +152,8 @@ pub struct GiGpu {
   pub stats: Option<Buffer>,
 
   pub gi_merge: Option<Buffer>,
+
+  pub lt_event: Option<Buffer>,
 
   pub gather_pipeline: Option<crate::brickmap::dda::ComputePipe>,
 
@@ -192,6 +207,10 @@ impl GiGpu {
 
   pub fn stats_buffer(&self) -> Option<&Buffer> {
     self.stats.as_ref()
+  }
+
+  pub fn lt_event_buffer(&self) -> Option<&Buffer> {
+    self.lt_event.as_ref()
   }
 
   pub fn slots(&self) -> u32 {
@@ -303,6 +322,7 @@ fn queue_gi_pipelines(
     bg5: None,
     stats: None,
     gi_merge: None,
+    lt_event: None,
     gather_pipeline: Some(gather),
     resolve_pipeline: Some(resolve),
     light_pipeline: Some(light),
@@ -425,6 +445,10 @@ fn prepare_gi(p: PrepareGiParams) {
     let merge = make("gate_gi_merge_req", (1 + GI_MERGE_SLOTS as u64 * GI_MERGE_WORDS as u64) * 4);
     queue.write_buffer(&merge, 0, &0u32.to_ne_bytes());
     gpu.gi_merge = Some(merge);
+    // 灯事件通道：计数头清零即可（事件体由 sweep 覆写；dispatch 每帧 clear）
+    let lt_event = make("gate_lt_event", c.lt_event_words as u64 * 4);
+    queue.write_buffer(&lt_event, 0, &0u32.to_ne_bytes());
+    gpu.lt_event = Some(lt_event);
     gpu.slots = slots;
     gpu.slots_tag = slots_tag;
     bevy::log::debug!(
@@ -447,16 +471,31 @@ fn prepare_gi(p: PrepareGiParams) {
   };
   gpu.prev_track = track;
 
-  let mut light_jump = gpu.light_ref.track(lighting.as_deref(), settings.emit_gain);
+  let light_jump = gpu.light_ref.track(lighting.as_deref(), settings.emit_gain);
   if light_jump {
     gpu.light_rev = gpu.light_rev.wrapping_add(1);
   }
-  let edited = dirty.as_ref().is_some_and(|d| d.edited || d.full || d.palette_changed);
+  let dirty = dirty.as_deref();
+  let edited = dirty.is_some_and(|d| d.edited || d.full || d.palette_changed);
   if edited {
+    // 编辑只冲掉 ReSTIR 时域水库（射线 vis 被几何改变作废）；不置 light_jump，
+    // 阳光信任与主题状态不因几何变化而失效。
     gpu.light_rev = gpu.light_rev.wrapping_add(1);
-    light_jump = true;
+    bevy::log::debug!(
+      target: "gate",
+      "GI 编辑信号 → rev={} jump={} full={} palette={}",
+      gpu.light_rev,
+      light_jump,
+      dirty.is_some_and(|d| d.full),
+      dirty.is_some_and(|d| d.palette_changed),
+    );
   }
-  let cap = if light_jump || edited { GiSettings::HIST_CAP_RESET } else { GiSettings::HIST_CAP };
+  // HIST_CAP_RESET 会把每个条目的历史计数钳到 cap 并存回（min(n, cap) 持久化），
+  // 普通编辑走这条路等于全世界的 IRC 历史被物理削减 ⇒ 显著性门控全屏回落父级，
+  // 表现为一次全屏 GI 闪断。钳制只保留给真正改变全场景光配置的事件：
+  // 主题/曝光增益（light_jump）、调色板重绘、整世界重建。
+  let global_light_change = light_jump || dirty.is_some_and(|d| d.full || d.palette_changed);
+  let cap = if global_light_change { GiSettings::HIST_CAP_RESET } else { GiSettings::HIST_CAP };
   gpu.hist_cap = cap;
 
   *gpu.uniform.get_mut() = GiUniform {
@@ -501,6 +540,7 @@ fn prepare_gi(p: PrepareGiParams) {
     Some(node_key),
     Some(st),
     Some(gm),
+    Some(ev),
     Some(rprev),
     Some(rtmp),
     Some(rcur),
@@ -513,6 +553,7 @@ fn prepare_gi(p: PrepareGiParams) {
     gpu.lt_node_key.as_ref(),
     gpu.stats.as_ref(),
     gpu.gi_merge.as_ref(),
+    gpu.lt_event.as_ref(),
     gpu.res_prev.as_ref(),
     gpu.res_tmp.as_ref(),
     gpu.res_cur.as_ref(),
@@ -535,6 +576,7 @@ fn prepare_gi(p: PrepareGiParams) {
       BindGroupEntry { binding: 8, resource: rtmp.as_entire_binding() },
       BindGroupEntry { binding: 9, resource: rcur.as_entire_binding() },
       BindGroupEntry { binding: 10, resource: gm.as_entire_binding() },
+      BindGroupEntry { binding: 11, resource: ev.as_entire_binding() },
     ],
   );
   gpu.bg5 = Some(bg5);

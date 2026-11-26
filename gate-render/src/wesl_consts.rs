@@ -16,6 +16,7 @@ pub struct GiConsts {
   pub irc_chain: u32,
   pub lt_bucket: u32,
   pub lt_top: u32,
+  pub lt_event_words: u32,
   pub gi_stat_words: u32,
 }
 
@@ -28,6 +29,7 @@ const REQUIRED: &[&str] = &[
   "IRC_CHAIN",
   "LT_BUCKET",
   "LT_TOP",
+  "LT_EVENT_WORDS",
   "GI_STAT_WORDS",
 ];
 
@@ -104,6 +106,7 @@ impl GiConsts {
       irc_chain: get("IRC_CHAIN"),
       lt_bucket: get("LT_BUCKET"),
       lt_top: get("LT_TOP"),
+      lt_event_words: get("LT_EVENT_WORDS"),
       gi_stat_words: get("GI_STAT_WORDS"),
     };
 

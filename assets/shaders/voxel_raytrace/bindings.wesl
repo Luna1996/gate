@@ -191,6 +191,7 @@ struct FogUniform {
 @group(5) @binding(8) var<storage, read_write> res_tmp: array<atomic<u32>>;
 @group(5) @binding(9) var<storage, read_write> res_cur: array<atomic<u32>>;
 @group(5) @binding(10) var<storage, read_write> gi_merge_req: array<atomic<u32>>;
+@group(5) @binding(11) var<storage, read_write> lt_event: array<atomic<u32>>;
 
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;

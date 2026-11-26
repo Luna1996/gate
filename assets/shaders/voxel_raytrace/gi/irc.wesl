@@ -1,9 +1,10 @@
-import package::bindings::{gi_stats, gi_u, irc, irc_key, view_u};
+import package::bindings::{gi_stats, gi_u, irc, irc_key, lt_event, view_u};
 import package::brickmap::{Grid};
 import package::common::{face_normal_from_index};
 import package::gi::common::{gi_div, gi_mix};
-import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVICT_GUARD, IRC_EVICT_PRESSURE, IRC_FALLBACK_LEVELS, IRC_HET_ALPHA, IRC_HET_K, IRC_HET_MIN, IRC_HET_SE_MAX, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_RV_K, IRC_RV_MAX, IRC_RV_MIN, IRC_RV_PRIOR, IRC_SIG_HI, IRC_SIG_LO, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2};
-import package::trace::{grid_is_far};
+import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, GI_STAT_IRC_LOCKED, GI_STAT_IRC_ORPHAN, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVENT_N, IRC_EVICT_GUARD, IRC_EVICT_PRESSURE, IRC_FALLBACK_LEVELS, IRC_HET_ALPHA, IRC_HET_K, IRC_HET_MIN, IRC_HET_SE_MAX, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_RV_K, IRC_RV_MAX, IRC_RV_MIN, IRC_RV_PRIOR, IRC_SIG_HI, IRC_SIG_LO, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2, LT_EVENT_CAP};
+import package::trace::{grid_is_far, make_grid};
+import package::world::{voxel_center_world};
 
 const IRC_W_VAL: u32 = 0u;
 const IRC_W_META: u32 = 1u;
@@ -396,9 +397,15 @@ fn irc_parent(cl: IrcCell) -> IrcPar {
 
 fn irc_resolve_slot(s: u32) {
   let kb = s * 2u;
-  let k1 = atomicLoad(&irc_key[kb + 1u]);
-  if (k1 == 0u) { return; }
   let b = s * IRC_WORDS;
+  let k1 = atomicLoad(&irc_key[kb + 1u]);
+  if (k1 == 0u) {
+    if (atomicLoad(&irc[b + IRC_W_N]) != 0u || atomicLoad(&irc[b + IRC_W_MEAN]) != 0u) {
+      atomicAdd(&gi_stats[GI_STAT_IRC_ORPHAN], 1u);
+    }
+    return;
+  }
+  if (k1 == IRC_LOCK) { atomicAdd(&gi_stats[GI_STAT_IRC_LOCKED], 1u); }
   let frame = gi_u.seq.x;
   let wq = atomicLoad(&irc[b + IRC_W_ACC_W]);
   let sunq = atomicLoad(&irc[b + IRC_W_ACC_SUN]);
@@ -423,11 +430,33 @@ fn irc_resolve_slot(s: u32) {
   }
   atomicAdd(&gi_stats[GI_STAT_IRC_LIVE], 1u);
 
+  // 灯事件（本帧 sweep/register 广播的灯生死）：条目世界中心落在事件半径内
+  // ⇒ 一次性降信任（n 钳到 IRC_EVENT_N），新样本立刻占主导。灯死亡的反弹
+  // 重建靠 streak 级联要几十秒（间接面靠邻域逐层传播），事件跳过级联。
+  let ev_count = min(atomicLoad(&lt_event[0]), LT_EVENT_CAP);
+  var n = min(bitcast<f32>(atomicLoad(&irc[b + IRC_W_N])) * gi_u.misc.z, gi_u.params.w);
+  if (ev_count > 0u) {
+    let cl_ev = irc_decode(vec2<u32>(atomicLoad(&irc_key[kb]), k1));
+    let cell = i32(1u << cl_ev.level);
+    let vc = vec3<i32>(cl_ev.c) * cell + vec3<i32>(cell / 2);
+    let pw = voxel_center_world(make_grid(cl_ev.obj), vc);
+    for (var e = 0u; e < ev_count; e = e + 1u) {
+      let o = 1u + e * 4u;
+      let ec = vec3<f32>(f32(bitcast<i32>(atomicLoad(&lt_event[o]))),
+                    f32(bitcast<i32>(atomicLoad(&lt_event[o + 1u]))),
+                    f32(bitcast<i32>(atomicLoad(&lt_event[o + 2u]))));
+      let er = bitcast<f32>(atomicLoad(&lt_event[o + 3u]));
+      if (distance(pw, ec) < er) {
+        n = min(n, IRC_EVENT_N);
+        break;
+      }
+    }
+  }
+
   var meta_w = atomicLoad(&irc[b + IRC_W_META]);
   var mean = vec3<f32>(bitcast<f32>(atomicLoad(&irc[b + IRC_W_MEAN])),
                        bitcast<f32>(atomicLoad(&irc[b + IRC_W_MEAN + 1u])),
                        bitcast<f32>(atomicLoad(&irc[b + IRC_W_MEAN + 2u])));
-  var n = min(bitcast<f32>(atomicLoad(&irc[b + IRC_W_N])) * gi_u.misc.z, gi_u.params.w);
   var varr = bitcast<f32>(atomicLoad(&irc[b + IRC_W_VAR]));
   var streak = (meta_w >> 20u) & 3u;
   var sun8 = (meta_w >> 8u) & 0xFFu;
