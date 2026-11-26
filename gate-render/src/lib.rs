@@ -25,7 +25,7 @@ pub use brickmap::{
   VoxelScene, create_dda_image, pool_capacity_chunks, pool_capacity_chunks_far, raycast,
   raycast_objects,
 };
-pub use brickmap::{PostFxSettings, RenderScale};
+pub use brickmap::{PostFxSettings, RenderScale, TonemapMode};
 pub use consts::VIEW_SIZE;
 pub use lighting::{
   AtmosphereSettings, BaseSettings, DirLightCfg, LightDesc, LightGlobals, LightPoolUniform,

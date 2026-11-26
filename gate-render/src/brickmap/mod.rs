@@ -12,7 +12,7 @@ pub use builder::{
 };
 pub use dda::{
   DdaCameraConfig, DdaImages, DdaViewUniform, EyeAdaptSettings, OrbitCamera, PostFxSettings,
-  RenderScale, create_dda_image,
+  RenderScale, TonemapMode, create_dda_image,
 };
 pub use raytrace::{RayHit, raycast, raycast_objects};
 pub use upload::{

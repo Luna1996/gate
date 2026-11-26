@@ -104,10 +104,57 @@ impl Default for RenderScale {
   }
 }
 
-#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ExtractResource)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TonemapMode {
+  Off,
+  #[default]
+  AgX,
+  Aces,
+  Neutral,
+}
+
+impl TonemapMode {
+  pub const COUNT: usize = 4;
+
+  pub fn from_index(i: usize) -> Self {
+    match i {
+      1 => Self::AgX,
+      2 => Self::Aces,
+      3 => Self::Neutral,
+      _ => Self::Off,
+    }
+  }
+
+  pub fn as_u32(self) -> u32 {
+    match self {
+      Self::Off => 0,
+      Self::AgX => 1,
+      Self::Aces => 2,
+      Self::Neutral => 3,
+    }
+  }
+}
+
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, ExtractResource)]
 #[extract_app(bevy::render::RenderApp)]
 pub struct PostFxSettings {
   pub fxaa: bool,
+  pub tonemap: TonemapMode,
+}
+
+impl Default for PostFxSettings {
+  fn default() -> Self {
+    Self { fxaa: false, tonemap: TonemapMode::AgX }
+  }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+pub struct PostUniform {
+  pub mode: u32,
+  pub bloom: f32,
+  pub threshold: f32,
+  pub pad: f32,
 }
 
 #[derive(Resource, Clone, Copy)]
@@ -346,6 +393,19 @@ pub(crate) struct AuxTexCache {
   out_base: Option<Texture>,
   out_base_view: Option<TextureView>,
   out_base_size: UVec2,
+  hdr_scene: Option<Texture>,
+  hdr_scene_view: Option<TextureView>,
+  bloom_a: Option<Texture>,
+  bloom_a_view: Option<TextureView>,
+  bloom_b: Option<Texture>,
+  bloom_b_view: Option<TextureView>,
+  post_sampler: Option<Sampler>,
+  post_buf: Option<UniformBuffer<PostUniform>>,
+  post_size: UVec2,
+  post_down_bg: Option<BindGroup>,
+  post_blur_h_bg: Option<BindGroup>,
+  post_blur_v_bg: Option<BindGroup>,
+  post_tonemap_bg: Option<BindGroup>,
 
   perf_vis: Option<Texture>,
   perf_vis_view: Option<TextureView>,
@@ -368,6 +428,13 @@ impl AuxTexCache {
 
   pub(crate) fn refl_meta_buffer(&self) -> Option<&Buffer> {
     self.refl_meta.as_ref()
+  }
+
+  pub(crate) fn post_ready(&self) -> bool {
+    self.post_down_bg.is_some()
+      && self.post_blur_h_bg.is_some()
+      && self.post_blur_v_bg.is_some()
+      && self.post_tonemap_bg.is_some()
   }
 }
 
@@ -447,6 +514,11 @@ pub(crate) struct DdaPipelines {
   refl_read_layout: BindGroupLayoutDescriptor,
   refl_pipeline: ComputePipe,
   compose_pipeline: ComputePipe,
+  post_layout: BindGroupLayoutDescriptor,
+  bloom_down_pipeline: ComputePipe,
+  bloom_h_pipeline: ComputePipe,
+  bloom_v_pipeline: ComputePipe,
+  tonemap_pipeline: ComputePipe,
 
   pub(crate) beam_pipeline: ComputePipe,
 
@@ -617,6 +689,54 @@ fn extract_camera_config(
   commands.insert_resource(uniform);
 }
 
+fn post_layout() -> BindGroupLayoutDescriptor {
+  let texture = |binding: u32| BindGroupLayoutEntry {
+    binding,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Texture {
+      sample_type: TextureSampleType::Float { filterable: true },
+      view_dimension: TextureViewDimension::D2,
+      multisampled: false,
+    },
+    count: None,
+  };
+  let storage = |binding: u32, format: TextureFormat| BindGroupLayoutEntry {
+    binding,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::StorageTexture {
+      access: StorageTextureAccess::WriteOnly,
+      format,
+      view_dimension: TextureViewDimension::D2,
+    },
+    count: None,
+  };
+  BindGroupLayoutDescriptor::new(
+    "DdaPost",
+    &[
+      texture(40),
+      texture(41),
+      storage(42, TextureFormat::Rgba16Float),
+      storage(43, TextureFormat::Rgba8Unorm),
+      BindGroupLayoutEntry {
+        binding: 44,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+        count: None,
+      },
+      BindGroupLayoutEntry {
+        binding: 45,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: Some(PostUniform::min_size()),
+        },
+        count: None,
+      },
+    ],
+  )
+}
+
 pub(crate) fn init_dda_pipelines(
   mut commands: Commands,
   asset_server: Res<AssetServer>,
@@ -628,7 +748,7 @@ pub(crate) fn init_dda_pipelines(
   let mut bg0_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
     ShaderStages::COMPUTE,
     (
-      texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+      texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
       uniform_buffer::<DdaViewUniform>(false),
       texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
       storage_buffer_read_only_sized(false, None),
@@ -657,7 +777,7 @@ pub(crate) fn init_dda_pipelines(
   let mut bg0_perf_entries: Vec<BindGroupLayoutEntry> = BindGroupLayoutEntries::sequential(
     ShaderStages::COMPUTE,
     (
-      texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+      texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
       uniform_buffer::<DdaViewUniform>(false),
       texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
       storage_buffer_read_only_sized(false, None),
@@ -875,7 +995,7 @@ pub(crate) fn init_dda_pipelines(
     visibility: ShaderStages::COMPUTE,
     ty: BindingType::StorageTexture {
       access: StorageTextureAccess::WriteOnly,
-      format: TextureFormat::Rgba8Unorm,
+      format: TextureFormat::Rgba16Float,
       view_dimension: TextureViewDimension::D2,
     },
     count: None,
@@ -974,6 +1094,23 @@ pub(crate) fn init_dda_pipelines(
   let refl = pipe("gate_dda_refl", refl_layouts.clone(), "dda_refl");
   let compose = pipe("gate_dda_refl_compose", refl_layouts, "dda_refl_compose");
 
+  let post = post_layout();
+  let empty = BindGroupLayoutDescriptor::new("DdaPostEmpty", &[]);
+  let post_layouts = vec![
+    empty.clone(),
+    empty.clone(),
+    empty.clone(),
+    empty.clone(),
+    empty.clone(),
+    empty.clone(),
+    empty.clone(),
+    post.clone(),
+  ];
+  let bloom_down = pipe("gate_bloom_down", post_layouts.clone(), "bloom_down");
+  let bloom_h = pipe("gate_bloom_blur_h", post_layouts.clone(), "bloom_blur_h");
+  let bloom_v = pipe("gate_bloom_blur_v", post_layouts.clone(), "bloom_blur_v");
+  let tonemap = pipe("gate_post_tonemap", post_layouts, "post_tonemap");
+
   let beam = pipe("gate_beam", layouts, "beam_main");
 
   let eye_histogram = pipe("gate_eye_histogram", eye_layouts.clone(), "eye_adapt_histogram");
@@ -1023,6 +1160,11 @@ pub(crate) fn init_dda_pipelines(
     refl_read_layout: refl_read,
     refl_pipeline: refl,
     compose_pipeline: compose,
+    post_layout: post,
+    bloom_down_pipeline: bloom_down,
+    bloom_h_pipeline: bloom_h,
+    bloom_v_pipeline: bloom_v,
+    tonemap_pipeline: tonemap,
     beam_pipeline: beam,
     eye_histogram_pipeline: eye_histogram,
     eye_update_pipeline: eye_update,
@@ -1044,6 +1186,8 @@ pub(crate) struct DdaTune<'w> {
   pub base: Option<Res<'w, crate::lighting::BaseSettings>>,
 
   pub atmo: Option<Res<'w, crate::lighting::AtmosphereSettings>>,
+
+  pub post: Option<Res<'w, PostFxSettings>>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1162,7 +1306,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       mip_level_count: 1,
       sample_count: 1,
       dimension: TextureDimension::D2,
-      format: TextureFormat::Rgba8Unorm,
+      format: TextureFormat::Rgba16Float,
       usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
       view_formats: &[],
     });
@@ -1199,6 +1343,59 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     beam_cache.refl_cap = refl_cap;
     beam_cache.glass_req = Some(make_buf("gate_glass_req", refl_px * 4));
     beam_cache.glass_meta = Some(make_buf("gate_glass_meta", 16));
+  }
+
+  if beam_cache.hdr_scene.is_none() || beam_cache.post_size != scale.size {
+    let make = |label: &str, width: u32, height: u32| {
+      render_device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+      })
+    };
+    let hdr = make("gate_hdr_scene", scale.size.x, scale.size.y);
+    beam_cache.hdr_scene_view = Some(hdr.create_view(&TextureViewDescriptor::default()));
+    beam_cache.hdr_scene = Some(hdr);
+    let bloom_w = scale.size.x.div_ceil(2).max(1);
+    let bloom_h = scale.size.y.div_ceil(2).max(1);
+    let a = make("gate_bloom_a", bloom_w, bloom_h);
+    beam_cache.bloom_a_view = Some(a.create_view(&TextureViewDescriptor::default()));
+    beam_cache.bloom_a = Some(a);
+    let b = make("gate_bloom_b", bloom_w, bloom_h);
+    beam_cache.bloom_b_view = Some(b.create_view(&TextureViewDescriptor::default()));
+    beam_cache.bloom_b = Some(b);
+    beam_cache.post_size = scale.size;
+  }
+
+  if beam_cache.post_sampler.is_none() {
+    beam_cache.post_sampler = Some(render_device.create_sampler(&SamplerDescriptor {
+      label: Some("gate_post_sampler"),
+      mag_filter: FilterMode::Linear,
+      min_filter: FilterMode::Linear,
+      mipmap_filter: MipmapFilterMode::Nearest,
+      ..default()
+    }));
+  }
+
+  if beam_cache.post_buf.is_none() {
+    beam_cache.post_buf = Some(UniformBuffer::from(PostUniform::default()));
+  }
+
+  let post_settings = tune.post.as_deref().copied().unwrap_or_default();
+  let bloom_strength = if post_settings.tonemap == TonemapMode::Off { 0.0 } else { 0.08 };
+  if let Some(post_buf) = beam_cache.post_buf.as_mut() {
+    *post_buf.get_mut() = PostUniform {
+      mode: post_settings.tonemap.as_u32(),
+      bloom: bloom_strength,
+      threshold: 1.0,
+      pad: 0.0,
+    };
+    post_buf.write_buffer(&render_device, &queue);
   }
 
   if beam_cache.perf_vis.is_none() || beam_cache.perf_size != scale.size {
@@ -1415,7 +1612,9 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
         BindGroupEntry { binding: 24, resource: ray.as_entire_binding() },
         BindGroupEntry {
           binding: 20,
-          resource: BindingResource::TextureView(&tex_view.texture_view),
+          resource: BindingResource::TextureView(
+            beam_cache.hdr_scene_view.as_ref().expect("hdr scene view"),
+          ),
         },
         BindGroupEntry { binding: 21, resource: BindingResource::TextureView(base_view) },
         BindGroupEntry { binding: 22, resource: sum.as_entire_binding() },
@@ -1425,8 +1624,47 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   } else {
     (None, None)
   };
+
+  let post_bgs = if let (Some(hdr), Some(bloom_a), Some(bloom_b), Some(sampler), Some(post_buf)) = (
+    beam_cache.hdr_scene_view.as_ref(),
+    beam_cache.bloom_a_view.as_ref(),
+    beam_cache.bloom_b_view.as_ref(),
+    beam_cache.post_sampler.as_ref(),
+    beam_cache.post_buf.as_ref(),
+  ) {
+    let layout = pipeline_cache.get_bind_group_layout(&pipelines.post_layout);
+    let post_u = post_buf.binding().expect("post uniform");
+    let target = &tex_view.texture_view;
+    let make = |src0: &TextureView, src1: &TextureView, dst: &TextureView| {
+      render_device.create_bind_group(
+        None,
+        &layout,
+        &[
+          BindGroupEntry { binding: 40, resource: BindingResource::TextureView(src0) },
+          BindGroupEntry { binding: 41, resource: BindingResource::TextureView(src1) },
+          BindGroupEntry { binding: 42, resource: BindingResource::TextureView(dst) },
+          BindGroupEntry { binding: 43, resource: BindingResource::TextureView(target) },
+          BindGroupEntry { binding: 44, resource: BindingResource::Sampler(sampler) },
+          BindGroupEntry { binding: 45, resource: post_u.clone() },
+        ],
+      )
+    };
+    (
+      Some(make(hdr, hdr, bloom_a)),
+      Some(make(bloom_a, hdr, bloom_b)),
+      Some(make(bloom_b, hdr, bloom_a)),
+      Some(make(hdr, bloom_a, bloom_b)),
+    )
+  } else {
+    (None, None, None, None)
+  };
+  beam_cache.post_down_bg = post_bgs.0;
+  beam_cache.post_blur_h_bg = post_bgs.1;
+  beam_cache.post_blur_v_bg = post_bgs.2;
+  beam_cache.post_tonemap_bg = post_bgs.3;
+
   let mut compose_entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
-    &tex_view.texture_view,
+    beam_cache.bloom_a_view.as_ref().expect("bloom view 未建"),
     &u,
     &beam_view,
     eye_buf.as_entire_binding(),
@@ -1661,6 +1899,7 @@ struct DdaReadyCtx<'a> {
   gi_on: bool,
   eye_on: bool,
   refl_ok: bool,
+  post_ok: bool,
 }
 
 fn dda_pipelines_ready(cx: &DdaReadyCtx<'_>) -> bool {
@@ -1686,6 +1925,11 @@ fn dda_pipelines_ready(cx: &DdaReadyCtx<'_>) -> bool {
     && (!cx.fog_on || cx.fog.is_some_and(|f| f.pipelines_ready(cx.pipeline_cache)))
     && (!cx.gi_on || gi_ok)
     && (!cx.refl_ok || comp(&cx.pipelines.refl_pipeline) && comp(&cx.pipelines.compose_pipeline))
+    && cx.post_ok
+    && comp(&cx.pipelines.bloom_down_pipeline)
+    && comp(&cx.pipelines.bloom_h_pipeline)
+    && comp(&cx.pipelines.bloom_v_pipeline)
+    && comp(&cx.pipelines.tonemap_pipeline)
     && (!cx.eye_on
       || comp(&cx.pipelines.eye_histogram_pipeline) && comp(&cx.pipelines.eye_update_pipeline))
 }
@@ -1844,6 +2088,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
       gi_on,
       eye_on,
       refl_ok,
+      post_ok: aux.as_ref().is_some_and(|a| a.post_ready()),
     });
   warm_mark(&WARM_ALL, "全部", all_ready);
   *ready = DdaReady(all_ready);
@@ -2148,6 +2393,67 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(gxc, gyc, 1);
       },
     );
+  }
+
+  let post_bgs = aux.as_ref().and_then(|a| {
+    Some((
+      a.post_down_bg.as_ref()?,
+      a.post_blur_h_bg.as_ref()?,
+      a.post_blur_v_bg.as_ref()?,
+      a.post_tonemap_bg.as_ref()?,
+    ))
+  });
+  if let Some((down, blur_h, blur_v, tonemap)) = post_bgs {
+    let half_x = scale.size.x.div_ceil(2).div_ceil(DDA_WORKGROUP_SIZE).max(1);
+    let half_y = scale.size.y.div_ceil(2).div_ceil(DDA_WORKGROUP_SIZE).max(1);
+    if let Some(pipe) = pipelines.bloom_down_pipeline.get(&pipeline_cache) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_bloom_down",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(7, down, &[]);
+          pass.dispatch_workgroups(half_x, half_y, 1);
+        },
+      );
+    }
+    if let Some(pipe) = pipelines.bloom_h_pipeline.get(&pipeline_cache) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_bloom_blur_h",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(7, blur_h, &[]);
+          pass.dispatch_workgroups(half_x, half_y, 1);
+        },
+      );
+    }
+    if let Some(pipe) = pipelines.bloom_v_pipeline.get(&pipeline_cache) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_bloom_blur_v",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(7, blur_v, &[]);
+          pass.dispatch_workgroups(half_x, half_y, 1);
+        },
+      );
+    }
+    if let Some(pipe) = pipelines.tonemap_pipeline.get(&pipeline_cache) {
+      crate::profiler::gpu_compute_pass(
+        &mut profiler,
+        ctx.command_encoder(),
+        "gate_post_tonemap",
+        |pass| {
+          pass.set_pipeline(pipe);
+          pass.set_bind_group(7, tonemap, &[]);
+          pass.dispatch_workgroups(gx.max(1), gy.max(1), 1);
+        },
+      );
+    }
   }
 
   if eye.as_ref().is_some_and(|e| e.settings.enabled)

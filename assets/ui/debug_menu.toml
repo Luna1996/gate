@@ -237,6 +237,23 @@ tooltip = "menu.render.ray.quality.tip"
 
 [[items.children]]
 kind = "sub_menu"
+id = "tone"
+label = "menu.render.tone"
+
+[[items.children.children]]
+kind = "switch_group"
+id = "mode"
+label = "menu.render.tone.mode"
+options = [
+    "menu.render.tone.off",
+    "menu.render.tone.agx",
+    "menu.render.tone.aces",
+    "menu.render.tone.neutral",
+]
+selected = 1
+
+[[items.children]]
+kind = "sub_menu"
 id = "exposure"
 label = "menu.render.exposure"
 

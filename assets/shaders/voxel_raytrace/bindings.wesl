@@ -1,4 +1,4 @@
-@group(0) @binding(0) var out_base: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var out_base: texture_storage_2d<rgba16float, write>;
 
 @group(7) @binding(10) var<storage, read_write> refl_req: array<vec4<u32>>;
 @group(7) @binding(11) var<storage, read_write> refl_meta: array<atomic<u32>>;
@@ -7,11 +7,24 @@
 @group(7) @binding(0) var out_tex_src: texture_2d<f32>;
 @group(7) @binding(1) var<storage, read_write> eye_adapt: array<atomic<u32>>;
 
-@group(7) @binding(20) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(7) @binding(20) var out_tex: texture_storage_2d<rgba16float, write>;
 @group(7) @binding(21) var out_base_tex: texture_2d<f32>;
 @group(7) @binding(22) var<storage, read_write> refl_sum: array<atomic<u32>>;
 @group(7) @binding(23) var<storage, read_write> refl_first: array<atomic<u32>>;
 @group(7) @binding(24) var<storage, read_write> refl_ray: array<atomic<u32>>;
+
+struct PostUniform {
+  mode: u32,
+  bloom: f32,
+  threshold: f32,
+  pad: f32,
+}
+@group(7) @binding(40) var post_src0: texture_2d<f32>;
+@group(7) @binding(41) var post_src1: texture_2d<f32>;
+@group(7) @binding(42) var post_dst: texture_storage_2d<rgba16float, write>;
+@group(7) @binding(43) var post_final: texture_storage_2d<rgba8unorm, write>;
+@group(7) @binding(44) var post_samp: sampler;
+@group(7) @binding(45) var<uniform> post_u: PostUniform;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 @group(0) @binding(4) var dda_hit: texture_storage_2d<rgba32uint, read_write>;

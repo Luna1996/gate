@@ -365,8 +365,13 @@ fn register_callbacks(world: &mut World) {
      mut refl: ResMut<gate_render::ReflectionSettings>,
      mut base: ResMut<gate_render::BaseSettings>,
      mut dlss: ResMut<gate_render::DlssSettings>,
+     mut post: ResMut<gate_render::PostFxSettings>,
      mut menu: Query<&mut DebugMenu, With<DebugMenuRoot>>| {
       match (ev.path.as_str(), &ev.action) {
+        ("render/tone/mode", MenuAction::Select(i)) => {
+          post.tonemap = gate_render::TonemapMode::from_index(*i);
+          info!("影调映射 → {:?}", post.tonemap);
+        }
         ("video/dlss", MenuAction::Select(i)) => {
           dlss.mode = gate_render::DlssMode::CHOICES[(*i).min(5)];
           #[cfg(feature = "dlss")]

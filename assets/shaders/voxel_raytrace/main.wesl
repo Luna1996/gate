@@ -1,4 +1,4 @@
-import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, post_dst, post_final, post_samp, post_src0, post_src1, post_u, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_jitter, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
 import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS, SUN_DIV};
@@ -244,7 +244,7 @@ fn trace_glass(origin_voxel: vec3<f32>, dir_voxel: vec3<f32>, max_t: f32,
 fn write_output(coord: vec2<i32>, col: vec3<f32>) {
   let exposure = bitcast<f32>(eye_adapt_ro[0u]);
   let exposed = col * select(1.0, exposure, exposure > 0.0);
-  textureStore(out_base, coord, vec4<f32>(linear_to_srgb(exposed) + dither3(coord), 1.0));
+  textureStore(out_base, coord, vec4<f32>(exposed, 1.0));
 }
 
 fn voxel_screen_uv(p_voxel: vec3<f32>, fallback: vec2<f32>) -> vec2<f32> {
@@ -805,7 +805,7 @@ fn dda_refl_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out_tex, coord, textureLoad(out_base_tex, coord, 0));
     return;
   }
-  let base = srgb_to_linear(textureLoad(out_base_tex, coord, 0).rgb);
+  let base = textureLoad(out_base_tex, coord, 0).rgb;
   var px_src = px;
   var ray_px = REFL_FIRST_NONE;
   let vis = textureLoad(dda_vis, coord);
@@ -847,7 +847,7 @@ fn dda_refl_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let exposure = bitcast<f32>(eye_adapt_ro[0u]);
   let lin = base + add * select(1.0, exposure, exposure > 0.0);
-  textureStore(out_tex, coord, vec4<f32>(linear_to_srgb(lin) + dither3(coord), 1.0));
+  textureStore(out_tex, coord, vec4<f32>(lin, 1.0));
 }
 
 const VIS_CAM: u32 = 0xFFFFFFFFu;
@@ -1347,4 +1347,157 @@ fn gi_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
   let s = gid.x;
   if (s >= arrayLength(&irc) / IRC_WORDS) { return; }
   irc_resolve_slot(s);
+}
+
+fn agx_contrast(x: vec3<f32>) -> vec3<f32> {
+  let x2 = x * x;
+  let x4 = x2 * x2;
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x
+    + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+
+fn agx_tonemap(color: vec3<f32>) -> vec3<f32> {
+  let srgb_to_rec2020 = mat3x3<f32>(
+    vec3<f32>(0.6274, 0.0691, 0.0164),
+    vec3<f32>(0.3293, 0.9195, 0.0880),
+    vec3<f32>(0.0433, 0.0113, 0.8956),
+  );
+  let rec2020_to_srgb = mat3x3<f32>(
+    vec3<f32>(1.6605, -0.1246, -0.0182),
+    vec3<f32>(-0.5876, 1.1329, -0.1006),
+    vec3<f32>(-0.0728, -0.0083, 1.1187),
+  );
+  let inset = mat3x3<f32>(
+    vec3<f32>(0.856627153315983, 0.137318972929847, 0.11189821299995),
+    vec3<f32>(0.0951212405381588, 0.761241990602591, 0.0767994186031903),
+    vec3<f32>(0.0482516061458583, 0.101439036467562, 0.811302368396859),
+  );
+  let outset = mat3x3<f32>(
+    vec3<f32>(1.1271005818144368, -0.1413297634984383, -0.14132976349843826),
+    vec3<f32>(-0.11060664309660323, 1.157823702216272, -0.11060664309660294),
+    vec3<f32>(-0.016493938717834573, -0.016493938717834257, 1.2519364065950405),
+  );
+  const min_ev: f32 = -12.47393;
+  const max_ev: f32 = 4.026069;
+  var c = srgb_to_rec2020 * color;
+  c = inset * c;
+  c = max(c, vec3<f32>(1e-10));
+  c = log2(c);
+  c = (c - min_ev) / (max_ev - min_ev);
+  c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  c = agx_contrast(c);
+  c = outset * c;
+  c = pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+  c = rec2020_to_srgb * c;
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn aces_fitted(color: vec3<f32>) -> vec3<f32> {
+  let rgb_to_rrt = mat3x3<f32>(
+    vec3<f32>(0.59719, 0.35458, 0.04823),
+    vec3<f32>(0.07600, 0.90834, 0.01566),
+    vec3<f32>(0.02840, 0.13383, 0.83777),
+  );
+  let odt_to_rgb = mat3x3<f32>(
+    vec3<f32>(1.60475, -0.53108, -0.07367),
+    vec3<f32>(-0.10208, 1.10813, -0.00605),
+    vec3<f32>(-0.00327, -0.07276, 1.07602),
+  );
+  var c = color * rgb_to_rrt;
+  c = (c * (c + 0.0245786) - 0.000090537)
+    / (c * (0.983729 * c + 0.4329510) + 0.238081);
+  c = c * odt_to_rgb;
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn pbr_neutral(color_in: vec3<f32>) -> vec3<f32> {
+  let start_compression = 0.8 - 0.04;
+  let desaturation = 0.15;
+  let min_channel = min(color_in.r, min(color_in.g, color_in.b));
+  let offset = select(min_channel - 6.25 * min_channel * min_channel, 0.04, min_channel >= 0.08);
+  let offset_color = color_in - vec3<f32>(offset);
+  let max_channel = max(offset_color.r, max(offset_color.g, offset_color.b));
+  if (max_channel < start_compression) {
+    return offset_color;
+  }
+  let d = 1.0 - start_compression;
+  let new_max = 1.0 - d * d / (max_channel + d - start_compression);
+  let color = offset_color * (new_max / max_channel);
+  let g = 1.0 - 1.0 / (desaturation * (max_channel - new_max) + 1.0);
+  return mix(color, vec3<f32>(new_max), g);
+}
+
+fn tonemap_color(c: vec3<f32>, mode: u32) -> vec3<f32> {
+  if (mode == 1u) { return agx_tonemap(c); }
+  if (mode == 2u) { return aces_fitted(c); }
+  if (mode == 3u) { return pbr_neutral(c); }
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn bloom_extract(c: vec3<f32>) -> vec3<f32> {
+  let l = max(c.r, max(c.g, c.b));
+  let k = smoothstep(post_u.threshold, post_u.threshold + 0.5, l);
+  return c * (k / max(l, 1e-4));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_down(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(post_dst);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+  let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+    / vec2<f32>(f32(dims.x), f32(dims.y));
+  let texel = 1.0 / vec2<f32>(textureDimensions(post_src0));
+  var c = vec3<f32>(0.0);
+  for (var y: i32 = -1; y <= 1; y = y + 2) {
+    for (var x: i32 = -1; x <= 1; x = x + 2) {
+      c = c + textureSampleLevel(post_src0, post_samp, uv + vec2<f32>(f32(x), f32(y)) * texel * 0.5, 0.0).rgb;
+    }
+  }
+  c = bloom_extract(c * 0.25);
+  textureStore(post_dst, coord, vec4<f32>(c, 1.0));
+}
+
+fn bloom_blur(coord: vec2<i32>, axis: vec2<f32>) {
+  let dims = textureDimensions(post_dst);
+  let uv = (vec2<f32>(f32(coord.x), f32(coord.y)) + vec2<f32>(0.5))
+    / vec2<f32>(f32(dims.x), f32(dims.y));
+  let texel = axis / vec2<f32>(textureDimensions(post_src0));
+  let w = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+  var c = textureSampleLevel(post_src0, post_samp, uv, 0.0).rgb * w[0];
+  for (var i: i32 = 1; i < 5; i = i + 1) {
+    let o = texel * f32(i);
+    c = c + textureSampleLevel(post_src0, post_samp, uv + o, 0.0).rgb * w[i];
+    c = c + textureSampleLevel(post_src0, post_samp, uv - o, 0.0).rgb * w[i];
+  }
+  textureStore(post_dst, coord, vec4<f32>(c, 1.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_blur_h(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(post_dst);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  bloom_blur(vec2<i32>(i32(gid.x), i32(gid.y)), vec2<f32>(1.0, 0.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn bloom_blur_v(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(post_dst);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  bloom_blur(vec2<i32>(i32(gid.x), i32(gid.y)), vec2<f32>(0.0, 1.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn post_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(post_final);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+  let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+    / vec2<f32>(f32(dims.x), f32(dims.y));
+  var c = textureSampleLevel(post_src0, post_samp, uv, 0.0).rgb;
+  let bloom = textureSampleLevel(post_src1, post_samp, uv, 0.0).rgb;
+  c = c + bloom * post_u.bloom;
+  c = tonemap_color(c, post_u.mode);
+  c = linear_to_srgb(c) + dither3(coord);
+  textureStore(post_final, coord, vec4<f32>(c, 1.0));
 }
