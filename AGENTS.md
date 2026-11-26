@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## 重要！重要！重要！
+
+- 禁止破坏逐体素着色风格。
+- 禁止写代码注释。
+- 禁止做相机静止时的纯静态复用偷懒优化。
+- 禁止在我未审核通过时提交代码。
+
 ## 构建 / 运行
 
 - **本仓库禁止 debug 构建**：`gate-*/build.rs` 会在 `PROFILE=debug` 时 panic。使用 `build-fast` / `balance` / `run-fast`；不再维护自定义 `release` profile。
