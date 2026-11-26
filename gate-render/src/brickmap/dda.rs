@@ -1518,6 +1518,11 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     return;
   };
   *lp.0.get_mut() = build_light_pool(&lighting);
+  let soft_angle = tune
+    .base
+    .as_ref()
+    .map_or(crate::lighting::BaseSettings::default().soft_angle_deg, |b| b.soft_angle_deg);
+  lp.0.get_mut().lights[0].shape.y = soft_angle.clamp(0.0, 5.0).to_radians();
 
   lp.0.get_mut().g.refl_tier = tune.refl.as_ref().map_or(0, |r| r.tier());
   lp.0.get_mut().g.refl_nest = tune.refl.as_ref().map_or(0, |r| r.nest());

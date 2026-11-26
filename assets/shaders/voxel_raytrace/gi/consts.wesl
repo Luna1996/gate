@@ -44,7 +44,7 @@ const IRC_HET_SE_MAX: f32 = 0.25;
 // 任意前缀都覆盖盘面。每格结果只取决于格子键 + 槽号，静止场景不会变化。
 const SUN_SLOTS: u32 = 16u;
 const SUN_SPP: u32 = 4u;
-const SUN_DIV: u32 = 4u;
+const SUN_DIV: u32 = 2u;
 
 const GI_SPP_MAX: u32 = 8u;
 const GI_NEE_STATIC: u32 = 2u;

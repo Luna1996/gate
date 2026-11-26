@@ -47,9 +47,9 @@ impl GiSettings {
 
   pub const GI_SIZE_REF_PX: u64 = 320 * 180;
 
-  pub const IRC_SLOTS_MIN: u32 = 1 << 19;
+  pub const IRC_SLOTS_MIN: u32 = 1 << 20;
 
-  pub const IRC_SLOTS_MAX: u32 = 1 << 20;
+  pub const IRC_SLOTS_MAX: u32 = 1 << 21;
 
   pub fn div(&self) -> u32 {
     self.gi_div.clamp(1, 8)

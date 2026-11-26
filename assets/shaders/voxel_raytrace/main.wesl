@@ -2,7 +2,7 @@ import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, 
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_jitter, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
 import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS, SUN_DIV};
-import package::gi::irc::{irc_accumulate, irc_addr, irc_display, irc_lookup, irc_resolve_slot, irc_sun_lookup};
+import package::gi::irc::{irc_accumulate, irc_addr, irc_display, irc_lookup, irc_resolve_slot, irc_sun_lookup, sun_addr};
 import package::gi::light::{lt_hit_weight, lt_nee, lt_pick, lt_register, lt_sweep_slot};
 import package::gi::ray::{gi_accumulate, gi_leaf_indirect, gi_origin, gi_surface};
 import package::gi::sun::{sun_gather_cell};
@@ -76,8 +76,9 @@ fn sun_transmittance(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32
 
 fn sun_vis_surface(g: Grid, voxel: vec3<i32>, face: u32, obj_id: i32, n: vec3<f32>,
                    p: vec3<f32>) -> vec3<f32> {
+  let a = sun_addr(g, u32(obj_id + 1), voxel, p);
   if ((light_u.g.base_flags & BASE_FLAG_SOFT_SHADOW) != 0u) {
-    let sv = irc_sun_lookup(irc_addr(g, u32(obj_id + 1), voxel, p), face);
+    let sv = irc_sun_lookup(a, face);
     if (sv.ok) { return sv.vis * sv.tint; }
   }
   let off = surface_offset(g, n, SHADOW_SURFACE_EPS);
@@ -978,7 +979,7 @@ fn sun_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (dot(n, n) < 1e-8) { return; }
   let nf = voxel_face_index(g, n, h.obj_id);
   let p = voxel_center_world(g, h.voxel);
-  sun_gather_cell(g, irc_addr(g, u32(h.obj_id + 1), h.voxel, p), nf, n, h.voxel, h.obj_id);
+  sun_gather_cell(g, sun_addr(g, u32(h.obj_id + 1), h.voxel, p), nf, n, h.voxel, h.obj_id);
 }
 
 @compute @workgroup_size(8, 8, 1)

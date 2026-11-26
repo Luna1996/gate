@@ -229,6 +229,20 @@ fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
   return IrcAddr(v, obj, level, per * per);
 }
 
+// 直光太阳阴影固定 level0，逐体素，不跟随 GI 的距离 LOD 变粗。
+fn sun_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
+  var v = voxel;
+  var obj = 0u;
+  if (idx != 0u) {
+    if (grid_is_far(idx)) {
+      v = vec3<i32>(floor(p));
+    } else {
+      obj = idx;
+    }
+  }
+  return IrcAddr(v, obj, 0u, 0.0);
+}
+
 struct SunVis {
   vis: f32,
   tint: vec3<f32>,

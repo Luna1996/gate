@@ -394,6 +394,10 @@ fn register_callbacks(world: &mut World) {
           base.soft_shadow = *on;
           info!("软阴影 → {}", if *on { "on" } else { "off（单条硬阴影）" });
         }
+        ("render/base/soft_angle", MenuAction::Value(v)) => {
+          base.soft_angle_deg = v.clamp(0.0, 3.0);
+          info!("软影角度 → {:.1}°", base.soft_angle_deg);
+        }
         ("render/base/normal", MenuAction::Toggle(on)) => {
           base.implicit_normal = *on;
           info!("隐式法相 → {}", if *on { "on" } else { "off（原色直出）" });

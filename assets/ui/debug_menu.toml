@@ -102,6 +102,17 @@ label = "menu.render.base.soft_shadow"
 checked = true
 tooltip = "menu.render.base.soft_shadow.tip"
 
+[[items.children.children]]
+kind = "slider"
+id = "soft_angle"
+label = "menu.render.base.soft_angle"
+value = 1.0
+min = 0.0
+max = 3.0
+step = 0.1
+decimals = 1
+tooltip = "menu.render.base.soft_angle.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "gi"

@@ -74,6 +74,7 @@ impl Default for ReflectionSettings {
 pub struct BaseSettings {
   pub shadow: bool,
   pub soft_shadow: bool,
+  pub soft_angle_deg: f32,
   pub implicit_normal: bool,
   pub vol_tint: bool,
   pub glass_quality: u32,
@@ -100,6 +101,7 @@ impl Default for BaseSettings {
     Self {
       shadow: true,
       soft_shadow: true,
+      soft_angle_deg: 1.0,
       implicit_normal: true,
       vol_tint: false,
       glass_quality: 2,
