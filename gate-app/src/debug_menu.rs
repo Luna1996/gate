@@ -54,6 +54,8 @@ const EDIT_MATERIAL_PATHS: [&str; 5] = [
 ];
 
 const SKY_HOUR_PATH: &str = "render/sky/time/hour";
+const AIR_DENSITY_PATH: &str = "render/sky/air/density";
+const AIR_START_PATH: &str = "render/sky/air/start";
 const BLUR_STRENGTH_PATH: &str = "render/sky/blur/strength";
 const BLUR_DECAY_PATH: &str = "render/sky/blur/decay";
 const BLUR_FOCUS_PATH: &str = "render/sky/blur/focus";
@@ -471,8 +473,17 @@ fn register_callbacks(world: &mut World) {
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut fog: ResMut<gate_render::FogSettings>,
-     mut sky: ResMut<gate_render::SkySettings>| {
+     mut sky: ResMut<gate_render::SkySettings>,
+     mut atmo: ResMut<gate_render::AtmosphereSettings>| {
       match (ev.path.as_str(), &ev.action) {
+        (AIR_DENSITY_PATH, MenuAction::Value(v)) => {
+          atmo.density = v.clamp(0.0, 100.0) * 0.000004;
+          info!("空气透视：浓度 → {:.5}", atmo.density);
+        }
+        (AIR_START_PATH, MenuAction::Value(v)) => {
+          atmo.start = v.max(0.0);
+          info!("空气透视：起始 → {:.0} vx", atmo.start);
+        }
         ("render/sky/blur/enabled", MenuAction::Toggle(on)) => {
           fog.enabled = *on;
           info!("光柱 → {}", if *on { "on" } else { "off" });

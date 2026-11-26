@@ -545,6 +545,7 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<LightingTheme>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::ReflectionSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::BaseSettings>::default(),
+      bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::AtmosphereSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<DlssFrame>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<DlssSettings>::default(),
@@ -554,6 +555,7 @@ impl Plugin for BrickMapDdaPlugin {
     app.insert_resource(EyeAdaptSettings::startup());
     app.init_resource::<crate::lighting::ReflectionSettings>();
     app.init_resource::<crate::lighting::BaseSettings>();
+    app.init_resource::<crate::lighting::AtmosphereSettings>();
     app.init_resource::<DlssFrame>();
     app.init_resource::<DlssSettings>();
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
@@ -1040,6 +1042,8 @@ pub(crate) struct DdaTune<'w> {
   pub refl: Option<Res<'w, crate::lighting::ReflectionSettings>>,
 
   pub base: Option<Res<'w, crate::lighting::BaseSettings>>,
+
+  pub atmo: Option<Res<'w, crate::lighting::AtmosphereSettings>>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1530,6 +1534,8 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
 
   lp.0.get_mut().g.base_flags =
     tune.base.as_ref().map_or(crate::lighting::BaseSettings::default().flags(), |b| b.flags());
+  let atmo = tune.atmo.as_deref().copied().unwrap_or_default();
+  lp.0.get_mut().g.exposure_pad = Vec4::new(atmo.density.max(0.0), atmo.start.max(0.0), 0.0, 0.0);
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 
@@ -1972,7 +1978,6 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
       ctx.command_encoder().clear_buffer(stats, 0, None);
     }
     if let Some(ev) = bg4.lt_event_buffer() {
-      // 灯事件通道计数头清零（事件体由本帧 sweep 覆写）
       ctx.command_encoder().clear_buffer(ev, 0, None);
     }
     {

@@ -9,7 +9,7 @@ import package::gi::sun::{sun_gather_cell};
 import package::gi::restir::{Res, res_add_nb, res_add_pick, res_adopt, res_begin, res_direct, res_finish, res_load_cur, res_load_prev, res_load_tmp, res_none, res_store_cur, res_store_tmp};
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
-import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_primary};
+import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_ambient, sky_primary};
 import package::world::{medium_one, voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_at_point, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_cfg_reflect, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
 @compute @workgroup_size(8, 8, 1)
@@ -83,6 +83,17 @@ fn sun_vis_surface(g: Grid, voxel: vec3<i32>, face: u32, obj_id: i32, n: vec3<f3
   }
   let off = surface_offset(g, n, SHADOW_SURFACE_EPS);
   return sun_transmittance(p + n * off, light_u.lights[0].kind_pos_dir.yzw, voxel, obj_id);
+}
+
+fn aerial_perspective(col: vec3<f32>, p_voxel: vec3<f32>, origin: vec3<f32>) -> vec3<f32> {
+  let a = light_u.g.exposure_pad;
+  if (a.x <= 0.0) { return col; }
+  let d = p_voxel - origin;
+  let dist = length(d);
+  let f = 1.0 - exp(-a.x * max(dist - a.y, 0.0));
+  if (f <= 0.0) { return col; }
+  let dir = d / max(dist, 1e-6);
+  return mix(col, sky_ambient(dir), clamp(f, 0.0, 1.0));
 }
 
 fn refl_cone_dir(r: vec3<f32>, u: vec2<f32>, spread: f32) -> vec3<f32> {
@@ -875,9 +886,6 @@ fn split_ray(gid: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
   return far_world_h.xyz / far_world_h.w - near_world_h.xyz / near_world_h.w;
 }
 
-// DLSS 逐像素输入：运动矢量（输出像素单位，Y 向下）与线性视深。
-// 静止世界下 p_prev == p（相机运动由重投影吸收）；移动物体的 prev 位姿
-// 接入后 p_prev 换成上一帧位姿下的同一点。
 fn dlss_store_inputs(coord: vec2<i32>, hit: WorldHit, dir: vec3<f32>) {
   let out_size = view_u.dlss.zw;
   if (out_size.x < 1.0) { return; }
@@ -1043,7 +1051,8 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
   let gg = make_grid(u32(first.obj_id) + 1u);
   let p_voxel = voxel_center_world(gg, first.voxel);
   if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
-    return fetch_material(first.palette_base, first.pal, p_voxel, normalize(gg.col1), PBR_DEBUG_ASSET).albedo;
+    let albedo = fetch_material(first.palette_base, first.pal, p_voxel, normalize(gg.col1), PBR_DEBUG_ASSET).albedo;
+    return aerial_perspective(albedo, p_voxel, origin_voxel);
   }
   let k0 = gi_key0(first.voxel, first.obj_id);
   let k1 = gi_key1(first.voxel, first.face_id, first.obj_id);
@@ -1079,7 +1088,7 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
                        fresnel_schlick(f0r, max(dot(v, n), 0.0)) * fade, qpx, true);
     }
   }
-  return col;
+  return aerial_perspective(col, p_voxel, origin_voxel);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1154,6 +1163,8 @@ fn dda_glass(@builtin(global_invocation_id) gid: vec3<u32>,
     var best = first;
     var col = shade_face(first, origin_voxel, dir_voxel, frustum_length, uv, sun_dir, sky, sun_c,
                      n_hint, need_n, u32(coord.y) * size.x + u32(coord.x), &best, f_shadow);
+    let fog_g = make_grid(u32(first.obj_id) + 1u);
+    col = aerial_perspective(col, voxel_center_world(fog_g, first.voxel), origin_voxel);
     if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
     dlss_store_inputs(coord, first, dir_voxel);
     write_output(coord, col);

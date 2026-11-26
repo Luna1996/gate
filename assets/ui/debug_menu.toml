@@ -365,6 +365,33 @@ tooltip = "menu.render.sky.time.lat.tip"
 
 [[items.children.children]]
 kind = "sub_menu"
+id = "air"
+label = "menu.render.sky.air"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "density"
+label = "menu.render.sky.air.density"
+value = 8.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+tooltip = "menu.render.sky.air.density.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "start"
+label = "menu.render.sky.air.start"
+value = 128.0
+min = 0.0
+max = 4096.0
+step = 16.0
+decimals = 0
+tooltip = "menu.render.sky.air.start.tip"
+
+[[items.children.children]]
+kind = "sub_menu"
 id = "blur"
 label = "menu.render.sky.blur"
 

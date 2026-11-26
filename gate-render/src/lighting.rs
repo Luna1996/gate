@@ -109,6 +109,22 @@ impl Default for BaseSettings {
   }
 }
 
+#[derive(
+  Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource,
+)]
+#[extract_app(bevy::render::RenderApp)]
+pub struct AtmosphereSettings {
+  pub density: f32,
+
+  pub start: f32,
+}
+
+impl Default for AtmosphereSettings {
+  fn default() -> Self {
+    Self { density: 0.000032, start: 128.0 }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DirLightCfg {
   pub dir: [f32; 3],
