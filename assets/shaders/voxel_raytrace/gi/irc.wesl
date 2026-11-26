@@ -286,7 +286,7 @@ fn irc_sun_cached(a: IrcAddr, face: u32) -> u32 {
   if (((meta_w >> IRC_META_SUN_SHIFT) & IRC_META_SUN_MASK) != irc_sun_code()) {
     return 0u;
   }
-  if (atomicLoad(&irc[b + IRC_W_SUN]) != 0xFFFFFFFFu) { return 0u; }
+  if ((atomicLoad(&irc[b + IRC_W_SUN]) & 0x55555555u) != 0x55555555u) { return 0u; }
   if (atomicLoad(&irc[b + IRC_W_STAMP]) != gi_u.seq.x) {
     atomicStore(&irc[b + IRC_W_STAMP], gi_u.seq.x);
     return 1u;
