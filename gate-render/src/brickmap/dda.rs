@@ -439,6 +439,7 @@ pub(crate) struct DdaPipelines {
   eye_layout: BindGroupLayoutDescriptor,
   bg0_perf_layout: BindGroupLayoutDescriptor,
   visible_pipeline: ComputePipe,
+  sun_pipeline: ComputePipe,
   shadow_pipeline: ComputePipe,
   shade_pipeline: ComputePipe,
   glass_pipeline: ComputePipe,
@@ -963,6 +964,7 @@ pub(crate) fn init_dda_pipelines(
     }))
   };
   let visible = pipe("gate_dda_visible", dda_layouts_perf.clone(), "dda_visible");
+  let sun = pipe("gate_sun_gather", dda_layouts_perf.clone(), "sun_gather");
   let shadow = pipe("gate_dda_shadow", dda_layouts_perf.clone(), "dda_shadow");
   let shade = pipe("gate_dda_shade", dda_layouts_perf.clone(), "dda_shade");
   let glass = pipe("gate_dda_glass", dda_layouts_perf, "dda_glass");
@@ -1011,6 +1013,7 @@ pub(crate) fn init_dda_pipelines(
     eye_layout: eye,
     bg0_perf_layout: bg0_perf,
     visible_pipeline: visible,
+    sun_pipeline: sun,
     shadow_pipeline: shadow,
     shade_pipeline: shade,
     glass_pipeline: glass,
@@ -1661,10 +1664,12 @@ fn dda_pipelines_ready(cx: &DdaReadyCtx<'_>) -> bool {
       && all(&bg.merge_pipeline)
   });
   comp(&cx.pipelines.visible_pipeline)
+    && comp(&cx.pipelines.sun_pipeline)
     && comp(&cx.pipelines.shadow_pipeline)
     && comp(&cx.pipelines.shade_pipeline)
     && comp(&cx.pipelines.glass_pipeline)
     && (!DDA_BEAM || comp(&cx.pipelines.beam_pipeline))
+    && cx.bg4.is_some_and(|bg| bg.resolve_pipeline.as_ref().is_some_and(&comp))
     && cx.pipeline_cache.get_render_pipeline(cx.pipelines.blit_pipeline).is_some()
     && cx.pipeline_cache.get_render_pipeline(cx.pipelines.blit_fxaa_pipeline).is_some()
     && (!cx.fog_on || cx.fog.is_some_and(|f| f.pipelines_ready(cx.pipeline_cache)))
@@ -1727,6 +1732,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
 
   let gx = scale.size.x.div_ceil(DDA_WORKGROUP_SIZE);
   let gy = scale.size.y.div_ceil(DDA_WORKGROUP_SIZE);
+  let sun_div = crate::wesl_consts::gi_consts().sun_div.max(1);
+  let sx = scale.size.x.div_ceil(sun_div).div_ceil(DDA_WORKGROUP_SIZE);
+  let sy = scale.size.y.div_ceil(sun_div).div_ceil(DDA_WORKGROUP_SIZE);
 
   let bx = scale.size.x.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
   let by = scale.size.y.div_ceil(4).div_ceil(crate::brickmap::consts::WORKGROUP_SIZE);
@@ -1795,14 +1803,15 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   let perf_bg0 = aux.as_ref().and_then(|a| a.perf_bg0.as_ref());
   let perf_pipes = (
     pipelines.visible_pipeline.get(&pipeline_cache),
+    pipelines.sun_pipeline.get(&pipeline_cache),
     pipelines.shadow_pipeline.get(&pipeline_cache),
     pipelines.shade_pipeline.get(&pipeline_cache),
     pipelines.glass_pipeline.get(&pipeline_cache),
   );
   warm_mark(&WARM_VIS, "visible", perf_pipes.0.is_some());
-  warm_mark(&WARM_SHADOW, "shadow", perf_pipes.1.is_some());
-  warm_mark(&WARM_SHADE, "shade", perf_pipes.2.is_some());
-  warm_mark(&WARM_GLASS, "glass", perf_pipes.3.is_some());
+  warm_mark(&WARM_SHADOW, "shadow", perf_pipes.2.is_some());
+  warm_mark(&WARM_SHADE, "shade", perf_pipes.3.is_some());
+  warm_mark(&WARM_GLASS, "glass", perf_pipes.4.is_some());
   warm_mark(&WARM_REFL, "refl", pipelines.refl_pipeline.get(&pipeline_cache).is_some());
   let perf_ready = main_ready && refl_ok && glass_ok && perf_bg0.is_some();
 
@@ -1814,6 +1823,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     && perf_pipes.1.is_some()
     && perf_pipes.2.is_some()
     && perf_pipes.3.is_some()
+    && perf_pipes.4.is_some()
     && dda_pipelines_ready(&DdaReadyCtx {
       pipeline_cache: &pipeline_cache,
       pipelines: &pipelines,
@@ -1832,7 +1842,8 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
   if !all_ready {
     return;
   }
-  if let (Some(vis_pipe), Some(shadow_pipe), Some(shade_pipe), Some(glass_pipe)) = perf_pipes
+  if let (Some(vis_pipe), Some(sun_pipe), Some(shadow_pipe), Some(shade_pipe), Some(glass_pipe)) =
+    perf_pipes
     && let Some(pbg0) = perf_bg0
   {
     crate::profiler::gpu_compute_pass(
@@ -1855,6 +1866,28 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
         pass.dispatch_workgroups(gx, gy, 1);
+      },
+    );
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_sun_gather",
+      |pass| {
+        pass.set_pipeline(sun_pipe);
+        bind_perf_groups(
+          pass,
+          &PerfBinds {
+            bg0: pbg0,
+            bg1: &bg1.0,
+            bg2: &bg2.0,
+            bg3: &bg3.0,
+            bg4: gi_b0,
+            bg5: b5,
+            fog_read,
+            refl_write: refl_write_bg,
+          },
+        );
+        pass.dispatch_workgroups(sx, sy, 1);
       },
     );
     crate::profiler::gpu_compute_pass(
@@ -2010,24 +2043,6 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
           },
         );
       }
-      if let Some(pipe) = bg4.resolve_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
-        let groups = bg4.slots().div_ceil(64);
-        crate::profiler::gpu_compute_pass(
-          &mut profiler,
-          ctx.command_encoder(),
-          "gate_gi_resolve",
-          |pass| {
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, gi_view_bg, &[]);
-            pass.set_bind_group(1, &bg1.0, &[]);
-            pass.set_bind_group(2, &bg2.0, &[]);
-            pass.set_bind_group(3, &bg3.0, &[]);
-            pass.set_bind_group(4, gi_b0, &[]);
-            pass.set_bind_group(5, b5, &[]);
-            pass.dispatch_workgroups(groups, 1, 1);
-          },
-        );
-      }
       if let Some(pipe) = bg4.merge_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
         let groups = crate::gi::GI_MERGE_SLOTS.div_ceil(64);
         crate::profiler::gpu_compute_pass(
@@ -2050,6 +2065,25 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         ctx.command_encoder().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
       }
     }
+  }
+
+  if let Some(pipe) = bg4.resolve_pipeline.as_ref().and_then(|p| p.get(&pipeline_cache)) {
+    let groups = bg4.slots().div_ceil(64);
+    crate::profiler::gpu_compute_pass(
+      &mut profiler,
+      ctx.command_encoder(),
+      "gate_gi_resolve",
+      |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, gi_view_bg, &[]);
+        pass.set_bind_group(1, &bg1.0, &[]);
+        pass.set_bind_group(2, &bg2.0, &[]);
+        pass.set_bind_group(3, &bg3.0, &[]);
+        pass.set_bind_group(4, gi_b0, &[]);
+        pass.set_bind_group(5, b5, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+      },
+    );
   }
 
   if refl_ok

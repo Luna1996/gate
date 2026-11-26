@@ -18,6 +18,7 @@ pub struct GiConsts {
   pub lt_top: u32,
   pub lt_event_words: u32,
   pub gi_stat_words: u32,
+  pub sun_div: u32,
 }
 
 const REQUIRED: &[&str] = &[
@@ -31,6 +32,7 @@ const REQUIRED: &[&str] = &[
   "LT_TOP",
   "LT_EVENT_WORDS",
   "GI_STAT_WORDS",
+  "SUN_DIV",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,13 +110,19 @@ impl GiConsts {
       lt_top: get("LT_TOP"),
       lt_event_words: get("LT_EVENT_WORDS"),
       gi_stat_words: get("GI_STAT_WORDS"),
+      sun_div: get("SUN_DIV"),
     };
 
-    if out.irc_words < 16 {
+    if out.irc_words < 17 {
       let msg = format!(
-        "IRC_WORDS = {} 太小（键 2 + 值 + 均值 3 + n + var + stamp + 累加 5）：{out:?}",
+        "IRC_WORDS = {} 太小（键 2 + 值 + 均值 3 + n + var + stamp + 累加 4 + 太阳盘 + 透射色）：{out:?}",
         out.irc_words
       );
+      error!("{msg}");
+      panic!("{msg}");
+    }
+    if !out.sun_div.is_power_of_two() || out.sun_div > 16 {
+      let msg = format!("SUN_DIV 必须是 2 的幂且 ≤16：{out:?}");
       error!("{msg}");
       panic!("{msg}");
     }

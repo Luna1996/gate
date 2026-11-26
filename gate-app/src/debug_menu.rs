@@ -390,6 +390,10 @@ fn register_callbacks(world: &mut World) {
           base.shadow = *on;
           info!("直光阴影 → {}", if *on { "on" } else { "off" });
         }
+        ("render/base/soft_shadow", MenuAction::Toggle(on)) => {
+          base.soft_shadow = *on;
+          info!("软阴影 → {}", if *on { "on" } else { "off（单条硬阴影）" });
+        }
         ("render/base/normal", MenuAction::Toggle(on)) => {
           base.implicit_normal = *on;
           info!("隐式法相 → {}", if *on { "on" } else { "off（原色直出）" });

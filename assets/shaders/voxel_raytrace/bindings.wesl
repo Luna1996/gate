@@ -146,6 +146,8 @@ const BASE_FLAG_IMPLICIT_NORMAL: u32 = 2u;
 
 const BASE_FLAG_VOL_TINT: u32 = 4u;
 
+const BASE_FLAG_SOFT_SHADOW: u32 = 32u;
+
 struct GiUniform {
   params: vec4<f32>,
 

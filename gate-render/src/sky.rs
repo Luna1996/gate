@@ -323,7 +323,7 @@ fn apply_sky(
   if let Some(mut theme) = theme {
     theme.sun = Some(DirLightCfg {
       dir: (-body.dir).to_array(),
-      angular_radius_deg: 0.0,
+      angular_radius_deg: radius_deg.max(0.0),
       color: light_color,
       intensity: k.light_intensity,
       disk_scale: k.disk_scale,

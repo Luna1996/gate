@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 const ENTRY_POINTS: &[&str] = &[
   "dda_visible",
+  "sun_gather",
   "dda_shadow",
   "dda_shade",
   "dda_glass",

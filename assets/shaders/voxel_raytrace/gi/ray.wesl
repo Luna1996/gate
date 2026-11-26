@@ -1,4 +1,4 @@
-import package::bindings::{BASE_FLAG_SHADOW, gi_u, light_u};
+import package::bindings::{BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, gi_u, light_u};
 import package::common::{MATERIAL_DEBUG_NONE, MaterialParams, emissive_radiance, face_of_normal, fetch_material};
 import package::brickmap::{Grid};
 import package::gi::common::{gi_cos_hemisphere, gi_enabled, gi_mix, gi_rand2};
@@ -65,12 +65,22 @@ fn gi_emission(s: GiSurface, recv_p: vec3<f32>, recv_n: vec3<f32>, to_recv: vec3
 
 fn gi_hit_radiance(s: GiSurface) -> vec3<f32> {
   let c = irc_lookup(s.addr, s.face);
-  let sun = select(gi_sun_vis(s), c.sun, c.sun_ok);
+  var sun = 1.0;
+  var sun_tint = vec3<f32>(1.0);
+  if ((light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
+    if ((light_u.g.base_flags & BASE_FLAG_SOFT_SHADOW) != 0u) {
+      sun = select(gi_sun_vis(s), c.sun, c.sun_ok);
+      sun_tint = select(vec3<f32>(1.0), c.tint, c.sun_ok);
+    } else {
+      sun = gi_sun_vis(s);
+    }
+  }
   let hemi = 0.5 + 0.5 * max(s.n.y, 0.0);
   let cold = sky_ambient(s.n) * (GI_FALLBACK * hemi);
   let indirect = mix(cold, c.e, c.conf);
   let kd = 1.0 - s.m.metallic;
-  return kd * s.m.albedo * (gi_sun_c() * (gi_ndl(s) * sun / GI_PI) + indirect);
+  return kd * s.m.albedo
+    * (gi_sun_c() * sun_tint * (gi_ndl(s) * sun / GI_PI) + indirect);
 }
 
 fn gi_leaf_irradiance(s: GiSurface, seed: u32) -> vec3<f32> {
@@ -105,14 +115,8 @@ fn gi_leaf_indirect(s: GiSurface, seed: u32) -> vec3<f32> {
   return rad * tint;
 }
 
-fn gi_accumulate(s: GiSurface, seed: u32, sun: f32) {
+fn gi_accumulate(s: GiSurface, seed: u32) {
   if (!gi_enabled()) { return; }
-  var sun_v = sun;
-  if (sun_v < 0.0) { sun_v = gi_sun_vis(s); }
   let sample = gi_leaf_irradiance(s, seed);
-  irc_accumulate(s.addr, s.n, sample, true, sun_v, gi_rand2(gi_mix(seed + 0x9E3779B9u)));
-}
-
-fn gi_accumulate_sun(s: GiSurface, seed: u32, sun: f32) {
-  irc_accumulate(s.addr, s.n, vec3<f32>(0.0), false, sun, gi_rand2(gi_mix(seed + 0x517CC1B7u)));
+  irc_accumulate(s.addr, s.n, sample, true, gi_rand2(gi_mix(seed + 0x9E3779B9u)));
 }

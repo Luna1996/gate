@@ -73,6 +73,7 @@ impl Default for ReflectionSettings {
 #[extract_app(bevy::render::RenderApp)]
 pub struct BaseSettings {
   pub shadow: bool,
+  pub soft_shadow: bool,
   pub implicit_normal: bool,
   pub vol_tint: bool,
   pub glass_quality: u32,
@@ -83,9 +84,11 @@ impl BaseSettings {
   pub const FLAG_IMPLICIT_NORMAL: u32 = 1 << 1;
   pub const FLAG_VOL_TINT: u32 = 1 << 2;
   pub const GLASS_QUALITY_SHIFT: u32 = 3;
+  pub const FLAG_SOFT_SHADOW: u32 = 1 << 5;
 
   pub fn flags(&self) -> u32 {
     (if self.shadow { Self::FLAG_SHADOW } else { 0 })
+      | (if self.soft_shadow { Self::FLAG_SOFT_SHADOW } else { 0 })
       | (if self.implicit_normal { Self::FLAG_IMPLICIT_NORMAL } else { 0 })
       | (if self.vol_tint { Self::FLAG_VOL_TINT } else { 0 })
       | ((self.glass_quality & 3) << Self::GLASS_QUALITY_SHIFT)
@@ -94,7 +97,13 @@ impl BaseSettings {
 
 impl Default for BaseSettings {
   fn default() -> Self {
-    Self { shadow: true, implicit_normal: true, vol_tint: false, glass_quality: 2 }
+    Self {
+      shadow: true,
+      soft_shadow: true,
+      implicit_normal: true,
+      vol_tint: false,
+      glass_quality: 2,
+    }
   }
 }
 
@@ -181,7 +190,12 @@ pub fn build_light_pool(theme: &LightingTheme) -> LightPoolUniform {
     u.lights[0] = LightDesc {
       kind_pos_dir: Vec4::new(0.0, l.x, l.y, l.z),
       color_intensity: Vec4::new(sun.color[0], sun.color[1], sun.color[2], sun.intensity),
-      shape: Vec4::new(sun.disk_scale.max(0.0), 0.0, 0.0, 0.0),
+      shape: Vec4::new(
+        sun.disk_scale.max(0.0),
+        sun.angular_radius_deg.to_radians().max(0.0),
+        0.0,
+        0.0,
+      ),
     };
     u.g.count = 1;
   }

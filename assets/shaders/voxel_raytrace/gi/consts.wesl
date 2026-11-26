@@ -13,7 +13,7 @@ const GI_SAMPLE_CLAMP: f32 = 16.0;
 const LT_NEE_MAX_D: f32 = 2048.0;
 const SHADOW_SURFACE_EPS: f32 = 0.03125;
 
-const IRC_WORDS: u32 = 16u;
+const IRC_WORDS: u32 = 17u;
 const IRC_BUCKET: u32 = 8u;
 const IRC_CHAIN: u32 = 4u;
 const IRC_MAX_LEVEL: u32 = 11u;
@@ -39,7 +39,12 @@ const IRC_HET_K: f32 = 4.0;
 const IRC_HET_ALPHA: f32 = 0.25;
 const IRC_HET_MIN: u32 = 3u;
 const IRC_HET_SE_MAX: f32 = 0.25;
-const IRC_SUN_ALPHA: f32 = 0.125;
+
+// 直光软阴影：太阳盘固定 16 个方向，每帧抽样 4 个；槽按位翻转顺序铺开，
+// 任意前缀都覆盖盘面。每格结果只取决于格子键 + 槽号，静止场景不会变化。
+const SUN_SLOTS: u32 = 16u;
+const SUN_SPP: u32 = 4u;
+const SUN_DIV: u32 = 4u;
 
 const GI_SPP_MAX: u32 = 8u;
 const GI_NEE_STATIC: u32 = 2u;

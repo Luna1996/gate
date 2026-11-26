@@ -1,8 +1,7 @@
 import package::bindings::{gi_stats, gi_u, irc, irc_key, lt_event, view_u};
 import package::brickmap::{Grid};
-import package::common::{face_normal_from_index};
 import package::gi::common::{gi_div, gi_mix};
-import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, GI_STAT_IRC_LOCKED, GI_STAT_IRC_ORPHAN, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVENT_N, IRC_EVICT_GUARD, IRC_EVICT_PRESSURE, IRC_FALLBACK_LEVELS, IRC_HET_ALPHA, IRC_HET_K, IRC_HET_MIN, IRC_HET_SE_MAX, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_RV_K, IRC_RV_MAX, IRC_RV_MIN, IRC_RV_PRIOR, IRC_SIG_HI, IRC_SIG_LO, IRC_SUN_ALPHA, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2, LT_EVENT_CAP};
+import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, GI_STAT_IRC_LOCKED, GI_STAT_IRC_ORPHAN, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVENT_N, IRC_EVICT_GUARD, IRC_EVICT_PRESSURE, IRC_FALLBACK_LEVELS, IRC_HET_ALPHA, IRC_HET_K, IRC_HET_MIN, IRC_HET_SE_MAX, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_RV_K, IRC_RV_MAX, IRC_RV_MIN, IRC_RV_PRIOR, IRC_SIG_HI, IRC_SIG_LO, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2, LT_EVENT_CAP, SUN_SLOTS, SUN_SPP};
 import package::trace::{grid_is_far, make_grid};
 import package::world::{voxel_center_world};
 
@@ -16,8 +15,10 @@ const IRC_W_SAMPLED: u32 = 8u;
 const IRC_W_RV: u32 = 9u;
 const IRC_W_ACC: u32 = 10u;
 const IRC_W_ACC_W: u32 = 13u;
-const IRC_W_ACC_SUN: u32 = 14u;
+// 16 槽 × 2 bit：0 未采样，1/2/3 = 可见度 0/0.5/1。
+const IRC_W_SUN: u32 = 14u;
 const IRC_W_HET: u32 = 15u;
+const IRC_W_SUN_TINT: u32 = 16u;
 
 const IRC_NONE: u32 = 0xFFFFFFFFu;
 const IRC_LOCK: u32 = 1u;
@@ -115,6 +116,14 @@ fn irc_decode(k: vec2<u32>) -> IrcCell {
 
 fn irc_slot_count() -> u32 {
   return arrayLength(&irc) / IRC_WORDS;
+}
+
+fn irc_sun_mean(mask: u32) -> vec2<f32> {
+  let lo = mask & 0x55555555u;
+  let hi = (mask >> 1u) & 0x55555555u;
+  let seen = countOneBits(lo | hi);
+  let sum = 2u * countOneBits(hi) + countOneBits(lo) - seen;
+  return vec2<f32>(f32(sum) / (2.0 * f32(max(seen, 1u))), f32(seen));
 }
 
 fn irc_bucket_base(k: vec2<u32>) -> u32 {
@@ -220,6 +229,52 @@ fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
   return IrcAddr(v, obj, level, per * per);
 }
 
+struct SunVis {
+  vis: f32,
+  tint: vec3<f32>,
+  ok: bool,
+}
+
+fn irc_sun_tint(raw: u32) -> vec3<f32> {
+  return select(vec3<f32>(1.0), rgb9e5_unpack(raw), raw != 0u);
+}
+
+fn irc_sun_lookup(a: IrcAddr, face: u32) -> SunVis {
+  for (var i = 0u; i < IRC_FALLBACK_LEVELS; i = i + 1u) {
+    let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level + i, face, a.obj)));
+    if (s == IRC_NONE) { continue; }
+    let b = s * IRC_WORDS;
+    let m = irc_sun_mean(atomicLoad(&irc[b + IRC_W_SUN]));
+    if (m.y < 0.5) { continue; }
+    return SunVis(m.x, irc_sun_tint(atomicLoad(&irc[b + IRC_W_SUN_TINT])), true);
+  }
+  return SunVis(0.0, vec3<f32>(1.0), false);
+}
+
+fn irc_sun_next(a: IrcAddr, face: u32) -> u32 {
+  let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level, face, a.obj)));
+  if (s == IRC_NONE) { return 0u; }
+  let mask = atomicLoad(&irc[s * IRC_WORDS + IRC_W_SUN]);
+  for (var i = 0u; i < SUN_SLOTS; i = i + 1u) {
+    if (((mask >> (i * 2u)) & 3u) == 0u) { return i; }
+  }
+  return (gi_u.seq.x * SUN_SPP) & (SUN_SLOTS - 1u);
+}
+
+fn irc_sun_sample(a: IrcAddr, face: u32, slot: u32, vis: f32, tint: vec3<f32>) {
+  let s = irc_claim(irc_cell_key(irc_cell_of(a.v, a.level, face, a.obj)));
+  if (s == IRC_NONE) { return; }
+  let b = s * IRC_WORDS;
+  let sh = slot * 2u;
+  let state = 1u + u32(clamp(vis, 0.0, 1.0) * 2.0 + 0.5);
+  atomicAnd(&irc[b + IRC_W_SUN], ~(3u << sh));
+  atomicOr(&irc[b + IRC_W_SUN], state << sh);
+  if (vis > 0.0 && (slot == 0u || atomicLoad(&irc[b + IRC_W_SUN_TINT]) == 0u)) {
+    atomicStore(&irc[b + IRC_W_SUN_TINT], rgb9e5_pack(max(tint, vec3<f32>(0.0005))));
+  }
+  atomicStore(&irc[b + IRC_W_STAMP], gi_u.seq.x);
+}
+
 fn irc_tap(k: vec2<u32>) -> vec4<f32> {
   let s = irc_find(k);
   if (s == IRC_NONE) { return vec4<f32>(0.0); }
@@ -283,13 +338,14 @@ struct IrcHit {
   e: vec3<f32>,
   conf: f32,
   sun: f32,
+  tint: vec3<f32>,
   sun_ok: bool,
   n: f32,
   fresh: bool,
 }
 
 fn irc_lookup(a: IrcAddr, face: u32) -> IrcHit {
-  var out = IrcHit(vec3<f32>(0.0), 0.0, 0.0, false, 0.0, false);
+  var out = IrcHit(vec3<f32>(0.0), 0.0, 0.0, vec3<f32>(1.0), false, 0.0, false);
   let frame = gi_u.seq.x;
   for (var i = 0u; i < IRC_FALLBACK_LEVELS; i = i + 1u) {
     let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level + i, face, a.obj)));
@@ -301,9 +357,13 @@ fn irc_lookup(a: IrcAddr, face: u32) -> IrcHit {
       out.n = bitcast<f32>(atomicLoad(&irc[b + IRC_W_N]));
       out.fresh = out.n >= 1.0 && (frame - atomicLoad(&irc[b + IRC_W_SAMPLED])) <= 1u;
     }
-    if (!out.sun_ok && ((meta_w >> 16u) & 0xFu) != 0u) {
-      out.sun = f32((meta_w >> 8u) & 0xFFu) * (1.0 / 255.0);
-      out.sun_ok = true;
+    if (!out.sun_ok) {
+      let sm = irc_sun_mean(atomicLoad(&irc[b + IRC_W_SUN]));
+      if (sm.y > 0.5) {
+        out.sun = sm.x;
+        out.tint = irc_sun_tint(atomicLoad(&irc[b + IRC_W_SUN_TINT]));
+        out.sun_ok = true;
+      }
     }
     let conf = f32(meta_w & 0xFFu) * (1.0 / 255.0);
     if (out.conf <= 0.0 && conf > 0.0) {
@@ -315,14 +375,11 @@ fn irc_lookup(a: IrcAddr, face: u32) -> IrcHit {
   return out;
 }
 
-fn irc_accumulate(a: IrcAddr, n_in: vec3<f32>, e: vec3<f32>, has_e: bool, sun: f32,
-                  rnd: vec2<f32>) {
+fn irc_accumulate(a: IrcAddr, n_in: vec3<f32>, e: vec3<f32>, has_e: bool, rnd: vec2<f32>) {
   let n = select(n_in, vec3<f32>(0.0, 1.0, 0.0), dot(n_in, n_in) < 1e-6);
   let w = n * n;
   var ev = min(e, vec3<f32>(IRC_V_MAX));
   ev = select(vec3<f32>(0.0), ev, ev >= vec3<f32>(0.0));
-  var sunq = 0u;
-  if (sun >= 0.0) { sunq = (1u << 20u) | u32(clamp(sun, 0.0, 1.0) * 255.0 + 0.5); }
   for (var ax = 0u; ax < 3u; ax = ax + 1u) {
     if (w[ax] < IRC_W_MIN) { continue; }
     let face = ax * 2u + select(0u, 1u, n[ax] > 0.0);
@@ -349,13 +406,8 @@ fn irc_accumulate(a: IrcAddr, n_in: vec3<f32>, e: vec3<f32>, has_e: bool, sun: f
         atomicAdd(&irc[b + IRC_W_ACC + 2u], q.z);
         atomicAdd(&irc[b + IRC_W_ACC_W], wq);
       }
-      if (sunq != 0u) { atomicAdd(&irc[b + IRC_W_ACC_SUN], sunq); }
     }
   }
-}
-
-fn irc_accumulate_sun(a: IrcAddr, face: u32, sun: f32, rnd: vec2<f32>) {
-  irc_accumulate(a, face_normal_from_index(face), vec3<f32>(0.0), false, sun, rnd);
 }
 
 struct IrcPar {
@@ -408,9 +460,8 @@ fn irc_resolve_slot(s: u32) {
   if (k1 == IRC_LOCK) { atomicAdd(&gi_stats[GI_STAT_IRC_LOCKED], 1u); }
   let frame = gi_u.seq.x;
   let wq = atomicLoad(&irc[b + IRC_W_ACC_W]);
-  let sunq = atomicLoad(&irc[b + IRC_W_ACC_SUN]);
   var stamp = atomicLoad(&irc[b + IRC_W_STAMP]);
-  if (wq != 0u || sunq != 0u) { stamp = frame; }
+  if (wq != 0u) { stamp = frame; }
   let age = frame - stamp;
   var evict = k1 == IRC_LOCK || age > gi_u.seq.y;
   if (!evict && age > IRC_EVICT_PRESSURE) {
@@ -459,9 +510,6 @@ fn irc_resolve_slot(s: u32) {
                        bitcast<f32>(atomicLoad(&irc[b + IRC_W_MEAN + 2u])));
   var varr = bitcast<f32>(atomicLoad(&irc[b + IRC_W_VAR]));
   var streak = (meta_w >> 20u) & 3u;
-  var sun8 = (meta_w >> 8u) & 0xFFu;
-  var sun_n = (meta_w >> 16u) & 0xFu;
-  if (gi_u.flags.z > 0.5) { sun_n = 0u; }
   var share = 0.0;
 
   if (wq != 0u) {
@@ -498,13 +546,6 @@ fn irc_resolve_slot(s: u32) {
     atomicStore(&irc[b + IRC_W_MEAN + 1u], bitcast<u32>(mean.y));
     atomicStore(&irc[b + IRC_W_MEAN + 2u], bitcast<u32>(mean.z));
     atomicStore(&irc[b + IRC_W_VAR], bitcast<u32>(varr));
-  }
-  if (sunq != 0u) {
-    let v = f32(sunq & 0xFFFFFu) / (255.0 * f32(max(sunq >> 20u, 1u)));
-    let a = max(1.0 / f32(sun_n + 1u), IRC_SUN_ALPHA);
-    sun8 = u32(clamp(mix(f32(sun8) * (1.0 / 255.0), v, a), 0.0, 1.0) * 255.0 + 0.5);
-    sun_n = min(sun_n + 1u, 15u);
-    atomicStore(&irc[b + IRC_W_ACC_SUN], 0u);
   }
   atomicStore(&irc[b + IRC_W_N], bitcast<u32>(n));
   atomicStore(&irc[b + IRC_W_STAMP], stamp);
@@ -557,5 +598,5 @@ fn irc_resolve_slot(s: u32) {
   atomicStore(&irc[b + IRC_W_VAL], rgb9e5_pack(out_e));
   atomicStore(&irc[b + IRC_W_META],
               (meta_w & 0xFF000000u) | u32(clamp(out_c, 0.0, 1.0) * 255.0 + 0.5)
-              | (sun8 << 8u) | (sun_n << 16u) | (streak << 20u));
+              | (streak << 20u));
 }

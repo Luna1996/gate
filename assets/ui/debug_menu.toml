@@ -95,6 +95,13 @@ label = "menu.render.base.shadow"
 checked = true
 tooltip = "menu.render.base.shadow.tip"
 
+[[items.children.children]]
+kind = "toggle"
+id = "soft_shadow"
+label = "menu.render.base.soft_shadow"
+checked = true
+tooltip = "menu.render.base.soft_shadow.tip"
+
 [[items.children]]
 kind = "sub_menu"
 id = "gi"
