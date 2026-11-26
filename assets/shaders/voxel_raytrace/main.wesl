@@ -407,6 +407,8 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
     if (h_continue) {
       h_local = h_local - hf0 * hamb;
     }
+    h_local = aerial_perspective(h_local, voxel_center_world(hgg, h.voxel),
+                                 view_u.cam_pos_voxel.xyz);
     refl_env = refl_env + chain_w * r_tint * h_local;
     if (!h_continue) { break; }
     let h_mirror_dir = reflect(-hv, hn);
@@ -746,6 +748,7 @@ fn refl_shade_ray(org: vec3<f32>, dir: vec3<f32>, tier: u32,
     rc = brdf_reflected(mr, rn, face_view_dir(org, r_vc),
                         SurfaceLight(sun_dir, sun_c * r_vis, 1.0, sky * GLASS_REFL_AMBIENT, r_gi))
       + emissive_radiance(mr, gi_emit_gain());
+    rc = aerial_perspective(rc, r_vc, view_u.cam_pos_voxel.xyz);
   }
   return rc;
 }
