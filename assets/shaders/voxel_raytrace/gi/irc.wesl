@@ -1,4 +1,4 @@
-import package::bindings::{gi_stats, gi_u, irc, irc_key, lt_event, view_u};
+import package::bindings::{gi_stats, gi_u, irc, irc_key, light_u, lt_event, view_u};
 import package::brickmap::{Grid};
 import package::gi::common::{gi_div, gi_mix};
 import package::gi::consts::{GI_LUMA, GI_STAT_IRC_DROP, GI_STAT_IRC_EVICT, GI_STAT_IRC_LIVE, GI_STAT_IRC_LOCKED, GI_STAT_IRC_ORPHAN, IRC_ACC_SCALE, IRC_BUCKET, IRC_CHAIN, IRC_EVENT_N, IRC_EVICT_GUARD, IRC_EVICT_PRESSURE, IRC_FALLBACK_LEVELS, IRC_HET_ALPHA, IRC_HET_K, IRC_HET_MIN, IRC_HET_SE_MAX, IRC_MAX_LEVEL, IRC_N_HALF, IRC_PARENT_CONF, IRC_RV_K, IRC_RV_MAX, IRC_RV_MIN, IRC_RV_PRIOR, IRC_SIG_HI, IRC_SIG_LO, IRC_V_MAX, IRC_VAR_ALPHA, IRC_W_MIN, IRC_WORDS, IRC_Z2, LT_EVENT_CAP, SUN_SLOTS, SUN_SPP};
@@ -19,6 +19,9 @@ const IRC_W_ACC_W: u32 = 13u;
 const IRC_W_SUN: u32 = 14u;
 const IRC_W_HET: u32 = 15u;
 const IRC_W_SUN_TINT: u32 = 16u;
+
+const IRC_META_SUN_SHIFT: u32 = 8u;
+const IRC_META_SUN_MASK: u32 = 0xFFFu;
 
 const IRC_NONE: u32 = 0xFFFFFFFFu;
 const IRC_LOCK: u32 = 1u;
@@ -253,11 +256,42 @@ fn irc_sun_tint(raw: u32) -> vec3<f32> {
   return select(vec3<f32>(1.0), rgb9e5_unpack(raw), raw != 0u);
 }
 
+fn irc_sun_code() -> u32 {
+  let l = light_u.lights[0].kind_pos_dir.yzw;
+  let r = light_u.lights[0].shape.y;
+  let h = gi_mix(bitcast<u32>(l.x)
+    ^ gi_mix(bitcast<u32>(l.y)
+    ^ gi_mix(bitcast<u32>(l.z)
+    ^ gi_mix(bitcast<u32>(r) ^ gi_u.seq.z))));
+  return h & IRC_META_SUN_MASK;
+}
+
+// code 变化时清空旧方向槽位；之后只写当前 code 的样本。
+// 读取端 code 不匹配直接判无效，回退单条当前太阳方向的硬阴影，避免残影。
+fn irc_sun_begin(a: IrcAddr, face: u32) -> bool {
+  let s = irc_claim(irc_cell_key(irc_cell_of(a.v, a.level, face, a.obj)));
+  if (s == IRC_NONE) { return false; }
+  let b = s * IRC_WORDS;
+  let code = irc_sun_code();
+  let meta_w = atomicLoad(&irc[b + IRC_W_META]);
+  if (((meta_w >> IRC_META_SUN_SHIFT) & IRC_META_SUN_MASK) == code) { return true; }
+  atomicStore(&irc[b + IRC_W_SUN], 0u);
+  atomicStore(&irc[b + IRC_W_SUN_TINT], 0u);
+  atomicStore(&irc[b + IRC_W_META],
+              (meta_w & ~(IRC_META_SUN_MASK << IRC_META_SUN_SHIFT))
+              | (code << IRC_META_SUN_SHIFT));
+  atomicStore(&irc[b + IRC_W_STAMP], gi_u.seq.x);
+  return false;
+}
+
 fn irc_sun_lookup(a: IrcAddr, face: u32) -> SunVis {
+  let code = irc_sun_code();
   for (var i = 0u; i < IRC_FALLBACK_LEVELS; i = i + 1u) {
     let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level + i, face, a.obj)));
     if (s == IRC_NONE) { continue; }
     let b = s * IRC_WORDS;
+    let meta_w = atomicLoad(&irc[b + IRC_W_META]);
+    if (((meta_w >> IRC_META_SUN_SHIFT) & IRC_META_SUN_MASK) != code) { continue; }
     let m = irc_sun_mean(atomicLoad(&irc[b + IRC_W_SUN]));
     if (m.y < 0.5) { continue; }
     return SunVis(m.x, irc_sun_tint(atomicLoad(&irc[b + IRC_W_SUN_TINT])), true);
@@ -361,6 +395,7 @@ struct IrcHit {
 fn irc_lookup(a: IrcAddr, face: u32) -> IrcHit {
   var out = IrcHit(vec3<f32>(0.0), 0.0, 0.0, vec3<f32>(1.0), false, 0.0, false);
   let frame = gi_u.seq.x;
+  let code = irc_sun_code();
   for (var i = 0u; i < IRC_FALLBACK_LEVELS; i = i + 1u) {
     let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level + i, face, a.obj)));
     if (s == IRC_NONE) { continue; }
@@ -371,7 +406,7 @@ fn irc_lookup(a: IrcAddr, face: u32) -> IrcHit {
       out.n = bitcast<f32>(atomicLoad(&irc[b + IRC_W_N]));
       out.fresh = out.n >= 1.0 && (frame - atomicLoad(&irc[b + IRC_W_SAMPLED])) <= 1u;
     }
-    if (!out.sun_ok) {
+    if (!out.sun_ok && ((meta_w >> IRC_META_SUN_SHIFT) & IRC_META_SUN_MASK) == code) {
       let sm = irc_sun_mean(atomicLoad(&irc[b + IRC_W_SUN]));
       if (sm.y > 0.5) {
         out.sun = sm.x;
@@ -611,6 +646,8 @@ fn irc_resolve_slot(s: u32) {
   atomicStore(&irc[b + IRC_W_RV], irc_stat_pack(IrcStat(rv, rv_mean, het)));
   atomicStore(&irc[b + IRC_W_VAL], rgb9e5_pack(out_e));
   atomicStore(&irc[b + IRC_W_META],
-              (meta_w & 0xFF000000u) | u32(clamp(out_c, 0.0, 1.0) * 255.0 + 0.5)
+              (meta_w & 0xFF000000u)
+              | (meta_w & (IRC_META_SUN_MASK << IRC_META_SUN_SHIFT))
+              | u32(clamp(out_c, 0.0, 1.0) * 255.0 + 0.5)
               | (streak << 20u));
 }

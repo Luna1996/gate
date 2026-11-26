@@ -2,7 +2,7 @@ import package::bindings::{light_u};
 import package::brickmap::{Grid};
 import package::gi::common::{gi_mix, gi_rand2};
 import package::gi::consts::{SHADOW_SURFACE_EPS, SUN_SLOTS, SUN_SPP};
-import package::gi::irc::{IrcAddr, irc_cell_key, irc_cell_of, irc_sun_next, irc_sun_sample};
+import package::gi::irc::{IrcAddr, irc_cell_key, irc_cell_of, irc_sun_begin, irc_sun_next, irc_sun_sample};
 import package::world::{face_normal_world, surface_offset, world_trace_medium_scene};
 
 const SUN_GOLDEN: f32 = 2.39996323;
@@ -80,8 +80,15 @@ fn sun_gather_cell(g: Grid, a: IrcAddr, face: u32, n: vec3<f32>, voxel: vec3<i32
                    obj_id: i32) {
   let seed = sun_cell_seed(a, face);
   let p = sun_cell_origin(g, a, face, n);
-  let base = irc_sun_next(a, face);
-  for (var i = 0u; i < SUN_SPP; i = i + 1u) {
+  let ok = irc_sun_begin(a, face);
+  var base = 0u;
+  // code 变化首帧补两倍方向；同一格的其他采样线程会继续填满空槽。
+  var count = SUN_SPP * 2u;
+  if (ok) {
+    base = irc_sun_next(a, face);
+    count = SUN_SPP;
+  }
+  for (var i = 0u; i < count; i = i + 1u) {
     let slot = (base + i) & (SUN_SLOTS - 1u);
     let ray = sun_vis_dir(p, sun_sample_dir(seed, slot), voxel, obj_id, a.level);
     irc_sun_sample(a, face, slot, ray.vis, ray.tint);
