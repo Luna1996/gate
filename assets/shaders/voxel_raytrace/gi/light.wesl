@@ -540,8 +540,6 @@ fn lt_tile_free(s: u32) {
   atomicStore(&lt_tile_key[s * 2u + 1u], 0u);
 }
 
-// 灯事件：dispatch 每帧清零计数头，本帧 sweep/register 产、resolve 同帧消费。
-// 中心为世界坐标、半径按旧功率或新灯亮度估计，覆盖灯的影响域。
 fn lt_event_push(center: vec3<f32>, radius: f32) {
   let i = atomicAdd(&lt_event[0], 1u);
   atomicAdd(&gi_stats[GI_STAT_LT_EVENT], 1u);
@@ -582,9 +580,6 @@ fn lt_sweep_tile(s: u32) {
   var evict = pop == 0u || frame - atomicLoad(&lt_tile[b + LT_T_STAMP]) > LT_EVICT_FRAMES;
   let g = make_grid(t.obj);
   if (!evict) {
-    // 成员验活：新鲜瓦片 1 位/帧；随陈旧（停止注册，疑似已删）按龄平方升级，
-    // 删除的自发光面在数十帧内退出 NEE 功率树，而不是等 1 位/帧 巡检
-    // 或整瓦 LT_EVICT_FRAMES 超时。遇存活位即停，活跃瓦片开销不变。
     let age = frame - atomicLoad(&lt_tile[b + LT_T_STAMP]);
     let checks = 1u + min(63u, age * age / 64u);
     let seed = gi_mix(s * 0x9E3779B1u + frame * 0x85EBCA77u);
@@ -624,8 +619,6 @@ fn lt_sweep_tile(s: u32) {
   }
   let leaf = vec3<i32>(floor(center)) >> vec3<u32>(LT_LEAF_LEVEL);
   var p_old = atomicLoad(&lt_tile[b + LT_T_POWER]);
-  // 死亡半径用瓦片生前功率（清链后 p_old 归零），整瓦逐出 = 光配置突变，
-  // 广播事件让半径内 IRC 条目立刻降信任重建。
   let p_death = p_old;
   let old_leaf = vec3<i32>(bitcast<i32>(atomicLoad(&lt_tile[b + LT_T_CELL])),
                            bitcast<i32>(atomicLoad(&lt_tile[b + LT_T_CELL + 1u])),
@@ -643,10 +636,6 @@ fn lt_sweep_tile(s: u32) {
     p_old = 0u;
   }
   if (evict) {
-    // 死亡广播只认「真死」：位被清光（pop==0，sweep 亲自确认面已不存在）
-    // 且 16 帧内无人再注册（误杀/维护性迁移下帧就会被可见着色注册回来，
-    // 不满足门槛 ⇒ 不广播；夜景大楼瓦片在容量压力下腾空重 claim 也不会
-    // 触发事件风暴）。删灯 → 位清光 ≈0.7s + 门槛 0.27s ≈ 1s 内广播。
     if (p_death > 0u && pop == 0u && frame - atomicLoad(&lt_tile[b + LT_T_STAMP]) > 16u) {
       lt_event_push(center, lt_event_radius(p_death));
     }

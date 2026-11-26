@@ -15,7 +15,6 @@ const IRC_W_SAMPLED: u32 = 8u;
 const IRC_W_RV: u32 = 9u;
 const IRC_W_ACC: u32 = 10u;
 const IRC_W_ACC_W: u32 = 13u;
-// 16 槽 × 2 bit：0 未采样，1/2/3 = 可见度 0/0.5/1。
 const IRC_W_SUN: u32 = 14u;
 const IRC_W_HET: u32 = 15u;
 const IRC_W_SUN_TINT: u32 = 16u;
@@ -23,7 +22,6 @@ const IRC_W_SUN_TINT: u32 = 16u;
 const IRC_META_SUN_SHIFT: u32 = 8u;
 const IRC_META_SUN_MASK: u32 = 0xFFFu;
 
-// 距离 LOD 切换前用父级预混最后一段，避免全局光变化瞬态在层级边界留下弧线。
 const IRC_LOD_BLEND: f32 = 0.2;
 
 const IRC_NONE: u32 = 0xFFFFFFFFu;
@@ -241,7 +239,6 @@ fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
   return IrcAddr(v, obj, level, per * per, parent);
 }
 
-// 直光太阳阴影固定 level0，逐体素，不跟随 GI 的距离 LOD 变粗。
 fn sun_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
   var v = voxel;
   var obj = 0u;
@@ -275,9 +272,6 @@ fn irc_sun_code() -> u32 {
   return h & IRC_META_SUN_MASK;
 }
 
-// 同一太阳 code 下 16 槽全满后可见度已确定；移动相机只改变新露出的格子，
-// 已满的格子重复采样只会得到相同结果。返回 0=需采样，1=本帧首次命中，2=本帧已命中。
-// 命中时刷新 stamp，避免可见条目按年龄回收。
 fn irc_sun_cached(a: IrcAddr, face: u32) -> u32 {
   let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level, face, a.obj)));
   if (s == IRC_NONE) { return 0u; }
@@ -294,8 +288,6 @@ fn irc_sun_cached(a: IrcAddr, face: u32) -> u32 {
   return 2u;
 }
 
-// code 变化时清空旧方向槽位；之后只写当前 code 的样本。
-// 读取端 code 不匹配直接判无效，回退单条当前太阳方向的硬阴影，避免残影。
 fn irc_sun_begin(a: IrcAddr, face: u32) -> bool {
   let s = irc_claim(irc_cell_key(irc_cell_of(a.v, a.level, face, a.obj)));
   if (s == IRC_NONE) { return false; }
@@ -562,9 +554,6 @@ fn irc_resolve_slot(s: u32) {
   }
   atomicAdd(&gi_stats[GI_STAT_IRC_LIVE], 1u);
 
-  // 灯事件（本帧 sweep/register 广播的灯生死）：条目世界中心落在事件半径内
-  // ⇒ 一次性降信任（n 钳到 IRC_EVENT_N），新样本立刻占主导。灯死亡的反弹
-  // 重建靠 streak 级联要几十秒（间接面靠邻域逐层传播），事件跳过级联。
   let ev_count = min(atomicLoad(&lt_event[0]), LT_EVENT_CAP);
   var n = min(bitcast<f32>(atomicLoad(&irc[b + IRC_W_N])) * gi_u.misc.z, gi_u.params.w);
   if (ev_count > 0u) {

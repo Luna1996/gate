@@ -40,8 +40,6 @@ const IRC_HET_ALPHA: f32 = 0.25;
 const IRC_HET_MIN: u32 = 3u;
 const IRC_HET_SE_MAX: f32 = 0.25;
 
-// 直光软阴影：太阳盘固定 16 个方向，每帧抽样 4 个；槽按位翻转顺序铺开，
-// 任意前缀都覆盖盘面。每格结果只取决于格子键 + 槽号，静止场景不会变化。
 const SUN_SLOTS: u32 = 16u;
 const SUN_SPP: u32 = 4u;
 const SUN_DIV: u32 = 2u;
@@ -64,10 +62,6 @@ const LT_POWER_MAX: u32 = 1048576u;
 const LT_MAX_DIST: f32 = 65536.0;
 const LT_SHADOW_EPS: f32 = 0.02;
 
-// 灯事件通道：发光瓦片生死时广播（中心 ×3 + 半径 ×1），irc_resolve 对
-// 半径内条目一次性降信任，跳过 streak 级联（间接光靠邻域逐层传播要几十秒）。
-// 布局：[0]=计数头，[1..1+CAP*4]=事件。每帧由 dispatch 清零，sweep 产、
-// resolve 同帧消费（同一 encoder 内 pass 顺序保证）。
 const LT_EVENT_CAP: u32 = 8u;
 const LT_EVENT_R_MIN: f32 = 96.0;
 const LT_EVENT_R_MAX: f32 = 640.0;

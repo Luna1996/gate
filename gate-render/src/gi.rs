@@ -445,7 +445,6 @@ fn prepare_gi(p: PrepareGiParams) {
     let merge = make("gate_gi_merge_req", (1 + GI_MERGE_SLOTS as u64 * GI_MERGE_WORDS as u64) * 4);
     queue.write_buffer(&merge, 0, &0u32.to_ne_bytes());
     gpu.gi_merge = Some(merge);
-    // 灯事件通道：计数头清零即可（事件体由 sweep 覆写；dispatch 每帧 clear）
     let lt_event = make("gate_lt_event", c.lt_event_words as u64 * 4);
     queue.write_buffer(&lt_event, 0, &0u32.to_ne_bytes());
     gpu.lt_event = Some(lt_event);
@@ -478,8 +477,6 @@ fn prepare_gi(p: PrepareGiParams) {
   let dirty = dirty.as_deref();
   let edited = dirty.is_some_and(|d| d.edited || d.full || d.palette_changed);
   if edited {
-    // 编辑只冲掉 ReSTIR 时域水库（射线 vis 被几何改变作废）；不置 light_jump，
-    // 阳光信任与主题状态不因几何变化而失效。
     gpu.light_rev = gpu.light_rev.wrapping_add(1);
     bevy::log::debug!(
       target: "gate",
@@ -490,10 +487,6 @@ fn prepare_gi(p: PrepareGiParams) {
       dirty.is_some_and(|d| d.palette_changed),
     );
   }
-  // HIST_CAP_RESET 会把每个条目的历史计数钳到 cap 并存回（min(n, cap) 持久化），
-  // 普通编辑走这条路等于全世界的 IRC 历史被物理削减 ⇒ 显著性门控全屏回落父级，
-  // 表现为一次全屏 GI 闪断。钳制只保留给真正改变全场景光配置的事件：
-  // 主题/曝光增益（light_jump）、调色板重绘、整世界重建。
   let global_light_change = light_jump || dirty.is_some_and(|d| d.full || d.palette_changed);
   let cap = if global_light_change { GiSettings::HIST_CAP_RESET } else { GiSettings::HIST_CAP };
   gpu.hist_cap = cap;

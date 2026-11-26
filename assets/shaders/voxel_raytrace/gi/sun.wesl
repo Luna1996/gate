@@ -7,7 +7,6 @@ import package::world::{face_normal_world, surface_offset, world_trace_medium_sc
 
 const SUN_GOLDEN: f32 = 2.39996323;
 const SUN_T_MAX: f32 = 3072.0;
-// 满槽后每 16 帧刷新 1 槽，兜住流式加载/远处几何变化；必须为 2 的幂。
 const SUN_CACHE_REFRESH: u32 = 16u;
 
 struct SunRay {
@@ -97,7 +96,6 @@ fn sun_gather_cell(g: Grid, a: IrcAddr, face: u32, n: vec3<f32>, voxel: vec3<i32
   let p = sun_cell_origin(g, a, face, n);
   let ok = irc_sun_begin(a, face);
   var base = 0u;
-  // code 变化首帧补两倍方向；同一格的其他采样线程会继续填满空槽。
   var count = SUN_SPP * 2u;
   if (ok) {
     base = irc_sun_next(a, face);

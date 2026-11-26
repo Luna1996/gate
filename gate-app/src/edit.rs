@@ -967,9 +967,6 @@ pub(crate) fn edit_selftest(
 ) {
   let SelftestParams { scene, orbit, settings, pbr_set, phys, mut displace_cache } = p;
   *frame += 1;
-  // 60/70：随机笔刷；600/750：放一盏 1vx 自发光灯再删掉；
-  // 900：放普通物体（编辑闪烁回归）；1200/2400：放一盏长寿命自发光物体再删掉
-  //（长尾回归：深积累缓存才复现「删灯久不灭」）。全部走真实编辑管线。
   let nth = match *frame {
     60 => 1,
     70 => 2,
@@ -992,7 +989,6 @@ pub(crate) fn edit_selftest(
     bevy::log::warn!("EDIT SELFTEST: 射线未命中体素 → 跳过");
     return;
   };
-  // 物体路径（nth≥5）允许命中已有物体：place 落在其表面；体素路径只编辑主世界。
   if nth < 5 && hit.obj_id != -1 {
     return;
   }
@@ -1004,8 +1000,6 @@ pub(crate) fn edit_selftest(
     let center = orbit.eye() + dir * t;
     match nth {
       5 => {
-        // 二分诊断：无物理变体（只 spawn+brush）。若 GISTAT 仍现大规模条目死亡，
-        // 凶手在 volume/builder 路径；若干净，凶手在物理激活。
         let mut obj_burst = b;
         obj_burst.size = 2;
         let pos = center - Vec3::splat(brush_radius(obj_burst.size) as f32);
@@ -1053,8 +1047,6 @@ pub(crate) fn edit_selftest(
   }
   let grid = scene.volumes.main_mut();
   if nth >= 3 {
-    // 灯的位置固定用放置时记录的 center：删除帧的射线会先命中灯本身，
-    // 按 hit+face 重算会偏出一格。
     let center = if nth == 3 {
       let c = hit + face;
       *lamp_center = Some(c);
