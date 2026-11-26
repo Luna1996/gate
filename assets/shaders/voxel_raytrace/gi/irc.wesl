@@ -23,6 +23,9 @@ const IRC_W_SUN_TINT: u32 = 16u;
 const IRC_META_SUN_SHIFT: u32 = 8u;
 const IRC_META_SUN_MASK: u32 = 0xFFFu;
 
+// 距离 LOD 切换前用父级预混最后一段，避免全局光变化瞬态在层级边界留下弧线。
+const IRC_LOD_BLEND: f32 = 0.2;
+
 const IRC_NONE: u32 = 0xFFFFFFFFu;
 const IRC_LOCK: u32 = 1u;
 const IRC_K1_VALID: u32 = 0x80000000u;
@@ -207,6 +210,7 @@ struct IrcAddr {
   obj: u32,
   level: u32,
   spf: f32,
+  parent: f32,
 }
 
 fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
@@ -226,10 +230,15 @@ fn irc_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
       foot = foot / max(g.scale, 1e-6);
     }
   }
-  let level = clamp(u32(ceil(log2(max(foot, 1.0)))), lmin, IRC_MAX_LEVEL);
+  let lf = log2(max(foot, 1e-6));
+  let level = clamp(u32(ceil(max(lf, 0.0))), lmin, IRC_MAX_LEVEL);
+  var parent = 0.0;
+  if (level < IRC_MAX_LEVEL) {
+    parent = 1.0 - smoothstep(0.0, IRC_LOD_BLEND, f32(level) - lf);
+  }
   let cell_px = f32(1u << level) * gi_u.params.y / foot;
   let per = cell_px / max(gi_u.flags.y, 1.0);
-  return IrcAddr(v, obj, level, per * per);
+  return IrcAddr(v, obj, level, per * per, parent);
 }
 
 // 直光太阳阴影固定 level0，逐体素，不跟随 GI 的距离 LOD 变粗。
@@ -243,7 +252,7 @@ fn sun_addr(g: Grid, idx: u32, voxel: vec3<i32>, p: vec3<f32>) -> IrcAddr {
       obj = idx;
     }
   }
-  return IrcAddr(v, obj, 0u, 0.0);
+  return IrcAddr(v, obj, 0u, 0.0, 0.0);
 }
 
 struct SunVis {
@@ -371,6 +380,10 @@ fn irc_display(a: IrcAddr, n_in: vec3<f32>) -> vec4<f32> {
     let face = ax * 2u + select(0u, 1u, n[ax] > 0.0);
     var r = irc_plane(a.v, a.level, face, a.obj);
     var l = a.level + 1u;
+    if (a.parent > 0.0 && r.a > 0.0) {
+      r = r * (1.0 - a.parent) + irc_plane(a.v, l, face, a.obj) * a.parent;
+      l = l + 1u;
+    }
     for (var i = 0u; i < IRC_FALLBACK_LEVELS && r.a < 0.5; i = i + 1u) {
       r = r + irc_plane(a.v, l, face, a.obj) * (1.0 - r.a);
       l = l + 1u;
