@@ -2,11 +2,13 @@ import package::bindings::{light_u};
 import package::brickmap::{Grid};
 import package::gi::common::{gi_mix, gi_rand2};
 import package::gi::consts::{SHADOW_SURFACE_EPS, SUN_SLOTS, SUN_SPP};
-import package::gi::irc::{IrcAddr, irc_cell_key, irc_cell_of, irc_sun_begin, irc_sun_next, irc_sun_sample};
+import package::gi::irc::{IrcAddr, irc_cell_key, irc_cell_of, irc_sun_begin, irc_sun_cached, irc_sun_next, irc_sun_sample};
 import package::world::{face_normal_world, surface_offset, world_trace_medium_scene};
 
 const SUN_GOLDEN: f32 = 2.39996323;
 const SUN_T_MAX: f32 = 3072.0;
+// 满槽后每 16 帧刷新 1 槽，兜住流式加载/远处几何变化；必须为 2 的幂。
+const SUN_CACHE_REFRESH: u32 = 16u;
 
 struct SunRay {
   vis: f32,
@@ -78,6 +80,19 @@ fn sun_vis_dir(p: vec3<f32>, dir: vec3<f32>, voxel: vec3<i32>, obj_id: i32,
 
 fn sun_gather_cell(g: Grid, a: IrcAddr, face: u32, n: vec3<f32>, voxel: vec3<i32>,
                    obj_id: i32) {
+  let cached = irc_sun_cached(a, face);
+  if (cached != 0u) {
+    if (cached == 1u) {
+      let seed = sun_cell_seed(a, face);
+      if (((gi_u.seq.x ^ seed) & (SUN_CACHE_REFRESH - 1u)) == 0u) {
+        let p = sun_cell_origin(g, a, face, n);
+        let slot = (gi_u.seq.x >> 4u) & (SUN_SLOTS - 1u);
+        let ray = sun_vis_dir(p, sun_sample_dir(seed, slot), voxel, obj_id, a.level);
+        irc_sun_sample(a, face, slot, ray.vis, ray.tint);
+      }
+    }
+    return;
+  }
   let seed = sun_cell_seed(a, face);
   let p = sun_cell_origin(g, a, face, n);
   let ok = irc_sun_begin(a, face);

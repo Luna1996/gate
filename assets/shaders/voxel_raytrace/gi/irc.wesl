@@ -275,6 +275,25 @@ fn irc_sun_code() -> u32 {
   return h & IRC_META_SUN_MASK;
 }
 
+// 同一太阳 code 下 16 槽全满后可见度已确定；移动相机只改变新露出的格子，
+// 已满的格子重复采样只会得到相同结果。返回 0=需采样，1=本帧首次命中，2=本帧已命中。
+// 命中时刷新 stamp，避免可见条目按年龄回收。
+fn irc_sun_cached(a: IrcAddr, face: u32) -> u32 {
+  let s = irc_find(irc_cell_key(irc_cell_of(a.v, a.level, face, a.obj)));
+  if (s == IRC_NONE) { return 0u; }
+  let b = s * IRC_WORDS;
+  let meta_w = atomicLoad(&irc[b + IRC_W_META]);
+  if (((meta_w >> IRC_META_SUN_SHIFT) & IRC_META_SUN_MASK) != irc_sun_code()) {
+    return 0u;
+  }
+  if (atomicLoad(&irc[b + IRC_W_SUN]) != 0xFFFFFFFFu) { return 0u; }
+  if (atomicLoad(&irc[b + IRC_W_STAMP]) != gi_u.seq.x) {
+    atomicStore(&irc[b + IRC_W_STAMP], gi_u.seq.x);
+    return 1u;
+  }
+  return 2u;
+}
+
 // code 变化时清空旧方向槽位；之后只写当前 code 的样本。
 // 读取端 code 不匹配直接判无效，回退单条当前太阳方向的硬阴影，避免残影。
 fn irc_sun_begin(a: IrcAddr, face: u32) -> bool {
