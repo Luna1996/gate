@@ -81,4 +81,5 @@ const GI_STAT_RES_TEMPORAL: u32 = 8u;
 const GI_STAT_RES_SPATIAL: u32 = 9u;
 const GI_STAT_IRC_ORPHAN: u32 = 10u;
 const GI_STAT_IRC_LOCKED: u32 = 11u;
+const GI_STAT_LT_EVENT: u32 = 12u;
 const GI_STAT_WORDS: u32 = 16u;

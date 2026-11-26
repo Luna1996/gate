@@ -2,7 +2,7 @@ import package::bindings::{gi_stats, gi_u, lt_event, lt_node, lt_node_key, lt_ti
 import package::brickmap::{Grid, sample_brickmap};
 import package::common::{FLAGS_TRANSMISSIVE, MATERIAL_DEBUG_NONE, emissive_radiance, face_normal_from_index, fetch_material, material_emissive, palette_flags};
 import package::gi::common::{gi_mix, gi_rand2};
-import package::gi::consts::{GI_PI, GI_STAT_LT_DROP, GI_STAT_LT_LINKED, GI_STAT_LT_TILES, GI_STAT_NEE, LT_BUCKET, LT_EVENT_CAP, LT_EVENT_R_MAX, LT_EVENT_R_MIN, LT_EVICT_FRAMES, LT_MAX_DIST, LT_NEE_MAX_D, LT_NODE_WORDS, LT_POWER_MAX, LT_POWER_SCALE, LT_SHADOW_EPS, LT_TILE_WORDS, LT_TOP};
+import package::gi::consts::{GI_PI, GI_STAT_LT_DROP, GI_STAT_LT_EVENT, GI_STAT_LT_LINKED, GI_STAT_LT_TILES, GI_STAT_NEE, LT_BUCKET, LT_EVENT_CAP, LT_EVENT_R_MAX, LT_EVENT_R_MIN, LT_EVICT_FRAMES, LT_MAX_DIST, LT_NEE_MAX_D, LT_NODE_WORDS, LT_POWER_MAX, LT_POWER_SCALE, LT_SHADOW_EPS, LT_TILE_WORDS, LT_TOP};
 import package::trace::{grid_is_far, make_grid};
 import package::world::{world_trace_medium_scene};
 
@@ -221,9 +221,6 @@ fn lt_register(voxel: vec3<i32>, face: u32, obj: u32, le_luma: f32) -> u32 {
   if (atomicLoad(&lt_tile[b + LT_T_STAMP]) != frame) { atomicStore(&lt_tile[b + LT_T_STAMP], frame); }
   if (atomicLoad(&lt_tile[b + LT_T_UNIT]) == 0u) {
     atomicStore(&lt_tile[b + LT_T_UNIT], bitcast<u32>(max(le_luma, 1e-4)));
-    // 新灯首注册：广播事件，半径内 IRC 条目降信任，反弹快速重建
-    lt_event_push(lt_tile_center_world(s),
-                  clamp(LT_EVENT_R_MIN + le_luma * 32.0, LT_EVENT_R_MIN, LT_EVENT_R_MAX));
   }
   return s;
 }
@@ -547,6 +544,7 @@ fn lt_tile_free(s: u32) {
 // 中心为世界坐标、半径按旧功率或新灯亮度估计，覆盖灯的影响域。
 fn lt_event_push(center: vec3<f32>, radius: f32) {
   let i = atomicAdd(&lt_event[0], 1u);
+  atomicAdd(&gi_stats[GI_STAT_LT_EVENT], 1u);
   if (i >= LT_EVENT_CAP) { return; }
   let o = 1u + i * 4u;
   atomicStore(&lt_event[o], bitcast<u32>(i32(center.x)));
@@ -645,7 +643,11 @@ fn lt_sweep_tile(s: u32) {
     p_old = 0u;
   }
   if (evict) {
-    if (p_death > 0u) {
+    // 死亡广播只认「真死」：位被清光（pop==0，sweep 亲自确认面已不存在）
+    // 且 16 帧内无人再注册（误杀/维护性迁移下帧就会被可见着色注册回来，
+    // 不满足门槛 ⇒ 不广播；夜景大楼瓦片在容量压力下腾空重 claim 也不会
+    // 触发事件风暴）。删灯 → 位清光 ≈0.7s + 门槛 0.27s ≈ 1s 内广播。
+    if (p_death > 0u && pop == 0u && frame - atomicLoad(&lt_tile[b + LT_T_STAMP]) > 16u) {
       lt_event_push(center, lt_event_radius(p_death));
     }
     lt_tile_free(s);
