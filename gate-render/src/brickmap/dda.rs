@@ -2315,6 +2315,9 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
             pass.dispatch_workgroups(groups, 1, 1);
           },
         );
+        if let Some(merge) = bg4.gi_merge.as_ref() {
+          ctx.command_encoder().clear_buffer(merge, 0, Some(4));
+        }
       }
       if let Some((src, dst, bytes)) = bg4.reservoir_copy() {
         ctx.command_encoder().copy_buffer_to_buffer(src, 0, dst, 0, bytes);

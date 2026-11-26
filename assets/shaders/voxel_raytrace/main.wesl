@@ -10,7 +10,7 @@ import package::gi::restir::{Res, res_add_nb, res_add_pick, res_adopt, res_begin
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
 import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_ambient, sky_primary};
-import package::world::{medium_one, voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_at_point, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_cfg_reflect, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
+import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_at_point, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_cfg_reflect, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
 @compute @workgroup_size(8, 8, 1)
 fn beam_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -272,10 +272,10 @@ fn refl_hit_gi_m(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32, pool_r: 
                  pool_st: i32, pos: vec3<f32>) -> vec4<f32> {
   let g = make_grid(u32(obj_id) + 1u);
   let n = face_normal_world(g, face_id);
-  let s = gi_surface(WorldHit(true, 0.0, pos, pal, n, face_id, voxel, obj_id, g.palette_base),
+  let p = voxel_center_world(g, voxel);
+  let s = gi_surface(WorldHit(true, 0.0, p, pal, n, face_id, voxel, obj_id, g.palette_base),
                      g, n, face_id);
-  let h = irc_lookup(s.addr, s.face);
-  return vec4<f32>(h.e, max(h.conf, select(0.0, 1.0, h.sun_ok)));
+  return irc_display(s.addr, s.n);
 }
 
 fn refl_hit_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32, pos: vec3<f32>) -> vec3<f32> {
@@ -283,24 +283,25 @@ fn refl_hit_gi(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32, pos: vec3<
 }
 
 const GI_MERGE_WORDS: u32 = 3u;
+const REFL_GI_MERGE_N: f32 = 8.0;
 
-fn gi_merge_push(k0: u32, k1: u32, seed: u32) {
-  let cap = arrayLength(&gi_merge_req) - 1u;
+fn gi_merge_push(k0: u32, k1: u32, seed: u32) -> bool {
+  let cap = (arrayLength(&gi_merge_req) - 1u) / GI_MERGE_WORDS;
   let i = atomicAdd(&gi_merge_req[0], 1u);
-  if (i >= cap) { return; }
+  if (i >= cap) { return false; }
   let o = 1u + i * GI_MERGE_WORDS;
   atomicStore(&gi_merge_req[o], k0);
   atomicStore(&gi_merge_req[o + 1u], k1);
   atomicStore(&gi_merge_req[o + 2u], seed);
+  return true;
 }
 
 fn gi_merge_one(i: u32) {
   let o = 1u + i * GI_MERGE_WORDS;
   let k0 = atomicLoad(&gi_merge_req[o]);
   let k1 = atomicLoad(&gi_merge_req[o + 1u]);
-  let seed = atomicLoad(&gi_merge_req[o + 2u]);
+  let seed = gi_mix(atomicLoad(&gi_merge_req[o + 2u]) + gi_u.seq.x * 0x9E3779B9u);
   let obj = i32((k1 >> 19u) & 0x1FFFu) - 1;
-  if (obj < 0) { return; }
   let face_id = (k1 >> 16u) & 7u;
   let voxel = gi_unkey_voxel(k0, k1, obj);
   let gg = make_grid(u32(obj + 1));
@@ -312,21 +313,20 @@ fn gi_merge_one(i: u32) {
   gi_accumulate(gi_surface(h, gg, hn, face_id), seed);
 }
 
-fn refl_gi_merge(h: WorldHit, seed: u32) -> bool {
+fn refl_gi_merge(h: WorldHit, face_id: u32, seed: u32) -> bool {
   if (!gi_enabled()) { return false; }
   let g = make_grid(u32(h.obj_id) + 1u);
-  let n = voxel_normal_fast(g, h.voxel, h.face_id, h.n);
-  let s = gi_surface(h, g, n, h.face_id);
+  let n = voxel_normal_fast(g, h.voxel, face_id, h.n);
+  let s = gi_surface(h, g, n, face_id);
   let hit = irc_lookup(s.addr, s.face);
-  if (hit.conf > 0.0 || hit.fresh) { return false; }
-  gi_merge_push(gi_key0(h.voxel, h.obj_id), gi_key1(h.voxel, h.face_id, h.obj_id), seed);
-  return true;
+  if (hit.fresh || hit.n >= REFL_GI_MERGE_N) { return false; }
+  return gi_merge_push(gi_key0(h.voxel, h.obj_id), gi_key1(h.voxel, face_id, h.obj_id), seed);
 }
 
 @compute @workgroup_size(64, 1, 1)
 fn gi_merge_drain(@builtin(global_invocation_id) gid: vec3<u32>,
                   @builtin(num_workgroups) nwg: vec3<u32>) {
-  let cap = arrayLength(&gi_merge_req) - 1u;
+  let cap = (arrayLength(&gi_merge_req) - 1u) / GI_MERGE_WORDS;
   let count = min(atomicLoad(&gi_merge_req[0]), cap);
   let stride = nwg.x * 64u;
   var i = gid.x;
@@ -334,7 +334,6 @@ fn gi_merge_drain(@builtin(global_invocation_id) gid: vec3<u32>,
     gi_merge_one(i);
     i = i + stride;
   }
-  if (gid.x == 0u) { atomicStore(&gi_merge_req[0], 0u); }
 }
 
 fn refl_seed(voxel: vec3<i32>, face_id: u32, obj_id: i32) -> u32 {
@@ -375,10 +374,10 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
     }
     let hgg = make_grid(u32(h.obj_id) + 1u);
     let hn = voxel_normal_fast(hgg, h.voxel, h.face_id, h.n);
-    var merged = false;
+    let hnf = voxel_face_index(hgg, hn, h.obj_id);
     if (merge_gi && lvl == 0u
         && (palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u) {
-      merged = refl_gi_merge(h, rseed);
+      refl_gi_merge(h, hnf, rseed);
     }
     let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
     let hamb = sky * GI_SKY_AMBIENT;
@@ -388,7 +387,6 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
 
     if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u
         && dot(hn, sun_dir) > 0.0) {
-      let hnf = voxel_face_index(hgg, hn, h.obj_id);
       let hp = voxel_center_world(hgg, h.voxel);
       h_vis = sun_vis_surface(hgg, h.voxel, hnf, h.obj_id, hn, hp);
     }
@@ -399,7 +397,7 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
       && dot(hf0, GI_LUMA) >= PBR_REFL_MIN_F0;
     var h_gi = vec3<f32>(0.0);
     if (tier >= REFL_TIER_GI) {
-      h_gi = select(refl_hit_gi(h.voxel, h.face_id, h.obj_id, h.pal, h.point), vec3<f32>(0.0), merged);
+      h_gi = refl_hit_gi(h.voxel, hnf, h.obj_id, h.pal, h.point);
     }
     var h_local = brdf_reflected(hm, hn, hv,
                                  SurfaceLight(sun_dir, sun_c * h_vis, 1.0, hamb, h_gi))
@@ -422,19 +420,6 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
   return refl_env;
 }
 
-const SUN_UNDERWATER_CAP: f32 = 3072.0;
-fn sun_vis_capped(origin: vec3<f32>, sun_dir: vec3<f32>, self_voxel: vec3<i32>, self_obj: i32,
-                  cap: f32) -> vec3<f32> {
-  var tint = vec3<f32>(1.0);
-  var best = world_miss();
-  var best_t = 1.0e+30;
-  medium_one(make_grid(0u), origin, sun_dir, min(cap, SUN_UNDERWATER_CAP), 0.0, false,
-             &best, &best_t, &tint);
-  if (!best.hit) { return tint; }
-  if (all(best.voxel == self_voxel) && best.obj_id == self_obj) { return vec3<f32>(1.0); }
-  return vec3<f32>(0.0);
-}
-
 fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frustum_length: f32,
               gi_uv: vec2<f32>, sun_dir: vec3<f32>, sky: vec3<f32>, sun_c: vec3<f32>,
               n_hint: vec3<f32>, n_hint_ok: bool,
@@ -447,9 +432,6 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var glass_w = 0.0;
   var sky_dir = ray_dir;
   var entry_v = ray_dir;
-  var water_miss = false;
-  var water_surf = false;
-  var refract_hit = false;
   var through_transmission = false;
   let glass_q = (light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
@@ -459,12 +441,6 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     var fnn = n_hint;
     if (!n_hint_ok) { fnn = voxel_normal_fast(fg, fvx, first.face_id, first.n); }
     let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
-    water_miss = fm.roughness < 0.1;
-    water_surf = water_miss || fm.ior < 1.4
-      || (fm.albedo.b > fm.albedo.r * 1.25 && fm.albedo.b > fm.albedo.g * 1.05);
-    if (water_miss && (first.face_id == 2u || first.face_id == 3u)) {
-      fnn = face_normal_world(fg, first.face_id);
-    }
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
@@ -478,7 +454,6 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       through = g.tint;
       refl = g.refl;
       sky_dir = g.dir;
-      refract_hit = glass_q >= 2u;
       through_transmission = true;
       glass_w = clamp(1.0 - fm.transmission, 0.0, 1.0);
     } else {
@@ -528,12 +503,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if (ndl > 0.0) {
       sun = vec3<f32>(1.0);
       if ((light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u) {
-        if (through_transmission && refract_hit && f_shadow.ok) {
-          let k = clamp(abs(entry_v.y) / max(abs(sun_dir.y), 0.05), 0.02, 8.0);
-          sun = f_shadow.vis * pow(max(through, vec3<f32>(1e-4)), vec3<f32>(k));
-        } else {
-          sun = sun_vis_surface(gg, best.voxel, nf, best.obj_id, n, p_voxel);
-        }
+        sun = sun_vis_surface(gg, best.voxel, nf, best.obj_id, n, p_voxel);
       }
     }
     var gi = vec3<f32>(0.0);
@@ -560,8 +530,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     }
     col = col * through + refl;
   } else {
-    var miss = sky_primary(sky_dir, sun_dir, sun_c) * through;
-    if (water_miss) { miss = glass_col; }
+    let miss = sky_primary(sky_dir, sun_dir, sun_c) * through;
     return mix(glass_col, miss + refl, 1.0 - glass_w);
   }
   return mix(glass_col, col, 1.0 - glass_w);
@@ -734,16 +703,18 @@ fn refl_shade_ray(org: vec3<f32>, dir: vec3<f32>, tier: u32,
     let rgg = make_grid(u32(rhit.obj_id) + 1u);
     let r_vc = voxel_center_world(rgg, rhit.voxel);
     let rn = voxel_normal_fast(rgg, rhit.voxel, rhit.face_id, rhit.n);
+    let rnf = voxel_face_index(rgg, rn, rhit.obj_id);
     let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
     var r_vis = vec3<f32>(1.0);
     if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u
         && dot(rn, sun_dir) > 0.0) {
-      let rnf = voxel_face_index(rgg, rn, rhit.obj_id);
       r_vis = sun_vis_surface(rgg, rhit.voxel, rnf, rhit.obj_id, rn, r_vc);
     }
     var r_gi = vec3<f32>(0.0);
-    if (tier >= REFL_TIER_GI) {
-      r_gi = refl_hit_gi(rhit.voxel, rhit.face_id, rhit.obj_id, rhit.pal, rhit.point);
+    if (tier >= REFL_TIER_GI
+        && (palette_flags(rhit.palette_base, rhit.pal) & FLAGS_TRANSMISSIVE) == 0u) {
+      refl_gi_merge(rhit, rnf, refl_seed(rhit.voxel, rnf, rhit.obj_id));
+      r_gi = refl_hit_gi(rhit.voxel, rnf, rhit.obj_id, rhit.pal, rhit.point);
     }
     rc = brdf_reflected(mr, rn, face_view_dir(org, r_vc),
                         SurfaceLight(sun_dir, sun_c * r_vis, 1.0, sky * GLASS_REFL_AMBIENT, r_gi))
@@ -1171,7 +1142,13 @@ fn dda_glass(@builtin(global_invocation_id) gid: vec3<u32>,
     if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
     dlss_store_inputs(coord, first, dir_voxel);
     write_output(coord, col);
-    if (gi_enabled() && gi_u.params.y > 0.0) { dda_hit_record(pgid, size, best, origin_voxel); }
+    if (gi_enabled() && gi_u.params.y > 0.0) {
+      if (((light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u) >= 2u) {
+        dda_hit_record(pgid, size, first, origin_voxel);
+      } else {
+        dda_hit_record(pgid, size, best, origin_voxel);
+      }
+    }
   }
 }
 
