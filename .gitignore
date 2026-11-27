@@ -3,7 +3,8 @@
 /dist
 # 运行期可写目录（日志、菜单存档）：与只读资源 assets/ 分离
 /logs
-/data
+/data/*
+!/data/mc.local.example.toml
 # DLSS/LLVM 构建依赖缓存（tools/fetch-dlss-deps.ps1 幂等拉取，不入库）
 /deps
 *.log

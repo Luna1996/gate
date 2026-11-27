@@ -1,0 +1,16 @@
+# 每台开发机不同；复制为 data/mc.local.toml 后按本机路径填写。
+# data/ 已 gitignore，本地文件不会进仓库。
+# 相对/绝对路径均可；也可用环境变量覆盖：
+# GATE_GREEN_FIELD / GATE_MC_ASSETS / GATE_MC_MODELS / GATE_MC_VANILLA
+
+# Anvil 世界目录（含 region/、level.dat）
+map = 'C:\game\Greenfield v0.5.4\Greenfield v0.5.4'
+
+# 主资源包：目录或 zip/jar
+assets = 'C:\game\Greenfield v0.5.4\Greenfield.Texture.Pack.1.17.zip'
+
+# 可选：模型回退目录（资源包只带部分 blockstate/model 时使用）
+models = 'C:\game\Greenfield v0.5.4\assets_mc'
+
+# 可选：原版客户端 jar 或资源目录
+vanilla = 'C:\Users\you\AppData\Roaming\.minecraft\versions\Greenfield\Greenfield.jar'

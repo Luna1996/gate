@@ -116,7 +116,7 @@ impl Layer {
 }
 
 impl Assets {
-  pub fn new(pack: impl Into<PathBuf>, vanilla: Option<PathBuf>) -> Self {
+  pub fn new(pack: impl Into<PathBuf>, models: Option<PathBuf>, vanilla: Option<PathBuf>) -> Self {
     let root = pack.into();
     let mut layers = Vec::new();
     let mut labels = Vec::new();
@@ -127,6 +127,21 @@ impl Assets {
       }
       None => {
         bevy::log::warn!(target: "gate", "MC 资源包! 打不开 {} ⇒ 无方块材质", root.display());
+      }
+    }
+    if let Some(path) = models.filter(|path| path != &root) {
+      match Layer::open(&path) {
+        Some(layer) => {
+          labels.push(format!("{}（模型回退 {}）", path.display(), layer.kind()));
+          layers.push(layer);
+        }
+        None => {
+          bevy::log::warn!(
+            target: "gate",
+            "MC 模型回退! 打不开 {} ⇒ 资源包缺失的 blockstate/model 无法解析",
+            path.display()
+          );
+        }
       }
     }
     match &vanilla {
