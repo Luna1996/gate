@@ -122,11 +122,15 @@ pub struct AtmosphereSettings {
   pub density: f32,
 
   pub start: f32,
+
+  pub scatter: f32,
+
+  pub anisotropy: f32,
 }
 
 impl Default for AtmosphereSettings {
   fn default() -> Self {
-    Self { density: 0.0016, start: 2.56 }
+    Self { density: 0.0016, start: 2.56, scatter: 1.0, anisotropy: 0.63 }
   }
 }
 

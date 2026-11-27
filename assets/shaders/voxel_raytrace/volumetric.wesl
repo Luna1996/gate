@@ -48,9 +48,24 @@ fn sky_base(dir: vec3<f32>) -> vec3<f32> {
   return sky_ambient(dir) + sky_stars(dir, night);
 }
 
+const SCATTER_GAIN: f32 = 0.02;
+
+fn sky_scatter(dir: vec3<f32>) -> vec3<f32> {
+  let s = light_u.g.exposure_pad;
+  if (s.z <= 0.0) { return vec3<f32>(0.0); }
+  let l = light_u.lights[0];
+  let g = clamp(s.w, -0.95, 0.95);
+  let cos_t = dot(dir, l.kind_pos_dir.yzw);
+  let d = max(1.0 + g * g - 2.0 * g * cos_t, 1e-3);
+  let lobe = (1.0 - g * g) / pow(d, 1.5);
+  let horizon = smoothstep(-0.05, 0.22, dir.y);
+  let tint = mix(sky_ambient(dir), l.color_intensity.xyz * l.color_intensity.w, 0.35);
+  return tint * (s.z * max(lobe - 1.0, 0.0) * horizon * SCATTER_GAIN);
+}
+
 fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
   let base = sky_base(dir);
-  if (fog_u_read.misc2.x <= 0.5) { return base; }
+  if (fog_u_read.misc2.x <= 0.5) { return base + sky_scatter(dir); }
   let ang = clamp(fog_u_read.misc2.z, 1e-4, SUN_CONE_MAX);
   let cos_t = dot(dir, sun_dir);
   let t2 = (1.0 - cos_t) / max(1.0 - cos(ang), 1e-12);
@@ -60,7 +75,7 @@ fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32
   let hx = clamp(t2 / (HALO_T * HALO_T), 0.0, 1.0);
   let halo = pow(1.0 - hx, HALO_POW) * (1.0 - hx * hx * hx);
   let disk_gain = max(light_u.lights[0].shape.x, 0.0);
-  return base
+  return base + sky_scatter(dir)
        + sun_c * (disk * SUN_DISK_GAIN * disk_gain
                   + halo * max(fog_u_read.misc2.w, 0.0));
 }

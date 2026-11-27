@@ -55,6 +55,8 @@ const EDIT_MATERIAL_PATHS: [&str; 5] = [
 const SKY_HOUR_PATH: &str = "render/sky/time/hour";
 const AIR_DENSITY_PATH: &str = "render/sky/air/density";
 const AIR_START_PATH: &str = "render/sky/air/start";
+const AIR_SCATTER_PATH: &str = "render/sky/air/scatter";
+const AIR_AIM_PATH: &str = "render/sky/air/aim";
 const BLUR_STRENGTH_PATH: &str = "render/sky/blur/strength";
 const BLUR_DECAY_PATH: &str = "render/sky/blur/decay";
 const BLUR_FOCUS_PATH: &str = "render/sky/blur/focus";
@@ -498,6 +500,14 @@ fn register_callbacks(world: &mut World) {
         (AIR_START_PATH, MenuAction::Value(v)) => {
           atmo.start = v.max(0.0);
           info!("空气透视：起始 → {:.2} m", atmo.start);
+        }
+        (AIR_SCATTER_PATH, MenuAction::Value(v)) => {
+          atmo.scatter = v.max(0.0) / 100.0;
+          info!("空气透视：散射 → {:.2}", atmo.scatter);
+        }
+        (AIR_AIM_PATH, MenuAction::Value(v)) => {
+          atmo.anisotropy = (v.clamp(0.0, 100.0) - 50.0) / 50.0 * 0.9;
+          info!("空气透视：方向 g → {:.2}", atmo.anisotropy);
         }
         ("render/sky/blur/enabled", MenuAction::Toggle(on)) => {
           fog.enabled = *on;

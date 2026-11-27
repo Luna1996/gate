@@ -9,7 +9,7 @@ import package::gi::sun::{sun_gather_cell};
 import package::gi::restir::{Res, res_add_nb, res_add_pick, res_adopt, res_begin, res_direct, res_finish, res_load_cur, res_load_prev, res_load_tmp, res_none, res_store_cur, res_store_tmp};
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
-import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_ambient, sky_primary};
+import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_ambient, sky_primary, sky_scatter};
 import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_at_point, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_cfg_reflect, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
 @compute @workgroup_size(8, 8, 1)
@@ -93,7 +93,7 @@ fn aerial_perspective(col: vec3<f32>, p_voxel: vec3<f32>, origin: vec3<f32>) -> 
   let f = 1.0 - exp(-a.x * max(dist - a.y, 0.0));
   if (f <= 0.0) { return col; }
   let dir = d / max(dist, 1e-6);
-  return mix(col, sky_ambient(dir), clamp(f, 0.0, 1.0));
+  return mix(col, sky_ambient(dir) + sky_scatter(dir), clamp(f, 0.0, 1.0));
 }
 
 fn refl_cone_dir(r: vec3<f32>, u: vec2<f32>, spread: f32) -> vec3<f32> {

@@ -407,6 +407,28 @@ step = 0.5
 decimals = 2
 tooltip = "menu.render.sky.air.start.tip"
 
+[[items.children.children.children]]
+kind = "slider"
+id = "scatter"
+label = "menu.render.sky.air.scatter"
+value = 100.0
+min = 0.0
+max = 200.0
+step = 1.0
+decimals = 0
+tooltip = "menu.render.sky.air.scatter.tip"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "aim"
+label = "menu.render.sky.air.aim"
+value = 85.0
+min = 0.0
+max = 100.0
+step = 1.0
+decimals = 0
+tooltip = "menu.render.sky.air.aim.tip"
+
 [[items.children.children]]
 kind = "sub_menu"
 id = "blur"

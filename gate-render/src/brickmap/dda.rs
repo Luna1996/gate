@@ -1805,8 +1805,12 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   lp.0.get_mut().g.base_flags =
     tune.base.as_ref().map_or(crate::lighting::BaseSettings::default().flags(), |b| b.flags());
   let atmo = tune.atmo.as_deref().copied().unwrap_or_default();
-  lp.0.get_mut().g.exposure_pad =
-    Vec4::new(atmo.density.max(0.0) / vpm, atmo.start.max(0.0) * vpm, 0.0, 0.0);
+  lp.0.get_mut().g.exposure_pad = Vec4::new(
+    atmo.density.max(0.0) / vpm,
+    atmo.start.max(0.0) * vpm,
+    atmo.scatter.max(0.0),
+    atmo.anisotropy.clamp(-0.95, 0.95),
+  );
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 
