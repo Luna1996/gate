@@ -140,11 +140,12 @@ impl Default for AtmosphereSettings {
 #[extract_app(bevy::render::RenderApp)]
 pub struct CloudSettings {
   pub cover: f32,
+  pub time: f32,
 }
 
 impl Default for CloudSettings {
   fn default() -> Self {
-    Self { cover: 1.0 }
+    Self { cover: 1.0, time: 0.0 }
   }
 }
 

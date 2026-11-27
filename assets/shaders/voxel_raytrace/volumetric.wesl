@@ -78,8 +78,10 @@ const CLOUD_RANGE_M: f32 = 8000.0;
 const CLOUD_STEP_M: f32 = 26.0;
 const CLOUD_STEP_GROW: f32 = 1.04;
 
-fn cloud_weather_uv(p: vec3<f32>, time: f32) -> vec2<f32> {
-  return p.xz / CLOUD_WEATHER_SCALE_M + vec2<f32>(time * 0.000012, time * 0.000007);
+const CLOUD_WIND_MPS: vec2<f32> = vec2<f32>(45.0, 18.0);
+
+fn cloud_weather_uv(p: vec3<f32>, time: f32, wind_scale: f32) -> vec2<f32> {
+  return (p.xz + CLOUD_WIND_MPS * time * wind_scale) / CLOUD_WEATHER_SCALE_M;
 }
 
 fn cloud_density_raw(
@@ -87,7 +89,8 @@ fn cloud_density_raw(
 ) -> f32 {
   let h = (p.y - base) / max(top - base, 1.0);
   if (h <= 0.0 || h >= 1.0) { return 0.0; }
-  let w = textureSampleLevel(cloud_weather, cloud_samp, cloud_weather_uv(p, time), 0.0);
+  let wind_scale = select(1.0, 1.7, layer == 1u);
+  let w = textureSampleLevel(cloud_weather, cloud_samp, cloud_weather_uv(p, time, wind_scale), 0.0);
   let cover = clamp(
     1.0 - exp(-w.r * cover_scale * 2.2 * select(1.0, 0.9, layer == 1u)),
     0.0,
@@ -100,12 +103,14 @@ fn cloud_density_raw(
   if (layer == 1u) {
     prof = smoothstep(0.0, 0.18, h) * (1.0 - smoothstep(0.7, 1.0, h)) * 0.6;
   }
-  let drift = vec3<f32>(time * 0.000006, 0.0, time * 0.000004);
-  let base_n = textureSampleLevel(cloud_noise, cloud_samp, p / CLOUD_BASE_SCALE_M + drift, 0.0);
+  let wind = vec3<f32>(CLOUD_WIND_MPS.x, 0.0, CLOUD_WIND_MPS.y) * time * wind_scale;
+  let base_n =
+    textureSampleLevel(cloud_noise, cloud_samp, (p + wind) / CLOUD_BASE_SCALE_M, 0.0);
   let cover_edge = 1.0 - cover;
   let shape = smoothstep(cover_edge, cover_edge + 0.12, base_n.r);
   if (shape <= 0.0 || !detail_on) { return shape * prof; }
-  let detail = textureSampleLevel(cloud_noise, cloud_samp, p / CLOUD_DETAIL_SCALE_M - drift * 3.0, 0.0);
+  let detail =
+    textureSampleLevel(cloud_noise, cloud_samp, (p + wind) / CLOUD_DETAIL_SCALE_M, 0.0);
   let eroded = smoothstep(cover_edge, cover_edge + 0.12, base_n.r - detail.g * 0.3);
   return eroded * prof;
 }

@@ -382,9 +382,7 @@ fn prepare_fog(p: PrepareFogParams) {
   let (sun_uv, facing) = project_sun(view_proj, cam_pos, sun);
 
   let size = scale.as_deref().map_or(crate::consts::VIEW_SIZE, |s| s.size);
-  let now = std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .map_or(0.0, |d| d.as_secs_f32() % 3600.0);
+  let now = cloud.as_deref().map_or(0.0, |c| c.time);
   *gpu.uniform.get_mut() = FogUniform {
     params: Vec4::new(settings.decay(), 0.0, 0.0, 0.0),
     misc: Vec4::new(0.0, settings.focus(), settings.strength(), facing),

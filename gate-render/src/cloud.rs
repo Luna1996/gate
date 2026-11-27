@@ -220,6 +220,9 @@ pub struct CloudPlugin;
 impl bevy::app::Plugin for CloudPlugin {
   fn build(&self, app: &mut bevy::app::App) {
     use bevy::ecs::schedule::IntoScheduleConfigs;
+    app
+      .init_resource::<crate::lighting::CloudSettings>()
+      .add_systems(bevy::app::Update, advance_cloud_time);
     let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
       return;
     };
@@ -230,6 +233,21 @@ impl bevy::app::Plugin for CloudPlugin {
         .after(crate::pipe_cache::init_gate_pipe_cache),
     );
   }
+}
+
+const CLOUD_HOUR_SCALE: f32 = 10.0;
+
+fn advance_cloud_time(
+  time: bevy::ecs::system::Res<bevy::prelude::Time>,
+  sky: bevy::ecs::system::Res<crate::sky::SkySettings>,
+  mut cloud: bevy::ecs::system::ResMut<crate::lighting::CloudSettings>,
+) {
+  if !sky.auto {
+    return;
+  }
+  let dt = time.delta_secs().min(0.1);
+  let rate = sky.hours_per_sec.max(0.0) * CLOUD_HOUR_SCALE;
+  cloud.time = (cloud.time + dt * rate).rem_euclid(3600.0);
 }
 
 fn queue_cloud_pipeline(

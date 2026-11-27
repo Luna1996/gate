@@ -1787,11 +1787,16 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   let cloud_noise_view =
     cloud_noise.map_or_else(|| gpu.cloud_noise_view.clone(), |i| i.texture_view.clone());
   let cloud_cover = tune.cloud.as_deref().map_or(1.0, |c| c.cover.max(0.0));
+  let cloud_time = tune.cloud.as_deref().map_or(0.0, |c| c.time);
   if let Some(cloud_gpu) = cloud_gpu.as_mut() {
-    let now = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .map_or(0.0, |d| d.as_secs_f32() % 3600.0);
-    cloud_gpu.prepare(&render_device, &queue, scale.size, view_uniform.view_proj, now, cloud_cover);
+    cloud_gpu.prepare(
+      &render_device,
+      &queue,
+      scale.size,
+      view_uniform.view_proj,
+      cloud_time,
+      cloud_cover,
+    );
   }
   let bg1 = {
     let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
