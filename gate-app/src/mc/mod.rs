@@ -79,7 +79,7 @@ pub fn build(
     },
     assets.root().display(),
     WINDOW_CHUNKS,
-    WINDOW_CHUNKS as f32 * chunk as f32 * 0.02,
+    WINDOW_CHUNKS as f32 * chunk as f32 / VOXELS_PER_BLOCK as f32,
   );
   let stamp = lod::stamp(world.dir());
   let city = Arc::new(source::McCity::new(world, assets, pool));

@@ -19,4 +19,4 @@ pub use dissolve::dissolve_into_main;
 pub use field::{Field, NodeFill, chunk_bounds, tight_bounds, world_aabb_of};
 pub use solver::{Constraint, ContactConstraint, ContactParams};
 pub use statics::{StaticChunk, StaticField, chunk_of};
-pub use world::{PhysicsWorld, StepConfig, StepProfile, StepStats, VOXELS_PER_METER, WORLD_BODY};
+pub use world::{PhysicsWorld, StepConfig, StepProfile, StepStats, WORLD_BODY};

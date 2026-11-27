@@ -2665,6 +2665,7 @@ dependencies = [
  "rayon",
  "ron",
  "serde",
+ "toml 0.8.23",
  "uuid",
  "wesl 0.5.0",
  "wgpu",

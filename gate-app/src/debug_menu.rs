@@ -10,7 +10,6 @@ use crate::camera::{CameraMode, FlyCamera};
 use crate::config::Config;
 use crate::consts::{
   CAM_INFO_REFRESH_SECS, EDIT_SIZE_MIN, FPS_MAX_FRAMES_PER_TICK, FPS_UPDATE_SECS, FPS_WINDOW_SECS,
-  VOXEL_PER_METER,
 };
 use crate::edit::{
   BrushMaterial, BrushShape, EditSettings, metal_toggle_to_metallic, smooth_pct_to_roughness,
@@ -302,6 +301,17 @@ fn split(path: &str) -> Vec<String> {
   path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
 
+fn scene_vpm(scene: Option<&gate_render::VoxelScene>) -> f32 {
+  scene.map_or(gate_voxel::DEFAULT_VOXEL_PER_METER, |s| s.volumes.main().voxel_per_meter())
+}
+
+fn menu_speed_mps(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<f32> {
+  match q_menu.single().ok()?.model.node(&split("player/camera/speed"))? {
+    MenuNode::Slider { value, .. } => Some(*value),
+    _ => None,
+  }
+}
+
 fn register_callbacks(world: &mut World) {
   world.init_resource::<WindowedRestore>();
   world.add_observer(
@@ -455,8 +465,8 @@ fn register_callbacks(world: &mut World) {
           refl.reach = k as u32;
           let (name, v) = match k {
             0 => ("关", "不发次级射线"),
-            1 => ("近", "≤1024vx"),
-            2 => ("中", "≤4096vx"),
+            1 => ("近", "≤20m"),
+            2 => ("中", "≤80m"),
             _ => ("远", "无限"),
           };
           info!("次级射线 → {name}（{v}）");
@@ -482,12 +492,12 @@ fn register_callbacks(world: &mut World) {
      mut atmo: ResMut<gate_render::AtmosphereSettings>| {
       match (ev.path.as_str(), &ev.action) {
         (AIR_DENSITY_PATH, MenuAction::Value(v)) => {
-          atmo.density = v.clamp(0.0, 100.0) * 0.000004;
-          info!("空气透视：浓度 → {:.5}", atmo.density);
+          atmo.density = v.clamp(0.0, 100.0) * 0.0002;
+          info!("空气透视：浓度 → {:.5}/m", atmo.density);
         }
         (AIR_START_PATH, MenuAction::Value(v)) => {
           atmo.start = v.max(0.0);
-          info!("空气透视：起始 → {:.0} vx", atmo.start);
+          info!("空气透视：起始 → {:.2} m", atmo.start);
         }
         ("render/sky/blur/enabled", MenuAction::Toggle(on)) => {
           fog.enabled = *on;
@@ -586,18 +596,21 @@ fn register_callbacks(world: &mut World) {
   });
 
   world.add_observer(
-    |ev: On<MenuActionEvent>, mut mode: ResMut<CameraMode>, mut fly: ResMut<FlyCamera>| match (
-      ev.path.as_str(),
-      &ev.action,
-    ) {
-      ("player/camera/mode", MenuAction::Select(i)) => {
-        *mode = if *i == 0 { CameraMode::Orbit } else { CameraMode::Fly };
+    |ev: On<MenuActionEvent>,
+     mut mode: ResMut<CameraMode>,
+     mut fly: ResMut<FlyCamera>,
+     scene: Option<Res<gate_render::VoxelScene>>| {
+      match (ev.path.as_str(), &ev.action) {
+        ("player/camera/mode", MenuAction::Select(i)) => {
+          *mode = if *i == 0 { CameraMode::Orbit } else { CameraMode::Fly };
+        }
+        ("player/camera/speed", MenuAction::Value(v)) => {
+          let vpm = scene_vpm(scene.as_deref());
+          fly.speed = *v * vpm;
+          info!("飞行速度 → {:.2} m/s {:.0} v/s @ {vpm:.1}vx/m", v, fly.speed);
+        }
+        _ => {}
       }
-      ("player/camera/speed", MenuAction::Value(v)) => {
-        fly.speed = *v * VOXEL_PER_METER;
-        info!("飞行速度 → {:.2} m/s {:.0} v/s", v, fly.speed);
-      }
-      _ => {}
     },
   );
 
@@ -655,7 +668,7 @@ fn register_callbacks(world: &mut World) {
   world.add_observer(
     |ev: On<MenuActionEvent>,
      mut edit: ResMut<EditSettings>,
-     q_menu: Query<&gate_ui::DebugMenu>,
+     mut q_menu: Query<&mut gate_ui::DebugMenu>,
      mut q_offsets: Query<(&gate_ui::menu::MenuItem, &mut gate_ui::TextInputValue)>,
      pbr_set: Option<Res<gate_render::PbrTextureSet>>,
      mut q_show: Query<&mut Visibility, With<ShowcaseRoot>>| {
@@ -667,8 +680,8 @@ fn register_callbacks(world: &mut World) {
         ("game/edit/place/size", MenuAction::Text(t)) => {
           if let Ok(v) = t.trim().parse::<u32>() {
             edit.size = v.max(EDIT_SIZE_MIN);
-            let auto = edit.size as f32;
-            write_brush_offset(&mut edit, auto, &mut q_offsets);
+            let auto = edit.size as f32 * 0.5;
+            write_brush_offset(&mut edit, auto, &mut q_offsets, &mut q_menu);
             info!(target: "gate", "笔触大小 → {} vx；偏移距离自动 → {:.1}", edit.size, auto);
           }
         }
@@ -708,7 +721,8 @@ fn register_callbacks(world: &mut World) {
           );
         }
         ("game/edit/mat/pbr_asset", MenuAction::Select(i)) => {
-          let name = menu_pbr_asset(&q_menu).unwrap_or_else(|| "?".to_string());
+          let name =
+            q_menu.single().ok().and_then(menu_pbr_asset).unwrap_or_else(|| "?".to_string());
           let (slot, how) = match pbr_set.as_deref().and_then(|s| s.slot_of(&name)) {
             Some(slot) => (slot, "按 PbrTextureSet 解析"),
             None => (*i as u32, "贴图集未就绪/未收录，回落选项下标"),
@@ -772,6 +786,16 @@ fn register_callbacks(world: &mut World) {
           ) {
             Ok(_info) => {
               phys.reset();
+              let vpm = scene.volumes.main().voxel_per_meter();
+              phys.cfg.gravity = Vec3::new(0.0, -9.81 * vpm, 0.0);
+              let speed_mps =
+                menu_speed_mps(&q_menu).unwrap_or(crate::consts::FLY_SPEED_MPS_DEFAULT);
+              fly.speed = speed_mps * vpm;
+              info!(
+                target: "gate",
+                "重载后单位换算：{vpm:.1}vx/m，飞行 {speed_mps:.2}m/s → {:.0}v/s",
+                fly.speed,
+              );
               let near_spawn = crate::mc::spawn_eye()
                 .is_none_or(|s| eye_now.distance_squared(s.as_vec3()) <= 25_000.0 * 25_000.0);
               if name == crate::mc::GREEN_FIELD && !was_mc && !near_spawn {
@@ -850,8 +874,8 @@ fn menu_world_model(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
   world_model_name(&q_menu.single().ok()?.model)
 }
 
-fn menu_pbr_asset(q_menu: &Query<&gate_ui::DebugMenu>) -> Option<String> {
-  match q_menu.single().ok()?.model.node(&split(EDIT_PBR_ASSET_PATH)) {
+fn menu_pbr_asset(menu: &gate_ui::DebugMenu) -> Option<String> {
+  match menu.model.node(&split(EDIT_PBR_ASSET_PATH)) {
     Some(MenuNode::Dropdown { options, selected, .. }) => options.get(*selected).cloned(),
     _ => None,
   }
@@ -984,6 +1008,7 @@ fn write_brush_offset(
   edit: &mut EditSettings,
   offset: f32,
   q: &mut Query<(&gate_ui::menu::MenuItem, &mut gate_ui::TextInputValue)>,
+  q_menu: &mut Query<&mut DebugMenu>,
 ) {
   edit.offset = offset.max(0.0);
   let text = format!("{:.1}", edit.offset);
@@ -991,6 +1016,12 @@ fn write_brush_offset(
     if item.path == EDIT_OFFSET_PATH && tv.0 != text {
       tv.0 = text.clone();
     }
+  }
+  if let Ok(mut menu) = q_menu.single_mut()
+    && let Some(MenuNode::Input { fields, .. }) = menu.model.node_mut(&split(EDIT_OFFSET_PATH))
+    && let Some(field) = fields.first_mut()
+  {
+    field.text = text;
   }
 }
 
@@ -1064,11 +1095,16 @@ pub(crate) fn wrap_deg(deg: f32) -> f32 {
 pub(crate) const CAM_POS_PATH: &str = "player/camera/pos";
 pub(crate) const CAM_DIR_PATH: &str = "player/camera/dir";
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct CameraInfoSources<'w> {
+  orbit: Res<'w, gate_render::OrbitCamera>,
+  mode: Res<'w, CameraMode>,
+  fly: Res<'w, FlyCamera>,
+}
+
 pub(crate) fn camera_info_tick(
   time: Res<Time>,
-  orbit: Res<gate_render::OrbitCamera>,
-  mode: Res<CameraMode>,
-  fly: Res<FlyCamera>,
+  src: CameraInfoSources,
   mut q_fields: Query<(&gate_ui::MenuItem, &TextInputState, &mut TextInputValue)>,
   mut q_menu: Query<&mut DebugMenu>,
   mut acc: Local<f32>,
@@ -1078,12 +1114,12 @@ pub(crate) fn camera_info_tick(
     return;
   }
   *acc = 0.0;
-  let eye = match *mode {
-    CameraMode::Orbit => orbit.eye(),
-    CameraMode::Fly => fly.pos,
+  let eye = match *src.mode {
+    CameraMode::Orbit => src.orbit.eye(),
+    CameraMode::Fly => src.fly.pos,
   };
-  let yaw_deg = wrap_deg(orbit.yaw.to_degrees());
-  let pitch_deg = orbit.pitch.to_degrees();
+  let yaw_deg = wrap_deg(src.orbit.yaw.to_degrees());
+  let pitch_deg = src.orbit.pitch.to_degrees();
 
   let mut writes: Vec<(String, usize, String)> = Vec::new();
   for (item, st, mut value) in &mut q_fields {

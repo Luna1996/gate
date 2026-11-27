@@ -12,7 +12,7 @@ struct Grid {
   w_mn: vec3<f32>,                w_mx: vec3<f32>,                l_min: vec3<f32>,               l_max: vec3<f32>,               max_chunk_steps: u32,           col0: vec3<f32>,                col1: vec3<f32>,
   col2: vec3<f32>,
   pos: vec3<f32>,                 scale: f32,
-  tree_base: u32,                 palette_base: u32,              index_origin: vec3<i32>,        index_dims: vec3<u32>,          obj_id: i32,                    vol: u32,                       coverage_r: f32,              }
+  tree_base: u32,                 palette_base: u32,              index_origin: vec3<i32>,        index_dims: vec3<u32>,          obj_id: i32,                    vol: u32,                       coverage_r: f32,                voxel_per_meter: f32,         }
 
 fn sample_brickmap(g: Grid, voxel: vec3<i32>) -> u32 {
   let m = ((voxel % vec3<i32>(i32(CHUNK_SIZE))) + vec3<i32>(i32(CHUNK_SIZE))) % vec3<i32>(i32(CHUNK_SIZE));

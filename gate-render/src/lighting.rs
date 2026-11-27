@@ -46,7 +46,7 @@ pub struct ReflectionSettings {
 impl ReflectionSettings {
   pub const TIERS: u32 = 5;
   pub const NEST_CHOICES: [u32; 4] = [0, 1, 2, 4];
-  pub const REACH_CHOICES: [u32; 4] = [0, 1024, 4096, u32::MAX];
+  pub const REACH_CHOICES_M: [f32; 4] = [0.0, 20.0, 80.0, f32::INFINITY];
 
   pub fn tier(&self) -> u32 {
     self.tier.min(Self::TIERS - 1)
@@ -56,8 +56,13 @@ impl ReflectionSettings {
     *Self::NEST_CHOICES.iter().min_by_key(|c| c.abs_diff(self.nest)).expect("NEST_CHOICES 非空")
   }
 
-  pub fn reach(&self) -> u32 {
-    Self::REACH_CHOICES[(self.reach as usize).min(Self::REACH_CHOICES.len() - 1)]
+  pub fn reach_voxels(&self, voxel_per_meter: f32) -> u32 {
+    let m = Self::REACH_CHOICES_M[(self.reach as usize).min(Self::REACH_CHOICES_M.len() - 1)];
+    if m.is_infinite() {
+      u32::MAX
+    } else {
+      (m * voxel_per_meter.max(1e-6)).round().clamp(0.0, u32::MAX as f32) as u32
+    }
   }
 }
 
@@ -121,7 +126,7 @@ pub struct AtmosphereSettings {
 
 impl Default for AtmosphereSettings {
   fn default() -> Self {
-    Self { density: 0.000032, start: 128.0 }
+    Self { density: 0.0016, start: 2.56 }
   }
 }
 

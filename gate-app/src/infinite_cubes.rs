@@ -72,6 +72,7 @@ fn attach_far_levels_with(
   const WINDOW_CHUNKS: i32 = 32;
   let cap_far = gate_render::pool_capacity_chunks_far(budget_bytes);
   let ladder = far_radius_ladder(cap_far, layers);
+  let vpm = volumes.main().voxel_per_meter();
   let mut dims = IVec3::splat(WINDOW_CHUNKS * 2);
   for (k, &scale) in FAR_SCALES.iter().enumerate() {
     let (_, r_out) = ladder[k];
@@ -87,11 +88,11 @@ fn attach_far_levels_with(
     bevy::log::info!(
       "FAR L{vol} scale {scale}（1 级体素 = {scale} 世界体素）覆盖 ±{:.2}km；窗口 {}×{}×{} chunk × 256 级体素、\
        格 {FAR_GRAIN} 级体素 = {:.2}m；半径阶梯 r{r_in}..{r_out}、内容 {l} 层",
-      far_coverage_voxels(vol, budget_bytes, layers) as f32 * 0.02 / 1000.0,
+      far_coverage_voxels(vol, budget_bytes, layers) as f32 / vpm / 1000.0,
       dims.x,
       dims.y,
       dims.z,
-      FAR_GRAIN as f32 * scale as f32 * 0.02,
+      FAR_GRAIN as f32 * scale as f32 / vpm,
       r_in = ladder[k].0,
       r_out = r_out,
       l = layers[k],

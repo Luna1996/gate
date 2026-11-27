@@ -997,6 +997,7 @@ pub struct VolumesBuilder {
   transforms: Vec<VolumeTransform>,
   far: Vec<bool>,
   coverage: Vec<f32>,
+  voxel_per_meter: Vec<f32>,
   tight: Vec<Option<(IVec3, IVec3)>>,
   tight_gen: Vec<u64>,
   tight_window_gen: Vec<u64>,
@@ -1035,6 +1036,7 @@ impl VolumesBuilder {
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
     let mut coverage = Vec::with_capacity(volumes.len());
+    let mut voxel_per_meter = Vec::with_capacity(volumes.len());
     for (idx, grid) in volumes.all().iter().enumerate() {
       let region_chunks = Self::region_chunks_of(grid, budget_bytes);
       builders.push(BrickMapBuilder::build_full_sized(
@@ -1046,12 +1048,14 @@ impl VolumesBuilder {
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
       coverage.push(grid.coverage_r());
+      voxel_per_meter.push(grid.voxel_per_meter());
     }
     Self {
       builders,
       transforms,
       far,
       coverage,
+      voxel_per_meter,
       tight: vec![None; volumes.len()],
       tight_gen: vec![u64::MAX; volumes.len()],
       tight_window_gen: vec![u64::MAX; volumes.len()],
@@ -1070,6 +1074,7 @@ impl VolumesBuilder {
     let mut transforms = Vec::with_capacity(volumes.len());
     let mut far = Vec::with_capacity(volumes.len());
     let mut coverage = Vec::with_capacity(volumes.len());
+    let mut voxel_per_meter = Vec::with_capacity(volumes.len());
     for (idx, grid) in volumes.all().iter().enumerate() {
       let region_chunks = Self::region_chunks_of(grid, budget_bytes);
       builders.push(BrickMapBuilder::new_unbuilt_sized(
@@ -1081,12 +1086,14 @@ impl VolumesBuilder {
       transforms.push(grid.transform());
       far.push(grid.is_far_level());
       coverage.push(grid.coverage_r());
+      voxel_per_meter.push(grid.voxel_per_meter());
     }
     Self {
       builders,
       transforms,
       far,
       coverage,
+      voxel_per_meter,
       tight: vec![None; volumes.len()],
       tight_gen: vec![u64::MAX; volumes.len()],
       tight_window_gen: vec![u64::MAX; volumes.len()],
@@ -1122,6 +1129,7 @@ impl VolumesBuilder {
       self.transforms.push(grid.transform());
       self.far.push(grid.is_far_level());
       self.coverage.push(grid.coverage_r());
+      self.voxel_per_meter.push(grid.voxel_per_meter());
       let b = &mut self.builders[idx];
       let words = b.buffers().b_struct.len();
       b.mark_struct_words(0, words);
@@ -1130,6 +1138,7 @@ impl VolumesBuilder {
       self.transforms[i] = grid.transform();
       self.far[i] = grid.is_far_level();
       self.coverage[i] = grid.coverage_r();
+      self.voxel_per_meter[i] = grid.voxel_per_meter();
     }
     self.sync_tight(volumes);
     self.sync_windows_tight(volumes);
@@ -1321,8 +1330,15 @@ impl VolumesBuilder {
       let tr = self.transforms[i];
       let origin = IVec3::new(g.index_origin_x, g.index_origin_y, g.index_origin_z);
       let dims = IVec3::new(g.index_dims_x as i32, g.index_dims_y as i32, g.index_dims_z as i32);
-      let mut desc =
-        GridDesc::from_transform(tr, tree_bases[i], palette_bases[i], g.tile_count, origin, dims);
+      let mut desc = GridDesc::from_transform(
+        tr,
+        tree_bases[i],
+        palette_bases[i],
+        g.tile_count,
+        origin,
+        dims,
+        self.voxel_per_meter[i],
+      );
       let (mn, mx) = match self.tight[i] {
         Some((lo, hi)) if i != 0 => super::wire::box_world_aabb(tr, lo.as_vec3(), hi.as_vec3()),
         _ => super::wire::window_world_aabb(tr, origin, dims),

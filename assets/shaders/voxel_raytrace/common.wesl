@@ -98,8 +98,6 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 const MATERIAL_FLAT_SHADING: u32 = 1u;
-const MATERIAL_TEX_WORLD_SCALE: f32 = 2.0;
-const MATERIAL_VOXEL_PER_METER: f32 = 50.0;
 const MATERIAL_TRIPLANAR_SHARPNESS: f32 = 4.0;
 const MATERIAL_TRIPLANAR_SINGLE_AXIS: u32 = 0u;
 const MATERIAL_MIN_ROUGHNESS: f32 = 0.05;
@@ -112,10 +110,10 @@ fn material_sample_pos(p_world: vec3<f32>) -> vec3<f32> {
   return select(p_world, floor(p_world) + vec3<f32>(0.5), MATERIAL_FLAT_SHADING != 0u);
 }
 
-fn pbr_mip_lod(p: vec3<f32>) -> f32 {
-  let dist_voxel = length(p - view_u.cam_pos_voxel.xyz);
-  let footprint_m = dist_voxel / MATERIAL_VOXEL_PER_METER * max(view_u.lod.x, 1e-6);
-  let texels = footprint_m / MATERIAL_TEX_WORLD_SCALE * f32(textureDimensions(pbr_albedo_rough).x);
+fn pbr_mip_lod(p: vec3<f32>, voxel_per_meter: f32, tile_m: f32) -> f32 {
+  let dist_m = length(p - view_u.cam_pos_voxel.xyz) / max(voxel_per_meter, 1e-4);
+  let footprint_m = dist_m * max(view_u.lod.x, 1e-6);
+  let texels = footprint_m / max(tile_m, 1e-4) * f32(textureDimensions(pbr_albedo_rough).x);
   return max(log2(max(texels, 1.0)), 0.0);
 }
 
@@ -130,8 +128,9 @@ fn triplanar_axis(slot: u32, uv: vec2<f32>, lod: f32) -> TriplanarSample {
   return TriplanarSample(srgb_to_linear(s.rgb), s.a, met);
 }
 
-fn triplanar_sample(slot: u32, p: vec3<f32>, n: vec3<f32>, lod: f32) -> TriplanarSample {
-  let uv_scale = 1.0 / (MATERIAL_TEX_WORLD_SCALE * MATERIAL_VOXEL_PER_METER);
+fn triplanar_sample(slot: u32, p: vec3<f32>, n: vec3<f32>, lod: f32,
+                    voxel_per_meter: f32, tile_m: f32) -> TriplanarSample {
+  let uv_scale = 1.0 / (max(tile_m, 1e-4) * max(voxel_per_meter, 1e-4));
   if (MATERIAL_TRIPLANAR_SINGLE_AXIS != 0u) {
     let an = abs(n);
     if (an.x >= an.y && an.x >= an.z) { return triplanar_axis(slot, p.zy * uv_scale, lod); }
@@ -158,7 +157,8 @@ fn apply_override(asset_value: f32, ov: f32) -> f32 {
   return select(ov, asset_value, ov < 0.0);
 }
 
-fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: vec3<f32>) -> MaterialParams {
+fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: vec3<f32>,
+                        voxel_per_meter: f32) -> MaterialParams {
   let a = material_assets[min(asset, MATERIAL_ASSET_SLOTS - 1u)];
   let sc_albedo = srgb_word_to_linear(a.albedo_rough);
   let sc_roughness = f32((a.albedo_rough >> 24u) & 0xFFu) / 255.0;
@@ -173,7 +173,9 @@ fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: v
   var metallic = sc_metallic;
   if (fused != MATERIAL_SLOT_NONE) {
     let p = material_sample_pos(p_world);
-    let ts = triplanar_sample(fused, p, n, pbr_mip_lod(p));
+    let tile_m = a.tile_m;
+    let ts = triplanar_sample(
+      fused, p, n, pbr_mip_lod(p, voxel_per_meter, tile_m), voxel_per_meter, tile_m);
     albedo = ts.albedo;
     roughness = ts.roughness;
     metallic = ts.metallic;
@@ -190,14 +192,14 @@ fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: v
 }
 
 fn fetch_material(palette_base: u32, pal: u32, p_world: vec3<f32>, n: vec3<f32>,
-                  debug_asset: u32) -> MaterialParams {
+                  voxel_per_meter: f32, debug_asset: u32) -> MaterialParams {
   if (debug_asset != MATERIAL_DEBUG_NONE) {
-    return fetch_material_asset(debug_asset, 0u, 0u, p_world, n);
+    return fetch_material_asset(debug_asset, 0u, 0u, p_world, n, voxel_per_meter);
   }
   let w0 = b_palette[palette_base + pal * 2u];
   let w1 = b_palette[palette_base + pal * 2u + 1u];
   if (((w1 >> 16u) & 0xFFu & FLAGS_IS_PBR) != 0u) {
-    return fetch_material_asset(w1 & 0xFFFFu, w0, w1, p_world, n);
+    return fetch_material_asset(w1 & 0xFFFFu, w0, w1, p_world, n, voxel_per_meter);
   }
   return MaterialParams(
     srgb_word_to_linear(w0),

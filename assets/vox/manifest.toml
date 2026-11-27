@@ -1,0 +1,10 @@
+format = 1
+
+[scenes.nuke]
+voxel_per_meter = 50.0
+
+[scenes.castle]
+voxel_per_meter = 50.0
+
+[scenes.Church_Of_St_Sophia]
+voxel_per_meter = 50.0

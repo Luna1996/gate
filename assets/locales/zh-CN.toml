@@ -153,15 +153,15 @@ GI 采样网格边长 = 渲染分辨率 ÷ 档位：**只决定每帧往世界�
 控制**次级射线**（玻璃镜面反射、玻璃透射链里的折线、镜面嵌套链）能追多远，以及发不发。
 
 - **关**：一条次级射线都不发 ⇒ 玻璃只剩透射染色与环境光，没有倒影
-- **近**：限 `1024` 体素
-- **中**：限 `4096` 体素
+- **近**：限 `20m`
+- **中**：限 `80m`
 - **远**（默认）：无限远，追到世界窗口边界
 
 追太远时多数像素是在空网格里空走：反射方向朝天的像素要一路走到世界边界才判未命中。限长把这段空走砍掉，未命中处直接出环境色。"""
 "menu.render.ray.reach.off" = "关"
-"menu.render.ray.reach.near" = "近"
-"menu.render.ray.reach.mid" = "中"
-"menu.render.ray.reach.far" = "远"
+"menu.render.ray.reach.near" = "近20m"
+"menu.render.ray.reach.mid" = "中80m"
+"menu.render.ray.reach.far" = "远∞"
 "menu.render.exposure" = "曝光"
 "menu.render.exposure.enabled" = "开启"
 "menu.render.exposure.ev_up" = "提亮上限"
@@ -196,10 +196,10 @@ GI 采样网格边长 = 渲染分辨率 ÷ 档位：**只决定每帧往世界�
 "menu.render.sky.air" = "空气"
 "menu.render.sky.air.density" = "浓度"
 "menu.render.sky.air.density.tip" = """
-空气透视强度：`0` = 关；越大，远景越快融入天空。"""
+空气透视强度（按米换算）：`0` = 关；越大，远景越快融入天空。"""
 "menu.render.sky.air.start" = "起始"
 "menu.render.sky.air.start.tip" = """
-开始起雾的距离（voxel）；近处保持清晰。"""
+开始起雾的距离（米）；近处保持清晰。"""
 "menu.render.sky.blur" = "圣光"
 "menu.render.sky.blur.enabled" = "开启"
 "menu.render.sky.blur.enabled.tip" = """
@@ -261,11 +261,15 @@ GI 采样网格边长 = 渲染分辨率 ÷ 档位：**只决定每帧往世界�
 "menu.player" = "玩家"
 "menu.player.camera" = "相机"
 "menu.player.camera.pos" = "相机位置"
+"menu.player.camera.pos.tip" = """
+世界坐标（体素）；切换地图后仍按体素显示。"""
 "menu.player.camera.dir" = "相机角度"
 "menu.player.camera.mode" = "相机模式"
 "menu.player.camera.mode.orbit" = "轨道"
 "menu.player.camera.mode.fly" = "自由"
 "menu.player.camera.speed" = "飞行速度"
+"menu.player.camera.speed.tip" = """
+米/秒；切换地图时按当前 `vx/m` 自动换算为体素/秒。"""
 "menu.pinned" = "常用"
 "menu.game" = "游戏"
 "menu.game.edit" = "编辑"
@@ -290,6 +294,8 @@ GI 采样网格边长 = 渲染分辨率 ÷ 档位：**只决定每帧往世界�
 "menu.game.edit.place.shape.torus" = "圆环"
 "menu.game.edit.place.shape.random" = "随机"
 "menu.game.edit.place.size" = "大小"
+"menu.game.edit.place.size.tip" = """
+笔触直径（体素）。"""
 "menu.game.edit.place.offset" = "偏移距离"
 "menu.game.edit.place.offset.tip" = """
 几何中心相对**点击选中的体素**沿命中面法线方向的偏移（体素）：
@@ -346,9 +352,9 @@ GI 采样网格边长 = 渲染分辨率 ÷ 档位：**只决定每帧往世界�
 """
 "menu.game.world.load_radius" = "加载半径"
 "menu.game.world.load_radius.tip" = """
-全分辨率（`4³` = `8cm`）的加载半径，切比雪夫距离，单位 chunk（`5.12m`）。
+全分辨率加载半径，切比雪夫距离，单位 chunk（边长 = `256 / vx/m` 米）。
 
-全分辨率树约 `278KB`/chunk ⇒ 半径是**内存的硬杠杆**：`2` ≈ `35MB`、`3` ≈ `95MB`。
+全分辨率树约 `278KB`/chunk ⇒ 半径是**内存的硬杠杆**。
 """
 "menu.game.world.unload_radius" = "卸载半径"
 "menu.game.world.unload_radius.tip" = """

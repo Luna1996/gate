@@ -799,7 +799,7 @@ fn make_grid(idx: u32) -> Grid {
     d.aabb_min.xyz, d.aabb_max.xyz,           l_mn, l_mx,                                chunk_budget,
     col0, col1, col2,                          pos, scale,                                d.tree_base, d.palette_base,               origin, vec3<u32>(d.index_dims_x, d.index_dims_y, d.index_dims_z),
         select(-1i, i32(idx) - 1i, idx > 0u),
-    idx,                                       d.coverage_r,                            );
+    idx,                                       d.coverage_r,                            d.voxel_per_meter,                       );
 }
 
 const GRID_FLAG_FAR: u32 = 1u;

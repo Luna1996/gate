@@ -13,9 +13,7 @@ use gate_voxel::{
 
 use crate::{
   camera::{CameraMode, MouseLock, cursor_ray},
-  consts::{
-    DEMO_DISPLACE_TEX_SCALE, EDIT_BUDGET_MS, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH, EDIT_REPEAT_SECS,
-  },
+  consts::{EDIT_BUDGET_MS, EDIT_DISPLACE_SIZE_MAX, EDIT_REACH, EDIT_REPEAT_SECS},
   height_field::{MaterialDisplace, MaterialDisplaceCache},
 };
 
@@ -574,12 +572,13 @@ fn run_brush(
     return plain(grid, "未位移（擦除路径）".to_string());
   }
   let entry = *grid.palette().get(palette);
-  let (source, reason) = brush_displace_source(entry, size, pbr_set, cache);
+  let vpm = grid.voxel_per_meter();
+  let (source, reason) = brush_displace_source(entry, size, pbr_set, cache, vpm);
   let Some((md, id)) = source else {
     return plain(grid, reason);
   };
-  let f = md.displace_fn();
-  let bound = md.bound();
+  let f = md.displace_fn(vpm);
+  let bound = md.bound(vpm);
   let Some(st) =
     fill_brush_displaced(grid, center, shape, size, palette, Displace { f: &f, bound })
   else {
@@ -589,8 +588,10 @@ fn run_brush(
     voxels: st.voxels,
     stats: Some(st),
     displace: format!(
-      "已按材质 `{id}` 位移，幅度 {} 体素（峰-峰，偏置双向 ±{bound}，一张高度图铺 {DEMO_DISPLACE_TEX_SCALE} 体素）",
-      md.amplitude()
+      "已按材质 `{id}` 位移，高度 {:.3}m（{:.2} 体素，峰-峰，偏置双向 ±{bound:.2}，一张高度图铺 {:.2} 体素）",
+      md.height_m(),
+      md.amplitude(vpm),
+      md.tile_m() * vpm.max(1e-6),
     ),
   }
 }
@@ -600,6 +601,7 @@ fn brush_displace_source<'a>(
   size: u32,
   pbr_set: Option<&'a PbrTextureSet>,
   cache: Option<&'a mut MaterialDisplaceCache>,
+  voxel_per_meter: f32,
 ) -> (Option<(&'a MaterialDisplace, &'a str)>, String) {
   if !entry.flags.contains(PaletteFlags::IS_PBR) {
     return (None, "未位移（平凡变体：槽里没有资产 ⇒ 没有高度图）".to_string());
@@ -620,7 +622,7 @@ fn brush_displace_source<'a>(
   let Some(cache) = cache else {
     return (None, "未位移（位移缓存资源缺失）".to_string());
   };
-  match cache.get_or_load(id, DEMO_DISPLACE_TEX_SCALE) {
+  match cache.get_or_load(id, voxel_per_meter) {
     Some(md) => (Some((md, id)), String::new()),
     None => {
       (None, format!("未位移（材质 `{id}` 的资产幅度 = 0 或高度图不可用，见上面的缓存日志）"))
@@ -784,8 +786,9 @@ fn brush_displaced(
   size: u32,
   pbr_set: Option<&PbrTextureSet>,
   cache: Option<&mut MaterialDisplaceCache>,
+  voxel_per_meter: f32,
 ) -> (bool, String) {
-  let (source, reason) = brush_displace_source(entry, size, pbr_set, cache);
+  let (source, reason) = brush_displace_source(entry, size, pbr_set, cache, voxel_per_meter);
   (source.is_some(), reason)
 }
 
@@ -897,8 +900,12 @@ pub(crate) fn voxel_edit_input(p: VoxelEditParams) {
   let material = if erase { "-".to_string() } else { b.mat.summary() };
   let entry =
     scene.volumes.volume(target).map_or_else(PaletteEntry::default, |g| *g.palette().get(pal));
+  let vpm = scene
+    .volumes
+    .volume(target)
+    .map_or(gate_voxel::DEFAULT_VOXEL_PER_METER, gate_voxel::VolumeGrid::voxel_per_meter);
   let (displaced, reason) =
-    brush_displaced(entry, size, pbr_set.as_deref(), Some(&mut displace_cache));
+    brush_displaced(entry, size, pbr_set.as_deref(), Some(&mut displace_cache), vpm);
   let hidden = scene
     .volumes
     .volume(target)

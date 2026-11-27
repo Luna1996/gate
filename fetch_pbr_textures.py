@@ -1,6 +1,6 @@
 """批量拉取 Poly Haven 的 PBR 贴图集（CC0，免署名、可商用、可随游戏分发）。
 
-只依赖标准库（urllib + json + hashlib）：无需 pip install、无需 API key。
+只依赖标准库（Python 3.11+）：无需 pip install、无需 API key。
 数据来源：https://api.polyhaven.com （免费 API，用法见 https://polyhaven.com/our-api ）
 
 每个材质产出 3 个文件，落在 `<out>/<材质 id>/`：
@@ -8,6 +8,9 @@
     <id>_albedo.jpg       ← Poly Haven `Diffuse`    sRGB 基色（GPU 侧 albedo 层）
     <id>_roughmetal.jpg   ← Poly Haven `arm`        glTF ORM 布局：R=AO / G=Roughness / B=Metalness（GPU 侧 rough-metal 层）
     <id>_height.png       ← Poly Haven `Displacement`  位移高度场（**只在 CPU 侧**供 CSG 位移用，不进 GPU）
+
+整个 `<out>` 还会产出 `manifest.toml`（记录每个材质的物理尺寸/来源）；
+人工调参直接写在对应材质表里，脚本只覆盖生成字段，其余字段原样保留。
 
 格式取舍：albedo / roughmetal 用 jpg（8 bit 足够、体积约为 png 的 1/5）；
 height 用 png（保留高度精度，且不进显存，体积代价可接受）。
@@ -21,12 +24,15 @@ height 用 png（保留高度精度，且不进显存，体积代价可接受）
     python fetch_pbr_textures.py stone_wall_04 dirt    # 只拉指定材质（Poly Haven 材质 id）
     python fetch_pbr_textures.py --force               # 忽略本地已有文件，全部重下
     python fetch_pbr_textures.py --out D:/tmp/pbr      # 换输出目录
+    python fetch_pbr_textures.py --refresh-meta        # 只刷新 manifest.toml，扫描 <out> 下全部材质
 """
 import argparse
 import hashlib
 import json
 import pathlib
+import re
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -41,6 +47,19 @@ CHANNELS = {
     "roughmetal": ("arm", "jpg"),
     "height": ("Displacement", "png"),
 }
+
+MANIFEST_NAME = "manifest.toml"
+LICENSE = "CC0-1.0"
+GENERATED_KEYS = (
+    "provider",
+    "license",
+    "source_url",
+    "source_size_m",
+    "files_hash",
+    "albedo",
+    "roughmetal",
+    "height",
+)
 
 # 缺省拉取清单：16 类表面（全部已核实含 Diffuse / arm / Displacement）
 # metal_plate 是唯一的金属 —— 验收 metallic / roughness BRDF 与镜面反射靠它，别删。
@@ -109,6 +128,115 @@ def download(url: str, dest: pathlib.Path) -> int:
   return total
 
 
+def fetch_info(material: str) -> dict | None:
+  try:
+    return get_json(f"{API}/info/{material}")
+  except urllib.error.HTTPError as e:
+    print(f"  [失败] {material}: 查不到 info（HTTP {e.code}）")
+  except Exception as e:  # noqa: BLE001
+    print(f"  [失败] {material}: info 请求出错 {e}")
+  return None
+
+
+def meta_entry(material: str, info: dict) -> dict | None:
+  dimensions = info.get("dimensions")
+  if not isinstance(dimensions, list) or len(dimensions) != 2:
+    return None
+  try:
+    size_m = [round(float(v) / 1000.0, 3) for v in dimensions]
+  except (TypeError, ValueError):
+    return None
+  entry = {
+    "provider": "polyhaven",
+    "license": LICENSE,
+    "source_url": f"https://polyhaven.com/a/{material}",
+    "source_size_m": size_m,
+  }
+  files_hash = info.get("files_hash")
+  if isinstance(files_hash, str):
+    entry["files_hash"] = files_hash
+  for suffix, (_, fmt) in CHANNELS.items():
+    entry[suffix] = f"{material}_{suffix}.{fmt}"
+  return entry
+
+
+def merge_entry(old: dict, generated: dict) -> dict:
+  entry = dict(generated)
+  for key, value in old.items():
+    if key not in GENERATED_KEYS:
+      entry[key] = value
+  return entry
+
+
+def read_manifest(path: pathlib.Path) -> dict[str, dict]:
+  if not path.is_file():
+    return {}
+  try:
+    with path.open("rb") as f:
+      data = tomllib.load(f)
+  except Exception as e:  # noqa: BLE001
+    print(f"  [失败] 读 {shown(path)}: {e}（将重建）")
+    return {}
+  materials = data.get("materials")
+  if not isinstance(materials, dict):
+    return {}
+  return {str(k): v for k, v in materials.items() if isinstance(v, dict)}
+
+
+def toml_key(key: str) -> str:
+  if re.fullmatch(r"[A-Za-z0-9_-]+", key):
+    return key
+  return json.dumps(key, ensure_ascii=False)
+
+
+def toml_value(value: object) -> str:
+  if isinstance(value, bool):
+    return "true" if value else "false"
+  if isinstance(value, str):
+    return json.dumps(value, ensure_ascii=False)
+  if isinstance(value, (int, float)):
+    return repr(value)
+  if isinstance(value, list):
+    return "[" + ", ".join(toml_value(v) for v in value) + "]"
+  raise TypeError(f"不支持写入 TOML 的类型: {type(value).__name__}")
+
+
+def write_manifest(path: pathlib.Path, materials: dict[str, dict]) -> None:
+  lines = ["format = 1", ""]
+  for material in sorted(materials):
+    lines.append(f"[materials.{toml_key(material)}]")
+    for key, value in materials[material].items():
+      lines.append(f"{toml_key(key)} = {toml_value(value)}")
+    lines.append("")
+  tmp = path.with_suffix(path.suffix + ".part")
+  tmp.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+  tmp.replace(path)
+
+
+def refresh_meta(out: pathlib.Path) -> int:
+  old = read_manifest(out / MANIFEST_NAME)
+  dirs = sorted(p for p in out.iterdir() if p.is_dir()) if out.is_dir() else []
+  if not dirs:
+    print(f"  [缺失] {shown(out)} 下没有材质目录")
+    return 1
+  materials: dict[str, dict] = {}
+  for i, directory in enumerate(dirs, 1):
+    material = directory.name
+    print(f"[{i}/{len(dirs)}] {material}")
+    info = fetch_info(material)
+    generated = meta_entry(material, info) if info is not None else None
+    if generated is None:
+      print(f"  [缺失] {material}: 无 dimensions")
+      if material in old:
+        materials[material] = old[material]
+      continue
+    materials[material] = merge_entry(old.get(material, {}), generated)
+  write_manifest(out / MANIFEST_NAME, materials)
+  print()
+  print(f"元数据：{len(materials)} 材质 → {shown(out / MANIFEST_NAME)}")
+  return 0
+
+
 def fetch_material(material: str, res: str, out: pathlib.Path, force: bool) -> tuple[int, int, int, int]:
   """拉单个材质，返回 (下载数, 跳过数, 缺失数, 失败数)。"""
   try:
@@ -159,14 +287,23 @@ def main() -> int:
     epilog="缺省材质清单：\n  " + "\n  ".join(f"{m:<20}# {n}" for m, n in MATERIALS),
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
-  ap.add_argument("materials", nargs="*", help="Poly Haven 材质 id（缺省 = 内置 12 个，见下）")
+  ap.add_argument("materials", nargs="*", help="Poly Haven 材质 id（缺省 = 内置 16 个，见下）")
   ap.add_argument("--res", default="1k", choices=RESOLUTIONS, help="分辨率档（缺省 1k）")
   ap.add_argument("--out", default=str(default_out()), help="输出目录（缺省 assets/textures/pbr）")
   ap.add_argument("--force", action="store_true", help="忽略已存在文件，强制重下")
+  ap.add_argument(
+    "--refresh-meta",
+    action="store_true",
+    help="只刷新 manifest.toml：扫描输出目录下全部材质，不下载贴图",
+  )
   args = ap.parse_args()
 
-  materials = args.materials or list(DEFAULT_MATERIALS)
   out = pathlib.Path(args.out)
+  if args.refresh_meta:
+    return refresh_meta(out)
+
+  materials = args.materials or list(DEFAULT_MATERIALS)
+  manifest = read_manifest(out / MANIFEST_NAME)
 
   print(f"来源：Poly Haven（CC0）  分辨率：{args.res}  共 {len(materials)} 个材质")
   print(f"输出：{out}")
@@ -175,6 +312,12 @@ def main() -> int:
   totals = [0, 0, 0, 0]
   for i, material in enumerate(materials, 1):
     print(f"[{i}/{len(materials)}] {material}")
+    info = fetch_info(material)
+    generated = meta_entry(material, info) if info is not None else None
+    if generated is not None:
+      manifest[material] = merge_entry(manifest.get(material, {}), generated)
+    else:
+      print(f"  [缺失] {material}: 无 dimensions")
     result = fetch_material(material, args.res, out, args.force)
     totals = [a + b for a, b in zip(totals, result)]
 
@@ -183,6 +326,9 @@ def main() -> int:
   print(f"汇总：下载 {got} · 跳过 {skipped} · 缺失 {missing} · 失败 {failed}")
   if failed or missing:
     print("（缺失/失败不影响其余材质；检查材质 id 或换 --res 后重跑）")
+  if manifest:
+    write_manifest(out / MANIFEST_NAME, manifest)
+    print(f"元数据：{len(manifest)} 材质 → {shown(out / MANIFEST_NAME)}")
   return 0
 
 

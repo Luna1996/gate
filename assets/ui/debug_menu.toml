@@ -392,19 +392,19 @@ label = "menu.render.sky.air.density"
 value = 8.0
 min = 0.0
 max = 100.0
-step = 1.0
-decimals = 0
+step = 0.1
+decimals = 1
 tooltip = "menu.render.sky.air.density.tip"
 
 [[items.children.children.children]]
 kind = "slider"
 id = "start"
 label = "menu.render.sky.air.start"
-value = 128.0
+value = 2.56
 min = 0.0
-max = 4096.0
-step = 16.0
-decimals = 0
+max = 256.0
+step = 0.5
+decimals = 2
 tooltip = "menu.render.sky.air.start.tip"
 
 [[items.children.children]]
@@ -546,6 +546,7 @@ label = "menu.player.camera"
 kind = "input"
 id = "pos"
 label = "menu.player.camera.pos"
+tooltip = "menu.player.camera.pos.tip"
 
 [[items.children.children.fields]]
 label = "menu.camera.axis.x"
@@ -607,10 +608,11 @@ kind = "slider"
 id = "speed"
 label = "menu.player.camera.speed"
 value = 2.6
-min = 0.32
+min = 0.1
 max = 40.0
 step = 0.1
 decimals = 1
+tooltip = "menu.player.camera.speed.tip"
 
 [[items]]
 kind = "sub_menu"
@@ -658,6 +660,7 @@ selected = 0
 kind = "input"
 id = "size"
 label = "menu.game.edit.place.size"
+tooltip = "menu.game.edit.place.size.tip"
 
 [[items.children.children.children.fields]]
 label = ""

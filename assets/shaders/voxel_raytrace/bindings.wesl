@@ -81,6 +81,7 @@ struct MaterialAsset {
 
   emissive_metal: u32,
   transmission_ior: u32,
+  tile_m: f32,
 };
 
 @group(1) @binding(5) var<storage, read> material_assets: array<MaterialAsset>;
@@ -119,6 +120,7 @@ struct GridDesc {
   index_dims_z: u32,
 
   coverage_r: f32,
+  voxel_per_meter: f32,
 }
 @group(2) @binding(0) var<storage, read> grid_descs: array<GridDesc>;
 

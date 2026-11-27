@@ -21,8 +21,8 @@ pub use dirty::DirtyTracker;
 pub use produce::{ChunkProducer, ChunkSource, Detail};
 
 pub use volume::{
-  COMP_BRICK_EXTENT, COMP_BRICKS_PER_CHUNK, DirtyEdit, ResidentChange, VolumeGrid, VolumeTransform,
-  Volumes,
+  COMP_BRICK_EXTENT, COMP_BRICKS_PER_CHUNK, DEFAULT_VOXEL_PER_METER, DirtyEdit, ResidentChange,
+  VolumeGrid, VolumeTransform, Volumes,
 };
 
 pub use palette::{

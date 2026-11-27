@@ -439,7 +439,8 @@ fn lt_pick(x: vec3<f32>, nx: vec3<f32>, seed: u32) -> LtSample {
   let pal = sample_brickmap(g, voxel);
   if (pal == 0u || (palette_flags(g.palette_base, pal) & FLAGS_TRANSMISSIVE) != 0u) { return out; }
   let pc = lt_to_world(g, vec3<f32>(voxel) + vec3<f32>(0.5));
-  let le = emissive_radiance(fetch_material(g.palette_base, pal, pc, ny, MATERIAL_DEBUG_NONE),
+  let le = emissive_radiance(fetch_material(
+    g.palette_base, pal, pc, ny, g.voxel_per_meter, MATERIAL_DEBUG_NONE),
                              gi_u.params.x);
   if (!(max(le.x, max(le.y, le.z)) > 0.0)) { return out; }
   let y = lt_to_world(g, lt_face_local(voxel, t.face, gi_rand2(gi_mix(seed + 0x68E31DA4u))));
@@ -478,8 +479,8 @@ fn lt_nee(x: vec3<f32>, nx: vec3<f32>, seed: u32) -> vec3<f32> {
   var le = vec3<f32>(0.0);
   if (pal != 0u && (palette_flags(g.palette_base, pal) & FLAGS_TRANSMISSIVE) == 0u) {
     let pc = lt_to_world(g, vec3<f32>(voxel) + vec3<f32>(0.5));
-    le = emissive_radiance(fetch_material(g.palette_base, pal, pc, ny, MATERIAL_DEBUG_NONE),
-                           gi_u.params.x);
+    le = emissive_radiance(fetch_material(
+      g.palette_base, pal, pc, ny, g.voxel_per_meter, MATERIAL_DEBUG_NONE), gi_u.params.x);
   }
   if (!(max(le.x, max(le.y, le.z)) > 0.0)) {
     atomicAnd(&lt_tile[tb + LT_T_MASK + (bit >> 5u)], ~(1u << (bit & 31u)));

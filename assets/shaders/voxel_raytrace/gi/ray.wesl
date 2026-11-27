@@ -26,7 +26,7 @@ fn gi_surface(h: WorldHit, g: Grid, n: vec3<f32>, face: u32) -> GiSurface {
   let p = voxel_center_world(g, h.voxel);
   var nf = face;
   if (h.obj_id < 0) { nf = face_of_normal(n); }
-  let m = fetch_material(h.palette_base, h.pal, p, n, MATERIAL_DEBUG_NONE);
+  let m = fetch_material(h.palette_base, h.pal, p, n, g.voxel_per_meter, MATERIAL_DEBUG_NONE);
   return GiSurface(g, p, n, m, irc_addr(g, u32(h.obj_id + 1), h.voxel, p), u32(h.obj_id + 1), nf,
                    h.voxel);
 }

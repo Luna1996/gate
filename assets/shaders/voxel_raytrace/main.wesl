@@ -273,8 +273,9 @@ fn refl_hit_gi_m(voxel: vec3<i32>, face_id: u32, obj_id: i32, pal: u32, pool_r: 
   let g = make_grid(u32(obj_id) + 1u);
   let n = face_normal_world(g, face_id);
   let p = voxel_center_world(g, voxel);
-  let s = gi_surface(WorldHit(true, 0.0, p, pal, n, face_id, voxel, obj_id, g.palette_base),
-                     g, n, face_id);
+  let s = gi_surface(
+    WorldHit(true, 0.0, p, pal, n, face_id, voxel, obj_id, g.palette_base, g.voxel_per_meter),
+    g, n, face_id);
   return irc_display(s.addr, s.n);
 }
 
@@ -309,7 +310,8 @@ fn gi_merge_one(i: u32) {
   if (pal == 0u) { return; }
   let hn = voxel_normal_fast(gg, voxel, face_id, face_normal_world(gg, face_id));
   let p = voxel_center_world(gg, voxel);
-  let h = WorldHit(true, 0.0, p, pal, hn, face_id, voxel, obj, gg.palette_base);
+  let h =
+    WorldHit(true, 0.0, p, pal, hn, face_id, voxel, obj, gg.palette_base, gg.voxel_per_meter);
   gi_accumulate(gi_surface(h, gg, hn, face_id), seed);
 }
 
@@ -379,7 +381,8 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
         && (palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) == 0u) {
       refl_gi_merge(h, hnf, rseed);
     }
-    let hm = fetch_material(h.palette_base, h.pal, h.point, hn, PBR_DEBUG_ASSET);
+    let hm =
+      fetch_material(h.palette_base, h.pal, h.point, hn, h.voxel_per_meter, PBR_DEBUG_ASSET);
     let hamb = sky * GI_SKY_AMBIENT;
     let hv = face_view_dir(chain_org, voxel_center_world(hgg, h.voxel));
     let h_start = h.point + hn * surface_offset(hgg, hn, SHADOW_SURFACE_EPS);
@@ -440,7 +443,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let fp = voxel_center_world(fg, fvx);
     var fnn = n_hint;
     if (!n_hint_ok) { fnn = voxel_normal_fast(fg, fvx, first.face_id, first.n); }
-    let fm = fetch_material(first.palette_base, first.pal, fp, fnn, PBR_DEBUG_ASSET);
+    let fm = fetch_material(
+      first.palette_base, first.pal, fp, fnn, first.voxel_per_meter, PBR_DEBUG_ASSET);
     let f_off = surface_offset(fg, fnn, SHADOW_SURFACE_EPS);
     let f_face = fp + fnn * f_off;
     let fv = face_view_dir(origin_voxel, fp);
@@ -477,7 +481,9 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let gg = make_grid(u32(best.obj_id) + 1u);
     let p_voxel = voxel_center_world(gg, best.voxel);
     if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
-      return fetch_material(best.palette_base, best.pal, p_voxel, normalize(gg.col1), PBR_DEBUG_ASSET).albedo;
+      return fetch_material(
+        best.palette_base, best.pal, p_voxel, normalize(gg.col1), gg.voxel_per_meter,
+        PBR_DEBUG_ASSET).albedo;
     }
     let k0 = gi_key0(best.voxel, best.obj_id);
     let k1 = gi_key1(best.voxel, best.face_id, best.obj_id);
@@ -489,7 +495,8 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     }
     let nf = voxel_face_index(gg, n, best.obj_id);
     let kv1 = gi_key1(best.voxel, nf, best.obj_id);
-    let m = fetch_material(best.palette_base, best.pal, p_voxel, n, PBR_DEBUG_ASSET);
+    let m = fetch_material(
+      best.palette_base, best.pal, p_voxel, n, gg.voxel_per_meter, PBR_DEBUG_ASSET);
     if (gi_enabled() && gi_u.params.y > 0.0
         && (palette_flags(best.palette_base, best.pal) & FLAGS_TRANSMISSIVE) == 0u) {
       let le = emissive_radiance(m, gi_emit_gain());
@@ -580,7 +587,7 @@ fn dda_hit_unpack(raw: vec4<u32>, origin_voxel: vec3<f32>, dir_voxel: vec3<f32>)
     voxel = voxel_at_point(g, point - n * (0.5 * g.scale));
   }
   return WorldHit(true, t, point, (raw.w >> 1u) & 0x7FFFu,
-                  n, face, voxel, obj, g.palette_base);
+                  n, face, voxel, obj, g.palette_base, g.voxel_per_meter);
 }
 
 
@@ -704,7 +711,8 @@ fn refl_shade_ray(org: vec3<f32>, dir: vec3<f32>, tier: u32,
     let r_vc = voxel_center_world(rgg, rhit.voxel);
     let rn = voxel_normal_fast(rgg, rhit.voxel, rhit.face_id, rhit.n);
     let rnf = voxel_face_index(rgg, rn, rhit.obj_id);
-    let mr = fetch_material(rhit.palette_base, rhit.pal, rhit.point, rn, PBR_DEBUG_ASSET);
+    let mr = fetch_material(
+      rhit.palette_base, rhit.pal, rhit.point, rn, rhit.voxel_per_meter, PBR_DEBUG_ASSET);
     var r_vis = vec3<f32>(1.0);
     if (tier >= 3u && (light_u.g.base_flags & BASE_FLAG_SHADOW) != 0u
         && dot(rn, sun_dir) > 0.0) {
@@ -757,7 +765,7 @@ fn dda_refl(@builtin(global_invocation_id) gid: vec3<u32>,
       let gg = make_grid(u32(obj_id + 1));
       let p_voxel = voxel_center_world(gg, voxel);
       let hn = voxel_normal_fast(gg, voxel, face_id, face_normal_world(gg, face_id));
-      let hm = fetch_material(b.x, pal, p_voxel, hn, PBR_DEBUG_ASSET);
+      let hm = fetch_material(b.x, pal, p_voxel, hn, gg.voxel_per_meter, PBR_DEBUG_ASSET);
       let hv = face_view_dir(view_u.cam_pos_voxel.xyz, p_voxel);
       let rseed = refl_seed(voxel, face_id, obj_id);
       let merge_gi = tier >= REFL_TIER_GI && gi_enabled();
@@ -1025,12 +1033,15 @@ fn shade_split(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, uv:
   let gg = make_grid(u32(first.obj_id) + 1u);
   let p_voxel = voxel_center_world(gg, first.voxel);
   if ((light_u.g.base_flags & BASE_FLAG_IMPLICIT_NORMAL) == 0u) {
-    let albedo = fetch_material(first.palette_base, first.pal, p_voxel, normalize(gg.col1), PBR_DEBUG_ASSET).albedo;
+    let albedo = fetch_material(
+      first.palette_base, first.pal, p_voxel, normalize(gg.col1), gg.voxel_per_meter,
+      PBR_DEBUG_ASSET).albedo;
     return aerial_perspective(albedo, p_voxel, origin_voxel);
   }
   let k0 = gi_key0(first.voxel, first.obj_id);
   let k1 = gi_key1(first.voxel, first.face_id, first.obj_id);
-  let m = fetch_material(first.palette_base, first.pal, p_voxel, n, PBR_DEBUG_ASSET);
+  let m = fetch_material(
+    first.palette_base, first.pal, p_voxel, n, gg.voxel_per_meter, PBR_DEBUG_ASSET);
   let v = face_view_dir(origin_voxel, p_voxel);
   let nf = voxel_face_index(gg, n, first.obj_id);
   if (gi_enabled() && gi_u.params.y > 0.0
@@ -1188,7 +1199,7 @@ fn gi_restir_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
   if ((palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let hm = fetch_material(h.palette_base, h.pal, h.point,
                             face_normal_world(make_grid(u32(h.obj_id) + 1u), h.face_id),
-                            PBR_DEBUG_ASSET);
+                            h.voxel_per_meter, PBR_DEBUG_ASSET);
     if (hm.roughness < 0.1) { res_store_tmp(idx, res_none()); return; }
     var tint = vec3<f32>(1.0);
     let bh = world_trace_medium_scene(view_u.cam_pos_voxel.xyz, dir,
@@ -1283,7 +1294,7 @@ fn gi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   if ((palette_flags(h.palette_base, h.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let hm = fetch_material(h.palette_base, h.pal, h.point,
                             face_normal_world(make_grid(u32(h.obj_id) + 1u), h.face_id),
-                            PBR_DEBUG_ASSET);
+                            h.voxel_per_meter, PBR_DEBUG_ASSET);
     if (hm.roughness < 0.1) { return; }
     var tint = vec3<f32>(1.0);
     let bh = world_trace_medium_scene(view_u.cam_pos_voxel.xyz, dir,

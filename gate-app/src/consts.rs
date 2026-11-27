@@ -110,6 +110,7 @@ pub const CAM_FAR: f32 = 1_048_576.0;
 pub const ROT_SPEED: f32 = 0.005;
 pub const ZOOM_LOG_SPEED: f32 = 0.35;
 pub const FLY_SPEED_DEFAULT: f32 = 128.0;
+pub const FLY_SPEED_MPS_DEFAULT: f32 = 2.6;
 pub const FLY_SPEED_FAST_MUL: f32 = 2.0;
 
 pub const CROSSHAIR_ARM: f32 = 8.0;
@@ -121,7 +122,6 @@ pub const EDIT_REACH: f32 = f32::INFINITY;
 pub const EDIT_REPEAT_SECS: f32 = 0.1;
 pub const EDIT_BUDGET_MS: f32 = 1.0;
 
-pub const VOXEL_PER_METER: f32 = 50.0;
 pub const CAM_INFO_REFRESH_SECS: f32 = 0.25;
 pub const FPS_WINDOW_SECS: f32 = 1.0;
 pub const FPS_MAX_FRAMES_PER_TICK: u32 = 8;
@@ -138,6 +138,5 @@ pub const EXT_VOXEL_HALF: i32 = EXT_VOXEL_X / 2;
 pub const DEMO_DISPLACE_SAMPLE: bool = true;
 pub const DEMO_DISPLACE_HEIGHT_MAP: &str = "stone_wall_04";
 pub const DEMO_DISPLACE_AMPLITUDE_OVERRIDE: Option<f32> = None;
-pub const DEMO_DISPLACE_TEX_SCALE: f32 = 100.0;
 
 pub const EDIT_DISPLACE_SIZE_MAX: u32 = 32;

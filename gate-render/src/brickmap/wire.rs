@@ -87,7 +87,7 @@ impl TileMeta {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, bevy::render::render_resource::ShaderType)]
 pub struct MaterialAsset {
   pub albedo_slot: u32,
   pub roughmetal_slot: u32,
@@ -97,30 +97,10 @@ pub struct MaterialAsset {
   pub albedo_rough: u32,
   pub emissive_metal: u32,
   pub transmission_ior: u32,
+  pub tile_m: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<MaterialAsset>() == 32);
-
-pub const MATERIAL_DISPLACE_AMPLITUDE_SHIFT: u32 = 24;
-pub const MATERIAL_DISPLACE_AMPLITUDE_MASK: u32 = 0xFF;
-
-const _: () = assert!(MATERIAL_DISPLACE_AMPLITUDE_SHIFT + 8 == 32);
-const _: () =
-  assert!(MATERIAL_DISPLACE_AMPLITUDE_MASK << MATERIAL_DISPLACE_AMPLITUDE_SHIFT == 0xFF00_0000);
-
-impl MaterialAsset {
-  pub fn displacement_amplitude(&self) -> u8 {
-    ((self.emissive_metal >> MATERIAL_DISPLACE_AMPLITUDE_SHIFT) & MATERIAL_DISPLACE_AMPLITUDE_MASK)
-      as u8
-  }
-
-  pub fn with_displacement_amplitude(mut self, amplitude: u8) -> Self {
-    self.emissive_metal = (self.emissive_metal
-      & !(MATERIAL_DISPLACE_AMPLITUDE_MASK << MATERIAL_DISPLACE_AMPLITUDE_SHIFT))
-      | ((amplitude as u32) << MATERIAL_DISPLACE_AMPLITUDE_SHIFT);
-    self
-  }
-}
+const _: () = assert!(std::mem::size_of::<MaterialAsset>() == 36);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]
@@ -170,6 +150,7 @@ pub struct GridDesc {
   pub index_dims_y: u32,
   pub index_dims_z: u32,
   pub coverage_r: f32,
+  pub voxel_per_meter: f32,
 }
 
 pub const GRID_FLAG_FAR: u32 = 1;
@@ -194,6 +175,7 @@ impl GridDesc {
     index_dims_y: 0,
     index_dims_z: 0,
     coverage_r: 0.0,
+    voxel_per_meter: gate_voxel::DEFAULT_VOXEL_PER_METER,
   };
 
   pub fn from_transform(
@@ -203,6 +185,7 @@ impl GridDesc {
     chunk_count: u32,
     origin: IVec3,
     dims: IVec3,
+    voxel_per_meter: f32,
   ) -> Self {
     let (mn, mx) = transform_aabb(tr.pos, tr.rot, tr.scale);
     Self {
@@ -224,6 +207,7 @@ impl GridDesc {
       index_dims_y: dims.y as u32,
       index_dims_z: dims.z as u32,
       coverage_r: 0.0,
+      voxel_per_meter,
     }
   }
 }

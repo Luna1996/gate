@@ -1,0 +1,161 @@
+format = 1
+
+[materials.brick_wall_001]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/brick_wall_001"
+source_size_m = [3.0, 3.0]
+files_hash = "fd60577b22b011e4f5ae6ac5b2ffddd8dacf9b3d"
+albedo = "brick_wall_001_albedo.jpg"
+roughmetal = "brick_wall_001_roughmetal.jpg"
+height = "brick_wall_001_height.png"
+
+[materials.broken_brick_wall]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/broken_brick_wall"
+source_size_m = [1.8, 1.8]
+files_hash = "e439c165fc0614c43616d5c46bc56f5d47ddb9ba"
+albedo = "broken_brick_wall_albedo.jpg"
+roughmetal = "broken_brick_wall_roughmetal.jpg"
+height = "broken_brick_wall_height.png"
+
+[materials.coated_pine]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/coated_pine"
+source_size_m = [0.74, 0.74]
+files_hash = "20f1804d76ee52164de77e26096f414debe0cb16"
+albedo = "coated_pine_albedo.jpg"
+roughmetal = "coated_pine_roughmetal.jpg"
+height = "coated_pine_height.png"
+
+[materials.cobblestone_01]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/cobblestone_01"
+source_size_m = [2.4, 2.4]
+files_hash = "b38b64aeccd1acb8b06d33f82b03e4f9862766fe"
+albedo = "cobblestone_01_albedo.jpg"
+roughmetal = "cobblestone_01_roughmetal.jpg"
+height = "cobblestone_01_height.png"
+
+[materials.dirt]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/dirt"
+source_size_m = [2.0, 2.0]
+files_hash = "fe7ab433626bec3f3bdc5a478b06eed2eb12572e"
+albedo = "dirt_albedo.jpg"
+roughmetal = "dirt_roughmetal.jpg"
+height = "dirt_height.png"
+
+[materials.floor_tiles_06]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/floor_tiles_06"
+source_size_m = [3.0, 3.0]
+files_hash = "22b151bef1f180591e0d306e551fb15e4bdf2990"
+albedo = "floor_tiles_06_albedo.jpg"
+roughmetal = "floor_tiles_06_roughmetal.jpg"
+height = "floor_tiles_06_height.png"
+
+[materials.herringbone_parquet]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/herringbone_parquet"
+source_size_m = [3.4, 3.4]
+files_hash = "4bdcf23af4b65d7983d801dc3b2ba4e7c4c387ca"
+albedo = "herringbone_parquet_albedo.jpg"
+roughmetal = "herringbone_parquet_roughmetal.jpg"
+height = "herringbone_parquet_height.png"
+
+[materials.lacquered_cherry_wood]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/lacquered_cherry_wood"
+source_size_m = [1.0, 1.0]
+files_hash = "51529acac26452171bca6186287876dfd926378e"
+albedo = "lacquered_cherry_wood_albedo.jpg"
+roughmetal = "lacquered_cherry_wood_roughmetal.jpg"
+height = "lacquered_cherry_wood_height.png"
+
+[materials.laminate_floor_02]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/laminate_floor_02"
+source_size_m = [1.7, 1.7]
+files_hash = "c5bf4f78e51905d1dc9c8b408abedc65b1933483"
+albedo = "laminate_floor_02_albedo.jpg"
+roughmetal = "laminate_floor_02_roughmetal.jpg"
+height = "laminate_floor_02_height.png"
+
+[materials.marble_cliff_03]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/marble_cliff_03"
+source_size_m = [5.748, 5.748]
+files_hash = "f0c671522a668a683a2197343fc804b9cbcd65c2"
+albedo = "marble_cliff_03_albedo.jpg"
+roughmetal = "marble_cliff_03_roughmetal.jpg"
+height = "marble_cliff_03_height.png"
+
+[materials.metal_plate]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/metal_plate"
+source_size_m = [0.5, 0.5]
+files_hash = "1046b39bf68d65eeb80dab84a99186a453ee94e0"
+albedo = "metal_plate_albedo.jpg"
+roughmetal = "metal_plate_roughmetal.jpg"
+height = "metal_plate_height.png"
+
+[materials.painted_plaster_wall]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/painted_plaster_wall"
+source_size_m = [2.0, 2.0]
+files_hash = "77e9d68a3359a2815a60a62fd3f0eba0f2f41994"
+albedo = "painted_plaster_wall_albedo.jpg"
+roughmetal = "painted_plaster_wall_roughmetal.jpg"
+height = "painted_plaster_wall_height.png"
+
+[materials.rocky_terrain_02]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/rocky_terrain_02"
+source_size_m = [90.0, 90.0]
+files_hash = "a4c0d422c59c4234227eb04c1fa9d28694c60fbe"
+albedo = "rocky_terrain_02_albedo.jpg"
+roughmetal = "rocky_terrain_02_roughmetal.jpg"
+height = "rocky_terrain_02_height.png"
+
+[materials.square_tiles_03]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/square_tiles_03"
+source_size_m = [2.0, 2.0]
+files_hash = "f2cdaf1bb4f9fc3d2057e9b3d4164678a4f16a14"
+albedo = "square_tiles_03_albedo.jpg"
+roughmetal = "square_tiles_03_roughmetal.jpg"
+height = "square_tiles_03_height.png"
+
+[materials.stone_wall_04]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/stone_wall_04"
+source_size_m = [1.7, 1.7]
+files_hash = "fe2f2f914a32ae4f2fa37b5a5edf8602b1e40b7e"
+albedo = "stone_wall_04_albedo.jpg"
+roughmetal = "stone_wall_04_roughmetal.jpg"
+height = "stone_wall_04_height.png"
+
+[materials.wooden_floor_01]
+provider = "polyhaven"
+license = "CC0-1.0"
+source_url = "https://polyhaven.com/a/wooden_floor_01"
+source_size_m = [1.988, 1.988]
+files_hash = "d5604305db653976734724d914f6451ec2350343"
+albedo = "wooden_floor_01_albedo.jpg"
+roughmetal = "wooden_floor_01_roughmetal.jpg"
+height = "wooden_floor_01_height.png"

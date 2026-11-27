@@ -272,6 +272,7 @@ pub struct GpuBrickMap {
   pub globals: UniformBuffer<BrickMapGlobals>,
   pub main_window_origin: IVec3,
   pub main_window_dims: UVec3,
+  pub main_voxel_per_meter: f32,
   pub volume_windows: Vec<IVec3>,
   pub light_sampler: Sampler,
   pub blit_sampler: Sampler,
@@ -401,6 +402,7 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     globals,
     main_window_origin: IVec3::ZERO,
     main_window_dims: UVec3::ZERO,
+    main_voxel_per_meter: gate_voxel::DEFAULT_VOXEL_PER_METER,
     volume_windows: Vec::new(),
     light_sampler,
     blit_sampler,
@@ -1031,6 +1033,7 @@ pub(crate) fn prepare(p: PrepareParams) {
     IVec3::new(main_desc.index_origin_x, main_desc.index_origin_y, main_desc.index_origin_z);
   gpu.main_window_dims =
     UVec3::new(main_desc.index_dims_x, main_desc.index_dims_y, main_desc.index_dims_z);
+  gpu.main_voxel_per_meter = main_desc.voxel_per_meter;
   gpu.volume_windows = snap
     .volumes
     .grid_descs

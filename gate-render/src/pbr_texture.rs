@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use bevy::{
   asset::RenderAssetUsages,
@@ -14,6 +16,8 @@ use bevy::{
     renderer::RenderDevice,
   },
 };
+
+use serde::Deserialize;
 
 use crate::brickmap::wire::{MATERIAL_SLOT_NONE, MaterialAsset};
 
@@ -69,6 +73,10 @@ impl PbrTextureSet {
     self.ids.iter().position(|x| x == id).map(|i| i as u32)
   }
 
+  pub fn meta(&self, slot: u32) -> Option<PbrMaterialMeta> {
+    self.ids.get(slot as usize).map(|id| material_meta(id))
+  }
+
   pub fn albedo_rough(&self) -> &Handle<Image> {
     &self.albedo_rough
   }
@@ -99,30 +107,106 @@ pub const METAL_DEMO_ID: &str = "metal_plate";
 
 pub const DISPLACE_DEMO_ID: &str = "stone_wall_04";
 
-pub const DISPLACE_DEMO_AMPLITUDE: u8 = 8;
+pub const DISPLACE_DEMO_HEIGHT_M: f32 = 0.16;
 
-pub const DISPLACE_TEX_DEMO_AMPLITUDE: u8 = 4;
+pub const DISPLACE_TEX_DEMO_HEIGHT_M: f32 = 0.08;
 
-fn default_displacement_amplitude(id: &str) -> u8 {
+const DEFAULT_TILE_M: f32 = 2.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PbrMaterialMeta {
+  pub source_size_m: [f32; 2],
+  pub tile_m: [f32; 2],
+  pub height_m: f32,
+  pub has_height: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct MaterialEntry {
+  #[serde(default)]
+  source_size_m: Option<[f32; 2]>,
+  #[serde(default)]
+  tile_m: Option<[f32; 2]>,
+  #[serde(default)]
+  height_m: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct ManifestFile {
+  format: u32,
+  #[serde(default)]
+  materials: BTreeMap<String, MaterialEntry>,
+}
+
+fn manifest() -> &'static BTreeMap<String, MaterialEntry> {
+  static CACHE: OnceLock<BTreeMap<String, MaterialEntry>> = OnceLock::new();
+  CACHE.get_or_init(|| {
+    let path = crate::paths::assets_dir().join(PBR_TEXTURE_DIR).join("manifest.toml");
+    let src = match std::fs::read_to_string(&path) {
+      Ok(v) => v,
+      Err(e) => {
+        warn!(
+          target: "gate",
+          "PBR 贴图集! 读 {} 失败（{e}）⇒ 平铺尺度回落 {DEFAULT_TILE_M}m",
+          path.display()
+        );
+        return BTreeMap::new();
+      }
+    };
+    match toml::from_str::<ManifestFile>(&src) {
+      Ok(m) if m.format == 1 => m.materials,
+      Ok(m) => {
+        warn!(
+          target: "gate",
+          "PBR 贴图集! {} format={}（只认 1）⇒ 平铺尺度回落 {DEFAULT_TILE_M}m",
+          path.display(),
+          m.format
+        );
+        BTreeMap::new()
+      }
+      Err(e) => {
+        warn!(
+          target: "gate",
+          "PBR 贴图集! 解析 {} 失败（{e}）⇒ 平铺尺度回落 {DEFAULT_TILE_M}m",
+          path.display()
+        );
+        BTreeMap::new()
+      }
+    }
+  })
+}
+
+fn default_height_m(id: &str) -> f32 {
   if !has_height_map(id) {
-    return 0;
+    return 0.0;
   }
-  if id == DISPLACE_DEMO_ID { DISPLACE_DEMO_AMPLITUDE } else { DISPLACE_TEX_DEMO_AMPLITUDE }
+  if id == DISPLACE_DEMO_ID { DISPLACE_DEMO_HEIGHT_M } else { DISPLACE_TEX_DEMO_HEIGHT_M }
 }
 
 fn has_height_map(id: &str) -> bool {
   crate::paths::assets_dir()
-    .join("textures")
-    .join("pbr")
+    .join(PBR_TEXTURE_DIR)
     .join(id)
     .join(format!("{id}{HEIGHT_SUFFIX}"))
     .is_file()
 }
 
-pub fn displacement_amplitude_of(id: &str) -> Option<u8> {
-  let root = crate::paths::assets_dir().join("textures").join("pbr");
-  let ids = scan_material_dirs(&root).ok()?;
-  ids.iter().any(|x| x == id).then(|| default_displacement_amplitude(id))
+pub fn material_meta(id: &str) -> PbrMaterialMeta {
+  let entry = manifest().get(id);
+  if entry.is_none() {
+    bevy::log::debug!(
+      target: "gate",
+      "PBR 贴图集! 材质 `{id}` 无 manifest 条目 ⇒ 平铺 {DEFAULT_TILE_M}m"
+    );
+  }
+  let source = entry.and_then(|e| e.source_size_m).unwrap_or([DEFAULT_TILE_M; 2]);
+  let tile = entry.and_then(|e| e.tile_m).unwrap_or(source);
+  PbrMaterialMeta {
+    source_size_m: source,
+    tile_m: tile,
+    height_m: entry.and_then(|e| e.height_m).unwrap_or_else(|| default_height_m(id)),
+    has_height: has_height_map(id),
+  }
 }
 
 pub fn material_ids() -> Vec<String> {
@@ -148,7 +232,8 @@ pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
       let i = i as u32;
       let textured = i < set.layers();
       let metallic = if metal_demo == Some(i) { METAL_DEMO_METALLIC as u32 } else { 0 };
-      let amplitude = set.ids().get(i as usize).map_or(0, |id| default_displacement_amplitude(id));
+      let tile_m =
+        set.ids().get(i as usize).map_or(DEFAULT_TILE_M, |id| material_meta(id).tile_m[0]);
       MaterialAsset {
         albedo_slot: if textured { i } else { MATERIAL_SLOT_NONE },
         roughmetal_slot: if textured { i } else { MATERIAL_SLOT_NONE },
@@ -158,8 +243,8 @@ pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
         albedo_rough,
         emissive_metal: metallic << 8 | (DEFAULT_SPECULAR as u32) << 16,
         transmission_ior: (DEFAULT_IOR_X100 as u32) << 16,
+        tile_m,
       }
-      .with_displacement_amplitude(amplitude)
     })
     .collect()
 }
@@ -576,24 +661,24 @@ fn log_texture_set(set: &PbrTextureSet) {
     .ids()
     .iter()
     .enumerate()
-    .map(|(slot, id)| (slot, id, default_displacement_amplitude(id)))
-    .filter(|(_, _, amp)| *amp > 0)
-    .map(|(slot, id, amp)| format!("{slot}={id}({amp})"))
+    .map(|(slot, id)| (slot, id, material_meta(id)))
+    .filter(|(_, _, meta)| meta.has_height && meta.height_m > 0.0)
+    .map(|(slot, id, meta)| format!("{slot}={id}({:.3}m)", meta.height_m))
     .collect();
   if displaced.is_empty() {
     warn!(
       target: "gate",
-      "位移幅度: 资产表无任何非 0 幅度（这 {n} 个材质目录都无 `<id>_height.png`）⇒ 笔触与 CSG 不位移；\
+      "位移高度: 资产表无任何非 0 高度（这 {n} 个材质目录都无 `<id>_height.png`）⇒ 笔触与 CSG 不位移；\
        放回 assets/textures/pbr/<id>/ 即恢复"
     );
   } else {
     info!(
       target: "gate",
-      "位移幅度: 非 0 槽位（`槽=id(幅度体素，峰-峰；偏置 0.5)`）= {} —— `{DISPLACE_DEMO_ID}` 是 {} 体素、\
-       其余 {} 体素（`DISPLACE_TEX_DEMO_AMPLITUDE`）；无高度图者恒 0",
+      "位移高度: 非 0 槽位（`槽=id(米，峰-峰；偏置 0.5)`）= {} —— `{DISPLACE_DEMO_ID}` 默认 {}m、\
+       其余 {}m；按物体每米体素数换算为体素；无高度图者恒 0",
       displaced.join("  "),
-      DISPLACE_DEMO_AMPLITUDE,
-      DISPLACE_TEX_DEMO_AMPLITUDE,
+      DISPLACE_DEMO_HEIGHT_M,
+      DISPLACE_TEX_DEMO_HEIGHT_M,
     );
   }
   for (row, chunk) in set.ids().chunks(SLOT_LOG_PER_LINE).enumerate() {
@@ -607,6 +692,18 @@ fn log_texture_set(set: &PbrTextureSet) {
       target: "gate",
       "PBR 槽位（字典序 = texture_2d_array 层号，albedo_rough / metal 同层）: {line}",
     );
+  }
+  for (row, chunk) in set.ids().chunks(SLOT_LOG_PER_LINE).enumerate() {
+    let line = chunk
+      .iter()
+      .enumerate()
+      .map(|(i, id)| {
+        let meta = material_meta(id);
+        format!("{}={id}({:.3}m)", row * SLOT_LOG_PER_LINE + i, meta.tile_m[0])
+      })
+      .collect::<Vec<_>>()
+      .join("  ");
+    info!(target: "gate", "PBR 平铺尺寸（manifest tile_m / source_size_m）: {line}");
   }
 }
 

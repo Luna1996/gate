@@ -9,6 +9,7 @@ use crate::palette::{Palette, PaletteId};
 
 pub const COMP_BRICKS_PER_CHUNK: usize = 16 * 16 * 16;
 pub const COMP_BRICK_EXTENT: i32 = 16;
+pub const DEFAULT_VOXEL_PER_METER: f32 = 50.0;
 
 const RESIDENT_LOG_MAX: usize = 16 * 1024;
 
@@ -40,6 +41,7 @@ pub struct VolumeGrid {
   far_level: bool,
   coverage_r: f32,
   attach_far: bool,
+  voxel_per_meter: f32,
 }
 
 impl Default for VolumeGrid {
@@ -65,6 +67,7 @@ impl Default for VolumeGrid {
       far_level: false,
       coverage_r: 0.0,
       attach_far: false,
+      voxel_per_meter: DEFAULT_VOXEL_PER_METER,
     }
   }
 }
@@ -141,7 +144,10 @@ impl Volumes {
 
   pub fn spawn_object(&mut self, pos: Vec3, rot: Mat3, scale: f32) -> i32 {
     let obj_id = self.list.len() as i32 - 1;
-    self.list.push(VolumeGrid::new_object(obj_id, pos, rot, scale));
+    let vpm = self.list.first().map_or(DEFAULT_VOXEL_PER_METER, VolumeGrid::voxel_per_meter);
+    let mut grid = VolumeGrid::new_object(obj_id, pos, rot, scale);
+    grid.set_voxel_per_meter(vpm);
+    self.list.push(grid);
     obj_id
   }
 
@@ -178,8 +184,10 @@ impl Volumes {
 
   pub fn add_far_level(&mut self, scale: f32) -> usize {
     let idx = self.list.len();
+    let vpm = self.list.first().map_or(DEFAULT_VOXEL_PER_METER, VolumeGrid::voxel_per_meter);
     let mut grid = VolumeGrid::new_object(idx as i32 - 1, Vec3::ZERO, Mat3::IDENTITY, scale);
     grid.far_level = true;
+    grid.set_voxel_per_meter(vpm);
     self.list.push(grid);
     idx
   }
@@ -221,6 +229,16 @@ impl VolumeGrid {
 
   pub fn obj_id(&self) -> i32 {
     self.obj_id
+  }
+
+  pub fn voxel_per_meter(&self) -> f32 {
+    self.voxel_per_meter
+  }
+
+  pub fn set_voxel_per_meter(&mut self, vpm: f32) {
+    if vpm.is_finite() && vpm > 0.0 {
+      self.voxel_per_meter = vpm;
+    }
   }
 
   pub fn is_far_level(&self) -> bool {

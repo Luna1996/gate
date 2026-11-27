@@ -18,7 +18,6 @@ use crate::field::{Field, world_aabb_of};
 use crate::solver::{Constraint, ContactConstraint, ContactParams, POSITION_BETA, color_by_body};
 use crate::statics::{StaticField, chunk_of};
 
-pub const VOXELS_PER_METER: f32 = 50.0;
 pub const WORLD_BODY: usize = 0;
 
 #[derive(Clone, Copy, Debug)]
@@ -42,7 +41,7 @@ pub struct StepConfig {
 impl Default for StepConfig {
   fn default() -> Self {
     Self {
-      gravity: Vec3::new(0.0, -9.81 * VOXELS_PER_METER, 0.0),
+      gravity: Vec3::ZERO,
       substeps: 8,
       iterations: 2,
       params: ContactParams::default(),

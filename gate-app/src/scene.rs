@@ -13,8 +13,8 @@ use gate_voxel::{
 use crate::{
   consts::{
     CAM_FAR, CAM_NEAR, DEMO_DISPLACE_AMPLITUDE_OVERRIDE, DEMO_DISPLACE_HEIGHT_MAP,
-    DEMO_DISPLACE_SAMPLE, DEMO_DISPLACE_TEX_SCALE, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y,
-    START_CAMERA_SKY, STARTUP_DEMO_SCENE,
+    DEMO_DISPLACE_SAMPLE, EXT_VOXEL_HALF, EXT_VOXEL_X, EXT_VOXEL_Z, FOV_Y, START_CAMERA_SKY,
+    STARTUP_DEMO_SCENE,
   },
   height_field::MaterialDisplace,
   mc, vox_scene,
@@ -34,6 +34,7 @@ pub(crate) fn setup(
   config: Res<crate::config::Config>,
   mut stream: ResMut<crate::infinite_cubes::Streaming>,
   pbr: Option<Res<gate_render::PbrTextureSet>>,
+  mut phys: ResMut<crate::physics::PhysicsState>,
 ) {
   let dda_handle = create_dda_image(&mut images);
   commands.spawn((Camera2d, Msaa::Off, UiPickingCamera));
@@ -91,6 +92,8 @@ pub(crate) fn setup(
   }
   grid.compact_all();
   bevy::log::info!("STEP 3 compact_all {:?}", t0.elapsed());
+  let vpm = grid.voxel_per_meter();
+  phys.cfg.gravity = Vec3::new(0.0, -9.81 * vpm, 0.0);
 
   let orbit = if START_CAMERA_SKY {
     OrbitCamera::from_eye(
@@ -111,9 +114,17 @@ pub(crate) fn setup(
     CAM_FAR,
   ));
   commands.insert_resource(saved.map_or(crate::camera::CameraMode::default(), |p| p.mode));
+  let speed_mps = config
+    .menu
+    .get("player/camera/speed")
+    .and_then(|v| match v {
+      gate_ui::MenuValue::Number(n) => Some(*n as f32),
+      _ => None,
+    })
+    .unwrap_or(crate::consts::FLY_SPEED_MPS_DEFAULT);
   commands.insert_resource(crate::camera::FlyCamera {
     pos: orbit.eye(),
-    speed: crate::consts::FLY_SPEED_DEFAULT,
+    speed: speed_mps * vpm,
     fast: false,
   });
 
@@ -188,6 +199,13 @@ fn build_world(
   cam_eye: IVec3,
   stream: &mut crate::infinite_cubes::Streaming,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
+  let vpm = if name == mc::GREEN_FIELD {
+    mc::VOXELS_PER_BLOCK as f32
+  } else {
+    vox_scene::voxel_per_meter(name)
+  };
+  grid.set_voxel_per_meter(vpm);
+  bevy::log::info!("世界 {name}: {vpm:.1} vx/m");
   if name == CUBE_IN_VOID {
     stream.set_source(None);
     return Ok(build_cube_in_void(grid));
@@ -643,34 +661,32 @@ fn build_displace_sample(grid: &mut VolumeGrid) {
 
   let base_voxels = fill_box(grid, plain, extent, 4);
 
-  let sample = match MaterialDisplace::load(
-    DEMO_DISPLACE_HEIGHT_MAP,
-    DEMO_DISPLACE_TEX_SCALE,
-    DEMO_DISPLACE_AMPLITUDE_OVERRIDE,
-  ) {
-    Ok(Some(s)) => s,
-    Ok(None) => {
-      let n = fill_box(grid, bumped, extent, 4);
-      bevy::log::warn!(
-        target: "gate",
-        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 幅度 = 0（资产值）⇒ 右台不位移\
-         （普通 CSG，写入 {n} 体素）"
-      );
-      return;
-    }
-    Err(e) => {
-      let n = fill_box(grid, bumped, extent, 4);
-      bevy::log::warn!(
-        target: "gate",
-        "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 高度图不可用（{e}）⇒ 右台普通 CSG\
-         （写入 {n} 体素）；放回 assets/textures/pbr/{DEMO_DISPLACE_HEIGHT_MAP}/\
-         {DEMO_DISPLACE_HEIGHT_MAP}_height.png 即恢复"
-      );
-      return;
-    }
-  };
-  let f = sample.displace_fn();
-  let bound = sample.bound();
+  let vpm = grid.voxel_per_meter();
+  let sample =
+    match MaterialDisplace::load(DEMO_DISPLACE_HEIGHT_MAP, vpm, DEMO_DISPLACE_AMPLITUDE_OVERRIDE) {
+      Ok(Some(s)) => s,
+      Ok(None) => {
+        let n = fill_box(grid, bumped, extent, 4);
+        bevy::log::warn!(
+          target: "gate",
+          "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 幅度 = 0（资产值）⇒ 右台不位移\
+           （普通 CSG，写入 {n} 体素）"
+        );
+        return;
+      }
+      Err(e) => {
+        let n = fill_box(grid, bumped, extent, 4);
+        bevy::log::warn!(
+          target: "gate",
+          "MT8-5 位移样例：材质 `{DEMO_DISPLACE_HEIGHT_MAP}` 高度图不可用（{e}）⇒ 右台普通 CSG\
+           （写入 {n} 体素）；放回 assets/textures/pbr/{DEMO_DISPLACE_HEIGHT_MAP}/\
+           {DEMO_DISPLACE_HEIGHT_MAP}_height.png 即恢复"
+        );
+        return;
+      }
+    };
+  let f = sample.displace_fn(vpm);
+  let bound = sample.bound(vpm);
   let t0 = std::time::Instant::now();
   let st = fill_box_displaced(grid, bumped, extent, 4, Some(Displace { f: &f, bound }));
   let (lo, hi) = sample.field().range();
@@ -679,8 +695,10 @@ fn build_displace_sample(grid: &mut VolumeGrid) {
     target: "gate",
     "MT6/MT8-5 位移样例 基准台 @{plain}+{extent} 普通 CSG {base_voxels} 体素 | \
      位移台 @{bumped}+{extent} 高度图 {DEMO_DISPLACE_HEIGHT_MAP} {w}×{h} texel {lo:.3}..{hi:.3} \
-     幅度 {} 体素 ±{bound} 铺 {DEMO_DISPLACE_TEX_SCALE} 体素 ⇒ {} 体素 整块 {}={} 壳层 {} {:?}",
-    sample.amplitude(),
+     高度 {:.3}m 幅度 {:.2} 体素 @{vpm:.1}vx/m ±{bound:.2} 每张铺 {:.2} 体素 ⇒ {} 体素 整块 {}={} 壳层 {} {:?}",
+    sample.height_m(),
+    sample.amplitude(vpm),
+    sample.tile_m() * vpm,
     st.voxels,
     st.whole_bricks,
     st.whole_bricks * 64,

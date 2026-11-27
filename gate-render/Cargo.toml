@@ -17,6 +17,7 @@ gate-voxel = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 ron = { workspace = true }
+toml = "0.8"
 uuid = "1"
 wgpu = "=30.0.1"
 wgpu-profiler = { workspace = true, optional = true }

@@ -118,70 +118,78 @@ fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
 
 pub struct MaterialDisplace {
   field: HeightField,
-  amplitude: f32,
-  tex_scale: f32,
+  height_m: f32,
+  tile_m: f32,
 }
 
 impl MaterialDisplace {
   pub fn load(
     id: &str,
-    tex_scale_voxels: f32,
+    voxel_per_meter: f32,
     amplitude_override: Option<f32>,
   ) -> Result<Option<Self>, String> {
-    let Some(asset_amplitude) = gate_render::pbr_texture::displacement_amplitude_of(id) else {
+    let meta = gate_render::pbr_texture::material_meta(id);
+    if !meta.has_height || meta.height_m <= 0.0 {
       info!(
         target: "gate",
-        "位移源 材质 `{id}` 不在 PBR 材质目录集 → 不位移（普通 CSG）",
+        "位移源 材质 `{id}` 高度 = 0（无高度图或未配置）→ 不位移（普通 CSG）",
       );
       return Ok(None);
-    };
-    let (amplitude, from_asset) = match amplitude_override {
-      Some(v) => (v, false),
-      None => (asset_amplitude as f32, true),
-    };
-    if amplitude == 0.0 {
+    }
+    let height_m = amplitude_override.map_or(meta.height_m, |v| v / voxel_per_meter.max(1e-6));
+    if height_m <= 0.0 {
       info!(
         target: "gate",
-        "位移源 材质 `{id}` 幅度 = 0（资产值）→ 不位移（普通 CSG）",
+        "位移源 材质 `{id}` 高度 = 0（覆盖值）→ 不位移（普通 CSG）",
       );
       return Ok(None);
     }
     let path =
       crate::assets_dir().join("textures").join("pbr").join(id).join(format!("{id}_height.png"));
     let field = HeightField::load_png(&path)?;
+    let tile_m = meta.tile_m[0].max(1e-4);
+    let amplitude = height_m * voxel_per_meter.max(1e-6);
     let bound = displace_bound(amplitude);
     let (lo, hi) = field.range();
     let size = field.size();
-    let source = if from_asset {
-      format!("幅度来自资产 id=`{id}`")
+    let source = if amplitude_override.is_some() {
+      "高度来自 consts::DEMO_DISPLACE_AMPLITUDE_OVERRIDE（实验旋钮）".to_string()
     } else {
-      "幅度来自 consts::DEMO_DISPLACE_AMPLITUDE_OVERRIDE（实验旋钮）".to_string()
+      format!("高度来自资产 id=`{id}`")
     };
     info!(
       target: "gate",
-      "位移源 材质 `{id}` 幅度 = {amplitude} 体素（峰-峰，±{bound}）{source}；\
-       高度图 {path} {w}×{h} texel {lo:.3}..{hi:.3}；铺 {tex_scale_voxels} 体素",
+      "位移源 材质 `{id}` 高度 = {height_m:.3}m（峰-峰 {amplitude:.2} 体素 @ {voxel_per_meter:.1}vx/m，\
+       ±{bound:.2}）{source}；高度图 {path} {w}×{h} texel {lo:.3}..{hi:.3}；每张铺 {tile_m:.3}m",
       path = path.display(),
       w = size.x,
       h = size.y,
     );
-    Ok(Some(Self { field, amplitude, tex_scale: tex_scale_voxels }))
+    Ok(Some(Self { field, height_m, tile_m }))
   }
 
-  pub fn amplitude(&self) -> f32 {
-    self.amplitude
+  pub fn amplitude(&self, voxel_per_meter: f32) -> f32 {
+    self.height_m * voxel_per_meter.max(1e-6)
   }
 
-  pub fn bound(&self) -> f32 {
-    displace_bound(self.amplitude)
+  pub fn bound(&self, voxel_per_meter: f32) -> f32 {
+    displace_bound(self.amplitude(voxel_per_meter))
   }
 
   pub fn field(&self) -> &HeightField {
     &self.field
   }
 
-  pub fn displace_fn(&self) -> impl Fn(Vec3, Vec3) -> f32 + '_ {
-    self.field.displace_fn(self.amplitude, self.tex_scale)
+  pub fn height_m(&self) -> f32 {
+    self.height_m
+  }
+
+  pub fn tile_m(&self) -> f32 {
+    self.tile_m
+  }
+
+  pub fn displace_fn(&self, voxel_per_meter: f32) -> impl Fn(Vec3, Vec3) -> f32 + '_ {
+    self.field.displace_fn(self.amplitude(voxel_per_meter), self.tile_m * voxel_per_meter.max(1e-6))
   }
 }
 
@@ -193,7 +201,7 @@ pub struct MaterialDisplaceCache {
 }
 
 impl MaterialDisplaceCache {
-  pub fn get_or_load(&mut self, id: &str, tex_scale_voxels: f32) -> Option<&MaterialDisplace> {
+  pub fn get_or_load(&mut self, id: &str, voxel_per_meter: f32) -> Option<&MaterialDisplace> {
     if self.entries.contains_key(id) {
       self.hits += 1;
       let t0 = Instant::now();
@@ -207,7 +215,7 @@ impl MaterialDisplaceCache {
       return found;
     }
     let t0 = Instant::now();
-    let loaded = match MaterialDisplace::load(id, tex_scale_voxels, None) {
+    let loaded = match MaterialDisplace::load(id, voxel_per_meter, None) {
       Ok(v) => v,
       Err(e) => {
         warn!(
@@ -223,10 +231,12 @@ impl MaterialDisplaceCache {
     match &loaded {
       Some(md) => info!(
         target: "gate",
-        "位移缓存 材质 `{id}` 首次解码 #{} 耗时 {elapsed:?} 幅度 {} 体素、铺 {tex_scale_voxels} 体素\
+        "位移缓存 材质 `{id}` 首次解码 #{} 耗时 {elapsed:?} 高度 {:.3}m、幅度 {:.2} 体素、每张铺 {:.2} 体素\
          ⇒ 此后落笔命中缓存、解码耗时 0",
         self.decodes,
-        md.amplitude(),
+        md.height_m,
+        md.amplitude(voxel_per_meter),
+        md.tile_m() * voxel_per_meter.max(1e-6),
       ),
       None => info!(
         target: "gate",

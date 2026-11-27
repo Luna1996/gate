@@ -168,6 +168,7 @@ fn face_normal_world(g: Grid, face_id: u32) -> vec3<f32> {
 struct SceneHit {
   uh: UnifiedHit,
   palette_base: u32,
+  voxel_per_meter: f32,
 }
 
 fn coverage_r_of(g: Grid) -> f32 {
@@ -217,6 +218,7 @@ fn bvh_leaf(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_hi_cap: f32, t_min: f
     *best_t = mhi.t;
     (*best).uh = mhi;
     (*best).palette_base = gi.palette_base;
+    (*best).voxel_per_meter = gi.voxel_per_meter;
   }
 }
 
@@ -326,6 +328,7 @@ fn trace_far(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32, depth_ca
       *best_t = mhi.t;
       (*best).uh = mhi;
       (*best).palette_base = gi.palette_base;
+      (*best).voxel_per_meter = gi.voxel_per_meter;
     }
     *shell = max(*shell, coverage_r_of(gi));
   }
@@ -349,10 +352,12 @@ fn trace_scene(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f
   }
   let jit = 1.0;
   var best = SceneHit(
-    trace_grid(g0, origin, dir, g0_cap, t_min, depth_cap, false, req, &mc_off, &gap), 0u);
+    trace_grid(g0, origin, dir, g0_cap, t_min, depth_cap, false, req, &mc_off, &gap), 0u,
+    g0.voxel_per_meter);
   if (best.uh.hit) {
     best_t = best.uh.t;
     best.palette_base = g0.palette_base;
+    best.voxel_per_meter = g0.voxel_per_meter;
   }
   trace_near(origin, dir, t_cap, t_min, depth_cap, req, &best, &best_t, &mc_off, &gap);
   trace_far(origin, dir, t_cap, t_min, depth_cap, req, far, jit, origin_xz, &shell, &best, &best_t,
@@ -398,17 +403,19 @@ struct WorldHit {
   voxel: vec3<i32>,
   obj_id: i32,
   palette_base: u32,
+  voxel_per_meter: f32,
 }
 
 fn world_miss() -> WorldHit {
-  return WorldHit(false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), -1, 0u);
+  return WorldHit(
+    false, 0.0, vec3<f32>(0.0), 0u, vec3<f32>(0.0), 0u, vec3<i32>(0), -1, 0u, 1.0);
 }
 
 fn world_raycast(g0: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, cfg: WorldRayQuery) -> WorldHit {
   let s = trace_scene(g0, origin, dir, max_t, cfg.t_min, cfg.depth_cap, cfg.req, cfg.far);
   return WorldHit(
     s.uh.hit, s.uh.t, origin + dir * s.uh.t, s.uh.pal, s.uh.n,
-    s.uh.face_id, s.uh.voxel, s.uh.obj_id, s.palette_base);
+    s.uh.face_id, s.uh.voxel, s.uh.obj_id, s.palette_base, s.voxel_per_meter);
 }
 
 fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
@@ -420,7 +427,7 @@ fn world_trace_medium(g: Grid, origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
   *tint = *tint * mc.tint;
   return WorldHit(
     h.hit, h.t, origin + dir * h.t, h.pal, h.n,
-    h.face_id, h.voxel, h.obj_id, g.palette_base);
+    h.face_id, h.voxel, h.obj_id, g.palette_base, g.voxel_per_meter);
 }
 
 fn medium_one(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f32,
@@ -437,7 +444,8 @@ fn medium_one(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f3
   if (h.hit && h.t < *best_t) {
     *best_t = h.t;
     *best = WorldHit(
-      h.hit, h.t, origin + dir * h.t, h.pal, h.n, h.face_id, h.voxel, h.obj_id, gi.palette_base);
+      h.hit, h.t, origin + dir * h.t, h.pal, h.n, h.face_id, h.voxel, h.obj_id, gi.palette_base,
+      gi.voxel_per_meter);
   }
 }
 

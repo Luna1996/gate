@@ -1765,15 +1765,17 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     .as_ref()
     .map_or(crate::lighting::BaseSettings::default().soft_angle_deg, |b| b.soft_angle_deg);
   lp.0.get_mut().lights[0].shape.y = soft_angle.clamp(0.0, 5.0).to_radians();
+  let vpm = gpu.main_voxel_per_meter.max(1e-6);
 
   lp.0.get_mut().g.refl_tier = tune.refl.as_ref().map_or(0, |r| r.tier());
   lp.0.get_mut().g.refl_nest = tune.refl.as_ref().map_or(0, |r| r.nest());
-  lp.0.get_mut().g.refl_reach = tune.refl.as_ref().map_or(0, |r| r.reach());
+  lp.0.get_mut().g.refl_reach = tune.refl.as_ref().map_or(0, |r| r.reach_voxels(vpm));
 
   lp.0.get_mut().g.base_flags =
     tune.base.as_ref().map_or(crate::lighting::BaseSettings::default().flags(), |b| b.flags());
   let atmo = tune.atmo.as_deref().copied().unwrap_or_default();
-  lp.0.get_mut().g.exposure_pad = Vec4::new(atmo.density.max(0.0), atmo.start.max(0.0), 0.0, 0.0);
+  lp.0.get_mut().g.exposure_pad =
+    Vec4::new(atmo.density.max(0.0) / vpm, atmo.start.max(0.0) * vpm, 0.0, 0.0);
   lp.0.write_buffer(&render_device, &queue);
   let bg3 = render_device.create_bind_group(None, &bg3_layout, &BindGroupEntries::single(&lp.0));
 

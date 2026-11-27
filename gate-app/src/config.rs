@@ -10,6 +10,8 @@ use crate::camera::{CameraMode, CameraPose, FlyCamera};
 
 pub const CONFIG_PATH: &str = "config.toml";
 
+const MENU_UNITS_VERSION: u32 = 4;
+
 pub fn name() -> String {
   match crate::consts::bench_config_tag() {
     Some(tag) => format!("config.{tag}.toml"),
@@ -41,12 +43,27 @@ fn write_text(path: &std::path::Path, src: &str) -> bool {
   }
 }
 
-#[derive(Resource, Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(default)]
+#[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
+  #[serde(default)]
+  pub menu_units: u32,
+  #[serde(default)]
   pub window: WindowState,
+  #[serde(default)]
   pub menu: BTreeMap<String, MenuValue>,
+  #[serde(default)]
   pub camera: Option<CameraPose>,
+}
+
+impl Default for Config {
+  fn default() -> Self {
+    Self {
+      menu_units: MENU_UNITS_VERSION,
+      window: WindowState::default(),
+      menu: BTreeMap::new(),
+      camera: None,
+    }
+  }
 }
 
 impl Config {
@@ -73,14 +90,87 @@ impl Config {
       }
     };
     match toml::from_str::<Self>(&src) {
-      Ok(c) => {
-        info!("config ← {}", path.display());
+      Ok(mut c) => {
+        if c.migrate_menu_units() {
+          c.save();
+        }
+        info!("config ← {}（menu_units={}）", path.display(), c.menu_units);
         c
       }
       Err(e) => {
         warn!("config 解析失败 {e} → 缺省");
         Self::default()
       }
+    }
+  }
+
+  fn migrate_menu_units(&mut self) -> bool {
+    let old = self.menu_units;
+    if old >= MENU_UNITS_VERSION {
+      return false;
+    }
+    let vpm = self.migration_voxel_per_meter();
+    let reference_vpm = gate_voxel::DEFAULT_VOXEL_PER_METER;
+    if old < 2 {
+      if let Some(MenuValue::Number(v)) = self.menu.get_mut("render/sky/air/start") {
+        *v = ((*v / vpm as f64) * 100.0).round() / 100.0;
+      }
+      if let Some(MenuValue::Number(v)) = self.menu.get_mut("render/sky/air/density") {
+        *v = ((*v * vpm as f64 / reference_vpm as f64) * 100.0).round() / 100.0;
+      }
+    }
+    if old == 2 {
+      for (path, decimals) in
+        [("game/edit/place/size", 0usize), ("game/edit/place/offset", 1), ("player/camera/pos", 2)]
+      {
+        if let Some(MenuValue::Text(t)) = self.menu.get_mut(path)
+          && let Ok(v) = t.trim().parse::<f32>()
+        {
+          *t = format!("{:.*}", decimals, v * reference_vpm);
+        }
+      }
+      if let Some(MenuValue::Number(v)) = self.menu.get_mut("render/sky/air/density") {
+        *v = ((*v * vpm as f64 / reference_vpm as f64) * 100.0).round() / 100.0;
+      }
+    }
+    if old == 3 {
+      for (path, decimals) in
+        [("game/edit/place/size", 0usize), ("game/edit/place/offset", 1), ("player/camera/pos", 2)]
+      {
+        if let Some(MenuValue::Text(t)) = self.menu.get_mut(path)
+          && let Ok(v) = t.trim().parse::<f32>()
+        {
+          *t = format!("{:.*}", decimals, v * vpm);
+        }
+      }
+      let chunk_scale = vpm as f64 / gate_voxel::CHUNK_SIZE as f64;
+      for path in [
+        "game/world/load_radius",
+        "game/world/unload_radius",
+        "game/world/coarse_radius",
+        "game/world/coarse_height",
+      ] {
+        if let Some(MenuValue::Number(v)) = self.menu.get_mut(path) {
+          *v = (*v * chunk_scale).round().max(0.0);
+        }
+      }
+    }
+    self.menu_units = MENU_UNITS_VERSION;
+    info!(
+      "config 菜单单位 → v{old} → v{MENU_UNITS_VERSION}（物理/光照=米，编辑/坐标=voxel，流式=chunk；按 {vpm} vx/m 换算）"
+    );
+    true
+  }
+
+  fn migration_voxel_per_meter(&self) -> f32 {
+    let name = match self.menu.get("game/world/model") {
+      Some(MenuValue::Text(name)) => name.as_str(),
+      _ => "nuke",
+    };
+    if name == crate::mc::GREEN_FIELD {
+      crate::mc::VOXELS_PER_BLOCK as f32
+    } else {
+      crate::vox_scene::voxel_per_meter(name)
     }
   }
 

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::OnceLock;
+
+use serde::Deserialize;
 
 use gate_voxel::{
   CHUNK_SIZE, ChunkCoord, ChunkTree, PALETTE_INDEX_MAX, PaletteEntry, PaletteFlags, PaletteId,
@@ -41,6 +44,82 @@ pub fn scan_vox_models() -> Vec<String> {
     return vec!["nuke".to_string()];
   }
   names
+}
+
+#[derive(Deserialize)]
+struct SceneManifest {
+  format: u32,
+  #[serde(default)]
+  scenes: HashMap<String, SceneEntry>,
+}
+
+#[derive(Deserialize, Default)]
+struct SceneEntry {
+  #[serde(default)]
+  voxel_per_meter: Option<f32>,
+}
+
+fn scene_manifest() -> &'static HashMap<String, SceneEntry> {
+  static CACHE: OnceLock<HashMap<String, SceneEntry>> = OnceLock::new();
+  CACHE.get_or_init(|| {
+    let path = gate_render::assets_dir().join("vox").join("manifest.toml");
+    let src = match std::fs::read_to_string(&path) {
+      Ok(v) => v,
+      Err(e) => {
+        bevy::log::warn!(
+          target: "gate",
+          "场景 manifest 读 {} 失败（{e}）⇒ 每米体素数回落 {}",
+          path.display(),
+          gate_voxel::DEFAULT_VOXEL_PER_METER,
+        );
+        return HashMap::new();
+      }
+    };
+    match toml::from_str::<SceneManifest>(&src) {
+      Ok(m) if m.format == 1 => m.scenes,
+      Ok(m) => {
+        bevy::log::warn!(
+          target: "gate",
+          "场景 manifest {} format={}（只认 1）⇒ 每米体素数回落 {}",
+          path.display(),
+          m.format,
+          gate_voxel::DEFAULT_VOXEL_PER_METER,
+        );
+        HashMap::new()
+      }
+      Err(e) => {
+        bevy::log::warn!(
+          target: "gate",
+          "场景 manifest 解析 {} 失败（{e}）⇒ 每米体素数回落 {}",
+          path.display(),
+          gate_voxel::DEFAULT_VOXEL_PER_METER,
+        );
+        HashMap::new()
+      }
+    }
+  })
+}
+
+pub fn voxel_per_meter(name: &str) -> f32 {
+  let entry = scene_manifest().get(name);
+  if entry.is_none() {
+    bevy::log::debug!(
+      target: "gate",
+      "场景 `{name}` 无 manifest 条目 ⇒ 每米 {} 体素",
+      gate_voxel::DEFAULT_VOXEL_PER_METER,
+    );
+  }
+  let vpm = entry.and_then(|e| e.voxel_per_meter).unwrap_or(gate_voxel::DEFAULT_VOXEL_PER_METER);
+  if vpm.is_finite() && vpm > 0.0 {
+    vpm
+  } else {
+    bevy::log::warn!(
+      target: "gate",
+      "场景 `{name}` voxel_per_meter={vpm} 无效 ⇒ 回落 {}",
+      gate_voxel::DEFAULT_VOXEL_PER_METER,
+    );
+    gate_voxel::DEFAULT_VOXEL_PER_METER
+  }
 }
 
 pub fn load_vox_scene(
