@@ -45,17 +45,8 @@ pub fn build(
   if !world::looks_like_world(dir) {
     return Err(format!("{} 不是 Anvil 世界（缺 region/ 或 level.dat）", dir.display()));
   }
-  let root = paths.assets.clone();
   let world = Arc::new(world::World::new(dir));
-  let models = paths.models.clone();
-  let vanilla = paths.vanilla.clone();
-  if vanilla.is_none() {
-    bevy::log::warn!(
-      target: "gate",
-      "MC 原版 fallback! 未配置 vanilla ⇒ 资源包缺失项不回落（data/mc.local.toml）"
-    );
-  }
-  let assets = Arc::new(assets::Assets::new(root, models, vanilla));
+  let assets = Arc::new(assets::Assets::new(&paths.stack));
   let pool = Arc::new(material::Pool::new());
 
   let chunk = gate_voxel::CHUNK_SIZE;
@@ -67,13 +58,14 @@ pub fn build(
   grid.set_attach_far(true);
   let half = IVec3::splat(WINDOW_CHUNKS * chunk);
   bevy::log::info!(
-    "MC 地图 {}{}；资产 {}；窗口 ±{} chunk（±{:.0} m）",
+    "MC 地图 {}{}；版本 {}；资源层 {}；窗口 ±{} chunk（±{:.0} m）",
     world.dir().display(),
     match spawn_eye() {
       Some(e) => format!("，出生点体素 {}", e),
       None => "（level.dat 读不到出生点）".to_string(),
     },
-    assets.root().display(),
+    paths.mc.display(),
+    paths.stack.len(),
     WINDOW_CHUNKS,
     WINDOW_CHUNKS as f32 * chunk as f32 / VOXELS_PER_BLOCK as f32,
   );

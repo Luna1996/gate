@@ -50,7 +50,6 @@ impl Texture {
 }
 
 pub struct Assets {
-  root: PathBuf,
   layers: Vec<Layer>,
   json: Mutex<HashMap<String, Option<Arc<Json>>>>,
   tex: Mutex<HashMap<String, Option<Arc<Texture>>>>,
@@ -97,16 +96,17 @@ impl Layer {
     }
   }
 
-  fn collect_png(&self, dir: &str, rel: &str, out: &mut Vec<String>) {
+  fn collect_files(&self, dir: &str, rel: &str, ext: &str, out: &mut Vec<String>) {
     match self {
-      Self::Dir { root } => collect_png_dir(&root.join(dir), rel, out),
+      Self::Dir { root } => collect_files_dir(&root.join(dir), rel, ext, out),
       Self::Zip { base, archive } => {
         let prefix = format!("{base}{dir}/");
+        let suffix = format!(".{ext}");
         let mut a = archive.lock().unwrap_or_else(|e| e.into_inner());
         for i in 0..a.len() {
           let Ok(entry) = a.by_index(i) else { continue };
           let Some(name) = entry.name().strip_prefix(&prefix) else { continue };
-          if let Some(stem) = name.strip_suffix(".png") {
+          if let Some(stem) = name.strip_suffix(&suffix) {
             out.push(format!("{rel}/{stem}"));
           }
         }
@@ -116,62 +116,27 @@ impl Layer {
 }
 
 impl Assets {
-  pub fn new(pack: impl Into<PathBuf>, models: Option<PathBuf>, vanilla: Option<PathBuf>) -> Self {
-    let root = pack.into();
+  pub fn new(stack: &[PathBuf]) -> Self {
     let mut layers = Vec::new();
     let mut labels = Vec::new();
-    match Layer::open(&root) {
-      Some(layer) => {
-        labels.push(format!("{}（{}）", root.display(), layer.kind()));
-        layers.push(layer);
-      }
-      None => {
-        bevy::log::warn!(target: "gate", "MC 资源包! 打不开 {} ⇒ 无方块材质", root.display());
-      }
-    }
-    if let Some(path) = models.filter(|path| path != &root) {
-      match Layer::open(&path) {
+    for path in stack {
+      match Layer::open(path) {
         Some(layer) => {
-          labels.push(format!("{}（模型回退 {}）", path.display(), layer.kind()));
+          labels.push(format!("{}（{}）", path.display(), layer.kind()));
           layers.push(layer);
         }
         None => {
-          bevy::log::warn!(
-            target: "gate",
-            "MC 模型回退! 打不开 {} ⇒ 资源包缺失的 blockstate/model 无法解析",
-            path.display()
-          );
+          bevy::log::warn!(target: "gate", "MC 资源! 打不开 {} ⇒ 该层跳过", path.display());
         }
       }
-    }
-    match &vanilla {
-      Some(path) => match Layer::open(path) {
-        Some(layer) => {
-          labels.push(format!("{}（原版 {}）", path.display(), layer.kind()));
-          layers.push(layer);
-        }
-        None => {
-          bevy::log::warn!(
-            target: "gate",
-            "MC 原版资源! 打不开 {} ⇒ 资源包缺失项不回落",
-            path.display()
-          );
-        }
-      },
-      None => labels.push("无原版 fallback".to_string()),
     }
     bevy::log::info!(target: "gate", "MC 资源栈: {}", labels.join(" → "));
     Self {
-      root,
       layers,
       json: Mutex::new(HashMap::new()),
       tex: Mutex::new(HashMap::new()),
       missing: Mutex::new(Default::default()),
     }
-  }
-
-  pub fn root(&self) -> &Path {
-    &self.root
   }
 
   pub fn blockstate(&self, block: &str) -> Option<Arc<Json>> {
@@ -212,9 +177,22 @@ impl Assets {
   }
 
   pub fn block_texture_paths(&self) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut models = Vec::new();
     for layer in &self.layers {
-      layer.collect_png("textures/block", "block", &mut out);
+      layer.collect_files("models", "models", "json", &mut models);
+    }
+    let mut out = Vec::new();
+    for rel in models {
+      let Some(path) = rel.strip_prefix("models/") else { continue };
+      let Some(json) = self.model(path) else { continue };
+      let Some(textures) = json.get("textures").and_then(|v| v.as_object()) else { continue };
+      for value in textures.values() {
+        let Some(name) = value.as_str() else { continue };
+        let name = name.strip_prefix("minecraft:").unwrap_or(name);
+        if name.starts_with("block/") {
+          out.push(name.to_string());
+        }
+      }
     }
     out.sort();
     out.dedup();
@@ -289,14 +267,14 @@ fn safe_rel(path: &str) -> Option<&str> {
   Some(p)
 }
 
-fn collect_png_dir(dir: &Path, rel: &str, out: &mut Vec<String>) {
+fn collect_files_dir(dir: &Path, rel: &str, ext: &str, out: &mut Vec<String>) {
   let Ok(entries) = std::fs::read_dir(dir) else { return };
   for entry in entries.flatten() {
     let path = entry.path();
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
     if path.is_dir() {
-      collect_png_dir(&path, &format!("{rel}/{name}"), out);
-    } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+      collect_files_dir(&path, &format!("{rel}/{name}"), ext, out);
+    } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
       let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
       out.push(format!("{rel}/{stem}"));
     }
