@@ -1,4 +1,4 @@
-import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, post_dst, post_final, post_samp, post_src0, post_src1, post_u, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, cloud_tex_post, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, post_dst, post_final, post_samp, post_src0, post_src1, post_u, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_jitter, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
 import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS, SUN_DIV};
@@ -9,7 +9,7 @@ import package::gi::sun::{sun_gather_cell};
 import package::gi::restir::{Res, res_add_nb, res_add_pick, res_adopt, res_begin, res_direct, res_finish, res_load_cur, res_load_prev, res_load_tmp, res_none, res_store_cur, res_store_tmp};
 import package::brickmap::{Grid, sample_brickmap};
 import package::trace::{LOD_DIAG, diag_sampled, make_grid, medium_of};
-import package::volumetric::{godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_ambient, sky_primary, sky_scatter};
+import package::volumetric::{cloud_render, godray_pass_blur_a, godray_pass_blur_b, godray_pass_mask, godray_sample_bilinear, sky_ambient, sky_primary, sky_scatter};
 import package::world::{voxel_normal_fast, WorldHit, camera_solid_pal, face_normal_world, surface_offset, vol_tint_color, voxel_at_point, voxel_center_world, voxel_normal, world_cfg_full, world_cfg_primary, world_cfg_reflect, world_miss, world_raycast, world_trace_glass_path, world_trace_medium_scene};
 
 @compute @workgroup_size(8, 8, 1)
@@ -1486,9 +1486,16 @@ fn post_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
     / vec2<f32>(f32(dims.x), f32(dims.y));
   var c = textureSampleLevel(post_src0, post_samp, uv, 0.0).rgb;
+  let cloud = textureSampleLevel(cloud_tex_post, post_samp, uv, 0.0);
+  c = c * (1.0 - cloud.a) + cloud.rgb;
   let bloom = textureSampleLevel(post_src1, post_samp, uv, 0.0).rgb;
   c = c + bloom * post_u.bloom;
   c = tonemap_color(c, post_u.mode);
   c = linear_to_srgb(c) + dither3(coord);
   textureStore(post_final, coord, vec4<f32>(c, 1.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cloud_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  cloud_render(gid);
 }

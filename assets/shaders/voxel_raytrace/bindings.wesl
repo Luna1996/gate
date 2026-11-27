@@ -25,6 +25,7 @@ struct PostUniform {
 @group(7) @binding(43) var post_final: texture_storage_2d<rgba8unorm, write>;
 @group(7) @binding(44) var post_samp: sampler;
 @group(7) @binding(45) var<uniform> post_u: PostUniform;
+@group(7) @binding(46) var cloud_tex_post: texture_2d<f32>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 @group(0) @binding(4) var dda_hit: texture_storage_2d<rgba32uint, read_write>;
@@ -222,6 +223,15 @@ struct FogUniform {
 
 @group(6) @binding(0) var<uniform> fog_u_read: FogUniform;
 @group(6) @binding(1) var fog_tex: texture_2d<f32>;
+
+struct CloudUniform {
+  prev_view_proj: mat4x4<f32>,
+  params: vec4<f32>,
+}
+@group(7) @binding(50) var<uniform> cloud_u: CloudUniform;
+@group(7) @binding(51) var cloud_out: texture_storage_2d<rgba16float, write>;
+@group(7) @binding(52) var cloud_hist: texture_2d<f32>;
+@group(7) @binding(53) var cloud_hist_samp: sampler;
 
 @group(0) @binding(30) var dda_vis: texture_storage_2d<rgba32uint, read_write>;
 @group(0) @binding(31) var dda_nrm: texture_storage_2d<rgba16float, read_write>;

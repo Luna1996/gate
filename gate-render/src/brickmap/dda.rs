@@ -719,6 +719,7 @@ fn post_layout() -> BindGroupLayoutDescriptor {
       texture(41),
       storage(42, TextureFormat::Rgba16Float),
       storage(43, TextureFormat::Rgba8Unorm),
+      texture(46),
       BindGroupLayoutEntry {
         binding: 44,
         visibility: ShaderStages::COMPUTE,
@@ -1236,6 +1237,8 @@ pub(crate) struct DdaTune<'w> {
 
   pub atmo: Option<Res<'w, crate::lighting::AtmosphereSettings>>,
 
+  pub cloud: Option<Res<'w, crate::lighting::CloudSettings>>,
+
   pub post: Option<Res<'w, PostFxSettings>>,
 }
 
@@ -1251,6 +1254,7 @@ pub(crate) struct PrepareDdaBindGroupsParams<'w, 's> {
   pbr_set: Option<Res<'w, crate::pbr_texture::PbrTextureSet>>,
   mc_set: Option<Res<'w, crate::mc_texture::McTextureSet>>,
   cloud_set: Option<Res<'w, crate::cloud_texture::CloudTextureSet>>,
+  cloud_gpu: Option<ResMut<'w, crate::cloud::CloudGpu>>,
   lighting: Option<Res<'w, LightingTheme>>,
   light_gpu: Option<ResMut<'w, LightPoolGpu>>,
   render_device: Res<'w, RenderDevice>,
@@ -1274,6 +1278,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     pbr_set,
     mc_set,
     cloud_set,
+    mut cloud_gpu,
     lighting,
     light_gpu,
     render_device,
@@ -1688,6 +1693,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     let layout = pipeline_cache.get_bind_group_layout(&pipelines.post_layout);
     let post_u = post_buf.binding().expect("post uniform");
     let target = &tex_view.texture_view;
+    let cloud_tex = cloud_gpu.as_ref().and_then(|c| c.out_view()).unwrap_or(hdr);
     let make = |src0: &TextureView, src1: &TextureView, dst: &TextureView| {
       render_device.create_bind_group(
         None,
@@ -1699,6 +1705,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
           BindGroupEntry { binding: 43, resource: BindingResource::TextureView(target) },
           BindGroupEntry { binding: 44, resource: BindingResource::Sampler(sampler) },
           BindGroupEntry { binding: 45, resource: post_u.clone() },
+          BindGroupEntry { binding: 46, resource: BindingResource::TextureView(cloud_tex) },
         ],
       )
     };
@@ -1779,6 +1786,13 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   let cloud_noise = cloud_set.as_deref().and_then(|s| gpu_images.get(s.noise()));
   let cloud_noise_view =
     cloud_noise.map_or_else(|| gpu.cloud_noise_view.clone(), |i| i.texture_view.clone());
+  let cloud_cover = tune.cloud.as_deref().map_or(1.0, |c| c.cover.max(0.0));
+  if let Some(cloud_gpu) = cloud_gpu.as_mut() {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map_or(0.0, |d| d.as_secs_f32() % 3600.0);
+    cloud_gpu.prepare(&render_device, &queue, scale.size, view_uniform.view_proj, now, cloud_cover);
+  }
   let bg1 = {
     let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
       gpu.struct_buf.as_entire_binding(),
@@ -1964,6 +1978,7 @@ pub(crate) struct DispatchDdaParams<'w, 's> {
   eye: Option<Res<'w, EyeAdaptGpu>>,
   gi: Option<Res<'w, crate::gi::GiSettings>>,
   fog: crate::volumetric::FogRes<'w>,
+  cloud: Option<Res<'w, crate::cloud::CloudGpu>>,
   aux: Option<Res<'w, AuxTexCache>>,
   pipeline_cache: Res<'w, PipelineCache>,
   pipelines: Res<'w, DdaPipelines>,
@@ -2031,6 +2046,7 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
     eye,
     gi,
     fog,
+    cloud,
     aux,
     pipeline_cache,
     pipelines,
@@ -2481,6 +2497,25 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.set_bind_group(7, rr, &[]);
         pass.dispatch_workgroups(gxc, gyc, 1);
       },
+    );
+  }
+
+  if let Some(cloud) = cloud.as_ref()
+    && let Some(fog_read) = fog_read
+  {
+    cloud.dispatch(
+      &mut profiler,
+      ctx.command_encoder(),
+      &pipeline_cache,
+      [
+        Some(&bg0.0),
+        Some(&bg1.0),
+        Some(&bg2.0),
+        Some(&bg3.0),
+        Some(gi_b0),
+        Some(b5),
+        Some(fog_read),
+      ],
     );
   }
 

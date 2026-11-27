@@ -22,6 +22,7 @@ const ENTRY_POINTS: &[&str] = &[
   "godray_main",
   "godray_blur_a",
   "godray_blur_b",
+  "cloud_main",
   "eye_adapt_histogram",
   "eye_adapt_update",
 ];

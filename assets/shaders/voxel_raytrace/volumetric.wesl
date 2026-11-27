@@ -1,4 +1,4 @@
-import package::bindings::{cloud_noise, cloud_samp, cloud_weather, dda_hit, fog_a_r_blur, fog_a_w, fog_a_w_blur, fog_b_r_blur, fog_b_w_blur, fog_u, fog_u_blur, fog_u_read, gi_u, grid_descs, light_u, view_u};
+import package::bindings::{cloud_hist, cloud_hist_samp, cloud_noise, cloud_out, cloud_samp, cloud_u, cloud_weather, dda_hit, fog_a_r_blur, fog_a_w, fog_a_w_blur, fog_b_r_blur, fog_b_w_blur, fog_u, fog_u_blur, fog_u_read, gi_u, grid_descs, light_u, view_u};
 import package::common::{hash_u32, sky_rgb};
 
 const SUN_DISK_GAIN: f32 = 3.0;
@@ -78,17 +78,18 @@ const CLOUD_RANGE_M: f32 = 8000.0;
 const CLOUD_STEP_M: f32 = 26.0;
 const CLOUD_STEP_GROW: f32 = 1.04;
 
-fn cloud_weather_uv(p: vec3<f32>) -> vec2<f32> {
-  let t = fog_u_read.misc3.z;
-  return p.xz / CLOUD_WEATHER_SCALE_M + vec2<f32>(t * 0.000012, t * 0.000007);
+fn cloud_weather_uv(p: vec3<f32>, time: f32) -> vec2<f32> {
+  return p.xz / CLOUD_WEATHER_SCALE_M + vec2<f32>(time * 0.000012, time * 0.000007);
 }
 
-fn cloud_density(p: vec3<f32>, base: f32, top: f32, layer: u32) -> f32 {
+fn cloud_density_raw(
+  p: vec3<f32>, base: f32, top: f32, layer: u32, time: f32, cover_scale: f32, detail_on: bool
+) -> f32 {
   let h = (p.y - base) / max(top - base, 1.0);
   if (h <= 0.0 || h >= 1.0) { return 0.0; }
-  let w = textureSampleLevel(cloud_weather, cloud_samp, cloud_weather_uv(p), 0.0);
+  let w = textureSampleLevel(cloud_weather, cloud_samp, cloud_weather_uv(p, time), 0.0);
   let cover = clamp(
-    1.0 - exp(-w.r * fog_u_read.misc3.w * 2.2 * select(1.0, 0.9, layer == 1u)),
+    1.0 - exp(-w.r * cover_scale * 2.2 * select(1.0, 0.9, layer == 1u)),
     0.0,
     1.0,
   );
@@ -99,15 +100,18 @@ fn cloud_density(p: vec3<f32>, base: f32, top: f32, layer: u32) -> f32 {
   if (layer == 1u) {
     prof = smoothstep(0.0, 0.18, h) * (1.0 - smoothstep(0.7, 1.0, h)) * 0.6;
   }
-  let t = fog_u_read.misc3.z;
-  let drift = vec3<f32>(t * 0.000006, 0.0, t * 0.000004);
+  let drift = vec3<f32>(time * 0.000006, 0.0, time * 0.000004);
   let base_n = textureSampleLevel(cloud_noise, cloud_samp, p / CLOUD_BASE_SCALE_M + drift, 0.0);
   let cover_edge = 1.0 - cover;
   let shape = smoothstep(cover_edge, cover_edge + 0.12, base_n.r);
-  if (shape <= 0.0) { return 0.0; }
+  if (shape <= 0.0 || !detail_on) { return shape * prof; }
   let detail = textureSampleLevel(cloud_noise, cloud_samp, p / CLOUD_DETAIL_SCALE_M - drift * 3.0, 0.0);
   let eroded = smoothstep(cover_edge, cover_edge + 0.12, base_n.r - detail.g * 0.3);
   return eroded * prof;
+}
+
+fn cloud_density(p: vec3<f32>, base: f32, top: f32, layer: u32) -> f32 {
+  return cloud_density_raw(p, base, top, layer, cloud_u.params.x, cloud_u.params.y, true);
 }
 
 fn cloud_phase(cos_t: f32) -> f32 {
@@ -148,8 +152,10 @@ fn cloud_march_layer(
   if (far <= near) { return vec4<f32>(0.0); }
   let base_step = select(CLOUD_STEP_M, 35.0, layer == 1u);
   let ratio = select(CLOUD_STEP_GROW, 1.12, layer == 1u);
+  let jitter = fract(
+    sin(dot(dir.xz, vec2<f32>(12.9898, 78.233)) + cloud_u.params.z * 0.618) * 43758.5453);
   var step = base_step;
-  var t = near;
+  var t = near + jitter * base_step;
   var trans = 1.0;
   var acc = vec3<f32>(0.0);
   for (var i = 0u; i < steps; i = i + 1u) {
@@ -174,8 +180,8 @@ fn cloud_march_layer(
   return vec4<f32>(acc, 1.0 - trans);
 }
 
-fn cloud_over(col: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
-  if (abs(dir.y) < 0.01) { return col; }
+fn cloud_volume(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec4<f32> {
+  if (abs(dir.y) < 0.01) { return vec4<f32>(0.0); }
   let amb = sky_ambient(dir);
   let vpm = max(grid_descs[0].voxel_per_meter, 1e-3);
   let cam_y = view_u.cam_pos_voxel.y / vpm;
@@ -188,20 +194,68 @@ fn cloud_over(col: vec3<f32>, dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f3
   let low_a = low.a * h;
   let high_rgb = high.rgb * h;
   let low_rgb = low.rgb * h;
-  var c = col;
+  var c = vec3<f32>(0.0);
+  var a = 0.0;
   if (cam_y > CLOUD_LOW_TOP_M) {
     c = c * (1.0 - low_a) + low_rgb;
+    a = a * (1.0 - low_a) + low_a;
     c = c * (1.0 - high_a) + high_rgb;
+    a = a * (1.0 - high_a) + high_a;
   } else {
     c = c * (1.0 - high_a) + high_rgb;
+    a = a * (1.0 - high_a) + high_a;
     c = c * (1.0 - low_a) + low_rgb;
+    a = a * (1.0 - low_a) + low_a;
   }
-  return c;
+  return vec4<f32>(c, a);
+}
+
+fn cloud_render(gid: vec3<u32>) {
+  let size = textureDimensions(cloud_out);
+  if (gid.x >= size.x || gid.y >= size.y) { return; }
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+  let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
+         / vec2<f32>(f32(size.x), f32(size.y));
+  let hsize = textureDimensions(dda_hit);
+  let hc = vec2<i32>(
+    clamp(i32(floor(uv.x * f32(hsize.x))), 0, i32(hsize.x) - 1),
+    clamp(i32(floor(uv.y * f32(hsize.y))), 0, i32(hsize.y) - 1));
+  let rec = textureLoad(dda_hit, hc);
+  if ((rec.w & 1u) != 0u) {
+    textureStore(cloud_out, coord, vec4<f32>(0.0));
+    return;
+  }
+
+  let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  let near_h = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
+  let far_h = view_u.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
+  let near_p = near_h.xyz / near_h.w;
+  let far_p = far_h.xyz / far_h.w;
+  let dir = normalize(far_p - near_p);
+
+  let sun = light_u.lights[0];
+  let sun_dir = sun.kind_pos_dir.yzw;
+  let sun_c = sun.color_intensity.xyz * sun.color_intensity.w;
+  let cur = cloud_volume(dir, sun_dir, sun_c);
+
+  var hist = vec4<f32>(0.0);
+  let cam = view_u.cam_pos_voxel.xyz;
+  let probe = cam + dir * 20000.0;
+  let prev_clip = cloud_u.prev_view_proj * vec4<f32>(probe, 1.0);
+  if (prev_clip.w > 1e-4) {
+    let prev_ndc = prev_clip.xyz / prev_clip.w;
+    let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    if (all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))) {
+      hist = textureSampleLevel(cloud_hist, cloud_hist_samp, prev_uv, 0.0);
+    }
+  }
+  let blend = select(0.0, 0.86, cloud_u.params.w > 0.5);
+  textureStore(cloud_out, coord, mix(cur, hist, blend));
 }
 
 fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32> {
   let base = sky_base(dir);
-  if (fog_u_read.misc2.x <= 0.5) { return cloud_over(base + sky_scatter(dir), dir, sun_dir, sun_c); }
+  if (fog_u_read.misc2.x <= 0.5) { return base + sky_scatter(dir); }
   let ang = clamp(fog_u_read.misc2.z, 1e-4, SUN_CONE_MAX);
   let cos_t = dot(dir, sun_dir);
   let t2 = (1.0 - cos_t) / max(1.0 - cos(ang), 1e-12);
@@ -211,10 +265,9 @@ fn sky_primary(dir: vec3<f32>, sun_dir: vec3<f32>, sun_c: vec3<f32>) -> vec3<f32
   let hx = clamp(t2 / (HALO_T * HALO_T), 0.0, 1.0);
   let halo = pow(1.0 - hx, HALO_POW) * (1.0 - hx * hx * hx);
   let disk_gain = max(light_u.lights[0].shape.x, 0.0);
-  let sky = base + sky_scatter(dir)
+  return base + sky_scatter(dir)
        + sun_c * (disk * SUN_DISK_GAIN * disk_gain
                   + halo * max(fog_u_read.misc2.w, 0.0));
-  return cloud_over(sky, dir, sun_dir, sun_c);
 }
 
 

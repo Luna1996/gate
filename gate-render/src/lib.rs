@@ -1,4 +1,5 @@
 pub mod brickmap;
+pub mod cloud;
 pub mod cloud_texture;
 pub mod consts;
 #[cfg(feature = "dlss")]
@@ -58,6 +59,7 @@ impl Plugin for GateRenderPlugin {
       profiler::GateProfilerPlugin,
       pbr_texture::PbrTexturesPlugin,
       cloud_texture::CloudTexturePlugin,
+      cloud::CloudPlugin,
     ));
     #[cfg(feature = "dlss")]
     app.add_plugins(dlss::DlssRenderPlugin);
