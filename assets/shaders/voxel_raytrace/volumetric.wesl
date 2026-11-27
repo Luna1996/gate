@@ -114,6 +114,35 @@ fn cloud_density(p: vec3<f32>, base: f32, top: f32, layer: u32) -> f32 {
   return cloud_density_raw(p, base, top, layer, cloud_u.params.x, cloud_u.params.y, true);
 }
 
+fn cloud_shadow_layer(
+  p: vec3<f32>, sun_dir: vec3<f32>, base: f32, top: f32, layer: u32, time: f32, cover: f32
+) -> f32 {
+  let a = (base - p.y) / sun_dir.y;
+  let b = (top - p.y) / sun_dir.y;
+  let near = max(min(a, b), 0.0);
+  let far = min(max(a, b), near + 12000.0);
+  if (far <= near) { return 0.0; }
+  let n = 4u;
+  let dt = (far - near) / f32(n);
+  var od = 0.0;
+  for (var i = 0u; i < n; i = i + 1u) {
+    let q = p + sun_dir * (near + (f32(i) + 0.5) * dt);
+    od = od + cloud_density_raw(q, base, top, layer, time, cover, false) * dt;
+  }
+  return od;
+}
+
+fn cloud_sun_shadow(p_voxel: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  if (sun_dir.y <= 0.0) { return 1.0; }
+  let vpm = max(grid_descs[0].voxel_per_meter, 1e-3);
+  let p = p_voxel / vpm;
+  let time = fog_u_read.misc3.z;
+  let cover = fog_u_read.misc3.w;
+  var od = cloud_shadow_layer(p, sun_dir, CLOUD_LOW_BASE_M, CLOUD_LOW_TOP_M, 0u, time, cover);
+  od = od + cloud_shadow_layer(p, sun_dir, CLOUD_HIGH_BASE_M, CLOUD_HIGH_TOP_M, 1u, time, cover);
+  return exp(-od * CLOUD_SIGMA * 0.65);
+}
+
 fn cloud_phase(cos_t: f32) -> f32 {
   let g0 = 0.8;
   let d0 = max(1.0 + g0 * g0 - 2.0 * g0 * cos_t, 1e-3);
