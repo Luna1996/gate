@@ -25,7 +25,6 @@ struct PostUniform {
 @group(7) @binding(43) var post_final: texture_storage_2d<rgba8unorm, write>;
 @group(7) @binding(44) var post_samp: sampler;
 @group(7) @binding(45) var<uniform> post_u: PostUniform;
-@group(7) @binding(46) var cloud_tex_post: texture_2d<f32>;
 @group(0) @binding(2) var beam_depth: texture_storage_2d<r32float, read_write>;
 @group(0) @binding(3) var<storage, read> eye_adapt_ro: array<u32>;
 @group(0) @binding(4) var dda_hit: texture_storage_2d<rgba32uint, read_write>;
@@ -110,6 +109,8 @@ struct MaterialAsset {
 @group(1) @binding(17) var cloud_samp: sampler;
 
 @group(1) @binding(18) var cloud_noise: texture_3d<f32>;
+
+@group(1) @binding(19) var cloud_tex_scene: texture_2d<f32>;
 
 struct GridDesc {
   pos_scale: vec4<f32>,

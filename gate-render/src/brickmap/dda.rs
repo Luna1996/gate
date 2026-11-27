@@ -719,7 +719,6 @@ fn post_layout() -> BindGroupLayoutDescriptor {
       texture(41),
       storage(42, TextureFormat::Rgba16Float),
       storage(43, TextureFormat::Rgba8Unorm),
-      texture(46),
       BindGroupLayoutEntry {
         binding: 44,
         visibility: ShaderStages::COMPUTE,
@@ -968,6 +967,17 @@ pub(crate) fn init_dda_pipelines(
     ty: BindingType::Texture {
       sample_type: TextureSampleType::Float { filterable: true },
       view_dimension: TextureViewDimension::D3,
+      multisampled: false,
+    },
+    count: None,
+  });
+
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 19,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Texture {
+      sample_type: TextureSampleType::Float { filterable: true },
+      view_dimension: TextureViewDimension::D2,
       multisampled: false,
     },
     count: None,
@@ -1693,7 +1703,6 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     let layout = pipeline_cache.get_bind_group_layout(&pipelines.post_layout);
     let post_u = post_buf.binding().expect("post uniform");
     let target = &tex_view.texture_view;
-    let cloud_tex = cloud_gpu.as_ref().and_then(|c| c.out_view()).unwrap_or(hdr);
     let make = |src0: &TextureView, src1: &TextureView, dst: &TextureView| {
       render_device.create_bind_group(
         None,
@@ -1705,7 +1714,6 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
           BindGroupEntry { binding: 43, resource: BindingResource::TextureView(target) },
           BindGroupEntry { binding: 44, resource: BindingResource::Sampler(sampler) },
           BindGroupEntry { binding: 45, resource: post_u.clone() },
-          BindGroupEntry { binding: 46, resource: BindingResource::TextureView(cloud_tex) },
         ],
       )
     };
@@ -1836,6 +1844,10 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
       binding: 18,
       resource: BindingResource::TextureView(&cloud_noise_view),
     });
+
+    let cloud_out_view = cloud_gpu.as_ref().and_then(|c| c.hist_view()).unwrap_or(&gpu.cloud_view);
+    entries
+      .push(BindGroupEntry { binding: 19, resource: BindingResource::TextureView(cloud_out_view) });
 
     render_device.create_bind_group(None, &bg1_layout, &entries)
   };
@@ -2275,6 +2287,24 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.dispatch_workgroups(gx, gy, 1);
       },
     );
+    if let Some(cloud) = cloud.as_ref()
+      && let Some(fog_read) = fog_read
+    {
+      cloud.dispatch(
+        &mut profiler,
+        ctx.command_encoder(),
+        &pipeline_cache,
+        [
+          Some(&bg0.0),
+          Some(&bg1.0),
+          Some(&bg2.0),
+          Some(&bg3.0),
+          Some(gi_b0),
+          Some(b5),
+          Some(fog_read),
+        ],
+      );
+    }
     crate::profiler::gpu_compute_pass(
       &mut profiler,
       ctx.command_encoder(),
@@ -2502,25 +2532,6 @@ pub(crate) fn dispatch_dda(p: DispatchDdaParams) {
         pass.set_bind_group(7, rr, &[]);
         pass.dispatch_workgroups(gxc, gyc, 1);
       },
-    );
-  }
-
-  if let Some(cloud) = cloud.as_ref()
-    && let Some(fog_read) = fog_read
-  {
-    cloud.dispatch(
-      &mut profiler,
-      ctx.command_encoder(),
-      &pipeline_cache,
-      [
-        Some(&bg0.0),
-        Some(&bg1.0),
-        Some(&bg2.0),
-        Some(&bg3.0),
-        Some(gi_b0),
-        Some(b5),
-        Some(fog_read),
-      ],
     );
   }
 

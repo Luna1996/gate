@@ -202,7 +202,10 @@ fn cloud_march_layer(
       let light = cloud_light(p, sun_dir, base, top, layer);
       let phase = cloud_phase(dot(dir, sun_dir));
       let ext = exp(-d * CLOUD_SIGMA * step);
-      let scatter = (min(sun_c, vec3<f32>(6.0)) * light * phase + amb * 0.35) * (1.0 - ext);
+      let sun = min(sun_c, vec3<f32>(6.0));
+      let rim = pow(max(dot(dir, sun_dir), 0.0), 6.0) * (1.0 - d);
+      let scatter = sun * (light * phase * (1.0 - ext) + rim * 0.12)
+                  + amb * 0.35 * (1.0 - ext);
       acc = acc + scatter * trans;
       trans = trans * ext;
       if (trans < 0.01) { break; }

@@ -42,6 +42,10 @@ impl CloudGpu {
     self.out_view.as_ref()
   }
 
+  pub fn hist_view(&self) -> Option<&TextureView> {
+    self.hist_view.as_ref()
+  }
+
   pub fn pipeline_ready(&self, cache: &PipelineCache) -> bool {
     self.pipeline.as_ref().is_some_and(|p| p.get(cache).is_some())
   }

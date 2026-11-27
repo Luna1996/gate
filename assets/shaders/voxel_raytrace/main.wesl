@@ -1,4 +1,4 @@
-import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, cloud_tex_post, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_u, lod_diag, out_base, out_tex, out_tex_src, post_dst, post_final, post_samp, post_src0, post_src1, post_u, view_u};
+import package::bindings::{refl_cfg, refl_meta, refl_req, refl_sum, refl_first, refl_ray, out_base_tex, BASE_FLAG_IMPLICIT_NORMAL, BASE_FLAG_SHADOW, BASE_FLAG_SOFT_SHADOW, BASE_FLAG_VOL_TINT, BEAM_BACKOFF, BEAM_DIV, beam_depth, cloud_tex_scene, dda_hit, dda_vis, dda_nrm, dda_shadow_tex, dlss_depth_tex, dlss_mvec_tex, gi_merge_req, glass_req, glass_meta, eye_adapt, eye_adapt_ro, fog_tex, gi_stats, gi_u, irc, light_samp, light_u, lod_diag, out_base, out_tex, out_tex_src, post_dst, post_final, post_samp, post_src0, post_src1, post_u, view_u};
 import package::common::{FLAGS_TRANSMISSIVE, MaterialParams, SurfaceLight, brdf_reflected, dielectric_f0, dither3, emissive_radiance, f0_of, face_of_normal, face_view_dir, fetch_material, fresnel_schlick, linear_to_srgb, material_ior, palette_flags, palette_rgb_linear, sky_rgb, srgb_to_linear};
 import package::gi::common::{gi_ambient_fallback, gi_div, gi_emit_gain, gi_enabled, gi_jitter, gi_key0, gi_key1, gi_key_ok, gi_mix, gi_pose_salt, gi_rand2, gi_record_pixel, gi_sample_base, gi_sample_boost, gi_unkey_voxel};
 import package::gi::consts::{GI_LUMA, GI_NEE_STATIC, GI_PI, GI_SAMPLE_CLAMP, GI_SKY_AMBIENT, GI_SPP_MAX, GI_STAT_RAYS, GI_STAT_RES_SPATIAL, GI_STAT_RES_TEMPORAL, IRC_WORDS, SHADOW_SURFACE_EPS, SUN_DIV};
@@ -1107,7 +1107,10 @@ fn dda_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
   var col = shade_split(first, origin_voxel, dir_voxel, px, u32(gid.y) * size.x + u32(gid.x),
                         n, sun_dir, sky, sun_c, sun_vis);
   if (!first.hit) {
-    col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px);
+    let cl = textureSampleLevel(cloud_tex_scene, light_samp, px, 0.0);
+    col = col * (1.0 - cl.a) + cl.rgb;
+    col = col + godray_sample_bilinear(fog_tex, vec2<f32>(textureDimensions(fog_tex)), px)
+              * (1.0 - cl.a);
   }
   if ((light_u.g.base_flags & BASE_FLAG_VOL_TINT) != 0u) { col = vol_tint_color(first); }
   dlss_store_inputs(coord, first, dir_voxel);
@@ -1487,8 +1490,6 @@ fn post_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
     / vec2<f32>(f32(dims.x), f32(dims.y));
   var c = textureSampleLevel(post_src0, post_samp, uv, 0.0).rgb;
-  let cloud = textureSampleLevel(cloud_tex_post, post_samp, uv, 0.0);
-  c = c * (1.0 - cloud.a) + cloud.rgb;
   let bloom = textureSampleLevel(post_src1, post_samp, uv, 0.0).rgb;
   c = c + bloom * post_u.bloom;
   c = tonemap_color(c, post_u.mode);
