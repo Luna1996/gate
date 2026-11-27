@@ -36,6 +36,7 @@ fastanvil = { workspace = true }
 flate2 = { workspace = true }
 png = { workspace = true }
 serde_json = { workspace = true }
+zip = { workspace = true }
 rust-i18n = "4.2"
 serde = { workspace = true }
 toml = "0.8"

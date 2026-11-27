@@ -923,6 +923,24 @@ pub(crate) fn init_dda_pipelines(
     count: None,
   });
 
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 14,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Texture {
+      sample_type: TextureSampleType::Float { filterable: true },
+      view_dimension: TextureViewDimension::D2Array,
+      multisampled: false,
+    },
+    count: None,
+  });
+
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 15,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+    count: None,
+  });
+
   let bg1 = BindGroupLayoutDescriptor::new("DdaBg1", &bg1_entries);
 
   let bg2 = BindGroupLayoutDescriptor::new(
@@ -1200,6 +1218,7 @@ pub(crate) struct PrepareDdaBindGroupsParams<'w, 's> {
   view_uniform: Option<Res<'w, DdaViewUniform>>,
   gpu_brickmap: Option<Res<'w, GpuBrickMap>>,
   pbr_set: Option<Res<'w, crate::pbr_texture::PbrTextureSet>>,
+  mc_set: Option<Res<'w, crate::mc_texture::McTextureSet>>,
   lighting: Option<Res<'w, LightingTheme>>,
   light_gpu: Option<ResMut<'w, LightPoolGpu>>,
   render_device: Res<'w, RenderDevice>,
@@ -1221,6 +1240,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     view_uniform,
     gpu_brickmap,
     pbr_set,
+    mc_set,
     lighting,
     light_gpu,
     render_device,
@@ -1718,6 +1738,9 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     pbr_albedo.map_or_else(|| gpu.pbr_albedo_rough_view.clone(), |i| i.texture_view.clone());
   let pbr_metal_view =
     pbr_metal.map_or_else(|| gpu.pbr_metal_view.clone(), |i| i.texture_view.clone());
+  let mc_albedo = mc_set.as_deref().and_then(|s| gpu_images.get(s.albedo()));
+  let mc_albedo_view =
+    mc_albedo.map_or_else(|| gpu.mc_albedo_view.clone(), |i| i.texture_view.clone());
   let bg1 = {
     let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
       gpu.struct_buf.as_entire_binding(),
@@ -1737,6 +1760,14 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     entries.push(BindGroupEntry { binding: 12, resource: gpu.occ.as_entire_binding() });
 
     entries.push(BindGroupEntry { binding: 13, resource: gpu.struct_buf_p1.as_entire_binding() });
+
+    entries.push(BindGroupEntry {
+      binding: 14,
+      resource: BindingResource::TextureView(&mc_albedo_view),
+    });
+
+    entries
+      .push(BindGroupEntry { binding: 15, resource: BindingResource::Sampler(&gpu.mc_sampler) });
 
     render_device.create_bind_group(None, &bg1_layout, &entries)
   };

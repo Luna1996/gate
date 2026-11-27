@@ -4,6 +4,7 @@ pub mod consts;
 pub mod dlss;
 pub mod gi;
 pub mod lighting;
+pub mod mc_texture;
 pub mod paths;
 pub mod pbr_texture;
 pub mod pipe_cache;
@@ -30,6 +31,9 @@ pub use consts::VIEW_SIZE;
 pub use lighting::{
   AtmosphereSettings, BaseSettings, DirLightCfg, LightDesc, LightGlobals, LightPoolUniform,
   LightingTheme, MAX_LIGHTS, ReflectionSettings, SkyCfg, build_light_pool, parse_lighting_ron,
+};
+pub use mc_texture::{
+  MC_ASSET_BASE, MC_TEX_MIP_LEVELS, MC_TEX_SIZE, McTextureSet, texture_array_image,
 };
 pub use paths::{assets_dir, data_dir, dda_wesl_dir, install_root, logs_dir};
 pub use pbr_texture::{PBR_TEXTURE_DIR, PbrTextureSet, PbrTexturesPlugin, material_ids};

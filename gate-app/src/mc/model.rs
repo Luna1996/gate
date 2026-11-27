@@ -155,8 +155,12 @@ fn bake(assets: &Assets, md: &RawModel) -> Option<Vec<Element>> {
 fn fallback(assets: &Assets, st: &BlockState) -> Option<SubModel> {
   let short = st.short_name();
   let tex = assets
-    .texture(&format!("block/{short}"))
-    .or_else(|| assets.texture(&format!("block/{short}_still")))?;
+    .texture_probe(&format!("block/{short}"))
+    .or_else(|| assets.texture_probe(&format!("block/{short}_still")));
+  if tex.is_none() {
+    bevy::log::debug!(target: "gate", "MC 回退贴图缺失 block/{short}（非立方体或无直贴图）");
+  }
+  let tex = tex?;
   let faces: [Option<Face>; 6] = std::array::from_fn(|i| {
     Some(Face { tex: tex.clone(), uv: default_uv(i, [0.0; 3], [16.0; 3]), rot: 0, tint: Some(0) })
   });

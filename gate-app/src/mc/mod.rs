@@ -2,6 +2,7 @@ pub mod assets;
 pub mod lod;
 pub mod material;
 pub mod model;
+pub mod pbr;
 pub mod source;
 pub mod summary;
 pub mod voxel;
@@ -36,9 +37,39 @@ pub fn map_dir() -> PathBuf {
 }
 
 pub fn assets_root() -> PathBuf {
-  std::env::var_os("GATE_MC_ASSETS")
-    .map(PathBuf::from)
-    .unwrap_or_else(|| PathBuf::from(r"C:\game\Greenfield v0.5.4\assets_mc"))
+  if let Some(path) = std::env::var_os("GATE_MC_ASSETS") {
+    return PathBuf::from(path);
+  }
+  let official = PathBuf::from(r"C:\game\Greenfield v0.5.4\Greenfield.Texture.Pack.1.17.zip");
+  if official.is_file() {
+    return official;
+  }
+  PathBuf::from(r"C:\game\Greenfield v0.5.4\assets_mc")
+}
+
+pub fn vanilla_root() -> Option<PathBuf> {
+  if let Some(path) = std::env::var_os("GATE_MC_VANILLA") {
+    let path = PathBuf::from(path);
+    if path.exists() {
+      return Some(path);
+    }
+    bevy::log::warn!(
+      target: "gate",
+      "MC 原版资源! GATE_MC_VANILLA={} 不存在 ⇒ 只读资源包",
+      path.display()
+    );
+    return None;
+  }
+  let mut candidates = Vec::new();
+  if let Some(appdata) = std::env::var_os("APPDATA") {
+    let versions = PathBuf::from(appdata).join(".minecraft").join("versions");
+    candidates.push(versions.join("1.17.1").join("1.17.1.jar"));
+    candidates.push(versions.join("1.17").join("1.17.jar"));
+  }
+  let pcl = PathBuf::from(r"C:\game\PCL2\.minecraft\versions");
+  candidates.push(pcl.join("1.17.1").join("1.17.1.jar"));
+  candidates.push(pcl.join("Greenfield").join("Greenfield.jar"));
+  candidates.into_iter().find(|path| path.is_file())
 }
 
 pub fn spawn_eye() -> Option<IVec3> {
@@ -55,11 +86,18 @@ pub fn build(
     return Err(format!("{} 不是 Anvil 世界（缺 region/ 或 level.dat）", dir.display()));
   }
   let root = assets_root();
-  if !root.is_dir() {
-    return Err(format!("{} 不是资产目录", root.display()));
+  if !root.exists() {
+    return Err(format!("{} 不是资产目录或资源包", root.display()));
   }
   let world = Arc::new(world::World::new(&dir));
-  let assets = Arc::new(assets::Assets::new(&root));
+  let vanilla = vanilla_root();
+  if vanilla.is_none() {
+    bevy::log::warn!(
+      target: "gate",
+      "MC 原版 fallback! 未找到原版 jar（设 GATE_MC_VANILLA）⇒ 资源包缺失项不回落"
+    );
+  }
+  let assets = Arc::new(assets::Assets::new(&root, vanilla));
   let pool = Arc::new(material::Pool::new());
 
   let chunk = gate_voxel::CHUNK_SIZE;
@@ -82,7 +120,8 @@ pub fn build(
     WINDOW_CHUNKS as f32 * chunk as f32 / VOXELS_PER_BLOCK as f32,
   );
   let stamp = lod::stamp(world.dir());
-  let city = Arc::new(source::McCity::new(world, assets, pool));
+  let pbr = Arc::new(voxel::PbrMap::new(&pbr::data(&assets).ids));
+  let city = Arc::new(source::McCity::new(world, assets, pool, pbr));
   let lod_path = lod::path_for(GREEN_FIELD);
   match lod::load(&lod_path, stamp) {
     Ok(f) => city.install_lod(f),

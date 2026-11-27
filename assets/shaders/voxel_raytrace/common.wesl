@@ -1,4 +1,4 @@
-import package::bindings::{b_palette, light_u, material_assets, pbr_albedo_rough, pbr_metal, pbr_samp, view_u};
+import package::bindings::{b_palette, light_u, material_assets, mc_albedo, mc_samp, pbr_albedo_rough, pbr_metal, pbr_samp, view_u};
 
 const CHUNK_SIZE: u32 = 256u;
 const MAX_LEVEL: u32 = 4u;
@@ -6,7 +6,8 @@ const NODE_FIXED_WORDS: u32 = 3u;    const CHUNK_INDEX_CAP: u32 = 64u;
 const INDEX_ENTRY_EMPTY: u32 = 0xFFFFFFFFu;
 const FLAGS_IS_PBR: u32 = 1u << 4u;
 const FLAGS_TRANSMISSIVE: u32 = 1u << 5u;
-const MATERIAL_ASSET_SLOTS: u32 = 1024u;
+const MATERIAL_ASSET_SLOTS: u32 = 2048u;
+const MC_TEX_SIZE: u32 = 32u;
 const MATERIAL_TEX_SLOTS: u32 = 64u;
 const MATERIAL_SLOT_NONE: u32 = 0xFFFFFFFFu;
 const DIR_LUT: array<u32, 8u> = array<u32, 8u>(
@@ -110,10 +111,10 @@ fn material_sample_pos(p_world: vec3<f32>) -> vec3<f32> {
   return select(p_world, floor(p_world) + vec3<f32>(0.5), MATERIAL_FLAT_SHADING != 0u);
 }
 
-fn pbr_mip_lod(p: vec3<f32>, voxel_per_meter: f32, tile_m: f32) -> f32 {
+fn pbr_mip_lod(p: vec3<f32>, voxel_per_meter: f32, tile_m: f32, tex_size: f32) -> f32 {
   let dist_m = length(p - view_u.cam_pos_voxel.xyz) / max(voxel_per_meter, 1e-4);
   let footprint_m = dist_m * max(view_u.lod.x, 1e-6);
-  let texels = footprint_m / max(tile_m, 1e-4) * f32(textureDimensions(pbr_albedo_rough).x);
+  let texels = footprint_m / max(tile_m, 1e-4) * tex_size;
   return max(log2(max(texels, 1.0)), 0.0);
 }
 
@@ -149,6 +150,28 @@ fn triplanar_sample(slot: u32, p: vec3<f32>, n: vec3<f32>, lod: f32,
   );
 }
 
+fn triplanar_axis_mc(slot: u32, uv: vec2<f32>, lod: f32) -> vec3<f32> {
+  let s = textureSampleLevel(mc_albedo, mc_samp, uv, i32(slot), lod);
+  return srgb_to_linear(s.rgb);
+}
+
+fn triplanar_sample_mc(slot: u32, p: vec3<f32>, n: vec3<f32>, lod: f32,
+                       voxel_per_meter: f32, tile_m: f32) -> vec3<f32> {
+  let uv_scale = 1.0 / (max(tile_m, 1e-4) * max(voxel_per_meter, 1e-4));
+  if (MATERIAL_TRIPLANAR_SINGLE_AXIS != 0u) {
+    let an = abs(n);
+    if (an.x >= an.y && an.x >= an.z) { return triplanar_axis_mc(slot, p.zy * uv_scale, lod); }
+    if (an.y >= an.z) { return triplanar_axis_mc(slot, p.xz * uv_scale, lod); }
+    return triplanar_axis_mc(slot, p.xy * uv_scale, lod);
+  }
+  let w = pow(abs(n), vec3<f32>(MATERIAL_TRIPLANAR_SHARPNESS));
+  let sx = triplanar_axis_mc(slot, p.zy * uv_scale, lod);
+  let sy = triplanar_axis_mc(slot, p.xz * uv_scale, lod);
+  let sz = triplanar_axis_mc(slot, p.xy * uv_scale, lod);
+  let inv = 1.0 / max(w.x + w.y + w.z, 1e-6);
+  return (sx * w.x + sy * w.y + sz * w.z) * inv;
+}
+
 fn override_value(v: u32) -> f32 {
   return select(f32(v - 1u) / 254.0, -1.0, v == 0u);
 }
@@ -174,11 +197,19 @@ fn fetch_material_asset(asset: u32, ov0: u32, ov1: u32, p_world: vec3<f32>, n: v
   if (fused != MATERIAL_SLOT_NONE) {
     let p = material_sample_pos(p_world);
     let tile_m = a.tile_m;
-    let ts = triplanar_sample(
-      fused, p, n, pbr_mip_lod(p, voxel_per_meter, tile_m), voxel_per_meter, tile_m);
-    albedo = ts.albedo;
-    roughness = ts.roughness;
-    metallic = ts.metallic;
+    if (a.texture_kind == 1u) {
+      albedo = triplanar_sample_mc(
+        fused, p, n, pbr_mip_lod(p, voxel_per_meter, tile_m, f32(MC_TEX_SIZE)),
+        voxel_per_meter, tile_m);
+    } else {
+      let ts = triplanar_sample(
+        fused, p, n, pbr_mip_lod(p, voxel_per_meter, tile_m,
+                                 f32(textureDimensions(pbr_albedo_rough).x)),
+        voxel_per_meter, tile_m);
+      albedo = ts.albedo;
+      roughness = ts.roughness;
+      metallic = ts.metallic;
+    }
   }
   return MaterialParams(
     albedo,

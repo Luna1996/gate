@@ -89,6 +89,9 @@ pub(crate) fn setup(
       info.aabb_max,
       t0.elapsed(),
     );
+    if name == mc::GREEN_FIELD {
+      mc::pbr::install(&mut images, &mut commands);
+    }
   }
   grid.compact_all();
   bevy::log::info!("STEP 3 compact_all {:?}", t0.elapsed());

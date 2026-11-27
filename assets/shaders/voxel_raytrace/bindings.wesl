@@ -82,6 +82,7 @@ struct MaterialAsset {
   emissive_metal: u32,
   transmission_ior: u32,
   tile_m: f32,
+  texture_kind: u32,
 };
 
 @group(1) @binding(5) var<storage, read> material_assets: array<MaterialAsset>;
@@ -98,6 +99,10 @@ struct MaterialAsset {
 @group(1) @binding(12) var<storage, read> occ: array<u32>;
 
 @group(1) @binding(13) var<storage, read> b_struct_p1: array<u32>;
+
+@group(1) @binding(14) var mc_albedo: texture_2d_array<f32>;
+
+@group(1) @binding(15) var mc_samp: sampler;
 
 struct GridDesc {
   pos_scale: vec4<f32>,

@@ -756,6 +756,9 @@ fn register_callbacks(world: &mut World) {
      mut base: ResMut<gate_render::BaseSettings>,
      mut phys: ResMut<crate::physics::PhysicsState>,
      pbr: Option<Res<gate_render::PbrTextureSet>>,
+     mc_set: Option<Res<gate_render::McTextureSet>>,
+     mut images: ResMut<Assets<Image>>,
+     mut commands: Commands,
      cam: Option<Res<gate_render::DdaCameraConfig>>,
      mut orbit: ResMut<gate_render::OrbitCamera>,
      mut fly: ResMut<crate::camera::FlyCamera>,
@@ -786,6 +789,9 @@ fn register_callbacks(world: &mut World) {
           ) {
             Ok(_info) => {
               phys.reset();
+              if name == crate::mc::GREEN_FIELD && mc_set.is_none() {
+                crate::mc::pbr::install(&mut images, &mut commands);
+              }
               let vpm = scene.volumes.main().voxel_per_meter();
               phys.cfg.gravity = Vec3::new(0.0, -9.81 * vpm, 0.0);
               let speed_mps =

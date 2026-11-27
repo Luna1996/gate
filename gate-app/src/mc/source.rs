@@ -10,7 +10,7 @@ use super::assets::Assets;
 use super::lod;
 use super::material::Pool;
 use super::summary::{self, Summary};
-use super::voxel::{self, BlockPlan, Fill};
+use super::voxel::{self, BlockPlan, Fill, PbrMap};
 use super::world::{self, BlockState, World};
 use crate::infinite_cubes::{FAR_GRAIN, FAR_SCALES};
 
@@ -24,6 +24,7 @@ pub struct McCity {
   world: Arc<World>,
   assets: Arc<Assets>,
   pool: Arc<Pool>,
+  pbr: Arc<PbrMap>,
   plans: Mutex<HashMap<String, Option<Arc<BlockPlan>>>>,
   summary: Summary,
   lod: lod::Cell,
@@ -32,11 +33,12 @@ pub struct McCity {
 }
 
 impl McCity {
-  pub fn new(world: Arc<World>, assets: Arc<Assets>, pool: Arc<Pool>) -> Self {
+  pub fn new(world: Arc<World>, assets: Arc<Assets>, pool: Arc<Pool>, pbr: Arc<PbrMap>) -> Self {
     Self {
       world,
       assets,
       pool,
+      pbr,
       plans: Mutex::new(HashMap::new()),
       summary: Summary::new(),
       lod: Arc::new(std::sync::RwLock::new(None)),
@@ -50,7 +52,7 @@ impl McCity {
     if let Some(hit) = self.plans.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
       return hit.clone();
     }
-    let built = voxel::plan(&self.assets, &self.pool, st);
+    let built = voxel::plan(&self.assets, &self.pool, st, &self.pbr);
     self.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(key, built.clone());
     built
   }

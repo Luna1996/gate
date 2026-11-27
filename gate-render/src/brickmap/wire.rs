@@ -98,9 +98,10 @@ pub struct MaterialAsset {
   pub emissive_metal: u32,
   pub transmission_ior: u32,
   pub tile_m: f32,
+  pub texture_kind: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<MaterialAsset>() == 36);
+const _: () = assert!(std::mem::size_of::<MaterialAsset>() == 40);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bevy::render::render_resource::ShaderType)]

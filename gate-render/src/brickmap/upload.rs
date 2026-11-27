@@ -278,11 +278,15 @@ pub struct GpuBrickMap {
   pub blit_sampler: Sampler,
   pub material_assets: Buffer,
   pub material_assets_uploaded: bool,
+  pub mc_layers_uploaded: u32,
   pub pbr_albedo_rough_tex: Texture,
   pub pbr_albedo_rough_view: TextureView,
   pub pbr_metal_tex: Texture,
   pub pbr_metal_view: TextureView,
   pub pbr_sampler: Sampler,
+  pub mc_albedo_tex: Texture,
+  pub mc_albedo_view: TextureView,
+  pub mc_sampler: Sampler,
 }
 
 fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
@@ -343,8 +347,11 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     make_pbr_placeholder("gate_pbr_albedo_rough_placeholder", TextureFormat::Rgba8Unorm);
   let (pbr_metal_tex, pbr_metal_view) =
     make_pbr_placeholder("gate_pbr_metal_placeholder", TextureFormat::R8Unorm);
+  let (mc_albedo_tex, mc_albedo_view) =
+    make_pbr_placeholder("gate_mc_albedo_placeholder", TextureFormat::Rgba8Unorm);
 
   let pbr_sampler = crate::pbr_texture::create_pbr_sampler(&device);
+  let mc_sampler = crate::mc_texture::create_mc_sampler(&device);
   info!(
     target: "gate",
     "PBR 采样器（BG1 binding 8）: Repeat×3 / Linear(mag,min,mipmap) / anisotropy_clamp = {} \
@@ -408,11 +415,15 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     blit_sampler,
     material_assets,
     material_assets_uploaded: false,
+    mc_layers_uploaded: 0,
     pbr_albedo_rough_tex,
     pbr_albedo_rough_view,
     pbr_metal_tex,
     pbr_metal_view,
     pbr_sampler,
+    mc_albedo_tex,
+    mc_albedo_view,
+    mc_sampler,
   });
 }
 
@@ -764,16 +775,23 @@ fn ensure_capacity(
   *cur = new_buf;
 }
 
-fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu: &mut GpuBrickMap) {
-  if gpu.material_assets_uploaded {
+fn upload_material_assets(
+  queue: &RenderQueue,
+  set: Option<&PbrTextureSet>,
+  mc: Option<&crate::mc_texture::McTextureSet>,
+  gpu: &mut GpuBrickMap,
+) {
+  let mc_layers = mc.map_or(0, |m| m.layers());
+  if gpu.material_assets_uploaded && (mc_layers == 0 || gpu.mc_layers_uploaded == mc_layers) {
     return;
   }
   let Some(set) = set else {
     return;
   };
-  let table = build_material_asset_table(set);
+  let table = build_material_asset_table(set, mc);
   queue.write_buffer(&gpu.material_assets, 0, u8_of_material_assets(&table));
   gpu.material_assets_uploaded = true;
+  gpu.mc_layers_uploaded = mc_layers;
 
   let layers = set.layers();
   info!(
@@ -782,6 +800,15 @@ fn upload_material_assets(queue: &RenderQueue, set: Option<&PbrTextureSet>, gpu:
      = MATERIAL_SLOT_NONE；其余槽位五个 *_slot 全 NONE（标量回退 = 中性灰 albedo(sRGB 128) + roughness 0.5 \
      + metallic 0 + specular 1.0(不调制电介质 F0) + emissive/transmission 0 + IOR 1.50）",
   );
+  if mc_layers > 0 {
+    info!(
+      target: "gate",
+      "材质资产表: MC 槽 {}..{}（{} 层，tile_m=1，texture_kind=1）",
+      crate::mc_texture::MC_ASSET_BASE,
+      crate::mc_texture::MC_ASSET_BASE as u32 + mc_layers,
+      mc_layers,
+    );
+  }
   match set.slot_of(METAL_DEMO_ID) {
     Some(i) => info!(
       target: "gate",
@@ -799,6 +826,7 @@ pub(crate) struct PrepareParams<'w, 's> {
   commands: Commands<'w, 's>,
   snapshot: Option<ResMut<'w, UploadSnapshot>>,
   pbr_set: Option<Res<'w, PbrTextureSet>>,
+  mc_set: Option<Res<'w, crate::mc_texture::McTextureSet>>,
   gpu: ResMut<'w, GpuBrickMap>,
   device: Res<'w, RenderDevice>,
   queue: Res<'w, RenderQueue>,
@@ -812,6 +840,7 @@ pub(crate) fn prepare(p: PrepareParams) {
     mut commands,
     snapshot,
     pbr_set,
+    mc_set,
     mut gpu,
     device,
     queue,
@@ -819,7 +848,7 @@ pub(crate) fn prepare(p: PrepareParams) {
     sample_channel,
     mut revision,
   } = p;
-  upload_material_assets(&queue, pbr_set.as_deref(), &mut gpu);
+  upload_material_assets(&queue, pbr_set.as_deref(), mc_set.as_deref(), &mut gpu);
   let Some(snap) = snapshot else { return };
   let t0 = std::time::Instant::now();
 

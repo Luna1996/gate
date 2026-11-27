@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use gate_voxel::{PaletteEntry, PaletteFlags, PaletteId};
+use gate_voxel::{PaletteEntry, PaletteFlags, PaletteId, PbrOverrides, override_byte};
 
 use super::assets::Assets;
 use super::material::Pool;
@@ -15,6 +16,7 @@ pub struct Mat {
   pub emissive: u8,
   pub transmission: u8,
   pub metallic: u8,
+  pub pbr: Option<u16>,
 }
 
 impl Mat {
@@ -22,6 +24,16 @@ impl Mat {
     let mut flags = PaletteFlags::default();
     if self.transmission > 0 {
       flags = flags.union(PaletteFlags::TRANSMISSIVE);
+    }
+    if let Some(asset) = self.pbr {
+      let ov = PbrOverrides {
+        roughness: override_byte(self.roughness as f32 / 255.0),
+        metallic: override_byte(self.metallic as f32 / 255.0),
+        emissive: 0,
+        transmission: 0,
+        specular: 0,
+      };
+      return PaletteEntry::pbr(asset, ov, flags);
     }
     PaletteEntry {
       color,
@@ -32,6 +44,39 @@ impl Mat {
       metallic: self.metallic,
     }
   }
+}
+
+pub struct PbrMap {
+  slots: HashMap<String, u16>,
+}
+
+impl PbrMap {
+  pub fn new(ids: &[String]) -> Self {
+    let slots = ids
+      .iter()
+      .enumerate()
+      .map(|(i, id)| (id.clone(), gate_render::MC_ASSET_BASE + i as u16))
+      .collect();
+    Self { slots }
+  }
+
+  pub fn slot_for_texture(&self, path: &str) -> Option<u16> {
+    self.slots.get(path).copied()
+  }
+}
+
+fn representative_face(subs: &[SubModel]) -> Option<&Face> {
+  const ORDER: [usize; 6] = [2, 3, 4, 5, 1, 0];
+  for sub in subs {
+    for el in &sub.elements {
+      for i in ORDER {
+        if let Some(face) = el.faces[i].as_ref() {
+          return Some(face);
+        }
+      }
+    }
+  }
+  None
 }
 
 #[derive(Debug, Clone)]
@@ -51,10 +96,23 @@ pub struct BlockPlan {
   pub fills: Vec<Fill>,
 }
 
-pub fn cells_of(assets: &Assets, pool: &Pool, st: &BlockState) -> Option<Box<[PaletteId; CELLS]>> {
+pub fn cells_of(
+  assets: &Assets,
+  pool: &Pool,
+  st: &BlockState,
+  pbr: &PbrMap,
+) -> Option<Box<[PaletteId; CELLS]>> {
   let subs: Vec<SubModel> = model::resolve(assets, st)?;
-  let mat = material_of(st);
+  let mut mat = material_of(st);
   let tint = tint_of(st);
+  if tint.is_none()
+    && mat.emissive == 0
+    && mat.transmission == 0
+    && let Some(face) = representative_face(&subs)
+    && face.tex.opaque
+  {
+    mat.pbr = pbr.slot_for_texture(&face.tex.path);
+  }
   let mut cells = [PaletteId::AIR; CELLS];
   for sub in &subs {
     let base = raster(&sub.elements, mat, tint, pool);
@@ -71,8 +129,8 @@ pub fn cells_of(assets: &Assets, pool: &Pool, st: &BlockState) -> Option<Box<[Pa
   (!cells.iter().all(|c| c.is_air())).then_some(Box::new(cells))
 }
 
-pub fn plan(assets: &Assets, pool: &Pool, st: &BlockState) -> Option<Arc<BlockPlan>> {
-  let cells = cells_of(assets, pool, st)?;
+pub fn plan(assets: &Assets, pool: &Pool, st: &BlockState, pbr: &PbrMap) -> Option<Arc<BlockPlan>> {
+  let cells = cells_of(assets, pool, st, pbr)?;
   let rep = rep_of(&cells[..]).unwrap_or(PaletteId::AIR);
   Some(Arc::new(BlockPlan { rep, fills: fills_of(&cells) }))
 }
@@ -289,7 +347,7 @@ fn rotate(src: &[PaletteId; CELLS], r: Rot) -> [PaletteId; CELLS] {
 pub fn material_of(st: &BlockState) -> Mat {
   let n = st.short_name();
   let lit = st.prop("lit").map(|v| v == "true").unwrap_or(false);
-  let mut m = Mat { roughness: 235, emissive: 0, transmission: 0, metallic: 0 };
+  let mut m = Mat { roughness: 235, emissive: 0, transmission: 0, metallic: 0, pbr: None };
   if is_light(n, lit) {
     m.emissive = 255;
     m.roughness = 200;

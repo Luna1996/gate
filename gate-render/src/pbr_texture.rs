@@ -220,14 +220,17 @@ const DEFAULT_SPECULAR: u8 = 255;
 const DEFAULT_IOR_X100: u16 = 150;
 const METAL_DEMO_METALLIC: u8 = 255;
 
-pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
+pub fn build_material_asset_table(
+  set: &PbrTextureSet,
+  mc: Option<&crate::mc_texture::McTextureSet>,
+) -> Vec<MaterialAsset> {
   let slots = crate::wesl_consts::material_consts().material_asset_slots as usize;
   let metal_demo = set.slot_of(METAL_DEMO_ID);
   let albedo_rough = DEFAULT_ALBEDO_SRGB as u32
     | (DEFAULT_ALBEDO_SRGB as u32) << 8
     | (DEFAULT_ALBEDO_SRGB as u32) << 16
     | (DEFAULT_ROUGHNESS as u32) << 24;
-  (0..slots)
+  let mut table: Vec<MaterialAsset> = (0..slots)
     .map(|i| {
       let i = i as u32;
       let textured = i < set.layers();
@@ -244,9 +247,29 @@ pub fn build_material_asset_table(set: &PbrTextureSet) -> Vec<MaterialAsset> {
         emissive_metal: metallic << 8 | (DEFAULT_SPECULAR as u32) << 16,
         transmission_ior: (DEFAULT_IOR_X100 as u32) << 16,
         tile_m,
+        texture_kind: 0,
       }
     })
-    .collect()
+    .collect();
+  if let Some(mc) = mc {
+    let base = crate::mc_texture::MC_ASSET_BASE as usize;
+    for layer in 0..mc.layers() as usize {
+      let Some(slot) = table.get_mut(base + layer) else { break };
+      *slot = MaterialAsset {
+        albedo_slot: layer as u32,
+        roughmetal_slot: MATERIAL_SLOT_NONE,
+        emissive_slot: MATERIAL_SLOT_NONE,
+        transmission_slot: MATERIAL_SLOT_NONE,
+        height_slot: MATERIAL_SLOT_NONE,
+        albedo_rough,
+        emissive_metal: (DEFAULT_SPECULAR as u32) << 16,
+        transmission_ior: (DEFAULT_IOR_X100 as u32) << 16,
+        tile_m: 1.0,
+        texture_kind: 1,
+      };
+    }
+  }
+  table
 }
 
 struct PendingMaterial {
@@ -271,9 +294,10 @@ impl Plugin for PbrTexturesPlugin {
       .init_resource::<PbrLoad>()
       .add_systems(Startup, start_pbr_texture_load)
       .add_systems(Update, finish_pbr_textures)
-      .add_plugins(
+      .add_plugins((
         bevy::render::extract_resource::ExtractResourcePlugin::<PbrTextureSet>::default(),
-      );
+        bevy::render::extract_resource::ExtractResourcePlugin::<crate::mc_texture::McTextureSet>::default(),
+      ));
   }
 }
 
