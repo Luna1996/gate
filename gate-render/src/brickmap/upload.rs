@@ -287,6 +287,11 @@ pub struct GpuBrickMap {
   pub mc_albedo_tex: Texture,
   pub mc_albedo_view: TextureView,
   pub mc_sampler: Sampler,
+  pub cloud_tex: Texture,
+  pub cloud_view: TextureView,
+  pub cloud_noise_tex: Texture,
+  pub cloud_noise_view: TextureView,
+  pub cloud_sampler: Sampler,
 }
 
 fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
@@ -349,6 +354,46 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     make_pbr_placeholder("gate_pbr_metal_placeholder", TextureFormat::R8Unorm);
   let (mc_albedo_tex, mc_albedo_view) =
     make_pbr_placeholder("gate_mc_albedo_placeholder", TextureFormat::Rgba8Unorm);
+  let cloud_tex = device.create_texture(&TextureDescriptor {
+    label: Some("gate_cloud_placeholder"),
+    size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    mip_level_count: 1,
+    sample_count: 1,
+    dimension: TextureDimension::D2,
+    format: TextureFormat::Rgba8Unorm,
+    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+    view_formats: &[],
+  });
+  let cloud_view = cloud_tex.create_view(&TextureViewDescriptor {
+    label: Some("gate_cloud_placeholder"),
+    dimension: Some(TextureViewDimension::D2),
+    ..Default::default()
+  });
+  let cloud_noise_tex = device.create_texture(&TextureDescriptor {
+    label: Some("gate_cloud_noise_placeholder"),
+    size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    mip_level_count: 1,
+    sample_count: 1,
+    dimension: TextureDimension::D3,
+    format: TextureFormat::Rgba8Unorm,
+    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+    view_formats: &[],
+  });
+  let cloud_noise_view = cloud_noise_tex.create_view(&TextureViewDescriptor {
+    label: Some("gate_cloud_noise_placeholder"),
+    dimension: Some(TextureViewDimension::D3),
+    ..Default::default()
+  });
+  let cloud_sampler = device.create_sampler(&SamplerDescriptor {
+    label: Some("gate_cloud_sampler"),
+    address_mode_u: AddressMode::Repeat,
+    address_mode_v: AddressMode::Repeat,
+    address_mode_w: AddressMode::Repeat,
+    mag_filter: FilterMode::Linear,
+    min_filter: FilterMode::Linear,
+    mipmap_filter: MipmapFilterMode::Nearest,
+    ..Default::default()
+  });
 
   let pbr_sampler = crate::pbr_texture::create_pbr_sampler(&device);
   let mc_sampler = crate::mc_texture::create_mc_sampler(&device);
@@ -424,6 +469,11 @@ fn init_empty_gpu(device: Res<RenderDevice>, mut commands: Commands) {
     mc_albedo_tex,
     mc_albedo_view,
     mc_sampler,
+    cloud_tex,
+    cloud_view,
+    cloud_noise_tex,
+    cloud_noise_view,
+    cloud_sampler,
   });
 }
 

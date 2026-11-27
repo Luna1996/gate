@@ -104,6 +104,12 @@ struct MaterialAsset {
 
 @group(1) @binding(15) var mc_samp: sampler;
 
+@group(1) @binding(16) var cloud_weather: texture_2d<f32>;
+
+@group(1) @binding(17) var cloud_samp: sampler;
+
+@group(1) @binding(18) var cloud_noise: texture_3d<f32>;
+
 struct GridDesc {
   pos_scale: vec4<f32>,
   rot0: vec4<f32>,

@@ -618,6 +618,7 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::ReflectionSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::BaseSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::AtmosphereSettings>::default(),
+      bevy::render::extract_resource::ExtractResourcePlugin::<crate::lighting::CloudSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<DlssFrame>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<DlssSettings>::default(),
@@ -628,6 +629,7 @@ impl Plugin for BrickMapDdaPlugin {
     app.init_resource::<crate::lighting::ReflectionSettings>();
     app.init_resource::<crate::lighting::BaseSettings>();
     app.init_resource::<crate::lighting::AtmosphereSettings>();
+    app.init_resource::<crate::lighting::CloudSettings>();
     app.init_resource::<DlssFrame>();
     app.init_resource::<DlssSettings>();
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
@@ -941,6 +943,35 @@ pub(crate) fn init_dda_pipelines(
     count: None,
   });
 
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 16,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Texture {
+      sample_type: TextureSampleType::Float { filterable: true },
+      view_dimension: TextureViewDimension::D2,
+      multisampled: false,
+    },
+    count: None,
+  });
+
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 17,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+    count: None,
+  });
+
+  bg1_entries.push(BindGroupLayoutEntry {
+    binding: 18,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Texture {
+      sample_type: TextureSampleType::Float { filterable: true },
+      view_dimension: TextureViewDimension::D3,
+      multisampled: false,
+    },
+    count: None,
+  });
+
   let bg1 = BindGroupLayoutDescriptor::new("DdaBg1", &bg1_entries);
 
   let bg2 = BindGroupLayoutDescriptor::new(
@@ -1219,6 +1250,7 @@ pub(crate) struct PrepareDdaBindGroupsParams<'w, 's> {
   gpu_brickmap: Option<Res<'w, GpuBrickMap>>,
   pbr_set: Option<Res<'w, crate::pbr_texture::PbrTextureSet>>,
   mc_set: Option<Res<'w, crate::mc_texture::McTextureSet>>,
+  cloud_set: Option<Res<'w, crate::cloud_texture::CloudTextureSet>>,
   lighting: Option<Res<'w, LightingTheme>>,
   light_gpu: Option<ResMut<'w, LightPoolGpu>>,
   render_device: Res<'w, RenderDevice>,
@@ -1241,6 +1273,7 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
     gpu_brickmap,
     pbr_set,
     mc_set,
+    cloud_set,
     lighting,
     light_gpu,
     render_device,
@@ -1741,6 +1774,11 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   let mc_albedo = mc_set.as_deref().and_then(|s| gpu_images.get(s.albedo()));
   let mc_albedo_view =
     mc_albedo.map_or_else(|| gpu.mc_albedo_view.clone(), |i| i.texture_view.clone());
+  let cloud = cloud_set.as_deref().and_then(|s| gpu_images.get(s.weather()));
+  let cloud_view = cloud.map_or_else(|| gpu.cloud_view.clone(), |i| i.texture_view.clone());
+  let cloud_noise = cloud_set.as_deref().and_then(|s| gpu_images.get(s.noise()));
+  let cloud_noise_view =
+    cloud_noise.map_or_else(|| gpu.cloud_noise_view.clone(), |i| i.texture_view.clone());
   let bg1 = {
     let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
       gpu.struct_buf.as_entire_binding(),
@@ -1768,6 +1806,17 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
 
     entries
       .push(BindGroupEntry { binding: 15, resource: BindingResource::Sampler(&gpu.mc_sampler) });
+
+    entries
+      .push(BindGroupEntry { binding: 16, resource: BindingResource::TextureView(&cloud_view) });
+
+    entries
+      .push(BindGroupEntry { binding: 17, resource: BindingResource::Sampler(&gpu.cloud_sampler) });
+
+    entries.push(BindGroupEntry {
+      binding: 18,
+      resource: BindingResource::TextureView(&cloud_noise_view),
+    });
 
     render_device.create_bind_group(None, &bg1_layout, &entries)
   };

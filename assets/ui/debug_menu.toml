@@ -382,6 +382,22 @@ tooltip = "menu.render.sky.time.lat.tip"
 
 [[items.children.children]]
 kind = "sub_menu"
+id = "cloud"
+label = "menu.render.sky.cloud"
+
+[[items.children.children.children]]
+kind = "slider"
+id = "cover"
+label = "menu.render.sky.cloud.cover"
+value = 100.0
+min = 0.0
+max = 200.0
+step = 1.0
+decimals = 0
+tooltip = "menu.render.sky.cloud.cover.tip"
+
+[[items.children.children]]
+kind = "sub_menu"
 id = "air"
 label = "menu.render.sky.air"
 

@@ -1,4 +1,5 @@
 pub mod brickmap;
+pub mod cloud_texture;
 pub mod consts;
 #[cfg(feature = "dlss")]
 pub mod dlss;
@@ -27,10 +28,12 @@ pub use brickmap::{
   raycast_objects,
 };
 pub use brickmap::{PostFxSettings, RenderScale, TonemapMode};
+pub use cloud_texture::{CloudTexturePlugin, CloudTextureSet};
 pub use consts::VIEW_SIZE;
 pub use lighting::{
-  AtmosphereSettings, BaseSettings, DirLightCfg, LightDesc, LightGlobals, LightPoolUniform,
-  LightingTheme, MAX_LIGHTS, ReflectionSettings, SkyCfg, build_light_pool, parse_lighting_ron,
+  AtmosphereSettings, BaseSettings, CloudSettings, DirLightCfg, LightDesc, LightGlobals,
+  LightPoolUniform, LightingTheme, MAX_LIGHTS, ReflectionSettings, SkyCfg, build_light_pool,
+  parse_lighting_ron,
 };
 pub use mc_texture::{
   MC_ASSET_BASE, MC_TEX_MIP_LEVELS, MC_TEX_SIZE, McTextureSet, texture_array_image,
@@ -54,6 +57,7 @@ impl Plugin for GateRenderPlugin {
       sky::SkyPlugin,
       profiler::GateProfilerPlugin,
       pbr_texture::PbrTexturesPlugin,
+      cloud_texture::CloudTexturePlugin,
     ));
     #[cfg(feature = "dlss")]
     app.add_plugins(dlss::DlssRenderPlugin);

@@ -351,6 +351,7 @@ struct PrepareFogParams<'w, 's> {
   view: Option<bevy::ecs::system::Res<'w, crate::brickmap::dda::DdaViewUniform>>,
   scale: Option<bevy::ecs::system::Res<'w, crate::brickmap::dda::RenderScale>>,
   lighting: Option<bevy::ecs::system::Res<'w, crate::lighting::LightingTheme>>,
+  cloud: Option<bevy::ecs::system::Res<'w, crate::lighting::CloudSettings>>,
   gi_gpu: Option<bevy::ecs::system::Res<'w, crate::gi::GiGpu>>,
   gpu: bevy::ecs::system::ResMut<'w, FogGpu>,
 }
@@ -365,6 +366,7 @@ fn prepare_fog(p: PrepareFogParams) {
     view,
     scale,
     lighting,
+    cloud,
     gi_gpu,
     mut gpu,
   } = p;
@@ -380,6 +382,9 @@ fn prepare_fog(p: PrepareFogParams) {
   let (sun_uv, facing) = project_sun(view_proj, cam_pos, sun);
 
   let size = scale.as_deref().map_or(crate::consts::VIEW_SIZE, |s| s.size);
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0.0, |d| d.as_secs_f32() % 3600.0);
   *gpu.uniform.get_mut() = FogUniform {
     params: Vec4::new(settings.decay(), 0.0, 0.0, 0.0),
     misc: Vec4::new(0.0, settings.focus(), settings.strength(), facing),
@@ -389,7 +394,7 @@ fn prepare_fog(p: PrepareFogParams) {
       settings.sun_cone.max(0.0),
       if settings.body { settings.halo.max(0.0) } else { 0.0 },
     ),
-    misc3: Vec4::new(sun_uv.x, sun_uv.y, 0.0, 0.0),
+    misc3: Vec4::new(sun_uv.x, sun_uv.y, now, cloud.as_deref().map_or(1.0, |c| c.cover.max(0.0))),
   };
   gpu.uniform.write_buffer(&device, &queue);
 

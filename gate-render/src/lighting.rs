@@ -134,6 +134,20 @@ impl Default for AtmosphereSettings {
   }
 }
 
+#[derive(
+  Resource, Clone, Copy, Debug, PartialEq, bevy::render::extract_resource::ExtractResource,
+)]
+#[extract_app(bevy::render::RenderApp)]
+pub struct CloudSettings {
+  pub cover: f32,
+}
+
+impl Default for CloudSettings {
+  fn default() -> Self {
+    Self { cover: 1.0 }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DirLightCfg {
   pub dir: [f32; 3],
