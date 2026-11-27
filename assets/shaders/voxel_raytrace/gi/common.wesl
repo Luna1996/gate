@@ -105,13 +105,12 @@ fn gi_ambient_fallback(n: vec3<f32>, cov: f32) -> vec3<f32> {
 }
 
 fn gi_sample_base() -> u32 {
-  let per_cell = f32(gi_div()) / max(gi_u.params.y, 1.0);
-  return u32(clamp(ceil(per_cell * per_cell), 1.0, f32(GI_SPP_MAX)));
+  return 1u;
 }
 
 fn gi_sample_boost(n: f32) -> u32 {
   if (n < GI_SPP_BOOST_N0) { return 8u; }
   if (n < GI_SPP_BOOST_N1) { return 4u; }
   if (n < GI_SPP_EASE_N) { return 2u; }
-  return 4u;
+  return 1u;
 }
