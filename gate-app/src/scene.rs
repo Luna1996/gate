@@ -357,8 +357,8 @@ fn mc_water_settings() -> WaterSettings {
   WaterSettings {
     enabled: false,
     level: 0.0,
-    deep: Vec3::new(0.010, 0.050, 0.085),
-    absorption: 0.02,
+    deep: Vec3::new(0.012, 0.045, 0.040),
+    absorption: 0.06,
     wave_amp: 0.055,
     wave_scale: 0.13,
     sparkle: 1.2,

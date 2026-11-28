@@ -280,7 +280,7 @@ impl View {
     best.map(|(h, _)| (h, lo, hi))
   }
 
-  pub fn water_top(&self, cx: i32, cz: i32) -> Option<i32> {
+  fn water_top_chunk(&self, cx: i32, cz: i32) -> Option<i32> {
     let ix = cx - self.f.col_min.0;
     let iz = cz - self.f.col_min.1;
     if ix < 0 || iz < 0 || ix >= self.f.dims.0 || iz >= self.f.dims.1 {
@@ -290,16 +290,46 @@ impl View {
     (v >= 0).then_some(v as i32)
   }
 
-  pub fn water_top_max(&self, cx: i32, cz: i32, cell_blocks: i32) -> Option<i32> {
+  fn water_top_max(&self, bx: i32, bz: i32, cell_blocks: i32) -> Option<i32> {
+    let c0x = bx.div_euclid(CELL);
+    let c0z = bz.div_euclid(CELL);
+    let c1x = (bx + cell_blocks - 1).div_euclid(CELL);
+    let c1z = (bz + cell_blocks - 1).div_euclid(CELL);
     let mut best = None;
-    for dz in 0..cell_blocks {
-      for dx in 0..cell_blocks {
-        if let Some(h) = self.water_top(cx + dx, cz + dz) {
+    for cz in c0z..=c1z {
+      for cx in c0x..=c1x {
+        if let Some(h) = self.water_top_chunk(cx, cz) {
           best = Some(best.map_or(h, |b: i32| b.max(h)));
         }
       }
     }
     best
+  }
+
+  pub fn water_level(&self, bx: i32, bz: i32, cell_blocks: i32) -> Option<i32> {
+    let any = self.water_top_max(bx, bz, cell_blocks)?;
+    let c0x = bx.div_euclid(CELL) - 1;
+    let c0z = bz.div_euclid(CELL) - 1;
+    let c1x = (bx + cell_blocks - 1).div_euclid(CELL) + 1;
+    let c1z = (bz + cell_blocks - 1).div_euclid(CELL) + 1;
+    let mut vals: [i32; 9] = [0; 9];
+    let mut n = 0usize;
+    for cz in c0z..=c1z {
+      for cx in c0x..=c1x {
+        if let Some(h) = self.water_top_chunk(cx, cz)
+          && n < vals.len()
+        {
+          vals[n] = h;
+          n += 1;
+        }
+      }
+    }
+    if n == 0 {
+      return Some(any);
+    }
+    let v = &mut vals[..n];
+    v.sort_unstable();
+    Some(v[n / 2])
   }
 
   fn top_height(&self, col: usize, rep: PaletteId) -> Option<i32> {
@@ -337,10 +367,8 @@ impl View {
             if name == FINE_AIR {
               continue;
             }
-            let Some(r) = self.rep.get(name as usize).copied().flatten() else { continue };
-            if r == rep {
-              return Some(y * CELL + (ly + 1) * FINE_CELL);
-            }
+            let r = self.rep.get(name as usize).copied().flatten()?;
+            return (r == rep).then_some(y * CELL + (ly + 1) * FINE_CELL);
           }
         }
       }

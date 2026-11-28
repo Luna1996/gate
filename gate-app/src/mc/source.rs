@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gate_voxel::{ChunkCoord, ChunkSource, ChunkTree, Detail, PaletteEntry, PaletteId};
@@ -30,6 +30,7 @@ pub struct McCity {
   lod: lod::Cell,
   water: Mutex<Option<(PaletteId, i32)>>,
   produced: Mutex<usize>,
+  far_log: AtomicU8,
 }
 
 impl McCity {
@@ -44,6 +45,7 @@ impl McCity {
       lod: Arc::new(std::sync::RwLock::new(None)),
       water: Mutex::new(None),
       produced: Mutex::new(0),
+      far_log: AtomicU8::new(0),
     }
   }
 
@@ -69,7 +71,7 @@ impl McCity {
     let cell_blocks = cell_blocks_of(scale);
     let water = *self.water.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
-      let water_top = |x: i32, z: i32| water.and_then(|_| view.water_top_max(x, z, cell_blocks));
+      let water_top = |x: i32, z: i32| water.and_then(|_| view.water_level(x, z, cell_blocks));
       return self.far_tree(
         coord,
         cell_blocks,
@@ -107,16 +109,31 @@ impl McCity {
     let sub = if cell_blocks == 8 { 2 } else { 4 };
     let n = cell_blocks / sub;
     let extent = sub * 16 / cell_blocks;
+    let mut n_idw = 0usize;
+    let mut n_wt = 0usize;
+    let mut n_fill = 0usize;
+    let (mut lv_min, mut lv_max) = (i32::MAX, i32::MIN);
     for kz in 0..cells {
       for ky in 0..cells {
         for kx in 0..cells {
           let c = origin + IVec3::new(kx, ky, kz) * cell_blocks;
           let Some(id) = cell(c) else { continue };
           let wt = water_top(c.x, c.z);
+          if water.is_some() {
+            if Some(id) == wrep {
+              n_idw += 1;
+            }
+            if wt.is_some() {
+              n_wt += 1;
+            }
+          }
           if let Some((w, fallback)) = water
             && (id == w || wt.is_some())
           {
             let level = wt.unwrap_or(fallback);
+            n_fill += 1;
+            lv_min = lv_min.min(level);
+            lv_max = lv_max.max(level);
             fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level, w);
             let below =
               if ky > 0 { cell(origin + IVec3::new(kx, ky - 1, kz) * cell_blocks) } else { None };
@@ -166,6 +183,20 @@ impl McCity {
           }
         }
       }
+    }
+    let bit = 1u8
+      << (if cell_blocks >= 16 {
+        2
+      } else if cell_blocks >= 8 {
+        1
+      } else {
+        0
+      });
+    if water.is_some() && self.far_log.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+      bevy::log::debug!(
+        "FAR water cb={cell_blocks} cells={} idw={n_idw} wt={n_wt} fill={n_fill} lv={lv_min}..{lv_max}",
+        cells * cells * cells
+      );
     }
     (!tree.is_empty()).then_some(tree)
   }

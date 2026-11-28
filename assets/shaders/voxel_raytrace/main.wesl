@@ -438,7 +438,6 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
 }
 
 const WATER_PROBE_T: f32 = 1024.0;
-const WATER_SIGMA: vec3<f32> = vec3<f32>(0.0030, 0.0012, 0.0006);
 
 fn water_tilt(v: vec3<f32>, t: f32, s: f32, a: f32) -> vec2<f32> {
   let p = v.xz * s;
@@ -485,10 +484,14 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let fv = face_view_dir(origin_voxel, fp);
     let fluid = (palette_flags(first.palette_base, first.pal) & FLAGS_FLUID) != 0u;
     if (fluid) {
-      let v = vec3<f32>(f32(first.voxel.x), f32(first.voxel.y), f32(first.voxel.z));
       let fpix = first.t * view_u.lod.x;
-      let fade = clamp(1.5 - fpix * 0.06, 0.0, 1.0);
-      let tilt = water_tilt(v, water_u.params.w, water_u.params.y, water_u.params.x) * fade;
+      let vox_main = 16.0 / max(first.voxel_per_meter, 1.0e-4);
+      let fade = clamp(1.0 - fpix * 0.12, 0.0, 1.0)
+               * clamp(1.0 - max(vox_main - 1.0, 0.0) / 32.0, 0.0, 1.0);
+      let small = water_tilt(fp, water_u.params.w, water_u.params.y, water_u.params.x) * fade;
+      let large = water_tilt(fp, water_u.params.w * 0.6, water_u.params.y * 0.15,
+                             water_u.params.x * 0.6) * (1.0 - fade);
+      let tilt = small + large;
       if (fnn.y > 0.5) {
         fnn = normalize(vec3<f32>(tilt.x, 1.0, tilt.y));
       } else if (fnn.y < -0.5) {
@@ -516,10 +519,14 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
           dir_in = normalize(eta_in * ray_dir + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * fnn);
         }
         var tint = vec3<f32>(1.0);
+        let turb = max(water_u.color.a, 1.0e-4);
+        let sigma = vec3<f32>(turb, turb * 0.4, turb * 0.2);
+        let optical_t = log(255.0) / turb + 24.0;
+        let t_cap = min(frustum_length, min(WATER_PROBE_T, optical_t));
         let probe = world_trace_water(f_face + dir_in * GLASS_EPS, dir_in,
-                                      min(frustum_length, WATER_PROBE_T), first.obj_id, &tint);
+                                      t_cap, first.obj_id, &tint);
         if (probe.hit) {
-          through = tint * exp(-max(probe.t, 0.0) * WATER_SIGMA);
+          through = tint * exp(-max(probe.t, 0.0) * sigma);
           best = probe;
           *best_out = probe;
         } else {
