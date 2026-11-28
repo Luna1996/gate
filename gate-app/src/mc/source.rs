@@ -69,24 +69,23 @@ impl McCity {
     let cell_blocks = cell_blocks_of(scale);
     let water = *self.water.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
-      let level_at =
-        |x: i32, z: i32| water.map_or(0, |(_, fallback)| view.water_top(x, z).unwrap_or(fallback));
+      let water_top = |x: i32, z: i32| water.and_then(|_| view.water_top_max(x, z, cell_blocks));
       return self.far_tree(
         coord,
         cell_blocks,
         water,
-        level_at,
+        water_top,
         |cell| view.cell(cell, cell_blocks),
         |cell| view.cell(cell, 4),
       );
     }
-    let level_at = |_: i32, _: i32| water.map_or(0, |(_, h)| h);
+    let water_top = |_: i32, _: i32| None;
     let summary = &self.summary;
     self.far_tree(
       coord,
       cell_blocks,
       water,
-      level_at,
+      water_top,
       |cell| summary.cell(self, cell, cell_blocks),
       |cell| summary.cell(self, cell, 4),
     )
@@ -97,7 +96,7 @@ impl McCity {
     coord: ChunkCoord,
     cell_blocks: i32,
     water: Option<(PaletteId, i32)>,
-    level_at: impl Fn(i32, i32) -> i32,
+    water_top: impl Fn(i32, i32) -> Option<i32>,
     cell: impl Fn(IVec3) -> Option<PaletteId>,
     fine: impl Fn(IVec3) -> Option<PaletteId>,
   ) -> Option<ChunkTree> {
@@ -113,10 +112,12 @@ impl McCity {
         for kx in 0..cells {
           let c = origin + IVec3::new(kx, ky, kz) * cell_blocks;
           let Some(id) = cell(c) else { continue };
-          if let Some((w, _)) = water
-            && id == w
+          let wt = water_top(c.x, c.z);
+          if let Some((w, fallback)) = water
+            && (id == w || wt.is_some())
           {
-            fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level_at(c.x, c.z), id);
+            let level = wt.unwrap_or(fallback);
+            fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level, w);
             let below =
               if ky > 0 { cell(origin + IVec3::new(kx, ky - 1, kz) * cell_blocks) } else { None };
             if ky == 0 || below.is_some_and(|b| Some(b) != wrep) {

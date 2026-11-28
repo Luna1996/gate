@@ -437,8 +437,8 @@ fn refl_env_chain(p_voxel: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rseed: u32, m:
   return refl_env;
 }
 
-const WATER_PROBE_T: f32 = 256.0;
-const WATER_SIGMA: vec3<f32> = vec3<f32>(0.0100, 0.0060, 0.0030);
+const WATER_PROBE_T: f32 = 1024.0;
+const WATER_SIGMA: vec3<f32> = vec3<f32>(0.0030, 0.0012, 0.0006);
 
 fn water_tilt(v: vec3<f32>, t: f32, s: f32, a: f32) -> vec2<f32> {
   let p = v.xz * s;

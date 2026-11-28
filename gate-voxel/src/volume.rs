@@ -505,6 +505,25 @@ impl VolumeGrid {
   }
 
   pub fn fill_brick(&mut self, voxel: IVec3, extent: i32, palette: PaletteId) -> Option<DirtyEdit> {
+    self.fill_brick_inner(voxel, extent, palette, true)
+  }
+
+  pub fn fill_brick_silent(
+    &mut self,
+    voxel: IVec3,
+    extent: i32,
+    palette: PaletteId,
+  ) -> Option<DirtyEdit> {
+    self.fill_brick_inner(voxel, extent, palette, false)
+  }
+
+  fn fill_brick_inner(
+    &mut self,
+    voxel: IVec3,
+    extent: i32,
+    palette: PaletteId,
+    log: bool,
+  ) -> Option<DirtyEdit> {
     let chunk = voxel.div_euclid(IVec3::splat(CHUNK_SIZE));
     let local = voxel.rem_euclid(IVec3::splat(CHUNK_SIZE));
     let cc = ChunkCoord(chunk);
@@ -520,7 +539,9 @@ impl VolumeGrid {
     };
     if changed {
       self.dirty.mark_data(cc);
-      self.note_edit_box(cc, voxel, voxel + IVec3::splat(extent));
+      if log {
+        self.note_edit_box(cc, voxel, voxel + IVec3::splat(extent));
+      }
       self.edit_generation = self.edit_generation.wrapping_add(1);
       Some(DirtyEdit { chunk: cc })
     } else {

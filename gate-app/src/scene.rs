@@ -63,7 +63,6 @@ pub(crate) fn setup(
   let mut water_seed = Vec::new();
   let mut water_bounds = None;
   let mut water_pal = None;
-  let mut water_cell = 1;
   let mut scene_water = WaterSettings::default();
   if STARTUP_DEMO_SCENE {
     paint_demo_palette(&mut grid);
@@ -107,7 +106,6 @@ pub(crate) fn setup(
       mc::pbr::install(&mut images, &mut commands);
       scene_water = mc_water_settings();
       water_pal = stream_water_palette(&stream);
-      water_cell = mc::VOXELS_PER_BLOCK;
     } else if name == WATER_TEST {
       water_pal = Some(crate::water::WATER_ID);
     }
@@ -119,7 +117,6 @@ pub(crate) fn setup(
     &grid,
     water_bounds,
     water_pal,
-    water_cell,
   ));
   grid.compact_all();
   bevy::log::info!("STEP 3 compact_all {:?}", t0.elapsed());
@@ -315,8 +312,7 @@ pub(crate) fn reload_world(
   } else {
     None
   };
-  let water_cell = if name == mc::GREEN_FIELD { mc::VOXELS_PER_BLOCK } else { 1 };
-  water.reset(&water_seed, &grid, Some((info.aabb_min, info.aabb_max)), water_pal, water_cell);
+  water.reset(&water_seed, &grid, Some((info.aabb_min, info.aabb_max)), water_pal);
   *water_settings =
     if name == mc::GREEN_FIELD { mc_water_settings() } else { WaterSettings::default() };
   grid.compact_all();

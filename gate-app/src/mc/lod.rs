@@ -290,6 +290,18 @@ impl View {
     (v >= 0).then_some(v as i32)
   }
 
+  pub fn water_top_max(&self, cx: i32, cz: i32, cell_blocks: i32) -> Option<i32> {
+    let mut best = None;
+    for dz in 0..cell_blocks {
+      for dx in 0..cell_blocks {
+        if let Some(h) = self.water_top(cx + dx, cz + dz) {
+          best = Some(best.map_or(h, |b: i32| b.max(h)));
+        }
+      }
+    }
+    best
+  }
+
   fn top_height(&self, col: usize, rep: PaletteId) -> Option<i32> {
     let mask = self.f.mask[col];
     if mask == 0 {
