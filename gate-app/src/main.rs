@@ -15,6 +15,7 @@ mod single_instance;
 #[cfg(feature = "profile")]
 mod tracy_layer;
 mod vox_scene;
+mod water;
 
 use bevy::{
   asset::{AssetPlugin, LoadState},
@@ -122,6 +123,7 @@ fn main() {
     .init_resource::<MouseLock>()
     .init_resource::<height_field::MaterialDisplaceCache>()
     .init_resource::<infinite_cubes::Streaming>()
+    .init_resource::<water::WaterSim>()
     .init_resource::<FpsOverlayVisible>()
     .init_resource::<FpsWindow>()
     .insert_resource(Config::load())
@@ -170,6 +172,8 @@ fn main() {
   #[cfg(feature = "profile")]
   app.add_systems(Update, tracy_frame_mark);
   app.add_systems(Update, infinite_cubes::stream_chunks);
+  app.add_systems(Update, water::tick_water);
+  app.add_systems(Update, water::advance_water_time);
   app.add_systems(
     Update,
     (physics::selftest, physics::follow_view, physics::step_physics)

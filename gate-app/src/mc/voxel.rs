@@ -16,6 +16,7 @@ pub struct Mat {
   pub emissive: u8,
   pub transmission: u8,
   pub metallic: u8,
+  pub fluid: bool,
   pub pbr: Option<u16>,
 }
 
@@ -24,6 +25,9 @@ impl Mat {
     let mut flags = PaletteFlags::default();
     if self.transmission > 0 {
       flags = flags.union(PaletteFlags::TRANSMISSIVE);
+    }
+    if self.fluid {
+      flags = flags.union(PaletteFlags::FLUID);
     }
     if let Some(asset) = self.pbr {
       let ov = PbrOverrides {
@@ -347,7 +351,8 @@ fn rotate(src: &[PaletteId; CELLS], r: Rot) -> [PaletteId; CELLS] {
 pub fn material_of(st: &BlockState) -> Mat {
   let n = st.short_name();
   let lit = st.prop("lit").map(|v| v == "true").unwrap_or(false);
-  let mut m = Mat { roughness: 235, emissive: 0, transmission: 0, metallic: 0, pbr: None };
+  let mut m =
+    Mat { roughness: 235, emissive: 0, transmission: 0, metallic: 0, fluid: false, pbr: None };
   if is_light(n, lit) {
     m.emissive = 255;
     m.roughness = 200;
@@ -361,8 +366,9 @@ pub fn material_of(st: &BlockState) -> Mat {
     m.roughness = 70;
   }
   if matches!(n, "water" | "flowing_water" | "bubble_column") {
-    m.transmission = 190;
+    m.transmission = 210;
     m.roughness = 20;
+    m.fluid = true;
   }
   if matches!(n, "honey_block" | "slime_block") {
     m.transmission = 150;

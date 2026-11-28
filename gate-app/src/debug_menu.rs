@@ -126,6 +126,8 @@ fn apply_world_model_options(model: &mut MenuFile) {
   options.push(crate::scene::INFINITE_CUBES.to_string());
   options.push(crate::scene::GLASS_TEST.to_string());
   options.push(crate::scene::GLASS_SLAB.to_string());
+  options.push(crate::scene::WATER_TEST.to_string());
+  options.push(crate::scene::LAKE_TEST.to_string());
   options.push(crate::mc::GREEN_FIELD.to_string());
   options.sort();
   options.dedup();
@@ -771,6 +773,8 @@ fn register_callbacks(world: &mut World) {
      mut stream: ResMut<crate::infinite_cubes::Streaming>,
      mut base: ResMut<gate_render::BaseSettings>,
      mut phys: ResMut<crate::physics::PhysicsState>,
+     mut water: ResMut<crate::water::WaterSim>,
+     mut water_settings: ResMut<gate_render::WaterSettings>,
      pbr: Option<Res<gate_render::PbrTextureSet>>,
      mc_set: Option<Res<gate_render::McTextureSet>>,
      mut images: ResMut<Assets<Image>>,
@@ -802,6 +806,8 @@ fn register_callbacks(world: &mut World) {
             &crate::scene::pbr_asset_ids(pbr.as_deref()),
             Some(eye_now.as_ivec3()),
             &mut stream,
+            &mut water,
+            &mut water_settings,
           ) {
             Ok(_info) => {
               phys.reset();

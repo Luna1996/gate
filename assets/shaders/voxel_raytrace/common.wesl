@@ -6,6 +6,8 @@ const NODE_FIXED_WORDS: u32 = 3u;    const CHUNK_INDEX_CAP: u32 = 64u;
 const INDEX_ENTRY_EMPTY: u32 = 0xFFFFFFFFu;
 const FLAGS_IS_PBR: u32 = 1u << 4u;
 const FLAGS_TRANSMISSIVE: u32 = 1u << 5u;
+
+const FLAGS_FLUID: u32 = 1u << 6u;
 const MATERIAL_ASSET_SLOTS: u32 = 4096u;
 const MC_TEX_SIZE: u32 = 32u;
 const MATERIAL_TEX_SLOTS: u32 = 64u;

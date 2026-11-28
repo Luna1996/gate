@@ -353,6 +353,7 @@ use std::borrow::Cow;
 
 use super::upload::GpuBrickMap;
 use crate::lighting::{LightPoolUniform, LightingTheme, build_light_pool};
+use crate::water::{WaterSettings, WaterUniform};
 
 #[derive(Resource)]
 pub(crate) struct DdaBg0BindGroup(pub(crate) BindGroup);
@@ -419,6 +420,7 @@ pub(crate) struct AuxTexCache {
   pub(crate) dlss_depth_view: Option<TextureView>,
   perf_size: UVec2,
   perf_bg0: Option<BindGroup>,
+  water_buf: Option<UniformBuffer<WaterUniform>>,
 }
 
 impl AuxTexCache {
@@ -622,6 +624,7 @@ impl Plugin for BrickMapDdaPlugin {
       bevy::render::extract_resource::ExtractResourcePlugin::<EyeAdaptSettings>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<DlssFrame>::default(),
       bevy::render::extract_resource::ExtractResourcePlugin::<DlssSettings>::default(),
+      bevy::render::extract_resource::ExtractResourcePlugin::<crate::water::WaterSettings>::default(),
       crate::responsive::ResponsivePlugin,
     ));
     app.add_systems(bevy::app::Update, advance_dlss_frame);
@@ -632,6 +635,7 @@ impl Plugin for BrickMapDdaPlugin {
     app.init_resource::<crate::lighting::CloudSettings>();
     app.init_resource::<DlssFrame>();
     app.init_resource::<DlssSettings>();
+    app.init_resource::<crate::water::WaterSettings>();
     let dda_shader = app.world().resource::<crate::shader::DdaShaderHandle>().clone();
     let dda_source = app.world().resource::<crate::shader::DdaShaderSource>().clone();
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -840,6 +844,16 @@ pub(crate) fn init_dda_pipelines(
       access: StorageTextureAccess::WriteOnly,
       format: TextureFormat::R32Float,
       view_dimension: TextureViewDimension::D2,
+    },
+    count: None,
+  });
+  bg0_perf_entries.push(BindGroupLayoutEntry {
+    binding: 37,
+    visibility: ShaderStages::COMPUTE,
+    ty: BindingType::Buffer {
+      ty: BufferBindingType::Uniform,
+      has_dynamic_offset: false,
+      min_binding_size: Some(WaterUniform::min_size()),
     },
     count: None,
   });
@@ -1250,6 +1264,8 @@ pub(crate) struct DdaTune<'w> {
   pub cloud: Option<Res<'w, crate::lighting::CloudSettings>>,
 
   pub post: Option<Res<'w, PostFxSettings>>,
+
+  pub water: Option<Res<'w, WaterSettings>>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1607,36 +1623,55 @@ pub(crate) fn prepare_dda_bind_groups(p: PrepareDdaBindGroupsParams) {
   };
   beam_cache.gi_bg0 = Some(gi_bg0);
 
-  let perf_bg0 =
-    if let (Some(vis), Some(nrm), Some(sh), Some(greq), Some(gmeta), Some(mvec), Some(dep)) = (
-      beam_cache.perf_vis_view.as_ref(),
-      beam_cache.perf_nrm_view.as_ref(),
-      beam_cache.perf_shadow_view.as_ref(),
-      beam_cache.glass_req.as_ref(),
-      beam_cache.glass_meta.as_ref(),
-      beam_cache.dlss_mvec_view.as_ref(),
-      beam_cache.dlss_depth_view.as_ref(),
-    ) {
-      let layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_perf_layout);
-      let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
-        beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
-        &u,
-        &beam_view,
-        eye_buf.as_entire_binding(),
-        beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
-      ))
-      .to_vec();
-      entries.push(BindGroupEntry { binding: 30, resource: BindingResource::TextureView(vis) });
-      entries.push(BindGroupEntry { binding: 31, resource: BindingResource::TextureView(nrm) });
-      entries.push(BindGroupEntry { binding: 32, resource: BindingResource::TextureView(sh) });
-      entries.push(BindGroupEntry { binding: 33, resource: greq.as_entire_binding() });
-      entries.push(BindGroupEntry { binding: 34, resource: gmeta.as_entire_binding() });
-      entries.push(BindGroupEntry { binding: 35, resource: BindingResource::TextureView(mvec) });
-      entries.push(BindGroupEntry { binding: 36, resource: BindingResource::TextureView(dep) });
-      Some(render_device.create_bind_group(None, &layout, &entries))
-    } else {
-      None
-    };
+  let water_uniform = tune.water.as_ref().map_or_else(WaterUniform::default, |w| w.uniform());
+  if beam_cache.water_buf.is_none() {
+    beam_cache.water_buf = Some(UniformBuffer::from(WaterUniform::default()));
+  }
+  if let Some(water_buf) = beam_cache.water_buf.as_mut() {
+    *water_buf.get_mut() = water_uniform;
+    water_buf.write_buffer(&render_device, &queue);
+  }
+
+  let perf_bg0 = if let (
+    Some(vis),
+    Some(nrm),
+    Some(sh),
+    Some(greq),
+    Some(gmeta),
+    Some(mvec),
+    Some(dep),
+    Some(wbuf),
+  ) = (
+    beam_cache.perf_vis_view.as_ref(),
+    beam_cache.perf_nrm_view.as_ref(),
+    beam_cache.perf_shadow_view.as_ref(),
+    beam_cache.glass_req.as_ref(),
+    beam_cache.glass_meta.as_ref(),
+    beam_cache.dlss_mvec_view.as_ref(),
+    beam_cache.dlss_depth_view.as_ref(),
+    beam_cache.water_buf.as_ref(),
+  ) {
+    let layout = pipeline_cache.get_bind_group_layout(&pipelines.bg0_perf_layout);
+    let mut entries: Vec<BindGroupEntry> = BindGroupEntries::sequential((
+      beam_cache.out_base_view.as_ref().expect("out_base view 未建"),
+      &u,
+      &beam_view,
+      eye_buf.as_entire_binding(),
+      beam_cache.dda_hit_view.as_ref().expect("dda_hit view 未建"),
+    ))
+    .to_vec();
+    entries.push(BindGroupEntry { binding: 30, resource: BindingResource::TextureView(vis) });
+    entries.push(BindGroupEntry { binding: 31, resource: BindingResource::TextureView(nrm) });
+    entries.push(BindGroupEntry { binding: 32, resource: BindingResource::TextureView(sh) });
+    entries.push(BindGroupEntry { binding: 33, resource: greq.as_entire_binding() });
+    entries.push(BindGroupEntry { binding: 34, resource: gmeta.as_entire_binding() });
+    entries.push(BindGroupEntry { binding: 35, resource: BindingResource::TextureView(mvec) });
+    entries.push(BindGroupEntry { binding: 36, resource: BindingResource::TextureView(dep) });
+    entries.push(BindGroupEntry { binding: 37, resource: wbuf.binding().expect("water uniform") });
+    Some(render_device.create_bind_group(None, &layout, &entries))
+  } else {
+    None
+  };
   beam_cache.perf_bg0 = perf_bg0;
 
   let (refl_write_bg, refl_read_bg) = if let (

@@ -61,23 +61,32 @@ impl McCity {
     self.pool.log_from(from)
   }
 
+  pub fn water_palette(&self) -> Option<PaletteId> {
+    self.water.lock().unwrap_or_else(|e| e.into_inner()).map(|(w, _)| w)
+  }
+
   fn produce_far(&self, coord: ChunkCoord, scale: i32) -> Option<ChunkTree> {
     let cell_blocks = cell_blocks_of(scale);
     let water = *self.water.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(view) = self.lod().filter(|v| v.supports(cell_blocks)) {
+      let level_at =
+        |x: i32, z: i32| water.map_or(0, |(_, fallback)| view.water_top(x, z).unwrap_or(fallback));
       return self.far_tree(
         coord,
         cell_blocks,
         water,
+        level_at,
         |cell| view.cell(cell, cell_blocks),
         |cell| view.cell(cell, 4),
       );
     }
+    let level_at = |_: i32, _: i32| water.map_or(0, |(_, h)| h);
     let summary = &self.summary;
     self.far_tree(
       coord,
       cell_blocks,
       water,
+      level_at,
       |cell| summary.cell(self, cell, cell_blocks),
       |cell| summary.cell(self, cell, 4),
     )
@@ -88,6 +97,7 @@ impl McCity {
     coord: ChunkCoord,
     cell_blocks: i32,
     water: Option<(PaletteId, i32)>,
+    level_at: impl Fn(i32, i32) -> i32,
     cell: impl Fn(IVec3) -> Option<PaletteId>,
     fine: impl Fn(IVec3) -> Option<PaletteId>,
   ) -> Option<ChunkTree> {
@@ -103,10 +113,10 @@ impl McCity {
         for kx in 0..cells {
           let c = origin + IVec3::new(kx, ky, kz) * cell_blocks;
           let Some(id) = cell(c) else { continue };
-          if let Some((w, level)) = water
+          if let Some((w, _)) = water
             && id == w
           {
-            fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level, id);
+            fill_water(&mut tree, [kx, ky, kz], cell_blocks, c.y, level_at(c.x, c.z), id);
             let below =
               if ky > 0 { cell(origin + IVec3::new(kx, ky - 1, kz) * cell_blocks) } else { None };
             if ky == 0 || below.is_some_and(|b| Some(b) != wrep) {
@@ -164,18 +174,22 @@ impl McCity {
   }
 
   pub fn install_lod(&self, f: lod::File) {
-    let view = lod::View::new(f, |key| self.plan_for(&BlockState::from_key(key)).map(|p| p.rep));
-    let water =
-      view.find_rep(|n| n.contains("water")).and_then(|w| view.top_mode(w).map(|h| (w, h)));
-    *self.water.lock().unwrap_or_else(|e| e.into_inner()) = water;
+    let mut view =
+      lod::View::new(f, |key| self.plan_for(&BlockState::from_key(key)).map(|p| p.rep));
+    let water = view
+      .find_rep(|n| n.contains("water"))
+      .and_then(|w| view.top_mode(w).map(|(h, lo, hi)| (w, h, lo, hi)));
+    *self.water.lock().unwrap_or_else(|e| e.into_inner()) = water.map(|(w, h, _, _)| (w, h));
     bevy::log::info!(
-      "LOD 装载：{} 列 {} 节、{} KB、名字 {} 个（{} 个没认领到槽 ⇒ 那些节算空）；远场改走 LOD 细格；水面 {} block",
+      "LOD 装载：{} 列 {} 节、{} KB、名字 {} 个（{} 个没认领到槽 ⇒ 那些节算空）；远场改走 LOD 细格；水面 {} block（{}..{}）",
       view.cols(),
       view.sections(),
       view.heap_bytes() / 1024,
       view.names(),
       view.missing(),
-      water.map_or(-1, |(_, h)| h),
+      water.map_or(-1, |(_, h, _, _)| h),
+      water.map_or(-1, |(_, _, lo, _)| lo),
+      water.map_or(-1, |(_, _, _, hi)| hi),
     );
     *self.lod.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(view));
   }

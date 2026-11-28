@@ -208,16 +208,20 @@ impl<'a> Cursor<'a> {
 pub struct View {
   f: File,
   rep: Vec<Option<PaletteId>>,
+  tops: Vec<i16>,
 }
 
 impl View {
   pub fn new(f: File, resolve: impl Fn(&str) -> Option<PaletteId>) -> Self {
     let rep = f.names.iter().map(|n| resolve(n)).collect();
-    Self { f, rep }
+    let tops = vec![-1; (f.dims.0 * f.dims.1) as usize];
+    Self { f, rep, tops }
   }
 
   pub fn heap_bytes(&self) -> usize {
-    self.f.heap_bytes() + self.rep.len() * std::mem::size_of::<Option<PaletteId>>()
+    self.f.heap_bytes()
+      + self.rep.len() * std::mem::size_of::<Option<PaletteId>>()
+      + self.tops.len() * 2
   }
 
   pub fn missing(&self) -> usize {
@@ -246,28 +250,44 @@ impl View {
     self.f.names.iter().position(|n| pred(n)).and_then(|i| self.rep.get(i).copied().flatten())
   }
 
-  pub fn top_mode(&self, rep: PaletteId) -> Option<i32> {
+  pub fn top_mode(&mut self, rep: PaletteId) -> Option<(i32, i32, i32)> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let hmax = (self.f.sec_y * CELL) as usize;
-    let counts: Vec<AtomicUsize> = (0..hmax).map(|_| AtomicUsize::new(0)).collect();
     let dims = self.f.dims;
-    (0..dims.1).into_par_iter().for_each(|iz| {
-      for ix in 0..dims.0 {
-        let col = (iz * dims.0 + ix) as usize;
-        if let Some(h) = self.top_height(col, rep) {
-          counts[h as usize].fetch_add(1, Ordering::Relaxed);
-        }
+    let cols = (dims.0 * dims.1) as usize;
+    let tops: Vec<i16> = (0..cols)
+      .into_par_iter()
+      .map(|col| self.top_height(col, rep).map_or(-1, |h| h as i16))
+      .collect();
+    let hmax = (self.f.sec_y * CELL) as usize;
+    let mut counts = vec![0u32; hmax];
+    let mut lo = i32::MAX;
+    let mut hi = i32::MIN;
+    for &t in &tops {
+      if t < 0 {
+        continue;
       }
-    });
+      counts[t as usize] += 1;
+      lo = lo.min(t as i32);
+      hi = hi.max(t as i32);
+    }
+    self.tops = tops;
     let mut best = None;
-    for (i, c) in counts.iter().enumerate() {
-      let n = c.load(Ordering::Relaxed);
+    for (i, &n) in counts.iter().enumerate() {
       if n > 0 && best.is_none_or(|(_, bn)| n > bn) {
         best = Some((i as i32, n));
       }
     }
-    best.map(|(h, _)| h)
+    best.map(|(h, _)| (h, lo, hi))
+  }
+
+  pub fn water_top(&self, cx: i32, cz: i32) -> Option<i32> {
+    let ix = cx - self.f.col_min.0;
+    let iz = cz - self.f.col_min.1;
+    if ix < 0 || iz < 0 || ix >= self.f.dims.0 || iz >= self.f.dims.1 {
+      return None;
+    }
+    let v = *self.tops.get((iz * self.f.dims.0 + ix) as usize)?;
+    (v >= 0).then_some(v as i32)
   }
 
   fn top_height(&self, col: usize, rep: PaletteId) -> Option<i32> {
@@ -305,8 +325,10 @@ impl View {
             if name == FINE_AIR {
               continue;
             }
-            let r = self.rep.get(name as usize).copied().flatten()?;
-            return (r == rep).then_some(y * CELL + (ly + 1) * FINE_CELL);
+            let Some(r) = self.rep.get(name as usize).copied().flatten() else { continue };
+            if r == rep {
+              return Some(y * CELL + (ly + 1) * FINE_CELL);
+            }
           }
         }
       }

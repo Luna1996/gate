@@ -449,6 +449,15 @@ fn medium_one(gi: Grid, origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, t_min: f3
   }
 }
 
+fn world_trace_water(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, obj_id: i32,
+                     tint: ptr<function, vec3<f32>>) -> WorldHit {
+  let g = make_grid(u32(obj_id + 1));
+  var best = world_miss();
+  var best_t = 1.0e+30;
+  medium_one(g, origin, dir, max_t, 0.0, false, &best, &best_t, tint);
+  return best;
+}
+
 fn medium_near(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32, stop_on_air: bool,
                best: ptr<function, WorldHit>, best_t: ptr<function, f32>,
                tint: ptr<function, vec3<f32>>) {

@@ -3,11 +3,11 @@ use glam::{IVec3, Vec3};
 
 use gate_render::{
   BrickMapBuilder, DdaCameraConfig, DdaImages, OrbitCamera, UploadBudget, VIEW_SIZE, VoxelScene,
-  create_dda_image,
+  WaterSettings, create_dda_image,
 };
 use gate_voxel::{
-  Displace, PaletteEntry, PaletteId, VolumeGrid, Volumes, draw_text, fill_box, fill_box_displaced,
-  fill_bricks, fill_sphere,
+  Displace, PaletteEntry, PaletteFlags, PaletteId, VolumeGrid, Volumes, draw_text, fill_box,
+  fill_box_displaced, fill_bricks, fill_sphere,
 };
 
 use crate::{
@@ -27,6 +27,12 @@ pub(crate) const INFINITE_CUBES: &str = "infinite_cubes";
 pub(crate) const GLASS_TEST: &str = "glass_test";
 
 pub(crate) const GLASS_SLAB: &str = "glass_slab";
+
+pub(crate) const WATER_TEST: &str = "water_test";
+
+pub(crate) const LAKE_TEST: &str = "lake_test";
+
+const LAKE_LEVEL: f32 = 34.0;
 
 pub(crate) fn setup(
   mut commands: Commands,
@@ -54,6 +60,11 @@ pub(crate) fn setup(
   let mut cam_target = Vec3::new(0., 0., 0.);
   let pbr_ids = pbr_asset_ids(pbr.as_deref());
   let mut start_eye = config.camera.as_ref().map_or(cam_eye, |p| p.to_orbit().eye());
+  let mut water_seed = Vec::new();
+  let mut water_bounds = None;
+  let mut water_pal = None;
+  let mut water_cell = 1;
+  let mut scene_water = WaterSettings::default();
   if STARTUP_DEMO_SCENE {
     paint_demo_palette(&mut grid);
     bevy::log::info!("STEP 1 palette {:?}", t0.elapsed());
@@ -66,6 +77,8 @@ pub(crate) fn setup(
       CUBE_IN_VOID => (Vec3::new(-64.0, 164.0, 192.0), Vec3::new(32.0, 64.0, 48.0)),
       GLASS_TEST => glass_test_camera(),
       GLASS_SLAB => glass_slab_camera(),
+      WATER_TEST => water_test_camera(),
+      LAKE_TEST => lake_test_camera(),
       mc::GREEN_FIELD => mc_camera(),
       _ => (Vec3::new(406.5, 339.5, 431.5), Vec3::new(551.5, 330.5, 359.5)),
     };
@@ -78,8 +91,9 @@ pub(crate) fn setup(
       (cam_eye, cam_target) = mc_camera();
       start_eye = cam_eye;
     }
-    let info = build_world(&mut grid, &name, &pbr_ids, start_eye.as_ivec3(), &mut stream)
-      .unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
+    let info =
+      build_world(&mut grid, &name, &pbr_ids, start_eye.as_ivec3(), &mut stream, &mut water_seed)
+        .unwrap_or_else(|e| panic!("{name} 加载失败: {e}"));
     bevy::log::info!(
       "STEP 2 world {name} instances={} written={} dropped={} aabb=[{}]-[{}] {:?}",
       info.instances_used,
@@ -91,8 +105,22 @@ pub(crate) fn setup(
     );
     if name == mc::GREEN_FIELD {
       mc::pbr::install(&mut images, &mut commands);
+      scene_water = mc_water_settings();
+      water_pal = stream_water_palette(&stream);
+      water_cell = mc::VOXELS_PER_BLOCK;
+    } else if name == WATER_TEST {
+      water_pal = Some(crate::water::WATER_ID);
     }
+    water_bounds = Some((info.aabb_min, info.aabb_max));
   }
+  commands.insert_resource(scene_water);
+  commands.insert_resource(crate::water::WaterSim::new(
+    &water_seed,
+    &grid,
+    water_bounds,
+    water_pal,
+    water_cell,
+  ));
   grid.compact_all();
   bevy::log::info!("STEP 3 compact_all {:?}", t0.elapsed());
   let vpm = grid.voxel_per_meter();
@@ -201,9 +229,12 @@ fn build_world(
   pbr_ids: &[String],
   cam_eye: IVec3,
   stream: &mut crate::infinite_cubes::Streaming,
+  water_seed: &mut Vec<IVec3>,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
-  let vpm = if name == mc::GREEN_FIELD {
+  let vpm = if name == mc::GREEN_FIELD || name == WATER_TEST {
     mc::VOXELS_PER_BLOCK as f32
+  } else if name == LAKE_TEST {
+    8.0
   } else {
     vox_scene::voxel_per_meter(name)
   };
@@ -224,6 +255,14 @@ fn build_world(
   if name == GLASS_SLAB {
     stream.set_source(None);
     return Ok(build_glass_slab(grid));
+  }
+  if name == WATER_TEST {
+    stream.set_source(None);
+    return Ok(build_water_test(grid, water_seed));
+  }
+  if name == LAKE_TEST {
+    stream.set_source(None);
+    return Ok(build_lake_test(grid));
   }
   if name == mc::GREEN_FIELD {
     let (info, city) = mc::build(grid, cam_eye)?;
@@ -250,16 +289,36 @@ pub(crate) fn pbr_asset_count(pbr: Option<&gate_render::PbrTextureSet>) -> usize
   pbr.map_or_else(|| gate_render::material_ids().len(), |s| s.ids().len())
 }
 
+fn stream_water_palette(stream: &crate::infinite_cubes::Streaming) -> Option<PaletteId> {
+  let any = stream.source()?.clone_as_any()?;
+  let city = any.downcast::<mc::source::McCity>().ok()?;
+  city.water_palette()
+}
+
 pub(crate) fn reload_world(
   scene: &mut VoxelScene,
   name: &str,
   pbr_ids: &[String],
   cam_eye: Option<IVec3>,
   stream: &mut crate::infinite_cubes::Streaming,
+  water: &mut crate::water::WaterSim,
+  water_settings: &mut WaterSettings,
 ) -> Result<vox_scene::VoxSceneInfo, Box<dyn std::error::Error>> {
   let mut grid = VolumeGrid::new();
   let eye = cam_eye.unwrap_or(IVec3::new(EXT_VOXEL_HALF, 16, EXT_VOXEL_HALF));
-  let info = build_world(&mut grid, name, pbr_ids, eye, stream)?;
+  let mut water_seed = Vec::new();
+  let info = build_world(&mut grid, name, pbr_ids, eye, stream, &mut water_seed)?;
+  let water_pal = if name == mc::GREEN_FIELD {
+    stream_water_palette(stream)
+  } else if name == WATER_TEST {
+    Some(crate::water::WATER_ID)
+  } else {
+    None
+  };
+  let water_cell = if name == mc::GREEN_FIELD { mc::VOXELS_PER_BLOCK } else { 1 };
+  water.reset(&water_seed, &grid, Some((info.aabb_min, info.aabb_max)), water_pal, water_cell);
+  *water_settings =
+    if name == mc::GREEN_FIELD { mc_water_settings() } else { WaterSettings::default() };
   grid.compact_all();
   let mut volumes = Volumes::new(grid);
   if volumes.main().attach_far() {
@@ -297,6 +356,157 @@ const GLASS_ROOM_H: i32 = 64;
 const GLASS_WALL: i32 = 2;
 const GLASS_CUBE_EDGE: i32 = 32;
 const GLASS_CUBE_Y: i32 = 40;
+
+fn mc_water_settings() -> WaterSettings {
+  WaterSettings {
+    enabled: false,
+    level: 0.0,
+    deep: Vec3::new(0.010, 0.050, 0.085),
+    absorption: 0.02,
+    wave_amp: 0.055,
+    wave_scale: 0.13,
+    sparkle: 1.2,
+    shade_cell: 1.0,
+    time: 0.0,
+    pool: None,
+  }
+}
+
+fn water_test_camera() -> (Vec3, Vec3) {
+  (Vec3::new(176.0, 112.0, 176.0), Vec3::new(64.0, 18.0, 64.0))
+}
+
+fn lake_test_camera() -> (Vec3, Vec3) {
+  (Vec3::new(461.0, 80.0, 256.0), Vec3::new(256.0, 34.0, 256.0))
+}
+
+fn lake_height(x: i32, z: i32) -> i32 {
+  let dx = (x - 256) as f32;
+  let dz = (z - 256) as f32;
+  let d = (dx * dx + dz * dz).sqrt() / 256.0;
+  let mut h = 4.0 + d * d * 64.0;
+  h += (x as f32 * 0.11).sin() * (z as f32 * 0.13).cos() * 2.5;
+  let ix = (x - 190) as f32;
+  let iz = (z - 200) as f32;
+  let id = (ix * ix + iz * iz).sqrt();
+  if id < 20.0 {
+    h += (1.0 - id / 20.0) * 28.0;
+  }
+  let bx = (x - 380) as f32;
+  let bz = (z - 300) as f32;
+  let bd = (bx * bx + bz * bz).sqrt();
+  if bd < 26.0 {
+    h -= (1.0 - bd / 26.0) * 6.0;
+  }
+  h.clamp(1.0, 70.0) as i32
+}
+
+fn build_lake_test(grid: &mut VolumeGrid) -> vox_scene::VoxSceneInfo {
+  const STONE: PaletteId = PaletteId(1);
+  const GRASS: PaletteId = PaletteId(2);
+  const SAND: PaletteId = PaletteId(3);
+  const DIRT: PaletteId = PaletteId(4);
+  const WALL: PaletteId = PaletteId(5);
+  let pal = grid.palette_mut();
+  pal.set(STONE, PaletteEntry { color: [92, 96, 104], roughness: 220, ..Default::default() });
+  pal.set(GRASS, PaletteEntry { color: [68, 110, 58], roughness: 210, ..Default::default() });
+  pal.set(SAND, PaletteEntry { color: [176, 164, 128], roughness: 200, ..Default::default() });
+  pal.set(DIRT, PaletteEntry { color: [92, 72, 54], roughness: 220, ..Default::default() });
+  pal.set(WALL, PaletteEntry { color: [84, 86, 90], roughness: 230, ..Default::default() });
+  let mut written = 0;
+  for x in 0..512 {
+    for z in 0..512 {
+      let h = lake_height(x, z);
+      written += fill_box(grid, IVec3::new(x, 0, z), IVec3::new(1, h, 1), STONE);
+      let top = if (h as f32) <= LAKE_LEVEL + 3.0 { SAND } else { GRASS };
+      grid.set_voxel_ivec3(IVec3::new(x, h - 1, z), top);
+      if h > 1 {
+        grid.set_voxel_ivec3(IVec3::new(x, h - 2, z), DIRT);
+      }
+    }
+  }
+  written += fill_box(grid, IVec3::new(360, 20, 230), IVec3::new(33, 19, 33), WALL);
+  written += fill_box(grid, IVec3::new(360, 38, 230), IVec3::new(1, 16, 33), WALL);
+  written += fill_box(grid, IVec3::new(392, 38, 230), IVec3::new(1, 16, 33), WALL);
+  written += fill_box(grid, IVec3::new(361, 38, 230), IVec3::new(31, 16, 1), WALL);
+  written += fill_box(grid, IVec3::new(361, 38, 262), IVec3::new(31, 16, 1), WALL);
+  for y in 38..54 {
+    for z in 241..251 {
+      grid.set_voxel_ivec3(IVec3::new(392, y, z), PaletteId::AIR);
+    }
+  }
+  vox_scene::VoxSceneInfo {
+    aabb_min: IVec3::ZERO,
+    aabb_max: IVec3::new(512, 72, 512),
+    instances_used: 1,
+    voxels_written: written,
+    voxels_dropped: 0,
+  }
+}
+
+fn build_water_test(grid: &mut VolumeGrid, water_seed: &mut Vec<IVec3>) -> vox_scene::VoxSceneInfo {
+  const FLOOR: PaletteId = PaletteId(1);
+  const WALL: PaletteId = PaletteId(2);
+  let pal = grid.palette_mut();
+  pal.set(FLOOR, PaletteEntry { color: [58, 62, 70], roughness: 220, ..Default::default() });
+  pal.set(WALL, PaletteEntry { color: [108, 112, 120], roughness: 200, ..Default::default() });
+  pal.set(
+    crate::water::WATER_ID,
+    PaletteEntry {
+      color: [26, 86, 142],
+      roughness: 6,
+      transmission: 255,
+      flags: PaletteFlags::FLUID.union(PaletteFlags::TRANSMISSIVE),
+      ..Default::default()
+    },
+  );
+  pal.set(
+    crate::water::SOURCE_ID,
+    PaletteEntry {
+      color: [36, 108, 172],
+      roughness: 6,
+      transmission: 255,
+      flags: PaletteFlags::FLUID
+        .union(PaletteFlags::FLUID_SOURCE)
+        .union(PaletteFlags::TRANSMISSIVE),
+      ..Default::default()
+    },
+  );
+
+  let mut written = fill_box(grid, IVec3::ZERO, IVec3::new(128, 4, 128), FLOOR);
+  written += fill_box(grid, IVec3::new(32, 4, 32), IVec3::new(4, 40, 64), WALL);
+  written += fill_box(grid, IVec3::new(92, 4, 32), IVec3::new(4, 40, 64), WALL);
+  written += fill_box(grid, IVec3::new(32, 4, 32), IVec3::new(24, 40, 4), WALL);
+  written += fill_box(grid, IVec3::new(72, 4, 32), IVec3::new(24, 40, 4), WALL);
+  written += fill_box(grid, IVec3::new(56, 4, 32), IVec3::new(16, 16, 4), WALL);
+  written += fill_box(grid, IVec3::new(56, 28, 32), IVec3::new(16, 16, 4), WALL);
+  written += fill_box(grid, IVec3::new(32, 4, 92), IVec3::new(24, 40, 4), WALL);
+  written += fill_box(grid, IVec3::new(72, 4, 92), IVec3::new(24, 40, 4), WALL);
+  written += fill_box(grid, IVec3::new(56, 4, 92), IVec3::new(16, 16, 4), WALL);
+  written += fill_box(grid, IVec3::new(56, 28, 92), IVec3::new(16, 16, 4), WALL);
+  written += fill_box(grid, IVec3::new(36, 4, 36), IVec3::new(56, 15, 56), crate::water::WATER_ID);
+  for x in 36..92 {
+    for y in 4..19 {
+      for z in 36..92 {
+        water_seed.push(IVec3::new(x, y, z));
+      }
+    }
+  }
+  for x in 62..66 {
+    for z in 62..66 {
+      let source = IVec3::new(x, 56, z);
+      grid.set_voxel_ivec3(source, crate::water::SOURCE_ID);
+      water_seed.push(source);
+    }
+  }
+  vox_scene::VoxSceneInfo {
+    aabb_min: IVec3::ZERO,
+    aabb_max: IVec3::new(128, 64, 128),
+    instances_used: 1,
+    voxels_written: written,
+    voxels_dropped: 0,
+  }
+}
 
 fn glass_test_camera() -> (Vec3, Vec3) {
   let eye = Vec3::new(0.0, GLASS_CUBE_Y as f32 - 2.0, 52.0);
@@ -401,6 +611,8 @@ pub(crate) fn test_world_camera(name: &str) -> Option<(Vec3, Vec3)> {
   match name {
     GLASS_TEST => Some(glass_test_camera()),
     GLASS_SLAB => Some(glass_slab_camera()),
+    WATER_TEST => Some(water_test_camera()),
+    LAKE_TEST => Some(lake_test_camera()),
     _ => None,
   }
 }

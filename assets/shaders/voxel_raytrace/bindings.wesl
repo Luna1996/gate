@@ -241,3 +241,13 @@ struct CloudUniform {
 @group(0) @binding(34) var<storage, read_write> glass_meta: array<atomic<u32>>;
 @group(0) @binding(35) var dlss_mvec_tex: texture_storage_2d<rg16float, write>;
 @group(0) @binding(36) var dlss_depth_tex: texture_storage_2d<r32float, write>;
+
+struct WaterUniform {
+  origin: vec4<f32>,
+  params: vec4<f32>,
+  color: vec4<f32>,
+  flags: vec4<f32>,
+  pool: vec4<f32>,
+  fall: vec4<f32>,
+}
+@group(0) @binding(37) var<uniform> water_u: WaterUniform;

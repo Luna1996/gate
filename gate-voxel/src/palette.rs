@@ -173,6 +173,8 @@ impl PaletteFlags {
   pub const HOLOGRAM: Self = Self(1 << 3);
   pub const IS_PBR: Self = Self(1 << 4);
   pub const TRANSMISSIVE: Self = Self(1 << 5);
+  pub const FLUID: Self = Self(1 << 6);
+  pub const FLUID_SOURCE: Self = Self(1 << 7);
 
   pub fn contains(self, other: Self) -> bool {
     self.0 & other.0 == other.0

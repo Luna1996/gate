@@ -15,6 +15,7 @@ mod responsive;
 pub mod shader;
 pub mod sky;
 pub mod volumetric;
+pub mod water;
 pub mod wesl_consts;
 
 use bevy::prelude::*;
@@ -45,6 +46,7 @@ pub use profiler::{ChunkUseFeed, LodRequest, LodRequestFeed, LodUse};
 pub use responsive::{ResponsivePlugin, resize_render_targets};
 pub use sky::{SkyPlugin, SkySettings, sun_altitude_deg};
 pub use volumetric::{FogPlugin, FogSettings};
+pub use water::{WaterPool, WaterSettings, WaterUniform};
 
 pub struct GateRenderPlugin;
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::{IVec3, Mat3, Vec3};
 
@@ -12,6 +12,7 @@ pub const COMP_BRICK_EXTENT: i32 = 16;
 pub const DEFAULT_VOXEL_PER_METER: f32 = 50.0;
 
 const RESIDENT_LOG_MAX: usize = 16 * 1024;
+const EDIT_LOG_MAX: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidentChange {
@@ -34,6 +35,8 @@ pub struct VolumeGrid {
   resident_log: Vec<ResidentChange>,
   resident_log_epoch: u64,
   edit_aabbs: HashMap<ChunkCoord, (IVec3, IVec3)>,
+  edit_log: VecDeque<(u64, IVec3, IVec3)>,
+  edit_log_seq: u64,
   stream_window: Option<(IVec3, IVec3)>,
   empty_chunks: HashSet<ChunkCoord>,
   empty_log: Vec<ChunkCoord>,
@@ -60,6 +63,8 @@ impl Default for VolumeGrid {
       resident_log: Vec::new(),
       resident_log_epoch: 0,
       edit_aabbs: HashMap::new(),
+      edit_log: VecDeque::new(),
+      edit_log_seq: 0,
       stream_window: None,
       empty_chunks: HashSet::new(),
       empty_log: Vec::new(),
@@ -261,6 +266,14 @@ impl VolumeGrid {
     self.edit_aabbs.remove(&chunk)
   }
 
+  pub fn edit_log_seq(&self) -> u64 {
+    self.edit_log_seq
+  }
+
+  pub fn edits_since(&self, seq: u64) -> impl Iterator<Item = (IVec3, IVec3)> + '_ {
+    self.edit_log.iter().filter(move |e| e.0 > seq).map(|e| (e.1, e.2))
+  }
+
   fn note_edit(&mut self, chunk: ChunkCoord, voxel: IVec3) {
     self.note_edit_box(chunk, voxel, voxel + IVec3::ONE);
   }
@@ -275,6 +288,11 @@ impl VolumeGrid {
         *l = l.min(lo);
         *h = h.max(hi);
       }
+    }
+    self.edit_log_seq = self.edit_log_seq.wrapping_add(1);
+    self.edit_log.push_back((self.edit_log_seq, lo, hi));
+    if self.edit_log.len() > EDIT_LOG_MAX {
+      self.edit_log.pop_front();
     }
   }
 
