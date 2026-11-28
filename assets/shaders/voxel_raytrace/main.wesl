@@ -470,6 +470,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
   var sky_dir = ray_dir;
   var through_transmission = false;
   var fluid_hit = false;
+  var water_deep = vec3<f32>(0.0);
   let glass_q = (light_u.g.base_flags >> GLASS_QUALITY_SHIFT) & 3u;
   if (first.hit && (palette_flags(first.palette_base, first.pal) & FLAGS_TRANSMISSIVE) != 0u) {
     let fg = make_grid(u32(first.obj_id) + 1u);
@@ -484,7 +485,7 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     let fv = face_view_dir(origin_voxel, fp);
     let fluid = (palette_flags(first.palette_base, first.pal) & FLAGS_FLUID) != 0u;
     if (fluid) {
-      let fpix = first.t * view_u.lod.x;
+      let fpix = length(fp - origin_voxel) * view_u.lod.x;
       let vox_main = 16.0 / max(first.voxel_per_meter, 1.0e-4);
       let fade = clamp(1.0 - fpix * 0.12, 0.0, 1.0)
                * clamp(1.0 - max(vox_main - 1.0, 0.0) / 32.0, 0.0, 1.0);
@@ -512,11 +513,12 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
                          rk.x, rk.y, true);
         }
         let eta_in = 1.0 / ior;
-        let ci_in = clamp(dot(-ray_dir, fnn), 0.0, 1.0);
+        let inc = -fv;
+        let ci_in = clamp(dot(-inc, fnn), 0.0, 1.0);
         let k_in = 1.0 - eta_in * eta_in * (1.0 - ci_in * ci_in);
-        var dir_in = ray_dir;
+        var dir_in = inc;
         if (glass_q >= 2u) {
-          dir_in = normalize(eta_in * ray_dir + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * fnn);
+          dir_in = normalize(eta_in * inc + (eta_in * ci_in - sqrt(max(k_in, 0.0))) * fnn);
         }
         var tint = vec3<f32>(1.0);
         let turb = max(water_u.color.a, 1.0e-4);
@@ -562,7 +564,11 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
     if (glass_w > 1.0 / 255.0) {
       let f_ndl = max(dot(fnn, sun_dir), 0.0);
       var f_sun = select(vec3<f32>(0.0), f_shadow.vis, f_shadow.ok);
-      if (!f_shadow.ok && f_ndl > 0.0) {
+      if (fluid_hit) {
+        f_sun = select(vec3<f32>(0.0),
+                       sun_vis_surface(fg, first.voxel, first.face_id, first.obj_id, fnn, f_face),
+                       f_ndl > 0.0);
+      } else if (!f_shadow.ok && f_ndl > 0.0) {
         f_sun = sun_transmittance(f_face, sun_dir, first.voxel, first.obj_id);
       }
       var f_gi = vec3<f32>(0.0);
@@ -570,6 +576,9 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       glass_col = brdf_reflected(fm, fnn, fv,
                                  SurfaceLight(sun_dir, sun_c * f_sun, 1.0, f_amb, f_gi))
                 + emissive_radiance(fm, gi_emit_gain());
+      if (fluid_hit) {
+        water_deep = water_u.color.rgb * (sky + sun_c * dot(f_sun, GI_LUMA) * 0.25);
+      }
     }
   }
   var col = vec3<f32>(0.0);
@@ -632,13 +641,13 @@ fn shade_face(first: WorldHit, origin_voxel: vec3<f32>, ray_dir: vec3<f32>, frus
       }
     }
     if (fluid_hit) {
-      col = col * through + water_u.color.rgb * (vec3<f32>(1.0) - through);
+      col = col * through + water_deep * (vec3<f32>(1.0) - through);
     } else {
       col = col * through + refl;
     }
   } else {
     var miss = sky_primary(sky_dir, sun_dir, sun_c) * through;
-    if (fluid_hit) { miss = water_u.color.rgb; }
+    if (fluid_hit) { miss = water_deep; }
     return mix(glass_col, miss + refl, 1.0 - glass_w);
   }
   return mix(glass_col, col, 1.0 - glass_w);
